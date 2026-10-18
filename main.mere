@@ -15352,7 +15352,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (if in_thread () then raise_exc world "__ThreadPark" "kill" else VNil)
        else if (str_len name == 4 && str_eq name "kill") then
          (match args with
-          | Cons (t, _) -> invoke_val_c env world blk t "kill" Nil false
+          // (only a thread: `Thread.kill(nil)` is ruby's TypeError, not a
+          //  NoMethodError for nil's #kill)
+          | Cons (t, _) ->
+            (if thr_is_thread world t then invoke_val_c env world blk t "kill" Nil false
+             else raise_exc world "TypeError" ("wrong argument type " ++ (match t with VNil -> "nil" | VBool true -> "true" | VBool false -> "false" | _ -> class_name t) ++ " (expected VM/thread)"))
           | _ -> VNil)
        else if (str_len name == 4 && str_eq name "list") then
          (let out = map_new () in
@@ -22587,12 +22591,23 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // join(limit): the limit is a number (or nil), and a thread still
           // parked when it runs out answers nil -- here a parked thread never
           // wakes on its own, so any limit runs out
+          // (a limit too large for a Float's precision is no limit; anything
+          //  with #to_f is converted, as rb_num2dbl does; else "into Float")
           if (str_len name == 4 && str_eq name "join")
+             && (match args with Cons (VBig _, _) -> true | Cons (VObj _, _) -> true | _ -> false) then
+            (match args with
+             | Cons (VBig _, _) -> invoke_val_c env world blk recv "join" (Cons (VNil, Nil)) false
+             | Cons (o9, _) ->
+               (match invoke_val_c env world blk o9 "respond_to?" (Cons (VSym "to_f", Nil)) false with
+                | VBool true -> invoke_val_c env world blk recv "join" (Cons (invoke_val_c env world blk o9 "to_f" Nil false, Nil)) false
+                | _ -> raise_exc world "TypeError" ("can't convert " ++ class_name o9 ++ " into Float"))
+             | Nil -> VNil)
+          else if (str_len name == 4 && str_eq name "join")
              && (match args with
                  | Cons (VInt _, _) -> false | Cons (VFlt _, _) -> false | Cons (VRat _, _) -> false
                  | Cons (VNil, _) -> false | Nil -> false | _ -> true) then
             (match args with
-             | Cons (a9, _) -> raise_exc world "TypeError" ("can't convert " ++ class_name a9 ++ " into time interval")
+             | Cons (a9, _) -> raise_exc world "TypeError" ("can't convert " ++ class_name a9 ++ " into Float")
              | Nil -> VNil)
           else if (str_len name == 4 && str_eq name "join") && alive
                   && (match args with Cons (VNil, _) -> false | Cons (_, _) -> true | Nil -> false)
@@ -25524,7 +25539,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        else if str_eq c "Thread" && (str_len name == 16 && str_eq name "handle_interrupt") then
          (match args with
           | Cons (VHsh _, _) -> thread_handle_interrupt env world blk newblk args
-          | Cons (a9, _) -> raise_exc world "ArgumentError" "unknown mask signature"
+          // (a mask that is no Hash is ruby's TypeError: rb_to_hash_type)
+          | Cons (a9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ (match a9 with VNil -> "nil" | VBool true -> "true" | VBool false -> "false" | _ -> class_name a9) ++ " into Hash")
           | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
        else if str_eq c "Thread" && (str_len name == 20 && str_eq name "each_caller_location") then
          (let _ = (match rev_app args Nil with
@@ -35951,6 +35967,12 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   let self9 = (if lv_has env "self" then lv_get env "self" else VNil) in
   if (match blame with VNil -> true | b9 -> rb_identical b9 self9) && mod_inst_delegates world self9 name then
     invoke_val_c env world noblk self9 name args false
+  // ...and so does a Thread subclass's to its builtin surface:
+  // `name`, `alive?`, `pending_interrupt?` in its own methods (and in its
+  // #initialize before super: test_thread's Bug #11959 and #12290)
+  else if (match blame with VNil -> true | b9 -> rb_identical b9 self9) && thr_inst_delegates world self9 name
+          && (if self_defines env world name then false else true) then
+    invoke_val_c env world noblk self9 name args false
   // a bare `initialize(lo, hi)` in a Range subclass instance is Range's
   // (test_range's CyclicRange: `o.instance_eval { initialize(o, 1) }`)
   else if (str_len name == 10 && str_eq name "initialize") && (match blame with VNil -> true | b9 -> rb_identical b9 self9)
@@ -36919,6 +36941,8 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        //  well -- `ancestors` in its #initialize, Bug #18185 -- the same
        //  delegation an explicit receiver gets)
        else if mod_inst_delegates world (VObj id) name then invoke_val_c env world noblk (VObj id) name args false
+       // (...and a Thread subclass's, see thr_inst_delegates)
+       else if thr_inst_delegates world (VObj id) name then invoke_val_c env world noblk (VObj id) name args false
        else undef_call_exc world (blamed (VObj id)) name args
      | VMain ->
        if ((str_len name == 13 && str_eq name "instance_eval") || (str_len name == 13 && str_eq name "instance_exec")) && (match args with Cons (VStr _, _) -> true | _ -> false)
@@ -41851,9 +41875,26 @@ and thread_new = fn world -> fn blk -> fn (c: str) -> fn (name: str) -> fn (args
   if (str_len name == 3 && str_eq name "new") && has_meth world c "initialize" then
     (let tid = alloc_oid ocls3 in
      let _ = map_set ocls3 tid c in
-     let _ = invoke world newblk (VObj tid) c "initialize" args in
-     if map_has iv3 (str_of_int tid ++ "@__tst") then VObj tid
-     else raise_exc world "ThreadError" ("uninitialized thread - check '" ++ cls_display world c ++ "#initialize'"))
+     // (marked as a thread being made, so `self.name = ` and
+     //  `pending_interrupt?` before super answer as a thread's)
+     let _ = map_set iv3 (str_of_int tid ++ "@__tpre") (VBool true) in
+     let ok9 = map_new () in
+     let ex0 = (if map_has iv3 "$exc" then map_get iv3 "$exc" else VNil) in
+     let _ = try_or (fn (u: unit) -> (let _ = invoke world newblk (VObj tid) c "initialize" args in let _ = map_set ok9 "y" 1 in VNil)) VNil in
+     // (an `exit` in it comes back as a value with $exc set: raised all the same)
+     let _ = (if map_has ok9 "y" && (match (if map_has iv3 "$exc" then map_get iv3 "$exc" else VNil) with VNil -> false | e9 -> (if rb_eq e9 ex0 then false else true))
+              then map_delete ok9 "y" else ()) in
+     let _ = map_delete iv3 (str_of_int tid ++ "@__tpre") in
+     if map_has iv3 (str_of_int tid ++ "@__tst") then
+       (if map_has ok9 "y" then VObj tid
+        // (initialize raised after super: that exception goes on)
+        else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (passed on past Thread#initialize)")) in
+              fail "mere-ruby: (passed on past Thread#initialize)"))
+     // ...and one that never reached super is an uninitialized thread,
+     // whatever it raised on the way (exit too: Bug #11959)
+     else if map_has ok9 "y" then raise_exc world "ThreadError" ("uninitialized thread - check '" ++ cls_display world c ++ "#initialize'")
+     else (let _ = map_delete iv3 "$exc" in let _ = map_clear prim_missing in
+           raise_exc world "ThreadError" "uninitialized thread"))
   else if hasblk then
     (let tid = alloc_oid ocls3 in
      let _ = map_set ocls3 tid c in
@@ -42593,7 +42634,13 @@ and thread_inst_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (tid:
      | VFlt _ -> thread_join_sch env world recv tid name limit alive me
      | VRat _ -> thread_join_sch env world recv tid name limit alive me
      | VNil -> thread_join_sch env world recv tid name limit alive me
-     | a9 -> raise_exc world "TypeError" ("can't convert " ++ class_name a9 ++ " into time interval"))
+     // (a limit past a Float's precision is no limit, and anything with
+     //  #to_f is converted, as rb_num2dbl does; else "into Float")
+     | VBig _ -> thread_join_sch env world recv tid name VNil alive me
+     | a9 ->
+       (match (match a9 with VObj _ -> invoke_val_c env world blk a9 "respond_to?" (Cons (VSym "to_f", Nil)) false | _ -> VBool false) with
+        | VBool true -> thread_join_sch env world recv tid name (invoke_val_c env world blk a9 "to_f" Nil false) alive me
+        | _ -> raise_exc world "TypeError" ("can't convert " ++ class_name a9 ++ " into Float")))
   else if (str_len name == 6 && str_eq name "status") then
     (if alive then (if sch_status_sleeping tid then mkstr "sleep" else tst) else tst)
   else if (str_len name == 18 && str_eq name "pending_interrupt?") then VBool (sch_pending_is world tid args)
@@ -42848,14 +42895,27 @@ and thread_fetch = fn env -> fn world -> fn blk -> fn (tid: int) -> fn (args: Va
         else if hasblk then flow_value (run_block world blk newblk (Cons (kv, Nil)))
         else (match rest with
               | Cons (d, _) -> d
-              | Nil -> raise_exc world "KeyError" ("key not found: " ++ key_err_desc (inspect kv))))
+              | Nil -> raise_exc_iv world "KeyError" ("key not found: " ++ key_err_desc (inspect kv))
+                        (Cons (("__key", kv), Cons (("__recv", VObj tid), Nil)))))
      | Nil -> VNil)
 // the dispatcher's cheap form of thr_is_thread: a started thread carries
 // @__tst, whatever its class
+// a bare name a Thread subclass instance answers from its builtin
+// surface (try_self_call_x), by name: an unknown one stays a NameError
+and thr_inst_delegates = fn world -> fn (v: Val) -> fn (name: str) ->
+  match v with
+  | VObj id ->
+    (let (_, _, o9, _) = world in
+     if map_has o9 id then
+       (let c9 = map_get o9 id in
+        if str_eq c9 "Thread" then false
+        else str_list_has (ancestors_of world c9) "Thread" && map_has (name_set "thrinst") name)
+     else false)
+  | _ -> false
 and thr_obj_here = fn world -> fn (v: Val) -> fn (cls: str) ->
   str_eq cls "Thread"
   || (match v with
-      | VObj id -> (let (_, _, _, iv9) = world in map_has iv9 (str_of_int id ++ "@__tst"))
+      | VObj id -> (let (_, _, _, iv9) = world in map_has iv9 (str_of_int id ++ "@__tst") || map_has iv9 (str_of_int id ++ "@__tpre"))
       | _ -> false)
 and thr_is_current = fn (v: Val) ->
   let cur = (if map_has cur_thr "t" then map_get cur_thr "t" else if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
