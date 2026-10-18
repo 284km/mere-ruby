@@ -6655,10 +6655,25 @@ let core_prelude_j =
   "    self.__f_read(0)\n" ++
   "    __f_bom_skip\n" ++
   "    if len.nil?\n" ++
+  "      at = self.pos\n" ++
   "      s = self.__f_read\n" ++
   "      ext, int = __ln_encs\n" ++
   "      s.force_encoding(ext)\n" ++
-  "      s = s.encode(int, ext, **(@__f_ecopts || \{})) if int\n" ++
+  "      if int\n" ++
+  "        begin\n" ++
+  "          s = s.encode(int, ext, **(@__f_ecopts || \{}))\n" ++
+  "        rescue Encoding::InvalidByteSequenceError, Encoding::UndefinedConversionError => e\n" ++
+  "          # what was converted is consumed, up to and through the byte the\n" ++
+  "          # converter stopped at: the next read starts after it (ruby's\n" ++
+  "          # converter has taken those bytes), not at the end\n" ++
+  "          bad = if e.respond_to?(:error_bytes) && e.error_bytes then e.error_bytes.b\n" ++
+  "                elsif (m = /U\\+(\\h+)/.match(e.message)) then [m[1].hex].pack(\"U\").encode(ext).b rescue nil\n" ++
+  "                end\n" ++
+  "          i = bad && s.b.byteindex(bad)\n" ++
+  "          self.pos = at + i + bad.bytesize if i && !__f_univ?\n" ++
+  "          raise\n" ++
+  "        end\n" ++
+  "      end\n" ++
   "      return s if buf.nil?\n" ++
   "      return buf.replace(s)\n" ++
   "    end\n" ++
@@ -6997,6 +7012,13 @@ let core_prelude_j =
   "    end\n" ++
   "    @__f_ecopts = opts.empty? ? nil : opts\n" ++
   "    @__f_encs_set = true\n" ++
+  "    # validate_enc_binmode: reading text in an ASCII-incompatible encoding\n" ++
+  "    # with no conversion is refused unless the stream is binary\n" ++
+  "    m = @__f_mode.to_s.split(\":\", 2)[0].to_s\n" ++
+  "    if (m.start_with?(\"r\") || m.include?(\"+\")) && !@__f_binmode && !m.include?(\"b\") && @__f_int.nil? &&\n" ++
+  "       @__f_ext && !@__f_ext.ascii_compatible?\n" ++
+  "      raise ArgumentError, \"ASCII incompatible encoding needs binmode\"\n" ++
+  "    end\n" ++
   "    self\n" ++
   "  end\n" ++
   "\n" ++
@@ -7417,6 +7439,9 @@ let core_prelude_k =
   "    r.send(:initialize, rfd, \"r\")\n" ++
   "    r.__fd_setencs(ext, int, int_given)\n" ++
   "    r.__fd_ecopts!(opts)\n" ++
+  "    # universal_newline: (or newline: :universal) decodes CRLF and CR on\n" ++
+  "    # the reading end (it was dropped, and the bytes came through as written)\n" ++
+  "    r.instance_variable_set(:@__io_univ, true) if opts[:universal_newline] || opts[:newline] == :universal\n" ++
   "    r.instance_variable_set(:@__io_peer, wfd)\n" ++
   "    w = allocate\n" ++
   "    w.send(:initialize, wfd, \"w\")\n" ++
@@ -7567,16 +7592,16 @@ let core_prelude_k =
   "  # nothing). A string already in it, or ASCII into an ASCII-compatible\n" ++
   "  # one, is written as it is; anything else is transcoded -- a BINARY string\n" ++
   "  # too, which is how a byte no encoding can map is refused.\n" ++
-  "  def self.__wstr(o, ext)\n" ++
+  "  def self.__wstr(o, ext, ecopts = nil)\n" ++
   "    s = o.is_a?(String) ? o : o.to_s\n" ++
   "    s = IO.__fdanystr(o) unless s.is_a?(String)\n" ++
   "    if ext && ext != Encoding::BINARY && s.encoding != ext && !(s.ascii_only? && ext.ascii_compatible?)\n" ++
-  "      s = s.encode(ext)\n" ++
+  "      s = ecopts ? s.encode(ext, **ecopts) : s.encode(ext)\n" ++
   "    end\n" ++
   "    s\n" ++
   "  end\n" ++
   "\n" ++
-  "  def __fd_wstr(o) = IO.__wstr(o, @__io_ext)\n" ++
+  "  def __fd_wstr(o) = IO.__wstr(o, @__io_ext, @__io_ecopts)\n" ++
   "\n" ++
   "  # a synchronous stream writes straight through, so a write the kernel\n" ++
   "  # refuses leaves nothing behind; otherwise the bytes wait in the buffer\n" ++
@@ -7728,7 +7753,14 @@ let core_prelude_k =
   "      raise IOError, \"stream closed in another thread\" if @__io_closed\n" ++
   "      s = IO.__fdread(fd, want)\n" ++
   "      if s.is_a?(String)\n" ++
+  "        s = __fd_univ_conv(s) if @__io_univ\n" ++
   "        @__io_rbuf << s\n" ++
+  "        return true\n" ++
+  "      end\n" ++
+  "      # (a CR held back at the end of the last chunk is a newline after all)\n" ++
+  "      if s.nil? && @__io_crpend\n" ++
+  "        @__io_crpend = nil\n" ++
+  "        @__io_rbuf << \"\\n\"\n" ++
   "        return true\n" ++
   "      end\n" ++
   "      return false if s.nil?\n" ++
@@ -7737,6 +7769,19 @@ let core_prelude_k =
   "      IO.__fd_raise(s) unless IO.__fdnb(fd) && IO.__again?(s)\n" ++
   "      IO.__sel_wait([[fd, 1, self]], -1)\n" ++
   "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # universal_newline: CRLF and a lone CR become LF as bytes arrive; a CR\n" ++
+  "  # at the end of a chunk waits for the next one, which may start with LF\n" ++
+  "  # (they were handed over as they came)\n" ++
+  "  def __fd_univ_conv(s)\n" ++
+  "    s = \"\\r\".b + s if @__io_crpend\n" ++
+  "    @__io_crpend = nil\n" ++
+  "    if s.end_with?(\"\\r\")\n" ++
+  "      s = s.byteslice(0, s.bytesize - 1)\n" ++
+  "      @__io_crpend = true\n" ++
+  "    end\n" ++
+  "    s.b.gsub(\"\\r\\n\", \"\\n\").gsub(\"\\r\", \"\\n\")\n" ++
   "  end\n" ++
   "\n" ++
   "  # the bytes of the buffer, up to `n`, taken off it\n" ++
@@ -7793,6 +7838,8 @@ let core_prelude_k =
   "    if len == 0\n" ++
   "      return buf ? buf.replace(\"\".b).force_encoding(buf.encoding) : \"\".b\n" ++
   "    end\n" ++
+  "    # bytes cannot be taken from a buffer of decoded characters\n" ++
+  "    raise IOError, \"byte oriented read for character buffered IO\" if @__io_univ && !@__io_rbuf.empty?\n" ++
   "    while @__io_rbuf.bytesize < len\n" ++
   "      break unless __fd_fill(len - @__io_rbuf.bytesize)\n" ++
   "    end\n" ++
@@ -8193,6 +8240,7 @@ let core_prelude_k =
   "      @__io_rbuf = (@__f_unget || \"\").b\n" ++
   "      @__f_unget = nil\n" ++
   "      @__ln_fbytes = 0\n" ++
+  "      @__ln_rawstart = self.pos\n" ++
   "    else\n" ++
   "      __fd_reading!\n" ++
   "      __fd_flush_w\n" ++
@@ -8203,6 +8251,20 @@ let core_prelude_k =
   "    return unless __ln_file?\n" ++
   "    left = @__io_rbuf.bytesize\n" ++
   "    unless left == 0\n" ++
+  "      # (under universal newline the bytes read ahead are already decoded,\n" ++
+  "      #  and fewer than the file's: they stay as what is read next, the way\n" ++
+  "      #  ruby's character buffer holds them, instead of seeking back)\n" ++
+  "      if __f_univ?\n" ++
+  "        # the file's position is where the decoded bytes that were taken\n" ++
+  "        # end: read them again from where this began (decoding moves it)\n" ++
+  "        fromfile = left < @__ln_fbytes ? left : @__ln_fbytes\n" ++
+  "        took = @__ln_fbytes - fromfile\n" ++
+  "        self.pos = @__ln_rawstart\n" ++
+  "        self.__f_read(took) if took > 0\n" ++
+  "        @__f_unget = @__io_rbuf.byteslice(0, left - fromfile) if left > fromfile\n" ++
+  "        @__io_rbuf = nil\n" ++
+  "        return\n" ++
+  "      end\n" ++
   "      back = left < @__ln_fbytes ? left : @__ln_fbytes\n" ++
   "      self.pos = self.pos - back if back > 0\n" ++
   "      @__f_unget = @__io_rbuf.byteslice(0, left - back) if left > back\n" ++
@@ -8517,6 +8579,12 @@ let core_prelude_k =
   "      f.set_encoding(opts[:encoding])\n" ++
   "    elsif !encs.compact.empty?\n" ++
   "      f.set_encoding(*encs)\n" ++
+  "    end\n" ++
+  "    # a \"BOM|\" in encoding: is read past at the start, as in the mode\n" ++
+  "    e = opts[:encoding] || opts[:external_encoding]\n" ++
+  "    if e.is_a?(String) && e.upcase.start_with?(\"BOM|\")\n" ++
+  "      f.instance_variable_set(:@__f_bom_mode, true)\n" ++
+  "      f.instance_variable_set(:@__f_bom_int, e.split(\":\", 2)[1])\n" ++
   "    end\n" ++
   "    f.binmode if opts[:binmode] && f.external_encoding.nil?\n" ++
   "    f.instance_variable_set(:@__f_binmode, true) if opts[:binmode]\n" ++
@@ -8852,8 +8920,25 @@ let core_prelude_k =
   "      end\n" ++
   "    end\n" ++
   "    flags, bin, text, ext, int, int_given = IO.__fd_modeenc(mode, opts)\n" ++
+  "    # validate_enc_binmode, before anything is opened\n" ++
+  "    univ_asked = (opts.key?(:newline) && opts[:newline] == :universal) || opts[:universal_newline]\n" ++
+  "    raise ArgumentError, \"newline decorator with binary mode\" if bin && univ_asked\n" ++
+  "    if !bin && (flags & 3) != WRONLY && int.nil? && ext && !ext.ascii_compatible?\n" ++
+  "      raise ArgumentError, \"ASCII incompatible encoding needs binmode\"\n" ++
+  "    end\n" ++
   "    f = File.new(path, flags, *[perm].compact)\n" ++
   "    f.__f_setencs(ext, int, int_given, bin, text)\n" ++
+  "    # invalid: / undef: / replace: / fallback: go to every conversion the\n" ++
+  "    # stream makes, reading and writing (they were dropped)\n" ++
+  "    eco = \{}\n" ++
+  "    [:invalid, :undef, :replace, :fallback].each \{ |k| eco[k] = opts[k] if opts.key?(k) }\n" ++
+  "    f.instance_variable_set(:@__f_ecopts, eco) unless eco.empty?\n" ++
+  "    # reading: newline: :universal, universal_newline:, or text mode\n" ++
+  "    univ = if opts.key?(:newline) && !opts[:newline].nil? then opts[:newline] == :universal\n" ++
+  "           elsif opts.key?(:universal_newline) then opts[:universal_newline] ? true : false\n" ++
+  "           elsif text then true\n" ++
+  "           end\n" ++
+  "    f.__f_univ_set(univ) unless univ.nil?\n" ++
   "    # newline: (or the older crlf_newline: / cr_newline:) -- what \"\\n\" is\n" ++
   "    # written as\n" ++
   "    nl = opts[:newline]\n" ++
@@ -8863,6 +8948,12 @@ let core_prelude_k =
   "    m = opts.key?(:mode) && !opts[:mode].nil? ? opts[:mode] : mode\n" ++
   "    if m.is_a?(String) && m.split(\":\", 2)[1].to_s.upcase.start_with?(\"BOM|\")\n" ++
   "      f.instance_variable_set(:@__f_bom_mode, true)\n" ++
+  "    end\n" ++
+  "    # ...and `encoding: \"BOM|UTF-8\"` names it as well (it was not read)\n" ++
+  "    e = opts[:encoding] || opts[:external_encoding]\n" ++
+  "    if e.is_a?(String) && e.upcase.start_with?(\"BOM|\")\n" ++
+  "      f.instance_variable_set(:@__f_bom_mode, true)\n" ++
+  "      f.instance_variable_set(:@__f_bom_int, e.split(\":\", 2)[1])\n" ++
   "    end\n" ++
   "    return f unless blk\n" ++
   "    begin\n" ++
@@ -8891,10 +8982,36 @@ let core_prelude_k =
   "    back = head.bytesize - n\n" ++
   "    self.pos = self.pos - back if back > 0\n" ++
   "    return if enc.nil?\n" ++
-  "    _, int = __ln_encs\n" ++
+  "    # the internal encoding the stream NAMED (\"BOM|UTF-8:UTF-8\"): it was\n" ++
+  "    # dropped as equal to the external before the BOM changed that, so a\n" ++
+  "    # UTF-16 file read as UTF-16 instead of converting\n" ++
+  "    nint = @__f_bom_int || (encs && encs.split(\":\", 2)[1])\n" ++
+  "    int = nint ? IO.__fd_enc(nint) : __ln_encs[1]\n" ++
+  "    int = nil if int == enc\n" ++
   "    __f_setencs(enc, int, !int.nil?, false, false)\n" ++
   "  end\n" ++
   "\n" ++
+  "  # universal newline on read (see file_univ_code): on or off as the\n" ++
+  "  # options said, in the code units of the external encoding\n" ++
+  "  def __f_univ_set(on)\n" ++
+  "    unless on\n" ++
+  "      @__f_univ = 0\n" ++
+  "      return\n" ++
+  "    end\n" ++
+  "    e = (__f_encstate[0] rescue nil)\n" ++
+  "    @__f_univ = case e && e.name\n" ++
+  "                when \"UTF-16LE\" then 2\n" ++
+  "                when \"UTF-16BE\" then 3\n" ++
+  "                when \"UTF-32LE\" then 4\n" ++
+  "                when \"UTF-32BE\" then 5\n" ++
+  "                else 1\n" ++
+  "                end\n" ++
+  "  end\n" ++
+  "  def __f_univ?\n" ++
+  "    return false if @__f_binmode\n" ++
+  "    return @__f_univ > 0 if @__f_univ\n" ++
+  "    @__f_mode.to_s.split(\":\", 2)[0].to_s.include?(\"t\")\n" ++
+  "  end\n" ++
   "  def __f_setencs(ext, int, int_given, bin, text)\n" ++
   "    @__f_dint = Encoding.default_internal\n" ++
   "    @__f_binmode = true if bin\n" ++
@@ -8914,7 +9031,7 @@ let core_prelude_k =
   "    n = 0\n" ++
   "    ext = __f_wext\n" ++
   "    objs.each do |o|\n" ++
-  "      s = IO.__wstr(o, ext)\n" ++
+  "      s = IO.__wstr(o, ext, @__f_ecopts)\n" ++
   "      next if s.empty?\n" ++
   "      s = s.gsub(\"\\n\", @__f_nl == :crlf ? \"\\r\\n\" : \"\\r\") if @__f_nl\n" ++
   "      n += self.__f_write(s)\n" ++
