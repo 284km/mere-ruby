@@ -10381,7 +10381,7 @@ and stdlib_src = fn (name: str) ->
     "    end\n" ++
     "  end\n" ++
     "\n" ++
-    "  def initialize(basename = \"\", tmpdir = nil, mode: nil, **_opts)\n" ++
+    "  def initialize(basename = \"\", tmpdir = nil, mode: nil, **opts)\n" ++
     "    base, ext = if basename.is_a?(Array)\n" ++
     "      [basename[0], basename[1]]\n" ++
     "    else\n" ++
@@ -10392,6 +10392,10 @@ and stdlib_src = fn (name: str) ->
     "    File.write(@path, \"\")\n" ++
     "    @unlinked = false\n" ++
     "    @tmpfile = File.open(@path, \"w+\")\n" ++
+    "    # `binmode: true` (or File::BINARY in mode:) was dropped: the file read\n" ++
+    "    # back as UTF-8. Kept for #open, which reopens the same way.\n" ++
+    "    @__tf_bin = opts[:binmode] || (mode.is_a?(Integer) && (mode & File::BINARY) != 0)\n" ++
+    "    @tmpfile.binmode if @__tf_bin\n" ++
     "    super(@tmpfile)\n" ++
     "  end\n" ++
     "\n" ++
@@ -10404,6 +10408,7 @@ and stdlib_src = fn (name: str) ->
     "  def open\n" ++
     "    @tmpfile.close rescue nil\n" ++
     "    @tmpfile = File.open(@path, \"r+\")\n" ++
+    "    @tmpfile.binmode if @__tf_bin\n" ++
     "    __setobj__(@tmpfile)\n" ++
     "    self\n" ++
     "  end\n" ++
@@ -15411,7 +15416,11 @@ and file_open_obj = fn world -> fn (args: Val list) ->
   else if map_has fifo_paths (abs_path_of path) && file_exists path then
     raise_exc world "NotImplementedError"
       ("opening a FIFO would wait for its other end, and every thread here is one OS thread - " ++ path)
-  else if (str_contains mode "r" && (if str_contains mode "+" then false else true))
+  // ("r+" too: it opens a file that is there and creates none, so a missing
+  //  one was opened as an empty file -- `open("|echo foo", "r+")`, which ruby
+  //  4.0 reads as a path, made a File; an integer mode with O_CREAT made the
+  //  file above, before this asks)
+  else if str_len mode > 0 && str_eq (char_at (file_mode_head mode) 0) "r"
      && (if file_exists path then false else true) then
     raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ path)
   else
@@ -15566,15 +15575,24 @@ and file_close_obj = fn world -> fn (id: int) ->
   // thousands.
   // (#autoclose = false leaves it open: the program took it over)
   let keep9 = map_has ivars (k ++ "@__f_keep_fd") && truthy (map_get ivars (k ++ "@__f_keep_fd")) in
-  let _ = (match (if map_has ivars (k ++ "@__f_fd") then map_get ivars (k ++ "@__f_fd") else VNil) with
-           | VInt fd9 -> (if fd9 >= 0 && (if keep9 then false else true) then (let _ = fd_close fd9 in fd_forget fd9) else ())
-           | _ -> ()) in
+  // ⚠ ...and a close(2) the kernel refuses is reported, after the File is
+  //   marked closed (ruby's fptr_finalize_flush): `IO.for_fd(f.fileno).close`
+  //   closes the number under f, and f.close is then EBADF -- it was silent
+  let bad9 = (match (if map_has ivars (k ++ "@__f_fd") then map_get ivars (k ++ "@__f_fd") else VNil) with
+              | VInt fd9 -> (if fd9 >= 0 && (if keep9 then false else true)
+                             then (let r9 = fd_close fd9 in let _ = fd_forget fd9 in r9 < 0) else false)
+              | _ -> false) in
   let _ = map_delete ivars (k ++ "@__f_fd") in
   // the mode it had, which #reopen onto a path uses again (the prelude's)
   let _ = (match (if map_has ivars (k ++ "@__f_mode") then map_get ivars (k ++ "@__f_mode") else VNil) with
            | VStr h9 -> (if str_eq (sget h9) "" then () else map_set ivars (k ++ "@__f_lastmode") (VStr h9))
            | _ -> ()) in
-  map_set ivars (k ++ "@__f_mode") (mkstr "")
+  let _ = map_set ivars (k ++ "@__f_mode") (mkstr "") in
+  if bad9 then
+    (let p9 = (match (if map_has ivars (k ++ "@__f_path") then map_get ivars (k ++ "@__f_path") else VNil) with
+               | VStr ph9 -> sget ph9 | _ -> "") in
+     let _ = raise_exc world "Errno::EBADF" ("Bad file descriptor @ fptr_finalize_flush - " ++ p9) in ())
+  else ()
 and rb_gets = fn (u: unit) ->
   let _ = stdin_line () in
   let s = stdin_buf () in
@@ -18970,7 +18988,11 @@ and stdio_hook = fn world -> fn (slot: str) ->
       | VObj id9 ->
         (let (m9, s9, o9, iv9) = world in
          if map_has iv9 (str_of_int id9 ++ "@__io_fd") then VNil else VObj id9)
-      | _ -> VNil)
+      | VNil -> VNil
+      // anything else here was let in by the setter for having a #write: a
+      // String with a singleton #write is a recorder too (test_io's
+      // puts_old_write), and puts wrote past it to the real stdout
+      | v9 -> v9)
    else VNil)
 and p_print = fn (args: Val list) ->
   match args with
