@@ -214,6 +214,8 @@ let def_depth = map_new ();
 // the top level and directly in another BEGIN (ruby's "BEGIN is permitted
 // only at toplevel"). lex_src starts every parse at 0.
 let stmt_nest = map_new ();
+// set ("q") while a condition under `!` is read: its literals are not warned about
+let cond_quiet = map_new ();
 // what the enclosing def, block and lambda bodies took anonymously, innermost
 // at "n": a frame is "D" (a def) or "B" (a block or lambda), then the letters
 // r (`*`), k (`**`), b (`&`), f (`...`). A call that passes one of them on
@@ -225,6 +227,11 @@ let afr = map_new ();
 // are numbered from): `eval(src, nil, "test.rb", 0)` warns at test.rb:1 for
 // the source's 2nd line
 let parse_lshift = map_new ();
+// the shift to add to a line the PARSER read off a token ("n"), and the one
+// for a line the LEXER counts from the start of the text ("b" + "n": an
+// eval's tokens are numbered from its line argument, its text from 1)
+let lshift_tok = fn (u: unit) -> if map_has parse_lshift "n" then map_get parse_lshift "n" else 0;
+let lshift_lex = fn (u: unit) -> lshift_tok () + (if map_has parse_lshift "b" then map_get parse_lshift "b" else 0);
 // ---- the local-variable table ----------------------------------------------
 // ruby decides several shapes by whether a NAME is a local variable assigned
 // earlier in the current scope, and nothing else can decide them: `p / r` is
@@ -300,10 +307,33 @@ let num_us_refuse = fn (s: str) -> fn (i: int) -> fn (j: int) ->
   if j > i && str_eq (char_at s (j - 1)) "_" then syn_refuse "trailing '_' in number"
   else if j > i && str_index_of (substring s i j) "__" >= 0 then syn_refuse "invalid underscore placement in number"
   else ();
+// how many ( [ { are open before offset i of s (counted on the raw text: a
+// bracket inside a string only ever makes it larger or smaller by its own)
+let rec br_depth = fn (s: str) -> fn (i: int) -> fn (k: int) -> fn (d: int) ->
+  if k >= i then d
+  else (let c9 = char_at s k in
+        br_depth s i (k + 1) (if str_eq c9 "(" || str_eq c9 "[" || str_eq c9 "\{" then d + 1
+                              else if str_eq c9 ")" || str_eq c9 "]" || str_eq c9 "}" then d - 1 else d));
+// does the line holding offset i begin (after blanks and `(`) with `def `?
+let rec line_start = fn (s: str) -> fn (k: int) ->
+  if k <= 0 then 0 else if str_eq (char_at s (k - 1)) "\n" then k else line_start s (k - 1);
+let rec skip_lead = fn (s: str) -> fn (k: int) ->
+  if k < str_len s && (str_eq (char_at s k) " " || str_eq (char_at s k) "\t" || str_eq (char_at s k) "(") then skip_lead s (k + 1) else k;
+let line_is_def = fn (s: str) -> fn (i: int) ->
+  let k9 = skip_lead s (line_start s i) in
+  k9 + 4 <= str_len s && str_eq (substring s k9 (k9 + 4)) "def ";
+// the line (from 1) that offset i of s is on
+let rec nls_before = fn (s: str) -> fn (i: int) -> fn (k: int) -> fn (n: int) ->
+  if k >= i then n else nls_before s i (k + 1) (if str_eq (char_at s k) "\n" then n + 1 else n);
 let rec lex_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
   else
     let c = char_at s i in
+    // (a CR that does not end the line is a space, and ruby says so)
+    let _ = bal_warn s i in
+    let _ = (if str_eq c "\r" && (if i + 1 < str_len s then (if str_eq (char_at s (i + 1)) "\n" then false else true) else true)
+             then warn_note (parse_time_file () ++ ":" ++ str_of_int (nls_before s i 0 1 + lshift_lex ()) ++ ": warning: encountered \\r in middle of line, treated as a mere space")
+             else ()) in
     if str_eq c " " || str_eq c "\t" || str_eq c "\r" then lex_go s (i + 1)
     // NUL, ^D and ^Z where a token would start end the script, as they do for
     // ruby; inside a comment or a string literal they are bytes like any
@@ -792,6 +822,14 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       else Cons (TStrL lit, lex_go s j)
     else
       let three = if i + 3 <= str_len s then substring s i (i + 3) else "" in
+      // (`...` at the end of a line outside brackets reads the next line as
+      //  its bound, and ruby says so: "... at EOL, should be parenthesized?")
+      let _ = (if str_eq three "..." && (let k9 = lvt_skip_sp s (i + 3) in k9 < str_len s && str_eq (char_at s k9) "\n")
+                  && br_depth s i 0 0 <= 0
+                  // (a `def`'s paren-less `...` parameter is no range: `def foo ...`)
+                  && (if line_is_def s i then false else true)
+               then warn_note (parse_time_file () ++ ":" ++ str_of_int (nls_before s i 0 1 + lshift_lex ()) ++ ": warning: ... at EOL, should be parenthesized?")
+               else ()) in
       if str_eq three "..." || str_eq three "||=" || str_eq three "&&=" ||
          str_eq three "<<=" || str_eq three ">>=" || str_eq three "**=" ||
          str_eq three "<=>" || str_eq three "===" then Cons (TP three, lex_go s (i + 3))
@@ -865,8 +903,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
                     else if str_eq nc "\n" then false
                     else if str_eq nc "&" then false else if str_eq nc "=" then false
                     else if str_eq nc "." then false else true)
-                // `x &y` with x a LOCAL is the binary `&`, as it is for ruby
+                // `x &y` with x a LOCAL is the binary `&`, as it is for ruby,
+                // and so is `1 &y` / `:a &y` after a literal
                 && (if lvt_prev_local s i then false else true)
+                && (if prev_is_lit s (prev_nonspace s (i - 1)) then false else true)
                 && (let pj = prev_nonspace s (i - 1) in
                     pj >= 0 && (let pc = char_at s pj in
                       is_alnum pc || str_eq pc "_" || str_eq pc "?" || str_eq pc "!"
@@ -2107,9 +2147,33 @@ and heredoc_body = fn (s: str) -> fn (i: int) -> fn (hid: str) -> fn (squiggly: 
   let body = if squiggly then hd_join (hd_strip lines (hd_min_indent lines 9999)) else hd_join lines in
   (body, after)
 
+// where `<<ID` (or <<-ID / <<~ID, quoted or not) is first written in s, or -1
+and hd_open_line = fn (s: str) -> fn (hid: str) ->
+  let k1 = str_index_of s ("<<" ++ hid) in
+  if k1 >= 0 then k1
+  else (let k2 = str_index_of s ("<<~" ++ hid) in
+        if k2 >= 0 then k2 + 1
+        else (let k3 = str_index_of s ("<<-" ++ hid) in if k3 >= 0 then k3 + 1 else 0 - 1))
+// the "unterminated heredoc" lines for the heredocs opened in s[k, e)
+and hd_more_ids = fn (s: str) -> fn (k: int) -> fn (e: int) ->
+  if k + 2 >= e then ""
+  else if str_eq (substring s k (k + 2)) "<<" then
+    (let k1 = (if k + 2 < e && (str_eq (char_at s (k + 2)) "~" || str_eq (char_at s (k + 2)) "-") then k + 3 else k + 2) in
+     let k2 = (if k1 < e && (str_eq (char_at s k1) "'" || str_eq (char_at s k1) "\"") then k1 + 1 else k1) in
+     let k3 = hd_id_end s k2 e in
+     if k3 > k2 && (is_alpha (char_at s k2) || str_eq (char_at s k2) "_")
+     then "\nunterminated heredoc; can't find string \"" ++ substring s k2 k3 ++ "\" anywhere before EOF" ++ hd_more_ids s k3 e
+     else hd_more_ids s (k + 2) e)
+  else hd_more_ids s (k + 1) e
+and hd_id_end = fn (s: str) -> fn (k: int) -> fn (e: int) ->
+  if k < e && (is_alnum (char_at s k) || str_eq (char_at s k) "_") then hd_id_end s (k + 1) e else k
 and heredoc_lines = fn (s: str) -> fn (i: int) -> fn (hid: str) -> fn (acc: str list) ->
   if i >= str_len s then
-    (let _ = syn_refuse ("unterminated heredoc; can't find string \"" ++ hid ++ "\" anywhere before EOF") in (rev_app_str acc Nil, i))
+    // (and every heredoc opened after it on the same line, which this one's
+    //  body swallowed: `puts <<A + <<B` names both)
+    (let ln0 = hd_open_line s hid in
+     let more9 = (if ln0 < 0 then "" else hd_more_ids s (ln0 + 2 + str_len hid) (find_nl s ln0)) in
+     let _ = syn_refuse ("unterminated heredoc; can't find string \"" ++ hid ++ "\" anywhere before EOF" ++ more9) in (rev_app_str acc Nil, i))
   else
     let nl = find_nl s i in
     let line = substring s i nl in
@@ -2405,6 +2469,41 @@ and prev_nonspace = fn (s: str) -> fn (i: int) ->
   if i < 0 then 0 - 1
   else if str_eq (char_at s i) " " then prev_nonspace s (i - 1)
   else i
+// the token ending at pj is a number or a symbol literal (`1`, `:a`)
+and prev_is_lit = fn (s: str) -> fn (pj: int) ->
+  pj >= 0 && (is_alnum (char_at s pj) || str_eq (char_at s pj) "_")
+  && (let b9 = word_start s pj in
+      is_digit (char_at s b9)
+      || (b9 >= 1 && str_eq (char_at s (b9 - 1)) ":" && (if b9 >= 2 then (if str_eq (char_at s (b9 - 2)) ":" then false else true) else true)))
+// ruby's -w warning for an operator that could be an argument's prefix
+// (`puts 1 **0`): space before it, none after, and a local variable or a
+// literal before -- where it is read as the binary operator
+and bal_warn = fn (s: str) -> fn (i: int) ->
+  let c9 = char_at s i in
+  let n9 = str_len s in
+  if (str_eq c9 "*" || str_eq c9 "&" || str_eq c9 "+" || str_eq c9 "-" || str_eq c9 "/" || str_eq c9 "%" || str_eq c9 "<")
+     && i > 0 && str_eq (char_at s (i - 1)) " " && parse_verbose () then
+    (let op9 = (if str_eq c9 "*" && i + 1 < n9 && str_eq (char_at s (i + 1)) "*" then "**"
+                else if str_eq c9 "<" then (if i + 1 < n9 && str_eq (char_at s (i + 1)) "<" then "<<" else "")
+                else c9) in
+     let j9 = i + str_len op9 in
+     let nx9 = (if j9 < n9 then char_at s j9 else " ") in
+     let ok9 = str_len op9 > 0
+               && (if str_eq nx9 " " || str_eq nx9 "\t" || str_eq nx9 "\n" || str_eq nx9 "=" then false else true)
+               && (if str_eq op9 nx9 || str_eq c9 nx9 then false else true)
+               && (if str_eq c9 "-" && str_eq nx9 ">" then false else true)
+               && (if str_eq c9 "&" && (str_eq nx9 "." || str_eq nx9 "&") then false else true)
+               && (lvt_prev_local s i || prev_is_lit s (prev_nonspace s (i - 1))) in
+     if ok9 then
+       (let syn9 = (if str_eq op9 "<<" then "here document"
+                    else if str_eq op9 "+" || str_eq op9 "-" then "unary operator"
+                    else if str_eq op9 "/" then "regexp literal"
+                    else if str_eq op9 "%" then "string literal"
+                    else "argument prefix") in
+        warn_note (parse_time_file () ++ ":" ++ str_of_int (nls_before s i 0 1 + lshift_lex ()) ++ ": warning: '" ++ op9
+                   ++ "' after local variable or literal is interpreted as binary operator even though it seems like " ++ syn9))
+     else ())
+  else ()
 
 and is_lparen = fn (p: str) -> str_eq p "(" || str_eq p " ("
 // the tokens AFTER a leading parenthesised group, for a statement-leading name
@@ -2606,7 +2705,7 @@ and skip_regex_flags = fn (s: str) -> fn (i: int) ->
 // here: it starts from an empty local-variable table, which a sublex (a
 // heredoc's line, an interpolation) must not do -- those call lex_go and see
 // the locals of the code around them.
-let lex_src = fn (s: str) -> let _ = map_set stmt_nest "d" 0 in let _ = map_set afr_n "n" 0 in let _ = lvt_reset () in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in lex_go s 0;
+let lex_src = fn (s: str) -> let _ = map_set stmt_nest "d" 0 in let _ = map_delete cond_quiet "q" in let _ = map_set afr_n "n" 0 in let _ = lvt_reset () in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in lex_go s 0;
 
 // ---- parser (precedence climbing) ---------------------------------------
 let is_keyword = fn (id: str) ->
@@ -3428,7 +3527,12 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
               // `||=` treats an undefined constant as nil (then assigns); other
               // op-assigns read first, so an undefined constant raises NameError.
               let readx = if str_eq base "||" then EScopedReadOrNil (EVar tmp, name) else EScopedRead (EVar tmp, name) in
-              (EStmt (SBegin (Cons (SAssign (tmp, recv), Cons (SExpr (EScopedAssign (EVar tmp, name, EBin (base, readx, v))), Nil)), Nil, Nil, Nil)), r4)
+              // (`||=` and `&&=` assign only when they must, as const_opasgn)
+              let asg9 = SExpr (EScopedAssign (EVar tmp, name, v)) in
+              let op9 = (if str_eq base "||" then SIf (Cons ((readx, Cons (SExpr readx, Nil)), Nil), Cons (asg9, Nil))
+                         else if str_eq base "&&" then SIf (Cons ((readx, Cons (asg9, Nil)), Nil), Cons (SExpr readx, Nil))
+                         else SExpr (EScopedAssign (EVar tmp, name, EBin (base, readx, v)))) in
+              (EStmt (SBegin (Cons (SAssign (tmp, recv), Cons (op9, Nil)), Nil, Nil, Nil)), r4)
             // `Gem::URI source_uri` -- a method named like a constant, called
             // with a paren-less argument, as `URI source_uri` is at the top
             // (see the is_cap case in parse_primary). A constant takes no
@@ -3764,7 +3868,7 @@ and parse_brace_stmts = fn toks -> fn (acc: Stmt list) ->
   let t = skip_nls toks in
   match t with
   | Cons (TP p, r) ->
-    if str_eq p "}" then (rev_app acc Nil, r)
+    if str_eq p "}" then (unreach_list (rev_app acc Nil), r)
     else let ln = tok_line t in
          let acc = brace_file_head acc in
          let (s0, r0) = parse_stmt t in let (s, r1) = apply_modifier s0 r0 in
@@ -4385,7 +4489,11 @@ and parse_primary = fn toks ->
       // name it would find a nested constant of the same name instead, which
       // is exactly what `::Process` inside Sidekiq (which has its own
       // Process) is written to avoid.
-      (match r with Cons (TId n, r2) -> (EConst ("::" ++ n), r2) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected constant after ::" ++ parsing_file ()))) in fail ("mere-ruby: expected constant after ::" ++ parsing_file ())))
+      (match r with
+       // `p ::Bar ||= 42`: a top-level constant op-assigned inside an expression
+       | Cons (TId n, Cons (TP eq9, r3)) when is_cap n && (if str_eq (opassign_base eq9) "" then false else true) ->
+         (let (v, r4) = parse_expr (skip_nls r3) in (EStmt (const_opasgn ("::" ++ n) ("::" ++ n) (opassign_base eq9) v), r4))
+       | Cons (TId n, r2) -> (EConst ("::" ++ n), r2) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected constant after ::" ++ parsing_file ()))) in fail ("mere-ruby: expected constant after ::" ++ parsing_file ())))
     else if str_eq p ".." || str_eq p "..." then
       // beginless range (..5)
       let (hi, r2) = parse_bin r 1 in
@@ -4942,13 +5050,30 @@ and parse_puts_args_pos = fn toks -> fn (acc: Expr list) ->
 
 // parse statements until a block-closing keyword (end / else / elsif /
 // when) or EOF; the closer is left unconsumed for the caller.
+// -w: a statement after an unconditional break / next / return / redo /
+// retry in the same list is never run, and ruby says so at its line
+and unreach_list = fn (xs: Stmt list) ->
+  let _ = (if parse_verbose () then unreach_go xs false 0 else ()) in xs
+and unreach_go = fn (xs: Stmt list) -> fn (jumped: bool) -> fn (ln: int) ->
+  match xs with
+  | Nil -> ()
+  | Cons (SLine n9, t) -> unreach_go t jumped n9
+  | Cons (SFile _, t) -> unreach_go t jumped ln
+  | Cons (s9, t) ->
+    if jumped then warn_note (parse_time_file () ++ ":" ++ str_of_int (ln + lshift_tok ()) ++ ": warning: statement not reached")
+    else
+      (let j9 = (match s9 with
+                 | SReturn _ -> true | SBreak _ -> true | SNext _ -> true
+                 | SExpr (EFlow (k9, _)) -> str_eq k9 "redo" || str_eq k9 "retry"
+                 | _ -> false) in
+       unreach_go t j9 ln)
 and parse_stmts = fn toks -> fn (acc: Stmt list) ->
   let (t, skipped) = skip_nls_n toks 0 in
   let _ = parse_line_add skipped in
   match t with
-  | Cons (TEOF, _) -> (rev_app acc Nil, t)
+  | Cons (TEOF, _) -> (unreach_list (rev_app acc Nil), t)
   | Cons (TId id, _) ->
-    if is_block_stop id then (rev_app acc Nil, t)
+    if is_block_stop id then (unreach_list (rev_app acc Nil), t)
     else
       let ln = tok_line t in
       let acc = (match acc with
@@ -5684,7 +5809,7 @@ and parse_stmt_at = fn toks ->
          // other ops read first, so an undefined constant raises NameError.
          let full = a ++ "::" ++ cn in
          let (e, r2) = parse_expr (skip_nls r) in
-         (SAssign (full, EBin (opassign_base eq, opasgn_const_read (opassign_base eq) full, e)), r2)
+         (const_opasgn full full (opassign_base eq) e, r2)
        else if str_eq eq "::" then
          (match scoped_const_path (a ++ "::" ++ cn) r with
           | (full, r2b) ->
@@ -5694,7 +5819,7 @@ and parse_stmt_at = fn toks ->
                // `A::B::C op= e` -> `A::B::C = A::B::C op e` (nil read when undefined).
                else if not (str_eq (opassign_base eq2) "") then
                  let (e, r4) = parse_expr (skip_nls r3) in
-                 (SAssign (full, EBin (opassign_base eq2, opasgn_const_read (opassign_base eq2) full, e)), r4)
+                 (const_opasgn full full (opassign_base eq2) e, r4)
                else parse_stmt_id toks
              | _ -> parse_stmt_id toks))
        else parse_stmt_id toks)
@@ -5708,12 +5833,21 @@ and parse_stmt_at = fn toks ->
       // `::Const op= e` -> `::Const = ::Const op e`. The write target keeps the
       // `::` (stored top-level as the bare name), so the read uses the bare name.
       let (e, r2) = parse_expr (skip_nls r) in
-      (SAssign ("::" ++ cn, EBin (opassign_base eq, opasgn_const_read (opassign_base eq) cn, e)), r2)
+      (const_opasgn ("::" ++ cn) ("::" ++ cn) (opassign_base eq) e, r2)
     else let (e, r2) = parse_expr toks in (SExpr e, r2)
   | Cons (TId id, r) -> parse_stmt_id toks
   | _ ->
     let (e, r) = parse_expr toks in (SExpr e, r)
 
+// `C op= e` for a scoped or top-level constant: `||=` assigns only when the
+// constant is undefined or falsy, `&&=` only when it is truthy, and either
+// otherwise answers the value it read -- an assignment of the same value
+// again is ruby's "already initialized constant" warning
+and const_opasgn = fn (target: str) -> fn (rd: str) -> fn (op: str) -> fn (e: Expr) ->
+  let read9 = opasgn_const_read op rd in
+  if str_eq op "||" then SIf (Cons ((read9, Cons (SExpr read9, Nil)), Nil), Cons (SAssign (target, e), Nil))
+  else if str_eq op "&&" then SIf (Cons ((read9, Cons (SAssign (target, e), Nil)), Nil), Cons (SExpr read9, Nil))
+  else SAssign (target, EBin (op, read9, e))
 and parse_stmt_id = fn toks ->
   match toks with
   | Cons (TId id, r) ->
@@ -6495,7 +6629,15 @@ and cond_ff = fn (e: Expr) ->
     if str_eq op "&&" || str_eq op "||" then EBin (op, cond_ff l, cond_ff r)
     else if str_eq op "+" && cond_is_dstr e then (let _ = cond_warn "string literal in condition" in e)
     else e
-  | EUn (op, x) -> if str_eq op "!" then EUn (op, cond_ff x) else e
+  // (a literal under `!` is not warned about: `1 if !""` says nothing)
+  | EUn (op, x) ->
+    if str_eq op "!" then
+      (let q9 = map_has cond_quiet "q" in
+       let _ = map_set cond_quiet "q" 1 in
+       let x9 = cond_ff x in
+       let _ = (if q9 then () else map_delete cond_quiet "q") in
+       EUn (op, x9))
+    else e
   // a bare regexp literal as a condition matches $_ (`if /foo/` is
   // `if $_ =~ /foo/`), with ruby's warning. It was a Regexp, always true.
   | ERegex (_, _) ->
@@ -6562,15 +6704,16 @@ and cond_str_parts = fn (e: Expr) ->
   | _ -> false
 // a parse-time warning at the line being read, -e included
 and cond_warn = fn (what: str) ->
-  warn_note (parse_time_file () ++ ":" ++ str_of_int (cond_line ()) ++ ": warning: " ++ what)
+  if map_has cond_quiet "q" then () else
+  warn_note (parse_time_file () ++ ":" ++ str_of_int (cond_line () + lshift_tok ()) ++ ": warning: " ++ what)
 
 // ruby's warning for a literal where a condition is read. It is not given for
 // a -e program (prism's warn_unless_e_option: the one-liner idioms are what
 // these literals are FOR there).
 and cond_lit_warn = fn (what: str) ->
   let f9 = parse_time_file () in
-  if str_eq f9 "-e" then ()
-  else warn_note (f9 ++ ":" ++ str_of_int (cond_line ()) ++ ": warning: " ++ what)
+  if str_eq f9 "-e" || map_has cond_quiet "q" then ()
+  else warn_note (f9 ++ ":" ++ str_of_int (cond_line () + lshift_tok ()) ++ ": warning: " ++ what)
 
 // ...and each END of a flip-flop is itself read as a condition (ruby's
 // range_op): an integer literal is compared with `$.`, the line last read,
@@ -6581,7 +6724,15 @@ and ff_operand = fn (e: Expr) ->
   match e with
   | EInt _ -> let _ = cond_lit_warn "integer literal in flip-flop" in EBin ("==", e, EVar "$.")
   | ERegex (_, _) -> let _ = cond_lit_warn "regex literal in flip-flop" in EBin ("=~", e, EVar "$_")
-  | _ -> e
+  // (a string or symbol end is always true: ruby says so, the symbol under -w)
+  | EStrL _ -> let _ = cond_warn "string literal in flip-flop" in e
+  | ESym _ -> let _ = (if parse_verbose () then cond_warn "symbol literal in flip-flop" else ()) in e
+  | EMethod (x, m, _) ->
+    (if str_eq m "__interp_str" then (let _ = cond_warn "string literal in flip-flop" in e)
+     else if str_eq m "to_sym" && cond_is_dstr x then
+       (let _ = (if parse_verbose () then cond_warn "symbol literal in flip-flop" else ()) in e)
+     else e)
+  | _ -> if cond_is_dstr e then (let _ = cond_warn "string literal in flip-flop" in e) else e
 
 and parse_if = fn toks -> fn (negate: bool) ->
   let (cond1, r0) = cond_in_pattern (parse_andor toks) in
@@ -7615,6 +7766,10 @@ and parse_def_inner = fn toks ->
        | Cons (TId _, _) -> parse_bare_params r Nil Nil
        | _ -> (Nil, Nil, r)) in
     parse_def_tail name params defs r2
+  // (a literal where the name goes, as prism names it)
+  | Cons (TSym _, _) -> (let _ = syn_refuse "unexpected symbol literal; expected a method name" in (SExpr ENil, toks))
+  | Cons (TStrL _, _) -> (let _ = syn_refuse "unexpected string literal; expected a method name" in (SExpr ENil, toks))
+  | Cons (TP sq, _) when str_eq sq "(s" -> (let _ = syn_refuse "unexpected string literal; expected a method name" in (SExpr ENil, toks))
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected method name after def" ++ parsing_file ()))) in fail ("mere-ruby: expected method name after def" ++ parsing_file ()))
 
 // endless method `def name(params) = expr` — body is a single expression;
