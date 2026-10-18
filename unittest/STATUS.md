@@ -24,7 +24,7 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | json/json_string_matching_test.rb | 1 | 0 | 1 | 0 | 0 |
 | json/ractor_test.rb | 3 | 0 | 3 | 0 | 0 |
 | ruby/test_alias.rb | 18 | 13 | 5 | 0 | 0 |
-| ruby/test_argf.rb | 78 | 51 | 21 | 0 | 6 |
+| ruby/test_argf.rb | 73 | 72 | 0 | 0 | 1 |
 | ruby/test_arithmetic_sequence.rb | 37 | 37 | 0 | 0 | 0 |
 | ruby/test_arity.rb | 3 | 1 | 2 | 0 | 0 |
 | ruby/test_array.rb | 459 | 439 | 20 | 0 | 0 |
@@ -49,9 +49,9 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_default_gems.rb | 0 | 0 | 0 | 0 | 0 |
 | ruby/test_defined.rb | 39 | 32 | 7 | 0 | 0 |
 | ruby/test_dir.rb | 39 | 35 | 3 | 0 | 1 |
-| ruby/test_dir_m17n.rb | 22 | 10 | 12 | 0 | 0 |
+| ruby/test_dir_m17n.rb | 22 | 14 | 8 | 0 | 0 |
 | ruby/test_dup.rb | 6 | 5 | 1 | 0 | 0 |
-| ruby/test_econv.rb | 83 | 63 | 20 | 0 | 0 |
+| ruby/test_econv.rb | 83 | 67 | 16 | 0 | 0 |
 | ruby/test_encoding.rb | 15 | 13 | 2 | 0 | 0 |
 | ruby/test_enum.rb | 84 | 78 | 4 | 2 | 0 |
 | ruby/test_enumerator.rb | 70 | 67 | 3 | 0 | 0 |
@@ -59,7 +59,7 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_eval.rb | 40 | 31 | 8 | 1 | 0 |
 | ruby/test_exception.rb | 98 | 85 | 13 | 0 | 0 |
 | ruby/test_fiber.rb | 34 | 30 | 2 | 2 | 0 |
-| ruby/test_file.rb | 78 | 76 | 1 | 1 | 0 |
+| ruby/test_file.rb | 78 | 77 | 0 | 1 | 0 |
 | ruby/test_file_exhaustive.rb | 124 | 114 | 8 | 1 | 1 |
 | ruby/test_fixnum.rb | 39 | 38 | 1 | 0 | 0 |
 | ruby/test_flip.rb | 5 | 4 | 1 | 0 | 0 |
@@ -67,15 +67,15 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_fnmatch.rb | 15 | 14 | 1 | 0 | 0 |
 | ruby/test_frozen.rb | 6 | 5 | 1 | 0 | 0 |
 | ruby/test_frozen_error.rb | 5 | 1 | 4 | 0 | 0 |
-| ruby/test_gc.rb | 54 | 29 | 21 | 4 | 0 |
+| ruby/test_gc.rb | 54 | 28 | 22 | 4 | 0 |
 | ruby/test_hash.rb | 306 | 286 | 12 | 8 | 0 |
 | ruby/test_ifunless.rb | 1 | 1 | 0 | 0 | 0 |
 | ruby/test_insns_leaf.rb | 1 | 1 | 0 | 0 | 0 |
 | ruby/test_integer.rb | 38 | 36 | 2 | 0 | 0 |
 | ruby/test_integer_comb.rb | 41 | 41 | 0 | 0 | 0 |
-| ruby/test_io.rb | 255 | 196 | 52 | 3 | 4 |
+| ruby/test_io.rb | 252 | 232 | 16 | 1 | 3 |
 | ruby/test_io_buffer.rb | 0 | 0 | 0 | 0 | 0 |
-| ruby/test_io_m17n.rb | 163 | 108 | 50 | 4 | 1 |
+| ruby/test_io_m17n.rb | 159 | 133 | 25 | 0 | 1 |
 | ruby/test_io_timeout.rb | 0 | 0 | 0 | 0 | 0 |
 | ruby/test_iterator.rb | 32 | 31 | 1 | 0 | 0 |
 | ruby/test_key_error.rb | 6 | 4 | 2 | 0 | 0 |
@@ -101,12 +101,12 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_optimization.rb | 89 | 58 | 31 | 0 | 0 |
 | ruby/test_pack.rb | 53 | 51 | 2 | 0 | 0 |
 | ruby/test_parse.rb | 102 | 37 | 65 | 0 | 0 |
-| ruby/test_path.rb | 6 | 3 | 3 | 0 | 0 |
+| ruby/test_path.rb | 6 | 4 | 2 | 0 | 0 |
 | ruby/test_pattern_matching.rb | 30 | 23 | 7 | 0 | 0 |
 | ruby/test_pipe.rb | 12 | 12 | 0 | 0 | 0 |
 | ruby/test_primitive.rb | 25 | 25 | 0 | 0 | 0 |
 | ruby/test_proc.rb | 117 | 109 | 8 | 0 | 0 |
-| ruby/test_process.rb | 159 | 127 | 29 | 2 | 1 |
+| ruby/test_process.rb | 159 | 128 | 28 | 2 | 1 |
 | ruby/test_ractor.rb | 17 | 10 | 6 | 1 | 0 |
 | ruby/test_rand.rb | 41 | 41 | 0 | 0 | 0 |
 | ruby/test_random_formatter.rb | 26 | 26 | 0 | 0 | 0 |
@@ -115,7 +115,7 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_rational2.rb | 1 | 1 | 0 | 0 | 0 |
 | ruby/test_readpartial.rb | 4 | 4 | 0 | 0 | 0 |
 | ruby/test_refinement.rb | 122 | 102 | 19 | 1 | 0 |
-| ruby/test_regexp.rb | 157 | 133 | 23 | 0 | 1 |
+| ruby/test_regexp.rb | 157 | 130 | 26 | 0 | 1 |
 | ruby/test_require.rb | 52 | 27 | 24 | 1 | 0 |
 | ruby/test_require_lib.rb | 42 | 39 | 0 | 3 | 0 |
 | ruby/test_rubyoptions.rb | 69 | 21 | 44 | 3 | 1 |
@@ -133,14 +133,14 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_symbol.rb | 59 | 51 | 8 | 0 | 0 |
 | ruby/test_syntax.rb | 171 | 88 | 80 | 2 | 1 |
 | ruby/test_system.rb | 8 | 7 | 1 | 0 | 0 |
-| ruby/test_thread.rb | 101 | 65 | 33 | 1 | 2 |
+| ruby/test_thread.rb | 101 | 66 | 32 | 1 | 2 |
 | ruby/test_thread_cv.rb | 14 | 10 | 4 | 0 | 0 |
 | ruby/test_thread_queue.rb | 41 | 35 | 6 | 0 | 0 |
 | ruby/test_threadgroup.rb | 4 | 1 | 2 | 0 | 1 |
 | ruby/test_time.rb | 88 | 87 | 0 | 1 | 0 |
 | ruby/test_time_tz.rb | 174 | 154 | 2 | 18 | 0 |
 | ruby/test_trace.rb | 5 | 3 | 1 | 0 | 1 |
-| ruby/test_transcode.rb | 97 | 68 | 29 | 0 | 0 |
+| ruby/test_transcode.rb | 97 | 82 | 15 | 0 | 0 |
 | ruby/test_undef.rb | 3 | 2 | 1 | 0 | 0 |
 | ruby/test_unicode_escape.rb | 8 | 4 | 4 | 0 | 0 |
 | ruby/test_variable.rb | 31 | 29 | 2 | 0 | 0 |
@@ -149,6 +149,6 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_weakmap.rb | 19 | 14 | 2 | 3 | 0 |
 | ruby/test_whileuntil.rb | 3 | 3 | 0 | 0 | 0 |
 | ruby/test_yield.rb | 13 | 10 | 3 | 0 | 0 |
-| **total** | 7384 | 6200 | 1047 | 110 | 27 |
+| **total** | 7372 | 6304 | 943 | 104 | 21 |
 
 _Generated by `unittest/run.sh` against ruby 4.0.6's test/ and tool/lib._

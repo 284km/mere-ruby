@@ -86,7 +86,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/dir | 32 | 0 | 0 | 2 | 0 | 34 |
 | core/file | 59 | 7 | 0 | 2 | 0 | 68 |
 | core/time | 61 | 2 | 0 | 3 | 0 | 66 |
-| core/io | 78 | 2 | 0 | 1 | 0 | 81 |
+| core/io | 73 | 7 | 0 | 1 | 0 | 81 |
 | library/date | 60 | 0 | 0 | 38 | 0 | 98 |
 | library/etc | 12 | 0 | 0 | 7 | 0 | 19 |
 | library/pathname | 18 | 0 | 0 | 2 | 0 | 20 |
