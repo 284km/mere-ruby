@@ -214,6 +214,13 @@ let def_depth = map_new ();
 // the top level and directly in another BEGIN (ruby's "BEGIN is permitted
 // only at toplevel"). lex_src starts every parse at 0.
 let stmt_nest = map_new ();
+// what the enclosing def, block and lambda bodies took anonymously, innermost
+// at "n": a frame is "D" (a def) or "B" (a block or lambda), then the letters
+// r (`*`), k (`**`), b (`&`), f (`...`). A call that passes one of them on
+// asks it (anon_use): ruby's "no anonymous rest parameter" and "anonymous
+// rest parameter is also used within block". lex_src starts every parse empty.
+let afr_n = map_new ();
+let afr = map_new ();
 // an eval's line argument below 1 ("n" = the argument minus the 1 the tokens
 // are numbered from): `eval(src, nil, "test.rb", 0)` warns at test.rb:1 for
 // the source's 2nd line
@@ -2599,7 +2606,7 @@ and skip_regex_flags = fn (s: str) -> fn (i: int) ->
 // here: it starts from an empty local-variable table, which a sublex (a
 // heredoc's line, an interpolation) must not do -- those call lex_go and see
 // the locals of the code around them.
-let lex_src = fn (s: str) -> let _ = map_set stmt_nest "d" 0 in let _ = lvt_reset () in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in lex_go s 0;
+let lex_src = fn (s: str) -> let _ = map_set stmt_nest "d" 0 in let _ = map_set afr_n "n" 0 in let _ = lvt_reset () in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in lex_go s 0;
 
 // ---- parser (precedence climbing) ---------------------------------------
 let is_keyword = fn (id: str) ->
@@ -3706,13 +3713,17 @@ and parse_block_inner = fn toks ->
   | Cons (TP brace, r) ->
     if str_eq brace "\{" then
       let (bp, ds, r2) = parse_block_params_d r in
+      let _ = afr_push ("B" ++ anon_flags bp) in
       let (body, r3) = parse_brace_stmts r2 Nil in
+      let _ = afr_pop () in
       (bp, defaults_prologue ds body, r3)
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected block" ++ parsing_file ()))) in fail ("mere-ruby: expected block" ++ parsing_file ()))
   | Cons (TId d, r) ->
     if str_eq d "do" then
       let (bp, ds0, r2) = parse_block_params_d r in
+      let _ = afr_push ("B" ++ anon_flags bp) in
       let (body0, r3) = parse_stmts r2 Nil in
+      let _ = afr_pop () in
       // do-blocks accept trailing rescue/ensure (an implicit begin).
       let (body, r5) =
         (match r3 with
@@ -4031,7 +4042,13 @@ and parse_primary = fn toks ->
     else if str_eq id "yield" then
       (match r with
        | Cons (TP p, r2) ->
-         if is_lparen p then let (argv, r3) = parse_call_args r2 in (EYield argv, r3)
+         if is_lparen p then
+           (let (argv, r3) = parse_call_args r2 in
+            // (a block is no argument of yield: `yield(...)` is ruby's
+            //  "unexpected ...", and `yield(&b)` "block argument should not be given")
+            let _ = (if args_have_fwd argv then syn_refuse "unexpected ..."
+                     else if args_have_bpass argv then syn_refuse "block argument should not be given" else ()) in
+            (EYield argv, r3))
          // `yield [0]` passes an array literal (not an index on the result).
          else if str_eq p "[" || str_eq p " [" then let (es, r3) = parse_puts_args r Nil in (EYield es, r3)
          // A double-quoted string is lexed as `TP "(s"` -- the open of the
@@ -4094,7 +4111,8 @@ and parse_primary = fn toks ->
                 else (true, Nil, r)) in
       // `super { ... }` / `super do ... end` passes an explicit block.
       if starts_block r1 then
-        let (bp, bb, r4) = parse_block r1 in (ESuperB (zs, argv, bp, bb), r4)
+        (let _ = (if args_have_bpass argv then syn_refuse "both block arg and actual block given; only one block is allowed" else ()) in
+         let (bp, bb, r4) = parse_block r1 in (ESuperB (zs, argv, bp, bb), r4))
       else (ESuper (zs, argv), r1)
     else if str_eq id "not" then
       // `not(x)` / `not x` — negation; with parens the chain continues
@@ -4379,6 +4397,7 @@ and parse_primary = fn toks ->
          | Cons (TP lp, r2) ->
            if str_eq lp "(" then let (ps, ds, r3) = parse_params r2 Nil Nil in (ps, ds, r3)
            else if str_eq lp "*" || str_eq lp "**" || str_eq lp "&" then lambda_bare_params r Nil Nil
+           else if str_eq lp "..." then (let _ = syn_refuse "unexpected ..." in (Nil, Nil, r))
            else (Nil, Nil, r)
          | Cons (TId n, r2) ->
            if str_eq n "do" then ((Nil : str list), (Nil : (str * Expr) list), r)
@@ -4396,10 +4415,14 @@ and parse_primary = fn toks ->
            (match last_default_block lds with
             | (true, lds2, sbp, sbb) -> (lds2, r1, (true, sbp, sbb))
             | (false, _, _, _) -> (lds, r1, (false, Nil, Nil)))) in
+      // (a lambda takes no `...`, and its anonymous parameters are its own)
+      let _ = (if ps_has params "*__fwd" then syn_refuse "unexpected ..." else ()) in
+      let _ = afr_push ("B" ++ anon_flags params) in
       let (bp, bb, r4) =
         (match swallowed with
          | (true, sbp, sbb) -> (sbp, sbb, r1)
          | (false, _, _) -> parse_block r1) in
+      let _ = afr_pop () in
       // carry the empty-params sentinel so a numbered param in the body is
       // rejected (numbered_misuse_expr checks a non-empty ELambda param list).
       let params = if empty_parens then Cons (empty_bp_marker, Nil) else params in
@@ -4432,8 +4455,9 @@ and parse_arr_items = fn toks -> fn (acc: Expr list) ->
   | Cons (TP st, r0b) ->
     // a bare `*` / `**` forwards the method's anonymous rest / keyword rest,
     // as in a call: `def a(b: 1, **) [b, **] end` (test_keyword)
-    if bare && str_eq st "*" then arr_items_sep (skip_nls r0b) (Cons (ESplat (EVar "__anonrest"), acc))
+    if bare && str_eq st "*" then (let _ = anon_use "r" in arr_items_sep (skip_nls r0b) (Cons (ESplat (EVar "__anonrest"), acc)))
     else if bare && str_eq st "**" then
+      let _ = anon_use "k" in
       arr_hash_items (skip_nls r0b) acc (Cons (EKwSplat (EVar "__anonkw"), Cons (EKwSplat (EVar "__anonkw"), Nil))) true
     else if str_eq st "*" then
       let (inner, r1) = parse_expr r0b in
@@ -4688,8 +4712,9 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
     // a bare `*` / `**` (right before `,` or `)`) forwards the method's
     // anonymous rest / keyword rest
     if str_eq star "*" && (match r0 with Cons (TP nx, _) -> str_eq nx ")" || str_eq nx "," | _ -> false) then
-      parse_call_sep r0 (Cons (ESplat (EVar "__anonrest"), pos)) hp
+      (let _ = anon_use "r" in parse_call_sep r0 (Cons (ESplat (EVar "__anonrest"), pos)) hp)
     else if str_eq star "**" && (match r0 with Cons (TP nx, _) -> str_eq nx ")" || str_eq nx "," | _ -> false) then
+      let _ = anon_use "k" in
       parse_call_sep r0 pos (Cons (EKwSplat (EVar "__anonkw"), Cons (EKwSplat (EVar "__anonkw"), hp)))
     else if str_eq star "*" then
       let (inner, r1) = parse_expr r0 in parse_call_sep r1 (Cons (ESplat inner, pos)) hp
@@ -4717,7 +4742,8 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
       (match r0 with
        | Cons (TP q, _) ->
          if str_eq q ")" then
-           parse_call_sep r0 (Cons (EBlockPass (EVar "__anonblk"), Cons (ESplat (EVar "__fwd"), pos))) hp
+           (let _ = anon_use "f" in
+            parse_call_sep r0 (Cons (EBlockPass (EVar "__anonblk"), Cons (ESplat (EVar "__fwd"), pos))) hp)
          else let (hi, r1) = parse_expr r0 in
               parse_call_sep r1 (Cons (ERange (ENil, hi, true), pos)) hp
        | _ ->
@@ -4728,7 +4754,7 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
       (match r0 with
        | Cons (TP nx, _) ->
          if str_eq nx ")" || str_eq nx "," then
-           parse_call_sep r0 (Cons (EBlockPass (EVar "__anonblk"), pos)) hp
+           (let _ = anon_use "b" in parse_call_sep r0 (Cons (EBlockPass (EVar "__anonblk"), pos)) hp)
          else let (be, r1) = parse_expr r0 in parse_call_sep r1 (Cons (EBlockPass be, pos)) hp
        | _ -> let (be, r1) = parse_expr r0 in parse_call_sep r1 (Cons (EBlockPass be, pos)) hp)
     else parse_call_pos_arg toks pos hp
@@ -4785,6 +4811,10 @@ and only_blockpass = fn (xs: Expr list) ->
   | Nil -> Nil
   | Cons (EBlockPass b, t) -> Cons (EBlockPass b, only_blockpass t)
   | Cons (_, t) -> only_blockpass t
+and args_have_bpass = fn (xs: Expr list) ->
+  match xs with Nil -> false | Cons (EBlockPass _, _) -> true | Cons (_, t) -> args_have_bpass t
+and args_have_fwd = fn (xs: Expr list) ->
+  match xs with Nil -> false | Cons (ESplat (EVar v), t) -> str_eq v "__fwd" || args_have_fwd t | Cons (_, t) -> args_have_fwd t
 and drop_blockpass = fn (xs: Expr list) ->
   match xs with
   | Nil -> Nil
@@ -7434,7 +7464,12 @@ and parse_def_inner = fn toks ->
        if str_eq rp0 ")" && str_eq dot0 "." then
          (let (params, defs, r3) =
             (match r2 with
-             | Cons (TP p, r4) -> if is_lparen p then parse_params r4 Nil Nil else (Nil, Nil, r2)
+             | Cons (TP p, r4) ->
+               if is_lparen p then parse_params r4 Nil Nil
+               // (paren-less, as a named receiver's: `def (o).foo ...; bar(...); end`)
+               else if str_eq p "*" || str_eq p "**" || str_eq p "&" || str_eq p "..." then parse_bare_params r2 Nil Nil
+               else (Nil, Nil, r2)
+             | Cons (TId _, _) -> parse_bare_params r2 Nil Nil
              | _ -> (Nil, Nil, r2)) in
           // nil / true / false are singletons: there is one of each, so a
           // singleton method on one is an instance method of its class. Say
@@ -7575,7 +7610,7 @@ and parse_def_inner = fn toks ->
          if is_lparen p then parse_params r3 Nil Nil
          // `def send **kw` (debug's DAP/CDP servers): a paren-less list may
          // open with the double splat as well as the single one.
-         else if str_eq p "*" || str_eq p "**" || str_eq p "&" || str_eq p " &" then parse_bare_params r Nil Nil
+         else if str_eq p "*" || str_eq p "**" || str_eq p "&" || str_eq p " &" || str_eq p "..." then parse_bare_params r Nil Nil
          else (Nil, Nil, r)
        | Cons (TId _, _) -> parse_bare_params r Nil Nil
        | _ -> (Nil, Nil, r)) in
@@ -7586,6 +7621,62 @@ and parse_def_inner = fn toks ->
 // otherwise the body runs to `end`. Operator-named defs take this path too
 // (`def >>(k) = Bits.new(@n >> k)`).
 and parse_def_tail = fn (name: str) -> fn (params: str list) -> fn (defs: (str * Expr) list) -> fn r2 ->
+  // (`...` after a rest parameter is ruby's "... after rest argument")
+  let _ = (if ps_has params "*__fwd" && anon_has_rest params
+           then syn_refuse "... after rest argument" else ()) in
+  let _ = afr_push ("D" ++ anon_flags params) in
+  let res9 = parse_def_tail_in name params defs r2 in
+  let _ = afr_pop () in
+  res9
+// the letters of a frame (see afr) for a parameter list: `(*)` is
+// "*__anonrest" and a paren-less `*` is "*"; `...` is "*__fwd" with an
+// "&__anonblk" beside it, which is no `&` of its own
+and anon_flags = fn (ps: str list) ->
+  let f9 = ps_has ps "*__fwd" in
+  (if ps_has ps "*__anonrest" || ps_has ps "*" then "r" else "")
+  ++ (if ps_has ps "**__anonkw" then "k" else "")
+  ++ (if (ps_has ps "&__anonblk" && (if f9 then false else true)) || ps_has ps "&" then "b" else "")
+  ++ (if f9 then "f" else "")
+and ps_has = fn (ps: str list) -> fn (x: str) ->
+  match ps with Nil -> false | Cons (p9, t9) -> str_eq p9 x || ps_has t9 x
+and anon_has_rest = fn (ps: str list) ->
+  match ps with
+  | Nil -> false
+  | Cons (p9, t9) ->
+    (str_len p9 >= 1 && str_eq (substring p9 0 1) "*"
+     && (if str_len p9 >= 2 && str_eq (substring p9 0 2) "**" then false else true)
+     && (if str_eq p9 "*__fwd" || str_eq p9 "*__opt" then false else true))
+    || anon_has_rest t9
+and afr_push = fn (fl: str) ->
+  let n9 = (if map_has afr_n "n" then map_get afr_n "n" else 0) + 1 in
+  let _ = map_set afr_n "n" n9 in
+  map_set afr (str_of_int n9) fl
+and afr_pop = fn (u: unit) ->
+  let n9 = (if map_has afr_n "n" then map_get afr_n "n" else 0) in
+  map_set afr_n "n" (if n9 > 0 then n9 - 1 else 0)
+// a call passes the anonymous `k` on: the innermost def must have taken it,
+// and no block or lambda between may have taken one of its own. A string
+// eval's parse has no frames: it is the calling method's, which the parser
+// cannot see, and is let through.
+and anon_use = fn (k: str) ->
+  anon_use_at k (if map_has afr_n "n" then map_get afr_n "n" else 0)
+and anon_use_at = fn (k: str) -> fn (i: int) ->
+  let what9 = (if str_eq k "r" then "rest parameter" else if str_eq k "k" then "keyword rest parameter" else "block parameter") in
+  if i <= 0 then
+    (let p9 = (if map_has load_ctx "parsing" then (match map_get load_ctx "parsing" with VStr h -> sget h | _ -> "") else "") in
+     if str_len p9 >= 6 && str_eq (substring p9 0 6) "(eval)" then ()
+     else if str_eq k "f" then syn_refuse "unexpected ..."
+     else syn_refuse ("no anonymous " ++ what9))
+  else
+    (let fl9 = (if map_has afr (str_of_int i) then map_get afr (str_of_int i) else "D") in
+     if str_eq (substring fl9 0 1) "B" then
+       (if (if str_eq k "f" then false else str_contains fl9 k)
+        then syn_refuse ("anonymous " ++ what9 ++ " is also used within block")
+        else anon_use_at k (i - 1))
+     else if str_contains fl9 k then ()
+     else if str_eq k "f" then syn_refuse "unexpected ..."
+     else syn_refuse ("no anonymous " ++ what9))
+and parse_def_tail_in = fn (name: str) -> fn (params: str list) -> fn (defs: (str * Expr) list) -> fn r2 ->
   (match r2 with
    | Cons (TP eq, r3) ->
      if str_eq eq "=" || str_eq eq " =" then
