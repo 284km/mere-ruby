@@ -2579,6 +2579,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // override never ran and the read was silent.
        // ...until ruby 3.4, which removed `$=` altogether: reading it is silent
        // there, so the warning that used to be the point is now the gap.
+       // (4.0 warns again, in the deprecated category: "variable $= is no
+       //  longer effective" where it is read -- test_regexp's test_ignorecase)
+       let _ = (if str_eq k "=" && deprecation_says () then rb_warn world "variable $= is no longer effective" else ()) in
        let _ = (if false && str_eq k "="
                    // Ruby's rule is "$VERBOSE is not nil": false still warns
                    // (it only turns off the VERBOSE-only ones), and nil is
@@ -5111,6 +5114,8 @@ and gvar_assign_checked = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
   // (the deprecation warning names the SPELLING written, as ruby's does:
   //  `alias $fs $;; $fs = ""` warns about $fs -- gvar_write reads it once)
   let _ = map_set gvar_wname "n" name in
+  // ...and a write to it is ignored, with the same warning
+  let _ = (if str_eq slot "=" && deprecation_says () then rb_warn world "variable $= is no longer effective; ignored" else ()) in
   if gvar_readonly slot then
     // The DIRECT spelling and the ALIASED one are different refusals, and the
     // alias table tells them apart: `$& = ""` is written as its own slot, so
@@ -14166,6 +14171,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 4 && str_eq name "to_s") then mkstr ("#<" ++ cls_display world (obj_print_cls world c9) ++ ":0x" ++ hex_pad16 (oid - handle_base) ++ ">")
        else mkstr (inspect_w env world recv)
      | _ -> mkstr (inspect_w env world recv))
+  // a UTF-16/32 regexp's #to_s is in ITS encoding: the pattern is read as
+  // characters (to UTF-8), wrapped as any other ("(?-mix:...)"), and written
+  // back -- the wrapper's ASCII was joined to the wide bytes as they were,
+  // and the result tagged UTF-8 (test_regexp's test_to_s)
+  else if (str_len name == 4 && str_eq name "to_s")
+          && (match recv with
+              | VRegex (_, _, ev9) -> (let e9 = enc_canon_name ev9 in enc_is_utf16 e9 || enc_is_utf32 e9)
+              | _ -> false) then
+    (match recv with
+     | VRegex (p9, f9, ev9) ->
+       (let e9 = enc_canon_name ev9 in
+        let u9 = cps_utf8 (decode_cps p9 e9 0) in
+        let d9 = rx_desc u9 f9 true in
+        match encode_cps (decode_cps d9 "UTF-8" 0) e9 "" with
+        | (w9, _) -> (let r9 = mkstr w9 in match r9 with VStr h9 -> (let _ = senc_set h9 e9 in r9) | _ -> r9))
+     | _ -> VNil)
   // `o.singleton_class.to_s` -- an explicit call, so it arrives here rather than
   // at the value printer, and only here is there a world to name the object's
   // class with. `#<Class:#<Object:0x..>>`, not the bookkeeping name.
@@ -14233,10 +14254,21 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          //  rb_reg_preprocess as well: ArgumentError, no pattern named)
          let _ = (if str_is_ascii sp || enc_valid body (enc_canon_name (senc_get sp)) then ()
                   else (let _ = raise_exc world "ArgumentError" "invalid multibyte character" in ())) in
-         let why9 = rx_invalid_msg body fl in
+         let mix9 = rx_u_mix_why body (enc_canon_name (senc_get sp)) in
+         let why9 = (if str_eq mix9 "" then rx_invalid_msg body fl else mix9) in
          let _ = rx_emit_warns world (rx_wq_take ()) body in
+         // (/n is bytes: a raw non-ASCII character from a string that is not
+         //  BINARY, or a \u escape, cannot be in it -- RegexpError, as ruby's
+         //  rb_reg_preprocess_dregexp says it)
+         let se9 = enc_canon_name (senc_get sp) in
+         if str_contains fl "n" && (if str_eq se9 "ASCII-8BIT" || str_eq se9 "US-ASCII" then false else true)
+            && (if str_is_ascii sp then false else true) then
+           raise_exc world "RegexpError" "/.../n has a non escaped non ASCII character in non ASCII-8BIT script"
+         else if str_contains fl "n" && (match rx_kinds body 0 false false with (hu9, _) -> hu9) then
+           raise_exc world "RegexpError" ("incompatible character encoding: /" ++ rx_esc_slashes body 0 "" ++ "/")
+         else
          if str_eq why9 "" then rx_build_once body fl (rx_one_enc recv) args
-         else if rx_escape_why why9 then raise_exc world "ArgumentError" why9
+         else if rx_escape_why why9 || (if str_eq mix9 "" then false else true) then raise_exc world "ArgumentError" why9
          else raise_exc world "RegexpError" (why9 ++ ": /" ++ rx_esc_slashes body 0 "" ++ "/")))
      | _ -> VNil)
   // Kernel#method(:name): a bound Method object (NameError when undefined).
@@ -16447,7 +16479,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // ...and a pattern that does not parse is refused with the reason,
           // "premature end of char-class: /^[$/" as ruby words it
           let _ = rx_wq_take () in
-          let why9 = rx_invalid_msg body fl in
+          let mix9 = rx_u_mix_why body (enc_canon_name (senc_get src)) in
+          let why9 = (if str_eq mix9 "" then rx_invalid_msg body fl else mix9) in
           let _ = rx_emit_warns world (rx_wq_take ()) body in
           if str_eq why9 "" then rx_with_tmo env world (rx_build_once body fl renc9 args) args
           else raise_exc world "RegexpError" (why9 ++ ": /" ++ rx_esc_slashes body 0 "" ++ "/"))
@@ -16498,6 +16531,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (match args with
        // (an encoding that is not ASCII-compatible -- UTF-16, UTF-32 -- is
        //  quoted by its characters, through UTF-8, and stays in it)
+       // (...and one that is not whole characters -- the lone "\x00" of a
+       //  UTF-16BE string -- has no character to escape: ruby gives it back)
+       | Cons (VStr s, _) when (if enc_ascii_compat (senc_get s) then false else true)
+                               && (if enc_valid (sget s) (enc_canon_name (senc_get s)) then false else true) ->
+         (let v9 = mkstr (sget s) in match v9 with VStr h9 -> (let _ = senc_set h9 (senc_get s) in v9) | _ -> v9)
        | Cons (VStr s, _) when (if enc_ascii_compat (senc_get s) then false else true) ->
          (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
           match invoke_val_c env world nb9 (VStr s) "encode" (Cons (mkstr "UTF-8", Nil)) false with
@@ -28900,7 +28938,12 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
   // object's own override from here is asking itself.
   // (an active refinement's method answers too: ruby's respond_to? honours
   // the refinements of the scope that calls it)
-  if responds_real world recv nm
+  // (MatchData, Rational and Complex have no allocate: ruby undefines it,
+  //  and the call here already refuses -- only respond_to? said yes)
+  if str_eq nm "allocate" && (match recv with
+                               | VClass c8 -> str_eq c8 "MatchData" || str_eq c8 "Rational" || str_eq c8 "Complex"
+                               | _ -> false) then VBool false
+  else if responds_real world recv nm
      || (if str_eq (refined_impl_for world recv nm) "" then false else true) then
     (if all then VBool true
      else if meth_protected world c9 nm then rtm9 ()
@@ -49128,7 +49171,125 @@ and rxp_parse = fn (pat: str) -> fn (fl: str) ->
   //   where ruby says "invalid backref number/name".
   else if map_has rx_named_mode "ref" && map_get rx_named_mode "ref" > g - 1 then
     (let _ = rxp_refuse "invalid backref number/name" in n)
+  else if str_contains fl "i" || str_contains pat "(?i" || str_contains pat "i)" || str_contains pat "i:" then rxf_node n
   else n
+
+// ⚠ CASE FOLDING THAT CHANGES LENGTH. Under /i a character whose full fold
+//   is several (ß -> "ss", ﬅ -> "st", ŉ -> "ʼn") matches those several, and a
+//   run of pattern characters that folds to them matches the one character:
+//   /(?i:ss)/ =~ "ß", /\ufb05/i =~ "\ufb06", /(?i:[ß])/ =~ "SS". The machine
+//   compares one character with one, so the tree is widened here, before
+//   compiling: such a character becomes (any character folding the same | the
+//   folded run), and a run of two or three /i characters that spells a
+//   multi-character fold gets that set as an alternative. Not inside a
+//   look-behind, whose length the alternatives would change.
+// the codepoints whose full fold is several characters, keyed by that fold
+// ("73 73" -> "DF,1E9E")
+and rxf_rev = fn (key: str) ->
+  let _ = (if map_len rx_mfold > 0 then ()
+           else
+             (let raw = case_fold_raw in
+              let n = str_len raw in
+              let rec go = fn (i: int) ->
+                (if i >= n then ()
+                 else
+                   (let e = (let x = str_find_from raw "," i in if x < 0 then n else x) in
+                    let c = str_find_from raw ":" i in
+                    let k = substring raw i c in
+                    let v = substring raw (c + 1) e in
+                    let _ = (if str_contains v " " then
+                               map_set rx_mfold v (if map_has rx_mfold v then map_get rx_mfold v ++ "," ++ k else k)
+                             else ()) in
+                    go (e + 1))) in
+              let _ = go 0 in
+              map_set rx_mfold "" "")) in
+  if map_has rx_mfold key then map_get rx_mfold key else ""
+// a character's full fold, in the table's spelling ("73 73")
+and rxf_key = fn (c: str) ->
+  (match utf8_cp_strict c 0 with
+   | (cp, _, _) ->
+     (let rec hx = fn (xs: int list) -> fn (acc: str) ->
+        (match xs with Nil -> acc | Cons (h, t) -> hx t (if str_eq acc "" then cp_hex h else acc ++ " " ++ cp_hex h)) in
+      hx (cp_fold_seq cp) ""))
+and rxf_set = fn (lst: str) -> fn (extra: RCls list) ->
+  let rec go = fn (xs: str list) ->
+    (match xs with
+     | Nil -> extra
+     | Cons (h, t) -> (if str_eq h "" then go t else Cons (CChr (utf8_enc (str_to_int_base h 16)), go t))) in
+  go (str_split lst ",")
+and rxf_cis = fn (key: str) ->
+  let rec go = fn (xs: str list) ->
+    (match xs with Nil -> (Nil : RNode list) | Cons (h, t) -> Cons (NCharCI (utf8_enc (str_to_int_base h 16)), go t)) in
+  go (str_split key " ")
+and rxf_char = fn (c: str) ->
+  let key = rxf_key c in
+  if str_contains key " " then
+    NAlt (Cons (NClass (rxf_set (rxf_rev key) (Cons (CChr c, Nil)), false, true), Cons (NSeq (rxf_cis key), Nil)))
+  else NCharCI c
+and rxf_node = fn (n: RNode) ->
+  match n with
+  | NCharCI c -> rxf_char c
+  | NClass (items, false, true) ->
+    (let rec multi = fn (xs: RCls list) ->
+       (match xs with
+        | Nil -> (Nil : RNode list)
+        | Cons (CChr c, t) -> (let k = rxf_key c in if str_contains k " " then Cons (NSeq (rxf_cis k), multi t) else multi t)
+        | Cons (_, t) -> multi t) in
+     match multi items with
+     | Nil -> n
+     | alts -> NAlt (Cons (n, alts)))
+  | NSeq xs -> NSeq (rxf_seq xs)
+  | NAlt xs -> NAlt (rxf_list xs)
+  | NRep (b, mn, mx, gr) -> NRep (rxf_node b, mn, mx, gr)
+  | NGroup (b, k, nm) -> NGroup (rxf_node b, k, nm)
+  | NLook (b, ng) -> NLook (rxf_node b, ng)
+  | NAtomic b -> NAtomic (rxf_node b)
+  | NCond (k, a, b) -> NCond (k, rxf_node a, rxf_node b)
+  | NAbsent b -> NAbsent (rxf_node b)
+  | _ -> n
+and rxf_list = fn (xs: RNode list) ->
+  match xs with Nil -> (Nil : RNode list) | Cons (h, t) -> Cons (rxf_node h, rxf_list t)
+// a run of /i characters spelling a multi-character fold: the run, or one
+// character that folds to it (three first, then two)
+and rxf_seq = fn (xs: RNode list) ->
+  match xs with
+  | Cons (x1, Cons (x2, Cons (x3, t))) when (let r = rxf_run3 x1 x2 x3 in if str_eq r "" then false else true) ->
+    Cons (NAlt (Cons (NSeq (Cons (x1, Cons (x2, Cons (x3, Nil)))),
+                Cons (NClass (rxf_set (rxf_run3 x1 x2 x3) Nil, false, true), Nil))), rxf_seq t)
+  | Cons (x1, Cons (x2, t)) when (let r = rxf_run2 x1 x2 in if str_eq r "" then false else true) ->
+    Cons (NAlt (Cons (NSeq (Cons (x1, Cons (x2, Nil))),
+                Cons (NClass (rxf_set (rxf_run2 x1 x2) Nil, false, true), Nil))), rxf_seq t)
+  | Cons (h, t) -> Cons (rxf_node h, rxf_seq t)
+  | Nil -> Nil
+// one member of such a run, by its fold: an /i character, or a character
+// with no case at all (a combining mark is read as itself either way); ""
+// for anything else -- a cased character outside /i must stay exact
+and rxf_member = fn (x: RNode) ->
+  match x with
+  | NCharCI c -> (let k = rxf_key c in if str_contains k " " then "" else k)
+  // (/i's `s` and `k` are a class of their case forms -- ſ, the Kelvin sign
+  //  -- and stand for the letter here)
+  | NClass (Cons (CChr c, Cons (CChr _, Cons (CChr _, Nil))), false, false) when str_eq c "s" || str_eq c "k" -> rxf_key c
+  | NChar c ->
+    (match utf8_cp_strict c 0 with
+     | (cp, _, _) -> (if cp > 127 && cp_upcase cp == cp && cp_downcase cp == cp
+                      && (match cp_fold_seq cp with Cons (f, Nil) -> f == cp | _ -> false)
+                      then cp_hex cp else ""))
+  | _ -> ""
+// the set of characters a run of two / three members spells, or ""; a run
+// needs at least one /i character in it
+and rxf_run2 = fn (x1: RNode) -> fn (x2: RNode) ->
+  let a = rxf_member x1 in let b = rxf_member x2 in
+  if str_eq a "" || str_eq b "" || (if rxf_has_ci x1 || rxf_has_ci x2 then false else true) then "" else rxf_rev (a ++ " " ++ b)
+and rxf_run3 = fn (x1: RNode) -> fn (x2: RNode) -> fn (x3: RNode) ->
+  let a = rxf_member x1 in let b = rxf_member x2 in let c = rxf_member x3 in
+  if str_eq a "" || str_eq b "" || str_eq c "" || (if rxf_has_ci x1 || rxf_has_ci x2 || rxf_has_ci x3 then false else true) then ""
+  else rxf_rev (a ++ " " ++ b ++ " " ++ c)
+and rxf_has_ci = fn (x: RNode) ->
+  match x with
+  | NCharCI _ -> true
+  | NClass (Cons (CChr c, Cons (CChr _, Cons (CChr _, Nil))), false, false) -> str_eq c "s" || str_eq c "k"
+  | _ -> false
 
 // \1 .. \999: onigmo's reading of a backslash and digits. The whole number
 // is a BACKREFERENCE when it is at most 9 or names a group already opened

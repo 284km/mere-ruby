@@ -691,7 +691,8 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
     else if str_eq c "/" && regex_position s i then
       // a minimal regex literal. With #{...} interpolation it desugars to
       // (string-concat).__regex("flags"); otherwise a plain TRegex token.
-      let (lit, fl0, j) = scan_regex s (i + 1) "" in
+      let (lit0, fl0, j) = scan_regex s (i + 1) "" in
+      let lit = rx_cm_rewrite lit0 (str_contains fl0 "x") in
       let fl = rx_one_enc_flag fl0 in
       let _ = rx_escapes_check lit fl in
       if rx_has_interp lit 0 || rx_has_dvar lit 0 then
@@ -720,7 +721,8 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // re-scanned keeping backslashes (%r?\?? is the regex /\?/, so the
       // escape must survive into the pattern, unlike %q string unescaping).
       else if str_eq (char_at s (i + 1)) "r" then
-        (let (rlit, rj) = scan_pct_regex s b 1 "" opener (pct_close_of opener) in
+        (let (rlit0, rj) = scan_pct_regex s b 1 "" opener (pct_close_of opener) in
+         let rlit = rx_cm_rewrite rlit0 (str_contains (substring s rj (skip_regex_flags s rj)) "x") in
          let fj = skip_regex_flags s rj in
          let fl = rx_one_enc_flag (substring s rj fj) in
          let _ = rx_escapes_check rlit fl in
@@ -1798,6 +1800,25 @@ and rx_src_enc_wrap = fn (e: Expr) -> fn (lit: str) -> fn (fl: str) ->
        (let en = (if str_eq cd "US-ASCII" || str_eq cd "ASCII" || str_eq cd "USASCII" || str_eq cd "ASCII-8BIT" || str_eq cd "BINARY" then "ASCII-8BIT" else cd) in
         EMethod (e, "__rx_enc~" ++ en, Nil))
      | _ -> e)
+// rb_reg_preprocess's refusal of a pattern that is not UTF-8 and holds both
+// a \u escape and a raw non-ASCII byte: named by whichever came first --
+// "UTF-8 character in non UTF-8 regexp" after a raw byte, "non ASCII
+// character in UTF-8 regexp" after a \u. "" when there is no such mix.
+and rx_u_mix_why = fn (p: str) -> fn (enc: str) ->
+  if enc_utf8_family enc then ""
+  else
+    (let n = str_len p in
+     let rec go = fn (i: int) -> fn (seen: int) ->
+       // seen: 0 nothing yet, 1 a raw byte first, 2 a \u first
+       if i >= n then ""
+       else if ord (char_at p i) >= 128 then
+         (if seen == 2 then "non ASCII character in UTF-8 regexp" else go (i + 1) (if seen == 0 then 1 else seen))
+       else if str_eq (char_at p i) "\\" && i + 1 < n then
+         (if str_eq (char_at p (i + 1)) "u" then
+            (if seen == 1 then "UTF-8 character in non UTF-8 regexp" else go (i + 2) (if seen == 0 then 2 else seen))
+          else go (i + 2) seen)
+       else go (i + 1) seen in
+     go 0 0)
 and rx_src_nonascii = fn (p: str) -> fn (i: int) ->
   if i >= str_len p then false
   else if ord (char_at p i) >= 128 then true
@@ -2411,6 +2432,82 @@ and scan_regex = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
        (acc, substring s (i + 1) fj, fj))
     else scan_regex s (i + 1) (acc ++ c)
 
+// ⚠ A REGEXP LITERAL'S control and meta escapes are bytes by the time the
+//   engine sees them: ruby's lexer writes `\cA`, `\C-a`, `\M-a`, `\c\xFF`,
+//   `\M-\C-a` as `\x01`, `\x01`, `\xE1`, `\x9F`, `\x81` (that is what
+//   #source shows), and only then is the pattern compiled. Handed on as
+//   written, `/\c\xFF/` never matched "\c\xFF" (test_regexp's
+//   test_match_control_meta_escape). One escape: (value, next index), or
+//   (-1, i) when it is not a control/meta form.
+and rx_cm_one = fn (s: str) -> fn (i: int) ->
+  let n = str_len s in
+  if i + 1 >= n || (if str_eq (char_at s i) "\\" then false else true) then (0 - 1, i)
+  else
+    let c = char_at s (i + 1) in
+    if str_eq c "c" then rx_cm_ctrl s (i + 2) i
+    else if str_eq c "C" && i + 2 < n && str_eq (char_at s (i + 2)) "-" then rx_cm_ctrl s (i + 3) i
+    else if str_eq c "M" && i + 2 < n && str_eq (char_at s (i + 2)) "-" then
+      (match rx_cm_atom s (i + 3) with
+       | (v, k) -> (if v < 0 then (0 - 1, i) else (rx_cm_or80 v, k)))
+    else (0 - 1, i)
+and rx_cm_or80 = fn (v: int) -> if v >= 128 then v else v + 128
+// ctrl: `?` is DEL, anything else keeps bits 0x9F (ruby's `c & 0x9f`)
+and rx_cm_ctrl = fn (s: str) -> fn (j: int) -> fn (i: int) ->
+  (match rx_cm_atom s j with
+   | (v, k) ->
+     if v < 0 then (0 - 1, i)
+     else if v == 63 then (127, k)
+     else (rx_cm_and9f v, k))
+and rx_cm_and9f = fn (v: int) ->
+  // v & 0x9f, written with the arithmetic there is: drop bits 0x20 and 0x40
+  let b5 = (v / 32) - (v / 64) * 2 in
+  let b6 = (v / 64) - (v / 128) * 2 in
+  v - b5 * 32 - b6 * 64
+// what follows a control/meta prefix: a nested prefix, a \xHH, an escaped
+// character, or one plain byte
+and rx_cm_atom = fn (s: str) -> fn (j: int) ->
+  let n = str_len s in
+  if j >= n then (0 - 1, j)
+  else if str_eq (char_at s j) "\\" && j + 1 < n then
+    (let c = char_at s (j + 1) in
+     if str_eq c "c" || ((str_eq c "C" || str_eq c "M") && j + 2 < n && str_eq (char_at s (j + 2)) "-") then rx_cm_one s j
+     else if str_eq c "x" && j + 2 < n && rx_cm_hexd (char_at s (j + 2)) >= 0 then
+       (if j + 3 < n && rx_cm_hexd (char_at s (j + 3)) >= 0
+        then (rx_cm_hexd (char_at s (j + 2)) * 16 + rx_cm_hexd (char_at s (j + 3)), j + 4)
+        else (rx_cm_hexd (char_at s (j + 2)), j + 3))
+     else if str_eq c "\\" then (92, j + 2)
+     else (0 - 1, j))
+  else (ord (char_at s j), j + 1)
+and rx_cm_hexd = fn (c: str) ->
+  let o = ord c in
+  if o >= 48 && o <= 57 then o - 48 else if o >= 65 && o <= 70 then o - 55 else if o >= 97 && o <= 102 then o - 87 else 0 - 1
+// the literal with every control/meta escape written as \xHH (outside an
+// interpolation, which is code, and outside a comment: `(?# ...)`, and under
+// /x a `#` outside a class to the end of the line -- ruby leaves those alone,
+// `# e.g. \M-ca` included, Bug #18294)
+and rx_cm_rewrite = fn (s: str) -> fn (xm: bool) ->
+  if (if str_contains s "\\c" || str_contains s "\\C-" || str_contains s "\\M-" then false else true) then s
+  else
+    (let n = str_len s in
+     let hx = "0123456789ABCDEF" in
+     let upto = fn (i: int) -> fn (c: str) -> (let j = str_find_from s c i in if j < 0 then n else j + 1) in
+     let rec go = fn (i: int) -> fn (acc: str) -> fn (incls: bool) ->
+       if i >= n then acc
+       else if str_eq (char_at s i) "#" && i + 1 < n && str_eq (char_at s (i + 1)) "\{" then
+         (let close = find_close_brace s (i + 2) 0 in go (close + 1) (acc ++ substring s i (close + 1)) incls)
+       else if str_eq (char_at s i) "\\" && i + 1 < n then
+         (match rx_cm_one s i with
+          | (v, k) ->
+            if v < 0 then go (i + 2) (acc ++ substring s i (i + 2)) incls
+            else go k (acc ++ "\\x" ++ char_at hx (v / 16) ++ char_at hx (v - (v / 16) * 16)) incls)
+       else if incls then go (i + 1) (acc ++ char_at s i) (if str_eq (char_at s i) "]" then false else true)
+       else if str_eq (char_at s i) "[" then go (i + 1) (acc ++ "[") true
+       else if str_eq (char_at s i) "(" && i + 2 < n && str_eq (char_at s (i + 1)) "?" && str_eq (char_at s (i + 2)) "#" then
+         (let e = upto (i + 3) ")" in go e (acc ++ substring s i e) false)
+       else if xm && str_eq (char_at s i) "#" then
+         (let e = upto (i + 1) "\n" in go e (acc ++ substring s i e) false)
+       else go (i + 1) (acc ++ char_at s i) false in
+     go 0 "" false)
 // ⚠ A RUN OF \xNN ESCAPES MUST BE WHOLE CHARACTERS of the literal's encoding
 //   (/e EUC-JP, /s Windows-31J, /u and no flag UTF-8; /n takes any byte):
 //   ruby refuses `/\xc2/e` and `/\xc2#{ }/e` at parse time with "too short
