@@ -18403,8 +18403,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // starts, while accepting loses only a handler that could never fire. The
     // limit is written down in KNOWN_GAPS rather than hidden.
     else if str_eq c "Signal" && ((str_len name == 4 && str_eq name "trap") || (str_len name == 4 && str_eq name "list") || (str_len name == 7 && str_eq name "signame")) then
+      // (its keys are the same String objects every time, as ruby's
+      //  fstrings are: test_signal compares their object_ids)
       (if (str_len name == 4 && str_eq name "list") then
-         mkhash (signal_list_pairs ())
+         mkhash (signal_list_pairs_kept ())
        else if (str_len name == 7 && str_eq name "signame") then
          // (a non-Integer converts with #to_int)
          (match coerce_int_args env world args with
@@ -18924,6 +18926,19 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // second of `kill(sig, a, b)` was never signalled, and its child waited
     // for ever) and a group signal was "unsupported".
     else if str_eq c "Process" && (str_len name == 4 && str_eq name "kill") then
+      // (the signal is an Integer, a String or a Symbol -- an object with
+      //  #to_str is its String -- and anything else "bad signal type")
+      // (raise_exc records and comes back: nothing may run after it here)
+      let bad9 = (match args with
+                  | Cons (VObj so9, _) ->
+                    (match invoke_val_c env world blk (VObj so9) "respond_to?" (Cons (VSym "to_str", Nil)) false with
+                     | VBool true -> "" | _ -> class_name (VObj so9))
+                  | Cons (VNil, _) -> "NilClass"
+                  | _ -> "") in
+      if str_len bad9 > 0 then raise_exc world "ArgumentError" ("bad signal type " ++ bad9) else
+      let args = (match args with
+                  | Cons (VObj so9, rest9) -> Cons (invoke_val_c env world blk (VObj so9) "to_str" Nil false, rest9)
+                  | _ -> args) in
       (match args with
        | Cons (sig0, pids0) when (match pids0 with Nil -> false | _ -> true) ->
          (let (grp9, sig9) = (match sig0 with
@@ -18965,7 +18980,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 each t9 (n + 1))
              | Cons (o9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name o9 ++ " into Integer")) in
           each pids9 0)
-       | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
+       | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 2+)"))
     // remove_const(:Name) deletes the constant, returning its value.
     else if (str_len name == 12 && str_eq name "remove_const") then
       (match args with
@@ -24020,6 +24035,16 @@ and proc_kill_one = fn env -> fn world -> fn (sig9: Val) -> fn (pid9: int) ->
                         | VStr h9 -> sget h9
                         | VSym y9 -> y9
                         | _ -> "") then VInt 1
+          // ...and one whose default action is to do nothing (CONT, CHLD,
+          // URG, WINCH, INFO) does nothing when nothing trapped it: it was
+          // raised as a SignalException, and the process died of SIGCONT
+          else if (pid9 == getpid () || pid9 == 0)
+                  && (let nm9 = signal_short (match sig9 with
+                                              | VInt k9 -> signal_name_of k9
+                                              | VStr h9 -> sget h9
+                                              | VSym y9 -> y9
+                                              | _ -> "") in
+                      str_eq nm9 "CONT" || str_eq nm9 "CHLD" || str_eq nm9 "URG" || str_eq nm9 "WINCH" || str_eq nm9 "INFO") then VInt 1
           // ⚠ ...and SIGINT's default handler raises INTERRUPT, not a
           //   SignalException: `rescue Interrupt` around a self-kill caught
           //   nothing. Its message is empty (ruby's, measured).
@@ -24092,6 +24117,21 @@ and signal_arg_name = fn env -> fn world -> fn (v: Val) ->
         | VStr h9 -> signal_arg_named world (sget h9)
         | _ -> raise_exc_str world "ArgumentError" ("bad signal type " ++ class_name v))
      else raise_exc_str world "ArgumentError" ("bad signal type " ++ class_name v))
+and signal_list_pairs_kept = fn (u: unit) ->
+  // (held in gc_hold, which the collector scans: a map of its own was no
+  //  root, and the kept Array was collected and its handle reused)
+  (match (if map_has gc_hold "sig_list" then map_get gc_hold "sig_list" else VNil) with
+   | VArr a9 -> deref a9
+   | _ ->
+     (let ps9 = signal_list_pairs () in
+      let _ = val_list_iter_freeze ps9 in
+      let _ = map_set gc_hold "sig_list" (arr_new ps9) in
+      ps9))
+and val_list_iter_freeze = fn (xs: Val list) ->
+  match xs with
+  | Nil -> ()
+  | Cons (VStr h9, t9) -> (let _ = sfrozen_set h9 in val_list_iter_freeze t9)
+  | Cons (_, t9) -> val_list_iter_freeze t9
 and signal_arg_named = fn world -> fn (nm0: str) ->
   let nm = signal_short nm0 in
   if str_eq nm "EXIT" || signal_num_of nm > 0 then nm
@@ -36371,6 +36411,10 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
      //   has its own) can share the shape, and `SignalException.new` reached
      //   here with nil and was reported as an unsupported signal.
      | Cons (VNil, _) -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)"
+     // (a leading "-" names a process group to kill(2), and is no signal:
+     //  "negative signal name: -SIGEXIT")
+     | Cons (VStr nh9, _) when str_len (sget nh9) > 0 && str_eq (char_at (sget nh9) 0) "-" ->
+       raise_exc world "ArgumentError" ("negative signal name: " ++ sget nh9)
      | Cons (v9, _) ->
        (let (num9, nm9) =
           (match v9 with
