@@ -35767,9 +35767,9 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   else if (str_len name == 4 && str_eq name "load") && (match args with Cons (_, _) -> true | Nil -> false)
           && (if self_defines env world name then false else true) then
     (match args with
-     | Cons (a9, _) ->
+     | Cons (a9, rest9) ->
        (match to_path_str noblk world a9 with
-        | VStr ph -> rb_load env world (sget ph)
+        | VStr ph -> rb_load env world (sget ph) (match rest9 with Cons (w9, _) -> w9 | Nil -> VNil)
         | _ -> raise_exc world "TypeError"
                  ("no implicit conversion of " ++ conv_gives_name a9 ++ " into String"))
      | Nil -> VNil)
@@ -36156,6 +36156,11 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
               let d = (if str_len d0 > 0 && str_eq (char_at d0 0) "/" then d0
                        else if str_eq d0 "." then env_get "PWD"
                        else env_get "PWD" ++ "/" ++ d0) in
+              // from the REAL file the call is in: a script run through a
+              // symlink requires its own siblings, not the link's
+              // ([ruby-dev:40040]; ruby's rb_current_realfilepath)
+              let fa = path_norm (d ++ "/" ++ basename_of (sget fh)) in
+              let d = (if is_reg_file fa then dirname_of (feat_realpath fa) else d) in
               mkstr (d ++ "/" ++ p)))
      | _ -> VNil)
   else if ((str_len name == 17 && str_eq name "__builtin_require") || (str_len name == 26 && str_eq name "__builtin_require_relative")) &&
@@ -38613,7 +38618,12 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
 
 // Kernel#load: run the file (no .rb auto-append, no dedup); resolves against
 // the $LOAD_PATH, then the current dir. Returns true.
-and rb_load = fn env -> fn world -> fn (p0: str) ->
+// `wrap` (the second argument): a Module runs the file inside it, anything
+// truthy inside a new anonymous one -- its constants and classes are the
+// module's, and its top-level defs the module's PRIVATE methods (they leaked
+// onto main and Object; note 361). self is the module here, where ruby's is
+// a copy of main extended by it.
+and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
   let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> sget d | _ -> ".") else ".") in
   let full = if str_len p0 > 0 && str_eq (char_at p0 0) "/" then p0
              else if str_len p0 >= 2 && (str_eq (substring p0 0 2) "./" || (str_len p0 >= 3 && str_eq (substring p0 0 3) "../")) then
@@ -38626,17 +38636,45 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
      let cod = src_coding src in
      let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
      let _ = map_set load_ctx "parsing" (mkstr full) in
-     let toks = number_nls src (lex_src src) in
-     let _ = parse_line_reset (count_nls toks) in
-     let (prog2, rest2) = parse_stmts toks Nil in
+     // ⚠ a file that does not parse is a SyntaxError, as require's is: the
+     //   parse failure was a bare `fail`, reported as StandardError
+     let pok = map_new () in
+     let (prog2, rest2) =
+       try_or (fn (u: unit) ->
+                 let toks = number_nls src (lex_src src) in
+                 let _ = parse_line_reset (count_nls toks) in
+                 let r = parse_stmts toks Nil in
+                 let _ = map_set pok "y" 1 in r)
+              (Nil, Nil) in
      let _ = map_set load_ctx "parsing" (mkstr "") in
+     let _ = (if map_has pok "y" then ()
+              else (let _ = (if map_has prim_missing "f" then () else map_set prim_missing "f" (mkstr full)) in
+                    let _ = map_set load_ctx "coding" savedc in
+                    let _ = raise_exc_iv world "SyntaxError"
+                              (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "syntax error") else "syntax error")
+                              (Cons (("__path", mkstr full), Nil)) in ())) in
      let _ = rx_check_pending () in
      let _ = warn_flush world in
      let _ = (match rest2 with
               | Cons (TEOF, _) -> ()
-              | _ -> (let __fm = ("mere-ruby: unexpected token at top level in " ++ full ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)) in
+              | _ -> (let __fm = ("mere-ruby: unexpected token at top level in " ++ full ++ parsing_file ()) in
+                      let _ = map_set load_ctx "coding" savedc in
+                      let _ = raise_exc_iv world "SyntaxError" __fm (Cons (("__path", mkstr full), Nil)) in ())) in
+     let wmod = (match wrap with
+                 | VClass c9 -> c9
+                 | VNil -> ""
+                 | VBool false -> ""
+                 | _ -> (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass "Module") "new" Nil false with
+                         | VClass c9 -> c9 | _ -> "")) in
      let fenv = map_new () in
-     let _ = map_set fenv "self" VMain in
+     let _ = map_set fenv "self" (if str_eq wmod "" then VMain else VClass wmod) in
+     let _ = (if str_eq wmod "" then ()
+              else (let _ = map_set fenv "__vis" (mkstr "private") in
+                    let _ = map_set fenv "__visc" (mkstr wmod) in
+                    map_set fenv "__wrapload" (VBool true))) in
+     let savedlex = lex_pack () in
+     let _ = set_lex wmod in
+     let _ = set_nest wmod in
      let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else mkstr ".") in
      let savedf = (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "") in
      let _ = map_set load_ctx "dir" (mkstr (dirname_of full)) in
@@ -38652,6 +38690,8 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
      let _ = ref_install 0 in
      let f = run_stmts fenv world noblk2 prog2 in
      let _ = ref_install rfprev in
+     let _ = set_lex (pack_cref savedlex) in
+     let _ = set_nest (pack_nest savedlex) in
      let _ = map_set load_ctx "dir" saved in
      let _ = map_set load_ctx "file" savedf in
      let _ = map_set load_ctx "coding" savedc in
@@ -46391,6 +46431,37 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
                    else gc_point world) in
           run_stmts env world blk rest))
 
+// a feature named as it was given, already in $LOADED_FEATURES as an
+// extension library (`$LOADED_FEATURES << "foo.so"` satisfies `require "foo"`).
+// ⚠ NOT "foo.rb": the shipped libraries are entered as "set.rb" before their
+//   source runs, and counting that as loaded skipped the source -- Set was
+//   undefined, and pp (test/unit's first require) died with a NameError.
+//   A ".rb" feature is the path search's question, below.
+and lf_has_bare = fn (p0: str) ->
+  (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
+   | VArr lfid ->
+     (let rec has9 = fn (xs: Val list) ->
+        (match xs with
+         | Nil -> false
+         | Cons (VStr h9, t9) -> (let f9 = sget h9 in str_eq f9 (p0 ++ ".so") || str_eq f9 (p0 ++ ".bundle") || has9 t9)
+         | Cons (_, t9) -> has9 t9) in
+      has9 (deref lfid))
+   | _ -> false)
+// the $LOAD_PATH a require searches, each entry converted as a path is
+// (#to_path, then #to_str) at the time of the require, and the array itself
+// left as the program wrote it (test_require's
+// test_require_to_str_redefined_in_load_path / test_require_not_modified_load_path:
+// an object on $: was skipped)
+and load_path_find_conv = fn env -> fn world -> fn (p1: str) ->
+  (match (if map_has globals (gvar_slot "LOAD_PATH") then map_get globals (gvar_slot "LOAD_PATH") else VNil) with
+   | VArr aid ->
+     (let rec conv9 = fn (xs: Val list) ->
+        (match xs with
+         | Nil -> (Nil : Val list)
+         | Cons (VStr h9, t9) -> Cons (VStr h9, conv9 t9)
+         | Cons (v9, t9) -> Cons (mkstr (require_path_of env world v9), conv9 t9)) in
+      load_path_go (conv9 (deref aid)) p1)
+   | _ -> "")
 // The loader behind `require` / `require_relative`: resolve the path, run the
 // file once, and record it. Reached through Kernel#require (see SRequire), so
 // a replaced `require` can still get here by calling the original.
@@ -46411,6 +46482,14 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
   else
      let p1 = if ends_with_rb p0 then p0 else p0 ++ ".rb" in
      let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> let d = sget d in d | _ -> ".") else ".") in
+     // require_relative goes from the REAL file the call is in: a script run
+     // through a symlink requires its own siblings, not the link's
+     // ([ruby-dev:40040]; ruby's rb_current_realfilepath)
+     let dir = (if rel then
+                  (let cf9 = (if map_has load_ctx "file" then (match map_get load_ctx "file" with VStr h9 -> sget h9 | _ -> "") else "") in
+                   let cfa9 = (if str_len cf9 > 0 && str_eq (char_at cf9 0) "/" then cf9 else path_norm (env_get "PWD" ++ "/" ++ cf9)) in
+                   if str_len cf9 > 0 && is_reg_file cfa9 then dirname_of (feat_realpath cfa9) else dir)
+                else dir) in
      // A library mere-ruby SHIPS is its implementation of that feature (see
      // stdlib_src, and the `shipped` use below): the source that runs comes
      // from the binary, not from any file. Compute it ONCE, here, because it
@@ -46423,6 +46502,10 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                     if (if str_eq s9 "" then false else true) then s9
                     else (let j9 = json_lib_src p0 in
                           if (if str_eq j9 "" then false else true) then j9 else json_ext_src p0)) in
+     // (a shipped library's own "pathname.so" entry is set before its source
+     // runs, so lf_has_bare is asked only of the others)
+     if (if rel then false else true) && (if ends_with_rb p0 then false else true) && str_eq shipped "" && lf_has_bare p0 then FNext (VBool false)
+     else
      // ...and where that fiction lives. m_driver seeds it beside RbConfig's
      // `rubylibdir`, which is the same fiction told to ruby code; one owner,
      // one value. Absent, this falls through to the behaviour below rather
@@ -46455,8 +46538,12 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                   env_get "PWD" ++ "/" ++ p1
                 else if (if str_eq shipped "" then false else true) && (if str_eq sdir "" then false else true) then
                   sdir ++ "/" ++ p1
-                else (let hit = load_path_find world p1 in
-                      if str_eq hit "" then dir ++ "/" ++ p1 else hit) in
+                // ⚠ not found on the $LOAD_PATH is not found: it fell back to
+                //   the REQUIRING FILE's directory, so `require "x/t.rb"`
+                //   found a file beside the program with no "." on $:
+                //   (ruby raises LoadError -- test_require's test_relative)
+                else (let hit = load_path_find_conv env world p1 in
+                      if str_eq hit "" then "/.mere-ruby-not-found/" ++ p1 else hit) in
      // ...and then CANONICALISED, because this one string is the whole
      // identity of a feature: it keys loaded_files, it is the entry pushed
      // onto $LOADED_FEATURES, and it is what is opened and read. Built by
@@ -46477,7 +46564,14 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                  if str_len n0 > 0 && str_eq (char_at n0 0) "/" then n0
                  else path_norm (env_get "PWD" ++ "/" ++ n0)) in
      let _ = (if gc_log_on () then print_err ("gc: require " ++ full) else ()) in
-     if feature_loaded full then FNext (VBool false)
+     // ...and the same file reached by another name (a symlink) is the same
+     // feature: ruby keeps the realpath of every loaded feature beside
+     // $LOADED_FEATURES (bug17885 -- b/b.rb on $: and a/b.rb by
+     // require_relative ran one body twice). Asked through the name it was
+     // loaded under, so a $LOADED_FEATURES the program rewrote still decides.
+     if feature_loaded full then FNext (VBool false) else
+     let rpf = (if is_reg_file full then feat_realpath full else full) in
+     if map_has feat_rpaths rpf && feature_loaded (map_get feat_rpaths rpf) then FNext (VBool false)
      // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
      // mere-ruby has no build to describe, so RbConfig::CONFIG is seeded at
      // startup and the require is satisfied here rather than searched for.
@@ -46508,11 +46602,24 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      else if (if is_reg_file full then false else true) && str_eq shipped "" then
        (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in
         FRaise (raise_exc world "LoadError" ("cannot load such file -- " ++ p0)))
+     // a frozen $LOADED_FEATURES cannot take the feature: refused before
+     // anything runs (it was a LoadError for the file)
+     else if (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
+              | VArr lfid -> val_frozen_mut (VArr lfid) | _ -> false) then
+       FRaise (raise_exc world "RuntimeError" "$LOADED_FEATURES is frozen; cannot append feature")
      else
        let _ = map_set loaded_files full VNil in
+       let _ = map_set feat_rpaths rpf full in
        let _ = (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
                 | VArr lfid -> arr_set lfid (list_append (deref lfid) (Cons (mkstr full, Nil)))
                 | _ -> ()) in
+       // a file that cannot be parsed did not load: taken back out, so the
+       // next require tries again (and raises again) -- it answered false
+       let unmark9 = fn (u: unit) ->
+         (let _ = map_delete loaded_files full in
+          match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
+          | VArr lfid -> arr_set lfid (vals_without (deref lfid) full)
+          | _ -> ()) in
        // A DIFFERENT NAME for a body that has already run. The feature is new
        // -- it was just pushed onto $LOADED_FEATURES above and this require
        // answers true, exactly as ruby does for `require "digest"` followed by
@@ -46559,6 +46666,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        // nothing to answer with.
        let _ = if map_has pok "y" then () else
                  (let _ = (if map_has prim_missing "f" then () else map_set prim_missing "f" (mkstr full)) in
+                  let _ = unmark9 () in
                   let _ = raise_exc_iv world "SyntaxError"
                             (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "syntax error") else "syntax error")
                             (Cons (("__path", mkstr full), Nil)) in ()) in
@@ -46567,6 +46675,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let _ = (match rest2 with
                 | Cons (TEOF, _) -> ()
                 | _ -> (let __fm = ("mere-ruby: unexpected token at top level in " ++ full ++ parsing_file ()) in
+                        let _ = unmark9 () in
                         let _ = raise_exc_iv world "SyntaxError" __fm (Cons (("__path", mkstr full), Nil)) in ())) in
        // the required file runs with its own top-level locals but the
        // same world (classes/methods/consts/globals are shared).
@@ -47388,6 +47497,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   // top-level def stays where it is, reachable only without a receiver.
   | SVis (mode, Nil) when str_eq mode "private_constant" || str_eq mode "public_constant" ->
     let _ = rb_warning world (mode ++ " with no argument is just ignored") in FNext VNil
+  // in a WRAPPED load (load(file, true) / load(file, mod)) the top level's
+  // `private :m` / `public :m` act on the wrapper module, and ruby says so
+  // under -w (they marked Object's entries)
+  | SVis (mode, names) when lv_has env "__wrapload" && (str_eq mode "private" || str_eq mode "public")
+                          && (match names with Nil -> false | _ -> true) ->
+    let _ = rb_warning world ("main." ++ mode ++ " in the wrapped load is effective only in wrapper module") in
+    let rec syms9 = fn (ns: str list) -> (match ns with Nil -> (Nil : Val list) | Cons (n9, t9) -> Cons (VSym n9, syms9 t9)) in
+    FNext (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (lv_get env "self") mode (syms9 names) false)
   | SVis (mode, names) ->
     let (meths, sup, ocls, ivars) = world in
     // (bare, inside a METHOD: ruby warns that it sets the mode of the
