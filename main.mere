@@ -3484,6 +3484,28 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           (let _ = (if map_has str_chilled h then map_delete str_chilled h else ()) in
            if str_eq (substring name 10 (str_len name)) "on" then (let _ = sfrozen_set h in str_fstring v) else v)
         | _ -> v))
+    // a regexp literal in a non-UTF-8 source, fixed to the source's encoding
+    // (rx_src_enc_wrap): the FIXEDENCODING shape Regexp.new gives, `u` and the
+    // encoding the value carries
+    else if str_len name > 9 && str_eq (substring name 0 9) "__rx_enc~" then
+      (match eval_e env world blk recv_e with
+       | VRegex (p9, f9, _) ->
+         VRegex (p9, (if str_contains f9 "u" then f9 else f9 ++ "u"), enc_canon_name (substring name 9 (str_len name)))
+       | v9 -> v9)
+    // an INTERPOLATED literal of a non-UTF-8 source (`__lit_denc~`): in a
+    // US-ASCII source it takes the first interpolated piece's other encoding
+    // ("x#\{euc}" is EUC-JP -- rb_str_concat_literals, dstr_ienc); in any
+    // other it is the source's encoding while it is ASCII only (a BINARY
+    // file's heredoc-built source stays BINARY), else what the pieces made
+    else if str_len name > 11 && str_eq (substring name 0 11) "__lit_denc~" then
+      (let cd = enc_canon_name (substring name 11 (str_len name)) in
+       let v = eval_e env world blk recv_e in
+       let cd = (if str_eq cd "US-ASCII" && map_has dstr_ienc "v" && (if str_eq (map_get dstr_ienc "v") "" then false else true)
+                 then map_get dstr_ienc "v" else cd) in
+       let tag = (if str_eq (enc_find_canon cd) "" then cd else enc_find_canon cd) in
+       (match v with
+        | VStr h -> (if str_eq cd "US-ASCII" || str_is_ascii h then (let _ = senc_set h tag in v) else v)
+        | _ -> v))
     else if str_len name > 10 && str_eq (substring name 0 10) "__lit_enc~" then
       (let cd = enc_canon_name (substring name 10 (str_len name)) in
        // under --enable-frozen-string-literal the bare literal below comes
@@ -16411,6 +16433,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // `Regexp.new("a".encode("ISO-8859-1"), Regexp::FIXEDENCODING)` is an
           // ISO-8859-1 pattern even though every byte in it is ASCII.
           let renc9 = (if str_contains fl "u" then enc_canon_name (senc_get src) else rx_one_enc (VStr src)) in
+          // ...and an ASCII-only source that NAMES a non-ASCII character by
+          // escape (`'\xc2\xa1'`, `'\p{Hiragana}'`) is fixed to its string's
+          // encoding when that is neither UTF-8 nor US-ASCII, as ruby's
+          // rb_reg_preprocess leaves it (it read as UTF-8 here)
+          let (renc9, fl) =
+            (let se9 = enc_canon_name (senc_get src) in
+             if str_eq renc9 "" && (if str_eq se9 "UTF-8" || str_eq se9 "US-ASCII" then false else true)
+                && enc_ascii_compat se9
+                && (match rx_kinds body 0 false false with (_, ho9) -> ho9 || str_contains body "\\p\{" || str_contains body "\\P\{")
+             then (se9, (if str_contains fl "u" then fl else fl ++ "u"))
+             else (renc9, fl)) in
           // ...and a pattern that does not parse is refused with the reason,
           // "premature end of char-class: /^[$/" as ruby words it
           let _ = rx_wq_take () in
@@ -23374,16 +23407,33 @@ and uses_it_clauses = fn (clauses: (Expr * Stmt list) list) ->
   | Nil -> false
   | Cons ((c, b), rest) -> uses_it_expr c || uses_it_stmts b || uses_it_clauses rest
 // the pieces of an interpolated string (see the EBin arm of eval_e)
-and dstr_piece = fn (e: Expr) ->
+// a literal piece of an interpolated string, through the tags a literal
+// wears (`__lit_enc~X`, its source's encoding; `__lit_fsl~`, its file's
+// frozen_string_literal): (true, text, encoding) -- "" for no tag
+and dstr_lit_of = fn (e: Expr) ->
   match e with
-  | EStrL _ -> true
-  | EMethod (_, m, Nil) -> str_len m == 12 && str_eq m "__interp_str"
-  | _ -> false
+  | EStrL t -> (true, t, "")
+  | EMethod (x, m, Nil) when str_len m > 10 && str_eq (substring m 0 10) "__lit_fsl~" -> dstr_lit_of x
+  | EMethod (x, m, Nil) when str_len m > 10 && str_eq (substring m 0 10) "__lit_enc~" ->
+    (match dstr_lit_of x with
+     | (true, t, _) -> (true, t, (let c9 = enc_canon_name (substring m 10 (str_len m)) in
+                                  if str_eq (enc_find_canon c9) "" then c9 else enc_find_canon c9))
+     | r -> r)
+  | _ -> (false, "", "")
+and dstr_piece = fn (e: Expr) ->
+  match dstr_lit_of e with
+  | (true, _, _) -> true
+  | _ -> (match e with
+          | EMethod (_, m, Nil) -> str_len m == 12 && str_eq m "__interp_str"
+          | _ -> false)
 and dstr_has_interp = fn (e: Expr) ->
-  match e with EMethod (_, _, _) -> true | _ -> false
+  match dstr_lit_of e with
+  | (true, _, _) -> false
+  | _ -> (match e with EMethod (_, _, _) -> true | _ -> false)
 and dstr_spine = fn (e: Expr) ->
   match e with
   | EStrL _ -> true
+  | EMethod (_, _, Nil) when (match dstr_lit_of e with (true, _, _) -> true | _ -> false) -> true
   | EBin (op, l, r) -> str_len op == 1 && str_eq op "+" && dstr_piece r && dstr_spine l
   | _ -> false
 and dstr_has_interp_l = fn (e: Expr) ->
@@ -23397,12 +23447,19 @@ and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     (match x with
      | EBin (_, l, r) -> pieces l (Cons (r, acc))
      | other -> Cons (other, acc)) in
-  let rec go = fn (ps: Expr list) -> fn (acc: str) -> fn (enc: str) ->
+  // (ie: the first INTERPOLATED piece's encoding that is not US-ASCII, which
+  //  a US-ASCII source's literal takes -- rb_str_concat_literals; read by
+  //  the `__lit_enc~` tag through dstr_ienc)
+  let rec go = fn (ps: Expr list) -> fn (acc: str) -> fn (enc: str) -> fn (ie: str) ->
     match ps with
-    | Nil -> (let v = mkstr acc in match v with VStr h -> (let _ = senc_set h enc in v) | _ -> v)
+    | Nil -> (let _ = map_set dstr_ienc "v" ie in
+              let v = mkstr acc in match v with VStr h -> (let _ = senc_set h enc in v) | _ -> v)
     | Cons (p, rest) ->
       (let (t9, e9) = (match p with
                        | EStrL t -> (t, "UTF-8")
+                       // a literal piece through its tags (dstr_lit_of)
+                       | EMethod (_, _, Nil) when (match dstr_lit_of p with (true, _, _) -> true | _ -> false) ->
+                         (match dstr_lit_of p with (_, t, en) -> (t, if str_eq en "" then "UTF-8" else en))
                        | EMethod (x, _, _) ->
                          (match eval_e env world blk x with
                           | VStr h -> (sget h, senc_get h)
@@ -23421,8 +23478,10 @@ and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        if str_eq renc "" then
          (let _ = prim_raise "Encoding::CompatibilityError"
                     ("incompatible character encodings: " ++ enc_msg_name enc ++ " and " ++ enc_msg_name e9) in VNil)
-       else go rest (acc ++ t9) renc) in
-  go (pieces e Nil) "" "UTF-8"
+       else go rest (acc ++ t9) renc
+              (if str_eq ie "" && (match dstr_lit_of p with (true, _, _) -> false | _ -> true) && (if str_eq (enc_canon_name e9) "US-ASCII" then false else true)
+               then enc_canon_name e9 else ie)) in
+  go (pieces e Nil) "" "UTF-8" ""
 // does the program redefine + - or * on a class a Complex's parts can be?
 and cpx_ops_redef = fn world ->
   let rec cls = fn (cs: str list) ->
@@ -27486,15 +27545,12 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
      | VStr h ->
        let sv = sget h in
        (match args with
-        | Cons (VRegex (p, pf, _), rest) ->
-          // a regexp whose SOURCE bytes are not valid UTF-8 was compiled in
-          // another encoding: matching it against a UTF-8 string is ruby's
-          // CompatibilityError (the exact foreign encoding is not tracked).
-          let _ = (if str_eq (enc_canon_name (senc_get h)) "UTF-8" && enc_valid_utf8 sv
-                      && (if enc_valid_utf8 p then false else true)
-                   then (let _ = prim_raise "Encoding::CompatibilityError"
-                                   ("incompatible encoding regexp match (EUC-JP regexp with UTF-8 string)") in ())
-                   else ()) in
+        | Cons (VRegex (p, pf, pev), rest) ->
+          // the regexp and the string must agree on an encoding, as for =~
+          // (rx_enc_guard): `e("\xa1\xa2").index(Regexp.new(a("\xc2\xa1")))`
+          // is a BINARY regexp with an EUC-JP string. (This guessed from the
+          // pattern's bytes alone, and named EUC-JP whatever they were.)
+          let _ = rx_enc_guard world (VRegex (p, pf, pev)) recv in
           let cn = utf8_len sv in
           let n = str_len sv in
           if (str_len name == 5 && str_eq name "index") || (str_len name == 9 && str_eq name "byteindex") then
@@ -34824,6 +34880,13 @@ and kernel_conv_fn0 = fn env -> fn world -> fn (name: str) -> fn (args: Val list
              | VNil -> (match v with
                         | VObj _ -> raise_exc world "TypeError"
                                       ("can't convert " ++ class_name v ++ " into String")
+                        // (a builtin value converts here: its text is
+                        //  US-ASCII as its #to_s is -- String(10), String(nil))
+                        | VInt _ -> ascii_tag_v (mkstr (to_s v))
+                        | VFlt _ -> ascii_tag_v (mkstr (to_s v))
+                        | VBig _ -> ascii_tag_v (mkstr (to_s v))
+                        | VNil -> ascii_tag_v (mkstr (to_s v))
+                        | VBool _ -> ascii_tag_v (mkstr (to_s v))
                         | _ -> mkstr (to_s v))
              | other -> raise_exc world "TypeError"
                           ("can't convert " ++ class_name v ++ " to String ("
@@ -35363,11 +35426,24 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     (if str_eq typ "X" || str_eq typ "B" then ascii_up body else body)
   else if str_eq typ "s" then
     let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-    let s0 = (match av with
-              | VStr h -> sget h
-              | _ -> (match invoke_val_c env world nb av "to_s" Nil false with VStr h2 -> sget h2 | other -> to_s other)) in
-    let s = (if pset && prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
-    rb_pad_str s flags width
+    let (s0, se0) = (match av with
+              | VStr h -> (sget h, enc_canon_name (senc_get h))
+              | _ -> (match invoke_val_c env world nb av "to_s" Nil false with
+                      | VStr h2 -> (sget h2, enc_canon_name (senc_get h2))
+                      | other -> (to_s other, "UTF-8"))) in
+    // width and precision count CHARACTERS OF THE STRING'S ENCODING -- bytes
+    // for BINARY (`"%10s" % "\xc2\xa1".b` is eight spaces), EUC-JP's
+    // characters for EUC-JP; they were UTF-8's for every string
+    let se = (if str_eq se0 "" then "UTF-8" else se0) in
+    if str_eq se "UTF-8" || (if enc_ascii_compat se then false else true) then
+      (let s = (if pset && prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
+       rb_pad_str s flags width)
+    else
+      (let s = (if pset && prec >= 0 && es_len s0 se > prec then substring s0 0 (es_boff s0 se prec) else s0) in
+       let len9 = es_len s se in
+       if width <= len9 then s
+       else if str_contains flags "-" then s ++ str_repeat " " (width - len9)
+       else str_repeat " " (width - len9) ++ s)
   else if str_eq typ "p" then
     let s0 = inspect_w env world av in
     let s = (if pset && prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
@@ -35379,7 +35455,13 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     //   `"%c" % [[]]` is "no implicit conversion of Array into Integer". An
     //   Array was taken apart here and its first element printed.
     let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-    let first_ch = fn (s0: str) -> (if str_len s0 == 0 then "" else utf8_substr s0 0 1) in
+    // (the first CHARACTER of the string's own encoding: "%c" % sjis("あい")
+    //  is the two bytes of あ, not the one byte UTF-8 would read off)
+    let first_ch = fn (s0: str) -> fn (e0: str) ->
+      (if str_len s0 == 0 then ""
+       else (let e9 = enc_canon_name e0 in
+             if str_eq e9 "" || enc_utf8_family e9 || (if enc_ascii_compat e9 then false else true) then utf8_substr s0 0 1
+             else substring s0 0 (es_boff s0 e9 1))) in
     // an Integer is a codepoint in the FORMAT's encoding (sprintf.c's
     // rb_enc_codelen): a US-ASCII / BINARY format takes a byte up to 255 and
     // calls more "out of char range", the byte-oriented encodings take the
@@ -35400,12 +35482,12 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
           else (let _ = prim_raise "ArgumentError" "invalid character" in ""))
        else utf8_enc cp) in
     let s = (match av with
-      | VStr h -> first_ch (sget h)
+      | VStr h -> first_ch (sget h) (senc_get h)
       | VInt cp -> cp_ch cp
       | _ ->
         let ts = (if responds world av "to_str" then invoke_val_c env world nb av "to_str" Nil false else VNil) in
         (match ts with
-         | VStr h -> first_ch (sget h)
+         | VStr h -> first_ch (sget h) (senc_get h)
          | _ ->
            let ti = (match av with
                      | VFlt _ -> invoke_val_c env world nb av "to_i" Nil false
@@ -49601,6 +49683,8 @@ and rxp_u_check = fn (xs: str list) ->
     (let rec hexy = fn (i: int) -> (if i >= str_len h then true else if rxp_hexv (char_at h i) >= 0 then hexy (i + 1) else false) in
      if (if hexy 0 then false else true) then "invalid Unicode list"
      else if str_len h > 6 || str_to_int_base h 16 > 1114111 then "invalid Unicode range"
+     // a surrogate is no character (`/\u{D800}/`, prism's words)
+     else if str_to_int_base h 16 >= 55296 && str_to_int_base h 16 <= 57343 then "invalid Unicode escape sequence"
      else rxp_u_check t)
 // Why a pattern does not parse, in ruby's words where the parser has them
 // ("premature end of char-class", "invalid hex escape", ...); "" when it does.
@@ -49632,7 +49716,7 @@ and rx_warn_src = fn (b: str) ->
 // the reasons rb_reg_preprocess gives (an escape it could not read)
 and rx_escape_why = fn (w: str) ->
   str_eq w "too short escape sequence" || str_eq w "invalid hex escape" || str_eq w "invalid Unicode escape"
-  || str_eq w "invalid Unicode list" || str_eq w "invalid Unicode range"
+  || str_eq w "invalid Unicode list" || str_eq w "invalid Unicode range" || str_eq w "invalid Unicode escape sequence"
 // the parser's queued warnings (rx_wq) for one pattern, through the world
 and rx_emit_warns = fn world -> fn (q: str) -> fn (body: str) ->
   if str_len q == 0 then ()
@@ -50613,7 +50697,7 @@ and rx_enc_guard = fn world -> fn (re: Val) -> fn (subj: Val) ->
                      else true) in
      let bad = fn (u: unit) ->
        raise_exc world "Encoding::CompatibilityError"
-         ("incompatible encoding regexp match (" ++ ren ++ " regexp with " ++ se ++ " string)") in
+         ("incompatible encoding regexp match (" ++ enc_msg_name ren ++ " regexp with " ++ enc_msg_name se ++ " string)") in
      if (if enc_ascii_compat se then false else true) then
        (if str_eq ren se then () else (let _ = bad () in ()))
      else if fixed && ((if enc_ascii_compat ren then false else true) || (if str_is_ascii h then false else true))
