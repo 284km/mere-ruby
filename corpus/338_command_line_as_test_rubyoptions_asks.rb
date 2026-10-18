@@ -23,6 +23,9 @@ def scen(name, args, stdin = "", env = {})
       # (ruby -c reports a jump with prism's source excerpt; the line and the
       #  words are what both say)
       e = e.sub(/\ARUBY: (-e:\d+): syntax error found \(SyntaxError\)\n.*?\^~+ (Invalid \w+)\n.*\z/m) { "RUBY: #{$1}: #{$2} (SyntaxError)\n" }
+      # (the platform in `ruby -v` is the build machine's -- arm64-darwin23 on
+      #  the CI runner, darwin25 here -- and not what this program asks about)
+      o = o.sub(/(\+PRISM) \[[^\]]+\]/, '\1 [PLATFORM]')
       puts "== #{name}"; p [o, e[0, 400], st.exitstatus]
     end
   end
