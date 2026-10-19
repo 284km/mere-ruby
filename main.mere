@@ -3491,6 +3491,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                      && (match lv_get env "self" with VMain -> true | VClass _ -> true | _ -> false)
                                      && (if self_user_defines env world "using" then false else true) ->
     do_using env world (eval_args env world blk arges)
+  // an interpolated pattern is put together from its pieces the way
+  // rb_reg_preprocess_dregexp does it, not by joining them as a string:
+  // two pieces that fix different encodings are "encoding mismatch in
+  // dynamic regexp" (RegexpError), where the join was an
+  // Encoding::CompatibilityError
+  | EMethod (recv_e, name, arges) when str_len name == 7 && str_eq name "__regex" && rx_is_chain recv_e ->
+    (let av9 = eval_args env world blk arges in
+     let fl9 = (match av9 with Cons (VStr f9, _) -> sget f9 | _ -> "") in
+     let rec evl = fn (xs: (Expr * str) list) ->
+       (match xs with
+        | Nil -> (Nil : (Val * str) list)
+        | Cons ((e9, k9), t9) -> (let v9 = eval_e env world blk e9 in Cons ((v9, k9), evl t9))) in
+     let vals9 = evl (rx_chain_leaves recv_e "" (Nil : (Expr * str) list)) in
+     invoke_val_c env world blk (rx_dregexp world vals9 fl9) "__regex" av9 false)
   // one piece of an interpolated pattern (rx_escape_dq wraps each): read
   // here, ahead of the dispatch -- through it every /#{x}/ cost a third more
   | EMethod (recv_e, name, Nil) when str_len name == 9 && str_eq name "__rx_frag" ->
@@ -14551,6 +14565,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
         match encode_cps (decode_cps d9 "UTF-8" 0) e9 "" with
         | (w9, _) -> (let r9 = mkstr w9 in match r9 with VStr h9 -> (let _ = senc_set h9 e9 in r9) | _ -> r9))
      | _ -> VNil)
+  // ...and any other regexp's #to_s / #inspect is in the regexp's encoding
+  // too (US-ASCII for a plain ASCII one): `/\xc2\xa1/e.to_s` is EUC-JP, and
+  // it is that encoding a pattern embedding it (`/#{r}/s`) compares
+  else if ((str_len name == 4 && str_eq name "to_s") || (str_len name == 7 && str_eq name "inspect"))
+          && (match recv with VRegex (_, _, _) -> true | _ -> false)
+          && (if rx_uninit_v world recv then false else true) then
+    (match recv with
+     | VRegex (p9, f9, ev9) ->
+       (let r9 = (if str_len name == 4 then mkstr (rx_desc p9 f9 true) else mkstr (inspect_w env world recv)) in
+        match r9 with VStr h9 -> (let _ = senc_set h9 (rx_enc_name p9 f9 ev9) in r9) | _ -> r9)
+     | _ -> VNil)
   // `o.singleton_class.to_s` -- an explicit call, so it arrives here rather than
   // at the value printer, and only here is there a world to name the object's
   // class with. `#<Class:#<Object:0x..>>`, not the bookkeeping name.
@@ -14631,7 +14656,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          else if str_contains fl "n" && (match rx_kinds body 0 false false with (hu9, _) -> hu9) then
            raise_exc world "RegexpError" ("incompatible character encoding: /" ++ rx_esc_slashes body 0 "" ++ "/")
          else
-         if str_eq why9 "" then rx_build_once body fl (rx_one_enc recv) args
+         // (the encoding the pieces fixed, when rx_dregexp put them
+         //  together: a piece of escapes alone fixes its own encoding, and the
+         //  joined text, all ASCII, cannot say so)
+         let fix9 = (if map_has rx_dre_enc "e" then (let f9 = map_get rx_dre_enc "e" in let _ = map_delete rx_dre_enc "e" in f9) else "") in
+         if str_eq why9 "" then rx_build_once body fl (if str_eq fix9 "" then rx_one_enc recv else fix9) args
          else if rx_escape_why why9 || (if str_eq mix9 "" then false else true) then raise_exc world "ArgumentError" why9
          else raise_exc world "RegexpError" (why9 ++ ": /" ++ rx_esc_slashes body 0 "" ++ "/")))
      | _ -> VNil)
@@ -24222,6 +24251,68 @@ and bad_sym_expr = fn (e: Expr) ->
   | EYield es -> bad_sym_exprs es
   | ELambda (_, b) -> bad_sym_stmts b
   | _ -> false
+// the leaves of an interpolated pattern's `+` chain, in order: a literal
+// piece is ("L" ++ the encoding its marker names, or ""), an interpolated
+// one "C"
+and rx_is_chain = fn (e: Expr) ->
+  match e with
+  | EBin (op, _, _) -> str_eq op "+"
+  // (a pattern that is one interpolation and nothing else is that piece)
+  | EMethod (_, m, Nil) when str_eq m "__interp_str" -> true
+  // (...or one of a source that is not UTF-8, `__lit_denc~`)
+  | EMethod (x, m, Nil) when str_len m > 11 && str_eq (substring m 0 11) "__lit_denc~" -> rx_is_chain x
+  | EMethod (x, m, Nil) -> str_len m > 10 && (str_eq (substring m 0 10) "__lit_enc~" || str_eq (substring m 0 10) "__lit_fsl~") && rx_is_chain x
+  | _ -> false
+and rx_chain_leaves = fn (e: Expr) -> fn (lenc: str) -> fn (acc: (Expr * str) list) ->
+  match e with
+  | EBin (op, a, b) when str_eq op "+" -> rx_chain_leaves a lenc (rx_chain_leaves b lenc acc)
+  | EMethod (x, m, Nil) when str_len m > 10 && str_eq (substring m 0 10) "__lit_enc~" && rx_is_chain x ->
+    rx_chain_leaves x (substring m 10 (str_len m)) acc
+  | EMethod (x, m, Nil) when str_len m > 10 && str_eq (substring m 0 10) "__lit_fsl~" && rx_is_chain x ->
+    rx_chain_leaves x lenc acc
+  | EMethod (x, m, Nil) when str_len m > 11 && str_eq (substring m 0 11) "__lit_denc~" && rx_is_chain x ->
+    rx_chain_leaves x (substring m 11 (str_len m)) acc
+  | EMethod (_, m, Nil) when str_eq m "__interp_str" -> Cons ((e, "C"), acc)
+  | _ -> Cons ((e, (if rx_lit_leaf e then "L" ++ lenc else "C")), acc)
+// a literal piece: a string literal, in any of the parse's markers
+// (`__lit_enc~`, `__lit_fsl~` -- a `# frozen_string_literal:` file wraps
+// every literal, and the piece was read as an interpolation)
+and rx_lit_leaf = fn (e: Expr) ->
+  match e with
+  | EStrL _ -> true
+  | EMethod (x, m, Nil) -> str_len m > 6 && str_eq (substring m 0 6) "__lit_" && rx_lit_leaf x
+  | _ -> false
+// rb_reg_preprocess_dregexp: each piece in its source encoding (a literal
+// piece of a pattern with e/s/u/n in that one), the encoding it fixes, and
+// one fixed encoding for all of them; the joined bytes carry it
+and rx_dregexp = fn world -> fn (vals: (Val * str) list) -> fn (fl: str) ->
+  let flenc = (if str_contains fl "u" then "UTF-8" else if str_contains fl "e" then "EUC-JP"
+               else if str_contains fl "s" then "Windows-31J" else "") in
+  let rec go = fn (xs: (Val * str) list) -> fn (acc: str) -> fn (fix: str) -> fn (first: str) ->
+    (match xs with
+     | Nil -> (let _ = (if str_eq fix "" then map_delete rx_dre_enc "e" else map_set rx_dre_enc "e" fix) in
+               mkstr_e acc (if str_eq fix "" then first else fix))
+     | Cons ((v9, k9), t9) ->
+       (let (b9, e9) = (match v9 with
+                        | VStr h9 -> (sget h9, enc_canon_name (senc_get h9))
+                        | _ -> (to_s v9, "UTF-8")) in
+        let lit9 = str_len k9 > 0 && str_eq (char_at k9 0) "L" in
+        let le9 = (if lit9 && str_len k9 > 1 then enc_canon_name (substring k9 1 (str_len k9)) else "") in
+        let src0 = (if lit9 && (if str_eq flenc "" then false else true) then flenc
+                    else if lit9 && (if str_eq le9 "" then false else true) then le9 else e9) in
+        let src9 = (if str_contains fl "n" && (if str_eq src0 "ASCII-8BIT" then false else true) then
+                      (if enc_all7 b9 then "ASCII-8BIT"
+                       else (let _ = raise_exc world "RegexpError" "/.../n has a non escaped non ASCII character in non ASCII-8BIT script" in src0))
+                    else src0) in
+        // (US-ASCII fixes nothing: a pattern in it is the one that is not
+        //  fixed -- a `\p{}` piece in a US-ASCII source left the pattern
+        //  US-ASCII where the /u beside it makes it UTF-8, test_unicode_age)
+        let f9 = (let f8 = rx_frag_fixed b9 src9 in if str_eq f8 "US-ASCII" then "" else f8) in
+        let fix2 = (if str_eq f9 "" then fix
+                    else if str_eq fix "" || str_eq fix f9 then f9
+                    else (let _ = raise_exc world "RegexpError" ("encoding mismatch in dynamic regexp : " ++ fix ++ " and " ++ f9) in fix)) in
+        go t9 (acc ++ b9) fix2 (if str_eq first "" then src0 else first))) in
+  go vals "" "" ""
 // is the eval'd source UTF-8 (its magic comment, else its own label)? Only
 // there must a symbol be valid UTF-8: a Shift_JIS source's `{\x87]: 1}` is
 // a Windows-31J symbol

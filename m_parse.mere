@@ -1986,9 +1986,14 @@ and rx_u_mix_why = fn (p: str) -> fn (enc: str) ->
        if i >= n then ""
        else if ord (char_at p i) >= 128 then
          (if seen == 2 then "non ASCII character in UTF-8 regexp" else go (i + 1) (if seen == 0 then 1 else seen))
+       // (only a \u past ASCII is UTF-8, and an escaped byte past 0x7f
+       //  counts as the raw one does: `\u0041\xa4\xa2` in EUC-JP is fine)
        else if str_eq (char_at p i) "\\" && i + 1 < n then
-         (if str_eq (char_at p (i + 1)) "u" then
+         (if str_eq (char_at p (i + 1)) "u" && rx_u_esc_ge80 p (i + 2) then
             (if seen == 1 then "UTF-8 character in non UTF-8 regexp" else go (i + 2) (if seen == 0 then 2 else seen))
+          else if str_eq (char_at p (i + 1)) "x" && i + 2 < n && is_hex_digit (char_at p (i + 2)) && hex_val (char_at p (i + 2)) >= 8
+                  && i + 3 < n && is_hex_digit (char_at p (i + 3)) then
+            (if seen == 2 then "non ASCII character in UTF-8 regexp" else go (i + 2) (if seen == 0 then 1 else seen))
           else go (i + 2) seen)
        else go (i + 1) seen in
      go 0 0)
@@ -2767,6 +2772,12 @@ and rx_cm_atom = fn (s: str) -> fn (j: int) ->
         then (rx_cm_hexd (char_at s (j + 2)) * 16 + rx_cm_hexd (char_at s (j + 3)), j + 4)
         else (rx_cm_hexd (char_at s (j + 2)), j + 3))
      else if str_eq c "\\" then (92, j + 2)
+     // (...and the one-letter escapes read_escaped_byte knows: `\M-\n` is
+     //  0x8A, test_regexp's test_unescape)
+     else if str_eq c "n" then (10, j + 2) else if str_eq c "t" then (9, j + 2)
+     else if str_eq c "r" then (13, j + 2) else if str_eq c "f" then (12, j + 2)
+     else if str_eq c "v" then (11, j + 2) else if str_eq c "a" then (7, j + 2)
+     else if str_eq c "e" then (27, j + 2)
      else (0 - 1, j))
   else (ord (char_at s j), j + 1)
 and rx_cm_hexd = fn (c: str) ->
@@ -2811,12 +2822,13 @@ and rx_cm_rewrite = fn (s: str) -> fn (xm: bool) ->
 and rx_frag_why = fn (v: str) ->
   let n = str_len v in
   let hx = fn (k: int) -> k < n && is_hex_digit (char_at v k) in
+  // (a \u{} list: -1 malformed, -2 a codepoint of 8 or more digits)
   let rec ulist = fn (k: int) -> fn (any: bool) -> fn (cnt: int) ->
     (if k >= n then 0 - 1
      else (let c = char_at v k in
            if str_eq c "}" then (if any then k + 1 else 0 - 1)
            else if str_eq c " " then ulist (k + 1) any 0
-           else if is_hex_digit c then (if cnt >= 6 then 0 - 1 else ulist (k + 1) true (cnt + 1))
+           else if is_hex_digit c then (if cnt >= 7 then 0 - 2 else ulist (k + 1) true (cnt + 1))
            else 0 - 1)) in
   let rec go = fn (i: int) ->
     if i >= n then ""
@@ -2826,39 +2838,143 @@ and rx_frag_why = fn (v: str) ->
              if str_eq c "x" then (if hx (i + 2) then go (i + 3) else "invalid hex escape")
              else if str_eq c "u" then
                (if i + 2 >= n then "too short escape sequence"
-                else if str_eq (char_at v (i + 2)) "\{" then (let k = ulist (i + 3) false 0 in if k < 0 then "invalid Unicode list" else go k)
+                else if str_eq (char_at v (i + 2)) "\{" then
+                  (let k = ulist (i + 3) false 0 in
+                   if k == 0 - 2 then "invalid Unicode range" else if k < 0 then "invalid Unicode list" else go k)
                 else if hx (i + 2) && hx (i + 3) && hx (i + 4) && hx (i + 5) then go (i + 6)
                 else "invalid Unicode escape")
-             else if str_eq c "c" then (if i + 2 >= n then "too short control escape" else ctl (i + 2))
-             else if str_eq c "C" then
-               (if i + 3 >= n || (if str_eq (char_at v (i + 2)) "-" then false else true) then "too short control escape" else ctl (i + 3))
-             else if str_eq c "M" then
-               (if i + 3 >= n || (if str_eq (char_at v (i + 2)) "-" then false else true) then "too short meta escape" else ctl (i + 3))
+             else if str_eq c "c" || str_eq c "C" || str_eq c "M" then
+               (match rx_esc_byte v (i + 1) false false with
+                | (w, _, k) -> if str_eq w "" then go k else w)
              else go (i + 2)))
-    else go (i + 1)
-  // the character a \c, \C- or \M- takes, which may be another escape
-  and ctl = fn (k: int) ->
-    if str_eq (char_at v k) "\\" then
-      (if k + 1 >= n then "too short escape sequence"
-       else (let c = char_at v (k + 1) in
-             if str_eq c "c" || str_eq c "C" || str_eq c "M" then go k else go (k + 2)))
-    else go (k + 1) in
+    else go (i + 1) in
   go 0
-// ...and the runs of \xHH in the piece must be whole characters of the
-// piece's own encoding (`e('\xc2')` then `e('\xa1')` is two halves)
+// ruby's read_escaped_byte from p (just past a backslash) under the \M-
+// and \C- prefixes already read: (refusal or "", the byte, next index)
+and rx_esc_byte = fn (v: str) -> fn (p: int) -> fn (meta: bool) -> fn (ctl: bool) ->
+  let n = str_len v in
+  let fin = fn (b: int) ->
+    (let b2 = (if ctl then (if b == 63 then 127 else rx_cm_and9f b) else b) in
+     if meta then rx_cm_or80 b2 else b2) in
+  let isoct = fn (k: int) -> k < n && (let o = ord (char_at v k) in o >= 48 && o <= 55) in
+  if p >= n then ("too short escape sequence", 0, p)
+  else
+    (let c = char_at v p in
+     let dash = p + 1 < n && str_eq (char_at v (p + 1)) "-" in
+     if str_eq c "M" then
+       (if meta then ("duplicate meta escape", 0, p)
+        else if dash then rx_esc_after v (p + 2) true ctl
+        else ("too short meta escape", 0, p))
+     else if str_eq c "C" then
+       (if ctl then ("duplicate control escape", 0, p)
+        else if dash then rx_esc_after v (p + 2) meta true
+        else ("too short control escape", 0, p))
+     else if str_eq c "c" then
+       (if ctl then ("duplicate control escape", 0, p) else rx_esc_after v (p + 1) meta true)
+     else if str_eq c "n" then ("", fin 10, p + 1) else if str_eq c "t" then ("", fin 9, p + 1)
+     else if str_eq c "r" then ("", fin 13, p + 1) else if str_eq c "f" then ("", fin 12, p + 1)
+     else if str_eq c "v" then ("", fin 11, p + 1) else if str_eq c "a" then ("", fin 7, p + 1)
+     else if str_eq c "e" then ("", fin 27, p + 1) else if str_eq c "\\" then ("", fin 92, p + 1)
+     else if isoct p then
+       (let k2 = (if isoct (p + 1) then (if isoct (p + 2) then p + 3 else p + 2) else p + 1) in
+        let rec ov = fn (k: int) -> fn (acc: int) -> (if k >= k2 then acc else ov (k + 1) (acc * 8 + ord (char_at v k) - 48)) in
+        let o = ov p 0 in
+        if o > 255 then ("invalid escape code", 0, k2) else ("", fin o, k2))
+     else if str_eq c "x" then
+       (if p + 1 < n && is_hex_digit (char_at v (p + 1)) then
+          (if p + 2 < n && is_hex_digit (char_at v (p + 2))
+           then ("", fin (hex_val (char_at v (p + 1)) * 16 + hex_val (char_at v (p + 2))), p + 3)
+           else ("", fin (hex_val (char_at v (p + 1))), p + 2))
+        else ("invalid hex escape", 0, p))
+     else ("unexpected escape sequence", 0, p))
+// the character a \c, \C- or \M- takes: another escape, or itself
+and rx_esc_after = fn (v: str) -> fn (p: int) -> fn (meta: bool) -> fn (ctl: bool) ->
+  let n = str_len v in
+  if p >= n then ((if ctl then "too short control escape" else "too short meta escape"), 0, p)
+  else if str_eq (char_at v p) "\\" then rx_esc_byte v (p + 1) meta ctl
+  else
+    (let b = ord (char_at v p) in
+     let b2 = (if ctl then (if b == 63 then 127 else rx_cm_and9f b) else b) in
+     ("", (if meta then rx_cm_or80 b2 else b2), p + 1))
+// ...and the escaped bytes in the piece (\xHH, \M-, \C-, \c) must be whole
+// characters of the piece's own encoding (`e('\xc2')` then `e('\xa1')` is
+// two halves); and outside UTF-8 a \u escape cannot sit beside them or a
+// raw non-ASCII byte -- in ruby's words for whichever came first
 and rx_frag_mb_why = fn (v: str) -> fn (enc: str) ->
   let n = str_len v in
   let hx = fn (k: int) -> k < n && is_hex_digit (char_at v k) in
-  let rec go = fn (i: int) -> fn (run: str) ->
-    if i + 1 < n && str_eq (char_at v i) "\\" && str_eq (char_at v (i + 1)) "x" && hx (i + 2) && hx (i + 3) then
-      go (i + 4) (run ++ chr (hex_val (char_at v (i + 2)) * 16 + hex_val (char_at v (i + 3))))
-    else
-      (let why = (if str_eq run "" then "" else rx_mb_why run enc) in
-       if (if str_eq why "" then false else true) then why
-       else if i >= n then ""
-       else if str_eq (char_at v i) "\\" then go (i + 2) ""
-       else go (i + 1) "") in
-  go 0 ""
+  let u8 = str_eq enc "UTF-8" in
+  let mix = fn (first: str) -> fn (now: str) ->
+    (if u8 then (first, "")
+     else if str_eq first "" then (now, "")
+     else if str_eq first now then (first, "")
+     else if str_eq now "b" then (first, "non ASCII character in UTF-8 regexp")
+     else (first, "UTF-8 character in non UTF-8 regexp")) in
+  let rec go = fn (i: int) -> fn (run: str) -> fn (first: str) ->
+    (let esc9 = (if i + 1 < n && str_eq (char_at v i) "\\" then char_at v (i + 1) else "") in
+     if str_eq esc9 "x" && hx (i + 2) && hx (i + 3) then
+       (let b = hex_val (char_at v (i + 2)) * 16 + hex_val (char_at v (i + 3)) in
+        match (if b >= 128 then mix first "b" else (first, "")) with
+        | (f2, w2) -> if str_eq w2 "" then go (i + 4) (run ++ chr b) f2 else w2)
+     else if str_eq esc9 "c" || str_eq esc9 "C" || str_eq esc9 "M" then
+       (match rx_esc_byte v (i + 1) false false with
+        | (w, b, k) ->
+          if (if str_eq w "" then false else true) then w
+          else (match (if b >= 128 then mix first "b" else (first, "")) with
+                | (f2, w2) -> if str_eq w2 "" then go k (run ++ chr b) f2 else w2))
+     else
+       (let why = (if str_eq run "" then "" else rx_mb_why run enc) in
+        if (if str_eq why "" then false else true) then why
+        else if i >= n then ""
+        else if str_eq esc9 "u" then
+          (let big = rx_u_big v (i + 2) in
+           match (if big then mix first "u" else (first, "")) with
+           | (f2, w2) -> if str_eq w2 "" then go (i + 2) "" f2 else w2)
+        else if str_eq (char_at v i) "\\" then go (i + 2) "" first
+        else if ord (char_at v i) >= 128 then
+          (match mix first "b" with (f2, w2) -> if str_eq w2 "" then go (i + 1) "" f2 else w2)
+        else go (i + 1) "" first)) in
+  go 0 "" ""
+// does the \u escape whose digits start at k name a codepoint past ASCII
+// (any of a {} list)?
+and rx_u_big = fn (v: str) -> fn (k: int) ->
+  let n = str_len v in
+  let rec hexrun = fn (j: int) -> fn (acc: int) -> fn (cnt: int) ->
+    (if j < n && cnt < 8 && is_hex_digit (char_at v j) then hexrun (j + 1) (acc * 16 + hex_val (char_at v j)) (cnt + 1) else (acc, j, cnt)) in
+  let rec lst = fn (j: int) ->
+    (if j >= n || str_eq (char_at v j) "}" then false
+     else if str_eq (char_at v j) " " then lst (j + 1)
+     else (match hexrun j 0 0 with
+           | (val, j2, cnt) -> if cnt == 0 then false else if val >= 128 then true else lst j2)) in
+  if k < n && str_eq (char_at v k) "\{" then lst (k + 1)
+  else (match hexrun k 0 0 with (val, _, cnt) -> cnt >= 4 && (let rec four = fn (j: int) -> fn (acc: int) -> (if j >= k + 4 then acc else four (j + 1) (acc * 16 + hex_val (char_at v j))) in four k 0 >= 128))
+// the encoding one piece of a dynamic pattern FIXES, read in its source
+// encoding src (rb_reg_preprocess): a raw non-ASCII byte or an escaped one
+// fixes src (BINARY for an escaped one in a US-ASCII piece), a \u escape
+// past ASCII fixes UTF-8, a \p{} property fixes src; "" when the piece
+// fixes nothing
+and rx_frag_fixed = fn (v: str) -> fn (src: str) ->
+  let n = str_len v in
+  let hx = fn (k: int) -> k < n && is_hex_digit (char_at v k) in
+  let rec go = fn (i: int) -> fn (fx: str) -> fn (prop: bool) ->
+    if i >= n then (if str_eq fx "" && prop then src else fx)
+    else if ord (char_at v i) >= 128 then go (i + 1) (if str_eq fx "" then src else fx) prop
+    else if str_eq (char_at v i) "\\" && i + 1 < n then
+      (let c = char_at v (i + 1) in
+       if str_eq c "x" && hx (i + 2) then
+         (let b = hex_val (char_at v (i + 2)) * 16 + (if hx (i + 3) then hex_val (char_at v (i + 3)) else 0) in
+          let k = (if hx (i + 3) then i + 4 else i + 3) in
+          // (in a US-ASCII piece an escaped byte past 0x7f fixes BINARY)
+          go k (if b >= 128 && str_eq fx "" then (if str_eq src "US-ASCII" then "ASCII-8BIT" else src) else fx) prop)
+       else if str_eq c "u" then
+         (let rec cp = fn (k: int) -> fn (acc: int) -> fn (cnt: int) ->
+            (if cnt < 6 && hx k then cp (k + 1) (acc * 16 + hex_val (char_at v k)) (cnt + 1) else (acc, k)) in
+          let (val, k) = (if i + 2 < n && str_eq (char_at v (i + 2)) "\{" then cp (i + 3) 0 0 else cp (i + 2) 0 2) in
+          go k (if val >= 128 && str_eq fx "" then "UTF-8" else fx) prop)
+       else if str_eq c "p" || str_eq c "P" then go (i + 2) fx true
+       else go (i + 2) fx prop)
+    else go (i + 1) fx prop in
+  go 0 "" false
 // ...and a piece that is a plain string literal is read when the pattern
 // is: `/#{"\\"}y/` is a SyntaxError, as ruby compiles that piece in
 and rx_static_frags = fn (lit: str) -> fn (i: int) ->
