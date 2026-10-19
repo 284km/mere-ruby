@@ -18052,14 +18052,41 @@ and rxp_quant = fn (pat: str) -> fn (atom: RNode) -> fn (p: int) -> fn (fl: str)
     else (atom, p)
 and rxp_lazy = fn (pat: str) -> fn (atom: RNode) -> fn (lo: int) -> fn (hi: int) -> fn (p: int) -> fn (fl: str) ->
   let p = (if str_contains fl "x" then rxp_skip_x pat p else p) in
-  if p < str_len pat && str_eq (char_at pat p) "?" then (NRep (atom, lo, hi, false), p + 1)
+  if p < str_len pat && str_eq (char_at pat p) "?" then (let _ = rxp_nested_rep_warn atom lo hi false in (NRep (atom, lo, hi, false), p + 1))
   // a POSSESSIVE quantifier is the greedy one wrapped in an atomic group:
   // `a*+` is exactly `(?>a*)`, which this engine already has. Reading it as
   // plain greedy (the old lenient path) was wrong -- greedy gives back what it
   // took, possessive does not, and ruby's RFC3986 URI pattern depends on it.
   else if p < str_len pat && str_eq (char_at pat p) "+" then
     (NAtomic (NRep (atom, lo, hi, true)), p + 1)
-  else (NRep (atom, lo, hi, true), p)
+  else (let _ = rxp_nested_rep_warn atom lo hi true in (NRep (atom, lo, hi, true), p))
+// a ?, * or + (or its lazy form) on a group that is nothing but another one
+// is reduced by onigmo, which says so (ReduceTypeTable): `(?:a?)?` is a
+// redundant `?`, `(?:a+)?` becomes `*`
+and rxp_nested_rep_warn = fn (atom: RNode) -> fn (lo: int) -> fn (hi: int) -> fn (greedy: bool) ->
+  let qn = fn (l: int) -> fn (h: int) -> fn (g: bool) ->
+    (let b = (if l == 0 && h == 1 then 0 else if l == 0 && h < 0 then 1 else if l == 1 && h < 0 then 2 else 0 - 1) in
+     if b < 0 then b else if g then b else b + 3) in
+  let qstr = fn (n: int) -> (match n with | 0 -> "?" | 1 -> "*" | 2 -> "+" | 3 -> "??" | 4 -> "*?" | _ -> "+?") in
+  // onigmo's ReduceTypeTable, rows the inner quantifier, columns the outer:
+  // 0 as is, 1 redundant, otherwise the index into ReduceQStr
+  let table = "122430" ++ "111551" ++ "221051" ++ "133133" ++ "111111" ++ "060331" in
+  let inner = (match rxp_peel_ncg atom with
+    | NRep (_, ilo, ihi, g) -> qn ilo ihi g
+    | _ -> 0 - 1) in
+  let outer = qn lo hi greedy in
+  if inner < 0 || outer < 0 then ()
+  else
+    (let t = ord (char_at table (inner * 6 + outer)) - 48 in
+     let red = (match t with | 2 -> "*" | 3 -> "*?" | 4 -> "??" | 5 -> "+ and ??" | _ -> "+? and ?") in
+     // ⚠ 6 (+? and ?) is in the table but ruby 4.0.6 says nothing for it
+     if t == 0 || t == 6 then ()
+     else if t == 1 then rxp_warn ("Aregular expression has redundant nested repeat operator '" ++ qstr inner ++ "'")
+     else rxp_warn ("Anested repeat operator '" ++ qstr inner ++ "' and '" ++ qstr outer ++ "' was replaced with '" ++ red ++ "' in regular expression"))
+and rxp_peel_ncg = fn (n: RNode) ->
+  match n with
+  | NGroup (x, 0, "") -> rxp_peel_ncg x
+  | _ -> n
 and rxp_braces = fn (pat: str) -> fn (p: int) ->
   let (lo, p2, ok1) = rxp_num pat p 0 false in
   if p2 < str_len pat && str_eq (char_at pat p2) "," then
@@ -18180,11 +18207,27 @@ and rxp_name = fn (pat: str) -> fn (p: int) -> fn (term: str) -> fn (acc: str) -
   if p >= str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp: unterminated group name")) in fail "mere-ruby: regexp: unterminated group name")
   else if str_eq (char_at pat p) term then (acc, p + 1)
   else rxp_name pat (p + 1) term (acc ++ char_at pat p)
+// onigmo's two tests for `[:`: a `:]` before an unescaped `]`
+// (str_exist_check_with_esc), then at most 20 characters up to the first
+// `:` or `]` (POSIX_BRACKET_CHECK_LIMIT_LENGTH). Past them it is a set of
+// plain members, so `[[:abcdefghijklmnopqrstu:]]` is `[`, `:` and a..u;
+// within them an unknown name is an error, `[[:ab12:]]` too.
 and rxp_posix_shape = fn (pat: str) -> fn (q: int) ->
+  rxp_posix_close pat q && rxp_posix_len pat q 0
+and rxp_posix_close = fn (pat: str) -> fn (q: int) ->
+  if q + 1 >= str_len pat then false
+  else (let c = char_at pat q in
+        if str_eq c ":" && str_eq (char_at pat (q + 1)) "]" then true
+        else if str_eq c "]" then false
+        else if str_eq c "\\" then rxp_posix_close pat (q + 2)
+        else rxp_posix_close pat (q + 1))
+and rxp_posix_len = fn (pat: str) -> fn (q: int) -> fn (i: int) ->
   if q >= str_len pat then false
   else (let c = char_at pat q in
-        if (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") then rxp_posix_shape pat (q + 1)
-        else str_eq c ":" && q + 1 < str_len pat && str_eq (char_at pat (q + 1)) "]")
+        if str_eq c ":" then q + 1 < str_len pat && str_eq (char_at pat (q + 1)) "]"
+        else if str_eq c "]" then false
+        else if i + 1 > 20 then false
+        else rxp_posix_len pat (q + 1) (i + 1))
 and rxp_class = fn (pat: str) -> fn (p: int) -> fn (fl: str) ->
   let (neg, p2) = (if p < str_len pat && str_eq (char_at pat p) "^" then (true, p + 1) else (false, p)) in
   rxp_class_items pat p2 fl neg Nil true
@@ -18195,6 +18238,7 @@ and rxp_class_items = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (neg: b
     // `[]` is ruby's "empty char-class"; a `]` first is a member only when
     // another `]` closes the class (`[]a]`)
     let _ = (if first && str_eq c "]" && str_find_from pat "]" (p + 1) < 0 then rxp_refuse "empty char-class" else ()) in
+    let _ = (if first && str_eq c "]" then rxp_warn "Acharacter class has ']' without escape" else ()) in
     if str_eq c "]" && (if first then false else true) then (rev_app acc Nil, neg, p + 1)
     // `[:name:]` -- only in that whole shape. `[[:0]]` is the set of ":" and
     // "0" to Onigmo (a class inside the class), not a bad POSIX name.
@@ -18211,6 +18255,13 @@ and rxp_class_items = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (neg: b
     // was a literal member and `&&` two ampersands, so both examples of
     // "character class composition" matched nothing. What follows `&&` is
     // parsed to the closing `]` and intersected with everything before it.
+    // a `[:` that has its `:]` but too far for a name is a plain `[`
+    // member, not a class inside the class (see rxp_posix_shape)
+    else if str_eq c "[" && p + 1 < str_len pat && str_eq (char_at pat (p + 1)) ":"
+            && rxp_posix_close pat (p + 2) then
+      (let _ = rxp_warn "Acharacter class has '[' without escape" in
+       let _ = rxp_dup_check acc 91 91 in
+       rxp_class_items pat (p + 1) fl neg (Cons (CChr "[", acc)) false)
     else if str_eq c "[" then
       (let (items2, neg2, p2) = rxp_class pat (p + 1) fl in
        rxp_class_items pat p2 fl neg (Cons (CSub (items2, neg2), acc)) false)
@@ -18344,10 +18395,10 @@ and rxp_perl_cls = fn (e: str) -> fn (fl: str) ->
 //   print), not an error.
 and rxp_prop = fn (pat: str) -> fn (p: int) ->
   let e = char_at pat p in
-  // (a \p with no `{` is the letter itself, and ruby says so under -w:
-  //  "invalid Unicode Property \p: /\p%s/")
+  // (a \p with no `{` is the letter itself, and ruby says so:
+  //  "invalid Unicode Property \p: /\p%s/" -- by default, not only -w)
   if p + 1 >= str_len pat || (if str_eq (char_at pat (p + 1)) "\{" then false else true) then
-    (let _ = rxp_warn ("Vinvalid Unicode Property \\" ++ e) in (CChr e, p + 1))
+    (let _ = rxp_warn ("Ainvalid Unicode Property \\" ++ e) in (CChr e, p + 1))
   else
     (let close = str_find_from pat "}" (p + 2) in
      let raw = (if close < 0 then "" else substring pat (p + 2) close) in
@@ -18760,7 +18811,9 @@ and rxv_caps_diff = fn (newer: (int * int) list) -> fn (older: (int * int) list)
   match newer with
   | Nil -> false
   | Cons ((slot, v), rest) ->
-    if slot < 100000 && (let old = rxv_slot_get older slot in (if old == v then false else true)) then true
+    // (the negative slots are the call stack and the depth-tagged copies of
+    //  a capture, not captures: a call that pushed a frame changed nothing)
+    if slot >= 0 && slot < 100000 && (let old = rxv_slot_get older slot in (if old == v then false else true)) then true
     else rxv_caps_diff rest older
 and rx_close = fn (pat: str) -> fn (p: int) -> fn (depth: int) ->
   if p >= str_len pat then p

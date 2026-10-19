@@ -286,6 +286,8 @@ type RNode = NChar of str | NCharCI of str | NAny | NAnyNL
            | NGrapheme                              // \X: one extended grapheme cluster
            | NCond of int * RNode * RNode           // (?(g)yes|no)
            | NAbsent of RNode                       // (?~absent)
+           | NCall of str                           // \g<x>: "#n" or a name, resolved when compiled
+           | NBackrefL of int * int * bool          // \k<x+n>: group, level, ci
            | NEmpty;
 // Compiled instructions (a program is an int-key Map "0".."N-1" -> RInst,
 // plus "meta" -> IMeta (count, ngroups) and "name:<x>" -> IMeta (gnum, 0)).
@@ -299,12 +301,20 @@ type RInst = IChar of str | ICharCI of str | IAny | IAnyNL
            | ICond of int * int                     // group, pc of the no-branch
            | IAbsent of int                         // pc of the absent sub-program
            | IMark of int | ICheck of int * int
+           | ICall of int * int                     // group, pc of its subroutine
+           | ISaveL of int                          // a save that also records the call depth
+           | IBackrefL of int * int * bool          // a backreference at a call level
+           | IRet
            | IOk | IOkAt | IMatch
            | IMeta of int * int;
 // VM results: a match's end index + capture saves (immutable assoc list,
 // newest first), and the search wrapper's hit / no-hit / uncompilable-pattern.
 type RxRes = RFound of int * (int * int) list | RFail;
 type RxHit = RHit of int * int * (int * int) list | RNoHit | RBadPat;
+// a parse's capturing groups by number, for the subroutines \g<x> calls
+let rx_gnodes = map_new ();
+// ...and the groups a program being compiled calls
+let rx_called = map_new ();
 
 // DEFLATE comes from the mgz package, vendored under .mere_modules/. Zlib's
 // streams are the same RFC 1951 body under a different wrapper, so mere-ruby
@@ -3481,6 +3491,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                      && (match lv_get env "self" with VMain -> true | VClass _ -> true | _ -> false)
                                      && (if self_user_defines env world "using" then false else true) ->
     do_using env world (eval_args env world blk arges)
+  // one piece of an interpolated pattern (rx_escape_dq wraps each): read
+  // here, ahead of the dispatch -- through it every /#{x}/ cost a third more
+  | EMethod (recv_e, name, Nil) when str_len name == 9 && str_eq name "__rx_frag" ->
+    (let v9 = eval_e env world blk recv_e in
+     match v9 with
+     | VStr sp -> (let why = rx_frag_why (sget sp) in if str_eq why "" then v9 else raise_exc world "ArgumentError" why)
+     | _ -> v9)
   | EMethod (recv_e, name, arges) ->
     // `"literal".freeze` is ruby's interning special form: every evaluation
     // of the same literal-freeze answers ONE object (CRuby compiles it to
@@ -30797,6 +30814,23 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
           (let _ = sset h (substring s 0 st ++ sget r ++ substring s en n) in
            let _ = senc_set h renc in VStr r)
         | _ -> prim_raise "IndexError" "regexp not matched")
+     // s[/re/, name] = r : the named group's number (the last of a shared
+     // name that took part), then as s[/re/, g] = r
+     | Cons (VRegex (p, pf, rx3), Cons (nmv, Cons (rv, Nil))) when (match nmv with VStr _ -> true | VSym _ -> true | _ -> false) ->
+       (match rxv_search p pf s 0 with
+        | RHit (_, _, saves) ->
+          (let nm = (match nmv with VSym x -> x | VStr nh -> sget nh | _ -> "") in
+           let key = pf ++ chr 1 ++ p in
+           let tbl = (if map_has rx_prog_names key then (match map_get rx_prog_names key with VStr th -> sget th | _ -> "") else "") in
+           let nums = (if str_eq tbl "" then Nil else md_nums_for (str_split tbl "|") nm) in
+           let rec pick = fn (xs: int list) -> fn (best: int) ->
+             (match xs with
+              | Nil -> best
+              | Cons (k, t) -> pick t (if rxv_slot_get saves (2 * k) >= 0 || best < 0 then k else best)) in
+           match nums with
+           | Nil -> prim_raise "IndexError" ("undefined group name reference: " ++ nm)
+           | _ -> str_mut_do h "[]=" (Cons (VRegex (p, pf, rx3), Cons (VInt (pick nums (0 - 1)), Cons (rv, Nil)))))
+        | _ -> prim_raise "IndexError" "regexp not matched")
      // s[/re/, g] = r : replace capture group g of the first match.
      | Cons (VRegex (p, pf, _), Cons (VInt g, Cons (VStr r, Nil))) ->
        let _ = enc_pair_guard h r in
@@ -50666,7 +50700,76 @@ and rxp_has_named = fn (pat: str) -> fn (i: int) -> fn (incls: bool) ->
                         && (if str_eq (char_at pat (i + 3)) "=" || str_eq (char_at pat (i + 3)) "!" then false else true)))
         then true
         else rxp_has_named pat (i + 1) false)
+// what is wrong with the pattern's calls, "" for nothing: a call to a group
+// that is not there, and a group whose call to itself can never end -- one
+// reached before anything is read (left recursion, `(\g<1>|.)`), or one on
+// every way through the body (`(.\g<1>)`). onigmo refuses both when it
+// compiles; a subroutine VM would recurse until the depth cap.
+and rxp_call_gnum = fn (key: str) ->
+  if str_len key > 1 && str_eq (char_at key 0) "#" then int_of_str (substring key 1 (str_len key))
+  else if map_has rx_gnums key then (match map_get rx_gnums key with VInt k -> k | _ -> 0) else 0
+and rxp_calls_why = fn (n: RNode) ->
+  let keys9 = map_new () in
+  let _ = rxp_collect_calls n keys9 in
+  let bad9 = map_new () in
+  let _ = map_iter keys9 (fn (k9: str) -> fn (_u9: int) ->
+            (let g9 = rxp_call_gnum k9 in
+             if g9 <= 0 || (if map_has rx_gnodes g9 then false else true) then
+               map_set bad9 "w" (if str_eq (char_at k9 0) "#" then "undefined group <" ++ substring k9 1 (str_len k9) ++ "> reference"
+                                 else "undefined name <" ++ k9 ++ "> reference")
+             else
+               (let body9 = (match map_get rx_gnodes g9 with NGroup (b9, _, _) -> b9 | o9 -> o9) in
+                if rxp_left_calls g9 body9 || rxp_all_call g9 body9 then map_set bad9 "w" "never ending recursion" else ()))) in
+  if map_has bad9 "w" then map_get bad9 "w" else ""
+and rxp_collect_calls = fn (n: RNode) -> fn keys ->
+  match n with
+  | NCall k -> map_set keys k 1
+  | NSeq xs -> list_iter_nodes xs keys
+  | NAlt xs -> list_iter_nodes xs keys
+  | NRep (b, _, _, _) -> rxp_collect_calls b keys
+  | NGroup (b, _, _) -> rxp_collect_calls b keys
+  | NLook (b, _) -> rxp_collect_calls b keys
+  | NLookB (b, _) -> rxp_collect_calls b keys
+  | NAtomic b -> rxp_collect_calls b keys
+  | NCond (_, a, b) -> (let _ = rxp_collect_calls a keys in rxp_collect_calls b keys)
+  | NAbsent b -> rxp_collect_calls b keys
+  | _ -> ()
+and list_iter_nodes = fn (xs: RNode list) -> fn keys ->
+  match xs with Nil -> () | Cons (x, t) -> (let _ = rxp_collect_calls x keys in list_iter_nodes t keys)
+// can n reach a call to group g before reading anything?
+and rxp_left_calls = fn (g: int) -> fn (n: RNode) ->
+  match n with
+  | NCall k -> rxp_call_gnum k == g
+  | NSeq xs -> rxp_left_seq g xs
+  | NAlt xs -> rxp_left_any g xs
+  | NRep (b, _, mx, _) -> mx != 0 && rxp_left_calls g b
+  | NGroup (b, _, _) -> rxp_left_calls g b
+  | NLook (b, _) -> rxp_left_calls g b
+  | NLookB (b, _) -> rxp_left_calls g b
+  | NAtomic b -> rxp_left_calls g b
+  | _ -> false
+and rxp_left_seq = fn (g: int) -> fn (xs: RNode list) ->
+  match xs with
+  | Nil -> false
+  | Cons (x, t) -> rxp_left_calls g x || (rxc_nullable x && rxp_left_seq g t)
+and rxp_left_any = fn (g: int) -> fn (xs: RNode list) ->
+  match xs with Nil -> false | Cons (x, t) -> rxp_left_calls g x || rxp_left_any g t
+// does every way through n call group g?
+and rxp_all_call = fn (g: int) -> fn (n: RNode) ->
+  match n with
+  | NCall k -> rxp_call_gnum k == g
+  | NSeq xs -> rxp_all_seq g xs
+  | NAlt xs -> (match xs with Nil -> false | _ -> rxp_all_alts g xs)
+  | NRep (b, mn, _, _) -> mn > 0 && rxp_all_call g b
+  | NGroup (b, _, _) -> rxp_all_call g b
+  | NAtomic b -> rxp_all_call g b
+  | _ -> false
+and rxp_all_seq = fn (g: int) -> fn (xs: RNode list) ->
+  match xs with Nil -> false | Cons (x, t) -> rxp_all_call g x || rxp_all_seq g t
+and rxp_all_alts = fn (g: int) -> fn (xs: RNode list) ->
+  match xs with Nil -> true | Cons (x, t) -> rxp_all_call g x && rxp_all_alts g t
 and rxp_parse = fn (pat: str) -> fn (fl: str) ->
+  let _ = map_clear rx_gnodes in
   let _ = map_clear rx_gnums in
   let _ = map_clear rx_gnall in
   let _ = map_clear rx_gbodies in
@@ -50679,6 +50782,7 @@ and rxp_parse = fn (pat: str) -> fn (fl: str) ->
   //   where ruby says "invalid backref number/name".
   else if map_has rx_named_mode "ref" && map_get rx_named_mode "ref" > g - 1 then
     (let _ = rxp_refuse "invalid backref number/name" in n)
+  else if (let w9 = rxp_calls_why n in if str_eq w9 "" then false else (let _ = rxp_refuse w9 in true)) then n
   else if str_contains fl "i" || str_contains pat "(?i" || str_contains pat "i)" || str_contains pat "i:" then rxf_node n
   else n
 
@@ -50853,6 +50957,12 @@ and rxp_ref_name = fn (pat: str) -> fn (p: int) -> fn (close: str) ->
 // the name is what comes before, so `\k<a+1>` names "a" -- which ruby then
 // refuses when only "a+1" exists. Level 0 is this level, the only one there
 // is without recursion; another level is refused as unsupported.
+// where a name's level suffix starts (the + or -), or -1
+and rx_lvl_at = fn (nm: str) ->
+  let rec go = fn (j: int) ->
+    (if j >= str_len nm then 0 - 1
+     else if str_eq (char_at nm j) "+" || str_eq (char_at nm j) "-" then j else go (j + 1)) in
+  if str_len nm > 1 then go 1 else 0 - 1
 and rxp_ref_by_name = fn (nm0: str) ->
   let rec lvl_at = fn (j: int) ->
     (if j >= str_len nm0 then 0 - 1
@@ -51000,6 +51110,8 @@ and rxp_atom = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
   else if str_eq c "*" || str_eq c "+" || str_eq c "?" then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp: target of repeat operator is not specified")) in fail "mere-ruby: regexp: target of repeat operator is not specified")
   else if str_contains fl "i" && ord c >= 128 then rxp_ci_mb pat p g
   else if str_contains fl "i" && is_alpha c then rxp_ci_ascii pat p g
+  // (onigmo lets a `]` that starts the pattern pass without a word)
+  else if str_eq c "]" && p > 0 then (let _ = rxp_warn "Aregular expression has ']' without escape" in (NChar c, p + 1, g))
   else (NChar c, p + 1, g)
 
 // an ASCII letter under /i in a UTF-8 pattern: also the characters outside
@@ -51131,24 +51243,39 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
              let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
           else if str_eq c "k" then (let _ = rxp_note_ref tgt in (NBackref (tgt, str_contains fl "i"), p2, g))
           else
-            (let bk = "#" ++ str_of_int tgt in
-             if map_has rx_gbodies bk
-             then (let src = (match map_get rx_gbodies bk with VStr h -> sget h | _ -> "") in
-                   let (nb, _, _) = rxp_alt src 0 fl 1 in (NGroup (rxp_shy nb, tgt, ""), p2, g))
-             else (let __fm = ("mere-ruby: regexp parse: undefined group reference: " ++ nm) in
-                   let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
+            // (a CALL: the group runs as a subroutine, so it may call itself
+            //  -- `(a|b\g<1>c)` -- and may be one defined later; the
+            //  number is checked when the pattern is complete, rxp_calls_ok)
+            (NCall ("#" ++ str_of_int tgt), p2, g))
+       // (a NAME several groups share is a reference to any of them, the
+       //  latest tried first, as onigmo's multiplex backref: `(?<x>.)(?<x>.)\k<x>`
+       //  matches "aba" and "abb")
+       else if str_eq c "k" && map_has rx_gnall nm && str_contains (map_get rx_gnall nm) "," then
+         (let rec nums9 = fn (s9: str) ->
+            (let ci9 = str_index_of s9 "," in
+             if ci9 < 0 then Cons (int_of_str s9, Nil)
+             else Cons (int_of_str (substring s9 0 ci9), nums9 (substring s9 (ci9 + 1) (str_len s9)))) in
+          let rec refs9 = fn (xs: int list) -> fn (acc: RNode list) ->
+            (match xs with Nil -> acc | Cons (n9, t9) -> refs9 t9 (Cons (NBackref (n9, str_contains fl "i"), acc))) in
+          let ns9 = nums9 (map_get rx_gnall nm) in
+          (NAlt (refs9 ns9 Nil), p2, g))
+       // (a LEVEL -- `\k<n+1>`, `\k<n-0>` -- names the capture made at
+       //  that call depth relative to here)
+       else if str_eq c "k" && (let li9 = rx_lvl_at nm in li9 > 0 && str_len nm > li9 + 1
+                                && rx_all_digits (substring nm (li9 + 1) (str_len nm)) 0 && map_has rx_gnums (substring nm 0 li9)) then
+         (let li9 = rx_lvl_at nm in
+          let l9 = int_of_str (substring nm (li9 + 1) (str_len nm)) in
+          let g9 = (match map_get rx_gnums (substring nm 0 li9) with VInt k -> k | _ -> 0) in
+          (NBackrefL (g9, (if str_eq (char_at nm li9) "-" then 0 - l9 else l9), str_contains fl "i"), p2, g))
        else if str_eq c "k" then (NBackref (rxp_ref_by_name nm, str_contains fl "i"), p2, g)
+       // (...but a CALL by such a name has no one body to call)
+       else if map_has rx_gnall nm && str_contains (map_get rx_gnall nm) "," then
+         (let _ = rxp_refuse ("multiplex definition name <" ++ nm ++ "> call") in (NEmpty, p2, g))
        else
-         (if map_has rx_gbodies nm
-          then (let src = (match map_get rx_gbodies nm with VStr h -> sget h | _ -> "") in
-                let (nb, _, _) = rxp_alt src 0 fl 1 in
-                // ⚠ a CALL captures: after `(?<foo>foo.)bar\g<foo>` group foo is
-                //   what the call matched ("foo2"), as in onigmo. The whole copy
-                //   went shy, so it kept the definition's "foo1". The groups
-                //   INSIDE the body stay shy (their numbers are the definition's).
-                (NGroup (rxp_shy nb, (if map_has rx_gnums nm then (match map_get rx_gnums nm with VInt k -> k | _ -> 0) else 0), nm), p2, g))
-          else (let __fm = ("mere-ruby: regexp parse: undefined group reference: " ++ nm) in
-                let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
+         // ⚠ a CALL captures: after `(?<foo>foo.)bar\g<foo>` group foo is
+         //   what the call matched ("foo2"), as in onigmo -- the subroutine
+         //   is the group itself, its captures included
+         (NCall nm, p2, g))
     // \cX / \C-X control escapes: the char's code masked to the control range.
     else if str_eq c "c" then
       (if p + 1 < str_len pat then (NChar (chr (rxp_ord (char_at pat (p + 1)) - (rxp_ord (char_at pat (p + 1)) / 32) * 32)), p + 2, g)
@@ -51255,6 +51382,7 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
            let _ = map_set rx_gnall nm ((if map_has rx_gnall nm then map_get rx_gnall nm ++ "," else "") ++ str_of_int g) in
            let _ = map_set rx_gbodies nm (mkstr (substring pat p2 p3)) in
            let _ = map_set rx_gbodies ("#" ++ str_of_int g) (mkstr (substring pat p2 p3)) in
+           let _ = map_set rx_gnodes g (NGroup (n, g, nm)) in
            (NGroup (n, g, nm), rxp_close pat p3, g2)))
      else if str_eq c2 "'" then
        (let (nm, p2) = rxp_name pat (p + 2) "'" "" in
@@ -51263,6 +51391,7 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
         let _ = (if map_has rx_gnums nm then () else map_set rx_gnums nm (VInt g)) in
         let _ = map_set rx_gnall nm ((if map_has rx_gnall nm then map_get rx_gnall nm ++ "," else "") ++ str_of_int g) in
         let _ = map_set rx_gbodies nm (mkstr (substring pat p2 p3)) in
+        let _ = map_set rx_gnodes g (NGroup (n, g, nm)) in
         (NGroup (n, g, nm), rxp_close pat p3, g2))
      // (?>...) atomic (possessive) group — non-capturing; once its body
      // matches, backtracking never re-enters it. Captures inside keep their
@@ -51289,8 +51418,10 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
        // (?imx-imx:...) scoped or (?imx-imx) rest-of-sequence flags.
        let (fl2, p2, colon) = rxp_flags pat (p + 1) fl "" false in
        if colon then
+         // the name "(?:" marks an option group, which onigmo does not peel
+         // for the nested repeat reduction (rxp_nested_rep_warn)
          (let (n, p3, g2) = rxp_alt pat p2 fl2 g in
-          (NGroup (n, 0, ""), rxp_close pat p3, g2))
+          (NGroup (n, 0, "(?:"), rxp_close pat p3, g2))
        else (NFlagsRest fl2, p2, g))
   // ⚠ beside a NAMED group a plain paren does not capture at all (onigmo's
   //   rule), so it takes no number: `/(y)(?<a>x)/` has one group, and it is
@@ -51299,13 +51430,14 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
   //   unnamed ones, but only the surface.
   else if map_has rx_named_mode "on" then
     (let (n, p2, g2) = rxp_alt pat p fl g in
-     (NGroup (n, 0, ""), rxp_close pat p2, g2))
+     (NGroup (n, 0, "("), rxp_close pat p2, g2))
   else
     let (n, p2, g2) = rxp_alt pat p fl (g + 1) in
     // \g<1> calls a group by NUMBER, and only named groups recorded a body to
     // call. "#" prefixes the numeric key because rxp_name_check refuses it as
     // a name, so the two spaces cannot collide.
     let _ = map_set rx_gbodies ("#" ++ str_of_int g) (mkstr (substring pat p p2)) in
+    let _ = map_set rx_gnodes g (NGroup (n, g, "")) in
     (NGroup (n, g, ""), rxp_close pat p2, g2)
 
 // read [imx]*(-[imx]*)? up to ':' (scoped) or ')' (rest). `neg` = after '-'.
@@ -51584,6 +51716,9 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
   | NGANCHOR -> let _ = map_set prog pc IGANCHOR in pc + 1
   | NWordB (b, asc) -> let _ = map_set prog pc (IWordB (b, asc)) in pc + 1
   | NBackref (g, ci) -> let _ = map_set prog pc (IBackref (g, ci)) in pc + 1
+  // (the subroutine's pc is filled in once every subroutine is emitted)
+  | NBackrefL (g, l, ci) -> let _ = map_set prog pc (IBackrefL (g, l, ci)) in pc + 1
+  | NCall k -> (let g9 = rxp_call_gnum k in let _ = map_set prog pc (ICall (g9, 0 - 1)) in pc + 1)
   | NSeq xs -> rxc_emit_seq prog pc xs
   | NAlt xs ->
     let (pc2, jmps) = rxc_emit_alt prog pc xs Nil in
@@ -51596,11 +51731,16 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
       // (a `"name:" ++ nm` entry used to be written here and never read by
       //  anything -- the named groups live in rx_prog_names. Dropped with the
       //  int-keyed program, which has no room for a string key anyway.)
-      (let _ = () in
-       let _ = map_set prog pc (ISave (2 * gn)) in
-       let pc2 = rxc_emit prog (pc + 1) b in
-       let _ = map_set prog pc2 (ISave (2 * gn + 1)) in
-       pc2 + 1)
+      // a group that \g<> calls is a call where it stands as well, as in
+      // onigmo: inside it the call depth is 1, which is what \k<x+n>
+      // counts levels by
+      (if map_has rx_called gn then (let _ = map_set prog pc (ICall (gn, 0 - 1)) in pc + 1)
+       else
+         (let lv9 = map_has rx_called (0 - 1) in
+          let _ = map_set prog pc (if lv9 then ISaveL (2 * gn) else ISave (2 * gn)) in
+          let pc2 = rxc_emit prog (pc + 1) b in
+          let _ = map_set prog pc2 (if lv9 then ISaveL (2 * gn + 1) else ISave (2 * gn + 1)) in
+          pc2 + 1))
   | NRep (b, lo, hi, greedy) ->
     let pc2 = rxc_emit_times prog pc b lo in
     if hi < 0 then
@@ -51728,10 +51868,49 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
     let n = rxp_parse pat fl in
     let prog = map_new () in
     let ng = rxp_ngroups n in
+    let _ = map_clear rx_called in
+    // (-1 marks a program with calls: its saves keep their depth)
+    // (and every called group is known before any is emitted: its own
+    //  site, before or after the call, is a call)
+    let _ = (let k9 = map_new () in
+             let _ = rxp_collect_calls n k9 in
+             let _ = map_iter k9 (fn (kk9: str) -> fn (_u9: int) -> map_set rx_called (rxp_call_gnum kk9) 1) in
+             if map_len k9 > 0 then map_set rx_called (0 - 1) 1 else ()) in
     let endpc = rxc_emit prog 0 n in
     let _ = map_set prog endpc IMatch in
+    // the groups \g<x> calls, each once as a subroutine after the program --
+    // its own code, its captures, then IRet -- and a call made inside one
+    // adds its group in turn
+    let subs9 = map_new () in
+    let rec emit_subs9 = fn (pc9: int) ->
+      (let todo9 = map_new () in
+       let _ = map_iter rx_called (fn (g9: int) -> fn (_u9: int) -> if g9 < 0 || map_has subs9 g9 then () else map_set todo9 g9 1) in
+       if map_len todo9 == 0 then pc9
+       else
+         (let pcr9 = map_new () in
+          let _ = map_set pcr9 0 pc9 in
+          let _ = map_iter todo9 (fn (g9: int) -> fn (_u9: int) ->
+                    (let at9 = map_get pcr9 0 in
+                     let _ = map_set subs9 g9 at9 in
+                     // (the group's body between its two saves: rxc_emit
+                     //  would make the group itself a call again)
+                     let body9 = (match map_get rx_gnodes g9 with NGroup (b9, _, _) -> b9 | o9 -> o9) in
+                     let _ = map_set prog at9 (ISaveL (2 * g9)) in
+                     let e8 = rxc_emit prog (at9 + 1) body9 in
+                     let _ = map_set prog e8 (ISaveL (2 * g9 + 1)) in
+                     let e9 = e8 + 1 in
+                     let _ = map_set prog e9 IRet in
+                     map_set pcr9 0 (e9 + 1))) in
+          emit_subs9 (map_get pcr9 0))) in
+    let total9 = emit_subs9 (endpc + 1) in
+    let rec patch9 = fn (q9: int) ->
+      (if q9 >= total9 then ()
+       else (let _ = (match map_get prog q9 with
+                      | ICall (g9, _) -> map_set prog q9 (ICall (g9, map_get subs9 g9))
+                      | _ -> ()) in patch9 (q9 + 1))) in
+    let _ = patch9 0 in
     // -1: the program's own entry. No instruction has a negative pc.
-    let _ = map_set prog (0 - 1) (IMeta (endpc + 1, ng)) in
+    let _ = map_set prog (0 - 1) (IMeta (total9, ng)) in
     let _ = map_set rx_progs key prog in
     // the names are still in rx_gnums from the parse just above
     let _ = map_set rx_prog_names key (mkstr (rx_names_join ())) in
@@ -51921,14 +52100,35 @@ and rxv_mc_allowed = fn prog -> fn (pc: int) -> fn (n: int) -> fn (at: bool) -> 
   else (match rxv_fetch prog pc with
         | IBackref (_, _) -> false
         | ICond (_, _) -> false
+        // (a subroutine is the same pc under different call stacks: a
+        //  visited (pc, i) says nothing about the next visit)
+        | ICall (_, _) -> false
+        | IBackrefL (_, _, _) -> false
         | IAtomic _ -> rxv_mc_allowed prog (pc + 1) n true ck
         | ICheck (_, _) -> rxv_mc_allowed prog (pc + 1) n at true
         | _ -> rxv_mc_allowed prog (pc + 1) n at ck)
 and rxv_mc_size = fn prog -> match map_get prog (0 - 1) with IMeta (n, _) -> n | _ -> 0
+// how many calls the call stack in saves has open
+and rxv_call_depth = fn (saves: (int * int) list) ->
+  let d = rxv_slot_get saves (0 - 3) in
+  if d <= 0 then 0 else d
 and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
            -> fn (saves: (int * int) list) -> fn (bt: (int * int * ((int * int) list)) list) ->
   match rxv_fetch prog pc with
   | IMatch -> RFound (i, saves)
+  // a call: the return pc goes on a stack kept in the saves themselves
+  // (slot -3 the depth -- -1 is \K's start --, slot -(100+d) frame d's
+  // return pc, -(500000+d) its group), so backtracking past the
+  // call takes the frame back with everything else
+  | ICall (cg, tgt) ->
+    (let d9 = rxv_slot_get saves (0 - 3) in
+     let d9 = (if d9 < 0 then 0 else d9) in
+     if d9 >= 2000 then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+     else rxv_run prog s tgt i (Cons ((0 - 3, d9 + 1), Cons ((0 - (100 + d9 + 1), pc + 1), Cons ((0 - (500000 + d9 + 1), cg), saves)))) bt)
+  | IRet ->
+    (let d9 = rxv_slot_get saves (0 - 3) in
+     if d9 <= 0 then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+     else rxv_run prog s (rxv_slot_get saves (0 - (100 + d9))) i (Cons ((0 - 3, d9 - 1), saves)) bt)
   | IOk -> RFound (i, saves)
   | IOkAt ->
     // end of a lookbehind body: only a run that lands exactly on the
@@ -51987,6 +52187,36 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     else rxv_run prog s a i saves (Cons ((b, i, saves), bt))
   | IJmp t -> rxv_run prog s t i saves bt
   | ISave slot -> rxv_run prog s (pc + 1) i (Cons ((slot, i), saves)) bt
+  // (in a pattern with calls a capture is also kept by the depth it was made
+  //  at, slot -(1000000 + depth*1000 + slot), for \k<x+n>)
+  // (the LEVEL of a capture is the call depth it was made at, and \k<n+k>
+  //  looks k levels below the depth it stands at -- onigmo's
+  //  backref_match_at_nested_level, where a called group's own site is a
+  //  call as well)
+  | ISaveL slot ->
+    (let d9 = rxv_call_depth saves in
+     let sv9 = Cons ((slot, i), Cons ((0 - (1000000 + d9 * 1000 + slot), i), saves)) in
+     // the END of a group takes the start made at the same depth back: a
+     // recursive call inside it set the start again (onigmo keeps starts
+     // on its stack, STACK_GET_MEM_START), `\A(a|b\g<1>c)\z` on "bac"
+     // is group 1 = "bac", not "ac"
+     let sv9 = (if slot - (slot / 2) * 2 == 1 then
+                  (let st9 = rxv_slot_get saves (0 - (1000000 + d9 * 1000 + slot - 1)) in
+                   if st9 >= 0 then Cons ((slot - 1, st9), sv9) else sv9)
+                else sv9) in
+     rxv_run prog s (pc + 1) i sv9 bt)
+  | IBackrefL (g, lvl, ci) ->
+    (let td9 = rxv_call_depth saves + lvl in
+     // (a program with no call keeps plain saves, all of them level 0)
+     let plain9 = td9 == 0 && rxv_slot_get saves (0 - 3) < 0 in
+     let a = (if td9 < 0 then 0 - 1 else if plain9 then rxv_slot_get saves (2 * g) else rxv_slot_get saves (0 - (1000000 + td9 * 1000 + 2 * g))) in
+     let b = (if td9 < 0 then 0 - 1 else if plain9 then rxv_slot_get saves (2 * g + 1) else rxv_slot_get saves (0 - (1000000 + td9 * 1000 + 2 * g + 1))) in
+     if a < 0 || b < a || i + (b - a) > str_len s then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+     else
+       (let seg = substring s a b in
+        let here = substring s i (i + (b - a)) in
+        if (if ci then str_eq (str_upcase seg) (str_upcase here) else str_eq seg here) then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
+        else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))))
   | IMark k -> rxv_run prog s (pc + 1) i (Cons ((k, i), saves)) bt
   | ICheck (k, out) ->
     // Onigmo's empty check: an iteration that consumed nothing AND changed no

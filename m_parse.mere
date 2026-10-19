@@ -785,6 +785,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let lit = rx_cm_rewrite lit0 (str_contains fl0 "x") in
       let fl = rx_one_enc_flag fl0 in
       let _ = rx_escapes_check lit fl in
+      let _ = rx_static_frags lit 0 in
       if rx_has_interp lit 0 || rx_has_dvar lit 0 then
         let toks = lex_go (rx_interp_src lit) 0 in
         // the literal's own offset goes with it: `/#{x}/o` builds ONCE, and
@@ -822,6 +823,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
          let fj = skip_regex_flags s rj in
          let fl = rx_one_enc_flag (substring s rj fj) in
          let _ = rx_escapes_check rlit fl in
+         let _ = rx_static_frags rlit 0 in
          if rx_has_interp rlit 0 || rx_has_dvar rlit 0 then
            tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src rlit) 0)))
                 (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", Cons (TP "(", Cons (TStrL fl,
@@ -2390,9 +2392,16 @@ and rx_escape_dq = fn (lit: str) -> fn (i: int) ->
     let c = char_at lit i in
     // an interpolation is code: copy it verbatim (its own quotes/escapes
     // must reach the code lexer untouched).
+    // Each piece goes through __rx_frag on its way in, which refuses the
+    // escapes ruby refuses in a piece on its own (rx_frag_why). (A piece
+    // that is not a String is not read -- its to_s comes after. ⚠ Nothing
+    // may be added between the parentheses: a "\n" there moved the line an
+    // eval inside the piece reports, test_literal's duplicated key.)
     if str_eq c "#" && i + 1 < str_len lit && str_eq (char_at lit (i + 1)) "\{" then
       let j = interp_close lit (i + 2) 1 in
-      substring lit i j ++ rx_escape_dq lit j
+      let code = substring lit (i + 2) (j - 1) in
+      (if rx_code_blank code 0 then substring lit i j
+       else "#\{(" ++ code ++ ").__rx_frag}") ++ rx_escape_dq lit j
     else if str_eq c "\"" then "\\\"" ++ rx_escape_dq lit (i + 1)
     else if str_eq c "\\" && i + 1 < str_len lit then
       // keep regex escapes as-is through the string lexer: the backslash is
@@ -2406,6 +2415,12 @@ and rx_escape_dq = fn (lit: str) -> fn (i: int) ->
        "\\\\" ++ (if str_eq nx "\\" then "\\\\" else if str_eq nx "\"" then "\\\"" else if str_eq nx "#" then "\\#" else nx)
        ++ rx_escape_dq lit (i + 2))
     else c ++ rx_escape_dq lit (i + 1)
+
+// nothing but spaces and newlines: `#{}` stays as it is (`(\n)` does not parse)
+and rx_code_blank = fn (code: str) -> fn (i: int) ->
+  if i >= str_len code then true
+  else (let c = char_at code i in
+        (str_eq c " " || str_eq c "\n" || str_eq c "\t") && rx_code_blank code (i + 1))
 
 // ...and the same rebuild for a %Q STRING, where a backslash escape must be
 // PROCESSED rather than preserved: rx_escape_dq doubles it so the pattern
@@ -2767,6 +2782,65 @@ and rx_cm_rewrite = fn (s: str) -> fn (xm: bool) ->
 //   ruby refuses `/\xc2/e` and `/\xc2#{ }/e` at parse time with "too short
 //   escaped multibyte character" -- the half character could only ever match
 //   half of one (note 299). Interpolation ends a run, as in ruby.
+// what rb_reg_preprocess refuses in ONE piece of an interpolated pattern:
+// ruby reads every piece's escapes on its own (rb_reg_preprocess_dregexp),
+// so `/#{"\\"}y/` is "too short escape sequence" although the joined text
+// `\y` is a fine pattern. "" when the piece is good.
+and rx_frag_why = fn (v: str) ->
+  let n = str_len v in
+  let hx = fn (k: int) -> k < n && is_hex_digit (char_at v k) in
+  let rec ulist = fn (k: int) -> fn (any: bool) -> fn (cnt: int) ->
+    (if k >= n then 0 - 1
+     else (let c = char_at v k in
+           if str_eq c "}" then (if any then k + 1 else 0 - 1)
+           else if str_eq c " " then ulist (k + 1) any 0
+           else if is_hex_digit c then (if cnt >= 6 then 0 - 1 else ulist (k + 1) true (cnt + 1))
+           else 0 - 1)) in
+  let rec go = fn (i: int) ->
+    if i >= n then ""
+    else if str_eq (char_at v i) "\\" then
+      (if i + 1 >= n then "too short escape sequence"
+       else (let c = char_at v (i + 1) in
+             if str_eq c "x" then (if hx (i + 2) then go (i + 3) else "invalid hex escape")
+             else if str_eq c "u" then
+               (if i + 2 >= n then "too short escape sequence"
+                else if str_eq (char_at v (i + 2)) "\{" then (let k = ulist (i + 3) false 0 in if k < 0 then "invalid Unicode list" else go k)
+                else if hx (i + 2) && hx (i + 3) && hx (i + 4) && hx (i + 5) then go (i + 6)
+                else "invalid Unicode escape")
+             else if str_eq c "c" then (if i + 2 >= n then "too short control escape" else ctl (i + 2))
+             else if str_eq c "C" then
+               (if i + 3 >= n || (if str_eq (char_at v (i + 2)) "-" then false else true) then "too short control escape" else ctl (i + 3))
+             else if str_eq c "M" then
+               (if i + 3 >= n || (if str_eq (char_at v (i + 2)) "-" then false else true) then "too short meta escape" else ctl (i + 3))
+             else go (i + 2)))
+    else go (i + 1)
+  // the character a \c, \C- or \M- takes, which may be another escape
+  and ctl = fn (k: int) ->
+    if str_eq (char_at v k) "\\" then
+      (if k + 1 >= n then "too short escape sequence"
+       else (let c = char_at v (k + 1) in
+             if str_eq c "c" || str_eq c "C" || str_eq c "M" then go k else go (k + 2)))
+    else go (k + 1) in
+  go 0
+// ...and a piece that is a plain string literal is read when the pattern
+// is: `/#{"\\"}y/` is a SyntaxError, as ruby compiles that piece in
+and rx_static_frags = fn (lit: str) -> fn (i: int) ->
+  if i + 1 >= str_len lit then ()
+  else if str_eq (char_at lit i) "\\" then rx_static_frags lit (i + 2)
+  else if str_eq (char_at lit i) "#" && str_eq (char_at lit (i + 1)) "\{" then
+    (let j = interp_close lit (i + 2) 1 in
+     let code = substring lit (i + 2) (j - 1) in
+     let _ = (if str_len code >= 2 && str_eq (char_at code 0) "\"" && str_eq (char_at code (str_len code - 1)) "\""
+                 && (if str_contains code "#" then false else true) then
+                (match lex_go code 0 with
+                 | Cons (TStrL v, rest) ->
+                   (match drop_eof rest with
+                    | Nil -> (let why = rx_frag_why v in if str_eq why "" then () else syn_refuse (why ++ ": /" ++ v ++ "/"))
+                    | _ -> ())
+                 | _ -> ())
+              else ()) in
+     rx_static_frags lit j)
+  else rx_static_frags lit (i + 1)
 and rx_escapes_check = fn (lit: str) -> fn (fl: str) ->
   // (a literal with no flag takes the SOURCE's encoding -- the magic
   //  comment's; a one-byte one, `# encoding: binary` included, takes any byte)
