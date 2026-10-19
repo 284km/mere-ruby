@@ -3281,7 +3281,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          // the bare name, which is what makes `method(:it)` find it.
          let key = (if str_eq c "" then nm else c ++ "#" ++ nm) in
          let (_, ps2, bb2, _) = newblk in
-         let _ = set_meth meths key (Meth (drop_yblk_params ps2, meth_block_defaults (drop_yblk_params ps2) bb2, drop_defaults_prologue bb2)) in
+         let _ = set_meth meths key (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
          let _ = map_set dm_methods key VNil in
          let _ = dm_store_closure key newblk in
          let _ = stamp_meth_src key in
@@ -3307,7 +3307,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           // Object.send(:remove_method) see it
           let _ = (if str_eq c "" then
                      (let ok9 = "Object#" ++ nm in
-                      let _ = set_meth meths ok9 (Meth (drop_yblk_params ps2, meth_block_defaults (drop_yblk_params ps2) bb2, drop_defaults_prologue bb2)) in
+                      let _ = set_meth meths ok9 (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
                       let _ = map_set dm_methods ok9 VNil in
                       let _ = dm_store_closure ok9 newblk in
                       let _ = (if map_has dm_captured key then map_set dm_captured ok9 (map_get dm_captured key) else ()) in
@@ -3980,6 +3980,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          (if has_meth world (dispatch_cls_of world bv9) "==" then
             (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
              let r9 = truthy (invoke world noblk bv9 (dispatch_cls_of world bv9) "==" (Cons (va0, Nil))) in
+             VBool (if str_eq op "==" then r9 else (if r9 then false else true)))
+          // (...and Comparable's ==, which asks the object's <=>: Bug #12864)
+          else if cmp_mixin_eq world bv9 then
+            (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+             let r9 = truthy (invoke_val_c env world noblk bv9 "==" (Cons (va0, Nil)) false) in
              VBool (if str_eq op "==" then r9 else (if r9 then false else true)))
           else VBool (if str_eq op "==" then rb_eq va0 bv9 else (if rb_eq va0 bv9 then false else true)))
        // not an object: the ordinary structural answer (arith_bin has no
@@ -4848,11 +4853,39 @@ and defined_super_str = fn env -> fn world ->
      let a9 = lookup_anc world above9 meth in
      if str_eq a9 "" || up9 above9 then VNil else mkstr "super")
 
+// num_remainder over a coerced pair: `x % y`, and where that is not 0 the
+// signs of x and y asked with <=> (an object without one is "comparison of X
+// with 0 failed"); opposite signs take y back off
+and num_remainder_walk = fn env -> fn world -> fn (cx: Val) -> fn (cy: Val) ->
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let z9 = invoke_val_c env world nb9 cx "%" (Cons (cy, Nil)) false in
+  if rb_eq z9 (VInt 0) then z9
+  else
+    (let sg9 = fn (v: Val) ->
+       (if is_num v then (if num_isneg v then 0 - 1 else if num_is_zero v then 0 else 1)
+        else
+          (let r9 = (if responds world v "<=>" then invoke_val_c env world nb9 v "<=>" (Cons (VInt 0, Nil)) false else VNil) in
+           match r9 with
+           | VInt k9 -> k9
+           | _ -> (let _ = prim_raise "ArgumentError" ("comparison of " ++ display_cls_msg world (dispatch_cls_of world v) ++ " with 0 failed") in 0))) in
+     let sx9 = sg9 cx in
+     let sy9 = sg9 cy in
+     if (sx9 < 0 && sy9 > 0) || (sx9 > 0 && sy9 < 0) then invoke_val_c env world nb9 z9 "-" (Cons (cy, Nil)) false
+     else z9)
+// Integer#coerce / Float#coerce with a Complex: through Float(), so its real
+// part as a Float beside self as one when the imaginary part is an exact
+// zero, and "can't convert 2+1i into Float" otherwise
+and cpx_coerce_flt = fn (o: Val) -> fn (recv: Val) ->
+  match o with
+  | VCpx (re9, VInt 0) -> arr_new (Cons (VFlt (to_f re9), Cons (VFlt (to_f recv), Nil)))
+  | _ -> prim_raise "RangeError" ("can't convert " ++ to_s o ++ " into Float")
 and coerce_operand_display = fn world -> fn (v: Val) ->
   match v with
   | VNil -> "nil" | VBool b -> (if b then "true" else "false")
   | VInt _ -> to_s v | VBig _ -> to_s v | VFlt _ -> to_s v
-  | VSym s -> ":" ++ s
+  // (a Symbol by its #inspect, as ruby names an immediate: `:"a b"`, and
+  //  :"\u3042" under a US-ASCII default)
+  | VSym _ -> inspect v
   // an OBJECT is named by its own class: class_name is world-free and answers
   // "Object" for every one of them, so `4 + obj` reported "Object can't be
   // coerced into Integer" whatever class obj was.
@@ -5824,6 +5857,16 @@ and cpx_obj_names = fn (name: str) ->
   || (str_len name == 6 && str_eq name "coerce")
   || (str_len name == 1 && (str_eq name "+" || str_eq name "-" || str_eq name "*" || str_eq name "/"))
   || (str_len name == 3 && str_eq name "quo")
+  || (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s")
+  || (str_len name == 3 && str_eq name "<=>")
+// Complex(re, im) with a Complex part folded in, as complex.c's
+// nucomp_s_canonicalize_internal does: re - im.imag and im.real + re.imag
+and cpx_canon_new = fn (re: Val) -> fn (im: Val) ->
+  match (re, im) with
+  | (VCpx (a, b), VCpx (c, d)) -> VCpx (arith_bin "-" a d, arith_bin "+" b c)
+  | (VCpx (a, b), _) -> VCpx (a, arith_bin "+" b im)
+  | (_, VCpx (c, d)) -> VCpx (arith_bin "-" re d, arith_bin "+" (VInt 0) c)
+  | _ -> VCpx (re, im)
 and cpx_obj_applies = fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   cpx_obj_names name &&
   (match recv with
@@ -5837,15 +5880,44 @@ and cpx_obj_call = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn 
   match recv with
   | VCpx (re, im) ->
     (let arg1 = (match args with Cons (a, _) -> a | Nil -> VNil) in
+     // (the Complex by its #to_s, as rb_raise's PRIsVALUE names it: "3+1i")
      let range = fn (tgt: str) ->
-       raise_exc world "RangeError" ("can't convert " ++ inspect_w env world recv ++ " into " ++ tgt) in
+       raise_exc world "RangeError" ("can't convert " ++ (match cpx_obj_call env world recv "to_s" Nil with VStr h9 -> sget h9 | _ -> inspect_w env world recv) ++ " into " ++ tgt) in
      if str_len name == 4 && (str_eq name "to_i" || str_eq name "to_f" || str_eq name "to_r") then
        (if cpx_exact_zero env world im then call re name Nil
+        // (#to_r asks a non-zero imaginary part its own #to_r: an exact zero
+        //  from it is real enough -- nucomp_to_r)
+        else if str_eq name "to_r" && (match im with VObj _ -> responds world im "to_r" | _ -> false)
+                && cpx_exact_zero env world (call im "to_r" Nil) then call re name Nil
         else range (if str_eq name "to_i" then "Integer" else if str_eq name "to_f" then "Float" else "Rational"))
      else if str_eq name "rationalize" then
        (if vlen args > 1 then raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0..1)")
         else if cpx_exact_zero env world im then call re "rationalize" args
         else range "Rational")
+     // #inspect / #to_s through the parts' own (complex.c's f_format): the
+     // real part, the sign of the imaginary one, its #abs, and "*" before
+     // the "i" when that does not end in a digit
+     else if str_eq name "inspect" || str_eq name "to_s" then
+       (let ins9 = str_eq name "inspect" in
+        let f9 = fn (v: Val) -> (if ins9 then inspect_w env world v
+                                 else (match v with VObj _ -> to_s (call v "to_s" Nil) | _ -> to_s v)) in
+        let neg9 = (match im with VObj _ -> truthy (call im "<" (Cons (VInt 0, Nil))) | _ -> num_isneg im) in
+        let ab9 = (match im with VObj _ -> call im "abs" Nil | _ -> (if num_isneg im then arith_bin "*" im (VInt (0 - 1)) else im)) in
+        let t9 = f9 re ++ (if neg9 then "-" else "+") ++ f9 ab9 in
+        let t9 = (if str_len t9 > 0 && is_digit (char_at t9 (str_len t9 - 1)) then t9 else t9 ++ "*") ++ "i" in
+        mkstr (if ins9 then "(" ++ t9 ++ ")" else t9))
+     // #<=> with a Numeric object (nucomp_cmp): nil unless self is real; a
+     // real other compares with the real part, any other through its coerce
+     else if str_eq name "<=>" then
+       (if (if cpx_exact_zero env world im then false else true) then VNil
+        else if cpx_is_real env world arg1 then call re "<=>" (Cons (arg1, Nil))
+        else
+          (match call arg1 "coerce" (Cons (recv, Nil)) with
+           | VArr aid ->
+             (match deref aid with
+              | Cons (a, Cons (b, Nil)) -> call a "<=>" (Cons (b, Nil))
+              | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
+           | _ -> raise_exc world "TypeError" "coerce must return [x, y]"))
      else if str_eq name "-@" then VCpx (call re "-@" Nil, call im "-@" Nil)
      else if str_eq name "==" then
        (if cpx_user_num world arg1 then
@@ -5862,10 +5934,12 @@ and cpx_obj_call = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn 
        // + - * / quo with a Numeric object: a REAL one works part by part,
        // anything else is `other.coerce(self)` and the operator on the pair
        (let op = (if str_eq name "quo" then "/" else name) in
+        // (parts that came back Complex -- `1 + obj` through obj's coerce --
+        //  fold into one Complex: nucomp_s_canonicalize_internal)
         if cpx_is_real env world arg1 then
-          (if str_eq op "+" || str_eq op "-" then VCpx (call re op (Cons (arg1, Nil)), im)
-           else if str_eq op "*" then VCpx (call re "*" (Cons (arg1, Nil)), call im "*" (Cons (arg1, Nil)))
-           else VCpx (call re "quo" (Cons (arg1, Nil)), call im "quo" (Cons (arg1, Nil))))
+          (if str_eq op "+" || str_eq op "-" then cpx_canon_new (call re op (Cons (arg1, Nil))) im
+           else if str_eq op "*" then cpx_canon_new (call re "*" (Cons (arg1, Nil))) (call im "*" (Cons (arg1, Nil)))
+           else cpx_canon_new (call re "quo" (Cons (arg1, Nil))) (call im "quo" (Cons (arg1, Nil))))
         else
           (match call arg1 "coerce" (Cons (recv, Nil)) with
            | VArr aid ->
@@ -8456,6 +8530,12 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
            // was always +max, so `10.step(by: -2)` stopped before 10)
            | (VInt b9, VNil) -> iter_each_result (range_step world encl theblk n (if b9 < 0 then 0 - int_max else int_max) b9) recv
            | (VNil, VNil) -> iter_each_result (range_step world encl theblk n int_max 1) recv
+           // (a `by:` that is no number is compared with 0, and a `to:` with
+           //  the receiver -- ruby's two refusals)
+           | (b9, _) when (match b9 with VNil -> false | _ -> (if is_num b9 then false else true)) ->
+             raise_exc world "ArgumentError" ("comparison of " ++ display_cls_msg world (dispatch_cls_of world b9) ++ " with 0 failed")
+           | (_, t9) when (match t9 with VNil -> false | _ -> (if is_num t9 then false else true)) ->
+             raise_exc world "ArgumentError" ("comparison of Integer with " ++ display_cls_msg world (dispatch_cls_of world t9) ++ " failed")
            | (b9, t9) ->
              (let bf9 = (match b9 with VNil -> 1.0 | v -> to_f v) in
               iter_each_result (flt_step world encl theblk (float_of_int n)
@@ -8467,6 +8547,8 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        //  not a number is compared with 0 first: "comparison of String with
        //  0 failed", as for a Float receiver)
        | Cons (_, Cons (VNil, _)) -> raise_exc world "TypeError" "step must be numeric"
+       // (a Hash step is ruby's odd refusal from adding to it)
+       | Cons (_, Cons (VHsh _, _)) -> raise_exc world "TypeError" "no implicit conversion of Integer into Hash"
        | Cons (_, Cons (sv9, _)) when (if is_num sv9 then false else true) ->
          raise_exc world "ArgumentError" ("comparison of " ++ display_cls_msg world (dispatch_cls_of world sv9) ++ " with 0 failed")
        // a Float anywhere makes the whole walk a Float walk, as in ruby.
@@ -9785,7 +9867,7 @@ and has_own_eq = fn world -> fn (v: Val) ->
   match v with
   | VObj _ ->
     (let c = dispatch_cls_of world v in
-     has_meth world c "==" || obj_is_a world (display_cls world c) "Time")
+     has_meth world c "==" || obj_is_a world (display_cls world c) "Time" || cmp_mixin_eq world v)
   | _ -> false
 
 // an Integer, Float or String whose class the program gave its own == asks it
@@ -9883,7 +9965,8 @@ and rb_eq_w0 = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
 and rb_eq_num_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
   match b with
   | VObj _ ->
-    (if has_meth world (dispatch_cls_of world b) "=="
+    // (...or Comparable's ==, which asks the object's <=>: Bug #12864)
+    (if has_meth world (dispatch_cls_of world b) "==" || cmp_mixin_eq world b
      then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) b "==" (Cons (a, Nil)) false)
      else rb_eq a b)
   | _ -> rb_eq a b
@@ -10974,6 +11057,9 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
   | VObj oid ->
     let (m2, s2, ocls2, iv2) = world in
     let cls = map_get ocls2 oid in
+    // (the program's #inspect, unless `super` from it is asking for the
+    //  builtin text: insp_super)
+    let usr9 = has_meth world cls "inspect" && (if map_has insp_super (str_of_int oid) then false else true) in
     // ⚠ `p ENV` and `ENV.inspect` are the same question. They reached different
     //   code and gave different answers -- the printer said #<EnvHash:0x..>
     //   while the method said the environment. Ask once, here.
@@ -10981,7 +11067,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     if str_eq cls "EnvHash" || (is_sng_cls cls && str_eq (sng_supername world cls) "EnvHash") then inspect_w env world (mkhash (env_hash_list ()))
     // a BasicObject has no #inspect (Kernel's is Object's): `p b` and
     // `[b].inspect` are ruby's NoMethodError, unless it defined one
-    else if (if has_meth world cls "inspect" then false else true) && is_basic_obj world v
+    else if (if usr9 then false else true) && is_basic_obj world v
             && (if map_has bm_bypass "k" then false else true) then
       (let _ = raise_exc world "NoMethodError"
                  ("undefined method 'inspect' for " ++ for_recv_cls world (dispatch_cls_of world v)) in "")
@@ -10990,21 +11076,21 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     //   form and showed the bookkeeping: `p Time.at(0)` printed
     //   "#<Time:0x... @__t=0, @__epoch=0>". A subclass that defines its own
     //   #inspect still gets it, below.
-    else if (if has_meth world cls "inspect" then false else true)
+    else if (if usr9 then false else true)
             && map_has iv2 (str_of_int oid ++ "@__t") && obj_is_a world (display_cls world cls) "Time"
     then time_str_of world v true
     // ...and `p fiber` is Fiber#inspect, `#<Fiber:0x.. file:line (status)>`,
     // for the same reason: the generic form printed the bookkeeping ivars
-    else if (if has_meth world cls "inspect" then false else true) && map_has iv2 (str_of_int oid ++ "@__fb_idx")
+    else if (if usr9 then false else true) && map_has iv2 (str_of_int oid ++ "@__fb_idx")
     then fb_inspect world v
     // ...and `p thread` is Thread#inspect, which printed its @__tst
-    else if (if has_meth world cls "inspect" then false else true) && map_has iv2 (str_of_int oid ++ "@__tst")
+    else if (if usr9 then false else true) && map_has iv2 (str_of_int oid ++ "@__tst")
             && thr_is_thread world v
     then thread_inspect world v
     // ...and a Range or Regexp SUBCLASS instance prints as what it holds
     // (a Range that holds itself, test_range's CyclicRange, is
     //  "(... .. ...)" inside itself, as ruby's recursive inspect says)
-    else if (if has_meth world cls "inspect" then false else true)
+    else if (if usr9 then false else true)
             && (rng_sub_held world v || rx_sub_held world v)
     then (if map_has insp_seen ("r" ++ str_of_int oid) then "(... .. ...)"
           else (let _ = map_set insp_seen ("r" ++ str_of_int oid) 1 in
@@ -11015,7 +11101,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // is not a String either does the default rendering stand in. #to_str is
     // never asked (the spec pins that too). `to_s other` skipped the dispatch
     // and printed the internal rendering instead of calling the object.
-    else if has_meth world cls "inspect"
+    else if usr9
     then (let nb8 = (false, (Nil : str list), (Nil : Stmt list), env) in
           match invoke world nb8 v cls "inspect" Nil with
           // an inspect result in ANOTHER encoding than the default external is
@@ -11052,7 +11138,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // printed `#<RuntimeError:0x.. @message="x">` -- the internals in place of
     // the message, and once a raise started recording a cause, @__cause and the
     // whole exception it points at came out too.
-    else if exc_is_a world cls "Exception" && (if has_meth world cls "inspect" then false else true) then
+    else if exc_is_a world cls "Exception" && (if usr9 then false else true) then
       (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) v "inspect" Nil false with
        | VStr h8 -> sget h8
        | o8 -> to_s o8)
@@ -11063,7 +11149,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // ordinary objects (`#<Named:0x..>`) because only the class itself was
     // asked.
     // an Enumerator::Chain shows its sources' own inspects
-    else if str_eq cls "Enumerator::Chain" && (if has_meth world cls "inspect" then false else true) then
+    else if str_eq cls "Enumerator::Chain" && (if usr9 then false else true) then
       (let (_, _, _, iv7) = world in
        if (if map_has iv7 (str_of_int oid ++ "@__ch") then false else true) then "#<Enumerator::Chain: uninitialized>"
        else
@@ -11216,6 +11302,9 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
   // Falling through to the world-free printer rendered a range of Comparables
   // as `#<object>..#<object>`, while an ARRAY holding the same two objects
   // printed them correctly: the tell that one question had two answers.
+  // (a Complex with an object part inspects through the parts: cpx_obj_call)
+  | VCpx (re9, im9) when (match re9 with VObj _ -> true | _ -> false) || (match im9 with VObj _ -> true | _ -> false) ->
+    (match cpx_obj_call env world v "inspect" Nil with VStr h9 -> sget h9 | _ -> inspect v)
   | VRange (lo, hi, excl) ->
     (match lo with
      | VNil -> (match hi with VNil -> "nil" | _ -> "")
@@ -13356,7 +13445,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
         match invoke_val_c env world nb9 a9 "coerce" (Cons (recv, Nil)) false with
         | VArr aid9 ->
           (match deref aid9 with
-           | Cons (x9, Cons (y9, Nil)) -> coerced_apply env world name x9 y9
+           | Cons (x9, Cons (y9, Nil)) ->
+             (if str_len name == 9 && str_eq name "remainder" then num_remainder_walk env world x9 y9
+              else coerced_apply env world name x9 y9)
            | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
         | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
      | _ -> VNil)
@@ -13972,6 +14063,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           && (match args with Cons (_, Nil) -> true | _ -> false)
           && (match recv with
               | VArr id -> elem_has_user_eq world (deref id) || prim_eq_redefined world
+                           // (...or the ARGUMENT's: `5 == obj` asks obj)
+                           || (match args with Cons (a9, _) -> has_own_eq world a9 | _ -> false)
               | _ -> false) then
     (match (recv, args) with
      | (VArr cid9, Cons (v, _)) ->
@@ -13998,6 +14091,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               | VArr id -> elem_has_user_eq world (deref id) || prim_eq_redefined world
                            || (((str_len name == 5 && str_eq name "assoc") || (str_len name == 6 && str_eq name "rassoc"))
                                && elem_has_vobj (deref id))
+                           // (...or the ARGUMENT's: an element 5 asks `5 == obj`,
+                           //  and Integer#== asks obj -- num_equal)
+                           || (match args with Cons (a9, _) -> has_own_eq world a9 | _ -> false)
               | _ -> false) then
     (match recv with
      | VArr id ->
@@ -17515,7 +17611,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
         | VProc pid -> (let _ = dm_store_closure (target ++ "#" ++ nm) (proc_as_block pid) in
                        let (h2, ps2, bb2, e2) = proc_as_block pid in
                        let _ = set_meth meths0 (target ++ "#" ++ nm)
-                                 (Meth (drop_yblk_params ps2, meth_block_defaults (drop_yblk_params ps2) bb2, drop_defaults_prologue bb2)) in
+                                 (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
                        let _ = map_set dm_methods (target ++ "#" ++ nm) VNil in
                        VSym nm)
         | other -> raise_exc world "TypeError" ("wrong argument type " ++ class_name other ++ " (expected Proc/Method/UnboundMethod)")))
@@ -21914,7 +22010,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // answer a Rational or ruby refuses.
        else if (str_len name == 3 && str_eq name "quo") then
          (let _ = need1 () in
-          let r9 = call0 "to_r" in
+          // (no #to_r at all is the same refusal: rb_convert_type)
+          let r9 = (if responds world recv "to_r" then call0 "to_r" else VNil) in
           // ...a RATIONAL and nothing else: `to_r` answering the Integer 1 is a
           // TypeError in ruby, which is what the spec asks for.
           match r9 with
@@ -21996,8 +22093,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 | _ -> false)
              | _ -> false) in
           if unfreeze9
+          // (the class by its #to_s, as rb_raise's PRIsVALUE names it: a
+          //  labeled_class's own label, where the internal AnonClass_N leaked)
           then raise_exc world "ArgumentError" ("can't unfreeze " ++ (let oc9 = map_get ocls id in
-                                                                      if is_sng_cls oc9 then cls else oc9))
+                                                                      let c9 = (if is_sng_cls oc9 then cls else oc9) in
+                                                                      let (mk9, _, _, _) = world in
+                                                                      if map_has mk9 ("(sng:" ++ c9 ++ ")#to_s")
+                                                                      then to_s (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass c9) "to_s" Nil false)
+                                                                      else display_cls_msg world c9))
           else recv))
     // Exception#== : same class, equal message, and equal backtrace.
     else if ((str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?")) && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
@@ -23717,6 +23820,19 @@ and ip_scan_exprs = fn (es: Expr list) ->
 and implicit_params_of = fn (body: Stmt list) ->
   (let n9 = max_numbered_stmts body in
    if n9 > 0 then n9 else (if uses_it_stmts body && (if stmts_assign_it body then false else true) then 1 else 0))
+// a define_method body's parameters: the block's, or -- for a block with
+// none that names _1.._n or `it` -- that many required ones (`it` is _1, which
+// the name resolves to). They were none, so `define_method(:f) { it * 2 }`
+// refused its argument.
+and dm_params = fn (ps: str list) -> fn (body: Stmt list) ->
+  let p9 = drop_yblk_params ps in
+  match p9 with
+  | Nil ->
+    (let n9 = max_numbered_stmts body in
+     if n9 > 0 then bnd_numbered_names 1 n9
+     else if uses_it_stmts body && (if stmts_assign_it body then false else true) then Cons ("_1", Nil)
+     else p9)
+  | _ -> p9
 // does the block body assign `it` (`it = it = "bar"`) BEFORE it reads it?
 // Then `it` is a local variable of the block, and the block has no implicit
 // parameter. (Read first -- `it or flunk; it = "bar"` -- and the block has
@@ -25154,7 +25270,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          (let (h2, ps2, bb2, e2) = newblk in
           let mk2 = (if str_eq target "(main)" then nm else target ++ "#" ++ nm) in
           let _ = set_meth meths mk2
-                    (Meth (drop_yblk_params ps2, meth_block_defaults (drop_yblk_params ps2) bb2, drop_defaults_prologue bb2)) in
+                    (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
           let _ = map_set dm_methods mk2 VNil in
           let _ = dm_store_closure mk2 (h2, ps2, bb2, e2) in
           let _ = stamp_meth_src mk2 in
@@ -25176,7 +25292,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          // list treats every parameter as mandatory (a zero-argument call to
          // `define_method(:m) { |a = 5| }` was an arity error).
          let _ = set_meth meths (c ++ "#" ++ nm)
-                   (Meth (drop_yblk_params ps2, meth_block_defaults (drop_yblk_params ps2) bb2, drop_defaults_prologue bb2)) in
+                   (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
          let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
          let _ = stamp_meth_src (c ++ "#" ++ nm) in
@@ -28680,7 +28796,12 @@ and obj_answers_eq = fn world -> fn (v: Val) ->
   // `def t.succ` on it) dispatches through "(sng:N)", which no builtin list
   // mentions, and the array of them then compared by identity
   | VObj _ -> (let c9 = dispatch_cls_of world v in
-               has_meth world c9 "==" || builtin_obj_has (display_cls world c9) "==")
+               has_meth world c9 "==" || builtin_obj_has (display_cls world c9) "==" || cmp_mixin_eq world v)
+  | _ -> false
+// an object whose == is Comparable's: it includes the module and has a <=>
+and cmp_mixin_eq = fn world -> fn (v: Val) ->
+  match v with
+  | VObj _ -> (let c9 = dispatch_cls_of world v in obj_is_a world c9 "Comparable" && has_meth world c9 "<=>")
   | _ -> false
 
 // ...or one with its own #eql? / #hash: a KEY that says it is eql? to
@@ -30335,6 +30456,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (let xneg9 = num_isneg recv in
         if (y9 > 0.0 && (if xneg9 then false else true)) || (y9 < 0.0 && xneg9) then VFlt (to_f recv) else recv)
      | _ -> recv)
+  // ...and a Float receiver: x % y when the signs agree, x itself when they
+  // differ (num_remainder: `4.2.remainder(-Float::INFINITY)` is 4.2, not NaN)
+  else if (str_len name == 9 && str_eq name "remainder")
+          && (match recv with VFlt x9 -> (if flt_is_nan x9 || flt_is_inf x9 then false else true) | _ -> false)
+          && (match args with Cons (VFlt y9, Nil) -> flt_is_inf y9 | _ -> false) then
+    recv
   // Rational#remainder by an exact number is exact: x - y * (x / y).truncate
   // (it went to the Float path and answered 0.0)
   else if (str_len name == 9 && str_eq name "remainder") && (match recv with VRat (_, _) -> true | _ -> false)
@@ -32128,7 +32255,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // Complex in ruby, and refusing it read the value's kind as its fitness.
      else if (match args with Cons (a9, _) -> is_cpx a9 | Nil -> false)
      then (match args with
-           | Cons (b9, _) -> cpx_arith "/" (VCpx (recv, VInt 0)) b9
+           // (a Complex receiver divides with its parts as Floats, as
+           //  nucomp_fdiv's f_divide with fdiv does)
+           | Cons (b9, _) -> (match recv with
+                              | VCpx (r9, i9) -> cpx_arith "/" (VCpx (VFlt (to_f r9), VFlt (to_f i9))) b9
+                              | _ -> cpx_arith "/" (VCpx (recv, VInt 0)) b9)
            | Nil -> VNil)
      else
      match recv with
@@ -32166,7 +32297,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     //  is square-and-multiply on the big digits: a bignum exponent matched no
     //  arm and the RECEIVER came back as the answer)
     (match (recv, args) with
-     | (VInt b, Cons (VInt e, Cons (VInt m, _))) -> VInt (int_pow_mod b e m)
+     // (a machine-int square of a residue fits only below 2**31: a modulus
+     //  past that squares in big digits, where `12.pow(e, 243682743764)`
+     //  wrapped and answered 40538675340)
+     | (VInt b, Cons (VInt e, Cons (VInt m, _))) when m < 2147483648 && m > 0 - 2147483648 -> VInt (int_pow_mod b e m)
      | (VInt _, Cons (e, Nil)) -> arith_bin "**" recv e
      | (VInt _, Cons (e, Cons (m, _))) -> norm_big (big_pow_mod_s (num_dec recv) (num_dec e) (num_dec m))
      | (VBig b, Cons (VInt e, Nil)) -> norm_big (big_pow b e "1")
@@ -32195,6 +32329,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (match recv with
         | VInt _ -> (if (match o with VFlt _ -> true | _ -> false)
                      then arr_new (Cons (o, Cons (VFlt (to_f recv), Nil)))
+                     // (a Complex goes through Float(): its real part when the
+                     //  imaginary one is an exact zero, refused otherwise)
+                     else if (match o with VCpx (_, _) -> true | _ -> false) then cpx_coerce_flt o recv
                      else if is_num o then arr_new (Cons (o, Cons (recv, Nil)))
                      else if (match o with VStr _ -> true | _ -> false)
                      then (match o with VStr h9 -> coerce_str recv h9 | _ -> VNil)
@@ -32211,7 +32348,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                      else coerce_refuse o)
         // Float#coerce answers two Floats: `2.5.coerce(1)` is [1.0, 2.5], not
         // [1, 2.5] -- the point of coercing is that both sides end up alike.
-        | VFlt _ -> (if is_num o then arr_new (Cons (VFlt (to_f o), Cons (recv, Nil)))
+        | VFlt _ -> (if (match o with VCpx (_, _) -> true | _ -> false) then cpx_coerce_flt o recv
+                     else if is_num o then arr_new (Cons (VFlt (to_f o), Cons (recv, Nil)))
                      else if (match o with VStr _ -> true | _ -> false)
                      then (match o with VStr h9 -> coerce_str recv h9 | _ -> VNil)
                      // ruby coerces through Float(), so a String that is not a
@@ -32229,6 +32367,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            // coerce through Float(), so the message names Complex and not the
            // unparsable string Float() was handed.
            else prim_raise "TypeError" (conv_name o ++ " can't be coerced into Complex"))
+        // Rational#coerce with a Complex (nurat_coerce): one with an exact zero
+        // imaginary part is its real part as a Rational, any other pairs with
+        // self as a Complex
+        | VRat (_, _) when (match o with VCpx (_, _) -> true | _ -> false) ->
+          (match o with
+           | VCpx (re9, VInt 0) -> arr_new (Cons (prim_method re9 "to_r" Nil, Cons (recv, Nil)))
+           | _ -> arr_new (Cons (o, Cons (VCpx (recv, VInt 0), Nil))))
         | _ -> arr_new (Cons (o, Cons (recv, Nil))))
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
   else if (str_len name == 5 && str_eq name "zero?") then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0")
@@ -32269,10 +32414,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VInt n -> (if n == 0 then VNil else recv)
      | VFlt f -> (if f == 0.0 then VNil else recv)
      | VBig s2 -> (if str_eq s2 "0" then VNil else recv)
-     | VRat (n, d) -> (if big_sign n == 0 then VNil else recv)
+     // (big_sign answers 1 for "0": a zero numerator is asked by name)
+     | VRat (n, d) -> (if str_eq (big_mag n) "0" then VNil else recv)
      | VCpx (cre, cim) -> (if rb_eq cre (VInt 0) && rb_eq cim (VInt 0) then VNil else recv)
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "nonzero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'nonzero?'")) in fail "mere-ruby: undefined method 'nonzero?'")))
-  else if (str_len name == 9 && str_eq name "positive?") then (match recv with VInt n -> VBool (n > 0) | VFlt f -> VBool (f > 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) > 0) | VRat (n, d) -> VBool (big_sign n > 0) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "positive?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'positive?'")) in fail "mere-ruby: undefined method 'positive?'")))
+  else if (str_len name == 9 && str_eq name "positive?") then (match recv with VInt n -> VBool (n > 0) | VFlt f -> VBool (f > 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) > 0) | VRat (n, d) -> VBool (big_sign n > 0 && (if str_eq (big_mag n) "0" then false else true)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "positive?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'positive?'")) in fail "mere-ruby: undefined method 'positive?'")))
   else if (str_len name == 9 && str_eq name "negative?") then (match recv with VInt n -> VBool (n < 0) | VFlt f -> VBool (f < 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) < 0) | VRat (n, d) -> VBool (big_sign n < 0) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "negative?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'negative?'")) in fail "mere-ruby: undefined method 'negative?'")))
   // (at the int64 edge the next integer is a Bignum: `(-2**63).pred` wrapped
   // to 2**63-1, and a reverse_each down from there never reached its end)
@@ -32576,6 +32722,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | Cons (b, _) ->
        (match recv with
         | VCpx (r, i) -> cpx_arith "/" recv b
+        // (by a Complex: the exact `/` of self as a Rational -- a Float's own
+        //  `/` -- where the Rational arithmetic below refused the Complex as
+        //  a zero divisor)
+        | v when (match b with VCpx (_, _) -> true | _ -> false) ->
+          arith_bin "/" (match v with VInt n -> mk_rat n 1 | VBig bb -> mk_rat_s bb "1" | x -> x) b
         | v ->
           // bare quo is NOT canonicalized: 2.quo(2) == (1/1).
           (if (match v with VFlt _ -> true | _ -> false) || (match b with VFlt _ -> true | _ -> false)
@@ -35433,7 +35584,11 @@ and kernel_rational = fn env -> fn world -> fn (args0: Val list) ->
   // raise -- Rational(1, 0, exception: false) is still a ZeroDivisionError. So
   // the flag is carried down to the places that answer to it rather than
   // wrapped around the whole conversion.
-  kernel_rational_go env world a1 a2 has2 raising
+  // (one or two arguments: `Rational()` was nil's TypeError and
+  //  `Rational(1, 2, 3)` dropped the third)
+  let np9 = vlen pos in
+  if np9 == 0 || np9 > 2 then raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int np9 ++ ", expected 1..2)")
+  else kernel_rational_go env world a1 a2 has2 raising
 
 // ruby's rb_protect around a conversion: run it, and on an exception answer
 // nil instead of unwinding. The caught exception must leave NOTHING behind --
@@ -35453,6 +35608,9 @@ and kern_rat_side = fn env -> fn world -> fn (v: Val) -> fn (raising: bool) ->
   match v with
   | VInt n -> VInt n
   | VBig b -> VBig b
+  // (NaN and the infinities have no Rational: Float#to_r's FloatDomainError)
+  | VFlt f when flt_is_nan f -> prim_raise "FloatDomainError" "NaN"
+  | VFlt f when flt_is_inf f -> prim_raise "FloatDomainError" (if f > 0.0 then "Infinity" else "-Infinity")
   | VFlt f -> (match flt_rat_parts f 0 with (n, d) -> mk_rat_s n d)
   | VRat (n, d) -> VRat (n, d)
   // (under `exception: false` a string that reads as "1/0" is nil as well:
@@ -35511,6 +35669,13 @@ and kernel_rational_go = fn env -> fn world -> fn (a10: Val) -> fn (a20: Val) ->
   then (if raising
         then (let _ = prim_raise "TypeError" "can't convert nil into Rational" in VNil)
         else VNil)
+  // (a Complex numerator that is not real divides, as nurat_convert's f_div
+  //  does: `Rational(Complex(1, 2), 2)` is ((1/2)+1i))
+  // (...and a non-real Complex denominator too: `Rational(Complex(1, 2),
+  //  Complex(1, 2))` is (1+0i))
+  else if has2 && (match a10 with VCpx (_, VInt 0) -> false | VCpx (_, _) -> true | _ -> false)
+          && (match a20 with VInt _ -> true | VBig _ -> true | VRat (_, _) -> true | VCpx (_, _) -> true | _ -> false) then
+    invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a10 "quo" (Cons (a20, Nil)) false
   else
     let b1 = kern_rat_side env world (kern_unwrap_cpx a10) raising in
     let b2 = (if has2 then kern_rat_side env world (kern_unwrap_cpx a20) raising else VInt 1) in
@@ -38465,7 +38630,37 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
     (let e2 = map_new () in
      let _ = map_set e2 "self" recv in
      kernel_warn e2 world args)
-  else if is_prim_method meth then prim_method recv meth args
+  // (`super` into Kernel#to_s / #inspect for a plain object is `#<Foo:0x..>`,
+  //  and the ivars for #inspect: the leaf's world-free answer is "#<object>",
+  //  which is replaced -- the builtin classes' own answers stand)
+  else if is_prim_method meth then
+    (let r9 = prim_method recv meth args in
+     match (recv, r9) with
+     // (an exception's is Exception#inspect: `#<E: message>`)
+     | (VObj _, VStr h9) when str_eq meth "inspect" && str_eq (sget h9) "#<object>" && exc_is_a world (dispatch_cls_of world recv) "Exception" ->
+       (let disp9 = cls_display world (display_cls world (dispatch_cls_of world recv)) in
+        let mv9 = invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) recv "to_s" Nil false in
+        let m9 = (match mv9 with VStr mh9 -> sget mh9 | VNil -> disp9 | o9 -> to_s o9) in
+        if str_eq m9 "" then mkstr disp9
+        else if str_contains m9 "\n" then mkstr ("#<" ++ disp9 ++ ":" ++ inspect_w gc_cenv0 world (mkstr m9) ++ ">")
+        else mkstr ("#<" ++ disp9 ++ ": " ++ m9 ++ ">"))
+     // (#inspect: the builtin text of the object, which inspect_w has --
+     //  a Struct's, a Time's, a Range subclass's, or `#<Foo:0x.. @a=1>`)
+     | (VObj oid9, VStr h9) when str_eq meth "inspect" && str_eq (sget h9) "#<object>" ->
+       (let _ = map_set insp_super (str_of_int oid9) 1 in
+        let r8 = inspect_w gc_cenv0 world recv in
+        let _ = map_delete insp_super (str_of_int oid9) in
+        mkstr r8)
+     // (#to_s: a plain object's `#<Foo:0x..>`; a builtin kind keeps its own)
+     | (VObj oid9, VStr h9) when str_eq meth "to_s" && str_eq (sget h9) "#<object>"
+                                 && (let c8 = dispatch_cls_of world recv in
+                                     if obj_is_a world c8 "Struct" || obj_is_a world c8 "Range" || obj_is_a world c8 "Time"
+                                        || obj_is_a world c8 "Data" || obj_is_a world c8 "Set" then false else true) ->
+       (let c9 = dispatch_cls_of world recv in
+        let ivs9 = (if str_eq meth "inspect" then obj_ivar_dump gc_cenv0 world oid9 c9 else "") in
+        mkstr ("#<" ++ cls_display world (obj_print_cls world c9) ++ ":0x" ++ hex_pad16 (oid9 - handle_base)
+               ++ (if str_eq ivs9 "" then "" else " " ++ ivs9) ++ ">"))
+     | _ -> r9)
   // a Thread subclass's `super` from #initialize is Thread#initialize, which
   // starts the body (with the block super was given)
   else if str_eq meth "initialize" && thr_is_thread world recv then

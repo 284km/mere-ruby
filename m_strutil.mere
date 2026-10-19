@@ -593,7 +593,35 @@ let rec toc_digits = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
 // one unsigned number: (intpart, fracpart, exppart, den-from-slash, nexti).
 // Empty intpart means "no number here". The '/' denominator only counts when
 // digits follow it; the exponent only when [sign]digits follow the e.
-let toc_number = fn (s: str) -> fn (i0: int) ->
+// a denominator after '/': digits, and (ruby 3.x's read_rat) a fraction and
+// an exponent of its own -- "5/3.3" is (50/33) and "5/3e1" (1/6). Answered as
+// one digit string when the value is whole ("30"), or as the digits and the
+// power of ten the NUMERATOR has to be multiplied by ("33e1"): dn_split
+let toc_den = fn (s: str) -> fn (i0: int) ->
+  (match toc_digits s i0 "" with
+   | (di, i1) ->
+     let (dfr, i2) = (if i1 + 1 < str_len s && str_eq (char_at s i1) "." && is_digit (char_at s (i1 + 1))
+                      then toc_digits s (i1 + 1) "" else ("", i1)) in
+     let (de, i3) = (if i2 < str_len s && (str_eq (char_at s i2) "e" || str_eq (char_at s i2) "E")
+                     then (let sg = (if i2 + 1 < str_len s && (str_eq (char_at s (i2 + 1)) "-" || str_eq (char_at s (i2 + 1)) "+")
+                                     then char_at s (i2 + 1) else "") in
+                           let ds = (if str_eq sg "" then i2 + 1 else i2 + 2) in
+                           if (if ds < str_len s then is_digit (char_at s ds) else false) then
+                             (match toc_digits s ds "" with
+                              | (ed, i9) -> ((if str_eq sg "-" then 0 - int_of_str ed else int_of_str ed), i9))
+                           else (0, i2))
+                     else (0, i2)) in
+     let k = de - str_len dfr in
+     if k >= 0 then (big_mul_s (di ++ dfr) (big_pow "10" k "1"), i3)
+     else (di ++ dfr ++ "e" ++ str_of_int (0 - k), i3));
+// a denominator from toc_den as (digits, power of ten for the numerator)
+let dn_split = fn (dn: str) ->
+  let k = str_index_of dn "e" in
+  if k < 0 then (dn, 0) else (substring dn 0 k, int_of_str (substring dn (k + 1) (str_len dn)));
+// (Rational's reading takes toc_den's denominator; Complex's keeps digits)
+let toc_number_x = fn (s: str) -> fn (i0: int) -> fn (rat: bool) ->
+  // (a number starts with a digit: "_5".to_c is (0+0i))
+  if i0 < str_len s && str_eq (char_at s i0) "_" then ("", "", "", "", i0) else
   (match toc_digits s i0 "" with
    | (ip0, i1) ->
      // ...and a number may start at its point: `.33`.to_c is (0.33+0i), where
@@ -617,8 +645,9 @@ let toc_number = fn (s: str) -> fn (i0: int) ->
                              else ("", i2))
                        else ("", i2)) in
        let (dn, i4) = (if i3 + 1 < str_len s && str_eq (char_at s i3) "/" && is_digit (char_at s (i3 + 1))
-                       then toc_digits s (i3 + 1) "" else ("", i3)) in
+                       then (if rat then toc_den s (i3 + 1) else toc_digits s (i3 + 1) "") else ("", i3)) in
        (ip, fp, ep, dn, i4));
+let toc_number = fn (s: str) -> fn (i0: int) -> toc_number_x s i0 false;
 // the parsed parts as a VALUE: a '/' makes a Rational (a decimal numerator
 // folds into it), a '.' or exponent makes a Float, else an Integer.
 let toc_value = fn (neg: bool) -> fn (ip: str) -> fn (fp: str) -> fn (ep: str) -> fn (dn: str) ->
@@ -628,8 +657,9 @@ let toc_value = fn (neg: bool) -> fn (ip: str) -> fn (fp: str) -> fn (ep: str) -
        (match norm_big (sgn ++ ip) with v -> v)
      else VFlt (float_of_str (sgn ++ ip ++ "." ++ (if str_eq fp "" then "0" else fp) ++ (if str_eq ep "" then "" else "e" ++ ep))))
   else
-    (let num = sgn ++ ip ++ fp in
-     let den = big_mul_s dn (big_pow "10" (str_len fp) "1") in
+    (let (dm, nk) = dn_split dn in
+     let num = big_mul_s (sgn ++ ip ++ fp) (big_pow "10" nk "1") in
+     let den = big_mul_s dm (big_pow "10" (str_len fp) "1") in
      mk_rat_s num den);
 let toc_unit = fn (c: str) -> str_eq c "i" || str_eq c "I" || str_eq c "j" || str_eq c "J";
 // String#to_c: [ws] [sign] (unit | number [unit | @polar | ±imag]) with
@@ -685,12 +715,18 @@ let rb_str_to_c_ok = fn (s: str) ->
 // the parsed parts as an exact Rational. The EXPONENT counts: "-9.2e2".to_r
 // is (-920/1), and dropping ep made it (-46/5).
 let rat_of_parts = fn (neg: bool) -> fn (ip: str) -> fn (fp: str) -> fn (ep: str) -> fn (dn: str) ->
-  let num0 = (if neg then "-" else "") ++ ip ++ fp in
+  let (dm, nk) = dn_split dn in
+  let num0 = big_mul_s ((if neg then "-" else "") ++ ip ++ fp) (big_pow "10" nk "1") in
   let den0 = big_pow "10" (str_len fp) "1" in
-  let den1 = (if str_eq dn "" then den0 else big_mul_s den0 dn) in
+  let den1 = (if str_eq dm "" then den0 else big_mul_s den0 dm) in
   let eneg = str_len ep > 0 && str_eq (char_at ep 0) "-" in
-  let emag = (if str_len ep == 0 then 0 else int_of_str (big_mag ep)) in
-  if emag == 0 then mk_rat_s num0 den1
+  // (an exponent past a long is read through a Float, as ruby's read_rat
+  //  does: "1e-99999999999999999999".to_r is 0.0, and a positive one is
+  //  FloatDomainError -- 10 to that power was being built digit by digit)
+  let ehuge = str_len (big_mag ep) > 18 in
+  let emag = (if str_len ep == 0 || ehuge then 0 else int_of_str (big_mag ep)) in
+  if ehuge then (if eneg then VFlt 0.0 else prim_raise "FloatDomainError" "Infinity")
+  else if emag == 0 then mk_rat_s num0 den1
   else if eneg then mk_rat_s num0 (big_mul_s den1 (big_pow "10" emag "1"))
   else mk_rat_s (big_mul_s num0 (big_pow "10" emag "1")) den1;
 // String#to_r: [ws] [sign] digits [. digits] [e exp] [/ digits], (0/1)
@@ -712,7 +748,7 @@ let rb_str_to_r_x = fn (s: str) ->
   let src = (if str_eq zp "" then s else substring s 0 i2 ++ "0" ++ substring s i2 (str_len s)) in
   let n = str_len src in
   let i1 = i2 in
-  match toc_number src i1 with
+  match toc_number_x src i1 true with
   | (ip, fp, ep, dn, j) ->
     if str_eq ip "" then (mk_rat_s "0" "1", false)
     else (rat_of_parts neg1 ip fp ep dn, ws j == n);
@@ -2300,8 +2336,10 @@ and inspect = fn (v: Val) ->
      //   "Â¡"), and only a fixed list of CJK encodings got the groups.
      // ...and a Unicode one that is not the result's (UTF8-MAC, CESU-8 under
      // a UTF-8 default) writes its non-ASCII characters as \u escapes
-     else if enc_utf8_family e && (if str_eq e "UTF-8" then false else true)
-             && (if str_eq e (insp_resenc ()) then false else true) && enc_valid_utf8 sv then
+     // (UTF-8 itself too, under a default that is not: `"\u3042".inspect` is
+     //  "\u3042" when default_internal is US-ASCII)
+     else if enc_utf8_family e
+             && (if str_eq e (insp_resenc ()) then false else true) && enc_valid_utf8 sv && (if rx_src_all7 sv 0 then false else true) then
        (let rec gou = fn (cps: int list) -> fn (acc: str) ->
           (match cps with
            | Nil -> acc
@@ -2409,13 +2447,17 @@ and inspect = fn (v: Val) ->
     // `:"f\x00o\x00o\x00"` where ruby writes `:"foo"`. String#inspect already
     // holds both rules, so the name is inspected AS a String wearing the
     // symbol's encoding rather than through a second copy of them.
+    // ...and a name with non-ASCII in it is a plain one only in the RESULT's
+    // encoding (rb_str_symname_p's resenc): under a US-ASCII default it is
+    // :"\u3042", through String#inspect's rule
     (let e9 = enc_canon_name (sym_enc_name sy) in
      let dummy9 = enc_is_dummy e9 in
+     let res9 = rx_src_all7 sy 0 || str_eq e9 (insp_resenc ()) in
      if (if dummy9 then false else true)
-        && (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else enc_ascii_compat e9) && sym_plain sy
+        && (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else enc_ascii_compat e9) && sym_plain sy && res9
      then ":" ++ sy
      else if (if dummy9 then false else true)
-             && enc_ascii_compat e9 && (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else true)
+             && enc_ascii_compat e9 && (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else true) && res9
      then ":\"" ++ esc_str_b sy 0 "" (rx_src_all7 sy 0) ++ "\""
      else ":" ++ inspect (mkstr_e sy e9))
   | VObj id -> if map_has enc_name (str_of_int id) then "#<Encoding:" ++ enc_display_name (map_get enc_name (str_of_int id)) ++ (if enc_is_dummy (map_get enc_name (str_of_int id)) then " (dummy)" else "") ++ ">" else "#<object>"
