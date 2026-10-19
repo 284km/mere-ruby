@@ -13,8 +13,6 @@
 let rec scan_digits = fn (s: str) -> fn (i: int) ->
   if i < str_len s && is_digit (char_at s i) then scan_digits s (i + 1) else i;
 
-let rec scan_ident = fn (s: str) -> fn (i: int) ->
-  if i < str_len s && is_alnum (char_at s i) then scan_ident s (i + 1) else i;
 
 let rec skip_comment = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then i
@@ -304,9 +302,18 @@ let lex_u8_width = fn (c: str) ->
 let lex_src_cw = fn (s: str) -> fn (i: int) ->
   if lex_src_is_utf8 () then lex_u8_width (char_at s i)
   else
-    (let cd = (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") in
+    // (the coding is the magic comment's spelling, upper-cased: enc_clen1
+    //  knows the canonical names, "WINDOWS-31J" was none of them)
+    (let cd = (match map_get load_ctx "coding" with VStr h -> enc_canon_name (sget h) | _ -> "") in
      let k = enc_clen1 cd (substring s i (if i + 4 < str_len s then i + 4 else str_len s)) in
      if k > 0 then k else 1);
+// an identifier's characters. A non-ASCII one is taken whole in the
+// source's encoding: in a Shift_JIS source the second byte of "\x87]" is
+// a `]`, which is part of the character, not the closing bracket.
+let rec scan_ident = fn (s: str) -> fn (i: int) ->
+  if i < str_len s && is_alnum (char_at s i) then
+    scan_ident s (i + (if ord (char_at s i) >= 128 && (if lex_src_is_utf8 () then false else true) then lex_src_cw s i else 1))
+  else i;
 
 // ⚠ a digit run's underscores as ruby allows them: one between two digits.
 //   `1_` ("trailing '_' in number") and `1__0` ("invalid underscore placement
@@ -525,6 +532,12 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       //   file's encoding. The lexer is the only one that sees the escape,
       //   so it says so with the closer: `(s ... )u8` (see the "(s" parse).
       if lex_u8_escaped s (i + 1) (j - 1) then
+        // (...which cannot sit beside the file's own non-ASCII characters:
+        //  "UTF-8 mixed within EUC-JP source")
+        let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
+        let _ = (if str_eq cd "" || str_eq cd "UTF-8" || str_eq cd "UTF8" then ()
+                 else if lex_raw_nonascii s (i + 1) (j - 1) then syn_refuse ("UTF-8 mixed within " ++ enc_canon_name cd ++ " source")
+                 else ()) in
         tapp (Cons (TP "(s", Cons (TStrL "", segs))) (Cons (TP ")u8", lex_go s j))
       else
       (match segs with
@@ -785,6 +798,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let lit = rx_cm_rewrite lit0 (str_contains fl0 "x") in
       let fl = rx_one_enc_flag fl0 in
       let _ = rx_escapes_check lit fl in
+      let _ = rx_raw_check lit fl in
       let _ = rx_static_frags lit 0 in
       if rx_has_interp lit 0 || rx_has_dvar lit 0 then
         let toks = lex_go (rx_interp_src lit) 0 in
@@ -823,6 +837,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
          let fj = skip_regex_flags s rj in
          let fl = rx_one_enc_flag (substring s rj fj) in
          let _ = rx_escapes_check rlit fl in
+         let _ = rx_raw_check rlit fl in
          let _ = rx_static_frags rlit 0 in
          if rx_has_interp rlit 0 || rx_has_dvar rlit 0 then
            tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src rlit) 0)))
@@ -1399,6 +1414,13 @@ and lvt_prev_local = fn (s: str) -> fn (i: int) ->
 // Does the raw double-quoted body s[i, e) spell a non-ASCII character with a
 // \u escape, in a file whose source encoding is not UTF-8? (A UTF-8 file's
 // literals are UTF-8 anyway, so there it never matters.)
+// a byte past 0x7f written as itself in s[i, e) (not in an escape or #{})
+and lex_raw_nonascii = fn (s: str) -> fn (i: int) -> fn (e: int) ->
+  if i >= e then false
+  else if str_eq (char_at s i) "\\" then lex_raw_nonascii s (i + 2) e
+  else if str_eq (char_at s i) "#" && i + 1 < e && str_eq (char_at s (i + 1)) "\{" then lex_raw_nonascii s (interp_close s (i + 2) 1) e
+  else if ord (char_at s i) >= 128 then true
+  else lex_raw_nonascii s (i + 1) e
 and lex_u8_escaped = fn (s: str) -> fn (i: int) -> fn (e: int) ->
   let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
   if str_eq cd "" || str_eq cd "UTF-8" || str_eq cd "UTF8" then false
@@ -2822,6 +2844,21 @@ and rx_frag_why = fn (v: str) ->
              if str_eq c "c" || str_eq c "C" || str_eq c "M" then go k else go (k + 2)))
     else go (k + 1) in
   go 0
+// ...and the runs of \xHH in the piece must be whole characters of the
+// piece's own encoding (`e('\xc2')` then `e('\xa1')` is two halves)
+and rx_frag_mb_why = fn (v: str) -> fn (enc: str) ->
+  let n = str_len v in
+  let hx = fn (k: int) -> k < n && is_hex_digit (char_at v k) in
+  let rec go = fn (i: int) -> fn (run: str) ->
+    if i + 1 < n && str_eq (char_at v i) "\\" && str_eq (char_at v (i + 1)) "x" && hx (i + 2) && hx (i + 3) then
+      go (i + 4) (run ++ chr (hex_val (char_at v (i + 2)) * 16 + hex_val (char_at v (i + 3))))
+    else
+      (let why = (if str_eq run "" then "" else rx_mb_why run enc) in
+       if (if str_eq why "" then false else true) then why
+       else if i >= n then ""
+       else if str_eq (char_at v i) "\\" then go (i + 2) ""
+       else go (i + 1) "") in
+  go 0 ""
 // ...and a piece that is a plain string literal is read when the pattern
 // is: `/#{"\\"}y/` is a SyntaxError, as ruby compiles that piece in
 and rx_static_frags = fn (lit: str) -> fn (i: int) ->
@@ -2841,6 +2878,88 @@ and rx_static_frags = fn (lit: str) -> fn (i: int) ->
               else ()) in
      rx_static_frags lit j)
   else rx_static_frags lit (i + 1)
+// what onigmo's unescape_escaped_nonascii says of a run of \xHH bytes in
+// a multibyte encoding, character by character: a lead byte the encoding
+// has no use for is "invalid multibyte escape", a character the run ends
+// inside of "too short escaped multibyte character". "" when it is whole.
+and rx_mb_why = fn (run: str) -> fn (enc: str) ->
+  let rec go = fn (p: int) ->
+    if p >= str_len run then ""
+    else
+      (let k = rx_mb_one run p enc in
+       if k > 0 then go (p + k)
+       else if k == 0 then "invalid multibyte escape"
+       else "too short escaped multibyte character") in
+  go 0
+// one character at p of s in enc: its length, 0 when no character starts
+// with that byte or a trail byte is wrong, -1 when s ends inside it
+and rx_mb_one = fn (s: str) -> fn (p: int) -> fn (enc: str) ->
+  let n = str_len s in
+  let b = fn (k: int) -> ord (char_at s k) in
+  let sj = str_eq enc "Shift_JIS" || str_eq enc "Windows-31J" in
+  let eu = str_eq enc "EUC-JP" in
+  let u8 = str_eq enc "UTF-8" in
+  let b0 = b p in
+  let k = (if b0 < 128 then 1
+           else if u8 then (if b0 < 194 || b0 > 244 then 0 else if b0 < 224 then 2 else if b0 < 240 then 3 else 4)
+           else if eu then (if b0 == 142 then 2 else if b0 == 143 then 3 else if b0 >= 161 && b0 <= 254 then 2 else 0)
+           else if sj then (if (b0 >= 129 && b0 <= 159) || (b0 >= 224 && b0 <= 252) then 2 else if b0 >= 161 && b0 <= 223 then 1 else 0)
+           else 1) in
+  let trail = fn (x: int) ->
+    (if u8 then x >= 128 && x <= 191
+     else if eu then x >= 161 && x <= 254
+     else if sj then (x >= 64 && x <= 126) || (x >= 128 && x <= 252)
+     else true) in
+  let rec tr = fn (j: int) ->
+    (if j >= k then k
+     else if p + j >= n then 0 - 1
+     else if trail (b (p + j)) then tr (j + 1)
+     else 0) in
+  if k == 0 then 0 else tr 1
+// a regexp literal's own (unescaped) non-ASCII bytes: an encoding option
+// other than the source's is refused when there are any, and they must be
+// whole characters of the source's encoding (reg_fragment_setenc and the
+// lexer's "invalid multibyte character")
+and rx_raw_check = fn (lit: str) -> fn (fl: str) ->
+  let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
+  let src = (if str_eq cd "" || str_eq cd "UTF-8" || str_eq cd "UTF8" then "UTF-8"
+             else if str_eq cd "EUC-JP" || str_eq cd "EUCJP-MS" || str_eq cd "CP51932" then "EUC-JP"
+             else if str_eq cd "SHIFT_JIS" then "Shift_JIS"
+             else if str_eq cd "WINDOWS-31J" || str_eq cd "CP932" || str_eq cd "SJIS" then "Windows-31J"
+             else if str_eq cd "ASCII-8BIT" || str_eq cd "BINARY" then "ASCII-8BIT"
+             else "") in
+  let n = str_len lit in
+  // (the first raw non-ASCII byte, -1 for none; escapes and #{} skipped)
+  let rec first_raw = fn (i: int) ->
+    if i >= n then 0 - 1
+    else if str_eq (char_at lit i) "\\" then first_raw (i + 2)
+    else if str_eq (char_at lit i) "#" && i + 1 < n && str_eq (char_at lit (i + 1)) "\{" then first_raw (interp_close lit (i + 2) 1)
+    else if ord (char_at lit i) >= 128 then i
+    else first_raw (i + 1) in
+  let r0 = first_raw 0 in
+  if r0 < 0 || str_eq src "" then ()
+  else
+    (let opt = (if str_contains fl "u" then "u" else if str_contains fl "e" then "e" else if str_contains fl "s" then "s" else if str_contains fl "n" then "n" else "") in
+     let oenc = (if str_eq opt "u" then "UTF-8" else if str_eq opt "e" then "EUC-JP" else if str_eq opt "s" then "Windows-31J" else if str_eq opt "n" then "ASCII-8BIT" else src) in
+     if (if str_eq oenc src then false else true) then
+       syn_refuse ("regexp encoding option '" ++ opt ++ "' differs from source encoding '" ++ src ++ "'")
+     else
+       (let rec walk = fn (i: int) ->
+          (if i >= n then ()
+           else if str_eq (char_at lit i) "\\" && i + 1 < n && ord (char_at lit (i + 1)) < 128 then walk (i + 2)
+           else if str_eq (char_at lit i) "\\" then walk (i + 1)
+           else if str_eq (char_at lit i) "#" && i + 1 < n && str_eq (char_at lit (i + 1)) "\{" then walk (interp_close lit (i + 2) 1)
+           else if ord (char_at lit i) < 128 then walk (i + 1)
+           else (let k = rx_mb_one lit i src in
+                 if k > 0 then walk (i + k)
+                 else syn_refuse ("invalid multibyte character: /" ++ rx_raw_show lit 0 ++ "/"))) in
+        walk 0))
+// the pattern as ruby shows it in that refusal: non-ASCII bytes as \xHH
+and rx_raw_show = fn (lit: str) -> fn (i: int) ->
+  if i >= str_len lit then ""
+  else (let o = ord (char_at lit i) in
+        let hd = "0123456789ABCDEF" in
+        (if o >= 128 then "\\x" ++ char_at hd (o / 16) ++ char_at hd (o - (o / 16) * 16) else char_at lit i) ++ rx_raw_show lit (i + 1))
 and rx_escapes_check = fn (lit: str) -> fn (fl: str) ->
   // (a literal with no flag takes the SOURCE's encoding -- the magic
   //  comment's; a one-byte one, `# encoding: binary` included, takes any byte)
@@ -2859,7 +2978,8 @@ and rx_escapes_check = fn (lit: str) -> fn (fl: str) ->
   let flush = fn (run: str) ->
     (if str_len run == 0 || str_eq enc "" then ()
      else if enc_valid run enc then ()
-     else syn_refuse ("too short escaped multibyte character: /" ++ rx_esc_show run ++ "/")) in
+     else (let why = rx_mb_why run enc in
+           syn_refuse ((if str_eq why "" then "too short escaped multibyte character" else why) ++ ": /" ++ rx_esc_show run ++ "/"))) in
   let rec go = fn (i: int) -> fn (run: str) ->
     if i >= n then flush run
     else if str_eq (char_at lit i) "\\" && i + 3 < n + 0 && i + 1 < n && str_eq (char_at lit (i + 1)) "x" && hx (i + 2) && hx (i + 3) then
@@ -4296,12 +4416,7 @@ and parse_primary = fn toks ->
           else (EMethod (e9, "__lit_enc~" ++ cd, Nil), r9)))
   // ...and a non-ASCII SYMBOL literal takes the same encoding: under
   // `# encoding: binary`, `:"il_\xC3\xA9tait"` is a BINARY symbol
-  | Cons (TSym s, r) ->
-    (let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
-     if str_eq cd "" || str_eq cd "UTF-8" || str_eq cd "UTF8" || enc_all7 s
-        || str_eq cd "US-ASCII" || str_eq cd "ASCII" || str_eq cd "USASCII"
-     then (ESym s, r)
-     else (EMethod (ESym s, "__lit_enc~" ++ cd, Nil), r))
+  | Cons (TSym s, r) -> (sym_src_enc s, r)
   | Cons (TId id, r) ->
     // `and` / `or` cannot START an expression. (Since ruby 4.0 a line that
     // begins with one CONTINUES the statement before it -- apply_modifier and
@@ -4990,6 +5105,14 @@ and hash_items_sep = fn r3 -> fn (acc: Expr list) ->
     else (let __fm = ("mere-ruby: expected , or } in hash, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated hash literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated hash literal" ++ parsing_file ()))
 
+// a symbol literal in the source's encoding: a non-ASCII one in a file
+// that is not UTF-8 is tagged with it (`__lit_enc~`)
+and sym_src_enc = fn (s: str) ->
+  let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
+  if str_eq cd "" || str_eq cd "UTF-8" || str_eq cd "UTF8" || enc_all7 s
+     || str_eq cd "US-ASCII" || str_eq cd "ASCII" || str_eq cd "USASCII"
+  then ESym s
+  else EMethod (ESym s, "__lit_enc~" ++ cd, Nil)
 and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
   // `name: value` symbol-key shorthand is equivalent to `:name => value`.
   let (k, r2) =
@@ -5031,6 +5154,8 @@ and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
      | ESym nm -> hash_items_sep (skip_nls r2) (Cons (EVar nm, Cons (k, acc)))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad hash key")) in fail "mere-ruby: bad hash key"))
   else
+  // (a non-ASCII label takes the file's encoding, as a :symbol does)
+  let k = (match k with ESym nm -> sym_src_enc nm | _ -> k) in
   let (v, r3a) = parse_expr (skip_nls r2) in
   let r3 = skip_nls r3a in
   match r3 with
