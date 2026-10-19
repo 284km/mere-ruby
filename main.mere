@@ -6222,6 +6222,15 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
   // exception (true, nil, 3, :sym, [1]) are ruby's TypeError -- they became
   // RuntimeErrors whose message was the value's #to_s.
   | Cons (VStr _, Cons (_, _)) -> raise_exc world "TypeError" "exception class/object expected"
+  // (a message in another encoding keeps it: the pair holds bytes, and
+  //  `raise "\x82\xa0"` in a cp932 source answered a UTF-8 #message)
+  | Cons (VStr h9, Nil) when (let e9 = enc_canon_name (senc_get h9) in
+                              (if str_eq e9 "UTF-8" || str_eq e9 "US-ASCII" then false else true) && (if enc_all7 (sget h9) then false else true)) ->
+    (let (_, _, ocls9, ivars9) = world in
+     let id9 = alloc_oid ocls9 in
+     let _ = map_set ocls9 id9 "RuntimeError" in
+     let _ = map_set ivars9 (str_of_int id9 ++ "@message") (VStr h9) in
+     exc_with_cause world (VObj id9))
   | Cons (VStr _, Nil) -> exc_with_cause world (make_exc args)
   // ⚠ the lightweight pair exists ONLY because something raised it (`.new`
   //   builds an object), so raising one again is a RE-raise, and ruby fixes an
@@ -11612,6 +11621,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   let _ = bi_reg_set name0 recv0 (caller_depth ()) in
   // (main's private helpers, called with a receiver other than a literal
   //  self: main_priv_name)
+  // (an exception the interpreter raised is a pair until it needs to be an
+  //  object, and the pair has no Locations of its own: they are its
+  //  backtrace's frames -- nil only when the program set the backtrace as
+  //  Strings. `e = assert_raise(TypeError) { {**1} }` answered nil.)
   let v = (if vischeck && (match recv0 with VMain -> main_priv_name name0 | _ -> false)
            then raise_exc_iv world "NoMethodError" ("private method '" ++ name0 ++ "' called for main")
                   (Cons (("__name", VSym name0), Cons (("__recv", VMain), Cons (("__args", arr_new args0), Nil))))
@@ -11622,6 +11635,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
            then (if (match args0 with Nil -> true | _ -> false) && (str_eq name0 "public" || str_eq name0 "private") then VNil
                  else invoke_val_c0 env world blk (VClass "Object") name0 args0 false)
            else invoke_val_c0 env world blk recv0 name0 args0 vischeck) in
+  // (...where the pair answered none, they are its backtrace's frames)
+  let v = (match v with
+           | VNil when (str_len name0 == 19 && str_eq name0 "backtrace_locations") && (match recv0 with VExc (_, _) -> true | _ -> false)
+                       && (if map_has raise_bt "e" && map_has raise_bt "eb" && rb_eq (map_get raise_bt "e") recv0 then false else true) ->
+             (match invoke_val_c0 env world blk recv0 "backtrace" Nil false with
+              | VArr a9 -> arr_new (bt_locs_of world (deref a9))
+              | _ -> VNil)
+           | _ -> v) in
   let _ = bi_reg_set pn pr pd in
   // the builtin #to_s / #inspect of nil, true, false, a Symbol, a Module, a
   // Range, a Rational, a Complex and an Encoding answer US-ASCII when the text
@@ -20953,11 +20974,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              c9)
           | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
        else if (str_len name == 5 && str_eq name "write") || (str_len name == 8 && str_eq name "syswrite") then
-         (let s2 = io_join_go args "" in
+         (let args = stdio_conv env world blk id args in
+          let s2 = io_join_go args "" in
           let _ = (if fd == 2 then err_raw s2 else out_print_checked world s2) in
           VInt (str_len s2))
        else if (str_len name == 2 && str_eq name "<<") then
-         (let s2 = io_join_go args "" in
+         (let args = stdio_conv env world blk id args in
+          let s2 = io_join_go args "" in
           let _ = (if fd == 2 then err_raw s2 else out_print_checked world s2) in
           recv)
        else if (str_len name == 5 && str_eq name "flush") || (str_len name == 5 && str_eq name "sync=") then recv
@@ -21002,17 +21025,24 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 4 && str_eq name "hash") then VInt (val_hash recv)
        else if (str_len name == 17 && str_eq name "external_encoding") then
          (if map_has ivars (str_of_int id ++ "@__io_ext") then map_get ivars (str_of_int id ++ "@__io_ext")
+          // (-E ext:int gives the standard streams the encodings it names;
+          //  an external one alone leaves them nil, as ruby's does)
+          else if map_has cli_opt "enc_external" && map_has cli_opt "enc_internal" && map_has def_ext_enc "v" then map_get def_ext_enc "v"
           else if fd == 0 then
             (if map_has def_ext_enc "v" then map_get def_ext_enc "v"
              else if map_has enc_objs "UTF-8" then map_get enc_objs "UTF-8" else VNil)
           else VNil)
        else if (str_len name == 17 && str_eq name "internal_encoding") then
          (if map_has ivars (str_of_int id ++ "@__io_int") then map_get ivars (str_of_int id ++ "@__io_int")
+          else if map_has cli_opt "enc_internal" && map_has def_int_enc "v"
+                  && (if map_has def_ext_enc "v" && rb_eq (map_get def_ext_enc "v") (map_get def_int_enc "v") then false else true)
+          then map_get def_int_enc "v"
           else VNil)
        else if (str_len name == 12 && str_eq name "set_encoding") then
          (let one9 = fn (a: Val) ->
             (match a with
-             | VStr h9 -> (let nm9 = enc_canon (sget h9) in
+             // (any spelling ruby takes: "utf-8" answered the String itself)
+             | VStr h9 -> (let nm9 = enc_find_canon (sget h9) in
                            if map_has enc_objs nm9 then map_get enc_objs nm9 else a)
              | _ -> a) in
           // the trailing OPTIONS are options, not an encoding: the internal
@@ -22999,8 +23029,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             (if (if alive then false else true) then VNil
              // another thread: under the scheduler its stack is standing,
              // suspended, and its frames can be read off it
+             // (...as Locations too, and selected by (level, length) or a
+             //  range as the current thread's are -- both were the whole
+             //  list, and the Locations none)
              else if (if thr_is_current recv then false else true) then
-               arr_new (if fb_can_suspend && (str_len name == 9) then sch_backtrace tid else (Nil : Val list))
+               (let strs9 = (if fb_can_suspend then sch_backtrace tid else (Nil : Val list)) in
+                let all9 = (if (str_len name == 19) then bt_locs_of world strs9 else strs9) in
+                match caller_args env world args with
+                | Nil -> arr_new all9
+                | Cons (a9, Cons (b9, _)) -> caller_pick2 all9 a9 b9
+                | Cons (a9, _) -> caller_pick all9 a9)
              else
                (let lbl9 = "Thread#" ++ name in
                 let all9 = (if (str_len name == 19) then Cons (loc_obj world (cur_file ()) (cur_line ()) lbl9, caller_locs world 0 (0 - 1))
@@ -38990,6 +39028,27 @@ and anc_const_key = fn world -> fn (cref: str) -> fn (name: str) ->
 // Exception#set_backtrace on an object: an Array of Strings is the backtrace,
 // and then there are no Locations (@__bt_user); an Array of Locations is kept
 // as the Locations, with its Strings as the backtrace
+// A standard stream with an external encoding (set_encoding, or -E) writes
+// a String in another encoding converted to it, as ruby's do_writeconv does:
+// `-Eutf-8:cp932` with `raise "\x82\xa0"` in a cp932 source reports the
+// message as UTF-8. BINARY and an ASCII-only String are written as they are.
+and stdio_conv = fn env -> fn world -> fn blk -> fn (id: int) -> fn (args: Val list) ->
+  let (_, _, _, ivars) = world in
+  let ext9 = (if map_has ivars (str_of_int id ++ "@__io_ext") then map_get ivars (str_of_int id ++ "@__io_ext")
+              else if map_has cli_opt "enc_external" && map_has cli_opt "enc_internal" && map_has def_ext_enc "v" then map_get def_ext_enc "v"
+              else VNil) in
+  let en9 = (match ext9 with VObj eo9 -> (if map_has enc_name (str_of_int eo9) then enc_canon_name (map_get enc_name (str_of_int eo9)) else "") | _ -> "") in
+  if str_eq en9 "" || str_eq en9 "ASCII-8BIT" then args
+  else
+    (let rec go = fn (xs: Val list) ->
+       (match xs with
+        | Nil -> Nil
+        | Cons (VStr h9, t9) ->
+          (let se9 = enc_canon_name (senc_get h9) in
+           if str_eq se9 en9 || str_eq se9 "ASCII-8BIT" || enc_all7 (sget h9) then Cons (VStr h9, go t9)
+           else Cons (invoke_val_c env world blk (VStr h9) "encode" (Cons (ext9, Nil)) false, go t9))
+        | Cons (x9, t9) -> Cons (x9, go t9)) in
+     go args)
 and exc_set_bt = fn world -> fn (id: int) -> fn (v: Val) ->
   let (_, _, ocls, ivars) = world in
   let k9 = str_of_int id in
@@ -48075,6 +48134,13 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      // require_relative ran one body twice). Asked through the name it was
      // loaded under, so a $LOADED_FEATURES the program rewrote still decides.
      if feature_loaded full then (let _ = req_circular_warn world full in FNext (VBool false)) else
+     // (...and a feature a file PROVIDED by name -- `$" << "target.rb"` in
+     //  a required file -- is loaded as far as `require "target"` is
+     //  concerned, wherever a target.rb would be found)
+     //  (the interpreter's own bare entries -- set.rb, thread.rb -- are
+     //  answered by the paths below, which also define what they name)
+     if (if str_contains p1 "/" || str_eq p1 "set.rb" || str_eq p1 "thread.rb" || str_eq p1 "ruby2_keywords.rb" then false
+         else feature_loaded p1) then FNext (VBool false) else
      let rpf = (if is_reg_file full then feat_realpath full else full) in
      if map_has feat_rpaths rpf && feature_loaded (map_get feat_rpaths rpf) then FNext (VBool false)
      // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
@@ -48247,7 +48313,17 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
         // program runs, so `require "set"` answers false. The library still has
         // to LOAD here (mere-ruby ships it as source behind an autoload); only
         // the answer changes.
-        | _ -> FNext (VBool (if str_eq p0 "set" || str_eq p0 "set.rb" then false else true)))
+        // (...and a feature takes its place in $LOADED_FEATURES when its file
+        //  has FINISHED, after whatever the file required or provided: ruby
+        //  appends it then. It went in when the load began -- the circular
+        //  check still sees it there while the file runs -- and is moved to
+        //  the end now. `$".pop` after `require "provide"` is provide.rb.)
+        | _ ->
+          let _ = (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
+                   | VArr lfid -> (let xs9 = deref lfid in
+                                   if val_strs_have xs9 full then arr_set lfid (list_append (vals_without xs9 full) (Cons (mkstr full, Nil))) else ())
+                   | _ -> ()) in
+          FNext (VBool (if str_eq p0 "set" || str_eq p0 "set.rb" then false else true)))
 
 // a Val list with every string equal to `s` removed.
 
