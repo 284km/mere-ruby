@@ -2693,6 +2693,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // does not appear in #local_variables), so it is resolved here rather
     // than bound: a real local or method called `it` is found above and wins.
     else if (str_len name == 2 && str_eq name "it") && lv_has env "_1" then lv_get env "_1"
+    // (a name main's singleton class answers, ahead of Object's: main_sng_has)
+    else if map_len hng_store > 0 && (match (if lv_has env "self" then lv_get env "self" else VMain) with VMain -> true | _ -> false)
+            && main_sng_has world name then
+      invoke_val_c env world noblk VMain name Nil false
     else if map_has meths name then call_method env world noblk name Nil
     // Kernel#local_variables: the locals visible in the current scope.
     else if (str_len name == 15 && str_eq name "local_variables") then local_vars_of env
@@ -2782,6 +2786,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else
     let args = eval_args env world blk arges in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+    // (with main as self, `extend M` is main's, and a method main's singleton
+    //  class has -- `def self.x`, an extended module's -- is found there before
+    //  Object's)
+    let self9 = (if lv_has env "self" then lv_get env "self" else VMain) in
+    if (match self9 with VMain -> true | _ -> false)
+       && ((str_len name == 6 && str_eq name "extend") || main_sng_has world name) then
+      invoke_val_c env world blk VMain name args false
+    else
     // Kernel conversion functions: Integer()/Float()/String()/Array()/
     // Rational()/Complex()/Hash().
     // top-level `autoload :Const, "path"` (implicit self is main, so it
@@ -11497,7 +11509,18 @@ and builtin_arity_msg_b = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
   let (pn, pr, pd) = bi_reg_get () in
   let _ = bi_reg_set name0 recv0 (caller_depth ()) in
-  let v = invoke_val_c0 env world blk recv0 name0 args0 vischeck in
+  // (main's private helpers, called with a receiver other than a literal
+  //  self: main_priv_name)
+  let v = (if vischeck && (match recv0 with VMain -> main_priv_name name0 | _ -> false)
+           then raise_exc_iv world "NoMethodError" ("private method '" ++ name0 ++ "' called for main")
+                  (Cons (("__name", VSym name0), Cons (("__recv", VMain), Cons (("__args", arr_new args0), Nil))))
+           // ...and with a literal self (or send) they are Object's: `self.private
+           // :m` makes a top-level method private, `self.public` alone answers
+           // nil, `self.define_method` defines on Object
+           else if (match recv0 with VMain -> main_priv_name name0 && (if str_eq name0 "include" || str_eq name0 "using" then false else true) | _ -> false)
+           then (if (match args0 with Nil -> true | _ -> false) && (str_eq name0 "public" || str_eq name0 "private") then VNil
+                 else invoke_val_c0 env world blk (VClass "Object") name0 args0 false)
+           else invoke_val_c0 env world blk recv0 name0 args0 vischeck) in
   let _ = bi_reg_set pn pr pd in
   // the builtin #to_s / #inspect of nil, true, false, a Symbol, a Module, a
   // Range, a Rational, a Complex and an Encoding answer US-ASCII when the text
@@ -14657,6 +14680,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // module's instance methods into the receiver's singleton class.
   else if (str_len name == 6 && str_eq name "extend") && (match recv with VClass _ -> true | VObj _ -> true
                                          | VStr _ -> true | VArr _ -> true | VHsh _ -> true
+                                         // (main too: `extend M` at the top level)
+                                         | VMain -> true
                                          | _ -> false) then
     // extend mixes a module's instance methods in as singleton methods of the
     // receiver. For an object that means materialising its singleton class (so
@@ -14694,6 +14719,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                | VHsh _ -> prim_sng_cls world recv "Hash"
                | VProc _ -> prim_sng_cls world recv "Proc"
                | VBind _ -> prim_sng_cls world recv "Binding"
+               | VMain -> prim_sng_cls world recv "Object"
                | _ -> "") in
      // a module with its own `self.extend_object` REPLACES the mixin: ruby
      // calls it instead, and the documented override ends with `super`, which
@@ -17527,7 +17553,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 // with NO names it sets the default visibility of the scope it
                 // was called from (see "__vis" in register_class_v) -- a
                 // `send :private`, or a `private` inside a block in the body
-                | Nil -> (let _ = (if (match args with Nil -> true | _ -> false) && lv_has env "__meth"
+                // (the method's OWN frame: a block inside a method -- a
+                //  Module.new body written in a test -- is not warned about,
+                //  ruby looks at the caller's iseq type)
+                | Nil -> (let _ = (if (match args with Nil -> true | _ -> false) && map_has env "__meth"
                                       && (if (str_len name == 20 && str_eq name "private_class_method") || (str_len name == 19 && str_eq name "public_class_method") then false else true)
                                    // (reached by a call -- an alias of it, `priv` --
                                    //  inside a method: the warning the bare
@@ -17978,6 +18007,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else (let _ = map_set seen9 nm9 1 in
                 let m9 = map_len tmp in
                 map_set tmp (str_of_int m9) (VSym nm9))) in
+       // (main's singleton class has methods of its own that no table row
+       //  names: inspect and to_s public, the top-level helpers private)
+       let _ = (if map_has hng_store "main:0" && str_eq (map_get hng_store "main:0") c then
+                  (if want_priv then list_iter (Cons ("define_method", Cons ("include", Cons ("private", Cons ("public", Cons ("ruby2_keywords", Cons ("using", Nil))))))) push9
+                   else if want_prot then ()
+                   else list_iter (Cons ("inspect", Cons ("to_s", Nil))) push9)
+                else ()) in
        // ⚠ ...and the NO-ARGUMENT form asks for the ancestors too. This branch
        //   answered own-methods whatever it was passed, so
        //   `SomeModule.private_instance_methods` -- the form eight core/module
@@ -25287,9 +25323,9 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                      // was the only answer here.
                      | VNil -> "NilClass"
                      | VBool b2 -> (if b2 then "TrueClass" else "FalseClass")
-                     // main's singleton methods are its top-level ones, the
-                     // way `def self.m` at the top level makes them
-                     | VMain -> "(main)"
+                     // main's singleton methods live in its singleton class,
+                     // as `def self.m` at the top level puts them
+                     | VMain -> hng_cls_of world VMain "Object"
                      | _ -> "") in
        let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr s2, _) -> sget s2 | _ -> "") in
        let _ = frz_recv_check env world recv in
@@ -27063,7 +27099,35 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         arr_new (idx_to_list out9 0 (map_len out9))))
   else if (str_len name == 17 && str_eq name "singleton_methods") then
     (match recv with
-     | VMain -> arr_new (Cons (VSym "inspect", Cons (VSym "to_s", Nil)))
+     // (main: its two, what its singleton class defines, and -- unless
+     //  `false` -- the public methods of the modules it was extended with)
+     | VMain ->
+       (let out9 = map_new () in
+        let add9 = fn (n9: str) -> (if map_has out9 n9 then () else map_set out9 n9 (VSym n9)) in
+        let _ = add9 "inspect" in
+        let _ = add9 "to_s" in
+        let _ = (if map_has hng_store "main:0" then
+                   (let (meths9, _, _, _) = world in
+                    let sc9 = map_get hng_store "main:0" in
+                    let all9 = (match args with Cons (VBool false, _) -> false | Cons (VNil, _) -> false | _ -> true) in
+                    let oa9 = ancestors_of world "Object" in
+                    let rec own9 = fn (c9: str) ->
+                      (let pfx = c9 ++ "#" in
+                       let plen = str_len pfx in
+                       map_iter meths9 (fn (k: str) -> fn (v: Meth) ->
+                         if str_len k > plen && str_eq (substring k 0 plen) pfx
+                            && (if map_has privates k || map_has protecteds k then false else true)
+                         then add9 (substring k plen (str_len k)) else ())) in
+                    let rec walk9 = fn (xs: str list) ->
+                      (match xs with
+                       | Nil -> ()
+                       | Cons (a9, t9) -> (if str_list_has oa9 a9 then ()
+                                           else (let _ = (if str_eq a9 sc9 || all9 then own9 a9 else ()) in walk9 t9))) in
+                    walk9 (ancestors_of world sc9))
+                 else ()) in
+        let l9 = map_new () in
+        let _ = map_iter out9 (fn (k9: str) -> fn (v9: Val) -> map_set l9 (str_of_int (map_len l9)) v9) in
+        arr_new (idx_to_list l9 0 (map_len l9)))
      // a String, Array, Hash or Proc with a singleton class of its own lists
      // the public methods defined there (it answered [] whatever was defined)
      | _ ->
@@ -27112,6 +27176,8 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
      | VHsh _ -> VClass (prim_sng_cls world recv "Hash")
      | VProc _ -> VClass (prim_sng_cls world recv "Proc")
      | VBind _ -> VClass (prim_sng_cls world recv "Binding")
+     // (main has one too: an Object of its own)
+     | VMain -> VClass (prim_sng_cls world recv "Object")
      | _ -> raise_exc world "TypeError" "can't define singleton")
   // String#encode: real transcode between UTF-8/ISO-8859-1/US-ASCII (and
   // relabel to/from ASCII-8BIT); an unrepresentable char raises a catchable
@@ -28376,6 +28442,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
 and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
   let (meths, sup, ocls, ivars) = world in
   match recv with
+  // (main's singleton class or a module it was extended with, when that is
+  //  where the name is: `def self.foo` at the top level)
+  | VMain when main_sng_has world nm ->
+    owner_anc world (ancestors_of world (map_get hng_store "main:0")) nm
   | VMain -> ""
   | VObj oid ->
     (let ocl = map_get ocls oid in
@@ -36262,6 +36332,8 @@ and kernel_overridden = fn env -> fn world -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
   map_has meths name || has_meth world "Kernel" name || has_meth world "Object" name
   || self_defines env world name
+  // (...and main's own singleton: `class << self; def puts` at the top level)
+  || (match (if lv_has env "self" then lv_get env "self" else VMain) with VMain -> main_sng_has world name | _ -> false)
 and undef_call_exc = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) ->
   undef_call_exc_x world blame name args false
 // Who the method was wanted from. A NoMethodError that names only the method is
@@ -36292,6 +36364,13 @@ and kernel_bare_special = fn (name: str) ->
   || (str_len name == 4 && str_eq name "exit")
 
 and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
+  // (main's own private methods -- include, public, private, define_method,
+  //  using, ruby2_keywords -- are there, and private: `self.include` is
+  //  "private method 'include' called for main")
+  if (match blame with VMain -> main_priv_name name | _ -> false) then
+    raise_exc_iv world "NoMethodError" ("private method '" ++ name ++ "' called for main")
+      (Cons (("__name", VSym name), Cons (("__recv", VMain), Cons (("__args", arr_new args), Nil))))
+  else
   // ⚠ a CLASS (or module) with a `def self.method_missing` gets the call
   //   instead of the NoMethodError: every other receiver kind asks its
   //   method_missing before giving up, and the class-method path came here
@@ -37500,6 +37579,25 @@ and env_as_main = fn env ->
   match (if lv_has env "self" then lv_get env "self" else VMain) with
   | VMain -> env
   | _ -> (let e9 = lv_child env in let _ = map_set e9 "self" VMain in e9)
+// the private methods main's singleton class has of its own (ruby's
+// top_include, top_public, ... : `singleton_class.private_instance_methods(false)`)
+and main_priv_name = fn (n: str) ->
+  str_eq n "include" || str_eq n "public" || str_eq n "private" || str_eq n "define_method"
+  || str_eq n "using" || str_eq n "ruby2_keywords"
+// does main's singleton class (or a module it was extended with) define name
+// itself -- above Object, which every top-level call already reaches?
+and main_sng_has = fn world -> fn (name: str) ->
+  if map_has hng_store "main:0" then
+    (let sc9 = map_get hng_store "main:0" in
+     let oa9 = ancestors_of world "Object" in
+     let rec go9 = fn (xs: str list) ->
+       (match xs with
+        | Nil -> false
+        | Cons (a9, t9) -> (if str_list_has oa9 a9 then false
+                            else if has_own_meth world a9 name then true
+                            else go9 t9)) in
+     go9 (ancestors_of world sc9))
+  else false
 and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   (match map_get meths name with
@@ -45556,6 +45654,8 @@ and cls_display = fn world -> fn (c0: str) ->
            // bookkeeping name (`#<Class:#<#<Class:0x..>:0x..>>`)
            let ocn = (if is_anon_cls ocn then to_s (VClass ocn) else ocn) in
            "#<Class:#<" ++ ocn ++ ":0x" ++ hex_pad16 (oid - handle_base) ++ ">>")
+     // (main's is an Object's, as ruby prints it: #<Class:#<Object:0x...>>)
+     else if str_eq inner "main:0" then "#<Class:#<Object:0x" ++ hex_pad16 8 ++ ">>"
      // a String's, an Array's (... hng_key) singleton is the object's too:
      // #<Class:#<String:0x...>>, not the bookkeeping key "str:N"
      else if str_len inner > 4 && str_eq (char_at inner 3) ":" && is_digit (char_at inner 4) then
@@ -47971,8 +48071,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              | VObj id -> (let _ = run_singleton_method_added world (VObj id) m in
                            singleton_cls_of world id ++ "#" ++ m)
              | VClass c -> (let _ = frz_cls_check world c in "(sng:" ++ c ++ ")#" ++ m)
+             // (main's own singleton class: `singleton_methods` lists it and
+             //  only main answers it -- main_sng_has finds it for a bare call)
+             | VMain -> prim_sng_cls world VMain "Object" ++ "#" ++ m
              | _ -> m)
-          else m)
+          else prim_sng_cls world VMain "Object" ++ "#" ++ m)
        else if str_contains name "#" then
          // `def C.m` names C the way any constant reference does: lexically
          // first. Asked at the top level only, `class A; class C; def C.m`
@@ -48265,19 +48368,15 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let name = resolve_scoped_base env name in
     // `class << target` at top level: open the target's singleton class.
     if (str_len name == 11 && str_eq name "<<singleton") then
-      // `class << self` at the top level opens main's singleton class, whose
-      // methods are private top-level methods; mere has no distinct main
-      // singleton, so run the body at top level (self stays main) and its
-      // `def`s register as bare top-level methods.
-      (if str_eq super0 "self" && lv_has env "self" && (match lv_get env "self" with VMain -> true | _ -> false) then
-         run_stmts env world blk body
-       // A `class << self` body's constant lookup continues the ENCLOSING
+      // (`class << self` at the top level opens main's singleton class --
+      //  sng_target_cls -- as for any other object)
+      (// A `class << self` body's constant lookup continues the ENCLOSING
        // lexical scope -- ruby walks the cref chain, so `Internal` inside
        // `module Zeitwerk; module X; class << self` finds Zeitwerk::Internal.
        // Only the def target is the singleton class.
        // the enclosing scope is the CALLER's cref (a method body carries the
        // scope its `def` was written in), falling back to the lexical stack.
-       else register_class_sng_in world (sng_target_cls world env super0 "Object") body
+       register_class_sng_in world (sng_target_cls world env super0 "Object") body
               (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ()))
     // `class Foo < Class`: Class has no subclasses
     else if str_eq super0 "Class" then
@@ -48508,7 +48607,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // ConstantSpecs::ModuleA` -- unable to see a dozen of its own constants.
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
      | VMain ->
-       (let mq = (if lv_has env m then (match lv_get env m with VClass mc -> mc | _ -> m) else m) in
+       // (a constant may hold an anonymous module: `Mod = Module.new;
+       //  include Mod` included the NAME "Mod", a module nobody made, and
+       //  its made-up ancestry put Object in it -- "cyclic include detected")
+       (let mq = (if lv_has env m then (match lv_get env m with VClass mc -> mc | _ -> m) else named_class_of_al env world blk "" m) in
         let _ = (if pre then do_prepend world "Object" mq else do_include world "Object" mq) in
         FNext VNil)
      | VClass c ->
@@ -48548,7 +48650,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // (bare, inside a METHOD: ruby warns that it sets the mode of the
     //  method's own scope, not the class's -- rb_warn, so not under -W0)
     let _ = (match names with
-             | Nil -> (if lv_has env "__meth" && (str_eq mode "public" || str_eq mode "private" || str_eq mode "protected" || str_eq mode "module_function")
+             | Nil -> (if map_has env "__meth" && (str_eq mode "public" || str_eq mode "private" || str_eq mode "protected" || str_eq mode "module_function")
                        then rb_warn world ("calling " ++ mode ++ " without arguments inside a method may not have the intended effect") else ())
              | _ -> ()) in
     let _ = (if str_eq mode "public" then publish_toplevel meths names else ()) in
