@@ -469,10 +469,17 @@ and raise_exc_iv = fn world -> fn (cls: str) -> fn (msg0: str) -> fn (fields: (s
   let _ = (if map_has frz_busy "v" then map_delete frz_busy "v" else ()) in
   let id = alloc_oid ocls in
   let _ = map_set ocls id cls in
-  let _ = map_set ivars (str_of_int id ++ "@message") (mkstr msg) in
+  let msg9 = mkstr msg in
+  let _ = map_set ivars (str_of_int id ++ "@message") msg9 in
+  // (a "__menc" field is no ivar: it names the message's encoding, as
+  //  sprintf's KeyError gives its format's)
   let rec put = fn (fs: (str * Val) list) ->
     (match fs with
      | Nil -> ()
+     | Cons (("__menc", VStr eh9), t) ->
+       (let e9 = sget eh9 in
+        let _ = (match msg9 with VStr mh9 -> (if str_eq e9 "" || str_eq e9 "UTF-8" then () else senc_set mh9 e9) | _ -> ()) in
+        put t)
      | Cons ((nm, v), t) -> (let _ = map_set ivars (str_of_int id ++ "@" ++ nm) v in put t)) in
   let _ = put fields in
   // an exception the interpreter raises inside a rescue has a cause as any
@@ -2782,9 +2789,12 @@ and range_to_a = fn (i: int) -> fn (last: int) ->
 // after numbered", "named{key} after unnumbered(2)") -- asked BEFORE the
 // key is looked up, so a mixed format is not a KeyError
 and rb_fmt_to_named_k = fn (mode: int) -> fn (op: str) -> fn (key: str) -> fn (cl: str) -> fn (nextarg: int) ->
-  if mode == 2 then (let _ = prim_raise "ArgumentError" ("named" ++ op ++ key ++ cl ++ " after numbered") in 3)
-  else if mode == 1 then (let _ = prim_raise "ArgumentError" ("named" ++ op ++ key ++ cl ++ " after unnumbered(" ++ int_to_base nextarg 10 ++ ")") in 3)
+  if mode == 2 then (let _ = prim_raise_enc "ArgumentError" ("named" ++ op ++ key ++ cl ++ " after numbered") (fmt_enc_now ()) in 3)
+  else if mode == 1 then (let _ = prim_raise_enc "ArgumentError" ("named" ++ op ++ key ++ cl ++ " after unnumbered(" ++ int_to_base nextarg 10 ++ ")") (fmt_enc_now ()) in 3)
   else 3
+// the encoding of the format being read (rb_format_in), for a refusal that
+// names part of it
+and fmt_enc_now = fn (u: unit) -> if map_has fmt_enc_cur "v" then map_get fmt_enc_cur "v" else ""
 and rb_fmt_is_type = fn (c: str) ->
   map_has (name_set "rb_fmt_is_type") c
 and rb_fmt_posarg = fn (args: Val list) -> fn (k: int) ->
@@ -2974,11 +2984,32 @@ and rb_digit_val_x = fn (c: str) ->
   else if o >= 97 && o <= 122 then o - 87
   else if o >= 65 && o <= 90 then o - 55
   else 0 - 1
-and rb_hexf = fn (ds: str) -> fn (i: int) -> fn (acc: float) ->
-  if i >= str_len ds then acc
-  else rb_hexf ds (i + 1) (acc * 16.0 + float_of_int (rb_digit_val_x (char_at ds i)))
-and rb_powf = fn (b: float) -> fn (e: int) ->
-  if e <= 0 then 1.0 else b * rb_powf b (e - 1)
+// the hex digits hd times 2**e2: the leading zeros dropped, the first 15
+// significant digits (60 bits) as an exact integer, the rest counted into
+// the exponent
+and rb_hex_sig = fn (hd: str) -> fn (e2: int) ->
+  let n = str_len hd in
+  let rec lz = fn (i: int) -> if i < n && str_eq (char_at hd i) "0" then lz (i + 1) else i in
+  let b = lz 0 in
+  if b >= n then 0.0
+  else
+    (let k = (if n - b > 15 then 15 else n - b) in
+     let rec acc = fn (i: int) -> fn (v: int) -> if i >= b + k then v else acc (i + 1) (v * 16 + rb_digit_val_x (char_at hd i)) in
+     let ex = e2 + 4 * (n - b - k) in
+     let ex = (if ex > 4000 then 4000 else if ex < 0 - 4000 then 0 - 4000 else ex) in
+     ldexp (float_of_int (acc b 0)) ex)
+// ruby reads a number with underscores through a buffer of DBL_DIG * 4
+// characters (util.c's rb_cstr_to_dbl): the leading zeros fold to one, and
+// past the buffer the mantissa's characters are dropped, so 10000 ones
+// joined by "_" is 1.1111111111111112e+59, not Infinity
+and rb_flt_us_cut = fn (us: bool) -> fn (m: str) ->
+  if us == false then m
+  else
+    (let sg = (if str_len m > 0 && str_eq (char_at m 0) "-" then "-" else "") in
+     let b0 = str_len sg in
+     let rec lz = fn (i: int) -> if i + 1 < str_len m && str_eq (char_at m i) "0" && str_eq (char_at m (i + 1)) "0" then lz (i + 1) else i in
+     let m2 = sg ++ substring m (lz b0) (str_len m) in
+     if str_len m2 > 60 then substring m2 0 60 else m2)
 and rb_flt_parse = fn (s0: str) ->
   let hi = rb_int_rtrim s0 (str_len s0) in
   let lo = rb_int_ltrim s0 0 in
@@ -3018,9 +3049,10 @@ and rb_flt_parse = fn (s0: str) ->
            else (0, i3)) in
         if i4 < hi then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
         else
-          let iv = rb_hexf ds 0 0.0 in
-          let fv = (if str_len fs == 0 then 0.0 else rb_hexf fs 0 0.0 / rb_powf 16.0 (str_len fs)) in
-          sgn * (iv + fv) * (if pexp >= 0 then rb_powf 2.0 pexp else 1.0 / rb_powf 2.0 (0 - pexp))
+          // (the significant digits and a binary exponent, put together once
+          //  by ldexp: "0x0." and 268 zeros then "1fp2099" is 31 * 2**1019,
+          //  where 16**270 and 2**2099 apart are Infinity and made NaN)
+          sgn * rb_hex_sig (ds ++ fs) (pexp - 4 * str_len fs)
     else
       // decimal: digits [. digits] [e [sign] digits], each digit run allowing
       // single underscores between digits.
@@ -3044,10 +3076,11 @@ and rb_flt_parse = fn (s0: str) ->
            else ("", i3)) in
         if i4 < hi then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
         else
-          float_of_str ((if neg then "-" else "")
-                        ++ (if str_len ds == 0 then "0" else ds)
-                        ++ (if str_len fs > 0 then "." ++ fs else "")
-                        ++ (if str_len es > 0 then "e" ++ es else ""))
+          (let m9 = (if neg then "-" else "")
+                    ++ (if str_len ds == 0 then "0" else ds)
+                    ++ (if str_len fs > 0 then "." ++ fs else "") in
+           float_of_str (rb_flt_us_cut (str_index_of (substring s0 lo hi) "_" >= 0) m9
+                         ++ (if str_len es > 0 then "e" ++ es else "")))
 and rb_flt_digits = fn (s0: str) -> fn (i: int) -> fn (hi: int) -> fn (hex: bool) ->
   fn (prev_us: bool) -> fn (seen_us: bool) -> fn (acc: str) ->
   if i >= hi then
@@ -16737,7 +16770,8 @@ and str_to_f_lenient = fn (s: str) ->
              let (ed, j1) = lex_digits s j0 "" in
              (if str_len ed == 0 then ("", i3) else ("e" ++ esg ++ ed, j1)))
        else ("", i3)) in
-    float_of_str (sg ++ ip ++ fp ++ ex)
+    // (with underscores, through ruby's buffer: rb_flt_us_cut)
+    float_of_str (rb_flt_us_cut (str_index_of (substring s i1 i3) "_" >= 0) (sg ++ ip ++ fp) ++ ex)
 and vals_len = fn (xs: Val list) -> fn (acc: int) ->
   match xs with Nil -> acc | Cons (_, t) -> vals_len t (acc + 1)
 and frame_line = fn (i: int) ->

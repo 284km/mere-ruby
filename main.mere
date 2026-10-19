@@ -340,7 +340,9 @@ let rat_to_f = fn (n: str) -> fn (d: str) ->
   //  `Rational(1, 10**23).to_f` 1.0000000000000001e-23; the exact quotient to
   //  40 digits handed to strtod is that one rounding.)
   if big_cmp_s na "4611686018427387904" < 0 && big_cmp_s d "4611686018427387904" < 0 then float_of_str n / float_of_str d
-  else if ln <= 300 && ld <= 300 then
+  // (to 2000 digits a side: `Rational(1, 10**303)` is 1.0e-303 exactly as
+  //  ruby rounds it, where the leading-digits estimate below was 1 ulp off)
+  else if ln <= 2000 && ld <= 2000 then
     (let p9 = 40 + ld - ln in
      let q9 = (if p9 >= 0 then big_div_s (big_mul_s na (big_pow "10" p9 "1")) d
                else big_div_s na (big_mul_s d (big_pow "10" (0 - p9) "1"))) in
@@ -3626,11 +3628,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                            | Cons (VObj _, Cons (_, Nil)) ->
                              (match args with
                               | Cons (a0, _) ->
-                                (if responds world a0 "begin" && responds world a0 "end" then
+                                (if range_like_obj world a0 then
                                    (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
                                     let bv = invoke_val_c env world nb a0 "begin" Nil false in
                                     let ev = invoke_val_c env world nb a0 "end" Nil false in
-                                    let ex = (if responds world a0 "exclude_end?" then truthy (invoke_val_c env world nb a0 "exclude_end?" Nil false) else false) in
+                                    let ex = truthy (invoke_val_c env world nb a0 "exclude_end?" Nil false) in
                                     Cons (VRange (bv, ev, ex), coerce_str_int_args env world (match args with Cons (_, r9) -> r9 | _ -> Nil)))
                                  else coerce_str_int_args env world args)
                               | _ -> args)
@@ -8072,7 +8074,10 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
     // other Enumerable methods iterate the [k,v] pairs as an array; the
     // block's |k, v| params auto-splat each pair.
     else via_arr_iter world encl theblk recv (arr_new (hash_to_a xs)) name args
-  | VRange (lo, hi, excl) ->
+  | VRange (lo0, hi0, excl) ->
+    // (a begin or end that converts to a String -- a delegator -- walks as the
+    //  String range: range_each's rb_check_string_type, ["9", "10"])
+    let (lo, hi) = rng_str_like world lo0 hi0 in
     // An ENDLESS integer range iterates: ruby's `(1..).each` runs until the
     // block breaks, and so does this -- the bound is the largest integer, and
     // nothing materialises. `first(n)` / `take(n)` stop after n.
@@ -8293,8 +8298,12 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
         if (str_len name == 4 && str_eq name "each") then iter_each_result (range_each world encl theblk (rng_int lo) last) recv
         // (a..b).step(n) { } walks the range by n; without a block it is an
         // ArithmeticSequence (invoke_val_c), so this arm only ever has one.
+        // (a NEGATIVE step walks down, and an exclusive end stops it one
+        //  above the end: `(0...-10).step(-2)` ends at -8)
         else if (str_len name == 4 && str_eq name "step") then
-          iter_each_result (range_step world encl theblk (rng_int lo) last (rng_step_int world args)) recv
+          (let by9 = rng_step_int world args in
+           let last9 = (if excl && by9 < 0 then rng_int hi + 1 else last) in
+           iter_each_result (range_step world encl theblk (rng_int lo) last9 by9) recv)
         else if (str_len name == 3 && str_eq name "map") || (str_len name == 7 && str_eq name "collect") then iter_result (range_map world encl theblk (rng_int lo) last Nil) recv
         else via_arr_iter world encl theblk recv (arr_new (range_to_a (rng_int lo) last)) name args)
      else
@@ -8331,8 +8340,10 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
                                | VNil -> (if (match by9 with VNil -> 1.0 | v -> to_f v) < 0.0 then 0.0 - 1.0 / 0.0 else 1.0 / 0.0)
                                | v -> to_f v)
                               (match by9 with VNil -> 1.0 | v -> to_f v)) recv)
-       // (a step that is not a number is compared with 0 first, and that is
-       //  ruby's refusal: "comparison of String with 0 failed")
+       // (a nil step with a block is "step must be numeric", and one that is
+       //  not a number is compared with 0 first, which is ruby's refusal:
+       //  "comparison of String with 0 failed")
+       | Cons (_, Cons (VNil, _)) -> raise_exc world "TypeError" "step must be numeric"
        | Cons (_, Cons (sv9, _)) when (if is_num sv9 then false else true) ->
          raise_exc world "ArgumentError" ("comparison of " ++ display_cls_msg world (dispatch_cls_of world sv9) ++ " with 0 failed")
        | Cons (lim9, rest9) ->
@@ -8452,6 +8463,12 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        // (no `Cons (VInt limit, _)` arm here: it matched `1.step(10, 2.5)` and
        // walked with a step of 1, silently dropping the Float. An integer
        // limit with a non-integer step belongs to the Float walk below.)
+       // (a nil step with a block is "step must be numeric", and one that is
+       //  not a number is compared with 0 first: "comparison of String with
+       //  0 failed", as for a Float receiver)
+       | Cons (_, Cons (VNil, _)) -> raise_exc world "TypeError" "step must be numeric"
+       | Cons (_, Cons (sv9, _)) when (if is_num sv9 then false else true) ->
+         raise_exc world "ArgumentError" ("comparison of " ++ display_cls_msg world (dispatch_cls_of world sv9) ++ " with 0 failed")
        // a Float anywhere makes the whole walk a Float walk, as in ruby.
        | Cons (lim9, rest9) ->
          (let sf9 = (match rest9 with Cons (sv9, _) -> to_f sv9 | _ -> 1.0) in
@@ -9537,11 +9554,10 @@ and coerce_slice_args = fn env -> fn world -> fn (args: Val list) ->
         let ex9 = (match (if map_has iw (str_of_int o0 ++ "@__rg_ex") then map_get iw (str_of_int o0 ++ "@__rg_ex") else VBool false) with
                    | VBool b9 -> b9 | _ -> false) in
         Cons (VRange (toi lo9, toi hi9, ex9), Nil))
-     else if responds world (VObj o0) "begin" && responds world (VObj o0) "end" then
+     else if range_like_obj world (VObj o0) then
        (let bv = invoke_val_c env world nb (VObj o0) "begin" Nil false in
         let ev = invoke_val_c env world nb (VObj o0) "end" Nil false in
-        let ex = (if responds world (VObj o0) "exclude_end?"
-                  then truthy (invoke_val_c env world nb (VObj o0) "exclude_end?" Nil false) else false) in
+        let ex = truthy (invoke_val_c env world nb (VObj o0) "exclude_end?" Nil false) in
         Cons (VRange (toi bv, toi ev, ex), Nil))
      // ...and an object that is neither a range nor an index is REFUSED, not
      // answered with nil. `"hello"[obj]` already refused and `"hello".slice!(obj)`
@@ -9620,11 +9636,10 @@ and coerce_arr_index_args = fn env -> fn world -> fn (name: str) -> fn (args: Va
                              then map_get iw9 (str_of_int oid9 ++ "@__rg_ex") else VBool false) with
                       | VBool b9 -> b9 | _ -> false) in
            VRange (bound lo9, bound hi9, ex9))
-        else if responds world v "begin" && responds world v "end" then
+        else if range_like_obj world v then
           (let bv = invoke_val_c env world nb v "begin" Nil false in
            let ev = invoke_val_c env world nb v "end" Nil false in
-           let ex = (if responds world v "exclude_end?"
-                     then truthy (invoke_val_c env world nb v "exclude_end?" Nil false) else false) in
+           let ex = truthy (invoke_val_c env world nb v "exclude_end?" Nil false) in
            VRange (bound bv, bound ev, ex))
         else toi v)
      | VRange (lo, hi, ex) -> VRange (bound lo, bound hi, ex)
@@ -9995,12 +10010,10 @@ and arr_fill_span_raw = fn env -> fn world -> fn (n: int) -> fn (idxargs: Val li
                  | Cons (VObj _, Nil) ->
                    (match idxargs with
                     | Cons (o9, Nil) ->
-                      (if responds world o9 "begin" && responds world o9 "end" then
+                      (if range_like_obj world o9 then
                          (let bv9 = invoke_val_c env world nb9 o9 "begin" Nil false in
                           let ev9 = invoke_val_c env world nb9 o9 "end" Nil false in
-                          let ex9 = (if responds world o9 "exclude_end?"
-                                     then truthy (invoke_val_c env world nb9 o9 "exclude_end?" Nil false)
-                                     else false) in
+                          let ex9 = truthy (invoke_val_c env world nb9 o9 "exclude_end?" Nil false) in
                           Cons (VRange (bv9, ev9, ex9), Nil))
                        else idxargs)
                     | _ -> idxargs)
@@ -11984,6 +11997,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
         else if mt9 then VNil
         else if str_eq name0 "min" || str_eq name0 "first" then lo9
         else hi9)
+     | _ -> VNil)
+  // ...and a range whose object bounds convert to Strings (a delegator)
+  // enumerates as the String range does (rng_str_like; #each is the walk's)
+  else if (match recv0 with
+           | VRange (lo9, hi9, _) -> (match (lo9, hi9) with (VObj _, _) -> true | (_, VObj _) -> true | _ -> false)
+                                    && (match rng_str_like world lo9 hi9 with (VStr _, _) -> true | _ -> false)
+           | _ -> false)
+          && (if str_eq name0 "each" || str_eq name0 "reverse_each" then false else true)
+          && (is_enum_method name0 || str_eq name0 "minmax" || str_eq name0 "last") then
+    (match recv0 with
+     | VRange (lo9, hi9, ex9) -> (match rng_str_like world lo9 hi9 with (l9, h9) -> invoke_val_c env world blk (VRange (l9, h9, ex9)) name0 args0 vischeck)
      | _ -> VNil)
   // A range of OBJECTS with #succ ENUMERATES, and every Enumerable name
   // follows from having the elements -- so the walk happens once, here, and
@@ -21426,6 +21450,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            | _ -> raise_exc world "TypeError" ("can't iterate from " ++ class_name hi9))
                 | VFlt _ -> raise_exc world "TypeError"
                               ("can't iterate from " ++ (if rng_is_int hi9 then "Integer" else "Float"))
+                // (a Rational begin cannot be walked either: range_size)
+                | VRat (_, _) -> raise_exc world "TypeError" "can't iterate from Rational"
                 | _ -> VNil))
           | _ -> VNil)
        // ...a builtin method's enumerator (over an Array, Hash, Range or an
@@ -29225,6 +29251,13 @@ and has_coerce = fn world -> fn (v: Val) ->
   | _ -> false
 
 and responds = fn world -> fn (recv: Val) -> fn (name: str) -> responds_x world recv name true true
+// an object an index can be a range through (rb_range_values): #begin, #end
+// and #exclude_end?, all three, private ones too (rb_check_funcall)
+and range_like_obj = fn world -> fn (v: Val) ->
+  let has9 = fn (n: str) ->
+    responds world v n
+    || (match v with VObj id9 -> (let (_, _, ocls9, _) = world in has_meth world (map_get ocls9 id9) n) | _ -> false) in
+  has9 "begin" && has9 "end" && has9 "exclude_end?"
 // ...and the same question about a REAL definition only: no respond_to_missing?,
 // which is how `Kernel#method` tells "this object has such a method" from "this
 // object merely claims the name". A Method made from the claim goes through
@@ -30536,6 +30569,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VInt k, _) ->
           arr_new (rng_n_from (rng_int_side lo) (rng_int_top hi ex) 1 (if k < 0 then 0 else k) Nil)
         | _ -> VNil)
+     | _ -> VNil)
+  // Range#first with no count is the begin, whatever the end (range_first:
+  // `("a"..nil).first` is "a", where the endless walk had nothing to give)
+  else if (match recv with VRange (_, _, _) -> true | _ -> false) && (str_len name == 5 && str_eq name "first")
+          && (match args with Nil -> true | _ -> false) then
+    (match recv with
+     | VRange (VNil, _, _) -> prim_raise "RangeError" "cannot get the first element of beginless range"
+     | VRange (lo9, _, _) -> lo9
      | _ -> VNil)
   // a Range delegates array-only enumeration methods to its materialised form.
   else if (match recv with VRange _ -> true | _ -> false) && range_delegate_name name
@@ -32426,7 +32467,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                      else if d == 0 then flt_round_v f
                      // zero rounds to itself, sign and all (-0.0.round(1) is -0.0)
                      else if f == 0.0 then recv
-                     else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_round (f * m)) / m)))
+                     // (a tie is settled in x's own scale, ruby's round_half_up:
+                     //  5.015 is 5.01499.. and still rounds to 5.02)
+                     else (let m = float_of_int (int_pow 10 d) in VFlt (rnd_half_up f m / m)))
                   | _ -> flt_round_v f)
      // Rational: the rounding family over the exact fraction. Precision 0
      // (or absent) answers an Integer, a positive precision a Rational.
@@ -34383,6 +34426,16 @@ and rng_succ_vals = fn world -> fn (cur: Val) -> fn (hi: Val) -> fn (excl: bool)
 
 // Does this range enumerate through #succ on an OBJECT begin? (A String or
 // Symbol one does not come here -- range_vals already walks those.)
+// the bounds of a Range with an object among them that converts to a String,
+// as Strings (an end may be missing); any other pair as it is
+and rng_str_like = fn world -> fn (lo: Val) -> fn (hi: Val) ->
+  let objy = fn (v: Val) -> (match v with VObj _ -> responds world v "to_str" | _ -> false) in
+  let ok = fn (v: Val) -> (match v with VStr _ -> true | _ -> objy v) in
+  if (objy lo || objy hi) && ok lo && (ok hi || (match hi with VNil -> true | _ -> false)) then
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     let cv = fn (v: Val) -> (if objy v then invoke_val_c gc_cenv0 world nb9 v "to_str" Nil false else v) in
+     (cv lo, cv hi))
+  else (lo, hi)
 and rng_is_succ_obj = fn world -> fn (lo: Val) -> fn (hi: Val) ->
   (match lo with VObj _ -> true | _ -> false)
   && (match hi with VNil -> false | _ -> true)
@@ -34834,6 +34887,7 @@ and rb_format_in = fn env -> fn world -> fn (enc: str) -> fn (fmt: str) -> fn (a
   let had = map_has fmt_enc_cur "v" in
   let prev = (if had then map_get fmt_enc_cur "v" else "") in
   let _ = map_set fmt_enc_cur "v" (enc_canon_name enc) in
+  let _ = (if map_has fmt_named_cur "k" then map_delete fmt_named_cur "k" else ()) in
   let out = rb_format env world fmt args in
   let _ = (if had then map_set fmt_enc_cur "v" prev else map_delete fmt_enc_cur "v") in
   out
@@ -34861,7 +34915,9 @@ and rb_format_go = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (arg
          // directive parser over a one-element argument list in numbered mode
          // with the position preset, so a stray %s inside cannot consume the
          // real argument list.
+         let _ = map_set fmt_named_cur "k" key in
          let (piece, j, na9, m9) = rb_fmt_dir env world fmt j0 (Cons (av, Nil)) 0 2 "" (0 - 1) false (0 - 1) false 1 in
+         let _ = map_delete fmt_named_cur "k" in
          let _ = na9 in
          let _ = m9 in
          rb_format_go env world fmt j args nextarg m2 (acc ++ piece)
@@ -34893,7 +34949,11 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
   else
     let c = char_at fmt i in
     if str_eq c "-" || str_eq c "+" || str_eq c " " || str_eq c "#" || str_eq c "0" then
-      rb_fmt_dir env world fmt (i + 1) args nextarg mode (flags ++ c) width wset prec pset pos
+      // (a flag comes before the width and the precision: sprintf.c's
+      //  CHECK_FOR_FLAGS)
+      (if pset then (let _ = prim_raise "ArgumentError" "flag after precision" in ("", i, nextarg, mode))
+       else if wset then (let _ = prim_raise "ArgumentError" "flag after width" in ("", i, nextarg, mode))
+       else rb_fmt_dir env world fmt (i + 1) args nextarg mode (flags ++ c) width wset prec pset pos)
     else if is_digit c then
       let (k, j) = rb_fmt_digits fmt i 0 false in
       (if j < n && str_eq (char_at fmt j) "$" then
@@ -34936,6 +34996,14 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
     // `%<name>` may stand anywhere in the spec (`%+15<foo>.5f`): the named
     // value is this directive's argument, and the format is named from here
     // ...and `%-20.5{foo}`: the named value as %s, with what came before it
+    else if str_eq c "\{" && map_has fmt_named_cur "k" then
+      (let (key, j) = rb_fmt_name fmt (i + 1) "" "}" in
+       let _ = prim_raise_enc "ArgumentError" ("named\{" ++ key ++ "} after <" ++ map_get fmt_named_cur "k" ++ ">") (fmt_enc_now ()) in
+       ("", j, nextarg, mode))
+    else if str_eq c "<" && map_has fmt_named_cur "k" then
+      (let (key, j) = rb_fmt_name fmt (i + 1) "" ">" in
+       let _ = prim_raise_enc "ArgumentError" ("named<" ++ key ++ "> after <" ++ map_get fmt_named_cur "k" ++ ">") (fmt_enc_now ()) in
+       ("", j, nextarg, mode))
     else if str_eq c "\{" then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" "}" in
        let m2 = rb_fmt_to_named_k mode "\{" key "}" nextarg in
@@ -34945,7 +35013,9 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
       (let (key, j) = rb_fmt_name fmt (i + 1) "" ">" in
        let m2 = rb_fmt_to_named_k mode "<" key ">" nextarg in
        let av = rb_fmt_named_w env world args key "<" ">" in
+       let _ = map_set fmt_named_cur "k" key in
        let (piece, j2, _, _) = rb_fmt_dir env world fmt j (Cons (av, Nil)) 0 2 flags width wset prec pset 1 in
+       let _ = map_delete fmt_named_cur "k" in
        (piece, j2, nextarg, m2))
     // a character that is not a directive is named when it is printable
     else (let o9 = ord c in
@@ -34959,7 +35029,7 @@ and rb_fmt_named = fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (c
      // symbol keys only: ruby does not accept a string key here, and the
      // message quotes the brackets the format used.
      if hash_haskey xs (VSym key) then hash_get xs (VSym key)
-     else prim_raise "KeyError" ("key" ++ op ++ key ++ cl ++ " not found")
+     else prim_raise_enc "KeyError" ("key" ++ op ++ key ++ cl ++ " not found") (fmt_enc_now ())
    | _ -> prim_raise "ArgumentError" "one hash required")
 
 // A named reference reads the one Hash argument through Hash#[] -- so its
@@ -34974,7 +35044,7 @@ and rb_fmt_named_w = fn env -> fn world -> fn (args: Val list) -> fn (key: str) 
        (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
         match invoke_val_c env world nb (VHsh h) "[]" (Cons (VSym key, Nil)) false with
         | VNil -> raise_exc_iv world "KeyError" ("key" ++ op ++ key ++ cl ++ " not found")
-                    (Cons (("__key", VSym key), Cons (("__recv", VHsh h), Nil)))
+                    (Cons (("__key", VSym key), Cons (("__recv", VHsh h), Cons (("__menc", mkstr (fmt_enc_now ())), Nil))))
         | v -> v))
   | _ -> rb_fmt_named args key op cl
 
@@ -48391,6 +48461,21 @@ and pending_exc = fn world ->
         else if map_has prim_missing "c" then
           (let e9 = VExc ((match map_get prim_missing "c" with VStr h -> sget h | _ -> "StandardError"),
                           (match map_get prim_missing "m" with VStr h -> sget h | _ -> "")) in
+           // (a message in another encoding: an object, whose message String
+           //  carries it -- prim_raise_enc)
+           let e9 = (if map_has prim_missing "me" then
+                       (let enc9 = (match map_get prim_missing "me" with VStr h -> sget h | _ -> "") in
+                        let _ = map_delete prim_missing "me" in
+                        match e9 with
+                        | VExc (c9, m9) ->
+                          (let id9 = alloc_oid ocls in
+                           let _ = map_set ocls id9 c9 in
+                           let ms9 = mkstr m9 in
+                           let _ = (match ms9 with VStr h9 -> senc_set h9 enc9 | _ -> ()) in
+                           let _ = map_set ivars (str_of_int id9 ++ "@message") ms9 in
+                           VObj id9)
+                        | _ -> e9)
+                     else e9) in
            let _ = note_prim_bt world e9 in
            // ...with the exception being handled as its cause (see raise_exc)
            match exc_with_cause world e9 with
