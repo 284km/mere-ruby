@@ -5501,6 +5501,12 @@ and assign_x_one = fn env -> fn world -> fn blk -> fn (t: Expr) -> fn (v: Val) -
      | rv -> let argvals = eval_args env world blk args in
              let _ = invoke_val_c env world blk rv (m ++ "=") (vappend argvals (Cons (v, Nil))) false in ())
   // a bare CONSTANT target (`A, b = 1, 2`).
+  // (`::FOO` is the top-level constant FOO)
+  | EConst n when str_len n > 2 && str_eq (substring n 0 2) "::" -> let _ = const_store world (substring n 2 (str_len n)) v in ()
+  // (...and a bare one belongs to the enclosing class or module, as `A = 1`
+  //  does: `module M; A, B = 1, 2; end` defined ::A)
+  | EConst n when is_upper_first n && (if str_contains n "::" then false else true) ->
+    (let key = const_assign_key env n in let _ = const_store world key v in let _ = name_anon key v in ())
   | EConst n -> let _ = const_store world n v in ()
   | _ -> ()
 
@@ -24105,6 +24111,184 @@ and bad_sym_expr = fn (e: Expr) ->
   | _ -> false
 and bad_sym_exprs = fn (es: Expr list) ->
   match es with Nil -> false | Cons (e, r) -> bad_sym_expr e || bad_sym_exprs r
+// The parse errors ruby finds in a whole program that this parser lets
+// through, in ruby's words ("" for none): a write to a match variable
+// ("Can't set variable $1"), a constant assigned inside a method ("dynamic
+// constant assignment"), a value that never comes back on the right of an
+// assignment ("void value expression"), a call given both `&blk` and a block,
+// and a block parameter named twice. They were run-time errors or no error
+// at all, so a syntax check -- the program behind a BEGIN that leaves before
+// anything runs (test/unit's assert_syntax_error) -- passed them.
+and static_why_stmts = fn (b: Stmt list) -> fn (indef: bool) ->
+  match b with
+  | Nil -> ""
+  | Cons (s, r) -> (let w = static_why_stmt s indef in if str_eq w "" then static_why_stmts r indef else w)
+and sw_first = fn (a: str) -> fn (f: unit -> str) -> if str_eq a "" then f () else a
+and sw_backref = fn (n: str) ->
+  str_len n >= 2 && str_eq (char_at n 0) "$"
+  // ($0 is the program name, and settable)
+  && (str_eq n "$&" || str_eq n "$`" || str_eq n "$'" || str_eq n "$+" || (is_digit (char_at n 1) && (if str_eq (char_at n 1) "0" then false else true)))
+and sw_dyn_const = fn (n: str) ->
+  (str_len n > 2 && str_eq (substring n 0 2) "::")
+  || (str_contains n "::" && is_upper_first (last_ns_seg n))
+and last_ns_seg = fn (n: str) ->
+  let rec go = fn (i: int) -> (if i < 1 then n else if str_eq (char_at n i) ":" && str_eq (char_at n (i - 1)) ":" then substring n (i + 1) (str_len n) else go (i - 1)) in
+  go (str_len n - 1)
+and static_why_stmt = fn (s: Stmt) -> fn (indef: bool) ->
+  match s with
+  | SAssign (n, e) ->
+    if sw_backref n then "Can't set variable " ++ n
+    else if indef && (is_upper_first n || sw_dyn_const n) then "dynamic constant assignment"
+    else if sw_void_expr e then "void value expression"
+    else static_why_expr e indef
+  | SLocalFrom (_, s2) -> (if sw_void_stmt s2 then "void value expression" else static_why_stmt s2 indef)
+  | SMultiAssign (ts, es) ->
+    (let bad9 = sw_names_backref ts in
+     if str_len bad9 > 0 then "Can't set variable " ++ bad9
+     else if sw_any_void es then "void value expression"
+     else static_why_exprs es indef)
+  | SMultiAssignX (ts, es) ->
+    (if str_len (sw_targets_backref ts) > 0 then "Can't set variable " ++ sw_targets_backref ts
+     else if indef && sw_targets_const ts then "dynamic constant assignment"
+     else if sw_any_void es then "void value expression"
+     else static_why_exprs es indef)
+  | SExpr e -> static_why_expr e indef
+  | SIVarAssign (_, e) -> static_why_expr e indef
+  | SReturn e -> static_why_expr e indef
+  | SPuts es -> static_why_exprs es indef
+  | SWhile (c, bd) -> sw_first (static_why_expr c indef) (fn (u: unit) -> static_why_stmts bd indef)
+  | SIf (cls, els) -> sw_first (static_why_clauses cls indef) (fn (u: unit) -> static_why_stmts els indef)
+  | SBegin (bd, rs, els, ens) ->
+    sw_first (static_why_stmts bd indef) (fn (u: unit) ->
+      sw_first (static_why_rescues rs indef) (fn (u2: unit) ->
+        sw_first (static_why_stmts els indef) (fn (u3: unit) -> static_why_stmts ens indef)))
+  | SDef (_, _, _, bd) -> static_why_stmts bd true
+  // (a class or module statement inside a method body, and one whose name
+  //  is not a constant -- `class foo`; `class << obj` is neither)
+  | SClass (n, sup, _) when indef && (if str_eq n "<<singleton" then false else true) ->
+    (if str_eq sup "(module)" then "module definition in method body" else "class definition in method body")
+  | SClassE (_, _, _) when indef -> "class definition in method body"
+  // (`class singleton_class::A` is a path through a method call: only a
+  //  bare name has to be a constant)
+  | SClass (n, _, _) when str_len n > 0 && (if str_eq n "<<singleton" then false else true)
+                          && str_index_of n "::" < 0
+                          && (let c0 = char_at n 0 in (if str_eq c0 ":" then false else true) && (if is_upper_first n then false else true)) ->
+    "class/module name must be CONSTANT"
+  | SClass (_, _, bd) -> static_why_stmts bd false
+  | SClassE (_, _, bd) -> static_why_stmts bd false
+  | SSingletonE (_, bd) -> static_why_stmts bd false
+  | SAndThen (a, b2) -> sw_first (static_why_stmt a indef) (fn (u: unit) -> static_why_stmt b2 indef)
+  | SOrElse (a, b2) -> sw_first (static_why_stmt a indef) (fn (u: unit) -> static_why_stmt b2 indef)
+  | _ -> ""
+and static_why_clauses = fn (cls: (Expr * Stmt list) list) -> fn (indef: bool) ->
+  match cls with
+  | Nil -> ""
+  | Cons ((c, bd), r) -> sw_first (static_why_expr c indef) (fn (u: unit) -> sw_first (static_why_stmts bd indef) (fn (u2: unit) -> static_why_clauses r indef))
+and static_why_rescues = fn (rs: (str list * str * Stmt list) list) -> fn (indef: bool) ->
+  match rs with
+  | Nil -> ""
+  | Cons ((_, _, bd), r) -> sw_first (static_why_stmts bd indef) (fn (u: unit) -> static_why_rescues r indef)
+and static_why_exprs = fn (es: Expr list) -> fn (indef: bool) ->
+  match es with
+  | Nil -> ""
+  | Cons (e, r) -> (let w = static_why_expr e indef in if str_eq w "" then static_why_exprs r indef else w)
+and static_why_expr = fn (e: Expr) -> fn (indef: bool) ->
+  match e with
+  | ECallB (_, args, bp, bb) ->
+    (if sw_has_blockpass args then "both block arg and actual block given"
+     else (let d9 = sw_dup_param bp in
+           if str_len d9 > 0 then "duplicated argument name"
+           else sw_first (static_why_exprs args indef) (fn (u: unit) -> static_why_stmts bb indef)))
+  | EMethodB (rc, _, args, bp, bb) ->
+    (if sw_has_blockpass args then "both block arg and actual block given"
+     else (let d9 = sw_dup_param bp in
+           if str_len d9 > 0 then "duplicated argument name"
+           else sw_first (static_why_expr rc indef) (fn (u: unit) -> sw_first (static_why_exprs args indef) (fn (u2: unit) -> static_why_stmts bb indef))))
+  | EScopedAssign (rc, _, v) -> (if indef then "dynamic constant assignment" else sw_first (static_why_expr rc indef) (fn (u: unit) -> static_why_expr v indef))
+  | ECall (_, args) -> static_why_exprs args indef
+  | EMethod (rc, _, args) -> sw_first (static_why_expr rc indef) (fn (u: unit) -> static_why_exprs args indef)
+  | EBin (_, a, b2) -> sw_first (static_why_expr a indef) (fn (u: unit) -> static_why_expr b2 indef)
+  | EUn (_, a) -> static_why_expr a indef
+  | EArr es -> static_why_exprs es indef
+  | EHsh es -> static_why_exprs es indef
+  | ETern (a, b2, c) -> sw_first (static_why_expr a indef) (fn (u: unit) -> sw_first (static_why_expr b2 indef) (fn (u2: unit) -> static_why_expr c indef))
+  | ELambda (_, bd) -> static_why_stmts bd indef
+  | EStmt st -> static_why_stmt st indef
+  | EAssign (n, v) -> (if sw_backref n then "Can't set variable " ++ n else if sw_void_expr v then "void value expression" else static_why_expr v indef)
+  | _ -> ""
+and sw_has_blockpass = fn (es: Expr list) ->
+  match es with Nil -> false | Cons (EBlockPass _, _) -> true | Cons (_, r) -> sw_has_blockpass r
+// a name given twice in block parameters (`|a, a|`); `_` and `_x` may repeat
+and sw_dup_param = fn (ps: str list) ->
+  match ps with
+  | Nil -> ""
+  | Cons (p0, r) ->
+    (let n = sw_param_name p0 in
+     if str_len n > 0 && (if str_eq (char_at n 0) "_" then false else true) && str_list_has (sw_param_names r) n then n
+     else sw_dup_param r)
+and sw_param_names = fn (ps: str list) ->
+  match ps with Nil -> Nil | Cons (p0, r) -> Cons (sw_param_name p0, sw_param_names r)
+and sw_param_name = fn (p0: str) ->
+  // (the markers the parser adds start with "__"; `*a`, `**a`, `&a`, `a:`
+  //  are a)
+  if str_len p0 >= 2 && str_eq (substring p0 0 2) "__" then ""
+  // (a destructuring group `(a, b)` is not checked here)
+  else if str_len p0 >= 1 && (str_eq (char_at p0 0) "(" || str_eq (char_at p0 0) ";") then ""
+  else
+    (let a = (if str_len p0 >= 2 && str_eq (substring p0 0 2) "**" then substring p0 2 (str_len p0)
+              else if str_len p0 >= 1 && (str_eq (char_at p0 0) "*" || str_eq (char_at p0 0) "&") then substring p0 1 (str_len p0)
+              else p0) in
+     let a = (if str_len a >= 1 && str_eq (char_at a (str_len a - 1)) ":" then substring a 0 (str_len a - 1) else a) in
+     if str_len a >= 2 && str_eq (substring a 0 2) "__" then "" else a)
+and sw_names_backref = fn (ts: str list) ->
+  match ts with
+  | Nil -> ""
+  | Cons (t, r) -> (let t2 = (if str_len t >= 1 && str_eq (char_at t 0) "*" then substring t 1 (str_len t) else t) in
+                    if sw_backref t2 then t2 else sw_names_backref r)
+and sw_targets_const = fn (ts: Expr list) ->
+  match ts with
+  | Nil -> false
+  | Cons (t, r) -> (match t with
+                    | EScopedRead (_, _) -> true
+                    | EConst _ -> true
+                    | _ -> false) || sw_targets_const r
+and sw_targets_backref = fn (ts: Expr list) ->
+  match ts with
+  | Nil -> ""
+  | Cons (t, r) -> (match t with
+                    | EVar n when sw_backref n -> n
+                    | ECall (n, Nil) when sw_backref n -> n
+                    | ESplat (EVar n) when sw_backref n -> n
+                    | _ -> sw_targets_backref r)
+and sw_any_void = fn (es: Expr list) ->
+  match es with Nil -> false | Cons (e, r) -> sw_void_expr e || sw_any_void r
+// a value that never comes back: return / break / next / redo / retry, and a
+// begin whose every way out is one (an ensure that leaves, or a body and all
+// its rescues -- or its else and all its rescues -- that do)
+and sw_void_expr = fn (e: Expr) ->
+  match e with
+  | EFlow (k, _) -> str_eq k "return" || str_eq k "break" || str_eq k "next" || str_eq k "redo" || str_eq k "retry"
+  | EArr es -> sw_any_void es
+  | EStmt st -> sw_void_stmt st
+  | _ -> false
+and sw_void_stmt = fn (s: Stmt) ->
+  match s with
+  | SReturn _ -> true
+  | SBreak _ -> true
+  | SNext _ -> true
+  | SExpr e -> sw_void_expr e
+  | SBegin (bd, rs, els, ens) ->
+    sw_void_stmts ens
+    || ((match els with Nil -> sw_void_stmts bd | _ -> sw_void_stmts els) && sw_rescues_void rs)
+  | _ -> false
+and sw_void_stmts = fn (b: Stmt list) ->
+  match b with
+  | Nil -> false
+  | Cons (s, Nil) -> sw_void_stmt s
+  | Cons (SLine _, r) -> sw_void_stmts r
+  | Cons (s, r) -> (if sw_void_stmt s then true else sw_void_stmts r)
+and sw_rescues_void = fn (rs: (str list * str * Stmt list) list) ->
+  match rs with Nil -> true | Cons ((_, _, bd), r) -> sw_void_stmts bd && sw_rescues_void r
 and numbered_misuse_stmts = fn (body: Stmt list) ->
   match body with Nil -> false | Cons (s, r) -> numbered_misuse_stmt s || numbered_misuse_stmts r
 and numbered_misuse_stmt = fn (s: Stmt) ->
@@ -49621,6 +49805,8 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
             (Cons (("__path", (if str_eq efile9 "" then VNil else mkstr efile9)), Nil)))
        else if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (invalid_flow_word_in_defs prog2)
        else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
+       else if (if str_eq (static_why_stmts prog2 false) "" then false else true) then
+         raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ static_why_stmts prog2 false)
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if bad_sym_stmts prog2 then raise_exc world "SyntaxError" "invalid symbol"
@@ -49629,6 +49815,8 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
      | _ ->
        if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (invalid_flow_word_in_defs prog2)
        else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
+       else if (if str_eq (static_why_stmts prog2 false) "" then false else true) then
+         raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ static_why_stmts prog2 false)
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if bare_yield_stmts prog2 then raise_exc world "SyntaxError" "Invalid yield"
