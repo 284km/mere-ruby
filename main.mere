@@ -3259,6 +3259,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
              && (if map_has lambda_ids (str_of_int pid0) then false else true)
           then raise_exc world "ArgumentError" "the lambda method requires a literal block"
           else VProc pid0)
+       else if sym_blk_proc env world newblk >= 0 then VProc (sym_blk_proc env world newblk)
        else
        let id = (proc_next ()) in
        let _ = store_proc (str_of_int id) (true, bp, bb, env) in
@@ -8170,6 +8171,17 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
     (if (str_len name == 7 && str_eq name "bsearch") then
        (let (v9, broke9, bv9) = rng_bsearch world encl theblk lo hi excl in
         if broke9 then bv9 else v9)
+     // a step that is NOT a Numeric, from a numeric begin, is walked with the
+     // step's own `+` and `<=>` (range_step's last branch): a Struct that
+     // coerces walks `(0..5).step(val.new(2))` as 0, val(2), val(4), and one
+     // that does not is the TypeError Integer#+ gives. This asked #coerce for
+     // an Integer step and refused what it got back.
+     else if (str_len name == 4 && str_eq name "step")
+             && (match lo with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat (_, _) -> true | _ -> false)
+             && (match args with Cons (VObj sid9, Nil) -> (if obj_is_a world (dispatch_cls_of world (VObj sid9)) "Numeric" then false else true) | _ -> false) then
+       (match args with
+        | Cons (st9, _) -> iter_each_result (rng_step_generic world encl theblk lo hi excl st9) recv
+        | _ -> recv)
      // a BIGNUM end (or begin) with an integer step: the walk in bignums.
      // The int arms below never saw one, and `(2**63 - 3..2**63 + 1).step(2)`
      // was "undefined method 'step'".
@@ -8297,8 +8309,14 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
                  || (match hi with VRat (_, _) -> true | _ -> false))
              && (match lo with VFlt _ -> (match args with Cons (VCpx (_, _), _) -> true | _ -> false) | VNil -> false | _ -> true)
              && (match hi with VFlt _ -> false | _ -> true) then
-       (let benv9 = (match encl with (_, _, _, e7) -> e7) in
-        invoke_with_block benv9 world encl recv "__step_generic" args theblk)
+       // (a numeric step of zero is refused before the walk, and no step is
+       //  1: `(0r..3r).step { }` was an arity error, `(0r..10r).step(0) { }`
+       //  walked nothing)
+       (if (match args with Cons (z9, Nil) -> (match z9 with VInt _ -> true | VRat (_, _) -> true | VFlt _ -> true | VBig _ -> true | _ -> false) && rb_eq z9 (VInt 0) | _ -> false)
+        then raise_exc world "ArgumentError" "step can't be 0"
+        else
+        (let benv9 = (match encl with (_, _, _, e7) -> e7) in
+         invoke_with_block benv9 world encl recv "__step_generic" (match args with Nil -> Cons (VInt 1, Nil) | _ -> args) theblk))
      else if (str_len name == 4 && str_eq name "step")
              && ((match lo with VFlt _ -> true | _ -> false)
                  || (match hi with VFlt _ -> true | _ -> false)
@@ -8350,7 +8368,10 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        (let a = rng_int lo in
         if (str_len name == 4 && str_eq name "each") then iter_each_result (range_each world encl theblk a int_max) recv
         else if (str_len name == 4 && str_eq name "step") then
-          iter_each_result (range_step world encl theblk a int_max (rng_step_int world args)) recv
+          // (a NEGATIVE step walks an endless range down: `(0..).step(-2)`
+          //  is 0, -2, -4, ... -- the end is open on the side it walks to)
+          (let by9 = rng_step_int world args in
+           iter_each_result (range_step world encl theblk a (if by9 < 0 then 0 - int_max else int_max) by9) recv)
         else if ((str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "take"))
                 && (match args with Cons (VInt _, _) -> true | _ -> false) then
           (match args with
@@ -9085,6 +9106,31 @@ and rng_step_int = fn world -> fn (args: Val list) ->
      | VInt n9 -> n9
      | _ -> (let _ = raise_exc world "TypeError"
                        (display_cls_msg world (dispatch_cls_of world v) ++ " can't be coerced into Integer") in 1))
+
+// range_step's generic walk: v, v + st, ... while `v <=> hi` keeps the sign
+// `lo <=> hi` has (an endless range walks until the block breaks)
+and rng_step_generic = fn world -> fn encl -> fn theblk -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (st: Val) ->
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+  let plus9 = fn (v: Val) -> invoke_val_c gc_cenv0 world nb9 v "+" (Cons (st, Nil)) false in
+  let sgn9 = fn (a: Val) -> fn (b: Val) ->
+    (match invoke_val_c gc_cenv0 world nb9 a "<=>" (Cons (b, Nil)) false with
+     | VInt n -> (if n < 0 then 0 - 1 else if n > 0 then 1 else 0)
+     | _ -> 2) in
+  let rec walk9 = fn (v: Val) -> fn (dir: int) ->
+    (let c9 = (match hi with VNil -> dir | _ -> sgn9 v hi) in
+     if (if c9 == dir then false else (if excl then true else c9 != 0)) then FNext VNil
+     else (match run_block_turn world encl theblk (Cons (v, Nil)) with
+           | FBreak r -> FBreak r | FReturn r -> FReturn r
+           | _ -> if c9 == 0 then FNext VNil else walk9 (plus9 v) dir)) in
+  match hi with
+  | VNil -> walk9 lo 1
+  | _ ->
+    (let dir = sgn9 lo hi in
+     if dir == 0 then (if excl then FNext VNil
+                       else (match run_block_turn world encl theblk (Cons (lo, Nil)) with
+                             | FBreak r -> FBreak r | FReturn r -> FReturn r | _ -> FNext VNil))
+     else if dir == sgn9 lo (plus9 lo) then walk9 lo dir
+     else FNext VNil)
 
 // ("A"..).step(k) { }: every k-th #succ, forever, until the block breaks.
 // the Integer-step walk, bounded or not (see the caller for what a step may be)
@@ -10354,6 +10400,27 @@ and arr_hash_rec = fn env -> fn world -> fn (id: int) ->
         | Cons (h, t) ->
           (let hv = (match h with
                      | VArr aid -> arr_hash_rec env world aid
+                     // (an object met again inside its own #hash is a cycle
+                     //  like an array's: the whole answer collapses to the
+                     //  constant -- rb_exec_recursive_outer, Bug #9151, a
+                     //  Struct whose hash is `[x, ""].hash` with a.x = b,
+                     //  b.x = a)
+                     //  (only a #hash the program wrote: the prelude's own --
+                     //  Struct's, Set's -- throw to their outermost call
+                     //  themselves, and give a different answer)
+                     | VObj oh9 when map_has cyc_seen ("o" ++ str_of_int oh9) -> (let _ = map_set cyc_flag "f" 1 in 4919)
+                     | VObj oh9 when prim_user_has world h "hash"
+                                     && (let ow9 = body_cls_of world (dispatch_cls_of world h) "hash" in
+                                         if map_has meth_cfn (ow9 ++ "#hash") || str_eq ow9 "Struct" || str_eq ow9 "Set" || str_eq ow9 "Data" then false else true) ->
+                       (let _ = map_set cyc_seen ("o" ++ str_of_int oh9) 1 in
+                        let r9 = invoke_val_c env world nb9 h "hash" Nil false in
+                        let _ = map_delete cyc_seen ("o" ++ str_of_int oh9) in
+                        match r9 with
+                        | VInt n -> n
+                        | VObj _ ->
+                          (match invoke_val_c env world nb9 r9 "to_int" Nil false with
+                           | VInt n -> n | _ -> 0)
+                        | other -> val_hash other)
                      | VObj _ ->
                        (let r9 = invoke_val_c env world nb9 h "hash" Nil false in
                         match r9 with
@@ -11461,6 +11528,11 @@ and builtin_arity_msg_b = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
   // every class by its own name, so `Class.new(StandardError)` read that row
   // and refused itself. Class methods have no rows here.
   else if (match recv with VClass _ -> true | _ -> false) then ""
+  // (String#match and Symbol#match take any number, but say 1..2 when given
+  //  none: rb_str_match_m checks the arity only then)
+  else if (str_len name == 5 && str_eq name "match") && (match args with Nil -> true | _ -> false)
+          && (match recv with VStr _ -> true | VSym _ -> true | _ -> false) then
+    "wrong number of arguments (given 0, expected 1..2)"
   else
     let cls = dispatch_cls_of world recv in
     let key0 = cls ++ "#" ++ name in
@@ -11817,7 +11889,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               | _ -> false) then
     (match (recv0, args0) with
      | (VObj o9, Cons (b9, _)) ->
+       // (the pairs a raise left behind are cleared at the outer call)
        (let (_, _, _, iv9) = world in
+        let _ = (if map_len rng_eq_seen > 0 then map_clear rng_eq_seen else ()) in
         VBool (rng_eq_w env world (map_get iv9 (str_of_int o9 ++ "@__rg_lo")) (map_get iv9 (str_of_int o9 ++ "@__rg_hi"))
                  (match (if map_has iv9 (str_of_int o9 ++ "@__rg_ex") then map_get iv9 (str_of_int o9 ++ "@__rg_ex") else VBool false) with
                   | VBool x9 -> x9 | _ -> false)
@@ -11847,6 +11921,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     (match args0 with
      | Cons (b9, _) -> (if rb_eq_w env world recv0 b9 then VInt 0 else VNil)
      | _ -> VNil)
+  else
+  // a program that REDEFINES Range#each is asked for the elements by #to_a,
+  // #entries and #last(n) (range_last's fast path is only for the builtin
+  // each): `(1..10).last(3)` over an each of [1, 2, 3, 4, 5] is [3, 4, 5]
+  if (match recv0 with VRange (_, _, _) -> true | _ -> false)
+     && ((str_len name0 == 4 && str_eq name0 "to_a") || (str_len name0 == 7 && str_eq name0 "entries")
+         || (str_len name0 == 4 && str_eq name0 "last" && (match args0 with Cons (_, _) -> true | Nil -> false)))
+     && (let (mm9, _, _, _) = world in map_has mm9 "Range#each") then
+    (let a9 = invoke_val_c env world blk recv0 "__to_a_by_each" Nil false in
+     if str_eq name0 "last" then invoke_val_c env world blk a9 "last" args0 false else a9)
   else
   // a BEGINLESS Range steps only over numbers: with no end at all, or with a
   // step that is not a number, there is nothing to walk and ruby refuses
@@ -11881,7 +11965,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
            (rng_is_int lo || (match lo with VFlt _ -> true | VRat (_, _) -> true | VCpx (_, _) -> true | VBig _ -> true | _ -> false)
             // a BEGINLESS numeric range makes the sequence too (its class is
             // the answer ruby/spec asks for); walking it is the TypeError.
-            || ((match lo with VNil -> true | _ -> false) && (rng_is_int hi || (match hi with VFlt _ -> true | _ -> false))))
+            || ((match lo with VNil -> true | _ -> false) && (rng_is_int hi || (match hi with VFlt _ -> true | VRat (_, _) -> true | _ -> false))))
            && (rng_is_int hi || rng_hi_open hi || (match hi with VFlt _ -> true | VRat (_, _) -> true | VBig _ -> true | _ -> false))
          // ...and a Rational receiver: `(1/10r).step(1/2r, 1/10r)`
          | VRat (_, _) -> true
@@ -11917,7 +12001,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // ...and a beginless range with a NON-numeric end has no sequence to make.
   else if str_eq name0 "step"
           && (match recv0 with
-              | VRange (VNil, hi9, _) -> (match hi9 with VNil -> false | VInt _ -> false | VBig _ -> false | VFlt _ -> false | _ -> true)
+              // (a Rational end is a number too: `(..10r).step(2r)`)
+              | VRange (VNil, hi9, _) -> (match hi9 with VNil -> false | VInt _ -> false | VBig _ -> false | VFlt _ -> false | VRat (_, _) -> false | _ -> true)
               | _ -> false) then
     (match args0 with
      | Nil -> raise_exc world "ArgumentError" "step is required for non-numeric ranges"
@@ -18952,6 +19037,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (match args with
        | Cons (VHsh h9, _) -> (let _ = map_set r2k_marks (str_of_int h9) VNil in let _ = mark_kw h9 in VHsh h9)
        | _ -> VNil)
+    // Marshal.__rng_uninit(r): an allocated Range never given its bounds,
+    // which range_dumper writes with excl nil and range_loader leaves alone
+    else if str_eq c "Marshal" && (str_len name == 12 && str_eq name "__rng_uninit") then
+      (match args with
+       | Cons (VObj o9, _) -> VBool (exc_is_a world (dispatch_cls_of world (VObj o9)) "Range" && (if rng_sub_held world (VObj o9) then false else true))
+       | _ -> VBool false)
     else if str_eq c "Marshal" && (str_len name == 10 && str_eq name "__rng_init") then
       (match args with
        | Cons (r9, rest9) -> (let _ = rng_sub_init world r9 rest9 true in r9)
@@ -21331,7 +21422,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             && (match (if map_has ivars (str_of_int id ++ "@__as_begin") then map_get ivars (str_of_int id ++ "@__as_begin") else VInt 0) with VNil -> true | _ -> false) then
       (let flt9 = (match (if map_has ivars (str_of_int id ++ "@__as_end") then map_get ivars (str_of_int id ++ "@__as_end") else VNil) with VFlt _ -> true | _ -> false)
                   || (match (if map_has ivars (str_of_int id ++ "@__as_step") then map_get ivars (str_of_int id ++ "@__as_step") else VNil) with VFlt _ -> true | _ -> false) in
-       raise_exc world "TypeError" (if flt9 then "no implicit conversion to float from nil" else "nil can't be coerced into Integer"))
+       // (a Rational END names Rational: `(..10r).step(2).to_a`)
+       let rat9 = (match (if map_has ivars (str_of_int id ++ "@__as_end") then map_get ivars (str_of_int id ++ "@__as_end") else VNil) with VRat (_, _) -> true | _ -> false) in
+       raise_exc world "TypeError" (if flt9 then "no implicit conversion to float from nil" else if rat9 then "nil can't be coerced into Rational" else "nil can't be coerced into Integer"))
     else if str_eq cls "Enumerator::ArithmeticSequence"
             && ((str_len name == 5 && str_eq name "begin") || (str_len name == 3 && str_eq name "end") || (str_len name == 4 && str_eq name "step") || (str_len name == 12 && str_eq name "exclude_end?")
                 || (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s") || (str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?") || (str_len name == 3 && str_eq name "===")
@@ -23145,6 +23238,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (map_has comp_inner (str_of_int pid) || map_has curry_target (str_of_int pid))
        && ((str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "()") || (str_len name == 2 && str_eq name "[]") || (str_len name == 5 && str_eq name "yield") || (str_len name == 3 && str_eq name "===")) then
       proc_derived_call env world blk pid args
+    // Symbol#to_proc's Proc called with nothing has no receiver to send to
+    // (sym_proc_call's own words, not the lambda's arity)
+    else if map_has proc_symsrc (str_of_int pid) && (match args with Nil -> true | _ -> false)
+       && ((str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "()") || (str_len name == 2 && str_eq name "[]") || (str_len name == 5 && str_eq name "yield")) then
+      raise_exc world "ArgumentError" "no receiver given"
     else if map_has comp_inner (str_of_int pid) && (str_len name == 5 && str_eq name "arity") then VInt (0 - 1)
     // Proc#ruby2_keywords: a *rest-only proc that must keep a trailing `key:`
     // hash MARKED as a keywords hash, so re-splatting it stays keywords. The
@@ -24793,6 +24891,30 @@ and bp_sym = fn world -> fn (bp: str list) -> fn (bb: Stmt list) ->
             && (has_meth world "Symbol" "to_proc" || (map_len undefs > 0 && undef_blocked world "Symbol" "to_proc")) -> s9
      | _ -> "")
   | _ -> ""
+// the parameters of Symbol#to_proc's stand-in (Symbol#to_proc, or a `&:sym`
+// block), with or without the lambda marker in front
+and sym_ps_shape = fn (ps: str list) ->
+  match ps with
+  | Cons (m9, rest9) when str_eq m9 lambda_blk_marker -> sym_ps_shape rest9
+  | Cons (a9, Cons (b9, Nil)) -> str_eq a9 "__bp" && str_eq b9 "*__ba"
+  | Cons (a9, Cons (b9, Cons (c9, Nil))) -> str_eq a9 "__bp" && str_eq b9 "*__ba" && str_eq c9 "&__bb"
+  | _ -> false
+// the Proc Symbol#to_proc answers for a `&:sym` the parser turned into a
+// block (extract_block_pass), or -1: `m(&:itself)` hands m's `&b`, and
+// proc/lambda/Proc.new, that one Proc, as `m(&sym)` does
+and sym_blk_proc = fn env -> fn world -> fn blk ->
+  match blk with
+  | (true, Cons (mk9, Cons ("__bp", Cons ("*__ba", Nil))), Cons (SExpr (EMethod (EVar "__bp", s9, Cons (ESplat (EVar "__ba"), Nil))), Nil), _)
+      when str_eq mk9 lambda_blk_marker
+           && (if has_meth world "Symbol" "to_proc" then false else true)
+           // (with refinements in play the call site's `using` decides what
+           //  :sym sends, and the shared Proc knows none: the stand-in stays)
+           && (if ref_on () then false else true) ->
+    (match (if map_has sym_proc_cache s9 then map_get sym_proc_cache s9
+            else invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VSym s9) "to_proc" Nil false) with
+     | VProc pid9 -> pid9
+     | _ -> 0 - 1)
+  | _ -> 0 - 1
 and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   match bv with
   | VProc pid ->
@@ -24803,6 +24925,13 @@ and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   | VNil -> (false, (Nil : str list), (Nil : Stmt list), env)
   // (a redefined Symbol#to_proc is asked, as ruby does for `&:sym`)
   | VSym s when (if has_meth world "Symbol" "to_proc" || (map_len undefs > 0 && undef_blocked world "Symbol" "to_proc") then false else true) ->
+    // (...and a method that takes the block as `&b` gets Symbol#to_proc's own
+    //  Proc, the one per symbol: `obj.m(&:itself).equal?(:itself.to_proc)`)
+    let _ = (if ref_on () then ()
+             else (match (if map_has sym_proc_cache s then map_get sym_proc_cache s
+                          else invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) bv "to_proc" Nil false) with
+                   | VProc pid9 -> map_set pending_srcproc "v" pid9
+                   | _ -> ())) in
     (true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil), env)
   | _ ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -25745,6 +25874,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
             (let pid0 = map_get pending_srcproc "v" in
              let _ = map_delete pending_srcproc "v" in
              VProc pid0)
+          else if sym_blk_proc env world newblk >= 0 then VProc (sym_blk_proc env world newblk)
           else
           let id = (proc_next ()) in let _ = store_proc (str_of_int id) newblk in
           let _ = if (let (h, _, _, _) = blk in h) then store_yblk (str_of_int id) blk else () in
@@ -27385,6 +27515,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                 (match xs with Nil -> (Nil : int list) | Cons (10, t9) -> Cons (13, Cons (10, crlf t9)) | Cons (c9, t9) -> Cons (c9, crlf t9)) in
               crlf cps0)
            else cps0) in
+        // (CP50220 writes half-width katakana as the full-width ones, a voiced
+        //  mark joining the kana before it: done on the whole text, since the
+        //  encoding below is a character at a time)
+        let cps1 = (if str_eq (enc_up to) "CP50220" then cp50220_fold cps1 else cps1) in
         // xml: escapes the markup characters of the decoded text (" only for
         // an attribute), before anything is encoded
         let cps1 = (if str_eq xml9 "" then cps1
@@ -28575,7 +28709,12 @@ and bm_params = fn world -> fn (owner0: str) -> fn (nm: str) ->
     (if str_eq owner "BasicObject" then arr_new Nil
      else arr_new (Cons (arr_new (Cons (VSym "rest", Nil)), Nil)))
   else if map_has meths key then
-    (match map_get meths key with Meth (ps, ds, _) -> arr_new (param_meta_of true ps ds))
+    (match map_get meths key with
+     // (a method define_method made of Symbol#to_proc's Proc answers as the
+     //  Proc does, with no names: its stand-in's parameters leaked)
+     | Meth (ps, _, _) when sym_ps_shape ps ->
+       arr_new (Cons (arr_new (Cons (VSym "req", Nil)), Cons (arr_new (Cons (VSym "rest", Nil)), Nil)))
+     | Meth (ps, ds, _) -> arr_new (param_meta_of true ps ds))
   else if map_has meths nm then
     (match map_get meths nm with Meth (ps, ds, _) -> arr_new (param_meta_of true ps ds))
   // ⚠ a BUILTIN method is not in the method table, and neither is one backed
@@ -28881,6 +29020,18 @@ and rng_eq_w = fn env -> fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (ex: boo
     (if rb_eq a b && (if useeql then rb_eql a b else true) then true
      else
        (match a with
+        // two Range-subclass instances compare as ranges, and a pair met
+        // again inside its own comparison is equal (rb_exec_recursive_paired:
+        // a range whose begin is itself, `x.send(:initialize, x, 1)`)
+        | VObj ao9 when rng_sub_held world a && rng_sub_held world b
+                        && (if has_meth world (dispatch_cls_of world a) (if useeql then "eql?" else "==") then false else true) ->
+          (let k9 = str_of_int ao9 ++ "|" ++ (match b with VObj bo9 -> str_of_int bo9 | _ -> "") in
+           if map_has rng_eq_seen k9 then true
+           else (let _ = map_set rng_eq_seen k9 1 in
+                 let r9 = (match rng_sub_as_range world a with
+                           | VRange (l9, h9, e9) -> rng_eq_w env world l9 h9 e9 b useeql
+                           | _ -> false) in
+                 let _ = map_delete rng_eq_seen k9 in r9))
         | VObj _ ->
           (if useeql then
              (if has_meth world (dispatch_cls_of world a) "eql?" then truthy (invoke_val_c env world nb9 a "eql?" (Cons (b, Nil)) false)
@@ -32625,6 +32776,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // a Binding answered 0, so every binding -- and its copies -- had one id
      | VBind id -> VInt (6000000 + id * 8)
      | VFlt f -> VInt (7000000 + int_of_float (f * 1000.0))
+     // a class or module is its name here, so its id is handed out on the
+     // first ask and kept: every class answered 0, and `c.dup.object_id ==
+     // c.object_id` (test_object_id) was true for a copy that is not equal?
+     | VClass c -> VInt (cls_oid c)
+     | VMain -> VInt 16
      | _ -> VInt 0)
   // #nan? / #next_float / #prev_float belong to Float alone: an Integer
   // answering false (or a Float) for them is a name Integer does not have.
@@ -44775,7 +44931,10 @@ and rng_sub_init = fn world -> fn (recv: Val) -> fn (args: Val list) -> fn (from
                    | (VNil, _) -> true
                    | (_, VNil) -> true
                    | _ -> (match invoke_val_c gc_cenv0 world noblk lo9 "<=>" (Cons (hi9, Nil)) false with VNil -> false | _ -> true)) in
-        if ok9 then (let _ = seed_builtin_subclass_ivars world (dispatch_cls_of world recv) id args in VNil)
+        // (range_init freezes a plain Range, not a subclass's instance:
+        //  `Range.allocate.send(:initialize, 1, 2).frozen?` is true)
+        if ok9 then (let _ = seed_builtin_subclass_ivars world (dispatch_cls_of world recv) id args in
+                     let _ = (if str_eq (dispatch_cls_of world recv) "Range" then ofrozen_set id else ()) in VNil)
         else raise_exc world "ArgumentError" "bad value for range"))
   | _ -> VNil
 
@@ -45013,6 +45172,7 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
                     // out of the block lost both. pending_srcproc is what
                     // coerce_to_block recorded on the way in.
                     (if map_has pending_srcproc "v" then VProc (map_get pending_srcproc "v")
+                     else if sym_blk_proc gc_cenv0 world blk >= 0 then VProc (sym_blk_proc gc_cenv0 world blk)
                      else
                      let pid = (proc_next ()) in
                      let _ = store_proc (str_of_int pid) blk in
