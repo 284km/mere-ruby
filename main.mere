@@ -4961,7 +4961,7 @@ and only_block_pass = fn (items: Expr list) ->
   | _ -> false
 and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   match items with
-  | Nil -> Nil
+  | Nil -> (let _ = (if map_has blk_kwp "e" then map_delete blk_kwp "e" else ()) in Nil)
   // splat argument: expand an array's elements into the argument list.
   | Cons (ESplat e, t) ->
     let spread = (match eval_e env world blk e with
@@ -5015,7 +5015,7 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
      // (Ruby 3.0): omit it rather than leaking an empty positional hash.
      | VHsh id ->
        (match hderef id with
-        | Nil -> eval_args env world blk t
+        | Nil -> (let r9 = eval_args env world blk t in let _ = map_set blk_kwp "e" "1" in r9)
         | pairs -> (match mkhash pairs with
                     | VHsh nid -> let _ = mark_kw nid in Cons (VHsh nid, eval_args env world blk t)
                     | v -> Cons (v, eval_args env world blk t)))
@@ -5028,7 +5028,8 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
     (match eval_e env world blk (EKwHash items9) with
      | VHsh id9 ->
        (match hderef id9 with
-        | Nil -> eval_args env world blk t
+        // (...but keywords were given, which a block's binding asks: blk_kwp)
+        | Nil -> (let r9 = eval_args env world blk t in let _ = map_set blk_kwp "e" "1" in r9)
         | _ -> Cons (VHsh id9, eval_args env world blk t))
      | v9 -> Cons (v9, eval_args env world blk t))
   | Cons (h, t) -> Cons (eval_e env world blk h, eval_args env world blk t)
@@ -6304,6 +6305,15 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
   // clear it here to keep it from leaking into a later method's frame.
   let _ = if map_has pending_home "v" then map_delete pending_home "v" else () in
+  // (keywords given that came to nothing: see blk_kwp. An empty hash flagged
+  //  by ruby2_keywords, splatted last, is one too, and passes nothing.)
+  let kwp9 = map_has blk_kwp "e" in
+  let _ = (if kwp9 then map_delete blk_kwp "e" else ()) in
+  let (argvals, kwp9) =
+    (match vlast argvals with
+     | VHsh lh9 when map_has r2k_splat lh9 && map_has r2k_marks (str_of_int lh9) && (match hderef lh9 with Nil -> true | _ -> false) ->
+       (rev_vals (match rev_vals argvals with Cons (_, t9) -> t9 | Nil -> (Nil : Val list)), true)
+     | _ -> (argvals, kwp9)) in
   // ...and the pending SOURCE PROC with it: it is only valid between
   // `m(&pr)`'s conversion and the method reading it. Once any block body
   // starts running, a `Hash.new { }` inside would otherwise pick up the proc
@@ -6434,7 +6444,7 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // the Array whole, as in ruby.) The count is the ONE scan below
   // (ip_scan_stmts), made here once for both: a second walk of every
   // parameter-less body was a measured 5%.
-  let ip9 = (match params with Nil -> ip_scan_stmts body | _ -> 0) in
+  let ip9 = (match params with Nil -> (let k9 = ip_scan_stmts body in if k9 == 10 && stmts_assign_it body then 0 else k9) | _ -> 0) in
   let argvals = (match (params, argvals) with
                  | (Nil, Cons (VArr a9, Nil)) ->
                    (if (if is_lam then false else true) && ip9 >= 2 && ip9 < 10 then deref a9 else argvals)
@@ -6446,7 +6456,7 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
                        | _ -> argvals)
                     else argvals)
                  | _ -> argvals) in
-  let _ = bind_block_params benv world encl_call (block_defaults body) params argvals is_lam in
+  let _ = bind_block_params benv world encl_call (block_defaults body) params argvals is_lam kwp9 in
   // ⚠ WHICH implicit parameters this frame HAS is a property of the body, not
   //   of the env: bind_numbered puts _1.._9 into every parameter-less block's
   //   frame, whether the body names them or not, and ruby 4.0's
@@ -6698,7 +6708,7 @@ and rescues_targets = fn rescues ->
 
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
-and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * Expr) list) -> fn (params0: str list) -> fn (argvals0: Val list) -> fn (is_lam: bool) ->
+and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * Expr) list) -> fn (params0: str list) -> fn (argvals0: Val list) -> fn (is_lam: bool) -> fn (kwp: bool) ->
   // numbered parameters: a block without explicit params binds _1.._9.
   let _ = (match params0 with
            | Nil -> bind_numbered cenv argvals0 1
@@ -6728,9 +6738,17 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
   // required keyword raises ArgumentError), then give **kw the leftover keys.
   // The presence of any keyword param disables auto-splat.
   let dsname = dsplat_name params in
+  let has_ds9 = ps_any_dsplat params in
   let params = drop_dsplat params in
   let kws = kw_params params in
   let params = pos_params params in
+  // ruby's "simple" block -- required positional parameters only -- spreads
+  // one Array whatever came with it; any other shape (an optional, a rest, a
+  // keyword, `**`, `&b`) does not when keywords were given, `**{}` included
+  // (Bug #18633, #19759)
+  let complex9 = has_ds9 || has_splat params || (match kws with Nil -> false | _ -> true)
+                 || (if str_eq (block_param_name params0) "" then false else true)
+                 || ps_any_default bdefaults params in
   let want_kw = (match kws with Nil -> (if str_eq dsname "" then false else true) | _ -> true) in
   let (argvals0, kwhash) = if want_kw then peel_kw_hash argvals0 else (argvals0, (Nil : Val list)) in
   // ...and a BLOCK declares it the same way: `proc { |**nil| }` refuses too.
@@ -6755,7 +6773,8 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
   //   parameter as the refusal.
   let argvals =
     (if is_lam then argvals0 else
-    (match (match kws with Nil -> Nil | _ -> kwhash) with
+    (match (if complex9 && (kwp || (match kwhash with Nil -> false | _ -> true)) then Cons (VNil, Nil)
+            else (match kws with Nil -> Nil | _ -> kwhash)) with
      | Cons (_, _) -> argvals0
      | Nil ->
        (match params with
@@ -23178,6 +23197,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // `proc { _1; proc {}.binding.implicit_parameter_get(:_1) }.call(7)`
        // was nil where ruby answers 7)
        let _ = map_set bind_store (str_of_int bid) (lv_child (bnd_snapshot cenv9)) in
+       // (its #source_location is the proc's: where the block was written, or
+       //  for Method#to_proc's, where the method was)
+       let _ = (if map_has proc_src (str_of_int pid) && map_has proc_src ("f" ++ str_of_int pid) then
+                  (match (map_get proc_src ("f" ++ str_of_int pid), map_get proc_src (str_of_int pid)) with
+                   | (VStr fh9, VInt ln9) -> (if str_eq (sget fh9) "" then () else map_set bind_loc (str_of_int bid) (sget fh9 ++ "\n" ++ str_of_int ln9))
+                   | _ -> ())
+                else ()) in
        VBind bid)
     // Proc#to_proc is the proc ITSELF -- the name was claimed with nothing
     // behind it, so `pr.to_proc` was a NoMethodError on a Proc.
@@ -23204,7 +23230,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             (let nn9 = max_numbered_stmts body in
              if nn9 > 0 then arr_new (numbered_params_meta is_lam 1 nn9)
              // ...and `it`'s parameter has no name to report.
-             else if uses_it_stmts body && (if lv_has e "it" then false else true)
+             else if uses_it_stmts body && (if lv_has e "it" || stmts_assign_it body then false else true)
              then arr_new (Cons (arr_new (Cons (VSym (if is_lam then "req" else "opt"), Nil)), Nil))
              else arr_new (Nil : Val list))
           // ...and Symbol#to_proc's proc has NO parameter NAMES in ruby (it is
@@ -23664,7 +23690,34 @@ and ip_scan_exprs = fn (es: Expr list) ->
 // the block's implicit parameter count: the numbered ones, or one for `it`.
 and implicit_params_of = fn (body: Stmt list) ->
   (let n9 = max_numbered_stmts body in
-   if n9 > 0 then n9 else (if uses_it_stmts body then 1 else 0))
+   if n9 > 0 then n9 else (if uses_it_stmts body && (if stmts_assign_it body then false else true) then 1 else 0))
+// does the block body assign `it` (`it = it = "bar"`) BEFORE it reads it?
+// Then `it` is a local variable of the block, and the block has no implicit
+// parameter. (Read first -- `it or flunk; it = "bar"` -- and the block has
+// both: the parameter, and from the assignment on, the local.)
+and stmts_assign_it = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (SAssign (n, e), rest) ->
+    (if str_len n == 2 && str_eq n "it" then true
+     else if uses_it_stmts (Cons (SAssign (n, e), Nil)) then false
+     else stmts_assign_it rest)
+  // (`a = b = e`: the chain's last link is a statement of its own)
+  | Cons (SLocalFrom (n, s2), rest) ->
+    (if str_len n == 2 && str_eq n "it" then true
+     else if stmts_assign_it (Cons (s2, Nil)) then true
+     else if uses_it_stmts (Cons (s2, Nil)) then false
+     else stmts_assign_it rest)
+  | Cons (s0, rest) ->
+    (if uses_it_stmts (Cons (s0, Nil)) then false
+     else (match s0 with
+           | SIf (clauses, els) -> clauses_assign_it clauses || stmts_assign_it els || stmts_assign_it rest
+           | SWhile (_, b) -> stmts_assign_it b || stmts_assign_it rest
+           | _ -> stmts_assign_it rest))
+and clauses_assign_it = fn (clauses: (Expr * Stmt list) list) ->
+  match clauses with
+  | Nil -> false
+  | Cons ((_, b), rest) -> stmts_assign_it b || clauses_assign_it rest
 and max_numbered_stmts = fn (body: Stmt list) ->
   match body with
   | Nil -> 0
@@ -36437,6 +36490,20 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
         then raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..3)"
         else VNil)
      | Nil -> VNil)
+  // RubyVM::InstructionSequence's options: debug_frozen_string_literal makes
+  // literals remember where they were made (str_lit_site) while the sequence
+  // runs, as under --debug=frozen-string-literal, and frozen_string_literal
+  // is the magic comment of the next eval (do_eval takes it). Answers whether
+  // the debug one was on before.
+  else if (str_len name == 13 && str_eq name "__isq_dbg_fsl") then
+    (let was9 = map_has cli_opt "dbg_fsl" in
+     let _ = (match args with
+              | Cons (VBool true, _) -> map_set cli_opt "dbg_fsl" "1"
+              | _ -> if map_has cli_opt "dbg_fsl" then map_delete cli_opt "dbg_fsl" else ()) in
+     let _ = (match args with
+              | Cons (_, Cons (VBool true, _)) -> map_set cli_opt "isq_fsl" "1"
+              | _ -> ()) in
+     VBool was9)
   else if (str_len name == 13 && str_eq name "__signal_pair") then
     (match args with
      // ⚠ NO signal at all is an arity error, not the signal "SIG": the
@@ -48800,7 +48867,12 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     // eval'd source is its own compilation unit: its literals follow ITS
     // magic comment (usually none), not that of the file loading right now
     let savedfsl9 = (if map_has fsl_ctx "v" then map_get fsl_ctx "v" else "") in
-    let _ = map_set fsl_ctx "v" (src_fsl code) in
+    // (RubyVM::InstructionSequence's frozen_string_literal option stands in
+    //  for a magic comment the source does not have, for this eval only)
+    let fsl9 = src_fsl code in
+    let isq9 = map_has cli_opt "isq_fsl" in
+    let _ = (if isq9 then map_delete cli_opt "isq_fsl" else ()) in
+    let _ = map_set fsl_ctx "v" (if isq9 && str_eq fsl9 "" then "on" else fsl9) in
     let _ = syn_why_take () in
     let _ = map_set parse_lshift "n" (eline9 - ebase9) in
     let _ = map_set parse_lshift "b" (ebase9 - 1) in

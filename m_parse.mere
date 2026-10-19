@@ -299,6 +299,14 @@ let lex_end = map_new ();
 let lex_u8_width = fn (c: str) ->
   let o = ord c in
   if o >= 240 then 4 else if o >= 224 then 3 else if o >= 192 then 2 else 1;
+// ...and of the character at s[i] in the SOURCE's encoding: a non-UTF-8 magic
+// comment, or the encoding of an eval'd string (`?\“` in EUC-JP is two bytes)
+let lex_src_cw = fn (s: str) -> fn (i: int) ->
+  if lex_src_is_utf8 () then lex_u8_width (char_at s i)
+  else
+    (let cd = (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") in
+     let k = enc_clen1 cd (substring s i (if i + 4 < str_len s then i + 4 else str_len s)) in
+     if k > 0 then k else 1);
 
 // ⚠ a digit run's underscores as ruby allows them: one between two digits.
 //   `1_` ("trailing '_' in number") and `1__0` ("invalid underscore placement
@@ -371,7 +379,14 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
         if dec_fits_int dv then ri_suffix s j (parse_base s (i + 2) j base 0)
         else Cons (TBig dv, lex_go s j)
       // leading-zero octal: 017 == 15 (0 then octal digits, not . or e).
-      else if str_eq c "0" && i + 1 < str_len s && (let n = char_at s (i + 1) in is_digit n && (if str_eq n "8" || str_eq n "9" then false else true)) then
+      // (`0_10` is octal too, 8; an 8 or a 9 in the run is ruby's syntax
+      //  error: `09` is the integer 0 and then an unexpected integer)
+      else if str_eq c "0" && i + 1 < str_len s && (let n = char_at s (i + 1) in is_digit n || str_eq n "_") then
+        let _ = (let j9 = scan_base s (i + 1) 10 in
+                 if oct_run_bad s (i + 1) j9 then
+                   syn_refuse (if j9 + 1 < str_len s && str_eq (char_at s j9) "." && is_digit (char_at s (j9 + 1))
+                               then "unexpected float, expecting end-of-input" else "unexpected integer, expecting end-of-input")
+                 else ()) in
         let j = scan_base s (i + 1) 8 in
         let _ = num_us_refuse s (i + 1) j in
         let dv = dec_of_base s (i + 1) j 8 "0" in
@@ -455,6 +470,9 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
            if i + 4 < str_len s && is_hex_digit (char_at s (i + 4))
            then Cons (TStrL (chr (d1 * 16 + hex_val (char_at s (i + 4)))), lex_go s (i + 5))
            else Cons (TStrL (chr d1), lex_go s (i + 4)))
+        // (`?\u{201c}`: the braced form, as in a string)
+        else if str_eq e "u" && i + 3 < str_len s && str_eq (char_at s (i + 3)) "\{" then
+          (let (bytes, j) = scan_u_braced s (i + 4) "" 0 in Cons (TStrL bytes, lex_go s j))
         else if str_eq e "u" && i + 6 < str_len s then
           (let cp = hex4 s (i + 3) in Cons (TStrL (utf8_of cp), lex_go s (i + 7)))
         // `?\C-z` / `?\cz` (control: low five bits, `?` -> DEL), `?\M-z` (meta:
@@ -471,7 +489,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
         // (`?\“`: a backslash before a multibyte character is that character,
         //  all of its bytes -- the first byte alone was a broken token)
         else if ord e >= 128 then
-          (let w = lex_u8_width e in
+          (let w = lex_src_cw s (i + 2) in
            let w = (if i + 2 + w > str_len s then 1 else w) in
            Cons (TStrL (substring s (i + 2) (i + 2 + w)), lex_go s (i + 2 + w)))
         else
@@ -485,7 +503,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // a multibyte character is ONE character: `?に` is "に". The literal took
       // its first byte only, and the two left over were "unexpected token"
       // (CRuby's test_string writes `assert_index(0, S("にんにちは"), ?に, 0)`).
-      else (let w = lex_u8_width n in
+      else (let w = lex_src_cw s (i + 1) in
             let w = (if i + 1 + w > str_len s then 1 else w) in
             Cons (TStrL (substring s (i + 1) (i + 1 + w)), lex_go s (i + 1 + w)))
     else if str_eq c "\"" then
@@ -1993,6 +2011,12 @@ and rx_enc_name = fn (p: str) -> fn (fl: str) -> fn (e: str) ->
   else if rx_src_nonascii p 0 then "UTF-8"
   else "US-ASCII"
 
+// an 8 or a 9 in s[i, j) (the digits after a leading-zero octal's 0)
+and oct_run_bad = fn (s: str) -> fn (i: int) -> fn (j: int) ->
+  if i >= j then false
+  else if str_eq (char_at s i) "8" || str_eq (char_at s i) "9" then true
+  else oct_run_bad s (i + 1) j
+
 and hex4 = fn (s: str) -> fn (i: int) ->
   hexv (char_at s i) * 4096 + hexv (char_at s (i + 1)) * 256 +
   hexv (char_at s (i + 2)) * 16 + hexv (char_at s (i + 3))
@@ -2375,8 +2399,8 @@ and is_char_lit = fn (s: str) -> fn (i: int) ->
   else if str_eq n "\\" then true
   // a non-ASCII character is an identifier character to ruby, so it follows
   // the word rule below, looking past the whole character
-  else if ord n >= 192 then
-    (let j = i + 1 + lex_u8_width n in
+  else if ord n >= 192 || (ord n >= 128 && (if lex_src_is_utf8 () then false else true)) then
+    (let j = i + 1 + lex_src_cw s (i + 1) in
      if j >= str_len s then true
      else let n2 = char_at s j in
           if is_alnum n2 || str_eq n2 "_" || ord n2 >= 128 then false else true)
@@ -2501,7 +2525,8 @@ and after_def_name = fn (s: str) -> fn (i: int) ->
      && (if k9 >= 3 then (if is_alnum (char_at s (k9 - 3)) || str_eq (char_at s (k9 - 3)) "_" then false else true) else true))
 // ruby's rule for a splat argument of a paren-less call: a space before the
 // `*` (or `**`), none after, and a method name before the space (lvt_cmd_arg;
-// p / pp / puts / print, which it leaves to their own paths, as well)
+// p / pp / puts / print, which it leaves to their own paths, and the
+// keywords yield and super, as well)
 and cmd_star = fn (s: str) -> fn (i: int) ->
   let n9 = str_len s in
   let k9 = (if i + 1 < n9 && str_eq (char_at s (i + 1)) "*" then i + 2 else i + 1) in
@@ -2514,7 +2539,7 @@ and cmd_star = fn (s: str) -> fn (i: int) ->
               pj >= 0 && is_alpha (char_at s pj)
               && (let b9 = word_start s pj in
                   let w9 = substring s b9 (pj + 1) in
-                  (str_eq w9 "p" || str_eq w9 "pp" || str_eq w9 "puts" || str_eq w9 "print")
+                  (str_eq w9 "p" || str_eq w9 "pp" || str_eq w9 "puts" || str_eq w9 "print" || str_eq w9 "yield" || str_eq w9 "super")
                   && (if b9 > 0 then (let c9 = char_at s (b9 - 1) in if str_eq c9 "." || str_eq c9 ":" || str_eq c9 "@" || str_eq c9 "$" then false else true) else true)
                   && (if lvt_is w9 then false else true)))))
 // the token ending at pj is a number or a symbol literal (`1`, `:a`)
@@ -4221,6 +4246,11 @@ and parse_primary = fn toks ->
          // operator, which the token does not carry, so the operators stay on the
          // no-argument side where they have always been.
          else if str_eq p "(s" || str_eq p " (s" then let (es, r3) = parse_puts_args r Nil in (EYield es, r3)
+         // `yield *a, **h` / `yield **h`: a splat first argument (see cmd_star)
+         else if str_eq p " *" || str_eq p " **" || str_eq p " &" then
+           (let (es, r3) = parse_puts_args r Nil in
+            let _ = (if args_have_bpass es then syn_refuse "block argument should not be given" else ()) in
+            (EYield es, r3))
          else (EYield Nil, r)
        | Cons (TNL _, _) -> (EYield Nil, r)
        | Cons (TEOF, _) -> (EYield Nil, r)
@@ -4260,7 +4290,8 @@ and parse_primary = fn toks ->
            // and the argument was left dangling. A SPACE-marked `[` is an
            // array argument too (`super [*message, ...].join("\n")`), which is
            // exactly what the lexer marks it for.
-           else if starts_bare_arg r || starts_sp_bracket r then let (a, r3) = parse_puts_args r Nil in (false, a, r3)
+           // (`super &b` passes only a block: an explicit empty argument list)
+           else if starts_bare_arg r || starts_sp_bracket r || str_eq p " &" then let (a, r3) = parse_puts_args r Nil in (false, a, r3)
            else (true, Nil, r)
          | _ -> if starts_bare_arg r then let (a, r3) = parse_puts_args r Nil in (false, a, r3)
                 else (true, Nil, r)) in
