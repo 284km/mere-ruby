@@ -1742,6 +1742,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // (the mark is under either spelling of Object's key: the statement
        // form in `class Object` writes "Object::X" for a constant the class
        // body stored bare)
+       // (`::A::X` with A only an autoload of the top level: A's file runs
+       //  first, then X is read in what it defined -- the walk below reads
+       //  `A::X` as a whole key and never fired A)
+       // (...and one another thread is still loading is waited for: its
+       //  class may be open with X not yet in it)
+       let _ = (if str_contains n "::" && (if map_has consts (const_head n) then autoload_busy_other (const_head n) else true)
+                then (let _ = autoload_fire env world blk (const_head n) in ()) else ()) in
        if (map_has consts n || map_has consts ("Object::" ++ n))
           && (map_has private_consts n || map_has private_consts ("Object::" ++ n))
        then priv_const_err world ("Object::" ++ n)
@@ -1756,6 +1763,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if (if str_eq (anc_const_key world "Object" n) "" then false else true)
        then map_get consts (anc_const_key world "Object" n)
        else if autoload_fire env world blk n then eval_e env world blk (EConst ("::" ++ n))
+       // (...and a path whose head is now defined is read as one)
+       else if str_contains n "::" && map_has consts (const_head n) then eval_e env world blk (EConst n)
        else raise_uninit_const world "Object" n ("uninitialized constant " ++ n))
     // scoped `A::B` keeps its existing handling; a bare `Const` resolves
     // through the lexical scope (cref) first, then top level.
@@ -1812,8 +1821,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                  || has_own_meth world rc "const_missing" then
            invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
          else if autoload_fire env world blk name then eval_e env world blk (EConst name)
+         // (`Object::X` with X an autoload of the top level, keyed by its
+         //  bare name: `Object.autoload(:X, f); Object::X`)
+         else if str_eq rc "Object" && autoload_fire env world blk cn && map_has consts cn then map_get consts cn
          else raise_uninit_const world rc cn ("uninitialized constant " ++ name)
-          | found -> found))
+          // (a constant an autoload just defined is private or deprecated as
+          //  the file said: `autoload :ZZZ` then `private_constant :ZZZ` in it)
+          | found -> if map_has private_consts name then priv_const_err world name
+                     else (let _ = const_read_note world name in found)))
     else
       let cref = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s -> sget s | _ -> "") else cur_lex ()) in
       // a string instance_eval'd on an object: its singleton class and then
@@ -2147,10 +2162,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // "constant" for a name that raises when read -- defined? has to agree
        // with the read.
        (if str_contains name "::" && map_has private_consts name then VNil
-        else if str_len name > 2 && str_eq (substring name 0 2) "::" then
-          (let n9 = substring name 2 (str_len name) in
+        // (`Object::X` is the top-level X, as `::X` is)
+        else if (str_len name > 2 && str_eq (substring name 0 2) "::")
+                || (str_len name > 8 && str_eq (substring name 0 8) "Object::" && (if str_contains (substring name 8 (str_len name)) "::" then false else true)) then
+          (let n9 = (if str_eq (substring name 0 2) "::" then substring name 2 (str_len name) else substring name 8 (str_len name)) in
            if map_has private_consts n9 || map_has private_consts ("Object::" ++ n9) then VNil
-           else if map_has consts n9 || map_has consts ("Object::" ++ n9) then mkstr "constant" else VNil)
+           else if map_has consts n9 || map_has consts ("Object::" ++ n9) || autoload_pending world n9 then mkstr "constant" else VNil)
         // an autoload (Set, Pathname) is a constant that exists before it loads
         // -- except to the thread loading it, where it is not there yet
         else if map_has consts name || autoload_pending world name then mkstr "constant"
@@ -2804,13 +2821,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     //   body's method on the anonymous class. Reading self answered Object
     //   for both. (A bare autoload inside a module body is the module either
     //   way.)
+    // (...but with a MODULE as self -- a `Module.new do autoload ... end`
+    //  block, an instance_eval'd class -- the call is Module#autoload on it)
     if (str_len name == 8 && str_eq name "autoload") && (match args with Cons (_, Cons (_, _)) -> true | _ -> false) then
-      autoload_register env world (autoload_cref env) args
+      autoload_register env world (match (if lv_has env "self" then lv_get env "self" else VNil) with VClass m9 -> (if str_eq m9 "Object" then "" else m9) | _ -> autoload_cref env) args
     else if (str_len name == 9 && str_eq name "autoload?") && (match args with Cons (_, _) -> true | _ -> false) then
       (match args with
        | Cons (nm, _) ->
          let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
-         let ns = autoload_cref env in
+         let ns = (match (if lv_has env "self" then lv_get env "self" else VNil) with VClass m9 -> (if str_eq m9 "Object" then "" else m9) | _ -> autoload_cref env) in
          let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
          (if autoload_pending world key then map_get autoloads key else VNil)
        | _ -> VNil)
@@ -10938,6 +10957,7 @@ and const_walk = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (name: str
 // the first segment: lexically scoped, top level, or still only an autoload.
 // "" means it could not be resolved at all.
 and const_walk_head = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (head: str) ->
+  let _ = (if autoload_busy_other head then (let _ = autoload_fire env world blk head in ()) else ()) in
   let k0 = lex_const_key cref head in
   let k = (if str_eq k0 "" then anc_const_key world cref head else k0) in
   if (if str_eq k "" then false else true) then k
@@ -11020,6 +11040,9 @@ and autoload_register = fn env -> fn world -> fn (ns: str) -> fn (args: Val list
      let _ = (if fresh9 then const_added_hook world key else ()) in
      VNil
    | _ -> VNil)
+// is another thread running this constant's autoload right now?
+and autoload_busy_other = fn (key: str) ->
+  map_has autoload_busy key && map_get autoload_busy key != sch_me ()
 and autoload_fire = fn env -> fn world -> fn blk -> fn (key: str) ->
   if map_has autoloads key then
     (let path = (match map_get autoloads key with VStr h -> sget h | _ -> "") in
@@ -18357,7 +18380,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | _ -> VNil)
     // singleton_class of a class/module: a distinct class whose namespace
     // holds the constants/methods defined via the object's instance_eval.
-    else if (str_len name == 15 && str_eq name "singleton_class") then VClass ("(sng:" ++ c ++ ")")
+    else if (str_len name == 15 && str_eq name "singleton_class") then (let _ = map_set sng_shown c 1 in VClass ("(sng:" ++ c ++ ")"))
     // Module#singleton_class?: activesupport refuses to define module
     // attributes on one.
     else if (str_len name == 16 && str_eq name "singleton_class?") then VBool (is_sng_whole c)
@@ -19160,6 +19183,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // of them a `mod` covers is `c.kind_of?(mod)`, asked in ruby. Left out: this
     // interpreter's own bookkeeping classes (a "__" name) and the singleton
     // classes OF classes, which ruby hides as well.
+    // ObjectSpace.__sym_of_id(id): the Symbol whose object_id it is, or nil
+    else if str_eq c "ObjectSpace" && (str_len name == 11 && str_eq name "__sym_of_id") then
+      (match args with
+       | Cons (VInt i9, _) -> (let n9 = sym_name_of_id i9 in if str_eq n9 "" then VNil else VSym n9)
+       | _ -> VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 9 && str_eq name "__objects") then
       (let (_, sup9, ocls9, _) = world in
        let want9 = (match args with Cons (VClass w9, _) -> w9 | _ -> "") in
@@ -19178,6 +19206,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       map_has sup9 in9 || map_has modules in9 || is_sng_cls in9
                       || str_eq in9 "Object" || str_eq in9 "BasicObject") then ()
           else (let _ = map_set seen9 k9 1 in map_set clss9 (map_len clss9) (VClass k9))) in
+       // (a class's singleton class that the program has OPENED -- `class <<
+       //  self` in its body, `.singleton_class` -- is a class each_object
+       //  sees; the ones only made to hold class methods are internal, as
+       //  CRuby's rb_singleton_class_internal_p says)
+       let _ = map_iter sng_shown (fn (k9: str) -> fn (_v9: int) ->
+                 (let s9 = "(sng:" ++ k9 ++ ")" in
+                  if (if map_has seen9 s9 then false else true)
+                  then (let _ = map_set seen9 s9 1 in map_set clss9 (map_len clss9) (VClass s9)) else ())) in
        let _ = add9 "BasicObject" in
        let _ = map_iter sup9 (fn (k9: str) -> fn (_v9: str) -> add9 k9) in
        let _ = map_iter modules (fn (k9: str) -> fn (_v9: Val) -> add9 k9) in
@@ -19293,6 +19329,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          let _ = if map_has deprecated_consts n then map_delete deprecated_consts n else () in
          let _ = if map_has consts n then map_delete consts n else () in
          let _ = if auto9 then map_delete autoloads al9 else () in
+         // (a class removed under its own name: the next `class` of that name
+         //  is a NEW class, and must not find this one's constants -- see
+         //  the SClass arm)
+         let _ = (match old with VClass oc9 when str_eq oc9 n -> map_set cls_removed n 1 | _ -> ()) in
          old
        | _ -> VNil)
     // attr_accessor / attr_reader / attr_writer called with values (a name
@@ -27470,7 +27510,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
      | VFlt _ -> raise_exc world "TypeError" "can't define singleton"
      | VSym _ -> raise_exc world "TypeError" "can't define singleton"
      | VObj id -> VClass (singleton_cls_of world id)
-     | VClass c -> VClass ("(sng:" ++ c ++ ")")
+     | VClass c -> (let _ = map_set sng_shown c 1 in VClass ("(sng:" ++ c ++ ")"))
      // a mutable primitive instance can have a singleton class (superclass is
      // its class); frozen immediates above already raise TypeError.
      // ⚠ ...but a DEDUPLICATED string is shared, so it cannot carry one:
@@ -32948,7 +32988,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "prev_float") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'prev_float'")) in fail "mere-ruby: undefined method 'prev_float'")))
   else if (str_len name == 9 && str_eq name "object_id") || (str_len name == 6 && str_eq name "__id__") then
     (match recv with
-     | VInt n -> VInt (2 * n + 1)
+     // (2n+1 past a machine int is a bignum, and a bignum's own id is the
+     //  same 2n+1: ObjectSpace._id2ref reads every odd id back as (id-1)/2,
+     //  and 0x4000000000000000's id wrapped to a negative number)
+     | VInt n when n > 0 - 4611686018427387903 && n < 4611686018427387903 -> VInt (2 * n + 1)
+     | VInt n -> arith_bin "+" (arith_bin "*" (VInt 2) (VInt n)) (VInt 1)
+     | VBig _ -> arith_bin "+" (arith_bin "*" (VInt 2) recv) (VInt 1)
      | VNil -> VInt 8
      | VBool b -> VInt (if b then 20 else 0)
      | VSym sy -> VInt (sym_id_of sy)
@@ -32958,8 +33003,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VHsh id -> VInt (4000000 + id * 8)
      | VProc id -> VInt (5000000 + id * 8)
      // a Binding answered 0, so every binding -- and its copies -- had one id
-     | VBind id -> VInt (6000000 + id * 8)
-     | VFlt f -> VInt (7000000 + int_of_float (f * 1000.0))
+     // (the symbols' ids are 6000000 up: a binding's start at 9000000, and
+     //  a Float's are even, as every id that is not an Integer's is)
+     | VBind id -> VInt (9000000 + id * 8)
+     | VFlt f -> VInt (7000000 + 2 * int_of_float (f * 1000.0))
      // a class or module is its name here, so its id is handed out on the
      // first ask and kept: every class answered 0, and `c.dup.object_id ==
      // c.object_id` (test_object_id) was true for a copy that is not equal?
@@ -46919,7 +46966,9 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
            // Its body's constant lookup continues the ENCLOSING lexical scope
            // (ruby walks the cref chain), so a bare constant inside it still
            // resolves against the module that encloses it.
-           register_class_sng_in world (sng_target_cls world cenv csuper cls) cbody cscope
+           (let tg9 = sng_target_cls world cenv csuper cls in
+            let _ = map_set sng_shown (if is_sng_cls tg9 then sng_inner tg9 else tg9) 1 in
+            register_class_sng_in world tg9 cbody cscope)
          else
          // `class ::C` inside a class body is a TOP-LEVEL constant (not nested
          // under the enclosing class): strip the `::` and don't qualify.
@@ -48710,6 +48759,18 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // resolve a variable-qualified base (`module m::N` with m a local) to the
     // module's real name before registration.
     let name = resolve_scoped_base env name in
+    // (a class of a name whose class was removed starts empty: its old
+    //  constants are keyed `Name::X` in the one table, and a test that
+    //  autoloads `class AutoloadTest; X = 1; end` twice was told X was
+    //  "already initialized")
+    let _ = (if map_has cls_removed name && (if map_has consts name then false else true) then
+               (let _ = map_delete cls_removed name in
+                let pfx9 = name ++ "::" in
+                let ks9 = map_new () in
+                let _ = map_iter consts (fn (k9: str) -> fn (_v9: Val) ->
+                          if str_len k9 > str_len pfx9 && str_eq (substring k9 0 (str_len pfx9)) pfx9 then map_set ks9 k9 1 else ()) in
+                map_iter ks9 (fn (k9: str) -> fn (_u9: int) -> map_delete consts k9))
+             else ()) in
     // `class << target` at top level: open the target's singleton class.
     if (str_len name == 11 && str_eq name "<<singleton") then
       // (`class << self` at the top level opens main's singleton class --
@@ -48720,8 +48781,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        // Only the def target is the singleton class.
        // the enclosing scope is the CALLER's cref (a method body carries the
        // scope its `def` was written in), falling back to the lexical stack.
-       register_class_sng_in world (sng_target_cls world env super0 "Object") body
-              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ()))
+       (let tg9 = sng_target_cls world env super0 "Object" in
+        let _ = (if is_sng_cls tg9 then map_set sng_shown (sng_inner tg9) 1 else ()) in
+        register_class_sng_in world tg9 body
+              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ())))
     // `class Foo < Class`: Class has no subclasses
     else if str_eq super0 "Class" then
       (let _ = raise_exc world "TypeError" "can't make subclass of Class" in FNext VNil)
