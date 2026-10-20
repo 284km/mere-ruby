@@ -3225,47 +3225,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | _ -> VNil)
     // catch(:tag) { ... throw :tag, v ... } via the flow-signal unwind.
     else if (str_len name == 5 && str_eq name "catch") && (if map_has meths "catch" then false else true) then
-      (match args with
-       | Cons (_, Cons (_, _)) ->
-         raise_exc world "ArgumentError"
-           ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)")
-       | _ ->
-       // with no tag ruby MAKES one (a fresh Object) and, either way, PASSES
-       // it to the block -- `catch(:k) { |y| y }` is :k, and it was nil.
-       let tag = (match args with Cons (t, _) -> t | _ -> new_obj world "Object" Nil) in
-       let d0 = (if map_has catch_depth "n" then (match map_get catch_depth "n" with VInt dn -> dn | _ -> 0) else 0) in
-       let _ = map_set catch_depth "n" (VInt (d0 + 1)) in
-       let _ = map_set catch_depth ("t" ++ str_of_int (d0 + 1)) tag in
-       let f = try_or (fn (u: unit) -> run_block world blk (true, bp, bb, env) (Cons (tag, Nil))) (FRaise VNil) in
-       let _ = map_set catch_depth "n" (VInt d0) in
-       (match f with
-        | FRaise _ ->
-          if map_has flow_sig "k" then
-            let k = (match map_get flow_sig "k" with VStr kk -> let kk = sget kk in kk | _ -> "") in
-            let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
-            let tg = (if map_has flow_sig "tag" then map_get flow_sig "tag" else VNil) in
-            let _ = map_delete flow_sig "k" in
-            // a CONSUMED flow signal must not leave its internal message behind:
-            // the next real failure would be reported as that instead.
-            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
-           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
-           let _ = if map_has prim_missing "rl" then map_delete prim_missing "rl" else () in
-           let _ = if map_has prim_missing "rd" then map_delete prim_missing "rd" else () in
-           let _ = bi_rescued () in
-           let _ = if map_has prim_missing "rbt" then map_delete prim_missing "rbt" else () in
-           let _ = if map_has prim_missing "rm" then map_delete prim_missing "rm" else () in
-           let _ = if map_has prim_missing "rf" then map_delete prim_missing "rf" else () in
-
-            if str_eq k "throw" && rb_identical tg tag then v
-            else flow_rethrow_tagged k tg v
-          else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
-        | other -> flow_value other))
+      catch_with_block world blk (true, bp, bb, env) args
     // Kernel#at_exit { }: remember the block and answer it as a Proc.
     else if (str_len name == 7 && str_eq name "at_exit") && (if map_has meths "at_exit" then false else true) then
-      (let pid = (proc_next ()) in
-       let _ = store_proc (str_of_int pid) (true, bp, bb, env) in
-       let _ = map_set at_exits (str_of_int (map_len at_exits)) (VProc pid) in
-       VProc pid)
+      at_exit_with_block (true, bp, bb, env)
     // Kernel#fork { }: not implemented (no process extern) — Ruby's own
     // NotImplementedError contract for fork-less platforms.
     else if (str_len name == 4 && str_eq name "fork") && (if map_has meths "fork" then false else true) then
@@ -10465,15 +10428,59 @@ and arr_spaceship_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val lis
 // and its per-array guard made the answer depend on the nesting depth.
 // is every pair of `xs` present in `ys` with an equal value? (Hash#<=)
 
+// ⚠ ...and a cycle met by an INNER Array#hash -- one a #hash method called
+//   while an outer Array#hash was under way (`def obj.hash; super; ...`
+//   through Struct#hash back to the array) -- does not come back through
+//   that method: ruby's rb_exec_recursive_outer unwinds to the OUTERMOST
+//   call, which answers the constant. It came back, and the code after
+//   `super` ran (test_thread's test_recursive_outer). The depth is
+//   cyc_flag "d"; the unwinding is a throw of :__hash_outer__.
 and arr_hash_w = fn env -> fn world -> fn (id: int) ->
-  let _ = (if map_has cyc_flag "f" then map_delete cyc_flag "f" else ()) in
-  let r = arr_hash_rec env world id in
-  if map_has cyc_flag "f" then 4919 else r
+  let d0 = (if map_has cyc_flag "d" then map_get cyc_flag "d" else 0) in
+  if d0 > 0 then
+    (let _ = map_set cyc_flag "d" (d0 + 1) in
+     let fl0 = map_has cyc_flag "f" in
+     let _ = (if fl0 then map_delete cyc_flag "f" else ()) in
+     let r = arr_hash_rec env world id in
+     let _ = map_set cyc_flag "d" d0 in
+     let cyc9 = map_has cyc_flag "f" in
+     let _ = (if fl0 then map_set cyc_flag "f" 1 else (if cyc9 then map_delete cyc_flag "f" else ())) in
+     if cyc9 then 4919 else r)
+  else
+    (let _ = map_set cyc_flag "d" 1 in
+     let _ = (if map_has cyc_flag "f" then map_delete cyc_flag "f" else ()) in
+     let _ = map_delete cyc_flag "ok" in
+     let r = try_or (fn (u: unit) -> (let v9 = arr_hash_rec env world id in let _ = map_set cyc_flag "ok" 1 in v9)) 0 in
+     let _ = map_delete cyc_flag "d" in
+     if map_has cyc_flag "ok" then (let _ = map_delete cyc_flag "ok" in if map_has cyc_flag "f" then 4919 else r)
+     else if map_has flow_sig "k" then
+       (let k = (match map_get flow_sig "k" with VStr kk -> sget kk | _ -> "") in
+        let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+        let tg = (if map_has flow_sig "tag" then map_get flow_sig "tag" else VNil) in
+        let _ = map_delete flow_sig "k" in
+        if str_eq k "throw" && rb_identical tg (VSym "__hash_outer__") then (let _ = flow_sig_consumed () in 4919)
+        else (match flow_rethrow_tagged k tg v with _ -> 0))
+     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in
+           let _ = fail "mere-ruby: (ruby exception raised)" in 0))
+// a consumed flow signal leaves none of its internal messages behind (as
+// Kernel#catch does): the next real failure would be reported as that
+and flow_sig_consumed = fn (u: unit) ->
+  let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+  let _ = (if map_has prim_missing "f" then map_delete prim_missing "f" else ()) in
+  let _ = (if map_has prim_missing "rl" then map_delete prim_missing "rl" else ()) in
+  let _ = (if map_has prim_missing "rd" then map_delete prim_missing "rd" else ()) in
+  let _ = bi_rescued () in
+  let _ = (if map_has prim_missing "rbt" then map_delete prim_missing "rbt" else ()) in
+  let _ = (if map_has prim_missing "rm" then map_delete prim_missing "rm" else ()) in
+  (if map_has prim_missing "rf" then map_delete prim_missing "rf" else ())
 
 and arr_hash_rec = fn env -> fn world -> fn (id: int) ->
   // (an ARRAY's guard is "a" ++ id, as val_hash keys it: "h" is a Hash's,
   //  and the two number spaces overlap)
-  if map_has cyc_seen ("a" ++ str_of_int id) then (let _ = map_set cyc_flag "f" 1 in 4919)
+  if map_has cyc_seen ("a" ++ str_of_int id) then
+    (if (if map_has cyc_flag "d" then map_get cyc_flag "d" else 0) > 1
+     then (match flow_rethrow_tagged "throw" (VSym "__hash_outer__") VNil with _ -> 4919)
+     else (let _ = map_set cyc_flag "f" 1 in 4919))
   else
     (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
      let _ = map_set cyc_seen ("a" ++ str_of_int id) 1 in
@@ -11683,6 +11690,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
            else if (match recv0 with VMain -> main_priv_name name0 && (if str_eq name0 "include" || str_eq name0 "using" then false else true) | _ -> false)
            then (if (match args0 with Nil -> true | _ -> false) && (str_eq name0 "public" || str_eq name0 "private") then VNil
                  else invoke_val_c0 env world blk (VClass "Object") name0 args0 false)
+           // Kernel#sleep and a bare format / sprintf by name (send, a
+           // Method's proc): the bare call's own arm, which is where a
+           // thread parks (try_self_call_x)
+           // (...not a receiver with a public one of its own: Mutex#sleep,
+           //  which ConditionVariable#wait sends)
+           else if (if vischeck then false else true) && kernel_send_fn name0 args0
+                   && (if has_meth world (dispatch_cls_of world recv0) name0 || hng_sng_has world recv0 name0
+                          || responds world recv0 name0 || kernel_fn_owned recv0 then false else true)
+           then (if str_len name0 == 5 then try_self_call_x env world recv0 name0 args0 false
+                 else raise_exc world "ArgumentError" "too few arguments")
            else invoke_val_c0 env world blk recv0 name0 args0 vischeck) in
   // (...where the pair answered none, they are its backtrace's frames)
   let v = (match v with
@@ -15481,7 +15498,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // ...in a CHILD of the caller's env, as a string eval runs: the
          // caller's locals are visible (`m.module_eval("self::Foo = c")`
          // read c as a method of the module), and the cref is the receiver
+         // (the string's file mark moves the RUN-time file to the eval's
+         //  name; it comes back after, raised or not, as Kernel#eval's does --
+         //  every block written after `m.module_eval("...")` reported the
+         //  eval as its file: test_thread's test_inspect)
+         let of9 = cur_file () in
+         let ol9 = cur_line () in
          let r = try_or (fn (u: unit) -> (let v9 = flow_value (register_class_blk world c p2 c env) in let _ = map_set ok9 "y" 1 in v9)) VNil in
+         let _ = cur_file_set of9 in
+         let _ = cur_line_set ol9 in
          let _ = set_lex saved in
          let _ = eval_pfile_pop savedpf in
          // (and the failure goes on AS IT WAS -- an exception's $exc, or a
@@ -20378,8 +20403,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // ... and the block the caller gives the PROC belongs to the method:
           // `method(:m).to_proc.call(5) { }` must reach m's yield, so the proc
           // takes a block parameter and passes it on.
+          // (a builtin on main -- `method(:Integer)`, `method(:sleep)` -- is no
+          //  function the call by name finds: it goes through #call too)
           let body = (match mrecv with
-                      | VMain -> Cons (SExpr (ECall (mnm, Cons (ESplat (EVar "__a"), Cons (EBlockPass (EVar "__b"), Nil)))), Nil)
+                      | VMain when has_meth world "Object" mnm || hng_sng_has world VMain mnm ->
+                        Cons (SExpr (ECall (mnm, Cons (ESplat (EVar "__a"), Cons (EBlockPass (EVar "__b"), Nil)))), Nil)
                       | _ -> Cons (SExpr (EMethod (EVar "__m_meth", "call", Cons (ESplat (EVar "__a"), Cons (EBlockPass (EVar "__b"), Nil)))), Nil)) in
           let pid = (proc_next ()) in
           let _ = store_proc (str_of_int pid) (true, Cons ("*__a", Cons ("&__b", Nil)), body, benv) in
@@ -25764,6 +25792,20 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
             && (let (m9, _, _, _) = world in if map_has m9 name then false else true)
             && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
       run_loop_builtin env world blk newblk
+    // ...and a Kernel function that takes no block, sent or called through
+    // a Method WITH one (`method(:Integer).call("1") { }`, a Method's proc
+    // started by a Thread subclass's `super`): the block is ignored, as
+    // ruby ignores it, and the call is the blockless one
+    else if kernel_blockless_fn name
+            && (let (m9, _, _, _) = world in if map_has m9 name then false else true)
+            && (if has_meth world (dispatch_cls_of world recv) name || hng_sng_has world recv name
+                   || responds world recv name || kernel_fn_owned recv then false else true) then
+      invoke_val_c env world blk recv name args false
+    // ...and `send(:catch) { }` / `send(:at_exit) { }`: Kernel's, by name
+    else if ((str_len name == 5 && str_eq name "catch") || (str_len name == 7 && str_eq name "at_exit"))
+            && (let (m9, _, _, _) = world in if map_has m9 name then false else true)
+            && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+      (if str_len name == 5 then catch_with_block world blk newblk args else at_exit_with_block newblk)
     // Object#then / yield_self: run the block with the receiver.
     else if (str_len name == 4 && str_eq name "then") || (str_len name == 10 && str_eq name "yield_self") then
       flow_value (run_block world blk newblk (Cons (recv, Nil)))
@@ -28096,9 +28138,17 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
        //   The block form was given this and the string form was not, which is
        //   the same rule living in one of its two places.
        let _ = map_set env2 "__definee_recv" recv in
-       let r2 = eval_run env2 world blk p2 in
+       // (...and the run-time file comes back after, as module_eval's does)
+       let of9 = cur_file () in
+       let ol9 = cur_line () in
+       let ok9 = map_new () in
+       let r2 = try_or (fn (u: unit) -> (let v9 = eval_run env2 world blk p2 in let _ = map_set ok9 "y" 1 in v9)) VNil in
+       let _ = cur_file_set of9 in
+       let _ = cur_line_set ol9 in
        let _ = lv_child_done env2 in
-       r2
+       if map_has ok9 "y" then r2
+       else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (passed on past a string *_eval)")) in
+             fail "mere-ruby: (passed on past a string *_eval)")
      | _ -> VNil)
   // is_a? / kind_of? walk the real (exception) hierarchy.
   else if ((str_len name == 5 && str_eq name "is_a?") || (str_len name == 8 && str_eq name "kind_of?") || (str_len name == 12 && str_eq name "instance_of?")) then
@@ -36956,6 +37006,63 @@ and undef_blame = fn world -> fn (blame: Val) ->
 //   `fork` refuses, and where `exit` unwinds. Routing every Kernel name to
 //   dispatch_prim took `sleep` away from the parking arm and
 //   core/threadgroup/list stopped seeing its threads at all.
+// Kernel#catch with its block (the bare `catch ... { }` and `send(:catch) { }`)
+and catch_with_block = fn world -> fn blk -> fn nb -> fn (args: Val list) ->
+      (match args with
+       | Cons (_, Cons (_, _)) ->
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)")
+       | _ ->
+       // with no tag ruby MAKES one (a fresh Object) and, either way, PASSES
+       // it to the block -- `catch(:k) { |y| y }` is :k, and it was nil.
+       let tag = (match args with Cons (t, _) -> t | _ -> new_obj world "Object" Nil) in
+       let d0 = (if map_has catch_depth "n" then (match map_get catch_depth "n" with VInt dn -> dn | _ -> 0) else 0) in
+       let _ = map_set catch_depth "n" (VInt (d0 + 1)) in
+       let _ = map_set catch_depth ("t" ++ str_of_int (d0 + 1)) tag in
+       let f = try_or (fn (u: unit) -> run_block world blk nb (Cons (tag, Nil))) (FRaise VNil) in
+       let _ = map_set catch_depth "n" (VInt d0) in
+       (match f with
+        | FRaise _ ->
+          if map_has flow_sig "k" then
+            let k = (match map_get flow_sig "k" with VStr kk -> let kk = sget kk in kk | _ -> "") in
+            let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+            let tg = (if map_has flow_sig "tag" then map_get flow_sig "tag" else VNil) in
+            let _ = map_delete flow_sig "k" in
+            // a CONSUMED flow signal must not leave its internal message behind:
+            // the next real failure would be reported as that instead.
+            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
+           let _ = if map_has prim_missing "rl" then map_delete prim_missing "rl" else () in
+           let _ = if map_has prim_missing "rd" then map_delete prim_missing "rd" else () in
+           let _ = bi_rescued () in
+           let _ = if map_has prim_missing "rbt" then map_delete prim_missing "rbt" else () in
+           let _ = if map_has prim_missing "rm" then map_delete prim_missing "rm" else () in
+           let _ = if map_has prim_missing "rf" then map_delete prim_missing "rf" else () in
+
+            if str_eq k "throw" && rb_identical tg tag then v
+            else flow_rethrow_tagged k tg v
+          else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
+        | other -> flow_value other))
+// Kernel#at_exit with its block
+and at_exit_with_block = fn nb ->
+  let pid = (proc_next ()) in
+  let _ = store_proc (str_of_int pid) nb in
+  let _ = map_set at_exits (str_of_int (map_len at_exits)) (VProc pid) in
+  VProc pid
+and kernel_blockless_fn = fn (name: str) ->
+  str_eq name "Integer" || str_eq name "Float" || str_eq name "String" || str_eq name "Array" || str_eq name "Hash"
+  || str_eq name "Rational" || str_eq name "Complex" || str_eq name "sleep" || str_eq name "format" || str_eq name "sprintf"
+  || str_eq name "rand" || str_eq name "srand" || str_eq name "printf" || str_eq name "puts" || str_eq name "print"
+  || str_eq name "p" || str_eq name "putc" || str_eq name "warn"
+// a builtin object with a #sleep of its own the prim layer answers (and
+// respond_to? does not list): Mutex#sleep unlocks, waits and locks again
+and kernel_fn_owned = fn (recv: Val) ->
+  match recv with
+  | VObj o9 -> (let c9 = class_name recv in str_eq c9 "Thread::Mutex" || str_eq c9 "Mutex" || str_eq c9 "Monitor")
+  | _ -> false
+and kernel_send_fn = fn (name: str) -> fn (args: Val list) ->
+  (str_len name == 5 && str_eq name "sleep")
+  || (((str_len name == 6 && str_eq name "format") || (str_len name == 7 && str_eq name "sprintf")) && (match args with Nil -> true | _ -> false))
 and kernel_bare_special = fn (name: str) ->
   (str_len name == 5 && str_eq name "sleep") || (str_len name == 4 && str_eq name "fork")
   || (str_len name == 4 && str_eq name "exit")
@@ -43555,8 +43662,15 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
                  // raised at it (or killed) before it ever ran
                  let _ = sch_deliver world tid in
                  match (if map_has iv3 (k ++ "@__tblk") then map_get iv3 (k ++ "@__tblk") else VNil) with
+                 // (a Method's proc -- `Thread.new(&method(:sleep))` -- is
+                 //  called with no block, as ruby's thread calls it: the
+                 //  enclosing block it was given became the proc's own &block,
+                 //  and a Thread subclass's `super` handed over the proc itself)
                  | VProc pid -> (let _ = rx_fiber_home r (proc_get (str_of_int pid)) in
-                                 run_block world blk (proc_get (str_of_int pid)) args)
+                                 let enc9 = (match proc_get (str_of_int pid) with
+                                             | (_, _, _, penv9) -> (if map_has penv9 "__m_meth"
+                                                                    then (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) else blk)) in
+                                 run_block world enc9 (proc_get (str_of_int pid)) args)
                  | _ -> FNext VNil)
                (FRaise VNil) in
   let _ = thread_report world tid result in
@@ -50163,10 +50277,15 @@ and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (e
      let ol9 = (cur_line ()) in
      let _ = cur_file_set efile in
      let _ = cur_line_set eline in
-     let r9 = eval_run env world blk prog2 in
+     // (raised or not: an eval that raised left the run-time file at its
+     //  name, and every block written after the rescue reported it)
+     let ok9 = map_new () in
+     let r9 = try_or (fn (u: unit) -> (let v9 = eval_run env world blk prog2 in let _ = map_set ok9 "y" 1 in v9)) VNil in
      let _ = cur_file_set of9 in
      let _ = cur_line_set ol9 in
-     r9)
+     if map_has ok9 "y" then r9
+     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (passed on past an eval)")) in
+           fail "mere-ruby: (passed on past an eval)"))
 
 
 // a Binding's env: the locals, and the lexical scope it was made in when that
