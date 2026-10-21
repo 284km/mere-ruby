@@ -7514,6 +7514,11 @@ and cond_ff = fn (e: Expr) ->
     else e
   | EAssign (_, v) ->
     (let _ = (if cond_static v then cond_warn "found '= literal' in conditional, should be ==" else ()) in e)
+  // (and a multiple assignment of literals: `(x, y = 1, 2) ? 1 : 2`)
+  | EStmt (SMultiAssign (_, vs)) ->
+    (let _ = (if cond_static_all vs then cond_warn "found '= literal' in conditional, should be ==" else ()) in e)
+  | EStmt (SMultiAssignX (_, vs)) ->
+    (let _ = (if cond_static_all vs then cond_warn "found '= literal' in conditional, should be ==" else ()) in e)
   | _ -> e
 
 // a value ruby counts as a literal for "found '= literal' in conditional":
@@ -7583,6 +7588,9 @@ and ff_operand = fn (e: Expr) ->
   // (a string or symbol end is always true: ruby says so, the symbol under -w)
   | EStrL _ -> let _ = cond_warn "string literal in flip-flop" in e
   | ESym _ -> let _ = (if parse_verbose () then cond_warn "symbol literal in flip-flop" else ()) in e
+  // (under the literal's frozen_string_literal / encoding tag too)
+  | EMethod (x, m, Nil) when str_len m > 6 && str_eq (substring m 0 6) "__lit_" && (match lit_untag x with EStrL _ -> true | _ -> false) ->
+    let _ = cond_warn "string literal in flip-flop" in e
   | EMethod (x, m, _) ->
     (if str_eq m "__interp_str" then (let _ = cond_warn "string literal in flip-flop" in e)
      else if str_eq m "to_sym" && cond_is_dstr x then
@@ -8978,3 +8986,302 @@ and parse_bare_after = fn (name: str) -> fn toks -> fn (acc: str list) -> fn (de
     else (rev_app (Cons (name, acc)) Nil, rev_app defs Nil, toks)
   | _ -> (rev_app (Cons (name, acc)) Nil, rev_app defs Nil, toks);
 
+
+// ---- "assigned but unused variable" (-w) ----------------------------------
+// ruby's warning for a local that is assigned and never read, given when the
+// scope that owns it closes: a def, a class body, a block, a lambda, the file.
+// Read is a bare `name` (EVar) -- `name()` is a call -- or the name of an
+// ambiguous `name [x]`; an argument or a block parameter never warns, nor does
+// a name that starts with `_`. The top level of -e and of an eval'd string,
+// and the blocks in it, say nothing (only their defs and class bodies do).
+// The walk is over the parsed program, after the parse, under -w only.
+let uv_line = map_new ();
+let uv_used = map_new ();
+let uv_cnt = map_new ();
+let uv_name = map_new ();
+let uv_ctr = map_new ();
+let uv_cur = map_new ();
+let uv_warnable = fn (n: str) ->
+  str_len n > 0 && (let o = ord (char_at n 0) in (o >= 97 && o <= 122) || o >= 128);
+let rec uv_find = fn (chain: (int * bool * bool) list) -> fn (n: str) ->
+  match chain with
+  | Nil -> 0 - 1
+  | Cons ((sid, hard, _), t) ->
+    if map_has uv_line (str_of_int sid ++ ":" ++ n) then sid
+    else if hard then 0 - 1
+    else uv_find t n;
+let uv_def = fn (chain: (int * bool * bool) list) -> fn (n: str) -> fn (used: bool) ->
+  if str_len n == 0 || (let o = ord (char_at n 0) in (if (o >= 97 && o <= 122) || o == 95 || o >= 128 then false else true))
+     || (str_len n <= 8 && lvt_is_kw n) then ()
+  else if uv_find chain n >= 0 then (if used then map_set uv_used (str_of_int (uv_find chain n) ++ ":" ++ n) 1 else ())
+  else (match chain with
+        | Cons ((sid, _, _), _) ->
+          (let k = str_of_int sid ++ ":" ++ n in
+           let _ = map_set uv_line k (if map_has uv_cur "l" then map_get uv_cur "l" else 0) in
+           let _ = (if used then map_set uv_used k 1 else ()) in
+           let c = (if map_has uv_cnt (str_of_int sid) then map_get uv_cnt (str_of_int sid) else 0) in
+           let _ = map_set uv_name (str_of_int sid ++ "#" ++ str_of_int c) n in
+           map_set uv_cnt (str_of_int sid) (c + 1))
+        | Nil -> ());
+let uv_use = fn (chain: (int * bool * bool) list) -> fn (n: str) ->
+  let sid = uv_find chain n in
+  if sid >= 0 then map_set uv_used (str_of_int sid ++ ":" ++ n) 1 else ();
+// a parameter spec as the parser writes it (`*a`, `**k`, `&b`, `k:`, `;x`,
+// `(a, (b, c))`): every name in it, declared as used
+let rec uv_decl_spec = fn (chain: (int * bool * bool) list) -> fn (s: str) -> fn (i: int) -> fn (st: int) ->
+  if i >= str_len s then (if i > st then uv_def chain (substring s st i) true else ())
+  else (let c = char_at s i in
+        if is_alnum c || str_eq c "_" then uv_decl_spec chain s (i + 1) st
+        else (let _ = (if i > st then uv_def chain (substring s st i) true else ()) in uv_decl_spec chain s (i + 1) (i + 1)));
+let rec uv_decl_params = fn (chain: (int * bool * bool) list) -> fn (ps: str list) ->
+  match ps with Nil -> () | Cons (p, t) -> (let _ = uv_decl_spec chain p 0 0 in uv_decl_params chain t);
+let uv_open = fn (chain: (int * bool * bool) list) -> fn (hard: bool) -> fn (quiet: bool) ->
+  let sid = (if map_has uv_ctr "n" then map_get uv_ctr "n" else 0) + 1 in
+  let _ = map_set uv_ctr "n" sid in
+  Cons ((sid, hard, quiet), chain);
+let uv_close = fn (chain: (int * bool * bool) list) -> fn (file: str) ->
+  match chain with
+  | Cons ((sid, _, quiet), _) ->
+    (let c = (if map_has uv_cnt (str_of_int sid) then map_get uv_cnt (str_of_int sid) else 0) in
+     let rec go = fn (i: int) ->
+       if i >= c then ()
+       else (let n = map_get uv_name (str_of_int sid ++ "#" ++ str_of_int i) in
+             let k = str_of_int sid ++ ":" ++ n in
+             let _ = (if quiet || map_has uv_used k || (if uv_warnable n then false else true) then ()
+                      else warn_note (file ++ ":" ++ str_of_int (map_get uv_line k + lshift_tok ()) ++ ": warning: assigned but unused variable - " ++ n)) in
+             go (i + 1)) in
+     go 0)
+  | Nil -> ();
+let rec str_index_of_ch_go = fn (s: str) -> fn (c: str) -> fn (i: int) ->
+  if i >= str_len s then 0 - 1 else if str_eq (char_at s i) c then i else str_index_of_ch_go s c (i + 1);
+let str_index_of_ch = fn (s: str) -> fn (c: str) -> str_index_of_ch_go s c 0;
+let rec uv_stmts = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ss: Stmt list) ->
+  match ss with
+  | Nil -> ()
+  | Cons (s, t) -> (let _ = uv_stmt chain file s in uv_stmts chain file t)
+and uv_body = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (hard: bool) -> fn (ps: str list) -> fn (ss: Stmt list) ->
+  // (a `for` is a block over `__fN` whose variables are the enclosing
+  //  scope's: `for a, b in xs; end; a` reads them)
+  if (match ps with Nil -> false | _ -> uv_for_params ps) then uv_stmts chain file ss
+  else
+  let l0 = (if map_has uv_cur "l" then map_get uv_cur "l" else 0) in
+  let quiet = (if hard then false else (match chain with Cons ((_, _, q), _) -> q | Nil -> false)) in
+  let ch = uv_open chain hard quiet in
+  let _ = uv_decl_params ch ps in
+  let _ = uv_stmts ch file ss in
+  let _ = uv_close ch file in
+  map_set uv_cur "l" l0
+and uv_stmt = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (s: Stmt) ->
+  match s with
+  | SLine n -> map_set uv_cur "l" n
+  | SExpr e -> uv_expr chain file e
+  | SPuts es -> uv_exprs chain file es
+  // (the name is the variable's before its value is read: `a ||= 1` is
+  //  `a = a || 1`, and reads a)
+  | SAssign (n, e) -> (let _ = uv_def chain n false in uv_expr chain file e)
+  // (`a = a = 1` reads nothing, and ruby says nothing)
+  | SLocalFrom (n, s2) ->
+    (let used = (match s2 with SAssign (n2, _) -> str_eq n2 n | SLocalFrom (n2, _) -> str_eq n2 n | _ -> false) in
+     let _ = uv_def chain n used in uv_stmt_val chain file s2)
+  | SIVarAssign (_, e) -> uv_expr chain file e
+  | SIf (cls, els) ->
+    (let rec cl9 = fn (xs: (Expr * Stmt list) list) ->
+       (match xs with Nil -> uv_stmts chain file els | Cons ((c, b), t) -> (let _ = uv_cond chain file c in let _ = uv_stmts chain file b in cl9 t)) in
+     cl9 cls)
+  // (the condition is read again after the body: `x = f until x == y`)
+  | SWhile (c, b) -> (let _ = uv_cond chain file c in let _ = uv_stmts chain file b in uv_cond chain file c)
+  | SDoWhile (b, c) -> (let _ = uv_stmt chain file b in uv_expr chain file c)
+  | SCase (e, ws, els) ->
+    (let _ = uv_expr chain file e in
+     let rec w9 = fn (xs: (Expr list * Stmt list) list) ->
+       (match xs with Nil -> uv_stmts chain file els | Cons ((cs, b), t) -> (let _ = uv_exprs chain file cs in let _ = uv_stmts chain file b in w9 t)) in
+     w9 ws)
+  | SCaseIn (e, cls, _, els) ->
+    (let _ = uv_expr chain file e in
+     let rec c9 = fn (xs: (Pat * Expr * Stmt list) list) ->
+       (match xs with Nil -> uv_stmts chain file els | Cons ((p, g, b), t) -> (let _ = uv_pat chain file p in let _ = uv_expr chain file g in let _ = uv_stmts chain file b in c9 t)) in
+     c9 cls)
+  | SDef (dn, ps, ds, b) ->
+    (let l0 = (if map_has uv_cur "l" then map_get uv_cur "l" else 0) in
+     // (`def a.foo`: the receiver is read)
+     let _ = (let h9 = str_index_of_ch dn "#" in if h9 > 0 then uv_use chain (substring dn 0 h9) else ()) in
+     let ch = uv_open chain true false in
+     let _ = uv_decl_params ch ps in
+     let rec d9 = fn (xs: (str * Expr) list) -> (match xs with Nil -> () | Cons ((_, e), t) -> (let _ = uv_expr ch file e in d9 t)) in
+     let _ = d9 ds in
+     let _ = uv_stmts ch file b in
+     let _ = uv_close ch file in
+     map_set uv_cur "l" l0)
+  | SReturn e -> uv_expr chain file e
+  | SBreak e -> uv_expr chain file e
+  | SNext e -> uv_expr chain file e
+  // (`class mod::C < parent`: a local in the path or as the superclass)
+  | SClass (cn, sup, b) ->
+    (let h9 = str_index_of_ch cn ":" in
+     let _ = (if h9 > 0 then uv_use chain (substring cn 0 h9) else ()) in
+     let _ = uv_use chain sup in
+     uv_body chain file true Nil b)
+  | SClassE (cn, e, b) ->
+    (let h9 = str_index_of_ch cn ":" in
+     let _ = (if h9 > 0 then uv_use chain (substring cn 0 h9) else ()) in
+     let _ = uv_expr chain file e in uv_body chain file true Nil b)
+  | SSingletonE (e, b) -> (let _ = uv_expr chain file e in uv_body chain file true Nil b)
+  | SBegin (b, rs, els, ens) ->
+    (let _ = uv_stmts chain file b in
+     let rec r9 = fn (xs: (str list * str * Stmt list) list) ->
+       (match xs with
+        | Nil -> ()
+        | Cons ((cs, v, rb), t) ->
+          (let _ = uv_rescue_classes chain file cs in
+           // (named at the `rescue` line: the one before its body's first)
+           let _ = (match uv_first_line rb with n9 when n9 > 1 -> map_set uv_cur "l" (n9 - 1) | _ -> ()) in
+           let _ = uv_def chain v false in let _ = uv_stmts chain file rb in r9 t)) in
+     let _ = r9 rs in
+     let _ = uv_stmts chain file els in
+     uv_stmts chain file ens)
+  | SPreexe b -> uv_stmts chain file b
+  | SAtExit (_, b) -> uv_body chain file false Nil b
+  // (the targets are the variables before the values are read, as ruby
+  //  reads left to right: `e, pid = IO.pipe do pid = fork ... end`)
+  | SMultiAssign (ns, es) ->
+    (let rec n9 = fn (xs: str list) -> (match xs with Nil -> () | Cons (x, t) -> (let _ = uv_def chain (if str_len x > 0 && str_eq (char_at x 0) "*" then substring x 1 (str_len x) else x) false in n9 t)) in
+     let _ = n9 ns in
+     uv_exprs chain file es)
+  | SMultiAssignX (ts, es) -> (let _ = uv_targets chain file ts in uv_exprs chain file es)
+  | SRequire (_, e) -> uv_expr chain file e
+  | SAndThen (a, b) -> (let _ = uv_stmt_val chain file a in uv_stmt chain file b)
+  | SOrElse (a, b) -> (let _ = uv_stmt_val chain file a in uv_stmt chain file b)
+  // (`include m` names a local module as a string)
+  | SInclude (n, _) -> uv_use chain n
+  | _ -> ()
+// a statement whose value is taken (`a = b = 1`, `x = 1 or flunk`, `(y = v)`):
+// the variable it assigns is used
+and uv_stmt_val = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (s: Stmt) ->
+  match s with
+  | SAssign (n, e) -> (let _ = uv_def chain n true in uv_expr chain file e)
+  | SLocalFrom (n, s2) -> (let _ = uv_def chain n true in uv_stmt_val chain file s2)
+  // (`begin ... rescue v = 3 end.should`: each clause's last statement is
+  //  the value)
+  | SBegin (b, rs, els, ens) ->
+    (let _ = uv_stmts_val chain file b in
+     let rec r9 = fn (xs: (str list * str * Stmt list) list) ->
+       (match xs with
+        | Nil -> ()
+        | Cons ((cs, v, rb), t) -> (let _ = uv_rescue_classes chain file cs in let _ = uv_def chain v false in let _ = uv_stmts_val chain file rb in r9 t)) in
+     let _ = r9 rs in
+     let _ = uv_stmts_val chain file els in
+     uv_stmts chain file ens)
+  | _ -> uv_stmt chain file s
+and uv_stmts_val = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ss: Stmt list) ->
+  match ss with
+  | Nil -> ()
+  | Cons (s, Nil) -> uv_stmt_val chain file s
+  | Cons (s, t) -> (let _ = uv_stmt chain file s in uv_stmts_val chain file t)
+and uv_first_line = fn (ss: Stmt list) ->
+  match ss with Nil -> 0 | Cons (SLine n, _) -> n | Cons (SFile _, t) -> uv_first_line t | Cons (_, t) -> 0
+// the parameters the parser gives a `for` loop's block (`__for`, `__forv`,
+// `__f0`, `*__f1` ...), and nothing else
+and uv_for_params = fn (ps: str list) ->
+  match ps with
+  | Nil -> true
+  | Cons (p9, t) ->
+    (let q9 = (if str_len p9 > 0 && str_eq (char_at p9 0) "*" then substring p9 1 (str_len p9) else p9) in
+     str_len q9 >= 3 && str_eq (substring q9 0 3) "__f" && uv_for_params t)
+// a rescue clause's classes: a runtime expression is registered (resc_reg)
+// and named by its sentinel, `*` in front for a splat
+and uv_rescue_classes = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (cs: str list) ->
+  match cs with
+  | Nil -> ()
+  | Cons (c0, t) ->
+    (let c = (if str_len c0 > 0 && str_eq (char_at c0 0) "*" then substring c0 1 (str_len c0) else c0) in
+     let _ = (if str_len c > 7 && str_eq (substring c 0 7) "@rexpr~" then
+                (let k = substring c 7 (str_len c) in if map_has resc_exprs k then uv_expr chain file (map_get resc_exprs k) else ())
+              else uv_use chain c) in
+     uv_rescue_classes chain file t)
+and uv_targets = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ts: Expr list) ->
+  match ts with
+  | Nil -> ()
+  | Cons (t, r) ->
+    (let _ = (match t with
+              | EVar n -> uv_def chain n false
+              | ESplat (EVar n) -> uv_def chain n false
+              | EArr xs -> uv_targets chain file xs
+              | ESplat (EArr xs) -> uv_targets chain file xs
+              | e -> uv_expr chain file e) in
+     uv_targets chain file r)
+// a condition's value is read: `if x = true` uses x (ruby says only that the
+// `=` is likely a `==`)
+and uv_cond = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (c: Expr) ->
+  match c with
+  | EAssign (n, v) -> (let _ = uv_def chain n true in uv_expr chain file v)
+  | EUn (op, a) when str_eq op "!" -> uv_cond chain file a
+  | _ -> uv_expr chain file c
+and uv_exprs = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (es: Expr list) ->
+  match es with Nil -> () | Cons (e, t) -> (let _ = uv_expr chain file e in uv_exprs chain file t)
+and uv_expr = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (e: Expr) ->
+  match e with
+  | EVar n -> uv_use chain n
+  // (an assignment written where its value is taken -- an argument, a
+  //  condition, `(x = v).m` -- counts as using it, as ruby counts it)
+  | EAssign (n, v) -> (let _ = uv_def chain n true in uv_expr chain file v)
+  | EArr es -> uv_exprs chain file es
+  | EHsh es -> uv_exprs chain file es
+  | EKwHash es -> uv_exprs chain file es
+  | EBin (_, a, b) -> (let _ = uv_expr chain file a in uv_expr chain file b)
+  | EUn (_, a) -> uv_expr chain file a
+  | ECall (_, args) -> uv_exprs chain file args
+  | EMethod (r, _, args) -> (let _ = uv_expr chain file r in uv_exprs chain file args)
+  | ESafe (r, _, args) -> (let _ = uv_expr chain file r in uv_exprs chain file args)
+  | EScopedAssign (r, _, v) -> (let _ = uv_expr chain file r in uv_expr chain file v)
+  | EScopedRead (r, _) -> uv_expr chain file r
+  | EScopedReadOrNil (r, _) -> uv_expr chain file r
+  | EAttrOp (r, _, _, v) -> (let _ = uv_expr chain file r in uv_expr chain file v)
+  | EIdxOp (r, args, _, v) -> (let _ = uv_expr chain file r in let _ = uv_exprs chain file args in uv_expr chain file v)
+  | ERange (a, b, _) -> (let _ = uv_expr chain file a in uv_expr chain file b)
+  | EAmbigIdx (n, args) -> (let _ = uv_use chain n in uv_exprs chain file args)
+  | EAmbigIdxC (n, a, b) -> (let _ = uv_use chain n in let _ = uv_expr chain file a in uv_expr chain file b)
+  | EFlipFlop (_, a, b, _) -> (let _ = uv_expr chain file a in uv_expr chain file b)
+  | EYield es -> uv_exprs chain file es
+  | ECallB (_, args, bp, bb) -> (let _ = uv_exprs chain file args in uv_body chain file false bp bb)
+  | EMethodB (r, _, args, bp, bb) -> (let _ = uv_expr chain file r in let _ = uv_exprs chain file args in uv_body chain file false bp bb)
+  | ESafeB (r, _, args, bp, bb) -> (let _ = uv_expr chain file r in let _ = uv_exprs chain file args in uv_body chain file false bp bb)
+  | ESuperB (_, args, bp, bb) -> (let _ = uv_exprs chain file args in uv_body chain file false bp bb)
+  | ELambda (ps, bb) -> uv_body chain file false ps bb
+  | ERaise es -> uv_exprs chain file es
+  | ESplat a -> uv_expr chain file a
+  | EKwSplat a -> uv_expr chain file a
+  | EBlockPass a -> uv_expr chain file a
+  | ETern (a, b, c) -> (let _ = uv_cond chain file a in let _ = uv_expr chain file b in uv_expr chain file c)
+  | EDefined a -> uv_expr chain file a
+  | ESuper (_, es) -> uv_exprs chain file es
+  | EStmt st -> uv_stmt_val chain file st
+  | EFlow (_, a) -> uv_expr chain file a
+  | EMatchTest (a, p) -> (let _ = uv_expr chain file a in uv_pat chain file p)
+  | EMatchBind (a, p) -> (let _ = uv_expr chain file a in uv_pat chain file p)
+  | _ -> ()
+and uv_pat = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (p: Pat) ->
+  match p with
+  // (ruby says nothing of a pattern's variables)
+  | PVar n -> uv_def chain n true
+  | PVal e -> uv_expr chain file e
+  | PPin e -> uv_expr chain file e
+  | PSplatP n -> uv_def chain n true
+  | PArrP ps -> uv_pats chain file ps
+  | PHashP (kvs, rest) ->
+    (let rec k9 = fn (xs: (str * Pat) list) -> (match xs with Nil -> () | Cons ((_, q), t) -> (let _ = uv_pat chain file q in k9 t)) in
+     let _ = k9 kvs in
+     if str_eq rest "" || str_eq rest "nil" || str_eq rest "*" then () else uv_def chain rest true)
+  | PAltP ps -> uv_pats chain file ps
+  | PAsP (q, n) -> (let _ = uv_pat chain file q in uv_def chain n true)
+  | PConstP (e, q) -> (let _ = uv_expr chain file e in uv_pat chain file q)
+and uv_pats = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ps: Pat list) ->
+  match ps with Nil -> () | Cons (p, t) -> (let _ = uv_pat chain file p in uv_pats chain file t);
+// the whole program's walk, after its parse: quiet_top for -e and an eval
+let uv_program = fn (prog: Stmt list) -> fn (file: str) -> fn (quiet_top: bool) ->
+  if parse_verbose () then
+    (let _ = map_clear uv_line in let _ = map_clear uv_used in let _ = map_clear uv_cnt in let _ = map_clear uv_name in
+     let _ = map_set uv_cur "l" 0 in
+     let ch = uv_open Nil true quiet_top in
+     let _ = uv_stmts ch file prog in
+     uv_close ch file)
+  else ();
