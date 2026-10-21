@@ -32,11 +32,11 @@ dropped, every platform-guarded Process file. 335 files moved from MATCH to SKIP
 so MATCH 2722 before it and 2410 on it are not the same question either.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 53 | 14 | 0 | 0 | 0 | 67 |
+| language | 55 | 12 | 0 | 0 | 0 | 67 |
 | core/string | 112 | 2 | 0 | 0 | 0 | 114 |
 | core/array | 103 | 0 | 0 | 1 | 1 | 105 |
 | core/hash | 68 | 1 | 0 | 0 | 0 | 69 |
-| core/range | 31 | 2 | 0 | 2 | 0 | 35 |
+| core/range | 30 | 3 | 0 | 2 | 0 | 35 |
 | core/comparable | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/complex | 42 | 0 | 0 | 1 | 0 | 43 |
 | core/env | 44 | 0 | 0 | 1 | 0 | 45 |
@@ -63,7 +63,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/set | 54 | 0 | 0 | 1 | 0 | 55 |
 | core/regexp | 23 | 1 | 0 | 0 | 0 | 24 |
 | core/enumerable | 58 | 2 | 0 | 1 | 0 | 61 |
-| core/module | 78 | 5 | 0 | 2 | 0 | 85 |
+| core/module | 79 | 4 | 0 | 2 | 0 | 85 |
 | core/filetest | 18 | 1 | 0 | 6 | 0 | 25 |
 | core/data | 12 | 0 | 0 | 1 | 0 | 13 |
 | core/math | 29 | 0 | 0 | 0 | 0 | 29 |
@@ -84,7 +84,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/builtin_constants | 1 | 0 | 0 | 0 | 0 | 1 |
 | core/fiber | 11 | 1 | 0 | 1 | 0 | 13 |
 | core/dir | 32 | 0 | 0 | 2 | 0 | 34 |
-| core/file | 59 | 7 | 0 | 2 | 0 | 68 |
+| core/file | 60 | 6 | 0 | 2 | 0 | 68 |
 | core/time | 61 | 2 | 0 | 3 | 0 | 66 |
 | core/io | 78 | 2 | 0 | 1 | 0 | 81 |
 | library/date | 60 | 0 | 0 | 38 | 0 | 98 |
@@ -134,7 +134,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/thread/backtrace/location | 5 | 2 | 0 | 0 | 0 | 7 |
 | core/tracepoint | 12 | 7 | 0 | 0 | 0 | 19 |
 | language/predefined | 2 | 0 | 0 | 0 | 0 | 2 |
-| language/regexp | 9 | 2 | 0 | 0 | 0 | 11 |
+| language/regexp | 11 | 0 | 0 | 0 | 0 | 11 |
 | library/cgi/cookie | 0 | 0 | 0 | 9 | 0 | 9 |
 | library/cgi/htmlextension | 0 | 0 | 0 | 26 | 0 | 26 |
 | library/cgi/queryextension | 0 | 0 | 0 | 38 | 0 | 38 |

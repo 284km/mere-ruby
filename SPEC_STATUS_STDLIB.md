@@ -53,7 +53,7 @@ them, is what ships; the two are not added together.
 | library/matrix/vector | 5 | 0 | 0 | 0 | 0 | 5 |
 | library/csv/ioreader | 0 | 0 | 0 | 4 | 0 | 4 |
 | library/uri/parser | 3 | 0 | 0 | 5 | 0 | 8 |
-| library/net-http/httpheader | 32 | 1 | 0 | 1 | 0 | 34 |
+| library/net-http/httpheader | 33 | 0 | 0 | 1 | 0 | 34 |
 | library/ripper | 0 | 0 | 2 | 0 | 0 | 2 |
 | library/csv/cell | 0 | 0 | 0 | 2 | 0 | 2 |
 | library/net-http/httpresponse | 20 | 0 | 0 | 0 | 0 | 20 |
