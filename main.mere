@@ -2787,6 +2787,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (match rb_gets () with VNil -> raise_exc world "EOFError" "end of file reached" | v -> v)
     else if (str_len name == 9 && str_eq name "readlines") && (if kernel_overridden env world "readlines" then false else true) then arr_new (rb_readlines ())
     else try_self_call env world VNil name Nil
+  // `private(:foo)` / `public(:foo)` at the top level is the statement
+  // `private :foo` (main's own visibility methods), parentheses or not: it
+  // was a call to the PRIVATE Module#private on main
+  | ECall (name, arges) when ((str_len name == 7 && str_eq name "private") || (str_len name == 6 && str_eq name "public"))
+                             && (match arges with Nil -> false | _ -> ecall_all_syms arges)
+                             && (match (if lv_has env "self" then lv_get env "self" else VMain) with VMain -> true | _ -> false) ->
+    flow_value (exec_stmt env world blk (SVis (name, ecall_sym_names arges)))
   | ECall (name, arges) ->
     let (meths, sup, ocls, ivars) = world in
     // a paren-less call with a trailing `&expr` block-pass (`send :m, :a, &pr`)
@@ -2820,6 +2827,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if (match self9 with VMain -> true | _ -> false)
        && ((str_len name == 6 && str_eq name "extend") || main_sng_has world name) then
       invoke_val_c env world blk VMain name args false
+    // (an active refinement of a method self has answers a bare call too, as
+    //  it does `obj.m`: `using R; m` with R refining Object#m)
+    else if map_len ref_active > 0 && (match self9 with VMain -> true | _ -> false)
+            && (let (mt9, _, _, _) = world in map_has mt9 ("Object#" ++ name))
+            && (if str_eq (refined_impl_for world self9 name) "" then false else true) then
+      ref_call world blk self9 (refined_impl_for world self9 name) name args
     else
     // Kernel conversion functions: Integer()/Float()/String()/Array()/
     // Rational()/Complex()/Hash().
@@ -18546,14 +18559,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // scope -- what every `using` in it brought in. ref_active is the table
     // `using` writes (target class -> impl module) and it is already
     // save/restored per scope, so the answer is its values.
-    else if str_eq c "Module" && (str_len name == 16 && str_eq name "used_refinements") then
+    else if (str_eq c "Module" || str_eq c "Refinement") && (str_len name == 16 && str_eq name "used_refinements") then
       // (newest `using` first, as ruby lists them: ref_used_impls)
       (let rec vs8 = fn (cs: str list) -> (match cs with Nil -> (Nil : Val list) | Cons (c, t) -> Cons (VClass c, vs8 t)) in
        arr_new (vs8 (ref_used_impls ())))
     // Module.used_modules: the modules whose refinements are active here --
     // the refinery of each used_refinements entry, once each, in that order
     // (an impl class is named "<refinery>_<i>" after "#<refinement:" 7 chars).
-    else if str_eq c "Module" && (str_len name == 12 && str_eq name "used_modules") then
+    else if (str_eq c "Module" || str_eq c "Refinement") && (str_len name == 12 && str_eq name "used_modules") then
       (let tmp7 = map_new () in
        let seen7 = map_new () in
        let _ = list_iter (ref_used_impls ()) (fn (im7: str) ->
@@ -28233,7 +28246,15 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
      | Cons (_, _) -> raise_exc world "TypeError" "class or module required"
      | _ -> VBool false)
   else if has_meth world cls name then
-    (if vischeck && meth_private world cls name
+    // (an active refinement of the method answers first, with its own
+    //  visibility: `refine Object do def m ...` makes a private Object#m
+    //  callable as `42.m`)
+    (let ri9 = (if map_len ref_active > 0 then refined_impl_for world recv name else "") in
+     if (if str_eq ri9 "" then false else true) then
+       (if vischeck && map_has privates (ri9 ++ "#" ++ name)
+        then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
+        else ref_call world blk recv ri9 name args)
+     else if vischeck && meth_private world cls name
      then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
      else invoke world noblk recv cls name args)
   else
@@ -38205,7 +38226,14 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let blamed = fn (v: Val) -> (match blame with VNil -> v | b -> b) in
-  if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
+  let selfr9 = (if lv_has env "self" then lv_get env "self" else VMain) in
+  // (a bare `m` at the top level, with a refinement of Object#m in use: the
+  //  refined method, as for `obj.m` -- see the ECall arm)
+  if map_len ref_active > 0 && (match selfr9 with VMain -> true | _ -> false)
+     && map_has meths ("Object#" ++ name)
+     && (if str_eq (refined_impl_for world selfr9 name) "" then false else true) then
+    ref_call world noblk selfr9 (refined_impl_for world selfr9 name) name args
+  else if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
   // Kernel's private copy hooks and BasicObject#method_missing, called with
   // no receiver (`instance_eval { initialize_copy(1) }`,
@@ -47250,6 +47278,22 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                                | Cons (n9, t9) ->
                                  (if map_has meths (cls ++ "#" ++ n9) || map_has vis_marks (cls ++ "#" ++ n9)
                                   then fresh_of9 t9 else Cons (n9, fresh_of9 t9))) in
+                            // (in a refinement, a name the refinement does not define
+                            //  but its target has gets a refined entry that hands the
+                            //  call on with super -- `refine(Cow) { public :moo }`
+                            //  makes Cow's private moo public where the refinement is
+                            //  used: rb_mod_public's refined ZSUPER entry)
+                            let _ = (if is_refine_impl cls && (str_eq m "private" || str_eq m "public" || str_eq m "protected") then
+                                       (let tgt9 = refine_target_of cls in
+                                        list_iter names (fn (n9: str) ->
+                                          if map_has meths (cls ++ "#" ++ n9) || str_eq tgt9 "" then ()
+                                          else if map_has meths (tgt9 ++ "#" ++ n9)
+                                                  || (if str_eq (lookup_anc world (ancestors_of world tgt9) n9) "" then false else true) then
+                                            (let _ = register_class_v world cls
+                                                       (Cons (SDef (n9, Cons ("*__rfa", Cons ("**__rfk", Cons ("&__rfb", Nil))), Nil,
+                                                                    Cons (SExpr (ESuper (true, Nil)), Nil)), Nil)) vis cenv in ())
+                                          else ()))
+                                     else ()) in
                             let _ = (if str_eq m "private" || str_eq m "public" || str_eq m "protected"
                                      then vis_names_check_inst world cls names else ()) in
                             let fresh9 = fresh_of9 names in
@@ -50718,6 +50762,10 @@ and refined_impl_in = fn world -> fn (ics: str list) -> fn (name: str) ->
     else refined_impl_in world rest name
 // call `name` as the active refinement ri has it -- or refuse it, when ri
 // undefined it
+and ecall_all_syms = fn (es: Expr list) ->
+  match es with Nil -> true | Cons (ESym _, t) -> ecall_all_syms t | _ -> false
+and ecall_sym_names = fn (es: Expr list) ->
+  match es with Nil -> Nil | Cons (ESym n, t) -> Cons (n, ecall_sym_names t) | Cons (_, t) -> ecall_sym_names t
 and ref_call = fn world -> fn blk -> fn (recv: Val) -> fn (ri: str) -> fn (name: str) -> fn (args: Val list) ->
   if map_len undefs > 0 && map_has undefs (ri ++ "#" ++ name) then
     raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_cls world (dispatch_cls_of world recv))
@@ -50741,7 +50789,10 @@ and refined_impl_go = fn world -> fn (ancs: str list) -> fn (name: str) ->
     // over a refinement of something further up the chain — Presenter#red
     // (Presenter < String) must beat `refine String do def red …`, or wrapping
     // inside the refined method recurses forever.
-    else if has_meth world a name then ""
+    // (its OWN method -- a def there, or a builtin of that class -- not one it
+    //  inherits: has_meth answers Object's private `m` for Integer, and
+    //  `refine Object do def m` lost to the very method it refines on `42.m`)
+    else if (let (mt9, _, _, _) = world in map_has mt9 (a ++ "#" ++ name)) || builtin_has_meth a name then ""
     else refined_impl_go world rest name
 
 // ---- pattern matching (case/in) -----------------------------------------
