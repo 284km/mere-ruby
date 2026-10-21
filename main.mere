@@ -4518,6 +4518,12 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
           && (match vb with VObj _ -> true | _ -> false) && (responds world vb "coerce" || has_coerce world vb) then
          (let (ok8, x8, y8) = coerced_pair env world vb va0 in
           if ok8 then coerced_apply env world "<=>" x8 y8 else VNil)
+       // ...and an object that does not coerce is not comparable with a
+       // number at all (int_cmp/flo_cmp/nurat_cmp's rb_num_coerce_cmp): no ==
+       // is asked, where rb_eq_w below asked the object's Comparable#==, i.e.
+       // its <=> with the number, and `(0..10).cover?(T.new(0)..)` raised
+       else if (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | _ -> false)
+          && (match vb with VObj _ -> true | _ -> false) then VNil
        // ⚠ Object#<=> answers 0 for two values that are ==, and the question
        //   is the OBJECT's #== -- the value-level rb_eq cannot reach a user
        //   definition, so `E.new <=> E.new` was nil for a class whose #== says
@@ -24405,7 +24411,7 @@ and bad_sym_exprs = fn (es: Expr list) ->
 // through, in ruby's words ("" for none): a write to a match variable
 // ("Can't set variable $1"), a constant assigned inside a method ("dynamic
 // constant assignment"), a value that never comes back on the right of an
-// assignment ("void value expression"), a call given both `&blk` and a block,
+// assignment ("unexpected void value expression"), a call given both `&blk` and a block,
 // and a block parameter named twice. They were run-time errors or no error
 // at all, so a syntax check -- the program behind a BEGIN that leaves before
 // anything runs (test/unit's assert_syntax_error) -- passed them.
@@ -24429,18 +24435,18 @@ and static_why_stmt = fn (s: Stmt) -> fn (indef: bool) ->
   | SAssign (n, e) ->
     if sw_backref n then "Can't set variable " ++ n
     else if indef && (is_upper_first n || sw_dyn_const n) then "dynamic constant assignment"
-    else if sw_void_expr e then "void value expression"
+    else if sw_void_expr e then "unexpected void value expression"
     else static_why_expr e indef
-  | SLocalFrom (_, s2) -> (if sw_void_stmt s2 then "void value expression" else static_why_stmt s2 indef)
+  | SLocalFrom (_, s2) -> (if sw_void_stmt s2 then "unexpected void value expression" else static_why_stmt s2 indef)
   | SMultiAssign (ts, es) ->
     (let bad9 = sw_names_backref ts in
      if str_len bad9 > 0 then "Can't set variable " ++ bad9
-     else if sw_any_void es then "void value expression"
+     else if sw_any_void es then "unexpected void value expression"
      else static_why_exprs es indef)
   | SMultiAssignX (ts, es) ->
     (if str_len (sw_targets_backref ts) > 0 then "Can't set variable " ++ sw_targets_backref ts
      else if indef && sw_targets_const ts then "dynamic constant assignment"
-     else if sw_any_void es then "void value expression"
+     else if sw_any_void es then "unexpected void value expression"
      else static_why_exprs es indef)
   | SExpr e -> static_why_expr e indef
   | SIVarAssign (_, e) -> static_why_expr e indef
@@ -24448,6 +24454,10 @@ and static_why_stmt = fn (s: Stmt) -> fn (indef: bool) ->
   | SPuts es -> static_why_exprs es indef
   | SWhile (c, bd) -> sw_first (static_why_expr c indef) (fn (u: unit) -> static_why_stmts bd indef)
   | SIf (cls, els) -> sw_first (static_why_clauses cls indef) (fn (u: unit) -> static_why_stmts els indef)
+  // (a retry belongs to a rescue clause: in the else or the ensure of the
+  //  same begin it has nothing to retry)
+  | SBegin (_, Cons (_, _), els, _) when sw_retry_here els -> "Invalid retry after else"
+  | SBegin (_, Cons (_, _), _, ens) when sw_retry_here ens -> "Invalid retry after ensure"
   | SBegin (bd, rs, els, ens) ->
     sw_first (static_why_stmts bd indef) (fn (u: unit) ->
       sw_first (static_why_rescues rs indef) (fn (u2: unit) ->
@@ -24466,7 +24476,8 @@ and static_why_stmt = fn (s: Stmt) -> fn (indef: bool) ->
     "class/module name must be CONSTANT"
   | SClass (_, _, bd) -> static_why_stmts bd false
   | SClassE (_, _, bd) -> static_why_stmts bd false
-  | SSingletonE (_, bd) -> static_why_stmts bd false
+  // (`class << (return)`: the object is a value that never comes)
+  | SSingletonE (oe, bd) -> (if sw_void_expr oe then "unexpected void value expression" else static_why_stmts bd false)
   | SAndThen (a, b2) -> sw_first (static_why_stmt a indef) (fn (u: unit) -> static_why_stmt b2 indef)
   | SOrElse (a, b2) -> sw_first (static_why_stmt a indef) (fn (u: unit) -> static_why_stmt b2 indef)
   | _ -> ""
@@ -24504,7 +24515,7 @@ and static_why_expr = fn (e: Expr) -> fn (indef: bool) ->
   | ETern (a, b2, c) -> sw_first (static_why_expr a indef) (fn (u: unit) -> sw_first (static_why_expr b2 indef) (fn (u2: unit) -> static_why_expr c indef))
   | ELambda (_, bd) -> static_why_stmts bd indef
   | EStmt st -> static_why_stmt st indef
-  | EAssign (n, v) -> (if sw_backref n then "Can't set variable " ++ n else if sw_void_expr v then "void value expression" else static_why_expr v indef)
+  | EAssign (n, v) -> (if sw_backref n then "Can't set variable " ++ n else if sw_void_expr v then "unexpected void value expression" else static_why_expr v indef)
   | _ -> ""
 and sw_has_blockpass = fn (es: Expr list) ->
   match es with Nil -> false | Cons (EBlockPass _, _) -> true | Cons (_, r) -> sw_has_blockpass r
@@ -24555,11 +24566,24 @@ and sw_any_void = fn (es: Expr list) ->
 // a value that never comes back: return / break / next / redo / retry, and a
 // begin whose every way out is one (an ensure that leaves, or a body and all
 // its rescues -- or its else and all its rescues -- that do)
+and sw_retry_here = fn (b: Stmt list) ->
+  match b with
+  | Nil -> false
+  | Cons (st, r) ->
+    (match st with
+     | SExpr (EFlow (k, _)) -> str_eq k "retry"
+     | SIf (cls, els) ->
+       (let rec cl9 = fn (xs: (Expr * Stmt list) list) ->
+          (match xs with Nil -> sw_retry_here els | Cons ((_, b9), t) -> sw_retry_here b9 || cl9 t) in
+        cl9 cls)
+     | _ -> false) || sw_retry_here r
 and sw_void_expr = fn (e: Expr) ->
   match e with
   | EFlow (k, _) -> str_eq k "return" || str_eq k "break" || str_eq k "next" || str_eq k "redo" || str_eq k "retry"
   | EArr es -> sw_any_void es
   | EStmt st -> sw_void_stmt st
+  // (a ternary whose branches both jump: `a = (c ? next : break)`)
+  | ETern (_, a, b) -> sw_void_expr a && sw_void_expr b
   | _ -> false
 and sw_void_stmt = fn (s: Stmt) ->
   match s with
@@ -24736,7 +24760,8 @@ and numbered_misuse_expr = fn (e: Expr) ->
   // explicit parameter list -- `proc { |x| it }` was already refused.
   | ELambda (ps, b) ->
     (match ps with
-     | Nil -> num_nested_bad b || numbered_misuse_stmts b
+     // (and `->{it + _2}` mixes the two ways, as a block's body may not)
+     | Nil -> blk_num_bad Nil b || num_nested_bad b || numbered_misuse_stmts b
      | _ -> if blk_num_bad ps b then true else numbered_misuse_stmts b)
   | ECallB (_, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_exprs args || numbered_misuse_stmts bb
   | EMethodB (r, _, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_expr r || numbered_misuse_exprs args || numbered_misuse_stmts bb
@@ -50296,7 +50321,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if eval_src_u8 cod codelbl && bad_sym_stmts prog2 then raise_exc world "SyntaxError" "invalid symbol"
-       else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
+       else if has_void_assign prog2 then raise_exc world "SyntaxError" "unexpected void value expression"
        else eval_run_at eenv world blk prog2 efile9 eline9
      | _ ->
        if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (invalid_flow_word_in_defs prog2)
@@ -50311,7 +50336,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
          raise_exc world "SyntaxError"
            (if map_has num_misuse_note "why" then map_get num_misuse_note "why" else "invalid numbered parameter")
        else if eval_src_u8 cod codelbl && bad_sym_stmts prog2 then raise_exc world "SyntaxError" "invalid symbol"
-       else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
+       else if has_void_assign prog2 then raise_exc world "SyntaxError" "unexpected void value expression"
        else eval_run_at eenv world blk prog2 efile9 eline9)
   // ...and anything else is ruby's TypeError, not an internal failure: `eval`
   // says which conversion it wanted.
