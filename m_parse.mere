@@ -5954,6 +5954,9 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
     if str_eq id "in" then
       (match s with
        | SExpr e -> let (pat, r2) = parse_pattern_top r in apply_modifier (SExpr (EMatchTest (e, pat))) r2
+       // (`r = 1 in pat` is `(r = 1) in pat`: the assignment binds first, and
+       //  the statement's value is the test)
+       | SAssign (_, _) -> let (pat, r2) = parse_pattern_top r in apply_modifier (SExpr (EMatchTest (EStmt s, pat))) r2
        | _ -> (s, toks))
     else if str_eq id "if" then
       let (c0, r2) = cond_in_pattern (parse_andor (skip_nls r)) in
@@ -7874,6 +7877,9 @@ and parse_case_in = fn (subj: Expr) -> fn toks -> fn acc ->
                | Cons (TId g, _) -> if str_eq g "then" || is_block_stop g then () else syn_refuse "expected a delimiter after the patterns of an `in` clause"
                | Cons (TNL _, _) -> ()
                | Cons (TEOF, _) -> ()
+               // (a label left over -- `in a, b:` -- is prism's second error)
+               | Cons (TP c9, _) when str_eq c9 ":" ->
+                 syn_refuse "expected a delimiter after the patterns of an `in` clause\nunexpected label, ignoring it"
                | _ -> syn_refuse "expected a delimiter after the patterns of an `in` clause") in
       let (b, r4) = parse_stmts (skip_then r3) Nil in
       parse_case_in subj r4 (Cons ((pat, guard, b), acc))
@@ -8086,7 +8092,14 @@ and parse_pattern_prim = fn toks ->
       // a lowercase name binds, unless a following `..`/`...` makes it a
       // range value pattern.
       (match r with
-       | Cons (TP dots, _) -> if str_eq dots ".." || str_eq dots "..." then let (e, r2) = parse_pat_value toks in (PVal e, r2) else (PVar nm, r)
+       // (...but only a pseudo-variable's: `in a..b` with a local or a
+       //  call at the end is ruby's "unexpected ..")
+       | Cons (TP dots, _) ->
+         if str_eq dots ".." || str_eq dots "..." then
+           (let _ = (if (str_len nm > 2 && str_eq (substring nm 0 2) "__") || str_eq nm "self" then ()
+                     else syn_refuse ("unexpected " ++ dots ++ ", ignoring it")) in
+            let (e, r2) = parse_pat_value toks in (PVal e, r2))
+         else (PVar nm, r)
        | _ -> (PVar nm, r))
   | _ -> let (e, r) = parse_pat_value toks in (PVal e, r)
 
@@ -8131,7 +8144,8 @@ and parse_pat_const_more = fn (e: Expr) -> fn toks ->
 and parse_pin = fn toks ->
   match toks with
   | Cons (TP lp, r) ->
-    if is_lparen lp then let (e, r2) = parse_expr r in (PPin e, expect r2 ")")
+    // (the group may break its line: `1 in ^(1\n)`)
+    if is_lparen lp then let (e, r2) = parse_expr (skip_nls r) in (PPin e, expect (skip_nls r2) ")")
     else if str_eq lp "@" then (match r with Cons (TId nm, r2) -> (PPin (EIVar nm), r2) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad ^@ pattern")) in fail "mere-ruby: bad ^@ pattern"))
     else if str_eq lp "$" then (match r with Cons (TId nm, r2) -> (PPin (EVar ("$" ++ nm)), r2) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad ^$ pattern")) in fail "mere-ruby: bad ^$ pattern"))
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad ^ pattern")) in fail "mere-ruby: bad ^ pattern")
@@ -8187,6 +8201,8 @@ and parse_arr_pat_one = fn toks -> fn (acc: Pat list) ->
         | Cons (TP rb, r3) -> if str_eq rb "]" then (rev_app (Cons (PSplatP "", acc2)) Nil, r3) else parse_arr_pat_elems (skip_nls r2) acc2
         | _ -> parse_arr_pat_elems (skip_nls r2) acc2)
      else if str_eq c "]" then (rev_app acc2 Nil, r2)
+     // (`in [a:]`: a label in an array pattern, in prism's words)
+     else if str_eq c ":" then (let _ = syn_refuse "unexpected implicit hash in pattern; use '\{' to delineate" in (rev_app acc2 Nil, r2))
      else (let __fm = ("mere-ruby: expected , or ] in array pattern, got " ++ c ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
    | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated array pattern" ++ parsing_file ()))) in fail ("mere-ruby: unterminated array pattern" ++ parsing_file ())))
 
@@ -8243,7 +8259,10 @@ and parse_hash_pat_kv = fn toks -> fn (acc: (str * Pat) list) -> fn (rest: str) 
   // key: `label:` (identifier) or `"string":` (symbol key).
   let (key, r2) =
     (match toks with
-     | Cons (TId nm, Cons (TP colon, r0)) -> if str_eq colon ":" then (nm, r0) else (let _ = syn_refuse "expected a label as the key in the hash pattern" in ("", Nil))
+     | Cons (TId nm, Cons (TP colon, r0)) -> if str_eq colon ":" then (nm, r0) else (let _ = syn_refuse "expected a label as the key in the hash pattern\nunexpected local variable or method; expected a key in the hash pattern" in ("", Nil))
+     // (prism's second error names what stood where the key goes: `{a}`, `{0 => a}`)
+     | Cons (TId _, _) -> (let _ = syn_refuse "expected a label as the key in the hash pattern\nunexpected local variable or method; expected a key in the hash pattern" in ("", Nil))
+     | Cons (TInt _, _) -> (let _ = syn_refuse "expected a label as the key in the hash pattern\nunexpected integer; expected a key in the hash pattern" in ("", Nil))
      | Cons (TStrL s, Cons (TP colon, r0)) -> if str_eq colon ":" then (s, r0) else (let _ = syn_refuse "expected a label as the key in the hash pattern" in ("", Nil))
      // a "string": key (double-quoted, no interpolation) lexes as `(s "" + s )`.
      | Cons (TP op, Cons (TStrL empty, Cons (TP plus, Cons (TStrL s, Cons (TP cp, Cons (TP colon, r0)))))) ->
