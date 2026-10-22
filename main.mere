@@ -1685,6 +1685,12 @@ import "m_pack.mere";
 import "m_json_lib.mere";
 import "m_json.mere";
 
+// one `FNext nil` for every turn that ends normally: a region's value is
+// copied out into the region around it, and a fresh one per turn of an
+// iterator piled up in the statement's region for the whole loop
+let flow_next_nil = FNext VNil;
+let flow_break_nil = FBreak VNil;
+let flow_raise_nil = FRaise VNil;
 let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   match e with
   | ESplat inner -> eval_e env world blk inner   // bare splat: evaluate inner
@@ -7640,7 +7646,7 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
              (match xs with
               | Nil -> FNext VNil
               | Cons (x9, t9) ->
-                (match run_block_turn world encl theblk (Cons (x9, Nil)) with
+                (match run_block_turn1 world encl theblk x9 with
                  | FBreak v -> FBreak v | FReturn v -> FReturn v
                  | _ -> (if str_eq (sget h) sv then go9 t9
                          else (match raise_exc world "RuntimeError" "string modified" with _ -> FNext VNil)))) in
@@ -8763,7 +8769,7 @@ and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> FNext VNil
   | Cons (h, t) ->
-    (match run_block_turn world encl theblk (Cons (h, Nil)) with
+    (match run_block_turn1 world encl theblk h with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | _ -> arr_each world encl theblk t)
 
@@ -8943,7 +8949,7 @@ and arr_reverse_each_live = fn world -> fn encl -> fn theblk -> fn (id: int) -> 
   if i0 <= 0 then FNext VNil
   else
     (let i = i0 - 1 in
-     match run_block_turn world encl theblk (Cons (val_nth (deref id) i, Nil)) with
+     match run_block_turn1 world encl theblk (val_nth (deref id) i) with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | _ -> (let n = val_list_len (deref id) in
              arr_reverse_each_live world encl theblk id (if i > n then n else i)))
@@ -9134,7 +9140,7 @@ and arr_each_idx = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (
   match xs with
   | Nil -> FNext VNil
   | Cons (h, t) ->
-    (match run_block_turn world encl theblk (Cons (h, Cons (VInt i, Nil))) with
+    (match run_block_turn_vi world encl theblk h i with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | _ -> arr_each_idx world encl theblk t (i + 1))
 
@@ -9147,14 +9153,58 @@ and arr_each_idx = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (
 // `80_000.times { |i| proc { i } }` kept every one of its procs alive through
 // the loop (note 272). Here only break / return values leave the turn.
 and run_block_turn = fn world -> fn encl -> fn theblk -> fn (args: Val list) ->
+  let _ = gc_point world in
   region TURN {
     match run_block world encl theblk args with
-    | FNext _ -> FNext VNil
+    | FNext _ -> flow_next_nil
+    | f -> f
+  }
+// (each turn is a safepoint, as a while loop's is: a block with an empty body
+//  runs no statement, and `10_000.times { h.each { } }` -- three million pairs
+//  -- asked for a collection three times)
+// ...with the turn's arguments made INSIDE its region: made by the caller,
+// the list (and an index's boxed Integer) went to the region of the statement
+// that called the iterator, open for the whole loop -- 48 bytes a turn,
+// `3_000_000.times {}` held 146 MB until it ended (note 403)
+and run_block_turn1 = fn world -> fn encl -> fn theblk -> fn (x: Val) ->
+  let _ = gc_point world in
+  region TURN {
+    match run_block world encl theblk (Cons (x, Nil)) with
+    | FNext _ -> flow_next_nil
+    | f -> f
+  }
+and run_block_turn_i = fn world -> fn encl -> fn theblk -> fn (i: int) ->
+  let _ = gc_point world in
+  region TURN {
+    match run_block world encl theblk (Cons (VInt i, Nil)) with
+    | FNext _ -> flow_next_nil
+    | f -> f
+  }
+and run_block_turn_vi = fn world -> fn encl -> fn theblk -> fn (x: Val) -> fn (i: int) ->
+  let _ = gc_point world in
+  region TURN {
+    match run_block world encl theblk (Cons (x, Cons (VInt i, Nil))) with
+    | FNext _ -> flow_next_nil
+    | f -> f
+  }
+// (Hash#each's [key, value] pair, made in the turn too)
+and run_block_turn_kv = fn world -> fn encl -> fn theblk -> fn (k: Val) -> fn (v: Val) ->
+  let _ = gc_point world in
+  region TURN {
+    match run_block world encl theblk (Cons (arr_new (Cons (k, Cons (v, Nil))), Nil)) with
+    | FNext _ -> flow_next_nil
+    | f -> f
+  }
+and run_block_turn_s = fn world -> fn encl -> fn theblk -> fn (cur: str) ->
+  let _ = gc_point world in
+  region TURN {
+    match run_block world encl theblk (Cons (mkstr cur, Nil)) with
+    | FNext _ -> flow_next_nil
     | f -> f
   }
 and range_each = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) ->
   if i > last then FNext VNil
-  else (match run_block_turn world encl theblk (Cons (VInt i, Nil)) with
+  else (match run_block_turn_i world encl theblk i with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
         // (stop AT the last value: above int64's maximum is a wrap, see range_down)
         | _ -> if i == last then FNext VNil else range_each world encl theblk (i + 1) last)
@@ -9194,7 +9244,7 @@ and rng_step_generic = fn world -> fn encl -> fn theblk -> fn (lo: Val) -> fn (h
   let rec walk9 = fn (v: Val) -> fn (dir: int) ->
     (let c9 = (match hi with VNil -> dir | _ -> sgn9 v hi) in
      if (if c9 == dir then false else (if excl then true else c9 != 0)) then FNext VNil
-     else (match run_block_turn world encl theblk (Cons (v, Nil)) with
+     else (match run_block_turn1 world encl theblk v with
            | FBreak r -> FBreak r | FReturn r -> FReturn r
            | _ -> if c9 == 0 then FNext VNil else walk9 (plus9 v) dir)) in
   match hi with
@@ -9202,7 +9252,7 @@ and rng_step_generic = fn world -> fn encl -> fn theblk -> fn (lo: Val) -> fn (h
   | _ ->
     (let dir = sgn9 lo hi in
      if dir == 0 then (if excl then FNext VNil
-                       else (match run_block_turn world encl theblk (Cons (lo, Nil)) with
+                       else (match run_block_turn1 world encl theblk lo with
                              | FBreak r -> FBreak r | FReturn r -> FReturn r | _ -> FNext VNil))
      else if dir == sgn9 lo (plus9 lo) then walk9 lo dir
      else FNext VNil)
@@ -9221,26 +9271,26 @@ and rng_str_step_int = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
 and rng_str_step_add = fn world -> fn encl -> fn theblk -> fn (cur: str) -> fn (add: str) -> fn (hi: str) -> fn (has_hi: bool) -> fn (excl: bool) ->
   if has_hi && (let c = str_compare cur hi in if excl then c >= 0 else c > 0) then FNext VNil
   else
-    (match run_block_turn world encl theblk (Cons (mkstr cur, Nil)) with
+    (match run_block_turn_s world encl theblk cur with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | _ -> rng_str_step_add world encl theblk (cur ++ add) add hi has_hi excl)
 
 and rng_str_step_endless = fn world -> fn encl -> fn theblk -> fn (cur: str) -> fn (k: int) ->
-  match run_block_turn world encl theblk (Cons (mkstr cur, Nil)) with
+  match run_block_turn_s world encl theblk cur with
   | FBreak v -> FBreak v | FReturn v -> FReturn v
   | _ -> rng_str_step_endless world encl theblk (str_succ_n cur k) k
 // every k-th element of a list, starting with the first
 
 // ("A"..).each { }: #succ forever, until the block breaks (or returns).
 and rng_str_each_endless = fn world -> fn encl -> fn theblk -> fn (cur: str) ->
-  match run_block_turn world encl theblk (Cons (mkstr cur, Nil)) with
+  match run_block_turn_s world encl theblk cur with
   | FBreak v -> FBreak v | FReturn v -> FReturn v
   | _ -> rng_str_each_endless world encl theblk (str_succ cur)
 
 // n.downto(m) { |i| }: descending.
 and range_down = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) ->
   if i < last then FNext VNil
-  else (match run_block_turn world encl theblk (Cons (VInt i, Nil)) with
+  else (match run_block_turn_i world encl theblk i with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
         // (stop AT the last value rather than below it: below int64's
         // minimum is a wrap to its maximum, and `(-2**63..-2**63).reverse_each`
@@ -9250,7 +9300,7 @@ and range_down = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: in
 // n.step(limit, by) { |i| }: by may be negative (descending).
 and range_step = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (limit: int) -> fn (by: int) ->
   if (by > 0 && i > limit) || (by < 0 && i < limit) || by == 0 then FNext VNil
-  else (match run_block_turn world encl theblk (Cons (VInt i, Nil)) with
+  else (match run_block_turn_i world encl theblk i with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
         | _ ->
           // ⚠ the next value may not fit an int: `i + by` WRAPPED, and
@@ -9272,18 +9322,18 @@ and aseq_big_ok = fn (b: Val) -> fn (e: Val) -> fn (st: Val) ->
 and range_step_bounded = fn world -> fn encl -> fn theblk -> fn (v: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (by: Val) ->
   (let c9 = cmp_vals v hi in
    if (if excl then c9 >= 0 else c9 > 0) then FNext VNil
-   else (match run_block_turn world encl theblk (Cons (v, Nil)) with
+   else (match run_block_turn1 world encl theblk v with
          | FBreak r -> FBreak r | FReturn r -> FReturn r
          | _ -> range_step_bounded world encl theblk (arith_bin "+" v by) hi excl by))
 // an endless range's #succ walk (`(c..).each { break if ... }`)
 and rng_succ_each_endless = fn world -> fn encl -> fn theblk -> fn (v: Val) ->
-  (match run_block_turn world encl theblk (Cons (v, Nil)) with
+  (match run_block_turn1 world encl theblk v with
    | FBreak r -> FBreak r | FReturn r -> FReturn r
    | _ -> (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
            rng_succ_each_endless world encl theblk (invoke_val_c gc_cenv0 world nb9 v "succ" Nil false)))
 // ...the endless walk past an int, one bignum at a time (until a break)
 and range_step_big = fn world -> fn encl -> fn theblk -> fn (v: Val) -> fn (by: Val) ->
-  (match run_block_turn world encl theblk (Cons (v, Nil)) with
+  (match run_block_turn1 world encl theblk v with
    | FBreak r -> FBreak r | FReturn r -> FReturn r
    | _ -> range_step_big world encl theblk (arith_bin "+" v by) by)
 
@@ -9532,7 +9582,7 @@ and hash_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   | Cons (k, rest) ->
     (match rest with
      | Cons (v, t) ->
-       (match run_block world encl theblk (Cons (arr_new (Cons (k, Cons (v, Nil))), Nil)) with
+       (match run_block_turn_kv world encl theblk k v with
         | FBreak bv -> FBreak bv | FReturn bv -> FReturn bv
         | _ -> hash_each world encl theblk t)
      | Nil -> FNext VNil)
@@ -9544,7 +9594,7 @@ and hash_each_one = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn 
   | Cons (k, rest) ->
     (match rest with
      | Cons (v, t) ->
-       (match run_block world encl theblk (Cons ((if want_key then k else v), Nil)) with
+       (match run_block_turn1 world encl theblk (if want_key then k else v) with
         | FBreak bv -> FBreak bv | FReturn bv -> FReturn bv
         | _ -> hash_each_one world encl theblk t want_key)
      | Nil -> FNext VNil)
@@ -26854,7 +26904,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          (let rec ln9 = fn (u: unit) ->
             (match stdin_io_call env world blk recv "gets" args with
              | VNil -> recv
-             | l9 -> (match run_block_turn world blk newblk (Cons (l9, Nil)) with
+             | l9 -> (match run_block_turn1 world blk newblk l9 with
                       | FBreak v9 -> v9 | FReturn _ -> recv
                       | _ -> ln9 ())) in
           ln9 ())
@@ -50217,11 +50267,18 @@ and run_while = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body: Stm
   // needed -- the same reason the statement region could be taken.
   // Each turn is a safepoint off the stack (gc_point, note 270).
   let _ = gc_point world in
+  // (a turn that goes on answers the one flow_next_nil, and the end the one
+  //  flow_break_nil: the region's value is copied out into the region around
+  //  the loop -- the statement's, open for all of it -- and a fresh FNext per
+  //  turn held 133 MB there over 3M turns of a while in a method, note 403)
   match region ITER {
     if truthy (eval_e env world blk cond) then
       let _ = tick () in
-      while_body_flow env world blk body
-    else FBreak VNil               // condition false: leave the loop with nil
+      (match while_body_flow env world blk body with
+       | FNext _ -> flow_next_nil
+       | FLoopNext _ -> flow_next_nil
+       | f -> f)
+    else flow_break_nil            // condition false: leave the loop with nil
   } with
   | FReturn v -> FReturn v
   | FRaise v -> FRaise v
@@ -50242,8 +50299,9 @@ and run_dowhile = fn env -> fn world -> fn blk -> fn (s: Stmt) -> fn (cond: Expr
     | FRaise v -> FRaise v
     | FBreak v -> FBreak v
     | _ ->
-      if truthy (eval_e env world blk cond) then FNext VNil
-      else FBreak VNil
+      // (the one flow_next_nil / flow_break_nil: see run_while)
+      if truthy (eval_e env world blk cond) then flow_next_nil
+      else flow_break_nil
   } with
   | FReturn v -> FReturn v
   | FRaise v -> FRaise v
@@ -50626,7 +50684,14 @@ and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
 
 and run_loop_builtin = fn env -> fn world -> fn blk -> fn theblk ->
   let _ = tick () in
-  let f = try_or (fn (u: unit) -> run_block world blk theblk Nil) (FRaise VNil) in
+  // one region a turn, as an iterator's (run_block_turn): the try's closure
+  // and the turn's flow went to the region of the statement around the loop,
+  // 180 bytes a turn (`loop` over 3M turns held 546 MB, note 403)
+  let f = region TURN {
+    match try_or (fn (u: unit) -> run_block world blk theblk Nil) flow_raise_nil with
+    | FNext _ -> flow_next_nil
+    | f9 -> f9
+  } in
   (match f with
    | FBreak v -> v
    | FRaise _ ->
