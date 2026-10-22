@@ -451,7 +451,36 @@ let line_is_def = fn (s: str) -> fn (i: int) ->
 // the line (from 1) that offset i of s is on
 let rec nls_before = fn (s: str) -> fn (i: int) -> fn (k: int) -> fn (n: int) ->
   if k >= i then n else nls_before s i (k + 1) (if str_eq (char_at s k) "\n" then n + 1 else n);
+// A token's line is the line of the newline mark that ends its logical line
+// (tok_line), less the newlines inside that logical line that come after the
+// token -- the ones no mark stands for: a `\` at the end of a line, a string
+// or a %w across lines. The lexer of the source lex_src was given (and not a
+// piece of it lexed on its own, an interpolation) counts them where the next
+// token starts and leaves a TCont there; lex_src takes the TConts out again
+// and keeps, for the mark that ends each logical line, how many tokens the
+// line has and after how many tokens each one stood.
+let tc_st = map_new ();
+// (lex_src's record, by the offset of the mark that ends a logical line --
+//  "eof" for the last line of a source with no newline at its end: "O" the
+//  tokens on the line, "O#n" how many newlines it passed, "O#k" after how
+//  many tokens the k-th one stood; number_nls moves it to the mark's line
+//  number, tc_ln)
+let tc_off = map_new ();
+let tc_ln = map_new ();
+let rec tc_nls = fn (s: str) -> fn (i: int) -> fn (stop: int) -> fn (acc: int) ->
+  if i >= stop || i >= str_len s then acc
+  else tc_nls s (i + 1) stop (if str_eq (char_at s i) "\n" then acc + 1 else acc);
+let tc_skipped = fn (s: str) -> fn (i: int) ->
+  if (if map_has tc_st "on" then map_get tc_st "on" == 1 else false) && str_len s == map_get tc_st "len" then
+    (let p = map_get tc_st "prev" in
+     if i > p then (let _ = map_set tc_st "prev" i in tc_nls s p i 0) else 0)
+  else 0;
+let tc_mark = fn (s: str) -> fn (j: int) ->
+  if (if map_has tc_st "on" then map_get tc_st "on" == 1 else false) && str_len s == map_get tc_st "len" then map_set tc_st "prev" j else ();
 let rec lex_go = fn (s: str) -> fn (i: int) ->
+  let k = tc_skipped s i in
+  if k > 0 then Cons (TCont k, lex_go_b s i) else lex_go_b s i
+and lex_go_b = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
   else
     let c = char_at s i in
@@ -473,6 +502,9 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
     else if str_eq c "\n" || str_eq c ";" then
       (let _ = (if str_eq c "\n" then lvt_newline () else ()) in
        let j = (if str_eq c "\n" then hd_jump s i else 0 - 1) in
+       // (the newline the mark stands for, and a heredoc's body after it, are
+       //  not newlines the line passed)
+       let _ = tc_mark s (if j >= 0 then j else i + 1) in
        Cons (TNL i, lex_go s (if j >= 0 then j else i + 1)))
     else if str_eq c "#" then
       (let e = skip_comment s i in
@@ -3269,7 +3301,30 @@ and skip_regex_flags = fn (s: str) -> fn (i: int) ->
 // (...and with no method around it: a refusal inside a def -- `def m; class
 //  X; end; end` -- leaves by `fail`, past the line that would have put the
 //  depth back, and every later source read as a method body)
-let lex_src = fn (s: str) -> let _ = map_delete scv_mode "m" in let _ = map_set def_depth "n" 0 in let _ = map_delete syn_why "pk" in let _ = map_set stmt_nest "d" 0 in let _ = map_delete cond_quiet "q" in let _ = map_set afr_n "n" 0 in let _ = lvt_reset () in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in lex_go s 0;
+// lex_src's TConts out of the stream (see tc_st)
+let rec tc_rep = fn (k: int) -> fn (t: int) -> fn (pend: int list) ->
+  if k <= 0 then pend else tc_rep (k - 1) t (Cons (t, pend));
+let rec tc_keep_go = fn (key: str) -> fn (pend: int list) -> fn (i: int) ->
+  match pend with
+  | Nil -> map_set tc_off (key ++ "#n") i
+  | Cons (c, r) -> (let _ = map_set tc_off (key ++ "#" ++ str_of_int i) c in tc_keep_go key r (i + 1));
+let tc_keep = fn (key: str) -> fn (t: int) -> fn (pend: int list) ->
+  match pend with
+  | Nil -> ()
+  | _ -> (let _ = map_set tc_off key t in tc_keep_go key pend 0);
+let rec tc_strip = fn toks -> fn (t: int) -> fn (pend: int list) ->
+  match toks with
+  | Nil -> (Nil : Tok list)
+  | Cons (TCont k, r) -> tc_strip r t (tc_rep k t pend)
+  | Cons (TNL o, r) -> (let _ = tc_keep (str_of_int o) t pend in Cons (TNL o, tc_strip r 0 Nil))
+  | Cons (TEOF, r) -> (let _ = tc_keep "eof" t pend in Cons (TEOF, tc_strip r 0 Nil))
+  | Cons (x, r) -> Cons (x, tc_strip r (t + 1) pend);
+let lex_src = fn (s: str) -> let _ = map_delete scv_mode "m" in let _ = map_set def_depth "n" 0 in let _ = map_delete syn_why "pk" in let _ = map_set stmt_nest "d" 0 in let _ = map_delete cond_quiet "q" in let _ = map_set afr_n "n" 0 in let _ = lvt_reset () in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in
+  let _ = map_set tc_st "on" 1 in let _ = map_set tc_st "len" (str_len s) in let _ = map_set tc_st "prev" 0 in
+  let _ = map_clear tc_off in
+  let toks = lex_go s 0 in
+  let _ = map_set tc_st "on" 0 in
+  tc_strip toks 0 Nil;
 
 // ---- parser (precedence climbing) ---------------------------------------
 let is_keyword = fn (id: str) ->
@@ -3403,6 +3458,30 @@ let rec skip_nls_n = fn toks -> fn (k: int) ->
 let rec nl_count_to = fn (s: str) -> fn (i: int) -> fn (stop: int) -> fn (acc: int) ->
   if i >= stop || i >= str_len s then acc
   else nl_count_to s (i + 1) stop (if str_eq (char_at s i) "\n" then acc + 1 else acc);
+// ...the record of the logical line a mark at offset key ends, now on line
+// ln. Two marks on one line (`x = "a\nb"; y`) leave that line without one:
+// which logical line a token is on is not known from the number alone.
+let tc_number = fn (key: str) -> fn (ln: int) ->
+  let lk = str_of_int ln in
+  let _ = map_set tc_ln (lk ++ "@") ((if map_has tc_ln (lk ++ "@") then map_get tc_ln (lk ++ "@") else 0) + 1) in
+  if map_has tc_off key then
+    (let n = map_get tc_off (key ++ "#n") in
+     let rec cp = fn (i: int) -> (if i >= n then () else (let _ = map_set tc_ln (lk ++ "#" ++ str_of_int i) (map_get tc_off (key ++ "#" ++ str_of_int i)) in cp (i + 1))) in
+     let _ = cp 0 in
+     let _ = map_set tc_ln (lk ++ "#n") n in
+     map_set tc_ln lk (map_get tc_off key))
+  else ();
+// the line of a token d tokens before the mark that ends its logical line,
+// the mark being on line n
+let tc_phys = fn (n: int) -> fn (d: int) ->
+  let lk = str_of_int n in
+  if map_has tc_ln lk && map_get tc_ln (lk ++ "@") == 1 then
+    (let idx = map_get tc_ln lk - d in
+     let m = map_get tc_ln (lk ++ "#n") in
+     let rec after = fn (i: int) -> fn (acc: int) ->
+       (if i >= m then acc else after (i + 1) (if map_get tc_ln (lk ++ "#" ++ str_of_int i) > idx then acc + 1 else acc)) in
+     n - after 0 0)
+  else n;
 let rec number_nls_go = fn (s: str) -> fn toks -> fn (off: int) -> fn (line: int) ->
   match toks with
   | Nil -> (Nil : Tok list)
@@ -3410,6 +3489,7 @@ let rec number_nls_go = fn (s: str) -> fn toks -> fn (off: int) -> fn (line: int
     // a `;` sits on the line it ends, so counting the newlines between the last
     // mark and this offset is right for both
     let ln = line + nl_count_to s off o 0 in
+    let _ = tc_number (str_of_int o) ln in
     Cons (TNL ln, number_nls_go s r (if o > off then o else off) ln)
   | Cons (t, r) -> Cons (t, number_nls_go s r off line);
 // `eval(code, binding, file, line)` says the code's FIRST line is `line`, so
@@ -3434,17 +3514,22 @@ let rec tnl_before_eof = fn toks -> fn (ln: int) ->
   | Cons (TEOF, r) -> Cons (TNL ln, Cons (TEOF, r))
   | Cons (t, r) -> Cons (t, tnl_before_eof r ln);
 let number_nls_at = fn (s: str) -> fn toks -> fn (base: int) ->
+  let _ = map_clear tc_ln in
   let numbered = number_nls_go s toks 0 base in
   if str_len s == 0 || str_eq (char_at s (str_len s - 1)) "\n" then numbered
-  else tnl_before_eof numbered (base + nl_count_to s 0 (str_len s) 0);
+  else (let ln9 = base + nl_count_to s 0 (str_len s) 0 in
+        let _ = tc_number "eof" ln9 in
+        tnl_before_eof numbered ln9);
 let number_nls = fn (s: str) -> fn toks -> number_nls_at s toks 1;
 // the line a token sits on: the next newline mark in the stream ends its line
-let rec tok_line = fn toks ->
+// (less the newlines its logical line passes after it: tc_phys)
+let rec tok_line_d = fn toks -> fn (d: int) ->
   match toks with
-  | Cons (TNL n, _) -> n
+  | Cons (TNL n, _) -> tc_phys n d
   | Cons (TEOF, _) -> 0
-  | Cons (_, r) -> tok_line r
+  | Cons (_, r) -> tok_line_d r (d + 1)
   | Nil -> 0;
+let tok_line = fn toks -> tok_line_d toks 0;
 let rec count_nls = fn toks ->
   match toks with
   | Nil -> 0
@@ -3905,6 +3990,39 @@ and parse_pow = fn toks ->
     else (b, r)
   | _ -> (b, r)
 
+// the line of the statement being parsed (parse_stmts, parse_brace_stmts);
+// setting it answers the one it replaces
+and pstmt_set = fn (ln: int) ->
+  let old = (if map_has parser_flags "pstmt" then (match map_get parser_flags "pstmt" with VInt n -> n | _ -> 0) else 0) in
+  let _ = map_set parser_flags "pstmt" (VInt ln) in old
+// a receiver whose evaluation may leave the current line elsewhere (a block
+// body's, a multi-line literal's) gets `__ln~N`, which sets the line to N
+// once the receiver has its value: the call on line N then reports N
+and ln_mark = fn (recv: Expr) -> fn (ln: int) ->
+  let cur = (if map_has parser_flags "pstmt" then (match map_get parser_flags "pstmt" with VInt n -> n | _ -> 0) else 0) in
+  if ln <= 0 || cur <= 0 || ln == cur then recv
+  else (match recv with
+        | EMethod (_, m9, _) when str_len m9 > 5 && str_eq (substring m9 0 5) "__ln~" -> recv
+        | EMethod (_, _, _) -> EMethod (recv, "__ln~" ++ str_of_int ln, Nil)
+        | EMethodB (_, _, _, _, _) -> EMethod (recv, "__ln~" ++ str_of_int ln, Nil)
+        | ECall (_, _) -> EMethod (recv, "__ln~" ++ str_of_int ln, Nil)
+        | ECallB (_, _, _, _) -> EMethod (recv, "__ln~" ++ str_of_int ln, Nil)
+        | ESafe (_, _, _) -> EMethod (recv, "__ln~" ++ str_of_int ln, Nil)
+        | ESafeB (_, _, _, _, _) -> EMethod (recv, "__ln~" ++ str_of_int ln, Nil)
+        | EArr _ -> EMethod (recv, "__ln~" ++ str_of_int ln, Nil)
+        | EHsh _ -> EMethod (recv, "__ln~" ++ str_of_int ln, Nil)
+        | EStmt _ -> EMethod (recv, "__ln~" ++ str_of_int ln, Nil)
+        | _ -> recv)
+// ...and what defined? asks about is the call itself, not the line marks
+// (`defined?(a⏎.b)` asked whether `a` had a method `__ln~2`)
+and ln_strip = fn (e: Expr) ->
+  match e with
+  | EMethod (x, m9, Nil) when str_len m9 > 5 && str_eq (substring m9 0 5) "__ln~" -> ln_strip x
+  | EMethod (x, m9, a9) -> EMethod (ln_strip x, m9, a9)
+  | EMethodB (x, m9, a9, p9, b9) -> EMethodB (ln_strip x, m9, a9, p9, b9)
+  | ESafe (x, m9, a9) -> ESafe (ln_strip x, m9, a9)
+  | ESafeB (x, m9, a9, p9, b9) -> ESafeB (ln_strip x, m9, a9, p9, b9)
+  | _ -> e
 // postfix method-call chains: `recv.name`, `recv.name(args)`, and the
 // setter form `recv.name = expr` (parsed as a call to `name=`).
 and parse_postfix = fn toks ->
@@ -3929,6 +4047,10 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
     // is settled where the identifier itself is parsed.
     let dot = (if str_eq dot0 " [" then "[" else dot0) in
     let r = (if str_eq dot "." then skip_nls r0 else r0) in   // `x.` + newline continues
+    // a call names the line of its method name, as ruby's backtrace does --
+    // not its statement's: `end.print do` after a block, `.m` on a line of
+    // its own (ln_mark)
+    let recv = (if str_eq dot "." || str_eq dot "&." then ln_mark recv (tok_line r) else recv) in
     if str_eq dot "." then
       (match r with
        // `:"#{x}"` lexes as `(s ...).to_sym`, and the literal takes no block:
@@ -4466,14 +4588,18 @@ and parse_brace_stmts = fn toks -> fn (acc: Stmt list) ->
     if str_eq p "}" then (unreach_list (rev_app acc Nil), r)
     else let ln = tok_line t in
          let acc = brace_file_head acc in
+         let sv9 = pstmt_set ln in
          let (s0, r0) = parse_stmt t in let (s, r1) = apply_modifier s0 r0 in
+         let _ = pstmt_set sv9 in
          let s = scv_stmt s in
          parse_brace_stmts r1 (Cons (s, (if ln > 0 then Cons (SLine ln, acc) else acc)))
   | Cons (TEOF, _) -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated block" ++ parsing_file ()))) in fail ("mere-ruby: unterminated block" ++ parsing_file ()))
   | _ ->
     let ln = tok_line t in
     let acc = brace_file_head acc in
+    let sv9 = pstmt_set ln in
     let (s0, r0) = parse_stmt t in let (s, r1) = apply_modifier s0 r0 in
+    let _ = pstmt_set sv9 in
     let s = scv_stmt s in
     parse_brace_stmts r1 (Cons (s, (if ln > 0 then Cons (SLine ln, acc) else acc)))
 
@@ -4886,17 +5012,17 @@ and parse_primary = fn toks ->
            (match r2 with
             | Cons (TId w, Cons (TP rp, r4)) ->
               if str_eq rp ")" then (EDefined (EVar w), r4)
-              else let (e, r3) = parse_andor r2 in (EDefined e, expect (skip_nls r3) ")")
-            | _ -> let (e, r3) = parse_andor r2 in (EDefined e, expect (skip_nls r3) ")"))
+              else let (e, r3) = parse_andor r2 in (EDefined (ln_strip e), expect (skip_nls r3) ")")
+            | _ -> let (e, r3) = parse_andor r2 in (EDefined (ln_strip e), expect (skip_nls r3) ")"))
          // `defined? a = 10` (no parens) — an assignment is unevaluated.
          else if defined_assignish r then
            let (st, r3) = parse_stmt r in (defined_assign_node r st, r3)
-         else let (e, r3) = parse_unary r in (EDefined e, r3)
+         else let (e, r3) = parse_unary r in (EDefined (ln_strip e), r3)
        // `defined? a = 10` at statement start (no leading paren token).
        | _ ->
          if defined_assignish r then
            let (st, r3) = parse_stmt r in (defined_assign_node r st, r3)
-         else let (e, r3) = parse_unary r in (EDefined e, r3))
+         else let (e, r3) = parse_unary r in (EDefined (ln_strip e), r3))
     else if str_eq id "break" || str_eq id "next" || str_eq id "return" || str_eq id "redo" || str_eq id "retry" then
       // flow keywords in expression position (ternary branches, call args).
       (match r with
@@ -5884,9 +6010,11 @@ and parse_stmts = fn toks -> fn (acc: Stmt list) ->
       let acc = (match acc with
                  | Nil -> (let f = parse_time_file () in if str_eq f "" then acc else Cons (SFile f, acc))
                  | _ -> acc) in
+      let sv9 = pstmt_set ln in
       let (s0, r0) = parse_stmt t in
       let (s0, r0) = grow_setter_stmt s0 r0 in
       let (s, r) = apply_modifier s0 r0 in
+      let _ = pstmt_set sv9 in
       let s = scv_stmt s in
       parse_stmts (expect_end r) (Cons (s, (if ln > 0 then Cons (SLine ln, acc) else acc)))
   | _ ->
@@ -5894,9 +6022,11 @@ and parse_stmts = fn toks -> fn (acc: Stmt list) ->
     let acc = (match acc with
                | Nil -> (let f = parse_time_file () in if str_eq f "" then acc else Cons (SFile f, acc))
                | _ -> acc) in
+    let sv9 = pstmt_set ln in
     let (s0, r0) = parse_stmt t in
     let (s0, r0) = grow_setter_stmt s0 r0 in
     let (s, r) = apply_modifier s0 r0 in
+    let _ = pstmt_set sv9 in
     let s = scv_stmt s in
     parse_stmts (expect_end r) (Cons (s, (if ln > 0 then Cons (SLine ln, acc) else acc)))
 
@@ -7216,7 +7346,7 @@ and parse_begin_go = fn toks ->
   let (rescues, r2) = parse_rescues r Nil in
   // an `else` with no `rescue` before it can never run: ruby refuses it
   let _ = (match (rescues, r2) with
-           | (Nil, Cons (TId "else", _)) -> syn_refuse "unexpected 'else' in 'begin' block; else without rescue is useless"
+           | (Nil, Cons (TId "else", _)) -> syn_refuse_at (tok_line r2) "unexpected `else` in `begin` block; else without rescue is useless"
            | _ -> ()) in
   let (els, r3) = parse_opt_kw_block r2 "else" in
   let (ens, r4) = parse_opt_kw_block r3 "ensure" in
