@@ -25537,12 +25537,32 @@ and rb_warning = fn world -> fn (msg: str) ->
 // methods: neither while the prelude runs, nor as a "previous definition".
 and warn_internal_file = fn (f: str) ->
   (str_len f > 10 && str_eq (substring f 0 10) "<internal:") || map_has shipped_files f
+// is Kernel (which has object_id) among the ancestors of the class a method
+// key names? A top-level def is Object's.
+// every scoped prefix of a constant path ("A::B", "A::B::C", ...): one that
+// is a private constant is ruby's "private constant A::B referenced"
+and priv_path_check = fn world -> fn (path: str) -> fn (from: int) ->
+  let i9 = str_find_from path "::" from in
+  if i9 < 0 then (if from > 0 && map_has private_consts path then raise_exc_unit world path else ())
+  else
+    (let pre9 = substring path 0 i9 in
+     let _ = (if from > 0 && map_has private_consts pre9 then raise_exc_unit world pre9 else ()) in
+     priv_path_check world path (i9 + 2))
+and raise_exc_unit = fn world -> fn (k: str) ->
+  let _ = raise_exc world "NameError" ("private constant " ++ k ++ " referenced") in ()
+and serious_has_kernel = fn world -> fn (key: str) ->
+  let h9 = str_rfind key "#" 0 (0 - 1) in
+  if h9 <= 0 then true
+  else str_list_has (ancestors_of world (substring key 0 h9)) "Kernel"
 and warn_redef = fn world -> fn (key: str) -> fn (name: str) ->
   let (meths, _, _, _) = world in
   if warn_internal_file (cur_file ()) then ()
   else
     (let _ = warn_perf_redef world key in
-     let _ = (if str_eq name "object_id" || str_eq name "__id__" || str_eq name "__send__"
+     // (...only over a method the class already has: a BasicObject
+     //  subclass or a module has no object_id to replace -- rb_method_entry_make
+     //  searches before it warns, Bug #10421)
+     let _ = (if (str_eq name "object_id" && serious_has_kernel world key) || str_eq name "__id__" || str_eq name "__send__"
               then rb_warn world ("redefining '" ++ name ++ "' may cause serious problems") else ()) in
      // (...only over a method a program wrote: one the prelude defined is
      // ruby's C method, and a stdlib file that redefines it -- pp.rb's
@@ -30673,9 +30693,18 @@ and meth_source_location = fn world -> fn (own0: str) -> fn (nm: str) -> fn (rec
   if map_has meth_src k9 && map_has meth_src ("f" ++ k9)
   then (match map_get meth_src ("f" ++ k9) with
         | VStr h9 -> (if str_eq (sget h9) "" then VNil
-                      else arr_new (Cons (mkstr (sget h9), Cons (map_get meth_src k9, Nil))))
+                      else arr_new (Cons (fstr_of (sget h9), Cons (map_get meth_src k9, Nil))))
         | _ -> VNil)
   else VNil
+// one frozen String per text, as ruby's fstring table answers a file name:
+// two methods defined from one `instance_eval(str, "generated code")` name
+// the same object (test_eval_location_fstring). Held in gc_hold, a GC root.
+and fstr_of = fn (s: str) ->
+  let k = "fs:" ++ s in
+  if map_has gc_hold k then map_get gc_hold k
+  else (let v = mkstr s in
+        let _ = (match v with VStr id -> sfrozen_set id | _ -> ()) in
+        let _ = map_set gc_hold k v in v)
 
 
 // #original_name is a DIFFERENT question from method equality, and answering
@@ -47311,9 +47340,13 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                          else if str_eq m "public_class_method" then
                            (let _ = vis_names_check world ("(sng:" ++ cls ++ ")") names in
                             mark_vis_mode meths ("(sng:" ++ cls ++ ")") names "public")
+                         // (through Module#private_constant, which marks the names
+                         //  in order and refuses the first one that is not there:
+                         //  `private_constant :C, :D rescue nil` leaves C private)
                          else if str_eq m "private_constant" then
                            (let _ = (match names with Nil -> rb_warning world "private_constant with no argument is just ignored" | _ -> ()) in
-                            mark_private_consts cls names)
+                            let rec syms9 = fn (ns: str list) -> (match ns with Nil -> (Nil : Val list) | Cons (n9, t9) -> Cons (VSym n9, syms9 t9)) in
+                            let _ = invoke_val_c cenv world (false, (Nil : str list), (Nil : Stmt list), cenv) (VClass cls) "private_constant" (syms9 names) false in ())
                          else
                            // ⚠ a visibility statement about an INHERITED method
                            //   makes an entry in this class, and ruby announces
@@ -49305,6 +49338,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // resolve a variable-qualified base (`module m::N` with m a local) to the
     // module's real name before registration.
     let name = resolve_scoped_base env name in
+    // (a private constant cannot be reached through `::`: `class
+    //  TestModule::PrivateClass; end` and `module A::Priv::M; end` are
+    //  NameErrors, wherever they are written)
+    let _ = (if toplevel || (if str_contains name "::" then false else true) then ()
+             else priv_path_check world name 0) in
     // (a class of a name whose class was removed starts empty: its old
     //  constants are keyed `Name::X` in the one table, and a test that
     //  autoloads `class AutoloadTest; X = 1; end` twice was told X was
@@ -49589,6 +49627,13 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   // top-level def stays where it is, reachable only without a receiver.
   | SVis (mode, Nil) when str_eq mode "private_constant" || str_eq mode "public_constant" ->
     let _ = rb_warning world (mode ++ " with no argument is just ignored") in FNext VNil
+  // (a class body's `private_constant :C, :D rescue nil` is wrapped in a
+  //  begin, and reaches here rather than the class body's own arm: it is the
+  //  method on self all the same)
+  | SVis (mode, names) when (str_eq mode "private_constant" || str_eq mode "public_constant")
+                            && (match (if lv_has env "self" then lv_get env "self" else VMain) with VClass _ -> true | _ -> false) ->
+    let rec syms9 = fn (ns: str list) -> (match ns with Nil -> (Nil : Val list) | Cons (n9, t9) -> Cons (VSym n9, syms9 t9)) in
+    FNext (invoke_val_c env world blk (lv_get env "self") mode (syms9 names) false)
   // in a WRAPPED load (load(file, true) / load(file, mod)) the top level's
   // `private :m` / `public :m` act on the wrapper module, and ruby says so
   // under -w (they marked Object's entries)
