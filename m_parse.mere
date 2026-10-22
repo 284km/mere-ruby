@@ -7878,6 +7878,10 @@ and parse_case_in = fn (subj: Expr) -> fn toks -> fn acc ->
                | Cons (TNL _, _) -> ()
                | Cons (TEOF, _) -> ()
                // (a label left over -- `in a, b:` -- is prism's second error)
+               // (`in "#{a}":` -- an interpolated key -- is a value pattern
+               //  left before its colon)
+               | Cons (TP c9, _) when str_eq c9 ":" && (match pat with PVal e9 -> scv_dstr e9 | _ -> false) ->
+                 syn_refuse "symbol literal with interpolation is not allowed\nexpected a delimiter after the patterns of an `in` clause"
                | Cons (TP c9, _) when str_eq c9 ":" ->
                  syn_refuse "expected a delimiter after the patterns of an `in` clause\nunexpected label, ignoring it"
                | _ -> syn_refuse "expected a delimiter after the patterns of an `in` clause") in
@@ -8279,10 +8283,25 @@ and parse_hash_pat_kv = fn toks -> fn (acc: (str * Pat) list) -> fn (rest: str) 
      | Cons (TNL _, _) -> (PVar key, r2)
      | Cons (TEOF, _) -> (PVar key, r2)
      | _ -> parse_pattern r2) in
+  // an omitted value binds a local of the key's name, so the key must be one
+  // (`in a?:` is refused, as prism does)
+  let _ = (match sub with
+           | PVar k9 when str_len k9 > 0 && (str_eq (char_at k9 (str_len k9 - 1)) "?" || str_eq (char_at k9 (str_len k9 - 1)) "!") ->
+             syn_refuse ("identifier " ++ k9 ++ " is not valid to set\nkey must be valid as local variables")
+           | PVar k9 when (if hp_local_name k9 0 then false else true) -> syn_refuse "key must be valid as local variables"
+           | _ -> ()) in
   // Ruby rejects a duplicated key name in a hash pattern.
   let _ = if pp_hitem_haskey acc key then syn_refuse "duplicated key name" else () in
   hash_pat_sep r3 (Cons ((key, sub), acc)) rest
 
+// a name a local variable can have: a lowercase letter or `_` first (or a
+// non-ASCII character), then letters, digits and `_`
+and hp_local_name = fn (k: str) -> fn (i: int) ->
+  if i >= str_len k then i > 0
+  else (let o = ord (char_at k i) in
+        let ok = (if i == 0 then (o >= 97 && o <= 122) || o == 95 || o >= 128
+                  else (o >= 97 && o <= 122) || (o >= 65 && o <= 90) || (o >= 48 && o <= 57) || o == 95 || o >= 128) in
+        if ok then hp_local_name k (i + 1) else false)
 and pp_hitem_haskey = fn (items: (str * Pat) list) -> fn (key: str) ->
   match items with Nil -> false | Cons (kp, r) -> let (k, _) = kp in str_eq k key || pp_hitem_haskey r key
 
@@ -9023,6 +9042,10 @@ let uv_cnt = map_new ();
 let uv_name = map_new ();
 let uv_ctr = map_new ();
 let uv_cur = map_new ();
+// an eval's caller's local variables (Kernel#eval fills it while the string
+// is checked): a bare name the string reads may be one of them, which ruby's
+// void warning calls "a variable" (a method call, it does not warn about)
+let vw_outer = map_new ();
 let uv_warnable = fn (n: str) ->
   str_len n > 0 && (let o = ord (char_at n 0) in (o >= 97 && o <= 122) || o >= 128);
 let rec uv_find = fn (chain: (int * bool * bool) list) -> fn (n: str) ->
@@ -9077,10 +9100,71 @@ let uv_close = fn (chain: (int * bool * bool) list) -> fn (file: str) ->
 let rec str_index_of_ch_go = fn (s: str) -> fn (c: str) -> fn (i: int) ->
   if i >= str_len s then 0 - 1 else if str_eq (char_at s i) c then i else str_index_of_ch_go s c (i + 1);
 let str_index_of_ch = fn (s: str) -> fn (c: str) -> str_index_of_ch_go s c 0;
+// a statement list: walked, and then -- once everything inside it is done,
+// as prism checks a list when it closes -- its statements in void context
+// warned about (vw_check): all but the last one, which is the list's value
 let rec uv_stmts = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ss: Stmt list) ->
+  let _ = uv_stmts_go chain file ss in vw_check chain file ss true
+// ...and one whose last statement is no value either: the program's own top
+// level, an ensure clause
+and uv_stmts_void = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ss: Stmt list) ->
+  let _ = uv_stmts_go chain file ss in vw_check chain file ss false
+and uv_stmts_go = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ss: Stmt list) ->
   match ss with
   | Nil -> ()
-  | Cons (s, t) -> (let _ = uv_stmt chain file s in uv_stmts chain file t)
+  | Cons (s, t) -> (let _ = uv_stmt chain file s in uv_stmts_go chain file t)
+// ruby's "possibly useless use of X in void context" (-w): a statement that
+// only computes a value, where the value goes nowhere
+and vw_check = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ss: Stmt list) -> fn (lastv: bool) ->
+  let rec real9 = fn (xs: Stmt list) -> (match xs with Nil -> 0 | Cons (SLine _, t) -> real9 t | Cons (SFile _, t) -> real9 t | Cons (_, t) -> 1 + real9 t) in
+  let n9 = real9 ss in
+  let rec go = fn (xs: Stmt list) -> fn (ln: int) -> fn (i: int) ->
+    (match xs with
+     | Nil -> ()
+     | Cons (SLine n, t) -> go t n i
+     | Cons (SFile _, t) -> go t ln i
+     | Cons (st, t) ->
+       (let _ = (if lastv && i == n9 - 1 then ()
+                 else (match st with
+                       | SExpr e ->
+                         (let w = vw_msg chain e in
+                          if str_eq w "" then ()
+                          else warn_note (file ++ ":" ++ str_of_int (ln + lshift_tok ()) ++ ": warning: possibly useless use of " ++ w ++ " in void context"))
+                       | _ -> ())) in
+        go t ln (i + 1))) in
+  go ss (if map_has uv_cur "l" then map_get uv_cur "l" else 0) 0
+and vw_msg = fn (chain: (int * bool * bool) list) -> fn (e: Expr) ->
+  match e with
+  | EInt _ -> "a literal" | EBig _ -> "a literal" | EFlt _ -> "a literal" | ERat (_, _) -> "a literal"
+  | EImag _ -> "a literal" | EImagF _ -> "a literal" | EImagRat (_, _) -> "a literal"
+  | EStrL _ -> "a literal" | ESym _ -> "a literal" | ERegex (_, _) -> "a literal"
+  | ENil -> "nil" | ESelf -> "self"
+  | EBool b -> (if b then "true" else "false")
+  | EIVar _ -> "a variable"
+  | EVar n ->
+    (if str_len n >= 8 && (str_eq (substring n 0 8) "__FILE__" || str_eq (substring n 0 8) "__LINE__") then "a literal"
+     else if str_len n > 0 && str_eq (char_at n 0) "$" then "a variable"
+     else if str_len n > 1 && str_eq (substring n 0 2) "@@" then "a variable"
+     else if uv_find chain n >= 0 || map_has vw_outer n then "a variable"
+     // (a numbered parameter is one; `it` is not, for ruby)
+     else if str_len n == 2 && str_eq (char_at n 0) "_" && is_digit (char_at n 1) && (if str_eq (char_at n 1) "0" then false else true) then "a variable"
+     else "")
+  | EConst c -> (if str_index_of_ch c ":" >= 0 then "::" else "a constant")
+  | EScopedRead (_, _) -> "::"
+  | ERange (_, _, x) -> (if x then "..." else "..")
+  | EDefined _ -> "defined?"
+  | EUn (op, _) -> (if str_eq op "-" then "-@" else if str_eq op "+" then "+@" else "")
+  | EBin (op, _, _) ->
+    (if scv_dstr e then "a literal"
+     else if str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/" || str_eq op "%" || str_eq op "|"
+             || str_eq op "^" || str_eq op "&" || str_eq op ">" || str_eq op "<" || str_eq op "<=" || str_eq op ">="
+             || str_eq op "!=" || str_eq op "==" || str_eq op "**" || str_eq op "<=>" then op
+     else "")
+  | EMethod (x, m, _) ->
+    (if str_eq m "__interp_str" || str_eq m "__regex" then "a literal"
+     else if str_len m > 6 && str_eq (substring m 0 6) "__lit_" then vw_msg chain x
+     else "")
+  | _ -> ""
 and uv_body = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (hard: bool) -> fn (ps: str list) -> fn (ss: Stmt list) ->
   // (a `for` is a block over `__fN` whose variables are the enclosing
   //  scope's: `for a, b in xs; end; a` reads them)
@@ -9160,7 +9244,7 @@ and uv_stmt = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (s: S
            let _ = uv_def chain v false in let _ = uv_stmts chain file rb in r9 t)) in
      let _ = r9 rs in
      let _ = uv_stmts chain file els in
-     uv_stmts chain file ens)
+     uv_stmts_void chain file ens)
   | SPreexe b -> uv_stmts chain file b
   | SAtExit (_, b) -> uv_body chain file false Nil b
   // (the targets are the variables before the values are read, as ruby
@@ -9192,13 +9276,15 @@ and uv_stmt_val = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (
         | Cons ((cs, v, rb), t) -> (let _ = uv_rescue_classes chain file cs in let _ = uv_def chain v false in let _ = uv_stmts_val chain file rb in r9 t)) in
      let _ = r9 rs in
      let _ = uv_stmts_val chain file els in
-     uv_stmts chain file ens)
+     uv_stmts_void chain file ens)
   | _ -> uv_stmt chain file s
 and uv_stmts_val = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ss: Stmt list) ->
+  let _ = uv_stmts_val_go chain file ss in vw_check chain file ss true
+and uv_stmts_val_go = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ss: Stmt list) ->
   match ss with
   | Nil -> ()
   | Cons (s, Nil) -> uv_stmt_val chain file s
-  | Cons (s, t) -> (let _ = uv_stmt chain file s in uv_stmts_val chain file t)
+  | Cons (s, t) -> (let _ = uv_stmt chain file s in uv_stmts_val_go chain file t)
 and uv_first_line = fn (ss: Stmt list) ->
   match ss with Nil -> 0 | Cons (SLine n, _) -> n | Cons (SFile _, t) -> uv_first_line t | Cons (_, t) -> 0
 // the parameters the parser gives a `for` loop's block (`__for`, `__forv`,
@@ -9304,6 +9390,15 @@ let uv_program = fn (prog: Stmt list) -> fn (file: str) -> fn (quiet_top: bool) 
     (let _ = map_clear uv_line in let _ = map_clear uv_used in let _ = map_clear uv_cnt in let _ = map_clear uv_name in
      let _ = map_set uv_cur "l" 0 in
      let ch = uv_open Nil true quiet_top in
+     let _ = uv_stmts_void ch file prog in
+     uv_close ch file)
+  else ();
+// ...an eval's string, whose last statement is the eval's value
+let uv_program_eval = fn (prog: Stmt list) -> fn (file: str) ->
+  if parse_verbose () then
+    (let _ = map_clear uv_line in let _ = map_clear uv_used in let _ = map_clear uv_cnt in let _ = map_clear uv_name in
+     let _ = map_set uv_cur "l" 0 in
+     let ch = uv_open Nil true true in
      let _ = uv_stmts ch file prog in
      uv_close ch file)
   else ();
