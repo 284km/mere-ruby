@@ -36,7 +36,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/string | 112 | 2 | 0 | 0 | 0 | 114 |
 | core/array | 103 | 0 | 0 | 1 | 1 | 105 |
 | core/hash | 68 | 1 | 0 | 0 | 0 | 69 |
-| core/range | 30 | 3 | 0 | 2 | 0 | 35 |
+| core/range | 31 | 2 | 0 | 2 | 0 | 35 |
 | core/comparable | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/complex | 42 | 0 | 0 | 1 | 0 | 43 |
 | core/env | 44 | 0 | 0 | 1 | 0 | 45 |
