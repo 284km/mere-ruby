@@ -605,8 +605,66 @@ let arr_each_val = fn (id: int) -> fn f ->
 // into str_store, so aliases share one mutable string. Fresh id per literal
 // evaluation — entries are never removed. A vec gives O(1) alloc/get/set
 // (string allocation is far hotter than array allocation).
+// ⚠ IN PAGES OF 4096 SLOTS, each with an arena of its own. A handle is a
+//   position and is never handed out again (the collector's watermarks read
+//   "made since" as "a handle above"), so one Vec grew by a slot for every
+//   String the program ever made, a dead one's blanked but kept:
+//   `3_000_000.times { "abc" + "d" }` left 9M slots, 369 MB (note 405). Most
+//   strings die young and their handles are neighbours, so a page whose slots
+//   are all dead is wound back (vec_recycle, at the sweep) -- the slots stay
+//   numbered, a read of one answers "", and the bytes go back.
 let str_store = vec_new ();
-let _ = vec_compact str_store;  // (an arena of its own from birth: see arr_store)
+let str_pg_dead = vec_new ();
+// a wound-back page keeps its first block (vec_recycle), so it is not left
+// where it was: its place in str_store gets the one empty page, and it goes to
+// a pool the next page is taken from -- the bytes are a page's per page live
+let str_pg_empty = vec_new ();
+let str_pg_pool = vec_new ();
+let str_pg_pool_n = vec_new ();
+let _ = vec_push str_pg_pool_n 0;
+// the handles issued so far (handle_base + this is the next one)
+let str_n = vec_new ();
+let _ = vec_push str_n 0;
+let str_count = fn (u: unit) -> vec_get str_n 0;
+let sraw = fn (id: int) ->
+  let i = id - handle_base in
+  let pg = vec_get str_store (i / 4096) in
+  let o = i - (i / 4096) * 4096 in
+  if o < vec_len pg then vec_get pg o else "";
+let sput = fn (id: int) -> fn (s: str) ->
+  let i = id - handle_base in
+  let pg = vec_get str_store (i / 4096) in
+  let o = i - (i / 4096) * 4096 in
+  if o < vec_len pg then vec_set pg o s else ();
+// (the sweep: surv holds the slots that lived, k of them -- a page with none
+//  is wound back, the others compacted unless nc)
+let str_pg_live = vec_new ();
+let str_pages_sweep = fn surv -> fn (k: int) -> fn (nc: bool) ->
+  let rec pz = fn (p: int) -> (if p >= vec_len str_store then () else (let _ = (if p < vec_len str_pg_live then vec_set str_pg_live p 0 else vec_push str_pg_live 0) in pz (p + 1))) in
+  let _ = pz 0 in
+  let rec pc = fn (j: int) -> (if j >= k then () else (let p9 = vec_get surv j / 4096 in let _ = vec_set str_pg_live p9 (vec_get str_pg_live p9 + 1) in pc (j + 1))) in
+  let _ = pc 0 in
+  let rec pw = fn (p: int) ->
+    (if p >= vec_len str_store then ()
+     else (let _ = (if vec_get str_pg_dead p == 1 then ()
+                    else if vec_get str_pg_live p == 0 && p < vec_len str_store - 1
+                    then (let pg = vec_get str_store p in
+                          let _ = vec_recycle pg in
+                          let n9 = vec_get str_pg_pool_n 0 in
+                          let _ = (if n9 < vec_len str_pg_pool then vec_set str_pg_pool n9 pg else vec_push str_pg_pool pg) in
+                          let _ = vec_set str_pg_pool_n 0 (n9 + 1) in
+                          let _ = vec_set str_store p str_pg_empty in
+                          vec_set str_pg_dead p 1)
+                    else if nc then ()
+                    else vec_compact (vec_get str_store p)) in
+           pw (p + 1))) in
+  pw 0;
+// the bytes of the pages not wound back
+let str_bytes = fn (u: unit) ->
+  let rec go = fn (p: int) -> fn (acc: int) ->
+    if p >= vec_len str_store then acc
+    else go (p + 1) (if vec_get str_pg_dead p == 1 then acc else acc + vec_bytes (vec_get str_store p)) in
+  go 0 0;
 // ⚠ ONE SNAPSHOT PER SUBJECT, NOT PER MATCH. A MatchData keeps the subject it
 // matched against (for #string / #pre_match / #post_match / $` / $'), and it
 // has to be the text AS IT WAS -- ruby's MatchData holds a frozen copy. Making
@@ -620,9 +678,21 @@ let _ = vec_compact str_store;  // (an arena of its own from birth: see arr_stor
 let rx_src_last = map_new ();
 let rx_src_hnd = map_new ();
 let mkstr = fn (s: str) ->
-  let id = handle_base + vec_len str_store in
-  let _ = vec_push str_store s in
-  VStr id;
+  let n = vec_get str_n 0 in
+  let _ = (if n - (n / 4096) * 4096 == 0
+           then (let np = vec_get str_pg_pool_n 0 in
+                 let _ = (if np > 0
+                          then (let pg = vec_get str_pg_pool (np - 1) in
+                                let _ = vec_set str_pg_pool_n 0 (np - 1) in
+                                vec_push str_store pg)
+                          else (let pg = vec_new () in
+                                let _ = vec_compact pg in
+                                vec_push str_store pg)) in
+                 vec_push str_pg_dead 0)
+           else ()) in
+  let _ = vec_push (vec_get str_store (n / 4096)) s in
+  let _ = vec_set str_n 0 (n + 1) in
+  VStr (handle_base + n);
 // ⚠ AN APPEND GOES INTO A QUEUE BESIDE THE STRING, AND THE NEXT READ FOLDS IT IN.
 // A Mere `str` is immutable, so `s << x` was `sset h (sget h ++ x)`: a copy of
 // the whole receiver per append, and building a string with `<<` was O(n^2).
@@ -690,14 +760,14 @@ let str_flush = fn (id: int) ->
   let tail = str_pend_fold id (k - 2) (map_get str_pch (id * 64 + k - 1)) in
   let _ = str_pend_drop id in
   let _ = map_set str_pend_n 1 ((if map_has str_pend_n 1 then map_get str_pend_n 1 else 0) + 1) in
-  let _ = vec_set str_store (id - handle_base) (vec_get str_store (id - handle_base) ++ tail) in
-  vec_get str_store (id - handle_base);
+  let _ = sput id (sraw id ++ tail) in
+  sraw id;
 // `map_len` first: nothing is queued in most programs, and then a read costs
 // one comparison more than it did.
 let sget = fn (id: int) ->
-  if map_len str_pend == 0 then vec_get str_store (id - handle_base)
+  if map_len str_pend == 0 then sraw id
   else if map_has str_pend id then str_flush id
-  else vec_get str_store (id - handle_base);
+  else sraw id;
 // ONE String handle per literal text that fails a builtin -- `map_set
 // prim_missing "i" (mkstr "...")`, the idiom 280 refusals use, made a String
 // on every raise, and a String's slot is never reused (note 310). Kept as an
@@ -712,7 +782,7 @@ let cstr_h = fn (t: str) ->
 let rec str_pend_len = fn (id: int) -> fn (i: int) -> fn (acc: int) ->
   if i < 0 then acc else str_pend_len id (i - 1) (acc + str_len (map_get str_pch (id * 64 + i)));
 let str_blen = fn (id: int) ->
-  let n0 = str_len (vec_get str_store (id - handle_base)) in
+  let n0 = str_len (sraw id) in
   if map_len str_pend > 0 && map_has str_pend id then str_pend_len id (map_get str_pend id - 1) n0
   else n0;
 // merge the top chunk (index k-1) down while the one below is at most twice it
@@ -724,9 +794,9 @@ let rec str_pend_settle = fn (id: int) -> fn (k: int) ->
      then (let _ = map_set str_pch (id * 64 + k - 2) (below ++ top) in str_pend_settle id (k - 1))
      else (let _ = map_set str_pend id k in ()))
   else
-    (let p = vec_get str_store (id - handle_base) in
+    (let p = sraw id in
      if str_len p <= 2 * str_len top
-     then (let _ = vec_set str_store (id - handle_base) (p ++ top) in
+     then (let _ = sput id (p ++ top) in
            (if map_len str_pend > 0 && map_has str_pend id then str_pend_drop id else str_pend_clear id 0))
      else (let _ = map_set str_pend id 1 in ()));
 // ⚠ IS THIS STRING ALL ASCII? Cached per handle, because the answer decides
@@ -770,9 +840,9 @@ let str_push = fn (id: int) -> fn (y: str) ->
        let _ = map_set str_pch (id * 64 + k) y in
        str_pend_settle id (k + 1))
     else
-      (let p = vec_get str_store (id - handle_base) in
+      (let p = sraw id in
        // still small beside what arrives: straight in, no queue
-       if str_len p <= 2 * str_len y then (let _ = vec_set str_store (id - handle_base) (p ++ y) in ())
+       if str_len p <= 2 * str_len y then (let _ = sput id (p ++ y) in ())
        else (let _ = map_set str_pch (id * 64) y in
              let _ = map_set str_pend id 1 in ()));
 // the ONE place a stored string is REPLACED, so the one place the answers
@@ -781,7 +851,7 @@ let sset = fn (id: int) -> fn (s: str) ->
   let _ = map_delete str_ascii id in
   let _ = map_delete str_valid8 id in
   let _ = (if map_len str_pend > 0 && map_has str_pend id then str_pend_drop id else ()) in
-  let _ = vec_set str_store (id - handle_base) s in ();
+  let _ = sput id s in ();
 // Kernel#gets state: what has been read of stdin, in stdin_src "s", handed
 // out through a cursor stdin_src_pos "p"; stdin_src "done" is the end of the
 // input (see stdin_more). Lets `while line = gets` terminate at EOF (nil) the
