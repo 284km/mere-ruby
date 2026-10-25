@@ -28,6 +28,16 @@
 # never yields, so version-guarded blocks are skipped on BOTH sides whatever
 # the reference is, and that record cannot see a reference move at all.
 #
+# 2026-10-25: 4.0.6 to 4.0.9, measured the same way. 380 of 382 corpus
+# programs print the same under both (one prints `ruby -v`, one a thread's
+# address on stderr), and every table tools/gen_*.rb asks ruby for comes out
+# the same. The unittest record is where the move shows: the same binary read
+# 6697 of 7366 against 4.0.6 and 6724 of 7426 against 4.0.9, RED 547 -> 578,
+# because 4.0.9's test files carry the fixes they test -- Set keeping
+# compare_by_identity, Regexp's range-repeat and null-check limits, curry's
+# arity, gets on a character boundary, strftime's zone abbreviation. ruby/spec
+# did not move (2487 on both): its tree is pinned separately.
+#
 # So: name the version, select it if rbenv has it, and refuse to run otherwise.
 # Refusing is the point. A gate that runs against whatever ruby is on PATH
 # reports a regression that did not happen, and the reader cannot tell.

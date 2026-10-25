@@ -10,8 +10,8 @@ reference `ruby`. `set`, `pathname` and `digest` are compiled in; the real
 to ruby 4.0.6 (`bench/csv.sh`).
 
 The milestones below (M0-M6) are how it was built. What it is measured by now
-is [ruby/spec](https://github.com/ruby/spec): **2048 of 2948 spec files**
-byte-identical to ruby 4.0.6 — every `core` and `language` file the suite has,
+is [ruby/spec](https://github.com/ruby/spec): **2488 of 2980 spec files**
+byte-identical to ruby 4.0.9 — every `core` and `language` file the suite has,
 plus the libraries this ships — see
 [Conformance](#conformance-rubyspec) for what that covers and what it does not.
 
@@ -491,8 +491,8 @@ target is the `language` and `core` groups, and the C-API (`optional/capi`) is
 out of scope. The stdlib (`library`) is IN scope for what this interpreter
 actually ships -- see below.
 
-The record covers **2948 spec files** across 153 groups: **2048 MATCH, 759
-DIFF, 0 CRASH**, 132 SKIP, 9 SLOW, against ruby 4.0.6. Run with no
+The record covers **2980 spec files** across 154 groups: **2488 MATCH, 149
+DIFF, 3 CRASH**, 335 SKIP, 5 SLOW, against ruby 4.0.9. Run with no
 directories, the sweep refreshes exactly the groups the table already has, so
 the numbers above are reproducible rather than a snapshot -- and every row of
 one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
