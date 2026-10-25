@@ -31,7 +31,7 @@
 # So: name the version, select it if rbenv has it, and refuse to run otherwise.
 # Refusing is the point. A gate that runs against whatever ruby is on PATH
 # reports a regression that did not happen, and the reader cannot tell.
-REF_RUBY_VERSION="${REF_RUBY_VERSION:-4.0.6}"
+REF_RUBY_VERSION="${REF_RUBY_VERSION:-4.0.9}"
 if [ "$(ruby -e 'print RUBY_VERSION' 2>/dev/null)" != "$REF_RUBY_VERSION" ]; then
   if [ -x "$HOME/.rbenv/versions/$REF_RUBY_VERSION/bin/ruby" ]; then
     RBENV_VERSION="$REF_RUBY_VERSION"; export RBENV_VERSION

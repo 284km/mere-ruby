@@ -21,7 +21,7 @@ compares the two **byte for byte**. The reference implementation is the oracle.
 That has three consequences you will feel immediately:
 
 1. **The reference is part of the subject.** Every gate sources
-   `tools/ref_ruby.sh`, which pins ruby **4.0.6** and refuses any other. A row
+   `tools/ref_ruby.sh`, which pins ruby **4.0.9** and refuses any other. A row
    measured against a different release is not comparable with the ones around
    it, and the difference reads as movement in mere-ruby when it is not. If you
    see a row move and you did not touch that area, check which ruby ran.
@@ -72,10 +72,10 @@ syscalls landed in the compiler before mere-ruby could use it.
 ### The reference ruby
 
 ```sh
-. ./tools/ref_ruby.sh    # sets $REF_RUBY_BIN, refuses anything that is not 4.0.6
+. ./tools/ref_ruby.sh    # sets $REF_RUBY_BIN, refuses anything that is not 4.0.9
 ```
 
-Install 4.0.6 however you manage rubies. ⚠ Do not use `ruby` from `PATH` for
+Install 4.0.9 however you manage rubies. ⚠ Do not use `ruby` from `PATH` for
 anything you intend to believe — on a typical machine that is a different
 version, and a single-file check run against it silently asks a different
 question from the sweep. The harness pins the reference itself; you should too.

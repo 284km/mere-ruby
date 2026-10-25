@@ -11,7 +11,7 @@ spec="$1"
 here="$(cd "$(dirname "$0")" && pwd)"
 # ⚠ PIN THE REFERENCE HERE, not in the caller. scoreboard.sh sources this, so
 # every recorded number is against the pinned ruby -- but a hand-run of ONE
-# file did not, and `ruby` on PATH is 3.4.9 while the records are 4.0.6. Every
+# file did not, and `ruby` on PATH is 3.4.9 while the records are 4.0.9. Every
 # per-file check in a working session was then asking a different question from
 # the sweep: core/array/detect_spec is `ruby_version_is "4.0"`, so under 3.4.9
 # the reference ran ZERO examples and the file read DIFF against a mere-ruby

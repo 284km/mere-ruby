@@ -6,7 +6,7 @@
 # (Proc#[] with Proc#call, Array#- ...) warns too, which reading the OP()
 # list in vm.c cannot tell.
 #
-#   ~/.rbenv/versions/4.0.6/bin/ruby tools/gen_perf_bop_keys.rb
+#   ~/.rbenv/versions/4.0.9/bin/ruby tools/gen_perf_bop_keys.rb
 #
 # Each candidate is redefined in a forked child, as a wrapper that keeps the
 # original's behaviour, and the child's stderr is read for the warning.

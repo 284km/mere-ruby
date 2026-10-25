@@ -29,8 +29,8 @@ RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"
 export RUBYOPT
 # NOTHING is expected to diverge here as of 2026-09-05: every step -- reading
 # the Gemfile, resolving it, building the definition, and setting up the load
-# paths -- answers what ruby answers, with the reference's own rubygems 4.0.16
-# and bundler 4.0.16 on both sides. Set DIVERGING to a step name when the next
+# paths -- answers what ruby answers, with the reference's own rubygems 4.0.20
+# and bundler 4.0.20 on both sides. Set DIVERGING to a step name when the next
 # boundary appears; the gate fails either way (a recorded divergence that
 # starts agreeing is reported as RETIRE, so the record cannot go stale).
 #
