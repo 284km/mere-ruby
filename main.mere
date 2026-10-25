@@ -2544,10 +2544,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if has then (match run_block world noblk blk args with
                  | FBreak v ->
                      let target = (if lv_has env "__blk_home" then lv_get env "__blk_home"
-                                   else if lv_has env "__fid" then lv_get env "__fid" else VInt 0) in
+                                   else yield_home_fid env) in
                      let tk = (match target with VInt t -> t | _ -> 0 - 1) in
                      if tk < 0 || (if fb_frame_live tk then false else true)
-                     then raise_exc world "LocalJumpError" "break from proc-closure"
+                     // (a block the prelude wrote -- Enumerable#first's --
+                     //  stands where ruby's is a C function's, and its orphan
+                     //  break is "unexpected break", [ruby-dev:107059])
+                     then raise_exc_iv world "LocalJumpError"
+                            (if ibreak_val v then "unexpected break" else "break from proc-closure")
+                            (Cons (("__exit_value", (if ibreak_val v then VNil else v)), Cons (("__reason", VSym "break"), Nil)))
                      else flow_throw_breakret (match target with VInt t -> t | _ -> 0) v
                  | other -> flow_value other)
     else raise_exc world "LocalJumpError" "no block given (yield)"
@@ -20773,6 +20778,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              if (str_len name == 2 && str_eq name "<<") then recv else r9)
           | VProc bpid ->
             (match run_block world (false, (Nil : str list), (Nil : Stmt list), env) (proc_get (str_of_int bpid)) args with
+             // ...a break from another thread than the one the generator
+             // runs for has no frame to go to there: LocalJumpError, as
+             // ruby's (Enumerable#first's is "unexpected break",
+             // [ruby-dev:107059])
+             | FBreak v when (match (if map_has ivars (str_of_int id ++ "@__y_thr") then map_get ivars (str_of_int id ++ "@__y_thr") else VNil) with
+                              | VInt t9 -> t9 != sch_me ()
+                              | _ -> false) ->
+               raise_exc_iv world "LocalJumpError"
+                 (if ibreak_val v then "unexpected break" else "break from proc-closure")
+                 (Cons (("__exit_value", (if ibreak_val v then VNil else v)), Cons (("__reason", VSym "break"), Nil)))
              | FBreak v -> raise_exc world "StopIteration" "iteration reached an end"
              | FNext r -> (if (str_len name == 2 && str_eq name "<<") then recv else r)
              | other -> (if (str_len name == 2 && str_eq name "<<") then recv else flow_value other))
@@ -24039,8 +24054,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                then raise_exc_iv world "LocalJumpError"
                       (if (let fk9 = "f" ++ str_of_int pid in
                            map_has proc_src fk9 && (match map_get proc_src fk9 with VStr h9 -> str_eq (sget h9) "<internal:prelude>" | _ -> false))
+                          || ibreak_val bv9
                        then "unexpected break" else "break from proc-closure")
-                      (Cons (("__exit_value", bv9), Cons (("__reason", VSym "break"), Nil)))
+                      (Cons (("__exit_value", (if ibreak_val bv9 then VNil else bv9)), Cons (("__reason", VSym "break"), Nil)))
                else flow_throw_breakret (match tgt9 with VInt t9 -> t9 | _ -> 0) bv9)
             | other9 -> flow_value other9)
     else if (str_len name == 5 && str_eq name "class") then VClass "Proc"
@@ -25225,6 +25241,30 @@ and proc_kill_one = fn env -> fn world -> fn (sig9: Val) -> fn (pid9: int) ->
          // signal 0 delivers nothing: it asks whether the process exists and
          // may be signalled, and our own always does.
          (if (pid9 == getpid () || pid9 == 0) && (match sig9 with VInt 0 -> true | _ -> false) then VInt 1
+          // ...and from a thread that is not the main one, the trap waits for
+          // the main thread, which ruby runs every handler on (a `t.join`
+          // in the handler joined the thread it was running on: "Target
+          // thread must not be current thread")
+          else if (pid9 == getpid () || pid9 == 0) && in_thread ()
+                  && signal_trap_callable (match sig9 with
+                                           | VInt k9 -> signal_name_of k9
+                                           | VStr h9 -> sget h9
+                                           | VSym y9 -> y9
+                                           | _ -> "") then
+            (let nm9 = signal_short (match sig9 with
+                                     | VInt k9 -> signal_name_of k9
+                                     | VStr h9 -> sget h9
+                                     | VSym y9 -> y9
+                                     | _ -> "") in
+             let q9 = (if map_has sig_queue "q" then map_get sig_queue "q" else "") in
+             let _ = map_set sig_queue "q" (q9 ++ nm9 ++ " ") in
+             let m9 = sch_main () in
+             let k9 = (if m9 >= 0 then sch_wait_kind m9 else 0) in
+             // (a sleep is woken for it, and so is a join, which looks again
+             //  at what it waits for: the trap runs in the middle of either)
+             let _ = (if k9 == 1 || k9 == 2 then (let _ = map_set sig_queue "w" "1" in sch_unpark m9)
+                      else if k9 == 8 then sch_unpark m9 else ()) in
+             VInt 1)
           // a signal to ourselves goes to what was trapped for it first
           else if (pid9 == getpid () || pid9 == 0)
                   && signal_deliver_self env world
@@ -25252,11 +25292,11 @@ and proc_kill_one = fn env -> fn world -> fn (sig9: Val) -> fn (pid9: int) ->
                       | VStr h9 -> str_eq (sget h9) "INT" || str_eq (sget h9) "SIGINT"
                       | VSym y9 -> str_eq y9 "INT" || str_eq y9 "SIGINT"
                       | _ -> false) then
-            raise_exc_val world (make_exc_w world (Cons (VClass "Interrupt", Cons (mkstr "", Nil))))
+            sig_raise_main world (make_exc_w world (Cons (VClass "Interrupt", Cons (mkstr "", Nil))))
           else if pid9 == getpid () || pid9 == 0 then
             // SignalException#initialize resolves the name and number itself
             // (see the prelude), so the signal is handed over as given.
-            raise_exc_val world (make_exc_w world (Cons (VClass "SignalException", Cons (sig9, Nil))))
+            sig_raise_main world (make_exc_w world (Cons (VClass "SignalException", Cons (sig9, Nil))))
           // ⚠ ANOTHER pid goes to kill(1), and its refusal is the answer:
           //   ESRCH when there is no such process, EPERM when there is one we
           //   may not signal -- `ps -p` tells the two apart, since kill's own
@@ -25454,6 +25494,39 @@ and sig_poll = fn env -> fn world ->
             // default is ruby's SignalException (Interrupt for INT)
             else (let _ = (if str_eq nm9 "INT" then raise_exc world "Interrupt" ""
                            else raise_exc world "SignalException" ("SIG" ++ nm9)) in ())))))
+// A signal's default exception goes to the MAIN thread, as an interrupt is
+// (Thread#raise's pending slot): from another thread it waits for the main
+// one, and under a Thread.handle_interrupt mask that holds it back
+// (`SignalException => :never`) it waits for the mask to end.
+and sig_raise_main = fn world -> fn (e: Val) ->
+  let m9 = sch_main () in
+  let (_, _, _, ivs) = world in
+  let pk9 = str_of_int m9 ++ "@__tpend" in
+  if m9 >= 0 && in_thread () then
+    (let _ = (if map_has ivs pk9 then () else map_set ivs pk9 e) in
+     let _ = (if sch_waiting m9 then sch_unpark m9 else ()) in
+     VInt 1)
+  else if m9 >= 0 && (if str_eq (sch_mask_mode world m9 e) "immediate" then false else true) then
+    (let _ = (if map_has ivs pk9 then () else map_set ivs pk9 e) in VInt 1)
+  else raise_exc_val world e
+// the frame a `yield` hands a break back to: the method's, past any lambda
+// the yield is written in (a lambda's own frame carries a __fid of its own,
+// marked __rxlam, which is its `return`'s target and not the block's)
+and yield_home_fid = fn env ->
+  let (found, f) = lv_owner env "__fid" in
+  if (if found then false else true) then VInt 0
+  else if map_has f "__rxlam" then
+    (match (if map_has f "__eid" then map_get f "__eid" else VNil) with
+     | VInt n9 -> (if map_has lv_up n9 then yield_home_fid (map_get lv_up n9) else map_get f "__fid")
+     | _ -> map_get f "__fid")
+  else map_get f "__fid"
+// the value the prelude's own blocks break with (Enumerable#first's): an
+// orphan one is ruby's "unexpected break", the C function's own words
+and ibreak_val = fn (v: Val) -> match v with VSym s9 -> str_eq s9 "__ibreak" | _ -> false
+// is a block or proc trapped for this signal (not a word like "IGNORE")?
+and signal_trap_callable = fn (sg: str) ->
+  let nm = signal_short sg in
+  map_has signal_traps nm && (match map_get signal_traps nm with VNil -> false | VStr _ -> false | _ -> true)
 and signal_deliver_self = fn env -> fn world -> fn (sg: str) ->
   let nm = signal_short sg in
   if (if map_has signal_traps nm then false else true) then false
@@ -26466,7 +26539,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                let _ = store_proc (str_of_int bpid) newblk in
                let yid = alloc_oid ocls0 in
                let _ = map_set ocls0 yid "Enumerator::Yielder" in
-               let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
+               let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in let _ = map_set ivars0 (str_of_int yid ++ "@__y_thr") (VInt (sch_me ())) in
                // ...and #each answers what the GENERATOR block answered, as
                // ruby's does (`Enumerator.new { |y| y << 1; :ret }.each { }` is
                // :ret) -- which is also StopIteration#result at the end of #next
@@ -26616,7 +26689,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                    let _ = store_proc (str_of_int bpid) wrapped in
                    let yid = alloc_oid ocls9 in
                    let _ = map_set ocls9 yid "Enumerator::Yielder" in
-                   let _ = map_set iv9 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
+                   let _ = map_set iv9 (str_of_int yid ++ "@__y_blk") (VProc bpid) in let _ = map_set iv9 (str_of_int yid ++ "@__y_thr") (VInt (sch_me ())) in
                    flow_value (run_block world blk (proc_get (str_of_int gpid)) (Cons (VObj yid, Nil))))
                 | _ -> VNil)
              else
@@ -40766,7 +40839,7 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
   let body = (if n < 0 then Cons (pushst, Cons (SExpr ENil, Nil))
               else Cons (pushst,
                    Cons (SIf (Cons ((EBin (">=", EMethod (EVar "__acc", "length", Nil), EInt n),
-                                     Cons (SBreak ENil, Nil)), Nil), Nil), Nil))) in
+                                     Cons (SBreak (ESym "__ibreak"), Nil)), Nil), Nil), Nil))) in
   let collector = (true, Cons ("*__e", Nil), body, cenv2) in
   let _ = (if map_has ivars0 (str_of_int eid ++ "@__e_step") then
              // produce form: yield seed, then step(prev) forever (bounded by
@@ -40805,7 +40878,7 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
                 let _ = store_proc (str_of_int bpid) collector in
                 let yid = alloc_oid ocls0 in
                 let _ = map_set ocls0 yid "Enumerator::Yielder" in
-                let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
+                let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in let _ = map_set ivars0 (str_of_int yid ++ "@__y_thr") (VInt (sch_me ())) in
                 // a break escaping the generator (no loop of its own) ends here.
                 // A run to the end keeps what the generator RETURNED: that is
                 // the finished iterator's StopIteration#result.
@@ -43911,6 +43984,16 @@ and thread_init = fn world -> fn blk -> fn (recv: Val) -> fn (args: Val list) ->
 // completed (value), parked (status run/sleep), or died (exception,
 // re-raised by join/value).
 and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) -> fn newblk ->
+         // (a new thread starts under its maker's Thread.handle_interrupt
+         //  masks, a copy of them: thread_create_core's
+         //  pending_interrupt_mask_stack)
+         let _ = (let (_, _, _, ivm) = world in
+                  let mk9 = str_of_int (sch_me ()) ++ "@__tmask" in
+                  match (if map_has ivm mk9 then map_get ivm mk9 else VNil) with
+                  | VArr ma9 -> (match deref ma9 with
+                                 | Nil -> ()
+                                 | ms9 -> map_set ivm (str_of_int tid ++ "@__tmask") (arr_new ms9))
+                  | _ -> ()) in
          if fb_can_suspend then thread_start_sch world blk tid args newblk
          else
          (let (m3, s3, ocls3, iv3) = world in
@@ -44033,11 +44116,20 @@ and sch_dispatch = fn world -> fn (me: int) ->
   let t = sch_pick () in
   if t == me then ()
   else if t >= 0 then sch_run world t
+  // ...unless Thread.ignore_deadlock is set: then everyone waits, for a
+  // signal whose trap may end a wait (run here when the one waiting is the
+  // main thread, which a trap runs on)
+  else if t == 0 - 1 && map_has thread_cfg "ignore_deadlock" && str_eq (map_get thread_cfg "ignore_deadlock") "1" then
+    (let _ = fb_os_sleep (sch_sig_slice 1000) in
+     let _ = (if map_len sig_armed > 0 then (let _ = sch_sig_check () in ()) else ()) in
+     let _ = (if me == sch_main () && map_has sig_queue "n" && str_len (map_get sig_queue "n") > 0
+              then sig_poll_all gc_cenv0 world else ()) in
+     sch_dispatch world me)
   else if t == 0 - 1 then
     // nobody can run and every live thread waits on another: the main thread
     // is told, and whoever it was waiting on stays waiting
     (let m = sch_main () in
-     let _ = map_set iv (str_of_int m ++ "@__tpend") (VExc ("fatal", "No live threads left. Deadlock?")) in
+     let _ = map_set iv (str_of_int m ++ "@__tpend") (VExc ("fatal", sch_deadlock_msg world me)) in
      let _ = sch_unpark m in
      sch_dispatch world me)
   else
@@ -44086,6 +44178,9 @@ and sch_deliver_at = fn world -> fn (me: int) -> fn (blocking: bool) ->
 // Wait: for kind on obj, until dl (0 = no limit). Answers true when the wait
 // ran out rather than being ended by someone.
 and sch_block = fn world -> fn (kind: int) -> fn (obj: int) -> fn (dl: int) ->
+  // (an interrupt already waiting that a blocking wait lets through is
+  //  raised before the wait, not after a wait nobody would end)
+  let _ = sch_deliver world (sch_me ()) in
   let out = sch_wait world kind obj dl in
   let _ = sch_deliver world (sch_me ()) in
   out
@@ -44115,7 +44210,10 @@ and sch_mask_mode = fn world -> fn (me: int) -> fn (e: Val) ->
                   | VArr aid -> deref aid | _ -> (Nil : Val list)) in
      let rec pairs = fn (ps: Val list) ->
        match ps with
-       | Cons (VClass kc, Cons (VSym md, r)) -> (if exc_is_a world ecls kc then md else pairs r)
+       // (Object and BasicObject are above every exception: exc_is_a stops
+       //  at Exception)
+       | Cons (VClass kc, Cons (VSym md, r)) ->
+         (if str_eq kc "Object" || str_eq kc "BasicObject" || exc_is_a world ecls kc then md else pairs r)
        | Cons (_, Cons (_, r)) -> pairs r
        | _ -> "" in
      let rec go = fn (ms: Val list) ->
@@ -44323,6 +44421,9 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
   let _ = (if map_has iv3 (k ++ "@__texc")
               && ((map_has iv3 (k ++ "@__tabort") && truthy (map_get iv3 (k ++ "@__tabort")))
                   || (map_has thread_cfg "abort_on_exception" && str_eq (map_get thread_cfg "abort_on_exception") "1")
+                  // ($DEBUG too: `ruby -d` aborts on a thread's exception,
+                  //  thread.c's `th->vm->thread_abort_on_exception || RTEST(ruby_debug)`)
+                  || (if map_has globals "DEBUG" then truthy (map_get globals "DEBUG") else false)
                   || thr_exc_is_exit world (map_get iv3 (k ++ "@__texc")))
            then (let m = sch_main () in
                  let _ = map_set iv3 (str_of_int m ++ "@__tpend") (map_get iv3 (k ++ "@__texc")) in
@@ -44342,7 +44443,7 @@ and thread_next = fn world -> fn (me: int) ->
   if t >= 0 then map_get sch_fb t
   else if t == 0 - 1 then
     (let m = sch_main () in
-     let _ = map_set iv (str_of_int m ++ "@__tpend") (VExc ("fatal", "No live threads left. Deadlock?")) in
+     let _ = map_set iv (str_of_int m ++ "@__tpend") (VExc ("fatal", sch_deadlock_msg world me)) in
      let _ = sch_unpark m in
      thread_next world me)
   else (let _ = fb_os_sleep 1000 in thread_next world me)
@@ -44656,7 +44757,16 @@ and thread_inst_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (tid:
      else (let _ = pend (VExc ("__ThreadPark", "kill")) in recv))
   else if (str_len name == 5 && str_eq name "raise") then
     // no argument is RuntimeError "" (measured on 4.0.6, both ways round)
-    (if tid == me then kernel_raise_now world (match args with Nil -> Cons (mkstr "", Nil) | _ -> args)
+    // (at itself too it waits when a Thread.handle_interrupt mask holds it
+    //  back: :on_blocking raises it at the next blocking wait, :never when the
+    //  mask is gone)
+    (if tid == me && (match (if map_has ivars (k ++ "@__tmask") then map_get ivars (k ++ "@__tmask") else VNil) with
+                      | VArr ma9 -> (match deref ma9 with Nil -> false | _ -> true)
+                      | _ -> false) then
+       (let e = (match args with Nil -> VExc ("RuntimeError", "") | _ -> make_exc_w world args) in
+        if str_eq (sch_mask_mode world me e) "immediate" then kernel_raise_now world (match args with Nil -> Cons (mkstr "", Nil) | _ -> args)
+        else (let _ = map_set ivars (k ++ "@__tpend") e in VNil))
+     else if tid == me then kernel_raise_now world (match args with Nil -> Cons (mkstr "", Nil) | _ -> args)
      else if (if alive then false else true) then VNil
      else (let e = (match args with Nil -> VExc ("RuntimeError", "") | _ -> make_exc_w world args) in
            let _ = pend e in VNil))
@@ -44713,11 +44823,67 @@ and sch_frame_label = fn (i: int) -> fn (base: int) ->
      then (if map_has fb_env_at (i - 1) then block_label (map_get fb_env_at (i - 1)) else "block in <main>")
      else meth_label n)
   else "?"
+// The deadlock fatal's message, as rb_check_deadlock writes it: the count,
+// then every thread with its state and its stack (Bug #21127). The thread
+// that found it (`me`) is the running one; the others are read off their
+// suspended stacks, under the call they wait in.
+and sch_deadlock_msg = fn world -> fn (me: int) ->
+  let (_, _, _, iv) = world in
+  let m = sch_main () in
+  let hx = fn (t: int) -> "0x" ++ hex_pad16 (t - handle_base) in
+  let wait_label = fn (t: int) ->
+    (let k9 = sch_wait_kind t in
+     if k9 == 8 then "Thread#join" else if k9 == 4 then "Thread::Queue#pop"
+     else if k9 == 5 then "Thread::SizedQueue#push" else if k9 == 6 then "Thread::Mutex#lock"
+     else if k9 == 3 then "Thread.stop" else if k9 == 9 then "Kernel#require" else "Kernel#sleep") in
+  let ids = map_new () in
+  let _ = map_iter sch_live (fn (t: int) -> fn (x: int) -> if t == m then () else map_set ids (map_len ids) t) in
+  let n9 = map_len ids + 1 in
+  let lines = fn (xs: Val list) ->
+    (let rec go = fn (ys: Val list) -> (match ys with Nil -> "" | Cons (VStr h, r) -> "   " ++ sget h ++ "\n" ++ go r | Cons (_, r) -> go r) in
+     go xs) in
+  let one = fn (t: int) ->
+    (let loc9 = (match (if map_has iv (str_of_int t ++ "@__tloc") then map_get iv (str_of_int t ++ "@__tloc") else VNil) with
+                 | VStr h -> " " ++ sget h | _ -> "") in
+     let bt9 = (if t == me then lines (Cons (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in '" ++ wait_label t ++ "'"), caller_frames 0))
+                else (let f9 = (if map_has sch_fb t then map_get sch_fb t else 0 - 1) in
+                      let top9 = (if f9 < 0 then "" else (let (tl, tf) = fb_saved_pos f9 in "   " ++ tf ++ ":" ++ str_of_int tl ++ ":in '" ++ wait_label t ++ "'\n")) in
+                      top9 ++ lines (sch_backtrace t))) in
+     "* #<Thread:" ++ hx t ++ loc9 ++ " sleep_forever>\n   rb_thread_t:" ++ hx t ++ " native:" ++ hx t ++ " int:0\n" ++ bt9) in
+  let rec rest = fn (i: int) -> (if i >= map_len ids then "" else one (map_get ids i) ++ rest (i + 1)) in
+  "No live threads left. Deadlock?\n" ++ str_of_int n9 ++ " threads, " ++ str_of_int n9 ++ " sleeps current:" ++ hx me ++ " main thread:" ++ hx m ++ "\n"
+  ++ one m ++ rest 0
+// The end of the program (after the at_exit handlers): every other live
+// thread is killed and runs its ensure clauses, the main thread already
+// dead for them (`mth.alive?` false, `mth.status` false) and each of them
+// "aborting" -- ruby's rb_thread_terminate_all. A thread its ensure keeps
+// waiting is given up on after a bound, as ruby gives up too.
+and sch_terminate_all = fn world ->
+  let m = sch_main () in
+  if m < 0 || map_len sch_live <= 1 || in_thread () then ()
+  else
+    (let (_, _, _, iv) = world in
+     let _ = map_set iv (str_of_int m ++ "@__tst") (VBool false) in
+     let _ = map_iter sch_live (fn (t: int) -> fn (x: int) ->
+               if t == m then ()
+               else (let pk9 = str_of_int t ++ "@__tpend" in
+                     let _ = (if map_has iv pk9 then () else map_set iv pk9 (VExc ("__ThreadPark", "kill"))) in
+                     if sch_waiting t then sch_unpark t else ())) in
+     let rec go = fn (n: int) ->
+       (if n <= 0 || map_len sch_live <= 1 then ()
+        else (let _ = try_or (fn (u: unit) -> let _ = sch_pass world in VNil) VNil in
+              let _ = map_delete iv (str_of_int m ++ "@__tpend") in
+              go (n - 1))) in
+     go 10000)
 // join: wait for t to end, or for the limit to run out (answers true then)
 and sch_join = fn env -> fn world -> fn (t: int) -> fn (limit: Val) ->
   let dl = sch_deadline env world limit in
   let rec go = fn (u: unit) ->
-    if map_has sch_live t then (if sch_block world 8 t dl then true else go ()) else false in
+    if map_has sch_live t then
+      (if sch_block world 8 t dl then true
+       else (let _ = (if in_thread () then () else if map_has sig_queue "q" && str_len (map_get sig_queue "q") > 0 then sig_poll_all env world else ()) in
+             go ()))
+    else false in
   go ()
 // The class of an Enumerator / Lazy / Chain OBJECT whose #initialize is the
 // builtin one, or "" -- the receivers enum_init serves
@@ -49568,7 +49734,15 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // nothing where ruby prints a newline, and `**h` arrived at eval_e as a
     // bare marker. Evaluating every argument before printing any is also what
     // ruby does -- an argument that raises means nothing is written.
-    let _ = (match eval_args env world blk es with
+    let vs0 = eval_args env world blk es in
+    // (the write is a blocking point: an interrupt a Thread.handle_interrupt
+    //  :on_blocking mask held back is raised here, before anything is written
+    //  -- p is not one, [Bug #11546])
+    let _ = (if in_thread () then
+               (let (_, _, _, ivp) = world in
+                if map_has ivp (str_of_int (sch_me ()) ++ "@__tpend") then sch_deliver world (sch_me ()) else VNil)
+             else VNil) in
+    let _ = (match vs0 with
              | Nil -> out_emit world "\n"
              | vs -> puts_each world vs) in
     FNext VNil
