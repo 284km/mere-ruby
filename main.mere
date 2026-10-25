@@ -16110,6 +16110,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // none is started in a cwd that may have been removed under it.
     // Dir#chdir (the prelude's) asks the same questions as Dir.chdir, about
     // the line that called it: Dir.__cd_guard(file, line) / __cd_step(in, file, line)
+    // (the path as the program wrote it, for one the Dir arm converted for the
+    //  OS: Dir#path and #inspect keep the caller's encoding, [ruby-dev:45280])
+    else if str_eq c "Dir" && (str_len name == 9 && str_eq name "__os_orig") then
+      (match args with
+       | Cons (VStr h9, _) when map_has os_conv_orig (sget h9) -> os_orig_val (sget h9)
+       | Cons (v9, _) -> v9
+       | Nil -> VNil)
     else if str_eq c "Dir" && (str_len name == 10 && str_eq name "__cd_guard") then
       (match args with
        | Cons (VStr f9, Cons (VInt l9, Cons (b9, _))) -> (let _ = dir_chdir_guard_at world (truthy b9) (sget f9) l9 in VNil)
@@ -16498,7 +16505,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              if (if enc_ascii_compat e9 then false else true)
              then raise_exc world "Encoding::CompatibilityError" ("path name must be ASCII-compatible (" ++ e9 ++ ")")
              else if str_contains (sget h9) (chr 0) then raise_exc world "ArgumentError" "path name contains null byte"
-             else mkstr (sget h9)) in
+             // (in its own encoding: rubygems' require passes every path
+             //  through File.path, and a Windows-31J name came back UTF-8)
+             else mkstr_e (sget h9) e9) in
           match args with
           | Cons (VStr ph, _) -> nul9h ph
           // ⚠ ...and anything WITHOUT #to_path is a TypeError, not the
@@ -16710,7 +16719,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let j9 = file_join_parts (file_join_flat env world args (map_new ())) "" in
           // a path cannot hold NUL, and ruby refuses it here rather than later
           if str_contains j9 (chr 0) then raise_exc world "ArgumentError" "string contains null byte"
-          else mkstr j9)
+          // (in the encoding of its first non-ASCII part, as rb_file_join's
+          //  result is: a Windows-31J directory joins to a Windows-31J path)
+          else if enc_all7 j9 then mkstr j9
+          else (let rec fe9 = fn (xs: Val list) ->
+                  (match xs with
+                   | Nil -> "UTF-8"
+                   | Cons (VStr h8, t8) -> (if enc_all7 (sget h8) then fe9 t8 else enc_canon_name (senc_get h8))
+                   | Cons (VArr a8, t8) -> (let r8 = fe9 (deref a8) in if str_eq r8 "UTF-8" then fe9 t8 else r8)
+                   | Cons (_, t8) -> fe9 t8) in
+                mkstr_e j9 (fe9 args)))
        else if (str_len name == 11 && str_eq name "expand_path") then
          // File.expand_path(path[, base]): a relative path resolves against
          // base when given (that is how a library says "next to this file",
@@ -16826,6 +16844,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let _ = (if str_eq name "chdir" || str_eq name "pwd" || str_eq name "getwd" || str_eq name "home" || str_eq name "tmpdir"
                    // (glob's NUL is its own refusal: "nul-separated glob pattern")
                    || str_eq name "glob" || str_eq name "[]" then () else dir_nul_check world args) in
+       // (the path the OS is asked about, in its encoding, as File's are)
+       let args = (if str_eq name "mkdir" || str_eq name "rmdir" || str_eq name "unlink" || str_eq name "delete"
+                      || str_eq name "exist?" || str_eq name "empty?" || str_eq name "entries" || str_eq name "children"
+                      || str_eq name "each_child" || str_eq name "foreach" || str_eq name "open" || str_eq name "new"
+                   then os_path_args world args else args) in
        if (str_len name == 3 && str_eq name "pwd") || (str_len name == 5 && str_eq name "getwd") then mkstr (env_get "PWD")
        // Dir.chdir(path) with no block: move and stay. The block form is in
        // invoke_with_block, and both go through dir_chdir_to.
@@ -16958,7 +16981,27 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                                 | Cons (VStr ph9, _) -> senc_get ph9
                                                 | _ -> "UTF-8")
                       | _ -> "UTF-8") in
-          let got9 = val_strs_tag (glob_strs (gl2_all (map_new ()) fl9 pats base)) penc in
+          // (with several patterns, each one's names carry ITS encoding:
+          //  `Dir[a, b]` with a in IBM437 and b in EUC-JP)
+          let rec flat9 = fn (vs: Val list) ->
+            (match vs with
+             | Nil -> Nil
+             | Cons (VArr fa9, t9) -> list_append (flat9 (deref fa9)) (flat9 t9)
+             | Cons (h9, t9) -> Cons (h9, flat9 t9)) in
+          let pv9 = flat9 pvals9 in
+          let rec per9 = fn (vs: Val list) ->
+            (match vs with
+             | Nil -> (Nil : Val list)
+             | Cons (VStr ph9, t9) ->
+               list_append (val_strs_tag (glob_strs (gl2_all (map_new ()) fl9 (glob_pat_args (Cons (VStr ph9, Nil))) base)) (senc_get ph9)) (per9 t9)
+             | Cons (_, t9) -> per9 t9) in
+          let got9 = (if val_list_len pv9 > 1 then per9 pv9
+                      else val_strs_tag (glob_strs (gl2_all (map_new ()) fl9 pats base)) penc) in
+          // (under -w, a directory on the way that cannot be read is warned
+          //  about, as ruby's glob does: opendir's "dir: Permission denied",
+          //  and the lstat of a literal name "replace_real_basename: ...")
+          let _ = (if (if map_has globals (gvar_slot "VERBOSE") then (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false) else false)
+                   then glob_perm_warn env world pv9 else ()) in
           // with a block: each name, and nil
           match blk with
           | (true, _, _, _) ->
@@ -37709,7 +37752,9 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
     (match args with
      | Cons (a9, rest9) ->
        (match to_path_str noblk world a9 with
-        | VStr ph -> rb_load env world (sget ph) (match rest9 with Cons (w9, _) -> w9 | Nil -> VNil)
+        | VStr ph -> (let _ = map_set req_penc "v" (mkstr (senc_get ph)) in
+                      let pc9 = (match os_path_conv world (VStr ph) with VStr c9 -> sget c9 | _ -> sget ph) in
+                      rb_load env world pc9 (match rest9 with Cons (w9, _) -> w9 | Nil -> VNil))
         | _ -> raise_exc world "TypeError"
                  ("no implicit conversion of " ++ conv_gives_name a9 ++ " into String"))
      | Nil -> VNil)
@@ -40838,7 +40883,7 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
       | _ -> VBool true))
   else
     (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in
-     raise_exc world "LoadError" ("cannot load such file -- " ++ p0))
+     raise_load_err world p0)
 
 // split on ':' -- the separator ruby uses for -I chains and RUBYLIB.
 // one ENV read: the write overlay wins (VNil = deleted), then the real
@@ -41501,9 +41546,24 @@ and gl2_all = fn g -> fn (fl: int) -> fn (pats: str list) -> fn (base: str) ->
 // silence, and the two builtin arms matched only `Cons (VStr _, _)` so a
 // MockObject fell past them and was reported as an undefined method named
 // __builtin_require_relative. One rule, one place.
+// "cannot load such file -- <path>", the message in the path's encoding when
+// that is not UTF-8 (a Windows-31J name ends a Windows-31J message)
+and raise_load_err = fn world -> fn (p0: str) ->
+  let pe9 = (if map_has req_penc "v" then (match map_get req_penc "v" with VStr h9 -> sget h9 | _ -> "") else "") in
+  if map_has os_conv_orig p0 then
+    (let t9 = map_get os_conv_orig p0 in
+     let i9 = str_find_from t9 (chr 1) 0 in
+     raise_exc_iv world "LoadError" ("cannot load such file -- " ++ substring t9 (i9 + 1) (str_len t9))
+       (Cons (("__menc", mkstr (substring t9 0 i9)), Nil)))
+  else if enc_all7 p0 || str_eq pe9 "" || str_eq pe9 "UTF-8" || (if enc_ascii_compat pe9 then false else true) then
+    raise_exc world "LoadError" ("cannot load such file -- " ++ p0)
+  else raise_exc_iv world "LoadError" ("cannot load such file -- " ++ p0) (Cons (("__menc", mkstr pe9), Nil))
 and require_path_of = fn env -> fn world -> fn (v: Val) ->
   (match v with
-   | VStr h9 -> sget h9
+   // (asked of the OS in its encoding, os_path_conv; the message names it
+   //  as written)
+   | VStr h9 -> (let _ = map_set req_penc "v" (mkstr (senc_get h9)) in
+                 match os_path_conv world v with VStr c9 -> sget c9 | _ -> sget h9)
    | _ ->
      (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
       let cls9 = dispatch_cls_of world v in
@@ -42591,8 +42651,11 @@ and os_path_conv = fn world -> fn (v: Val) ->
        (let e9 = enc_canon_name (senc_get h9) in
         if str_eq e9 "UTF-8" || str_eq e9 "ASCII-8BIT" || str_eq e9 "US-ASCII" || (if enc_ascii_compat e9 then false else true) then v
         else
-          (let r9 = invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) v "encode" (Cons (mkstr "UTF-8", Nil)) false in
-           let _ = (match r9 with VStr rh9 -> map_set os_conv_orig (sget rh9) (e9 ++ chr 1 ++ sget h9) | _ -> ()) in
+          // (a path that does not convert -- bytes its encoding cannot
+          //  read -- goes as it is, rb_str_conv_enc's answer)
+          (let r9 = try_or (fn (u: unit) -> invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) v "encode" (Cons (mkstr "UTF-8", Nil)) false) v in
+           let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+           let _ = (match r9 with VStr rh9 -> (if rh9 == h9 then () else map_set os_conv_orig (sget rh9) (e9 ++ chr 1 ++ sget h9)) | _ -> ()) in
            r9))
      else v)
   | _ -> v
@@ -42627,8 +42690,8 @@ and dir_there = fn (p9: str) ->
 // ENOTDIR, a path that is not there at all is ENOENT.
 and dir_open_fail = fn world -> fn (p9: str) ->
   if file_exists p9
-  then raise_exc world "Errno::ENOTDIR" ("Not a directory @ dir_initialize - " ++ p9)
-  else raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_initialize - " ++ p9)
+  then dir_raise_p world "Errno::ENOTDIR" "Not a directory @ dir_initialize - " p9
+  else dir_raise_p world "Errno::ENOENT" "No such file or directory @ dir_initialize - " p9
 // A mode as `mkdir -m` wants it: four octal digits of the low twelve bits.
 // There is no general base formatter here and one question does not need one.
 and oct12 = fn (n9: int) ->
@@ -42817,14 +42880,22 @@ and dir_names_split = fn (raw: str) -> fn (i: int) ->
 // in proc_last_errno) as ruby's Errno: the numbers those calls give, by name,
 // because the table errno_by_num is darwin's and ENOTEMPTY, ENAMETOOLONG and
 // ELOOP differ on linux. Anything else is a SystemCallError with the number.
+// (a path os_path_conv converted is named as the program wrote it, the
+//  message in its encoding, [ruby-dev:45279])
+and dir_raise_p = fn world -> fn (cls: str) -> fn (msg: str) -> fn (p: str) ->
+  if map_has os_conv_orig p then
+    (let t9 = map_get os_conv_orig p in
+     let i9 = str_find_from t9 (chr 1) 0 in
+     raise_exc_iv world cls (msg ++ substring t9 (i9 + 1) (str_len t9)) (Cons (("__menc", mkstr (substring t9 0 i9)), Nil)))
+  else raise_exc world cls (msg ++ p)
 and dir_errno_raise = fn world -> fn (e: int) -> fn (fn9: str) -> fn (p: str) ->
   let nm9 = (if e == 17 then "EEXIST" else if e == 2 then "ENOENT" else if e == 13 then "EACCES"
              else if e == 20 then "ENOTDIR" else if e == 66 || e == 39 then "ENOTEMPTY"
              else if e == 1 then "EPERM" else if e == 30 then "EROFS" else if e == 16 then "EBUSY"
              else if e == 21 then "EISDIR" else if e == 22 then "EINVAL"
              else if e == 63 || e == 36 then "ENAMETOOLONG" else if e == 62 || e == 40 then "ELOOP" else "") in
-  if str_eq nm9 "" then raise_exc world "SystemCallError" ("unknown error " ++ str_of_int e ++ " @ " ++ fn9 ++ " - " ++ p)
-  else raise_exc world ("Errno::" ++ nm9) (errno_desc nm9 ++ " @ " ++ fn9 ++ " - " ++ p)
+  if str_eq nm9 "" then dir_raise_p world "SystemCallError" ("unknown error " ++ str_of_int e ++ " @ " ++ fn9 ++ " - ") p
+  else dir_raise_p world ("Errno::" ++ nm9) (errno_desc nm9 ++ " @ " ++ fn9 ++ " - ") p
 // the fields of the snapshot file_stat / file_lstat just took, from i on
 and stat_fields_from = fn (i: int) ->
   if i >= 13 then Nil else Cons (VInt (file_stat_field i), stat_fields_from (i + 1))
@@ -45332,8 +45403,6 @@ and cmperr_cls = fn env -> fn world -> fn (v: Val) ->
                | VStr h9 -> sget h9
                | _ -> display_cls_msg world (dispatch_cls_of world v))
   | _ -> class_name v
-// each zip argument as an Array, or VNil when one of them cannot answer #to_a
-// (which is the only case the lazy path cannot take).
 // Kernel#global_variables: the numbered ones are the groups of the last
 // match that took part ($1 and $12 of twelve, not a $2 that matched nothing),
 // not whatever slots were written before
@@ -45356,7 +45425,30 @@ and global_vars_with_match = fn env -> fn world -> fn blk ->
      | Cons (VNil, t9) -> nums9 t9 (k + 1)
      | Cons (_, t9) -> Cons (VSym ("$" ++ str_of_int k), nums9 t9 (k + 1))) in
   arr_new (list_append (keep9 all9) (nums9 caps9 1))
-
+and glob_perm_warn = fn env -> fn world -> fn (pv: Val list) ->
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let fq9 = fn (m: str) -> fn (p: str) -> truthy (invoke_val_c env world nb9 (VClass "File") m (Cons (mkstr p, Nil)) false) in
+  let magic9 = fn (seg: str) -> str_contains seg "*" || str_contains seg "?" || str_contains seg "[" || str_contains seg "\{" in
+  let warn9 = fn (msg: str) -> warning_emit world ("<internal:dir>:412: warning: " ++ msg ++ ": Permission denied\n") VNil in
+  let rec go = fn (xs: Val list) ->
+    (match xs with
+     | Nil -> ()
+     | Cons (VStr ph9, t9) ->
+       (let p0 = sget ph9 in
+        let p9 = (if str_len p0 > 1 && str_eq (char_at p0 (str_len p0 - 1)) "/" then substring p0 0 (str_len p0 - 1) else p0) in
+        let rec ls9 = fn (k: int) -> (if k < 0 then 0 - 1 else if str_eq (char_at p9 k) "/" then k else ls9 (k - 1)) in
+        let i9 = ls9 (str_len p9 - 1) in
+        let dir9 = (if i9 > 0 then substring p9 0 i9 else "") in
+        let last9 = (if i9 >= 0 then substring p9 (i9 + 1) (str_len p9) else p9) in
+        let _ = (if str_eq dir9 "" || magic9 dir9 then ()
+                 else if (if fq9 "directory?" dir9 then false else true) then ()
+                 else if magic9 last9 then (if fq9 "readable?" dir9 then () else warn9 dir9)
+                 else if fq9 "executable?" dir9 then () else warn9 ("replace_real_basename: " ++ p9)) in
+        go t9)
+     | Cons (_, t9) -> go t9) in
+  go pv
+// each zip argument as an Array, or VNil when one of them cannot answer #to_a
+// (which is the only case the lazy path cannot take).
 and lz_zip_args = fn env -> fn world -> fn (xs: Val list) ->
   let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
   arr_new (lz_zip_args_go env world nb9 xs)
@@ -49124,6 +49216,10 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      // These win over anything on the $LOAD_PATH: a mere-ruby that is pointed
      // at CRuby's stdlib (-I / RUBYLIB) must still use its OWN rbconfig, and
      // must not read CRuby's thread.rb.
+     // (the transcoders are built in and loaded: `require
+     //  "enc/trans/single_byte"` loads nothing and answers false, as ruby's
+     //  does once they are there)
+     else if str_len p0 > 10 && str_eq (substring p0 0 10) "enc/trans/" then FNext (VBool false)
      else if str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb" ||
              str_eq p0 "thread" || str_eq p0 "thread.rb" ||
              // Enumerator has been built in since 1.9; requiring it is a no-op
@@ -49135,6 +49231,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
              // psych.so: the parser is shipped as Ruby source (stdlib_src),
              // so the extension is never looked for.
              str_eq p0 "psych.so" ||
+
              // zlib is a C extension in CRuby; here the compression itself is
              // the vendored mgz package and the stream classes are shipped as
              // Ruby source (stdlib_src), so the .so is never looked for.
@@ -49145,7 +49242,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        FNext (VBool true)
      else if (if is_reg_file full then false else true) && str_eq shipped "" then
        (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in
-        FRaise (raise_exc world "LoadError" ("cannot load such file -- " ++ p0)))
+        FRaise (raise_load_err world p0))
      // a frozen $LOADED_FEATURES cannot take the feature: refused before
      // anything runs (it was a LoadError for the file)
      else if (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
