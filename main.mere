@@ -4182,6 +4182,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if str_eq op "==" && has_meth world ocl "<=>" && obj_is_a world ocl "Comparable"
                && (if has_meth world ocl "==" then false else true) then
          (let bv9 = eval_e env world blk b in
+          // (the same object is equal without asking: cmp_equal's x == y)
+          if (match (va0, bv9) with (VObj i9, VObj j9) -> i9 == j9 | _ -> false) then VBool true else
           match invoke world noblk va0 ocl "<=>" (Cons (bv9, Nil)) with
           // nil means "not comparable", which for #== is simply false; ANY
           // OTHER non-number is a broken comparison and ruby says so rather
@@ -4640,7 +4642,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
           if ok7 then coerced_apply env world op x7 y7
           else raise_exc world "ArgumentError"
                  ("comparison of " ++ class_name va0 ++ " with "
-                  ++ display_cls_msg world (dispatch_cls_of world vb) ++ " failed"))
+                  ++ cmperr_cls env world vb ++ " failed"))
        // ...and the four relations are all false against a NaN, for the same
        //   reason: it is unordered, not equal-to.
        else if (match va0 with VFlt f7 -> (if f7 == f7 then false else true) | _ -> false)
@@ -4658,7 +4660,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
          raise_exc_iv world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ for_recv_cls world (dispatch_cls_of world va0))
            (Cons (("__name", VSym op), Cons (("__args", arr_new (Cons (vb, Nil))), Cons (("__recv", va0), Nil))))
        else if cmp_incompatible va0 vb then
-         raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with " ++ (if is_num vb then to_s vb else class_name vb) ++ " failed")
+         raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with " ++ (if is_num vb then to_s vb else cmperr_cls env world vb) ++ " failed")
        else
          let c = cmp_vals va0 vb in
          VBool (if str_eq op "<" then c < 0 else if str_eq op "<=" then c <= 0 else if str_eq op ">" then c > 0 else c >= 0))
@@ -13228,8 +13230,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 (match shift_width_v env world lov9 with
                  | VInt b9 ->
                    (match hiv9 with
-                    // endless: everything from beg up
-                    | VNil -> VInt (int_aref_shift n9 b9)
+                    // endless: everything from beg up, exactly n >> beg (a
+                    // negative beg shifts LEFT and may need a bignum:
+                    // `-16[-66..]` is -16 << 66, it was 0)
+                    | VNil -> (if b9 < 0 then arith_bin ">>" recv (VInt b9) else VInt (int_aref_shift n9 b9))
                     | _ ->
                       (match shift_width_v env world hiv9 with
                        | VInt e9 ->
@@ -13238,9 +13242,24 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                           // ⚠ upper below lower is not an empty slice: ruby
                           // ignores the upper bound and takes everything from
                           // beg up, which answering 0 got wrong.
-                          else VInt (int_aref_shift n9 b9))
+                          else (if b9 < 0 then arith_bin ">>" recv (VInt b9) else VInt (int_aref_shift n9 b9)))
                        | _ -> VInt 0))
                  | _ -> VInt 0))
+           // ...and a bignum's bits, the same arithmetic
+           | VBig _ ->
+             (match (lov9, shift_width_v env world lov9) with
+              | (VNil, _) -> VInt 0
+              | (_, VInt b9) ->
+                (match hiv9 with
+                 | VNil -> arith_bin ">>" recv (VInt b9)
+                 | _ ->
+                   (match shift_width_v env world hiv9 with
+                    | VInt e9 ->
+                      (if b9 < e9 then int_slice_v recv b9 ((e9 - b9) + (if excl9 then 0 else 1))
+                       else if b9 == e9 then (if excl9 then VInt 0 else int_aref_bit recv (VInt b9))
+                       else arith_bin ">>" recv (VInt b9))
+                    | _ -> VInt 0))
+              | _ -> VInt 0)
            | _ -> VInt 0)
         | Cons (iv9, Nil) -> int_aref_bit recv (shift_width_v env world iv9)
         | _ -> VInt 0))
@@ -15113,6 +15132,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   else
   match recv with
   | VClass c ->
+    // (an ivar written on the singleton class of a frozen class names the
+    //  singleton, "can't modify frozen Class: #<Class:A>": rb_check_frozen
+    //  on it, not rb_class_modify_check on the class it stands for)
+    let _ = (if is_sng_cls c && ((str_len name == 21 && str_eq name "instance_variable_set") || (str_len name == 24 && str_eq name "remove_instance_variable"))
+                && (clsfrozen_get c || clsfrozen_get (sng_inner c))
+             then (let _ = raise_exc_iv world "FrozenError" ("can't modify frozen Class: #<Class:" ++ cls_display world (sng_inner c) ++ ">")
+                             (Cons (("__recv", recv), Nil)) in ())
+             else ()) in
     // every writer named in cls_frozen_refuses goes through this ONE check.
     // The empty-store test comes first: this arm is every class-method call in
     // the program, and a program that never freezes a class should pay one map
@@ -20769,7 +20796,23 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let qv = (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else arr_new Nil) in
        let items = (match qv with VArr aid -> deref aid | _ -> Nil) in
        let closed = map_has ivars (k ++ "@__qclosed") in
-       if fb_can_suspend && queue_sch_name name then queue_sch env world recv id cls name args
+       // (one made by allocate was never initialized: ruby's TypeError,
+       //  "#<Thread::Queue:0x...> not initialized")
+       // (ruby names the class Thread::Queue there)
+       let qname9 = (let s9 = inspect_w env world recv in
+                     if str_len s9 > 2 && str_eq (substring s9 0 2) "#<" && (if str_contains s9 "#<Thread::" then false else true)
+                     then "#<Thread::" ++ substring s9 2 (str_len s9) else s9) in
+       if (if map_has ivars (k ++ "@__q") then false else true) && queue_sch_name name then
+         raise_exc world "TypeError" (qname9 ++ " not initialized")
+       // (SizedQueue#max= takes a positive size, under the scheduler too)
+       else if (str_len name == 4 && str_eq name "max=") && (match args with Cons (VInt mx, _) -> mx <= 0 | _ -> false) then
+         raise_exc world "ArgumentError" "queue size must be positive"
+       else if (if map_has ivars (k ++ "@__q") then false else true)
+               && ((str_len name == 4 && str_eq name "push") || (str_len name == 2 && str_eq name "<<") || (str_len name == 3 && str_eq name "enq")
+                   || (str_len name == 4 && str_eq name "size") || (str_len name == 6 && str_eq name "length") || (str_len name == 6 && str_eq name "empty?")
+                   || (str_len name == 5 && str_eq name "clear") || (str_len name == 5 && str_eq name "close")) then
+         raise_exc world "TypeError" (qname9 ++ " not initialized")
+       else if fb_can_suspend && queue_sch_name name then queue_sch env world recv id cls name args
        else if (str_len name == 4 && str_eq name "push") || (str_len name == 2 && str_eq name "<<") || (str_len name == 3 && str_eq name "enq") then
          (if closed then raise_exc world "ClosedQueueError" "queue closed"
           else
@@ -20809,7 +20852,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 3 && str_eq name "max") then
          (if map_has ivars (k ++ "@__qmax") then map_get ivars (k ++ "@__qmax") else VNil)
        else if (str_len name == 4 && str_eq name "max=") then
-         (match args with Cons (VInt mx, _) -> let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in VInt mx | _ -> VNil)
+         (match args with
+          | Cons (VInt mx, _) when mx <= 0 -> raise_exc world "ArgumentError" "queue size must be positive"
+          | Cons (VInt mx, _) -> let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in VInt mx
+          | _ -> VNil)
        // ⚠ ...but NOT dup/clone. A Queue has no #initialize_copy in ruby, so
        //   copying one is a NoMethodError naming THAT -- and handing the two
        //   names to the generic handler answered a COPY instead, which is
@@ -20834,6 +20880,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (if in_thread () then raise_exc world "__ThreadPark" "sleep"
           else raise_exc world "fatal" "No live threads left. Deadlock?")
        else if (str_len name == 6 && str_eq name "signal") || (str_len name == 9 && str_eq name "broadcast") then recv
+       // (no #initialize_copy, as for Queue: dup and clone are NoMethodError,
+       //  Bug #9440)
+       else if (str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone") then
+         raise_exc world "NoMethodError" "undefined method 'initialize_copy' for an instance of Thread::ConditionVariable"
        // the universal names, same reason as the ThreadGroup arm above.
        else if is_prim_method name then dispatch_prim env world blk recv name args false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of ConditionVariable"))
@@ -36876,6 +36926,10 @@ and kernel_integer_go = fn env -> fn world -> fn (pos: Val list) ->
                       | _ -> (let _ = conv_fail "ArgumentError" "base specified for non string value" in VNil)))
            else v0) in
   match v with
+  // (an ASCII-incompatible string is not read at all: "ASCII incompatible
+  //  encoding: UTF-16BE", [ruby-core:43566])
+  | VStr h when (if enc_ascii_compat (senc_get h) then false else true) ->
+    raise_exc world "Encoding::CompatibilityError" ("ASCII incompatible encoding: " ++ senc_get h)
   | VStr h -> rb_int_parse_b (sget h) base
   | VInt n -> VInt n
   | VBig b -> VBig b
@@ -40086,7 +40140,9 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
         let fl = (if map_has i9x (str_of_int oid ++ "@__rx_flags") then to_s (map_get i9x (str_of_int oid ++ "@__rx_flags")) else "") in
         invoke_val_c (map_new ()) world superblk (VRegex (src, fl, "")) meth args false)
      | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
-  else raise_exc world "NoMethodError" (super_missing_msg meth recv)
+  // (with the receiver, the name and the arguments, as every NoMethodError)
+  else raise_exc_iv world "NoMethodError" (super_missing_msg meth recv)
+         (Cons (("__name", VSym meth), Cons (("__recv", recv), Cons (("__args", arr_new args), Nil))))
 
 // the hooks Ruby ships as empty private methods, so `super` from an override
 // always has somewhere to land.
@@ -44350,7 +44406,8 @@ and mutex_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (id: int) -
      else
        (let t0 = sch_now () in
         let _ = release () in
-        let _ = (match dur9 with VNil -> sch_wait world 3 0 0 | _ -> sch_wait world 1 0 (sch_deadline env world dur9)) in
+        let dl9 = (match dur9 with VNil -> 0 | _ -> sch_deadline env world dur9) in
+        let _ = (match dur9 with VNil -> sch_wait world 3 0 0 | _ -> sch_wait world 1 0 dl9) in
         let _ = sch_cv_leave (sch_me ()) in
         // the lock is taken back BEFORE anything raised at this thread is
         // delivered: a kill or a raise leaves it holding the mutex, so the
@@ -44359,7 +44416,11 @@ and mutex_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (id: int) -
           if held () then (let _ = sch_wait world 6 id 0 in relock ()) else take () in
         let _ = relock () in
         let _ = sch_deliver world (sch_me ()) in
-        VInt ((sch_now () - t0 + 500000000) / 1000000000)))
+        // (a sleep that ran to its timeout answers nil, ruby 4.0's
+        //  Mutex#sleep -- and so ConditionVariable#wait does too)
+        (match dur9 with
+         | VNil -> VInt ((sch_now () - t0 + 500000000) / 1000000000)
+         | _ -> if sch_now () >= dl9 then VNil else VInt ((sch_now () - t0 + 500000000) / 1000000000))))
 // ConditionVariable under the scheduler, the way ruby's is: #wait puts the
 // thread in the variable's line and calls #sleep on the object it was given
 // (usually a Mutex, whose #sleep unlocks, waits and locks again); #signal
@@ -45233,10 +45294,19 @@ and lz_size_ops = fn (ops: Val list) -> fn (n: Val) ->
          | _ -> lz_size_ops rest VNil))
      else lz_size_ops rest VNil)
 
-// each zip argument as an Array, or VNil when one of them cannot answer #to_a
-// (which is the only case the lazy path cannot take).
 and lz_shown = fn (n: str) -> fn (args: Val list) ->
   arr_new (Cons (VStr (mkstr_h n), Cons (arr_new args, Nil)))
+// rb_cmperr names the other side's CLASS as its #to_s prints it (a class
+// may define its own, EnvUtil.labeled_class does), not the internal name
+and cmperr_cls = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VObj _ -> (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env)
+                       (VClass (display_cls world (dispatch_cls_of world v))) "to_s" Nil false with
+               | VStr h9 -> sget h9
+               | _ -> display_cls_msg world (dispatch_cls_of world v))
+  | _ -> class_name v
+// each zip argument as an Array, or VNil when one of them cannot answer #to_a
+// (which is the only case the lazy path cannot take).
 and lz_zip_args = fn env -> fn world -> fn (xs: Val list) ->
   let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
   arr_new (lz_zip_args_go env world nb9 xs)
