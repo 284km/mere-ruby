@@ -2777,12 +2777,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else
     let (meths, sup, ocls, ivars) = world in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-    if lv_has env name then lv_get env name
+    // (an implicit block parameter the running eval cannot see is no local)
+    let evon9 = map_has ev_active "n" && map_get ev_active "n" > 0 in
+    let hid9 = evon9 && numbered_digit name > 0 && implicit_hidden env name in
+    if (if hid9 then false else true) && lv_has env name then lv_get env name
     // `it` (ruby 3.4): inside a block with no parameters it names the first
     // argument -- the same value `_1` names. It is NOT a local variable (it
     // does not appear in #local_variables), so it is resolved here rather
     // than bound: a real local or method called `it` is found above and wins.
-    else if (str_len name == 2 && str_eq name "it") && lv_has env "_1" then lv_get env "_1"
+    else if (str_len name == 2 && str_eq name "it") && (if evon9 && implicit_hidden env "_1" then false else true) && lv_has env "_1" then lv_get env "_1"
     // (a name main's singleton class answers, ahead of Object's: main_sng_has)
     else if map_len hng_store > 0 && (match (if lv_has env "self" then lv_get env "self" else VMain) with VMain -> true | _ -> false)
             && main_sng_has world name then
@@ -6794,7 +6797,13 @@ and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
     // that frame is unknown or already gone (a proc whose home has returned).
     // __fid lives in the defining method's frame, so read it through the chain.
     let home = (if lv_has cenv "__fid" then (match lv_get cenv "__fid" with VInt t -> t | _ -> 0) else 0) in
-    if home == 0 then flow_rethrow "return" v
+    // (no method around it, inside a class or module body: there is nothing
+    //  to return from -- only the top level's own return ends the script)
+    if home == 0 && (if str_eq (cur_lex ()) "" then false else true) then
+      (let _ = raise_exc_iv world "LocalJumpError" "unexpected return"
+                 (Cons (("__exit_value", v), Cons (("__reason", VSym "return"), Nil))) in
+       flow_rethrow "return" v)
+    else if home == 0 then flow_rethrow "return" v
     // ⚠ ...but a home frame that has already RETURNED cannot be returned
     //   through: that is ruby's LocalJumpError, carrying the value as
     //   #exit_value and :return as #reason. Falling back to a plain return
@@ -14552,7 +14561,33 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      let tag9 = (if tagged9 && is_sng_cls tag0 && (str_len name == 3 && str_eq name "dup")
                  then (if map_has sup9 tag0 then map_get sup9 tag0 else "String")
                  else tag0) in
-     let _ = (if tagged9 then map_set hng_store (hng_key cp) tag9 else ()) in
+     // ...and a clone's singleton class is ITS OWN, a copy of the methods,
+     // modules and constants: it was the original's, so `def b.f` after
+     // `b = a.clone` redefined a.f too (test_keyword_duplicated)
+     let _ = (if tagged9 && is_sng_cls tag9 && (str_len name == 5 && str_eq name "clone") && (if str_eq (hng_key cp) "" then false else true) then
+                (let (meths9, _, _, _) = world in
+                 let nsng9 = "(sng:" ++ hng_key cp ++ ")" in
+                 let base9 = (if map_has sup9 tag9 then map_get sup9 tag9 else class_name recv) in
+                 let _ = set_sup sup9 nsng9 base9 in
+                 let _ = (if is_sng_cls base9 then () else map_set hng_sng_base (hng_key cp) base9) in
+                 let _ = (if map_has includes tag9 then map_set includes nsng9 (map_get includes tag9) else ()) in
+                 let _ = (if map_has prepends tag9 then map_set prepends nsng9 (map_get prepends tag9) else ()) in
+                 let mpre9 = tag9 ++ "#" in
+                 let tm9 = map_new () in
+                 let _ = map_iter meths9 (fn (k: str) -> fn (v: Meth) ->
+                           if str_len k > str_len mpre9 && str_eq (substring k 0 (str_len mpre9)) mpre9
+                           then map_set tm9 (nsng9 ++ "#" ++ substring k (str_len mpre9) (str_len k)) v
+                           else ()) in
+                 let _ = map_iter tm9 (fn (k: str) -> fn (v: Meth) -> set_meth meths9 k v) in
+                 let cpre9 = tag9 ++ "::" in
+                 let tc9 = map_new () in
+                 let _ = map_iter consts (fn (k: str) -> fn (v: Val) ->
+                           if str_len k > str_len cpre9 && str_eq (substring k 0 (str_len cpre9)) cpre9
+                           then map_set tc9 (nsng9 ++ "::" ++ substring k (str_len cpre9) (str_len k)) v
+                           else ()) in
+                 let _ = map_iter tc9 (fn (k: str) -> fn (v: Val) -> map_set consts k v) in
+                 map_set hng_store (hng_key cp) nsng9)
+              else if tagged9 then map_set hng_store (hng_key cp) tag9 else ()) in
      // ...and so does a CHILLED literal's state: #clone of one is chilled
      // too (it warns when mutated), #dup is an ordinary string
      let _ = (match (recv, cp) with
@@ -24801,6 +24836,53 @@ and sw_dyn_const = fn (n: str) ->
 and last_ns_seg = fn (n: str) ->
   let rec go = fn (i: int) -> (if i < 1 then n else if str_eq (char_at n i) ":" && str_eq (char_at n (i - 1)) ":" then substring n (i + 1) (str_len n) else go (i - 1)) in
   go (str_len n - 1)
+// ...asked of a whole program's class and module bodies (a refusal the
+// file's parse makes, as ruby's does: the program and a required file)
+and cb_ret_prog = fn (b: Stmt list) ->
+  match b with
+  | Nil -> false
+  | Cons (SClass (_, _, bd), r) -> cb_ret_stmts bd || cb_ret_prog bd || cb_ret_prog r
+  | Cons (SClassE (_, _, bd), r) -> cb_ret_stmts bd || cb_ret_prog bd || cb_ret_prog r
+  | Cons (_, r) -> cb_ret_prog r
+// a `return` reached in a class body's own code: through statements and
+// the expressions that run in place, never into a def, a nested class (its
+// own body is asked), a block or a lambda
+and cb_ret_stmts = fn (b: Stmt list) ->
+  match b with Nil -> false | Cons (s, r) -> cb_ret_stmt s || cb_ret_stmts r
+and cb_ret_stmt = fn (s: Stmt) ->
+  match s with
+  | SReturn _ -> true
+  | SExpr e -> cb_ret_expr e
+  | SAssign (_, e) -> cb_ret_expr e
+  | SIVarAssign (_, e) -> cb_ret_expr e
+  | SPuts es -> cb_ret_exprs es
+  | SWhile (c, bd) -> cb_ret_expr c || cb_ret_stmts bd
+  | SIf (cls, els) -> cb_ret_clauses cls || cb_ret_stmts els
+  | SBegin (bd, rs, els, ens) -> cb_ret_stmts bd || cb_ret_rescues rs || cb_ret_stmts els || cb_ret_stmts ens
+  | SAndThen (a, b2) -> cb_ret_stmt a || cb_ret_stmt b2
+  | SOrElse (a, b2) -> cb_ret_stmt a || cb_ret_stmt b2
+  | _ -> false
+and cb_ret_clauses = fn (cls: (Expr * Stmt list) list) ->
+  match cls with Nil -> false | Cons ((c, b), r) -> cb_ret_expr c || cb_ret_stmts b || cb_ret_clauses r
+and cb_ret_rescues = fn (rs: (str list * str * Stmt list) list) ->
+  match rs with Nil -> false | Cons ((_, _, b), r) -> cb_ret_stmts b || cb_ret_rescues r
+and cb_ret_exprs = fn (es: Expr list) ->
+  match es with Nil -> false | Cons (e, r) -> cb_ret_expr e || cb_ret_exprs r
+and cb_ret_expr = fn (e: Expr) ->
+  match e with
+  | EFlow (k, x) -> str_eq k "return" || cb_ret_expr x
+  | EStmt s -> cb_ret_stmt s
+  | ECall (_, args) -> cb_ret_exprs args
+  | EMethod (r, _, args) -> cb_ret_expr r || cb_ret_exprs args
+  | ESafe (r, _, args) -> cb_ret_expr r || cb_ret_exprs args
+  | EBin (_, a, b) -> cb_ret_expr a || cb_ret_expr b
+  | EUn (_, a) -> cb_ret_expr a
+  | ETern (a, b, c) -> cb_ret_expr a || cb_ret_expr b || cb_ret_expr c
+  | EArr xs -> cb_ret_exprs xs
+  | ERaise xs -> cb_ret_exprs xs
+  | EAssign (_, x) -> cb_ret_expr x
+  | ESplat x -> cb_ret_expr x
+  | _ -> false
 and static_why_stmt = fn (s: Stmt) -> fn (indef: bool) ->
   match s with
   | SAssign (n, e) ->
@@ -24845,8 +24927,11 @@ and static_why_stmt = fn (s: Stmt) -> fn (indef: bool) ->
                           && str_index_of n "::" < 0
                           && (let c0 = char_at n 0 in (if str_eq c0 ":" then false else true) && (if is_upper_first n then false else true)) ->
     "class/module name must be CONSTANT"
-  | SClass (_, _, bd) -> static_why_stmts bd false
-  | SClassE (_, _, bd) -> static_why_stmts bd false
+  // (a `return` in the body itself -- not in a method, block or lambda
+  //  there -- has nothing to return from: prism's "Invalid return in
+  //  class/module body", Feature #4840)
+  | SClass (_, _, bd) -> (if cb_ret_stmts bd then "Invalid return in class/module body" else static_why_stmts bd false)
+  | SClassE (_, _, bd) -> (if cb_ret_stmts bd then "Invalid return in class/module body" else static_why_stmts bd false)
   // (`class << (return)`: the object is a value that never comes)
   | SSingletonE (oe, bd) -> (if sw_void_expr oe then "unexpected void value expression" else static_why_stmts bd false)
   | SAndThen (a, b2) -> sw_first (static_why_stmt a indef) (fn (u: unit) -> static_why_stmt b2 indef)
@@ -24974,13 +25059,37 @@ and sw_void_stmts = fn (b: Stmt list) ->
   | Cons (s, r) -> (if sw_void_stmt s then true else sw_void_stmts r)
 and sw_rescues_void = fn (rs: (str list * str * Stmt list) list) ->
   match rs with Nil -> true | Cons ((_, _, bd), r) -> sw_void_stmts bd && sw_rescues_void r
+// a block's body, knowing whether the block takes numbered parameters: an
+// assignment to one there is "Can't assign to numbered parameter _1"
+// (`proc {_1; _1 = nil}`), where outside such a block `_1` is only reserved
+and numbered_misuse_blk = fn (bp: str list) -> fn (bb: Stmt list) ->
+  let saved9 = map_has num_misuse_note "inblk" in
+  let _ = (match bp with
+           | Nil -> (if max_numbered_stmts bb > 0 then map_set num_misuse_note "inblk" "1"
+                     else if saved9 then map_delete num_misuse_note "inblk" else ())
+           | _ -> (if saved9 then map_delete num_misuse_note "inblk" else ())) in
+  let r9 = numbered_param_named bp || numbered_misuse_stmts bb in
+  let _ = (if saved9 then map_set num_misuse_note "inblk" "1" else if map_has num_misuse_note "inblk" then map_delete num_misuse_note "inblk" else ()) in
+  r9
+// a parameter NAMED _1.._9 (`proc {|_3|}`, `def x(_4) end`): reserved
+and numbered_param_named = fn (ps: str list) ->
+  match ps with
+  | Nil -> false
+  | Cons (p9, r9) ->
+    (let n9 = pbase p9 in
+     if numbered_digit n9 > 0 then
+       (let _ = (if map_has num_misuse_note "why" then () else map_set num_misuse_note "why" (n9 ++ " is reserved for numbered parameters")) in true)
+     else numbered_param_named r9)
 and numbered_misuse_stmts = fn (body: Stmt list) ->
   match body with Nil -> false | Cons (s, r) -> numbered_misuse_stmt s || numbered_misuse_stmts r
 and numbered_misuse_stmt = fn (s: Stmt) ->
   match s with
   // (`_1 = 0`: ruby's "_1 is reserved for numbered parameters")
   | SAssign (n, e) -> (if numbered_digit n > 0 then
-                         (let _ = (if map_has num_misuse_note "why" then () else map_set num_misuse_note "why" (n ++ " is reserved for numbered parameters")) in true)
+                         (let _ = (if map_has num_misuse_note "why" then ()
+                                   else map_set num_misuse_note "why"
+                                          (if map_has num_misuse_note "inblk" then "Can't assign to numbered parameter " ++ n
+                                           else n ++ " is reserved for numbered parameters")) in true)
                        else numbered_misuse_expr e)
   | SExpr e -> numbered_misuse_expr e
   | SIVarAssign (_, e) -> numbered_misuse_expr e
@@ -24988,6 +25097,12 @@ and numbered_misuse_stmt = fn (s: Stmt) ->
   | SPuts es -> numbered_misuse_exprs es
   | SWhile (c, b) -> numbered_misuse_expr c || numbered_misuse_stmts b
   | SIf (clauses, els) -> numbered_misuse_clauses clauses || numbered_misuse_stmts els
+  // (...and a method NAMED one: `def _5; end`, `def self._6; end`)
+  | SDef (nm9, ps, _, _) ->
+    (let rec ld9 = fn (k: int) -> (if k < 0 then k else if str_eq (char_at nm9 k) "." then k else ld9 (k - 1)) in
+     let i9 = ld9 (str_len nm9 - 1) in
+     let b9 = (if i9 >= 0 then substring nm9 (i9 + 1) (str_len nm9) else nm9) in
+     numbered_param_named (Cons (b9, ps)))
   | _ -> false
 and numbered_misuse_clauses = fn (clauses: (Expr * Stmt list) list) ->
   match clauses with Nil -> false | Cons ((c, b), r) -> numbered_misuse_expr c || numbered_misuse_stmts b || numbered_misuse_clauses r
@@ -25055,10 +25170,14 @@ and blk_num_bad = fn (bp: str list) -> fn (bb: Stmt list) ->
   // cases differently (the spec matches on the wording).
   (let bad9 = (match bp with
                | Nil -> max_numbered_stmts bb > 0 && uses_it_stmts bb
-               | _ -> max_numbered_stmts bb > 0 || uses_it_stmts bb) in
+               // (a parameter NAMED it is that parameter: `proc {|it| it}`)
+               | _ -> max_numbered_stmts bb > 0
+                      || (uses_it_stmts bb && (if bp_names_it bp then false else true))) in
    let _ = (if bad9 && (if map_has num_misuse_note "why" then false else true)
             then (let _ = map_set num_misuse_note "why" (numbered_misuse_why bp bb) in ()) else ()) in
    bad9)
+and bp_names_it = fn (bp: str list) ->
+  match bp with Nil -> false | Cons (p9, r9) -> str_eq (pbase p9) "it" || bp_names_it r9
 // a numbered param referenced in THIS block's scope (does not descend into a
 // nested block/lambda body, which starts its own numbered-param scope).
 and own_num_stmts = fn (b: Stmt list) -> match b with Nil -> 0 | Cons (s, r) -> imax (own_num_stmt s) (own_num_stmts r)
@@ -25134,8 +25253,8 @@ and numbered_misuse_expr = fn (e: Expr) ->
      // (and `->{it + _2}` mixes the two ways, as a block's body may not)
      | Nil -> blk_num_bad Nil b || num_nested_bad b || numbered_misuse_stmts b
      | _ -> if blk_num_bad ps b then true else numbered_misuse_stmts b)
-  | ECallB (_, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_exprs args || numbered_misuse_stmts bb
-  | EMethodB (r, _, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_expr r || numbered_misuse_exprs args || numbered_misuse_stmts bb
+  | ECallB (_, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_exprs args || numbered_misuse_blk bp bb
+  | EMethodB (r, _, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_expr r || numbered_misuse_exprs args || numbered_misuse_blk bp bb
   | EBin (_, a, b) -> numbered_misuse_expr a || numbered_misuse_expr b
   | EUn (_, a) -> numbered_misuse_expr a
   | ECall (_, args) -> numbered_misuse_exprs args
@@ -46602,7 +46721,9 @@ and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn 
             then (let _ = (if has_default defaults p
                            then declare_nils frame (expr_pat_vars (get_default defaults p)) else ()) in
                   hash_get kwhash (VSym nm))
-            else if has_default defaults p then eval_e frame world blk (get_default defaults p) else VNil in
+            // (declared as nil before its default runs, as a positional one
+            //  is: `def m(bar: bar)` reads nil)
+            else if has_default defaults p then (let _ = map_set frame nm VNil in eval_e frame world blk (get_default defaults p)) else VNil in
     let _ = map_set frame nm v in bind_kw_params frame world blk rest defaults kwhash
 
 // bind_params for a METHOD call, with the callee marked as the frame a raise
@@ -49585,6 +49706,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                    let tk = number_nls src (lex_src src) in
                    let _ = parse_line_reset (count_nls tk) in
                    let r = parse_stmts tk Nil in
+                   let _ = (match r with (pg9, _) -> if cb_ret_prog pg9 then syn_refuse "Invalid return in class/module body" else ()) in
                    let _ = map_set pok "y" 1 in r)
                 (Nil, Nil) in
        let _ = map_set load_ctx "parsing" (mkstr "") in
@@ -51380,7 +51502,12 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
 // run an eval'd program with the position it was TOLD it has, restoring the
 // caller's afterwards (an eval inside an eval must not keep the inner one's).
 and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (efile: str) -> fn (eline: int) ->
-  if str_eq efile "" then eval_run env world blk prog2
+  // (run in a class or module body, outside any method, the eval'd code's
+  //  own `return` has nothing to return from: ruby's LocalJumpError)
+  if (if lv_has env "__meth" then false else true) && (if str_eq (cur_lex ()) "" then false else true)
+     && cb_ret_stmts prog2 then
+    raise_exc_iv world "LocalJumpError" "unexpected return" (Cons (("__reason", VSym "return"), Nil))
+  else if str_eq efile "" then eval_run env world blk prog2
   else
     // the parsed program carries an SFile naming the eval'd SOURCE, which
     // would overwrite the file the caller named the moment it runs.
@@ -51411,7 +51538,33 @@ and bnd_capture = fn env ->
            else (let _ = map_set snap9 "__blex" (mkstr (cur_lex ())) in
                  map_set snap9 "__bnest" (mkstr (cur_nest ())))) in
   snap9
+// An eval'd program runs in its caller's env, and the caller's block
+// parameters are not the program's: `[1].each { eval("_1") }` and
+// `eval("it")` there are NameErrors. The env is marked while the program runs
+// (implicit_hidden stops at the mark), and the mark is taken off however it
+// ends.
 and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
+  if map_has env "__evtop" then eval_run0 env world blk prog2
+  else
+    (let _ = map_set env "__evtop" VNil in
+     let _ = map_set ev_active "n" ((if map_has ev_active "n" then map_get ev_active "n" else 0) + 1) in
+     let ok9 = map_new () in
+     let r9 = try_or (fn (u: unit) -> (let v9 = eval_run0 env world blk prog2 in let _ = map_set ok9 "y" 1 in v9)) VNil in
+     let _ = map_delete env "__evtop" in
+     let _ = map_set ev_active "n" (map_get ev_active "n" - 1) in
+     if map_has ok9 "y" then r9
+     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (passed on past an eval)")) in
+           fail "mere-ruby: (passed on past an eval)"))
+// is the implicit parameter `name` (_1.._9, "_1" for `it`) found only past
+// a running eval's own env? Then the eval'd code does not see it.
+and implicit_hidden = fn env -> fn (name: str) ->
+  if map_has env "__evtop" then true
+  else if map_has env name then false
+  else
+    (match (if map_has env "__eid" then map_get env "__eid" else VNil) with
+     | VInt n9 -> (if map_has lv_up n9 then implicit_hidden (map_get lv_up n9) name else false)
+     | _ -> false)
+and eval_run0 = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
   // Ruby hoists an eval'd string's local-variable assignments at parse time,
   // so a read that lexically precedes the assignment (or a nested eval sharing
   // the same binding) sees nil rather than a NameError.
@@ -51475,8 +51628,9 @@ and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
       else if home != 0 then
         (let _ = raise_exc_iv world "LocalJumpError" "unexpected return"
                    (Cons (("__exit_value", v), Cons (("__reason", VSym "return"), Nil))) in VNil)
-      // (at the top level ruby ends the program; here the eval ends, as before)
-      else v)
+      // ...and at the top level it ends the program, as the top level's own
+      // return does (the driver takes the flow; see gc_drive)
+      else (let _ = flow_rethrow "return" v in VNil))
    | other -> flow_value other)
 
 // park a flow kind+value and unwind via fail; a runner up the stack
