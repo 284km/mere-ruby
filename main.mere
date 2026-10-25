@@ -19439,6 +19439,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (match args with
        | Cons (VInt i9, _) -> (let n9 = sym_name_of_id i9 in if str_eq n9 "" then VNil else VSym n9)
        | _ -> VNil)
+    // ObjectSpace.__str_of_id(id): the String whose object_id it is (2000000
+    // + its handle * 8, see #object_id), or nil -- _id2ref reads a String's id
+    // back, as ruby's does (test_id2ref_geniv_liveness, ruby 4.0.9)
+    else if str_eq c "ObjectSpace" && (str_len name == 11 && str_eq name "__str_of_id") then
+      (match args with
+       | Cons (VInt i9, _) ->
+         (let d9 = i9 - 2000000 in
+          let h9 = d9 / 8 in
+          if d9 >= 0 && h9 * 8 == d9 && h9 >= handle_base && h9 - handle_base < str_count () then VStr h9 else VNil)
+       | _ -> VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 9 && str_eq name "__objects") then
       (let (_, sup9, ocls9, _) = world in
        let want9 = (match args with Cons (VClass w9, _) -> w9 | _ -> "") in
@@ -23667,7 +23677,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else VNil)
     // currying a curried proc curries the proc BEHIND it, not the collector.
     else if map_has curry_target (str_of_int pid) && (str_len name == 5 && str_eq name "curry") then
-      (let tgt8 = (match map_get curry_target (str_of_int pid) with VInt t -> t | _ -> 0) in
+      (let args = curry_int_arg env world blk args in
+       let tgt8 = (match map_get curry_target (str_of_int pid) with VInt t -> t | _ -> 0) in
        let ar8 = (match args with
                   | Cons (VInt n, _) -> n
                   | _ -> (match map_get curry_arity (str_of_int pid) with VInt n -> n | _ -> 0)) in
@@ -23679,7 +23690,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       // never be satisfied. A non-lambda proc is not strict and takes any n,
       // and a variadic lambda has no fixed count to disagree with -- so the
       // check is exactly "a lambda with a fixed arity, given a different one".
-      (let nat9 = (match invoke_val_c env world blk recv "arity" Nil false with
+      (let args = curry_int_arg env world blk args in
+       let nat9 = (match invoke_val_c env world blk recv "arity" Nil false with
                    | VInt a -> a
                    | _ -> 0) in
        let _ = (match args with
@@ -27208,7 +27220,19 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          (match recv with
           | VStr h ->
             (if str_len name == 7 then (match unpack_call env world h 2 args with Cons (v, _) -> v | Nil -> VNil)
-             else iter_each_result (arr_each world blk newblk (unpack_call env world h 1 args)) VNil)
+             // (a block that changes the string is refused after the value it
+             //  was handed, as ruby 4.0.9 does: [Bug #22315])
+             else (let n9 = str_blen h in
+                   let rec go9 = fn (xs: Val list) ->
+                     (match xs with
+                      | Nil -> FNext VNil
+                      | Cons (v9, t9) ->
+                        (match run_block_turn1 world blk newblk v9 with
+                         | FBreak b9 -> FBreak b9
+                         | FReturn r9 -> FReturn r9
+                         | _ -> (if str_blen h == n9 then go9 t9
+                                 else (let _ = raise_exc world "RuntimeError" "string modified" in FNext VNil)))) in
+                   iter_each_result (go9 (unpack_call env world h 1 args)) VNil))
           | _ -> recv)
        else builtin_iter world blk newblk recv name args))
 
@@ -27994,6 +28018,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
            | Cons (a1, Cons (a2, _)) -> (a1, a2, VNil)
            | Cons (a1, _) -> (a1, VNil, VNil)
            | Nil -> (VNil, VNil, VNil)) in
+        let enc_src_len9 = str_blen h in
         let optv = fn (k: str) ->
           (match opts with
            | VHsh oh -> (match hash_lookup (hderef oh) (VSym k) with (true, v) -> v | _ -> VNil)
@@ -28242,6 +28267,9 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                                 | VProc _ -> invoke_val_c env world nb fbv "call" (Cons (ch, Nil)) false
                                 | VObj _ -> (if responds world fbv "[]" then invoke_val_c env world nb fbv "[]" (Cons (ch, Nil)) false else VNil)
                                 | _ -> VNil) in
+                     // ...and a fallback that changed the string being
+                     // converted is refused (ruby 4.0.9, [Bug #22330])
+                     let _ = (if str_blen h == enc_src_len9 then () else (let _ = raise_exc world "RuntimeError" "string modified" in ())) in
                      // what it answers must BE a String (#to_str, never #to_s)
                      let fb = (match fb0 with
                                | VNil -> VNil
@@ -38483,6 +38511,18 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
 // top-level method call: fresh frame, no self; blk is installed for yield.
 // A strict callable's #curry count has to fit its #parameters: at least the
 // required ones, and at most required + optional unless there is a rest.
+// curry's arity is an Integer by #to_int, asked once (ruby 4.0.9:
+// `proc { |x, *y| x }.curry(1r)` curries one, and an object with #to_int is
+// asked exactly once, test_curry_arity_to_int)
+and curry_int_arg = fn env -> fn world -> fn blk -> fn (args: Val list) ->
+  match args with
+  | Cons (VInt _, _) -> args
+  | Cons (VNil, _) -> args
+  | Cons (a9, rest9) ->
+    (match invoke_val_c env world blk a9 "to_int" Nil false with
+     | VInt n9 -> Cons (VInt n9, rest9)
+     | _ -> args)
+  | Nil -> args
 and curry_bounds_check = fn env -> fn world -> fn blk -> fn (callable: Val) -> fn (n9: int) ->
   let ps9 = (match invoke_val_c env world blk callable "parameters" Nil false with
              | VArr pa9 -> deref pa9
@@ -43138,9 +43178,15 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
            | _ -> lz_step_ops env world blk did rest (i + 1) r)
         // ...and so is anything that answers both #each and #force (a lazy
         // enumerator), as ruby's lazy flat_map flattens it
-        | VObj lo9 when (let (_, _, oc9, _) = world in str_eq (map_get oc9 lo9) "Enumerator::Lazy")
-                        || (responds world r "each" && responds world r "force") ->
+        | VObj lo9 when (let (_, _, oc9, _) = world in str_eq (map_get oc9 lo9) "Enumerator::Lazy") ->
           (match invoke_val_c env world blk r "force" Nil false with
+           | VArr faid -> lz_emit_each env world blk did rest (i + 1) (deref faid)
+           | r2 -> lz_step_ops env world blk did rest (i + 1) r2)
+        // ...any other object with both is walked by its own #each, whose
+        // block answers the element (ruby 4.0.9's test_flat_map_non_array:
+        // an #each that keeps the block and calls it later)
+        | VObj _ when responds world r "each" && responds world r "force" ->
+          (match invoke_val_c env world blk (VClass "Enumerator::Lazy") "__fm_each" (Cons (r, Nil)) false with
            | VArr faid -> lz_emit_each env world blk did rest (i + 1) (deref faid)
            | r2 -> lz_step_ops env world blk did rest (i + 1) r2)
         | _ -> lz_step_ops env world blk did rest (i + 1) r))
@@ -50009,6 +50055,13 @@ and pending_exc = fn world ->
                            VObj id9)
                         | _ -> e9)
                      else e9) in
+           // ...and an EncodingError whose #initialize the program redefined is
+           // made by #new, which runs it (ruby 4.0.9's test_intern_is_not_leaf:
+           // interning an invalid String raises through it)
+           let e9 = (match e9 with
+                     | VExc (c9, m9) when str_eq c9 "EncodingError" && has_meth world "EncodingError" "initialize" ->
+                       invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) (VClass "EncodingError") "new" (Cons (mkstr m9, Nil)) false
+                     | _ -> e9) in
            let _ = note_prim_bt world e9 in
            // ...with the exception being handled as its cause (see raise_exc)
            match exc_with_cause world e9 with
@@ -51365,6 +51418,24 @@ and rxp_all_seq = fn (g: int) -> fn (xs: RNode list) ->
   match xs with Nil -> false | Cons (x, t) -> rxp_all_call g x || rxp_all_seq g t
 and rxp_all_alts = fn (g: int) -> fn (xs: RNode list) ->
   match xs with Nil -> true | Cons (x, t) -> rxp_all_call g x && rxp_all_alts g t
+// the quantifiers ruby gives an id of its own: range = a finite upper bound
+// above one ({0,100}), else the loops whose body may match nothing (a null
+// check guards each turn)
+and rxp_count_rep = fn (n: RNode) -> fn (range: bool) ->
+  match n with
+  | NRep (b, _, hi, _) ->
+    (if range then (if hi > 1 then 1 else 0) else (if hi == 0 - 1 && rxc_nullable b then 1 else 0)) + rxp_count_rep b range
+  | NSeq xs -> rxp_count_reps xs range
+  | NAlt xs -> rxp_count_reps xs range
+  | NGroup (b, _, _) -> rxp_count_rep b range
+  | NLook (b, _) -> rxp_count_rep b range
+  | NLookB (b, _) -> rxp_count_rep b range
+  | NAtomic b -> rxp_count_rep b range
+  | NAbsent b -> rxp_count_rep b range
+  | NCond (_, a, b) -> rxp_count_rep a range + rxp_count_rep b range
+  | _ -> 0
+and rxp_count_reps = fn (xs: RNode list) -> fn (range: bool) ->
+  match xs with Nil -> 0 | Cons (x, t) -> rxp_count_rep x range + rxp_count_reps t range
 and rxp_parse = fn (pat: str) -> fn (fl: str) ->
   let _ = map_clear rx_gnodes in
   let _ = map_clear rx_gnums in
@@ -51380,6 +51451,11 @@ and rxp_parse = fn (pat: str) -> fn (fl: str) ->
   else if map_has rx_named_mode "ref" && map_get rx_named_mode "ref" > g - 1 then
     (let _ = rxp_refuse "invalid backref number/name" in n)
   else if (let w9 = rxp_calls_why n in if str_eq w9 "" then false else (let _ = rxp_refuse w9 in true)) then n
+  // ruby 4.0.9's Onigmo numbers its range repeats and its null checks in a
+  // 16-bit id, and refuses a pattern that needs more than 32767 of either
+  // (4.0.6 wrapped the id round)
+  else if (let rr9 = rxp_count_rep n true in rr9 > 32767) then (let _ = rxp_refuse "too many range repeat" in n)
+  else if (let nc9 = rxp_count_rep n false in nc9 > 32767) then (let _ = rxp_refuse "too many null check" in n)
   else if str_contains fl "i" || str_contains pat "(?i" || str_contains pat "i)" || str_contains pat "i:" then rxf_node n
   else n
 
