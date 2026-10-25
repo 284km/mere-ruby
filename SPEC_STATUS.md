@@ -40,7 +40,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/comparable | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/complex | 42 | 0 | 0 | 1 | 0 | 43 |
 | core/env | 44 | 0 | 0 | 1 | 0 | 45 |
-| core/exception | 37 | 2 | 0 | 0 | 0 | 39 |
+| core/exception | 38 | 1 | 0 | 0 | 0 | 39 |
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/float | 47 | 0 | 0 | 3 | 0 | 50 |
 | core/integer | 59 | 1 | 0 | 9 | 1 | 70 |
