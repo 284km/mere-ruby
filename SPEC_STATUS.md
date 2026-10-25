@@ -13,7 +13,7 @@ implementations' tags files. Per-file DIFF/CRASH lists live in `mspec/tags/`.
 - **SLOW** stopped by one of this harness's bounds — CPU seconds, wall clock or bytes —
   and so working, not aborting. The row in `mspec/tags/` names which bound answered.
 
-Measured against **ruby 4.0.6** (tools/ref_ruby.sh). The reference is part
+Measured against **ruby 4.0.9** (tools/ref_ruby.sh). The reference is part
 of the subject: a row measured against another release is not comparable with the
 ones around it, and the difference reads as movement in mere-ruby.
 
@@ -88,7 +88,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/time | 61 | 2 | 0 | 3 | 0 | 66 |
 | core/io | 78 | 2 | 0 | 1 | 0 | 81 |
 | library/date | 60 | 0 | 0 | 38 | 0 | 98 |
-| library/etc | 11 | 1 | 0 | 7 | 0 | 19 |
+| library/etc | 12 | 0 | 0 | 7 | 0 | 19 |
 | library/pathname | 18 | 0 | 0 | 2 | 0 | 20 |
 | library/stringio | 61 | 1 | 0 | 2 | 0 | 64 |
 | library/cgi | 8 | 0 | 0 | 7 | 0 | 15 |
