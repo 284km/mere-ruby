@@ -3866,10 +3866,10 @@ and dispatch_cls_of = fn world -> fn (recv: Val) ->
 and no_singleton_here = fn world -> fn (recv: Val) -> fn (fallback: str) ->
   let _ = (match recv with
            | VRat (_, _) -> raise_exc_iv world "FrozenError"
-               ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+               ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ inspect recv)
                (Cons (("__recv", recv), Nil))
            | VCpx (_, _) -> raise_exc_iv world "FrozenError"
-               ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+               ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ inspect recv)
                (Cons (("__recv", recv), Nil))
            | _ -> raise_exc world "TypeError" "can't define singleton") in
   fallback
@@ -4029,7 +4029,10 @@ and anc_has = fn (anc: str list) -> fn (want: str) ->
 and lookup_anc_above = fn world -> fn (anc: str list) -> fn (from: str) -> fn (name: str) ->
   match anc with
   | Nil -> ""
-  | Cons (a, rest) -> if str_eq a from then lookup_anc world rest name
+  // (an `undef` above stops the walk: it is an entry that says "no method",
+  //  so super from below it is "no superclass method", as in ruby)
+  | Cons (a, rest) -> if str_eq a from then
+                        (if map_len undefs > 0 && undef_blocked_anc world rest name then "" else lookup_anc world rest name)
                       else lookup_anc_above world rest from name
 and make_unbound_method = fn world -> fn (cls: str) -> fn (nm: str) ->
   let (_, _, ocls0, ivars0) = world in
@@ -5381,14 +5384,31 @@ and stdlib_src = fn (name: str) ->
     "  # `Data.define(:a) \{ def initialize(a:); super; end }` work. A block-defined\n" ++
     "  # initialize lands on the generated class and its `super` reaches this one; if\n" ++
     "  # the generated method were on the same class the block would replace it.\n" ++
+    // A member is a Symbol, a String or something with #to_str (rb_to_symbol);
+    // a writer's name and a repeated one are refused. The values live in ONE
+    // hidden Hash, @__dv, not in `@<member>`: a member may be any Symbol
+    // (`Data.define(:@a)` made `@@a`), and a data has no instance variables.
     "  def self.define(*names, &blk)\n" ++
-    "    syms = names.map \{ |n| n.to_sym }\n" ++
+    "    syms = []\n" ++
+    "    names.each do |n|\n" ++
+    "      sym = if Symbol === n then n\n" ++
+    "            elsif String === n then n.to_sym\n" ++
+    "            elsif n.respond_to?(:to_str) then n.to_str.to_sym\n" ++
+    "            else raise TypeError, \"#\{n.inspect} is not a symbol nor a string\"\n" ++
+    "            end\n" ++
+    "      raise ArgumentError, \"invalid data member: #\{sym}\" if sym.to_s.end_with?(\"=\")\n" ++
+    "      raise ArgumentError, \"duplicate member: #\{sym}\" if syms.include?(sym)\n" ++
+    "      syms << sym\n" ++
+    "    end\n" ++
     "    c = Class.new(self)\n" ++
     "    c.instance_variable_set(:@__members, syms)\n" ++
     "    c.define_singleton_method(:members) \{ @__members || superclass.members }\n" ++
     "    syms.each do |s|\n" ++
-    "      c.send(:define_method, s) \{ instance_variable_get(\"@#\{s}\") }\n" ++
+    "      c.send(:define_method, s) \{ @__dv ? @__dv[s] : nil }\n" ++
     "    end\n" ++
+    // (a defined class is not a place to define another: rb_undef_method on
+    //  its singleton, so it does not respond to ::define)
+    "    c.singleton_class.send(:undef_method, :define)\n" ++
     "    c.class_eval(&blk) if blk\n" ++
     "    c\n" ++
     "  end\n" ++
@@ -5439,19 +5459,27 @@ and stdlib_src = fn (name: str) ->
     "    unless extra.empty?\n" ++
     "      raise ArgumentError, \"unknown keyword#\{extra.size > 1 ? 's' : ''}: #\{extra.map \{ |x| shown[x].inspect }.join(', ')}\"\n" ++
     "    end\n" ++
-    "    ms.each \{ |m| instance_variable_set(\"@#\{m}\", vals[m]) }\n" ++
+    "    dv = \{}\n" ++
+    "    ms.each \{ |m| dv[m] = vals[m] }\n" ++
+    "    @__dv = dv\n" ++
     "    freeze\n" ++
     "  end\n" ++
+    // a copy is frozen too, whatever clone(freeze: false) asked
+    "  def initialize_copy(o)\n" ++
+    "    @__dv = o.instance_variable_get(:@__dv)\n" ++
+    "    freeze\n" ++
+    "  end\n" ++
+    "  private :initialize_copy\n" ++
     "\n" ++
     "  def members; self.class.members; end\n" ++
     "\n" ++
     "  def to_h(&b)\n" ++
     "    h = \{}\n" ++
-    "    self.class.members.each \{ |m| h[m] = instance_variable_get(\"@#\{m}\") }\n" ++
+    "    self.class.members.each \{ |m| h[m] = @__dv ? @__dv[m] : nil }\n" ++
     "    b ? h.to_h(&b) : h\n" ++
     "  end\n" ++
     "\n" ++
-    "  def deconstruct; self.class.members.map \{ |m| instance_variable_get(\"@#\{m}\") }; end\n" ++
+    "  def deconstruct; self.class.members.map \{ |m| @__dv ? @__dv[m] : nil }; end\n" ++
     "  # ⚠ NOT `to_h.slice(*ks)`: a pattern match asks for the keys it is about to\n" ++
     "  # bind and STOPS at the first one this data has no member for -- and answers\n" ++
     "  # \{} outright when more keys are asked than there are members, because then\n" ++
@@ -5519,11 +5547,19 @@ and stdlib_src = fn (name: str) ->
     "    return \"#<data #\{nm || Module.instance_method(:inspect).bind_call(self.class)}:...>\" if seen[__id__]\n" ++
     "    seen[__id__] = true\n" ++
     "    begin\n" ++
-    "      body = ms.map \{ |m| \"#\{m}=#\{instance_variable_get(\"@#\{m}\").inspect}\" }.join(\", \")\n" ++
+    // (a member that is no local's or constant's name is written as its
+    //  Symbol, rb_struct_inspect's rule; and the separator after the name is
+    //  there only before a member, so an anonymous memberless data is
+    //  `#<data >` and a named one `#<data F>`)
+    "      body = ms.map do |m|\n" ++
+    "        t = m.to_s\n" ++
+    "        plain = !t.empty? && !(t[0] =~ /\\d/) && t.each_char.all? \{ |ch| ch =~ /\\w/ || ch.ord >= 128 }\n" ++
+    "        \"#\{plain ? t : m.inspect}=#\{(@__dv ? @__dv[m] : nil).inspect}\"\n" ++
+    "      end.join(\", \")\n" ++
     "    ensure\n" ++
     "      seen.delete(__id__)\n" ++
     "    end\n" ++
-    "    \"#<data#\{nm ? \" #\{nm}\" : \"\"}#\{body.empty? ? \"\" : \" #\{body}\"}>\"\n" ++
+    "    \"#<data #\{nm ? nm : \"\"}#\{nm && !body.empty? ? \" \" : \"\"}#\{body}>\"\n" ++
     "  end\n" ++
     "  alias_method :to_s, :inspect\n" ++
     "end\n" ++
@@ -13454,9 +13490,6 @@ and stdlib_src = fn (name: str) ->
     "      names = obj.instance_variables.reject \{ |n| n.to_s.start_with?(\"@__\") }\n" ++
     "      if Exception === obj\n" ++
     "        names = names.reject \{ |n| n == :@message || n.to_s.start_with?(\"@__\") }\n" ++
-    "      elsif defined?(::Data) && ::Data === obj\n" ++
-    "        ms = obj.class.members.map \{ |m| :\"@#\{m}\" }\n" ++
-    "        names = names - ms\n" ++
     "      end\n" ++
     "      names\n" ++
     "    end\n" ++
@@ -14275,7 +14308,9 @@ and stdlib_src = fn (name: str) ->
     "          vals << object\n" ++
     "        end\n" ++
     "        if is_data\n" ++
-    "          ms.each_with_index \{ |m, i| v.instance_variable_set(:\"@#\{m}\", vals[i]) }\n" ++
+    "          dv = \{}\n" ++
+    "          ms.each_with_index \{ |m, i| dv[m] = vals[i] }\n" ++
+    "          v.instance_variable_set(:@__dv, dv)\n" ++
     "          Marshal.__freeze(v)\n" ++
     "        else\n" ++
     "          vals.each_with_index \{ |x, i| v[i] = x }\n" ++

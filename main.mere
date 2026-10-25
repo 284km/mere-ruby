@@ -1934,6 +1934,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          && autoload_fire env world blk ak9
       then eval_e env world blk (EConst name)
       else if (if str_eq key "" then false else true) then (let _ = const_read_note world key in map_get consts key)
+      // ⚠ a class under BasicObject does not see the top level: ruby's walk
+      //   is the lexical scopes (not the top one), then the cref's ancestors,
+      //   and Object is not among them. `class PO < BasicObject; def m;
+      //   Object; end; end` is "uninitialized constant PO::Object", and a
+      //   string instance_eval'd on such an object answers the same.
+      else if map_has consts name && (if str_list_has nests9 "Object" then false else true)
+              && bo_root world (if str_eq iec9 "" then cref else iec9) 0 then
+        (let ow9 = (if str_eq iec9 "" then cref else if is_sng_cls iec9 then sng_supername world iec9 else iec9) in
+         raise_uninit_const world ow9 name ("uninitialized constant " ++ ow9 ++ "::" ++ name))
       else if map_has consts name then (let _ = const_read_note world name in map_get consts name)
       // an autoload registered ANYWHERE along the lexical nesting, or at top
       // level. Only the innermost cref and the bare name were tried, so a
@@ -2067,7 +2076,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if truthy (eval_e env world blk cond) then eval_e env world blk then_e
     else eval_e env world blk else_e
   | ECaseNone -> VNil   // only meaningful as an SCase subject marker
-  | EDefined e ->
+  | EDefined e0 ->
+    // (a literal's tags -- `"x".__lit_fsl~off` under frozen_string_literal:
+    //  false, the encoding ones -- are not calls: defined? asked whether
+    //  String had a method `__lit_fsl~off`, and `defined?(1.to_i("x"))` was nil)
+    let e = lit_unwrap e0 in
     // A desugared string or regexp LITERAL answers "expression", not the `+`
     // chain (nor the `.__regex` call) it is built from. The lexer opens both
     // with an empty TStrL, so the leftmost leaf of the chain marks it -- and
@@ -2143,8 +2156,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           if str_eq k "!" || str_eq k "~" then mkstr "global-variable"
           // $& / $` / $' are READ OUT of $~, so they are defined exactly when
           // the last match succeeded -- not when a slot of their own exists.
-          else if str_eq k "&" || str_eq k "`" || str_eq k "'" || str_eq k "+" then
+          else if str_eq k "&" || str_eq k "`" || str_eq k "'" then
             (if truthy (rx_md_get ()) then mkstr "global-variable" else VNil)
+          // ...and $+ is the last group that matched: none (no groups, or
+          // none of them took part) is nil, as for $1
+          else if str_eq k "+" then
+            (if truthy (rx_md_get ()) && truthy (eval_e env world blk (EVar name)) then mkstr "global-variable" else VNil)
           else if str_len k == 1 && k >= "1" && k <= "9" then
             (if map_has globals k && truthy (map_get globals k) then mkstr "global-variable" else VNil)
           else if map_has globals k then mkstr "global-variable" else VNil)
@@ -2167,6 +2184,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if is_upper_first name then eval_e env world blk (EDefined (EConst name))
        else if lv_has env name then mkstr "local-variable"
        else if is_method_defined env world name || is_kernel_builtin name || defined_self_has env world name || defined_self_rtm env world name then mkstr "method"
+       // (a refined method where the refinement is active, private or not)
+       else if map_len ref_active > 0 && (if str_eq (refined_impl_for world (lv_get env "self") name) "" then false else true) then mkstr "method"
        else VNil
      // (every argument has to be defined first -- see defined_args_ok)
      // ...and a call (with parentheses or without -- the bare name above)
@@ -2211,7 +2230,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                  // `module Q; autoload :R, f`, `defined?(R)` is "constant"
                  // without loading anything
                  || (let k9 = lex_autoload_key cref9 name in
-                     if str_eq k9 "" then false else autoload_pending world k9)) then mkstr "constant"
+                     if str_eq k9 "" then false else autoload_pending world k9)
+                 // ...and one registered in an ANCESTOR of the scope: a
+                 // subclass (or an object's singleton) asks its superclass's
+                 // autoload, [ruby-core:35509]
+                 || (map_len autoloads > 0 && (if str_eq cref9 "" then false else true)
+                     && (let rec any9 = fn (xs: str list) ->
+                           (match xs with
+                            | Nil -> false
+                            | Cons (a9, t9) -> (if str_eq a9 "Object" then false else autoload_pending world (a9 ++ "::" ++ name)) || any9 t9) in
+                         // (a singleton's body has the scope "N::(sng:id)":
+                         //  its ancestors are the singleton's)
+                         any9 (ancestors_of world (let i9 = str_find_from cref9 "(sng:" 0 in
+                                                  if i9 > 0 then substring cref9 i9 (str_len cref9) else cref9))))) then mkstr "constant"
         else if str_contains name "::" then
           // ⚠ a PRIVATE constant is not defined? through the scope operator --
           // the whole point of private_constant is that `M::X` cannot see it,
@@ -2248,6 +2279,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // A throw/break/next in the receiver, however, escapes normally.
        let rv = defined_eval_recv env world blk recv in
        if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) then VNil else
+       // (a refined public method, where the refinement is active)
+       if map_len ref_active > 0 && (if str_eq (refined_impl_for world rv name) "" then false else true)
+          && (if str_eq (refined_impl_for world rv name) "" then false else (if meth_private world (refined_impl_for world rv name) name then false else true))
+       then mkstr "method" else
        (match rv with
         | VObj id ->
           // ruby answers `defined?(o.m)` by ASKING the object: a singleton or
@@ -2270,7 +2305,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
            //   (...through rb_check_funcall: an object that overrides
            //   #respond_to? is first asked whether it responds to
            //   :respond_to_missing? at all, and a no is nil)
-           else if responds_real world rv name then mkstr "method"
+           else if (let _ = rt_dep_warn world rv cls in responds_real world rv name) then mkstr "method"
            else if has_meth world cls "respond_to_missing?"
                    && (if has_meth world cls "respond_to?"
                        then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) rv
@@ -2292,7 +2327,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           (let cls9 = dispatch_cls_of world rv in
            if has_meth world cls9 name then
              (if meth_private world cls9 name then VNil else mkstr "method")
-           else if responds world rv name then mkstr "method"
+           else if (let _ = rt_dep_warn world rv cls9 in responds world rv name) then mkstr "method"
            else VNil))
      | EScopedRead (recv, cn) ->
        // defined?(recv::Const): the receiver may raise or be a non-class
@@ -3664,7 +3699,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                    && (if delete_is_noop env world recv name args then false else true)
                    && (if arr_mut_arity_wrong recv name args then false else true)
                    && (if str_mut_arity_first world recv name args then false else true)
-                then let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil)) in ()
+                then let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil)) in ()
                 else ()) in
        // a `self.`-receiver call may reach private methods (always for a
        // setter, and generally in modern Ruby).
@@ -3937,7 +3972,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // `<<` mutates a String/Array receiver in place — FrozenError first.
     let _ = (if str_eq op "<<" then chill_touch world va0 "<<" else ()) in
     let _ = (if str_eq op "<<" && builtin_mut_on_frozen world va0 "<<"
-             then let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name va0 ++ ": " ++ inspect va0) (Cons (("__recv", va0), Nil)) in ()
+             then let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world va0 ++ ": " ++ inspect va0) (Cons (("__recv", va0), Nil)) in ()
              else ()) in
     // `s << x` on a string appends in place (store rewrite: aliases see it).
     // An integer appends the codepoint's character, as in Ruby.
@@ -5365,7 +5400,7 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
               //   ivar-assignment door two thousand lines up gets both right;
               //   this is the same refusal written a second time.
               then (let _ = raise_exc_iv world "FrozenError"
-                              ("can't modify frozen " ++ class_name slf ++ ": " ++ frz_inspect env world slf)
+                              ("can't modify frozen " ++ frz_cls world slf ++ ": " ++ frz_inspect env world slf)
                               (Cons (("__recv", slf), Nil)) in ())
               else ()) in
      let k = ivar_self_key slf n in
@@ -7619,7 +7654,7 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
   // far without one.
   let _ = chill_touch world recv name in
   if builtin_mut_on_frozen world recv name then
-    raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
+    raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
   // Range#min / #max / #minmax with a block are `super` into Enumerable's,
   // so with that one undef'd they have no superclass method
   else if (match recv with VRange (_, _, _) -> true | _ -> false)
@@ -12919,7 +12954,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          then false else true)
      && (if delete_is_noop env world recv name args then false else true)
      && (if arr_mut_arity_wrong recv name args then false else true) then
-    raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
+    raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
   else
   // an active refinement (`using M`, M refining this receiver's class or an
   // ancestor) wins over builtins and base methods, per Ruby's refinement
@@ -14267,7 +14302,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // one a program sees, since a literal is frozen in ruby too.
   else if (str_len name == 10 && str_eq name "initialize") && (match recv with VRegex (_, _, _) -> true | _ -> false)
           && (if prim_user_has world recv "initialize" then false else true) then
-    raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
+    raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
   // String#initialize(other) IS #replace: the same #to_str, the same refusal
   // of what has none, the same FrozenError, other's encoding carried over.
   // It kept only the bytes, and only of a String.
@@ -14289,7 +14324,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // form changes nothing there -- so this cannot live in is_mutating_method,
     // which only knows the name.
     (if val_frozen_mut recv then
-       raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
+       raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
      else
      (match args with
      | Cons (_, Cons (_, Cons (_, _))) ->
@@ -15082,8 +15117,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // The empty-store test comes first: this arm is every class-method call in
     // the program, and a program that never freezes a class should pay one map
     // length for it, not a walk down twenty names.
-    let _ = (if map_len cls_frozen > 0 && cls_frozen_refuses name args
-             then frz_cls_check world c else ()) in
+    // (...and a singleton class whose object is frozen, which cls_frozen
+    //  does not record. A constant or class variable write asks the class
+    //  itself, rb_check_frozen: "can't modify frozen Class: #<Class:#<...>>")
+    let _ = (if (map_len cls_frozen > 0 || is_sng_cls c) && cls_frozen_refuses name args
+             then (if frz_const_name name then frz_const_check world c else frz_cls_check world c) else ()) in
     // a singleton class cannot be instantiated: new / allocate raise TypeError.
     if is_sng_cls c && ((str_len name == 3 && str_eq name "new") || (str_len name == 8 && str_eq name "allocate")) then
       raise_exc world "TypeError" "can't create instance of singleton class"
@@ -17255,7 +17293,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let _ = (match args with
                 | Cons (v9, _) -> math_domain_check world name (to_f v9)
                 | Nil -> ()) in
-       if (str_len name == 4 && str_eq name "sqrt") then (match args with Cons (v, _) -> VFlt (sqrt (to_f v)) | _ -> VFlt 0.0)
+       // (the root of -0.0 is +0.0 in ruby's math_sqrt, not libm's -0.0)
+       if (str_len name == 4 && str_eq name "sqrt") then (match args with Cons (v, _) -> (let x9 = to_f v in VFlt (if x9 == 0.0 then 0.0 else sqrt x9)) | _ -> VFlt 0.0)
        else if (str_len name == 5 && str_eq name "hypot") then (match args with Cons (a, Cons (b, _)) -> VFlt (hypot (to_f a) (to_f b)) | _ -> VFlt 0.0)
        else if (str_len name == 3 && str_eq name "sin") then (match args with Cons (v, _) -> VFlt (sin (to_f v)) | _ -> VFlt 0.0)
        else if (str_len name == 3 && str_eq name "cos") then (match args with Cons (v, _) -> VFlt (cos (to_f v)) | _ -> VFlt 0.0)
@@ -17323,6 +17362,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // not. (3.2 did -- one of the changes the newer reference brought.)
           | Cons (v, Cons (b, _)) ->
             (let bf = to_f b in
+             // ...and the base has the same domain as the argument
+             let _ = math_domain_check world name bf in
              if bf == 10.0 then VFlt (big_log10 v)
              else if bf == 2.0 then VFlt (big_log2 v)
              else VFlt (big_ln v / log bf))
@@ -18925,7 +18966,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                  // an alias of a builtin reported its own name as the original.
                  // ...but only a builtin that EXISTS: a missing name is the
                  // same NameError the `alias` keyword raises (alias_builtin_exists)
-                 else if alias_builtin_exists world c n2 then
+                 else if (let _ = zsuper_dead_check world c n2 in alias_builtin_exists world c n2) then
                    (let _ = (if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2) in
                     set_builtin_alias world c n1 n2)
                  else (let _ = raise_exc_iv world "NameError"
@@ -20118,7 +20159,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                        else if vischeck && meth_protected world cls name && (if protected_ok_m env world cls name then false else true) then "protected"
                        else "") in
        if str_eq refused9 "" then invoke world noblk recv cls name args
-       else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
+       else if has_meth world cls "method_missing" then (let _ = vec_set mm_priv 0 0 in invoke world noblk recv cls "method_missing" (Cons (VSym name, args)))
        else raise_exc_iv world "NoMethodError" (refused9 ++ " method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
               (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
     // a private Kernel method a class (or an object's singleton) made PUBLIC
@@ -20189,7 +20230,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // program was refused permission to change could not be asked for.
           let _ = (if val_frozen_mut recv
                    then (let _ = raise_exc_iv world "FrozenError"
-                                   ("can't modify frozen " ++ cls ++ ": " ++ inspect_w env world recv)
+                                   ("can't modify frozen " ++ cls_display world cls ++ ": " ++ inspect_w env world recv)
                                    (Cons (("__recv", recv), Nil)) in ())
                    else ()) in
           let _ = map_set ivars (str_of_int id ++ "@" ++ nm9) value in value)
@@ -20203,7 +20244,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let nm9 = ivar_name_val env world v in
           let _ = (if val_frozen_mut recv
                    then (let _ = raise_exc_iv world "FrozenError"
-                                   ("can't modify frozen " ++ cls ++ ": " ++ inspect_w env world recv)
+                                   ("can't modify frozen " ++ cls_display world cls ++ ": " ++ inspect_w env world recv)
                                    (Cons (("__recv", recv), Nil)) in ())
                    else ()) in
           let k9 = str_of_int id ++ "@" ++ nm9 in
@@ -23219,7 +23260,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | VObj oid9 -> (let (_, _, o9, _) = world in
                        invoke world noblk recv (map_get o9 oid9) "method_missing" (Cons (VSym name, args)))
        | _ -> VNil)
-    else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
+    else if has_meth world cls "method_missing" then (let _ = vec_set mm_priv 0 0 in invoke world noblk recv cls "method_missing" (Cons (VSym name, args)))
     // ⚠ ...and KERNEL's, which every object has as a private instance method:
     //   `send` bypasses privacy, so `obj.__send__(:rand)` must reach them.
     //   AFTER method_missing, not before: `p` is one of those names, and a
@@ -26977,7 +27018,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // dispatcher has no branch for it, so hand it to the plain one.
        else if builtin_obj_has cls name then invoke_val_c env world blk recv name args false
        else if is_sng_cls cls && builtin_obj_has (sng_supername world cls) name then invoke_val_c env world blk recv name args false
-       else if has_meth world cls "method_missing" then invoke world newblk recv cls "method_missing" (Cons (VSym name, args))
+       else if has_meth world cls "method_missing" then (let _ = vec_set mm_priv 0 0 in invoke world newblk recv cls "method_missing" (Cons (VSym name, args)))
        else raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_obj env world recv cls)
            (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
      // `blk` (the enclosing method's block) is threaded so a yield inside
@@ -26986,7 +27027,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // the in-place mutators below are reached with a block, ahead of
        // builtin_iter's guard, so the frozen check has to happen here too.
        if is_mutating_method name && val_frozen_mut recv then
-         raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
+         raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
        else
        // a reopened built-in class's method (with the call-site block) wins
        // over the hardcoded iterators.
@@ -27836,10 +27877,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
        (match args with
         | Cons (v, _) ->
           (let nm9 = ivar_name_val env world v in
-           if str_eq base "" then raise_exc world "FrozenError" ("can't modify frozen " ++ cls ++ ": " ++ inspect recv)
+           if str_eq base "" then raise_exc world "FrozenError" ("can't modify frozen " ++ cls_display world cls ++ ": " ++ inspect recv)
            // ...and so does one that CAN hold them once it is frozen: a frozen
            // String, Array, Hash or Binding took the write
-           else if val_is_frozen recv then raise_exc world "FrozenError" ("can't modify frozen " ++ cls ++ ": " ++ inspect recv)
+           else if val_is_frozen recv then raise_exc world "FrozenError" ("can't modify frozen " ++ cls_display world cls ++ ": " ++ inspect recv)
            else if (str_len name == 24 && str_eq name "remove_instance_variable") then
              (let k9 = base ++ "@" ++ nm9 in
               if map_has ivars0 k9
@@ -37249,8 +37290,8 @@ and kernel_overridden = fn env -> fn world -> fn (name: str) ->
   || self_defines env world name
   // (...and main's own singleton: `class << self; def puts` at the top level)
   || (match (if lv_has env "self" then lv_get env "self" else VMain) with VMain -> main_sng_has world name | _ -> false)
-and undef_call_exc = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) ->
-  undef_call_exc_x world blame name args false
+and undef_call_exc = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) -> fn (lvs: unit -> Val) ->
+  undef_call_exc_x world blame name args false lvs
 // Who the method was wanted from. A NoMethodError that names only the method is
 // a diagnosis with the subject removed: `undefined method 'match'` cost a probe
 // to find out it was Gem::Platform. The wording follows the "for an instance of
@@ -37335,7 +37376,8 @@ and kernel_bare_special = fn (name: str) ->
   (str_len name == 5 && str_eq name "sleep") || (str_len name == 4 && str_eq name "fork")
   || (str_len name == 4 && str_eq name "exit")
 
-and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
+// (lvs: the local variable names where the call was, NameError#local_variables)
+and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) -> fn (lvs: unit -> Val) ->
   // (main's own private methods -- include, public, private, define_method,
   //  using, ruby2_keywords -- are there, and private: `self.include` is
   //  "private method 'include' called for main")
@@ -37379,13 +37421,17 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
   // A blame of VNil is "no receiver known", which is not nil BEING the
   // receiver, so the field is left off entirely (the prelude has a sentinel
   // for exactly that difference).
+  let lv9 = lvs () in
   let flds9 = (match blame with
-               | VNil -> Cons (("__name", VSym name), Nil)
-               | _ -> Cons (("__name", VSym name), Cons (("__recv", blame), Nil))) in
+               | VNil -> Cons (("__name", VSym name), Cons (("__lvars", lv9), Nil))
+               | _ -> Cons (("__name", VSym name), Cons (("__recv", blame), Cons (("__lvars", lv9), Nil)))) in
+  // (a NoMethodError from a call with no receiver carries its arguments and
+  //  is a private call, NoMethodError#args and #private_call?)
+  let nflds9 = Cons (("__args", arr_new args), Cons (("__priv", VBool true), flds9)) in
   match args with
-  | Nil -> if explicit then raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame) flds9
+  | Nil -> if explicit then raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame) nflds9
            else raise_exc_iv world "NameError" ("undefined local variable or method '" ++ name ++ "'" ++ undef_blame world blame) flds9
-  | _ -> raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame) flds9
+  | _ -> raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame) nflds9
 
 // implicit-self send when self is a primitive: honour a subclass tag (its own
 // method, then an alias-to-builtin) before the base primitive class + prims.
@@ -37408,7 +37454,9 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
   //   here as "undefined method 'raise'". ostruct writes exactly that --
   //   `alias_method :raise!, :raise` -- and calls raise! from
   //   method_missing on every new member, so `OpenStruct.new(a: 1)` died.
-  | _ when str_eq src "raise" || str_eq src "fail" ->
+  // (...and so are the senders: `alias_method :try, :__send__` on a String's
+  //  singleton class sends through the dispatcher, [ruby-dev:38824])
+  | _ when str_eq src "raise" || str_eq src "fail" || str_eq src "__send__" || str_eq src "send" || str_eq src "public_send" ->
     invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
   // ...and neither are the String MUTATORS (concat, <<, replace ...): they
   // rewrite the receiver's store entry in the dispatcher. The receiver is
@@ -38027,8 +38075,13 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        //   Kernel defines. The list is is_kernel_builtin -- the same one
        //   respond_to? and private_instance_methods answer from.
        else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk (VObj id) name args false
-       else if has_meth world cls "method_missing" then invoke world noblk (VObj id) cls "method_missing" (Cons (VSym name, args))
-       else undef_call_exc_x world (blamed (VObj id)) name args explicit
+       else if has_meth world cls "method_missing" then
+          // (marked as a receiverless call for the NoMethodError a `super`
+          //  in it raises; the other method_missing doors clear the mark)
+          (let _ = vec_set mm_priv 0 1 in
+           let r9 = invoke world noblk (VObj id) cls "method_missing" (Cons (VSym name, args)) in
+           let _ = vec_set mm_priv 0 0 in r9)
+       else (undef_call_exc_x world (blamed (VObj id)) name args explicit (fn (u9: unit) -> local_vars_of env))
      // top-level self is main (an Object); route the string form of
      // instance_eval/instance_exec to the prim dispatcher (self stays main).
      | VMain ->
@@ -38051,7 +38104,7 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        // (a bare `using` with no argument is still main.using, which says
        // what it wanted)
        else if (str_len name == 5 && str_eq name "using") then do_using env world args
-       else undef_call_exc_x world (blamed VMain) name args explicit
+       else (undef_call_exc_x world (blamed VMain) name args explicit (fn (u9: unit) -> local_vars_of env))
      | VClass c ->
        // a `def self.new` outranks the built-in allocation here exactly as it
        // does for an explicit receiver -- a bare `new` inside another class
@@ -38065,7 +38118,7 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        //   and killed the thread instead of parking it. A class is an Object
        //   and has Kernel's private methods like any other.
        else if kernel_bare_special name && (if has_meth world "Module" name then false else true) then
-         undef_call_exc_x world (blamed (VClass c)) name args explicit
+         (undef_call_exc_x world (blamed (VClass c)) name args explicit (fn (u9: unit) -> local_vars_of env))
        // a bare call inside a class/module body (self is the class) routes
        // through the receiver dispatcher so builtins like module_eval/class_eval
        // apply; invoke_val_c raises NoMethodError itself if truly undefined.
@@ -38075,7 +38128,7 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // same Kernel route as the two arms above (see there).
   else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
   else if (str_len name == 5 && str_eq name "using") then do_using env world args
-  else undef_call_exc_x world (blamed VMain) name args explicit
+  else (undef_call_exc_x world (blamed VMain) name args explicit (fn (u9: unit) -> local_vars_of env))
 
 // implicit-self method call (a method calling a sibling method).
 // does the current self's class define this method? The stdin builtins (gets /
@@ -38472,7 +38525,7 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        else if mod_inst_delegates world (VObj id) name then invoke_val_c env world noblk (VObj id) name args false
        // (...and a Thread subclass's, see thr_inst_delegates)
        else if thr_inst_delegates world (VObj id) name then invoke_val_c env world noblk (VObj id) name args false
-       else undef_call_exc world (blamed (VObj id)) name args
+       else (undef_call_exc world (blamed (VObj id)) name args (fn (u9: unit) -> local_vars_of env))
      | VMain ->
        if ((str_len name == 13 && str_eq name "instance_eval") || (str_len name == 13 && str_eq name "instance_exec")) && (match args with Cons (VStr _, _) -> true | _ -> false)
        then dispatch_prim env world noblk VMain name args false
@@ -38485,7 +38538,7 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
        // (a bare `using`: main.using, see try_self_call_x)
        else if (str_len name == 5 && str_eq name "using") then do_using env world args
-       else undef_call_exc world (blamed VMain) name args
+       else (undef_call_exc world (blamed VMain) name args (fn (u9: unit) -> local_vars_of env))
      | VClass c ->
        // class-level self (class << self body / class methods): route through
        // the receiver dispatcher so class/module builtins (name, constants,
@@ -38497,7 +38550,7 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        else if has_meth world ("(sng:" ++ c ++ ")") name then invoke world noblk (VClass c) ("(sng:" ++ c ++ ")") name args
        // ...and Kernel's bare specials, as in try_self_call_x's VClass arm
        else if kernel_bare_special name && (if has_meth world "Module" name then false else true) then
-         undef_call_exc world (blamed (VClass c)) name args
+         (undef_call_exc world (blamed (VClass c)) name args (fn (u9: unit) -> local_vars_of env))
        else invoke_val_c env world noblk (VClass c) name args false
      | other ->
        // primitive self (a reopened built-in class's method body): user
@@ -38506,7 +38559,7 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
   // ...and with no self bound at all, which is the ordinary top level.
   else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
   else if (str_len name == 5 && str_eq name "using") then do_using env world args
-  else undef_call_exc world (blamed VMain) name args
+  else (undef_call_exc world (blamed VMain) name args (fn (u9: unit) -> local_vars_of env))
 
 // top-level method call: fresh frame, no self; blk is installed for yield.
 // A strict callable's #curry count has to fit its #parameters: at least the
@@ -38990,7 +39043,8 @@ and super_next = fn world -> fn env -> fn (recv: Val) -> fn (defcls: str) -> fn 
             then known9 else idx9 anc9 0) in
   let rec drop9 = fn (xs: str list) -> fn (k: int) -> (if k <= 0 then xs else (match xs with Nil -> Nil | Cons (_, t9) -> drop9 t9 (k - 1))) in
   let rest9 = drop9 anc9 (i0 + 1) in
-  let a2 = lookup_anc world rest9 meth in
+  // (an `undef` above stops it: "super: no superclass method")
+  let a2 = (if map_len undefs > 0 && undef_blocked_anc world rest9 meth then "" else lookup_anc world rest9 meth) in
   if str_eq a2 "" then ("", 0 - 1) else (a2, i0 + 1 + idx_in9 rest9 a2)
 and idx_in9 = fn (xs: str list) -> fn (x: str) ->
   let rec go = fn (ys: str list) -> fn (i: int) -> (match ys with Nil -> 0 - 1 | Cons (h, t) -> (if str_eq h x then i else go t (i + 1))) in
@@ -39914,7 +39968,10 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
        raise_exc_iv world "NoMethodError"
          ("undefined method '" ++ (match nm with VSym sy -> sy | VStr h -> sget h | other -> to_s other)
           ++ "' for " ++ for_recv_cls world dcls)
-         (Cons (("__name", (match nm with VStr h -> VSym (sget h) | _ -> nm)), Cons (("__recv", recv), Cons (("__args", arr_new rest9), Nil))))
+         (let pv9 = vec_get mm_priv 0 in
+          let _ = vec_set mm_priv 0 0 in
+          Cons (("__name", (match nm with VStr h -> VSym (sget h) | _ -> nm)), Cons (("__recv", recv), Cons (("__args", arr_new rest9),
+            Cons (("__priv", VBool (pv9 == 1)), Nil)))))
      | Nil -> raise_exc world "NoMethodError" ("undefined method for " ++ for_recv_cls world dcls))
   // Kernel's functions are ancestors of every object, so `super` from an
   // override of one reaches it: `def load(name, wrap = false) = super` is how
@@ -44421,7 +44478,7 @@ and enum_init = fn env -> fn world -> fn (recv: Val) -> fn (cls: str) -> fn (arg
   | VObj id ->
     (let k = str_of_int id in
      let _ = (if val_is_frozen recv then
-                (let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ cls ++ ": " ++ inspect_w env world recv)
+                (let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ cls_display world cls ++ ": " ++ inspect_w env world recv)
                            (Cons (("__recv", recv), Nil)) in ())
               else ()) in
      if str_eq cls "Enumerator::Chain" then
@@ -46422,6 +46479,88 @@ and arr_mut_arity_wrong = fn (recv: Val) -> fn (name: str) -> fn (args: Val list
   // (Hash#replace counts before it asks frozen, as Array#replace does)
   | VHsh _ -> str_eq name "replace" && val_list_len args != 1
   | _ -> false
+// The writes ruby refuses with rb_check_frozen on the class itself rather
+// than rb_class_modify_check: for a singleton class the message names the
+// singleton class and #receiver answers it, not its object.
+// Is c a class whose superclass chain ends at BasicObject without passing
+// Object? (a module, the top level and an unknown name are not)
+// A module's `private :class` is an entry that stands for the method above
+// it, and above a module there is nothing: aliasing it is "undefined method
+// 'class' for module '#<Module:...>'", though Kernel answers the name for
+// everything else (the first entry along the module's ancestors decides).
+and zsuper_dead_check = fn world -> fn (c: str) -> fn (n: str) ->
+  let (m9, _, _, _) = world in
+  if map_has modules c && map_len vis_marks > 0 then
+    (let rec first9 = fn (xs: str list) ->
+       (match xs with
+        | Nil -> ""
+        | Cons (a9, t9) -> if map_has m9 (a9 ++ "#" ++ n) || map_has vis_marks (a9 ++ "#" ++ n) then a9 else first9 t9) in
+     let anc9 = ancestors_of world c in
+     let f9 = first9 anc9 in
+     if (if str_eq f9 "" then false else true) && (if map_has m9 (f9 ++ "#" ++ n) then false else true)
+        && str_eq (lookup_anc_above world anc9 f9 n) ""
+     then (let _ = raise_exc_iv world "NameError"
+                     ("undefined method '" ++ n ++ "' for module '" ++ cls_display world c ++ "'")
+                     (Cons (("__name", VSym n), Nil)) in ())
+     else ())
+  else ()
+
+// defined?(o.m) for a missing m asks o.respond_to?(:respond_to_missing?)
+// (rb_check_funcall), and a respond_to? that takes one parameter is the
+// deprecated signature: two warnings under Warning[:deprecated], the call and
+// where it was defined
+and rt_dep_warn = fn world -> fn (rv: Val) -> fn (cls0: str) ->
+  if deprecation_says () then
+    (let (m9, _, _, _) = world in
+     // (a String, Array or Hash with a singleton class keeps it aside)
+     let hk9 = hng_key rv in
+     let cls = (if (if str_eq hk9 "" then false else true) && map_has hng_store hk9 then map_get hng_store hk9 else cls0) in
+     let ow9 = lookup_anc world (ancestors_of world cls) "respond_to?" in
+     if str_eq ow9 "" || (if map_has m9 (ow9 ++ "#respond_to?") then false else true) then ()
+     else
+       (match map_get m9 (ow9 ++ "#respond_to?") with
+        | Meth (ps9, ds9, _) ->
+          (match (ps9, ds9) with
+           | (Cons (p9, Nil), Nil) ->
+             if str_len p9 > 0 && (str_eq (char_at p9 0) "*" || str_eq (char_at p9 0) "&" || str_eq (char_at p9 (str_len p9 - 1)) ":") then ()
+             else
+               (let who9 = (if is_sng_cls ow9 then (match rv with VObj _ -> obj_to_s_default world rv | _ -> to_s rv) ++ "." else cls_display world ow9 ++ "#") in
+                let k9 = ow9 ++ "#respond_to?" in
+                let _ = warning_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: " ++ who9
+                                            ++ "respond_to?(:respond_to_missing?) uses the deprecated method signature, which takes one parameter\n") (VSym "deprecated") in
+                if map_has meth_src k9 && map_has meth_src ("f" ++ k9) then
+                  warning_emit world (to_s (map_get meth_src ("f" ++ k9)) ++ ":" ++ to_s (map_get meth_src k9) ++ ": warning: respond_to? is defined here\n") (VSym "deprecated")
+                else ())
+           | _ -> ())))
+  else ()
+
+and lit_unwrap = fn (e: Expr) ->
+  match e with
+  | EMethod (r9, m9, Nil) when str_len m9 > 6 && str_eq (substring m9 0 6) "__lit_" -> lit_unwrap r9
+  | EMethod (r9, m9, a9) -> EMethod (lit_unwrap r9, m9, lit_unwrap_list a9)
+  | ECall (n9, a9) -> ECall (n9, lit_unwrap_list a9)
+  | EArr a9 -> EArr (lit_unwrap_list a9)
+  | other -> other
+and lit_unwrap_list = fn (es: Expr list) ->
+  match es with Nil -> Nil | Cons (h, t) -> Cons (lit_unwrap h, lit_unwrap_list t)
+
+and bo_root = fn world -> fn (c: str) -> fn (d: int) ->
+  if d > 64 || str_eq c "" || str_eq c "Object" then false
+  else if str_eq c "BasicObject" then true
+  else (let (_, sup9, _, _) = world in
+        if map_has sup9 c then bo_root world (map_get sup9 c) (d + 1) else false)
+
+and frz_const_name = fn (name: str) ->
+  (str_len name == 9 && str_eq name "const_set") || (str_len name == 12 && str_eq name "remove_const")
+  || (str_len name == 18 && str_eq name "class_variable_set") || (str_len name == 21 && str_eq name "remove_class_variable")
+
+and frz_const_check = fn world -> fn (c0: str) ->
+  if is_sng_cls c0 && (clsfrozen_get c0
+                       || (let in8 = sng_inner c0 in str_len in8 > 0 && is_digit (char_at in8 0) && ofrozen_get (int_of_str in8)))
+  then (let _ = raise_exc_iv world "FrozenError" ("can't modify frozen Class: " ++ cls_display world c0)
+                  (Cons (("__recv", VClass c0), Nil)) in ())
+  else frz_cls_check world c0
+
 and frz_cls_check = fn world -> fn (c0: str) ->
   // `K.instance_eval { def m; end }` writes to K's SINGLETON namespace, and
   // ruby still calls it modifying K ("can't modify frozen Class: K"). An
@@ -46429,9 +46568,9 @@ and frz_cls_check = fn world -> fn (c0: str) ->
   // by the object check instead.
   let c = if is_sng_cls c0 then sng_inner c0 else c0 in
   if clsfrozen_get c
-  then (let _ = raise_exc world "FrozenError"
+  then (let _ = raise_exc_iv world "FrozenError"
           ("can't modify frozen " ++ (if map_has modules c then "Module" else "Class")
-           ++ ": " ++ display_cls_msg world c) in ())
+           ++ ": " ++ display_cls_msg world c) (Cons (("__recv", VClass c), Nil)) in ())
   // (...and a singleton class that was itself frozen -- `class << o; self;
   //  end.freeze` -- refuses a def into it, whatever its object is)
   // (ruby names the singleton's OBJECT: "can't modify frozen Object: #<Object:0x...>")
@@ -46441,9 +46580,12 @@ and frz_cls_check = fn world -> fn (c0: str) ->
                             || (let in8 = sng_inner c0 in str_len in8 > 0 && is_digit (char_at in8 0) && ofrozen_get (int_of_str in8)))
   then (let in9 = sng_inner c0 in
         let msg9 = (if str_len in9 > 0 && is_digit (char_at in9 0)
-                    then (let o9 = VObj (int_of_str in9) in "can't modify frozen " ++ class_name o9 ++ ": " ++ inspect_w gc_cenv0 world o9)
+                    then (let o9 = VObj (int_of_str in9) in "can't modify frozen " ++ frz_cls world o9 ++ ": " ++ inspect_w gc_cenv0 world o9)
                     else "can't modify frozen Class: " ++ display_cls_msg world c0) in
-        let _ = raise_exc world "FrozenError" msg9 in ())
+        // (the receiver is the singleton's object, rb_class_modify_check's
+        //  attached object)
+        let rv9 = (if str_len in9 > 0 && is_digit (char_at in9 0) then VObj (int_of_str in9) else VClass c0) in
+        let _ = raise_exc_iv world "FrozenError" msg9 (Cons (("__recv", rv9), Nil)) in ())
   else ()
 
 // ---- Exception#detailed_message / #full_message ---------------------------
@@ -46946,6 +47088,7 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   //   mistake surfaced only when foo was called, as a NoMethodError about a
   //   different name. A builtin counts if any ancestor's builtin table, Kernel
   //   or Module (for a class or module receiver) answers it.
+  let _ = zsuper_dead_check world cls n2 in
   let _ = (if map_has meths (src ++ "#" ++ n2) || alias_builtin_exists world cls n2 then ()
            else (let _ = raise_exc_iv world "NameError"
                            ("undefined method '" ++ n2 ++ "' for class '" ++ cls_display world cls ++ "'")
@@ -46981,12 +47124,16 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   // ...and it keeps the ORIGINAL'S VISIBILITY. `alias :aka :bar` under a
   // `private` copies a private method, and the copy is private too: it was
   // public, so `public_send(:aka)` reached a method public_send must refuse.
+  // (...as it is seen FROM HERE, as alias_method does: `public :foo` in
+  //  this class makes the inherited private foo public, and `alias bar foo`
+  //  after it is public too)
   let _ = (let k1 = cls ++ "#" ++ n1 in
            let k2 = src ++ "#" ++ n2 in
+           let zs9 = map_has vis_marks (cls ++ "#" ++ n2) && (if map_has meths (cls ++ "#" ++ n2) then false else true) in
            let _ = (if map_has privates k1 then map_delete privates k1 else ()) in
            let _ = (if map_has protecteds k1 then map_delete protecteds k1 else ()) in
-           if map_has privates k2 then (let _ = map_set privates k1 VNil in ())
-           else if map_has protecteds k2 then (let _ = map_set protecteds k1 VNil in ())
+           if (if zs9 then meth_private world cls n2 else map_has privates k2) then (let _ = map_set privates k1 VNil in ())
+           else if (if zs9 then meth_protected world cls n2 else map_has protecteds k2) then (let _ = map_set protecteds k1 VNil in ())
            else ()) in
   // an alias ADDS a method, so `method_added` fires for the new name --
   // rubocop-ast registers its visitors from that hook and writes
@@ -47429,7 +47576,8 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
     // that would change it, so this is per statement, not at the entry.
     // (...and an object's singleton class asks whether its OBJECT is frozen,
     //  which cls_frozen does not record: `o.freeze; class << o; def x; end`)
-    let _ = (if (map_len cls_frozen > 0 || is_sng_cls cls) && cls_body_writes s then frz_cls_check world cls else ()) in
+    let _ = (if (map_len cls_frozen > 0 || is_sng_cls cls) && cls_body_writes s
+             then (match s with SAssign (_, _) -> frz_const_check world cls | _ -> frz_cls_check world cls) else ()) in
     // ⚠ THE DEFAULT VISIBILITY IS A PROPERTY OF THE SCOPE, not of the syntax
     //   that set it: `send :private`, `1.times { private }` and an eval'd
     //   `private` set it too, and a def run by eval or by a block inside the
@@ -48039,8 +48187,25 @@ and math_conv_args = fn env -> fn world -> fn (xs: Val list) ->
     Cons ((match h with
            | VObj _ -> (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
                         invoke_val_c env world nb9 h "to_f" Nil false)
+           // an Integer or Rational whose #to_f the program redefined is
+           // converted through it, as rb_to_float does when the method is not
+           // the basic one (test_math's test_override_*_to_f)
+           | VInt _ -> math_conv_redef env world h "Integer"
+           | VBig _ -> math_conv_redef env world h "Integer"
+           | VRat _ -> math_conv_redef env world h "Rational"
            | other -> other),
           math_conv_args env world t)
+
+// The class a FrozenError names: rb_obj_class as ruby prints it, so an
+// anonymous class is #<Class:0x...> rather than the internal name (an object
+// with a singleton class still names its real class).
+and frz_cls = fn world -> fn (v: Val) -> cls_display world (class_name v)
+
+and math_conv_redef = fn env -> fn world -> fn (h: Val) -> fn (cls: str) ->
+  if has_meth world cls "to_f" then
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     invoke_val_c env world nb9 h "to_f" Nil false)
+  else h
 
 and list_iter_vals = fn (xs: Val list) -> fn (f: Val -> unit) ->
   match xs with Nil -> () | Cons (h, t) -> (let _ = f h in list_iter_vals t f)
@@ -49113,7 +49278,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      let _ = (if (val_frozen_mut slf || val_is_immediate slf)
                  && (if str_len name > 5 && str_eq (substring name 0 5) "__io_" then val_is_immediate slf else true)
               then (let _ = raise_exc_iv world "FrozenError"
-                              ("can't modify frozen " ++ class_name slf ++ ": " ++ frz_inspect env world slf)
+                              ("can't modify frozen " ++ frz_cls world slf ++ ": " ++ frz_inspect env world slf)
                               (Cons (("__recv", slf), Nil)) in ())
               else ()) in
      let k = ivar_self_key slf name in

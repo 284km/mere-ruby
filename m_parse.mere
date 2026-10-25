@@ -4704,6 +4704,12 @@ and pipe_group = fn toks -> fn (acc: str) ->
 // is the TNL at the head of toks a `;` rather than a newline? Both lex as
 // TNL and carry a line number: a `;` shares its number with the newline that
 // ends its line, while a newline's number is below the next mark's.
+and nls_has_semi = fn toks ->
+  match toks with
+  | Cons (TNL _, r) -> tnl_semi toks || nls_has_semi r
+  | _ -> false
+and defined_semi = fn (semi: bool) -> fn (e: Expr) ->
+  if semi then EDefined (EVar "__defined__expression") else EDefined (ln_strip e)
 and tnl_semi = fn toks ->
   match toks with
   | Cons (TNL n, r) -> tok_line r == n
@@ -4996,8 +5002,11 @@ and parse_primary = fn toks ->
       (match r with
        | Cons (TP p, r2) ->
          if is_lparen p then
-           // the parens hold statements: `defined? (\n  x\n)`, `defined?(;x)`
-           // and `defined?(x;)` ask about x, and `defined? (\n)` about ()
+           // the parens hold statements: `defined? (\n  x\n)` asks about x and
+           // `defined? (\n)` about (); a `;` before or after the one
+           // statement makes it statements, "expression" (ruby 4.0; 3.4 asked
+           // about x)
+           let semi9 = nls_has_semi r2 in
            let r2 = skip_nls r2 in
            let empty = (match r2 with Cons (TP rp0, _) -> str_eq rp0 ")" | _ -> false) in
            if empty then (EDefined (EVar "nil"), expect r2 ")") else
@@ -5017,9 +5026,9 @@ and parse_primary = fn toks ->
            // operators `and`/`or`/`not` are allowed (`defined?(a and b)`).
            (match r2 with
             | Cons (TId w, Cons (TP rp, r4)) ->
-              if str_eq rp ")" then (EDefined (EVar w), r4)
-              else let (e, r3) = parse_andor r2 in (EDefined (ln_strip e), expect (skip_nls r3) ")")
-            | _ -> let (e, r3) = parse_andor r2 in (EDefined (ln_strip e), expect (skip_nls r3) ")"))
+              if str_eq rp ")" then (EDefined (EVar (if semi9 then "__defined__expression" else w)), r4)
+              else let (e, r3) = parse_andor r2 in (defined_semi (semi9 || nls_has_semi r3) e, expect (skip_nls r3) ")")
+            | _ -> let (e, r3) = parse_andor r2 in (defined_semi (semi9 || nls_has_semi r3) e, expect (skip_nls r3) ")"))
          // `defined? a = 10` (no parens) — an assignment is unevaluated.
          else if defined_assignish r then
            let (st, r3) = parse_stmt r in (defined_assign_node r st, r3)
@@ -6240,6 +6249,26 @@ and const_fold_str = fn (e: Expr) ->
   | EMethod (rc, m, _) -> if str_eq m "to_s" || str_eq m "to_sym" || str_eq m "to_str" || str_eq m "__interp_str" then const_fold_str rc else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: cannot constant-fold alias name")) in fail "mere-ruby: cannot constant-fold alias name")
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: cannot constant-fold alias name")) in fail "mere-ruby: cannot constant-fold alias name")
 
+// an interpolated symbol whose parts are not all literals
+and alias_dyn_at = fn toks ->
+  match toks with
+  | Cons (TP op, _) -> str_eq op "(s" && (let (e, _) = parse_primary toks in if const_foldable e then false else true)
+  | _ -> false
+and alias_skip_name = fn toks ->
+  if alias_dyn_at toks then (let (_, r) = alias_name_expr toks in r)
+  else (let (_, r) = parse_alias_name toks in r)
+and alias_name_expr = fn toks ->
+  if alias_dyn_at toks then
+    (let (e, r2) = parse_primary toks in
+     let r3 = (match r2 with Cons (TP dot, Cons (TId ts, r4)) -> if str_eq dot "." && (str_eq ts "to_sym" || str_eq ts "to_s") then r4 else r2 | _ -> r2) in
+     (e, r3))
+  else (let (n, r) = parse_alias_name toks in (ESym n, r))
+and const_foldable = fn (e: Expr) ->
+  match e with
+  | EStrL _ -> true | ESym _ -> true | EInt _ -> true | EBig _ -> true | EBool _ -> true | ENil -> true
+  | EBin (o, a, b) -> str_eq o "+" && const_foldable a && const_foldable b
+  | EMethod (rc, m, _) -> (str_eq m "to_s" || str_eq m "to_sym" || str_eq m "to_str" || str_eq m "__interp_str") && const_foldable rc
+  | _ -> false
 and parse_alias_name = fn toks ->
   match toks with
   // `alias expires_at= expires=` — a setter's name carries its `=`.
@@ -6894,6 +6923,13 @@ and parse_stmt_id = fn toks ->
        | _ -> let (es, r2) = parse_puts_args r Nil in apply_modifier (SExpr (ECall (id, es))) r2)
     // `attr :sym` (and `attr :a, :b`) is the classic reader-only form.
     else if str_eq id "attr" && (match r with Cons (TSym _, _) -> true | _ -> false) then parse_attr "r" r
+    // `alias :"foo_#{i}" :"foo_#{i}"`: a name that is an interpolation the
+    // parser cannot fold is the alias of the scope at run time, alias_method
+    // with the two symbols the expressions make
+    else if str_eq id "alias" && (alias_dyn_at r || alias_dyn_at (alias_skip_name r)) then
+      (let (e1, r1) = alias_name_expr r in
+       let (e2, r2) = alias_name_expr r1 in
+       (SExpr (ECall ("alias_method", Cons (e1, Cons (e2, Nil)))), r2))
     else if str_eq id "alias" then
       // `alias new old` — names may be bare or :symbols.
       let (n1, r1) = parse_alias_name r in
