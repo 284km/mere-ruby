@@ -6544,7 +6544,11 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
 and blk_head_pos = fn (body: Stmt list) ->
   match body with
   | Cons (SFile f, t) -> (let _ = cur_file_set f in blk_head_pos t)
-  | Cons (SLine n, _) -> cur_line_set n
+  // (the block's opening line when the parser marked it: a raise while
+  //  binding is reported there, as ruby's is)
+  // (the opening line wins, but what follows -- an eval's SFile -- is read)
+  | Cons (SLine n, t) -> (if n < 0 then (let _ = blk_head_pos t in cur_line_set (0 - n)) else cur_line_set n)
+  | Cons (st9, t) -> (if dflt_prologue_stmt st9 then blk_head_pos t else ())
   | _ -> ()
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // consume any pending forwarded-block home: a `&proc` passed to a BUILTIN
@@ -6666,7 +6670,7 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   //  block was written in -- its body's first SFile and SLine -- as ruby
   //  reports `unknown keyword` for `proc {|a:| a}`; the caller's line was
   //  still the current one)
-  let _ = (match params with Nil -> () | _ -> blk_head_pos body) in
+  let _ = (match params with Nil -> (if is_lam then blk_head_pos body else ()) | _ -> blk_head_pos body) in
   // ...and a lambda's own arity refusal is the lambda's: the builtin that
   // called it (Proc#call, an each) is not put on top of it
   let _ = (if is_lam && map_has struct_ctr "bd" && map_get struct_ctr "bd" >= cd_get ()
@@ -12896,6 +12900,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // just the user table: the call goes to method_missing if the object has
   // one, and to NoMethodError if it does not. Without this the builtin behind
   // the undef'd name kept answering (see undef_blocked).
+  // A builtin receiver (an Integer, a String, nil...) whose class or an
+  // ancestor -- Object, Kernel, Comparable -- has a method_missing the
+  // program defined gets it for a name nothing answers: `1.foo` with
+  // `class Integer; def method_missing` was a NoMethodError regardless.
+  if map_has hook_flags "mm"
+     && (match recv with
+         | VInt _ -> true | VBig _ -> true | VFlt _ -> true | VStr _ -> true | VSym _ -> true
+         | VArr _ -> true | VHsh _ -> true | VNil -> true | VBool _ -> true | VRange (_, _, _) -> true
+         | _ -> false)
+     && (if str_eq name "method_missing" then false else true)
+     && (let c9m = dispatch_cls_of world recv in
+         has_meth world c9m "method_missing" && (if has_meth world c9m name then false else true)
+         && (if undef_blocked world c9m name then false else true)
+         && (if responds_x world recv name true false then false else true)) then
+    invoke world noblk recv (dispatch_cls_of world recv) "method_missing" (Cons (VSym name, args))
+  else
   if undef_blocked world (dispatch_cls_of world recv) name then
     (let c9u = dispatch_cls_of world recv in
      if has_meth world c9u "method_missing"
@@ -20469,6 +20489,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        if (str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "===") then
          (if map_has ivars (str_of_int id ++ "@__m_mm")
           then invoke_val_c env world blk mrecv "method_missing" (Cons (VSym mnm, args)) false
+          // (Kernel#binding called as a Method has a C function for its
+          //  caller, not Ruby code: rb_f_binding's refusal)
+          else if str_eq mnm "binding" && (str_eq mown "Kernel" || str_eq mown "")
+                  && (if has_meth world (dispatch_cls_of world mrecv) "binding" then false else true) then
+            raise_exc world "RuntimeError" "Cannot create Binding object for non-Ruby caller"
           else
          match mrecv with
           | VMain -> (if (let (m8, _, _, _) = world in map_has m8 mnm) then call_method (env_as_main env) world blk mnm args else invoke_val_c env world blk VMain mnm args false)
@@ -24116,7 +24141,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (match args with
        | Cons (VProc p2, _) -> VBool (str_eq (r2k_root (str_of_int pid)) (r2k_root (str_of_int p2)))
        | _ -> VBool false)
-    else if (str_len name == 7 && str_eq name "lambda?") then VBool (map_has lambda_ids (str_of_int pid))
+    // (...or one made from a block the parser wrote as a lambda: `&:sym`
+    //  where a refinement is active is such a block, and Symbol#to_proc's
+    //  procs are lambdas)
+    else if (str_len name == 7 && str_eq name "lambda?") then
+      VBool (map_has lambda_ids (str_of_int pid)
+             || (match proc_get (str_of_int pid) with (_, Cons (m9, _), _, _) -> str_eq m9 lambda_blk_marker | _ -> false))
     // Proc#binding: the environment the proc CAPTURED, which is the same
     // thing Kernel#binding hands back for the frame it was called in.
     else if (str_len name == 7 && str_eq name "binding") then
@@ -26068,6 +26098,9 @@ and warn_redef = fn world -> fn (key: str) -> fn (name: str) ->
      //  searches before it warns, Bug #10421)
      let _ = (if (str_eq name "object_id" && serious_has_kernel world key) || str_eq name "__id__" || str_eq name "__send__"
               then rb_warn world ("redefining '" ++ name ++ "' may cause serious problems") else ()) in
+     // (...and Object's method_missing: rb_method_entry_make's own warning)
+     let _ = (if str_eq key "Object#method_missing"
+              then rb_warn world "redefining Object#method_missing may cause infinite loop" else ()) in
      // (...only over a method a program wrote: one the prelude defined is
      // ruby's C method, and a stdlib file that redefines it -- pp.rb's
      // Kernel#pp -- must not make every -w child process warn)
@@ -30631,6 +30664,14 @@ and reopen_kind_err = fn world -> fn (full: str) -> fn (is_mod: bool) ->
                     let nl9 = str_index_of l9 "\n" in
                     "\n" ++ substring l9 0 nl9 ++ ":" ++ substring l9 (nl9 + 1) (str_len l9) ++ ": previous definition of " ++ nm9 ++ " was here")
               else "") in
+  // (in a library shipped here for one of ruby's C extensions -- etc,
+  //  zlib... -- the refusal is rb_define_module's, which names the class of
+  //  what the constant holds instead: "Etc is not a module (C)")
+  let cf9 = cur_file () in
+  if str_len cf9 > 14 && str_eq (substring cf9 0 14) "/usr/lib/ruby/" && map_has consts full then
+    raise_exc world "TypeError" (nm9 ++ (if is_mod then " is not a module (" else " is not a class (")
+                                 ++ display_cls_msg world (dispatch_cls_of world (map_get consts full)) ++ ")")
+  else
   raise_exc world "TypeError" (nm9 ++ (if is_mod then " is not a module" else " is not a class") ++ loc9)
 // Can a method (or proc) with these parameters carry the ruby2_keywords flag?
 // Only one that collects its arguments in a bare splat and takes no keywords,
@@ -37949,7 +37990,12 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // receiver too: `ancestors` / `name` in its own #initialize (Bug #18185).
   // `self.ancestors` went through the delegation; the bare name did not.
   let self9 = (if lv_has env "self" then lv_get env "self" else VNil) in
-  if (match blame with VNil -> true | b9 -> rb_identical b9 self9) && mod_inst_delegates world self9 name then
+  // main's define_method with a method as its body (no block): it defines on
+  // Object, as the block form does (Feature #6609)
+  if (str_len name == 13 && str_eq name "define_method") && (match blame with VNil -> true | _ -> false)
+     && (match self9 with VMain -> true | _ -> false) && (match args with Cons (_, Cons (_, Nil)) -> true | _ -> false) then
+    invoke_val_c env world noblk (VClass "Object") name args false
+  else if (match blame with VNil -> true | b9 -> rb_identical b9 self9) && mod_inst_delegates world self9 name then
     invoke_val_c env world noblk self9 name args false
   // ...and so does a Thread subclass's to its builtin surface:
   // `name`, `alive?`, `pending_interrupt?` in its own methods (and in its
@@ -49825,6 +49871,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   // matters, because the last statement is the body's value.
   // ...and it is where a :line tracepoint fires: one statement, one event.
   //   A program with no tracepoint pays the one flag lookup.
+  // (a block's opening line, see parse_block_inner: nothing to run)
+  | SLine n when n < 0 -> FNext VNil
   | SLine n -> let _ = cur_line_set n in
     //   ...but not in `<internal:...>` code (the prelude): ruby's own core
     //   code emits no :line events.
