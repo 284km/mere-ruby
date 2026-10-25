@@ -3729,7 +3729,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // every alias sees it (unless the class redefines the method).
        else if (match recv with VStr _ -> true | _ -> false)
                && (is_str_mut name || (str_len name == 3 && str_eq name "[]="))
-               && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+               && (if has_meth world (dispatch_cls_of world recv) name then false else true)
+               // (...nor one an active refinement redefines: `refine(String) {
+               //  def chop! }` was passed by, Bug #8880)
+               && (map_len ref_active == 0 || str_eq (refined_impl_for world recv name) "") then
          // the count first, as invoke_val_c0 asks it: `"foo".slice!` and
          // `s.chomp!("", "")` came here and never met the table.
          let __am = builtin_arity_msg world recv name args in
@@ -13001,7 +13004,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // A class that redefines the method keeps priority.
   if (match recv with VStr _ -> true | _ -> false)
      && (is_str_mut name || (str_len name == 3 && str_eq name "[]="))
-     && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+     && (if has_meth world (dispatch_cls_of world recv) name then false else true)
+     && (map_len ref_active == 0 || str_eq (refined_impl_for world recv name) "") then
     (match recv with
      | VStr h ->
        (if (str_len name == 6 && str_eq name "slice!") && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false)
@@ -22351,7 +22355,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // binds to Child, because Child's singleton inherits from Parent's.
           // The check compared "(sng:Parent)" against Child's own class name
           // and refused a binding ruby allows.
-          let ok = (if map_has modules ucls then true
+          // (a refinement's method binds to what the refinement refines, and
+          //  nothing else: "bind argument must be an instance of A")
+          let rt9 = (if is_refine_impl ucls then refine_target_of ucls else "") in
+          let ok = (if (if str_eq rt9 "" then false else true) then
+                      (match target with
+                       | VObj tid -> obj_is_a world (map_get ocls tid) rt9
+                       | _ -> obj_is_a world (class_name target) rt9 || str_eq (class_name target) rt9)
+                    else if map_has modules ucls then true
                     else if is_sng_cls ucls then
                       (match target with
                        | VClass tc9 -> obj_is_a world ("(sng:" ++ tc9 ++ ")") ucls || str_eq ("(sng:" ++ tc9 ++ ")") ucls
@@ -22380,7 +22391,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              else (match args with
                    | Cons (_, rest) -> invoke_val_c env world blk bm9 "call" rest false
                    | _ -> VNil))
-          else raise_exc world "TypeError" ("bind argument must be an instance of " ++ ucls))
+          else raise_exc world "TypeError" ("bind argument must be an instance of " ++ cls_display world (if str_eq rt9 "" then ucls else rt9)))
        else if (str_len name == 4 && str_eq name "name") then VSym unm
        else if (str_len name == 5 && str_eq name "owner") then
          VClass (impl_public (if map_has ivars (str_of_int id ++ "@__um_owner")
@@ -25688,10 +25699,12 @@ and proc_derived_call = fn env -> fn world -> fn blk -> fn (pid: int) -> fn (arg
 // redefined to_proc was never called for `[1, 2].map(&:to_s)` (note 305).
 and bp_sym = fn world -> fn (bp: str list) -> fn (bb: Stmt list) ->
   match bp with
-  | Cons (m9, Cons (p9, Cons (r9, Nil))) when str_eq m9 lambda_blk_marker && str_eq p9 "__bp" && str_eq r9 "*__ba" ->
+  | Cons (m9, Cons (p9, Cons (r9, rest9))) when str_eq m9 lambda_blk_marker && str_eq p9 "__bp" && str_eq r9 "*__ba"
+                                               && (match rest9 with Nil -> true | Cons (q9, Nil) -> str_eq q9 "&__bb" | _ -> false) ->
     (match bb with
-     | Cons (SExpr (EMethod (EVar v9, s9, Cons (ESplat (EVar a9), Nil))), Nil)
+     | Cons (SExpr (EMethod (EVar v9, s9, Cons (ESplat (EVar a9), tl9))), Nil)
        when str_eq v9 "__bp" && str_eq a9 "__ba"
+            && (match tl9 with Nil -> true | Cons (EBlockPass (EVar "__bb"), Nil) -> true | _ -> false)
             && (has_meth world "Symbol" "to_proc" || (map_len undefs > 0 && undef_blocked world "Symbol" "to_proc")) -> s9
      | _ -> "")
   | _ -> ""
@@ -25708,7 +25721,7 @@ and sym_ps_shape = fn (ps: str list) ->
 // proc/lambda/Proc.new, that one Proc, as `m(&sym)` does
 and sym_blk_proc = fn env -> fn world -> fn blk ->
   match blk with
-  | (true, Cons (mk9, Cons ("__bp", Cons ("*__ba", Nil))), Cons (SExpr (EMethod (EVar "__bp", s9, Cons (ESplat (EVar "__ba"), Nil))), Nil), _)
+  | (true, Cons (mk9, Cons ("__bp", Cons ("*__ba", Cons ("&__bb", Nil)))), Cons (SExpr (EMethod (EVar "__bp", s9, Cons (ESplat (EVar "__ba"), Cons (EBlockPass (EVar "__bb"), Nil)))), Nil), _)
       when str_eq mk9 lambda_blk_marker
            && (if has_meth world "Symbol" "to_proc" then false else true)
            // (with refinements in play the call site's `using` decides what
@@ -47889,6 +47902,14 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
     //  which cls_frozen does not record: `o.freeze; class << o; def x; end`)
     let _ = (if (map_len cls_frozen > 0 || is_sng_cls cls) && cls_body_writes s
              then (match s with SAssign (_, _) -> frz_const_check world cls | _ -> frz_cls_check world cls) else ()) in
+    // (a constant or class variable written in a `refine` body lands on the
+    //  module around it, and ruby says so, Bug #10103)
+    let _ = (if is_refine_impl cls
+                && (match s with
+                    | SAssign (n9, _) -> is_upper_first n9
+                    | SIVarAssign (n9, _) -> str_len n9 > 0 && str_eq (char_at n9 0) "@"
+                    | _ -> false)
+             then rb_warn world "not defined at the refinement, but at the outer class/module" else ()) in
     // ⚠ THE DEFAULT VISIBILITY IS A PROPERTY OF THE SCOPE, not of the syntax
     //   that set it: `send :private`, `1.times { private }` and an eval'd
     //   `private` set it too, and a def run by eval or by a block inside the
