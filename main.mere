@@ -2788,7 +2788,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // Kernel#instance_variables_to_inspect (ruby 4.0): nil means "all of them";
     // a class overrides it to choose what #inspect shows (see inspect_w).
     else if (str_len name == 29 && str_eq name "instance_variables_to_inspect") then VNil
-    else if (str_len name == 16 && str_eq name "global_variables") && (if map_has meths name then false else true) then global_vars_of ()
+    else if (str_len name == 16 && str_eq name "global_variables") && (if map_has meths name then false else true) then global_vars_with_match env world blk
     // Kernel#binding: capture the current locals env (which holds "self") --
     // unless the receiver has its own `binding` (rubocop-ast's compiler holds
     // its variable bindings in an `attr_reader :binding`, and a builtin must
@@ -2980,7 +2980,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | _ -> (let _ = (match args with Cons (VSym s, _) -> map_set r2k_methods s VNil | _ -> ()) in
                (match args with Cons (a, _) -> a | _ -> VNil)))
     else if (str_len name == 15 && str_eq name "local_variables") && (if map_has meths name then false else true) then local_vars_of env
-    else if (str_len name == 16 && str_eq name "global_variables") && (if map_has meths name then false else true) then global_vars_of ()
+    else if (str_len name == 16 && str_eq name "global_variables") && (if map_has meths name then false else true) then global_vars_with_match env world blk
     // ⚠ a top-level `def include` is a private method of OBJECT, and inside a
     //   module Module#include is found first. Top-level methods are searched
     //   before self's here, so a program (or a spec harness) with its own
@@ -11514,7 +11514,9 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
        let nm9 = (if str_eq cls "Method" then gv9 "@__m_name" else gv9 "@__um_name") in
        let rcv9 = (if map_has iv2 (str_of_int oid ++ "@__m_recv") then map_get iv2 (str_of_int oid ++ "@__m_recv") else VMain) in
        let own9 = (if str_eq own9 "" then class_name rcv9 else own9) in
-       (if str_eq cls "Method" then bound_meth_inspect world (gv9 "@__m_owner") nm9 rcv9
+       (if str_eq cls "Method" && map_has iv2 (str_of_int oid ++ "@__m_bound") && (if str_eq (gv9 "@__m_owner") "" then false else true)
+        then meth_inspect_str world "Method" (gv9 "@__m_owner") nm9 (bm_params world (gv9 "@__m_owner") nm9) (meth_source_location world (gv9 "@__m_owner") nm9 rcv9)
+        else if str_eq cls "Method" then bound_meth_inspect world (gv9 "@__m_owner") nm9 rcv9
         else meth_inspect_str world cls own9 nm9 (bm_params world own9 nm9)
          (meth_source_location world own9 nm9 rcv9)))
     else if map_has md_whole oid then
@@ -20662,7 +20664,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // name, the parameter SHAPE and where it was written. It used to be
          // the class and the name alone, and for an object with ivars the
          // default printer showed the internal ones instead.
-         mkstr (bound_meth_inspect world mown mnm mrecv)
+         mkstr (if map_has ivars (str_of_int id ++ "@__m_bound") && (if str_eq mown "" then false else true)
+                then meth_inspect_str world "Method" mown mnm (bm_params world mown mnm) (meth_source_location world mown mnm mrecv)
+                else bound_meth_inspect world mown mnm mrecv)
        // the universal names, same reason as the ThreadGroup arm above (this
        // one refused `nil?` and `itself`).
        else if is_prim_method name then dispatch_prim env world blk recv name args false
@@ -22324,6 +22328,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              let _ = (match bm9 with
                       | VObj b9 -> msnap_carry world id "UnboundMethod" b9 "Method"
                       | _ -> ()) in
+             // (a Method made by #bind names its owner in #inspect, not the
+             //  receiver's class: Bug #22321)
+             let _ = (match bm9 with
+                      | VObj b9 -> (if (str_len name == 4 && str_eq name "bind") then map_set ivars (str_of_int b9 ++ "@__m_bound") (VBool true) else ())
+                      | _ -> ()) in
              if (str_len name == 4 && str_eq name "bind") then bm9
              else (match args with
                    | Cons (_, rest) -> invoke_val_c env world blk bm9 "call" rest false
@@ -23706,6 +23715,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // hash MARKED as a keywords hash, so re-splatting it stays keywords. The
     // flag is per PROC, the way ruby2_keywords is per method, and the method
     // side has had r2k_methods all along.
+    // (a frozen proc refuses the flag before anything else)
+    else if (str_len name == 14 && str_eq name "ruby2_keywords") && cfrozen_get 2 pid then
+      raise_exc_iv world "FrozenError" ("can't modify frozen Proc: " ++ inspect_w env world recv) (Cons (("__recv", recv), Nil))
     else if (str_len name == 14 && str_eq name "ruby2_keywords") then
       (let ps9 = (match proc_get (str_of_int pid) with (h9, ps9, _, _) -> strip_marker_params ps9) in
        // ruby WARNS (and does nothing) for a proc that cannot carry the flag:
@@ -23817,6 +23829,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       // into *rest can be re-splatted and still arrive as keywords.
       let _ = (if map_has r2k_procs (r2k_root (str_of_int pid)) then mark_r2k_tail args else ()) in
       let theblk = proc_get (str_of_int pid) in
+      // ...and a LAMBDA without keyword parameters absorbs a `key:` hash
+      // positionally, so it loses the mark, as a method's does: `->(*a, b)
+      // { m(*a, b) }` passed b to m as a Hash, not as keywords
+      // (not Symbol#to_proc's, nor one Method#to_proc made: they forward the
+      //  call, keywords and all, to a method)
+      let _ = (if map_has lambda_ids (str_of_int pid) && (if map_has r2k_procs (r2k_root (str_of_int pid)) then false else true)
+                  && (if map_has proc_symsrc (str_of_int pid) then false else true)
+                  && (match theblk with (_, _, _, ce9) -> (if lv_has ce9 "__m_meth" then false else true))
+                  && (match theblk with (_, ps9, _, _) -> (match kw_params (strip_marker_params ps9) with Nil -> true | _ -> false))
+               then unmark_kwargs args else ()) in
       // a lambda checks arity strictly (procs stay lenient).
       let _ =
         if map_has lambda_ids (str_of_int pid) then
@@ -39895,6 +39917,11 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
                     || (str_len meth == 3 && str_eq meth "===") ->
        (let _ = map_set proc_bcall 0 1 in
         invoke_val_c gc_cenv0 world superblk recv "call" args false)
+     // (String#=== is String#==: the same bytes, and false for a non-String)
+     | VStr h9 when (str_len meth == 3 && str_eq meth "===") ->
+       (match args with
+        | Cons (VStr o9, _) -> VBool (str_eq (sget h9) (sget o9))
+        | _ -> VBool false)
      | _ ->
        (match superblk with
         | (true, _, _, _) -> builtin_iter world superblk superblk recv meth args
@@ -45307,6 +45334,29 @@ and cmperr_cls = fn env -> fn world -> fn (v: Val) ->
   | _ -> class_name v
 // each zip argument as an Array, or VNil when one of them cannot answer #to_a
 // (which is the only case the lazy path cannot take).
+// Kernel#global_variables: the numbered ones are the groups of the last
+// match that took part ($1 and $12 of twelve, not a $2 that matched nothing),
+// not whatever slots were written before
+and global_vars_with_match = fn env -> fn world -> fn blk ->
+  let all9 = (match global_vars_of () with VArr a9 -> deref a9 | _ -> Nil) in
+  let rec keep9 = fn (xs: Val list) ->
+    (match xs with
+     | Nil -> Nil
+     | Cons (VSym n9, t9) when str_len n9 > 1 && is_digit (char_at n9 1) && (if str_eq n9 "$0" then false else true) -> keep9 t9
+     | Cons (h9, t9) -> Cons (h9, keep9 t9)) in
+  let md9 = eval_e env world blk (EVar "$~") in
+  let caps9 = (match md9 with
+               | VNil -> Nil
+               | _ -> (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) md9 "captures" Nil false with
+                       | VArr c9 -> deref c9
+                       | _ -> Nil)) in
+  let rec nums9 = fn (xs: Val list) -> fn (k: int) ->
+    (match xs with
+     | Nil -> Nil
+     | Cons (VNil, t9) -> nums9 t9 (k + 1)
+     | Cons (_, t9) -> Cons (VSym ("$" ++ str_of_int k), nums9 t9 (k + 1))) in
+  arr_new (list_append (keep9 all9) (nums9 caps9 1))
+
 and lz_zip_args = fn env -> fn world -> fn (xs: Val list) ->
   let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
   arr_new (lz_zip_args_go env world nb9 xs)
@@ -52917,7 +52967,23 @@ and bound_meth_inspect = fn world -> fn (mown: str) -> fn (mnm: str) -> fn (mrec
   // (...and for an alias, where the method it was made FROM is: `alias bar
   //  foo` in a subclass is `#<Method: C3(C)#bar(foo)()>`)
   let bown9 = body_cls_of world mown (original_name_of world mown mnm) in
-  if str_eq mown "" || is_sng_cls mown || str_eq klass9 (cls_display world bown9) then base9
+  // a BUILTIN reached on a class: ruby names the class's singleton and the
+  // owner (`#<Class:String>(Module)#prepend(*)`, Bug #17428), or the class
+  // and a dot when the singleton owns it (`String.new(*)`), with the
+  // parameters its arity implies
+  if str_eq mown "" && (match mrecv with VClass c9 -> (if map_has modules c9 || is_sng_cls c9 then false else true) | _ -> false) then
+    (let c9 = (match mrecv with VClass c8 -> c8 | _ -> "") in
+     let l9 = builtin_frame_label world mrecv mnm in
+     let ix9 = str_index_of l9 "#" in
+     let ow9 = (if ix9 > 0 then substring l9 0 ix9 else "") in
+     if str_eq ow9 "" then base9
+     else
+       (let ar9 = builtin_arity_of world ow9 mnm in
+        let rec us9 = fn (k: int) -> (if k <= 0 then "" else if k == 1 then "_" else "_, " ++ us9 (k - 1)) in
+        let ps9 = (if ar9 < 0 then (let rq9 = 0 - ar9 - 1 in (if rq9 > 0 then us9 rq9 ++ ", " else "") ++ "*") else us9 ar9) in
+        if is_sng_cls ow9 then "#<Method: " ++ cls_display world c9 ++ "." ++ mnm ++ "(" ++ ps9 ++ ")>"
+        else "#<Method: " ++ cls_display world ("(sng:" ++ c9 ++ ")") ++ "(" ++ cls_display world ow9 ++ ")#" ++ mnm ++ "(" ++ ps9 ++ ")>"))
+  else if str_eq mown "" || is_sng_cls mown || str_eq klass9 (cls_display world bown9) then base9
   else "#<Method: " ++ klass9 ++ "(" ++ cls_display world bown9 ++ ")#" ++ substring base9 (str_len ("#<Method: " ++ cls_display world mown ++ "#")) (str_len base9)
 and meth_inspect_str = fn world -> fn (kind: str) -> fn (owner: str) -> fn (nm0: str) -> fn (params: Val) -> fn (loc: Val) ->
   // an ALIAS names what it was made from, in parentheses after its own name
