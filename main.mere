@@ -14553,7 +14553,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      else mkstr (inspect_w env world (mkhash (env_hash_list ()))))
   else if ((str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s"))
           && (match recv with VArr _ -> true | VHsh _ -> true | _ -> false)
-          && not (has_meth world (class_name recv) name) then
+          // (asked of the receiver's own class: an Array or Hash SUBCLASS's
+          //  #to_s -- or one a module it includes gives -- is its own, and
+          //  json names a key with it)
+          && not (has_meth world (class_name recv) name)
+          && not (has_meth world (dispatch_cls_of world recv) name) then
     // the RESULT is US-ASCII unless a piece forces something wider: ruby builds
     // it in US-ASCII and negotiates as it appends, so `[].inspect.encoding` is
     // US-ASCII and stays that way while every element inspects to plain ASCII.
@@ -19816,7 +19820,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                        // (a visibility statement on an inherited method is
                        //  the class's own entry -- ruby's zsuper method -- and
                        //  remove_method takes it away like any other)
-                       (if map_has meths0 key || builtin_owns_here c n9 || map_has vis_marks key then ()
+                       // (...or one of Module's own definition hooks, a builtin
+                       //  there: json's test removes Module#included and puts
+                       //  its own in its place)
+                       // (...or an alias of a builtin, which is this class's entry too)
+                       (if map_has meths0 key || builtin_owns_here c n9 || map_has vis_marks key
+                           || map_has builtin_alias key
+                           || ((str_eq c "Module" || str_eq c "Class") && is_definition_hook n9) then
+                          (if (if tomb then false else true) && map_has builtin_alias key then map_delete builtin_alias key else ())
                         else (let _ = raise_exc world "NameError"
                                 ("method '" ++ n9 ++ "' not defined in " ++ cls_display world c) in ()))) in
             let _ = (if (if tomb then false else true) && (if map_has meths0 key then false else true) && map_has vis_marks key then
@@ -20081,7 +20092,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // `singleton_class.send :alias_method, :[], :new`, so `Node[a, b]` is
     // `Node.new(a, b)`): the alias table records the source name.
     else if (if str_eq (blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name) "" then false else true) then
-      invoke_val_c env world blk recv (blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name) args false
+      (if is_definition_hook (blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name) then VNil
+       else invoke_val_c env world blk recv (blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name) args false)
     // a class object is an instance of Class < Module, so user methods on
     // Module/Class are callable on any class.
     else if has_meth world "Module" name then invoke world noblk recv "Module" name args
@@ -20250,7 +20262,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // ordinary object, so aliasing any Kernel or Object method installed a name
     // that answered NoMethodError.
     else if (if str_eq (blt_alias_lookup world (ancestors_of world cls) name) "" then false else true) then
-      invoke_val_c env world blk recv (blt_alias_lookup world (ancestors_of world cls) name) args false
+      (if is_definition_hook (blt_alias_lookup world (ancestors_of world cls) name) then VNil
+       else invoke_val_c env world blk recv (blt_alias_lookup world (ancestors_of world cls) name) args false)
     // The four Kernel names ruby keeps PRIVATE whatever a class does with them
     // (is_kernel_priv_only). Their builtin arms are further down, and a plain
     // call has to be refused before reaching one -- `obj.initialize_copy(x)`
@@ -37636,6 +37649,10 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
 // first, and the usual reason for the alias is that there is one.
 and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn (args: Val list) ->
   match (recv, args) with
+  // (an alias of a builtin definition hook is that no-op hook, not the name
+  //  asked again: `alias_method :included_orig, :included` and then a new
+  //  #included that calls it went round for ever)
+  | _ when is_definition_hook src -> VNil
   | (VArr id, _) when str_eq src "pack" -> pack_call env world (deref id) args
   | (VStr h, _) when str_eq src "unpack" -> arr_new (unpack_call env world h 0 args)
   | (VStr h, _) when str_eq src "unpack1" -> (match unpack_call env world h 2 args with Cons (v, _) -> v | Nil -> VNil)
@@ -39983,6 +40000,14 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
           (let k9 = hash_store_key gc_cenv0 world h9 k in
            hput_or_queue_w gc_cenv0 world h9 (hcbi_on h9) k9 v (fn (u: unit) -> hash_put_wx gc_cenv0 world h9 (hcbi_on h9) (hderef h9) k9 v))
         | _ -> VNil)
+     // (...and an Array subclass's #<< / #push: the append prim_method does
+     //  not make, json's parser hands each element to the class's own #<<)
+     | VArr aid9 when (str_len meth == 2 && str_eq meth "<<") || (str_len meth == 4 && str_eq meth "push") || (str_len meth == 6 && str_eq meth "append") ->
+       (let _ = (if val_is_frozen recv then
+                   (let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+                              (Cons (("__recv", recv), Nil)) in ())
+                 else ()) in
+        let _ = arr_set aid9 (list_append (deref aid9) args) in recv)
      // a PROC's #call from a prepended / refined / redefined #call: the
      // builtin call, which prim_method cannot make (proc_bcall tells the Proc
      // arm to skip the program's #call this once, note 305)
@@ -47355,6 +47380,9 @@ and alias_builtin_exists = fn world -> fn (cls: str) -> fn (n: str) ->
   // (BasicObject's private hooks every class has: `class BasicObject;
   //  alias_method :initialize, :initialize` -- test_super, Bug #21992)
   || str_eq n "initialize" || str_eq n "method_missing" || str_eq n "respond_to_missing?"
+  // (...and Module's definition hooks, which every module answers as no-ops:
+  //  `Module.send(:alias_method, :included_orig, :included)`, json's own test)
+  || ((str_eq cls "Module" || str_eq cls "Class") && is_definition_hook n)
   // ⚠ ...and a REFINEMENT sees the class it refines: `refine Array do alias
   //   orig_count count end` names Array#count, and the refinement module's
   //   own chain (Refinement, Module, Object...) has no count, so it was a
