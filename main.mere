@@ -5376,7 +5376,11 @@ and gvar_assign_checked = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
      let _ = gvar_write world slot v9 in ())
   // ($> is $stdout under its other name, and refuses in that name)
   else if str_eq slot "stdout" || str_eq slot "stderr" || str_eq slot ">" then
-    (if responds world v "write" then (let _ = gvar_write world slot v in ())
+    // ($> and $stdout are ONE variable: written under either name, both read it)
+    (if responds world v "write" then
+       (let _ = gvar_write world slot v in
+        let _ = (if str_eq slot ">" then gvar_write world "stdout" v
+                 else if str_eq slot "stdout" && map_has globals ">" then gvar_write world ">" v else ()) in ())
      // (named as WRITTEN: an alias of $stdout refuses in its own name)
      else (let _ = raise_exc world "TypeError"
              (name ++ " must have write method, "
@@ -12954,6 +12958,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // (transform_keys! / transform_values! are yielders too, when given
   // nothing -- `frozen.transform_keys!` is an Enumerator; with a mapping Hash
   // they write at once and refuse here)
+  // (the prelude's IO reads lock and unlock the buffer they fill)
+  if (str_len name == 9 && str_eq name "__locktmp") || (str_len name == 11 && str_eq name "__unlocktmp") then
+    (match recv with
+     | VStr h9 -> (let _ = (if str_eq name "__locktmp" then map_set str_locks (str_of_int h9) 1
+                            else if map_has str_locks (str_of_int h9) then map_delete str_locks (str_of_int h9) else ()) in recv)
+     | _ -> recv)
+  else
   if builtin_mut_on_frozen world recv name
      && (if enum_needs_block name then false else true)
      && (if transform_bang_bare name args
@@ -31217,6 +31228,12 @@ and chill_changes = fn (name: str) ->
   || str_eq name "bytesplice" || str_eq name "singleton_class" || str_eq name "instance_variable_set"
   || str_eq name "extend" || str_eq name "define_singleton_method"
 and builtin_mut_on_frozen = fn world -> fn (recv: Val) -> fn (name: str) ->
+  // (a string a waiting read is filling is locked: rb_str_locktmp's refusal,
+  //  asked at the same doors the frozen check is)
+  let _ = (if map_len str_locks > 0 && is_mutating_method name
+              && (match recv with VStr h9 -> map_has str_locks (str_of_int h9) | _ -> false)
+              && (if has_meth world (dispatch_cls_of world recv) name then false else true)
+           then (let _ = raise_exc world "RuntimeError" "can't modify string; temporarily locked" in ()) else ()) in
   is_mutating_method name && val_frozen_mut recv
   && (if has_meth world (dispatch_cls_of world recv) name then false else true)
 
@@ -42595,6 +42612,7 @@ and io_fd_prim = fn world -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "__fdlive" then
     (let d = fd_dup (ia 0) in
      if d >= 0 then (let _ = fd_close d in VBool true)
+     else if fd_neg_errno () != 0 - 9 then VBool true
      else (let _ = forget (ia 0) in VBool false))
   else if str_eq name "__fdlist" then
     (let all9 = (match args with Cons (VBool true, _) -> true | _ -> false) in
@@ -42620,8 +42638,10 @@ and io_fd_prim = fn world -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "__fdseek" then VInt (fd_seek (ia 0) (ia 1) (ia 2))
   else if str_eq name "__fdclose" then
     (let r = fd_close (ia 0) in let _ = (if r == 0 then forget (ia 0) else ()) in VInt r)
+  // (a refusal is -errno: EMFILE at the descriptor limit is not EBADF)
   else if str_eq name "__fddup" then
-    (let n = fd_dup (ia 0) in let _ = (if n >= 0 then carry (ia 0) n else ()) in VInt n)
+    (let n = fd_dup (ia 0) in
+     if n >= 0 then (let _ = carry (ia 0) n in VInt n) else VInt (fd_neg_errno ()))
   else if str_eq name "__fddup2" then
     (let n = (if ia 0 < 0 || ia 1 < 0 then 0 - 1 else dup2 (ia 0) (ia 1)) in
      let _ = (if n >= 0 && ia 0 != ia 1 then carry (ia 0) n else ()) in VInt n)
@@ -54597,9 +54617,14 @@ and p_print_each = fn env -> fn world -> fn (args: Val list) ->
 // puts of one value: arrays flatten recursively; an object uses its
 // user-defined to_s if present (Ruby would otherwise print an address,
 // which cannot be byte-matched — corpus objects define to_s).
-and puts_one = fn world -> fn (v: Val) ->
+and puts_one = fn world -> fn (v: Val) -> puts_one_in world (Nil : int list) v
+// (`seen` is the arrays being written, outside in: one that holds itself is
+//  written as [...], as rb_io_puts does -- it went down forever)
+and puts_one_in = fn world -> fn (seen: int list) -> fn (v: Val) ->
   match v with
-  | VArr id -> puts_each world (deref id)
+  | VArr id ->
+    (if int_list_has seen id then out_emit_line world "[...]"
+     else puts_each_in world (Cons (id, seen)) (deref id))
   | VObj id ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls id in
@@ -54653,10 +54678,11 @@ and out_emit_line_x = fn world -> fn (s: str) -> fn (has_nl: bool) ->
            let _ = invoke_val_c gc_cenv0 world nb9 t9 "write" (Cons (mkstr "\n", Nil)) false in ())
         else (let _ = invoke_val_c gc_cenv0 world nb9 t9 "write" (Cons (mkstr s, Cons (mkstr "\n", Nil))) false in ())))
 
-and puts_each = fn world -> fn (xs: Val list) ->
+and puts_each = fn world -> fn (xs: Val list) -> puts_each_in world (Nil : int list) xs
+and puts_each_in = fn world -> fn (seen: int list) -> fn (xs: Val list) ->
   match xs with
   | Nil -> ()
-  | Cons (h, t) -> let _ = puts_one world h in puts_each world t;
+  | Cons (h, t) -> let _ = puts_one_in world seen h in puts_each_in world seen t;
 
 // run a program; when print_result is true, print the last statement's
 // value with no trailing newline (bootstraptest's `print(begin; ...; end)`
