@@ -2586,8 +2586,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let _ = debug_raise_note world exc in
     raise_exc_val world exc
   | EVar name ->
+    // a bare `bg!` -- no parentheses, no arguments -- that names an alias of
+    // block_given? / raise is the call the ECall arm resolves (a name that
+    // ends in ! or ? is never a local variable)
+    if map_len builtin_alias > 0 && str_len name > 1
+       && (let l9 = char_at name (str_len name - 1) in str_eq l9 "!" || str_eq l9 "?")
+       && (let t9 = kernel_fn_alias_of env world name in
+           str_eq t9 "block_given?" || str_eq t9 "iterator?" || str_eq t9 "raise" || str_eq t9 "fail")
+    then eval_e env world blk (ECall (name, Nil))
     // `__FILE__` / `__dir__` with the parsed file attached (see enc_pseudo_var).
-    if str_len name > 9 && str_eq (substring name 0 9) "__FILE__~" then
+    else if str_len name > 9 && str_eq (substring name 0 9) "__FILE__~" then
       (let f9 = substring name 9 (str_len name) in
        let v = mkstr f9 in
        let _ = (if map_has file_name_enc f9 then (match v with VStr id -> senc_set id (map_get file_name_enc f9) | _ -> ()) else ()) in
@@ -2902,7 +2910,30 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                            //  redefined it: `alias _orig_pack pack` and a new
                            //  `pack` is the builtin's own alias path, which
                            //  calls the ORIGINAL)
-                           if is_kernel_builtin t9 && (if has_meth world c9 t9 || map_has meths t9 then false else true) then t9 else ""))) in
+                           // (...and block_given?, which reads the CALLER's block:
+                           //  openstruct's `alias_method :block_given!, :block_given?`)
+                           if (is_kernel_builtin t9 || str_eq t9 "block_given?" || str_eq t9 "iterator?")
+                              && (if has_meth world c9 t9 || map_has meths t9 then false else true) then t9 else ""))) in
+    // (raise / fail are not functions an ECall finds -- the parser makes
+    //  them their own node -- so an alias of one raises through Kernel's:
+    //  openstruct's `raise! ArgumentError, msg, caller(1)`)
+    if (str_eq ka9 "raise" || str_eq ka9 "fail") && (if str_eq ka9 name then false else true) then
+      invoke_val_c env world blk (VClass "Kernel") ka9 (eval_args env world blk arges) false
+    else
+    // (...and block_given? reads the caller's frame, as the bare word does)
+    if (str_eq ka9 "block_given?" || str_eq ka9 "iterator?") && (match arges with Nil -> true | _ -> false) then
+      eval_e env world blk (EVar ka9)
+    else
+    // (...and an alias of an OBJECT's builtin -- define_singleton_method,
+    //  instance_variable_set -- called on the implicit self is the same call
+    //  with self as the receiver: the receiver dispatcher resolves it)
+    if map_len builtin_alias > 0 && str_eq ka9 ""
+       && (match (if lv_has env "self" then lv_get env "self" else VMain) with VObj _ -> true | _ -> false)
+       && (let t9 = kernel_fn_alias_of env world name in
+           (if str_eq t9 "" then false else true) && (if str_eq t9 name then false else true)
+           && (if is_kernel_builtin t9 then false else true)) then
+      invoke_val_c env world blk (lv_get env "self") name (eval_args env world blk arges) false
+    else
     if (if str_eq ka9 "" then false else (if str_eq ka9 name then false else true)) then eval_e env world blk (ECall (ka9, arges))
     else
     let args = eval_args env world blk arges in
@@ -20054,6 +20085,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            // (`undef_method(:method_missing)`, test_object)
                            || str_eq n9 "method_missing" || str_eq n9 "respond_to_missing?" || str_eq n9 "initialize"
                            || is_kernel_builtin n9 || is_prim_method n9
+                           || listed_builtin_root world c n9
                            // (a class's singleton inherits Class's methods:
                            //  `class << self; undef_method :new; end`, as
                            //  bigdecimal does)
@@ -20516,8 +20548,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // ordinary object, so aliasing any Kernel or Object method installed a name
     // that answered NoMethodError.
     else if (if str_eq (blt_alias_lookup world (ancestors_of world cls) name) "" then false else true) then
-      (if is_definition_hook (blt_alias_lookup world (ancestors_of world cls) name) then VNil
-       else invoke_val_c env world blk recv (blt_alias_lookup world (ancestors_of world cls) name) args false)
+      (let t9 = blt_alias_lookup world (ancestors_of world cls) name in
+       if is_definition_hook t9 then VNil
+       // (an alias of raise / fail -- openstruct's `alias_method :raise!,
+       //  :raise` -- raises as the function does: no object answers #raise)
+       else if str_eq t9 "raise" || str_eq t9 "fail" then invoke_val_c env world blk (VClass "Kernel") t9 args false
+       // (...and BasicObject's: `!` is the receiver's falsiness, and the two
+       //  evals take the block, which only the block-taking door passes on)
+       else if str_eq t9 "!" then VBool (if truthy recv then false else true)
+       else if (str_eq t9 "instance_eval" || str_eq t9 "instance_exec") && (match blk with (true, _, _, _) -> true | _ -> false) then
+         invoke_with_block env world blk recv t9 args blk
+       else invoke_val_c env world blk recv t9 args false)
     // The four Kernel names ruby keeps PRIVATE whatever a class does with them
     // (is_kernel_priv_only). Their builtin arms are further down, and a plain
     // call has to be refused before reaching one -- `obj.initialize_copy(x)`
@@ -26542,6 +26583,18 @@ and blk_spread_for = fn world -> fn (recv: Val) -> fn (name: str) -> fn b ->
      then blk_spread b else b)
   | _ -> b
 and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk ->
+    // an alias of instance_eval / instance_exec (openstruct's
+    // `instance_eval!`) is the eval itself, block and all
+    let iea9 = (if map_len builtin_alias == 0 then ""
+                else (match recv with
+                      | VObj _ -> (let c9 = dispatch_cls_of world recv in
+                                   if has_meth world c9 name then ""
+                                   else blt_alias_lookup world (ancestors_of world c9) name)
+                      | _ -> "")) in
+    // (...and of any builtin an object answers with a block: openstruct's
+    //  `define_singleton_method!(name) { ... }`)
+    if (if str_eq iea9 "" then false else (if str_eq iea9 name then false else true)) then invoke_with_block env world blk recv iea9 args newblk
+    else
     // the count is checked here too: a block is not an argument, and
     // `each_slice(2, 2) { }` is the same wrong count as without one.
     let __amb = builtin_arity_msg_b world recv name args true in
@@ -28445,6 +28498,12 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   // Integer#coerce / Float#coerce go through Float(), which asks an OBJECT for
   // #to_f. The leaf below has no world to ask with, so it refused every object
   // that was not already a number.
+  // (what is not a number has no #coerce: nil, true, a String, a Symbol...)
+  if (str_len name == 6 && str_eq name "coerce")
+     && (match recv with VInt _ -> false | VBig _ -> false | VFlt _ -> false | VRat (_, _) -> false | VCpx (_, _) -> false | VObj _ -> false | VClass _ -> false | _ -> true) then
+    raise_exc_iv world "NoMethodError" ("undefined method 'coerce' for " ++ for_recv_cls world (class_name recv))
+      (Cons (("__name", VSym "coerce"), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
+  else
   // (a Rational refuses an object, naming its class: BigDecimal is not
   //  converted through #to_f)
   if (str_len name == 6 && str_eq name "coerce") && (match recv with VRat (_, _) -> true | _ -> false)
@@ -31224,6 +31283,11 @@ and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: b
     // ...and the list method_defined? answers from, which is the same fact
     // asked through a different door. See builtin_pub_meth.
     || builtin_pub_meth cls name
+    // ...and what `instance_methods` lists for the class (Kernel's,
+    // BasicObject's, Comparable's): `o.respond_to?(:instance_eval)` was false
+    // for a name the list named and the object answered
+    || (listed_builtin_root world cls name && (if meth_private world cls name then false else true)
+        && (if map_len undefs > 0 && undef_blocked world cls name then false else true))
     // ...and a descriptor stream of an IO SUBCLASS (a socket) answers the
     // layer's stream methods: the lists above name IO's by the class name, so
     // `sock.respond_to?(:read)` and a bare `closed?` inside one were false
@@ -34219,7 +34283,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            | VFlt _ -> arr_new (Cons (o, Cons (VFlt (to_f recv), Nil)))
            | VRat (_, _) -> arr_new (Cons (o, Cons (recv, Nil)))
            | _ -> prim_raise "TypeError" (class_name o ++ " can't be coerced into Rational"))
-        | _ -> arr_new (Cons (o, Cons (recv, Nil))))
+        // ...and what is not a number has no #coerce at all: `nil.coerce(1)`
+        // answered [1, nil], so Matrix's apply_through_coercion asked it
+        // again and again until the stack ran out
+        | _ -> (let _ = prim_nm_set_ra recv args (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
   else if (str_len name == 5 && str_eq name "zero?") then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0")
      | VRat (rn, rd) -> VBool (str_eq rn "0")
@@ -38227,7 +38294,14 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
   //   method_missing on every new member, so `OpenStruct.new(a: 1)` died.
   // (...and so are the senders: `alias_method :try, :__send__` on a String's
   //  singleton class sends through the dispatcher, [ruby-dev:38824])
-  | _ when str_eq src "raise" || str_eq src "fail" || str_eq src "__send__" || str_eq src "send" || str_eq src "public_send" ->
+  // (raise / fail as the FUNCTION, with the receiver as self: an object's
+  //  dispatcher has no raise arm, and OpenStruct's raise! from
+  //  method_missing still said "undefined method 'raise'")
+  | _ when str_eq src "raise" || str_eq src "fail" ->
+    invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass "Kernel") src args false
+  // (BasicObject#! is the receiver's falsiness; prim_method has no "!")
+  | _ when str_eq src "!" -> VBool (if truthy recv then false else true)
+  | _ when str_eq src "__send__" || str_eq src "send" || str_eq src "public_send" ->
     invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
   // ...and neither are the String MUTATORS (concat, <<, replace ...): they
   // rewrite the receiver's store entry in the dispatcher. The receiver is
@@ -38250,6 +38324,17 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
   | (VProc _, _) ->
     (let _ = (if str_eq src "call" && has_meth world "Proc" "call" then map_set proc_bcall 0 1 else ()) in
      invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false)
+  // ...nor an OBJECT's (instance_variable_set, define_singleton_method,
+  // freeze ...: the dispatcher's object arms). Only while nothing redefined
+  // the name -- then the alias is how the new method reaches the builtin, and
+  // asking the receiver would find the new one.
+  // (...and not when the name is itself an alias in that chain: a builtin
+  //  UnboundMethod define_method'd under its own name -- `define_method
+  //  :instance_of?, Object.instance_method(:instance_of?)` -- asked the
+  //  receiver for the same alias for ever)
+  | (VObj _, _) when (if has_meth world (dispatch_cls_of world recv) src then false else true)
+                     && str_eq (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) src) "" ->
+    invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
   | _ -> prim_method recv src args
 and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> fn (args: Val list) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -47465,7 +47550,36 @@ and bind_seq_one = fn frame -> fn world -> fn (p: str) -> fn (v: Val) ->
 // visibility entirely, so #public_methods listed the protected ones.
 // want: 0 = public+protected (#methods), 1 = public, 2 = private, 3 = protected.
 and collect_vis = fn world -> fn (cls: str) -> fn names -> fn blocked -> fn (want: int) -> fn (recur: bool) ->
-  collect_vis_go world (ancestors_of world cls) names blocked want recur true
+  let anc9 = ancestors_of world cls in
+  let _ = collect_vis_go world anc9 names blocked want recur true in
+  // The PUBLIC methods Kernel, BasicObject and Comparable have in the
+  // primitive table are no rows the walk can find: `Object.instance_methods`
+  // listed 4 names of ruby's 51, and openstruct, which aliases each of them
+  // with a `!`, had no `class!`. They sit at the bottom of the chain, so a
+  // name the walk listed, made private or undefined above is left as the
+  // walk decided it.
+  if recur && (want == 0 || want == 1) then
+    (let add9 = fn (nm: str) -> (if map_has names nm || map_has blocked nm then () else map_set names nm (VSym nm)) in
+     let _ = (if str_list_has anc9 "Kernel" then list_iter (kernel_instance_list ()) add9 else ()) in
+     let _ = (if str_list_has anc9 "Comparable" then list_iter (str_split "< <= == > >= between? clamp" " ") add9 else ()) in
+     (if str_list_has anc9 "BasicObject" then list_iter (str_split "! != == __id__ __send__ equal? instance_eval instance_exec" " ") add9 else ()))
+  else ()
+// the names collect_vis adds at the bottom of `cls`'s chain: what
+// `instance_methods` lists, so `undef_method(*instance_methods)` may undefine
+// each of them (strscan's test does, on a String's singleton class)
+and listed_builtin_root = fn world -> fn (cls: str) -> fn (nm: str) ->
+  let anc9 = ancestors_of world cls in
+  (str_list_has anc9 "Kernel" && str_list_has (kernel_instance_list ()) nm)
+  || (str_list_has anc9 "Comparable" && str_list_has (str_split "< <= == > >= between? clamp" " ") nm)
+  || (str_list_has anc9 "BasicObject" && str_list_has (str_split "! != == __id__ __send__ equal? instance_eval instance_exec" " ") nm)
+// Kernel's public instance methods, as ruby 4.0 has them (=~ left Object in
+// ruby 3.2)
+and kernel_instance_list = fn (u: unit) ->
+  str_split ("!~ <=> === class clone define_singleton_method display dup enum_for eql? extend freeze frozen? hash inspect "
+             ++ "instance_of? instance_variable_defined? instance_variable_get instance_variable_set instance_variables is_a? "
+             ++ "itself kind_of? method methods nil? object_id private_methods protected_methods public_method public_methods "
+             ++ "public_send remove_instance_variable respond_to? send singleton_class singleton_method singleton_methods "
+             ++ "tap then to_enum to_s yield_self") " "
 
 
 // the four names, as an array, for a receiver whose class chain is `cls`.
@@ -48144,6 +48258,15 @@ and do_using = fn env -> fn world -> fn (args: Val list) ->
 // methods) and left the class without the method. rubygems guards its
 // `alias gem_original_require require` with `unless defined?(...)`, so the one
 // alias the whole of `require` hangs off was the one that did not happen.
+// the Kernel function a bare name is an alias of, for the implicit self:
+// "" when the class defines the name itself or it is no such alias
+and kernel_fn_alias_of = fn env -> fn world -> fn (name: str) ->
+  let (meths9, _, _, _) = world in
+  if map_has meths9 name then ""
+  else (let s9 = (if lv_has env "self" then lv_get env "self" else VMain) in
+        let c9 = (match s9 with VMain -> "Object" | _ -> dispatch_cls_of world s9) in
+        if has_meth world c9 name then ""
+        else blt_alias_lookup world (ancestors_of world c9) name)
 and alias_builtin_exists = fn world -> fn (cls: str) -> fn (n: str) ->
   let rec any9 = fn (cs: str list) ->
     (match cs with
@@ -48156,6 +48279,9 @@ and alias_builtin_exists = fn world -> fn (cls: str) -> fn (n: str) ->
   // (BasicObject's private hooks every class has: `class BasicObject;
   //  alias_method :initialize, :initialize` -- test_super, Bug #21992)
   || str_eq n "initialize" || str_eq n "method_missing" || str_eq n "respond_to_missing?"
+  // (...and BasicObject's public ones, which every object answers: openstruct
+  //  aliases each of Object.instance_methods with a `!`)
+  || str_eq n "!" || str_eq n "instance_eval" || str_eq n "instance_exec"
   // (...and Module's definition hooks, which every module answers as no-ops:
   //  `Module.send(:alias_method, :included_orig, :included)`, json's own test)
   || ((str_eq cls "Module" || str_eq cls "Class") && is_definition_hook n)
@@ -49716,6 +49842,7 @@ and undef_check = fn world -> fn (cls: str) -> fn (names: str list) ->
        || map_has builtin_alias (cls ++ "#" ++ n)
        // (BasicObject's private hooks every class has)
        || str_eq n "method_missing" || str_eq n "respond_to_missing?" || str_eq n "initialize"
+       || listed_builtin_root world cls n
        // (a class's singleton inherits Class's methods: `class << self;
        //  undef_method :new; end`, as bigdecimal does)
        || (is_sng_cls cls && (str_eq n "new" || str_eq n "allocate" || builtin_has_meth "Class" n))
