@@ -15889,6 +15889,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Nil -> VNil)
     else if str_eq c "Encoding" && (str_len name == 4 && str_eq name "find") then
       (match args with
+       // (a name in an encoding that is not ASCII-compatible names nothing:
+       //  "invalid encoding name (non ASCII)", as rb_to_encoding_index says)
+       | Cons (VStr nh, _) when (if enc_ascii_compat (enc_canon_name (senc_get nh)) then false else true) ->
+         raise_exc world "ArgumentError" "invalid encoding name (non ASCII)"
        | Cons (VStr nh, _) ->
          // (the special names are case-insensitive: "LOCALE" is "locale")
          (let nm2 = (let lo9 = rb_case_str "d" "" (sget nh) in
@@ -16903,7 +16907,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if ((str_len name == 3 && str_eq name "new") || (str_len name == 4 && str_eq name "open"))
                && file_kw_args args && has_meth world "(sng:File)" "__open_kw" then
          invoke_val_c env world blk recv "__open_kw" args false
-       else if (str_len name == 3 && str_eq name "new") || (str_len name == 4 && str_eq name "open") then file_open_obj world (os_path_args world args)
+       else if (str_len name == 3 && str_eq name "new") || (str_len name == 4 && str_eq name "open") then
+         (let _ = file_mode_enc_warn world args in file_open_obj world (os_path_args world args))
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for File"))
     // Dir class methods (pwd via env, mkdir via the shell).
     // Warning[:category] — the warning-category switches: a write is
@@ -21501,6 +21506,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              let _ = (if fd == 2 then err_raw s9 else out_print_checked world s9) in
              c9)
           | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
+       // standard input is not opened for writing, unless it was reopened
+       // onto a stream that is (IO#reopen keeps that as @__std_w)
+       else if fd == 0 && ((str_len name == 5 && str_eq name "write") || (str_len name == 8 && str_eq name "syswrite") || (str_len name == 2 && str_eq name "<<")) then
+         (match (if map_has ivars (str_of_int id ++ "@__std_w") then map_get ivars (str_of_int id ++ "@__std_w") else VNil) with
+          | VBool true ->
+            (let args = stdio_conv env world blk id args in
+             let s2 = io_join_go args "" in
+             let _ = fd_put_all 0 s2 0 0 in
+             if str_eq name "<<" then recv else VInt (str_len s2))
+          | _ -> raise_exc world "IOError" "not opened for writing")
        else if (str_len name == 5 && str_eq name "write") || (str_len name == 8 && str_eq name "syswrite") then
          (let args = stdio_conv env world blk id args in
           let s2 = io_join_go args "" in
@@ -21584,6 +21599,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       if f9 && truthy v9 then map_set ivars (str_of_int id ++ "@__io_univ") (VBool true)
                       else if map_has ivars (str_of_int id ++ "@__io_univ") then map_delete ivars (str_of_int id ++ "@__io_univ")
                       else ())
+                   else ()) in
+          // (...and a newline decorator for what STDOUT writes: `newline:
+          //  :crlf` / `:cr`, or crlf_newline: / cr_newline:)
+          let _ = (if fd == 1 then
+                     (let nl9 = (if opt9 < 0 then ""
+                                 else (let (fn9, vn9) = hash_lookup (hderef opt9) (VSym "newline") in
+                                       let (fc9, vc9) = hash_lookup (hderef opt9) (VSym "crlf_newline") in
+                                       let (fr9, vr9) = hash_lookup (hderef opt9) (VSym "cr_newline") in
+                                       if (fn9 && (match vn9 with VSym k9 -> str_eq k9 "crlf" | _ -> false)) || (fc9 && truthy vc9) then "crlf"
+                                       else if (fn9 && (match vn9 with VSym k9 -> str_eq k9 "cr" | _ -> false)) || (fr9 && truthy vr9) then "cr"
+                                       else "")) in
+                      if str_eq nl9 "" then map_clear stdout_nl else map_set stdout_nl "v" nl9)
                    else ()) in
           let _ = (match args with
                    | Cons (e1, rest9) ->
@@ -26191,6 +26218,29 @@ and rb_verbose_true = fn (u: unit) ->
   if map_has globals (gvar_slot "VERBOSE")
   then (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false)
   else false
+// the encodings a File's mode names ("r:bom|utf-8:euc-jp"), as ruby's
+// rb_io_ext_int_to_encs warns when it opens: a BOM| on a name that is not
+// UTF-*, and a name that is no encoding (which is then ignored)
+// (Kernel#open, in the prelude, has warned at its caller's line already)
+and file_mode_enc_warn = fn world -> fn (args: Val list) ->
+  if str_eq (cur_file ()) "<internal:prelude>" then () else
+  match args with
+  | Cons (_, Cons (VStr h, _)) ->
+    (let m = sget h in
+     let c = str_find_from m ":" 0 in
+     if c < 0 then ()
+     else (let rest = substring m (c + 1) (str_len m) in
+           let c2 = str_find_from rest ":" 0 in
+           let _ = mode_enc_warn1 world (if c2 < 0 then rest else substring rest 0 c2) true in
+           if c2 < 0 then () else mode_enc_warn1 world (substring rest (c2 + 1) (str_len rest)) false))
+  | _ -> ()
+and mode_enc_warn1 = fn world -> fn (nm0: str) -> fn (ext: bool) ->
+  let bom = ext && str_len nm0 >= 4 && str_eq (str_upcase (substring nm0 0 4)) "BOM|" in
+  let nm = (if bom then substring nm0 4 (str_len nm0) else nm0) in
+  let _ = (if bom && (if str_len nm >= 4 then str_eq (str_upcase (substring nm 0 4)) "UTF-" else false) == false
+           then rb_warn world ("BOM with non-UTF encoding " ++ nm ++ " is nonsense") else ()) in
+  if str_len nm == 0 || str_eq nm "-" || map_has enc_objs (enc_find_canon nm) then ()
+  else rb_warn world ("Unsupported encoding " ++ nm ++ " ignored")
 and rb_warn = fn world -> fn (msg: str) ->
   (if (if map_has globals (gvar_slot "VERBOSE")
        then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
@@ -27078,7 +27128,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
           let fobj = (if file_kw_args args && has_meth world "(sng:File)" "__open_kw"
                       then invoke_val_c env world nb9 recv "__open_kw" args false
-                      else file_open_obj world (os_path_args world (path_args nb9 world "open" args))) in
+                      else (let _ = file_mode_enc_warn world args in
+                            file_open_obj world (os_path_args world (path_args nb9 world "open" args)))) in
           (if has_meth world "(sng:File)" "__open_blk" then
              invoke_with_block env world blk (VClass "File") "__open_blk" (Cons (fobj, Nil)) newblk
            else
@@ -42902,6 +42953,11 @@ and io_fd_prim = fn world -> fn (name: str) -> fn (args: Val list) ->
     (let n = (if ia 0 < 0 || ia 1 < 0 then 0 - 1 else dup2 (ia 0) (ia 1)) in
      let _ = (if n >= 0 && ia 0 != ia 1 then carry (ia 0) n else ()) in VInt n)
   else if str_eq name "__fdtty" then VBool (fd_isatty (ia 0) == 1)
+  // STDOUT's newline decorator, for the interpreter's own writes to it
+  else if str_eq name "__fdstdoutnl" then
+    (match args with
+     | Cons (VSym k9, _) -> (let _ = map_set stdout_nl "v" k9 in VNil)
+     | _ -> (let _ = map_clear stdout_nl in VNil))
   else if str_eq name "__fdsync" then VInt (if ia 0 < 0 then 0 - 1 else fsync (ia 0))
   else if str_eq name "__fdnonblock" then
     (let r = io_set_nonblocking (ia 0) in let _ = (if r >= 0 then map_set fd_nb (ia 0) 1 else ()) in VInt r)
@@ -54978,8 +55034,23 @@ and out_emit = fn world -> fn (s: str) ->
 // (m_driver's top level). Before this the refusal was dropped and a program
 // whose reader had gone printed on into nothing.
 and out_print_checked = fn world -> fn (s: str) ->
+  // (STDOUT with a newline decorator -- set_encoding(..., newline: :crlf)
+  //  -- writes LF as CRLF or CR; IO.__stdout_nl set it)
+  let s = (if map_len stdout_nl > 0 && str_contains s "\n"
+           then nl_expand s (if str_eq (map_get stdout_nl "v") "crlf" then "\r\n" else "\r")
+           else s) in
   let _ = out_print_no_nl s in
   out_check world
+// every LF of s as rep
+and nl_expand = fn (s: str) -> fn (rep: str) ->
+  let b9 = strbuf_new () in
+  let n9 = str_len s in
+  let rec go = fn (i: int) -> fn (from: int) ->
+    (if i >= n9 then strbuf_push b9 (substring s from n9)
+     else if str_eq (char_at s i) "\n" then (let _ = strbuf_push b9 (substring s from i) in let _ = strbuf_push b9 rep in go (i + 1) (i + 1))
+     else go (i + 1) from) in
+  let _ = go 0 0 in
+  strbuf_to_str b9
 and out_check = fn world ->
   let e = (if out_errno_ok then proc_out_errno () else 0) in
   if e == 0 then () else out_refused world e
