@@ -3508,6 +3508,15 @@ let core_prelude_d =
   "  # and refuses a command the same way. The old copy of that parsing had\n" ++
   "  # none of the conversions and no argv0.\n" ++
   "  def exec(*args)\n" ++
+  "    # (a descriptor redirected to itself, `f.fileno => f.fileno`, is made\n" ++
+  "    #  inheritable before the exec is tried -- and stays so if it fails)\n" ++
+  "    if args.last.is_a?(Hash)\n" ++
+  "      args.last.each do |k, v|\n" ++
+  "        kf = k.is_a?(IO) ? k.fileno : k\n" ++
+  "        vf = v.is_a?(IO) ? v.fileno : v\n" ++
+  "        IO.__fdcloexec(kf, false) if kf.is_a?(Integer) && kf == vf && kf > 2\n" ++
+  "      end\n" ++
+  "    end\n" ++
   "    pid = Process.spawn(*args)\n" ++
   "    Process.wait(pid)\n" ++
   "    exit!($?.exitstatus || 1)\n" ++
@@ -3556,6 +3565,13 @@ let core_prelude_d =
   // Thread::Backtrace: the class the Locations belong to, and the limit
   // --backtrace-limit set (-1 when none was)
   "class Thread\n" ++
+  // (every thread here runs on the one OS thread, a scheduler's M:N: the main
+  //  thread answers the process's id, another nil -- which ruby allows on
+  //  an M:N scheduler -- and a dead one nil)
+  "  def native_thread_id\n" ++
+  "    return nil unless alive?\n" ++
+  "    equal?(Thread.main) ? Process.pid : nil\n" ++
+  "  end\n" ++
   "  class Backtrace\n" ++
   "    def self.limit = ($__backtrace_limit || -1)\n" ++
   "  end\n" ++
@@ -4966,6 +4982,10 @@ let core_prelude_f =
   "    m = __rlimit_value(max)\n" ++
   "    name = __rlimit_type(resource)\n" ++
   "    raise SystemCallError.new(\"setrlimit\", 22) if name.nil?\n" ++
+  "    # (the limits it already has are no change: macOS refuses even those\n" ++
+  "    #  for STACK in a process whose main stack was linked larger, as this\n" ++
+  "    #  one's is)\n" ++
+  "    return nil if getrlimit(resource) == [c, m]\n" ++
   "    e = __setrlimit(name, c, m)\n" ++
   "    raise SystemCallError.new(\"setrlimit\", e) if e != 0\n" ++
   "    nil\n" ++
@@ -6497,16 +6517,32 @@ let core_prelude_i =
   "\n" ++
   // without a block: a read-only COPY. With one: the string itself, writable
   // unless it is frozen, and freed when the block ends
+  "    # ruby says once per process, at the first buffer made, that IO::Buffer\n" ++
+  "    # is experimental (a warning of that category, so -W:no-experimental\n" ++
+  "    # silences it)\n" ++
+  "    def self.__experimental\n" ++
+  "      return if @__exp_warned\n" ++
+  "      @__exp_warned = true\n" ++
+  "      warn(\"IO::Buffer is experimental and both the Ruby and C interface may change in the future!\", uplevel: 0, category: :experimental)\n" ++
+  "    end\n" ++
   "    def self.for(string)\n" ++
+  "      IO::Buffer.__experimental\n" ++
   "      b = allocate\n" ++
   "      unless block_given?\n" ++
   "        b.__init_for(string.dup)\n" ++
   "        return b\n" ++
   "      end\n" ++
   "      b.__init_for(string, !string.frozen?)\n" ++
+  "      # (the string is locked while the block has it: a change to it is\n" ++
+  "      #  \"can't modify string; temporarily locked\", rb_str_locktmp)\n" ++
+  "      locked = !string.frozen?\n" ++
+  "      string.__locktmp if locked\n" ++
+  "      b.instance_variable_set(:@__locked, locked)\n" ++
   "      begin\n" ++
   "        yield b\n" ++
   "      ensure\n" ++
+  "        string.__unlocktmp if locked\n" ++
+  "        b.instance_variable_set(:@__locked, false)\n" ++
   "        b.free\n" ++
   "      end\n" ++
   "    end\n" ++
@@ -6514,6 +6550,7 @@ let core_prelude_i =
   "    # the arguments are checked the way ruby 4.0 checks them, and the flags\n" ++
   "    # are MAPPED plus EXTERNAL|SHARED (or PRIVATE) plus READONLY if asked\n" ++
   "    def self.map(file, size = nil, offset = 0, flags = 0)\n" ++
+  "      IO::Buffer.__experimental\n" ++
   "      raise TypeError, \"not an Integer\" unless size.nil? || size.is_a?(Integer)\n" ++
   "      raise TypeError, \"no implicit conversion from nil to integer\" if offset.nil?\n" ++
   "      unless offset.is_a?(Integer)\n" ++
@@ -6550,6 +6587,7 @@ let core_prelude_i =
   // a STRING-backed buffer over a new string of that many NULs: external and
   // writable for the block, freed after it, and the string is the answer
   "    def self.string(length)\n" ++
+  "      IO::Buffer.__experimental\n" ++
   "      raise LocalJumpError, \"no block given\" unless block_given?\n" ++
   "      length = __int!(length)\n" ++
   "      if length > 9223372036854775807 || length < -9223372036854775808\n" ++
@@ -6580,6 +6618,7 @@ let core_prelude_i =
   "    # (a size of a page or more is MAPPED unless flags say otherwise: ruby asks\n" ++
   "    # the kernel for pages from there on)\n" ++
   "    def initialize(size = DEFAULT_SIZE, flags = nil)\n" ++
+  "      IO::Buffer.__experimental\n" ++
   "      size = IO::Buffer.__int!(size)\n" ++
   "      raise ArgumentError, \"Size can't be negative!\" if size < 0\n" ++
   "      flags = size >= PAGE_SIZE ? MAPPED : INTERNAL if flags.nil?\n" ++
@@ -6612,7 +6651,13 @@ let core_prelude_i =
   // writes through to the string it was made for
   "    def __store(bytes)\n" ++
   "      enc = @s.encoding\n" ++
-  "      @s.frozen? ? (@s = bytes) : @s.replace(bytes.force_encoding(enc))\n" ++
+  "      # (the lock IO::Buffer.for holds on the string is the buffer's own:\n" ++
+  "      #  its writes go through it)\n" ++
+  "      return @s = bytes if @s.frozen?\n" ++
+  "      @s.__unlocktmp if @__locked\n" ++
+  "      @s.replace(bytes.force_encoding(enc))\n" ++
+  "      @s.__locktmp if @__locked\n" ++
+  "      @s\n" ++
   "    end\n" ++
   "    private :__store\n" ++
   "\n" ++
