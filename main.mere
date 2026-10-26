@@ -2771,7 +2771,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else (let c9 = char_at name 1 in
              // ($_ itself is the last line read, nil until there is one, and
              //  ruby says nothing about it)
-             let _ = (if (is_alpha c9 || str_eq c9 "_") && (if str_eq name "$_" then false else true)
+             // (...and `$-x`, an option variable no switch set)
+             let _ = (if (is_alpha c9 || str_eq c9 "_" || (str_eq c9 "-" && str_len name == 3 && is_alpha (char_at name 2)))
+                         && (if str_eq name "$_" then false else true)
                       then rb_warning world ("global variable '" ++ name ++ "' not initialized") else ()) in
              VNil))
     else
@@ -50592,7 +50594,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // the new name reads and writes the old one's slot (this is all `English`
     // is).
     if str_len n1 > 0 && str_eq (char_at n1 0) "$" && str_len n2 > 0 && str_eq (char_at n2 0) "$" then
-      (let _ = map_set gvar_alias (substring n1 1 (str_len n1)) (mkstr (substring n2 1 (str_len n2))) in FNext VNil)
+      (let a9 = substring n1 1 (str_len n1) in
+       let t9 = "=" ++ gvar_slot (substring n2 1 (str_len n2)) in
+       // (`alias $& $saved` where $saved holds $&'s own entry: back to itself)
+       let _ = (if str_eq t9 ("=" ++ a9) then map_delete gvar_alias a9 else map_set gvar_alias a9 (mkstr t9)) in
+       FNext VNil)
     else
     // self is a class inside a class/module body (and inside class_eval), so the
     // alias belongs to that class -- the bare-name form is for a top-level
@@ -51436,9 +51442,9 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     // the lexer meets one in code (lex_go), as ruby's does: cutting at the
     // first NUL anywhere also cut at one inside a comment or a string. (A
     // UTF-16 source without a BOM still stops at its first code NUL.)
+    let bom9 = (let c1 = sget code in str_len c1 >= 3 && str_eq (substring c1 0 3) (chr 239 ++ chr 187 ++ chr 191)) in
     let code = (let c1 = sget code in
-                if str_len c1 >= 3 && str_eq (substring c1 0 3) (chr 239 ++ chr 187 ++ chr 191)
-                then substring c1 3 (str_len c1) else c1) in
+                if bom9 then substring c1 3 (str_len c1) else c1) in
     let eenv = (match rest with Cons (VBind bid, _) -> map_get bind_store (str_of_int bid) | _ -> env) in
     let sentinel = Cons (SDeclare (Cons ("__syntax_error__", Nil)), Nil) in
     // the eval'd string's encoding (its magic comment, else its own label)
@@ -51446,7 +51452,9 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
     let _ = coding_refuse world code efile9 in
     let cod = src_coding code in
-    let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then str_upcase codelbl else cod)) in
+    // (a source that starts with a UTF-8 BOM is UTF-8, whatever the string
+    //  holding it is labelled: a binary "\xEF\xBB\xBF x = __ENCODING__")
+    let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then (if bom9 then "UTF-8" else str_upcase codelbl) else cod)) in
     let _ = set_parsing_eval code in
     let ebase9 = (if eline9 > 0 then eline9 else 1) in
     // ...and the name `__FILE__` answers inside it (restored below beside the
@@ -51499,10 +51507,9 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
           let why9 = (if str_len why0 == 0 && sl9 > 0 then syn_frame code (sl9 - eline9) sl9 why9 else why9) in
           let msg = (if str_len why9 > 0 then (if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int (if sl9 > 0 && str_len why0 == 0 then sl9 else eline9) ++ ": " ++ why9 else try_or (fn (u: unit) ->
             let toks2 = number_nls code (lex_src code) in
-            let (st1, rest1) = parse_stmt toks2 in
-            (match skip_nls rest1 with
-             | Cons (TId _, _) -> ": syntax error, unexpected local variable or method, expecting end-of-input"
-             | _ -> "syntax error")) "syntax error") in
+            // (ending in a newline, as every prism message does: a message
+            //  piped on is a complete line)
+            (let d9 = syn_dots_bad toks2 in if str_len d9 > 0 then d9 else syn_junk_after toks2) ++ "\n") "syntax error\n") in
           // ⚠ that re-lex was only to WORD the error, but lexing queues every
           // regexp literal it sees -- so the bad one went back on the queue
           // and the NEXT eval raised its SyntaxError instead of its own.
@@ -51549,6 +51556,66 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
 
 // run an eval'd program with the position it was TOLD it has, restoring the
 // caller's afterwards (an eval inside an eval must not keep the inner one's).
+// The wording of a refusal nothing more specific named: the statements are
+// read one by one, and the first token that follows a complete statement
+// with no newline or `;` between is what prism calls unexpected ("unexpected
+// constant, expecting end-of-input" for `1E1E1`). A leading `<<` that starts
+// no heredoc is prism's own "unexpected <<".
+and syn_junk_after = fn toks ->
+  match toks with
+  | Cons (TP p9, _) when str_eq p9 "<<" -> ": syntax error, unexpected <<, ignoring it"
+  // (a comma list of names with nothing assigned is a write target, and a
+  //  pseudo-variable in it is prism's "Can't assign to true")
+  | Cons (TId _, Cons (TP c9, _)) when str_eq c9 "," && (if str_eq (syn_mlhs_bad toks false) "" then false else true) ->
+    syn_mlhs_bad toks false
+  | _ ->
+    (let (_, rest1) = parse_stmt toks in
+     match rest1 with
+     | Cons (TNL _, r9) -> (match skip_nls r9 with Cons (TEOF, _) -> "syntax error" | Nil -> "syntax error" | r10 -> syn_junk_after r10)
+     | Cons (TP sc9, r9) when str_eq sc9 ";" -> (match skip_nls r9 with Cons (TEOF, _) -> "syntax error" | Nil -> "syntax error" | r10 -> syn_junk_after r10)
+     | Cons (TEOF, _) -> "syntax error"
+     | Nil -> "syntax error"
+     | Cons (t9, _) -> ": syntax error, unexpected " ++ syn_tok_word t9 ++ ", expecting end-of-input")
+// `...` where it forwards nothing: as a block parameter (`|...|`), or as a
+// beginless range with nothing after it (`[...]`, `return(...)`), in prism's
+// words
+and syn_dots_bad = fn toks ->
+  match toks with
+  | Cons (TP b9, Cons (TP d9, Cons (TP e9, _))) when str_eq b9 "|" && str_eq d9 "..." && str_eq e9 "|" ->
+    ": syntax error, unexpected ... in block argument"
+  // (`bar(...)` and `super(...)` forward: the parenthesis is a call's)
+  | Cons (TId n9, Cons (TP o9, Cons (TP d9, r9))) when str_eq o9 "(" && str_eq d9 "..."
+                                                     && (if str_eq n9 "return" || str_eq n9 "defined?" || str_eq n9 "not" then false else true) ->
+    syn_dots_bad r9
+  | Cons (TP d9, Cons (TP c9, _)) when str_eq d9 "..." && (str_eq c9 ")" || str_eq c9 "]") ->
+    ": syntax error, unexpected '" ++ c9 ++ "'; expected an expression after the operator"
+  | Cons (_, r) -> syn_dots_bad r
+  | Nil -> ""
+and syn_mlhs_bad = fn toks -> fn (comma: bool) ->
+  match toks with
+  | Cons (TId n, r) ->
+    (if comma && (str_eq n "true" || str_eq n "false" || str_eq n "nil" || str_eq n "__FILE__"
+                  || str_eq n "__LINE__" || str_eq n "__ENCODING__") then "Can't assign to " ++ n
+     else if comma && str_eq n "self" then "Can't change the value of self"
+     else syn_mlhs_bad r comma)
+  | Cons (TP c, r) -> (if str_eq c "," then syn_mlhs_bad r true else "")
+  | _ -> ""
+// what prism calls a token in "unexpected ..."
+and syn_tok_word = fn (t: Tok) ->
+  match t with
+  | TId n -> (if str_len n > 0 && is_upper_first n then "constant"
+              else if str_len n > 0 && str_eq (char_at n 0) "@" then (if str_len n > 1 && str_eq (char_at n 1) "@" then "class variable" else "instance variable")
+              else if str_len n > 0 && str_eq (char_at n 0) "$" then "global variable"
+              else if is_keyword n then "'" ++ n ++ "'"
+              else "local variable or method")
+  | TInt _ -> "integer"
+  | TBig _ -> "integer"
+  | TFlt _ -> "float"
+  | TStrL _ -> "string literal"
+  | TSym _ -> "symbol literal"
+  | TRegex (_, _) -> "regular expression"
+  | TP p -> "'" ++ p ++ "'"
+  | _ -> "token"
 and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (efile: str) -> fn (eline: int) ->
   // (run in a class or module body, outside any method, the eval'd code's
   //  own `return` has nothing to return from: ruby's LocalJumpError)

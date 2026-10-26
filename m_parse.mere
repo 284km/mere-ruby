@@ -636,8 +636,20 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
            then Cons (TStrL (chr (d1 * 16 + hex_val (char_at s (i + 4)))), lex_go s (i + 5))
            else Cons (TStrL (chr d1), lex_go s (i + 4)))
         // (`?\u{201c}`: the braced form, as in a string)
+        // (...ONE codepoint: `?\u{41 42}` is "Multiple codepoints at single
+        //  character literal")
         else if str_eq e "u" && i + 3 < str_len s && str_eq (char_at s (i + 3)) "\{" then
-          (let (bytes, j) = scan_u_braced s (i + 4) "" (0 - 1) in Cons (TStrL bytes, lex_go s j))
+          (let (bytes, j) = scan_u_braced s (i + 4) "" (0 - 1) in
+           let close9 = str_find_from s "}" (i + 4) in
+           let inner9 = (if close9 > i + 4 then mc_trim (substring s (i + 4) close9) else "") in
+           if str_contains inner9 " " || str_contains inner9 "\t" then
+             (let _ = syn_refuse "Multiple codepoints at single character literal" in Nil)
+           else Cons (TStrL bytes, lex_go s j))
+        // (`\uXXXX` needs all four digits: `?\u123` is "invalid Unicode escape")
+        else if str_eq e "u" && (if i + 6 < str_len s then false else true
+                                 || (if is_hex_digit (char_at s (i + 3)) && is_hex_digit (char_at s (i + 4))
+                                        && is_hex_digit (char_at s (i + 5)) && is_hex_digit (char_at s (i + 6)) then false else true)) then
+          (let _ = syn_refuse "invalid Unicode escape" in Nil)
         else if str_eq e "u" && i + 6 < str_len s then
           (let cp = hex4 s (i + 3) in Cons (TStrL (utf8_of cp), lex_go s (i + 7)))
         // `?\C-z` / `?\cz` (control: low five bits, `?` -> DEL), `?\M-z` (meta:
@@ -2466,7 +2478,9 @@ and heredoc_lines = fn (s: str) -> fn (i: int) -> fn (hid: str) -> fn (acc: str 
   else
     let nl = find_nl s i in
     let line = substring s i nl in
-    if str_eq (hd_lstrip line) hid then (rev_app_str acc Nil, if nl < str_len s then nl + 1 else nl)
+    // (an identifier that itself starts with a blank -- `<<' FOO'` -- ends at
+    //  a line that is exactly it, [Bug #19539])
+    if str_eq (hd_lstrip line) hid || str_eq line hid then (rev_app_str acc Nil, if nl < str_len s then nl + 1 else nl)
     else heredoc_lines s (if nl < str_len s then nl + 1 else nl) hid (Cons (line, acc))
 
 and rev_app_str = fn (xs: str list) -> fn (acc: str list) ->
@@ -2664,7 +2678,8 @@ and is_char_lit = fn (s: str) -> fn (i: int) ->
   let n = char_at s (i + 1) in
   // after a LOCAL the `?` is always the ternary's (`x ?1:2`)
   if lvt_prev_local s i then false
-  else if str_eq n " " || str_eq n "\n" || str_eq n "\t" || str_eq n "\r" then false
+  // (vertical tab and form feed are blanks too: `?\v` is "unexpected '?'")
+  else if str_eq n " " || str_eq n "\n" || str_eq n "\t" || str_eq n "\r" || ord n == 11 || ord n == 12 then false
   else if str_eq n "\\" then true
   // a non-ASCII character is an identifier character to ruby, so it follows
   // the word rule below, looking past the whole character
@@ -2679,10 +2694,18 @@ and is_char_lit = fn (s: str) -> fn (i: int) ->
           if is_alnum n2 || str_eq n2 "_" then false else true)
   else regex_position s i
 
+// does the line holding i start with `undef ` (its comma list is names)?
+and undef_line_at = fn (s: str) -> fn (i: int) ->
+  let rec bol = fn (k: int) -> (if k <= 0 then 0 else if str_eq (char_at s (k - 1)) "\n" then k else bol (k - 1)) in
+  let b9 = lvt_skip_ws s (bol i) in
+  b9 + 6 <= i && str_eq (substring s b9 (b9 + 6)) "undef "
 // is the / at i in a value position (a regex) rather than a division?
 and regex_position = fn (s: str) -> fn (i: int) ->
   let p = prev_nonspace s (i - 1) in
   if p < 0 then true
+  // (in `undef a, /` the names are method names, operators among them: the
+  //  `/` after the comma names Integer#/ -- it opened a regexp)
+  else if str_eq (char_at s p) "," && undef_line_at s i then false
   else
     let c = char_at s p in
     if str_eq c "(" || str_eq c "," || str_eq c "=" || str_eq c "~" ||
@@ -3368,7 +3391,23 @@ let rec tc_strip = fn toks -> fn (t: int) -> fn (pend: int list) ->
   | Cons (TNL o, r) -> (let _ = tc_keep (str_of_int o) t pend in Cons (TNL o, tc_strip r 0 Nil))
   | Cons (TEOF, r) -> (let _ = tc_keep "eof" t pend in Cons (TEOF, tc_strip r 0 Nil))
   | Cons (x, r) -> Cons (x, tc_strip r (t + 1) pend);
-let lex_src = fn (s: str) -> let _ = map_delete scv_mode "m" in let _ = map_set def_depth "n" 0 in let _ = map_delete syn_why "pk" in let _ = map_set stmt_nest "d" 0 in let _ = map_delete cond_quiet "q" in let _ = map_set afr_n "n" 0 in let _ = lvt_reset () in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in
+// CRLF line ends read as LF, as ruby's lexer reads them: a string or heredoc
+// that spans one holds "\n" (a lone CR stays). Applied where the source enters
+// the lexer and where its newlines are counted (number_nls), so the offsets
+// agree; a source with no CRLF is passed through untouched.
+let crlf_norm = fn (s: str) ->
+  if str_contains s "\r\n" then
+    (let b9 = strbuf_new () in
+     let n9 = str_len s in
+     let rec go = fn (i: int) -> fn (from: int) ->
+       (if i + 1 >= n9 then strbuf_push b9 (substring s from n9)
+        else if str_eq (char_at s i) "\r" && str_eq (char_at s (i + 1)) "\n"
+        then (let _ = strbuf_push b9 (substring s from i) in go (i + 1) (i + 1))
+        else go (i + 1) from) in
+     let _ = go 0 0 in
+     strbuf_to_str b9)
+  else s;
+let lex_src = fn (s0: str) -> let s = crlf_norm s0 in let _ = map_delete scv_mode "m" in let _ = map_set def_depth "n" 0 in let _ = map_delete syn_why "pk" in let _ = map_set stmt_nest "d" 0 in let _ = map_delete cond_quiet "q" in let _ = map_set afr_n "n" 0 in let _ = lvt_reset () in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in
   let _ = map_set tc_st "on" 1 in let _ = map_set tc_st "len" (str_len s) in let _ = map_set tc_st "prev" 0 in
   let _ = map_clear tc_off in
   let toks = lex_go s 0 in
@@ -3562,7 +3601,8 @@ let rec tnl_before_eof = fn toks -> fn (ln: int) ->
   | Nil -> (Nil : Tok list)
   | Cons (TEOF, r) -> Cons (TNL ln, Cons (TEOF, r))
   | Cons (t, r) -> Cons (t, tnl_before_eof r ln);
-let number_nls_at = fn (s: str) -> fn toks -> fn (base: int) ->
+let number_nls_at = fn (s0: str) -> fn toks -> fn (base: int) ->
+  let s = crlf_norm s0 in
   let _ = map_clear tc_ln in
   let numbered = number_nls_go s toks 0 base in
   if str_len s == 0 || str_eq (char_at s (str_len s - 1)) "\n" then numbered
@@ -5555,10 +5595,19 @@ and hash_key_expr = fn toks ->
     else (ke, expect r "=>")
   | _ -> (ke, expect r "=>")
 // the key a `"string":` label names
+// a string literal, bare or wearing a literal tag (`__lit_enc~` in a source
+// that is not UTF-8 -- `"foo":` in a US-ASCII file is a label too)
+and str_lit_like = fn (e: Expr) ->
+  match e with
+  | EStrL _ -> true
+  | EBin ("+", _, _) -> true
+  | EMethod (x9, m9, Nil) -> str_len m9 > 6 && str_eq (substring m9 0 6) "__lit_" && str_lit_like x9
+  | _ -> false
 and str_label_key = fn (ke: Expr) ->
   match ke with
   | EStrL lit9 -> ESym lit9
   | EMethod (EStrL lit9, m9, Nil) when str_len m9 > 10 && str_eq (substring m9 0 10) "__lit_fsl~" -> ESym lit9
+  | EMethod (EStrL lit9, m9, Nil) when str_len m9 > 10 && str_eq (substring m9 0 10) "__lit_enc~" && enc_all7 lit9 -> ESym lit9
   | _ -> EMethod (ke, "to_sym", Nil)
 
 and parse_hash_items = fn toks -> fn (acc: Expr list) ->
@@ -5955,7 +6004,7 @@ and parse_puts_args_pos = fn toks -> fn (acc: Expr list) ->
     // trailing `k => v` pairs collect into one Hash argument, and so do
     // `"k": v` string labels, whose value may be on the next line
     // (`obj.set "foo":\n 1`); a `:` cannot follow a whole argument otherwise
-    else if str_eq p "=>" || (str_eq p ":" && (match e with EStrL _ -> true | EBin ("+", _, _) -> true | _ -> false)) then
+    else if str_eq p "=>" || (str_eq p ":" && str_lit_like e) then
       let (v, r3) = parse_expr (skip_nls r2) in
       let hp0 = Cons (v, Cons ((if str_eq p ":" then str_label_key e else e), Nil)) in
       (match r3 with
