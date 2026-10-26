@@ -50,6 +50,30 @@ let scv_value = fn (s: str) -> fn (i: int) -> fn (e: int) ->
               // (the original spelling, for the warning)
               substring s (i + a) (i + b)));
 // is the `#` at i the first thing on its line?
+// `# frozen_string_literal: true` (any case, `-` or `_`), as a comment says it
+let fsl_comment_text = fn (t: str) ->
+  let n = str_len t in
+  let rec sp = fn (k: int) -> (if k < n && (str_eq (char_at t k) " " || str_eq (char_at t k) "\t") then sp (k + 1) else k) in
+  let k = sp 1 in
+  let w = "frozen_string_literal" in
+  if k + str_len w > n then false
+  else
+    (let rec same = fn (j: int) ->
+       (if j >= str_len w then true
+        else (let a = char_at t (k + j) in
+              let b = char_at w j in
+              (str_eq a b || (str_eq b "_" && str_eq a "-") || (ord a >= 65 && ord a <= 90 && ord a + 32 == ord b)) && same (j + 1))) in
+     same 0 && (let k2 = sp (k + str_len w) in k2 < n && str_eq (char_at t k2) ":"));
+// is there code (not blank lines, comments or a shebang) before byte i?
+let code_before = fn (s: str) -> fn (i: int) ->
+  let rec line = fn (k: int) ->
+    (if k >= i then false
+     else (let rec eol = fn (j: int) -> (if j < i && (if str_eq (char_at s j) "\n" then false else true) then eol (j + 1) else j) in
+           let e = eol k in
+           let rec fst = fn (j: int) -> (if j < e && (str_eq (char_at s j) " " || str_eq (char_at s j) "\t" || str_eq (char_at s j) "\r") then fst (j + 1) else j) in
+           let f = fst k in
+           if f >= e || str_eq (char_at s f) "#" then line (e + 1) else true)) in
+  line 0;
 let rec scv_comment_only = fn (s: str) -> fn (i: int) ->
   if i <= 0 then true
   else (let c = char_at s (i - 1) in
@@ -509,6 +533,10 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
     else if str_eq c "#" then
       (let e = skip_comment s i in
        let v = scv_value s i e in
+       // (a frozen_string_literal comment after the first token is no magic
+       //  comment: -w says so, once the line is a comment alone)
+       let _ = (if parse_verbose () && fsl_comment_text (substring s i e) && scv_comment_only s i && code_before s i
+                then lex_warn_at s i "'frozen_string_literal' is ignored after any tokens" else ()) in
        if str_eq v "" then lex_go s e
        else if (if scv_comment_only s i then false else true) then
          (let _ = (if parse_verbose () then lex_warn_at s i "'shareable_constant_value' is ignored unless in comment-only line" else ()) in lex_go s e)
@@ -1117,7 +1145,12 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
           Cons (TP " [", lex_go s (i + 1))
         else if str_eq c "(" && i > 0 && str_eq (char_at s (i - 1)) " "
                 && (let pj = prev_nonspace s (i - 1) in
-                    pj >= 0 && (let pc = char_at s pj in is_alnum pc || str_eq pc "_" || str_eq pc "?" || str_eq pc "!")) then
+                    pj >= 0 && (let pc = char_at s pj in is_alnum pc || str_eq pc "_" || str_eq pc "?" || str_eq pc "!"
+                                // (an operator method called through a dot,
+                                //  `1.+ (x)`, is a method name as much)
+                                || (let rec ob = fn (k: int) -> (if k >= 0 && str_contains "+-*/%<>=~^&|" (char_at s k) then ob (k - 1) else k) in
+                                    let k9 = ob pj in
+                                    k9 < pj && k9 >= 0 && str_eq (char_at s k9) "." && (if k9 >= 1 && str_eq (char_at s (k9 - 1)) "." then false else true)))) then
           Cons (TP " (", lex_go s (i + 1))
         // ` &x` (space before, none after) directly after an expression-ending
         // token is a command-style block-pass argument (`recv.meth &blk`),
@@ -3428,8 +3461,7 @@ let is_keyword = fn (id: str) ->
   str_eq id "true" || str_eq id "false" || str_eq id "nil";
 
 // a capitalized bare identifier is a constant (a class reference here).
-let is_cap = fn (id: str) ->
-  let o = ord (char_at id 0) in o >= 65 && o <= 90;
+let is_cap = fn (id: str) -> is_upper_first id;
 
 // an @-prefixed identifier is an instance variable.
 let is_ivar = fn (id: str) -> str_len id > 0 && str_eq (char_at id 0) "@";
@@ -4217,6 +4249,11 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
               if str_eq lp2 "(" then
                 let (argv, r4) = parse_call_args r3 in
                 attach_block_method recv lp argv r4
+              // (`1.+ (x rescue 1)`: a space before the paren makes the
+              //  group the first argument, as for a named method above)
+              else if str_eq lp2 " (" then
+                let (es, r4) = parse_puts_args r2 Nil in
+                attach_block_method recv lp es r4
               else attach_block_method recv lp Nil r2
             | _ -> attach_block_method recv lp Nil r2)
          else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected method name after ." ++ parsing_file ()))) in fail ("mere-ruby: expected method name after ." ++ parsing_file ()))
@@ -4732,8 +4769,9 @@ and parse_pipe_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) li
           | (Nil, Cons (TP bar9, r9)) when str_eq bar9 "|" -> (Cons (empty_bp_marker, Nil), (Nil : (str * Expr) list), r9)
           | _ -> parse_pipe_params r acc ds)
   | Cons (TP bar, r) ->
-    if str_eq bar "|" then (rev_app acc Nil, rev_app ds Nil, r)
+    if str_eq bar "|" then (let _ = bp_dup_check acc in (bp_under_dedup (rev_app acc Nil) (map_new ()) 0, rev_app ds Nil, r))
     else if str_eq bar "*" then
+      let _ = splat_check acc in
       (match r with Cons (TId n, r2) -> pipe_after ("*" ++ n) r2 acc ds | _ -> pipe_after "*" r acc ds)
     else if str_eq bar "**" then
       // `**kw` — keyword-splat: collects a trailing hash argument (or {}).
@@ -4826,7 +4864,7 @@ and parse_block_locals = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) l
     (match skip_nls r with
      | Cons (TP c, r2) ->
        if str_eq c "," then parse_block_locals r2 (Cons (";" ++ n, acc)) ds
-       else if str_eq c "|" then (rev_app (Cons (";" ++ n, acc)) Nil, rev_app ds Nil, r2)
+       else if str_eq c "|" then (let _ = bp_dup_check (Cons (";" ++ n, acc)) in (rev_app (Cons (";" ++ n, acc)) Nil, rev_app ds Nil, r2))
        else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad block-local list")) in fail "mere-ruby: bad block-local list")
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad block-local list")) in fail "mere-ruby: bad block-local list"))
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad block-local list")) in fail "mere-ruby: bad block-local list")
@@ -4847,7 +4885,7 @@ and pipe_after = fn (name: str) -> fn toks -> fn (acc: str list) -> fn (ds: (str
        | Cons (TP bar2, _) -> if str_eq bar2 "|" then parse_pipe_params r (Cons ("*,", Cons (name, acc))) ds
                               else parse_pipe_params r (Cons (name, acc)) ds
        | _ -> parse_pipe_params r (Cons (name, acc)) ds)
-    else if str_eq p "|" then (rev_app (Cons (name, acc)) Nil, rev_app ds Nil, r)
+    else if str_eq p "|" then (let _ = bp_dup_check (Cons (name, acc)) in (bp_under_dedup (rev_app (Cons (name, acc)) Nil) (map_new ()) 0, rev_app ds Nil, r))
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected , or | in block params" ++ parsing_file ()))) in fail ("mere-ruby: expected , or | in block params" ++ parsing_file ()))
   // `|one; bl|` — the ; (lexed as a newline) starts the block-local names
   // (and a real newline is skipped)
@@ -6177,6 +6215,13 @@ and opasgn_resc = fn (e: Expr) -> fn toks ->
   | Cons (TId w, r) when str_eq w "rescue" ->
     (let (h, r2) = parse_expr r in (resc_wrap e (SExpr h), r2))
   | _ -> (e, toks)
+and resc_cmd_check = fn toks ->
+  match toks with
+  | Cons (TId n9, rest9) when (if is_keyword n9 then (str_eq n9 "raise" || str_eq n9 "not") else true)
+                              && (if str_eq n9 "defined?" then false else true)
+                              && (str_eq n9 "not" || starts_bare_arg rest9) ->
+    syn_refuse "unexpected argument after a rescue modifier, expecting end-of-input"
+  | _ -> ()
 and resc_wrap = fn (e: Expr) -> fn (h: Stmt) ->
   EStmt (SBegin (Cons (SExpr e, Nil), Cons ((Nil, "", Cons (h, Nil)), Nil), Nil, Nil))
 // ...around the LAST argument only (the value an attribute or index write stores)
@@ -6236,6 +6281,13 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
        | _ -> apply_modifier (SWhile (EUn ("!", c), Cons (s, Nil))) r2)
     else if str_eq id "rescue" then
       // `expr rescue fallback` — a one-line begin/rescue.
+      // (after an assignment the fallback is an `arg`: a command call --
+      //  `a = x rescue raise "e"`, `a = x rescue Foo 2` -- is refused)
+      let _ = (match s with
+               | SAssign (_, _) -> resc_cmd_check (skip_nls r)
+               | SIVarAssign (_, _) -> resc_cmd_check (skip_nls r)
+               | SExpr (EAssign (_, _)) -> resc_cmd_check (skip_nls r)
+               | _ -> ()) in
       let (h, r2) = parse_stmt (skip_nls r) in
       // rescue binds tighter than `=`: `a = b rescue c` is `a = (b rescue c)`,
       // so the assignment still happens with the fallback value. (Op-assigns
@@ -7369,7 +7421,11 @@ and parse_stmt_ident = fn toks -> fn (id: str) -> fn r ->
            // `var += expr` -> `var = var <op> expr`
            let (e0, r30) = parse_expr (skip_nls r2) in
            let (e, r3) = opasgn_resc e0 r30 in
-           (SAssign (id, EBin (opassign_base p, EVar id, e)), r3)
+           // (`$g ||= v` reads an unset global without -w's warning, as the
+           //  `defined?` ruby's ||= asks first)
+           let rd9 = (if str_eq (opassign_base p) "||" && str_len id > 1 && str_eq (char_at id 0) "$"
+                      then ECall ("__gvar_or_nil", Cons (EStrL id, Nil)) else EVar id) in
+           (SAssign (id, EBin (opassign_base p, rd9, e)), r3)
          else if not (str_eq (opassign_base p) "") && is_cap id then
            // `Const op= expr` — a bare constant op-assign (nil read when undefined).
            let (e, r3) = parse_expr (skip_nls r2) in
@@ -9144,6 +9200,25 @@ and param_kind_check = fn (ps: str list) ->
 // one pass over the names, a set of the bases seen: comparing every pair
 // (with a substring for each) was quadratic, and a def of 65535 keywords --
 // test_keyword asks for exactly that -- grew to tens of GB
+// `|_, _|`: a name starting with `_` may repeat, and the FIRST one is the
+// local -- the later ones bind nothing (they get a hidden name each, the
+// `name~N` a method's repeated parameter gets, which #parameters reports as
+// the name)
+and bp_under_dedup = fn (ps: str list) -> fn seen9 -> fn (i: int) ->
+  match ps with
+  | Nil -> (Nil : str list)
+  | Cons (h, t) ->
+    (if str_len h > 0 && str_eq (char_at h 0) "_" && (if str_contains h "~" || str_eq (char_at h (str_len h - 1)) ":" then false else true) then
+       (if map_has seen9 h then Cons (h ++ "~" ++ str_of_int i, bp_under_dedup t seen9 (i + 1))
+        else (let _ = map_set seen9 h 1 in Cons (h, bp_under_dedup t seen9 (i + 1))))
+     else Cons (h, bp_under_dedup t seen9 (i + 1)))
+// a block's parameters and its block-locals (`;name`) share one namespace
+and bp_dup_check = fn (ps: str list) ->
+  let rec strip = fn (xs: str list) ->
+    (match xs with
+     | Nil -> (Nil : str list)
+     | Cons (h, t) -> Cons ((if str_len h > 1 && str_eq (char_at h 0) ";" then substring h 1 (str_len h) else h), strip t)) in
+  if param_has_dup (strip ps) then syn_refuse "duplicated argument name" else ()
 and param_has_dup = fn (ps: str list) ->
   let seen9 = map_new () in
   param_has_dup_go ps seen9
@@ -9171,6 +9246,13 @@ and pcount_base = fn (acc: str list) -> fn (base: str) ->
 //  renamed one answered "unknown keyword: :_")
 // a second `**`, or `**nil` (no keywords at all) after a keyword: ruby's
 // refusals for `def m(**a, **nil)` and `def m(a:, **nil)`
+// a second `*` (not the `*,` a trailing comma leaves)
+and splat_check = fn (acc: str list) ->
+  let rec any9 = fn (xs: str list) ->
+    (match xs with
+     | Nil -> false
+     | Cons (x, t) -> (str_len x >= 1 && str_eq (char_at x 0) "*" && (if str_len x >= 2 && (str_eq (char_at x 1) "*" || str_eq (char_at x 1) ",") then false else true)) || any9 t) in
+  if any9 acc then syn_refuse "unexpected multiple `*` splat parameters" else ()
 and kwsplat_check = fn (nm: str) -> fn (acc: str list) ->
   let rec any9 = fn (xs: str list) -> fn (kw: bool) ->
     (match xs with
@@ -9203,6 +9285,7 @@ and parse_params = fn toks0 -> fn (acc: str list) -> fn (defs: (str * Expr) list
   | Cons (TP p, r) ->
     if str_eq p ")" then (let ps9 = rev_app acc Nil in let _ = param_dup_check ps9 in (ps9, rev_app defs Nil, r))
     else if str_eq p "*" then
+      let _ = splat_check acc in
       (match r with
        | Cons (TId name, r2) -> parse_params_after (uniq_param ("*" ++ name) acc) r2 acc defs
        // a bare * gets a hidden name too, so `t(*)` can forward it
