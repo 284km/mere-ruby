@@ -10533,20 +10533,32 @@ and stdlib_src = fn (name: str) ->
     "  # ⚠ a File, not a Tempfile, as ruby's create gives (mode 0600, removed\n" ++
     "  #   after the block). This yielded a Tempfile, so every File method a\n" ++
     "  #   Delegator could not see was a NoMethodError inside the block.\n" ++
-    "  def self.create(basename = \"\", tmpdir = nil, mode: 0, anonymous: false, **_opts)\n" ++
-    "    base, ext = basename.is_a?(Array) ? [basename[0], basename[1]] : [basename, \"\"]\n" ++
-    "    path = (tmpdir || Tempfile.tmpdir) + \"/\" + Tempfile.next_name(base, ext)\n" ++
-    "    File.write(path, \"\")\n" ++
-    "    File.chmod(0600, path)\n" ++
-    "    f = File.open(path, \"r+\")\n" ++
-    "    f.binmode if (mode & File::BINARY) != 0\n" ++
-    "    File.unlink(path) if anonymous\n" ++
-    "    return f unless block_given?\n" ++
+    "  # ruby's Tempfile.create: a File (0600, removed after the block) made\n" ++
+    "  # through Dir::Tmpname.create, so the name, the argument checks and the\n" ++
+    "  # options passed on to File.open are the same; an anonymous one is\n" ++
+    "  # unlinked at once and answers its directory as its path\n" ++
+    "  def self.create(basename = \"\", tmpdir = nil, mode: 0, anonymous: false, **options)\n" ++
+    "    tmpfile = nil\n" ++
+    "    Dir::Tmpname.create(basename, tmpdir, **options) do |tmpname, n, opts|\n" ++
+    "      mode |= File::RDWR | File::CREAT | File::EXCL\n" ++
+    "      opts[:perm] = 0600\n" ++
+    "      tmpfile = File.open(tmpname, mode, **opts)\n" ++
+    "    end\n" ++
+    "    if anonymous\n" ++
+    "      File.unlink(tmpfile.path)\n" ++
+    "      dir = File.join(tmpdir || Dir.tmpdir, \"\")\n" ++
+    "      tmpfile.instance_variable_set(:@__tf_anon_path, dir)\n" ++
+    "      tmpfile.define_singleton_method(:path) \{ @__tf_anon_path }\n" ++
+    "      tmpfile.define_singleton_method(:to_path) \{ @__tf_anon_path }\n" ++
+    "    end\n" ++
+    "    return tmpfile unless block_given?\n" ++
     "    begin\n" ++
-    "      yield f\n" ++
+    "      yield tmpfile\n" ++
     "    ensure\n" ++
-    "      f.close unless f.closed?\n" ++
-    "      File.unlink(path) if !anonymous && File.exist?(path)\n" ++
+    "      tmpfile.close unless tmpfile.closed?\n" ++
+    "      if !anonymous\n" ++
+    "        File.unlink(tmpfile.path) rescue nil\n" ++
+    "      end\n" ++
     "    end\n" ++
     "  end\n" ++
     "\n" ++
@@ -10560,21 +10572,21 @@ and stdlib_src = fn (name: str) ->
     "    end\n" ++
     "  end\n" ++
     "\n" ++
-    "  def initialize(basename = \"\", tmpdir = nil, mode: nil, **opts)\n" ++
-    "    base, ext = if basename.is_a?(Array)\n" ++
-    "      [basename[0], basename[1]]\n" ++
-    "    else\n" ++
-    "      [basename, \"\"]\n" ++
-    "    end\n" ++
-    "    dir = tmpdir || Tempfile.tmpdir\n" ++
-    "    @path = dir + \"/\" + Tempfile.next_name(base, ext)\n" ++
-    "    File.write(@path, \"\")\n" ++
+    "  # ruby's Tempfile#initialize: the file is made by Dir::Tmpname.create\n" ++
+    "  # with mode 0600, and the options (encoding:, binmode: ...) go to\n" ++
+    "  # File.open -- and to #open when it reopens\n" ++
+    "  def initialize(basename = \"\", tmpdir = nil, mode: 0, **options)\n" ++
     "    @unlinked = false\n" ++
-    "    @tmpfile = File.open(@path, \"w+\")\n" ++
-    "    # `binmode: true` (or File::BINARY in mode:) was dropped: the file read\n" ++
-    "    # back as UTF-8. Kept for #open, which reopens the same way.\n" ++
-    "    @__tf_bin = opts[:binmode] || (mode.is_a?(Integer) && (mode & File::BINARY) != 0)\n" ++
-    "    @tmpfile.binmode if @__tf_bin\n" ++
+    "    @mode = mode | File::RDWR | File::CREAT | File::EXCL\n" ++
+    "    tmpfile = nil\n" ++
+    "    ::Dir::Tmpname.create(basename, tmpdir, **options) do |tmpname, n, opts|\n" ++
+    "      opts[:perm] = 0600\n" ++
+    "      tmpfile = File.open(tmpname, @mode, **opts)\n" ++
+    "      @opts = opts.freeze\n" ++
+    "    end\n" ++
+    "    @path = tmpfile.path\n" ++
+    "    @tmpfile = tmpfile\n" ++
+    "    @__tf_bin = options[:binmode] || (mode & File::BINARY) != 0\n" ++
     "    super(@tmpfile)\n" ++
     "  end\n" ++
     "\n" ++
@@ -10586,8 +10598,8 @@ and stdlib_src = fn (name: str) ->
     "  # became an IOError. The guard did not break this, it found it.\n" ++
     "  def open\n" ++
     "    @tmpfile.close rescue nil\n" ++
-    "    @tmpfile = File.open(@path, \"r+\")\n" ++
-    "    @tmpfile.binmode if @__tf_bin\n" ++
+    "    mode = @mode & ~(File::CREAT | File::EXCL)\n" ++
+    "    @tmpfile = File.open(@path, mode, **(@opts || \{}))\n" ++
     "    __setobj__(@tmpfile)\n" ++
     "    self\n" ++
     "  end\n" ++
@@ -12321,6 +12333,35 @@ and stdlib_src = fn (name: str) ->
     "    ensure\n" ++
     "      FileUtils.remove_entry(path)\n" ++
     "    end\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "module Dir::Tmpname\n" ++
+    "  UNUSABLE_CHARS = \"^,-.0-9A-Z_a-z~\"\n" ++
+    "  # ruby's Dir::Tmpname.create: the prefix and suffix are Strings (or\n" ++
+    "  # convert to one), the name is prefix, date, pid, random and suffix\n" ++
+    "  # under tmpdir, and the block is tried again with a new name while the\n" ++
+    "  # name is taken\n" ++
+    "  def self.create(basename, tmpdir = nil, max_try: nil, **opts)\n" ++
+    "    origdir = tmpdir\n" ++
+    "    tmpdir ||= Dir.tmpdir\n" ++
+    "    n = nil\n" ++
+    "    prefix, suffix = basename\n" ++
+    "    prefix = (String.try_convert(prefix) or raise ArgumentError, \"unexpected prefix: #\{prefix.inspect}\")\n" ++
+    "    prefix = prefix.delete(UNUSABLE_CHARS)\n" ++
+    "    suffix &&= (String.try_convert(suffix) or raise ArgumentError, \"unexpected suffix: #\{suffix.inspect}\")\n" ++
+    "    suffix &&= suffix.delete(UNUSABLE_CHARS)\n" ++
+    "    begin\n" ++
+    "      t = Time.now.strftime(\"%Y%m%d\")\n" ++
+    "      path = \"#\{prefix}#\{t}-#\{$$}-#\{rand(0x100000000).to_s(36)}#\{n ? \"-#\{n}\" : ''}#\{suffix || ''}\"\n" ++
+    "      path = File.join(tmpdir, path)\n" ++
+    "      yield(path, n, opts, origdir)\n" ++
+    "    rescue Errno::EEXIST\n" ++
+    "      n ||= 0\n" ++
+    "      n += 1\n" ++
+    "      retry if !max_try or n < max_try\n" ++
+    "      raise \"cannot generate temporary name using '#\{basename}' under '#\{tmpdir}'\"\n" ++
+    "    end\n" ++
+    "    path\n" ++
     "  end\n" ++
     "end\n"
   else if str_eq n "logger" then
@@ -15540,6 +15581,8 @@ and cpx_realize_args = fn world -> fn (args: Val list) ->
 //   in the file, and mere-ruby's File has no string mode that means that --
 //   "w" is the nearest and it truncates. Every mode ruby's own `mode` string
 //   can express round-trips exactly.
+// (file_open_obj asks O_CREAT and O_TRUNC of the integer itself: without
+//  O_CREAT a missing file is ENOENT)
 and int_mode_str = fn (n9: int) ->
   let acc = n9 - (n9 / 4) * 4 in
   let app = (n9 / 8) - (n9 / 16) * 2 == 1 in
@@ -15688,6 +15731,23 @@ and file_open_obj = fn world -> fn (args: Val list) ->
   else if str_len mode > 0 && str_eq (char_at (file_mode_head mode) 0) "r"
      && (if file_exists path then false else true) then
     raise_sysopen world "Errno::ENOENT" "No such file or directory" path (file_arg_enc args)
+  // an integer mode without O_CREAT opens only a file that is there
+  else if (match args with Cons (_, Cons (VInt n9, _)) -> (n9 / 512) - (n9 / 1024) * 2 == 0 | _ -> false)
+     && (if existed0 then false else true) then
+    raise_sysopen world "Errno::ENOENT" "No such file or directory" path (file_arg_enc args)
+  // the access the file's permissions refuse is EACCES at the open (the
+  // write or read that followed failed with no errno at all)
+  else if existed0 && (if str_eq (char_at (file_mode_head mode) 0) "r" && (if str_contains mode "+" then false else true)
+                       then (if fs_access path "-r" then false else true)
+                       else if str_contains mode "+" then (if fs_access path "-r" && fs_access path "-w" then false else true)
+                       else (if fs_access path "-w" then false else true)) then
+    raise_sysopen world "Errno::EACCES" "Permission denied" path (file_arg_enc args)
+  else
+  // ...and O_TRUNC without O_CREAT empties the file it opens
+  let _ = (match args with
+           | Cons (_, Cons (VInt n9, _)) -> (if (n9 / 1024) - (n9 / 2048) * 2 == 1 && existed0 then (let _ = write_file path "" in ()) else ())
+           | _ -> ()) in
+  if false then VNil
   else
     // w truncates at open, so an unwritten-then-closed file ends up empty; a
     // creates the file when it is absent. Either way the open is the moment ruby

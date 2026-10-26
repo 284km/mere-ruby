@@ -3385,12 +3385,21 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             //  inside an instance method was "undefined method")
             && (match (if lv_has env "self" then lv_get env "self" else VMain) with VClass _ -> true | VObj _ -> true | VMain -> true | _ -> false) then
       invoke_val_c env world blk (if lv_has env "self" then lv_get env "self" else VMain) name args false
+    // (a body given as an ARGUMENT wins over the block: `define_method(:m,
+    //  pr) { }` is pr's method -- the argument path below takes it)
+    else if (str_len name == 13 && str_eq name "define_method")
+            && (match args with Cons (_, Cons (_, _)) -> true | _ -> false)
+            && (match (if lv_has env "self" then lv_get env "self" else VMain) with
+                | VClass _ -> true | _ -> false) then
+      invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (lv_get env "self") "define_method" args false
     else if (str_len name == 13 && str_eq name "define_method")
             && (match (if lv_has env "self" then lv_get env "self" else VMain) with
                 | VClass _ -> true | VMain -> true | _ -> false) then
       (match (match (if lv_has env "self" then lv_get env "self" else VMain) with
               | VClass c0 -> VClass c0 | _ -> VClass "") with
        | VClass c ->
+         // (a frozen class refuses it, as the receiver form does)
+         let _ = (if str_eq c "" then () else frz_cls_check world c) in
          let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr s, _) -> sget s | Cons (a9, _) -> sym_or_str_arg env world a9 | _ -> "") in
          let _ = warn_serious_redef world nm in
          // a top-level define_method goes where a top-level `def` goes: under
@@ -7951,8 +7960,13 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        | _ -> VNil)
     else if (str_len name == 6 && str_eq name "reduce") || (str_len name == 6 && str_eq name "inject") then
       (match args with
-       | Cons (init, _) -> iter_result (arr_reduce world encl theblk xs init) recv
-       | Nil -> (match xs with Nil -> VNil | Cons (h, t) -> iter_result (arr_reduce world encl theblk t h) recv))
+       // (an initial value AND an operator: the operator is used, and -w
+       //  says the block is not)
+       | Cons (_, Cons (_, Nil)) ->
+         (let _ = rb_warning world "given block not used" in
+          (match encl with (_, _, _, ee9) -> reduce_sym ee9 world (false, (Nil : str list), (Nil : Stmt list), ee9) xs args))
+       | Cons (init, _) -> iter_result (arr_reduce_lv world encl theblk id 0 xs (arr_ver id) init) recv
+       | Nil -> (match xs with Nil -> VNil | Cons (h, t) -> iter_result (arr_reduce_lv world encl theblk id 1 t (arr_ver id) h) recv))
     else if (str_len name == 5 && str_eq name "count") then iter_result (arr_count_blk world encl theblk id 0 xs (arr_ver id) 0) recv
     // ...and the optional IFNONE argument is CALLED when nothing matched (it is
     // not a default value): `[1].find(-> { :none }) { false }` is :none. The
@@ -9455,13 +9469,16 @@ and range_map = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int
         | f -> if i == last then FNext (arr_new (val_rev (Cons (flow_value f, acc)) Nil))
                else range_map world encl theblk (i + 1) last (Cons (flow_value f, acc)))
 
-and arr_reduce = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val) ->
-  match xs with
+// (the array is read live, as #any? reads it: a block that appends to it
+//  sees the new elements -- arr_lv re-reads after a change)
+and arr_reduce_lv = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i: int) -> fn (xs0: Val list) -> fn (ver0: int) -> fn (acc: Val) ->
+  let ver = arr_ver id in
+  match arr_lv id i xs0 ver0 with
   | Nil -> FNext acc
   | Cons (h, t) ->
     (match run_block world encl theblk (Cons (acc, Cons (h, Nil))) with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
-     | f -> arr_reduce world encl theblk t (flow_value f))
+     | f -> arr_reduce_lv world encl theblk id (i + 1) t ver (flow_value f))
 
 // min_by / max_by: the element whose block value is smallest / largest.
 and arr_min_by = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (want_max: bool) ->
@@ -11906,7 +11923,41 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               | VArr a9 -> arr_new (bt_locs_of world (deref a9))
               | _ -> VNil)
            | _ -> v) in
+  // a copy made by #clone / #dup has the original's finalizers too (they
+  // are kept by the prelude's ObjectSpace; fin_on says it has any)
+  let _ = (if ((str_len name0 == 5 && str_eq name0 "clone") || (str_len name0 == 3 && str_eq name0 "dup"))
+              && map_has fin_on "y"
+              && (match v with VInt _ -> false | VNil -> false | VBool _ -> false | VSym _ -> false | VFlt _ -> false | _ -> true)
+           then (let _ = invoke_val_c0 env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass "ObjectSpace") "__fin_copy" (Cons (recv0, Cons (v, Nil))) false in ())
+           else ()) in
+  // ...and a copy of a Proc SUBCLASS's proc is one of the subclass too, and
+  // its #initialize_clone / #initialize_dup runs, as an object's does
+  let _ = (match (recv0, v) with
+           | (VProc p9, VProc np9) when ((str_len name0 == 5 && str_eq name0 "clone") || (str_len name0 == 3 && str_eq name0 "dup"))
+                                        && (if p9 == np9 then false else true)
+                                        && map_has hng_store ("prc:" ++ str_of_int p9)
+                                        && (if is_sng_cls (map_get hng_store ("prc:" ++ str_of_int p9)) then false else true) ->
+             (let c9 = map_get hng_store ("prc:" ++ str_of_int p9) in
+              let _ = (if map_has hng_store ("prc:" ++ str_of_int np9) then () else map_set hng_store ("prc:" ++ str_of_int np9) c9) in
+              let hook9 = (if str_len name0 == 5 then "initialize_clone" else "initialize_dup") in
+              if has_meth world c9 hook9
+              then (let _ = invoke world (false, (Nil : str list), (Nil : Stmt list), env) v c9 hook9 (Cons (recv0, Nil)) in ())
+              else ())
+           | _ -> ()) in
   let _ = bi_reg_set pn pr pd in
+  // ...and a Proc SUBCLASS's proc prints its class as the class prints itself
+  // (`#<Proc🍻:0x... f:1>`; proc_to_s formats with the class's #to_s)
+  let v = (match (recv0, v) with
+           | (VProc p9, VStr h9) when ((str_len name0 == 4 && str_eq name0 "to_s") || (str_len name0 == 7 && str_eq name0 "inspect"))
+                                      && map_has hng_store ("prc:" ++ str_of_int p9)
+                                      && (if is_sng_cls (map_get hng_store ("prc:" ++ str_of_int p9)) then false else true)
+                                      && str_starts_with (sget h9) "#<Proc:" ->
+             (let c9 = map_get hng_store ("prc:" ++ str_of_int p9) in
+              let n9 = (match invoke_val_c0 env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass c9) "to_s" Nil false with
+                        | VStr hn -> sget hn | _ -> cls_display world c9) in
+              let s9 = sget h9 in
+              mkstr ("#<" ++ n9 ++ substring s9 6 (str_len s9)))
+           | _ -> v) in
   // the builtin #to_s / #inspect of nil, true, false, a Symbol, a Module, a
   // Range, a Rational, a Complex and an Encoding answer US-ASCII when the text
   // is ASCII (rb_usascii_str_new): mere-ruby's strings are UTF-8 unless told,
@@ -15424,7 +15475,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // so the constructor stayed public.
     // `Proc.new` with NO block: the block is the object being asked for, and
     // ruby refuses rather than making an empty one.
-    else if str_eq c "Proc" && (str_len name == 3 && str_eq name "new") then
+    else if (str_len name == 3 && str_eq name "new") && (str_eq c "Proc" || obj_is_a world c "Proc") then
       raise_exc world "ArgumentError" "tried to create Proc object without a block"
     // ...and `allocate` the same way: private_class_method marks both, and a
     // Singleton's allocate was still answering a second instance.
@@ -16105,7 +16156,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              | Cons (VObj oid, _) ->
                (let ocls2 = map_get ocl0 oid in
                 let noblk2 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                if has_meth world ocls2 "to_a" || has_meth world ocls2 "method_missing" then
+                if has_meth world ocls2 "to_a" || (has_meth world ocls2 "method_missing" && responds world (VObj oid) "to_a") then
                   (match invoke_val_c env world noblk2 (VObj oid) "to_a" Nil false with
                    | VArr aid -> deref aid
                    | other ->
@@ -16125,6 +16176,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let id2 = alloc_oid ocl0 in
        let _ = map_set ocl0 id2 c in
        let _ = map_set iv0 (str_of_int id2 ++ "@__q") (arr_new seed) in
+       // (a size that is not an Integer is converted with #to_int, and one
+       //  with none is ruby's TypeError)
+       let args = (if str_eq c "SizedQueue" then
+                     (match args with
+                      | Cons (VInt _, _) -> args
+                      | Cons (v9, t9) -> Cons (rnd_to_int env world v9, t9)
+                      | Nil -> args)
+                   else args) in
        let _ = (if str_eq c "SizedQueue" then
                   (match args with
                    | Cons (VInt mx, _) ->
@@ -16936,7 +16995,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                && file_kw_args args && has_meth world "(sng:File)" "__open_kw" then
          invoke_val_c env world blk recv "__open_kw" args false
        else if (str_len name == 3 && str_eq name "new") || (str_len name == 4 && str_eq name "open") then
-         (let _ = file_mode_enc_warn world args in file_open_obj world (os_path_args world args))
+         (match file_first_arg env world args with
+          | VNil -> (let _ = file_mode_enc_warn world args in file_open_obj world (os_path_args world args))
+          | io9 -> io9)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for File"))
     // Dir class methods (pwd via env, mkdir via the shell).
     // Warning[:category] — the warning-category switches: a write is
@@ -18300,11 +18361,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
            // fixture) depends on it: BasicObject's chain has no Kernel in it.
            // Asking "is the target below the owner" of a module refused 86 files
            // in one group -- a new check taking out input that used to work.
+           // (a Kernel method asked of Object is Kernel's -- its owner is the
+           //  module -- and binds to a BasicObject subclass as well)
            else if (if str_eq scls "" then false
                     else if map_has modules scls then false
                     else if str_eq scls c then false
+                    else if (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VObj uid) "owner" Nil false with
+                             | VClass o9 -> map_has modules o9
+                             | _ -> false) then false
                     else (if str_list_has (ancestors_of world c) scls then false else true))
-           then raise_exc world "TypeError" ("bind argument must be a subclass of " ++ scls)
+           then (if is_sng_cls scls then raise_exc world "TypeError" "can't bind singleton method to a different class"
+                 else raise_exc world "TypeError" ("bind argument must be a subclass of " ++ cls_display world scls))
            // (an object holding a definition its name has since lost --
            //  redefined or removed -- transplants THAT one: msnap_save's copy)
            else if (if str_eq (msnap_src world uid ocl9 scls snm) "" then false else true) then
@@ -19682,6 +19749,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // interpreter's own bookkeeping classes (a "__" name) and the singleton
     // classes OF classes, which ruby hides as well.
     // ObjectSpace.__sym_of_id(id): the Symbol whose object_id it is, or nil
+    // (a finalizer exists: from now on #clone / #dup copy them, see
+    //  invoke_val_c)
+    else if str_eq c "ObjectSpace" && (str_len name == 10 && str_eq name "__fin_flag") then
+      (let _ = map_set fin_on "y" 1 in VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 11 && str_eq name "__sym_of_id") then
       (match args with
        | Cons (VInt i9, _) -> (let n9 = sym_name_of_id i9 in if str_eq n9 "" then VNil else VSym n9)
@@ -20747,6 +20818,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let _ = map_set ivars (str_of_int nid ++ "@__m_name") (mkstr mnm) in
           let _ = map_set ivars (str_of_int nid ++ "@__m_owner") (mkstr mown) in
           let _ = map_set ivars (str_of_int nid ++ "@__m_recv") mrecv in
+          // (...and the instance variables a program gave it)
+          let _ = ivars_copy_pfx world (str_of_int id ++ "@") (str_of_int nid ++ "@") in
           let _ = (if (str_len name == 5 && str_eq name "clone") && ofrozen_get id then ofrozen_set nid else ()) in
           VObj nid)
        else if (str_len name == 6 && str_eq name "freeze") then (let _ = ofrozen_set id in recv)
@@ -21057,7 +21130,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 3 && str_eq name "max") then
          (if map_has ivars (k ++ "@__qmax") then map_get ivars (k ++ "@__qmax") else VNil)
        else if (str_len name == 4 && str_eq name "max=") then
-         (match args with
+         (match (match args with
+                 | Cons (VInt _, _) -> args
+                 | Cons (v9, t9) -> Cons (rnd_to_int env world v9, t9)
+                 | Nil -> args) with
           | Cons (VInt mx, _) when mx <= 0 -> raise_exc world "ArgumentError" "queue size must be positive"
           | Cons (VInt mx, _) -> let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in VInt mx
           | _ -> VNil)
@@ -22650,6 +22726,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let _ = list_iter (Cons ("@__um_owner", Cons ("@__um_from", Cons ("@__um_def", Nil)))) (fn (k9: str) ->
                     if map_has ivars (str_of_int id ++ k9) then map_set ivars (str_of_int nid ++ k9) (map_get ivars (str_of_int id ++ k9)) else ()) in
           let _ = msnap_carry world id "UnboundMethod" nid "UnboundMethod" in
+          let _ = ivars_copy_pfx world (str_of_int id ++ "@") (str_of_int nid ++ "@") in
           let _ = (if (str_len name == 5 && str_eq name "clone") && ofrozen_get id then ofrozen_set nid else ()) in
           VObj nid)
        else if (str_len name == 6 && str_eq name "freeze") then (let _ = ofrozen_set id in recv)
@@ -24016,14 +24093,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            else arr_new (Cons (mkstr (sget h9), Cons (map_get proc_src (str_of_int pid), Nil))))
              | _ -> VNil)
        else VNil)
-    // currying a curried proc curries the proc BEHIND it, not the collector.
+    // currying a curried proc curries THAT proc, with what it has already
+    // collected: its own arity is -1, so with no count the curry is the proc
+    // itself (ruby's curry of it takes 0 and calls straight through), and
+    // with one it collects that many and hands them on
     else if map_has curry_target (str_of_int pid) && (str_len name == 5 && str_eq name "curry") then
       (let args = curry_int_arg env world blk args in
-       let tgt8 = (match map_get curry_target (str_of_int pid) with VInt t -> t | _ -> 0) in
-       let ar8 = (match args with
-                  | Cons (VInt n, _) -> n
-                  | _ -> (match map_get curry_arity (str_of_int pid) with VInt n -> n | _ -> 0)) in
-       mk_curried world tgt8 (Nil : Val list) ar8 pid)
+       match args with
+       | Cons (VInt n, _) -> mk_curried world pid (Nil : Val list) n pid
+       | _ -> recv)
     else if (str_len name == 5 && str_eq name "curry") then
       // ⚠ A LAMBDA (and a Method, which curries through one) is strict about
       // its argument count, and curry's own argument is that count: ruby
@@ -24196,7 +24274,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       (Cons (("__exit_value", (if ibreak_val bv9 then VNil else bv9)), Cons (("__reason", VSym "break"), Nil)))
                else flow_throw_breakret (match tgt9 with VInt t9 -> t9 | _ -> 0) bv9)
             | other9 -> flow_value other9)
-    else if (str_len name == 5 && str_eq name "class") then VClass "Proc"
+    // (a Proc subclass's instance is a proc tagged with the subclass)
+    else if (str_len name == 5 && str_eq name "class") then
+      (let hk9 = "prc:" ++ str_of_int pid in
+       if map_has hng_store hk9 && (if is_sng_cls (map_get hng_store hk9) then false else true)
+       then VClass (map_get hng_store hk9) else VClass "Proc")
     // a copy (dup / clone, see proc_copy) is == to its original and to other
     // copies of it, though not equal?
     else if (str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?") then
@@ -26251,6 +26333,21 @@ and rb_verbose_true = fn (u: unit) ->
   if map_has globals (gvar_slot "VERBOSE")
   then (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false)
   else false
+// File.new / File.open's first argument when it is no path: a descriptor
+// (an Integer: the IO over it; EBADF when it is negative) or what converts to
+// no String (true, false, nil, a Float: ruby's TypeError). VNil: a path.
+and file_first_arg = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Cons (VInt n9, _) ->
+    (if n9 < 0 then raise_exc world "Errno::EBADF" "Bad file descriptor"
+     else invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass "IO") "new" args false)
+  | Cons (VBool b9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ (if b9 then "true" else "false") ++ " into String")
+  | Cons (VNil, _) -> raise_exc world "TypeError" "no implicit conversion of nil into String"
+  | Cons (VObj _, _) when (match args with
+                           | Cons (o9, _) -> (if responds world o9 "to_path" || responds world o9 "to_str" || responds world o9 "to_int" then false else true)
+                           | Nil -> false) ->
+    (match args with Cons (o9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name o9 ++ " into String") | Nil -> VNil)
+  | _ -> VNil
 // the encodings a File's mode names ("r:bom|utf-8:euc-jp"), as ruby's
 // rb_io_ext_int_to_encs warns when it opens: a BOM| on a name that is not
 // UTF-*, and a name that is no encoding (which is then ignored)
@@ -26675,6 +26772,9 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           // the method lands in the singleton, so the object hears of it
           let _ = (if is_sng_cls target then run_method_added world target nm else ()) in
           VSym nm))
+    else if (str_len name == 13 && str_eq name "define_method") && (match recv with VClass _ -> true | _ -> false)
+            && (match args with Cons (_, Cons (_, _)) -> true | _ -> false) then
+      invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv "define_method" args false
     else if (str_len name == 13 && str_eq name "define_method") && (match recv with VClass _ -> true | _ -> false) then
       (match recv with
        | VClass c ->
@@ -27082,6 +27182,22 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // definition while `Klass.new` used it -- one method, two answers.
        if (str_len name == 3 && str_eq name "new") && has_meth world ("(sng:" ++ c ++ ")") name then
          invoke world newblk recv ("(sng:" ++ c ++ ")") name args
+       // a SUBCLASS of Proc makes a new proc from the block, tagged with the
+       // subclass (as a String subclass's strings are), and runs its own
+       // #initialize on it with the arguments
+       else if (str_len name == 3 && str_eq name "new") && (if str_eq c "Proc" then false else obj_is_a world c "Proc") then
+         // (...a proc that is already one of this subclass is answered itself)
+         (let src9 = (if map_has pending_srcproc "v" then map_get pending_srcproc "v" else 0 - 1) in
+          let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+          if src9 >= 0 && map_has hng_store ("prc:" ++ str_of_int src9) && str_eq (map_get hng_store ("prc:" ++ str_of_int src9)) c
+          then VProc src9
+          else
+          let id = (proc_next ()) in
+          let _ = store_proc (str_of_int id) newblk in
+          let _ = if (let (h, _, _, _) = blk in h) then store_yblk (str_of_int id) blk else () in
+          let _ = map_set hng_store ("prc:" ++ str_of_int id) c in
+          let _ = (if has_meth world c "initialize" then (let _ = invoke world newblk (VProc id) c "initialize" args in ()) else ()) in
+          VProc id)
        else if str_eq c "Proc" && (str_len name == 3 && str_eq name "new") then
          // `Proc.new(&pr)` answers pr ITSELF, exactly as `proc(&pr)` does --
          // pending_srcproc is the proc the block was made from, and rebuilding
@@ -27161,8 +27277,14 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
           let fobj = (if file_kw_args args && has_meth world "(sng:File)" "__open_kw"
                       then invoke_val_c env world nb9 recv "__open_kw" args false
-                      else (let _ = file_mode_enc_warn world args in
-                            file_open_obj world (os_path_args world (path_args nb9 world "open" args)))) in
+                      else (match file_first_arg env world args with
+                            | VNil -> (let _ = file_mode_enc_warn world args in
+                                       file_open_obj world (os_path_args world (path_args nb9 world "open" args)))
+                            | io9 -> io9)) in
+          // (File.new takes no block: ruby warns and keeps the File)
+          if str_len name == 3 then
+            (let _ = rb_warn world "File::new() does not take block; use File::open() instead" in fobj)
+          else
           (if has_meth world "(sng:File)" "__open_blk" then
              invoke_with_block env world blk (VClass "File") "__open_blk" (Cons (fobj, Nil)) newblk
            else
@@ -30266,7 +30388,7 @@ and mod_name_val = fn (c: str) ->
   // the SAME frozen String each time, as ruby answers (it is the name, not a
   // fresh description of it)
   else if map_has cls_name_str c then map_get cls_name_str c
-  else (let s9 = mkstr c in
+  else (let s9 = mkstr (thread_pub_name c) in
         let _ = (match s9 with VStr h9 -> sfrozen_set h9 | _ -> ()) in
         let _ = map_set cls_name_str c s9 in s9)
 and rng_eq_w = fn env -> fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (ex: bool) -> fn (other: Val) -> fn (useeql: bool) ->
@@ -31570,6 +31692,9 @@ and builtin_mut_on_frozen = fn world -> fn (recv: Val) -> fn (name: str) ->
            then (let _ = raise_exc world "RuntimeError" "can't modify string; temporarily locked" in ()) else ()) in
   is_mutating_method name && val_frozen_mut recv
   && (if has_meth world (dispatch_cls_of world recv) name then false else true)
+  // (String#delete answers a NEW string -- it is delete! that mutates;
+  //  Array's and Hash's #delete are the mutating ones the list means)
+  && (match recv with VStr _ -> (if str_len name == 6 && str_eq name "delete" then false else true) | _ -> true)
 
 
 // String#slice!(regexp[, group]): remove the GROUP's span (0 = the whole
@@ -40350,6 +40475,9 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   if (str_len meth == 15 && str_eq meth "initialize_copy") || (str_len meth == 14 && str_eq meth "initialize_dup")
      || (str_len meth == 16 && str_eq meth "initialize_clone") then
     kernel_copy_hook gc_cenv0 world recv meth args
+  // a Proc subclass's #initialize calling super: Proc's own does nothing
+  // (the proc was made from the block before #initialize ran)
+  else if (str_len meth == 10 && str_eq meth "initialize") && (match recv with VProc _ -> true | _ -> false) then VNil
   // `super do |k, v| ... end` from a subclass's ITERATOR needs the block to
   // reach the builtin: prim_method has none, so an each/map/... super answered
   // as if no block had been given.
@@ -40413,6 +40541,11 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
     thread_new world superblk tc9 meth args superblk
   | VClass nc9 when (str_len meth == 3 && str_eq meth "new") && (if map_has modules nc9 then false else true) ->
     new_obj_wb world nc9 args superblk
+  // `super` from a module prepended to a number's class (`class Integer;
+  // prepend M` and M#+ calling super) is the builtin operation
+  | VInt _ -> prim_method recv meth args
+  | VBig _ -> prim_method recv meth args
+  | VFlt _ -> prim_method recv meth args
   | _ ->
   let dcls = dispatch_cls_of world recv in
   // a descriptor stream's stream methods are the prelude layer's (fdio_route),
@@ -44943,7 +45076,13 @@ and queue_sch = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (cls:
     (let _ = put (Nil : Val list) in let _ = sch_wake_all 5 id in recv)
   else
     // max=: a larger bound lets waiting pushers try again
-    (match args with
+    // (a size that is not an Integer goes through #to_int: TypeError
+    //  without one, ArgumentError when it is not positive)
+    (match (match args with
+            | Cons (VInt _, _) -> args
+            | Cons (v9, t9) -> Cons (rnd_to_int env world v9, t9)
+            | Nil -> args) with
+     | Cons (VInt mx, _) when mx <= 0 -> raise_exc world "ArgumentError" "queue size must be positive"
      | Cons (VInt mx, _) -> (let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in let _ = sch_wake_all 5 id in VInt mx)
      | _ -> VNil)
 // Mutex under the scheduler. Held = mtx_thr has it (a thread that ends lets
@@ -47696,6 +47835,8 @@ and for_recv_obj = fn env -> fn world -> fn (recv: Val) -> fn (c: str) ->
 and cls_display = fn world -> fn (c0: str) ->
   let (meths, sup, ocls, ivars) = world in
   let c = impl_public c0 in
+  // (the thread primitives live under Thread: ruby names them so)
+  if (if str_eq (thread_pub_name c) c then false else true) then thread_pub_name c else
   // a class defined INSIDE a singleton class, "(sng:N)::K": the singleton as
   // ruby prints it, then the rest of the path (#<Class:#<Object:0x..>>::K)
   if is_sng_cls c && (if str_eq (char_at c (str_len c - 1)) ")" then false else true)
