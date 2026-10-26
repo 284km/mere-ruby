@@ -1696,6 +1696,7 @@ import "m_eval_leaf.mere";
 import "m_pack.mere";
 // json: the ruby half verbatim (generated), and the C half (see m_json.mere)
 import "m_json_lib.mere";
+import "m_bigdecimal_lib.mere";
 import "m_json.mere";
 
 // one `FNext nil` for every turn that ends normally: a region's value is
@@ -11905,7 +11906,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   //  object, and the pair has no Locations of its own: they are its
   //  backtrace's frames -- nil only when the program set the backtrace as
   //  Strings. `e = assert_raise(TypeError) { {**1} }` answered nil.)
-  let v = (if vischeck && (match recv0 with VMain -> main_priv_name name0 | _ -> false)
+  let v = (if cls_sng_undef world recv0 name0 then cls_sng_undef_raise world recv0 name0 args0
+           else if vischeck && (match recv0 with VMain -> main_priv_name name0 | _ -> false)
            then raise_exc_iv world "NoMethodError" ("private method '" ++ name0 ++ "' called for main")
                   (Cons (("__name", VSym name0), Cons (("__recv", VMain), Cons (("__args", arr_new args0), Nil))))
            // ...and with a literal self (or send) they are Object's: `self.private
@@ -20015,6 +20017,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            // (`undef_method(:method_missing)`, test_object)
                            || str_eq n9 "method_missing" || str_eq n9 "respond_to_missing?" || str_eq n9 "initialize"
                            || is_kernel_builtin n9 || is_prim_method n9
+                           // (a class's singleton inherits Class's methods:
+                           //  `class << self; undef_method :new; end`, as
+                           //  bigdecimal does)
+                           || (is_sng_cls c && (str_eq n9 "new" || str_eq n9 "allocate" || builtin_has_meth "Class" n9))
                         then ()
                         // ...naming the class as it prints (an anonymous one is
                         // `#<Module:0x...>`, not its internal key); a CLASS's
@@ -27193,6 +27199,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        let _ = lv_child_done e3c in
        r3)
     else
+    if cls_sng_undef world recv name then cls_sng_undef_raise world recv name args
+    else
     (match recv with
      | VClass c ->
        // Proc.new { } captures the block; Class.new { } makes an anonymous
@@ -28400,6 +28408,14 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   // Integer#coerce / Float#coerce go through Float(), which asks an OBJECT for
   // #to_f. The leaf below has no world to ask with, so it refused every object
   // that was not already a number.
+  // (a Rational refuses an object, naming its class: BigDecimal is not
+  //  converted through #to_f)
+  if (str_len name == 6 && str_eq name "coerce") && (match recv with VRat (_, _) -> true | _ -> false)
+     && (match args with Cons (VObj _, Nil) -> true | _ -> false) then
+    (match args with
+     | Cons (o9, _) -> raise_exc world "TypeError" (cls_display world (dispatch_cls_of world o9) ++ " can't be coerced into Rational")
+     | _ -> VNil)
+  else
   if (str_len name == 6 && str_eq name "coerce") && is_num recv
      && (match args with Cons (VObj _, Nil) -> true | _ -> false)
      && (match args with Cons (o9, _) -> prim_user_has world o9 "to_f" | _ -> false) then
@@ -29987,7 +30003,9 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
   //  where the name is: `def self.foo` at the top level)
   | VMain when main_sng_has world nm ->
     owner_anc world (ancestors_of world (map_get hng_store "main:0")) nm
-  | VMain -> ""
+  // (...and one a module Object includes defined, `module Kernel; def
+  //  BigDecimal`: main is an Object, and `method(:BigDecimal)` finds it)
+  | VMain -> (if map_has meths nm then "" else owner_anc world (ancestors_of world "Object") nm)
   | VObj oid ->
     (let ocl = map_get ocls oid in
      let a = owner_anc world (ancestors_of world ocl) nm in
@@ -34154,6 +34172,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           (match o with
            | VCpx (re9, VInt 0) -> arr_new (Cons (prim_method re9 "to_r" Nil, Cons (recv, Nil)))
            | _ -> arr_new (Cons (o, Cons (VCpx (recv, VInt 0), Nil))))
+        // ...and with the rest (nurat_coerce): an Integer becomes a Rational,
+        // a Float makes both Floats, a Rational pairs as it is, and anything
+        // else is refused naming its class
+        | VRat (_, _) ->
+          (match o with
+           | VInt n9 -> arr_new (Cons (VRat (str_of_int n9, "1"), Cons (recv, Nil)))
+           | VBig b9 -> arr_new (Cons (VRat (b9, "1"), Cons (recv, Nil)))
+           | VFlt _ -> arr_new (Cons (o, Cons (VFlt (to_f recv), Nil)))
+           | VRat (_, _) -> arr_new (Cons (o, Cons (recv, Nil)))
+           | _ -> prim_raise "TypeError" (class_name o ++ " can't be coerced into Rational"))
         | _ -> arr_new (Cons (o, Cons (recv, Nil))))
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
   else if (str_len name == 5 && str_eq name "zero?") then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0")
@@ -39510,6 +39538,20 @@ and self_user_defines = fn env -> fn world -> fn (name: str) ->
 // ancestors and stop at whichever comes first: a definition (still reachable)
 // or a tombstone (gone, builtin included). Nothing is walked at all until the
 // program undefs something, so the usual dispatch pays one map_len.
+// a class whose singleton undefined a name it inherits from Class
+// (`class << self; undef_method :new; end`) no longer answers it
+and cls_sng_undef = fn world -> fn (recv: Val) -> fn (name: str) ->
+  match recv with
+  | VClass c9 -> map_len undefs > 0 && map_has undef_names name
+                 && undef_blocked world ("(sng:" ++ c9 ++ ")") name
+                 && (if has_meth world ("(sng:" ++ c9 ++ ")") name then false else true)
+  | _ -> false
+and cls_sng_undef_raise = fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  (match recv with
+   | VClass c9 -> raise_exc_iv world "NoMethodError"
+                    ("undefined method '" ++ name ++ "' for " ++ (if map_has modules c9 then "module " else "class ") ++ cls_display world c9)
+                    (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
+   | _ -> VNil)
 and undef_blocked = fn world -> fn (cls: str) -> fn (name: str) ->
   if map_len undefs == 0 then false
   else if str_eq cls "" then false
@@ -40563,6 +40605,14 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
     thread_new world superblk tc9 meth args superblk
   | VClass nc9 when (str_len meth == 3 && str_eq meth "new") && (if map_has modules nc9 then false else true) ->
     new_obj_wb world nc9 args superblk
+  // ...and from its own `self.allocate`: Class#allocate, a plain object of
+  // the class (bigdecimal guards its allocator this way)
+  | VClass ac9 when (str_len meth == 8 && str_eq meth "allocate") && (if map_has modules ac9 then false else true)
+                    && (if str_eq ac9 "String" || str_eq ac9 "Array" || str_eq ac9 "Hash" then false else true) ->
+    (let (_, _, ocls9, _) = world in
+     let id9 = alloc_oid ocls9 in
+     let _ = map_set ocls9 id9 ac9 in
+     VObj id9)
   // `super` from a module prepended to a number's class (`class Integer;
   // prepend M` and M#+ calling super) is the builtin operation
   | VInt _ -> prim_method recv meth args
@@ -49629,6 +49679,9 @@ and undef_check = fn world -> fn (cls: str) -> fn (names: str list) ->
        || map_has builtin_alias (cls ++ "#" ++ n)
        // (BasicObject's private hooks every class has)
        || str_eq n "method_missing" || str_eq n "respond_to_missing?" || str_eq n "initialize"
+       // (a class's singleton inherits Class's methods: `class << self;
+       //  undef_method :new; end`, as bigdecimal does)
+       || (is_sng_cls cls && (str_eq n "new" || str_eq n "allocate" || builtin_has_meth "Class" n))
        // (in a refine body, a method of the REFINED class: `refine String do
        //  undef + end` takes `+` away where the refinement is active)
        || (is_refine_impl cls && (let t9 = refine_target_of cls in
@@ -49926,7 +49979,9 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      let shipped = (let s9 = stdlib_src p0 in
                     if (if str_eq s9 "" then false else true) then s9
                     else (let j9 = json_lib_src p0 in
-                          if (if str_eq j9 "" then false else true) then j9 else json_ext_src p0)) in
+                          if (if str_eq j9 "" then false else true) then j9
+                          else (let x9 = json_ext_src p0 in
+                                if (if str_eq x9 "" then false else true) then x9 else bigdecimal_lib_src p0))) in
      // (a shipped library's own "pathname.so" entry is set before its source
      // runs, so lf_has_bare is asked only of the others)
      if (if rel then false else true) && (if ends_with_rb p0 then false else true) && str_eq shipped "" && lf_has_bare p0 then FNext (VBool false)
