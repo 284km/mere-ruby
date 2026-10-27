@@ -317,8 +317,10 @@ type RxRes = RFound of int * (int * int) list | RFail;
 type RxHit = RHit of int * int * (int * int) list | RNoHit | RBadPat;
 // a parse's capturing groups by number, for the subroutines \g<x> calls
 let rx_gnodes = map_new ();
+let _ = map_compact rx_gnodes;  // (its own arena: gc_churn_bytes, note 441)
 // ...and the groups a program being compiled calls
 let rx_called = map_new ();
+let _ = map_compact rx_called;  // (its own arena: rxp_parse gives it back at each parse, note 441)
 
 // DEFLATE comes from the mgz package, vendored under .mere_modules/. Zlib's
 // streams are the same RFC 1951 body under a different wrapper, so mere-ruby
@@ -591,6 +593,12 @@ let top_env_reg = map_new ();
 let fn frame_env_bytes_fwd: unit -> int;
 let gc_store_bytes = fn (u: unit) ->
   if arena_measurable then str_bytes () + map_bytes str_pch + map_bytes arr_store + map_bytes hash_store + gc_churn_bytes ()
+                           // ...and the marks kept beside the strings: one per literal
+                           // evaluated (chilled), per tagged string (encoding). Unseen,
+                           // `n.times { "a" + "b" }` held three times what was counted
+                           // between two collections (note 441)
+                           + map_bytes str_chilled + map_bytes str_chilled_sym + map_bytes str_enc + map_bytes str_frozen
+                           + map_bytes str_ascii + map_bytes str_valid8
                            + vec_get qv_ctr 3
                            + (if map_has top_env_reg 0 then map_bytes (map_get top_env_reg 0) else 0)
                            + frame_env_bytes_fwd ()
@@ -624,8 +632,16 @@ let gc_pressure = fn world ->
   // ...and the byte axis last: it measures a dozen arenas. (Asking it one
   //   time in 16 let a bignum-heavy test file collect later and peak past
   //   the 6 GB guard, so it is asked every time again.)
+  // (the headroom grows with what lived: twice it, at least 8 MB, and never
+  //  more than the live + 32 MB it always was -- the same from 32 MB live
+  //  up. A flat live + 32 MB let a program whose live data is 5 MB triple its
+  //  RSS between two collections; ruby's own leak tests allow twice the
+  //  starting RSS, and every one of them failed on the headroom, note 441.)
   || gc_store_bytes () > (if tight then bbase + 8388608
-                          else bbase + (let st9 = vec_get gc_knob 12 in if st9 < bbase then bbase - st9 else 0) + 33554432);
+                          else (let st9 = vec_get gc_knob 12 in
+                                let live9 = (if st9 < bbase then bbase - st9 else 0) in
+                                let h9 = (if live9 * 2 < 8388608 then 8388608 else live9 * 2) in
+                                bbase + (if h9 > live9 + 33554432 then live9 + 33554432 else h9)));
 
 
 // nth suffix of a list -- the driver's cursor walks the top-level statement
@@ -708,6 +724,11 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                 // left a copy of every live hash each time (note 303)
                 else let _ = map_set live k VNil in
                      let _ = gc_mark_vals live (hsettled id) in
+                     // (its default and default proc live as long as it does,
+                     //  and no longer: rooted from the tables, every
+                     //  `Hash.new { }` ever made kept its block, note 441)
+                     let _ = (if map_len hash_dflt > 0 && map_has hash_dflt (str_of_int id) then gc_mark_val live (map_get hash_dflt (str_of_int id)) else ()) in
+                     let _ = (if map_len hash_dproc > 0 && map_has hash_dproc (str_of_int id) then gc_mark_val live (map_get hash_dproc (str_of_int id)) else ()) in
                      let _ = (if map_has hash_index id
                               then map_iter (map_get hash_index id) (fn (d: str) -> fn (x: Val) -> gc_mark_val live x)
                               else ()) in
@@ -868,12 +889,26 @@ let gc_fixpoint = fn ivars -> fn live ->
   // (the owner index in a region of its own: one per collection went to the
   //  default region)
   region GFX {
-  let idx = map_new () in
+  // ⚠ A CHAIN, NOT A LIST PER OWNER: a map's value is copied on every store,
+  //   so `map_set idx owner (Cons (v, map_get idx owner))` copied the owner's
+  //   whole list once per ivar -- quadratic in one object's ivars, a 50 MB
+  //   region in one collection under `n.times { s.gsub(/a/, "") }` (note 441).
+  //   head: the owner's last value; prevs: each value's previous one.
+  let head = map_new () in
+  let vals = vec_new () in
+  let prevs = vec_new () in
   let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
     let owner = gc_owner_of k in
     if owner < 0 then gc_mark_val live v
-    else if map_has idx owner then map_set idx owner (Cons (v, map_get idx owner))
-    else map_set idx owner (Cons (v, Nil))) in
+    else (let i = vec_len vals in
+          let _ = vec_push vals v in
+          let _ = vec_push prevs (if map_has head owner then map_get head owner else 0 - 1) in
+          map_set head owner i)) in
+  let rec mark_chain = fn (j: int) ->
+    (if j < 0 then () else (let _ = gc_mark_val live (vec_get vals j) in mark_chain (vec_get prevs j))) in
+  let _ = (if gc_log_on ()
+           then print_err ("gc: owned ivars=" ++ str_of_int (vec_len vals) ++ " owners=" ++ str_of_int (map_len head))
+           else ()) in
   let rec drain = fn (rounds: int) ->
     (if map_len gc_obj_pend == 0 then rounds
      else
@@ -883,7 +918,7 @@ let gc_fixpoint = fn ivars -> fn live ->
         let rec each = fn (i: int) ->
           (if i >= vec_len ks then ()
            else (let o = vec_get ks i in
-                 let _ = (if map_has idx o then gc_mark_vals live (map_get idx o) else ()) in
+                 let _ = (if map_has head o then mark_chain (map_get head o) else ()) in
                  each (i + 1))) in
         let _ = each 0 in
         drain (rounds + 1))) in
@@ -944,11 +979,8 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter ff_state mk in
   let _ = map_iter gvar_alias mk in
   let _ = map_iter gvar_traces mk in
-  let _ = map_iter hash_dflt mk in
-  let _ = map_iter hash_dproc mk in
   let _ = map_iter hook_flags mk in
   let _ = map_iter io_cap mk in
-  let _ = map_iter kwarg_marks mk in
   let _ = map_iter lambda_ids mk in
   let _ = map_iter le_path mk in
   // The interned frozen strings (`"lit".freeze`, `-str`): canonical by
@@ -1401,6 +1433,7 @@ let gc_collect = fn env -> fn world ->
     let _ = map_iter hash_indexed (fn (k: int) -> fn (b: bool) ->
       if map_has live (k * 8 + 3) then () else vec_push dHM k) in
     let _ = gc_drop_i hash_indexed dHM in
+    let _ = (if nc then () else map_compact_big hash_indexed) in
     // (a dead hash's stale mark goes too; a live one keeps its own, and the
     //  values in its list the index overwrote were marked with the list --
     //  kept a collection longer, never lost)
@@ -1408,11 +1441,23 @@ let gc_collect = fn env -> fn world ->
     let _ = map_iter hash_stale (fn (k: int) -> fn (b: bool) ->
       if map_has live (k * 8 + 3) then () else vec_push dHS k) in
     let _ = gc_drop_i hash_stale dHS in
+    let _ = (if nc then () else map_compact_big hash_stale) in
     // ...and a dead hash's compare_by_identity mark (one per such hash made)
     let dCI = vec_new () in
     let _ = map_iter hcbi (fn (k: int) -> fn (b: int) ->
       if map_has live (k * 8 + 3) then () else vec_push dCI k) in
     let _ = gc_drop_i hcbi dCI in
+    let _ = (if nc then () else map_compact_big hcbi) in
+    // ...and its default, default proc and keyword marks (keyed as text)
+    let dsh = fn tbl -> fn (d: Vec['d, str]) ->
+      let _ = map_iter tbl (fn (k: str) -> fn (v: Val) ->
+        if map_has live (int_of_str k * 8 + 3) then () else vec_push d k) in
+      let _ = gc_drop_s tbl d in
+      (if nc then () else map_compact_big tbl) in
+    let _ = dsh hash_dflt (vec_new ()) in
+    let _ = dsh hash_dproc (vec_new ()) in
+    let _ = dsh kwarg_marks (vec_new ()) in
+    let _ = dsh r2k_marks (vec_new ()) in
     let _ = (if nc then () else map_compact hash_store) in
     // ⚠ and the appends queued for a string (str_pend): a live string's are
     // folded in and a dead one's dropped, BEFORE the sweep below reads the
@@ -1453,6 +1498,15 @@ let gc_collect = fn env -> fn world ->
       if map_has live (k * 8 + 1) then () else vec_push dF k) in
     let _ = gc_drop_i str_frozen dF in
     let _ = (if nc then () else map_compact str_frozen) in
+    // ...and the ASCII / valid-UTF-8 answers kept per string: one per string
+    // ever asked, kept forever (note 441)
+    let dsb = fn tbl -> fn (d: Vec['d, int]) ->
+      let _ = map_iter tbl (fn (k: int) -> fn (v: bool) ->
+        if map_has live (k * 8 + 1) then () else vec_push d k) in
+      let _ = gc_drop_i tbl d in
+      (if nc then () else map_compact_big tbl) in
+    let _ = dsb str_ascii (vec_new ()) in
+    let _ = dsb str_valid8 (vec_new ()) in
     // ...and the chilled marks, which are keyed the same way (as text): a
     // dead string's mark would otherwise outlive it -- one per literal
     // evaluated and per Symbol#to_s, kept forever.
@@ -1497,6 +1551,11 @@ let gc_collect = fn env -> fn world ->
     // gc_churn_bytes): their entries are all kept, the copies the writes
     // replaced go back with the old arena
     let _ = (if nc then () else gc_churn_compact ()) in
+    // (...and the parser's own: the regexp groups and the lexer's line
+    //  record, cleared at every parse and never given back at one, note 441)
+    let _ = (if nc then () else map_compact_big rx_gnodes) in
+    let _ = (if nc then () else map_compact_big tc_off) in
+    let _ = (if nc then () else map_compact_big tc_ln) in
     // ...and the queues and indexes dropped since the last one go back to their
     // pools, now that every stack is suspended (note 303)
     let _ = (if nc then () else qv_drain ()) in
@@ -1515,7 +1574,11 @@ let gc_collect = fn env -> fn world ->
     // the next thresholds, set HERE so any caller at any depth inherits the
     // same amortization: entries = live + max(scan/2, 4000); bytes = the
     // post-collection baseline (gc_pressure fires at 2x it plus 32 MB).
-    let scan = map_len arr_store + map_len hash_store + str_count () in
+    // (the strings that LIVED, knob 10 -- not str_count, every handle ever
+    //  issued: that grew the gap between two collections for as long as the
+    //  program ran, and 100k `s.gsub(/a/, "")` went from 4k objects a
+    //  collection to 120k, note 441)
+    let scan = map_len arr_store + map_len hash_store + vec_get gc_knob 10 in
     let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
     let _ = vec_set gc_knob 0 (map_len ivars + map_len ocls + delta) in
     let _ = vec_set gc_knob 1 (gc_store_bytes ()) in
@@ -29205,6 +29268,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         //   per character, so 200,000 euro signs out of ISO-8859-15 took 8 GB
         //   (test_transcode's test_length). `acc` is kept as a parameter and
         //   no longer read; what an early way out answers is the buffer so far.
+        // (the buffer, and what each character's step makes, in a region of
+        //  their own: in the default region they stayed, 48 bytes and up a
+        //  call -- note 441. Only the bytes leave it.)
+        let bytes = region EB {
         let eb = strbuf_new () in
         let rec emit = fn (xs: int list) -> fn (acc: str) ->
           (match xs with
@@ -29296,7 +29363,8 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         // ISO-2022-JP is stateful -- one character at a time each came out
         // wrapped in its own ESC $ B ... ESC ( B, so a run is re-joined.
         let q9 = (if str_eq xml9 "attr" then (match encode_cps (Cons (34, Nil)) to_enc9 "" with (qb9, _) -> qb9) else "") in
-        let bytes = (let b0 = q9 ++ iso2022_join to_enc9 (emit cps1 "") ++ q9 in if str_eq b0 "" then b0 else bom9 ++ b0) in
+        (let b0 = q9 ++ iso2022_join to_enc9 (emit cps1 "") ++ q9 in if str_eq b0 "" then b0 else bom9 ++ b0)
+        } in
         if (str_len name == 7 && str_eq name "encode!") then (let _ = sset h bytes in let _ = senc_set h to in recv)
         else (let c = mkstr bytes in (match c with VStr id -> let _ = senc_set id to in c | _ -> c)))
      | _ -> VNil)
@@ -39728,6 +39796,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
                      | VProc pid -> (match proc_get (str_of_int pid) with (_, _, _, cenv) -> lv_child cenv)
                      | _ -> frame_pool_get ())
                   else frame_pool_get ()) in
+     let _ = (if from_pool then () else map_set frame "__nopool" (VBool true)) in
      let _ = map_set frame "__fid" (VInt (next_fid ())) in
      let _ = map_set frame "__meth" (frame_text name) in
      // Whether THIS call was given a block. `block_given?` asks about the
@@ -39763,18 +39832,10 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let out = (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
     let _ = (if rfprev9 >= 0 then ref_install rfprev9 else ()) in
     // the frame dies here unless something captured it (or its chain):
-    // recycled and pooled, its arena wound back to the warm seed. Safe on
-    // every exit path -- method_body_flow converts raises to Flow values,
-    // so this line always runs.
-    let _ = (if from_pool && (if map_has frame "__captured" then false else true)
-             then frame_pool_put frame
-             // (a captured one waits in lv_cap for a collection that does
-             // not reach it)
-             else if from_pool then
-               (match (if map_has frame "__eid" then map_get frame "__eid" else VNil) with
-                | VInt n9 -> map_set lv_cap n9 frame
-                | _ -> ())
-             else ()) in
+    // recycled and pooled, its arena wound back to the warm seed. (A call
+    // that ends in a raise or a flow signal passing through gives it back in
+    // method_body_flow instead: frame_done.)
+    let _ = frame_done frame in
      let _ = fire_trace world "return" name "Object" in
      let _ = fire_tp_vl world "return" name "Object" out slf9
                (match (if map_has meth_src ("e" ++ name) then map_get meth_src ("e" ++ name) else VNil) with VInt l9 -> l9 | _ -> cur_line ()) "" in
@@ -40210,6 +40271,7 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
                     | VProc pid -> (match proc_get (str_of_int pid) with (_, _, _, cenv) -> lv_child cenv)
                     | _ -> frame_pool_get ())
                  else frame_pool_get ()) in
+    let _ = (if from_pool then () else map_set frame "__nopool" (VBool true)) in
     let _ = map_set frame "__fid" (VInt (next_fid ())) in
     // A body that came from define_method is a BLOCK, and a block's
     // `block_given?` asks about the frame it was written in -- never about the
@@ -40318,18 +40380,10 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
              | FBreak _ -> map_set meth_broke 0 1
              | _ -> (if map_has meth_broke 0 then map_delete meth_broke 0 else ())) in
     // the frame dies here unless something captured it (or its chain):
-    // recycled and pooled, its arena wound back to the warm seed. Safe on
-    // every exit path -- method_body_flow converts raises to Flow values,
-    // so this line always runs.
-    let _ = (if from_pool && (if map_has frame "__captured" then false else true)
-             then frame_pool_put frame
-             // (a captured one waits in lv_cap for a collection that does
-             // not reach it)
-             else if from_pool then
-               (match (if map_has frame "__eid" then map_get frame "__eid" else VNil) with
-                | VInt n9 -> map_set lv_cap n9 frame
-                | _ -> ())
-             else ()) in
+    // recycled and pooled, its arena wound back to the warm seed. (A call
+    // that ends in a raise or a flow signal passing through gives it back in
+    // method_body_flow instead: frame_done.)
+    let _ = frame_done frame in
     let _ = fire_trace world "return" name defcls in
     let _ = (if cfn9 then tp_fire_owned world defcls name true out slf9
              else fire_tp_vlc world (if attr9 then "c_return" else "return") mnm defcls out slf9
@@ -41799,7 +41853,9 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
               let _ = map_set flow_sig "fid" (VInt target) in
               let _ = map_set flow_sig "v" v in
               (let m = "mere-ruby: (unhandled " ++ k ++ " looking for its frame)" in
-               let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m))
+               let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in
+               // (this call is over: run_meth will not get to give its frame back)
+               let _ = frame_done frame in fail m))
       else if str_eq k "retry" then FRaise (raise_exc world "SyntaxError" "Invalid retry")
       // `redo` in a define_method body restarts the body, as it would the
       // block the method was made from (it was "unhandled redo", and a spec
@@ -41809,8 +41865,12 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
                   let mn9 = (match (if map_has frame "__meth" then map_get frame "__meth" else VNil) with VStr h9 -> sget h9 | _ -> "") in
                   map_has dm_methods (dc9 ++ "#" ++ mn9)) then
         (let _ = tick () in method_body_flow frame world blk body)
-      else flow_rethrow k v
-    else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
+      else (let _ = frame_done frame in flow_rethrow k v)
+    else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in
+          // (the exception leaves the call as a Mere failure, past run_meth's
+          //  frame_done: the frame goes back here, note 441)
+          let _ = frame_done frame in
+          fail "mere-ruby: (ruby exception raised)")
   | other -> other
 
 // materialize an Enumerator into an array (unbounded enum_take).
@@ -52598,7 +52658,15 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     // (without a binding an eval is a scope of its own under the caller's:
     //  it reads and writes the caller's locals, and the ones it makes end
     //  with it -- `eval("a = 2"); eval("p a")` is a NameError)
-    let eenv = (match rest with Cons (VBind bid, _) -> map_get bind_store (str_of_int bid) | _ -> lv_child env) in
+    // (from the pool, and back to it when the eval is done: a lv_child was a
+    //  new map in the default region and a parent link, per eval, for good --
+    //  1.4 KB an `eval("1 + 1")`, note 441)
+    let fresh9 = (match rest with Cons (VBind _, _) -> false | _ -> true) in
+    let eenv = (match rest with Cons (VBind bid, _) -> map_get bind_store (str_of_int bid) | _ -> blk_env_get env) in
+    // (given back however the eval ends: a SyntaxError or an exception leaves
+    //  it as a Mere failure, past the line after it -- a pooled env kept per
+    //  failed eval was 9 KB, test_eval's syntax-error loop)
+    let (res9, fail9) = try_or_msg (fn (u: unit) -> ((
     // (...and its own default visibility: `eval("private")` leaves the
     //  class body's defs after it as they were)
     let _ = (match rest with
@@ -52640,7 +52708,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
       let (p2, _) = parse_stmts toks Nil in
       let _ = rx_check_pending () in
       let _ = map_clear vw_outer in
-      let _ = lv_names_into eenv vw_outer (map_new ()) in
+      let _ = region LVN { lv_names_into eenv vw_outer (map_new ()) } in
       let _ = uv_program_eval p2 (parse_time_file ()) in
       let _ = map_clear vw_outer in
      let _ = warn_flush world in p2) sentinel in
@@ -52724,6 +52792,9 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if eval_src_u8 cod codelbl && bad_sym_stmts prog2 then raise_exc world "SyntaxError" "invalid symbol"
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "unexpected void value expression"
        else eval_run_at eenv world blk prog2 efile9 eline9)
+    ), "")) (fn (m: str) -> (VNil, (if str_eq m "" then " " else m))) in
+    let _ = (if fresh9 then blk_env_put eenv else ()) in
+    if str_eq fail9 "" then res9 else fail fail9
   // ...and anything else is ruby's TypeError, not an internal failure: `eval`
   // says which conversion it wanted.
   // ...asking the object for a string first: ruby converts with #to_str and
@@ -52813,13 +52884,15 @@ and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (e
      let _ = cur_line_set eline in
      // (raised or not: an eval that raised left the run-time file at its
      //  name, and every block written after the rescue reported it)
+     region EVA {
      let ok9 = map_new () in
      let r9 = try_or (fn (u: unit) -> (let v9 = eval_run env world blk prog2 in let _ = map_set ok9 "y" 1 in v9)) VNil in
      let _ = cur_file_set of9 in
      let _ = cur_line_set ol9 in
      if map_has ok9 "y" then r9
      else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (passed on past an eval)")) in
-           fail "mere-ruby: (passed on past an eval)"))
+           fail "mere-ruby: (passed on past an eval)")
+     })
 
 
 // a Binding's env: the locals, and the lexical scope it was made in when that
@@ -52843,13 +52916,16 @@ and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
   else
     (let _ = map_set env "__evtop" VNil in
      let _ = map_set ev_active "n" ((if map_has ev_active "n" then map_get ev_active "n" else 0) + 1) in
+     // (the flag in a region of its own, as in eval_run_at, note 441)
+     region EVB {
      let ok9 = map_new () in
      let r9 = try_or (fn (u: unit) -> (let v9 = eval_run0 env world blk prog2 in let _ = map_set ok9 "y" 1 in v9)) VNil in
      let _ = map_delete env "__evtop" in
      let _ = map_set ev_active "n" (map_get ev_active "n" - 1) in
      if map_has ok9 "y" then r9
      else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (passed on past an eval)")) in
-           fail "mere-ruby: (passed on past an eval)"))
+           fail "mere-ruby: (passed on past an eval)")
+     })
 // is the implicit parameter `name` (_1.._9, "_1" for `it`) found only past
 // a running eval's own env? Then the eval'd code does not see it.
 and implicit_hidden = fn env -> fn (name: str) ->
@@ -53575,6 +53651,9 @@ and rxp_call_gnum = fn (key: str) ->
   if str_len key > 1 && str_eq (char_at key 0) "#" then int_of_str (substring key 1 (str_len key))
   else if map_has rx_gnums key then (match map_get rx_gnums key with VInt k -> k | _ -> 0) else 0
 and rxp_calls_why = fn (n: RNode) ->
+  // (its two tables in a region of their own: once per parse they went to
+  //  the default region, note 441)
+  region RCW {
   let keys9 = map_new () in
   let _ = rxp_collect_calls n keys9 in
   let bad9 = map_new () in
@@ -53587,6 +53666,7 @@ and rxp_calls_why = fn (n: RNode) ->
                (let body9 = (match map_get rx_gnodes g9 with NGroup (b9, _, _) -> b9 | o9 -> o9) in
                 if rxp_left_calls g9 body9 || rxp_all_call g9 body9 then map_set bad9 "w" "never ending recursion" else ()))) in
   if map_has bad9 "w" then map_get bad9 "w" else ""
+  }
 and rxp_collect_calls = fn (n: RNode) -> fn keys ->
   match n with
   | NCall k -> map_set keys k 1
@@ -54442,6 +54522,10 @@ and warn_flush = fn world ->
   let n = (if map_has warn_pending "n" then (match map_get warn_pending "n" with VInt k -> k | _ -> 0) else 0) in
   let d = (if map_has warn_pending "done" then (match map_get warn_pending "done" with VInt k -> k | _ -> 0) else 0) in
   let _ = warn_flush_go world d n in
+  // (and the ones said go: a GC root, one entry per warning a parse ever
+  //  queued -- every eval's, note 441)
+  let rec drop9 = fn (i: int) -> (if i >= n then () else (let _ = (if map_has warn_pending ("w" ++ str_of_int i) then map_delete warn_pending ("w" ++ str_of_int i) else ()) in drop9 (i + 1))) in
+  let _ = drop9 d in
   map_set warn_pending "done" (VInt n)
 and warn_flush_go = fn world -> fn (i: int) -> fn (n: int) ->
   if i >= n then ()
@@ -54478,6 +54562,9 @@ and rx_check_go = fn (i: int) -> fn (n: int) ->
     let _ = rx_wq_take () in
     let ok9 = rx_validate body fl in
     let loc9 = (if map_has rx_pending ("l" ++ str_of_int i) then (match map_get rx_pending ("l" ++ str_of_int i) with VStr h -> sget h | _ -> "-") else "-") in
+    // (read, and gone: the queue is a GC root, and a literal it kept was kept
+    //  for good -- one per regexp literal in every eval, note 441)
+    let _ = rx_pending_drop i in
     let _ = rx_note_warns (rx_wq_take ()) loc9 body in
     if ok9 then rx_check_go (i + 1) n
     else
