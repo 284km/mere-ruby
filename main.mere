@@ -1699,6 +1699,7 @@ import "m_json_lib.mere";
 import "m_bigdecimal_lib.mere";
 import "m_syslog_lib.mere";
 import "m_builtin_lists.mere";
+import "m_delegate_lib.mere";
 import "m_json.mere";
 
 // one `FNext nil` for every turn that ends normally: a region's value is
@@ -4036,8 +4037,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     //  instances undefined, and `UU.new === 1` after `undef_method :===` is
     //  the NoMethodError the object asked for)
     if map_len undefs > 0 && map_has undef_names op && (match va0 with VClass _ -> false | _ -> true) && undef_blocked world (dispatch_cls_of world va0) op then
-      raise_exc_iv world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ for_recv_cls world (dispatch_cls_of world va0))
-        (Cons (("__name", VSym op), Cons (("__recv", va0), Nil)))
+      // (...asked of #method_missing first, as any undefined name is: ruby's
+      //  Delegator undefines === and <=> so that they reach it and delegate)
+      (if has_meth world (dispatch_cls_of world va0) "method_missing" then
+         invoke world (false, (Nil : str list), (Nil : Stmt list), env) va0 (dispatch_cls_of world va0) "method_missing"
+           (Cons (VSym op, Cons (eval_e env world blk b, Nil)))
+       else raise_exc_iv world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ for_recv_cls world (dispatch_cls_of world va0))
+        (Cons (("__name", VSym op), Cons (("__recv", va0), Nil))))
     else
     // ⚠ TWO INTEGERS AND A PLAIN OPERATOR, before even the chain of operator
     //   names below (`<<`, `==`, `!=` ...): `i < n` and `i += 1` paid a dozen
@@ -11505,6 +11511,15 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     if str_eq cls "EnvHash" || (is_sng_cls cls && str_eq (sng_supername world cls) "EnvHash") then inspect_w env world (mkhash (env_hash_list ()))
     // a BasicObject has no #inspect (Kernel's is Object's): `p b` and
     // `[b].inspect` are ruby's NoMethodError, unless it defined one
+    // (...unless it has a #method_missing, which an undefined name reaches
+    //  first: ruby's Delegator undefines #inspect so that `p delegator`
+    //  prints the object it delegates to)
+    else if (if usr9 then false else true) && is_basic_obj world v
+            && (if map_has bm_bypass "k" then false else true)
+            && has_meth world (dispatch_cls_of world v) "method_missing" then
+      (match invoke world (false, (Nil : str list), (Nil : Stmt list), env) v (dispatch_cls_of world v) "method_missing" (Cons (VSym "inspect", Nil)) with
+       | VStr h9 -> sget h9
+       | r9 -> to_s r9)
     else if (if usr9 then false else true) && is_basic_obj world v
             && (if map_has bm_bypass "k" then false else true) then
       (let _ = raise_exc world "NoMethodError"
@@ -15433,6 +15448,19 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
             && is_sng_cls c && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
       raise_exc world "TypeError" "can't copy singleton class"
+    // a builtin MODULE's copy -- `::Kernel.dup`, which ruby's Delegator
+    // takes and then undefines names in -- answered Kernel itself, so the
+    // undefines removed Kernel's own require and format. Its methods live in
+    // the dispatcher, where nothing can copy them; the copy is a new
+    // anonymous module that includes the original, so what it undefines is
+    // gone for whatever includes the copy and nowhere else.
+    else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
+            && map_has modules c && builtin_cls_name c
+            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+       let m9 = invoke_val_c env world nb9 (VClass "Module") "new" Nil false in
+       let _ = invoke_val_c env world nb9 m9 "include" (Cons (recv, Nil)) false in
+       m9)
     else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
             && (if is_sng_cls c then false else true)
             // (a builtin class has nothing in these tables to copy; it keeps the old answer)
@@ -18010,6 +18038,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // question asked at the end: a private or protected method is NOT one of
     // them, and ruby refuses with the same NameError shape. It shares this arm
     // rather than getting a copy, so the two cannot find different methods.
+    // (a class method of this name above the class answers first --
+    //  DelegateClass's -- and its `super` reaches here through refl_super)
+    else if ((str_len name == 15 && str_eq name "instance_method") || (str_len name == 22 && str_eq name "public_instance_method"))
+            && has_meth world ("(sng:" ++ c ++ ")") name
+            && (if map_has refl_super "v" then (let _ = map_delete refl_super "v" in false) else true) then
+      invoke world noblk recv ("(sng:" ++ c ++ ")") name args
     else if (str_len name == 15 && str_eq name "instance_method")
             || (str_len name == 22 && str_eq name "public_instance_method") then
       (let (meths0, sup0, ocls0, ivars0) = world in
@@ -31901,6 +31935,10 @@ and builtin_mut_on_frozen = fn world -> fn (recv: Val) -> fn (name: str) ->
   && (match recv with VStr _ -> (if str_len name == 6 && str_eq name "delete" then false else true) | _ -> true)
   // (a frozen Thread's `[]=` is refused by the Thread itself, in its words)
   && (match recv with VObj _ -> (if str_len name == 3 && str_eq name "[]=" && obj_is_a world (dispatch_cls_of world recv) "Thread" then false else true) | _ -> true)
+  // (...and an object with a #method_missing of its own has no builtin
+  //  `upcase!` to refuse: the name reaches the hook, and a frozen
+  //  Delegator's target refuses in ITS words -- "frozen String")
+  && (match recv with VObj _ -> (if has_meth world (dispatch_cls_of world recv) "method_missing" then false else true) | _ -> true)
 
 
 // String#slice!(regexp[, group]): remove the GROUP's span (0 = the whole
@@ -36355,7 +36393,17 @@ and cmp_possible_w = fn world -> fn (a: Val) -> fn (b: Val) ->
   | VObj oid ->
     (let (m9, s9, o9, i9) = world in
      let ocl = map_get o9 oid in
-     if has_meth world ocl "<=>" then
+     // an object with a method_missing is asked through the ordinary call, so
+     // an undefined <=> reaches it (a Delegator undefines <=> in its Kernel
+     // copy and forwards it there, note 434)
+     // (the ordinary call does not see that undef yet -- `d.send(:<=>, x)` is
+     //  Kernel's -- so an undefined <=> goes to method_missing here)
+     if has_meth world ocl "method_missing" && map_len undefs > 0 && undef_blocked world ocl "<=>" then
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        match try_or (fn (u: unit) -> invoke world nb9 a ocl "method_missing" (Cons (VSym "<=>", Cons (b, Nil)))) VNil with
+        | VInt _ -> true
+        | _ -> false)
+     else if has_meth world ocl "<=>" then
        (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
         match invoke world nb9 a ocl "<=>" (Cons (b, Nil)) with VInt _ -> true | _ -> false)
      // ...and a BUILTIN <=> answers too. Time's lives in the dispatcher, not
@@ -50247,7 +50295,9 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                           else (let x9 = json_ext_src p0 in
                                 if (if str_eq x9 "" then false else true) then x9
                                 else (let b9 = bigdecimal_lib_src p0 in
-                                      if (if str_eq b9 "" then false else true) then b9 else syslog_lib_src p0)))) in
+                                      if (if str_eq b9 "" then false else true) then b9
+                                      else (let y9 = syslog_lib_src p0 in
+                                            if (if str_eq y9 "" then false else true) then y9 else delegate_lib_src p0))))) in
      // (a shipped library's own "pathname.so" entry is set before its source
      // runs, so lf_has_bare is asked only of the others)
      if (if rel then false else true) && (if ends_with_rb p0 then false else true) && str_eq shipped "" && lf_has_bare p0 then FNext (VBool false)
