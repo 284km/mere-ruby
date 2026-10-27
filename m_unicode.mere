@@ -287,6 +287,31 @@ let rec jis_hex = fn (s: str) -> fn (i: int) -> fn (e: int) -> fn (acc: int) ->
 let jis_hx2 = fn (b: int) ->
   let d = fn (v: int) -> chr (if v < 10 then 48 + v else 55 + v) in
   d (b / 16) ++ d (b - (b / 16) * 16);
+// EUC-JIS-2004 (JIS X 0213): where it reads otherwise than EUC-JP, from the
+// generated m_eucjis2004 (note 440). Built on first use: code (hex) -> the
+// character, -1 for a code only EUC-JP reads; and the character -> its code.
+let ej2004_dec = map_new ();
+let ej2004_enc = map_new ();
+let ej2004_load = fn (u: unit) ->
+  if map_len ej2004_dec > 0 then ()
+  else list_iter (str_split ej2004_src ",") (fn (e: str) ->
+         (let j = str_index_of e "=" in
+          if j <= 0 then ()
+          else (let k = substring e 0 j in
+                let v = substring e (j + 1) (str_len e) in
+                if str_eq v "-" then map_set ej2004_dec k (0 - 1)
+                else (let cp = jis_hex v 0 (str_len v) 0 in
+                      let _ = map_set ej2004_dec k cp in
+                      if map_has ej2004_enc (str_of_int cp) then () else map_set ej2004_enc (str_of_int cp) k))));
+// the hex key of the character at i (one, two or three bytes), "" for ASCII
+let ej2004_key = fn (s: str) -> fn (i: int) ->
+  let b0 = ord (char_at s i) in
+  let w = (if b0 < 128 then 1 else if b0 == 143 then 3 else 2) in
+  if w == 1 || i + w > str_len s then ""
+  else if w == 2 then jis_hx2 b0 ++ jis_hx2 (ord (char_at s (i + 1)))
+  else jis_hx2 b0 ++ jis_hx2 (ord (char_at s (i + 1))) ++ jis_hx2 (ord (char_at s (i + 2)));
+let rec ej2004_bytes = fn (k: str) -> fn (i: int) ->
+  if i + 1 >= str_len k then "" else chr (jis_hex k i (i + 2) 0) ++ ej2004_bytes k (i + 2);
 // the two maps are built on first use; the raw literal costs nothing until a
 // program actually transcodes CJK text.
 let jis_tables_build = fn (u: unit) ->
@@ -545,8 +570,12 @@ let rec iso2022_dec = fn (cpx: bool) -> fn (s: str) -> fn (i: int) -> fn (mode: 
   else if o i == 27 then
     (if o (i + 1) == 40 && (o (i + 2) == 66 || o (i + 2) == 74) then iso2022_dec cpx s (i + 3) 0
      else if o (i + 1) == 36 && (o (i + 2) == 66 || o (i + 2) == 64) then iso2022_dec cpx s (i + 3) 1
-     else if o (i + 1) == 40 && o (i + 2) == 73 then iso2022_dec cpx s (i + 3) 2
+     // (the half-width katakana set is CP5022x's: ISO-2022-JP has no such
+     //  escape, and ruby refuses `ESC ( I` there, note 440)
+     else if o (i + 1) == 40 && o (i + 2) == 73 && cpx then iso2022_dec cpx s (i + 3) 2
      else Cons (0 - 1, iso2022_dec cpx s (i + 1) mode))
+  // (CP50221 reads a high-bit katakana byte, 0xA1..0xDF, in any state)
+  else if cpx && o i >= 161 && o i <= 223 then Cons (65377 + o i - 161, iso2022_dec cpx s (i + 1) mode)
   else if o i >= 128 then Cons (0 - 1, iso2022_dec cpx s (i + 1) mode)
   else if mode == 1 then
     (if o i < 33 || o i > 126 then Cons (0 - 1, iso2022_dec cpx s (i + 1) mode)
@@ -559,7 +588,10 @@ let rec iso2022_dec = fn (cpx: bool) -> fn (s: str) -> fn (i: int) -> fn (mode: 
         let ch = (if w9 >= 0 then utf8_enc w9 else jis_e2u_ch (jis_hx2 (o i + 128) ++ jis_hx2 (o (i + 1) + 128))) in
         if str_eq ch "" then Cons (0 - (10 + i), iso2022_dec cpx s (i + 2) mode)
         else Cons ((match utf8_cp ch 0 with (c, _) -> c), iso2022_dec cpx s (i + 2) mode)))
-  else if mode == 2 then
+  // (SO .. SI is the katakana set too, in CP5022x)
+  else if cpx && o i == 14 then iso2022_dec cpx s (i + 1) 3
+  else if cpx && o i == 15 then iso2022_dec cpx s (i + 1) 0
+  else if mode == 2 || mode == 3 then
     (if o i >= 33 && o i <= 95 then Cons (65377 + o i - 33, iso2022_dec cpx s (i + 1) mode)
      else Cons (0 - 1, iso2022_dec cpx s (i + 1) mode))
   // (SO and SI shift into a set ISO-2022-JP does not have: broken there)
@@ -599,6 +631,21 @@ let rec decode_cps = fn (s: str) -> fn (from0: str) -> fn (i: int) ->
   // (UTF8-MAC reads as UTF-8: String#encode composes what it decomposed)
   let from = (if str_eq (enc_up from0) "UTF8-MAC" then "UTF-8" else enc_tx_alias from0) in
   if i >= str_len s then Nil
+  // EUC-JIS-2004: its own reading where the table has one, EUC-JP's for the
+  // rest (a character at a time, its undefined marks moved to where it is)
+  else if str_eq (enc_up from0) "EUC-JIS-2004" then
+    (let _ = ej2004_load () in
+     let k9 = ej2004_key s i in
+     if (if str_eq k9 "" then false else map_has ej2004_dec k9) then
+       (let v9 = map_get ej2004_dec k9 in
+        Cons ((if v9 < 0 then 0 - (10 + i) else v9), decode_cps s from0 (i + str_len k9 / 2)))
+     else
+       (let w9 = (if str_eq k9 "" then 1 else str_len k9 / 2) in
+        let rec shift9 = fn (xs: int list) ->
+          (match xs with
+           | Nil -> decode_cps s from0 (i + w9)
+           | Cons (c9, t9) -> Cons ((if c9 <= 0 - 10 then c9 - i else c9), shift9 t9)) in
+        shift9 (decode_cps (substring s i (i + w9)) "EUC-JP" 0)))
   else if iso2022_name (enc_up from) then iso2022_dec (if str_eq (enc_up from) "ISO-2022-JP" then false else true) s i 0
   // CESU-8: UTF-8, except that a character past the BMP is its surrogate
   // pair, each half written as a three-byte sequence
@@ -778,8 +825,24 @@ let rec encode_cps_go = fn (cps: int list) -> fn (to0: str) -> fn b ->
   | Cons (cp, t) ->
     (let to = enc_tx_alias to0 in
      let tu = enc_up to in
-     let put = fn (x: str) -> (let _ = strbuf_push b x in encode_cps_go t to b) in
-     if str_eq tu "UTF-8" then put (utf8_enc cp)
+     // (on with the name as GIVEN: after an ASCII character, the rest of an
+     //  EUC-JIS-2004 string was written as EUC-JP)
+     let put = fn (x: str) -> (let _ = strbuf_push b x in encode_cps_go t to0 b) in
+     // EUC-JIS-2004: its own code for a character the table has; EUC-JP's
+     // otherwise, unless that code is one it does not read
+     if str_eq (enc_up to0) "EUC-JIS-2004" && cp >= 128 then
+       (let _ = ej2004_load () in
+        if map_has ej2004_enc (str_of_int cp) then
+          (let k9 = map_get ej2004_enc (str_of_int cp) in put (ej2004_bytes k9 0))
+        else
+          (let b9 = strbuf_new () in
+           if (if encode_cps_go (Cons (cp, Nil)) "EUC-JP" b9 then false else true) then false
+           else
+             (let x9 = strbuf_to_str b9 in
+              let k9 = ej2004_key x9 0 in
+              if (if str_eq k9 "" then false else map_has ej2004_dec k9) then false
+              else put x9)))
+     else if str_eq tu "UTF-8" then put (utf8_enc cp)
      // (CESU-8 writes a character past the BMP as its two surrogates)
      else if str_eq tu "CESU-8" then
        (if cp >= 65536 then
