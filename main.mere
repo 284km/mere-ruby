@@ -2844,9 +2844,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // block is the whole method, and the blockless form reached the
     // undefined-local-variable path.
     // Kernel#exit!: ends the process NOW -- no at_exit handlers, no ensure
-    // clauses -- with the status given (false = 1, true / none = 0)
+    // clauses -- with the status given (true = 0; false and none = 1:
+    // exit!'s default is false, where exit's is true -- note 436)
     else if (str_len name == 5 && str_eq name "exit!") && (if map_has meths "exit!" then false else true) then
-      (let _ = exit 0 in VNil)
+      (let _ = exit 1 in VNil)
     else if (str_len name == 7 && str_eq name "at_exit") && (if map_has meths "at_exit" then false else true) then
       raise_exc world "ArgumentError" "called without a block"
     // a bare `abort` is Kernel#abort with no message (it was "undefined
@@ -3384,10 +3385,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // Kernel#at_exit { }: remember the block and answer it as a Proc.
     else if (str_len name == 7 && str_eq name "at_exit") && (if map_has meths "at_exit" then false else true) then
       at_exit_with_block (true, bp, bb, env)
-    // Kernel#fork { }: not implemented (no process extern) — Ruby's own
-    // NotImplementedError contract for fork-less platforms.
+    // Kernel#fork { }: Process.fork, with the block (note 436)
     else if (str_len name == 4 && str_eq name "fork") && (if map_has meths "fork" then false else true) then
-      raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
+      invoke world (true, bp, bb, env) (VClass "Process") "(sng:Process)" "fork" Nil
     // proc { } / lambda { } capture the block as a first-class VProc.
     // (...unless self's class defines its own: then `lambda { return 1 }` is a
     // call to it with a block, which stays a proc)
@@ -19852,6 +19852,27 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if str_eq c "Process" && (str_len name == 8 && str_eq name "__getsid") then
       (match args with Cons (VInt p9, _) -> VInt (getsid p9) | _ -> VInt (0 - 1))
     else if str_eq c "Process" && (str_len name == 8 && str_eq name "__setsid") then VInt (setsid ())
+    else if str_eq c "Process" && (str_len name == 9 && str_eq name "__setpgid") then
+      (match args with Cons (VInt p9, Cons (VInt g9, _)) -> VInt (setpgid p9 g9) | _ -> VInt (0 - 1))
+    // fork(2), under the prelude's Process._fork (note 436): -1 is EAGAIN,
+    // the one way it fails that a program can do anything about
+    else if str_eq c "Process" && (str_len name == 6 && str_eq name "__fork") then
+      (match try_or (fn (u: unit) -> fork ()) (0 - 2) with
+       | p9 when p9 == 0 - 2 -> raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
+       | p9 when p9 < 0 -> raise_exc world "Errno::EAGAIN" "Resource temporarily unavailable - fork(2)"
+       // ($$ is read once at startup: the child's is its own)
+       | p9 when p9 == 0 ->
+         (let _ = map_set globals "$" (VInt (getpid ())) in
+          let _ = (if map_len all_thr > 1 then sch_forget_others world else ()) in VInt 0)
+       | p9 -> VInt p9)
+    // ...and the end of a forked child that ran a block: the at_exit
+    // handlers, the other threads stopped, and the process ends -- never a
+    // return into the code that called fork, which is the parent's
+    else if str_eq c "Process" && (str_len name == 12 && str_eq name "__child_exit") then
+      (let st9 = (match args with Cons (VInt n9, _) -> n9 | _ -> 0) in
+       let ov9 = run_at_exits_r world (fn (e9: Val) -> print_err (inspect_w gc_cenv0 world e9)) in
+       let _ = sch_terminate_all world in
+       let _ = exit (if ov9 >= 0 then ov9 else st9) in VNil)
     // The raw limit and priority calls under the prelude's getrlimit /
     // setrlimit / getpriority / setpriority, which do the argument coercion
     // ruby does (a Symbol or String short name, #to_str, #to_int, :INFINITY)
@@ -31298,6 +31319,13 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
                  if map_has undef_names nm && undef_blocked world sng8 nm then false
                  else has_meth world sng8 nm || (str_eq nm "new" && meth_private world sng8 "new"))
               | _ -> has_meth world c9 nm) then VBool true
+  // ...and Kernel's private functions (fork, sleep, exit!, trace_var), which
+  // have no table entry: every receiver whose chain has Kernel answers them
+  // (`respond_to?(:fork, true)` is how test_process decides to run its fork
+  // tests -- note 436)
+  else if all && is_kernel_builtin nm
+          && (if map_len undefs > 0 && undef_blocked world c9 nm then false else true)
+          && str_list_has (ancestors_of world c9) "Kernel" then VBool true
   else rtm9 ()
 
 // ruby's coerce protocol does NOT go through respond_to?: it looks the method
@@ -38361,7 +38389,7 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
      else if fb_can_suspend then with_builtin_frame world VNil "sleep" (fn (u: unit) -> sch_sleep gc_cenv0 world VNil)
      else if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
   else if (str_len name == 4 && str_eq name "fork") then
-    raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
+    invoke world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) (VClass "Process") "(sng:Process)" "fork" Nil
   else if (str_len name == 4 && str_eq name "exit") then
     raise_system_exit world (exit_status_arg world args) "exit"
   else
@@ -38624,7 +38652,7 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
     raise_system_exit world (exit_status_arg world args) "exit"
   // ...and exit!, which ends it now: no at_exit handlers, no ensure clauses
   else if (str_len name == 5 && str_eq name "exit!") then
-    (let _ = exit (exit_status_arg world args) in VNil)
+    (let _ = exit (match args with Nil -> 1 | _ -> exit_status_arg world args) in VNil)
   // Kernel#abort(msg): the message is a String by #to_str (TypeError
   // otherwise), written to $STDERR -- whatever $stderr is now, which is what
   // mspec's IOStub reads -- and it becomes the SystemExit's message.
@@ -38757,10 +38785,9 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
     //   and an object one made rand answer a Float (the no-argument form),
     //   which is what core/kernel/rand_spec asks about.
     (if (str_len name == 5 && str_eq name "srand") then srand_val env world args else rnd_kernel env world (false, (Nil : str list), (Nil : Stmt list), env) args)
-  // Kernel#fork is not implemented (no process extern) — Ruby's own
-  // NotImplementedError contract for platforms without fork.
+  // Kernel#fork: Process.fork (note 436)
   else if (str_len name == 4 && str_eq name "fork") then
-    raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
+    invoke world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) (VClass "Process") "(sng:Process)" "fork" Nil
   // `@@x ||= v`'s read: the class variable's value, or nil when it has never
   // been assigned (a bare read of an undefined class variable is a NameError).
   else if (str_len name == 13 && str_eq name "__gvar_or_nil") && (match args with Cons (VStr _, _) -> true | _ -> false) then
@@ -45808,6 +45835,30 @@ and sch_terminate_all = fn world ->
               let _ = map_delete iv (str_of_int m ++ "@__tpend") in
               go (n - 1))) in
      go 10000)
+// After fork(2) in the child: the thread that forked is the only one. The
+// others were never copied into the child (ruby's rb_thread_atfork): they are
+// dead there, without running their ensure clauses, and the forking thread is
+// the main one (note 436).
+// (every thread Thread.list knows, started or not: one made just before the
+//  fork that has not run yet is dead in the child too)
+and sch_forget_others = fn world ->
+  let (_, _, _, iv) = world in
+  let me = sch_me () in
+  let others = map_new () in
+  let _ = map_iter all_thr (fn (k9: str) -> fn (t9: Val) ->
+            (match t9 with
+             | VObj t -> (if t == me then () else map_set others t 1)
+             | _ -> ())) in
+  let _ = map_iter others (fn (t: int) -> fn (x: int) ->
+            (let _ = map_set iv (str_of_int t ++ "@__tst") (VBool false) in
+             if map_has sch_live t then
+               (let _ = map_delete sch_live t in
+                let _ = (if sch_waiting t then sch_unpark t else ()) in
+                let _ = (if map_has sch_queued t then map_delete sch_queued t else ()) in
+                let _ = (if map_has sch_fb t then map_set fb_state (map_get sch_fb t) 3 else ()) in
+                fb_live_add (0 - 1))
+             else (if map_has sch_queued t then map_delete sch_queued t else ()))) in
+  if me >= 0 && me != sch_main () then map_set sch_st "main" me else ()
 // join: wait for t to end, or for the limit to run out (answers true then)
 and sch_join = fn env -> fn world -> fn (t: int) -> fn (limit: Val) ->
   let dl = sch_deadline env world limit in
@@ -48769,10 +48820,10 @@ and builtin_frame_label = fn world -> fn (recv: Val) -> fn (name: str) ->
 // and its collector does not compact -- `GC.respond_to?(:auto_compact)` true
 // sent envutil's under_gc_compact_stress into GC.auto_compact= and its
 // NotImplementedError (eleven *_gc_compact_stress tests), and
-// `Process.respond_to?(:_fork)` true ran test_process's fork tests
+// `Process.respond_to?(:_fork)` true ran test_process's fork tests -- until
+// fork was real (note 436)
 and bo_notimpl = fn (cls: str) -> fn (name: str) ->
-  (str_eq cls "Process" && (str_eq name "fork" || str_eq name "_fork" || str_eq name "daemon"))
-  || (str_eq cls "GC" && (str_eq name "compact" || str_eq name "auto_compact" || str_eq name "auto_compact="
+  (str_eq cls "GC" && (str_eq name "compact" || str_eq name "auto_compact" || str_eq name "auto_compact="
                           || str_eq name "latest_compact_info" || str_eq name "verify_compaction_references"))
 and bo_defines = fn (cls: str) -> fn (name: str) ->
   (let _ = bo_ensure () in map_has bi_owner_set (cls ++ "#" ++ name) || map_has bi_owner_set ("Enumerable#" ++ name))
@@ -51929,6 +51980,13 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
                    if map_has flow_sig "k" then (match map_get flow_sig "k" with VStr kk -> let kk = sget kk in kk | _ -> "") else ""
                  | _ -> "") in
     let flowv = (if str_eq flowk "" then VNil else (if map_has flow_sig "v" then map_get flow_sig "v" else VNil)) in
+    // ...and WHERE it is going: a break / return out of a block names the
+    // frame it unwinds to (fid), a throw its tag. The ensure body may make
+    // signals of its own -- IO#close waits for a child in a loop that
+    // returns -- and those overwrote the slots, so a `break` out of
+    // `IO.popen(cmd) { }` lost its frame and ended the program (note 436)
+    let flowfid = (if str_eq flowk "" then VNil else (if map_has flow_sig "fid" then map_get flow_sig "fid" else VNil)) in
+    let flowtag = (if str_eq flowk "" then VNil else (if map_has flow_sig "tag" then map_get flow_sig "tag" else VNil)) in
     let _ = if str_eq flowk "" then () else map_delete flow_sig "k" in
     // handle rescue / else, itself wrapped so a raise inside a handler
     // (or a re-raise past all rescues) still lets ensure run first.
@@ -52095,7 +52153,9 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
          (match outcome with
           | FRaise _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (exception propagates after ensure)")) in fail "mere-ruby: (exception propagates after ensure)")
           | other -> let _ = map_set globals "!" prev_bang in other)
-       else flow_rethrow flowk flowv
+       else (let _ = (match flowfid with VNil -> () | f9 -> map_set flow_sig "fid" f9) in
+             let _ = (match flowtag with VNil -> () | t9 -> map_set flow_sig "tag" t9) in
+             flow_rethrow flowk flowv)
      | esc -> esc)
 
 

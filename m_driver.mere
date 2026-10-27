@@ -4676,7 +4676,11 @@ let core_prelude_f =
   "\n" ++
   "  # Kernel#spawn is Process.spawn (see there for what a child is here)\n" ++
   "  def spawn(*args) = Process.spawn(*args)\n" ++
-  "  module_function :spawn\n" ++
+  "  module_function :spawn\n" ++  // Kernel.fork { } is Process.fork (note 436). Only the PUBLIC singleton
+  // is written here: the private instance method stays the builtin, as an
+  // instance method in Kernel answered Thread.method(:fork) -- Thread's own
+  // fork has no table entry -- and corpus 210 saw it.
+  "  def self.fork(&blk) = Process.fork(&blk)\n" ++
   "\n" ++
   "  # ⚠ Kernel#select IS NOT DEFINED HERE, and the reason is worth the line.\n" ++
   "  #   Defining it (a zero timeout answers nil, anything else refuses) closed\n" ++
@@ -5053,6 +5057,94 @@ let core_prelude_f =
   "  end\n" ++
   "\n" ++
   "  def self.getpgrp = getpgid(0)\n" ++
+  "\n" ++
+  // setpgid(2) (note 436: with fork here, the specs that fork a child to
+  // move it into a group of its own run). No errno comes back, so the
+  // refusal is named as setsid's is: no such process is ESRCH, anything
+  // else EPERM.
+  "  def self.setpgid(pid, pgid)\n" ++
+  "    pid = __pid_arg(pid)\n" ++
+  "    r = __setpgid(pid, __pid_arg(pgid))\n" ++
+  "    if r < 0\n" ++
+  "      raise Errno::ESRCH if pid != 0 && (begin; Process.kill(0, pid); rescue Errno::ESRCH; nil; rescue SystemCallError; 1; end).nil?\n" ++
+  "      raise Errno::EPERM\n" ++
+  "    end\n" ++
+  "    0\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.setpgrp = setpgid(0, 0)\n" ++
+  "\n" ++  // fork (note 436). Process._fork is the hook ruby 3.1 added: Kernel#fork
+  // and Process.fork call it, and a program may wrap it (a gem that must
+  // reopen a connection in the child does). What is written but not yet
+  // flushed goes first, or the child would write it a second time. A
+  // child given a block never returns from here: it runs the block, then
+  // the at_exit handlers, and ends -- status 0, an exit's own, or 1 for an
+  // exception it did not rescue (reported as the top level would).
+  // (the parent can wait for the child as for a spawned one; the child has
+  //  no children of its own yet)
+  "  def self._fork\n" ++
+  "    pid = __fork\n" ++
+  "    if pid == 0\n" ++
+  "      @__kids = \{}\n" ++
+  "    else\n" ++
+  "      (@__kids ||= \{})[pid] = [:direct, nil]\n" ++
+  "    end\n" ++
+  "    pid\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__flush_std\n" ++
+  "    begin; $stdout.flush; rescue StandardError; end\n" ++
+  "    begin; $stderr.flush; rescue StandardError; end\n" ++
+  "  end\n" ++
+  "\n" ++
+  // (what a _fork hook answers is a pid, by #to_int; and what one raises in
+  //  the CHILD is not the caller's to rescue -- that code is the parent's --
+  //  so the child reports it and ends, as ruby's does)
+  "  def self.fork(&blk)\n" ++
+  "    __flush_std\n" ++
+  "    me = Process.pid\n" ++
+  "    begin\n" ++
+  "      pid = _fork\n" ++
+  "    rescue Exception => e\n" ++
+  "      raise if Process.pid == me\n" ++
+  "      begin; $stderr.write(e.full_message(highlight: false)); rescue Exception; end\n" ++
+  "      __child_exit(1)\n" ++
+  "    end\n" ++
+  "    unless pid.is_a?(Integer)\n" ++
+  "      raise TypeError, \"no implicit conversion of \" + (pid.nil? ? \"nil\" : pid.class.to_s) + \" into Integer\" unless pid.respond_to?(:to_int)\n" ++
+  "      pid = pid.to_int\n" ++
+  "    end\n" ++
+  "    return pid if pid != 0\n" ++
+  "    return nil unless blk\n" ++
+  "    st = 0\n" ++
+  "    begin\n" ++
+  "      blk.call\n" ++
+  "    rescue SystemExit => e\n" ++
+  "      st = e.status\n" ++
+  "    rescue Exception => e\n" ++
+  "      begin; $stderr.write(e.full_message(highlight: false)); rescue Exception; end\n" ++
+  "      st = 1\n" ++
+  "    end\n" ++
+  "    __child_exit(st)\n" ++
+  "  end\n" ++
+  "\n" ++
+  // daemon(3)'s steps, as ruby's rb_daemon takes them: the parent ends at
+  // once (exit!, no at_exit), the child leads a new session, and unless told
+  // otherwise moves to / and points its standard streams at /dev/null.
+  "  def self.daemon(nochdir = nil, noclose = nil)\n" ++
+  "    __flush_std\n" ++
+  "    exit!(0) if __fork != 0\n" ++
+  "    begin; setsid; rescue SystemCallError; end\n" ++
+  "    exit!(0) if __fork != 0\n" ++
+  "    @__kids = \{}\n" ++
+  "    Dir.chdir('/') unless nochdir\n" ++
+  "    unless noclose\n" ++
+  "      $stdin.reopen(File::NULL)\n" ++
+  "      $stdout.reopen(File::NULL, 'w')\n" ++
+  "      $stderr.reopen(File::NULL, 'w')\n" ++
+  "    end\n" ++
+  "    0\n" ++
+  "  end\n" ++
   "\n" ++
   "  # setsid(2): a process that already leads a group is refused with EPERM,\n" ++
   "  # the only way it fails.\n" ++
@@ -5758,10 +5850,11 @@ let core_prelude_f =
   "    def pid = self[:pid]\n" ++
   "  end\n" ++
   "\n" ++
+  // (the pid is the thread's before it first runs: `Process.detach(pid).pid`
+  //  asked at once was nil while the new thread waited its turn, note 436)
   "  def self.detach(pid)\n" ++
   "    pid = __to_pid(pid)\n" ++
-  "    Waiter.new(pid) do |p|\n" ++
-  "      Thread.current[:pid] = p\n" ++
+  "    w = Waiter.new(pid) do |p|\n" ++
   "      begin\n" ++
   "        Process.wait(p)\n" ++
   "        $?\n" ++
@@ -5769,6 +5862,8 @@ let core_prelude_f =
   "        nil\n" ++
   "      end\n" ++
   "    end\n" ++
+  "    w[:pid] = pid\n" ++
+  "    w\n" ++
   "  end\n" ++
   "  Tms = Struct.new(:utime, :stime, :cutime, :cstime)\n" ++
   "\n" ++
@@ -9460,10 +9555,9 @@ let core_prelude_k =
   "      end\n" ++
   "    else\n" ++
   "      s = __fd_str(cmd)\n" ++
-  "      if s == \"-\"\n" ++
-  "        raise NotImplementedError, \"fork() function is unimplemented on this machine\"\n" ++
-  "      end\n" ++
-  "      words = [s]\n" ++
+  // "-" is no program: the process forks, and the child's standard input and
+  // output are the other ends of the pipes (note 436)
+  "      words = s == \"-\" ? nil : [s]\n" ++
   "    end\n" ++
   "    io_opts = \{}\n" ++
   "    sp_opts = \{}\n" ++
@@ -9478,11 +9572,29 @@ let core_prelude_k =
   "    pw = wr ? IO.__fdpipe : nil\n" ++
   "    sp_opts[:out] = pr[1] if rd\n" ++
   "    sp_opts[:in] = pw[0] if wr\n" ++
+  "    if words.nil?\n" ++
+  "      Process.__flush_std\n" ++
+  "      pid = Process._fork\n" ++
+  "      if pid == 0\n" ++
+  "        IO.__fddup2(pr[1], 1) if rd\n" ++
+  "        IO.__fddup2(pw[0], 0) if wr\n" ++
+  "        (pr.to_a + pw.to_a).each \{ |fd| IO.__fdclose(fd) }\n" ++
+  "        return nil unless blk\n" ++
+  // (with a block the child ends after it, at once: ruby's popen _exits)
+  "        begin\n" ++
+  "          yield nil\n" ++
+  "        ensure\n" ++
+  "          Process.__flush_std\n" ++
+  "          exit!(0)\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "    else\n" ++
   "    begin\n" ++
   "      pid = env ? Process.spawn(env, *words, **sp_opts) : Process.spawn(*words, **sp_opts)\n" ++
   "    rescue Exception\n" ++
   "      (pr.to_a + pw.to_a).each \{ |fd| IO.__fdclose(fd) }\n" ++
   "      raise\n" ++
+  "    end\n" ++
   "    end\n" ++
   "    IO.__fdclose(pr[1]) if rd\n" ++
   "    IO.__fdclose(pw[0]) if wr\n" ++
