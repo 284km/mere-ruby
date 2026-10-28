@@ -2467,10 +2467,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else
     // `super(args, &block)` / `super(args, &nil)` forwards an explicit block
     // (nil = no block); otherwise super passes along the current block.
-    let (arges, superblk) =
+    // (the block argument is converted AFTER the others: `super(**o, &o)`
+    //  asks #to_hash before #to_proc, as a plain call does)
+    let (arges, bpl9) =
       (match rev_app arges Nil with
-       | Cons (EBlockPass be, rrest) -> (rev_app rrest Nil, coerce_to_block env world blk (eval_e env world blk be))
-       | _ -> (arges, blk)) in
+       | Cons (EBlockPass be, rrest) -> (rev_app rrest Nil, Cons (be, (Nil : Expr list)))
+       | _ -> (arges, (Nil : Expr list))) in
     // zsuper forwards the CURRENT parameter values (defaults applied,
     // splat expanded), not the original call arguments.
     let args = if zsuper then
@@ -2480,6 +2482,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                      | _ -> (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                   else (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
+    let superblk = (match bpl9 with
+                    | Cons (be9, _) -> coerce_to_block env world blk (eval_e env world blk be9)
+                    | Nil -> blk) in
     let _ = map_set super_call_pend "v" 1 in
     // resume the method search in the receiver's ancestor chain, strictly
     // after the class/module the current method is defined in — so super walks
@@ -5690,7 +5695,13 @@ and const_seg_last = fn (key: str) ->
   if i9 + 2 >= str_len key then key else const_seg_last (substring key (i9 + 2) (str_len key))
 and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
   let _ = (if map_has consts key
-           then (let _ = rb_warn world ("already initialized constant " ++ key) in
+           // (an anonymous namespace is said as it inspects, `#<Class:0x...>`,
+           //  not by the name the interpreter keeps it under)
+           then (let shown9 = (let k9 = str_rindex_go key "::" (str_len key - 2) in
+                               if k9 > 0 && is_anon_cls (substring key 0 k9)
+                               then to_s (VClass (substring key 0 k9)) ++ substring key k9 (str_len key)
+                               else key) in
+                 let _ = rb_warn world ("already initialized constant " ++ shown9) in
                  // ...and where the old one was set, as ruby says next
                  // (nothing for one the interpreter or the prelude seeded)
                  if map_has const_src key && (if rb_verbose_nil () then false else true) then
@@ -13302,6 +13313,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                           || (str_len name == 5 && str_eq name "fetch") || (str_len name == 6 && str_eq name "insert") || (str_len name == 7 && str_eq name "flatten")
                           || (str_len name == 8 && str_eq name "flatten!") || (str_len name == 6 && str_eq name "rotate") || (str_len name == 7 && str_eq name "rotate!")
                           || (str_len name == 3 && str_eq name "[]=") || (str_len name == 5 && str_eq name "store"))
+                      // (not for a method this Array's own singleton defines:
+                      //  `def a.[]=(*args)` takes Strings, Bug #21012)
+                      && (if hng_sng_has world recv name then false else true)
               then coerce_arr_index_args env world name args0
               else if (match recv with VStr _ -> true | VArr _ -> true | VRange (_, _, _) -> true | _ -> false)
                       && ((str_len name == 2 && str_eq name "at") || (str_len name == 9 && str_eq name "delete_at") || (str_len name == 2 && str_eq name "[]")
@@ -15100,6 +15114,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                  else ())
               | _ -> ()) in
      let c99 = (if tagged9 then (if is_sng_cls tag9 && map_has sup9 tag9 then map_get sup9 tag9 else tag9) else class_name recv) in
+     // (Array's / Hash's own #initialize_copy, redefined by the program, is
+     //  what fills the copy: ruby allocates it empty and calls that -- a
+     //  no-op one leaves `[1, 2, 3].dup` empty, Bug #14847)
+     let _ = (if (str_eq c99 "Array" || str_eq c99 "Hash") && has_meth world c99 "initialize_copy" then
+                (match cp with
+                 | VArr ca9 -> arr_set ca9 Nil
+                 | VHsh ch9 -> hset ch9 Nil
+                 | _ -> ())
+              else ()) in
      let _ = (if has_meth world c99 "initialize_copy"
               then (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
                     let _ = invoke world nb cp c99 "initialize_copy" (Cons (recv, Nil)) in ())
@@ -17419,7 +17442,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                              base ++ "/" ++ path)) in
              // (the run of slashes kept is the one the PATH was written with;
              // a base of "/" joined to "bin" is "/bin", not "//bin")
-             let r9 = mkstr (if str_len path > 0 && str_eq (char_at path 0) "/" then xp_norm whole else path_norm whole) in
+             // (a path that starts with exactly two slashes keeps them, as
+             //  POSIX allows that root to mean something else: ruby's
+             //  `File.expand_path(".", "//")` is "//")
+             let root9 = (if str_len path > 0 && str_eq (char_at path 0) "/" then path
+                          else (match rest with Cons (VStr b9, _) -> sget b9 | _ -> "")) in
+             let dbl9 = str_len root9 >= 2 && str_eq (substring root9 0 2) "//"
+                        && (str_len root9 == 2 || (if str_eq (char_at root9 2) "/" then false else true)) in
+             let n9 = (if str_len path > 0 && str_eq (char_at path 0) "/" then xp_norm whole else path_norm whole) in
+             let r9 = mkstr (if dbl9 && str_len n9 > 0 && str_eq (char_at n9 0) "/" && (if str_len n9 > 1 && str_eq (char_at n9 1) "/" then false else true)
+                             then "/" ++ n9 else n9) in
              // the encoding is rb_enc_check's pick between the string the
              // answer was built on (a base, or the UTF-8 home a "~" became)
              // and the argument: an ASCII-only argument takes the other's,
