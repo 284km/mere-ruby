@@ -4081,7 +4081,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | VBig s -> if str_eq op "-" then norm_big (big_neg_s s) else VBig s
        | VFlt f -> if str_eq op "-" then VFlt (f * (0.0 - 1.0)) else VFlt f
        | VRat (n, d) -> if str_eq op "-" then VRat (big_neg_s n, d) else VRat (n, d)
-       | VCpx (r, i) -> if str_eq op "-" then VCpx (num_neg r, num_neg i) else VCpx (r, i)
+       // (a Complex with objects in it negates them by their own -@, as
+       //  #-@ already did: `-Complex(SimpleRat(2,3), ...)` came back as is)
+       | VCpx (r, i) ->
+         (if str_eq op "-" then
+            (match (r, i) with
+             | (VObj _, _) -> invoke_val_c env world blk (VCpx (r, i)) "-@" Nil false
+             | (_, VObj _) -> invoke_val_c env world blk (VCpx (r, i)) "-@" Nil false
+             | _ -> VCpx (num_neg r, num_neg i))
+          else VCpx (r, i))
        // unary -/+ on an object dispatch to its -@ / +@ method.
        | other -> invoke_val_c env world blk other (op ++ "@") Nil false)
   | EBin (op, a, b) ->
@@ -4461,6 +4469,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        if fast9 then fv9 else
        let hk = hng_key va0 in
        if cpx_obj_applies world va0 op (Cons (vb, Nil)) then cpx_obj_call env world va0 op (Cons (vb, Nil))
+       // (a real number on the left of such a Complex is a Complex with a zero
+       //  imaginary part, as Integer#+'s coerce makes it: `2 - c`)
+       else if (match va0 with VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat (_, _) -> true | _ -> false)
+               && (match vb with VCpx (VObj _, _) -> true | VCpx (_, VObj _) -> true | _ -> false)
+               && cpx_obj_names op then
+         cpx_obj_call env world (VCpx (va0, VInt 0)) op (Cons (vb, Nil))
+       // (...and so is a plain Complex on the left: `cc + c`)
+       else if (match va0 with VCpx (_, _) -> true | _ -> false)
+               && (match vb with VCpx (VObj _, _) -> true | VCpx (_, VObj _) -> true | _ -> false)
+               && cpx_obj_names op then
+         cpx_obj_call env world va0 op (Cons (vb, Nil))
        else if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) op then
          let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
          invoke world noblk va0 (map_get hng_store hk) op (Cons (vb, Nil))
@@ -6227,7 +6246,7 @@ and cpx_obj_names = fn (name: str) ->
   || (str_len name == 11 && str_eq name "rationalize") || (str_len name == 2 && (str_eq name "-@" || str_eq name "=="))
   || (str_len name == 6 && str_eq name "coerce")
   || (str_len name == 1 && (str_eq name "+" || str_eq name "-" || str_eq name "*" || str_eq name "/"))
-  || (str_len name == 3 && str_eq name "quo")
+  || (str_len name == 3 && str_eq name "quo") || (str_len name == 2 && str_eq name "**")
   || (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s")
   || (str_len name == 3 && str_eq name "<=>")
 // Complex(re, im) with a Complex part folded in, as complex.c's
@@ -6244,6 +6263,8 @@ and cpx_obj_applies = fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: 
    | VCpx (re, im) ->
      (match re with VObj _ -> true | _ -> false) || (match im with VObj _ -> true | _ -> false)
      || (match args with Cons (a, _) -> cpx_user_num world a | Nil -> false)
+     // (...or the other is a Complex with objects in it)
+     || (match args with Cons (VCpx (VObj _, _), _) -> true | Cons (VCpx (_, VObj _), _) -> true | _ -> false)
    | _ -> false)
 and cpx_obj_call = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -6282,6 +6303,12 @@ and cpx_obj_call = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn 
      else if str_eq name "<=>" then
        (if (if cpx_exact_zero env world im then false else true) then VNil
         else if cpx_is_real env world arg1 then call re "<=>" (Cons (arg1, Nil))
+        // (a Complex other: the real parts when both are real, else nil --
+        //  asking its coerce came back to here forever)
+        else if (match arg1 with VCpx (_, _) -> true | _ -> false) then
+          (match arg1 with
+           | VCpx (r2, i2) -> (if cpx_exact_zero env world i2 then call re "<=>" (Cons (r2, Nil)) else VNil)
+           | _ -> VNil)
         else
           (match call arg1 "coerce" (Cons (recv, Nil)) with
            | VArr aid ->
@@ -6298,8 +6325,35 @@ and cpx_obj_call = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn 
         else (match arg1 with
               | VCpx (r2, i2) -> VBool (truthy (call re "==" (Cons (r2, Nil))) && truthy (call im "==" (Cons (i2, Nil))))
               | _ -> VBool (cpx_exact_zero env world im && truthy (call re "==" (Cons (arg1, Nil))))))
+     // #** by an Integer multiplies the parts by their own operators (the
+     // answer keeps their class, `c ** 2` of SimpleRats is SimpleRats); any
+     // other power is the Float one, as rb_complex_pow comes to through f_expt
+     else if str_eq name "**" then
+       (let tofc = fn (v: Val) ->
+          (match v with
+           | VCpx (a, b) -> VCpx (VFlt (to_f (call a "to_f" Nil)), VFlt (to_f (call b "to_f" Nil)))
+           | VObj _ -> VFlt (to_f (call v "to_f" Nil))
+           | _ -> v) in
+        let rec pw = fn (acc: Val) -> fn (k: int) ->
+          (if k <= 0 then acc else pw (cpx_obj_call env world acc "*" (Cons (recv, Nil))) (k - 1)) in
+        match arg1 with
+        // (a Numeric object of the program's is asked to coerce, as
+        //  rb_num_coerce_bin does: test_coerce2's ObjectX has no #to_f)
+        | VObj _ ->
+          (match call arg1 "coerce" (Cons (recv, Nil)) with
+           | VArr aid ->
+             (match deref aid with
+              | Cons (a, Cons (b, Nil)) -> call a "**" (Cons (b, Nil))
+              | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
+           | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
+        | VInt 0 -> VCpx (VInt 1, VInt 0)
+        | VInt n -> (if n > 0 then pw recv (n - 1)
+                     else cpx_obj_call env world (VCpx (VInt 1, VInt 0)) "/" (Cons (pw recv (0 - n - 1), Nil)))
+        | _ -> arith_bin "**" (tofc recv) (tofc arg1))
      else if str_eq name "coerce" then
-       (if cpx_is_real env world arg1 then arr_new (Cons (VCpx (arg1, VInt 0), Cons (recv, Nil)))
+       // (a Complex is taken as it is, nucomp_coerce)
+       (if (match arg1 with VCpx (_, _) -> true | _ -> false) then arr_new (Cons (arg1, Cons (recv, Nil)))
+        else if cpx_is_real env world arg1 then arr_new (Cons (VCpx (arg1, VInt 0), Cons (recv, Nil)))
         else raise_exc world "TypeError" (display_cls_msg world (dispatch_cls_of world arg1) ++ " can't be coerced into Complex"))
      else
        // + - * / quo with a Numeric object: a REAL one works part by part,
@@ -6307,7 +6361,21 @@ and cpx_obj_call = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn 
        (let op = (if str_eq name "quo" then "/" else name) in
         // (parts that came back Complex -- `1 + obj` through obj's coerce --
         //  fold into one Complex: nucomp_s_canonicalize_internal)
-        if cpx_is_real env world arg1 then
+        // (a Complex other works part by part too: nucomp_mul / f_divide)
+        if (match arg1 with VCpx (_, _) -> true | _ -> false) then
+          (match arg1 with
+           | VCpx (r2, i2) ->
+             (let mul = fn (a: Val) -> fn (b: Val) -> call a "*" (Cons (b, Nil)) in
+              let add = fn (a: Val) -> fn (b: Val) -> call a "+" (Cons (b, Nil)) in
+              let sub = fn (a: Val) -> fn (b: Val) -> call a "-" (Cons (b, Nil)) in
+              if str_eq op "+" || str_eq op "-" then cpx_canon_new (call re op (Cons (r2, Nil))) (call im op (Cons (i2, Nil)))
+              else if str_eq op "*" then cpx_canon_new (sub (mul re r2) (mul im i2)) (add (mul re i2) (mul im r2))
+              else
+                (let den = add (mul r2 r2) (mul i2 i2) in
+                 cpx_canon_new (call (add (mul re r2) (mul im i2)) "quo" (Cons (den, Nil)))
+                               (call (sub (mul im r2) (mul re i2)) "quo" (Cons (den, Nil)))))
+           | _ -> VNil)
+        else if cpx_is_real env world arg1 then
           (if str_eq op "+" || str_eq op "-" then cpx_canon_new (call re op (Cons (arg1, Nil))) im
            else if str_eq op "*" then cpx_canon_new (call re "*" (Cons (arg1, Nil))) (call im "*" (Cons (arg1, Nil)))
            else cpx_canon_new (call re "quo" (Cons (arg1, Nil))) (call im "quo" (Cons (arg1, Nil))))
@@ -8868,7 +8936,11 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
     if (str_len name == 5 && str_eq name "times") then
       iter_each_result (big_upto world encl theblk "0" (big_sub_s bs "1") 1) recv
     else if (str_len name == 4 && str_eq name "step") then
-      (match args with
+      (match step_kw_norm world args with
+       // (the keyword form, `(2**64).step(by: 2, to: 2**64 + 4)`)
+       | Cons (VHsh hid9, Nil) ->
+         iter_each_result (num_step world encl theblk recv (aseq_kw (hderef hid9) "to")
+                             (match aseq_kw (hderef hid9) "by" with VNil -> VInt 1 | v9 -> v9)) recv
        | Cons (lim9, rest9) ->
          iter_each_result (num_step world encl theblk recv lim9
                              (match rest9 with Cons (b9, _) -> b9 | _ -> VInt 1)) recv
@@ -8989,6 +9061,11 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
 // receiver's OWN arithmetic -- a bignum stays exact and a rational stays a
 // rational, where a float walk would lose both.
 and num_step = fn world -> fn encl -> fn theblk -> fn (cur: Val) -> fn (lim: Val) -> fn (by: Val) ->
+  // (a Float anywhere is ruby's float walk, counted: adding 0.5 to 2**64 as a
+  //  Float is 2**64 again, and `(2**64).step(2**64 + 1, 0.5)` never ended)
+  if (match (lim, by) with (VFlt _, _) -> true | (_, VFlt _) -> true | _ -> false) then
+    flt_step world encl theblk (aseq_to_flt cur) (aseq_to_flt lim) (aseq_to_flt by)
+  else
   let up = cmp_vals by (VInt 0) > 0 in
   let c = cmp_vals cur lim in
   if up && c > 0 then FNext VNil
@@ -9617,8 +9694,13 @@ and range_step = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (limit: i
 and aseq_big_ok = fn (b: Val) -> fn (e: Val) -> fn (st: Val) ->
   let isi = fn (v: Val) -> (match v with VInt _ -> true | VBig _ -> true | _ -> false) in
   isi b && isi e && isi st
-  && (match (b, e, st) with (VInt _, VInt _, VInt _) -> false | _ -> true)
+  // (three ints whose span cannot overflow are counted in ints; a span past
+  //  2**62 is counted here: `(-2**62).step(2**62, 1).size` wrapped negative)
+  && (match (b, e, st) with (VInt bi, VInt ei, VInt _) -> aseq_wide bi ei | _ -> true)
   && (match st with VInt 0 -> false | _ -> true)
+and aseq_wide = fn (b: int) -> fn (e: int) ->
+  let lim = 2305843009213693952 in
+  b > lim || b < 0 - lim || e > lim || e < 0 - lim
 // a bounded walk in bignums: v, v + by, ... while v is inside the range
 and range_step_bounded = fn world -> fn encl -> fn theblk -> fn (v: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (by: Val) ->
   (let c9 = cmp_vals v hi in
@@ -10691,11 +10773,13 @@ and arr_sum_w = fn env -> fn world -> fn (xs: Val list) -> fn (init: Val) ->
      fold9 xs init)
   else
   let exact = fn (v: Val) -> (match v with VInt _ -> true | VBig _ -> true | _ -> false) in
-  let numv = fn (v: Val) -> (match v with VInt _ -> true | VFlt _ -> true | VBig _ -> true | _ -> false) in
+  // (a Rational in the float run is a double too, ruby's rat2dbl)
+  let numv = fn (v: Val) -> (match v with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat (_, _) -> true | _ -> false) in
   let tof = fn (v: Val) -> (match v with
                             | VFlt f -> f
                             | VInt n -> float_of_int n
                             | VBig b -> float_of_str b
+                            | VRat (rn, rd) -> rat_to_f rn rd
                             | _ -> 0.0) in
   let isnan9 = fn (f: float) -> (if f == f then false else true) in
   let isinf9 = fn (f: float) -> (if f == 0.0 then false else f * 0.5 == f) in
@@ -10751,6 +10835,27 @@ and arr_sum_w = fn env -> fn world -> fn (xs: Val list) -> fn (init: Val) ->
                    go9 ys v9))
         else if (match h with VFlt _ -> true | _ -> false) && numv init then
           fsum ys (tof init + float_of_int n) 0.0
+        // ...and a Rational joins the exact run (ruby's ary_sum keeps the
+        // rationals apart and adds them in before the floats): `[10**8/1r,
+        // 1e-16, ...].sum` is the compensated float sum, where folding with
+        // `+` lost every small term
+        else if (match h with VRat (_, _) -> true | _ -> false) && numv init then
+          (let rec gr = fn (zs: Val list) -> fn (acc: Val) ->
+             (match zs with
+              | Nil -> acc
+              | Cons (h9, t9) ->
+                (match h9 with
+                 | VInt _ -> gr t9 (apply_bin_vals world noblk9 "+" acc h9)
+                 | VBig _ -> gr t9 (apply_bin_vals world noblk9 "+" acc h9)
+                 | VRat (_, _) -> gr t9 (apply_bin_vals world noblk9 "+" acc h9)
+                 | VFlt _ -> fsum zs (tof acc) 0.0
+                 | _ ->
+                   (let rec go9 = fn (ws: Val list) -> fn (a9: Val) ->
+                      (match ws with
+                       | Nil -> a9
+                       | Cons (w9, u9) -> go9 u9 (apply_bin_vals world noblk9 "+" a9 w9)) in
+                    go9 zs acc))) in
+           gr ys (apply_bin_vals world noblk9 "+" (VInt n) init))
         else
           (let v9 = (if n == 0 then init else apply_bin_vals world noblk9 "+" (VInt n) init) in
            let rec go9 = fn (zs: Val list) -> fn (acc: Val) ->
@@ -11107,6 +11212,11 @@ and key_has_user_hash = fn world -> fn (k: Val) ->
   // a TIME's #hash and #eql? are dispatcher arms, which no method table
   // names, so `{Time.at(1) => 1}[Time.at(1)]` was nil (an identity key)
   | VObj id9 -> has_meth world (dispatch_cls_of world k) "hash" || map_has md_whole id9 || map_has time_inst (str_of_int id9)
+                // (...and one that UNDEFINED #hash for its #method_missing to
+                //  answer: a Delegator, whose #hash is its object's --
+                //  test_any_hash_fixable)
+                || (map_len undefs > 0 && (let c9 = dispatch_cls_of world k in
+                                           undef_blocked world c9 "hash" && has_meth world c9 "method_missing"))
   | VArr _ -> key_hash_here world k
   | VHsh _ -> key_hash_here world k
   // ⚠ A STRING KEY IS HASHED BY ITS CONTENT, ALWAYS. Ruby's rb_any_hash
@@ -12530,6 +12640,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
            && (rng_is_int hi || rng_hi_open hi || (match hi with VFlt _ -> true | VRat (_, _) -> true | VBig _ -> true | _ -> false))
          // ...and a Rational receiver: `(1/10r).step(1/2r, 1/10r)`
          | VRat (_, _) -> true
+         // ...and a bignum's: `(2**64).step(2**64 + 2)` was NoMethodError
+         | VBig _ -> true
          | _ -> false)
      // ...and the step itself has to be a NUMBER (or the keyword hash): with
      // anything else ruby hands back a plain Enumerator and complains only when
@@ -22626,7 +22738,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       | Cons (a9, t9) -> Cons (invoke_val_c env world blk a9 "to_int" Nil false, t9)
                       | Nil -> Nil) in
           match (b, e, st) with
-          | (VInt bi, VInt ei, VInt si) ->
+          | (VInt bi, VInt ei, VInt si) when (if aseq_wide bi ei then false else true) || (match args with Nil -> false | _ -> true) ->
             (let n = aseq_size bi ei si excl in
              if (str_len name == 4 && str_eq name "size") then VInt n
              else (match args with
