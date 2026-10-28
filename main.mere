@@ -12296,6 +12296,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   //  backtrace's frames -- nil only when the program set the backtrace as
   //  Strings. `e = assert_raise(TypeError) { {**1} }` answered nil.)
   let v = (if cls_sng_undef world recv0 name0 then cls_sng_undef_raise world recv0 name0 args0
+           // (String#match / Symbol#match ask the PATTERN's own #match when
+           //  it has one: rx_own_match)
+           else if str_len name0 == 5 && str_eq name0 "match" && rx_own_match world recv0 args0 then
+             rx_own_match_call env world blk recv0 args0 (false, (Nil : str list), (Nil : Stmt list), env)
+           // (a Regexp SUBCLASS instance handed to a builtin that takes a
+           //  pattern is the Regexp it holds: rx_sub_args)
+           else if rx_sub_args_needed world recv0 name0 args0 then
+             invoke_val_c env world blk recv0 name0 (rx_sub_args world args0) vischeck
            else if vischeck && (match recv0 with VMain -> main_priv_name name0 | _ -> false)
            then raise_exc_iv world "NoMethodError" ("private method '" ++ name0 ++ "' called for main")
                   (Cons (("__name", VSym name0), Cons (("__recv", VMain), Cons (("__args", arr_new args0), Nil))))
@@ -27158,7 +27166,9 @@ and builtin_answers = fn world -> fn (recv: Val) -> fn (name: str) ->
 // methods (and the prelude's, which are Ruby) push theirs in invoke.
 and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk0 ->
   let newblk = (if blk_is_lambda newblk0 then blk_spread_for world recv name newblk0 else newblk0) in
-  if bi_frameless world recv name
+  if str_len name == 5 && str_eq name "match" && rx_own_match world recv args then rx_own_match_call env world blk recv args newblk
+  else if rx_sub_args_needed world recv name args then invoke_with_block env world blk recv name (rx_sub_args world args) newblk
+  else if bi_frameless world recv name
   then invoke_with_block0 env world blk recv name args newblk
   else with_builtin_frame world recv name (fn (u: unit) -> invoke_with_block0 env world blk recv name args newblk)
 // ⚠ WHICH VALUES ONE YIELD GAVE TOGETHER. Ruby spreads them over a lambda's
@@ -27168,6 +27178,42 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
 //   Hash#map and #find (Hash#each, #any?, #count... yield one Array). Here
 //   both arrive as one Array, so the lambda is marked to spread it.
 //   `e.each_with_index.find_all(&->(x, i) { })` was "given 1, expected 2".
+// String#match / Symbol#match with a pattern that has a #match of its own
+// (`def re.match`): ruby's str_match_m calls it with the string and the rest,
+// and yields its answer to the block when there is one and it is not nil
+// (test_string / test_symbol's test_match_method)
+and rx_own_match = fn world -> fn (recv: Val) -> fn (args: Val list) ->
+  (match recv with VStr _ -> true | VSym _ -> true | _ -> false)
+  && (match args with Cons (VRegex (_, _, _), _) -> hng_sng_has world (match args with Cons (a9, _) -> a9 | Nil -> VNil) "match" | _ -> false)
+and rx_own_match_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (args: Val list) -> fn newblk ->
+  match args with
+  | Cons (re9, rest9) ->
+    (let s9 = (match recv with VSym y9 -> mkstr y9 | _ -> recv) in
+     let r9 = invoke_val_c0 env world blk re9 "match" (Cons (s9, rest9)) false in
+     match (r9, newblk) with
+     | (VNil, _) -> VNil
+     | (_, (true, _, _, _)) -> flow_value (run_block world blk newblk (Cons (r9, Nil)))
+     | _ -> r9)
+  | Nil -> VNil
+// A builtin String / Symbol / Array / Hash method that takes a pattern sees
+// a Regexp subclass instance as the Regexp it holds -- `"foo".match(MyRe.new
+// ("o+"))` and `gsub` refused it ("expected Regexp") and `grep` matched
+// nothing -- unless the instance answers the operation itself (its own ===
+// or match), or the receiver's class defines the method.
+and rx_sub_args_needed = fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  (match recv with VStr _ -> true | VSym _ -> true | VArr _ -> true | VHsh _ -> true | _ -> false)
+  && rx_sub_in_args world args
+  && (if prim_user_has world recv name then false else true)
+and rx_sub_in_args = fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> false
+  | Cons (a9, t9) ->
+    (rx_sub_held world a9 && (if prim_user_has world a9 "===" || prim_user_has world a9 "match" then false else true))
+    || rx_sub_in_args world t9
+and rx_sub_args = fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> (Nil : Val list)
+  | Cons (a9, t9) -> Cons ((if rx_sub_held world a9 then rx_sub_as_regex world a9 else a9), rx_sub_args world t9)
 and blk_spread_for = fn world -> fn (recv: Val) -> fn (name: str) -> fn b ->
   match recv with
   | VHsh _ ->
@@ -29396,6 +29442,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
      | VHsh _ -> VClass (prim_sng_cls world recv "Hash")
      | VProc _ -> VClass (prim_sng_cls world recv "Proc")
      | VBind _ -> VClass (prim_sng_cls world recv "Binding")
+     | VRegex (_, _, _) -> VClass (prim_sng_cls world recv "Regexp")
      // (main has one too: an Object of its own)
      | VMain -> VClass (prim_sng_cls world recv "Object")
      | _ -> raise_exc world "TypeError" "can't define singleton")
@@ -51804,6 +51851,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
             | VHsh h -> hng_cls_of world (VHsh h) "Hash" ++ "#" ++ m
             | VProc ph -> hng_cls_of world (VProc ph) "Proc" ++ "#" ++ m
             | VBind bph -> hng_cls_of world (VBind bph) "Binding" ++ "#" ++ m
+            // (a Regexp keyed by its value: see hng_key)
+            | VRegex (rp9, rf9, re9) -> hng_cls_of world (VRegex (rp9, rf9, re9)) "Regexp" ++ "#" ++ m
             // An immediate has no per-object class to put the method in, and
             // ruby refuses at that step -- before any hook. It used to register
             // the BARE name here, which defines a top-level method and lets
