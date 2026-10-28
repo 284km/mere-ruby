@@ -49,10 +49,14 @@ p Process.respond_to?(:fork), respond_to?(:fork, true), Process.respond_to?(:dae
 p Object.new.respond_to?(:sleep, true), Object.new.respond_to?(:sleep)
 
 # Process._fork is the hook both forms go through
+# (what the hook sees is printed after the children are done: ruby buffers
+#  the parent's stdout, so a child's at_exit line comes first there, and an
+#  unbuffered write raced it)
+$hooked = []
 module ForkHook
   def _fork
     pid = super
-    puts "hooked in parent" if pid > 0
+    $hooked << "hooked in parent" if pid > 0
     pid
   end
 end
@@ -68,6 +72,7 @@ end
 w.close
 puts r.read
 Process.wait(pid)
+puts $hooked
 begin
   Process.wait
 rescue Errno::ECHILD
