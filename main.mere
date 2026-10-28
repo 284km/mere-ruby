@@ -5708,7 +5708,22 @@ and const_added_hook = fn world -> fn (key: str) ->
       let owner9 = (if i9 < 0 then "Object" else substring key 0 i9) in
       let simple9 = (if i9 < 0 then key else substring key (i9 + 2) (str_len key)) in
       run_cls_hook world owner9 "const_added" simple9)
+   // (...and with no hook of the program's, Module#const_added still runs --
+   //  a C method, so a TracePoint sees its c_call and c_return, note 448)
+   else if map_has hook_flags "tp" then
+     (let i9 = last_sep_at key 0 (0 - 1) in
+      let owner9 = (if i9 < 0 then "Object" else substring key 0 i9) in
+      tp_c_hook world "const_added" owner9)
    else ())
+// the two events of a C hook (method_added, const_added, inherited) that
+// nothing overrides, as ruby makes them around the builtin's empty body
+and tp_c_hook = fn world -> fn (hook: str) -> fn (owner: str) ->
+  // (the event's class is where the hook is DEFINED -- Module#method_added,
+  //  Module#const_added, Class#inherited -- and self the class it runs on)
+  let dc9 = (if str_eq hook "inherited" then "Class" else "Module") in
+  let _ = fire_tp_vlc world "c_call" hook dc9 VNil (VClass owner) (cur_line ()) "" hook in
+  let _ = fire_tp_vlc world "c_return" hook dc9 VNil (VClass owner) (cur_line ()) "" hook in
+  ()
 
 // What a READ of an existing constant has to do besides answer it. The reads
 // that ask (the lexical and scoped EConst, EScopedRead, const_get,
@@ -38614,6 +38629,13 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
   // (a NoMethodError from a call with no receiver carries its arguments and
   //  is a private call, NoMethodError#args and #private_call?)
   let nflds9 = Cons (("__args", arr_new args), Cons (("__priv", VBool true), flds9)) in
+  // (BasicObject#method_missing ran -- a C method, its c_call and c_return
+  //  for a TracePoint, note 448)
+  let _ = (if map_has hook_flags "tp" then
+             (let s9 = (match blame with VNil -> VMain | b9 -> b9) in
+              let _ = fire_tp_vlc world "c_call" "method_missing" "BasicObject" VNil s9 (cur_line ()) "" "method_missing" in
+              let _ = fire_tp_vlc world "c_return" "method_missing" "BasicObject" VNil s9 (cur_line ()) "" "method_missing" in ())
+           else ()) in
   match args with
   | Nil -> if explicit then raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame) nflds9
            else raise_exc_iv world "NameError" ("undefined local variable or method '" ++ name ++ "'" ++ undef_blame world blame) flds9
@@ -40779,7 +40801,8 @@ and run_method_added = fn world -> fn (cls: str) -> fn (nm: str) ->
      then run_singleton_method_added world (VObj (int_of_str inner9)) nm
      else if is_sng_cls inner9 then ()
      else run_singleton_method_added world (VClass inner9) nm)
-  else if (if map_has hook_flags "ma" then false else true) then ()
+  else if (if map_has hook_flags "ma" then false else true) then
+    (if map_has hook_flags "tp" then tp_c_hook world "method_added" cls else ())
   else if has_meth world ("(sng:" ++ cls ++ ")") "method_added"
   then (let _ = invoke world noblk (VClass cls) ("(sng:" ++ cls ++ ")") "method_added" (Cons (VSym nm, Nil)) in ())
   else ()
@@ -45104,6 +45127,8 @@ and cmd_needs_shell = fn (c: str) ->
 // constant's own name (no namespace) and #receiver the module it was looked
 // for in -- Object at the top level. Both were nil.
 and raise_uninit_const = fn world -> fn (owner: str) -> fn (cn: str) -> fn (msg: str) ->
+  // (Module#const_missing ran -- a C method, note 448)
+  let _ = (if map_has hook_flags "tp" then tp_c_hook world "const_missing" (if str_eq owner "" then "Object" else owner) else ()) in
   raise_exc_iv world "NameError" msg
     (Cons (("__name", VSym cn), Cons (("__recv", VClass (if str_eq owner "" then "Object" else owner)),
       // (in the name's encoding: a Symbol from an ISO-8859-15 String keeps it
@@ -45625,6 +45650,9 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
   let _ = map_set globals "?" VNil in
   let args = (match (if map_has iv3 (k ++ "@__targs") then map_get iv3 (k ++ "@__targs") else VNil) with
               | VArr aid -> deref aid | _ -> (Nil : Val list)) in
+  // (a TracePoint on every thread sees it begin and end, the thread as its
+  //  self -- :thread_begin / :thread_end, note 448)
+  let _ = (if map_has hook_flags "tp" then fire_tp_vlc world "thread_begin" "" "" VNil (VObj tid) (cur_line ()) "" "" else ()) in
   let result = try_or (fn (u: unit) ->
                  // raised at it (or killed) before it ever ran
                  let _ = sch_deliver world tid in
@@ -45640,6 +45668,7 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
                                  run_block world enc9 (proc_get (str_of_int pid)) args)
                  | _ -> FNext VNil)
                (FRaise VNil) in
+  let _ = (if map_has hook_flags "tp" then fire_tp_vlc world "thread_end" "" "" VNil (VObj tid) (cur_line ()) "" "" else ()) in
   let _ = thread_report world tid result in
   let _ = thread_finish world tid result in
   // abort_on_exception (the thread's, or Thread's): the exception is raised
@@ -49072,7 +49101,9 @@ and register_class_lex = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
 // Ruby's `inherited` hook: when a new subclass is created, call
 // superclass.inherited(subclass) if a (class-level) `inherited` is defined.
 and call_inherited = fn world -> fn env -> fn (super_name: str) -> fn (sub_name: str) ->
-  if str_eq super_name "" then ()
+  // (a class with no superclass written is Object's: Class#inherited runs,
+  //  a C method a TracePoint sees, note 448)
+  if str_eq super_name "" then (if map_has hook_flags "tp" && (if map_has modules sub_name then false else true) then tp_c_hook world "inherited" "Object" else ())
   else
     let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
     // `inherited` is a class method: it lives in the superclass's singleton
@@ -49082,6 +49113,7 @@ and call_inherited = fn world -> fn env -> fn (super_name: str) -> fn (sub_name:
       let _ = invoke world nb (VClass super_name) ("(sng:" ++ super_name ++ ")") "inherited" (Cons (VClass sub_name, Nil)) in ()
     else if has_meth world super_name "inherited" then
       let _ = invoke_val_c env world nb (VClass super_name) "inherited" (Cons (VClass sub_name, Nil)) false in ()
+    else if map_has hook_flags "tp" then tp_c_hook world "inherited" super_name
     else ()
 
 // A class or module body, a `class << x` body and a required file's top level
@@ -51562,6 +51594,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                        if str_len in9 > 0 && is_digit (char_at in9 0) then false else true)
                     else true)
              then run_method_added world (substring key 0 (str_index_of key "#")) (meth_base name)
+             // (a top-level def is Object's: its method_added still runs,
+             //  a C method a TracePoint sees, note 448)
+             else if (if str_contains key "#" then false else true) && map_has hook_flags "tp" then
+               (if map_has hook_flags "ma" && has_meth world "(sng:Object)" "method_added" then run_method_added world "Object" (meth_base name)
+                else tp_c_hook world "method_added" "Object")
              else ()) in
     // a (re)definition is not ruby2_keywords until explicitly marked; clear any
     // stale mark so a later plain `def m` does not inherit an earlier one.
