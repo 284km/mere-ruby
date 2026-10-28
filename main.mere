@@ -2119,8 +2119,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   // the right condition on the switching-on iteration; `..` checks it at
   // once (a single-element range fires exactly one iteration).
   | EFlipFlop (site, c1, c2, excl) ->
-    let key = str_of_int site in
-    let on = (match map_get ff_state key with VBool b -> b | _ -> false) in
+    // (each thread has its own: a flip-flop's state is a frame's special
+    //  variable, as $~ is -- test_flip's shared_thread, note 447)
+    let key = str_of_int site ++ "@" ++ str_of_int (sch_me ()) in
+    let on = (if map_has ff_state key then (match map_get ff_state key with VBool b -> b | _ -> false) else false) in
     if on then
       let v2 = eval_e env world blk c2 in
       let _ = if truthy v2 then map_set ff_state key (VBool false) else () in
@@ -11692,7 +11694,9 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // ordinary objects (`#<Named:0x..>`) because only the class itself was
     // asked.
     // an Enumerator::Chain shows its sources' own inspects
-    else if str_eq cls "Enumerator::Chain" && (if usr9 then false else true) then
+    // (a chain with a singleton method of its own -- `e1.define_singleton_method
+    //  (:rewind)` -- is still a chain, note 447)
+    else if str_eq (if is_sng_cls cls then sng_supername world cls else cls) "Enumerator::Chain" && (if usr9 then false else true) then
       (let (_, _, _, iv7) = world in
        if (if map_has iv7 (str_of_int oid ++ "@__ch") then false else true) then "#<Enumerator::Chain: uninitialized>"
        else
@@ -41239,6 +41243,13 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
     thread_new world superblk tc9 meth args superblk
   | VClass nc9 when (str_len meth == 3 && str_eq meth "new") && (if map_has modules nc9 then false else true) ->
     new_obj_wb world nc9 args superblk
+  // ...and from a chain's own #each (a singleton's, on a dup): the chain's
+  // builtin walk over its sources (note 447)
+  | VObj oid9 when (str_len meth == 4 && str_eq meth "each")
+                   && (let (_, _, oc9, _) = world in
+                       let c9 = map_get oc9 oid9 in
+                       str_eq (if is_sng_cls c9 then sng_supername world c9 else c9) "Enumerator::Chain") ->
+    (let _ = chain_drive gc_cenv0 world superblk oid9 0 (chain_srcs world oid9) superblk in recv)
   // ...and from an object's #methods / #public_methods / ... override (ruby's
   // Delegator: `__getobj__.methods(all) | super`): the builtin list
   | VObj oid9 when is_vis_list_name meth ->
@@ -45492,12 +45503,14 @@ and sch_tick = fn world ->
 and sch_secs_ns = fn env -> fn world -> fn (v: Val) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let num = fn (x: Val) ->
+    // (a limit past what nanoseconds hold -- `join(2**62-1)`, test_thread's
+    //  FIXNUM_MAX -- is forever, not a wrap to a past deadline: note 447)
     match x with
-    | VInt n -> n * 1000000000
-    | VFlt f -> int_of_float (f * 1000000000.0)
+    | VInt n -> (if n > 4611686017 then 4611686018427387903 else n * 1000000000)
+    | VFlt f -> (if f > 4611686017.0 then 4611686018427387903 else int_of_float (f * 1000000000.0))
     | _ -> (match invoke_val_c env world noblk x "to_f" Nil false with
-            | VFlt f -> int_of_float (f * 1000000000.0)
-            | VInt n -> n * 1000000000
+            | VFlt f -> (if f > 4611686017.0 then 4611686018427387903 else int_of_float (f * 1000000000.0))
+            | VInt n -> (if n > 4611686017 then 4611686018427387903 else n * 1000000000)
             | _ -> 0) in
   match v with
   // an object that is not a Numeric is a time interval through #divmod(1):
@@ -45555,7 +45568,9 @@ and sch_kw_has_timeout = fn (args: Val list) ->
 and sch_deadline = fn env -> fn world -> fn (limit: Val) ->
   match limit with
   | VNil -> 0
-  | _ -> (let ns = sch_secs_ns env world limit in sch_now () + (if ns < 1 then 1 else ns))
+  | _ -> (let ns = sch_secs_ns env world limit in
+          let n0 = sch_now () in
+          if ns > 4611686018427387903 - n0 then 4611686018427387903 else n0 + (if ns < 1 then 1 else ns))
 // Thread.new under the scheduler: the thread goes to the end of the run queue
 // and the creator keeps running. Its body is a proc in proc_store, reached
 // through the Thread's ivar (@__tblk), and its arguments an Array in its
@@ -47224,9 +47239,15 @@ and enum_inspect_str = fn env -> fn world -> fn (oid: int) -> fn (cls: str) ->
     (let mn = (match gv "@meth" with VStr h -> sget h | VSym sy -> sy | _ -> "") in
      if str_eq mn "" then
        "#<Enumerator: #<Enumerator::Generator:0x" ++ hex_pad16 (oid - handle_base) ++ ">:each>"
+     // (one met again inside itself -- an array it walks that holds it -- is
+     //  ruby's "#<Enumerator: ...>", note 447)
+     else if map_has insp_seen ("e" ++ str_of_int oid) then "#<Enumerator: ...>"
      else
-       "#<Enumerator: " ++ inspect_w env world (gv "@recv") ++ ":" ++ mn
-       ++ argstr (match gv "@eargs" with VArr aid -> deref aid | _ -> Nil) ++ ">")
+       (let _ = map_set insp_seen ("e" ++ str_of_int oid) 1 in
+        let r9 = "#<Enumerator: " ++ inspect_w env world (gv "@recv") ++ ":" ++ mn
+                 ++ argstr (match gv "@eargs" with VArr aid -> deref aid | _ -> Nil) ++ ">" in
+        let _ = map_delete insp_seen ("e" ++ str_of_int oid) in
+        r9))
 
 
 // allocate an object, then run initialize if the class defines one.
@@ -53462,6 +53483,10 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
        let noblk0 = (false, (Nil : str list), (Nil : Stmt list), frame0) in
        truthy (invoke world noblk0 cand ocl "==" (Cons (v, Nil))))
     else rb_eq cand v
+  // (a Regexp with a === of its own -- `def regexp.===(o) true end` -- is
+  //  asked, as grep asks it: note 447)
+  | VRegex (_, _, _) when prim_user_has world cand "===" ->
+    truthy (invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) cand "===" (Cons (v, Nil)) false)
   | VRegex (p, pf, _) ->
     (match v with
      | VStr sv -> (match rx_do_match world p pf (sget sv) (senc_get sv) with VNil -> false | _ -> true)
