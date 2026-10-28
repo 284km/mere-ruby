@@ -3148,6 +3148,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if ((str_len name == 7 && str_eq name "include") || (str_len name == 7 && str_eq name "prepend"))
             && map_has meths name && (match (if lv_has env "self" then lv_get env "self" else VNil) with VClass _ -> true | _ -> false) then
       invoke_val_c env world noblk (lv_get env "self") name args false
+    // ...and with an instance of a Module subclass as self (in its own
+    // #initialize, before super): the module half's (mod_inst_delegates)
+    else if ((str_len name == 7 && str_eq name "include") || (str_len name == 7 && str_eq name "prepend"))
+            && (let sv9 = (if lv_has env "self" then lv_get env "self" else VNil) in mod_inst_delegates world sv9 name) then
+      invoke_val_c env world noblk (lv_get env "self") name args false
     // ...and with MAIN as self -- in a top-level method, or a module method
     // run there -- main's own `include` (and `prepend`) is Object's, splat and
     // several modules included. Only the one-module statement form reached
@@ -4337,6 +4342,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          invoke world noblk va0 "IO" (fdio_mname op) (Cons (eval_e env world blk b, Nil))
        else if has_meth world ocl op then
          invoke world noblk va0 ocl op (Cons (eval_e env world blk b, Nil))
+       // an instance of a Module subclass compares as its module half
+       // (mod_inst_delegates): `SubModule.new < Enumerable`
+       else if mod_inst_delegates world va0 op then
+         invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // a builtin-backed class may answer the operator without a method-table
        // entry: Time compares by its instant, and `t1 < t2` has to reach that
        // rather than fall through to "no method". Through a SINGLETON class as
@@ -4349,7 +4358,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if str_eq ocl "Enumerator::Yielder" && str_eq op "<<" then
          invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
        // File / IO handles and queues: recv << data.
-       else if (str_eq ocl "File" || str_eq ocl "IO" || str_eq ocl "Queue" || str_eq ocl "SizedQueue") && str_eq op "<<" then
+       else if (str_eq ocl "File" || str_eq ocl "IO" || str_eq ocl "Queue" || str_eq ocl "SizedQueue"
+                || (map_len prim_sub > 0 && str_len (prim_base_name ocl) > 0)) && str_eq op "<<" then
          invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
        // enumerator chaining: e1 + e2.
        else if (is_enum_cls ocl || str_eq ocl "Enumerator::Chain") && str_eq op "+" then
@@ -12461,9 +12471,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // ⚠ ...and NOT when the class has a BUILTIN <=> (Time's lives in the
   //   dispatcher, not the method table): this arm shadowed it and every Time
   //   range stopped constructing -- corpus/179 caught it.
+  // ⚠ ...nor when an ancestor UNDEFINED it (Delegator's Kernel copy): the
+  //   undef check below sends it to #method_missing, and this arm answered
+  //   Object's first -- `d.send(:<=>, t)` was nil for a SimpleDelegator of a
+  //   Time (test_time's test_delegate)
   else if str_eq name0 "<=>" && (match recv0 with VObj _ -> true | _ -> false)
           && (if has_meth world (dispatch_cls_of world recv0) "<=>" then false else true)
-          && (if builtin_obj_has (display_cls world (dispatch_cls_of world recv0)) "<=>" then false else true) then
+          && (if builtin_obj_has (display_cls world (dispatch_cls_of world recv0)) "<=>" then false else true)
+          && (if map_len undefs > 0 && undef_blocked world (dispatch_cls_of world recv0) "<=>" then false else true) then
     (match args0 with
      | Cons (b9, _) -> (if rb_eq_w env world recv0 b9 then VInt 0 else VNil)
      | _ -> VNil)
@@ -16342,13 +16357,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     //   read its own `@a` out of the queue's row and answered ITSELF, and the
     //   mspec matcher built that way recursed until the stack ran out. It
     //   needs no collection to happen; see alloc_oid for the reason it exists.
-    else if (str_eq c "Queue" || str_eq c "SizedQueue") && (str_len name == 3 && str_eq name "new") then
+    // (a subclass, or a copy, of one makes the same object under its own
+    //  name -- unless it defines #initialize, which then runs as usual and
+    //  reaches the builtin one by super)
+    else if (str_len name == 3 && str_eq name "new")
+            && (str_eq c "Queue" || str_eq c "SizedQueue"
+                || (let b9 = prim_base_name c in
+                    (str_eq b9 "Queue" || str_eq b9 "SizedQueue") && (if has_meth world c "initialize" then false else true))) then
       (let (mth0, sup0, ocl0, iv0) = world in
+       let qb = (if str_eq c "Queue" || str_eq c "SizedQueue" then c else prim_base_name c) in
        // Queue.new(enumerable) seeds from the argument: an Array directly,
        // anything else through #to_a (TypeError when absent or when it
        // returns a non-Array; an exception raised by #to_a propagates).
        let seed =
-         (if str_eq c "Queue" then
+         (if str_eq qb "Queue" then
             (match args with
              | Nil -> Nil
              | Cons (VArr aid, _) -> deref aid
@@ -16377,13 +16399,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let _ = map_set iv0 (str_of_int id2 ++ "@__q") (arr_new seed) in
        // (a size that is not an Integer is converted with #to_int, and one
        //  with none is ruby's TypeError)
-       let args = (if str_eq c "SizedQueue" then
+       let args = (if str_eq qb "SizedQueue" then
                      (match args with
                       | Cons (VInt _, _) -> args
                       | Cons (v9, t9) -> Cons (rnd_to_int env world v9, t9)
                       | Nil -> args)
                    else args) in
-       let _ = (if str_eq c "SizedQueue" then
+       let _ = (if str_eq qb "SizedQueue" then
                   (match args with
                    | Cons (VInt mx, _) ->
                      (if mx <= 0 then (let _ = raise_exc world "ArgumentError" "queue size must be positive" in ())
@@ -16391,10 +16413,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                    | _ -> let _ = raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)" in ())
                 else ()) in
        VObj id2)
-    else if str_eq c "ConditionVariable" && (str_len name == 3 && str_eq name "new") then
+    else if (str_len name == 3 && str_eq name "new")
+            && (str_eq c "ConditionVariable"
+                || (str_eq (prim_base_name c) "ConditionVariable" && (if has_meth world c "initialize" then false else true))) then
       (let (mth0, sup0, ocl0, iv0) = world in
        let id2 = alloc_oid ocl0 in
-       let _ = map_set ocl0 id2 "ConditionVariable" in
+       let _ = map_set ocl0 id2 c in
        VObj id2)
     // ThreadGroup: groups are markers on thread objects (@__tgrp).
     else if str_eq c "ThreadGroup" && (str_len name == 3 && str_eq name "new") then
@@ -18245,6 +18269,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // a builtin method has no entry in the user method table, but it is
        // still a method of the class and reflection must see it.
        let origin = if str_eq origin "" && (if hidden9 then false else true) && builtin_has_meth c mname then c else origin in
+       // (...and a subclass of a thread primitive's is the builtin's: prim_sub)
+       let origin = (if str_eq origin "" && (if hidden9 then false else true) && map_len prim_sub > 0 && map_has prim_sub c
+                        && builtin_has_meth (map_get prim_sub c) mname
+                     then map_get prim_sub c else origin) in
        // ...and MODULE's own methods are builtins of a different shape: they
        // are answered by the class dispatcher, not by builtin_has_meth, so
        // `Module.instance_method(:remove_method)` was a NameError for a method
@@ -19367,6 +19395,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          else if below then VBool ((str_len name == 1 && str_eq name "<") || (str_len name == 2 && str_eq name "<="))
          else if above then VBool ((str_len name == 1 && str_eq name ">") || (str_len name == 2 && str_eq name ">="))
          else VNil
+       // (an instance of a Module subclass is its module half here too)
+       | Cons (VObj o8, _) when mod_inst_is world (VObj o8) ->
+         invoke_val_c env world blk recv name (Cons (mod_inst_backing world (VObj o8), Nil)) false
        // `A < 1` is a TypeError in Ruby; `A <=> 1` is just nil.
        | Cons (_, _) ->
          if (str_len name == 3 && str_eq name "<=>") then VNil
@@ -19939,6 +19970,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | _ -> VNil)
     // a class's own name, as Module#name answers it before any `def self.name`
     // a program adds (the dump writes the constant path, not what #name says)
+    // whether an object is a thread primitive's through a subclass or a copy
+    // of the class (Thread::Queue === obj answers false for a copy's)
+    else if str_eq c "Marshal" && (str_len name == 11 && str_eq name "__prim_data") then
+      (match args with
+       | Cons (VObj o9, _) -> (let (_, _, oc9, _) = world in VBool (map_has oc9 o9 && map_has prim_sub (map_get oc9 o9)))
+       | _ -> VBool false)
     else if str_eq c "Marshal" && (str_len name == 7 && str_eq name "__cname") then
       (match args with
        | Cons (VClass k9, _) ->
@@ -21448,8 +21485,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // Queue / SizedQueue (synchronous model): a plain FIFO. A pop that
     // would block forever (empty, not closed, nobody left to push) is the
     // deadlock fatal; the non-blocking form is ThreadError.
-    else if str_eq cls "Queue" || str_eq cls "SizedQueue" then
-      (let k = str_of_int id in
+    else if str_eq cls "Queue" || str_eq cls "SizedQueue"
+            || (map_len prim_sub > 0 && (let b9 = prim_base_name cls in str_eq b9 "Queue" || str_eq b9 "SizedQueue")) then
+      (let cls = prim_base_name cls in
+       let k = str_of_int id in
        let qv = (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else arr_new Nil) in
        let items = (match qv with VArr aid -> deref aid | _ -> Nil) in
        let closed = map_has ivars (k ++ "@__qclosed") in
@@ -21459,7 +21498,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let qname9 = (let s9 = inspect_w env world recv in
                      if str_len s9 > 2 && str_eq (substring s9 0 2) "#<" && (if str_contains s9 "#<Thread::" then false else true)
                      then "#<Thread::" ++ substring s9 2 (str_len s9) else s9) in
-       if (if map_has ivars (k ++ "@__q") then false else true) && queue_sch_name name then
+       if str_len name == 10 && str_eq name "initialize" then prim_q_init world id cls args
+       else if (if map_has ivars (k ++ "@__q") then false else true) && queue_sch_name name then
          raise_exc world "TypeError" (qname9 ++ " not initialized")
        // (SizedQueue#max= takes a positive size, under the scheduler too)
        else if (str_len name == 4 && str_eq name "max=") && (match args with Cons (VInt mx, _) -> mx <= 0 | _ -> false) then
@@ -21530,7 +21570,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ cls))
     // ConditionVariable (synchronous model): wait returns immediately (there
     // is nobody to signal us later); signal/broadcast are no-ops.
-    else if str_eq cls "ConditionVariable" then
+    else if str_eq cls "ConditionVariable" || (map_len prim_sub > 0 && str_eq (prim_base_name cls) "ConditionVariable") then
       (if fb_can_suspend && ((str_len name == 4 && str_eq name "wait") || (str_len name == 6 && str_eq name "signal")
                              || (str_len name == 9 && str_eq name "broadcast")) then
          cv_sch env world blk recv id name args
@@ -21550,8 +21590,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // Mutex (synchronous model): the owner is a thread object; a lock held
     // by a dead thread is reacquirable, a re-lock by the owner (or a lock
     // held by a live other thread, which would block forever) is ThreadError.
-    else if str_eq cls "Mutex" then
-      (let k = str_of_int id in
+    else if str_eq cls "Mutex" || (map_len prim_sub > 0 && str_eq (prim_base_name cls) "Mutex") then
+      (let cls = "Mutex" in
+       let k = str_of_int id in
        let owner = (if map_has ivars (k ++ "@__mown") then map_get ivars (k ++ "@__mown") else VNil) in
        let cur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
        let owner_alive =
@@ -27283,8 +27324,13 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           | other -> if self_ret && finished9 then recv else other))
     // Mutex#synchronize { }: lock, run, unlock — the unlock behaves like an
     // ensure (a raising block still releases before the raise continues).
-    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls id) "Mutex") | _ -> false)
-            && (str_len name == 11 && str_eq name "synchronize") then
+    else if (str_len name == 11 && str_eq name "synchronize")
+            && (match recv with
+                | VObj id -> (let (_, _, ocls, _) = world in
+                              let c9 = map_get ocls id in
+                              str_eq c9 "Mutex"
+                              || (str_eq (prim_base_name c9) "Mutex" && (if has_meth world c9 name then false else true)))
+                | _ -> false) then
       (let _ = invoke_val_c env world blk recv "lock" Nil false in
        let result = try_or (fn (u: unit) -> run_block world blk newblk Nil) (FRaise VNil) in
        (match result with
@@ -30433,6 +30479,10 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
      // decided Method equality: two aliases of one ENV method compared unequal
      // because the alias table is keyed by owner and the owner was blank.
      else if str_eq a "" && builtin_obj_has ocl nm then ocl
+     // (...and a subclass of a thread primitive's is the builtin's: prim_sub)
+     else if str_eq a "" && map_len prim_sub > 0 && map_has prim_sub ocl
+             && (if map_has prim_copy ocl then false else true)
+             && builtin_has_meth (map_get prim_sub ocl) nm then map_get prim_sub ocl
      else a)
   | VClass c2 ->
     (let sng = "(sng:" ++ c2 ++ ")" in
@@ -31135,6 +31185,26 @@ and mod_inst_delegates = fn world -> fn (recv: Val) -> fn (name: str) ->
         (if has_meth world c9 name then false else true)
         && str_list_has (ancestors_of world c9) "Module")
   | _ -> false
+// Queue#initialize / SizedQueue#initialize, which a subclass's own
+// #initialize reaches by super
+and prim_q_init = fn world -> fn (id: int) -> fn (cls: str) -> fn (args: Val list) ->
+  let (_, _, _, ivars) = world in
+  let k = str_of_int id in
+  let seed9 = (match args with
+               | Cons (VArr aid9, _) -> (if str_eq cls "Queue" then deref aid9 else Nil)
+               | _ -> Nil) in
+  let _ = map_set ivars (k ++ "@__q") (arr_new seed9) in
+  if str_eq cls "SizedQueue" then
+    (match args with
+     | Cons (VInt mx, _) ->
+       (if mx <= 0 then raise_exc world "ArgumentError" "queue size must be positive"
+        else (let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in VNil))
+     | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
+  else VNil
+and mod_inst_is = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id -> (let (_, _, oc9, _) = world in map_has oc9 id && str_list_has (ancestors_of world (map_get oc9 id)) "Module")
+  | _ -> false
 and mod_inst_backing = fn world -> fn (recv: Val) ->
   let (_, _, _, iv9) = world in
   match recv with
@@ -31142,7 +31212,11 @@ and mod_inst_backing = fn world -> fn (recv: Val) ->
     (let k9 = str_of_int id ++ "@__modbk" in
      if map_has iv9 k9 then map_get iv9 k9
      else (let m9 = make_anon_cls world "Module" Nil in
-           let _ = map_set iv9 k9 m9 in m9))
+           let _ = map_set iv9 k9 m9 in
+           // (the way back, for #ancestors: held, so the object outlives a
+           //  class that includes it)
+           let _ = (match m9 with VClass b9 -> map_set gc_hold ("modbk:" ++ b9) recv | _ -> ()) in
+           m9))
   | _ -> recv
 // ⚠ Class#dup / Module#dup / #clone answered THE RECEIVER: `M.dup` was M, so
 //   whatever a program did to the copy it did to the original (a frozen
@@ -31158,6 +31232,8 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
   let nc = fresh_anon (if ismod then "AnonModule_" else "AnonClass_") in
   let _ = (if ismod then map_set modules nc VNil
            else set_sup s9 nc (if map_has s9 c then map_get s9 c else "Object")) in
+  let _ = (let b9 = prim_base_name c in
+           if str_len b9 > 0 then (let _ = map_set prim_sub nc b9 in map_set prim_copy nc b9) else ()) in
   // the pairs to copy are collected first: the tables are written while
   // being read otherwise
   let rec_pfx = fn (src: str) -> fn (dst: str) ->
@@ -31626,6 +31702,9 @@ and responds_x0 = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: 
     // ...and the list method_defined? answers from, which is the same fact
     // asked through a different door. See builtin_pub_meth.
     || builtin_pub_meth cls name
+    // ...and a subclass of a thread primitive inherits the builtin's
+    // (prim_sub): `MyQ.new.respond_to?(:push)` was false
+    || (map_len prim_sub > 0 && map_has prim_sub cls && builtin_pub_meth (map_get prim_sub cls) name)
     // ...and what `instance_methods` lists for the class (Kernel's,
     // BasicObject's, Comparable's): `o.respond_to?(:instance_eval)` was false
     // for a name the list named and the object answered
@@ -41356,6 +41435,12 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
           (match args with Cons (v9, _) -> exc_set_bt world id9 v9 | _ -> VNil)
         else (if map_has iv9 (str_of_int id9 ++ "@__bt") then map_get iv9 (str_of_int id9 ++ "@__bt") else VNil))
      | _ -> VNil)
+  // `super` from the #initialize of a Queue / SizedQueue subclass
+  else if str_eq meth "initialize" && (match recv with VObj _ -> true | _ -> false)
+          && (let b9 = prim_base_name dcls in str_eq b9 "Queue" || str_eq b9 "SizedQueue") then
+    (match recv with
+     | VObj id9 -> prim_q_init world id9 (prim_base_name dcls) args
+     | _ -> VNil)
   else if str_eq meth "respond_to?" then
     // the BUILTIN answer, not `responds` -- that would dispatch back into the
     // override we are the `super` of.
@@ -43584,7 +43669,10 @@ and time_cmp_other = fn world -> fn (recv: Val) -> fn (name: str) -> fn (b: Val)
     (match b with
      // (...or answers it through method_missing: a SimpleDelegator around a
      //  Time, test_time's test_delegate, note 450)
-     | VObj _ when has_meth world (dispatch_cls_of world b) "<=>" || responds world b "<=>" ->
+     // (...or has it undefined and a #method_missing to take it: Delegator)
+     | VObj _ when has_meth world (dispatch_cls_of world b) "<=>" || responds world b "<=>"
+                   || (map_len undefs > 0 && undef_blocked world (dispatch_cls_of world b) "<=>"
+                       && has_meth world (dispatch_cls_of world b) "method_missing") ->
        (let r9 = invoke_val_c gc_cenv0 world blk9 b "<=>" (Cons (recv, Nil)) false in
         match r9 with
         | VNil -> VNil
@@ -49948,6 +50036,9 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let mq = (if lv_has cenv m
                    then (match lv_get cenv m with
                          | VClass mc9 -> mc9
+                         // (an instance of a Module subclass: its module half)
+                         | VObj o9 when mod_inst_is world (VObj o9) ->
+                           (match mod_inst_backing world (VObj o9) with VClass bc9 -> bc9 | _ -> m)
                          | _ -> named_class_of_al cenv world (false, (Nil : str list), (Nil : Stmt list), cenv) cls (resolve_scope_name cls m))
                    else named_class_of_al cenv world (false, (Nil : str list), (Nil : Stmt list), cenv) cls (resolve_scope_name cls m)) in
          // ...and along the body's LEXICAL scope when the name did not resolve
@@ -51932,8 +52023,21 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
         let _ = (if pre then do_prepend world "Object" mq else do_include world "Object" mq) in
         FNext VNil)
      | VClass c ->
-       let mq = (if lv_has env m then (match lv_get env m with VClass mc -> mc | _ -> named_class_of_al env world blk c (resolve_scope_name c m)) else named_class_of_al env world blk c (resolve_scope_name c m)) in
+       // (a local may hold an instance of a Module subclass: its module half)
+       let mq = (if lv_has env m then (match lv_get env m with
+                                       | VClass mc -> mc
+                                       | VObj o9 when mod_inst_is world (VObj o9) ->
+                                         (match mod_inst_backing world (VObj o9) with VClass bc -> bc | _ -> m)
+                                       | _ -> named_class_of_al env world blk c (resolve_scope_name c m)) else named_class_of_al env world blk c (resolve_scope_name c m)) in
        (let _ = (if pre then do_prepend world c mq else do_include world c mq) in FNext VNil)
+     // (an instance of a Module subclass, in its own #initialize: its module
+     //  half -- mod_inst_backing)
+     | VObj o9 when mod_inst_is world (VObj o9) ->
+       (match mod_inst_backing world (VObj o9) with
+        | VClass c ->
+          let mq = (if lv_has env m then (match lv_get env m with VClass mc -> mc | _ -> named_class_of_al env world blk c (resolve_scope_name c m)) else named_class_of_al env world blk c (resolve_scope_name c m)) in
+          (let _ = (if pre then do_prepend world c mq else do_include world c mq) in FNext VNil)
+        | _ -> FNext VNil)
      | _ -> FNext VNil)
   | SUndef names ->
     let (meths, sup, ocls, ivars) = world in
