@@ -943,6 +943,9 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter frame_str_ids (fn (k: str) -> fn (h: int) -> gc_mark_val live (VStr h)) in
   let mk = fn (k: str) -> fn (v: Val) -> gc_mark_val live v in
   let _ = gc_mark_env live env in
+  // (the env a TracePoint hook is running for: a method's frame whose body
+  //  has ended is no longer the running frame of its depth -- tp_env)
+  let _ = map_iter tp_env (fn (k: int) -> fn (e) -> gc_mark_env live e) in
   let _ = map_iter globals mk in
   let _ = map_iter rx_parked (fn (k: int) -> fn (i: int) -> gc_mark_val live (VObj i)) in
   let _ = gc_mark_val live (rx_md_get ()) in
@@ -2695,6 +2698,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                        then map_set raise_bt "keep" (VInt 1) else ())
              | _ -> ()) in
     let _ = debug_raise_note world exc in
+    // (the :raise's binding is this frame's: tp_env)
+    let _ = (if tpr9 then tp_env_set env else ()) in
     raise_exc_val world exc
   | EVar name ->
     // a bare `bg!` -- no parentheses, no arguments -- that names an alias of
@@ -6454,13 +6459,15 @@ and cpx_obj_call = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn 
 and tp_raise = fn world -> fn (exc: Val) ->
   if map_has hook_flags "tp" then
     (let d9 = (if map_has tp_mstack "d" then int_of_str (map_get tp_mstack "d") else 0) in
+     // (#self is the raising frame's, when its env is known: tp_env)
+     let slf9 = (if map_has tp_env 0 then (let e9 = map_get tp_env 0 in if lv_has e9 "self" then lv_get e9 "self" else VNil) else VNil) in
      if d9 > 0 then
        fire_tp_vlc world "raise" (map_get tp_mstack ("m" ++ str_of_int d9)) (map_get tp_mstack ("k" ++ str_of_int d9))
-         exc VNil (cur_line ()) "" (map_get tp_mstack ("c" ++ str_of_int d9))
+         exc slf9 (cur_line ()) "" (map_get tp_mstack ("c" ++ str_of_int d9))
      else if map_has tp_mstack "xm" then
        (let m9 = map_get tp_mstack "xm" in let k9 = map_get tp_mstack "xk" in
         let _ = map_delete tp_mstack "xm" in let _ = map_delete tp_mstack "xk" in
-        fire_tp_vlc world "raise" m9 k9 exc VNil (cur_line ()) "" m9)
+        fire_tp_vlc world "raise" m9 k9 exc slf9 (cur_line ()) "" m9)
      else fire_tp_v world "raise" "" "" exc VNil)
   else ()
 // the method a `raise` is written in, from its frame (as a :line names it)
@@ -6848,7 +6855,8 @@ and tp_make_exc = fn world -> fn (args: Val list) ->
     (let c9 = (match exc with VObj i9 -> dispatch_cls_of world exc | _ -> "") in
      if str_len c9 > 0 && has_meth world c9 "initialize" then ()
      else (let _ = fire_tp_vlc world "c_call" "initialize" "Exception" VNil exc (cur_line ()) "" "initialize" in
-           fire_tp_vlc world "c_return" "initialize" "Exception" VNil exc (cur_line ()) "" "initialize")) in
+           // (Exception#initialize returns the exception: its return_value)
+           fire_tp_vlc world "c_return" "initialize" "Exception" exc exc (cur_line ()) "" "initialize")) in
   match args with
   | Cons (VClass c9, _) ->
     (let _ = fire_tp_vlc world "c_call" "exception" "(sng:Exception)" VNil (VClass c9) (cur_line ()) "" "exception" in
@@ -6900,8 +6908,13 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
       // run_begin restores $! to its pre-begin value when the construct ends.
       let _ = map_set globals "!" exc in
       // ...and a :rescue tracepoint sees the exception it handles
+      // (on the first line of the clause's body, the `rescue`'s own when it
+      //  has none)
       let _ = (if map_has hook_flags "tp"
-               then fire_tp_v world "rescue" "" "" exc (if lv_has env "self" then lv_get env "self" else VMain)
+               then (let l9 = tp_rescue_line handler in
+                     let _ = (if l9 > 0 then cur_line_set l9 else ()) in
+                     let _ = tp_env_set env in
+                     fire_tp_v world "rescue" "" "" exc (if lv_has env "self" then lv_get env "self" else VMain))
                else ()) in
       run_stmts env world blk handler
     else run_rescues env world blk exc rest
@@ -6997,6 +7010,9 @@ and tp_meth_flow = fn world -> fn frame -> fn blk -> fn body -> fn (mnm: str) ->
   let _ = map_set tp_mstack ("m" ++ str_of_int d9) mnm in
   let _ = map_set tp_mstack ("c" ++ str_of_int d9) callee in
   let _ = map_set tp_mstack ("k" ++ str_of_int d9) cls in
+  // (the frame stays out of the pool when the body fails, until the
+  //  :return below has made its binding: frame_done_unless_tp)
+  let _ = map_set frame "__tpkeep" VNil in
   let f9 = try_or_msg (fn (u: unit) -> method_body_flow frame world blk body)
              (fn (m: str) ->
                (let _ = map_set tp_mstack "d" (str_of_int (d9 - 1)) in
@@ -7005,11 +7021,40 @@ and tp_meth_flow = fn world -> fn frame -> fn blk -> fn body -> fn (mnm: str) ->
                 //  ITS exception in $exc)
                 let ex9 = tp_exc_save world in
                 let _ = fire_trace world "return" callee cls in
-                let _ = fire_tp_vlc world "return" mnm cls VNil slf (cur_line ()) "" callee in
+                // (on the line that raised, not the caller's, which the body's
+                //  end has put back)
+                let l9 = (if map_has tp_mstack "fl" then int_of_str (map_get tp_mstack "fl") else cur_line ()) in
+                let _ = tp_env_set frame in
+                let _ = fire_tp_vlc world "return" mnm cls VNil slf l9 "" callee in
                 let _ = tp_exc_restore world ex9 in
+                let _ = (if map_has frame "__tpkeep" then (let _ = map_delete frame "__tpkeep" in frame_done frame) else ()) in
                 fail m)) in
+  let _ = (if map_has frame "__tpkeep" then map_delete frame "__tpkeep" else ()) in
   let _ = map_set tp_mstack "d" (str_of_int (d9 - 1)) in
   f9
+// a failing body's frame goes back to the pool -- unless tp_meth_flow is
+// keeping it for its :return's binding, and gives it back itself
+and frame_done_unless_tp = fn frame ->
+  if map_has frame "__tpkeep" then () else frame_done frame
+// the locals the event's scope assigns later are in its binding already, nil
+// (`_local_var = 1` on the line being reported: ruby's binding.eval answers
+// nil there, not a NameError)
+// (set on a method's frame as it is entered under a TracePoint, before its
+//  :call: tp_env_meth)
+and tp_env_meth = fn frame -> fn body ->
+  let _ = map_set frame "__tpdecl" (frame_text (str_join_sep (deep_targets body) "\n")) in
+  tp_env_set frame
+and tp_decl_nils = fn env -> fn snap ->
+  match (if lv_has env "__tpdecl" then lv_get env "__tpdecl" else VNil) with
+  | VStr h9 -> (let d9 = sget h9 in
+                if str_eq d9 "" then () else declare_nils snap (str_split d9 "\n"))
+  | _ -> ()
+and tp_rescue_line = fn (body: Stmt list) ->
+  match body with
+  | Cons (SLineQ n9, t9) -> (if n9 > 0 then n9 else tp_rescue_line t9)
+  | Cons (SLine n9, t9) -> (if n9 > 0 then n9 else tp_rescue_line t9)
+  | Cons (SFile _, t9) -> tp_rescue_line t9
+  | _ -> 0
 and tp_exc_save = fn world ->
   let (_, _, _, iv9) = world in
   if map_has iv9 "$exc" then Cons (map_get iv9 "$exc", Nil) else (Nil : Val list)
@@ -20264,6 +20309,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else VNil)
     // TracePoint#enable / #disable tell the interpreter whether to fire at all.
     // the parameters of the block a :b_call / :b_return is about
+    else if str_eq c "TracePoint" && (str_len name == 9 && str_eq name "__binding") then
+      (if map_has tp_env 0 then
+         (let e9 = map_get tp_env 0 in
+          let id = (handle_base + map_len bind_store) in
+          let snap9 = bnd_capture e9 in
+          let _ = tp_decl_nils e9 snap9 in
+          let _ = map_set bind_store (str_of_int id) (lv_child snap9) in
+          let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
+          VBind id)
+       else VNil)
     else if str_eq c "TracePoint" && (str_len name == 12 && str_eq name "__blk_params") then
       (if map_has tp_cur_blk 0 then
          (let b9 = map_get tp_cur_blk 0 in
@@ -20281,6 +20336,26 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Cons (VBool true, _) -> (let _ = map_set trace_fn "tpbusy" VNil in VNil)
        | Cons (VBool false, _) -> (let _ = (if map_has trace_fn "tpbusy" then map_delete trace_fn "tpbusy" else ()) in VNil)
        | _ -> VBool (map_has trace_fn "tpbusy"))
+    // the :line ruby's own Ruby code makes in TracePoint#enable / #disable
+    // (<internal:trace_point>), seen by the other tracepoints: fired as a
+    // program's event, though the prelude asks for it
+    else if str_eq c "TracePoint" && (str_len name == 7 && str_eq name "__iline") then
+      (match args with
+       | Cons (VSym m9, Cons (VInt l9, Cons (s9, _))) ->
+         (if map_has hook_flags "tp" && (if map_has trace_fn "tpbusy" then false else true) then
+            (let had9 = map_has trace_fn "tpblk" in
+             let _ = map_set trace_fn "tpblk" VNil in
+             let _ = fire_tp_vlc world "line" m9 "TracePoint" VNil s9 l9 "<internal:trace_point>" m9 in
+             let _ = (if had9 then () else if map_has trace_fn "tpblk" then map_delete trace_fn "tpblk" else ()) in
+             VNil)
+          else VNil)
+       | _ -> VNil)
+    // RubyVM::InstructionSequence.compile_option's specialized_instruction:
+    // off, `X.new` is a call of Class#new again (tp_opt_new)
+    else if str_eq c "TracePoint" && (str_len name == 11 && str_eq name "__spec_insn") then
+      (let _ = (match args with
+                | Cons (VBool false, _) -> map_set trace_fn "nospec" VNil
+                | _ -> if map_has trace_fn "nospec" then map_delete trace_fn "nospec" else ()) in VNil)
     else if str_eq c "TracePoint" && (str_len name == 8 && str_eq name "__active") then
       (let _ = (match args with
                 | Cons (VBool true, _) -> map_set hook_flags "tp" VNil
@@ -24887,6 +24962,19 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if map_has comp_inner (str_of_int pid) && (str_len name == 15 && str_eq name "source_location") then VNil
     // Proc#source_location: [file, line] of where the block was written, or nil
     // for a proc with no source of its own.
+    // the file and the lines a proc's body spans, for a TracePoint that
+    // targets it: [file, first, last] (its statements' lines, the nested
+    // blocks' inside them)
+    else if (str_len name == 10 && str_eq name "__tp_lines") && map_has proc_store (str_of_int pid) && map_has proc_src (str_of_int pid) then
+      (let (_, _, body9, _) = proc_get (str_of_int pid) in
+       let lo9 = (match map_get proc_src (str_of_int pid) with VInt n9 -> n9 | _ -> 0) in
+       let rec hi9 = fn (b9: Stmt list) -> fn (acc: int) ->
+         (match b9 with
+          | Cons (SLine n9, t9) -> hi9 t9 (let a9 = (if n9 < 0 then 0 - n9 else n9) in if a9 > acc then a9 else acc)
+          | Cons (_, t9) -> hi9 t9 acc
+          | Nil -> acc) in
+       let f9 = (if map_has proc_src ("f" ++ str_of_int pid) then (match map_get proc_src ("f" ++ str_of_int pid) with VStr h9 -> sget h9 | _ -> "") else "") in
+       arr_new (Cons (mkstr f9, Cons (VInt lo9, Cons (VInt (hi9 body9 lo9), Nil)))))
     else if (str_len name == 15 && str_eq name "source_location") then
       (if map_has proc_src (str_of_int pid)
        then (let f9 = (if map_has proc_src ("f" ++ str_of_int pid) then map_get proc_src ("f" ++ str_of_int pid) else mkstr "") in
@@ -40701,6 +40789,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let _ = fire_trace world "call" name "Object" in
      let slf9 = (if lv_has frame "self" then lv_get frame "self" else VNil) in
      // (on the line it was defined on, note 435)
+     let _ = (if map_has hook_flags "tp" then tp_env_meth frame body else ()) in
      let _ = fire_tp_vl world "call" name "Object" VNil slf9
                (match (if map_has meth_src name then map_get meth_src name else VNil) with VInt l9 -> l9 | _ -> cur_line ()) "" in
      // (as run_meth: tp_meth_flow while a TracePoint is armed)
@@ -40712,10 +40801,15 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
     // recycled and pooled, its arena wound back to the warm seed. (A call
     // that ends in a raise or a flow signal passing through gives it back in
     // method_body_flow instead: frame_done.)
-    let _ = frame_done frame in
+    // (...after the :return while a TracePoint is armed: its binding, as in
+    //  run_meth)
+    let tpf9 = map_has hook_flags "tp" in
+    let _ = (if tpf9 then () else frame_done frame) in
      let _ = fire_trace world "return" name "Object" in
+     let _ = (if tpf9 then tp_env_set frame else ()) in
      let _ = fire_tp_vl world "return" name "Object" (match flow9 with FBreak _ -> VNil | _ -> out) slf9
                (match (if map_has meth_src ("e" ++ name) then map_get meth_src ("e" ++ name) else VNil) with VInt l9 -> l9 | _ -> cur_line ()) "" in
+     let _ = (if tpf9 then frame_done frame else ()) in
      out)
 
 // class-variable helpers: the owning class is self's class (or the class
@@ -41243,13 +41337,14 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     let attr9 = (map_len hook_flags > 0) && meth_is_attr params body in
     let _ = (if cfn9 then tp_fire_owned world defcls name false VNil slf9
              else if attr9 then fire_tp_vlc world "c_call" mnm defcls VNil slf9 (cur_line ()) "" name
-             else fire_tp_vlc world "call" mnm defcls VNil slf9
+             else (let _ = (if map_has hook_flags "tp" then tp_env_meth frame body else ()) in
+                   fire_tp_vlc world "call" mnm defcls VNil slf9
                     // (a top-level def is kept under its bare name)
                     (match (if map_has meth_src dk then map_get meth_src dk
                             else if str_eq defcls "Object" && map_has meth_src name then map_get meth_src name
                             else VNil) with VInt l9 -> l9 | _ -> cur_line ())
                     // (...in the file it was written in, not the caller's)
-                    (if map_has hook_flags "tp" then tp_meth_path dk defcls name else "") name) in
+                    (if map_has hook_flags "tp" then tp_meth_path dk defcls name else "") name)) in
     // (while a TracePoint is armed: tp_meth_flow, which keeps the method on
     //  tp_mstack for a :raise inside it and makes a raise that leaves it a
     //  :return too, with no value -- ruby's, Bug #9759 / #13369. Kept out of
@@ -41268,8 +41363,13 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     // recycled and pooled, its arena wound back to the warm seed. (A call
     // that ends in a raise or a flow signal passing through gives it back in
     // method_body_flow instead: frame_done.)
-    let _ = frame_done frame in
+    // (...after the :return, while a TracePoint is armed: the event's binding
+    //  is this frame -- tp_env -- and the hook's own call would take it from
+    //  the pool)
+    let tpf9 = map_has hook_flags "tp" && (if cfn9 || attr9 then false else true) in
+    let _ = (if tpf9 then () else frame_done frame) in
     let _ = fire_trace world "return" name defcls in
+    let _ = (if tpf9 then tp_env_set frame else ()) in
     // (a method a block's `break` left returns no value of its own: the
     //  :return's return_value is nil, Bug #13369)
     let _ = (if cfn9 then tp_fire_owned world defcls name true out slf9
@@ -41287,6 +41387,7 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
                        (let l9 = int_of_str (map_get tp_mstack "rl") in let _ = map_delete tp_mstack "rl" in l9)
                      | _ -> cur_line ())
                     (if map_has hook_flags "tp" && (if attr9 then false else true) then tp_meth_path dk defcls name else "") name) in
+    let _ = (if tpf9 then frame_done frame else ()) in
     out
 
 // the ten globals a match publishes: `$~` and the numbered groups. The frame
@@ -41698,6 +41799,12 @@ and fire_tp_vl = fn world -> fn (ev: str) -> fn (mname: str) -> fn (cls: str) ->
   fire_tp_vlc world ev mname cls rv slf line path mname
 // ...and the CALLEE: the name the method was called by, when an alias
 and fire_tp_vlc = fn world -> fn (ev: str) -> fn (mname: str) -> fn (cls: str) -> fn (rv: Val) -> fn (slf: Val) -> fn (line: int) -> fn (path: str) -> fn (callee: str) ->
+  // (an event inside the hook -- tpbusy -- is not fired, and leaves the
+  //  hook's env where it is)
+  if map_has trace_fn "tpbusy" then fire_tp_vlc0 world ev mname cls rv slf line path callee
+  else (let _ = fire_tp_vlc0 world ev mname cls rv slf line path callee in
+        if map_has tp_env 0 then map_delete tp_env 0 else ())
+and fire_tp_vlc0 = fn world -> fn (ev: str) -> fn (mname: str) -> fn (cls: str) -> fn (rv: Val) -> fn (slf: Val) -> fn (line: int) -> fn (path: str) -> fn (callee: str) ->
   // `tp.enable` arms the hook inside its own frame, so the RETURN from enable
   // would be the first event -- ruby arms it after that frame instead. Its
   // own :return events are the difference, so they are not reported.
@@ -41727,6 +41834,7 @@ and fire_tp_vlc = fn world -> fn (ev: str) -> fn (mname: str) -> fn (cls: str) -
                                   Cons ((if str_eq callee "" then VNil else VSym callee), Nil))))))))) in VNil)
                (fn (m: str) -> (let _ = map_delete trace_fn "tpbusy" in
                                 let _ = (if map_has trace_fn "tpblk" then map_delete trace_fn "tpblk" else ()) in
+                                let _ = (if map_has tp_env 0 then map_delete tp_env 0 else ()) in
                                 fail m)) in
      let _ = map_delete trace_fn "tpbusy" in ())
   else ()
@@ -41743,6 +41851,10 @@ and tp_traced = fn env -> fn world -> fn (e: Expr) ->
   | ECall (name, _) ->
     (if map_has trace_fn ("tpskip:" ++ name) then (let _ = map_delete trace_fn ("tpskip:" ++ name) in false) else true)
     && tp_plain_name name && tp_bare_builtin env world name
+  // (...with a block: `loop { }`, `proc { }`)
+  | ECallB (name, _, _, _) ->
+    (if map_has trace_fn ("tpskip:" ++ name) then (let _ = map_delete trace_fn ("tpskip:" ++ name) in false) else true)
+    && tp_plain_name name && tp_bare_builtin env world name
   // (a bare name that is no local: a call with no parentheses -- `osz` for
   //  an alias of Hash#size, `block_given?`)
   | EVar name ->
@@ -41755,7 +41867,7 @@ and eval_tp = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EMethod (recv_e, name, arges) ->
     (let rv9 = eval_e env world blk recv_e in
      let _ = lv_set env "__tpr~" rv9 in
-     if tp_builtin_target world rv9 name then
+     if tp_builtin_target world rv9 name && (if tp_opt_new world rv9 name arges then false else true) then
        (let _ = tp_fire_builtin world rv9 name false VNil in
         let r9 = tp_raise_ret world rv9 name (fn (u: unit) -> eval_e env world blk (EMethod (EVar "__tpr~", name, arges))) in
         let _ = tp_fire_builtin world rv9 name true r9 in r9)
@@ -41787,6 +41899,17 @@ and eval_tp = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      let _ = map_set trace_fn ("tpskip:" ++ name) VNil in
      let r9 = tp_raise_ret world s9 name (fn (u: unit) -> eval_e env world blk (ECall (name, arges))) in
      let _ = tp_fire_builtin world s9 name true r9 in r9)
+  | ECallB (name, arges, bp, bb) ->
+    (let s9 = (if lv_has env "self" then lv_get env "self" else VMain) in
+     let _ = tp_fire_builtin world s9 name false VNil in
+     let _ = map_set trace_fn ("tpskip:" ++ name) VNil in
+     let l0 = cur_line () in
+     let r9 = tp_raise_ret world s9 name (fn (u: unit) -> eval_e env world blk (ECallB (name, arges, bp, bb))) in
+     // (its :c_return is on the call's line, not the block's last one)
+     let l9 = cur_line () in
+     let _ = cur_line_set l0 in
+     let _ = tp_fire_builtin world s9 name true r9 in
+     let _ = cur_line_set l9 in r9)
   | EVar name ->
     (let s9 = (if lv_has env "self" then lv_get env "self" else VMain) in
      let _ = tp_fire_builtin world s9 name false VNil in
@@ -41824,7 +41947,8 @@ and ir_ensure = fn (u: unit) ->
   if map_len ir_tbl > 0 then ()
   else list_iter (str_split internal_ruby_rows (chr 10)) (fn (row: str) ->
          (match str_split row (chr 9) with
-          | Cons (k9, Cons (p9, Cons (l9, _))) -> map_set_s ir_tbl k9 (p9 ++ chr 9 ++ l9)
+          | Cons (k9, Cons (p9, Cons (l9, Cons (e9, _)))) -> map_set_s ir_tbl k9 (p9 ++ chr 9 ++ l9 ++ chr 9 ++ e9)
+          | Cons (k9, Cons (p9, Cons (l9, _))) -> map_set_s ir_tbl k9 (p9 ++ chr 9 ++ l9 ++ chr 9 ++ l9)
           | _ -> ()))
 and tp_hash_at = fn (s9: str) -> fn (i: int) ->
   if i >= str_len s9 then i else if str_eq (char_at s9 i) "#" then i else tp_hash_at s9 (i + 1)
@@ -41847,14 +41971,42 @@ and tp_fire_owned_c = fn world -> fn (own9: str) -> fn (name: str) -> fn (is_ret
   if map_has ir_tbl ky9 then
     (let pl9 = str_split (map_get ir_tbl ky9) (chr 9) in
      let path9 = (match pl9 with Cons (p9, _) -> p9 | _ -> "") in
-     let line9 = (match pl9 with Cons (_, Cons (l9, _)) -> int_of_str l9 | _ -> cur_line ()) in
+     // (a :call on the first line, the :return on the last)
+     let line9 = (match pl9 with
+                  | Cons (_, Cons (l9, Cons (e9, _))) -> int_of_str (if is_ret then e9 else l9)
+                  | Cons (_, Cons (l9, _)) -> int_of_str l9
+                  | _ -> cur_line ()) in
      fire_tp_vlc world (if is_ret then "return" else "call") name own9 rv slf line9 path9 callee)
   else fire_tp_vlc world (if is_ret then "c_return" else "c_call") name own9 rv slf (cur_line ()) "" callee
 and tp_fire_builtin = fn world -> fn (recv: Val) -> fn (name: str) -> fn (is_ret: bool) -> fn (rv: Val) ->
   let src9 = tp_blt_src world recv name in
   let lbl = builtin_frame_label world recv src9 in
   if str_eq lbl "" || tp_opt_call recv src9 then ()
+  // (a Struct class's `new` is its own singleton's, not Struct.new)
+  else if str_eq src9 "new" && tp_struct_cls world recv then
+    tp_fire_owned_c world (match recv with VClass c9 -> "(sng:" ++ c9 ++ ")" | _ -> "Class") src9 is_ret rv recv name
   else tp_fire_owned_c world (substring lbl 0 (tp_hash_at lbl 0)) src9 is_ret rv recv name
+// `X.new(...)` with no block is ruby 4.0's opt_new when it reaches Class#new:
+// the object is allocated and #initialize called with no :c_call of `new`
+// (String.new, Array.new, Data's are their own and still are) -- unless
+// compile_option turned specialized_instruction off
+and tp_opt_new = fn world -> fn (recv: Val) -> fn (name: str) -> fn (arges: Expr list) ->
+  str_len name == 3 && str_eq name "new" && (if map_has trace_fn "nospec" then false else true)
+  && (match recv with VClass _ -> true | _ -> false)
+  && (if tp_has_blockpass arges then false else true)
+  && (tp_struct_cls world recv
+      || (let l9 = builtin_frame_label world recv name in
+          str_len l9 > 6 && str_eq (substring l9 0 6) "Class#"))
+// a class Struct.new made: its `new` is ruby's Class#new, its own singleton's
+and tp_struct_cls = fn world -> fn (recv: Val) ->
+  match recv with
+  | VClass c9 -> (if str_eq c9 "Struct" then false else str_list_has (ancestors_of world c9) "Struct")
+  | _ -> false
+and tp_has_blockpass = fn (xs: Expr list) ->
+  match xs with
+  | Cons (EBlockPass _, _) -> true
+  | Cons (_, t) -> tp_has_blockpass t
+  | Nil -> false
 // ruby's optimized calls are no C method calls: send / __send__ (what they
 // send is), and a Proc's call / () / [] / yield / ===
 and tp_opt_call = fn (recv: Val) -> fn (name: str) ->
@@ -42795,6 +42947,9 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // emitted a flow signal (try_or has already caught any fail by this point).
   let _ = cd_set cd in
   let _ = (if gcbare then () else gc_unsafe_pop ()) in
+  // (the line the body was on as it ended, for a traced call's :return when
+  //  it ends in a raise: tp_meth_flow)
+  let _ = (if map_has frame "__tpkeep" then map_set tp_mstack "fl" (str_of_int (cur_line ())) else ()) in
   // ... and with it the caller's line and file, for the same reason
   let _ = cur_line_set (if map_has call_lines cd then map_get call_lines cd else 0) in
   let _ = cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "") in
@@ -42837,7 +42992,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
               (let m = "mere-ruby: (unhandled " ++ k ++ " looking for its frame)" in
                let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in
                // (this call is over: run_meth will not get to give its frame back)
-               let _ = frame_done frame in fail m))
+               let _ = frame_done_unless_tp frame in fail m))
       else if str_eq k "retry" then FRaise (raise_exc world "SyntaxError" "Invalid retry")
       // `redo` in a define_method body restarts the body, as it would the
       // block the method was made from (it was "unhandled redo", and a spec
@@ -42847,11 +43002,11 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
                   let mn9 = (match (if map_has frame "__meth" then map_get frame "__meth" else VNil) with VStr h9 -> sget h9 | _ -> "") in
                   map_has dm_methods (dc9 ++ "#" ++ mn9)) then
         (let _ = tick () in method_body_flow frame world blk body)
-      else (let _ = frame_done frame in flow_rethrow k v)
+      else (let _ = frame_done_unless_tp frame in flow_rethrow k v)
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in
           // (the exception leaves the call as a Mere failure, past run_meth's
           //  frame_done: the frame goes back here, note 441)
-          let _ = frame_done frame in
+          let _ = frame_done_unless_tp frame in
           fail "mere-ruby: (ruby exception raised)")
   | other -> other
 
@@ -50333,12 +50488,13 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   // where the `class` keyword is, so it starts with what is active there; the
   // env names it so a block written in the body keeps it (ref_enter_env).
   let _ = (if ref_on () && ref_cur_id () > 0 then map_set cenv "__rf" (VInt (ref_cur_id ())) else ()) in
+  let _ = (if map_has hook_flags "tp" then map_set cenv "__tpdecl" (mkstr (str_join_sep (deep_targets body) "\n")) else ()) in
   let r = in_scope_frame (scope_label_of cls) cenv (fn (u: unit) -> register_class_v world cls body "public" cenv) in
   let _ = restore_ref_active saved in
   (match r with
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
    // ...and :end when the body is left normally, with the class as #self
-   | _ -> (let _ = (if map_has hook_flags "tp" then fire_tp_vl world "end" "" cls VNil (VClass cls) (class_end_line body) "" else ()) in r))
+   | _ -> (let _ = (if map_has hook_flags "tp" then (let _ = tp_env_set cenv in fire_tp_vl world "end" "" cls VNil (VClass cls) (class_end_line body) "") else ()) in r))
 
 // run a class_eval-style BLOCK body as class `cls`: defs go to the class, but
 // constants and nested classes go to `cscope` — the block's LEXICAL scope
@@ -52071,7 +52227,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                              else "Object") in
                    // (an endless def's body makes none: ruby's has no line of its own)
                    if str_len c9 > 0 && (map_has meth_src ("~" ++ c9 ++ "#" ++ m9) || (str_eq c9 "Object" && map_has meth_src ("~" ++ m9))) then ()
-                   else fire_tp_v world "line" (if str_eq c9 "" then "" else m9) c9 VNil (if lv_has env "self" then lv_get env "self" else VMain))
+                   else (let _ = tp_env_set env in
+                         fire_tp_v world "line" (if str_eq c9 "" then "" else m9) c9 VNil (if lv_has env "self" then lv_get env "self" else VMain)))
              else ()) in
     FNext VNil
   | SFile f -> let _ = cur_file_set f in FNext VNil
