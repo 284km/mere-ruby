@@ -413,6 +413,27 @@ let parse_lshift = map_new ();
 // eval's tokens are numbered from its line argument, its text from 1)
 let lshift_tok = fn (u: unit) -> if map_has parse_lshift "n" then map_get parse_lshift "n" else 0;
 let lshift_lex = fn (u: unit) -> lshift_tok () + (if map_has parse_lshift "b" then map_get parse_lshift "b" else 0);
+// a character literal a \u escape spelled: UTF-8 whatever the source's
+// encoding, as a string's is (the `(s ... )u8` shape lex_dstr makes)
+let lex_u8_char = fn (bytes: str) -> fn rest ->
+  if enc_all7 bytes then Cons (TStrL bytes, rest)
+  else Cons (TP "(s", Cons (TStrL "", Cons (TP "+", Cons (TStrL bytes, Cons (TP ")u8", rest)))));
+// the first byte in [i, j) that starts no valid UTF-8 character, or -1
+let rec lex_bad_mb = fn (s: str) -> fn (i: int) -> fn (j: int) ->
+  if i >= j then 0 - 1
+  else (let b = ord (char_at s i) in
+        if b < 128 then lex_bad_mb s (i + 1) j
+        else if lex_utf8_ok s i then lex_bad_mb s (i + (if b >= 240 then 4 else if b >= 224 then 3 else 2)) j
+        else i);
+// ruby's words for it: "invalid multibyte character 0x8A"
+// (prism's report is two lines: "syntax error found", then the place again
+//  with the reason)
+let lex_bad_mb_refuse = fn (s: str) -> fn (k: int) ->
+  let b = ord (char_at s k) in
+  let hx = "0123456789ABCDEF" in
+  let rec nl9 = fn (j: int) -> fn (n: int) -> (if j >= k then n else nl9 (j + 1) (if str_eq (char_at s j) "\n" then n + 1 else n)) in
+  syn_refuse ("syntax error found\n" ++ parse_time_file () ++ ":" ++ str_of_int (nl9 0 1 + lshift_lex ())
+              ++ ": invalid multibyte character 0x" ++ substring hx (b / 16) (b / 16 + 1) ++ substring hx (b - (b / 16) * 16) (b - (b / 16) * 16 + 1));
 // A refusal the LEXER makes knows exactly where it is: byte i of the source,
 // w bytes wide. It names the line (counted as lshift_lex counts) and the
 // column and width, so syn_frame puts prism's `^~~` under the bad bytes and
@@ -739,7 +760,11 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
     // (a `?` where only a value can stand that starts no character literal:
     //  at the end of the source, or before a blank or a word)
     else if str_eq c "?" && pct_strict_value s i && (if i + 1 < str_len s && is_char_lit s i then false else true) then
-      (let _ = syn_refuse (if i + 1 >= str_len s then "incomplete character syntax" else "unexpected '?', ignoring it") in Nil)
+      // (...unless what follows holds a byte that is no UTF-8 character:
+      //  that is what ruby names, `?a\x8a`)
+      (let bad9 = (if i + 1 < str_len s && lex_src_is_utf8 () then lex_bad_mb s (i + 1) (scan_ident s (i + 1)) else 0 - 1) in
+       let _ = (if bad9 >= 0 then lex_bad_mb_refuse s bad9
+                else syn_refuse (if i + 1 >= str_len s then "incomplete character syntax" else "unexpected '?', ignoring it")) in Nil)
     else if str_eq c "?" && i + 1 < str_len s && is_char_lit s i then
       // character literal: `?x` is the one-character string "x", for ANY
       // character that is not whitespace — `?/` and `?,` count, which is how
@@ -766,25 +791,19 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
            let inner9 = (if close9 > i + 4 then mc_trim (substring s (i + 4) close9) else "") in
            if str_contains inner9 " " || str_contains inner9 "\t" then
              (let _ = syn_refuse "Multiple codepoints at single character literal" in Nil)
-           else Cons (TStrL bytes, lex_go s j))
+           else lex_u8_char bytes (lex_go s j))
         // (`\uXXXX` needs all four digits: `?\u123` is "invalid Unicode escape")
         else if str_eq e "u" && (if i + 6 < str_len s then false else true
                                  || (if is_hex_digit (char_at s (i + 3)) && is_hex_digit (char_at s (i + 4))
                                         && is_hex_digit (char_at s (i + 5)) && is_hex_digit (char_at s (i + 6)) then false else true)) then
           (let _ = syn_refuse "invalid Unicode escape" in Nil)
         else if str_eq e "u" && i + 6 < str_len s then
-          (let cp = hex4 s (i + 3) in Cons (TStrL (utf8_of cp), lex_go s (i + 7)))
+          (let cp = hex4 s (i + 3) in lex_u8_char (utf8_of cp) (lex_go s (i + 7)))
         // `?\C-z` / `?\cz` (control: low five bits, `?` -> DEL), `?\M-z` (meta:
-        // high bit set), and `?\M-\C-z` (both).
-        else if str_eq e "M" && i + 4 < str_len s && str_eq (char_at s (i + 3)) "-" then
-          (if str_eq (char_at s (i + 4)) "\\" && i + 7 < str_len s
-              && str_eq (char_at s (i + 5)) "C" && str_eq (char_at s (i + 6)) "-" then
-             Cons (TStrL (chr (ctrl_code (char_at s (i + 7)) + 128)), lex_go s (i + 8))
-           else Cons (TStrL (chr ((ord (char_at s (i + 4)) - (ord (char_at s (i + 4)) / 128) * 128) + 128)), lex_go s (i + 5)))
-        else if str_eq e "C" && i + 4 < str_len s && str_eq (char_at s (i + 3)) "-" then
-          Cons (TStrL (chr (ctrl_code (char_at s (i + 4)))), lex_go s (i + 5))
-        else if str_eq e "c" && i + 3 < str_len s then
-          Cons (TStrL (chr (ctrl_code (char_at s (i + 3)))), lex_go s (i + 4))
+        // high bit set), and the two nested -- read as a string's are (dq_cm),
+        // with ruby's refusals marked from the `?`
+        else if str_eq e "c" || ((str_eq e "C" || str_eq e "M") && i + 3 < str_len s && str_eq (char_at s (i + 3)) "-") then
+          (let (v9, j9) = dq_cm_at s i (i + 1) "" in Cons (TStrL (chr v9), lex_go s j9))
         // (`?\“`: a backslash before a multibyte character is that character,
         //  all of its bytes -- the first byte alone was a broken token)
         else if ord e >= 128 then
@@ -866,6 +885,10 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
     else if ord c >= 128 && lex_src_is_utf8 () && (if lex_utf8_ok s i then false else true) then
       (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: invalid multibyte char (UTF-8)" ++ parsing_file ()))) in
        fail ("mere-ruby: invalid multibyte char (UTF-8)" ++ parsing_file ()))
+    // (a name with a byte in it that is no UTF-8 character: ruby's
+    //  "invalid multibyte character", not a name nobody defined)
+    else if is_alpha c && lex_src_is_utf8 () && lex_bad_mb s i (scan_ident s i) >= 0 then
+      (let _ = lex_bad_mb_refuse s (lex_bad_mb s i (scan_ident s i)) in Nil)
     else if is_alpha c then
       let j = scan_ident s i in
       // Ruby method names may end in `?` or `!` (e.g. even?, sort!). Guard
@@ -1821,6 +1844,9 @@ and lex_dstr_t = fn (term: str) -> fn (s: str) -> fn (i: int) -> fn (lit: str) -
       //   "\M-\C-a" was "M-C-a" (`?\cA` alone had them: see lex_go)
       else if str_eq e "c" || ((str_eq e "C" || str_eq e "M") && i + 2 < str_len s && str_eq (char_at s (i + 2)) "-") then
         (let (v9, j9) = dq_cm s i in lex_dstr_t term s j9 (lit ++ chr v9))
+      // `\M1` / `\C1`: a meta or control with no dash
+      else if (str_eq e "C" || str_eq e "M") && i + 2 < str_len s then
+        (let _ = syn_refuse_pos s i 3 "Invalid escape character syntax" in lex_dstr_t term s (i + 2) lit)
       // \xHH — one byte from up to two hex digits.
       else if str_eq e "x" && i + 2 < str_len s && is_hex_digit (char_at s (i + 2)) then
         let d1 = hex_val (char_at s (i + 2)) in
@@ -1897,6 +1923,10 @@ and dq_digits_end = fn (s: str) -> fn (i: int) ->
 and u_cp_checked = fn (cp: int) ->
   if cp > 1114111 || (cp >= 55296 && cp <= 57343) then (let _ = syn_refuse "invalid Unicode escape" in "")
   else utf8_of cp
+and u_digits_max = fn (s: str) -> fn (i: int) ->
+  let rec back = fn (j: int) -> (if j > 0 && is_hex_digit (char_at s (j - 1)) then back (j - 1) else j) in
+  let b9 = back i in
+  if i - b9 > 6 then syn_refuse_pos s b9 (i - b9) "invalid Unicode escape sequence; maximum length is 6 digits" else ()
 and scan_u_braced = fn (s: str) -> fn (i: int) -> fn (acc: str) -> fn (cp: int) ->
   // (the source ends inside the braces: prism names the list from its
   //  backslash, then the string that never closed)
@@ -1908,8 +1938,9 @@ and scan_u_braced = fn (s: str) -> fn (i: int) -> fn (acc: str) -> fn (cp: int) 
   else
     let c = char_at s i in
     // (cp is -1 before a digit: `\u{0}` is NUL, and `\u{}` nothing)
-    if str_eq c "}" then (acc ++ (if cp >= 0 then u_cp_checked cp else ""), i + 1)
-    else if str_eq c " " then scan_u_braced s (i + 1) (acc ++ (if cp >= 0 then u_cp_checked cp else "")) (0 - 1)
+    // (a codepoint of more than six digits is refused across its digits)
+    if str_eq c "}" then (let _ = u_digits_max s i in (acc ++ (if cp >= 0 then u_cp_checked cp else ""), i + 1))
+    else if str_eq c " " then (let _ = u_digits_max s i in scan_u_braced s (i + 1) (acc ++ (if cp >= 0 then u_cp_checked cp else "")) (0 - 1))
     // (more than six digits, past U+10FFFF, is refused at the end anyway;
     //  the cap keeps the number from growing without bound)
     else if is_hex_digit c then scan_u_braced s (i + 1) acc (if cp > 1114111 then cp else (if cp < 0 then 0 else cp) * 16 + hex_val c)
@@ -2004,37 +2035,56 @@ and pct_value_kw = fn (w: str) ->
 // it ends. The argument is one ASCII character or another escape -- a
 // control or meta one, \xHH, octal, or a simple one; `\u` and a multibyte
 // character are "Invalid escape character syntax", as in ruby.
-and dq_cm = fn (s: str) -> fn (i: int) ->
+// \cX / \C-X / \M-X, nested: the value, and the index after it. `st` is
+// where the escape began and `chain` what it has written so far (`\M-\C-`):
+// prism's refusals mark from the backslash, and its warning for a blank
+// argument spells the escape that should have been written.
+and dq_cm = fn (s: str) -> fn (i: int) -> dq_cm_at s i i ""
+and dq_cm_at = fn (s: str) -> fn (st: int) -> fn (i: int) -> fn (chain: str) ->
   let e = char_at s (i + 1) in
-  if str_eq e "c" then (let (v, j) = dq_cm_arg s (i + 2) in (dq_ctl v, j))
-  else if str_eq e "C" then (let (v, j) = dq_cm_arg s (i + 3) in (dq_ctl v, j))
-  else (let (v, j) = dq_cm_arg s (i + 3) in ((v - (v / 128) * 128) + 128, j))
+  if str_eq e "c" then (let (v, j) = dq_cm_arg s st (i + 2) (chain ++ "\\c") in (dq_ctl v, j))
+  else if str_eq e "C" then (let (v, j) = dq_cm_arg s st (i + 3) (chain ++ "\\C-") in (dq_ctl v, j))
+  else (let (v, j) = dq_cm_arg s st (i + 3) (chain ++ "\\M-") in ((v - (v / 128) * 128) + 128, j))
 and dq_ctl = fn (v: int) ->
   if v == 63 then 127 else (v / 128) * 128 + (v - (v / 32) * 32)
 and dq_cm_bad = fn (u: unit) -> (let _ = syn_refuse "Invalid escape character syntax" in (0, 0))
-and dq_cm_arg = fn (s: str) -> fn (i: int) ->
+// (...placed: from the backslash through what made it bad)
+and dq_cm_bad_at = fn (s: str) -> fn (st: int) -> fn (e: int) ->
+  let _ = syn_refuse_pos s st (e - st) "Invalid escape character syntax" in (0, e)
+and dq_cm_warn = fn (s: str) -> fn (i: int) -> fn (use: str) ->
+  warn_note (parse_time_file () ++ ":" ++ str_of_int (nls_before s i 0 1 + lshift_lex ()) ++ ": warning: invalid character syntax; use " ++ use)
+and dq_cm_arg = fn (s: str) -> fn (st: int) -> fn (i: int) -> fn (chain: str) ->
   if i >= str_len s then dq_cm_bad ()
   else
     let c = char_at s i in
     if str_eq c "\\" && i + 1 < str_len s then
       (let e2 = char_at s (i + 1) in
-       if str_eq e2 "c" || ((str_eq e2 "C" || str_eq e2 "M") && i + 2 < str_len s && str_eq (char_at s (i + 2)) "-") then dq_cm s i
+       if str_eq e2 "c" || ((str_eq e2 "C" || str_eq e2 "M") && i + 2 < str_len s && str_eq (char_at s (i + 2)) "-") then dq_cm_at s st i chain
        else if str_eq e2 "x" && i + 2 < str_len s && is_hex_digit (char_at s (i + 2)) then
          (let d1 = hex_val (char_at s (i + 2)) in
           if i + 3 < str_len s && is_hex_digit (char_at s (i + 3)) then (d1 * 16 + hex_val (char_at s (i + 3)), i + 4)
           else (d1, i + 3))
        else if e2 >= "0" && e2 <= "7" then scan_octal s (i + 1) 0 0
-       else if str_eq e2 "u" || ord e2 >= 128 then dq_cm_bad ()
+       // (a \u or \U is no character a control or meta can take)
+       else if str_eq e2 "u" || str_eq e2 "U" then dq_cm_bad_at s st (i + 2)
+       else if ord e2 >= 128 then dq_cm_bad ()
        else
          (let v = (if str_eq e2 "n" then 10 else if str_eq e2 "t" then 9 else if str_eq e2 "r" then 13
                    else if str_eq e2 "e" then 27 else if str_eq e2 "a" then 7 else if str_eq e2 "b" then 8
                    else if str_eq e2 "f" then 12 else if str_eq e2 "v" then 11 else if str_eq e2 "s" then 32
                    else ord e2) in
           (v, i + 2)))
-    else if ord c >= 128 then dq_cm_bad ()
+    // a blank written as itself is taken, with ruby's warning naming the
+    // escape: `\C- ` is `\C-\s`; a tab under a control is the tab (`\t`,
+    // `\M-\t`)
+    else if str_eq c " " then (let _ = dq_cm_warn s i (chain ++ "\\s") in (32, i + 1))
+    else if str_eq c "\t" then (let _ = dq_cm_warn s i ((if str_contains chain "\\M-" then "\\M-" else "") ++ "\\t") in (9, i + 1))
+    // ...and any other control character written as itself is refused, as
+    // is a multibyte one (marked through all its bytes)
+    else if ord c < 32 then dq_cm_bad_at s st (i + 1)
+    else if ord c >= 128 then
+      dq_cm_bad_at s st (i + (let o = ord c in if o >= 240 then 4 else if o >= 224 then 3 else if o >= 192 then 2 else 1))
     else (ord c, i + 1)
-and ctrl_code = fn (x: str) ->
-  if str_eq x "?" then 127 else (let o = ord x in o - (o / 32) * 32)
 
 // the last non-blank character before position i is `ch`
 and prev_nonspace_is = fn (s: str) -> fn (i: int) -> fn (ch: str) ->
