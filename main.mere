@@ -7223,7 +7223,7 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // region STMT block, into the region current here.
   let _ = if pooled then blk_env_put benv else () in
   let _ = (if lfid9 > 0 then map_delete live_frames lfid9 else ()) in
-  if ok then f
+  if ok then (if map_len brk_wraps > 0 then brk_home_flow cenv f else f)
   // the lambda's own return, consumed here (see lfid9)
   else if lfid9 > 0 && map_has flow_sig "k" && map_has flow_sig "fid"
           && (match map_get flow_sig "k" with VStr kk -> str_eq (sget kk) "returnret" | _ -> false)
@@ -26958,13 +26958,66 @@ and sym_blk_proc = fn env -> fn world -> fn blk ->
      | VProc pid9 -> pid9
      | _ -> 0 - 1)
   | _ -> 0 - 1
+// ⚠ `break` in a block passed on with `&` leaves the method that was GIVEN
+//   the block, whoever runs it: `def m(&b); [1].map { [2].each(&b); :no };
+//   end; m { break 5 }` is 5. yield knew (__blk_home), but a builtin or
+//   class_eval that ran the block took the break as its own and answered
+//   with it, and the method went on (test_unbound_refine_method's
+//   EnvUtil.labeled_module is `class_eval(&block)` with a `break refine`).
+//   The block's env is wrapped in one that names that frame, and run_block0
+//   sends the break there.
+and brk_wrap = fn (pid: int) -> fn t ->
+  if map_has lambda_ids (str_of_int pid) || (if map_has proc_home (str_of_int pid) then false else true) then t
+  else
+    (match map_get proc_home (str_of_int pid) with
+     | VInt h9 ->
+       (if h9 > 0 && fb_frame_live h9 then
+          (let _ = brk_wrap_sweep () in
+           match t with
+           | (h, ps, b, e) ->
+             (let w = blk_env_get e in
+              let _ = map_set w "__brkh" (VInt h9) in
+              let n = (if map_has brk_wrap_n 0 then map_get brk_wrap_n 0 else 0) in
+              let _ = map_set brk_wrap_n 0 (n + 1) in
+              let _ = map_set brk_wraps n w in
+              let _ = map_set brk_wrap_h n h9 in
+              (h, ps, b, w)))
+        else t)
+     | _ -> t)
+// give back the wrappers whose frame has returned (a captured one stays:
+// blk_env_put keeps what a closure holds)
+and brk_wrap_sweep = fn (u: unit) ->
+  if map_len brk_wrap_h == 0 then ()
+  else
+    (let dead = vec_new () in
+     let _ = map_iter brk_wrap_h (fn (k: int) -> fn (h9: int) -> (if fb_frame_live h9 then () else vec_push dead k)) in
+     let rec go = fn (i: int) ->
+       (if i >= vec_len dead then ()
+        else (let k = vec_get dead i in
+              let _ = (if map_has brk_wraps k then blk_env_put (map_get brk_wraps k) else ()) in
+              let _ = map_delete brk_wraps k in
+              let _ = map_delete brk_wrap_h k in
+              go (i + 1))) in
+     go 0)
+// ...and a re-scoped run of the same block (instance_eval's child env with
+// its own self, class_exec's with its parameter bound) keeps the mark
+and brk_carry = fn src -> fn dst ->
+  if map_len brk_wraps > 0 && map_has src "__brkh" then map_set dst "__brkh" (map_get src "__brkh") else ()
+// a block's FBreak, when its env names the frame the break leaves
+and brk_home_flow = fn cenv -> fn (f: Flow) ->
+  match f with
+  | FBreak v when map_has cenv "__brkh" ->
+    (match map_get cenv "__brkh" with
+     | VInt h9 -> (if h9 > 0 && fb_frame_live h9 then (let _ = flow_throw_breakret h9 v in FNext VNil) else f)
+     | _ -> f)
+  | _ -> f
 and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   match bv with
   | VProc pid ->
     // forward the proc's home frame so the callee's `break` targets it.
     let _ = if map_has proc_home (str_of_int pid) then map_set pending_home "v" (map_get proc_home (str_of_int pid)) else () in
     let _ = map_set pending_srcproc "v" pid in
-    proc_as_block pid
+    brk_wrap pid (proc_as_block pid)
   | VNil -> (false, (Nil : str list), (Nil : Stmt list), env)
   // (a redefined Symbol#to_proc is asked, as ruby does for `&:sym`)
   | VSym s when (if has_meth world "Symbol" "to_proc" || (map_len undefs > 0 && undef_blocked world "Symbol" "to_proc") then false else true) ->
@@ -26995,7 +27048,7 @@ and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
      | VProc pid ->
        (let _ = if map_has proc_home (str_of_int pid) then map_set pending_home "v" (map_get proc_home (str_of_int pid)) else () in
         let _ = map_set pending_srcproc "v" pid in
-        proc_as_block pid)
+        brk_wrap pid (proc_as_block pid))
      | bad ->
        (let _ = raise_exc world "TypeError"
                   ("can't convert " ++ class_name bv ++ " to Proc (" ++ class_name bv ++ "#to_proc gives " ++ class_name bad ++ ")") in
@@ -28082,6 +28135,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        //   block sets it. mspec's `before :each` assigns describe-level locals
        //   exactly that way, so a whole spec file ran against nil.
        let e3c = lv_child e3 in
+       let _ = brk_carry e3 e3c in
        let _ = map_set e3c "self" recv in
        // ...and the DEFAULT DEFINEE moves with it: a bare `def` in this block
        // belongs to the receiver's singleton class. Stored as the receiver
@@ -28309,7 +28363,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
              // block is (bound in a child env, so the outer scope keeps its own)
              let e3b = (match ps3 with
                         | Nil -> e3
-                        | Cons (p3, _) -> (let ch3 = lv_child e3 in
+                        | Cons (p3, _) -> (let ch3 = lv_child e3 in let _ = brk_carry e3 ch3 in
                                            let _ = lv_set ch3 p3 (VClass anon) in ch3)) in
              // ⚠ AN #initialize IN THE BLOCK REPLACED THE MEMBER INITIALIZER.
              //   struct_build installs the generated one on the class itself,
@@ -28364,7 +28418,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
              // env, as module_eval does, so the outer scope keeps its own.
              let e3b = (match ps3 with
                         | Nil -> e3
-                        | Cons (p3, _) -> (let ch3 = lv_child e3 in
+                        | Cons (p3, _) -> (let ch3 = lv_child e3 in let _ = brk_carry e3 ch3 in
                                            let _ = lv_set ch3 p3 (VClass anon9) in ch3)) in
              // ...and a `break` out of the body is the value of Class.new
              // (test_array's `obj1, obj2 = Class.new { ...; break [new, new] }`)
@@ -28423,7 +28477,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           let e3b = (match ps3 with
                      | Nil -> e3
                      | Cons (p3, _) ->
-                       (let ch3 = lv_child e3 in
+                       (let ch3 = lv_child e3 in let _ = brk_carry e3 ch3 in
                         let a3 = (if (str_len name == 10 && str_eq name "class_exec") || (str_len name == 11 && str_eq name "module_exec")
                                   then (match args with Cons (a9, _) -> a9 | Nil -> VClass c)
                                   else VClass c) in
@@ -50096,7 +50150,8 @@ and register_class_ieval = fn world -> fn (cls: str) -> fn (body: Stmt list) -> 
   let _ = restore_ref_active saved in
   (match r with
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
-   | _ -> r)
+   // (a forwarded block's break leaves the method it was given to: brk_wrap)
+   | _ -> (if map_len brk_wraps > 0 then brk_home_flow denv r else r))
 
 // (the `end`'s line the parser put at the head of the body: end_line_mark)
 and class_end_line = fn (body: Stmt list) ->
@@ -50185,7 +50240,8 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   let _ = restore_ref_active saved in
   (match r with
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
-   | _ -> r)
+   // (a forwarded block's break leaves the method it was given to: brk_wrap)
+   | _ -> (if map_len brk_wraps > 0 then brk_home_flow denv r else r))
 
 // walk the class body tracking the current visibility mode (a bare
 // `private` marks every subsequent def private until `public`).
