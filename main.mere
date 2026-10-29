@@ -3386,6 +3386,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
               | Cons (f9, rest9) -> Cons (pack_cv env world 0 "str" f9, rest9)
               | Nil -> Nil) with
        | Cons (VStr h, rest) ->
+         let _ = fmt_ascii_guard world (senc_get h) in
          let out = rb_format_in env world (senc_get h) (sget h) rest in
          // (a US-ASCII result that came out holding a byte past 127 -- `%c`
          //  of 0x80 -- is BINARY, as ruby makes it)
@@ -4948,6 +4949,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
         (match va0 with
          | VStr h ->
            let args2 = rb_fmt_args env world vb in
+           let _ = fmt_ascii_guard world (senc_get h) in
            let out = rb_format_in env world (senc_get h) (sget h) args2 in
            let renc = (let r9 = rb_fmt_enc (senc_get h) (sget h) args2 in
                        if str_eq r9 "US-ASCII" && (if str_ascii_only out 0 then false else true) then "ASCII-8BIT" else r9) in
@@ -29219,6 +29221,58 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   let v = dispatch_prim0 env world blk recv name args vischeck in
   let _ = bi_reg_set pn pr pd in
   v
+// EUC-JP <-> Shift_JIS by JIS arithmetic (see the encode arm): the bytes,
+// and false at the first character the other side cannot carry
+// ...and the status: "" converted, the character's bytes when it is one
+// ruby's converter calls undefined (EUC-JP 8E E0-FE and 3-byte 8F ...,
+// Shift_JIS F0-FC leads), "x" for anything else (the path below decides)
+// a format in an ASCII-incompatible encoding (UTF-16, a dummy such as
+// UTF-7) is refused before it is read, in ruby's words
+and fmt_ascii_guard = fn world -> fn (enc: str) ->
+  let e9 = enc_canon_name enc in
+  if str_eq e9 "" || enc_ascii_compat e9 then ()
+  else (let _ = raise_exc world "Encoding::CompatibilityError" ("ASCII incompatible encoding: " ++ e9) in ())
+and eucsjis_tx = fn (s: str) -> fn (e2s: bool) ->
+  let b9 = strbuf_new () in
+  let st9 = (if e2s then e2s_go s 0 b9 else s2e_go s 0 b9) in
+  (strbuf_to_str b9, st9)
+and bytes_hex_esc = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then "" else "\\x" ++ hex2_up (ord (char_at s i)) ++ bytes_hex_esc s (i + 1)
+and e2s_go = fn (s: str) -> fn (i: int) -> fn b9 ->
+  if i >= str_len s then ""
+  else
+    (let a = ord (char_at s i) in
+     if a < 128 then (let _ = strbuf_push b9 (chr a) in e2s_go s (i + 1) b9)
+     else if a == 142 && i + 1 < str_len s && ord (char_at s (i + 1)) >= 161 && ord (char_at s (i + 1)) <= 223 then
+       (let _ = strbuf_push b9 (chr (ord (char_at s (i + 1)))) in e2s_go s (i + 2) b9)
+     else if a == 142 && i + 1 < str_len s && ord (char_at s (i + 1)) >= 224 && ord (char_at s (i + 1)) <= 254 then substring s i (i + 2)
+     else if a == 143 && i + 2 < str_len s && ord (char_at s (i + 1)) >= 161 && ord (char_at s (i + 2)) >= 161 then substring s i (i + 3)
+     else if a >= 161 && a <= 254 && i + 1 < str_len s && ord (char_at s (i + 1)) >= 161 && ord (char_at s (i + 1)) <= 254 then
+       (let j1 = a - 128 in
+        let j2 = ord (char_at s (i + 1)) - 128 in
+        let s1 = (j1 + 1) / 2 + (if j1 <= 94 then 112 else 176) in
+        let s2 = (if j1 - (j1 / 2) * 2 == 1 then j2 + (if j2 < 96 then 31 else 32) else j2 + 126) in
+        let _ = strbuf_push b9 (chr s1) in
+        let _ = strbuf_push b9 (chr s2) in
+        e2s_go s (i + 2) b9)
+     else "x")
+and s2e_go = fn (s: str) -> fn (i: int) -> fn b9 ->
+  if i >= str_len s then ""
+  else
+    (let a = ord (char_at s i) in
+     if a < 128 then (let _ = strbuf_push b9 (chr a) in s2e_go s (i + 1) b9)
+     else if a >= 161 && a <= 223 then (let _ = strbuf_push b9 (chr 142) in let _ = strbuf_push b9 (chr a) in s2e_go s (i + 1) b9)
+     else if ((a >= 129 && a <= 159) || (a >= 224 && a <= 239)) && i + 1 < str_len s then
+       (let c = ord (char_at s (i + 1)) in
+        if c < 64 || c > 252 || c == 127 then "x"
+        else
+          (let j1a = (a - (if a <= 159 then 112 else 176)) * 2 - 1 in
+           let (j1, j2) = (if c >= 159 then (j1a + 1, c - 126) else (j1a, c - (if c >= 128 then 32 else 31))) in
+           if j1 < 33 || j1 > 126 || j2 < 33 || j2 > 126 then "x"
+           else (let _ = strbuf_push b9 (chr (j1 + 128)) in let _ = strbuf_push b9 (chr (j2 + 128)) in s2e_go s (i + 2) b9)))
+     else if a >= 240 && a <= 252 && i + 1 < str_len s && ord (char_at s (i + 1)) >= 64 && ord (char_at s (i + 1)) <= 252 && ord (char_at s (i + 1)) != 127 then
+       substring s i (i + 2)
+     else "x")
 and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   // Integer#ceildiv by an object that coerces: `-div(0 - other)` through
@@ -29815,6 +29869,23 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         then raise_exc world "Encoding::ConverterNotFoundError" ("code converter not found (" ++ from ++ " to " ++ to ++ ")")
         else if (if deco9 then false else enc_ascii_compat from && enc_ascii_compat to && enc_all7 (sget h)) then
           relabel9 (sget h)
+        // EUC-JP <-> Shift_JIS is ruby's japanese.trans: JIS X 0208 by
+        // arithmetic, table or no table -- the unassigned rows 93-94 too
+        // (EUC-JP FDA1 is Shift_JIS EF40). What it cannot carry (JIS X 0212,
+        // kana past DF) falls to the path below, whose error is ruby's.
+        else if (if deco9 then false else (str_eq from "EUC-JP" && str_eq to "Shift_JIS") || (str_eq from "Shift_JIS" && str_eq to "EUC-JP"))
+                && (match eucsjis_tx (sget h) (str_eq from "EUC-JP") with (_, st9) -> (if str_eq st9 "x" then false else true)) then
+          (match eucsjis_tx (sget h) (str_eq from "EUC-JP") with
+           | (b9, st9) ->
+             if str_eq st9 "" then relabel9 b9
+             // (ruby's message from the one direct step, the bytes as \xNN)
+             else (let ch9 = mkstr st9 in
+                   let _ = (match ch9 with VStr ci -> senc_set ci from | _ -> ()) in
+                   raise_exc_iv world "Encoding::UndefinedConversionError"
+                     ("\"" ++ bytes_hex_esc st9 0 ++ "\" from " ++ from ++ " to " ++ to)
+                     (Cons (("source_encoding_name", mkstr from),
+                       Cons (("destination_encoding_name", mkstr to),
+                       Cons (("error_char", ch9), Nil))))))
         // CRuby has no converter to or from these (Encoding::Converter.new
         // refuses every one of them against UTF-8), so there is no path.
         else if (if str_eq from to then false
