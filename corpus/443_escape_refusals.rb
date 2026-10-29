@@ -30,5 +30,5 @@ $VERBOSE = true
 puts "?\\u{1234}: #{eval('?\u{1234}').encoding}"
 puts "?\\u1234: #{eval('?\u1234').encoding}"
 puts "?a: #{eval('?a').encoding}"
-puts "\" ?a\\x8a\": #{run(" ?a\x8a").inspect}"
-puts "\"x = a\\x8a\": #{run("x = a\x8a").inspect}"
+puts "\" ?a\\x8a\": #{run(" ?a\x8a").sub(/\(eval at [^)]*\)/, "(eval)").inspect}"
+puts "\"x = a\\x8a\": #{run("x = a\x8a").sub(/\(eval at [^)]*\)/, "(eval)").inspect}"
