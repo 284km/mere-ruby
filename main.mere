@@ -25958,9 +25958,13 @@ and cb_ret_expr = fn (e: Expr) ->
   | _ -> false
 and static_why_stmt = fn (s: Stmt) -> fn (indef: bool) ->
   match s with
+  // `A::B ||= v` / `A::B &&= v`: the assignment under the read is an
+  // op-assign's, which a method may make (const_opasgn in the parser)
+  | SIf (Cons ((EConstOrNil m9, Cons (SExpr _, Nil)), Nil), Cons (SAssign (n9, v9), Nil)) when str_eq m9 n9 -> static_why_expr v9 indef
+  | SIf (Cons ((EConst m9, Cons (SAssign (n9, v9), Nil)), Nil), Cons (SExpr _, Nil)) when str_eq m9 n9 -> static_why_expr v9 indef
   | SAssign (n, e) ->
     if sw_backref n then "Can't set variable " ++ n
-    else if indef && (is_upper_first n || sw_dyn_const n) then "dynamic constant assignment"
+    else if indef && (is_upper_first n || sw_dyn_const n) && (if const_opasgn n e then false else true) then "dynamic constant assignment"
     else if sw_void_expr e then "unexpected void value expression"
     else static_why_expr e indef
   | SLocalFrom (_, s2) -> (if sw_void_stmt s2 then "unexpected void value expression" else static_why_stmt s2 indef)
@@ -26036,7 +26040,9 @@ and static_why_expr = fn (e: Expr) -> fn (indef: bool) ->
      else (let d9 = sw_dup_param bp in
            if str_len d9 > 0 then "duplicated argument name"
            else sw_first (static_why_expr rc indef) (fn (u: unit) -> sw_first (static_why_exprs args indef) (fn (u2: unit) -> static_why_stmts bb indef))))
-  | EScopedAssign (rc, _, v) -> (if indef then "dynamic constant assignment" else sw_first (static_why_expr rc indef) (fn (u: unit) -> static_why_expr v indef))
+  // (`A::B += 1` is written through a temporary, `~opasgn~N`: an op-assign,
+  //  which a method may make)
+  | EScopedAssign (rc, _, v) -> (if indef && (match rc with EVar t9 -> (if str_len t9 > 8 && str_eq (substring t9 0 8) "~opasgn~" then false else true) | _ -> true) then "dynamic constant assignment" else sw_first (static_why_expr rc indef) (fn (u: unit) -> static_why_expr v indef))
   | ECall (_, args) -> static_why_exprs args indef
   | EMethod (rc, _, args) -> sw_first (static_why_expr rc indef) (fn (u: unit) -> static_why_exprs args indef)
   | EBin (_, a, b2) -> sw_first (static_why_expr a indef) (fn (u: unit) -> static_why_expr b2 indef)
@@ -55173,7 +55179,10 @@ and rxp_calls_why = fn (n: RNode) ->
   let bad9 = map_new () in
   let _ = map_iter keys9 (fn (k9: str) -> fn (_u9: int) ->
             (let g9 = rxp_call_gnum k9 in
-             if g9 <= 0 || (if map_has rx_gnodes g9 then false else true) then
+             // (group 0 is the whole pattern, `\g<0>`)
+             if g9 == 0 && str_eq k9 "#0" then
+               (if rxp_left_calls 0 n || rxp_all_call 0 n then map_set bad9 "w" "never ending recursion" else ())
+             else if g9 <= 0 || (if map_has rx_gnodes g9 then false else true) then
                map_set bad9 "w" (if str_eq (char_at k9 0) "#" then "undefined group <" ++ substring k9 1 (str_len k9) ++ "> reference"
                                  else "undefined name <" ++ k9 ++ "> reference")
              else
@@ -55721,7 +55730,15 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
           if map_has rx_named_mode "on" then
             (let __fm = "mere-ruby: regexp parse: numbered backref/call is not allowed. (use name)" in
              let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-          else if tgt <= 0 then
+          // (`\g<0>` calls the whole pattern; `\k<0>` names no group)
+          // (ruby's words carry the `>` twice)
+          // (...only when the number WRITTEN is 0: `\k<-2>` that lands on 0
+          //  is ruby's "invalid backref number/name")
+          else if str_eq c "k" && (let d9 = (if str_eq (char_at nm 0) "-" || str_eq (char_at nm 0) "+" then substring nm 1 (str_len nm) else nm) in
+                                   str_len d9 > 0 && int_of_str d9 == 0) then
+            (let __fm = "mere-ruby: regexp parse: invalid group name <" ++ nm ++ ">>" in
+             let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
+          else if tgt < 0 || (tgt == 0 && str_eq c "k") then
             (let __fm = "mere-ruby: regexp parse: invalid backref number/name" in
              let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
           else if str_eq c "k" then (let _ = rxp_note_ref tgt in (NBackref (tgt, str_contains fl "i"), p2, g))
@@ -56384,11 +56401,12 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
                      let _ = map_set subs9 g9 at9 in
                      // (the group's body between its two saves: rxc_emit
                      //  would make the group itself a call again)
-                     let body9 = (match map_get rx_gnodes g9 with NGroup (b9, _, _) -> b9 | o9 -> o9) in
-                     let _ = map_set prog at9 (ISaveL (2 * g9)) in
-                     let e8 = rxc_emit prog (at9 + 1) body9 in
-                     let _ = map_set prog e8 (ISaveL (2 * g9 + 1)) in
-                     let e9 = e8 + 1 in
+                     // (group 0, `\g<0>`, is the whole pattern again, and
+                     //  saves nothing: the match's own bounds are its)
+                     let body9 = (if g9 == 0 then n else (match map_get rx_gnodes g9 with NGroup (b9, _, _) -> b9 | o9 -> o9)) in
+                     let s9 = (if g9 == 0 then at9 else (let _ = map_set prog at9 (ISaveL (2 * g9)) in at9 + 1)) in
+                     let e8 = rxc_emit prog s9 body9 in
+                     let e9 = (if g9 == 0 then e8 else (let _ = map_set prog e8 (ISaveL (2 * g9 + 1)) in e8 + 1)) in
                      let _ = map_set prog e9 IRet in
                      map_set pcr9 0 (e9 + 1))) in
           emit_subs9 (map_get pcr9 0))) in
