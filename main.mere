@@ -2066,7 +2066,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     then map_get consts (substring name 2 (str_len name))
     else VNil
   | EScopedRead (recv_e, cn) ->
-    (match eval_e env world blk recv_e with
+    (match scope_mod_val world (eval_e env world blk recv_e) with
      | VClass c ->
        let key = c ++ "::" ++ cn in
        // `Logger::WARN` where WARN comes from an INCLUDED module (or a
@@ -2106,7 +2106,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
         else if map_has consts cn then map_get consts cn else VNil)
      | _ -> VNil)
   | EScopedAssign (recv_e, cn, val_e) ->
-    let rv = eval_e env world blk recv_e in
+    let rv = scope_mod_val world (eval_e env world blk recv_e) in
     let v = eval_e env world blk val_e in
     (match rv with
      | VClass c -> let _ = const_store world (c ++ "::" ++ cn) v in v
@@ -5912,7 +5912,7 @@ and assign_x_one = fn env -> fn world -> fn blk -> fn (t: Expr) -> fn (v: Val) -
     ()
   // `recv::CONST = v` — assign a constant in the receiver module's namespace.
   | EScopedRead (recv, cn) ->
-    (match eval_e env world blk recv with
+    (match scope_mod_val world (eval_e env world blk recv) with
      | VClass c -> let _ = const_store world (c ++ "::" ++ cn) v in ()
      | other -> let _ = raise_exc world "TypeError" (inspect other ++ " is not a class/module") in ())
   // `recv&.attr = v` — assign only when the receiver is non-nil.
@@ -7043,6 +7043,7 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // that was passed to the OUTER call (`instance_exec(&blk)` made every hash
   // built inside default to blk itself, which then ran again).
   let _ = if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else () in
+  let _ = (if map_len ub_amp > 0 then map_clear ub_amp else ()) in
   let (has, params00, body, cenv) = theblk in
   // ⚠ A BLOCK INVOCATION IS A FRAME. ruby's backtrace carries
   // `block in <where the block was WRITTEN>` between the block body and
@@ -17275,12 +17276,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           //   already run the #to_path/#to_str conversion, so a value that
           //   is still not a String here has neither -- or its #to_path
           //   answered something that is not one, which is a TypeError too.
+          // (...asked of #to_path when it has one, else of #to_str -- whose
+          //  wrong answer is named as #to_str's)
           | Cons (VObj o9, _) ->
-            (match invoke_val_c env world noblk (VObj o9) "to_path" Nil false with
+            (let via9 = (if responds world (VObj o9) "to_path" || (if responds world (VObj o9) "to_str" then false else true) then "to_path" else "to_str") in
+             match invoke_val_c env world noblk (VObj o9) via9 Nil false with
              | VStr h9 -> nul9h h9
              | r9 -> raise_exc world "TypeError"
-                       ("can't convert " ++ class_name (VObj o9) ++ " to String (" ++ class_name (VObj o9)
-                        ++ "#to_path gives " ++ class_name r9 ++ ")"))
+                       ("can't convert " ++ cls_display world (dispatch_cls_of world (VObj o9)) ++ " to String (" ++ cls_display world (dispatch_cls_of world (VObj o9))
+                        ++ "#" ++ via9 ++ " gives " ++ class_name r9 ++ ")"))
           | _ -> path_arg_err world args 1 1)
        // ⚠ A NON-String PATH IS A TypeError. All three of these answered ""
        //   for anything that was not a String -- File.basename(1) was "",
@@ -18941,6 +18945,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       raise_exc world "ArgumentError" "tried to create Proc object without a block"
     else if (str_len name == 13 && str_eq name "define_method") && (match args with Nil -> true | _ -> false) then
       raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..2)"
+    // (more than a name and a body is counted before either is looked at)
+    else if (str_len name == 13 && str_eq name "define_method") && (match args with Cons (_, Cons (_, Cons (_, _))) -> true | _ -> false) then
+      raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")
     else if (str_len name == 13 && str_eq name "define_method") && (match args with Cons (_, Cons (_, _)) -> true | _ -> false) then
       (let (meths0, sup0, ocls0, ivars0) = world in
        let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h | Cons (a9, _) -> sym_or_str_arg env world a9 | _ -> "") in
@@ -27053,6 +27060,7 @@ and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
     // forward the proc's home frame so the callee's `break` targets it.
     let _ = if map_has proc_home (str_of_int pid) then map_set pending_home "v" (map_get proc_home (str_of_int pid)) else () in
     let _ = map_set pending_srcproc "v" pid in
+    let _ = map_set ub_amp 0 1 in
     brk_wrap pid (proc_as_block pid)
   | VNil -> (false, (Nil : str list), (Nil : Stmt list), env)
   // (a redefined Symbol#to_proc is asked, as ruby does for `&:sym`)
@@ -27430,7 +27438,10 @@ and bi_meth_shadowed = fn world -> fn (id: int) -> fn (mown: str) -> fn (mnm: st
   let own9 = bi_meth_own world id in
   map_has ivars (str_of_int id ++ "@__m_bi") && (if str_eq own9 "" then false else true)
   // (a PRIVATE override shadows too: initialize_copy is always private)
+  // (...and Class#allocate held for a class that has none of its own --
+  //  Rational's and Complex's are undefined, the C function is not)
   && (prim_user_has world mrecv mnm || bi_priv_over world mrecv mnm || has_meth world own9 mnm
+      || (str_eq mnm "allocate" && bi_alloc_zero mrecv)
       || (map_len ref_active > 0 && (if str_eq (refined_impl_for world mrecv mnm) "" then false else true)))
 // ...and the call: an object's builtins are the dispatcher's arms below its
 // has_meth arm, so that one dispatch skips the Ruby body (bi_skip); a value's
@@ -27445,6 +27456,10 @@ and bi_meth_call = fn env -> fn world -> fn blk -> fn (id: int) -> fn (mnm: str)
                 (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
      let _ = map_clear bi_skip in r9) in
   match (mrecv, newblk) with
+  // (an uninitialized Rational / Complex is its zero: `Class.instance_method
+  //  (:allocate).bind_call(Rational)` is (0/1), test_uninitialized)
+  | (VClass c9, _) when str_eq mnm "allocate" && str_eq c9 "Rational" -> VRat ("0", "1")
+  | (VClass c9, _) when str_eq mnm "allocate" && str_eq c9 "Complex" -> VCpx (VInt 0, VInt 0)
   // (an object's Object / Kernel builtins are what `super` from an override
   //  reaches: super_missing, which never consults the override)
   // (Object#initialize_copy is kernel_copy_hook: the class check and the
@@ -27454,6 +27469,8 @@ and bi_meth_call = fn env -> fn world -> fn blk -> fn (id: int) -> fn (mnm: str)
   | (VObj _, _) -> skip9 ()
   | (_, (true, _, _, _)) -> skip9 ()
   | _ -> invoke_val_c env world blk mrecv (bi_meth_name world (bi_meth_own world id) mnm) args false
+and bi_alloc_zero = fn (v: Val) ->
+  match v with VClass c9 -> str_eq c9 "Rational" || str_eq c9 "Complex" | _ -> false
 and bi_priv_over = fn world -> fn (recv: Val) -> fn (name: str) ->
   let c = dispatch_cls_of world recv in
   if str_eq c "" then false else has_meth world c name
@@ -27564,7 +27581,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        //   `invoke` is the internal call and does not check.
        let cls3 = dispatch_cls_of world recv in
        if (if vis3 then false else true) && has_meth world cls3 m3
-       then invoke world newblk recv cls3 m3 rest3
+       then ub_skip_run (fn (u: unit) -> invoke world newblk recv cls3 m3 rest3)
        // ...and so is the builtin (private) Enumerator#initialize
        else if (if vis3 then false else true) && (if str_eq (enum_init_cls world recv m3) "" then false else true)
        then enum_init env world recv (enum_init_cls world recv m3) rest3 newblk
@@ -27669,7 +27686,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
       (let m3 = send_name_arg env world args in
        let rest3 = (match args with Cons (_, r) -> r | Nil -> Nil) in
        let _ = (if (str_len name == 11 && str_eq name "public_send") then public_send_guard world recv m3 else ()) in
-       invoke_with_block env world blk recv m3 rest3 newblk)
+       ub_skip_run (fn (u: unit) -> invoke_with_block env world blk recv m3 rest3 newblk))
     // `UnboundMethod#bind_call(obj, ...) { }`: bind, then the Method's #call
     // below with the block. The plain dispatcher's bind_call has no block to
     // hand on, so a method that yields raised "no block given".
@@ -31772,6 +31789,15 @@ and mod_inst_is = fn world -> fn (v: Val) ->
   match v with
   | VObj id -> (let (_, _, oc9, _) = world in map_has oc9 id && str_list_has (ancestors_of world (map_get oc9 id)) "Module")
   | _ -> false
+// the module a `::` scope names: an instance of a Module subclass
+// (`Class.new(Module).new`) is the module it backs, as it is to
+// const_get / constants (test_massign_const_order's `x1.y1::A = ...`)
+and scope_mod_val = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id ->
+    (let (_, _, ocls9, _) = world in
+     if map_has ocls9 id && obj_is_a world (map_get ocls9 id) "Module" then mod_inst_backing world v else v)
+  | _ -> v
 and mod_inst_backing = fn world -> fn (recv: Val) ->
   let (_, _, _, iv9) = world in
   match recv with
@@ -53438,11 +53464,23 @@ and run_dowhile = fn env -> fn world -> fn blk -> fn (s: Stmt) -> fn (cond: Expr
 // given a block. Said under -w, or with Warning[:strict_unused_block] (which,
 // set false, silences it), once per method. Not for a method the prelude
 // wrote (a C method in ruby), a define_method, or #initialize.
+// run k as a call made through send: its block is passed with no warning
+and ub_skip_run = fn k ->
+  let _ = map_set ub_skip 0 1 in
+  let r9 = try_or_msg k (fn (m: str) -> (let _ = map_clear ub_skip in fail m)) in
+  let _ = map_clear ub_skip in r9
 and unused_blk_warn = fn world -> fn (key: str) -> fn (defcls: str) -> fn (name: str) -> fn (params: str list) -> fn (body: Stmt list) ->
   // (each DEFINITION once: a method defined again is a new one)
+  // (...and a block passed with `&` once more: `f {}` and `f(&b)` are a
+  //  warning each, a second of either is none -- ruby's dup check)
+  let amp9 = map_len ub_amp > 0 in
+  let _ = (if amp9 then map_clear ub_amp else ()) in
   let seen9 = key ++ "@" ++ (if map_has meth_src ("f" ++ key) then (match map_get meth_src ("f" ++ key) with VStr h -> sget h | _ -> "") else "")
-              ++ ":" ++ (if map_has meth_src key then (match map_get meth_src key with VInt n -> str_of_int n | _ -> "") else "") in
-  if map_has unused_blk_seen seen9 then ()
+              ++ ":" ++ (if map_has meth_src key then (match map_get meth_src key with VInt n -> str_of_int n | _ -> "") else "")
+              ++ (if amp9 then "&" else "") in
+  // (a call through send passes its block with no warning)
+  if map_len ub_skip > 0 then map_clear ub_skip
+  else if map_has unused_blk_seen seen9 then ()
   else if (if map_has warn_cats "strict_unused_block" then truthy (map_get warn_cats "strict_unused_block") else rb_verbose_true ())
           && (if map_has meth_cfn key || map_has dm_closenv key || map_has dm_captured key || str_eq name "initialize" then false else true)
           && (if str_eq (block_param_name params) "" then true else false)
@@ -53561,9 +53599,30 @@ and bare_yield_stmt = fn (s: Stmt) ->
   | SClassE (_, _, b) -> bare_yield_stmts b
   | SSingletonE (e, b) -> bare_yield_expr e || bare_yield_stmts b
   | SWhile (c, b) -> bare_yield_expr c || bare_yield_stmts b
-  | SBegin (b, _, _, _) -> bare_yield_stmts b
+  | SBegin (b, rs, el, en) -> bare_yield_stmts b || bare_yield_rescues rs || bare_yield_stmts el || bare_yield_stmts en
   | SIf (clauses, els) -> bare_yield_clauses clauses || bare_yield_stmts els
+  // ⚠ blk_capture asks this whether a block body yields -- the method's
+  //   block is kept for it only then -- so a form it does not walk lost the
+  //   block: `wrap { case x; when 1; yield; end }` was "no block given
+  //   (yield)" (test_arity's assert_arity is written that way)
+  | SCase (e, whens, els) -> bare_yield_expr e || bare_yield_whens whens || bare_yield_stmts els
+  | SCaseIn (e, arms, _, els) -> bare_yield_expr e || bare_yield_arms arms || bare_yield_stmts els
+  | SAndThen (a, b) -> bare_yield_stmt a || bare_yield_stmt b
+  | SOrElse (a, b) -> bare_yield_stmt a || bare_yield_stmt b
+  | SLocalFrom (_, s2) -> bare_yield_stmt s2
+  | SMultiAssign (_, es) -> bare_yield_exprs es
+  | SMultiAssignX (ts, es) -> bare_yield_exprs ts || bare_yield_exprs es
+  | SDoWhile (s2, e) -> bare_yield_stmt s2 || bare_yield_expr e
+  | SBreak e -> bare_yield_expr e
+  | SNext e -> bare_yield_expr e
+  | SRequire (_, e) -> bare_yield_expr e
   | _ -> false
+and bare_yield_rescues = fn (rs: (str list * str * Stmt list) list) ->
+  match rs with Nil -> false | Cons ((_, _, b), t) -> bare_yield_stmts b || bare_yield_rescues t
+and bare_yield_whens = fn (ws: (Expr list * Stmt list) list) ->
+  match ws with Nil -> false | Cons ((es, b), t) -> bare_yield_exprs es || bare_yield_stmts b || bare_yield_whens t
+and bare_yield_arms = fn (arms: (Pat * Expr * Stmt list) list) ->
+  match arms with Nil -> false | Cons ((_, g, b), t) -> bare_yield_expr g || bare_yield_stmts b || bare_yield_arms t
 
 and bare_yield_clauses = fn (clauses: (Expr * Stmt list) list) ->
   match clauses with
