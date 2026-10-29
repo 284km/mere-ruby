@@ -4187,6 +4187,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if map_len ref_active > 0 && (if str_eq (refined_impl_for world va0 op) "" then false else true) then
       ref_call world blk va0 (refined_impl_for world va0 op) op (Cons (eval_e env world blk b, Nil))
     else
+    // an operator a builtin's class ALIASED to another builtin (`class Float;
+    // alias / quo; end`) is that builtin: the branches below would answer
+    // the operator's own meaning. One lookup while nothing is aliased.
+    if map_len blt_alias_ops > 0 && map_has blt_alias_ops op && bin_blt_alias_recv va0
+       && (if str_eq (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world va0)) op) "" then false else true) then
+      blt_alias_call env world va0 (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world va0)) op) (Cons (eval_e env world blk b, Nil))
+    else
     // `<<` mutates a String/Array receiver in place — FrozenError first.
     let _ = (if str_eq op "<<" then chill_touch world va0 "<<" else ()) in
     let _ = (if str_eq op "<<" && builtin_mut_on_frozen world va0 "<<"
@@ -4511,6 +4518,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
 // are Integer's operators (and Comparable's, which it includes) still the
 // builtins? Asked of has_meth once per method-table generation (mro_now
 // moves on every write to a method table), and never under a refinement
+and bin_blt_alias_recv = fn (v: Val) ->
+  match v with
+  | VClass _ -> false
+  | VObj _ -> false
+  | _ -> true
 and int_ops_plain = fn world ->
   if ref_on () then false
   else
@@ -4520,7 +4532,7 @@ and int_ops_plain = fn world ->
        (let rec none = fn (ops: str list) ->
           (match ops with
            | Nil -> true
-           | Cons (o, t) -> (if has_meth world "Integer" o then false else none t)) in
+           | Cons (o, t) -> (if has_meth world "Integer" o || map_has builtin_alias ("Integer#" ++ o) then false else none t)) in
         let ok = none (Cons ("+", Cons ("-", Cons ("*", Cons ("<", Cons ("<=", Cons (">", Cons (">=", Cons ("==", Cons ("!=", Nil)))))))))) in
         let _ = vec_set int_fast_st 0 g in
         let _ = vec_set int_fast_st 1 (if ok then 1 else 0) in
@@ -18593,6 +18605,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let _ = map_set ocls0 id "UnboundMethod" in
           let _ = map_set ivars0 (str_of_int id ++ "@__um_cls") (mkstr origin) in
           let _ = msnap_note world id "UnboundMethod" origin mname in
+          let _ = bi_meth_mark world id origin mname in
           // ...and the OWNER separately, because they are not the same class
           // when a subclass only published the method: @__um_cls is where the
           // body is (what #arity and #bind need) and this is what #owner
@@ -21098,7 +21111,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             (let nm9 = (match mn9 with VSym y9 -> y9 | VStr h9 -> sget h9 | _ -> inspect mn9) in
              raise_exc_iv world "NoMethodError" ("undefined method '" ++ nm9 ++ "' for " ++ for_recv_cls world cls)
                (Cons (("__name", VSym nm9), Cons (("__args", arr_new rest9), Cons (("__recv", recv), Nil)))))))
-    else if has_meth world cls name then
+    else if has_meth world cls name && bi_skip_pass name then
       // ⚠ a visibility refusal is a MISSING method as far as #method_missing
       //   is concerned: ruby hands `obj.priv` to the object's method_missing
       //   when it has one, and raises only when it does not.
@@ -21271,6 +21284,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        if (str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "===") then
          (if map_has ivars (str_of_int id ++ "@__m_mm")
           then invoke_val_c env world blk mrecv "method_missing" (Cons (VSym mnm, args)) false
+          // (a Method made from a builtin runs the builtin, though the name
+          //  has a Ruby body now: bi_meth_mark)
+          else if bi_meth_shadowed world id mown mnm mrecv then
+            bi_meth_call env world blk id mnm mrecv args (false, (Nil : str list), (Nil : Stmt list), env)
           // (Kernel#binding called as a Method has a C function for its
           //  caller, not Ruby code: rb_f_binding's refusal)
           else if str_eq mnm "binding" && (str_eq mown "Kernel" || str_eq mown "")
@@ -23317,6 +23334,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              // (the UnboundMethod's definition, not the one the name has now)
              let _ = (match bm9 with
                       | VObj b9 -> msnap_carry world id "UnboundMethod" b9 "Method"
+                      | _ -> ()) in
+             // (...and a builtin's mark: the Method holds the builtin the
+             //  UnboundMethod was made from, whatever the name means now)
+             let _ = (match bm9 with
+                      | VObj b9 -> (if map_has ivars (str_of_int id ++ "@__m_bi")
+                                    then (let _ = map_set ivars (str_of_int b9 ++ "@__m_bi") (VBool true) in
+                                          if map_has ivars (str_of_int id ++ "@__m_biown")
+                                          then map_set ivars (str_of_int b9 ++ "@__m_biown") (map_get ivars (str_of_int id ++ "@__m_biown"))
+                                          else ())
+                                    else if map_has ivars (str_of_int b9 ++ "@__m_bi") then map_delete ivars (str_of_int b9 ++ "@__m_bi") else ())
                       | _ -> ()) in
              // (a Method made by #bind names its owner in #inspect, not the
              //  receiver's class: Bug #22321)
@@ -27214,6 +27241,52 @@ and rx_sub_args = fn world -> fn (args: Val list) ->
   match args with
   | Nil -> (Nil : Val list)
   | Cons (a9, t9) -> Cons ((if rx_sub_held world a9 then rx_sub_as_regex world a9 else a9), rx_sub_args world t9)
+// a builtin's Method whose name the receiver now answers with a Ruby body
+// (its class overrides it, or the builtin was redefined after the Method
+// was made), or that an active refinement would take
+// the object dispatch's "the class defines it" test, unless this is the one
+// dispatch a builtin's Method asked to skip it for (bi_skip, taken once)
+and bi_skip_pass = fn (name: str) ->
+  if map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name then (let _ = map_clear bi_skip in false)
+  else true
+and bi_meth_own = fn world -> fn (id: int) ->
+  let (_, _, _, ivars) = world in
+  if map_has ivars (str_of_int id ++ "@__m_biown") then (match map_get ivars (str_of_int id ++ "@__m_biown") with VStr h9 -> sget h9 | _ -> "") else ""
+and bi_meth_shadowed = fn world -> fn (id: int) -> fn (mown: str) -> fn (mnm: str) -> fn (mrecv: Val) ->
+  let (_, _, _, ivars) = world in
+  let own9 = bi_meth_own world id in
+  map_has ivars (str_of_int id ++ "@__m_bi") && (if str_eq own9 "" then false else true)
+  // (a PRIVATE override shadows too: initialize_copy is always private)
+  && (prim_user_has world mrecv mnm || bi_priv_over world mrecv mnm || has_meth world own9 mnm
+      || (map_len ref_active > 0 && (if str_eq (refined_impl_for world mrecv mnm) "" then false else true)))
+// ...and the call: an object's builtins are the dispatcher's arms below its
+// has_meth arm, so that one dispatch skips the Ruby body (bi_skip); a value's
+// are reached through a hidden builtin alias on the owner
+and bi_meth_call = fn env -> fn world -> fn blk -> fn (id: int) -> fn (mnm: str) -> fn (mrecv: Val) -> fn (args: Val list) -> fn newblk ->
+  let skip9 = fn (u: unit) ->
+    (let _ = map_set bi_skip "n" mnm in
+     let r9 = try_or_msg (fn (u2: unit) ->
+                (match newblk with
+                 | (true, _, _, _) -> invoke_with_block env world blk mrecv mnm args newblk
+                 | _ -> invoke_val_c env world blk mrecv mnm args false))
+                (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
+     let _ = map_clear bi_skip in r9) in
+  match (mrecv, newblk) with
+  // (an object's Object / Kernel builtins are what `super` from an override
+  //  reaches: super_missing, which never consults the override)
+  // (Object#initialize_copy is kernel_copy_hook: the class check and the
+  //  frozen check, never the override)
+  | (VObj _, (false, _, _, _)) when str_eq mnm "initialize_copy" -> kernel_copy_hook env world mrecv mnm args
+  | (VObj _, (false, _, _, _)) when bi_via_super mnm -> super_missing world blk mrecv mnm args
+  | (VObj _, _) -> skip9 ()
+  | (_, (true, _, _, _)) -> skip9 ()
+  | _ -> invoke_val_c env world blk mrecv (bi_meth_name world (bi_meth_own world id) mnm) args false
+and bi_priv_over = fn world -> fn (recv: Val) -> fn (name: str) ->
+  let c = dispatch_cls_of world recv in
+  if str_eq c "" then false else has_meth world c name
+and bi_via_super = fn (n: str) ->
+  str_eq n "to_s" || str_eq n "inspect" || str_eq n "initialize_dup"
+  || str_eq n "initialize_clone" || str_eq n "respond_to?" || str_eq n "respond_to_missing?" || str_eq n "methods"
 and blk_spread_for = fn world -> fn (recv: Val) -> fn (name: str) -> fn b ->
   match recv with
   | VHsh _ ->
@@ -27465,7 +27538,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
             // visibility, so invoke the method itself when it can be found.
             (let dcls = dispatch_cls_of world mrecv in
              let owner = (if str_eq mown "" then dcls else mown) in
-             if msnap_held world mid "Method" owner mnm then msnap_call world newblk mrecv mid "Method" owner mnm args
+             if bi_meth_shadowed world mid mown mnm mrecv then bi_meth_call env world blk mid mnm mrecv args newblk
+             else if msnap_held world mid "Method" owner mnm then msnap_call world newblk mrecv mid "Method" owner mnm args
              else if has_meth world owner mnm then invoke world newblk mrecv owner mnm args
              else if has_meth world dcls mnm then invoke world newblk mrecv dcls mnm args
              else invoke_with_block env world blk mrecv mnm args newblk))
@@ -28397,7 +28471,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                && (thr_is_thread world recv || fb_is_fiber world recv)
                && (if has_meth world cls name then false else true) then
          invoke_val_c env world blk recv name args true
-       else if has_meth world cls name then
+       else if has_meth world cls name && bi_skip_pass name then
          (if meth_private world cls name
           then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
           else invoke world newblk recv cls name args)
@@ -39063,6 +39137,11 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
   | (VArr id, _) when str_eq src "pack" -> pack_call env world (deref id) args
   | (VStr h, _) when str_eq src "unpack" -> arr_new (unpack_call env world h 0 args)
   | (VStr h, _) when str_eq src "unpack1" -> (match unpack_call env world h 2 args with Cons (v, _) -> v | Nil -> VNil)
+  // (Float#quo is ruby's `/` asked again, through a guard against asking
+  //  itself: once `/` is an alias of quo, quo reaches quo, and the guard's
+  //  answer is a NameError written "1.0/2.0")
+  | (VFlt _, Cons (arg, _)) when str_eq src "quo" && str_eq (blt_alias_lookup world (Cons ("Float", Nil)) "/") "quo" ->
+    raise_exc_iv world "NameError" (inspect recv ++ "/" ++ inspect arg) (Cons (("__name", VSym "/"), Cons (("__recv", recv), Nil)))
   | (_, Cons (arg, _)) when is_binary_op_name src -> arith_bin src recv arg
   // ⚠ Kernel#raise is not a prim_method: it is answered by the receiver
   //   dispatcher (invoke_val_c0's raise / fail arm), so an alias of it ended
