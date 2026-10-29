@@ -4820,6 +4820,38 @@ and parse_block = fn toks ->
   let _ = if had then map_set parser_flags "nodo" VNil else () in
   r
 
+// the line marker for the next statement of a list: SLineQ when the one
+// before it is on the same line (`a = 1; b = 2`), which sets the line but is
+// no :line event -- ruby fires one per LINE, the first statement's
+// The first statement of a nested list (an if's, a while's, a begin's body)
+// on its enclosing statement's line is no event either; a block's, a def's
+// and a class's body start afresh (pstmt is 0 there: ruby's own iseq)
+and line_mark = fn (ln: int) -> fn (acc: Stmt list) ->
+  let p9 = prev_line_mark acc in
+  if p9 == ln then SLineQ ln
+  else if p9 < 0 && ln == pstmt_cur () then SLineQ ln
+  else SLine ln
+// A `begin ... end` statement is no :line itself: its body's first statement
+// is, on the begin's line too (ruby marks the body, not the keyword)
+and begin_mark = fn toks -> fn (s: Stmt) -> fn (ln: int) -> fn (acc: Stmt list) ->
+  match (skip_nls toks, s) with
+  | (Cons (TId kw, _), SBegin (body, rs, el, en)) when str_eq kw "begin" ->
+    (SBegin (head_fire body ln, rs, el, en), SLineQ ln)
+  | _ -> (s, line_mark ln acc)
+and head_fire = fn (b: Stmt list) -> fn (ln: int) ->
+  match b with
+  | Cons (SFile f, t) -> Cons (SFile f, head_fire t ln)
+  | Cons (SLineQ n, t) when n == ln -> Cons (SLine n, t)
+  | _ -> b
+and pstmt_cur = fn (u: unit) ->
+  if map_has parser_flags "pstmt" then (match map_get parser_flags "pstmt" with VInt n -> n | _ -> 0) else 0
+and prev_line_mark = fn (acc: Stmt list) ->
+  match acc with
+  | Cons (SLine n, _) -> n
+  | Cons (SLineQ n, _) -> n
+  | Cons (SFile _, t) -> prev_line_mark t
+  | Cons (_, t) -> prev_line_mark t
+  | Nil -> 0 - 1
 // ...with the line its `{` or `do` is on in front of the body, as a NEGATIVE
 // SLine: a block's (and a lambda's) source_location is that line, not the
 // line of the call it hangs off nor its first statement's. The mark runs as
@@ -4836,7 +4868,9 @@ and parse_block_inner0 = fn toks ->
     if str_eq brace "\{" then
       let (bp, ds, r2) = parse_block_params_d r in
       let _ = afr_push ("B" ++ anon_flags bp) in
+      let sv9 = pstmt_set 0 in
       let (body, r3) = parse_brace_stmts r2 Nil in
+      let _ = pstmt_set sv9 in
       let _ = afr_pop () in
       (bp, defaults_prologue ds body, r3)
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected block" ++ parsing_file ()))) in fail ("mere-ruby: expected block" ++ parsing_file ()))
@@ -4844,7 +4878,9 @@ and parse_block_inner0 = fn toks ->
     if str_eq d "do" then
       let (bp, ds0, r2) = parse_block_params_d r in
       let _ = afr_push ("B" ++ anon_flags bp) in
+      let sv9 = pstmt_set 0 in
       let (body0, r3) = parse_stmts r2 Nil in
+      let _ = pstmt_set sv9 in
       let _ = afr_pop () in
       // do-blocks accept trailing rescue/ensure (an implicit begin).
       let (body, r5) =
@@ -4896,7 +4932,7 @@ and parse_brace_stmts = fn toks -> fn (acc: Stmt list) ->
          let (s0, r0) = parse_stmt t in let (s0, r0) = grow_setter_stmt s0 r0 in let (s, r1) = apply_modifier s0 r0 in
          let _ = pstmt_set sv9 in
          let s = scv_stmt s in
-         parse_brace_stmts r1 (Cons (s, (if ln > 0 then Cons (SLine ln, acc) else acc)))
+         parse_brace_stmts r1 (Cons (s, (if ln > 0 then Cons (line_mark ln acc, acc) else acc)))
   | Cons (TEOF, _) -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated block" ++ parsing_file ()))) in fail ("mere-ruby: unterminated block" ++ parsing_file ()))
   | _ ->
     let ln = tok_line t in
@@ -4905,7 +4941,8 @@ and parse_brace_stmts = fn toks -> fn (acc: Stmt list) ->
     let (s0, r0) = parse_stmt t in let (s0, r0) = grow_setter_stmt s0 r0 in let (s, r1) = apply_modifier s0 r0 in
     let _ = pstmt_set sv9 in
     let s = scv_stmt s in
-    parse_brace_stmts r1 (Cons (s, (if ln > 0 then Cons (SLine ln, acc) else acc)))
+    let (s, mk9) = begin_mark t s ln acc in
+    parse_brace_stmts r1 (Cons (s, (if ln > 0 then Cons (mk9, acc) else acc)))
 
 
 // like parse_block_params but also returns (name, default-expr) pairs for
@@ -6241,6 +6278,7 @@ and unreach_go = fn (xs: Stmt list) -> fn (jumped: bool) -> fn (ln: int) ->
   match xs with
   | Nil -> ()
   | Cons (SLine n9, t) -> unreach_go t jumped (if n9 < 0 then ln else n9)
+  | Cons (SLineQ n9, t) -> unreach_go t jumped (if n9 < 0 then ln else n9)
   | Cons (SFile _, t) -> unreach_go t jumped ln
   | Cons (s9, t) ->
     if jumped then warn_note (parse_time_file () ++ ":" ++ str_of_int (ln + lshift_tok ()) ++ ": warning: statement not reached")
@@ -6354,7 +6392,8 @@ and parse_stmts = fn toks -> fn (acc: Stmt list) ->
       let (s, r) = apply_modifier s0 r0 in
       let _ = pstmt_set sv9 in
       let s = scv_stmt s in
-      parse_stmts (expect_end r) (Cons (s, (if ln > 0 then Cons (SLine ln, acc) else acc)))
+      let (s, mk9) = begin_mark t s ln acc in
+      parse_stmts (expect_end r) (Cons (s, (if ln > 0 then Cons (mk9, acc) else acc)))
   | _ ->
     let ln = tok_line t in
     let acc = (match acc with
@@ -6366,7 +6405,7 @@ and parse_stmts = fn toks -> fn (acc: Stmt list) ->
     let (s, r) = apply_modifier s0 r0 in
     let _ = pstmt_set sv9 in
     let s = scv_stmt s in
-    parse_stmts (expect_end r) (Cons (s, (if ln > 0 then Cons (SLine ln, acc) else acc)))
+    parse_stmts (expect_end r) (Cons (s, (if ln > 0 then Cons (line_mark ln acc, acc) else acc)))
 
 // trailing statement modifiers: `STMT if C`, `unless C`, `while C`,
 // `until C`. Each desugars to the corresponding block form wrapping the
@@ -7202,7 +7241,9 @@ and parse_stmt_id = fn toks ->
          let _ = (if str_eq id "BEGIN" && d9 != 1 && d9 != p9
                   then syn_refuse "BEGIN is permitted only at toplevel" else ()) in
          let _ = (if str_eq id "BEGIN" then map_set stmt_nest "p" (d9 + 1) else ()) in
+         let sv9 = pstmt_set 0 in
          let (body, r3) = parse_brace_stmts r2 Nil in
+         let _ = pstmt_set sv9 in
          let _ = (if str_eq id "BEGIN" then map_set stmt_nest "p" p9 else ()) in
          // (END inside a method is legal and ruby warns about it)
          let _ = (if str_eq id "END" && map_has def_depth "n" && map_get def_depth "n" > 0
@@ -7693,7 +7734,9 @@ and parse_class_go = fn toks ->
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected class name after class" ++ parsing_file ()))) in fail ("mere-ruby: expected class name after class" ++ parsing_file ()))
 
 and parse_class_body_tail = fn r2 ->
+    let sv9 = pstmt_set 0 in
     let (body0, r5a) = parse_stmts r2 Nil in
+    let _ = pstmt_set sv9 in
     // class-body-level rescue/ensure wraps the body in an implicit begin.
     (match r5a with
      | Cons (TId k, _) ->
@@ -7701,9 +7744,14 @@ and parse_class_body_tail = fn r2 ->
          let (rescues, ra) = parse_rescues r5a Nil in
          let (els, rb) = parse_opt_kw_block ra "else" in
          let (ens, rc) = parse_opt_kw_block rb "ensure" in
-         (Cons (SBegin (body0, rescues, els, ens), Nil), rc)
-       else (body0, r5a)
-     | _ -> (body0, r5a))
+         (end_line_mark rc (Cons (SBegin (body0, rescues, els, ens), Nil)), rc)
+       else (end_line_mark r5a body0, r5a)
+     | _ -> (end_line_mark r5a body0, r5a))
+// the line of a class body's `end`, as a negative SLineQ at its head: no
+// statement (exec passes it by), it is what the :end event reports
+and end_line_mark = fn r -> fn (body: Stmt list) ->
+  let ln = tok_line (skip_nls r) in
+  if ln > 0 then Cons (SLineQ (0 - ln), body) else body
 
 and parse_class_rest = fn (name: str) -> fn r ->
     (match r with
@@ -7756,10 +7804,14 @@ and parse_rescues = fn toks -> fn acc ->
   match toks with
   | Cons (TId id, r) ->
     if str_eq id "rescue" then
+      let rl9 = tok_line toks in
       let (classes, var, prefix, r2) = parse_rescue_head r in
       let (handler, r3) = parse_stmts r2 Nil in
       // a complex capture target injects an assignment at the handler's top.
       let handler = (match prefix with Nil -> handler | Cons (s, _) -> Cons (s, handler)) in
+      // ...and the `rescue`'s own line in front of it all, as a negative
+      // SLineQ (no statement): where the match and the :rescue event are
+      let handler = (if rl9 > 0 then Cons (SLineQ (0 - rl9), handler) else handler) in
       parse_rescues r3 (Cons ((classes, var, handler), acc))
     else (rev_app acc Nil, toks)
   | _ -> (rev_app acc Nil, toks)
@@ -8160,11 +8212,16 @@ and parse_if_tail = fn toks ->
     else if str_eq id "elsif" then
       // the same parser as `if`: an elsif condition may use the low-precedence
       // `and` / `or` (racc's generated parsers are written that way).
+      let eln = tok_line toks in
       let (c0, r2) = parse_andor r in
       let c = cond_ff_at r2 c0 in
       let (b, r3) = parse_stmts (skip_then r2) Nil in
       let (clauses, els, r4) = parse_if_tail r3 in
-      (Cons ((c, b), clauses), els, r4)
+      // ...as an `if` in the else, behind a line marker: the elsif's
+      // condition is a :line of its own (Bug #10763), unless it is on the
+      // if's line
+      (Nil, Cons ((if eln > 0 && (if eln == pstmt_cur () then false else true) then SLine eln else SLineQ eln),
+                  Cons (SIf (Cons ((c, b), clauses), els), Nil)), r4)
     else (let __fm = ("mere-ruby: expected elsif/else/end, got " ++ id ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated if" ++ parsing_file ()))) in fail ("mere-ruby: unterminated if" ++ parsing_file ()))
 
@@ -9342,7 +9399,9 @@ and is_op_method_name = fn (op: str) ->
   map_has (name_set "opmeth") op
 
 and parse_def_body = fn (name: str) -> fn (params: str list) -> fn (defs: (str * Expr) list) -> fn r2 ->
+    let sv9 = pstmt_set 0 in
     let (body0, r4) = parse_stmts r2 Nil in
+    let _ = pstmt_set sv9 in
     // method-level rescue/ensure: `def f ... rescue ... end` wraps the
     // whole body in an implicit begin.
     let (body, r5) =
@@ -9710,12 +9769,13 @@ and uv_stmts_go = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (
 // ruby's "possibly useless use of X in void context" (-w): a statement that
 // only computes a value, where the value goes nowhere
 and vw_check = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (ss: Stmt list) -> fn (lastv: bool) ->
-  let rec real9 = fn (xs: Stmt list) -> (match xs with Nil -> 0 | Cons (SLine _, t) -> real9 t | Cons (SFile _, t) -> real9 t | Cons (_, t) -> 1 + real9 t) in
+  let rec real9 = fn (xs: Stmt list) -> (match xs with Nil -> 0 | Cons (SLine _, t) -> real9 t | Cons (SLineQ _, t) -> real9 t | Cons (SFile _, t) -> real9 t | Cons (_, t) -> 1 + real9 t) in
   let n9 = real9 ss in
   let rec go = fn (xs: Stmt list) -> fn (ln: int) -> fn (i: int) ->
     (match xs with
      | Nil -> ()
      | Cons (SLine n, t) -> go t (if n < 0 then ln else n) i
+     | Cons (SLineQ n, t) -> go t (if n < 0 then ln else n) i
      | Cons (SFile _, t) -> go t ln i
      | Cons (st, t) ->
        (let _ = (if lastv && i == n9 - 1 then ()
@@ -9774,6 +9834,7 @@ and uv_body = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (hard
 and uv_stmt = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (s: Stmt) ->
   match s with
   | SLine n -> (if n < 0 then () else map_set uv_cur "l" n)
+  | SLineQ n -> (if n < 0 then () else map_set uv_cur "l" n)
   | SExpr e -> uv_expr chain file e
   | SPuts es -> uv_exprs chain file es
   // (the name is the variable's before its value is read: `a ||= 1` is
@@ -9880,7 +9941,7 @@ and uv_stmts_val_go = fn (chain: (int * bool * bool) list) -> fn (file: str) -> 
   | Cons (s, Nil) -> uv_stmt_val chain file s
   | Cons (s, t) -> (let _ = uv_stmt chain file s in uv_stmts_val_go chain file t)
 and uv_first_line = fn (ss: Stmt list) ->
-  match ss with Nil -> 0 | Cons (SLine n, t) -> (if n < 0 then uv_first_line t else n) | Cons (SFile _, t) -> uv_first_line t | Cons (_, t) -> 0
+  match ss with Nil -> 0 | Cons (SLine n, t) -> (if n < 0 then uv_first_line t else n) | Cons (SLineQ n, t) when n < 0 -> uv_first_line t | Cons (SFile _, t) -> uv_first_line t | Cons (_, t) -> 0
 // the parameters the parser gives a `for` loop's block (`__for`, `__forv`,
 // `__f0`, `*__f1` ...), and nothing else
 and uv_for_params = fn (ps: str list) ->
