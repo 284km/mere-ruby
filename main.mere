@@ -3850,12 +3850,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // file's heredoc-built source stays BINARY), else what the pieces made
     else if str_len name > 11 && str_eq (substring name 0 11) "__lit_denc~" then
       (let cd = enc_canon_name (substring name 11 (str_len name)) in
+       // ⚠ dstr_ienc is what THIS literal's interpolation brought in. A static
+       //   heredoc makes no interpolation and so never sets it, and it read
+       //   whatever the last interpolated literal anywhere had left: after the
+       //   rubygems preload, every static heredoc of a US-ASCII file was
+       //   UTF-8 (test_magic_comment's eval source, note 465)
+       let _ = (if map_has dstr_ienc "v" then map_delete dstr_ienc "v" else ()) in
        let v = eval_e env world blk recv_e in
        let cd = (if str_eq cd "US-ASCII" && map_has dstr_ienc "v" && (if str_eq (map_get dstr_ienc "v") "" then false else true)
                  then map_get dstr_ienc "v" else cd) in
        let tag = (if str_eq (enc_find_canon cd) "" then cd else enc_find_canon cd) in
        (match v with
-        | VStr h -> (if str_eq cd "US-ASCII" || str_is_ascii h then (let _ = senc_set h tag in v) else v)
+        // (...and a word a \u escape made non-ASCII -- `%W"\u{00de}"` in a
+        //  US-ASCII source -- keeps the UTF-8 its pieces gave it)
+        | VStr h -> (if str_is_ascii h then (let _ = senc_set h tag in v) else v)
         | _ -> v))
     else if str_len name > 10 && str_eq (substring name 0 10) "__lit_enc~" then
       (let cd = enc_canon_name (substring name 10 (str_len name)) in
@@ -26774,9 +26782,24 @@ and bt_drop_main = fn (bt: Val) ->
   | _ -> bt
 // a file or eval'd string whose magic comment names no encoding, or one
 // there is not: ruby's ArgumentError, at the line of the comment
-and coding_refuse = fn world -> fn (src: str) -> fn (file: str) ->
+and coding_refuse = fn world -> fn (src: str) -> fn (file: str) -> coding_refuse_at world src file 1
+// (base: the line the source starts at -- an eval's given line)
+// ...written as prism writes it: the comment's line with the one before it
+// and two after, the encoding's name underlined
+and coding_refuse_at = fn world -> fn (src: str) -> fn (file: str) -> fn (base: int) ->
   let ln9 = src_coding_bad_line src in
-  if ln9 > 0 then (let _ = raise_exc world "ArgumentError" (file ++ ":" ++ str_of_int ln9 ++ ": unknown or invalid encoding in the magic comment") in ())
+  if ln9 > 0 then
+    (let lines = str_split src (chr 10) in
+     let n9 = val_count_str lines in
+     let lo = (if ln9 > 1 then ln9 - 1 else ln9) in
+     let hi = (if ln9 + 2 < n9 then ln9 + 2 else n9) in
+     let w = str_len (str_of_int (base + hi - 1)) in
+     let pad = fn (k: int) -> (let t = str_of_int k in str_repeat " " (w - str_len t) ++ t) in
+     let row = fn (k: int) -> ((if k == ln9 then "> " else "  ") ++ pad (base + k - 1) ++ " | " ++ str_nth_line lines (k - 1) ++ "\n") in
+     let cl = str_nth_line lines (ln9 - 1) in
+     let (c9, l9) = coding_name_span cl in
+     let rec rows = fn (k: int) -> (if k > hi then "" else row k ++ (if k == ln9 then str_repeat " " (w + 3) ++ "| " ++ str_repeat " " c9 ++ "^" ++ str_repeat "~" (l9 - 1) ++ "\n" else "") ++ rows (k + 1)) in
+     let _ = raise_exc world "ArgumentError" (file ++ ":" ++ str_of_int (base + ln9 - 1) ++ ": unknown or invalid encoding in the magic comment\n" ++ rows lo) in ())
   else
     // (...and one that names an encoding a source cannot be in -- UTF-16,
     //  UTF-32: ASCII-incompatible, which ruby refuses in the same words)
@@ -26786,6 +26809,19 @@ and coding_refuse = fn world -> fn (src: str) -> fn (file: str) ->
        (let _ = raise_exc world "ArgumentError" (file ++ ":" ++ (if str_len src >= 2 && str_eq (substring src 0 2) "#!" then "2" else "1")
                                                  ++ ": unknown or invalid encoding in the magic comment") in ())
      else ())
+and val_count_str = fn (xs: str list) -> (match xs with Nil -> 0 | Cons (_, t) -> 1 + val_count_str t)
+and str_nth_line = fn (xs: str list) -> fn (i: int) ->
+  match xs with Nil -> "" | Cons (h, t) -> (if i <= 0 then h else str_nth_line t (i - 1))
+// where a magic comment's encoding name starts in its line, and how long it is
+and coding_name_span = fn (l: str) ->
+  let k = str_find_from l "coding" 0 in
+  if k < 0 then (0, 1)
+  else
+    (let rec skip = fn (i: int) -> (if i < str_len l && (str_eq (char_at l i) " " || str_eq (char_at l i) ":" || str_eq (char_at l i) "=") then skip (i + 1) else i) in
+     let st = skip (k + 6) in
+     let rec run = fn (i: int) -> (if i < str_len l && (if str_eq (char_at l i) " " || str_eq (char_at l i) ";" || str_eq (char_at l i) "\t" then false else true) then run (i + 1) else i) in
+     let en = run st in
+     (st, (if en > st then en - st else 1)))
 and run_at_exit_batch = fn world -> fn report -> fn st ->
   let n = map_len at_exits in
   if n == 0 then ()
@@ -28650,13 +28686,19 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // Enumerable method through that each (`cls.new.map { }` has to go
        // through the subclass's each, which is where its bookkeeping happens).
        let tcls9 = dispatch_cls_of world recv in
-       if (if str_eq tcls9 pcls then false else true) && has_meth world tcls9 name then
+       // (...unless this is the one dispatch a builtin's Method asked to skip
+       //  them for, with a block: `String.instance_method(:upcase).bind(sub)
+       //  .call { }`, a Method made before the name was redefined -- bi_skip,
+       //  taken once)
+       let ovr9 = ((if str_eq tcls9 pcls then false else true) && has_meth world tcls9 name) || has_meth world pcls name in
+       let skp9 = ovr9 && (if bi_skip_pass name then false else true) in
+       if (if skp9 then false else true) && (if str_eq tcls9 pcls then false else true) && has_meth world tcls9 name then
          invoke world newblk recv tcls9 name args
        else if (if str_eq tcls9 pcls then false else true)
                && has_meth world tcls9 "each" && is_enum_method name
                && (if (str_len name == 4 && str_eq name "each") then false else true) then
          builtin_iter world blk newblk (enum_collect world recv tcls9) name args
-       else if has_meth world pcls name then invoke world newblk recv pcls name args
+       else if (if skp9 then false else true) && has_meth world pcls name then invoke world newblk recv pcls name args
        // in-place Array mutators taking a block: map!/select!/reject!/etc.
        else if ((str_len name == 4 && str_eq name "map!") || (str_len name == 8 && str_eq name "collect!")) && (match recv with VArr _ -> true | _ -> false) then
          (match recv with
@@ -32180,6 +32222,10 @@ and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: b
           // (Complex undefines Numeric's ordering and rounding)
           && (if str_eq c9 "Complex" && str_list_has (complex_undef_names ()) name then false else true)
           && (if map_len undefs > 0 && undef_blocked world c9 name then false else true)))
+  // ...and a name its class's chain ALIASED to a builtin: `class S <
+  // String; alias each each_char; end` answers each (the call works)
+  || (map_len builtin_alias > 0 && (match recv with VObj _ -> false | VClass _ -> false | VMain -> false | _ -> true)
+      && (if str_eq (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) name) "" then false else true))
 and responds_x0 = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: bool) -> fn (ask_rtm: bool) ->
   // (an undefined name does not answer, for a builtin receiver of any kind:
   //  only String asked -- `class Hash; undef_method :keys; end` left
@@ -46827,6 +46873,11 @@ and sch_backtrace = fn (t: int) ->
           if d < base then (Nil : Val list)
           else Cons (mkstr (frame_file d ++ ":" ++ str_of_int (frame_line d) ++ ":in '" ++ sch_frame_label d base ++ "'"), go (d - 1)) in
         (match top with Cons (h, _) -> Cons (h, go (hi - 1)) | Nil -> go (hi - 1)))
+// is a block's frame anywhere on the running stack at or below depth d?
+and blk_frame_on_stack = fn (d: int) ->
+  if d < 0 then false
+  else if map_has call_names_s d && str_eq (map_get call_names_s d) blk_frame_mark then true
+  else blk_frame_on_stack (d - 1)
 // frame_label_at for a stack that is not the running one: its base is its own
 and sch_frame_label = fn (i: int) -> fn (base: int) ->
   if i <= 0 || i < base then "<main>"
@@ -53702,7 +53753,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     // the eval'd string's encoding (its magic comment, else its own label)
     // is the script encoding while parsing it (__ENCODING__ capture).
     let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
-    let _ = coding_refuse world code efile9 in
+    let _ = coding_refuse_at world code efile9 (if eline9 > 0 then eline9 else 1) in
     let cod = src_coding code in
     // (a source that starts with a UTF-8 BOM is UTF-8, whatever the string
     //  holding it is labelled: a binary "\xEF\xBB\xBF x = __ENCODING__")
@@ -54153,6 +54204,12 @@ and eval_run0 = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
       // `proc { eval("return 1") }` called after its method ended) is ruby's
       // LocalJumpError, as a block's own `return` is (see run_block)
       else if home != 0 then
+        (let _ = raise_exc_iv world "LocalJumpError" "unexpected return"
+                   (Cons (("__exit_value", v), Cons (("__reason", VSym "return"), Nil))) in VNil)
+      // ...and in a BLOCK at the top level it has nothing to return from:
+      // ruby's LocalJumpError (`[1].each { eval("return") }`; a block's own
+      // literal `return` there ends the program, the eval'd one does not)
+      else if blk_frame_on_stack (cd_get () - 1) then
         (let _ = raise_exc_iv world "LocalJumpError" "unexpected return"
                    (Cons (("__exit_value", v), Cons (("__reason", VSym "return"), Nil))) in VNil)
       // ...and at the top level it ends the program, as the top level's own
