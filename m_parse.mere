@@ -797,7 +797,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
         //  "UTF-8 mixed within EUC-JP source")
         let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
         let _ = (if str_eq cd "" || str_eq cd "UTF-8" || str_eq cd "UTF8" then ()
-                 else if lex_raw_nonascii s (i + 1) (j - 1) then syn_refuse ("UTF-8 mixed within " ++ enc_canon_name cd ++ " source")
+                 else if lex_raw_nonascii s (i + 1) (j - 1) || lex_esc_nonascii s (i + 1) (j - 1) then syn_refuse ("UTF-8 mixed within " ++ enc_canon_name cd ++ " source")
                  else ()) in
         tapp (Cons (TP "(s", Cons (TStrL "", segs))) (Cons (TP ")u8", lex_go s j))
       else
@@ -1171,7 +1171,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
          if two9 then Cons (TP " **", lex_go s (i + 2))
          else Cons (TP " *", lex_go s (i + 1)))
       else
-      let _ = (if str_eq three "..." && (let k9 = lvt_skip_sp s (i + 3) in k9 < str_len s && str_eq (char_at s k9) "\n")
+      let _ = (if str_eq three "..." && (let k9 = lvt_skip_sp s (i + 3) in k9 >= str_len s || str_eq (char_at s k9) "\n")
                   && br_depth s i 0 0 <= 0
                   // (a `def`'s paren-less `...` parameter is no range: `def foo ...`)
                   && (if line_is_def s i then false else true)
@@ -1712,6 +1712,21 @@ and lex_raw_nonascii = fn (s: str) -> fn (i: int) -> fn (e: int) ->
   else if str_eq (char_at s i) "#" && i + 1 < e && str_eq (char_at s (i + 1)) "\{" then lex_raw_nonascii s (interp_close s (i + 2) 1) e
   else if ord (char_at s i) >= 128 then true
   else lex_raw_nonascii s (i + 1) e
+// ...or a byte escape past ASCII (`\xE9`, `\351`): a byte of the file's
+// encoding, beside which a \u for a non-ASCII character cannot sit
+and lex_esc_nonascii = fn (s: str) -> fn (i: int) -> fn (e: int) ->
+  if i + 1 >= e then false
+  else if (if str_eq (char_at s i) "\\" then false else true) then lex_esc_nonascii s (i + 1) e
+  else if str_eq (char_at s (i + 1)) "x" && i + 3 < e + 1 && i + 2 < e && is_hex_digit (char_at s (i + 2)) then
+    (let v = hex_val (char_at s (i + 2)) in
+     let (v, k) = (if i + 3 < e && is_hex_digit (char_at s (i + 3)) then (v * 16 + hex_val (char_at s (i + 3)), i + 4) else (v, i + 3)) in
+     if v >= 128 then true else lex_esc_nonascii s k e)
+  else if ord (char_at s (i + 1)) >= 48 && ord (char_at s (i + 1)) <= 55 then
+    (let rec oc = fn (k: int) -> fn (v: int) -> fn (n: int) ->
+       (if n < 3 && k < e && ord (char_at s k) >= 48 && ord (char_at s k) <= 55 then oc (k + 1) (v * 8 + ord (char_at s k) - 48) (n + 1) else (v, k)) in
+     match oc (i + 1) 0 0 with
+     | (v, k) -> if v >= 128 then true else lex_esc_nonascii s k e)
+  else lex_esc_nonascii s (i + 2) e
 and lex_u8_escaped = fn (s: str) -> fn (i: int) -> fn (e: int) ->
   let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
   if str_eq cd "" || str_eq cd "UTF-8" || str_eq cd "UTF8" then false
@@ -3475,11 +3490,7 @@ and rx_interp_bytes_check = fn toks ->
   | Cons (TStrL v, r) ->
     (if enc_valid v "UTF-8" then rx_interp_bytes_check r
      else
-       (let rec bad = fn (i: int) -> (if i >= str_len v then 0 - 1 else if ord (char_at v i) >= 128 && (if enc_valid (substring v i (str_len v)) "UTF-8" then false else true) then i else bad (i + 1)) in
-        let b9 = bad 0 in
-        let o = (if b9 >= 0 then ord (char_at v b9) else 0) in
-        let hd = "0123456789ABCDEF" in
-        syn_refuse ("invalid multibyte character 0x" ++ char_at hd (o / 16) ++ char_at hd (o - (o / 16) * 16))))
+       syn_refuse ("invalid multibyte character: /" ++ rx_raw_show v 0 ++ "/"))
   | Cons (_, r) -> rx_interp_bytes_check r
   | Nil -> ()
 and rx_escapes_check = fn (lit: str) -> fn (fl: str) ->
@@ -3507,6 +3518,10 @@ and rx_escapes_check = fn (lit: str) -> fn (fl: str) ->
     else if str_eq (char_at lit i) "\\" && i + 3 < n + 0 && i + 1 < n && str_eq (char_at lit (i + 1)) "x" && hx (i + 2) && hx (i + 3) then
       go (i + 4) (run ++ chr (hexv (char_at lit (i + 2)) * 16 + hexv (char_at lit (i + 3))))
     else if str_eq (char_at lit i) "\\" && i + 1 < n then (let _ = flush run in go (i + 2) "")
+    // (an interpolation is code, not the pattern's escapes: `/#{"\xcd"}/`
+    //  is rx_interp_bytes_check's)
+    else if str_eq (char_at lit i) "#" && i + 1 < n && str_eq (char_at lit (i + 1)) "\{" then
+      (let _ = flush run in go (interp_close lit (i + 2) 1) "")
     else (let _ = flush run in go (i + 1) "") in
   // `\u` takes four hex digits or a `{` list, inside a class too, in a
   // source of any encoding (`/[\users]/x` is ruby's SyntaxError, which the
@@ -4377,6 +4392,9 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
                       // `defined?(Warning.[]=)` (ruby's own test/lib envutil):
                       // the setter NAMED, with nothing after it.
                       if str_eq lp2 ")" then parse_postfix_more (EMethod (recv, "[]=", Nil)) r4
+                      // (`foo.[]= ...` at the end of a line is the setter
+                      //  with no argument, made the start of an endless range)
+                      else if range_at_eol r4 then parse_postfix_more (EMethod (recv, "[]=", Nil)) r4
                       // ...and a block may follow it like any call's
                       // (test_optimization: `obj.[]=('', 1){}`)
                       else if str_eq lp2 "(" then
@@ -4388,6 +4406,7 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
                     | Cons (TEOF, _) -> parse_postfix_more (EMethod (recv, "[]=", Nil)) r4
                     | _ -> (let (rhs, r5b) = parse_expr r4 in (EMethod (recv, "[]=", Cons (rhs, Nil)), r5b)))
                  // (`foo.[] bar` takes a paren-less argument, as any call)
+                 else if range_at_eol r3 then parse_postfix_more (EMethod (recv, "[]", Nil)) r3
                  else if starts_bare_arg r3 then attach_block_method recv "[]" Nil r3
                  else parse_postfix_more (EMethod (recv, "[]", Nil)) r3
                | _ -> if starts_bare_arg r3 then attach_block_method recv "[]" Nil r3
@@ -4843,6 +4862,14 @@ and head_fire = fn (b: Stmt list) -> fn (ln: int) ->
   | Cons (SFile f, t) -> Cons (SFile f, head_fire t ln)
   | Cons (SLineQ n, t) when n == ln -> Cons (SLine n, t)
   | _ -> b
+// `..` / `...` with nothing after it on its line: a range's operator, not
+// the start of a beginless one
+and range_at_eol = fn toks ->
+  match toks with
+  | Cons (TP d9, Cons (TNL _, _)) -> str_eq d9 "..." || str_eq d9 ".."
+  | Cons (TP d9, Cons (TEOF, _)) -> str_eq d9 "..." || str_eq d9 ".."
+  | Cons (TP d9, Nil) -> str_eq d9 "..." || str_eq d9 ".."
+  | _ -> false
 and pstmt_cur = fn (u: unit) ->
   if map_has parser_flags "pstmt" then (match map_get parser_flags "pstmt" with VInt n -> n | _ -> 0) else 0
 and prev_line_mark = fn (acc: Stmt list) ->
@@ -5354,12 +5381,16 @@ and parse_primary = fn toks ->
            // `defined?((a, b = 1, 2))` wraps the assignment in ITS OWN parens,
            // so the scan for a top-level `=` found it one level down and the
            // whole thing read as an expression.
-           if defined_assignish r2
+           // defined?(if.../while.../case.../begin... end) answers "expression"
+           // -- first: an `=` inside the begin is no assignment of defined?'s.
+           // The statement is kept (EDefined of an EStmt answers "expression"
+           // unevaluated): what it holds is still checked, `class X;
+           // defined?(begin e = 1; return end); end` is ruby's SyntaxError.
+           if defined_compound r2 then
+             let (st, r3) = parse_stmt r2 in (EDefined (EStmt st), expect r3 ")")
+           else if defined_assignish r2
               || (match r2 with Cons (TP lp2, r6) -> is_lparen lp2 && defined_assignish r6 | _ -> false) then
              let (st, r3) = parse_stmt r2 in (defined_assign_node r2 st, expect r3 ")")
-           // defined?(if.../while.../case... end) answers "expression".
-           else if defined_compound r2 then
-             let (_, r3) = parse_stmt r2 in (EDefined (EVar "__defined__expression"), expect r3 ")")
            else
            // defined?(puts) — a keyword-named method probes as a plain call.
            // parse the inner expression at the lowest precedence so the word
@@ -6438,6 +6469,27 @@ and resc_cmd_check = fn toks ->
                               && (str_eq n9 "not" || starts_bare_arg rest9) ->
     syn_refuse "unexpected argument after a rescue modifier, expecting end-of-input"
   | _ -> ()
+// the shape `recv::Const op= v` parses to (see its parse): the assignment
+// of the temporary's constant, plain or under the ||= / &&= test
+and scoped_opasgn = fn (t9: str) -> fn (op9: Stmt) ->
+  str_len t9 > 0 &&
+  (match op9 with
+   | SExpr (EScopedAssign (EVar t8, _, _)) -> str_eq t8 t9
+   | SIf (Cons ((EScopedReadOrNil (EVar t8, _), _), Nil), _) -> str_eq t8 t9
+   | SIf (Cons ((EScopedRead (EVar t8, _), _), Nil), _) -> str_eq t8 t9
+   | _ -> false)
+and scoped_opasgn_resc = fn (op9: Stmt) -> fn (h: Stmt) ->
+  match op9 with
+  | SExpr (EScopedAssign (r9, n9, EBin (b9, EScopedRead (rr9, nn9), v9))) ->
+    SExpr (EScopedAssign (r9, n9, EBin (b9, EScopedRead (rr9, nn9), resc_wrap v9 h)))
+  | SExpr (EScopedAssign (r9, n9, v9)) -> SExpr (EScopedAssign (r9, n9, resc_wrap v9 h))
+  | SIf (Cons ((c9, b9), Nil), e9) -> SIf (Cons ((c9, scoped_opasgn_list b9 h), Nil), scoped_opasgn_list e9 h)
+  | other -> other
+and scoped_opasgn_list = fn (ss: Stmt list) -> fn (h: Stmt) ->
+  match ss with
+  | Nil -> Nil
+  | Cons (SExpr (EScopedAssign (r9, n9, v9)), t) -> Cons (SExpr (EScopedAssign (r9, n9, resc_wrap v9 h)), t)
+  | Cons (s9, t) -> Cons (s9, scoped_opasgn_list t h)
 and resc_wrap = fn (e: Expr) -> fn (h: Stmt) ->
   EStmt (SBegin (Cons (SExpr e, Nil), Cons ((Nil, "", Cons (h, Nil)), Nil), Nil, Nil))
 // ...around the LAST argument only (the value an attribute or index write stores)
@@ -6525,6 +6577,10 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
        | SExpr (EIdxOp (recv, idxs, op, rhs)) -> apply_modifier (SExpr (EIdxOp (recv, idxs, op, resc_wrap rhs h))) r2
        | SMultiAssign (ts, Cons (rhs, Nil)) -> apply_modifier (SMultiAssign (ts, Cons (resc_wrap rhs h, Nil))) r2
        | SMultiAssignX (ts, Cons (rhs, Nil)) -> apply_modifier (SMultiAssignX (ts, Cons (resc_wrap rhs h, Nil))) r2
+       // (`v::C ||= x rescue y`: the scoped constant's op-assign, which the
+       //  parser made `t = v; <assign t::C>` -- the rescue is the value's)
+       | SExpr (EStmt (SBegin (Cons (SAssign (t9, rv9), Cons (op9, Nil)), Nil, Nil, Nil))) when scoped_opasgn t9 op9 ->
+         apply_modifier (SExpr (EStmt (SBegin (Cons (SAssign (t9, rv9), Cons (scoped_opasgn_resc op9 h, Nil)), Nil, Nil, Nil)))) r2
        | _ -> apply_modifier (SBegin (Cons (s, Nil), Cons ((Nil, "", Cons (h, Nil)), Nil), Nil, Nil)) r2)
     else if str_eq id "and" || str_eq id "or" then
       // lowest-precedence: `x = 1 and y = 2` runs the second statement
@@ -8056,6 +8112,11 @@ and defined_assign_go = fn toks -> fn (depth: int) ->
       (if depth == 0 then false else defined_assign_go r (depth - 1))
     else if depth == 0 && (str_eq p "=" || (if str_eq (opassign_base p) "" then false else true)) then true
     else defined_assign_go r depth
+  // (an `=` inside a begin ... end is the body's, not defined?'s operand's:
+  //  `defined?0--begin e = 1; return end`)
+  | Cons (TId w, r) when str_eq w "begin" || str_eq w "do" || str_eq w "def" || str_eq w "class" || str_eq w "module" ->
+    defined_assign_go r (depth + 1)
+  | Cons (TId w, r) when str_eq w "end" -> (if depth == 0 then false else defined_assign_go r (depth - 1))
   | Cons (_, r) -> defined_assign_go r depth
 
 and cond_ff = fn (e: Expr) ->

@@ -4033,7 +4033,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // .min(2) }` the arithmetic arm stood aside for a "given" block and the
        // iterating path answered [], while the same expression at the prompt
        // answered [0, 1]. Every ruby/spec example runs in that shape.
-       else if is_setter_name name then
+       // (...a writer called with NOTHING -- `o.[]=`, a method named by the
+       //  call syntax, not an assignment -- answers its own value)
+       else if is_setter_name name && (match args with Nil -> false | _ -> true) then
          let _ = invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv name args vis in
          (match rev_app args Nil with Cons (v, _) -> v | Nil -> VNil)
        else invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv name args vis)
@@ -25820,6 +25822,9 @@ and cb_ret_stmt = fn (s: Stmt) ->
   | SBegin (bd, rs, els, ens) -> cb_ret_stmts bd || cb_ret_rescues rs || cb_ret_stmts els || cb_ret_stmts ens
   | SAndThen (a, b2) -> cb_ret_stmt a || cb_ret_stmt b2
   | SOrElse (a, b2) -> cb_ret_stmt a || cb_ret_stmt b2
+  // (a statement that declares a local -- `e = no_method_error()` in a
+  //  begin -- comes wrapped)
+  | SLocalFrom (_, s2) -> cb_ret_stmt s2
   | _ -> false
 and cb_ret_clauses = fn (cls: (Expr * Stmt list) list) ->
   match cls with Nil -> false | Cons ((c, b), r) -> cb_ret_expr c || cb_ret_stmts b || cb_ret_clauses r
@@ -25841,6 +25846,10 @@ and cb_ret_expr = fn (e: Expr) ->
   | ERaise xs -> cb_ret_exprs xs
   | EAssign (_, x) -> cb_ret_expr x
   | ESplat x -> cb_ret_expr x
+  // (inside defined? too: ruby refuses it when it compiles, though the
+  //  operand is never run -- `nil&defined?0--begin return end`)
+  | EDefined x -> cb_ret_expr x
+  | ERange (a, b, _) -> cb_ret_expr a || cb_ret_expr b
   | _ -> false
 and static_why_stmt = fn (s: Stmt) -> fn (indef: bool) ->
   match s with
@@ -51347,18 +51356,26 @@ and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (la
      | _ -> (0, 2, lastv))
 
 and hoist_run = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
-  let _ = run_pre env world blk prog in
-  let r = run_stmts env world blk (filter_mid prog) in
-  let _ = run_post env world blk prog in
-  r
+  // (a `return` in an eval's BEGIN leaves the method the eval is in, with
+  //  nothing after it run -- test_return_in_BEGIN_in_eval)
+  match run_pre_f env world blk prog with
+  | FReturn v -> FReturn v
+  | _ ->
+    (let r = run_stmts env world blk (filter_mid prog) in
+     let _ = run_post env world blk prog in
+     r)
 
-and run_pre = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
+and run_pre_f = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
   match prog with
-  | Nil -> ()
+  | Nil -> FNext VNil
   // (a BEGIN inside a BEGIN runs first: its body is hoisted the same way)
-  | Cons (SPreexe body, rest) -> (let _ = run_pre env world blk body in
-                                  match run_stmts env world blk (filter_mid body) with _ -> run_pre env world blk rest)
-  | Cons (_, rest) -> run_pre env world blk rest
+  | Cons (SPreexe body, rest) ->
+    (match run_pre_f env world blk body with
+     | FReturn v -> FReturn v
+     | _ -> (match run_stmts env world blk (filter_mid body) with
+             | FReturn v -> FReturn v
+             | _ -> run_pre_f env world blk rest))
+  | Cons (_, rest) -> run_pre_f env world blk rest
 
 
 
@@ -52765,6 +52782,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // the thread boundary — it raises LocalJumpError (catchable in the block).
     if (if map_has thread_flag "n" then (match map_get thread_flag "n" with VBool b -> b | _ -> false) else false)
     then (let _ = raise_exc world "LocalJumpError" "unexpected return" in FRaise VNil)
+    else if map_len eval_cb_ret > 0 && map_get eval_cb_ret 0 > 0 && (if lv_has env "__meth" then false else true)
+    then (let _ = raise_exc_iv world "LocalJumpError" "unexpected return" (Cons (("__reason", VSym "return"), Nil)) in FRaise VNil)
     // (the line a :return reports is the `return`'s, which the caller's
     //  line has replaced by the time the event is made)
     else (let _ = (if map_len hook_flags > 0 && map_has hook_flags "tp" then map_set tp_mstack "rl" (str_of_int (cur_line ())) else ()) in
@@ -53668,6 +53687,10 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
       let _ = uv_program_eval p2 (parse_time_file ()) in
       let _ = map_clear vw_outer in
      let _ = warn_flush world in p2) sentinel in
+    // (...and what it noted before it refused: ruby says both, the warning
+    //  first -- `foo.[]= bar, ...` is "... at EOL" then the SyntaxError --
+    //  where a refusal left them for the next eval to print)
+    let _ = warn_flush world in
     let _ = map_set parse_lshift "n" 0 in
     let _ = map_set parse_lshift "b" 0 in
     let _ = map_set fsl_ctx "v" savedfsl9 in
@@ -53939,10 +53962,18 @@ and syn_tok_word = fn (t: Tok) ->
 and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (efile: str) -> fn (eline: int) ->
   // (run in a class or module body, outside any method, the eval'd code's
   //  own `return` has nothing to return from: ruby's LocalJumpError)
+  // (...when the return RUNS, its value made first: `eval "return
+  //  puts('x')"` prints x, test_eval_return_toplevel)
   if (if lv_has env "__meth" then false else true) && (if str_eq (cur_lex ()) "" then false else true)
      && cb_ret_stmts prog2 then
-    raise_exc_iv world "LocalJumpError" "unexpected return" (Cons (("__reason", VSym "return"), Nil))
-  else if str_eq efile "" then eval_run env world blk prog2
+    (let d9 = (if map_has eval_cb_ret 0 then map_get eval_cb_ret 0 else 0) in
+     let _ = map_set eval_cb_ret 0 (d9 + 1) in
+     let r9 = try_or_msg (fn (u: unit) -> eval_run_at0 env world blk prog2 efile eline)
+                (fn (m: str) -> (let _ = map_set eval_cb_ret 0 d9 in fail m)) in
+     let _ = map_set eval_cb_ret 0 d9 in r9)
+  else eval_run_at0 env world blk prog2 efile eline
+and eval_run_at0 = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (efile: str) -> fn (eline: int) ->
+  if str_eq efile "" then eval_run env world blk prog2
   else
     // the parsed program carries an SFile naming the eval'd SOURCE, which
     // would overwrite the file the caller named the moment it runs.
