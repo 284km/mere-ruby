@@ -50595,6 +50595,17 @@ and scope_label_of = fn (cls: str) ->
   let short = substring cls (last 0 0) (str_len cls) in
   (if map_has modules cls then "<module:" else "<class:") ++ short ++ ">"
 
+// run f with the nesting the env carries (a method's frame, a block written in
+// a class body) as the current one: what f opens -- `class << self` -- is
+// nested in it, as it is in ruby; the global nesting is "" there. Put back
+// however f ends.
+and with_env_nest = fn env -> fn (f: unit -> Flow) ->
+  if lv_has env "__nest" then
+    (let s9 = cur_nest () in
+     let _ = set_nest (match lv_get env "__nest" with VStr h9 -> sget h9 | _ -> s9) in
+     let r9 = try_or_msg (fn (u: unit) -> f ()) (fn (m: str) -> (let _ = set_nest s9 in fail m)) in
+     let _ = set_nest s9 in r9)
+  else f ()
 and register_class_sng_in = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (lex: str) ->
   let saved = map_copy ref_active in
   // ⚠ the scope arrives as an ARGUMENT rather than from cur_lex (). Read from
@@ -50708,6 +50719,11 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   // their lexical scope for later constant resolution.
   let _ = map_set cenv "__cscope" (mkstr cls) in
   let _ = map_set cenv "__cref" (mkstr cls) in
+  // ...and the nesting, for the same reason: a proc written in the body and
+  // run later -- `instance_eval(&PR)`, a define_method -- is still in this
+  // nesting (Module.nesting there, and the scopes its constants are read
+  // from), and a `class << self` it opens is nested in it
+  let _ = (let n9 = cur_nest () in if str_eq n9 "" then () else map_set cenv "__nest" (mkstr n9)) in
   // ...and the refinement snapshot for the same reason. The body is written
   // where the `class` keyword is, so it starts with what is active there; the
   // env names it so a block written in the body keeps it (ref_enter_env).
@@ -52988,8 +53004,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      // that singleton's ancestors DO include the enclosing module, so the
      // constants were found by the second route. The body's cref is the scope
      // that encloses it, exactly as for `class << self`.
-     | _ -> register_class_sng_in world (sng_cls_of_val world recv "Object") body
-              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ()))
+     | _ -> with_env_nest env (fn (u: unit) -> register_class_sng_in world (sng_cls_of_val world recv "Object") body
+              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ())))
   | SClass (name0, super0, body) ->
     let (meths, sup, ocls, ivars) = world in
     // a leading `::` (class ::C) is a top-level constant; at the top level the
@@ -53033,8 +53049,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        // scope its `def` was written in), falling back to the lexical stack.
        (let tg9 = sng_target_cls world env super0 "Object" in
         let _ = (if is_sng_cls tg9 then map_set sng_shown (sng_inner tg9) 1 else ()) in
-        register_class_sng_in world tg9 body
-              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ())))
+        with_env_nest env (fn (u: unit) -> register_class_sng_in world tg9 body
+              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ()))))
     // `class Foo < Class`: Class has no subclasses
     else if str_eq super0 "Class" then
       (let _ = raise_exc world "TypeError" "can't make subclass of Class" in FNext VNil)
@@ -55727,7 +55743,34 @@ and rxf_member = fn (x: RNode) ->
      | (cp, _, _) -> (if cp > 127 && cp_upcase cp == cp && cp_downcase cp == cp
                       && (match cp_fold_seq cp with Cons (f, Nil) -> f == cp | _ -> false)
                       then cp_hex cp else ""))
+  // (a character outside ASCII is its UTF-8 bytes -- `\u0308`, `ʼ` -- and
+  //  under /i a cased one is the choice of its case forms, `ι` or `\u03b9`:
+  //  either is one member, by its simple fold. `/^\u03b9\u0308\u0301$/i`
+  //  matches "\u0390", `/^\u02bcn$/i` "\u0149", as onigmo's do)
+  | NSeq xs -> (let f9 = rxf_seq_fold xs in if f9 < 0 then "" else cp_hex f9)
+  | NAlt alts -> (let f9 = rxf_alt_fold alts in if f9 < 0 then "" else cp_hex f9)
   | _ -> ""
+// the simple fold of the one non-ASCII character a run of byte nodes spells,
+// or -1
+and rxf_seq_fold = fn (xs: RNode list) ->
+  let rec cat = fn (ys: RNode list) -> fn (acc: str) ->
+    (match ys with
+     | Nil -> acc
+     | Cons (NChar c, t) -> (if str_len c == 1 then cat t (acc ++ c) else "")
+     | _ -> "") in
+  let s9 = cat xs "" in
+  if str_len s9 < 2 then 0 - 1
+  else (match utf8_cp_strict s9 0 with
+        | (cp, n9, ok9) -> (if ok9 && n9 == str_len s9 then (match cp_fold_seq cp with Cons (f, Nil) -> f | _ -> 0 - 1) else 0 - 1))
+// ...and of a choice whose every branch is such a character, all with the
+// same fold (a cased character's case forms), or -1
+and rxf_alt_fold = fn (alts: RNode list) ->
+  let rec go = fn (ys: RNode list) -> fn (f0: int) ->
+    (match ys with
+     | Nil -> f0
+     | Cons (NSeq xs, t) -> (let f9 = rxf_seq_fold xs in if f9 < 0 || (f0 >= 0 && f9 != f0) then 0 - 1 else go t f9)
+     | _ -> 0 - 1) in
+  match alts with Cons (_, Cons (_, _)) -> go alts (0 - 1) | _ -> 0 - 1
 // the set of characters a run of two / three members spells, or ""; a run
 // needs at least one /i character in it
 and rxf_run2 = fn (x1: RNode) -> fn (x2: RNode) ->
@@ -55740,6 +55783,7 @@ and rxf_run3 = fn (x1: RNode) -> fn (x2: RNode) -> fn (x3: RNode) ->
 and rxf_has_ci = fn (x: RNode) ->
   match x with
   | NCharCI _ -> true
+  | NAlt alts -> rxf_alt_fold alts >= 0
   | NClass (Cons (CChr c, Cons (CChr _, Cons (CChr _, Nil))), false, false) -> str_eq c "s" || str_eq c "k"
   | _ -> false
 
