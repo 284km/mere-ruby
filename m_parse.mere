@@ -517,6 +517,26 @@ let lvt_fid = vec_new ();
 let lvt_fop = vec_new ();
 let lvt_kk = vec_new ();
 let lvt_kl = vec_new ();
+// per scope depth d: the offset of the identifier being lexed when it opened
+// (lvt_sv 4 then -- for a def or class, its keyword), and the length of that
+// source (lvt_vcall_pre's first-mention scan)
+let lvt_fst = vec_new ();
+let lvt_fsl = vec_new ();
+// ---- -w's "mismatched indentations" (prism's parser_warn_indentation_mismatch)
+// Per opener n of the lvt_kk stack: the keyword that opened it (ind_k: 0 for
+// one nothing is checked against -- a block, a hash, an endless def -- else a
+// code ind_name reads), where that keyword starts (ind_at), the start of the
+// line whose indentation it is measured on (ind_ln: `else` moves it), 1 for an
+// `if` straight after `else` (ind_ae, measured with what is before it), and
+// the length of the source it is in (ind_src). lvt_sv 6..10 hold the same for
+// the opener the next lvt_kpush pushes. ind_ctl: "off" while an eval's code is
+// lexed (prism checks no eval), "no" after a `warn-indent: false` comment.
+let ind_k = vec_new ();
+let ind_at = vec_new ();
+let ind_ln = vec_new ();
+let ind_ae = vec_new ();
+let ind_src = vec_new ();
+let ind_ctl = map_new ();
 // ---- heredoc bodies a newline jumps over -----------------------------------
 // A heredoc's body starts on the line after the one its `<<ID` is on, and the
 // rest of that line is ordinary code -- which may hold a SECOND heredoc, whose
@@ -651,6 +671,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
        Cons (TNL i, lex_go s (if j >= 0 then j else i + 1)))
     else if str_eq c "#" then
       (let e = skip_comment s i in
+       let _ = ind_directive (substring s i e) in
        let v = scv_value s i e in
        // (a frozen_string_literal comment after the first token is no magic
        //  comment: -w says so, once the line is a comment alone)
@@ -916,8 +937,16 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
           else j
         else j in
       let w = substring s i j2 in
+      let pre9 = lvt_vcall_pre s i j2 w in
+      let _ = lvt_vset lvt_sv 4 i in
+      let _ = lvt_vset lvt_sv 5 (str_len s) in
       let _ = lvt_ident s i j2 w in
-      Cons (TId (lex_name w), lex_go s j2)
+      let t9 = lex_name w in
+      (match pre9 with
+       | Nil -> Cons (TId t9, lex_go s j2)
+       // (assigned right here -- `x = 1` -- is the local, not a call)
+       | _ -> if lvt_is w then Cons (TId t9, lex_go s j2)
+              else (let rest9 = lex_go s j2 in Cons (TId (lvt_vcall_tag s j2 pre9 w t9), rest9)))
     else if str_eq c "@" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "@" then
       // @@classvar: both @ kept in the identifier text
       let j = scan_ident s (i + 2) in
@@ -1334,7 +1363,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
                       || str_eq pc ")" || str_eq pc "]" || str_eq pc "\"")) then
           (let _ = amb_prefix_warn s i "&" in Cons (TP " &", lex_go s (i + 1)))
         else if is_punct1 c then
-          (let _ = (if str_eq c "\{" then lvt_brace_open s (i + 1) else if str_eq c "}" then lvt_brace_close () else ()) in
+          (let _ = (if str_eq c "\{" then lvt_brace_open s (i + 1) else if str_eq c "}" then lvt_brace_close s i else ()) in
            Cons (TP c, lex_go s (i + 1)))
         // backslash-newline continues the statement on the next line.
         else if str_eq c "\\" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\n" then
@@ -1358,6 +1387,102 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
                        then "mere-ruby: Invalid char '\\x" ++ char_at "0123456789ABCDEF" (ord c / 16) ++ char_at "0123456789ABCDEF" (ord c - (ord c / 16) * 16) ++ "' in expression" ++ parsing_file ()
                        else "mere-ruby: unexpected character: " ++ c ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
 
+// ---- -w's mismatched indentations (see ind_k above) --------------------------
+and ind_line_start = fn (s: str) -> fn (i: int) ->
+  if i <= 0 then 0 else if str_eq (char_at s (i - 1)) "\n" then i else ind_line_start s (i - 1)
+and ind_pend = fn (s: str) -> fn (i: int) -> fn (code: int) -> fn (ae: int) ->
+  let _ = lvt_vset lvt_sv 6 code in
+  let _ = lvt_vset lvt_sv 7 i in
+  let _ = lvt_vset lvt_sv 8 ae in
+  let _ = lvt_vset lvt_sv 9 (ind_line_start s i) in
+  lvt_vset lvt_sv 10 (str_len s)
+and ind_name = fn (k: int) ->
+  if k == 1 then "begin" else if k == 2 then "if" else if k == 3 then "unless"
+  else if k == 4 then "while" else if k == 5 then "until" else if k == 6 then "for"
+  else if k == 7 then "def" else if k == 8 then "class" else if k == 9 then "module"
+  else if k == 10 then "case" else if k == 11 then "->" else "else"
+// prism's token_column: tabs to the next stop of 8, and -1 when anything but
+// blanks comes first (when it is asked to break there). A line that starts
+// before the token's keyword -- `else` moved it -- measures nothing: 0.
+and ind_col = fn (s: str) -> fn (ls: int) -> fn (e: int) -> fn (brk: bool) ->
+  let b0 = (if ls == 0 && str_len s >= 3 && ord (char_at s 0) == 239 && ord (char_at s 1) == 187 && ord (char_at s 2) == 191 then 3 else ls) in
+  let rec go = fn (k: int) -> fn (c: int) ->
+    (if k >= e then c
+     else (let o = ord (char_at s k) in
+           if o == 9 then go (k + 1) ((c / 8 + 1) * 8)
+           else if o == 32 then go (k + 1) (c + 1)
+           else if brk then 0 - 1
+           else go (k + 1) (c + 1))) in
+  go b0 0
+and ind_on = fn (u: unit) ->
+  parse_verbose () && (if map_has ind_ctl "off" || map_has ind_ctl "no" then false else true)
+// the closing keyword at i of s against opener n (allow: `when` / `in` may sit
+// deeper than their `case`)
+and ind_warn_n = fn (s: str) -> fn (n: int) -> fn (i: int) -> fn (close: str) -> fn (allow: bool) ->
+  let k = lvt_vget ind_k n in
+  // (only in the source lex_src was given: an interpolation's code is lexed
+  //  on its own, where an offset is no line of the file)
+  if k == 0 || (if ind_on () then false else true) || lvt_vget ind_src n != str_len s || lvt_vget lvt_sv 11 != str_len s then ()
+  else
+    let ol = lvt_vget ind_ln n in
+    let cl = ind_line_start s i in
+    let ae = lvt_vget ind_ae n == 1 in
+    if ol == cl || ol > str_len s then ()
+    else
+      let oc = ind_col s ol (lvt_vget ind_at n) (if ae then false else true) in
+      if (if ae then false else true) && oc < 0 then ()
+      else
+        let cc = ind_col s cl i true in
+        if cc < 0 || cc == oc || (allow && cc > oc) then ()
+        else warn_note (parse_time_file () ++ ":" ++ str_of_int (nls_before s i 0 1 + lshift_lex ())
+                        ++ ": warning: mismatched indentations at '" ++ close ++ "' with '" ++ ind_name k
+                        ++ "' at " ++ str_of_int (nls_before s ol 0 1 + lshift_lex ()))
+and ind_warn = fn (s: str) -> fn (i: int) -> fn (close: str) -> fn (allow: bool) ->
+  let n = lvt_vget lvt_sv 2 in
+  if n <= 0 then () else ind_warn_n s n i close allow
+// else / elsif / rescue / ensure / when / in, against the opener on top. An
+// `else` then takes its place -- the `ensure` / `end` after it are measured
+// against the `else` -- in an if / unless and in a body that rescues (begin,
+// def, class, module, a lambda, a do-block: prism's parse_rescues sets
+// `opening = &else_keyword` whether or not there was an opening to check).
+// A case's `else` leaves the `case`.
+and ind_mid = fn (s: str) -> fn (i: int) -> fn (w: str) ->
+  let n = lvt_vget lvt_sv 2 in
+  if n <= 0 then ()
+  else
+    let k = lvt_vget ind_k n in
+    let body = k == 1 || k == 7 || k == 8 || k == 9 || k == 11 in
+    if str_eq w "else" then
+      (if k == 2 || k == 3 || body || (k == 0 && lvt_vget lvt_kk n == 1) then
+         (let _ = ind_warn_n s n i "else" false in
+          let _ = lvt_vset ind_k n 12 in
+          let _ = lvt_vset ind_at n i in
+          let _ = lvt_vset ind_ae n 0 in
+          let _ = lvt_vset ind_src n (str_len s) in
+          lvt_vset ind_ln n (ind_line_start s i))
+       else ())
+    else if str_eq w "elsif" then (if k == 2 then ind_warn_n s n i "elsif" false else ())
+    else if str_eq w "rescue" || str_eq w "ensure" then (if body then ind_warn_n s n i w false else ())
+    else if k == 10 then ind_warn_n s n i w true
+    else ()
+// a `warn-indent:` / `warn_indent:` magic comment, wherever it stands
+and ind_directive = fn (t: str) ->
+  let rec low = fn (k: int) -> fn (acc: str) ->
+    (if k >= str_len t then acc
+     else (let o = ord (char_at t k) in low (k + 1) (acc ++ (if o >= 65 && o <= 90 then chr (o + 32) else char_at t k)))) in
+  let l = (if str_len t > 200 then t else low 0 "") in
+  let k0 = str_index_of l "warn_indent" in
+  let k1 = (if k0 >= 0 then k0 else str_index_of l "warn-indent") in
+  if k1 < 0 then ()
+  else
+    let rec sp = fn (k: int) -> (if k < str_len l && (str_eq (char_at l k) " " || str_eq (char_at l k) "\t") then sp (k + 1) else k) in
+    let a = sp (k1 + 11) in
+    if a < str_len l && str_eq (char_at l a) ":" then
+      (let b = sp (a + 1) in
+       if b + 4 <= str_len l && str_eq (substring l b (b + 4)) "true" then map_delete ind_ctl "no"
+       else if b + 5 <= str_len l && str_eq (substring l b (b + 5)) "false" then map_set ind_ctl "no" 1
+       else ())
+    else ()
 // ---- the local-variable table: scopes (see lvt_names above) -----------------
 and lvt_vget = fn v -> fn (i: int) -> if i < vec_len v then vec_get v i else 0
 and lvt_vset = fn v -> fn (i: int) -> fn (x: int) ->
@@ -1368,6 +1493,13 @@ and lvt_reset = fn (u: unit) ->
   let _ = lvt_vset lvt_sv 1 1 in
   let _ = lvt_vset lvt_sv 2 0 in
   let _ = lvt_vset lvt_sv 3 0 in
+  let _ = lvt_vset lvt_sv 4 0 in
+  let _ = lvt_vset lvt_sv 5 0 in
+  let _ = lvt_vset lvt_sv 6 0 in
+  let _ = lvt_vset lvt_sv 7 0 in
+  let _ = lvt_vset lvt_sv 8 0 in
+  let _ = lvt_vset lvt_sv 9 0 in
+  let _ = lvt_vset lvt_sv 10 0 in
   let _ = lvt_vset lvt_fid 0 0 in
   lvt_vset lvt_fop 0 1
 and lvt_push_frame = fn (opaque: int) ->
@@ -1376,6 +1508,8 @@ and lvt_push_frame = fn (opaque: int) ->
   let _ = lvt_vset lvt_sv 1 (id + 1) in
   let _ = lvt_vset lvt_fid d id in
   let _ = lvt_vset lvt_fop d opaque in
+  let _ = lvt_vset lvt_fst d (lvt_vget lvt_sv 4) in
+  let _ = lvt_vset lvt_fsl d (lvt_vget lvt_sv 5) in
   lvt_vset lvt_sv 0 d
 and lvt_pop_frame = fn (u: unit) ->
   let d = lvt_vget lvt_sv 0 in if d > 0 then lvt_vset lvt_sv 0 (d - 1) else ()
@@ -1383,7 +1517,12 @@ and lvt_pop_frame = fn (u: unit) ->
 // parameter or `-> do` would otherwise put `nil`/`do` in the table.
 and lvt_add = fn (name: str) ->
   if str_len name == 0 || is_upper (char_at name 0) || (str_len name <= 8 && lvt_is_kw name) then ()
-  else map_set lvt_names (str_of_int (lvt_vget lvt_fid (lvt_vget lvt_sv 0)) ++ ":" ++ name) 1
+  else
+    // (the value is where the name was first recorded: lvt_sv 4 is the
+    //  offset of the identifier being lexed, 5 the length of the source it is
+    //  in -- see lvt_vcall_tag)
+    (let k9 = str_of_int (lvt_vget lvt_fid (lvt_vget lvt_sv 0)) ++ ":" ++ name in
+     if map_has lvt_names k9 then () else map_set lvt_names k9 (lvt_vget lvt_sv 4 * 1048576 + lvt_vget lvt_sv 5))
 // by LENGTH first: this runs for every local recorded, and a string compare
 // here is a memcmp whatever the lengths (it was the lexer's largest cost).
 and lvt_is_kw = fn (w: str) ->
@@ -1413,6 +1552,12 @@ and lvt_kpush = fn (kind: int) -> fn (loopat: int) ->
   let n = lvt_vget lvt_sv 2 + 1 in
   let _ = lvt_vset lvt_sv 2 n in
   let _ = lvt_vset lvt_kk n kind in
+  let _ = lvt_vset ind_k n (lvt_vget lvt_sv 6) in
+  let _ = lvt_vset ind_at n (lvt_vget lvt_sv 7) in
+  let _ = lvt_vset ind_ae n (lvt_vget lvt_sv 8) in
+  let _ = lvt_vset ind_ln n (lvt_vget lvt_sv 9) in
+  let _ = lvt_vset ind_src n (lvt_vget lvt_sv 10) in
+  let _ = lvt_vset lvt_sv 6 0 in
   lvt_vset lvt_kl n loopat
 and lvt_ktop = fn (u: unit) ->
   let n = lvt_vget lvt_sv 2 in if n > 0 then lvt_vget lvt_kk n else 0 - 1
@@ -1428,15 +1573,19 @@ and lvt_kpop = fn (u: unit) ->
 // newline or body never came), then the keyword on top is the one it closes.
 // An `end` meeting a brace is a mismatch this table cannot resolve; it leaves
 // the stack alone rather than pop a scope that is still open.
-and lvt_end = fn (u: unit) ->
+and lvt_end = fn (s: str) -> fn (i: int) ->
   let t = lvt_ktop () in
-  if t == 3 || t == 4 then (let _ = lvt_kpop () in lvt_end ())
-  else if t == 0 || t == 1 then lvt_kpop ()
+  if t == 3 || t == 4 then (let _ = lvt_kpop () in lvt_end s i)
+  else if t == 0 || t == 1 then (let _ = ind_warn s i "end" false in lvt_kpop ())
   else ()
 // `}` closes the nearest brace, and anything a misread left above it.
-and lvt_brace_close = fn (u: unit) ->
+and lvt_brace_close = fn (s: str) -> fn (i: int) ->
   let rec has = fn (n: int) -> if n <= 0 then false else if lvt_vget lvt_kk n == 2 then true else has (n - 1) in
-  let rec pop = fn (u2: unit) -> (let t = lvt_ktop () in let _ = lvt_kpop () in if t == 2 then () else pop ()) in
+  let rec pop = fn (u2: unit) ->
+    (let t = lvt_ktop () in
+     // (a lambda's `}` is measured against its `->`)
+     let _ = (if t == 2 then ind_warn s i "}" false else ()) in
+     let _ = lvt_kpop () in if t == 2 then () else pop ()) in
   if has (lvt_vget lvt_sv 2) then pop () else ()
 // "ne" counts the endless defs on the stack, so that the common newline --
 // with none open -- costs one lookup.
@@ -1531,18 +1680,33 @@ and lvt_stmt_start = fn (s: str) -> fn (p: int) ->
     let c = char_at s p in
     if is_alnum c then
       (let w = word_ending_at s p in
-       str_eq w "then" || str_eq w "else" || str_eq w "do" || str_eq w "begin" ||
-       str_eq w "ensure" || str_eq w "and" || str_eq w "or" || str_eq w "not" ||
-       str_eq w "when" || str_eq w "in")
+       // (`self.begin if x` -- a keyword spelled after `.` is a method's
+       //  name, and the `if` after it a modifier)
+       let b = p + 1 - str_len w in
+       (if b > 0 && (let pc = char_at s (b - 1) in str_eq pc "." || str_eq pc ":") then false
+        else
+          str_eq w "then" || str_eq w "else" || str_eq w "do" || str_eq w "begin" ||
+          str_eq w "ensure" || str_eq w "and" || str_eq w "or" || str_eq w "not" ||
+          str_eq w "when" || str_eq w "in"))
     else if str_eq c ")" || str_eq c "]" || str_eq c "}" || str_eq c "\"" || str_eq c "'" ||
             str_eq c "`" || str_eq c "?" || str_eq c "!" || str_eq c "/" then false
+    // (an operator spelled as a Symbol ends an expression too: `x << :** if c`)
+    else if str_contains "*&+-<>=%^|~" c then
+      (let rec back = fn (k: int) -> (if k >= 0 && str_contains "*&+-<>=%^|~[]" (char_at s k) then back (k - 1) else k) in
+       let k = back p in
+       if k >= 0 && str_eq (char_at s k) ":" && (k == 0 || (if str_eq (char_at s (k - 1)) ":" then false else true)) then false
+       else true)
     else true
 // `def` at j (just past the keyword): push its opaque scope and read its
 // parameters, with or without parentheses; an endless def (`def f(a) = a`)
 // has no `end`, and its scope closes at the newline.
 and lvt_def = fn (s: str) -> fn (j: int) ->
   let n = str_len s in
-  let k = lvt_skip_sp s j in
+  let k0 = lvt_skip_sp s j in
+  // (a singleton def on an expression -- `def (obj = Object.new).to_str` --
+  //  has its receiver in parentheses: the name starts after them, and the
+  //  `=` inside is no endless def's)
+  let k = (if k0 < n && str_eq (char_at s k0) "(" then lvt_close s (k0 + 1) + 1 else k0) in
   let rec name_end = fn (e: int) ->
     if e >= n then e
     else (let o = ord (char_at s e) in
@@ -1676,7 +1840,7 @@ and lvt_ident = fn (s: str) -> fn (i: int) -> fn (j: int) -> fn (w: str) ->
   else if str_len w > 6 ||
           (if o0 == 101 || o0 == 100 || o0 == 99 || o0 == 109 || o0 == 98 || o0 == 102 ||
               o0 == 119 || o0 == 117 || o0 == 105 || o0 == 114 then false else true) then lvt_assign_or_mlhs s i j w p
-  else if str_eq w "end" then lvt_end ()
+  else if str_eq w "end" then lvt_end s i
   else if str_eq w "do" then
     (let kn = lvt_vget lvt_sv 2 in
      let lp = (if kn > 0 then lvt_vget lvt_kl kn else 0 - 1) in
@@ -1690,16 +1854,24 @@ and lvt_ident = fn (s: str) -> fn (i: int) -> fn (j: int) -> fn (w: str) ->
        (let _ = lvt_kpush 1 (0 - 1) in
         let _ = lvt_push_frame 0 in
         lvt_block_params s j))
-  else if str_eq w "def" then lvt_def s j
+  else if str_eq w "def" then (let _ = ind_pend s i 7 0 in lvt_def s j)
   else if str_eq w "class" || str_eq w "module" then
-    (let _ = lvt_kpush 1 (0 - 1) in lvt_push_frame 1)
-  else if str_eq w "begin" || str_eq w "case" then lvt_kpush 0 (0 - 1)
-  else if str_eq w "for" then (let _ = lvt_for_vars s j in lvt_kpush 0 i)
+    (let _ = ind_pend s i (if str_eq w "class" then 8 else 9) 0 in
+     let _ = lvt_kpush 1 (0 - 1) in lvt_push_frame 1)
+  else if str_eq w "begin" || str_eq w "case" then
+    (let _ = ind_pend s i (if str_eq w "begin" then 1 else 10) 0 in lvt_kpush 0 (0 - 1))
+  else if str_eq w "for" then (let _ = lvt_for_vars s j in let _ = ind_pend s i 6 0 in lvt_kpush 0 i)
   else if str_eq w "while" || str_eq w "until" then
-    (if lvt_stmt_start s p then lvt_kpush 0 i else ())
+    (if lvt_stmt_start s p then (let _ = ind_pend s i (if str_eq w "while" then 4 else 5) 0 in lvt_kpush 0 i) else ())
   else if str_eq w "if" || str_eq w "unless" then
-    (if lvt_stmt_start s p then lvt_kpush 0 (0 - 1) else ())
-  else if str_eq w "rescue" then lvt_rescue_var s j
+    (if lvt_stmt_start s p
+     then (let ae9 = (p >= 3 && str_eq (substring s (word_start s p) (p + 1)) "else") in
+           let _ = ind_pend s i (if str_eq w "if" then 2 else 3) (if ae9 then 1 else 0) in
+           lvt_kpush 0 (0 - 1))
+     else ())
+  else if str_eq w "rescue" then (let _ = ind_mid s i w in lvt_rescue_var s j)
+  else if str_eq w "else" || str_eq w "elsif" || str_eq w "ensure" || str_eq w "when" || str_eq w "in" then
+    (let _ = ind_mid s i w in lvt_assign_or_mlhs s i j w p)
   else lvt_assign_or_mlhs s i j w p
 // the name at [i, j) is about to be assigned (`x =`, `x op=`, `a, b =`)?
 and lvt_assign_or_mlhs = fn (s: str) -> fn (i: int) -> fn (j: int) -> fn (w: str) -> fn (p: int) ->
@@ -1724,6 +1896,7 @@ and lvt_brace_open = fn (s: str) -> fn (j: int) ->
 and lvt_lambda = fn (s: str) -> fn (j: int) ->
   let n = str_len s in
   let k = lvt_skip_sp s j in
+  let _ = ind_pend s (j - 2) 11 0 in
   let _ = lvt_kpush 4 (0 - 1) in
   let _ = lvt_push_frame 0 in
   if k < n && str_eq (char_at s k) "(" then lvt_param_names s (k + 1) (lvt_close s (k + 1))
@@ -1770,6 +1943,88 @@ and lvt_prev_local = fn (s: str) -> fn (i: int) ->
      else if b > 0 && (let c = char_at s (b - 1) in str_eq c "." || str_eq c ":" || str_eq c "@" || str_eq c "$") then false
      else lvt_is (substring s b (p + 1)))
   else false
+
+// ---- a name that is not a local YET is a method call -----------------------
+// ruby decides at parse time: `constants.each` in a block is a call even when
+// the method around it assigns `constants` further down (test_assignment's
+// test_massign_const_order). The table is filled as the lexer goes, so a name
+// it does not know here may still be assigned later in the same scope -- and
+// lex_go builds a token after lexing everything behind it, so by then that
+// assignment has been recorded. lvt_vcall_pre takes, for a bare name the
+// table does not know, the scopes it would be looked up in; lvt_vcall_tag
+// marks it (chr 2 in front: EVar answers it as a call) when one of them got
+// the name later.
+// (only up to a def / class / module scope: a name the lexer sees at the top
+//  of a file or an eval's code may be the binding's local, which the table
+//  never knew. And only for a name a method is called on -- `x.m`, `x&.m`:
+//  it is read there, never a target. A name standing alone was a target the
+//  table had missed -- `(a, b), c = …` records no b -- and the next
+//  statement's `a, (b, c) = …` recorded it, which made the first b a call.)
+and lvt_vcall_pre = fn (s: str) -> fn (i: int) -> fn (j: int) -> fn (w: str) ->
+  let n = str_len s in
+  let o0 = ord (char_at w 0) in
+  let l0 = ord (char_at w (str_len w - 1)) in
+  if (if o0 >= 97 && o0 <= 122 then false else o0 != 95) || l0 == 63 || l0 == 33 then Nil
+  else if o0 == 95 && str_len w > 1 && is_digit (char_at w 1) then Nil
+  else if str_eq w "it" || lvt_is_kw w || lvt_is w then Nil
+  else
+    let p = lvt_prev s (i - 1) in
+    let po = (if p >= 0 then ord (char_at s p) else 0) in
+    if po == 46 || po == 58 || po == 64 || po == 36 || po == 38 then Nil
+    else if p >= 2 && (let b = word_start s p in
+                       let pw = substring s b (p + 1) in
+                       str_eq pw "def" || str_eq pw "alias" || str_eq pw "undef") then Nil
+    else
+      let k = lvt_skip_sp s j in
+      let c = (if k < n then ord (char_at s k) else 10) in
+      let fits = (c == 46 && (k + 1 >= n || ord (char_at s (k + 1)) != 46))
+                 || (c == 38 && k + 1 < n && ord (char_at s (k + 1)) == 46) in
+      if (if fits then false else true) then Nil
+      else
+        // (the head of the answer is where the def / class begins)
+        let rec chain = fn (d: int) ->
+          (if d <= 0 then (Nil : int list)
+           else if lvt_vget lvt_fop d == 1 then
+             (if lvt_vget lvt_fsl d == n && lvt_vget lvt_fst d < i
+              then Cons (lvt_vget lvt_fst d, Cons (lvt_vget lvt_fid d, Nil)) else Nil)
+           else (match chain (d - 1) with
+                 | Cons (st, r) -> Cons (st, Cons (lvt_vget lvt_fid d, r))
+                 | Nil -> (Nil : int list))) in
+        chain (lvt_vget lvt_sv 0)
+// ...when the name was recorded after THIS statement ended: one recorded
+// before the next newline or `;` is a target of the same statement --
+// `(a, b), c = …` records a and b only once it reaches the `=` -- and one
+// recorded while lexing another source (an interpolation's code) is left as
+// it was.
+and lvt_vcall_tag = fn (s: str) -> fn (j: int) -> fn (pre: int list) -> fn (w: str) -> fn (t: str) ->
+  let rec ends = fn (k: int) -> fn (e: int) ->
+    (if k >= e then false
+     else (let o = ord (char_at s k) in o == 10 || o == 59 || ends (k + 1) e)) in
+  let rec later = fn (xs: int list) ->
+    (match xs with
+     | Nil -> false
+     | Cons (id, r) ->
+       (let k9 = str_of_int id ++ ":" ++ w in
+        (map_has lvt_names k9
+         && (let v9 = map_get lvt_names k9 in
+             let at9 = v9 / 1048576 in
+             v9 - at9 * 1048576 == str_len s && at9 > j && at9 <= str_len s && ends j at9))
+        || later r)) in
+  // ...and only when this is the name's first mention in its def / class:
+  // the table also misses locals -- a `=> e` at the end of a rescue list that
+  // runs over several lines -- and a later `rescue => e` recording it must
+  // not turn the `e` that list bound into a call. Any earlier spelling of
+  // the name, in any role, keeps it as it was.
+  let rec mentioned = fn (k: int) -> fn (e: int) ->
+    (let f = str_find_from s w k in
+     if f < 0 || f >= e then false
+     else if (f > 0 && (is_alnum (char_at s (f - 1)) || str_eq (char_at s (f - 1)) "_"))
+             || (f + str_len w < str_len s && (is_alnum (char_at s (f + str_len w)) || str_eq (char_at s (f + str_len w)) "_"))
+     then mentioned (f + 1) e
+     else true) in
+  match pre with
+  | Cons (st, ids) -> if later ids && (if mentioned st (j - str_len w) then false else true) then chr 2 ++ t else t
+  | Nil -> t
 
 // Does the raw double-quoted body s[i, e) spell a non-ASCII character with a
 // \u escape, in a file whose source encoding is not UTF-8? (A UTF-8 file's
@@ -3788,7 +4043,7 @@ let crlf_norm = fn (s: str) ->
      let _ = go 0 0 in
      strbuf_to_str b9)
   else s;
-let lex_src = fn (s0: str) -> let s = crlf_norm s0 in let _ = map_delete scv_mode "m" in let _ = map_set def_depth "n" 0 in let _ = map_delete syn_why "pk" in let _ = map_set stmt_nest "d" 0 in let _ = map_delete cond_quiet "q" in let _ = map_set afr_n "n" 0 in let _ = lvt_reset () in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in
+let lex_src = fn (s0: str) -> let s = crlf_norm s0 in let _ = map_delete scv_mode "m" in let _ = map_set def_depth "n" 0 in let _ = map_delete syn_why "pk" in let _ = map_set stmt_nest "d" 0 in let _ = map_delete cond_quiet "q" in let _ = map_set afr_n "n" 0 in let _ = lvt_reset () in let _ = map_delete ind_ctl "no" in let _ = lvt_vset lvt_sv 11 (str_len s) in let _ = hd_reset () in let _ = map_set lex_end 0 (0 - 1) in
   let _ = map_set tc_st "on" 1 in let _ = map_set tc_st "len" (str_len s) in let _ = map_set tc_st "prev" 0 in
   let _ = map_clear tc_off in
   let toks = lex_go s 0 in
