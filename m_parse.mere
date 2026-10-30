@@ -6344,6 +6344,35 @@ and brace_after_lit = fn (es: Expr list) -> fn toks ->
        (if str_eq m9 "__interp_str" || (str_eq m9 "to_sym" && cond_is_dstr (lit_untag x9)) then syn_refuse "unexpected '\{' after a method call without parenthesis" else ())
      | e9 -> if cond_is_dstr e9 then syn_refuse "unexpected '\{' after a method call without parenthesis" else ())
   | _ -> ()
+// what ruby will not open a singleton class on at parse time: a number, a
+// String (interpolated too), a Symbol, an Array, a Regexp, __FILE__ /
+// __LINE__ / __ENCODING__ -- or parenthesised statements ending in one
+// (nil, true, false, a Hash and a Range are not refused here)
+and sdef_lit = fn (e0: Expr) ->
+  let e = lit_untag e0 in
+  match e with
+  | EStmt (SBegin (bd9, Nil, Nil, Nil)) -> sdef_lit_last bd9
+  | EInt _ -> true
+  | EBig _ -> true
+  | ERat (_, _) -> true
+  | EImag _ -> true
+  | EImagF _ -> true
+  | EImagRat (_, _) -> true
+  | EFlt _ -> true
+  | EStrL _ -> true
+  | ESym _ -> true
+  | EArr _ -> true
+  | ERegex (_, _) -> true
+  | EVar n -> (str_len n >= 8 && (str_eq (substring n 0 8) "__FILE__" || str_eq (substring n 0 8) "__LINE__"))
+              || (str_len n >= 12 && str_eq (substring n 0 12) "__ENCODING__")
+  | EMethod (x, m, _) -> str_eq m "__regex" || str_eq m "__interp_str" || (str_eq m "to_sym" && cond_is_dstr x)
+  | EBin (_, _, _) -> cond_is_dstr e
+  | _ -> false
+and sdef_lit_last = fn (ss: Stmt list) ->
+  match ss with Nil -> false | Cons (SExpr x9, Nil) -> sdef_lit x9 | Cons (_, Nil) -> false | Cons (_, t9) -> sdef_lit_last t9
+and sdef_lit_refuse = fn toks ->
+  let _ = map_set syn_extra "fsl" "1" in
+  syn_refuse_at (tok_line toks) "cannot define singleton method for literals"
 and lit_untag = fn (e: Expr) ->
   match e with
   | EMethod (y, n9, Nil) when str_len n9 > 6 && str_eq (substring n9 0 6) "__lit_" -> lit_untag y
@@ -7916,6 +7945,8 @@ and parse_qualified_name = fn (acc: str) -> fn toks ->
 and mark_module = fn (s: Stmt) ->
   match s with
   | SClass (n, sup, body) -> if str_eq sup "" then SClass (n, "(module)", body) else s
+  // (the scope held in a temporary first: class_scoped_by)
+  | SBegin (Cons (SAssign (t9, e9), Cons (c9, Nil)), Nil, Nil, Nil) -> SBegin (Cons (SAssign (t9, e9), Cons (mark_module c9, Nil)), Nil, Nil, Nil)
   | _ -> s
 
 // (a new context for the "nodo" flag, as parse_begin is: `while class Foo;
@@ -7973,10 +8004,22 @@ and parse_class_go = fn toks ->
        | Cons (TId slf, r1) -> let (name, r) = parse_qualified_name slf r1 in parse_class_rest ("::" ++ name) r
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected class name after class" ++ parsing_file ()))) in fail ("mere-ruby: expected class name after class" ++ parsing_file ())))
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected class name after class" ++ parsing_file ()))) in fail ("mere-ruby: expected class name after class" ++ parsing_file ()))
+  // `class if c; A end::B ... end`, `module while ...; break A end::B`: the
+  // scope of the name is any primary value. The value goes in a temporary
+  // and the name is read under it, as `class x::B` with a local x is
+  | Cons (TId kw9, _) when str_eq kw9 "if" || str_eq kw9 "unless" || str_eq kw9 "while" || str_eq kw9 "until"
+                           || str_eq kw9 "case" || str_eq kw9 "begin" ->
+    (match parse_expr toks with
+     | (EScopedRead (sc9, nm9), r9) -> class_scoped_by sc9 nm9 r9
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected class name after class" ++ parsing_file ()))) in fail ("mere-ruby: expected class name after class" ++ parsing_file ())))
   | Cons (TId name0, r0) ->
     let (name, r) = parse_qualified_name name0 r0 in
     parse_class_rest name r
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected class name after class" ++ parsing_file ()))) in fail ("mere-ruby: expected class name after class" ++ parsing_file ()))
+and class_scoped_by = fn (sc: Expr) -> fn (nm: str) -> fn r ->
+  let tmp = fresh_tmp () in
+  let (st9, r2) = parse_class_rest (tmp ++ "::" ++ nm) r in
+  (SBegin (Cons (SAssign (tmp, sc), Cons (st9, Nil)), Nil, Nil, Nil), r2)
 
 and parse_class_body_tail = fn r2 ->
     let sv9 = pstmt_set 0 in
@@ -9338,7 +9381,13 @@ and parse_def = fn toks ->
   let toks = (match toks with Cons (TNL _, _) -> skip_nls toks | _ -> toks) in
   let sl9 = tok_line toks in
   let _ = (if map_has parser_flags "defend" then map_delete parser_flags "defend" else ()) in
-  let r = parse_def_inner toks in
+  let r0 = parse_def_inner toks in
+  // (a body with its own rescue starts at the def's line, quietly: that is
+  //  the line the method's frame shows from inside the clause -- resc_at)
+  let r = (match r0 with
+           | (SDef (dn9, ps9, ds9, Cons (SBegin (bd9, Cons (rc9, rs9), el9, en9), Nil)), rr9) when sl9 > 0 ->
+             (SDef (dn9, ps9, ds9, Cons (SLineQ sl9, Cons (SBegin (bd9, Cons (rc9, rs9), el9, en9), Nil))), rr9)
+           | _ -> r0) in
   let _ = if had then map_set parser_flags "nodo" VNil else () in
   // (where its `end` is -- the def's own line for an endless one)
   // (keyed by the bare name and the line: the file the parser names and the
@@ -9368,6 +9417,11 @@ and parse_def_inner = fn toks ->
   // what a singleton class can be opened on anyway.
   | Cons (TP lp0, r0) when is_lparen lp0 ->
     (let (recv_e, r1) = parse_expr r0 in
+     // (a literal there -- `def (1).foo`, `def ("a").foo`, `def ((x;[])).foo`
+     //  -- is prism's "cannot define singleton method for literals", a parse
+     //  error: it was a TypeError when the def ran, or a method defined on a
+     //  fresh String. syn_frame marks the literal, see "fsl")
+     let _ = (if sdef_lit recv_e then sdef_lit_refuse toks else ()) in
      match r1 with
      // ...and the name after the dot may be an OPERATOR: ruby/spec builds its
      // matchers as `def (@m = BasicObject.new).===(obj)`, which is a def, an
@@ -9457,6 +9511,9 @@ and parse_def_inner = fn toks ->
        | Cons (TId _, _) -> parse_bare_params r Nil Nil
        | _ -> (Nil, Nil, r)) in
     parse_def_tail name params defs r2
+  // (`def __FILE__.foo`: the pseudo-variables are literals too)
+  | Cons (TId w9, Cons (TP dot9, _)) when str_eq dot9 "." && (str_eq w9 "__FILE__" || str_eq w9 "__LINE__" || str_eq w9 "__ENCODING__") ->
+    (let _ = sdef_lit_refuse toks in parse_def_tail w9 Nil Nil toks)
   | Cons (TId name0, r0) ->
     // `def recv.name` — a singleton method. `def self.m` drops self. and
     // registers on the enclosing class/module; `def C.m` registers under
