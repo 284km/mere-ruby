@@ -27,6 +27,15 @@ Dir.mktmpdir do |dir|
     p e.path == File.join(dir, "begin_in_class.rb")
   end
 
+  # (...and one whose reason is the parser's own keeps it: `,` alone is an
+  # unexpected token)
+  File.write(File.join(dir, "comma.rb"), ",\n")
+  begin
+    require File.join(dir, "comma.rb")
+  rescue SyntaxError => e
+    p e.message.include?("unexpected")
+  end
+
   # An END block in a class body is the class body's for `return`.
   File.write(File.join(dir, "end_return.rb"), "class Y452; END {return if false}; end\n")
   begin
