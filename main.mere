@@ -2548,6 +2548,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                      | _ -> (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                   else (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
+    // (a call through super warns nothing of a block it is given)
+    let _ = map_set super_call_pend "v" 1 in
     let ext9 = (if is_sng_cls defcls then
                   (let a9 = lookup_anc world (anc_after_or_all (ancestors_of world defcls) defcls) meth in
                    if (if str_eq a9 "" then false else true) && map_has modules a9 then a9 else "")
@@ -15327,11 +15329,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // and the array's buffer takes the first element's -- so `[].inspect` and
     // `[1,2].inspect` are US-ASCII while `["a"].inspect` is UTF-8. mkstr alone
     // stamped UTF-8 on every one of them.
+    // (rb_inspect's encoding is default_internal's when there is one, else
+    //  default_external's: insp_resenc)
     (let txt = inspect_w env world recv in
-     let dext = (match (if map_has def_ext_enc "v" then map_get def_ext_enc "v" else VNil) with
-                 | VObj eo9 -> (if map_has enc_name (str_of_int eo9)
-                                then map_get enc_name (str_of_int eo9) else "UTF-8")
-                 | _ -> "UTF-8") in
+     let dext = insp_resenc () in
      let strish = fn (v: Val) -> (match v with VStr _ -> true | VSym _ -> true | _ -> false) in
      let rec any_str = fn (ys: Val list) ->
        (match ys with Nil -> false | Cons (h, t) -> strish h || any_str t) in
@@ -25883,11 +25884,22 @@ and rx_chain_leaves = fn (e: Expr) -> fn (lenc: str) -> fn (acc: (Expr * str) li
     rx_chain_leaves x lenc acc
   | EMethod (x, m, Nil) when str_len m > 11 && str_eq (substring m 0 11) "__lit_denc~" && rx_is_chain x ->
     rx_chain_leaves x (substring m 11 (str_len m)) acc
-  | EMethod (_, m, Nil) when str_eq m "__interp_str" -> Cons ((e, "C"), acc)
+  // (an interpolated string LITERAL, `#{"\u1234"}`, is folded into the
+  //  source by ruby's compiler: "S", whose clash is a concatenation's)
+  | EMethod (x, m, Nil) when str_eq m "__interp_str" -> Cons ((e, (if rx_lit_str x then "S" else "C")), acc)
   | _ -> Cons ((e, (if rx_lit_leaf e then "L" ++ lenc else "C")), acc)
 // a literal piece: a string literal, in any of the parse's markers
 // (`__lit_enc~`, `__lit_fsl~` -- a `# frozen_string_literal:` file wraps
 // every literal, and the piece was read as an interpolation)
+// ...or a string literal however the parse wrote it: `"a" + "b"` pieces, a
+// \u one under its UTF-8 tag (`(s "" + "..." )u8`)
+and rx_lit_str = fn (e: Expr) ->
+  match e with
+  | EBin (op, a, b) -> str_eq op "+" && rx_lit_str a && rx_lit_str b
+  // (a regexp's piece passes through __rx_frag on its way in: rx_escape_dq)
+  | EMethod (x, m, Nil) when str_eq m "__rx_frag" -> rx_lit_str x
+  | EMethod (x, m, Nil) -> str_len m > 6 && str_eq (substring m 0 6) "__lit_" && rx_lit_str x
+  | _ -> rx_lit_leaf e
 and rx_lit_leaf = fn (e: Expr) ->
   match e with
   | EStrL _ -> true
@@ -25899,7 +25911,10 @@ and rx_lit_leaf = fn (e: Expr) ->
 and rx_dregexp = fn world -> fn (vals: (Val * str) list) -> fn (fl: str) ->
   let flenc = (if str_contains fl "u" then "UTF-8" else if str_contains fl "e" then "EUC-JP"
                else if str_contains fl "s" then "Windows-31J" else "") in
-  let rec go = fn (xs: (Val * str) list) -> fn (acc: str) -> fn (fix: str) -> fn (first: str) ->
+  // (fixlit: the fixing piece was an interpolated string LITERAL. Two of
+  //  those that disagree are ruby's string concatenation error, made when
+  //  it folds them: "incompatible character encodings")
+  let rec go = fn (xs: (Val * str) list) -> fn (acc: str) -> fn (fix: str) -> fn (first: str) -> fn (fixlit: bool) ->
     (match xs with
      | Nil -> (let _ = (if str_eq fix "" then map_delete rx_dre_enc "e" else map_set rx_dre_enc "e" fix) in
                mkstr_e acc (if str_eq fix "" then first else fix))
@@ -25921,9 +25936,12 @@ and rx_dregexp = fn world -> fn (vals: (Val * str) list) -> fn (fl: str) ->
         let f9 = (let f8 = rx_frag_fixed b9 src9 in if str_eq f8 "US-ASCII" then "" else f8) in
         let fix2 = (if str_eq f9 "" then fix
                     else if str_eq fix "" || str_eq fix f9 then f9
+                    else if fixlit && str_eq k9 "S" then
+                      (let _ = raise_exc world "Encoding::CompatibilityError" ("incompatible character encodings: " ++ fix ++ " and " ++ f9) in fix)
                     else (let _ = raise_exc world "RegexpError" ("encoding mismatch in dynamic regexp : " ++ fix ++ " and " ++ f9) in fix)) in
-        go t9 (acc ++ b9) fix2 (if str_eq first "" then src0 else first))) in
-  go vals "" "" ""
+        let fixlit2 = (if str_eq f9 "" || (if str_eq fix "" then false else true) then fixlit else str_eq k9 "S") in
+        go t9 (acc ++ b9) fix2 (if str_eq first "" then src0 else first) fixlit2)) in
+  go vals "" "" "" false
 // is the eval'd source UTF-8 (its magic comment, else its own label)? Only
 // there must a symbol be valid UTF-8: a Shift_JIS source's `{\x87]: 1}` is
 // a Windows-31J symbol
@@ -43957,12 +43975,28 @@ and gl2_help = fn g -> fn (path: str) -> fn (blen: int) -> fn (sep9: bool) -> fn
                     else split qt same other)
                  | Cons (_, qt) -> split qt same other) in
               let (same, other) = split pt Nil Nil in
-              let buf = gl2_join path sep9 name in
+              let buf = gl2_join path sep9 (gl2_real_case g path name) in
               sappend (gl2_help g buf blen true "?" (Cons (r, same)) fl) (plains other))
            else plains pt)
         | Cons (_, pt) -> plains pt) in
      sappend here (plains pats))
   else here
+// a name written without magic is answered as the filesystem spells it
+// where names are case-insensitive (macOS): `Dir.glob("filewithcases")`
+// finds "FileWithCases", as ruby's replace_real_basename makes it
+and gl2_real_case = fn g -> fn (path: str) -> fn (name: str) ->
+  if (if str_eq (sys_os ()) "darwin" then false else true) || str_eq name "." || str_eq name ".." then name
+  else
+    (let _ = gl2_list g path 1 in
+     let ks = gl2_kids g path in
+     if str_list_has ks name then name
+     else
+       (let lo = str_downcase_ascii name in
+        let rec find = fn (xs: str list) ->
+          (match xs with
+           | Nil -> name
+           | Cons (k, t) -> (if str_eq (str_downcase_ascii k) lo then k else find t)) in
+        find ks))
 and gl2_pappend = fn (a: ((str * str) list) list) -> fn (b: ((str * str) list) list) ->
   (match a with Nil -> b | Cons (h, t) -> Cons (h, gl2_pappend t b))
 and gl2_prev = fn (a: ((str * str) list) list) ->
@@ -53793,6 +53827,9 @@ and unused_blk_warn = fn world -> fn (key: str) -> fn (defcls: str) -> fn (name:
           && (if str_eq (block_param_name params) "" then true else false)
           && map_has meth_src key
           && (if ub_stmts body then false else true)
+          // (ruby says nothing when some method of the same name does use
+          //  a block: the call may be duck typing -- ub_name_used)
+          && (if ub_name_used world name then false else true)
   then
     (let _ = map_set unused_blk_seen seen9 1 in
      let shown = (if str_eq defcls "" then "Object#" ++ name
@@ -53810,6 +53847,23 @@ and unused_blk_warn = fn world -> fn (key: str) -> fn (defcls: str) -> fn (name:
 // does a method body use its block: a `yield` or a `super` anywhere in it
 // (blocks included, nested defs not). A form this does not know counts as a
 // use, so the warning above is never said for a method it cannot read.
+and ub_name_used = fn world -> fn (name: str) ->
+  let (meths9, _, _, _) = world in
+  let hit9 = map_new () in
+  let suf9 = "#" ++ name in
+  let _ = map_iter meths9 (fn (k: str) -> fn (m: Meth) ->
+            // (the prelude's are ruby's C methods, which say nothing here)
+            if map_has hit9 "y" || map_has meth_cfn k then ()
+            else if str_eq k name || (str_len k > str_len suf9 && str_eq (substring k (str_len k - str_len suf9) (str_len k)) suf9) then
+              (match m with
+               | Meth (ps9, _, b9) -> (if (if str_eq (block_param_name ps9) "" then false else true) || ub_stmts b9 then map_set hit9 "y" 1 else ()))
+            else ()) in
+  map_has hit9 "y"
+and super_drops_block = fn (args: Expr list) ->
+  match args with
+  | Nil -> false
+  | Cons (EBlockPass ENil, _) -> true
+  | Cons (_, t) -> super_drops_block t
 and ub_stmts = fn (ss: Stmt list) ->
   match ss with
   | Nil -> false
@@ -53849,8 +53903,10 @@ and ub_exprs = fn (es: Expr list) ->
 and ub_expr = fn (e: Expr) ->
   match e with
   | EYield _ -> true
-  | ESuper (_, _) -> true
-  | ESuperB (_, _, _, _) -> true
+  // (a super passes the method's block on -- unless `&nil` takes it away,
+  //  or a block of its own replaces it, whose body may still yield)
+  | ESuper (_, args) -> (if super_drops_block args then false else true)
+  | ESuperB (_, _, _, bb) -> ub_stmts bb
   | EInt _ -> false
   | EBig _ -> false
   | EFlt _ -> false
