@@ -42092,7 +42092,17 @@ and tp_fire_builtin = fn world -> fn (recv: Val) -> fn (name: str) -> fn (is_ret
   // (a Struct class's `new` is its own singleton's, not Struct.new)
   else if str_eq src9 "new" && tp_struct_cls world recv then
     tp_fire_owned_c world (match recv with VClass c9 -> "(sng:" ++ c9 ++ ")" | _ -> "Class") src9 is_ret rv recv name
-  else tp_fire_owned_c world (substring lbl 0 (tp_hash_at lbl 0)) src9 is_ret rv recv name
+  else (let own9 = substring lbl 0 (tp_hash_at lbl 0) in
+        tp_fire_owned_c world own9 (tp_c_alias own9 src9) is_ret rv recv name)
+// the name a C alias of a builtin reports as its method_id (rb_define_alias:
+// `q << x` is Thread::Queue#push called as <<)
+and tp_c_alias = fn (own: str) -> fn (n: str) ->
+  if str_eq own "Thread::Queue" || str_eq own "Thread::SizedQueue" then
+    (if str_eq n "<<" || str_eq n "enq" then "push"
+     else if str_eq n "deq" || str_eq n "shift" then "pop"
+     else if str_eq n "size" && str_eq own "Thread::Queue" then "length"
+     else n)
+  else n
 // `X.new(...)` with no block is ruby 4.0's opt_new when it reaches Class#new:
 // the object is allocated and #initialize called with no :c_call of `new`
 // (String.new, Array.new, Data's are their own and still are) -- unless
@@ -47652,6 +47662,10 @@ and fb_new = fn world -> fn (c: str) -> fn newblk -> fn (args: Val list) ->
 // ---- a fiber's body, on its own coroutine --------------------------------------
 // Runs when the resumer first switches to the fiber (fb_run_body in
 // m_fiber_coro.mere), so the resumer is suspended below it.
+// a TracePoint's :fiber_switch, on the side the thread arrives at: a fiber's
+// first moment, and each resume / yield / transfer coming back
+and fb_tp_switch = fn world ->
+  if map_len hook_flags > 0 && map_has hook_flags "tp" then (let _ = fire_tp_v world "fiber_switch" "" "" VNil VMain in ()) else ()
 and fb_thread_main = fn (i: int) ->
   let world = fb_world () in
   let _ = fb_ctx_fresh i in
@@ -47664,6 +47678,7 @@ and fb_thread_main = fn (i: int) ->
               | VNil -> (Nil : Val list)
               | v -> Cons (v, Nil)) in
   let _ = (if map_has fb_xfer "v" then map_delete fb_xfer "v" else ()) in
+  let _ = fb_tp_switch world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let r = (match fb_iv world oid "@__fb_blk" with
            | VProc pid ->
@@ -47742,6 +47757,9 @@ and fb_raise_carried = fn world ->
   let _ = fb_restore_k (0 - 1) "iv" iv "$exc" in
   let _ = fb_overlay_sv (0 - 1) "pm" prim_missing in
   let _ = fb_overlay_sv (0 - 1) "bt" raise_bt in
+  // (raised again on this side, as ruby's rb_fiber_resume does: a :raise
+  //  tracepoint sees it a second time, in the fiber that resumed)
+  let _ = (if map_len hook_flags > 0 && map_has hook_flags "tp" && map_has iv "$exc" then tp_raise world (map_get iv "$exc") else ()) in
   let m = "mere-ruby: (ruby exception raised)" in
   let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in
   (let _ = fail m in VNil)
@@ -47805,7 +47823,12 @@ and fb_resume = fn world -> fn (recv: Val) -> fn (args: Val list) -> fn (xfer: b
 and fb_enter = fn world -> fn (t: int) -> fn (args: Val list) -> fn (xfer: bool) -> fn (kind: int) ->
   let me = fb_cur () in
   let st = fb_state_of t in
-  let _ = (if xfer
+  // (a transfer does not change where the target returns to: a fiber that
+  //  was resumed and then transferred away is resumed still when it is
+  //  transferred back to, and its Fiber.yield goes to its resumer -- ruby's
+  //  fiber_switch sets prev only for a resume)
+  let _ = (if xfer && map_has fb_parent t && (if map_has fb_xferd t then false else true) then ()
+           else if xfer
            then (let _ = map_set fb_xferd t 1 in
                  map_set fb_ret t (if map_has fb_xferd me then fb_return_target me else me))
            else (let _ = (if map_has fb_xferd t then map_delete fb_xferd t else ()) in
@@ -47853,6 +47876,7 @@ and fb_enter = fn world -> fn (t: int) -> fn (args: Val list) -> fn (xfer: bool)
   let _ = fb_switch me t in
   let _ = map_set fb_state me 1 in
   let _ = (if map_has fb_sus_x me then map_delete fb_sus_x me else ()) in
+  let _ = fb_tp_switch world in
   fb_after_wake world
 and fb_yield = fn world -> fn (args: Val list) ->
   let _ = fb_boot () in
@@ -47868,6 +47892,7 @@ and fb_yield = fn world -> fn (args: Val list) ->
      let _ = map_set fb_xk "k" 0 in
      let _ = fb_switch me p in
      let _ = map_set fb_state me 1 in
+     let _ = fb_tp_switch world in
      fb_after_wake world)
 and fb_raise = fn world -> fn (recv: Val) -> fn (args: Val list) ->
   let _ = fb_boot () in
@@ -50387,7 +50412,11 @@ and bo_ensure = fn (u: unit) ->
 and bo_walk = fn (anc: str list) -> fn (name: str) ->
   match anc with
   | Nil -> ""
-  | Cons (a, rest) ->
+  | Cons (a0, rest) ->
+    // (the thread primitives are kept under their short names here and are
+    //  Thread::'s in ruby, as the rows have them)
+    let a = (if str_eq a0 "Queue" || str_eq a0 "SizedQueue" || str_eq a0 "Mutex" || str_eq a0 "ConditionVariable"
+             then "Thread::" ++ a0 else a0) in
     if str_len a > 6 && str_eq (substring a 0 5) "(sng:" then
       (if map_has bi_owner_set (substring a 5 (str_len a - 1) ++ "." ++ name) then a ++ "#" ++ name
        else bo_walk rest name)
