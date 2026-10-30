@@ -26012,6 +26012,9 @@ and cb_ret_stmt = fn (s: Stmt) ->
   // (a statement that declares a local -- `e = no_method_error()` in a
   //  begin -- comes wrapped)
   | SLocalFrom (_, s2) -> cb_ret_stmt s2
+  // (an END block's body is the class body's too: `class X; END {return};
+  //  end` is the same error)
+  | SAtExit (_, bd) -> cb_ret_stmts bd
   | _ -> false
 and cb_ret_clauses = fn (cls: (Expr * Stmt list) list) ->
   match cls with Nil -> false | Cons ((c, b), r) -> cb_ret_expr c || cb_ret_stmts b || cb_ret_clauses r
@@ -47262,6 +47265,9 @@ and sch_backtrace = fn (t: int) ->
 and blk_frame_on_stack = fn (d: int) ->
   if d < 0 then false
   else if map_has call_names_s d && str_eq (map_get call_names_s d) blk_frame_mark then true
+  // (a required or loaded file is a top level of its own: a block of its
+  //  requirer's below it is not one the file's code is in)
+  else if map_has call_names_s d && str_eq (map_get call_names_s d) "<top (required)>" then false
   else blk_frame_on_stack (d - 1)
 // frame_label_at for a stack that is not the running one: its base is its own
 and sch_frame_label = fn (i: int) -> fn (base: int) ->
@@ -51902,6 +51908,40 @@ and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (la
         (0, 2, lastv))
      | _ -> (0, 2, lastv))
 
+// a program's statements without its top-level BEGIN blocks (run_pre_f ran them)
+and req_nopre = fn (ss: Stmt list) ->
+  match ss with
+  | Nil -> (Nil : Stmt list)
+  | Cons (SPreexe _, t) -> req_nopre t
+  | Cons (s9, t) -> Cons (s9, req_nopre t)
+// The message of a required file's SyntaxError, as ruby's carries it:
+// "<path>:<line>: syntax error found" and prism's frame -- what eval's
+// SyntaxError says for the same source, asked of a parse-only eval (cli_opt
+// "evpo", as the main script's report is). What it cannot say keeps the
+// parser's own words, without the interpreter's prefix.
+and req_syntax_framed = fn env -> fn world -> fn (path: str) -> fn (src: str) -> fn (dflt0: str) ->
+  let dflt = (if str_len dflt0 > 19 && str_eq (substring dflt0 0 19) "mere-ruby: syntax: " then substring dflt0 19 (str_len dflt0)
+              else if str_len dflt0 > 11 && str_eq (substring dflt0 0 11) "mere-ruby: " then substring dflt0 11 (str_len dflt0)
+              else dflt0) in
+  let (_, _, _, iv9) = world in
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let sx9 = (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil) in
+  let spm9 = (if map_has prim_missing "i" then map_get prim_missing "i" else VNil) in
+  let sbt9 = (if map_has raise_bt "v" then map_get raise_bt "v" else VNil) in
+  let _ = map_set cli_opt "evpo" "y" in
+  let ok9 = try_or (fn (u: unit) -> (let _ = invoke_val_c env world nb9 VMain "eval" (Cons (mkstr src, Cons (VNil, Cons (mkstr path, Cons (VInt 1, Nil))))) false in true)) false in
+  let _ = map_delete cli_opt "evpo" in
+  let m9 = (if ok9 then ""
+            else (match (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil) with
+                  | VNil -> ""
+                  | e9 -> (match try_or (fn (u: unit) -> invoke_val_c env world nb9 e9 "message" Nil false) VNil with
+                           | VStr h9 -> sget h9
+                           | _ -> ""))) in
+  let _ = (match sx9 with VNil -> (if map_has iv9 "$exc" then map_delete iv9 "$exc" else ()) | _ -> map_set iv9 "$exc" sx9) in
+  let _ = (match spm9 with VNil -> (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) | _ -> map_set prim_missing "i" spm9) in
+  // (the backtrace the asking eval's raise left is not the require's)
+  let _ = (match sbt9 with VNil -> (if map_has raise_bt "v" then map_delete raise_bt "v" else ()) | _ -> map_set raise_bt "v" sbt9) in
+  if str_eq m9 "" then dflt else m9
 and hoist_run = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
   // (a `return` in an eval's BEGIN leaves the method the eval is in, with
   //  nothing after it run -- test_return_in_BEGIN_in_eval)
@@ -52290,8 +52330,8 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let _ = if map_has pok "y" then () else
                  (let _ = (if map_has prim_missing "f" then () else map_set prim_missing "f" (mkstr full)) in
                   let _ = unmark9 () in
-                  let _ = raise_exc_iv world "SyntaxError"
-                            (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "syntax error") else "syntax error")
+                  let m0 = (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "syntax error") else "syntax error") in
+                  let _ = raise_exc_iv world "SyntaxError" (req_syntax_framed env world full src m0)
                             (Cons (("__path", mkstr full), Nil)) in ()) in
        let _ = rx_check_pending () in
      let _ = warn_flush world in
@@ -52334,7 +52374,13 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        // (and no refinement: the file is its own scope, see rb_load)
        let rfprev9 = ref_cur_id () in
        let _ = ref_install 0 in
-       let f = in_scope_frame "<top (required)>" fenv (fn (u: unit) -> run_stmts fenv world noblk2 prog2) in
+       // (a BEGIN at the file's top level runs first, as load's and the main
+       //  script's do -- it is no nested BEGIN -- and a `return` in it ends
+       //  the file there)
+       let f = in_scope_frame "<top (required)>" fenv (fn (u: unit) ->
+                 (match run_pre_f fenv world noblk2 prog2 with
+                  | FReturn _ -> FNext VNil
+                  | _ -> run_stmts fenv world noblk2 (req_nopre prog2))) in
        let _ = ref_install rfprev9 in
        let _ = set_lex (pack_cref savedlex) in
        let _ = set_nest (pack_nest savedlex) in
@@ -54455,7 +54501,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
           // answered nil for the file the caller had just named.
           raise_exc_iv world "SyntaxError" msg
             (Cons (("__path", (if str_eq efile9 "" then VNil else mkstr efile9)), Nil)))
-       else if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (invalid_flow_word_in_defs prog2)
+       else if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (eval_flow_msg code efile9 eline9 (invalid_flow_word_in_defs prog2))
        else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
        else if (if str_eq (static_why_stmts prog2 false) "" then false else true) then
          raise_exc world "SyntaxError" (syn_static_msg code efile9 eline9 (static_why_stmts prog2 false))
@@ -54467,7 +54513,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if map_has cli_opt "evpo" then VNil
        else eval_run_at eenv world blk prog2 efile9 eline9
      | _ ->
-       if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (invalid_flow_word_in_defs prog2)
+       if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (eval_flow_msg code efile9 eline9 (invalid_flow_word_in_defs prog2))
        else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
        else if (if str_eq (static_why_stmts prog2 false) "" then false else true) then
          raise_exc world "SyntaxError" (syn_static_msg code efile9 eline9 (static_why_stmts prog2 false))
@@ -54505,6 +54551,10 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
 // no heredoc is prism's own "unexpected <<".
 // A refusal the static checks make, as prism words and frames it where the
 // place can be found: `class xxx` marks the name (note 445).
+// a jump the walk found inside a def or a class body: a class body's return
+// is the framed report (syn_static_msg); the others keep their bare words
+and eval_flow_msg = fn (code: str) -> fn (efile9: str) -> fn (eline9: int) -> fn (why: str) ->
+  if str_eq why "Invalid return in class/module body" then syn_static_msg code efile9 eline9 why else why
 and syn_static_msg = fn (code: str) -> fn (efile9: str) -> fn (eline9: int) -> fn (why: str) ->
   let fl9 = (if str_eq efile9 "" then "(eval)" else efile9) in
   if str_eq why "class/module name must be CONSTANT" && map_has syn_junk_name "c" then
@@ -54523,6 +54573,26 @@ and syn_static_msg = fn (code: str) -> fn (efile9: str) -> fn (eline9: int) -> f
         let _ = map_set syn_why_ln "w" (str_len n9) in
         fl9 ++ ":" ++ str_of_int (k9 + eline9) ++ ": "
         ++ syn_frame code k9 (k9 + eline9) ("unexpected constant path after `" ++ (if str_find_from code ("class " ++ n9) 0 >= 0 then "class" else "module") ++ "`; class/module name must be CONSTANT")))
+  // (a class body's `return` is marked at the word, in prism's frame -- the
+  //  first `return` that is a word of its own; one in a def before it would
+  //  be marked instead, which this does not tell apart)
+  else if str_eq why "Invalid return in class/module body" then
+    (let idc = fn (c: str) -> (let o = ord c in (o >= 48 && o <= 57) || (o >= 65 && o <= 90) || (o >= 97 && o <= 122) || o == 95 || o >= 128) in
+     let rec find = fn (i: int) ->
+       (let a9 = str_find_from code "return" i in
+        if a9 < 0 then a9
+        else if (a9 > 0 && idc (char_at code (a9 - 1))) || (a9 + 6 < str_len code && (idc (char_at code (a9 + 6)) || str_eq (char_at code (a9 + 6)) "?" || str_eq (char_at code (a9 + 6)) "!"))
+        then find (a9 + 6) else a9) in
+     let at9 = find 0 in
+     if at9 < 0 then fl9 ++ ":" ++ str_of_int eline9 ++ ": " ++ why
+     else
+       (let rec bol = fn (i: int) -> (if i <= 0 then 0 else if str_eq (char_at code (i - 1)) "\n" then i else bol (i - 1)) in
+        let b9 = bol at9 in
+        let rec nlc = fn (i: int) -> fn (k: int) -> (if i >= b9 then k else nlc (i + 1) (if str_eq (char_at code i) "\n" then k + 1 else k)) in
+        let k9 = nlc 0 0 in
+        let _ = map_set syn_why_ln "c" (at9 - b9) in
+        let _ = map_set syn_why_ln "w" 6 in
+        fl9 ++ ":" ++ str_of_int (k9 + eline9) ++ ": " ++ syn_frame code k9 (k9 + eline9) why))
   else fl9 ++ ":" ++ str_of_int eline9 ++ ": " ++ why
 and syn_junk_after = fn toks ->
   match toks with
@@ -54835,12 +54905,21 @@ and while_body_flow = fn env -> fn world -> fn blk -> fn (body: Stmt list) ->
 // flow signal (throw/break/next/return) so `defined?(throw(:x).foo)` performs
 // the throw normally instead of swallowing it.
 and defined_eval_recv = fn env -> fn world -> fn blk -> fn (recv: Expr) ->
+  let (_, _, _, iv9) = world in
+  let sx9 = (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil) in
+  let spm9 = (if map_has prim_missing "i" then map_get prim_missing "i" else VNil) in
   let rv = try_or (fn (u: unit) -> eval_e env world blk recv) (VSym "__mere_defined_fail__") in
   // a pending flow signal (flow_sig still holds "k") means the receiver did a
   // throw/break/next; re-fail so it propagates instead of being swallowed.
   if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) && map_has flow_sig "k"
   then (let m = "mere-ruby: (unhandled flow signal inside defined?)" in
         let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
+  // (an exception it swallowed is no exception any more: what it left
+  //  behind was reported with the next real one, at exit)
+  else if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) then
+    (let _ = (match sx9 with VNil -> (if map_has iv9 "$exc" then map_delete iv9 "$exc" else ()) | _ -> map_set iv9 "$exc" sx9) in
+     let _ = (match spm9 with VNil -> (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) | _ -> map_set prim_missing "i" spm9) in
+     rv)
   else rv
 
 // a break unwinding to a specific method frame (its block's home). The nearest
