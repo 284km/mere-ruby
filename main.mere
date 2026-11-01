@@ -4205,6 +4205,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
            (Cons (VSym op, Cons (eval_e env world blk b, Nil)))
        else raise_exc_iv world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ for_recv_cls world (dispatch_cls_of world va0))
         (Cons (("__name", VSym op), Cons (("__recv", va0), Nil))))
+    // ⚠ THE RIGHT SIDE ONCE. Several `==` / `!=` arms below ask the right
+    //   operand in their condition and again in their body, and the next arm
+    //   asks it again when a condition says no: `i.chr != y.shift` shifted
+    //   twice and compared with the wrong element (test_stringchar's
+    //   test_char). An operand with effects is evaluated here, and the
+    //   comparison is run over two temporaries, which read twice harmlessly.
+    else if (str_eq op "==" || str_eq op "!=") && ebin_rhs_effects b then
+      (let bv9 = eval_e env world blk b in
+       let e2 = lv_flat_pooled env in
+       let _ = map_set e2 "__opa" va0 in
+       let _ = map_set e2 "__opb" bv9 in
+       let r9 = eval_e e2 world blk (EBin (op, EVar "__opa", EVar "__opb")) in
+       let _ = scratch_env_done e2 in
+       r9)
     else
     // ⚠ TWO INTEGERS AND A PLAIN OPERATOR, before even the chain of operator
     //   names below (`<<`, `==`, `!=` ...): `i < n` and `i += 1` paid a dozen
@@ -4575,6 +4589,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
 // are Integer's operators (and Comparable's, which it includes) still the
 // builtins? Asked of has_meth once per method-table generation (mro_now
 // moves on every write to a method table), and never under a refinement
+// can evaluating this operand do anything but read? (ebin's once-only rule)
+// the ASCII-compatible encodings in which every byte is one character
+// (ruby 4.0.9's table, read by asking each for 0x80..0xFF)
+and chr_single_byte_encs = fn (u: unit) -> str_split "ASCII-8BIT ISO-8859-1 ISO-8859-2 ISO-8859-3 ISO-8859-4 ISO-8859-5 ISO-8859-6 ISO-8859-7 ISO-8859-8 ISO-8859-9 ISO-8859-10 ISO-8859-11 ISO-8859-13 ISO-8859-14 ISO-8859-15 ISO-8859-16 KOI8-R KOI8-U Windows-1250 Windows-1251 Windows-1252 Windows-1253 Windows-1254 Windows-1257 IBM437 IBM720 IBM737 IBM775 CP850 IBM852 CP852 IBM855 CP855 IBM857 IBM860 IBM861 IBM862 IBM863 IBM864 IBM865 IBM866 IBM869 Windows-1258 GB1988 macCentEuro macCroatian macCyrillic macGreek macIceland macRoman macRomania macThai macTurkish macUkraine Windows-1256 Windows-1255 TIS-620 Windows-874" " "
+and ebin_rhs_effects = fn (e: Expr) ->
+  match e with
+  | EVar _ -> false | EInt _ -> false | EFlt _ -> false | EStrL _ -> false
+  | EBool _ -> false | ENil -> false | ESym _ -> false | ESelf -> false
+  | EConst _ -> false | EIVar _ -> false
+  | _ -> true
 and bin_blt_alias_recv = fn (v: Val) ->
   match v with
   | VClass _ -> false
@@ -30327,6 +30351,16 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                        | Nil -> (Nil : int list)
                        | Cons (c9, t9) ->
                          if c9 > 0 - 10 then Cons (c9, und2 t9)
+                         // (0x8E and a byte past the katakana, from an EUC-JP
+                         //  of the CP51932 kind into CP50220/CP50221: carried
+                         //  through as that byte, marked past Unicode for the
+                         //  encoder -- ruby's direct converter does so)
+                         else if (str_eq (enc_up to) "CP50220" || str_eq (enc_up to) "CP50221")
+                                 && (str_eq (enc_up from) "CP51932" || str_eq (enc_up from) "EUC-JP" || str_eq (enc_up from) "EUCJP-MS")
+                                 && (let off8 = 0 - c9 - 10 in
+                                     off8 + 1 < str_len (sget h) && ord (char_at (sget h) off8) == 142
+                                     && ord (char_at (sget h) (off8 + 1)) >= 224 && ord (char_at (sget h) (off8 + 1)) <= 254) then
+                           Cons (1114112 + ord (char_at (sget h) (0 - c9 - 10 + 1)), und2 t9)
                          else if und_rep then
                            (let rec app9 = fn (r9: int list) ->
                               (match r9 with Nil -> und2 t9 | Cons (x9, rt9) -> Cons (x9, app9 rt9)) in
@@ -34934,7 +34968,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // negative number is out of char range, and so is one past the largest
         // codepoint Unicode defines.
         else if n < 0 || n > 1114111 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
-        else prim_raise "NotImplementedError" ("Integer#chr in " ++ given ++ " is not implemented here"))
+        // (the encodings with no model here are ASCII-compatible: below 0x80 a
+        //  number is its byte. A SINGLE-BYTE one -- every byte a character, as
+        //  ruby's table lists them -- takes the rest of a byte too, and is out
+        //  of char range past it; in the multibyte ones ruby names no single
+        //  byte past ASCII, "invalid codepoint" -- test_stringchar's test_dump)
+        else if n < 128 || (str_list_has (chr_single_byte_encs ()) given && n < 256) then
+          (let r = mkstr (chr n) in (match r with VStr rid -> (let _ = senc_set rid given in r) | _ -> r))
+        else if str_list_has (chr_single_byte_encs ()) given then prim_raise "RangeError" (str_of_int n ++ " out of char range")
+        else prim_raise "RangeError" ("invalid codepoint 0x" ++ str_upcase (int_to_base n 16) ++ " in " ++ given))
      // (the first character of the receiver's encoding, tagged with it)
      | VStr svh -> let sv = sget svh in let e9 = senc_get svh in
        (let c9 = (if enc_cut e9 == 1 then utf8_char sv 0 else substring sv 0 (es_boff sv e9 1)) in
@@ -57935,6 +57977,8 @@ and rxv_search_e = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: in
     (let _ = (if vec_get cut_k 0 == 1 then () else cut_set "UTF-8") in
      rxv_search pat fl s start)
 and rx_do_match_atp = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) -> fn (bst: int) -> fn (enc: str) -> fn (wantpos: bool) ->
+  // (the subject's encoding, for a property class: uprop_char_cp)
+  let _ = (if vec_len uprop_enc == 0 then vec_push uprop_enc (enc_canon_name enc) else vec_set uprop_enc 0 (enc_canon_name enc)) in
   match rxv_search_e pat fl sv bst enc with
   | RBadPat ->
     // the legacy engine takes no offset, so a pattern the new one refuses
