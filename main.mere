@@ -2952,7 +2952,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       let id = (handle_base + map_len bind_store) in
       // (a frame of its own over the snapshot: what is defined THROUGH the
       // binding is listed first and a #dup shares the rest -- see Binding#dup)
-      let _ = map_set bind_store (str_of_int id) (lv_child (bnd_capture env)) in
+      let _ = map_set bind_store (str_of_int id) (bnd_live env) in
       // where it was made, for #source_location
       let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
       VBind id
@@ -3132,7 +3132,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // as a first-class Binding, unless the user redefined `binding`.
     else if (str_len name == 7 && str_eq name "binding") && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = (handle_base + map_len bind_store) in
-      let _ = map_set bind_store (str_of_int id) (lv_child (bnd_capture env)) in
+      let _ = map_set bind_store (str_of_int id) (bnd_live env) in
       let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
       VBind id
     // eval "code" re-enters the interpreter. With a Binding 2nd arg it runs
@@ -3326,6 +3326,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // "1\n2" printed beside it, which is every failure message test/unit builds.
     else if ((str_len name == 1 && str_eq name "p") || (str_len name == 2 && str_eq name "pp"))
             && (if kernel_overridden env world name then false else true) then
+      let _ = (if map_has hook_flags "tp" then p_tp_inspects env world args else ()) in
       let _ = p_print_w env world args in
       (match args with Nil -> VNil | Cons (v, Nil) -> v | _ -> arr_new args)
     // Kernel#print: write each arg's to_s (no separators, no newline).
@@ -5841,6 +5842,22 @@ and const_added_hook = fn world -> fn (key: str) ->
 // the two events of a C hook (method_added, const_added, inherited) that
 // nothing overrides, as ruby makes them around the builtin's empty body
 and tp_c_hook = fn world -> fn (hook: str) -> fn (owner: str) -> tp_c_hook_in world hook owner ""
+// Kernel#p calls each argument's #inspect, a C method a TracePoint sees: an
+// Integer's and a Float's is #to_s under another name, so the event's
+// method_id is :to_s (test_settracefunc's test_recursive, Bug #9940). An
+// object with its own #inspect runs Ruby code, whose :call the call makes.
+and p_tp_inspects = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> ()
+  | Cons (v, t) ->
+    (let num9 = (match v with VInt _ -> true | VBig _ -> true | VFlt _ -> true | _ -> false) in
+     let cls9 = (if num9 then (match v with VFlt _ -> "Float" | _ -> "Integer") else class_name v) in
+     let own9 = (match v with VObj _ -> has_meth world (dispatch_cls_of world v) "inspect" | _ -> false) in
+     let _ = (if own9 then ()
+              else (let mid9 = (if num9 then "to_s" else "inspect") in
+                    let _ = fire_tp_vlc world "c_call" mid9 cls9 VNil v (cur_line ()) "" "inspect" in
+                    let _ = fire_tp_vlc world "c_return" mid9 cls9 (mkstr (inspect_w env world v)) v (cur_line ()) "" "inspect" in ())) in
+     p_tp_inspects env world t)
 // (dc: the class holding the builtin, when a singleton re-defined it from
 //  the builtin's Method; "" for where ruby defines it)
 and tp_c_hook_in = fn world -> fn (hook: str) -> fn (owner: str) -> fn (dc: str) ->
@@ -27712,7 +27729,17 @@ and builtin_answers = fn world -> fn (recv: Val) -> fn (name: str) ->
 // methods (and the prelude's, which are Ruby) push theirs in invoke.
 and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk0 ->
   let newblk = (if blk_is_lambda newblk0 then blk_spread_for world recv name newblk0 else newblk0) in
-  if str_len name == 5 && str_eq name "match" && rx_own_match world recv args then rx_own_match_call env world blk recv args newblk
+  // (a builtin's subclass value with an alias of a builtin under this name:
+  //  the builtin it names, as the block-less call does in invoke_val_c0)
+  if map_len builtin_alias > 0
+     && (match recv with VObj _ -> false | VClass _ -> false | VMain -> false | _ -> true)
+     && (if has_meth world (dispatch_cls_of world recv) name then false else true)
+     && (let src9 = blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) name in
+         (if str_eq src9 "" then false else true)
+         // (the builtin itself: not a method the class redefined since)
+         && (if has_meth world (dispatch_cls_of world recv) src9 then false else true)) then
+    invoke_with_block env world blk recv (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) name) args newblk0
+  else if str_len name == 5 && str_eq name "match" && rx_own_match world recv args then rx_own_match_call env world blk recv args newblk
   else if rx_sub_args_needed world recv name args then invoke_with_block env world blk recv name (rx_sub_args world args) newblk
   else if bi_frameless world recv name
   then invoke_with_block0 env world blk recv name args newblk
@@ -41722,7 +41749,9 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     //  :return's return_value is nil, Bug #13369)
     let _ = (if cfn9 then tp_fire_owned world defcls name true out slf9
              else
-               (let rv9 = (match flow9 with FBreak _ -> VNil | _ -> out) in
+               // (...but a define_method body IS the block: its own `break v`
+               //  returns v, and both events say so)
+               (let rv9 = (match flow9 with FBreak _ -> (if map_has dm_methods dk then out else VNil) | _ -> out) in
                 // (a body that ran to its end returns at the `end`)
                 let rl9 = (match flow9 with
                            | FNext _ -> (match (if map_has meth_src ("e" ++ dk) then map_get meth_src ("e" ++ dk)
@@ -55074,6 +55103,29 @@ and eval_run_at0 = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (
 // and __nest). `module Sandbox; BINDING = binding; end` and then
 // `eval("module M2; MM; end", Sandbox::BINDING)` found nothing of Sandbox's
 // inside M2, and Module.nesting there was [] (eval_run puts it back on)
+// ⚠ A BINDING SHARES ITS FRAME. A local the frame assigns after `binding`
+//   was taken is read through it, and one the binding assigns that the frame
+//   has is the frame's (test_eval's test_eval_orig: `b = binding; foo = 5;
+//   eval("foo", b)`). It was a snapshot (bnd_capture), which saw neither. The
+//   frame -- and its scope chain -- is marked captured, so the pool never
+//   hands it to another call (frame_done). The binding's own frame on top
+//   holds what eval defines through it, and the bookkeeping the snapshot
+//   carried: the lexical scope at the top level, and the implicit
+//   parameters of the frame it was made in.
+and bnd_live = fn env ->
+  let _ = mark_captured env in
+  let c9 = lv_child env in
+  let _ = (if lv_has env "__meth" then ()
+           else (let _ = map_set c9 "__blex" (mkstr (cur_lex ())) in
+                 map_set c9 "__bnest" (mkstr (cur_nest ())))) in
+  let _ = (if map_has env "__ip" then
+             (let snap9 = bnd_snapshot env in
+              map_iter snap9 (fn (k9: str) -> fn (v9: Val) ->
+                if str_eq k9 "__ip" || (str_len k9 > 5 && str_eq (substring k9 0 5) "__ipv") then map_set c9 k9 v9 else ()))
+           // (an OUTER block's are not this frame's: shadowed, as the
+           //  snapshot left them out)
+           else map_set c9 "__ip" VNil) in
+  c9
 and bnd_capture = fn env ->
   let snap9 = bnd_snapshot env in
   let _ = (if lv_has env "__meth" then ()
