@@ -8045,7 +8045,14 @@ let core_prelude_j =
   "      loc = (body.source_location rescue nil)\n" ++
   "      return nil unless loc\n" ++
   "      label = (body.respond_to?(:name) && body.name) ? body.name.to_s : \"block in <main>\"\n" ++
-  "      __new(nil, loc[0], loc[0], loc[1], label)\n" ++
+  "      i = __new(nil, loc[0], loc[0], loc[1], label)\n" ++
+  "      # (a builtin ruby writes in Ruby disassembles as that ruby prints it)\n" ++
+  "      if loc[0].start_with?(\"<internal:\") && body.respond_to?(:owner)\n" ++
+  "        own = body.owner\n" ++
+  "        key = own.singleton_class? ? own.inspect[/\\A#<Class:(.*)>\\z/, 1].to_s + \".\" + label : own.name.to_s + \"#\" + label\n" ++
+  "        i.instance_variable_set(:@__dis, TracePoint.__bdisasm(key))\n" ++
+  "      end\n" ++
+  "      i\n" ++
   "    end\n" ++
   "    def self.disasm(body) = of(body)&.disasm\n" ++
   "    def self.load_from_binary(bin)\n" ++
@@ -8073,12 +8080,46 @@ let core_prelude_j =
   "    def first_lineno = @__line\n" ++
   "    def script_lines = nil\n" ++
   "    def inspect = \"<RubyVM::InstructionSequence:#\{@__label}@#\{@__file}:#\{@__line}>\"\n" ++
-  "    def disasm = \"== disasm: #\{inspect}\\n\"\n" ++
+  "    def disasm = @__dis || \"== disasm: #\{inspect}\\n\"\n" ++
   "    alias disassemble disasm\n" ++
   "    def to_a = [\"YARVInstructionSequence/SimpleDataFormat\", 3, 4, 1, \{}, @__label, @__file, absolute_path, @__line, :top, [], \{}, [], []]\n" ++
   "    def to_binary(extra = nil) = \"MRISEQ\\0#\{@__file}\\0#\{@__path}\\0#\{@__line}\\0#\{@__label}\\0#\{@__src}\"\n" ++
   "    def each_child = self\n" ++
   "    def trace_points = []\n" ++
+  "  end\n" ++
+  // RubyVM::AbstractSyntaxTree: parse refuses what the parser refuses (the
+  // SyntaxError ISeq.compile's check raises -- `def (1).foo; end` is "cannot
+  // define singleton method for literals", test_parse's
+  // define_singleton_error), and answers the program's SCOPE node. There is no
+  // node tree of ruby's here: the node answers its kind and its extent.
+  "  module AbstractSyntaxTree\n" ++
+  "    class Node\n" ++
+  "      attr_reader :type, :children, :first_lineno, :first_column, :last_lineno, :last_column\n" ++
+  "      def initialize(type, children, fl, fc, ll, lc)\n" ++
+  "        @type, @children, @first_lineno, @first_column, @last_lineno, @last_column = type, children, fl, fc, ll, lc\n" ++
+  "      end\n" ++
+  "      def inspect = \"#<RubyVM::AbstractSyntaxTree::Node:#\{@type}@#\{@first_lineno}:#\{@first_column}-#\{@last_lineno}:#\{@last_column}>\"\n" ++
+  "      def script_lines = nil\n" ++
+  "      def source = nil\n" ++
+  "    end\n" ++
+  "    def self.parse(src, keep_script_lines: false, error_tolerant: false, keep_tokens: false)\n" ++
+  "      src = src.to_str unless src.is_a?(String)\n" ++
+  "      # (its errors are parse.y's: the message, the line, a caret under\n" ++
+  "      #  the place -- not prism's annotated listing)\n" ++
+  "      begin\n" ++
+  "        InstructionSequence.__send__(:__syntax, src, \"(eval)\", 1)\n" ++
+  "      rescue SyntaxError => e\n" ++
+  "        m = e.message\n" ++
+  "        code = m[/^> *\\d+ \\| (.*)$/, 1]\n" ++
+  "        car = m[/^ +\\| ( *)(\\^~*) (.+)$/]\n" ++
+  "        raise unless code && car\n" ++
+  "        col, mark, what = $1.size, $2, $3.sub(\"cannot define singleton method\", \"can't define singleton method\")\n" ++
+  "        raise SyntaxError, what + \"\\n\" + code + \"\\n\" + \" \" * col + mark + \"\\n\"\n" ++
+  "      end\n" ++
+  "      ls = src.lines\n" ++
+  "      Node.new(:SCOPE, [[], nil, nil], 1, 0, [ls.size, 1].max, ls.empty? ? 0 : ls.last.chomp.bytesize)\n" ++
+  "    end\n" ++
+  "    def self.parse_file(path, **kw) = parse(File.read(path), **kw)\n" ++
   "  end\n" ++
   "end\n";
 
@@ -12314,7 +12355,8 @@ let rec cli_dump_items = fn (xs: str list) ->
     let x9 = (let p9 = str_find_from x "+" 0 in if p9 < 0 then x else substring x 0 p9) in
     let _ = (if str_eq x9 "syntax" then map_set cli_opt "check" "1"
              else if str_eq x9 "" then ()
-             else map_set cli_opt "dump" "1") in
+             else (let _ = (if str_eq x9 "parsetree" || str_eq x9 "parsetree_with_comment" then map_set cli_opt "parsetree" "1" else ()) in
+                   map_set cli_opt "dump" "1")) in
     cli_dump_items t;
 let cli_dump = fn (v: str) -> cli_dump_items (str_split v ",");
 // ruby reads ONE argument as a run of switches (proc_options' `reswitch`):
@@ -12431,7 +12473,9 @@ let rec take_flags = fn (argl: str list) ->
     // --parser=prism|parse.y: the one parser there is answers to either name
     else if str_len a > 9 && str_eq (substring a 0 9) "--parser=" then
       (let p9 = substring a 9 (str_len a) in
-       if str_eq p9 "prism" || str_eq p9 "parse.y" then take_flags rest
+       // (parse.y's description has no +PRISM: ruby --parser=parse.y -v)
+       if str_eq p9 "prism" then (let _ = (if map_has cli_opt "parsey" then map_delete cli_opt "parsey" else ()) in take_flags rest)
+       else if str_eq p9 "parse.y" then (let _ = map_set cli_opt "parsey" "1" in take_flags rest)
        else let _ = cli_fatal ("unknown parser " ++ p9) in Nil)
     else if str_eq a "--copyright" then let _ = map_set cli_opt "copyright" "1" in take_flags rest
     // -i[ext]: ARGF edits its files in place, keeping each as file+ext when an
@@ -12521,7 +12565,8 @@ let rec take_flags = fn (argl: str list) ->
       let _ = map_set cli_opt "ver" "1" in
       let _ = cli_verbose (VBool true) in take_flags rest
     else if str_eq a "--version" then
-      let _ = map_set cli_opt "ver" "1" in take_flags rest
+      let _ = map_set cli_opt "ver" "1" in
+      let _ = map_set cli_opt "vonly" "1" in take_flags rest
     else if str_eq a "-h" || str_eq a "--help" then
       let _ = map_set cli_opt "help" "1" in take_flags rest
     else if is_loop_short a then
@@ -12725,6 +12770,125 @@ let cli_flush_warns = fn (u: unit) ->
 
 // -c: parse, say "Syntax OK", run nothing -- the same parse run_src makes, so
 // the answer is about the program that would have run.
+// --dump=parsetree: the program's tree, in the shape prism prints one (`@
+// ProgramNode`, `+-- name: value`, a child node under `|   `). The nodes are
+// this parser's, named as prism names their kinds -- a string is a
+// StringNode whose `unescaped:` is its text -- without prism's locations,
+// which this parser does not keep; a kind it has no name for is `@ Node`.
+let pt_q = fn (s: str) ->
+  let b = strbuf_new () in
+  let _ = strbuf_push b "\"" in
+  let rec go = fn (i: int) ->
+    (if i >= str_len s then ()
+     else (let c = char_at s i in
+           let _ = strbuf_push b (if str_eq c "\"" then "\\\"" else if str_eq c "\\" then "\\\\" else if str_eq c "\n" then "\\n" else c) in
+           go (i + 1))) in
+  let _ = go 0 in
+  let _ = strbuf_push b "\"" in
+  strbuf_to_str b;
+let rec pt_e = fn (out) -> fn (ind: str) -> fn (e: Expr) ->
+  let ln = fn (t: str) -> strbuf_push out (ind ++ t ++ "\n") in
+  let sub = fn (lbl: str) -> fn (x: Expr) -> (let _ = ln ("+-- " ++ lbl ++ ":") in pt_e out (ind ++ "|   ") x) in
+  let subs = fn (lbl: str) -> fn (xs: Expr list) ->
+    (let _ = ln ("+-- " ++ lbl ++ ": (length: " ++ str_of_int (pt_len xs) ++ ")") in
+     pt_list out (ind ++ "|   ") xs) in
+  match e with
+  | EInt n -> (let _ = ln "@ IntegerNode" in ln ("+-- value: " ++ str_of_int n))
+  | EBig b -> (let _ = ln "@ IntegerNode" in ln ("+-- value: " ++ b))
+  | EFlt f -> (let _ = ln "@ FloatNode" in ln ("+-- value: " ++ str_of_float f))
+  | EStrL t -> (let _ = ln "@ StringNode" in ln ("+-- unescaped: " ++ pt_q t))
+  | ESym t -> (let _ = ln "@ SymbolNode" in ln ("+-- unescaped: " ++ pt_q t))
+  | ERegex (t, f) -> (let _ = ln "@ RegularExpressionNode" in ln ("+-- unescaped: " ++ pt_q t))
+  | ENil -> ln "@ NilNode"
+  | EBool true -> ln "@ TrueNode"
+  | EBool false -> ln "@ FalseNode"
+  | ESelf -> ln "@ SelfNode"
+  | EVar n -> (let _ = ln "@ LocalVariableReadNode" in ln ("+-- name: :" ++ n))
+  | EConst c -> (let _ = ln "@ ConstantReadNode" in ln ("+-- name: :" ++ c))
+  | EIVar n -> (let _ = ln "@ InstanceVariableReadNode" in ln ("+-- name: :" ++ n))
+  | EAssign (n, v) -> (let _ = ln "@ LocalVariableWriteNode" in let _ = ln ("+-- name: :" ++ n) in sub "value" v)
+  | EArr xs -> (let _ = ln "@ ArrayNode" in subs "elements" xs)
+  | EHsh xs -> (let _ = ln "@ HashNode" in subs "elements" xs)
+  | ERange (a, b, x) -> (let _ = ln "@ RangeNode" in let _ = ln ("+-- RangeFlags: " ++ (if x then "exclude_end" else "nil")) in let _ = sub "left" a in sub "right" b)
+  | EBin (op, a, b) ->
+    (if str_eq op "&&" || str_eq op "and" then (let _ = ln "@ AndNode" in let _ = sub "left" a in sub "right" b)
+     else if str_eq op "||" || str_eq op "or" then (let _ = ln "@ OrNode" in let _ = sub "left" a in sub "right" b)
+     else (let _ = ln "@ CallNode" in let _ = sub "receiver" a in let _ = ln ("+-- name: :" ++ op) in subs "arguments" (Cons (b, Nil))))
+  | EUn (op, a) -> (let _ = ln "@ CallNode" in let _ = sub "receiver" a in ln ("+-- name: :" ++ op))
+  | ECall (n, args) -> (let _ = ln "@ CallNode" in let _ = ln "+-- receiver: nil" in let _ = ln ("+-- name: :" ++ n) in subs "arguments" args)
+  | EMethod (r, n, args) -> (let _ = ln "@ CallNode" in let _ = sub "receiver" r in let _ = ln ("+-- name: :" ++ n) in subs "arguments" args)
+  | ECallB (n, args, _, body) ->
+    (let _ = ln "@ CallNode" in let _ = ln "+-- receiver: nil" in let _ = ln ("+-- name: :" ++ n) in
+     let _ = subs "arguments" args in let _ = ln "+-- block:" in pt_block out (ind ++ "    ") body)
+  | EMethodB (r, n, args, _, body) ->
+    (let _ = ln "@ CallNode" in let _ = sub "receiver" r in let _ = ln ("+-- name: :" ++ n) in
+     let _ = subs "arguments" args in let _ = ln "+-- block:" in pt_block out (ind ++ "    ") body)
+  | ETern (c, a, b) -> (let _ = ln "@ IfNode" in let _ = sub "predicate" c in let _ = sub "statements" a in sub "subsequent" b)
+  | EYield args -> (let _ = ln "@ YieldNode" in subs "arguments" args)
+  | ESplat x -> (let _ = ln "@ SplatNode" in sub "expression" x)
+  | EStmt st -> pt_s out ind st
+  | _ -> ln "@ Node"
+and pt_list = fn (out) -> fn (ind: str) -> fn (xs: Expr list) ->
+  match xs with
+  | Nil -> ()
+  | Cons (x, t) -> (let _ = strbuf_push out (ind ++ "+-- ") in
+                    let _ = pt_e_inline out ind x in pt_list out ind t)
+// a list element: its first line follows the `+-- ` already written
+and pt_e_inline = fn (out) -> fn (ind: str) -> fn (x: Expr) ->
+  let b2 = strbuf_new () in
+  let _ = pt_e b2 (ind ++ "    ") x in
+  let t9 = strbuf_to_str b2 in
+  strbuf_push out (substring t9 (str_len ind + 4) (str_len t9))
+and pt_len = fn (xs: Expr list) -> (match xs with Nil -> 0 | Cons (_, t) -> 1 + pt_len t)
+and pt_block = fn (out) -> fn (ind: str) -> fn (body: Stmt list) ->
+  let _ = strbuf_push out (ind ++ "@ BlockNode\n") in
+  pt_stmts out ind body
+and pt_stmts = fn (out) -> fn (ind: str) -> fn (ss: Stmt list) ->
+  let xs = pt_real ss in
+  let _ = strbuf_push out (ind ++ "+-- body: (length: " ++ str_of_int (pt_len xs) ++ ")\n") in
+  pt_list out (ind ++ "    ") xs
+// the statements as nodes: the parser's line marks and declarations are no
+// nodes of prism's
+and pt_real = fn (ss: Stmt list) ->
+  match ss with
+  | Nil -> (Nil : Expr list)
+  | Cons (SLine _, t) -> pt_real t
+  | Cons (SLineQ _, t) -> pt_real t
+  | Cons (SFile _, t) -> pt_real t
+  | Cons (SDeclare _, t) -> pt_real t
+  | Cons (SExpr e, t) -> Cons (e, pt_real t)
+  | Cons (st, t) -> Cons (EStmt st, pt_real t)
+and pt_s = fn (out) -> fn (ind: str) -> fn (st: Stmt) ->
+  let ln = fn (t: str) -> strbuf_push out (ind ++ t ++ "\n") in
+  match st with
+  | SExpr e -> pt_e out ind e
+  | SAssign (n, v) -> (let _ = ln "@ LocalVariableWriteNode" in let _ = ln ("+-- name: :" ++ n) in
+                       let _ = ln "+-- value:" in pt_e out (ind ++ "|   ") v)
+  | SIVarAssign (n, v) -> (let _ = ln "@ InstanceVariableWriteNode" in let _ = ln ("+-- name: :" ++ n) in
+                           let _ = ln "+-- value:" in pt_e out (ind ++ "|   ") v)
+  | SDef (n, _, _, body) -> (let _ = ln "@ DefNode" in let _ = ln ("+-- name: :" ++ n) in
+                             let _ = ln "+-- body:" in pt_stmts out (ind ++ "    ") body)
+  | SClass (n, _, body) -> (let _ = ln "@ ClassNode" in let _ = ln ("+-- name: :" ++ n) in
+                            let _ = ln "+-- body:" in pt_stmts out (ind ++ "    ") body)
+  | SReturn e -> (let _ = ln "@ ReturnNode" in let _ = ln "+-- arguments:" in pt_e out (ind ++ "|   ") e)
+  | SWhile (c, body) -> (let _ = ln "@ WhileNode" in let _ = ln "+-- predicate:" in let _ = pt_e out (ind ++ "|   ") c in
+                         let _ = ln "+-- statements:" in pt_stmts out (ind ++ "    ") body)
+  | SIf (Cons ((c, body), _), _) -> (let _ = ln "@ IfNode" in let _ = ln "+-- predicate:" in let _ = pt_e out (ind ++ "|   ") c in
+                                     let _ = ln "+-- statements:" in pt_stmts out (ind ++ "    ") body)
+  | _ -> ln "@ Node";
+let cli_parsetree = fn (src0: str) -> fn (name: str) ->
+  let (src, _) = src_prepare src0 in
+  let cod9 = src_coding src in
+  let _ = map_set load_ctx "coding" (mkstr (if str_eq cod9 "" then "UTF-8" else cod9)) in
+  let _ = map_set load_ctx "file" (mkstr name) in
+  let toks = number_nls src (lex_src src) in
+  let _ = parse_line_reset (count_nls toks) in
+  let (prog9, _) = parse_stmts toks Nil in
+  let out = strbuf_new () in
+  let _ = strbuf_push out "@ ProgramNode\n+-- statements:\n    @ StatementsNode\n" in
+  let _ = pt_stmts out "    " prog9 in
+  let _ = print_no_nl (strbuf_to_str out) in
+  0;
 let cli_check = fn (src0: str) -> fn (name: str) ->
   let (src, _) = src_prepare src0 in
   let cod9 = src_coding src in
@@ -12887,8 +13051,18 @@ let run_cli = fn () ->
   let _ = (if str_eq (env_get "RUBY_FREE_AT_EXIT") "" then ()
            else print_err "mere-ruby: warning: Free at exit is experimental and may be unstable") in
   // -v prints before the program runs, like ruby's does.
-  let _ = (if map_has cli_opt "ver" then print ruby_desc else ()) in
+  let _ = (if map_has cli_opt "ver"
+           then print (if map_has cli_opt "parsey"
+                       then (let k9 = str_index_of ruby_desc " +PRISM" in
+                             if k9 < 0 then ruby_desc else substring ruby_desc 0 k9 ++ substring ruby_desc (k9 + 7) (str_len ruby_desc))
+                       else ruby_desc) else ()) in
+  // --version prints and runs nothing -- not the program, not a -r library
+  if map_has cli_opt "vonly" then 0 else
   // -y / --dump: nothing runs (cli_dump)
+  // (--dump=parsetree prints the program's tree, cli_parsetree)
+  if map_has cli_opt "parsetree" && map_has cli_opt "eval" then cli_parsetree (map_get cli_opt "eval") "-e" else
+  if map_has cli_opt "parsetree" && (match argl0 with Cons (_, _) -> true | Nil -> false) then
+    (match argl0 with Cons (f9, _) -> cli_parsetree (read_file f9) f9 | Nil -> 0) else
   if map_has cli_opt "dump" && (if map_has cli_opt "check" then false else true) then 0 else
   if map_has cli_opt "eval" then
     // -e wins over a script path, and the remaining args are ARGV. __FILE__ is
