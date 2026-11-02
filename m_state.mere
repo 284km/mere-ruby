@@ -275,6 +275,12 @@ extern fn io_poll_add: int -> int -> int -> int;
 extern fn io_poll_del: int -> int -> int;
 extern fn io_poll_wait: int -> int -> int;
 extern fn io_poll_get: int -> int -> int;
+// (mere v0.1.682) select(2)'s third set for one descriptor, no wait; exec(2)
+// with proc_spawn's arguments; the title ps shows; send(2) with flags
+extern fn fd_except_ready: int -> int;
+extern fn proc_exec: str -> str -> str -> str -> str -> int;
+extern fn proc_set_title: str -> int;
+extern fn sock_send: int -> int -> int -> int -> int;
 // one arena block, reused: 64 KiB is the read size and the write chunk.
 
 // Object ids come from a counter carried IN the ocls map itself (special key
@@ -2204,6 +2210,13 @@ let cur_meth_set = fn (s: str) -> vec_set cur_fm 1 (pos_name_id s);
 // blocks in open(2) until the other end is opened, and every thread here is
 // this one OS thread, so the open would wait forever -- see file_open_obj.
 let fifo_paths = map_new ();
+// ...and the ones this process is reading now (load / require of a FIFO,
+// File.__read_fifo): an open for WRITING finds its other end there, so it
+// does not wait
+let fifo_readers = map_new ();
+// the Array a #pack is reading (0 -> its id) and how many of its items have
+// been converted so far (1): see pack_call_live
+let pack_live = map_new ();
 // a permission that leaves the owner no write bit, held back until the File
 // that created the file closes: open(2) applies it at the open and the
 // descriptor still writes, but a File here writes through its path (path ->
@@ -3422,6 +3435,14 @@ let blk_ok = map_new ();
 // they run in the REVERSE of it, after the program (and after an uncaught
 // exception has been reported), and before an explicit `exit`.
 let at_exits = map_new ();
+// the at_exit procs that are END { } blocks (by proc id), and whether the one
+// running now is one: ruby's [BUG] report names an END block's own frame
+// "block in <main>" where caller says "block (2 levels) in <main>"
+let end_procs = map_new ();
+// set once the program lowers its own RLIMIT_NOFILE: from then on a File
+// takes its descriptor at the open (file_open_obj), so the limit counts it
+let file_eager_fd = map_new ();
+let end_now = map_new ();
 // the signal number of a SignalException an at_exit handler raised and nobody
 // rescued ("s"; the last handler's says): the process then ends OF that
 // signal, as when the main script raises it (ruby's ruby_default_signal)
@@ -3688,6 +3709,12 @@ let udp_put = fn (fd: int) -> fn (s: str) ->
   let n = str_len s in
   let _ = (if str_has_nul s then tcp_put_bytes p s 0 n else (let _ = mem_copy_str p 0 s in ())) in
   udp_send fd p n;
+// send(2) with flags (MSG_OOB), the bytes through the same arena block
+let sock_put_flags = fn (fd: int) -> fn (s: str) -> fn (fl: int) ->
+  let p = tcp_arena () in
+  let n = str_len s in
+  let _ = (if str_has_nul s then tcp_put_bytes p s 0 n else (let _ = mem_copy_str p 0 s in ())) in
+  sock_send fd p n fl;
 // The same two moves for an ordinary descriptor. ⚠ The arena block is SHARED
 //   with the tcp path on purpose -- one 64 KiB block, reused -- so nothing
 //   here may hold it across a call that could also use it.
@@ -3750,7 +3777,7 @@ let rec io_poll_fill = fn (s: int) -> fn (fds: Val list) -> fn (ints: Val list) 
   match fds with
   | Cons (VInt fd, rest) ->
     (match ints with
-     | Cons (VInt b, irest) -> (let _ = io_poll_add s fd b in io_poll_fill s rest irest)
+     | Cons (VInt b, irest) -> (let _ = io_poll_add s fd (bit_and b 3) in io_poll_fill s rest irest)
      | _ -> ())
   | _ -> ();
 let rec io_poll_drain = fn (s: int) -> fn (fds: Val list) ->
@@ -3767,7 +3794,27 @@ let rec io_poll_answer = fn (got) -> fn (fds: Val list) ->
   | Cons (VInt fd, rest) -> Cons (VInt (if map_has got fd then map_get got fd else 0), io_poll_answer got rest)
   | Cons (_, rest) -> Cons (VInt 0, io_poll_answer got rest)
   | Nil -> (Nil : Val list);
-let io_poll_bits = fn (fds: Val list) -> fn (ints: Val list) -> fn (ms: int) ->
+// ...and interest 8 is an exceptional condition (an out-of-band byte), which
+// poll(2) cannot wait for on Darwin: each such descriptor is asked with
+// fd_except_ready after the poll, and the wait goes in 10 ms slices while
+// one is in the set (IO.select's third array, test_io's select_exceptfds)
+let rec io_poll_exc = fn (got) -> fn (fds: Val list) -> fn (ints: Val list) ->
+  match fds with
+  | Cons (VInt fd, rest) ->
+    (match ints with
+     | Cons (VInt b, irest) ->
+       (let _ = (if bit_and b 8 != 0 && fd_except_ready fd == 1 then
+                   map_set got fd (bit_or (if map_has got fd then map_get got fd else 0) 8)
+                 else ()) in
+        io_poll_exc got rest irest)
+     | _ -> ())
+  | _ -> ();
+let rec io_poll_has_exc = fn (ints: Val list) ->
+  match ints with
+  | Cons (VInt b, r) -> bit_and b 8 != 0 || io_poll_has_exc r
+  | Cons (_, r) -> io_poll_has_exc r
+  | Nil -> false;
+let io_poll_once = fn (fds: Val list) -> fn (ints: Val list) -> fn (ms: int) ->
   let s = io_ps_id () in
   let _ = io_poll_fill s fds ints in
   let n = io_poll_wait s ms in
@@ -3775,7 +3822,19 @@ let io_poll_bits = fn (fds: Val list) -> fn (ints: Val list) -> fn (ms: int) ->
   let _ = map_set got (0 - 1) 0 in
   let _ = (if n > 0 then io_poll_read s got 0 n else ()) in
   let _ = io_poll_drain s fds in
+  let _ = io_poll_exc got fds ints in
   io_poll_answer got fds;
+let rec io_poll_any = fn (vs: Val list) ->
+  match vs with Cons (VInt b, r) -> b != 0 || io_poll_any r | Cons (_, r) -> io_poll_any r | Nil -> false;
+let io_poll_bits = fn (fds: Val list) -> fn (ints: Val list) -> fn (ms: int) ->
+  if io_poll_has_exc ints then
+    (let rec go = fn (left: int) ->
+       (let r = io_poll_once fds ints 0 in
+        if io_poll_any r || left == 0 then r
+        else (let _ = io_poll_once fds ints (if left < 0 || left > 10 then 10 else left) in
+              go (if left < 0 then left else if left > 10 then left - 10 else 0))) in
+     go ms)
+  else io_poll_once fds ints ms;
 let rec fd_get_all = fn (fd: int) -> fn (acc: str) ->
   let chunk = fd_get fd in
   if str_eq chunk "" then acc else fd_get_all fd (acc ++ chunk);

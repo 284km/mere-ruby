@@ -1367,11 +1367,32 @@ let gc_collect = fn env -> fn world ->
     // Deleting the dead keys allocates nothing; the compaction after it, when
     // it can happen, moves only the living.
     let dIV = vec_new () in
+    // (a File nothing reaches gives its descriptor back, as ruby's finalizer
+    //  closes it -- unless #autoclose = false gave it to the program. Before,
+    //  a File the program dropped held its descriptor until exit, and with
+    //  RLIMIT_NOFILE lowered the next open was EMFILE however much was
+    //  garbage: test_dir's glob_gc_for_fd)
+    let dFD = vec_new () in
     let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
       let owner = gc_owner_of k in
       if owner < 0 then ()
       else if map_has live (owner * 8) then ()
-      else vec_push dIV k) in
+      else
+        (let _ = (if str_ends_with k "@__f_fd" then
+                    (match v with
+                     | VInt fd9 ->
+                       (let kp9 = str_of_int owner ++ "@__f_keep_fd" in
+                        if fd9 > 2 && (if map_has ivars kp9 then (if truthy (map_get ivars kp9) then false else true) else true)
+                        then vec_push dFD fd9 else ())
+                     | _ -> ())
+                  else ()) in
+         vec_push dIV k)) in
+    let rec close_fds = fn (i: int) ->
+      if i >= vec_len dFD then ()
+      else (let fd9 = vec_get dFD i in
+            let _ = (if fd_close fd9 == 0 then fd_forget fd9 else ()) in
+            close_fds (i + 1)) in
+    let _ = close_fds 0 in
     let _ = gc_drop_s ivars dIV in
     let _ = (if nc then () else map_compact ivars) in
     // every key here IS an object id now -- the one non-numeric entry ("$next")
@@ -5695,13 +5716,15 @@ and gvar_assign_checked = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
                                 | VStr h9 -> (let c9 = mkstr (sget h9) in
                                               (match c9 with VStr i9 -> (let _ = senc_set i9 (senc_get h9) in let _ = sfrozen_set i9 in c9) | _ -> c9))
                                 | _ -> x) in
+     // ...and it is the title ps shows, as set_arg0 makes it (mere v0.1.682)
+     let title9 = fn (x: Val) -> (match x with VStr h9 -> (let _ = proc_set_title (sget h9) in ()) | _ -> ()) in
      match v with
-     | VStr _ -> (let _ = gvar_write world slot (frz9 v) in ())
+     | VStr _ -> (let _ = gvar_write world slot (frz9 v) in title9 v)
      | _ ->
        (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
         let ts9 = (if responds world v "to_str" then invoke_val_c env world nb9 v "to_str" Nil false else VNil) in
         match ts9 with
-        | VStr _ -> (let _ = gvar_write world slot (frz9 ts9) in ())
+        | VStr _ -> (let _ = gvar_write world slot (frz9 ts9) in title9 ts9)
         | _ -> (let _ = raise_exc world "TypeError"
                   ("no implicit conversion of " ++ (match v with VNil -> "nil" | _ -> display_cls_msg world (dispatch_cls_of world v))
                    ++ " into String") in ())))
@@ -17144,6 +17167,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else if n9 < 0 then VNil
           else mkstr (mem_to_str p9 n9))
        | _ -> VNil)
+    // a FIFO this process is reading now, or no longer (File.__read_fifo)
+    else if str_eq c "File" && (str_len name == 13 && str_eq name "__fifo_reader") then
+      (match args with
+       | Cons (VStr p9, Cons (VBool on9, _)) ->
+         (let k9 = abs_path_of (sget p9) in
+          let _ = (if on9 then map_set fifo_readers k9 1 else if map_has fifo_readers k9 then map_delete fifo_readers k9 else ()) in VNil)
+       | _ -> VNil)
     else if str_eq c "File" && (str_len name == 7 && str_eq name "__umask") then
       (match args with Cons (VInt m9, _) -> VInt (file_umask m9) | _ -> VInt 0)
     // flock(2) through the compiler's file_flock (v0.1.550), which takes the
@@ -17994,6 +18024,25 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 chk9 t9)) in
           let _ = chk9 pvals9 in
           let pats = glob_pat_args pvals9 in
+          // ruby opens the first directory a pattern reads, so with no
+          // descriptor left it is EMFILE naming that directory (dir_test's
+          // glob_too_may_open_files); this glob holds none, so one dup(2) asks
+          let _ = (match pats with
+                   | Cons (gp9, _) ->
+                     (match glob_open_dir gp9 with
+                      // (a directory that is not there is not opened: [])
+                      | (true, gd9) when str_eq gd9 "" || dir_there gd9 ->
+                        (let d9 = fd_dup 0 in
+                         // (EMFILE collects once and asks again, as ruby's
+                         //  rb_gc_for_fd does: a dropped File gives its
+                         //  descriptor back -- test_dir's glob_gc_for_fd)
+                         let d9 = (if d9 < 0 && fd_neg_errno () == 0 - 24 then (let _ = gc_collect_any env world in fd_dup 0) else d9) in
+                         if d9 >= 0 then (let _ = fd_close d9 in ())
+                         else if fd_neg_errno () == 0 - 24 then
+                           (let _ = dir_raise_p world "Errno::EMFILE" "Too many open files - " (if str_len base > 0 && str_eq gd9 "" then base else gd9) in ())
+                         else ())
+                      | _ -> ())
+                   | _ -> ()) in
           // ⚠ ...and the results carry the PATTERN's encoding. Every name came
           //   back UTF-8 whatever was asked for, because the strings are built
           //   here and nothing told them where they came from.
@@ -20484,6 +20533,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (match args with
           | Cons (VInt fd, Cons (VStr h, _)) -> VInt (udp_put fd (sget h))
           | _ -> VInt (0 - 1))
+       // send(2) with the flags as given (the platform's MSG_*): the count,
+       // or -errno
+       else if (str_len name == 11 && str_eq name "__send_flag") then
+         (match args with
+          | Cons (VInt fd, Cons (VStr h, Cons (VInt fl, _))) ->
+            (let n9 = sock_put_flags fd (sget h) fl in if n9 < 0 then VInt (fd_neg_errno ()) else VInt n9)
+          | _ -> VInt (0 - 22))
        // one datagram, or nil when recv(2) refused (a timeout, a closed fd).
        // An EMPTY datagram is a real answer and comes back as "".
        else if (str_len name == 10 && str_eq name "__udp_recv") then
@@ -20679,6 +20735,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if str_eq c "Process" && (str_len name == 8 && str_eq name "__getsid") then
       (match args with Cons (VInt p9, _) -> VInt (getsid p9) | _ -> VInt (0 - 1))
     else if str_eq c "Process" && (str_len name == 8 && str_eq name "__setsid") then VInt (setsid ())
+    else if str_eq c "Process" && (str_len name == 9 && str_eq name "__end_now") then VBool (map_has end_now 0)
     else if str_eq c "Process" && (str_len name == 9 && str_eq name "__setpgid") then
       (match args with Cons (VInt p9, Cons (VInt g9, _)) -> VInt (setpgid p9 g9) | _ -> VInt (0 - 1))
     // fork(2), under the prelude's Process._fork (note 436): -1 is EAGAIN,
@@ -20729,7 +20786,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if str_eq c "Process" && (str_len name == 11 && str_eq name "__setrlimit") then
       (match args with
        | Cons (VStr n9, Cons (VInt c9, Cons (VInt m9, _))) ->
-         if proc_setrlimit (sget n9) c9 m9 == 0 then VInt 0 else VInt (proc_last_errno ())
+         if proc_setrlimit (sget n9) c9 m9 == 0
+         then (let _ = (if str_eq (sget n9) "NOFILE" then map_set file_eager_fd 0 1 else ()) in VInt 0)
+         else VInt (proc_last_errno ())
        | _ -> VInt 22)
     // the names this platform has, and one name's RLIMIT_ number (-1: none),
     // which is what Process::RLIMIT_* are made from at startup
@@ -20870,6 +20929,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Cons (VStr p9, Cons (VStr a9, Cons (VStr e9, Cons (VStr x9, Cons (VInt g9, Cons (VStr d9, _)))))) ->
          VInt (proc_spawn (sget p9) (sget a9) (sget e9) (sget x9) g9 (sget d9))
        | _ -> VInt (0 - 22))
+    // ...and exec(2) with the same arguments but the group (mere v0.1.682):
+    // this process becomes the program; an answer is a failure, -errno
+    else if str_eq c "Process" && (str_len name == 7 && str_eq name "__pexec") then
+      (match args with
+       | Cons (VStr p9, Cons (VStr a9, Cons (VStr e9, Cons (VStr x9, Cons (VStr d9, _))))) ->
+         VInt (proc_exec (sget p9) (sget a9) (sget e9) (sget x9) (sget d9))
+       | _ -> VInt (0 - 22))
+    // the title ps shows (mere v0.1.682), over the argument strings
+    else if str_eq c "Process" && (str_len name == 10 && str_eq name "__settitle") then
+      (match args with Cons (VStr t9, _) -> VInt (proc_set_title (sget t9)) | _ -> VInt (0 - 1))
     else if str_eq c "Process" && (str_len name == 7 && str_eq name "__pwait") then
       (match args with Cons (VInt p9, Cons (VInt f9, _)) -> VInt (proc_waitpid p9 f9) | _ -> VInt (0 - 22))
     else if str_eq c "Process" && (str_len name == 8 && str_eq name "__pwstat") then VInt (proc_wait_status ())
@@ -27224,6 +27293,7 @@ and run_at_exit_procs = fn world -> fn report -> fn st -> fn (xs: Val list) ->
     let bang9 = (if map_has globals "!" then map_get globals "!" else VNil) in
     let ok = map_new () in
     let pm9 = map_has prim_missing "c" || map_has prim_missing "n" in
+    let _ = (if map_has end_procs pid then map_set end_now 0 1 else map_delete end_now 0) in
     let _ = try_or (fn (u: unit) ->
                       (match run_block world nb (proc_as_block pid) Nil with
                        | FRaise v9 -> FRaise v9
@@ -30827,7 +30897,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         else arr_new vals)
      | _ -> recv)
   else if (str_len name == 4 && str_eq name "pack") && (match recv with VArr _ -> true | _ -> false) then
-    (match recv with VArr id -> pack_call env world (deref id) args | _ -> recv)
+    (match recv with VArr id -> pack_call_live env world id args | _ -> recv)
   // combination / permutation without a block are ENUMERATORS, not the list of
   // tuples: the enumerator is answered from the array as it is when it is
   // WALKED, so `enum = a.permutation; a << 3; enum.to_a` sees the third element.
@@ -39916,7 +39986,7 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
   //  asked again: `alias_method :included_orig, :included` and then a new
   //  #included that calls it went round for ever)
   | _ when is_definition_hook src -> VNil
-  | (VArr id, _) when str_eq src "pack" -> pack_call env world (deref id) args
+  | (VArr id, _) when str_eq src "pack" -> pack_call_live env world id args
   | (VStr h, _) when str_eq src "unpack" -> arr_new (unpack_call env world h 0 args)
   | (VStr h, _) when str_eq src "unpack1" -> (match unpack_call env world h 2 args with Cons (v, _) -> v | Nil -> VNil)
   // (Float#quo is ruby's `/` asked again, through a guard against asking
@@ -43590,8 +43660,14 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
   // (a file that is there and cannot be read is not loadable either)
   if is_reg_file full && (if fs_access full "-r" then false else true) then raise_load_err world p0
   else
-  if is_reg_file full then
-    (let src = read_file full in
+  // (a FIFO is loadable too, read as its writer fills it: File.__read_fifo)
+  let fifo9 = (let m9 = fs_mode full true in m9 >= 0 && bit_and m9 61440 == 4096) in
+  if is_reg_file full || fifo9 then
+    (let src = (if fifo9
+                then (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass "File") "__read_fifo" (Cons (mkstr full, Nil)) false with
+                      | VStr h9 -> sget h9
+                      | _ -> "")
+                else read_file full) in
      let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
      let _ = coding_refuse world src full in
      let cod = src_coding src in
@@ -45747,6 +45823,22 @@ and dir_names_split = fn (raw: str) -> fn (i: int) ->
 // ELOOP differ on linux. Anything else is a SystemCallError with the number.
 // (a path os_path_conv converted is named as the program wrote it, the
 //  message in its encoding, [ruby-dev:45279])
+// the directory a glob pattern opens first: the components before the first
+// one with a wildcard in it ("" for the current one, "/" kept for a root
+// path), and false when no component has one (nothing is opened then)
+and glob_open_dir = fn (p: str) ->
+  let rec magic = fn (s: str) -> fn (i: int) ->
+    (if i >= str_len s then false
+     else (let c = char_at s i in
+           str_eq c "*" || str_eq c "?" || str_eq c "[" || str_eq c "\{" || magic s (i + 1))) in
+  let rec go = fn (parts: str list) -> fn (acc: str) -> fn (first: bool) ->
+    (match parts with
+     | Nil -> (false, acc)
+     | Cons (c, rest) ->
+       (if magic c 0 then (true, acc)
+        else go rest (if first then (if str_eq c "" then "/" else c)
+                      else if str_eq acc "/" || str_eq acc "" then acc ++ c else acc ++ "/" ++ c) false)) in
+  go (str_split p "/") "" true
 and dir_raise_p = fn world -> fn (cls: str) -> fn (msg: str) -> fn (p: str) ->
   if map_has os_conv_orig p then
     (let t9 = map_get os_conv_orig p in
@@ -46494,6 +46586,22 @@ and pack_fmt_of = fn env -> fn world -> fn (v: Val) ->
   | VStr h -> (sget h, str_len (senc_get h) >= 3 && str_eq (substring (senc_get h) 0 3) "UTF")
   | _ -> ("", false)
 // Array#pack(fmt, buffer: nil)
+// Array#pack reads the array AS IT IS at each item, as ruby's NEXTFROM does:
+// a conversion (#to_str, #to_int) that empties it leaves the next directive
+// with "too few arguments" (test_pack's pack_resize), not the item that was
+// there when pack began. The array is named here while pack runs, and
+// pack_call's conversions check it.
+// (a pack inside a conversion -- #to_str packing -- puts the outer one back
+//  when it returns; one that raises ends the outer pack too)
+and pack_call_live = fn env -> fn world -> fn (id: int) -> fn (args: Val list) ->
+  let sid9 = (if map_has pack_live 0 then map_get pack_live 0 else 0 - 1) in
+  let sn9 = (if map_has pack_live 1 then map_get pack_live 1 else 0) in
+  let _ = map_set pack_live 0 id in
+  let _ = map_set pack_live 1 0 in
+  let r9 = pack_call env world (deref id) args in
+  let _ = map_set pack_live 0 sid9 in
+  let _ = map_set pack_live 1 sn9 in
+  r9
 and pack_call = fn env -> fn world -> fn (xs: Val list) -> fn (args: Val list) ->
   match args with
   | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)"
@@ -46508,8 +46616,18 @@ and pack_call = fn env -> fn world -> fn (xs: Val list) -> fn (args: Val list) -
      //   refuses with "format string modified" (test_array's
      //   pack_format_mutation empties it from a #to_int)
      let fs0 = (match fv with VStr fh0 -> sget fh0 | _ -> "") in
+     let xs_n9 = vlen xs in
      let cv = fn (kind: str) -> fn (v: Val) ->
-       (let r = pack_cv env world assoc kind v in
+       (let k9 = (if map_has pack_live 1 then map_get pack_live 1 else 0) in
+        let _ = map_set pack_live 1 (k9 + 1) in
+        // (the array shrank under a conversion: what is past its end now
+        //  is not there, see pack_call_live)
+        let _ = (if map_has pack_live 0 && map_get pack_live 0 >= 0 then
+                   (match map_get pack_live 0 with
+                    | lid9 -> (let n9 = vlen (deref lid9) in
+                               if n9 < xs_n9 && k9 >= n9 then (let _ = prim_raise "ArgumentError" "too few arguments" in ()) else ()))
+                 else ()) in
+        let r = pack_cv env world assoc kind v in
         let _ = (match (v, fv) with
                  | (VObj _, VStr fh0) ->
                    (if str_eq (sget fh0) fs0 then ()
@@ -53835,6 +53953,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
         //  END { } as a block inside a block, and its frame is "block (2
         //  levels) in <main>")
         let _ = store_proc (str_of_int pid) (true, (Nil : str list), body, lv_child env) in
+        let _ = map_set end_procs pid 1 in
         let _ = map_set at_exits (str_of_int (map_len at_exits)) (VProc pid) in
         FNext VNil))
   // ⚠ The parser also builds this for a CHAINED assignment (`$g = a = 5`,

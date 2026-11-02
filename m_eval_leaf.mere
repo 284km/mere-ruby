@@ -6168,6 +6168,14 @@ and stdlib_src = fn (name: str) ->
     "    outbuf ? __fd_into(outbuf, out) : out\n" ++
     "  end\n" ++
     "  def send(data, flags = 0, *dest)\n" ++
+    "    # with flags (MSG_OOB) it is send(2) itself, after what is buffered\n" ++
+    "    if dest.empty? && flags.to_i != 0 && @socktype != Socket::SOCK_DGRAM\n" ++
+    "      __check_open\n" ++
+    "      flush\n" ++
+    "      n = Socket.__send_flag(@__io_fd, data.to_s, flags.to_i)\n" ++
+    "      IO.__fd_raise(n) if n < 0\n" ++
+    "      return n\n" ++
+    "    end\n" ++
     "    if @socktype == Socket::SOCK_DGRAM\n" ++
     "      __check_open\n" ++
     "      n = Socket.__udp_send(@__io_fd, data.to_s)\n" ++
@@ -15890,7 +15898,9 @@ and file_open_obj = fn world -> fn (args: Val list) ->
   //   name instead, for the FIFOs this process made (fifo_paths); one made
   //   elsewhere is not recognised, because telling a FIFO from a file needs
   //   stat(2), which is a subprocess here for every open.
-  else if map_has fifo_paths (abs_path_of path) && file_exists path then
+  else if map_has fifo_paths (abs_path_of path) && file_exists path
+          && (if map_has fifo_readers (abs_path_of path) && (str_contains mode "w" || str_contains mode "a" || str_contains mode "+")
+              then false else true) then
     raise_exc world "NotImplementedError"
       ("opening a FIFO would wait for its other end, and every thread here is one OS thread - " ++ path)
   // ("r+" too: it opens a file that is there and creates none, so a missing
@@ -15944,7 +15954,9 @@ and file_open_obj = fn world -> fn (args: Val list) ->
     //   short of permissions, and the reference measured for /dev/tty.
     else if str_len path > 5 && str_eq (substring path 0 5) "/dev/" && file_exists path
             && (let fd0 = fd_open path (if str_contains mode "+" || str_contains mode "w" || str_contains mode "a" then "r+" else "r") 438 in
-                if fd0 < 0 then true else (let _ = fd_close fd0 in false)) then
+                // (no descriptor left is EMFILE, below, not this device's
+                //  refusal)
+                if fd0 < 0 then (if fd_neg_errno () == 0 - 24 then false else true) else (let _ = fd_close fd0 in false)) then
       raise_sysopen world "Errno::ENXIO" "Device not configured" path (file_arg_enc args)
     else
     let _ = (if creating then write_file path "" else ()) in
@@ -15971,6 +15983,18 @@ and file_open_obj = fn world -> fn (args: Val list) ->
                else if map_has enc_objs "UTF-8" then map_get enc_objs "UTF-8" else VNil) in
     let _ = map_set ivars (str_of_int id ++ "@__f_dint")
               (if map_has def_int_enc "v" then map_get def_int_enc "v" else VNil) in
+    // ⚠ The lazy descriptor (file_fd_of) means a File holds none, so a
+    //   program that lowered RLIMIT_NOFILE and opened files until EMFILE
+    //   never got there (dir_test's glob_too_may_open_files opened sixteen
+    //   and none failed). Once the program set that limit itself, the File
+    //   takes its descriptor here, and open(2)'s EMFILE is the open's.
+    let _ = (if map_has file_eager_fd 0 then
+               (let fd9 = file_fd_of world id in
+                if fd9 < 0 && fd_neg_errno () == 0 - 24 then
+                  (let _ = map_delete ivars (str_of_int id ++ "@__f_fd") in
+                   raise_sysopen world "Errno::EMFILE" "Too many open files" path (file_arg_enc args))
+                else VNil)
+             else VNil) in
     VObj id
 and file_flush_obj = fn world -> fn (id: int) ->
   let (meths, sup, ocls, ivars) = world in
@@ -15996,6 +16020,12 @@ and file_flush_obj = fn world -> fn (id: int) ->
               | VInt n -> n | _ -> 0) in
   let _ =
     (if str_eq buf "" then ()
+     // ...but a FIFO has no content to splice into: reading it waits for a
+     // writer (this one), so the bytes go through the File's descriptor
+     // (test_require's fifo tests write one from a thread)
+     else if (let m9 = fs_mode path true in m9 >= 0 && bit_and m9 61440 == 4096) then
+       (let fd9 = file_fd_of world id in
+        let _ = (if fd9 >= 0 then fd_put_all fd9 buf 0 0 else 0) in ())
      else if str_contains mode "a" then
        (let _ = write_file path ((if file_exists path then read_file path else "") ++ buf) in ())
      else if str_contains mode "w" || str_contains mode "+" then
