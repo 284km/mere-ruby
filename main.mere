@@ -711,8 +711,15 @@ let ary_rlen = fn (v: Val) -> match v with VArr a -> val_list_len (deref a) | _ 
 // the objects marked live that gc_fixpoint has not yet marked the ivars of
 // (emptied where a mark begins, in gc_mark_roots)
 let gc_obj_pend = map_new ();
+// the Struct classes (Struct_N) a value names, seen while marking: a class
+// is a name and was never collected, so `Struct.new("A")` then
+// `remove_const(:A)` kept every one ever made (test_struct's
+// named_structs_are_not_rooted). gc_sweep_structs drops the rest.
+let gc_live_cls = map_new ();
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
+  | VClass c9 when str_len c9 > 7 && str_eq (substring c9 0 7) "Struct_" ->
+    map_set gc_live_cls c9 1
   | VObj id -> let k = id * 8 in
                (if map_has live k then () else (let _ = map_set live k VNil in let _ = map_set gc_obj_pend id 0 in ()))
   | VStr id -> let k = id * 8 + 1 in
@@ -1281,6 +1288,101 @@ let gc_drop_sh = fn tbl -> fn (dead: Vec['d, str]) -> fn (pre: str) ->
 // the block a :b_call / :b_return is about, while its hook runs: what
 // TracePoint#parameters describes (made a Proc only when asked)
 let tp_cur_blk = map_new ();
+// A Struct class nothing names any more -- no constant holds it, no live
+// object is one, no live value is it, no live class inherits from it and no
+// live String names it (a Method keeps its owner as one) -- leaves the
+// tables gc_purge_sng clears for a dead singleton class, and its own:
+// members, generated-method marks, display name. Only the classes
+// Struct.new makes (Struct_N): a program makes those by the thousand and
+// throws them away (test_struct's named_structs_are_not_rooted; a class is
+// a name, and was never collected).
+// the class a "Class#name" key belongs to ("Struct_5" for "Struct_5#a",
+// "(sng:Struct_5)#members" and meth_src's "fStruct_5#a" / "eStruct_5#a")
+let gc_key_cls = fn (k0: str) ->
+  let k = (if str_len k0 > 8 && (str_eq (char_at k0 0) "f" || str_eq (char_at k0 0) "e")
+              && (str_eq (substring k0 1 8) "Struct_" || str_eq (substring k0 1 6) "(sng:") then substring k0 1 (str_len k0) else k0) in
+  let h = str_index_of k "#" in
+  let c = (if h < 0 then k else substring k 0 h) in
+  if str_len c > 6 && str_eq (substring c 0 5) "(sng:" then substring c 5 (str_len c - 1) else c;
+// (a key that does not mention Struct_ is passed by a search that makes
+//  nothing; the scratch is this function's region -- walking a dozen tables
+//  per collection in the default one was 1.6 KB a Struct, note 495)
+let gc_purge_cls = fn tbl -> fn dead ->
+  region GPC {
+    let dk = vec_new () in
+    let _ = map_iter tbl (fn (k: str) -> fn v ->
+              if str_index_of k "Struct_" >= 0 && map_has dead (gc_key_cls k) then vec_push dk k else ()) in
+    gc_drop_s tbl dk
+  };
+let gc_sweep_structs = fn world -> fn live -> fn (nc: bool) ->
+  let (meths, sup, ocls, ivars) = world in
+  if map_len struct_mem == 0 then ()
+  else
+  region SWS {
+    let is_s = fn (c: str) -> str_len c > 7 && str_eq (substring c 0 7) "Struct_" in
+    let keep = map_new () in
+    let _ = map_iter gc_live_cls (fn (c: str) -> fn (x: int) -> map_set keep c 1) in
+    let _ = map_clear gc_live_cls in
+    let _ = map_iter consts (fn (k: str) -> fn (v: Val) ->
+              (match v with VClass c -> (if is_s c then map_set keep c 1 else ()) | _ -> ())) in
+    let _ = map_iter ocls (fn (id: int) -> fn (c: str) ->
+              if is_s c && map_has live (id * 8) then map_set keep c 1 else ()) in
+    // (a Method / UnboundMethod names its class and its method key as
+    //  Strings -- @__m_owner, @__um_cls, "Struct_5#q" -- and so may other
+    //  internal ivars: any live one that mentions a Struct_N keeps it)
+    let rec names_in = fn (t: str) -> fn (from: int) ->
+      (let i = str_find_from t "Struct_" from in
+       if i < 0 then ()
+       else
+         (let rec dg = fn (j: int) -> (if j < str_len t && is_digit (char_at t j) then dg (j + 1) else j) in
+          let e = dg (i + 7) in
+          let _ = (if e > i + 7 then map_set keep (substring t i e) 1 else ()) in
+          names_in t e)) in
+    let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
+              (match v with
+               | VStr h -> (let t = sget h in if str_len t >= 8 && str_index_of t "Struct_" >= 0 then names_in t 0 else ())
+               | VClass c -> (if is_s c then map_set keep c 1 else ())
+               | _ -> ())) in
+    let dead = map_new () in
+    let _ = map_iter struct_mem (fn (c: str) -> fn (v: Val) -> if map_has keep c then () else map_set dead c 1) in
+    // (a class some class still inherits from stays, and so on up: walked
+    //  until nothing more is kept)
+    let rec settle = fn (u: unit) ->
+      (let moved = map_new () in
+       let _ = map_iter sup (fn (c: str) -> fn (p: str) ->
+                 if map_has dead p && (if map_has dead (gc_key_cls c) then false else true) then map_set moved p 1 else ()) in
+       if map_len moved == 0 then ()
+       else (let _ = map_iter moved (fn (p: str) -> fn (x: int) -> map_delete dead p) in settle ())) in
+    let _ = settle () in
+    if map_len dead == 0 then ()
+    else
+      (let _ = gc_purge_cls meths dead in
+       let _ = gc_purge_cls sup dead in
+       let _ = gc_purge_cls meth_cref dead in
+       let _ = gc_purge_cls mro_anc dead in
+       let _ = gc_purge_cls mro_anc_gen dead in
+       let _ = gc_purge_cls privates dead in
+       let _ = gc_purge_cls protecteds dead in
+       let _ = gc_purge_cls undefs dead in
+       let _ = gc_purge_cls includes dead in
+       let _ = gc_purge_cls prepends dead in
+       let _ = gc_purge_cls alias_origin dead in
+       let _ = gc_purge_cls alias_srcname dead in
+       let _ = gc_purge_cls meth_params dead in
+       let _ = gc_purge_cls meth_src dead in
+       let _ = gc_purge_cls dm_methods dead in
+       let _ = gc_purge_cls dm_captured dead in
+       let _ = gc_purge_cls dm_closenv dead in
+       let _ = gc_purge_cls vis_marks dead in
+       let _ = gc_purge_cls struct_gen dead in
+       let _ = gc_purge_cls struct_mem dead in
+       let _ = gc_purge_cls anon_name dead in
+       let _ = mro_bump () in
+       if nc then ()
+       else (let _ = map_compact meths in let _ = map_compact sup in let _ = map_compact meth_src in
+             let _ = map_compact privates in let _ = map_compact vis_marks in let _ = map_compact alias_srcname in
+             let _ = map_compact struct_gen in let _ = map_compact struct_mem in map_compact anon_name))
+  };
 let gc_collect = fn env -> fn world ->
   region GCC {
     let (meths, sup, ocls, ivars) = world in
@@ -1319,6 +1421,7 @@ let gc_collect = fn env -> fn world ->
     let _ = gc_mark_roots env live in
     let _ = gc_fixpoint ivars live in
     let _ = gc_sweep_captured live in
+    let _ = gc_sweep_structs world live nc in
     // THE PROCS NOTHING REACHED (the VProc arm of gc_mark_val marks the ones
     // something does), and what was kept beside each by its id. Before note
     // 270 every proc was a root, and with it everything it had captured.
