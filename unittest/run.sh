@@ -2,7 +2,7 @@
 # CRuby's OWN tests, run under mere-ruby and under the reference ruby, test
 # by test. ruby/spec is one yardstick; this is the second one.
 #
-#   ./unittest/run.sh <ruby-src> [path under test/ ...]
+#   ./unittest/run.sh <ruby-src> [--list] [--all | path under test/ ...]
 #
 # <ruby-src> is a CRuby source tree AT THE REFERENCE'S RELEASE -- the ruby_4_0
 # branch for 4.0.9 (tools/ref_ruby.sh). Only two of its directories are read:
@@ -12,8 +12,9 @@
 #   written against a newer json and fails four tests under 4.0.x itself, which
 #   would read as four defects in mere-ruby.
 #
-# Without paths it runs the list in unittest/files.txt. With paths, a
-# directory means every *_test.rb and test_*.rb in it.
+# Without paths it runs the historical selection in unittest/files.txt.
+# Explicit directories are recursive; explicit paths and --all include default
+# exclusions. --list prints the selection without requiring either interpreter.
 #
 # Each file runs with `-v --show-skip` on both sides, under tool/lib's runner,
 # which names every test it runs and then every one that did not pass:
@@ -44,6 +45,9 @@
 #
 # Writes unittest/STATUS.md and unittest/tags/<file>.txt (the RED tests, one
 # per line). Both are checked in: every line goes through mspec/mask.sh.
+# UNITTEST_RECORD_DIR changes the record destination for an exploratory run.
+# COVERAGE.tsv records each side's exit status, summary and discovered tests;
+# missing summaries and zero tests make the run exit 1, even with zero RED.
 set -u
 LC_ALL=C; export LC_ALL
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -52,6 +56,21 @@ src="${1:?usage: unittest/run.sh <ruby-src> [path under test/ ...]}"
 shift
 src="$(cd "$src" && pwd)"
 [ -d "$src/tool/lib" ] && [ -d "$src/test" ] || { echo "unittest: $src has no tool/lib and test/" >&2; exit 2; }
+if [ "${1:-}" = "--list" ]; then
+  shift
+  exec sh "$here/list.sh" "$src" "$@"
+fi
+if [ "${1:-}" != "--one" ]; then
+  list="$(mktemp)"
+  trap 'rm -f "$list"' EXIT
+  sh "$here/list.sh" "$src" "$@" > "$list" || exit 2
+  [ -s "$list" ] || { echo "unittest: empty selection" >&2; exit 2; }
+fi
+records="${UNITTEST_RECORD_DIR:-$here}"
+mkdir -p "$records/tags" || exit 2
+records="$(cd "$records" && pwd)"
+UNITTEST_RECORD_DIR="$records"; export UNITTEST_RECORD_DIR
+[ -z "${UNITTEST_KEEP:-}" ] || mkdir -p "$UNITTEST_KEEP" || exit 2
 # ⚠ THE TEST EXTENSIONS AN INSTALLED RUBY DOES NOT CARRY. test_file,
 #   test_file_exhaustive and test_dir_m17n require -test-/file, test_call
 #   -test-/iter, test_keyword -test-/rb_call_super_kw -- C extensions built
@@ -83,31 +102,11 @@ wall="${UNITTEST_WALL:-600}"
 seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
 
-if [ "${1:-}" != "--one" ]; then
-  if [ "$#" -eq 0 ]; then
-    set -- $(grep -v '^#' "$here/files.txt" | grep -v '^$' | grep -v '^-')
-  fi
-  list="$(mktemp)"; trap 'rm -f "$list"' EXIT
-  for p in "$@"; do
-    if [ -d "$src/test/$p" ]; then
-      # (test_helper.rb is a helper by that name, not a test file)
-      (cd "$src/test" && find "$p" -maxdepth 1 \( -name '*_test.rb' -o -name 'test_*.rb' \) ! -name 'test_helper.rb' -type f | sort) >> "$list"
-    elif [ -f "$src/test/$p" ]; then
-      echo "$p" >> "$list"
-    else
-      echo "unittest: no test/$p in $src" >&2
-    fi
-  done
-  # files.txt may take a file back out of a directory it named: `-ruby/test_x.rb`
-  grep '^-' "$here/files.txt" | sed 's/^-//' > "$list.x"
-  grep -v -x -F -f "$list.x" "$list" > "$list.k"; mv -f "$list.k" "$list"; rm -f "$list.x"
-fi
-
 runner='
   my ($wall, @cmd) = @ARGV;
   my $pid = fork();
   if (!defined $pid) { exit 127 }
-  if (!$pid) { open(STDERR, ">&", \*STDOUT); exec(@cmd); exit 127 }
+  if (!$pid) { exec(@cmd); exit 127 }
   $SIG{ALRM} = sub { kill "KILL", $pid; exit 142 };
   alarm $wall;
   waitpid($pid, 0);
@@ -119,10 +118,28 @@ verdicts() {
     /^\[ *[0-9]+\/[0-9]+\] / { n = $0; sub(/^\[ *[0-9]+\/[0-9]+\] /, "", n); sub(/ = .*$/, "", n); ran[n] = 1; next }
     /^ *[0-9]+\) Failure:/ { want = "F"; next }
     /^ *[0-9]+\) Error:/   { want = "E"; next }
+    /^ *[0-9]+\) Timeout:/ { want = "T"; next }
     /^ *[0-9]+\) Skipped:/ { want = "S"; next }
     want != "" { n = $1; sub(/:$/, "", n); bad[n] = want; ran[n] = 1; want = ""; next }
     /^[0-9]+ tests, [0-9]+ assertions, / { done = 1; next }
     END { for (n in ran) print n "\t" ((n in bad) ? bad[n] : (done ? "." : "X")) }' | sort -u
+}
+
+# Summary count and discovered names are both needed: a missing test extension
+# can skip every class definition and still print a successful 0-test summary.
+coverage() {
+  awk -v code="$2" -v discovered="$3" '
+    /^[0-9]+ tests, [0-9]+ assertions, / {
+      summary=$1; expected_exit=($5+$7)%256; done=1
+    }
+    END {
+      if (!done) state="INCOMPLETE"
+      else if (summary == 0) state="ZERO"
+      else if (summary != discovered) state="COUNT_MISMATCH"
+      else if (code != expected_exit) state="EXIT_ERROR"
+      else state="COMPLETE"
+      printf "%s\t%s\t%s\t%s", state, code, (done ? summary : "-"), discovered
+    }' "$1"
 }
 
 # ONE FILE, both sides -- the unit the loop below hands out, as
@@ -139,19 +156,30 @@ if [ "${1:-}" = "--one" ]; then
   #   inherited stderr -- and `| verdicts` waited on it for 2 h 40 m, the
   #   whole sweep stopped behind one file, whose verdicts then came out empty
   #   (MATCH 57 -> 0). An orphan holding a file holds nothing up.
-  out1="$(mktemp)"
-  (cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" -I "$shim" "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2>&1)
+  out1="$(mktemp)"; err1="$(mktemp)"
+  # Verbose names are printed before a test runs, without a newline. A warning
+  # on stderr can otherwise join the name and create a different test identity.
+  # Parse stdout, then append stderr to the saved diagnostic log.
+  (cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" -I "$shim" -r test/unit "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  ref_code=$?
   ro="$(verdicts < "$out1")"
-  (cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$shim" "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2>&1)
+  ref_found="$(printf '%s\n' "$ro" | awk 'NF {n++} END {print n+0}')"
+  ref_coverage="$(coverage "$out1" "$ref_code" "$ref_found")"
+  cat "$err1" >> "$out1"
+  [ -z "${UNITTEST_KEEP:-}" ] || cp "$out1" "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').reference.out"
+  (cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$shim" -r test/unit "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  mr_code=$?
   mo="$(verdicts < "$out1")"
-  # UNITTEST_KEEP=<dir> keeps mere-ruby's side of each file there, as
-  # <test/path with / as _>.out -- the failure messages a survey clusters
-  # (the verdicts alone say which tests, not why)
+  mr_found="$(printf '%s\n' "$mo" | awk 'NF {n++} END {print n+0}')"
+  mr_coverage="$(coverage "$out1" "$mr_code" "$mr_found")"
+  cat "$err1" >> "$out1"
+  # Preserve the old mere-ruby log name and add the reference side beside it.
   [ -n "${UNITTEST_KEEP:-}" ] && cp "$out1" "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').out"
-  rm -f "$out1"
+  printf '%s\t%s\t%s\n' "$rel" "$ref_coverage" "$mr_coverage" > "$work/$n.coverage"
+  rm -f "$out1" "$err1"
   rf="$(mktemp)"; mf="$(mktemp)"
   printf '%s\n' "$ro" | grep -v '^$' > "$rf"; printf '%s\n' "$mo" | grep -v '^$' > "$mf"
-  tag="$here/tags/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').txt"
+  tag="$records/tags/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').txt"
   counts="$(join -t "	" -a 1 -a 2 -e - -o 0,1.2,2.2 "$rf" "$mf" | awk -F'\t' -v tag="$tag" '
     BEGIN { m = r = b = x = n = 0; printf "" > tag }
     {
@@ -189,9 +217,11 @@ else
   ut_guard=$!
 fi
 work="$(mktemp -d)"; trap '[ -n "$ut_guard" ] && kill "$ut_guard" 2>/dev/null; rm -f "$list"; rm -rf "$work"' EXIT INT TERM
-mkdir -p "$here/tags"
 awk '{ print NR " " $0 }' "$list" | xargs -n 2 -P "$jobs" sh "$0" "$src" --one "$work"
-status="$here/STATUS.md.$$"
+status="$records/STATUS.md.$$"
+coverage_file="$records/COVERAGE.tsv.$$"
+printf 'file\tref_state\tref_exit\tref_summary_tests\tref_discovered_tests\tmere_state\tmere_exit\tmere_summary_tests\tmere_discovered_tests\n' > "$coverage_file"
+incomplete=0
 tm=0; tr=0; tb=0; tx=0; tt=0
 {
   echo "# mere-ruby — CRuby's own tests"
@@ -211,7 +241,16 @@ tm=0; tr=0; tb=0; tx=0; tt=0
 i=0
 while read -r rel; do
   i=$((i + 1))
-  [ -f "$work/$i.row" ] || { echo "unittest: no result for $rel" >&2; continue; }
+  if [ ! -f "$work/$i.row" ] || [ ! -f "$work/$i.coverage" ]; then
+    echo "unittest: no result for $rel" >&2
+    printf '%s\tMISSING\t-\t-\t-\tMISSING\t-\t-\t-\n' "$rel" >> "$coverage_file"
+    incomplete=$((incomplete + 1))
+    continue
+  fi
+  cat "$work/$i.coverage" >> "$coverage_file"
+  if ! awk -F '\t' '$2 == "COMPLETE" && $6 == "COMPLETE" {ok=1} END {exit !ok}' "$work/$i.coverage"; then
+    incomplete=$((incomplete + 1))
+  fi
   set -- $(cat "$work/$i.row")
   printf '| %s | %s | %s | %s | %s | %s |\n' "$rel" "$1" "$2" "$3" "$4" "$5" >> "$status"
   printf '%-48s %4s tests  MATCH %4s  RED %4s  BOTH %3s  EXTRA %3s\n' "$rel" "$1" "$2" "$3" "$4" "$5"
@@ -220,7 +259,12 @@ done < "$list"
 {
   printf '| **total** | %s | %s | %s | %s | %s |\n' "$tt" "$tm" "$tr" "$tb" "$tx"
   echo
+  printf 'File coverage: %s incomplete or zero-test files. See `COVERAGE.tsv`.\n' "$incomplete"
+  echo
   echo "_Generated by \`unittest/run.sh\` against ruby $REF_RUBY_VERSION's test/ and tool/lib._"
 } >> "$status"
-mv "$status" "$here/STATUS.md"
+mv "$status" "$records/STATUS.md"
+mv "$coverage_file" "$records/COVERAGE.tsv"
+[ "$incomplete" -eq 0 ] || echo "unittest: $incomplete files incomplete or zero-test; see $records/COVERAGE.tsv" >&2
 echo "total: $tt tests, MATCH $tm, RED $tr, BOTH $tb, EXTRA $tx"
+[ "$incomplete" -eq 0 ]
