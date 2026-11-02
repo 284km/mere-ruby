@@ -57520,6 +57520,37 @@ and rx_cut_key = fn (pat: str) -> fn (fl: str) ->
               || (if str_all_ascii_go pat 0 (str_len pat) then false else true))
   then k9 ++ chr 2 ++ "U8"
   else k9
+// ASCII characters one of which every match of n contains, "" when none is
+// known: Onigmo's map, which turns `d()*+|a*a*bc` against a subject with no
+// d and no b into an answer at once, where the search -- no cache for a
+// capture in an atomic group -- is cubic and ran out of its budget. A
+// sequence needs any one of its parts' (the fewest), an alternation all of
+// its branches' together, a loop its body's when it must run.
+and rxr_req = fn (n: RNode) ->
+  match n with
+  | NChar c -> (if str_len c == 1 && ord c > 0 && ord c < 128 then c else "")
+  | NSeq xs -> rxr_req_seq xs ""
+  | NAlt xs -> rxr_req_alt xs ""
+  | NRep (b, lo, _, _) -> (if lo >= 1 then rxr_req b else "")
+  | NGroup (b, _, _) -> rxr_req b
+  | NAtomic b -> rxr_req b
+  | NLook (b, negd) -> (if negd then "" else rxr_req b)
+  | _ -> ""
+and rxr_req_seq = fn (xs: RNode list) -> fn (best: str) ->
+  match xs with
+  | Nil -> best
+  | Cons (h, t) ->
+    (let r = rxr_req h in
+     if str_len r > 0 && (str_len best == 0 || str_len r < str_len best) then rxr_req_seq t r else rxr_req_seq t best)
+and rxr_req_alt = fn (xs: RNode list) -> fn (acc: str) ->
+  match xs with
+  | Nil -> acc
+  | Cons (h, t) -> (let r = rxr_req h in if str_len r == 0 then "" else rxr_req_alt t (acc ++ r))
+// does s hold one of req's characters at or after i?
+and rxr_any_from = fn (s: str) -> fn (req: str) -> fn (i: int) -> fn (j: int) ->
+  if j >= str_len req then false
+  else if str_find_from s (char_at req j) i >= 0 then true
+  else rxr_any_from s req i (j + 1)
 and rxc_get = fn (pat: str) -> fn (fl: str) ->
   let key = rx_cut_key pat fl in
   if map_has rx_progs key then map_get rx_progs key
@@ -57589,11 +57620,15 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
     // -1: the program's own entry. No instruction has a negative pc.
     let _ = map_set prog (0 - 1) (IMeta (total9, ng)) in
     let _ = map_set rx_progs key prog in
+    let req9 = rxr_req n in
+    let _ = map_set rx_reqs key req9 in
     // the names are still in rx_gnums from the parse just above
     let _ = map_set rx_prog_names key (mkstr (rx_names_join ())) in
     let plain9 = fl ++ chr 1 ++ pat in
     let _ = (if map_has rx_progs plain9 then ()
-             else (let _ = map_set rx_progs plain9 prog in map_set rx_prog_names plain9 (mkstr (rx_names_join ())))) in
+             else (let _ = map_set rx_progs plain9 prog in
+                   let _ = map_set rx_reqs plain9 req9 in
+                   map_set rx_prog_names plain9 (mkstr (rx_names_join ())))) in
     prog
 
 // the parse's named groups, flattened to "name=number|..." (insertion order is
@@ -57720,6 +57755,14 @@ and rxv_tick = fn (u: unit) ->
   if n > rxv_budget && vec_get rxv_mc 0 == 0 then
     (let _ = vec_set rxv_steps 0 0 in
      let _ = prim_raise "Regexp::TimeoutError" "regexp match timeout" in ())
+  else if vec_get rxv_mc 0 == 1 && vec_get rxv_mc 3 > 0 && vec_get rxv_imf 0 == 0 then
+    (let m = vec_get rxv_steps 1 + 1 in
+     let _ = vec_set rxv_steps 1 m in
+     if m > rxv_budget then
+       (let _ = vec_set rxv_steps 0 0 in
+        let _ = vec_set rxv_steps 1 0 in
+        let _ = prim_raise "Regexp::TimeoutError" "regexp match timeout" in ())
+     else ())
   else ()
 // a timeout in seconds as the ns rx_fl_tmo keeps: rb_num2dbl's refusals,
 // "invalid timeout" for one not above zero, and ruby's ceiling past
@@ -57815,11 +57858,14 @@ and rxv_inner_m = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) -> fn (
 and rxv_no_caps = fn prog -> (match map_get prog (0 - 1) with IMeta (_, g) -> g <= 1 | _ -> false)
 // may this program use the cache? Not when what it matches depends on what
 // it captured (a backreference, a conditional on a group); and not, as
-// Onigmo gives up on it too, for an atomic group beside a loop whose body can
-// be empty (`d()*+|a*a*bc`, Bug #20886: ruby times that one out, and the test
-// says so)
-and rxv_mc_allowed = fn prog -> fn (pc: int) -> fn (n: int) -> fn (at: bool) -> fn (ck: bool) ->
-  if pc >= n then (if at && ck then false else true)
+// Onigmo gives up on it too, for a capture inside an atomic group
+// (`d()*+|a*a*bc`, Bug #20886: ruby times that one out, and the test says
+// so). That was "an atomic group and a loop whose body can be empty,
+// anywhere": `^(?:(?>a)…)?(?=(?:(?:ab)*(?:ab)*)+?…)` lost the cache for
+// an empty-able loop nowhere near its atomic group, and ran out of its
+// budget where ruby answers in 30 ms.
+and rxv_mc_allowed = fn prog -> fn (pc: int) -> fn (n: int) ->
+  if pc >= n then true
   else (match rxv_fetch prog pc with
         | IBackref (_, _) -> false
         | ICond (_, _) -> false
@@ -57827,9 +57873,22 @@ and rxv_mc_allowed = fn prog -> fn (pc: int) -> fn (n: int) -> fn (at: bool) -> 
         //  visited (pc, i) says nothing about the next visit)
         | ICall (_, _) -> false
         | IBackrefL (_, _, _) -> false
-        | IAtomic _ -> rxv_mc_allowed prog (pc + 1) n true ck
-        | ICheck (_, _) -> rxv_mc_allowed prog (pc + 1) n at true
-        | _ -> rxv_mc_allowed prog (pc + 1) n at ck)
+        // (its body is sub .. pc - 2, and pc - 1 its IOk)
+        | IAtomic sub -> if rxv_caps_in prog sub (pc - 1) then false else rxv_mc_allowed prog (pc + 1) n
+        | _ -> rxv_mc_allowed prog (pc + 1) n)
+// is a group's start or end saved between pc a and b?
+and rxv_caps_in = fn prog -> fn (a: int) -> fn (b: int) ->
+  if a >= b then false
+  else (match rxv_fetch prog a with
+        | ISave k -> (if k >= 2 then true else rxv_caps_in prog (a + 1) b)
+        | ISaveL k -> (if k >= 2 then true else rxv_caps_in prog (a + 1) b)
+        | _ -> rxv_caps_in prog (a + 1) b)
+// s[a, a+n) and s[i, i+n) byte for byte, nothing copied (char_at hands out
+// a table's one-byte strings)
+and rxv_seg_eq = fn (s: str) -> fn (a: int) -> fn (i: int) -> fn (n: int) -> fn (k: int) ->
+  if k >= n then true
+  else if ord (char_at s (a + k)) == ord (char_at s (i + k)) then rxv_seg_eq s a i n (k + 1)
+  else false
 and rxv_mc_size = fn prog -> match map_get prog (0 - 1) with IMeta (n, _) -> n | _ -> 0
 // how many calls the call stack in saves has open
 and rxv_call_depth = fn (saves: (int * int) list) ->
@@ -57951,9 +58010,8 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
      let b = (if td9 < 0 then 0 - 1 else if plain9 then rxv_slot_get saves (2 * g + 1) else rxv_slot_get saves (0 - (1000000 + td9 * 1000 + 2 * g + 1))) in
      if a < 0 || b < a || i + (b - a) > str_len s then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
      else
-       (let seg = substring s a b in
-        let here = substring s i (i + (b - a)) in
-        if (if ci then str_eq (str_upcase seg) (str_upcase here) else str_eq seg here) then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
+       (if (if ci then (let seg = substring s a b in let here = substring s i (i + (b - a)) in str_eq (str_upcase seg) (str_upcase here))
+            else rxv_seg_eq s a i (b - a) 0) then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
         else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))))
   | IMark k -> rxv_run prog s (pc + 1) i (Cons ((k, i), saves)) bt
   | ICheck (k, out) ->
@@ -57961,8 +58019,18 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     // capture ends the loop here (keeping this iteration's captures, no
     // backtracking into other alternatives); one that changed a capture is
     // allowed to continue (e.g. /(a|\2b|())*/ needs the () iteration).
+    // (the iteration that continues comes back to the loop's split at the
+    //  SAME position it entered from, a moment ago on this very path: the
+    //  cache has marked it, and a mark means "failed" -- the next turn was
+    //  cut, and `"aacac" =~ /(a*)+.(a*)?$/` kept "a" in its first group where
+    //  ruby has "". So that split is taken here, past the marks.)
     if rxv_slot_get saves k == i then
-      (if rxv_caps_changed saves k then rxv_run prog s (pc + 1) i saves bt
+      (if rxv_caps_changed saves k then
+         (match rxv_fetch prog (pc + 1) with
+          | IJmp l9 -> (match rxv_fetch prog l9 with
+                        | ISplit (a9, b9) -> rxv_run prog s a9 i saves (Cons ((b9, i, saves), bt))
+                        | _ -> rxv_run prog s (pc + 1) i saves bt)
+          | _ -> rxv_run prog s (pc + 1) i saves bt)
        else rxv_run prog s out i saves bt)
     else rxv_run prog s (pc + 1) i saves bt
   | IBOL ->
@@ -57996,10 +58064,17 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     (let a = rxv_slot_get saves (2 * g) in
      let b = rxv_slot_get saves (2 * g + 1) in
      if a < 0 || b < a then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+     // (in place, without /i: the group and the text here were copied out to
+     //  compare, two strings of the group's length a check, kept to the end of
+     //  the match -- `^(a*)\1b?a*$` over a million a's took 7 GB in the half
+     //  second before its timeout, test_regexp's per_instance_redos_test)
+     else if (if ci then false else true) then
+       (if i + (b - a) <= str_len s && rxv_seg_eq s a i (b - a) 0 then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
+        else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
      else
        let seg = substring s a b in
        let here = (if i + (b - a) <= str_len s then substring s i (i + (b - a)) else "") in
-       let eqv = (if ci then str_eq (str_upcase seg) (str_upcase here) else str_eq seg here) in
+       let eqv = str_eq (str_upcase seg) (str_upcase here) in
        if eqv && i + (b - a) <= str_len s then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
        // (under /i in UTF-8, by folded characters, whose byte lengths may differ)
        else if ci && vec_get cut_k 0 == 1 && (let n9 = rxv_ci_ref_len s i seg in n9 >= 0) then
@@ -58086,6 +58161,7 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
   let once9 = vec_get rxv_once 0 == 1 in
   let _ = (if once9 then vec_set rxv_once 0 0 else ()) in
   let _ = vec_set rxv_steps 0 0 in
+  let _ = vec_set rxv_steps 1 0 in
   let key = rx_cut_key pat fl in
   // record this search's start offset so \G (IGANCHOR) can anchor to it.
   // rindex pins \G to ITS offset argument while attempting matches at
@@ -58104,7 +58180,7 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
                 then () else map_set rx_cur "k" kh9) in
        let prog = map_get rx_progs key in
        let ok9 = (if map_has rx_mc_ok key then map_get rx_mc_ok key == 1
-                  else (let a9 = rxv_mc_allowed prog 0 (rxv_mc_size prog) false false in
+                  else (let a9 = rxv_mc_allowed prog 0 (rxv_mc_size prog) in
                         let _ = map_set rx_mc_ok key (if a9 then 1 else 0) in a9)) in
        let _ = vec_set rxv_mc 0 0 in
        let _ = vec_set rxv_mc 1 (str_len s + 1) in
@@ -58125,7 +58201,11 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
        // the last of the four quadratics in CSV.parse.
        // Not when rindex has PINNED \G to its own offset ("o"): that walk tries
        // earlier positions on purpose, and its \G is not the search's start.
-       if (if map_has rx_ganchor "o" then false else true) && rxv_anchored prog then
+       // (no cache to bound it, and none of the characters every match holds
+       //  is left: no search -- see rxr_req)
+       let req9 = (if ok9 then "" else if map_has rx_reqs key then map_get rx_reqs key else "") in
+       if str_len req9 > 0 && start <= str_len s && (if rxr_any_from s req9 start 0 then false else true) then RNoHit
+       else if (if map_has rx_ganchor "o" then false else true) && rxv_anchored prog then
          (if start > str_len s then RNoHit
           else match rxv_run prog s 0 start Nil Nil with
                | RFound (e, sv) -> RHit (rxv_keep_start sv start, e, sv)
