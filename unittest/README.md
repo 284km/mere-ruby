@@ -83,3 +83,71 @@ a stub RSS guard. It covers selection, test framework preloading, load errors,
 zero tests, interrupted output, count mismatches, exit codes, warning output,
 both raw logs, record destinations and the existing verdict categories. It
 does not build Mere or run CRuby's suites.
+
+## Full measurement in GitHub Actions
+
+Pull requests, pushes to `main`, the weekly schedule and manual dispatch run
+the full `test/` candidate inventory. For Ruby 4.0.9 this is 757 files, including
+the 16 files excluded from the historical default and the encoding subdirectory.
+Bootstrap tests, basic tests and RubySpec remain separate suites.
+
+The workflow pins the Mere compiler and Ruby source to full commit SHAs.
+`workflow_dispatch` accepts `mere_ref`, a full published Mere commit SHA, to
+measure a newer compiler without changing the default pin. The macOS jobs use
+`macos-26` consistently. Linux still has its separate compilation smoke test.
+
+The corpus job builds mere-ruby once with `tools/build.sh` at O2 and uploads the
+binary before running the corpus. A separate job builds Ruby 4.0.9 and its native
+test extensions and both JITs (with Rust 1.85.0), installs a relocatable
+reference, and verifies the four test
+extensions previously replaced by shims. Reference-only extension paths take
+precedence over those shims; mere-ruby keeps its own Ruby implementations.
+
+`unittest/ci.py` partitions the manifest into 64 shards with no overlapping files.
+At most four macOS measurement jobs run at once. Each file runs sequentially:
+each interpreter has a 600-second wall limit, and the worker's process group
+has an aggregate RSS cap of 2 GiB, polled every 0.1 seconds. A worker also has
+an outer wall limit of twice the per-side limit plus 60 seconds. Polling can
+overshoot the RSS cap; it is a measurement bound, not a reservation. These bounds
+differ from historical local sweeps and are recorded with each result.
+
+The CI supervisor starts a new process group per file. It watches and cleans up
+that group rather than starting the historical machine-wide RSS guard. Limits,
+zero-test results, startup failures and unattempted files are separate states.
+Each completed file atomically updates `result.json`, so a job that stops early
+leaves its remaining files marked `NOT_RUN`. Missing shard artifacts are expanded
+back to the manifest's full file list as `MISSING_SHARD` by the collection job.
+
+Artifacts are retained for seven days:
+
+| Artifact | Contents |
+|---|---|
+| `unittest-plan` | Exact candidate list, pinned revisions and shard count |
+| `mere-ruby-macos` | O2 binary, build mode and compiler/source provenance |
+| `ruby-reference-macos` | Installed reference, native test extensions and provenance |
+| `unittest-shard-N` | Per-file results, bounds, peak group RSS and sanitized diagnostic logs |
+| `unittest-report` | `SUMMARY.md`, `summary.json` and every planned file in `files.tsv` |
+
+Diagnostic logs pass through the repository's existing masking rules before
+upload and are capped at 2 MiB per log with a truncation marker. Private raw
+logs are not part of the artifact. Interrupted workers also retain masked
+partial stdout/stderr when available.
+
+The Actions summary reports the named-test totals and incomplete-file count.
+Known RED, BOTH, EXTRA and measured dependency/resource failures do not fail
+the collection job by themselves: its status means results were collected,
+not that Ruby conformance was achieved. Missing/unattempted files, inconsistent
+revisions, binaries, bounds or counts, and infrastructure errors fail collection.
+Read `files.tsv` as well as the four verdict totals before comparing runs.
+
+The binary hash, actual source commits and reference hash must agree across
+shards. This prevents combining a partial run, another compiler build or another
+Ruby version into one measurement. Result files are artifacts; CI does not
+commit a partial sweep over the checked-in historical records.
+
+```sh
+python3 unittest/ci_check.py -v
+```
+
+This checks partitioning, collection, missing and partial shards, provenance,
+resource cleanup and diagnostic masking with small controlled fixtures.

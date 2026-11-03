@@ -156,17 +156,20 @@ if [ "${1:-}" = "--one" ]; then
   #   inherited stderr -- and `| verdicts` waited on it for 2 h 40 m, the
   #   whole sweep stopped behind one file, whose verdicts then came out empty
   #   (MATCH 57 -> 0). An orphan holding a file holds nothing up.
-  out1="$(mktemp)"; err1="$(mktemp)"
+  out1="$work/$n.stdout"; err1="$work/$n.stderr"
+  printf 'ref\n' > "$work/$n.phase"
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.
   # Parse stdout, then append stderr to the saved diagnostic log.
-  (cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" -I "$shim" -r test/unit "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" -I "${UNITTEST_REF_EXT_PATH:-$shim}" -I "$shim" -r test/unit "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   ref_code=$?
   ro="$(verdicts < "$out1")"
   ref_found="$(printf '%s\n' "$ro" | awk 'NF {n++} END {print n+0}')"
   ref_coverage="$(coverage "$out1" "$ref_code" "$ref_found")"
+  printf '%s\n' "$ref_coverage" > "$work/$n.ref-coverage"
   cat "$err1" >> "$out1"
   [ -z "${UNITTEST_KEEP:-}" ] || cp "$out1" "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').reference.out"
+  printf 'mere\n' > "$work/$n.phase"
   (cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$shim" -r test/unit "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   mo="$(verdicts < "$out1")"

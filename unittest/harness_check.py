@@ -203,6 +203,26 @@ exit "$(cat "$FIXTURE_ROOT/$side.code")"
         self.assertIn("MATCH 0, RED 0, BOTH 1, EXTRA 0",
                       self.run_harness("ruby/test_ok.rb").stdout)
 
+    def test_explicit_reference_binary_is_verified_and_preserved(self):
+        binary = self.root / "custom-reference"
+        binary.write_text("#!/bin/sh\nprintf fixture\n")
+        binary.chmod(0o755)
+        result = subprocess.run(["sh", "-c", '. "$1"; printf "%s" "$REF_RUBY_BIN"',
+                                 "reference-check", str(ROOT / "tools/ref_ruby.sh")],
+                                env=dict(self.env, REF_RUBY_BIN=str(binary), REF_RUBY_VERSION="fixture"),
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, str(binary))
+
+    def test_wrong_explicit_reference_version_is_refused(self):
+        binary = self.root / "wrong-reference"
+        binary.write_text("#!/bin/sh\nprintf wrong\n")
+        binary.chmod(0o755)
+        result = subprocess.run(["sh", "-c", '. "$1"', "reference-check", str(ROOT / "tools/ref_ruby.sh")],
+                                env=dict(self.env, REF_RUBY_BIN=str(binary), REF_RUBY_VERSION="fixture"),
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

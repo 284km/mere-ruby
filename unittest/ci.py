@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Plan, bound and collect the CRuby test measurement used by CI."""
+import argparse
+import csv
+import hashlib
+import json
+import os
+import platform
+import re
+import signal
+import subprocess
+import tempfile
+import time
+from collections import Counter
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+COUNTS = ("tests", "match", "red", "both", "extra")
+COVERAGE = ("ref_state", "ref_exit", "ref_summary_tests", "ref_discovered_tests",
+            "mere_state", "mere_exit", "mere_summary_tests", "mere_discovered_tests")
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def save(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".new")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    temp.replace(path)
+
+
+def load(path):
+    return json.loads(Path(path).read_text())
+
+
+def plan(args):
+    files = subprocess.check_output(
+        ["sh", str(ROOT / "unittest/list.sh"), str(args.ruby_src), "--all"], text=True).splitlines()
+    if not files or len(files) != len(set(files)) or not 1 <= args.shards <= 256:
+        raise ValueError("empty/duplicate manifest or invalid shard count")
+    if any(not re.fullmatch(r"[0-9a-f]{40}", getattr(args, key)) for key in ("source_ref", "mere_ref", "ruby_ref")):
+        raise ValueError("measurement source refs must be full commit SHAs")
+    manifest = dict(schema=1, source_ref=args.source_ref, mere_ref=args.mere_ref,
+                    ruby_ref=args.ruby_ref, ruby_version=args.ruby_version,
+                    shards=min(args.shards, len(files)), files=files)
+    save(args.output / "manifest.json", manifest)
+    (args.output / "files.txt").write_text("\n".join(files) + "\n")
+    matrix = {"shard": list(range(manifest["shards"]))}
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as file:
+            file.write("matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n")
+    print(f"Planned {len(files)} files in {manifest['shards']} shards")
+
+
+def build_info(args):
+    def revision(path):
+        return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
+    value = dict(source_ref=revision(ROOT), mere_ref=revision(args.compiler),
+                 binary_sha256=digest(ROOT / "mere-ruby"),
+                 optimization=(ROOT / ".build_mode").read_text().strip(),
+                 os=platform.system(), arch=platform.machine())
+    if value["optimization"] != "O2":
+        raise ValueError("measurement requires an O2 build")
+    save(args.output, value)
+
+
+def reference_info(args):
+    save(args.output, dict(
+        ruby_ref=subprocess.check_output(["git", "-C", str(args.ruby_src), "rev-parse", "HEAD"], text=True).strip(),
+        version=subprocess.check_output([str(args.binary.resolve()), "-e", "print RUBY_VERSION"], text=True),
+        binary_sha256=digest(args.binary)))
+
+
+def group_rss(group):
+    # Only this worker's new process group can be killed. Do not start the
+    # historical global rss_guard, which could target another build or run.
+    output = subprocess.check_output(["ps", "-axo", "pgid=,rss="], text=True)
+    return sum(int(parts[1]) for line in output.splitlines()
+               if len(parts := line.split()) == 2 and int(parts[0]) == group)
+
+
+def stop_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def supervise(command, env, log, rss_kb, seconds):
+    start = time.monotonic()
+    peak = 0
+    limit = None
+    with log.open("wb") as output:
+        process = subprocess.Popen(command, env=env, stdout=output, stderr=output, start_new_session=True)
+        try:
+            while process.poll() is None:
+                peak = max(peak, group_rss(process.pid))
+                if peak > rss_kb:
+                    limit = "MEMORY_LIMIT"
+                    break
+                if time.monotonic() - start > seconds:
+                    limit = "WALL_LIMIT"
+                    break
+                time.sleep(0.1)
+        finally:
+            # Also reap subprocesses that outlive an otherwise finished test.
+            stop_group(process)
+    return dict(exit=process.returncode, peak_rss_kb=peak,
+                seconds=round(time.monotonic() - start, 3), limit=limit)
+
+
+def sanitize(source, target):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.check_output(
+        ["sh", "-c", '. "$1"; strip_noise < "$2"', "mask",
+         str(ROOT / "mspec/mask.sh"), str(source)], env=dict(os.environ, LC_ALL="C"))
+    cap = 2 * 1024 * 1024
+    if len(result) > cap:
+        result = result[:cap].decode("utf-8", "replace").encode() + b"\n[diagnostic log truncated at 2 MiB]\n"
+    target.write_bytes(result)
+
+
+def run_shard(args):
+    manifest = load(args.plan)
+    build = load(args.build_info)
+    reference = load(args.reference_info)
+    binary = Path(os.environ.get("MR_BIN", ROOT / "mere-ruby")).resolve()
+    if (build["source_ref"] != manifest["source_ref"] or build["mere_ref"] != manifest["mere_ref"]
+            or build["binary_sha256"] != digest(binary) or build["optimization"] != "O2"):
+        raise ValueError("build does not match this measurement plan")
+    if (reference["ruby_ref"] != manifest["ruby_ref"] or reference["version"] != manifest["ruby_version"]
+            or reference["binary_sha256"] != digest(os.environ["REF_RUBY_BIN"])):
+        raise ValueError("reference does not match this measurement plan")
+    if not 0 <= args.shard < manifest["shards"]:
+        raise ValueError("shard index out of range")
+    if args.wall <= 0 or args.rss_kb <= 0:
+        raise ValueError("measurement bounds must be positive")
+    files = manifest["files"][args.shard::manifest["shards"]]
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    result = dict(schema=1, shard=args.shard, source_ref=manifest["source_ref"],
+                  mere_ref=manifest["mere_ref"], ruby_ref=manifest["ruby_ref"],
+                  binary_sha256=build["binary_sha256"],
+                  reference_sha256=digest(os.environ["REF_RUBY_BIN"]),
+                  bounds=dict(wall_per_side=args.wall, rss_group_kb=args.rss_kb),
+                  rows=[dict(file=file, ref_state="NOT_RUN", mere_state="NOT_RUN") for file in files])
+    save(output / "result.json", result)
+    infra_error = False
+    # Raw outputs stay outside the artifact. Only masked logs are uploaded.
+    with tempfile.TemporaryDirectory(prefix="mere-ruby-measurement-") as private:
+        private = Path(private)
+        work = private / "work"
+        raw = private / "raw"
+        work.mkdir(); raw.mkdir()
+        env = dict(os.environ, MR_BIN=str(binary), UNITTEST_RECORD_DIR=str(private / "records"),
+                   UNITTEST_KEEP=str(raw), UNITTEST_WALL=str(args.wall),
+                   REF_RUBY_VERSION=manifest["ruby_version"])
+        for index, file in enumerate(files):
+            row = dict(file=file, **dict.fromkeys(COUNTS), ref_state="NOT_RUN", mere_state="NOT_RUN")
+            log = private / "driver.log"
+            try:
+                run = supervise(["sh", str(ROOT / "unittest/run.sh"), str(args.ruby_src.resolve()),
+                                 "--one", str(work), str(index), file], env, log,
+                                args.rss_kb, args.wall * 2 + 60)
+                row["execution"] = run
+                coverage = work / f"{index}.coverage"
+                counts = work / f"{index}.row"
+                if coverage.exists() and counts.exists():
+                    values = coverage.read_text().strip().split("\t")
+                    if values[0] != file or len(values) != 9:
+                        raise ValueError("invalid worker coverage row")
+                    row.update(zip(COVERAGE, values[1:]))
+                    for side in ("ref", "mere"):
+                        if row[side + "_state"] == "INCOMPLETE" and row[side + "_exit"] == "142":
+                            row[side + "_state"] = "WALL_LIMIT"
+                    numbers = list(map(int, counts.read_text().split()))
+                    if len(numbers) != 5 or numbers[0] != sum(numbers[1:]) or min(numbers) < 0:
+                        raise ValueError("invalid worker test counts")
+                    row.update(zip(COUNTS, numbers))
+                elif run["limit"]:
+                    phase = (work / f"{index}.phase").read_text().strip()
+                    if phase not in ("ref", "mere"):
+                        raise ValueError("invalid worker phase")
+                    row[phase + "_state"] = run["limit"]
+                    if phase == "mere" and (work / f"{index}.ref-coverage").exists():
+                        row.update(zip(COVERAGE[:4], (work / f"{index}.ref-coverage").read_text().strip().split("\t")))
+                else:
+                    raise ValueError("worker did not publish a result")
+            except Exception as error:
+                row.update(ref_state="INFRA_ERROR", mere_state="INFRA_ERROR", error=type(error).__name__)
+                infra_error = True
+            finally:
+                key = file[:-3].replace("/", "_")
+                try:
+                    for name in (key + ".out", key + ".reference.out"):
+                        if (raw / name).exists():
+                            sanitize(raw / name, output / "logs" / name)
+                    for suffix in ("stdout", "stderr"):
+                        partial = work / f"{index}.{suffix}"
+                        if partial.exists():
+                            sanitize(partial, output / "logs" / (key + ".partial." + suffix))
+                    tag = private / "records/tags" / (key + ".txt")
+                    if tag.exists():
+                        sanitize(tag, output / "tags" / tag.name)
+                    if log.exists():
+                        sanitize(log, output / "logs" / (key + ".driver.out"))
+                except Exception as error:
+                    row["log_error"] = type(error).__name__
+                    infra_error = True
+                result["rows"][index] = row
+                save(output / "result.json", result)
+            print(f"{file}: {row['ref_state']} / {row['mere_state']}", flush=True)
+    result["infrastructure_error"] = infra_error
+    save(output / "result.json", result)
+    return int(infra_error)
+
+
+def merge(args):
+    manifest = load(args.plan)
+    expected = manifest["files"]
+    rows = {file: dict(file=file, ref_state="MISSING_SHARD", mere_state="MISSING_SHARD") for file in expected}
+    seen = set()
+    shards = set()
+    binary_hashes = set()
+    reference_hashes = set()
+    bounds = set()
+    errors = []
+    for path in sorted(args.input.rglob("result.json")):
+        try:
+            result = load(path)
+            shard = result["shard"]
+            if shard in shards or not 0 <= shard < manifest["shards"]:
+                raise ValueError("duplicate or invalid shard")
+            if any(result[key] != manifest[key] for key in ("source_ref", "mere_ref", "ruby_ref")):
+                raise ValueError("shard provenance differs")
+            wanted = expected[shard::manifest["shards"]]
+            if [row["file"] for row in result["rows"]] != wanted:
+                raise ValueError("shard file list differs")
+            for row in result["rows"]:
+                if row["file"] in seen:
+                    raise ValueError("duplicate file")
+                numbers = [row.get(key) for key in COUNTS]
+                if not all(value is None for value in numbers):
+                    if (not all(type(value) is int and value >= 0 for value in numbers)
+                            or numbers[0] != sum(numbers[1:])):
+                        raise ValueError("invalid case counts")
+                if not isinstance(row["ref_state"], str) or not isinstance(row["mere_state"], str):
+                    raise ValueError("invalid execution state")
+            shards.add(shard)
+            binary_hashes.add(result["binary_sha256"])
+            reference_hashes.add(result["reference_sha256"])
+            bounds.add(json.dumps(result["bounds"], sort_keys=True))
+            if result.get("infrastructure_error"):
+                errors.append(f"Shard {shard} reported an infrastructure error")
+            for row in result["rows"]:
+                seen.add(row["file"])
+                rows[row["file"]] = row
+        except (ValueError, KeyError, TypeError) as error:
+            errors.append(f"Invalid shard artifact: {type(error).__name__}")
+    if len(binary_hashes) > 1 or len(reference_hashes) > 1:
+        errors.append("Different interpreter binaries were measured")
+    if len(bounds) > 1:
+        errors.append("Different resource bounds were measured")
+    totals = {key: sum(row.get(key) or 0 for row in rows.values()) for key in COUNTS}
+    incomplete = sum(row["ref_state"] != "COMPLETE" or row["mere_state"] != "COMPLETE" for row in rows.values())
+    missing = sum(row["ref_state"] in ("MISSING_SHARD", "NOT_RUN", "INFRA_ERROR")
+                  and row["mere_state"] in ("MISSING_SHARD", "NOT_RUN", "INFRA_ERROR") for row in rows.values())
+    # An interrupted file is attempted and remains visible, even if no case
+    # counts survived. A missing shard or unattempted file is an infrastructure failure.
+    failed = bool(errors or missing or len(shards) != manifest["shards"])
+    summary = dict(source_ref=manifest["source_ref"], mere_ref=manifest["mere_ref"],
+                   ruby_ref=manifest["ruby_ref"], expected_files=len(expected),
+                   received_shards=len(shards), expected_shards=manifest["shards"],
+                   incomplete_files=incomplete, missing_files=missing, totals=totals,
+                   ref_states=dict(Counter(row["ref_state"] for row in rows.values())),
+                   mere_states=dict(Counter(row["mere_state"] for row in rows.values())),
+                   binary_sha256=sorted(binary_hashes), reference_sha256=sorted(reference_hashes),
+                   resource_bounds=[json.loads(value) for value in sorted(bounds)],
+                   infrastructure_errors=errors, measurement_collected=not failed)
+    save(args.output / "summary.json", summary)
+    args.output.mkdir(parents=True, exist_ok=True)
+    fields = ["file", *COUNTS, *COVERAGE]
+    with (args.output / "files.tsv").open("w", newline="") as file:
+        writer = csv.DictWriter(file, fields, delimiter="\t", lineterminator="\n", extrasaction="ignore")
+        writer.writeheader(); writer.writerows(rows.values())
+    lines = ["# CRuby test measurement", "",
+             f"Files: {len(expected)} planned; {missing} missing; {incomplete} incomplete or zero-test.",
+             f"Shards: {len(shards)}/{manifest['shards']} received.", "",
+             "| named tests | MATCH | RED | BOTH | EXTRA |", "|---:|---:|---:|---:|---:|",
+             "| " + " | ".join(str(totals[key]) for key in COUNTS) + " |", "",
+             "Counts cover named tests only. Zero-test and incomplete files remain in files.tsv.",
+             "Collected results do not mean Ruby conformance: RED, BOTH, EXTRA and file coverage need review.", "",
+             f"mere-ruby source: `{manifest['source_ref']}`", f"Mere compiler: `{manifest['mere_ref']}`",
+             f"Ruby tests: `{manifest['ruby_ref']}`", "", *errors, ""]
+    (args.output / "SUMMARY.md").write_text("\n".join(lines))
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as file:
+            file.write("\n".join(lines))
+    return int(failed)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    command = commands.add_parser("plan")
+    command.add_argument("--ruby-src", type=Path, required=True)
+    command.add_argument("--output", type=Path, required=True)
+    command.add_argument("--shards", type=int, default=64)
+    for key in ("source-ref", "mere-ref", "ruby-ref", "ruby-version"):
+        command.add_argument("--" + key, required=True)
+    command.set_defaults(func=plan)
+    command = commands.add_parser("build-info")
+    command.add_argument("--compiler", type=Path, required=True)
+    command.add_argument("--output", type=Path, required=True)
+    command.set_defaults(func=build_info)
+    command = commands.add_parser("reference-info")
+    for key in ("ruby-src", "binary", "output"):
+        command.add_argument("--" + key, type=Path, required=True)
+    command.set_defaults(func=reference_info)
+    command = commands.add_parser("run")
+    for key in ("ruby-src", "plan", "build-info", "reference-info", "output"):
+        command.add_argument("--" + key, type=Path, required=True)
+    command.add_argument("--shard", type=int, required=True)
+    command.add_argument("--wall", type=int, default=600)
+    command.add_argument("--rss-kb", type=int, default=2097152)
+    command.set_defaults(func=run_shard)
+    command = commands.add_parser("merge")
+    for key in ("plan", "input", "output"):
+        command.add_argument("--" + key, type=Path, required=True)
+    command.set_defaults(func=merge)
+    args = parser.parse_args()
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
