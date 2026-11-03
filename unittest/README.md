@@ -131,6 +131,44 @@ The load paths propagate to `assert_separately` children; the extra context is
 not applied to mere-ruby or other test groups. The reference build job checks
 both actual C compilation/linking and a test that starts a separate Ruby.
 
+`test_data.py` installs Unicode 17.0.0 `CaseFolding.txt` from its versioned
+Unicode URL and verifies its pinned SHA-256 before use. The runtime archive
+includes the data, and every shard verifies it against the reference build
+provenance. This prevents 58 named casefold tests from appearing measured
+while performing zero assertions after a missing-data skip.
+
+The pinned RubyGems Cargo tests still call the upstream `exe/gem` entry point,
+whereas Ruby stores it in `bin/gem`. Preparation copies the exact pinned
+entry point to `exe/gem`, records its hash and verifies it on restoration.
+No test definitions or assertions are changed.
+
+Each file receives a fresh `GEM_TEST_TMPDIR` outside the Ruby checkout, avoiding
+accidental membership in Ruby's Cargo workspace. Its `CARGO_HOME` is also fresh.
+The reference job and every shard install Rust 1.85.0 and select its actual
+toolchain binaries using `UNITTEST_RUST_BIN`; these work with an empty HOME
+without inheriting rustup configuration or Cargo credentials. Both interpreters
+receive the same toolchain. Actual cargo/rustc versions and data hashes are
+recorded, and collection rejects mixed inputs.
+
+`environment_smoke.py` uses the normal process-family supervisor, a 300-second
+wall limit and 2 GiB family RSS limit. It requires the 58 casefold tests to
+perform assertions without failures/skips. Four Cargo smoke cases cover an
+extension build, an expected build failure, and two gem install/load paths.
+Sanitized logs and summaries are retained as `reference-environment-smoke`.
+The full measurement still runs all nine Cargo tests. In the pinned upstream
+`refute_ffi_handle`, `assert_raise` has no exception class: CRuby's test runner
+rejects the expected `Fiddle::DLError`. That reference failure remains visible
+in the full measurement; the environment smoke uses the four functional paths.
+
+`reference_conditions.tsv` classifies all 26 reference ZERO files from the
+macOS baseline. They require Windows (five), DTrace/SystemTap (12), a Solaris/
+Linux-only extension (one), development ABI checks (one), an alternate parser
+(two), DBM (two), OpenSSL::Engine (one), SHAPE_DEBUG (one), or are an intentional
+empty sentinel (one). The merged `files.tsv` includes the condition and needed
+configuration; the summary lists counts and newly unclassified ZERO files.
+These rows stay ZERO and never count as passing. Alternate-platform/build
+measurements must retain their own provenance instead of mixing into macOS.
+
 `unittest/ci.py` partitions the manifest into 64 shards with no overlapping files.
 At most four macOS measurement jobs run at once. Each file runs sequentially:
 each interpreter has a 600-second wall limit, and the tracked process family
@@ -227,7 +265,8 @@ not that Ruby conformance was achieved. Missing/unattempted files, inconsistent
 revisions, binaries, bounds or counts, and infrastructure errors fail collection.
 Read `files.tsv` as well as the four verdict totals before comparing runs.
 
-The binary hash, actual source commits and reference hash must agree across
+The binary hash, actual source commits, reference hash, prepared test data and
+Rust toolchain must agree across
 shards. This prevents combining a partial run, another compiler build or another
 Ruby version into one measurement. Result files are artifacts; CI does not
 commit a partial sweep over the checked-in historical records.
@@ -235,6 +274,7 @@ commit a partial sweep over the checked-in historical records.
 ```sh
 python3 unittest/ci_check.py -v
 python3 unittest/transcript_check.py -v
+python3 unittest/test_data_check.py -v
 python3 unittest/process_family_check.py -v
 ```
 

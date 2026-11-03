@@ -421,6 +421,67 @@ print(json.dumps({"parent_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrs
         self.assertEqual(env["HOME"], str(private / "home"))
         self.assertEqual(list((private / "home").iterdir()), [])
         self.assertEqual(env["UNITTEST_SEED"], "1")
+        self.assertEqual(env['GEM_TEST_TMPDIR'], str(private / 'tmp/gems'))
+        self.assertEqual(env['CARGO_HOME'], str(private / 'cargo'))
+        self.assertFalse(Path(env['CARGO_HOME']).exists())
+
+    def test_direct_rust_binaries_work_with_an_empty_home_and_no_parent_config(self):
+        directory = self.root / 'toolchain/bin'
+        directory.mkdir(parents=True)
+        for name in ('rustc', 'cargo'):
+            path = directory / name
+            path.write_text('#!/bin/sh\nprintf "%s fixture\\n" "${0##*/}"\n')
+            path.chmod(0o755)
+        private = self.root / 'rust-environment'
+        with patch.dict(os.environ, dict(UNITTEST_RUST_BIN=str(directory),
+                                        CARGO_HOME='/secret/cargo', RUSTUP_HOME='/secret/rustup',
+                                        RUSTUP_TOOLCHAIN='private-toolchain')):
+            env = ci.test_environment(private, self.root / 'mere-ruby', 'fixture')
+            info = ci.rust_info()
+        self.assertEqual(info, dict(rustc='rustc fixture', cargo='cargo fixture'))
+        self.assertTrue(env['PATH'].startswith(str(directory.resolve()) + os.pathsep))
+        self.assertEqual(env['RUSTC'], str(directory.resolve() / 'rustc'))
+        self.assertNotIn('RUSTUP_HOME', env)
+        self.assertNotIn('RUSTUP_TOOLCHAIN', env)
+        self.assertNotEqual(env['CARGO_HOME'], '/secret/cargo')
+        self.assertEqual(subprocess.check_output(['cargo', '--version'], env=env, text=True).strip(), 'cargo fixture')
+
+    def test_changed_test_data_or_rust_toolchain_cannot_be_merged(self):
+        self.run_shard(0)
+        self.run_shard(1)
+        path = self.output / '1/result.json'
+        result = ci.load(path)
+        result['rust_toolchain'] = dict(rustc='different', cargo='different')
+        ci.save(path, result)
+        self.assertEqual(self.merge(), 1)
+        result['rust_toolchain'] = None
+        result['test_data'] = dict(sha256='different')
+        ci.save(path, result)
+        self.assertEqual(self.merge(), 1)
+
+    def test_changed_restored_test_data_stops_before_running_a_shard(self):
+        reference = ci.load(self.reference)
+        reference['test_data'] = dict(sha256='original')
+        ci.save(self.reference, reference)
+        with patch.object(ci.test_data, 'verify', return_value=dict(sha256='changed')):
+            with self.assertRaises(ValueError):
+                self.run_shard(0)
+        self.assertFalse((self.output / '0/result.json').exists())
+
+    def test_zero_conditions_explain_known_files_without_hiding_new_zero_results(self):
+        file = ci.load(self.plan_path)['files'][0]
+        (self.root / 'unittest/reference_conditions.tsv').write_text(
+            'file\tcondition\tevidence\tneeded\n' + file + '\twindows\tPlatform guard\tRun on Windows\n')
+        self.fixture.transcript('reference', '0 tests, 0 assertions, 0 failures, 0 errors, 0 skips\n')
+        self.run_shard(0)
+        self.run_shard(1)
+        self.assertEqual(self.merge(), 0)
+        summary = ci.load(self.root / 'report/summary.json')
+        self.assertEqual(summary['ref_states'], {'ZERO': 3})
+        self.assertEqual(summary['ref_zero_conditions'], dict(windows=1, UNCLASSIFIED=2))
+        self.assertEqual(len(summary['ref_zero_unclassified']), 2)
+        self.assertEqual(summary['totals']['match'], 0)
+        self.assertIn('Run on Windows', (self.root / 'report/files.tsv').read_text())
 
     @unittest.skipUnless(REAL_RUBY and REAL_TOOL_LIB, "set UNITTEST_REAL_RUBY and UNITTEST_REAL_TOOL_LIB for the real Test::Unit fixture")
     def test_real_test_unit_inspected_names_and_inline_stdout(self):
