@@ -1,0 +1,319 @@
+// AES-128/192/256 CBC and ECB streams: FIPS 197 and SP 800-38A.
+// Table lookups are not constant-time; this is an experimental interpreter
+// implementation, not a replacement for a hardened native crypto provider.
+let openssl_cipher_source =
+  "  class Cipher\n" ++
+  "    class CipherError < OpenSSLError; end\n" ++
+  "    class AuthTagError < CipherError; end\n" ++
+  "\n" ++
+  "    SBOX = [\n" ++
+  "      '637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0' \\\n" ++
+  "      'b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b275' \\\n" ++
+  "      '09832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cf' \\\n" ++
+  "      'd0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2' \\\n" ++
+  "      'cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdb' \\\n" ++
+  "      'e0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08' \\\n" ++
+  "      'ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9e' \\\n" ++
+  "      'e1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16'\n" ++
+  "    ].pack('H*').bytes.freeze\n" ++
+  "    INV_SBOX = Array.new(256)\n" ++
+  "    SBOX.each_with_index \{ |value, index| INV_SBOX[value] = index }\n" ++
+  "    INV_SBOX.freeze\n" ++
+  "\n" ++
+  "    def self.new(*args)\n" ++
+  "      object = allocate\n" ++
+  "      object.send(:initialize, *args)\n" ++
+  "      object\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def self.ciphers\n" ++
+  "      [128, 192, 256].flat_map \{ |bits| [\"aes-#\{bits}-cbc\", \"aes-#\{bits}-ecb\", \"aes#\{bits}\"] }.sort\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def name\n" ++
+  "      __initialized!\n" ++
+  "      @name.dup\n" ++
+  "    end\n" ++
+  "    def key_len\n" ++
+  "      __initialized!\n" ++
+  "      @key_len\n" ++
+  "    end\n" ++
+  "    def iv_len\n" ++
+  "      __initialized!\n" ++
+  "      @iv_len\n" ++
+  "    end\n" ++
+  "    def initialize(name)\n" ++
+  "      raise RuntimeError, 'Cipher already initialized' if @name\n" ++
+  "      name = OpenSSL.__str(name).upcase\n" ++
+  "      name = \"AES-#\{name[3..]}-CBC\" if /\\AAES(128|192|256)\\z/.match?(name)\n" ++
+  "      match = /\\AAES-(128|192|256)-(CBC|ECB)\\z/.match(name)\n" ++
+  "      raise CipherError, 'unsupported cipher algorithm' unless match\n" ++
+  "      @name, @mode = name, match[2]\n" ++
+  "      @key_len = match[1].to_i / 8\n" ++
+  "      @iv_len = @mode == 'CBC' ? 16 : 0\n" ++
+  "      @padding = true\n" ++
+  "      @encrypt = false\n" ++
+  "      @initial_iv = \"\\0\".b * @iv_len\n" ++
+  "      reset\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def initialize_copy(other)\n" ++
+  "      super\n" ++
+  "      @key = @key.dup if @key\n" ++
+  "      @round_keys = @round_keys.dup if @round_keys\n" ++
+  "      @initial_iv = @initial_iv.dup\n" ++
+  "      @chain = @chain.dup\n" ++
+  "      @buffer = @buffer.dup\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def encrypt\n" ++
+  "      __initialized!\n" ++
+  "      @encrypt = true\n" ++
+  "      @key = @round_keys = nil\n" ++
+  "      reset\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def decrypt\n" ++
+  "      __initialized!\n" ++
+  "      @encrypt = false\n" ++
+  "      @key = @round_keys = nil\n" ++
+  "      reset\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def reset\n" ++
+  "      __initialized!\n" ++
+  "      @buffer = ''.b\n" ++
+  "      @chain = @initial_iv.bytes\n" ++
+  "      self\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def block_size\n" ++
+  "      __initialized!\n" ++
+  "      16\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def authenticated?\n" ++
+  "      __initialized!\n" ++
+  "      false\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def key=(value)\n" ++
+  "      __initialized!\n" ++
+  "      value = OpenSSL.__str(value)\n" ++
+  "      raise ArgumentError, \"key must be #\{@key_len} bytes\" unless value.bytesize == @key_len\n" ++
+  "      @key = value.b.dup\n" ++
+  "      @round_keys = __expand_key(@key.bytes)\n" ++
+  "      reset\n" ++
+  "      value\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def key_len=(length)\n" ++
+  "      __initialized!\n" ++
+  "      length = __integer(length)\n" ++
+  "      raise CipherError, 'invalid key length' unless length == @key_len\n" ++
+  "      length\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def iv=(value)\n" ++
+  "      __initialized!\n" ++
+  "      value = OpenSSL.__str(value)\n" ++
+  "      raise ArgumentError, \"iv must be #\{@iv_len} bytes\" unless value.bytesize == @iv_len\n" ++
+  "      @initial_iv = value.b.dup\n" ++
+  "      reset\n" ++
+  "      value\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def iv_len=(length)\n" ++
+  "      __initialized!\n" ++
+  "      length = __integer(length)\n" ++
+  "      raise CipherError, 'invalid iv length' unless length == @iv_len\n" ++
+  "      length\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def padding=(value)\n" ++
+  "      __initialized!\n" ++
+  "      @padding = __integer(value) != 0\n" ++
+  "      value\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def random_key\n" ++
+  "      __initialized!\n" ++
+  "      self.key = Random.random_bytes(@key_len)\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def random_iv\n" ++
+  "      __initialized!\n" ++
+  "      self.iv = Random.random_bytes(@iv_len)\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def update(data, output = nil)\n" ++
+  "      __ready!\n" ++
+  "      data = OpenSSL.__str(data).b.dup\n" ++
+  "      raise ArgumentError, 'data must not be empty' if data.empty?\n" ++
+  "      output = OpenSSL.__str(output) unless output.nil?\n" ++
+  "      output.replace(''.b) if output\n" ++
+  "      @buffer << data\n" ++
+  "      result = ''.b\n" ++
+  "      hold = !@encrypt && @padding ? 16 : 0\n" ++
+  "      while @buffer.bytesize >= 16 + hold\n" ++
+  "        result << __block(@buffer.byteslice(0, 16).bytes).pack('C*')\n" ++
+  "        @buffer = @buffer.byteslice(16..)\n" ++
+  "      end\n" ++
+  "      return result unless output\n" ++
+  "      output.replace(result)\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def final\n" ++
+  "      __ready!\n" ++
+  "      if @encrypt\n" ++
+  "        if @padding\n" ++
+  "          length = 16 - @buffer.bytesize\n" ++
+  "          block = @buffer + [length].pack('C') * length\n" ++
+  "          @buffer = ''.b\n" ++
+  "          __block(block.bytes).pack('C*')\n" ++
+  "        else\n" ++
+  "          raise CipherError, 'wrong final block length' unless @buffer.empty?\n" ++
+  "          ''.b\n" ++
+  "        end\n" ++
+  "      elsif @padding\n" ++
+  "        raise CipherError, 'wrong final block length' unless @buffer.bytesize == 16\n" ++
+  "        plain = __block(@buffer.bytes)\n" ++
+  "        @buffer = ''.b\n" ++
+  "        length = plain[-1]\n" ++
+  "        unless length && length.between?(1, 16) && plain[-length, length].all? \{ |byte| byte == length }\n" ++
+  "          raise CipherError, 'bad decrypt'\n" ++
+  "        end\n" ++
+  "        plain[0, 16 - length].pack('C*')\n" ++
+  "      else\n" ++
+  "        raise CipherError, 'wrong final block length' unless @buffer.empty?\n" ++
+  "        ''.b\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def pkcs5_keyivgen(password, salt = nil, iterations = 2048, digest = 'MD5')\n" ++
+  "      __initialized!\n" ++
+  "      password = OpenSSL.__str(password).b\n" ++
+  "      salt = OpenSSL.__str(salt).b unless salt.nil?\n" ++
+  "      raise ArgumentError, 'salt must be an 8-octet string' if salt && salt.bytesize != 8\n" ++
+  "      iterations = __integer(iterations)\n" ++
+  "      raise ArgumentError, 'iterations must be positive' unless iterations > 0\n" ++
+  "      digest = digest.name if OpenSSL::Digest === digest\n" ++
+  "      material = ''.b\n" ++
+  "      previous = ''.b\n" ++
+  "      while material.bytesize < @key_len + @iv_len\n" ++
+  "        previous = OpenSSL::Digest.digest(digest, previous + password + (salt || ''.b))\n" ++
+  "        (iterations - 1).times \{ previous = OpenSSL::Digest.digest(digest, previous) }\n" ++
+  "        material << previous\n" ++
+  "      end\n" ++
+  "      self.key = material.byteslice(0, @key_len)\n" ++
+  "      self.iv = material.byteslice(@key_len, @iv_len)\n" ++
+  "      nil\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    private\n" ++
+  "    def __initialized!\n" ++
+  "      raise RuntimeError, 'Cipher not initialized!' unless @name\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def __ready!\n" ++
+  "      __initialized!\n" ++
+  "      raise CipherError, 'key not set' unless @key\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def __integer(value)\n" ++
+  "      return value if Integer === value\n" ++
+  "      raise TypeError, 'no implicit conversion into Integer' unless value.respond_to?(:to_int)\n" ++
+  "      value = value.to_int\n" ++
+  "      raise TypeError, 'to_int did not return Integer' unless Integer === value\n" ++
+  "      value\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def __xtime(value)\n" ++
+  "      ((value << 1) ^ ((value & 128) == 0 ? 0 : 0x11b)) & 255\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    # FIPS 197, KEYEXPANSION: byte words, including AES-256's extra SUBWORD.\n" ++
+  "    def __expand_key(key)\n" ++
+  "      result = key.dup\n" ++
+  "      @rounds = key.length / 4 + 6\n" ++
+  "      round_constant = 1\n" ++
+  "      while result.length < (@rounds + 1) * 16\n" ++
+  "        word = result[-4, 4]\n" ++
+  "        if result.length % key.length == 0\n" ++
+  "          word = word.rotate.map \{ |byte| SBOX[byte] }\n" ++
+  "          word[0] ^= round_constant\n" ++
+  "          round_constant = __xtime(round_constant)\n" ++
+  "        elsif key.length == 32 && result.length % key.length == 16\n" ++
+  "          word = word.map \{ |byte| SBOX[byte] }\n" ++
+  "        end\n" ++
+  "        4.times \{ |index| result << (result[result.length - key.length] ^ word[index]) }\n" ++
+  "      end\n" ++
+  "      result\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def __add_key(state, round)\n" ++
+  "      16.times \{ |index| state[index] ^= @round_keys[round * 16 + index] }\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def __shift_rows(state, inverse)\n" ++
+  "      16.times.map do |index|\n" ++
+  "        row, column = index % 4, index / 4\n" ++
+  "        source_column = (column + (inverse ? -row : row)) % 4\n" ++
+  "        state[row + source_column * 4]\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def __mix_columns(state, inverse)\n" ++
+  "      4.times do |column|\n" ++
+  "        offset = column * 4\n" ++
+  "        a, b, c, d = state[offset, 4]\n" ++
+  "        if inverse\n" ++
+  "          u = __xtime(__xtime(a ^ c))\n" ++
+  "          v = __xtime(__xtime(b ^ d))\n" ++
+  "          a ^= u; c ^= u; b ^= v; d ^= v\n" ++
+  "        end\n" ++
+  "        total = a ^ b ^ c ^ d\n" ++
+  "        state[offset] = a ^ total ^ __xtime(a ^ b)\n" ++
+  "        state[offset + 1] = b ^ total ^ __xtime(b ^ c)\n" ++
+  "        state[offset + 2] = c ^ total ^ __xtime(c ^ d)\n" ++
+  "        state[offset + 3] = d ^ total ^ __xtime(d ^ a)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def __aes(state)\n" ++
+  "      if @encrypt\n" ++
+  "        __add_key(state, 0)\n" ++
+  "        1.upto(@rounds) do |round|\n" ++
+  "          state = state.map \{ |byte| SBOX[byte] }\n" ++
+  "          state = __shift_rows(state, false)\n" ++
+  "          __mix_columns(state, false) unless round == @rounds\n" ++
+  "          __add_key(state, round)\n" ++
+  "        end\n" ++
+  "      else\n" ++
+  "        __add_key(state, @rounds)\n" ++
+  "        (@rounds - 1).downto(0) do |round|\n" ++
+  "          state = __shift_rows(state, true)\n" ++
+  "          state = state.map \{ |byte| INV_SBOX[byte] }\n" ++
+  "          __add_key(state, round)\n" ++
+  "          __mix_columns(state, true) unless round == 0\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "      state\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def __block(input)\n" ++
+  "      if @encrypt\n" ++
+  "        input = input.each_with_index.map \{ |byte, index| byte ^ @chain[index] } if @mode == 'CBC'\n" ++
+  "        result = __aes(input)\n" ++
+  "        @chain = result.dup if @mode == 'CBC'\n" ++
+  "        result\n" ++
+  "      else\n" ++
+  "        result = __aes(input.dup)\n" ++
+  "        if @mode == 'CBC'\n" ++
+  "          result = result.each_with_index.map \{ |byte, index| byte ^ @chain[index] }\n" ++
+  "          @chain = input\n" ++
+  "        end\n" ++
+  "        result\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "  end\n";
