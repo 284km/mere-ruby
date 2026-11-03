@@ -85,13 +85,13 @@ class TestReferenceProbe < Test::Unit::TestCase
 end
 ''')
 
-    def measure(self):
+    def measure(self, file='ruby/test_reference_probe.rb'):
         output = self.root / 'result'
         with patch.object(ci, 'ROOT', self.root), patch.object(ci, 'ProcessFamily', FixtureFamily), \
                 patch.dict(os.environ, dict(self.fixture.env, REF_RUBY_BIN=str(self.root / 'reference'),
                                             UNITTEST_REF_EXT_PATH=str(self.ext), GITHUB_OUTPUT='', GITHUB_STEP_SUMMARY='')):
             ci.save(self.root / 'plan.json', dict(source_ref='a'*40, mere_ref='b'*40, ruby_ref='c'*40,
-                                                 ruby_version=self.version, shards=1, files=['ruby/test_reference_probe.rb']))
+                                                 ruby_version=self.version, shards=1, files=[file]))
             ci.save(self.root / 'build.json', dict(source_ref='a'*40, mere_ref='b'*40,
                                                   binary_sha256=ci.digest(self.root / 'mere-ruby'), optimization='O2'))
             ci.save(self.root / 'reference.json', dict(ruby_ref='c'*40, version=self.version,
@@ -112,6 +112,35 @@ end
         row = self.measure()
         self.assertEqual((row['ref_state'], row['mere_state']), ('INCOMPLETE', 'COMPLETE'), row)
         self.assertEqual((row['match'], row['extra']), (0, 3))
+
+    def test_standalone_prerequisite_is_loaded_for_both_sides(self):
+        (self.root / 'src/test/ruby/test_enum.rb').write_text('''class TestStandalone < Test::Unit::TestCase
+  def test_delegate
+    assert_equal('hello', SimpleDelegator.new('hello').to_s)
+  end
+end
+''')
+        row = self.measure('ruby/test_enum.rb')
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
+        self.assertEqual((row['match'], row['red'], row['both']), (1, 0, 0), row)
+
+    def test_source_library_path_is_kept_in_parent_and_child(self):
+        (self.root / 'src/lib').mkdir()
+        (self.root / 'src/lib/source_fixture.rb').write_text('SOURCE_FIXTURE = "pinned-source"\n')
+        (self.root / 'src/test/rubygems').mkdir()
+        (self.root / 'src/test/rubygems/test_source.rb').write_text('''require 'source_fixture'
+class TestSource < Test::Unit::TestCase
+  def test_source
+    assert_equal('pinned-source', SOURCE_FIXTURE)
+    out, status = Open3.capture2e(ENV.fetch('RUBY'), '-rsource_fixture', '-e', 'print SOURCE_FIXTURE')
+    assert(status.success?, out)
+    assert_equal('pinned-source', out)
+  end
+end
+''')
+        row = self.measure('rubygems/test_source.rb')
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
+        self.assertEqual(row['match'], 1, row)
 
 
 if __name__ == '__main__':

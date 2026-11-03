@@ -131,6 +131,13 @@ Missing native reference extensions stay visible instead of falling back.
 The real-Ruby regression compiles a small extension and checks competing
 native/shim paths in both the parent and a subprocess.
 
+RubyGems tests load the pinned source `lib/` on both sides, including children,
+so repository-specific checks such as `Gem.prefix` inspect the tested source.
+`bootstrap.rb` explicitly preloads the prerequisites that selected files rely
+on from earlier whole-suite tests (Tempfile, tmpdir, FileUtils, delegate or
+socket). Only the named files receive those prerequisites, equally per side.
+This does not change test definitions, assertions or feature guards.
+
 The reference archive also preserves its original build Makefile and static
 Ruby library. After extraction, `prepare_reference.rb` validates those files,
 the source headers and generated config header, then creates a small rbconfig

@@ -34,22 +34,35 @@ def main():
     failed = False
     with tempfile.TemporaryDirectory(prefix='mre-', dir='/tmp') as folder:
         private = Path(folder)
-        for index, (file, count) in enumerate((('ruby/enc/test_regex_casefold.rb', 58),
-                                             ('rubygems/test_gem_ext_cargo_builder.rb', 4))):
+        checks = [
+            ('ruby/enc/test_regex_casefold.rb', 58, None),
+            ('rubygems/test_gem_ext_cargo_builder.rb', 4, '/test_(build_cdylib|build_fail|full_integration|custom_name)/'),
+            ('-ext-/iter/test_iter_break.rb', 1, None),
+            ('-ext-/iter/test_yield_block.rb', 2, None),
+            ('ruby/test_backtrace.rb', 1, '/test_caller_locations_absolute_path$/'),
+            ('ruby/test_file_exhaustive.rb', 2, '/test_(stat_)?socket_p$/'),
+            ('ruby/test_enum.rb', 1, '/test_sum$/'),
+            ('rubygems/test_gem.rb', 1, '/test_self_prefix$/'),
+        ]
+        for index, (file, count, selection) in enumerate(checks):
             work = private / str(index)
             work.mkdir()
             stdout, stderr, metadata = [work / name for name in ('stdout', 'stderr', 'encodings')]
             env = ci.test_environment(work / 'environment', binary, version)
-            env.update(UNITTEST_CASE_ENCODINGS=str(metadata), UNITTEST_STDOUT=str(stdout))
-            command = [str(binary), '-I', str(source / 'tool/lib'), '-I', str(source / 'test'),
-                       '-I', str(source / '.ext' / arch), '-r', 'test/unit',
+            libraries = [source / 'tool/lib', source / 'test', source / '.ext' / arch]
+            if file.startswith('rubygems/'):
+                libraries.insert(0, source / 'lib')
+            env.update(RUBY=str(binary), RUBYLIB=os.pathsep.join(map(str, libraries)), UNITTEST_TEST_FILE=file,
+                       UNITTEST_CASE_ENCODINGS=str(metadata), UNITTEST_STDOUT=str(stdout))
+            command = [str(binary), *[arg for path in libraries for arg in ('-I', str(path))], '-r', 'test/unit',
+                       '-r', str(ci.ROOT / 'unittest/bootstrap.rb'),
                        '-r', str(ci.ROOT / 'unittest/case_encodings.rb'),
                        str(source / 'test' / file), '-v', '--show-skip', '--seed=1']
-            if file.startswith('rubygems/'):
+            if selection:
                 # Exercise build success/failure and both gem install/load
                 # paths. The full sweep still runs all nine upstream tests,
                 # including its argument-less assert_raise defect.
-                command.append('--name=/test_(build_cdylib|build_fail|full_integration|custom_name)/')
+                command.append('--name=' + selection)
             # Keep stdout separate from diagnostics, under the normal family
             # supervisor. Shell arguments remain positional and quoted.
             run = ci.supervise(['sh', '-c', 'exec "$@" > "$UNITTEST_STDOUT"', 'reference-smoke', *command],

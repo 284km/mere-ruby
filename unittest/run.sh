@@ -141,17 +141,21 @@ if [ "${1:-}" = "--one" ]; then
   if [ -n "${UNITTEST_REF_EXT_PATH:-}" ]; then
     ref_lib="$UNITTEST_REF_EXT_PATH:$ref_lib"
   fi
+  mere_lib="$src/tool/lib:$src/test:$shim:$stdlib"
   case "$rel" in
     mkmf/*)
       if [ -f "$src/.unittest-reference/rbconfig.rb" ]; then
         set -- -I "$src/.unittest-reference" -I "$src/lib"
         ref_lib="$src/.unittest-reference:$src/lib:$ref_lib"
       fi ;;
+    rubygems/*)
+      ref_lib="$src/lib:$ref_lib"
+      mere_lib="$src/lib:$mere_lib" ;;
   esac
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.
   # Parse stdout, then append stderr to the saved diagnostic log.
-  (cd "$dir" && RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   ref_code=$?
   printf '%s\n' "$ref_code" > "$work/$n.ref.exit.new"
   mv "$work/$n.ref.exit.new" "$work/$n.ref.exit"
@@ -162,7 +166,7 @@ if [ "${1:-}" = "--one" ]; then
   out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
   printf 'mere\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
-  (cd "$dir" && RUBY="$mr" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$src/tool/lib:$src/test:$shim:$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && RUBY="$mr" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
   mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"

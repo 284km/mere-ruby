@@ -20,7 +20,7 @@ class HarnessCheck(unittest.TestCase):
         self.root = Path(self.temp.name)
         for folder in ["unittest", "tools", "mspec", "src/test/ruby/enc", "src/tool/lib", "bin"]:
             (self.root / folder).mkdir(parents=True)
-        for script in ["run.sh", "list.sh", "transcript.py", "case_encodings.rb"]:
+        for script in ["run.sh", "list.sh", "transcript.py", "case_encodings.rb", "bootstrap.rb"]:
             shutil.copyfile(ROOT / "unittest" / script, self.root / "unittest" / script)
         shutil.copyfile(ROOT / "mspec/mask.sh", self.root / "mspec/mask.sh")
         (self.root / "unittest/files.txt").write_text("ruby\n-ruby/test_vm.rb\n")
