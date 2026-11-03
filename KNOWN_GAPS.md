@@ -4358,7 +4358,15 @@ follows the size of the table and the file cannot MATCH without copying all
 left read the installation's directories (rubylibdir exists, archdir holds
 etc.bundle, sitelibdir is on $LOAD_PATH), which mere-ruby does not have.
 
-**What fixing it would take.** An installation layout of mere-ruby's own.
+`expand` now performs in-place make-variable expansion (including escaped
+`$$`, suffix substitutions and cyclic references). `fire_update!` updates
+transitive dependents using the separate `MAKEFILE_CONFIG` snapshot. The
+empty `configure_args` records that mere-ruby has no Autoconf invocation;
+it also makes Shellwords receive a String. These APIs do not supply a
+CRuby extension ABI or compiler/linker flags.
+
+**What fixing the remaining build integration takes.** An installation
+layout and build metadata of mere-ruby's own.
 
 ## A Proc's instance variables are not carried by #dup / #clone
 
