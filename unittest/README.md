@@ -118,8 +118,18 @@ The corpus job builds mere-ruby once with `tools/build.sh` at O2 and uploads the
 binary before running the corpus. A separate job builds Ruby 4.0.9 and its native
 test extensions and both JITs (with Rust 1.85.0), installs a relocatable
 reference, and verifies the four test
-extensions previously replaced by shims. Reference-only extension paths take
-precedence over those shims; mere-ruby keeps its own Ruby implementations.
+extensions previously replaced by shims. The reference load path excludes
+those shims entirely: Ruby can select a later .rb before an earlier native
+extension. mere-ruby keeps its own Ruby implementations.
+
+Workers launch absolute test paths from each file's directory, preserving
+the source assumptions about `__FILE__` and absolute backtrace locations.
+Each side explicitly selects its running interpreter through `RUBY` and
+passes its helper paths through `RUBYLIB` to children. Only the reference
+receives the native extension directory; only mere-ruby receives the shims.
+Missing native reference extensions stay visible instead of falling back.
+The real-Ruby regression compiles a small extension and checks competing
+native/shim paths in both the parent and a subprocess.
 
 The reference archive also preserves its original build Makefile and static
 Ruby library. After extraction, `prepare_reference.rb` validates those files,
@@ -249,7 +259,9 @@ and the mask wall limit are recorded with the measurement bounds. These limits
 also apply to driver logs, partial output and RED tags.
 
 Both interpreters run with a small environment allowlist and a fresh temporary
-HOME and TMPDIR per file. Only PATH, locale, explicit interpreter/extension paths,
+HOME and TMPDIR per file. The owning temporary directory uses a short private
+path under `/tmp`, so test-generated UNIX socket names fit macOS's 104-byte
+limit; it is reclaimed with the measurement context. Only PATH, locale, explicit interpreter/extension paths,
 the generated process-family identifier and the harness settings are passed;
 parent credentials and GitHub session variables
 are not inherited. This is important for whole Test::Unit failure reports:

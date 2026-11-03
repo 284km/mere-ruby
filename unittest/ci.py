@@ -272,7 +272,7 @@ def run_shard(args):
                   mere_ref=manifest["mere_ref"], ruby_ref=manifest["ruby_ref"],
                   binary_sha256=build["binary_sha256"],
                   reference_sha256=digest(os.environ["REF_RUBY_BIN"]),
-                  environment_policy="allowlist-gem-temp-rust-v2",
+                  environment_policy="isolated-native-reference-v3",
                   test_data=data, rust_toolchain=rust_info(),
                   case_policy=transcript.POLICY,
                   bounds=dict(wall_per_side=args.wall, rss_family_kb=args.rss_kb,
@@ -291,7 +291,9 @@ def run_shard(args):
     save(output / "result.json", result)
     infra_error = False
     # Raw outputs stay outside the artifact. Only masked logs are uploaded.
-    with tempfile.TemporaryDirectory(prefix="mere-ruby-measurement-") as private:
+    # macOS sun_path is limited to 104 bytes. A nested runner TMPDIR can
+    # exceed that before the test adds its own socket filename.
+    with tempfile.TemporaryDirectory(prefix="mru-", dir='/tmp') as private:
         private = Path(private)
         work = private / "work"
         raw = private / "raw"

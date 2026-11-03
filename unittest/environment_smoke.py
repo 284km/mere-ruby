@@ -32,7 +32,7 @@ def main():
         raise ValueError('reference Unicode version differs from the pinned data')
     report = dict(test_data=data, rust_toolchain=rust, results=[])
     failed = False
-    with tempfile.TemporaryDirectory(prefix='mere-reference-environment-') as folder:
+    with tempfile.TemporaryDirectory(prefix='mre-', dir='/tmp') as folder:
         private = Path(folder)
         for index, (file, count) in enumerate((('ruby/enc/test_regex_casefold.rb', 58),
                                              ('rubygems/test_gem_ext_cargo_builder.rb', 4))):
