@@ -32,9 +32,11 @@ def snapshot(marker=None):
     # macOS -E and Linux's BSD-style e show launch environments, even after
     # unsetenv in the process. This recovers fast double-forks that reparent
     # before the next PPID sample. Never retain/log command lines or env values.
-    command = ["ps", "-ww", "-axo", "pid=,ppid=,pgid=,rss=,state=,lstart=,command="]
+    fields = "pid=,ppid=,pgid=,rss=,state=,lstart=,command="
+    command = ["ps", "-ww", "-axo", fields]
     if marker:
-        command.insert(1, "-E" if sys.platform == "darwin" else "e")
+        command = (["ps", "-E", "-ww", "-axo", fields] if sys.platform == "darwin"
+                   else ["ps", "eww", "-eo", fields])
     output = subprocess.check_output(command, text=True, encoding="utf-8", errors="replace", stderr=subprocess.PIPE,
                                      env={"PATH": os.defpath, "LC_ALL": "C"})
     records = {}
