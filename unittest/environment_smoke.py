@@ -24,11 +24,11 @@ def main():
     rust = ci.rust_info()
     if not rust:
         raise ValueError('UNITTEST_RUST_BIN must select the installed toolchain binaries')
-    version, unicode_version, arch = subprocess.check_output(
+    version, unicode_version, emoji_version, arch = subprocess.check_output(
         [str(binary), '-rrbconfig', '-e',
-         'puts RUBY_VERSION, RbConfig::CONFIG.fetch("UNICODE_VERSION"), RbConfig::CONFIG.fetch("arch")'],
+         'puts RUBY_VERSION, RbConfig::CONFIG.fetch("UNICODE_VERSION"), RbConfig::CONFIG.fetch("UNICODE_EMOJI_VERSION"), RbConfig::CONFIG.fetch("arch")'],
         text=True, timeout=10).splitlines()
-    if unicode_version != test_data.VERSION:
+    if unicode_version != test_data.VERSION or emoji_version != test_data.EMOJI_VERSION:
         raise ValueError('reference Unicode version differs from the pinned data')
     report = dict(test_data=data, rust_toolchain=rust, results=[])
     failed = False
@@ -36,6 +36,10 @@ def main():
         private = Path(folder)
         checks = [
             ('ruby/enc/test_regex_casefold.rb', 58, None),
+            ('ruby/enc/test_case_comprehensive.rb', None, None),
+            ('ruby/enc/test_grapheme_breaks.rb', None, None),
+            ('ruby/enc/test_emoji_breaks.rb', None, None),
+            ('test_unicode_normalize.rb', None, None),
             ('rubygems/test_gem_ext_cargo_builder.rb', 4, '/test_(build_cdylib|build_fail|full_integration|custom_name)/'),
             ('-ext-/iter/test_iter_break.rb', 1, None),
             ('-ext-/iter/test_yield_block.rb', 2, None),
@@ -49,7 +53,8 @@ def main():
             work.mkdir()
             stdout, stderr, metadata = [work / name for name in ('stdout', 'stderr', 'encodings')]
             env = ci.test_environment(work / 'environment', binary, version)
-            libraries = [source / 'tool/lib', source / 'test', source / '.ext' / arch]
+            native = Path(os.environ.get('UNITTEST_REF_EXT_PATH', source / '.ext' / arch))
+            libraries = [source / 'tool/lib', source / 'test', native]
             if file.startswith('rubygems/'):
                 libraries.insert(0, source / 'lib')
             env.update(RUBY=str(binary), RUBYLIB=os.pathsep.join(map(str, libraries)), UNITTEST_TEST_FILE=file,
@@ -70,7 +75,8 @@ def main():
             result = transcript.parse(stdout, run['exit'], metadata)
             summary = result['summary']
             passed = (not run['limit'] and result['state'] == 'COMPLETE'
-                      and result['discovered'] == count and summary['assertions'] > 0
+                      and (result['discovered'] == count if count is not None else result['discovered'] > 1)
+                      and summary['assertions'] > 0
                       and all(summary[key] == 0 for key in ('failures', 'errors', 'skips')))
             report['results'].append(dict(file=file, passed=passed, state=result['state'],
                                           summary=summary, discovered=result['discovered'], **run))

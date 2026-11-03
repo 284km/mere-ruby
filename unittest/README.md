@@ -148,11 +148,14 @@ The load paths propagate to `assert_separately` children; the extra context is
 not applied to mere-ruby or other test groups. The reference build job checks
 both actual C compilation/linking and a test that starts a separate Ruby.
 
-`test_data.py` installs Unicode 17.0.0 `CaseFolding.txt` from its versioned
-Unicode URL and verifies its pinned SHA-256 before use. The runtime archive
-includes the data, and every shard verifies it against the reference build
-provenance. This prevents 58 named casefold tests from appearing measured
-while performing zero assertions after a missing-data skip.
+`test_data.json` pins nine Unicode/Emoji inputs, their versioned official URLs,
+exact sizes and SHA-256 hashes. `test_data.py` downloads at most the declared
+size plus one byte per input and verifies every restored file before use.
+The set includes UnicodeData, CaseFolding, SpecialCasing, NormalizationTest,
+GraphemeBreakTest and the four Emoji 17.0 inputs used by the pinned tests.
+The runtime archive carries the entire set; every shard checks it against
+the reference build provenance. The data policy is recorded independently
+from case identities, so partial or older input sets cannot be mixed in.
 
 The pinned RubyGems Cargo tests still call the upstream `exe/gem` entry point,
 whereas Ruby stores it in `bin/gem`. Preparation copies the exact pinned
@@ -168,8 +171,11 @@ receive the same toolchain. Actual cargo/rustc versions and data hashes are
 recorded, and collection rejects mixed inputs.
 
 `environment_smoke.py` uses the normal process-family supervisor, a 300-second
-wall limit and 2 GiB family RSS limit. It requires the 58 casefold tests to
-perform assertions without failures/skips. Four Cargo smoke cases cover an
+wall limit and 2 GiB family RSS limit. It requires casefold, comprehensive
+case mapping, grapheme, emoji and normalization tests to execute assertions
+without failures/skips. Data-dependent suites must define multiple cases.
+Additional checks cover native iter semantics, absolute backtrace paths,
+short UNIX socket paths, standalone delegate and source RubyGems. Four Cargo smoke cases cover an
 extension build, an expected build failure, and two gem install/load paths.
 Sanitized logs and summaries are retained as `reference-environment-smoke`.
 The full measurement still runs all nine Cargo tests. In the pinned upstream
