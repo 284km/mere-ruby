@@ -1,166 +1,287 @@
 name: CI
 
-# WHY THIS EXISTS. This repository had no CI, and neither did any of the ~36
-# programs written in Mere. merelang/mere's own CI checks that its `main` still
-# COMPILES this code (test/downstream/REPOS) -- but "does it still build" and
-# "does it still agree with ruby" are different questions, and only the second
-# one can see this repository rotting on its own.
-#
-# It is also the repository that found the last upstream regression: v0.1.333
-# stopped `let int_max = ...` at top level from compiling, mere-ruby binds
-# exactly that, and it went unnoticed into a release because the upstream gate
-# only type-checked. This job is the other end of that.
-#
-# TWO JOBS, BECAUSE THE TWO QUESTIONS HAVE DIFFERENT RIGHT PLATFORMS.
-#
-# `corpus` runs on macOS. run_corpus.sh diffs mere-ruby against THE RUBY ON THE
-# MACHINE, and mere-ruby reports `RUBY_PLATFORM = "arm64-darwin22"` wherever it
-# runs -- its socket constants are the BSD ones to match (SOL_SOCKET 65535,
-# AF_INET6 30, SO_REUSEADDR 4). On Linux the oracle is a Linux ruby, so
-# corpus/108_sockets.rb compares two different platforms' answers and the
-# difference is real but is not a defect. Comparing like with like means
-# running where the identity it claims is true.
-#
-# `build-linux` compiles and smoke-runs on Linux anyway, because "does it still
-# build elsewhere" is worth knowing and is what turned up three undocumented
-# flags in the README's one build line.
-
 on:
   push:
+    branches: [main]
   pull_request:
-  # The compiler moves daily and this repository does not, so a weekly run
-  # catches the case where nothing here changed and it broke anyway.
+  workflow_dispatch:
+    inputs:
+      mere_ref:
+        description: Full published Mere commit SHA (default is the pinned compiler)
+        type: string
+        required: false
   schedule:
     - cron: "0 3 * * 1"
 
-jobs:
-  corpus:
-    runs-on: macos-latest
-    timeout-minutes: 60
+permissions:
+  contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin both dependencies so a moved result is about mere-ruby. A published
+  # Mere improvement can be selected through workflow_dispatch.
+  MERE_REF: ${{ inputs.mere_ref || '563e845b1d33f5e294ac4f91147096542ec0d7e1' }}
+  RUBY_SOURCE_REF: 3e93b23afcec3433f6aecc34b5d832799d754238
+  REF_RUBY_VERSION: "4.0.9"
+
+jobs:
+  unittest-harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      # `.mere_modules/mgz` is a SUBMODULE, and checkout does not fetch those
-      # by default -- so the directory was empty and `import "mgz/deflate.mere"`
-      # failed. Verifying locally, where the submodule was already checked out,
-      # is what hid it.
       - uses: actions/checkout@v5
         with:
-          submodules: true
-
-      # BUILT FROM main, NOT FROM THE LATEST RELEASE. This repository is
-      # developed against the compiler as it is. The cost is that a break
-      # upstream reddens this repository too -- the truth of the dependency,
-      # and merelang/mere's downstream_check tells the two apart from the
-      # other side.
-      - name: Check out the Mere compiler
-        uses: actions/checkout@v5
-        with:
-          repository: merelang/mere
-          path: .mere-compiler
-
-      # THE ORACLE HAS TO BE THE ONE tools/ref_ruby.sh NAMES, and this took
-      # three tries to get right. main.mere reports
-      # `ruby 4.0.9 ... [arm64-darwin25]`, run_corpus.sh sources ref_ruby.sh,
-      # and ref_ruby.sh REFUSES any other ruby -- which is what this job did
-      # from 2026-09-04 to 2026-09-05, red on every commit, because the
-      # reference moved to 3.4.9 and this pin still said 3.2.2:
-      #
-      #   platform  a Linux ruby reports SOL_SOCKET 1 where this reports 65535
-      #             (BSD). Both correct for the platform each answers as.
-      #   minor     3.4 put spaces around `=>` in Hash#inspect: `{"k" => nil}`
-      #             against `{"k"=>nil}`; 4.0 prints a Set as `Set[1, 2]`.
-      #   PATCH     3.2.11 stopped warning on a `$=` read where 3.2.2 warned.
-      #             Within one minor version.
-      #
-      # None of the three was a defect on either side. Pinning is not a
-      # workaround here -- it is what makes the diff mean anything at all.
-      # (The darwin release number in RUBY_PLATFORM is the one axis no corpus
-      # program prints, so the runner's macOS may differ from the 25 above.)
+          persist-credentials: false
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "4.0.9"
-
-      - name: Set up OCaml
-        uses: ocaml/setup-ocaml@v3
+          ruby-version: ${{ env.REF_RUBY_VERSION }}
+      - uses: actions/checkout@v5
         with:
-          ocaml-compiler: "5.1"
-
-      - name: Build mere
+          repository: ruby/ruby
+          ref: ${{ env.RUBY_SOURCE_REF }}
+          path: .ruby-framework
+          sparse-checkout: tool/lib
+          persist-credentials: false
+      - run: python3 unittest/harness_check.py -v
+      - run: python3 unittest/process_family_check.py -v
+      - name: Test CI collection and real Test::Unit diagnostics
         run: |
-          cd .mere-compiler
-          opam install . --deps-only
-          opam exec -- dune build bin/mere.exe
+          UNITTEST_REAL_RUBY="$(ruby -rrbconfig -e 'print RbConfig.ruby')" \
+          UNITTEST_REAL_TOOL_LIB="$GITHUB_WORKSPACE/.ruby-framework/tool/lib" \
+            python3 unittest/ci_check.py -v
 
-      # MEASURED: 39 seconds to emit 13.3 MB of C, 25 seconds to compile it
-      # into a 4.1 MB binary.
-      #
-      # This job is the macOS one, so the README's build line is used as
-      # written: `-Wl,-stack_size` is a Mach-O option and is not optional here.
-      # Parsing and evaluating recurse over the statement list, so native stack
-      # use is O(program length) and a long program dies in C below the
-      # interpreter's own SystemStackError guard; README "-stack_size is not
-      # optional" and PAIN.md M9 have the measurement. The Linux job below
-      # needs three different flags, none of which that line mentions.
-      - name: Build mere-ruby
-        run: |
-          .mere-compiler/_build/default/bin/mere.exe -c main.mere > mr.c
-          clang -O2 -w -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
-          ls -l mere-ruby
-
-      # MEASURED: 42 seconds, 162/162, peak RSS 825 MB -- comfortably inside a
-      # hosted runner. The gates that are NOT here are the ones the README says
-      # to run alone: the mspec sweep drives this interpreter past 6 GB and one
-      # spec file reaches 15.3 GB, and bootstraptest extracts a 121k-line
-      # generated program. Those need their RSS guard and a machine to
-      # themselves, so they are not made into a job that shares one.
-      # The records in this repository are CHECKED IN and public, and one of the
-      # spec groups measures the process environment. On 2026-09-04 a session
-      # token reached a public commit that way. This runs before anything that
-      # takes time, because it is the check that a human skips.
-      - name: record_hygiene.sh — no machine or environment text in the records
-        run: ./mspec/record_hygiene.sh
-
-      - name: run_corpus.sh — every corpus program, byte for byte against ruby
-        run: ./run_corpus.sh
-
-  # Not the corpus -- just that it still compiles and runs somewhere else. The
-  # three flags below are the ones the README's build line assumes away.
-  build-linux:
+  unittest-plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          repository: ruby/ruby
+          ref: ${{ env.RUBY_SOURCE_REF }}
+          path: .ruby-tests
+          persist-credentials: false
+      - id: plan
+        name: Inventory every test file and partition it once
+        run: |
+          python3 unittest/ci.py plan --ruby-src .ruby-tests --output measurement-plan \
+            --shards 64 --source-ref "$GITHUB_SHA" --mere-ref "$MERE_REF" \
+            --ruby-ref "$RUBY_SOURCE_REF" --ruby-version "$REF_RUBY_VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unittest-plan
+          path: measurement-plan
+          retention-days: 7
+
+  corpus:
+    runs-on: macos-26
+    timeout-minutes: 90
+    outputs:
+      binary_sha: ${{ steps.ready.outputs.binary_sha }}
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: true
+          persist-credentials: false
       - uses: actions/checkout@v5
         with:
           repository: merelang/mere
+          ref: ${{ env.MERE_REF }}
           path: .mere-compiler
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.REF_RUBY_VERSION }}
       - uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5.1"
-      - name: Build mere
+      - name: Build the pinned Mere compiler
+        working-directory: .mere-compiler
         run: |
-          cd .mere-compiler
+          opam install . --deps-only
+          opam exec -- dune build bin/mere.exe
+      - name: Build the measurement binary at O2
+        run: sh tools/build.sh
+      - name: Record binary provenance
+        run: python3 unittest/ci.py build-info --compiler .mere-compiler --output build-info.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mere-ruby-macos
+          path: |
+            mere-ruby
+            .build_mode
+            build-info.json
+          include-hidden-files: true
+          retention-days: 7
+      - id: ready
+        run: echo "binary_sha=$(shasum -a 256 mere-ruby | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Check record hygiene
+        run: sh mspec/record_hygiene.sh
+      - name: Compare every corpus program
+        run: sh run_corpus.sh
+
+  unittest-reference:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          repository: ruby/ruby
+          ref: ${{ env.RUBY_SOURCE_REF }}
+          path: .ruby-tests
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.REF_RUBY_VERSION }}
+      - name: Install reference build dependencies
+        run: brew install autoconf automake libtool pkgconf openssl@3 libyaml
+      - name: Install pinned Rust for the reference JITs
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Build reference Ruby including test-only C extensions
+        env:
+          RUSTUP_TOOLCHAIN: 1.85.0
+        run: sh unittest/build_reference.sh .ruby-tests "$GITHUB_WORKSPACE/.reference-ruby"
+      - name: Record reference provenance and package its runtime
+        run: |
+          python3 unittest/ci.py reference-info --ruby-src .ruby-tests \
+            --binary .reference-ruby/bin/ruby --output reference-build.json
+          tar -czf reference-runtime.tar.gz .reference-ruby .ruby-tests/.ext
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ruby-reference-macos
+          path: |
+            reference-runtime.tar.gz
+            reference-build.json
+          retention-days: 7
+
+  unittest-shards:
+    name: CRuby tests / shard ${{ matrix.shard }}
+    needs: [unittest-plan, corpus, unittest-reference]
+    # Corpus differences do not suppress the measurement after a successful
+    # upload. A failed build still cannot supply an unrelated binary.
+    if: ${{ !cancelled() && needs.corpus.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
+    runs-on: macos-26
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.unittest-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          repository: ruby/ruby
+          ref: ${{ env.RUBY_SOURCE_REF }}
+          path: .ruby-tests
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: unittest-plan
+          path: measurement-plan
+      - uses: actions/download-artifact@v4
+        with:
+          name: mere-ruby-macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: ruby-reference-macos
+      - name: Ensure native reference runtime dependencies
+        run: brew install openssl@3 libyaml
+      - name: Restore exact binaries and native test extensions
+        run: |
+          chmod +x mere-ruby
+          tar -xzf reference-runtime.tar.gz
+          echo "$GITHUB_WORKSPACE/.reference-ruby/bin" >> "$GITHUB_PATH"
+          echo "REF_RUBY_BIN=$GITHUB_WORKSPACE/.reference-ruby/bin/ruby" >> "$GITHUB_ENV"
+          arch=$(.reference-ruby/bin/ruby -rrbconfig -e 'print RbConfig::CONFIG.fetch("arch")')
+          echo "UNITTEST_REF_EXT_PATH=$GITHUB_WORKSPACE/.ruby-tests/.ext/$arch" >> "$GITHUB_ENV"
+      - name: Measure partition with independent wall and RSS limits
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          ulimit -c 0
+          python3 unittest/ci.py run --ruby-src .ruby-tests \
+            --plan measurement-plan/manifest.json --build-info build-info.json \
+            --reference-info reference-build.json --shard "$SHARD" \
+            --output "measurement/shard-$SHARD" --wall 600 --rss-kb 2097152
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unittest-shard-${{ matrix.shard }}
+          path: measurement
+          if-no-files-found: warn
+          retention-days: 7
+
+  unittest-summary:
+    needs: [unittest-plan, unittest-shards]
+    if: ${{ always() && needs.unittest-plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: unittest-plan
+          path: measurement-plan
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: unittest-shard-*
+          path: shard-results
+      - name: Collect every planned file including interrupted shards
+        if: always()
+        run: |
+          python3 unittest/ci.py merge --plan measurement-plan/manifest.json \
+            --input shard-results --output measurement-report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unittest-report
+          path: measurement-report
+          if-no-files-found: warn
+          retention-days: 7
+
+  build-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          repository: merelang/mere
+          ref: ${{ env.MERE_REF }}
+          path: .mere-compiler
+          persist-credentials: false
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.1"
+      - name: Build the pinned Mere compiler
+        working-directory: .mere-compiler
+        run: |
           opam install . --deps-only
           opam exec -- dune build bin/mere.exe
       - name: Build mere-ruby on Linux
-        run: |
-          .mere-compiler/_build/default/bin/mere.exe -c main.mere > mr.c
-          clang -O2 -w -fbracket-depth=1024 mr.c -lm -o mere-ruby
-
-      # ⚠ the headroom is gone: the emitted C needs 269 where mainline clang
-      # defaults to 256, so -fbracket-depth on the build line above is
-      # load-bearing. This step reports both numbers -- the distance to the flag
-      # and whether the default would still do -- and fails only on the first.
-      # Reuses the mr.c the step above just wrote.
-      - name: bracket_depth (how much room is left under clang's nesting cap)
-        if: ${{ !cancelled() }}
+        run: sh tools/build.sh
+      - name: Check C nesting headroom
         run: MR_C=mr.c sh tools/bracket_depth_check.sh
-      - name: It runs
+      - name: Smoke test
         run: |
           ulimit -s 524288
           echo 'puts [1,2,3].map { |x| x * 2 }.inspect' > /tmp/t.rb
           out=$(./mere-ruby /tmp/t.rb)
           [ "$out" = "[2, 4, 6]" ] || { echo "got [$out]"; exit 1; }
-          echo "linux build runs: $out"

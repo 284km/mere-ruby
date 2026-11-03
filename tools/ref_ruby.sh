@@ -42,6 +42,16 @@
 # Refusing is the point. A gate that runs against whatever ruby is on PATH
 # reports a regression that did not happen, and the reader cannot tell.
 REF_RUBY_VERSION="${REF_RUBY_VERSION:-4.0.9}"
+if [ -n "${REF_RUBY_BIN:-}" ]; then
+  # CI builds a reference with test-only C extensions. Verify that exact
+  # binary rather than replacing it with an installed rbenv interpreter.
+  ref_have="$("$REF_RUBY_BIN" -e 'print RUBY_VERSION' 2>/dev/null)"
+  if [ "$ref_have" != "$REF_RUBY_VERSION" ]; then
+    echo "reference binary reports ${ref_have:-none}, expected $REF_RUBY_VERSION" >&2
+    exit 2
+  fi
+  export REF_RUBY_BIN
+else
 if [ "$(ruby -e 'print RUBY_VERSION' 2>/dev/null)" != "$REF_RUBY_VERSION" ]; then
   if [ -x "$HOME/.rbenv/versions/$REF_RUBY_VERSION/bin/ruby" ]; then
     RBENV_VERSION="$REF_RUBY_VERSION"; export RBENV_VERSION
@@ -67,4 +77,5 @@ if [ "$ref_have" != "$REF_RUBY_VERSION" ]; then
   echo "the recorded numbers are against $REF_RUBY_VERSION; another one is a different question," >&2
   echo "not a regression. Install it, or set REF_RUBY_VERSION to sweep against something else." >&2
   exit 2
+fi
 fi
