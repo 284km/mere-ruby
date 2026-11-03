@@ -118,8 +118,25 @@ The corpus job builds mere-ruby once with `tools/build.sh` at O2 and uploads the
 binary before running the corpus. A separate job builds Ruby 4.0.9 and its native
 test extensions and both JITs (with Rust 1.85.0), installs a relocatable
 reference, and verifies the four test
-extensions previously replaced by shims. Reference-only extension paths take
-precedence over those shims; mere-ruby keeps its own Ruby implementations.
+extensions previously replaced by shims. The reference load path excludes
+those shims entirely: Ruby can select a later .rb before an earlier native
+extension. mere-ruby keeps its own Ruby implementations.
+
+Workers launch absolute test paths from each file's directory, preserving
+the source assumptions about `__FILE__` and absolute backtrace locations.
+Each side explicitly selects its running interpreter through `RUBY` and
+passes its helper paths through `RUBYLIB` to children. Only the reference
+receives the native extension directory; only mere-ruby receives the shims.
+Missing native reference extensions stay visible instead of falling back.
+The real-Ruby regression compiles a small extension and checks competing
+native/shim paths in both the parent and a subprocess.
+
+RubyGems tests load the pinned source `lib/` on both sides, including children,
+so repository-specific checks such as `Gem.prefix` inspect the tested source.
+`bootstrap.rb` explicitly preloads the prerequisites that selected files rely
+on from earlier whole-suite tests (Tempfile, tmpdir, FileUtils, delegate or
+socket). Only the named files receive those prerequisites, equally per side.
+This does not change test definitions, assertions or feature guards.
 
 The reference archive also preserves its original build Makefile and static
 Ruby library. After extraction, `prepare_reference.rb` validates those files,
@@ -131,11 +148,14 @@ The load paths propagate to `assert_separately` children; the extra context is
 not applied to mere-ruby or other test groups. The reference build job checks
 both actual C compilation/linking and a test that starts a separate Ruby.
 
-`test_data.py` installs Unicode 17.0.0 `CaseFolding.txt` from its versioned
-Unicode URL and verifies its pinned SHA-256 before use. The runtime archive
-includes the data, and every shard verifies it against the reference build
-provenance. This prevents 58 named casefold tests from appearing measured
-while performing zero assertions after a missing-data skip.
+`test_data.json` pins nine Unicode/Emoji inputs, their versioned official URLs,
+exact sizes and SHA-256 hashes. `test_data.py` downloads at most the declared
+size plus one byte per input and verifies every restored file before use.
+The set includes UnicodeData, CaseFolding, SpecialCasing, NormalizationTest,
+GraphemeBreakTest and the four Emoji 17.0 inputs used by the pinned tests.
+The runtime archive carries the entire set; every shard checks it against
+the reference build provenance. The data policy is recorded independently
+from case identities, so partial or older input sets cannot be mixed in.
 
 The pinned RubyGems Cargo tests still call the upstream `exe/gem` entry point,
 whereas Ruby stores it in `bin/gem`. Preparation copies the exact pinned
@@ -150,9 +170,19 @@ without inheriting rustup configuration or Cargo credentials. Both interpreters
 receive the same toolchain. Actual cargo/rustc versions and data hashes are
 recorded, and collection rejects mixed inputs.
 
+The packaged Rake entry point is invoked explicitly with each side's selected
+Ruby and Rake library directory. RubyGems tests reset GEM_HOME/GEM_PATH; falling
+back to a host `rake` shebang could otherwise start an unrelated Ruby with
+incompatible native extensions. The reference's packaged gem library paths
+remain available to its children through RUBYLIB.
+
 `environment_smoke.py` uses the normal process-family supervisor, a 300-second
-wall limit and 2 GiB family RSS limit. It requires the 58 casefold tests to
-perform assertions without failures/skips. Four Cargo smoke cases cover an
+wall limit and 2 GiB family RSS limit. It requires casefold, comprehensive
+case mapping, grapheme, emoji and normalization tests to execute assertions
+without failures/skips. Data-dependent suites must define multiple cases.
+Additional checks cover native iter semantics, absolute backtrace paths,
+short UNIX socket paths, standalone delegate, native marshal helpers, source
+RubyGems require behavior and all extension-builder cases. Four Cargo smoke cases cover an
 extension build, an expected build failure, and two gem install/load paths.
 Sanitized logs and summaries are retained as `reference-environment-smoke`.
 The full measurement still runs all nine Cargo tests. In the pinned upstream
@@ -249,7 +279,9 @@ and the mask wall limit are recorded with the measurement bounds. These limits
 also apply to driver logs, partial output and RED tags.
 
 Both interpreters run with a small environment allowlist and a fresh temporary
-HOME and TMPDIR per file. Only PATH, locale, explicit interpreter/extension paths,
+HOME and TMPDIR per file. The owning temporary directory uses a short private
+path under `/tmp`, so test-generated UNIX socket names fit macOS's 104-byte
+limit; it is reclaimed with the measurement context. Only PATH, locale, explicit interpreter/extension paths,
 the generated process-family identifier and the harness settings are passed;
 parent credentials and GitHub session variables
 are not inherited. This is important for whole Test::Unit failure reports:

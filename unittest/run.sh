@@ -38,8 +38,8 @@
 #   BOTH    neither side passed it (the reference's own failures: excluded)
 #   EXTRA   mere-ruby passed it and the reference did not
 #
-# Both sides get the reference's stdlib and bundled gems on RUBYLIB (tests
-# require them) and tool/lib first on -I, and both run in the test file's own
+# Both sides get their explicit library paths on RUBYLIB so subprocesses use
+# the same test helpers. Both run absolute test paths in the file's own
 # directory, as `make test-all` does. mere-ruby's answer is its own
 # (json, digest, zlib ... are the ones it ships or answers).
 #
@@ -76,11 +76,9 @@ UNITTEST_RECORD_DIR="$records"; export UNITTEST_RECORD_DIR
 #   -test-/iter, test_keyword -test-/rb_call_super_kw -- C extensions built
 #   only inside a CRuby build tree -- and the reference ruby fails to load them
 #   as surely as mere-ruby does: about 400 tests measured on NEITHER side.
-#   unittest/shim/-test-/ has a Ruby stand-in for each, and BOTH sides get it
-#   on the load path (and pass it to the children assert_separately starts,
-#   which inherit $:), so it is part of the instrument as mspec's shim is. A
-#   stand-in that answered differently from the extension would show as the
-#   reference's own failure (BOTH), not as a verdict on mere-ruby.
+#   The reference uses only its real native extensions. A .rb stand-in can
+#   shadow a native extension even on a later load path, so shims are supplied
+#   only to mere-ruby. Missing reference extensions remain visible failures.
 shim="$here/shim"
 . "$root"/tools/ref_ruby.sh
 . "$root"/mspec/mask.sh
@@ -101,6 +99,17 @@ wall="${UNITTEST_WALL:-600}"
 #   (42.upto(Float::INFINITY).size) came first the second time.
 seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
+rake_source="$("$ref" -e 'begin; print Gem.bin_path("rake", "rake"); rescue Gem::Exception; end')"
+select_rake() {
+  if [ -n "$rake_source" ]; then
+    # Gem tests replace GEM_HOME/GEM_PATH and may fall back to a host rake
+    # whose shebang selects a different Ruby/extension ABI.
+    rake="$("$ref" -rshellwords -e 'print Shellwords.join(ARGV)' "$1" "-I${rake_source%/*}/../lib" "$rake_source")" || return 1
+    export rake
+  else
+    unset rake
+  fi
+}
 
 runner='
   my ($wall, @cmd) = @ARGV;
@@ -120,12 +129,11 @@ if [ "${1:-}" = "--one" ]; then
   work="$2"; n="$3"; rel="$4"
   # -ext-/... is a real part of CRuby's test tree. Passing it directly to
   # dirname/basename treats the leading hyphen as an option on macOS.
-  base="${rel##*/}"
+  file="$src/test/$rel"
   case "$rel" in
     */*) dir="$src/test/${rel%/*}" ;;
     *) dir="$src/test" ;;
   esac
-  case "$base" in -*) base="./$base" ;; esac
   # ⚠ INTO A FILE, then read: a pipe is not done until every process holding
   #   its write end is gone, and a test can leave one behind. test_process's
   #   fifo tests start `cat < fifo` from a ruby they interrupt; under
@@ -140,16 +148,25 @@ if [ "${1:-}" = "--one" ]; then
   # restored context reuses the installed config, rebinding only topdir;
   # children inherit these -I entries through assert_separately.
   set --
+  ref_lib="$src/tool/lib:$src/test:$stdlib"
+  if [ -n "${UNITTEST_REF_EXT_PATH:-}" ]; then
+    ref_lib="$UNITTEST_REF_EXT_PATH:$ref_lib"
+  fi
+  mere_lib="$src/tool/lib:$src/test:$shim:$stdlib"
   case "$rel" in
     mkmf/*)
       if [ -f "$src/.unittest-reference/rbconfig.rb" ]; then
         set -- -I "$src/.unittest-reference" -I "$src/lib"
+        ref_lib="$src/.unittest-reference:$src/lib:$ref_lib"
       fi ;;
+    rubygems/*)
+      ref_lib="$src/lib:$ref_lib"
+      mere_lib="$src/lib:$mere_lib" ;;
   esac
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.
   # Parse stdout, then append stderr to the saved diagnostic log.
-  (cd "$dir" && UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -I "${UNITTEST_REF_EXT_PATH:-$shim}" -I "$shim" -r test/unit -r "$here/case_encodings.rb" "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$ref" && RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   ref_code=$?
   printf '%s\n' "$ref_code" > "$work/$n.ref.exit.new"
   mv "$work/$n.ref.exit.new" "$work/$n.ref.exit"
@@ -160,7 +177,7 @@ if [ "${1:-}" = "--one" ]; then
   out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
   printf 'mere\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
-  (cd "$dir" && UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/case_encodings.rb" "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$mr" && RUBY="$mr" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
   mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"
