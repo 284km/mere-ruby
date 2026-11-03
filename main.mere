@@ -57822,38 +57822,175 @@ and rxv_mc_start = fn (u: unit) ->
   vec_set rxv_mc 0 1
 // an inner run (a lookaround's, an atomic group's, an absent's body) on its
 // own backtrack stack, one level deeper: the cache marks only the outer run
-and rxv_inner = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) -> fn (saves: (int * int) list) ->
+// the VM's state (see rxs_slots): a slot's value, -1 when unset
+and rxs_sg = fn (k: int) ->
+  let j = rxs_ix k in
+  if j >= 0 then (if j < vec_len rxs_vg && vec_get rxs_vg j == vec_get rxs_top 3 then vec_get rxs_vs j else 0 - 1)
+  else if map_has rxs_slots k then map_get rxs_slots k else 0 - 1
+// the index of a slot kept by index, -1 for one kept in the table
+and rxs_ix = fn (k: int) ->
+  if k >= 0 then (if k < 1024 then k else if k >= 100000 && k < 160000 then k - 98976 else 0 - 1) else 0 - 1
+// set without logging (the trail's own undo uses it)
+and rxs_put = fn (k: int) -> fn (x: int) ->
+  let j = rxs_ix k in
+  if j >= 0 then
+    (let _ = (if j >= vec_len rxs_vg then rxs_widen (vec_len rxs_vg) (j + 1) else ()) in
+     let _ = vec_set rxs_vg j (vec_get rxs_top 3) in
+     vec_set rxs_vs j x)
+  else if x < 0 then map_delete rxs_slots k else map_set rxs_slots k x
+// grow the indexed slots to n, all from no search
+and rxs_widen = fn (m: int) -> fn (n: int) ->
+  if m >= n then ()
+  else (let _ = vec_push rxs_vs (0 - 1) in let _ = vec_push rxs_vg (0 - 1) in rxs_widen (m + 1) n)
+and rxs_vput = fn v -> fn (n: int) -> fn (x: int) -> if n < vec_len v then vec_set v n x else vec_push v x
+// write a slot, logging the value it replaces
+and rxs_ss = fn (k: int) -> fn (x: int) ->
+  let t = vec_get rxs_top 1 in
+  let j = rxs_ix k in
+  if j >= 0 && j < vec_len rxs_vg then
+    (let g = vec_get rxs_top 3 in
+     let old = (if vec_get rxs_vg j == g then vec_get rxs_vs j else 0 - 1) in
+     let _ = (if t + 1 < vec_len rxs_trail then (let _ = vec_set rxs_trail t k in vec_set rxs_trail (t + 1) old)
+              else (let _ = rxs_vput rxs_trail t k in rxs_vput rxs_trail (t + 1) old)) in
+     let _ = vec_set rxs_top 1 (t + 2) in
+     let _ = vec_set rxs_vg j g in
+     vec_set rxs_vs j x)
+  else
+    (let _ = rxs_vput rxs_trail t k in
+     let _ = rxs_vput rxs_trail (t + 1) (rxs_sg k) in
+     let _ = vec_set rxs_top 1 (t + 2) in
+     rxs_put k x)
+// take the trail back to length t
+and rxs_undo = fn (t: int) ->
+  let cur = vec_get rxs_top 1 in
+  if cur <= t then ()
+  else (let k = vec_get rxs_trail (cur - 2) in
+        let old = vec_get rxs_trail (cur - 1) in
+        let j = rxs_ix k in
+        // (an indexed slot was written in this search, so it is in range)
+        let _ = (if j >= 0 then vec_set rxs_vs j old else rxs_put k old) in
+        let _ = vec_set rxs_top 1 (cur - 2) in
+        rxs_undo t)
+// a choice point: go to (pc, i) with the trail and the marks as they are now
+and rxs_push = fn (pc: int) -> fn (i: int) ->
+  let n = vec_get rxs_top 0 in
+  let _ = (if n + 3 < vec_len rxs_stk then
+             (let _ = vec_set rxs_stk n pc in
+              let _ = vec_set rxs_stk (n + 1) i in
+              let _ = vec_set rxs_stk (n + 2) (vec_get rxs_top 1) in
+              vec_set rxs_stk (n + 3) (vec_get rxs_top 2))
+           else
+             (let _ = rxs_vput rxs_stk n pc in
+              let _ = rxs_vput rxs_stk (n + 1) i in
+              let _ = rxs_vput rxs_stk (n + 2) (vec_get rxs_top 1) in
+              rxs_vput rxs_stk (n + 3) (vec_get rxs_top 2))) in
+  vec_set rxs_top 0 (n + 4)
+// back to the latest choice above base: false when there is none; else its
+// pc and position in rxs_res, the trail and the marks taken back to it
+and rxs_pop = fn (base: int) ->
+  let n = vec_get rxs_top 0 in
+  if n <= base then false
+  else (let _ = vec_set rxs_res 0 (vec_get rxs_stk (n - 4)) in
+        let _ = vec_set rxs_res 1 (vec_get rxs_stk (n - 3)) in
+        let _ = rxs_undo (vec_get rxs_stk (n - 2)) in
+        let _ = vec_set rxs_top 2 (vec_get rxs_stk (n - 1)) in
+        let _ = vec_set rxs_top 0 (n - 4) in
+        let _ = rxv_tick () in
+        true)
+// a memo mark on the path (see rxv_im)
+and rxs_mark = fn (tag: int) -> fn (k: int) ->
+  let n = vec_get rxs_top 2 in
+  let _ = rxs_vput rxs_marks n tag in
+  let _ = rxs_vput rxs_marks (n + 1) k in
+  vec_set rxs_top 2 (n + 2)
+// a search starts with nothing
+and rxs_reset = fn (u: unit) ->
+  // (a search tries every start position, and most patterns never use a
+  //  slot outside 0 .. 1023: an empty table is left as it is)
+  let _ = (if map_len rxs_slots > 0 then map_clear rxs_slots else ()) in
+  let _ = vec_set rxs_top 3 (vec_get rxs_top 3 + 1) in
+  let _ = vec_set rxs_top 0 0 in
+  let _ = vec_set rxs_top 1 0 in
+  vec_set rxs_top 2 0
+// the slots as the (slot, value) list a hit carries
+and rxs_snapshot = fn (u: unit) ->
+  let rest = (if map_len rxs_slots == 0 then (Nil : (int * int) list)
+              else (let ks = vec_new () in
+                    let _ = map_iter rxs_slots (fn (k: int) -> fn (x: int) -> let _ = vec_push ks k in vec_push ks x) in
+                    rxs_snap_list ks 0 (Nil : (int * int) list))) in
+  rxs_snap_vs (if vec_len rxs_vg < 1024 then vec_len rxs_vg - 1 else 1023) rest
+and rxs_snap_vs = fn (k: int) -> fn (acc: (int * int) list) ->
+  if k < 0 then acc
+  else (let x = (if vec_get rxs_vg k == vec_get rxs_top 3 then vec_get rxs_vs k else 0 - 1) in
+        rxs_snap_vs (k - 1) (if x >= 0 then Cons ((k, x), acc) else acc))
+and rxs_snap_list = fn ks -> fn (j: int) -> fn (acc: (int * int) list) ->
+  if j >= vec_len ks then acc else rxs_snap_list ks (j + 2) (Cons ((vec_get ks j, vec_get ks (j + 1)), acc))
+// did this loop turn change a capture? The latest trail entry of slot k is
+// the turn's start (IMark); a capture slot written after it (its first write
+// there logged what it held before the turn) that holds another value now
+and rxs_caps_changed = fn (k: int) ->
+  let top = vec_get rxs_top 1 in
+  let st = rxs_trail_last k (top - 2) in
+  if st < 0 then false else rxs_caps_from st (st + 2) top
+and rxs_trail_last = fn (k: int) -> fn (j: int) ->
+  if j < 0 then 0 - 1 else if vec_get rxs_trail j == k then j else rxs_trail_last k (j - 2)
+and rxs_caps_from = fn (st: int) -> fn (j: int) -> fn (top: int) ->
+  if j >= top then false
+  else (let sl = vec_get rxs_trail j in
+        if sl >= 0 && sl < 100000 && rxs_first_write st j sl && (if rxs_sg sl == vec_get rxs_trail (j + 1) then false else true) then true
+        else rxs_caps_from st (j + 2) top)
+and rxs_first_write = fn (st: int) -> fn (j: int) -> fn (sl: int) ->
+  if j - 2 <= st then true else if vec_get rxs_trail (j - 2) == sl then false else rxs_first_write st (j - 2) sl
+and rxv_inner = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
   let f0 = vec_get rxv_imf 0 in
   let _ = vec_set rxv_imf 0 0 in
   let _ = vec_set rxv_mc 3 (vec_get rxv_mc 3 + 1) in
-  let r = rxv_run prog s sub i saves Nil in
+  let base = vec_get rxs_top 0 in
+  let t0 = vec_get rxs_top 1 in
+  let m0 = vec_get rxs_top 2 in
+  let r = rxv_run prog s sub i base in
   let _ = vec_set rxv_mc 3 (vec_get rxv_mc 3 - 1) in
   let _ = vec_set rxv_imf 0 f0 in
-  r
+  rxs_inner_done r base t0 m0
+// after an inner run: its choices are dropped (an atomic group's and a
+// lookaround's are not backtracked into); a run that failed leaves nothing,
+// one that found keeps its writes (a lookahead's captures), and its marks
+// are gone either way -- they are its own (see rxv_inner_m)
+and rxs_inner_done = fn (r: RxRes) -> fn (base: int) -> fn (t0: int) -> fn (m0: int) ->
+  let _ = vec_set rxs_top 0 base in
+  let _ = vec_set rxs_top 2 m0 in
+  match r with
+  | RFail -> (let _ = rxs_undo t0 in RFail)
+  | other -> other
 // ...an atomic group's or a lookahead's, which may answer from rxv_im: the
-// path of its success is the (-9, key) marks its saves carry (backtracking
-// takes a dead branch's back with the saves), each key mapped to the end
-and rxv_inner_m = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) -> fn (saves: (int * int) list) ->
+// path of its success is the marks on rxs_marks above where it started
+// (going back takes a dead branch's off with the trail), each key mapped to
+// the end
+and rxv_inner_m = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
   if (vec_get rxv_mc 0 == 1 || vec_get rxv_mc 4 > 0) && rxv_no_caps prog then
     (let f0 = vec_get rxv_imf 0 in
      let _ = vec_set rxv_imf 0 1 in
      let _ = vec_set rxv_mc 3 (vec_get rxv_mc 3 + 1) in
-     let r = rxv_run prog s sub i saves Nil in
+     let base = vec_get rxs_top 0 in
+     let t0 = vec_get rxs_top 1 in
+     let m0 = vec_get rxs_top 2 in
+     let r = rxv_run prog s sub i base in
      let _ = vec_set rxv_mc 3 (vec_get rxv_mc 3 - 1) in
      let _ = vec_set rxv_imf 0 f0 in
-     // (only this run's marks: a run nested in another starts from saves
-     //  that carry the outer one's, which led to the OUTER run's end --
-     //  `(?>...(?=...)...)` took the nested end for them)
+     // (only this run's marks, the ones above m0 with its depth: a run
+     //  nested in another had taken its own off already, and the outer
+     //  run's are below m0 -- `(?>...(?=...)...)` once took the nested end
+     //  for the outer one's)
      let mk = 0 - (100000 + vec_get rxv_mc 3 + 1) in
-     match r with
-     | RFound (e, sv) ->
-       (let rec strip = fn (xs: (int * int) list) ->
-          (match xs with
-           | Nil -> (Nil : (int * int) list)
-           | Cons ((k9, v9), t9) -> (if k9 == mk then (let _ = map_set rxv_im v9 e in strip t9) else Cons ((k9, v9), strip t9))) in
-        RFound (e, strip sv))
-     | other -> other)
-  else rxv_inner prog s sub i saves
+     let _ = (match r with
+              | RFound (e, _) -> rxs_memo_marks m0 (vec_get rxs_top 2) mk e
+              | RFail -> ()) in
+     rxs_inner_done r base t0 m0)
+  else rxv_inner prog s sub i
+and rxs_memo_marks = fn (j: int) -> fn (top: int) -> fn (mk: int) -> fn (e: int) ->
+  if j >= top then ()
+  else (let _ = (if vec_get rxs_marks j == mk then map_set rxv_im (vec_get rxs_marks (j + 1)) e else ()) in
+        rxs_memo_marks (j + 2) top mk e)
 // a pattern with no group of its own (its captures cannot differ by path)
 and rxv_no_caps = fn prog -> (match map_get prog (0 - 1) with IMeta (_, g) -> g <= 1 | _ -> false)
 // may this program use the cache? Not when what it matches depends on what
@@ -57890,39 +58027,43 @@ and rxv_seg_eq = fn (s: str) -> fn (a: int) -> fn (i: int) -> fn (n: int) -> fn 
   else if ord (char_at s (a + k)) == ord (char_at s (i + k)) then rxv_seg_eq s a i n (k + 1)
   else false
 and rxv_mc_size = fn prog -> match map_get prog (0 - 1) with IMeta (n, _) -> n | _ -> 0
-// how many calls the call stack in saves has open
-and rxv_call_depth = fn (saves: (int * int) list) ->
-  let d = rxv_slot_get saves (0 - 3) in
+// how many calls the call stack in the slots has open
+and rxv_call_depth = fn (u: unit) ->
+  let d = rxs_sg (0 - 3) in
   if d <= 0 then 0 else d
-and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
-           -> fn (saves: (int * int) list) -> fn (bt: (int * int * ((int * int) list)) list) ->
+and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (base: int) ->
   match rxv_fetch prog pc with
-  | IMatch -> RFound (i, saves)
-  // a call: the return pc goes on a stack kept in the saves themselves
+  | IMatch -> RFound (i, Nil)
+  // a call: the return pc goes on a stack kept in the slots themselves
   // (slot -3 the depth -- -1 is \K's start --, slot -(100+d) frame d's
   // return pc, -(500000+d) its group), so backtracking past the
   // call takes the frame back with everything else
   | ICall (cg, tgt) ->
-    (let d9 = rxv_slot_get saves (0 - 3) in
+    (let d9 = rxs_sg (0 - 3) in
      let d9 = (if d9 < 0 then 0 else d9) in
-     if d9 >= 2000 then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
-     else rxv_run prog s tgt i (Cons ((0 - 3, d9 + 1), Cons ((0 - (100 + d9 + 1), pc + 1), Cons ((0 - (500000 + d9 + 1), cg), saves)))) bt)
+     if d9 >= 2000 then (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
+     else (let _ = rxs_ss (0 - (500000 + d9 + 1)) cg in
+           let _ = rxs_ss (0 - (100 + d9 + 1)) (pc + 1) in
+           let _ = rxs_ss (0 - 3) (d9 + 1) in
+           rxv_run prog s tgt i base))
   | IRet ->
-    (let d9 = rxv_slot_get saves (0 - 3) in
-     if d9 <= 0 then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
-     else rxv_run prog s (rxv_slot_get saves (0 - (100 + d9))) i (Cons ((0 - 3, d9 - 1), saves)) bt)
-  | IOk -> RFound (i, saves)
+    (let d9 = rxs_sg (0 - 3) in
+     if d9 <= 0 then (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
+     else (let rpc9 = rxs_sg (0 - (100 + d9)) in
+           let _ = rxs_ss (0 - 3) (d9 - 1) in
+           rxv_run prog s rpc9 i base))
+  | IOk -> RFound (i, Nil)
   | IOkAt ->
     // end of a lookbehind body: only a run that lands exactly on the
     // lookbehind's position counts, so `(?<=\A|/)` can take either branch.
-    (if i == map_get rxv_lb_end "e" then RFound (i, saves) else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
+    (if i == map_get rxv_lb_end "e" then RFound (i, Nil) else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
   | IChar c ->
-    if i < str_len s && str_eq (char_at s i) c then rxv_run prog s (pc + 1) (i + 1) saves bt
-    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    if i < str_len s && str_eq (char_at s i) c then rxv_run prog s (pc + 1) (i + 1) base
+    else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | ICharCI c ->
     if i < str_len s && (str_eq (char_at s i) c || str_eq (rxv_swapcase (char_at s i)) c || str_eq (char_at s i) (rxv_swapcase c))
-    then rxv_run prog s (pc + 1) (i + 1) saves bt
-    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    then rxv_run prog s (pc + 1) (i + 1) base
+    else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | IAny ->
     // Ruby's `.` is one CHARACTER. This VM walks bytes, so on a UTF-8 subject it
     // consumed one byte of a multibyte character: `"こんにちは"[/に./]` came back
@@ -57931,14 +58072,14 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     // by byte (a literal's own bytes line up with the subject's); making the
     // classes character-aware is the rest of that question and not this fix.
     if i < str_len s && (if str_eq (char_at s i) "\n" then false else true)
-    then rxv_run prog s (pc + 1) (i + cut_clen s i) saves bt
-    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    then rxv_run prog s (pc + 1) (i + cut_clen s i) base
+    else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | IAnyNL ->
-    if i < str_len s then rxv_run prog s (pc + 1) (i + cut_clen s i) saves bt
-    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    if i < str_len s then rxv_run prog s (pc + 1) (i + cut_clen s i) base
+    else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | IGrapheme ->
-    if i < str_len s then rxv_run prog s (pc + 1) (gcb_cluster_end s i) saves bt
-    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    if i < str_len s then rxv_run prog s (pc + 1) (gcb_cluster_end s i) base
+    else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   // the yes-branch when group k has matched (both ends saved, as a
   // backreference requires), the no-branch otherwise
   // (?~absent) at i: every end e whose [i, e) holds no match of absent is a
@@ -57948,15 +58089,16 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
   // alternatives to backtrack into.
   | IAbsent sub ->
     (let e = rxv_absent_end prog s sub i in
-     rxv_run prog s (pc + 1) e saves (rxv_absent_alts s (pc + 1) i e saves bt))
+     let _ = rxv_absent_alts s (pc + 1) i e in
+     rxv_run prog s (pc + 1) e base)
   | ICond (k, nopc) ->
-    (let a = rxv_slot_get saves (2 * k) in
-     let b = rxv_slot_get saves (2 * k + 1) in
-     if a >= 0 && b >= a then rxv_run prog s (pc + 1) i saves bt else rxv_run prog s nopc i saves bt)
+    (let a = rxs_sg (2 * k) in
+     let b = rxs_sg (2 * k + 1) in
+     if a >= 0 && b >= a then rxv_run prog s (pc + 1) i base else rxv_run prog s nopc i base)
   | IClass (items, neg, ci) ->
     if i < str_len s && rxv_cls items neg ci (cut_char_at s i)
-    then rxv_run prog s (pc + 1) (i + cut_clen s i) saves bt
-    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    then rxv_run prog s (pc + 1) (i + cut_clen s i) base
+    else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | ISplit (a, b) ->
     let _ = rxv_clock () in
     if vec_get rxv_mc 0 == 1 && vec_get rxv_mc 3 == 0 then
@@ -57964,26 +58106,27 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
        let w = k / 60 in
        let m = bit_shl 1 (k - w * 60) in
        let x = vec_get rxv_mc_bits w in
-       if bit_and x m != 0 then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
-       else (let _ = vec_set rxv_mc_bits w (bit_or x m) in rxv_run prog s a i saves (Cons ((b, i, saves), bt))))
+       if bit_and x m != 0 then (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
+       else (let _ = vec_set rxv_mc_bits w (bit_or x m) in let _ = rxs_push b i in rxv_run prog s a i base))
     // (inside an atomic group's or a lookahead's run: rxv_im -- and before
     //  the cache is on, a choice there counts toward turning it on, as a
     //  backtrack does: a run that succeeds pops none of its choices, so a
     //  quadratic walk of them never reached the threshold)
     else if vec_get rxv_imf 0 == 1 && vec_get rxv_mc 0 == 0 && vec_get rxv_mc 4 > 0 then
-      (let _ = rxv_tick () in rxv_run prog s a i saves (Cons ((b, i, saves), bt)))
+      (let _ = rxv_tick () in let _ = rxs_push b i in rxv_run prog s a i base)
     else if vec_get rxv_imf 0 == 1 && vec_get rxv_mc 0 == 1 then
       (let k = pc * vec_get rxv_mc 1 + i in
        if map_has rxv_im k then
          (let e9 = map_get rxv_im k in
-          if e9 >= 0 then RFound (e9, saves)
+          if e9 >= 0 then RFound (e9, Nil)
           // (-1: seen and failed, or still on this path -- an empty turn)
-          else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
+          else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
        else (let _ = map_set rxv_im k (0 - 1) in
-             let sv = Cons ((0 - (100000 + vec_get rxv_mc 3), k), saves) in rxv_run prog s a i sv (Cons ((b, i, sv), bt))))
-    else rxv_run prog s a i saves (Cons ((b, i, saves), bt))
-  | IJmp t -> rxv_run prog s t i saves bt
-  | ISave slot -> rxv_run prog s (pc + 1) i (Cons ((slot, i), saves)) bt
+             let _ = rxs_mark (0 - (100000 + vec_get rxv_mc 3)) k in
+             let _ = rxs_push b i in rxv_run prog s a i base))
+    else (let _ = rxs_push b i in rxv_run prog s a i base)
+  | IJmp t -> rxv_run prog s t i base
+  | ISave slot -> (let _ = rxs_ss slot i in rxv_run prog s (pc + 1) i base)
   // (in a pattern with calls a capture is also kept by the depth it was made
   //  at, slot -(1000000 + depth*1000 + slot), for \k<x+n>)
   // (the LEVEL of a capture is the call depth it was made at, and \k<n+k>
@@ -57991,29 +58134,28 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
   //  backref_match_at_nested_level, where a called group's own site is a
   //  call as well)
   | ISaveL slot ->
-    (let d9 = rxv_call_depth saves in
-     let sv9 = Cons ((slot, i), Cons ((0 - (1000000 + d9 * 1000 + slot), i), saves)) in
+    (let d9 = rxv_call_depth () in
+     let st9 = (if slot - (slot / 2) * 2 == 1 then rxs_sg (0 - (1000000 + d9 * 1000 + slot - 1)) else 0 - 1) in
+     let _ = rxs_ss (0 - (1000000 + d9 * 1000 + slot)) i in
+     let _ = rxs_ss slot i in
      // the END of a group takes the start made at the same depth back: a
      // recursive call inside it set the start again (onigmo keeps starts
      // on its stack, STACK_GET_MEM_START), `\A(a|b\g<1>c)\z` on "bac"
      // is group 1 = "bac", not "ac"
-     let sv9 = (if slot - (slot / 2) * 2 == 1 then
-                  (let st9 = rxv_slot_get saves (0 - (1000000 + d9 * 1000 + slot - 1)) in
-                   if st9 >= 0 then Cons ((slot - 1, st9), sv9) else sv9)
-                else sv9) in
-     rxv_run prog s (pc + 1) i sv9 bt)
+     let _ = (if st9 >= 0 then rxs_ss (slot - 1) st9 else ()) in
+     rxv_run prog s (pc + 1) i base)
   | IBackrefL (g, lvl, ci) ->
-    (let td9 = rxv_call_depth saves + lvl in
-     // (a program with no call keeps plain saves, all of them level 0)
-     let plain9 = td9 == 0 && rxv_slot_get saves (0 - 3) < 0 in
-     let a = (if td9 < 0 then 0 - 1 else if plain9 then rxv_slot_get saves (2 * g) else rxv_slot_get saves (0 - (1000000 + td9 * 1000 + 2 * g))) in
-     let b = (if td9 < 0 then 0 - 1 else if plain9 then rxv_slot_get saves (2 * g + 1) else rxv_slot_get saves (0 - (1000000 + td9 * 1000 + 2 * g + 1))) in
-     if a < 0 || b < a || i + (b - a) > str_len s then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    (let td9 = rxv_call_depth () + lvl in
+     // (a program with no call keeps plain slots, all of them level 0)
+     let plain9 = td9 == 0 && rxs_sg (0 - 3) < 0 in
+     let a = (if td9 < 0 then 0 - 1 else if plain9 then rxs_sg (2 * g) else rxs_sg (0 - (1000000 + td9 * 1000 + 2 * g))) in
+     let b = (if td9 < 0 then 0 - 1 else if plain9 then rxs_sg (2 * g + 1) else rxs_sg (0 - (1000000 + td9 * 1000 + 2 * g + 1))) in
+     if a < 0 || b < a || i + (b - a) > str_len s then (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
      else
        (if (if ci then (let seg = substring s a b in let here = substring s i (i + (b - a)) in str_eq (str_upcase seg) (str_upcase here))
-            else rxv_seg_eq s a i (b - a) 0) then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
-        else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))))
-  | IMark k -> rxv_run prog s (pc + 1) i (Cons ((k, i), saves)) bt
+            else rxv_seg_eq s a i (b - a) 0) then rxv_run prog s (pc + 1) (i + (b - a)) base
+        else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)))
+  | IMark k -> (let _ = rxs_ss k i in rxv_run prog s (pc + 1) i base)
   | ICheck (k, out) ->
     // Onigmo's empty check: an iteration that consumed nothing AND changed no
     // capture ends the loop here (keeping this iteration's captures, no
@@ -58024,32 +58166,32 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     //  cache has marked it, and a mark means "failed" -- the next turn was
     //  cut, and `"aacac" =~ /(a*)+.(a*)?$/` kept "a" in its first group where
     //  ruby has "". So that split is taken here, past the marks.)
-    if rxv_slot_get saves k == i then
-      (if rxv_caps_changed saves k then
+    if rxs_sg k == i then
+      (if rxs_caps_changed k then
          (match rxv_fetch prog (pc + 1) with
           | IJmp l9 -> (match rxv_fetch prog l9 with
-                        | ISplit (a9, b9) -> rxv_run prog s a9 i saves (Cons ((b9, i, saves), bt))
-                        | _ -> rxv_run prog s (pc + 1) i saves bt)
-          | _ -> rxv_run prog s (pc + 1) i saves bt)
-       else rxv_run prog s out i saves bt)
-    else rxv_run prog s (pc + 1) i saves bt
+                        | ISplit (a9, b9) -> (let _ = rxs_push b9 i in rxv_run prog s a9 i base)
+                        | _ -> rxv_run prog s (pc + 1) i base)
+          | _ -> rxv_run prog s (pc + 1) i base)
+       else rxv_run prog s out i base)
+    else rxv_run prog s (pc + 1) i base
   | IBOL ->
     // line start: position 0, or right after a \n — but NOT the end-of-string
     // position after a trailing \n (there is no empty last line in Ruby).
-    if i == 0 || (i < str_len s && str_eq (char_at s (i - 1)) "\n") then rxv_run prog s (pc + 1) i saves bt
-    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    if i == 0 || (i < str_len s && str_eq (char_at s (i - 1)) "\n") then rxv_run prog s (pc + 1) i base
+    else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | IEOL ->
-    if i >= str_len s || str_eq (char_at s i) "\n" then rxv_run prog s (pc + 1) i saves bt
-    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
-  | IBOS -> if i == 0 then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    if i >= str_len s || str_eq (char_at s i) "\n" then rxv_run prog s (pc + 1) i base
+    else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
+  | IBOS -> if i == 0 then rxv_run prog s (pc + 1) i base else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | IGANCHOR ->
     // \G: match only at the search's start offset (set by rxv_search).
     (let g = (if map_has rx_ganchor "g" then map_get rx_ganchor "g" else 0) in
-     if i == g then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
-  | IEOS -> if i >= str_len s then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+     if i == g then rxv_run prog s (pc + 1) i base else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
+  | IEOS -> if i >= str_len s then rxv_run prog s (pc + 1) i base else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | IEOSNL ->
-    if i >= str_len s || (i == str_len s - 1 && str_eq (char_at s i) "\n") then rxv_run prog s (pc + 1) i saves bt
-    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    if i >= str_len s || (i == str_len s - 1 && str_eq (char_at s i) "\n") then rxv_run prog s (pc + 1) i base
+    else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | IWordB (want, asc) ->
     // ⚠ ruby's \b is a UNICODE boundary even where its \w is ASCII: "é" is a
     //   word character to `/\b/` ("xé" =~ /x\b/ is nil) and only (?a) makes
@@ -58058,69 +58200,67 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     (let w1 = i > 0 && rxv_word_before s i asc in
      let w2 = i < str_len s && rxv_word_at s i asc in
      let atb = (if w1 then (if w2 then false else true) else w2) in
-     if (if want then atb else (if atb then false else true)) then rxv_run prog s (pc + 1) i saves bt
-     else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
+     if (if want then atb else (if atb then false else true)) then rxv_run prog s (pc + 1) i base
+     else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
   | IBackref (g, ci) ->
-    (let a = rxv_slot_get saves (2 * g) in
-     let b = rxv_slot_get saves (2 * g + 1) in
-     if a < 0 || b < a then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+    (let a = rxs_sg (2 * g) in
+     let b = rxs_sg (2 * g + 1) in
+     if a < 0 || b < a then (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
      // (in place, without /i: the group and the text here were copied out to
      //  compare, two strings of the group's length a check, kept to the end of
      //  the match -- `^(a*)\1b?a*$` over a million a's took 7 GB in the half
      //  second before its timeout, test_regexp's per_instance_redos_test)
      else if (if ci then false else true) then
-       (if i + (b - a) <= str_len s && rxv_seg_eq s a i (b - a) 0 then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
-        else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
+       (if i + (b - a) <= str_len s && rxv_seg_eq s a i (b - a) 0 then rxv_run prog s (pc + 1) (i + (b - a)) base
+        else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
      else
        let seg = substring s a b in
        let here = (if i + (b - a) <= str_len s then substring s i (i + (b - a)) else "") in
        let eqv = str_eq (str_upcase seg) (str_upcase here) in
-       if eqv && i + (b - a) <= str_len s then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
+       if eqv && i + (b - a) <= str_len s then rxv_run prog s (pc + 1) (i + (b - a)) base
        // (under /i in UTF-8, by folded characters, whose byte lengths may differ)
        else if ci && vec_get cut_k 0 == 1 && (let n9 = rxv_ci_ref_len s i seg in n9 >= 0) then
-         rxv_run prog s (pc + 1) (i + rxv_ci_ref_len s i seg) saves bt
-       else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
+         rxv_run prog s (pc + 1) (i + rxv_ci_ref_len s i seg) base
+       else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
   | ILook (sub, negd) ->
-    (match rxv_inner_m prog s sub i saves with
-     | RFound (_, sv2) ->
-       if negd then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)) else rxv_run prog s (pc + 1) i sv2 bt
+    (match rxv_inner_m prog s sub i with
+     | RFound (_, _) ->
+       if negd then (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail) else rxv_run prog s (pc + 1) i base
      | RFail ->
-       if negd then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
+       if negd then rxv_run prog s (pc + 1) i base else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
   | IAtomic sub ->
     // Run the body on a FRESH backtrack stack (its internal choices stay
     // contained); take its first match, consume to that end, keep its
     // captures, and continue with the OUTER stack — so we never backtrack
     // back into the group. That is atomic-group / possessive semantics.
-    (match rxv_inner_m prog s sub i saves with
-     | RFound (e, sv2) -> rxv_run prog s (pc + 1) e sv2 bt
-     | RFail -> (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
+    (match rxv_inner_m prog s sub i with
+     | RFound (e, _) -> rxv_run prog s (pc + 1) e base
+     | RFail -> (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
   | ILookB (sub, wlo, whi, negd) ->
     // try every start the body could have had, longest first, and require it
     // to end exactly here -- that is what makes differing-width alternatives
     // in a lookbehind work.
-    (match rxv_lookb_try prog s sub i wlo whi saves with
-     | RFound (_, sv2) ->
-       if negd then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)) else rxv_run prog s (pc + 1) i sv2 bt
+    (match rxv_lookb_try prog s sub i wlo whi with
+     | RFound (_, _) ->
+       if negd then (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail) else rxv_run prog s (pc + 1) i base
      | RFail ->
-       if negd then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
-  | IMeta (_, _) -> (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+       if negd then rxv_run prog s (pc + 1) i base else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
+  | IMeta (_, _) -> (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
 
-// did this loop iteration (the saves newer than the most recent `k` mark
-// entry) change any capture slot's value vs before the iteration?
 // a lookbehind body that ends exactly at `i`, starting anywhere between
 // i-whi and i-wlo (longest first, as ruby prefers).
 and rxv_lookb_try = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
-                   fn (wlo: int) -> fn (whi: int) -> fn (saves: (int * int) list) ->
+                   fn (wlo: int) -> fn (whi: int) ->
   if whi < wlo then RFail
-  else if i - whi < 0 then rxv_lookb_try prog s sub i wlo (whi - 1) saves
+  else if i - whi < 0 then rxv_lookb_try prog s sub i wlo (whi - 1)
   else
     (let prev = (if map_has rxv_lb_end "e" then map_get rxv_lb_end "e" else 0 - 1) in
      let _ = map_set rxv_lb_end "e" i in
-     let r = rxv_inner prog s sub (i - whi) saves in
+     let r = rxv_inner prog s sub (i - whi) in
      let _ = map_set rxv_lb_end "e" prev in
      match r with
      | RFound (e, sv2) -> RFound (e, sv2)
-     | RFail -> rxv_lookb_try prog s sub i wlo (whi - 1) saves)
+     | RFail -> rxv_lookb_try prog s sub i wlo (whi - 1))
 
 
 // does [i, e) of s contain a match of the sub-program? (the subject cut at e,
@@ -58129,8 +58269,9 @@ and rxv_absent_hit = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) -> f
   let t = substring s 0 e in
   let rec from = fn (j: int) ->
     (if j > e then false
-     else (match rxv_inner prog t sub j Nil with
-           | RFound (_, _) -> true
+     else (let t0 = vec_get rxs_top 1 in
+           match rxv_inner prog t sub j with
+           | RFound (_, _) -> (let _ = rxs_undo t0 in true)
            | RFail -> from (j + (if j < e then cut_clen t j else 1)))) in
   from i
 // the longest end (a character boundary) with no match of absent before it
@@ -58149,9 +58290,9 @@ and rxv_absent_fill = fn v -> fn (xs: int list) ->
   match xs with Nil -> () | Cons (h, t) -> let _ = vec_push v h in rxv_absent_fill v t
 // the shorter clean ends, i .. e (exclusive), as backtrack entries: the
 // nearest to e is tried first, so it goes on top
-and rxv_absent_alts = fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (e: int) -> fn (saves: (int * int) list) -> fn (bt: (int * int * ((int * int) list)) list) ->
-  if i >= e then bt
-  else rxv_absent_alts s pc (i + cut_clen s i) e saves (Cons ((pc, i, saves), bt))
+and rxv_absent_alts = fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (e: int) ->
+  if i >= e then ()
+  else (let _ = rxs_push pc i in rxv_absent_alts s pc (i + cut_clen s i) e)
 
 // search: the leftmost match at or after `start` (compile cached; RBadPat
 // when the new engine cannot handle the pattern -> caller uses the legacy one).
@@ -58191,7 +58332,7 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
        let _ = vec_set rxv_dl 0 (if tmo9 > 0 then sch_now () + tmo9 else 0) in
        let _ = vec_set rxv_dl 1 0 in
        // (at most half the budget, or a long subject would run out of it first)
-       let _ = vec_set rxv_mc 4 (if ok9 then (let t9 = (str_len s + 1) * rxv_mc_size prog in if t9 > rxv_budget / 2 then rxv_budget / 2 else t9) else 0 - 1) in
+       let _ = vec_set rxv_mc 4 (if ok9 then (let t9 = (str_len s + 1) * rxv_mc_size prog in if t9 > rxv_mc_cap then rxv_mc_cap else t9) else 0 - 1) in
        // ⚠ AN ANCHORED PROGRAM HAS EXACTLY ONE POSITION TO TRY. A pattern whose
        // FIRST instruction is `\G` or `\A` can only match where the anchor is,
        // so a failure there is a failure everywhere -- but the search walked
@@ -58207,13 +58348,13 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
        if str_len req9 > 0 && start <= str_len s && (if rxr_any_from s req9 start 0 then false else true) then RNoHit
        else if (if map_has rx_ganchor "o" then false else true) && rxv_anchored prog then
          (if start > str_len s then RNoHit
-          else match rxv_run prog s 0 start Nil Nil with
-               | RFound (e, sv) -> RHit (rxv_keep_start sv start, e, sv)
+          else match (let _ = rxs_reset () in rxv_run prog s 0 start 0) with
+               | RFound (e, _) -> (let sv = rxs_snapshot () in RHit (rxv_keep_start sv start, e, sv))
                | RFail -> RNoHit)
        else if once9 then
          (if start > str_len s then RNoHit
-          else match rxv_run prog s 0 start Nil Nil with
-               | RFound (e, sv) -> RHit (rxv_keep_start sv start, e, sv)
+          else match (let _ = rxs_reset () in rxv_run prog s 0 start 0) with
+               | RFound (e, _) -> (let sv = rxs_snapshot () in RHit (rxv_keep_start sv start, e, sv))
                | RFail -> RNoHit)
        else rxv_search_go prog s start (str_len s))
     else (let _ = map_set rx_bad key VNil in RBadPat)
@@ -58226,8 +58367,8 @@ and rxv_anchored = fn prog ->
 and rxv_search_go = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) ->
   if i > len then RNoHit
   else
-    match rxv_run prog s 0 i Nil Nil with
-    | RFound (e, sv) -> RHit (rxv_keep_start sv i, e, sv)
+    match (let _ = rxs_reset () in rxv_run prog s 0 i 0) with
+    | RFound (e, _) -> (let sv = rxs_snapshot () in RHit (rxv_keep_start sv i, e, sv))
     // Restart at the next CHARACTER: stepping a byte at a time made a scan over
     // a multibyte string try positions inside a character, so `"こんにちは"
     // .split(//)` reported 15 pieces where Ruby says 5.
