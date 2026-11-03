@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import selectors
 import signal
 import subprocess
 import tempfile
@@ -21,6 +22,9 @@ ROOT = Path(__file__).resolve().parent.parent
 COUNTS = ("tests", "match", "red", "both", "extra")
 COVERAGE = ("ref_state", "ref_exit", "ref_summary_tests", "ref_discovered_tests",
             "mere_state", "mere_exit", "mere_summary_tests", "mere_discovered_tests")
+LOG_INPUT_CAP = 2 * 1024 * 1024
+LOG_OUTPUT_CAP = 2 * 1024 * 1024
+LOG_MASK_SECONDS = 10
 
 
 def digest(path):
@@ -114,13 +118,65 @@ def supervise(command, env, log, rss_kb, seconds):
 
 
 def sanitize(source, target):
+    # sed/perl buffer whole lines. Bound their input, including an unterminated
+    # line, before starting them. Larger raw logs are never scanned to EOF.
+    # Drain stdout in fixed chunks, keeping only the bounded prefix on disk.
+    reasons = []
+    with tempfile.TemporaryFile() as prefix, tempfile.TemporaryFile() as masked:
+        with source.open("rb") as raw:
+            remaining = LOG_INPUT_CAP
+            while remaining:
+                block = raw.read(min(65536, remaining))
+                if not block:
+                    break
+                prefix.write(block)
+                remaining -= len(block)
+            if raw.read(1):
+                reasons.append("input")
+        prefix.seek(0)
+        command = ["sh", "-c", '. "$1"; strip_noise', "mask", str(ROOT / "mspec/mask.sh")]
+        process = subprocess.Popen(command, stdin=prefix, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   start_new_session=True,
+                                   env=dict(PATH=os.environ.get("PATH", os.defpath),
+                                            HOME=os.environ["HOME"], LC_ALL="C"))
+        try:
+            deadline = time.monotonic() + LOG_MASK_SECONDS
+            remaining = LOG_OUTPUT_CAP + 1
+            with process.stdout as pipe, selectors.DefaultSelector() as selector:
+                selector.register(pipe, selectors.EVENT_READ)
+                while True:
+                    seconds = deadline - time.monotonic()
+                    if seconds <= 0 or not selector.select(seconds):
+                        raise subprocess.TimeoutExpired(command, LOG_MASK_SECONDS)
+                    block = os.read(pipe.fileno(), 65536)
+                    if not block:
+                        break
+                    if remaining:
+                        kept = block[:remaining]
+                        masked.write(kept)
+                        remaining -= len(kept)
+                status = process.wait(timeout=max(0, deadline - time.monotonic()))
+        except BaseException:
+            # This fixed mask pipeline only starts sed/perl in its own group.
+            # It cannot leave an unbounded masking process after a timeout.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+            raise
+        if status:
+            raise subprocess.CalledProcessError(status, command)
+        masked.seek(0)
+        result = masked.read(LOG_OUTPUT_CAP + 1)
+    if len(result) > LOG_OUTPUT_CAP:
+        reasons.append("output")
+        result = result[:LOG_OUTPUT_CAP]
+    if reasons:
+        # Do not leave a partial UTF-8 code point at the capped boundary.
+        result = result.decode("utf-8", "ignore").encode()
+        result += ("\n[diagnostic log truncated at 2 MiB (" + "/".join(reasons) + " limit)]\n").encode()
     target.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.check_output(
-        ["sh", "-c", '. "$1"; strip_noise < "$2"', "mask",
-         str(ROOT / "mspec/mask.sh"), str(source)], env=dict(os.environ, LC_ALL="C"))
-    cap = 2 * 1024 * 1024
-    if len(result) > cap:
-        result = result[:cap].decode("utf-8", "replace").encode() + b"\n[diagnostic log truncated at 2 MiB]\n"
     target.write_bytes(result)
 
 
@@ -164,7 +220,9 @@ def run_shard(args):
                   reference_sha256=digest(os.environ["REF_RUBY_BIN"]),
                   environment_policy="allowlist-v1",
                   bounds=dict(wall_per_side=args.wall, rss_family_kb=args.rss_kb,
-                              process_scope="descendants-and-marker-v1"),
+                              process_scope="descendants-and-marker-v1",
+                              diagnostic_input_bytes=LOG_INPUT_CAP, diagnostic_output_bytes=LOG_OUTPUT_CAP,
+                              diagnostic_mask_seconds=LOG_MASK_SECONDS),
                   rows=[dict(file=file, ref_state="NOT_RUN", mere_state="NOT_RUN") for file in files])
     save(output / "result.json", result)
     infra_error = False

@@ -2,11 +2,14 @@
 """Check sharding, partial collection and provenance without building Mere."""
 import contextlib
 import io
+import json
 import os
 import shlex
 import shutil
 import subprocess
 import signal
+import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -218,6 +221,80 @@ class CICheck(unittest.TestCase):
         text = target.read_text()
         self.assertNotIn("/Users/operator", text)
         self.assertNotIn("private-value", text)
+
+    def test_diagnostic_memory_is_bounded_as_unterminated_input_grows(self):
+        # Separate processes make peak RSS comparable. No newline: sed/perl
+        # must not be allowed to buffer the entire raw log as a single line.
+        worker = '''import json, resource, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import ci
+ci.sanitize(Path(sys.argv[2]), Path(sys.argv[3]))
+divisor = 1024 if sys.platform == "darwin" else 1
+print(json.dumps({"parent_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / divisor,
+                  "mask_kb": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / divisor}))
+'''
+        samples = []
+        for size_mb in (8, 64):
+            source, target = self.root / f"raw-{size_mb}.out", self.root / f"public-{size_mb}.out"
+            with source.open("wb") as raw:
+                block = b"x" * 65536
+                for _ in range(size_mb * 16):
+                    raw.write(block)
+            result = subprocess.run([sys.executable, "-c", worker, str(Path(ci.__file__).parent),
+                                     str(source), str(target)], text=True, capture_output=True,
+                                    timeout=30, check=True)
+            samples.append(json.loads(result.stdout))
+            self.assertLessEqual(target.stat().st_size, ci.LOG_OUTPUT_CAP + 128)
+            self.assertIn(b"input limit", target.read_bytes())
+        # Allow interpreter/OS noise, while rejecting the previous ~56 MiB
+        # increase for this 8 -> 64 MiB input change, in parent or mask tools.
+        print("Diagnostic peak RSS KiB (8/64 MiB input): " + json.dumps(samples), file=sys.stderr)
+        for component in ("parent_kb", "mask_kb"):
+            self.assertLess(samples[1][component] - samples[0][component], 16 * 1024, samples)
+
+    def test_input_truncation_is_reported_even_when_masked_output_is_short(self):
+        source, target = self.root / "hash.out", self.root / "public.out"
+        source.write_bytes(b'{"key"=>"' + b"x" * ci.LOG_INPUT_CAP + b'"}')
+        ci.sanitize(source, target)
+        text = target.read_text()
+        self.assertTrue(text.startswith("{..."))
+        self.assertIn("input limit", text)
+        self.assertLess(len(text), 128)
+
+    def test_expanded_output_is_capped_and_utf8_boundaries_are_valid(self):
+        source, target = self.root / "invalid.out", self.root / "public.out"
+        source.write_bytes(b"\xff" * (ci.LOG_INPUT_CAP // 2))
+        ci.sanitize(source, target)
+        self.assertLessEqual(target.stat().st_size, ci.LOG_OUTPUT_CAP + 128)
+        self.assertIn("output limit", target.read_text())
+        source.write_text("abcd\U0001f600\n")
+        with patch.object(ci, "LOG_OUTPUT_CAP", 5):
+            ci.sanitize(source, target)
+        self.assertTrue(target.read_text().startswith("abcd\n[diagnostic log truncated"))
+
+    def test_mask_timeout_reclaims_its_group_and_publishes_no_output(self):
+        source, target = self.root / "raw.out", self.root / "public.out"
+        source.write_text("diagnostic\n")
+        for body in ("sleep 30", "yes noisy"):
+            with self.subTest(mask=body):
+                (self.root / "mspec/mask.sh").write_text("strip_noise() { " + body + "; }\n")
+                start = time.monotonic()
+                with patch.object(ci, "LOG_MASK_SECONDS", 0.1), patch.object(ci.os, "killpg", wraps=os.killpg) as kill:
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        ci.sanitize(source, target)
+                kill.assert_called_once()
+                self.assertEqual(kill.call_args.args[1], signal.SIGKILL)
+                self.assertLess(time.monotonic() - start, 3)
+                self.assertFalse(target.exists())
+
+    def test_failed_mask_does_not_publish_unfiltered_output(self):
+        source, target = self.root / "raw.out", self.root / "public.out"
+        source.write_text("private diagnostic\n")
+        (self.root / "mspec/mask.sh").write_text("strip_noise() { cat; return 1; }\n")
+        with self.assertRaises(subprocess.CalledProcessError):
+            ci.sanitize(source, target)
+        self.assertFalse(target.exists())
 
     def test_interpreters_receive_only_an_allowlist_and_an_empty_home(self):
         private = self.root / "private-environment"

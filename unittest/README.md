@@ -136,9 +136,18 @@ Artifacts are retained for seven days:
 | `unittest-report` | `SUMMARY.md`, `summary.json` and every planned file in `files.tsv` |
 
 Diagnostic logs pass through the repository's existing masking rules before
-upload and are capped at 2 MiB per log with a truncation marker. Private raw
-logs are not part of the artifact. Interrupted workers also retain masked
-partial stdout/stderr when available.
+upload. Each mask receives at most the first 2 MiB of raw input, bounding even
+sed/perl's buffering of a single unterminated line. Filtered output is drained
+in 64 KiB chunks, retaining at most 2 MiB plus a truncation marker. The marker
+identifies whether input, output, or both reached their limits. A capped prefix
+does not end with a partial UTF-8 code point. Private raw logs are not uploaded.
+Interrupted workers also retain masked partial stdout/stderr when available.
+
+The fixed mask pipeline has a 10-second wall limit and its own process group,
+which is reclaimed on timeout. Failed or timed-out masking publishes no new
+log and fails collection as an infrastructure error. Input/output byte limits
+and the mask wall limit are recorded with the measurement bounds. These limits
+also apply to driver logs, partial output and RED tags.
 
 Both interpreters run with a small environment allowlist and a fresh temporary
 HOME and TMPDIR per file. Only PATH, locale, explicit interpreter/extension paths,
@@ -173,3 +182,6 @@ The process-family checks use real processes, including new sessions/groups,
 empty exec environments, fast double-forks and multiline argv. They require
 permission to inspect processes with ps. The CI harness job also runs a real
 Ruby 4.0.9 Test::Unit fixture for multiline environment diagnostics.
+The collection checks compare parent and mask-process peak RSS for 8 MiB and
+64 MiB logs without newlines, exercise output expansion and UTF-8 truncation,
+and check both silent and continuously noisy mask timeouts.
