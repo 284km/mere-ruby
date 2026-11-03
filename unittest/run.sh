@@ -148,7 +148,14 @@ coverage() {
 # the rows in list order, so how many files ran at once does not show in it.
 if [ "${1:-}" = "--one" ]; then
   work="$2"; n="$3"; rel="$4"
-  dir="$src/test/$(dirname "$rel")"; base="$(basename "$rel")"
+  # -ext-/... is a real part of CRuby's test tree. Passing it directly to
+  # dirname/basename treats the leading hyphen as an option on macOS.
+  base="${rel##*/}"
+  case "$rel" in
+    */*) dir="$src/test/${rel%/*}" ;;
+    *) dir="$src/test" ;;
+  esac
+  case "$base" in -*) base="./$base" ;; esac
   # ⚠ INTO A FILE, then read: a pipe is not done until every process holding
   #   its write end is gone, and a test can leave one behind. test_process's
   #   fifo tests start `cat < fifo` from a ruby they interrupt; under

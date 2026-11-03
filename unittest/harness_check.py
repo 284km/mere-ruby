@@ -34,11 +34,14 @@ class HarnessCheck(unittest.TestCase):
         interpreter = '''#!/bin/sh
 case "$*" in *rubylibdir*) printf '\\n'; exit 0 ;; esac
 preload=0
+script=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "-r" ] && [ "${2:-}" = "test/unit" ]; then preload=1; fi
+  case "$1" in *.rb) script="$1" ;; esac
   shift
 done
 [ "$preload" -eq 1 ] || { echo 'uninitialized constant Test (NameError)'; exit 1; }
+[ -n "$script" ] && [ -f "$script" ] || { echo 'fixture script not found'; exit 1; }
 side=$(basename "$0")
 if [ -f "$FIXTURE_ROOT/$side.interleave" ]; then
   printf '[1/1] Example#test_ok'
@@ -102,6 +105,16 @@ exit "$(cat "$FIXTURE_ROOT/$side.code")"
         result = self.run_harness("--list", "-ext-")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["-ext-/test_bug.rb"])
+
+    def test_extension_directory_with_leading_hyphen_reaches_the_test_file(self):
+        (self.root / "src/test/-ext-").mkdir()
+        (self.root / "src/test/-ext-/test_bug.rb").write_text("# fixture\n")
+        result = self.run_harness("-ext-/test_bug.rb")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MATCH 1, RED 0, BOTH 0, EXTRA 0", result.stdout)
+        row = self.coverage()[0]
+        self.assertEqual(row["ref_state"], "COMPLETE")
+        self.assertEqual(row["mere_state"], "COMPLETE")
 
     def test_bad_or_empty_selection_fails_before_running(self):
         for args in [("missing.rb",), ("--all", "ruby"), ("../test.rb",)]:
