@@ -263,6 +263,7 @@ def run_shard(args):
                               transcript_case_bytes=transcript.CASE_BYTES,
                               transcript_cases=transcript.CASE_LIMIT,
                               transcript_snapshot_bytes=transcript.SNAPSHOT_BYTES,
+                              transcript_encoding_bytes=transcript.ENCODING_BYTES,
                               transcript_seconds=transcript.PARSE_SECONDS),
                   rows=[dict(file=file, ref_state="NOT_RUN", mere_state="NOT_RUN") for file in files])
     save(output / "result.json", result)

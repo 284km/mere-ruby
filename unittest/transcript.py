@@ -6,16 +6,17 @@ import re
 import time
 from pathlib import Path
 
-POLICY = "symbols-and-durable-cases-v1"
+POLICY = "encoding-aware-durable-cases-v2"
 INPUT_BYTES = 64 * 1024 * 1024
 LINE_BYTES = 64 * 1024
 NAME_BYTES = 16 * 1024
 CASE_BYTES = 4 * 1024 * 1024
 CASE_LIMIT = 100000
 SNAPSHOT_BYTES = 16 * 1024 * 1024
+ENCODING_BYTES = 16 * 1024 * 1024
 PARSE_SECONDS = 10
 COUNTS = ("tests", "match", "red", "both", "extra")
-STATES = {"COMPLETE", "ZERO", "INCOMPLETE", "COUNT_MISMATCH", "EXIT_ERROR",
+STATES = {"COMPLETE", "ZERO", "INCOMPLETE", "COUNT_MISMATCH", "EXIT_ERROR", "IDENTITY_AMBIGUOUS",
           "REPORT_MISMATCH", "PARSE_LIMIT", "MEMORY_LIMIT", "WALL_LIMIT", "NOT_RUN"}
 PROGRESS = re.compile(rb'^\[ *[0-9]+/[0-9]+\] (.*?)#(?=test|\")')
 SUMMARY = re.compile(rb'^(\d+) tests, (\d+) assertions, (\d+) failures, (\d+) errors, (\d+) skips')
@@ -32,13 +33,13 @@ def atomic(path, text):
     pending.replace(path)
 
 
-def symbol(data):
+def symbol(data, spelling=False):
     """Read only the Symbol.inspect token, never adjacent test diagnostics."""
     if not data.startswith(b'"'):
         found = re.match(rb'test[A-Za-z0-9_\x80-\xff]*[!?=]?', data)
         if not found:
             raise ValueError("invalid bare method name")
-        return found[0]
+        return (found[0], found[0]) if spelling else found[0]
     output = bytearray()
     index = 1
     escapes = {ord(k): v for k, v in {'a': b'\a', 'b': b'\b', 't': b'\t', 'n': b'\n',
@@ -48,7 +49,7 @@ def symbol(data):
         byte = data[index]
         index += 1
         if byte == ord('"'):
-            return bytes(output)
+            return (bytes(output), data[:index]) if spelling else bytes(output)
         if byte != ord('\\'):
             output.append(byte)
             continue
@@ -121,7 +122,13 @@ def lines(stream, issues):
         issues.add('input_limit')
 
 
-def parse(path, exit_code):
+def case_identity(suite, suite_encoding, method, method_encoding):
+    def component(raw, encoding):
+        return identity(raw) + ('\\{' + encoding + '}' if not raw.isascii() else '')
+    return component(suite, suite_encoding) + '#' + component(method, method_encoding)
+
+
+def parse(path, exit_code, encodings=None):
     cases, aliases, bad = {}, {}, {}
     reports = dict.fromkeys(('F', 'E', 'T', 'S'), 0)
     issues = set()
@@ -129,20 +136,55 @@ def parse(path, exit_code):
     want = None
     used = 0
 
-    def add(raw):
+    typed = set()
+
+    def add(raw, key=None):
         nonlocal used
-        if raw in aliases:
-            return aliases[raw]
-        key = identity(raw)
+        key = identity(raw) if key is None else key
         size = len(key.encode('utf-8'))
-        if size > NAME_BYTES or len(cases) >= CASE_LIMIT or used + size > CASE_BYTES:
-            issues.add('case_limit')
-            return None
         if key not in cases:
+            if size > NAME_BYTES or len(cases) >= CASE_LIMIT or used + size > CASE_BYTES:
+                issues.add('case_limit')
+                return None
             used += size
             cases[key] = 'X'
-        aliases[raw] = key
+        aliases.setdefault(raw, set()).add(key)
         return key
+
+    if encodings is not None and Path(encodings).exists():
+        with Path(encodings).open('rb') as stream:
+            if stream.readline(32) != b'case-encodings-v1\n':
+                issues.add('encoding_metadata_invalid')
+            remaining = ENCODING_BYTES
+            deadline = time.monotonic() + PARSE_SECONDS
+            while remaining:
+                line = stream.readline(min(LINE_BYTES, remaining))
+                if not line:
+                    break
+                remaining -= len(line)
+                if time.monotonic() >= deadline:
+                    issues.add('time_limit')
+                    break
+                try:
+                    kind, suite_hex, suite_enc, method_hex, method_enc = line.rstrip(b'\n').split(b'\t')
+                    if (not line.endswith(b'\n') or kind not in (b'N', b'F', b'E', b'T', b'S')
+                            or not all(re.fullmatch(rb'[A-Za-z0-9_-]{1,64}', e) for e in (suite_enc, method_enc))
+                            or not all(re.fullmatch(rb'(?:[0-9a-f]{2})+', h) for h in (suite_hex, method_hex))
+                            or len(suite_hex) + len(method_hex) > NAME_BYTES * 2):
+                        raise ValueError('invalid encoding record')
+                    suite, method = bytes.fromhex(suite_hex.decode()), bytes.fromhex(method_hex.decode())
+                    raw = suite + b'#' + method
+                    key = add(raw, case_identity(suite, suite_enc.decode(), method, method_enc.decode()))
+                    typed.add(raw)
+                    if key is not None and kind != b'N':
+                        verdict = kind.decode()
+                        bad[key] = verdict
+                        reports[verdict] += 1
+                except ValueError:
+                    issues.add('encoding_metadata_invalid')
+                    break
+            if not remaining and stream.read(1):
+                issues.add('encoding_metadata_limit')
 
     if Path(path).exists():
         with Path(path).open('rb') as stream:
@@ -151,7 +193,14 @@ def parse(path, exit_code):
                 if progress:
                     summary = None  # A summary from an earlier nested run is not final.
                     try:
-                        add(progress[1] + b'#' + symbol(line[progress.end():]))
+                        method, token = symbol(line[progress.end():], spelling=True)
+                        raw = progress[1] + b'#' + method
+                        if raw not in typed:
+                            if raw.isascii():
+                                add(raw)
+                            else:
+                                issues.add('encoding_metadata_missing')
+                                add(raw, identity(progress[1]) + '#\\{unknown:' + token.hex() + '}')
                     except (ValueError, UnicodeError):
                         issues.add('name_parse')
                     want = None
@@ -170,11 +219,17 @@ def parse(path, exit_code):
                     continue
                 if want:
                     raw = line[:-1] if line.endswith(b':') else line
-                    key = aliases.get(raw)
-                    if key is None and b' [' in line:
+                    keys = aliases.get(raw)
+                    if keys is None and b' [' in line:
                         raw = line[:line.rfind(b' [')]
-                        key = aliases.get(raw)
-                    if key is None and line.endswith(b':') and re.match(rb'^.*?#test', raw):
+                        keys = aliases.get(raw)
+                    if raw in typed:
+                        # Exact error callbacks already attributed this report,
+                        # including names whose human-readable headers collide.
+                        want = None
+                        continue
+                    key = next(iter(keys)) if keys and len(keys) == 1 else None
+                    if key is None and line.endswith(b':') and re.match(rb'^.*?#test', raw) and raw.isascii():
                         key = add(raw)
                     if key is not None:
                         bad[key] = want
@@ -182,7 +237,7 @@ def parse(path, exit_code):
                         want = None
     state = 'INCOMPLETE'
     if issues:
-        state = 'PARSE_LIMIT'
+        state = 'IDENTITY_AMBIGUOUS' if issues == {'encoding_metadata_missing'} else 'PARSE_LIMIT'
     elif summary is not None and exit_code is not None:
         if summary['tests'] == 0:
             state = 'ZERO'
@@ -266,7 +321,7 @@ def recover(work, index, phase, limit):
             result = load(snapshot)
         else:
             code = int(exit_path.read_text()) if exit_path.exists() else None
-            result = parse(work / f'{index}.{side}.stdout', code)
+            result = parse(work / f'{index}.{side}.stdout', code, work / f'{index}.{side}.encodings')
             if code is None:
                 result['state'] = limit if side == phase else 'NOT_RUN'
         pair.append(result)
@@ -280,6 +335,7 @@ def main():
     command.add_argument('stdout', type=Path)
     command.add_argument('exit_code', type=int)
     command.add_argument('output', type=Path)
+    command.add_argument('--encodings', type=Path)
     command = commands.add_parser('compare')
     command.add_argument('reference', type=Path)
     command.add_argument('mere', type=Path)
@@ -288,7 +344,7 @@ def main():
     command.add_argument('tag', type=Path)
     args = parser.parse_args()
     if args.command == 'parse':
-        save(args.output, parse(args.stdout, args.exit_code))
+        save(args.output, parse(args.stdout, args.exit_code, args.encodings))
     else:
         reference, mere = load(args.reference), load(args.mere)
         counts, tags = compare(reference, mere)

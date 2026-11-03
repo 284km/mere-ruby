@@ -64,13 +64,14 @@ the summary's test count and the number of distinct test names discovered.
 | COUNT_MISMATCH | Summary count and discovered names disagree |
 | EXIT_ERROR | Summary exists but its failures + errors do not explain the exit code |
 | REPORT_MISMATCH | Failure/error/skip report counts do not agree with the summary |
+| IDENTITY_AMBIGUOUS | Non-ASCII names lack runtime encoding metadata; no cases are confirmed passing |
 | PARSE_LIMIT | Transcript or case-name/count budgets prevented complete parsing; issues are recorded |
 | MISSING | The worker did not produce both its result and coverage row |
 
 A file is complete even if some tests failed or were skipped; consult the
 four verdict columns and raw logs for those results. As before, RED is a
 measurement rather than a shell failure. The top-level command now exits 1
-if any selected file is ZERO, INCOMPLETE, COUNT_MISMATCH, EXIT_ERROR or MISSING.
+if any selected file has a state other than COMPLETE.
 Neither an empty union of named tests nor a successful zero-test summary is
 accepted as complete coverage. This also catches missing test-only extensions
 that silently prevent a test class from being defined.
@@ -163,10 +164,22 @@ can retain already known cases while still failing infrastructure collection
 and aborting the shard. A hard stop of the collector/VM can still leave the
 current file NOT_RUN; this is not a recovery mechanism for a lost VM.
 
+Both interpreters preload `case_encodings.rb` after Test::Unit. Its start/result
+callbacks record the bytes and encoding of non-ASCII suite/method names in a
+private, bounded sidecar. Canonical identities include the encoding, so UTF-8,
+ASCII-8BIT and legacy encodings with identical bytes remain distinct. Error
+callbacks also identify the failing case when human-readable report headers
+are identical. ASCII names keep their existing identities. Encoding suffixes
+use a reserved escaped marker that cannot alias literal method-name text.
+`Symbol.inspect` alone cannot distinguish every Ruby encoding: parsing older
+non-ASCII logs without this sidecar yields IDENTITY_AMBIGUOUS, never MATCH.
+Invalid/truncated metadata yields PARSE_LIMIT. Metadata is not uploaded.
+
 The parser reads at most 64 MiB per side in 64 KiB line chunks. A single name
 is capped at 16 KiB, and a side retains at most 100,000 names totaling 4 MiB.
 Parsing also has a 10-second processing deadline, checked between bounded
-line chunks. Private snapshots are limited to 16 MiB when read back. This bounds recovery
+line chunks. Encoding metadata is limited to 16 MiB, with the same line/name
+and processing-time bounds. Private snapshots are limited to 16 MiB when read back. This bounds recovery
 after the worker's monitor has stopped, including unterminated diagnostic lines.
 Budget exhaustion is PARSE_LIMIT, with the reason retained in result.json.
 The parser policy and budgets are recorded in the shard/report, and results

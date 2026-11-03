@@ -149,22 +149,22 @@ if [ "${1:-}" = "--one" ]; then
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.
   # Parse stdout, then append stderr to the saved diagnostic log.
-  (cd "$dir" && perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -I "${UNITTEST_REF_EXT_PATH:-$shim}" -I "$shim" -r test/unit "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -I "${UNITTEST_REF_EXT_PATH:-$shim}" -I "$shim" -r test/unit -r "$here/case_encodings.rb" "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   ref_code=$?
   printf '%s\n' "$ref_code" > "$work/$n.ref.exit.new"
   mv "$work/$n.ref.exit.new" "$work/$n.ref.exit"
-  python3 "$here/transcript.py" parse "$out1" "$ref_code" "$work/$n.ref.json" || exit 1
+  python3 "$here/transcript.py" parse "$out1" "$ref_code" "$work/$n.ref.json" --encodings "$work/$n.ref.encodings" || exit 1
   [ -z "${UNITTEST_KEEP:-}" ] || cat "$out1" "$err1" > "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').reference.out"
   # Separate files prevent a kill between the phase switch and redirection
   # from reinterpreting reference stdout as mere-ruby stdout.
   out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
   printf 'mere\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
-  (cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/case_encodings.rb" "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
   mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"
-  python3 "$here/transcript.py" parse "$out1" "$mr_code" "$work/$n.mere.json" || exit 1
+  python3 "$here/transcript.py" parse "$out1" "$mr_code" "$work/$n.mere.json" --encodings "$work/$n.mere.encodings" || exit 1
   # Preserve the old mere-ruby log name and add the reference side beside it.
   [ -n "${UNITTEST_KEEP:-}" ] && cat "$out1" "$err1" > "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').out"
   tag="$records/tags/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').txt"

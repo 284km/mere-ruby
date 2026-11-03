@@ -435,13 +435,16 @@ class TestInspectedNames < Test::Unit::TestCase
   end
 end
 ''')
-        result = subprocess.run([REAL_RUBY, '-I', REAL_TOOL_LIB, '-r', 'test/unit', str(program), '-v', '--seed=1'],
-                                env=dict(PATH=os.environ['PATH'], HOME=str(self.root), TMPDIR=str(self.root), LC_ALL='C'),
+        metadata = self.root / 'names.encodings'
+        result = subprocess.run([REAL_RUBY, '-I', REAL_TOOL_LIB, '-r', 'test/unit',
+                                 '-r', str(harness_check.ROOT / 'unittest/case_encodings.rb'), str(program), '-v', '--seed=1'],
+                                env=dict(PATH=os.environ['PATH'], HOME=str(self.root), TMPDIR=str(self.root), LC_ALL='C',
+                                         UNITTEST_CASE_ENCODINGS=str(metadata)),
                                 capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 3)
         source = self.root / 'names.stdout'
         source.write_bytes(result.stdout)
-        parsed = transcript.parse(source, result.returncode)
+        parsed = transcript.parse(source, result.returncode, metadata)
         self.assertEqual(parsed['state'], 'COMPLETE')
         self.assertEqual(parsed['discovered'], 3)
         self.assertTrue(all(verdict == 'F' for verdict in parsed['cases'].values()))
@@ -451,6 +454,46 @@ end
             'puts JSON.generate((0..255).map {|n| s = "test_".b + n.chr.b; [s.to_sym.inspect.sub(/\\A:/, ""), s.unpack1("H*")]})'], text=True))
         for spelling, raw in symbols:
             self.assertEqual(transcript.symbol(spelling.encode()), bytes.fromhex(raw))
+
+    @unittest.skipUnless(REAL_RUBY and REAL_TOOL_LIB, "set real Ruby and Test::Unit paths")
+    def test_real_encoded_symbols_remain_distinct_in_results_and_failure_aliases(self):
+        def run(names, failure=None):
+            program = self.root / 'encoded.rb'
+            program.write_text('''class TestEncoded < Test::Unit::TestCase
+  names = [%s]
+  names.each_with_index do |name, index|
+    define_method(name) { %s }
+  end
+end
+''' % (', '.join(names), 'assert(true)' if failure is None else 'assert(index != %d)' % failure))
+            metadata = self.root / 'encoded.encodings'
+            result = subprocess.run([REAL_RUBY, '-I', REAL_TOOL_LIB, '-r', 'test/unit',
+                                     '-r', str(harness_check.ROOT / 'unittest/case_encodings.rb'), str(program),
+                                     '-v', '--seed=1'],
+                                    env=dict(PATH=os.environ['PATH'], HOME=str(self.root), TMPDIR=str(self.root),
+                                             LC_ALL='C', UNITTEST_CASE_ENCODINGS=str(metadata)),
+                                    capture_output=True, timeout=15)
+            source = self.root / 'encoded.stdout'
+            source.write_bytes(result.stdout)
+            parsed = transcript.parse(source, result.returncode, metadata)
+            self.assertEqual(parsed['state'], 'COMPLETE', (parsed, result.stderr))
+            self.assertEqual(parsed['summary']['assertions'], len(names))
+            self.assertEqual(parsed['discovered'], len(names))
+            return parsed
+
+        for encoded in ('"test_é"', '"test_é".encode("ISO-8859-1")'):
+            names = [encoded, encoded + '.b']
+            with self.subTest(encoded=encoded):
+                both = run(names)
+                self.assertEqual(list(both['cases'].values()), ['.', '.'])
+                reference, mere = run(names[:1]), run(names[1:])
+                counts, _ = transcript.compare(reference, mere)
+                self.assertEqual(counts, dict(tests=2, match=0, red=1, both=0, extra=1))
+                for failed in (0, 1):
+                    result = run(names, failed)
+                    failed_key = next(iter(run([names[failed]])['cases']))
+                    self.assertEqual(result['cases'], {key: 'F' if key == failed_key else '.'
+                                                       for key in both['cases']})
 
     @unittest.skipUnless(REAL_RUBY and REAL_TOOL_LIB, "set UNITTEST_REAL_RUBY and UNITTEST_REAL_TOOL_LIB for the real Test::Unit fixture")
     def test_real_test_unit_multiline_hash_and_array_diagnostics_do_not_leak_parent_environment(self):

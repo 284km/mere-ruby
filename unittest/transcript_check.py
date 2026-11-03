@@ -58,10 +58,57 @@ class TranscriptCheck(unittest.TestCase):
                 data = (b'[1/1] Example#' + token + b' = 0.01 s\n'
                         b'  1) Failure:\nExample#' + raw + b':\nfailed\n'
                         b'1 tests, 1 assertions, 1 failures, 0 errors, 0 skips\n')
-                result = self.parse(data, 1)
+                metadata = self.root / 'encodings'
+                encoding = 'UTF-8' if b'\\u' in token else 'ASCII-8BIT'
+                metadata.write_text('case-encodings-v1\nN\t' + b'Example'.hex() + '\tUS-ASCII\t'
+                                    + raw.hex() + '\t' + encoding + '\nF\t' + b'Example'.hex()
+                                    + '\tUS-ASCII\t' + raw.hex() + '\t' + encoding + '\n'
+                                    if not raw.isascii() else 'case-encodings-v1\n')
+                self.parse(data, 1)
+                result = tr.parse(self.root / 'stdout', 1, metadata)
                 self.assertEqual(result['state'], 'COMPLETE')
-                self.assertEqual(result['cases'], {tr.identity(b'Example#' + raw): 'F'})
+                self.assertEqual(result['cases'], {tr.case_identity(b'Example', 'US-ASCII', raw, encoding): 'F'})
         self.assertNotEqual(tr.identity(b'Example#test_\xff'), tr.identity(b'Example#test_\\xff'))
+
+    def test_missing_or_invalid_encoding_metadata_cannot_create_matches(self):
+        utf8 = self.parse('[1/1] Example#test_é = 0.00 s\n'
+                          '1 tests, 1 assertions, 0 failures, 0 errors, 0 skips\n')
+        binary = self.parse('[1/1] Example#"test_\\xC3\\xA9" = 0.00 s\n'
+                            '1 tests, 1 assertions, 0 failures, 0 errors, 0 skips\n')
+        self.assertEqual(utf8['state'], 'IDENTITY_AMBIGUOUS')
+        self.assertEqual(binary['state'], 'IDENTITY_AMBIGUOUS')
+        self.assertNotEqual(utf8['cases'], binary['cases'])
+        self.assertEqual(tr.compare(utf8, binary)[0], dict(tests=2, match=0, red=0, both=2, extra=0))
+        metadata = self.root / 'encodings'
+        for record in ('!limit\n', 'N\t00\tUTF-8\tbroken\tUTF-8\n', 'N\t00'):
+            metadata.write_text('case-encodings-v1\n' + record)
+            parsed = tr.parse(self.root / 'stdout', 0, metadata)
+            self.assertEqual(parsed['state'], 'PARSE_LIMIT')
+            self.assertNotIn('.', parsed['cases'].values())
+
+    def test_encoding_suffix_cannot_alias_a_literal_method_name(self):
+        self.assertNotEqual(tr.case_identity(b'Example', 'US-ASCII', 'test_é'.encode(), 'UTF-8'),
+                            tr.case_identity(b'Example', 'US-ASCII', 'test_é\\{UTF-8}'.encode(), 'UTF-8'))
+
+    def test_encoding_metadata_is_bounded_and_survives_recovery(self):
+        metadata = self.root / '0.ref.encodings'
+        record = 'N\t' + b'Example'.hex() + '\tUS-ASCII\t' + 'test_é'.encode().hex() + '\tUTF-8\n'
+        metadata.write_text('case-encodings-v1\n' + record)
+        self.parse('[1/1] Example#test_é = 0.00 s\n'
+                   '1 tests, 1 assertions, 0 failures, 0 errors, 0 skips\n', name='0.ref.stdout')
+        pair = tr.recover(self.root, 0, 'ref', 'WALL_LIMIT')
+        self.assertEqual(pair[0]['state'], 'WALL_LIMIT')
+        self.assertEqual(list(pair[0]['cases'].values()), ['X'])
+        (self.root / '0.ref.exit').write_text('0\n')
+        pair = tr.recover(self.root, 0, 'ref', 'WALL_LIMIT')
+        self.assertEqual(pair[0]['state'], 'COMPLETE')
+        self.assertEqual(tr.compare(*pair)[0]['red'], 1)
+        with patch.object(tr, 'ENCODING_BYTES', len(record)):
+            metadata.write_text('case-encodings-v1\n' + record * 2)
+            result = tr.parse(self.root / '0.ref.stdout', 0, metadata)
+        self.assertEqual(result['state'], 'PARSE_LIMIT')
+        self.assertIn('encoding_metadata_limit', result['issues'])
+        self.assertNotIn('.', result['cases'].values())
 
     def test_unrecognized_failure_header_cannot_become_a_pass(self):
         result = self.parse('[1/1] Example#test_ok = 0.01 s\n'
