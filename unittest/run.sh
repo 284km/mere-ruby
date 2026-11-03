@@ -99,6 +99,17 @@ wall="${UNITTEST_WALL:-600}"
 #   (42.upto(Float::INFINITY).size) came first the second time.
 seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
+rake_source="$("$ref" -e 'begin; print Gem.bin_path("rake", "rake"); rescue Gem::Exception; end')"
+select_rake() {
+  if [ -n "$rake_source" ]; then
+    # Gem tests replace GEM_HOME/GEM_PATH and may fall back to a host rake
+    # whose shebang selects a different Ruby/extension ABI.
+    rake="$("$ref" -rshellwords -e 'print Shellwords.join(ARGV)' "$1" "-I${rake_source%/*}/../lib" "$rake_source")" || return 1
+    export rake
+  else
+    unset rake
+  fi
+}
 
 runner='
   my ($wall, @cmd) = @ARGV;
@@ -137,7 +148,7 @@ if [ "${1:-}" = "--one" ]; then
   # restored context reuses the installed config, rebinding only topdir;
   # children inherit these -I entries through assert_separately.
   set --
-  ref_lib="$src/tool/lib:$src/test"
+  ref_lib="$src/tool/lib:$src/test:$stdlib"
   if [ -n "${UNITTEST_REF_EXT_PATH:-}" ]; then
     ref_lib="$UNITTEST_REF_EXT_PATH:$ref_lib"
   fi
@@ -155,7 +166,7 @@ if [ "${1:-}" = "--one" ]; then
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.
   # Parse stdout, then append stderr to the saved diagnostic log.
-  (cd "$dir" && RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$ref" && RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   ref_code=$?
   printf '%s\n' "$ref_code" > "$work/$n.ref.exit.new"
   mv "$work/$n.ref.exit.new" "$work/$n.ref.exit"
@@ -166,7 +177,7 @@ if [ "${1:-}" = "--one" ]; then
   out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
   printf 'mere\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
-  (cd "$dir" && RUBY="$mr" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$mr" && RUBY="$mr" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
   mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"

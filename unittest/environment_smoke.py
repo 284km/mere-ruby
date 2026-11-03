@@ -2,6 +2,7 @@
 """Prove the reference executes Unicode assertions and builds Rust gems."""
 import argparse
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -31,6 +32,9 @@ def main():
     if unicode_version != test_data.VERSION or emoji_version != test_data.EMOJI_VERSION:
         raise ValueError('reference Unicode version differs from the pinned data')
     report = dict(test_data=data, rust_toolchain=rust, results=[])
+    rake = subprocess.check_output([str(binary), '-e', 'print Gem.bin_path("rake", "rake")'], text=True, timeout=10)
+    bundled = subprocess.check_output([str(binary), '-e',
+        'print Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort.join(":")'], text=True, timeout=10)
     failed = False
     with tempfile.TemporaryDirectory(prefix='mre-', dir='/tmp') as folder:
         private = Path(folder)
@@ -47,6 +51,9 @@ def main():
             ('ruby/test_file_exhaustive.rb', 2, '/test_(stat_)?socket_p$/'),
             ('ruby/test_enum.rb', 1, '/test_sum$/'),
             ('rubygems/test_gem.rb', 1, '/test_self_prefix$/'),
+            ('-ext-/marshal/test_usrmarshal.rb', 3, None),
+            ('rubygems/test_gem_ext_builder.rb', 23, None),
+            ('rubygems/test_require.rb', 41, None),
         ]
         for index, (file, count, selection) in enumerate(checks):
             work = private / str(index)
@@ -59,6 +66,8 @@ def main():
                 libraries.insert(0, source / 'lib')
             env.update(RUBY=str(binary), RUBYLIB=os.pathsep.join(map(str, libraries)), UNITTEST_TEST_FILE=file,
                        UNITTEST_CASE_ENCODINGS=str(metadata), UNITTEST_STDOUT=str(stdout))
+            env['RUBYLIB'] += os.pathsep + bundled
+            env['rake'] = shlex.join([str(binary), '-I' + str(Path(rake).parent.parent / 'lib'), rake])
             command = [str(binary), *[arg for path in libraries for arg in ('-I', str(path))], '-r', 'test/unit',
                        '-r', str(ci.ROOT / 'unittest/bootstrap.rb'),
                        '-r', str(ci.ROOT / 'unittest/case_encodings.rb'),

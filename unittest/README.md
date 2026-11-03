@@ -170,12 +170,19 @@ without inheriting rustup configuration or Cargo credentials. Both interpreters
 receive the same toolchain. Actual cargo/rustc versions and data hashes are
 recorded, and collection rejects mixed inputs.
 
+The packaged Rake entry point is invoked explicitly with each side's selected
+Ruby and Rake library directory. RubyGems tests reset GEM_HOME/GEM_PATH; falling
+back to a host `rake` shebang could otherwise start an unrelated Ruby with
+incompatible native extensions. The reference's packaged gem library paths
+remain available to its children through RUBYLIB.
+
 `environment_smoke.py` uses the normal process-family supervisor, a 300-second
 wall limit and 2 GiB family RSS limit. It requires casefold, comprehensive
 case mapping, grapheme, emoji and normalization tests to execute assertions
 without failures/skips. Data-dependent suites must define multiple cases.
 Additional checks cover native iter semantics, absolute backtrace paths,
-short UNIX socket paths, standalone delegate and source RubyGems. Four Cargo smoke cases cover an
+short UNIX socket paths, standalone delegate, native marshal helpers, source
+RubyGems require behavior and all extension-builder cases. Four Cargo smoke cases cover an
 extension build, an expected build failure, and two gem install/load paths.
 Sanitized logs and summaries are retained as `reference-environment-smoke`.
 The full measurement still runs all nine Cargo tests. In the pinned upstream

@@ -34,6 +34,7 @@ class HarnessCheck(unittest.TestCase):
             'REF_RUBY_VERSION=fixture\nREF_RUBY_BIN=' + shlex.quote(str(self.root / "reference")) + '\n')
         interpreter = '''#!/bin/sh
 case "$*" in *rubylibdir*) printf '\\n'; exit 0 ;; esac
+case "$*" in *Gem.bin_path*) printf '\\n'; exit 0 ;; esac
 preload=0
 script=
 while [ "$#" -gt 0 ]; do

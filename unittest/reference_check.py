@@ -142,6 +142,24 @@ end
         self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
         self.assertEqual(row['match'], 1, row)
 
+    def test_rake_uses_each_selected_interpreter_with_its_library(self):
+        (self.root / 'src/test/ruby/test_rake_command.rb').write_text('''require 'shellwords'
+class TestRakeCommand < Test::Unit::TestCase
+  def test_rake_command
+    command = Shellwords.split(ENV.fetch('rake'))
+    assert_equal(ENV.fetch('RUBY'), command.first)
+    assert_equal(Gem.bin_path('rake', 'rake'), command.last)
+    assert_equal('-I' + File.dirname(command.last) + '/../lib', command[1])
+    out, status = Open3.capture2e(*command, '--version')
+    assert(status.success?, out)
+    assert_match(/rake, version /, out)
+  end
+end
+''')
+        row = self.measure('ruby/test_rake_command.rb')
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
+        self.assertEqual((row['match'], row['red'], row['both']), (1, 0, 0), row)
+
 
 if __name__ == '__main__':
     unittest.main()
