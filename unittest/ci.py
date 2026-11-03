@@ -18,6 +18,7 @@ from pathlib import Path
 
 from process_family import MARKER, ProcessFamily
 import transcript
+import test_data
 
 ROOT = Path(__file__).resolve().parent.parent
 COUNTS = ("tests", "match", "red", "both", "extra")
@@ -79,7 +80,7 @@ def reference_info(args):
     save(args.output, dict(
         ruby_ref=subprocess.check_output(["git", "-C", str(args.ruby_src), "rev-parse", "HEAD"], text=True).strip(),
         version=subprocess.check_output([str(args.binary.resolve()), "-e", "print RUBY_VERSION"], text=True),
-        binary_sha256=digest(args.binary)))
+        binary_sha256=digest(args.binary), test_data=test_data.verify(args.ruby_src)))
 
 
 def supervise(command, env, log, rss_kb, seconds):
@@ -224,9 +225,26 @@ def test_environment(private, binary, ruby_version):
                LANG="C", LC_ALL="C", REF_RUBY_BIN=os.environ["REF_RUBY_BIN"],
                REF_RUBY_VERSION=ruby_version, MR_BIN=str(binary),
                UNITTEST_SEED="1")
+    # RubyGems defaults to <source>/tmp, inside Ruby's Cargo workspace.
+    # Rust caches/config also need a fresh location when HOME is isolated.
+    env.update(GEM_TEST_TMPDIR=str(temp / 'gems'), CARGO_HOME=str(private / 'cargo'))
+    if os.environ.get('UNITTEST_RUST_BIN'):
+        rust_bin = Path(os.environ['UNITTEST_RUST_BIN']).resolve()
+        env['PATH'] = str(rust_bin) + os.pathsep + env['PATH']
+        env['RUSTC'] = str(rust_bin / 'rustc')
     if os.environ.get("UNITTEST_REF_EXT_PATH"):
         env["UNITTEST_REF_EXT_PATH"] = os.environ["UNITTEST_REF_EXT_PATH"]
     return env
+
+
+def rust_info():
+    if not os.environ.get('UNITTEST_RUST_BIN'):
+        return None
+    directory = Path(os.environ['UNITTEST_RUST_BIN']).resolve()
+    return {name: subprocess.check_output([str(directory / name), '--version'],
+                                         env={'PATH': str(directory), 'HOME': '/nonexistent'},
+                                         text=True, timeout=10).strip()
+            for name in ('rustc', 'cargo')}
 
 
 def run_shard(args):
@@ -244,6 +262,9 @@ def run_shard(args):
         raise ValueError("shard index out of range")
     if args.wall <= 0 or args.rss_kb <= 0:
         raise ValueError("measurement bounds must be positive")
+    data = test_data.verify(args.ruby_src) if reference.get('test_data') else None
+    if data != reference.get('test_data'):
+        raise ValueError('reference test data differs from build provenance')
     files = manifest["files"][args.shard::manifest["shards"]]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -251,7 +272,8 @@ def run_shard(args):
                   mere_ref=manifest["mere_ref"], ruby_ref=manifest["ruby_ref"],
                   binary_sha256=build["binary_sha256"],
                   reference_sha256=digest(os.environ["REF_RUBY_BIN"]),
-                  environment_policy="allowlist-v1",
+                  environment_policy="allowlist-gem-temp-rust-v2",
+                  test_data=data, rust_toolchain=rust_info(),
                   case_policy=transcript.POLICY,
                   bounds=dict(wall_per_side=args.wall, rss_family_kb=args.rss_kb,
                               process_scope="descendants-and-marker-v1",
@@ -372,6 +394,7 @@ def merge(args):
     bounds = set()
     environment_policies = set()
     case_policies = set()
+    test_inputs = set()
     errors = []
     for path in sorted(args.input.rglob("result.json")):
         try:
@@ -400,6 +423,8 @@ def merge(args):
             bounds.add(json.dumps(result["bounds"], sort_keys=True))
             environment_policies.add(result.get("environment_policy", "legacy-inherited"))
             case_policies.add(result.get('case_policy', 'legacy-awk'))
+            test_inputs.add(json.dumps(dict(test_data=result.get('test_data'),
+                                            rust_toolchain=result.get('rust_toolchain')), sort_keys=True))
             if result.get("infrastructure_error"):
                 errors.append(f"Shard {shard} reported an infrastructure error")
             for row in result["rows"]:
@@ -415,6 +440,28 @@ def merge(args):
         errors.append("Different environment policies were measured")
     if len(case_policies) > 1:
         errors.append('Different case parsing policies were measured')
+    if len(test_inputs) > 1:
+        errors.append('Different test data or Rust toolchains were measured')
+    conditions = {}
+    condition_path = ROOT / 'unittest/reference_conditions.tsv'
+    if condition_path.exists():
+        with condition_path.open() as stream:
+            for item in csv.DictReader(stream, delimiter='\t'):
+                if item['file'] in conditions or not item['condition'] or not item['needed']:
+                    raise ValueError('invalid reference condition inventory')
+                conditions[item['file']] = item
+    zero_conditions = Counter()
+    unclassified = []
+    for file, row in rows.items():
+        row.update(ref_zero_condition='-', ref_zero_needed='-')
+        if row['ref_state'] == 'ZERO':
+            condition = conditions.get(file)
+            category = condition['condition'] if condition else 'UNCLASSIFIED'
+            row.update(ref_zero_condition=category,
+                       ref_zero_needed=condition['needed'] if condition else 'Investigate zero-test reference result')
+            zero_conditions[category] += 1
+            if condition is None:
+                unclassified.append(file)
     totals = {key: sum(row.get(key) or 0 for row in rows.values()) for key in COUNTS}
     incomplete = sum(row["ref_state"] != "COMPLETE" or row["mere_state"] != "COMPLETE" for row in rows.values())
     missing = sum(row["ref_state"] in ("MISSING_SHARD", "NOT_RUN", "INFRA_ERROR")
@@ -427,15 +474,17 @@ def merge(args):
                    received_shards=len(shards), expected_shards=manifest["shards"],
                    incomplete_files=incomplete, missing_files=missing, totals=totals,
                    ref_states=dict(Counter(row["ref_state"] for row in rows.values())),
+                   ref_zero_conditions=dict(zero_conditions), ref_zero_unclassified=unclassified,
                    mere_states=dict(Counter(row["mere_state"] for row in rows.values())),
                    binary_sha256=sorted(binary_hashes), reference_sha256=sorted(reference_hashes),
                    resource_bounds=[json.loads(value) for value in sorted(bounds)],
                    environment_policies=sorted(environment_policies),
                    case_policies=sorted(case_policies),
+                   test_inputs=[json.loads(value) for value in sorted(test_inputs)],
                    infrastructure_errors=errors, measurement_collected=not failed)
     save(args.output / "summary.json", summary)
     args.output.mkdir(parents=True, exist_ok=True)
-    fields = ["file", *COUNTS, *COVERAGE]
+    fields = ["file", *COUNTS, *COVERAGE, 'ref_zero_condition', 'ref_zero_needed']
     with (args.output / "files.tsv").open("w", newline="") as file:
         writer = csv.DictWriter(file, fields, delimiter="\t", lineterminator="\n", extrasaction="ignore")
         writer.writeheader(); writer.writerows(rows.values())
@@ -448,6 +497,10 @@ def merge(args):
              "Collected results do not mean Ruby conformance: RED, BOTH, EXTRA and file coverage need review.", "",
              f"mere-ruby source: `{manifest['source_ref']}`", f"Mere compiler: `{manifest['mere_ref']}`",
              f"Ruby tests: `{manifest['ruby_ref']}`", "", *errors, ""]
+    if zero_conditions:
+        lines.extend(['Reference ZERO files remain unmeasured; conditions do not mark them as passing.', '',
+                      '| Reference ZERO condition | Files |', '|---|---:|',
+                      *[f'| {key} | {value} |' for key, value in sorted(zero_conditions.items())], ''])
     (args.output / "SUMMARY.md").write_text("\n".join(lines))
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as file:
