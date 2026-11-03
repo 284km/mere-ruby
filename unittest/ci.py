@@ -17,6 +17,7 @@ from collections import Counter
 from pathlib import Path
 
 from process_family import MARKER, ProcessFamily
+import transcript
 
 ROOT = Path(__file__).resolve().parent.parent
 COUNTS = ("tests", "match", "red", "both", "extra")
@@ -180,6 +181,38 @@ def sanitize(source, target):
     target.write_bytes(result)
 
 
+def sanitize_parts(sources, target):
+    # Interrupted workers keep stdout/stderr separate. Bound concatenation
+    # before feeding the already bounded mask, including the overflow byte.
+    with tempfile.NamedTemporaryFile() as combined:
+        remaining = LOG_INPUT_CAP + 1
+        for source in sources:
+            if not source.exists():
+                continue
+            with source.open('rb') as stream:
+                while remaining:
+                    block = stream.read(min(65536, remaining))
+                    if not block:
+                        break
+                    combined.write(block)
+                    remaining -= len(block)
+        combined.flush()
+        sanitize(Path(combined.name), target)
+
+
+def recover_cases(work, index, file, phase, limit, records):
+    reference, mere = transcript.recover(work, index, phase, limit)
+    values = dict(zip(COVERAGE, transcript.coverage(reference) + transcript.coverage(mere)))
+    for side, parsed in (('ref', reference), ('mere', mere)):
+        values[side + '_summary'] = parsed['summary']
+        values[side + '_parse_issues'] = parsed['issues']
+    counts, tags = transcript.compare(reference, mere)
+    values.update(counts)
+    key = file[:-3].replace('/', '_')
+    transcript.atomic(records / 'tags' / (key + '.txt'), tags)
+    return values
+
+
 def test_environment(private, binary, ruby_version):
     # Whole failure reports can pretty-print ENV as multiline hashes or pairs.
     # Formatting masks cannot reliably remove arbitrary inherited credentials.
@@ -219,10 +252,19 @@ def run_shard(args):
                   binary_sha256=build["binary_sha256"],
                   reference_sha256=digest(os.environ["REF_RUBY_BIN"]),
                   environment_policy="allowlist-v1",
+                  case_policy=transcript.POLICY,
                   bounds=dict(wall_per_side=args.wall, rss_family_kb=args.rss_kb,
                               process_scope="descendants-and-marker-v1",
                               diagnostic_input_bytes=LOG_INPUT_CAP, diagnostic_output_bytes=LOG_OUTPUT_CAP,
-                              diagnostic_mask_seconds=LOG_MASK_SECONDS),
+                              diagnostic_mask_seconds=LOG_MASK_SECONDS,
+                              transcript_input_bytes=transcript.INPUT_BYTES,
+                              transcript_line_bytes=transcript.LINE_BYTES,
+                              transcript_name_bytes=transcript.NAME_BYTES,
+                              transcript_case_bytes=transcript.CASE_BYTES,
+                              transcript_cases=transcript.CASE_LIMIT,
+                              transcript_snapshot_bytes=transcript.SNAPSHOT_BYTES,
+                              transcript_encoding_bytes=transcript.ENCODING_BYTES,
+                              transcript_seconds=transcript.PARSE_SECONDS),
                   rows=[dict(file=file, ref_state="NOT_RUN", mere_state="NOT_RUN") for file in files])
     save(output / "result.json", result)
     infra_error = False
@@ -263,24 +305,44 @@ def run_shard(args):
                     phase = (work / f"{index}.phase").read_text().strip()
                     if phase not in ("ref", "mere"):
                         raise ValueError("invalid worker phase")
-                    row[phase + "_state"] = run["limit"]
-                    if phase == "mere" and (work / f"{index}.ref-coverage").exists():
-                        row.update(zip(COVERAGE[:4], (work / f"{index}.ref-coverage").read_text().strip().split("\t")))
+                    row.update(recover_cases(work, index, file, phase, run['limit'], private / 'records'))
                 else:
                     raise ValueError("worker did not publish a result")
+                for side in ('ref', 'mere'):
+                    snapshot = work / f'{index}.{side}.json'
+                    if snapshot.exists():
+                        parsed = transcript.load(snapshot)
+                        row[side + '_summary'] = parsed['summary']
+                        row[side + '_parse_issues'] = parsed['issues']
             except Exception as error:
                 row.update(ref_state="INFRA_ERROR", mere_state="INFRA_ERROR", error=type(error).__name__)
                 infra_error = True
+                if (work / f'{index}.ref.json').exists():
+                    # Preserve a known reference result even when inspection
+                    # or collection failed. The infrastructure flag still
+                    # fails CI and the shard aborts on supervision errors.
+                    try:
+                        phase = (work / f'{index}.phase').read_text().strip()
+                        if phase not in ('ref', 'mere'):
+                            raise ValueError('invalid worker phase')
+                        row.update(recover_cases(work, index, file, phase, 'INFRA_ERROR', private / 'records'))
+                    except Exception as recovery_error:
+                        row['recovery_error'] = type(recovery_error).__name__
             finally:
                 key = file[:-3].replace("/", "_")
                 try:
-                    for name in (key + ".out", key + ".reference.out"):
-                        if (raw / name).exists():
-                            sanitize(raw / name, output / "logs" / name)
-                    for suffix in ("stdout", "stderr"):
-                        partial = work / f"{index}.{suffix}"
-                        if partial.exists():
-                            sanitize(partial, output / "logs" / (key + ".partial." + suffix))
+                    for side, name in (('ref', key + '.reference.out'), ('mere', key + '.out')):
+                        stdout = work / f'{index}.{side}.stdout'
+                        stderr = work / f'{index}.{side}.stderr'
+                        if stdout.exists() or stderr.exists():
+                            sanitize_parts([stdout, stderr], output / 'logs' / name)
+                            if not supervised or run.get('limit'):
+                                for suffix in ('stdout', 'stderr'):
+                                    partial = work / f'{index}.{side}.{suffix}'
+                                    if partial.exists():
+                                        sanitize(partial, output / 'logs' / (key + '.partial.' + side + '.' + suffix))
+                        elif (raw / name).exists():
+                            sanitize(raw / name, output / 'logs' / name)
                     tag = private / "records/tags" / (key + ".txt")
                     if tag.exists():
                         sanitize(tag, output / "tags" / tag.name)
@@ -309,6 +371,7 @@ def merge(args):
     reference_hashes = set()
     bounds = set()
     environment_policies = set()
+    case_policies = set()
     errors = []
     for path in sorted(args.input.rglob("result.json")):
         try:
@@ -336,6 +399,7 @@ def merge(args):
             reference_hashes.add(result["reference_sha256"])
             bounds.add(json.dumps(result["bounds"], sort_keys=True))
             environment_policies.add(result.get("environment_policy", "legacy-inherited"))
+            case_policies.add(result.get('case_policy', 'legacy-awk'))
             if result.get("infrastructure_error"):
                 errors.append(f"Shard {shard} reported an infrastructure error")
             for row in result["rows"]:
@@ -349,6 +413,8 @@ def merge(args):
         errors.append("Different resource bounds were measured")
     if len(environment_policies) > 1:
         errors.append("Different environment policies were measured")
+    if len(case_policies) > 1:
+        errors.append('Different case parsing policies were measured')
     totals = {key: sum(row.get(key) or 0 for row in rows.values()) for key in COUNTS}
     incomplete = sum(row["ref_state"] != "COMPLETE" or row["mere_state"] != "COMPLETE" for row in rows.values())
     missing = sum(row["ref_state"] in ("MISSING_SHARD", "NOT_RUN", "INFRA_ERROR")
@@ -365,6 +431,7 @@ def merge(args):
                    binary_sha256=sorted(binary_hashes), reference_sha256=sorted(reference_hashes),
                    resource_bounds=[json.loads(value) for value in sorted(bounds)],
                    environment_policies=sorted(environment_policies),
+                   case_policies=sorted(case_policies),
                    infrastructure_errors=errors, measurement_collected=not failed)
     save(args.output / "summary.json", summary)
     args.output.mkdir(parents=True, exist_ok=True)
