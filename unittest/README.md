@@ -3,6 +3,8 @@
 `run.sh` compares individual tests under CRuby and mere-ruby. File execution
 coverage is recorded separately from MATCH / RED / BOTH / EXTRA, so a load
 failure on both sides cannot disappear as a successful zero-test run.
+The runner uses Python 3.9 or later (standard library only) to parse and
+atomically save each interpreter's case results.
 
 ## Selecting files
 
@@ -61,6 +63,8 @@ the summary's test count and the number of distinct test names discovered.
 | INCOMPLETE | No final test summary, including startup errors and timeouts |
 | COUNT_MISMATCH | Summary count and discovered names disagree |
 | EXIT_ERROR | Summary exists but its failures + errors do not explain the exit code |
+| REPORT_MISMATCH | Failure/error/skip report counts do not agree with the summary |
+| PARSE_LIMIT | Transcript or case-name/count budgets prevented complete parsing; issues are recorded |
 | MISSING | The worker did not produce both its result and coverage row |
 
 A file is complete even if some tests failed or were skipped; consult the
@@ -79,6 +83,7 @@ a separate measurement from listing it.
 
 ```sh
 python3 unittest/harness_check.py -v
+python3 unittest/transcript_check.py -v
 ```
 
 The check uses fixed fake-interpreter transcripts, temporary source trees and
@@ -86,6 +91,15 @@ a stub RSS guard. It covers selection, test framework preloading, load errors,
 zero tests, interrupted output, count mismatches, exit codes, warning output,
 both raw logs, record destinations and the existing verdict categories. It
 does not build Mere or run CRuby's suites.
+
+`transcript.py` recognizes the Symbol.inspect token at the start of each
+verbose progress line, normalizes its quoted/escaped spelling, and resolves
+failure reports against that same identity. Output printed by a test directly
+after the token does not become part of its name. Control bytes and literal
+backslashes have distinct single-line encodings. No transcript text is evaluated
+as Ruby or Python code. Failure/error/skip report counts are also checked;
+unrecognized reports, missing summaries and missing final exit statuses cannot
+turn a case into MATCH.
 
 ## Full measurement in GitHub Actions
 
@@ -138,6 +152,27 @@ Each completed file atomically updates `result.json`, so a job that stops early
 leaves its remaining files marked `NOT_RUN`. Missing shard artifacts are expanded
 back to the manifest's full file list as `MISSING_SHARD` by the collection job.
 
+Each interpreter has separate stdout/stderr, a saved exit status and an atomic
+private case snapshot. The reference snapshot is committed before mere-ruby
+starts. If the worker reaches a memory/wall limit, the collector reuses that
+snapshot and parses bounded partial output from the interrupted side. Finished
+reference cases remain in the totals and RED tags instead of becoming null
+counts. Reference skips/failures remain non-passing; an interrupted mere-ruby
+summary without a saved exit status does not establish a pass. Monitor failures
+can retain already known cases while still failing infrastructure collection
+and aborting the shard. A hard stop of the collector/VM can still leave the
+current file NOT_RUN; this is not a recovery mechanism for a lost VM.
+
+The parser reads at most 64 MiB per side in 64 KiB line chunks. A single name
+is capped at 16 KiB, and a side retains at most 100,000 names totaling 4 MiB.
+Parsing also has a 10-second processing deadline, checked between bounded
+line chunks. Private snapshots are limited to 16 MiB when read back. This bounds recovery
+after the worker's monitor has stopped, including unterminated diagnostic lines.
+Budget exhaustion is PARSE_LIMIT, with the reason retained in result.json.
+The parser policy and budgets are recorded in the shard/report, and results
+from different case policies cannot be merged. Per-side summaries retain
+assertions, failures, errors and skips in shard JSON as well as case counts.
+
 Artifacts are retained for seven days:
 
 | Artifact | Contents |
@@ -186,6 +221,7 @@ commit a partial sweep over the checked-in historical records.
 
 ```sh
 python3 unittest/ci_check.py -v
+python3 unittest/transcript_check.py -v
 python3 unittest/process_family_check.py -v
 ```
 
@@ -198,6 +234,10 @@ Ruby 4.0.9 Test::Unit fixture for multiline environment diagnostics.
 The collection checks compare parent and mask-process peak RSS for 8 MiB and
 64 MiB logs without newlines, exercise output expansion and UTF-8 truncation,
 and check both silent and continuously noisy mask timeouts.
+The transcript checks also compare peak RSS while recovering from 8/128 MiB
+unterminated input. Collection tests stop real workers after the reference has
+finished, including a mere-ruby fixture that prints an early summary and then
+stalls, to verify retained RED counts and the absence of false matches.
 
 ## Classified baseline gaps
 
@@ -218,9 +258,9 @@ the original build Makefile and verifies the packaged context independently.
 The remaining 28 rows include 26 zero-case configurations and two counting
 inconsistencies. They require Windows/TTY, trace privileges and providers,
 optional DBM/Engine/Shape/test-extension APIs, parser or development-build
-conditions, and explicit treatment of an empty chkbuild helper. Counting work
-remains for quoted Symbol names, Unicode test data, and Cargo diagnostics that
-join verbose progress lines. Cargo also needs isolated fixture directories
+conditions, and explicit treatment of an empty chkbuild helper. The inspected
+name and inline-diagnostic counting problems are addressed by transcript.py;
+Unicode test data remains an environment task. Cargo also needs isolated fixture directories
 and a usable Rust environment. No candidate is removed or reported as passing
 because it defined no cases.
 
@@ -233,3 +273,11 @@ problem. Six files had started tests before terminating; their symptoms are
 recorded separately from load failures. These rows are a dated baseline,
 not new execution results. Their API gaps remain implementation work; the
 runner changes do not substitute fake crypto/parser/test-extension results.
+
+The original casefold and Cargo logs now identify 58 and nine cases respectively,
+retaining their actual skips/failures/errors. Replaying the previous String and
+Ractor memory-limit artifacts retains all 460 reference cases (458 RED and two
+BOTH), rather than losing their totals. These are parser/recovery checks on
+saved evidence, not new interpreter-conformance results. A fresh reference Rand
+run also verifies all 41 cases before diagnostic address masking, which can
+collapse hexadecimal seeds in archived human-readable labels.

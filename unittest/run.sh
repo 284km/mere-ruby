@@ -112,36 +112,6 @@ runner='
   waitpid($pid, 0);
   exit(($? & 127) ? 128 + ($? & 127) : ($? >> 8));
 '
-# one line per test: "Class#test_name<TAB>verdict"
-verdicts() {
-  awk '
-    /^\[ *[0-9]+\/[0-9]+\] / { n = $0; sub(/^\[ *[0-9]+\/[0-9]+\] /, "", n); sub(/ = .*$/, "", n); ran[n] = 1; next }
-    /^ *[0-9]+\) Failure:/ { want = "F"; next }
-    /^ *[0-9]+\) Error:/   { want = "E"; next }
-    /^ *[0-9]+\) Timeout:/ { want = "T"; next }
-    /^ *[0-9]+\) Skipped:/ { want = "S"; next }
-    want != "" { n = $1; sub(/:$/, "", n); bad[n] = want; ran[n] = 1; want = ""; next }
-    /^[0-9]+ tests, [0-9]+ assertions, / { done = 1; next }
-    END { for (n in ran) print n "\t" ((n in bad) ? bad[n] : (done ? "." : "X")) }' | sort -u
-}
-
-# Summary count and discovered names are both needed: a missing test extension
-# can skip every class definition and still print a successful 0-test summary.
-coverage() {
-  awk -v code="$2" -v discovered="$3" '
-    /^[0-9]+ tests, [0-9]+ assertions, / {
-      summary=$1; expected_exit=($5+$7)%256; done=1
-    }
-    END {
-      if (!done) state="INCOMPLETE"
-      else if (summary == 0) state="ZERO"
-      else if (summary != discovered) state="COUNT_MISMATCH"
-      else if (code != expected_exit) state="EXIT_ERROR"
-      else state="COMPLETE"
-      printf "%s\t%s\t%s\t%s", state, code, (done ? summary : "-"), discovered
-    }' "$1"
-}
-
 # ONE FILE, both sides -- the unit the loop below hands out, as
 # `run.sh <src> --one <work> <n> <rel>`. It writes the file's tag and a row,
 # <work>/<n>.row ("tests match red both extra"); the table is assembled from
@@ -163,8 +133,9 @@ if [ "${1:-}" = "--one" ]; then
   #   inherited stderr -- and `| verdicts` waited on it for 2 h 40 m, the
   #   whole sweep stopped behind one file, whose verdicts then came out empty
   #   (MATCH 57 -> 0). An orphan holding a file holds nothing up.
-  out1="$work/$n.stdout"; err1="$work/$n.stderr"
-  printf 'ref\n' > "$work/$n.phase"
+  out1="$work/$n.ref.stdout"; err1="$work/$n.ref.stderr"
+  printf 'ref\n' > "$work/$n.phase.new"
+  mv "$work/$n.phase.new" "$work/$n.phase"
   # mkmf's own tests require Ruby's build Makefile and source headers. The
   # restored context reuses the installed config, rebinding only topdir;
   # children inherit these -I entries through assert_separately.
@@ -180,42 +151,27 @@ if [ "${1:-}" = "--one" ]; then
   # Parse stdout, then append stderr to the saved diagnostic log.
   (cd "$dir" && perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -I "${UNITTEST_REF_EXT_PATH:-$shim}" -I "$shim" -r test/unit "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   ref_code=$?
-  ro="$(verdicts < "$out1")"
-  ref_found="$(printf '%s\n' "$ro" | awk 'NF {n++} END {print n+0}')"
-  ref_coverage="$(coverage "$out1" "$ref_code" "$ref_found")"
-  printf '%s\n' "$ref_coverage" > "$work/$n.ref-coverage"
-  cat "$err1" >> "$out1"
-  [ -z "${UNITTEST_KEEP:-}" ] || cp "$out1" "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').reference.out"
-  printf 'mere\n' > "$work/$n.phase"
+  printf '%s\n' "$ref_code" > "$work/$n.ref.exit.new"
+  mv "$work/$n.ref.exit.new" "$work/$n.ref.exit"
+  python3 "$here/transcript.py" parse "$out1" "$ref_code" "$work/$n.ref.json" || exit 1
+  [ -z "${UNITTEST_KEEP:-}" ] || cat "$out1" "$err1" > "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').reference.out"
+  # Separate files prevent a kill between the phase switch and redirection
+  # from reinterpreting reference stdout as mere-ruby stdout.
+  out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
+  printf 'mere\n' > "$work/$n.phase.new"
+  mv "$work/$n.phase.new" "$work/$n.phase"
   (cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
-  mo="$(verdicts < "$out1")"
-  mr_found="$(printf '%s\n' "$mo" | awk 'NF {n++} END {print n+0}')"
-  mr_coverage="$(coverage "$out1" "$mr_code" "$mr_found")"
-  cat "$err1" >> "$out1"
+  printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
+  mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"
+  python3 "$here/transcript.py" parse "$out1" "$mr_code" "$work/$n.mere.json" || exit 1
   # Preserve the old mere-ruby log name and add the reference side beside it.
-  [ -n "${UNITTEST_KEEP:-}" ] && cp "$out1" "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').out"
-  printf '%s\t%s\t%s\n' "$rel" "$ref_coverage" "$mr_coverage" > "$work/$n.coverage"
-  rm -f "$out1" "$err1"
-  rf="$(mktemp)"; mf="$(mktemp)"
-  printf '%s\n' "$ro" | grep -v '^$' > "$rf"; printf '%s\n' "$mo" | grep -v '^$' > "$mf"
+  [ -n "${UNITTEST_KEEP:-}" ] && cat "$out1" "$err1" > "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').out"
   tag="$records/tags/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').txt"
-  counts="$(join -t "	" -a 1 -a 2 -e - -o 0,1.2,2.2 "$rf" "$mf" | awk -F'\t' -v tag="$tag" '
-    BEGIN { m = r = b = x = n = 0; printf "" > tag }
-    {
-      n++
-      rp = ($2 == "."); mp = ($3 == ".")
-      if (rp && mp) m++
-      else if (rp) { r++; print $1 "\t" ($3 == "-" ? "ABSENT" : $3) >> tag }
-      else if (mp) x++
-      else b++
-    }
-    END { print n, m, r, b, x }')"
-  rm -f "$rf" "$mf"
-  set -- $counts
+  python3 "$here/transcript.py" compare "$work/$n.ref.json" "$work/$n.mere.json" \
+    --file="$rel" "$work/$n" "$tag" || exit 1
   [ -s "$tag" ] || rm -f "$tag"
   [ -f "$tag" ] && { strip_noise < "$tag" > "$tag.m" && mv "$tag.m" "$tag"; }
-  printf '%s %s %s %s %s\n' "$1" "$2" "$3" "$4" "$5" > "$work/$n.row"
   exit 0
 fi
 

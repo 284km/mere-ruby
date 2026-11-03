@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import ci
 import harness_check
+import transcript
 
 REAL_RUBY = os.environ.get("UNITTEST_REAL_RUBY")
 REAL_TOOL_LIB = os.environ.get("UNITTEST_REAL_TOOL_LIB")
@@ -148,15 +149,68 @@ class CICheck(unittest.TestCase):
         def limited(command, env, log, rss, seconds):
             work, index = Path(command[-3]), command[-2]
             (work / f"{index}.phase").write_text("mere\n")
-            (work / f"{index}.ref-coverage").write_text("COMPLETE\t0\t1\t1\n")
-            (work / f"{index}.stderr").write_text("partial diagnostic\n")
+            source = work / f'{index}.ref.stdout'
+            source.write_text(self.fixture.passing())
+            transcript.save(work / f'{index}.ref.json', transcript.parse(source, 0))
+            (work / f"{index}.mere.stderr").write_text("partial diagnostic\n")
             log.write_text("")
             return dict(exit=-9, peak_rss_kb=rss + 1, seconds=0.1, limit="MEMORY_LIMIT")
         with patch.object(ci, "supervise", side_effect=limited):
             self.assertEqual(self.run_shard(0), 0)
         result = ci.load(self.output / "0/result.json")
         self.assertTrue(all(row["ref_state"] == "COMPLETE" and row["mere_state"] == "MEMORY_LIMIT" for row in result["rows"]))
-        self.assertTrue(list((self.output / "0/logs").glob("*.partial.stderr")))
+        self.assertTrue(all(row['tests'] == row['red'] == 1 and row['match'] == 0 for row in result['rows']))
+        self.assertTrue(list((self.output / "0/logs").glob("*.partial.mere.stderr")))
+        self.assertEqual(self.run_shard(1), 0)
+        self.assertEqual(self.merge(), 0)
+        self.assertEqual(ci.load(self.root / 'report/summary.json')['totals'],
+                         dict(tests=3, match=1, red=2, both=0, extra=0))
+
+    def stall_interpreter(self, side):
+        path = self.root / side
+        marker = self.root / (side + '.started')
+        exit_line = 'exit "$(cat "$fixture_root/$side.code")"'
+        path.write_text(path.read_text().replace(exit_line,
+                        'printf "partial diagnostic\\n" >&2\n: > ' + shlex.quote(str(marker))
+                        + '\nsleep 10\n' + exit_line))
+        metadata = self.build if side == 'mere-ruby' else self.reference
+        value = ci.load(metadata)
+        value['binary_sha256'] = ci.digest(path)
+        ci.save(metadata, value)
+        return marker
+
+    def test_actual_worker_memory_stop_retains_reference_cases_without_false_matches(self):
+        marker = self.stall_interpreter('mere-ruby')
+        with patch.object(FixtureFamily, 'sample', lambda family: 1025 if marker.exists() else 1):
+            self.assertEqual(self.run_shard(1), 0)
+        self.assertTrue(marker.exists())
+        row = ci.load(self.output / '1/result.json')['rows'][0]
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'MEMORY_LIMIT'))
+        self.assertEqual((row['tests'], row['match'], row['red']), (1, 0, 1))
+        self.assertTrue(list((self.output / '1/logs').glob('*.reference.out')))
+        self.assertTrue(list((self.output / '1/tags').glob('*.txt')))
+
+    def test_actual_worker_wall_stop_retains_reference_cases_without_false_matches(self):
+        marker = self.stall_interpreter('mere-ruby')
+        actual = ci.supervise
+        with patch.object(ci, 'supervise', side_effect=lambda command, env, log, rss, seconds:
+                          actual(command, env, log, rss, 2)):
+            self.assertEqual(self.run_shard(1), 0)
+        self.assertTrue(marker.exists())
+        row = ci.load(self.output / '1/result.json')['rows'][0]
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'WALL_LIMIT'))
+        self.assertEqual((row['tests'], row['match'], row['red']), (1, 0, 1))
+
+    def test_reference_wall_stop_does_not_treat_its_early_summary_as_passed(self):
+        marker = self.stall_interpreter('reference')
+        actual = ci.supervise
+        with patch.object(ci, 'supervise', side_effect=lambda command, env, log, rss, seconds:
+                          actual(command, env, log, rss, 2)):
+            self.assertEqual(self.run_shard(1), 0)
+        self.assertTrue(marker.exists())
+        row = ci.load(self.output / '1/result.json')['rows'][0]
+        self.assertEqual((row['ref_state'], row['mere_state']), ('WALL_LIMIT', 'NOT_RUN'))
+        self.assertEqual((row['tests'], row['match'], row['red']), (1, 0, 0))
 
     def test_lost_rss_monitor_is_an_infrastructure_failure(self):
         with patch.object(FixtureFamily, "sample", side_effect=RuntimeError("monitor unavailable")):
@@ -164,6 +218,23 @@ class CICheck(unittest.TestCase):
         rows = ci.load(self.output / "0/result.json")["rows"]
         self.assertEqual(rows[0]["ref_state"], "INFRA_ERROR")
         self.assertTrue(all(row["ref_state"] == "NOT_RUN" for row in rows[1:]))
+
+    def test_monitor_failure_after_reference_preserves_cases_and_still_fails_collection(self):
+        def failed(command, env, log, rss, seconds):
+            work, index = Path(command[-3]), command[-2]
+            source = work / f'{index}.ref.stdout'
+            source.write_text(self.fixture.passing())
+            transcript.save(work / f'{index}.ref.json', transcript.parse(source, 0))
+            (work / f'{index}.phase').write_text('mere\n')
+            log.write_text('')
+            raise RuntimeError('monitor unavailable')
+        with patch.object(ci, 'supervise', side_effect=failed):
+            self.assertEqual(self.run_shard(0), 1)
+        rows = ci.load(self.output / '0/result.json')['rows']
+        self.assertEqual((rows[0]['ref_state'], rows[0]['mere_state']), ('COMPLETE', 'INFRA_ERROR'))
+        self.assertEqual((rows[0]['tests'], rows[0]['red'], rows[0]['match']), (1, 1, 0))
+        self.assertTrue(all(row['ref_state'] == 'NOT_RUN' for row in rows[1:]))
+        self.assertEqual(self.merge(), 1)
 
     def test_duplicate_shards_are_not_summed_twice(self):
         self.run_shard(0)
@@ -187,6 +258,15 @@ class CICheck(unittest.TestCase):
         path = self.output / "1/result.json"
         result = ci.load(path)
         result["environment_policy"] = "legacy-inherited"
+        ci.save(path, result)
+        self.assertEqual(self.merge(), 1)
+
+    def test_different_case_parsing_policies_are_not_merged(self):
+        self.run_shard(0)
+        self.run_shard(1)
+        path = self.output / '1/result.json'
+        result = ci.load(path)
+        result['case_policy'] = 'legacy-awk'
         ci.save(path, result)
         self.assertEqual(self.merge(), 1)
 
@@ -341,6 +421,36 @@ print(json.dumps({"parent_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrs
         self.assertEqual(env["HOME"], str(private / "home"))
         self.assertEqual(list((private / "home").iterdir()), [])
         self.assertEqual(env["UNITTEST_SEED"], "1")
+
+    @unittest.skipUnless(REAL_RUBY and REAL_TOOL_LIB, "set UNITTEST_REAL_RUBY and UNITTEST_REAL_TOOL_LIB for the real Test::Unit fixture")
+    def test_real_test_unit_inspected_names_and_inline_stdout(self):
+        program = self.root / 'names.rb'
+        program.write_text('''require "test/unit"
+class TestInspectedNames < Test::Unit::TestCase
+  ["test_a-b", 'test_name with "quotes"', "test_unicode_\\u{1F600}"].each do |name|
+    define_method(name) do
+      puts ["diagnostic", "after progress"].inspect
+      flunk "expected failure"
+    end
+  end
+end
+''')
+        result = subprocess.run([REAL_RUBY, '-I', REAL_TOOL_LIB, '-r', 'test/unit', str(program), '-v', '--seed=1'],
+                                env=dict(PATH=os.environ['PATH'], HOME=str(self.root), TMPDIR=str(self.root), LC_ALL='C'),
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 3)
+        source = self.root / 'names.stdout'
+        source.write_bytes(result.stdout)
+        parsed = transcript.parse(source, result.returncode)
+        self.assertEqual(parsed['state'], 'COMPLETE')
+        self.assertEqual(parsed['discovered'], 3)
+        self.assertTrue(all(verdict == 'F' for verdict in parsed['cases'].values()))
+        # Check Ruby's real Symbol.inspect spellings, including every binary
+        # byte, without evaluating any transcript as Ruby or Python source.
+        symbols = json.loads(subprocess.check_output([REAL_RUBY, '-rjson', '-e',
+            'puts JSON.generate((0..255).map {|n| s = "test_".b + n.chr.b; [s.to_sym.inspect.sub(/\\A:/, ""), s.unpack1("H*")]})'], text=True))
+        for spelling, raw in symbols:
+            self.assertEqual(transcript.symbol(spelling.encode()), bytes.fromhex(raw))
 
     @unittest.skipUnless(REAL_RUBY and REAL_TOOL_LIB, "set UNITTEST_REAL_RUBY and UNITTEST_REAL_TOOL_LIB for the real Test::Unit fixture")
     def test_real_test_unit_multiline_hash_and_array_diagnostics_do_not_leak_parent_environment(self):
