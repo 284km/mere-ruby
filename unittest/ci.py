@@ -11,8 +11,11 @@ import signal
 import subprocess
 import tempfile
 import time
+import uuid
 from collections import Counter
 from pathlib import Path
+
+from process_family import MARKER, ProcessFamily
 
 ROOT = Path(__file__).resolve().parent.parent
 COUNTS = ("tests", "match", "red", "both", "extra")
@@ -74,31 +77,19 @@ def reference_info(args):
         binary_sha256=digest(args.binary)))
 
 
-def group_rss(group):
-    # Only this worker's new process group can be killed. Do not start the
-    # historical global rss_guard, which could target another build or run.
-    output = subprocess.check_output(["ps", "-axo", "pgid=,rss="], text=True)
-    return sum(int(parts[1]) for line in output.splitlines()
-               if len(parts := line.split()) == 2 and int(parts[0]) == group)
-
-
-def stop_group(process):
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
-
-
 def supervise(command, env, log, rss_kb, seconds):
+    ProcessFamily.preflight()
     start = time.monotonic()
     peak = 0
     limit = None
+    marker = uuid.uuid4().hex
+    child_env = dict(env, **{MARKER: marker})
     with log.open("wb") as output:
-        process = subprocess.Popen(command, env=env, stdout=output, stderr=output, start_new_session=True)
+        process = subprocess.Popen(command, env=child_env, stdout=output, stderr=output, start_new_session=True)
+        family = ProcessFamily(process, marker)
         try:
             while process.poll() is None:
-                peak = max(peak, group_rss(process.pid))
+                peak = max(peak, family.sample())
                 if peak > rss_kb:
                     limit = "MEMORY_LIMIT"
                     break
@@ -107,8 +98,17 @@ def supervise(command, env, log, rss_kb, seconds):
                     break
                 time.sleep(0.1)
         finally:
-            # Also reap subprocesses that outlive an otherwise finished test.
-            stop_group(process)
+            try:
+                family.stop()
+            finally:
+                # Fail closed on monitor/cleanup errors. The shard aborts and
+                # CI tears down its VM; no later file uses an uncertain runner.
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.wait(timeout=5)
     return dict(exit=process.returncode, peak_rss_kb=peak,
                 seconds=round(time.monotonic() - start, 3), limit=limit)
 
@@ -122,6 +122,22 @@ def sanitize(source, target):
     if len(result) > cap:
         result = result[:cap].decode("utf-8", "replace").encode() + b"\n[diagnostic log truncated at 2 MiB]\n"
     target.write_bytes(result)
+
+
+def test_environment(private, binary, ruby_version):
+    # Whole failure reports can pretty-print ENV as multiline hashes or pairs.
+    # Formatting masks cannot reliably remove arbitrary inherited credentials.
+    # Give both interpreters the same small environment and an empty home.
+    home, temp = private / "home", private / "tmp"
+    home.mkdir(parents=True)
+    temp.mkdir()
+    env = dict(PATH=os.environ.get("PATH", os.defpath), HOME=str(home), TMPDIR=str(temp),
+               LANG="C", LC_ALL="C", REF_RUBY_BIN=os.environ["REF_RUBY_BIN"],
+               REF_RUBY_VERSION=ruby_version, MR_BIN=str(binary),
+               UNITTEST_SEED="1")
+    if os.environ.get("UNITTEST_REF_EXT_PATH"):
+        env["UNITTEST_REF_EXT_PATH"] = os.environ["UNITTEST_REF_EXT_PATH"]
+    return env
 
 
 def run_shard(args):
@@ -146,7 +162,9 @@ def run_shard(args):
                   mere_ref=manifest["mere_ref"], ruby_ref=manifest["ruby_ref"],
                   binary_sha256=build["binary_sha256"],
                   reference_sha256=digest(os.environ["REF_RUBY_BIN"]),
-                  bounds=dict(wall_per_side=args.wall, rss_group_kb=args.rss_kb),
+                  environment_policy="allowlist-v1",
+                  bounds=dict(wall_per_side=args.wall, rss_family_kb=args.rss_kb,
+                              process_scope="descendants-and-marker-v1"),
                   rows=[dict(file=file, ref_state="NOT_RUN", mere_state="NOT_RUN") for file in files])
     save(output / "result.json", result)
     infra_error = False
@@ -156,16 +174,18 @@ def run_shard(args):
         work = private / "work"
         raw = private / "raw"
         work.mkdir(); raw.mkdir()
-        env = dict(os.environ, MR_BIN=str(binary), UNITTEST_RECORD_DIR=str(private / "records"),
-                   UNITTEST_KEEP=str(raw), UNITTEST_WALL=str(args.wall),
-                   REF_RUBY_VERSION=manifest["ruby_version"])
         for index, file in enumerate(files):
+            env = test_environment(private / f"environment-{index}", binary, manifest["ruby_version"])
+            env.update(UNITTEST_WALL=str(args.wall), UNITTEST_RECORD_DIR=str(private / "records"),
+                       UNITTEST_KEEP=str(raw))
             row = dict(file=file, **dict.fromkeys(COUNTS), ref_state="NOT_RUN", mere_state="NOT_RUN")
             log = private / "driver.log"
+            supervised = False
             try:
                 run = supervise(["sh", str(ROOT / "unittest/run.sh"), str(args.ruby_src.resolve()),
                                  "--one", str(work), str(index), file], env, log,
                                 args.rss_kb, args.wall * 2 + 60)
+                supervised = True
                 row["execution"] = run
                 coverage = work / f"{index}.coverage"
                 counts = work / f"{index}.row"
@@ -214,6 +234,8 @@ def run_shard(args):
                 result["rows"][index] = row
                 save(output / "result.json", result)
             print(f"{file}: {row['ref_state']} / {row['mere_state']}", flush=True)
+            if not supervised:
+                break
     result["infrastructure_error"] = infra_error
     save(output / "result.json", result)
     return int(infra_error)
@@ -228,6 +250,7 @@ def merge(args):
     binary_hashes = set()
     reference_hashes = set()
     bounds = set()
+    environment_policies = set()
     errors = []
     for path in sorted(args.input.rglob("result.json")):
         try:
@@ -254,6 +277,7 @@ def merge(args):
             binary_hashes.add(result["binary_sha256"])
             reference_hashes.add(result["reference_sha256"])
             bounds.add(json.dumps(result["bounds"], sort_keys=True))
+            environment_policies.add(result.get("environment_policy", "legacy-inherited"))
             if result.get("infrastructure_error"):
                 errors.append(f"Shard {shard} reported an infrastructure error")
             for row in result["rows"]:
@@ -265,6 +289,8 @@ def merge(args):
         errors.append("Different interpreter binaries were measured")
     if len(bounds) > 1:
         errors.append("Different resource bounds were measured")
+    if len(environment_policies) > 1:
+        errors.append("Different environment policies were measured")
     totals = {key: sum(row.get(key) or 0 for row in rows.values()) for key in COUNTS}
     incomplete = sum(row["ref_state"] != "COMPLETE" or row["mere_state"] != "COMPLETE" for row in rows.values())
     missing = sum(row["ref_state"] in ("MISSING_SHARD", "NOT_RUN", "INFRA_ERROR")
@@ -280,6 +306,7 @@ def merge(args):
                    mere_states=dict(Counter(row["mere_state"] for row in rows.values())),
                    binary_sha256=sorted(binary_hashes), reference_sha256=sorted(reference_hashes),
                    resource_bounds=[json.loads(value) for value in sorted(bounds)],
+                   environment_policies=sorted(environment_policies),
                    infrastructure_errors=errors, measurement_collected=not failed)
     save(args.output / "summary.json", summary)
     args.output.mkdir(parents=True, exist_ok=True)

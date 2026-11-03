@@ -2,6 +2,7 @@
 """Exercise discovery and accounting with controlled interpreter transcripts."""
 import csv
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -30,7 +31,7 @@ class HarnessCheck(unittest.TestCase):
         (self.root / "bin/pgrep").write_text("#!/bin/sh\nexit 1\n")
         (self.root / "bin/pgrep").chmod(0o755)
         (self.root / "tools/ref_ruby.sh").write_text(
-            'REF_RUBY_VERSION=fixture\nREF_RUBY_BIN="$FIXTURE_ROOT/reference"\n')
+            'REF_RUBY_VERSION=fixture\nREF_RUBY_BIN=' + shlex.quote(str(self.root / "reference")) + '\n')
         interpreter = '''#!/bin/sh
 case "$*" in *rubylibdir*) printf '\\n'; exit 0 ;; esac
 preload=0
@@ -43,14 +44,15 @@ done
 [ "$preload" -eq 1 ] || { echo 'uninitialized constant Test (NameError)'; exit 1; }
 [ -n "$script" ] && [ -f "$script" ] || { echo 'fixture script not found'; exit 1; }
 side=$(basename "$0")
-if [ -f "$FIXTURE_ROOT/$side.interleave" ]; then
+fixture_root=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$fixture_root/$side.interleave" ]; then
   printf '[1/1] Example#test_ok'
   printf '/fixture/test.rb:1: warning: test warning\\n' >&2
   printf ' = 0.00 s\\n1 tests, 1 assertions, 0 failures, 0 errors, 0 skips\\n'
 else
-  cat "$FIXTURE_ROOT/$side.transcript"
+  cat "$fixture_root/$side.transcript"
 fi
-exit "$(cat "$FIXTURE_ROOT/$side.code")"
+exit "$(cat "$fixture_root/$side.code")"
 '''
         for side in ["reference", "mere-ruby"]:
             (self.root / side).write_text(interpreter)

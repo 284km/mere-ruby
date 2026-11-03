@@ -105,14 +105,21 @@ precedence over those shims; mere-ruby keeps its own Ruby implementations.
 
 `unittest/ci.py` partitions the manifest into 64 shards with no overlapping files.
 At most four macOS measurement jobs run at once. Each file runs sequentially:
-each interpreter has a 600-second wall limit, and the worker's process group
+each interpreter has a 600-second wall limit, and the tracked process family
 has an aggregate RSS cap of 2 GiB, polled every 0.1 seconds. A worker also has
 an outer wall limit of twice the per-side limit plus 60 seconds. Polling can
 overshoot the RSS cap; it is a measurement bound, not a reservation. These bounds
 differ from historical local sweeps and are recorded with each result.
 
-The CI supervisor starts a new process group per file. It watches and cleans up
-that group rather than starting the historical machine-wide RSS guard. Limits,
+The CI supervisor starts a new session per file and tracks PID/start-time
+identities, parent ancestry, process groups and a per-file inherited marker.
+This includes children that create another session or daemonize before the
+next sample. Launch environments provide the marker after ordinary unsetenv;
+ancestry and recorded birth identities also follow children with empty exec
+environments. Cleanup stops parents, rescans for racing forks, then kills the
+verified descendants. It does not select processes by interpreter name.
+Process inspection is checked before launching tests, and a supervision error
+aborts the shard so later files do not use an uncertain runner. Limits,
 zero-test results, startup failures and unattempted files are separate states.
 Each completed file atomically updates `result.json`, so a job that stops early
 leaves its remaining files marked `NOT_RUN`. Missing shard artifacts are expanded
@@ -125,13 +132,23 @@ Artifacts are retained for seven days:
 | `unittest-plan` | Exact candidate list, pinned revisions and shard count |
 | `mere-ruby-macos` | O2 binary, build mode and compiler/source provenance |
 | `ruby-reference-macos` | Installed reference, native test extensions and provenance |
-| `unittest-shard-N` | Per-file results, bounds, peak group RSS and sanitized diagnostic logs |
+| `unittest-shard-N` | Per-file results, bounds, peak family RSS and sanitized diagnostic logs |
 | `unittest-report` | `SUMMARY.md`, `summary.json` and every planned file in `files.tsv` |
 
 Diagnostic logs pass through the repository's existing masking rules before
 upload and are capped at 2 MiB per log with a truncation marker. Private raw
 logs are not part of the artifact. Interrupted workers also retain masked
 partial stdout/stderr when available.
+
+Both interpreters run with a small environment allowlist and a fresh temporary
+HOME and TMPDIR per file. Only PATH, locale, explicit interpreter/extension paths,
+the generated process-family identifier and the harness settings are passed;
+parent credentials and GitHub session variables
+are not inherited. This is important for whole Test::Unit failure reports:
+multiline hashes and arrays can expose environment values that a line-oriented
+mask cannot remove reliably. The environment policy is recorded in each shard
+and mixed policies are rejected during collection. A real Ruby 4.0.9 Test::Unit
+fixture exercises both renderings through the artifact publication path.
 
 The Actions summary reports the named-test totals and incomplete-file count.
 Known RED, BOTH, EXTRA and measured dependency/resource failures do not fail
@@ -147,7 +164,12 @@ commit a partial sweep over the checked-in historical records.
 
 ```sh
 python3 unittest/ci_check.py -v
+python3 unittest/process_family_check.py -v
 ```
 
 This checks partitioning, collection, missing and partial shards, provenance,
 resource cleanup and diagnostic masking with small controlled fixtures.
+The process-family checks use real processes, including new sessions/groups,
+empty exec environments, fast double-forks and multiline argv. They require
+permission to inspect processes with ps. The CI harness job also runs a real
+Ruby 4.0.9 Test::Unit fixture for multiline environment diagnostics.

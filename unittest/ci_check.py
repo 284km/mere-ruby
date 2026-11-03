@@ -3,6 +3,10 @@
 import contextlib
 import io
 import os
+import shlex
+import shutil
+import subprocess
+import signal
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +14,29 @@ from unittest.mock import patch
 
 import ci
 import harness_check
+
+REAL_RUBY = os.environ.get("UNITTEST_REAL_RUBY")
+REAL_TOOL_LIB = os.environ.get("UNITTEST_REAL_TOOL_LIB")
+
+
+class FixtureFamily:
+    """Controlled transcript tests spawn no escaping children."""
+    def __init__(self, process, marker):
+        self.process = process
+
+    @staticmethod
+    def preflight():
+        pass
+
+    def sample(self):
+        return 1
+
+    def stop(self):
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.process.wait()
 
 
 class CICheck(unittest.TestCase):
@@ -26,7 +53,7 @@ class CICheck(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(ci, "ROOT", self.root).start()
         patch.dict(os.environ, dict(fixture.env, REF_RUBY_BIN=str(self.root / "reference"))).start()
-        patch.object(ci, "group_rss", return_value=1).start()
+        patch.object(ci, "ProcessFamily", FixtureFamily).start()
         patch.dict(os.environ, {"GITHUB_OUTPUT": "", "GITHUB_STEP_SUMMARY": ""}).start()
         self.quiet = contextlib.redirect_stdout(io.StringIO())
         self.quiet.__enter__()
@@ -129,9 +156,11 @@ class CICheck(unittest.TestCase):
         self.assertTrue(list((self.output / "0/logs").glob("*.partial.stderr")))
 
     def test_lost_rss_monitor_is_an_infrastructure_failure(self):
-        with patch.object(ci, "group_rss", side_effect=RuntimeError("monitor unavailable")):
+        with patch.object(FixtureFamily, "sample", side_effect=RuntimeError("monitor unavailable")):
             self.assertEqual(self.run_shard(0), 1)
-        self.assertTrue(all(row["ref_state"] == "INFRA_ERROR" for row in ci.load(self.output / "0/result.json")["rows"]))
+        rows = ci.load(self.output / "0/result.json")["rows"]
+        self.assertEqual(rows[0]["ref_state"], "INFRA_ERROR")
+        self.assertTrue(all(row["ref_state"] == "NOT_RUN" for row in rows[1:]))
 
     def test_duplicate_shards_are_not_summed_twice(self):
         self.run_shard(0)
@@ -145,7 +174,16 @@ class CICheck(unittest.TestCase):
         self.run_shard(1)
         path = self.output / "1/result.json"
         result = ci.load(path)
-        result["bounds"]["rss_group_kb"] *= 2
+        result["bounds"]["rss_family_kb"] *= 2
+        ci.save(path, result)
+        self.assertEqual(self.merge(), 1)
+
+    def test_different_environment_policies_are_not_merged(self):
+        self.run_shard(0)
+        self.run_shard(1)
+        path = self.output / "1/result.json"
+        result = ci.load(path)
+        result["environment_policy"] = "legacy-inherited"
         ci.save(path, result)
         self.assertEqual(self.merge(), 1)
 
@@ -153,7 +191,7 @@ class CICheck(unittest.TestCase):
         log = self.root / "limited.log"
         # A fixed memory reading exercises the actual group cleanup without
         # depending on the host ps implementation or allocating large memory.
-        with patch.object(ci, "group_rss", return_value=1025):
+        with patch.object(FixtureFamily, "sample", return_value=1025):
             result = ci.supervise(["sh", "-c", "sleep 10"], dict(os.environ), log, 1024, 10)
         self.assertEqual(result["limit"], "MEMORY_LIMIT")
         self.assertLess(result["seconds"], 3)
@@ -180,6 +218,64 @@ class CICheck(unittest.TestCase):
         text = target.read_text()
         self.assertNotIn("/Users/operator", text)
         self.assertNotIn("private-value", text)
+
+    def test_interpreters_receive_only_an_allowlist_and_an_empty_home(self):
+        private = self.root / "private-environment"
+        private.mkdir()
+        with patch.dict(os.environ, {"REVIEW_SECRET": "SYNTHETIC_SECRET_VALUE", "ACTIONS_RUNTIME_TOKEN": "SYNTHETIC_TOKEN"}):
+            env = ci.test_environment(private, self.root / "mere-ruby", "fixture")
+        self.assertNotIn("REVIEW_SECRET", env)
+        self.assertNotIn("ACTIONS_RUNTIME_TOKEN", env)
+        self.assertEqual(env["HOME"], str(private / "home"))
+        self.assertEqual(list((private / "home").iterdir()), [])
+        self.assertEqual(env["UNITTEST_SEED"], "1")
+
+    @unittest.skipUnless(REAL_RUBY and REAL_TOOL_LIB, "set UNITTEST_REAL_RUBY and UNITTEST_REAL_TOOL_LIB for the real Test::Unit fixture")
+    def test_real_test_unit_multiline_hash_and_array_diagnostics_do_not_leak_parent_environment(self):
+        shutil.copytree(REAL_TOOL_LIB, self.root / "src/tool/lib", dirs_exist_ok=True)
+        program = self.root / "src/test/ruby/test_env_diagnostics.rb"
+        program.write_text('''require "test/unit"
+class TestEnvironmentDiagnostics < Test::Unit::TestCase
+  def test_hash
+    assert_equal({"expected" => "different"}, ENV.to_h)
+  end
+  def test_pairs
+    assert_equal([["expected", "different"]], ENV.to_a)
+  end
+end
+''')
+        secret = "SYNTHETIC_SECRET_VALUE"
+        baseline_env = dict(PATH=os.environ["PATH"], HOME=str(self.root), TMPDIR=str(self.root),
+                            LC_ALL="C", REVIEW_SECRET=secret)
+        baseline = subprocess.run([REAL_RUBY, "-I", REAL_TOOL_LIB, "-r", "test/unit", str(program), "-v"],
+                                  env=baseline_env, text=True, capture_output=True, timeout=15)
+        self.assertEqual(baseline.returncode, 2)
+        self.assertTrue(secret in baseline.stdout, "the real framework must render the synthetic environment value")
+        version = subprocess.check_output([REAL_RUBY, "-e", "print RUBY_VERSION"], text=True).strip()
+        for name in ("reference", "mere-ruby"):
+            (self.root / name).unlink()
+            (self.root / name).symlink_to(Path(REAL_RUBY).resolve())
+        (self.root / "tools/ref_ruby.sh").write_text(
+            f"REF_RUBY_VERSION={shlex.quote(version)}\nREF_RUBY_BIN={shlex.quote(str(self.root / 'reference'))}\n")
+        build = ci.load(self.build)
+        build["binary_sha256"] = ci.digest(self.root / "mere-ruby")
+        ci.save(self.build, build)
+        ci.save(self.reference, dict(ruby_ref="c" * 40, version=version,
+                                    binary_sha256=ci.digest(self.root / "reference")))
+        manifest = ci.load(self.plan_path)
+        manifest.update(files=["ruby/test_env_diagnostics.rb"], shards=1, ruby_version=version)
+        ci.save(self.plan_path, manifest)
+        with patch.dict(os.environ, {"REVIEW_SECRET": secret}):
+            self.assertEqual(self.run_shard(0), 0)
+        result = ci.load(self.output / "0/result.json")
+        self.assertEqual(result["rows"][0]["ref_state"], "COMPLETE")
+        self.assertEqual(result["rows"][0]["mere_state"], "COMPLETE")
+        self.assertEqual(result["rows"][0]["both"], 2)
+        self.assertTrue((self.output / "0/logs/ruby_test_env_diagnostics.reference.out").exists())
+        self.assertTrue((self.output / "0/logs/ruby_test_env_diagnostics.out").exists())
+        for path in (self.output / "0").rglob("*"):
+            if path.is_file():
+                self.assertFalse(secret in path.read_text(errors="replace"), "parent environment leaked into an artifact")
 
 
 if __name__ == "__main__":
