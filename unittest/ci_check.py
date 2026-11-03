@@ -296,6 +296,41 @@ print(json.dumps({"parent_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrs
             ci.sanitize(source, target)
         self.assertFalse(target.exists())
 
+    def reference_context_fixture(self):
+        settings = json.loads(subprocess.check_output(
+            [REAL_RUBY, "-rrbconfig", "-rjson", "-e",
+             'puts JSON.generate(RbConfig::CONFIG.slice("arch", "LIBRUBY_A", "prefix", "bindir"))'], text=True))
+        build = self.root / "ruby source's build"
+        for name in ("Makefile", settings["LIBRUBY_A"], "lib/mkmf.rb", "include/ruby.h",
+                     f'.ext/include/{settings["arch"]}/ruby/config.h'):
+            path = build / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# context fixture, not used for compilation\n")
+        return settings, build
+
+    @unittest.skipUnless(REAL_RUBY, "set UNITTEST_REAL_RUBY for the reference context fixture")
+    def test_reference_context_rebinds_build_directory_and_preserves_installation(self):
+        settings, build = self.reference_context_fixture()
+        subprocess.run([REAL_RUBY, str(harness_check.ROOT / "unittest/prepare_reference.rb"), str(build)],
+                       check=True, capture_output=True, text=True, timeout=10)
+        code = 'puts JSON.generate(RbConfig::CONFIG.slice("topdir", "prefix", "bindir"))'
+        result = subprocess.check_output([REAL_RUBY, "-I", str(build / ".unittest-reference"),
+                                          "-rrbconfig", "-rjson", "-e", code], text=True, timeout=10)
+        config = json.loads(result)
+        self.assertEqual(config["topdir"], str(build.resolve()))
+        self.assertEqual(config["prefix"], settings["prefix"])
+        self.assertEqual(config["bindir"], settings["bindir"])
+
+    @unittest.skipUnless(REAL_RUBY, "set UNITTEST_REAL_RUBY for the reference context fixture")
+    def test_incomplete_reference_build_context_is_refused(self):
+        settings, build = self.reference_context_fixture()
+        (build / settings["LIBRUBY_A"]).unlink()
+        result = subprocess.run([REAL_RUBY, str(harness_check.ROOT / "unittest/prepare_reference.rb"), str(build)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(settings["LIBRUBY_A"], result.stderr)
+        self.assertFalse((build / ".unittest-reference/rbconfig.rb").exists())
+
     def test_interpreters_receive_only_an_allowlist_and_an_empty_home(self):
         private = self.root / "private-environment"
         private.mkdir()
@@ -310,21 +345,26 @@ print(json.dumps({"parent_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrs
     @unittest.skipUnless(REAL_RUBY and REAL_TOOL_LIB, "set UNITTEST_REAL_RUBY and UNITTEST_REAL_TOOL_LIB for the real Test::Unit fixture")
     def test_real_test_unit_multiline_hash_and_array_diagnostics_do_not_leak_parent_environment(self):
         shutil.copytree(REAL_TOOL_LIB, self.root / "src/tool/lib", dirs_exist_ok=True)
+        # This helper is outside the current test directory, as psych/helper
+        # and rubygems/simple_gem are in the real source tree.
+        (self.root / "src/test/diagnostic_helper.rb").write_text('DIAGNOSTIC_EXPECTED = "different"\n')
         program = self.root / "src/test/ruby/test_env_diagnostics.rb"
         program.write_text('''require "test/unit"
+require "diagnostic_helper"
 class TestEnvironmentDiagnostics < Test::Unit::TestCase
   def test_hash
-    assert_equal({"expected" => "different"}, ENV.to_h)
+    assert_equal({"expected" => DIAGNOSTIC_EXPECTED}, ENV.to_h)
   end
   def test_pairs
-    assert_equal([["expected", "different"]], ENV.to_a)
+    assert_equal([["expected", DIAGNOSTIC_EXPECTED]], ENV.to_a)
   end
 end
 ''')
         secret = "SYNTHETIC_SECRET_VALUE"
         baseline_env = dict(PATH=os.environ["PATH"], HOME=str(self.root), TMPDIR=str(self.root),
                             LC_ALL="C", REVIEW_SECRET=secret)
-        baseline = subprocess.run([REAL_RUBY, "-I", REAL_TOOL_LIB, "-r", "test/unit", str(program), "-v"],
+        baseline = subprocess.run([REAL_RUBY, "-I", REAL_TOOL_LIB, "-I", str(self.root / "src/test"),
+                                   "-r", "test/unit", str(program), "-v"],
                                   env=baseline_env, text=True, capture_output=True, timeout=15)
         self.assertEqual(baseline.returncode, 2)
         self.assertTrue(secret in baseline.stdout, "the real framework must render the synthetic environment value")

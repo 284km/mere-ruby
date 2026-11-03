@@ -47,6 +47,9 @@ stdout so warnings cannot be mistaken for part of a verbose test name.
 
 Both sides preload CRuby's `tool/lib/test/unit` before loading a file, including
 files that normally rely on the shared runner to define `Test::Unit`.
+Both sides also include the source `test/` directory on their load paths, so
+shared helpers such as `psych/helper` and `rubygems/simple_gem` can be loaded
+from nested test directories.
 
 `COVERAGE.tsv` has one row per selected file. Each side records the exit code,
 the summary's test count and the number of distinct test names discovered.
@@ -102,6 +105,16 @@ test extensions and both JITs (with Rust 1.85.0), installs a relocatable
 reference, and verifies the four test
 extensions previously replaced by shims. Reference-only extension paths take
 precedence over those shims; mere-ruby keeps its own Ruby implementations.
+
+The reference archive also preserves its original build Makefile and static
+Ruby library. After extraction, `prepare_reference.rb` validates those files,
+the source headers and generated config header, then creates a small rbconfig
+wrapper at the current checkout location. For reference-side `mkmf/` tests,
+the wrapper changes only the build `topdir`, keeping the installed prefix and
+interpreter paths. Source `lib/` supplies mkmf's matching build-tree behavior.
+The load paths propagate to `assert_separately` children; the extra context is
+not applied to mere-ruby or other test groups. The reference build job checks
+both actual C compilation/linking and a test that starts a separate Ruby.
 
 `unittest/ci.py` partitions the manifest into 64 shards with no overlapping files.
 At most four macOS measurement jobs run at once. Each file runs sequentially:
@@ -185,3 +198,38 @@ Ruby 4.0.9 Test::Unit fixture for multiline environment diagnostics.
 The collection checks compare parent and mask-process peak RSS for 8 MiB and
 64 MiB logs without newlines, exercise output expansion and UTF-8 truncation,
 and check both silent and continuously noisy mask timeouts.
+
+## Classified baseline gaps
+
+The [completed baseline](https://github.com/284km/mere-ruby/actions/runs/41571293365)
+measured all 757 candidates, including 53 files whose reference state was not
+COMPLETE and 325 whose mere-ruby state was INCOMPLETE. These are file counts;
+the named-case verdicts also include shared cases and unreached tests.
+
+[reference_gaps.tsv](reference_gaps.tsv) retains all 53 reference rows with
+their conditions and next actions. The 25 startup failures comprise 16 mkmf
+files needing the build context and nine files needing the test-root load
+path. A reference-only local probe reached 176 cases and 570 assertions across
+those 25 files: zero failures/errors and four skips. Its Makefile CC_WRAPPER
+field was reconstructed from the real reference RbConfig for this local smoke;
+the library and generated headers came from that reference artifact. CI uses
+the original build Makefile and verifies the packaged context independently.
+
+The remaining 28 rows include 26 zero-case configurations and two counting
+inconsistencies. They require Windows/TTY, trace privileges and providers,
+optional DBM/Engine/Shape/test-extension APIs, parser or development-build
+conditions, and explicit treatment of an empty chkbuild helper. Counting work
+remains for quoted Symbol names, Unicode test data, and Cargo diagnostics that
+join verbose progress lines. Cargo also needs isolated fixture directories
+and a usable Rust environment. No candidate is removed or reported as passing
+because it defined no cases.
+
+[incomplete_causes.tsv](incomplete_causes.tsv) classifies every one of the 325
+mere-ruby incomplete files using the baseline logs. In particular, 150 stop at
+unimplemented OpenSSL::Cipher (all 149 RubyGems files plus bundled-gem tests),
+63 at missing prism/prism, 64 at missing test-only extension APIs, and 17 at
+missing RbConfig APIs. Eight more share the corrected test-root load-path
+problem. Six files had started tests before terminating; their symptoms are
+recorded separately from load failures. These rows are a dated baseline,
+not new execution results. Their API gaps remain implementation work; the
+runner changes do not substitute fake crypto/parser/test-extension results.
