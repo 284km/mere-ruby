@@ -53,8 +53,10 @@ ideas:
 | ten workers instead of six | 736.7s, CPU +50s | slower; the bottleneck is shared and serial |
 | unique `/tmp` paths per corpus process | `138` prints `File.basename(__FILE__)` | breaks byte-equality; the two sides are two processes |
 
-**Still open, both outside this repository**: the 41s emit and the ~350s `clang`
-invocation, which needs the emitted C split into several translation units.
+**Closed 2026-11-04, outside this repository**: the 41s emit and the ~350s
+`clang` invocation were the Mere compiler writing the same code many times
+over, not the size of the interpreter. See the dated section at the end:
+the emit is about 5s, and `clang -O2` about 50s on 37 MB of C.
 
 ## The cycle, measured 2026-09-22
 
@@ -1044,7 +1046,8 @@ The sweep's remaining cost is process creation and filesystem work, shared
 across workers, and neither scheduling nor worker count moves it. The two
 remaining items in the loop are both outside this repository: the 41s emit and
 the ~350s `clang` invocation, which needs the emitted C split into several
-translation units.
+translation units. (2026-11-04: neither needed splitting -- see the last
+section.)
 
 ## 2026-09-30: a hung spec can empty the rest of a sweep
 
@@ -1076,3 +1079,47 @@ from that before/after, not traced.
 - ⚠ **`--fast` is -O1 now.** -O0 could no longer run the prelude at all (the
   lexer's per-token tail call is a frame at -O0), and `scoreboard.sh` refuses
   an O1 build as it refused O0.
+
+## 2026-11-04: the C was large because it was written many times over
+
+Mere's CI compiles this interpreter's emitted C with clang 18 on Linux (the
+downstream compile check), and it had crept to 1031-1144 s against a
+1200-second limit. clang's `-ftime-report` put 88% of it in one pass, SROA,
+and `-ftime-trace` put almost all of that in one function: `eval_e`, 2,807
+lines of Mere and **70.8 MB of C** with about 970,000 locals.
+
+The size was the compiler's, not the interpreter's. Splitting `eval_e` would not
+have helped:
+
+- **A guarded match arm wrote the arms below it twice** -- after a failed
+  pattern and after a failed guard -- so each `when` doubled everything under
+  it. The tell was in the counts: the literal `"=="` appeared 24,576 times
+  (3 x 2^13) in `eval_e`. Fixed in Mere 0.1.699.
+- **A curried lambda's two-argument entry wrote its second stage again**, and
+  when that stage was another `fn`, each stage doubled the ones below it
+  (Fibonacci in the arity; `invoke_val_c0`, seven parameters, was 14 copies of
+  5.6 MB in the LLVM IR). Fixed in Mere 0.1.701.
+
+Timed on the same source, same machine, under load:
+
+| | Mere 0.1.697 | Mere 0.1.701 |
+|---|---|---|
+| emitted C | 132 MB | **37 MB** |
+| emit (`mere -c`) | 41s (2026-09-22) | **5.3s** |
+| `clang -O2` (Apple clang), user | 452s | **53s** |
+| `clang -O2` (clang 18, Linux image) | 893s (SROA 785s) | 115s (0.1.699) |
+| Mere CI, this repository's row | 1031-1144s | **74s** |
+| LLVM IR (`mere -ll`) | 261 MB (0.1.699) | **59 MB** |
+
+The corpus and the two benchmarks take the same user time on both binaries.
+
+- ⚠ **Count the repeats before splitting a big function.** A literal or a
+  call that appears a power of two times in the emitted code, when the source
+  writes it a handful of times, is a code generator copying a continuation per
+  branch. The cure is in the compiler and helps every program it compiles
+  (mbrowse's C went from 26 MB to 5 MB with the same change).
+- The LLVM build of this interpreter did not link at -O1 or -O2 with 0.1.697-0.1.700:
+  LLVM's tail-recursion pass broke a `musttail` in `rxp_count_rep`, which also
+  holds an accumulating self-call. Mere 0.1.701 marks such self-calls `notail`;
+  the LLVM build matches the C build on all 482 corpus programs.
+
