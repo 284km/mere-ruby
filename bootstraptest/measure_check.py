@@ -98,7 +98,7 @@ class MeasurementCheck(unittest.TestCase):
             self.skipTest('set UNITTEST_REAL_RUBY and UNITTEST_BOOTSTRAP_RUNNER for upstream runner checks')
         fixture = self.root / 'test_forms.rb'
         fixture.write_text(source)
-        skips = self.root / 'skips'; skips.mkdir()
+        skips = self.root / 'skips'; skips.mkdir(exist_ok=True)
         env = dict(os.environ, BOOTSTRAP_CASE_LOG=str(self.ledger), BOOTSTRAP_SKIP_DIR=str(skips))
         result = subprocess.run([ruby, str(measure.ROOT / 'bootstraptest/audit_runner.rb'), runner,
                                  '--ruby=' + ruby, '-j1', '--timeout=3', str(fixture)],
@@ -132,6 +132,23 @@ assert_equal 'skipped', %q{skip 'skipped'}
         self.assertEqual(summary['state'], 'INCOMPLETE')
         self.assertEqual(summary['discovered'], 1)
         self.assertEqual(list(cases.values()), ['X'])
+
+    def test_repeated_assertions_on_one_line_remain_distinct(self):
+        result, (summary, cases) = self.native("3.times { assert_equal '3', '1+2' }\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(summary['verdicts'], dict(PASS=3))
+        self.assertEqual(len(cases), 3)
+        self.assertEqual({key[-1] for key in cases}, {1, 2, 3})
+
+    def test_generated_driver_pids_do_not_create_false_test_name_differences(self):
+        source = "assert_equal 'true', %Q{#{Process.pid} > 0}\n"
+        first, (summary, left) = self.native(source)
+        left_digest = json.loads(self.ledger.read_text().splitlines()[0])['source_sha256']
+        second, (summary, right) = self.native(source)
+        right_digest = json.loads(self.ledger.read_text().splitlines()[0])['source_sha256']
+        self.assertEqual((first.returncode, second.returncode), (0, 0))
+        self.assertNotEqual(left_digest, right_digest)
+        self.assertEqual(measure.compare(left, right), dict(tests=1, match=1, red=0, both=0, extra=0))
 
 
 if __name__ == '__main__':

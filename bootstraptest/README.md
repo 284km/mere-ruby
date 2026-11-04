@@ -10,8 +10,10 @@ replaced by a no-op.
 `audit_runner.rb` adds discovery, start and finish records around the native
 runner. Its child wrapper records an explicit `BT_Skip` without changing the
 original result text or line count. An expected skip message remains SKIP.
-Case identities include the source location, source digest and occurrence,
-so loops that generate multiple assertions on one line remain distinct.
+Case identities use source location and occurrence, so loops that generate
+multiple assertions on one line remain distinct. A digest of generated code
+is also recorded; driver PIDs or paths inside it do not create false test-name
+differences. Both native drivers use the same source-discovery random seed.
 
 Each side is bounded to 600 seconds per source file and a 2 GiB process family.
 The upstream assertion-specific timeout also applies. A missing final event,

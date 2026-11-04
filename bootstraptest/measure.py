@@ -67,7 +67,10 @@ def parse_cases(path, execution):
                         raise ValueError('invalid assertion source digest')
                     if type(record['line']) is not int or record['line'] <= 0:
                         raise ValueError('invalid assertion line')
-                    base = (record['file'], record['line'], record['source_sha256'])
+                    # Generated source can contain the driver's PID or paths.
+                    # Upstream assertion identity is its location/occurrence;
+                    # the digest remains audit data, not a different test name.
+                    base = (record['file'], record['line'])
                     occurrences[base] += 1
                     cases[identifier] = dict(record, key=base + (occurrences[base],), status='X', started=False)
                 elif event == 'start':

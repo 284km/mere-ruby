@@ -76,4 +76,7 @@ module BootstrapAudit
 end
 
 runner = ARGV.shift or abort 'missing upstream bootstrap runner'
+# Source files can generate assertions in loops. Both native hosts use the
+# same discovery seed; target programs retain the upstream runner's behavior.
+srand(1)
 load runner
