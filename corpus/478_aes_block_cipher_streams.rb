@@ -120,3 +120,22 @@ cipher.reset
 same = 'data'
 p cipher.update('data', same).equal?(same)
 p (same + cipher.final).unpack1('H*')
+
+# Supplied buffers retain their encoding, even when an update emits no bytes.
+['UTF-8', 'UTF-16LE', 'ISO-8859-1'].each do |encoding|
+  cipher = OpenSSL::Cipher.new('AES-128-CBC').encrypt
+  cipher.key = 'k' * 16
+  cipher.iv = 'i' * 16
+  output = 'old'.dup.force_encoding(encoding)
+  first = cipher.update('p', output)
+  p [encoding, first.equal?(output), output.encoding.name, output.bytesize]
+  second = cipher.update('p' * 15, output)
+  p [encoding, second.equal?(output), output.encoding.name, output.unpack1('H*')]
+end
+
+# Explicit nil options have the same defaults as omitted arguments.
+[[], [nil, nil, nil], [nil, 1, nil], [nil, 1, 'MD5']].each do |options|
+  cipher = OpenSSL::Cipher.new('AES-128-ECB').encrypt
+  p cipher.pkcs5_keyivgen('pw', *options)
+  p (cipher.update('derived key') + cipher.final).unpack1('H*')
+end
