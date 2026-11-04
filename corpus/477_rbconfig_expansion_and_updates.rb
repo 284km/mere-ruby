@@ -21,3 +21,11 @@ ensure
     config.delete(name)
   end
 end
+
+# configure_args consumers use Shellwords' String and Array extensions.
+require 'shellwords'
+p RbConfig::CONFIG['configure_args'].shellsplit.is_a?(Array)
+p ''.shellsplit
+p %q{--with-name='a b' plain\ word}.shellsplit
+p 'a b'.shellescape
+p ['a', 'b c', ''].shelljoin
