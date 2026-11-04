@@ -997,7 +997,7 @@ A MatchData holds 64 capture groups (ruby exposes only `$1`..`$9` as globals,
 but `m[10]` and `m[:name]` are answered up to 64). A pattern with more than
 that silently keeps the first 64.
 
-## `openssl` is a hash function, and nothing else
+## `openssl` hashes and AES block-cipher streams
 
 `require "openssl"` gives `OpenSSL::Digest` (SHA1, SHA256, MD5 — the digests
 mere-ruby already ships, wearing OpenSSL's class shape) and `OpenSSL::HMAC`,
@@ -1010,9 +1010,17 @@ actually needs (`uninitialized constant OpenSSL::SSL`), which names the
 missing capability, rather than load and fail somewhere further away. This is
 where excon, fog-aws and aws-sdk-s3 stop, and all three stop there having
 loaded everything else.
-`OpenSSL::Cipher` is the one exception: its `CipherError` is a class that
-activesupport names at load time, so the class exists and `Cipher.new`
-raises.
+`OpenSSL::Cipher` implements AES-128, AES-192 and AES-256 in CBC and ECB
+modes, including incremental updates, PKCS#7 padding, key/IV validation,
+copy/reset and EVP_BytesToKey-compatible password derivation. Unsupported
+algorithms raise `CipherError`; `ciphers` lists only implemented algorithms.
+The block transforms are checked against FIPS 197 and SP 800-38A vectors,
+then streaming and state transitions are compared with the reference.
+
+This implementation uses table lookups and is not constant-time. It is
+experimental interpreter functionality, not a hardened cryptographic
+provider. Authenticated modes, PKey, certificates and TLS remain separate
+implementation work.
 
 Linking real TLS would be a decision, not a gap: Mere has `tcp_starttls`
 (OpenSSL, native only), so the cost is a permanent libssl dependency that the
@@ -3538,7 +3546,7 @@ exactly, because the other half would have to invent something:
 |---|---|
 | `cgi` — escapeHTML, unescapeHTML, the URI encoders, escapeElement | the request-shaped instance methods `#params`, `#header`, `#out`, `#[]`: they need a request environment, and this process is not a CGI script. ⚠ `CGI.new` itself SUCCEEDS and hands back an object none of them answer for -- the one row here that fails somewhere other than the name you asked for |
 | `io/console` — `StringIO#getch` | `#getpass`: ruby consumes one character more than "a line without the newline", and a method that is close but not the same is a wrong answer where a missing one is an honest refusal |
-| `openssl` — `OpenSSL::Digest`, HMAC | TLS, X509, PKey: a gem should fail on the constant that names the missing capability, not load and fail somewhere else |
+| `openssl` — `OpenSSL::Digest`, HMAC, experimental AES CBC/ECB | TLS, X509, PKey: a gem should fail on the constant that names the missing capability, not load and fail somewhere else |
 | `socket` — Addrinfo, Option, AncillaryData, constants; TCP in both families, connected UDP | bind(2)/sendto(2) to a chosen address and UNIX sockets EXIST and raise `NotImplementedError`, for the same reason (see the `socket` entry) |
 
 ⚠ Each of these was added because something failed by NAME rather than by
