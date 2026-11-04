@@ -160,6 +160,58 @@ end
         self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
         self.assertEqual((row['match'], row['red'], row['both']), (1, 0, 0), row)
 
+    def test_reference_default_gem_activation_in_parent_and_child(self):
+        (self.root / 'src/test/ruby/test_default_activation.rb').write_text('''require 'json'
+class TestDefaultActivation < Test::Unit::TestCase
+  def test_activation
+    assert_equal({}, JSON.parse('{}'))
+    unless ENV['RUBY'] == ENV['MR_BIN']
+      refute_nil(Gem.loaded_specs['json'])
+      out, status = Open3.capture2e(ENV.fetch('RUBY'), '-rjson', '-e', "print Gem.loaded_specs.fetch('json').name")
+      assert(status.success?, out)
+      assert_equal('json', out)
+    end
+  end
+end
+''')
+        row = self.measure('ruby/test_default_activation.rb')
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
+        self.assertEqual((row['match'], row['red'], row['both']), (1, 0, 0), row)
+
+    def test_rake_builder_can_select_its_installed_fixture_gem(self):
+        (self.root / 'src/test/rubygems').mkdir()
+        (self.root / 'src/test/rubygems/test_gem_ext_rake_builder.rb').write_text('''require 'rubygems/ext'
+require 'tmpdir'
+require 'fileutils'
+class TestRakeFixture < Test::Unit::TestCase
+  def test_fixture_selection
+    Dir.mktmpdir('rake-fixture') do |home|
+      spec = Gem::Specification.new do |s|
+        s.name = 'rake'
+        s.version = '999.0'
+        s.summary = 'fixture'
+        s.authors = ['fixture']
+        s.executables = ['rake']
+        s.files = ['bin/rake']
+      end
+      FileUtils.mkdir_p(File.join(home, 'specifications'))
+      bin = File.join(home, 'gems', spec.full_name, 'bin')
+      FileUtils.mkdir_p(bin)
+      File.write(File.join(bin, 'rake'), "puts 'selected-fixture-rake'\\n")
+      File.write(File.join(home, 'specifications', spec.full_name + '.gemspec'), spec.to_ruby)
+      Gem.use_paths(home)
+      Gem::Specification.reset
+      output = []
+      Gem::Ext::RakeBuilder.build('Rakefile', home, output, [], nil, home)
+      assert_include(output.join, 'selected-fixture-rake')
+    end
+  end
+end
+''')
+        row = self.measure('rubygems/test_gem_ext_rake_builder.rb')
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
+        self.assertEqual((row['match'], row['red'], row['both']), (1, 0, 0), row)
+
 
 if __name__ == '__main__':
     unittest.main()
