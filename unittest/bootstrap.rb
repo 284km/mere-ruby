@@ -19,3 +19,20 @@ module MereRubyTestBootstrap
 
   PRELOADS.fetch(ENV["UNITTEST_TEST_FILE"], []).each { |library| require library }
 end
+
+# RubyGems' tests request test-unit 3, where an unqualified assert_raise accepts
+# any exception. The already-loaded ruby-core runner instead treats its empty
+# expected-class list as a mismatch. Bridge only that API difference for gem
+# tests, retaining explicit class checks and the core runner's skip handling.
+if ENV.fetch("UNITTEST_TEST_FILE", "").start_with?("rubygems/")
+  module MereRubyGemAssertionContract
+    def assert_raise(*expected, &block)
+      if expected.empty? || (expected.size == 1 && String === expected[0])
+        assert_raise_kind_of(Exception, *expected, &block)
+      else
+        super
+      end
+    end
+  end
+  Test::Unit::TestCase.prepend(MereRubyGemAssertionContract)
+end

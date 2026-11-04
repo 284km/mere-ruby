@@ -212,6 +212,36 @@ end
         self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
         self.assertEqual((row['match'], row['red'], row['both']), (1, 0, 0), row)
 
+    def test_gem_assertion_contract_requires_an_exception_and_preserves_typed_checks(self):
+        (self.root / 'src/test/rubygems').mkdir()
+        (self.root / 'src/test/rubygems/test_assertion_contract.rb').write_text('''class TestGemAssertionContract < Test::Unit::TestCase
+  def test_contract
+    error = assert_raise { raise ArgumentError, 'any exception' }
+    assert_equal(ArgumentError, error.class)
+    assert_raise('message') { raise TypeError }
+    assert_raise(Test::Unit::AssertionFailedError) { assert_raise {} }
+    assert_raise(Test::Unit::AssertionFailedError) { assert_raise(TypeError) { raise ArgumentError } }
+    assert_raise(Test::Unit::PendedError) { assert_raise { raise Test::Unit::PendedError, 'keep skip' } }
+  end
+end
+''')
+        row = self.measure('rubygems/test_assertion_contract.rb')
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
+        self.assertEqual((row['match'], row['red'], row['both']), (1, 0, 0), row)
+
+    def test_core_assertion_contract_is_unchanged(self):
+        (self.root / 'src/test/ruby/test_assertion_contract.rb').write_text('''class TestCoreAssertionContract < Test::Unit::TestCase
+  def test_contract
+    assert_raise(Test::Unit::AssertionFailedError) { assert_raise { raise ArgumentError } }
+    assert_raise(Test::Unit::AssertionFailedError) { assert_raise {} }
+    assert_raise(ArgumentError) { raise ArgumentError }
+  end
+end
+''')
+        row = self.measure('ruby/test_assertion_contract.rb')
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
+        self.assertEqual((row['match'], row['red'], row['both']), (1, 0, 0), row)
+
 
 if __name__ == '__main__':
     unittest.main()

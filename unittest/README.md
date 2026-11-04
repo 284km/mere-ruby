@@ -142,6 +142,12 @@ so repository-specific checks such as `Gem.prefix` inspect the tested source.
 `bootstrap.rb` explicitly preloads the prerequisites that selected files rely
 on from earlier whole-suite tests (Tempfile, tmpdir, FileUtils, delegate or
 socket). Only the named files receive those prerequisites, equally per side.
+RubyGems files also receive test-unit 3's unqualified `assert_raise` contract:
+some exception must be raised, while explicit expected classes retain their
+checks and pending/skipped tests still propagate. The ruby-core assertion
+contract is unchanged for core files. This avoids reporting a missing Fiddle
+symbol as a failure merely because the two assertion frameworks disagree on
+an empty expected-class list.
 This does not change test definitions, assertions or feature guards.
 
 The reference archive also preserves its original build Makefile and static
