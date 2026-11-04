@@ -35,3 +35,11 @@ class IncompleteDigest < Digest::Base; end
     p [error.class, error.message]
   end
 end
+
+# Requiring another digest entry point preserves existing wrappers and mutexes.
+wrapper = Digest::SHA2.new(384) << 'abc'
+implementation_class = wrapper.class
+mutex = Digest::REQUIRE_MUTEX
+require 'digest/md5'
+p [implementation_class.equal?(Digest::SHA2), wrapper.class.equal?(Digest::SHA2),
+   mutex.equal?(Digest::REQUIRE_MUTEX), wrapper.hexdigest]
