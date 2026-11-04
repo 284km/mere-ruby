@@ -602,13 +602,17 @@ require now promises more than the object delivers. A program that
 requires it and then uses a lazy enumerator will fail later, and further
 from the cause than a LoadError would have been.
 
-## YAML is a loader subset, and `require "yaml"` can be lost after a failed load
+## YAML / Psych cover a subset of the full parser and emitter APIs
 
-`yaml` / `psych` ship as Ruby source: block mappings and sequences, flow
-collections, the implicit scalar types (including YAML 1.1's rule that a
-float needs a decimal point *and* a signed exponent, so `1.0e3` is a
-String), comments, and multiple documents. No emitter, no anchors or
-aliases, no explicit tags, no block scalars (`|` / `>`).
+`yaml` / `psych` ship as Ruby source, including a basic emitter. Dumping
+accepts a positional options Hash through `Object#to_yaml` and `Psych.dump`,
+as YAML::Store uses, and propagates `indentation` through nested mappings,
+sequences, tagged values and literal scalars. Widths outside 2..9 use the
+default width, following the pinned reference.
+
+These dump contracts do not complete Psych's node, handler, event or loader
+APIs. Large YAML::Store transaction workloads also need performance work;
+passing the small store cases does not establish the large-file behavior.
 
 
 ## `UnboundMethod#bind_call` re-dispatches by name
