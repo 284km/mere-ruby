@@ -26,3 +26,31 @@ module IncludedResult; end
 class IncludeReceiver; end
 p IncludeReceiver.class_eval { include IncludedResult }
 p IncludeReceiver.class_eval { prepend Enumerable }
+
+# Digest comparison coerces text rather than delegating String#== back to it.
+class ComparisonDigest < Digest::Class
+  def finish; 'x'.b; end
+end
+class DigestText
+  def to_str; '78'; end
+end
+class ReversedDigestEquality
+  def to_str; 'different'; end
+  def ==(_); true; end
+end
+class MissingDigestConversion; end
+class NilDigestConversion
+  def to_str; nil; end
+end
+class InvalidDigestConversion
+  def to_str; 123; end
+end
+comparison = ComparisonDigest.new
+p [comparison == DigestText.new, comparison == ReversedDigestEquality.new]
+p [comparison == MissingDigestConversion.new, comparison == NilDigestConversion.new]
+begin
+  comparison == InvalidDigestConversion.new
+rescue TypeError => error
+  p error.class
+end
+p [comparison == ComparisonDigest.new, comparison == '78', comparison == 'different']
