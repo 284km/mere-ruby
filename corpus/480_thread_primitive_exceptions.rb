@@ -20,3 +20,67 @@ rescue ArgumentError => error
   p [error.class, error.message]
 end
 p Thread.new { Thread.exit }.join.status
+
+# A handled failure in thread_end must not reuse the worker's pending error.
+Thread.report_on_exception = false
+observed = []
+hook = TracePoint.new(:thread_end) do
+  observed << $!
+  begin
+    Integer('invalid callback input')
+  rescue ArgumentError => error
+    observed << [error.class, error.cause]
+  end
+  GC.start
+end
+hook.enable
+[:missing, :argument, :explicit, :exit].each do |kind|
+  worker = Thread.new do
+    case kind
+    when :missing then nil.original_worker_failure
+    when :argument then Integer('invalid worker input')
+    when :explicit then raise 'original worker failure'
+    when :exit then Thread.exit
+    end
+  end
+  begin
+    worker.join
+    p [kind, worker.status]
+  rescue StandardError => error
+    p [kind, error.class, error.cause, error.backtrace.any? { |frame| frame.include?('block') }]
+    p error.name if NoMethodError === error
+  end
+end
+hook.disable
+p observed
+
+# Reporting invokes user code too; its handled errors leave join's error intact.
+class ThreadReportSink
+  attr_reader :text
+  def initialize; @text = ''; end
+  def write(text)
+    begin
+      Integer('invalid report input')
+    rescue ArgumentError
+      @text << text
+    end
+    text.bytesize
+  end
+end
+original_stderr = $stderr
+sink = ThreadReportSink.new
+$stderr = sink
+begin
+  worker = Thread.new do
+    Thread.current.report_on_exception = true
+    Integer('original report failure')
+  end
+  begin
+    worker.join
+  rescue ArgumentError => error
+    p [error.message.include?('original report failure'), error.cause.nil?,
+       sink.text.include?('original report failure'), sink.text.include?('ArgumentError')]
+  end
+ensure
+  $stderr = original_stderr
+end

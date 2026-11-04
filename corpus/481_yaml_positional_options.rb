@@ -28,3 +28,19 @@ p YAML.dump([['a']], indentation: 3.9)
     p error.class
   end
 end
+
+# Compact sequences retain nil entries and mappings across dump/load.
+values = [
+  [[nil, {'a' => 1}]],
+  [[nil, {'a' => 1}], [1, 2]],
+  {'outer' => [[nil, {'a' => [1, 2]}], ['tail']]},
+  [{'a' => 1, 'b' => 2}, [nil, {'c' => 3}]],
+]
+[2, 3, 4, 9].each do |width|
+  values.each do |object|
+    result = YAML.unsafe_load(YAML.dump(object, indentation: width))
+    raise 'YAML dump/load changed data' unless result == object
+    p [width, result]
+  end
+end
+p YAML.unsafe_load("---\n- -word\n")
