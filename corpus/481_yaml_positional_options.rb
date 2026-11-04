@@ -32,6 +32,7 @@ end
 # Compact sequences retain nil entries and mappings across dump/load.
 values = [
   [[nil, {'a' => 1}]],
+  [[{'a' => 1}, nil]],
   [[nil, {'a' => 1}], [1, 2]],
   {'outer' => [[nil, {'a' => [1, 2]}], ['tail']]},
   [{'a' => 1, 'b' => 2}, [nil, {'c' => 3}]],
