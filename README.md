@@ -127,7 +127,7 @@ Every change is checked against the reference `ruby` before it lands:
 ./run_corpus.sh --both                           # ...with the hash index ON and OFF,
                                                  # running the reference once, not twice
                                                  # (and eight SOURCE gates, see tools/)
-./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
+./bootstraptest/all.sh <ruby-checkout>           # legacy assert_equal pairs (a subset)
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
 ./mspec/record_hygiene.sh                        # the records name no machine and no operator
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -139,6 +139,11 @@ Every change is checked against the reference `ruby` before it lands:
 Each harness derives what it needs from the arguments; nothing is left in
 `/tmp` between runs. Two of them used to be, and a cleared `/tmp` quietly
 took the measurement with it.
+
+CI also measures every `bootstraptest/test_*.rb` through the pinned Ruby's
+native runner, including exit, pattern, syntax and finish assertions. See
+[bootstrap measurement](bootstraptest/README.md) for the complete manifest,
+bounded execution, explicit skips and saved per-assertion results.
 
 `run_corpus.sh` also runs eight SOURCE gates before it runs a program, because
 each of them catches a defect that is invisible at runtime -- a rule written
@@ -485,11 +490,12 @@ match, each row carrying WHY it does not).
 [`CAUSES.md`](CAUSES.md). That is the number worth acting on: the table says how
 many files disagree, and this says how many NAMES they come down to. It reads
 the tags files only, so the bucket key can be retuned without re-sweeping. Those tag files are the honest, checked-in record of the gap — the
-same idea as the tags/filter files every other implementation keeps. Passing
-100% is a non-goal (only MRI does, because the specs are derived from it); the
-target is the `language` and `core` groups, and the C-API (`optional/capi`) is
-out of scope. The stdlib (`library`) is IN scope for what this interpreter
-actually ships -- see below.
+same idea as the tags/filter files every other implementation keeps. The
+long-term goal is to pass every test in the pinned Ruby suites, including
+stdlib, VM and C-API tests as the required runtime support is implemented.
+The existing scoreboard below measures its recorded groups and source tree;
+it is not a complete inventory. CI's `measurement-plan/suites.json` separately
+lists the broader target suites and inputs still awaiting measurement.
 
 The record covers **2980 spec files** across 154 groups: **2488 MATCH, 149
 DIFF, 3 CRASH**, 335 SKIP, 5 SLOW, against ruby 4.0.9. Run with no
