@@ -35,11 +35,18 @@ hook = TracePoint.new(:thread_end) do
 end
 hook.enable
 [:missing, :argument, :explicit, :exit].each do |kind|
+  worker_line = nil
   worker = Thread.new do
     case kind
-    when :missing then nil.original_worker_failure
-    when :argument then Integer('invalid worker input')
-    when :explicit then raise 'original worker failure'
+    when :missing
+      worker_line = __LINE__ + 1
+      nil.original_worker_failure
+    when :argument
+      worker_line = __LINE__ + 1
+      Integer('invalid worker input')
+    when :explicit
+      worker_line = __LINE__ + 1
+      raise 'original worker failure'
     when :exit then Thread.exit
     end
   end
@@ -47,8 +54,9 @@ hook.enable
     worker.join
     p [kind, worker.status]
   rescue StandardError => error
-    p [kind, error.class, error.cause, error.backtrace.any? { |frame| frame.include?('block') }]
+    p [kind, error.class, error.cause, error.backtrace.any? { |frame| frame.include?(":#{worker_line}:") }]
     p error.name if NoMethodError === error
+    p error.message.include?('invalid worker input') if ArgumentError === error
   end
 end
 hook.disable
