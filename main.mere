@@ -300,7 +300,9 @@ type RNode = NChar of str | NCharCI of str | NAny | NAnyNL
 // Compiled instructions (a program is an int-key Map "0".."N-1" -> RInst,
 // plus "meta" -> IMeta (count, ngroups) and "name:<x>" -> IMeta (gnum, 0)).
 type RInst = IChar of str | IByte of int | ICharCI of str | IAny | IAnyNL
-           | IClass of RCls list * bool * bool
+           // (items, negated, /i, and for a class without /i the answer for
+           //  each ASCII byte, "0"/"1" x 128: read where a byte is a character)
+           | IClass of RCls list * bool * bool * str
            | ISplit of int * int | IJmp of int | ISave of int
            | IBOL | IEOL | IBOS | IEOS | IEOSNL | IGANCHOR
            | IWordB of bool * bool | IBackref of int * bool
@@ -57410,7 +57412,7 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
   | NAny -> let _ = map_set prog pc IAny in pc + 1
   | NAnyNL -> let _ = map_set prog pc IAnyNL in pc + 1
   | NGrapheme -> let _ = map_set prog pc IGrapheme in pc + 1
-  | NClass (items, neg, ci) -> let _ = map_set prog pc (IClass (items, neg, ci)) in pc + 1
+  | NClass (items, neg, ci) -> let _ = map_set prog pc (IClass (items, neg, ci, (if ci then "" else rxv_cls_bits items neg 0 ""))) in pc + 1
   | NBOL -> let _ = map_set prog pc IBOL in pc + 1
   | NEOL -> let _ = map_set prog pc IEOL in pc + 1
   | NBOS -> let _ = map_set prog pc IBOS in pc + 1
@@ -57783,6 +57785,17 @@ and meth_inspect_str = fn world -> fn (kind: str) -> fn (owner: str) -> fn (nm0:
 and rxv_tick = fn (u: unit) ->
   let n = vec_get rxv_steps 0 + 1 in
   let _ = vec_set rxv_steps 0 n in
+  if n < vec_get rxv_steps 2 then () else rxv_tick_slow n
+// (slot 2 of rxv_steps is the next count with anything to do: the cache's
+//  threshold, the budget, or the very next step while the cache is on or a
+//  deadline is set -- 0 at a search's start, so its first step decides)
+and rxv_tick_slow = fn (n: int) ->
+  let _ = rxv_tick_at n in
+  let t9 = vec_get rxv_mc 4 in
+  vec_set rxv_steps 2
+    (if vec_get rxv_mc 0 == 1 || vec_get rxv_dl 0 > 0 then n + 1
+     else if t9 > n && t9 <= rxv_budget then t9 else rxv_budget + 1)
+and rxv_tick_at = fn (n: int) ->
   let _ = (if n == vec_get rxv_mc 4 then rxv_mc_start () else ()) in
   let _ = (if vec_get rxv_dl 0 == 0 then () else rxv_clock ()) in
   // (with the cache on, the marks bound the work, and the budget is not asked)
@@ -57880,6 +57893,16 @@ and rxs_vput = fn v -> fn (n: int) -> fn (x: int) -> if n < vec_len v then vec_s
 // write a slot, logging the value it replaces
 and rxs_ss = fn (k: int) -> fn (x: int) ->
   let t = vec_get rxs_top 1 in
+  // (a capture's slot, with room on the trail: the common write, inline)
+  if k >= 0 && k < 1024 && k < vec_len rxs_vg && t + 1 < vec_len rxs_trail then
+    (let g = vec_get rxs_top 3 in
+     let _ = vec_set rxs_trail t k in
+     let _ = vec_set rxs_trail (t + 1) (if vec_get rxs_vg k == g then vec_get rxs_vs k else 0 - 1) in
+     let _ = vec_set rxs_top 1 (t + 2) in
+     let _ = vec_set rxs_vg k g in
+     vec_set rxs_vs k x)
+  else rxs_ss_any k x t
+and rxs_ss_any = fn (k: int) -> fn (x: int) -> fn (t: int) ->
   let j = rxs_ix k in
   if j >= 0 && j < vec_len rxs_vg then
     (let g = vec_get rxs_top 3 in
@@ -57900,7 +57923,7 @@ and rxs_undo = fn (t: int) ->
   if cur <= t then ()
   else (let k = vec_get rxs_trail (cur - 2) in
         let old = vec_get rxs_trail (cur - 1) in
-        let j = rxs_ix k in
+        let j = (if k >= 0 && k < 1024 then k else rxs_ix k) in
         // (an indexed slot was written in this search, so it is in range)
         let _ = (if j >= 0 then vec_set rxs_vs j old else rxs_put k old) in
         let _ = vec_set rxs_top 1 (cur - 2) in
@@ -58108,11 +58131,15 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (base:
     // which is not even a valid string. Literals and classes still compare byte
     // by byte (a literal's own bytes line up with the subject's); making the
     // classes character-aware is the rest of that question and not this fix.
-    if i < str_len s && (if str_eq (char_at s i) "\n" then false else true)
+    // (an ASCII byte is one character in a UTF-8 or a one-byte cut: no decode)
+    if i < str_len s && ord (char_at s i) < 128 && vec_get cut_k 0 != 2 then
+      (if ord (char_at s i) == 10 then (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
+       else rxv_run prog s (pc + 1) (i + 1) base)
+    else if i < str_len s && (if str_eq (char_at s i) "\n" then false else true)
     then rxv_run prog s (pc + 1) (i + cut_clen s i) base
     else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | IAnyNL ->
-    if i < str_len s then rxv_run prog s (pc + 1) (i + cut_clen s i) base
+    if i < str_len s then rxv_run prog s (pc + 1) (i + (if ord (char_at s i) < 128 && vec_get cut_k 0 != 2 then 1 else cut_clen s i)) base
     else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | IGrapheme ->
     if i < str_len s then rxv_run prog s (pc + 1) (gcb_cluster_end s i) base
@@ -58132,13 +58159,18 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (base:
     (let a = rxs_sg (2 * k) in
      let b = rxs_sg (2 * k + 1) in
      if a >= 0 && b >= a then rxv_run prog s (pc + 1) i base else rxv_run prog s nopc i base)
-  | IClass (items, neg, ci) ->
-    if i < str_len s && rxv_cls items neg ci (cut_char_at s i)
+  | IClass (items, neg, ci, bits) ->
+    if i < str_len s && str_len bits == 128 && ord (char_at s i) < 128 && vec_get cut_k 0 != 2 then
+      (if ord (char_at bits (ord (char_at s i))) == 49 then rxv_run prog s (pc + 1) (i + 1) base
+       else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
+    else if i < str_len s && rxv_cls items neg ci (cut_char_at s i)
     then rxv_run prog s (pc + 1) (i + cut_clen s i) base
     else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
   | ISplit (a, b) ->
     let _ = (if vec_get rxv_dl 0 == 0 then () else rxv_clock ()) in
-    if vec_get rxv_mc 0 == 1 && vec_get rxv_mc 3 == 0 then
+    // (no cache and no memo: the usual split, asked first)
+    if vec_get rxv_imf 0 == 0 && vec_get rxv_mc 0 == 0 then (let _ = rxs_push b i in rxv_run prog s a i base)
+    else if vec_get rxv_mc 0 == 1 && vec_get rxv_mc 3 == 0 then
       (let k = pc * vec_get rxv_mc 1 + i in
        let w = k / 60 in
        let m = bit_shl 1 (k - w * 60) in
@@ -58340,6 +58372,7 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
   let _ = (if once9 then vec_set rxv_once 0 0 else ()) in
   let _ = vec_set rxv_steps 0 0 in
   let _ = vec_set rxv_steps 1 0 in
+  let _ = vec_set rxv_steps 2 0 in
   let key = rx_cut_key pat fl in
   // record this search's start offset so \G (IGANCHOR) can anchor to it.
   // rindex pins \G to ITS offset argument while attempting matches at
