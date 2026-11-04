@@ -5,6 +5,13 @@ Dir.mkdir(directory, 0700)
 path = File.join(directory, 'fileutils.rb')
 File.write(path, "require 'tmpdir_missing_fileutils_dependency'\n")
 $LOAD_PATH.unshift(directory)
+attempts = 0
+begin
+  attempts += 1
+  raise 'retry witness' if attempts < 2
+rescue RuntimeError
+  retry
+end
 begin
   require 'tmpdir'
   raise 'tmpdir swallowed a FileUtils dependency error'

@@ -1,5 +1,13 @@
 # The shipped tmpdir also works without an external Ruby installation.
 $LOAD_PATH.clear
+# A preceding rescue/retry must not make LoadError lose its path metadata.
+attempts = 0
+begin
+  attempts += 1
+  raise 'retry witness' if attempts < 2
+rescue RuntimeError
+  retry
+end
 require 'tmpdir'
 directory = nil
 result = Dir.mktmpdir('standalone-tmpdir') do |root|
