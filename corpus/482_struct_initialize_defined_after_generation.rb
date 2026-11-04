@@ -59,3 +59,47 @@ begin
 rescue ArgumentError
   puts 'custom initializer rejects excess arguments'
 end
+
+# A valid member name must not overlap interpreter initialization machinery.
+CollisionCase = Struct.new(:__struct_init, :other)
+c = CollisionCase.new(42, 43)
+p [c.public_send(:__struct_init), c.respond_to?(:__struct_init)]
+p CollisionCase.public_instance_methods(false).include?(:__struct_init)
+c.__struct_init = 44
+p c.to_a
+CollisionCase.class_eval do
+  def initialize(value, other=value)
+    super
+  end
+end
+p CollisionCase.new(45).public_send(:__struct_init)
+
+KeywordCollisionCase = Struct.new(:__struct_init, :other, keyword_init: true)
+k = KeywordCollisionCase.new(__struct_init: 46, other: 47)
+p [k.public_send(:__struct_init), k.respond_to?(:__struct_init)]
+KeywordCollisionCase.class_eval do
+  def initialize(**args)
+    super
+  end
+end
+p KeywordCollisionCase.new(__struct_init: 48).to_a
+class KeywordCollisionChild < KeywordCollisionCase
+  def initialize(**args)
+    super
+  end
+end
+p KeywordCollisionChild.new(__struct_init: 49).public_send(:__struct_init)
+
+OwnMethodCase = Struct.new(:value) do
+  def initialize(value)
+    super(value + 1)
+  end
+  def __struct_init(*)
+    raise 'user method must not be used for member initialization'
+  end
+end
+p OwnMethodCase.new(50).value
+plain = Struct.new(:value)
+p plain.private_instance_methods(false).include?(:__struct_init)
+GC.start
+p [CollisionCase.new(51).to_a, KeywordCollisionCase.new(__struct_init: 52).to_a]

@@ -43,6 +43,7 @@ type Expr = EInt of int | EBig of str | ERat of str * str | EImag of int | EImag
           // M3 object model:
           | ESym of str          // :name
           | ESelf                // self
+          | EStructInit          // generated Struct member initialization; never parsed
           | EConst of str        // a capitalized name (a class reference)
           | EConstOrNil of str   // a const read that yields nil when undefined
           | EScopedAssign of Expr * str * Expr  // recv::Const = value (runtime recv)
@@ -249,6 +250,10 @@ type Val = VInt of int | VFlt of float | VStr of int | VBool of bool
 // params with `= default`), and body. Stored in the methods table (a
 // Map[str, Meth]) keyed by bare name (top-level) or "Class#name".
 type Meth = Meth of str list * (str * Expr) list * Stmt list;
+
+// Generated initializers are class metadata, outside Ruby's method namespace.
+// Their AST holds no Ruby object handles; gc_sweep_structs drops dead classes.
+let struct_initializers = map_new ();
 
 // Statement execution result: FNext carries the statement's value (so a
 // method's implicit return is its last statement's value); FReturn is a
@@ -1377,13 +1382,14 @@ let gc_sweep_structs = fn world -> fn live -> fn (nc: bool) ->
        let _ = gc_purge_cls dm_closenv dead in
        let _ = gc_purge_cls vis_marks dead in
        let _ = gc_purge_cls struct_gen dead in
+       let _ = gc_purge_cls struct_initializers dead in
        let _ = gc_purge_cls struct_mem dead in
        let _ = gc_purge_cls anon_name dead in
        let _ = mro_bump () in
        if nc then ()
        else (let _ = map_compact meths in let _ = map_compact sup in let _ = map_compact meth_src in
              let _ = map_compact privates in let _ = map_compact vis_marks in let _ = map_compact alias_srcname in
-             let _ = map_compact struct_gen in let _ = map_compact struct_mem in map_compact anon_name))
+             let _ = map_compact struct_gen in let _ = map_compact struct_initializers in let _ = map_compact struct_mem in map_compact anon_name))
   };
 let gc_collect = fn env -> fn world ->
   region GCC {
@@ -1920,6 +1926,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   if map_len hook_flags > 0 && tp_hook_on () && tp_traced env world e then eval_tp env world blk e
   else if map_len hook_flags > 0 && tp_enum_each env world e then eval_tp_enum_each env world blk e else
   match e with
+  | EStructInit -> struct_initialize_members env world blk
   | ESplat inner -> eval_e env world blk inner   // bare splat: evaluate inner
   // `**h` reaching HERE means no list-level walker took it. eval_args and
   // hsh_eval_items intercept the marker and splice the hash's pairs -- but
@@ -29009,30 +29016,16 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                         | Nil -> e3
                         | Cons (p3, _) -> (let ch3 = lv_child e3 in let _ = brk_carry e3 ch3 in
                                            let _ = lv_set ch3 p3 (VClass anon) in ch3)) in
-             // ⚠ AN #initialize IN THE BLOCK REPLACED THE MEMBER INITIALIZER.
-             //   struct_build installs the generated one on the class itself,
-             //   so `Struct.new(:json) { def initialize(j) super(j.to_s) end }`
-             //   -- json's JSON::Fragment, verbatim -- overwrote it, and the
-             //   `super` went up to Struct and died "given 1, expected 0".
-             //   In ruby the member initializer is Struct's, one level up.
-             //   When the block defines its own, the generated one moves to
-             //   #__struct_init and Struct#initialize forwards to it, which is
-             //   the shape struct_build already uses for a parent that
-             //   defines #initialize.
+             // The generated initializer is already retained in class
+             // metadata. A block may replace #initialize without consuming
+             // a Ruby method name for its backing implementation.
              let (m3, _, _, _) = world in
              let ik3 = anon ++ "#initialize" in
              let gen3 = (if map_has m3 ik3 then Cons (map_get m3 ik3, Nil) else Nil) in
              let _ = (match gen3 with Cons (_, _) -> del_meth m3 ik3 | Nil -> ()) in
              let _ = flow_value (register_class_blk world anon bb3 bcref e3b) in
              let _ = (match gen3 with
-                      | Cons (g3, _) ->
-                        (if map_has m3 ik3 then
-                           (let _ = set_meth m3 (anon ++ "#__struct_init") g3 in
-                            if map_has m3 "Struct#initialize" then ()
-                            else set_meth m3 "Struct#initialize"
-                                   (Meth (Cons ("*__sa", Nil), Nil,
-                                          Cons (SReturn (EMethod (ESelf, "__struct_init", Cons (ESplat (EVar "__sa"), Nil))), Nil))))
-                         else set_meth m3 ik3 g3)
+                      | Cons (g3, _) -> (if map_has m3 ik3 then () else set_meth m3 ik3 g3)
                       | Nil -> ()) in
              VClass anon)
           | other -> other)
@@ -43396,6 +43389,18 @@ and is_struct_obj_cls = fn world -> fn (c: str) ->
 
 
 
+// This instruction only occurs in Struct's generated base initializer.
+// Bind the retained member parameters in its existing frame: using an
+// ordinary method call would collide with member accessors or user methods.
+and struct_initialize_members = fn env -> fn world -> fn blk ->
+  let recv9 = lv_get env "self" in
+  let owner9 = struct_members_cls world (ancestors_of world (dispatch_cls_of world recv9)) in
+  let args9 = (match lv_get env "__args" with VArr id9 -> deref id9 | _ -> Nil) in
+  match map_get struct_initializers owner9 with
+  | Meth (params9, defaults9, body9) ->
+    (let _ = bind_params_m env world blk "initialize" params9 defaults9 args9 in
+     flow_value (run_stmts env world blk body9))
+
 // `parent` is the class the generated struct inherits from. It is `Struct` for
 // `Struct.new(:a)` and the RECEIVER for `class SubX < Struct; end;
 // SubX.new(:a)` -- ruby lets any memberless descendant of Struct generate one,
@@ -43445,11 +43450,10 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
   let init_owner9 = lookup_anc world (ancestors_of world (if str_eq parent "" then "Struct" else parent)) "initialize" in
   let parent_inits9 = (if str_eq init_owner9 "" || str_eq init_owner9 "Struct" then false
                        else obj_is_a world init_owner9 "Struct") in
-  let init_key9 = (if parent_inits9 then anon ++ "#__struct_init" else anon ++ "#initialize") in
   let _ = (if (if map_has meths "Struct#initialize" then false else true) then
              (let _ = set_meth meths "Struct#initialize"
                (Meth (Cons ("*__sa", Nil), Nil,
-                      Cons (SReturn (EMethod (ESelf, "__struct_init", Cons (ESplat (EVar "__sa"), Nil))), Nil))) in
+                      Cons (SReturn EStructInit, Nil))) in
               mark_vis_mode meths "Struct" (Cons ("initialize", Nil)) "private")
            else ()) in
   // ⚠ ruby's Struct#initialize takes (*args) and says in its OWN words what
@@ -43458,7 +43462,7 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
   //   and takes a positional Hash as its keywords. Keyword parameters on the
   //   generated method answered the binder's messages instead, and refused
   //   `K.new({name: "x"})` outright.
-  let _ = set_meth meths init_key9
+  let member_init9 =
             (if kw then Meth (Cons ("*__sa", Cons ("**__kw", Nil)), Nil,
                               Cons (SReturn (EMethod (ESelf, "__struct_kw_init", Cons (EVar "__sa", Cons (EVar "__kw", Nil)))), Nil))
              // Positional members default to nil: Struct.new(:a, :b).new takes
@@ -43468,9 +43472,8 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
                                           Cons (SExpr (ERaise (Cons (EConst "ArgumentError", Cons (EStrL "struct size differs", Nil)))), Nil)), Nil),
                                    Nil),
                               struct_init_body members 0))) in
-  let _ = (if parent_inits9 then ()
-           else set_meth meths (anon ++ "#__struct_init") (map_get meths init_key9)) in
-  let _ = mark_vis_mode meths anon (Cons ("__struct_init", Nil)) "private" in
+  let _ = map_set struct_initializers anon member_init9 in
+  let _ = (if parent_inits9 then () else set_meth meths (anon ++ "#initialize") member_init9) in
   let toa = Cons (SReturn (EArr (struct_ivar_reads members)), Nil) in
   let _ = set_meth meths (anon ++ "#to_a") (Meth (Nil, Nil, toa)) in
   let _ = set_meth meths (anon ++ "#to_ary") (Meth (Nil, Nil, toa)) in
