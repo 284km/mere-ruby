@@ -327,6 +327,16 @@ type RInst = IChar of str | IByte of int | ICharCI of str | IAny | IAnyNL
 type RxRes = RFound of int * (int * int) list | RFail;
 type RxHit = RHit of int * int * (int * int) list | RNoHit | RBadPat;
 // a parse's capturing groups by number, for the subroutines \g<x> calls
+// the search before's pattern and what was looked up for it (rxv_search):
+// "p" "f" "e" its pattern, flags and cut encoding, "r" the required bytes,
+// "b" the start set; [valid, cut kind, cache allowed, key handle]; the program
+let rxv_ls = map_new ();
+let rxv_li = vec_new ();
+let _ = vec_push rxv_li 0;
+let _ = vec_push rxv_li 0;
+let _ = vec_push rxv_li 0;
+let _ = vec_push rxv_li 0;
+let rxv_lp = vec_new ();
 let rx_gnodes = map_new ();
 let _ = map_compact rx_gnodes;  // (its own arena: gc_churn_bytes, note 441)
 // ...and the groups a program being compiled calls
@@ -1428,6 +1438,15 @@ let gc_collect = fn env -> fn world ->
     let live = map_new () in
     let _ = gc_mark_roots env live in
     let _ = gc_fixpoint ivars live in
+    // (a MatchData still a record holds its subject and its pattern key by
+    //  handle: what its ivars would have kept, for the ones that are live --
+    //  strings point at nothing, so no further fixpoint pass is needed)
+    let _ = map_iter md_lz_ix (fn (id: int) -> fn (o: int) ->
+      if map_has live (id * 8) then
+        (let _ = gc_mark_val live (VStr (vec_get md_lz_v (o + 3))) in
+         let kh9 = vec_get md_lz_v (o + 4) in
+         if kh9 >= 0 then gc_mark_val live (VStr kh9) else ())
+      else ()) in
     let _ = gc_sweep_captured live in
     let _ = gc_sweep_structs world live nc in
     // THE PROCS NOTHING REACHED (the VProc arm of gc_mark_val marks the ones
@@ -1525,6 +1544,13 @@ let gc_collect = fn env -> fn world ->
       if map_has live (k * 8) then () else vec_push dMW k) in
     let _ = gc_drop_i md_whole dMW in
     let _ = (if nc then () else map_compact md_whole) in
+    // ...and the records of the ones nothing reached, then the slab moved down
+    // over what they held
+    let dLZ = vec_new () in
+    let _ = map_iter md_lz_ix (fn (k: int) -> fn (o: int) ->
+      if map_has live (k * 8) then () else vec_push dLZ k) in
+    let _ = gc_drop_i md_lz_ix dLZ in
+    let _ = md_lz_compact () in
     let dAK = vec_new () in
     let _ = map_iter arr_store (fn (k: int) -> fn (xs: Val list) ->
       if map_has live (k * 8 + 2) then () else vec_push dAK k) in
@@ -2390,8 +2416,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           // none of them took part) is nil, as for $1
           else if str_eq k "+" then
             (if truthy (rx_md_get ()) && truthy (eval_e env world blk (EVar name)) then mkstr "global-variable" else VNil)
-          else if str_len k == 1 && k >= "1" && k <= "9" then
-            (if map_has globals k && truthy (map_get globals k) then mkstr "global-variable" else VNil)
+          // ($1.. are views on `$~` too: defined when that group took part)
+          else if str_len k >= 1 && all_digits k 0 && (if str_eq k "0" then false else true) then
+            (if truthy (rx_md_get ()) && truthy (eval_e env world blk (EVar name)) then mkstr "global-variable" else VNil)
           else if map_has globals k then mkstr "global-variable" else VNil)
        else if str_len name >= 2 && str_eq (substring name 0 2) "@@" then
          let (m2, s2, o2, iv2) = world in
@@ -2981,9 +3008,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        if str_eq k "=" && (if map_has globals "=" then false else true) then VBool false
        else
        // $& / $` / $' are views on the last match, which is what $~ holds.
-       if str_eq k "~" then rx_md_get ()
+       if str_eq k "~" then md_cur world
        else if (str_eq k "&" || str_eq k "`" || str_eq k "'") then
-         (match rx_md_get () with
+         (match md_cur world with
           | VObj mid ->
             (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
              if str_eq k "&" then invoke_val_c env world nb (VObj mid) "[]" (Cons (VInt 0, Nil)) false
@@ -2994,7 +3021,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // have participated: `"xy" =~ /(x)(a)?(y)/` leaves $+ as "y" while
        // group 2 is nil. It answered nil for every match.
        else if str_eq k "+" then
-         (match (rx_md_get ()) with
+         (match (md_cur world) with
           | VObj mid ->
             (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
              let n9 = (match invoke_val_c env world nb (VObj mid) "size" Nil false with VInt n -> n | _ -> 1) in
@@ -3009,7 +3036,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // than living in slots of their own -- which is what lets a call save
        // and restore ONE global instead of ten.
        else if str_len k >= 1 && all_digits k 0 && (if str_eq k "0" then false else true) then
-         (match (rx_md_get ()) with
+         (match (md_cur world) with
           | VObj mid ->
             (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
              invoke_val_c env world nb (VObj mid) "[]" (Cons (VInt (int_of_str k), Nil)) false)
@@ -3571,6 +3598,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if ((str_len name == 4 && str_eq name "send") || (str_len name == 8 && str_eq name "__send__") || (str_len name == 11 && str_eq name "public_send"))
             && (if map_has meths name then false else true)
             && (if user_defines_send world (if lv_has env "self" then lv_get env "self" else VMain) name then false else true) then
+      ps_frame (str_len name == 11 && str_eq name "public_send") (fn (u: unit) ->
       (let recv = if lv_has env "self" then lv_get env "self" else VMain in
        let vis = (str_len name == 11 && str_eq name "public_send") in
        let m = send_name_arg env world args in
@@ -3580,7 +3608,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // (main.using, private, reached by send: see do_using_main)
        else if (str_len m == 5 && str_eq m "using") && (if vis then false else true)
                && (match recv with VMain -> true | _ -> false) then do_using_main env world rest
-       else invoke_val_c env world blk recv m rest vis)
+       else invoke_val_c env world blk recv m rest vis))
     // enum_for(:m) / to_enum(:m): an Enumerator that drives self.m on #each.
     else if ((str_len name == 8 && str_eq name "enum_for") || (str_len name == 7 && str_eq name "to_enum")) && (if map_has meths name then false else true) then
       // `to_enum(:m, a, b)` records a and b: they are the arguments the
@@ -4088,6 +4116,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        if ((str_len name == 4 && str_eq name "send") || (str_len name == 8 && str_eq name "__send__") || (str_len name == 11 && str_eq name "public_send"))
           && (if user_defines_send world recv name then false else true) then
          // public_send respects visibility; send/__send__ bypass it.
+         ps_frame (str_len name == 11 && str_eq name "public_send") (fn (u: unit) ->
          let vis = (str_len name == 11 && str_eq name "public_send") in
          let m = send_name_arg env world args in
          let rest = (match args with Cons (_, r) -> r | Nil -> Nil) in
@@ -4096,7 +4125,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           // (main.using, private, reached by send: see do_using_main)
           else if (str_len m == 5 && str_eq m "using") && (if vis then false else true)
                   && (match recv with VMain -> true | _ -> false) then do_using_main env world rest
-          else invoke_val_c env world blk recv m rest vis)
+          else invoke_val_c env world blk recv m rest vis))
        // ⚠ a class that DEFINES #respond_to? answers with it, and with whatever
        // it returns: this arm used to answer for every receiver, so an override
        // was reached only through the internal probe (which reads it for
@@ -13927,6 +13956,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               && (match (if map_has globals ";" then map_get globals ";" else VNil) with VNil -> false | _ -> true)
               && deprecation_says ()
            then rb_warn world "$; is set to non-nil value" else ()) in
+  // ...and split by a Regexp leaves `$~` nil -- its last search found
+  // nothing (rb_reg_search past the end); by a String it is left alone
+  let _ = (if (str_len name == 5 && str_eq name "split") && (match recv with VStr _ -> true | _ -> false)
+              && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false)
+           then rx_md_set VNil else ()) in
   // (transform_keys! / transform_values! are yielders too, when given
   // nothing -- `frozen.transform_keys!` is an Enumerator; with a mapping Hash
   // they write at once and refuse here)
@@ -13945,6 +13979,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      && (if delete_is_noop env world recv name args then false else true)
      && (if arr_mut_arity_wrong recv name args then false else true) then
     raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect env world recv) (Cons (("__recv", recv), Nil))
+  // (...and a regexp that is not frozen has been initialized all the same:
+  //  rb_reg_initialize_m refuses after the frozen check -- a literal is a
+  //  FrozenError, which Regexp#initialize itself raises further on, and
+  //  `Regexp.new("x").send(:initialize, "y")` this)
+  else if (str_len name == 10 && str_eq name "initialize") && (match recv with VRegex _ -> true | _ -> false)
+          && (if val_is_frozen recv then false else true) then
+    raise_exc world "TypeError" "already initialized regexp"
   else
   // an active refinement (`using M`, M refining this receiver's class or an
   // ancestor) wins over builtins and base methods, per Ruby's refinement
@@ -15817,7 +15858,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // a singleton method defined on this exact String/Array/Hash wins.
   let hk = hng_key recv in
   if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) name then
-    invoke world noblk recv (map_get hng_store hk) name args
+    // (with an explicit receiver its visibility holds, as for any object's:
+    //  main's -- `singleton_class.class_eval { private def m; end }` -- was
+    //  callable as `main_ref.m`, and so through `&:m`)
+    (let sc9 = map_get hng_store hk in
+     let refused9 = (if vischeck && meth_private world sc9 name then "private"
+                     else if vischeck && meth_protected world sc9 name && (if protected_ok_m env world sc9 name then false else true) then "protected"
+                     else "") in
+     if str_eq refused9 "" then invoke world noblk recv sc9 name args
+     else raise_exc_iv world "NoMethodError" (refused9 ++ " method '" ++ name ++ "' called for " ++ (match recv with VMain -> "main" | _ -> "#<" ++ class_name recv ++ ":0x" ++ hex_pad16 (val_hash recv) ++ ">"))
+            (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
   // an alias-to-builtin (`alias_method :plus, :+`) delegates under the source
   // builtin name: a binary operator goes through arith_bin (prim_method has no
   // "+"), everything else through prim_method.
@@ -18383,7 +18433,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // Regexp.last_match / .last_match(n): the same MatchData `$~` holds, which
     // is how a `method =~ /re/` test reads its capture afterwards.
     else if str_eq c "Regexp" && (str_len name == 10 && str_eq name "last_match") then
-      (let md = (rx_md_get ()) in
+      (let md = (md_cur world) in
        match args with
        | Cons (ix, rest9) ->
          (match rest9 with
@@ -21893,6 +21943,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else if str_eq mnm "binding" && (str_eq mown "Kernel" || str_eq mown "")
                   && (if has_meth world (dispatch_cls_of world mrecv) "binding" then false else true) then
             raise_exc world "RuntimeError" "Cannot create Binding object for non-Ruby caller"
+          // (Kernel#eval called as a Method reads the CALLER's frame, as
+          //  rb_f_eval does: `method(:eval).call("def m; end")` in a class body
+          //  defines m on that class. Taken on the caller's own self it is the
+          //  bare eval; on a class it was a NoMethodError, the class-method
+          //  dispatcher having no eval.)
+          else if str_eq mnm "eval" && (str_eq mown "Kernel" || str_eq mown "")
+                  && (if has_meth world (dispatch_cls_of world mrecv) "eval" then false else true)
+                  && rb_identical mrecv (if lv_has env "self" then lv_get env "self" else VMain) then
+            do_eval env world blk args
           else
          match mrecv with
           | VMain -> (if (let (m8, _, _, _) = world in map_has m8 mnm) then call_method (env_as_main env) world blk mnm args else invoke_val_c env world blk VMain mnm args false)
@@ -21956,7 +22015,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             // makes for an ordinary call
             else if str_eq mown "Kernel" then
               (let _ = map_set bm_bypass "k" VNil in
-               let r9 = try_or (fn (u: unit) -> FNext (invoke_val_c env world blk mrecv mnm args false)) (FRaise VNil) in
+               // (Kernel#warn reads its self: bound to the Warning module it
+               //  writes the text itself instead of calling Warning.warn)
+               let env9 = (if str_eq mnm "warn" then (let e9 = lv_flat env in let _ = map_set e9 "self" mrecv in e9) else env) in
+               let r9 = try_or (fn (u: unit) -> FNext (invoke_val_c env9 world blk mrecv mnm args false)) (FRaise VNil) in
                let _ = map_delete bm_bypass "k" in
                match r9 with
                | FNext v9 -> v9
@@ -22264,6 +22326,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                raise_exc_iv world "LocalJumpError"
                  (if ibreak_val v then "unexpected break" else "break from proc-closure")
                  (Cons (("__exit_value", (if ibreak_val v then VNil else v)), Cons (("__reason", VSym "break"), Nil)))
+             // ...a yielder #each made unwinds to that #each, which answers
+             // the break's value (`Enumerator.new { |y| y << 1 }.each { break 9 }`
+             // is 9). A flow, not an exception: the generator's own `loop` or
+             // `rescue` must not catch it -- StopIteration was caught by both,
+             // and outside them it escaped #each as an error.
+             | FBreak v when map_has ivars (str_of_int id ++ "@__y_brkt") ->
+               (match map_get ivars (str_of_int id ++ "@__y_brkt") with
+                | VInt t9 -> (let _ = flow_throw_breakret t9 v in VNil)
+                | _ -> VNil)
              | FBreak v -> raise_exc world "StopIteration" "iteration reached an end"
              | FNext r -> (if (str_len name == 2 && str_eq name "<<") then recv else r)
              | other -> (if (str_len name == 2 && str_eq name "<<") then recv else flow_value other))
@@ -25274,7 +25345,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // (with main as their self: `TOPLEVEL_BINDING.receiver.send(:m)` from
     //  inside another object's method ran m with that object as self)
     let (meths, sup, ocls, ivars) = world in
-    if map_has meths name then call_method (env_as_main env) world noblk name args
+    // (a top-level def is a PRIVATE method of Object: `main = self; main.m`
+    //  -- an explicit receiver other than `self` -- is refused, as it is for
+    //  any other object, and so is `&:m` reaching it)
+    if map_has meths name && vischeck && meth_private world "Object" name then
+      raise_exc_iv world "NoMethodError" ("private method '" ++ name ++ "' called for main")
+        (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
+    else if map_has meths name then call_method (env_as_main env) world noblk name args
     // `define_singleton_method(:m, a_proc)` on main: a top-level method, as
     // the block form and `def self.m` make (it was "undefined method")
     else if (str_len name == 23 && str_eq name "define_singleton_method")
@@ -25682,7 +25759,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       | _ -> false) ->
             arr_new (Cons (arr_new (Cons (VSym "req", Nil)),
                            Cons (arr_new (Cons (VSym "rest", Nil)), Nil)))
-          | ps1 -> arr_new (param_meta_of is_lam ps1 (block_defaults body))))
+          | ps1 -> arr_new (param_kw_order (param_meta_of is_lam ps1 (block_defaults body)))))
     else if (str_len name == 5 && str_eq name "arity") && map_has proc_arity (str_of_int pid) then
       map_get proc_arity (str_of_int pid)
     else if (str_len name == 5 && str_eq name "arity") then
@@ -27974,7 +28051,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     invoke_with_block env world blk recv (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) name) args newblk0
   else if str_len name == 5 && str_eq name "match" && rx_own_match world recv args then rx_own_match_call env world blk recv args newblk
   else if rx_sub_args_needed world recv name args then invoke_with_block env world blk recv name (rx_sub_args world args) newblk
-  else if bi_frameless world recv name
+  else if bi_frameless world recv name || gen_routed world recv name args newblk
   then invoke_with_block0 env world blk recv name args newblk
   else with_builtin_frame world recv name (fn (u: unit) -> invoke_with_block0 env world blk recv name args newblk)
 // ⚠ WHICH VALUES ONE YIELD GAVE TOGETHER. Ruby spreads them over a lambda's
@@ -28108,6 +28185,11 @@ and bi_meth_call = fn env -> fn world -> fn blk -> fn (id: int) -> fn (mnm: str)
   //  frozen check, never the override)
   | (VObj _, (false, _, _, _)) when str_eq mnm "initialize_copy" -> kernel_copy_hook env world mrecv mnm args
   | (VObj _, (false, _, _, _)) when bi_via_super mnm -> super_missing world blk mrecv mnm args
+  // (Kernel#warn is the builtin with the receiver as its self -- bound to the
+  //  Warning module, it writes the text instead of calling Warning.warn,
+  //  which is what an override of Warning.warn reaches through super)
+  | (_, (false, _, _, _)) when str_eq mnm "warn" && str_eq (bi_meth_own world id) "Kernel" ->
+    (let e9 = lv_flat env in let _ = map_set e9 "self" mrecv in kernel_warn e9 world args)
   | (VObj _, _) -> skip9 ()
   | (_, (true, _, _, _)) -> skip9 ()
   | _ -> invoke_val_c env world blk mrecv (bi_meth_name world (bi_meth_own world id) mnm) args false
@@ -28192,11 +28274,12 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
            && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false)
         // an unwrapped send BYPASSES visibility (public_send keeps it),
         // exactly as the blockless send arm does.
-        then (let vis2 = (str_len name == 11 && str_eq name "public_send") in
+        then ps_frame (str_len name == 11 && str_eq name "public_send") (fn (u: unit) ->
+             (let vis2 = (str_len name == 11 && str_eq name "public_send") in
               let m2 = send_name_arg env world args in
               let rest2 = (match args with Cons (_, r) -> r | Nil -> Nil) in
               let _ = (if vis2 then public_send_guard world recv m2 else ()) in
-              invoke_val_c env world blk recv m2 rest2 vis2)
+              invoke_val_c env world blk recv m2 rest2 vis2))
         // vischeck TRUE: this path is reached with an explicit receiver (a
         // bare call's own methods were dispatched by the caller), and a
         // forwarded private call must refuse -- `def foo(...) = @o.foo(...)`
@@ -28213,6 +28296,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
     if ((str_len name == 4 && str_eq name "send") || (str_len name == 8 && str_eq name "__send__") || (str_len name == 11 && str_eq name "public_send"))
        && (if user_defines_send world recv name then false else true)
        && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
+      ps_frame (str_len name == 11 && str_eq name "public_send") (fn (u: unit) ->
       (let vis3 = (str_len name == 11 && str_eq name "public_send") in
        let m3 = send_name_arg env world args in
        let rest3 = (match args with Cons (_, r) -> r | Nil -> Nil) in
@@ -28227,7 +28311,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // ...and so is the builtin (private) Enumerator#initialize
        else if (if vis3 then false else true) && (if str_eq (enum_init_cls world recv m3) "" then false else true)
        then enum_init env world recv (enum_init_cls world recv m3) rest3 newblk
-       else invoke_with_block env world blk recv m3 rest3 newblk)
+       else invoke_with_block env world blk recv m3 rest3 newblk))
     else
     // the block path skips invoke_val_c's argument conversion, so the string
     // methods that duck-type their arguments convert here too.
@@ -28325,10 +28409,11 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        | other -> (let _ = flow_value other in recv))
     // recv.send(:m, args) { block } — forward the block to the sent method.
     else if ((str_len name == 4 && str_eq name "send") || (str_len name == 8 && str_eq name "__send__") || (str_len name == 11 && str_eq name "public_send")) && (if user_defines_send world recv name then false else true) && (match args with Cons (_, _) -> true | _ -> false) then
+      ps_frame (str_len name == 11 && str_eq name "public_send") (fn (u: unit) ->
       (let m3 = send_name_arg env world args in
        let rest3 = (match args with Cons (_, r) -> r | Nil -> Nil) in
        let _ = (if (str_len name == 11 && str_eq name "public_send") then public_send_guard world recv m3 else ()) in
-       ub_skip_run (fn (u: unit) -> invoke_with_block env world blk recv m3 rest3 newblk))
+       ub_skip_run (fn (u: unit) -> invoke_with_block env world blk recv m3 rest3 newblk)))
     // `UnboundMethod#bind_call(obj, ...) { }`: bind, then the Method's #call
     // below with the block. The plain dispatcher's bind_call has no block to
     // hand on, so a method that yields raised "no block given".
@@ -28570,7 +28655,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                // ...and #each answers what the GENERATOR block answered, as
                // ruby's does (`Enumerator.new { |y| y << 1; :ret }.each { }` is
                // :ret) -- which is also StopIteration#result at the end of #next
-               flow_value (run_block world blk (proc_get (str_of_int gpid)) (Cons (VObj yid, Nil)))
+               gen_run_brk world blk gpid yid
              | _ -> VNil)
           else
           let recv2 = (if map_has ivars0 (str_of_int id ++ "@recv") then map_get ivars0 (str_of_int id ++ "@recv") else VNil) in
@@ -28717,7 +28802,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                    let yid = alloc_oid ocls9 in
                    let _ = map_set ocls9 yid "Enumerator::Yielder" in
                    let _ = map_set iv9 (str_of_int yid ++ "@__y_blk") (VProc bpid) in let _ = map_set iv9 (str_of_int yid ++ "@__y_thr") (VInt (sch_me ())) in
-                   flow_value (run_block world blk (proc_get (str_of_int gpid)) (Cons (VObj yid, Nil))))
+                   gen_run_brk world blk gpid yid)
                 | _ -> VNil)
              else
              // Anything else (a produce form) is materialised and walked as pairs.
@@ -28800,6 +28885,11 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                       || (str_len name == 6 && str_eq name "detect") || (str_len name == 10 && str_eq name "find_index")) then
             invoke_with_block env world blk recv
               (if (str_len name == 6 && str_eq name "detect") then "__gen_find" else "__gen_" ++ name) Nil newblk
+          // a plain Enumerator given a block walks its #each (see __gen_map)
+          else if (let (hb9, _, _, _) = newblk in hb9)
+                  && (let (_, _, ocg, _) = world in str_eq (map_get ocg id) "Enumerator")
+                  && (let g9 = gen_stream_name name in str_len g9 > 0 && gen_stream_args_ok g9 args) then
+            invoke_with_block env world blk recv ("__gen_" ++ gen_stream_name name) args newblk
           else
             invoke_with_block env world blk (enum_to_arr env world blk id) (if (str_len name == 10 && str_eq name "with_index") then "each_with_index" else name) args newblk)
        | _ -> VNil)
@@ -29539,11 +29629,13 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           | VStr s -> let se9 = senc_get s in let s = sget s in
             (match args with
              | Cons (VRegex (pat, pf, _), _) ->
-               let _ = rx_scan_blk world newblk pat pf s 0 se9 in
-               let _ = rb_scan_lastpub world pat pf s se9 in recv
+               (match rx_scan_blk world newblk pat pf s 0 se9 with
+                | FNext _ -> (let _ = rb_scan_lastpub world pat pf s se9 in recv)
+                | f9 -> iter_each_result f9 recv)
              | Cons (VStr p, _) ->
-               let _ = rx_scan_blk world newblk (rx_escape (sget p)) "" s 0 se9 in
-               let _ = rb_scan_lastpub world (rx_escape (sget p)) "" s se9 in recv
+               (match rx_scan_blk world newblk (rx_escape (sget p)) "" s 0 se9 with
+                | FNext _ -> (let _ = rb_scan_lastpub world (rx_escape (sget p)) "" s se9 in recv)
+                | f9 -> iter_each_result f9 recv)
              | _ -> builtin_iter world blk newblk recv name args)
           | _ -> recv)
        // ⚠ `send(:lambda) { }` / `send(:proc) { }` / `send(:loop) { }`: these
@@ -31292,7 +31384,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                      then (let _ = cut_set e in let it9 = rx_scan_all2 pat pf sv 0 in let _ = cut_set "UTF-8" in it9)
                      else rx_scan_all2 pat pf sv 0) in
         let _ = rb_scan_lastpub world pat pf sv (senc_get h) in
-        arr_new (rb_scan_tag items e))
+        // (the pieces are new strings, untagged, and an untagged string IS
+        //  UTF-8: for a UTF-8 receiver there is nothing to tag, and walking
+        //  the list to tag it was two thirds of a scan of 40,000 words)
+        arr_new (if str_eq e "UTF-8" then items else rb_scan_tag items e))
      | _ -> VNil)
   // String#index/rindex/byteindex/byterindex/partition/rpartition with a
   // Regexp: search (with a character offset where one is taken), publish $~
@@ -31328,13 +31423,13 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         //   No match is nil before the capture is looked at, as in ruby.
         (match args with
          | Cons (_, Cons (cap9, _)) ->
-           (match (rx_md_get ()) with
+           (match (md_cur world) with
             | VNil -> VNil
             | md9 -> invoke_val_c env world blk md9 "[]" (Cons (cap9, Nil)) false)
          // (the value is the match just published: asking the prim again
          //  searched a second time, cutting as UTF-8 whatever the receiver)
          | _ ->
-           (match (rx_md_get ()) with
+           (match (md_cur world) with
             | VNil -> VNil
             | md9 -> invoke_val_c env world blk md9 "[]" (Cons (VInt 0, Nil)) false)))
      | _ -> VNil)
@@ -31405,14 +31500,14 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   else if (str_len name == 5 && str_eq name "match") && (match recv with VStr _ -> true | VRegex _ -> true | VSym _ -> true | _ -> false) then
     (let hit = (fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (enc: str) ->
                   let _ = rx_do_match_atp world p pf sv 0 enc false in
-                  rx_md_get ()) in
+                  md_cur world) in
      // the same, from a BYTE offset into the WHOLE subject -- see
      // rx_do_match_at: the subject stays whole so #begin is the real one.
      // Neither wants the character position: they read $~, which carries the
      // span in bytes and converts only if someone asks for #begin.
      let hit_at = (fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (b: int) -> fn (enc: str) ->
                   let _ = rx_do_match_atp world p pf sv b enc false in
-                  rx_md_get ()) in
+                  md_cur world) in
      match recv with
      // ...and #match, for the same reason.
      | VSym s -> invoke_val_c env world blk (mkstr s) name args false
@@ -31871,9 +31966,9 @@ and bm_params = fn world -> fn (owner0: str) -> fn (nm: str) ->
      //  Proc does, with no names: its stand-in's parameters leaked)
      | Meth (ps, _, _) when sym_ps_shape ps ->
        arr_new (Cons (arr_new (Cons (VSym "req", Nil)), Cons (arr_new (Cons (VSym "rest", Nil)), Nil)))
-     | Meth (ps, ds, _) -> arr_new (param_meta_of true ps ds))
+     | Meth (ps, ds, _) -> arr_new (param_kw_order (param_meta_of true ps ds)))
   else if map_has meths nm then
-    (match map_get meths nm with Meth (ps, ds, _) -> arr_new (param_meta_of true ps ds))
+    (match map_get meths nm with Meth (ps, ds, _) -> arr_new (param_kw_order (param_meta_of true ps ds)))
   // ⚠ a BUILTIN method is not in the method table, and neither is one backed
   //   by respond_to_missing? -- this answered an EMPTY parameter list for both,
   //   which claims a method that takes nothing. ruby derives a C method's
@@ -49051,6 +49146,44 @@ and arr_count_eqq = fn world -> fn (xs: Val list) -> fn (pat: Val) -> fn (acc: i
 
 
 
+// a call the Enumerator dispatcher hands to a prelude walk (__gen_map,
+// __gen_count): the walk's own frame is the method's (Enumerable#map), so no
+// builtin frame goes under it -- that one also put the source's frames on
+// top, for the materialising walk this replaced
+and gen_routed = fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk ->
+  (let (hb9, _, _, _) = newblk in hb9)
+  && (match recv with VObj id -> (let (_, _, oc9, _) = world in str_eq (map_get oc9 id) "Enumerator") | _ -> false)
+  && ((str_len name == 5 && str_eq name "count" && (match args with Nil -> true | _ -> false))
+      || (let g9 = gen_stream_name name in str_len g9 > 0 && gen_stream_args_ok g9 args))
+// Run a generator's block with yielder `yid`. A break in the block the
+// yielder feeds unwinds here and is this call's value (see the yielder's
+// arm); the target is negative, so no method frame on the way takes it.
+and gen_run_brk = fn world -> fn blk -> fn (gpid: int) -> fn (yid: int) ->
+  let (_, _, _, ivars0) = world in
+  let brkt9 = 0 - 1000 - yid in
+  let _ = map_set ivars0 (str_of_int yid ++ "@__y_brkt") (VInt brkt9) in
+  match try_or (fn (u: unit) -> run_block world blk (proc_get (str_of_int gpid)) (Cons (VObj yid, Nil))) (FRaise VNil) with
+  | FRaise _ when map_has flow_sig "k" && map_has flow_sig "fid"
+                  && (match map_get flow_sig "k" with VStr kk -> str_eq (sget kk) "breakret" | _ -> false)
+                  && (match map_get flow_sig "fid" with VInt f9 -> f9 == brkt9 | _ -> false) ->
+    (let v9 = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+     let _ = map_clear flow_sig in
+     let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+     let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
+     let _ = if map_has prim_missing "rl" then map_delete prim_missing "rl" else () in
+     let _ = if map_has prim_missing "rd" then map_delete prim_missing "rd" else () in
+     let _ = bi_rescued () in
+     let _ = if map_has prim_missing "rbt" then map_delete prim_missing "rbt" else () in
+     let _ = if map_has prim_missing "rm" then map_delete prim_missing "rm" else () in
+     let _ = if map_has prim_missing "rf" then map_delete prim_missing "rf" else () in
+     v9)
+  | FRaise _ ->
+    (let m9 = (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h9 -> sget h9 | _ -> "mere-ruby: (ruby exception raised)")
+               else "mere-ruby: (ruby exception raised)") in
+     let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m9)) in
+     fail m9)
+  | f9 -> flow_value f9
+
 // Drive an Enumerator's source method. `to_enum(:name)` keeps working when
 // `name` is PRIVATE -- ruby's Enumerator calls it the way `send` does, and
 // `to_enum(__method__)` inside a private method is the standard shape (it is
@@ -49344,6 +49477,8 @@ and caller_args = fn env -> fn world -> fn (args: Val list) ->
 // outlives the reason.
 and caller_loc_list = fn world -> fn (i: int) ->
   if i < fb_depth_base () then (Nil : Val list)
+  // (the prelude walk's own frames are no frames of ruby's: gen_frame_hidden)
+  else if gen_frame_hidden i then caller_loc_list world (i - 1)
   else (let (f9, l9) = frame_pos i in Cons (loc_obj world f9 l9 (frame_label_at i), caller_loc_list world (i - 1)))
 
 // (the same rescue-clause frame as caller_frames_at)
@@ -51250,6 +51385,7 @@ and bo_names = fn (pre: str) -> fn (s: str) -> fn (i: int) -> fn (st: int) -> fn
 // no frame of its own: the program's methods (they push one in invoke), and
 // the calls ruby itself leaves out of a backtrace -- send re-dispatches, and
 // Proc#call / yield run the block as the caller's own call
+// (public_send pushes its own, in ps_frame, around the method it calls)
 and bi_frameless = fn world -> fn (recv: Val) -> fn (name: str) ->
   if (str_len name == 4 && (str_eq name "send" || str_eq name "call"))
      || (str_len name == 8 && str_eq name "__send__")
@@ -51324,6 +51460,24 @@ and with_builtin_frame = fn world -> fn (recv: Val) -> fn (name: str) -> fn (bod
      let _ = cd_set cd in
      let _ = map_set struct_ctr "bf" pbf in
      if ok then v else (let _ = note_extern_refused m in fail m))
+// Kernel#public_send is an ordinary C method in ruby: its frame stands between
+// the caller and the method it calls, and its own refusals ("no method name
+// given") are raised in it. (send and __send__ are re-dispatched by the VM and
+// leave no frame.) The method it calls gets a frame of its own -- a builtin
+// entered at the depth this one left ("bf") would otherwise run in it.
+and ps_frame = fn (on: bool) -> fn (body: unit -> Val) ->
+  if on then
+    (let cd = caller_depth () in
+     let pbf = (if map_has struct_ctr "bf" then map_get struct_ctr "bf" else (0 - 1)) in
+     let _ = fb_wm_call (cd - 1) in
+     let _ = bi_frame_put cd "Kernel#public_send" in
+     let _ = cd_set (cd + 1) in
+     let _ = map_set struct_ctr "bf" (0 - 1) in
+     let (ok, v, m) = try_or_msg (fn (u: unit) -> (true, body (), "")) (fn (m: str) -> (false, VNil, m)) in
+     let _ = cd_set cd in
+     let _ = map_set struct_ctr "bf" pbf in
+     if ok then v else (let _ = note_extern_refused m in fail m))
+  else body ()
 and bi_frame_put = fn (d: int) -> fn (l: str) ->
   // ⚠ the frame's own watermark starts NOW. A suspended fiber's stack is
   //   rooted by what each frame built since its current statement began
@@ -52587,13 +52741,18 @@ and protected_ok_m = fn env -> fn world -> fn (cls: str) -> fn (name: str) ->
   let own9 = lookup_anc world (ancestors_of world cls) name in
   protected_ok env world (if str_eq own9 "" then cls else own9)
 and protected_ok = fn env -> fn world -> fn (cls: str) ->
-  if lv_has env "self" then
+  // (`&:m` calls m as a public method whoever made the proc: the block the
+  //  parser writes for it binds __bp, and a protected m is refused from it)
+  if lv_has env "__bp" then false
+  else if lv_has env "self" then
     (let (meths, sup, ocls, ivars) = world in
      match lv_get env "self" with
      | VObj id -> obj_is_a world (map_get ocls id) cls
      // a CLASS self is kind_of? its own metaclass chain, which is where a
      // protected class method lives
      | VClass sc -> str_list_has (ancestors_of world ("(sng:" ++ sc ++ ")")) cls
+     // (main is a kind of its own singleton class, when it has one)
+     | VMain -> str_list_has (ancestors_of world (if map_has hng_store "main:0" then map_get hng_store "main:0" else "Object")) cls
      | _ -> false)
   else false
 
@@ -53522,7 +53681,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
            // were read, so this registered a bare name nothing could reach
            // and `$g.foo` raised NoMethodError.
            (if str_len recv > 1 && str_eq (char_at recv 0) "$" then
-              (if str_eq recv "$~" then rx_md_get ()
+              (if str_eq recv "$~" then md_cur world
                else if map_has globals (substring recv 1 (str_len recv))
                then map_get globals (substring recv 1 (str_len recv)) else VNil)
             else if str_len recv > 1 && str_eq (char_at recv 0) "@" && lv_has env "self" then
@@ -57428,6 +57587,13 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
   | NEmpty -> pc
   | NFlagsRest _ -> pc
   | NChar c -> let _ = map_set prog pc (if str_len c == 1 then IByte (ord c) else IChar c) in pc + 1
+  // (an ASCII character under /i is a class of its two cases, answered from
+  //  the byte table as any class is: ICharCI swapped the subject's case and
+  //  compared strings at every step -- /alpha|beta/i was 120 times ruby's)
+  | NCharCI c when str_len c == 1 && ord c < 128 ->
+    (let o = rxv_swapcase c in
+     let items = (if str_eq o c || (if str_len o == 1 then false else true) then Cons (CChr c, Nil) else Cons (CChr c, Cons (CChr o, Nil))) in
+     let _ = map_set prog pc (IClass (items, false, false, rxv_cls_bits items false 0 "")) in pc + 1)
   | NCharCI c -> let _ = map_set prog pc (ICharCI c) in pc + 1
   | NAny -> let _ = map_set prog pc IAny in pc + 1
   | NAnyNL -> let _ = map_set prog pc IAnyNL in pc + 1
@@ -58108,6 +58274,62 @@ and rxv_mc_size = fn prog -> match vec_get prog 0 with IMeta (n, _) -> n | _ -> 
 and rxv_call_depth = fn (u: unit) ->
   let d = rxs_sg (0 - 3) in
   if d <= 0 then 0 else d
+// a greedy one-character loop, run in place (see ISplit): leave-choices at
+// each position the body reads from, then the exit where it stops. Each
+// character is a step (rxv_tick): the split loop's steps were its pops, and a
+// loop with no choices to pop never counted toward the cache -- `/a+z/` over
+// a million a's started from each of them, a million long each time.
+and rxv_span = fn prog -> fn (s: str) -> fn (a: int) -> fn (b: int) -> fn (i: int) -> fn (base: int) ->
+  if rxv_span_poss prog a b then rxv_span_all prog s a b i base
+  else rxv_span_go prog s a b i base
+and rxv_span_go = fn prog -> fn (s: str) -> fn (a: int) -> fn (b: int) -> fn (i: int) -> fn (base: int) ->
+  let _ = rxv_tick () in
+  let j = rxv_span_step prog s a i in
+  if j < 0 then rxv_run prog s b i base
+  else (let _ = rxs_push b i in rxv_span_go prog s a b j base)
+// ...and with no choices at all when backing off cannot help: what follows
+// the loop reads one ASCII byte the body never reads, so at any shorter end
+// the byte there is the body's and not that one (Onigmo makes such a loop
+// possessive). `[a-z]+@` over a word that has no @ backed off a character at
+// a time and failed at each: quadratic in the word.
+and rxv_span_all = fn prog -> fn (s: str) -> fn (a: int) -> fn (b: int) -> fn (i: int) -> fn (base: int) ->
+  let _ = rxv_tick () in
+  let j = rxv_span_step prog s a i in
+  if j < 0 then rxv_run prog s b i base else rxv_span_all prog s a b j base
+and rxv_span_poss = fn prog -> fn (a: int) -> fn (b: int) ->
+  let rec next = fn (pc: int) ->
+    (match rxv_fetch prog pc with
+     | ISave _ -> next (pc + 1)
+     | IByte c -> c
+     | _ -> 0 - 1) in
+  let c = next b in
+  if c < 0 || c >= 128 then false
+  else
+    (match rxv_fetch prog a with
+     | IByte d -> d != c
+     | IChar _ -> true
+     | IClass (_, _, _, bits) -> str_len bits == 128 && ord (char_at bits c) != 49
+     | IAny -> c == 10
+     | _ -> false)
+// where the one-character instruction at pc leaves position i: -1 when it
+// does not match there, -2 when it is no such instruction. Each arm is
+// rxv_run's own for that instruction.
+and rxv_span_step = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int) ->
+  match rxv_fetch prog pc with
+  | IByte b -> (if i < str_len s && ord (char_at s i) == b then i + 1 else 0 - 1)
+  | IChar c -> (if i < str_len s && str_eq (char_at s i) c then i + 1 else 0 - 1)
+  | IClass (items, neg, ci, bits) ->
+    (if i < str_len s && str_len bits == 128 && ord (char_at s i) < 128 && vec_get cut_k 0 != 2 then
+       (if ord (char_at bits (ord (char_at s i))) == 49 then i + 1 else 0 - 1)
+     else if i < str_len s && rxv_cls items neg ci (cut_char_at s i) then i + cut_clen s i
+     else 0 - 1)
+  | IAny ->
+    (if i < str_len s && ord (char_at s i) < 128 && vec_get cut_k 0 != 2 then
+       (if ord (char_at s i) == 10 then 0 - 1 else i + 1)
+     else if i < str_len s && (if str_eq (char_at s i) "\n" then false else true) then i + cut_clen s i
+     else 0 - 1)
+  | IAnyNL -> (if i < str_len s then i + (if ord (char_at s i) < 128 && vec_get cut_k 0 != 2 then 1 else cut_clen s i) else 0 - 1)
+  | _ -> 0 - 2
 and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (base: int) ->
   match rxv_fetch prog pc with
   | IMatch -> RFound (i, Nil)
@@ -58189,7 +58411,21 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (base:
   | ISplit (a, b) ->
     let _ = (if vec_get rxv_dl 0 == 0 then () else rxv_clock ()) in
     // (no cache and no memo: the usual split, asked first)
-    if vec_get rxv_imf 0 == 0 && vec_get rxv_mc 0 == 0 then (let _ = rxs_push b i in rxv_run prog s a i base)
+    // ...and when it is a greedy loop over ONE character -- `\w+`, `[^,]*`,
+    // `.*`: the body a single instruction that reads one, then a jump back
+    // here -- the loop runs right here: a choice to leave at each position,
+    // as the split would have pushed, and on to the exit where the body
+    // first fails. The same choices in the same order, without dispatching
+    // split, body and jump once a character (rxv_span).
+    // (the star loop's own layout -- split, body, jump back, exit -- and
+    //  nothing else: a lazy split's first target is its exit, which may be
+    //  the program's last instruction)
+    if vec_get rxv_imf 0 == 0 && vec_get rxv_mc 0 == 0 then
+      (if a == pc + 1 && b == pc + 3
+          && (match rxv_fetch prog (a + 1) with IJmp t9 -> t9 == pc | _ -> false)
+          && rxv_span_step prog s a i != 0 - 2
+       then rxv_span prog s a b i base
+       else (let _ = rxs_push b i in rxv_run prog s a i base))
     else if vec_get rxv_mc 0 == 1 && vec_get rxv_mc 3 == 0 then
       (let k = pc * vec_get rxv_mc 1 + i in
        let w = k / 60 in
@@ -58393,26 +58629,54 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
   let _ = vec_set rxv_steps 0 0 in
   let _ = vec_set rxv_steps 1 0 in
   let _ = vec_set rxv_steps 2 0 in
-  let key = rx_cut_key pat fl in
   // record this search's start offset so \G (IGANCHOR) can anchor to it.
   // rindex pins \G to ITS offset argument while attempting matches at
   // earlier positions; the override slot ("o") carries that pin.
   let _ = map_set rx_ganchor "g" (if map_has rx_ganchor "o" then map_get rx_ganchor "o" else start) in
+  // (the same pattern as the search before -- a scan or a gsub asks once per
+  //  match -- reuses what that one looked up: the key built, the program, the
+  //  cache verdict, the required bytes and the start set were eight lookups
+  //  and two key builds a search, more than a small match itself, note 506)
+  let cute = (if vec_len cut_e > 0 then vec_get cut_e 0 else "") in
+  if vec_get rxv_li 0 == 1 && vec_get rxv_li 1 == vec_get cut_k 0
+     && str_eq (map_get rxv_ls "p") pat && str_eq (map_get rxv_ls "f") fl && str_eq (map_get rxv_ls "e") cute
+     // (the key's handle may have been collected and reused since: asked
+     //  again, as rx_key_handle asks)
+     && (vec_get rxv_li 3 < 0 || str_eq (sget (vec_get rxv_li 3)) (map_get rxv_ls "k")) then
+    rxv_search_k fl s start once9 (vec_get rxv_lp 0) (vec_get rxv_li 2 == 1) (map_get rxv_ls "r") (map_get rxv_ls "b") (vec_get rxv_li 3)
+  else
+  let key = rx_cut_key pat fl in
   if map_has rx_bad key then RBadPat
   else
     let ok = try_or (fn (u: unit) -> let _ = rxc_get pat fl in true) false in
     if ok then
-      // (and not written when it is the handle there already: every write
-      //  copies into rx_cur's region, 384 bytes per gsub)
-      (let kh9 = rx_key_handle key in
-       let _ = (if map_has rx_cur "k" && (match map_get rx_cur "k" with
-                                          | VStr o9 -> (match kh9 with VStr n9 -> o9 == n9 | _ -> false)
-                                          | _ -> false)
-                then () else map_set rx_cur "k" kh9) in
+      (let kh9 = (match rx_key_handle key with VStr h9 -> h9 | _ -> 0 - 1) in
        let prog = map_get rx_progs key in
        let ok9 = (if map_has rx_mc_ok key then map_get rx_mc_ok key == 1
                   else (let a9 = rxv_mc_allowed prog 0 (rxv_mc_size prog) in
                         let _ = map_set rx_mc_ok key (if a9 then 1 else 0) in a9)) in
+       // (no cache to bound it, and none of the characters every match holds
+       //  is left: no search -- see rxr_req)
+       let req9 = (if ok9 then "" else if map_has rx_reqs key then map_get rx_reqs key else "") in
+       let fbs9 = (if vec_get cut_k 0 == 2 then "" else rxv_fbs key prog) in
+       let _ = map_set rxv_ls "p" pat in
+       let _ = map_set rxv_ls "k" key in
+       let _ = map_set rxv_ls "f" fl in
+       let _ = map_set rxv_ls "e" cute in
+       let _ = map_set rxv_ls "r" req9 in
+       let _ = map_set rxv_ls "b" fbs9 in
+       let _ = (if vec_len rxv_lp == 0 then vec_push rxv_lp prog else vec_set rxv_lp 0 prog) in
+       let _ = vec_set rxv_li 1 (vec_get cut_k 0) in
+       let _ = vec_set rxv_li 2 (if ok9 then 1 else 0) in
+       let _ = vec_set rxv_li 3 kh9 in
+       let _ = vec_set rxv_li 0 1 in
+       rxv_search_k fl s start once9 prog ok9 req9 fbs9 kh9)
+    else (let _ = map_set rx_bad key VNil in RBadPat)
+and rxv_search_k = fn (fl: str) -> fn (s: str) -> fn (start: int) -> fn (once9: bool) -> fn prog -> fn (ok9: bool) -> fn (req9: str) -> fn (fbs9: str) -> fn (kh9: int) ->
+  // (and not written when it is the handle there already: every write
+  //  copies into rx_cur's region, 384 bytes per gsub)
+  let _ = (if map_has rx_cur "k" && (match map_get rx_cur "k" with VStr o9 -> o9 == kh9 | _ -> false)
+           then () else (if kh9 >= 0 then map_set rx_cur "k" (VStr kh9) else ())) in
        let _ = vec_set rxv_mc 0 0 in
        let _ = vec_set rxv_mc 1 (str_len s + 1) in
        let _ = vec_set rxv_mc 2 (rxv_mc_size prog) in
@@ -58432,9 +58696,6 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
        // the last of the four quadratics in CSV.parse.
        // Not when rindex has PINNED \G to its own offset ("o"): that walk tries
        // earlier positions on purpose, and its \G is not the search's start.
-       // (no cache to bound it, and none of the characters every match holds
-       //  is left: no search -- see rxr_req)
-       let req9 = (if ok9 then "" else if map_has rx_reqs key then map_get rx_reqs key else "") in
        if str_len req9 > 0 && start <= str_len s && (if rxr_any_from s req9 start 0 then false else true) then RNoHit
        else if (if map_has rx_ganchor "o" then false else true) && rxv_anchored prog then
          (if start > str_len s then RNoHit
@@ -58446,8 +58707,10 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
           else match (let _ = rxs_reset () in rxv_run prog s 0 start 0) with
                | RFound (e, _) -> (let sv = rxs_snapshot () in RHit (rxv_keep_start sv start, e, sv))
                | RFail -> RNoHit)
-       else rxv_search_go prog s start (str_len s))
-    else (let _ = map_set rx_bad key VNil in RBadPat)
+       else
+         // (where no match can start, nothing is run: rxv_fbs)
+         (if str_len fbs9 == 0 || vec_get cut_k 0 == 2 then rxv_search_go prog s start (str_len s)
+          else rxv_search_fb prog s start (str_len s) fbs9 (vec_get cut_k 0 == 1))
 // a \K that ran moved the match's start to where it stood
 and rxv_keep_start = fn (sv: (int * int) list) -> fn (st: int) ->
   (let k9 = rxv_slot_get sv (0 - 1) in if k9 >= 0 then k9 else st)
@@ -58463,6 +58726,72 @@ and rxv_search_go = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) ->
     // a multibyte string try positions inside a character, so `"こんにちは"
     // .split(//)` reported 15 pieces where Ruby says 5.
     | RFail -> rxv_search_go prog s (i + (if i < str_len s then cut_clen s i else 1)) len
+
+// THE BYTES A MATCH CAN START WITH. The search tried every position: a reset
+// and a run of the program at each, to fail on the first instruction almost
+// everywhere -- `text.index(/key_3999/)` over 300 KB was 300,000 runs. When
+// every way into the program reads a byte first (no anchor, no empty match,
+// no `.`), the bytes it can read there are a set, and a position whose byte
+// is not in it is skipped without running anything (Onigmo's map search).
+// The set is 256 "0"/"1", or "" when there is none; kept per pattern key.
+// (A position inside a UTF-8 character is never a start: rxv_fb_skip.)
+and rxv_fbs = fn (key: str) -> fn prog ->
+  if map_has rx_fbs key then map_get rx_fbs key
+  else
+    (let acc = vec_new () in
+     let rec z = fn (i: int) -> (if i >= 256 then () else (let _ = vec_push acc 0 in z (i + 1))) in
+     let _ = z 0 in
+     let seen = map_new () in
+     let ok = rxv_fb prog seen acc 0 in
+     let r = (if ok then (let rec bits = fn (i: int) -> fn (a: str) -> (if i >= 256 then a else bits (i + 1) (a ++ (if vec_get acc i == 1 then "1" else "0"))) in bits 0 "")
+              else "") in
+     let _ = map_set rx_fbs key r in r)
+// the first bytes of the runs from pc into acc; false when some run can
+// start without reading one. A pc met again on the way read nothing more.
+and rxv_fb = fn prog -> fn seen -> fn acc -> fn (pc: int) ->
+  if map_has seen pc then true
+  else
+    (let _ = map_set seen pc 1 in
+     match rxv_fetch prog pc with
+     | IByte b -> (let _ = vec_set acc b 1 in true)
+     | IChar c -> (if str_len c > 0 then (let _ = vec_set acc (ord (char_at c 0)) 1 in true) else false)
+     | ICharCI c ->
+       (if str_len c == 1 && ord c < 128 then
+          (let _ = vec_set acc (ord c) 1 in
+           let o = rxv_swapcase c in
+           let _ = (if str_len o == 1 then vec_set acc (ord o) 1 else ()) in
+           str_len o == 1)
+        else false)
+     // (the ASCII answers are the class's own; any byte above them may start
+     //  a character it holds)
+     | IClass (_, _, _, bits) ->
+       (if str_len bits == 128 then
+          (let rec fill = fn (i: int) ->
+             (if i >= 256 then ()
+              else (let _ = (if i >= 128 || ord (char_at bits i) == 49 then vec_set acc i 1 else ()) in fill (i + 1))) in
+           let _ = fill 0 in true)
+        else false)
+     | ISplit (a, b) -> rxv_fb prog seen acc a && rxv_fb prog seen acc b
+     | IJmp j -> rxv_fb prog seen acc j
+     | ISave _ -> rxv_fb prog seen acc (pc + 1)
+     | IMark _ -> rxv_fb prog seen acc (pc + 1)
+     | ICheck (_, out) -> rxv_fb prog seen acc (pc + 1) && rxv_fb prog seen acc out
+     | _ -> false)
+// the search with the start set: run the program only where it can start
+and rxv_search_fb = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) -> fn (fbs: str) -> fn (u8: bool) ->
+  let j = rxv_fb_skip s i len fbs u8 in
+  // (every match reads a byte first, so none starts at the end)
+  if j >= len then RNoHit
+  else
+    match (let _ = rxs_reset () in rxv_run prog s 0 j 0) with
+    | RFound (e, _) -> (let sv = rxs_snapshot () in RHit (rxv_keep_start sv j, e, sv))
+    | RFail -> rxv_search_fb prog s (j + cut_clen s j) len fbs u8
+and rxv_fb_skip = fn (s: str) -> fn (i: int) -> fn (len: int) -> fn (fbs: str) -> fn (u8: bool) ->
+  if i >= len then len
+  else
+    (let b = ord (char_at s i) in
+     if ord (char_at fbs b) == 49 && (if u8 then (b < 128 || b >= 192) else true) then i
+     else rxv_fb_skip s (i + 1) len fbs u8)
 
 // a minimal regex engine: literals, ^ $ anchors, . any, \d \w \s classes,
 // and + * on single elements. Backtracking, no groups.
@@ -58626,6 +58955,12 @@ and rxe_backref_many = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int
 // text matched a byte of it and `"\x80" =~ /./` answered 0.
 and rx_enc_guard = fn world -> fn (re: Val) -> fn (subj: Val) ->
   match (re, subj) with
+  // (the common case has nothing to refuse: an ASCII subject in the default
+  //  encoding meets a pattern with no encoding of its own -- every encoding
+  //  such a pattern can have is ASCII-compatible, and ASCII is valid in all
+  //  of them. The names below were canonicalised and the pattern's source
+  //  scanned at every match: 42% of a small `match?`, note 506.)
+  | (VRegex (_, _, ev0), VStr h0) when str_len ev0 == 0 && (if map_has str_enc h0 then false else true) && str_is_ascii h0 -> ()
   | (VRegex (p, fl, ev), VStr h) ->
     (let se = enc_canon_name (senc_get h) in
      let sv = sget h in
@@ -59179,10 +59514,13 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
 // the block (the capture array when the pattern has groups, else the matched
 // string), publishing $~/$1.. per match so the block can read them. Mirrors
 // rx_scan_all2's cursor advance (zero-width matches step one char).
+// (a Flow: a `break` in the block ends the scan with its value, as it ends
+//  any iterator -- it was dropped, and `"ab".scan(/./) { break 1 }` walked on
+//  and answered the receiver)
 and rx_scan_blk = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) -> fn (enc: str) ->
   match rxv_search pat fl s i with
-  | RBadPat -> ()
-  | RNoHit -> ()
+  | RBadPat -> FNext VNil
+  | RNoHit -> FNext VNil
   | RHit (st, en, saves) ->
     let ng = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
     let _ = rxv_export_caps saves ng in
@@ -59195,9 +59533,13 @@ and rx_scan_blk = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn (
                        | VArr id9 -> (let _ = arr_set id9 (rb_scan_tag (deref id9) enc) in a9)
                        | _ -> a9))) in
     let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
-    let _ = flow_value (run_block world nb newblk (Cons (item, Nil))) in
-    let nexti = (if en > st then en else st + 1) in
-    rx_scan_blk world newblk pat fl s nexti enc
+    (match run_block world nb newblk (Cons (item, Nil)) with
+     | FBreak v -> FBreak v
+     | FReturn v -> FReturn v
+     | FRaise v -> FRaise v
+     | _ ->
+       (let nexti = (if en > st then en else st + 1) in
+        rx_scan_blk world newblk pat fl s nexti enc))
 
 // gsub/sub with a Hash replacement: each match is looked up in the hash and
 // replaced by the (to_s of the) value, or by "" when the key is absent.

@@ -1083,6 +1083,22 @@ and param_report_name = fn (n: str) ->
     else if str_eq (char_at n i) "~" then substring n 0 i
     else cut (i + 1) in
   if str_len n >= 2 && str_eq (substring n 0 2) "_~" then "_" else cut 0
+// ruby lists the REQUIRED keywords before the optional ones, whatever order
+// they were written in: `def m(a: 1, b:)` is [[:keyreq, :b], [:key, :a]]
+// (rb_iseq_parameters walks the required ones first). The keywords stand
+// together, so the rest of the list keeps its place around them.
+and param_kw_order = fn (xs: Val list) ->
+  let kind = fn (v: Val) -> (match v with VArr id -> (match deref id with Cons (VSym k, _) -> k | _ -> "") | _ -> "") in
+  let rec go = fn (ys: Val list) -> fn (pre: Val list) -> fn (req: Val list) -> fn (opt: Val list) -> fn (post: Val list) -> fn (seen: bool) ->
+    (match ys with
+     | Nil -> rev_app pre (rev_app req (rev_app opt (rev_app post Nil)))
+     | Cons (y, t) ->
+       (let k = kind y in
+        if str_eq k "keyreq" then go t pre (Cons (y, req)) opt post true
+        else if str_eq k "key" then go t pre req (Cons (y, opt)) post true
+        else if seen then go t pre req opt (Cons (y, post)) seen
+        else go t (Cons (y, pre)) req opt post seen)) in
+  go xs Nil Nil Nil Nil false
 and param_meta_of = fn (is_lam: bool) -> fn (ps: str list) -> fn (ds: (str * Expr) list) ->
   match ps with
   | Nil -> Nil
@@ -16486,6 +16502,26 @@ and wo_object_block = fn newblk -> fn (memo: Val) ->
               Cons (SIf (Cons ((EMethod (rv, "[]", Cons (EInt 0, Nil)), Cons (SBreak got, Nil)), Nil), Nil),
               Cons (SExpr got, Nil))) in
   (true, Cons ("*__e", Nil), body, cenv)
+// The block-taking Enumerable methods an Enumerator answers by walking its
+// #each in the prelude (`__gen_<name>`), and the argument shapes that walk
+// takes; anything else is materialised and handed to the Array method.
+and gen_stream_name = fn (name: str) ->
+  if str_eq name "map" || str_eq name "collect" then "map"
+  else if str_eq name "flat_map" || str_eq name "collect_concat" then "flat_map"
+  else if str_eq name "select" || str_eq name "filter" || str_eq name "find_all" then "select"
+  else if str_eq name "detect" then "find"
+  else if str_eq name "reduce" then "inject"
+  else if str_eq name "reject" || str_eq name "filter_map" || str_eq name "drop_while" || str_eq name "take_while"
+          || str_eq name "sort_by" || str_eq name "min_by" || str_eq name "max_by" || str_eq name "minmax_by"
+          || str_eq name "group_by" || str_eq name "partition" || str_eq name "uniq" || str_eq name "each_with_object"
+          || str_eq name "inject" || str_eq name "find" || str_eq name "find_index" || str_eq name "each_entry"
+          || str_eq name "any?" || str_eq name "all?" || str_eq name "none?" || str_eq name "one?" then name
+  else ""
+and gen_stream_args_ok = fn (g: str) -> fn (args: Val list) ->
+  match args with
+  | Nil -> (if str_eq g "each_with_object" then false else true)
+  | Cons (_, Nil) -> str_eq g "min_by" || str_eq g "max_by" || str_eq g "each_with_object" || str_eq g "inject"
+  | _ -> false
 and wi_answers_elems = fn (src: str) ->
   str_eq src "select" || str_eq src "filter" || str_eq src "find_all" ||
   str_eq src "reject" || str_eq src "take_while" || str_eq src "drop_while" ||
@@ -17510,7 +17546,24 @@ and here_pos = fn (cd: int) ->
      | (g9, l9) -> (if str_starts_with g9 "<internal:prelude" then (f9, cur_line ()) else (g9, l9)))
   else (f9, cur_line ())
 and caller_list = fn (i: int) ->
-  if i < fb_depth_base () then (Nil : Val list) else Cons (mkstr (frame_str i), caller_list (i - 1))
+  if i < fb_depth_base () then (Nil : Val list)
+  else if gen_frame_hidden i then caller_list (i - 1)
+  else Cons (mkstr (frame_str i), caller_list (i - 1))
+// the frames of an Enumerator's prelude walk that ruby's C method has none
+// of: the block __gen_map hands #each, and the __gen_keyed helper the *_by
+// walks share (its frame and its block). The walk itself is shown, as
+// Enumerable#map (meth_label).
+and gen_frame_hidden = fn (i: int) ->
+  i >= 1 && map_has call_names_s (i - 1)
+  && (let n = map_get call_names_s (i - 1) in
+      if str_eq n blk_frame_mark then
+        (map_has fb_env_at (i - 1)
+         && (let e9 = map_get fb_env_at (i - 1) in
+             lv_has e9 "__meth"
+             && (match lv_get e9 "__meth" with
+                 | VStr h9 -> (let m9 = sget h9 in str_len m9 > 6 && str_eq (substring m9 0 6) "__gen_")
+                 | _ -> false)))
+      else str_eq n "Enumerator#__gen_keyed")
 and caller_depth = fn (u: unit) ->
   cd_get ()
 and caller_pick = fn (all: Val list) -> fn (a: Val) ->
@@ -19613,7 +19666,7 @@ and set_named_caps = fn env -> fn (pat: str) -> fn (p: int) -> fn (gidx: int) ->
          let g = gidx + 1 in
          // (a reserved word is bound only when it IS a local already -- a
          //  keyword parameter named `nil:`, reachable through binding)
-         let _ = (if rx_cap_local_ok name || lv_has env name then lv_set env name (if map_has globals (str_of_int g) then map_get globals (str_of_int g) else VNil) else ()) in
+         let _ = (if rx_cap_local_ok name || lv_has env name then lv_set env name (rx_named_val g) else ()) in
          set_named_caps env pat (nend + 1) g
        else if str_eq (char_at pat (p + 1)) "?" then set_named_caps env pat (p + 1) gidx
        else set_named_caps env pat (p + 1) (gidx + 1))
@@ -19678,15 +19731,8 @@ and rx_clear_go = fn (i: int) -> fn (hi: int) ->
 and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> fn (ng: int) -> fn (enc: str) ->
   let (meths, sup, ocls, ivars) = world in
   let id = alloc_oid ocls in
-  // one itoa for the id, not one per field: every ivar key here is
-  // `<id>@...`, and there are eight of them on every successful match.
-  let idk = str_of_int id in
   let _ = map_set ocls id "MatchData" in
   let _ = rx_md_set (VObj id) in
-  let _ = map_set ivars (idk ++ "@0") (mkstr_e (substring sv st en) enc) in
-  let _ = map_set md_whole id (substring sv st en) in
-  // keep the subject and the span, so #pre_match / #post_match / #begin / #end
-  // (and $` / $' / $&, which are derived from them) can be answered.
   // the subject, snapshotted once per (subject, encoding) rather than per match
   let srcv = (if map_has rx_src_hnd "h" && str_eq (map_get rx_src_last "s") sv
                  && str_eq (map_get rx_src_last "e") enc
@@ -19697,42 +19743,104 @@ and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> 
                        let _ = map_set rx_src_last "e" enc in
                        let _ = map_set rx_src_hnd "h" nh in VStr nh)
                     | other -> other)) in
+  // the pattern this match came from, so #[](:name) / #names /
+  // #named_captures can look its group names up (rx_prog_names)
+  let keyh = (if map_has rx_cur "k" then (match map_get rx_cur "k" with VStr h9 -> h9 | _ -> 0 - 1) else 0 - 1) in
+  (match srcv with
+   | VStr srch ->
+     // the record (see md_lz_ix); the object is written when it is read
+     (let _ = map_set md_lz_ix id (vec_get md_lz_top 0) in
+      let _ = md_lz_put st in
+      let _ = md_lz_put en in
+      let _ = md_lz_put ng in
+      let _ = md_lz_put srch in
+      let _ = md_lz_put keyh in
+      let _ = md_lz_put (md_lz_enc_code enc) in
+      let hi = rx_cap_hi () in
+      let _ = md_lz_put (if hi < 0 then 0 else hi) in
+      let rec caps = fn (g: int) ->
+        (if g > hi then ()
+         else (let a = (if map_has rx_caps (g * 4) && map_has rx_caps (g * 4 + 1) then map_get rx_caps (g * 4) else 0 - 1) in
+               let b = (if a >= 0 then map_get rx_caps (g * 4 + 1) else 0 - 1) in
+               let _ = md_lz_put a in
+               let _ = md_lz_put b in
+               caps (g + 1))) in
+      caps 1)
+   | _ -> md_write world id sv st en ng enc srcv keyh (rx_lz_caps_now 1)) 
+// the current match's group spans, as a record lists them
+and rx_lz_caps_now = fn (g: int) ->
+  if g > rx_cap_hi () then (Nil : (int * int) list)
+  else (let a = (if map_has rx_caps (g * 4) && map_has rx_caps (g * 4 + 1) then map_get rx_caps (g * 4) else 0 - 1) in
+        let b = (if a >= 0 then map_get rx_caps (g * 4 + 1) else 0 - 1) in
+        Cons ((a, b), rx_lz_caps_now (g + 1)))
+// a MatchData record written out as the object's ivars -- what publishing a
+// match wrote before it was a record
+and md_force = fn world -> fn (id: int) ->
+  if map_has md_lz_ix id then
+    (let o = map_get md_lz_ix id in
+     let _ = map_delete md_lz_ix id in
+     let st = vec_get md_lz_v o in
+     let en = vec_get md_lz_v (o + 1) in
+     let ng = vec_get md_lz_v (o + 2) in
+     let srch = vec_get md_lz_v (o + 3) in
+     let keyh = vec_get md_lz_v (o + 4) in
+     let enc = map_get md_lz_encn (vec_get md_lz_v (o + 5)) in
+     let hi = vec_get md_lz_v (o + 6) in
+     let rec caps = fn (g: int) ->
+       (if g > hi then (Nil : (int * int) list)
+        else Cons ((vec_get md_lz_v (o + 5 + 2 * g), vec_get md_lz_v (o + 6 + 2 * g)), caps (g + 1))) in
+     md_write world id (sget srch) st en ng enc (VStr srch) keyh (caps 1))
+  else ()
+and md_write = fn world -> fn (id: int) -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> fn (ng: int) -> fn (enc: str) -> fn (srcv: Val) -> fn (keyh: int) -> fn (cps: (int * int) list) ->
+  let (meths, sup, ocls, ivars) = world in
+  // one itoa for the id, not one per field: every ivar key here is `<id>@...`
+  let idk = str_of_int id in
+  let _ = map_set ivars (idk ++ "@0") (mkstr_e (substring sv st en) enc) in
+  let _ = map_set md_whole id (substring sv st en) in
+  // keep the subject and the span, so #pre_match / #post_match / #begin / #end
+  // (and $` / $' / $&, which are derived from them) can be answered.
   let _ = map_set ivars (idk ++ "@__src") srcv in
   let _ = map_set ivars (idk ++ "@__st") (VInt st) in
   let _ = map_set ivars (idk ++ "@__en") (VInt en) in
   let _ = (if ng >= 0 then map_set ivars (idk ++ "@__ng") (VInt ng) else ()) in
-  // the pattern this match came from, so #[](:name) / #names / #named_captures
-  // can look its group names up (rx_prog_names, keyed the same way).
-  let _ = (if map_has rx_cur "k" then map_set ivars (idk ++ "@__key") (map_get rx_cur "k") else ()) in
+  let _ = (if keyh >= 0 then map_set ivars (idk ++ "@__key") (VStr keyh) else ()) in
   // (and the Regexp's encoding, when the match recorded it -- rx_key_renc;
   //  the key may carry the cut's mark after a chr 2)
-  let _ = (if map_len rx_key_renc > 0 && map_has rx_cur "k" then
-             (match map_get rx_cur "k" with
-              | VStr kh9 -> (let k0 = sget kh9 in
-                             let c9 = str_index_of k0 (chr 2) in
-                             let k9 = (if c9 > 0 then substring k0 0 c9 else k0) in
-                             if map_has rx_key_renc k9 then map_set ivars (idk ++ "@__renc") (mkstr (map_get rx_key_renc k9)) else ())
-              | _ -> ())
+  let _ = (if map_len rx_key_renc > 0 && keyh >= 0 then
+             (let k0 = sget keyh in
+              let c9 = str_index_of k0 (chr 2) in
+              let k9 = (if c9 > 0 then substring k0 0 c9 else k0) in
+              if map_has rx_key_renc k9 then map_set ivars (idk ++ "@__renc") (mkstr (map_get rx_key_renc k9)) else ())
            else ()) in
-  let _ = rx_store_groups ivars id sv 1 enc in
-  rx_pub_groups sv 1 true enc
-and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) -> fn (enc: str) ->
-  if g > rx_cap_hi () then ()
-  else
-    let ks = g * 4 in let ke = g * 4 + 1 in
-    let idk = str_of_int id in let gk = str_of_int g in
-    let _ = (if map_has rx_caps ks && map_has rx_caps ke then
-               let a = map_get rx_caps ks in let b = map_get rx_caps ke in
-               (if b >= a then
-                  // the span too, not only the text: #begin(n) / #end(n) had
-                  // nothing but group 0's span to answer from, so `begin(1)`
-                  // reported where the whole match started
-                  (let _ = map_set ivars (idk ++ "@__st" ++ gk) (VInt a) in
-                   let _ = map_set ivars (idk ++ "@__en" ++ gk) (VInt b) in
-                   map_set ivars (idk ++ "@" ++ gk) (mkstr_e (substring sv a b) enc))
-                else ())
-             else ()) in
-    rx_store_groups ivars id sv (g + 1) enc
+  md_write_groups ivars idk sv cps 1 enc
+// each group's span and text: a group that did not take part has neither
+and md_write_groups = fn ivars -> fn (idk: str) -> fn (sv: str) -> fn (cps: (int * int) list) -> fn (g: int) -> fn (enc: str) ->
+  match cps with
+  | Nil -> ()
+  | Cons ((a, b), t) ->
+    (let _ = (if a >= 0 && b >= a then
+                (let gk = str_of_int g in
+                 let _ = map_set ivars (idk ++ "@__st" ++ gk) (VInt a) in
+                 let _ = map_set ivars (idk ++ "@__en" ++ gk) (VInt b) in
+                 map_set ivars (idk ++ "@" ++ gk) (mkstr_e (substring sv a b) enc))
+              else ()) in
+     md_write_groups ivars idk sv t (g + 1) enc)
+// `$~`, written out first if it is still a record. Every read of `$~` that
+// hands the MatchData on goes through this (rx_md_get itself only moves the id
+// between frames)
+and md_cur = fn world ->
+  let v = rx_md_get () in
+  let _ = (match v with VObj i -> md_force world i | _ -> ()) in
+  v
+// group g of the match `=~` just made, for the locals its named groups bind
+// (nil when it failed or the group took no part)
+and rx_named_val = fn (g: int) ->
+  if vec_get rx_md 0 < 0 then VNil
+  else if map_has rx_caps (g * 4) && map_has rx_caps (g * 4 + 1) && map_has rx_src_last "s" then
+    (let a = map_get rx_caps (g * 4) in
+     let b = map_get rx_caps (g * 4 + 1) in
+     if b >= a then mkstr_e (substring (map_get rx_src_last "s") a b) (map_get rx_src_last "e") else VNil)
+  else VNil
 and md_num_list = fn ivars -> fn (id: int) ->
   let key = (if map_has ivars (str_of_int id ++ "@__key")
              then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
@@ -19795,23 +19903,10 @@ and md_collect_nums = fn ivars -> fn (id: int) -> fn (ns: int list) ->
 // the value it replaced in the map's arena. A pattern with no groups wrote
 // nine VNils over nine VNils on every match. Write as far as THIS match
 // reaches, clear as far as the LAST one did, and remember which that was.
-and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) -> fn (enc: str) ->
-  let hi = (let h = (if ok then rx_cap_hi () else 0) in if h > 9 then 9 else h) in
-  let last = (if map_has rx_wide 1 then map_get rx_wide 1 else 0) in
-  let _ = rx_pub_go sv i ok enc (if hi > last then hi else last) in
-  map_set rx_wide 1 hi
-and rx_pub_go = fn (sv: str) -> fn (i: int) -> fn (ok: bool) -> fn (enc: str) -> fn (lim: int) ->
-  if i > lim then ()
-  else
-    let k_s = i * 4 in
-    let k_e = i * 4 + 1 in
-    let v = if ok && map_has rx_caps k_s && map_has rx_caps k_e then
-              (let a = map_get rx_caps k_s in
-               let b = map_get rx_caps k_e in
-               if b >= a then mkstr_e (substring sv a b) enc else VNil)
-            else VNil in
-    let _ = map_set globals (str_of_int i) v in
-    rx_pub_go sv (i + 1) ok enc lim
+// ($1..$9 are views on `$~` -- see the gvar read -- and the locals a named
+//  group binds read the match itself, rx_named_val: the copies this wrote into
+//  globals at every match, one new string a group, had no reader left)
+and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) -> fn (enc: str) -> ()
 and rx_step = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
   if str_eq (char_at pat p) "." then utf8_clen s i else 1
 and rx_elem = fn (pat: str) -> fn (p: int) -> fn (c: str) ->
