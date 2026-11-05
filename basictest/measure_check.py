@@ -39,6 +39,14 @@ class BasicCheck(unittest.TestCase):
         self.assertEqual(summary['verdicts'], dict(PASS=1, FAIL=1))
         self.assertEqual(measure.compare(cases, cases)['both'], 1)
 
+    def test_eval_origin_inner_line_and_repetition_are_distinct(self):
+        evaluated = f"ok 1 ((eval at {self.source}:12):1:in '<main>')\n"
+        summary, cases = self.parse(self.passing() + evaluated * 2 + 'end of test(test: 3)\n')
+        self.assertEqual(summary['state'], 'COMPLETE')
+        self.assertEqual(len(cases), 3)
+        self.assertEqual([c['eval_line'] for c in summary['cases']], [0, 1, 1])
+        self.assertEqual([c['occurrence'] for c in summary['cases']], [1, 1, 2])
+
     def test_missing_final_does_not_promote_progress(self):
         summary, cases = self.parse(self.passing(), exit=1, child=1)
         self.assertEqual(summary['state'], 'INCOMPLETE')

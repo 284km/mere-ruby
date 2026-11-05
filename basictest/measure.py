@@ -22,9 +22,10 @@ OUTPUT_BYTES = 16 * 1024 * 1024
 def parse_output(path, source, execution, child_exit):
     cases, issues, final = {}, [], None
     occurrences = Counter()
-    location = re.escape(str(source)) + r':(\d+)(?::in .*)?'
-    passed = re.compile(r'^ok \d+ \(' + location + r'\)$')
-    failed = re.compile(r'^not ok .+ \d+ -- ' + location + r'$')
+    location = re.compile(re.escape(str(source)) + r':(\d+)(?::in .*)?')
+    evaluated = re.compile(r'\(eval at ' + re.escape(str(source)) + r':(\d+)\):(\d+)(?::in .*)?')
+    passed = re.compile(r'^ok \d+ \((.*)\)$')
+    failed = re.compile(r'^not ok .+ \d+ -- (.*)$')
     success = re.compile(r'^end of test\(test: (\d+)\)$')
     failure = re.compile(r'^not ok/test: (\d+) failed (\d+)$')
     try:
@@ -36,11 +37,17 @@ def parse_output(path, source, execution, child_exit):
             if good or bad:
                 if final is not None:
                     raise ValueError('basic case after final summary')
-                line = int((good or bad).group(1))
-                if line <= 0:
+                frame = (good or bad).group(1)
+                origin, inside_eval = location.fullmatch(frame), evaluated.fullmatch(frame)
+                if not origin and not inside_eval:
+                    raise ValueError('unrecognized basic source location')
+                line = int((origin or inside_eval).group(1))
+                eval_line = int(inside_eval.group(2)) if inside_eval else 0
+                if line <= 0 or (inside_eval and eval_line <= 0):
                     raise ValueError('invalid basic source line')
-                occurrences[line] += 1
-                cases[('basictest/test.rb', line, occurrences[line])] = 'PASS' if good else 'FAIL'
+                base = (line, eval_line)
+                occurrences[base] += 1
+                cases[('basictest/test.rb', line, eval_line, occurrences[base])] = 'PASS' if good else 'FAIL'
             elif summary or errors:
                 if final is not None:
                     raise ValueError('duplicate basic summary')
@@ -58,7 +65,7 @@ def parse_output(path, source, execution, child_exit):
     effective = {key: value if state == 'COMPLETE' else 'X' for key, value in cases.items()}
     return dict(state=state, execution=execution, child_exit=child_exit, summary=final,
                 discovered=len(cases), verdicts=dict(Counter(effective.values())), issues=issues,
-                cases=[dict(file=key[0], line=key[1], occurrence=key[2], observed=cases[key], status=value)
+                cases=[dict(file=key[0], line=key[1], eval_line=key[2], occurrence=key[3], observed=cases[key], status=value)
                        for key, value in effective.items()]), effective
 
 

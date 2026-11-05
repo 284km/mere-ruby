@@ -12,7 +12,8 @@ that runner. Assertions, expected values and source lines are unchanged. A
 private source symlink avoids the upstream runner's unquoted shell source path.
 PATH and env-shebang Ruby children use the selected side too.
 
-Case identities are original source line plus occurrence. The body's `ok` and
+Case identities are original source line, an eval's inner line when present,
+and occurrence. The body's `ok` and
 `not ok` records, final test/failure counts, body exit and runner exit must
 agree. The final failure summary is a completed measurement with failed cases;
 missing final output, malformed records, a crash after the summary and a
