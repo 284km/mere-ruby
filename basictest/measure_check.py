@@ -18,17 +18,22 @@ class BasicCheck(unittest.TestCase):
         self.root = Path(temporary.name)
         self.source = self.root / 'source with spaces/basictest/test.rb'
         self.source.parent.mkdir(parents=True)
+        self.source.write_text('test_check "fixture"\n')
         self.output = self.root / 'stdout'
+        self.stderr = self.root / 'stderr'
 
     def parse(self, text, exit=0, child=0, limit=None):
         self.output.write_text(text)
-        return measure.parse_output(self.output, self.source, dict(exit=exit, limit=limit), child)
+        count = len([line for line in text.splitlines() if line.startswith(('ok ', 'not ok '))])
+        progress = '.' * count + f'OK {count}\n' if 'end of test' in text or 'not ok/test:' in text else '.' * count
+        self.stderr.write_text(f'{self.source}:fixture ' + progress)
+        return measure.parse_output(self.output, self.stderr, self.source, dict(exit=exit, limit=limit), child)
 
-    def passing(self):
-        return f"ok 1 ({self.source}:12:in '<main>')\n"
+    def passing(self, index=1):
+        return f"ok {index} ({self.source}:12:in '<main>')\n"
 
     def test_repeated_locations_remain_distinct(self):
-        summary, cases = self.parse(self.passing() * 2 + 'end of test(test: 2)\n')
+        summary, cases = self.parse(self.passing() + self.passing(2) + 'end of test(test: 2)\n')
         self.assertEqual(summary['state'], 'COMPLETE')
         self.assertEqual(list(cases.values()), ['PASS', 'PASS'])
         self.assertEqual({key[-1] for key in cases}, {1, 2})
@@ -40,12 +45,26 @@ class BasicCheck(unittest.TestCase):
         self.assertEqual(measure.compare(cases, cases)['both'], 1)
 
     def test_eval_origin_inner_line_and_repetition_are_distinct(self):
-        evaluated = f"ok 1 ((eval at {self.source}:12):1:in '<main>')\n"
-        summary, cases = self.parse(self.passing() + evaluated * 2 + 'end of test(test: 3)\n')
+        evaluated = f"ok 2 ((eval at {self.source}:12):1:in '<main>')\n"
+        summary, cases = self.parse(self.passing() + evaluated + evaluated.replace('ok 2 ', 'ok 3 ') + 'end of test(test: 3)\n')
         self.assertEqual(summary['state'], 'COMPLETE')
         self.assertEqual(len(cases), 3)
         self.assertEqual([c['eval_line'] for c in summary['cases']], [0, 1, 1])
-        self.assertEqual([c['occurrence'] for c in summary['cases']], [1, 1, 2])
+        self.assertEqual([c['index'] for c in summary['cases']], [1, 2, 3])
+
+    def test_different_caller_locations_do_not_invent_extra_cases(self):
+        text = self.passing() + 'end of test(test: 1)\n'
+        _, reference = self.parse(text)
+        _, mere = self.parse(text.replace(':12:', ':99:'))
+        self.assertEqual(measure.compare(reference, mere), dict(tests=1, match=1, red=0, both=0, extra=0))
+
+    def test_different_section_counts_cannot_match_shifted_ordinals(self):
+        left, reference = self.parse(self.passing() + self.passing(2) + 'end of test(test: 2)\n')
+        right, mere = self.parse(self.passing() + 'end of test(test: 1)\n')
+        mere, gaps = measure.align_cases(left, right, reference, mere)
+        self.assertEqual(right['state'], 'COUNT_MISMATCH')
+        self.assertTrue(gaps)
+        self.assertEqual(measure.compare(reference, mere)['match'], 0)
 
     def test_missing_final_does_not_promote_progress(self):
         summary, cases = self.parse(self.passing(), exit=1, child=1)
@@ -88,7 +107,8 @@ class BasicCheck(unittest.TestCase):
                 final = 'not ok/test: 1 failed 1' if failed else 'end of test(test: 1)'
                 # Inspect ./miniruby too: the host and the body's CLI children
                 # must use the requested target, including paths with spaces.
-                self.source.write_text('abort "missing miniruby" unless File.executable?("./miniruby")\nputs ' + json.dumps(line) + '\nputs ' + json.dumps(final) + '\n')
+                progress = str(expected_source) + ':fixture ' + ('.F 1' if failed else '.OK 1')
+                self.source.write_text('def test_check(name); end\ntest_check "fixture"\nabort "missing miniruby" unless File.executable?("./miniruby")\nSTDERR.puts ' + json.dumps(progress) + '\nputs ' + json.dumps(line) + '\nputs ' + json.dumps(final) + '\n')
                 env = dict(PATH=os.environ['PATH'], HOME=str(self.root), LANG='C', LC_ALL='C', RUBYOPT='-Eutf-8')
                 with patch.object(measure.ci, 'ProcessFamily', FixtureFamily):
                     summary, cases = measure.run_side(self.source.parent.parent, Path(ruby).resolve(), Path(ruby).resolve(),

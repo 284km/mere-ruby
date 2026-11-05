@@ -19,17 +19,16 @@ POLICY = 'native-basic-durable-output-v1'
 OUTPUT_BYTES = 16 * 1024 * 1024
 
 
-def parse_output(path, source, execution, child_exit):
-    cases, issues, final = {}, [], None
-    occurrences = Counter()
+def parse_output(path, stderr, source, execution, child_exit):
+    cases, observed, issues, final = {}, [], [], None
     location = re.compile(re.escape(str(source)) + r':(\d+)(?::in .*)?')
     evaluated = re.compile(r'\(eval at ' + re.escape(str(source)) + r':(\d+)\):(\d+)(?::in .*)?')
-    passed = re.compile(r'^ok \d+ \((.*)\)$')
-    failed = re.compile(r'^not ok .+ \d+ -- (.*)$')
+    passed = re.compile(r'^ok (\d+) \((.*)\)$')
+    failed = re.compile(r'^not ok .+ (\d+) -- (.*)$')
     success = re.compile(r'^end of test\(test: (\d+)\)$')
     failure = re.compile(r'^not ok/test: (\d+) failed (\d+)$')
     try:
-        if path.stat().st_size > OUTPUT_BYTES:
+        if max(path.stat().st_size, stderr.stat().st_size) > OUTPUT_BYTES:
             raise ValueError('basic output byte bound exceeded')
         for raw in path.read_text().splitlines():
             good, bad = passed.fullmatch(raw), failed.fullmatch(raw)
@@ -37,7 +36,7 @@ def parse_output(path, source, execution, child_exit):
             if good or bad:
                 if final is not None:
                     raise ValueError('basic case after final summary')
-                frame = (good or bad).group(1)
+                frame = (good or bad).group(2)
                 origin, inside_eval = location.fullmatch(frame), evaluated.fullmatch(frame)
                 if not origin and not inside_eval:
                     raise ValueError('unrecognized basic source location')
@@ -45,9 +44,8 @@ def parse_output(path, source, execution, child_exit):
                 eval_line = int(inside_eval.group(2)) if inside_eval else 0
                 if line <= 0 or (inside_eval and eval_line <= 0):
                     raise ValueError('invalid basic source line')
-                base = (line, eval_line)
-                occurrences[base] += 1
-                cases[('basictest/test.rb', line, eval_line, occurrences[base])] = 'PASS' if good else 'FAIL'
+                observed.append(dict(index=int((good or bad).group(1)), line=line, eval_line=eval_line,
+                                     status='PASS' if good else 'FAIL'))
             elif summary or errors:
                 if final is not None:
                     raise ValueError('duplicate basic summary')
@@ -58,14 +56,49 @@ def parse_output(path, source, execution, child_exit):
                 raise ValueError('output after basic summary')
     except (OSError, UnicodeError, ValueError) as error:
         issues.append(type(error).__name__ + ': ' + str(error))
+    # Caller locations are diagnostic data produced by the interpreter under
+    # test. Mere currently coalesces some of them onto a block's first line;
+    # using them as identities would invent EXTRA cases. The original runner
+    # already supplies section names, section totals and per-section ordinals.
+    sections_complete = True
+    try:
+        names = set(re.findall(r'^\s*test_check ["\x27]([^"\x27]+)["\x27]', source.read_text(), re.M))
+        pattern = re.compile('^' + re.escape(str(source)) + ':(' + '|'.join(map(re.escape, sorted(names))) + ') ', re.M)
+        text = stderr.read_text()
+        sections = list(pattern.finditer(text)) if names else []
+        occurrences, offset = Counter(), 0
+        for i, section in enumerate(sections):
+            name = section.group(1)
+            occurrences[name] += 1
+            block = text[section.end():sections[i + 1].start() if i + 1 < len(sections) else len(text)]
+            totals = re.findall(r'^[.F]*(?:OK)? (\d+)$', block, re.M)
+            if len(totals) > 1:
+                raise ValueError('duplicate basic section total')
+            if totals:
+                count = int(totals[0])
+            elif i + 1 == len(sections):
+                count = len(observed) - offset
+                sections_complete = False
+            else:
+                raise ValueError('missing basic section total')
+            for index, case in enumerate(observed[offset:offset + count], 1):
+                if case['index'] != index:
+                    raise ValueError('inconsistent basic section ordinal')
+                cases[('basictest/test.rb', name, occurrences[name], index)] = case
+            offset += count
+        if offset != len(observed):
+            raise ValueError('basic output and section counts disagree')
+    except (OSError, UnicodeError, ValueError) as error:
+        issues.append(type(error).__name__ + ': ' + str(error))
     complete = (not issues and final is not None and final['tests'] == len(cases)
-                and final['failures'] == sum(v == 'FAIL' for v in cases.values())
+                and sections_complete and final['failures'] == sum(v['status'] == 'FAIL' for v in cases.values())
                 and child_exit == 0 and execution['exit'] == int(final['failures'] > 0))
     state = execution['limit'] or ('COMPLETE' if complete and cases else 'ZERO' if complete else 'INCOMPLETE')
-    effective = {key: value if state == 'COMPLETE' else 'X' for key, value in cases.items()}
+    effective = {key: value['status'] if state == 'COMPLETE' else 'X' for key, value in cases.items()}
     return dict(state=state, execution=execution, child_exit=child_exit, summary=final,
                 discovered=len(cases), verdicts=dict(Counter(effective.values())), issues=issues,
-                cases=[dict(file=key[0], line=key[1], eval_line=key[2], occurrence=key[3], observed=cases[key], status=value)
+                cases=[dict(file=key[0], section=key[1], occurrence=key[2], index=key[3],
+                            line=cases[key]['line'], eval_line=cases[key]['eval_line'], observed=cases[key]['status'], status=value)
                        for key, value in effective.items()]), effective
 
 
@@ -78,6 +111,25 @@ def compare(reference, mere):
     return counts
 
 
+def align_cases(reference, mere, reference_cases, mere_cases):
+    # A conditional inside a section could shift all following ordinals.
+    # Refuse that alignment rather than matching unrelated passing assertions.
+    gaps = []
+    if reference['state'] == mere['state'] == 'COMPLETE':
+        left = Counter(key[1:3] for key in reference_cases)
+        right = Counter(key[1:3] for key in mere_cases)
+        gaps = [dict(section=key[0], occurrence=key[1], reference=left[key], mere=right[key])
+                for key in sorted(left.keys() & right.keys()) if left[key] != right[key]]
+        if gaps:
+            mere['state'] = 'COUNT_MISMATCH'
+            mere['issues'].append('section counts differ; case ordinals cannot be aligned safely')
+            mere['verdicts'] = dict(X=len(mere_cases))
+            for case in mere['cases']:
+                case['status'] = 'X'
+            mere_cases = dict.fromkeys(mere_cases, 'X')
+    return mere_cases, gaps
+
+
 def run_side(source, reference, binary, work, env, wall, rss_kb, output):
     work.mkdir()
     # Upstream interpolates its source directory into a shell command without
@@ -88,12 +140,12 @@ def run_side(source, reference, binary, work, env, wall, rss_kb, output):
     # The body invokes ./miniruby itself for command-line tests. This is an
     # actual selected interpreter, not the native host that drives the suite.
     (work / 'miniruby').symlink_to(binary)
-    stdout, exit_file = work / 'body.stdout', work / 'body.exit'
+    stdout, stderr, exit_file = work / 'body.stdout', work / 'body.stderr', work / 'body.exit'
     launcher = work / 'target.sh'
-    launcher.write_text('#!/bin/sh\n' + shlex.quote(str(binary)) + ' "$@" > ' + shlex.quote(str(stdout))
+    launcher.write_text('#!/bin/sh\n' + shlex.quote(str(binary)) + ' "$@" > ' + shlex.quote(str(stdout)) + ' 2> ' + shlex.quote(str(stderr))
                         + '\ncode=$?\nprintf \'%s\\n\' "$code" > ' + shlex.quote(str(exit_file) + '.new')
                         + '\nmv ' + shlex.quote(str(exit_file) + '.new') + ' ' + shlex.quote(str(exit_file))
-                        + '\ncat ' + shlex.quote(str(stdout)) + '\nexit "$code"\n')
+                        + '\ncat ' + shlex.quote(str(stderr)) + ' >&2\ncat ' + shlex.quote(str(stdout)) + '\nexit "$code"\n')
     launcher.chmod(0o755)
     side_env = dict(env, RUBY=str(launcher), UNITTEST_CHILD_RUBY=str(binary),
                     PATH=str(ROOT / 'unittest/child-bin') + os.pathsep + env['PATH'])
@@ -109,10 +161,12 @@ def run_side(source, reference, binary, work, env, wall, rss_kb, output):
             child_exit = int(exit_file.read_text().strip())
         except ValueError:
             pass
-    summary, verdicts = parse_output(stdout, source_alias / 'basictest/test.rb', execution, child_exit)
+    summary, verdicts = parse_output(stdout, stderr, source_alias / 'basictest/test.rb', execution, child_exit)
     ci.sanitize_parts([log], output.with_suffix('.runner.out'))
     if stdout.is_file():
         ci.sanitize_parts([stdout], output.with_suffix('.body.out'))
+    if stderr.is_file():
+        ci.sanitize_parts([stderr], output.with_suffix('.body.stderr'))
     return summary, verdicts
 
 
@@ -150,6 +204,7 @@ def measure(args):
                                                    args.wall, args.rss_kb, args.output / side)
                 result['rows'] = [row]
                 ci.save(args.output / 'summary.json', result)
+        verdicts['mere'], row['identity_gaps'] = align_cases(row['reference'], row['mere'], verdicts['reference'], verdicts['mere'])
         result['totals'] = row['counts'] = compare(verdicts['reference'], verdicts['mere'])
         result['reference_gaps'] = [] if row['reference']['state'] == 'COMPLETE' else ['basictest/test.rb']
         ci.save(args.output / 'summary.json', result)
