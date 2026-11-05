@@ -245,3 +245,54 @@ goes through the regexp path and its per-match `$~`, which is a separate arc.
 was a map entry keyed `"<gid>:<i>"`, built on every read and write (about
 440 bytes per 32-bit draw). With the state in a Vec and the bytes written
 into the byte arena, `Random.new.bytes(100 MB)` is 1.5 s and 0.98 GB.
+
+## `regexp.sh`
+
+```
+./bench/regexp.sh [path/to/mere-ruby]
+```
+
+Thirteen regexp workloads (`bench/regexp_bench.rb`), CPU seconds best of
+three against the reference ruby, and the count each answered. Measured
+2026-11-05 (Apple silicon, ruby 4.0.9), before and after the engine work of
+that day:
+
+| workload | ruby | before | after | what it asks |
+|---|---|---|---|---|
+| scan_words | 0.04 | 0.13 | 0.10 | `scan(/\w+/)` over 300 KB |
+| scan_email | 0.06 | 0.25 | 0.17 | `scan(/[a-z]+@[a-z]+\.com/)` |
+| gsub_digits | 0.013 | 0.074 | 0.027 | `gsub(/\d+/, "#")` |
+| split_csv | 0.027 | 0.065 | 0.049 | `split(/,/)` |
+| match_lines | 0.003 | 0.20 | 0.15 | `=~ /\[ERROR\]/` on 15,000 lines |
+| capture_log | 0.014 | 0.060 | 0.044 | five captures per line |
+| literal_find | 0.004 | 0.125 | 0.052 | `index(/key_3999/)` in 300 KB |
+| anchored | 0.007 | 0.33 | 0.24 | `=~ /\Avalue-\d+\z/` on 20,000 small strings |
+| alternation | 0.012 | 0.21 | 0.033 | `scan(/alpha\|gamma\|kappa\|mu/)` |
+| dotstar | 0.005 | 0.029 | 0.012 | `scan(/path=(.*)$/)` |
+| classes | 0.003 | 0.017 | 0.010 | `scan(/"[^"]*"/)` |
+| ci | 0.007 | 0.89 | 0.015 | `scan(/ALPHA\|BETA/i)` |
+| nomatch | 0.005 | 0.056 | 0.010 | a pattern that is nowhere |
+
+What changed, in the order it paid:
+
+- **The start set.** A pattern every match of which reads a byte first has a
+  set of bytes it can start with; positions whose byte is not in it are
+  skipped without running the program (`rxv_fbs`). alternation, ci, nomatch.
+- **`/i` on an ASCII character is a class** of its two cases, answered from
+  the byte table, not a case swap and a string compare per step.
+- **The MatchData is a record until `$~` is read** (`md_force`): `=~` in a
+  condition never reads it, and writing its eight ivars and a new string per
+  group at every match was most of a small match, and most of what the
+  collector then walked.
+- **A greedy loop over one character runs in place** (`rxv_span`): the same
+  choices in the same order, without dispatching split, body and jump per
+  character; and none at all when the byte after the loop is one the body
+  never reads (Onigmo makes those possessive).
+- **The search before is reused** when the pattern is the same: a scan asks
+  once per match, and building the key and eight lookups was more than a
+  small match.
+
+What is left: match_lines and anchored are the interpreter's call and loop,
+not the engine (the loop alone is 20x ruby's); literal_find wants memchr, which
+a byte loop in Mere is not; scan_email starts a search at every letter of a
+word, where Onigmo searches for the `@` first and backs up.
