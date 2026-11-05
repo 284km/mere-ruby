@@ -58,6 +58,34 @@ class MeasurementCheck(unittest.TestCase):
         self.write([dict(event='final', normal_exit=True, exit=1, discovered=0)])
         self.assertEqual(measure.parse_cases(self.ledger, self.execution(exit=1))[0]['state'], 'INCOMPLETE')
 
+    def test_knownbugs_zero_requires_a_comment_only_input(self):
+        file = self.root / 'KNOWNBUGS.rb'
+        file.write_text('# known bug sentinel\n\n')
+        self.assertEqual(measure.empty_inputs(self.root), ['KNOWNBUGS.rb'])
+        file.write_text("if false\n  assert_equal '1', '1'\nend\n")
+        self.assertEqual(measure.empty_inputs(self.root), [])
+
+    def test_empty_knownbugs_does_not_count_as_a_passing_case(self):
+        args = self.collection([(0, 'same'), (1, 'same')])
+        manifest = json.loads(args.plan.read_text())
+        manifest['files'][0] = 'KNOWNBUGS.rb'
+        manifest['empty_inputs'] = ['KNOWNBUGS.rb']
+        args.plan.write_text(json.dumps(manifest))
+        for index in range(2):
+            path = args.input / str(index) / 'result.json'
+            value = json.loads(path.read_text())
+            value['manifest'] = manifest
+            if index == 0:
+                value['rows'][0].update(file='KNOWNBUGS.rb', reference=dict(state='ZERO'), mere=dict(state='ZERO'),
+                                        counts=dict(tests=0, match=0, red=0, both=0, extra=0))
+            path.write_text(json.dumps(value))
+        with contextlib.redirect_stdout(io.StringIO()):
+            measure.merge(args)
+        report = json.loads((args.output / 'summary.json').read_text())
+        self.assertEqual(report['reference_gaps'], [])
+        self.assertEqual(report['totals']['tests'], 1)
+        self.assertEqual(report['reference_states'], dict(ZERO=1, COMPLETE=1))
+
     def collection(self, shards):
         manifest = dict(files=['bootstraptest/test_a.rb', 'bootstraptest/test_b.rb'], shards=2)
         plan = self.root / 'plan.json'; plan.write_text(json.dumps(manifest))
@@ -125,6 +153,12 @@ assert_equal 'skipped', %q{skip 'skipped'}
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(summary['state'], 'COMPLETE')
         self.assertEqual(summary['verdicts'], dict(FAIL=1, PASS=1))
+
+    def test_native_empty_source_is_reported_as_zero(self):
+        result, (summary, cases) = self.native('# known bug sentinel\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(summary['state'], 'ZERO')
+        self.assertEqual(cases, {})
 
     def test_native_source_load_failure_keeps_registered_cases_unpassed(self):
         result, (summary, cases) = self.native("assert_equal '3', '1+2'\nraise 'source registration failed'\n")

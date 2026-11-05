@@ -85,6 +85,11 @@ shim="$here/shim"
 mr="${MR_BIN:-$root/mere-ruby}"
 [ -x "$mr" ] || { echo "unittest: no $mr" >&2; exit 2; }
 ref="${REF_RUBY_BIN:-ruby}"
+# Resolve before changing into a test directory. The child launcher refuses
+# relative targets so a local executable cannot change the measured side.
+ref="$(command -v "$ref")" || exit 2
+case "$mr" in /*) ;; *) mr="$(cd "$(dirname "$mr")" && pwd)/$(basename "$mr")" ;; esac
+case "$ref" in /*) ;; *) ref="$(cd "$(dirname "$ref")" && pwd)/$(basename "$ref")" ;; esac
 # the per-file bound, per side: a test file that hangs (a thread waiting on a
 # pipe nobody writes) is KILLED, not signalled -- see bootstraptest/all.sh
 # ⚠ 600, not 300: test_io takes about 270 s alone (one test, a child writing
@@ -176,7 +181,7 @@ if [ "${1:-}" = "--one" ]; then
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.
   # Parse stdout, then append stderr to the saved diagnostic log.
-  (cd "$dir" && select_rake "$ref" && RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$ref" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$ref" RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   ref_code=$?
   printf '%s\n' "$ref_code" > "$work/$n.ref.exit.new"
   mv "$work/$n.ref.exit.new" "$work/$n.ref.exit"
@@ -187,7 +192,7 @@ if [ "${1:-}" = "--one" ]; then
   out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
   printf 'mere\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
-  (cd "$dir" && select_rake "$mr" && RUBY="$mr" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$mr" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr" RUBY="$mr" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
   mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"

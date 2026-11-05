@@ -15,13 +15,24 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'unittest'))
 import ci
 
-POLICY = 'native-bootstrap-durable-cases-v1'
+POLICY = 'native-bootstrap-knownbugs-v2'
 CASE_BYTES = 16 * 1024 * 1024
 CASE_LIMIT = 100000
 
 
 def files(source):
-    return sorted(str(p.relative_to(source)) for p in (source / 'bootstraptest').glob('test_*.rb'))
+    paths = [str(p.relative_to(source)) for p in (source / 'bootstraptest').glob('test_*.rb')]
+    if (source / 'KNOWNBUGS.rb').is_file():
+        paths.append('KNOWNBUGS.rb')
+    return sorted(paths)
+
+
+def empty_inputs(source):
+    # The pinned KNOWNBUGS file is a comment-only sentinel. A later executable
+    # body may not become a successful zero-case measurement through a guard.
+    path = source / 'KNOWNBUGS.rb'
+    return ['KNOWNBUGS.rb'] if path.is_file() and all(not line.strip() or line.lstrip().startswith('#')
+                                                   for line in path.read_text().splitlines()) else []
 
 
 def revision(path):
@@ -39,7 +50,8 @@ def plan(args):
         raise ValueError('Ruby source does not match manifest')
     ci.save(args.output, dict(schema=1, policy=POLICY, source_ref=args.source_ref,
                              mere_ref=args.mere_ref, ruby_ref=args.ruby_ref,
-                             shards=args.shards, files=selected))
+                             shards=args.shards, files=selected, empty_inputs=empty_inputs(args.ruby_src),
+                             input_sha256={file: ci.digest(args.ruby_src / file) for file in selected}))
 
 
 def parse_cases(path, execution):
@@ -114,7 +126,9 @@ def compare(reference, mere):
 def measure(args):
     manifest, build, reference = ci.load(args.plan), ci.load(args.build_info), ci.load(args.reference_info)
     args.output.mkdir(parents=True, exist_ok=True)
-    if manifest['policy'] != POLICY or files(args.ruby_src) != manifest['files']:
+    if (manifest['policy'] != POLICY or files(args.ruby_src) != manifest['files']
+            or manifest['empty_inputs'] != empty_inputs(args.ruby_src)
+            or manifest['input_sha256'] != {file: ci.digest(args.ruby_src / file) for file in manifest['files']}):
         raise ValueError('bootstrap inventory changed')
     if not 0 <= args.shard < manifest['shards']:
         raise ValueError('invalid shard')
@@ -127,7 +141,8 @@ def measure(args):
     if ci.digest(args.binary) != build['binary_sha256'] or ci.digest(args.reference) != reference['binary_sha256']:
         raise ValueError('measurement binary digest mismatch')
     result = dict(schema=1, policy=POLICY, shard=args.shard, manifest=manifest, build=build,
-                  harness=dict(measure_sha256=ci.digest(Path(__file__)), audit_sha256=ci.digest(ROOT / 'bootstraptest/audit_runner.rb')),
+                  harness=dict(measure_sha256=ci.digest(Path(__file__)), audit_sha256=ci.digest(ROOT / 'bootstraptest/audit_runner.rb'),
+                               child_launcher_sha256=ci.digest(ROOT / 'unittest/child-bin/ruby')),
                   reference=reference, wall_seconds=args.wall, rss_kb=args.rss_kb, rows=[], infrastructure_error=None)
     ci.save(args.output / 'result.json', result)
     os.environ['REF_RUBY_BIN'] = str(args.reference.resolve())
@@ -135,7 +150,7 @@ def measure(args):
         for index, file in enumerate(manifest['files']):
             if index % manifest['shards'] != args.shard:
                 continue
-            row = dict(file=file)
+            row = dict(file=file, empty_input=file in manifest['empty_inputs'])
             parsed = {}
             with tempfile.TemporaryDirectory(prefix='mr-bootstrap-', dir='/tmp') as temp:
                 private = Path(temp)
@@ -155,7 +170,10 @@ def measure(args):
                     ledger = work / 'cases.jsonl'
                     launcher = work / 'target.sh'
                     child_libraries = env['RUBYLIB'] if side == 'reference' else str(args.ruby_src.resolve() / 'lib') + os.pathsep + stdlib
-                    launcher.write_text('#!/bin/sh\nexport RUBYLIB=' + shlex.quote(child_libraries) + '\nexec ' + shlex.quote(str(binary.resolve())) + ' "$@"\n')
+                    launcher.write_text('#!/bin/sh\nexport RUBYLIB=' + shlex.quote(child_libraries)
+                                        + '\nexport UNITTEST_CHILD_RUBY=' + shlex.quote(str(binary.resolve()))
+                                        + '\nexport PATH=' + shlex.quote(str(ROOT / 'unittest/child-bin')) + ':"$PATH"'
+                                        + '\nexec ' + shlex.quote(str(binary.resolve())) + ' "$@"\n')
                     launcher.chmod(0o755)
                     side_env = dict(env, BOOTSTRAP_CASE_LOG=str(ledger), BOOTSTRAP_SKIP_DIR=str(skips), RUBY=str(launcher))
                     command = [str(args.reference.resolve()), str(ROOT / 'bootstraptest/audit_runner.rb'),
@@ -213,7 +231,10 @@ def merge(args):
     missing = sorted(set(manifest['files']) - set(names))
     summary = dict(schema=1, policy=POLICY, manifest=manifest, received_shards=sorted(seen),
                    missing_files=missing, infrastructure_errors=errors,
-                   reference_gaps=[row['file'] for row in rows if row['reference']['state'] != 'COMPLETE'],
+                   reference_gaps=[row['file'] for row in rows if row['reference']['state'] != 'COMPLETE'
+                                   and not (row['file'] in manifest.get('empty_inputs', [])
+                                            and row['reference']['state'] == 'ZERO')],
+                   empty_inputs=manifest.get('empty_inputs', []),
                    provenance=provenance[0] if provenance else None,
                    totals={key: sum(row['counts'][key] for row in rows) for key in ci.COUNTS},
                    reference_states=dict(Counter(row['reference']['state'] for row in rows)),
@@ -223,7 +244,8 @@ def merge(args):
              '| File | Reference | Mere | MATCH | RED | BOTH | EXTRA |', '|---|---|---|---:|---:|---:|---:|']
     for row in sorted(rows, key=lambda row: row['file']):
         lines.append('| ' + ' | '.join([row['file'], row['reference']['state'], row['mere']['state']] + [str(row['counts'][key]) for key in ci.COUNTS[1:]]) + ' |')
-    lines.extend(['', f'Missing files: {len(missing)}. Infrastructure errors: {len(errors)}.', ''])
+    lines.extend(['', f'Missing files: {len(missing)}. Infrastructure errors: {len(errors)}.',
+                  'Comment-only inputs (zero cases, not passing tests): ' + ', '.join(manifest.get('empty_inputs', [])), ''])
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / 'SUMMARY.md').write_text('\n'.join(lines))
     print(json.dumps({key: value for key, value in summary.items() if key not in ('rows', 'manifest', 'provenance')}))

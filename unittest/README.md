@@ -105,9 +105,15 @@ turn a case into MATCH.
 ## Full measurement in GitHub Actions
 
 Pull requests, pushes to `main`, the weekly schedule and manual dispatch run
-the full `test/` candidate inventory. For Ruby 4.0.9 this is 757 files, including
-the 16 files excluded from the historical default and the encoding subdirectory.
-Bootstrap tests, basic tests and RubySpec remain separate suites.
+the full `test/` candidate inventory. For Ruby 4.0.9 this is 758 files: 757
+matching the naming rules and the audited standalone body
+`rubygems/bundler_test_gem.rb` in `extra_files.txt`. This includes the 16 files
+excluded from the historical default and the encoding subdirectory. Recursive
+directory selections include audited extra bodies in that directory; the
+historical default stays unchanged. A missing audited body is an error.
+Shared test modules are associated with their includers rather than executed
+as independent zero-case bodies. The remaining helper candidates still need
+that audit. Bootstrap, basic and RubySpec remain separate measurements.
 
 The workflow pins the Mere compiler and Ruby source to full commit SHAs.
 `workflow_dispatch` accepts `mere_ref`, a full published Mere commit SHA, to
@@ -133,9 +139,16 @@ those directories are not duplicated in its `RUBYLIB`. mere-ruby receives the
 reference's pure-Ruby library directories explicitly. Adding native stdlib
 directories to `RUBYLIB` bypasses default-gem activation and moves them ahead
 of RubyGems' insertion marker, including in child processes. This distinction
-is recorded as environment policy `standalone-source-libraries-v5`.
+is recorded as environment policy `per-side-path-ruby-v6`.
+`child-bin/ruby` also routes PATH and `/usr/bin/env ruby` children to the
+absolute interpreter selected for that side, including gem binstubs. An unset
+selection is an error, rather than a fallback to a host Ruby. Explicit
+`RUBY`/EnvUtil launches retain their selected absolute target. Tests that
+deliberately replace PATH or hardcode another interpreter still require their
+own context audit; this launcher does not rewrite those commands.
 The real-Ruby regression compiles a small extension and checks competing
-native/shim paths in both the parent and a subprocess.
+native/shim paths in the parent, an explicit subprocess, a PATH child and an
+env-shebang child with a deliberately wrong host Ruby behind the launcher.
 
 RubyGems tests load the pinned source `lib/` on both sides, including children,
 so repository-specific checks such as `Gem.prefix` inspect the tested source.
