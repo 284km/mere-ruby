@@ -1,7 +1,7 @@
 # Bootstrap measurement
 
 CI's bootstrap report runs every `bootstraptest/test_*.rb` from the pinned Ruby
-source through that source's original bootstrap runner. The driver is the
+source, plus `KNOWNBUGS.rb`, through that source's original bootstrap runner. The driver is the
 exact native reference Ruby; its `--ruby` target is either that reference or
 the O2 mere-ruby measurement binary. The upstream assertion methods evaluate
 equality, matching, syntax, exit and finish conditions. No assertion kind is
@@ -26,6 +26,12 @@ and limits travel with each shard. Collection checks all planned files and
 shards, duplicate rows, unchanged provenance and missing reference results.
 Behavior differences are measurement results. Missing inputs, infrastructure
 errors and reference gaps fail collection.
+
+The plan hashes every input. A comment-only `KNOWNBUGS.rb` is explicitly
+inventoried as an empty input: its ZERO result is reported with zero tests,
+never a passing case. Executable input that discovers no assertions remains
+a reference gap. The selected target also handles PATH and env-shebang Ruby
+children, without putting Mere's library paths into the native host.
 
 Artifacts:
 

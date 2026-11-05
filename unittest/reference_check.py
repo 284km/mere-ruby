@@ -107,6 +107,36 @@ end
         self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
         self.assertEqual((row['tests'], row['match'], row['red'], row['both'], row['extra']), (3, 3, 0, 0, 0), row)
 
+    def test_path_and_env_shebang_children_use_each_selected_side(self):
+        poison = self.root / 'bin/ruby'
+        poison.write_text('#!/bin/sh\necho wrong-host-ruby >&2\nexit 93\n')
+        poison.chmod(0o755)
+        (self.root / 'src/test/ruby/test_path_child.rb').write_text('''require 'open3'
+require 'tmpdir'
+class TestPathChild < Test::Unit::TestCase
+  def test_path_ruby
+    expected = ENV['RUBY'] == ENV['MR_BIN'] ? 'shim' : 'native'
+    out, status = Open3.capture2e('ruby', '-r-test-/reference_probe', '-e', 'print NativeReferenceProbe.value')
+    assert(status.success?, out)
+    assert_equal(expected, out)
+  end
+  def test_env_shebang
+    expected = ENV['RUBY'] == ENV['MR_BIN'] ? 'shim' : 'native'
+    Dir.mktmpdir do |dir|
+      script = File.join(dir, 'fixture')
+      File.write(script, "#!/usr/bin/env ruby\\nrequire '-test-/reference_probe'\\nprint NativeReferenceProbe.value\\n")
+      File.chmod(0700, script)
+      out, status = Open3.capture2e(script)
+      assert(status.success?, out)
+      assert_equal(expected, out)
+    end
+  end
+end
+''')
+        row = self.measure('ruby/test_path_child.rb')
+        self.assertEqual((row['ref_state'], row['mere_state']), ('COMPLETE', 'COMPLETE'), row)
+        self.assertEqual((row['tests'], row['match']), (2, 2), row)
+
     def test_missing_native_reference_does_not_fall_back_to_mere_shim(self):
         (self.ext / '-test-' / self.extension.name).unlink()
         row = self.measure()

@@ -22,6 +22,7 @@ class HarnessCheck(unittest.TestCase):
             (self.root / folder).mkdir(parents=True)
         for script in ["run.sh", "list.sh", "transcript.py", "case_encodings.rb", "bootstrap.rb"]:
             shutil.copyfile(ROOT / "unittest" / script, self.root / "unittest" / script)
+        shutil.copytree(ROOT / 'unittest/child-bin', self.root / 'unittest/child-bin')
         shutil.copyfile(ROOT / "mspec/mask.sh", self.root / "mspec/mask.sh")
         (self.root / "unittest/files.txt").write_text("ruby\n-ruby/test_vm.rb\n")
         for name in ["test_ok.rb", "test_vm.rb", "test_helper.rb", "enc/test_encoding.rb"]:
@@ -108,6 +109,18 @@ exit "$(cat "$fixture_root/$side.code")"
         result = self.run_harness("--list", "-ext-")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["-ext-/test_bug.rb"])
+
+    def test_audited_extra_bodies_follow_recursive_scope_without_duplicates(self):
+        (self.root / 'src/test/rubygems').mkdir()
+        (self.root / 'src/test/rubygems/bundler_test_gem.rb').write_text('# body\n')
+        (self.root / 'unittest/extra_files.txt').write_text('rubygems/bundler_test_gem.rb\n')
+        self.assertIn('rubygems/bundler_test_gem.rb', self.run_harness('--list', '--all').stdout.splitlines())
+        result = self.run_harness('--list', 'rubygems', 'rubygems/bundler_test_gem.rb')
+        self.assertEqual(result.stdout.splitlines(), ['rubygems/bundler_test_gem.rb'])
+        self.assertNotIn('rubygems/bundler_test_gem.rb', self.run_harness('--list', 'ruby').stdout)
+        self.assertNotIn('rubygems/bundler_test_gem.rb', self.run_harness('--list').stdout)
+        (self.root / 'src/test/rubygems/bundler_test_gem.rb').unlink()
+        self.assertEqual(self.run_harness('--list', '--all').returncode, 2)
 
     def test_extension_directory_with_leading_hyphen_reaches_the_test_file(self):
         (self.root / "src/test/-ext-").mkdir()

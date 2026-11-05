@@ -272,7 +272,7 @@ def run_shard(args):
                   mere_ref=manifest["mere_ref"], ruby_ref=manifest["ruby_ref"],
                   binary_sha256=build["binary_sha256"],
                   reference_sha256=digest(os.environ["REF_RUBY_BIN"]),
-                  environment_policy="standalone-source-libraries-v5",
+                  environment_policy="per-side-path-ruby-v6",
                   test_data=data, rust_toolchain=rust_info(),
                   case_policy=transcript.POLICY,
                   bounds=dict(wall_per_side=args.wall, rss_family_kb=args.rss_kb,

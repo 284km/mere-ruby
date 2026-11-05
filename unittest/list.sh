@@ -2,7 +2,7 @@
 # Discover files without requiring a built interpreter or running a test.
 # Default: the historical files.txt selection (directories are shallow).
 # Explicit paths: recursive, including files excluded from the default record.
-# --all: every test_*.rb / *_test.rb below test/, except test_helper.rb.
+# --all: named candidates plus audited standalone bodies in extra_files.txt.
 set -eu
 LC_ALL=C; export LC_ALL
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -42,6 +42,29 @@ for path in "$@"; do
     exit 2
   fi
 done
+# Extra bodies follow the same directory scope as named candidates. Missing
+# entries fail before execution instead of quietly shrinking a pinned suite.
+if [ "$recursive" -eq 1 ] && [ -f "$here/extra_files.txt" ]; then
+  awk 'NF && $0 !~ /^#/ {print}' "$here/extra_files.txt" > "$work/extra"
+  while IFS= read -r extra; do
+    case "$extra" in
+      /*|..|../*|*/../*|*/..|--*|*[!a-zA-Z0-9_./-]*) echo "unittest: invalid extra path: $extra" >&2; exit 2 ;;
+    esac
+    for path in "$@"; do
+      if [ -d "$src/test/$path" ]; then
+        scope="$(cd "$src/test/$path" && pwd)"
+        case "$src/test/$extra" in
+          "$scope"/*) selected=1 ;;
+          *) selected=0 ;;
+        esac
+        if [ "$selected" -eq 1 ]; then
+          [ -f "$src/test/$extra" ] || { echo "unittest: missing audited test/$extra" >&2; exit 2; }
+          printf '%s\n' "$extra" >> "$work/files"
+        fi
+      fi
+    done
+  done < "$work/extra"
+fi
 sed 's|^\./||' "$work/files" | sort -u > "$work/sorted"
 if [ "$default" -eq 1 ]; then
   awk '/^-/ {print substr($0,2)}' "$here/files.txt" > "$work/excluded"

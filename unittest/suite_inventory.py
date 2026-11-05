@@ -24,10 +24,11 @@ def inventory(source):
     runners = {'test': 'test/runner.rb', 'bootstraptest': 'bootstraptest/runner.rb',
                'basictest': 'basictest/runner.rb', 'tool/test': 'tool/test/runner.rb',
                'spec/ruby': 'spec/mspec/bin/mspec', 'spec/bundler': 'spec/bin/rspec',
-               'spec/syntax_suggest': 'common.mk:test-syntax-suggest',
+               'spec/syntax_suggest': 'template/Makefile.in:test-syntax-suggest',
                'spec/mspec': 'spec/mspec: ruby -S bundle exec rspec (see README.md and Gemfile)',
                'spec-root': 'common.mk:bundled_gems_spec-run', 'knownbugs': 'bootstraptest/runner.rb'}
-    measured = {'test': 'unittest-report', 'bootstraptest': 'bootstrap-report'}
+    measured = {'test': 'unittest-report', 'bootstraptest': 'bootstrap-report',
+                'knownbugs': 'bootstrap-report', 'basictest': 'basic-report'}
     suites = []
     for name, paths in inputs.items():
         if len(paths) != len(set(paths)):
@@ -35,7 +36,10 @@ def inventory(source):
         records = []
         for path in paths:
             records.append(dict(path=path, sha256=hashlib.sha256((source / path).read_bytes()).hexdigest()))
-        suites.append(dict(suite=name, runner=runners[name], candidate_files=len(records), files=records,
+        runner = source / runners[name]
+        suites.append(dict(suite=name, runner=runners[name],
+                           runner_sha256=hashlib.sha256(runner.read_bytes()).hexdigest() if runner.is_file() else None,
+                           candidate_files=len(records), files=records,
                            report_artifact=measured.get(name),
                            execution='separate CI artifact; inventory is not an execution result' if name in measured else 'measurement pending'))
     unit_paths = set(inputs['test'])
