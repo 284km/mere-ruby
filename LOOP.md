@@ -1123,3 +1123,61 @@ The corpus and the two benchmarks take the same user time on both binaries.
   holds an accumulating self-call. Mere 0.1.701 marks such self-calls `notail`;
   the LLVM build matches the C build on all 482 corpus programs.
 
+
+## 2026-11-05: Enumerator walks its #each; the regexp engine's entry, not its steps
+
+**An Enumerator's block-taking Enumerable methods ran their source to the end
+first.** `str.to_enum(:scan, re).map { $& }` answered the last match four
+times: the elements were collected into an Array and the Array's map ran
+after. They walk #each now, one element at a time (the prelude's `__gen_map`
+and twenty more, written to enum.c's two ways of yielding: values kept apart,
+or packed into one and spread over a lambda), each block answering nil to the
+source as enum.c's do. Their frames read as ruby's C methods
+(`Enumerable#map`). Under it were two older faults: **a `break` in
+String#scan's block was dropped**, and **a `break` in the block of
+`Enumerator.new {}.each` was a StopIteration nothing caught** (it now unwinds
+to that #each as a flow, past the generator's own `loop` and `rescue`).
+
+Also: public_send is a frame of its own; `method(:eval).call` reads its
+caller; a wrapped load's self carries main's extended modules; `&:sym` and an
+explicit receiver respect a singleton class's private and protected methods
+(main's included); parameters list required keywords first; a regexp split
+leaves `$~` nil. core/kernel: 113 of 118 match.
+
+**The regexp engine was slow at its entry, not in its steps.** Thirteen
+workloads against ruby (`bench/regexp.sh`) put `/i`, an alternation, a
+literal in a long text and `=~` on small strings at 15-120x, where the
+engine's own steps (scan, gsub) were 3-6x. A profile of `=~` on small strings:
+the collector 40%, writing the MatchData's ivars, the encoding check; the VM
+under 5%. What changed:
+
+- the bytes a match can start with are a set, and other positions are
+  skipped without running the program;
+- `/i` on an ASCII character is a class of its two cases;
+- the MatchData is a record until `$~` is read;
+- a greedy loop over one character runs in place, pushing the same choices in
+  the same order -- none when the byte after it is one the body never reads --
+  and counts its steps toward the match cache (without them `/a+z/` over a
+  million a's was quadratic: test_match_cache_with_peek_optimization);
+- the search before is reused when the pattern is the same.
+
+| workload | ruby | before | after |
+|---|---|---|---|
+| ci `scan(/ALPHA\|BETA/i)` | 0.007 | 0.89 | 0.014 |
+| alternation | 0.012 | 0.21 | 0.033 |
+| nomatch | 0.005 | 0.056 | 0.009 |
+| literal_find | 0.004 | 0.125 | 0.049 |
+| gsub_digits | 0.013 | 0.074 | 0.026 |
+| scan_words | 0.034 | 0.13 | 0.099 |
+| anchored (`=~` on 20,000 small strings) | 0.007 | 0.33 | 0.22 |
+
+- ⚠ **Measure the workloads before the engine.** A single adversarial case
+  measures the VM's step; it says nothing about the search's entry or the
+  objects a match leaves, which is where the typical uses spent their time.
+- ⚠ **Two sides computed by this interpreter can agree by both being wrong.**
+  test_lazy_to_enum_lazy_methods compares an Enumerator's answer with a Lazy's;
+  fixing the Enumerator made it red, because the Lazy had the same fault.
+- Left: anchored and match_lines are the interpreter's call and loop, not the
+  engine; literal_find wants memchr from an offset, which Mere's `str_index_of`
+  does not take; scan_email starts at every letter of a word where Onigmo
+  searches for the `@` first.
