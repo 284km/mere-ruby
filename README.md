@@ -265,6 +265,13 @@ example was describing a layout rather than measuring anything. (`shellwords`
 used to be here too; it is compiled in now, so the shipped one wins and it
 demonstrates nothing about the load path.)
 
+Psych's `ScalarScanner`, `ClassLoader` and `Handler` use their real pure Ruby
+files from the supplied library path. The class resolver preserves restricted
+class/symbol loading, and String subclasses can call `super` into `match?`.
+`sh tools/psych_scalar_check.sh` compares these protocols with native Psych,
+including autoload and direct require. The existing YAML parser/emitter is
+still a subset; full Parser, Nodes, aliases, tags and serialization remain work.
+
 A C extension is not automatically out of reach, but it has to be
 answered rather than found. `digest`, `date` and `etc` ship as Ruby
 source, `zlib`'s compression comes from a vendored Mere package (above)
