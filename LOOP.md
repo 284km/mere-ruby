@@ -1224,3 +1224,86 @@ read eight ways (ten on an ASCII subject), all as ruby's.
   rindex only on ASCII subjects.
 - Left: scan_words and gsub_digits run the VM at every match, and the VM is
   about 40% of scan_words; rebuilding it would gain at most 1.5x there.
+
+
+## 2026-11-06: what every statement and every call paid, and an Enumerator over one value
+
+**Each statement paid for work that had not changed.** A profile of an empty
+`while` loop showed four costs on every statement, none of them the loop's:
+
+- the file name was set again (`SFile`), with the lookups behind it, though it
+  was the file already current;
+- the safepoint summed the bytes of every store to decide whether to collect;
+  it now sums them only when an allocation counter moved, or once in 64 calls
+  (`gc_bytes_due`);
+- `undef_blocked`, the builtin alias lookup and the singleton check behind an
+  arity message walked their tables for names no program had undefined,
+  aliased or defined (each now asks a map of the names first);
+- the regexp's last-search state was eight string keys in a map, written at
+  every search; it is a vector of eight slots.
+
+Two more were Mere's, fixed there in 0.1.705: every region a statement took
+was charged to a table of sites that is only printed under
+`MERE_REGION_STATS`, and string equality was `strcmp` where the length is
+already stored before the bytes (now a length check and `memcmp`).
+
+| per iteration, microseconds | before | after |
+|---|---|---|
+| `while` with an empty body | 1.08 | 0.59 |
+| `while` + `a.size` | 2.85 | 1.76 |
+| `while` + `f(i)` | 2.96 | 1.84 |
+| `while` + `pr.call(i)` | 4.06 | 2.80 |
+| `times { yield-ish }` | 1.52 | 0.91 |
+
+**An Enumerator over a source that yields one value walks it with one
+parameter.** `n.times.select { }`, `ary.each.map { }` and their kind went
+through the generic walk, which packs each yield's values into an array for
+blocks that may take several. For Integer#times, Array#each, an Integer
+Range#each and String#each_line / each_char / each_byte, when the program has
+not redefined the source, `count`, `map`, `select`, `reject` and `filter_map`
+use a walk that yields `x` (`__gen1_*` in the prelude), and `to_a` / `first` /
+`take` build the elements without running the source (`gen1_take`).
+
+| N = 20000, seconds | before | after |
+|---|---|---|
+| `times.count { }` | 0.156 | 0.037 |
+| `times.select { }` | 0.171 | 0.042 |
+| `times.sum { }` | 0.138 | 0.016 |
+| `times.to_a` | 0.111 | 0.000 |
+| `map.with_index` | 0.294 | 0.205 |
+
+**`=~` with `\K` and String#rindex with a regexp answer as ruby's.** Both
+were left in the entry before this one:
+
+- `=~` answers where the successful attempt began, which a `\K` leaves behind
+  (`rxv_att`); it answered the match's own start.
+- String#rindex tried attempts from inside a UTF-8 character, which matched
+  its trailing bytes (`"aあbあb".rindex(/[^ ]b/)` was 5). It now skips
+  continuation bytes. index and rindex count characters in the subject's own
+  encoding (binary, ISO-8859-1, EUC-JP, UTF-16), where they counted UTF-8's.
+
+The regexp workloads (bench/regexp.sh, best of three):
+
+| workload | ruby | before | after |
+|---|---|---|---|
+| match_lines | 0.003 | 0.130 (37x) | 0.047 (13x) |
+| anchored | 0.007 | 0.210 (28x) | 0.088 (12x) |
+| scan_words | 0.035 | 0.101 | 0.070 |
+| capture_log | 0.014 | 0.048 | 0.038 |
+| scan_email | 0.058 | 0.114 | 0.100 |
+
+corpus 488 reads `\K` and rindex over UTF-8, binary, ISO-8859-1, EUC-JP and
+UTF-16 subjects; corpus 489 reads the one-value walk next to sources that yield
+several values, a generator, break / next / return / raise in the block, `$~`
+in the block and programs that redefine the source. Both are as ruby's.
+
+- Found and left, all there before this change:
+  - a lambda passed to `map` over a source that yields several values
+    (`each_with_index`, `with_index`, `[[1, 2]].each`) raises ArgumentError;
+  - `select(&:itself)` over a generator that yields two values raises
+    ArgumentError;
+  - aliasing the builtin Integer#times and then redefining it gives
+    NoMethodError for the alias.
+- Left: scan_words is now about 30% the VM, 14% entering a search and 15-20%
+  the collector. Rebuilding the VM is still worth at most 1.4x there.
+  match_lines and anchored are now the interpreter's loop and call.

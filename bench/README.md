@@ -316,7 +316,27 @@ the 507 binary and this one alternately; the rest did not move):
   when nothing in the pattern reads where the match started (no backreference,
   condition, call, absent operator or `\G`).
 
-What is left: match_lines and anchored are the interpreter's call and loop,
-not the engine (the loop alone is 20x ruby's); scan_words and gsub_digits run
-the VM at every match, and the VM is about 40% of scan_words, so rebuilding it
-would gain at most 1.5x there.
+Then, on 2026-11-06, what every statement and call paid (the 508 binary and
+this one alternately, best of three; the workloads not listed moved under 10%):
+
+| workload | ruby | before | after |
+|---|---|---|---|
+| match_lines | 0.003 | 0.130 | 0.047 |
+| anchored | 0.007 | 0.210 | 0.088 |
+| scan_words | 0.035 | 0.101 | 0.070 |
+| capture_log | 0.014 | 0.048 | 0.038 |
+| scan_email | 0.058 | 0.114 | 0.100 |
+| gsub_digits | 0.013 | 0.026 | 0.022 |
+
+- **A statement no longer pays for what did not change**: setting the current
+  file again, summing every store's bytes at the safepoint, and walking the
+  undef, alias and singleton tables for names no program touched. With Mere
+  0.1.705 (regions are not tallied unless `MERE_REGION_STATS` is set, string
+  equality is a length check and `memcmp`), an empty `while` iteration went
+  from 1.08 to 0.59 microseconds.
+- **The last-search state is a vector of eight slots**, where it was a map of
+  eight string keys written at every search.
+
+What is left: match_lines and anchored are the interpreter's loop and call
+(13x and 12x ruby's). scan_words is about 30% the VM, 14% entering a search
+and 15-20% the collector, so rebuilding the VM would gain at most 1.4x there.
