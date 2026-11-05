@@ -128,6 +128,12 @@ Each side explicitly selects its running interpreter through `RUBY` and
 passes its helper paths through `RUBYLIB` to children. Only the reference
 receives the native extension directory; only mere-ruby receives the shims.
 Missing native reference extensions stay visible instead of falling back.
+The native reference retains its own standard/default-gem load path ordering;
+those directories are not duplicated in its `RUBYLIB`. mere-ruby receives the
+reference's pure-Ruby library directories explicitly. Adding native stdlib
+directories to `RUBYLIB` bypasses default-gem activation and moves them ahead
+of RubyGems' insertion marker, including in child processes. This distinction
+is recorded as environment policy `standalone-source-libraries-v5`.
 The real-Ruby regression compiles a small extension and checks competing
 native/shim paths in both the parent and a subprocess.
 
@@ -136,6 +142,12 @@ so repository-specific checks such as `Gem.prefix` inspect the tested source.
 `bootstrap.rb` explicitly preloads the prerequisites that selected files rely
 on from earlier whole-suite tests (Tempfile, tmpdir, FileUtils, delegate or
 socket). Only the named files receive those prerequisites, equally per side.
+RubyGems files also receive test-unit 3's unqualified `assert_raise` contract:
+some exception must be raised, while explicit expected classes retain their
+checks and pending/skipped tests still propagate. The ruby-core assertion
+contract is unchanged for core files. This avoids reporting a missing Fiddle
+symbol as a failure merely because the two assertion frameworks disagree on
+an empty expected-class list.
 This does not change test definitions, assertions or feature guards.
 
 The reference archive also preserves its original build Makefile and static
@@ -173,8 +185,10 @@ recorded, and collection rejects mixed inputs.
 The packaged Rake entry point is invoked explicitly with each side's selected
 Ruby and Rake library directory. RubyGems tests reset GEM_HOME/GEM_PATH; falling
 back to a host `rake` shebang could otherwise start an unrelated Ruby with
-incompatible native extensions. The reference's packaged gem library paths
-remain available to its children through RUBYLIB.
+incompatible native extensions. The RakeBuilder tests are the exception: they
+install and select their own good/bad Rake fixtures, so the worker leaves the
+`rake` override unset for that file. Native children keep their own installed
+gem paths; mere-ruby children receive the pure-Ruby gem libraries explicitly.
 
 `environment_smoke.py` uses the normal process-family supervisor, a 300-second
 wall limit and 2 GiB family RSS limit. It requires casefold, comprehensive

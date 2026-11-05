@@ -101,6 +101,13 @@ seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
 rake_source="$("$ref" -e 'begin; print Gem.bin_path("rake", "rake"); rescue Gem::Exception; end')"
 select_rake() {
+  # This file installs its own rake gem and checks RubyGems' executable
+  # selection. A global override would bypass that fixture. Its other tests
+  # already select their good/bad rake explicitly through build_rake_in.
+  if [ "$rel" = "rubygems/test_gem_ext_rake_builder.rb" ]; then
+    unset rake
+    return 0
+  fi
   if [ -n "$rake_source" ]; then
     # Gem tests replace GEM_HOME/GEM_PATH and may fall back to a host rake
     # whose shebang selects a different Ruby/extension ABI.
@@ -148,7 +155,10 @@ if [ "${1:-}" = "--one" ]; then
   # restored context reuses the installed config, rebinding only topdir;
   # children inherit these -I entries through assert_separately.
   set --
-  ref_lib="$src/tool/lib:$src/test:$stdlib"
+  # Native Ruby supplies its own standard/default-gem load paths. Repeating
+  # them in RUBYLIB moves them before RubyGems' insertion marker, bypassing
+  # default-gem activation and changing which gem version wins in children.
+  ref_lib="$src/tool/lib:$src/test"
   if [ -n "${UNITTEST_REF_EXT_PATH:-}" ]; then
     ref_lib="$UNITTEST_REF_EXT_PATH:$ref_lib"
   fi
