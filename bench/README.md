@@ -292,7 +292,31 @@ What changed, in the order it paid:
   once per match, and building the key and eight lookups was more than a
   small match.
 
+Then, the same day, the literal a match must hold (the mean of two runs each,
+the 507 binary and this one alternately; the rest did not move):
+
+| workload | ruby | before | after |
+|---|---|---|---|
+| literal_find | 0.004 | 0.055 | 0.003 |
+| scan_email | 0.065 | 0.175 | 0.120 |
+| nomatch | 0.005 | 0.010 | 0.001 |
+
+- **The required literal is found first** (`rxq_store`, `rxv_search_lit`):
+  the longest run of ASCII characters every match holds, preferring one at a
+  bounded distance from the match's start, with the least and most bytes
+  before it. The search finds the literal (memchr from the start, a byte loop
+  after), and runs the program only at the starts that can reach it. Not for a
+  multibyte encoding other than UTF-8, `/i`, or `\G`.
+- **String#index on an ASCII string skips the character walks**: the answer
+  was a byte offset converted back to characters by copying the prefix and
+  counting it, which was most of literal_find after the search.
+- **An opening class loop skips its run** (`rxq_lead`, `rxq_next`): when
+  `/[a-z]+@/` fails at a letter, it fails at every later letter of that run,
+  since the attempts from there are a subset of the ones already tried. Only
+  when nothing in the pattern reads where the match started (no backreference,
+  condition, call, absent operator or `\G`).
+
 What is left: match_lines and anchored are the interpreter's call and loop,
-not the engine (the loop alone is 20x ruby's); literal_find wants memchr, which
-a byte loop in Mere is not; scan_email starts a search at every letter of a
-word, where Onigmo searches for the `@` first and backs up.
+not the engine (the loop alone is 20x ruby's); scan_words and gsub_digits run
+the VM at every match, and the VM is about 40% of scan_words, so rebuilding it
+would gain at most 1.5x there.

@@ -329,9 +329,13 @@ type RxHit = RHit of int * int * (int * int) list | RNoHit | RBadPat;
 // a parse's capturing groups by number, for the subroutines \g<x> calls
 // the search before's pattern and what was looked up for it (rxv_search):
 // "p" "f" "e" its pattern, flags and cut encoding, "r" the required bytes,
-// "b" the start set; [valid, cut kind, cache allowed, key handle]; the program
+// "b" the start set, "l" the literal every match holds, "c" the opening
+// class loop's answers (rxq_lead); [valid, cut kind,
+// cache allowed, key handle, the literal's least and most offset]; the program
 let rxv_ls = map_new ();
 let rxv_li = vec_new ();
+let _ = vec_push rxv_li 0;
+let _ = vec_push rxv_li 0;
 let _ = vec_push rxv_li 0;
 let _ = vec_push rxv_li 0;
 let _ = vec_push rxv_li 0;
@@ -31461,7 +31465,12 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
           // is a BINARY regexp with an EUC-JP string. (This guessed from the
           // pattern's bytes alone, and named EUC-JP whatever they were.)
           let _ = rx_enc_guard world (VRegex (p, pf, pev)) recv in
-          let cn = utf8_len sv in
+          // (an ASCII receiver counts characters as bytes: the length, the
+          //  offset and the answer were each a walk of the whole string --
+          //  `text.index(/key_3999/)` over 300 KB was those walks, not the
+          //  search. The answer is the handle's, cached: str_is_ascii)
+          let a9 = str_is_ascii h && enc_ascii_compat (senc_get h) in
+          let cn = (if a9 then str_len sv else utf8_len sv) in
           let n = str_len sv in
           if (str_len name == 5 && str_eq name "index") || (str_len name == 9 && str_eq name "byteindex") then
             (let off0 = (match rest with Cons (VInt o, _) -> o | _ -> 0) in
@@ -31474,9 +31483,9 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
              // beside it has cleared all along.
              if off < 0 || off > lim then (let _ = rx_md_set VNil in VNil)
              else
-               let bst = (if (str_len name == 5 && str_eq name "index") then utf8_boff sv off 0 else off) in
-               (match rx_idx_pub world p pf sv bst (senc_get h) with
-                | VInt ci -> (if (str_len name == 5 && str_eq name "index") then VInt ci else VInt (utf8_boff sv ci 0))
+               let bst = (if (str_len name == 5 && str_eq name "index") && (if a9 then false else true) then utf8_boff sv off 0 else off) in
+               (match rx_idx_pub world p pf sv bst (senc_get h) a9 with
+                | VInt ci -> (if (str_len name == 5 && str_eq name "index") || a9 then VInt ci else VInt (utf8_boff sv ci 0))
                 | other -> other))
           else if (str_len name == 6 && str_eq name "rindex") || (str_len name == 10 && str_eq name "byterindex") then
             (let lim0 = (if (str_len name == 6 && str_eq name "rindex") then cn else n) in
@@ -31488,10 +31497,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
              let off = (if off0 < 0 then lim0 + off0 else off0) in
              if off < 0 then (let _ = rx_md_set VNil in VNil)
              else
-               let blim = (if (str_len name == 6 && str_eq name "rindex") then utf8_boff sv (if off > cn then cn else off) 0
+               let blim = (if (str_len name == 6 && str_eq name "rindex") && (if a9 then false else true) then utf8_boff sv (if off > cn then cn else off) 0
                            else (if off > n then n else off)) in
-               (match rx_last_pub world p pf sv blim (senc_get h) with
-                | VInt ci -> (if (str_len name == 6 && str_eq name "rindex") then VInt ci else VInt (utf8_boff sv ci 0))
+               (match rx_last_pub world p pf sv blim (senc_get h) a9 with
+                | VInt ci -> (if (str_len name == 6 && str_eq name "rindex") || a9 then VInt ci else VInt (utf8_boff sv ci 0))
                 | other -> other))
           else if (str_len name == 9 && str_eq name "partition") then
             (match rxv_search p pf sv 0 with
@@ -31507,7 +31516,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
              if st < 0 then (let _ = rx_md_set VNil in
                              arr_new (Cons (mkstr "", Cons (mkstr "", Cons (mkstr sv, Nil)))))
              else
-               (let _ = rx_last_pub world p pf sv n (senc_get h) in
+               (let _ = rx_last_pub world p pf sv n (senc_get h) a9 in
                 arr_new (Cons (mkstr_e (substring sv 0 st) (senc_get h), Cons (mkstr_e (substring sv st en) (senc_get h), Cons (mkstr_e (substring sv en n) (senc_get h), Nil))))))
         | _ -> VNil)
      | _ -> VNil)
@@ -57789,6 +57798,133 @@ and rxr_any_from = fn (s: str) -> fn (req: str) -> fn (i: int) -> fn (j: int) ->
   if j >= str_len req then false
   else if str_find_from s (char_at req j) i >= 0 then true
   else rxr_any_from s req i (j + 1)
+// THE LITERAL EVERY MATCH HOLDS, AND HOW FAR INTO THE MATCH IT STANDS
+// (Onigmo's exact). A run of plain ASCII characters in the pattern's own
+// sequence -- not under a loop, an alternation or a lookaround -- is in
+// every match, at least dmin and at most dmax bytes (-1: no bound) after its
+// start. The search looks for the literal first (rxv_search_lit): none left
+// is no match at all, and a start more than dmax bytes before it, or less
+// than dmin, cannot match. `text.index(/key_3999/)` ran the program at every
+// `k` of 300 KB; `/zzz\d+qqq/` at every `z`.
+// The widths are bytes, of the widest cut: any character is 1 to 4 bytes
+// (a one-byte cut's 1 is within that); /i reaches folds of other lengths
+// (ß for ss, the Kelvin sign for k), so a /i character or class is 0 to
+// unbounded. Kept per key: the literal, "" when none.
+and rxq_store = fn (key: str) -> fn (n: RNode) ->
+  let xs = rxq_flat n Nil in
+  let _ = vec_set rxq_best 0 0 in
+  let _ = vec_set rxq_best 1 0 in
+  let _ = vec_set rxq_best 2 0 in
+  let lit = rxq_walk (rev_app xs Nil) 0 0 "" 0 0 "" in
+  let _ = map_set rx_lits key lit in
+  let _ = map_set rx_litmn key (vec_get rxq_best 1) in
+  let _ = map_set rx_litmx key (vec_get rxq_best 2) in
+  map_set rx_leads key (rxq_lead (rev_app xs Nil) n)
+// A PATTERN THAT OPENS WITH A CLASS LOOP, `[a-z]+@...`: a run from x that
+// failed tried the rest of the pattern after every position the loop reached
+// -- and a start further along the same run of the class reaches a part of
+// those, so it fails too. The search moves on past the run (rxq_next): a
+// scan for /[a-z]+@[a-z]+\.com/ read each word once per letter in it. The
+// class's answers for ASCII ("" when there is no such loop), and only for a
+// pattern whose rest cannot tell where the match began -- no backreference,
+// condition, call, absent operator or \G.
+and rxq_lead = fn (xs: RNode list) -> fn (n: RNode) ->
+  match xs with
+  | Cons (NRep (NClass (items, neg, false), lo, hi, _), _) when lo >= 1 && hi < 0 && rxq_plain n ->
+    rxv_cls_bits items neg 0 ""
+  | _ -> ""
+and rxq_plain = fn (n: RNode) ->
+  match n with
+  | NBackref (_, _) -> false | NBackrefL (_, _, _) -> false | NCond (_, _, _) -> false
+  | NCall _ -> false | NAbsent _ -> false | NGANCHOR -> false
+  | NSeq xs -> rxq_plain_l xs | NAlt xs -> rxq_plain_l xs
+  | NRep (b, _, _, _) -> rxq_plain b | NGroup (b, _, _) -> rxq_plain b | NAtomic b -> rxq_plain b
+  | NLook (b, _) -> rxq_plain b | NLookB (b, _) -> rxq_plain b
+  | _ -> true
+and rxq_plain_l = fn (xs: RNode list) ->
+  match xs with Nil -> true | Cons (h, t) -> rxq_plain h && rxq_plain_l t
+// the next start after a run from x failed: past the class's run when x
+// is in it (rxq_lead), else the next character
+and rxq_next = fn (s: str) -> fn (x: int) -> fn (ld: str) ->
+  if x >= str_len s then x + 1
+  else if str_len ld == 0 then x + cut_clen s x
+  else (let b = ord (char_at s x) in
+        if b < 128 && ord (char_at ld b) == 49 then rxq_run s (x + 1) ld else x + cut_clen s x)
+and rxq_run = fn (s: str) -> fn (j: int) -> fn (ld: str) ->
+  if j >= str_len s then j
+  else (let b = ord (char_at s j) in if b < 128 && ord (char_at ld b) == 49 then rxq_run s (j + 1) ld else j)
+// the pattern's own sequence, its groups opened (newest first)
+and rxq_flat = fn (n: RNode) -> fn (acc: RNode list) ->
+  match n with
+  | NSeq xs -> rxq_flat_l xs acc
+  | NGroup (b, _, _) -> rxq_flat b acc
+  | NAtomic b -> rxq_flat b acc
+  | _ -> Cons (n, acc)
+and rxq_flat_l = fn (xs: RNode list) -> fn (acc: RNode list) ->
+  match xs with Nil -> acc | Cons (h, t) -> rxq_flat_l t (rxq_flat h acc)
+// along the sequence: lo/hi the offset reached, run the literal being read
+// (from rlo/rhi); the best one so far is returned, its offsets in rxq_best
+and rxq_walk = fn (xs: RNode list) -> fn (lo: int) -> fn (hi: int) -> fn (run: str) -> fn (rlo: int) -> fn (rhi: int) -> fn (best: str) ->
+  match xs with
+  | Nil -> rxq_better run rlo rhi best
+  | Cons (NChar c, t) when str_len c == 1 && ord c > 0 && ord c < 128 ->
+    (if str_len run == 0 then rxq_walk t (lo + 1) (if hi < 0 then hi else hi + 1) c lo hi best
+     else rxq_walk t (lo + 1) (if hi < 0 then hi else hi + 1) (run ++ c) rlo rhi best)
+  | Cons (h, t) ->
+    (let best2 = rxq_better run rlo rhi best in
+     let a = rxq_wmin h in
+     let b = rxq_wmax h in
+     rxq_walk t (rxq_cap (lo + a)) (if hi < 0 || b < 0 then 0 - 1 else rxq_cap0 (hi + b)) "" 0 0 best2)
+// a bounded offset is worth more (the search skips to it), then length
+and rxq_better = fn (run: str) -> fn (rlo: int) -> fn (rhi: int) -> fn (best: str) ->
+  if str_len run == 0 then best
+  else
+    (let sc = str_len run + (if rhi >= 0 then 100000 else 0) in
+     let sb = (if str_len best == 0 then 0 else str_len best + (if vec_get rxq_best 2 >= 0 then 100000 else 0)) in
+     if sc > sb then (let _ = vec_set rxq_best 1 rlo in let _ = vec_set rxq_best 2 rhi in run) else best)
+// (offsets past a gigabyte are no bound: the least is then only smaller)
+and rxq_cap = fn (w: int) -> if w > 1000000000 then 1000000000 else w
+and rxq_cap0 = fn (w: int) -> if w > 1000000000 then 0 - 1 else w
+and rxq_wmin = fn (n: RNode) ->
+  match n with
+  | NChar c -> (if str_len c == 0 then 0 else 1) | NAny -> 1 | NAnyNL -> 1 | NGrapheme -> 1
+  | NClass (_, _, ci) -> (if ci then 0 else 1)
+  | NSeq xs -> rxq_wmin_l xs 0
+  | NAlt xs -> rxq_wmin_alt xs (0 - 1)
+  | NRep (b, lo, _, _) -> rxq_cap (rxq_wmin b * (if lo > 1000000000 then 1000000000 else lo))
+  | NGroup (b, _, _) -> rxq_wmin b
+  | NAtomic b -> rxq_wmin b
+  | _ -> 0
+and rxq_wmin_l = fn (xs: RNode list) -> fn (a: int) ->
+  match xs with Nil -> a | Cons (h, t) -> rxq_wmin_l t (rxq_cap (a + rxq_wmin h))
+and rxq_wmin_alt = fn (xs: RNode list) -> fn (a: int) ->
+  match xs with
+  | Nil -> (if a < 0 then 0 else a)
+  | Cons (h, t) -> (let w = rxq_wmin h in rxq_wmin_alt t (if a < 0 || w < a then w else a))
+and rxq_wmax = fn (n: RNode) ->
+  match n with
+  | NChar c -> str_len c
+  | NAny -> 4 | NAnyNL -> 4
+  | NClass (_, _, ci) -> (if ci then 0 - 1 else 4)
+  | NSeq xs -> rxq_wmax_l xs 0
+  | NAlt xs -> rxq_wmax_alt xs 0
+  | NRep (b, _, hi, _) ->
+    (let w = rxq_wmax b in
+     if w < 0 || hi < 0 then 0 - 1 else if hi > 1000000000 || (w > 0 && hi > 1000000000 / w) then 0 - 1 else w * hi)
+  | NGroup (b, _, _) -> rxq_wmax b
+  | NAtomic b -> rxq_wmax b
+  | NBOL -> 0 | NEOL -> 0 | NBOS -> 0 | NEOS -> 0 | NEOSNL -> 0 | NGANCHOR -> 0
+  | NWordB (_, _) -> 0 | NLook (_, _) -> 0 | NLookB (_, _) -> 0
+  | NFlagsRest _ -> 0 | NEmpty -> 0
+  | _ -> 0 - 1
+and rxq_wmax_l = fn (xs: RNode list) -> fn (a: int) ->
+  match xs with
+  | Nil -> a
+  | Cons (h, t) -> (let w = rxq_wmax h in let a2 = (if w < 0 then 0 - 1 else rxq_cap0 (a + w)) in if a2 < 0 then a2 else rxq_wmax_l t a2)
+and rxq_wmax_alt = fn (xs: RNode list) -> fn (a: int) ->
+  match xs with
+  | Nil -> a
+  | Cons (h, t) -> (let w = rxq_wmax h in if w < 0 then 0 - 1 else rxq_wmax_alt t (if w > a then w else a))
 and rxc_get = fn (pat: str) -> fn (fl: str) ->
   let key = rx_cut_key pat fl in
   if map_has rx_progs key then map_get rx_progs key
@@ -57867,12 +58003,14 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
     let _ = map_set rx_progs key prog in
     let req9 = rxr_req n in
     let _ = map_set rx_reqs key req9 in
+    let _ = rxq_store key n in
     // the names are still in rx_gnums from the parse just above
     let _ = map_set rx_prog_names key (mkstr (rx_names_join ())) in
     let plain9 = fl ++ chr 1 ++ pat in
     let _ = (if map_has rx_progs plain9 then ()
              else (let _ = map_set rx_progs plain9 prog in
                    let _ = map_set rx_reqs plain9 req9 in
+                   let _ = rxq_store plain9 n in
                    map_set rx_prog_names plain9 (mkstr (rx_names_join ())))) in
     prog
 
@@ -58667,6 +58805,7 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
      //  again, as rx_key_handle asks)
      && (vec_get rxv_li 3 < 0 || str_eq (sget (vec_get rxv_li 3)) (map_get rxv_ls "k")) then
     rxv_search_k fl s start once9 (vec_get rxv_lp 0) (vec_get rxv_li 2 == 1) (map_get rxv_ls "r") (map_get rxv_ls "b") (vec_get rxv_li 3)
+      (map_get rxv_ls "l") (vec_get rxv_li 4) (vec_get rxv_li 5) (map_get rxv_ls "c")
   else
   let key = rx_cut_key pat fl in
   if map_has rx_bad key then RBadPat
@@ -58682,6 +58821,14 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
        //  is left: no search -- see rxr_req)
        let req9 = (if ok9 then "" else if map_has rx_reqs key then map_get rx_reqs key else "") in
        let fbs9 = (if vec_get cut_k 0 == 2 then "" else rxv_fbs key prog) in
+       let lit9 = (if vec_get cut_k 0 == 2 || (if map_has rx_lits key then false else true) then "" else map_get rx_lits key) in
+       let dmn9 = (if str_len lit9 > 0 then map_get rx_litmn key else 0) in
+       let dmx9 = (if str_len lit9 > 0 then map_get rx_litmx key else 0) in
+       let ld9 = (if vec_get cut_k 0 == 2 || (if map_has rx_leads key then false else true) then "" else map_get rx_leads key) in
+       let _ = map_set rxv_ls "l" lit9 in
+       let _ = map_set rxv_ls "c" ld9 in
+       let _ = vec_set rxv_li 4 dmn9 in
+       let _ = vec_set rxv_li 5 dmx9 in
        let _ = map_set rxv_ls "p" pat in
        let _ = map_set rxv_ls "k" key in
        let _ = map_set rxv_ls "f" fl in
@@ -58693,9 +58840,9 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
        let _ = vec_set rxv_li 2 (if ok9 then 1 else 0) in
        let _ = vec_set rxv_li 3 kh9 in
        let _ = vec_set rxv_li 0 1 in
-       rxv_search_k fl s start once9 prog ok9 req9 fbs9 kh9)
+       rxv_search_k fl s start once9 prog ok9 req9 fbs9 kh9 lit9 dmn9 dmx9 ld9)
     else (let _ = map_set rx_bad key VNil in RBadPat)
-and rxv_search_k = fn (fl: str) -> fn (s: str) -> fn (start: int) -> fn (once9: bool) -> fn prog -> fn (ok9: bool) -> fn (req9: str) -> fn (fbs9: str) -> fn (kh9: int) ->
+and rxv_search_k = fn (fl: str) -> fn (s: str) -> fn (start: int) -> fn (once9: bool) -> fn prog -> fn (ok9: bool) -> fn (req9: str) -> fn (fbs9: str) -> fn (kh9: int) -> fn (lit9: str) -> fn (dmn9: int) -> fn (dmx9: int) -> fn (ld9: str) ->
   // (and not written when it is the handle there already: every write
   //  copies into rx_cur's region, 384 bytes per gsub)
   let _ = (if map_has rx_cur "k" && (match map_get rx_cur "k" with VStr o9 -> o9 == kh9 | _ -> false)
@@ -58731,16 +58878,20 @@ and rxv_search_k = fn (fl: str) -> fn (s: str) -> fn (start: int) -> fn (once9: 
                | RFound (e, _) -> (let sv = rxs_snapshot () in RHit (rxv_keep_start sv start, e, sv))
                | RFail -> RNoHit)
        else
-         // (where no match can start, nothing is run: rxv_fbs)
-         (if str_len fbs9 == 0 || vec_get cut_k 0 == 2 then rxv_search_go prog s start (str_len s)
-          else rxv_search_fb prog s start (str_len s) fbs9 (vec_get cut_k 0 == 1))
+         // (the literal every match holds is looked for first: rxq_store;
+         //  not under rindex's pinned \G, whose walk is its own)
+         (if str_len lit9 > 0 && vec_get cut_k 0 != 2 && (if map_has rx_ganchor "o" then false else true) then
+            rxv_search_lit prog s start (str_len s) lit9 dmn9 dmx9 (if vec_get cut_k 0 == 2 then "" else fbs9) (vec_get cut_k 0 == 1) ld9
+          // (where no match can start, nothing is run: rxv_fbs)
+          else if str_len fbs9 == 0 || vec_get cut_k 0 == 2 then rxv_search_go prog s start (str_len s) ld9
+          else rxv_search_fb prog s start (str_len s) fbs9 (vec_get cut_k 0 == 1) ld9)
 // a \K that ran moved the match's start to where it stood
 and rxv_keep_start = fn (sv: (int * int) list) -> fn (st: int) ->
   (let k9 = rxv_slot_get sv (0 - 1) in if k9 >= 0 then k9 else st)
 // the first instruction, when it is an anchor, is the whole search plan
 and rxv_anchored = fn prog ->
   match rxv_fetch prog 0 with IGANCHOR -> true | IBOS -> true | _ -> false
-and rxv_search_go = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) ->
+and rxv_search_go = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) -> fn (ld: str) ->
   if i > len then RNoHit
   else
     match (let _ = rxs_reset () in rxv_run prog s 0 i 0) with
@@ -58748,7 +58899,7 @@ and rxv_search_go = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) ->
     // Restart at the next CHARACTER: stepping a byte at a time made a scan over
     // a multibyte string try positions inside a character, so `"こんにちは"
     // .split(//)` reported 15 pieces where Ruby says 5.
-    | RFail -> rxv_search_go prog s (i + (if i < str_len s then cut_clen s i else 1)) len
+    | RFail -> rxv_search_go prog s (rxq_next s i ld) len ld
 
 // THE BYTES A MATCH CAN START WITH. The search tried every position: a reset
 // and a run of the program at each, to fail on the first instruction almost
@@ -58801,20 +58952,57 @@ and rxv_fb = fn prog -> fn seen -> fn acc -> fn (pc: int) ->
      | ICheck (_, out) -> rxv_fb prog seen acc (pc + 1) && rxv_fb prog seen acc out
      | _ -> false)
 // the search with the start set: run the program only where it can start
-and rxv_search_fb = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) -> fn (fbs: str) -> fn (u8: bool) ->
+and rxv_search_fb = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) -> fn (fbs: str) -> fn (u8: bool) -> fn (ld: str) ->
   let j = rxv_fb_skip s i len fbs u8 in
   // (every match reads a byte first, so none starts at the end)
   if j >= len then RNoHit
   else
     match (let _ = rxs_reset () in rxv_run prog s 0 j 0) with
     | RFound (e, _) -> (let sv = rxs_snapshot () in RHit (rxv_keep_start sv j, e, sv))
-    | RFail -> rxv_search_fb prog s (j + cut_clen s j) len fbs u8
+    | RFail -> rxv_search_fb prog s (rxq_next s j ld) len fbs u8 ld
 and rxv_fb_skip = fn (s: str) -> fn (i: int) -> fn (len: int) -> fn (fbs: str) -> fn (u8: bool) ->
   if i >= len then len
   else
     (let b = ord (char_at s i) in
      if ord (char_at fbs b) == 49 && (if u8 then (b < 128 || b >= 192) else true) then i
      else rxv_fb_skip s (i + 1) len fbs u8)
+
+// the search with the literal: find it at or after lo + dmin, run the
+// program at the starts that can reach it -- from dmax before it (or lo) to
+// dmin before it -- and when none matches, look for the next one past them
+and rxv_search_lit = fn prog -> fn (s: str) -> fn (lo: int) -> fn (len: int) -> fn (lit: str) -> fn (dmn: int) -> fn (dmx: int) -> fn (fbs: str) -> fn (u8: bool) -> fn (ld: str) ->
+  if lo > len then RNoHit
+  else
+    (let p = rxq_find s lit (lo + dmn) in
+     if p < 0 then RNoHit
+     else
+       (let a0 = (if dmx >= 0 && p - dmx > lo then p - dmx else lo) in
+        // (not inside a UTF-8 character: a broken subject never gets here)
+        let a = (if u8 then rxq_cstart s a0 len else a0) in
+        rxv_search_win prog s a (p - dmn) len lit dmn dmx fbs u8 ld))
+and rxv_search_win = fn prog -> fn (s: str) -> fn (x: int) -> fn (hi: int) -> fn (len: int) -> fn (lit: str) -> fn (dmn: int) -> fn (dmx: int) -> fn (fbs: str) -> fn (u8: bool) -> fn (ld: str) ->
+  if x > hi then rxv_search_lit prog s x len lit dmn dmx fbs u8 ld
+  else if str_len fbs > 0 && ord (char_at fbs (ord (char_at s x))) != 49 then
+    rxv_search_win prog s (x + cut_clen s x) hi len lit dmn dmx fbs u8 ld
+  else
+    match (let _ = rxs_reset () in rxv_run prog s 0 x 0) with
+    | RFound (e, _) -> (let sv = rxs_snapshot () in RHit (rxv_keep_start sv x, e, sv))
+    | RFail -> rxv_search_win prog s (rxq_next s x ld) hi len lit dmn dmx fbs u8 ld
+and rxq_cstart = fn (s: str) -> fn (i: int) -> fn (len: int) ->
+  if i >= len then i
+  else (let b = ord (char_at s i) in if b >= 128 && b < 192 then rxq_cstart s (i + 1) len else i)
+// the first lit in s at or after i, or -1 (str_index_of is memchr from 0)
+and rxq_find = fn (s: str) -> fn (lit: str) -> fn (i: int) ->
+  if i <= 0 then str_index_of s lit
+  else rxq_find_go s lit (ord (char_at lit 0)) i (str_len s - str_len lit)
+and rxq_find_go = fn (s: str) -> fn (lit: str) -> fn (b0: int) -> fn (j: int) -> fn (last: int) ->
+  if j > last then 0 - 1
+  else if ord (char_at s j) == b0 && rxq_at s lit j 1 then j
+  else rxq_find_go s lit b0 (j + 1) last
+and rxq_at = fn (s: str) -> fn (lit: str) -> fn (j: int) -> fn (k: int) ->
+  if k >= str_len lit then true
+  else if ord (char_at s (j + k)) == ord (char_at lit k) then rxq_at s lit j (k + 1)
+  else false
 
 // a minimal regex engine: literals, ^ $ anchors, . any, \d \w \s classes,
 // and + * on single elements. Backtracking, no groups.
@@ -59089,13 +59277,13 @@ and md_cidx = fn ivars -> fn (id: int) -> fn (src: str) -> fn (b: int) ->
   | _ -> utf8_cidx src b
 // String#index(regexp, offset): search from a byte offset, publish $~ and
 // the groups exactly as =~ does, and answer the hit in CHARACTERS (or nil).
-and rx_idx_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (bst: int) -> fn (enc: str) ->
+and rx_idx_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (bst: int) -> fn (enc: str) -> fn (a9: bool) ->
   match rxv_search_e p pf sv bst enc with
   | RHit (st, en, saves) ->
     (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
      let _ = rxv_export_caps saves ng in
      let _ = rx_publish_at world sv st en ng enc in
-     VInt (if enc_cut enc == 2 then es_cidx sv enc st else utf8_cidx sv st))
+     VInt (if a9 then st else if enc_cut enc == 2 then es_cidx sv enc st else utf8_cidx sv st))
   | _ ->
     (let _ = rx_clear_caps 1 in
      let _ = rx_md_set VNil in
@@ -59119,7 +59307,7 @@ and rx_last_hit = fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (from: int) 
 // answers the first position where one begins -- \G stays pinned to pos (the
 // override slot), which is how /YOU\G/ can match five characters earlier.
 // Published like =~, answered in characters (or nil).
-and rx_last_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (limit: int) -> fn (enc: str) ->
+and rx_last_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (limit: int) -> fn (enc: str) -> fn (a9: bool) ->
   let _ = map_set rx_ganchor "o" limit in
   let rec down = fn (q: int) ->
     if q < 0 then
@@ -59137,7 +59325,7 @@ and rx_last_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn 
             (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
              let _ = rxv_export_caps saves ng in
              let _ = rx_publish_at world sv st en ng enc in
-             VInt (utf8_cidx sv st))
+             VInt (if a9 then st else utf8_cidx sv st))
           else down (q - 1))
        | _ -> down (q - 1)) in
   let r = down limit in

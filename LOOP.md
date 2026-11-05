@@ -1181,3 +1181,46 @@ under 5%. What changed:
   engine; literal_find wants memchr from an offset, which Mere's `str_index_of`
   does not take; scan_email starts at every letter of a word where Onigmo
   searches for the `@` first.
+
+
+## 2026-11-05 (2): the regexp search finds the literal a match must hold first
+
+**A search runs the program only where a match can reach its literal.** The
+compiler records, for each pattern, the longest run of ASCII characters every
+match holds -- preferring one at a bounded distance from the match's start --
+and the least and most bytes before it (`rxq_store`; a top-level sequence,
+opening groups and atomic groups, never an alternative). The search finds the
+literal and tries only the starts in that window, then the literal's next
+place (`rxv_search_lit`). Onigmo does the same with its optimization info.
+Not for a multibyte encoding other than UTF-8 (its character boundaries are
+not the bytes'), `/i` (the literal has more than one spelling) or `\G`.
+
+**String#index on an ASCII string skips the character walks.** After the
+search, literal_find spent its time turning the byte offset back into a
+character index by copying the prefix and counting it. A string the
+interpreter already knows is ASCII answers the byte offset.
+
+**An opening class loop skips the rest of its run after a failed start.**
+`/[a-z]+@/` failing at the first letter of a word fails at every later one:
+the attempts from there are a subset of the ones already made, so long as
+nothing in the pattern reads where the match started (a backreference, a
+condition, a call, an absent operator or `\G`).
+
+| workload | ruby | before | after |
+|---|---|---|---|
+| literal_find `index(/key_3999/)` | 0.004 | 0.055 | 0.003 |
+| scan_email `scan(/[a-z]+@[a-z]+\.com/)` | 0.065 | 0.175 | 0.120 |
+| nomatch | 0.005 | 0.010 | 0.001 |
+
+The other ten did not move. corpus 487 holds forty-four patterns over twelve
+subjects (a literal at a fixed, bounded and unbounded distance, a multibyte
+subject, `/i`, a backreference, `\G`, binary, ISO-8859-1 and EUC-JP), each
+read eight ways (ten on an ASCII subject), all as ruby's.
+
+- Left as they were: `=~` with `\K` answers the position after `\K` where ruby
+  answers the attempt's start, and String#rindex with a regexp on a multibyte
+  string can answer a byte-shaped index (`"あいう key_9 えお key_3999 かき".rindex(/[^ ]+ key/)`
+  is 13, ruby's 11). Both were there before this change; corpus 487 reads
+  rindex only on ASCII subjects.
+- Left: scan_words and gsub_digits run the VM at every match, and the VM is
+  about 40% of scan_words; rebuilding it would gain at most 1.5x there.
