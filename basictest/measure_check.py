@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import measure
 from ci_check import FixtureFamily
@@ -93,6 +94,40 @@ class BasicCheck(unittest.TestCase):
         self.assertTrue(summary['issues'])
         summary, cases = self.parse('end of test(test: 0)\n')
         self.assertEqual(summary['state'], 'ZERO')
+
+    def test_oversized_output_is_not_opened_after_failing_size_check(self):
+        _, reference = self.parse(self.passing() + 'end of test(test: 1)\n')
+        original_open = Path.open
+        for oversized in [self.output, self.stderr]:
+            with self.subTest(path=oversized):
+                self.parse(self.passing() + 'end of test(test: 1)\n')
+                with oversized.open('wb') as stream:
+                    stream.truncate(measure.OUTPUT_BYTES + 1)
+
+                def guarded_open(path, *args, **kwargs):
+                    if path == oversized:
+                        raise AssertionError('oversized output must not be opened')
+                    return original_open(path, *args, **kwargs)
+
+                with patch.object(Path, 'open', guarded_open):
+                    summary, cases = measure.parse_output(self.output, self.stderr, self.source, dict(exit=0, limit=None), 0)
+                self.assertEqual(summary['state'], 'INCOMPLETE')
+                self.assertTrue(any('byte bound exceeded' in issue for issue in summary['issues']))
+                self.assertEqual(measure.compare(reference, cases)['match'], 0)
+
+    def test_stderr_growth_after_stat_is_rejected_by_the_bounded_read(self):
+        self.output.write_text('')
+        self.stderr.write_bytes(b'x' * 65)
+        original_stat = Path.stat
+
+        def stale_stat(path, *args, **kwargs):
+            return SimpleNamespace(st_size=0) if path == self.stderr else original_stat(path, *args, **kwargs)
+
+        with patch.object(measure, 'OUTPUT_BYTES', 64), patch.object(Path, 'stat', stale_stat):
+            summary, cases = measure.parse_output(self.output, self.stderr, self.source, dict(exit=0, limit=None), 0)
+        self.assertEqual(summary['state'], 'INCOMPLETE')
+        self.assertTrue(any('byte bound exceeded' in issue for issue in summary['issues']))
+        self.assertEqual(cases, {})
 
     def test_native_host_output_is_captured_even_when_runner_discards_it(self):
         ruby = os.environ.get('UNITTEST_REAL_RUBY')

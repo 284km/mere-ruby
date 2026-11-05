@@ -19,8 +19,21 @@ POLICY = 'native-basic-durable-output-v1'
 OUTPUT_BYTES = 16 * 1024 * 1024
 
 
+def read_output(path):
+    if path.stat().st_size > OUTPUT_BYTES:
+        raise ValueError('basic output byte bound exceeded')
+    # Also cap the read itself: a remaining writer may grow the file after
+    # stat. Reuse this bounded snapshot during section parsing below.
+    with path.open('rb') as stream:
+        data = stream.read(OUTPUT_BYTES + 1)
+    if len(data) > OUTPUT_BYTES:
+        raise ValueError('basic output byte bound exceeded')
+    return data.decode('utf-8')
+
+
 def parse_output(path, stderr, source, execution, child_exit):
     cases, observed, issues, final = {}, [], [], None
+    text = None
     location = re.compile(re.escape(str(source)) + r':(\d+)(?::in .*)?')
     evaluated = re.compile(r'\(eval at ' + re.escape(str(source)) + r':(\d+)\):(\d+)(?::in .*)?')
     passed = re.compile(r'^ok (\d+) \((.*)\)$')
@@ -30,7 +43,9 @@ def parse_output(path, stderr, source, execution, child_exit):
     try:
         if max(path.stat().st_size, stderr.stat().st_size) > OUTPUT_BYTES:
             raise ValueError('basic output byte bound exceeded')
-        for raw in path.read_text().splitlines():
+        output = read_output(path)
+        text = read_output(stderr)
+        for raw in output.splitlines():
             good, bad = passed.fullmatch(raw), failed.fullmatch(raw)
             summary, errors = success.fullmatch(raw), failure.fullmatch(raw)
             if good or bad:
@@ -62,9 +77,10 @@ def parse_output(path, stderr, source, execution, child_exit):
     # already supplies section names, section totals and per-section ordinals.
     sections_complete = True
     try:
+        if text is None:
+            raise ValueError('basic output snapshot unavailable within byte bound')
         names = set(re.findall(r'^\s*test_check ["\x27]([^"\x27]+)["\x27]', source.read_text(), re.M))
         pattern = re.compile('^' + re.escape(str(source)) + ':(' + '|'.join(map(re.escape, sorted(names))) + ') ', re.M)
-        text = stderr.read_text()
         sections = list(pattern.finditer(text)) if names else []
         occurrences, offset = Counter(), 0
         for i, section in enumerate(sections):
