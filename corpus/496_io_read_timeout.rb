@@ -107,3 +107,69 @@ begin
 ensure
   server.close
 end
+
+# A timed-out operation owns the prefix it already read; recovery starts
+# after that prefix, including when it came from previous read-ahead.
+[:pipe, :socket].each do |kind|
+  [[:read], [:read, 4], [:gets], [:readline], [:gets, nil], [:gets, "END"]].each do |call|
+    [false, true].each do |prefetched|
+      with_stream(kind) do |reader, writer|
+        reader.timeout = 0.002
+        writer.write(prefetched ? "first\na" : "a")
+        writer.flush
+        p reader.gets if prefetched
+        begin
+          reader.public_send(*call)
+          raise "partial read did not time out"
+        rescue IO::TimeoutError
+          p [kind, call, prefetched, :timed_out]
+        end
+        writer.write("b\nrest")
+        writer.close
+        p [reader.gets, reader.read]
+      end
+    end
+  end
+  [nil, 10].each do |length|
+    ["", "X", "OLD", "long buffer"].each do |initial|
+      ["", "a", "abcd"].each do |prefix|
+        with_stream(kind) do |reader, writer|
+          reader.timeout = 0.002
+          buffer = initial.dup.force_encoding("UTF-16LE")
+          writer.write(prefix)
+          writer.flush
+          begin
+            reader.read(length, buffer)
+            raise "buffered partial read did not time out"
+          rescue IO::TimeoutError
+            p [kind, length, initial, prefix, buffer.bytes, buffer.encoding]
+          end
+          writer.write("tail")
+          writer.close
+          p reader.read
+        end
+      end
+    end
+  end
+end
+
+# A partial multibyte character belongs to the failed read too.
+[:pipe, :socket].each do |kind|
+  [[:gets, 1], [:getc], [:readchar]].each do |call|
+    with_stream(kind) do |reader, writer|
+      reader.timeout = 0.002
+      reader.set_encoding('UTF-8')
+      writer.write("\xc3".b)
+      writer.flush
+      begin
+        reader.public_send(*call)
+        raise "partial character did not time out"
+      rescue IO::TimeoutError
+        p [kind, call, :timed_out]
+      end
+      writer.write("Z\n")
+      writer.close
+      p reader.read.bytes
+    end
+  end
+end
