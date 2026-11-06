@@ -14,6 +14,54 @@ class InvalidEntropySize
 end
 p Random.urandom(EntropySize.new).bytesize
 p Random.urandom(1.9).bytesize
+
+# The public singleton method is inherited; the native helper belongs to Random.
+class EntropyRandom < Random; end
+[0, 7, 65537].each do |size|
+  bytes = EntropyRandom.urandom(size)
+  p [bytes.bytesize, bytes.encoding == Encoding::BINARY]
+end
+
+# Primitive-backed subclasses still participate in implicit integer conversion.
+class EntropyStringSize < String
+  attr_reader :calls
+  def to_int
+    @calls = (@calls || 0) + 1
+    7
+  end
+end
+class EntropyArraySize < Array
+  def to_int = 65537
+end
+class EntropyHashSize < Hash
+  private
+  def to_int = 0
+end
+size = EntropyStringSize.new
+p [Random.urandom(size).bytesize, size.calls]
+p EntropyRandom.urandom(EntropyArraySize.new).bytesize
+p Random.urandom(EntropyHashSize.new).bytesize
+
+class InvalidEntropyStringSize < String
+  def to_int = nil
+end
+class InvalidEntropyArraySize < Array
+  def to_int = 1.5
+end
+class RaisingEntropySize < String
+  def to_int = raise(ArgumentError, "conversion failed")
+end
+class LargeEntropySize < Array
+  def to_int = 2**64
+end
+[InvalidEntropyStringSize.new, InvalidEntropyArraySize.new, RaisingEntropySize.new, LargeEntropySize.new].each do |size|
+  begin
+    Random.urandom(size)
+  rescue Exception => error
+    p [error.class, error.message]
+  end
+end
+
 [-1, nil, true, "1", InvalidEntropySize.new, 2**63, 2**64, -2**63-1].each do |size|
   begin
     Random.urandom(size)
