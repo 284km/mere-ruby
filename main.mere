@@ -1962,6 +1962,8 @@ import "m_pack.mere";
 import "m_json_lib.mere";
 import "m_bigdecimal_lib.mere";
 import "m_syslog_lib.mere";
+// prism: the C half as ruby over libprism (generated from lib/prism_ext.rb)
+import "m_prism_lib.mere";
 import "m_builtin_lists.mere";
 import "m_delegate_lib.mere";
 import "m_internal_ruby.mere";
@@ -20757,6 +20759,35 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (match args with Cons (VInt p, Cons (VStr h, _)) -> VInt (sys_syslog p (sget h)) | _ -> bad9 ())
        else if str_eq name "__closelog" then VInt (sys_closelog ())
        else (match args with Cons (VInt m, _) -> VInt (sys_setlogmask m) | _ -> bad9 ()))
+    // Prism's C library (vendor/prism, Prism 1.8.2), the five externs of
+    // tools/prism_glue.c, reached from the shipped lib/prism_ext.rb (what
+    // `require "prism/prism"` answers). Each answer is the parser's serialized
+    // form, which Prism's own Ruby library reads. Only names starting with
+    // __prism_ are answered, as for Syslog above.
+    else if str_eq c "Prism" && str_len name > 8 && str_eq (substring name 0 8) "__prism_"
+            && (str_eq name "__prism_ser" || str_eq name "__prism_ok" || str_eq name "__prism_more"
+                || str_eq name "__prism_query" || str_eq name "__prism_version") then
+      (let bad9 = fn (u: unit) -> raise_exc world "ArgumentError" ("Prism." ++ name ++ ": bad arguments") in
+       if str_eq name "__prism_ser" then
+         (match args with
+          | Cons (VInt k, Cons (VStr s, Cons (VStr o, _))) ->
+              // (str_of_bytes copies the glue's static buffer into this region
+              //  before any ruby runs again -- see m_state's extern note)
+              mkstr_e (str_of_bytes (prism_ser k (bytes_of_str (sget s)) (bytes_of_str (sget o)))) "ASCII-8BIT"
+          | _ -> bad9 ())
+       else if str_eq name "__prism_ok" then
+         (match args with
+          | Cons (VStr s, Cons (VStr o, _)) -> VBool (prism_ok (bytes_of_str (sget s)) (bytes_of_str (sget o)) == 1)
+          | _ -> bad9 ())
+       else if str_eq name "__prism_more" then
+         (match args with
+          | Cons (VStr s, Cons (VStr o, _)) -> VBool (prism_more (bytes_of_str (sget s)) (bytes_of_str (sget o)) == 1)
+          | _ -> bad9 ())
+       else if str_eq name "__prism_query" then
+         (match args with
+          | Cons (VInt k, Cons (VStr s, Cons (VStr e, _))) -> VInt (prism_query k (bytes_of_str (sget s)) (sget e))
+          | _ -> bad9 ())
+       else mkstr (prism_version ()))
     // The socket capability: the raw fd operations the `socket` library (Ruby
     // source, see stdlib_src) builds TCPSocket / TCPServer on. Only names
     // starting with __ are answered, so a program's own `class Socket` is not
@@ -22353,7 +22384,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // builtin (there is no ruby source behind one).
        else if (str_len name == 15 && str_eq name "source_location") then meth_source_location world mown mnm mrecv
        else if (str_len name == 10 && str_eq name "parameters") then
-         bm_params world (if str_eq mown "" then dispatch_cls_of world mrecv else mown) mnm
+         // (a builtin SINGLETON method -- `Dir.method(:glob)` -- is named by
+         //  its frame label "(sng:Dir)#glob", as #owner above reads it; the
+         //  dispatch class of the receiver is the class's own, and the
+         //  internal-ruby table keys the method "Dir.glob")
+         bm_params world (if str_eq mown "" then
+                            (let l9 = builtin_frame_label world mrecv mnm in
+                             if str_len l9 > 5 && str_eq (substring l9 0 5) "(sng:" && str_index_of l9 "#" > 0
+                             then substring l9 0 (str_index_of l9 "#")
+                             else dispatch_cls_of world mrecv)
+                          else mown) mnm
        else if (str_len name == 6 && str_eq name "unbind") then
          (let uid = alloc_oid ocls in
           let _ = map_set ocls uid "UnboundMethod" in
@@ -32207,9 +32247,18 @@ and bm_params = fn world -> fn (owner0: str) -> fn (nm: str) ->
   // are the body's.
   let owner = body_cls_of world owner0 nm in
   let key = owner ++ "#" ++ nm in
+  // the builtins ruby writes in Ruby have NAMED parameters (m_internal_ruby's
+  // 5th column; Prism's unpack1 polyfill reads them): asked first, by the
+  // body's class and then by the one the Method names (a singleton's
+  // "(sng:Dir)", which body_cls_of resolves past), when no method the
+  // program defined answers the name
+  let ir9 = (if map_has meths key || map_has meths nm then (Nil : Val list)
+             else (match ir_params owner nm with Nil -> ir_params owner0 nm | x9 -> x9)) in
   // a struct's member initializer is Struct#initialize, a C function of any
   // arity: [[:rest]] (the generated body's `*__over` showed through)
-  if str_len nm == 10 && str_eq nm "initialize" && map_has struct_mem owner then
+  if (match ir9 with Cons (_, _) -> true | Nil -> false) then
+    (match ir9 with Cons (v9, _) -> v9 | Nil -> VNil)
+  else if str_len nm == 10 && str_eq nm "initialize" && map_has struct_mem owner then
     arr_new (Cons (arr_new (Cons (VSym "rest", Nil)), Nil))
   // ...and so is a builtin class's own #initialize (a C function of any
   // arity, `Array#initialize(*)`), BasicObject's taking nothing
@@ -43124,9 +43173,31 @@ and ir_ensure = fn (u: unit) ->
   if map_len ir_tbl > 0 then ()
   else list_iter (str_split internal_ruby_rows (chr 10)) (fn (row: str) ->
          (match str_split row (chr 9) with
+          // (the 5th column, the parameters, rides along for ir_params)
+          | Cons (k9, Cons (p9, Cons (l9, Cons (e9, Cons (q9, _))))) -> map_set_s ir_tbl k9 (p9 ++ chr 9 ++ l9 ++ chr 9 ++ e9 ++ chr 9 ++ q9)
           | Cons (k9, Cons (p9, Cons (l9, Cons (e9, _)))) -> map_set_s ir_tbl k9 (p9 ++ chr 9 ++ l9 ++ chr 9 ++ e9)
           | Cons (k9, Cons (p9, Cons (l9, _))) -> map_set_s ir_tbl k9 (p9 ++ chr 9 ++ l9 ++ chr 9 ++ l9)
           | _ -> ()))
+// the parameters of a builtin ruby writes in Ruby, which have NAMES where a C
+// method's do not (`String#unpack1` is [[:req, :fmt], [:key, :offset]]; the
+// generator's 5th column). One array in the list, or Nil for a C builtin.
+and ir_params = fn (owner: str) -> fn (nm: str) ->
+  let _ = ir_ensure () in
+  let k9 = (if is_sng_cls owner then sng_inner owner ++ "." ++ nm else owner ++ "#" ++ nm) in
+  if map_has ir_tbl k9 then
+    (match str_split (map_get ir_tbl k9) (chr 9) with
+     | Cons (_, Cons (_, Cons (_, Cons (q9, _)))) when str_len q9 > 0 ->
+       (let rec go = fn (prs: str list) -> fn (acc: Val list) ->
+          (match prs with
+           | Nil -> rev_app acc Nil
+           | Cons (pr, t9) ->
+             (let i9 = str_index_of pr ":" in
+              let one9 = (if i9 < 0 then arr_new (Cons (VSym pr, Nil))
+                          else arr_new (Cons (VSym (substring pr 0 i9), Cons (VSym (substring pr (i9 + 1) (str_len pr)), Nil)))) in
+              go t9 (Cons (one9, acc)))) in
+        Cons (arr_new (go (str_split q9 ",") Nil), Nil))
+     | _ -> Nil)
+  else Nil
 and tp_hash_at = fn (s9: str) -> fn (i: int) ->
   if i >= str_len s9 then i else if str_eq (char_at s9 i) "#" then i else tp_hash_at s9 (i + 1)
 // does `recv.name` reach a BUILTIN (no method the program or the prelude
@@ -43456,6 +43527,15 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
        (match args with
         | Cons (VStr o9, _) -> VBool (str_eq (sget h9) (sget o9))
         | _ -> VBool false)
+     // pack / unpack / unpack1 are not prim_method's (they take the
+     //  evaluator, for a block-less call that still reads the format with
+     //  ruby's errors): the same three arms blt_alias_call has. A module
+     //  prepended to String with `def unpack1(f, offset: 0) = super(f)` --
+     //  Prism's polyfill -- reached "undefined method 'unpack1'" here.
+     | VArr id9 when (str_len meth == 4 && str_eq meth "pack") -> pack_call_live gc_cenv0 world id9 args
+     | VStr h9 when (str_len meth == 6 && str_eq meth "unpack") -> arr_new (unpack_call gc_cenv0 world h9 0 args)
+     | VStr h9 when (str_len meth == 7 && str_eq meth "unpack1") ->
+       (match unpack_call gc_cenv0 world h9 2 args with Cons (v, _) -> v | Nil -> VNil)
      | _ ->
        (match superblk with
         | (true, _, _, _) -> builtin_iter world superblk superblk recv meth args
@@ -53619,16 +53699,37 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      // require.
      // (json's two halves are their own modules -- the library's ruby files
      // are generated from the reference's, see tools/gen_json_lib.rb)
-     let shipped = (let s9 = stdlib_src p0 in
+     // (a SHIPPED file's require_relative names a sibling by the shipped
+     //  name: prism/serialize.rb's `require_relative "polyfill/unpack1"` is
+     //  the feature "prism/polyfill/unpack1". The file "is" under the
+     //  stdlibdir fiction, so the name is the path under it. The parser
+     //  already made the path absolute (__builtin_relpath), so the usual
+     //  case is the first branch; the second is a relative name reaching
+     //  here from a shipped file by another road)
+     let sdir0 = (if map_has load_ctx "stdlibdir" then (match map_get load_ctx "stdlibdir" with VStr d -> sget d | _ -> "") else "") in
+     let pship = (if str_len sdir0 > 0 && str_len p0 > str_len sdir0 + 1
+                     && str_eq (substring p0 0 (str_len sdir0 + 1)) (sdir0 ++ "/") then
+                    substring p0 (str_len sdir0 + 1) (str_len p0)
+                  else if rel then
+                    (let cf9 = (if map_has load_ctx "file" then (match map_get load_ctx "file" with VStr h9 -> sget h9 | _ -> "") else "") in
+                     if str_len sdir0 > 0 && str_len cf9 > str_len sdir0 + 1
+                        && str_eq (substring cf9 0 (str_len sdir0 + 1)) (sdir0 ++ "/") && map_has shipped_files cf9 then
+                       (let d9 = dirname_of (substring cf9 (str_len sdir0 + 1) (str_len cf9)) in
+                        if str_eq d9 "." || str_eq d9 "" then p0 else path_norm (d9 ++ "/" ++ p0))
+                     else p0)
+                  else p0) in
+     let shipped = (let s9 = stdlib_src pship in
                     if (if str_eq s9 "" then false else true) then s9
-                    else (let j9 = json_lib_src p0 in
+                    else (let j9 = json_lib_src pship in
                           if (if str_eq j9 "" then false else true) then j9
-                          else (let x9 = json_ext_src p0 in
+                          else (let x9 = json_ext_src pship in
                                 if (if str_eq x9 "" then false else true) then x9
-                                else (let b9 = bigdecimal_lib_src p0 in
+                                else (let b9 = bigdecimal_lib_src pship in
                                       if (if str_eq b9 "" then false else true) then b9
-                                      else (let y9 = syslog_lib_src p0 in
-                                            if (if str_eq y9 "" then false else true) then y9 else delegate_lib_src p0))))) in
+                                      else (let y9 = syslog_lib_src pship in
+                                            if (if str_eq y9 "" then false else true) then y9
+                                            else (let q9 = prism_lib_src pship in
+                                                  if (if str_eq q9 "" then false else true) then q9 else delegate_lib_src pship)))))) in
      // (a shipped library's own "pathname.so" entry is set before its source
      // runs, so lf_has_bare is asked only of the others)
      if (if rel then false else true) && (if ends_with_rb p0 then false else true) && str_eq shipped "" && lf_has_bare p0 then FNext (VBool false)

@@ -89,12 +89,36 @@ if [ "$emit" = 1 ]; then
 fi
 [ -f mr.c ] || { echo "build.sh: no mr.c to compile" >&2; exit 2; }
 
-printf 'cc     clang %s %s mr.c -o mere-ruby\n' "$opt" "$plat"
+# libprism (vendor/prism, see its README): compiled once into vendor/prism/obj
+# and kept, since it changes only when the vendored copy does. Always -O2 --
+# it is not the interpreter, and the sweep's CPU bound measures the parser
+# the same way whichever build of mr.c is beside it.
+pobj="$root/vendor/prism/obj"
+plib="$pobj/libprism.a"
+pneed=0
+[ -f "$plib" ] || pneed=1
+if [ "$pneed" = 0 ]; then
+  for f in "$root"/vendor/prism/src/*.c "$root"/vendor/prism/src/util/*.c \
+           "$root"/vendor/prism/include/prism.h "$root"/vendor/prism/include/prism/*.h \
+           "$root"/vendor/prism/include/prism/util/*.h; do
+    [ "$f" -nt "$plib" ] && { pneed=1; break; }
+  done
+fi
+if [ "$pneed" = 1 ]; then
+  printf 'cc     clang -O2 vendor/prism/src/*.c -> vendor/prism/obj/libprism.a\n'
+  rm -rf "$pobj"; mkdir -p "$pobj"
+  for f in "$root"/vendor/prism/src/*.c "$root"/vendor/prism/src/util/*.c; do
+    clang -O2 -w -I "$root/vendor/prism/include" -c "$f" -o "$pobj/$(basename "$f" .c).o" || { rm -rf "$pobj"; exit 1; }
+  done
+  ar rcs "$plib" "$pobj"/*.o || { rm -rf "$pobj"; exit 1; }
+fi
+
+printf 'cc     clang %s %s mr.c tools/prism_glue.c libprism.a -o mere-ruby\n' "$opt" "$plat"
 # ⚠ NEVER `cp` OVER A RUNNING BINARY -- the text pages of a process that is
 # mid-run are backed by that file, and overwriting them SIGKILLs it or, worse,
 # gives it another build's instructions. Build beside it and rename.
 # shellcheck disable=SC2086
-clang $opt -w $plat mr.c -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
+clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$plib" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
 
 # ...and say which build this is, where something that must not be misled can
