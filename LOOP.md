@@ -1463,3 +1463,68 @@ io_m17n 159, objectspace 36, eval 39, m17n 126, string 439, struct 100.
     a kept closure costs about 7 KB, most of it the 4 KB arena of its frame.
   - `Hash#shift` rewrites the rest of the hash, so emptying one with it is
     quadratic (20,000 entries: 7.4 s, ruby 0.06 s).
+
+## 2026-11-07: the three left on 11-06, and what zip, a core class and a hash's count still differed on
+
+The three left by the entry before, and what turned up on the way:
+
+- **`Hash#shift` was quadratic.** Mere's `map_set` copied the stored list
+  into the map's arena again every time, and the new value of the hash's
+  list is the old one with its head dropped. Mere 0.1.711 keeps a tail the
+  map already holds; `Hash#empty?` looks at the head instead of counting.
+  Emptying 20,000 entries: 7.4 s to 0.1 s (a million: 5.4 s, ruby 0.35 s).
+- **`Hash#size` counted the list.** Each hash now keeps its pair count: a
+  new key adds one, a delete takes one, any other rewrite of the list drops
+  the count and the next `size` counts again. `size` called while a hash
+  grows to 30,000 entries: 17.4 s to 0.14 s.
+- **A kept closure cost about 7 KB**, most of it the 4 KB first block of its
+  frame's map. The frame a closure captured is compacted when its call ends,
+  and Mere 0.1.711 sizes a compacted map's first block to what moved into it
+  (512 bytes to 4 KB). 200,000 procs: 1,437 MB to 683 MB; a million
+  `define_finalizer`: 99 s / 6.6 GB to 74 s / 4.7 GB (still over
+  test_finalizer's 60 s: every collection marks every kept closure, which
+  wants a generational GC).
+- **A FIFO opened between threads.** The read side opens without blocking
+  and waits for a writer while the other threads run; the write side waits
+  for a reader thread of this process to open it. A FIFO another process
+  made (the parent of assert_separately) is known by its stat type, looked
+  at only while threads are alive. test_open_fifo_does_not_block_other_threads
+  and ruby/spec's File.open on a FIFO pass. Opened to read, it is an IO, not
+  a File (as `File.open(fd)` is, before and now).
+- **zip and the force_blockarg family pass a lambda its tuple as a proc
+  would.** ruby's enum_yield cuts the values to a lambda's parameters or pads
+  them with nil (Enumerable#zip, select, find and the rest); a Symbol or
+  Method proc still takes the packed array. Array#zip is strict, as
+  rb_ary_zip yields plainly, and an Enumerator's zip, which goes through it,
+  keeps the fit.
+- **A module included into a core class after its method.** With
+  `Integer.include M` and `M#to_s`, `1.to_s`, `"#{1}"` and
+  `1.method(:to_s).owner` are Integer's, as the core class's own method
+  comes first in its ancestors; the module wins only where ruby 4.0.9's
+  table names it the owner. The owner is moved for `obj.method(name)` only:
+  put first into what makes every Method, it moved a bind too, and
+  `Kernel.instance_method(:inspect).bind_call` on a String's subclass came
+  out as String#inspect (corpus 320 caught it, after the round below had
+  run on the binary before that change).
+
+corpus 498 reads the tails, the closures, the FIFO, zip and the core
+method against ruby.
+
+Not done: test_hash's `*_memory_leak` (the heap grows in steps until the GC
+collects -- 100k to 300k iterations: 173 to 189 MB -- not a leak; passing
+them means retuning the GC's thresholds).
+
+The round (on the binary before the owner change and Mere 0.1.711): 10
+gates, corpus 497/497 with the hash index on and off, stderr and GC_STRESS
+differing from the previous binary on 498 only (it is ruby's), stdlib the
+same, 706 specs with 705 the same and File.open's up (127 to 129 passing,
+the FIFO). Unit tests against the previous binary, none down: hash 297,
+enum 89, enumerator 70, lazy_enumerator 64, array 459, range 67, proc 117,
+method 97, module 192, object 65, io 244 (243), objectspace 36, gc 28,
+thread 97 (96), process 155, require 51, settracefunc 97, string 439,
+eval 39, struct 100, integer 38, alias 17. On the final binary (Mere
+0.1.711, the owner moved for `obj.method` only, rebased onto the
+Random.urandom PR): 10 gates, corpus 498/498, 492, 498 and 320 under
+GC_STRESS as ruby, and twelve of the unit tests again with the same counts
+(hash, method, module, object, proc, array, struct, eval, enum, enumerator,
+string, integer). The corpus program was 494 until the PR took that number.

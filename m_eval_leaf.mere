@@ -610,7 +610,7 @@ and drop_yblk_params = fn (ps: str list) ->
     //   argument more than it said, and `define_method(:now,
     //   &Time.method(:now))` answered the Method object itself.
     else if str_eq m lambda_blk_marker then drop_yblk_params rest
-    else if str_eq m lambda_spread_marker then drop_yblk_params rest
+    else if str_eq m lambda_spread_marker || str_eq m lambda_fit_marker then drop_yblk_params rest
     else ps
   | _ -> ps
 // is this block a lambda (its marker after any yield-block markers)?
@@ -625,13 +625,44 @@ and blk_is_lambda = fn b ->
    match b with (h, ps, _, _) -> h && go ps)
 // the block, marked to spread a single Array over its parameters when it is
 // a lambda (a proc already does); anything else comes back as it was
+// a lambda block with lambda_fit_marker (see there): only when it has more
+// than one positional parameter -- `->(x) { }` takes the tuple whole, as a
+// proc with one parameter does, and so does `->(*a) { }`
+and blk_fit = fn b ->
+  (match b with
+   | (h, ps, body, e) ->
+     let pp9 = pos_params (strip_marker_params (drop_yblk_params ps)) in
+     let rec plain = fn (xs: str list) -> (match xs with Nil -> 0 | Cons (p, t) -> (if str_len p > 0 && (str_eq (char_at p 0) "*" || str_eq (char_at p 0) "&") then 0 else 1) + plain t) in
+     let rec rest = fn (xs: str list) -> (match xs with Nil -> false | Cons (p, t) -> (str_len p > 1 && str_eq (char_at p 0) "*" && (if str_eq (char_at p 1) "*" then false else true)) || rest t) in
+     let n9 = plain pp9 in
+     // (a Symbol's or a Method's proc -- `*__a, &__b` / `__bp` -- is given the
+     //  packed values as its one argument, not fitted: Proc#__fb_kind's 1)
+     let fwd9 = str_list_has (strip_marker_params (drop_yblk_params ps)) "__bp"
+                || str_list_has (strip_marker_params (drop_yblk_params ps)) "*__a" in
+     if (if h then false else true) || fwd9 || (if n9 >= 2 || (n9 >= 1 && rest pp9) then false else true) then b
+     else
+       (let rec go = fn (xs: str list) ->
+          (match xs with
+           | Cons (m, r) ->
+             if str_eq m lambda_blk_marker then
+               (match r with
+                | Cons (m2, r2) -> if str_eq m2 lambda_fit_marker then xs
+                                   else if str_eq m2 lambda_spread_marker then Cons (m, Cons (lambda_fit_marker, r2))
+                                   else Cons (m, Cons (lambda_fit_marker, r))
+                | Nil -> Cons (m, Cons (lambda_fit_marker, r)))
+             else if str_len m > 9 && str_eq (substring m 0 9) yblk_marker then Cons (m, go r)
+             else xs
+           | Nil -> xs) in
+        (h, go ps, body, e)))
 and blk_spread = fn b ->
   (let rec go = fn (ps: str list) ->
      (match ps with
       | Cons (m, rest) ->
         if str_eq m lambda_blk_marker then
           (match rest with
-           | Cons (m2, _) -> if str_eq m2 lambda_spread_marker then ps else Cons (m, Cons (lambda_spread_marker, rest))
+           // (one already fitted -- Range's and Enumerable's zip, which hand the
+           //  block on to Array#zip -- keeps its fitting)
+           | Cons (m2, _) -> if str_eq m2 lambda_spread_marker || str_eq m2 lambda_fit_marker then ps else Cons (m, Cons (lambda_spread_marker, rest))
            | Nil -> Cons (m, Cons (lambda_spread_marker, rest)))
         else if str_len m > 9 && str_eq (substring m 0 9) yblk_marker then Cons (m, go rest)
         else ps
@@ -1008,7 +1039,7 @@ and strip_marker_params = fn (params: str list) ->
   match params with
   | Nil -> Nil
   | Cons (p, r) ->
-    if str_eq p empty_bp_marker || str_eq p lambda_blk_marker || str_eq p lambda_spread_marker
+    if str_eq p empty_bp_marker || str_eq p lambda_blk_marker || str_eq p lambda_spread_marker || str_eq p lambda_fit_marker
     then strip_marker_params r else Cons (p, strip_marker_params r)
 and blk_arity = fn (is_lam: bool) -> fn (ps: str list) -> fn (ds: (str * Expr) list) ->
   let n = mandatory_pos_count (pos_params ps) ds + (if kw_any ps ds true then 1 else 0) in
@@ -1251,6 +1282,18 @@ and cvar_name_checked = fn world -> fn (nm: str) ->
   if cvar_name_shaped nm then ivar_arg_name (ivar_arg_name nm)
   else (let _ = raise_exc world "NameError"
                   ("'" ++ nm ++ "' is not allowed as a class variable name") in "")
+// (a module's method that a core class's own one comes before -- see
+//  has_meth_b's `nat` -- is not what a value's Method holds: the builtin's
+//  is, and the owner says Integer, not M. Only for `obj.method(name)`: a
+//  bind / bind_call names its definition, Kernel#inspect onto a String's
+//  subclass included)
+and value_meth_owner = fn world -> fn (recv: Val) -> fn (owner: str) -> fn (nm: str) ->
+  (match recv with
+   | VObj _ -> owner | VClass _ -> owner | VMain -> owner
+   | _ -> if str_len owner > 0 && (if str_list_has (ancestors_of world (dispatch_cls_of world recv)) owner then true else false)
+             && map_has modules owner
+             && (if has_meth world (dispatch_cls_of world recv) nm then false else true)
+          then "" else owner)
 and mk_bound_method = fn world -> fn (recv: Val) -> fn (owner: str) -> fn (nm: str) ->
   let (meths, sup, ocls, ivars) = world in
   let id = alloc_oid ocls in
@@ -16077,6 +16120,26 @@ and raise_sysopen = fn world -> fn (cls: str) -> fn (what: str) -> fn (path: str
   else if enc_all7 path || str_eq penc "" then raise_exc world cls (what ++ " @ rb_sysopen - " ++ path)
   else raise_exc_iv world cls (what ++ " @ rb_sysopen - " ++ path) (Cons (("__menc", mkstr penc), Nil))
 and file_arg_enc = fn (args: Val list) -> (match args with Cons (VStr h, _) -> enc_canon_name (senc_get h) | _ -> "")
+// a FIFO opened to write, while other threads run: wait (a millisecond at a
+// time, letting them run) until one of them has opened it to read. True when
+// one has; false at once when nothing else could.
+// a FIFO, by stat(2) -- asked only while other threads are alive, the case
+// where one of them can be its other end (alone, the open waits as ruby's does)
+and fifo_threaded = fn (path: str) ->
+  fb_can_suspend && map_len sch_live > 1
+  && try_or (fn (u: unit) -> file_stat path == 0 && (let m9 = file_stat_field 2 in (m9 / 4096) - ((m9 / 4096) / 16) * 16 == 1)) false
+and fifo_wait_reader = fn world -> fn (k: str) -> fn (mode: str) ->
+  if (if str_contains mode "w" || str_contains mode "a" then false else true) then false
+  else if (if fb_can_suspend then false else true) then false
+  else
+    (let rec go = fn (u: unit) ->
+       if map_has fifo_readers k then true
+       else if map_len sch_live <= 1 && sch_me () == sch_main () then false
+       else (let _ = map_set sch_io (sch_me ()) 1 in
+             let _ = sch_block world 1 0 (sch_now () + 1000000) in
+             let _ = (if map_has sch_io (sch_me ()) then map_delete sch_io (sch_me ()) else ()) in
+             go ()) in
+     go ())
 and file_open_obj = fn world -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   let path = (match args with Cons (VStr h, _) -> sget h | _ -> "") in
@@ -16171,9 +16234,27 @@ and file_open_obj = fn world -> fn (args: Val list) ->
   //   name instead, for the FIFOs this process made (fifo_paths); one made
   //   elsewhere is not recognised, because telling a FIFO from a file needs
   //   stat(2), which is a subprocess here for every open.
+  // ...unless there are threads to be the other end: a FIFO opened to READ
+  //   is a descriptor stream that waits for its writer as a pipe's reader
+  //   waits (File.__fifo_open_r), and one opened to WRITE waits -- letting
+  //   the others run -- until a reader here has opened it, after which
+  //   open(2) returns at once (test_io's test_open_fifo_does_not_block_other_threads,
+  //   core/file/open "on a FIFO")
+  else if fb_can_suspend && (map_has fifo_paths (abs_path_of path) && file_exists path || fifo_threaded path)
+          && str_eq (char_at (file_mode_head mode) 0) "r" && (if str_contains mode "+" then false else true)
+          && (match args with Cons (_, Cons (VInt _, _)) -> false | _ -> true) then
+    invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) (VClass "File") "__fifo_open_r" (Cons (mkstr path, Nil)) false
+  // (a FIFO made elsewhere -- by the parent of an assert_separately --
+  //  opened to write while other threads run waits the same way)
+  else if fifo_threaded path && (str_contains mode "w" || str_contains mode "a")
+          && (if map_has fifo_readers (abs_path_of path) then false else true)
+          && (if fifo_wait_reader world (abs_path_of path) mode then false else true) then
+    raise_exc world "NotImplementedError"
+      ("opening a FIFO would wait for its other end, and every thread here is one OS thread - " ++ path)
   else if map_has fifo_paths (abs_path_of path) && file_exists path
           && (if map_has fifo_readers (abs_path_of path) && (str_contains mode "w" || str_contains mode "a" || str_contains mode "+")
-              then false else true) then
+              then false else true)
+          && (if fifo_wait_reader world (abs_path_of path) mode then false else true) then
     raise_exc world "NotImplementedError"
       ("opening a FIFO would wait for its other end, and every thread here is one OS thread - " ++ path)
   // ("r+" too: it opens a file that is there and creates none, so a missing
@@ -17794,7 +17875,7 @@ and strip_block_params = fn (params: str list) ->
   match params with
   | Nil -> Nil
   | Cons (p, r) ->
-    if is_block_param p || str_eq p empty_bp_marker || str_eq p lambda_blk_marker || str_eq p lambda_spread_marker
+    if is_block_param p || str_eq p empty_bp_marker || str_eq p lambda_blk_marker || str_eq p lambda_spread_marker || str_eq p lambda_fit_marker
     then strip_block_params r else Cons (p, strip_block_params r)
 and bind_block_locals = fn cenv -> fn (params: str list) ->
   match params with
