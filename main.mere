@@ -17037,7 +17037,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // Guarded by the names they implement, as Thread's are.
     else if (str_eq c "Fiber" || obj_is_a world c "Fiber") && fb_cls_name name
             && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
-      (if (str_len name == 5 && str_eq name "yield") then fb_yield world args
+      (let _ = fb_boot () in
+       if (str_len name == 5 && str_eq name "yield") then fb_yield world args
        else if (str_len name == 7 && str_eq name "current") then (let _ = fb_boot () in fb_obj_for world (fb_cur ()))
        else if (str_len name == 2 && str_eq name "[]") then
          (match args with Cons (k, Nil) -> fb_storage_aref env world k
@@ -17046,13 +17047,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (match args with Cons (k, Cons (v, Nil)) -> fb_storage_aset env world k v
                         | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 2)"))
        else if (str_len name == 9 && str_eq name "blocking?") then (if fb_blocking_now () then VInt 1 else VBool false)
+       else if (str_len name == 17 && str_eq name "current_scheduler") && fb_blocking_now () then VNil
+       else if (str_len name == 8 && str_eq name "schedule") then
+         (let th = fb_thread_of (fb_cur ()) in
+          if map_has fb_sched th then invoke_val_c env world blk (map_get fb_sched th) "fiber" args false
+          else raise_exc world "RuntimeError" "No scheduler is available!")
        else if (str_len name == 9 && str_eq name "scheduler") || (str_len name == 17 && str_eq name "current_scheduler") then
          (if map_has fb_sched (fb_thread_of (fb_cur ())) then map_get fb_sched (fb_thread_of (fb_cur ())) else VNil)
        else if (str_len name == 13 && str_eq name "set_scheduler") then
          (match args with
-          | Cons (VNil, Nil) ->
-            (let th = fb_thread_of (fb_cur ()) in
-             let _ = (if map_has fb_sched th then map_delete fb_sched th else ()) in VNil)
+          | Cons (VNil, Nil) -> fb_sched_close env world
           | Cons (sch, Nil) ->
             // the hooks a scheduler must have, in the order ruby checks them
             (let need = Cons ("block", Cons ("unblock", Cons ("kernel_sleep", Cons ("io_wait", Nil)))) in
@@ -17063,6 +17067,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                  (if responds world sch n then chk r
                   else (let _ = raise_exc world "ArgumentError" ("Scheduler must implement #" ++ n) in ())) in
              let _ = chk need in
+             let _ = fb_sched_close env world in
              let _ = map_set fb_sched (fb_thread_of (fb_cur ())) sch in
              sch)
           | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
@@ -27428,6 +27433,9 @@ and signal_deliver_self = fn env -> fn world -> fn (sg: str) ->
 // runs goes right after that one, not at the end.
 and run_at_exits_r = fn world -> fn report ->
   let st = map_new () in
+  // The main thread drains its scheduler before running at_exit hooks.
+  let closed = try_or (fn (u: unit) -> let _ = fb_sched_close gc_cenv0 world in true) false in
+  let _ = (if closed then () else (let _ = report (pending_exc world) in map_set st "v" 1)) in
   let _ = map_set in_exit_hooks "y" 1 in
   // a `trap(:EXIT, handler)` runs FIRST, once -- and what it raises is
   // reported LAST, after the at_exit handlers' own (ruby holds it as the
@@ -29190,6 +29198,12 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
              (let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
               let _ = (match fobj with VObj fid -> file_close_obj world fid | _ -> ()) in
               r)))
+       // Forward the caller's block and arguments to the thread's scheduler.
+       else if (str_eq c "Fiber" || obj_is_a world c "Fiber") && (str_len name == 8 && str_eq name "schedule")
+               && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+         (let th = fb_thread_of (fb_cur ()) in
+          if map_has fb_sched th then invoke_with_block env world blk (map_get fb_sched th) "fiber" args newblk
+          else raise_exc world "RuntimeError" "No scheduler is available!")
        // Fiber.blocking { |f| }: the running fiber is blocking for the block
        else if str_eq c "Fiber" && (str_len name == 8 && str_eq name "blocking") then
          (let _ = fb_boot () in
@@ -47784,9 +47798,21 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
   let _ = map_clear flow_sig in
   let _ = map_clear raise_bt in
   let _ = map_set globals "!" VNil in
+  // Scheduler callbacks may allocate or suspend, so retain a successful
+  // return value on the live Thread as well as the exception captured above.
+  let _ = (match result with FNext v -> map_set iv3 (k ++ "@__tfinish_val") v | _ -> ()) in
+  let closed = try_or (fn (u: unit) -> let _ = fb_sched_close gc_cenv0 world in true) false in
+  let result = (if closed then result else FRaise (thread_capture_exception world (pending_exc world))) in
+  let _ = (match result with FRaise exc -> map_set iv3 (k ++ "@__tfinish_exc") exc | _ -> ()) in
+  let _ = (if map_has iv3 "$exc" then map_delete iv3 "$exc" else ()) in
+  let _ = map_clear prim_missing in
+  let _ = map_clear flow_sig in
+  let _ = map_clear raise_bt in
+  let _ = map_set globals "!" VNil in
   let _ = (if map_has hook_flags "tp" then fire_tp_vlc world "thread_end" "" "" VNil (VObj tid) (cur_line ()) "" "" else ()) in
   let _ = thread_report world tid result in
   let _ = thread_finish world tid result in
+  let _ = (if map_has iv3 (k ++ "@__tfinish_val") then map_delete iv3 (k ++ "@__tfinish_val") else ()) in
   let _ = (if map_has iv3 (k ++ "@__tfinish_exc") then map_delete iv3 (k ++ "@__tfinish_exc") else ()) in
   // abort_on_exception (the thread's, or Thread's): the exception is raised
   // in the main thread too, wherever it is waiting
@@ -48194,6 +48220,19 @@ and thread_join_sch = fn env -> fn world -> fn (recv: Val) -> fn (tid: int) -> f
   else if map_has ivars (k ++ "@__texc") then flow_value (re_raise world (map_get ivars (k ++ "@__texc")))
   else if (str_len name == 5) then (if map_has ivars (k ++ "@__tval") then map_get ivars (k ++ "@__tval") else VNil)
   else recv
+// Closing keeps the scheduler installed while it drains pending fibers.
+// Clear it even if its callback raises, as rb_fiber_scheduler_set does.
+and fb_sched_close = fn env -> fn world ->
+  let th = fb_thread_of (fb_cur ()) in
+  if map_has fb_sched th then
+    (let sch = map_get fb_sched th in
+     let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let ok = try_or (fn (u: unit) ->
+       let _ = (if responds world sch "scheduler_close" then invoke_val_c env world nb sch "scheduler_close" Nil false
+                else if responds world sch "close" then invoke_val_c env world nb sch "close" Nil false else VNil) in true) false in
+     let _ = map_delete fb_sched th in
+     if ok then VNil else fail "mere-ruby: (scheduler close exception propagates)")
+  else VNil
 // a Fiber scheduler answers for this fiber: the thread has one and the
 // fiber is not blocking
 and fb_sched_here = fn (u: unit) ->
@@ -48601,6 +48640,10 @@ and fb_kw = fn (args: Val list) -> fn (k: str) ->
 // ---- Fiber.new --------------------------------------------------------------
 and fb_new = fn world -> fn (c: str) -> fn newblk -> fn (args: Val list) ->
   let _ = fb_boot () in
+  // A forwarded &proc belongs to this constructor. Leaving its identity
+  // pending makes the next method's &block reuse the previous fiber body.
+  let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+  let _ = (if map_has pending_home "v" then map_delete pending_home "v" else ()) in
   let (_, _, ocls, iv) = world in
   let (hass, st0) = fb_kw args "storage" in
   let st = (if hass then fb_storage_check world st0 else VNil) in
