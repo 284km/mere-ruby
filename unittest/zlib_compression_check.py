@@ -31,6 +31,17 @@ end
 '''
 
 
+def mixed_runs(seed):
+    rng = random.Random(seed)
+    n = rng.choice([300, 1000, 4000, 10000, 40000, 120000])
+    rng.choice([8, 16, 32, 64, 128, 256])
+    data = bytearray()
+    while len(data) < n:
+        data.extend(bytes(rng.randrange(256) for _ in range(rng.randrange(1, 40))))
+        data.extend(b"\0" * rng.randrange(1, 500))
+    return bytes(data[:n])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=Path(__file__).resolve().parent.parent / 'mere-ruby')
@@ -39,6 +50,10 @@ def main():
     rng = random.Random(731)
     cases = {
         'empty': b'',
+        # Review witness: the old limiter emitted an oversubscribed CL tree.
+        'mixed-zero-runs-1141': mixed_runs(1141),
+        'mixed-zero-runs-23': mixed_runs(23),
+        'mixed-zero-runs-87': mixed_runs(87),
         'binary': bytes(range(256)) * 260,
         'repeat-1m': b'x' * 1048576,
         # More than 150,000 largely literal tokens exercises multiple blocks.
