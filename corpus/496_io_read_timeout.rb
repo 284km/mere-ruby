@@ -10,6 +10,47 @@ ensure
   writer.close unless writer.closed?
 end
 
+# Cleanup must write the native String buffer without executing overrides
+# that could replace the pending IO::TimeoutError with an unrelated error.
+class TimeoutReplaceBuffer < String
+  def replace(*) = raise('replace override was called')
+end
+class TimeoutOverrideBuffer < String
+  [:bytesize, :encoding, :b, :byteslice, :replace, :force_encoding].each do |name|
+    define_method(name) do |*|
+      $timeout_buffer_calls << name
+      raise "#{name} override was called"
+    end
+  end
+end
+[:pipe, :socket].each do |kind|
+  [TimeoutReplaceBuffer, TimeoutOverrideBuffer].each do |klass|
+    [nil, 2].each do |length|
+      ['', 'old', 'long buffer'].each do |initial|
+        with_stream(kind) do |reader, writer|
+          $timeout_buffer_calls = []
+          buffer = klass.new(initial)
+          String.instance_method(:force_encoding).bind_call(buffer, Encoding::UTF_16LE)
+          reader.timeout = 0.002
+          writer.write('a')
+          writer.flush
+          begin
+            reader.read(length, buffer)
+            raise 'subclass-buffer read did not time out'
+          rescue IO::TimeoutError => error
+            bytes = String.instance_method(:bytes).bind_call(buffer)
+            encoding = String.instance_method(:encoding).bind_call(buffer)
+            p [kind, length, initial, error.class, error.message, bytes, encoding, $timeout_buffer_calls]
+          end
+          writer.write('tail')
+          writer.close
+          p reader.read
+        end
+      end
+    end
+  end
+end
+
 [:pipe, :socket].each do |kind|
   with_stream(kind) do |reader, writer|
     p [kind, reader.timeout, writer.timeout]
