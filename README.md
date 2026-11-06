@@ -231,6 +231,19 @@ needs), `Zlib.adler32`, `Zlib::Inflate.inflate` and
 blocks. Verified both directions against CRuby: mere-ruby reads what the
 system zlib writes, and the system zlib reads what mere-ruby writes.
 
+The submodule is pinned to mgz `a3b818b` (including its hash-chain match
+finder, bounded token blocks and length-limited Huffman trees). The old
+`74fa3a3` pin scanned the entire 32 KiB window at each position. Compressed
+bytes and ratios may change; the uncompressed bytes and gzip CRC/size checks
+remain the contract. The bridge uses mgz's `inflate_buf` byte-buffer API for
+one-shot decoding; the Ruby streaming inflater keeps its existing bounded
+reader and dictionary handling.
+
+`python3 unittest/zlib_compression_check.py` checks both formats in both
+directions against Python's native zlib/gzip, including binary data, input
+beyond the token-block boundary, a 1 MiB repeated input and a corrupt gzip
+CRC. Each child has a 30-second limit to catch the old window-scan behavior.
+
 ## The load path
 
 mere-ruby ships a set of pure-Ruby libraries compiled in (`monitor`,
