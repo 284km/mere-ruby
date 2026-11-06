@@ -11,6 +11,46 @@ def show_digest_new(original)
   original.update('more')
   p [copy.hexdigest, original.hexdigest]
 end
+
+# Digest::Instance#new returns the native clone, ignoring reset's result and
+# bypassing a wrapper's clone/send overrides while allowing private reset.
+class ResetReturnsMarkerDigest < OpenSSL::Digest::SHA256
+  def reset
+    @reset_called = true
+    super
+    :reset_return
+  end
+end
+class ResetRaisesDigest < OpenSSL::Digest::SHA256
+  def reset
+    raise 'from reset'
+  end
+end
+class PrivateResetDigest < OpenSSL::Digest::SHA256
+  private :reset
+end
+class CloneOverrideDigest < OpenSSL::Digest::SHA256
+  def clone(*)
+    raise 'clone override must not run'
+  end
+end
+class SendOverrideDigest < OpenSSL::Digest::SHA256
+  def send(*)
+    raise 'send override must not run'
+  end
+end
+[ResetReturnsMarkerDigest, PrivateResetDigest, CloneOverrideDigest, SendOverrideDigest, ResetRaisesDigest].each do |type|
+  begin
+    original = type.new('old')
+    copy = original.new
+    p [copy.class.name, copy.hexdigest, original.hexdigest, copy.equal?(original),
+       copy.instance_variable_get(:@reset_called)]
+    copy.update('abc')
+    p [copy.hexdigest, original.hexdigest]
+  rescue => error
+    p [type.name, error.class.name, error.message]
+  end
+end
 show_digest_new(OpenSSL::Digest.new('SHA256'))
 show_digest_new(OpenSSL::Digest::SHA1.new)
 show_digest_new(OpenSSL::Digest::MD5.new)
