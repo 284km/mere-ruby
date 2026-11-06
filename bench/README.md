@@ -340,3 +340,32 @@ this one alternately, best of three; the workloads not listed moved under 10%):
 What is left: match_lines and anchored are the interpreter's loop and call
 (13x and 12x ruby's). scan_words is about 30% the VM, 14% entering a search
 and 15-20% the collector, so rebuilding the VM would gain at most 1.4x there.
+
+Then, later on 2026-11-06, three smaller costs. The machine was loaded (load
+average 8 to 29 from other work), so the seconds moved by more than the
+change; instructions retired (`/usr/bin/time -l`, the whole process, so the
+setup that builds `text` and `log` is in it) are steadier:
+
+| workload | before | after |
+|---|---|---|
+| match_lines | 2315M | 1904M |
+| anchored | 2844M | 2209M |
+| capture_log | 2342M | 1980M |
+| scan_words | 2836M | 2400M |
+| scan_email | 3614M | 3085M |
+| literal_find | 1720M | 1319M |
+
+- **An Integer in a string interpolation is written without the dispatcher**
+  (`"value-#{i}"`), when no refinement is active and the program has neither
+  prepended to Integer nor defined its own `to_s` on it. anchored's timed loop
+  is 20% fewer instructions; most of the setup's drop is this too.
+- **The string store's bytes are kept, not walked.** The safepoint asked for
+  every string page's block chain at each check; a page's bytes are now
+  measured again only after something wrote to it, and the page strings are
+  being appended to is measured once a megabyte has been added. A loop that
+  keeps making 5 MB strings peaks at 432-570 MB where it peaked at 638-786.
+- **The literal prefilter's later searches use memchr too** (Mere 0.1.707's
+  `str_index_from`), where only a search from the start did.
+
+The VM was measured again for rebuilding and left: scan_words is 2.0x ruby's
+and the VM about 30% of it.

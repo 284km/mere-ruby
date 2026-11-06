@@ -1307,3 +1307,87 @@ in the block and programs that redefine the source. Both are as ruby's.
 - Left: scan_words is now about 30% the VM, 14% entering a search and 15-20%
   the collector. Rebuilding the VM is still worth at most 1.4x there.
   match_lines and anchored are now the interpreter's loop and call.
+
+## 2026-11-06 (2): how an Enumerable method yields several values, aliases of a builtin iterator, and three smaller costs
+
+**The three differences left in the entry before this one, measured against
+ruby 4.0.9 method by method.** A source that yields several values at once
+(`each_with_index`, a generator's `y.yield 1, 2`, a Hash's `each`) reaches
+the block of an Enumerable method in one of three ways, as enum.c's
+`enum_yield` hands them:
+
+- apart (`rb_yield_values2`): map, flat_map, count, inject, to_h,
+  each_with_object and their kind;
+- packed and given as to a proc, even when the block is a lambda
+  (`rb_yield_force_blockarg`): select, find, reject, the `*_by` family,
+  partition, drop_while, take_while, each_entry, cycle, zip -- a lambda's
+  parameters are cut to the values' number or padded with nil, and a Symbol's
+  proc or a Method's is given the packed array as its one argument;
+- packed and given as they are: sum, chunk, slice_before, slice_after,
+  each_slice, each_cons.
+
+mere-ruby spread them for every method. The first of the entry's three was
+not a difference: a lambda wanting one value, given to `map` over such a
+source, raises ArgumentError in ruby too (map hands the values apart). What
+differed was the second way: `select(&:itself)` raised, a lambda wanting one
+raised, and count and to_h packed values they should spread. The prelude's
+walks now ask `__fb_prep` for a lambda's parameters and yield through
+`__fb_fit`; `blk_spread_for` knows the methods of each way, and that a call
+through `send` is the method's own. each_with_index and each_entry answer
+their receiver, whatever walked it.
+
+**An alias of a builtin iterator, called without a block, is an Enumerator.**
+`alias old_times times; 3.old_times` was NoMethodError, as were upto, downto,
+step, each_slice, map and the rest: the alias went to a layer with no
+blockless form. When the class has redefined the name since, the alias with a
+block reaches the builtin (the user's body is skipped for that one call), and
+without one it is an Enumerator over the name, whose #each reaches the new
+method, as ruby's does.
+
+corpus 490 is the matrix: 5 sources (a generator, each_with_index, a Hash's
+each, a generator yielding one array, a Hash) by 38 methods by 9 blocks
+(lambdas of 1, 2, rest, optional and keyword parameters, two Symbol procs, a
+proc, a Method), and the edge cases (to_ary, a Range's and an Array's zip, the
+receiver each_with_index answers). corpus 491 is the aliases. Both are as
+ruby's.
+
+**Three smaller costs.**
+
+- An Integer in a string interpolation is written without the dispatcher,
+  when no refinement is active and Integer has neither a prepended module nor
+  a `to_s` of the program's. anchored's timed loop is 20% fewer instructions.
+- The string store's bytes are kept rather than walked at each safepoint: a
+  page is measured again only after something wrote to it, and the page being
+  appended to only once a megabyte has been added since. match_lines' timed
+  loop is 6-10% fewer cycles; a loop making 5 MB strings peaks at 432-570 MB
+  where it peaked at 638-786, collecting 42 times where it collected 28.
+- The literal prefilter searches from a later position with Mere 0.1.707's
+  `str_index_from` (memchr from an offset), where only the first search, from
+  the start, used `str_index_of`. A literal search workload is 18% fewer
+  instructions.
+
+Instructions retired, whole process (the machine was loaded; the seconds
+moved by more than the change):
+
+| workload | before | after |
+|---|---|---|
+| match_lines | 2315M | 1904M |
+| anchored | 2844M | 2209M |
+| capture_log | 2342M | 1980M |
+| scan_words | 2836M | 2400M |
+| scan_email | 3614M | 3085M |
+| literal_find | 1720M | 1319M |
+
+The round: 10 gates, corpus 493/493 with the hash index on and off, stderr and
+GC_STRESS differing from the previous binary on 490 and 491 only (both now
+ruby's), stdlib the same, 1007 specs the same, and every unit test file the
+same count as before (alias, struct and gc run on both binaries).
+
+- Found and left:
+  - Enumerable#zip with a lambda wanting more parameters than the tuple has
+    raises ArgumentError; ruby pads with nil.
+  - `Integer.include M` with an `M#to_s` changes what `"#{1}"` gives in
+    mere-ruby ("vM") and not in ruby ("v1"); it did before this change too.
+- Left: the VM. scan_words is 2.0x ruby's and the VM about 30% of it, so
+  rebuilding it would gain at most 1.4x there; match_lines and anchored are the
+  interpreter's loop and call.

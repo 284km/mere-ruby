@@ -650,6 +650,31 @@ let _ = vec_push str_pg_pool_n 0;
 let str_n = vec_new ();
 let _ = vec_push str_n 0;
 let str_count = fn (u: unit) -> vec_get str_n 0;
+// ⚠ THE PAGES' BYTES ARE KEPT, NOT WALKED. The byte axis asked str_bytes at
+//   every safepoint where something was made, and it summed every page ever
+//   issued (vec_bytes walks a page's blocks): a fourth of `each_line.count {
+//   l =~ re }`, which makes a String per line. A page's bytes change only when
+//   it is written (mkstr, sput) or swept, so a written page is queued once
+//   (str_pg_dq) and str_bytes measures just those, keeping the sum.
+let str_pg_bytes = vec_new ();
+let str_pg_dirty = vec_new ();
+let str_pg_dq = vec_new ();
+let str_pg_dq_n = vec_new ();
+let _ = vec_push str_pg_dq_n 0;
+let str_pg_tot = vec_new ();
+let _ = vec_push str_pg_tot 0;
+// ...and an APPEND is not a write to measure: the page mkstr pushes onto is
+// the one every safepoint would measure again (its block chain walked each
+// time). The lengths appended since it was last measured are added up
+// instead, and it is measured once they pass a megabyte.
+let str_pg_add = vec_new ();
+let _ = vec_push str_pg_add 0;
+let str_pg_touch = fn (p: int) ->
+  if vec_get str_pg_dirty p == 1 then ()
+  else (let _ = vec_set str_pg_dirty p 1 in
+        let k = vec_get str_pg_dq_n 0 in
+        let _ = (if k < vec_len str_pg_dq then vec_set str_pg_dq k p else vec_push str_pg_dq p) in
+        vec_set str_pg_dq_n 0 (k + 1));
 let sraw = fn (id: int) ->
   let i = id - handle_base in
   let pg = vec_get str_store (i / 4096) in
@@ -659,7 +684,7 @@ let sput = fn (id: int) -> fn (s: str) ->
   let i = id - handle_base in
   let pg = vec_get str_store (i / 4096) in
   let o = i - (i / 4096) * 4096 in
-  if o < vec_len pg then vec_set pg o s else ();
+  if o < vec_len pg then (let _ = str_pg_touch (i / 4096) in vec_set pg o s) else ();
 // (the sweep: surv holds the slots that lived, k of them -- a page with none
 //  is wound back, the others compacted unless nc)
 let str_pg_live = vec_new ();
@@ -673,6 +698,8 @@ let str_pages_sweep = fn surv -> fn (k: int) -> fn (nc: bool) ->
      else (let _ = (if vec_get str_pg_dead p == 1 then ()
                     else if vec_get str_pg_live p == 0 && p < vec_len str_store - 1
                     then (let pg = vec_get str_store p in
+                          let _ = vec_set str_pg_tot 0 (vec_get str_pg_tot 0 - vec_get str_pg_bytes p) in
+                          let _ = vec_set str_pg_bytes p 0 in
                           let _ = vec_recycle pg in
                           let n9 = vec_get str_pg_pool_n 0 in
                           let _ = (if n9 < vec_len str_pg_pool then vec_set str_pg_pool n9 pg else vec_push str_pg_pool pg) in
@@ -680,15 +707,28 @@ let str_pages_sweep = fn surv -> fn (k: int) -> fn (nc: bool) ->
                           let _ = vec_set str_store p str_pg_empty in
                           vec_set str_pg_dead p 1)
                     else if nc then ()
-                    else vec_compact (vec_get str_store p)) in
+                    else (let _ = str_pg_touch p in vec_compact (vec_get str_store p))) in
            pw (p + 1))) in
   pw 0;
-// the bytes of the pages not wound back
+// the bytes of the pages not wound back: the kept sum, after measuring the
+// pages written since it was last asked
 let str_bytes = fn (u: unit) ->
-  let rec go = fn (p: int) -> fn (acc: int) ->
-    if p >= vec_len str_store then acc
-    else go (p + 1) (if vec_get str_pg_dead p == 1 then acc else acc + vec_bytes (vec_get str_store p)) in
-  go 0 0;
+  let cur = (vec_get str_n 0 - 1) / 4096 in
+  let _ = (if vec_get str_pg_add 0 >= 1048576 && cur >= 0 then str_pg_touch cur else ()) in
+  let k = vec_get str_pg_dq_n 0 in
+  let rec go = fn (j: int) ->
+    if j >= k then ()
+    else (let p = vec_get str_pg_dq j in
+          let _ = vec_set str_pg_dirty p 0 in
+          let _ = (if p == cur then vec_set str_pg_add 0 0 else ()) in
+          let _ = (if vec_get str_pg_dead p == 1 then ()
+                   else (let b = vec_bytes (vec_get str_store p) in
+                         let _ = vec_set str_pg_tot 0 (vec_get str_pg_tot 0 + b - vec_get str_pg_bytes p) in
+                         vec_set str_pg_bytes p b)) in
+          go (j + 1)) in
+  let _ = go 0 in
+  let _ = vec_set str_pg_dq_n 0 0 in
+  vec_get str_pg_tot 0 + vec_get str_pg_add 0;
 // ⚠ ONE SNAPSHOT PER SUBJECT, NOT PER MATCH. A MatchData keeps the subject it
 // matched against (for #string / #pre_match / #post_match / $` / $'), and it
 // has to be the text AS IT WAS -- ruby's MatchData holds a frozen copy. Making
@@ -712,8 +752,14 @@ let mkstr = fn (s: str) ->
                           else (let pg = vec_new () in
                                 let _ = vec_compact pg in
                                 vec_push str_store pg)) in
-                 vec_push str_pg_dead 0)
+                 let _ = vec_push str_pg_bytes 0 in
+                 let _ = vec_push str_pg_dirty 0 in
+                 let _ = vec_push str_pg_dead 0 in
+                 // (the page it fills next, and the one it filled, are measured)
+                 let _ = (if n > 0 then str_pg_touch (n / 4096 - 1) else ()) in
+                 str_pg_touch (n / 4096))
            else ()) in
+  let _ = vec_set str_pg_add 0 (vec_get str_pg_add 0 + str_len s) in
   let _ = vec_push (vec_get str_store (n / 4096)) s in
   let _ = vec_set str_n 0 (n + 1) in
   VStr (handle_base + n);

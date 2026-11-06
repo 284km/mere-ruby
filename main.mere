@@ -8462,10 +8462,14 @@ and hash_iterating_name = fn (name: str) ->
 // A receiver walked as the Array of its elements answers what the ARRAY's
 // method answers -- except the iterators whose answer is the receiver itself:
 // each_slice / each_cons hand back the Array they walked (ruby 3.1+ returns
-// the receiver), and a Range's was that temporary Array, not the Range.
+// the receiver), and a Range's was that temporary Array, not the Range. So do
+// each_with_index and each_entry (`{a: 1}.each_with_index { }` is the Hash).
+and iter_answers_self = fn (name: str) ->
+  (str_len name == 15 && str_eq name "each_with_index") || (str_len name == 10 && str_eq name "each_entry")
 and via_arr_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (arr: Val) -> fn (name: str) -> fn (args: Val list) ->
   let r9 = builtin_iter world encl theblk arr name args in
-  if (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons") then
+  if (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons")
+     || (str_len name == 15 && str_eq name "each_with_index") || (str_len name == 10 && str_eq name "each_entry") then
     (match (r9, arr) with
      | (VArr a9, VArr b9) -> (if a9 == b9 then recv else r9)
      | _ -> r9)
@@ -25467,6 +25471,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if map_has proc_symsrc (str_of_int pid) && (match args with Nil -> true | _ -> false)
        && ((str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "()") || (str_len name == 2 && str_eq name "[]") || (str_len name == 5 && str_eq name "yield")) then
       raise_exc world "ArgumentError" "no receiver given"
+    // What enum.c's rb_yield_force_blockarg does with this proc, for the
+    // prelude's walks (__fb_prep): 0 a proc, 1 a forwarder that takes the
+    // packed values as ONE argument (Symbol#to_proc's, Method#to_proc's, a
+    // curried or composed one), 2 a lambda written in Ruby, whose parameters
+    // take them as a proc's would.
+    else if (str_len name == 9 && str_eq name "__fb_kind") then
+      (let k9 = str_of_int pid in
+       if map_has proc_symsrc k9 || map_has curry_target k9 || map_has comp_inner k9 then VInt 1
+       else (match proc_get k9 with
+             | (_, Cons (m9, Cons (p9, r9)), _, _) when str_eq m9 lambda_blk_marker
+                   && (str_eq p9 "__bp" || (str_eq p9 lambda_spread_marker && (match r9 with Cons (q9, _) -> str_eq q9 "__bp" | Nil -> false))) -> VInt 1
+             | (_, Cons (m9, _), _, _) when str_eq m9 lambda_blk_marker -> VInt 2
+             | (_, Cons (a9, Cons (b9, Nil)), _, _) when str_eq a9 "*__a" && str_eq b9 "&__b" -> VInt 1
+             | _ -> VInt (if map_has lambda_ids k9 then 2 else 0)))
     else if map_has comp_inner (str_of_int pid) && (str_len name == 5 && str_eq name "arity") then VInt (0 - 1)
     // Proc#ruby2_keywords: a *rest-only proc that must keep a trailing `key:`
     // hash MARKED as a keywords hash, so re-splatting it stays keywords. The
@@ -26151,6 +26169,13 @@ and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                        | EMethod (x, _, _) ->
                          (match eval_e env world blk x with
                           | VStr h -> (sget h, senc_get h)
+                          // an Integer whose #to_s nothing replaced (no
+                          // definition, prepend or refinement) is its digits,
+                          // US-ASCII: the dispatcher's walk to the same answer
+                          // was a fifth of `"value-#{i}" =~ re`
+                          | VInt n9 when map_len ref_active == 0 && (if map_has prepends "Integer" then false else true)
+                                         && (if prim_user_has world (VInt n9) "to_s" then false else true) ->
+                            (str_of_int n9, "US-ASCII")
                           | v -> (match invoke_val_c env world blk v "to_s" Nil false with
                                   | VStr h2 -> (sget h2, senc_get h2)
                                   // a #to_s that answered something else: ruby
@@ -26162,7 +26187,9 @@ and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                                  ("#<" ++ cls_display world (obj_print_cls world (map_get oc9 oid9)) ++ ":0x" ++ hex_pad16 (oid9 - handle_base) ++ ">", "UTF-8"))
                                               | _ -> (to_s other, "UTF-8"))))
                        | _ -> ("", "UTF-8")) in
-       let renc = enc_compat2 enc acc e9 t9 in
+       // (a US-ASCII piece is ASCII only: a UTF-8 string takes it as it is,
+       //  empty or not -- rb_enc_compatible)
+       let renc = (if str_eq e9 "US-ASCII" && str_eq enc "UTF-8" then enc else enc_compat2 enc acc e9 t9) in
        if str_eq renc "" then
          (let _ = prim_raise "Encoding::CompatibilityError"
                     ("incompatible character encodings: " ++ enc_msg_name enc ++ " and " ++ enc_msg_name e9) in VNil)
@@ -28089,10 +28116,17 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
      && (match recv with VObj _ -> false | VClass _ -> false | VMain -> false | _ -> true)
      && (if has_meth world (dispatch_cls_of world recv) name then false else true)
      && (let src9 = blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) name in
-         (if str_eq src9 "" then false else true)
-         // (the builtin itself: not a method the class redefined since)
-         && (if has_meth world (dispatch_cls_of world recv) src9 then false else true)) then
-    invoke_with_block env world blk recv (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) name) args newblk0
+         (if str_eq src9 "" then false else true)) then
+    (let src9 = blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) name in
+     // (the builtin itself, also when the class has redefined the name since:
+     //  the alias is how the new method reaches the old one, so the one
+     //  dispatch skips the Ruby body -- bi_skip, as a builtin's Method does)
+     if has_meth world (dispatch_cls_of world recv) src9 then
+       (let _ = map_set bi_skip "n" src9 in
+        let r9 = try_or_msg (fn (u: unit) -> invoke_with_block env world blk recv src9 args newblk0)
+                   (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
+        let _ = map_clear bi_skip in r9)
+     else invoke_with_block env world blk recv src9 args newblk0)
   else if str_len name == 5 && str_eq name "match" && rx_own_match world recv args then rx_own_match_call env world blk recv args newblk
   else if rx_sub_args_needed world recv name args then invoke_with_block env world blk recv name (rx_sub_args world args) newblk
   else if bi_frameless world recv name || gen_routed world recv name args newblk
@@ -28249,18 +28283,62 @@ and blk_spread_for = fn world -> fn (recv: Val) -> fn (name: str) -> fn b ->
   match recv with
   | VHsh _ ->
     // (only to a lambda that wants two or more: `->(x) { }` takes the pair)
-    if (str_eq name "map" || str_eq name "collect" || str_eq name "find" || str_eq name "detect")
+    if (str_eq name "map" || str_eq name "collect" || str_eq name "find" || str_eq name "detect" || str_eq name "zip")
        && (if prim_user_has world recv name then false else true)
        && (match b with (_, ps9, body9, _) -> mandatory_pos_count (pos_params (strip_marker_params (drop_yblk_params ps9))) (block_defaults body9) >= 2)
     then blk_spread b else b
+  | VObj id when (if str_eq name "zip" || str_eq name "map" || str_eq name "collect" || str_eq name "find" || str_eq name "detect" then
+                   (let (_, _, _, ivh) = world in
+                    let k9 = str_of_int id in
+                    str_eq name "zip"
+                    || (map_has ivh (k9 ++ "@recv") && (match map_get ivh (k9 ++ "@recv") with VHsh _ -> true | _ -> false)
+                        && (match (if map_has ivh (k9 ++ "@meth") then map_get ivh (k9 ++ "@meth") else VNil) with
+                            | VStr mh -> (let m8 = sget mh in str_eq m8 "each" || str_eq m8 "each_pair")
+                            | _ -> false)))
+                 else false) ->
+    // `h.each.map(&->(k, v) { })` is the Hash's own: enum_collect hands the
+    // block's arity to Hash#each, which yields the pair apart (as above). And
+    // #zip gives a lambda wanting two or more the tuple spread (Array's and
+    // Enumerable's both)
+    (match b with (_, ps9, body9, _) ->
+       if mandatory_pos_count (pos_params (strip_marker_params (drop_yblk_params ps9))) (block_defaults body9) >= 2 then blk_spread b else b)
+  | VArr _ when str_eq name "zip" ->
+    (match b with (_, ps9, body9, _) ->
+       if mandatory_pos_count (pos_params (strip_marker_params (drop_yblk_params ps9))) (block_defaults body9) >= 2 then blk_spread b else b)
+  | VRange _ when str_eq name "zip" ->
+    (match b with (_, ps9, body9, _) ->
+       if mandatory_pos_count (pos_params (strip_marker_params (drop_yblk_params ps9))) (block_defaults body9) >= 2 then blk_spread b else b)
   | VObj id ->
     (let (_, _, _, iv9) = world in
      let m9 = (if map_has iv9 (str_of_int id ++ "@meth") && map_has iv9 (str_of_int id ++ "@recv")
                then (match map_get iv9 (str_of_int id ++ "@meth") with VStr mh -> sget mh | _ -> "") else "") in
      if (str_eq m9 "each_with_index" || str_eq m9 "with_index" || str_eq m9 "each_with_object" || str_eq m9 "with_object")
         && is_enum_cls (class_name recv)
-     then blk_spread b else b)
+     then
+       // ...as enum.c hands each method the two values: apart (map, count,
+       // inject), packed and given as to a proc (select, find, the *_by
+       // family, cycle, zip -- a lambda wanting one takes the pair, a Symbol's
+       // proc is sent to it), or packed and given as they are (sum, chunk,
+       // each_slice -- a lambda wanting two is refused)
+       // (the prelude's walks -- __gen_select -- hand them as enum.c does
+       //  already, and `send(:select, &l)` decides when it reaches select)
+       (if (str_len name > 5 && str_eq (substring name 0 5) "__gen")
+           || str_eq name "send" || str_eq name "__send__" || str_eq name "public_send" then b
+        else if fb_packed_name name then
+          (match b with (_, ps9, body9, _) ->
+             if mandatory_pos_count (pos_params (strip_marker_params (drop_yblk_params ps9))) (block_defaults body9) >= 2 then blk_spread b else b)
+        else if yield_packed_name name then b
+        else blk_spread b)
+     else b)
   | _ -> b
+and fb_packed_name = fn (n: str) ->
+  str_eq n "select" || str_eq n "filter" || str_eq n "find_all" || str_eq n "reject" || str_eq n "find"
+  || str_eq n "detect" || str_eq n "partition" || str_eq n "group_by" || str_eq n "min_by" || str_eq n "max_by"
+  || str_eq n "sort_by" || str_eq n "minmax_by" || str_eq n "drop_while" || str_eq n "each_entry"
+  || str_eq n "cycle" || str_eq n "zip"
+and yield_packed_name = fn (n: str) ->
+  str_eq n "sum" || str_eq n "chunk" || str_eq n "slice_before" || str_eq n "slice_after"
+  || str_eq n "each_slice" || str_eq n "each_cons"
 and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk ->
     // an alias of instance_eval / instance_exec (openstruct's
     // `instance_eval!`) is the eval itself, block and all
@@ -29371,7 +29449,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // `extend Enumerable` + `def self.each`: the block iterators come from
        // the class's own each, exactly as they do for an instance.
        else if has_meth world ("(sng:" ++ c ++ ")") "each" && is_enum_method name then
-         builtin_iter world blk newblk (enum_collect world recv ("(sng:" ++ c ++ ")")) name args
+         (let r9 = builtin_iter world blk newblk (enum_collect world recv ("(sng:" ++ c ++ ")")) name args in
+          if iter_answers_self name then recv else r9)
        // ⚠ A NAMESPACE CLASS METHOD CALLED WITH A BLOCK never reached the arm
        //   that implements it: this path ends in prim_method, which does not
        //   know them, so `File.foreach(p) { }`, `Dir.glob(p) { }` and even
@@ -29441,7 +29520,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        else if has_meth world cls "each" && (is_enum_method name || enum_arg_iter name) then
          // ...but each_slice / each_cons answer the RECEIVER, and the array
          // they were driven through would answer itself.
-         (if enum_arg_iter name && (if (str_len name == 5 && str_eq name "cycle") then false else true)
+         (if (enum_arg_iter name && (if (str_len name == 5 && str_eq name "cycle") then false else true)) || iter_answers_self name
           then (let _ = builtin_iter world blk newblk (enum_collect world recv cls) name args in recv)
           else builtin_iter world blk newblk (enum_collect world recv cls) name args)
        // a synthetic class's own method, reached with a block in hand (often a
@@ -29487,7 +29566,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        else if (if str_eq tcls9 pcls then false else true)
                && has_meth world tcls9 "each" && is_enum_method name
                && (if (str_len name == 4 && str_eq name "each") then false else true) then
-         builtin_iter world blk newblk (enum_collect world recv tcls9) name args
+         (let r9 = builtin_iter world blk newblk (enum_collect world recv tcls9) name args in
+          if iter_answers_self name then recv else r9)
        else if (if skp9 then false else true) && has_meth world pcls name then invoke world newblk recv pcls name args
        // in-place Array mutators taking a block: map!/select!/reject!/etc.
        else if ((str_len name == 4 && str_eq name "map!") || (str_len name == 8 && str_eq name "collect!")) && (match recv with VArr _ -> true | _ -> false) then
@@ -40369,7 +40449,17 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
   | (VStr _, _) when (if has_meth world (dispatch_cls_of world recv) src then false else true)
                      && str_eq (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) src) "" ->
     invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
+  // (...nor an ITERATOR's blockless form on any value: `alias old_times
+  //  times; 3.old_times` was "undefined method 'times'", and so was a Method
+  //  of it. Once the class redefines the name it is an Enumerator over that
+  //  name, as ruby's is -- its #each sends `times` again, to the new one)
+  | _ when (match recv with VObj _ -> false | _ -> true) && alias_iter_name src ->
+    if has_meth world (dispatch_cls_of world recv) src then make_enum_a world recv src args
+    else invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
   | _ -> prim_method recv src args
+and alias_iter_name = fn (n: str) ->
+  enum_needs_block n || enum_arg_iter n || str_eq n "times" || str_eq n "upto" || str_eq n "downto"
+  || str_eq n "step" || str_eq n "each_grapheme_cluster"
 and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> fn (args: Val list) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let hk = hng_key other in
@@ -59084,18 +59174,9 @@ and rxv_search_win = fn prog -> fn (s: str) -> fn (x: int) -> fn (hi: int) -> fn
 and rxq_cstart = fn (s: str) -> fn (i: int) -> fn (len: int) ->
   if i >= len then i
   else (let b = ord (char_at s i) in if b >= 128 && b < 192 then rxq_cstart s (i + 1) len else i)
-// the first lit in s at or after i, or -1 (str_index_of is memchr from 0)
-and rxq_find = fn (s: str) -> fn (lit: str) -> fn (i: int) ->
-  if i <= 0 then str_index_of s lit
-  else rxq_find_go s lit (ord (char_at lit 0)) i (str_len s - str_len lit)
-and rxq_find_go = fn (s: str) -> fn (lit: str) -> fn (b0: int) -> fn (j: int) -> fn (last: int) ->
-  if j > last then 0 - 1
-  else if ord (char_at s j) == b0 && rxq_at s lit j 1 then j
-  else rxq_find_go s lit b0 (j + 1) last
-and rxq_at = fn (s: str) -> fn (lit: str) -> fn (j: int) -> fn (k: int) ->
-  if k >= str_len lit then true
-  else if ord (char_at s (j + k)) == ord (char_at lit k) then rxq_at s lit j (k + 1)
-  else false
+// the first lit in s at or after i, or -1: memchr from i (mere 0.1.706's
+// str_index_from; the later searches of a scan walked a byte at a time)
+and rxq_find = fn (s: str) -> fn (lit: str) -> fn (i: int) -> str_index_from s lit i
 
 // a minimal regex engine: literals, ^ $ anchors, . any, \d \w \s classes,
 // and + * on single elements. Backtracking, no groups.
