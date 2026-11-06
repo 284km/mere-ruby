@@ -90,7 +90,7 @@ end
         with patch.object(ci, 'ROOT', self.root), patch.object(ci, 'ProcessFamily', FixtureFamily), \
                 patch.dict(os.environ, dict(self.fixture.env, REF_RUBY_BIN=str(self.root / 'reference'),
                                             UNITTEST_REF_EXT_PATH=str(self.ext), GITHUB_OUTPUT='', GITHUB_STEP_SUMMARY='')):
-            ci.save(self.root / 'plan.json', dict(source_ref='a'*40, mere_ref='b'*40, ruby_ref='c'*40,
+            ci.save(self.root / 'plan.json', dict(schema=1, source_ref='a'*40, mere_ref='b'*40, ruby_ref='c'*40,
                                                  ruby_version=self.version, shards=1, files=[file]))
             ci.save(self.root / 'build.json', dict(source_ref='a'*40, mere_ref='b'*40,
                                                   binary_sha256=ci.digest(self.root / 'mere-ruby'), optimization='O2'))
