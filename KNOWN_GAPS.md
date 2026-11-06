@@ -81,12 +81,21 @@ call read "mere-ruby: (ruby exception raised) (StandardError)".) What the
 startup and every write ask -- getpid, the signal setup, the rlimit table,
 the errno of a refused write -- is asked once and answered empty instead.
 
-## IO#timeout is kept but does not end a wait
+## IO#timeout still does not bound every write
 
-`r.timeout = 0.1` is kept, answered, and carried by `#dup` (test_io's
-dup_timeout), but a blocking read or write does not raise IO::TimeoutError
-when it runs out: the readiness loop of the IO layer waits as before.
-test_io's blocking_timeout and recycled_fd_close need the wait itself.
+`r.timeout = 0.1` is kept, answered, and carried by `#dup`. Descriptor-backed
+buffered reads (`read`, `gets`, `getc`, `getbyte`, and their shared readers) and
+socket accept/receive readiness waits raise `IO::TimeoutError` when the wait
+expires. Explicit `wait_readable`/`wait_writable` use the stream timeout when
+no timeout is supplied and retain their nil-on-timeout behavior.
+
+The write-buffer flush loop and direct writes still do not apply the stream
+timeout. This is not a complete implementation of Ruby's timeout contract;
+regular File operations and scheduler-specific I/O paths also need separate
+coverage.
+
+`readpartial` and `sysread` retain their unlimited raw-read behavior, matching
+Ruby 4.0.9's `io_getpartial` and `rb_io_sysread` paths.
 
 ## A child a signal killed is told from an exit code by its number
 
