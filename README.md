@@ -233,6 +233,12 @@ system zlib writes, and the system zlib reads what mere-ruby writes.
 
 ## The load path
 
+`Random.urandom`, also used by `SecureRandom.random_bytes`, reads
+`/dev/urandom` in bounded chunks on native Unix hosts. It returns a binary
+string without consuming the generator controlled by `srand`. A host without
+that entropy source, or a failed read, raises `RuntimeError`; there is no
+pseudorandom fallback for this API. `Random.bytes` remains the seeded generator.
+
 mere-ruby ships a set of pure-Ruby libraries compiled in (`monitor`,
 `stringio`, `strscan`, `set`, `pathname`, `time`, `delegate`, `English`,
 `digest`, `securerandom`, `base64`, `shellwords`, `observer`,
