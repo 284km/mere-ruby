@@ -28,7 +28,7 @@ def inventory(source):
                'spec/mspec': 'spec/mspec: ruby -S bundle exec rspec (see README.md and Gemfile)',
                'spec-root': 'common.mk:bundled_gems_spec-run', 'knownbugs': 'bootstraptest/runner.rb'}
     measured = {'test': 'unittest-report', 'bootstraptest': 'bootstrap-report',
-                'knownbugs': 'bootstrap-report', 'basictest': 'basic-report'}
+                'knownbugs': 'bootstrap-report', 'basictest': 'basic-report', 'tool/test': 'tool-report'}
     suites = []
     for name, paths in inputs.items():
         if len(paths) != len(set(paths)):
