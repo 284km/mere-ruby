@@ -85,6 +85,77 @@ class CICheck(unittest.TestCase):
         self.assertEqual(summary["totals"]["match"], 3)
         self.assertEqual(summary["missing_files"], 0)
 
+    def weighted_plan(self, seconds, ruby_ref='c' * 40, shards=2):
+        path = self.root / 'timings.json'
+        ci.save(path, dict(schema=1, ruby_ref=ruby_ref, seconds=seconds))
+        ci.plan(SimpleNamespace(ruby_src=self.root / 'src', output=self.root / 'plan', shards=shards,
+                                source_ref='a' * 40, mere_ref='b' * 40, ruby_ref='c' * 40,
+                                ruby_version='fixture', timings=path))
+        return ci.load(self.plan_path)
+
+    def test_weighted_plan_executes_and_collects_every_file_once(self):
+        files = ci.load(self.plan_path)['files']
+        manifest = self.weighted_plan(dict(zip(files, [1, 100, 2])))
+        self.assertEqual(manifest['files'], files)
+        self.assertEqual(manifest['partitions'], [[files[1]], [files[2], files[0]]])
+        self.assertEqual(self.run_shard(0), 0)
+        self.assertEqual(self.run_shard(1), 0)
+        self.assertEqual(self.merge(), 0)
+        self.assertEqual(ci.load(self.root / 'report/summary.json')['totals']['match'], 3)
+        timings = ci.load(self.root / 'report/timings.json')
+        self.assertEqual(set(timings['seconds']), set(files))
+        self.assertEqual(timings['ruby_ref'], manifest['ruby_ref'])
+
+    def test_unknown_and_removed_timing_entries_do_not_change_inventory(self):
+        files = ci.load(self.plan_path)['files']
+        manifest = self.weighted_plan({files[0]: 100, 'removed.rb': 999})
+        self.assertEqual(manifest['scheduling']['matched_files'], 1)
+        self.assertEqual(sorted(sum(ci.partitions(manifest), [])), sorted(files))
+        self.assertEqual(sum(manifest['scheduling']['estimated_seconds']), 220)
+
+    def test_changed_upstream_ref_ignores_old_weights(self):
+        files = ci.load(self.plan_path)['files']
+        manifest = self.weighted_plan({files[0]: 999}, ruby_ref='d' * 40)
+        self.assertEqual(manifest['scheduling']['matched_files'], 0)
+        self.assertEqual(sum(manifest['scheduling']['estimated_seconds']), 180)
+
+    def test_invalid_weights_fail_before_plan_publication(self):
+        file = ci.load(self.plan_path)['files'][0]
+        for value in (-1, 0, float('inf'), float('nan'), True, '10'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.weighted_plan({file: value})
+
+    def test_balancing_is_stable_and_reduces_skew(self):
+        files = ['a', 'b', 'c', 'd']
+        seconds = dict(zip(files, [600, 10, 500, 10]))
+        groups, totals = ci.balance(files, 2, seconds)
+        self.assertEqual((groups, totals), ci.balance(list(reversed(files)), 2, seconds))
+        self.assertEqual(max(totals), 600)
+        self.assertEqual(sorted(sum(groups, [])), files)
+
+    def test_more_shards_than_files_stays_nonempty(self):
+        manifest = self.weighted_plan({}, shards=8)
+        self.assertEqual(manifest['shards'], 3)
+        self.assertTrue(all(len(group) == 1 for group in ci.partitions(manifest)))
+
+    def test_duplicate_missing_or_unknown_partition_files_are_refused(self):
+        manifest = self.weighted_plan({})
+        files = manifest['files']
+        for groups in ([[files[0]], [files[0], files[2]]], [[files[0]], [files[1]]],
+                       [[files[0]], [files[1], 'unknown.rb']], [files, []]):
+            ci.save(self.plan_path, dict(manifest, partitions=groups))
+            with self.subTest(groups=groups):
+                with self.assertRaises(ValueError):
+                    self.run_shard(0)
+                with self.assertRaises(ValueError):
+                    self.merge()
+
+    def test_weighted_missing_shard_remains_a_collection_failure(self):
+        self.weighted_plan({})
+        self.assertEqual(self.run_shard(0), 0)
+        self.assertEqual(self.merge(), 1)
+        self.assertFalse((self.root / 'report/timings.json').exists())
+
     def test_missing_shard_retains_all_manifest_rows_and_fails_collection(self):
         self.run_shard(0)
         self.assertEqual(self.merge(), 1)
