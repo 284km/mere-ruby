@@ -231,8 +231,11 @@ needs), `Zlib.adler32`, `Zlib::Inflate.inflate` and
 blocks. Verified both directions against CRuby: mere-ruby reads what the
 system zlib writes, and the system zlib reads what mere-ruby writes.
 
-The submodule is pinned to mgz `a3b818b` (including its hash-chain match
-finder, bounded token blocks and length-limited Huffman trees). The old
+The submodule is pinned to mgz `661a01d` (including its hash-chain match
+finder, bounded token blocks and length-limited Huffman trees). The length
+limiter corrects the actual code-space excess, and all three Huffman trees
+are validated before any block bits are emitted, preventing oversubscribed
+trees from producing corrupt streams. The old
 `74fa3a3` pin scanned the entire 32 KiB window at each position. Compressed
 bytes and ratios may change; the uncompressed bytes and gzip CRC/size checks
 remain the contract. The bridge uses mgz's `inflate_buf` byte-buffer API for
