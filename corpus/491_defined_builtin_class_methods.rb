@@ -52,3 +52,68 @@ end
 p defined?(DefinedOverrideSurface.absent)
 # The queried builtin is available, and querying it sends no signal.
 p Process.kill(0, Process.pid) if defined?(Process.kill)
+
+# Builtin entries have visibility even when they have no Ruby method body.
+class << Time
+  private :utc
+end
+p defined?(Time.utc)
+class DefinedPrivateTime < Time; end
+p defined?(DefinedPrivateTime.utc)
+class << Time
+  protected :utc
+end
+p defined?(Time.utc)
+class Time
+  def self.defined_utc_on(receiver)
+    defined?(receiver.utc)
+  end
+end
+p [Time.defined_utc_on(Time), Time.defined_utc_on(DefinedPrivateTime)]
+class << Time
+  public :utc
+end
+p [defined?(Time.utc), defined?(DefinedPrivateTime.utc)]
+
+module DefinedDeniedHook
+  def self.events; @events ||= []; end
+  def self.respond_to?(*args)
+    events << args
+    false
+  end
+  def self.respond_to_missing?(*)
+    raise 'denied hook must not run'
+  end
+  def self.real; end
+end
+p [defined?(DefinedDeniedHook.absent), defined?(DefinedDeniedHook.real)]
+p DefinedDeniedHook.events
+module DefinedAllowedHook
+  def self.events; @events ||= []; end
+  def self.respond_to?(*args)
+    events << args
+    true
+  end
+  def self.respond_to_missing?(name, private_ok = false)
+    events << [name, private_ok]
+    name == :dynamic
+  end
+end
+p [defined?(DefinedAllowedHook.dynamic), defined?(DefinedAllowedHook.absent)]
+p DefinedAllowedHook.events
+module DefinedOneArgumentHook
+  def self.events; @events ||= []; end
+  def self.respond_to?(name)
+    events << name
+    true
+  end
+  def self.respond_to_missing?(name, private_ok = false)
+    events << [name, private_ok]
+    name == :dynamic
+  end
+end
+saved_verbose = $VERBOSE
+$VERBOSE = nil
+p defined?(DefinedOneArgumentHook.dynamic)
+$VERBOSE = saved_verbose
+p DefinedOneArgumentHook.events
