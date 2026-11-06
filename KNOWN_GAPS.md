@@ -170,6 +170,18 @@ project, and nothing in the corpus needs it.
 
 ## A Fiber runs on a coroutine, and a suspended one is read conservatively
 
+`Fiber.schedule` forwards its arguments and block to the current thread's
+scheduler. Blocking fibers expose no `Fiber.current_scheduler`. Descriptor
+waits for buffered reads, socket accepts and readiness waits can yield via
+`io_wait`; `IO.select` delegates to the optional `io_select` hook. Replacing or
+clearing a scheduler, ending a worker thread, and ending the main thread drain
+it through `scheduler_close` (or legacy `close`). Main-thread draining precedes
+`at_exit` handlers. This is not complete Fiber scheduler support: optimized
+`io_read`/`io_write` hooks, every blocking write path, process/DNS hooks and
+cross-thread close behavior still need work. The upstream `fiber/test_io.rb`
+measurement now completes, but its descriptor-leak diagnostics remain, and
+its passing test count alone does not establish full scheduler compatibility.
+
 ```ruby
 fib = Fiber.new { a, b = 0, 1; loop { Fiber.yield a; a, b = b, a + b } }
 p 10.times.map { fib.resume }     # works: [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
