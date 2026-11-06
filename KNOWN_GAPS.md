@@ -1084,14 +1084,15 @@ on a chosen address and answers getsockname / getpeername itself:
 - **getsockname / getpeername are the kernel's own** (sock_local_addr /
   sock_peer_addr). They were read from outside -- lsof(8) on macOS, /proc on
   Linux, about 35 ms a socket -- before the runtime could ask.
-- **UDP binds and connects, but cannot send to an address.**
-  `UDPSocket#bind` is bind(2), `#connect` / `send` / `recv` are the runtime's
-  udp_open / send / recv. `#send` to an address needs sendto(2) and raises
-  NotImplementedError, and a datagram's sender needs recvfrom(2): `#recvfrom`
-  on a socket that is not connected is Errno::ENOTCONN from getpeername(2),
-  which is why ipsocket/recvfrom_spec and socket/recvfrom_spec stay DIFF. A
-  datagram is one recv(2) / send(2) and never passes through the stream
-  buffer, so an empty one is `""` and is actually sent.
+- **UDP supports addressed datagrams.** `UDPSocket#send` accepts host/port,
+  packed sockaddr, and Addrinfo destinations; `#recvfrom` reports each packet's
+  actual sender. The native sendto/recvfrom helpers preserve the socket's
+  descriptor and binding, pass flags to the kernel, and carry binary and empty
+  packets. `MSG_PEEK` leaves the datagram queued; short receives discard its
+  remainder. Zero-length receives retain the host kernel's behavior.
+  `UDPSocket#connect` still replaces the underlying descriptor, so preserving
+  a prior binding across connect remains unsupported. Generic `Socket` and
+  `IPSocket` datagram paths retain their existing limitations.
 - **UNIX sockets** need a sockaddr_un for connect(2) and bind(2) and an array
   for socketpair(2); they raise NotImplementedError. `Addrinfo.unix` and
   `Socket.sockaddr_un` are data and work.
@@ -3568,7 +3569,7 @@ exactly, because the other half would have to invent something:
 | `cgi` — escapeHTML, unescapeHTML, the URI encoders, escapeElement | the request-shaped instance methods `#params`, `#header`, `#out`, `#[]`: they need a request environment, and this process is not a CGI script. ⚠ `CGI.new` itself SUCCEEDS and hands back an object none of them answer for -- the one row here that fails somewhere other than the name you asked for |
 | `io/console` — `StringIO#getch` | `#getpass`: ruby consumes one character more than "a line without the newline", and a method that is close but not the same is a wrong answer where a missing one is an honest refusal |
 | `openssl` — `OpenSSL::Digest`, HMAC, experimental AES CBC/ECB | TLS, X509, PKey: a gem should fail on the constant that names the missing capability, not load and fail somewhere else |
-| `socket` — Addrinfo, Option, AncillaryData, constants; TCP in both families, connected UDP | bind(2)/sendto(2) to a chosen address and UNIX sockets EXIST and raise `NotImplementedError`, for the same reason (see the `socket` entry) |
+| `socket` — Addrinfo, Option, AncillaryData, constants; TCP in both families, addressed UDP | `UDPSocket` supports addressed send/receive; generic socket datagram paths and binding preservation across UDP connect remain limited (see the `socket` entry) |
 
 ⚠ Each of these was added because something failed by NAME rather than by
 behaviour: `require "fcntl"` on line four of core/io/reopen_spec took that
