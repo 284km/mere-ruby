@@ -49,6 +49,38 @@ end
 p [result.class, result.alive?]
 Fiber.set_scheduler(nil)
 
+# Fill a write buffer so readiness cannot bypass the scheduler hook. Its
+# masks use IO::WRITABLE == 4, unlike the internal poll bit == 2.
+class EventScheduler < WaitScheduler
+  attr_accessor :ready
+  def io_wait(io, events, timeout)
+    p [:requested, events]
+    @ready
+  end
+end
+[:pipe, :socket].each do |kind|
+  reader, writer = kind == :pipe ? IO.pipe : UNIXSocket.pair
+  begin
+    loop do
+      break if writer.write_nonblock("x" * 4096, exception: false) == :wait_writable
+    end
+    scheduler = EventScheduler.new
+    Fiber.set_scheduler(scheduler)
+    scheduler.ready = 0
+    Fiber.schedule { writer.wait_writable(0.01) }
+    if kind == :socket
+      [IO::READABLE, IO::WRITABLE, IO::READABLE | IO::WRITABLE, nil, false].each do |ready|
+        scheduler.ready = ready
+        Fiber.schedule { p writer.wait(IO::READABLE | IO::WRITABLE, 0.01) }
+      end
+    end
+  ensure
+    Fiber.set_scheduler(nil)
+    reader.close
+    writer.close
+  end
+end
+
 p s.events
 
 # A read suspends its fiber, allowing the peer's writer to run; closing

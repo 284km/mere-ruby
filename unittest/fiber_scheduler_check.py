@@ -67,10 +67,35 @@ Fiber.set_scheduler(SchedulerProbe.new)
 }
 
 
+for status in (0, 42):
+    CASES[f'main close exit {status}'] = BASE + f'''
+class SchedulerProbe
+  def scheduler_close = exit({status})
+end
+Fiber.set_scheduler(SchedulerProbe.new)
+at_exit {{ GC.start; p [$!&.class, $!&.status] }}
+'''
+CASES['main close exception visible'] = BASE + '''
+class SchedulerProbe
+  def scheduler_close = raise('close failed')
+end
+Fiber.set_scheduler(SchedulerProbe.new)
+at_exit { GC.start; p [$!&.class, $!&.message] }
+'''
+CASES['handler overrides close status'] = CASES['main close exit 42'] + '''
+at_exit { exit 7 }
+'''
+CASES['handler overrides close error'] = CASES['main close exception visible'] + '''
+at_exit { exit 0 }
+'''
+EXIT_STATUS = {'main close failure status': 1, 'main close exception visible': 1,
+               'main close exit 42': 42, 'handler overrides close status': 7}
+
+
 def run(binary, arguments, env):
     result = subprocess.run([binary, *arguments], env=env, capture_output=True,
                             text=True, timeout=15)
-    return result.returncode, result.stdout
+    return result.returncode, result.stdout, bool(result.stderr)
 
 
 def main():
@@ -81,7 +106,7 @@ def main():
     cases.update({name: ['-e', source] for name, source in CASES.items()})
     for name, arguments in cases.items():
         expected = run(reference, arguments, os.environ.copy())
-        assert expected[0] == (1 if name == 'main close failure status' else 0), name
+        assert expected[0] == EXIT_STATUS.get(name, 0), name
         for mode in ('on', 'off'):
             env = os.environ.copy()
             env.pop('MERE_RUBY_NO_HASH_INDEX', None)
