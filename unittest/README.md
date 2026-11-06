@@ -80,6 +80,13 @@ The existing wall-time and RSS controls still apply to full runs. Start with
 small selections while developing; running the entire expanded selection is
 a separate measurement from listing it.
 
+## Tool tests
+
+The separate [tool measurement](../tooltest/README.md) executes the 12
+`tool/test` candidate bodies through their original runner, including their
+CLI and parallel fixtures. CI publishes four `tool-shard-*` artifacts and a
+`tool-report`; these cases are not added to the `test/` totals above.
+
 ## Checking the harness
 
 ```sh
