@@ -37,10 +37,12 @@ def run_side(source, reference, binary, private, output, version, wall, rss_kb, 
     # Upstream --ruby splits on spaces rather than parsing shell quoting.
     # The private directory is allocated under /tmp, so a launcher there can
     # select a real interpreter whose original path contains spaces.
-    child = private.resolve() / 'ruby'
-    if any(char.isspace() for char in str(child)):
-        raise ValueError('tool private directory must have a whitespace-free path')
-    child.symlink_to(ROOT / 'unittest/child-bin/ruby')
+    child = binary
+    if any(char.isspace() for char in str(binary)):
+        child = private.resolve() / 'ruby'
+        if any(char.isspace() for char in str(child)):
+            raise ValueError('tool private directory must have a whitespace-free path')
+        child.symlink_to(binary)
     env = ci.test_environment(private / 'environment', binary, version)
     libraries = [str(source / 'tool/lib'), str(source / 'test')]
     if binary == reference:
