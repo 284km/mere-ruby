@@ -226,13 +226,61 @@ configuration; the summary lists counts and newly unclassified ZERO files.
 These rows stay ZERO and never count as passing. Alternate-platform/build
 measurements must retain their own provenance instead of mixing into macOS.
 
-`unittest/ci.py` partitions the manifest into 64 shards with no overlapping files.
+`unittest/ci.py` partitions the manifest into eight shards with no overlapping files.
+CI supplies `--timings unittest/timings.json`: the planner assigns the longest
+observed files first to the lightest shard, with deterministic tie breaking.
+The complete discovered inventory remains in `files`; schema 2 plans also save
+explicit `partitions`. Execution and collection validate that every file occurs
+exactly once. Old schema 1 round-robin plans remain readable.
+
+Timing estimates only control placement. New files receive a 60-second estimate,
+removed files are ignored, and a different upstream Ruby SHA discards the old
+weights. None of these cases skips a file or reuses a test verdict. Invalid
+negative, zero or non-finite estimates fail planning. The plan records the timing
+file hash, coverage and estimated shard durations.
+
 At most four macOS measurement jobs run at once. Each file runs sequentially:
 each interpreter has a 600-second wall limit, and the tracked process family
 has an aggregate RSS cap of 2 GiB, polled every 0.1 seconds. A worker also has
 an outer wall limit of twice the per-side limit plus 60 seconds. Polling can
 overshoot the RSS cap; it is a measurement bound, not a reservation. These bounds
 differ from historical local sweeps and are recorded with each result.
+
+### CI scheduling measurements
+
+The [2026-11-06 baseline](https://github.com/284km/mere-ruby/actions/runs/42165539038)
+ran 758 files in 64 macOS jobs. Those jobs consumed 221.0 runner-minutes:
+179.9 minutes in the measurement steps and 41.1 minutes outside them. The median
+per-job setup/teardown cost was 38 seconds. The median delay from job creation
+to start was 139.4 minutes; this includes the workflow's concurrency limit and
+runner availability, so it is not a direct measurement of provider capacity.
+
+Repartitioning those observed per-file times into eight jobs gives approximately
+22.2 minutes of supervised execution per job. Keeping measurement work constant
+and using the observed median overhead projects 185.0 runner-minutes, about 16%
+below the baseline. This is a replay estimate, not a measured wall-clock speedup;
+other workflows and available macOS capacity still affect elapsed time. Four
+shards save little additional setup time and leave fewer scheduling units when
+durations change; sixteen double the setup count for little estimated balance
+benefit. Eight keeps two waves at the existing four-job concurrency limit.
+
+The snapshot includes six mere-ruby WALL_LIMIT files (fiber/test_io.rb,
+openssl/test_ossl.rb, resolv/test_dns.rb, ruby/test_io_timeout.rb,
+socket/test_tcp.rb and zlib/test_zlib.rb), totaling about 60 minutes. Their
+600-second limits and incomplete-result reporting are retained. Runtime fixes
+are needed to remove that work without changing the measurement budget.
+Reference and compiler builds take only a few minutes; this change targets the
+larger repeated-job overhead without introducing native-runtime cache validity
+or ABI dependencies.
+
+Successful collection writes `timings.json` into `unittest-report`, using the
+observed per-file supervisor durations and exact source/compiler/Ruby refs.
+To refresh the checked-in estimates, inspect a completed full report, copy that
+file to `unittest/timings.json`, and add its `run_url`. Keep the originating refs:
+these identify the observation, not the sources of the next measurement.
+Missing/infrastructure-failed collections do not produce timing estimates.
+Replan against the full inventory after updating the snapshot; weights may age
+as mere-ruby improves, but they never reduce coverage.
 
 The CI supervisor starts a new session per file and tracks PID/start-time
 identities, parent ancestry, process groups and a per-file inherited marker.
@@ -285,11 +333,11 @@ Artifacts are retained for seven days:
 
 | Artifact | Contents |
 |---|---|
-| `unittest-plan` | Exact candidate list, pinned revisions and shard count |
+| `unittest-plan` | Exact candidate list, pinned revisions, partitions and scheduling estimates |
 | `mere-ruby-macos` | O2 binary, build mode and compiler/source provenance |
 | `ruby-reference-macos` | Installed reference, native test extensions and provenance |
 | `unittest-shard-N` | Per-file results, bounds, peak family RSS and sanitized diagnostic logs |
-| `unittest-report` | `SUMMARY.md`, `summary.json` and every planned file in `files.tsv` |
+| `unittest-report` | `SUMMARY.md`, `summary.json`, every planned file in `files.tsv`, and successful-run `timings.json` |
 
 Diagnostic logs pass through the repository's existing masking rules before
 upload. Each mask receives at most the first 2 MiB of raw input, bounding even

@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -45,6 +46,37 @@ def load(path):
     return json.loads(Path(path).read_text())
 
 
+def partitions(manifest):
+    """Validate exact coverage before either executing or collecting a plan."""
+    files, count = manifest['files'], manifest['shards']
+    if (type(count) is not int or not 1 <= count <= len(files)
+            or len(files) != len(set(files))):
+        raise ValueError('invalid partition inventory')
+    if manifest['schema'] == 1:
+        return [files[index::count] for index in range(count)]
+    if manifest['schema'] != 2:
+        raise ValueError('unsupported plan schema')
+    groups = manifest['partitions']
+    if (not isinstance(groups, list) or len(groups) != count
+            or any(not isinstance(group, list) or not group for group in groups)):
+        raise ValueError('invalid partitions')
+    assigned = [file for group in groups for file in group]
+    if len(assigned) != len(files) or set(assigned) != set(files):
+        raise ValueError('partitions must cover every file exactly once')
+    return groups
+
+
+def balance(files, count, seconds):
+    # Longest processing time first; stable ties make plans reproducible.
+    # Unknown files still run, with a conservative one-minute estimate.
+    groups, totals = [[] for _ in range(count)], [0.0] * count
+    for file in sorted(files, key=lambda file: (-seconds.get(file, 60), file)):
+        index = min(range(count), key=lambda i: (totals[i], len(groups[i]), i))
+        groups[index].append(file)
+        totals[index] += seconds.get(file, 60)
+    return groups, [round(total, 3) for total in totals]
+
+
 def plan(args):
     files = subprocess.check_output(
         ["sh", str(ROOT / "unittest/list.sh"), str(args.ruby_src), "--all"], text=True).splitlines()
@@ -55,6 +87,24 @@ def plan(args):
     manifest = dict(schema=1, source_ref=args.source_ref, mere_ref=args.mere_ref,
                     ruby_ref=args.ruby_ref, ruby_version=args.ruby_version,
                     shards=min(args.shards, len(files)), files=files)
+    timing_path = getattr(args, 'timings', None)
+    if timing_path:
+        timing = load(timing_path)
+        seconds = timing['seconds']
+        if (timing['schema'] != 1 or not isinstance(seconds, dict)
+                or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                       for value in seconds.values())):
+            raise ValueError('invalid timing estimates')
+        # A changed upstream inventory uses equal weights until remeasured.
+        # Estimates only schedule work; they never select or skip test files.
+        if timing['ruby_ref'] != args.ruby_ref:
+            seconds = {}
+        groups, totals = balance(files, manifest['shards'], seconds)
+        manifest.update(schema=2, partitions=groups,
+                        scheduling=dict(policy='longest-first-v1', timing_sha256=digest(timing_path),
+                                        matched_files=sum(file in seconds for file in files),
+                                        unknown_seconds=60, estimated_seconds=totals))
+    partitions(manifest)
     save(args.output / "manifest.json", manifest)
     (args.output / "files.txt").write_text("\n".join(files) + "\n")
     matrix = {"shard": list(range(manifest["shards"]))}
@@ -265,7 +315,7 @@ def run_shard(args):
     data = test_data.verify(args.ruby_src) if reference.get('test_data') else None
     if data != reference.get('test_data'):
         raise ValueError('reference test data differs from build provenance')
-    files = manifest["files"][args.shard::manifest["shards"]]
+    files = partitions(manifest)[args.shard]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     result = dict(schema=1, shard=args.shard, source_ref=manifest["source_ref"],
@@ -387,6 +437,7 @@ def run_shard(args):
 
 def merge(args):
     manifest = load(args.plan)
+    groups = partitions(manifest)
     expected = manifest["files"]
     rows = {file: dict(file=file, ref_state="MISSING_SHARD", mere_state="MISSING_SHARD") for file in expected}
     seen = set()
@@ -406,7 +457,7 @@ def merge(args):
                 raise ValueError("duplicate or invalid shard")
             if any(result[key] != manifest[key] for key in ("source_ref", "mere_ref", "ruby_ref")):
                 raise ValueError("shard provenance differs")
-            wanted = expected[shard::manifest["shards"]]
+            wanted = groups[shard]
             if [row["file"] for row in result["rows"]] != wanted:
                 raise ValueError("shard file list differs")
             for row in result["rows"]:
@@ -485,6 +536,15 @@ def merge(args):
                    test_inputs=[json.loads(value) for value in sorted(test_inputs)],
                    infrastructure_errors=errors, measurement_collected=not failed)
     save(args.output / "summary.json", summary)
+    if not failed:
+        # Only observed execution times become future scheduling hints. No
+        # results, verdicts or cached binaries are reused by the measurement.
+        seconds = {file: row['execution']['seconds'] for file, row in rows.items()
+                   if type(row.get('execution', {}).get('seconds')) in (int, float)
+                   and math.isfinite(row['execution']['seconds']) and row['execution']['seconds'] > 0}
+        save(args.output / 'timings.json', dict(schema=1, source_ref=manifest['source_ref'],
+                                              mere_ref=manifest['mere_ref'], ruby_ref=manifest['ruby_ref'],
+                                              seconds=seconds))
     args.output.mkdir(parents=True, exist_ok=True)
     fields = ["file", *COUNTS, *COVERAGE, 'ref_zero_condition', 'ref_zero_needed']
     with (args.output / "files.tsv").open("w", newline="") as file:
@@ -517,6 +577,7 @@ def main():
     command.add_argument("--ruby-src", type=Path, required=True)
     command.add_argument("--output", type=Path, required=True)
     command.add_argument("--shards", type=int, default=64)
+    command.add_argument("--timings", type=Path, help="optional per-file execution estimates; never filters tests")
     for key in ("source-ref", "mere-ref", "ruby-ref", "ruby-version"):
         command.add_argument("--" + key, required=True)
     command.set_defaults(func=plan)
