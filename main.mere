@@ -863,15 +863,49 @@ and gc_mark_vals = fn live -> fn (xs: Val list) ->
   | Cons (v, rest) -> let _ = gc_mark_val live v in gc_mark_vals live rest;
 // an id a half-evaluated statement built (fb_stack_wm): kind 0 object, 1 array,
 // 2 string, 3 hash. An id no store holds any more is skipped, not dereferenced.
-// (an object id is marked only if it is an object still: a stopped stack's
+// An object id is marked only if it is an object still: a stopped stack's
 // interval runs over every id made since its statement began, and with two
 // thousand stopped fibers each collection put millions of dead ids into the
-// live set -- the arrays, strings and hashes were already asked; note 275)
+// live set; arrays and hashes likewise check their stores (note 275).
+// String slots keep their ids after collection, so range checks alone do not
+// establish that a string is still present.
+// The previous sweep's survivors are sorted by handle: it keeps the old
+// survivors in order, then appends the newly allocated slots in order.
+let gc_str_surv_lower = fn (slot: int) ->
+  let rec search = fn (lo: int) -> fn (hi: int) ->
+    if lo >= hi then lo
+    else (let mid = lo + (hi - lo) / 2 in
+          if vec_get gc_str_surv mid < slot then search (mid + 1) hi
+          else search lo mid) in
+  search 0 (vec_get gc_knob 10);
+let gc_str_present = fn (id: int) ->
+  let slot = id - handle_base in
+  if slot < 0 || slot >= str_count () then false
+  else if slot >= vec_get gc_knob 8 then true
+  else (let j = gc_str_surv_lower slot in
+        j < vec_get gc_knob 10 && vec_get gc_str_surv j == slot);
 let gc_mark_wm = fn live -> fn (k: int) -> fn (n: int) ->
   if k == 0 then (if map_has obj_cls n then gc_mark_val live (VObj n) else ())
   else if k == 1 then (if map_has arr_store n then gc_mark_val live (VArr n) else ())
-  else if k == 2 then (if n >= handle_base && n - handle_base < str_count () then gc_mark_val live (VStr n) else ())
+  else if k == 2 then (if gc_str_present n then gc_mark_val live (VStr n) else ())
   else (if map_has hash_store n then gc_mark_val live (VHsh n) else ());
+// A conservative interval may include strings an earlier sweep already
+// reclaimed. Visit only its old survivors and its slots allocated since that
+// sweep. Empty live strings are survivors too; their contents are not a test
+// for liveness. Marking never mutates this survivor list (the sweep does).
+let gc_mark_str_interval = fn live -> fn (lo: int) -> fn (up: int) ->
+  let first = (if lo < handle_base then 0 else lo - handle_base) in
+  let stop = (if up - handle_base > str_count () then str_count () else up - handle_base) in
+  let rec old = fn (j: int) ->
+    if j >= vec_get gc_knob 10 then ()
+    else (let slot = vec_get gc_str_surv j in
+          if slot >= stop then ()
+          else (let _ = gc_mark_val live (VStr (handle_base + slot)) in old (j + 1))) in
+  let rec fresh = fn (slot: int) ->
+    if slot >= stop then ()
+    else (let _ = gc_mark_val live (VStr (handle_base + slot)) in fresh (slot + 1)) in
+  let _ = old (gc_str_surv_lower first) in
+  fresh (if first > vec_get gc_knob 8 then first else vec_get gc_knob 8);
 
 // A number some stack can still reach (fb_scan_stack), which may be a handle
 // of any kind: it is marked as each kind a store still holds. Conservative --
@@ -890,7 +924,9 @@ let gc_mark_wm_merged = fn live -> fn (ivs: Vec['v, (int * int * int)]) ->
      else (let (k9, lo9, up9) = (vec_get ivs i : (int * int * int)) in
            tolist (i - 1) k (if k9 == k then Cons ((lo9, up9), acc) else acc))) in
   let rec each = fn (k: int) -> fn (n: int) -> fn (up: int) ->
-    (if n >= up then () else (let _ = gc_mark_wm live k n in each k (n + 1) up)) in
+    (if n >= up then ()
+     else if k == 2 then gc_mark_str_interval live n up
+     else (let _ = gc_mark_wm live k n in each k (n + 1) up)) in
   let rec go = fn (k: int) -> fn (ys: (int * int) list) -> fn (cur: int) ->
     (match ys with
      | Nil -> ()

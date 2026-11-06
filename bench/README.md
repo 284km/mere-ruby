@@ -369,3 +369,24 @@ setup that builds `text` and `log` is in it) are steadier:
 
 The VM was measured again for rebuilding and left: scan_words is 2.0x ruby's
 and the VM about 30% of it.
+
+## `recycled_string_pages.rb`
+
+```sh
+ruby bench/recycled_string_pages.rb
+MERE_RUBY_GC_LOG=1 ./mere-ruby bench/recycled_string_pages.rb
+```
+
+The first argument selects temporary allocations (default 100,000); the second
+selects explicit collections (default 20). The two calls share an expression,
+so the caller's conservative allocation interval includes handles that the
+first call has already discarded and collected. The result remains
+`[nil, :collected]`; elapsed collection time goes to stderr. With GC logging,
+compare the `gc: END live=` counts as well as time. The collector uses the previous sweep's survivor list to skip
+collected handles, including holes inside pages that still hold live strings.
+
+Measured on Apple silicon at O2 with Mere `01ed9680` (2026-11-07), using
+100,000 temporary allocations and 20 collections, the median of three runs
+changed from 0.352 seconds to 0.021 seconds. Peak mark-table entries in these
+runs changed from 301,767 to 1,772. Both builds print the same result. These
+numbers measure this collector workload, not the duration of the CI workflow.
