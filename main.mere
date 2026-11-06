@@ -6394,6 +6394,27 @@ and assign_targets = fn env -> fn world -> fn (targets: str list) -> fn (values:
 // through Mere's `fail` -- was written out at the `raise` arm in eval_e and
 // nowhere else, so anything else that wanted to raise a real object (rather
 // than the VExc pair raise_exc makes) had to copy all four lines.
+and stdin_wait_name = fn (name: str) ->
+  str_eq name "read" || str_eq name "readpartial" || str_eq name "getc" || str_eq name "readchar"
+  || str_eq name "getbyte" || str_eq name "readbyte" || str_eq name "gets" || str_eq name "readline"
+  || str_eq name "each_line" || str_eq name "readlines"
+and stdin_wait_ready = fn env -> fn world -> fn (recv: Val) ->
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let ready = (fn (u: unit) ->
+                 try_or (fn (u2: unit) ->
+                   (match io_poll_bits (Cons (VInt 0, Nil)) (Cons (VInt 1, Nil)) 0 with
+                    | Cons (VInt b9, _) -> b9 != 0
+                    | _ -> true)) true) in
+  let rec go = fn (u: unit) ->
+    if ready () then ()
+    else
+      (let _ = map_set sch_io (sch_me ()) 1 in
+       let _ = sch_block world 1 0 (sch_now () + 1000000) in
+       let _ = (if map_has sch_io (sch_me ()) then map_delete sch_io (sch_me ()) else ()) in
+       if truthy (invoke_val_c env world nb9 recv "closed?" Nil false)
+       then (let _ = raise_exc world "IOError" "stream closed in another thread" in ())
+       else go ()) in
+  go ()
 and stdin_read_name = fn (name: str) ->
   (str_len name == 4 && (str_eq name "read" || str_eq name "gets" || str_eq name "getc" || str_eq name "eof?"))
   || (str_len name == 3 && str_eq name "eof") || (str_len name == 7 && str_eq name "getbyte")
@@ -6433,6 +6454,13 @@ and stdin_gets_sep = fn (sep: str) -> fn (para: bool) ->
      let _ = map_set globals "." (VInt ((match (if map_has globals "." then map_get globals "." else VInt 0) with VInt n -> n | _ -> 0) + 1)) in
      line9)
 and stdin_io_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  // (with other threads alive, a read that has to go to the descriptor waits
+  //  for it to be readable first, a millisecond at a time, as the descriptor
+  //  layer's reads do: read(2) on an empty pipe stopped every thread -- and
+  //  a $stdin another thread closes in the meantime is that IOError)
+  let _ = (if fb_can_suspend && (map_len sch_live > 1 || sch_me () != sch_main ())
+              && str_len (stdin_buf ()) <= stdin_cur () && stdin_wait_name name
+           then stdin_wait_ready env world recv else ()) in
   // as much of the input as this call needs, and no more: a whole read wants
   // all of it, a length that many bytes, readpartial whatever one read gives,
   // a character or a byte the next one (see stdin_more)
@@ -15158,7 +15186,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        //   isdst at that instant (see tz_dst_in); UTC and fixed offsets never
        //   are in daylight saving.
        else if (str_len name == 4 && str_eq name "dst?") || (str_len name == 5 && str_eq name "isdst") then
-         (if time_is_utc world recv || time_is_fixed world recv then VBool false
+         (let (_, _, _, iv9) = world in
+          let kz9 = str_of_int oid ++ "@__tzo" in
+          let zo9 = (if map_has iv9 kz9 then map_get iv9 kz9 else VNil) in
+          let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+          // a zone OBJECT that answers dst? says (zone_set_dst asks it with
+          // the time in UTC); one that does not is never in daylight saving
+          if (match zo9 with VNil -> false | VStr _ -> false | VInt _ -> false | VRat (_, _) -> false | _ -> true) then
+            (if truthy (invoke_val_c env world nb9 zo9 "respond_to?" (Cons (VSym "dst?", Nil)) false)
+             then VBool (truthy (invoke_val_c env world nb9 zo9 "dst?" (Cons (invoke_val_c env world nb9 recv "getutc" Nil false, Nil)) false))
+             else VBool false)
+          else if time_is_utc world recv || time_is_fixed world recv then VBool false
           else VBool (tz_dst_in (time_tz_of oid) (time_tz_ep world recv (match prim_time_epoch world recv with VInt n -> n | _ -> 0))))
        // one question about #wday, asked seven ways.
        else if (str_len name == 7 && str_eq name "monday?") || (str_len name == 8 && str_eq name "tuesday?")
@@ -15328,7 +15366,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let zn9 = invoke_val_c env world blk recv "zone" Nil false in
           arr_new (Cons (VInt ss, Cons (VInt mi, Cons (VInt hh, Cons (VInt dd, Cons (VInt mo,
             Cons (time_year_v world recv yy, Cons (VInt (imod (idiv_floor ep 86400 + 4) 7), Cons (VInt (yday_of yy mo dd),
-            Cons (VBool false, Cons (zn9, Nil)))))))))))) 
+            Cons (invoke_val_c env world blk recv "isdst" Nil false, Cons (zn9, Nil)))))))))))) 
        // round / ceil / floor to n decimal places (0 = whole seconds).
        else if (str_len name == 5 && str_eq name "round") || (str_len name == 4 && str_eq name "ceil")
                || (str_len name == 5 && str_eq name "floor") then
@@ -16625,7 +16663,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 | Cons (VObj src9, Nil) when map_has iv9 (str_of_int src9 ++ "@__t") -> time_copy_zone world (VObj src9) (VObj id)
                 | _ -> ()) in
        // `in:` fixes the zone the new Time shows (Time.at(0, in: "+01:00")).
-       let _ = (match time_in_kw args with VNil -> () | z9 -> time_set_zone world id (Cons (z9, Nil))) in
+       // (a zone NAME goes through the class's .find_timezone, as Time.new's)
+       let _ = (match time_in_kw args with VNil -> () | z9 -> time_set_zone world id (time_find_tz world c (Cons (z9, Nil)))) in
        VObj id)
     else if (str_len name == 8 && str_eq name "allocate") && (str_eq c "Array" || str_eq c "Hash" || str_eq c "String") then
       (match args with
@@ -16856,6 +16895,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          //  `$VERBOSE = true` around the call is what asks for them)
          let _ = warn_flush world in
          let _ = map_set load_ctx "parsing" (mkstr "") in
+         let _ = tp_script_compiled world (sget code) ef el in
          // string-form *_eval sets the lexical scope (cref) to the receiver.
          // ⚠ ...and puts it back when the code RAISES too: a `module A` that
          //   was refused inside `m.module_eval "..."` left the scope at m, and
@@ -22047,9 +22087,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               (match mrecv with VClass c9 -> mod_name_val c9 | _ -> VNil)
             // Kernel#inspect bound to a String, Array or Hash (a subclass's,
             // typically) is Kernel's: the class, an address and the ivars --
-            // not the value's own inspect
+            // not the value's own inspect. So it is for a Struct (whose own
+            // is "#<struct ...>") and an Integer, Float, Symbol, nil or bool
             else if str_eq mown "Kernel" && str_eq mnm "inspect" && (match args with Nil -> true | _ -> false)
-                    && (match mrecv with VStr _ -> true | VArr _ -> true | VHsh _ -> true | _ -> false) then
+                    && (match mrecv with VStr _ -> true | VArr _ -> true | VHsh _ -> true | VObj _ -> true
+                        | VInt _ -> true | VBig _ -> true | VFlt _ -> true | VSym _ -> true | VNil -> true | VBool _ -> true
+                        | _ -> false) then
               (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
                let ivs9 = (match invoke_val_c env world nb9 mrecv "instance_variables" Nil false with
                            | VArr a9 -> deref a9 | _ -> Nil) in
@@ -23009,6 +23052,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                    || str_eq name "printf" || str_eq name "putc" || str_eq name "syswrite")
           && std_fd_closed fd then
          raise_exc world "Errno::EBADF" ("Bad file descriptor @ io_writev - " ++ (if fd == 2 then "<STDERR>" else "<STDOUT>"))
+       // ($stdin closed: a read is "closed stream", as ruby's)
+       else if fd == 0 && stdin_read_name name && map_has ivars (str_of_int id ++ "@__std_closed") then
+         raise_exc world "IOError" "closed stream"
        else if fd == 0 && stdin_read_name name then stdin_io_call env world blk recv name args
        // ...and the other two were never readable
        else if (fd == 1 || fd == 2) && stdin_read_name name then raise_exc world "IOError" "not opened for reading"
@@ -23164,8 +23210,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // deciding what to open, and a standard stream answers with its name.
        else if (str_len name == 4 && str_eq name "path") || (str_len name == 7 && str_eq name "to_path") then
          mkstr (if fd == 0 then "<STDIN>" else if fd == 2 then "<STDERR>" else "<STDOUT>")
-       else if (str_len name == 5 && str_eq name "close") then VNil
-       else if (str_len name == 7 && str_eq name "closed?") then VBool false
+       // $stdin can be closed (and a reader waiting on it in another thread
+       // is told: stdin_wait_ready); STDOUT and STDERR stay open here
+       else if (str_len name == 5 && str_eq name "close") then
+         (let _ = (if fd == 0 then map_set ivars (str_of_int id ++ "@__std_closed") (VBool true) else ()) in VNil)
+       else if (str_len name == 7 && str_eq name "closed?") then
+         VBool (fd == 0 && map_has ivars (str_of_int id ++ "@__std_closed"))
        // the universal names (nil?, equal?, itself ...), which this chain refused
        else if is_prim_method name then dispatch_prim env world blk recv name args false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of IO"))
@@ -23283,7 +23333,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             let _ = map_iter env_ovr (fn (k2: str) -> fn (v: Val) ->
               (match v with
                | VStr h -> if str_eq (sget h) target && (if map_has hit "k" then false else true)
-                           then map_set hit "k" (mkstr k2) else ()
+                           then map_set hit "k" (env_fstr k2) else ()
                | _ -> ())) in
             (if map_has hit "k" then map_get hit "k"
              else env_key_scan (env_all_pairs ()) target)
@@ -27103,7 +27153,7 @@ and proc_kill_one = fn env -> fn world -> fn (sig9: Val) -> fn (pid9: int) ->
              let k9 = (if m9 >= 0 then sch_wait_kind m9 else 0) in
              // (a sleep is woken for it, and so is a join, which looks again
              //  at what it waits for: the trap runs in the middle of either)
-             let _ = (if k9 == 1 || k9 == 2 then (let _ = map_set sig_queue "w" "1" in sch_unpark m9)
+             let _ = (if k9 == 1 || k9 == 2 || sch_trap_wakes k9 then (let _ = map_set sig_queue "w" "1" in sch_unpark m9)
                       else if k9 == 8 then sch_unpark m9 else ()) in
              VInt 1)
           // SEGV, BUS and ILL to ourselves are ruby's [BUG]: the crash report
@@ -28723,8 +28773,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          let h = mkhash (env_hash_list ()) in
          let r = invoke_with_block env world blk h name args newblk in
          let _ = (if mutates
-                  then (let _ = env_del_keys (env_hl_keys (env_hash_list ())) in
-                        (match h with VHsh hid -> env_set_pairs env world (hderef hid) | _ -> ()))
+                  then (let _ = env_del_keys (env_unxcode (env_hl_keys (env_hash_list ()))) in
+                        (match h with VHsh hid -> env_set_pairs env world (env_unxcode (hderef hid)) | _ -> ()))
                   else ()) in
          // reject!/select!/filter! answer nil when nothing changed; the rest of
          // the self-returning names answer ENV.
@@ -31027,6 +31077,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
        let _ = map_clear vw_outer in
        let _ = warn_flush world in
        let _ = map_set load_ctx "parsing" (mkstr "") in
+       let _ = tp_script_compiled world code ef el in
        // pfile is a PARSE-time slot (see parse_time_file), so it comes back
        // down as soon as the parse is over -- the body runs without it.
        let _ = eval_pfile_pop savedpf in
@@ -47532,6 +47583,10 @@ and sch_block = fn world -> fn (kind: int) -> fn (obj: int) -> fn (dl: int) ->
   //  raised before the wait, not after a wait nobody would end)
   let _ = sch_deliver world (sch_me ()) in
   let out = sch_wait world kind obj dl in
+  // (woken on the main thread for a signal: its trap runs here, and the
+  //  caller, which looks again at what it waits for, waits on or not)
+  let _ = (if sch_trap_wakes kind && map_has sig_queue "w" && sch_me () == sch_main () then
+             (let _ = map_delete sig_queue "w" in sig_poll_all gc_cenv0 world) else ()) in
   let _ = sch_deliver world (sch_me ()) in
   out
 // ...the wait alone, for a caller that must put something back (a mutex)
@@ -47838,7 +47893,12 @@ and thread_next = fn world -> fn (me: int) ->
      let _ = map_set iv (str_of_int m ++ "@__tpend") (VExc ("fatal", sch_deadlock_msg world me)) in
      let _ = sch_unpark m in
      thread_next world me)
-  else (let _ = fb_os_sleep 1000 in thread_next world me)
+  // (someone sleeps for ever: as sch_dispatch, looking for a marked signal
+  //  every 20 ms when a trap waits for one -- this slept a second at a time
+  //  and never looked, so `loop { sleep }` outlived the TERM that ends it)
+  else (let _ = fb_os_sleep (sch_sig_slice 1000) in
+        let _ = (if map_len sig_armed > 0 then (let _ = sch_sig_check () in ()) else ()) in
+        thread_next world me)
 // A thread that dies of an exception says so on stderr, unless its
 // report_on_exception is off -- while it is still alive, so the line names it
 // "run" as ruby's does. (ruby follows the message with error_highlight's
@@ -49893,7 +49953,7 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
      match pos9 with
      | Nil ->
        (let t9 = make_time_at_ns world 0 (int_of_float (time () * 1000000000.0)) in
-        let _ = (match t9 with VObj o9 -> (let _ = map_set ocls o9 cls in time_set_zone world o9 (Cons (time_in_kw args, Nil))) | _ -> ()) in
+        let _ = (match t9 with VObj o9 -> (let _ = map_set ocls o9 cls in time_set_zone world o9 (time_find_tz world cls (Cons (time_in_kw args, Nil)))) | _ -> ()) in
         t9)
      // one String is ruby 3.3's strict form, Time.new("2020-12-24 15:56:17
      // +09:00"); the prelude parses it and comes back here with the fields.
@@ -55747,7 +55807,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "unexpected void value expression"
        // (a parse-only eval -- the main script's syntax report, cli_syntax_framed -- runs nothing)
        else if map_has cli_opt "evpo" then VNil
-       else eval_run_at eenv world blk prog2 efile9 eline9
+       else (let _ = tp_script_compiled world code efile9 eline9 in eval_run_at eenv world blk prog2 efile9 eline9)
      | _ ->
        if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (eval_flow_msg code efile9 eline9 (invalid_flow_word_in_defs prog2))
        else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
@@ -55764,7 +55824,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "unexpected void value expression"
        // (a parse-only eval -- the main script's syntax report, cli_syntax_framed -- runs nothing)
        else if map_has cli_opt "evpo" then VNil
-       else eval_run_at eenv world blk prog2 efile9 eline9)
+       else (let _ = tp_script_compiled world code efile9 eline9 in eval_run_at eenv world blk prog2 efile9 eline9))
     ), "")) (fn (m: str) -> (VNil, (if str_eq m "" then " " else m))) in
     let _ = (if fresh9 then blk_env_put eenv else ()) in
     if str_eq fail9 "" then res9 else fail fail9
@@ -55896,6 +55956,11 @@ and syn_tok_word = fn (t: Tok) ->
   | TRegex (_, _) -> "regular expression"
   | TP p -> "'" ++ p ++ "'"
   | _ -> "token"
+// TracePoint's :script_compiled, for a String eval about to run: the source
+// is the event's eval_script, and its file the instruction sequence's path
+and tp_script_compiled = fn world -> fn (code: str) -> fn (efile: str) -> fn (eline: int) ->
+  if map_has hook_flags "tp" then fire_tp_vlc0 world "script_compiled" "" "" (mkstr code) VNil eline efile ""
+  else ()
 and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (efile: str) -> fn (eline: int) ->
   // (run in a class or module body, outside any method, the eval'd code's
   //  own `return` has nothing to return from: ruby's LocalJumpError)

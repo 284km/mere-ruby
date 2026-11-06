@@ -1391,3 +1391,75 @@ same count as before (alias, struct and gc run on both binaries).
 - Left: the VM. scan_words is 2.0x ruby's and the VM about 30% of it, so
   rebuilding it would gain at most 1.4x there; match_lines and anchored are the
   interpreter's loop and call.
+
+## 2026-11-06 (3): what CRuby's tests still found -- a trap in the middle of a wait, a zone object, ENV under default_internal
+
+The candidates left from the record of 2026-10-31 (sweep 485) were run one by
+one against ruby 4.0.9. Most already passed: the rounds since had fixed them
+(the m17n regexps, sprintf with a named encoding, Rational's subclass and
+power overflow, the regexp match cache, require's FIFO, `\K`). What still
+differed:
+
+- **A trap that runs while the main thread waits.** A signal delivered while
+  the main thread was in `Queue#pop`, a Mutex or the autoload of another
+  thread was left for later ("none of them looks again at what woke it"), so
+  `trap(:INT) { q.push 1 }` with the main thread in `q.pop` fell into the
+  deadlock fatal. Those waits do look again: the main thread is woken for the
+  signal, runs the trap in the middle of the wait (sch_block) and waits on, or
+  stops when the trap gave it what it waited for. Thread.stop and a condition
+  wait are left as they were. And when the last other thread ends while the
+  main one sleeps for ever, the scheduler now looks for a marked signal every
+  20 ms there too (`thread_next` slept a second at a time and never looked):
+  `loop { sleep }` outlived the TERM that ends it.
+- **Two threads waiting on one child.** Process.wait computed the children it
+  waits for once; the one another thread reaped stayed in the list and the
+  waiter polled for ever. It asks again after each wait, and with none left it
+  is ECHILD, as waitpid(2) answers.
+- **`$stdin` read from a thread** was read(2) on descriptor 0 for every thread:
+  it now waits for the descriptor to be readable first, a millisecond at a
+  time, when other threads are alive. `$stdin.close` closes it (`closed?` was
+  always false), and a reader waiting on it in another thread gets "stream
+  closed in another thread".
+- **A Time with a zone object**: `dst?` asks the zone's `dst?` (with the time in
+  UTC, as zone_set_dst does), `to_a`'s isdst is `isdst` (it was always false,
+  local times in daylight saving too), and a zone NAME given to
+  `Time.now(in:)` / `Time.at(in:)` goes through the class's `find_timezone` as
+  Time.new's does.
+- **ENV under a default_internal** is transcoded to it, not relabelled: the
+  bytes were UTF-8 tagged Windows-31J. A name or value that does not go across
+  stays UTF-8, as rb_external_str_new_with_enc leaves it. The methods that
+  filter ENV with a block run on a copy and write it back; the copy's
+  transcoded names are written back as the bytes they came from (they made a
+  second variable beside each). `ENV.key` answers a frozen string like the
+  other reads.
+- **Kernel#inspect bound to a Struct or an immediate** (`bind_call`) is
+  Kernel's `#<S:0x... @a=1>`, not the value's own inspect.
+- **TracePoint :script_compiled** for a String eval, instance_eval and
+  class_eval, with `eval_script` and `instruction_sequence`.
+- **A call with more than 131,000 literal arguments** raises SystemStackError
+  when it is made (ruby pushes them on a VM stack of 131,072 slots); it was an
+  ArgumentError from the callee.
+- **ObjectSpace's finalizers at exit** were taken one `Hash#shift` at a time,
+  and each shift rewrote the rest of the table (quadratic): the table is now
+  taken whole and walked.
+
+corpus 492 reads each of them against ruby (the old binary stops at the
+deadlock fatal of the first).
+
+The round: 10 gates, corpus 494/494 (496/496 after the rebase onto the
+PRs merged meanwhile) with the hash index on and off, GC_STRESS and stderr
+differing from the previous binary on 492 only (under GC_STRESS too it is
+ruby's), stdlib the same, 600 specs the same (eval_script now MATCH; thread's
+list_spec counts a loop and differs on both). Unit tests against the previous
+binary or the record, none down: exception 95, object 65, env 92, time_tz
+155/155, settracefunc 97 (95), signal 22, thread 96, thread_queue 41,
+thread_cv 14, process 155 (153), io 243 (242 on the previous binary),
+io_m17n 159, objectspace 36, eval 39, m17n 126, string 439, struct 100.
+
+- Left:
+  - A FIFO opened from one thread while another is its other end: refused
+    (every thread is one OS thread, and open(2) waits).
+  - A million `define_finalizer` (test_finalizer) still takes 99 s and 6.6 GB:
+    a kept closure costs about 7 KB, most of it the 4 KB arena of its frame.
+  - `Hash#shift` rewrites the rest of the hash, so emptying one with it is
+    quadratic (20,000 entries: 7.4 s, ruby 0.06 s).
