@@ -1665,3 +1665,68 @@ compare Prism against Ripper, and test/ripper (457) is Ripper itself.
   PR #29 moved MERE_REF to 991f299b while mere.toml still says >= 0.1.711,
   and a 0.1.711 build failed to link the UDP externs. Build with the
   pinned ref (mere-wt-712).
+
+## 2026-11-07 (4): where a command may stand -- the parser's 127, and what parse.y refuses that this one took
+
+Note 511's parser gaps, measured against test/prism's fixtures with
+`RubyVM::InstructionSequence.compile`: 39 fixtures (valid programs) this
+parser refused, and 84 of test/prism/errors (invalid programs) it accepted.
+After the round: 15 refused (4 are ruby 3.3-only syntax ruby 4.0 refuses
+too, so 11), 23 accepted (3 are version-gated, so 20).
+
+- **Valid programs it refused** (24 shapes, each a line of corpus/501 or
+  of the fixtures): an endless range before `&&`/`==`/`?`/`=>`
+  (`(1..) && 2`), an operator method after `::` (`A::+`, `a::[]`),
+  `Foo::Bar &baz`, `C do ... end`, a const or splat in a pattern after
+  `::`, `**` in a hash pattern, pinned `_1`, a bare array stopping at
+  `and`/`or`, block-locals after `;` in def and lambda params, `->a:`
+  across a newline, `for *v in`, `not` across a newline, `defined?` with
+  its operand on the next line, `def (a)::b`, anonymous `*` as an index,
+  bare `**` in a hash literal, `*`/`**` alone as a command's argument,
+  `case 1 in 2; when`, `do` before `:` is a label, `foo if: 1`, `class`
+  and `module` as arguments, `z = x y rescue c d`, trailing `=> k: v`
+  pairs after a flow keyword's value, `%w` and friends closed by a
+  vertical tab, `elsif x in pat`, `rescue => A[]`, and `c ? foo do |n| n
+  end : 0` -- which needed the lexer: a `:` a space away from `end`,
+  `self`, `nil`, `true` or `false` is never that keyword's label, so it
+  comes out as " :" and the label arms do not see it.
+- **Invalid programs it accepted** -- the big one is where a paren-less
+  call (a COMMAND) may stand. parse.y lets one be the statement, the
+  whole value of an assignment, the sole argument of a call, an operand
+  of `and`/`or`/`not`/`!`; everywhere else it is "unexpected local
+  variable or method". The parser now marks the end of a paren-less
+  argument list ("lastcmd", set by parse_puts_args, not by `raise(X)`
+  through the same path), every place that reads an operand clears the
+  mark before and checks it after (binary operands, elements, hash
+  values, one argument among several, defaults, `when` and `rescue`
+  lists, ranges, `defined?`, ternary branches, splat operands), and a
+  statement clears it on the way in and out, with "stmtcmd" carrying it
+  to the `in` / `and` modifiers that are parsed after the statement
+  returns. The first version marked `raise(X)` too and refused the
+  prelude at boot: the flag must say "bare and non-empty".
+- **The small ones**, each a line: parameter order (required, optional,
+  `*`, post-required, keywords, `**`, `&`, `...` last; an optional after
+  the post-required ones), trailing commas in def and lambda parameters
+  and after `|&b,|`, `*` after keyword arguments, an argument after a
+  block argument, a `,` at the start of a line, `_1` as a target, `foo!
+  += 1`, `case` with no clause, `for` with no index or no `do`, `class A
+  < B end`, `if 0 0`, `::foo`, `A::$b`, `alias $a b`, `foo(alias x y)`,
+  `defined?()` with the paren glued on, `1.. || 2` (`||` after `..` is
+  two `|`s to ruby), `def @foo`.
+- **Still accepted (20)**: `! ! a b`, `true && not true`, `def a = b
+  rescue c d`, `a, b = c = d f`, `->a=b c{}`, block-param defaults with a
+  unary operator, `in -1**2`, `a=>b, *,`, `p(...1...)`, duplicate names in
+  destructured params, and the five void-value `(return)` shapes.
+  **Still refused (11)**: `def foo = puts "x" do ... end`, `A::__END__`,
+  three heredoc shapes, `foo :a, :b if bar? or baz and qux` in a file
+  (alone it parses), `^({ a: })`, `0..` + `; a..`, `a:b` as a bare
+  argument, and the `%` strings spanning heredoc newlines.
+- **Checked**: corpus 508/508 with the hash index on and off, corpus 501
+  under GC_STRESS=50, the 10 gates, and the parser-side unittest groups
+  at their known counts (syntax 168, parse 102, literal 30, lambda 27,
+  proc 117, method 97, iterator 32, yield 13, assignment 29, class 60,
+  module 192, string 439, array 459, hash 297, eval 39, object 65, super
+  50, defined 39, pattern_matching 30, range 67). test_call and
+  test_keyword show EXTRA because the reference side needs the `-test-`
+  C extensions this tree never built. Build 60 s; 14 builds in the
+  round.
