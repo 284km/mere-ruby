@@ -33,6 +33,13 @@ files = [["prism/prism", "#{here}/lib/prism_ext.rb"]]
 names = ["prism"] + Dir.glob("#{dir}/prism/**/*.rb").sort.map { |f| f.delete_prefix("#{dir}/").delete_suffix(".rb") }
 names.delete("prism/ffi")
 names.each { |n| files << [n, "#{dir}/#{n}.rb"] }
+# Ripper: lib/ripper_ext.rb (Prism::Translation::Ripper as ::Ripper, see
+# there) under every name the reference's ripper files are required by, so
+# that none of those files -- which require "ripper.so", the C core -- is
+# read from the load path. The source guards itself against a second load.
+%w[ripper ripper.so ripper/core ripper/lexer ripper/filter ripper/sexp].each do |n|
+  files << [n, "#{here}/lib/ripper_ext.rb"]
+end
 
 def lit(line)
   line.gsub(/[\\"{}\t\r]/) { |c| { "\\" => "\\\\", '"' => '\\"', "{" => "\\{", "}" => "\\}", "\t" => "\\t", "\r" => "\\r" }[c] }

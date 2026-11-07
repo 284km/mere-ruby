@@ -1598,3 +1598,70 @@ all RED on one `LoadError`; it is now measured.
   itself 4 s once. test/prism takes about 40 minutes under the harness
   (dump_test 103 s, snippets and ripper_test the long ones) and is not in
   files.txt; CI's measurement of all 758 files carries it.
+
+## 2026-11-07 (3): `require "ripper"` -- Prism's Ripper translation as ::Ripper, and what loading it found
+
+Note 511's stage 5. test/prism's lex_test (968) and ripper_test (946)
+compare Prism against Ripper, and test/ripper (457) is Ripper itself.
+
+- **What was built.** `::Ripper` is `Prism::Translation::Ripper`, as on
+  TruffleRuby. lib/ripper_ext.rb -- shipped under "ripper", "ripper.so" and
+  the four names ripper's own files are required by -- adds the Ruby half
+  the reference layers on its C core: `Ripper::Lexer` (tokenize / lex /
+  scan over `Prism.lex_compat`, with the `on_sp` tokens Prism leaves out
+  filled back in from the source, in source order so a heredoc's lines do
+  not hide a gap), `Ripper.tokenize` / `lex` / `slice`, `Ripper::Filter`,
+  `dedent_string`, `end_seen?`, `encoding`, and the C core's default event
+  handlers, which answer their first argument where the translation's
+  answer nil. `Ripper.new(src).parse` through the translation, so a
+  subclass's `on_*` overrides see Prism's walk of the tree.
+- **What it found in the interpreter**, each a witness in corpus/500:
+  - `$~` had no frame of its own in a class body, a module body, a
+    singleton class body or a required file's top level (ruby's each is its
+    own svar scope). prism's SexpBuilder is `grep(/\Aon_/) { $'.to_sym }`
+    in a class body of a required file: the match was made under the
+    builtin call's frame and the block swapped in frame 0's stale value.
+    Each is a frame now (`rx_call_enter` around it) -- keyed "__rxfid", not
+    "__fid", because the first try put "__fid" on a required file's env
+    and `eval "return"` at its top level became "unexpected return".
+  - `super` from an override of `==`, `!=`, `!` or `===` on a plain object
+    ran out of chain (BasicObject's live in the primitive table): Prism's
+    `Lexer::State#==` is `super or to_int == i`.
+  - `class C < Al::Sub` with `Al = M::In`, and `class C < Ripper::Filter`
+    with Ripper bound to the translation: the superclass was looked up by
+    the NAME "Al::Sub", which no constant has (`named_class_of` resolves
+    the head segment to the class it is bound to now). Two more of the
+    same family are noted and not fixed: `class Outer` with `Outer =
+    M::Inner` defines a new class instead of reopening, and `class A::B`
+    where B is an autoload constant defines instead of loading.
+  - `yield` in a class_eval / instance_eval body was "no block given":
+    the body runs as class-body statements with no block of its own. The
+    enclosing method's rides in the env under "__yblk" (test/ripper's
+    DummyParser hooks events with `define_method(name) { yield(name) }`
+    inside `class_eval`).
+  - `[[1]] == [delegator]` was false: an Array element against an object
+    was compared structurally; ruby's rb_ary_equal asks the object when it
+    answers #to_ary (Prism's lex tokens are SimpleDelegators over arrays).
+  - A magic comment's spaces are ISSPACE: a vertical tab too.
+- **The record.** test/prism's lex_test 968/968 and ripper_test 946/946
+  (both compare Prism with Ripper), bom_test 10/10, magic_comment_test
+  990/991 (3 → 965 → 946 → 10 → 990 of the files that required Ripper).
+  test/ripper, 457 cases: 155 on the first binary, **324** on the last --
+  filter 7/7, sexp 57/58, scanner_events 51/64, parser_events 165/202,
+  lexer 18/29, ripper 24/39, test_files_* 2/58 (the translation reads what
+  the callbacks return). corpus 506/506 with the hash index on and off, 499 and 500
+  under GC_STRESS=50 the same, 10 gates ok (bracket depth 826). Thirty-four
+  unit test groups against the previous binary, none down: syntax 168
+  (167 on the "__fid" try, back with "__rxfid"), super 50, lambda 27,
+  yield 13, iterator 32, class 60, module 192, object 65, eval 39, method
+  97, proc 117, require 51, string 439, array 459, hash 297, regexp 161,
+  m17n 126, marshal 230, struct 100, settracefunc 97, enum 89, parse 102,
+  literal 30, pack 54, assignment 29. What is RED in them is the known set:
+  the memory_leak tests time out under a loaded machine, callcc, and the
+  compaction ones.
+- **The cycle.** Each of the seven rebuilds was 55-60 s; test/ripper takes
+  25 minutes under the harness (test_files_* run `-rripper` children over
+  lib/), the four Prism files 30. The dependence on CI's Mere pin bit once:
+  PR #29 moved MERE_REF to 991f299b while mere.toml still says >= 0.1.711,
+  and a 0.1.711 build failed to link the UDP externs. Build with the
+  pinned ref (mere-wt-712).

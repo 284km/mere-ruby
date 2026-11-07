@@ -257,6 +257,20 @@ magic_comment_test, ripper_test compare against it), `RubyVM::InstructionSequenc
 (newline_test, locals_test) and mere-ruby's own parser refusing or accepting
 what CRuby's does not.
 
+`ripper` is parse.y with event callbacks, a C extension. Here `::Ripper` is
+`Prism::Translation::Ripper` -- Ripper's API over Prism's tree, as on
+TruffleRuby -- with the Ruby half the reference layers on its C core
+(`Ripper::Lexer` and `Ripper.tokenize` / `lex` / `slice` over
+`Prism.lex_compat`, `Ripper::Filter`, `dedent_string`, the C core's default
+event handlers that answer their first argument) in `lib/ripper_ext.rb`,
+which answers `require "ripper"` and every name ripper's own files are
+required by. Prism documents the known differences: some scanner events are
+not dispatched during `#parse`, and a syntax error's message is Prism's, not
+parse.y's. test/prism's lex_test and ripper_test (which compare Prism with
+Ripper) pass; test/ripper's `test_files_*` do not, because the translation
+reads what a parser's callbacks RETURN (`arguments&.any?`) where the C core
+does not -- an upstream difference, not this interpreter's.
+
 `python3 unittest/zlib_compression_check.py` checks both formats in both
 directions against Python's native zlib/gzip, including binary data, input
 beyond the token-block boundary, a 1 MiB repeated input and a corrupt gzip

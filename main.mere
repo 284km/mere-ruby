@@ -2906,6 +2906,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                             (Cons (("__exit_value", (if ibreak_val v then VNil else v)), Cons (("__reason", VSym "break"), Nil)))
                      else flow_throw_breakret (match target with VInt t -> t | _ -> 0) v
                  | other -> flow_value other)
+    // (a class_eval / instance_eval body runs as statements with no block
+    //  of its own; the enclosing method's rides in its env -- yblk_env)
+    else if lv_has env "__yblk" then
+      (match lv_get env "__yblk" with
+       | VProc ypid -> flow_value (run_block world noblk (proc_get (str_of_int ypid)) args)
+       | _ -> raise_exc world "LocalJumpError" "no block given (yield)")
     else raise_exc world "LocalJumpError" "no block given (yield)"
   | ERaise arges ->
     let (meths, sup, ocls, ivars) = world in
@@ -11153,6 +11159,17 @@ and rb_eq_w0 = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
     (match b with
      | VObj _ ->
        (if responds world b "to_str"
+        then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) b "==" (Cons (a, Nil)) false)
+        else rb_eq a b)
+     | _ -> rb_eq a b)
+  // ...and `[] == obj` asks the object when it answers #to_ary (rb_ary_equal:
+  //   `rb_equal(ary2, ary1)`): Prism's LexCompat tokens are SimpleDelegators
+  //   over arrays, and `Ripper.lex(src) == Prism.lex_compat(src).value`
+  //   compared each array with a delegator structurally -- false
+  | VArr _ ->
+    (match b with
+     | VObj _ ->
+       (if responds world b "to_ary"
         then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) b "==" (Cons (a, Nil)) false)
         else rb_eq a b)
      | _ -> rb_eq a b)
@@ -29611,9 +29628,15 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                         let _ = (if str_len p3 > 1 && str_eq (char_at p3 0) "*" && (if str_eq (char_at p3 1) "*" then false else true)
                                  then lv_set ch3 (substring p3 1 (str_len p3)) (arr_new (Cons (a3, Nil)))
                                  else lv_set ch3 p3 a3) in ch3)) in
-          flow_value (register_class_blk world c bb3 cscope e3b))
+          // `yield` in the block is the ENCLOSING METHOD's block (`def hook;
+          // singleton_class.class_eval { define_method(n) { yield } }; end` --
+          // test/ripper's DummyParser), but the body runs as class-body
+          // statements with no block of its own: the method's block rides in
+          // the env under __yblk, which the yield evaluator falls back to
+          let e3y = yblk_env e3b blk in
+          flow_value (register_class_blk world c bb3 cscope e3y))
        else if (str_len name == 13 && str_eq name "instance_eval") || (str_len name == 13 && str_eq name "instance_exec") then
-         (let (h3, ps3, bb3, e3) = newblk in flow_value (register_class_ieval world c bb3 e3))
+         (let (h3, ps3, bb3, e3) = newblk in flow_value (register_class_ieval world c bb3 (yblk_env e3 blk)))
        else if str_eq c "Array" && (str_len name == 3 && str_eq name "new") then
          // Array.new(n) { |i| ... }: the block's value per index, with the same
          // size refusal the value form gets (and a break answers its value).
@@ -32529,7 +32552,13 @@ and arr_eq_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
     (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
      let same = (if obj_answers_eq world x
                  then truthy (invoke_val_c env world nb9 x "==" (Cons (y, Nil)) false)
-                 else cmp_member_w env world x y) in
+                 // (an Array or Hash element against an OBJECT asks the object
+                 //  when it answers #to_ary / #to_hash -- rb_eq_w's arms; a
+                 //  structural compare of `[[1]] == [delegator]` said false)
+                 else (match (x, y) with
+                       | (VArr _, VObj _) -> rb_eq_w env world x y
+                       | (VHsh _, VObj _) -> rb_eq_w env world x y
+                       | _ -> cmp_member_w env world x y)) in
      if same then arr_eq_w env world xt yt else false)
   | (_, _) -> false
 
@@ -43666,10 +43695,21 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   | VFlt _ -> prim_method recv meth args
   | _ ->
   let dcls = dispatch_cls_of world recv in
+  // BasicObject's own `==` (identity), `!` (the truth of self), `!=` (the
+  // negation of `==`, whichever `==` the object has) and Object#=== (`==`):
+  // `super` from an override of one -- Prism's Lexer::State has
+  // `def ==(i) super or to_int == i end` -- ran out of chain into "undefined
+  // method '=='". (Object#=~ is gone since 3.2: that one is no superclass
+  // method, as ruby says.)
+  if (str_len meth == 2 && str_eq meth "==") then prim_method recv "equal?" args
+  else if (str_len meth == 3 && str_eq meth "===") then invoke_val_c gc_cenv0 world superblk recv "==" args false
+  else if (str_len meth == 2 && str_eq meth "!=") then
+    VBool (if truthy (invoke_val_c gc_cenv0 world superblk recv "==" args false) then false else true)
+  else if (str_len meth == 1 && str_eq meth "!") then VBool (if truthy recv then false else true)
   // a descriptor stream's stream methods are the prelude layer's (fdio_route),
   // so `super` from a singleton override -- a mock of #close that calls the
   // real one -- lands there
-  if (match recv with
+  else if (match recv with
       | VObj oid9 -> (let (_, _, oc9, _) = world in
                       let c9 = map_get oc9 oid9 in
                       fdio_route world oid9 (if is_sng_cls c9 then sng_supername world c9 else c9) meth)
@@ -44621,6 +44661,11 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
            | FReturn _ -> true
            | _ -> pre9 t)
         | Cons (_, t) -> pre9 t) in
+     // (the loaded file's top level is a frame with its own `$~`, as
+     //  require's is -- see do_require)
+     let fid9 = next_fid () in
+     let _ = map_set fenv "__rxfid" (VInt fid9) in
+     let rx0 = rx_call_enter fid9 in
      let preret9 = pre9 prog2 in
      let rec nopre9 = fn (ss: Stmt list) ->
        (match ss with
@@ -44628,6 +44673,7 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
         | Cons (SPreexe _, t) -> nopre9 t
         | Cons (s9, t) -> Cons (s9, nopre9 t)) in
      let f = (if preret9 then FNext VNil else run_stmts fenv world noblk2 (nopre9 prog2)) in
+     let _ = rx_call_leave fid9 rx0 (map_has fenv "__captured") in
      let _ = cur_file_set savedcf9 in
      let _ = ref_install rfprev in
      let _ = set_lex (pack_cref savedlex) in
@@ -52218,7 +52264,12 @@ and register_class_sng_in = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let _ = set_lex scope in
   // (the refinements, as a class body: see register_class)
   let _ = (if ref_on () && ref_cur_id () > 0 then map_set cenv "__rf" (VInt (ref_cur_id ())) else ()) in
+  // (a frame of its own with its own `$~`, as a class body's -- see register_class)
+  let fid9 = next_fid () in
+  let _ = map_set cenv "__rxfid" (VInt fid9) in
+  let rx0 = rx_call_enter fid9 in
   let r = in_scope_frame "singleton class" cenv (fn (u: unit) -> register_class_v world cls body "public" cenv) in
+  let _ = rx_call_leave fid9 rx0 (map_has cenv "__captured") in
   let _ = set_lex saved_lex in
   let _ = set_nest saved_nest in
   let _ = restore_ref_active saved in
@@ -52300,7 +52351,16 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   // env names it so a block written in the body keeps it (ref_enter_env).
   let _ = (if ref_on () && ref_cur_id () > 0 then map_set cenv "__rf" (VInt (ref_cur_id ())) else ()) in
   let _ = (if map_has hook_flags "tp" then map_set cenv "__tpdecl" (mkstr (str_join_sep (deep_targets body) "\n")) else ()) in
+  // a class / module body is a FRAME of its own with its own `$~`: nil on
+  // entry, and the enclosing code's match untouched by the body's (ruby's
+  // ISEQ_TYPE_CLASS has its own local table and svar). It was shared with
+  // the enclosing frame, and a block written in the body -- prism's
+  // SexpBuilder's `grep(/\Aon_/) { $' }` -- found its home elsewhere.
+  let fid9 = next_fid () in
+  let _ = map_set cenv "__rxfid" (VInt fid9) in
+  let rx0 = rx_call_enter fid9 in
   let r = in_scope_frame (scope_label_of cls) cenv (fn (u: unit) -> register_class_v world cls body "public" cenv) in
+  let _ = rx_call_leave fid9 rx0 (map_has cenv "__captured") in
   let _ = restore_ref_active saved in
   (match r with
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
@@ -52314,6 +52374,19 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
 // so the locals around it stay visible (`us = self; base.class_eval { ... us
 // ... }` is how rubocop-ast copies a registry to a subclass). Only `self` and
 // the constant scope are rebound.
+// the env a class_eval / instance_eval body runs in, carrying the enclosing
+// method's block for `yield` (see the yield evaluator): a child, so the
+// block's own closure env is not written to
+and yblk_env = fn denv -> fn blk ->
+  match blk with
+  | (true, _, _, _) ->
+    (let ch9 = lv_child denv in
+     let _ = brk_carry denv ch9 in
+     let ypid = proc_next () in
+     let _ = store_proc (str_of_int ypid) blk in
+     let _ = map_set ch9 "__yblk" (VProc ypid) in
+     ch9)
+  | _ -> denv
 and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
   // ⚠ a block body is starting, so the pending `&pr` source is spent -- as
   //   run_block says for the same reason. A class body never reached it, so
@@ -53996,6 +54069,14 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        // same world (classes/methods/consts/globals are shared).
        let fenv = map_new () in
        let _ = map_set fenv "self" VMain in
+       // ⚠ the file's top level is a FRAME of its own, with its own `$~`: the
+       //   requirer's is parked and comes back, and a block written in the file
+       //   (a class body's `grep(/\Aon_/) { $' }`, prism's SexpBuilder) finds
+       //   its home where the matches made beside it go. Without a fid the
+       //   block's home was frame 0 while the file ran under the builtin
+       //   call's frame, so the block swapped in a stale, or no, match.
+       let fid9 = next_fid () in
+       let _ = map_set fenv "__rxfid" (VInt fid9) in
        let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else mkstr ".") in
        let savedf = (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "") in
        let _ = map_set load_ctx "dir" (mkstr (dirname_of full)) in
@@ -54029,10 +54110,13 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        // (a BEGIN at the file's top level runs first, as load's and the main
        //  script's do -- it is no nested BEGIN -- and a `return` in it ends
        //  the file there)
+       let rx0 = rx_call_enter fid9 in
        let f = in_scope_frame "<top (required)>" fenv (fn (u: unit) ->
                  (match run_pre_f fenv world noblk2 prog2 with
                   | FReturn _ -> FNext VNil
                   | _ -> run_stmts fenv world noblk2 (req_nopre prog2))) in
+       // (a proc written at the file's top level may still match into it)
+       let _ = rx_call_leave fid9 rx0 (map_has fenv "__captured") in
        let _ = ref_install rfprev9 in
        let _ = set_lex (pack_cref savedlex) in
        let _ = set_nest (pack_nest savedlex) in
