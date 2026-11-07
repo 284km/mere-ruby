@@ -2023,3 +2023,60 @@ itself as root).
   require 51, syntax 168, object 65, method 97 at their known counts
   (test_file / test_file_exhaustive are EXTRA on this machine: the
   reference needs its -test- extensions).
+
+## 2026-11-08 (8): what test/optparse and test/cgi found -- a splat of an Enumerator, `===` and Method on a subclass of Hash, a singleton method on a dup'd IO, a block on an extended Array or a class method; cgi/escape is ruby's own
+
+Note 511's stage 3, the two it had not measured. optparse here is ruby's
+own lib/optparse.rb (the harness's RUBYLIB), so every one of its 30 red
+tests was the interpreter's: 289 → 319/319. cgi/escape was a
+hand-written CGI in m_eval_leaf.mere; it is ruby 4.0.9's lib/cgi/escape.rb
+byte for byte now (lib/cgi_escape_ext.rb, through tools/gen_pathname_lib.rb;
+its `require 'cgi/escape.so'` is a LoadError the file rescues itself), with
+lib/cgi_ext.rb for `cgi` and `cgi/util` (the escape library plus ruby's
+$VERBOSE warning): test_cgi_escape 435: 392 → 423. corpus/509 is the
+witness.
+
+- **A splat spread an Enumerator as [the Enumerator]**: `[*opt.each_line]`
+  (optparse's separator lines) and `f(*enum)`. The splat asked only a
+  user-defined to_a (has_meth) or a user respond_to?; it asks `responds`
+  now, which sees the builtin to_a as well.
+- **`H === H.new` was false for `class H < Hash`** (optparse's
+  `CompletingHash === pattern`): case_eqq asked class_name, which is the
+  builtin's name for a tagged value; dispatch_cls_of names the subclass.
+- **`H.new.method(:conv)` for a module the subclass includes** had no owner
+  (bm_owner_of looked at the subclass's OWN table, then the builtin's
+  ancestors, never the subclass's ancestors) and its call re-dispatched by
+  name on a Hash: NoMethodError. The subclass's ancestors come first.
+- **An IO given a singleton method stopped answering its builtins**:
+  `s = $stdout.dup; def s.tty?; true; end` left `s.respond_to?(:write)`
+  false, and `$stdout = s` refused it (optparse's help pager). responds_x0
+  asked builtin_obj_has of the singleton class's name; it asks the class
+  under it too (sng_base_cls).
+- **A singleton method on a String/Array/Hash called WITH a block** --
+  `def ary.m; yield; end; ary.m { }`, or `ARGV.extend(Arguable);
+  ARGV.options { }` -- fell through to the builtin iterators and was a
+  NoMethodError (without a block it worked). The block dispatcher's
+  primitive arm asks the value's singleton class first, as invoke_val_c0
+  does.
+- **A class method that takes no block, called with one** (`Encoding.list
+  { }`, `String.name { }`) was a NoMethodError: the block dispatcher's
+  class arm ended in prim_method, which knows no class. It ends in the
+  plain dispatch, block in hand.
+- **Left**: `(($stdout = x) rescue y)` -- a parenthesized assignment under
+  a rescue modifier is rewritten as `$stdout = (x rescue y)`, so a refusal
+  by the SETTER escapes (ruby rescues it; the parens are gone by the time
+  apply_modifier looks); `a, b = *enum` (the multiple assignment's own
+  spread does not ask to_a); cgi's 13: the regexp engine on UTF-16/32 and
+  IBM037 strings (a regexp built from an interpolated UTF-16 string keeps
+  US-ASCII; a `Regexp.new` of one matches nothing).
+- **Checked**: corpus 519/519 both ways, 509 under GC_STRESS=50, the 13
+  gates, optparse 319/319 (all 16 files), cgi 423/435, and the
+  dispatch-sensitive groups at their known counts or above (syntax 168,
+  parse 102, eval 39, object 65, method 97, module 192, class 60, proc
+  117, lambda 27, enumerator 70, enum 89, array 459, hash 297, string 439,
+  io 244, encoding 15, refinement 121, marshal 230, struct 100, require
+  51, iterator 32, case 6, assignment 29, super 50, symbol 59, range 67,
+  set 60, exception 94, variable 32). Corpus 436 caught the first cut of
+  the singleton arm: it took a SUBCLASS tag for a singleton and ran the
+  override a builtin's Method had asked to skip (bi_skip); the arm asks
+  is_sng_cls and bi_skip_pass now.
