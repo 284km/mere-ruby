@@ -1944,3 +1944,42 @@ tests, gated on ObjectSpace.dump. test/strscan 149: 135 → 149.
   autoload 27). Corpus 394 once lost ruby's own `[:outer, false]` line
   while the unittest batch loaded the machine: the REFERENCE side raced
   its SIGINT; alone, both print it.
+
+## 2026-11-08 (6): tmpdir is ruby's own -- test_tmpdir 3 → 9, and the gate the last push broke
+
+Note 511's stage 3, "tmpdir 7". Dir.mktmpdir was a string of this
+interpreter's own in m_eval_leaf.mere (a standalone FileUtils fallback, no
+candidate walk for Dir.tmpdir, a traversal in the prefix left as it was),
+over a Dir.tmpdir primitive that answered $TMPDIR and nothing else.
+lib/tmpdir_ext.rb is ruby 4.0.9's lib/tmpdir.rb byte for byte, generated
+with pathname (tools/gen_pathname_lib.rb); its `def self.tmpdir` on Dir
+replaces the primitive once required. corpus/507 is the witness.
+test_tmpdir 10: 3 → 9; the one left is test_ractor (Dir.mktmpdir inside a
+Ractor, held open across a port -- this Ractor runs the block through).
+
+- **The gate the last push broke**: tools/tmpdir_fileutils_check.sh ran
+  unittest/repro/tmpdir_fileutils_dependency_error.rb, which put a
+  fileutils.rb that raises LoadError on the $LOAD_PATH and expected
+  `require "tmpdir"` to surface it -- the rule for the OLD fallback ("only
+  an absent FileUtils permits it"). With FileUtils shipped, a shipped
+  feature is named from its name alone, over a file of the same name on
+  the $LOAD_PATH (do_require's rule since the digest/sha2 round), so the
+  repro's LoadError never fires and it has no subject. Retired; the other
+  three repros (both load orders against the reference's FileUtils, and
+  tmpdir with the $LOAD_PATH cleared) stand. ⚠ It was not run before the
+  push: the "10 gates" are the nine tools/*_check.sh the LOOP.md rounds
+  name PLUS this one, and ci.yml also runs unicode_normalize, psych_scalar
+  and yaml_store. All thirteen pass now.
+- **`File::Stat#world_writable?` / `#world_readable?`** answered the low
+  twelve bits (01777 for /tmp); ruby answers the permission bits alone
+  (0777 → 511).
+- **`Etc.systmpdir`** was `$TMPDIR || "/tmp"`; ruby's is
+  confstr(_CS_DARWIN_USER_TEMP_DIR) on macOS (what `getconf
+  DARWIN_USER_TEMP_DIR` prints) and /tmp elsewhere. tmpdir.rb asks for
+  $TMPDIR itself, in front of it.
+- **Left**: test_ractor. And the errno under an UNSEARCHABLE directory
+  (chmod 0) is wrong across File and Dir: ruby says EACCES for open,
+  delete, chmod, rename, chown, readlink, utime, Dir.open (ours: ENOENT,
+  ENOTDIR, or a nil from Dir.open), and a symlink loop is ELOOP for
+  File.open/File.read (ours ENOENT), and lchown on a dangling link works
+  (ours ENOENT). That is the 5 of fileutils and the 1 of test_find, next.

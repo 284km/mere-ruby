@@ -14,5 +14,4 @@ for name in fileutils_before_tmpdir tmpdir_before_fileutils; do
   diff -u "$task_tmp/reference" "$task_tmp/candidate"
 done
 "$mr" "$root/unittest/repro/tmpdir_without_fileutils.rb"
-"$mr" "$root/unittest/repro/tmpdir_fileutils_dependency_error.rb"
 echo "tmpdir and FileUtils load orders match the reference"

@@ -2,7 +2,9 @@
 # ships it -- and lib/find_ext.rb (Find, which Pathname#find requires) and
 # lib/fileutils_ext.rb (FileUtils, which Pathname#rmtree requires), turned
 # into Mere string literals so that `require "pathname"` (and "pathname.so"),
-# `require "find"` and `require "fileutils"` need no file on the load path.
+# `require "find"` and `require "fileutils"` need no file on the load path;
+# lib/stringio_ext.rb, lib/strscan_ext.rb and lib/tmpdir_ext.rb (ruby's own
+# lib/tmpdir.rb) ride along.
 #
 #   ruby tools/gen_pathname_lib.rb > m_pathname_lib.mere
 #
@@ -16,7 +18,8 @@ files = [[%w[pathname pathname.so], File.read("#{here}/lib/pathname_ext.rb")],
          [%w[find], File.read("#{here}/lib/find_ext.rb")],
          [%w[fileutils], File.read("#{here}/lib/fileutils_ext.rb")],
          [%w[stringio stringio.so], File.read("#{here}/lib/stringio_ext.rb")],
-         [%w[strscan strscan.so], File.read("#{here}/lib/strscan_ext.rb")]]
+         [%w[strscan strscan.so], File.read("#{here}/lib/strscan_ext.rb")],
+         [%w[tmpdir], File.read("#{here}/lib/tmpdir_ext.rb")]]
 
 def lit(line)
   line.gsub(/[\\"{}\t\r]/) { |c| { "\\" => "\\\\", '"' => '\\"', "{" => "\\{", "}" => "\\}", "\t" => "\\t", "\r" => "\\r" }[c] }
