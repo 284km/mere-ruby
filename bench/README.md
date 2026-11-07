@@ -390,3 +390,34 @@ Measured on Apple silicon at O2 with Mere `01ed9680` (2026-11-07), using
 changed from 0.352 seconds to 0.021 seconds. Peak mark-table entries in these
 runs changed from 301,767 to 1,772. Both builds print the same result. These
 numbers measure this collector workload, not the duration of the CI workflow.
+
+## `file_read_checks.rb`
+
+```sh
+ruby bench/file_read_checks.rb [bytes] [rounds]
+./mere-ruby bench/file_read_checks.rb [bytes] [rounds]
+```
+
+The defaults create a 1 MiB file of 64-byte lines, perform 1,000 rounds of
+`read(0)`, `SEEK_SET`, and `SEEK_CUR`, then read every line with `File.foreach`.
+The file size rounds up to a whole line. Timings go to stderr; stdout reports
+the final position and next byte, then the line and byte counts. Compare those
+outputs with CRuby before comparing times.
+
+Measured on Apple silicon at O2 with Mere `991f299b`, against mere-ruby
+`7009a58` (2026-11-07), median seconds from three runs with the defaults:
+
+| workload | before | after | Ruby 4.0.9 |
+|---|---:|---:|---:|
+| empty reads and seeks | 0.866 | 0.108 | 0.00065 |
+| foreach, 16,384 lines | 30.322 | 20.071 | 0.00469 |
+
+The native byte reader no longer loads the file for zero-byte validation or
+when pushback supplies all requested bytes. Seeking only reads the file to
+find its size for `SEEK_END`; the line reader's seeks over read-ahead bytes
+use `SEEK_SET`. Stream checks and flushing remain in place. Positive reads
+that need file bytes still load the whole file, so this does not remove all
+file-size-dependent work from the line reader.
+
+The foreach runs ranged from 30.3–32.4 seconds before and 15.6–21.2 seconds
+after. These are local workload measurements, not an end-to-end CI speedup.
