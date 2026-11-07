@@ -1,6 +1,7 @@
 # Case mapping is context-independent in Ruby. Titlecase and case folding
 # need their own mappings, including characters that map to themselves.
-samples = ["ΣΣ Σ", "ßß", "ŉŉ", "ǅǈǋǲ", "ᾈᾀ", "և", "აᲐ", "Ꭰꭰ", "Iİıi"]
+samples = ["ΣΣ Σ", "ßß", "ŉŉ", "ǅǈǋǲ", "ᾈᾀ", "և", "აᲐ", "Ꭰꭰ", "Iİıi",
+           "漢字𠀀🙂aZ"]
 %w[UTF-8 UTF-16LE UTF-16BE UTF-32LE UTF-32BE].each do |encoding|
   samples.each do |sample|
     source = sample.encode(encoding)
@@ -14,6 +15,11 @@ samples = ["ΣΣ Σ", "ßß", "ŉŉ", "ǅǈǋǲ", "ᾈᾀ", "և", "აᲐ", "Ꭰ
   source = "Iİıi".encode(encoding)
   p [:upcase, :downcase, :capitalize, :swapcase].map { |m| source.public_send(m, :turkic).encode('UTF-8') }
   p "aΣß".encode(encoding).capitalize(:ascii).encode('UTF-8')
+  # Compare bytes here: noncharacter rendering by String#inspect is separate
+  # from the case mapping and the mask's upper bound.
+  high = "\u{10FFFF}Aß".encode(encoding)
+  p [:upcase, :downcase, :capitalize, :swapcase].map { |m| high.public_send(m).bytes }
+  p high.downcase(:fold).bytes
 end
 
 # Even an all-ASCII source can map to a non-ASCII byte in a single-byte
