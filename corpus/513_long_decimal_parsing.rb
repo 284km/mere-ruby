@@ -1,5 +1,5 @@
 # Decimal fast-path boundaries, permissive termination and underscore rules.
-inputs = ["", "_12", "12_", "12__34", "12_34", "  +12_34tail", "-0_01",
+inputs = ["", "_12", "12_", "12__34", "12_34", "  +12_34tail", "-1_01",
           "9" * 18, "9" * 19, "0" * 25 + "42", "1" * 25 + "__99",
           "-" + "2_" * 30 + "3", "0d" + "3" * 25, "0x" + "a" * 25]
 inputs.each do |s|
