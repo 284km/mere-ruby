@@ -496,6 +496,25 @@ Two runs before this change used 1,549–1,793 MiB. All runs reached the same
 usage, not full FileUtils compatibility. The CI limits and test inputs are
 unchanged.
 
+## Builtin disassembly startup storage
+
+The generated `internal_disasm_text` has 219,645 bytes. Building it by chained
+concatenation retained every intermediate prefix in the default arena. The
+generator now emits a single buffer inside a temporary region; only its final
+string escapes. The decoded table is byte-identical, including all separators.
+
+On Apple silicon at O2 with Mere `991f299b`, against mere-ruby `e45622a`
+(2026-11-07), `MERE_REGION_STATS=1` reported default-arena allocations falling
+from 143,718,720 to 33,904,016 bytes for the same minimal input. The new
+temporary region allocated 481,832 bytes. Three runs of `sleep 1; puts :ok`
+used 203,328–203,344 KiB peak RSS before and 96,176–96,992 KiB after. The sleep
+allows the process sampler to observe startup storage; these measurements do
+not establish a wall-time improvement.
+
+`corpus/511_internal_disassembly_buffer.rb` compares complete disassemblies
+for five builtins after collections, checking that the retained table remains
+readable after the startup buffer's region ends.
+
 ## Positioned positive-length reads
 
 Regular `File#read(length)` calls without universal newline conversion now
