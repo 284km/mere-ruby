@@ -1842,3 +1842,105 @@ bom_test 7 → 10, implicit_array_test 6 → 10, attribute_write_test 6 → 7.
   public_send instead of the setter rule.
 - **Ripper's whitespace gaps are matched as bytes**, so a source with a
   BOM or invalid UTF-8 lexes (bom_test).
+
+## 2026-11-08 (4): Pathname is ruby's own -- test/pathname 144 → 285, and what shipping it found
+
+Note 511's stage 3, "pathname 143". Ruby 4.0 has Pathname in its core,
+written in Ruby (pathname_builtin.rb, with `<=>` and `sub` as C primitives
+that the file itself defines in Ruby when absent). mere-ruby shipped a
+hand-written approximation: no `descend`, no `del_trailing_separator`, a
+`cleanpath` of its own that took `/..` to `/..`, a `parent` of `.` that was
+`.`. lib/pathname_ext.rb is now pathname_builtin.rb and lib/pathname.rb
+(find, rmtree, mktmpdir) byte for byte, generated into m_pathname_lib.mere
+(tools/gen_pathname_lib.rb) with lib/find_ext.rb and lib/fileutils_ext.rb
+-- ruby's lib/find.rb and lib/fileutils.rb, which Pathname#find and
+#rmtree require, and which `require "fileutils"` found nowhere before --
+answered after the prism library. Each of
+the interpreter's own faults it ran into is a line of corpus/505:
+
+- **`Module#method_defined?(name, false)` counted Object's builtins**:
+  `Pathname.method_defined?(:<=>, false)` was true, so the file's
+  `unless method_defined?(:<=>, false)` never defined its Ruby `<=>` (nor
+  `sub`), every Pathname compared nil and `sort` failed. With the
+  ancestors left out, a builtin counts only when the class owns it (its
+  own row, or a primitive the class answers): a user class says no.
+- **`File.path(obj)` with neither #to_path nor #to_str** was a
+  NoMethodError from asking #to_path anyway; ruby's TypeError "no implicit
+  conversion of Object into String" (pathname rewords it).
+- **`obj =~ re` on a plain object** answered nil; Object#=~ is gone since
+  ruby 3.2 and `!~` already raised. NoMethodError, unless the class
+  answers =~ or method_missing.
+- **Proc#binding was a snapshot**: `blk.binding.local_variable_set` wrote
+  into a copy, and so did `eval("$~ = m", blk.binding)` -- which is how
+  pathname_builtin.rb hands the match to the caller's block in
+  Pathname#sub. It is live now (bnd_live, as Kernel#binding's).
+- **An eval under a binding ran under the CALLER's `$~` frame**, so even a
+  live binding's `$~ =` landed in the method that called eval. The eval
+  enters the binding's home frame (rx_home_fid of its env; frame 0 is the
+  main program's) and leaves it as a call does, on a raise too.
+- **A stat under a directory that cannot be searched** was ENOENT; EACCES
+  (test_find under a chmod 0 directory).
+- **Left (2)**: `File.singleton_class.prepend(mod)` does not override a
+  builtin File.split (test_split), and test_realpath's own helper hits an
+  ENOTDIR this parser's File.realpath does not reproduce standalone.
+- **Checked**: corpus 514/514 both ways (505 under GC_STRESS=50 and with
+  the hash index off), the gates, test/pathname 285/287, fileutils
+  112/117 and find 18/19 (the same as before the stdlib files were
+  shipped), and the unittest groups at their known counts.
+
+## 2026-11-08 (5): StringIO and StringScanner as their tests ask -- stringio 77 → 99, strscan 135 → 149
+
+Note 511's stage 3, "stringio" and "strscan". Both classes lived as
+strings inside m_eval_leaf.mere; they are lib/stringio_ext.rb and
+lib/strscan_ext.rb now, generated into m_pathname_lib.mere with pathname,
+find and fileutils (tools/gen_pathname_lib.rb), and corpus/506 is the
+witness. test/stringio 102: 77 → 99, the 3 left are the chilled-string
+tests, gated on ObjectSpace.dump. test/strscan 149: 135 → 149.
+
+- **`StringIO.new` and `StringIO.new(nil)` spell the same default**: the
+  null device is only the explicit nil (a private mark is the default),
+  reads nothing (`read` nil, `read(0)` ""), and `write` answers 0.
+- **`dup` and `reopen(strio)` SHARE the struct behind the stream** -- the
+  string, the position, the line number: a getc on either copy moves both
+  (ruby's strio_copy). Only the open/closed flags are the object's own.
+  The state is one object (`@st`) the copy points at.
+- **A frozen StringIO**: `puts`, `string=` and `reopen` are FrozenError
+  "can't modify frozen StringIO", before the mode is looked at.
+- **A write that cannot be converted into the stream's encoding** was
+  stored as its own bytes; ruby refuses it unless it is ASCII:
+  Encoding::CompatibilityError "incompatible character encodings:
+  Windows-31J and UTF-8". An ASCII-only buffer labelled US-ASCII still
+  takes the first non-ASCII string's encoding.
+- **A limit never splits a character in any encoding**: `gets(1)` on
+  "a".encode("utf-16be") is the 2-byte "a" (the cut moves until the piece
+  is valid, at most a character's bytes); it was UTF-8-only before.
+- **`pread(0, offset, buf)`** is "" (or the buffer, untouched) before the
+  offset is looked at: `pread(0, -10)` is not EINVAL. The EINVAL text is
+  ruby's "pread: Invalid offset argument: -1".
+- **The rest of the stringio round** (from the first pass): `string` is
+  nil on the null device; "BOM|UTF-8" in set_encoding; a mode's spelling
+  (`rbt`, `r+b`, `rb+` are fine, `x` and `rx` are "invalid access mode");
+  `read(nil, buf)` keeps the buffer's encoding; `pread` past the end is
+  EOFError; gets with a limit and a non-String separator is TypeError; the
+  separator is encoded into a non-ASCII-compatible buffer's encoding; the
+  byte search for a separator; paragraph mode counts "\r\n" as a blank
+  line and chomps only when a separator was found; ungetc on the null
+  device is nil and on a frozen buffer IOError "not modifiable string";
+  `write` at MAX_LENGTH is "pos + len overflows"; a frozen buffer is "not
+  opened for writing"; `read_nonblock(len, buf, exception:)`.
+- **StringScanner** (lib/strscan_ext.rb, Version 3.1.6): the scanner
+  re-measures when the string's bytesize changed under it (`__sync`);
+  an uninitialized scanner (allocate) is ArgumentError "uninitialized
+  StringScanner object" and inspects as "#<StringScanner (uninitialized)>";
+  eos?/rest/rest_size/bol? read the live bytesize; an anchored regexp
+  with a fixed encoding (`/./e`) keeps it; `[]` takes negative indexes
+  and an unknown name is IndexError; getch/get_byte at the end are nil.
+- **Checked**: corpus 515/515 both ways (506 under GC_STRESS=50), the
+  gates, stringio 99/102, strscan 149/149, pathname 285/287, fileutils
+  112/117, find 18/19, tmpdir 3/10, and the unittest groups at their
+  known counts (syntax 168, parse 102, eval 39, object 65, method 97,
+  module 192, class 60, string 439, io 244, regexp 161, require 51,
+  marshal 230, struct 100, proc 117, m17n 126, symbol 59, const 5,
+  autoload 27). Corpus 394 once lost ruby's own `[:outer, false]` line
+  while the unittest batch loaded the machine: the REFERENCE side raced
+  its SIGINT; alone, both print it.

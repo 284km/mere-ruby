@@ -2002,6 +2002,7 @@ import "m_syslog_lib.mere";
 import "m_prism_lib.mere";
 import "m_builtin_lists.mere";
 import "m_delegate_lib.mere";
+import "m_pathname_lib.mere";
 import "m_internal_ruby.mere";
 import "m_internal_disasm.mere";
 import "m_json.mere";
@@ -5039,7 +5040,10 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
              // a mock's =~ lives behind method_missing: call that directly.
              else if has_meth world oclq "method_missing"
              then invoke world nb (VObj oq) oclq "method_missing" (Cons (VSym "=~", Cons (va0, Nil)))
-             else VNil)
+             // (Object#=~ is gone since ruby 3.2: `Pathname("a") =~ /a/` is
+             //  the NoMethodError test_pathname's test_matchop asks for)
+             else raise_exc_iv world "NoMethodError" ("undefined method '=~' for " ++ for_recv_cls world oclq)
+                    (Cons (("__name", VSym "=~"), Cons (("__recv", VObj oq), Nil))))
           | _ -> VNil)
        | VObj _ when rx_sub_held world va0 -> invoke_val_c env world blk va0 "=~" (Cons (vb, Nil)) false
        // (...and anything else on the right is its String's question: `:foo
@@ -5050,6 +5054,14 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
                      | VObj _ -> invoke_val_c env world blk vb "=~" (Cons (mkstr sv, Nil)) false
                      | _ -> VNil)
        | VRegex (p, pf, _) -> (match vb with VStr sv -> rx_do_match world p pf (sget sv) (senc_get sv) | VSym sv -> rx_do_match world p pf (sym_bytes sv) (sym_enc_name sv) | _ -> VNil)
+       // (Object#=~ is gone since ruby 3.2: a plain object that answers
+       //  neither =~ nor method_missing is the NoMethodError test_pathname's
+       //  test_matchop asks for, as `!~` below already says)
+       | VObj _ ->
+         (if has_meth world (dispatch_cls_of world va0) "=~" || has_meth world (dispatch_cls_of world va0) "method_missing" then
+            invoke_val_c env world blk va0 "=~" (Cons (vb, Nil)) false
+          else raise_exc_iv world "NoMethodError" ("undefined method '=~' for " ++ for_recv_cls world (dispatch_cls_of world va0))
+                 (Cons (("__name", VSym "=~"), Cons (("__recv", va0), Nil))))
        | _ -> VNil)
     else if str_eq op "!~" then
       (let vb = vb in
@@ -17923,6 +17935,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           //   answered something that is not one, which is a TypeError too.
           // (...asked of #to_path when it has one, else of #to_str -- whose
           //  wrong answer is named as #to_str's)
+          | Cons (VObj o9, _) when (if responds world (VObj o9) "to_path" || responds world (VObj o9) "to_str" then false else true) ->
+            raise_exc world "TypeError" ("no implicit conversion of " ++ display_cls world (dispatch_cls_of world (VObj o9)) ++ " into String")
           | Cons (VObj o9, _) ->
             (let via9 = (if responds world (VObj o9) "to_path" || (if responds world (VObj o9) "to_str" then false else true) then "to_path" else "to_str") in
              match invoke_val_c env world noblk (VObj o9) via9 Nil false with
@@ -19870,7 +19884,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           if (str_len name == 23 && str_eq name "private_method_defined?") then VBool priv8
           else if (str_len name == 25 && str_eq name "protected_method_defined?") then VBool false
           else VBool (if priv8 then false else true))
-       else if str_eq origin "" && builtin_has_meth c nm then
+       // (...and with the ancestors left out, only a builtin of THIS class:
+       //  `Pathname.method_defined?(:<=>, false)` was true of Object's, so
+       //  ruby's own pathname_builtin.rb never defined its Ruby <=> and sub)
+       else if str_eq origin "" && (if inh2 then builtin_has_meth c nm
+                                    else builtin_owns_here c nm || (is_prim_method nm && builtin_obj_has c nm)) then
          VBool ((str_len name == 15 && str_eq name "method_defined?") || (str_len name == 22 && str_eq name "public_method_defined?"))
        // Every class inherits BasicObject's #initialize, and it is PRIVATE:
        // `C.private_method_defined?(:initialize)` is true for a class that
@@ -26041,7 +26059,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // dropped the defining block's implicit-parameter VALUES, so
        // `proc { _1; proc {}.binding.implicit_parameter_get(:_1) }.call(7)`
        // was nil where ruby answers 7)
-       let _ = map_set bind_store (str_of_int bid) (lv_child (bnd_snapshot cenv9)) in
+       // ⚠ ...and LIVE, as Kernel#binding's is: a snapshot answered
+       //   `local_variable_set` and `eval("$~ = m", blk.binding)` into a copy
+       //   nobody read -- ruby's own pathname_builtin.rb sets the caller's
+       //   `$~` that way before yielding in Pathname#sub (bnd_live carries
+       //   the implicit-parameter values the snapshot was for)
+       let _ = map_set bind_store (str_of_int bid) (bnd_live cenv9) in
        // (its #source_location is the proc's: where the block was written, or
        //  for Method#to_proc's, where the method was)
        let _ = (if map_has proc_src (str_of_int pid) && map_has proc_src ("f" ++ str_of_int pid) then
@@ -53933,7 +53956,9 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                                       else (let y9 = syslog_lib_src pship in
                                             if (if str_eq y9 "" then false else true) then y9
                                             else (let q9 = prism_lib_src pship in
-                                                  if (if str_eq q9 "" then false else true) then q9 else delegate_lib_src pship)))))) in
+                                                  if (if str_eq q9 "" then false else true) then q9
+                                                  else (let n9 = pathname_lib_src pship in
+                                                        if (if str_eq n9 "" then false else true) then n9 else delegate_lib_src pship))))))) in
      // (a shipped library's own "pathname.so" entry is set before its source
      // runs, so lf_has_bare is asked only of the others)
      if (if rel then false else true) && (if ends_with_rb p0 then false else true) && str_eq shipped "" && lf_has_bare p0 then FNext (VBool false)
@@ -56337,7 +56362,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "unexpected void value expression"
        // (a parse-only eval -- the main script's syntax report, cli_syntax_framed -- runs nothing)
        else if map_has cli_opt "evpo" then VNil
-       else (let _ = tp_script_compiled world code efile9 eline9 in eval_run_at eenv world blk prog2 efile9 eline9)
+       else (let _ = tp_script_compiled world code efile9 eline9 in eval_run_bound rest eenv world blk prog2 efile9 eline9)
      | _ ->
        if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (eval_flow_msg code efile9 eline9 (invalid_flow_word_in_defs prog2))
        else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
@@ -56354,7 +56379,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "unexpected void value expression"
        // (a parse-only eval -- the main script's syntax report, cli_syntax_framed -- runs nothing)
        else if map_has cli_opt "evpo" then VNil
-       else (let _ = tp_script_compiled world code efile9 eline9 in eval_run_at eenv world blk prog2 efile9 eline9))
+       else (let _ = tp_script_compiled world code efile9 eline9 in eval_run_bound rest eenv world blk prog2 efile9 eline9))
     ), "")) (fn (m: str) -> (VNil, (if str_eq m "" then " " else m))) in
     let _ = (if fresh9 then blk_env_put eenv else ()) in
     if str_eq fail9 "" then res9 else fail fail9
@@ -56491,6 +56516,27 @@ and syn_tok_word = fn (t: Tok) ->
 and tp_script_compiled = fn world -> fn (code: str) -> fn (efile: str) -> fn (eline: int) ->
   if map_has hook_flags "tp" then fire_tp_vlc0 world "script_compiled" "" "" (mkstr code) VNil eline efile ""
   else ()
+// an eval under a BINDING runs under that binding's `$~` frame: ruby's
+// svar is the binding's cfp's, so `eval("$~ = m", blk.binding)` sets what
+// the block (and the method it is written in) read next -- pathname's
+// Pathname#sub hands the match to the caller's block that way. The frame
+// is entered and left as a call's is, its value parked and brought back.
+and eval_run_bound = fn (rest: Val list) -> fn eenv -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (efile9: str) -> fn (eline9: int) ->
+  match rest with
+  | Cons (VBind _, _) ->
+    (let bf9 = rx_home_fid eenv in
+     let cur9 = vec_get rx_frame 0 in
+     // (frame 0 is the main program's: a block written at the top level
+     //  has it as its home, and a binding of that block switches to it)
+     if bf9 >= 0 && bf9 != cur9 then
+       (let rx0 = rx_call_enter bf9 in
+        let _ = vec_set rx_md 0 (rx_parked_of bf9) in
+        let r9 = try_or_msg (fn (u: unit) -> eval_run_at eenv world blk prog2 efile9 eline9)
+                   (fn (m: str) -> (let _ = rx_call_leave bf9 rx0 true in fail m)) in
+        let _ = rx_call_leave bf9 rx0 true in
+        r9)
+     else eval_run_at eenv world blk prog2 efile9 eline9)
+  | _ -> eval_run_at eenv world blk prog2 efile9 eline9
 and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (efile: str) -> fn (eline: int) ->
   // (run in a class or module body, outside any method, the eval'd code's
   //  own `return` has nothing to return from: ruby's LocalJumpError)
