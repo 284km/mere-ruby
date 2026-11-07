@@ -391,6 +391,32 @@ changed from 0.352 seconds to 0.021 seconds. Peak mark-table entries in these
 runs changed from 301,767 to 1,772. Both builds print the same result. These
 numbers measure this collector workload, not the duration of the CI workflow.
 
+## `exit_gc_workload.rb`
+
+```sh
+ruby bench/exit_gc_workload.rb [temporary_errors] [collections]
+./mere-ruby bench/exit_gc_workload.rb [temporary_errors] [collections]
+```
+
+The final class body creates 20,000 temporary conversion errors by default.
+An exit hook collects them, reports the remaining count, and times 20 further
+collections. Stdout checks that the captured result survives. The interpreter
+uses conservative stack roots, so its retained count need not be exactly zero.
+
+On Apple silicon at O2 with Mere `991f299b`, against mere-ruby `23ce853`
+(2026-11-07), two runs retained all 20,000 errors before this fix and 126 after.
+The timed collections took 0.99–1.35 seconds before and 0.033–0.042 seconds
+after. Stdout matched Ruby 4.0.9.
+
+The driver now ends the completed top-level statement's temporary allocation
+interval before running exit hooks. Its result remains explicitly rooted in
+`gc_hold`, and captured values retain their usual roots. This particularly
+affects test runners that execute their suites from an exit hook. A local
+`test_UTF-8_upcase_ascii` comparison went from about 121 to 7.5 seconds in the
+test body, with all 40,569 assertions passing; initialization adds roughly a
+minute and is not included in those body times. Concurrent validation limits
+timing precision.
+
 ## `file_read_checks.rb`
 
 ```sh
