@@ -287,7 +287,7 @@ shard with the previous weights. Replaying the same observations with refreshed
 weights gives 959.8–960.6 seconds per shard. A four-worker replay falls from
 2,298.3 to 1,920.4 seconds (16.4%); this excludes setup, queueing and future
 runtime variation and is not an observed end-to-end speedup. The report has no
-WALL_LIMIT files, but 23 MEMORY_LIMIT files and 166 incomplete or zero-test files
+WALL_LIMIT files, but 22 MEMORY_LIMIT files and 166 incomplete or zero-test files
 remain. Successful collection is not Ruby conformance.
 
 Successful collection writes `timings.json` into `unittest-report`, using the
