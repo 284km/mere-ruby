@@ -511,3 +511,26 @@ The `file_read_checks.rb` benchmark above also exercises this path through
 28.12 seconds to 24.47 seconds with identical output. Other validation ran
 concurrently; this is indicative, not an isolated benchmark or a CI duration
 claim. Per-line interpreter work still dominates much of this workload.
+
+## Temporary expression scopes
+
+```sh
+MERE_RUBY_STORE_STATS=1 ./mere-ruby bench/scratch_scopes.rb 10000
+python3 unittest/scratch_scope_check.py
+```
+
+The workload keeps a closure over the surrounding scope, performs comparisons
+and attribute/index updates, and repeats accessors and comparisons that raise.
+Its output checks values, the retained closure and the original exceptions.
+The checker compares fresh frame counts at 100 and 10,000 iterations, with
+hash indexing ON and OFF; it does not rely on an RSS threshold.
+
+On main `e45622a`, the indexed runs allocated 602 and 60,002 fresh frames.
+Clearing the parent's capture marker from each detached temporary and releasing
+it on both success and failure reduced those counts to 3 and 3 in both modes.
+A real capture of the temporary still keeps it alive and registers it for GC.
+
+With the pinned O2 compiler `991f299b`, Ruby 4.0.9's
+`TestHashOnly#test_broken_hash_value` previously exceeded the 2 GiB family RSS
+limit (2,103,536 KiB observed). After this change it passed both assertions in
+31.9 seconds with 269,344 KiB peak family RSS. The inputs and limits are unchanged.
