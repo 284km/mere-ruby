@@ -1070,11 +1070,15 @@ on a chosen address and answers getsockname / getpeername itself:
   whatever the kernel named -- for pipes and files too, since the layer is
   shared. The messages are the class's own text; ruby's sometimes add the
   call site (`@ io_fillbuf - fd:11`), which is not reproduced.
-- **TCP, either family.** `TCPSocket`/`Socket#connect` go through
-  `tcp_connect`. `TCPSocket.new` resolves the host itself and tries each
-  address in turn, as ruby does ("localhost" is ::1, then 127.0.0.1); a name
-  the files half cannot resolve is left to `tcp_connect`'s own resolver,
-  which tries only its first address. `TCPServer.new` is the runtime's
+- **TCP, either family.** `TCPSocket.new` resolves IPv4 and IPv6 on native
+  workers and polls nonblocking connections while yielding to Ruby threads.
+  It enforces open, resolution, and connection deadlines, binds a requested
+  local address/port before connecting, and supports the resolver delay/error
+  controls used by Ruby's socket tests. Fast fallback prefers IPv6 within a
+  50 ms resolution window and starts another attempt after 250 ms; disabling
+  it serializes connection attempts. Resolver workers own libc data only and
+  release it when a cancelled resolution eventually returns. `Socket#connect`
+  still uses the older blocking `tcp_connect` path. `TCPServer.new` uses
   tcp_listen_at, which is init_inetsock_internal's loop: every AI_PASSIVE
   answer in turn gets socket(2), SO_REUSEADDR and bind(2), the first that
   binds is the listener, and a refusal is the Errno the kernel named
