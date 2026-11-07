@@ -8,6 +8,9 @@ def exchange(host, **options)
   accepted = server.accept
   accepted.write("a\0b")
   p [client.remote_address.ip_address == host, client.recvfrom(3)]
+  accepted.close
+  accepted = nil
+  p client.recvfrom(1) # EOF is nil, not a two-element packet.
 ensure
   accepted&.close
   client&.close
@@ -16,6 +19,22 @@ end
 
 exchange('127.0.0.1', test_mode_settings: {delay: {ipv6: 1000}})
 exchange('127.0.0.1', test_mode_settings: {error: {ipv6: Socket::EAI_FAIL}})
+# A deadline for the unresolved family must preserve the IPv4 answer and
+# release the preference wait, even before that answer has been attempted.
+exchange('127.0.0.1', resolv_timeout: 0.01,
+         test_mode_settings: {delay: {ipv6: 1000}})
+
+# A failed connection does not hide the unresolved family's timeout when
+# there is no usable address or active attempt left.
+closed = TCPServer.new('127.0.0.1', 0)
+port = closed.addr[1]
+closed.close
+begin
+  TCPSocket.new('localhost', port, resolv_timeout: 0.01,
+               test_mode_settings: {delay: {ipv4: 1000}})
+rescue IO::TimeoutError
+  p :resolution_timeout_after_connection_failure
+end
 
 [:open_timeout, :resolv_timeout].each do |kind|
   begin
