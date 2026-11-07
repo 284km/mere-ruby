@@ -470,6 +470,31 @@ file-size-dependent work from the line reader.
 The foreach runs ranged from 30.3–32.4 seconds before and 15.6–21.2 seconds
 after. These are local workload measurements, not an end-to-end CI speedup.
 
+## `long_backtrace.rb`
+
+```sh
+ruby bench/long_backtrace.rb [frames]
+./mere-ruby bench/long_backtrace.rb [frames]
+```
+
+The default formats 15,000 explicit frames, independently of the interpreter's
+recursion limit. It reports the byte count, line count and endpoints. Forward
+and reverse backtrace formatting now use buffers instead of repeatedly copying
+the remaining suffix or accumulated prefix. Bottom-up frame numbers also use
+Ruby's alignment when the trace has multiple digits.
+
+On Apple silicon at O2 with Mere `991f299b` (2026-11-07), maximum child RSS
+reported by macOS `getrusage(RUSAGE_CHILDREN)` fell from 3,725,721,600 to
+194,756,608 bytes. Both outputs match Ruby 4.0.9. This OS high-water measurement
+captures short allocation spikes that periodic process sampling can miss.
+
+The unchanged upstream `ruby/test_stack.rb` now reaches its final summary
+within the existing 2 GiB budget: 3 tests, 10 assertions, one failure and one
+error, at 1,012,400 KiB sampled process-family RSS. Stack-size configuration
+compatibility remains incomplete. In `ruby/test_thread.rb`, the former
+stopping case completes, but a later interrupt/trap test still reaches the
+memory limit; this is not a claim of complete Thread compatibility.
+
 ## `buffered_file_writes.rb`
 
 ```sh
