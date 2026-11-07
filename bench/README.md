@@ -421,3 +421,29 @@ file-size-dependent work from the line reader.
 
 The foreach runs ranged from 30.3–32.4 seconds before and 15.6–21.2 seconds
 after. These are local workload measurements, not an end-to-end CI speedup.
+
+## `buffered_file_writes.rb`
+
+```sh
+ruby bench/buffered_file_writes.rb [writes]
+./mere-ruby bench/buffered_file_writes.rb [writes]
+```
+
+The default performs 16,384 small writes before flushing. Stdout checks the
+position, persisted size, and complete contents; elapsed time goes to stderr.
+The buffer now appends to the existing String's chunk queue instead of copying
+its entire prefix and allocating another String handle for every write.
+
+On Apple silicon at O2 with Mere `991f299b`, against mere-ruby `23ce853`
+(2026-11-07), two local runs reduced peak process RSS from 409–526 MiB to
+251–252 MiB. Whole-process wall times were 5.12–5.53 seconds before and
+4.44–4.62 seconds after. Other validation was running concurrently, so these
+wall times are indicative rather than an isolated timing comparison. Ruby
+4.0.9 prints the same checks.
+
+A bounded run of Ruby 4.0.9's `fileutils/test_fileutils.rb`, with both test
+ordering and `Kernel.srand` fixed to 1, completed with peak RSS of 304 MiB.
+Two runs before this change used 1,549–1,793 MiB. All runs reached the same
+117 tests and retained the same five existing failures; this measures resource
+usage, not full FileUtils compatibility. The CI limits and test inputs are
+unchanged.
