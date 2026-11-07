@@ -6432,6 +6432,9 @@ and stdlib_src = fn (name: str) ->
     "end\n" ++
     "\n" ++
     "class TCPSocket < IPSocket\n" ++
+    "  def recvfrom(maxlen, flags = 0)\n" ++
+    "    [recv(maxlen, flags), nil]\n" ++
+    "  end\n" ++
     "  def self.gethostbyname(host)\n" ++
     "    list = Addrinfo.__getaddrinfo(host, nil, 0, Socket::SOCK_STREAM, 0, Socket::AI_CANONNAME, false)\n" ++
     "    names = [list[0].canonname || host, []]\n" ++
@@ -6456,23 +6459,110 @@ and stdlib_src = fn (name: str) ->
     "    end\n" ++
     "    -1\n" ++
     "  end\n" ++
-    "  # A connect here is the runtime's blocking connect(2): it cannot be given\n" ++
-    "  # a deadline. A deadline of zero is the one that is known in advance -- no\n" ++
-    "  # connect completes in no time, and ruby's own nonblocking connect times out\n" ++
-    "  # on it even over loopback -- so it is answered without connecting. A\n" ++
-    "  # positive one is not enforced (KNOWN_GAPS).\n" ++
-    "  def initialize(host, port, local_host = nil, local_port = nil, connect_timeout: nil, open_timeout: nil, resolv_timeout: nil, fast_fallback: true)\n" ++
+    "  # Resolution workers never run Ruby. This loop owns their lifetime and yields\n" ++
+    "  # while DNS or connect(2) is pending, including during timeout cleanup.\n" ++
+    "  def self.__connect_with_deadlines(host, port, local_host, local_port, connect_timeout, open_timeout, resolv_timeout, fast_fallback, settings)\n" ++
+    "    start = Process.clock_gettime(Process::CLOCK_MONOTONIC)\n" ++
+    "    jobs = \{}\n" ++
+    "    ready = \{6 => [], 4 => []}\n" ++
+    "    active = []\n" ++
+    "    last_error = nil\n" ++
+    "    resolution_error = nil\n" ++
+    "    first_v4 = nil\n" ++
+    "    next_attempt = start\n" ++
+    "    last_family = 4\n" ++
+    "    local = local_host.nil? ? '' : Addrinfo.__getaddrinfo(local_host, nil, 0, 0, 0, 0, false)[0].ip_address\n" ++
+    "    families = host.include?(':') ? [6] : (host.match?(/\\A[0-9.]+\\z/) ? [4] : [6, 4])\n" ++
+    "    settings = \{} unless settings.is_a?(Hash)\n" ++
+    "    delays = settings[:delay] || \{}\n" ++
+    "    errors = settings[:error] || \{}\n" ++
+    "    families.each do |family|\n" ++
+    "      key = family == 6 ? :ipv6 : :ipv4\n" ++
+    "      job = Socket.__resolve_start(host, port, family, Integer(delays[key] || 0), Integer(errors[key] || 0))\n" ++
+    "      raise SystemCallError.new('getaddrinfo worker', -job) if job < 0\n" ++
+    "      jobs[family] = job\n" ++
+    "    end\n" ++
+    "    loop do\n" ++
+    "      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)\n" ++
+    "      raise IO::TimeoutError, 'user specified open timeout' if open_timeout && now - start >= open_timeout\n" ++
+    "      jobs.keys.each do |family|\n" ++
+    "        job = jobs[family]\n" ++
+    "        next if Socket.__resolve_done(job) == 0\n" ++
+    "        error = Socket.__resolve_error(job)\n" ++
+    "        if error != 0\n" ++
+    "          resolution_error = Socket::ResolutionError.new('getaddrinfo failed')\n" ++
+    "        else\n" ++
+    "          index = 0\n" ++
+    "          loop do\n" ++
+    "            address = Socket.__resolve_address(job, index)\n" ++
+    "            break if address.empty?\n" ++
+    "            ready[family] << address unless ready[family].include?(address)\n" ++
+    "            index += 1\n" ++
+    "          end\n" ++
+    "          first_v4 ||= now if family == 4\n" ++
+    "        end\n" ++
+    "        Socket.__resolve_release(job)\n" ++
+    "        jobs.delete(family)\n" ++
+    "      end\n" ++
+    "      active.dup.each do |entry|\n" ++
+    "        fd, since = entry\n" ++
+    "        if (IO.__poll([fd], [2], 0)[0] & 6) != 0\n" ++
+    "          error = Socket.__connect_error(fd)\n" ++
+    "          active.delete(entry)\n" ++
+    "          return fd if error == 0\n" ++
+    "          IO.__fdclose(fd)\n" ++
+    "          last_error = SystemCallError.new(\"connect(2) for #\{host.inspect} port #\{port}\", error)\n" ++
+    "          next_attempt = now\n" ++
+    "        elsif connect_timeout && now - since >= connect_timeout\n" ++
+    "          active.delete(entry)\n" ++
+    "          IO.__fdclose(fd)\n" ++
+    "          last_error = IO::TimeoutError.new('user specified connect timeout')\n" ++
+    "          next_attempt = now\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "      raise IO::TimeoutError, 'user specified resolution timeout' if resolv_timeout && !jobs.empty? && now - start >= resolv_timeout\n" ++
+    "      if now >= next_attempt && (fast_fallback || active.empty?)\n" ++
+    "        family = last_family == 6 ? 4 : 6\n" ++
+    "        family = 10 - family if ready[family].empty?\n" ++
+    "        wait_v6 = family == 4 && jobs.key?(6) && first_v4 && now - first_v4 < 0.05\n" ++
+    "        unless ready[family].empty? || wait_v6\n" ++
+    "          address = ready[family].shift\n" ++
+    "          last_family = family\n" ++
+    "          fd = Socket.__connect_start(address, port, local, local_port || 0)\n" ++
+    "          if fd < 0\n" ++
+    "            context = local_host || local_port ? \"bind/connect(2) for #\{local_host.inspect} port #\{local_port}\" : \"connect(2) for #\{host.inspect} port #\{port}\"\n" ++
+    "            last_error = SystemCallError.new(context, -fd)\n" ++
+    "            next_attempt = now\n" ++
+    "          else\n" ++
+    "            active << [fd, now]\n" ++
+    "            next_attempt = now + 0.25\n" ++
+    "          end\n" ++
+    "          next\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "      if jobs.empty? && active.empty? && ready[4].empty? && ready[6].empty?\n" ++
+    "        raise(last_error || resolution_error || Socket::ResolutionError.new('getaddrinfo returned no addresses'))\n" ++
+    "      end\n" ++
+    "      sleep 0.001\n" ++
+    "    end\n" ++
+    "  ensure\n" ++
+    "    jobs&.each_value \{ |job| Socket.__resolve_release(job) }\n" ++
+    "    active&.each \{ |entry| IO.__fdclose(entry[0]) }\n" ++
+    "  end\n" ++
+    "  def initialize(host, port, local_host = nil, local_port = nil, connect_timeout: nil, open_timeout: nil, resolv_timeout: nil, fast_fallback: true, test_mode_settings: nil)\n" ++
     "    __new_block_warn if block_given?\n" ++
+    "    if open_timeout && (connect_timeout || resolv_timeout)\n" ++
+    "      raise ArgumentError, 'open_timeout cannot be combined with connect_timeout or resolv_timeout'\n" ++
+    "    end\n" ++
+    "    raise Socket::ResolutionError, 'getaddrinfo: no service specified' if port.nil?\n" ++
     "    @host = host\n" ++
     "    @port = port\n" ++
-    "    t = open_timeout || connect_timeout\n" ++
-    "    raise IO::TimeoutError, \"user specified timeout for #\{host}:#\{port}\" if t && t <= 0\n" ++
-    "    fd = TCPSocket.__connect_any(host, Addrinfo.__port_of(port, \"tcp\"))\n" ++
-    "    if fd < 0\n" ++
-    "      raise Errno::ECONNREFUSED, \"connect(2) for #\{host.inspect} port #\{port}\"\n" ++
+    "    [open_timeout, connect_timeout, resolv_timeout].each do |timeout|\n" ++
+    "      raise IO::TimeoutError, 'user specified timeout' if timeout && timeout <= 0\n" ++
     "    end\n" ++
+    "    host = host.nil? ? '' : host.to_str\n" ++
+    "    fd = TCPSocket.__connect_with_deadlines(host, Addrinfo.__port_of(port, 'tcp'), local_host, local_port && Addrinfo.__port_of(local_port, 'tcp'), connect_timeout, open_timeout, resolv_timeout, fast_fallback, test_mode_settings)\n" ++
     "    __setup(fd)\n" ++
-    "    Socket::Endpoint__.check_local(self, local_host, local_port) if local_host || local_port\n" ++
     "  end\n" ++
     "end\n" ++
     "\n" ++
@@ -6732,6 +6822,9 @@ and stdlib_src = fn (name: str) ->
     "end\n" ++
     "\n" ++
     "class Socket < BasicSocket\n" ++
+    "  def self.ip_address_list\n" ++
+    "    Socket.__ip_addresses.split.map \{ |address| Addrinfo.new([address].pack('H*'), nil, 0, 0) }\n" ++
+    "  end\n" ++
     "  module Constants\n" ++
     "    def self.__table\n" ++
     "      @__table ||= begin\n" ++
