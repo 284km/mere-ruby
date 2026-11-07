@@ -338,10 +338,10 @@ unless defined?(::Ripper)
         prev_state = 0
         tokens.each do |(start, pos, event, tok, st)|
           if start && start > cursor
-            gap = source.byteslice(cursor, start - cursor)
-            if gap.match?(/\A(?:[ \t\f\r\v]|\\[ \t\n])+\z/)
+            gap = source.byteslice(cursor, start - cursor).b
+            if gap.match?(/\A(?:[ \t\f\r\v]|\\[ \t\n])+\z/n)
               at = cursor
-              gap.scan(/[ \t\f\r\v]+|\\[ \t\n]/).each do |sp|
+              gap.scan(/[ \t\f\r\v]+|\\[ \t\n]/n).each do |sp|
                 line = offsets.rindex { |o| o <= at }
                 elems << Elem.new([line + @lineno, at - offsets[line]], :on_sp, sp, state)
                 at += sp.bytesize
@@ -363,10 +363,10 @@ unless defined?(::Ripper)
         #  a final newline the scanner reports the state the line ended in)
         state = prev_state if elems.last && elems.last.event == :on_nl
         if cursor < source.bytesize
-          gap = source.byteslice(cursor, source.bytesize - cursor)
-          if gap.match?(/\A(?:[ \t\f\r\v]|\\[ \t\n])+\z/)
+          gap = source.byteslice(cursor, source.bytesize - cursor).b
+          if gap.match?(/\A(?:[ \t\f\r\v]|\\[ \t\n])+\z/n)
             at = cursor
-            gap.scan(/[ \t\f\r\v]+|\\[ \t\n]/).each do |sp|
+            gap.scan(/[ \t\f\r\v]+|\\[ \t\n]/n).each do |sp|
               line = offsets.rindex { |o| o <= at }
               elems << Elem.new([line + @lineno, at - offsets[line]], :on_sp, sp, state)
               at += sp.bytesize

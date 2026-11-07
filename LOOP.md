@@ -1821,3 +1821,24 @@ compile_error; `arguments&.any?` on a callback's answer; no warn hooks).
   related unittest groups (const, module 192, class 60, autoload, syntax
   168, parse 102, eval 39, object 65, method 97, refinement, require 51,
   struct 100, marshal 230) with prism's ripper_test 946 and lex_test 968.
+
+## 2026-11-08 (3): an implicit array is a statement's right side, a scoped constant takes one, an explicit `o.[]=(0, 1)` is a call
+
+The small prism files left (note 512 §4's "implicit array 4" and bom 3):
+bom_test 7 → 10, implicit_array_test 6 → 10, attribute_write_test 6 → 7.
+
+- **`x = *b` as a condition, an argument, a flow keyword's value or
+  another assignment's value** is parse.y's "multiple assignment is not
+  allowed in this context"; this parser took it anywhere (`if a = *b
+  then end` ran). The expression-level arms that read a splat value mark
+  "mrhs" the way a paren-less argument list marks "lastcmd"; the places
+  that may not hold one clear the mark before their operand and refuse it
+  after. A statement's own right side (`a = *b`, `o.a = *b`, parens) is
+  untouched. `A::A = *b` and `A::A = 1, 2` were refused outright: the
+  scoped-constant assignment read one expression where the plain one read
+  a list. corpus/504.
+- **`o.[]=(0, 1)` answers what the method answers** -- it is a call,
+  where `o[0] = 1` answers 1 -- so the explicit spelling goes through
+  public_send instead of the setter rule.
+- **Ripper's whitespace gaps are matched as bytes**, so a source with a
+  BOM or invalid UTF-8 lexes (bom_test).
