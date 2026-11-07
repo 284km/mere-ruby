@@ -41,8 +41,30 @@ unless defined?(::Ripper)
     # caller's String.
     alias __translation_initialize initialize
     def initialize(source, filename = "(ripper)", lineno = 1)
+      # (the C core reads any object that answers #gets, line by line, when
+      #  the parse runs -- a line that is no String is its TypeError then)
+      @__input = nil
+      unless source.is_a?(String)
+        raise TypeError, "wrong argument type #{source.class} (expected String)" unless source.respond_to?(:gets)
+        @__input = source
+        source = ""
+      end
       __translation_initialize(source, filename.is_a?(String) ? filename.dup.freeze : filename, lineno)
       @__parsing = false
+    end
+
+    # The source, read from the #gets object on first use.
+    def source
+      if @__input
+        input, @__input = @__input, nil
+        buf = +""
+        while (line = input.gets)
+          raise TypeError, "wrong argument type #{line.class} (expected String)" unless line.is_a?(String)
+          buf << line
+        end
+        @source = buf
+      end
+      @source
     end
 
     # The C core's parser-state readers answer nil outside a parse. The
@@ -70,9 +92,37 @@ unless defined?(::Ripper)
     alias __translation_parse parse
     def parse
       @__parsing = true
+      __yydebug_trace if @yydebug && @debug_output
       __translation_parse
     ensure
       @__parsing = false
+    end
+
+    # The C core's yydebug is bison's trace on debug_output: one "Next token
+    # is token ..." line per token, named as parse.y names it, with its
+    # location. The names test_ripper reads are given; the rest keep the
+    # scanner event's.
+    YYDEBUG_TOKEN_NAMES = {
+      on_ident: "local variable or method", on_tstring_content: "literal content",
+      on_int: "integer literal", on_float: "float literal", on_const: "constant",
+      on_ivar: "instance variable", on_gvar: "global variable", on_cvar: "class variable",
+      on_tstring_beg: "string literal", on_kw: "keyword", on_op: "operator",
+    }.freeze
+    YYDEBUG_NAMED_TOKENS = %i[on_ident on_const on_ivar on_gvar on_cvar on_int on_float on_kw on_op].freeze
+    private_constant :YYDEBUG_TOKEN_NAMES, :YYDEBUG_NAMED_TOKENS
+
+    def __yydebug_trace
+      Lexer.new(result.source.source, @filename, @lineno).lex.each do |(pos, event, tok, _state)|
+        next if event == :on_sp || event == :on_nl || event == :on_ignored_nl
+        name = YYDEBUG_TOKEN_NAMES[event] || event.to_s.delete_prefix("on_")
+        line, col = pos
+        # (bison prints a name's text, and nothing for a literal's content)
+        text = YYDEBUG_NAMED_TOKENS.include?(event) ? tok : ""
+        loc = "(#{line}.#{col}-#{line}.#{col + tok.length}: #{text})"
+        @debug_output << "Next token is token \"#{name}\" #{loc}\n"
+        @debug_output << "Shifting token \"#{name}\" #{loc}\n"
+        @debug_output << "   $1 = token \"#{name}\" #{loc}\n"
+      end
     end
 
     # Whether the source has an `__END__`.
@@ -216,6 +266,11 @@ unless defined?(::Ripper)
 
       attr_reader :errors
 
+      # Whether the last parse (scan / lex / tokenize) found a syntax error.
+      def error?
+        !@errors.empty?
+      end
+
       def initialize(src, filename = "-", lineno = 1)
         @source = src.respond_to?(:read) ? src.read : (src.respond_to?(:gets) ? src.gets(nil) : src)
         @filename = filename
@@ -280,21 +335,43 @@ unless defined?(::Ripper)
         elems = []
         cursor = 0
         state = 0
+        prev_state = 0
         tokens.each do |(start, pos, event, tok, st)|
           if start && start > cursor
             gap = source.byteslice(cursor, start - cursor)
-            if gap.match?(/\A(?:[ \t\f\r\v]|\\\n)+\z/)
+            if gap.match?(/\A(?:[ \t\f\r\v]|\\[ \t\n])+\z/)
               at = cursor
-              gap.scan(/[ \t\f\r\v]+|\\\n/).each do |sp|
+              gap.scan(/[ \t\f\r\v]+|\\[ \t\n]/).each do |sp|
                 line = offsets.rindex { |o| o <= at }
                 elems << Elem.new([line + @lineno, at - offsets[line]], :on_sp, sp, state)
                 at += sp.bytesize
               end
             end
           end
+          # (the __END__ token is the marker line alone; what follows is
+          #  the program's DATA, no token)
+          tok = tok[/\A__END__\n?/] if event == :on___end__
+          # (an unterminated heredoc has no end token: `EOS ` is not it)
+          next if event == :on_heredoc_end && tok.empty?
           elems << Elem.new(pos, event, tok, st)
           cursor = start + tok.bytesize if start && start + tok.bytesize > cursor
+          prev_state = state
           state = st
+        end
+        # (whitespace after the last token -- or a source that is nothing
+        #  else -- is on_sp too: `1\n\t \t`, test_lexer's spaces_at_eof; after
+        #  a final newline the scanner reports the state the line ended in)
+        state = prev_state if elems.last && elems.last.event == :on_nl
+        if cursor < source.bytesize
+          gap = source.byteslice(cursor, source.bytesize - cursor)
+          if gap.match?(/\A(?:[ \t\f\r\v]|\\[ \t\n])+\z/)
+            at = cursor
+            gap.scan(/[ \t\f\r\v]+|\\[ \t\n]/).each do |sp|
+              line = offsets.rindex { |o| o <= at }
+              elems << Elem.new([line + @lineno, at - offsets[line]], :on_sp, sp, state)
+              at += sp.bytesize
+            end
+          end
         end
         elems
       end

@@ -1786,3 +1786,38 @@ all of them (63/63). Each is a line of corpus/502.
   gates, and the unittest groups at their known counts (syntax 168, parse
   102, eval 39, object 65, ast 1706, string 439, symbol 59, m17n 126,
   float 63, method 97, module 192, class 60, among others). 8 builds.
+
+## 2026-11-08 (2): test/ripper's remaining differences -- a constant inside `class A::B`, and the Ripper layer's loose ends
+
+Note 513 §4. test/ripper (minus the test_files_* sweeps): 322 → 337 of
+399. parser_events stays at 165/202: its 37 are the translation's
+(errors reach on_parse_error, not on_assign_error / on_param_error /
+compile_error; `arguments&.any?` on a callback's answer; no warn hooks).
+
+- **`Ripper::Lexer` inside `class TestRipper::Ripper` was the test class's
+  own.** The lexical walk for a qualified name's HEAD took every prefix of
+  the cref's path as a scope -- "TestRipper" is not one: the nesting of
+  `class TestRipper::Ripper` is [TestRipper::Ripper] alone, and `Ripper`
+  there is the top-level one (an alias of Prism::Translation::Ripper). The
+  bare-name path already dropped a hit in a scope that is not on the
+  nesting; the qualified path did not. And a head that is itself
+  qualified (`Ripper::Lexer::State` with Ripper an alias) is read as the
+  constant it names, through the same arm one segment shorter. corpus/503.
+- **The Ripper layer** (lib/ripper_ext.rb): a source that answers #gets
+  is read at parse time, line by line, a line that is no String its
+  TypeError then (test_ripper's Input); Lexer#error?; the whitespace
+  after the last token and `\ ` are on_sp (after a final newline with the
+  state the line ended in); an unterminated heredoc has no end token; the
+  `__END__` token is the marker line alone; yydebug writes bison's
+  "Next token is token ..." lines on debug_output, named as parse.y names
+  them.
+- **Left, all the translation's or prism's**: lexer states after a heredoc
+  (BEG vs END), `}` as on_embexpr_end, error recovery around heredocs,
+  the regexp-option encoding check (prism says the opposite of parse.y
+  for `/[\xC0-\xF0]/u` and `/n`), parse.y's wording for
+  `def req(a?:)`, words_sep splitting, `?\\` as a CHAR, `$\` and the
+  invalid-escape tokens, and the no_memory_leak timeouts.
+- **Checked**: corpus 511/511 both ways, the 10 gates, and the constant-
+  related unittest groups (const, module 192, class 60, autoload, syntax
+  168, parse 102, eval 39, object 65, method 97, refinement, require 51,
+  struct 100, marshal 230) with prism's ripper_test 946 and lex_test 968.
