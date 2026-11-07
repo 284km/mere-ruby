@@ -473,3 +473,19 @@ Two runs before this change used 1,549–1,793 MiB. All runs reached the same
 117 tests and retained the same five existing failures; this measures resource
 usage, not full FileUtils compatibility. The CI limits and test inputs are
 unchanged.
+
+## Positioned positive-length reads
+
+Regular `File#read(length)` calls without universal newline conversion now
+open the existing path, seek to the logical position, and read at most the
+requested byte count in 64 KiB chunks. This avoids a whole-file copy for each
+small read. It keeps the existing path-based behavior and does not cache file
+contents, so changes between reads remain visible. Device reads and newline
+conversion retain their existing path.
+
+The `file_read_checks.rb` benchmark above also exercises this path through
+`File.foreach`. One local O2 comparison against `23ce853`, using Mere
+`991f299b` and the default 1 MiB input, reduced the foreach portion from
+28.12 seconds to 24.47 seconds with identical output. Other validation ran
+concurrently; this is indicative, not an isolated benchmark or a CI duration
+claim. Per-line interpreter work still dominates much of this workload.
