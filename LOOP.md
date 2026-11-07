@@ -1983,3 +1983,43 @@ Ractor, held open across a port -- this Ractor runs the block through).
   ENOTDIR, or a nil from Dir.open), and a symlink loop is ELOOP for
   File.open/File.read (ours ENOENT), and lchown on a dangling link works
   (ours ENOENT). That is the 5 of fileutils and the 1 of test_find, next.
+
+## 2026-11-08 (7): the errno for a path an operation could not reach -- EACCES under a chmod 0 directory, ELOOP for a loop, worked out once for every file operation
+
+Note 511's stage 3, fileutils's 5 and test_find's 1. The file builtins hand
+back no errno (m_state.mere's note at proc_last_errno: it is gone by the
+time Mere can read it), so every file operation that failed reasoned about
+the cause on its own, and all of them reasoned "not there" as ENOENT: open,
+read, write, unlink, chmod, rename, chown, utime, readlink under a
+directory that cannot be searched (chmod 0) were ENOENT where ruby says
+EACCES; Dir.children/entries said ENOTDIR and Dir.open opened the
+directory and listed nothing; a symbolic link that leads only to links was
+ENOENT for open/read/chmod/utime where ruby says ELOOP; a create in a
+directory that cannot be written died below the level that has a ruby
+exception ("error (StandardError)"). corpus/508 is the witness (it skips
+itself as root).
+
+- **One classifier, fs_absent_name** (m_eval_leaf.mere, beside
+  raise_sysopen): a trailing slash on a file or a prefix that is there and
+  is not a directory is ENOTDIR; a link chain past forty is ELOOP
+  (fs_sym_loop, through file_readlink); the nearest prefix that is there
+  (by lstat too) and is a directory that cannot be searched (fs_access -x)
+  is EACCES; else ENOENT. fs_absent_raise names ruby's C function
+  ("apply2files", "rb_sysopen", "dir_initialize", ...), and
+  raise_sysopen_absent keeps the path's encoding as raise_sysopen does.
+- **Where it is asked**: file_open_obj's three "not there" arms, File.read,
+  File.write (a parent that is there and cannot be written is EACCES, as
+  is a create in one), File.delete, File.chmod, File.rename (the source
+  that is not there names the error, else the destination), Dir.open
+  (refused at the open when the directory cannot be read, as opendir
+  refuses, not at the first entry) and dir_open_fail, and the prelude's
+  chown, utime, readlink and File::Stat's miss (its ENOTDIR walk stays,
+  the rest is File.__absent -- one owner).
+- **lchown is the link itself** (chown -h): a dangling link is a path that
+  is there. It was chown, which asked File.exist? and said ENOENT.
+- **Checked**: corpus 518/518 both ways, 508 under GC_STRESS=50, the 13
+  gates (name_len 3767), fileutils 112 → 117/117, find 18 → 19/19, and
+  pathname 285, tmpdir 9, tempfile 37, dir 38, io 244, process 155,
+  require 51, syntax 168, object 65, method 97 at their known counts
+  (test_file / test_file_exhaustive are EXTRA on this machine: the
+  reference needs its -test- extensions).

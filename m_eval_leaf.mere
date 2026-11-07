@@ -14539,6 +14539,51 @@ and raise_sysopen = fn world -> fn (cls: str) -> fn (what: str) -> fn (path: str
   else if enc_all7 path || str_eq penc "" then raise_exc world cls (what ++ " @ rb_sysopen - " ++ path)
   else raise_exc_iv world cls (what ++ " @ rb_sysopen - " ++ path) (Cons (("__menc", mkstr penc), Nil))
 and file_arg_enc = fn (args: Val list) -> (match args with Cons (VStr h, _) -> enc_canon_name (senc_get h) | _ -> "")
+// The error ruby names for a path an operation could not reach. The file
+// builtins hand back no errno (see proc_last_errno's note in m_state.mere),
+// so it is worked out the way the prelude's File::Stat.__snap works it out:
+// a symbolic link that leads only to links past the forty the kernel
+// follows is ELOOP; the nearest prefix that is there and is not a directory
+// is ENOTDIR (a trailing slash on a file too); a directory on the way that
+// cannot be searched is EACCES -- ruby's own answer for open, unlink, chmod,
+// rename, chown, utime, readlink and opendir under a chmod 0 directory
+// (test_find's unreadable dir, fileutils's rm_r without permissions), which
+// every one of them called ENOENT here; else ENOENT.
+and fs_sym_loop = fn (p: str) -> fn (n: int) ->
+  if n > 40 then true
+  else
+    (let m = fs_mode p false in
+     if m < 0 || (if (m / 4096) - (m / 65536) * 16 == 10 then false else true) then false
+     else
+       (let a = tcp_arena () in
+        let n9 = try_or (fn (u: unit) -> file_readlink p a 65536) (0 - 2) in
+        if n9 < 0 then false
+        else
+          (let t = mem_to_str a n9 in
+           let nxt = (if str_len t > 0 && str_eq (char_at t 0) "/" then t else dirname_of p ++ "/" ++ t) in
+           fs_sym_loop nxt (n + 1))))
+and fs_absent_name = fn (path: str) ->
+  let rec chop = fn (d: str) ->
+    if str_len d > 1 && str_eq (char_at d (str_len d - 1)) "/" then chop (substring d 0 (str_len d - 1)) else d in
+  let d0 = chop path in
+  if (if str_eq d0 path then false else true) && file_exists d0 && (if dir_there d0 then false else true) then "ENOTDIR"
+  else if fs_sym_loop path 0 then "ELOOP"
+  else
+    // the nearest prefix that is there (by lstat too: a dangling link counts)
+    (let rec up = fn (d: str) ->
+       if file_exists d || fs_mode d false >= 0 then d
+       else (let u = dirname_of d in if str_eq u d then d else up u) in
+     let anc = up (dirname_of d0) in
+     if str_eq anc d0 then "ENOENT"
+     else if file_exists anc && (if dir_there anc then false else true) then "ENOTDIR"
+     else if dir_there anc && (if fs_access anc "-x" then false else true) then "EACCES"
+     else "ENOENT")
+and fs_absent_raise = fn world -> fn (fn9: str) -> fn (p: str) ->
+  let nm = fs_absent_name p in
+  dir_raise_p world ("Errno::" ++ nm) (errno_desc nm ++ " @ " ++ fn9 ++ " - ") p
+and raise_sysopen_absent = fn world -> fn (path: str) -> fn (penc: str) ->
+  let nm = fs_absent_name path in
+  raise_sysopen world ("Errno::" ++ nm) (errno_desc nm) path penc
 // a FIFO opened to write, while other threads run: wait (a millisecond at a
 // time, letting them run) until one of them has opened it to read. True when
 // one has; false at once when nothing else could.
@@ -14682,11 +14727,11 @@ and file_open_obj = fn world -> fn (args: Val list) ->
   //  file above, before this asks)
   else if str_len mode > 0 && str_eq (char_at (file_mode_head mode) 0) "r"
      && (if file_exists path then false else true) then
-    raise_sysopen world "Errno::ENOENT" "No such file or directory" path (file_arg_enc args)
+    raise_sysopen_absent world path (file_arg_enc args)
   // an integer mode without O_CREAT opens only a file that is there
   else if (match args with Cons (_, Cons (VInt n9, _)) -> (n9 / 512) - (n9 / 1024) * 2 == 0 | _ -> false)
      && (if existed0 then false else true) then
-    raise_sysopen world "Errno::ENOENT" "No such file or directory" path (file_arg_enc args)
+    raise_sysopen_absent world path (file_arg_enc args)
   // the access the file's permissions refuse is EACCES at the open (the
   // write or read that followed failed with no errno at all)
   else if existed0 && (if str_eq (char_at (file_mode_head mode) 0) "r" && (if str_contains mode "+" then false else true)
@@ -14717,7 +14762,12 @@ and file_open_obj = fn world -> fn (args: Val list) ->
     // file_exists answers true for a directory, so the parent is the whole test,
     // and it costs no subprocess (`run` is a constant 127 in the Wasm build).
     if creating && (if file_exists (dirname_of path) then false else true) then
-      raise_sysopen world "Errno::ENOENT" "No such file or directory" path (file_arg_enc args)
+      raise_sysopen_absent world path (file_arg_enc args)
+    // (a directory that is there and cannot be written: open(2)'s EACCES for
+    //  the file it would make -- the primitive write failed below the level
+    //  that has a ruby exception, "error (StandardError)")
+    else if creating && (if existed0 then false else true) && (if fs_access (dirname_of path) "-w" then false else true) then
+      raise_sysopen world "Errno::EACCES" "Permission denied" path (file_arg_enc args)
     // ⚠ A DEVICE IS OPENED AT THE OPEN, because opening one is where it can
     //   refuse: /dev/tty with no controlling terminal exists and cannot be
     //   opened, and the lazy descriptor (file_fd_of) let File.open succeed and
