@@ -420,6 +420,11 @@ let parse_lshift = map_new ();
 // eval's tokens are numbered from its line argument, its text from 1)
 let lshift_tok = fn (u: unit) -> if map_has parse_lshift "n" then map_get parse_lshift "n" else 0;
 let lshift_lex = fn (u: unit) -> lshift_tok () + (if map_has parse_lshift "b" then map_get parse_lshift "b" else 0);
+// a lexer's warning at byte i of s, with that byte's line (rare: the count
+// walks the source up to i) -- shifted as a token's line is, for an eval
+let lex_warn_at = fn (s: str) -> fn (i: int) -> fn (what: str) ->
+  let rec nls = fn (k: int) -> fn (n: int) -> (if k >= i then n else nls (k + 1) (if str_eq (char_at s k) "\n" then n + 1 else n)) in
+  warn_note (parse_time_file () ++ ":" ++ str_of_int (nls 0 1 + lshift_lex ()) ++ ": warning: " ++ what);
 // a character literal a \u escape spelled: UTF-8 whatever the source's
 // encoding, as a string's is (the `(s ... )u8` shape lex_dstr makes)
 let lex_u8_char = fn (bytes: str) -> fn rest ->
@@ -658,7 +663,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
                 && (if map_has globals "VERBOSE" && (match map_get globals "VERBOSE" with VNil -> true | _ -> false) then false else true)
              then warn_note (parse_time_file () ++ ":" ++ str_of_int (nls_before s i 0 1 + lshift_lex ()) ++ ": warning: encountered \\r in middle of line, treated as a mere space")
              else ()) in
-    if str_eq c " " || str_eq c "\t" || str_eq c "\r" then lex_go s (i + 1)
+    if str_eq c " " || str_eq c "\t" || str_eq c "\r" || ord c == 11 || ord c == 12 then lex_go s (i + 1)
     // NUL, ^D and ^Z where a token would start end the script, as they do for
     // ruby; inside a comment or a string literal they are bytes like any
     // other (see src_prepare, which used to cut at the first NUL anywhere).
@@ -758,7 +763,10 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
              && (k + 1 >= str_len s || (let nc = char_at s (k + 1) in if num_sfx_blocked nc then false else true)) then
             Cons (TImagF (float_of_str (strip_us (substring s i k) 0 "")), lex_go s (k + 1))
           else
-            Cons (TFlt (float_of_str (strip_us (substring s i k) 0 "")), lex_go s k)
+            (let f9 = float_of_str (strip_us (substring s i k) 0 "") in
+             let _ = (if f9 > 1.7976931348623157e308 && parse_verbose () then
+                        lex_warn_at s i ("Float " ++ substring s i k ++ " out of range") else ()) in
+             Cons (TFlt f9, lex_go s k))
         else
           let je = scan_exponent s j in
           let _ = num_us_refuse s j je in
@@ -889,6 +897,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
         else
         tapp (Cons (TP "(s", Cons (TStrL "", segs))) (Cons (TP ")u8", lex_go s j))
       else
+      let _ = ascii_src_check s (i + 1) (j - 1) in
       (match segs with
        | Cons (TP plus, Cons (TStrL lit, Nil)) ->
          if str_eq plus "+" then Cons (TStrL lit, lex_go s j)
@@ -896,6 +905,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
        | _ -> tapp (Cons (TP "(s", Cons (TStrL "", segs))) (Cons (TP ")", lex_go s j)))
     else if str_eq c "'" then
       let (lit, j) = lex_sq s (i + 1) "" in
+      let _ = ascii_src_check s (i + 1) (j - 1) in
       Cons (TStrL lit, lex_go s j)
     // `cmd` — a command literal: a call to the ` method with the interpolated
     // string (Kernel#` is a stub; specs override it via define_method(:`)).
@@ -1042,12 +1052,14 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
           else if str_eq cj "=" && str_eq nj "=" && j0 + 2 < str_len s && str_eq (char_at s (j0 + 2)) ">" then j0 + 1
           else j0
         else j0 in
+      let _ = ascii_src_check s (i + 1) j in
       Cons (TSym (sym_note_lex (substring s (i + 1) j)), lex_go s j)
     else if str_eq c ":" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "'"
             && colon_opens_sym s i && (if colon_after_value s i then false else true) then
       // :'quoted symbol' -- unless the colon closes a label, in which case
       // `{x:'true'}` is the key x and the STRING 'true'.
       let (lit, j) = lex_sq s (i + 2) "" in
+      let _ = ascii_src_check s (i + 2) (j - 1) in
       Cons (TSym (sym_note_lex lit), lex_go s j)
     else if str_eq c ":" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "@" && str_eq (char_at s (i + 2)) "@" then
       let j = scan_ident s (i + 3) in
@@ -1120,9 +1132,27 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
       // escapes (\n and \t) and dropped the backslash from every other one, so
       // `:"\0"` was the symbol "0" and `:"\x01"` the symbol "x01" -- a second
       // copy of a rule the string scanner already had, three escapes wide.
-      else (match lex_dstr_t "\"" s (i + 2) "" with
-            | (Cons (TP _, Cons (TStrL lit9, Nil)), j9) -> Cons (TSym (sym_note_lex lit9), lex_go s j9)
-            | (_, _) -> Cons (TSym (sym_note_lex (dq_unescape body 0)), lex_go s (close + 1)))
+      else
+      let _ = ascii_src_check s (i + 2) close in
+      // (a \u escape for a non-ASCII character, or a byte escape past
+      //  ASCII, gives the symbol a double-quoted STRING's encoding -- forced
+      //  UTF-8, binary in a US-ASCII source, the source's otherwise, and the
+      //  two together are "UTF-8 mixed within": the string's own rules, by
+      //  reading it as one and asking #to_sym -- test/prism's
+      //  symbol_encoding_test)
+      let u8 = lex_u8_escaped s (i + 2) close in
+      let cd0 = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
+      let utf8src = (str_eq cd0 "" || str_eq cd0 "UTF-8" || str_eq cd0 "UTF8") in
+      (match lex_dstr_t "\"" s (i + 2) "" with
+       | (Cons (TP _, Cons (TStrL lit9, Nil)), j9) when (if u8 then false else (utf8src || enc_all7 lit9)) -> Cons (TSym (sym_note_lex lit9), lex_go s j9)
+       | (_, _) ->
+         let (segs, j) = lex_dstr s (i + 2) "" in
+         let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
+         let mixed9 = (if u8 && (if str_eq cd "" || str_eq cd "UTF-8" || str_eq cd "UTF8" then false else true)
+                       then lex_mix_kind s (lex_segs s (i + 2) (j - 1)) false false "" else 0) in
+         let _ = (if mixed9 == 1 then syn_refuse ("UTF-8 mixed within " ++ enc_canon_name cd ++ " source") else ()) in
+         tapp (Cons (TP "(s", Cons (TStrL "", segs)))
+              (Cons (TP (if u8 then ")u8" else ")"), Cons (TP ".", Cons (TId "to_sym", lex_go s j)))))
     else if str_eq c "<" && i + 3 < str_len s && str_eq (char_at s (i + 1)) "<"
             && (str_eq (char_at s (i + 2)) "~" || str_eq (char_at s (i + 2)) "-")
             && (is_alpha (char_at s (i + 3)) || str_eq (char_at s (i + 3)) "\"" || str_eq (char_at s (i + 3)) "'" || str_eq (char_at s (i + 3)) "`"
@@ -1320,10 +1350,11 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
          if two9 then Cons (TP " **", lex_go s (i + 2))
          else Cons (TP " *", lex_go s (i + 1)))
       else
-      let _ = (if str_eq three "..." && (let k9 = lvt_skip_sp s (i + 3) in k9 >= str_len s || str_eq (char_at s k9) "\n")
+      let _ = (if str_eq three "..." && (let k9 = lvt_skip_blank s (i + 3) in k9 >= str_len s || str_eq (char_at s k9) "\n" || str_eq (char_at s k9) "#")
                   && br_depth s i 0 0 <= 0
-                  // (a `def`'s paren-less `...` parameter is no range: `def foo ...`)
-                  && (if line_is_def s i then false else true)
+                  // (a `def`'s paren-less `...` parameter is no range: `def foo ...`;
+                  //  the BODY of an endless def, `def foo(...) = bar ...`, is)
+                  && (if line_is_def s i && (if def_eq_before s i then false else true) then false else true)
                then warn_note (parse_time_file () ++ ":" ++ str_of_int (nls_before s i 0 1 + lshift_lex ()) ++ ": warning: ... at EOL, should be parenthesized?")
                else ()) in
       if str_eq three "..." || str_eq three "||=" || str_eq three "&&=" ||
@@ -1387,6 +1418,30 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
                                     let k9 = ob pj in
                                     k9 < pj && k9 >= 0 && str_eq (char_at s k9) "." && (if k9 >= 1 && str_eq (char_at s (k9 - 1)) "." then false else true)))) then
           Cons (TP " (", lex_go s (i + 1))
+        // ` -x` / ` +x` (space before, none after) after a NAME that is no
+        // local, no keyword and no constant is the ARGUMENT's sign: `foo -1`
+        // is foo(-1), "ambiguous first argument" under -w (after a local or a
+        // literal it is the binary operator, with bal_warn's words). The token
+        // is " -", which the call parsers take and the operator layer reads
+        // as the plain operator when no call took it.
+        else if (str_eq c "-" || str_eq c "+") && i > 0 && (str_eq (char_at s (i - 1)) " " || str_eq (char_at s (i - 1)) "\t")
+                && i + 1 < str_len s
+                && (let nc = char_at s (i + 1) in
+                    if str_eq nc " " || str_eq nc "\t" || str_eq nc "\n" || str_eq nc "\r" || str_eq nc "=" || str_eq nc ">" || str_eq nc "@" then false
+                    else if str_eq nc c then false else true)
+                && (if lvt_prev_local s i then false else true)
+                && (if prev_is_lit s (prev_nonspace s (i - 1)) then false else true)
+                && (let pj = prev_nonspace s (i - 1) in
+                    pj >= 0 && (let pc = char_at s pj in is_alnum pc || str_eq pc "_" || str_eq pc "?" || str_eq pc "!")
+                    && (let wj = (let pc = char_at s pj in if str_eq pc "?" || str_eq pc "!" then pj - 1 else pj) in
+                        wj >= 0 && (is_alnum (char_at s wj) || str_eq (char_at s wj) "_")
+                        // (a capitalized name too: `A -1` is the call A(-1)
+                        //  to ruby, "undefined method 'A'")
+                        && (let w = word_ending_at s wj in
+                            str_len w > 0 && (if is_digit (char_at w 0) then false else true)
+                            && (if lvt_is_kw w || str_eq w "defined?" then false else true))))
+                && (if after_def_name s i then false else true) then
+          (let _ = amb_first_arg_warn s i c in Cons (TP (" " ++ c), lex_go s (i + 1)))
         // ` &x` (space before, none after) directly after an expression-ending
         // token is a command-style block-pass argument (`recv.meth &blk`),
         // distinct from binary `a & b`/`a&b` and from a `, &blk` param/arg
@@ -1412,7 +1467,11 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
                     pj >= 0 && (let pc = char_at s pj in
                       is_alnum pc || str_eq pc "_" || str_eq pc "?" || str_eq pc "!"
                       || str_eq pc ")" || str_eq pc "]" || str_eq pc "\"")) then
-          (let _ = amb_prefix_warn s i "&" in Cons (TP " &", lex_go s (i + 1)))
+          // (`a &:sym` with a plain name is unambiguous: no warning, as ruby)
+          (let _ = (if i + 2 < str_len s && str_eq (char_at s (i + 1)) ":"
+                       && (let c2 = char_at s (i + 2) in is_alnum c2 || str_eq c2 "_" || str_eq c2 "\"" || str_eq c2 "'")
+                    then () else amb_prefix_warn s i "&") in
+           Cons (TP " &", lex_go s (i + 1)))
         else if is_punct1 c then
           (let _ = (if str_eq c "\{" then lvt_brace_open s (i + 1) else if str_eq c "}" then lvt_brace_close s i else ()) in
            Cons (TP c, lex_go s (i + 1)))
@@ -1654,6 +1713,16 @@ and lvt_newline = fn (u: unit) ->
 // lvt_is_kw)
 and lvt_skip_sp = fn (s: str) -> fn (k: int) ->
   if k < str_len s && (let o = ord (char_at s k) in o == 32 || o == 9) then lvt_skip_sp s (k + 1) else k
+// (...blanks of every kind but the newline: a tab, a vertical tab, a form feed)
+and lvt_skip_blank = fn (s: str) -> fn (k: int) ->
+  if k < str_len s && (let o = ord (char_at s k) in o == 32 || o == 9 || o == 11 || o == 12 || o == 13) then lvt_skip_blank s (k + 1) else k
+// is there a ` = ` between the line's `def` and offset i (an endless def's body)?
+and def_eq_before = fn (s: str) -> fn (i: int) ->
+  let rec go = fn (k: int) ->
+    (if k + 2 >= i then false
+     else if str_eq (char_at s k) " " && str_eq (char_at s (k + 1)) "=" && str_eq (char_at s (k + 2)) " " then true
+     else go (k + 1)) in
+  go (line_start s i)
 and lvt_skip_ws = fn (s: str) -> fn (k: int) ->
   if k < str_len s && (let o = ord (char_at s k) in o == 32 || o == 9 || o == 10 || o == 13) then lvt_skip_ws s (k + 1) else k
 and lvt_prev = fn (s: str) -> fn (k: int) ->
@@ -2209,6 +2278,14 @@ and lex_raw_nonascii = fn (s: str) -> fn (i: int) -> fn (e: int) ->
   else lex_raw_nonascii s (i + 1) e
 // ...or a byte escape past ASCII (`\xE9`, `\351`): a byte of the file's
 // encoding, beside which a \u for a non-ASCII character cannot sit
+// a literal of a US-ASCII source holds no byte past ASCII: `'ą'` is ruby's
+// "invalid multibyte character 0xC4" (test/prism's encoding tests)
+and ascii_src_check = fn (s: str) -> fn (a: int) -> fn (b: int) ->
+  let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
+  if str_eq cd "US-ASCII" || str_eq cd "ASCII" || str_eq cd "USASCII" || str_eq cd "ANSI_X3.4-1968" || str_eq cd "646" then
+    (let rec go = fn (k: int) -> (if k >= b || k >= str_len s then () else if ord (char_at s k) >= 128 then lex_bad_mb_refuse s k else go (k + 1)) in
+     go a)
+  else ()
 and lex_esc_nonascii = fn (s: str) -> fn (i: int) -> fn (e: int) ->
   if i + 1 >= e then false
   else if (if str_eq (char_at s i) "\\" then false else true) then lex_esc_nonascii s (i + 1) e
@@ -2216,6 +2293,8 @@ and lex_esc_nonascii = fn (s: str) -> fn (i: int) -> fn (e: int) ->
     (let v = hex_val (char_at s (i + 2)) in
      let (v, k) = (if i + 3 < e && is_hex_digit (char_at s (i + 3)) then (v * 16 + hex_val (char_at s (i + 3)), i + 4) else (v, i + 3)) in
      if v >= 128 then true else lex_esc_nonascii s k e)
+  // (`\M-x` sets the high bit: a byte past ASCII as `\xFF` is)
+  else if str_eq (char_at s (i + 1)) "M" && i + 2 < e && str_eq (char_at s (i + 2)) "-" then true
   else if ord (char_at s (i + 1)) >= 48 && ord (char_at s (i + 1)) <= 55 then
     (let rec oc = fn (k: int) -> fn (v: int) -> fn (n: int) ->
        (if n < 3 && k < e && ord (char_at s k) >= 48 && ord (char_at s k) <= 55 then oc (k + 1) (v * 8 + ord (char_at s k) - 48) (n + 1) else (v, k)) in
@@ -3603,7 +3682,14 @@ and prev_nonspace = fn (s: str) -> fn (i: int) ->
 and amb_prefix_warn = fn (s: str) -> fn (i: int) -> fn (op: str) ->
   if parse_verbose () && (if after_def_name s i || prev_word_kw s i then false else true) then
     warn_note (parse_time_file () ++ ":" ++ str_of_int (nls_before s i 0 1 + lshift_lex ())
-               ++ ": warning: ambiguous `" ++ op ++ "` has been interpreted as an argument prefix")
+               ++ (if map_has cli_opt "evfile" then ": warning: '" ++ op ++ "' interpreted as argument prefix"
+                   else ": warning: ambiguous `" ++ op ++ "` has been interpreted as an argument prefix"))
+  else ()
+and amb_first_arg_warn = fn (s: str) -> fn (i: int) -> fn (op: str) ->
+  if parse_verbose () then
+    warn_note (parse_time_file () ++ ":" ++ str_of_int (nls_before s i 0 1 + lshift_lex ())
+               ++ (if map_has cli_opt "evfile" then ": warning: ambiguous first argument; put parentheses or a space even after '" ++ op ++ "' operator"
+                   else ": warning: ambiguous first argument; put parentheses or a space even after `" ++ op ++ "` operator"))
   else ()
 // is the word before the space at i a keyword (`def &(n)`, `yield *a`)?
 and prev_word_kw = fn (s: str) -> fn (i: int) ->
@@ -4749,7 +4835,7 @@ and paren_seq = fn toks -> fn (acc: Stmt list) ->
 and parse_andor = fn toks ->
   match toks with
   | Cons (TId w, r) ->
-    if str_eq w "not" then let (e, r2) = parse_expr r in parse_andor_more (EUn ("!", e)) r2
+    if str_eq w "not" then let (e, r2) = parse_expr r in let _ = asgn_cond_warn e in parse_andor_more (EUn ("!", e)) r2
     else let (e, r2) = parse_expr toks in parse_andor_more e r2
   | _ -> let (e, r) = parse_expr toks in parse_andor_more e r
 
@@ -4841,7 +4927,7 @@ and is_cmp_op = fn (op: str) -> str_eq op "<" || str_eq op "<=" || str_eq op ">"
 and parse_more = fn (lhs: Expr) -> fn toks -> fn (minp: int) ->
   match toks with
   // (a splat mark no command took is the operator it is spelled as)
-  | Cons (TP sp9, rest) when str_eq sp9 " *" || str_eq sp9 " **" ->
+  | Cons (TP sp9, rest) when str_eq sp9 " *" || str_eq sp9 " **" || str_eq sp9 " -" || str_eq sp9 " +" ->
     parse_more lhs (Cons (TP (substring sp9 1 (str_len sp9)), rest)) minp
   | Cons (TP op, rest) ->
     let p = prec_of op in
@@ -4935,6 +5021,7 @@ and parse_unary = fn toks ->
          let (e, r) = parse_unary rest in (EUn (op, e), r)
        | _ ->
          (let (b, r) = parse_postfix rest in
+          let _ = (if str_eq op "!" then asgn_cond_warn b else ()) in
           let u = EUn (op, b) in
           match r with
           | Cons (TP p2, rest2) when str_eq p2 "**" ->
@@ -5462,6 +5549,7 @@ and starts_bare_arg = fn toks ->
   // `f !x` can only be a negated argument: a method named f! lexes as one
   // token, and `a ! b` is not Ruby.
   | Cons (TP p, _) -> str_eq p "(s" || str_eq p "~" || str_eq p "!" || str_eq p "->" || str_eq p " ::" || str_eq p " *" || str_eq p " **"
+                      || str_eq p " -" || str_eq p " +"
   | _ -> false
 
 // A trailing `&:sym` block-pass arg becomes a real one-param block
@@ -6096,9 +6184,9 @@ and parse_primary = fn toks ->
       // (the operand may be on the next line: `not foo and not` / `bar`)
       (match r with
        | Cons (TP lp, _) ->
-         if str_eq lp "(" then let (e, r2) = parse_primary r in (EUn ("!", e), r2)
-         else let (e, r2) = parse_expr r in (EUn ("!", e), r2)
-       | _ -> let (e, r2) = parse_expr (skip_nls r) in (EUn ("!", e), r2))
+         if str_eq lp "(" then let (e, r2) = parse_primary r in let _ = asgn_cond_warn e in (EUn ("!", e), r2)
+         else let (e, r2) = parse_expr r in let _ = asgn_cond_warn e in (EUn ("!", e), r2)
+       | _ -> let (e, r2) = parse_expr (skip_nls r) in let _ = asgn_cond_warn e in (EUn ("!", e), r2))
     // (`foo(alias x y)`: a statement where a value is due)
     else if str_eq id "alias" || str_eq id "undef" then
       (let _ = syn_refuse ("unexpected an `" ++ id ++ "` at a non-statement position") in (ENil, r))
@@ -6319,7 +6407,7 @@ and parse_primary = fn toks ->
             else (ECall (id, es), r2b))
          // `q *a` / `q **h`: a splat first argument (see cmd_star), and the
          // `do` after the arguments is the command's, as for any argument
-         else if (str_eq p " *" || str_eq p " **" || str_eq p " &")
+         else if (str_eq p " *" || str_eq p " **" || str_eq p " &" || str_eq p " -" || str_eq p " +")
                  // (`_1 **2` -- a numbered parameter is a variable, and the
                  //  star its operator: whitequark's numparam_ruby_bug_19025)
                  && (if str_len id == 2 && str_eq (char_at id 0) "_" && is_digit (char_at id 1) then false else true) then
@@ -7071,7 +7159,8 @@ and parse_puts_args_go = fn toks -> fn (acc: Expr list) ->
   // collect into one Hash argument, like the parenthesized form.
   // (a command's marked first splat, see cmd_star, is the plain one here)
   let toks = (match toks with
-              | Cons (TP sp9, r9) when str_eq sp9 " *" || str_eq sp9 " **" || str_eq sp9 " &" -> Cons (TP (substring sp9 1 (str_len sp9)), r9)
+              | Cons (TP sp9, r9) when str_eq sp9 " *" || str_eq sp9 " **" || str_eq sp9 " &" || str_eq sp9 " -" || str_eq sp9 " +" ->
+                Cons (TP (substring sp9 1 (str_len sp9)), r9)
               | _ -> toks) in
   match toks with
   | Cons (TId kname, Cons (TP colon, r0)) ->
@@ -7363,6 +7452,17 @@ and parse_stmts = fn toks -> fn (acc: Stmt list) ->
 // in Rational`, `return input if input in Literal | Literal8` (net-imap): a
 // one-line pattern test is a condition like any other boolean, in the
 // statement form and the modifier form alike.
+// `if` / `unless` / `elsif` with its condition on the NEXT line: ruby reads
+// on and says so under -w ("'if' at the end of line without an expression")
+and kw_eol_skip = fn toks -> fn (kw: str) ->
+  match toks with
+  | Cons (TNL ln9, _) ->
+    (let _ = (if parse_verbose () then
+                warn_note (parse_time_file () ++ ":" ++ str_of_int (ln9 + lshift_tok ())
+                           ++ ": warning: '" ++ kw ++ "' at the end of line without an expression")
+              else ()) in
+     skip_nls toks)
+  | _ -> toks
 and cond_in_pattern = fn (cr: (Expr * Tok list)) ->
   let (c, r) = cr in
   match r with
@@ -8339,7 +8439,7 @@ and parse_stmt_id = fn toks ->
                   else ()) in
          // (END inside a method is legal and ruby warns about it)
          let _ = (if str_eq id "END" && map_has def_depth "n" && map_get def_depth "n" > 0
-                  then print_err ((let f9 = parse_time_file () in if str_eq f9 "" then "-" else f9)
+                  then warn_note ((let f9 = parse_time_file () in if str_eq f9 "" then "-" else f9)
                                   ++ ":" ++ str_of_int (tok_line r + (if map_has parse_lshift "n" then map_get parse_lshift "n" else 0))
                                   ++ ": warning: END in method; use at_exit")
                   else ()) in
@@ -9197,6 +9297,13 @@ and defined_assign_go = fn toks -> fn (depth: int) ->
   | Cons (TId w, r) when str_eq w "end" -> (if depth == 0 then false else defined_assign_go r (depth - 1))
   | Cons (_, r) -> defined_assign_go r depth
 
+// `!(a = 2)` and `not a = 2`: the operand is a condition, and an assignment
+// of a literal there is ruby's "found '= literal' in conditional"
+and asgn_cond_warn = fn (e: Expr) ->
+  match lit_untag e with
+  | EAssign (_, v) -> (if cond_static v then cond_warn "found '= literal' in conditional, should be ==" else ())
+  | EStmt (SMultiAssign (_, vs)) -> (if cond_static_all vs then cond_warn "found '= literal' in conditional, should be ==" else ())
+  | _ -> ()
 and cond_ff = fn (e: Expr) ->
   match e with
   | ERange (a, b, excl) ->
@@ -9228,6 +9335,12 @@ and cond_ff = fn (e: Expr) ->
   // __FILE__ is a string literal; an integer (and __LINE__) is a literal
   | EVar n when str_len n >= 8 && str_eq (substring n 0 8) "__FILE__" -> let _ = cond_warn "string literal in condition" in e
   | EInt _ -> let _ = (if parse_verbose () then cond_warn "literal in condition" else ()) in e
+  | EFlt _ -> let _ = (if parse_verbose () then cond_warn "literal in condition" else ()) in e
+  | ERat _ -> let _ = (if parse_verbose () then cond_warn "literal in condition" else ()) in e
+  | EImag _ -> let _ = (if parse_verbose () then cond_warn "literal in condition" else ()) in e
+  | EImagF _ -> let _ = (if parse_verbose () then cond_warn "literal in condition" else ()) in e
+  | EImagRat _ -> let _ = (if parse_verbose () then cond_warn "literal in condition" else ()) in e
+  | EVar n when str_len n >= 12 && str_eq (substring n 0 12) "__ENCODING__" -> let _ = (if parse_verbose () then cond_warn "literal in condition" else ()) in e
   // the interpolated forms: "a#{x}" (pieces joined by __interp_str), its
   // `.to_sym`, and a regexp built with `.__regex` -- which matches $_
   | EMethod (x, m, _) ->
@@ -9338,6 +9451,7 @@ and ff_operand = fn (e: Expr) ->
   | _ -> if cond_is_dstr e then (let _ = cond_warn "string literal in flip-flop" in e) else e
 
 and parse_if = fn toks -> fn (negate: bool) ->
+  let toks = kw_eol_skip toks (if negate then "unless" else "if") in
   let (cond1, r0) = cond_in_pattern (parse_andor toks) in
   // `if x = compute rescue next` -- the rescue modifier binds tighter than the
   // `if`, so the CONDITION is `(x = compute) rescue next` (activesupport's
@@ -9368,7 +9482,7 @@ and parse_if_tail = fn toks ->
       // `and` / `or` (racc's generated parsers are written that way).
       let eln = tok_line toks in
       // (`elsif x in pat` is a one-line pattern test, as `if x in pat` is)
-      let (c0, r2) = cond_in_pattern (parse_andor r) in
+      let (c0, r2) = cond_in_pattern (parse_andor (kw_eol_skip r "elsif")) in
       let c = cond_ff_at r2 c0 in
       let (b, r3) = parse_stmts (let _ = then_check "expected `then` or `;` or '\\n'" r2 in skip_then r2) Nil in
       let (clauses, els, r4) = parse_if_tail r3 in

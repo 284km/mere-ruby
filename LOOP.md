@@ -1730,3 +1730,59 @@ too, so 11), 23 accepted (3 are version-gated, so 20).
   test_keyword show EXTRA because the reference side needs the `-test-`
   C extensions this tree never built. Build 60 s; 14 builds in the
   round.
+
+## 2026-11-08: what test/prism's encoding and warnings tests found -- vcalls, instance_eval's constants, a symbol's escapes, the sign after a name, and parsing as a file
+
+Note 511's stage 3 again, from note 512 §4's "encodings 15" and
+"warnings_test 13": test/prism/encoding (encodings 10, string 16, symbol 8)
+and test/prism/result/warnings_test (29). Before: 2 / 13 / 4 / 16. After:
+all of them (63/63). Each is a line of corpus/502.
+
+- **A bare name an object's class answers through method_missing.**
+  `def f; zzz; end` with a `method_missing` was "undefined local variable
+  or method": the zero-argument self-call asked `respond_to?` (so a class
+  with respond_to_missing? worked) and never method_missing itself. ruby's
+  vcall asks it whatever respond_to? says. encodings_test evals every
+  identifier of an encoding against a BasicObject whose method_missing
+  answers the name -- `_0`, `p`, each letter -- and a bare `p` on a
+  BasicObject goes there too, not to Kernel#p.
+- **A constant in a string instance_eval'd on an object** is looked up
+  through the object's class (its cref is the singleton class), so that
+  class's `const_missing` answers before the NameError. The block form
+  keeps the enclosing scope, as ruby's does.
+- **A quoted symbol's encoding follows its escapes**, as a double-quoted
+  string's does: `\u{80}` forces UTF-8, `\x80` in a US-ASCII source is
+  binary, in a Windows-1253 source the source's, and `\x80\u{80}` in any
+  non-UTF-8 source is "UTF-8 mixed within". The lexer reads such a `:"..."`
+  as the string and `.to_sym` -- one rule, the string's. `\M-x` counts as
+  a byte past ASCII (`"\u{80}\M-\C-?"` is the same refusal). A byte past
+  ASCII in a US-ASCII source's string or symbol literal is "invalid
+  multibyte character 0xC4", as prism says it.
+- **`foo -1` is foo(-1).** After a name that is no local, no keyword and no
+  literal, ` -x` / ` +x` (space before, none after) is the argument's
+  sign -- ruby's "ambiguous first argument; put parentheses or a space"
+  under -w -- where after a local or a literal it stays the operator. It
+  was the operator everywhere: `foo -1` called foo() and subtracted. A
+  capitalized name too (`A -1` is "undefined method 'A'"). The lexer
+  marks it " -" as it marks " *"; the call parsers take it and the
+  operator layer reads it as the plain operator when no call did.
+- **RubyVM::AbstractSyntaxTree.parse reads its source as a file.** It ran
+  the eval behind ISeq.compile's syntax check, whose warnings are an
+  eval's: no unused variables, no void statements, no indentation check.
+  A flag the shim sets ("evfile") makes that one eval parse as a file,
+  under the name "(none)" as ruby's does, with prism's wording for the
+  two ambiguity warnings there ("'&' interpreted as argument prefix";
+  ruby's own files and evals keep "ambiguous `&` has been interpreted",
+  which corpus/345 pins). And the warnings that were missing or went to
+  the wrong place: "END in method" wrote to fd 2 past a swapped $stderr
+  (warn_note now); "Float ... out of range" only for a float without a
+  fraction; `if` / `unless` / `elsif` with the condition on the next line
+  was a SyntaxError ("'if' at the end of line without an expression");
+  "literal in condition" for a Float, Rational, Complex and __ENCODING__;
+  "found '= literal' in conditional" under `!` and `not`; `... at EOL`
+  with a comment or a form feed after it, and in an endless def's body;
+  `\v` and `\f` are whitespace; `a &:sym` warns nothing.
+- **Checked**: corpus 510/510 both ways, 502 under GC_STRESS=50, the 10
+  gates, and the unittest groups at their known counts (syntax 168, parse
+  102, eval 39, object 65, ast 1706, string 439, symbol 59, m17n 126,
+  float 63, method 97, module 192, class 60, among others). 8 builds.
