@@ -402,13 +402,15 @@ Keep 20,000 strings across 20 collections, check every value, mutate a subset,
 and collect and check them again. Compaction now copies a live string page
 only after allocation or mutation changed it; completely dead pages still
 return to the pool. The mutation flag is separate from byte-accounting
-dirtiness, which can be cleared between collections. Deferred compaction
-retains the flag until compaction is safe. Retired arenas remain managed by
-the runtime's global retirement list.
+dirtiness, which can be cleared between collections. The flag is cleared
+only when compaction reduces the page's capacity: the compiler's unit result
+does not distinguish a copy from a pin-induced deferral. Deferred and
+equal-capacity compactions therefore remain pending for another collection.
+Retired arenas remain managed by the runtime's global retirement list.
 
 On Apple silicon at O2 with Mere `991f299b`, compared with `a4eb486`
-(2026-11-07), two runs changed the timed collections from 0.069–0.077 seconds
-to 0.038–0.040 seconds. Both validation checks match Ruby 4.0.9. This measures
+(2026-11-07), two runs changed the timed collections from 0.057–0.058 seconds
+to 0.035–0.039 seconds. Both validation checks match Ruby 4.0.9. This measures
 the collection workload, not whole-process or CI duration.
 
 ## `exit_gc_workload.rb`
