@@ -1238,7 +1238,8 @@ class Date
       when 2, 3
         ajd, vof, vsg = (a.size == 2 ? [a[0] - Rational(1, 2), 0, a[1]] : a)
         vsg = (vsg ? Date::GREGORIAN : Date::JULIAN) unless vsg.is_a?(Numeric)
-        t = (ajd + Rational(1, 2) + vof) * 86400
+        # (the old shapes' ajd is UTC, as the six-field one's jd and df are)
+        t = (ajd + Rational(1, 2)) * 86400
         j = (t / 86400).floor
         secs = t - j * 86400
         [j, secs.floor, (secs - secs.floor) * 1_000_000_000, (vof * 86400).round, vsg]
@@ -1295,6 +1296,1224 @@ class DateTime < Date
   end
 end
 
+
+# ===========================================================================
+# THE MODEL, ONCE, for Date and DateTime alike (date_core.c's, read back).
+#
+# Every instance holds the same five things, as ruby's ComplexDateData does,
+# but LOCAL rather than UTC:
+#
+#   @jd     the Julian Day on the local clock (an Integer, any size)
+#   @df     the seconds into that day, 0...86400
+#   @sf     the fraction of that second, a Rational in [0, 1)
+#   @of     the offset from UTC in whole seconds (-86400..86400)
+#   @start  the calendar reform, a Float (a Julian Day, or +-Infinity)
+#
+# and @year/@month/@day, the civil date of @jd read on @start's calendar.
+# A Date is the same object with @df, @sf and @of zero -- until arithmetic
+# gives it a fraction, which ruby keeps (`Date.new(2004,9,19) + 1r/2` has a
+# day_fraction of 1/2). Every instance has the same eight instance
+# variables, so a DateTime overwritten by initialize_copy from a Date keeps
+# its size (test_memsize).
+#
+# ⚠ THE LAYERS ABOVE HELD FOUR SHAPES. A Date had @jd and the civil fields;
+#   a DateTime had those plus @hour/@minute/@second/@sec_frac/@offset; the
+#   calendar was right for Date.new and ignored by DateTime.new (whose
+#   `start` was never passed down), so DateTime.new(..., Date::JULIAN) was a
+#   Gregorian date and test_period2 was 80 quintillion days out; arithmetic
+#   built through Date.jd / DateTime.new by NAME, so a DateSub + 1 was a Date
+#   and a DateTime + 1/2 lost its fraction of a second. Everything below
+#   builds through `self.class.allocate.__init`.
+# ===========================================================================
+class Date
+  # ⚠ ONE GUARD for every `start` argument (date_core's val2sg): a number,
+  #   +-Infinity or a Julian Day inside ruby's reform window; anything else
+  #   is warned about and replaced by ITALY. nil is ITALY too: the shim's own
+  #   callers pass it for "the default".
+  def self.__sg(sg)
+    return ITALY.to_f if sg.nil?
+    raise TypeError, "no implicit conversion to float from #{sg.class}" unless sg.is_a?(Numeric)
+    f = sg.to_f
+    if f.nan? || (!f.infinite? && (f < 2298874 || f > 2426355))
+      warn("warning: invalid start is ignored") if $VERBOSE
+      return ITALY.to_f
+    end
+    f
+  end
+
+  def self.__num!(v, name)
+    raise TypeError, "invalid #{name} (not numeric)" unless v.is_a?(Numeric)
+    v
+  end
+
+  def self.__int(v) = v.is_a?(Integer) ? v : v.to_i
+
+  def self.__whole?(v)
+    case v
+    when Integer then true
+    when Float then v.finite? && v.round == v
+    when Rational then v.denominator == 1
+    else false
+    end
+  end
+
+  # the whole part of an argument and what it leaves over, IN DAYS (`unit`
+  # is how many of the argument make a day: 24 hours, 1440 minutes ...),
+  # as d_trunc / h_trunc / min_trunc / s_trunc split them
+  def self.__trunc(v, unit)
+    return [v, 0] if v.is_a?(Integer)
+    return [v.to_i, 0] if __whole?(v)
+    i = v.div(1)
+    fr = v % 1
+    fr = fr.quo(unit) if unit != 1
+    [i, fr]
+  end
+
+  # --- the calendars, every question asked of a `start` --------------------
+  # A civil date is valid when it goes to a Julian Day and comes back the
+  # same (1582-10-10 does not, under ITALY). A negative month counts back
+  # from December, a negative day from the month's last day -- the last day
+  # THAT EXISTS, which c_find_ldom finds by trying 31, 30, ...
+  def self.__valid_civil_jd(y, m, d, sg)
+    m += 13 if m < 0
+    return nil if m < 1 || m > 12
+    if d < 0
+      l = __find_ldom(y, m, sg)
+      return nil if l.nil?
+      y2, m2, d2 = jd_to_civil(l + d + 1, sg)
+      return nil unless y2 == y && m2 == m
+      d = d2
+    end
+    jd = civil_to_jd(y, m, d, sg)
+    y2, m2, d2 = jd_to_civil(jd, sg)
+    return nil unless y2 == y && m2 == m && d2 == d
+    jd
+  end
+
+  def self.__find_ldom(y, m, sg)
+    d = 31
+    while d > 0
+      j = __valid_civil_jd(y, m, d, sg)
+      return j if j
+      d -= 1
+    end
+    nil
+  end
+
+  # the first and last days of a year, which the reform can move
+  def self.__fdoy(y, sg)
+    g = gregorian_to_jd(y, 1, 1)
+    return g if g >= sg
+    j = julian_to_jd(y, 1, 1)
+    return j if j < sg
+    d = 2
+    while d <= 30
+      jd = __valid_civil_jd(y, 1, d, sg)
+      return jd if jd
+      d += 1
+    end
+    nil
+  end
+
+  def self.__ldoy(y, sg)
+    i = 0
+    while i < 30
+      jd = __valid_civil_jd(y, 12, 31 - i, sg)
+      return jd if jd
+      i += 1
+    end
+    nil
+  end
+
+  def self.__jd_to_ordinal(jd, sg)
+    y = jd_to_civil(jd, sg)[0]
+    [y, jd - __fdoy(y, sg) + 1]
+  end
+
+  def self.__valid_ordinal_jd(y, d, sg)
+    if d < 0
+      l = __ldoy(y, sg)
+      return nil if l.nil?
+      y2, d2 = __jd_to_ordinal(l + d + 1, sg)
+      return nil unless y2 == y
+      d = d2
+    end
+    f = __fdoy(y, sg)
+    return nil if f.nil?
+    jd = f + d - 1
+    y2, d2 = __jd_to_ordinal(jd, sg)
+    return nil unless y2 == y && d2 == d
+    jd
+  end
+
+  # ISO weeks: week 1 holds the year's first Thursday (its 4th of January)
+  def self.__commercial_jd(y, w, d, sg)
+    r = __fdoy(y, sg) + 3
+    (r - r % 7) + 7 * (w - 1) + (d - 1)
+  end
+
+  def self.__jd_to_commercial(jd, sg)
+    a = jd_to_civil(jd - 3, sg)[0]
+    r = __fdoy(a + 1, sg) + 3
+    y = jd >= r - r % 7 ? a + 1 : a
+    r = __fdoy(y, sg) + 3
+    w = 1 + (jd - (r - r % 7)).div(7)
+    d = (jd + 1) % 7
+    [y, w, d == 0 ? 7 : d]
+  end
+
+  def self.__valid_commercial_jd(y, w, d, sg)
+    d += 8 if d < 0
+    if w < 0
+      y2, w2, _d2 = __jd_to_commercial(__commercial_jd(y + 1, 1, 1, sg) + w * 7, sg)
+      return nil unless y2 == y
+      w = w2
+    end
+    jd = __commercial_jd(y, w, d, sg)
+    y2, w2, d2 = __jd_to_commercial(jd, sg)
+    return nil unless y2 == y && w2 == w && d2 == d
+    jd
+  end
+
+  # %U / %W weeks (f = 0: weeks from Sunday, 1: from Monday), as strptime's
+  # fields name them
+  def self.__weeknum_jd(y, w, d, f, sg)
+    r = __fdoy(y, sg) + 6
+    (r - (r - f + 1) % 7 - 7) + 7 * w + d
+  end
+
+  def self.__jd_to_weeknum(jd, f, sg)
+    y = jd_to_civil(jd, sg)[0]
+    r = __fdoy(y, sg) + 6
+    j = jd - (r - (r - f + 1) % 7) + 7
+    [y, j.div(7), j % 7]
+  end
+
+  def self.__valid_weeknum_jd(y, w, d, f, sg)
+    d += 7 if d < 0
+    if w < 0
+      y2, w2, _d2 = __jd_to_weeknum(__weeknum_jd(y + 1, 1, f, f, sg) + w * 7, f, sg)
+      return nil unless y2 == y
+      w = w2
+    end
+    jd = __weeknum_jd(y, w, d, f, sg)
+    y2, w2, d2 = __jd_to_weeknum(jd, f, sg)
+    return nil unless y2 == y && w2 == w && d2 == d
+    jd
+  end
+
+  # the time of day as c_valid_time_p takes it: a negative field counts back
+  # from the end of the day, hour or minute, and 24:00:00 is allowed
+  def self.__valid_time(h, mi, s)
+    h += 24 if h < 0
+    mi += 60 if mi < 0
+    s += 60 if s < 0
+    return nil if h < 0 || h > 24 || mi < 0 || mi > 59 || s < 0 || s > 59 || (h == 24 && (mi > 0 || s > 0))
+    [h, mi, s]
+  end
+
+  # --- offsets --------------------------------------------------------------
+  # A zone name or a numeric offset, in seconds east of UTC, as
+  # date_zone_to_diff reads it; nil when it is neither.
+  def self.__zones
+    @__zones ||= begin
+      h = {}
+      __zone_src.join(";").split(";").each do |e|
+        k, v = e.split("=")
+        h[k] = v.to_i
+      end
+      h
+    end
+  end
+
+  def self.__zone_to_diff(str)
+    s = str.to_s
+    dst = false
+    low = s.downcase
+    if (m = /\A(.*?)\s+(standard|daylight)\s+time\z/.match(low))
+      low = m[1]
+      dst = m[2] == "daylight"
+      s = s[0, m[1].size]
+    elsif (m = /\A(.*?)\s+dst\z/.match(low))
+      low = m[1]
+      dst = true
+      s = s[0, m[1].size]
+    end
+    key = low.strip.gsub(/\s+/, " ")
+    if (o = __zones[key])
+      return dst ? o + 3600 : o
+    end
+    s = s[3..] if s.size > 3 && /\A(gmt|utc)/i.match?(s)
+    return nil unless s[0] == "+" || s[0] == "-"
+    neg = s[0] == "-"
+    s = s[1..]
+    hs = s[/\A\d*/]
+    rest = s[hs.size..]
+    if rest.start_with?(":")
+      hour = hs.to_i
+      return nil if hour > 23
+      rest = rest[1..]
+      ms = rest[/\A\d*/]
+      min = ms.to_i
+      return nil if min > 59
+      rest = rest[ms.size..]
+      sec = 0
+      if rest.start_with?(":")
+        sec = rest[1..][/\A\d*/].to_i
+        return nil if sec > 59
+      end
+      off = hour * 3600 + min * 60 + sec
+    elsif rest.start_with?(",") || rest.start_with?(".")
+      hour = hs.to_i
+      return nil if hour > 23
+      digits = rest[1..]
+      ds = digits[/\A\d*/][0, 7]
+      n = ds.size
+      sec = ds.to_i
+      nxt = digits[n]
+      sec += 1 if nxt && nxt >= (sec.odd? ? "5" : "6") && nxt <= "9"
+      sec *= 36
+      if neg
+        hour = -hour
+        sec = -sec
+      end
+      if n <= 2
+        sec *= 10 if n == 1
+        return sec + hour * 3600
+      end
+      r = Rational(sec, 10**(n - 2)) + hour * 3600
+      return r.denominator == 1 ? r.to_i : r
+    else
+      l = s.size
+      hour = hs.to_i
+      min = 0
+      sec = 0
+      if l > 2
+        hour = s[0, 2 - l % 2][/\A\d*/].to_i
+        min = s[2 - l % 2, 2].to_s[/\A\d*/].to_i if l >= 3
+        sec = s[4 - l % 2, 2].to_s[/\A\d*/].to_i if l >= 5
+      end
+      off = hour * 3600 + min * 60 + sec
+    end
+    neg ? -off : off
+  end
+
+  # offset_to_sec: a fraction of a day (-1, 0 and 1 for an Integer), or a
+  # String; nil for one out of range. Something that is not a number is a
+  # TypeError, and so is a Numeric whose to_r is not a Rational (it was a
+  # loop that never ended).
+  def self.__offset_to_sec(v)
+    case v
+    when Integer
+      return nil unless v == -1 || v == 0 || v == 1
+      v * 86400
+    when Float
+      n = v * 86400
+      return nil if n < -86400 || n > 86400
+      r = n.round
+      warn("warning: fraction of offset is ignored") if $VERBOSE && r != n
+      r
+    when String
+      s = __zone_to_diff(v)
+      return nil unless s.is_a?(Integer) && s >= -86400 && s <= 86400
+      s
+    else
+      raise TypeError, "expected numeric" unless v.is_a?(Numeric)
+      r = v.is_a?(Rational) ? v : v.to_r
+      r = r.to_r if r.is_a?(Integer)
+      raise TypeError, "wrong argument type #{r.class} (expected Rational)" unless r.is_a?(Rational)
+      secs = r * 86400
+      if secs.denominator == 1
+        n = secs.numerator
+      else
+        n = secs.round
+        warn("warning: fraction of offset is ignored") if $VERBOSE
+      end
+      return nil if n < -86400 || n > 86400
+      n
+    end
+  end
+
+  def self.__val2off(v)
+    o = __offset_to_sec(v)
+    if o.nil?
+      warn("warning: invalid offset is ignored") if $VERBOSE
+      o = 0
+    end
+    o
+  end
+
+  # --- building ---------------------------------------------------------------
+  def __init(jd, df, sf, of, sg)
+    @jd = jd
+    @df = df
+    @sf = sf
+    @of = of
+    @start = sg
+    @year, @month, @day = Date.jd_to_civil(jd, sg)
+    self
+  end
+
+  # the parts, for another instance's comparisons
+  def __df = @df
+  def __sf = @sf
+  def __of = @of
+  def __utc_day_secs = @jd * 86400 + @df - @of
+  def __utc_secs = @jd * 86400 + @df - @of + @sf
+
+  # (the earlier layers' setters, kept for any caller they had)
+  def __set_jd(n, start = ITALY) = __init(n, 0, Rational(0, 1), 0, Date.__sg(start))
+  def __set_time(h, mi, s)
+    t = h * 3600 + mi * 60 + s
+    @df = t.floor
+    @sf = (t - @df).to_r
+    self
+  end
+  def __set_offset(o)
+    @of = (o * 86400).round
+    self
+  end
+
+  def self.new(y = -4712, m = 1, d = 1, sg = ITALY)
+    sg = __sg(sg)
+    __num!(d, "day")
+    __num!(m, "month")
+    __num!(y, "year")
+    d, fr = __trunc(d, 1)
+    jd = __valid_civil_jd(__int(y), __int(m), d, sg)
+    raise Date::Error, "invalid date" if jd.nil?
+    r = allocate.__init(jd, 0, Rational(0, 1), 0, sg)
+    fr == 0 ? r : r + fr
+  end
+
+  def self.civil(y = -4712, m = 1, d = 1, sg = ITALY) = new(y, m, d, sg)
+
+  def self.jd(jd = 0, sg = ITALY)
+    sg = __sg(sg)
+    __num!(jd, "jd")
+    j, fr = __trunc(jd, 1)
+    r = allocate.__init(j, 0, Rational(0, 1), 0, sg)
+    fr == 0 ? r : r + fr
+  end
+
+  def self.ordinal(y = -4712, d = 1, sg = ITALY)
+    sg = __sg(sg)
+    __num!(d, "yday")
+    __num!(y, "year")
+    d, fr = __trunc(d, 1)
+    jd = __valid_ordinal_jd(__int(y), d, sg)
+    raise Date::Error, "invalid date" if jd.nil?
+    r = allocate.__init(jd, 0, Rational(0, 1), 0, sg)
+    fr == 0 ? r : r + fr
+  end
+
+  def self.commercial(y = -4712, w = 1, d = 1, sg = ITALY)
+    sg = __sg(sg)
+    __num!(d, "cwday")
+    __num!(w, "cweek")
+    __num!(y, "year")
+    d, fr = __trunc(d, 1)
+    jd = __valid_commercial_jd(__int(y), __int(w), d, sg)
+    raise Date::Error, "invalid date" if jd.nil?
+    r = allocate.__init(jd, 0, Rational(0, 1), 0, sg)
+    fr == 0 ? r : r + fr
+  end
+
+  def self.today(sg = ITALY)
+    sg = __sg(sg)
+    t = Time.now
+    allocate.__init(gregorian_to_jd(t.year, t.mon, t.mday), 0, Rational(0, 1), 0, sg)
+  end
+
+  def self.commercial_to_jd(y, w, d, sg = ITALY) = __commercial_jd(y, w, d, __sg(sg))
+
+  def self.valid_jd?(jd, _sg = ITALY) = jd.is_a?(Numeric)
+
+  def self.valid_civil?(y, m, d, sg = ITALY)
+    return false unless y.is_a?(Numeric) && m.is_a?(Numeric) && d.is_a?(Numeric)
+    !__valid_civil_jd(__int(y), __int(m), __int(d), __sg(sg)).nil?
+  end
+
+  def self.valid_ordinal?(y, d, sg = ITALY)
+    return false unless y.is_a?(Numeric) && d.is_a?(Numeric)
+    !__valid_ordinal_jd(__int(y), __int(d), __sg(sg)).nil?
+  end
+
+  def self.valid_commercial?(y, w, d, sg = ITALY)
+    return false unless y.is_a?(Numeric) && w.is_a?(Numeric) && d.is_a?(Numeric)
+    !__valid_commercial_jd(__int(y), __int(w), __int(d), __sg(sg)).nil?
+  end
+
+  class << self
+    alias_method :valid_date?, :valid_civil?
+  end
+
+  # --- what a set of parsed fields names (d_new_by_frags) ---------------------
+  # `seconds` (strptime's %s / %Q) becomes a day and a time of day ...
+  def self.__rewrite_frags(h)
+    seconds = h.delete(:seconds)
+    return h if seconds.nil?
+    seconds += h[:offset] if h[:offset]
+    d = seconds.div(86400)
+    fr = seconds % 86400
+    h[:jd] = 2440588 + d
+    h[:hour] = fr.div(3600)
+    fr %= 3600
+    h[:min] = fr.div(60)
+    fr %= 60
+    h[:sec] = fr.div(1)
+    h[:sec_fraction] = fr % 1
+    h
+  end
+
+  def self.__frag_tab
+    @__frag_tab ||= [
+      [:time, [:hour, :min, :sec]],
+      [nil, [:jd]],
+      [:ordinal, [:year, :yday, :hour, :min, :sec]],
+      [:civil, [:year, :mon, :mday, :hour, :min, :sec]],
+      [:commercial, [:cwyear, :cweek, :cwday, :hour, :min, :sec]],
+      [:wday, [:wday, :hour, :min, :sec]],
+      [:wnum0, [:year, :wnum0, :wday, :hour, :min, :sec]],
+      [:wnum1, [:year, :wnum1, :wday, :hour, :min, :sec]],
+      [nil, [:cwyear, :cweek, :wday, :hour, :min, :sec]],
+      [nil, [:year, :wnum0, :cwday, :hour, :min, :sec]],
+      [nil, [:year, :wnum1, :cwday, :hour, :min, :sec]]
+    ]
+  end
+
+  # ... and what is missing is taken from today, by the pattern the fields
+  # given fit best (rt_complete_frags)
+  def self.__complete_frags(klass, h)
+    k = nil
+    a = nil
+    e = 0
+    __frag_tab.each do |key, fields|
+      n = fields.count { |f| !h[f].nil? }
+      if n > e
+        e = n
+        k = key
+        a = fields
+      end
+    end
+    today = nil
+    if k && a.size > e
+      case k
+      when :ordinal
+        h[:year] = (today ||= Date.today).year if h[:year].nil?
+        h[:yday] = 1 if h[:yday].nil?
+      when :civil, :commercial, :wnum0, :wnum1
+        a.each do |f|
+          break unless h[f].nil?
+          h[f] = (today ||= Date.today).__send__(f)
+        end
+        case k
+        when :civil
+          h[:mon] = 1 if h[:mon].nil?
+          h[:mday] = 1 if h[:mday].nil?
+        when :commercial
+          h[:cweek] = 1 if h[:cweek].nil?
+          h[:cwday] = 1 if h[:cwday].nil?
+        when :wnum0
+          h[:wnum0] = 0 if h[:wnum0].nil?
+          h[:wday] = 0 if h[:wday].nil?
+        when :wnum1
+          h[:wnum1] = 0 if h[:wnum1].nil?
+          h[:wday] = 1 if h[:wday].nil?
+        end
+      when :wday
+        today ||= Date.today
+        h[:jd] = (today - today.wday + h[:wday]).jd
+      end
+    end
+    if k == :time && klass <= DateTime
+      h[:jd] = (today ||= Date.today).jd if h[:jd].nil?
+    end
+    h[:hour] = 0 if h[:hour].nil?
+    h[:min] = 0 if h[:min].nil?
+    if h[:sec].nil?
+      h[:sec] = 0
+    elsif h[:sec] > 59
+      h[:sec] = 59
+    end
+    h
+  end
+
+  def self.__valid_date_frags(h, sg)
+    return h[:jd] unless h[:jd].nil?
+    if !h[:yday].nil? && !h[:year].nil?
+      jd = __valid_ordinal_jd(__int(h[:year]), __int(h[:yday]), sg)
+      return jd if jd
+    end
+    if !h[:mday].nil? && !h[:mon].nil? && !h[:year].nil?
+      jd = __valid_civil_jd(__int(h[:year]), __int(h[:mon]), __int(h[:mday]), sg)
+      return jd if jd
+    end
+    wd = h[:cwday]
+    if wd.nil?
+      wd = h[:wday]
+      wd = 7 if !wd.nil? && wd == 0
+    end
+    if !wd.nil? && !h[:cweek].nil? && !h[:cwyear].nil?
+      jd = __valid_commercial_jd(__int(h[:cwyear]), __int(h[:cweek]), __int(wd), sg)
+      return jd if jd
+    end
+    wd = h[:wday]
+    if wd.nil?
+      wd = h[:cwday]
+      wd = 0 if !wd.nil? && wd == 7
+    end
+    if !wd.nil? && !h[:wnum0].nil? && !h[:year].nil?
+      jd = __valid_weeknum_jd(__int(h[:year]), __int(h[:wnum0]), __int(wd), 0, sg)
+      return jd if jd
+    end
+    wd = h[:wday]
+    wd = h[:cwday] if wd.nil?
+    wd = (wd - 1) % 7 unless wd.nil?
+    if !wd.nil? && !h[:wnum1].nil? && !h[:year].nil?
+      jd = __valid_weeknum_jd(__int(h[:year]), __int(h[:wnum1]), __int(wd), 1, sg)
+      return jd if jd
+    end
+    nil
+  end
+
+  def self.__new_by_frags(h, sg)
+    sg = __sg(sg)
+    raise Date::Error, "invalid date" if h.nil?
+    h = h.dup
+    if h[:jd].nil? && h[:yday].nil? && !h[:year].nil? && !h[:mon].nil? && !h[:mday].nil?
+      jd = __valid_civil_jd(__int(h[:year]), __int(h[:mon]), __int(h[:mday]), sg)
+    else
+      __rewrite_frags(h)
+      __complete_frags(self, h)
+      jd = __valid_date_frags(h, sg)
+    end
+    raise Date::Error, "invalid date" if jd.nil?
+    allocate.__init(jd, 0, Rational(0, 1), 0, sg)
+  end
+
+  # the constructors from the format readers (date_s_iso8601 and kin): the
+  # reader's fields, then the same completion Date.parse does
+  def self.iso8601(str = "-4712-01-01", sg = ITALY, limit: 128) = __new_by_frags(_iso8601(str, limit: limit), sg)
+  def self.rfc3339(str = "-4712-01-01T00:00:00+00:00", sg = ITALY, limit: 128) = __new_by_frags(_rfc3339(str, limit: limit), sg)
+  def self.xmlschema(str = "-4712-01-01", sg = ITALY, limit: 128) = __new_by_frags(_xmlschema(str, limit: limit), sg)
+  def self.rfc2822(str = "Mon, 1 Jan -4712 00:00:00 +0000", sg = ITALY, limit: 128) = __new_by_frags(_rfc2822(str, limit: limit), sg)
+  def self.httpdate(str = "Mon, 01 Jan -4712 00:00:00 GMT", sg = ITALY, limit: 128) = __new_by_frags(_httpdate(str, limit: limit), sg)
+  def self.jisx0301(str = "-4712-01-01", sg = ITALY, limit: 128) = __new_by_frags(_jisx0301(str, limit: limit), sg)
+  class << self
+    alias_method :rfc822, :rfc2822
+  end
+
+  # --- reading ------------------------------------------------------------
+  attr_reader :jd, :year
+  def mon = @month
+  def month = @month
+  def mday = @day
+  def day = @day
+  def start = @start
+  def wday = (@jd + 1) % 7
+  def yday = @jd - Date.__fdoy(@year, @start) + 1
+  def cwday = (w = (@jd + 1) % 7) == 0 ? 7 : w
+  def cwyear = Date.__jd_to_commercial(@jd, @start)[0]
+  def cweek = Date.__jd_to_commercial(@jd, @start)[1]
+  def julian? = @jd < @start
+  def gregorian? = !julian?
+  def leap?
+    return Date.gregorian_leap?(@year) if gregorian?
+    Date.jd_to_civil(Date.civil_to_jd(@year, 3, 1, @start) - 1, @start)[2] == 29
+  end
+
+  def ajd
+    return Rational(2 * @jd - 1, 2) if @df == 0 && @of == 0 && @sf == 0
+    __utc_secs.to_r / 86400 - Rational(1, 2)
+  end
+  def amjd = ajd - Rational(4800001, 2)
+  def mjd = @jd - 2400001
+  def ld = @jd - 2299160
+  # (0 for a plain Date, as ruby's "simple" one answers; a Rational once it
+  #  has a time of day)
+  def day_fraction
+    return 0 if @df == 0 && @sf == 0
+    (@df + @sf).to_r / 86400
+  end
+
+  # --- the same instant on another calendar --------------------------------
+  def new_start(sg = ITALY) = self.class.allocate.__init(@jd, @df, @sf, @of, Date.__sg(sg))
+  def italy = new_start(ITALY)
+  def england = new_start(ENGLAND)
+  def julian = new_start(JULIAN)
+  def gregorian = new_start(GREGORIAN)
+
+  # --- arithmetic (d_lite_plus / d_lite_minus / d_lite_rshift) ----------------
+  # A whole number moves the day; a Rational is exact to any precision; a
+  # Float is taken as days, seconds and nanoseconds, the last rounded.
+  def +(other)
+    case other
+    when Integer
+      return self.class.allocate.__init(@jd + other, @df, @sf, @of, @start)
+    when Rational
+      return self + other.numerator if other.denominator == 1
+      delta = other * 86400
+    when Float
+      raise FloatDomainError, other.to_s unless other.finite?
+      neg = other < 0
+      o = other.abs
+      days = o.floor
+      o -= days
+      o *= 86400
+      secs = o.floor
+      o -= secs
+      ns = (o * 1_000_000_000).round
+      delta = days * 86400 + secs + Rational(ns, 1_000_000_000)
+      delta = -delta if neg
+    else
+      raise TypeError, "expected numeric" unless other.is_a?(Numeric)
+      r = other.to_r
+      raise TypeError, "wrong argument type #{r.class} (expected Rational)" unless r.is_a?(Rational) || r.is_a?(Integer)
+      return self + r
+    end
+    __plus_seconds(delta)
+  end
+
+  def __plus_seconds(delta)
+    t = @df + @sf + delta
+    dj = t.div(86400)
+    rem = t - dj * 86400
+    df = rem.floor
+    self.class.allocate.__init(@jd + dj, df, (rem - df).to_r, @of, @start)
+  end
+
+  def -(other)
+    return (__utc_secs - other.__utc_secs).to_r / 86400 if other.is_a?(Date)
+    raise TypeError, "expected numeric" unless other.is_a?(Numeric)
+    self + (-other)
+  end
+
+  def next_day(n = 1) = self + n
+  def prev_day(n = 1) = self - n
+  def succ = self + 1
+  def next = self + 1
+
+  # n months on; the day is clamped to the last that exists in that month
+  # (in the reform's month, the last BEFORE the gap: 1583-10-14 << 12 is
+  # 1582-10-04)
+  def >>(n)
+    raise TypeError, "expected numeric" unless n.is_a?(Numeric)
+    t = @year * 12 + (@month - 1) + n
+    y = t.div(12)
+    m = (t % 12).floor + 1
+    d = @day
+    jd = nil
+    loop do
+      jd = Date.__valid_civil_jd(y, m, d, @start)
+      break if jd
+      d -= 1
+      raise Date::Error, "invalid date" if d < 1
+    end
+    self + (jd - @jd)
+  end
+
+  def <<(n)
+    raise TypeError, "expected numeric" unless n.is_a?(Numeric)
+    self >> -n
+  end
+
+  def next_month(n = 1) = self >> n
+  def prev_month(n = 1) = self << n
+  def next_year(n = 1) = self >> (n * 12)
+  def prev_year(n = 1) = self << (n * 12)
+
+  # --- comparing --------------------------------------------------------------
+  # two dates by their instants (on UTC); a number by the astronomical
+  # Julian Day it is compared with (Date.new(2001,2,3) <=> 2451943.5 is 0)
+  def <=>(other)
+    if other.is_a?(Date)
+      a = __utc_day_secs
+      b = other.__utc_day_secs
+      return a <=> b if a != b
+      return @sf <=> other.__sf
+    end
+    return ajd <=> other if other.is_a?(Numeric)
+    return nil unless other.respond_to?(:coerce)
+    a, b = other.coerce(self)
+    a <=> b
+  end
+
+  def ==(other)
+    return true if equal?(other)
+    c = (self <=> other)
+    c.nil? ? false : c == 0
+  end
+
+  # the same calendar DAY (the local one), whatever the time
+  def ===(other)
+    return @jd == other if other.is_a?(Numeric)
+    return @jd == other.jd if other.is_a?(Date)
+    return nil unless other.respond_to?(:coerce)
+    a, b = other.coerce(self)
+    a == b
+  end
+
+  def eql?(other) = other.is_a?(Date) && (self <=> other) == 0
+  def hash = [__utc_day_secs, @sf].hash
+
+  # --- iteration (d_lite_step) -------------------------------------------------
+  # The direction is the step's sign asked of the step itself (`by <=> 0`),
+  # so an object whose <=> answers nil is an ArgumentError, and one that
+  # answers 2 is a step forward.
+  def step(limit, by = 1)
+    return to_enum(:step, limit, by) unless block_given?
+    c = (by <=> 0)
+    raise ArgumentError, "comparison of #{by.class} with 0 failed" if c.nil?
+    c = c > 0 ? 1 : (c < 0 ? -1 : 0) unless c.is_a?(Integer)
+    d = self
+    if c < 0
+      while (d <=> limit) >= 0
+        yield d
+        d += by
+      end
+    elsif c == 0
+      loop { yield d }
+    else
+      while (d <=> limit) <= 0
+        yield d
+        d += by
+      end
+    end
+    self
+  end
+
+  def upto(max)
+    return to_enum(:upto, max) unless block_given?
+    d = self
+    while (d <=> max) <= 0
+      yield d
+      d += 1
+    end
+    self
+  end
+
+  def downto(min)
+    return to_enum(:downto, min) unless block_given?
+    d = self
+    while (d <=> min) >= 0
+      yield d
+      d -= 1
+    end
+    self
+  end
+
+  # --- printing ---------------------------------------------------------------
+  def __off_s
+    a = @of.abs
+    format("%s%02d:%02d", @of < 0 ? "-" : "+", a / 3600, a % 3600 / 60).force_encoding(Encoding::US_ASCII)
+  end
+
+  def __date_s = format("%s%04d-%02d-%02d", @year < 0 ? "-" : "", @year.abs, @month, @day)
+  def to_s = __date_s.force_encoding(Encoding::US_ASCII)
+
+  # the instant as ruby shows it: UTC day, seconds and nanoseconds, the
+  # offset in seconds and the reform
+  def inspect
+    u = __utc_day_secs
+    ns = @sf * 1_000_000_000
+    ns = ns.to_i if ns.denominator == 1
+    sts = @start.infinite? ? (@start < 0 ? "-Inf" : "Inf") : @start.to_i.to_s
+    "#<#{self.class}: #{to_s} ((#{u.div(86400)}j,#{u % 86400}s,#{ns.inspect}n),#{@of < 0 ? '-' : '+'}#{@of.abs}s,#{sts}j)>".force_encoding(Encoding::US_ASCII)
+  end
+
+  # date_strftime's %z, which differs from Time's: "-" drops the hour's
+  # padding (%-:::z is +9), and a width pads the hours
+  def self.__strf_z(off, flags, width, colons)
+    aoff = off.abs
+    hl = aoff / 3600 < 10 ? 1 : 2
+    hw = flags.include?("-") && hl == 1 ? 1 : 2
+    extra = case colons
+            when 0 then 3
+            when 1 then 4
+            when 2 then 7
+            else aoff % 3600 == 0 ? 1 : (aoff % 60 == 0 ? 4 : 7)
+            end
+    prec = width || -1
+    prec = prec <= extra + hw ? hw : prec - extra
+    pad = nil
+    flags.each_char { |c| pad = c if c == "_" || c == "0" }
+    s = +""
+    if pad == "_" && prec > hl
+      s << " " * (prec - hl)
+      prec = hl
+    end
+    s << (off < 0 ? "-" : "+")
+    s << (aoff / 3600).to_s.rjust(prec, "0")
+    r = aoff % 3600
+    return s if colons == 3 && r == 0
+    s << ":" if colons >= 1
+    s << format("%02d", r / 60)
+    r %= 60
+    return s if colons == 3 && r == 0
+    s << format(":%02d", r) if colons >= 2
+    s
+  end
+
+  def __strf_fields
+    [@year, @month, @day, yday, wday, @df / 3600, @df % 3600 / 60, @df % 60, @sf, @of, false, __off_s,
+     __utc_secs - 210866803200, true]
+  end
+
+  # the one strftime engine (Time.__strf) with this date's fields; the
+  # result is in the format's encoding (US-ASCII for the default formats)
+  def __strftime(fmt)
+    fmt = fmt.to_str unless fmt.is_a?(String)
+    Date.__strf_range_check(fmt, @year)
+    if fmt.include?("z")
+      of = @of
+      fmt = fmt.gsub(/%%|%[-_0^#]*\d*:*z/) do |m|
+        next m if m == "%%"
+        colons = m.count(":")
+        next m if colons > 3
+        flags = m[/\A%[-_0^#]*/][1..]
+        w = m[1..][/\d+/]
+        Date.__strf_z(of, flags, w && w.to_i, colons)
+      end
+    end
+    Time.__strf(fmt, __strf_fields)
+  end
+
+  def strftime(fmt = "%F".dup.force_encoding(Encoding::US_ASCII)) = __strftime(fmt)
+
+  def __ascii(fmt) = __strftime(fmt.dup.force_encoding(Encoding::US_ASCII))
+  def asctime = __ascii("%a %b %e %H:%M:%S %Y")
+  def ctime = __ascii("%a %b %e %H:%M:%S %Y")
+  def iso8601 = __ascii("%Y-%m-%d")
+  def xmlschema = __ascii("%Y-%m-%d")
+  def rfc3339 = __ascii("%Y-%m-%dT%H:%M:%S%:z")
+  def rfc2822 = __ascii("%a, %-d %b %Y %T %z")
+  def rfc822 = __ascii("%a, %-d %b %Y %T %z")
+  def httpdate
+    u = @of == 0 ? self : self.class.allocate.__init(*__utc_parts, 0, @start)
+    u.__ascii("%a, %d %b %Y %T GMT")
+  end
+  def __utc_parts
+    u = __utc_day_secs
+    [u.div(86400), u % 86400, @sf]
+  end
+
+  def jisx0301
+    era, base = __jis_era
+    return __ascii("%Y-%m-%d") unless era
+    format("%s%02d.%02d.%02d", era, @year - base, @month, @day).force_encoding(Encoding::US_ASCII)
+  end
+
+  # --- conversions --------------------------------------------------------
+  def to_date = self
+  def to_datetime = DateTime.allocate.__init(@jd, 0, Rational(0, 1), 0, @start)
+  # (Time's calendar is the Gregorian one)
+  def to_time
+    y, m, d = julian? ? Date.jd_to_gregorian(@jd) : [@year, @month, @day]
+    Time.local(y, m, d)
+  end
+
+  # --- Marshal: [nth, jd, df, sf, of, sg], jd and df on UTC, sf in ns ------
+  def marshal_dump
+    j, df, sf = __utc_parts
+    ns = sf * 1_000_000_000
+    ns = ns.to_i if ns.denominator == 1
+    [0, j, df, ns, @of, @start]
+  end
+
+  def __marshal_set(jd, df, sf, of, sg)
+    u = jd * 86400 + df + of
+    __init(u.div(86400), u % 86400, sf.to_r / 1_000_000_000, of, sg.is_a?(Numeric) ? sg.to_f : ITALY.to_f)
+  end
+
+  class Infinity < Numeric
+    def <=>(other)
+      case other
+      when Infinity then d <=> other.d
+      when Float::INFINITY then d <=> 1
+      when -Float::INFINITY then d <=> -1
+      when Numeric then d
+      else
+        begin
+          l, r = other.coerce(self)
+          return l <=> r
+        rescue NoMethodError
+        end
+        nil
+      end
+    end
+  end
+end
+
+class DateTime < Date
+  class << self
+    undef_method :today
+  end
+
+  # a time-of-day argument: numeric, and a fraction only in the last one given
+  def self.__arg(v, name, unit, pos, n)
+    Date.__num!(v, name)
+    i, fr = Date.__trunc(v, unit)
+    raise Date::Error, "invalid fraction" if fr != 0 && n > pos
+    [i, fr]
+  end
+
+  def self.__build(jd, h, mi, s, of, sg, fr)
+    t = Date.__valid_time(h, mi, s)
+    raise Date::Error, "invalid date" if t.nil?
+    h, mi, s = t
+    if h == 24
+      h = 0
+      fr += 1
+    end
+    r = allocate.__init(jd, h * 3600 + mi * 60 + s, Rational(0, 1), of, sg)
+    fr == 0 ? r : r + fr
+  end
+
+  # the clock arguments of every constructor, from the last to the first as
+  # ruby checks them: [hour, minute, second, offset, start, fraction]
+  def self.__clock(args, base, n)
+    h, mi, s, of, sg = args[base, 5]
+    sg = n > base + 4 ? Date.__sg(sg) : ITALY.to_f
+    of = n > base + 3 ? Date.__val2off(of) : 0
+    fr = 0
+    s, f = n > base + 2 ? __arg(s, "second", 86400, 1 << 30, n) : [0, 0]
+    fr = f if f != 0
+    mi, f = n > base + 1 ? __arg(mi, "minute", 1440, base + 2, n) : [0, 0]
+    fr = f if f != 0
+    h, f = n > base ? __arg(h, "hour", 24, base + 1, n) : [0, 0]
+    fr = f if f != 0
+    [h, mi, s, of, sg, fr]
+  end
+
+  def self.new(*args)
+    n = args.size
+    raise ArgumentError, "wrong number of arguments (given #{n}, expected 0..8)" if n > 8
+    h, mi, s, of, sg, fr = __clock(args, 3, n)
+    y, m, d = args
+    if n > 2
+      d, f = __arg(d, "day", 1, 3, n)
+      fr = f if f != 0
+    else
+      d = 1
+    end
+    m = n > 1 ? Date.__int(Date.__num!(m, "month")) : 1
+    y = n > 0 ? Date.__int(Date.__num!(y, "year")) : -4712
+    jd = Date.__valid_civil_jd(y, m, d, sg)
+    raise Date::Error, "invalid date" if jd.nil?
+    __build(jd, h, mi, s, of, sg, fr)
+  end
+
+  def self.civil(*args) = new(*args)
+
+  def self.jd(*args)
+    n = args.size
+    raise ArgumentError, "wrong number of arguments (given #{n}, expected 0..6)" if n > 6
+    h, mi, s, of, sg, fr = __clock(args, 1, n)
+    if n > 0
+      jd, f = __arg(args[0], "jd", 1, 1, n)
+      fr = f if f != 0
+    else
+      jd = 0
+    end
+    __build(jd, h, mi, s, of, sg, fr)
+  end
+
+  def self.ordinal(*args)
+    n = args.size
+    raise ArgumentError, "wrong number of arguments (given #{n}, expected 0..7)" if n > 7
+    h, mi, s, of, sg, fr = __clock(args, 2, n)
+    if n > 1
+      d, f = __arg(args[1], "yday", 1, 2, n)
+      fr = f if f != 0
+    else
+      d = 1
+    end
+    y = n > 0 ? Date.__int(Date.__num!(args[0], "year")) : -4712
+    jd = Date.__valid_ordinal_jd(y, d, sg)
+    raise Date::Error, "invalid date" if jd.nil?
+    __build(jd, h, mi, s, of, sg, fr)
+  end
+
+  def self.commercial(*args)
+    n = args.size
+    raise ArgumentError, "wrong number of arguments (given #{n}, expected 0..8)" if n > 8
+    h, mi, s, of, sg, fr = __clock(args, 3, n)
+    if n > 2
+      d, f = __arg(args[2], "cwday", 1, 3, n)
+      fr = f if f != 0
+    else
+      d = 1
+    end
+    w = n > 1 ? Date.__int(Date.__num!(args[1], "cweek")) : 1
+    y = n > 0 ? Date.__int(Date.__num!(args[0], "year")) : -4712
+    jd = Date.__valid_commercial_jd(y, w, d, sg)
+    raise Date::Error, "invalid date" if jd.nil?
+    __build(jd, h, mi, s, of, sg, fr)
+  end
+
+  # the local clock to the nanosecond, at the local offset
+  def self.now(sg = ITALY)
+    sg = Date.__sg(sg)
+    t = Time.now
+    s = t.sec
+    s = 59 if s > 59
+    allocate.__init(Date.gregorian_to_jd(t.year, t.mon, t.mday), t.hour * 3600 + t.min * 60 + s,
+                    Rational(t.nsec, 1_000_000_000), t.utc_offset, sg)
+  end
+
+  # dt_new_by_frags: the date as Date's, then the clock, the fraction of the
+  # second and the offset the fields carry (an offset beyond a day is
+  # warned about and dropped)
+  def self.__new_by_frags(h, sg)
+    sg = Date.__sg(sg)
+    raise Date::Error, "invalid date" if h.nil?
+    h = h.dup
+    if h[:jd].nil? && h[:yday].nil? && !h[:year].nil? && !h[:mon].nil? && !h[:mday].nil?
+      jd = Date.__valid_civil_jd(Date.__int(h[:year]), Date.__int(h[:mon]), Date.__int(h[:mday]), sg)
+      h[:hour] = 0 if h[:hour].nil?
+      h[:min] = 0 if h[:min].nil?
+      if h[:sec].nil?
+        h[:sec] = 0
+      elsif h[:sec] == 60
+        h[:sec] = 59
+      end
+    else
+      Date.__rewrite_frags(h)
+      Date.__complete_frags(self, h)
+      jd = Date.__valid_date_frags(h, sg)
+    end
+    raise Date::Error, "invalid date" if jd.nil?
+    t = Date.__valid_time(Date.__int(h[:hour]), Date.__int(h[:min]), Date.__int(h[:sec]))
+    raise Date::Error, "invalid date" if t.nil?
+    sf = h[:sec_fraction].nil? ? Rational(0, 1) : h[:sec_fraction].to_r
+    of = h[:offset].nil? ? 0 : Date.__int(h[:offset])
+    if of < -86400 || of > 86400
+      warn("warning: invalid offset is ignored") if $VERBOSE
+      of = 0
+    end
+    r = allocate.__init(jd, t[0] * 3600 + t[1] * 60 + t[2], Rational(0, 1), of, sg)
+    r = r.__plus_seconds(0) if t[0] == 24
+    sf == 0 ? r : r.__plus_seconds(sf)
+  end
+
+  def self._strptime(str, fmt = "%FT%T%z") = Date._strptime(str, fmt)
+  def self.strptime(str = "-4712-01-01T00:00:00+00:00", fmt = "%FT%T%z", sg = ITALY) = __new_by_frags(Date._strptime(str, fmt), sg)
+  def self.parse(str = "-4712-01-01T00:00:00+00:00", comp = true, sg = ITALY, limit: 128) = __new_by_frags(Date._parse(str, comp, limit: limit), sg)
+  def self.iso8601(str = "-4712-01-01T00:00:00+00:00", sg = ITALY, limit: 128) = __new_by_frags(Date._iso8601(str, limit: limit), sg)
+  def self.rfc3339(str = "-4712-01-01T00:00:00+00:00", sg = ITALY, limit: 128) = __new_by_frags(Date._rfc3339(str, limit: limit), sg)
+  def self.xmlschema(str = "-4712-01-01T00:00:00+00:00", sg = ITALY, limit: 128) = __new_by_frags(Date._xmlschema(str, limit: limit), sg)
+  def self.rfc2822(str = "Mon, 1 Jan -4712 00:00:00 +0000", sg = ITALY, limit: 128) = __new_by_frags(Date._rfc2822(str, limit: limit), sg)
+  def self.httpdate(str = "Mon, 01 Jan -4712 00:00:00 GMT", sg = ITALY, limit: 128) = __new_by_frags(Date._httpdate(str, limit: limit), sg)
+  def self.jisx0301(str = "-4712-01-01T00:00:00+00:00", sg = ITALY, limit: 128) = __new_by_frags(Date._jisx0301(str, limit: limit), sg)
+  class << self
+    alias_method :rfc822, :rfc2822
+  end
+
+  # --- the clock ---------------------------------------------------------
+  def hour = @df / 3600
+  def minute = @df % 3600 / 60
+  alias_method :min, :minute
+  def second = @df % 60
+  alias_method :sec, :second
+  def sec_fraction = @sf
+  alias_method :second_fraction, :sec_fraction
+  def offset = @of.to_r / 86400
+  def zone = __off_s
+  def day_fraction = (@df + @sf).to_r / 86400
+
+  # the same instant at another offset
+  def new_offset(of = 0)
+    o = Date.__val2off(of)
+    u = __utc_day_secs + o
+    self.class.allocate.__init(u.div(86400), u % 86400, @sf, o, @start)
+  end
+
+  # (the layers above defined these on DateTime; Date's are the ones now)
+  def +(other) = super
+  def -(other) = super
+  def inspect = super
+  def marshal_dump = super
+  def __marshal_set(jd, df, sf, of, sg) = super
+
+  def to_s
+    (__date_s + format("T%02d:%02d:%02d", @df / 3600, @df % 3600 / 60, @df % 60) + __off_s).force_encoding(Encoding::US_ASCII)
+  end
+
+  def strftime(fmt = "%FT%T%:z".dup.force_encoding(Encoding::US_ASCII)) = __strftime(fmt)
+
+  # T%H:%M:%S, n digits of the second's fraction, and the offset
+  def __timediv(n)
+    n = n.to_i
+    __ascii(n > 0 ? "T%H:%M:%S.%#{n}N%:z" : "T%H:%M:%S%:z")
+  end
+  def iso8601(n = 0) = (__ascii("%Y-%m-%d") + __timediv(n)).force_encoding(Encoding::US_ASCII)
+  def xmlschema(n = 0) = iso8601(n)
+  def rfc3339(n = 0) = iso8601(n)
+  def jisx0301(n = 0) = (super() + __timediv(n)).force_encoding(Encoding::US_ASCII)
+
+  def to_date = Date.allocate.__init(@jd, 0, Rational(0, 1), 0, @start)
+  def to_datetime = self
+  def to_time
+    y, m, d = julian? ? Date.jd_to_gregorian(@jd) : [@year, @month, @day]
+    Time.new(y, m, d, @df / 3600, @df % 3600 / 60, @df % 60 + @sf, @of)
+  end
+end
+
+class Date
+  # date_core's zone table (zonetab.list), as "name=seconds" pairs
+  def self.__zone_src
+    [
+      "ut=0;gmt=0;est=-18000;edt=-14400;cst=-21600;cdt=-18000;mst=-25200;mdt=-21600",
+      "pst=-28800;pdt=-25200;a=3600;b=7200;c=10800;d=14400;e=18000;f=21600;g=25200;h=28800",
+      "i=32400;k=36000;l=39600;m=43200;n=-3600;o=-7200;p=-10800;q=-14400;r=-18000;s=-21600",
+      "t=-25200;u=-28800;v=-32400;w=-36000;x=-39600;y=-43200;z=0;utc=0;wet=0;at=-7200",
+      "brst=-7200;ndt=-5400;art=-10800;adt=-10800;brt=-10800;clst=-10800;nst=-9000;ast=-14400",
+      "clt=-14400;akdt=-28800;ydt=-28800;akst=-32400;hadt=-32400;hdt=-32400;yst=-32400",
+      "ahst=-36000;cat=7200;hast=-36000;hst=-36000;nt=-39600;idlw=-43200;bst=3600;cet=3600",
+      "fwt=3600;met=3600;mewt=3600;mez=3600;swt=3600;wat=3600;west=3600;cest=7200;eet=7200",
+      "fst=7200;mest=7200;mesz=7200;sast=7200;sst=-39600;bt=10800;eat=10800;eest=10800",
+      "msk=10800;msd=14400;zp4=14400;zp5=18000;ist=19800;zp6=21600;wast=7200;cct=23400",
+      "sgt=28800;wadt=28800;jst=32400;kst=32400;east=-21600;gst=36000;eadt=39600;idle=43200",
+      "nzst=43200;nzt=43200;nzdt=46800;afghanistan=16200;alaskan=-32400;arab=10800",
+      "arabian=14400;arabic=10800;atlantic=-14400;aus central=34200;aus eastern=36000",
+      "azores=-3600;canada central=-21600;cape verde=-3600;caucasus=14400",
+      "cen. australia=34200;central america=-21600;central asia=21600;central europe=3600",
+      "central european=3600;central pacific=39600;central=-21600;china=28800;dateline=-43200",
+      "e. africa=10800;e. australia=36000;e. europe=7200;e. south america=-10800",
+      "eastern=-18000;egypt=7200;ekaterinburg=18000;fiji=43200;fle=7200;greenland=-10800",
+      "greenwich=0;gtb=7200;hawaiian=-36000;india=19800;iran=12600;jerusalem=7200;korea=32400",
+      "mexico=-21600;mid-atlantic=-7200;mountain=-25200;myanmar=23400;n. central asia=21600",
+      "nepal=20700;new zealand=43200;newfoundland=-12600;north asia east=28800",
+      "north asia=25200;pacific sa=-14400;pacific=-28800;romance=3600;russian=10800",
+      "sa eastern=-10800;sa pacific=-18000;sa western=-14400;samoa=-39600;se asia=25200",
+      "malay peninsula=28800;south africa=7200;sri lanka=21600;taipei=28800;tasmania=36000",
+      "tokyo=32400;tonga=46800;us eastern=-18000;us mountain=-25200;vladivostok=36000",
+      "w. australia=28800;w. central africa=3600;w. europe=3600;west asia=18000",
+      "west pacific=36000;yakutsk=32400;acdt=37800;acst=34200;act=-18000;acwst=31500",
+      "aedt=39600;aest=36000;aft=16200;almt=21600;anast=43200;anat=43200;aoe=-43200",
+      "aqtt=18000;awdt=32400;awst=28800;azost=0;azot=-3600;azst=18000;azt=14400;bnt=28800",
+      "bot=-14400;btt=21600;cast=28800;chadt=49500;chast=45900;chost=32400;chot=28800",
+      "chst=36000;chut=36000;cidst=-14400;cist=-18000;ckt=-36000;cot=-18000;cvt=-3600",
+      "cxt=25200;davt=25200;ddut=36000;easst=-18000;ect=-18000;egst=0;egt=-3600;fet=10800",
+      "fjst=46800;fjt=43200;fkst=-10800;fkt=-14400;fnt=-7200;galt=-21600;gamt=-32400",
+      "get=14400;gft=-10800;gilt=43200;gyt=-14400;hkt=28800;hovst=28800;hovt=25200;ict=25200",
+      "idt=10800;iot=21600;irdt=16200;irkst=32400;irkt=28800;irst=12600;kgt=21600;kost=39600",
+      "krast=28800;krat=25200;kuyt=14400;lhdt=39600;lhst=37800;lint=50400;magst=43200",
+      "magt=39600;mart=-30600;mawt=18000;mht=43200;mmt=23400;mut=14400;mvt=18000;myt=28800",
+      "nct=39600;nfdt=43200;nft=39600;novst=25200;novt=25200;npt=20700;nrt=43200;nut=-39600",
+      "omsst=25200;omst=21600;orat=18000;pet=-18000;petst=43200;pett=43200;pgt=36000",
+      "phot=46800;pht=28800;pkt=18000;pmdt=-7200;pmst=-10800;pont=39600;pwt=32400;pyst=-10800",
+      "qyzt=21600;ret=14400;rott=-10800;sakt=39600;samt=14400;sbt=39600;sct=14400;sret=39600",
+      "srt=-10800;syot=10800;taht=-36000;tft=18000;tjt=18000;tkt=46800;tlt=32400;tmt=18000",
+      "tost=50400;tot=46800;trt=10800;tvt=43200;ulast=32400;ulat=28800;uyst=-7200;uyt=-10800",
+      "uzt=18000;vet=-14400;vlast=39600;vlat=36000;vost=21600;vut=39600;wakt=43200",
+      "warst=-10800;wft=43200;wgst=-3600;wgt=-7200;wib=25200;wit=32400;wita=28800;wt=0",
+      "yakst=36000;yakt=32400;yapt=36000;yekst=21600;yekt=18000",
+    ]
+  end
+end
+
 # ===========================================================================
 # The readers are ruby's own, ported: Date::MereDateParse is date_parse.c
 # (date__parse and the iso8601 / rfc3339 / xmlschema / rfc2822 / httpdate /
@@ -1321,13 +2540,19 @@ class Date
   def self.__from_quad(q, start)
     raise Date::Error, "invalid date" if q.nil?
     jd, df, sf, of = q
-    start = ITALY if start.nil?
-    return jd(jd, start) unless self <= DateTime
-    total = jd * 86400 + df + of + Rational(sf, 1_000_000_000)
-    __from_local(total, Rational(of, 86400), start)
+    sg = __sg(start.nil? ? ITALY : start)
+    return allocate.__init(jd, 0, Rational(0, 1), 0, sg) unless self <= DateTime
+    # (the quadruple is UTC; the model keeps the local day and seconds)
+    local = jd * 86400 + df + of
+    allocate.__init(local.div(86400), local % 86400, Rational(sf, 1_000_000_000), of, sg)
   end
 
   def self.__new_by_hash(hash, start)
+    # (an offset past a day is dropped, with ruby's verbose-mode warning)
+    if $VERBOSE && hash.is_a?(Hash) && hash[:offset].is_a?(Numeric) && self <= DateTime &&
+       (hash[:offset] < -86400 || hash[:offset] > 86400)
+      warn("invalid offset is ignored", uplevel: 2)
+    end
     __from_quad(MereDateStrptime.new_by_frags(self <= DateTime ? :datetime : :date, hash, start.nil? ? ITALY : start), start)
   end
 

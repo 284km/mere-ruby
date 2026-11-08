@@ -2188,3 +2188,38 @@ byte now (lib/time_ext.rb); it reads through those, and test_time went
   439, literal 30, parse 102, syntax 168, marshal 230, json all green, and
   psych identical on the old and the new binary (86/538, its C side is
   stage 7′).
+
+## 2026-11-08 (11): one Date model, date_core's -- test/date 111 → 143/143; strftime's width and a negative year, Marshal and a Numeric subclass
+
+Date's third round. The layers of lib/date_ext.rb held four shapes of
+object (a Date with a day and nothing else; a DateTime with its own clock
+fields; DateTime.new ignoring its calendar; arithmetic rebuilding objects
+by name). A last layer now gives both classes date_core's one model: the
+local Julian Day, the seconds into it, the fraction of a second (a
+Rational), the offset in seconds and the calendar reform, set through one
+`__init`, with civil / ordinal / commercial / weeknum read on the reform's
+calendar (the 1582 and 1752 gaps), the clock checks and fractions of
+date_core's constructors, `+`/`-`/`>>`/`<<` keeping the class (a DateSub
+stays one) and the fraction, `<=>` and `===` with Numeric and
+Date::Infinity, new_offset, new_start/julian/gregorian, deconstruct_keys
+with the clock, marshal_dump in ruby's shape. (It was drafted by a workflow
+agent that hit its limit before reporting; its draft was rebuilt from its
+transcript and finished here.) The parser layer of round (10) stays on
+top: its [jd, df, sf, of] quadruple is built with `__init`. corpus/516 is
+the witness. Three outside the library:
+
+- **strftime's width and a negative number**: `%5Y` of -200 was -00200;
+  an explicit width counts the sign (-0200), and a year's default width is
+  its digits', so the sign is one more (%Y -0200, %_Y " -200"), while %C's
+  is not (-2). Time's strftime is the same engine and had the same bug.
+- **Marshal refused a Numeric subclass of the program's own** in an `o`
+  record (Date::Infinity, in the 1.8 / 1.9.2 dumps of a Date): only the
+  builtin numbers are refused now. The old shapes' ajd is UTC, which
+  marshal_load had moved by the offset.
+- **DateTime.parse with an offset past a day** drops it with ruby's
+  verbose-mode warning ("invalid offset is ignored").
+- **Checked**: corpus 531/531 both ways, 516 under GC_STRESS=50, the 13
+  gates, test/date 143/143, test_time 42/42, ruby/test_time 87,
+  test_time_tz 155, marshal 230, strftime of Date and Time against ruby
+  over 20 directives on negative, small and five-digit years, psych
+  identical on the old and the new binary.
