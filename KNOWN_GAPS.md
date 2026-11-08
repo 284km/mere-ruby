@@ -629,7 +629,14 @@ from the cause than a LoadError would have been.
 accepts a positional options Hash through `Object#to_yaml` and `Psych.dump`,
 as YAML::Store uses, and propagates `indentation` through nested mappings,
 sequences, tagged values and literal scalars. Widths outside 2..9 use the
-default width, following the pinned reference.
+default width, following the pinned reference. Collection and tagged-object
+output tracks identity and emits anchors/aliases for cycles and shared references,
+including complex mapping keys. Each `dump` has its own graph; `dump_stream`
+shares its graph across documents, matching the pinned reference.
+
+The loader does not yet reconstruct anchors/aliases, and Struct ivars and Data
+serialization remain incomplete. Removing emitter recursion lets the upstream
+Array/Struct/Data test files finish; it does not make their round trips pass.
 
 These dump contracts do not complete Psych's node, handler, event or loader
 APIs. Large YAML::Store transaction workloads also need performance work;

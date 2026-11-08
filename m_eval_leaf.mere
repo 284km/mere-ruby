@@ -10226,10 +10226,8 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "end\n"
   else if str_eq n "yaml" || str_eq n "psych" then
-    "# A YAML *loader* subset: block mappings, block sequences, flow collections,\n" ++
-    "# the scalar types Ruby maps, comments, and multiple documents. No emitter, no\n" ++
-    "# anchors/aliases, no tags beyond the implicit ones. Enough for the\n" ++
-    "# configuration and data files gems actually ship.\n" ++
+    "# A YAML loader/emitter subset. The emitter tracks collection/object identity\n" ++
+    "# to write anchors and aliases; the loader still lacks alias reconstruction.\n" ++
     "module Psych\n" ++
     "  # the reference's version, which specs gate on (library/yaml)\n" ++
     "  VERSION = \"5.3.1\"\n" ++
@@ -10749,7 +10747,56 @@ and stdlib_src = fn (name: str) ->
     "\n" ++
     "  def self.parse_file(path, **opts) = parse(File.read(path), **opts)\n" ++
     "  module Emitter\n" ++
-    "    def self.dump(o, options = \{})\n" ++
+    "    # One graph per dump or stream. Identity keys never call a cyclic object's hash\n" ++
+    "    # or eql?, and registering before descending terminates back edges. Keep\n" ++
+    "    # tagged pairs so user-facing accessors are evaluated only once.\n" ++
+    "    class Graph\n" ++
+    "      def initialize(root)\n" ++
+    "        @nodes = \{}.compare_by_identity\n" ++
+    "        @next_anchor = 0\n" ++
+    "        visit(root)\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      def visit(o)\n" ++
+    "        if (node = @nodes[o])\n" ++
+    "          unless node[0]\n" ++
+    "            @next_anchor += 1\n" ++
+    "            node[0] = @next_anchor.to_s\n" ++
+    "          end\n" ++
+    "          return\n" ++
+    "        end\n" ++
+    "        tag = Emitter.tagged(o)\n" ++
+    "        return unless Emitter.collection?(o) || tag\n" ++
+    "        @nodes[o] = [nil, false, tag]\n" ++
+    "        if o.is_a?(Array)\n" ++
+    "          o.each \{ |v| visit(v) }\n" ++
+    "        elsif o.is_a?(Hash)\n" ++
+    "          o.each \{ |k, v| visit(k); visit(v) }\n" ++
+    "        elsif tag[1]\n" ++
+    "          tag[1].each \{ |k, v| visit(k); visit(v) }\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      def tag(o)\n" ++
+    "        node = @nodes[o]\n" ++
+    "        node && node[2]\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      def alias_for(o)\n" ++
+    "        node = @nodes[o]\n" ++
+    "        node && node[0] && node[1] ? \"*\" + node[0] : nil\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      def reference(o)\n" ++
+    "        node = @nodes[o]\n" ++
+    "        return nil unless node && node[0]\n" ++
+    "        return \"*\" + node[0] if node[1]\n" ++
+    "        node[1] = true\n" ++
+    "        \"&\" + node[0]\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "\n" ++
+    "    def self.dump(o, options = \{}, graph = nil)\n" ++
     "      width = options.fetch(:indentation, 2)\n" ++
     "      unless Integer === width\n" ++
     "        original = width\n" ++
@@ -10769,26 +10816,29 @@ and stdlib_src = fn (name: str) ->
     "        raise RangeError, \"integer #\{width} too big to convert to 'int'\"\n" ++
     "      end\n" ++
     "      width = 2 unless width.between?(2, 9)\n" ++
-    "      \"---\" + top(o, width)\n" ++
+    "      \"---\" + top(o, width, graph || Graph.new(o))\n" ++
     "    end\n" ++
     "\n" ++
-    "    def self.top(o, width = 2)\n" ++
+    "    def self.top(o, width, graph)\n" ++
+    "      ref = graph.reference(o)\n" ++
+    "      return \" \" + ref + \"\\n\" if ref && ref.start_with?(\"*\")\n" ++
+    "      prefix = ref ? \" \" + ref : \"\"\n" ++
     "      if o.nil?\n" ++
     "        \"\\n\"\n" ++
     "      elsif collection?(o)\n" ++
     "        if empty_collection?(o)\n" ++
-    "          \" \" + (o.is_a?(Hash) ? \"\{}\" : \"[]\") + \"\\n\"\n" ++
+    "          prefix + \" \" + (o.is_a?(Hash) ? \"\{}\" : \"[]\") + \"\\n\"\n" ++
     "        else\n" ++
-    "          \"\\n\" + block(o, 0, width)\n" ++
+    "          prefix + \"\\n\" + block(o, 0, width, graph)\n" ++
     "        end\n" ++
-    "      elsif (t = tagged(o))\n" ++
+    "      elsif (t = graph.tag(o))\n" ++
     "        tag, pairs = t\n" ++
     "        if pairs.nil?\n" ++
-    "          \" \" + tag + \"\\n\"\n" ++
+    "          prefix + \" \" + tag + \"\\n\"\n" ++
     "        elsif pairs.empty?\n" ++
-    "          \" \" + tag + \" \{}\\n\"\n" ++
+    "          prefix + \" \" + tag + \" \{}\\n\"\n" ++
     "        else\n" ++
-    "          \" \" + tag + \"\\n\" + map_lines(pairs, 0, width)\n" ++
+    "          prefix + \" \" + tag + \"\\n\" + map_lines(pairs, 0, width, graph)\n" ++
     "        end\n" ++
     "      elsif o.is_a?(String) && multiline?(o)\n" ++
     "        \" \" + literal(o, width)\n" ++
@@ -10841,53 +10891,80 @@ and stdlib_src = fn (name: str) ->
     "      end\n" ++
     "    end\n" ++
     "\n" ++
-    "    def self.block(o, n, width = 2)\n" ++
+    "    def self.block(o, n, width, graph)\n" ++
     "      if o.is_a?(Array)\n" ++
-    "        o.map \{ |v| item_lines(v, n, width) }.join\n" ++
+    "        o.map \{ |v| item_lines(v, n, width, graph) }.join\n" ++
     "      else\n" ++
-    "        map_lines(o.to_a, n, width)\n" ++
+    "        map_lines(o.to_a, n, width, graph)\n" ++
     "      end\n" ++
     "    end\n" ++
     "\n" ++
-    "    def self.item_lines(v, n, width = 2)\n" ++
+    "    def self.item_lines(v, n, width, graph, complex_key = false)\n" ++
     "      pad = \" \" * n\n" ++
+    "      ref = graph.reference(v)\n" ++
+    "      return pad + \"- \" + ref + \"\\n\" if ref && ref.start_with?(\"*\")\n" ++
+    "      prefix = ref ? \"- \" + ref + \" \" : \"- \"\n" ++
     "      if collection?(v) && !v.empty?\n" ++
-    "        inner = block(v, n + width, width)\n" ++
+    "        child_indent = complex_key && ref && v.is_a?(Array) ? n : n + width\n" ++
+    "        inner = block(v, child_indent, width, graph)\n" ++
+    "        return pad + \"- \" + ref + \"\\n\" + inner if ref\n" ++
     "        pad + \"-\" + (\" \" * (width - 1)) + inner[(n + width)..-1]\n" ++
-    "      elsif (t = tagged(v))\n" ++
+    "      elsif (t = graph.tag(v))\n" ++
     "        tag, pairs = t\n" ++
     "        if pairs.nil?\n" ++
-    "          pad + \"- \" + tag + \"\\n\"\n" ++
+    "          pad + prefix + tag + \"\\n\"\n" ++
     "        elsif pairs.empty?\n" ++
-    "          pad + \"- \" + tag + \" \{}\\n\"\n" ++
+    "          pad + prefix + tag + \" \{}\\n\"\n" ++
     "        else\n" ++
-    "          pad + \"- \" + tag + \"\\n\" + map_lines(pairs, n + width, width)\n" ++
+    "          pad + prefix + tag + \"\\n\" + map_lines(pairs, n + width, width, graph)\n" ++
     "        end\n" ++
     "      elsif multiline?(v)\n" ++
-    "        pad + \"- \" + literal(v, n + width)\n" ++
+    "        pad + prefix + literal(v, n + width)\n" ++
     "      elsif v.nil?\n" ++
     "        pad + \"-\\n\"\n" ++
     "      else\n" ++
-    "        pad + \"- \" + scalar(v) + \"\\n\"\n" ++
+    "        pad + prefix + scalar(v) + \"\\n\"\n" ++
     "      end\n" ++
     "    end\n" ++
     "\n" ++
-    "    def self.map_lines(pairs, n, width = 2)\n" ++
+    "    def self.map_lines(pairs, n, width, graph)\n" ++
     "      pad = \" \" * n\n" ++
     "      pairs.map do |k, v|\n" ++
-    "        key = pad + key_scalar(k) + \":\"\n" ++
-    "        if v.is_a?(Hash) && !v.empty?\n" ++
-    "          key + \"\\n\" + block(v, n + width, width)\n" ++
+    "        key_prefix = \"\"\n" ++
+    "        if empty_collection?(k)\n" ++
+    "          key_ref = graph.reference(k)\n" ++
+    "          key_text = (key_ref ? key_ref + \" \" : \"\")\n" ++
+    "          key_text += scalar(k) unless key_ref && key_ref.start_with?(\"*\")\n" ++
+    "          key = pad + key_text + \":\"\n" ++
+    "        elsif collection?(k) || graph.tag(k)\n" ++
+    "          key_ref = graph.alias_for(k)\n" ++
+    "          if key_ref\n" ++
+    "            key = pad + key_ref + \" :\"\n" ++
+    "          else\n" ++
+    "            key_prefix = item_lines(k, n, width, graph, true)\n" ++
+    "            key_prefix[n] = \"?\"\n" ++
+    "            key = pad + \":\"\n" ++
+    "          end\n" ++
+    "        else\n" ++
+    "          key = pad + key_scalar(k) + \":\"\n" ++
+    "        end\n" ++
+    "        ref = graph.reference(v)\n" ++
+    "        if ref && ref.start_with?(\"*\")\n" ++
+    "          next key_prefix + key + \" \" + ref + \"\\n\"\n" ++
+    "        end\n" ++
+    "        key += \" \" + ref if ref\n" ++
+    "        body = if v.is_a?(Hash) && !v.empty?\n" ++
+    "          key + \"\\n\" + block(v, n + width, width, graph)\n" ++
     "        elsif v.is_a?(Array) && !v.empty?\n" ++
-    "          key + \"\\n\" + block(v, n, width)\n" ++
-    "        elsif (t = tagged(v))\n" ++
+    "          key + \"\\n\" + block(v, n, width, graph)\n" ++
+    "        elsif (t = graph.tag(v))\n" ++
     "          tag, prs = t\n" ++
     "          if prs.nil?\n" ++
     "            key + \" \" + tag + \"\\n\"\n" ++
     "          elsif prs.empty?\n" ++
     "            key + \" \" + tag + \" \{}\\n\"\n" ++
     "          else\n" ++
-    "            key + \" \" + tag + \"\\n\" + map_lines(prs, n + width, width)\n" ++
+    "            key + \" \" + tag + \"\\n\" + map_lines(prs, n + width, width, graph)\n" ++
     "          end\n" ++
     "        elsif multiline?(v)\n" ++
     "          key + \" \" + literal(v, n + width)\n" ++
@@ -10898,6 +10975,7 @@ and stdlib_src = fn (name: str) ->
     "        else\n" ++
     "          key + \" \" + scalar(v) + \"\\n\"\n" ++
     "        end\n" ++
+    "        key_prefix + body\n" ++
     "      end.join\n" ++
     "    end\n" ++
     "\n" ++
@@ -10966,7 +11044,8 @@ and stdlib_src = fn (name: str) ->
     "\n" ++
     "  # YAML.dump_stream(*objs): one document per object, one after another.\n" ++
     "  def self.dump_stream(*objs)\n" ++
-    "    objs.map \{ |o| Emitter.dump(o) }.join\n" ++
+    "    graph = Emitter::Graph.new(objs)\n" ++
+    "    objs.map \{ |o| Emitter.dump(o, \{}, graph) }.join\n" ++
     "  end\n" ++
     "\n" ++
     "  # YAML.dump(obj[, io]): the text, or the io it was written to.\n" ++
@@ -10989,7 +11068,6 @@ and stdlib_src = fn (name: str) ->
     "      alias transform to_ruby\n" ++
     "    end\n" ++
     "  end\n" ++
-
     "\n" ++
     "  def self.deep_symbolize(v)\n" ++
     "    case v\n" ++
@@ -11008,6 +11086,7 @@ and stdlib_src = fn (name: str) ->
     "class Object\n" ++
     "  def to_yaml(options = \{}) = Psych.dump(self, options)\n" ++
     "end\n"
+
   else if str_eq n "__psych_class_loader" then
     "require 'date'\n" ++
     "require 'psych/class_loader'\n" ++
