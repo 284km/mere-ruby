@@ -4,6 +4,15 @@ require 'rbconfig'
 raise 'native probe builds currently require macOS' unless RUBY_PLATFORM.include?('darwin')
 root = File.expand_path('../..', __dir__)
 headers = File.join(__dir__, 'include')
+target = nil
+if ENV['MERE_NATIVE_CONFIG_DIR']
+  require 'json'
+  directory = File.expand_path(ENV.fetch('MERE_NATIVE_CONFIG_DIR'))
+  target = JSON.parse(File.read(File.join(directory, 'config.json')))
+  raise 'unsupported native configuration schema' unless target.fetch('schema') == 1
+  headers = File.join(directory, 'include')
+  raise 'native target headers missing' unless File.file?(File.join(headers, 'ruby/target_sizes.h'))
+end
 config = {
   'prefix' => root, 'exec_prefix' => '$(prefix)',
   'bindir' => root, 'ruby_install_name' => 'mere-ruby', 'RUBY_INSTALL_NAME' => 'mere-ruby',
@@ -30,6 +39,15 @@ config = {
   'build_os' => RbConfig::CONFIG['host_os'], 'sitearch' => RbConfig::CONFIG['arch'],
   'INSTALL' => 'install', 'EXTOUT' => '.ext', 'MAKEDIRS' => 'mkdir -p', 'CP' => 'cp', 'TOUCH' => 'touch'
 }
+if target
+  %w[CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS].each do |key|
+    config[key] = target.fetch('settings').fetch(key)
+    if ENV.key?(key) && ENV[key] != config[key]
+      raise "#{key} differs from generated native configuration; regenerate headers"
+    end
+  end
+  config['CPPFLAGS'] = '-DPROBE_TYPED_API ' + config['CPPFLAGS']
+end
 config.each { |key, value| RbConfig::MAKEFILE_CONFIG[key] = value.dup }
 config.each { |key, value| RbConfig::CONFIG[key] = value.dup }
 config.each_key { |key| RbConfig.expand(RbConfig::CONFIG[key]) }

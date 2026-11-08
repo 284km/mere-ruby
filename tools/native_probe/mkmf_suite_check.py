@@ -29,6 +29,9 @@ WT = Path(__file__).resolve().parents[2]
 SRC, REF, OUT = opts.ruby_source.resolve(), opts.reference.resolve(), opts.output.resolve()
 REF_BUILD = opts.reference_build.resolve() if opts.reference_build else SRC
 MERE = opts.mere.resolve() if opts.mere else WT/'mere-ruby'
+TARGET_CONFIG = (Path(os.environ['MERE_NATIVE_CONFIG_DIR']).resolve()
+                 if os.environ.get('MERE_NATIVE_CONFIG_DIR') else None)
+PROBE_HEADERS = TARGET_CONFIG/'include' if TARGET_CONFIG else WT/'tools/native_probe/include'
 OUT.mkdir(parents=True, exist_ok=True)
 if any(OUT.iterdir()):
     parser.error('--output must be empty, to exclude stale build products')
@@ -61,8 +64,10 @@ manifest = dict(inputs=before, files=[p.name for p in files],
                     Path(__file__).resolve(), WT/'tools/native_probe/mkmf_test_bootstrap.rb',
                     WT/'tools/native_probe/build_config.rb', WT/'unittest/bootstrap.rb',
                     WT/'unittest/child-bin/ruby']},
-                probe_headers={str(p.relative_to(WT)): digest(p)
-                    for p in (WT/'tools/native_probe/include').rglob('*') if p.is_file()},
+                probe_headers={str(p.relative_to(PROBE_HEADERS)): digest(p)
+                    for p in PROBE_HEADERS.rglob('*') if p.is_file()},
+                target_config=(json.loads((TARGET_CONFIG/'config.json').read_text())
+                               if TARGET_CONFIG else None),
                 reference_config=config, reference_libraries={},
                 limits=dict(seconds=90, process_family_rss_kib=2*1024*1024))
 save('manifest.json', manifest)
@@ -136,7 +141,7 @@ for side, binary in [('reference', REF), ('mere', MERE)]:
         shutil.copy2(SRC/p, dest)
     # Each runtime uses only its own headers and libraries. The in-tree mkmf
     # linker selects LIBRUBYARG_STATIC even for a shared installed CRuby.
-    inc = WT/'tools/native_probe/include' if side == 'mere' else Path(config['rubyhdrdir'])
+    inc = PROBE_HEADERS if side == 'mere' else Path(config['rubyhdrdir'])
     (source/'include').symlink_to(inc)
     arch = build/'.ext/include'/config['arch']
     arch.parent.mkdir(parents=True)
@@ -157,6 +162,8 @@ for side, binary in [('reference', REF), ('mere', MERE)]:
                        shlex.quote(str(WT/'tools/native_probe/mkmf_test_bootstrap.rb'))+' "$@"\n')
     launcher.chmod(0o755)
     env = dict(os.environ)
+    if TARGET_CONFIG:
+        env['MERE_NATIVE_CONFIG_DIR'] = str(TARGET_CONFIG)
     for key in ['RUBYOPT', 'APPVEYOR', 'MERE_LOADER_TEST', 'MERE_RUBY_GC_STRESS',
                 'MERE_RUBY_GC_DBG', 'MERE_TYPED_SKIP_MARK', 'MERE_TYPED_SKIP_FREE',
                 'MERE_NATIVE_SKIP_ENSURE', 'MERE_NATIVE_PROBE_NO_ROOT']:

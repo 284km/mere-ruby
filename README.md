@@ -298,6 +298,44 @@ and `--mere /path/to/instrumented-runtime`. The validator adds ASan/UBSan
 through mkmf's compiler/linker options and uses `use_sigaltstack=0`; the
 generated interpreter can remain uninstrumented, as in the earlier probes.
 
+### Target-specific probe headers
+
+The optional header generator measures `sizeof` using compilation only. It
+does not link or execute target programs, and reads `VALUE` from the probe API
+rather than copying CRuby's layout. It generates a separate header tree with
+`SIZEOF_*`, `LONG_LONG`, and `<limits.h>` for `CHAR_BIT`:
+
+```sh
+python3 tools/native_probe/configure_headers.py \
+  --cc clang --cflags='-O2 -arch arm64' \
+  --output /tmp/mere-native-arm64
+MERE_NATIVE_CONFIG_DIR=/tmp/mere-native-arm64 \
+  ./mere-ruby -r ./tools/native_probe/build_config.rb -rmkmf extconf.rb
+```
+
+Use a fresh output directory per target. Compiler commands, flags, header
+hashes, sizes, and compilation diagnostics are recorded alongside the headers.
+Generation publishes the directory only after verification; existing output,
+an unusable compiler, or a compiler accepting invalid code causes failure.
+Generated headers also check their sizes against the extension's actual C types.
+Supply target/sysroot options in the compiler flags. The opt-in RbConfig uses
+the recorded commands and flags; conflicting environment overrides fail and
+require regeneration. `MERE_NATIVE_CONFIG_DIR` must be passed to child Ruby
+processes as well. The suite helper below normalizes it and stages the same
+headers for in-tree tests, while the reference keeps its own headers.
+
+Run the generator checks with a real target toolchain:
+
+```sh
+python3 tools/native_probe/configure_headers_check.py \
+  --cc clang --cflags='-O2 -arch arm64' --output /tmp/native-header-check
+```
+
+Header generation and C compilation are validated on macOS arm64/x86_64 and
+Linux x86_64 GCC 15. Linux extension loading and the mkmf build configuration
+remain unvalidated; the existing macOS guard stays in place. These generated
+headers do not supply embedding functions or a runtime archive.
+
 ### Measuring all mkmf files
 
 The test environment prototype stages unchanged `test/mkmf` and `lib/mkmf.rb`
