@@ -67,6 +67,20 @@ p ["#{x}#{x}".encoding.name, "#{x}#{x}".to_sym.encoding.name]
   end
 end
 
+# Static adjacent pieces keep their parse-time encoding on either side.
+# ASCII/non-ASCII escapes, empty pieces and frozen-source settings are distinct.
+x = 1
+y = 2
+%w[UTF-8 US-ASCII ASCII-8BIT EUC-JP Windows-31J].each do |coding|
+  [false, true].each do |frozen|
+    ['"a" "#{x}#{y}"', '"#{x}#{y}" "a"', '"" "#{x}#{y}"', '"#{x}#{y}" ""', '"\\u0041" "#{x}#{y}"', '"#{x}#{y}" "\\u0041"', '"\\u3042" "#{x}#{y}"', '"#{x}#{y}" "\\u3042"', '"\\x80" "#{x}#{y}"', '"#{x}#{y}" "\\x80"', '"a" "#{x}#{y}" "b"', '"#{x}#{y}" "a" "#{y}"', '\'a\' "#{x}#{y}"', '"#{x}#{y}" \'a\''].each do |source|
+      header = "# coding: " + coding + "\n# frozen_string_literal: " + frozen.to_s + "\n"
+      value = eval((header + source).encode(coding))
+      p [coding, frozen, source, value.bytes, value.encoding.name, value.frozen?]
+    end
+  end
+end
+
 # Adjacent interpolated literals do not invoke a replaced String#+.
 class String
   def +(other); raise 'literal concatenation called String#+'; end
