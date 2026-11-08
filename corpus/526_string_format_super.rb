@@ -95,3 +95,91 @@ begin
 rescue NoMethodError => error
   puts error.class
 end
+
+# An undef entry must stop super before either builtin fallback.
+class NoFormat < String
+  undef_method :%
+end
+class ChildFormat < NoFormat
+  def %(value)
+    super
+  end
+end
+class BlockChildFormat < NoFormat
+  def %(value)
+    super { raise 'format block must not run' }
+  end
+end
+[ChildFormat.new('%s'), BlockChildFormat.new('%s')].each do |receiver|
+  begin
+    receiver % 'removed'
+    raise 'super bypassed undef'
+  rescue NoMethodError => error
+    p [error.class, error.name, error.receiver.equal?(receiver), error.args]
+  end
+end
+
+class NoEach < Array
+  undef_method :each
+end
+values = NoEach.new([3, 4])
+def values.each
+  super { |value| yield value }
+end
+begin
+  values.each { raise 'undefined iterator yielded' }
+  raise 'singleton super bypassed undef'
+rescue NoMethodError => error
+  p [error.class, error.name, error.receiver.equal?(values), error.args]
+end
+# The block-less singleton path must observe the same barrier.
+plain = NoFormat.new('%s')
+def plain.%(value)
+  super
+end
+begin
+  plain % 'removed'
+  raise 'singleton super bypassed undef'
+rescue NoMethodError => error
+  p [error.class, error.name, error.args]
+end
+
+# A method defined before the barrier remains callable.
+class RestoredFormat < NoFormat
+  def %(value)
+    "restored:#{value}"
+  end
+end
+class WrappedRestoredFormat < RestoredFormat
+  def %(value)
+    super
+  end
+end
+p WrappedRestoredFormat.new('%s') % 'ok'
+module RestoredEach
+  def each
+    yield :restored
+  end
+end
+values.extend(RestoredEach)
+p values.each { |value| value }
+
+# Missing-method handling retains arguments and the literal block.
+class MissingFormat < ChildFormat
+  def method_missing(name, *args)
+    [name, args]
+  end
+end
+p MissingFormat.new('%s') % 'missing'
+# A separate receiver has no extended implementation above its undef entry.
+missing_values = NoEach.new
+class << missing_values
+  def each(value)
+    super(value) { |item| yield item }
+  end
+  def method_missing(name, *args)
+    [name, args, yield(:missing)]
+  end
+end
+p missing_values.each(:argument) { |item| [item, :block] }
+p FormatString.new('%s') % 'after undef errors'
