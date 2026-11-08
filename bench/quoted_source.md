@@ -33,9 +33,10 @@ startup. The previous-scanner binary contains the validated #38/#42 integration
 
 The full upstream `ruby/test_allocation.rb` now completes within the unchanged
 600-second/2-GiB limits: 82 tests in 24.471 seconds at 473,376 KiB peak family
-RSS. Its 82 errors remain: the ObjectSpace count results do not provide the
-array/hash counters those CRuby allocation checks expect. A small unchanged
-test reproduces that error before this patch. Completion is not conformance.
+RSS. Its 82 errors remain: 76 arise because ObjectSpace does not provide the
+array/hash counters those CRuby allocation checks expect; six are test-method
+lookup errors. Focused unchanged tests reproduce both categories before this
+patch. Completion is not conformance.
 
 The final code also handles a single Unicode escape list containing 100,000
 codepoints at 61,734,912 bytes peak child RSS; the initial fix to only the outer
