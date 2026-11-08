@@ -2363,3 +2363,39 @@ Note 511's stage 3: "ruby/enc", "cgi", "erb 4", "uri 3", "monitor 3",
   monitor 11 → 14/14, etc 11 → 13. test_array's one flip is
   test_shared_marking, a five-second GC test that the REFERENCE failed in
   one run and passed in the other (mere-ruby skips it both times).
+
+## 2026-11-08 (14): Tempfile is ruby's own -- test_tempfile 37 → 45/45; a File's clone, a lone splat's to_a
+
+Note 511's stage 3, "tempfile 8". corpus/526 is the witness.
+
+- **Tempfile was mere-ruby's own** (140 lines in m_eval_leaf.mere): unlink
+  and close! left the path set, Tempfile.open's #open did not answer the
+  reopened File, and an anonymous file could not be made. It is ruby
+  4.0.9's lib/tempfile.rb now, byte for byte (lib/tempfile_ext.rb through
+  tools/gen_pathname_lib.rb, as Pathname and tmpdir are), DelegateClass(File)
+  and all; every test but the anonymous two passed with it as it is.
+- **An anonymous file** (`Tempfile.create(anonymous: true)`) is ruby's
+  create-and-unlink: a descriptor that outlives its name. mere-ruby's File
+  is a path and a buffer, and a file unlinked under it cannot be read back
+  (File#fileno reopens the path). One method is redefined after ruby's
+  file, marked as mere-ruby's: the file keeps its generated name until it
+  is closed (or the process exits) and answers its path as ruby's does,
+  the directory's (`File.join(tmpdir, "")`).
+- **File#clone shared the original's state**: closing a clone closed the
+  original (IO's clone is initialize_copy, a dup of the descriptor, as
+  dup is). It is File#dup's copy, with the modules the File was extended
+  with and its frozen state.
+- **`a, b = *x` with a lone splat** asked only a user-defined to_a: an
+  Enumerator, a Hash, a Range bound themselves to `a`. A builtin that
+  answers to_a splats into its elements (a String does not answer it).
+- **Checked**: corpus 543/543 both ways, 526 under GC_STRESS=50, the 13
+  gates; 136 unittest files (7033 tests, the wide set plus IO, File, Dir,
+  ARGF, process and require) against dcbdbf0's binary: test_tempfile
+  37 → 45, no file lower (test_dir's test_symlink failed once while both
+  runs shared the machine and passes alone, twice); the assignment-heavy
+  files (assignment, array, hash, enumerator, range, syntax, struct, call,
+  iterator, yield, proc, lazy enumerator, io) at their counts.
+- **Left** (interpreter): `(($stdout = x) rescue y)` -- the parentheses
+  vanish before the rescue modifier sees the assignment, so the rescue
+  wraps the value and the setter's TypeError escapes; `x = a = *b` should
+  be a SyntaxError ("multiple assignment is not allowed in this context").

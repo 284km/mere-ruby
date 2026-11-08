@@ -28,7 +28,8 @@ files = [[%w[pathname pathname.so], File.read("#{here}/lib/pathname_ext.rb")],
            "class Date\n" + File.read("#{here}/lib/date_parse_ext.rb").sub(/\A# frozen_string_literal: \w+\n/, "") + "\n" +
            File.read("#{here}/lib/date_strptime_ext.rb").sub(/\A# frozen_string_literal: \w+\n/, "") +
            "\n  private_constant :MereDateParse, :MereDateStrptime\nend\n"],
-         [%w[time], File.read("#{here}/lib/time_ext.rb")]]
+         [%w[time], File.read("#{here}/lib/time_ext.rb")],
+         [%w[tempfile], File.read("#{here}/lib/tempfile_ext.rb")]]
 
 def lit(line)
   line.gsub(/[\\"{}\t\r]/) { |c| { "\\" => "\\\\", '"' => '\\"', "{" => "\\{", "}" => "\\}", "\t" => "\\t", "\r" => "\\r" }[c] }
