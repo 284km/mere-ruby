@@ -2444,6 +2444,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (if interp_literal e then mkstr "expression"
     else
     (match e with
+     | ECall (marker, Cons (EStmt st, Nil)) when str_eq marker (chr 1 ++ "defined_assignment") ->
+       (let _ = declare_nils env (stmt_targets st) in mkstr "assignment")
      | ENil -> mkstr "nil"
      | EBool b -> if b then mkstr "true" else mkstr "false"
      // `&&`, `||`, `and` and `or` are CONTROL FLOW, not method calls: ruby
@@ -3330,7 +3332,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if (match rev_app arges Nil with Cons (EBlockPass _, _) -> true | _ -> false) then
       (match rev_app arges Nil with
        | Cons (EBlockPass be, rrest) ->
-         eval_e env world blk (ECallB (name, rev_app rrest Nil, Cons ("&coerce", Nil), Cons (SExpr be, Nil)))
+         eval_e env world blk (ECallB (name, rev_app rrest Nil, Cons (block_pass_marker, Nil), Cons (SExpr be, Nil)))
        | _ -> VNil)
     else
     // `refine X.singleton_class do...end` mis-parses: the do-block binds to the
@@ -3796,7 +3798,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   // `eval(src) { }`: eval takes no block -- the literal one is dropped, and a
   // `yield` in the source is the caller's (a LocalJumpError at the top)
   | ECallB (name, arges, bp, _) when (str_len name == 4 && str_eq name "eval")
-                                     && (match bp with Cons ("&coerce", _) -> false | _ -> true)
+                                     && (match bp with Cons (p9, _) when str_eq p9 block_pass_marker -> false | _ -> true)
                                      && (let (mt9, _, _, _) = world in if map_has mt9 "eval" then false else true) ->
     eval_e env world blk (ECall (name, arges))
   | ECallB (name, arges, _, _) when (str_len name == 5 && str_eq name "using")
@@ -3808,7 +3810,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let args = eval_args env world blk arges in
     let newblk = (match bp with
                   | Cons (c, Nil) ->
-                    (if str_eq c "&coerce"
+                    (if str_eq c block_pass_marker
                      then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil)
                      else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
                            blk_capture blk (true, bp, bb, env) bb))
@@ -3950,7 +3952,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       raise_exc_iv world "NoMethodError" ("undefined method 'refine' for " ++ for_recv_cls world (dispatch_cls_of world (lv_get env "self")))
         (Cons (("__name", VSym "refine"), Cons (("__recv", lv_get env "self"), Nil)))
     else if (str_len name == 6 && str_eq name "refine") && (match lv_get env "self" with VClass _ -> true | _ -> false)
-            && (match bp with Cons (c9, Nil) -> str_eq c9 "&coerce" | _ -> false) then
+            && (match bp with Cons (c9, Nil) -> str_eq c9 block_pass_marker | _ -> false) then
       raise_exc world "ArgumentError" "can't pass a Proc as a block to Module#refine"
     else if (str_len name == 6 && str_eq name "refine") && (match args with Cons (VClass _, _) -> true | _ -> false) && (match lv_get env "self" with VClass _ -> true | _ -> false) then
       (let refinery = (match lv_get env "self" with VClass rc -> rc | _ -> "") in
@@ -4397,7 +4399,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let recv = eval_e env world blk recv_e in
     let args = eval_args env world blk arges in
     let newblk = (match bp with
-                  | Cons (c, Nil) -> if str_eq c "&coerce" then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else blk_capture blk (true, bp, bb, env) bb
+                  | Cons (c, Nil) -> if str_eq c block_pass_marker then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else blk_capture blk (true, bp, bb, env) bb
                   | _ -> (let s9 = bp_sym world bp bb in
                           if str_len s9 > 0 then coerce_to_block env world blk (VSym s9)
                           else blk_capture blk (true, bp, bb, env) bb)) in
@@ -4480,10 +4482,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EBin (op, a, b) ->
     if str_len op == 2 && str_eq op "&&" then
       let va = eval_e env world blk a in
-      if truthy va then eval_e env world blk b else va
+      if truthy va then eval_e env world blk b
+      else (let _ = declare_nils env (expr_pat_vars b) in va)
     else if str_len op == 2 && str_eq op "||" then
       let va = eval_e env world blk a in
-      if truthy va then va else eval_e env world blk b
+      if truthy va then (let _ = declare_nils env (expr_pat_vars b) in va)
+      else eval_e env world blk b
     // an interpolated string, `"a#{x}b"` -- desugared by the lexer to
     // `"" + "a" + x.__interp_str + "b"` -- is built in ONE pass: the pieces'
     // bytes are joined and one String is made at the end. The `+` chain made
@@ -7893,14 +7897,15 @@ and stmt_targets = fn (s: Stmt) ->
      | EVar h ->
        // assignments from the hidden for-loop params leak by design.
        if str_len h > 2 && str_eq (substring h 0 3) "__f" then Nil else Cons (n, Nil)
-     | _ -> Cons (n, Nil))
+     | _ -> Cons (n, expr_pat_vars e))
   | SLocalFrom (n, s2) -> Cons (n, stmt_targets s2)
-  | SMultiAssign (ts, _) -> ts
-  | SMultiAssignX (ts, _) -> x_target_names ts
+  | SMultiAssign (ts, es) -> list_append_str ts (exprs_pat_vars es)
+  | SMultiAssignX (ts, es) -> list_append_str (x_target_names ts) (list_append_str (exprs_pat_vars ts) (exprs_pat_vars es))
   | SIf (clauses, els) -> list_append_str (clauses_targets clauses) (deep_targets els)
-  | SWhile (_, b) -> deep_targets b
-  | SCase (_, whens, els) -> list_append_str (whens_targets whens) (deep_targets els)
-  | SCaseIn (_, clauses, _, els) -> list_append_str (clauses_pat_vars clauses) (list_append_str (clausesin_targets clauses) (deep_targets els))
+  | SWhile (c, b) -> list_append_str (expr_pat_vars c) (deep_targets b)
+  | SDoWhile (b, c) -> list_append_str (stmt_targets b) (expr_pat_vars c)
+  | SCase (e, whens, els) -> list_append_str (expr_pat_vars e) (list_append_str (whens_targets whens) (deep_targets els))
+  | SCaseIn (e, clauses, _, els) -> list_append_str (expr_pat_vars e) (list_append_str (clauses_pat_vars clauses) (list_append_str (clausesin_targets clauses) (deep_targets els)))
   | SBegin (b, rescues, els, ens) ->
     list_append_str (deep_targets b)
       (list_append_str (rescues_targets rescues) (list_append_str (deep_targets els) (deep_targets ens)))
@@ -7910,22 +7915,52 @@ and stmt_targets = fn (s: Stmt) ->
   // and one-line pattern matching `x => pat` / `x in pat` — the latter even
   // when nested in a larger expression (`(x in pat).should == y`).
   | SExpr e -> expr_pat_vars e
+  | SPuts es -> exprs_pat_vars es
+  | SIVarAssign (_, e) -> expr_pat_vars e
+  | SReturn e -> expr_pat_vars e
+  | SBreak e -> expr_pat_vars e
+  | SNext e -> expr_pat_vars e
+  | SRequire (_, e) -> expr_pat_vars e
+  // The receiver/superclass is evaluated here; the class body has its own scope.
+  | SClassE (_, e, _) -> expr_pat_vars e
+  | SSingletonE (e, _) -> expr_pat_vars e
   | _ -> Nil
 
 // collect variables that an expression declares as locals: named captures from
-// `=~`, and pattern variables from any nested one-line `=>` / `in`.
+// `=~`, pattern variables, and assignments inside skipped expressions.
+// Block/lambda bodies and method/class bodies belong to separate scopes.
 and expr_pat_vars = fn (e: Expr) ->
   match e with
-  | EMatchBind (_, pat) -> pat_vars pat
-  | EMatchTest (_, pat) -> pat_vars pat
+  | EMatchBind (a, pat) -> list_append_str (expr_pat_vars a) (pat_vars pat)
+  | EMatchTest (a, pat) -> list_append_str (expr_pat_vars a) (pat_vars pat)
   | EBin (o, a, b) ->
     let capt = if str_eq o "=~" then (match a with ERegex (pat, _) -> rx_capture_names pat 0 | _ -> Nil) else Nil in
     list_append_str capt (list_append_str (expr_pat_vars a) (expr_pat_vars b))
   | EUn (_, a) -> expr_pat_vars a
+  | ESplat a -> expr_pat_vars a
+  | EKwSplat a -> expr_pat_vars a
+  | EBlockPass a -> expr_pat_vars a
+  | EDefined a -> expr_pat_vars a
+  | EFlow (_, a) -> expr_pat_vars a
+  | ERange (a, b, _) -> list_append_str (expr_pat_vars a) (expr_pat_vars b)
+  | EFlipFlop (_, a, b, _) -> list_append_str (expr_pat_vars a) (expr_pat_vars b)
+  | EAttrOp (recv, _, _, a) -> list_append_str (expr_pat_vars recv) (expr_pat_vars a)
+  | EIdxOp (recv, es, _, a) -> list_append_str (expr_pat_vars recv) (list_append_str (exprs_pat_vars es) (expr_pat_vars a))
+  | EScopedRead (a, _) -> expr_pat_vars a
+  | EScopedReadOrNil (a, _) -> expr_pat_vars a
+  | EScopedAssign (a, _, b) -> list_append_str (expr_pat_vars a) (expr_pat_vars b)
+  | EAmbigIdx (_, es) -> exprs_pat_vars es
+  | EAmbigIdxC (_, a, b) -> list_append_str (expr_pat_vars a) (expr_pat_vars b)
+  | EYield es -> exprs_pat_vars es
+  | ERaise es -> exprs_pat_vars es
+  | ESuper (_, es) -> exprs_pat_vars es
+  | ESuperB (_, es, ps, body) -> list_append_str (exprs_pat_vars es) (block_pass_targets ps body)
+  | EKwHash es -> exprs_pat_vars es
+  | ESafeB (recv, _, args, ps, body) -> list_append_str (expr_pat_vars recv) (list_append_str (exprs_pat_vars args) (block_pass_targets ps body))
   | EMethod (recv, _, args) -> list_append_str (expr_pat_vars recv) (exprs_pat_vars args)
-  | EMethodB (recv, _, args, _, _) -> list_append_str (expr_pat_vars recv) (exprs_pat_vars args)
+  | EMethodB (recv, _, args, ps, body) -> list_append_str (expr_pat_vars recv) (list_append_str (exprs_pat_vars args) (block_pass_targets ps body))
   | ECall (_, args) -> exprs_pat_vars args
-  | ECallB (_, args, _, _) -> exprs_pat_vars args
+  | ECallB (_, args, ps, body) -> list_append_str (exprs_pat_vars args) (block_pass_targets ps body)
   | ETern (a, b, c) -> list_append_str (expr_pat_vars a) (list_append_str (expr_pat_vars b) (expr_pat_vars c))
   | EArr es -> exprs_pat_vars es
   | EHsh es -> exprs_pat_vars es
@@ -7939,18 +7974,31 @@ and expr_pat_vars = fn (e: Expr) ->
   // targets that statement would — including a nested case/in's pattern vars.
   | EStmt s -> stmt_targets s
   | _ -> Nil
+// The parser stores &expr in a synthetic block, but evaluates it in the
+// caller's scope. A literal block's body still belongs to its own scope.
+and block_pass_targets = fn (ps: str list) -> fn (body: Stmt list) ->
+  match ps with
+  | Cons (p, Nil) -> if str_eq p block_pass_marker then deep_targets body else Nil
+  | _ -> Nil
 and exprs_pat_vars = fn (es: Expr list) ->
   match es with Nil -> Nil | Cons (h, t) -> list_append_str (expr_pat_vars h) (exprs_pat_vars t)
+
+// Modifier bodies precede their guards in Ruby source. Their early pass
+// must not declare names assigned later inside the guard itself.
+and clause_body_targets = fn clauses ->
+  match clauses with
+  | Nil -> Nil
+  | Cons (cl, rest) -> let (_, b) = cl in list_append_str (deep_targets b) (clause_body_targets rest)
 
 and clauses_targets = fn clauses ->
   match clauses with
   | Nil -> Nil
-  | Cons (cl, rest) -> let (c, b) = cl in list_append_str (deep_targets b) (clauses_targets rest)
+  | Cons (cl, rest) -> let (c, b) = cl in list_append_str (expr_pat_vars c) (list_append_str (deep_targets b) (clauses_targets rest))
 
 and whens_targets = fn whens ->
   match whens with
   | Nil -> Nil
-  | Cons (w, rest) -> let (vs, b) = w in list_append_str (deep_targets b) (whens_targets rest)
+  | Cons (w, rest) -> let (vs, b) = w in list_append_str (exprs_pat_vars vs) (list_append_str (deep_targets b) (whens_targets rest))
 
 and rescues_targets = fn rescues ->
   match rescues with
@@ -53612,7 +53660,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        // `define_method(:name) { body }` registers the block as a method;
        // any other expression statement executes.
        // ⚠ ...a LITERAL block, and a Symbol name. `define_method(:x, &pr)`
-       //   arrives here too, as the block-pass form (bp is ["&coerce"], the
+       //   arrives here too, as the block-pass form (bp contains block_pass_marker, the
        //   body the expression), and was registered as a method whose one
        //   parameter was a block called `coerce` and whose body evaluated
        //   `pr` -- so it refused every argument and answered the proc. A
@@ -53620,7 +53668,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        //   are the call form's job, which evaluates what it was given.
        | SExpr (ECallB (fname, fargs, bp, bb))
          when (match (fargs, bp) with
-               | (_, Cons (c9, Nil)) when str_eq c9 "&coerce" -> false
+               | (_, Cons (c9, Nil)) when str_eq c9 block_pass_marker -> false
                | (Cons (ESym _, Nil), _) -> true
                | _ -> false) ->
          if str_eq fname "define_method" then
@@ -55046,7 +55094,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   // a modifier `x if c` / `x unless c`: x comes first in the text, so its
   // targets are locals before c is read (apply_modifier's mod_mark)
   | SIf (clauses, Cons (SDeclare (Cons (m9, Nil)), els9)) when str_eq m9 mod_mark ->
-    let _ = declare_nils env (clauses_targets clauses) in
+    let _ = declare_nils env (clause_body_targets clauses) in
     exec_stmt env world blk (SIf (clauses, els9))
   | SIf (clauses, els) ->
     // after the if, declare (as nil) any assignment targets in branches
@@ -55775,11 +55823,13 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SDoWhile (s2, cond) -> run_dowhile env world blk s2 cond
   | SAndThen (s1, s2) ->
     (match exec_stmt env world blk s1 with
-     | FNext v -> if truthy v then exec_stmt env world blk s2 else FNext v
+     | FNext v -> if truthy v then exec_stmt env world blk s2
+                  else (let _ = declare_nils env (stmt_targets s2) in FNext v)
      | esc -> esc)
   | SOrElse (s1, s2) ->
     (match exec_stmt env world blk s1 with
-     | FNext v -> if truthy v then FNext v else exec_stmt env world blk s2
+     | FNext v -> if truthy v then (let _ = declare_nils env (stmt_targets s2) in FNext v)
+                  else exec_stmt env world blk s2
      | esc -> esc)
   | SDeclare names ->
     let _ = declare_nils env names in FNext VNil
@@ -57957,7 +58007,7 @@ and hash_items_vars = fn (items: (str * Pat) list) ->
 and clausesin_targets = fn clauses ->
   match clauses with
   | Nil -> Nil
-  | Cons (cl, rest) -> let (p, g, b) = cl in list_append_str (deep_targets b) (clausesin_targets rest)
+  | Cons (cl, rest) -> let (p, g, b) = cl in list_append_str (expr_pat_vars g) (list_append_str (deep_targets b) (clausesin_targets rest))
 
 // ---- regex pattern parser (compiled engine) -------------------------------
 // Parses a Ruby regex body into RNode (types near Flow). Flags are resolved
