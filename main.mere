@@ -1038,6 +1038,9 @@ let gc_mark_roots = fn env -> fn live ->
   //  has ended is no longer the running frame of its depth -- tp_env)
   let _ = map_iter tp_env (fn (k: int) -> fn (e) -> gc_mark_env live e) in
   let _ = map_iter globals mk in
+  let _ = if mr_probe_mark () == 1 then
+    map_iter native_handle_values (fn (slot: int) -> fn (value: Val) -> gc_mark_val live value)
+    else () in
   let _ = map_iter rx_parked (fn (k: int) -> fn (i: int) -> gc_mark_val live (VObj i)) in
   let _ = gc_mark_val live (rx_md_get ()) in
   let _ = map_iter consts mk in
@@ -20887,6 +20890,128 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // `require "prism/prism"` answers). Each answer is the parser's serialized
     // form, which Prism's own Ruby library reads. Only names starting with
     // __prism_ are answered, as for Syslog above.
+    else if str_eq c "NativeProbe" && str_len name > 2 && str_eq (substring name 0 2) "__" then
+      (let retain9 = fn (v: Val) ->
+         let token = native_handle_retain v in
+         if token == 0 then
+           (let _ = raise_exc world "NoMemoryError" "native handle token space exhausted" in 0)
+         else token in
+       let get9 = fn (token: int) ->
+         if native_handle_valid token then native_handle_get token
+         else raise_exc world "ArgumentError" "native handle is invalid or released" in
+       let bad9 = fn (u: unit) -> raise_exc world "ArgumentError" "invalid native handle arguments" in
+       if str_eq name "__retain" then
+         (match args with Cons (v, Nil) -> VInt (retain9 v) | _ -> bad9 ())
+       else if str_eq name "__get" then
+         (match args with Cons (VInt t, Nil) -> get9 t | _ -> bad9 ())
+       else if str_eq name "__release" then
+         (match args with Cons (VInt t, Nil) ->
+            if native_handle_release t then VNil else bad9 ()
+          | _ -> bad9 ())
+       else if str_eq name "__update" then
+         (match args with Cons (VInt t, Cons (v, Nil)) ->
+            if native_handle_update t v then VNil else bad9 ()
+          | _ -> bad9 ())
+       else if str_eq name "__count" then VInt (native_handle_count ())
+       else if str_eq name "__capacity" then VInt (native_handle_capacity ())
+       else if str_eq name "__table_bytes" then VInt (native_handle_bytes ())
+       else if str_eq name "__c_store" then
+         (match args with Cons (VInt slot, Cons (VInt t, Nil)) ->
+            if slot < 0 || slot >= 256 || (if native_handle_valid t then false else true) then bad9 ()
+            else (let _ = mr_probe_slot_put slot t in VNil)
+          | _ -> bad9 ())
+       else if str_eq name "__c_get" || str_eq name "__c_forget" then
+         (match args with Cons (VInt slot, Nil) ->
+            if slot < 0 || slot >= 256 then bad9 ()
+            else if str_eq name "__c_get" then get9 (mr_probe_slot_get slot)
+            else (let _ = mr_probe_slot_put slot 0 in VNil)
+          | _ -> bad9 ())
+       else if str_eq name "__watch" then
+         (match args with Cons (VInt t, Nil) ->
+            (match get9 t with VStr h ->
+               // Ruby's internal id includes handle_base (2^48). The test
+               // observer transports only a checked page-store index in C int.
+               let index = h - handle_base in
+               if index < 0 || index > native_handle_max then bad9 ()
+               else (let _ = mr_probe_watch_string index in VNil)
+             | _ -> bad9 ())
+          | _ -> bad9 ())
+       else if str_eq name "__watched_size" then VInt (str_len (sget (handle_base + mr_probe_watched_string ())))
+       else if str_eq name "__seed_handle" then
+         (match args with Cons (VInt kind, Nil) ->
+            if kind == 0 then VInt (retain9 (mkstr ("native-seed-" ++ str_repeat "x" 4096)))
+            else if kind == 1 then
+              (let a = arr_new Nil in
+               let _ = (match a with VArr id -> arr_set id (Cons (mkstr "native-cycle", Cons (a, Nil))) | _ -> ()) in
+               VInt (retain9 a))
+            else if kind == 2 then
+              (let (_, _, ocls, ivars) = world in
+               let oid = alloc_oid ocls in
+               let _ = map_set ocls oid "Object" in
+               let _ = map_set ivars (str_of_int oid ++ "@payload") (mkstr ("native-object-" ++ str_repeat "y" 4096)) in
+               VInt (retain9 (VObj oid)))
+            else bad9 ()
+          | _ -> bad9 ())
+       else if str_eq name "__load" then
+         (match args with
+          | Cons (VStr h, Nil) ->
+            let rc = mr_probe_load (sget h) in
+            if rc < 0 then raise_exc world "LoadError" (mr_probe_error ()) else VInt rc
+          | _ -> raise_exc world "ArgumentError" "probe load expects a path")
+       else if str_eq name "__call" then
+         (match args with
+          | Cons (VStr h, Cons (VFlt x, Cons (VFlt y, Nil))) ->
+            let id = mr_probe_find (sget h) in
+            if id < 0 then raise_exc world "NameError" "unknown probe method"
+            else VFlt (mr_probe_call id x y)
+          | _ -> raise_exc world "TypeError" "probe supports two Float arguments only")
+       else if str_eq name "__seed" then
+         (let token = retain9 (mkstr ("native-seed-" ++ str_repeat "x" 4096)) in
+          let _ = native_handle_release (mr_probe_held ()) in
+          let _ = mr_probe_hold token in VNil)
+       else if str_eq name "__phase" then VInt (mr_probe_phase ())
+       else if str_eq name "__resources" then VInt (mr_probe_live_resources ())
+       else if str_eq name "__callback" then
+         (match args with
+          | Cons (proc, Cons (VInt n, Nil)) ->
+            // Reserve roots before entering C, including the exception slot:
+            // exhaustion must not interrupt foreign cleanup on the raise path.
+            let exception_token = retain9 VNil in
+            let proc_token = native_handle_retain proc in
+            let _ = if proc_token == 0 then
+              (let _ = native_handle_release exception_token in
+               let _ = raise_exc world "NoMemoryError" "native handle token space exhausted" in ()) else () in
+            let pending = map_new () in
+            let safe_cb = fn (x: int) ->
+              try_or_msg (fn (u: unit) ->
+                match invoke_val_c env world blk (native_handle_get proc_token) "call" (Cons (VInt x, Nil)) false with
+                | VInt r -> r
+                | _ -> let _ = raise_exc world "TypeError" "probe callback expects Integer result" in 0)
+                (fn (m: str) ->
+                  let (_, _, _, iv) = world in
+                  let _ = map_set pending "raised" true in
+                  let _ = native_handle_update exception_token (map_get iv "$exc") in
+                  0 - 1) in
+            // Capture Ruby's exception before returning to C. The native call
+            // completes its cleanup before we re-raise that same Ruby object.
+            let r = mr_probe_reenter safe_cb n in
+            let _ = native_handle_release proc_token in
+            if map_has pending "raised" then
+              (let e = native_handle_get exception_token in
+               let _ = native_handle_release exception_token in raise_exc_val world e)
+            else (let _ = native_handle_release exception_token in VInt r)
+          | _ -> raise_exc world "ArgumentError" "probe callback expects a callable and Integer")
+       else if str_eq name "__hold" then
+         (match args with
+          | Cons (v, Nil) -> let token = retain9 v in
+                            let _ = native_handle_release (mr_probe_held ()) in
+                            let _ = mr_probe_hold token in VNil
+          | _ -> raise_exc world "ArgumentError" "probe hold expects one object")
+       else if str_eq name "__fetch" then
+         (if native_handle_valid (mr_probe_held ()) then native_handle_get (mr_probe_held ()) else VNil)
+       else if str_eq name "__clear" then
+         (let _ = native_handle_release (mr_probe_held ()) in let _ = mr_probe_hold 0 in VNil)
+       else raise_exc world "NoMethodError" "unknown probe operation")
     else if str_eq c "Prism" && str_len name > 8 && str_eq (substring name 0 8) "__prism_"
             && (str_eq name "__prism_ser" || str_eq name "__prism_ok" || str_eq name "__prism_more"
                 || str_eq name "__prism_query" || str_eq name "__prism_version") then
