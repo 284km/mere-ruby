@@ -11965,8 +11965,12 @@ and key_has_user_hash = fn world -> fn (k: Val) ->
                 //  test_any_hash_fixable)
                 || (map_len undefs > 0 && (let c9 = dispatch_cls_of world k in
                                            undef_blocked world c9 "hash" && has_meth world c9 "method_missing"))
-  | VArr _ -> key_hash_here world k
-  | VHsh _ -> key_hash_here world k
+  // (...and an Array or Hash key holding such a key: its #hash is made of
+  //  theirs and its #eql? asks theirs, so the structural compare -- identity
+  //  for an object -- lost `h[[label_a, label_b]]` for good: resolv's DNS
+  //  name compression keys its table by arrays of Label::Str)
+  | VArr aid9 -> key_hash_here world k || elems_user_hash world (deref aid9)
+  | VHsh hid9 -> key_hash_here world k || elems_user_hash world (hderef hid9)
   // ⚠ A STRING KEY IS HASHED BY ITS CONTENT, ALWAYS. Ruby's rb_any_hash
   // branches on the type tag for String (and for true/false/Integer/Float/
   // Symbol, which are already excluded here), so a redefined String#hash --
@@ -11975,6 +11979,29 @@ and key_has_user_hash = fn world -> fn (k: Val) ->
   // what core/hash/element_reference's fixture raises on.
   | _ -> false
 
+and hash_pairs_code = fn env -> fn world -> fn (xs: Val list) -> fn (acc: int) ->
+  match xs with
+  | Cons (k9, Cons (v9, t9)) ->
+    (let code9 = fn (x: Val) ->
+       (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) x "hash" Nil false with
+        | VInt n9 -> n9
+        | _ -> val_hash x) in
+     hash_pairs_code env world t9 (acc + code9 k9 * 31 + code9 v9))
+  | _ -> acc
+// (bounded: a key that holds itself -- `a << a`, `h[:x] = [h]` -- is a
+//  cycle, and sixteen levels down is far past any key a program builds)
+and elems_user_hash = fn world -> fn (xs: Val list) -> elems_uh world xs 0
+and elems_uh = fn world -> fn (xs: Val list) -> fn (d: int) ->
+  if d > 16 then false
+  else
+  match xs with
+  | Nil -> false
+  | Cons (x9, t9) ->
+    (match x9 with
+     | VObj _ -> key_has_user_hash world x9
+     | VArr a9 -> key_hash_here world x9 || elems_uh world (deref a9) (d + 1)
+     | VHsh h9 -> key_hash_here world x9 || elems_uh world (hderef h9) (d + 1)
+     | _ -> false) || elems_uh world t9 d
 // ⚠ dispatch_cls_of DELIBERATELY looks past a hanging SINGLETON class (it
 // answers the class a `super` should resume above), so `def k.hash` on an
 // Array key was invisible here and Hash never asked that key for its hash --
@@ -12054,6 +12081,10 @@ and hkey_eql_w = fn env -> fn world -> fn (hid: int) -> fn (a: Val) -> fn (b: Va
        (if has_meth world (dispatch_cls_of world b) "eql?"
         then truthy (invoke_val_c env world nb7 b "eql?" (Cons (a, Nil)) false)
         else if (match b with VObj ib -> map_has time_inst (str_of_int ib) | _ -> false)
+        then truthy (invoke_val_c env world nb7 b "eql?" (Cons (a, Nil)) false)
+        // (an Array / Hash search key holding user-hashed keys: the builtin
+        //  #eql?, which asks its elements')
+        else if (match b with VArr _ -> true | VHsh _ -> true | _ -> false)
         then truthy (invoke_val_c env world nb7 b "eql?" (Cons (a, Nil)) false)
         else hkey_md_eql env world a b)
      else false)
@@ -15633,9 +15664,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // hash agrees with itself however deeply it is wrapped.
   else if (str_len name == 4 && str_eq name "hash") && (match recv with VHsh _ -> true | _ -> false)
           && (if prim_user_has world recv "hash" then false else true) then
-    (let _ = (if map_has cyc_flag "f" then map_delete cyc_flag "f" else ()) in
-     let r9 = val_hash recv in
-     VInt (if map_has cyc_flag "f" then 5077 else r9))
+    (match recv with
+     // (a key or value with its own #hash: the pairs' #hash answers, summed,
+     //  so two hashes that are #eql? hash alike -- as Array#hash asks its
+     //  elements. The structural code ignored them, and a Hash holding such
+     //  a value was never found as a key again)
+     | VHsh hid9 when elems_user_hash world (hderef hid9) ->
+       VInt (hash_pairs_code env world (hderef hid9) 7193)
+     | _ ->
+       (let _ = (if map_has cyc_flag "f" then map_delete cyc_flag "f" else ()) in
+        let r9 = val_hash recv in
+        VInt (if map_has cyc_flag "f" then 5077 else r9)))
   // Array#initialize (reached through `send`, since it is private): the same
   // conversions and refusals Array.new gets. The primitive had neither, so a
   // size of 2**62 recursed until the stack died and #to_ary was never asked.
@@ -17653,6 +17692,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let k9 = abs_path_of (sget p9) in
           let _ = (if on9 then map_set fifo_readers k9 1 else if map_has fifo_readers k9 then map_delete fifo_readers k9 else ()) in VNil)
        | _ -> VNil)
+    // ...and whether one is reading it now (File.__fifo_open_nb's ENXIO)
+    else if str_eq c "File" && (str_len name == 17 && str_eq name "__fifo_has_reader") then
+      (match args with
+       | Cons (VStr p9, _) -> VBool (map_has fifo_readers (abs_path_of (sget p9)))
+       | _ -> VBool false)
     else if str_eq c "File" && (str_len name == 7 && str_eq name "__umask") then
       (match args with Cons (VInt m9, _) -> VInt (file_umask m9) | _ -> VInt 0)
     // flock(2) through the compiler's file_flock (v0.1.550), which takes the
@@ -22036,8 +22080,23 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // `singleton_class.send :alias_method, :[], :new`, so `Node[a, b]` is
     // `Node.new(a, b)`): the alias table records the source name.
     else if (if str_eq (blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name) "" then false else true) then
-      (if is_definition_hook (blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name) then VNil
-       else invoke_val_c env world blk recv (blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name) args false)
+      (let t9 = blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name in
+       if is_definition_hook t9 then VNil
+       // (the BUILTIN the alias was taken of, also when the class defines that
+       //  name itself since: `class << HTTP; alias newobj new; end` and then
+       //  `def HTTP.new` -- net/http's newobj is the plain Class#new, as an
+       //  alias copies the method it names when it is made)
+       else if has_meth world ("(sng:" ++ c ++ ")") t9 && str_eq t9 "new" then
+         // (Class#new itself: allocate, then the instance's #initialize)
+         (let o9 = invoke_val_c env world blk recv "allocate" Nil false in
+          let _ = invoke_val_c env world blk o9 "initialize" args false in
+          o9)
+       else if has_meth world ("(sng:" ++ c ++ ")") t9 then
+         (let _ = map_set bi_skip "n" t9 in
+          let r9 = try_or_msg (fn (u: unit) -> invoke_val_c env world blk recv t9 args false)
+                     (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
+          let _ = map_clear bi_skip in r9)
+       else invoke_val_c env world blk recv t9 args false)
     // a class object is an instance of Class < Module, so user methods on
     // Module/Class are callable on any class.
     else if has_meth world "Module" name then invoke world noblk recv "Module" name args

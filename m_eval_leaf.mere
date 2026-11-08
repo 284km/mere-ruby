@@ -379,6 +379,10 @@ and make_exc = fn (args: Val list) ->
        (let m = sget m in
         if is_errno then VExc (c, errno_message c m true) else VExc (c, m))
      | _ -> (if is_errno then VExc (c, errno_message c "" false) else VExc (c, c)))
+  // (`raise exc, msg` is exc.exception(msg): the copy carries the new
+  //  message -- net/http's "Failed to open TCP connection to ..." around a
+  //  SocketError kept the old one)
+  | Cons (VExc (c, _), Cons (VStr m2, _)) -> VExc (c, sget m2)
   | Cons (VExc (c, m), _) -> VExc (c, m)
   | Cons (v, _) -> VExc ("RuntimeError", to_s v)
 and rescue_matches = fn world -> fn (exc: Val) -> fn (classes: str list) ->
@@ -10434,7 +10438,10 @@ and stdlib_src = fn (name: str) ->
     "      s = (String === str ? str : str.to_str).b\n" ++
     "      @total_in += s.bytesize\n" ++
     "      if @finished\n" ++
+    "        # (after the end: kept in the output buffer, not answered by this\n" ++
+    "        #  call -- rb_inflate_inflate's zstream_append_buffer2)\n" ++
     "        @out << s\n" ++
+    "        @__after_end = true\n" ++
     "      else\n" ++
     "        @in << s\n" ++
     "        __decode(false)\n" ++
@@ -10450,7 +10457,12 @@ and stdlib_src = fn (name: str) ->
     "        @finished = true\n" ++
     "        rest = @in.byteslice(used, @in.bytesize - used)\n" ++
     "        @in = +\"\".b\n" ++
-    "        @out << rest\n" ++
+    "        # (what follows the stream's end is not output, and not counted\n" ++
+    "        #  in total_in: zstream_run stops at Z_STREAM_END)\n" ++
+    "        unless rest.empty?\n" ++
+    "          @unused = rest\n" ++
+    "          @total_in -= rest.bytesize\n" ++
+    "        end\n" ++
     "      when 1\n" ++
     "        raise Zlib::BufError, \"buffer error\" if final\n" ++
     "      when 3\n" ++
@@ -10478,9 +10490,19 @@ and stdlib_src = fn (name: str) ->
     "    end\n" ++
     "\n" ++
     "    def inflate(str, buffer: nil, &blk)\n" ++
-    "      __feed(str)\n" ++
-    "      r = __drain(&blk)\n" ++
-    "      buffer && r ? buffer.replace(r) : r\n" ++
+    "      # (the stream's lock is held while it runs, the block too: another\n" ++
+    "      #  thread waits, and an inflate from inside its own block is the\n" ++
+    "      #  mutex's ThreadError -- zlib.c's zstream_run_synchronized)\n" ++
+    "      (@__lock ||= Thread::Mutex.new).synchronize do\n" ++
+    "        __feed(str)\n" ++
+    "        if @__after_end\n" ++
+    "          @__after_end = false\n" ++
+    "          r = +\"\".b\n" ++
+    "          return buffer ? buffer.replace(r) : r\n" ++
+    "        end\n" ++
+    "        r = __drain(&blk)\n" ++
+    "        buffer && r ? buffer.replace(r) : r\n" ++
+    "      end\n" ++
     "    end\n" ++
     "\n" ++
     "    def <<(str)\n" ++
@@ -11222,6 +11244,14 @@ and file_open_obj = fn world -> fn (args: Val list) ->
   //   the others run -- until a reader here has opened it, after which
   //   open(2) returns at once (test_io's test_open_fifo_does_not_block_other_threads,
   //   core/file/open "on a FIFO")
+  // (an Integer mode with O_NONBLOCK on a FIFO does not wait at all:
+  //  File.__fifo_open_nb -- test/io/wait's test_fifo_wait)
+  else if (map_has fifo_paths (abs_path_of path) && file_exists path || fifo_threaded path)
+          && (match args with
+              | Cons (_, Cons (VInt fl9, _)) -> bit_and fl9 (if str_eq (sys_os ()) "linux" then 2048 else 4) != 0
+              | _ -> false) then
+    invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) (VClass "File") "__fifo_open_nb"
+      (Cons (mkstr path, Cons ((match args with Cons (_, Cons (fl9, _)) -> fl9 | _ -> VInt 0), Nil))) false
   else if fb_can_suspend && (map_has fifo_paths (abs_path_of path) && file_exists path || fifo_threaded path)
           && str_eq (char_at (file_mode_head mode) 0) "r" && (if str_contains mode "+" then false else true)
           && (match args with Cons (_, Cons (VInt _, _)) -> false | _ -> true) then

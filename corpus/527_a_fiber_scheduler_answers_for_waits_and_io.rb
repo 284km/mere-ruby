@@ -105,7 +105,10 @@ Thread.new do
   result[:hooks] = s.log.map(&:first).uniq.sort
 end.join
 
-show("order") { result[:order] }
+# (two fibers wake from 10 ms sleeps, and which runs first is the clock's:
+#  the mutex's exclusion is the fact, the rest is printed sorted)
+show("mutex excludes") { o = result[:order]; o.index(:a1) < o.index(:a2) && o.index(:a2) < o.index(:b) }
+show("order") { result[:order].sort_by(&:inspect) }
 show("hooks") { result[:hooks] }
 
 # a mutex held by another fiber of the thread is a deadlock to a fiber with

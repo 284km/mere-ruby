@@ -2519,3 +2519,48 @@ corpus/528 is the witness.
   io/wait and open-uri) against 96dac90's binary: MATCH 7285 → 7334,
   test/socket 147 → 194/209, no file lower (test_array's shared_marking
   and test_thread's priority are the reference's flakes, as before).
+
+## 2026-11-09 (17): what net/http, resolv, zlib and io/wait found -- Array and Hash keys holding user-hashed objects, an alias of Class#new, `raise exc, msg`, a deflate stream's tail, a FIFO with O_NONBLOCK
+
+Note 511's stage 3, "net/http 3, resolv 1, io/wait 1". corpus/530 is the
+witness.
+
+- **An Array (or Hash) key holding objects with their own #hash and #eql?
+  was never found again**: Hash asked only whether the Array itself had a
+  user #hash and otherwise compared structure -- identity, for an object.
+  resolv's DNS name compression keys its table by arrays of Label::Str,
+  so every name was written out in full (test_caa_roundtrip). Such a key
+  now takes the hash protocol (`elems_user_hash`), its #eql? is the
+  builtin's, which asks the elements', and Hash#hash sums its pairs' #hash
+  answers when any of them has its own (it was structural, so two #eql?
+  hashes hashed apart).
+- **`class << HTTP; alias newobj new; end` and then `def HTTP.new`**: the
+  alias of the builtin reached the later definition (net/http's newobj
+  read ENV's proxy). A class-level alias of `new` whose class now defines
+  `new` is Class#new itself: allocate, then #initialize.
+- **`raise exc, msg` on the lightweight exception pair kept the old
+  message** (make_exc): net/http's "Failed to open TCP connection to
+  host:port (...)" around a SocketError lost its text. The copy carries the
+  new message, as exc.exception(msg) does.
+- **Zlib::Inflate**: the bytes after the end of a deflate stream are not
+  output and not counted in total_in (zstream_run stops at Z_STREAM_END) --
+  net/http's body read "hello\r\n" for "hello"; data fed after the end is
+  kept in the buffer and not answered by that call; the stream's lock is a
+  Mutex, so another thread waits and an inflate from inside its own block
+  is the mutex's ThreadError ("deadlock; recursive locking").
+- **A FIFO opened with an Integer mode holding O_NONBLOCK** does not wait:
+  the reading end opens at once (read-write first, as __fifo_open_r does,
+  since the runtime's open takes no flags), the writing end is ENXIO until
+  a reader here has it open (`File.__fifo_has_reader`), and each is a File
+  over its descriptor (test/io/wait's test_fifo_wait).
+- **Left**: io/console's 27 need a pty, termios on any descriptor and the
+  window size ioctl -- with socket's ancillary data, a connect on an
+  existing descriptor and getifaddrs, a round of runtime builtins in Mere.
+- corpus/527's order line was the clock's (two fibers waking from 10 ms
+  sleeps; ruby itself answered both orders): the mutex's exclusion is
+  printed as the fact, the rest sorted.
+- **Checked**: corpus 551/551 both ways, 530 under GC_STRESS=50, the 13
+  gates; 184 unittest files (7847 tests: the wide set with zlib) against
+  d4b5233's binary: MATCH 7402 → 7408 (net/http 116 → 119/119, resolv
+  green, io/wait 7/8 with the eighth failing in ruby too, zlib 53 → 54),
+  no file lower.
