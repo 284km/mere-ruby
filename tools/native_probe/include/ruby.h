@@ -22,4 +22,7 @@ VALUE probe_dbl2num(double);
 void rb_define_singleton_method(VALUE, const char *, probe_method2, int);
 #define NUM2DBL(v) probe_num2dbl(v)
 #define DBL2NUM(v) probe_dbl2num(v)
+#ifdef PROBE_TYPED_API
+#include "typed_probe.h"
+#endif
 #endif

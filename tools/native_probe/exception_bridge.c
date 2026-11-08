@@ -38,7 +38,7 @@ static _Noreturn void jump_pending(int token) {
     active->pending = token;
     longjmp(active->guard->jump, 1);
 }
-static VALUE dispatch(int op, VALUE recv, ID mid, int argc, VALUE a0, VALUE a1) {
+VALUE probe_dispatch(int op, VALUE recv, ID mid, int argc, VALUE a0, VALUE a1) {
     assert(active);
     native_request request = {.mu_op=op, .mu_recv=recv, .mu_mid=mid,
         .mu_argc=argc, .mu_a0=a0, .mu_a1=a1};
@@ -58,7 +58,7 @@ static VALUE protect(probe_body body, VALUE argument) {
 ID rb_intern(const char *name) {
     for (int i=0; i<name_count; i++) if (!strcmp(names[i], name)) return (ID)i+1;
     if (name_count == 64 || strlen(name) >= sizeof(names[0])) {
-        dispatch(API_ERROR, 0, 1, 0, 0, 0); abort();
+        probe_dispatch(API_ERROR, 0, 1, 0, 0, 0); abort();
     }
     strcpy(names[name_count], name);
     return (ID)++name_count;
@@ -68,31 +68,31 @@ char *mr_native_method_name(int id) {
 }
 VALUE rb_funcall(VALUE object, ID id, int argc, ...) {
     if (argc < 0 || argc > 2 || id == 0 || id > (ID)name_count) {
-        dispatch(API_ERROR, 0, 1, 0, 0, 0); abort();
+        probe_dispatch(API_ERROR, 0, 1, 0, 0, 0); abort();
     }
     va_list args; va_start(args, argc);
     VALUE a0 = argc > 0 ? va_arg(args, VALUE) : Qnil;
     VALUE a1 = argc > 1 ? va_arg(args, VALUE) : Qnil;
     va_end(args);
-    return dispatch(CALL, object, id, argc, a0, a1);
+    return probe_dispatch(CALL, object, id, argc, a0, a1);
 }
-VALUE rb_yield(VALUE object) { return dispatch(YIELD, object, 0, 0, 0, 0); }
+VALUE rb_yield(VALUE object) { return probe_dispatch(YIELD, object, 0, 0, 0, 0); }
 _Noreturn void rb_exc_raise(VALUE exception) {
-    dispatch(RAISE, exception, 0, 0, 0, 0); abort();
+    probe_dispatch(RAISE, exception, 0, 0, 0, 0); abort();
 }
 VALUE rb_ensure(probe_body body, VALUE object, probe_body cleanup, VALUE data) {
-    VALUE previous_bang = dispatch(GET_BANG, 0, 0, 0, 0, 0);
+    VALUE previous_bang = probe_dispatch(GET_BANG, 0, 0, 0, 0, 0);
     VALUE result = protect(body, object);
     int body_pending = active->pending;
     active->pending = 0;
-    dispatch(ENTER_ENSURE, (VALUE)body_pending, 0, 0, 0, 0);
+    probe_dispatch(ENTER_ENSURE, (VALUE)body_pending, 0, 0, 0, 0);
     if (!getenv("MERE_NATIVE_SKIP_ENSURE")) {
         ensures++;
         (void)protect(cleanup, data);
     }
     int cleanup_pending = active->pending;
     active->pending = 0;
-    dispatch(SET_BANG, previous_bang, 0, 0, 0, 0);
+    probe_dispatch(SET_BANG, previous_bang, 0, 0, 0, 0);
     if (cleanup_pending) jump_pending(cleanup_pending);
     if (body_pending) jump_pending(body_pending);
     return result;
@@ -134,11 +134,13 @@ int mr_native_find(const char *name) {
 int mr_native_arity(int method) {
     return method >= 0 && method < method_count ? methods[method].arity : -1;
 }
+extern VALUE probe_typed_entry(int, VALUE, VALUE);
 static VALUE entry(VALUE unused) {
     (void)unused;
     int method = active->method;
-    if (method < 0 || method >= method_count) {
-        dispatch(API_ERROR, 0, 1, 0, 0, 0); abort();
+    if (method < 0) return probe_typed_entry(-method-1, active->first, active->second);
+    if (method >= method_count) {
+        probe_dispatch(API_ERROR, 0, 1, 0, 0, 0); abort();
     }
     if (methods[method].arity == 1) return methods[method].fn.one(Qnil, active->first);
     return methods[method].fn.two(Qnil, active->first, active->second);

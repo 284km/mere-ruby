@@ -148,10 +148,56 @@ This is a synchronous interpreter-thread experiment on macOS / O1. Its tokens
 are not CRuby's VALUE ABI. Registration supports one- and two-argument methods;
 `rb_funcall` transports up to two arguments (the original input exercises zero).
 The Ruby adapter routes calls to registered C methods. General extension
-loading, mkmf, TypedData, asynchronous callbacks, thread/fiber suspension, and
+loading, mkmf, asynchronous callbacks, thread/fiber suspension, and
 system allocation failure recovery remain outside this experiment. The older
 float adapter uses a separate value representation. These results do not
 change the main branch's test scoreboard.
+
+## TypedData investigation
+
+The `feat/native-typeddata` prototype adds owner-based mark/free support to the
+native exception experiment. Rebuild with the same compiler, then run:
+
+```sh
+python3 tools/native_probe/typeddata_check.py \
+  --ruby-source /path/to/ruby-4.0.9 \
+  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --output /tmp/native-typeddata-results
+```
+
+The validator compiles the original `typeddata.c` and `dataerror.c` unchanged
+for both runtimes, runs their complete test files (4 tests / 20 assertions),
+and compares a shared C box fixture. There are 78 shared behavior checks and
+4 native bookkeeping checks. Normal execution and GC stress pass; disabling
+mark or free fails the corresponding negative control. Original input hashes
+are checked before and after the runs. Limits remain 90 seconds and 2 GiB per
+process family, including the original million-allocation child process.
+
+Borrowed tokens are rooted while their C invocation is active. Outside that
+invocation, only dmark on a reachable owner keeps a stored token and its Ruby
+value alive. The collector follows C edges in its ordinary object fixpoint,
+so C/Ruby chains and cycles have the same reachability rules. Dead owners are
+detached before dfree, and descriptor fields are cached first: the original
+dynamic-type test frees its descriptor inside dfree. Expired returned tokens
+raise after releasing temporary roots. Weak token tables and owned C payload
+bytes contribute to memory pressure accounting.
+
+The existing conservative stack scan can delay some unreachable owners. The
+shared fixture checks actual reclamation and tracks allocation generations to
+detect double free; it does not require every unreachable object to disappear
+after a fixed number of collections. Disabling the stack scan is used only as
+a separate diagnostic, never for the normal success result.
+
+This remains a local macOS / O1 experiment. Registration and Ruby routing are
+fixture-specific. Embedded storage is emulated by a separate allocation;
+free callbacks run synchronously during sweep, without reproducing CRuby's
+deferred-free scheduling. Movable marking/dcompact, generational barriers,
+shutdown finalization, general extension loading, mkmf, and the CRuby binary
+ABI remain unimplemented. Mark/free callbacks must not invoke Ruby or allocate.
+C-side ASan/UBSan validation covers the bridge and the unchanged extensions;
+the generated interpreter is uninstrumented. That run uses
+`ASAN_OPTIONS=use_sigaltstack=0` for the runtime's coroutine stack management.
+It is not a whole-interpreter sanitizer or leak-freedom claim.
 
 ## Gates
 
