@@ -22,3 +22,29 @@ end
 date = Date.new(2001, 2, 3)
 p date.strftime('%20F %10A')
 puts 'padding chunks and owned time-format strings preserved'
+
+class PaddingZoneLabel < String
+  def to_s = self
+  def <<(value) = raise('subclass append called')
+  def dup = raise('subclass dup called')
+  def rjust(*args) = raise('subclass padding called')
+  def upcase = raise('subclass case called')
+end
+class PaddingLabelZone
+  attr_reader :label
+  def initialize
+    @label = PaddingZoneLabel.new('XyZ').freeze
+  end
+  def local_to_utc(t) = t
+  def utc_to_local(t) = t
+  def abbr(t) = @label
+end
+zone = PaddingLabelZone.new
+t = Time.at(0, in: zone)
+{'%Z' => 'XyZ', '%Z!' => 'XyZ!', '%8Z!' => '     XyZ!', '%^Z' => 'XYZ'}.each do |fmt, expected|
+  result = t.strftime(fmt)
+  raise 'zone label ownership or class' unless result.instance_of?(String) && !result.frozen? && result == expected
+  result << '?'
+  raise 'borrowed zone changed' unless zone.label == 'XyZ'
+end
+puts 'subclass zone labels produce ordinary mutable Strings'
