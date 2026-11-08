@@ -6894,6 +6894,84 @@ and tp_raise_at = fn env ->
             else "Object") in
   if str_eq c9 "" then (if map_has tp_mstack "xm" then (let _ = map_delete tp_mstack "xm" in map_delete tp_mstack "xk") else ())
   else (let _ = map_set tp_mstack "xm" m9 in map_set tp_mstack "xk" c9)
+// Synchronous native investigation boundary. A callback returns its rooted
+// outcome before C unwinds; no Mere exception crosses a foreign stack frame.
+and native_probe_invoke = fn env -> fn world -> fn (method: int) -> fn (arguments: Val list) -> fn (block: Val) ->
+  let (_, _, _, ivars) = world in
+  let scope = vec_new () in
+  let keep = fn (v: Val) ->
+    let token = native_handle_retain v in
+    if token == 0 then
+      (let _ = raise_exc world "NoMemoryError" "native handle token space exhausted" in 0)
+    else (let _ = vec_push scope token in token) in
+  let get = fn (token: int) ->
+    if token == 0 then VNil
+    else if native_handle_valid token then native_handle_get token
+    else raise_exc world "ArgumentError" "invalid native VALUE" in
+  let clear = fn (u: unit) ->
+    let _ = map_delete flow_sig "k" in
+    let _ = map_delete ivars "$exc" in
+    let rec drop_keys = fn keys -> match keys with
+      | Nil -> ()
+      | Cons (k, rest) -> let _ = map_delete prim_missing k in drop_keys rest in
+    let _ = drop_keys (Cons ("n", Cons ("rv", Cons ("rvc", Cons ("rvn", Cons ("rvv", Cons ("av", Cons ("c", Cons ("m", Cons ("i", Cons ("f", Cons ("rl", Cons ("rd", Cons ("rbt", Cons ("rm", Cons ("rf", Nil)))))))))))))))) in
+    bi_rescued () in
+  let saved = fn (k: str) -> if map_has flow_sig k then map_get flow_sig k else VNil in
+  let capture = fn (u: unit) ->
+    let kind = saved "k" in
+    let exc = if map_has flow_sig "k" then VNil else pending_exc world in
+    let out = arr_new (Cons (exc, Cons (kind, Cons (saved "v", Cons (saved "tag", Cons (saved "fid", Nil)))))) in
+    let token = keep out in
+    let _ = clear () in 0 - token in
+  let finish = fn (u: unit) ->
+    let rec release = fn (i: int) ->
+      if i >= vec_len scope then ()
+      else (let _ = native_handle_release (vec_get scope i) in release (i + 1)) in
+    release 0 in
+  // Reserved before C entry, so even token exhaustion returns to C cleanup.
+  let emergency = keep (arr_new (Cons (VExc ("NoMemoryError", "native outcome capture failed"), Cons (VNil, Cons (VNil, Cons (VNil, Cons (VNil, Nil))))))) in
+  let outcome = try_or_msg (fn (u: unit) ->
+    let block_token = keep block in
+    let first = (match arguments with Cons (v, _) -> keep v | _ -> 0) in
+    let second = (match arguments with Cons (_, Cons (v, _)) -> keep v | _ -> 0) in
+    let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+    let callback = fn (request: native_request) ->
+      try_or_msg (fn (u: unit) ->
+        if request.op == 1 then
+          (let args = if request.argc == 0 then Nil
+                      else if request.argc == 1 then Cons (get request.a0, Nil)
+                      else Cons (get request.a0, Cons (get request.a1, Nil)) in
+           keep (invoke_val_c env world noblk (get request.recv) (mr_native_method_name request.mid) args false))
+        else if request.op == 2 then
+          (match get block_token with
+           | VNil -> let _ = raise_exc world "LocalJumpError" "no block given" in 0
+           | proc -> keep (invoke_val_c env world noblk proc "call" (Cons (get request.recv, Nil)) false))
+        else if request.op == 3 then let _ = raise_exc_val world (get request.recv) in 0
+        else if request.op == 4 then keep (if map_has globals "!" then map_get globals "!" else VNil)
+        else if request.op == 5 then
+          (let _ = (match get request.recv with
+                    | VArr a -> (match deref a with Cons (exc, Cons (VNil, _)) -> map_set globals "!" exc | _ -> ())
+                    | _ -> ()) in 0)
+        else if request.op == 6 then (let _ = map_set globals "!" (get request.recv) in 0)
+        else let _ = raise_exc world "ArgumentError" "unsupported native API request" in 0)
+        (fn (message: str) ->
+          try_or_msg capture (fn (capture_message: str) -> let _ = clear () in 0 - emergency)) in
+    mr_native_invoke callback method first second)
+    (fn (message: str) -> let _ = finish () in fail message) in
+  let value = get (if outcome < 0 then 0 - outcome else outcome) in
+  let _ = finish () in
+  if outcome >= 0 then value
+  else (match value with
+    | VArr a -> (match deref a with
+      | Cons (exc, Cons (kind, Cons (v, Cons (tag, Cons (fid, _))))) ->
+        (let _ = (match kind with
+          | VNil -> map_set ivars "$exc" exc
+          | _ -> let _ = map_set flow_sig "k" kind in
+                 let _ = map_set flow_sig "v" v in
+                 let _ = map_set flow_sig "tag" tag in map_set flow_sig "fid" fid) in
+         fail "mere-ruby: native outcome")
+      | _ -> raise_exc world "RuntimeError" "invalid native outcome")
+    | _ -> raise_exc world "RuntimeError" "invalid native outcome")
 and raise_exc_val = fn world -> fn (exc: Val) ->
   let (meths, sup, ocls, ivars) = world in
   let _ = map_set ivars "$exc" exc in
@@ -20913,6 +20991,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             if native_handle_update t v then VNil else bad9 ()
           | _ -> bad9 ())
        else if str_eq name "__count" then VInt (native_handle_count ())
+       else if str_eq name "__native_resources" then VInt (mr_native_resources ())
+       else if str_eq name "__native_depth" then VInt (mr_native_depth ())
+       else if str_eq name "__native_ensures" then VInt (mr_native_ensures ())
+       else if str_eq name "__native_load" then
+         (match args with Cons (VStr path, Nil) ->
+           let rc = mr_native_load (sget path) in
+           if rc < 0 then raise_exc world "LoadError" (mr_native_error ()) else VInt rc
+          | _ -> bad9 ())
+       else if str_eq name "__native_call" then
+         (match args with Cons (VStr method, Cons (VArr av, Cons (proc, Nil))) ->
+           let id = mr_native_find (sget method) in
+           if id < 0 then raise_exc world "NameError" "unknown native method"
+           else if list_len (deref av) != mr_native_arity id then
+             raise_exc world "ArgumentError" "wrong native argument count"
+           else native_probe_invoke env world id (deref av) proc
+          | _ -> bad9 ())
        else if str_eq name "__capacity" then VInt (native_handle_capacity ())
        else if str_eq name "__table_bytes" then VInt (native_handle_bytes ())
        else if str_eq name "__c_store" then

@@ -118,6 +118,41 @@ Divergences that are understood and deliberately unfixed are tracked in
 [KNOWN_GAPS.md](KNOWN_GAPS.md), with what each costs and what fixing it
 would take — separately from what nobody has looked at yet.
 
+## Native exception investigation
+
+The `feat/native-ensure` prototype connects unchanged Ruby 4.0.9
+`ext/-test-/exception/ensured.c` through a small investigation header.
+Build with a Mere compiler containing `merelang/mere` PR #40, then run:
+
+```sh
+MERE=/path/to/mere sh tools/build.sh --fast
+python3 tools/native_probe/ensure_check.py \
+  --ruby-source /path/to/ruby-4.0.9 \
+  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --output /tmp/native-ensure-results
+```
+
+The validator builds the same C input against each runtime's headers and runs
+both original exception tests, shared behavior checks, GC stress, and negative
+controls with C cleanup disabled. Each interpreter run has a 90-second and
+2-GiB process-family limit. It requires permission to inspect processes.
+
+Callbacks capture Ruby exceptions and nonlocal flow in rooted outcome tokens,
+return to C, and resume unwinding only after C has released its resources.
+The C `setjmp` guards never jump across a Mere callback frame. Cleanup errors
+override body errors; the boundary preserves exception identity, `$!`, cause,
+backtrace, and the original raise event. Temporary roots belong to one native
+invocation, including nested invocations, and are released on both exits.
+
+This is a synchronous interpreter-thread experiment on macOS / O1. Its tokens
+are not CRuby's VALUE ABI. Registration supports one- and two-argument methods;
+`rb_funcall` transports up to two arguments (the original input exercises zero).
+The Ruby adapter routes calls to registered C methods. General extension
+loading, mkmf, TypedData, asynchronous callbacks, thread/fiber suspension, and
+system allocation failure recovery remain outside this experiment. The older
+float adapter uses a separate value representation. These results do not
+change the main branch's test scoreboard.
+
 ## Gates
 
 Every change is checked against the reference `ruby` before it lands:
