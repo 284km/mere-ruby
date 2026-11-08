@@ -331,24 +331,36 @@ match; incomplete transcripts or changed inputs fail the measurement.
 
 On the macOS / O1 prototype, all 17 files complete. CRuby reports 148 tests,
 419 assertions, no failures/errors and 4 skips. Mere reports 148 tests,
-308 assertions, 6 failures, 12 errors and 4 skips. Six files pass fully
-(`configuration`, `flags`, `have_macro`, `install`, `libs`, `mkmf`); ten have
+401 assertions, 7 failures, 6 errors and 4 skips. Eight files pass fully
+(`configuration`, `convertible`, `flags`, `have_macro`, `install`, `libs`,
+`mkmf`, `signedness`); eight have
 failures/errors, and `pkg_config` skips all four cases on both runtimes.
 The remaining obstacles are:
 
-- Built-in `String#%` lookup through `super` (`convertible`, `signedness`,
-  `sizeof`) and an unassigned local after short-circuit evaluation (`framework`).
+- An unassigned local after short-circuit evaluation (`framework`).
 - Target RbConfig selection (`config`) and PATH-dependent `Process.uid` in
   `File::Stat#executable?` (`find_executable`).
-- Missing probe-header size/limits definitions (`constant`), unsupported
+- Missing probe-header size/limits definitions (`constant`, `sizeof`), unsupported
   embedding API `ruby_init` (`egrep_cpp`, `have_func`), and a test archive-name
   assumption derived from the absent `LIBRUBY_A` (`have_library`).
 
-The framework reports 126 successful cases, but this is not proof that every
+The framework reports 131 successful cases, but this is not proof that every
 reference assertion was reached: `constant#test_long` returns early with the
 current missing size macros. Skips and that limitation remain visible in
 the results. These measurements do not update the main-branch scoreboard or
 establish Linux, O2, installation or general extension compatibility.
+
+`String#%` reached through `super` now uses the ordinary formatting operator's
+builtin implementation, preserving coercion and result encoding. Singleton
+overrides with a literal block also reach the builtin fallback, as calls
+without a block already do. The regression covers singleton/subclass/prepend
+lookup, explicit and forwarded arguments, coercion, encoding, arity errors,
+ignored blocks and builtin iterator blocks, including GC stress. The unchanged
+`test/ruby/test_sprintf.rb` passes 33 tests / 37,672 assertions on both runtimes.
+This resolves all six formatting lookup errors in the three mkmf files:
+`convertible` and `signedness` pass fully, while `sizeof` now reaches a separate
+failure caused by the missing `SIZEOF_INT` header definition. Its builtin-size
+case also skips conditional assertions while size macros remain absent.
 
 ## Gates
 
