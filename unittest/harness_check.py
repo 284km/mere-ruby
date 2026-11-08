@@ -243,6 +243,49 @@ exit "$(cat "$fixture_root/$side.code")"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, str(binary))
 
+    def test_corpus_uses_selected_reference_and_both_index_modes(self):
+        shutil.copyfile(ROOT / "run_corpus.sh", self.root / "run_corpus.sh")
+        shutil.copyfile(ROOT / "tools/ref_ruby.sh", self.root / "tools/ref_ruby.sh")
+        (self.root / "corpus").mkdir()
+        (self.root / "corpus/01_arith.rb").write_text("# fixture\n")
+        for name in ["gc_roots", "dup_defs", "dead_defs", "meth_writes",
+                     "name_spec", "rx_caps", "ns_names", "name_len"]:
+            stub = self.root / "tools" / (name + "_check.sh")
+            stub.write_text("#!/bin/sh\nexit 0\n")
+            stub.chmod(0o755)
+        hygiene = self.root / "mspec/record_hygiene.sh"
+        hygiene.write_text("#!/bin/sh\nexit 0\n")
+        hygiene.chmod(0o755)
+        # PATH's ruby must never run after the explicit binary is selected.
+        wrong = self.root / "bin/ruby"
+        wrong.write_text("#!/bin/sh\necho wrong-reference\nexit 99\n")
+        wrong.chmod(0o755)
+        reference = self.root / "selected reference"
+        reference.write_text('''#!/bin/sh
+if [ "$1" = "-e" ]; then printf fixture; exit 0; fi
+printf 'reference\\n' >> "$FIXTURE_ROOT/corpus.calls"
+printf 'answer\\n'
+''')
+        reference.chmod(0o755)
+        (self.root / "mere-ruby").write_text('''#!/bin/sh
+[ "${MERE_RUBY_ERRNO_CHECK:-}" = 1 ] && exit 0
+printf 'candidate:%s\\n' "${MERE_RUBY_NO_HASH_INDEX-unset}" >> "$FIXTURE_ROOT/corpus.calls"
+printf 'answer\\n'
+''')
+        env = dict(self.env, REF_RUBY_BIN=str(reference), REF_RUBY_VERSION="fixture",
+                   MERE_RUBY_NO_HASH_INDEX="1")
+        cases = [(('--both',), ["reference", "candidate:unset", "candidate:1"]),
+                 ((), ["reference", "candidate:1"])]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                calls = self.root / "corpus.calls"
+                calls.write_text("")
+                result = subprocess.run(["sh", "run_corpus.sh", *args], cwd=self.root,
+                                        env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("1/1 corpus programs match ruby", result.stdout)
+                self.assertEqual(calls.read_text().splitlines(), expected)
+
     def test_wrong_explicit_reference_version_is_refused(self):
         binary = self.root / "wrong-reference"
         binary.write_text("#!/bin/sh\nprintf wrong\n")

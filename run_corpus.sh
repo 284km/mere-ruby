@@ -105,7 +105,12 @@ exp="$tmpd/exp.txt"; got="$tmpd/got.txt"; dif="$tmpd/diff.txt"
 # project has already been caught by once, with `diff <(a) <(b)`. Sequential in
 # one process keeps the programs' assumptions true.
 sb_both=0
-[ "${1:-}" = "--both" ] && sb_both=1
+if [ "${1:-}" = "--both" ]; then
+  sb_both=1
+  # A caller may already have disabled indexing. The first pass must still
+  # exercise ON; the second pass below explicitly selects OFF.
+  unset MERE_RUBY_NO_HASH_INDEX
+fi
 
 pass=0
 for f in corpus/*.rb; do
@@ -113,7 +118,7 @@ for f in corpus/*.rb; do
   # ended non-zero stopped the gate on that line: no FAIL, no diff, just exit
   # 1 -- even when both sides failed the same way and printed the same thing.
   # Both statuses are read, and a difference in either is a FAIL that says so.
-  rrc=0; ruby "$f" > "$exp" 2>/dev/null || rrc=$?
+  rrc=0; "$REF_RUBY_BIN" "$f" > "$exp" 2>/dev/null || rrc=$?
   mrc=0; "$MR_BIN" "$f" > "$got" || mrc=$?
   if ! diff -u "$exp" "$got" > "$dif"; then
     echo "FAIL $f"
