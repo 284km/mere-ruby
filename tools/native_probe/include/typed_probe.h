@@ -74,4 +74,10 @@ VALUE probe_typed_int(int);
 #define NUM2UINT(v) ((unsigned)probe_typed_num(v))
 #define NUM2INT(v) probe_typed_num(v)
 #define INT2NUM(v) probe_typed_int(v)
+double probe_typed_num2dbl(VALUE);
+VALUE probe_typed_dbl2num(double);
+#undef NUM2DBL
+#undef DBL2NUM
+#define NUM2DBL(v) probe_typed_num2dbl(v)
+#define DBL2NUM(v) probe_typed_dbl2num(v)
 #endif

@@ -1,6 +1,10 @@
 #ifndef NATIVE_PROBE_RUBY_H
 #define NATIVE_PROBE_RUBY_H
+#ifdef RUBY_EXTCONF_H
+#include RUBY_EXTCONF_H
+#endif
 #include <stdint.h>
+#include <stdio.h>
 #include <math.h>
 typedef uint32_t VALUE;
 typedef uint32_t ID;

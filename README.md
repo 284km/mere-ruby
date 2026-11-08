@@ -148,8 +148,8 @@ This is a synchronous interpreter-thread experiment on macOS / O1. Its tokens
 are not CRuby's VALUE ABI. The original adapter supports one- and two-argument methods;
 `rb_funcall` transports up to two arguments (the original input exercises zero).
 The original Ruby adapter routes calls to registered C methods; the native
-loader experiment below replaces that routing for its supported API. mkmf,
-asynchronous callbacks, thread/fiber suspension, and
+loader experiment below replaces that routing for its supported API.
+Asynchronous callbacks, thread/fiber suspension, and
 system allocation failure recovery remain outside this experiment. The older
 float adapter uses a separate value representation. These results do not
 change the main branch's test scoreboard.
@@ -194,7 +194,7 @@ fixture-specific Ruby routing; the loader below also tests ordinary require.
 Embedded storage is emulated by a separate allocation;
 free callbacks run synchronously during sweep, without reproducing CRuby's
 deferred-free scheduling. Movable marking/dcompact, generational barriers,
-shutdown finalization, the full extension API, mkmf, and the CRuby binary
+shutdown finalization, the full extension API, and the CRuby binary
 ABI remain unimplemented. Mark/free callbacks must not invoke Ruby or allocate.
 C-side ASan/UBSan validation covers the bridge and the unchanged extensions;
 the generated interpreter is uninstrumented. That run uses
@@ -239,13 +239,64 @@ This is still a local macOS / O1, synchronous prototype, with limits of 512
 class-name slots, 4096 method slots and 128 resident libraries. It does not
 implement variable-arity C entry points, concurrent loading, unloading,
 automatic discovery of all C roots, or the rest of the Ruby C API. Existing
-TypedData and exception limitations above still apply. The next step is to
-connect RbConfig/mkmf and validate extensions built by that path. The older
-float probe still uses its separate adapter and value representation.
+TypedData and exception limitations above still apply. The mkmf experiment
+below connects source builds. The older float probe remains available for
+regression checks with its separate adapter and value representation.
 
 `--mere /path/to/instrumented-runtime --sanitize-extension` validates C-side
 ASan/UBSan builds; `--select` can restrict run names. Instrumenting only the
 bridges and extensions does not instrument the generated interpreter.
+
+## Native builds with mkmf
+
+The `feat/native-mkmf` prototype runs the unchanged Ruby 4.0.9 `mkmf.rb` on
+mere-ruby, then uses its Makefile to compile and link native extensions.
+`tools/native_probe/build_config.rb` explicitly supplies RbConfig with this
+worktree's headers, compiler and linker settings. Load it with `-r` before
+`-rmkmf`; it does not change the default runtime configuration. The prototype
+uses macOS bundles and resolves interpreter symbols at load time, without
+linking against libruby.
+
+```sh
+python3 tools/native_probe/mkmf_check.py \
+  --ruby-source /path/to/ruby-4.0.9 \
+  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --output /tmp/native-mkmf-results
+```
+
+The output directory must be empty. The validator runs both runtimes, captures
+compiler commands and checks original source hashes. It stages unchanged
+float `extconf.rb`, `auto_ext.rb`, `init.c`, `nextafter.c` and
+`missing/nextafter.c`, preserving their include layout. CRuby's generated
+internal-header dependency list is omitted; mkmf generates dependencies for
+this header set. The upstream in-tree extconf needs `top_srcdir`, supplied as
+a make variable pointing at the staged source. No source patch or Ruby routing
+adapter is used for these float calls.
+
+`NUM2DBL` / `DBL2NUM` now use the common scoped VALUE path. The unchanged
+nextafter file passes 400 tests / 1,225 assertions. Another 13 checks cover
+numeric coercion, nested calls, GC, exceptions, NaN and signed zero, in normal
+and GC-stress execution. The existing loader checks pass with mkmf-built
+fixtures, including TypedData allocation and Init failure/retry. The unchanged
+`test/mkmf/test_mkmf.rb` passes 94 tests / 188 assertions on both runtimes.
+
+The build checks actually compile/link positive and negative header/symbol
+probes. An intentionally failing compiler must stop extconf without producing
+a Makefile. A related interpreter fix permits implicit calls with a forwarded
+block to included private methods on main, retaining singleton precedence.
+
+This is an opt-in macOS / O1 experiment, not installed headers or full gem
+build support. The small header set exposes only the implemented probe API.
+It does not provide CRuby's internal types or binary ABI. Passing the global
+mkmf file does not establish success of all 17 mkmf files: the in-tree test
+base also needs build-tree metadata and configuration in child interpreters.
+Default RbConfig, installation/packaging, Linux/O2, and full-suite validation
+remain separate work. Prior native lifetime and threading limits still apply.
+
+For C-side sanitizer validation, pass `--side mere --sanitize-extension`
+and `--mere /path/to/instrumented-runtime`. The validator adds ASan/UBSan
+through mkmf's compiler/linker options and uses `use_sigaltstack=0`; the
+generated interpreter can remain uninstrumented, as in the earlier probes.
 
 ## Gates
 

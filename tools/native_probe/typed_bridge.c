@@ -23,6 +23,7 @@ static struct { char path[4096]; void *handle; void (*init)(void); int calls; } 
 static int library_count, open_failures;
 static char error[512];
 static _Thread_local const char *text;
+static _Thread_local double number;
 static _Thread_local closure_int_int marker;
 static _Thread_local int marking;
 struct payload { const rb_data_type_t *type; void *data; size_t owned; int next; };
@@ -148,6 +149,14 @@ int mr_typed_loader_stat(int field) {
 }
 char *mr_typed_error(void) { return error; }
 char *mr_typed_text(void) { return (char *)(text ? text : ""); }
+double mr_typed_number(void) { return number; }
+int mr_typed_set_number(double value) { number=value; return 0; }
+double probe_typed_num2dbl(VALUE value) {
+    probe_dispatch(22,value,0,0,0,0); return number;
+}
+VALUE probe_typed_dbl2num(double value) {
+    number=value; return probe_dispatch(23,0,0,0,0,0);
+}
 VALUE rb_str_new_cstr(const char *s) {
     const char *old=text; text=s;
     VALUE result=probe_dispatch(10,0,0,0,0,0); text=old; return result;
