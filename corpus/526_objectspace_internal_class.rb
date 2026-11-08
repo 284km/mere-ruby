@@ -40,9 +40,52 @@ class << k
 end
 p [k.answer, m.answer]
 
+# Inherited methods and removed methods still leave an existing singleton.
+extended = Module.new
+extension = Module.new { def marker; :ok; end }
+extended.extend(extension)
+extended_class = ObjectSpace.internal_class_of(extended)
+p [extended.marker, extended_class.equal?(extended.singleton_class)]
+removed = Module.new
+def removed.marker; :ok; end
+removed.method(:marker).owner.send(:remove_method, :marker)
+removed_class = ObjectSpace.internal_class_of(removed)
+p removed_class.equal?(removed.singleton_class)
+empty_extended = Module.new
+empty_extended.extend(Module.new)
+ec = ObjectSpace.internal_class_of(empty_extended)
+p ec.equal?(empty_extended.singleton_class)
+
+# An overridden extend_object that does nothing creates no singleton.
+untouched = Module.new
+no_extension = Module.new
+def no_extension.extend_object(_target); end
+untouched.extend(no_extension)
+p ObjectSpace.internal_class_of(untouched).equal?(Module)
+
+empty_singleton = Module.new
+empty_singleton.singleton_class
+[empty_singleton, removed].each do |original|
+  [original.dup, original.clone].each do |copy|
+    cc = ObjectSpace.internal_class_of(copy)
+    p cc.equal?(copy.singleton_class)
+  end
+end
+
+# A class inside a singleton namespace is still an ordinary class.
+holder = Object.new
+class << holder
+  class Nested; end
+end
+nested = holder.singleton_class.const_get(:Nested)
+nested_class = ObjectSpace.internal_class_of(nested)
+p nested_class.equal?(nested.singleton_class)
+p nested.singleton_class?
+
 # Class-of chains must reach an existing cycle without growing new classes.
 # The exact topology of builtin/internal classes is runtime-specific.
-targets = values + [obj, a, m, mc, k, kc, kcc, Class, Module, Object, BasicObject]
+targets = values + [obj, a, m, mc, k, kc, kcc, extended, removed, empty_extended,
+                    untouched, nested, nested_class, Class, Module, Object, BasicObject]
 count = ObjectSpace.each_object(Class).count
 bounded = targets.all? do |value|
   seen = {}.compare_by_identity

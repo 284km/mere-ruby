@@ -13,6 +13,13 @@ explicit metaclass links with a finite cycle; opening a singleton through
 ordinary class until they acquire a singleton. This path does not dispatch
 overridden Ruby `class` or `singleton_class` methods.
 
+Singleton existence is recorded persistently by method, undef and mixin
+writers. It survives removal of the last own method, includes inherited-only
+singletons from `extend`, and is copied by Module dup/clone even when the
+singleton is empty. Reflection does not scan the current method table to infer
+this history. Only whole singleton names use metaclass handling; an ordinary
+class nested inside a singleton namespace keeps its own class identity.
+
 Local macOS arm64 measurements use O2, base `dcbdbf0aab7631d5991a0dccbee87d8802099d63`,
 Mere compiler `991f299b20f18639713685fe3297e087ddc5b1d7`, and unchanged CRuby
 source `3e93b23afcec3433f6aecc34b5d832799d754238`. The supervisor retains the
@@ -39,6 +46,9 @@ Validation:
 - The regression covers immediate/frozen values, existing singleton classes,
   an Array subclass, overridden reflection methods, module singleton methods,
   metaclass exposure, finite traversal, stable class enumeration and GC.
+- Review regressions cover inherited-only and empty extensions, last-method
+  removal, an overridden `extend_object` that creates nothing, empty singleton
+  duplication/cloning and an ordinary class in a singleton namespace.
 
 These are local resource and correctness measurements, not an end-to-end
 GitHub Actions speedup. Hosted CI remains a separate validation step.
