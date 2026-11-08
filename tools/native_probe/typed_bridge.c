@@ -1,23 +1,27 @@
-/* Synchronous TypedData experiment. Descriptors and payloads stay in C;
- * Ruby values are borrowed tokens visited only by reachable owners' dmark. */
+/* Native registration and synchronous TypedData prototype. Libraries remain
+ * resident once Init has run: Ruby definitions and payload callbacks may outlive
+ * a failed Init. A missing symbol/ABI failure is closed before running code. */
 #define PROBE_TYPED_API
 #include "include/ruby.h"
 #include "exception_api.h"
 #include <assert.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 
 extern VALUE probe_dispatch(int, VALUE, ID, int, VALUE, VALUE);
-static char names[64][128] = {"", "Object", "StandardError"};
-static int class_count = 3;
+static char names[512][256] = {"", "Object", "StandardError", "RuntimeError", "LoadError", "ArgumentError"};
+static int class_count = 6;
 static struct {
-    char name[180]; VALUE klass; int arity;
+    char name[128]; int klass, arity, kind;
     union { probe_method0 zero; probe_method1 one; probe_method2 two; } fn;
-} methods[64];
+} methods[4096];
 static int method_count;
-static void *module;
-static char error[256];
+static struct { char path[4096]; void *handle; void (*init)(void); int calls; } libraries[128];
+static int library_count, open_failures;
+static char error[512];
 static _Thread_local const char *text;
 static _Thread_local closure_int_int marker;
 static _Thread_local int marking;
@@ -27,59 +31,120 @@ static int capacity, high, free_head;
 static int live_count, free_count, mark_count, payload_count;
 static size_t payload_bytes;
 
-VALUE rb_define_module(const char *name) { return rb_define_module_under(0, name); }
+_Noreturn void rb_raise(VALUE klass, const char *format, ...) {
+    char message[1024]; va_list ap; va_start(ap,format);
+    vsnprintf(message,sizeof(message),format,ap); va_end(ap);
+    text=message; probe_dispatch(18,klass,0,0,0,0); abort();
+}
+VALUE rb_require(const char *path) {
+    const char *previous=text; text=path;
+    VALUE result=probe_dispatch(19,0,0,0,0,0); text=previous; return result;
+}
+static int class_id(VALUE klass) {
+    if(klass & PROBE_CLASS_TAG) {
+        int id=(int)(klass & ~PROBE_CLASS_TAG);
+        if(id>0 && id<class_count) return id;
+        rb_raise(rb_eArgError,"invalid native class VALUE");
+    }
+    return (int)probe_dispatch(16,klass,0,0,0,0);
+}
+int mr_typed_class_index(const char *name) {
+    for(int i=1;i<class_count;i++) if(!strcmp(names[i],name)) return i;
+    if(class_count==512 || strlen(name)>=sizeof(names[0])) return 0;
+    strcpy(names[class_count],name); return class_count++;
+}
+VALUE rb_define_module(const char *name) { return rb_define_module_under(0,name); }
 VALUE rb_define_module_under(VALUE parent, const char *name) {
-    char full[128];
-    assert(parent < (VALUE)class_count);
-    snprintf(full, sizeof(full), "%s%s%s", names[parent], parent ? "::" : "", name);
-    for (int i=1; i<class_count; i++) if (!strcmp(names[i], full)) return (VALUE)i;
-    assert(class_count < 64 && strlen(full) < sizeof(names[0]));
-    strcpy(names[class_count], full);
-    return (VALUE)class_count++;
+    int p=parent ? class_id(parent) : 0;
+    char full[256]; int n=snprintf(full,sizeof(full),"%s%s%s",p==1?"":names[p],p>1?"::":"",name);
+    if(n<0 || n>=(int)sizeof(full)) rb_raise(rb_eArgError,"native class name too long");
+    int id=mr_typed_class_index(full); if(!id) rb_raise(rb_eLoadError,"native class capacity exhausted");
+    probe_dispatch(20,(VALUE)id,1,0,0,0); return PROBE_CLASS_TAG | (VALUE)id;
 }
+VALUE rb_define_class(const char *name, VALUE super) { return rb_define_class_under(0,name,super); }
 VALUE rb_define_class_under(VALUE parent, const char *name, VALUE super) {
-    (void)super; return rb_define_module_under(parent, name);
+    int p=parent ? class_id(parent) : 0;
+    char full[256]; int n=snprintf(full,sizeof(full),"%s%s%s",p==1?"":names[p],p>1?"::":"",name);
+    if(n<0 || n>=(int)sizeof(full)) rb_raise(rb_eArgError,"native class name too long");
+    int id=mr_typed_class_index(full); if(!id) rb_raise(rb_eLoadError,"native class capacity exhausted");
+    probe_dispatch(20,(VALUE)id,0,class_id(super),0,0); return PROBE_CLASS_TAG | (VALUE)id;
 }
-char *mr_typed_class_name(int id) { return id > 0 && id < class_count ? names[id] : "Object"; }
-static int reg(VALUE klass, const char *name, int arity) {
-    assert(klass < (VALUE)class_count && method_count < 64);
-    int i = method_count++;
-    snprintf(methods[i].name, sizeof(methods[i].name), "%s.%s", names[klass], name);
-    methods[i].klass = klass; methods[i].arity = arity; return i;
+char *mr_typed_class_name(int id) { return id>0 && id<class_count ? names[id] : "Object"; }
+char *mr_typed_method_name(int id) { return id>=0 && id<method_count ? methods[id].name : ""; }
+int mr_typed_method_info(int id,int field) {
+    if(id<0 || id>=method_count) return -1;
+    return field==0 ? methods[id].klass : field==1 ? methods[id].arity : methods[id].kind;
 }
-void rb_define_alloc_func(VALUE klass, probe_method0 fn) {
-    int i=reg(klass, "allocate", -1); methods[i].fn.zero=fn;
+static int reg(VALUE klass,const char *name,int arity,int kind) {
+    if(method_count==4096 || strlen(name)>=sizeof(methods[0].name)) rb_raise(rb_eLoadError,"native method capacity exhausted");
+    if(arity<0 || arity>2) rb_raise(rb_eArgError,"native arity is outside 0..2");
+    int i=method_count++; strcpy(methods[i].name,name);
+    methods[i].klass=class_id(klass); methods[i].arity=arity; methods[i].kind=kind; return i;
 }
-void probe_typed_define0(VALUE k, const char *n, probe_method0 f, int a) {
-    assert(a==0); int i=reg(k,n,a); methods[i].fn.zero=f;
+void rb_define_alloc_func(VALUE klass,probe_method0 f) {
+    int i=reg(klass,"allocate",0,2); methods[i].fn.zero=f; probe_dispatch(21,(VALUE)i,0,0,0,0);
 }
-void probe_typed_define1(VALUE k, const char *n, probe_method1 f, int a) {
-    assert(a==1); int i=reg(k,n,a); methods[i].fn.one=f;
-}
-void probe_typed_define2(VALUE k, const char *n, probe_method2 f, int a) {
-    assert(a==2); int i=reg(k,n,a); methods[i].fn.two=f;
-}
+#define DEFINE_REG(N,TYPE,MEMBER) \
+void probe_typed_define##N(VALUE k,const char*n,TYPE f,int a) { \
+    if(a!=N) rb_raise(rb_eArgError,"native method signature mismatch"); \
+    int i=reg(k,n,a,1); methods[i].fn.MEMBER=f; probe_dispatch(21,(VALUE)i,0,0,0,0); } \
+void probe_typed_instance##N(VALUE k,const char*n,TYPE f,int a) { \
+    if(a!=N) rb_raise(rb_eArgError,"native method signature mismatch"); \
+    int i=reg(k,n,a,0); methods[i].fn.MEMBER=f; probe_dispatch(21,(VALUE)i,0,0,0,0); }
+DEFINE_REG(0,probe_method0,zero)
+DEFINE_REG(1,probe_method1,one)
+DEFINE_REG(2,probe_method2,two)
+#define DEFINE_MODULE(N,TYPE,MEMBER) \
+void probe_typed_module##N(VALUE k,const char*n,TYPE f,int a) { \
+    probe_typed_define##N(k,n,f,a); \
+    int i=reg(k,n,a,3); methods[i].fn.MEMBER=f; probe_dispatch(21,(VALUE)i,0,0,0,0); }
+DEFINE_MODULE(0,probe_method0,zero)
+DEFINE_MODULE(1,probe_method1,one)
+DEFINE_MODULE(2,probe_method2,two)
 int mr_typed_find(const char *name) {
-    for(int i=0;i<method_count;i++) if(!strcmp(methods[i].name,name)) return i;
+    for(int i=method_count-1;i>=0;i--) {
+        char full[400]; snprintf(full,sizeof(full),"%s.%s",names[methods[i].klass],methods[i].name);
+        if(!strcmp(full,name)) return i;
+    }
     return -1;
 }
-VALUE probe_typed_entry(int method, VALUE first, VALUE second) {
+VALUE probe_typed_entry(int method,VALUE self,VALUE first,VALUE second) {
+    if(method>=1000000) {
+        int i=method-1000000; assert(i>=0 && i<library_count);
+        libraries[i].calls++; libraries[i].init(); return Qnil;
+    }
     assert(method>=0 && method<method_count);
-    if(methods[method].arity==-1) return methods[method].fn.zero(methods[method].klass);
-    // Static methods in the original typeddata fixture ignore their receiver,
-    // except dynamic_type which passes it to Make_Struct. Give those the C class.
-    VALUE self = !strcmp(names[methods[method].klass], "Bug::TypedData") ? methods[method].klass : first;
-    if(methods[method].arity==0) return methods[method].fn.zero(self);
-    if(methods[method].arity==1) return methods[method].fn.one(self,second);
-    return methods[method].fn.two(self,first,second);
+    VALUE result;
+    if(methods[method].arity==0) result=methods[method].fn.zero(self);
+    else if(methods[method].arity==1) result=methods[method].fn.one(self,first);
+    else result=methods[method].fn.two(self,first,second);
+    // Class constants have stable tagged ids; Ruby receives a scoped token.
+    return result & PROBE_CLASS_TAG ? probe_dispatch(17,result,0,0,0,0) : result;
 }
 int mr_typed_load(const char *path) {
-    if(module) return method_count;
-    module=dlopen(path,RTLD_NOW|RTLD_LOCAL);
-    if(!module) { snprintf(error,sizeof(error),"%s",dlerror()); return -1; }
-    void (*init)(void)=(void (*)(void))dlsym(module,"Init_typed_probe");
-    if(!init) { snprintf(error,sizeof(error),"%s",dlerror()); dlclose(module); module=NULL; return -1; }
-    init(); return method_count;
+    for(int i=0;i<library_count;i++) if(!strcmp(libraries[i].path,path)) return 1000000+i;
+    if(library_count==128 || strlen(path)>=sizeof(libraries[0].path)) { snprintf(error,sizeof(error),"native library capacity exhausted"); return -1; }
+    void *handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);
+    if(!handle) { snprintf(error,sizeof(error),"%s",dlerror()); open_failures++; return -1; }
+    const unsigned *abi=(const unsigned *)dlsym(handle,"mere_extension_abi");
+    const char *base=strrchr(path,'/'); base=base?base+1:path;
+    char symbol[256]="Init_"; size_t n=strcspn(base,".");
+    int valid=n>0 && n+6<sizeof(symbol);
+    for(size_t i=0;valid && i<n;i++) if(!(isalnum((unsigned char)base[i]) || base[i]=='_')) valid=0;
+    if(valid) { memcpy(symbol+5,base,n); symbol[n+5]=0; }
+    void (*init)(void)=valid?(void (*)(void))dlsym(handle,symbol):NULL;
+    if(!abi || *abi!=0x4d520002U || !init) {
+        snprintf(error,sizeof(error),"native extension ABI or Init symbol mismatch: %s",base);
+        dlclose(handle); open_failures++; return -1;
+    }
+    int i=library_count++; strcpy(libraries[i].path,path);
+    libraries[i].handle=handle; libraries[i].init=init; return 1000000+i;
+}
+int mr_typed_loader_stat(int field) {
+    if(field==0) return library_count;
+    if(field==1) return open_failures;
+    if(field==2) return method_count;
+    int n=0; for(int i=0;i<library_count;i++) n+=libraries[i].calls; return n;
 }
 char *mr_typed_error(void) { return error; }
 char *mr_typed_text(void) { return (char *)(text ? text : ""); }
@@ -105,7 +170,7 @@ VALUE probe_typed_wrap(VALUE klass, const rb_data_type_t *type, void *p, size_t 
     entries[slot]=(struct payload){.type=type,.data=p,.owned=owned};
     live_count++; if(owned) payload_count++; payload_bytes += owned;
     // WRAP publishes the owner before returning its active VALUE token.
-    return probe_dispatch(11,(VALUE)slot,klass,0,0,0);
+    return probe_dispatch(11,(VALUE)slot,(ID)class_id(klass),0,0,0);
 }
 void *probe_typed_malloc(size_t size) {
     void *p=calloc(1,size); if(!p) abort(); return p;

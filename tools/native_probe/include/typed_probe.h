@@ -22,13 +22,22 @@ struct rb_data_type_struct {
 #define RUBY_TYPED_WB_PROTECTED 2
 #define RUBY_TYPED_EMBEDDABLE 4
 #define RUBY_DEFAULT_FREE ruby_xfree
-#define rb_cObject ((VALUE)1)
-#define rb_eStandardError ((VALUE)2)
+#define PROBE_CLASS_TAG ((VALUE)0x80000000U)
+#define rb_cObject (PROBE_CLASS_TAG | 1)
+#define rb_eStandardError (PROBE_CLASS_TAG | 2)
+#define rb_eRuntimeError (PROBE_CLASS_TAG | 3)
+#define rb_eLoadError (PROBE_CLASS_TAG | 4)
+#define rb_eArgError (PROBE_CLASS_TAG | 5)
+/* Loader rejects prebuilt extensions using a different VALUE ABI. */
+__attribute__((weak,visibility("default"))) const unsigned mere_extension_abi = 0x4d520002U;
+_Noreturn void rb_raise(VALUE, const char *, ...);
+VALUE rb_require(const char *);
 void ruby_xfree(void *);
 #define xfree ruby_xfree
 #define ALLOC(type) ((type *)calloc(1, sizeof(type)))
 VALUE rb_define_module(const char *);
 VALUE rb_define_module_under(VALUE, const char *);
+VALUE rb_define_class(const char *, VALUE);
 VALUE rb_define_class_under(VALUE, const char *, VALUE);
 void rb_define_alloc_func(VALUE, probe_method0);
 void probe_typed_define0(VALUE, const char *, probe_method0, int);
@@ -37,7 +46,17 @@ void probe_typed_define2(VALUE, const char *, probe_method2, int);
 #undef rb_define_singleton_method
 #define rb_define_singleton_method(k,n,f,a) \
     _Generic((f), probe_method0: probe_typed_define0, probe_method1: probe_typed_define1, probe_method2: probe_typed_define2)(k,n,f,a)
-#define rb_define_method rb_define_singleton_method
+void probe_typed_instance0(VALUE, const char *, probe_method0, int);
+void probe_typed_instance1(VALUE, const char *, probe_method1, int);
+void probe_typed_instance2(VALUE, const char *, probe_method2, int);
+void probe_typed_module0(VALUE, const char *, probe_method0, int);
+void probe_typed_module1(VALUE, const char *, probe_method1, int);
+void probe_typed_module2(VALUE, const char *, probe_method2, int);
+#define rb_define_method(k,n,f,a) \
+    _Generic((f), probe_method0: probe_typed_instance0, probe_method1: probe_typed_instance1, probe_method2: probe_typed_instance2)(k,n,f,a)
+#undef rb_define_module_function
+#define rb_define_module_function(k,n,f,a) \
+    _Generic((f), probe_method0: probe_typed_module0, probe_method1: probe_typed_module1, probe_method2: probe_typed_module2)(k,n,f,a)
 void rb_gc_mark(VALUE);
 VALUE rb_str_new_cstr(const char *);
 VALUE probe_typed_wrap(VALUE, const rb_data_type_t *, void *, size_t);

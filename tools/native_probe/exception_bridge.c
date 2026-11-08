@@ -19,7 +19,7 @@ struct context {
     struct context *previous;
     struct guard *guard;
     int pending, method;
-    VALUE first, second;
+    VALUE first, second, third;
 };
 static _Thread_local struct context *active;
 static int live_resources, call_depth, ensures;
@@ -134,20 +134,20 @@ int mr_native_find(const char *name) {
 int mr_native_arity(int method) {
     return method >= 0 && method < method_count ? methods[method].arity : -1;
 }
-extern VALUE probe_typed_entry(int, VALUE, VALUE);
+extern VALUE probe_typed_entry(int, VALUE, VALUE, VALUE);
 static VALUE entry(VALUE unused) {
     (void)unused;
     int method = active->method;
-    if (method < 0) return probe_typed_entry(-method-1, active->first, active->second);
+    if (method < 0) return probe_typed_entry(-method-1, active->first, active->second, active->third);
     if (method >= method_count) {
         probe_dispatch(API_ERROR, 0, 1, 0, 0, 0); abort();
     }
     if (methods[method].arity == 1) return methods[method].fn.one(Qnil, active->first);
     return methods[method].fn.two(Qnil, active->first, active->second);
 }
-int mr_native_invoke(closure_native_request_int callback, int method, int first, int second) {
+int mr_native_invoke(closure_native_request_int callback, int method, int first, int second, int third) {
     struct context context = {.callback=callback, .previous=active,
-        .method=method, .first=(VALUE)first, .second=(VALUE)second};
+        .method=method, .first=(VALUE)first, .second=(VALUE)second, .third=(VALUE)third};
     void *resource = malloc(64);
     if (!resource) abort();
     live_resources++; call_depth++;

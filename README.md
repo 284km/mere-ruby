@@ -145,10 +145,11 @@ backtrace, and the original raise event. Temporary roots belong to one native
 invocation, including nested invocations, and are released on both exits.
 
 This is a synchronous interpreter-thread experiment on macOS / O1. Its tokens
-are not CRuby's VALUE ABI. Registration supports one- and two-argument methods;
+are not CRuby's VALUE ABI. The original adapter supports one- and two-argument methods;
 `rb_funcall` transports up to two arguments (the original input exercises zero).
-The Ruby adapter routes calls to registered C methods. General extension
-loading, mkmf, asynchronous callbacks, thread/fiber suspension, and
+The original Ruby adapter routes calls to registered C methods; the native
+loader experiment below replaces that routing for its supported API. mkmf,
+asynchronous callbacks, thread/fiber suspension, and
 system allocation failure recovery remain outside this experiment. The older
 float adapter uses a separate value representation. These results do not
 change the main branch's test scoreboard.
@@ -188,16 +189,63 @@ detect double free; it does not require every unreachable object to disappear
 after a fixed number of collections. Disabling the stack scan is used only as
 a separate diagnostic, never for the normal success result.
 
-This remains a local macOS / O1 experiment. Registration and Ruby routing are
-fixture-specific. Embedded storage is emulated by a separate allocation;
+This remains a local macOS / O1 experiment. Its original validator uses
+fixture-specific Ruby routing; the loader below also tests ordinary require.
+Embedded storage is emulated by a separate allocation;
 free callbacks run synchronously during sweep, without reproducing CRuby's
 deferred-free scheduling. Movable marking/dcompact, generational barriers,
-shutdown finalization, general extension loading, mkmf, and the CRuby binary
+shutdown finalization, the full extension API, mkmf, and the CRuby binary
 ABI remain unimplemented. Mark/free callbacks must not invoke Ruby or allocate.
 C-side ASan/UBSan validation covers the bridge and the unchanged extensions;
 the generated interpreter is uninstrumented. That run uses
 `ASAN_OPTIONS=use_sigaltstack=0` for the runtime's coroutine stack management.
 It is not a whole-interpreter sanitizer or leak-freedom claim.
+
+## Native registration and require investigation
+
+The `feat/native-loader` prototype connects C module/class definitions,
+fixed-arity methods (0..2 arguments), module functions and allocators to the
+ordinary Ruby method tables. Inheritance, aliases, visibility, argument checks,
+blocks and `super` use the interpreter's existing dispatch. Allocators receive
+the actual subclass, and `new` invokes its Ruby `initialize` normally.
+
+```sh
+python3 tools/native_probe/loader_check.py \
+  --ruby-source /path/to/ruby-4.0.9 \
+  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --output /tmp/native-loader-results
+```
+
+This validator uses native bundles directly through `require`, with no
+extension-specific Ruby routing files in its load path. It checks 41 shared
+contracts plus 4 native bookkeeping contracts, including GC stress, repeated
+require, absolute/symlink identity, `.so` aliases, `require_relative`, nested
+and circular loading, Ruby-file precedence, and initialization failure/retry.
+The unchanged upstream TypedData and exception test files, plus the selected
+`test_marshal` roundtrip, pass 7 tests / 31 assertions on both runtimes.
+The remaining Marshal compatibility cases are not included. Original input
+hashes and exact result counts are checked; each process family retains the
+90-second / 2-GiB limit.
+
+The loader resolves `Init_<basename>` and requires this prototype's ABI marker.
+Extensions must be rebuilt against its headers with `PROBE_TYPED_API`; CRuby
+binary extensions cannot be loaded. A failed Init removes the loaded-feature
+entry but leaves its partial Ruby definitions, matching CRuby. Libraries stay
+resident after opening successfully so those methods and TypedData callbacks
+remain callable; retry invokes Init again on the same library state. ABI or
+missing-Init failures close the handle before invoking Init.
+
+This is still a local macOS / O1, synchronous prototype, with limits of 512
+class-name slots, 4096 method slots and 128 resident libraries. It does not
+implement variable-arity C entry points, concurrent loading, unloading,
+automatic discovery of all C roots, or the rest of the Ruby C API. Existing
+TypedData and exception limitations above still apply. The next step is to
+connect RbConfig/mkmf and validate extensions built by that path. The older
+float probe still uses its separate adapter and value representation.
+
+`--mere /path/to/instrumented-runtime --sanitize-extension` validates C-side
+ASan/UBSan builds; `--select` can restrict run names. Instrumenting only the
+bridges and extensions does not instrument the generated interpreter.
 
 ## Gates
 
