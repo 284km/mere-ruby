@@ -113,12 +113,12 @@ if [ "$pneed" = 1 ]; then
   ar rcs "$plib" "$pobj"/*.o || { rm -rf "$pobj"; exit 1; }
 fi
 
-printf 'cc     clang %s %s mr.c tools/prism_glue.c tools/socket_glue.c libprism.a -o mere-ruby\n' "$opt" "$plat"
+printf 'cc     clang %s %s mr.c tools/prism_glue.c tools/socket_glue.c tools/process_glue.c libprism.a -o mere-ruby\n' "$opt" "$plat"
 # ⚠ NEVER `cp` OVER A RUNNING BINARY -- the text pages of a process that is
 # mid-run are backed by that file, and overwriting them SIGKILLs it or, worse,
 # gives it another build's instructions. Build beside it and rename.
 # shellcheck disable=SC2086
-clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" -pthread "$plib" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
+clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/process_glue.c" -pthread "$plib" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
 
 # ...and say which build this is, where something that must not be misled can
