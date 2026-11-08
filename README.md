@@ -298,6 +298,58 @@ and `--mere /path/to/instrumented-runtime`. The validator adds ASan/UBSan
 through mkmf's compiler/linker options and uses `use_sigaltstack=0`; the
 generated interpreter can remain uninstrumented, as in the earlier probes.
 
+### Measuring all mkmf files
+
+The test environment prototype stages unchanged `test/mkmf` and `lib/mkmf.rb`
+inputs, generates a real Makefile, and supplies the in-tree header layout.
+An explicit launcher preloads the build configuration in parent and child
+interpreters, including children started through PATH or with `-w`, `-I` and
+`-C`. The default runtime configuration remains unchanged.
+
+```sh
+python3 tools/native_probe/mkmf_suite_check.py \
+  --ruby-source /path/to/ruby-4.0.9 \
+  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --reference-build /path/to/matching-ruby-build \
+  --output /tmp/mkmf-suite-results
+```
+
+Use an empty output directory. The reference needs its matching static Ruby
+library because in-tree mkmf probes select `LIBRUBYARG_STATIC`, even for a
+shared Ruby installation. Libraries absent from the installation are taken
+from `--reference-build` (default: the source directory). Mere uses only its
+own probe headers and does not link libruby. No C API stubs or test assertion
+changes are introduced by the launcher.
+
+Before measuring, the helper checks parent/child configuration, rejects a
+raw interpreter missing the preload, and compiles positive and negative
+header/symbol probes. Every measured command has a 90-second / 2-GiB process-family
+limit. It saves input and binary hashes, Makefiles, compiler preflight logs,
+test transcripts, per-case results and comparisons. Test inventories must
+match; incomplete transcripts or changed inputs fail the measurement.
+**Exit zero means measurement completed, not that every test passed.**
+
+On the macOS / O1 prototype, all 17 files complete. CRuby reports 148 tests,
+419 assertions, no failures/errors and 4 skips. Mere reports 148 tests,
+308 assertions, 6 failures, 12 errors and 4 skips. Six files pass fully
+(`configuration`, `flags`, `have_macro`, `install`, `libs`, `mkmf`); ten have
+failures/errors, and `pkg_config` skips all four cases on both runtimes.
+The remaining obstacles are:
+
+- Built-in `String#%` lookup through `super` (`convertible`, `signedness`,
+  `sizeof`) and an unassigned local after short-circuit evaluation (`framework`).
+- Target RbConfig selection (`config`) and PATH-dependent `Process.uid` in
+  `File::Stat#executable?` (`find_executable`).
+- Missing probe-header size/limits definitions (`constant`), unsupported
+  embedding API `ruby_init` (`egrep_cpp`, `have_func`), and a test archive-name
+  assumption derived from the absent `LIBRUBY_A` (`have_library`).
+
+The framework reports 126 successful cases, but this is not proof that every
+reference assertion was reached: `constant#test_long` returns early with the
+current missing size macros. Skips and that limitation remain visible in
+the results. These measurements do not update the main-branch scoreboard or
+establish Linux, O2, installation or general extension compatibility.
+
 ## Gates
 
 Every change is checked against the reference `ruby` before it lands:
