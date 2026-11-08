@@ -4132,6 +4132,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // object per content and encoding, so `"abc".equal?("abc")` is true and
     // the same literal evaluated twice is the same object. Frozen but fresh
     // each time, every identity question about a frozen literal said false.
+    // Quote-boundary metadata controls folding in the parser only.
+    else if str_eq name "__lit_static" || str_eq name "__lit_folded" then
+      eval_e env world blk recv_e
     else if str_len name > 10 && str_eq (substring name 0 10) "__lit_fsl~"
             && str_eq (substring name 10 (str_len name)) "on" && (match recv_e with EStrL _ -> true | _ -> false)
             && (if map_has cli_opt "dbg_fsl" then false else true) then
@@ -4155,6 +4158,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | VRegex (p9, f9, _) ->
          VRegex (p9, (if str_contains f9 "u" then f9 else f9 ++ "u"), enc_canon_name (substring name 9 (str_len name)))
        | v9 -> v9)
+    // The interpolation evaluator negotiates tagged source pieces
+    // itself. Retagging its result would discard the first dynamic piece's
+    // encoding (for example EUC-JP interpolated in a binary source file).
+    else if str_len name > 11 && str_eq (substring name 0 11) "__lit_denc~"
+            && dstr_spine recv_e && dstr_has_interp_l recv_e then
+      eval_e env world blk recv_e
     // an INTERPOLATED literal of a non-UTF-8 source (`__lit_denc~`): in a
     // US-ASCII source it takes the first interpolated piece's other encoding
     // ("x#\{euc}" is EUC-JP -- rb_str_concat_literals, dstr_ienc); in any
@@ -26484,13 +26493,31 @@ and dstr_has_interp_l = fn (e: Expr) ->
   match e with
   | EBin (_, l, r) -> dstr_has_interp r || dstr_has_interp_l l
   | _ -> false
-// evaluated left to right, each piece's encoding folded in as `+` folds it
-// (enc_compat2, and the same CompatibilityError), the String made once
+// Evaluate left to right, negotiating encodings as Ruby's literal concatenation
+// does (including its US-ASCII upgrade), and materialize one result String.
 and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   let rec pieces = fn (x: Expr) -> fn (acc: Expr list) ->
     (match x with
      | EBin (_, l, r) -> pieces l (Cons (r, acc))
      | other -> Cons (other, acc)) in
+  // The lexer inserts empty literal separators and a leading empty seed.
+  // They are not source parts. Ruby seeds a single interpolation with the
+  // source encoding, but a multi-part literal starts with its first part.
+  let rec source_parts = fn (ps: Expr list) ->
+    match ps with
+    | Nil -> Nil
+    | Cons (p, rest) ->
+      (match dstr_lit_of p with
+       | (true, t, _) when str_len t == 0 -> source_parts rest
+       | _ -> Cons (p, source_parts rest)) in
+  let all_parts = pieces e Nil in
+  let seed_enc = (match all_parts with
+                  | Cons (p, _) -> (match dstr_lit_of p with
+                                   | (true, _, en) when str_len en > 0 -> en
+                                   | _ -> "UTF-8")
+                  | _ -> "UTF-8") in
+  let ps = source_parts all_parts in
+  let multi = (match ps with Cons (_, Cons (_, _)) -> true | _ -> false) in
   // (ie: the first INTERPOLATED piece's encoding that is not US-ASCII, which
   //  a US-ASCII source's literal takes -- rb_str_concat_literals; read by
   //  the `__lit_enc~` tag through dstr_ienc)
@@ -26499,13 +26526,25 @@ and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     | Nil -> (let _ = map_set dstr_ienc "v" ie in
               let v = mkstr acc in match v with VStr h -> (let _ = senc_set h enc in v) | _ -> v)
     | Cons (p, rest) ->
-      (let (t9, e9) = (match p with
+      // The compiler drops a trailing empty static piece after another part;
+      // dynamic empty strings still participate in encoding negotiation.
+      (let static_empty = (match p with
+                            | EMethod (x, m, Nil) when str_eq m "__interp_str" ->
+                              (match dstr_lit_of x with (true, t, _) -> str_len t == 0 | _ -> false)
+                            | _ -> false) in
+       if multi && static_empty && (match rest with Nil -> true | _ -> false) && (if str_eq enc "" then false else true)
+       then go rest acc enc ie
+       else let (t9, e9) = (match p with
                        | EStrL t -> (t, "UTF-8")
                        // a literal piece through its tags (dstr_lit_of)
                        | EMethod (_, _, Nil) when (match dstr_lit_of p with (true, _, _) -> true | _ -> false) ->
                          (match dstr_lit_of p with (_, t, en) -> (t, if str_eq en "" then "UTF-8" else en))
                        | EMethod (x, _, _) ->
-                         (match eval_e env world blk x with
+                         (match dstr_lit_of x with
+                          // A static embedded string is a literal part, as in
+                          // Ruby's compiler; read its parse-time encoding.
+                          | (true, t, en) -> (t, if str_eq en "" then "UTF-8" else en)
+                          | _ -> (match eval_e env world blk x with
                           | VStr h -> (sget h, senc_get h)
                           // an Integer whose #to_s nothing replaced (no
                           // definition, prepend or refinement) is its digits,
@@ -26523,18 +26562,22 @@ and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                               | VObj oid9 ->
                                                 (let (_, _, oc9, _) = world in
                                                  ("#<" ++ cls_display world (obj_print_cls world (map_get oc9 oid9)) ++ ":0x" ++ hex_pad16 (oid9 - handle_base) ++ ">", "UTF-8"))
-                                              | _ -> (to_s other, "UTF-8"))))
+                                              | _ -> (to_s other, "UTF-8")))))
                        | _ -> ("", "UTF-8")) in
        // (a US-ASCII piece is ASCII only: a UTF-8 string takes it as it is,
        //  empty or not -- rb_enc_compatible)
-       let renc = (if str_eq e9 "US-ASCII" && str_eq enc "UTF-8" then enc else enc_compat2 enc acc e9 t9) in
+       let renc = (if str_eq enc "" then e9 else enc_compat2 enc acc e9 t9) in
+       // rb_str_concat_literals upgrades a US-ASCII result when a dynamic
+       // piece supplies another encoding, including an empty piece.
+       let renc = (if str_eq renc "US-ASCII" && (if str_eq e9 "US-ASCII" then false else true)
+                   then e9 else renc) in
        if str_eq renc "" then
          (let _ = prim_raise "Encoding::CompatibilityError"
                     ("incompatible character encodings: " ++ enc_msg_name enc ++ " and " ++ enc_msg_name e9) in VNil)
        else go rest (acc ++ t9) renc
               (if str_eq ie "" && (match dstr_lit_of p with (true, _, _) -> false | _ -> true) && (if str_eq (enc_canon_name e9) "US-ASCII" then false else true)
                then enc_canon_name e9 else ie)) in
-  go (pieces e Nil) "" "UTF-8" ""
+  go ps "" (if multi then "" else seed_enc) ""
 // does the program redefine + - or * on a class a Complex's parts can be?
 and cpx_ops_redef = fn world ->
   let rec cls = fn (cs: str list) ->
@@ -35127,8 +35170,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // true / false / nil each have ONE to_s string, frozen: ruby answers the
      // same object every time (`false.to_s.equal?(false.to_s)`), which a fresh
      // mkstr per call cannot. The intern table `-str` uses answers it.
-     | VBool _ -> str_fstring (mkstr (to_s recv))
-     | VNil -> str_fstring (mkstr "")
+     // Set the encoding before interning: tagging the shared UTF-8 entry
+     // afterwards also changes an unrelated frozen literal of the same text.
+     | VBool _ -> str_fstring (mkstr_ascii (to_s recv))
+     | VNil -> str_fstring (mkstr_ascii "")
      // a Symbol's text carries the symbol's encoding (see sym_enc_name).
      // ...and is CHILLED (ruby 3.4..4.0): mutating it warns, naming the
      // symbol (see chill_touch)
