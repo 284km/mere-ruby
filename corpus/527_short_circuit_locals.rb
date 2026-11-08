@@ -117,3 +117,40 @@ answer = defined?((defined_a, defined_b = never_run))
 p [answer, defined_a, defined_b]
 existing = :unchanged
 p [defined?(existing = never_run), existing]
+
+# Review regression: modifier.
+def before_guard = true
+1.times do
+  result = (:kept if before_guard || (before_guard = raise("unexpected rhs")))
+  p [result, before_guard]
+end
+def unless_guard = false
+1.times do
+  result = (:kept unless unless_guard && (unless_guard = raise("unexpected rhs")))
+  p [result, unless_guard]
+end
+1.times do
+  p (body_first = :written if body_first)
+  p (unless_body_first = :written unless unless_body_first)
+end
+
+# Review regression: literal.
+def local_name = :method
+1.times do
+  true || [].map { |&coerce| local_name = :block }
+  p local_name
+end
+p [1].map { |&coerce| coerce.nil? }
+def take_block(&b) = b.call
+p take_block(&(assigned_block = proc { :passed }))
+p assigned_block.call
+
+# Review regression: nonlocal.
+defined?($review_not_local = 1)
+defined?(REVIEW_NOT_LOCAL = 1)
+defined?(@review_not_local = 1)
+defined?(ÄREVIEW_NOT_LOCAL = 1)
+defined?($review_with_rhs = (review_rhs = raise("not evaluated")))
+p TOPLEVEL_BINDING.local_variables.grep(/review_not_local|REVIEW_NOT_LOCAL/)
+p [TOPLEVEL_BINDING.local_variables.include?(:review_rhs), review_rhs]
+p [defined?($review_not_local), defined?(REVIEW_NOT_LOCAL), defined?(@review_not_local), defined?(ÄREVIEW_NOT_LOCAL)]
