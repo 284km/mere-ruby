@@ -73,12 +73,30 @@ x = 1
 y = 2
 %w[UTF-8 US-ASCII ASCII-8BIT EUC-JP Windows-31J].each do |coding|
   [false, true].each do |frozen|
-    ['"a" "#{x}#{y}"', '"#{x}#{y}" "a"', '"" "#{x}#{y}"', '"#{x}#{y}" ""', '"\\u0041" "#{x}#{y}"', '"#{x}#{y}" "\\u0041"', '"\\u3042" "#{x}#{y}"', '"#{x}#{y}" "\\u3042"', '"\\x80" "#{x}#{y}"', '"#{x}#{y}" "\\x80"', '"a" "#{x}#{y}" "b"', '"#{x}#{y}" "a" "#{y}"', '\'a\' "#{x}#{y}"', '"#{x}#{y}" \'a\''].each do |source|
+    [
+      '"a" "#{x}#{y}"', '"#{x}#{y}" "a"',
+      '"" "#{x}#{y}"', '"#{x}#{y}" ""',
+      '"\\u0041" "#{x}#{y}"', '"#{x}#{y}" "\\u0041"',
+      '"\\u3042" "#{x}#{y}"', '"#{x}#{y}" "\\u3042"',
+      '"\\x80" "#{x}#{y}"', '"#{x}#{y}" "\\x80"',
+      '"a" "#{x}#{y}" "b"', '"#{x}#{y}" "a" "#{y}"',
+      '\'a\' "#{x}#{y}"', '"#{x}#{y}" \'a\'',
+      '"a" "#{\'b\'}"', '"#{\'a\'}" "b"',
+      '"" "#{\'\'}"', '"a" "#{nil}"'
+    ].each do |source|
       header = "# coding: " + coding + "\n# frozen_string_literal: " + frozen.to_s + "\n"
       value = eval((header + source).encode(coding))
       p [coding, frozen, source, value.bytes, value.encoding.name, value.frozen?]
     end
   end
+end
+
+# Converting singleton values must not re-encode an interned UTF-8 literal.
+['', 'true', 'false'].zip([nil, true, false]).each do |text, singleton|
+  literal = eval("# frozen_string_literal: true\n" + text.inspect)
+  converted = singleton.to_s
+  p [literal.encoding.name, converted.encoding.name, literal.frozen?,
+     converted.frozen?, converted.equal?(singleton.to_s)]
 end
 
 # Adjacent interpolated literals do not invoke a replaced String#+.
