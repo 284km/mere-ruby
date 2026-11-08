@@ -91,3 +91,13 @@ begin
 ensure
   File.unlink(path) if File.exist?(path)
 end
+
+# Reflection permits Object for the first name, but not later path segments.
+p RootFallback.const_get(:ROOT_ORDER)
+p RootFallback.const_source_location(:ROOT_ORDER) == Object.const_source_location(:ROOT_ORDER)
+begin
+  Object.const_get("RootFallback::String")
+rescue NameError => e
+  p e.class
+end
+p Object.const_source_location("RootFallback::String")
