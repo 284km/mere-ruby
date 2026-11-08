@@ -470,6 +470,31 @@ file-size-dependent work from the line reader.
 The foreach runs ranged from 30.3–32.4 seconds before and 15.6–21.2 seconds
 after. These are local workload measurements, not an end-to-end CI speedup.
 
+## `long_backtrace.rb`
+
+```sh
+ruby bench/long_backtrace.rb [frames]
+./mere-ruby bench/long_backtrace.rb [frames]
+```
+
+The default formats 15,000 explicit frames, independently of the interpreter's
+recursion limit. It reports the byte count, line count and endpoints. Forward
+and reverse backtrace formatting now use buffers instead of repeatedly copying
+the remaining suffix or accumulated prefix. Bottom-up frame numbers also use
+Ruby's alignment when the trace has multiple digits.
+
+On Apple silicon at O2 with Mere `991f299b` (2026-11-07), maximum child RSS
+reported by macOS `getrusage(RUSAGE_CHILDREN)` fell from 3,725,721,600 to
+194,756,608 bytes. Both outputs match Ruby 4.0.9. This OS high-water measurement
+captures short allocation spikes that periodic process sampling can miss.
+
+The unchanged upstream `ruby/test_stack.rb` now reaches its final summary
+within the existing 2 GiB budget: 3 tests, 10 assertions, one failure and one
+error, at 1,012,400 KiB sampled process-family RSS. Stack-size configuration
+compatibility remains incomplete. In `ruby/test_thread.rb`, the former
+stopping case completes, but a later interrupt/trap test still reaches the
+memory limit; this is not a claim of complete Thread compatibility.
+
 ## `buffered_file_writes.rb`
 
 ```sh
@@ -495,6 +520,25 @@ Two runs before this change used 1,549–1,793 MiB. All runs reached the same
 117 tests and retained the same five existing failures; this measures resource
 usage, not full FileUtils compatibility. The CI limits and test inputs are
 unchanged.
+
+## Builtin disassembly startup storage
+
+The generated `internal_disasm_text` has 219,645 bytes. Building it by chained
+concatenation retained every intermediate prefix in the default arena. The
+generator now emits a single buffer inside a temporary region; only its final
+string escapes. The decoded table is byte-identical, including all separators.
+
+On Apple silicon at O2 with Mere `991f299b`, against mere-ruby `e45622a`
+(2026-11-07), `MERE_REGION_STATS=1` reported default-arena allocations falling
+from 143,718,720 to 33,904,016 bytes for the same minimal input. The new
+temporary region allocated 481,832 bytes. Three runs of `sleep 1; puts :ok`
+used 203,328–203,344 KiB peak RSS before and 96,176–96,992 KiB after. The sleep
+allows the process sampler to observe startup storage; these measurements do
+not establish a wall-time improvement.
+
+`corpus/511_internal_disassembly_buffer.rb` compares complete disassemblies
+for five builtins after collections, checking that the retained table remains
+readable after the startup buffer's region ends.
 
 ## Positioned positive-length reads
 

@@ -2080,3 +2080,68 @@ witness.
   the singleton arm: it took a SUBCLASS tag for a singleton and ran the
   override a builtin's Method had asked to skip (bi_skip); the arm asks
   is_sng_cls and bi_skip_pass now.
+
+## 2026-11-08 (9): test/date, first round -- Date moves to lib/date_ext.rb; names and printers are US-ASCII, a Date has no clock, Marshal in ruby's shape; a %w list indented with tabs; a 100,000-digit to_i
+
+Note 511's stage 3, "date 103". test/date: 143 tests over 12 files,
+45 → 71 (measured on both binaries). The Date library (1,100 lines of Ruby inside a Mere string in
+m_eval_leaf.mere, grown in layers) is lib/date_ext.rb now, through
+tools/gen_pathname_lib.rb with the rest; the first generation reproduced
+the old literal byte for byte, and every change since is a Ruby edit.
+corpus/510 is the witness. Two of the interpreter's own came out first:
+
+- **A `%w` list broken across lines and indented with tabs held a word of
+  tabs** (`%w(sunday? ... wednesday?\n\t\t\t\t thursday? ...)` in
+  test_date_attr): the word reader ended a word at a space or a newline
+  only. Any white space does (pw_ws), in %w, %i, %W and %I, and after a
+  backslash.
+- **`("1" + "0" * 100_000).to_i` never returned** -- test_date_parse's
+  too-long-year test, which took the whole file down (27 red): the bignum
+  path multiplied the growing decimal by ten per digit, quadratic. VBig is
+  a decimal string, so a long run of base-10 digits is taken whole (a
+  second for 100,000 digits).
+
+The date side, cluster by cluster:
+
+- MONTHNAMES / DAYNAMES and their abbreviations, to_s, inspect, strftime
+  (when ASCII), zone, rfc3339/2822, httpdate are US-ASCII.
+- A Date has no hour / min / sec / sec_fraction / zone / offset; those were
+  on Date (so `Date#respond_to?(:hour)` was true) and are DateTime's. The
+  Date printers read midnight at +00:00 through __hour/__minute/__second/
+  __offset, which DateTime answers from its fields.
+- Marshal: marshal_dump is [0, jd, df, sf, of, sg] (the UTC day, seconds
+  into it, nanoseconds, offset seconds, the reform); marshal_load reads
+  that and the 1.6 ([ajd, sg]) and 1.8 ([ajd, of, sg]) shapes, which
+  Date._load (Marshal's `u` type) hands it; a frozen date refuses.
+  initialize_copy takes any Date (a DateTime copied from a Date is that
+  date's midnight) and refuses the rest with TypeError.
+- DateTime.ordinal / .commercial with a time of day; a negative month
+  counts back from December; Date.commercial's negative week and day
+  counted back for validation but the jd was made from the negatives; a
+  non-number anywhere (Date.new/jd/ordinal/commercial, julian_leap?,
+  gregorian_leap?) is TypeError "expected numeric"; a Float with no
+  fraction is its integer.
+- The string parsers take `limit:` and refuse a longer string
+  (ArgumentError "string length (N) exceeds the limit 128"): _parse,
+  parse, _iso8601, _rfc3339, _xmlschema, and the new _rfc2822/_rfc822/
+  _httpdate/_jisx0301 and rfc3339/xmlschema/httpdate/jisx0301 class
+  methods (the limit, then the general parser).
+- jisx0301 for Date and DateTime(n): the era letter from Meiji 6
+  (1873-01-01), T/S/H/R at ruby's Julian Days, ISO 8601 before that.
+- strftime: `%^P` and `%#P` are upper case; a width of 8192 or more, or a
+  year of more than 2048 digits, is Errno::ERANGE as ruby's buffer makes
+  it; DateTime#to_date is a Date (it answered self); a negative year
+  prints as -0001.
+- **Left (72)**: fractional seconds inside a DateTime's jd (sec_fraction
+  through `+ Rational`, %L/%N from a parsed fraction), the offset in `%z`
+  for a parsed DateTime, the calendar reform (Date::ITALY/ENGLAND periods,
+  `civil__reform`, `different_alignments`), Date._parse and _strptime
+  against ruby's date_parse.c (21 + 11), `<=>` across Date/DateTime and
+  Infinity, deconstruct_keys with the clock, `===`, a DateSub subclass's
+  identity, DateTime.now's sub-second, Date#to_time for a Julian date,
+  test_date_compat's DateTime.
+- **Checked**: corpus 523/523 both ways, 510 under GC_STRESS=50, the 13
+  gates, test/date 71/143, and syntax 168, parse 102, literal 30, integer
+  38, marshal 230, object 65, method 97, string 439, array 459 at their
+  known counts; test_time.rb (which requires date) 22/42 on both the old
+  and the new binary.

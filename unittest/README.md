@@ -280,6 +280,16 @@ Reference and compiler builds take only a few minutes; this change targets the
 larger repeated-job overhead without introducing native-runtime cache validity
 or ABI dependencies.
 
+The checked-in estimates now come from the [post-merge run on 2026-11-07](https://github.com/284km/mere-ruby/actions/runs/42361097257)
+at `278a46c`, after the runtime fixes. All 758 files were collected from eight
+shards. The observed execution totals ranged from 708.0 to 1,383.5 seconds per
+shard with the previous weights. Replaying the same observations with refreshed
+weights gives 959.8–960.6 seconds per shard. A four-worker replay falls from
+2,298.3 to 1,920.4 seconds (16.4%); this excludes setup, queueing and future
+runtime variation and is not an observed end-to-end speedup. The report has no
+WALL_LIMIT files, but 22 MEMORY_LIMIT files and 166 incomplete or zero-test files
+remain. Successful collection is not Ruby conformance.
+
 Successful collection writes `timings.json` into `unittest-report`, using the
 observed per-file supervisor durations and exact source/compiler/Ruby refs.
 To refresh the checked-in estimates, inspect a completed full report, copy that
