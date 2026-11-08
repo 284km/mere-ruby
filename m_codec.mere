@@ -93,7 +93,48 @@ let enc_up = fn (s: str) -> enc_up_go s 0 "";
 // time; so is every single-byte encoding.
 // EUC-JIS-2004 reads and writes as EUC-JP here (its JIS X 0213 plane has no
 // table of its own: the characters EUC-JP has are the same bytes)
-let enc_tx_alias = fn (e: str) -> if str_eq (enc_up e) "EUC-JIS-2004" then "EUC-JP" else e;
+// (and a carrier's encodings are their bases' -- UTF8-KDDI is UTF-8,
+//  SJIS-KDDI Windows-31J -- with the carrier's emoji over them: emoji_co)
+let enc_tx_alias = fn (e: str) ->
+  let u = enc_up e in
+  if str_eq u "EUC-JIS-2004" then "EUC-JP"
+  else if str_eq u "UTF8-DOCOMO" || str_eq u "UTF8-KDDI" || str_eq u "UTF8-SOFTBANK" then "UTF-8"
+  else if str_eq u "SJIS-DOCOMO" || str_eq u "SJIS-KDDI" || str_eq u "SJIS-SOFTBANK" then "Windows-31J"
+  else e;
+// ---- the carriers' emoji (m_emoji.mere's tables, from ruby 4.0.9) ----
+// the company of a carrier encoding, "" for any other
+let emoji_co = fn (e: str) ->
+  let u = enc_up e in
+  if str_eq u "UTF8-DOCOMO" || str_eq u "SJIS-DOCOMO" then "DoCoMo"
+  else if str_eq u "UTF8-KDDI" || str_eq u "SJIS-KDDI" || str_eq u "ISO-2022-JP-KDDI" then "KDDI"
+  else if str_eq u "UTF8-SOFTBANK" || str_eq u "SJIS-SOFTBANK" then "SoftBank"
+  else "";
+let emoji_sjis_co = fn (e: str) ->
+  let u = enc_up e in
+  if str_eq u "SJIS-DOCOMO" then "DoCoMo" else if str_eq u "SJIS-KDDI" then "KDDI"
+  else if str_eq u "SJIS-SOFTBANK" then "SoftBank" else "";
+// a table read into emoji_tables once, as "name:key" -> value
+let emoji_load = fn (name: str) ->
+  let src = emoji_src name in
+  let n = str_len src in
+  let rec num = fn (i: int) -> fn (acc: int) -> fn (neg: bool) ->
+    if i < n && ord (char_at src i) >= 48 && ord (char_at src i) <= 57 then num (i + 1) (acc * 10 + ord (char_at src i) - 48) neg
+    else if i < n && str_eq (char_at src i) "-" then num (i + 1) acc true
+    else (i, if neg then 0 - acc else acc) in
+  let rec go = fn (i: int) ->
+    if i >= n then ()
+    else
+      (match num i 0 false with
+       | (j, k) ->
+         (match num (j + 1) 0 false with
+          | (j2, v) -> (let _ = map_set emoji_tables (name ++ ":" ++ str_of_int k) v in go (j2 + 1)))) in
+  let _ = go 0 in
+  map_set emoji_tables (name ++ "!") 1;
+// the value for k, or -2 when the table has none (-1: named undefined)
+let emoji_tbl = fn (name: str) -> fn (k: int) ->
+  let _ = (if map_has emoji_tables (name ++ "!") then () else emoji_load name) in
+  let key = name ++ ":" ++ str_of_int k in
+  if map_has emoji_tables key then map_get emoji_tables key else 0 - 2;
 // ---- transcoding between UTF-8 / ISO-8859-1 / US-ASCII (formula-based) ----
 // decode source bytes to a codepoint list (UTF-8 multibyte; else byte=cp).
 // UTF-16, both ways. `encode` used to answer the SAME BYTES for every target it
@@ -444,6 +485,7 @@ let utf8_bad_len = fn (s: str) -> fn (i: int) ->
 // X 0208 (two 7-bit bytes, looked up as the EUC-JP pair), ESC ( I the
 // half-width katakana of CP5022x. A byte with the high bit set, a broken
 // escape, or a control byte inside a JIS X 0208 run is broken (-1).
+let iso_kddi = (let v9 = vec_new () in let _ = vec_push v9 0 in v9);
 let rec iso2022_dec = fn (cpx: bool) -> fn (s: str) -> fn (i: int) -> fn (mode: int) ->
   let n = str_len s in
   let o = fn (k: int) -> if k < n then ord (char_at s k) else 0 - 1 in
@@ -464,7 +506,11 @@ let rec iso2022_dec = fn (cpx: bool) -> fn (s: str) -> fn (i: int) -> fn (mode: 
      else
        // (CP50220/50221 read the pair as Windows-31J does: the NEC and IBM
        //  rows, and 0x224C is U+FFE2, not JIS X 0208's U+00AC)
-       (let sj9 = sjis_of_jis (o i) (o (i + 1)) in
+       (let kd9 = (if vec_get iso_kddi 0 == 1 then emoji_tbl "jd_KDDI" (o i * 256 + o (i + 1)) else 0 - 2) in
+        if kd9 >= 0 then Cons (kd9, iso2022_dec cpx s (i + 2) mode)
+        else if kd9 == 0 - 1 then Cons (0 - (10 + i), iso2022_dec cpx s (i + 2) mode)
+        else
+        let sj9 = sjis_of_jis (o i) (o (i + 1)) in
         let w9 = (if cpx then jisv_dec "WINDOWS-31J" (ord (char_at sj9 0)) (ord (char_at sj9 1)) else 0 - 1) in
         let ch = (if w9 >= 0 then utf8_enc w9 else jis_e2u_ch (jis_hx2 (o i + 128) ++ jis_hx2 (o (i + 1) + 128))) in
         if str_eq ch "" then Cons (0 - (10 + i), iso2022_dec cpx s (i + 2) mode)
@@ -483,6 +529,29 @@ let rec decode_cps = fn (s: str) -> fn (from0: str) -> fn (i: int) ->
   // (UTF8-MAC reads as UTF-8: String#encode composes what it decomposed)
   let from = (if str_eq (enc_up from0) "UTF8-MAC" then "UTF-8" else enc_tx_alias from0) in
   if i >= str_len s then Nil
+  // a carrier's Shift_JIS: its emoji (and the codes it reads otherwise) from
+  // its table, Windows-31J's for the rest
+  else if (if str_eq (emoji_sjis_co from0) "" then false else true) then
+    (let co = emoji_sjis_co from0 in
+     let b = ord (char_at s i) in
+     let v = (if b >= 129 && b <= 252 && (b < 160 || b > 223) && i + 1 < str_len s
+              then emoji_tbl ("sd_" ++ co) (b * 256 + ord (char_at s (i + 1))) else 0 - 2) in
+     if v >= 0 then Cons (v, decode_cps s from0 (i + 2))
+     else if v == 0 - 1 then Cons (0 - (10 + i), decode_cps s from0 (i + 2))
+     else
+       (let l9 = enc_clen s "Windows-31J" i in
+        let l = (if l9 < 1 then 1 else if i + l9 > str_len s then str_len s - i else l9) in
+        let rec shift9 = fn (xs: int list) ->
+          (match xs with
+           | Nil -> decode_cps s from0 (i + l)
+           | Cons (c9, t9) -> Cons ((if c9 <= 0 - 10 then c9 - i else c9), shift9 t9)) in
+        shift9 (decode_cps (substring s i (i + l)) "Windows-31J" 0)))
+  // ISO-2022-JP-KDDI: ISO-2022-JP with KDDI's JIS X 0208 pairs (iso_kddi)
+  else if str_eq (enc_up from0) "ISO-2022-JP-KDDI" then
+    (let _ = vec_set iso_kddi 0 1 in
+     let r9 = iso2022_dec false s i 0 in
+     let _ = vec_set iso_kddi 0 0 in
+     r9)
   // EUC-JIS-2004: its own reading where the table has one, EUC-JP's for the
   // rest (a character at a time, its undefined marks moved to where it is)
   else if str_eq (enc_up from0) "EUC-JIS-2004" then
@@ -669,6 +738,13 @@ let rec encode_cps_go = fn (cps: int list) -> fn (to0: str) -> fn b ->
               let k9 = ej2004_key x9 0 in
               if (if str_eq k9 "" then false else map_has ej2004_dec k9) then false
               else put x9)))
+     // a carrier's Shift_JIS: its table, Windows-31J's for the rest
+     else if (if str_eq (emoji_sjis_co to0) "" then false else true) then
+       (let v = emoji_tbl ("se_" ++ emoji_sjis_co to0) cp in
+        if v >= 0 then put (chr (v / 256) ++ chr (v - (v / 256) * 256))
+        else if v == 0 - 1 then false
+        else if encode_cps_go (Cons (cp, Nil)) "Windows-31J" b then encode_cps_go t to0 b
+        else false)
      else if str_eq tu "UTF-8" then put (utf8_enc cp)
      // (stateless-ISO-2022-JP: a JIS X 0208 character is 0x92 and its EUC-JP
      //  pair; what EUC-JP writes otherwise -- katakana, JIS X 0212 -- it
@@ -761,16 +837,24 @@ let rec encode_cps_go = fn (cps: int list) -> fn (to0: str) -> fn b ->
                 if str_eq j5 "" then false
                 else (let _ = to_mode 1 in let _ = strbuf_push b j5 in go5 t5 1))) in
         go5 cps 0)
-     else if str_eq tu "ISO-2022-JP" then
+     else if str_eq tu "ISO-2022-JP" || str_eq tu "ISO-2022-JP-KDDI" then
        // stateful JIS: ASCII bytes as-is, JIS X 0208 pairs inside
        // ESC $ B ... ESC ( B mode switches, closed back to ASCII at the end.
-       (let rec go2 = fn (xs: int list) -> fn (mode: int) ->
+       // (ISO-2022-JP-KDDI: KDDI's pairs first, from its table)
+       (let kd9 = str_eq tu "ISO-2022-JP-KDDI" in
+        let rec go2 = fn (xs: int list) -> fn (mode: int) ->
           (match xs with
            | Nil -> (let _ = (if mode == 1 then strbuf_push b (chr 27 ++ "(B") else ()) in true)
            | Cons (cp2, t2) ->
              if cp2 >= 0 && cp2 < 128 then
                (let _ = (if mode == 1 then strbuf_push b (chr 27 ++ "(B") else ()) in
                 let _ = strbuf_push b (chr cp2) in go2 t2 0)
+             else if kd9 && emoji_tbl "je_KDDI" cp2 == 0 - 1 then false
+             else if kd9 && emoji_tbl "je_KDDI" cp2 >= 0 then
+               (let v9 = emoji_tbl "je_KDDI" cp2 in
+                let _ = (if mode == 0 then strbuf_push b (chr 27 ++ "$B") else ()) in
+                let _ = strbuf_push b (chr (v9 / 256) ++ chr (v9 - (v9 / 256) * 256)) in
+                go2 t2 1)
              else
                let pair = jis_u2e_pair (utf8_enc cp2) in
                (if str_eq pair "" then false
