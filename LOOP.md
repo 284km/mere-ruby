@@ -2286,3 +2286,80 @@ Note 511's stage 3, "ruby/enc 117". Measured first: 219 tests, 151 green
   denominator of the test's 2x ratio, and the ~115 MB an eval of a syntax
   error grows by in the loop now crosses it (rss 99 MB -> 216 MB). The
   growth itself is older -- a stage 4 item, not this round's.
+
+## 2026-11-08 (13): the rest of ruby/enc, cgi, erb, uri, monitor, did_you_mean -- a wide string's methods through UTF-8, nil's string is US-ASCII before it is interned
+
+Note 511's stage 3: "ruby/enc", "cgi", "erb 4", "uri 3", "monitor 3",
+"did_you_mean 3", "etc 5". corpus/524 and 525 are the witnesses.
+
+- **A UTF-16/32 string's chomp, count, split, ord, casecmp(?) and
+  gsub/sub/scan with a regexp** run on the string as UTF-8 and come back in
+  its encoding: the arguments of the same encoding converted, a regexp in
+  the string's encoding as its source in UTF-8, a replacement table's
+  strings too (cgi's escapeHTML on UTF-16 gsubs with a Hash). A table key
+  in another encoding never equals a match in this one, even when its
+  bytes are ASCII, and is left out (corpus 518's ISO-8859-7 keys).
+  gsub with a replacement of an incompatible encoding raises ruby's
+  "incompatible character encodings", unless nothing matched or
+  everything did. A string that does not decode keeps the engine's
+  reading; ord on a broken first character is "invalid byte sequence".
+- **A multibyte literal is one atom** in a regexp of its encoding:
+  `/^あ+$/` in EUC-JP repeated the last byte (`"ああ" =~` was nil), and so
+  `\p{Hiragana}+` could not match either. A property search on UTF-8
+  reads characters as UTF-8 (uprop_enc stayed the subject's).
+- **CESU-8** has its own shape (surrogate halves as two three-byte
+  sequences, no four-byte UTF-8): valid_encoding?, length, ord. GB18030's
+  chop finds the start of the last character from the left (Onigmo's
+  state machine, gb18_left_adjust). Integer#chr in Big5, CP949, GBK,
+  EUC-TW and their kin takes a well-formed code that is not in the table.
+- **Encoding::Converter.asciicompat_encoding** answers the pairs it
+  lacked: CESU-8 → UTF-8, CP50220/50221 → CP51932, ISO-2022-JP-KDDI →
+  its stateless form, IBM037 → ISO-8859-1 (cgi's escapeHTML on a dummy
+  encoding works in that one). Time#strftime refuses a UTF-16/32 format.
+  The Cyrillic letters U+1C80..U+1C88 fold with their plain forms.
+- **nil.to_s was interned as UTF-8 and relabelled US-ASCII after**: the
+  canonical "" was then what a frozen "" literal's UTF-8 key found, and
+  every `''.dup` in a frozen_string_literal file was US-ASCII once a nil
+  had been interpolated anywhere -- uri's test_build failed only after
+  test_find_proxy_no_proxy, where IPAddr builds "invalid address: #{@addr}"
+  with @addr nil. PR #47 (9b7befb) made the same fix meanwhile and its
+  version is kept; this round adds nil.inspect as a fresh string, as
+  ruby's, and true/false's inspect interned as US-ASCII.
+- **Marshal asked the dumped object's own equal?** (`obj.equal?(::ENV)`,
+  `v.equal?(:__undef)`): erb's AlwaysEqual answered true and was dumped
+  as ENV, then loaded as a bad link. The receivers are the known objects.
+- **`def CONST.m` in a class body** with the constant holding an Array or a
+  String defined on a "(sng:CONST)" nothing reaches (libexec/erb's
+  `def ARGV.switch` inside `class ERB`): the constant's value is the
+  receiver, as a local's is.
+- **`include A::B::C` whose qualifier comes from const_missing** recorded
+  the text (URI::REGEXP is RFC2396_REGEXP through URI.const_missing) and
+  matched no module; such a name is evaluated as the constant expression
+  it is. **`defined?(A::B::C)`** with A::B a const_set alias of another
+  module asks the module A::B evaluates to (URI::PATTERN::ESCAPED).
+- **A method named `lambda` (or `proc`) on self** is that method:
+  did_you_mean's HumanTypo has `attr_accessor :lambda` and `(lambda / 2)`
+  raised "tried to create Proc object without a block".
+- **private_methods** lists Kernel's private instance methods and
+  BasicObject's (kernel_private_fill): did_you_mean offers `raise` for
+  `raiae` called privately. Struct's "no member" NameError carries the
+  name and the receiver.
+- **Monitor** belongs to a fiber, as ruby's since 3.0 (another fiber's
+  try_enter is false); a timed wait that runs out is false; the mixin's
+  initialize forwards with `(...)`, so a parent's keyword initialize gets
+  its keywords.
+- **Etc**: a uid or gid is a uid_t -- nobody's -2 in /etc/passwd is
+  4294967294, and getpwuid(-2) finds it.
+- **Left**: cgi's two NativeExt tests ask for the C extension; etc's three
+  Ractor tests (an unsafe call raising in a Ractor, a parallel run);
+  Tempfile's eight (next round: an anonymous file needs a descriptor that
+  outlives its name, and mere-ruby's File is a path and a buffer).
+- **Checked**: corpus 536/536 both ways, 524 and 525 under GC_STRESS=50,
+  the 13 gates; 123 unittest files (6018 tests) against the same set under
+  be480af's binary: MATCH 5898 → 5944, no file lower. ruby/enc 194 →
+  216/219 (every test ruby passes; the three left fail in ruby too),
+  cgi/escape 427 → 433/435, erb 76 → 80/80 and erb_command 0 → 2/2,
+  uri/common 14 → 16, uri/generic 25 → 26, did_you_mean 3 → 0 red,
+  monitor 11 → 14/14, etc 11 → 13. test_array's one flip is
+  test_shared_marking, a five-second GC test that the REFERENCE failed in
+  one run and passed in the other (mere-ruby skips it both times).
