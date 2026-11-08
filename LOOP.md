@@ -2461,3 +2461,61 @@ green). corpus/527 is the witness.
   Happy Eyeballs timing tests, memory-leak tests too slow here),
   io/console 27, net/http 3 (+ https 19, openssl: stage 7), resolv 1,
   io/wait 1.
+
+## 2026-11-09 (16): socket is a Ruby file now -- datagrams with recvmsg/sendmsg, a bound datagram socket keeps its port, ruby's Socket.tcp -- test/socket 147 → 194/209
+
+Note 511's stage 3, "socket ~84" (first measured: 209 tests, 147 green).
+corpus/528 is the witness.
+
+- **The socket library moves to lib/socket_ext.rb** (2,250 lines that were
+  a Mere string in m_eval_leaf.mere), shipped through
+  tools/gen_pathname_lib.rb like Pathname and Tempfile. Its one
+  interpolation -- the platform's constant table -- is a primitive now,
+  Socket.__consts_text (m_unicode.mere's sock_consts). The move alone
+  changed no result.
+- **Datagrams.** One helper takes one datagram (`__dgram_take`: the
+  runtime's recvfrom, MSG_DONTWAIT when non-blocking, one byte more than
+  asked for so a longer datagram is seen -- macOS's recvfrom answers what
+  it copied), and recvmsg / recvmsg_nonblock (MSG_TRUNC; macOS's
+  MSG_DONTWAIT back in the flags), recvfrom_nonblock (UDPSocket's array,
+  Socket's Addrinfo), recv_nonblock on a datagram socket and Socket#recvfrom
+  stand on it. sendmsg / sendmsg_nonblock are send (ancillary data is
+  NotImplementedError: the runtime has no sendmsg). Socket#send to an
+  address sends to it (it was EDESTADDRREQ).
+- **A BOUND datagram socket that connects keeps its descriptor**: the
+  runtime's connect makes a new socket, so the port the peer was told
+  about went away and test/socket's udp_pair never received anything. The
+  peer is remembered instead (send without an address, getpeername,
+  peeraddr use it); an unbound socket takes the runtime's connected one as
+  before. A stream Socket connected already answers EISCONN (0 without
+  exceptions) -- a second connect_nonblock made a second connection.
+- **Ruby's own code, as it is**: Socket.tcp with Happy Eyeballs v2
+  (tcp_with_fast_fallback, the resolution threads and stores; every
+  hostname-resolution test passes), tcp_server_sockets, udp_server_*,
+  ip_sockets_port0, UDPSource; Socket.tcp_fast_fallback(=) as socket.c
+  keeps it.
+- **Smaller ones**: a NUL in a host, a service or a UNIX path is ruby's
+  ArgumentError; getnameinfo takes an Addrinfo; UDPSocket#bind / #connect
+  read the host with #to_str and check the socket after (IOError when the
+  conversion closed it, as getsockopt and listen do now); EMSGSIZE names
+  the host and port; BasicSocket.for_fd(-1) is EBADF; Socket.pair /
+  UNIXSocket.pair with a block yield and close; getpeereid from
+  LOCAL_PEERCRED (SO_PEERCRED on Linux) and the xucred's inspect;
+  Socket::Option.ipv4_multicast_loop / _ttl; getifaddrs is ruby's
+  NotImplementedError (the runtime gives addresses, not interfaces).
+- **UNIXSocket.pair / Socket.pair IGNORED THEIR BLOCK**, so every test
+  written as `UNIXSocket.pair { |i, o| ... }` passed without running a line
+  -- test/fiber's test_io_close among them. Running, they showed that a
+  stream closed under a waiter did not interrupt it: a fiber waiting in its
+  scheduler's io_wait is now interrupted through #fiber_interrupt with the
+  IOError (the stream keeps who waits on it), and a thread parked waiting
+  for readiness raises "stream closed in another thread".
+- **Left** (the runtime): file descriptors over SCM_RIGHTS and
+  SO_TIMESTAMP (sendmsg/recvmsg with ancillary data), connecting from a
+  chosen local port (connect(2) on an existing descriptor), getifaddrs;
+  the memory-leak tests (a child doing 100,000 binds) time out here.
+- **Checked**: corpus 549/549 both ways, 528 under GC_STRESS=50, the 13
+  gates; 182 unittest files (7733 tests: the wide set with net, resolv,
+  io/wait and open-uri) against 96dac90's binary: MATCH 7285 → 7334,
+  test/socket 147 → 194/209, no file lower (test_array's shared_marking
+  and test_thread's priority are the reference's flakes, as before).
