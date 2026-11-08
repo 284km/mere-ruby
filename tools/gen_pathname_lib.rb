@@ -22,7 +22,13 @@ files = [[%w[pathname pathname.so], File.read("#{here}/lib/pathname_ext.rb")],
          [%w[tmpdir], File.read("#{here}/lib/tmpdir_ext.rb")],
          [%w[cgi/escape], File.read("#{here}/lib/cgi_escape_ext.rb")],
          [%w[cgi cgi/util], File.read("#{here}/lib/cgi_ext.rb")],
-         [%w[date date_core], File.read("#{here}/lib/date_ext.rb")]]
+         # (the ports' magic comments are dropped: in the middle of a file
+         #  ruby warns that they are ignored, and assert_separately sees it)
+         [%w[date date_core], File.read("#{here}/lib/date_ext.rb") +
+           "class Date\n" + File.read("#{here}/lib/date_parse_ext.rb").sub(/\A# frozen_string_literal: \w+\n/, "") + "\n" +
+           File.read("#{here}/lib/date_strptime_ext.rb").sub(/\A# frozen_string_literal: \w+\n/, "") +
+           "\n  private_constant :MereDateParse, :MereDateStrptime\nend\n"],
+         [%w[time], File.read("#{here}/lib/time_ext.rb")]]
 
 def lit(line)
   line.gsub(/[\\"{}\t\r]/) { |c| { "\\" => "\\\\", '"' => '\\"', "{" => "\\{", "}" => "\\}", "\t" => "\\t", "\r" => "\\r" }[c] }

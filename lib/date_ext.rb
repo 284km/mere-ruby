@@ -427,7 +427,7 @@ class DateTime < Date
   # or "+HH:MM"; the civil fields are read AS local to that offset, so only
   # #offset, #zone and the printers change.
   def self.new(y = -4712, m = 1, d = 1, h = 0, min = 0, s = 0, off = 0, _start = nil)
-    obj = super(y, m, d)
+    obj = super(y, m, d, _start)
     obj.__set_time(h, min, s)
     obj.__set_offset(Date.__offset_of(off))
     obj
@@ -1194,7 +1194,7 @@ class DateTime
     end
     next_day = h == 24
     h = 0 if next_day
-    obj = __new_fields(y, m, d, h, mi, sfr == 0 ? si : si + sfr, off)
+    obj = __new_fields(y, m, d, h, mi, sfr == 0 ? si : si + sfr, off, _st)
     obj += 1 if next_day
     carry = dfr * 86400 + hfr * 3600 + mfr * 60
     obj += Rational(carry, 86400) if carry != 0
@@ -1292,5 +1292,77 @@ class DateTime < Date
   def self.commercial(cwyear = -4712, cweek = 1, cwday = 1, h = 0, min = 0, s = 0, off = 0, start = Date::ITALY)
     dd = Date.commercial(cwyear, cweek, cwday, start)
     new(dd.year, dd.month, dd.day, h, min, s, off, start)
+  end
+end
+
+# ===========================================================================
+# The readers are ruby's own, ported: Date::MereDateParse is date_parse.c
+# (date__parse and the iso8601 / rfc3339 / xmlschema / rfc2822 / httpdate /
+# jisx0301 readers, lib/date_parse_ext.rb) and Date::MereDateStrptime is
+# date_strptime.c with date_core.c's frag completion (rt_rewrite_frags,
+# rt_complete_frags, d_new_by_frags; lib/date_strptime_ext.rb). Both were
+# checked against ruby 4.0.9 on every call test/date makes and on tens of
+# thousands of generated inputs (tools/date_checks/). Every constructor
+# below goes hash -> new_by_frags -> [jd, df, sf, of], as date_core does.
+# ===========================================================================
+class Date
+  def self._parse(str, comp = true, limit: 128) = MereDateParse._parse(str, comp, limit: limit)
+  def self._iso8601(str, limit: 128) = MereDateParse._iso8601(str, limit: limit)
+  def self._rfc3339(str, limit: 128) = MereDateParse._rfc3339(str, limit: limit)
+  def self._xmlschema(str, limit: 128) = MereDateParse._xmlschema(str, limit: limit)
+  def self._rfc2822(str, limit: 128) = MereDateParse._rfc2822(str, limit: limit)
+  def self._rfc822(str, limit: 128) = MereDateParse._rfc822(str, limit: limit)
+  def self._httpdate(str, limit: 128) = MereDateParse._httpdate(str, limit: limit)
+  def self._jisx0301(str, limit: 128) = MereDateParse._jisx0301(str, limit: limit)
+  def self._strptime(str, fmt = "%F") = MereDateStrptime._strptime(str, fmt)
+
+  # the object a [jd, df, sf, of] quadruple (UTC day, seconds, nanoseconds,
+  # offset seconds) names, of this class
+  def self.__from_quad(q, start)
+    raise Date::Error, "invalid date" if q.nil?
+    jd, df, sf, of = q
+    start = ITALY if start.nil?
+    return jd(jd, start) unless self <= DateTime
+    total = jd * 86400 + df + of + Rational(sf, 1_000_000_000)
+    __from_local(total, Rational(of, 86400), start)
+  end
+
+  def self.__new_by_hash(hash, start)
+    __from_quad(MereDateStrptime.new_by_frags(self <= DateTime ? :datetime : :date, hash, start.nil? ? ITALY : start), start)
+  end
+
+  def self.parse(str = "-4712-01-01", comp = true, start = ITALY, limit: 128)
+    __new_by_hash(_parse(str, comp, limit: limit), start)
+  end
+  def self.strptime(str = "-4712-01-01", fmt = "%F", start = ITALY)
+    __new_by_hash(_strptime(str, fmt), start)
+  end
+  def self.iso8601(str = "-4712-01-01", start = ITALY, limit: 128) = __new_by_hash(_iso8601(str, limit: limit), start)
+  def self.rfc3339(str = "-4712-01-01T00:00:00+00:00", start = ITALY, limit: 128) = __new_by_hash(_rfc3339(str, limit: limit), start)
+  def self.xmlschema(str = "-4712-01-01", start = ITALY, limit: 128) = __new_by_hash(_xmlschema(str, limit: limit), start)
+  def self.rfc2822(str = "Mon, 1 Jan -4712 00:00:00 +0000", start = ITALY, limit: 128) = __new_by_hash(_rfc2822(str, limit: limit), start)
+  def self.httpdate(str = "Mon, 01 Jan -4712 00:00:00 GMT", start = ITALY, limit: 128) = __new_by_hash(_httpdate(str, limit: limit), start)
+  def self.jisx0301(str = "-4712-01-01", start = ITALY, limit: 128) = __new_by_hash(_jisx0301(str, limit: limit), start)
+  class << self
+    alias rfc822 rfc2822
+  end
+end
+
+class DateTime < Date
+  def self._strptime(str, fmt = "%FT%T%z") = MereDateStrptime._strptime(str, fmt)
+  def self.parse(str = "-4712-01-01T00:00:00+00:00", comp = true, start = ITALY, limit: 128)
+    __new_by_hash(_parse(str, comp, limit: limit), start)
+  end
+  def self.strptime(str = "-4712-01-01T00:00:00+00:00", fmt = "%FT%T%z", start = ITALY)
+    __new_by_hash(_strptime(str, fmt), start)
+  end
+  def self.iso8601(str = "-4712-01-01T00:00:00+00:00", start = ITALY, limit: 128) = __new_by_hash(_iso8601(str, limit: limit), start)
+  def self.rfc3339(str = "-4712-01-01T00:00:00+00:00", start = ITALY, limit: 128) = __new_by_hash(_rfc3339(str, limit: limit), start)
+  def self.xmlschema(str = "-4712-01-01T00:00:00+00:00", start = ITALY, limit: 128) = __new_by_hash(_xmlschema(str, limit: limit), start)
+  def self.rfc2822(str = "Mon, 1 Jan -4712 00:00:00 +0000", start = ITALY, limit: 128) = __new_by_hash(_rfc2822(str, limit: limit), start)
+  def self.httpdate(str = "Mon, 01 Jan -4712 00:00:00 GMT", start = ITALY, limit: 128) = __new_by_hash(_httpdate(str, limit: limit), start)
+  def self.jisx0301(str = "-4712-01-01T00:00:00+00:00", start = ITALY, limit: 128) = __new_by_hash(_jisx0301(str, limit: limit), start)
+  class << self
+    alias rfc822 rfc2822
   end
 end

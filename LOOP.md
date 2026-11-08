@@ -2145,3 +2145,46 @@ The date side, cluster by cluster:
   38, marshal 230, object 65, method 97, string 439, array 459 at their
   known counts; test_time.rb (which requires date) 22/42 on both the old
   and the new binary.
+
+## 2026-11-08 (10): Date's readers and `time` are ruby's own -- test/date 71 → 111, test_time 22 → 42
+
+Note 511's stage 3, date's second round. Date._parse and the format
+readers are date_parse.c ported to Ruby (lib/date_parse_ext.rb), and
+Date._strptime with date_core.c's frag completion (rt_rewrite_frags,
+rt_complete_frags, d_new_by_frags) is date_strptime.c ported
+(lib/date_strptime_ext.rb). Both were written against ruby 4.0.9 as the
+oracle: tools/date_checks/check_parse.rb compares 37,079 calls (every call
+test_date_parse.rb makes, every string literal in it through every reader,
+and 31,620 generated inputs) and check_strptime.rb 18,363, with no
+difference; replayed through the shipped Date under mere-ruby, the 36,954
+parse cases with ruby's answers all agree. The generator wraps both in
+`class Date` as private constants (Date::MereDateParse,
+Date::MereDateStrptime) and drops their magic comments, which ruby warns
+about in the middle of a file (assert_separately saw the warning).
+Date.parse / strptime / iso8601 / rfc3339 / xmlschema / rfc2822 / httpdate
+/ jisx0301, for Date and DateTime, go hash -> new_by_frags -> [jd, df, sf,
+of] as date_core does. `require "time"` is ruby's lib/time.rb byte for
+byte now (lib/time_ext.rb); it reads through those, and test_time went
+22 → 42/42. corpus/511 is the witness.
+
+- **DateTime.new dropped its calendar** (the 8th argument): the start a
+  parsed DateTime was asked for was ITALY again. Passed through.
+- **Integer() of a long decimal was quadratic**: 100,000 digits took 74
+  seconds (a bignum multiply-and-add per digit). A plain run of decimal
+  digits is the bignum's text, taken whole. String#to_i's fast path took
+  the digits one character at a time into a growing string; one substring.
+- **The parse port's digit scan and character-class test** went a
+  character at a time (`s[j]` per character, a block call per byte):
+  Date._parse of a 100,000-digit year took 2.6 s against the test's 3 s
+  timeout. One search each; 0.06 s.
+- **Left in test/date (32)**: the model -- fractions of a second and of a
+  day carried by Date and DateTime (`Date.new + 1/2r`, jd(..., 3/8)), the
+  calendar reform for civil/ordinal/commercial and to_time, new_offset,
+  ===, <=> with Infinity and sub-millisecond, a subclass's identity
+  through arithmetic, Marshal's 1.8 / 1.9.2 shapes with objects, memsize.
+- **Checked**: corpus 524/524 both ways, 511 under GC_STRESS=50, the 13
+  gates, test/date 111/143, test_time 42/42, ruby/test_time 87,
+  test_time_tz 155, integer 38, float 63, rational 52, numeric 27, string
+  439, literal 30, parse 102, syntax 168, marshal 230, json all green, and
+  psych identical on the old and the new binary (86/538, its C side is
+  stage 7′).
