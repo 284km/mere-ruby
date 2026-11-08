@@ -6463,6 +6463,19 @@ let core_prelude_f =
   "  def self.wait(pid = -1, flags = 0)\n" ++
   "    pid = __to_pid(pid)\n" ++
   "    flags = 0 if flags.nil?\n" ++
+  "    # a non-blocking fiber's Fiber scheduler waits with its process_wait,\n" ++
+  "    # which answers a Process::Status (rb_process_status_wait; anything\n" ++
+  "    # else is rb_waitpid's TypeError)\n" ++
+  "    if (sch = Fiber.current_scheduler) && sch.respond_to?(:process_wait)\n" ++
+  "      st = sch.process_wait(pid, flags)\n" ++
+  "      return nil if st.nil?\n" ++
+  "      unless st.is_a?(Process::Status)\n" ++
+  "        raise TypeError, \"wrong argument type \" + (st == false || st == true ? st.inspect : st.class.to_s) + \" (expected process_status)\"\n" ++
+  "      end\n" ++
+  "      @__kids.delete(st.pid)\n" ++
+  "      Process.__set_last(st)\n" ++
+  "      return st.pid\n" ++
+  "    end\n" ++
   "    pids = if pid == -1 then @__kids.keys\n" ++
   "           elsif pid == 0 then @__kids.keys.reject \{ |p| @__kids[p][1] }\n" ++
   "           elsif pid > 0 then (@__kids.key?(pid) ? [pid] : [])\n" ++
@@ -7827,18 +7840,77 @@ let core_prelude_i =
   "      out.join(\"\\n\")\n" ++
   "    end\n" ++
   "\n" ++
+  "    # read/write/pread/pwrite: LENGTH is the least to move -- 0 is one\n" ++
+  "    # call, up to the rest of the buffer; nil is the rest of the buffer.\n" ++
+  "    # A non-blocking fiber's Fiber scheduler answers through io_read,\n" ++
+  "    # io_write, io_pread, io_pwrite when it has them (ruby's\n" ++
+  "    # rb_fiber_scheduler_io_read and the rest), its result as it is.\n" ++
   "    def read(io, length = nil, offset = 0)\n" ++
   "      __check!\n" ++
-  "      data = length.nil? ? io.read : io.read(length)\n" ++
-  "      return 0 if data.nil?\n" ++
-  "      set_string(data, offset)\n" ++
+  "      length = size - offset if length.nil?\n" ++
+  "      if (sch = Fiber.current_scheduler) && sch.respond_to?(:io_read)\n" ++
+  "        return sch.io_read(io, self, length, offset)\n" ++
+  "      end\n" ++
+  "      got = 0\n" ++
+  "      while got < length || got == 0\n" ++
+  "        room = size - offset - got\n" ++
+  "        break if room <= 0\n" ++
+  "        # (a descriptor stream is read(2) on its descriptor, past the\n" ++
+  "        #  stream's own read-ahead, as ruby's buffer reads it: an error is\n" ++
+  "        #  -errno -- -EAGAIN from a non-blocking one with nothing ready,\n" ++
+  "        #  which a scheduler's io_read loops on -- and nil the end)\n" ++
+  "        fd = io.instance_variable_defined?(:@__io_fd) ? io.instance_variable_get(:@__io_fd) : nil\n" ++
+  "        if fd\n" ++
+  "          data = IO.__fdread(fd, room)\n" ++
+  "          return(got > 0 ? got : data) if data.is_a?(Integer)\n" ++
+  "        else\n" ++
+  "          data = io.readpartial(room) rescue nil\n" ++
+  "        end\n" ++
+  "        break if data.nil? || data.empty?\n" ++
+  "        set_string(data, offset + got)\n" ++
+  "        got += data.bytesize\n" ++
+  "        break if length == 0\n" ++
+  "      end\n" ++
+  "      got\n" ++
   "    end\n" ++
   "\n" ++
   "    def write(io, length = nil, offset = 0)\n" ++
   "      __check!\n" ++
-  "      s = get_string(offset, length)\n" ++
+  "      length = size - offset if length.nil?\n" ++
+  "      if (sch = Fiber.current_scheduler) && sch.respond_to?(:io_write)\n" ++
+  "        return sch.io_write(io, self, length, offset)\n" ++
+  "      end\n" ++
+  "      s = get_string(offset, size - offset)\n" ++
+  "      fd = io.instance_variable_defined?(:@__io_fd) ? io.instance_variable_get(:@__io_fd) : nil\n" ++
+  "      if fd\n" ++
+  "        io.flush\n" ++
+  "        return IO.__fdwrite(fd, s)\n" ++
+  "      end\n" ++
   "      io.write(s)\n" ++
   "      s.bytesize\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def pread(io, from, length = nil, offset = 0)\n" ++
+  "      __check!\n" ++
+  "      length = size - offset if length.nil?\n" ++
+  "      if (sch = Fiber.current_scheduler) && sch.respond_to?(:io_pread)\n" ++
+  "        return sch.io_pread(io, self, from, length, offset)\n" ++
+  "      end\n" ++
+  "      room = size - offset\n" ++
+  "      return 0 if room <= 0\n" ++
+  "      data = io.pread(room, from) rescue nil\n" ++
+  "      return 0 if data.nil?\n" ++
+  "      set_string(data, offset)\n" ++
+  "      data.bytesize\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def pwrite(io, from, length = nil, offset = 0)\n" ++
+  "      __check!\n" ++
+  "      length = size - offset if length.nil?\n" ++
+  "      if (sch = Fiber.current_scheduler) && sch.respond_to?(:io_pwrite)\n" ++
+  "        return sch.io_pwrite(io, self, from, length, offset)\n" ++
+  "      end\n" ++
+  "      io.pwrite(get_string(offset, size - offset), from)\n" ++
   "    end\n" ++
   "\n" ++
   "    # the result of a bitwise operation is a NEW INTERNAL buffer, not a view --\n" ++
@@ -9164,8 +9236,45 @@ let core_prelude_k =
   "\n" ++
   "  # the write buffer out, as far as the kernel takes it: what it did not\n" ++
   "  # take stays, so a flush that failed fails again at close (ruby's order)\n" ++
+  "  # A non-blocking fiber's Fiber scheduler reads and writes for the stream\n" ++
+  "  # when it has io_read / io_write (ruby's rb_fiber_scheduler_io_read):\n" ++
+  "  # the bytes in an IO::Buffer, the answer the count or -errno. EAGAIN asks\n" ++
+  "  # the scheduler's io_wait and tries again, or raises when that says no\n" ++
+  "  # (the errno is the one the hook gave, whatever io_wait did meanwhile).\n" ++
+  "  # While the hook runs it reads and writes this stream plainly.\n" ++
+  "  def __fd_sched_io(sch, events)\n" ++
+  "    loop do\n" ++
+  "      @__io_sch_hook = true\n" ++
+  "      begin\n" ++
+  "        r = yield\n" ++
+  "      ensure\n" ++
+  "        @__io_sch_hook = nil\n" ++
+  "      end\n" ++
+  "      return r unless r.is_a?(Integer) && r < 0\n" ++
+  "      e = -r\n" ++
+  "      raise SystemCallError.new(nil, e) unless e == Errno::EAGAIN::Errno || e == Errno::EWOULDBLOCK::Errno\n" ++
+  "      w = sch.io_wait(self, events, @__io_timeout)\n" ++
+  "      raise SystemCallError.new(nil, e) unless w && w != 0\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "  private :__fd_sched_io\n" ++
+  "  def __fd_sched_fill(sch, want)\n" ++
+  "    buf = IO::Buffer.new(want)\n" ++
+  "    r = __fd_sched_io(sch, IO::READABLE) \{ sch.io_read(self, buf, 0, 0) }\n" ++
+  "    return false if !r.is_a?(Integer) || r == 0\n" ++
+  "    @__io_rbuf << buf.get_string(0, r)\n" ++
+  "    true\n" ++
+  "  end\n" ++
+  "  private :__fd_sched_fill\n" ++
+  "\n" ++
   "  def __fd_flush_w\n" ++
   "    return if @__io_wbuf.nil? || @__io_wbuf.empty?\n" ++
+  "    if !@__io_sch_hook && (sch = Fiber.current_scheduler) && sch.respond_to?(:io_write)\n" ++
+  "      data = @__io_wbuf\n" ++
+  "      @__io_wbuf = +\"\".b\n" ++
+  "      __fd_sched_io(sch, IO::WRITABLE) \{ sch.io_write(self, IO::Buffer.for(data), data.bytesize, 0) }\n" ++
+  "      return __fd_flush_w\n" ++
+  "    end\n" ++
   "    fd = __fd_wfd\n" ++
   "    until @__io_wbuf.empty?\n" ++
   "      n = IO.__fdwrite(fd, @__io_wbuf)\n" ++
@@ -9434,6 +9543,9 @@ let core_prelude_k =
   "  end\n" ++
   "\n" ++
   "  def __fd_fill(want = 65536, timeout = @__io_timeout)\n" ++
+  "    if !@__io_sch_hook && (sch = Fiber.current_scheduler) && sch.respond_to?(:io_read)\n" ++
+  "      return __fd_sched_fill(sch, want)\n" ++
+  "    end\n" ++
   "    fd = @__io_fd\n" ++
   "    loop do\n" ++
   "      # a wait another thread ended by closing the stream\n" ++
@@ -11022,6 +11134,38 @@ let core_prelude_k =
   "      f.instance_variable_set(iv, instance_variable_get(iv)) if instance_variable_defined?(iv)\n" ++
   "    end\n" ++
   "    f\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # what a Fiber scheduler's io_write / io_read hook is handed (the\n" ++
+  "  # interpreter's flush and read call these when the running fiber is a\n" ++
+  "  # non-blocking one whose scheduler has the hook): the bytes in an\n" ++
+  "  # IO::Buffer, the least to move, offset 0; an answer below zero is the\n" ++
+  "  # errno (rb_fiber_scheduler_io_result_apply)\n" ++
+  "  def __sched_write(data)\n" ++
+  "    r = Fiber.current_scheduler.io_write(self, IO::Buffer.for(data), data.bytesize, 0)\n" ++
+  "    raise SystemCallError.new(nil, -r) if r.is_a?(Integer) && r < 0\n" ++
+  "    r\n" ++
+  "  end\n" ++
+  "  def __sched_read(length = nil, outbuf = nil)\n" ++
+  "    sch = Fiber.current_scheduler\n" ++
+  "    out = \"\".b\n" ++
+  "    loop do\n" ++
+  "      room = length ? length - out.bytesize : 8192\n" ++
+  "      break if room <= 0\n" ++
+  "      buf = IO::Buffer.new(room)\n" ++
+  "      @__f_hook = true\n" ++
+  "      begin\n" ++
+  "        r = sch.io_read(self, buf, 0, 0)\n" ++
+  "      ensure\n" ++
+  "        remove_instance_variable(:@__f_hook)\n" ++
+  "      end\n" ++
+  "      raise SystemCallError.new(nil, -r) if r.is_a?(Integer) && r < 0\n" ++
+  "      break if !r.is_a?(Integer) || r == 0\n" ++
+  "      out << buf.get_string(0, r)\n" ++
+  "    end\n" ++
+  "    return nil if length && length > 0 && out.empty?\n" ++
+  "    out.force_encoding(external_encoding || Encoding.default_external) unless length\n" ++
+  "    outbuf ? outbuf.replace(out) : out\n" ++
   "  end\n" ++
   "\n" ++
   "  # ...and its clone is that copy too (ruby's IO#initialize_copy dups the\n" ++

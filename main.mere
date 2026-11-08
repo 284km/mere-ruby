@@ -1215,6 +1215,7 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = (if fbx then () else map_iter fb_sv mk) in
   let _ = map_iter fb_storage (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
   let _ = map_iter fb_sched (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
+  let _ = map_iter fsw_tbl (fn (k: str) -> fn (v: Val) -> gc_mark_val live v) in
   // arr_store and hash_store are NOT roots since the collector took them on:
   // a reachable array or hash is marked through the VArr / VHsh arms, and an
   // unreachable one is exactly what gets dropped and compacted away.
@@ -6250,7 +6251,7 @@ and tp_c_hook_in = fn world -> fn (hook: str) -> fn (owner: str) -> fn (dc: str)
 //    is not nil.
 and const_read_note = fn world -> fn (key: str) ->
   let _ = (if map_len autoload_busy > 0 && fb_can_suspend && map_has autoload_busy key
-              && (if map_get autoload_busy key == sch_me () then false else true) then
+              && (if map_get autoload_busy key == al_me () then false else true) then
              // ...PARKED, not passing: a thread that passed until the load
              // was over spun for as long as the loader slept -- and what each
              // turn allocated stayed, test_bug_13526's ten threads past 6.5 GB
@@ -6258,7 +6259,7 @@ and const_read_note = fn world -> fn (key: str) ->
              // autoload_settle wakes it (wait kind 9, on the loader's id).
              (let rec wait9 = fn (u: unit) ->
                 (if map_has autoload_busy key
-                 then (let _ = sch_block world 9 (map_get autoload_busy key) 0 in wait9 ())
+                 then (let _ = blk_wait world 9 (map_get autoload_busy key) VNil 0 in wait9 ())
                  else ()) in
               wait9 ())
            else ()) in
@@ -12350,11 +12351,18 @@ and autoload_register = fn env -> fn world -> fn (ns: str) -> fn (args: Val list
    | _ -> VNil)
 // is another thread running this constant's autoload right now?
 and autoload_busy_other = fn (key: str) ->
-  map_has autoload_busy key && map_get autoload_busy key != sch_me ()
+  map_has autoload_busy key && map_get autoload_busy key != al_me ()
+// who is loading an autoload, for autoload_busy: the thread -- or, in a
+// non-blocking fiber of a thread with a Fiber scheduler, that FIBER (a
+// number no thread has): the other fibers of the thread wait for the load
+// through the scheduler instead of reading the constant half made
+// (test/fiber's test_autoload, whose file sleeps)
+and al_me = fn (u: unit) ->
+  if fb_sched_here () then 0 - (1000 + fb_cur ()) else sch_me ()
 and autoload_fire = fn env -> fn world -> fn blk -> fn (key: str) ->
   if map_has autoloads key then
     (let path = (match map_get autoloads key with VStr h -> sget h | _ -> "") in
-     let me9 = sch_me () in
+     let me9 = al_me () in
      // ⚠ THE ENTRY USED TO BE REMOVED BEFORE THE FILE RAN, so that a file not
      //   defining the constant would fail as a NameError instead of spinning
      //   here. That also made every question asked DURING the load, and after
@@ -12384,7 +12392,7 @@ and autoload_fire = fn env -> fn world -> fn blk -> fn (key: str) ->
                             (let _ = (if main_sng_has world "require" || (let (mt9, _, _, _) = world in map_has mt9 "require")
                                       then (let _ = invoke_val_c env world blk VMain "require" (Cons (mkstr path, Nil)) false in FNext VNil)
                                       else exec_stmt env world blk (SRequire (false, EStrL path))) in true)) false in
-        let _ = autoload_settle key in
+        let _ = autoload_settle world key in
         // a file that ran and did not define the constant is worth a word
         // under -w (ruby's rb_warning), once: the registration is spent
         let _ = (if ok9 && (if map_has consts key then false else true) then
@@ -12400,14 +12408,15 @@ and autoload_fire = fn env -> fn world -> fn blk -> fn (key: str) ->
 // an autoload the calling thread would see: registered, and not the one this
 // thread is in the middle of loading (to it, that constant is not there yet).
 and autoload_live = fn (key: str) ->
-  map_has autoloads key && (if map_has autoload_busy key then (if map_get autoload_busy key == sch_me () then false else true) else true)
+  map_has autoloads key && (if map_has autoload_busy key then (if map_get autoload_busy key == al_me () then false else true) else true)
 // the load of `key` is over, however it ended: nobody is loading it, and a
 // location its file gave the constant is now everyone's
-and autoload_settle = fn (key: str) ->
-  let ld9 = (if map_has autoload_busy key then map_get autoload_busy key else 0 - 1) in
+and autoload_settle = fn world -> fn (key: str) ->
+  let busy9 = map_has autoload_busy key in
+  let ld9 = (if busy9 then map_get autoload_busy key else 0 - 1) in
   let _ = map_delete autoload_busy key in
-  // (the threads parked on this load: const_read_note)
-  let _ = (if ld9 >= 0 then sch_wake_all 9 ld9 else ()) in
+  // (the threads -- and fibers -- parked on this load: const_read_note)
+  let _ = (if busy9 then fsw_wake_all world 9 ld9 else ()) in
   // (a registration whose file defined the constant is spent for good)
   let _ = (if map_has consts key && map_has autoloads key then map_delete autoloads key else ()) in
   if map_has const_src_pend key then
@@ -17296,6 +17305,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                  (if responds world sch n then chk r
                   else (let _ = raise_exc world "ArgumentError" ("Scheduler must implement #" ++ n) in ())) in
              let _ = chk need in
+             // (ruby 4.0 asks for #fiber_interrupt too, and warns without it:
+             //  rb_fiber_scheduler_set's rb_warn)
+             let _ = (if responds world sch "fiber_interrupt" then ()
+                      else warning_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: Scheduler should implement #fiber_interrupt\n") VNil) in
              let _ = fb_sched_close env world in
              let _ = map_set fb_sched (fb_thread_of (fb_cur ())) sch in
              sch)
@@ -20188,7 +20201,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // the same predicate that guards the arm), all public
           let _ = (if str_eq cx "Fiber" && (if want_prot || want_priv then false else true) then
                      list_iter (Cons ("resume", Cons ("transfer", Cons ("alive?", Cons ("raise", Cons ("kill",
-                                Cons ("blocking?", Cons ("storage", Cons ("storage=", Cons ("inspect", Cons ("to_s", Nil)))))))))))
+                                Cons ("blocking?", Cons ("storage", Cons ("storage=", Cons ("inspect", Cons ("to_s",
+                                Cons ("backtrace", Cons ("backtrace_locations", Nil)))))))))))))
                        (fn (nf9: str) -> (if fb_inst_name nf9 && (if map_has meths0 (pfx ++ nf9) then false else true) then push9 nf9 else ()))
                    else ()) in
           // ...MATH's module functions, which are its PRIVATE instance methods
@@ -21342,7 +21356,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // ($$ is read once at startup: the child's is its own)
        | p9 when p9 == 0 ->
          (let _ = map_set globals "$" (VInt (getpid ())) in
-          let _ = (if map_len all_thr > 1 then sch_forget_others world else ()) in VInt 0)
+          let _ = (if map_len all_thr > 1 then sch_forget_others world else ()) in
+          // (and the child starts with no Fiber scheduler: ruby's atfork
+          //  resets it without closing it -- the parent's is not the child's)
+          let _ = map_clear fb_sched in
+          VInt 0)
        | p9 -> VInt p9)
     // ...and the end of a forked child that ran a block: the at_exit
     // handlers, the other threads stopped, and the process ends -- never a
@@ -22779,6 +22797,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (if (str_len name == 6 && str_eq name "resume") then fb_resume world recv args false
        else if (str_len name == 8 && str_eq name "transfer") then fb_resume world recv args true
        else if (str_len name == 6 && str_eq name "alive?") then VBool (fb_state_of (fb_index_of world recv) != 3)
+       // Fiber#backtrace / #backtrace_locations: the current fiber's is the
+       // running code's ('Fiber#backtrace' on top, as Thread's); a finished
+       // fiber's is [] (a dead thread's is nil); another's is [] -- its suspended stack is not read
+       // here (a thread's is, sch_backtrace)
+       else if (str_len name == 9 && str_eq name "backtrace") || (str_len name == 19 && str_eq name "backtrace_locations") then
+         (let i9 = fb_index_of world recv in
+          if fb_state_of i9 == 3 then arr_new Nil
+          else if i9 == fb_cur () then bt_of_current env world ("Fiber#" ++ name) (str_len name == 19) args
+          else arr_new Nil)
        else if (str_len name == 5 && str_eq name "raise") then fb_raise world recv args
        else if (str_len name == 4 && str_eq name "kill") then fb_kill world recv
        else if (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s") then mkstr (fb_inspect world recv)
@@ -23059,6 +23086,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          raise_exc world "IOError" "not opened for reading"
        else if map_has io_writes name && (if mode_writable mode then false else true) then
          raise_exc world "IOError" "not opened for writing"
+       // a read in a non-blocking fiber whose Fiber scheduler has #io_read
+       // is that hook's (File#__sched_read; ruby's rb_fiber_scheduler_io_read),
+       // except while the hook itself reads this File (@__f_hook)
+       // (the prelude's File#read reads through __f_read; its __f_read(0) is
+       //  a probe that moves nothing)
+       else if (str_len name == 8 && str_eq name "__f_read") && fb_sched_here ()
+               && (match args with Cons (VInt 0, _) -> false | _ -> true)
+               && (if map_has ivars (k ++ "@__f_hook") then false else true)
+               && responds world (map_get fb_sched (fb_thread_of (fb_cur ()))) "io_read" then
+         invoke_val_c env world blk recv "__sched_read" args false
        else
        // ⚠ ...AND A READ ON A READ-WRITE HANDLE FLUSHES FIRST. Writes buffer
        //   into @__f_buf and every reader here goes to the file, so
@@ -25563,21 +25600,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 | Nil -> arr_new all9
                 | Cons (a9, Cons (b9, _)) -> caller_pick2 all9 a9 b9
                 | Cons (a9, _) -> caller_pick all9 a9)
-             else
-               (let lbl9 = "Thread#" ++ name in
-                let all9 = (if (str_len name == 19) then Cons (loc_obj world (cur_file ()) (cur_line ()) lbl9, caller_locs world 0 (0 - 1))
-                            else Cons (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in '" ++ lbl9 ++ "'"), caller_frames 0)) in
-                let ca9 = caller_args env world args in
-                let _ = (match ca9 with
-                         | Cons (VInt a9, _) -> (if a9 < 0 then raise_exc world "ArgumentError" ("negative level (" ++ str_of_int a9 ++ ")") else VNil)
-                         | _ -> VNil) in
-                let _ = (match ca9 with
-                         | Cons (_, Cons (VInt b9, _)) -> (if b9 < 0 then raise_exc world "ArgumentError" ("negative size (" ++ str_of_int b9 ++ ")") else VNil)
-                         | _ -> VNil) in
-                match ca9 with
-                | Nil -> arr_new all9
-                | Cons (a9, Cons (b9, _)) -> caller_pick2 all9 a9 b9
-                | Cons (a9, _) -> caller_pick all9 a9))
+             else bt_of_current env world ("Thread#" ++ name) (str_len name == 19) args)
           else if (str_len name == 5 && str_eq name "stop?") then
             VBool (if alive then (match tst with VStr h -> str_eq (sget h) "sleep" | _ -> false) else true)
           else if (str_len name == 4 && str_eq name "kill") || (str_len name == 4 && str_eq name "exit") || (str_len name == 9 && str_eq name "terminate") then
@@ -48678,6 +48701,20 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
               let ov9 = run_at_exits_r world (fn (e8: Val) -> print_err (inspect_w gc_cenv0 world e8)) in
               let _ = exit (if ov9 >= 0 then ov9 else st9) in ())
            else ()) in
+  let _ = map_set sch_ending tid 1 in
+  // (fibers joining it through a Fiber scheduler are #unblock'ed while it ends
+  //  (sch_ending: done to sch_join, live to the scheduler, so an #unblock
+  //  that sleeps wakes again -- test_thread_join_hang): an #unblock that raises is the thread's
+  //  exception, which its join raises -- test/fiber's test_broken_unblock)
+  let _ = (let key9 = "8:" ++ str_of_int tid in
+           if map_has fsw_tbl key9 then
+             (let ok9 = try_or (fn (u: unit) -> let _ = fsw_wake_all world 8 tid in true) false in
+              if ok9 then ()
+              else (let (_, _, _, iv9) = world in
+                    if map_has iv9 "$exc" && (if map_has iv9 (str_of_int tid ++ "@__texc") then false else true)
+                    then map_set iv9 (str_of_int tid ++ "@__texc") (map_get iv9 "$exc") else ()))
+           else ()) in
+  let _ = map_delete sch_ending tid in
   let _ = thread_release world tid in
   let _ = map_delete sch_live tid in
   let _ = map_set fb_state r 3 in
@@ -48800,7 +48837,7 @@ and thread_release = fn world -> fn (tid: int) ->
   map_iter held (fn (mid: int) -> fn (u: int) ->
     let _ = map_delete mtx_thr mid in
     let _ = map_set iv3 (str_of_int mid ++ "@__mown") VNil in
-    let _ = sch_wake_one 6 mid in ())
+    let _ = fsw_wake_one world 6 mid in ())
 // Queue / SizedQueue under the scheduler: a pop from an empty queue and a
 // push to a full one wait (kinds 4 and 5), and each side wakes the first
 // waiter of the other. close wakes every waiter: a popper then answers nil,
@@ -48854,10 +48891,10 @@ and queue_sch = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (cls:
                          | _ -> false) in
              if full then
                (if nb then raise_exc world "ThreadError" "queue full"
-                else if sch_block world 5 id dl then VNil
+                else if blk_wait world 5 id recv dl then VNil
                 else go ())
              else (let _ = put (list_append (items ()) (Cons (v, Nil))) in
-                   let _ = sch_wake_one 4 id in
+                   let _ = fsw_wake_one world 4 id in
                    recv)) in
         go ()))
   else if (str_len name == 3 && str_eq name "pop") || (str_len name == 5 && str_eq name "shift") || (str_len name == 3 && str_eq name "deq") then
@@ -48867,22 +48904,22 @@ and queue_sch = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (cls:
        (let dl = sch_deadline env world tmo in
         let rec go = fn (u: unit) ->
           match items () with
-          | Cons (h, t) -> (let _ = put t in let _ = sch_wake_one 5 id in h)
+          | Cons (h, t) -> (let _ = put t in let _ = fsw_wake_one world 5 id in h)
           | Nil ->
             (if nb then raise_exc world "ThreadError" "queue empty"
              else if closed () then VNil
-             else if sch_block world 4 id dl then VNil
+             else if blk_wait world 4 id recv dl then VNil
              else go ()) in
         go ()))
   else if (str_len name == 5 && str_eq name "close") then
     (let _ = map_set ivars (k ++ "@__qclosed") (VBool true) in
-     let _ = sch_wake_all 4 id in
-     let _ = sch_wake_all 5 id in
+     let _ = fsw_wake_all world 4 id in
+     let _ = fsw_wake_all world 5 id in
      recv)
   else if (str_len name == 11 && str_eq name "num_waiting") then
     VInt (sch_waiters_n 4 id + sch_waiters_n 5 id)
   else if (str_len name == 5 && str_eq name "clear") then
-    (let _ = put (Nil : Val list) in let _ = sch_wake_all 5 id in recv)
+    (let _ = put (Nil : Val list) in let _ = fsw_wake_all world 5 id in recv)
   else
     // max=: a larger bound lets waiting pushers try again
     // (a size that is not an Integer goes through #to_int: TypeError
@@ -48892,7 +48929,7 @@ and queue_sch = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (cls:
             | Cons (v9, t9) -> Cons (rnd_to_int env world v9, t9)
             | Nil -> args) with
      | Cons (VInt mx, _) when mx <= 0 -> raise_exc world "ArgumentError" "queue size must be positive"
-     | Cons (VInt mx, _) -> (let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in let _ = sch_wake_all 5 id in VInt mx)
+     | Cons (VInt mx, _) -> (let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in let _ = fsw_wake_all world 5 id in VInt mx)
      | _ -> VNil)
 // Mutex under the scheduler. Held = mtx_thr has it (a thread that ends lets
 // go, thread_release); the owner word is the fiber that locked it, as ruby's
@@ -48911,16 +48948,19 @@ and mutex_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (id: int) -
   let release = fn (u: unit) ->
     let _ = map_set ivars (k ++ "@__mown") VNil in
     let _ = map_delete mtx_thr id in
-    sch_wake_one 6 id in
+    fsw_wake_one world 6 id in
   if (str_len name == 4 && str_eq name "lock") then
     (if mine () then raise_exc world "ThreadError" "deadlock; recursive locking"
      // held by another fiber of THIS thread: waiting would stop the thread
      // for ever, so it is refused (ruby's words)
-     else if held () && map_get mtx_thr id == sch_me () then
+     // (...unless this fiber is a non-blocking one with a Fiber scheduler:
+     //  it waits through the scheduler's #block, and the unlock calls
+     //  #unblock -- test/fiber's interleaved locking)
+     else if held () && map_get mtx_thr id == sch_me () && (if fb_sched_here () then false else true) then
        raise_exc world "ThreadError" "deadlock; lock already owned by another fiber belonging to the same thread"
      else
        (let rec go = fn (u: unit) ->
-          if held () then (let _ = sch_block world 6 id 0 in go ()) else (let _ = take () in recv) in
+          if held () then (let _ = blk_wait world 6 id recv 0 in go ()) else (let _ = take () in recv) in
         go ()))
   else if (str_len name == 8 && str_eq name "try_lock") then
     (if held () then VBool false else (let _ = take () in VBool true))
@@ -48944,6 +48984,22 @@ and mutex_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (id: int) -
                              ("can't convert " ++ display_cls_msg world (dispatch_cls_of world other9)
                               ++ " into time interval") in ())) in
      if (if mine () then false else true) then raise_exc world "ThreadError" "Attempt to unlock a mutex which is not locked"
+     // a non-blocking fiber with a Fiber scheduler sleeps in the scheduler's
+     // #kernel_sleep(timeout) (ruby's mutex_sleep_begin) and takes the lock
+     // back through it; it answers the seconds slept
+     else if fb_sched_here () then
+       (let t0 = sch_now () in
+        let _ = release () in
+        let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+        let ok = try_or (fn (u: unit) -> let _ = invoke_val_c env world noblk (map_get fb_sched (fb_thread_of (fb_cur ()))) "kernel_sleep" (Cons (dur9, Nil)) false in true) false in
+        // (the lock is taken back even when something was raised into the
+        //  sleep -- ruby's ensure, mutex_lock_uninterruptible -- so the
+        //  synchronize around a condition wait can unlock)
+        let rec relock = fn (u: unit) ->
+          if held () then (let _ = blk_wait world 6 id recv 0 in relock ()) else take () in
+        let _ = relock () in
+        if ok then VInt ((sch_now () - t0 + 500000000) / 1000000000)
+        else fail "mere-ruby: (an exception raised into a scheduler wait propagates)")
      else
        (let t0 = sch_now () in
         let _ = release () in
@@ -48968,11 +49024,21 @@ and mutex_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (id: int) -
 // wakes the first in line from that sleep, #broadcast all of them. Thread#run
 // and #wakeup end the sleep as well, which is what ruby does too.
 and cv_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (id: int) -> fn (name: str) -> fn (args: Val list) ->
-  if (str_len name == 6 && str_eq name "signal") then (let _ = sch_cv_wake id false in recv)
-  else if (str_len name == 9 && str_eq name "broadcast") then (let _ = sch_cv_wake id true in recv)
+  // (a fiber waiting through its Fiber scheduler is in fsw_tbl's line 7,
+  //  woken by the scheduler's #unblock, ahead of the threads)
+  if (str_len name == 6 && str_eq name "signal") then
+    (let _ = (if fsw_wake_one world 7 id then () else sch_cv_wake id false) in recv)
+  else if (str_len name == 9 && str_eq name "broadcast") then
+    (let _ = fsw_wake_all world 7 id in let _ = sch_cv_wake id true in recv)
   else
     (match args with
      | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..2)"
+     | Cons (m, rest) when fb_sched_here () ->
+       (let sq = fsw_join world 7 id recv in
+        let rv = map_new () in
+        let ok = try_or (fn (u: unit) -> let _ = map_set rv 0 (invoke_val_c env world blk m "sleep" rest false) in true) false in
+        let _ = fsw_drop ("7:" ++ str_of_int id) sq in
+        if ok then map_get rv 0 else fail "mere-ruby: (an exception raised into a scheduler wait propagates)")
      | Cons (m, rest) ->
        (let me = sch_me () in
         let _ = sch_cv_join me id in
@@ -49068,13 +49134,108 @@ and fb_sched_close = fn env -> fn world ->
      let _ = map_delete fb_sched th in
      if ok then VNil else fail "mere-ruby: (scheduler close exception propagates)")
   else VNil
+// A wait on (kind, obj) -- a queue to fill or drain, a mutex, a condition
+// variable -- in a non-blocking fiber of a thread with a Fiber scheduler is
+// the scheduler's #block(blocker, timeout): the fiber goes in obj's line
+// (fsw_tbl) and the scheduler runs others until a waker calls its
+// #unblock(blocker, fiber) (fsw_wake_one; ruby's sync_wakeup). Elsewhere the
+// thread waits (sch_block). True when the deadline passed.
+and blk_wait = fn world -> fn (kind: int) -> fn (obj: int) -> fn (blocker: Val) -> fn (dl: int) ->
+  if fb_sched_here () then
+    (let sch = map_get fb_sched (fb_thread_of (fb_cur ())) in
+     let key = str_of_int kind ++ ":" ++ str_of_int obj in
+     let sq = fsw_join world kind obj blocker in
+     let tmo = (if dl > 0 then (let r9 = dl - sch_now () in VFlt (float_of_int (if r9 < 0 then 0 else r9) / 1000000000.0)) else VNil) in
+     let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     let ok = try_or (fn (u: unit) -> let _ = invoke_val_c gc_cenv0 world noblk sch "block" (Cons (blocker, Cons (tmo, Nil))) false in true) false in
+     // (out of the line if nobody woke it: a timeout, or a raise into the
+     //  fiber -- Fiber#raise from another fiber, which unwinds from here and
+     //  left the entry for a later unlock to #unblock on a closed scheduler)
+     let _ = fsw_drop key sq in
+     if ok then dl > 0 && sch_now () >= dl
+     else fail "mere-ruby: (an exception raised into a scheduler wait propagates)")
+  else sch_block world kind obj dl
+// this fiber into (kind, obj)'s line; its place, for fsw_drop
+and fsw_join = fn world -> fn (kind: int) -> fn (obj: int) -> fn (blocker: Val) ->
+  let sch = map_get fb_sched (fb_thread_of (fb_cur ())) in
+  let fo = fb_obj_for world (fb_cur ()) in
+  let key = str_of_int kind ++ ":" ++ str_of_int obj in
+  let sq = (if map_has sch_st "fseq" then map_get sch_st "fseq" else 0) in
+  let _ = map_set sch_st "fseq" (sq + 1) in
+  let ent = arr_new (Cons (VInt sq, Cons (fo, Cons (sch, Cons (blocker, Nil))))) in
+  let _ = (match (if map_has fsw_tbl key then map_get fsw_tbl key else VNil) with
+           | VArr aid -> arr_set aid (list_append (deref aid) (Cons (ent, Nil)))
+           | _ -> map_set fsw_tbl key (arr_new (Cons (ent, Nil)))) in
+  sq
+and fsw_drop = fn (key: str) -> fn (sq: int) ->
+  match (if map_has fsw_tbl key then map_get fsw_tbl key else VNil) with
+  | VArr aid ->
+    (let rec keep = fn (xs: Val list) ->
+       match xs with
+       | Nil -> (Nil : Val list)
+       | Cons (VArr e9, r9) -> (match deref e9 with Cons (VInt s9, _) when s9 == sq -> keep r9 | _ -> Cons (VArr e9, keep r9))
+       | Cons (x9, r9) -> Cons (x9, keep r9) in
+     let left = keep (deref aid) in
+     (match left with Nil -> map_delete fsw_tbl key | _ -> arr_set aid left))
+  | _ -> ()
+and fsw_unblock = fn world -> fn (e: Val) ->
+  match e with
+  | VArr e9 ->
+    (match deref e9 with
+     | Cons (_, Cons (fo, Cons (sch, Cons (blocker, _)))) ->
+       (let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        let _ = invoke_val_c gc_cenv0 world noblk sch "unblock" (Cons (blocker, Cons (fo, Nil))) false in ())
+     | _ -> ())
+  | _ -> ()
+// wake the first waiter of kind on obj -- a fiber in line through its
+// scheduler, else a waiting thread; true when there was one
+and fsw_wake_one = fn world -> fn (kind: int) -> fn (obj: int) ->
+  let key = str_of_int kind ++ ":" ++ str_of_int obj in
+  match (if map_has fsw_tbl key then map_get fsw_tbl key else VNil) with
+  | VArr aid ->
+    (match deref aid with
+     | Cons (e, rest) ->
+       (let _ = (match rest with Nil -> map_delete fsw_tbl key | _ -> arr_set aid rest) in
+        let _ = fsw_unblock world e in true)
+     | Nil -> sch_wake_one kind obj)
+  | _ -> sch_wake_one kind obj
+and fsw_wake_all = fn world -> fn (kind: int) -> fn (obj: int) ->
+  let key = str_of_int kind ++ ":" ++ str_of_int obj in
+  let _ = (match (if map_has fsw_tbl key then map_get fsw_tbl key else VNil) with
+           | VArr aid -> (let es = deref aid in
+                          let _ = map_delete fsw_tbl key in
+                          list_iter es (fn (e: Val) -> fsw_unblock world e))
+           | _ -> ()) in
+  sch_wake_all kind obj
+// the running code's backtrace as Thread#backtrace / Fiber#backtrace answer
+// it for the current thread or fiber: caller(0)'s frames under a frame for
+// the call itself (`lbl9`, 'Thread#backtrace'), selected as caller selects
+and bt_of_current = fn env -> fn world -> fn (lbl9: str) -> fn (locs: bool) -> fn (args: Val list) ->
+  let all9 = (if locs then Cons (loc_obj world (cur_file ()) (cur_line ()) lbl9, caller_locs world 0 (0 - 1))
+              else Cons (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in '" ++ lbl9 ++ "'"), caller_frames 0)) in
+  let ca9 = caller_args env world args in
+  let _ = (match ca9 with
+           | Cons (VInt a9, _) -> (if a9 < 0 then raise_exc world "ArgumentError" ("negative level (" ++ str_of_int a9 ++ ")") else VNil)
+           | _ -> VNil) in
+  let _ = (match ca9 with
+           | Cons (_, Cons (VInt b9, _)) -> (if b9 < 0 then raise_exc world "ArgumentError" ("negative size (" ++ str_of_int b9 ++ ")") else VNil)
+           | _ -> VNil) in
+  match ca9 with
+  | Nil -> arr_new all9
+  | Cons (a9, Cons (b9, _)) -> caller_pick2 all9 a9 b9
+  | Cons (a9, _) -> caller_pick all9 a9
 // a Fiber scheduler answers for this fiber: the thread has one and the
 // fiber is not blocking
 and fb_sched_here = fn (u: unit) ->
   map_has fb_sched (fb_thread_of (fb_cur ())) && (if fb_blocking_now () then false else true)
+// (Kernel#sleep answers the whole seconds slept whatever the hook returns, as
+//  rb_f_sleep does after rb_fiber_scheduler_kernel_sleepv: test/fiber's
+//  test_sleep compared the hook's true with >= 0)
 and fb_sched_sleep = fn env -> fn world -> fn (args: Val list) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-  invoke_val_c env world noblk (map_get fb_sched (fb_thread_of (fb_cur ()))) "kernel_sleep" args false
+  let t0 = sch_now () in
+  let _ = invoke_val_c env world noblk (map_get fb_sched (fb_thread_of (fb_cur ()))) "kernel_sleep" args false in
+  VInt ((sch_now () - t0 + 500000000) / 1000000000)
 // the frames of a thread that is not running, innermost first, read off the
 // stack it stopped on
 // A parked thread's frames, read off the per-depth tables of its band: its
@@ -49192,8 +49353,8 @@ and sch_forget_others = fn world ->
 and sch_join = fn env -> fn world -> fn (t: int) -> fn (limit: Val) ->
   let dl = sch_deadline env world limit in
   let rec go = fn (u: unit) ->
-    if map_has sch_live t then
-      (if sch_block world 8 t dl then true
+    if map_has sch_live t && (if map_has sch_ending t then false else true) then
+      (if blk_wait world 8 t (VObj t) dl then true
        else (let _ = (if in_thread () then () else if map_has sig_queue "q" && str_len (map_get sig_queue "q") > 0 then sig_poll_all env world else ()) in
              go ()))
     else false in
@@ -54574,7 +54735,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        // $LOADED_FEATURES makes them live again)
        let _ = map_delete req_loading p0 in
        let _ = (if map_has req_loading_thr p0 then map_delete req_loading_thr p0 else ()) in
-       let _ = list_iter alk9 autoload_settle in
+       let _ = list_iter alk9 (autoload_settle world) in
        (match f with
         // A require that raised did NOT load the feature. Ruby takes it back
         // out of $LOADED_FEATURES so a later require retries; leaving it

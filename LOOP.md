@@ -2399,3 +2399,65 @@ Note 511's stage 3, "tempfile 8". corpus/526 is the witness.
   vanish before the rescue modifier sees the assignment, so the rescue
   wraps the value and the setter's TypeError escapes; `x = a = *b` should
   be a SyntaxError ("multiple assignment is not allowed in this context").
+
+## 2026-11-09 (15): a Fiber scheduler answers for a non-blocking fiber's waits, I/O, names and children -- test/fiber 59 → 95/95
+
+Note 511's stage 3, "fiber scheduler ~77" (first measured: 95 tests, 59
+green). corpus/527 is the witness.
+
+- **Waits.** A Mutex, Queue/SizedQueue, ConditionVariable or Thread#join
+  that blocks a non-blocking fiber of a thread with a Fiber scheduler is
+  the scheduler's `#block(blocker, timeout)`, and the waker calls its
+  `#unblock(blocker, fiber)` (ruby's sync_wakeup). One primitive does it:
+  `blk_wait` puts the fiber in the object's line (`fsw_tbl`, a GC root,
+  "kind:obj" → [seq, fiber, scheduler, blocker]) and calls #block; the
+  wakers (`fsw_wake_one` / `fsw_wake_all`) unblock fibers in line before
+  waking threads. The thread path (`sch_block`) is unchanged. A raise into
+  the waiting fiber (Fiber#raise from another) leaves the line on its way
+  out -- the entry left behind was #unblock'ed on a closed scheduler at the
+  next unlock. Mutex#sleep in such a fiber is `#kernel_sleep(timeout)` and
+  takes the lock back even when something was raised into the sleep
+  (ruby's ensure), so a condition wait's synchronize can unlock. A blocking
+  fiber facing a mutex another fiber of its thread holds is still ruby's
+  deadlock error.
+- **Thread#join** ends for fiber joiners while the thread ends
+  (`sch_ending`: done to the join, live to the scheduler) -- the joiners
+  are #unblock'ed from the ending thread, which may sleep in #unblock
+  (test_thread_join_hang); an #unblock that raises is the thread's
+  exception, which its join raises (test_broken_unblock).
+- **An autoload** loaded by such a fiber is that fiber's
+  (`al_me`): the thread's other fibers wait for the load through the
+  scheduler instead of reading the constant half made (test_autoload's
+  file sleeps). autoload_settle wakes fibers and threads.
+- **sleep** is #kernel_sleep and answers the whole seconds slept, whatever
+  the hook returns. **getaddrinfo** asks `#address_resolve` for a name
+  (not a number, not with AI_NUMERICHOST): each address it gives is looked
+  up as a number, nil or none left is EAI_NONAME (IPSocket.getaddress,
+  Addrinfo.tcp and getnameinfo go the same way). **Process.wait** (and so
+  system) asks `#process_wait`, whose answer must be a Process::Status
+  (rb_waitpid's TypeError). A forked child starts with no scheduler.
+  set_scheduler warns when #fiber_interrupt is missing (ruby 4.0).
+- **I/O.** A File's flush hands its bytes to `#io_write` and its read asks
+  `#io_read` (File#__sched_write / #__sched_read; the hook's own writes
+  through the File land where the bytes belong, @__f_hook); a descriptor
+  stream's fill and flush do the same, and EAGAIN asks `#io_wait`, raising
+  the hook's errno when it says no. IO::Buffer#read/#write take LENGTH as
+  the least to move (0 is one call up to the rest of the buffer), read and
+  write a descriptor stream's descriptor itself (past its read-ahead,
+  -errno on failure, -EAGAIN from a non-blocking one with nothing ready),
+  and go to the scheduler's hooks; #pread / #pwrite are new.
+- **Fiber#backtrace / #backtrace_locations**: the current fiber's is the
+  running code's ('Fiber#backtrace' on top, as Thread's), a finished
+  fiber's [], another's [] (its suspended stack is not read).
+- **Checked**: corpus 545/545 both ways, 527 under GC_STRESS=50, the 13
+  gates; 162 unittest files (7413 tests: the wide set, IO and its
+  neighbours, test/fiber, socket, monitor, thread_queue, autoload,
+  io_buffer) against 67b7e08's binary: MATCH 6948 → 6988, test/fiber
+  59 → 95/95, ruby/test_io_buffer 47 → 52, no file lower (pathname's
+  test_lutime compared two clock readings while both runs shared the
+  machine; alone it passes, twice).
+- **Next in stage 3**: socket (58 red: tcp_server_sockets, getifaddrs,
+  recvmsg/sendmsg, a chosen local port, send with a destination, the
+  Happy Eyeballs timing tests, memory-leak tests too slow here),
+  io/console 27, net/http 3 (+ https 19, openssl: stage 7), resolv 1,
+  io/wait 1.
