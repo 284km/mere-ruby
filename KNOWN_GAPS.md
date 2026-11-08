@@ -629,7 +629,17 @@ from the cause than a LoadError would have been.
 accepts a positional options Hash through `Object#to_yaml` and `Psych.dump`,
 as YAML::Store uses, and propagates `indentation` through nested mappings,
 sequences, tagged values and literal scalars. Widths outside 2..9 use the
-default width, following the pinned reference.
+default width, following the pinned reference. Collection and tagged-object
+output tracks identity and emits anchors/aliases for cycles and shared references,
+including complex mapping keys. Each `dump` has its own graph; `dump_stream`
+shares its graph across documents, matching the pinned reference.
+
+The loader reconstructs the emitted collection/object anchor subset, retaining
+shared identity and cycles. `load`/`safe_load` require `aliases: true` to follow
+aliases; `unsafe_load` allows them. Anchor tables are isolated per document.
+The loader is still a subset of YAML, and Struct ivars and Data serialization
+remain incomplete. The upstream Array/Struct/Data files finish, with remaining
+compatibility failures/errors.
 
 These dump contracts do not complete Psych's node, handler, event or loader
 APIs. Large YAML::Store transaction workloads also need performance work;

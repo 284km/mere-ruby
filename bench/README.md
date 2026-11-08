@@ -3,6 +3,12 @@
 Every harness here is meant to be run against CRuby as well, because a number
 without the reference number is not a measurement.
 
+## `yaml_cycles.rb`
+
+Dump a self-referential array and compare memory use before and after identity
+tracking in the emitter. See [yaml_cycles.md](yaml_cycles.md) for measurements
+and the remaining loader limitations.
+
 ## `alloc_per_call.sh`
 
 ```
