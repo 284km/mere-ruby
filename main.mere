@@ -7816,7 +7816,13 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // the Array whole, as in ruby.) The count is the ONE scan below
   // (ip_scan_stmts), made here once for both: a second walk of every
   // parameter-less body was a measured 5%.
-  let ip9 = (match params with Nil -> (let k9 = ip_scan_stmts body in if k9 == 10 && stmts_assign_it body then 0 else k9) | _ -> 0) in
+  let ip9 = (match params with
+             | Nil -> (let k9 = ip_scan_stmts body in
+                       // An ordinary local `it` must not mask _1.._9 in
+                       // the combined scanner's highest marker.
+                       if k9 == 10 && (lv_has cenv "it" || stmts_assign_it body)
+                       then max_numbered_stmts body else k9)
+             | _ -> 0) in
   let argvals = (match (params, argvals) with
                  | (Nil, Cons (VArr a9, Nil)) ->
                    (if (if is_lam then false else true) && ip9 >= 2 && ip9 < 10 then deref a9 else argvals)
@@ -7828,10 +7834,17 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
                        | _ -> argvals)
                     else argvals)
                  | _ -> argvals) in
+  // Materialize only the implicit parameters declared by this block. Empty
+  // blocks otherwise retained nine unused slots in every captured frame.
+  let _ = (match params with
+           | Nil -> bind_numbered benv argvals 1
+                      (if ip_slots_known_stmts body then
+                         (if ip9 == 10 then (if lv_has cenv "it" then 0 else 1) else ip9)
+                       else 9)
+           | _ -> ()) in
   let _ = bind_block_params benv world encl_call (block_defaults body) params argvals is_lam kwp9 in
   // ⚠ WHICH implicit parameters this frame HAS is a property of the body, not
-  //   of the env: bind_numbered puts _1.._9 into every parameter-less block's
-  //   frame, whether the body names them or not, and ruby 4.0's
+  //   of the env: the slots alone do not distinguish `it` from `_1`, and ruby 4.0's
   //   Binding#implicit_parameters answers only the ones the body declares
   //   (`proc { _3; binding.implicit_parameters }` is [:_1, :_2, :_3], and
   //   `proc { binding.implicit_parameters }` is [] -- measured, all 46 of the
@@ -8134,10 +8147,6 @@ and rescues_targets = fn rescues ->
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
 and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * Expr) list) -> fn (params0: str list) -> fn (argvals0: Val list) -> fn (is_lam: bool) -> fn (kwp: bool) ->
-  // numbered parameters: a block without explicit params binds _1.._9.
-  let _ = (match params0 with
-           | Nil -> bind_numbered cenv argvals0 1
-           | _ -> ()) in
   // A block's own `&b` parameter binds the block given at the CALL SITE, the
   // same way a method's does -- the comment here used to claim blocks are not
   // re-passed through block params, and `proc {|x, &b| b.call(x) }.call(7) { }`
@@ -27080,6 +27089,47 @@ and ip_scan_exprs = fn (es: Expr list) ->
   match es with
   | Nil -> 0
   | Cons (e, rest) -> imax (ip_scan_expr e) (ip_scan_exprs rest)
+// The implicit-parameter scanner intentionally handles a subset of AST shapes.
+// Keep the legacy backing slots for any shape it cannot prove complete; e.g.
+// next/break payloads, interpolation, patterns and rescue bodies may name _N.
+and ip_slots_known_stmts = fn (ss: Stmt list) ->
+  match ss with Nil -> true | Cons (s, rest) -> ip_slots_known_stmt s && ip_slots_known_stmts rest
+and ip_slots_known_stmt = fn (s: Stmt) ->
+  match s with
+  | SLine _ -> true | SLineQ _ -> true | SFile _ -> true | SDeclare _ -> true
+  | SExpr e -> ip_slots_known_expr e
+  | SAssign (_, e) -> ip_slots_known_expr e
+  | SIVarAssign (_, e) -> ip_slots_known_expr e
+  | SReturn e -> ip_slots_known_expr e
+  | SPuts es -> ip_slots_known_exprs es
+  | SWhile (c, b) -> ip_slots_known_expr c && ip_slots_known_stmts b
+  | SIf (cs, els) -> ip_slots_known_clauses cs && ip_slots_known_stmts els
+  | SAndThen (a, b) -> ip_slots_known_stmt a && ip_slots_known_stmt b
+  | SOrElse (a, b) -> ip_slots_known_stmt a && ip_slots_known_stmt b
+  | _ -> false
+and ip_slots_known_clauses = fn (cs: (Expr * Stmt list) list) ->
+  match cs with Nil -> true
+  | Cons ((e, b), rest) -> ip_slots_known_expr e && ip_slots_known_stmts b && ip_slots_known_clauses rest
+and ip_slots_known_expr = fn (e: Expr) ->
+  match e with
+  | EInt _ -> true | EBig _ -> true | ERat _ -> true | EImag _ -> true
+  | EImagF _ -> true | EImagRat _ -> true | EFlt _ -> true | EBool _ -> true
+  | ENil -> true | EVar _ -> true | ESelf -> true | EConst _ -> true
+  | EConstOrNil _ -> true | EIVar _ -> true | ECaseNone -> true
+  | EStrL s -> (if str_contains s ("#" ++ chr 123) then false else true)
+  | ESym s -> (if str_contains s ("#" ++ chr 123) then false else true)
+  | ECall (_, es) -> ip_slots_known_exprs es
+  | EBin (_, a, b) -> ip_slots_known_expr a && ip_slots_known_expr b
+  | EUn (_, a) -> ip_slots_known_expr a
+  | EMethod (r, _, es) -> ip_slots_known_expr r && ip_slots_known_exprs es
+  | EMethodB (r, _, es, _, _) -> ip_slots_known_expr r && ip_slots_known_exprs es
+  | ECallB (_, es, _, _) -> ip_slots_known_exprs es
+  | EArr es -> ip_slots_known_exprs es | EHsh es -> ip_slots_known_exprs es
+  | ETern (a, b, c) -> ip_slots_known_expr a && ip_slots_known_expr b && ip_slots_known_expr c
+  | EYield es -> ip_slots_known_exprs es
+  | _ -> false
+and ip_slots_known_exprs = fn (es: Expr list) ->
+  match es with Nil -> true | Cons (e, rest) -> ip_slots_known_expr e && ip_slots_known_exprs rest
 // the block's implicit parameter count: the numbered ones, or one for `it`.
 and implicit_params_of = fn (body: Stmt list) ->
   (let n9 = max_numbered_stmts body in
