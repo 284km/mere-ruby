@@ -2738,3 +2738,62 @@ corpus/536 is the witness.
   lower: test_method (kwarg_eval_memory_leak, an RSS ratio both binaries
   fail alike when run again) and test_require, 51 → 0 -- the Thread.pass
   wait above, which hung the file -- and 51 again with the timed wait.
+
+## 2026-11-09 (21): the spec record measured again against 4.0.9's own spec tree; Kernel, BasicObject and Module; eval's frames; csv loads -- spec DIFF 133 → 104, the stdlib record's CRASH 48 → 6
+
+Note 533 is the re-plan of what stage 3 still has; this is its round 1.
+corpus/546 is the witness.
+
+- **The record is 4.0.9's now.** SPEC_STATUS.md and SPEC_STATUS_STDLIB.md
+  were measured (2026-10-26) against ruby master's spec tree
+  (`84a27934cf53`). The reference is 4.0.9, so 4.0.9's own tree is the
+  subject (its file counts differ, which the guard refuses:
+  `SPEC_TOTALS_OK=1`, deliberately, once). Re-measured before any change:
+  DIFF 133 + 32, CRASH 4 + 48.
+- **The shim's method matchers asked a different question.** mspec's
+  `have_private_instance_method(m, inc)` is
+  `private_instance_methods(inc).include?(m)`; the shim asked
+  `private_method_defined?(m)` and dropped `inc`. ruby itself failed
+  core/kernel/syscall_spec under it. The eight matchers ask the lists now.
+- **csv did not load** (42 of the stdlib record's CRASHes): forwardable --
+  ruby's file since (18) -- generates `def pos=(...)`, and a setter's
+  `(...)` was not read as one.
+- **BasicObject** had no row of builtins: its `*_method_defined?` were
+  false about what its method lists named (`bo_defines`, the reference's
+  owner table); BasicObject::BasicObject is a constant; a class with no
+  Object above it does not see the top level (`const_defined?`,
+  `defined?`); `remove_method :method_missing` on it is accepted; a
+  singleton class is `instance_of?(Class)`.
+- **Kernel's functions on Kernel and on a module**: `Kernel.block_given?`,
+  `.__dir__`, `.system` are the bare call in the caller's frame (they were
+  sent to main); `mod.send(:puts, x)` / `self.send(:block_given?)` in a
+  module method reach Kernel's function (`kernel_by_name`, as an object's
+  do) unless the class has its own class method of the name, up its
+  superclasses; a bare `fail` is a bare `raise`; under -n/-p chomp, chop,
+  sub and gsub are module functions.
+- **A class's own builtin precedes an ancestor's method**:
+  `Module.public_method_defined?(:include)` found the shim's private
+  top-level `def include` on Object first (`anc_past`).
+- **eval draws its frames**: the eval method's ('Kernel#eval',
+  'Binding#eval', 'Kernel.eval') at the call, and the code's above it,
+  labelled like the frame it runs in, or the binding's (`eval_framed`,
+  `bind_lbl`). The code ran IN the caller's frame, so `caller` lost the call
+  and warn's uplevel counted from the wrong frame. ⚠ The first version
+  made test_method's kwarg_eval_memory_leak fail every time (RSS ×1.6
+  against ×1.2): the eval method's frame runs no statement, so its
+  statement watermark kept what an earlier frame at that depth had left,
+  and the collector rooted everything built since. A frame's interval
+  starts at its entry now, as a block's does for a builtin caller.
+- Smaller: Module#constants lists a prepended module's; a frozen class
+  refuses define_method from a class_eval block; `define_method(:m) { |a,|
+  }` takes one argument; a singleton's builtin alias is in its methods
+  lists; `%c`, eval's file and line answer ruby's conversion refusals
+  ("can't convert X to String (X#to_str gives Y)"); main's private_methods
+  has its own six; ARGFClass, Enumerable__Impl and IO::POPEN_IO_KEYS are
+  private constants (they were the program's).
+- **Left** in these groups: object_id of two equal Bignums (a Bignum is a
+  value here), IO#reopen replacing a singleton class, open-uri and
+  RubyGems under the shipped record, a C extension that fails to load
+  (stage 7'), `load(f, true)` with `using`, define_method of an
+  UnboundMethod with a nested def. Found on the way: `MF.open(path)` for a
+  File subclass is a TypeError (pre-existing).

@@ -1070,25 +1070,25 @@ def be_kind_of(k); KindOfMatcher.new(k, false); end
 def be_an_instance_of(k); KindOfMatcher.new(k, true); end
 def be_instance_of(k); KindOfMatcher.new(k, true); end
 
-# reflection matchers: obj.should have_instance_method(:m) etc. `predicate` is
-# the query method sent to the subject.
+# reflection matchers: obj.should have_instance_method(:m) etc., asked as
+# mspec's own are -- the method LIST for that visibility, with the second
+# argument as its include-super flag (mspec/matchers/have_*_method.rb). These
+# asked *_method_defined? and dropped the flag, which is a different question:
+# `Kernel.private_method_defined?(:syscall)` is false where
+# `Kernel.private_instance_methods.include?(:syscall)` is true, and ruby
+# failed core/kernel/syscall_spec under the shim while mspec passes it.
 class HaveMethodMatcher
-  def initialize(predicate, name); @predicate = predicate; @name = name; end
-  def match?(subject); subject.send(@predicate, @name); end
+  def initialize(lister, name, inc); @lister = lister; @name = name.to_sym; @inc = inc; end
+  def match?(subject); subject.send(@lister, @inc).include?(@name); end
 end
-def have_instance_method(name, inc = true); HaveMethodMatcher.new(:instance_method_defined_shim, name); end
-def have_public_instance_method(name, inc = true); HaveMethodMatcher.new(:public_method_defined?, name); end
-def have_private_instance_method(name, inc = true); HaveMethodMatcher.new(:private_method_defined?, name); end
-def have_protected_instance_method(name, inc = true); HaveMethodMatcher.new(:protected_method_defined?, name); end
-def have_method(name, inc = true); HaveMethodMatcher.new(:respond_to?, name); end
-def have_public_method(name, inc = true); HaveMethodMatcher.new(:respond_to?, name); end
-class Module
-  # have_instance_method accepts any visibility; method_defined? excludes
-  # private, so OR the family for the matcher's semantics.
-  def instance_method_defined_shim(name)
-    method_defined?(name) || private_method_defined?(name) || protected_method_defined?(name)
-  end
-end
+def have_instance_method(name, inc = true); HaveMethodMatcher.new(:instance_methods, name, inc); end
+def have_public_instance_method(name, inc = true); HaveMethodMatcher.new(:public_instance_methods, name, inc); end
+def have_private_instance_method(name, inc = true); HaveMethodMatcher.new(:private_instance_methods, name, inc); end
+def have_protected_instance_method(name, inc = true); HaveMethodMatcher.new(:protected_instance_methods, name, inc); end
+def have_method(name, inc = true); HaveMethodMatcher.new(:methods, name, inc); end
+def have_public_method(name, inc = true); HaveMethodMatcher.new(:public_methods, name, inc); end
+def have_private_method(name, inc = true); HaveMethodMatcher.new(:private_methods, name, inc); end
+def have_singleton_method(name, inc = true); HaveMethodMatcher.new(:singleton_methods, name, inc); end
 
 # obj.should be_ancestor_of(mod): self appears in mod.ancestors.
 class AncestorOfMatcher
