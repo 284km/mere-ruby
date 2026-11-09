@@ -356,11 +356,11 @@ let _ = map_compact rx_gnodes;  // (its own arena: gc_churn_bytes, note 441)
 let rx_called = map_new ();
 let _ = map_compact rx_called;  // (its own arena: rxp_parse gives it back at each parse, note 441)
 
-// DEFLATE comes from the mgz package, vendored under .mere_modules/. Zlib's
-// streams are the same RFC 1951 body under a different wrapper, so mere-ruby
-// only adds the zlib header/Adler-32 around what mgz already computes.
+// The resumable engine uses mgz's RFC 1951 tables and bit writer.
+// Ruby owns the serialized state; native, Wasm and RV share the algorithm.
 import "mgz/inflate.mere";
 import "mgz/deflate.mere";
+import "m_zstream.mere";
 
 import "m_state.mere";
 import "m_owners.mere";
@@ -2037,6 +2037,7 @@ let fb_reclaim = fn env -> fn world ->
   };
 
 import "m_openssl_cipher.mere";
+import "m_zlib_lib.mere";
 import "m_eval_leaf.mere";
 import "m_pack.mere";
 // json: the ruby half verbatim (generated), and the C half (see m_json.mere)
@@ -21147,71 +21148,37 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                               || (str_len name == 28 && str_eq name "verify_compaction_references")) then
       raise_exc world "NotImplementedError"
         "this collector marks and sweeps; it never moves an object, so there is no compaction to configure"
-    // Zlib.crc32(str, seed) / Zlib.adler32(str, seed), and the two stream
-    // methods, reached as Zlib::Deflate.deflate / Zlib::Inflate.inflate.
-    else if (str_eq c "Zlib" || str_eq c "Zlib::Deflate" || str_eq c "Zlib::Inflate")
-            && ((str_len name == 5 && str_eq name "crc32") || (str_len name == 7 && str_eq name "adler32") ||
-                (str_len name == 7 && str_eq name "deflate") || (str_len name == 7 && str_eq name "inflate") ||
-                (str_len name == 6 && str_eq name "gunzip") || (str_len name == 4 && str_eq name "gzip")) then
-      (let sv = (match args with Cons (VStr h, _) -> sget h | _ -> "") in
-       let v = str_to_bytevec sv in
-       // ⚠ A BIGNUM SEED WAS IGNORED. The two arms below match VInt, so
-       //   `Zlib.crc32(s, 2**128)` fell to the no-seed arm and answered the
-       //   plain checksum; ruby converts the seed to an unsigned long and
-       //   refuses what does not fit. Asked of the reference: 2**32 is taken
-       //   (and truncated), 2**64 is RangeError. A decimal of more than twenty
-       //   digits is past 2**64 whatever it is; exactly twenty is not decided
-       //   here and is let through.
-       let _ = (match args with
-                | Cons (_, Cons (VBig b9, _)) ->
-                  (if (str_len name == 5 && str_eq name "crc32") || (str_len name == 7 && str_eq name "adler32") then
-                     (let d9 = to_s (VBig b9) in
-                      if str_len d9 > 20 && (if str_eq (char_at d9 0) "-" then false else true)
-                      then (let _ = raise_exc world "RangeError" "bignum too big to convert into 'unsigned long'" in ())
-                      else ())
-                   else ())
-                | _ -> ()) in
-       if (str_len name == 5 && str_eq name "crc32") then
-         (match args with
-          // crc32(str, seed): continue a running CRC, which is how a PNG
-          // chunk's checksum covers the type and the content together.
-          | Cons (_, Cons (VInt seed, _)) -> VInt (bit_xor (crc32_cont (bit_xor seed mask32) v) mask32)
-          | _ -> VInt (crc32_vec v))
-       else if (str_len name == 7 && str_eq name "adler32") then
-         (match args with
-          | Cons (_, Cons (VInt seed, _)) -> VInt (adler32_vec v seed)
-          | Nil -> VInt 1
-          | _ -> VInt (adler32_vec v 1))
-       else if (str_len name == 7 && str_eq name "deflate") then
-         mkstr_e (bytevec_to_str (zlib_wrap (deflate_body v) (adler32_vec v 1))) "ASCII-8BIT"
-       else if (str_len name == 4 && str_eq name "gzip") then
-         mkstr_e (bytevec_to_str (deflate_gzip v)) "ASCII-8BIT"
-       // Zlib.gunzip: a whole gzip MEMBER (header, deflate stream, trailer),
-       // which is what GzipReader reads and what a .gz data file is. mgz
-       // knows the header layout and checks the trailer's CRC and length.
-       else if (str_len name == 6 && str_eq name "gunzip") then
-         (let data = bytebuf_of_bytes (bytes_of_str sv) in
-          if is_gzip data then
-            (let (out, _) = inflate_buf (bytevec_pad v) (gzip_body_start data) in
-             if gzip_trailer_ok data (bytebuf_len out) (crc32_buf out)
-             then mkstr_e (str_of_bytes (bytes_of_bytebuf out)) "ASCII-8BIT"
-             else raise_exc world "Zlib::GzipFile::CRCError" "invalid compressed data -- crc error")
-          else raise_exc world "Zlib::GzipFile::Error" "not in gzip format")
-       // (what comes out of every one of these is bytes: BINARY, as in ruby --
-       // which a byte comparison hid until String#== asked the encodings)
-       else
-         (let (out, _) = inflate_buf (bytevec_pad v) (zlib_body_start v) in
-          mkstr_e (str_of_bytes (bytes_of_bytebuf out)) "ASCII-8BIT"))
-    // the stream half of Zlib::Inflate: one zlib stream decoded as far as
-    // the input goes -- [status, output, bytes consumed, dictionary id], the
-    // status as zi_zlib numbers it (the Ruby class turns it into its errors)
-    else if str_eq c "Zlib" && (str_len name == 11 && str_eq name "__inflate_x") then
-      (let sv9 = (match args with Cons (VStr h, _) -> sget h | _ -> "") in
-       let dv9 = (match args with Cons (_, Cons (VStr h, _)) -> str_to_bytevec (sget h) | _ -> vec_new ()) in
-       let (st9, out9, used9, did9) = zi_zlib (str_to_bytevec sv9) dv9 in
-       let o9 = mkstr (bytevec_to_str out9) in
-       let _ = (match o9 with VStr h9 -> senc_set h9 "ASCII-8BIT" | _ -> ()) in
-       arr_new (Cons (VInt st9, Cons (o9, Cons (VInt used9, Cons (VInt did9, Nil))))))
+    // Only the binary checksum loop is native to Mere. The public API and
+    // stream lifecycle are defined by lib/zlib_stream.rb.
+    else if str_eq c "Zlib" && str_eq name "__data_type" then
+      (match args with
+       | Cons (VStr h, _) ->
+         (let src = sget h in
+          let rec scan = fn (i: int) -> fn (text: bool) ->
+            if i == str_len src then VInt (if text then 1 else 0) else
+            let b = ord (char_at src i) in
+            if b <= 31 && bit_and (bit_shr 4093624447 b) 1 != 0 then VInt 0
+            else scan (i + 1) (text || b >= 32 || b == 9 || b == 10 || b == 13) in scan 0 false)
+       | _ -> raise_exc world "TypeError" "a String is required")
+    else if str_eq c "Zlib" && str_eq name "__checksum" then
+      (match args with
+       | Cons (VInt kind, Cons (VStr src, Cons (VInt seed, _))) ->
+         (region ZCHECK { let bytes = zs_vec (sget src) in
+          if kind == 0 then VInt (bit_and (bit_xor (crc32_cont (bit_xor (bit_and seed mask32) mask32) bytes) mask32) mask32)
+          else VInt (adler32_vec bytes (bit_and seed mask32)) })
+       | _ -> raise_exc world "ArgumentError" "__checksum: malformed arguments")
+    else if str_eq c "Zlib" && str_eq name "__deflate_step" then
+      (match args with
+       | Cons (VStr src, Cons (VStr hist, Cons (VInt bb, Cons (VInt bc, Cons (VInt fl, Cons (VInt lv, Cons (VInt strategy, Cons (VInt wb, _)))))))) ->
+         (region ZSTEP { let (out, history, buf, cnt, used) = zs_deflate (sget src) (sget hist) bb bc fl lv strategy wb in
+          arr_new (Cons (mkstr_e out "ASCII-8BIT", Cons (mkstr_e history "ASCII-8BIT", Cons (VInt buf, Cons (VInt cnt, Cons (VInt used, Nil)))))) })
+       | _ -> raise_exc world "ArgumentError" "__deflate_step: malformed state")
+    else if str_eq c "Zlib" && str_eq name "__inflate_step" then
+      (match args with
+       | Cons (VStr st, Cons (VStr hist, Cons (VStr src, Cons (VInt limit, _)))) ->
+         (region ZSTEP { let (state, history, out, used, status) = zs_inflate (sget st) (sget hist) (sget src) limit in
+          arr_new (Cons (mkstr_e state "ASCII-8BIT", Cons (mkstr_e history "ASCII-8BIT", Cons (mkstr_e out "ASCII-8BIT", Cons (VInt used, Cons (VInt status, Nil)))))) })
+       | _ -> raise_exc world "ArgumentError" "__inflate_step: malformed state")
     // json's two engines (m_json.mere), under the ruby classes json_ext_src
     // defines around them. Everything they call back for goes through `cb`,
     // which is the only place here that can call a ruby method: on_load and
@@ -41401,44 +41368,7 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
 
 
 
-// ---- Zlib -----------------------------------------------------------------
-// The DEFLATE engine is the vendored mgz package; everything here is the
-// bridge: mere-ruby's byte-holding String to and from a Mere byte vector, and
-// zlib's wrapper (RFC 1950) around the same RFC 1951 body mgz produces for
-// gzip. A String is a length-carrying handle, so NUL and high bytes survive.
-
-// Halving concatenation, NOT str_join: the C backend's str_join copies with
-// NUL-terminated semantics, so a byte string containing 0x00 comes back the
-// right LENGTH with its non-zero bytes compacted to the front (65,0,65 joins
-// to 65,65,0). `++` is correct on both backends, and splitting in half keeps
-// this O(n log n) instead of the quadratic left fold.
-
-// CRC-32 continued from a running value (mgz's crc32_vec always starts and
-// ends fresh); Zlib.crc32's seed argument needs the resumable form.
-
-// Adler-32 (RFC 1950 §9): the zlib stream's checksum, where gzip uses CRC-32.
-
-// zlib wrapper: CMF/FLG chosen so the 16-bit header is a multiple of 31,
-// then the DEFLATE body, then Adler-32 big-endian.
-
-// A zlib stream starts with CMF/FLG; a raw DEFLATE stream does not, so accept
-// both (Ruby's Zlib::Inflate.inflate is given zlib streams, but chunky_png
-// hands raw bodies around too).
-// The bit reader fetches a byte whenever its buffer runs dry, so a stream
-// that ends exactly on a byte boundary reads one past the end. gzip's 8-byte
-// trailer absorbed that; a zlib stream's 4-byte Adler-32 does not always.
-// Padding is safe: inflate stops at the BFINAL block, never at the end.
-
-// RFC 1951 3.2.4 stored blocks: a byte-aligned header (BFINAL, BTYPE=00),
-// LEN and its one's complement little-endian, then the bytes verbatim. Valid
-// DEFLATE that every inflater accepts; it just does not compress.
-
-
-// prepend `h` to each combination array in `combos`.
-
-// all k-combinations of xs, preserving order.
-
-// all k-permutations of xs.
+// Array permutations.
 and arr_permutations = fn (xs: Val list) -> fn (k: int) ->
   if k == 0 then Cons (arr_new Nil, Nil)
   else if k < 0 then Nil
@@ -46948,181 +46878,6 @@ and time_parse_off1 = fn world -> fn (v: Val) ->
 // The part of a Float or Rational below 1, in units of 1/scale, truncated
 // (a Rational exactly; `9999r/10000` usec is 999 ns, not 1000). An Integer
 // usec is whole units, which a caller handles before asking.
-// ---- inflate for a STREAM: where the data ended, and whether it did -----
-// mgz's inflate answers the output and nothing else, and reads past the end
-// of what it is given (its caller pads with zeros), so a stream object could
-// not tell "incomplete, wait for more" from "complete, and here is what
-// follows it", which is the whole of Zlib::Inflate's contract: #finish
-// refuses an incomplete stream with BufError, and what arrives after the end
-// passes through unchanged. This is the same decoder (mgz's Huffman tables
-// and length/distance bases) over a bit reader that STOPS at the end of the
-// input and says so, with the zlib header and trailer read here: a preset
-// dictionary (FDICT) is asked for and then seeds the window, and the Adler-32
-// is checked.
-//
-// st: [byte position, bit buffer, bits left in it, ran out (1)]
-and zi_bit = fn st -> fn data -> fn (n: int) ->
-  let _ = (if (vec_get st 2 : int) == 0 then
-             (let p = (vec_get st 0 : int) in
-              if p >= n then (let _ = vec_set st 3 1 in let _ = vec_set st 1 0 in vec_set st 2 8)
-              else (let _ = vec_set st 1 (vec_get data p) in
-                    let _ = vec_set st 0 (p + 1) in
-                    vec_set st 2 8))
-           else ()) in
-  let buf = (vec_get st 1 : int) in
-  let _ = vec_set st 1 (bit_shr buf 1) in
-  let _ = vec_set st 2 ((vec_get st 2 : int) - 1) in
-  bit_and buf 1
-and zi_bits = fn st -> fn data -> fn (n: int) -> fn (k: int) ->
-  let rec go = fn (i: int) -> fn (acc: int) ->
-    (if i == k then acc else go (i + 1) (bit_or acc (bit_shl (zi_bit st data n) i))) in
-  go 0 0
-and zi_decode = fn st -> fn data -> fn (n: int) -> fn count -> fn syms ->
-  let rec go = fn (len: int) -> fn (code0: int) -> fn (first: int) -> fn (index: int) ->
-    (if len == 16 || (vec_get st 3 : int) == 1 then 0 - 1
-     else
-       (let code = bit_or code0 (zi_bit st data n) in
-        let c = (vec_get count len : int) in
-        if code < first + c then (vec_get syms (index + (code - first)) : int)
-        else go (len + 1) (bit_shl code 1) (bit_shl (first + c) 1) (index + c))) in
-  go 1 0 0 0
-// the codes of one Huffman block; false when the input ran out or a code was
-// bad (st[3] says which)
-and zi_codes = fn st -> fn data -> fn (n: int) -> fn out -> fn lc -> fn ls -> fn dc -> fn ds ->
-  let rec loop = fn (u: unit) ->
-    (let sym = zi_decode st data n lc ls in
-     if (vec_get st 3 : int) == 1 || sym < 0 then false
-     else if sym < 256 then (let _ = vec_push out sym in loop ())
-     else if sym == 256 then true
-     else if sym > 285 then false
-     else
-       (let li = sym - 257 in
-        let len = (vec_get len_base li : int) + zi_bits st data n (vec_get len_extra li) in
-        let dsym = zi_decode st data n dc ds in
-        if dsym < 0 || dsym > 29 then false
-        else
-          (let dist = (vec_get dist_base dsym : int) + zi_bits st data n (vec_get dist_extra dsym) in
-           let from = vec_len out - dist in
-           if from < 0 || (vec_get st 3 : int) == 1 then false
-           else
-             (let rec copy = fn (i: int) ->
-                (if i == len then () else (let _ = vec_push out (vec_get out (from + i)) in copy (i + 1))) in
-              let _ = copy 0 in
-              loop ())))) in
-  loop ()
-and zi_dynamic = fn st -> fn data -> fn (n: int) ->
-  let hlit = zi_bits st data n 5 + 257 in
-  let hdist = zi_bits st data n 5 + 1 in
-  let hclen = zi_bits st data n 4 + 4 in
-  let cl = vec_new () in
-  let rec z19 = fn (i: int) -> (if i == 19 then () else (let _ = vec_push cl 0 in z19 (i + 1))) in
-  let _ = z19 0 in
-  let rec rd = fn (i: int) ->
-    (if i == hclen then () else (let _ = vec_set cl (vec_get clen_order i) (zi_bits st data n 3) in rd (i + 1))) in
-  let _ = rd 0 in
-  let (clc, cls) = huff_build cl in
-  let lengths = vec_new () in
-  let total = hlit + hdist in
-  let rec rep = fn (k: int) -> fn (v: int) ->
-    (if k <= 0 || vec_len lengths >= total then () else (let _ = vec_push lengths v in rep (k - 1) v)) in
-  let rec fill = fn (u: unit) ->
-    (if vec_len lengths >= total || (vec_get st 3 : int) == 1 then ()
-     else
-       (let sym = zi_decode st data n clc cls in
-        if sym < 0 then (let _ = vec_set st 3 2 in ())
-        else if sym < 16 then (let _ = vec_push lengths sym in fill ())
-        else if sym == 16 then
-          (if vec_len lengths == 0 then (let _ = vec_set st 3 2 in ())
-           else (let prev = (vec_get lengths (vec_len lengths - 1) : int) in
-                 let _ = rep (3 + zi_bits st data n 2) prev in fill ()))
-        else if sym == 17 then (let _ = rep (3 + zi_bits st data n 3) 0 in fill ())
-        else (let _ = rep (11 + zi_bits st data n 7) 0 in fill ()))) in
-  let _ = fill () in
-  let llen = vec_new () in
-  let dlen = vec_new () in
-  let rec split = fn (i: int) ->
-    (if i >= vec_len lengths then ()
-     else (let _ = (if i < hlit then vec_push llen (vec_get lengths i) else vec_push dlen (vec_get lengths i)) in
-           split (i + 1))) in
-  let _ = split 0 in
-  (llen, dlen)
-// the deflate blocks from st's position: 0 = done, 1 = ran out, 2 = bad data
-and zi_blocks = fn st -> fn data -> fn (n: int) -> fn out ->
-  let final = zi_bit st data n in
-  let btype = zi_bits st data n 2 in
-  if (vec_get st 3 : int) == 1 then 1
-  else
-    (let ok =
-       (if btype == 0 then
-          (let _ = vec_set st 1 0 in
-           let _ = vec_set st 2 0 in
-           let p = (vec_get st 0 : int) in
-           if p + 4 > n then (let _ = vec_set st 3 1 in false)
-           else
-             (let len = (vec_get data p : int) + bit_shl (vec_get data (p + 1)) 8 in
-              let nlen = (vec_get data (p + 2) : int) + bit_shl (vec_get data (p + 3)) 8 in
-              if bit_xor len nlen != 0xFFFF then (let _ = vec_set st 3 2 in false)
-              else if p + 4 + len > n then (let _ = vec_set st 3 1 in false)
-              else
-                (let rec copy = fn (i: int) ->
-                   (if i == len then () else (let _ = vec_push out (vec_get data (p + 4 + i)) in copy (i + 1))) in
-                 let _ = copy 0 in
-                 let _ = vec_set st 0 (p + 4 + len) in
-                 true)))
-        else if btype == 1 then
-          (let (lc, ls) = huff_build (fixed_lit_lengths ()) in
-           let (dc, ds) = huff_build (fixed_dist_lengths ()) in
-           zi_codes st data n out lc ls dc ds)
-        else if btype == 2 then
-          (let (llen, dlen) = zi_dynamic st data n in
-           if (vec_get st 3 : int) != 0 then false
-           else
-             (let (lc, ls) = huff_build llen in
-              let (dc, ds) = huff_build dlen in
-              zi_codes st data n out lc ls dc ds))
-        else (let _ = vec_set st 3 2 in false)) in
-     if ok then (if final == 1 then 0 else zi_blocks st data n out)
-     else (if (vec_get st 3 : int) == 1 then 1 else 2))
-// a whole zlib stream: (status, output, bytes consumed, dictionary id)
-// status 0 done, 1 needs more input, 2 bad data, 3 needs the dictionary,
-// 4 bad check value
-and zi_zlib = fn data -> fn dict ->
-  let n = vec_len data in
-  if n < 2 then (1, vec_new (), 0, 0)
-  else
-    (let cmf = (vec_get data 0 : int) in
-     let flg = (vec_get data 1 : int) in
-     if bit_and cmf 15 != 8 || floor_mod (cmf * 256 + flg) 31 != 0 then (2, vec_new (), 0, 0)
-     else
-       (let hasdict = bit_and flg 32 != 0 in
-        if hasdict && n < 6 then (1, vec_new (), 0, 0)
-        else
-          (let did = (if hasdict then
-                        bit_or (bit_shl (vec_get data 2) 24) (bit_or (bit_shl (vec_get data 3) 16) (bit_or (bit_shl (vec_get data 4) 8) (vec_get data 5)))
-                      else 0) in
-           if hasdict && vec_len dict == 0 then (3, vec_new (), 0, did)
-           else
-             (let out = vec_new () in
-              let dn = (if hasdict then vec_len dict else 0) in
-              let rec seed = fn (i: int) -> (if i >= dn then () else (let _ = vec_push out (vec_get dict i) in seed (i + 1))) in
-              let _ = seed 0 in
-              let st = vec_new () in
-              let _ = vec_push st (if hasdict then 6 else 2) in
-              let _ = vec_push st 0 in
-              let _ = vec_push st 0 in
-              let _ = vec_push st 0 in
-              let r = zi_blocks st data n out in
-              let body = vec_new () in
-              let rec strip = fn (i: int) -> (if i >= vec_len out then () else (let _ = vec_push body (vec_get out i) in strip (i + 1))) in
-              let _ = strip dn in
-              if r != 0 then (r, body, 0, did)
-              else
-                (let p = (vec_get st 0 : int) in
-                 if p + 4 > n then (1, body, 0, did)
-                 else
-                   (let want = bit_or (bit_shl (vec_get data p) 24) (bit_or (bit_shl (vec_get data (p + 1)) 16) (bit_or (bit_shl (vec_get data (p + 2)) 8) (vec_get data (p + 3)))) in
-                    if want != adler32_vec body 1 then (4, body, p + 4, did)
-                    else (0, body, p + 4, did)))))))
 // a String in US-ASCII: what ruby's Time printers answer
 and mkstr_ascii = fn (s: str) ->
   let v = mkstr s in
