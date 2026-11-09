@@ -61,3 +61,31 @@ r.finish
 
 p Zlib.adler32_combine(Zlib.adler32('first'), Zlib.adler32('last'), 4) == Zlib.adler32('firstlast')
 p Zlib.crc32_combine(Zlib.crc32('first'), Zlib.crc32('last'), 4) == Zlib.crc32('firstlast')
+
+# One-shot inflate discards bytes after its member; instances retain them.
+encoded = Zlib.deflate('foo')
+p Zlib.inflate(encoded + 'unused')
+p Zlib::Inflate.inflate(encoded + 'unused')
+[nil, true, 1].each do |value|
+  [:deflate, :inflate].each do |method|
+    begin; Zlib.send(method, value); rescue => e; p [method, e.class]; end
+  end
+end
+
+# Sync before a header switches to raw; after a header it skips lost checks.
+[false, true].each do |header_seen|
+  d = Zlib::Deflate.new
+  first = d.deflate('before', Zlib::FULL_FLUSH)
+  last = d.deflate('after', Zlib::FINISH)
+  i = Zlib::Inflate.new
+  if header_seen
+    i.inflate(first.byteslice(0, 2))
+    bad = "\xff".b + first.byteslice(2, first.bytesize - 2) + last
+  else
+    bad = 'corrupt' + first + last
+  end
+  begin; i.inflate(bad); rescue Zlib::DataError; end
+  p i.sync('')
+  p i.inflate('') + i.finish
+  i.close; d.close
+end

@@ -98,6 +98,7 @@ module Zlib
     end
 
     def self.deflate(str, level = DEFAULT_COMPRESSION, &block)
+      str = Zlib.__string(str)
       z = new(level)
       begin
         z.deflate(str, FINISH, &block)
@@ -269,6 +270,7 @@ module Zlib
       @crc = 0
       @size = 0
       @bad = false
+      @skip_check = false
       @sync_tail = +''.b
     end
 
@@ -279,11 +281,12 @@ module Zlib
     end
 
     def self.inflate(str, &block)
+      str = Zlib.__string(str)
       z = new
       begin
         out = z.inflate(str, &block)
-        tail = z.finish(&block)
-        block ? nil : out + tail
+        z.finish(&block) unless z.finished?
+        block ? nil : out
       ensure
         z.close unless z.closed?
       end
@@ -373,7 +376,9 @@ module Zlib
           @out << data
           @total_out += data.bytesize
           @size += data.bytesize
-          @adler = @format == :gzip ? Zlib.crc32(data, @adler) : Zlib.adler32(data, @adler)
+          unless @skip_check
+            @adler = @format == :gzip ? Zlib.crc32(data, @adler) : Zlib.adler32(data, @adler)
+          end
           if status < 0
             @bad = true
             raise DataError, 'invalid compressed data -- format violated'
@@ -387,11 +392,11 @@ module Zlib
           return if @in.bytesize < n
           tail = __consume(n)
           if @format == :zlib
-            raise DataError, 'incorrect data check' if tail.unpack1('N') != @adler
+            raise DataError, 'incorrect data check' if !@skip_check && tail.unpack1('N') != @adler
           elsif @format == :gzip
             crc, size = tail.unpack('V2')
-            raise DataError, 'incorrect data check' if crc != @adler
-            raise DataError, 'incorrect length check' if size != (@size & 0xffffffff)
+            raise DataError, 'incorrect data check' if !@skip_check && crc != @adler
+            raise DataError, 'incorrect length check' if !@skip_check && size != (@size & 0xffffffff)
           end
           @phase = :done
           @finished = true
@@ -493,11 +498,18 @@ module Zlib
         __consume(marker + 4)
         @state = +''.b
         @history = +''.b
+        # inflateSync treats recovery before a header as raw DEFLATE. After
+        # a header it retains framing, but the lost prefix prevents checking.
+        @format = :raw if @phase == :header
+        @skip_check = true
+        @adler = @format == :zlib ? 1 : 0
         @phase = :body
         @bad = false
         true
       else
         @in = @in.byteslice(-[3, @in.bytesize].min, @in.bytesize) || +''.b
+        @state = +''.b
+        @bad = true
         false
       end
     end

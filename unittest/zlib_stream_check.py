@@ -44,6 +44,32 @@ end
   p d.data_type
   d.close
 end
+# One-shot APIs reject nil and discard bytes after their compressed member.
+encoded = Zlib.deflate('foo')
+p Zlib.inflate(encoded + 'unused')
+p Zlib::Inflate.inflate(encoded + 'unused')
+[nil, true, 1].each do |value|
+  [:deflate, :inflate].each do |method|
+    begin; Zlib.send(method, value); rescue => e; p [method, e.class]; end
+  end
+end
+# Recovery with/without a parsed header follows inflateSync's framing rule.
+[false, true].each do |header_seen|
+  d = Zlib::Deflate.new
+  first = d.deflate('before', Zlib::FULL_FLUSH)
+  last = d.deflate('after', Zlib::FINISH)
+  i = Zlib::Inflate.new
+  if header_seen
+    i.inflate(first.byteslice(0, 2))
+    bad = "\xff".b + first.byteslice(2, first.bytesize - 2) + last
+  else
+    bad = 'corrupt' + first + last
+  end
+  begin; i.inflate(bad); rescue Zlib::DataError; end
+  p i.sync('')
+  p i.inflate('') + i.finish
+  i.close; d.close
+end
 # A copy branches independently and reset starts a new stream.
 d = Zlib::Deflate.new
 a = d.deflate('prefix')
