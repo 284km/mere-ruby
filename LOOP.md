@@ -2670,3 +2670,71 @@ The rest of note 511's "test直下" after (18). corpus/533 is the witness.
   kwarg_eval_memory_leak (an RSS ratio, 1.24 against 1.2; the baseline
   failed it the same way when run again) and test_pathname's EXTRA 1 (its
   reference side).
+
+## 2026-11-09 (20): bootstraptest and tool/test -- a require lock, a /o site built once, a binding's block, yield's scope, STDIN's output, EAGAIN on an inherited descriptor
+
+Note 511's stage 3 "bootstrap 173 / tool/test 5". The numbers are CI's at
+8341bb4 (bootstrap-report, tool-report); of bootstrap's red, test_ractor's
+63 are stage 9, test_insns' 1 stage 10 and test_yjit's 21 stage 11, which
+left 33 here. Measured locally through ruby's own runner
+(bootstraptest/runner.rb, tool/test/runner.rb) as the CI jobs run them.
+corpus/536 is the witness.
+
+- **bootstraptest 33 → 0** (every file but test_ractor and test_insns
+  passes whole):
+  - **the require lock**: a second thread requiring a file another thread
+    is still loading found it marked and went on before anything was
+    defined. It waits until that load ends (`req_wait_other`, over the
+    req_loading / req_loading_thr the loader already kept) in short timed
+    sleeps -- so it reads as stopped, which test_require's race_exception
+    waits for (a Thread.pass loop hung the whole file) -- and then asks
+    again: a load that raised was taken back out, and the waiter loads it.
+  - **`yield` and its scope**: one in a class, module or singleton-class
+    body is refused wherever that body is, a def included
+    (`class_yield_stmts`); a file's top-level yield is refused when the
+    file is parsed (`yield_refuse_file`; it was a LocalJumpError at run
+    time); in an eval, a top-level yield is refused only outside a method,
+    so `binding.eval("yield")` of a method's binding is the method's. A
+    method's `binding` keeps the block the method was given (`bind_yblk`,
+    marked with the binding) and Binding#eval yields to it.
+  - **a proc in a class body** returns from the method or lambda the
+    `class` statement ran in: the body's env does not continue the
+    enclosing chain, so the statement hands its frame over through a
+    one-shot slot (`cls_home_note` / `cls_home_take`, `__ret_home`).
+  - **STDIN's print / puts / printf / putc** went to standard output; they
+    are IO's now, through its #write (refused while it reads, the
+    reopened stream once IO#reopen made it writable).
+  - **the at-exit flush** of a writer nobody closed waited for ever on a
+    pipe whose reader had gone with the threads (test_io's ten
+    copy_stream-under-SIGINT runs timed out): at exit a write that would
+    block ends the flush.
+  - **a `/.../o` site** runs its pieces once: the cache is consulted before
+    the interpolation, and a thread arriving while another builds the site
+    waits for it and takes its result (`rx_once_gate` / `rx_once_eval`).
+  - **the main thread's locals** were lost once a second thread existed:
+    Thread.current did not boot the main fiber's root mark, so the slot
+    changed (`fb_tl_base` boots it).
+  - eval's refusals in ruby's words: a flow word in a rescue body (`eval
+    "0 rescue break"`), a range's end (`0..$1=1`), `{*0}`, two splats in
+    one target group (`v0,(*,v1,) = 0`), an invalid byte ahead of an
+    unterminated string, and an empty file name given to eval names the
+    message `:0:` as ruby's does; `def m() :m end` inside a block or
+    parens (`paren_closes_def_params` reads the words before the `(`);
+    `__FILE__` carries the file's frozen_string_literal comment, and
+    `load` now reads that comment at all (only require did).
+- **tool/test 5 → 1**: test/unit's parallel worker read its stdin -- a
+  pipe the parent made non-blocking -- and EAGAIN raised: the descriptor
+  layer waited only on descriptors it had made non-blocking itself, and an
+  EAGAIN can only come from a non-blocking one, so it is a wait now
+  (read and write). Regexp#=~ reads an object through #to_str (minitest's
+  assert_match), and refuses one without it. Left: test_commit_email,
+  which needs nkf -- a C extension, stage 7'.
+- **Checked**: corpus 561/561 both ways (492 needs a UTF-8 locale on the
+  reference side: after a reboot the shell had none and ruby's ENV strings
+  came back BINARY, the baseline binary differing the same way), 536 under
+  GC_STRESS=50, the 13 gates; 247 unittest files (10361 tests: ruby/,
+  json, the top level and the libraries of the last rounds) against
+  f3ef3b7's binary, MATCH 9716 → 9716 + the files above. Two files read
+  lower: test_method (kwarg_eval_memory_leak, an RSS ratio both binaries
+  fail alike when run again) and test_require, 51 → 0 -- the Thread.pass
+  wait above, which hung the file -- and 51 again with the timed wait.

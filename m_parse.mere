@@ -2182,12 +2182,17 @@ and paren_closes_def_params = fn (s: str) -> fn (p: int) ->
   let k = opn (p - 1) 0 in
   if k < 0 then false
   else
-    let rec bos = fn (q: int) -> (if q <= 0 then 0 else (let c = char_at s (q - 1) in if str_eq c "\n" || str_eq c ";" then q else bos (q - 1))) in
-    let b = lvt_skip_sp s (bos k) in
-    let rec end_blank = fn (q: int) -> (if q > b && (str_eq (char_at s (q - 1)) " " || str_eq (char_at s (q - 1)) "\t") then end_blank (q - 1) else q) in
-    let e = end_blank k in
-    b + 4 < e && str_eq (substring s b (b + 4)) "def " && (let nm = lvt_skip_sp s (b + 4) in
-                                                            nm < e && (if str_contains (substring s nm e) " " then false else true))
+    // the words just before the `(`: the name (`m`, `self.m`, `m=`), and
+    // `def` before it -- wherever the def stands, a block's `{ def m() :m
+    // end }` too, where the statement does not start the line
+    let blank = fn (q: int) -> str_eq (char_at s q) " " || str_eq (char_at s q) "\t" in
+    let rec back_sp = fn (q: int) -> (if q > 0 && blank (q - 1) then back_sp (q - 1) else q) in
+    let rec back_word = fn (q: int) -> (if q > 0 && (if blank (q - 1) || str_eq (char_at s (q - 1)) "\n" || str_eq (char_at s (q - 1)) ";" then false else true) then back_word (q - 1) else q) in
+    let e = back_sp k in
+    let nb = back_word e in
+    let de = back_sp nb in
+    nb < e && de >= 3 && de < nb && str_eq (substring s (de - 3) de) "def"
+    && (de == 3 || (let c0 = char_at s (de - 4) in (if is_alnum c0 || str_eq c0 "_" || str_eq c0 "." || str_eq c0 ":" || str_eq c0 "@" || str_eq c0 "$" then false else true)))
 // is the identifier ending just before i (blanks between) a known local?
 // Not when it is itself a method name (`x.p /re/`), a symbol, an ivar or a
 // global: those end in the same characters.
@@ -2396,7 +2401,12 @@ and lex_dstr_t = fn (term: str) -> fn (s: str) -> fn (i: int) -> fn (lit: str) -
 // Each interpolation seals the current literal run before a fresh buffer
 // reads the remainder. Nested literals therefore cannot overwrite its bytes.
 and lex_dstr_buf = fn b -> fn (term: str) -> fn (s: str) -> fn (i: int) ->
-  if i >= str_len s then (let _ = syn_why_note "unterminated string meets end of file" in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated string" ++ parsing_file ()))) in fail ("mere-ruby: unterminated string" ++ parsing_file ())))
+  // (an unterminated string in a UTF-8 source that holds a byte no character
+  //  starts with is reported for the byte first, as prism lists it:
+  //  `eval("\"\xf0")` is "invalid multibyte character 0xF0")
+  if i >= str_len s && lex_src_is_utf8 () && lex_bad_mb s 0 (str_len s) >= 0 then
+    (let _ = lex_bad_mb_refuse s (lex_bad_mb s 0 (str_len s)) in (Nil, i))
+  else if i >= str_len s then (let _ = syn_why_note "unterminated string meets end of file" in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated string" ++ parsing_file ()))) in fail ("mere-ruby: unterminated string" ++ parsing_file ())))
   else
     let c = char_at s i in
     if str_eq c term then (Cons (TP "+", Cons (TStrL (strbuf_to_str b), Nil)), i + 1)
@@ -6512,7 +6522,7 @@ and parse_primary = fn toks ->
             if (if had then false else starts_do_block r2b) then
               (let (bp, bb, r4) = parse_block r2b in (ECallB (id, es, bp, bb), r4))
             else (ECall (id, es), r2b))
-         else (enc_pseudo_var_at id (tok_line r), r)
+         else pseudo_var_fsl id (tok_line r) r
        | _ ->
          if starts_block r then
            let (bp, bb, r4) = parse_block r in (ECallB (id, Nil, bp, bb), r4)
@@ -6529,7 +6539,7 @@ and parse_primary = fn toks ->
            (if starts_block r2 then
               let (bp, bb, r4) = parse_block r2 in (ECallB (id, es, bp, bb), r4)
             else (ECall (id, es), r2))
-         else (enc_pseudo_var_at id (tok_line r), r))
+         else pseudo_var_fsl id (tok_line r) r)
   | Cons (TP p, r) ->
     if str_eq p "(s" then lit_fsl_wrap (
       // a desugared string literal: ("" + seg + ...) with a marked opener
@@ -6829,6 +6839,12 @@ and lit_folded = fn (e: Expr) ->
       (str_len nm > 11 && str_eq (substring nm 0 11) "__lit_denc~") -> lit_folded x
   | _ -> false
 // the __lit_fsl marker: the magic comment of the file being PARSED
+// a pseudo-variable, and `__FILE__` as the string literal it is: frozen or
+// not by the file's frozen_string_literal comment, which outranks the
+// command line (bootstraptest's test_syntax asks both ways)
+and pseudo_var_fsl = fn (id: str) -> fn (line: int) -> fn r ->
+  if str_eq id "__FILE__" then lit_fsl_wrap (enc_pseudo_var_at id line, r)
+  else (enc_pseudo_var_at id line, r)
 and lit_fsl_wrap = fn (pr: (Expr * Tok list)) ->
   match pr with
   | (e9, r9) ->
@@ -6884,6 +6900,9 @@ and parse_hash_items = fn toks -> fn (acc: Expr list) ->
        | _ ->
          let (inner, r1) = parse_expr r0 in
          hash_items_sep r1 (Cons (EKwSplat inner, Cons (EKwSplat inner, acc))))
+    // (a single splat is no element of a hash: `{*0}`)
+    else if str_eq dsp "*" || str_eq dsp " *" then
+      (let _ = syn_refuse "unexpected *, expecting '}' or a key in the hash literal" in parse_hash_items_kv toks acc)
     else parse_hash_items_kv toks acc
   | _ -> parse_hash_items_kv toks acc
 
@@ -8112,8 +8131,13 @@ and parse_x_group = fn toks -> fn (acc: Expr list) ->
       // continuation line.
       (match skip_nls r2 with
        // `(e,)` — a trailing comma inside the group
+       // (...is an implicit rest, so with a splat already there it is two:
+       //  `v0,(*,v1,) = 0`, ruby's "multiple splats")
        | Cons (TP rp, r3) ->
-         if str_eq rp ")" then (rev_app (Cons (t, acc)) Nil, r3)
+         if str_eq rp ")" then
+           (let rec has_splat = fn (xs: Expr list) -> (match xs with Nil -> false | Cons (ESplat _, _) -> true | Cons (_, t9) -> has_splat t9) in
+            let _ = (if has_splat (Cons (t, acc)) then syn_refuse "unexpected ')' resulting in multiple splats in multiple assignment" else ()) in
+            (rev_app (Cons (t, acc)) Nil, r3))
          else parse_x_group (skip_nls r2) (Cons (t, acc))
        | _ -> parse_x_group (skip_nls r2) (Cons (t, acc)))
     else if str_eq p ")" then (rev_app (Cons (t, acc)) Nil, r2)

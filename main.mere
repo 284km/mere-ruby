@@ -826,6 +826,7 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
   | VBind id -> let k = id * 8 + 5 in
                 (if map_has live k then ()
                  else let _ = map_set live k VNil in
+                      let _ = (if map_len bind_yblk > 0 && map_has bind_yblk id then gc_mark_val live (VProc (map_get bind_yblk id)) else ()) in
                       (if map_has bind_store (str_of_int id)
                        then gc_mark_env live (map_get bind_store (str_of_int id))
                        else ()))
@@ -3314,6 +3315,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       let _ = map_set bind_store (str_of_int id) (bnd_live env) in
       // where it was made, for #source_location
       let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
+      // (...and the block the method was given, which a `yield` evaluated
+      //  through the binding reaches: bootstraptest's test_proc [Bug #5634])
+      let _ = (match blk with
+               | (true, _, _, _) ->
+                 (let pid = (proc_next ()) in
+                  let _ = store_proc (str_of_int pid) blk in
+                  map_set bind_yblk id pid)
+               | _ -> ()) in
       VBind id
     // paren-less Kernel#rand / gets / readline / readlines (`line = gets`).
     else if (str_len name == 6 && str_eq name "caller") && (if map_has meths name then false else true) then
@@ -4149,6 +4158,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EMethod (recv_e, name, Nil) when str_len name > 5 && str_eq (substring name 0 5) "__ln~" ->
     (let v9 = eval_e env world blk recv_e in
      let _ = cur_line_set (int_of_str (substring name 5 (str_len name))) in v9)
+  // a `/.../o` site: built ONCE, its pieces evaluated only then (rx_once_eval)
+  | EMethod (recv_e, name, arges) when str_len name == 7 && str_eq name "__regex" && rx_once_gate arges ->
+    rx_once_eval env world blk recv_e arges
   | EMethod (recv_e, name, arges) when str_len name == 7 && str_eq name "__regex" && rx_is_chain recv_e ->
     (let av9 = eval_args env world blk arges in
      let fl9 = (match av9 with Cons (VStr f9, _) -> sget f9 | _ -> "") in
@@ -4591,7 +4603,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | VSym sv ->
             let r = rx_do_match world pat pfl (sym_bytes sv) (sym_enc_name sv) in
             let _ = set_named_caps env pat 0 0 in r
-          | _ -> VNil)
+          | VNil -> VNil
+          // (anything else through #to_str, or ruby's TypeError -- as the
+          //  Regexp#=~ arm of a non-literal receiver does)
+          | _ ->
+            (match conv_try env world vb "to_str" with
+             | VStr sv ->
+               (let r = rx_do_match world pat pfl (sget sv) (senc_get sv) in
+                let _ = set_named_caps env pat 0 0 in r)
+             | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name vb ++ " into String")))
        | _ -> VNil)
     else
     // an object whose class defines the operator dispatches to it.
@@ -5161,7 +5181,14 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
                      | VStr _ -> raise_exc world "TypeError" "type mismatch: String given"
                      | VObj _ -> invoke_val_c env world blk vb "=~" (Cons (mkstr sv, Nil)) false
                      | _ -> VNil)
-       | VRegex (p, pf, _) -> (match vb with VStr sv -> rx_do_match world p pf (sget sv) (senc_get sv) | VSym sv -> rx_do_match world p pf (sym_bytes sv) (sym_enc_name sv) | _ -> VNil)
+       | VRegex (p, pf, _) -> (match vb with VStr sv -> rx_do_match world p pf (sget sv) (senc_get sv) | VSym sv -> rx_do_match world p pf (sym_bytes sv) (sym_enc_name sv)
+                               | VNil -> VNil
+                               // (anything else is a String through #to_str, or
+                               //  ruby's TypeError: minitest's assert_match
+                               //  with an object that answers to_str)
+                               | _ -> (match conv_try env world vb "to_str" with
+                                       | VStr sv -> rx_do_match world p pf (sget sv) (senc_get sv)
+                                       | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name vb ++ " into String")))
        // (Object#=~ is gone since ruby 3.2: a plain object that answers
        //  neither =~ nor method_missing is the NoMethodError test_pathname's
        //  test_matchop asks for, as `!~` below already says)
@@ -7895,7 +7922,10 @@ and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
     // method that merely yielded the block. Falls back to a plain return if
     // that frame is unknown or already gone (a proc whose home has returned).
     // __fid lives in the defining method's frame, so read it through the chain.
-    let home = (if lv_has cenv "__fid" then (match lv_get cenv "__fid" with VInt t -> t | _ -> 0) else 0) in
+    let home = (if lv_has cenv "__fid" then (match lv_get cenv "__fid" with VInt t -> t | _ -> 0)
+                // (written in a class body: the frame its `class` ran in)
+                else if lv_has cenv "__ret_home" then (match lv_get cenv "__ret_home" with VInt t -> t | _ -> 0)
+                else 0) in
     // (no method around it, inside a class or module body: there is nothing
     //  to return from -- only the top level's own return ends the script)
     if home == 0 && (if str_eq (cur_lex ()) "" then false else true) then
@@ -23726,6 +23756,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if fd == 0 && stdin_read_name name then stdin_io_call env world blk recv name args
        // ...and the other two were never readable
        else if (fd == 1 || fd == 2) && stdin_read_name name then raise_exc world "IOError" "not opened for reading"
+       // ...and standard INPUT's output methods are IO's, through its #write:
+       // a refusal while it reads, the reopened stream's descriptor once
+       // IO#reopen made it writable (bootstraptest's test_io: they went to
+       // standard output)
+       else if fd == 0 && ((str_len name == 4 && str_eq name "puts") || (str_len name == 5 && str_eq name "print")
+                           || (str_len name == 6 && str_eq name "printf") || (str_len name == 4 && str_eq name "putc")) then
+         (if str_eq name "printf" then
+            (match args with
+             | Cons (f9, r9) -> invoke_val_c env world blk recv "__io_printf" (Cons (f9, Cons (arr_new r9, Nil))) false
+             | Nil -> VNil)
+          else if str_eq name "putc" then invoke_val_c env world blk recv "__io_putc" args false
+          else invoke_val_c env world blk recv ("__io_" ++ name) (Cons (arr_new args, Nil)) false)
        // ⚠ STDOUT.puts / STDERR.puts write to THAT stream, not through $stdout
        //   / $stderr: the formatting helpers are Kernel#puts's, which ask the
        //   global, so the write is marked direct while they run (io_std_direct)
@@ -27419,6 +27461,8 @@ and static_why_expr = fn (e: Expr) -> fn (indef: bool) ->
   | ECall (_, args) -> static_why_exprs args indef
   | EMethod (rc, _, args) -> sw_first (static_why_expr rc indef) (fn (u: unit) -> static_why_exprs args indef)
   | EBin (_, a, b2) -> sw_first (static_why_expr a indef) (fn (u: unit) -> static_why_expr b2 indef)
+  // (a range's ends: `0..$1=1` -- bootstraptest's test_syntax)
+  | ERange (a, b2, _) -> sw_first (static_why_expr a indef) (fn (u: unit) -> static_why_expr b2 indef)
   | EUn (_, a) -> static_why_expr a indef
   | EArr es -> static_why_exprs es indef
   | EHsh es -> static_why_exprs es indef
@@ -27821,6 +27865,29 @@ and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) 
 // yield and block_given? inside the block read the frame, not this.
 and blk_noblk = fn b ->
   match b with (_, _, _, e9) -> (false, (Nil : str list), (Nil : Stmt list), e9)
+// A `/.../o` site evaluates its pieces only the first time: afterwards the
+// cache answers before they run. A thread that arrives while another is
+// still building it waits for that one and takes its result, as ruby's once
+// does (bootstraptest's test_thread: the second thread's interpolation would
+// have slept two seconds). The builder's own evaluation passes the gate.
+and rx_once_gate = fn (arges: Expr list) ->
+  let k = rx_once_key arges in
+  (if str_eq k "" then false else true)
+  && (if map_len rx_once_busy > 0 && map_has rx_once_busy k && map_get rx_once_busy k == sch_me () then false else true)
+and rx_once_eval = fn env -> fn world -> fn blk -> fn (recv_e: Expr) -> fn (arges: Expr list) ->
+  let k = rx_once_key arges in
+  let rec wait = fn (u: unit) ->
+    (if map_has rx_once k then ()
+     else if map_has rx_once_busy k then (let _ = sch_pass world in wait ())
+     else ()) in
+  let _ = wait () in
+  if map_has rx_once k then map_get rx_once k
+  else
+    (let _ = map_set rx_once_busy k (sch_me ()) in
+     let v = try_or_msg (fn (u: unit) -> eval_e env world blk (EMethod (recv_e, "__regex", arges)))
+               (fn (m: str) -> (let _ = map_delete rx_once_busy k in fail m)) in
+     let _ = map_delete rx_once_busy k in
+     v)
 and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
   match cur with
   | (true, _, _, _) ->
@@ -45350,6 +45417,10 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
      let _ = coding_refuse world src full in
      let cod = src_coding src in
      let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
+     // (...and its frozen_string_literal comment, read while it parses: the
+     //  literals -- and __FILE__ -- carry it, as a required file's do)
+     let savedfsl9 = (if map_has fsl_ctx "v" then map_get fsl_ctx "v" else "") in
+     let _ = map_set fsl_ctx "v" (src_fsl src) in
      // (a SCRIPT_LINES__ Hash at the top level is given every loaded file's
      //  lines, in the file's encoding -- what a debugger reads, note 446)
      let _ = (if map_has consts "SCRIPT_LINES__" then
@@ -45375,9 +45446,11 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
                  let r = parse_stmts toks Nil in
                  let _ = (match r with (pg9, _) -> uv_program pg9 (parse_time_file ()) false) in
                  let _ = (match r with (pg9, _) -> if cb_ret_prog pg9 then syn_refuse "Invalid return in class/module body" else ()) in
+                 let _ = (match r with (pg9, _) -> yield_refuse_file pg9) in
                  let _ = map_set pok "y" 1 in r)
               (Nil, Nil) in
      let _ = map_set load_ctx "parsing" (mkstr "") in
+     let _ = map_set fsl_ctx "v" savedfsl9 in
      let _ = (if map_has pok "y" then ()
               else (let _ = (if map_has prim_missing "f" then () else map_set prim_missing "f" (mkstr full)) in
                     let _ = map_set load_ctx "coding" savedc in
@@ -50352,6 +50425,10 @@ and fb_tl_base = fn world -> fn (tid: int) -> fn (name: str) ->
                     || (str_len name == 4 && str_eq name "keys") || (str_len name == 4 && str_eq name "key?")
                     || (str_len name == 5 && str_eq name "fetch") in
   let running = (match (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) with VObj t -> t == tid | _ -> false) in
+  // (the main thread's root fiber is root from the start: unbooted, its
+  //  index read as some fiber's once a second thread existed, and the
+  //  locals set before that were not found -- bootstraptest's test_thread)
+  let _ = fb_boot () in
   let i = fb_cur () in
   if fiber_local && running && (if fb_is_root i then false else true)
   then (match fb_obj_for world i with VObj o -> str_of_int o | _ -> str_of_int tid)
@@ -53238,6 +53315,7 @@ and register_class_sng_in = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let scope = (if str_eq lex "" then cls else lex ++ "::" ++ cls) in
   let cenv = map_new () in
   let _ = map_set cenv "self" (VClass cls) in
+  let _ = cls_home_take cenv in
   let _ = map_set cenv "__cscope" (mkstr scope) in
   let _ = map_set cenv "__cref" (mkstr scope) in
   // A `def` in the body records cur_lex () as its cref (register_class_v), and
@@ -53311,6 +53389,22 @@ and class_end_line = fn (body: Stmt list) ->
   match body with
   | Cons (SLineQ n, _) when n < 0 -> 0 - n
   | _ -> cur_line ()
+// the frame a proc written in a class body returns from: the method or lambda
+// the `class` statement runs in. A body is no frame of its own and its env
+// does not continue the enclosing chain, so it is handed over through a
+// one-shot slot -- set at the statement, taken when the body's env is made.
+// (bootstraptest's test_proc: `lambda { class A; proc { return :ng }.call;
+// end }.call` returns from the lambda; it was "unexpected return")
+and cls_home_note = fn env ->
+  let h = (if lv_has env "__fid" then (match lv_get env "__fid" with VInt t -> t | _ -> 0)
+           else if lv_has env "__ret_home" then (match lv_get env "__ret_home" with VInt t -> t | _ -> 0)
+           else 0) in
+  if h > 0 then map_set cls_ret_home 0 h
+  else if map_len cls_ret_home > 0 then map_delete cls_ret_home 0 else ()
+and cls_home_take = fn cenv ->
+  if map_len cls_ret_home > 0
+  then (let _ = map_set cenv "__ret_home" (VInt (map_get cls_ret_home 0)) in map_delete cls_ret_home 0)
+  else ()
 and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   // ruby's TracePoint(:class) fires when a class or module body is ENTERED --
   // zeitwerk watches for exactly that to notice an explicit namespace. The
@@ -53328,6 +53422,7 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let saved = map_copy ref_active in
   let cenv = map_new () in
   let _ = map_set cenv "self" (VClass cls) in
+  let _ = cls_home_take cenv in
   // a literal class body IS the lexical scope for the constants/classes it
   // defines; __cscope names that scope (a class_eval-style block overrides it
   // via register_class_blk). __cref makes blocks created in the body capture
@@ -53705,6 +53800,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
            // resolves against the module that encloses it.
            (let tg9 = sng_target_cls world cenv csuper cls in
             let _ = meta_open world tg9 in
+            let _ = cls_home_note cenv in
             register_class_sng_in world tg9 cbody cscope)
          else
          // `class ::C` inside a class body is a TOP-LEVEL constant (not nested
@@ -53771,6 +53867,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
             let saved_nest = cur_nest () in
             let _ = push_nest anon9 in
             let _ = set_lex anon9 in
+            let _ = cls_home_note cenv in
             let r = register_class world anon9 cbody in
             let _ = set_lex saved_lex in
             let _ = set_nest saved_nest in
@@ -53797,6 +53894,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let saved_nest = cur_nest () in
          let _ = push_nest full in
          let _ = set_lex full in
+         let _ = cls_home_note cenv in
          let r = register_class world full cbody in
          let _ = set_lex saved_lex in
          let _ = set_nest saved_nest in
@@ -53834,6 +53932,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                  let _ = call_inherited world cenv sc internal in
                  let saved_lex = cur_lex () in
                  let _ = set_lex internal in
+                 let _ = cls_home_note cenv in
                  let r = register_class world internal cbody in
                  let _ = set_lex saved_lex in
                  r)
@@ -53844,6 +53943,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
               let _ = if was_new && (if str_eq sc full then false else true) then call_inherited world cenv sc full else () in
               let saved_lex = cur_lex () in
               let _ = set_lex full in
+              let _ = cls_home_note cenv in
               let r = register_class world full cbody in
               let _ = set_lex saved_lex in
               r
@@ -54829,6 +54929,17 @@ and req_circular_warn = fn world -> fn (full: str) ->
                   ++ full ++ "\n" ++ fr (caller_frames 0) "" in
         warning_emit world msg VNil)
      else ())
+// the require lock: is another thread loading `full` under the name p0 now?
+and req_other_loading = fn (p0: str) -> fn (full: str) ->
+  map_has req_loading p0 && str_eq (map_get req_loading p0) full
+  && map_has req_loading_thr p0 && (if map_get req_loading_thr p0 == sch_me () then false else true)
+// ...and the wait for it: short timed sleeps, so the waiter reads as stopped
+// (Thread#stop?) the way ruby's blocked one does -- test_require's
+// race_exception has the loader wait for exactly that
+and req_wait_other = fn world -> fn (p0: str) -> fn (full: str) ->
+  if req_other_loading p0 full
+  then (let _ = sch_block world 1 0 (sch_now () + 1000000) in req_wait_other world p0 full)
+  else ()
 and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) ->
   // (`require "etc.so"` -- tmpdir's -- is the shipped etc, one feature with
   //  `require "etc"`)
@@ -54958,7 +55069,14 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      // $LOADED_FEATURES (bug17885 -- b/b.rb on $: and a/b.rb by
      // require_relative ran one body twice). Asked through the name it was
      // loaded under, so a $LOADED_FEATURES the program rewrote still decides.
-     if feature_loaded full then (let _ = req_circular_warn world full in FNext (VBool false)) else
+     // (...and one ANOTHER thread is loading now is waited for: ruby's
+     //  require lock. The second thread found the feature marked and went on
+     //  before the first had defined anything -- bootstraptest's test_load.)
+     // (...and asked again once it is done: a load that raised was taken
+     //  back out, and this thread loads the file itself)
+     if feature_loaded full && req_other_loading p0 full then
+       (let _ = req_wait_other world p0 full in do_require env world blk rel p0)
+     else if feature_loaded full then (let _ = req_circular_warn world full in FNext (VBool false)) else
      // (...and a feature a file PROVIDED by name -- `$" << "target.rb"` in
      //  a required file -- is loaded as far as `require "target"` is
      //  concerned, wherever a target.rb would be found)
@@ -55062,6 +55180,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                    let _ = parse_line_reset (count_nls tk) in
                    let r = parse_stmts tk Nil in
                    let _ = (match r with (pg9, _) -> if cb_ret_prog pg9 then syn_refuse "Invalid return in class/module body" else ()) in
+                   let _ = (match r with (pg9, _) -> yield_refuse_file pg9) in
                    let _ = map_set pok "y" 1 in r)
                 (Nil, Nil) in
        let _ = map_set load_ctx "parsing" (mkstr "") in
@@ -55703,8 +55822,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      | VFlt _ -> (let _ = raise_exc world "TypeError" "can't define singleton" in FNext VNil)
      | VBig _ -> (let _ = raise_exc world "TypeError" "can't define singleton" in FNext VNil)
      | VSym _ -> (let _ = raise_exc world "TypeError" "can't define singleton" in FNext VNil)
-     | VBool b -> register_class_lex world (if b then "TrueClass" else "FalseClass") body
-     | VNil -> register_class_lex world "NilClass" body
+     | VBool b -> (let _ = cls_home_note env in register_class_lex world (if b then "TrueClass" else "FalseClass") body)
+     | VNil -> (let _ = cls_home_note env in register_class_lex world "NilClass" body)
      // `class << obj` for any other receiver. register_class_lex set the
      // lexical scope to the SINGLETON's own name, so a bare constant in the
      // body was looked up under "(sng:111)" and then along that singleton's
@@ -55712,8 +55831,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      // that singleton's ancestors DO include the enclosing module, so the
      // constants were found by the second route. The body's cref is the scope
      // that encloses it, exactly as for `class << self`.
-     | _ -> with_env_nest env (fn (u: unit) -> register_class_sng_in world (sng_cls_of_val world recv "Object") body
-              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ())))
+     | _ -> with_env_nest env (fn (u: unit) -> (let _ = cls_home_note env in register_class_sng_in world (sng_cls_of_val world recv "Object") body
+              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ()))))
   | SClass (name0, super0, body) ->
     let (meths, sup, ocls, ivars) = world in
     // a leading `::` (class ::C) is a top-level constant; at the top level the
@@ -55757,8 +55876,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        // scope its `def` was written in), falling back to the lexical stack.
        (let tg9 = sng_target_cls world env super0 "Object" in
         let _ = meta_open world tg9 in
-        with_env_nest env (fn (u: unit) -> register_class_sng_in world tg9 body
-              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ()))))
+        with_env_nest env (fn (u: unit) -> (let _ = cls_home_note env in register_class_sng_in world tg9 body
+              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ())))))
     // `class Foo < Class`: Class has no subclasses
     else if str_eq super0 "Class" then
       (let _ = raise_exc world "TypeError" "can't make subclass of Class" in FNext VNil)
@@ -55889,7 +56008,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        let saved_lex = cur_lex () in
        let _ = set_lex internal in
        // restored even when the body raises (see register_class_lex)
-       let r = try_or (fn (u: unit) -> register_class world internal body) (FRaise VNil) in
+       let r = try_or (fn (u: unit) -> (let _ = cls_home_note env in register_class world internal body)) (FRaise VNil) in
        let _ = set_lex saved_lex in
        let r = (match r with
                 | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
@@ -55916,7 +56035,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let saved_nest = cur_nest () in
     let _ = push_nest name in
     // restored even when the body raises (see register_class_lex)
-    let r = try_or (fn (u: unit) -> register_class world name body) (FRaise VNil) in
+    let r = try_or (fn (u: unit) -> (let _ = cls_home_note env in register_class world name body)) (FRaise VNil) in
     let _ = set_lex saved_lex in
     let _ = set_nest saved_nest in
     let r = (match r with
@@ -56947,6 +57066,31 @@ and bare_yield_exprs = fn (es: Expr list) ->
   match es with
   | Nil -> false
   | Cons (e, rest) -> bare_yield_expr e || bare_yield_exprs rest
+// ...and a `yield` whose scope is a class, module or singleton-class body is
+// refused wherever that body is -- inside a def too: `def m; class << self;
+// yield; end; end` (bootstraptest's test_jump). The walk reaches the bodies
+// through the statements that hold them; a partial walk only leaves one
+// unrefused.
+and class_yield_stmts = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (s, rest) -> class_yield_stmt s || class_yield_stmts rest
+and class_yield_stmt = fn (s: Stmt) ->
+  match s with
+  | SClass (_, _, b) -> bare_yield_stmts b || class_yield_stmts b
+  | SClassE (_, _, b) -> bare_yield_stmts b || class_yield_stmts b
+  | SSingletonE (_, b) -> bare_yield_stmts b || class_yield_stmts b
+  | SDef (_, _, _, b) -> class_yield_stmts b
+  | SIf (clauses, els) ->
+    (let rec cl = fn (xs: (Expr * Stmt list) list) -> (match xs with Nil -> false | Cons ((_, b), t) -> class_yield_stmts b || cl t) in
+     cl clauses || class_yield_stmts els)
+  | SBegin (b, _, el, en) -> class_yield_stmts b || class_yield_stmts el || class_yield_stmts en
+  | SWhile (_, b) -> class_yield_stmts b
+  | _ -> false
+// a file's yields: one outside any method, or in a class body, is ruby's
+// parse-time "Invalid yield" (a file's top level is no method)
+and yield_refuse_file = fn (pg: Stmt list) ->
+  if class_yield_stmts pg || bare_yield_stmts pg then syn_refuse "Invalid yield" else ()
 
 // does any def/class body contain a directly-invalid retry/redo?
 // (Ruby rejects them at parse time; blocks and loops are legal homes.)
@@ -57040,6 +57184,8 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
      | Cons (_, Cons (_, Cons (VStr f9, r9))) ->
        // (a file name in another encoding keeps it: `__FILE__` answers the
        //  name as given, see file_name_enc)
+       // (...and an EMPTY name is the name too: a SyntaxError's message
+       //  starts `:0:` for `eval(code, nil, '', 0)`, as ruby's does)
        (let e9 = enc_canon_name (senc_get f9) in
         let _ = (if str_eq e9 "UTF-8" || str_eq e9 "US-ASCII" || enc_all7 (sget f9) then () else map_set file_name_enc (sget f9) e9) in
         (sget f9, (match r9 with Cons (VInt l9, _) -> l9 | _ -> 1)))
@@ -57078,6 +57224,10 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     //  new map in the default region and a parent link, per eval, for good --
     //  1.4 KB an `eval("1 + 1")`, note 441)
     let fresh9 = (match rest with Cons (VBind _, _) -> false | _ -> true) in
+    // (a binding made where a block was given yields to that block)
+    let blk = (match rest with
+               | Cons (VBind bid, _) when map_len bind_yblk > 0 && map_has bind_yblk bid -> proc_get (str_of_int (map_get bind_yblk bid))
+               | _ -> blk) in
     let eenv = (match rest with Cons (VBind bid, _) -> map_get bind_store (str_of_int bid) | _ -> blk_env_get env) in
     // (given back however the eval ends: a SyntaxError or an exception leaves
     //  it as a Mere failure, past the line after it -- a pooled env kept per
@@ -57197,7 +57347,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
           //  ISeq.compile's check puts in front, which it starts at line - 1
           //  to pay for)
           let el9 = (if str_contains code "BEGIN\{throw :__isq_ok, :ok}" then eline9 + 1 else eline9) in
-          let msg = (if str_len why9 > 0 then (if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int (if sl9 > 0 && str_len why0 == 0 then sl9 else el9) ++ ": " ++ why9 else try_or (fn (u: unit) ->
+          let msg = (if str_len why9 > 0 then efile9 ++ ":" ++ str_of_int (if sl9 > 0 && str_len why0 == 0 then sl9 else el9) ++ ": " ++ why9 else try_or (fn (u: unit) ->
             let toks2 = number_nls code (lex_src code) in
             // (ending in a newline, as every prism message does: a message
             //  piped on is a complete line)
@@ -57223,7 +57373,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
                                           if i8 >= 0 then substring m8 (i8 + str_len pre9) (str_len m8) else m8) in
                               let _ = map_set syn_why_ln "c" c9 in
                               let _ = map_set syn_why_ln "w" (str_len jn9) in
-                              (if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int (jl9 + eline9 - 1) ++ ": "
+                              efile9 ++ ":" ++ str_of_int (jl9 + eline9 - 1) ++ ": "
                               ++ syn_frame code (jl9 - 1) (jl9 + eline9 - 1) why8))
                      else (let _ = (if map_has syn_why_ln "jl" then map_delete syn_why_ln "jl" else ()) in msg)) in
           // (a source that ended inside something -- `def m` with no `end` --
@@ -57245,7 +57395,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
                                                             let t9 = number_nls (code ++ "\nend") (tail9 (lex_src code)) in
                                                             let _ = parse_stmts t9 Nil in true)) false))
                             | _ -> false)
-                     then (if str_eq efile9 "" then "(eval)" else efile9) ++ ":"
+                     then efile9 ++ ":"
                           // (framed as prism does: a mark just past the last
                           //  line that has anything on it -- note 445; the
                           //  head names that line too)
@@ -57272,7 +57422,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
                            let k9 = nlc 0 0 in
                            let _ = map_set syn_why_ln "c" (e9 - b9) in
                            let _ = map_set syn_why_ln "w" 1 in
-                           (if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int (k9 + eline9) ++ ": "
+                           efile9 ++ ":" ++ str_of_int (k9 + eline9) ++ ": "
                            ++ syn_frame code k9 (k9 + eline9) "unexpected end-of-input; expecting a message to send to the receiver")
                         else msg)
                      else msg) in
@@ -57287,7 +57437,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
           raise_exc_iv world "SyntaxError" msg
             (Cons (("__path", (if str_eq efile9 "" then VNil else mkstr efile9)), Nil)))
        else if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (eval_flow_msg code efile9 eline9 (invalid_flow_word_in_defs prog2))
-       else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
+       else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" (efile9 ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
        else if (if str_eq (static_why_stmts prog2 false) "" then false else true) then
          raise_exc world "SyntaxError" (syn_static_msg code efile9 eline9 (static_why_stmts prog2 false))
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
@@ -57299,12 +57449,15 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else (let _ = tp_script_compiled world code efile9 eline9 in eval_run_bound rest eenv world blk prog2 efile9 eline9)
      | _ ->
        if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (eval_flow_msg code efile9 eline9 (invalid_flow_word_in_defs prog2))
-       else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
+       else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" (efile9 ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
        else if (if str_eq (static_why_stmts prog2 false) "" then false else true) then
          raise_exc world "SyntaxError" (syn_static_msg code efile9 eline9 (static_why_stmts prog2 false))
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
-       else if bare_yield_stmts prog2 then raise_exc world "SyntaxError" "Invalid yield"
+       // (a yield at the eval's own top level is the method's when the code
+       //  runs in one -- `binding.eval("yield")` of a method's binding)
+       else if class_yield_stmts prog2 || (bare_yield_stmts prog2 && (if lv_has eenv "__meth" then false else true)) then
+         raise_exc world "SyntaxError" "Invalid yield"
        else if (let _ = (if map_has num_misuse_note "why" then (let _ = map_delete num_misuse_note "why" in ()) else ()) in
                 numbered_misuse_stmts prog2) then
          raise_exc world "SyntaxError"
@@ -57341,7 +57494,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
 and eval_flow_msg = fn (code: str) -> fn (efile9: str) -> fn (eline9: int) -> fn (why: str) ->
   if str_eq why "Invalid return in class/module body" then syn_static_msg code efile9 eline9 why else why
 and syn_static_msg = fn (code: str) -> fn (efile9: str) -> fn (eline9: int) -> fn (why: str) ->
-  let fl9 = (if str_eq efile9 "" then "(eval)" else efile9) in
+  let fl9 = efile9 in
   if str_eq why "class/module name must be CONSTANT" && map_has syn_junk_name "c" then
     (let n9 = map_get syn_junk_name "c" in
      let _ = map_delete syn_junk_name "c" in
