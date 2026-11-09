@@ -2050,10 +2050,45 @@ let rec strs_same = fn (a: str list) -> fn (b: str list) ->
   match a with
   | Nil -> (match b with Nil -> true | _ -> false)
   | Cons (x, xs) -> (match b with Cons (y, ys) -> str_eq x y && strs_same xs ys | Nil -> false);
-let mro_bump = fn () ->
-  let n = (if map_has mro_gen 0 then map_get mro_gen 0 else 0) in
-  map_set mro_gen 0 (n + 1);
+// Anonymous owners invalidate locally until another receiver has cached a
+// dependency on them. Epochs come from one monotonic counter, so max(global,
+// local) remains a collision-free token for the receiver's caches.
+let mro_local_epoch = map_new ();
+let mro_external = map_new ();
+let mro_lookup_root = map_new ();
+let _ = map_compact mro_local_epoch;
+let _ = map_compact mro_external;
+let _ = map_compact mro_lookup_root;
+let rec mro_local_name = fn (c: str) ->
+  if str_len c > 6 && str_starts_with c "(sng:" then mro_local_name (substring c 5 (str_len c - 1))
+  else str_starts_with c "AnonClass_" || str_starts_with c "AnonModule_"
+       || str_starts_with c "Struct_" || str_starts_with c "Refine_";
+let mro_next_epoch = fn () ->
+  let n = (if map_has mro_gen 2 then map_get mro_gen 2 else 0) + 1 in
+  let _ = map_set mro_gen 2 n in n;
+let mro_bump = fn () -> map_set mro_gen 0 (mro_next_epoch ());
 let mro_now = fn () -> if map_has mro_gen 0 then map_get mro_gen 0 else 0;
+let mro_now_class = fn (c: str) ->
+  let all = mro_now () in
+  let own = (if map_has mro_local_epoch c then map_get mro_local_epoch c else 0) in
+  if own > all then own else all;
+let mro_observe = fn (c: str) ->
+  if mro_local_name c &&
+     (if map_has mro_lookup_root 0 then (if str_eq (map_get mro_lookup_root 0) c then false else true) else true)
+  then (if map_has mro_external c then () else map_set mro_external c 1) else ();
+let mro_cached_dependency = fn (c: str) ->
+  if map_has mro_lookup_root 0 then mro_observe c else ();
+let mro_lookup_enter = fn (c: str) ->
+  if map_has mro_lookup_root 0 then false
+  else (let _ = map_set mro_lookup_root 0 c in true);
+let mro_lookup_leave = fn (owned: bool) ->
+  if owned then map_delete mro_lookup_root 0 else ();
+let mro_bump_class = fn (c: str) ->
+  // If a pure lookup fails, its armed context forces subsequent mutations
+  // to invalidate globally rather than relying on partial dependencies.
+  if map_has mro_lookup_root 0 || (if mro_local_name c then false else true) || map_has mro_external c
+  then mro_bump ()
+  else map_set mro_local_epoch c (mro_next_epoch ());
 // the generation at which Integer's operators were last found to be the
 // builtins (slot 0), the answer (slot 1), and whether there is one (slot 2):
 // see int_ops_plain
@@ -4336,7 +4371,7 @@ let prim_copy_q = fn (c: str) ->
   map_len prim_copy > 0 && map_has prim_copy c
   && (let b = map_get prim_copy c in str_eq b "Queue" || str_eq b "SizedQueue");
 let set_sup = fn tbl -> fn (k: str) -> fn (v: str) ->
-  let _ = mro_bump () in
+  let _ = mro_bump_class k in
   let b = prim_base_name v in
   let _ = (if str_len b > 0 then map_set prim_sub k b else ()) in
   map_set tbl k v;
@@ -4361,8 +4396,8 @@ let inc_keep = map_new ();
 // whose chain already held m2 does not add m2 there again (CRuby's
 // include propagation skips what the chain has); included first, it would
 let pre_excl = map_new ();
-let set_inc = fn (k: str) -> fn (v: str) -> let _ = class_sng_note k in let _ = mro_bump () in map_set includes k v;
-let set_pre = fn (k: str) -> fn (v: str) -> let _ = class_sng_note k in let _ = mro_bump () in map_set prepends k v;
+let set_inc = fn (k: str) -> fn (v: str) -> let _ = class_sng_note k in let _ = mro_bump_class k in map_set includes k v;
+let set_pre = fn (k: str) -> fn (v: str) -> let _ = class_sng_note k in let _ = mro_bump_class k in map_set prepends k v;
 // ⚠ AND THE SAME FOR THE METHOD TABLE AND ITS TOMBSTONES, for a reason the
 // three above did not have: `has_meth` MEMOISES the whole ancestor walk on
 // this generation, so a definition that does not bump it is a definition the
@@ -4457,7 +4492,8 @@ let struct_gen = map_new ();
 let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
   let _ = class_sng_method_note k in
   let _ = msnap_save tbl k in
-  let _ = mro_bump () in
+  let sep = str_index_of k "#" in
+  let _ = (if sep > 0 then mro_bump_class (substring k 0 sep) else mro_bump ()) in
   let _ = (if map_len undefs > 0 && map_has undefs k then del_undef k else ()) in
   // (...and a delegation to a builtin under this name: `alias to_f _to_f`
   //  then `def to_f` is the def, and the alias answered in its place)
@@ -4661,6 +4697,7 @@ let _ = map_compact bi_reg_r;  // (its own arena: gc_churn_bytes, note 270)
 let map_compact_big = fn m -> if map_bytes m > 262144 then map_compact m else ();
 let gc_churn_bytes = fn (u: unit) ->
   map_bytes mro_anc + map_bytes mro_mods + map_bytes hm_memo
+  + map_bytes mro_local_epoch + map_bytes mro_external + map_bytes mro_lookup_root
   + map_bytes prim_missing + map_bytes bi_reg_n + map_bytes bi_reg_r
   // ...and the method table: a `def` copies the body's AST in, and redefining
   // it (test_yield instance_evals thousands of generated definitions) leaves
@@ -4684,6 +4721,9 @@ let gc_churn_bytes = fn (u: unit) ->
   + map_bytes rx_gnums + map_bytes rx_gbodies
   + map_bytes arr_pending + map_bytes arr_vc + map_bytes arr_vc_ver + map_bytes arr_vc_len + map_bytes arr_vers + map_bytes lv_up + map_bytes lv_cap + map_bytes lv_capx;
 let gc_churn_compact = fn (u: unit) ->
+  let _ = map_compact_big mro_local_epoch in
+  let _ = map_compact_big mro_external in
+  let _ = map_compact_big mro_lookup_root in
   let _ = map_compact_big arr_pending in
   let _ = map_compact_big arr_vc in
   let _ = map_compact_big arr_vc_ver in
