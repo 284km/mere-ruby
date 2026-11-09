@@ -2608,3 +2608,65 @@ green). corpus/532 is the witness.
   files) against 8341bb4's binary: MATCH 7673 → 7730, no file lower
   (test_dir's test_symlink failed on the baseline's side, under load, as
   before).
+
+## 2026-11-09 (19): the rest of the top-level files -- a builtin iterator gets no frame block, a class's builtin alias ahead of a module's method, WeakMap is weak, the TRICK entries' syntax -- test/*.rb 435 → 458/478
+
+The rest of note 511's "test直下" after (18). corpus/533 is the witness.
+
+- **A builtin iterator was handed the frame's block** as the block its own
+  block ran under: `def f(ws) = ws.each(&:join); f([w]) { 1 }` called
+  `join` with f's block (open3's pipeline waited on that), and
+  `[1].map { |x, &b| b }` answered the frame's block where ruby says nil.
+  A user `yield` already passed no block there; the 24 builtin sites now
+  do the same (`blk_noblk`). yield and block_given? inside the block body
+  read the environment, not that argument. test_open3 25 → 30/31.
+- **A class's alias of a builtin ahead of a module's method**, the half
+  (18) left: `method(:name)` owns it by the class that made the alias
+  (`alias_owner`), and Method#call and the implicit-self call reach it by
+  name (`alias_first`). test_tsort 5 → 8/8.
+- **ObjectSpace::WeakMap is weak.** It was a Hash, so nothing it held was
+  ever collected and WeakRef#weakref_alive? was always true. The entries
+  live in the interpreter (`weak_k` / `weak_v` by entry number, found by
+  map id and key identity), which the collector does not mark: after
+  marking, `gc_weak_prune` drops an entry whose map, key or value was not
+  reached (the gc roots gate lists the two maps with that reason).
+  WeakKeyMap is no longer a WeakMap subclass -- ruby's superclass is
+  Object -- and keeps its Hash. test_weakref 3 → 5/5 (its 150,000-WeakRef
+  leak test runs inside the 60 s now).
+- **pp** (31 → 35/36): pp keeps the objects it is printing in
+  `Thread.current[:__recursive_key__][:inspect]`, the table ruby's own
+  #inspect consults, so an #inspect a pretty_print calls stops at them --
+  Array, Hash, Struct and plain objects read it once a program has
+  written that key (`insp_pp_held`). A singleton
+  #instance_variables_to_inspect wins over the Kernel default on a bare
+  call. Struct's own #members / #size / #to_a bound to a struct answer
+  from its member table, even when a member of that name replaced the
+  method (`Struct.new(:members, :class)`), and the Struct prelude reads
+  the names through `Struct.__members_of` for the same reason (no slower:
+  one dispatch, as the bare call was).
+- **TRICK** (17 → 22/22): a backslash at the end of a line inside a
+  double-quoted string is a continuation (it kept the newline -- 02-mame's
+  quine came out a different program); braces inside a %-literal in an
+  interpolation are text (`find_close_brace` skips `%@..@`, `%q(..)`;
+  `interp_close` now delegates to it); after `..` a local followed by ` -1`
+  is the subtraction (`lvt_prev_local` took the range's dot for a call's);
+  `x ||= v` as an expression declares x as the statement does; `[a] *
+  2000.0` truncates the count; a bare `select` with no arguments is
+  Kernel's ArgumentError where self is no Enumerable.
+- **Exception#==** follows exc_equal: an object of another class is asked
+  for its #exception, which must be of the receiver's class (a
+  SimpleDelegator equals the exception from both sides). The duplicate,
+  unreachable copy of the arm is gone. test_delegate 36 → 37/37.
+- RbConfig::MAKEFILE_CONFIG names sitedir / sitelibdir under site_ruby,
+  as configure writes them. test_rbconfig 4 → 6/6.
+- **Left** (none of them this stage's): test_pty 15 and extlibs' pty (a
+  pty: the runtime round); open3's capture3_flip -- the child mere-ruby's
+  write to a full non-blocking pipe raises EAGAIN where ruby waits, which
+  is Mere's print (the runtime round); extlibs' coverage and pp's
+  RubyVM::AbstractSyntaxTree (stage 10); tmpdir's Ractor.
+- **Checked**: corpus 557/557 both ways, 533 under GC_STRESS=50, the 13
+  gates; 207 unittest files (8470 tests) against 8341bb4's binary: MATCH
+  7942 → 8017. Two files read one lower and are the load's: test_method's
+  kwarg_eval_memory_leak (an RSS ratio, 1.24 against 1.2; the baseline
+  failed it the same way when run again) and test_pathname's EXTRA 1 (its
+  reference side).
