@@ -102,17 +102,18 @@ process family; these are single runs while other validation was active.
 
 | Operation | Wall seconds | Family peak KiB |
 | --- | ---: | ---: |
-| Load native large document | 20.148 | 583,616 |
-| Emit large document | 9.132 | 457,200 |
-| Load 4 MiB quoted scalar | 0.718 | 138,880 |
-| Store 1,000 keys and update | 38.469 | 453,536 |
-| 20 parser/visitor lifetimes | 1.241 | 139,632 |
-| 200 parser/visitor lifetimes | 6.874 | 166,304 |
+| Load native large document | 18.349 | 721,984 |
+| Emit large document | 10.607 | 466,288 |
+| Load 4 MiB quoted scalar | 0.733 | 149,648 |
+| Store 1,000 keys and update | 45.089 | 371,232 |
+| 20 parser/visitor lifetimes | 1.525 | 128,992 |
+| 200 parser/visitor lifetimes | 9.020 | 169,424 |
 
-Default-arena allocation totals were 45,414,672 and 50,788,112 bytes for
-20/200 lifetimes: growth 5,373,440 bytes, below the 8 MiB gate. The event-backend
+Default-arena allocation totals were 46,217,488 and 51,549,272 bytes for
+20/200 lifetimes: growth 5,331,784 bytes, below the 8 MiB gate. The event-backend
 graph gate measured 7.534/30.224 child user seconds for 8,000/32,000 nodes and
-passed its relative scaling bound. These numbers replace neither the earlier
+passed its relative scaling bound. The memory measurements use the binary with
+main `8fc6b70` and the Psych backend. These numbers replace neither the earlier
 implementation's timings nor a dedicated latency benchmark.
 
 The final Linux arm64 O2 binary also passes all 635 Psych tests, the event and
@@ -121,13 +122,13 @@ and a 512 MiB stack limit for the interpreter.
 
 | Operation | Wall seconds | Family peak KiB |
 | --- | ---: | ---: |
-| Load native large document | 8.666 | 606,908 |
-| Emit large document | 4.391 | 480,672 |
-| Load 4 MiB quoted scalar | 0.439 | 123,376 |
-| Store 1,000 keys and update | 21.536 | 404,176 |
-| 20 parser/visitor lifetimes | 0.540 | 90,344 |
-| 200 parser/visitor lifetimes | 3.094 | 104,556 |
+| Load native large document | 7.596 | 596,696 |
+| Emit large document | 3.891 | 404,032 |
+| Load 4 MiB quoted scalar | 0.442 | 149,416 |
+| Store 1,000 keys and update | 18.818 | 412,536 |
+| 20 parser/visitor lifetimes | 0.421 | 78,180 |
+| 200 parser/visitor lifetimes | 2.801 | 101,392 |
 
-Linux default-arena allocation totals were 45,294,184/50,526,208 bytes,
-a 5,232,024-byte increase. Six YAML corpus programs match the reference under
+Linux default-arena allocation totals were 46,098,984/51,323,720 bytes,
+a 5,224,736-byte increase. Six YAML corpus programs match the reference under
 GC stress every 50 allocations with hash indexing both enabled and disabled.
