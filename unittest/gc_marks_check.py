@@ -21,7 +21,6 @@ let check = fn (key: int) ->
   let fresh = (if map_has reference key then false else true) in
   let _ = ensure (gc_live_mark live key == fresh) in
   let _ = ensure (if gc_live_mark live key then false else true) in
-  let _ = gc_live_add live key in
   let _ = map_set reference key 1 in
   ensure (gc_live_has live key);
 let rec fill = fn (i: int) ->
@@ -42,7 +41,7 @@ let _ = check 60;
 let _ = ensure (gc_live_count live == map_len reference);
 let _ = ensure (map_len live < 1400);
 let _ = ensure (gc_live_count other == 0);
-let _ = gc_live_add other 30;
+let _ = ensure (gc_live_mark other 30);
 let _ = ensure (gc_live_count other == 1);
 let dense = map_new ();
 let rec kinds = fn (kind: int) ->
