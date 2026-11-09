@@ -472,6 +472,7 @@ let qv_drain = fn (u: unit) ->
   let _ = go 0 in
   vec_set qv_ctr 1 0;
 let arr_pending = map_new ();
+let _ = map_compact arr_pending; // Own resize storage so collection can reclaim it.
 let rec vec_tail_list = fn (v) -> fn (i: int) -> fn (acc: Val list) ->
   if i < 0 then acc else vec_tail_list v (i - 1) (Cons (vec_get v i, acc));
 // ⚠ AND SHIFTS ARE A COUNT, NOT A COPY. `shift` stored the rest of the list,
@@ -492,8 +493,11 @@ let arr_plen = map_new ();
 // alternates with a whole-array read takes it back instead of copying the
 // list into a new Vec every time (note 278 §4)
 let arr_vc = map_new ();
+let _ = map_compact arr_vc; // Own resize storage so collection can reclaim it.
 let arr_vc_ver = map_new ();
+let _ = map_compact arr_vc_ver; // Own resize storage so collection can reclaim it.
 let arr_vc_len = map_new ();
+let _ = map_compact arr_vc_len; // Own resize storage so collection can reclaim it.
 let rec list_drop_k = fn (xs: Val list) -> fn (k: int) ->
   if k <= 0 then xs else (match xs with Nil -> xs | Cons (_, t) -> list_drop_k t (k - 1));
 let arr_off_of = fn (id: int) -> (if map_len arr_off > 0 && map_has arr_off id then map_get arr_off id else 0);
@@ -549,6 +553,7 @@ let deref = fn (id: int) ->
   else (let o = arr_off_of id in
         if o == 0 then map_get arr_store id else list_drop_k (map_get arr_store id) o);
 let arr_vers = map_new ();
+let _ = map_compact arr_vers; // Own resize storage so collection can reclaim it.
 let arr_ver = fn (id: int) -> (if map_has arr_vers id then map_get arr_vers id else 0);
 // push without writing the map or the array: O(1) per element
 let rec vec_push_all = fn (v) -> fn (xs: Val list) ->
@@ -2070,7 +2075,8 @@ let hm_memo = map_new ();
 let _ = map_compact hm_memo;  // (its own arena: gc_churn_bytes, note 270)
 let hm_memo_gen = map_new ();
 
-let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
+let lv_up = map_new ();
+let _ = map_compact lv_up; // Own resize storage so collection can reclaim it.    // "<frame id>" -> that frame's parent env
 // THE CAPTURED FRAMES THAT HAVE LEFT THE STACK, by frame id (note 272). A
 // block's env or a method's frame that a proc captured is not given back to
 // the frame pool when its call ends (the proc reads and writes through it),
@@ -2080,11 +2086,13 @@ let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
 // is a lambda in its own frame, 69 KB per assertion. A collection marks the
 // envs it reaches (gc_mark_env) and gives the rest of these back.
 let lv_cap = map_new ();
+let _ = map_compact lv_cap; // Own resize storage so collection can reclaim it.
 // ...and the scope envs lv_child made (an eval's, an instance_exec's, a
 // class_exec body's) once their run is over, captured by a proc made in them:
 // their links go the same way, but they are not pool frames and are not
 // handed back to the pool (lv_child_done)
 let lv_capx = map_new ();
+let _ = map_compact lv_capx; // Own resize storage so collection can reclaim it.
 let lv_ctr = map_new ();   // "n" -> next frame id
 // the Range pairs being compared (rng_eq_w), to stop a recursive one
 let rng_eq_seen = map_new ();
@@ -2634,6 +2642,66 @@ let cur_file = fn () -> vec_get pos_names (vec_get cur_fm 0);
 // created as the call that takes it is evaluated.
 let proc_src = map_new ();
 let _ = map_compact proc_src;  // (its own arena from birth, compacted by the sweep: note 300)
+// Default source locations are shared by every Proc from the same site.
+// proc_src holds only explicit overrides; the per-Proc table stores one int.
+let proc_source_defaults = map_new ();
+let _ = map_compact proc_source_defaults;
+let proc_source_sites = map_new ();
+let proc_source_lines = map_new ();
+let proc_source_paths = map_new ();
+let proc_source_keys = map_new ();
+let proc_source_refs = map_new ();
+let proc_source_next = vec_new ();
+let _ = vec_push proc_source_next 0;
+let _ = map_compact proc_source_sites;
+let _ = map_compact proc_source_lines;
+let _ = map_compact proc_source_paths;
+let _ = map_compact proc_source_keys;
+let _ = map_compact proc_source_refs;
+let proc_source_key = fn (k: str) ->
+  let file = str_len k > 0 && str_eq (char_at k 0) "f" in
+  (int_of_str (if file then substring k 1 (str_len k) else k), file);
+let proc_source_has = fn (k: str) ->
+  map_has proc_src k || (let (id, _) = proc_source_key k in map_has proc_source_defaults id);
+let proc_source_get = fn (k: str) ->
+  if map_has proc_src k then map_get proc_src k
+  else (let (id, file) = proc_source_key k in
+        let site = map_get proc_source_defaults id in
+        if file then map_get proc_source_paths site else VInt (map_get proc_source_lines site));
+let proc_source_init = fn (k: str) -> fn (line: int) -> fn (file: str) ->
+  let id = int_of_str k in
+  if map_has proc_source_defaults id then ()
+  else (let key = str_of_int line ++ ":" ++ file in
+        let site = (if map_has proc_source_sites key then map_get proc_source_sites key
+                    else (let i = vec_get proc_source_next 0 in
+                          let _ = vec_set proc_source_next 0 (i + 1) in
+                          let _ = map_set proc_source_lines i line in
+                          let _ = map_set proc_source_paths i (frame_text file) in
+                          let _ = map_set proc_source_keys i key in
+                          let _ = map_set proc_source_refs i 0 in
+                          let _ = map_set proc_source_sites key i in i)) in
+        let _ = map_set proc_source_refs site (map_get proc_source_refs site + 1) in
+        let _ = map_set proc_source_defaults id site in ());
+let proc_source_drop = fn (id: int) ->
+  if map_has proc_source_defaults id then
+    (let site = map_get proc_source_defaults id in
+     let n = map_get proc_source_refs site in
+     let _ = map_delete proc_source_defaults id in
+     if n > 1 then (let _ = map_set proc_source_refs site (n - 1) in ())
+     else (let _ = map_delete proc_source_sites (map_get proc_source_keys site) in
+           let _ = map_delete proc_source_keys site in
+           let _ = map_delete proc_source_lines site in
+           let _ = map_delete proc_source_paths site in
+           let _ = map_delete proc_source_refs site in ()))
+  else ();
+let proc_sources_compact = fn (u: unit) ->
+  let _ = map_compact proc_source_defaults in
+  let _ = map_compact proc_source_sites in
+  let _ = map_compact proc_source_keys in
+  let _ = map_compact proc_source_lines in
+  let _ = map_compact proc_source_paths in
+  map_compact proc_source_refs;
+
 let proc_symsrc = map_new ();    // Symbol#to_proc's proc id -> the symbol name
 // Symbol#to_proc's proc, one per symbol name (ruby caches it)
 let sym_proc_cache = map_new ();
@@ -2688,9 +2756,9 @@ let copy_meth_src = fn (dst: str) -> fn (src: str) ->
 // installs it is not where it was defined.
 let stamp_meth_src_proc = fn (key: str) -> fn (pk: str) ->
   let _ = (if map_has meth_cfn key then map_delete meth_cfn key else ()) in
-  if map_has proc_src pk && map_has proc_src ("f" ++ pk)
-  then (let _ = map_set meth_src key (map_get proc_src pk) in
-        map_set meth_src ("f" ++ key) (map_get proc_src ("f" ++ pk)))
+  if proc_source_has pk && proc_source_has ("f" ++ pk)
+  then (let _ = map_set meth_src key (proc_source_get pk) in
+        map_set meth_src ("f" ++ key) (proc_source_get ("f" ++ pk)))
   else ();
 // ⚠ HOW MANY PROC IDS WERE EVER ISSUED, not how many procs there are (note
 //   270). A new proc's id was `handle_base + map_len proc_store` at forty
@@ -2768,8 +2836,7 @@ let store_proc = fn (k: str) -> fn entry ->
                                        | Cons (st9, t9) -> (if dflt_prologue_stmt st9 then ol9 t9 else 0)
                                        | _ -> 0) in
   let ln9 = ol9 body in
-  let _ = (if map_has proc_src k then () else map_set proc_src k (VInt (if ln9 > 0 then ln9 else cur_line ()))) in
-  let _ = (if map_has proc_src ("f" ++ k) then () else map_set proc_src ("f" ++ k) (frame_text (cur_file ()))) in
+  let _ = proc_source_init k (if ln9 > 0 then ln9 else cur_line ()) (cur_file ()) in
   let _ = map_set proc_bkey k (blk_intern ps body) in
   map_set proc_store k (h, ps, (Nil : Stmt list), penv);
 let store_yblk = fn (k: str) -> fn b ->
@@ -3209,6 +3276,12 @@ let unused_blk_seen = map_new ();
 let super_call_pend = map_new ();
 // "y" once a finalizer has been defined (ObjectSpace.__fin_flag)
 let fin_on = map_new ();
+// Weak target identities, never Vals: callbacks are rooted by ObjectSpace's
+// Ruby registry, but registration must not itself keep the target alive.
+let fin_targets = map_new (); // Ruby object_id -> collector mark key
+let fin_ready = map_new ();   // dead target ids awaiting a Ruby safepoint
+let _ = map_compact fin_targets;
+let _ = map_compact fin_ready;
 // std_fd_closed's answers, "1" / "2" -> 1 (closed at start) or 0
 let std_fd_shut = map_new ();
 let rx_progs = map_new ();
@@ -4592,8 +4665,17 @@ let gc_churn_bytes = fn (u: unit) ->
   //  its values are str). ⚠ Given back HERE and not at each parse: a
   //  map_compact asks every suspended stack for its pins, and a gem that
   //  parses inside an Enumerator (csv) made it most of its time, note 441.
-  + map_bytes rx_gnums + map_bytes rx_gbodies;
+  + map_bytes rx_gnums + map_bytes rx_gbodies
+  + map_bytes arr_pending + map_bytes arr_vc + map_bytes arr_vc_ver + map_bytes arr_vc_len + map_bytes arr_vers + map_bytes lv_up + map_bytes lv_cap + map_bytes lv_capx;
 let gc_churn_compact = fn (u: unit) ->
+  let _ = map_compact_big arr_pending in
+  let _ = map_compact_big arr_vc in
+  let _ = map_compact_big arr_vc_ver in
+  let _ = map_compact_big arr_vc_len in
+  let _ = map_compact_big arr_vers in
+  let _ = map_compact_big lv_up in
+  let _ = map_compact_big lv_cap in
+  let _ = map_compact_big lv_capx in
   let _ = map_compact_big bind_mark_s in
   let _ = map_compact_big rx_gnums in
   let _ = map_compact_big rx_gbodies in
