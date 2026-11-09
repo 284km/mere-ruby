@@ -1070,25 +1070,25 @@ def be_kind_of(k); KindOfMatcher.new(k, false); end
 def be_an_instance_of(k); KindOfMatcher.new(k, true); end
 def be_instance_of(k); KindOfMatcher.new(k, true); end
 
-# reflection matchers: obj.should have_instance_method(:m) etc. `predicate` is
-# the query method sent to the subject.
+# reflection matchers: obj.should have_instance_method(:m) etc., asked as
+# mspec's own are -- the method LIST for that visibility, with the second
+# argument as its include-super flag (mspec/matchers/have_*_method.rb). These
+# asked *_method_defined? and dropped the flag, which is a different question:
+# `Kernel.private_method_defined?(:syscall)` is false where
+# `Kernel.private_instance_methods.include?(:syscall)` is true, and ruby
+# failed core/kernel/syscall_spec under the shim while mspec passes it.
 class HaveMethodMatcher
-  def initialize(predicate, name); @predicate = predicate; @name = name; end
-  def match?(subject); subject.send(@predicate, @name); end
+  def initialize(lister, name, inc); @lister = lister; @name = name.to_sym; @inc = inc; end
+  def match?(subject); subject.send(@lister, @inc).include?(@name); end
 end
-def have_instance_method(name, inc = true); HaveMethodMatcher.new(:instance_method_defined_shim, name); end
-def have_public_instance_method(name, inc = true); HaveMethodMatcher.new(:public_method_defined?, name); end
-def have_private_instance_method(name, inc = true); HaveMethodMatcher.new(:private_method_defined?, name); end
-def have_protected_instance_method(name, inc = true); HaveMethodMatcher.new(:protected_method_defined?, name); end
-def have_method(name, inc = true); HaveMethodMatcher.new(:respond_to?, name); end
-def have_public_method(name, inc = true); HaveMethodMatcher.new(:respond_to?, name); end
-class Module
-  # have_instance_method accepts any visibility; method_defined? excludes
-  # private, so OR the family for the matcher's semantics.
-  def instance_method_defined_shim(name)
-    method_defined?(name) || private_method_defined?(name) || protected_method_defined?(name)
-  end
-end
+def have_instance_method(name, inc = true); HaveMethodMatcher.new(:instance_methods, name, inc); end
+def have_public_instance_method(name, inc = true); HaveMethodMatcher.new(:public_instance_methods, name, inc); end
+def have_private_instance_method(name, inc = true); HaveMethodMatcher.new(:private_instance_methods, name, inc); end
+def have_protected_instance_method(name, inc = true); HaveMethodMatcher.new(:protected_instance_methods, name, inc); end
+def have_method(name, inc = true); HaveMethodMatcher.new(:methods, name, inc); end
+def have_public_method(name, inc = true); HaveMethodMatcher.new(:public_methods, name, inc); end
+def have_private_method(name, inc = true); HaveMethodMatcher.new(:private_methods, name, inc); end
+def have_singleton_method(name, inc = true); HaveMethodMatcher.new(:singleton_methods, name, inc); end
 
 # obj.should be_ancestor_of(mod): self appears in mod.ancestors.
 class AncestorOfMatcher
@@ -1160,6 +1160,15 @@ class EqualMatcher
   def match?(actual); actual.equal?(@expected); end
 end
 def equal(expected); EqualMatcher.new(expected); end
+
+# x.should eql(y) -- #eql? (mspec's EqlMatcher). It was missing, and the 112
+# spec files that use it died on `undefined method 'eql'` on BOTH sides, so
+# those examples measured nothing.
+class EqlMatcher
+  def initialize(expected); @expected = expected; end
+  def match?(actual); actual.eql?(@expected); end
+end
+def eql(expected); EqlMatcher.new(expected); end
 
 # x.should include(a, b, ...) — every argument is a member.
 class IncludeMatcher
@@ -1269,6 +1278,14 @@ module Kernel
     end
     exps = [[e, forbidden]]
     begin
+      # the singleton's OWN method of that name is kept under a proxy name and
+      # put back when the example ends, as mspec's Mock.install_method does:
+      # removing the stub alone also removed it -- `Dir.stub!(:mkdir)` left
+      # Dir with no mkdir for every example after it, on both sides
+      meta = singleton_class
+      orig = :"__mspec_orig_#{sym}"
+      own = meta.instance_methods(false).include?(sym) || meta.private_instance_methods(false).include?(sym)
+      meta.send(:alias_method, orig, sym) if own
       singleton_class.send(:define_method, sym) do |*args, &blk|
         hit = nil
         exps.each { |pair| hit = pair if hit.nil? && pair[0].matches?(args) }
@@ -1293,7 +1310,7 @@ module Kernel
           end
         end
       end
-      $mspec_stubs << [self, sym, exps]
+      $mspec_stubs << [self, sym, exps, own]
     rescue Exception
       # a frozen object or an immediate has nowhere to put one; the example
       # will surface that on its own terms.
@@ -1318,9 +1335,16 @@ def __mspec_verify_stubs
 end
 
 def __mspec_drop_stubs
-  $mspec_stubs.each do |obj, sym, _exps|
+  $mspec_stubs.each do |obj, sym, _exps, own|
     begin
-      obj.singleton_class.send(:remove_method, sym)
+      meta = obj.singleton_class
+      if own
+        orig = :"__mspec_orig_#{sym}"
+        meta.send(:alias_method, sym, orig)
+        meta.send(:remove_method, orig)
+      else
+        meta.send(:remove_method, sym)
+      end
     rescue Exception
     end
   end
@@ -1406,6 +1430,11 @@ class MockObject
     ok, e = __mock_find(:respond_to?, [sym, include_all])
     return e.value if ok
     return true if @syms.include?(sym)
+    # ...and a mocked #method_missing that would answer this name: mspec's
+    # MockObject keeps Object#respond_to?, which lets rb_check_funcall forward
+    # the call (core/array/flatten's `[obj].flatten` asks #to_ary that way)
+    ok, e = __mock_find(:method_missing, [sym])
+    return true if ok
     # what this object REALLY has, asked without `super`: a super from a
     # redefined #respond_to? lands back in the builtin probe, which consults
     # this very method again -- `MockObject.new('x').respond_to?(:each_entry)`
@@ -1436,11 +1465,14 @@ class MockObject
     [false, nil]
   end
   def __mock_syms; @syms; end
+  # mspec's MockObject defines neither: unstubbed, they are Object's, with the
+  # address -- io/puts_spec builds `object.inspect.split(" ")[0] + ">"` and
+  # expects what rb_any_to_s writes for a #to_s that gives no String
   def to_s
-    ok, v = __mock_answer(:to_s); ok ? v : "#<MockObject #{@name}>"
+    ok, v = __mock_answer(:to_s); ok ? v : super
   end
   def inspect
-    ok, v = __mock_answer(:inspect); ok ? v : "#<MockObject #{@name}>"
+    ok, v = __mock_answer(:inspect); ok ? v : super
   end
 end
 

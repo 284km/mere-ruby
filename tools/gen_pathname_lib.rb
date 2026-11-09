@@ -33,7 +33,8 @@ files = [[%w[pathname pathname.so], File.read("#{here}/lib/pathname_ext.rb")],
          [%w[socket socket.so], File.read("#{here}/lib/socket_ext.rb")],
          [%w[forwardable], File.read("#{here}/lib/forwardable_ext.rb")],
          [%w[shellwords], File.read("#{here}/lib/shellwords_ext.rb")],
-         [%w[singleton], File.read("#{here}/lib/singleton_ext.rb")]]
+         [%w[singleton], File.read("#{here}/lib/singleton_ext.rb")],
+         [%w[logger], File.read("#{here}/lib/logger_ext.rb")]]
 
 def lit(line)
   line.gsub(/[\\"{}\t\r]/) { |c| { "\\" => "\\\\", '"' => '\\"', "{" => "\\{", "}" => "\\}", "\t" => "\\t", "\r" => "\\r" }[c] }

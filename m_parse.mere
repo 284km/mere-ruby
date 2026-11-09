@@ -6377,9 +6377,9 @@ and parse_primary = fn toks ->
     // def/class in expression position (def evaluates to the method name
     // as a symbol; class to its body's last value).
     else if str_eq id "def" then let (s, r2) = parse_def_counted r in (EStmt s, r2)
-    else if str_eq id "class" then let (s, r2) = parse_class r in (EStmt s, r2)
+    else if str_eq id "class" then let _ = cls_def_check "class" r in let (s, r2) = parse_class r in (EStmt s, r2)
     // (`foo module Bar; end`: a module is an expression where a class is)
-    else if str_eq id "module" then let (s, r2) = parse_class r in (EStmt (mark_module s), r2)
+    else if str_eq id "module" then let _ = cls_def_check "module" r in let (s, r2) = parse_class r in (EStmt (mark_module s), r2)
     // `puts` is a statement form here, but in ruby it is a method call like any
     // other and may stand wherever a value can: `def run = puts("hi")`,
     // `x = (puts "q")`, `ok && puts(3)`. Read the statement and let it be the
@@ -8637,8 +8637,8 @@ and parse_stmt_id = fn toks ->
     else if str_eq id "case" then let (s, r2) = parse_case r in stmt_postfix s r2
     else if str_eq id "for" then let (s, r2) = parse_for r in stmt_postfix s r2
     else if str_eq id "def" then let (s, r2) = parse_def_counted r in stmt_postfix s r2
-    else if str_eq id "class" then let (s, r2) = parse_class r in stmt_postfix s r2
-    else if str_eq id "module" then let (s, r2) = parse_class r in stmt_postfix (mark_module s) r2
+    else if str_eq id "class" then let _ = cls_def_check "class" r in let (s, r2) = parse_class r in stmt_postfix s r2
+    else if str_eq id "module" then let _ = cls_def_check "module" r in let (s, r2) = parse_class r in stmt_postfix (mark_module s) r2
     else if str_eq id "begin" then let (s, r2) = parse_begin r in stmt_postfix s r2
     // `attr_accessor :a, :b` names the attributes statically, but these are
     // methods: `attr_writer name` passes a variable. A non-symbol argument
@@ -9053,7 +9053,22 @@ and mark_module = fn (s: Stmt) ->
 
 // (a new context for the "nodo" flag, as parse_begin is: `while class Foo;
 //  tap do end; end; break; end` gives the do to tap)
+// A class or module is no statement of a method body -- a block or lambda
+// in one included -- and ruby's parser refuses it; `class << obj` is the one
+// form that may stand there, and its body is no method body.
+and cls_def_check = fn (kw: str) -> fn r ->
+  if (if map_has def_depth "n" then map_get def_depth "n" else 0) > 0
+     && (if str_eq kw "class" then (match r with Cons (TP p9, _) -> (if str_eq p9 "<<" then false else true) | _ -> true) else true)
+  then syn_refuse ("unexpected " ++ kw ++ " definition in method body")
+  else ()
 and parse_class = fn toks ->
+  let sng9 = (match toks with Cons (TP p9, _) -> str_eq p9 "<<" | _ -> false) in
+  let dd9 = (if map_has def_depth "n" then map_get def_depth "n" else 0) in
+  let _ = (if sng9 && dd9 > 0 then map_set def_depth "n" 0 else ()) in
+  let res9 = parse_class_in toks in
+  let _ = (if sng9 && dd9 > 0 then map_set def_depth "n" dd9 else ()) in
+  res9
+and parse_class_in = fn toks ->
   let had = map_has parser_flags "nodo" in
   let _ = if had then map_delete parser_flags "nodo" else () in
   // (a class or module body is a scope for shareable_constant_value too: the
@@ -9114,6 +9129,14 @@ and parse_class_go = fn toks ->
     (match parse_expr toks with
      | (EScopedRead (sc9, nm9), r9) -> class_scoped_by sc9 nm9 r9
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected class name after class" ++ parsing_file ()))) in fail ("mere-ruby: expected class name after class" ++ parsing_file ())))
+  // ...and so is a method call's: `class singleton_class::A` opens A under
+  // the value singleton_class answers (the name was the constant
+  // "singleton_class::A"). A local reads the same way, as a variable.
+  | Cons (TId name0, Cons (TP cc9, Cons (TId nm9, r9)))
+      when str_eq cc9 "::" && str_len name0 > 0
+           && (if str_eq name0 "self" || str_eq name0 "nil" || str_eq name0 "true" || str_eq name0 "false" then false else true)
+           && (let c9 = char_at name0 0 in str_eq c9 "_" || (ord c9 >= 97 && ord c9 <= 122)) ->
+    (let (nm, r) = parse_qualified_name nm9 r9 in class_scoped_by (EVar name0) nm r)
   | Cons (TId name0, r0) ->
     let (name, r) = parse_qualified_name name0 r0 in
     parse_class_rest name r
@@ -9278,6 +9301,7 @@ and parse_rescue_classes = fn toks -> fn (acc: str list) ->
       (match r with
        | Cons (TId c, r2) ->
          (let (full, r0) = scoped_name c r2 in
+          let full = "::" ++ full in
           match r0 with
           | Cons (TP p2, r3) ->
             if str_eq p2 "," then parse_rescue_classes (skip_nls r3) (Cons (full, acc))
@@ -10774,7 +10798,9 @@ and parse_def_inner = fn toks ->
               // (and `def foo=()` -- empty parentheses, an endless method's
               //  spaced `=` lexes otherwise -- which ruby then refuses as a
               //  setter when an endless body follows)
-              if str_eq lp "(" && (str_eq st "*" || str_eq st "**" || is_lparen st || str_eq st ")") then (name ++ "=", r1) else (name, r)
+              // (...and `def pos=(...)`, a setter forwarding everything:
+              //  forwardable's generated delegators, which csv uses)
+              if str_eq lp "(" && (str_eq st "*" || str_eq st "**" || is_lparen st || str_eq st ")" || str_eq st "&" || str_eq st "...") then (name ++ "=", r1) else (name, r)
             // `def value= value` — a setter whose parameter has no parens. An
             // endless method cannot look like this: its body would have to be
             // a bare name followed by a newline, which is a name, not a body.

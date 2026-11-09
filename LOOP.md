@@ -2738,3 +2738,353 @@ corpus/536 is the witness.
   lower: test_method (kwarg_eval_memory_leak, an RSS ratio both binaries
   fail alike when run again) and test_require, 51 → 0 -- the Thread.pass
   wait above, which hung the file -- and 51 again with the timed wait.
+
+## 2026-11-09 (21): the spec record measured again against 4.0.9's own spec tree; Kernel, BasicObject and Module; eval's frames; csv loads -- spec DIFF 133 → 104, the stdlib record's CRASH 48 → 6
+
+Note 533 is the re-plan of what stage 3 still has; this is its round 1.
+corpus/546 is the witness.
+
+- **The record is 4.0.9's now.** SPEC_STATUS.md and SPEC_STATUS_STDLIB.md
+  were measured (2026-10-26) against ruby master's spec tree
+  (`84a27934cf53`). The reference is 4.0.9, so 4.0.9's own tree is the
+  subject (its file counts differ, which the guard refuses:
+  `SPEC_TOTALS_OK=1`, deliberately, once). Re-measured before any change:
+  DIFF 133 + 32, CRASH 4 + 48.
+- **The shim's method matchers asked a different question.** mspec's
+  `have_private_instance_method(m, inc)` is
+  `private_instance_methods(inc).include?(m)`; the shim asked
+  `private_method_defined?(m)` and dropped `inc`. ruby itself failed
+  core/kernel/syscall_spec under it. The eight matchers ask the lists now.
+- **csv did not load** (42 of the stdlib record's CRASHes): forwardable --
+  ruby's file since (18) -- generates `def pos=(...)`, and a setter's
+  `(...)` was not read as one.
+- **BasicObject** had no row of builtins: its `*_method_defined?` were
+  false about what its method lists named (`bo_defines`, the reference's
+  owner table); BasicObject::BasicObject is a constant; a class with no
+  Object above it does not see the top level (`const_defined?`,
+  `defined?`); `remove_method :method_missing` on it is accepted; a
+  singleton class is `instance_of?(Class)`.
+- **Kernel's functions on Kernel and on a module**: `Kernel.block_given?`,
+  `.__dir__`, `.system` are the bare call in the caller's frame (they were
+  sent to main); `mod.send(:puts, x)` / `self.send(:block_given?)` in a
+  module method reach Kernel's function (`kernel_by_name`, as an object's
+  do) unless the class has its own class method of the name, up its
+  superclasses; a bare `fail` is a bare `raise`; under -n/-p chomp, chop,
+  sub and gsub are module functions.
+- **A class's own builtin precedes an ancestor's method**:
+  `Module.public_method_defined?(:include)` found the shim's private
+  top-level `def include` on Object first (`anc_past`).
+- **eval draws its frames**: the eval method's ('Kernel#eval',
+  'Binding#eval', 'Kernel.eval') at the call, and the code's above it,
+  labelled like the frame it runs in, or the binding's (`eval_framed`,
+  `bind_lbl`). The code ran IN the caller's frame, so `caller` lost the call
+  and warn's uplevel counted from the wrong frame. ⚠ The first version
+  made test_method's kwarg_eval_memory_leak fail every time (RSS ×1.6
+  against ×1.2): the eval method's frame runs no statement, so its
+  statement watermark kept what an earlier frame at that depth had left,
+  and the collector rooted everything built since. A frame's interval
+  starts at its entry now, as a block's does for a builtin caller.
+- Smaller: Module#constants lists a prepended module's; a frozen class
+  refuses define_method from a class_eval block; `define_method(:m) { |a,|
+  }` takes one argument; a singleton's builtin alias is in its methods
+  lists; `%c`, eval's file and line answer ruby's conversion refusals
+  ("can't convert X to String (X#to_str gives Y)"); main's private_methods
+  has its own six; ARGFClass, Enumerable__Impl and IO::POPEN_IO_KEYS are
+  private constants (they were the program's).
+- **Left** in these groups: object_id of two equal Bignums (a Bignum is a
+  value here), IO#reopen replacing a singleton class, open-uri and
+  RubyGems under the shipped record, a C extension that fails to load
+  (stage 7'), `load(f, true)` with `using`, define_method of an
+  UnboundMethod with a nested def. Found on the way: `MF.open(path)` for a
+  File subclass is a TypeError (pre-existing).
+
+## 2026-11-09 (22): language, command_line, proc, method, exception -- super in a builtin iterator's block, a proc's &param from `&pr`, a vcall's method_missing super, a proc's return at a loaded file's top level, class in a method body
+
+Round 2 of note 533. corpus/555 is the witness.
+
+- **`super()` inside a block a builtin iterator runs** (`1.times { super() }`,
+  `[1].map { super }`, `tap { super }`) lost the method's block: since (19)
+  such a block gets no frame block, and only a body that YIELDS carries the
+  method's (blk_capture asks bare_yield_stmts). A super that passes the block
+  on asks the same question now -- for the capture only, not as a yield for
+  the syntax check (yscan_defined).
+- **A proc's `&b` is the proc passed with `&`**: `->(x, &b) { b }.(1, &l)`
+  answered a copy, so `.equal?(l)` was false (language/lambda_spec's two
+  `evaluate` blocks). The Proc call notes the source proc (amp_src_note) for
+  the binding that follows, as a method's `&b` already took it
+  (pending_srcproc).
+- ⚠ **`pending_srcproc` outlived its call**: `{}.each(&pr)` never runs a
+  block, so nothing cleared it, and a later `Proc.new { :lit }` answered pr.
+  EMethodB with a literal block clears it, as ECallB's arm did.
+- **A method_missing reached by a bare name** (a vcall -- it could have been a
+  local) raises NameError "undefined local variable or method" from its
+  `super`; it was NoMethodError (test_exception's
+  method_missing_reason_clear, Bug #10969). try_self_call marks the call,
+  the door into method_missing takes the mark (mm_reason_take, mm_priv 2).
+- **A proc's return at a loaded file's top level** (`proc { return }.call`
+  in a file `load`ed or `require`d) has no method to leave and ends the file;
+  it unwound past the load and ended the whole program silently
+  (language/return_spec counted one assertion fewer and nothing failed).
+  top_return_taken, in rb_load and do_require.
+- **`class`/`module` in a method body is a SyntaxError** ("unexpected class
+  definition in method body"), a block or lambda in one included; `class <<
+  obj` may stand there and its body is no method body. It was accepted.
+- **`class expr::Name` with a method call for expr** (`class
+  singleton_class::A`) opens the class under the call's value
+  (class_scoped_by, as the keyword forms did); it was the constant
+  "singleton_class::A". `nil`, `true`, `false` and `self` keep their path.
+- **Method equality and a class's methods**: `c.method(:new) ==
+  Class.instance_method(:new).bind(c)` -- a class's builtin that is an
+  instance method of Class/Module is owned there (builtin_frame_label, as
+  #owner says); a singleton's alias of a builtin (`class << self;
+  alias_method :n, :new`) is that builtin -- respond_to?, #method and #== now
+  see it; a singleton that only made a builtin private holds no body.
+  `String.method(:include)` is Module's builtin ahead of the shim's private
+  top-level `def include` on Object (#owner and #inspect).
+- Smaller: Proc#=== takes a block by send; Proc#inspect is BINARY like #to_s;
+  `$/ =` (and `$-0`) keeps a new frozen String, or the String itself when it
+  already is one with no ivars (4.0); `-r` libraries do not run for a script
+  that is not there.
+- **Left**, each with its reason: `break` in a Thread body raises
+  LocalJumpError AT the break in ruby -- here the break leaves the block as a
+  value, and whether a loop between catches it is a static fact the
+  evaluator does not keep; a heredoc's interpolation reports the statement's
+  line (lines are statement-level, SLine); binding.local_variables lists a
+  local assigned AFTER the call in ruby (the parse-time local table --
+  methods and blocks would need their body at hand); `proc { |_:, _: 2| }`
+  reads a block's keyword default by bare name (the defaults are decoded
+  from the body's prologue); `$:` starts empty -- RbConfig's directories
+  come from GEM_HOME and may be a real ruby's, whose files `require` would
+  then load (-I/RUBYLIB "at the front" and predefined's $: examples);
+  `defined?(Gem)` (RubyGems is not shipped); `import_methods Zlib` refuses
+  C methods in ruby and Zlib is Ruby here; $0 does not set the process title
+  (Mere runtime); test_exception's errinfo_encoding_in_debug (an EUC-JP
+  class name in $DEBUG's line). `File.readlines` is 3 ms a call here
+  (region blocks zeroed per statement list, Mere's allocator), which
+  test_blocking_backtrace's 10000 raises feel.
+
+## 2026-11-09 (23): the I/O family -- IO::Buffer's values, copies and slices (test_io_buffer 52 → 78/80), a program's own class methods of File, Dir.send(:open) with a block, realpath's EACCES, a chilled string in StringIO
+
+Round 3 of note 533. corpus/556 is the witness.
+
+- **IO::Buffer had no value API past get_value**: set_value, get_values,
+  set_values, values, each_byte, copy and size_of were missing, and so were
+  the 128-bit types (pack has no directive for them: read and written
+  byte by byte) and NETWORK_ENDIAN. A value converts BEFORE the write -- its
+  #to_int may free what a slice looks into, and the write then finds the
+  slice invalid, as ruby's does. ruby's words for the range refusals ("Type
+  extends beyond end of buffer! (offset=N > size=M)", the offset shown as
+  C's size_t). The prelude's methods are written as Ruby and escaped into
+  the string by a script, which is the safe way to grow a class this size
+  in m_driver.
+- **A slice is a SLICE** (ruby 4.0): neither EXTERNAL nor INTERNAL. It was
+  EXTERNAL, and a resize of the MAPPED buffer under it moved the memory and
+  left the slice valid (a generation, `__gen`, now says it was cut from
+  memory that moved). A slice resized is a buffer of its own; one whose
+  source is gone is InvalidatedError. `dup` is a writable INTERNAL copy
+  (`IO::Buffer.for(s).dup.and!(mask)` was "not writable"); a transferred
+  `for` buffer writes into its string until the string is frozen; the
+  hexdump's hex column is 47 wide; clear takes a byte (`clear(260)` is 4)
+  and refuses what is not an Integer; get_string converts its encoding
+  first (its #to_str may free the buffer); for, string and map refuse
+  what is not theirs; map flushes what was written to the file first.
+- **A program's own class method of File, IO or FileTest comes before the
+  builtin**: `class << File; def dirname` and a module prepended to File's
+  singleton (pathname's test_split) were never asked -- the builtin arms
+  answered first. Only a definition the program wrote (sng_user_owner): the
+  prelude's are the builtins, and a module INCLUDED in the singleton comes
+  after the builtin, as in ruby.
+- **`Dir.send(:open, d) { |dir| }` yielded a File**: send with a block on a
+  class receiver asked the class for INSTANCE methods and found
+  Kernel#open. A class's methods are its singleton's.
+- realpath through a directory that cannot be searched is EACCES (the walk
+  asks fs_absent_name why a name is not there); pathname 285 → 287/287.
+- **A chilled literal in StringIO**: ObjectSpace.dump says `"chilled":true`
+  (without it test_stringio's three chilled-string tests were never defined
+  -- ABSENT, 99 → 102/102), and StringIO#set_encoding leaves a chilled
+  string's encoding alone (String#__chilled?), as strio_set_encoding does.
+- Smaller: the standard streams answer #to_i; `lineno = nil` is NUM2INT's
+  "from nil to integer"; IO.try_convert says "to IO"; Dir.glob and Dir[]
+  refuse a keyword they do not take (kw_stray_refuse, warn's rule made
+  general); StringIO.open with nothing is over "".
+- **The shim's MockObject** answered #to_s and #inspect as
+  `#<MockObject name>`; mspec's defines neither, so they are Object's (with
+  the address). io/puts_spec and stringio/puts_spec read
+  `object.inspect.split(" ")[0]` and failed on BOTH sides.
+- **Left**: File.new(fd) answers the IO (a File here is a path, not a
+  descriptor); File#size and #stat of a file deleted while open need
+  fstat(2) on its descriptor (Mere has stat by path only -- the runtime
+  round); IO#reopen(io) does not turn a File into an IO; test_io_buffer's
+  test_shared (a MAP_SHARED mapping a forked child writes into -- the
+  runtime round) and test_bug_21210 (GC.compact, stage 9); test_tmpdir's
+  test_ractor (stage 9); `def` in File's singleton then `remove_method`
+  leaves no method in ruby (the C method was replaced in the same table),
+  and the builtin here. A warning raised inside a shipped library that is
+  a C extension in ruby (StringIO's `<<` on a chilled string) names the
+  library's line, where ruby names the caller's.
+
+## 2026-11-09 (24): thread, fiber, tracepoint -- a thread killed from a rescue or ensure clause, TracePoint#parameters in a :b_call hook, the "(X#m gives Y)" refusals, the main script's directory after Dir.chdir
+
+Round 4 of note 533, verified with round 3 (one cycle). corpus/557 is the
+witness.
+
+- **`rescue; Thread.exit` killed the PROGRAM** ("exception re-raised past all
+  rescues"; core/thread/kill_spec and terminate_spec CRASHed). The kill is
+  the scheduler's park signal, a pair (`__ThreadPark`), and raised while $!
+  was set it was given a cause -- exc_with_cause made it an object, and no
+  runner knew that object: it went on as the thread's exception, up past
+  every rescue. The park signal takes no cause.
+- **TracePoint#parameters in a :b_call hook was always []**: the HOOK's own
+  block runs through run_block_tp too, which set the block being traced and
+  then REMOVED it before the hook's body ran -- so `tp.parameters` in the
+  hook found nothing. It is put back as it was.
+- **`trace.enable(target: proc)` for none of a block's events** (`:call`) is
+  "can not enable any hooks".
+- **The main script's `__dir__` and `require_relative` after `Dir.chdir`**:
+  a script run by a relative path (`ruby subdir/x.rb`) has its directory
+  read against where the program STARTED (cwd0) -- it was read against the
+  current directory, so after `Dir.chdir __dir__` the sibling was looked for
+  in subdir/subdir. Three places read PWD for it: `__dir__`'s parse-time
+  form, `__builtin_relpath` (the parser's require_relative) and do_require.
+- "can't convert X to Y (X#m gives Z)": seven refusals said "into" -- ruby
+  says "into" only for its other two forms ("no implicit conversion of X
+  into Y", "can't convert nil into Float"). Fiber#raise with nothing is a
+  RuntimeError with no message (Thread#raise's), not "unhandled exception".
+- **Left**: `block (N levels)` counts the envs a block's frame sits under,
+  not its lexical nesting -- a thread's block under the shim's describe/it
+  is 6 levels where ruby says 4, and a thread inside a lambda inside a block
+  one short (report_on_exception_spec's order example); `break` in a thread
+  body (round 2); handle_interrupt_spec and list_spec differ only in the
+  reference's own tallies (ruby fails two handle_interrupt examples here; a
+  timing count); native_thread_id is nil for a green thread (the spec
+  allows it); core/signal/trap_spec's EPIPE from a child's write (the
+  runtime round, with print's EAGAIN).
+
+## 2026-11-09 (25): numbers and strings -- a number's === asks an object, Rational#quo and Complex#quo through #coerce, "%#o" with a precision, ObjectSpace.dump's fstring; an eval's synthetic file name
+
+Round 5 of note 533, verified with rounds 3 and 4 (one cycle). corpus/558 is
+the witness (and 557 for the last two points below).
+
+- **`1 === obj` is `obj == 1`** (num_equal): `==` asked the object and `===`
+  -- which IS `==` for a number -- did not, so `case obj when 7` never
+  matched an object that says it equals 7 (core/integer and core/float
+  case_compare). case_eqq takes the reverse question for every number.
+- **Rational#quo is Rational#/**: through #coerce the pair is asked `/` (it
+  was asked quo, which the coerced object need not have). Complex#quo and
+  #/ with an object that coerces but is no Numeric reached the plain
+  division and answered ZeroDivisionError or 2 (cpx_obj_applies takes it
+  now; the pair is asked #quo, `(2/1)`).
+- **`"%#.8o" % 1` is "00000001"**: the precision's leading zero is the one
+  `#` asks for; another was put in front (test_sprintf_comb, 3).
+- Integer, Bignum and Float #inspect are US-ASCII, as their #to_s is.
+- ObjectSpace.dump says `"fstring":true` for the interned copy of a text
+  (String#__fstring?: the intern table names this very string) --
+  test_string's test_uplus_minus.
+- **A relative file name is the main script's or an eval's**: round 4 read
+  every relative name against where the program started, and an
+  `instance_eval(src, "foo.rb")`'s require_relative is read against where
+  it is NOW (require_relative_spec). rel_file_base tells the main script
+  (load_ctx "script0") from the rest; a synthetic name has no
+  absolute_path. A TracePoint target that is no Method, UnboundMethod or
+  Proc is "specified target is not supported".
+- **Left**: a Regexp is a value here -- no ivars (Marshal of one with
+  ivars), no #extend (Marshal.load of an extended one); `Time.dup` is a
+  class without Time's builtin class methods (`c.now`); Enumerable#map
+  hands #each its own block, arity -2, where ruby passes the user's (arity
+  2); Lazy#grep's $~; Enumerator.new(size) { }; Complex#fdiv through
+  #coerce; `b.local_variable_set(:self, x)` -- the env keeps the receiver
+  under that key, so the local replaced self (test_literal's
+  hash_value_omission); core/time/new's timezone protocol;
+  locale_charmap from LC_ALL; numeric/step_spec is over the CPU budget.
+
+## 2026-11-10 (26): the small core items and the libraries -- object keys in the hash index, the timezone protocol's #local_to_utc, Numeric#step's edges, Array#== under the cycle guard, a clone's define_method closures, `x&.m(&pr)`, Kernel.load from a class with its own #load
+
+Rounds 8 and 9 of note 537, verified in one cycle. corpus/559 is the
+witness.
+
+- **A plain object key is its identity in the hash index.** hkey_digest
+  answered "" for every object, so a hash keyed by objects was never
+  indexed and every store scanned: 20,000 inserts took 48 s (0.08 s now;
+  ruby 0.004). An object with a #hash of its own (or a Time, a MatchData)
+  still answers "" and goes the protocol way -- main.mere answers through
+  a forward hook (hkey_obj_ident_fwd), where the method tables are.
+- **Time.new with a zone object**: a Time that #local_to_utc answers is its
+  INSTANT (ruby's extract_time), not the wall clock #utc_to_local's answer
+  is read as -- `+09:00` came back as offset 0; an offset of a day or more
+  is "utc_offset out of range"; a zone with no #local_to_utc is read as an
+  offset and refused (TypeError) where it fell back to #utc_to_local; and a
+  `{}` in the zone's place is a zone, not keywords (only a keyword hash is
+  stripped).
+- **Numeric#step**: `1.0.step` walks without end; from an infinity toward
+  the same infinity it yields nothing (ruby's count is NaN), and from an
+  infinite begin toward a finite end it yields the begin until the block
+  breaks; `42.step(Float::INFINITY, 1)` stays an Integer walk (num_step's
+  `inf`); a step that is no number makes a plain Enumerator, not an
+  ArithmeticSequence; `1.step(5, 1, to: 5)` is "to is given twice"; a
+  Float receiver's `by: "1"` is compared with 0. core/numeric/step was SLOW
+  (`Float::INFINITY.step(Float::INFINITY, 1)` never ended) and MATCHes.
+- **Array#== under the cycle guard** with an element that answers #==
+  itself: two arrays that each hold themselves recursed forever
+  (core/array/equal_value was SLOW). cmp_cycle_guard is rb_eq's eq_seen.
+- **#clone keeps what a singleton method was written in**: the copy took
+  the method bodies and none of the side tables keyed by them (copy_meth_src
+  -- a define_method body's closure, its block, its source), so every
+  OpenStruct accessor on a frozen clone read `name` as a method call and
+  answered nil (library/openstruct/frozen).
+- **`x&.m(&pr)` passes pr** -- the block-pass marker ran as a literal
+  block, so the block never ran. resolv's Hosts#each_address is exactly
+  that (`@name2addr[name]&.each(&proc)`), and every /etc/hosts lookup was
+  empty (resolv's 4 files).
+- **`Kernel.load(f)` inside a class that defines #load** called itself
+  forever: the module function was answered as a bare call in the caller's
+  frame, where self's own method comes first. With such a method the call
+  runs with Kernel as self in a child frame (both the `Kernel.x` shortcut
+  and the by-name door). irb's IRB::Locale#load is this; Binding#irb is
+  ruby's prelude method now, and irb gets as far as Reline, which needs
+  IO#winsize -- the runtime round.
+- A CLASS receiver's protected singleton method is not respond_to?
+  (weakref delegated to it). Hash#merge keeps the receiver's subclass;
+  update / merge! / replace refuse a frozen receiver before #to_hash.
+  String#=== asks an object with #to_str; String#to_str of a subclass is a
+  String; an invalid Emacs-Mule byte encodes as "?". A program's own class
+  method of a core class (Time.now, Process.pid, Math.sqrt, ...) is asked
+  before the builtin (round 4's File/IO/FileTest rule, for every core class
+  with a singleton: name_set "core_sng_cls"). Encoding.locale_charmap
+  reads LC_ALL, LC_CTYPE, LANG. A C extension that IS there fails as ruby's
+  dlopen does -- a LoadError with no #path -- not as a missing file.
+- Libraries: cgi's escapeURIComponent(nil) is TypeError; logger is ruby's
+  own (the logger gem 1.7.0, lib/logger_ext.rb) in place of a smaller one
+  of ours (psych's `!ruby/exception` came with #72's vendored psych, which
+  replaced the edit made here); WeakKeyMap keeps [key, value]
+  pairs (and the LATER of two equal keys, as ruby does).
+- Cost: is_kernel_builtin built a 70-name list and walked it with str_eq on
+  every call, and is_a? walked the ancestors each time; a table and a memo
+  on the class generation. Object.new 3.7 → 3.3 us (ruby 75 ns), and
+  WeakKeyMap's Bug #20691 test 18.9 → 14.5 s, still over its 10 s: the rest
+  is per-call dispatch, a performance arc of its own.
+- **The shim**: mspec's `eql` matcher was missing -- 112 spec files use it,
+  and those examples died on BOTH sides, measuring nothing. Measured, they
+  found three: Rational#to_i floored (`Rational(-7, 4).to_i` was -2);
+  Float#divmod floored a quotient flodivmod ROUNDS (`(x - fmod) / y` lands
+  a hair under the whole number, `0.59.divmod(7.761021455128987e-11)` was
+  one short); Numeric#eql? on a program's own Numeric was identity, where
+  ruby asks #==. Also in the shim: a mock whose
+  #method_missing is mocked answers respond_to? for that name (mspec's
+  keeps Object's, and rb_check_funcall forwards); a stub keeps the
+  singleton's own method and puts it back. ⚠ The MockObject #to_s /
+  #inspect change (23) describes was LOST from 8fc6b70: a `git checkout` of
+  the shim, used to undo a trace, took it back out. It is in now.
+- **Left**: `Time.dup` and IO#reopen's new singleton class (round 11);
+  Enumerator.new's block local and $LOADED_FEATURES' matching of relative,
+  non-canonical and C-extension names (require_spec, 24 -- round 10);
+  RubyGems (`-rrubygems`, Gem.bin_path) and open-uri, whose uri is not
+  shipped -- no stdlib is; irb (IO#winsize) and test_blocking_backtrace
+  (File.readlines' 3 ms) are the runtime round.
+- **Checked**: spec DIFF 65 → **53** (SLOW 2 → 0, CRASH 2; 65 is the
+  record after #72's psych), the stdlib record's DIFF 32 → **26** (CRASH 6).
+  corpus 574/574 both ways after the rebase onto #72, 559 and #72's 550
+  under GC_STRESS=50, the 13 gates; 247 unittest files against round 5's
+  binary, MATCH 9755 → 9754 -- the one is test_kwarg_eval_memory_leak, an
+  RSS ratio round 5's binary fails as well when run again; the numeric,
+  hash, time, array and range files again with the final binary,
+  unchanged; psych's 635 (#72) 635.
