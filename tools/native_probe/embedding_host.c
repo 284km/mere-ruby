@@ -43,6 +43,13 @@ int main(int argc,char **argv) {
  }
  if(simple(mere_embedding_setup)) return 10;
  if(simple(mere_embedding_setup)) return 11;
+ if(argc>1 && !strcmp(argv[1],"local-call-before-assignment")) {
+  check("def read_before_assign; :method; end; $before_assignment = read_before_assign; read_before_assign = 7; raise 'method shadowed' unless $before_assignment == :method; raise 'assignment lost' unless read_before_assign == 7",0,"");
+  check("def conditional_local; :conditional_method; end; $before_conditional = conditional_local; conditional_local = 1 if false; raise 'conditional shadowed' unless $before_conditional == :conditional_method",0,"");
+  check("GC.start; raise 'completed local lost' unless conditional_local.nil? && read_before_assign == 7",0,"");
+  if(simple(mere_embedding_cleanup)) return 39;
+  mere_lib_shutdown(); puts("local_call_order_passed"); return 0;
+ }
  if(argc>1 && !strcmp(argv[1],"locals-after-error")) {
   check("kept = 42",0,"");
   handled("raise 'failed'; after_failure = 1; kept = 99","RuntimeError");
