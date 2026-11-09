@@ -24,3 +24,11 @@ p [5].map { "value=#{_1}" }
 p [6].map { (_1.._1).to_a }
 p [7].map { begin; raise "test"; rescue; _1; end }
 p [8].map { case _1; when 8; _1 + 1; end }
+
+# A normal local named `it` may coexist with numbered parameters.
+it = :outer
+p [1].map { [_1, it] }
+p [[1, 2, 3]].map { [_1, _3, it, binding.implicit_parameters] }
+p proc { it = :local; [_1, it] }.call(7)
+p proc { it = :local; [_1, _3, it, binding.implicit_parameters] }.call(4, 5, 6)
+p proc { it = :local; [_1, _3, it] }.call([4, 5, 6])
