@@ -4408,7 +4408,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   // fold the evaluated pairs through hash_put so duplicate keys (from an
   // explicit repeat or a **splat then override) collapse last-value-wins,
   // keeping the key's first position — Ruby hash-literal semantics.
-  | EHsh items -> hstored_seed env world (mkhash (hash_merge Nil (hsh_eval_items env world blk items)))
+  // (...and keys with their own #hash collapse by THAT protocol, as `h[k] =
+  //  v` does: `{a1 => 1, a2 => 2}` with two equal IPAddrs is one entry)
+  | EHsh items ->
+    (let kv9 = hsh_eval_items env world blk items in
+     if elems_user_hash world kv9 then
+       (let h9 = mkhash Nil in
+        let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        let rec put9 = fn (xs: Val list) ->
+          (match xs with
+           | Cons (k9, Cons (v9, t9)) -> (let _ = invoke_val_c env world nb9 h9 "[]=" (Cons (k9, Cons (v9, Nil))) false in put9 t9)
+           | _ -> ()) in
+        let _ = put9 kv9 in h9)
+     else hstored_seed env world (mkhash (hash_merge Nil kv9)))
   // a keyword-argument hash: same value as EHsh, but its handle is marked so
   // method binding knows it came from `key: value` syntax (not a positional {}).
   | EKwHash items ->
@@ -16588,6 +16600,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      // a module with its own `self.extend_object` REPLACES the mixin: ruby
      // calls it instead, and the documented override ends with `super`, which
      // is where the mixin actually happens.
+     // (a module whose singleton UNDEFINED extend_object cannot be extended
+     //  with: ruby's call of it is the NoMethodError -- singleton.rb does
+     //  this to Singleton)
+     let _ = list_iter args (fn (a9: Val) ->
+               match a9 with
+               | VClass m9 when map_len undefs > 0 && undef_blocked world ("(sng:" ++ m9 ++ ")") "extend_object" ->
+                 (let _ = cls_sng_undef_raise world a9 "extend_object" (Cons (recv, Nil)) in ())
+               | _ -> ()) in
      let hooked = (let rec anyh = fn (xs: Val list) ->
                      (match xs with
                       | Nil -> false
@@ -19806,8 +19826,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              (let sk = scls ++ "#" ++ snm in
               // a builtin source (`method(:constants)`) has no Meth body: it is
               // installed as an alias the dispatcher resolves to the builtin
-              let _ = if map_has meths0 sk then set_meth meths0 (target ++ "#" ++ nm) (map_get meths0 sk)
-                      else (let _ = map_set blt_alias_names nm 1 in map_set builtin_alias (target ++ "#" ++ nm) snm) in
+              // (...and what the singleton defined under that name before goes:
+              //  `Fiber.define_singleton_method(:current_scheduler, original)`
+              //  is test_timeout putting the builtin back, and the mock's
+              //  method stayed ahead of the alias)
+              // (a Method of a BUILTIN -- @__m_bi -- is that builtin, whatever
+              //  the table holds under its name now)
+              let bi9 = str_eq ocl9 "Method" && map_has ivars0 (str_of_int uid ++ "@__m_bi") in
+              let _ = if map_has meths0 sk && (if bi9 then false else true) then set_meth meths0 (target ++ "#" ++ nm) (map_get meths0 sk)
+                      else (let _ = (if map_has meths0 (target ++ "#" ++ nm) then del_meth meths0 (target ++ "#" ++ nm) else ()) in
+                            if str_eq nm snm then ()
+                            else (let _ = map_set blt_alias_names nm 1 in map_set builtin_alias (target ++ "#" ++ nm) snm)) in
               let _ = copy_meth_src (target ++ "#" ++ nm) sk in
               let _ = if map_has meth_cref sk then map_set meth_cref (target ++ "#" ++ nm) (map_get meth_cref sk) else () in
               VSym nm))
@@ -21841,6 +21870,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            //  `class << self; undef_method :new; end`, as
                            //  bigdecimal does)
                            || (is_sng_cls c && (str_eq n9 "new" || str_eq n9 "allocate" || builtin_has_meth "Class" n9))
+                           // (...and Module's hooks: singleton.rb's
+                           //  `c.singleton_class.send(:undef_method, :extend_object)`)
+                           || (is_sng_cls c && (builtin_has_meth "Module" n9 || sng_module_hook n9))
                         then ()
                         // ...naming the class as it prints (an anonymous one is
                         // `#<Module:0x...>`, not its internal key); a CLASS's
@@ -28695,7 +28727,9 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
   //  the builtin it names, as the block-less call does in invoke_val_c0)
   if map_len builtin_alias > 0
      && (match recv with VObj _ -> false | VClass _ -> false | VMain -> false | _ -> true)
-     && (if has_meth world (dispatch_cls_of world recv) name then false else true)
+     && (if has_meth world (dispatch_cls_of world recv) name
+            && (if alias_first world (dispatch_cls_of world recv) name then false else true)
+         then false else true)
      && (let src9 = blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) name in
          (if str_eq src9 "" then false else true)) then
     (let src9 = blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) name in
@@ -34228,12 +34262,28 @@ and val_shuffle_r = fn env -> fn world -> fn (rng: Val) -> fn (xs: Val list) -> 
 and prim_user_has = fn world -> fn (recv: Val) -> fn (name: str) ->
   let c = dispatch_cls_of world recv in
   ((if str_eq c "" then false else has_meth world c name)
-   && (if meth_private world c name then false else true))
+   && (if meth_private world c name then false else true)
+   // (...unless an ALIAS of a builtin comes first in the ancestors: `class
+   //  Hash; include TSort; alias tsort_each_node each_key; end` -- the class's
+   //  alias is ahead of the module's method, which raised NotImplementedError)
+   && (if map_len builtin_alias > 0 && alias_first world c name then false else true))
   // ...or the value's own SINGLETON class. dispatch_cls_of deliberately looks
   // past it (so `super` resumes above the singleton), which left respond_to?
   // answering false for a method `def a.m` had just defined and calling worked.
   || hng_sng_has world recv name
 
+// is a builtin alias of `name` reached before any method of that name, walking
+// cls's ancestors?
+and alias_first = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (m9, _, _, _) = world in
+  let rec go = fn (xs: str list) ->
+    match xs with
+    | Nil -> false
+    | Cons (a, t) ->
+      if map_has m9 (a ++ "#" ++ name) then false
+      else if map_has builtin_alias (a ++ "#" ++ name) then true
+      else go t in
+  go (ancestors_of world cls)
 // does this value's singleton class (from `def value.method`) define `name`?
 and hng_sng_has = fn world -> fn (recv: Val) -> fn (name: str) ->
   if map_len hng_store == 0 then false else
@@ -54219,6 +54269,10 @@ and protected_ok = fn env -> fn world -> fn (cls: str) ->
 // down at require time. A tombstone is all it needs: the hook is reached through
 // has_meth, which already answers false for an undef'd name.
 
+// Module's private methods a class's or module's singleton class has, which
+// undef_method may take away
+and sng_module_hook = fn (n: str) ->
+  str_list_has (str_split "extend_object|append_features|prepend_features|included|extended|prepended|method_added|method_removed|method_undefined|const_added|module_function|private|public|protected|define_method|remove_method|undef_method|alias_method|attr|attr_reader|attr_writer|attr_accessor|refine|using|remove_const|initialize_copy" "|") n
 and undef_check = fn world -> fn (cls: str) -> fn (names: str list) ->
   match names with
   | Nil -> ()
@@ -54237,6 +54291,9 @@ and undef_check = fn world -> fn (cls: str) -> fn (names: str list) ->
        // (a class's singleton inherits Class's methods: `class << self;
        //  undef_method :new; end`, as bigdecimal does)
        || (is_sng_cls cls && (str_eq n "new" || str_eq n "allocate" || builtin_has_meth "Class" n))
+       // (...and Module's, the private hooks among them: singleton.rb takes
+       //  extend_object away from Singleton's own singleton class)
+       || (is_sng_cls cls && (builtin_has_meth "Module" n || sng_module_hook n))
        // (in a refine body, a method of the REFINED class: `refine String do
        //  undef + end` takes `+` away where the refinement is active)
        || (is_refine_impl cls && (let t9 = refine_target_of cls in

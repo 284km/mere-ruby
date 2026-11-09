@@ -2564,3 +2564,47 @@ witness.
   d4b5233's binary: MATCH 7402 → 7408 (net/http 116 → 119/119, resolv
   green, io/wait 7/8 with the eighth failing in ruby too, zlib 53 → 54),
   no file lower.
+
+## 2026-11-09 (18): the top-level test files -- Forwardable, Shellwords and Singleton are ruby's own, a builtin put back with define_singleton_method -- test/*.rb 381 → 435/478
+
+Note 511's stage 3, "test直下 116" (measured now: 22 files, 478 tests, 381
+green). corpus/532 is the witness.
+
+- **Forwardable, Shellwords and Singleton were mere-ruby's own** (smaller
+  versions in m_eval_leaf.mere): ruby's lib/forwardable.rb, shellwords.rb
+  and singleton.rb are shipped now, byte for byte, through
+  tools/gen_pathname_lib.rb (lib/*_ext.rb). test_forwardable 18 → 27/27,
+  test_shellwords 5 → 11/11, test_singleton 11 → 13/13. Two interpreter
+  holes came with singleton.rb: undef_method of Module's private hooks
+  (`extend_object`, `append_features`, ...) on a singleton class was a
+  NameError, in both the statement and the method (`sng_module_hook`); and
+  extending with a module whose singleton undefined extend_object is
+  ruby's NoMethodError (its call of the hook).
+- **`define_singleton_method(:name, original)`** where original is a Method
+  of a builtin taken before the name was overridden: the override stayed
+  ahead (the Method is looked up by owner and name, which was now the
+  override's). A builtin Method (@__m_bi) puts the builtin back: the
+  override is removed. test_timeout's mocked Fiber.current_scheduler
+  stayed installed, and every later reader thread asked the mock for
+  io_wait: 0 → 35/35.
+- **A Hash literal with keys of their own #hash** collapses by that
+  protocol, as `h[k] = v` does (test_ipaddr's test_hash: eight IPAddrs,
+  five distinct).
+- **A class's alias of a builtin ahead of an included module's method**
+  (`class Hash; include TSort; alias tsort_each_node each_key`): an
+  explicit call reaches the alias now (`alias_first`); the implicit-self
+  call and `method(:name)` still reach the module's -- TSort's 3 are left.
+- SecureRandom has ruby's gen_random / gen_random_urandom /
+  gen_random_openssl; RbConfig::MAKEFILE_CONFIG keeps rubylibdir and
+  rubyarchdir unexpanded, as configure writes them.
+- **Left**: test_pty 15 (a pty: the runtime round), test_pp 5 (pp of a
+  recursive Struct, iv hiding, the AST node), test_trick 5 (the TRICK
+  entries' syntax), open3's pipeline (Process::Waiter#join), test_tsort 3,
+  weakref 2 (a recycled reference), rbconfig's sitelibdir, extlibs 2
+  (coverage, pty), delegate 1 (Exception#== asking #exception), tmpdir's
+  Ractor.
+- **Checked**: corpus 552/552 both ways, 532 under GC_STRESS=50, the 13
+  gates; 201 unittest files (8174 tests: the wide set with the top-level
+  files) against 8341bb4's binary: MATCH 7673 → 7730, no file lower
+  (test_dir's test_symlink failed on the baseline's side, under load, as
+  before).

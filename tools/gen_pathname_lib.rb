@@ -30,7 +30,10 @@ files = [[%w[pathname pathname.so], File.read("#{here}/lib/pathname_ext.rb")],
            "\n  private_constant :MereDateParse, :MereDateStrptime\nend\n"],
          [%w[time], File.read("#{here}/lib/time_ext.rb")],
          [%w[tempfile], File.read("#{here}/lib/tempfile_ext.rb")],
-         [%w[socket socket.so], File.read("#{here}/lib/socket_ext.rb")]]
+         [%w[socket socket.so], File.read("#{here}/lib/socket_ext.rb")],
+         [%w[forwardable], File.read("#{here}/lib/forwardable_ext.rb")],
+         [%w[shellwords], File.read("#{here}/lib/shellwords_ext.rb")],
+         [%w[singleton], File.read("#{here}/lib/singleton_ext.rb")]]
 
 def lit(line)
   line.gsub(/[\\"{}\t\r]/) { |c| { "\\" => "\\\\", '"' => '\\"', "{" => "\\{", "}" => "\\}", "\t" => "\\t", "\r" => "\\r" }[c] }
