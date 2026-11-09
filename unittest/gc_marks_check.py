@@ -18,7 +18,9 @@ let reference = map_new ();
 let check = fn (key: int) ->
   let _ = ensure (gc_live_has live key == map_has reference key) in
   let _ = ensure (if gc_live_has other key then false else true) in
-  let _ = gc_live_add live key in
+  let fresh = (if map_has reference key then false else true) in
+  let _ = ensure (gc_live_mark live key == fresh) in
+  let _ = ensure (if gc_live_mark live key then false else true) in
   let _ = gc_live_add live key in
   let _ = map_set reference key 1 in
   ensure (gc_live_has live key);
@@ -42,6 +44,19 @@ let _ = ensure (map_len live < 1400);
 let _ = ensure (gc_live_count other == 0);
 let _ = gc_live_add other 30;
 let _ = ensure (gc_live_count other == 1);
+let dense = map_new ();
+let rec kinds = fn (kind: int) ->
+  if kind == 8 then () else
+  let rec ids = fn (id: int) ->
+    if id == 3000 then () else
+    let _ = ensure (gc_live_mark dense (id * 8 + kind)) in
+    let _ = ensure (if kind == 7 then true else (if gc_live_has dense (id * 8 + kind + 1) then false else true)) in
+    ids (id + 1) in
+  let _ = ids 0 in
+  let _ = ensure (map_len dense == (kind + 1) * 100) in
+  kinds (kind + 1);
+let _ = kinds 0;
+let _ = ensure (gc_live_count dense == 24000);
 let _ = print "packed GC marks: boundaries, sparse IDs, duplicates and independent sets";
 '''
 with tempfile.TemporaryDirectory(prefix="mere-gc-marks-") as folder:
