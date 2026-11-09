@@ -43,6 +43,15 @@ int main(int argc,char **argv) {
  }
  if(simple(mere_embedding_setup)) return 10;
  if(simple(mere_embedding_setup)) return 11;
+ if(argc>1 && !strcmp(argv[1],"locals-after-error")) {
+  check("kept = 42",0,"");
+  handled("raise 'failed'; after_failure = 1; kept = 99","RuntimeError");
+  check("GC.start; raise 'names lost' unless TOPLEVEL_BINDING.local_variables == [:after_failure, :kept]; raise 'reflection lost' unless TOPLEVEL_BINDING.local_variable_get(:after_failure).nil?; raise 'local lost' unless after_failure.nil?; raise 'value changed' unless kept == 42",0,"");
+  check("after_failure = 7",0,"");
+  check("raise 'assignment lost' unless after_failure == 7 && kept == 42",0,"");
+  if(simple(mere_embedding_cleanup)) return 38;
+  mere_lib_shutdown(); puts("locals_after_error_passed"); return 0;
+ }
  if(argc>1 && !strcmp(argv[1],"persistent-locals")) {
   check("kept = 42; never = 1 if false",0,"");
   check("raise 'names lost' unless TOPLEVEL_BINDING.local_variables == [:kept, :never]; raise 'unassigned lost' unless TOPLEVEL_BINDING.local_variable_get(:never).nil?",0,"");

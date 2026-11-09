@@ -111,7 +111,7 @@ for mode in (['setup-failure'] if args.setup_failure else ['pending-runtime', 'p
              'hooks-error-then-exit', 'pending-runtime-normal-hook',
              'runtime-status-ivar', 'exit-subclass', 'persistent-locals',
              'bad-inspect-pending', 'bad-inspect-clear', 'bad-inspect-hook',
-             'primitive-pending']):
+             'primitive-pending', 'locals-after-error']):
     text = run(mode, [output / 'host', mode])
     if mode == 'bad-inspect-hook':
         assert text == 'after_bad_inspect\nprotected_reporting_passed\n'
