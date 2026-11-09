@@ -46,6 +46,9 @@ begin
 rescue Errno::EBADF
 end
 
+raise 'close must finish after EBADF' unless f.closed?
+raise 'repeated close' unless f.close.nil?
+
 if File.exist?('/dev/full')
   f = File.open('/dev/full', 'w')
   f.write('buffered')
@@ -58,6 +61,8 @@ if File.exist?('/dev/full')
       f.close
     rescue Errno::ENOSPC
     end
+    raise 'close must finish after ENOSPC' unless f.closed?
+    raise 'repeated close after ENOSPC' unless f.close.nil?
   end
 end
 puts 'device flush, error propagation and regular-file positions preserved'
