@@ -11314,26 +11314,55 @@ and file_flush_obj = fn world -> fn (id: int) ->
      let _ = map_delete ivars (k ++ "@__f_hook") in
      if ok then () else fail "mere-ruby: (an exception raised by a scheduler's io_write propagates)")
   else
-  let _ =
-    (if str_eq buf "" then ()
+  let flushed =
+    (if str_eq buf "" then true
      // ...but a FIFO has no content to splice into: reading it waits for a
      // writer (this one), so the bytes go through the File's descriptor
-     // (test_require's fifo tests write one from a thread)
-     else if (let m9 = fs_mode path true in m9 >= 0 && bit_and m9 61440 == 4096) then
+     // (test_require's fifo tests write one from a thread). Character devices
+     // also have no file image: padding /dev/null up to a growing logical
+     // offset allocates an ever-larger NUL prefix on every flush.
+     else if (let m9 = fs_mode path true in
+              let kind9 = bit_and m9 61440 in
+              m9 >= 0 && (kind9 == 4096 || kind9 == 8192)) then
        (let fd9 = file_fd_of world id in
-        let _ = (if fd9 >= 0 then fd_put_all fd9 buf 0 0 else 0) in ())
+        let rec write = fn (off: int) ->
+          if off >= str_len buf then true else
+          (let n9 = (if fd9 >= 0 then fd_put_all fd9 buf off 0 else 0 - 1) in
+           if n9 > 0 then
+             (let next = off + n9 in
+              // Publish only consumed bytes before any wait or exception.
+              let _ = map_set ivars (k ++ "@__f_wpos") (VInt (wpos + next)) in
+              let _ = map_set ivars (k ++ "@__f_buf") (mkstr (substring buf next (str_len buf))) in
+              write next)
+           else if n9 == 0 then (let _ = raise_exc world "IOError" "write returned zero bytes" in false)
+           else
+             (let err9 = (if fd9 < 0 then 9 else 0 - fd_neg_errno ()) in
+              let _ = errno_build () in
+              let key9 = str_of_int err9 in
+              let nm9 = (if map_has errno_by_num key9 then map_get errno_by_num key9 else "") in
+              if str_eq nm9 "EINTR" then write off
+              else if str_eq nm9 "EAGAIN" || str_eq nm9 "EWOULDBLOCK" then
+                (let entry = arr_new (Cons (VInt fd9, Cons (VInt 2, Cons (VObj id, Nil)))) in
+                 let entries = arr_new (Cons (entry, Nil)) in
+                 let _ = invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
+                           (VClass "IO") "__sel_wait" (Cons (entries, Cons (VInt (0 - 1), Nil))) false in
+                 write off)
+              else (let cls9 = (if str_eq nm9 "" then "SystemCallError" else "Errno::" ++ nm9) in
+                    let _ = raise_exc world cls9 path in false))) in
+        write 0)
      else if str_contains mode "a" then
-       (let _ = write_file path ((if file_exists path then read_file path else "") ++ buf) in ())
+       (let _ = write_file path ((if file_exists path then read_file path else "") ++ buf) in true)
      else if str_contains mode "w" || str_contains mode "+" then
        (let old9 = (if file_exists path then read_file path else "") in
         let head9 = (if str_len old9 >= wpos then substring old9 0 wpos
                      else old9 ++ str_repeat (chr 0) (wpos - str_len old9)) in
         let after9 = wpos + str_len buf in
         let tail9 = (if str_len old9 > after9 then substring old9 after9 (str_len old9) else "") in
-        let _ = write_file path (head9 ++ buf ++ tail9) in ())
-     else ()) in
-  let _ = map_set ivars (k ++ "@__f_wpos") (VInt (wpos + str_len buf)) in
-  map_set ivars (k ++ "@__f_buf") (mkstr "")
+        let _ = write_file path (head9 ++ buf ++ tail9) in true)
+     else true) in
+  if not flushed then ()
+  else (let _ = map_set ivars (k ++ "@__f_wpos") (VInt (wpos + str_len buf)) in
+        map_set ivars (k ++ "@__f_buf") (mkstr ""))
 // The File's REAL DESCRIPTOR, opened the first time something asks for one.
 //
 // ⚠ LAZILY, and that is the whole design. Until now a File here was a path
@@ -11380,7 +11409,8 @@ and file_close_obj = fn world -> fn (id: int) ->
   let (meths, sup, ocls, ivars) = world in
   let k = str_of_int id in
   // one path for getting bytes out, so a close after a flush cannot undo it
-  let _ = file_flush_obj world id in
+  let flushed = try_or (fn (u: unit) -> let _ = file_flush_obj world id in true) false in
+  let flush_exc = (if map_has ivars "$exc" then map_get ivars "$exc" else VNil) in
   // ...and a permission held back until now (file_perm_at_close)
   let _ = (match (if map_has ivars (k ++ "@__f_path") then map_get ivars (k ++ "@__f_path") else VNil) with
            | VStr ph9 -> (let p9 = sget ph9 in
@@ -11408,7 +11438,9 @@ and file_close_obj = fn world -> fn (id: int) ->
            | VStr h9 -> (if str_eq (sget h9) "" then () else map_set ivars (k ++ "@__f_lastmode") (VStr h9))
            | _ -> ()) in
   let _ = map_set ivars (k ++ "@__f_mode") (mkstr "") in
-  if bad9 then
+  let _ = map_set ivars (k ++ "@__f_buf") (mkstr "") in
+  if not flushed then (let _ = re_raise world flush_exc in ())
+  else if bad9 then
     (let p9 = (match (if map_has ivars (k ++ "@__f_path") then map_get ivars (k ++ "@__f_path") else VNil) with
                | VStr ph9 -> sget ph9 | _ -> "") in
      let _ = raise_exc world "Errno::EBADF" ("Bad file descriptor @ fptr_finalize_flush - " ++ p9) in ())
