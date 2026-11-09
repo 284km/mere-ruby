@@ -26,3 +26,12 @@ custom = {}
 p [custom.key?(MembershipKey.new(5)), custom.include?(MembershipKey.new(21))]
 GC.start
 p custom.member?(MembershipKey.new(19))
+
+# Identity hashes must never structurally digest a shared container graph.
+shared = []
+22.times { shared = [shared, shared] }
+identity = {}.compare_by_identity
+identity[shared] = nil
+p [identity.key?(shared), identity.has_key?(shared),
+   identity.include?(shared), identity.member?(shared)]
+p [identity.key?([]), identity.member?(nil)]
