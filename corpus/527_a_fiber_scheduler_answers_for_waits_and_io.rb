@@ -87,7 +87,13 @@ Thread.new do
   m2 = Thread::Mutex.new
   Fiber.schedule { m2.synchronize { cv.wait(m2); order << :signalled } }
   Fiber.schedule { m2.synchronize { cv.signal } }
-  Fiber.schedule { order << [:slept, sleep(0.01)] }
+  Fiber.schedule do
+    started = s.now
+    seconds = sleep(0.01)
+    # CRuby subtracts whole wall-clock seconds, so a 10 ms sleep may return
+    # either 0 or 1. Compare the contract and elapsed duration, not that value.
+    order << [:slept, seconds.is_a?(Integer) && seconds >= 0, s.now - started >= 0.01]
+  end
   Fiber.schedule do
     t = Thread.new { :joined }
     order << [:value, t.value]
