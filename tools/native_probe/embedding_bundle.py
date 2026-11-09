@@ -77,11 +77,27 @@ inputs = [generated / 'embedding.o', generated / 'embedding.h', prism, *glue,
           FIXTURES / 'embedding_integration.c', FIXTURES / 'embedding_host.c']
 (output / 'manifest.json').write_text(json.dumps({
     'schema': 1,
+    'build_provenance': json.loads((generated / 'build-provenance.json').read_text()) if (generated / 'build-provenance.json').is_file() else None,
     'archive': str(archive),
     'platform': platform.platform(),
     'system_link_flags': link,
     'members': [p.name for p in sorted(objects.glob('*.o'))],
     'sha256': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [*inputs, archive]},
     'api': 'generated mere_embedding_* API; no ruby_init/ruby_cleanup facade',
+}, indent=2) + '\n')
+# Preserve templates separately from expanded consumer paths. Build tools may
+# substitute exec_prefix; an absolute MAKEFILE_CONFIG libdir breaks that use.
+(output / 'build-config.json').write_text(json.dumps({
+    'schema': 1,
+    'templates': {'prefix': str(output), 'exec_prefix': '$(prefix)',
+                  'libdir': '$(exec_prefix)/lib', 'includedir': '$(prefix)/include',
+                  'RUBY_SO_NAME': 'mere-ruby',
+                  'LIBRUBY_A': 'lib$(RUBY_SO_NAME)-embedding.a',
+                  'LIBRUBYARG_STATIC': '$(libdir)/$(LIBRUBY_A)'},
+    'expanded': {'prefix': str(output), 'exec_prefix': str(output),
+                 'libdir': str(libraries), 'includedir': str(includes),
+                 'LIBRUBY_A': archive.name, 'LIBRUBYARG_STATIC': str(archive)},
+    'system_link_flags': link,
+    'api': 'mere_embedding_*; not the CRuby VALUE ABI',
 }, indent=2) + '\n')
 print('Self-contained embedding archive and consumer checks passed', flush=True)

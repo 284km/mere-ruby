@@ -107,4 +107,19 @@ paths = [compiler, prism, *ROOT.glob('*.mere'), *FIXTURES.glob('embedding*'),
          output / 'embedding.c', output / 'embedding.h', archive, output / 'host']
 (output / 'sha256.json').write_text(json.dumps({str(p): hashlib.sha256(p.read_bytes()).hexdigest()
     for p in paths if p.is_file()}, indent=2) + '\n')
+def revision(directory):
+    result = subprocess.run(['git', '-C', str(directory), 'rev-parse', 'HEAD'],
+                            capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+(output / 'build-provenance.json').write_text(json.dumps({
+    'schema': 1,
+    'source_revision': revision(ROOT),
+    'compiler_revision': revision(compiler.parent),
+    'compiler_sha256': hashlib.sha256(compiler.read_bytes()).hexdigest(),
+    'prism_sha256': hashlib.sha256(prism.read_bytes()).hexdigest(),
+    'target': platform.platform(),
+    'sources': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in [*ROOT.glob('*.mere'), *FIXTURES.glob('embedding*')]
+                if p.is_file()},
+}, indent=2) + '\n')
 print('Protected embedding lifecycle checks passed', flush=True)
