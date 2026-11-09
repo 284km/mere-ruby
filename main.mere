@@ -1633,6 +1633,21 @@ let gc_collect = fn env -> fn world ->
             let _ = (if fd_close fd9 == 0 then fd_forget fd9 else ()) in
             close_fds (i + 1)) in
     let _ = close_fds 0 in
+    // Native destructors cannot call Ruby or access Mere regions. Collect
+    // weak ownership entries first; releasing one may free other C resources.
+    let dSSL = vec_new () in
+    let _ = map_iter openssl_owned (fn (owner: int) -> fn (handle: int) ->
+      if map_has live ((owner + handle_base) * 8) then () else vec_push dSSL owner) in
+    let rec release_ssl = fn (i: int) ->
+      if i >= vec_len dSSL then () else
+      (let owner = vec_get dSSL i in
+       let handle = map_get openssl_owned owner in
+       let _ = mr_ossl_release handle in
+       let _ = map_delete openssl_owner handle in
+       let _ = map_delete openssl_owned owner in release_ssl (i + 1)) in
+    let _ = release_ssl 0 in
+    let _ = (if nc then () else map_compact openssl_owned) in
+    let _ = (if nc then () else map_compact openssl_owner) in
     let _ = gc_drop_s ivars dIV in
     let _ = (if nc then () else map_compact ivars) in
     // every key here IS an object id now -- the one non-numeric entry ("$next")
@@ -21296,10 +21311,52 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // __prism_ are answered, as for Syslog above.
     else if str_eq c "OpenSSL" && str_eq name "__native_available" then
       VBool (try_or_msg (fn (u: unit) -> mr_ossl_available () == 1) (fn (m: str) -> false))
+    else if str_eq c "OpenSSL" && str_eq name "__native_bind" then
+      (match args with
+       | Cons (VObj owner, Cons (VInt handle, Nil)) ->
+         let owner = owner - handle_base in
+         if handle <= 0 || handle > 2147483647 || mr_ossl_valid handle != 1 then
+           raise_exc world "TypeError" "invalid native OpenSSL handle"
+         else if map_has openssl_owned owner || map_has openssl_owner handle then
+           raise_exc world "TypeError" "native OpenSSL object already has an owner"
+         else (let _ = map_set openssl_owned owner handle in
+               let _ = map_set openssl_owner handle owner in VNil)
+       | _ -> raise_exc world "TypeError" "invalid native OpenSSL owner")
+    else if str_eq c "OpenSSL" && str_eq name "__native_handle" then
+      (match args with
+       | Cons (VObj owner, Nil) ->
+         let owner = owner - handle_base in
+         if map_has openssl_owned owner then VInt (map_get openssl_owned owner)
+         else raise_exc world "TypeError" "native OpenSSL object wasn't initialized"
+       | _ -> raise_exc world "TypeError" "invalid native OpenSSL owner")
+    else if str_eq c "OpenSSL" && str_eq name "__native_move" then
+      (match args with
+       | Cons (VObj source, Cons (VObj target, Nil)) ->
+         let source = source - handle_base in
+         let target = target - handle_base in
+         if source == target then VNil
+         else if map_has openssl_owned source && (if map_has openssl_owned target then false else true) then
+           (let handle = map_get openssl_owned source in
+            let _ = map_delete openssl_owned source in
+            let _ = map_set openssl_owned target handle in
+            let _ = map_set openssl_owner handle target in VNil)
+         else raise_exc world "TypeError" "invalid native OpenSSL ownership transfer"
+       | _ -> raise_exc world "TypeError" "invalid native OpenSSL owner")
+    else if str_eq c "OpenSSL" && str_eq name "__native_release" then
+      (match args with
+       | Cons (VObj owner, Nil) ->
+         let owner = owner - handle_base in
+         if map_has openssl_owned owner then
+           (let handle = map_get openssl_owned owner in
+            let _ = map_delete openssl_owned owner in
+            let _ = map_delete openssl_owner handle in VBool (mr_ossl_release handle == 1))
+         else VBool false
+       | _ -> raise_exc world "TypeError" "invalid native OpenSSL owner")
     else if str_eq c "OpenSSL" && str_eq name "__native_call" then
       (match args with
        | Cons (VStr operation, Cons (VStr payload, Nil)) ->
-         mkstr_e (str_of_bytes (mr_ossl_call (sget operation) (bytes_of_str (sget payload)))) "ASCII-8BIT"
+         (let reply = str_of_bytes (mr_ossl_call (sget operation) (bytes_of_str (sget payload))) in
+          let _ = mr_ossl_clear_result () in mkstr_e reply "ASCII-8BIT")
        | _ -> raise_exc world "ArgumentError" "invalid OpenSSL provider arguments")
     else if str_eq c "Prism" && str_len name > 8 && str_eq (substring name 0 8) "__prism_"
             && (str_eq name "__prism_ser" || str_eq name "__prism_ok" || str_eq name "__prism_more"

@@ -1,8 +1,12 @@
 # ruby tools/gen_openssl_lib.rb > m_openssl_lib.mere
 require 'pathname'
 root = Pathname.new(__dir__).parent
-names = %w[core bn oid asn1 backend]
+names = %w[core bn oid asn1 backend pkey ec config x509]
 source = names.map { |name| root.join("lib/openssl_#{name}.rb").read }.join("\n")
+source = root.join('vendor/openssl/BSDL').read.lines.map { |line| '# ' + line }.join + source
+%w[marshal pkey x509].each do |name|
+  source << "\n" << root.join("vendor/openssl/lib/openssl/#{name}.rb").read.lines.reject { |line| line.start_with?('require_relative ', '# frozen_string_literal:') }.join
+end
 if ARGV.include?('--ruby')
   print source
   exit

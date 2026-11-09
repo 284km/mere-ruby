@@ -192,6 +192,7 @@ module OpenSSL
         oid, short, long = [oid, short, long].map { |v| ASN1.string(v) }
         raise ASN1Error, 'invalid or duplicate object identifier' if OID_NAMES.key?(oid) || OID_LOOKUP.key?(short) || OID_LOOKUP.key?(long)
         ObjectId.new(oid).to_der
+        Backend.call('oid.register', oid, short, long) if defined?(Backend) && OpenSSL.__native_available
         OID_NAMES[oid] = [short, long]
         [oid, short, long].each { |name| OID_LOOKUP[name] = oid }
         true

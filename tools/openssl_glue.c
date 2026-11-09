@@ -5,6 +5,17 @@
 #include <openssl/err.h>
 #include <openssl/bn.h>
 #include <openssl/evp.h>
+#include <openssl/decoder.h>
+#include <openssl/encoder.h>
+#include <openssl/core_names.h>
+#include <openssl/pem.h>
+#include <openssl/ec.h>
+#include <openssl/provider.h>
+#include <openssl/x509v3.h>
+#include <openssl/conf.h>
+#include <time.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -15,23 +26,24 @@ struct mere_bytes { long long len; unsigned char data[]; };
 typedef struct mere_bytes mere_bytes;
 enum { WIRE_LIMIT = 64 * 1024 * 1024, NODE_LIMIT = 1048576 };
 typedef struct arg { char type; size_t len; char *s; struct arg *items; } arg;
-typedef struct buffer { unsigned char *p; size_t len, cap; } buffer;
+typedef struct buffer { unsigned char *p; size_t len, cap; int failed; } buffer;
 static mere_bytes *result;
 static size_t result_cap;
 
 static int reserve(buffer *b, size_t n) {
-    if (n > WIRE_LIMIT || b->len > WIRE_LIMIT - n) return 0;
+    if (b->failed) return 0;
+    if (n > WIRE_LIMIT || b->len > WIRE_LIMIT - n) { b->failed=1; return 0; }
     if (b->len + n > b->cap) {
         size_t cap = b->cap ? b->cap : 256;
         while (cap < b->len + n) cap *= 2;
         void *p = realloc(b->p, cap);
-        if (!p) return 0;
+        if (!p) { b->failed=2; return 0; }
         b->p = p; b->cap = cap;
     }
     return 1;
 }
 static void put(buffer *b, const void *p, size_t n) {
-    if (!reserve(b,n)) abort();
+    if (!reserve(b,n)) return;
     if(n) memcpy(b->p+b->len,p,n); b->len+=n;
 }
 static void byte(buffer *b, char c) { put(b,&c,1); }
@@ -48,7 +60,7 @@ static void integer(buffer *b, long long n) {
 }
 static void boolean(buffer *b, int truth) { byte(b,truth?'t':'f'); }
 static void error(buffer *b, const char *klass, const char *message) {
-    b->len=0; byte(b,'e'); text(b,klass); text(b,message);
+    b->len=0; b->failed=0; byte(b,'e'); text(b,klass); text(b,message);
     ERR_clear_error();
 }
 static void ssl_error(buffer *b, const char *klass, const char *operation) {
@@ -123,8 +135,15 @@ static void bn_call(const char *op,const arg *args,buffer *out) {
     BN_CTX *ctx=BN_CTX_new();
     int ok=0, answer=-1;
     if(!a||!r||!rem||!ctx) goto done;
-    if(args->len>1 && at(args,1)->type!='n') b=bn_arg(at(args,1));
-    if(args->len>2 && at(args,2)->type!='n') c=bn_arg(at(args,2));
+    const arg *flags=at(args,args->len-1);
+    size_t argc=args->len-(flags->type=='a'?1:0);
+    if(argc>1 && at(args,1)->type!='n') b=bn_arg(at(args,1));
+    if(argc>2 && at(args,2)->type!='n') c=bn_arg(at(args,2));
+    if(flags->type=='a') {
+        BN_set_flags(a,(int)num(at(flags,0)));
+        if(b) BN_set_flags(b,(int)num(at(flags,1)));
+        if(c) BN_set_flags(c,(int)num(at(flags,2)));
+    }
     if(!strcmp(op,"sqr")) ok=BN_sqr(r,a,ctx);
     else if(!strcmp(op,"add")&&b) ok=BN_add(r,a,b);
     else if(!strcmp(op,"sub")&&b) ok=BN_sub(r,a,b);
@@ -165,6 +184,13 @@ done:
     BN_clear_free(a); BN_clear_free(b); BN_clear_free(c); BN_clear_free(r); BN_clear_free(rem); BN_CTX_free(ctx);
 }
 
+#include "openssl/registry.inc"
+#include "openssl/pkey.inc"
+#include "openssl/x509.inc"
+#include "openssl/x509_constants.inc"
+#include "openssl/x509_store.inc"
+#include "openssl/config.inc"
+
 static void dispatch(const char *op,const arg *args,buffer *out) {
     if(!strcmp(op,"version")) { text(out,OpenSSL_version(OPENSSL_VERSION)); return; }
     if(!strcmp(op,"version_number")) { integer(out,(long long)OpenSSL_version_num()); return; }
@@ -174,11 +200,43 @@ static void dispatch(const char *op,const arg *args,buffer *out) {
         byte(out,'a'); number(out,n); put(out,entries.p,entries.len); free(entries.p); return;
     }
     if(!strncmp(op,"bn.",3)) { bn_call(op+3,args,out); return; }
+    if(!strncmp(op,"object.",7)) { object_call(op+7,args,out); return; }
+    if(!strncmp(op,"pkey.",5)) { pkey_call(op+5,args,out); return; }
+    if(!strncmp(op,"keygen.",7)) { keygen_call(op+7,args,out); return; }
+    if(!strncmp(op,"ec_group.",9)) { ec_group_call(op+9,args,out); return; }
+    if(!strncmp(op,"ec_point.",9)) { ec_point_call(op+9,args,out); return; }
+    if(!strncmp(op,"xname.",6)) { x509_name_call(op+6,args,out); return; }
+    if(!strncmp(op,"xext.",5)) { x509_extension_call(op+5,args,out); return; }
+    if(!strncmp(op,"xcert.",6)) { x509_certificate_call(op+6,args,out); return; }
+    if(!strncmp(op,"xreq.",5)) { x509_request_call(op+5,args,out); return; }
+    if(!strncmp(op,"xcrl.",5)) { x509_crl_call(op+5,args,out); return; }
+    if(!strncmp(op,"xrev.",5)) { x509_revoked_call(op+5,args,out); return; }
+    if(!strncmp(op,"xstore.",7)) { x509_store_call(op+7,args,out); return; }
+    if(!strncmp(op,"xctx.",5)) { x509_context_call(op+5,args,out); return; }
+    if(!strcmp(op,"x509.constants")) { x509_constants(out); return; }
+    if(!strncmp(op,"config.",7)) { config_call(op+7,args,out); return; }
+    if(!strcmp(op,"oid.register")) {
+        if(!count(args,3,3,out)) return;
+        const arg *oid=at(args,0),*sn=at(args,1),*ln=at(args,2);
+        if(oid->type!='s'||sn->type!='s'||ln->type!='s'||memchr(oid->s,0,oid->len)||memchr(sn->s,0,sn->len)||memchr(ln->s,0,ln->len))
+            error(out,"OpenSSL::ASN1::ASN1Error","invalid OID name");
+        else if(OBJ_create(oid->s,sn->s,ln->s)==NID_undef) ssl_error(out,"OpenSSL::ASN1::ASN1Error","OBJ_create");
+        else boolean(out,1);
+        return;
+    }
+    if(!strcmp(op,"fips_mode")) { boolean(out,EVP_default_properties_is_fips_enabled(NULL)); return; }
     error(out,"NotImplementedError","unknown native OpenSSL operation");
 }
 
 int mr_ossl_available(void) { return 1; }
+int mr_ossl_valid(int id) { return lookup(id,0)!=NULL; }
+int mr_ossl_release(int id) { return release(id); }
+int mr_ossl_clear_result(void) {
+    if(result&&result->len>0) { OPENSSL_cleanse(result->data,(size_t)result->len); result->len=0; }
+    return 0;
+}
 mere_bytes *mr_ossl_call(const char *operation,mere_bytes *input) {
+    mr_ossl_clear_result();
     buffer out={0}; arg args={0}; size_t nodes=0;
     if(!input||input->len<0||input->len>WIRE_LIMIT) {
         error(&out,"ArgumentError","provider request too large");
@@ -188,6 +246,10 @@ mere_bytes *mr_ossl_call(const char *operation,mere_bytes *input) {
         else dispatch(operation,&args,&out);
     }
     free_arg(&args);
+    if(out.failed) {
+        int memory=out.failed==2;
+        error(&out,memory?"NoMemoryError":"RangeError",memory?"native provider allocation failed":"native provider response exceeds wire budget");
+    }
     if(result_cap<out.len || (result_cap>8*1024*1024 && out.len<4096)) {
         size_t cap=out.len<4096?4096:out.len;
         void *p=realloc(result,sizeof(mere_bytes)+cap); if(!p) abort();

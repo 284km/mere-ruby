@@ -83,7 +83,8 @@ module OpenSSL
     end
     def native_math(operation, *others)
       values = [@value.to_s] + others.map { |n| BN.number(n).to_s }
-      result = Backend.call('bn.' + operation, *values)
+      flags = [get_flags(CONSTTIME)] + others.map { |n| n.is_a?(BN) ? n.get_flags(CONSTTIME) : 0 }
+      result = Backend.call('bn.' + operation, *values, flags)
       result.is_a?(Array) ? result.map { |n| BN.new(n) } : BN.new(result)
     end
     private :native_math
