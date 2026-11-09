@@ -59,11 +59,13 @@ class StringIO
             Encoding.find(ext.to_s.split(":")[0])
           end
     @enc = enc
-    @st.string.force_encoding(enc) if @st.string && !@st.string.frozen?
+    # (a chilled literal keeps its encoding: changing it would be the change
+    #  ruby warns about, and strio_set_encoding leaves such a string alone)
+    @st.string.force_encoding(enc) if @st.string && !@st.string.frozen? && !@st.string.__chilled?
     self
   end
 
-  def self.open(string = nil, mode = nil, **opts)
+  def self.open(string = NO_STRING, mode = nil, **opts)
     io = new(string, mode, **opts)
     return io unless block_given?
     begin
@@ -606,8 +608,9 @@ class StringIO
         seen.delete(orig.__id__)
       else
         s = a.to_s
-        # a #to_s that is not a String is replaced by the default one
-        s = format("#<%s:0x%016x>", a.class.to_s, a.__id__) unless s.is_a?(String)
+        # a #to_s that is not a String is replaced by the default one --
+        # Kernel#to_s itself, so the address is the one #inspect shows
+        s = Kernel.instance_method(:to_s).bind_call(a) unless s.is_a?(String)
         write(s)
         write("\n") unless s.end_with?("\n")
       end
