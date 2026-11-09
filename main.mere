@@ -1467,6 +1467,47 @@ let gc_sweep_structs = fn world -> fn live -> fn (nc: bool) ->
              let _ = map_compact privates in let _ = map_compact vis_marks in let _ = map_compact alias_srcname in
              let _ = map_compact struct_gen in let _ = map_compact struct_initializers in let _ = map_compact struct_mem in map_compact anon_name))
   };
+// a key's IDENTITY, as WeakMap compares keys: a handle by its id, an
+// immediate by its value
+let weak_ident = fn (v: Val) ->
+  match v with
+  | VObj i -> "o" ++ str_of_int i
+  | VStr i -> "s" ++ str_of_int i
+  | VArr i -> "a" ++ str_of_int i
+  | VHsh i -> "h" ++ str_of_int i
+  | VProc i -> "p" ++ str_of_int i
+  | VInt n -> "i" ++ str_of_int n
+  | VSym y -> "y" ++ y
+  | VClass c -> "c" ++ c
+  | _ -> "v" ++ inspect v;
+// a handle the marking did not reach (an immediate is never collected)
+let weak_dead = fn live -> fn (v: Val) ->
+  match v with
+  | VObj i -> (if map_has live (i * 8) then false else true)
+  | VStr i -> (if map_has live (i * 8 + 1) then false else true)
+  | VArr i -> (if map_has live (i * 8 + 2) then false else true)
+  | VHsh i -> (if map_has live (i * 8 + 3) then false else true)
+  | VProc i -> (if map_has live (i * 8 + 4) then false else true)
+  | _ -> false;
+// WeakMap's sweep: an entry whose map, key or value died goes with it (the
+// dead are gathered first, then deleted; deleting allocates nothing)
+let gc_weak_prune = fn live ->
+  if map_len weak_k == 0 then ()
+  else
+    (let gone9 = vec_new () in
+     let _ = map_iter weak_k (fn (s9: int) -> fn (k9: Val) ->
+       if weak_dead live (VObj (map_get weak_own s9)) || weak_dead live k9 || weak_dead live (map_get weak_v s9)
+       then vec_push gone9 s9 else ()) in
+     let rec go = fn (i: int) ->
+       (if i >= vec_len gone9 then ()
+        else (let s9 = vec_get gone9 i in
+              let _ = map_delete weak_ix (map_get weak_ixk s9) in
+              let _ = map_delete weak_ixk s9 in
+              let _ = map_delete weak_k s9 in
+              let _ = map_delete weak_v s9 in
+              let _ = map_delete weak_own s9 in
+              go (i + 1))) in
+     go 0);
 let gc_collect = fn env -> fn world ->
   region GCC {
     let (meths, sup, ocls, ivars) = world in
@@ -1513,6 +1554,7 @@ let gc_collect = fn env -> fn world ->
          let kh9 = vec_get md_lz_v (o + 4) in
          if kh9 >= 0 then gc_mark_val live (VStr kh9) else ())
       else ()) in
+    let _ = gc_weak_prune live in
     let _ = gc_sweep_captured live in
     let _ = gc_sweep_structs world live nc in
     // THE PROCS NOTHING REACHED (the VProc arm of gc_mark_val marks the ones
@@ -2878,6 +2920,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else (let _ = vec_set super_idx_pend 0 j2 in run_meth world (sbh, sbp, sbb, sbe) recv a2 meth (map_get meths (a2 ++ "#" ++ meth)) args))
   | EBlockPass e -> eval_e env world blk e   // non-&:sym block-pass: best effort
   | EAssign (name, e) ->
+    // (the local exists, as nil, from its own assignment on, as the statement
+    //  form's does: `p(x ||= 5)` reads x before the write)
+    let _ = (if str_len name > 0
+                && (let c = ord (char_at name 0) in (c >= 97 && c <= 122) || c == 95)
+                && (if lv_has env name then false else true)
+             then lv_set env name VNil else ()) in
     let (skip9, v) = const_opassign env world blk name e in
     if skip9 then v else
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
@@ -3251,7 +3299,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if (str_len name == 15 && str_eq name "local_variables") then local_vars_of env
     // Kernel#instance_variables_to_inspect (ruby 4.0): nil means "all of them";
     // a class overrides it to choose what #inspect shows (see inspect_w).
-    else if (str_len name == 29 && str_eq name "instance_variables_to_inspect") then VNil
+    // (a singleton override on self is the receiver's own answer: pp asks for it bare)
+    else if (str_len name == 29 && str_eq name "instance_variables_to_inspect")
+            && (if lv_has env "self" then (if has_meth world (dispatch_cls_of world (lv_get env "self")) name then false else true) else true) then VNil
     else if (str_len name == 16 && str_eq name "global_variables") && (if map_has meths name then false else true) then global_vars_with_match env world blk
     // Kernel#binding: capture the current locals env (which holds "self") --
     // unless the receiver has its own `binding` (rubocop-ast's compiler holds
@@ -3316,6 +3366,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if (str_len name == 8 && str_eq name "readline") && (if kernel_overridden env world "readline" then false else true) then
       (match rb_gets () with VNil -> raise_exc world "EOFError" "end of file reached" | v -> v)
     else if (str_len name == 9 && str_eq name "readlines") && (if kernel_overridden env world "readlines" then false else true) then arr_new (rb_readlines ())
+    // ...and a bare `select` is Kernel#select (IO.select) where self is no
+    // Enumerable: its ArgumentError, which TRICK 2013's yhara spells "A" with
+    else if (str_len name == 6 && str_eq name "select")
+            && (if self_defines env world name then false else true)
+            && (match (if lv_has env "self" then lv_get env "self" else VMain) with
+                | VMain -> true
+                | VObj o9 -> (let (_, _, oc9, _) = world in
+                              if str_list_has (ancestors_of world (map_get oc9 o9)) "Enumerable" then false else true)
+                | _ -> false) then
+      invoke_val_c env world blk (VClass "IO") "select" Nil false
     else try_self_call env world VNil name Nil
   // `private(:foo)` / `public(:foo)` at the top level is the statement
   // `private :foo` (main's own visibility methods), parentheses or not: it
@@ -4016,7 +4076,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let hk = hng_key other in
          let tagged = if str_eq hk "" then false else map_has hng_store hk in
          let tagcls = if tagged then map_get hng_store hk else "" in
-         if tagged && has_meth world tagcls name then invoke world newblk other tagcls name args
+         if tagged && has_meth world tagcls name
+            && (if map_len builtin_alias > 0 && alias_first world tagcls name then false else true) then invoke world newblk other tagcls name args
          else if tagged && (if str_eq (blt_alias_lookup world (ancestors_of world tagcls) name) "" then false else true) then
            (let src = blt_alias_lookup world (ancestors_of world tagcls) name in
             // (with the block it was called with: Enumerable#find's `each`
@@ -5466,6 +5527,18 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
               (if str_len (sget sh9) == 0 then arith_bin op va0 (VInt 0)
                else if str_len (sget sh9) > 1 then raise_exc world "ArgumentError" "argument too big"
                else raise_exc world "NoMemoryError" "failed to allocate memory")
+            else arith_bin op va0 (VInt (if f < 0.0 then 0 else int_of_float f)))
+         | _ -> arith_bin op va0 vb)
+      // (...and an Array's count the same way: rb_ary_times reads it through
+      //  NUM2LONG too -- TRICK 2013's mame writes `[128]*n=20E2`)
+      else if str_eq op "*" && (match va0 with VArr _ -> true | _ -> false) && (match vb with VFlt _ -> true | _ -> false) then
+        (match vb with
+         | VFlt f ->
+           (if flt_is_nan f then raise_exc world "RangeError" "float NaN out of range of integer"
+            else if flt_is_inf f then raise_exc world "RangeError" ("float " ++ (if f > 0.0 then "Inf" else "-Inf") ++ " out of range of integer")
+            else if f >= 9223372036854775808.0 || f < 0.0 - 9223372036854775808.0 then
+              raise_exc world "RangeError" ("float " ++ (if f < 0.0 then "-" else "") ++ fmt_g_abs (VFlt (if f < 0.0 then 0.0 - f else f)) 10 false false ++ " out of range of integer")
+            else if f <= 0.0 - 1.0 then raise_exc world "ArgumentError" "negative argument"
             else arith_bin op va0 (VInt (if f < 0.0 then 0 else int_of_float f)))
          | _ -> arith_bin op va0 vb)
       // `arr * "sep"` is `arr.join(sep)`, not repetition -- ruby's Array#* takes
@@ -12722,7 +12795,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
        // ⚠ a struct that holds itself recursed until the stack died
        //   (test_struct's `o.a = o`): ruby prints the class path and "..."
        //   there, the path of an anonymous one being `#<Class:0x..>`.
-       if map_has insp_seen ("o" ++ str_of_int oid) then
+       if map_has insp_seen ("o" ++ str_of_int oid) || insp_pp_held env world v then
          "#<struct " ++ cls_display world cls ++ ":...>"
        else
          (let _ = map_set insp_seen ("o" ++ str_of_int oid) 1 in
@@ -12782,7 +12855,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     //   @me = self; end; end; p C.new` was a SIGSEGV, and so was
     //   `Thread.new { Thread.current.exit }.value` (the thread ends up holding
     //   itself). ruby shows the address again and then "...".
-    else if map_has insp_seen ("o" ++ str_of_int oid) then
+    else if map_has insp_seen ("o" ++ str_of_int oid) || insp_pp_held env world v then
       "#<" ++ cls_display world (obj_print_cls world cls) ++ ":0x" ++ hex_pad16 (oid - handle_base) ++ " ...>"
     else
       // ruby 4.0: Kernel#inspect asks #instance_variables_to_inspect first. An
@@ -12813,14 +12886,14 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
        let _ = map_delete insp_seen ("o" ++ str_of_int oid) in
        r8)
   | VArr id ->
-    if map_has insp_seen ("a" ++ str_of_int id) then "[...]"
+    if map_has insp_seen ("a" ++ str_of_int id) || insp_pp_held env world v then "[...]"
     else
       let _ = map_set insp_seen ("a" ++ str_of_int id) 1 in
       let r = "[" ++ join_inspect_w env world (deref id) "" ++ "]" in
       let _ = map_delete insp_seen ("a" ++ str_of_int id) in
       r
   | VHsh hid ->
-    if map_has insp_seen ("h" ++ str_of_int hid) then "\{...}"
+    if map_has insp_seen ("h" ++ str_of_int hid) || insp_pp_held env world v then "\{...}"
     else
       let _ = map_set insp_seen ("h" ++ str_of_int hid) 1 in
       let r = "\{" ++ join_pairs_w env world (hderef hid) "" ++ "}" in
@@ -21575,6 +21648,63 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // says false, bo_notimpl), and calling one is ruby's rb_f_notimplement
     else if str_eq c "Process" && bo_notimpl c name && (if has_meth world "(sng:Process)" name then false else true) then
       raise_exc world "NotImplementedError" (name ++ "() function is unimplemented on this machine")
+    // a struct's member names from its table, which no member can shadow
+    // (the Struct prelude's #[] and #to_h read them so: a member may be named
+    // `members`)
+    else if str_eq c "Struct" && (str_len name == 12 && str_eq name "__members_of") then
+      (match args with
+       | Cons (VObj o9, _) ->
+         (let (_, _, oc9, _) = world in
+          match map_get struct_mem (struct_members_cls world (ancestors_of world (map_get oc9 o9))) with
+          | VArr aid -> arr_new (deref aid)
+          | _ -> arr_new Nil)
+       | _ -> arr_new Nil)
+    // ObjectSpace::WeakMap's table (weak_k / weak_v, not GC roots): set, get
+    // and delete answer [true, value] for an entry and nil for none, since a
+    // stored value can itself be nil; __wm_pairs lists [key, value] in the
+    // order they were first set
+    else if str_eq c "ObjectSpace" && str_len name > 5 && str_eq (substring name 0 5) "__wm_" then
+      (match args with
+       | Cons (VObj m9, rest9) ->
+         (let ix9 = fn (k: Val) -> str_of_int m9 ++ ":" ++ weak_ident k in
+          if str_eq name "__wm_set" then
+            (match rest9 with
+             | Cons (k9, Cons (v9, _)) ->
+               (let ik9 = ix9 k9 in
+                if map_has weak_ix ik9 then (let _ = map_set weak_v (map_get weak_ix ik9) v9 in v9)
+                else (let s9 = (if map_has weak_seq "n" then map_get weak_seq "n" else 0) + 1 in
+                      let _ = map_set weak_seq "n" s9 in
+                      let _ = map_set weak_ix ik9 s9 in
+                      let _ = map_set weak_ixk s9 ik9 in
+                      let _ = map_set weak_own s9 m9 in
+                      let _ = map_set weak_k s9 k9 in
+                      let _ = map_set weak_v s9 v9 in v9))
+             | _ -> VNil)
+          else if str_eq name "__wm_get" || str_eq name "__wm_del" then
+            (match rest9 with
+             | Cons (k9, _) ->
+               (let ik9 = ix9 k9 in
+                if map_has weak_ix ik9 then
+                  (let s9 = map_get weak_ix ik9 in
+                   let v9 = map_get weak_v s9 in
+                   let _ = (if str_eq name "__wm_del" then
+                              (let _ = map_delete weak_ix ik9 in let _ = map_delete weak_ixk s9 in
+                               let _ = map_delete weak_k s9 in let _ = map_delete weak_v s9 in
+                               map_delete weak_own s9)
+                            else ()) in
+                   arr_new (Cons (VBool true, Cons (v9, Nil))))
+                else VNil)
+             | _ -> VNil)
+          else if str_eq name "__wm_pairs" then
+            // (newest first down to 1, consing: the list comes out oldest first)
+            (let rec walk = fn (s9: int) -> fn (acc: Val list) ->
+               (if s9 < 1 then acc
+                else if map_has weak_own s9 && map_get weak_own s9 == m9
+                then walk (s9 - 1) (Cons (arr_new (Cons (map_get weak_k s9, Cons (map_get weak_v s9, Nil))), acc))
+                else walk (s9 - 1) acc) in
+             arr_new (walk (if map_has weak_seq "n" then map_get weak_seq "n" else 0) Nil))
+          else VNil)
+       | _ -> VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 19 && str_eq name "__internal_class_of") then
       (match args with Cons (value, _) -> objectspace_class_of world value | _ -> VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 10 && str_eq name "__fin_flag") then
@@ -22503,6 +22633,30 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        if (str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "===") then
          (if map_has ivars (str_of_int id ++ "@__m_mm")
           then invoke_val_c env world blk mrecv "method_missing" (Cons (VSym mnm, args)) false
+          // (Struct's own #members, #size, #to_a ... bound to a struct answer
+          //  from its member table, whatever a member of that name made of
+          //  the method: pp binds Struct#members to every struct it prints,
+          //  and `Struct.new(:members, :class)` is a test of exactly that)
+          else if str_eq mown "Struct" && is_struct_gen_method mnm && (match args with Nil -> true | _ -> false)
+                  && (match mrecv with VObj o9 -> (let (_, _, oc9, _) = world in is_struct_obj_cls world (map_get oc9 o9)) | _ -> false)
+                  && (str_eq mnm "members" || str_eq mnm "size" || str_eq mnm "length" || str_eq mnm "to_a"
+                      || str_eq mnm "to_ary" || str_eq mnm "values" || str_eq mnm "deconstruct") then
+            (match mrecv with
+             | VObj o9 ->
+               (let (_, _, oc9, iv9) = world in
+                let ms9 = (match map_get struct_mem (struct_members_cls world (ancestors_of world (map_get oc9 o9))) with
+                           | VArr aid -> deref aid | _ -> Nil) in
+                if str_eq mnm "members" then arr_new ms9
+                else if str_eq mnm "size" || str_eq mnm "length" then VInt (vals_len ms9 0)
+                else
+                  (let rec field9 = fn (xs: Val list) ->
+                     (match xs with
+                      | Nil -> (Nil : Val list)
+                      | Cons (m9, t9) ->
+                        (let k9 = str_of_int o9 ++ "@" ++ struct_slot (match m9 with VSym y9 -> y9 | _ -> "") in
+                         Cons ((if map_has iv9 k9 then map_get iv9 k9 else VNil), field9 t9))) in
+                   arr_new (field9 ms9)))
+             | _ -> VNil)
           // (a Method made from a builtin runs the builtin, though the name
           //  has a Ruby body now: bi_meth_mark)
           else if bi_meth_shadowed world id mown mnm mrecv then
@@ -22544,7 +22698,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             // name again re-dispatches, so `obj.method(:m).super_method.call`
             // ran the subclass's m forever. Invoke the owner's directly when
             // there is one (a builtin has no entry and keeps the old path).
-            else if (if str_eq mown "" then false else true) && (has_meth world mown mnm || msnap_held world id "Method" mown mnm) then
+            else if (if str_eq mown "" then false else true) && (has_meth world mown mnm || msnap_held world id "Method" mown mnm)
+                    // (an alias of a builtin is reached by name: alias_owner)
+                    && (if map_len builtin_alias > 0 && alias_first world mown mnm then false else true) then
               (if msnap_held world id "Method" mown mnm
                then msnap_call world blk mrecv id "Method" mown mnm args
                // (the owner's OWN definition, not a lookup from it: a class
@@ -25015,30 +25171,31 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                                                       then to_s (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass c9) "to_s" Nil false)
                                                                       else display_cls_msg world c9))
           else recv))
-    // Exception#== : same class, equal message, and equal backtrace.
+    // Exception#== (ruby's exc_equal): the same object; else an object of the
+    // receiver's class -- or one whose #exception converts it into one -- with
+    // an equal message and backtrace. A SimpleDelegator around an exception
+    // has another class, and equals it from both sides through #exception.
+    // (a second copy of this arm, unreachable behind the first, is gone)
     else if ((str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?")) && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       (match args with
-       | Cons (VObj oid2, _) ->
-         (let cls2 = map_get ocls oid2 in
-          if str_eq cls cls2 && exc_is_a world cls2 "Exception" then
-            let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-            let m1 = invoke_val_c env world noblk recv "message" Nil false in
-            let m2 = invoke_val_c env world noblk (VObj oid2) "message" Nil false in
-            let b1 = (if map_has ivars (str_of_int id ++ "@__bt") then map_get ivars (str_of_int id ++ "@__bt") else VNil) in
-            let b2 = (if map_has ivars (str_of_int oid2 ++ "@__bt") then map_get ivars (str_of_int oid2 ++ "@__bt") else VNil) in
-            VBool (rb_eq m1 m2 && rb_eq b1 b2)
-          else VBool false)
-       | _ -> VBool false)
-    else if ((str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?")) && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
-      (match args with
-       | Cons (VObj oid2, _) ->
-         (let cls2 = map_get ocls oid2 in
-          if str_eq cls cls2 && exc_is_a world cls2 "Exception" then
-            let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-            let m1 = invoke_val_c env world noblk recv "message" Nil false in
-            let m2 = invoke_val_c env world noblk (VObj oid2) "message" Nil false in
-            VBool (rb_eq m1 m2)
-          else VBool false)
+       | Cons (o9, _) ->
+         (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+          let ours = fn (v: Val) -> (match v with VObj u9 -> str_eq (map_get ocls u9) cls | _ -> false) in
+          let bt_of = fn (v: Val) ->
+            (match v with
+             | VObj u9 -> (if map_has ivars (str_of_int u9 ++ "@__bt") then map_get ivars (str_of_int u9 ++ "@__bt") else VNil)
+             | _ -> VNil) in
+          if rb_identical recv o9 then VBool true
+          else
+            (let cv = (if ours o9 then o9
+                       else if responds world o9 "exception"
+                       then try_or (fn (u: unit) -> invoke_val_c env world noblk o9 "exception" Nil false) VNil
+                       else VNil) in
+             if ours cv then
+               VBool (rb_eq (invoke_val_c env world noblk recv "message" Nil false)
+                            (invoke_val_c env world noblk cv "message" Nil false)
+                      && rb_eq (bt_of recv) (bt_of cv))
+             else VBool false))
        | _ -> VBool false)
     // Exception#to_s: @message (class name when nil). This is the default;
     // a user #to_s override is dispatched before reaching here.
@@ -25818,6 +25975,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 VNil)
              | Cons (kv, Cons (v, _)) ->
                (let kk = thread_key_of env world kv in
+                let _ = (if str_len kk == 17 && str_eq kk "__recursive_key__" then map_set pp_rk_on "on" 1 else ()) in
                 let _ = tl_note_key ivars (fb_tl_base world tid name) kk in
                 let _ = map_set ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) v in v)
              | _ -> VNil)
@@ -27659,6 +27817,14 @@ and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) 
 // table, where every receiver's lookup ends up.
 
 
+// The block a builtin hands to the block it runs: none. The frame's own block
+// rode along as `encl`, and a block's `&b` -- the parser's `&:sym` stand-in
+// among them -- bound to it: `def f = ws.each(&:join); f { }` called join
+// WITH f's block, and `[1].map { |x, &b| b }` answered f's block where ruby
+// answers nil. The env stays (the iterators read their bindings from it);
+// yield and block_given? inside the block read the frame, not this.
+and blk_noblk = fn b ->
+  match b with (_, _, _, e9) -> (false, (Nil : str list), (Nil : Stmt list), e9)
 and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
   match cur with
   | (true, _, _, _) ->
@@ -28757,6 +28923,14 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
                    (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
         let _ = map_clear bi_skip in r9)
      else invoke_with_block env world blk recv src9 args newblk0)
+  // (a Thread -- a subclass's too, Process::Waiter among them -- takes no
+  //  block in its waits and lookups: join/value/status/... with one is the
+  //  same call, as ruby ignores the block. The subclass's fell to
+  //  NoMethodError, and open3's `wait_thrs.each(&:join)` hit it)
+  else if (match recv with VObj _ -> true | _ -> false) && sch_thr_name name
+          && thr_obj_here world recv (dispatch_cls_of world recv)
+          && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+    invoke_val_c env world blk recv name args false
   else if str_len name == 5 && str_eq name "match" && rx_own_match world recv args then rx_own_match_call env world blk recv args newblk
   else if rx_sub_args_needed world recv name args then invoke_with_block env world blk recv name (rx_sub_args world args) newblk
   else if bi_frameless world recv name || gen_routed world recv name args newblk
@@ -28827,7 +29001,7 @@ and rx_own_match_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (ar
      let r9 = invoke_val_c0 env world blk re9 "match" (Cons (s9, rest9)) false in
      match (r9, newblk) with
      | (VNil, _) -> VNil
-     | (_, (true, _, _, _)) -> flow_value (run_block world blk newblk (Cons (r9, Nil)))
+     | (_, (true, _, _, _)) -> flow_value (run_block world (blk_noblk blk) newblk (Cons (r9, Nil)))
      | _ -> r9)
   | Nil -> VNil
 // A builtin String / Symbol / Array / Hash method that takes a pattern sees
@@ -28864,6 +29038,11 @@ and bi_meth_shadowed = fn world -> fn (id: int) -> fn (mown: str) -> fn (mnm: st
   let (_, _, _, ivars) = world in
   let own9 = bi_meth_own world id in
   map_has ivars (str_of_int id ++ "@__m_bi") && (if str_eq own9 "" then false else true)
+  // (what Struct.new wrote for a struct class is Struct's own method, not an
+  //  override of it: pp binds Struct#members to every struct it prints)
+  && (if map_len struct_gen > 0
+         && map_has struct_gen (owner_anc world (ancestors_of world (dispatch_cls_of world mrecv)) mnm ++ "#" ++ mnm)
+      then false else true)
   // (a PRIVATE override shadows too: initialize_copy is always private)
   // (...and Class#allocate held for a class that has none of its own --
   //  Rational's and Complex's are undefined, the C function is not)
@@ -29151,12 +29330,12 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
       (if str_len name == 5 then catch_with_block world blk newblk args else at_exit_with_block newblk)
     // Object#then / yield_self: run the block with the receiver.
     else if (str_len name == 4 && str_eq name "then") || (str_len name == 10 && str_eq name "yield_self") then
-      flow_value (run_block world blk newblk (Cons (recv, Nil)))
+      flow_value (run_block world (blk_noblk blk) newblk (Cons (recv, Nil)))
     // Object#tap: run the block with the receiver, then return the receiver.
     else if (str_len name == 3 && str_eq name "tap") then
       // `x.tap { break v }` answers v -- a break leaves the METHOD, and tap
       // returning its receiver regardless swallowed it.
-      (match run_block world blk newblk (Cons (recv, Nil)) with
+      (match run_block world (blk_noblk blk) newblk (Cons (recv, Nil)) with
        | FBreak bv -> bv
        | other -> (let _ = flow_value other in recv))
     // recv.send(:m, args) { block } — forward the block to the sent method.
@@ -29209,6 +29388,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
              let owner = (if str_eq mown "" then dcls else mown) in
              if bi_meth_shadowed world mid mown mnm mrecv then bi_meth_call env world blk mid mnm mrecv args newblk
              else if msnap_held world mid "Method" owner mnm then msnap_call world newblk mrecv mid "Method" owner mnm args
+             else if map_len builtin_alias > 0 && alias_first world owner mnm then invoke_with_block env world blk mrecv mnm args newblk
              else if has_meth world owner mnm then invoke world newblk mrecv owner mnm args
              else if has_meth world dcls mnm then invoke world newblk mrecv dcls mnm args
              else invoke_with_block env world blk mrecv mnm args newblk))
@@ -29316,7 +29496,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        | Cons (kv, _) ->
          (let k2 = env_key_of env world kv in
           match env_lookup_v k2 with
-          | VNil -> flow_value (run_block world blk newblk (Cons (mkstr k2, Nil)))
+          | VNil -> flow_value (run_block world (blk_noblk blk) newblk (Cons (mkstr k2, Nil)))
           | v -> (if (str_len name == 6 && str_eq name "delete") then (let _ = map_set env_ovr k2 VNil in v) else v))
        | _ -> VNil)
     // ENV with a block. Same idea as the block-free arm: what ENV answers, it
@@ -29371,7 +29551,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                               || (str_eq (prim_base_name c9) "Mutex" && (if has_meth world c9 name then false else true)))
                 | _ -> false) then
       (let _ = invoke_val_c env world blk recv "lock" Nil false in
-       let result = try_or (fn (u: unit) -> run_block world blk newblk Nil) (FRaise VNil) in
+       let result = try_or (fn (u: unit) -> run_block world (blk_noblk blk) newblk Nil) (FRaise VNil) in
        (match result with
         | FRaise _ ->
           let (m0, s0, ocls0, iv0) = world in
@@ -29755,7 +29935,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           //   run_begin's own "propagates after ensure" fail relies on.
           let ok9 = map_new () in
           let r = try_or (fn (u: unit) ->
-                            let v = flow_value (run_block world blk newblk (Cons (dobj, Nil))) in
+                            let v = flow_value (run_block world (blk_noblk blk) newblk (Cons (dobj, Nil))) in
                             let _ = map_set ok9 "y" 1 in v) VNil in
           let _ = invoke_val_c env world blk dobj "close" Nil false in
           if map_has ok9 "y" then r
@@ -29787,7 +29967,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
             let ok9 = map_new () in
             let _ = dir_cdblk_step true in
             let r = try_or (fn (u: unit) ->
-                              let v = flow_value (run_block world blk newblk (Cons (mkstr tgt, Nil))) in
+                              let v = flow_value (run_block world (blk_noblk blk) newblk (Cons (mkstr tgt, Nil))) in
                               let _ = map_set ok9 "y" 1 in v) VNil in
             let _ = dir_cdblk_step false in
             // the way back can be gone (the block removed it): ruby says so
@@ -29811,7 +29991,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           (if has_meth world "(sng:File)" "__open_blk" then
              invoke_with_block env world blk (VClass "File") "__open_blk" (Cons (fobj, Nil)) newblk
            else
-             (let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
+             (let r = flow_value (run_block world (blk_noblk blk) newblk (Cons (fobj, Nil))) in
               let _ = (match fobj with VObj fid -> file_close_obj world fid | _ -> ()) in
               r)))
        // Forward the caller's block and arguments to the thread's scheduler.
@@ -29826,7 +30006,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           let i = fb_cur () in
           let was = map_has fb_blocking i in
           let _ = map_set fb_blocking i 1 in
-          let r = flow_value (run_block world blk newblk (Cons (fb_obj_for world i, Nil))) in
+          let r = flow_value (run_block world (blk_noblk blk) newblk (Cons (fb_obj_for world i, Nil))) in
           let _ = (if was then () else map_delete fb_blocking i) in
           r)
        // Fiber.new { }: a real fiber now (see fb_new and m_fiber.mere) -- the
@@ -29997,7 +30177,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           // a block made of a Symbol (`Math.module_eval(&:to_s)`) is a call on
           // its one argument, which is the module: run it as the block it is
           // (as class-body statements its `__bp` was a method of the module)
-          if str_list_has ps3 "__bp" then flow_value (run_block world blk newblk (Cons (VClass c, Nil)))
+          if str_list_has ps3 "__bp" then flow_value (run_block world (blk_noblk blk) newblk (Cons (VClass c, Nil)))
           else
           let cscope = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
           // ⚠ `module_eval { |mod| ... }` PASSES THE MODULE to its block, and
@@ -30091,7 +30271,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // `extend Enumerable` + `def self.each`: the block iterators come from
        // the class's own each, exactly as they do for an instance.
        else if has_meth world ("(sng:" ++ c ++ ")") "each" && is_enum_method name then
-         (let r9 = builtin_iter world blk newblk (enum_collect world recv ("(sng:" ++ c ++ ")")) name args in
+         (let r9 = builtin_iter world (blk_noblk blk) newblk (enum_collect world recv ("(sng:" ++ c ++ ")")) name args in
           if iter_answers_self name then recv else r9)
        // ⚠ A NAMESPACE CLASS METHOD CALLED WITH A BLOCK never reached the arm
        //   that implements it: this path ends in prim_method, which does not
@@ -30167,8 +30347,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          // ...but each_slice / each_cons answer the RECEIVER, and the array
          // they were driven through would answer itself.
          (if (enum_arg_iter name && (if (str_len name == 5 && str_eq name "cycle") then false else true)) || iter_answers_self name
-          then (let _ = builtin_iter world blk newblk (enum_collect world recv cls) name args in recv)
-          else builtin_iter world blk newblk (enum_collect world recv cls) name args)
+          then (let _ = builtin_iter world (blk_noblk blk) newblk (enum_collect world recv cls) name args in recv)
+          else builtin_iter world (blk_noblk blk) newblk (enum_collect world recv cls) name args)
        // a synthetic class's own method, reached with a block in hand (often a
        // nil one, from `__send__(m, *args, &block)` forwarding): the block
        // dispatcher has no branch for it, so hand it to the plain one.
@@ -30225,7 +30405,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        else if (if str_eq tcls9 pcls then false else true)
                && has_meth world tcls9 "each" && is_enum_method name
                && (if (str_len name == 4 && str_eq name "each") then false else true) then
-         (let r9 = builtin_iter world blk newblk (enum_collect world recv tcls9) name args in
+         (let r9 = builtin_iter world (blk_noblk blk) newblk (enum_collect world recv tcls9) name args in
           if iter_answers_self name then recv else r9)
        else if (if skp9 then false else true) && has_meth world pcls name then invoke world newblk recv pcls name args
        // in-place Array mutators taking a block: map!/select!/reject!/etc.
@@ -30304,7 +30484,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                 if hix_has h9 ci9 xs9 k9 then
                   (let v9 = hix_get h9 ci9 xs9 k9 in
                    let _ = hdel_indexed h9 k9 (hash_del xs9 k9) in v9)
-                else flow_value (run_block world blk newblk (Cons (k9, Nil))))
+                else flow_value (run_block world (blk_noblk blk) newblk (Cons (k9, Nil))))
              | _ -> VNil)
           | _ -> VNil)
        // Array#delete with a block: the block runs when NOTHING matched (its
@@ -30318,13 +30498,13 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                (let xs = deref id in
                 let had = val_member_w env world xs v in
                 if had then (let _ = arr_set id (val_remove_w env world xs v) in v)
-                else flow_value (run_block world blk newblk (Cons (v, Nil))))
+                else flow_value (run_block world (blk_noblk blk) newblk (Cons (v, Nil))))
              | _ -> VNil)
           | _ -> VNil)
        // fetch with a default block: run the block when the key/index is absent.
        else if (str_len name == 5 && str_eq name "fetch") && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false) then
          (match recv with
-          | VHsh h -> let xs = hderef h in (match args with Cons (k, _) -> (if hash_haskey xs k then hash_get xs k else flow_value (run_block world blk newblk (Cons (k, Nil)))) | _ -> VNil)
+          | VHsh h -> let xs = hderef h in (match args with Cons (k, _) -> (if hash_haskey xs k then hash_get xs k else flow_value (run_block world (blk_noblk blk) newblk (Cons (k, Nil)))) | _ -> VNil)
           // the index converts through #to_int for the LOOKUP, but the block
           // receives the ORIGINAL object (spec: `.should.equal?(o)`), and the
           // block path does no argument conversion of its own -- a convertible
@@ -30338,8 +30518,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                 | Cons (VInt i, _) ->
                   (let j = (if i < 0 then n + i else i) in
                    if j >= 0 && j < n then val_nth ys j
-                   else flow_value (run_block world blk newblk (Cons (a0, Nil))))
-                | _ -> flow_value (run_block world blk newblk (Cons (a0, Nil))))
+                   else flow_value (run_block world (blk_noblk blk) newblk (Cons (a0, Nil))))
+                | _ -> flow_value (run_block world (blk_noblk blk) newblk (Cons (a0, Nil))))
              | _ -> VNil)
           | _ -> recv)
        // Hash#merge/merge!/update with a conflict block.
@@ -30422,7 +30602,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                (match rx_scan_blk world newblk (rx_escape (sget p)) "" s 0 se9 with
                 | FNext _ -> (let _ = rb_scan_lastpub world (rx_escape (sget p)) "" s se9 in recv)
                 | f9 -> iter_each_result f9 recv)
-             | _ -> builtin_iter world blk newblk recv name args)
+             | _ -> builtin_iter world (blk_noblk blk) newblk recv name args)
           | _ -> recv)
        // ⚠ `send(:lambda) { }` / `send(:proc) { }` / `send(:loop) { }`: these
        //   are Kernel methods like any other, and here they were only reachable
@@ -30461,7 +30641,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                                  else (let _ = raise_exc world "RuntimeError" "string modified" in FNext VNil)))) in
                    iter_each_result (go9 (unpack_call env world h 1 args)) VNil))
           | _ -> recv)
-       else builtin_iter world blk newblk recv name args))
+       else builtin_iter world (blk_noblk blk) newblk recv name args))
 
 // dispatch on a primitive receiver: reopened built-in classes win (class
 // Integer / class Object monkey-patching), then the hardcoded prims.
@@ -32761,6 +32941,11 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
      let hk9 = hng_key other in
      let sc9 = (if str_eq hk9 "" then "" else if map_has hng_store hk9 then map_get hng_store hk9 else "") in
      if (if str_eq sc9 "" then false else map_has meths (sc9 ++ "#" ++ nm)) then sc9
+     // (a builtin ALIAS the subclass made is its own method, ahead of a module
+     //  it includes: tsort's `alias tsort_each_node each_key` over TSort's)
+     else if (if str_eq sc9 "" then false else true) && map_len builtin_alias > 0
+             && (if str_eq (alias_owner world sc9 nm) "" then false else true) then
+       alias_owner world sc9 nm
      // (...and the subclass's ANCESTORS -- a module it includes -- before
      //  the builtin's: `H.new.method(:conv)` for `class H < Hash; include M`
      //  had no owner, and its call re-dispatched by name on a Hash)
@@ -33526,6 +33711,7 @@ and mod_inst_backing = fn world -> fn (recv: Val) ->
 //   and ivars, under the same superclass. It has no name until a constant is
 //   given it, like any anonymous class.
 and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
+  region CCOPY {
   let (m9, s9, o9, iv9) = world in
   let ismod = map_has modules c in
   let nc = fresh_anon (if ismod then "AnonModule_" else "AnonClass_") in
@@ -33540,7 +33726,7 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
      let dst_cls9 = substring dst 0 (str_len dst - 1) in
      let ks9 = map_new () in
      let _ = map_iter m9 (fn (k: str) -> fn (v: Meth) ->
-       if str_len k > pl9 && str_eq (substring k 0 pl9) src
+       if str_len k > pl9 && str_starts_with k src
           && (if str_contains (substring k pl9 (str_len k)) "#" then false else true)
        then map_set ks9 (str_of_int (map_len ks9)) (mkstr k) else ()) in
      list_iter_vals (idx_to_list ks9 0 (map_len ks9)) (fn (kv: Val) ->
@@ -33582,7 +33768,7 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
     (let pl9 = str_len src in
      let ks9 = map_new () in
      let _ = map_iter tbl (fn (k: str) -> fn (v: Val) ->
-       if str_len k > pl9 && str_eq (substring k 0 pl9) src
+       if str_len k > pl9 && str_starts_with k src
           && (if str_eq nested_sep "" then true else (if str_contains (substring k pl9 (str_len k)) nested_sep then false else true))
        then map_set ks9 (str_of_int (map_len ks9)) (mkstr k) else ()) in
      list_iter_vals (idx_to_list ks9 0 (map_len ks9)) (fn (kv: Val) ->
@@ -33598,6 +33784,7 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
   let _ = copy_kv iv9 ("cls:" ++ c ++ "@") ("cls:" ++ nc ++ "@") "" in
   let _ = (if keep_frozen && map_has cls_frozen c then map_set cls_frozen nc (map_get cls_frozen c) else ()) in
   VClass nc
+  }
 // A define_method CALLED from a class body (its env reaches the body's
 // "__vis", see register_class_v) takes the body's default visibility, as a
 // def there does -- and in `module_function` mode it is a module function.
@@ -34297,6 +34484,17 @@ and alias_first = fn world -> fn (cls: str) -> fn (name: str) ->
     | Cons (a, t) ->
       if map_has m9 (a ++ "#" ++ name) then false
       else if map_has builtin_alias (a ++ "#" ++ name) then true
+      else go t in
+  go (ancestors_of world cls)
+// ...and the class that holds that alias ("" when a method comes first)
+and alias_owner = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (m9, _, _, _) = world in
+  let rec go = fn (xs: str list) ->
+    match xs with
+    | Nil -> ""
+    | Cons (a, t) ->
+      if map_has m9 (a ++ "#" ++ name) then ""
+      else if map_has builtin_alias (a ++ "#" ++ name) then a
       else go t in
   go (ancestors_of world cls)
 // does this value's singleton class (from `def value.method`) define `name`?
@@ -41281,7 +41479,8 @@ and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> 
   let hk = hng_key other in
   let tagged = if str_eq hk "" then false else map_has hng_store hk in
   let tagcls = if tagged then map_get hng_store hk else "" in
-  if tagged && has_meth world tagcls name then invoke world noblk other tagcls name args
+  if tagged && has_meth world tagcls name
+     && (if map_len builtin_alias > 0 && alias_first world tagcls name then false else true) then invoke world noblk other tagcls name args
   else if tagged && (if str_eq (blt_alias_lookup world (ancestors_of world tagcls) name) "" then false else true) then
     (let src = blt_alias_lookup world (ancestors_of world tagcls) name in
      blt_alias_call env world other src args)
@@ -41402,7 +41601,16 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // ancestry of every Array and changed what `Array.instance_method(:select)`
   // reports (see the prelude's note). A block-only `select` never has
   // arguments, so Enumerable's is not reached from here.
-  else if (str_len name == 6 && str_eq name "select") && (match args with Cons (_, _) -> true | Nil -> false)
+  // (...and without arguments it is still Kernel's where self is no
+  //  Enumerable: an ArgumentError, which TRICK 2013's yhara spells "A" with)
+  else if (str_len name == 6 && str_eq name "select")
+          && (match args with
+              | Cons (_, _) -> true
+              | Nil -> (match (if lv_has env "self" then lv_get env "self" else VMain) with
+                        | VMain -> true
+                        | VObj o9 -> (let (_, _, oc9, _) = world in
+                                      if str_list_has (ancestors_of world (map_get oc9 o9)) "Enumerable" then false else true)
+                        | _ -> false))
           && (if self_defines env world name then false else true) then
     invoke_val_c env world noblk (VClass "IO") "select" args false
   // `set_trace_func(proc)` installs the tracer, `set_trace_func(nil)` removes
@@ -44756,7 +44964,9 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
             (Meth (Nil, Nil, Cons (SReturn (EMethod (self_m "to_a", "size", Nil)), Nil))) in
   // (these are Struct's in ruby, not the class's own: struct_gen)
   let _ = list_iter (Cons ("to_a", Cons ("to_ary", Cons ("values", Cons ("deconstruct", Cons ("members", Cons ("each", Cons ("size", Cons ("length", Nil)))))))))
-            (fn (n9: str) -> map_set struct_gen (anon ++ "#" ++ n9) 1) in
+            // (...unless a MEMBER has the name: its accessor replaced it, and
+            //  is the class's own -- `Struct.new(:members, :class)`)
+            (fn (n9: str) -> if str_list_has members n9 then () else map_set struct_gen (anon ++ "#" ++ n9) 1) in
   // (#values_at, #dig, #deconstruct_keys and #each_pair are Struct's, from
   // struct_common_src: the generated spellings here were always replaced by
   // them, and are gone now that those live one class up)
@@ -46240,6 +46450,22 @@ and thread_key_of = fn env -> fn world -> fn (kv: Val) ->
 
 // The receiver, as a FrozenError message shows it -- "..." when we are already
 // inside one. See frz_busy in m_state for why that case exists at all.
+// pp's cycle table. pp.rb keeps the objects it is in the middle of printing
+// in Thread.current[:__recursive_key__][:inspect] -- the table ruby's own
+// #inspect consults -- so an #inspect that a pretty_print calls stops at them:
+// `a = []; a << HasInspect.new(a)` pretty-prints as `[<inspect:[...]>]`.
+and insp_pp_held = fn env -> fn world -> fn (v: Val) ->
+  if map_len pp_rk_on == 0 then false
+  else
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let t9 = invoke_val_c env world nb9 (VClass "Thread") "current" Nil false in
+     match invoke_val_c env world nb9 t9 "[]" (Cons (VSym "__recursive_key__", Nil)) false with
+     | VHsh h9 ->
+       (match invoke_val_c env world nb9 (VHsh h9) "[]" (Cons (VSym "inspect", Nil)) false with
+        | VHsh h8 -> truthy (invoke_val_c env world nb9 (VHsh h8) "include?" (Cons (v, Nil)) false)
+        | _ -> false)
+     | _ -> false)
+
 and frz_inspect = fn env -> fn world -> fn (v: Val) ->
   if map_has frz_busy "v" then " ..."
   else (let _ = map_set frz_busy "v" VNil in
@@ -48442,7 +48668,7 @@ and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) ->
           let _ = map_set globals "_" VNil in
           let savedbud = (if map_has step_budget "n" then map_get step_budget "n" else 0) in
           let _ = map_set step_budget "n" 2000 in
-          let result = try_or (fn (u: unit) -> run_block world blk newblk args) (FRaise VNil) in
+          let result = try_or (fn (u: unit) -> run_block world (blk_noblk blk) newblk args) (FRaise VNil) in
           let remaining = (if map_has step_budget "n" then map_get step_budget "n" else 0) in
           let newbud = savedbud - (2000 - remaining) in
           let _ = map_set step_budget "n" (if newbud < 1000 then 1000 else newbud) in
@@ -48661,7 +48887,7 @@ and thread_handle_interrupt = fn env -> fn world -> fn blk -> fn newblk -> fn (a
   let _ = map_set iv k (arr_new (Cons (mask, (match saved with VArr aid -> deref aid | _ -> (Nil : Val list))))) in
   let r = try_or (fn (u: unit) ->
             let _ = sch_deliver_at world me false in
-            run_block world blk newblk Nil) (FRaise VNil) in
+            run_block world (blk_noblk blk) newblk Nil) (FRaise VNil) in
   let exc = (if map_has iv "$exc" then map_get iv "$exc" else VNil) in
   let _ = map_set iv k saved in
   let _ = sch_deliver_at world me false in
@@ -49718,7 +49944,7 @@ and thread_fetch = fn env -> fn world -> fn blk -> fn (tid: int) -> fn (args: Va
         let _ = (if hasblk && n9 == 2 then rb_warn world "block supersedes default value argument" else ()) in
         let slot = fb_tl_base world tid "fetch" ++ "@__tl_" ++ kk in
         if map_has iv9 slot then map_get iv9 slot
-        else if hasblk then flow_value (run_block world blk newblk (Cons (kv, Nil)))
+        else if hasblk then flow_value (run_block world (blk_noblk blk) newblk (Cons (kv, Nil)))
         else (match rest with
               | Cons (d, _) -> d
               | Nil -> raise_exc_iv world "KeyError" ("key not found: " ++ key_err_desc (inspect kv))

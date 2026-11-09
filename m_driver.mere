@@ -18,10 +18,9 @@ let err_where = fn (name: str) ->
   let where = (if ln > 0 then file ++ ":" ++ str_of_int ln else file) in
   if str_eq m "" then where else where ++ ":in '" ++ meth_label m ++ "'";
 
-// ObjectSpace::WeakMap: a Hash that does not keep its keys alive. mere-ruby
-// frees nothing, so the weakness has no observable effect here -- what matters
-// is that the class EXISTS, because activesupport's DescendantsTracker builds
-// one at load time and railties stops there otherwise.
+// ObjectSpace::WeakMap: a table that keeps neither its keys nor its values
+// alive (see the class below). activesupport's DescendantsTracker builds one
+// at load time, and railties stops there without it.
 let core_prelude_a =
   // ruby 4.0's toplevel `Ruby` module: the identity constants again, and
   // Ruby::Box, which is never enabled here (RUBY_BOX is a CRuby build switch).
@@ -2573,43 +2572,51 @@ let core_prelude_d =
   "  class WeakMap\n" ++
   "    include Enumerable\n" ++
   // (no braces in this source: a `{` in a Mere string starts an interpolation)
-  // WeakMap matches keys by IDENTITY (two equal Strings are two keys);
-  // (key? / member?, length and each_pair are ALIASES in ruby, and the specs
-  // compare the UnboundMethods)
-  // WeakKeyMap below by equality, and its #getkey answers the STORED key.
-  "    def initialize; @h = Hash.new.compare_by_identity; end\n" ++
-  "    def [](k); @h[k]; end\n" ++
-  "    def []=(k, v); @h[k] = v; v; end\n" ++
-  "    def include?(k); @h.key?(k); end\n" ++
+  // The table is the interpreter's (ObjectSpace.__wm_*, weak_k / weak_v in
+  // m_state), which the collector does not mark: an entry goes once its key
+  // or its value is reachable from nowhere else, which is what WeakRef's
+  // #weakref_alive? asks. Keys match by IDENTITY (two equal Strings are two
+  // keys). (key? / member?, length and each_pair are ALIASES in ruby, and the
+  // specs compare the UnboundMethods)
+  "    def [](k); r = ::ObjectSpace.__wm_get(self, k); r ? r[1] : nil; end\n" ++
+  "    def []=(k, v); ::ObjectSpace.__wm_set(self, k, v); v; end\n" ++
+  "    def include?(k); !::ObjectSpace.__wm_get(self, k).nil?; end\n" ++
   "    alias key? include?\n" ++
   "    alias member? include?\n" ++
-  "    def delete(k, &b); @h.key?(k) ? @h.delete(k) : (b ? b.call(k) : nil); end\n" ++
-  "    def size; @h.size; end\n" ++
+  "    def delete(k, &b); r = ::ObjectSpace.__wm_del(self, k); r ? r[1] : (b ? b.call(k) : nil); end\n" ++
+  "    def size; ::ObjectSpace.__wm_pairs(self).size; end\n" ++
   "    alias length size\n" ++
-  "    def keys; @h.keys; end\n" ++
-  "    def values; @h.values; end\n" ++
+  "    def keys; ::ObjectSpace.__wm_pairs(self).map(&:first); end\n" ++
+  "    def values; ::ObjectSpace.__wm_pairs(self).map(&:last); end\n" ++
   // the iterators want a block -- they make no Enumerator -- except over an
   // empty map, where ruby never gets as far as yielding
-  "    def __blk!(b); raise LocalJumpError, 'no block given' if b.nil? && !@h.empty?; end\n" ++
-  "    def each(&b); __blk!(b); @h.each(&b) unless @h.empty?; self; end\n" ++
+  "    def __blk!(b, ps); raise LocalJumpError, 'no block given' if b.nil? && !ps.empty?; end\n" ++
+  "    def each(&b); ps = ::ObjectSpace.__wm_pairs(self); __blk!(b, ps); ps.each(&b); self; end\n" ++
   "    alias each_pair each\n" ++
-  "    def each_key(&b); __blk!(b); @h.each_key(&b) unless @h.empty?; self; end\n" ++
-  "    def each_value(&b); __blk!(b); @h.each_value(&b) unless @h.empty?; self; end\n" ++
+  "    def each_key(&b); ps = ::ObjectSpace.__wm_pairs(self); __blk!(b, ps); ps.each \{ |k, _| b.call(k) }; self; end\n" ++
+  "    def each_value(&b); ps = ::ObjectSpace.__wm_pairs(self); __blk!(b, ps); ps.each \{ |_, v| b.call(v) }; self; end\n" ++
   // (no #{} in this source: Mere interpolates its own strings the same way)
   // ruby shows the map's address and then each pair
   "    def inspect\n" ++
   "      head = '#<ObjectSpace::WeakMap:0x' + object_id.to_s(16).rjust(16, '0')\n" ++
-  "      return head + '>' if @h.empty?\n" ++
+  "      ps = ::ObjectSpace.__wm_pairs(self)\n" ++
+  "      return head + '>' if ps.empty?\n" ++
   // ...and an entry WITHOUT Kernel (a BasicObject) has no #inspect to ask:
   // it prints the way ruby's any_to_s does, through Kernel#to_s bound to it
   "      ins = lambda \{ |o| ::Kernel === o ? o.inspect : ::Kernel.instance_method(:to_s).bind_call(o) }\n" ++
-  "      head + ': ' + @h.map \{ |k, v| ins.call(k) + ' => ' + ins.call(v) }.join(', ') + '>'\n" ++
+  "      head + ': ' + ps.map \{ |k, v| ins.call(k) + ' => ' + ins.call(v) }.join(', ') + '>'\n" ++
   "    end\n" ++
   "  end\n" ++
-  "  class WeakKeyMap < WeakMap\n" ++
+  // WeakKeyMap matches keys by EQUALITY, and its #getkey answers the STORED
+  // key. It is not a WeakMap (ruby's superclass is Object), and its table is
+  // an ordinary Hash: the keys are held, which no program here can observe
+  // but through memory.
+  "  class WeakKeyMap\n" ++
   // ...and the stored key is the OBJECT given, not the copy a Hash makes of an
   // unfrozen String key, so the originals are kept beside the table.
   "    def initialize; @h = Hash.new; @ks = []; end\n" ++
+  "    def [](k); @h[k]; end\n" ++
+  "    def key?(k); @h.key?(k); end\n" ++
   // an immediate cannot be collected, so it cannot be a weak key; and the key
   // is hashed, so one without #hash (a BasicObject) is refused by that call
   "    def []=(k, v)\n" ++
@@ -6690,6 +6697,11 @@ let core_prelude_f =
   "  #  the others, which RbConfig.expand resolves to CONFIG's values)\n" ++
   "  MAKEFILE_CONFIG[\"rubylibdir\"] = \"$(rubylibprefix)/$(ruby_version)\"\n" ++
   "  MAKEFILE_CONFIG[\"rubyarchdir\"] = \"$(rubylibdir)/$(arch)\"\n" ++
+  // (...and the site directory the same way: ruby's Makefile names it under
+  //  site_ruby, which test_rbconfig asks of every site* key. CONFIG keeps
+  //  the directory this interpreter loads from.)
+  "  MAKEFILE_CONFIG[\"sitedir\"] = \"$(rubylibprefix)/site_ruby\"\n" ++
+  "  MAKEFILE_CONFIG[\"sitelibdir\"] = \"$(sitedir)/$(ruby_version)\"\n" ++
   "\n" ++
   "  def self.expand(value, config = CONFIG)\n" ++
   "    expanded = value.gsub(/\\$\\$|\\$\\(([^()]+)\\)|\\$\\\{([^\{}]+)\\}/) do |token|\n" ++
