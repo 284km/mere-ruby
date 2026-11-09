@@ -623,27 +623,33 @@ require now promises more than the object delivers. A program that
 requires it and then uses a lazy enumerator will fail later, and further
 from the cause than a LoadError would have been.
 
-## YAML / Psych cover a subset of the full parser and emitter APIs
+## YAML / Psych: event backend and measured compatibility
 
-`yaml` / `psych` ship as Ruby source, including a basic emitter. Dumping
-accepts a positional options Hash through `Object#to_yaml` and `Psych.dump`,
-as YAML::Store uses, and propagates `indentation` through nested mappings,
-sequences, tagged values and literal scalars. Widths outside 2..9 use the
-default width, following the pinned reference. Collection and tagged-object
-output tracks identity and emits anchors/aliases for cycles and shared references,
-including complex mapping keys. Each `dump` has its own graph; `dump_stream`
-shares its graph across documents, matching the pinned reference.
+`psych` ships the pinned Psych 5.3.1 Ruby nodes, handlers, visitors, class loader,
+scanner and public API under their MIT license (`vendor/psych`). Its parser and
+emitter are implemented in Ruby here; no libyaml or native Psych extension is
+linked. `libyaml_version` reports the pinned reference compatibility version.
 
-The loader reconstructs the emitted collection/object anchor subset, retaining
-shared identity and cycles. `load`/`safe_load` require `aliases: true` to follow
-aliases; `unsafe_load` allows them. Anchor tables are isolated per document.
-The loader is still a subset of YAML, and Struct ivars and Data serialization
-remain incomplete. The upstream Array/Struct/Data files finish, with remaining
-compatibility failures/errors.
+Parser instances emit stream/document, collection, scalar, alias and location
+events, with marks, tag directives, scalar styles and String/IO encoding handling.
+Nodes and TreeBuilder retain the AST. The emitter accepts events or node visitors,
+and supports indentation, canonical output, line width and block/flow collections.
+Loader visitors enforce permitted classes/symbols and the aliases option; unsafe
+loading and node transformation retain collection/object cycles and shared values.
+The Struct/Data, coder, stream, merge-key and tagged-object protocols are those
+of the supplied Psych visitors.
 
-These dump contracts do not complete Psych's node, handler, event or loader
-APIs. Large YAML::Store transaction workloads also need performance work;
-passing the small store cases does not establish the large-file behavior.
+All 635 discovered upstream Psych tests pass against Ruby 4.0.9. The optional
+`test_yamldbm.rb` discovers zero tests on both installed interpreters and is not
+included in that count. The independent event/location gate, scalar wire tests
+(29 values and five explicit styles in both directions), large native wire/store
+round trips, graph scaling and 20/200 lifetime checks are separate CI gates.
+Each monitored large operation has a 120-second / 2,097,152-KiB family budget.
+
+This measures these APIs and fixtures, rather than proving all YAML productions
+and libyaml diagnostics identical. In particular, identity for unboxed core values
+still follows the runtime representation: equal Range literals can be treated as
+the same value. This is separate from the indexed graph storage for heap objects.
 
 
 ## `UnboundMethod#bind_call` re-dispatches by name
@@ -3885,47 +3891,47 @@ so: the 64-bit version is the more natural transcription of the standard, it is
 correct, and it is unusable. A dogfood that only checked answers would have
 shipped it.
 
-## The gzip engine runs at about 30 KB/s, and nothing had reached it before
+## Zlib streams and gzip IO are resumable (closed 2026-11-09)
 
-```
-Zlib.gzip("." * 2**20)   #   1 MB -> 1051 bytes,  35.3s
-Zlib.gzip("." * 2**21)   #   2 MB -> 2068 bytes,  71.2s
-Zlib.gzip("." * 2**22)   #   4 MB -> 4099 bytes, 142.6s
-```
+The historical one-shot implementation buffered all input, ignored flush and
+compression options, and could not set a compression dictionary. Both engines
+now retain state between calls. The pure Mere implementation is
+`m_zstream.mere`, using mgz's format tables and bit writer, with the Ruby API
+in `lib/zlib_ext.rb`, `lib/zlib_stream.rb`, and `lib/zlib_gzip.rb` (embedded by
+`tools/gen_zlib_lib.rb`). It adds no libz or native-extension dependency.
 
-Linear, and about **34 seconds per megabyte**. `library/zlib/gzipwriter/write_spec.rb`
-writes 2\*\*23 bytes and is recorded SLOW: the harness stops it over the CPU
-budget, which is the honest verdict -- it is working, not aborting.
+Deflate handles raw, zlib and gzip framing, compression levels and strategies,
+preset dictionaries, partial/sync/full/final flushes, params, duplication,
+reset and close. Blocks are bounded by 16,383 tokens; the input lookahead is
+bounded, and the dictionary is at most 32 KiB. Inflate commits complete
+symbols, keeps its bit reader and Huffman tables, and produces output before
+the stream ends. Partial input is not replayed from the beginning. Raw, zlib,
+gzip and automatic-header readers validate headers, checksums and trailers.
+Dictionary negotiation, sync recovery, output buffers, block breaks and
+post-stream passthrough are exercised against the reference.
 
-⚠ **This cost is not new; only its visibility is.** Before `Zlib::GzipFile.wrap`
-existed the spec died on the missing name in milliseconds, so the record showed
-a NoMethodError and never the seconds. A hole with no workaround leaves no
-trace of what is behind it, and closing the hole is what put the number in the
-record. The same is true of the eight other SLOW rows this harness carries.
+GzipReader reads incrementally and retains bytes after its member for
+`unused` and `zcat`; GzipWriter emits incremental compressed output. Header
+metadata, finish without closing the underlying IO, rewind, encoding,
+pushback and the distinct footer/CRC/length errors are covered. Checksums
+accept IO input and support Adler-32/CRC-32 composition.
 
-**What fixing it would take.** Work in the deflate encoder itself, not here.
-The interesting question first is which half the time is in -- the LZ77 match
-search or the Huffman coding -- and neither has been measured.
-
-## `Zlib::Deflate` and `Zlib::Inflate` buffer, and cannot change mid-stream
-
-`Zlib.deflate` / `Zlib.inflate` are one-shot. The streaming classes are built on
-them by buffering the input and running the engine once, at `finish`, which
-gives byte-identical output because deflate is deterministic here:
-`d.deflate("hello") + d.finish == Zlib.deflate("hello")`.
-
-What that model cannot express is a change part way through a stream, so
-`Deflate#params`, `Deflate#set_dictionary`, `Inflate#set_dictionary` and
-`Inflate#add_dictionary` raise `NotImplementedError` naming the reason rather
-than accepting the call and ignoring it. `Inflate#sync` answers false and
-`#sync_point?` answers false, which is true of a stream that is never partial.
-
-⚠ `Zlib::Deflate` and `Zlib::Inflate` already existed as bare classes whose
-class methods are answered by the dispatcher, so their `superclass` is `Object`
-where ruby says `Zlib::ZStream`. Reopening either with `< ZStream` is a
-superclass mismatch; the shared surface is a module mixed into all three
-instead. Nothing in ruby/spec reads `Zlib::Deflate.superclass`, and every
-ZStream spec constructs a `Zlib::Deflate`.
+The old 30 KB/s figure predates the indexed mgz engine and is not a current
+measurement. `unittest/zlib_compression_check.py` measures large streams in
+both directions against an independent native decoder.
+`unittest/zlib_stream_check.py` compares protocols, one-byte input, malformed
+streams and repeated lifecycles with Ruby 4.0.9. Scratch vectors have explicit
+region owners: the former per-call default-arena growth is a regression gate.
+On macOS the reference's 96 Zlib tests produce 95 MATCH and one shared skip.
+Linux discovers one additional native-extension memory test. Its `LOADED_ZLIB`
+lookup requires a loaded `zlib.so`; this implementation loads `zlib.rb`, so the
+helper constructs a bare `-r` and fails before exercising gunzip. The unchanged
+Linux run records 95 MATCH, one RED and one shared skip. A direct supervised
+1,000/10,000 gunzip repetition passes; family peak RSS is 68,500/90,652 KiB.
+The independent 50/500 stream-lifetime allocation gate also passes on Linux. The
+compressor is an independent implementation: compression choices can differ
+from libz for arbitrary inputs even when both streams represent identical
+bytes; the checked ruby/spec compression fixtures agree byte for byte.
 
 ## Two small refusals that are representation, not effort
 

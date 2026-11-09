@@ -1,0 +1,530 @@
+// Resumable RFC 1951 engine. All persistent state is returned as bytes, so
+// Ruby owns its lifetime and GC reaches it without an auxiliary handle table.
+// No compressed prefix is replayed; a decoder commits one complete symbol.
+let zs_vec = fn (s: str) ->
+  let v = (vec_new () : Vec[R, int]) in
+  let rec go = fn (i: int) -> if i >= str_len s then ()
+    else (let _ = vec_push v (ord (char_at s i)) in go (i + 1)) in
+  let _ = go 0 in v;
+let zs_str = fn v -> region ZSTR { str_of_bytes (bytes_of_bytebuf (let b = bytebuf_new 0 in
+  let rec go = fn (i: int) -> if i == vec_len v then b
+    else (let _ = bytebuf_push b (vec_get v i) in go (i + 1)) in go 0)) };
+let zs_fixed = fn toks -> fn s -> fn out -> fn (last: int) ->
+  let code = fn (sym: int) ->
+    if sym <= 143 then (sym + 48, 8) else if sym <= 255 then (sym + 256, 9)
+    else if sym <= 279 then (sym - 256, 7) else (sym - 88, 8) in
+  let put = fn (sym: int) -> let (v, n) = code sym in bw_bits s out (rev_bits v n) n in
+  let _ = bw_bits s out last 1 in let _ = bw_bits s out 1 2 in
+  let rec go = fn (i: int) -> if i >= vec_len toks then put 256 else
+    let _ = if (vec_get toks i : int) == 0 then put (vec_get toks (i + 1)) else
+      let (sym, nb, x) = len_encode (vec_get toks (i + 1)) in
+      let _ = put sym in let _ = bw_bits s out x nb in
+      let (sym2, nb2, x2) = dist_encode (vec_get toks (i + 2)) in
+      let _ = bw_bits s out (rev_bits sym2 5) 5 in bw_bits s out x2 nb2 in go (i + 3) in go 0;
+// Huffman heap ordering follows zlib: frequency, then subtree depth, with
+// the same replacement order for equal leaves. RFC 1951 permits other
+// trees, but a deterministic tie rule also preserves zlib's short streams.
+// Block coding uses mgz's canonical codes and length limiter.
+let zs_dynamic = fn data -> fn toks -> fn s -> fn out -> fn (bfinal: int) ->
+  region ZDYN {
+  let limit_lengths = fn (len) -> fn (freq) -> fn (nsym: int) -> fn (maxbits: int) ->
+    let cnt = vec_new () in
+    let rec zc = fn (i: int) -> if i > 64 then () else let _ = vec_push cnt 0 in zc (i + 1) in
+    let _ = zc 0 in
+    let rec clamp = fn (i: int) ->
+      if i >= nsym then ()
+      else
+        let _ = if (vec_get freq i : int) > 0 then
+                  (let b = (vec_get len i : int) in
+                   let b2 = if b > maxbits then maxbits else b in
+                   let _ = vec_set len i b2 in
+                   let _ = vec_set cnt b2 ((vec_get cnt b2 : int) + 1) in ())
+                else () in
+        clamp (i + 1) in
+    let _ = clamp 0 in
+    let rec space = fn (b: int) ->
+      if b > maxbits then 0 else (vec_get cnt b : int) * (bit_shl 1 (maxbits - b)) + space (b + 1) in
+    let excess = space 1 - (bit_shl 1 maxbits) in
+    if excess <= 0 then len
+    else
+      let rec fix = fn (ov: int) ->
+        if ov <= 0 then ()
+        else
+          let rec findb = fn (b: int) ->
+            if b < 1 then 1 else if (vec_get cnt b : int) > 0 then b else findb (b - 1) in
+          let b = findb (maxbits - 1) in
+          let _ = vec_set cnt b ((vec_get cnt b : int) - 1) in
+          let _ = vec_set cnt (b + 1) ((vec_get cnt (b + 1) : int) + 2) in
+          let _ = vec_set cnt maxbits ((vec_get cnt maxbits : int) - 1) in
+          fix (ov - 1) in
+      let _ = fix excess in
+      let order = vec_new () in
+      let rec collect = fn (i: int) ->
+        if i >= nsym then ()
+        else let _ = if (vec_get freq i : int) > 0 then (let _ = vec_push order i in ()) else () in
+             collect (i + 1) in
+      let _ = collect 0 in
+      let rec sort = fn (i: int) ->
+        if i >= vec_len order then ()
+        else
+          let rec back = fn (j: int) ->
+            if j <= 0 then ()
+            else
+              let a = (vec_get order (j - 1) : int) in
+              let b = (vec_get order j : int) in
+              let fa = (vec_get freq a : int) in
+              let fb = (vec_get freq b : int) in
+              if fa > fb || (fa == fb && a < b) then ()
+              else
+                let _ = vec_set order (j - 1) b in
+                let _ = vec_set order j a in
+                back (j - 1) in
+          let _ = back i in
+          sort (i + 1) in
+      let _ = sort 0 in
+      let pos = vec_new () in
+      let _ = vec_push pos 0 in
+      let rec give = fn (b: int) ->
+        if b > maxbits then ()
+        else
+          let rec take = fn (k: int) ->
+            if k >= (vec_get cnt b : int) then ()
+            else
+              let i = (vec_get pos 0 : int) in
+              let _ = if i < vec_len order then
+                        (let _ = vec_set len (vec_get order i : int) b in
+                         let _ = vec_set pos 0 (i + 1) in ()) else () in
+              take (k + 1) in
+          let _ = take 0 in
+          give (b + 1) in
+      let _ = give 1 in
+      len in
+  let canon_codes = fn lengths -> fn (n: int) -> fn (maxbits: int) ->
+    let bl_count = vec_new () in
+    let rec z = fn i -> if i > maxbits then () else let _ = vec_push bl_count 0 in z (i + 1) in
+    let _ = z 0 in
+    let rec cnt = fn i -> if i == n then () else
+      let l = (vec_get lengths i : int) in
+      let _ = if l > 0 then vec_set bl_count l ((vec_get bl_count l : int) + 1) else () in
+      cnt (i + 1) in
+    let _ = cnt 0 in
+    let next_code = vec_new () in
+    let rec z2 = fn i -> if i > maxbits then () else let _ = vec_push next_code 0 in z2 (i + 1) in
+    let _ = z2 0 in
+    let rec fill = fn (bits: int) -> fn (code: int) ->
+      if bits > maxbits then ()
+      else
+        let c = bit_shl (code + (vec_get bl_count (bits - 1) : int)) 1 in
+        let _ = vec_set next_code bits c in
+        fill (bits + 1) c in
+    let _ = fill 1 0 in
+    let codes = vec_new () in
+    let rec z3 = fn i -> if i == n then () else let _ = vec_push codes 0 in z3 (i + 1) in
+    let _ = z3 0 in
+    let rec asg = fn i -> if i == n then () else
+      let l = (vec_get lengths i : int) in
+      let _ = if l > 0 then
+          let c = (vec_get next_code l : int) in
+          let _ = vec_set codes i c in
+          vec_set next_code l (c + 1)
+        else () in
+      asg (i + 1) in
+    let _ = asg 0 in
+    codes in
+  let zs_lengths = fn freq -> fn (nsym: int) -> fn (maxbits: int) ->
+    let f = vec_new () in let depth = vec_new () in let left = vec_new () in let right = vec_new () in
+    let heap = vec_new () in let _ = vec_push heap 0 in
+    let rec seed = fn (i: int) -> if i == nsym then () else
+      let _ = vec_push f (vec_get freq i) in let _ = vec_push depth 0 in
+      let _ = vec_push left (0 - 1) in let _ = vec_push right (0 - 1) in
+      let _ = if (vec_get freq i : int) != 0 then vec_push heap i else () in seed (i + 1) in
+    let _ = seed 0 in
+    let last = if vec_len heap > 1 then (vec_get heap (vec_len heap - 1) : int) else 0 - 1 in
+    let rec force = fn (lastsym: int) -> if vec_len heap >= 3 then () else
+      let sym = if lastsym < 2 then lastsym + 1 else 0 in
+      let _ = vec_push heap sym in let _ = vec_set f sym 1 in force (if sym > lastsym then sym else lastsym) in
+    let _ = force last in
+    let size = vec_new () in let _ = vec_push size (vec_len heap - 1) in
+    let smaller = fn (a: int) -> fn (b: int) ->
+      (vec_get f a : int) < (vec_get f b : int) || ((vec_get f a : int) == (vec_get f b : int) && (vec_get depth a : int) <= (vec_get depth b : int)) in
+    let down = fn (at: int) ->
+      let v = (vec_get heap at : int) in
+      let rec go = fn (k: int) ->
+        let j0 = k * 2 in
+        if j0 > (vec_get size 0 : int) then vec_set heap k v else
+        let j = if j0 < (vec_get size 0 : int) && smaller (vec_get heap (j0 + 1)) (vec_get heap j0) then j0 + 1 else j0 in
+        if smaller v (vec_get heap j) then vec_set heap k v else
+        (let _ = vec_set heap k (vec_get heap j) in go j) in go at in
+    let rec heapify = fn (i: int) -> if i == 0 then () else (let _ = down i in heapify (i - 1)) in
+    let _ = heapify ((vec_get size 0 : int) / 2) in
+    let rec merge = fn (u: unit) ->
+      if (vec_get size 0 : int) < 2 then (vec_get heap 1 : int) else
+      let a = (vec_get heap 1 : int) in
+      let _ = vec_set heap 1 (vec_get heap (vec_get size 0)) in
+      let _ = vec_set size 0 ((vec_get size 0 : int) - 1) in
+      let _ = down 1 in let b = (vec_get heap 1 : int) in let node = vec_len f in
+      let _ = vec_push f ((vec_get f a : int) + (vec_get f b : int)) in
+      let _ = vec_push depth (1 + (if (vec_get depth a : int) > (vec_get depth b : int) then (vec_get depth a : int) else (vec_get depth b : int))) in
+      let _ = vec_push left a in let _ = vec_push right b in
+      let _ = vec_set heap 1 node in let _ = down 1 in merge () in
+    let root = merge () in let lengths = vec_new () in
+    let rec zero = fn (i: int) -> if i == nsym then () else (let _ = vec_push lengths 0 in zero (i + 1)) in
+    let _ = zero 0 in
+    let rec assign = fn (node: int) -> fn (len: int) ->
+      if node < nsym then vec_set lengths node len else
+      (let _ = assign (vec_get left node) (len + 1) in assign (vec_get right node) (len + 1)) in
+    let _ = assign root 0 in
+    limit_lengths lengths f nsym maxbits in
+  let nt = vec_len toks in
+  let lfreq = vec_new () in
+  let rec zl = fn i -> if i == 286 then () else let _ = vec_push lfreq 0 in zl (i + 1) in
+  let _ = zl 0 in
+  let dfreq = vec_new () in
+  let rec zd = fn i -> if i == 30 then () else let _ = vec_push dfreq 0 in zd (i + 1) in
+  let _ = zd 0 in
+  let rec count = fn i ->
+    if i >= nt then ()
+    else
+      let kind = (vec_get toks i : int) in
+      let _ = if kind == 0 then
+          let sym = (vec_get toks (i + 1) : int) in
+          vec_set lfreq sym ((vec_get lfreq sym : int) + 1)
+        else
+          let (lsym, a, b) = len_encode (vec_get toks (i + 1)) in
+          let _ = a in let _ = b in
+          let _ = vec_set lfreq lsym ((vec_get lfreq lsym : int) + 1) in
+          let (dsym, c, e) = dist_encode (vec_get toks (i + 2)) in
+          let _ = c in let _ = e in
+          vec_set dfreq dsym ((vec_get dfreq dsym : int) + 1) in
+      count (i + 3) in
+  let _ = count 0 in
+  let _ = vec_set lfreq 256 ((vec_get lfreq 256 : int) + 1) in  // EOB
+  let rec leaves = fn (i: int) -> fn (count: int) -> fn (last: int) ->
+    if i == 30 then (count, last) else if (vec_get dfreq i : int) > 0
+    then leaves (i + 1) (count + 1) i else leaves (i + 1) count last in
+  let (count, single) = leaves 0 0 0 in
+  let _ = if count == 0 then (let _ = vec_set dfreq 0 1 in vec_set dfreq 1 1)
+    else if count == 1 then vec_set dfreq (if single == 0 then 1 else 0) 1 else () in
+  let llen = zs_lengths lfreq 286 15 in
+  let dlen = zs_lengths dfreq 30 15 in
+  let _ = if vmax dlen 30 == 0 then vec_set dlen 0 1 else () in
+  if (if valid_lengths llen 286 15 true then false else true)
+     || (if valid_lengths dlen 30 15 true then false else true) then 0
+  else
+  let lcode = canon_codes llen 286 15 in
+  let dcode = canon_codes dlen 30 15 in
+  let rec last_nz = fn v -> fn (i: int) -> fn (floor: int) ->
+    if i < floor then floor else if (vec_get v i : int) > 0 then i else last_nz v (i - 1) floor in
+  let hlit = last_nz llen 285 256 + 1 in    // >= 257
+  let hdist = last_nz dlen 29 0 + 1 in       // >= 1
+  let cl_syms = vec_new () in   // each: [sym, extra_nbits, extra_val] triples
+  let combined = vec_new () in
+  let rec cc1 = fn i -> if i == hlit then () else let _ = vec_push combined (vec_get llen i) in cc1 (i + 1) in
+  let _ = cc1 0 in
+  let rec cc2 = fn i -> if i == hdist then () else let _ = vec_push combined (vec_get dlen i) in cc2 (i + 1) in
+  let _ = cc2 0 in
+  let cn = vec_len combined in
+  let rec rle = fn i ->
+    if i >= cn then ()
+    else
+      let v = (vec_get combined i : int) in
+      let rec runlen = fn j -> if j < cn && (vec_get combined j : int) == v then runlen (j + 1) else j - i in
+      let run = runlen i in
+      if v == 0 then
+        if run >= 11 then
+          let r = if run > 138 then 138 else run in
+          let _ = vec_push cl_syms 18 in let _ = vec_push cl_syms 7 in let _ = vec_push cl_syms (r - 11) in
+          rle (i + r)
+        else if run >= 3 then
+          let r = if run > 10 then 10 else run in
+          let _ = vec_push cl_syms 17 in let _ = vec_push cl_syms 3 in let _ = vec_push cl_syms (r - 3) in
+          rle (i + r)
+        else
+          let _ = vec_push cl_syms 0 in let _ = vec_push cl_syms 0 in let _ = vec_push cl_syms 0 in
+          rle (i + 1)
+      else
+        let _ = vec_push cl_syms v in let _ = vec_push cl_syms 0 in let _ = vec_push cl_syms 0 in
+        let rem = run - 1 in
+        let rec reps = fn k ->
+          if k >= 3 then
+            let r = if k > 6 then 6 else k in
+            let _ = vec_push cl_syms 16 in let _ = vec_push cl_syms 2 in let _ = vec_push cl_syms (r - 3) in
+            reps (k - r)
+          else if k > 0 then
+            let rec ones = fn m -> if m == 0 then () else
+              let _ = vec_push cl_syms v in let _ = vec_push cl_syms 0 in let _ = vec_push cl_syms 0 in ones (m - 1) in
+            ones k
+          else () in
+        let _ = reps rem in
+        rle (i + run) in
+  let _ = rle 0 in
+  let clfreq = vec_new () in
+  let rec zc = fn i -> if i == 19 then () else let _ = vec_push clfreq 0 in zc (i + 1) in
+  let _ = zc 0 in
+  let cs_n = vec_len cl_syms in
+  let rec ccount = fn i -> if i >= cs_n then () else
+    let sym = (vec_get cl_syms i : int) in
+    let _ = vec_set clfreq sym ((vec_get clfreq sym : int) + 1) in ccount (i + 3) in
+  let _ = ccount 0 in
+  let cllen = zs_lengths clfreq 19 7 in
+  if valid_lengths cllen 19 7 false == false then 0
+  else
+  let clcode = canon_codes cllen 19 7 in
+  let rec last_cl = fn (i: int) -> if i < 4 then 4 else
+    if (vec_get cllen (vec_get cl_order i) : int) > 0 then i + 1 else last_cl (i - 1) in
+  let hclen = last_cl 18 in
+  let _ = bw_bits s out bfinal 1 in   // BFINAL
+  let _ = bw_bits s out 2 2 in   // BTYPE = 10 (dynamic)
+  let _ = bw_bits s out (hlit - 257) 5 in
+  let _ = bw_bits s out (hdist - 1) 5 in
+  let _ = bw_bits s out (hclen - 4) 4 in
+  let rec emit_cl = fn i -> if i == hclen then () else
+    let _ = bw_bits s out (vec_get cllen (vec_get cl_order i)) 3 in emit_cl (i + 1) in
+  let _ = emit_cl 0 in
+  let rec emit_rle = fn i -> if i >= cs_n then () else
+    let sym = (vec_get cl_syms i : int) in
+    let enb = (vec_get cl_syms (i + 1) : int) in
+    let eval = (vec_get cl_syms (i + 2) : int) in
+    let _ = bw_bits s out (rev_bits (vec_get clcode sym) (vec_get cllen sym)) (vec_get cllen sym) in
+    let _ = if enb > 0 then bw_bits s out eval enb else () in
+    emit_rle (i + 3) in
+  let _ = emit_rle 0 in
+  let rec emit_data = fn i -> if i >= nt then () else
+    let kind = (vec_get toks i : int) in
+    let _ = if kind == 0 then
+        let sym = (vec_get toks (i + 1) : int) in
+        bw_bits s out (rev_bits (vec_get lcode sym) (vec_get llen sym)) (vec_get llen sym)
+      else
+        let (lsym, lnb, lval) = len_encode (vec_get toks (i + 1)) in
+        let _ = bw_bits s out (rev_bits (vec_get lcode lsym) (vec_get llen lsym)) (vec_get llen lsym) in
+        let _ = if lnb > 0 then bw_bits s out lval lnb else () in
+        let (dsym, dnb, dval) = dist_encode (vec_get toks (i + 2)) in
+        let _ = bw_bits s out (rev_bits (vec_get dcode dsym) (vec_get dlen dsym)) (vec_get dlen dsym) in
+        let _ = if dnb > 0 then bw_bits s out dval dnb else () in
+        () in
+    emit_data (i + 3) in
+  let _ = emit_data 0 in
+  let _ = bw_bits s out (rev_bits (vec_get lcode 256) (vec_get llen 256)) (vec_get llen 256) in
+  1 };
+
+
+
+// Level-dependent search work (zlib's configuration table). The engine
+// keeps the same 32 KiB dictionary; higher levels search more candidates.
+let zs_find = fn data -> fn (pos: int) -> fn (n: int) -> fn head -> fn prev -> fn (level: int) -> fn (wbits: int) ->
+  if pos + 2 >= n then (0, 0) else
+  let chain_limit = if level <= 1 then 4 else if level == 2 then 8 else if level == 3 then 32
+    else if level == 4 then 16 else if level == 5 then 32 else if level == 6 then 128
+    else if level == 7 then 256 else if level == 8 then 1024 else 4096 in
+  let nice = if level <= 1 then 8 else if level <= 2 then 16 else if level == 3 then 32
+    else if level == 4 then 16 else if level == 5 then 32 else if level <= 7 then 128 else 258 in
+  let rec length = fn (from: int) -> fn (k: int) ->
+    if k == 258 || pos + k >= n || (vec_get data (from + k) : int) != (vec_get data (pos + k) : int) then k
+    else length from (k + 1) in
+  let rec walk = fn (cand: int) -> fn (chain: int) -> fn (best: int) -> fn (dist: int) ->
+    if cand < 0 || chain == 0 || pos - cand > bit_shl 1 wbits || pos <= cand then (best, dist) else
+    let len = length cand 0 in
+    let (next, nd) = if len > best then (len, pos - cand) else (best, dist) in
+    if next >= nice then (next, nd) else walk (vec_get prev (bit_and cand 32767)) (chain - 1) next nd in
+  walk (vec_get head (dfl_hash data pos n)) chain_limit 0 0;
+
+let zs_deflate = fn (input: str) -> fn (history: str) -> fn (bb: int) -> fn (bc: int) ->
+  fn (flush: int) -> fn (level: int) -> fn (strategy: int) -> fn (wbits: int) ->
+  region ZENC {
+  let data = zs_vec (history ++ input) in
+  let n = vec_len data in let start = str_len history in
+  let head = vec_new () in let prev = vec_new () in
+  let rec zero = fn (i: int) -> if i == 32768 then () else
+    (let _ = vec_push head (0 - 1) in let _ = vec_push prev (0 - 1) in zero (i + 1)) in
+  let _ = zero 0 in
+  let insert = fn (i: int) -> if i == 0 || i + 2 >= n then () else
+    let h = dfl_hash data i n in
+    let _ = vec_set prev (bit_and i 32767) (vec_get head h) in vec_set head h i in
+  let rec seed = fn (i: int) -> if i >= start then () else (let _ = insert i in seed (i + 1)) in
+  let _ = seed 0 in
+  let toks = vec_new () in
+  let rec walk = fn (i: int) -> if i >= n || vec_len toks >= 49149 then i else
+    let (ml0, md0) = if strategy == 2 || level == 0 then (0, 0)
+      else if strategy == 3 then
+        (if i == 0 then (0, 0) else
+          let rec run = fn (k: int) -> if k >= 258 || i + k >= n || (vec_get data (i + k) : int) != (vec_get data (i - 1) : int) then k else run (k + 1) in
+          (run 0, 1))
+      else zs_find data i n head prev level wbits in
+    let ml = if md0 > bit_shl 1 wbits || (strategy == 1 && ml0 < 6) then 0 else ml0 in
+    let _ = insert i in
+    let (nextml, _) = if ml >= 3 && ml < 128 && strategy < 2 && level > 3 && i + 1 < n
+      then zs_find data (i + 1) n head prev level wbits else (0, 0) in
+    if ml < 3 || nextml > ml then
+      (let _ = vec_push toks 0 in let _ = vec_push toks (vec_get data i) in let _ = vec_push toks 0 in walk (i + 1))
+    else (let _ = vec_push toks 1 in let _ = vec_push toks ml in let _ = vec_push toks md0 in
+      let rec add = fn (k: int) -> if k >= ml then () else (let _ = insert (i + k) in add (k + 1)) in
+      let _ = add 1 in walk (i + ml)) in
+  let stop = walk start in
+  if flush == 0 && stop == n && vec_len toks < 49149 then ("", history, bb, bc, 0)
+  else
+  let effective = if stop < n then 0 else flush in
+  let last = if effective == 4 then 1 else 0 in
+  let writer = fn (u: unit) -> let s = bw_new () in let _ = vec_set s 0 bb in let _ = vec_set s 1 bc in s in
+  let fs = writer () in let fo = vec_new () in
+  let _ = zs_fixed toks fs fo last in
+  let ds = writer () in let dout = vec_new () in
+  let dok = if strategy == 4 || level == 0 then 0 else zs_dynamic data toks ds dout last in
+  let ss = writer () in let so = vec_new () in
+  let _ = deflate_stored_block data start stop ss so last in
+  let cost = fn out -> fn s -> vec_len out * 8 + (vec_get s 1 : int) in
+  let (bs, bo) = if level == 0 then (ss, so)
+    else if cost so ss <= cost fo fs && (dok == 0 || cost so ss <= cost dout ds) then (ss, so)
+    else if dok != 0 && cost dout ds < cost fo fs then (ds, dout) else (fs, fo) in
+  let _ = if effective == 2 || effective == 3 then
+    (let empty = vec_new () in let _ = deflate_stored_block empty 0 0 bs bo 0 in ())
+    else if effective == 1 then (let empty = vec_new () in zs_fixed empty bs bo 0) else () in
+  let _ = if last == 1 then bw_flush bs bo else () in
+  let all = substring (history ++ input) 0 stop in
+  let size = bit_shl 1 wbits in
+  let hist = if effective == 3 then "" else if str_len all > size then substring all (str_len all - size) (str_len all) else all in
+  (zs_str bo, hist, (vec_get bs 0 : int), (vec_get bs 1 : int), stop - start) };
+
+// State words: phase (0 block, 1 stored header, 2 stored bytes, 3 dynamic
+// table, 4 codes, 5 end), BFINAL, stored bytes left, bit buffer, bit count.
+// Then 288 literal and 32 distance code lengths. The history is separate.
+let zs_state_new = fn (u: unit) ->
+  let st = (vec_new () : Vec[R, int]) in let rec go = fn (i: int) -> if i == 325 then () else (let _ = vec_push st 0 in go (i + 1)) in
+  let _ = go 0 in st;
+let zs_state_read = fn (src: str) ->
+  let st = zs_state_new () in
+  let rec go = fn (i: int) -> if i == 325 || i * 4 + 3 >= str_len src then () else
+    let p = i * 4 in
+    let x = ord (char_at src p) + bit_shl (ord (char_at src (p + 1))) 8
+      + bit_shl (ord (char_at src (p + 2))) 16 + bit_shl (ord (char_at src (p + 3))) 24 in
+    let _ = vec_set st i x in go (i + 1) in
+  let _ = go 0 in st;
+let zs_state_write = fn st ->
+  region ZSER {
+  let out = bytebuf_new 0 in let rec go = fn (i: int) -> if i == 325 then str_of_bytes (bytes_of_bytebuf out) else
+    let x = (vec_get st i : int) in
+    let rec word = fn (j: int) -> if j == 4 then () else (let _ = bytebuf_push out (bit_and (bit_shr x (j * 8)) 255) in word (j + 1)) in
+    let _ = word 0 in go (i + 1) in go 0 };
+let zs_inflate = fn (encoded: str) -> fn (history: str) -> fn (input: str) -> fn (limit: int) ->
+  region ZDEC {
+  let st = zs_state_read encoded in let src = zs_vec input in let n = vec_len src in
+  let rd = vec_new () in
+  let _ = vec_push rd 0 in let _ = vec_push rd (vec_get st 3) in
+  let _ = vec_push rd (vec_get st 4) in let _ = vec_push rd 0 in
+  let out = zs_vec history in let hn = vec_len out in
+  let bits = fn (k: int) ->
+    let rec go = fn (j: int) -> fn (acc: int) -> if j == k then acc else
+      let _ = if (vec_get rd 2 : int) == 0 then
+        (let p = (vec_get rd 0 : int) in if p >= n then (let _ = vec_set rd 3 1 in ()) else
+          (let _ = vec_set rd 0 (p + 1) in let _ = vec_set rd 1 (vec_get src p) in vec_set rd 2 8)) else () in
+      if (vec_get rd 3 : int) != 0 then acc else
+        let b = (vec_get rd 1 : int) in let _ = vec_set rd 1 (bit_shr b 1) in
+        let _ = vec_set rd 2 ((vec_get rd 2 : int) - 1) in
+        go (j + 1) (bit_or acc (bit_shl (bit_and b 1) j)) in go 0 0 in
+  let decode = fn count -> fn syms ->
+    let rec go = fn (len: int) -> fn (code0: int) -> fn (first: int) -> fn (index: int) ->
+      if len > 15 then 0 - 1 else let code = bit_or code0 (bits 1) in
+      if (vec_get rd 3 : int) != 0 then 0 - 2 else
+      let c = (vec_get count len : int) in
+      if code >= first && code < first + c then (vec_get syms (index + code - first) : int)
+      else go (len + 1) (bit_shl code 1) (bit_shl (first + c) 1) (index + c) in go 1 0 0 0 in
+  let lens = fn (start: int) -> fn (len: int) ->
+    let v = vec_new () in let rec go = fn (i: int) -> if i == len then v else (let _ = vec_push v (vec_get st (start + i)) in go (i + 1)) in go 0 in
+  let save_lens = fn l -> fn d ->
+    let rec go = fn (i: int) -> if i == 320 then () else
+      (let _ = vec_set st (5 + i) (if i < 288 then (if i < vec_len l then (vec_get l i : int) else 0)
+        else (if i - 288 < vec_len d then (vec_get d (i - 288) : int) else 0)) in go (i + 1)) in go 0 in
+  let restore = fn (p: int) -> fn (b: int) -> fn (c: int) ->
+    let _ = vec_set rd 0 p in let _ = vec_set rd 1 b in let _ = vec_set rd 2 c in vec_set rd 3 0 in
+  let valid = fn v -> fn (kind: int) ->
+    let counts = vec_new () in let rec zero = fn (i: int) -> if i == 16 then () else (let _ = vec_push counts 0 in zero (i + 1)) in
+    let _ = zero 0 in
+    let rec count = fn (i: int) -> if i == vec_len v then () else
+      (let x = (vec_get v i : int) in let _ = vec_set counts x ((vec_get counts x : int) + 1) in count (i + 1)) in
+    let _ = count 0 in
+    let rec check = fn (i: int) -> fn (left: int) ->
+      if left < 0 then false else if i == 16 then left == 0 || (kind != 0 && (vec_get counts 1 : int) == 1 && (vec_get counts 0 : int) == vec_len v - 1)
+      else check (i + 1) (left * 2 - (vec_get counts i : int)) in check 1 1 in
+  let rec loop = fn (u: unit) ->
+    let phase = (vec_get st 0 : int) in
+    if phase == 5 then 1 else if vec_len out - hn >= limit then 0 else
+    let p0 = (vec_get rd 0 : int) in let b0 = (vec_get rd 1 : int) in let c0 = (vec_get rd 2 : int) in
+    if phase == 0 then
+      let last = bits 1 in let kind = bits 2 in
+      if (vec_get rd 3 : int) != 0 then (let _ = restore p0 b0 c0 in 0)
+      else if kind == 3 then 0 - 3 else
+        (let _ = vec_set st 1 last in
+         let _ = if kind == 0 then
+           (let _ = vec_set rd 1 0 in let _ = vec_set rd 2 0 in vec_set st 0 1)
+           else if kind == 1 then (let l = vec_new () in let d = vec_new () in
+             let rec fill = fn (i: int) -> if i == 288 then () else
+               (let _ = vec_push l (if i < 144 then 8 else if i < 256 then 9 else if i < 280 then 7 else 8) in fill (i + 1)) in
+             let _ = fill 0 in
+             let rec dist = fn (i: int) -> if i == 32 then () else (let _ = vec_push d 5 in dist (i + 1)) in
+             let _ = dist 0 in let _ = save_lens l d in vec_set st 0 4)
+           else vec_set st 0 3 in loop ())
+    else if phase == 1 then
+      let len = bits 16 in let inv = bits 16 in
+      if (vec_get rd 3 : int) != 0 then (let _ = restore p0 b0 c0 in 0)
+      else if bit_xor len inv != 65535 then 0 - 3
+      else (let _ = vec_set st 2 len in let _ = vec_set st 0 2 in loop ())
+    else if phase == 2 then
+      let left = (vec_get st 2 : int) in
+      if left == 0 then (let _ = vec_set st 0 (if (vec_get st 1 : int) == 1 then 5 else 0) in loop ())
+      else if p0 >= n then 0 else
+        (let _ = vec_push out (vec_get src p0) in let _ = vec_set rd 0 (p0 + 1) in let _ = vec_set st 2 (left - 1) in loop ())
+    else if phase == 3 then
+      let hlit = bits 5 + 257 in let hdist = bits 5 + 1 in let hclen = bits 4 + 4 in
+      let cl = vec_new () in let rec zero = fn (i: int) -> if i == 19 then () else (let _ = vec_push cl 0 in zero (i + 1)) in
+      let _ = zero 0 in
+      let rec readcl = fn (i: int) -> if i == hclen then () else (let _ = vec_set cl (vec_get clen_order i) (bits 3) in readcl (i + 1)) in
+      let _ = readcl 0 in
+      if (vec_get rd 3 : int) != 0 then (let _ = restore p0 b0 c0 in 0)
+      else if hlit > 286 || hdist > 32 || valid cl 0 == false then 0 - 3 else
+      let (cc, cs) = huff_build cl in let ls = vec_new () in
+      let rec fill = fn (u: unit) ->
+        if vec_len ls == hlit + hdist then true else
+        let sym = decode cc cs in
+        if sym < 0 then false else if sym < 16 then (let _ = vec_push ls sym in fill ()) else
+        if sym == 16 && vec_len ls == 0 then false else
+        let k = if sym == 16 then bits 2 + 3 else if sym == 17 then bits 3 + 3 else bits 7 + 11 in
+        let x = if sym == 16 then (vec_get ls (vec_len ls - 1) : int) else 0 in
+        if vec_len ls + k > hlit + hdist || (vec_get rd 3 : int) != 0 then false else
+        let rec rep = fn (i: int) -> if i == k then () else (let _ = vec_push ls x in rep (i + 1)) in
+        let _ = rep 0 in fill () in
+      let ok = fill () in
+      if (vec_get rd 3 : int) != 0 then (let _ = restore p0 b0 c0 in 0)
+      else if ok == false then 0 - 3 else
+      let l = vec_new () in let d = vec_new () in
+      let rec split = fn (i: int) -> if i == vec_len ls then () else
+        (let _ = if i < hlit then vec_push l (vec_get ls i) else vec_push d (vec_get ls i) in split (i + 1)) in
+      let _ = split 0 in
+      if (vec_get l 256 : int) == 0 || valid l 1 == false || (vmax d (vec_len d) != 0 && valid d 1 == false) then 0 - 3
+      else (let _ = save_lens l d in let _ = vec_set st 0 4 in loop ())
+    else
+      let (lc, ls) = huff_build (lens 5 288) in let (dc, ds) = huff_build (lens 293 32) in
+      let rec codes = fn (u: unit) ->
+        if vec_len out - hn >= limit then 0 else
+        let p = (vec_get rd 0 : int) in let b = (vec_get rd 1 : int) in let c = (vec_get rd 2 : int) in
+        let sym = decode lc ls in
+        if (vec_get rd 3 : int) != 0 then (let _ = restore p b c in 0)
+        else if sym < 0 || sym > 285 then 0 - 3
+        else if sym < 256 then (let _ = vec_push out sym in codes ())
+        else if sym == 256 then (let _ = vec_set st 0 (if (vec_get st 1 : int) == 1 then 5 else 0) in loop ())
+        else let len = (vec_get len_base (sym - 257) : int) + bits (vec_get len_extra (sym - 257)) in
+          let distcode = decode dc ds in
+          if (vec_get rd 3 : int) != 0 then (let _ = restore p b c in 0)
+          else if distcode < 0 || distcode > 29 then 0 - 3 else
+          let dist = (vec_get dist_base distcode : int) + bits (vec_get dist_extra distcode) in
+          if (vec_get rd 3 : int) != 0 then (let _ = restore p b c in 0)
+          else if dist > vec_len out then 0 - 3 else
+          let from = vec_len out - dist in
+          let rec copy = fn (i: int) -> if i == len then () else (let _ = vec_push out (vec_get out (from + i)) in copy (i + 1)) in
+          let _ = copy 0 in codes () in codes () in
+  let status = loop () in
+  let _ = vec_set st 3 (vec_get rd 1) in let _ = vec_set st 4 (vec_get rd 2) in
+  let produced = bytebuf_new 0 in
+  let rec result = fn (i: int) -> if i >= vec_len out then () else (let _ = bytebuf_push produced (vec_get out i) in result (i + 1)) in
+  let _ = result hn in
+  let h = bytebuf_new 0 in let _ = (let rec go = fn (i: int) -> if i >= vec_len out then () else
+    (let _ = bytebuf_push h (vec_get out i) in go (i + 1)) in go (if vec_len out > 32768 then vec_len out - 32768 else 0)) in
+  (zs_state_write st, str_of_bytes (bytes_of_bytebuf h), str_of_bytes (bytes_of_bytebuf produced), (vec_get rd 0 : int), status) };
