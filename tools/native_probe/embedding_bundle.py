@@ -23,6 +23,10 @@ parser.add_argument('--prism-lib', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 args = parser.parse_args()
 generated, prism, output = args.library_dir.resolve(), args.prism_lib.resolve(), args.output.resolve()
+provenance_path = generated / 'build-provenance.json'
+provenance = json.loads(provenance_path.read_text()) if provenance_path.is_file() else None
+if provenance and provenance.get('setup_failure_injected'):
+    parser.error('the setup-failure fixture cannot be packaged as an embedding library')
 for path in [generated / 'embedding.o', generated / 'embedding.h', prism]:
     if not path.is_file():
         parser.error(f'missing input: {path}')
@@ -77,7 +81,7 @@ inputs = [generated / 'embedding.o', generated / 'embedding.h', prism, *glue,
           FIXTURES / 'embedding_integration.c', FIXTURES / 'embedding_host.c']
 (output / 'manifest.json').write_text(json.dumps({
     'schema': 1,
-    'build_provenance': json.loads((generated / 'build-provenance.json').read_text()) if (generated / 'build-provenance.json').is_file() else None,
+    'build_provenance': provenance,
     'archive': str(archive),
     'platform': platform.platform(),
     'system_link_flags': link,

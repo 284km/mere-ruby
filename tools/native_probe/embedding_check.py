@@ -31,6 +31,8 @@ parser.add_argument('--compiler', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--prism-lib', type=Path, default=ROOT / 'vendor/prism/obj/libprism.a')
 parser.add_argument('--reference-prefix', type=Path)
+parser.add_argument('--setup-failure', action='store_true',
+                    help='Inject an initialization failure into a separate test fixture')
 args = parser.parse_args()
 output = args.output.resolve()
 output.mkdir(parents=True, exist_ok=False)
@@ -40,10 +42,11 @@ sys.path.insert(0, str(ROOT / 'unittest'))
 from ci import supervise
 os.chdir(ROOT)
 results = {}
-def run(name, command, seconds=90):
+def run(name, command, seconds=90, rss_kb=2097152):
     command = list(map(str, command))
     log = output / (name + '.out')
-    result = supervise(command, dict(os.environ), log, 2097152, seconds)
+    result = supervise(command, dict(os.environ), log, rss_kb, seconds)
+    result['rss_limit_kb'] = rss_kb
     result['command'] = command
     results[name] = result
     (output / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
@@ -59,8 +62,17 @@ source = re.sub(r'import "(m_[^"]+\.mere)";',
 source = re.sub(r'import "(mgz/[^"]+\.mere)";',
                 lambda m: 'import "' + str(ROOT / '.mere_modules' / m[1]) + '";', source)
 (output / 'embedding_core.mere').write_text(source)
+api = FIXTURES / 'embedding_api.mere'
+if args.setup_failure:
+    # Exercise the real protected setup/cleanup path with partial state. Keep
+    # the injected fixture separate from the archive distributed to consumers.
+    original = api.read_text()
+    call = 'let _ = driver_setup env "" "(embedded)" in 0'
+    assert original.count(call) == 1
+    api = output / 'embedding_api_failure.mere'
+    api.write_text(original.replace(call, 'fail "injected setup failure"'))
 (output / 'embedding.mere').write_text(
-    'import "embedding_core.mere";\nimport "' + str(FIXTURES / 'embedding_api.mere') + '";\n'
+    'import "embedding_core.mere";\nimport "' + str(api) + '";\n'
     'let setup = fn () -> vm_setup ();\n'
     'let eval_source = fn (source: str) -> vm_eval source;\n'
     'let cleanup = fn () -> vm_cleanup ();\n'
@@ -77,7 +89,11 @@ if platform.system() != 'Darwin':
     soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
     bound = 512 * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_STACK, (bound if hard < 0 else min(bound, hard), hard))
-run('compile', flags + ['-c', output / 'embedding.c', '-o', output / 'embedding.o'], 300)
+# The generated interpreter is a large translation unit. Apple Clang's O2
+# compilation can exceed 2 GiB even before lifecycle changes. Bound the build
+# separately; every interpreter execution retains the 2-GiB runtime limit.
+run('compile', flags + ['-c', output / 'embedding.c', '-o', output / 'embedding.o'],
+    300, rss_kb=3145728)
 archive = output / 'libmere_embedding_probe.a'
 run('archive', ['ar', 'rcs', archive, output / 'embedding.o'])
 run('link', flags + ['-I', output, FIXTURES / 'embedding_host.c', archive,
@@ -87,14 +103,15 @@ expected = {
     'cleanup-error': 'before_cleanup\nfirst_hook\nlast_hook\nhost_survived\n',
     'cleanup-exit': 'cleanup_hook\nhost_survived\n',
 }
-for mode, text in expected.items():
+for mode, text in ({} if args.setup_failure else expected).items():
     assert run(mode, [output / 'host', mode]) == text
-for mode in ['pending-runtime', 'pending-exit', 'handled-runtime',
+for mode in (['setup-failure'] if args.setup_failure else ['pending-runtime', 'pending-exit', 'handled-runtime',
              'pending-runtime-hook-exit', 'pending-exit-hook-error',
              'pending-exit-hook-exit', 'hooks-exit-then-error',
-             'hooks-error-then-exit', 'pending-runtime-normal-hook']:
+             'hooks-error-then-exit', 'pending-runtime-normal-hook',
+             'runtime-status-ivar', 'exit-subclass']):
     run(mode, [output / 'host', mode])
-if args.reference_prefix:
+if args.reference_prefix and not args.setup_failure:
     ruby = args.reference_prefix.resolve() / 'bin/ruby'
     config = json.loads(subprocess.check_output([str(ruby), '-rjson', '-rrbconfig', '-e',
         'puts JSON.generate(RbConfig::CONFIG.slice("rubyhdrdir", "rubyarchhdrdir", "libdir", "LIBRUBYARG_SHARED"))'], text=True))
@@ -104,7 +121,7 @@ if args.reference_prefix:
         *shlex.split(config['LIBRUBYARG_SHARED']), '-o', output / 'reference'])
     assert run('reference', [output / 'reference']) == expected['lifecycle']
 paths = [compiler, prism, *ROOT.glob('*.mere'), *FIXTURES.glob('embedding*'),
-         output / 'embedding.c', output / 'embedding.h', archive, output / 'host']
+         api, output / 'embedding.c', output / 'embedding.h', archive, output / 'host']
 (output / 'sha256.json').write_text(json.dumps({str(p): hashlib.sha256(p.read_bytes()).hexdigest()
     for p in paths if p.is_file()}, indent=2) + '\n')
 def revision(directory):
@@ -113,6 +130,7 @@ def revision(directory):
     return result.stdout.strip() if result.returncode == 0 else None
 (output / 'build-provenance.json').write_text(json.dumps({
     'schema': 1,
+    'setup_failure_injected': args.setup_failure,
     'source_revision': revision(ROOT),
     'compiler_revision': revision(compiler.parent),
     'compiler_sha256': hashlib.sha256(compiler.read_bytes()).hexdigest(),

@@ -51,3 +51,6 @@ The tests compare lifecycle behavior with Ruby and exercise cleanup
 precedence, retained state, output flushing, and fixed scalar/string workloads
 at 1,000, 10,000, and 100,000 evaluations. Those allocation checks do not
 establish bounded memory for every Ruby program or full Ruby compatibility.
+CI also builds a separate `--setup-failure` fixture to check cleanup after
+partial initialization; that fixture cannot be packaged as a consumer library.
+C compilation has a 3-GiB memory budget; interpreter runs retain the 2-GiB limit.

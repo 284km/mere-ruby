@@ -30,9 +30,20 @@ int main(int argc,char **argv) {
  struct sigaction action={0}, observed={0}; action.sa_handler=host_signal; sigemptyset(&action.sa_mask); sigaction(SIGPIPE,&action,NULL);
  mere_lib_init();
  check("puts 'must_not_run'",2,"");
+ if(argc>1 && !strcmp(argv[1],"setup-failure")) {
+  if(simple(mere_embedding_setup)!=1) return 30;
+  if(simple(mere_embedding_setup)!=2) return 31;
+  mere_buf input={(const unsigned char *)"puts 'must_not_run'",19},err={0};
+  long long status=0;
+  mere_status result=mere_embedding_eval_source(input,&status,&err);
+  boundary(result,err);
+  if(status!=2 || simple(mere_embedding_clear_error)!=2) return 32;
+  if(simple(mere_embedding_cleanup)!=1 || simple(mere_embedding_cleanup)!=1) return 33;
+  mere_lib_shutdown(); puts("failed_setup_cleanup_passed"); return 0;
+ }
  if(simple(mere_embedding_setup)) return 10;
  if(simple(mere_embedding_setup)) return 11;
- if(argc>1 && (strstr(argv[1],"pending-") == argv[1] || strstr(argv[1],"hooks-") == argv[1] || !strcmp(argv[1],"handled-runtime"))) {
+ if(argc>1 && (strstr(argv[1],"pending-") == argv[1] || strstr(argv[1],"hooks-") == argv[1] || !strcmp(argv[1],"handled-runtime") || !strcmp(argv[1],"runtime-status-ivar") || !strcmp(argv[1],"exit-subclass"))) {
   const char *mode=argv[1]; int expected=0;
   if(!strcmp(mode,"pending-runtime-hook-exit")) {check("at_exit { exit 9 }",0,""); expected=9;}
   if(!strcmp(mode,"pending-exit-hook-error")) {check("at_exit { raise 'hook_error' }",0,""); expected=1;}
@@ -43,11 +54,23 @@ int main(int argc,char **argv) {
   if(strstr(mode,"pending-runtime")==mode) {check("raise 'pending_runtime'",1,"RuntimeError");if(!expected)expected=1;}
   if(strstr(mode,"pending-exit")==mode) {check("exit 7",1,"SystemExit");if(!expected)expected=7;}
   if(!strcmp(mode,"handled-runtime")) handled("raise 'handled'","RuntimeError");
+  if(!strcmp(mode,"runtime-status-ivar")) {
+   check("e = RuntimeError.new('status'); e.instance_variable_set(:@__status, 7); raise e",1,"RuntimeError");
+   if(simple(mere_embedding_exception_status)!=1) return 26;
+   expected=1;
+  }
+  if(!strcmp(mode,"exit-subclass")) {
+   check("class EmbeddedExit < SystemExit; end; raise EmbeddedExit.new(7)",1,"EmbeddedExit");
+   if(simple(mere_embedding_exception_status)!=7) return 27;
+   expected=7;
+  }
   if(simple(mere_embedding_cleanup)!=expected || simple(mere_embedding_cleanup)!=expected) return 23;
   mere_buf diagnostics={0},err={0};
   mere_status result=mere_embedding_error_diagnostics(&diagnostics,&err);
   boundary(result,err);
   if((strstr(mode,"pending-runtime")==mode || strstr(mode,"hook-error") || strstr(mode,"hooks-")) && diagnostics.len==0) return 24;
+  if(!strcmp(mode,"runtime-status-ivar") && diagnostics.len==0) return 28;
+  if(!strcmp(mode,"exit-subclass") && diagnostics.len!=0) return 29;
   mere_lib_free((void*)diagnostics.ptr);
   if(simple(mere_embedding_clear_error)!=2) return 25;
   mere_lib_shutdown(); puts("cleanup_contract_passed"); return 0;
