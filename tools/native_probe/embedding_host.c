@@ -43,6 +43,14 @@ int main(int argc,char **argv) {
  }
  if(simple(mere_embedding_setup)) return 10;
  if(simple(mere_embedding_setup)) return 11;
+ if(argc>1 && !strcmp(argv[1],"method-gc")) {
+  check("def collect_inside; GC.start; 42; end; raise 'active body lost' unless collect_inside == 42",0,"");
+  check("raise 'retained body lost' unless collect_inside == 42; $gc_block = proc { GC.start; 43 }; raise 'active block lost' unless $gc_block.call == 43",0,"");
+  handled("def collect_then_raise; GC.start; raise 'after collection'; end; collect_then_raise","RuntimeError");
+  check("raise 'recovery failed' unless collect_inside == 42; at_exit { raise 'cleanup body lost' unless collect_inside == 42 && $gc_block.call == 43 }",0,"");
+  if(simple(mere_embedding_cleanup)) return 40;
+  mere_lib_shutdown(); puts("method_gc_passed"); return 0;
+ }
  if(argc>1 && !strcmp(argv[1],"local-call-before-assignment")) {
   check("def read_before_assign; :method; end; $before_assignment = read_before_assign; read_before_assign = 7; raise 'method shadowed' unless $before_assignment == :method; raise 'assignment lost' unless read_before_assign == 7",0,"");
   check("def conditional_local; :conditional_method; end; $before_conditional = conditional_local; conditional_local = 1 if false; raise 'conditional shadowed' unless $before_conditional == :conditional_method",0,"");
