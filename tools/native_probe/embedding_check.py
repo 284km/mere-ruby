@@ -79,7 +79,7 @@ run('compile', flags + ['-c', output / 'embedding.c', '-o', output / 'embedding.
 archive = output / 'libmere_embedding_probe.a'
 run('archive', ['ar', 'rcs', archive, output / 'embedding.o'])
 run('link', flags + ['-I', output, FIXTURES / 'embedding_host.c', archive,
-    ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', prism, '-pthread', *link_flags, '-o', output / 'host'])
+    ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', ROOT / 'tools/process_glue.c', prism, '-pthread', *link_flags, '-o', output / 'host'])
 expected = {
     'lifecycle': 'between_evals\nstate_preserved\nbefore_cleanup\nend_hook\nnested_hook\ncleanup_hook\nhost_survived\n',
     'cleanup-error': 'before_cleanup\nfirst_hook\nlast_hook\nhost_survived\n',

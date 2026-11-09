@@ -43,7 +43,7 @@ def run(name, command, seconds=90):
 flags = ['clang', '-O2', '-w', '-I', library, '-I', FIXTURES,
          '-I', ROOT / 'vendor/prism/include']
 libs = [library / 'libmere_embedding_probe.a', ROOT / 'tools/prism_glue.c',
-        ROOT / 'tools/socket_glue.c', prism, '-pthread']
+        ROOT / 'tools/socket_glue.c', ROOT / 'tools/process_glue.c', prism, '-pthread']
 if platform.system() == 'Darwin':
     libs += ['-Wl,-stack_size,0x20000000']
 else:
