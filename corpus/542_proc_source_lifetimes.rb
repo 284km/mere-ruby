@@ -5,7 +5,7 @@ kept = []
   original = eval("proc { :ok }", binding, name, i + 10)
   copy = original.dup
   location = original.source_location
-  location[0].replace("changed")
+  location[0].replace("changed") unless location[0].frozen?
   raise "source alias" unless original.source_location == [name, i + 10]
   raise "duplicate source" unless copy.source_location == [name, i + 10]
   kept << copy if i % 9 == 0
