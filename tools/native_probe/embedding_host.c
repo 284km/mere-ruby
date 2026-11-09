@@ -43,6 +43,40 @@ int main(int argc,char **argv) {
  }
  if(simple(mere_embedding_setup)) return 10;
  if(simple(mere_embedding_setup)) return 11;
+ if(argc>1 && !strcmp(argv[1],"persistent-locals")) {
+  check("kept = 42; never = 1 if false",0,"");
+  check("raise 'names lost' unless TOPLEVEL_BINDING.local_variables == [:kept, :never]; raise 'unassigned lost' unless TOPLEVEL_BINDING.local_variable_get(:never).nil?",0,"");
+  check("later = 7; kept = 43",0,"");
+  check("GC.start; raise 'binding order' unless TOPLEVEL_BINDING.local_variables == [:later, :kept, :never]; raise 'values lost' unless kept == 43 && later == 7",0,"");
+  if(simple(mere_embedding_cleanup)) return 34;
+  mere_lib_shutdown(); puts("persistent_locals_passed"); return 0;
+ }
+ if(argc>1 && (!strcmp(argv[1],"bad-inspect-pending") || !strcmp(argv[1],"bad-inspect-clear") || !strcmp(argv[1],"bad-inspect-hook") || !strcmp(argv[1],"primitive-pending"))) {
+  const char *mode=argv[1];
+  check("class BadInspect < StandardError; def inspect; raise 'inspect failed'; end; end; $original = BadInspect.new('original')",0,"");
+  if(!strcmp(mode,"primitive-pending")) {
+   check("at_exit { raise 'pending lost' unless $!.is_a?(ArgumentError) && $!.message.include?('invalid') }; Integer('bad')",1,"ArgumentError");
+  } else if(!strcmp(mode,"bad-inspect-hook")) {
+   check("at_exit { puts 'after_bad_inspect' }; at_exit { raise $original }",0,"");
+  } else {
+   if(!strcmp(mode,"bad-inspect-pending")) check("at_exit { raise 'identity lost' unless $!.equal?($original) }",0,"");
+   check("raise $original",1,"BadInspect");
+   if(!strcmp(mode,"bad-inspect-clear")) {
+    if(simple(mere_embedding_clear_error)) return 35;
+    check("GC.start; raise 'clear failed' unless $!.nil?; puts 'recovered'",0,"");
+   }
+  }
+  int expected=!strcmp(mode,"bad-inspect-clear") ? 0 : 1;
+  if(simple(mere_embedding_cleanup)!=expected || simple(mere_embedding_cleanup)!=expected) return 36;
+  check("puts 'must_not_run'",2,!strcmp(mode,"primitive-pending") ? "ArgumentError" : expected ? "BadInspect" : "");
+  if(expected) {
+   mere_buf diagnostics={0},err={0};
+   mere_status result=mere_embedding_error_diagnostics(&diagnostics,&err); boundary(result,err);
+   if(diagnostics.len==0) return 37;
+   mere_lib_free((void*)diagnostics.ptr);
+  }
+  mere_lib_shutdown(); puts("protected_reporting_passed"); return 0;
+ }
  if(argc>1 && (strstr(argv[1],"pending-") == argv[1] || strstr(argv[1],"hooks-") == argv[1] || !strcmp(argv[1],"handled-runtime") || !strcmp(argv[1],"runtime-status-ivar") || !strcmp(argv[1],"exit-subclass"))) {
   const char *mode=argv[1]; int expected=0;
   if(!strcmp(mode,"pending-runtime-hook-exit")) {check("at_exit { exit 9 }",0,""); expected=9;}

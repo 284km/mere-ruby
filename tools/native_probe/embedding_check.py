@@ -109,8 +109,12 @@ for mode in (['setup-failure'] if args.setup_failure else ['pending-runtime', 'p
              'pending-runtime-hook-exit', 'pending-exit-hook-error',
              'pending-exit-hook-exit', 'hooks-exit-then-error',
              'hooks-error-then-exit', 'pending-runtime-normal-hook',
-             'runtime-status-ivar', 'exit-subclass']):
-    run(mode, [output / 'host', mode])
+             'runtime-status-ivar', 'exit-subclass', 'persistent-locals',
+             'bad-inspect-pending', 'bad-inspect-clear', 'bad-inspect-hook',
+             'primitive-pending']):
+    text = run(mode, [output / 'host', mode])
+    if mode == 'bad-inspect-hook':
+        assert text == 'after_bad_inspect\nprotected_reporting_passed\n'
 if args.reference_prefix and not args.setup_failure:
     ruby = args.reference_prefix.resolve() / 'bin/ruby'
     config = json.loads(subprocess.check_output([str(ruby), '-rjson', '-rrbconfig', '-e',

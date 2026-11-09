@@ -35,6 +35,9 @@ and `exception_status` inspect it without consuming it; further evaluation
 is refused. Call `clear_error` to acknowledge it and resume evaluation, or
 call `cleanup` to finish with that pending error. `SystemExit(0)` is still a
 protected exception even though its exit status is zero.
+Diagnostics read the stored exception class and message without invoking
+Ruby methods such as an overridden `inspect`. Primitive errors are retained
+as Ruby's pending `$!`, just like explicitly raised exceptions.
 
 Cleanup runs exit hooks in Ruby's order, flushes open output, and terminates
 the scheduler. A later hook failure or SystemExit replaces the pending exit
