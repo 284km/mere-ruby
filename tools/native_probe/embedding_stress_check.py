@@ -2,9 +2,8 @@
 """Check retained state and allocation growth in an existing embedding archive.
 
 First build the archive with embedding_check.py. This checks fixed workloads;
-it does not assert bounded memory for arbitrary Ruby programs. The allocation
-gate currently exposes the remaining monotonic string-page metadata growth;
-it is a diagnostic and is not yet part of the passing CI gate.
+it does not assert bounded memory for arbitrary Ruby programs. The same gate
+checks both per-evaluation temporaries and historical string-page metadata.
 """
 from pathlib import Path
 import argparse
@@ -66,10 +65,9 @@ for mode in ['scalar', 'churn']:
         matches = re.findall(r'^region-stats default: .*alloc_total=(\d+)$', text, re.M)
         assert len(matches) == 1, 'missing or ambiguous allocator statistics'
         totals[mode][count] = int(matches[0])
-    values = list(totals[mode].values())
     (output / 'allocation-totals.json').write_text(json.dumps(totals, indent=2) + '\n')
-    # A small fixed allowance accommodates startup/sampling differences. The
-    # former per-evaluation retention exceeds it even at 10,000 evaluations.
+# A small fixed allowance accommodates startup/sampling differences. The
+# former per-evaluation retention exceeds it even at 10,000 evaluations.
 violations = {mode: counts for mode, counts in totals.items()
               if max(counts.values()) - min(counts.values()) > 1024}
 assert not violations, ('unresolved allocation growth', violations)
