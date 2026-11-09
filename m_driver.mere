@@ -2415,18 +2415,18 @@ let core_prelude_d =
   "  def incomplete_input?; @incomplete_input; end\n" ++
   "end\n" ++
   "module ObjectSpace\n" ++
-  "  # Finalizers. There is no hook from this collector into Ruby code, so\n" ++
-  "  # one never runs when its object is collected; what ruby ALSO does --\n" ++
-  "  # run every finalizer still registered when the process exits, with the\n" ++
-  "  # object's id -- is done here, from at_exit. undefine_finalizer takes\n" ++
-  "  # them back, and both refuse a frozen object as ruby does.\n" ++
+  "  # The collector queues dead identities; callbacks run at a Ruby safepoint.\n" ++
+  "  # Still-registered targets are finalized at process exit as well.\n" ++
   "  @__fin = Hash.new\n" ++
+  "  @__fin_more = Hash.new\n" ++
   "  def self.__fin_frozen(obj)\n" ++
   "    raise FrozenError, \"can't modify frozen \" + obj.class.to_s + \": \" + obj.inspect if obj.frozen?\n" ++
   "  end\n" ++
   "  def self.define_finalizer(obj, callable = nil, &blk)\n" ++
   "    callable ||= blk\n" ++
-  "    unless callable.respond_to?(:call)\n" ++
+  "    fast = __fin_fast(obj, callable)\n" ++
+  "    return fast if fast\n" ++
+  "    unless callable.respond_to?(:call, true)\n" ++
   "      raise ArgumentError, \"wrong type argument \" + callable.class.to_s + \" (should be callable)\"\n" ++
   "    end\n" ++
   "    # an immediate is never collected, so it cannot have one (asked before\n" ++
@@ -2437,32 +2437,49 @@ let core_prelude_d =
   "    __fin_frozen(obj)\n" ++
   "    # a finalizer whose receiver IS the object keeps it alive for ever\n" ++
   "    rcv = if ::Method === callable then callable.receiver\n" ++
-  "          elsif ::Proc === callable then (callable.binding.receiver rescue nil)\n" ++
+  "          elsif ::Proc === callable then (__fin_proc_receiver(callable) rescue nil)\n" ++
   "          end\n" ++
   "    warn(\"finalizer references object to be finalized\", uplevel: 1) if rcv.equal?(obj)\n" ++
-  "    unless @__fin_hooked\n" ++
-  "      @__fin_hooked = true\n" ++
-  "      at_exit do\n" ++
-  "        ObjectSpace.__run_finalizers\n" ++
-  "      end\n" ++
-  "    end\n" ++
+  "    __install_finalizer_hook unless @__fin_hooked\n" ++
   "    # the same finalizer (by ==, so a dup of a proc too) is kept once, and\n" ++
   "    # the one kept is what a second definition answers\n" ++
   "    ObjectSpace.__fin_flag\n" ++
-  "    list = (@__fin[obj.object_id] ||= [])\n" ++
-  "    same = list.find \{ |c| c == callable }\n" ++
-  "    return [0, same] if same\n" ++
-  "    list << callable\n" ++
+  "    id = obj.object_id\n" ++
+  "    __fin_watch(obj, id)\n" ++
+  "    if @__fin.key?(id)\n" ++
+  "      first = @__fin[id]\n" ++
+  "      return [0, first] if first == callable\n" ++
+  "      list = (@__fin_more[id] ||= [])\n" ++
+  "      same = list.find \{ |c| c == callable }\n" ++
+  "      return [0, same] if same\n" ++
+  "      list << callable\n" ++
+  "    else\n" ++
+  "      @__fin[id] = callable\n" ++
+  "    end\n" ++
   "    [0, callable]\n" ++
   "  end\n" ++
+  "  def self.__install_finalizer_hook\n" ++
+  "    @__fin_hooked = true\n" ++
+  "    at_exit do\n" ++
+  "      ObjectSpace.__run_finalizers\n" ++
+  "    end\n" ++
+  "  end\n" ++
   "  def self.__fin_copy(from, to)\n" ++
-  "    list = @__fin[from.object_id]\n" ++
-  "    @__fin[to.object_id] = list.dup if list && !from.equal?(to)\n" ++
+  "    id = from.object_id\n" ++
+  "    if @__fin.key?(id) && !from.equal?(to)\n" ++
+  "      dest = to.object_id\n" ++
+  "      @__fin[dest] = @__fin[id]\n" ++
+  "      more = @__fin_more[id]\n" ++
+  "      @__fin_more[dest] = more.dup if more\n" ++
+  "      __fin_watch(to, dest)\n" ++
+  "    end\n" ++
   "    nil\n" ++
   "  end\n" ++
   "  def self.undefine_finalizer(obj)\n" ++
   "    __fin_frozen(obj)\n" ++
   "    @__fin.delete(obj.object_id)\n" ++
+  "    @__fin_more.delete(obj.object_id)\n" ++
+  "    __fin_forget(obj.object_id)\n" ++
   "    obj\n" ++
   "  end\n" ++
   "  # one at a time until none is left: a finalizer may define another (it\n" ++
@@ -2497,21 +2514,39 @@ let core_prelude_d =
   "  # (the table is taken whole and walked, and what the finalizers define\n" ++
   "  # meanwhile is the next round: one #shift per object rewrote the rest of\n" ++
   "  # the table each time, and a million finalizers never finished)\n" ++
+  "  def self.__run_ready_finalizers\n" ++
+  "    __fin_take_ready.each do |id|\n" ++
+  "      if @__fin.key?(id)\n" ++
+  "        first = @__fin.delete(id)\n" ++
+  "        more = @__fin_more.delete(id)\n" ++
+  "        __call_finalizers(id, first, more)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "  end\n" ++
   "  def self.__run_finalizers\n" ++
   "    until @__fin.empty?\n" ++
   "      batch = @__fin\n" ++
+  "      extras = @__fin_more\n" ++
   "      @__fin = Hash.new\n" ++
-  "      batch.each do |id, cs|\n" ++
-  "        cs.each do |c|\n" ++
-  "          begin\n" ++
-  "            c.call(id)\n" ++
-  "          rescue SystemExit\n" ++
-  "          rescue Exception => e\n" ++
-  "            unless $VERBOSE.nil?\n" ++
-  "              $stderr.puts \"warning: Exception in finalizer \" + c.inspect\n" ++
-  "              $stderr.puts e.message + \" (\" + e.class.to_s + \")\"\n" ++
-  "            end\n" ++
-  "          end\n" ++
+  "      @__fin_more = Hash.new\n" ++
+  "      __fin_run_batch(batch, extras)\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "  def self.__call_finalizers(id, first, more)\n" ++
+  "    __call_finalizer(id, first)\n" ++
+  "    more.each \{ |c| __call_finalizer(id, c) } if more\n" ++
+  "  end\n" ++
+  "  def self.__call_finalizer(id, c)\n" ++
+  "    begin\n" ++
+  "      c.__send__(:call, id)\n" ++
+  "    rescue SystemExit\n" ++
+  "    rescue Exception => e\n" ++
+  "      unless $VERBOSE.nil?\n" ++
+  "        begin\n" ++
+  "          $stderr.puts \"warning: Exception in finalizer \" + c.inspect\n" ++
+  "          $stderr.puts e.message + \" (\" + e.class.to_s + \")\"\n" ++
+  "        rescue Exception\n" ++
+  "          # Reporting must not discard the rest of a detached batch.\n" ++
   "        end\n" ++
   "      end\n" ++
   "    end\n" ++
@@ -11726,6 +11761,12 @@ let store_stats = fn world ->
   let _ = row "gc_in_body" (if map_has gc_state "nib" then map_get gc_state "nib" else 0) in
   // ...and the captured frames: waiting in lv_cap, and given back (note 272)
   let _ = row "lv_cap" (map_len lv_cap) in
+  let frame_measure = map_new () in
+  let _ = map_iter lv_cap (fn (id: int) -> fn e ->
+    (let _ = map_set frame_measure 0 ((if map_has frame_measure 0 then map_get frame_measure 0 else 0) + map_bytes e) in
+     map_set frame_measure 1 ((if map_has frame_measure 1 then map_get frame_measure 1 else 0) + map_len e))) in
+  let _ = row "bytes_captured_frames" (if map_has frame_measure 0 then map_get frame_measure 0 else 0) in
+  let _ = row "entries_captured_frames" (if map_has frame_measure 1 then map_get frame_measure 1 else 0) in
   let _ = row "lv_cap_freed" (if map_has gc_state "capfree" then map_get gc_state "capfree" else 0) in
   row "insp_seen" (map_len insp_seen);
 
@@ -13005,6 +13046,7 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
          let _ = (if gc_auto_off () then ()
                   else (let _ = (if fb_live () > 0 then (let _ = fb_reclaim env world in ()) else ()) in
                         gc_collect_any env world)) in
+         let _ = fin_drain world in
          gc_drive (cursor + consumed) v2)
       else if flag == 1 then gc_drive gc_total v2
       else if flag == 2 then gc_drive (gc_total + 1) lastv
