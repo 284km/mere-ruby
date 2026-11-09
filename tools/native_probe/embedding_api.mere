@@ -1,5 +1,7 @@
 // Experimental singleton embedding lifecycle. Ruby exceptions are recorded as
 // metadata and return status 1; status 2 means the lifecycle refuses the call.
+// A protected exception remains pending until clear_error or cleanup. Reading
+// exception metadata never handles it, and eval refuses to overwrite it.
 // No Ruby signal disposition is installed here. Hosts serialize all API calls.
 // An explicit Ruby exit!/exec remains process control, not a protected exception.
 let vm_phase = map_new ();
@@ -21,6 +23,9 @@ let vm_capture_error = fn (message: str) ->
   let exc = pending_exc world in
   let cls = exc_cls_of world exc in
   let _ = map_set vm_error "class" cls in
+  let _ = map_set vm_error "pending" "yes" in
+  let _ = (if str_eq cls "SystemExit" then () else
+    map_set vm_error "diagnostics" ((if map_has vm_error "diagnostics" then map_get vm_error "diagnostics" else "") ++ inspect_w gc_cenv0 world exc ++ "\n")) in
   let _ = map_set vm_exit_code "status"
     (match exc with
      | VObj id -> (match (if map_has ivars_g (str_of_int id ++ "@__status") then map_get ivars_g (str_of_int id ++ "@__status") else VNil) with VInt n -> n | _ -> 1)
@@ -53,7 +58,7 @@ let vm_setup = fn () ->
 let vm_eval = fn (source: str) ->
   // Persistent stores copy retained values before this call region closes.
   region EVALUATION {
-  if (if map_has vm_phase "v" then map_get vm_phase "v" else 0) != 1 then 2 else
+  if (if map_has vm_phase "v" then map_get vm_phase "v" else 0) != 1 || map_has vm_error "pending" then 2 else
   let _ = map_set vm_phase "v" 2 in
   let _ = vm_clear_pending () in
   let result = try_or_msg (fn (u: unit) ->
@@ -67,21 +72,31 @@ let vm_eval = fn (source: str) ->
   let _ = map_compact fb_off_fn in
   let _ = map_compact lvt_names in
   let _ = map_set vm_phase "v" 1 in result };
+// Explicit host acknowledgement also resets Ruby's pending exception state.
+let vm_clear_error = fn () ->
+  if (if map_has vm_phase "v" then map_get vm_phase "v" else 0) != 1 then 2
+  else (let _ = vm_clear_pending () in 0);
 let vm_cleanup = fn () ->
   let phase = (if map_has vm_phase "v" then map_get vm_phase "v" else 0) in
   if phase == 3 then (if map_has vm_exit_code "cleanup" then map_get vm_exit_code "cleanup" else 0)
-  else if phase != 1 then 2 else
+  else if phase != 1 && phase != 4 then 2 else
   let _ = map_set vm_phase "v" 2 in
-  let _ = vm_clear_pending () in
+  // Keep the pending error visible to at_exit through $!. Its saved status
+  // applies only when no later hook failure or SystemExit replaces it.
+  let pending_status = (if map_has vm_exit_code "status" then map_get vm_exit_code "status" else 0) in
   let world = (meths_g, cls_sup, obj_cls, ivars_g) in
   let result = try_or_msg (fn (u: unit) ->
-    let status = run_at_exits_r world (fn (exc: Val) ->
-      let _ = map_set vm_error "class" (exc_cls_of world exc) in ()) in
+    let status = (if phase == 4 then 0 - 1 else
+      run_at_exits_r world (fn (exc: Val) ->
+        let _ = map_set vm_error "class" (exc_cls_of world exc) in
+        map_set vm_error "diagnostics" ((if map_has vm_error "diagnostics" then map_get vm_error "diagnostics" else "") ++ inspect_w gc_cenv0 world exc ++ "\n"))) in
     let _ = sch_terminate_all world in
     let signal = (if map_has at_exit_sig "s" then map_get at_exit_sig "s" else 0) in
-    if signal > 0 then 128 + signal else if status >= 0 then status else 0) vm_capture_error in
+    if signal > 0 then 128 + signal else if status >= 0 then status else pending_status)
+    (fn (message: str) -> let _ = vm_capture_error message in
+      if map_has vm_exit_code "status" then map_get vm_exit_code "status" else 1) in
   let _ = map_set vm_exit_code "cleanup" result in
   let _ = map_set vm_phase "v" 3 in result;
 let vm_error_class = fn () -> if map_has vm_error "class" then map_get vm_error "class" else "";
+let vm_error_diagnostics = fn () -> if map_has vm_error "diagnostics" then map_get vm_error "diagnostics" else "";
 let vm_exception_status = fn () -> if map_has vm_exit_code "status" then map_get vm_exit_code "status" else 0;
-

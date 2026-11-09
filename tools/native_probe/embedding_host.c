@@ -18,6 +18,12 @@ static void check(const char *code, int status, const char *klass) {
  if(cl.len!=(long long)strlen(klass)||memcmp(cl.ptr,klass,(size_t)cl.len)) { fprintf(stderr,"class:%.*s expected:%s source:%s\n",(int)cl.len,cl.ptr,klass,code); exit(92); }
  mere_lib_free((void*)cl.ptr);
 }
+static void handled(const char *source, const char *klass) {
+ check(source,1,klass);
+ /* Inspection leaves the error pending, so another eval must be refused. */
+ check("raise 'must not execute'",2,klass);
+ if(simple(mere_embedding_clear_error)) exit(93);
+}
 static void host_signal(int sig) { (void)sig; }
 int main(int argc,char **argv) {
  setvbuf(stdout,NULL,_IOLBF,0);
@@ -26,7 +32,26 @@ int main(int argc,char **argv) {
  check("puts 'must_not_run'",2,"");
  if(simple(mere_embedding_setup)) return 10;
  if(simple(mere_embedding_setup)) return 11;
- if(argc>1 && !strcmp(argv[1],"cleanup-error")) {
+ if(argc>1 && (strstr(argv[1],"pending-") == argv[1] || strstr(argv[1],"hooks-") == argv[1] || !strcmp(argv[1],"handled-runtime"))) {
+  const char *mode=argv[1]; int expected=0;
+  if(!strcmp(mode,"pending-runtime-hook-exit")) {check("at_exit { exit 9 }",0,""); expected=9;}
+  if(!strcmp(mode,"pending-exit-hook-error")) {check("at_exit { raise 'hook_error' }",0,""); expected=1;}
+  if(!strcmp(mode,"pending-exit-hook-exit")) {check("at_exit { exit 9 }",0,""); expected=9;}
+  if(!strcmp(mode,"pending-runtime-normal-hook")) {check("at_exit { raise 'pending invisible' unless $!.is_a?(RuntimeError) }",0,""); expected=1;}
+  if(!strcmp(mode,"hooks-exit-then-error")) {check("at_exit { raise 'hook_error' }; at_exit { exit 9 }",0,""); expected=1;}
+  if(!strcmp(mode,"hooks-error-then-exit")) {check("at_exit { exit 9 }; at_exit { raise 'hook_error' }",0,""); expected=9;}
+  if(strstr(mode,"pending-runtime")==mode) {check("raise 'pending_runtime'",1,"RuntimeError");if(!expected)expected=1;}
+  if(strstr(mode,"pending-exit")==mode) {check("exit 7",1,"SystemExit");if(!expected)expected=7;}
+  if(!strcmp(mode,"handled-runtime")) handled("raise 'handled'","RuntimeError");
+  if(simple(mere_embedding_cleanup)!=expected || simple(mere_embedding_cleanup)!=expected) return 23;
+  mere_buf diagnostics={0},err={0};
+  mere_status result=mere_embedding_error_diagnostics(&diagnostics,&err);
+  boundary(result,err);
+  if((strstr(mode,"pending-runtime")==mode || strstr(mode,"hook-error") || strstr(mode,"hooks-")) && diagnostics.len==0) return 24;
+  mere_lib_free((void*)diagnostics.ptr);
+  if(simple(mere_embedding_clear_error)!=2) return 25;
+  mere_lib_shutdown(); puts("cleanup_contract_passed"); return 0;
+ } else if(argc>1 && !strcmp(argv[1],"cleanup-error")) {
   check("at_exit { puts 'last_hook' }; at_exit { raise 'hook_error' }; at_exit { puts 'first_hook' }",0,"");
   puts("before_cleanup");
   if(simple(mere_embedding_cleanup)!=1) return 12;
@@ -38,19 +63,21 @@ int main(int argc,char **argv) {
   check("$stdout.sync=true; $lifetime=40; local_value=7; at_exit { puts 'cleanup_hook' }; KEEP=Object.new; $keep=KEEP",0,"");
   puts("between_evals");
   check("raise 'state' unless $lifetime==40 && local_value==7 && KEEP.equal?($keep); $lifetime+=2",0,"");
-  check("raise 'runtime'",1,"RuntimeError");
+  handled("raise 'runtime'","RuntimeError");
   check("raise 'pending leaked' unless $!.nil?; raise 'state lost' unless $lifetime==42",0,"");
-  check("def broken(",1,"SyntaxError");
+  handled("def broken(","SyntaxError");
   check("exit 7",1,"SystemExit");
   if(simple(mere_embedding_exception_status)!=7) return 15;
+  if(simple(mere_embedding_clear_error)) return 21;
   check("exit 0",1,"SystemExit");
   if(simple(mere_embedding_exception_status)!=0) return 16;
-  check("BEGIN { raise 'begin' }",1,"RuntimeError");
-  check("raise ArgumentError, 'arg'",1,"ArgumentError");
-  check("Object.this_method_does_not_exist",1,"NoMethodError");
+  if(simple(mere_embedding_clear_error)) return 22;
+  handled("BEGIN { raise 'begin' }","RuntimeError");
+  handled("raise ArgumentError, 'arg'","ArgumentError");
+  handled("Object.this_method_does_not_exist","NoMethodError");
   check("GC.start; raise 'gc lost state' unless $lifetime==42 && local_value==7 && KEEP.equal?($keep)",0,"");
   check("at_exit { GC.start; raise 'closure lost' unless local_value==7 && KEEP.equal?($keep); at_exit { GC.start; puts 'nested_hook' } }; END { puts 'end_hook' }",0,"");
-  check("def nested_failure; raise 'nested'; end; nested_failure",1,"RuntimeError");
+  handled("def nested_failure; raise 'nested'; end; nested_failure","RuntimeError");
   check("raise 'cleanup happened' unless $!.nil?; puts 'state_preserved'",0,"");
   for(int i=0;i<20;i++) check("GC.start; raise 'persistent binding lost' unless TOPLEVEL_BINDING.eval('local_value')==7 && KEEP.equal?($keep)",0,"");
   puts("before_cleanup");

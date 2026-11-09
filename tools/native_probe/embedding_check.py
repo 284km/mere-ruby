@@ -64,6 +64,8 @@ source = re.sub(r'import "(mgz/[^"]+\.mere)";',
     'let setup = fn () -> vm_setup ();\n'
     'let eval_source = fn (source: str) -> vm_eval source;\n'
     'let cleanup = fn () -> vm_cleanup ();\n'
+    'let clear_error = fn () -> vm_clear_error ();\n'
+    'let error_diagnostics = fn () -> vm_error_diagnostics ();\n'
     'let error_class = fn () -> vm_error_class ();\n'
     'let exception_status = fn () -> vm_exception_status ();\n()\n')
 for mode in ['header', 'c']:
@@ -87,6 +89,11 @@ expected = {
 }
 for mode, text in expected.items():
     assert run(mode, [output / 'host', mode]) == text
+for mode in ['pending-runtime', 'pending-exit', 'handled-runtime',
+             'pending-runtime-hook-exit', 'pending-exit-hook-error',
+             'pending-exit-hook-exit', 'hooks-exit-then-error',
+             'hooks-error-then-exit', 'pending-runtime-normal-hook']:
+    run(mode, [output / 'host', mode])
 if args.reference_prefix:
     ruby = args.reference_prefix.resolve() / 'bin/ruby'
     config = json.loads(subprocess.check_output([str(ruby), '-rjson', '-rrbconfig', '-e',
