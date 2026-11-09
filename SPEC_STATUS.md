@@ -94,7 +94,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | library/cgi | 6 | 1 | 0 | 7 | 0 | 14 |
 | library/tempfile | 10 | 0 | 0 | 0 | 0 | 10 |
 | library/readline | 0 | 0 | 0 | 12 | 0 | 12 |
-| library/yaml | 8 | 1 | 0 | 0 | 0 | 9 |
+| library/yaml | 9 | 0 | 0 | 0 | 0 | 9 |
 | library/zlib | 8 | 0 | 0 | 0 | 0 | 8 |
 | library/monitor | 6 | 0 | 0 | 0 | 0 | 6 |
 | library/securerandom | 5 | 0 | 0 | 0 | 0 | 5 |
