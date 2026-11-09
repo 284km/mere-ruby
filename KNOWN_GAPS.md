@@ -3885,47 +3885,41 @@ so: the 64-bit version is the more natural transcription of the standard, it is
 correct, and it is unusable. A dogfood that only checked answers would have
 shipped it.
 
-## The gzip engine runs at about 30 KB/s, and nothing had reached it before
+## Zlib streams and gzip IO are resumable (closed 2026-11-09)
 
-```
-Zlib.gzip("." * 2**20)   #   1 MB -> 1051 bytes,  35.3s
-Zlib.gzip("." * 2**21)   #   2 MB -> 2068 bytes,  71.2s
-Zlib.gzip("." * 2**22)   #   4 MB -> 4099 bytes, 142.6s
-```
+The historical one-shot implementation buffered all input, ignored flush and
+compression options, and could not set a compression dictionary. Both engines
+now retain state between calls. The pure Mere implementation is
+`m_zstream.mere`, using mgz's format tables and bit writer, with the Ruby API
+in `lib/zlib_ext.rb`, `lib/zlib_stream.rb`, and `lib/zlib_gzip.rb` (embedded by
+`tools/gen_zlib_lib.rb`). It adds no libz or native-extension dependency.
 
-Linear, and about **34 seconds per megabyte**. `library/zlib/gzipwriter/write_spec.rb`
-writes 2\*\*23 bytes and is recorded SLOW: the harness stops it over the CPU
-budget, which is the honest verdict -- it is working, not aborting.
+Deflate handles raw, zlib and gzip framing, compression levels and strategies,
+preset dictionaries, partial/sync/full/final flushes, params, duplication,
+reset and close. Blocks are bounded by 16,383 tokens; the input lookahead is
+bounded, and the dictionary is at most 32 KiB. Inflate commits complete
+symbols, keeps its bit reader and Huffman tables, and produces output before
+the stream ends. Partial input is not replayed from the beginning. Raw, zlib,
+gzip and automatic-header readers validate headers, checksums and trailers.
+Dictionary negotiation, sync recovery, output buffers, block breaks and
+post-stream passthrough are exercised against the reference.
 
-⚠ **This cost is not new; only its visibility is.** Before `Zlib::GzipFile.wrap`
-existed the spec died on the missing name in milliseconds, so the record showed
-a NoMethodError and never the seconds. A hole with no workaround leaves no
-trace of what is behind it, and closing the hole is what put the number in the
-record. The same is true of the eight other SLOW rows this harness carries.
+GzipReader reads incrementally and retains bytes after its member for
+`unused` and `zcat`; GzipWriter emits incremental compressed output. Header
+metadata, finish without closing the underlying IO, rewind, encoding,
+pushback and the distinct footer/CRC/length errors are covered. Checksums
+accept IO input and support Adler-32/CRC-32 composition.
 
-**What fixing it would take.** Work in the deflate encoder itself, not here.
-The interesting question first is which half the time is in -- the LZ77 match
-search or the Huffman coding -- and neither has been measured.
-
-## `Zlib::Deflate` and `Zlib::Inflate` buffer, and cannot change mid-stream
-
-`Zlib.deflate` / `Zlib.inflate` are one-shot. The streaming classes are built on
-them by buffering the input and running the engine once, at `finish`, which
-gives byte-identical output because deflate is deterministic here:
-`d.deflate("hello") + d.finish == Zlib.deflate("hello")`.
-
-What that model cannot express is a change part way through a stream, so
-`Deflate#params`, `Deflate#set_dictionary`, `Inflate#set_dictionary` and
-`Inflate#add_dictionary` raise `NotImplementedError` naming the reason rather
-than accepting the call and ignoring it. `Inflate#sync` answers false and
-`#sync_point?` answers false, which is true of a stream that is never partial.
-
-⚠ `Zlib::Deflate` and `Zlib::Inflate` already existed as bare classes whose
-class methods are answered by the dispatcher, so their `superclass` is `Object`
-where ruby says `Zlib::ZStream`. Reopening either with `< ZStream` is a
-superclass mismatch; the shared surface is a module mixed into all three
-instead. Nothing in ruby/spec reads `Zlib::Deflate.superclass`, and every
-ZStream spec constructs a `Zlib::Deflate`.
+The old 30 KB/s figure predates the indexed mgz engine and is not a current
+measurement. `unittest/zlib_compression_check.py` measures large streams in
+both directions against an independent native decoder.
+`unittest/zlib_stream_check.py` compares protocols, one-byte input, malformed
+streams and repeated lifecycles with Ruby 4.0.9. Scratch vectors have explicit
+region owners: the former per-call default-arena growth is a regression gate.
+The reference's 96 Zlib tests produce 95 MATCH and one shared skip. The
+compressor is an independent implementation: compression choices can differ
+from libz for arbitrary inputs even when both streams represent identical
+bytes; the checked ruby/spec compression fixtures agree byte for byte.
 
 ## Two small refusals that are representation, not effort
 

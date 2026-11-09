@@ -58,6 +58,7 @@ def main():
         'repeat-1m': b'x' * 1048576,
         # More than 150,000 largely literal tokens exercises multiple blocks.
         'random-200k': bytes(rng.randrange(256) for _ in range(200000)),
+        'random-2m': bytes(rng.randrange(256) for _ in range(2 * 1024 * 1024)),
     }
     with tempfile.TemporaryDirectory(prefix='mr-zlib-') as directory:
         root = Path(directory)
