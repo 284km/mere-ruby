@@ -209,7 +209,7 @@ class BasicSocket < IO
     [data, (remote_address rescue nil), 0]
   end
   private :__recvmsg_plain
-  # sendmsg(2) (Mere's sock_sendmsg) with control messages: each a
+  # sendmsg(2) (Mere's sock_sendmsg_to) with control messages: each a
   # Socket::AncillaryData or [level, type, data], to the destination given or
   # the connected peer; without control data it is send(2) / sendto(2).
   def sendmsg(mesg, flags = 0, dest = nil, *controls)
