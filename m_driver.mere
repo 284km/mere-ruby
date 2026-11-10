@@ -768,6 +768,9 @@ let core_prelude_c =
   "  def self.shareable?(o); __shr_p(o, Hash.new.compare_by_identity); end\n" ++
   "  def self.__shr_p(o, seen)\n" ++
   "    return true if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module)\n" ++
+  // These classes represent mutable parser/emitter sessions, matching Psych's
+  // native typed-data contract even when their public object is frozen.
+  "    return false if defined?(Psych::Parser) && (o.is_a?(Psych::Parser) || o.is_a?(Psych::Emitter))\n" ++
   "    return true if seen.key?(o)\n" ++
   "    return false unless o.frozen?\n" ++
   "    seen[o] = true\n" ++
@@ -786,6 +789,7 @@ let core_prelude_c =
   "  end\n" ++
   "  def self.__shr_make(o, seen)\n" ++
   "    return if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module)\n" ++
+  "    raise Ractor::Error, \"cannot make Psych backend session shareable\" if defined?(Psych::Parser) && (o.is_a?(Psych::Parser) || o.is_a?(Psych::Emitter))\n" ++
   "    return if seen.key?(o)\n" ++
   "    seen[o] = true\n" ++
   "    if o.is_a?(Proc) then o.freeze; return; end\n" ++
@@ -2652,32 +2656,44 @@ let core_prelude_d =
   // but through memory.
   "  class WeakKeyMap\n" ++
   // ...and the stored key is the OBJECT given, not the copy a Hash makes of an
-  // unfrozen String key, so the originals are kept beside the table.
-  "    def initialize; @h = Hash.new; @ks = []; end\n" ++
-  "    def [](k); @h[k]; end\n" ++
+  // unfrozen String key, so each entry is the pair [key as given, value].
+  // (It was a second array of the keys, searched by #eql? on #getkey and
+  //  #delete; with the checks below, eight calls per store -- Bug #20691's
+  //  million stores took 18 s against assert_normal_exit's 10.)
+  "    def initialize; @h = Hash.new; end\n" ++
+  "    def [](k); e = @h[k]; e ? e[1] : nil; end\n" ++
   "    def key?(k); @h.key?(k); end\n" ++
   // an immediate cannot be collected, so it cannot be a weak key; and the key
   // is hashed, so one without #hash (a BasicObject) is refused by that call
   "    def []=(k, v)\n" ++
-  "      if ::NilClass === k || ::TrueClass === k || ::FalseClass === k || ::Integer === k || ::Float === k || ::Symbol === k\n" ++
+  "      case k\n" ++
+  "      when nil, true, false, ::Integer, ::Float, ::Symbol\n" ++
   "        raise ArgumentError, 'WeakKeyMap keys must be garbage collectable'\n" ++
   "      end\n" ++
+  // (a later store under an equal key keeps the LATER key, as ruby's
+  //  wkmap_aset does -- the first one was kept here)
   "      k.hash\n" ++
-  "      @ks << k unless @h.key?(k)\n" ++
-  "      @h[k] = v\n" ++
+  "      @h[k] = [k, v]\n" ++
   "      v\n" ++
   "    end\n" ++
   "    def delete(k, &b)\n" ++
   "      return(b ? b.call(k) : nil) unless @h.key?(k)\n" ++
-  "      @ks.reject! \{ |x| x.eql?(k) }\n" ++
-  "      @h.delete(k)\n" ++
+  "      @h.delete(k)[1]\n" ++
   "    end\n" ++
-  "    def getkey(k)\n" ++
-  "      @ks.find \{ |x| x.eql?(k) }\n" ++
-  "    end\n" ++
-  "    def clear; @h.clear; @ks.clear; self; end\n" ++
+  "    def getkey(k); e = @h[k]; e ? e[0] : nil; end\n" ++
+  "    def clear; @h.clear; self; end\n" ++
   // the address is the object's own id, in ruby's 16-digit shape
   "    def inspect; '#<ObjectSpace::WeakKeyMap:0x' + object_id.to_s(16).rjust(16, '0') + ' size=' + @h.size.to_s + '>'; end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // Binding#irb is ruby's prelude.rb method: load irb (which redefines this
+  // very method) and call it again. Without the library -- no stdlib is
+  // shipped -- that is the LoadError for `irb`, the same as ruby's when the
+  // gem cannot be activated. (Its RubyGems fallback has no RubyGems here.)
+  "class Binding\n" ++
+  "  def irb(...)\n" ++
+  "    require 'irb'\n" ++
+  "    irb(...)\n" ++
   "  end\n" ++
   "end\n" ++
   "class Range\n" ++
@@ -7285,7 +7301,7 @@ let core_prelude_f =
   "    else\n" ++
   "      unless File.__fifo_has_reader(path)\n" ++
   "        e = Errno::ENXIO.new\n" ++
-  "        e.instance_variable_set(:@message, e.message + \" @ rb_sysopen - \" + path)\n" ++
+  "        e.instance_variable_set(:@__exception_message, e.message + \" @ rb_sysopen - \" + path)\n" ++
   "        raise e\n" ++
   "      end\n" ++
   "      fd = IO.__fdopen(path, \"w\", 0666)\n" ++
@@ -12026,7 +12042,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
            let _ = map_set bind_store (str_of_int bid) env in
            let _ = map_set tl_bid "v" bid in
            map_set consts "TOPLEVEL_BINDING" (VBind bid)) in
-  // Exception#initialize(msg = nil) sets @message, so a user exception's
+  // Exception#initialize(msg = nil) sets @__exception_message, so a user exception's
   // `super(msg)` records the message (read back by make_exc_w).
   // `require` and `require_relative` are ordinary Kernel methods whose bodies
   // call the loader, so a library can replace them (RubyGems does) and alias
@@ -12050,7 +12066,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
     (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require", Cons (EVar "path", Nil))), Nil))) in
   let _ = set_meth meths "(sng:Kernel)#require_relative"
     (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require_relative", Cons (EVar "path", Nil))), Nil))) in
-  let _ = set_meth meths "Exception#initialize" (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil), Cons (SIVarAssign ("message", EVar "msg"), Nil))) in
+  let _ = set_meth meths "Exception#initialize" (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil), Cons (SIVarAssign ("__exception_message", EVar "msg"), Nil))) in
   // An Errno class's message is the SYSTEM's text, and `.new` has to say the
   // same thing `raise` does: `Errno::EINVAL.new.message` is "Invalid argument",
   // not the class name, and with an argument it reads "<text> - <arg>". raise
@@ -12071,13 +12087,13 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
     (Meth (Cons ("msg", Cons ("extra", Cons ("loc", Nil))),
            Cons (("msg", ECall ("__sce_no_arg", Cons (ESelf, Nil))), Cons (("extra", ENil), Cons (("loc", ENil), Nil))),
            Cons (SIVarAssign ("__errno", EVar "extra"),
-             Cons (SIVarAssign ("message", ECall ("__errno_message", Cons (ESelf, Cons (EVar "msg", Cons (EVar "extra", Cons (EVar "loc", Nil)))))), Nil)))) in
+             Cons (SIVarAssign ("__exception_message", ECall ("__errno_message", Cons (ESelf, Cons (EVar "msg", Cons (EVar "extra", Cons (EVar "loc", Nil)))))), Nil)))) in
   // #errno: the number it was given, or the platform's number for its class.
   let _ = set_meth meths "SystemCallError#errno"
     (Meth (Nil, Nil, Cons (SExpr (ECall ("__errno_number", Cons (ESelf, Cons (EIVar "__errno", Nil)))), Nil))) in
   // NameError#initialize(msg = nil, name = nil): also records the offending
   // name (NoMethodError inherits this). #name reads it back.
-  let _ = set_meth meths "NameError#initialize" (Meth (Cons ("msg", Cons ("name", Nil)), Cons (("msg", ENil), Cons (("name", ENil), Nil)), Cons (SIVarAssign ("message", EVar "msg"), Cons (SIVarAssign ("__name", EVar "name"), Nil)))) in
+  let _ = set_meth meths "NameError#initialize" (Meth (Cons ("msg", Cons ("name", Nil)), Cons (("msg", ENil), Cons (("name", ENil), Nil)), Cons (SIVarAssign ("__exception_message", EVar "msg"), Cons (SIVarAssign ("__name", EVar "name"), Nil)))) in
   let _ = set_meth meths "NameError#name" (Meth (Nil, Nil, Cons (SExpr (EIVar "__name"), Nil))) in
   let _ = set_meth meths "StopIteration#result" (Meth (Nil, Nil, Cons (SExpr (EIVar "result"), Nil))) in
   // The exception classes whose constructor takes MORE than a message. Ruby
@@ -12095,7 +12111,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
            // the default is a SENTINEL, not nil: `nil.foo` really has nil as
            // its receiver, and #receiver must tell that from never being told.
            Cons (("msg", ENil), Cons (("name", ENil), Cons (("receiver:", ESym "__no_receiver__"), Nil))),
-           Cons (SIVarAssign ("message", EVar "msg"),
+           Cons (SIVarAssign ("__exception_message", EVar "msg"),
              Cons (SIVarAssign ("__name", EVar "name"),
                Cons (SIVarAssign ("__recv", EVar "receiver"), Nil))))) in
   // #receiver RAISES when nothing set one: ruby's "no receiver is available",
@@ -12108,7 +12124,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = set_meth meths "NoMethodError#initialize"
     (Meth (Cons ("msg", Cons ("name", Cons ("args", Cons ("priv", Cons ("receiver:", Nil))))),
            Cons (("msg", ENil), Cons (("name", ENil), Cons (("args", ENil), Cons (("priv", EBool false), Cons (("receiver:", ESym "__no_receiver__"), Nil))))),
-           Cons (SIVarAssign ("message", EVar "msg"),
+           Cons (SIVarAssign ("__exception_message", EVar "msg"),
              Cons (SIVarAssign ("__name", EVar "name"),
                Cons (SIVarAssign ("__args", EVar "args"),
                  Cons (SIVarAssign ("__priv", EVar "priv"),
@@ -12130,7 +12146,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
                              Cons (SExpr (ERaise (Cons (EConst "ArgumentError",
                                      Cons (EStrL "wrong number of arguments (given 2, expected 1)", Nil)))), Nil)), Nil), Nil),
            Cons (SIVarAssign ("__sigpair", ECall ("__signal_pair", Cons (EVar "sig", Nil))),
-             Cons (SIVarAssign ("message",
+             Cons (SIVarAssign ("__exception_message",
                      EBin ("||", EVar "msg", EMethod (EIVar "__sigpair", "[]", Cons (EInt 1, Nil)))), Nil))))) in
   // Interrupt is SIGINT with a message of its own: `Interrupt.new` is signo 2
   // and message "Interrupt", and `Interrupt.new("m")` is just "m". Inheriting
@@ -12141,7 +12157,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = set_meth meths "Interrupt#initialize"
     (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil),
            Cons (SIVarAssign ("__sigpair", ECall ("__signal_pair", Cons (ESym "INT", Nil))),
-             Cons (SIVarAssign ("message",
+             Cons (SIVarAssign ("__exception_message",
                      EBin ("||", EVar "msg", EStrL "Interrupt")), Nil)))) in
   let _ = set_meth meths "SignalException#signo"
     (Meth (Nil, Nil, Cons (SExpr (EMethod (EIVar "__sigpair", "[]", Cons (EInt 0, Nil))), Nil))) in
@@ -12151,7 +12167,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   // answers "Interrupt". Reading the pair answered the signal's own name for
   // every one of them.
   let _ = set_meth meths "SignalException#signm"
-    (Meth (Nil, Nil, Cons (SExpr (EIVar "message"), Nil))) in
+    (Meth (Nil, Nil, Cons (SExpr (EIVar "__exception_message"), Nil))) in
   // LocalJumpError#reason: :noreason unless the raiser said which jump it was.
   let _ = set_meth meths "LocalJumpError#reason"
     (Meth (Nil, Nil, Cons (SExpr (EBin ("||", EIVar "__reason", ESym "noreason")), Nil))) in
@@ -12163,7 +12179,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = set_meth meths "KeyError#initialize"
     (Meth (Cons ("msg", Cons ("receiver:", Cons ("key:", Nil))),
            Cons (("msg", ENil), Cons (("receiver:", ESym "__no_receiver__"), Cons (("key:", ESym "__no_key__"), Nil))),
-           Cons (SIVarAssign ("message", EVar "msg"),
+           Cons (SIVarAssign ("__exception_message", EVar "msg"),
              Cons (SIVarAssign ("__recv", EVar "receiver"),
                Cons (SIVarAssign ("__key", EVar "key"), Nil))))) in
   // (and, as FrozenError's, refuse to answer what was never given: ruby's
@@ -12181,7 +12197,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = set_meth meths "NoMatchingPatternKeyError#initialize"
     (Meth (Cons ("msg", Cons ("matchee:", Cons ("key:", Nil))),
            Cons (("msg", ENil), Cons (("matchee:", ENil), Cons (("key:", ENil), Nil))),
-           Cons (SIVarAssign ("message", EVar "msg"),
+           Cons (SIVarAssign ("__exception_message", EVar "msg"),
              Cons (SIVarAssign ("__matchee", EVar "matchee"),
                Cons (SIVarAssign ("__key", EVar "key"), Nil))))) in
   let _ = set_meth meths "NoMatchingPatternKeyError#matchee" (Meth (Nil, Nil, Cons (SExpr (EIVar "__matchee"), Nil))) in
@@ -12191,7 +12207,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = set_meth meths "FrozenError#initialize"
     (Meth (Cons ("msg", Cons ("receiver:", Nil)),
            Cons (("msg", ENil), Cons (("receiver:", ESym "__no_receiver__"), Nil)),
-           Cons (SIVarAssign ("message", EVar "msg"),
+           Cons (SIVarAssign ("__exception_message", EVar "msg"),
              Cons (SIVarAssign ("__recv", EVar "receiver"), Nil)))) in
   let _ = set_meth meths "FrozenError#receiver"
     (Meth (Nil, Nil, Cons (SIf (Cons ((EBin ("==", EIVar "__recv", ESym "__no_receiver__"),
@@ -12212,7 +12228,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
                    ETern (EMethod (EVar "status", "is_a?", Cons (EConst "String", Nil)), EInt 0,
                      ETern (EBin ("==", EVar "status", EBool true), EInt 0,
                        ETern (EBin ("==", EVar "status", EBool false), EInt 1, EVar "status")))),
-             Cons (SIVarAssign ("message",
+             Cons (SIVarAssign ("__exception_message",
                      ETern (EMethod (EVar "status", "is_a?", Cons (EConst "String", Nil)),
                             EVar "status", EVar "msg")), Nil)))) in
   let _ = set_meth meths "SystemExit#status" (Meth (Nil, Nil, Cons (SExpr (EIVar "__status"), Nil))) in
@@ -12785,9 +12801,7 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   // for a day they were invisible because the GC log was armed after them.
   let _ = (if str_eq (env_get "MERE_RUBY_INTERN_LOG") "" then () else map_set intern_log "on" 1) in
   let _ = map_set gc_state "log" (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then 0 else 1) in
-  // (the script's directory as it is NOW, absolute: __dir__ and
-  //  require_relative answer from it, and a relative one read against the
-  //  cwd a later Dir.chdir moved to named a directory that is not there)
+  // Resolve the script directory before Ruby code can change the cwd.
   let d0 = dirname_of name in
   let _ = map_set load_ctx "dir" (mkstr (if str_len d0 > 0 && str_eq (char_at d0 0) "/" then d0
                                          else if str_eq name "-e" || str_eq name "-" then d0
@@ -12796,8 +12810,6 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   // (the directory the script was started in, after -C: what a Location's
   //  #absolute_path joins a relative path to, as ruby resolves it at load)
   let _ = map_set load_ctx "cwd0" (mkstr (proc_cwd ())) in
-  // (...and which name is the main script's, whose relative path is read
-  //  against it: rel_file_base)
   let _ = map_set load_ctx "script0" (mkstr name) in
   let _ = map_set loaded_files name VNil in
   let cod0 = src_coding src in

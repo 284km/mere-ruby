@@ -2996,3 +2996,95 @@ the witness (and 557 for the last two points below).
   under that key, so the local replaced self (test_literal's
   hash_value_omission); core/time/new's timezone protocol;
   locale_charmap from LC_ALL; numeric/step_spec is over the CPU budget.
+
+## 2026-11-10 (26): the small core items and the libraries -- object keys in the hash index, the timezone protocol's #local_to_utc, Numeric#step's edges, Array#== under the cycle guard, a clone's define_method closures, `x&.m(&pr)`, Kernel.load from a class with its own #load
+
+Rounds 8 and 9 of note 537, verified in one cycle. corpus/559 is the
+witness.
+
+- **A plain object key is its identity in the hash index.** hkey_digest
+  answered "" for every object, so a hash keyed by objects was never
+  indexed and every store scanned: 20,000 inserts took 48 s (0.08 s now;
+  ruby 0.004). An object with a #hash of its own (or a Time, a MatchData)
+  still answers "" and goes the protocol way -- main.mere answers through
+  a forward hook (hkey_obj_ident_fwd), where the method tables are.
+- **Time.new with a zone object**: a Time that #local_to_utc answers is its
+  INSTANT (ruby's extract_time), not the wall clock #utc_to_local's answer
+  is read as -- `+09:00` came back as offset 0; an offset of a day or more
+  is "utc_offset out of range"; a zone with no #local_to_utc is read as an
+  offset and refused (TypeError) where it fell back to #utc_to_local; and a
+  `{}` in the zone's place is a zone, not keywords (only a keyword hash is
+  stripped).
+- **Numeric#step**: `1.0.step` walks without end; from an infinity toward
+  the same infinity it yields nothing (ruby's count is NaN), and from an
+  infinite begin toward a finite end it yields the begin until the block
+  breaks; `42.step(Float::INFINITY, 1)` stays an Integer walk (num_step's
+  `inf`); a step that is no number makes a plain Enumerator, not an
+  ArithmeticSequence; `1.step(5, 1, to: 5)` is "to is given twice"; a
+  Float receiver's `by: "1"` is compared with 0. core/numeric/step was SLOW
+  (`Float::INFINITY.step(Float::INFINITY, 1)` never ended) and MATCHes.
+- **Array#== under the cycle guard** with an element that answers #==
+  itself: two arrays that each hold themselves recursed forever
+  (core/array/equal_value was SLOW). cmp_cycle_guard is rb_eq's eq_seen.
+- **#clone keeps what a singleton method was written in**: the copy took
+  the method bodies and none of the side tables keyed by them (copy_meth_src
+  -- a define_method body's closure, its block, its source), so every
+  OpenStruct accessor on a frozen clone read `name` as a method call and
+  answered nil (library/openstruct/frozen).
+- **`x&.m(&pr)` passes pr** -- the block-pass marker ran as a literal
+  block, so the block never ran. resolv's Hosts#each_address is exactly
+  that (`@name2addr[name]&.each(&proc)`), and every /etc/hosts lookup was
+  empty (resolv's 4 files).
+- **`Kernel.load(f)` inside a class that defines #load** called itself
+  forever: the module function was answered as a bare call in the caller's
+  frame, where self's own method comes first. With such a method the call
+  runs with Kernel as self in a child frame (both the `Kernel.x` shortcut
+  and the by-name door). irb's IRB::Locale#load is this; Binding#irb is
+  ruby's prelude method now, and irb gets as far as Reline, which needs
+  IO#winsize -- the runtime round.
+- A CLASS receiver's protected singleton method is not respond_to?
+  (weakref delegated to it). Hash#merge keeps the receiver's subclass;
+  update / merge! / replace refuse a frozen receiver before #to_hash.
+  String#=== asks an object with #to_str; String#to_str of a subclass is a
+  String; an invalid Emacs-Mule byte encodes as "?". A program's own class
+  method of a core class (Time.now, Process.pid, Math.sqrt, ...) is asked
+  before the builtin (round 4's File/IO/FileTest rule, for every core class
+  with a singleton: name_set "core_sng_cls"). Encoding.locale_charmap
+  reads LC_ALL, LC_CTYPE, LANG. A C extension that IS there fails as ruby's
+  dlopen does -- a LoadError with no #path -- not as a missing file.
+- Libraries: cgi's escapeURIComponent(nil) is TypeError; logger is ruby's
+  own (the logger gem 1.7.0, lib/logger_ext.rb) in place of a smaller one
+  of ours (psych's `!ruby/exception` came with #72's vendored psych, which
+  replaced the edit made here); WeakKeyMap keeps [key, value]
+  pairs (and the LATER of two equal keys, as ruby does).
+- Cost: is_kernel_builtin built a 70-name list and walked it with str_eq on
+  every call, and is_a? walked the ancestors each time; a table and a memo
+  on the class generation. Object.new 3.7 → 3.3 us (ruby 75 ns), and
+  WeakKeyMap's Bug #20691 test 18.9 → 14.5 s, still over its 10 s: the rest
+  is per-call dispatch, a performance arc of its own.
+- **The shim**: mspec's `eql` matcher was missing -- 112 spec files use it,
+  and those examples died on BOTH sides, measuring nothing. Measured, they
+  found three: Rational#to_i floored (`Rational(-7, 4).to_i` was -2);
+  Float#divmod floored a quotient flodivmod ROUNDS (`(x - fmod) / y` lands
+  a hair under the whole number, `0.59.divmod(7.761021455128987e-11)` was
+  one short); Numeric#eql? on a program's own Numeric was identity, where
+  ruby asks #==. Also in the shim: a mock whose
+  #method_missing is mocked answers respond_to? for that name (mspec's
+  keeps Object's, and rb_check_funcall forwards); a stub keeps the
+  singleton's own method and puts it back. ⚠ The MockObject #to_s /
+  #inspect change (23) describes was LOST from 8fc6b70: a `git checkout` of
+  the shim, used to undo a trace, took it back out. It is in now.
+- **Left**: `Time.dup` and IO#reopen's new singleton class (round 11);
+  Enumerator.new's block local and $LOADED_FEATURES' matching of relative,
+  non-canonical and C-extension names (require_spec, 24 -- round 10);
+  RubyGems (`-rrubygems`, Gem.bin_path) and open-uri, whose uri is not
+  shipped -- no stdlib is; irb (IO#winsize) and test_blocking_backtrace
+  (File.readlines' 3 ms) are the runtime round.
+- **Checked**: spec DIFF 65 → **53** (SLOW 2 → 0, CRASH 2; 65 is the
+  record after #72's psych), the stdlib record's DIFF 32 → **26** (CRASH 6).
+  corpus 574/574 both ways after the rebase onto #72, 559 and #72's 550
+  under GC_STRESS=50, the 13 gates; 247 unittest files against round 5's
+  binary, MATCH 9755 → 9754 -- the one is test_kwarg_eval_memory_leak, an
+  RSS ratio round 5's binary fails as well when run again; the numeric,
+  hash, time, array and range files again with the final binary,
+  unchanged; psych's 635 (#72) 635.

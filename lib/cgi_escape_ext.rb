@@ -62,6 +62,11 @@ module CGI::Escape
   #   url_encoded_string = CGI.escapeURIComponent("'Stop!' said Fred")
   #      # => "%27Stop%21%27%20said%20Fred"
   def escapeURIComponent(string)
+    # (the C extension takes a String, or what converts to one: StringValue)
+    unless string.is_a?(String)
+      raise TypeError, "no implicit conversion of #{string.nil? ? 'nil' : string.class} into String" unless string.respond_to?(:to_str)
+      string = string.to_str
+    end
     encoding = string.encoding
     buffer = string.b
     buffer.gsub!(/([^a-zA-Z0-9_.\-~]+)/) do |m|

@@ -117,6 +117,20 @@ extern fn prism_ok: bytes -> bytes -> int;
 extern fn prism_more: bytes -> bytes -> int;
 extern fn prism_query: int -> bytes -> str -> int;
 extern fn prism_version: unit -> str;
+// The provider returns borrowed bytes, copied before Ruby runs again.
+extern fn mr_ossl_available: unit -> int;
+extern fn mr_ossl_call: str -> bytes -> bytes;
+extern fn mr_ossl_valid: int -> int;
+extern fn mr_ossl_release: int -> int;
+extern fn mr_ossl_clear_result: unit -> int;
+// Native resource owners are weak object IDs, not Ruby roots. The GC releases
+// these directly, just as it releases a File's unreachable descriptor.
+let openssl_owned = map_new ();
+// Owner offsets, not raw Ruby handles: the conservative C-stack walk must
+// not mistake metadata reached through a temporary map pointer for roots.
+let openssl_owner = map_new ();
+let _ = map_compact openssl_owned;
+let _ = map_compact openssl_owner;
 // libc's getpid: Process.pid has to be the real one -- a made-up number would
 // be a stable lie, and sidekiq builds its identity string from it.
 // libm, for the Math functions Mere has no builtin for. DERIVING them from
@@ -1060,6 +1074,9 @@ let _ = map_compact hash_indexed;  // (its own arena: a write per hash / string 
 // for it. A forward declaration is exactly the tool for that; it is the one
 // the compiler grew today (v0.1.483) for cases like this.
 let fn hderef_fwd: int -> Val list;
+// ...and whether an object key is compared by identity alone (no #hash of its
+// own, not a Time or MatchData): main.mere answers, where the method tables are.
+let fn hkey_obj_ident_fwd: Val -> bool;
 // the containers whose digest is being taken right now: one met again inside
 // itself (`h = {}; h[:x] = [h]`) makes the key undigestible, and the walk
 // answers instead -- it used to recurse until the native stack ran out, which
@@ -1098,6 +1115,11 @@ let rec hkey_digest = fn (k: Val) ->
   // front: no separator can be confused with content.
   | VArr id -> hkey_cont ("A" ++ str_of_int id) "A" (deref id)
   | VHsh id -> hkey_cont ("H" ++ str_of_int id) "H" (hderef_fwd id)
+  // ⚠ A PLAIN OBJECT KEY IS ITS IDENTITY. It answered "" and every hash keyed
+  // by objects was scanned: 20,000 inserts took 48 s (WeakKeyMap's Bug #20691
+  // test timed out). One with a #hash of its own still answers "" -- its code
+  // is the program's, and only the protocol path asks it.
+  | VObj id -> (if hkey_obj_ident_fwd k then "o" ++ str_of_int id else "")
   | _ -> ""
 and hkey_cont = fn (b: str) -> fn (tag: str) -> fn (xs: Val list) ->
   if map_has hkey_busy b then ""
@@ -2102,6 +2124,11 @@ let _ = vec_push int_fast_st 0;
 // mro_mods_gen below, and the same MERE_RUBY_NO_MRO_CACHE switch turns it off
 // -- which is also how it is tested: the corpus and the spec sweep have to
 // give the same answers with the memo off as with it on.
+// ...and is_a? by (class, target), the same generation: `Object.new` asked it
+// about a dozen times, each a walk of the ancestor list with a str_eq per name
+// (16% of a profile of that loop). The value is generation * 2 + the answer.
+let isa_memo = map_new ();
+let _ = map_compact isa_memo;  // (its own arena: gc_churn_bytes, note 270)
 let hm_memo = map_new ();
 let _ = map_compact hm_memo;  // (its own arena: gc_churn_bytes, note 270)
 let hm_memo_gen = map_new ();
@@ -2412,6 +2439,11 @@ let name_sets = map_new ();
 let name_spec = fn (tag: str) ->
   if str_eq tag "builtin_cls_name" then ("String|Array|Hash|Integer|Float|Numeric|Complex|Rational|Range|"
     ++ "Symbol|TrueClass|FalseClass|NilClass|Kernel|Comparable"
+    )
+  // the core classes and modules whose CLASS methods are the dispatcher's
+  // builtins, which a program's own definition of the name comes before
+  else if str_eq tag "core_sng_cls" then ("File|IO|FileTest|Dir|Time|Process|Math|Marshal|GC|ObjectSpace|"
+    ++ "Signal|Random|Regexp|Thread|Fiber|Encoding|Struct|Proc|Warning|Etc"
     )
   else if str_eq tag "enc_preserving" then ("upcase|downcase|capitalize|swapcase|reverse|strip|lstrip|rstrip|"
     ++ "chomp|chop|chr|squeeze|delete|succ|next|*|gsub|sub|"
@@ -3644,6 +3676,9 @@ let warn_note = fn (s: str) ->
 // is taken as equal, so the walk terminates and `[1,[...]] == [2,[...]]` is
 // still false because the 1 and the 2 differ before the cycle closes.
 let eq_seen = map_new ();
+// the Kernel module functions being answered with Kernel as self (`Kernel.load`
+// from a class that has #load of its own): see invoke_val_c0's Kernel arm
+let kmf_busy = map_new ();
 let insp_seen = map_new ();
 // ObjectSpace::WeakMap's entries, by insertion number. weak_k and weak_v are
 // NOT GC roots: a collection drops an entry once its map, its key or its value
