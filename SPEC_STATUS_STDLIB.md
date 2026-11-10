@@ -62,7 +62,7 @@ them, is what ships; the two are not added together.
 | library/ipaddr | 6 | 0 | 0 | 0 | 0 | 6 |
 | library/prime/integer | 4 | 0 | 0 | 0 | 0 | 4 |
 | library/uri/ldap | 0 | 0 | 0 | 12 | 0 | 12 |
-| library/socket/basicsocket | 22 | 1 | 0 | 1 | 0 | 24 |
+| library/socket/basicsocket | 23 | 0 | 0 | 1 | 0 | 24 |
 | library/uri | 14 | 0 | 0 | 5 | 0 | 19 |
 | library/timeout | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/find | 2 | 0 | 0 | 0 | 0 | 2 |

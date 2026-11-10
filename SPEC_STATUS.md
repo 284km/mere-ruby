@@ -85,7 +85,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/fiber | 11 | 0 | 0 | 0 | 0 | 11 |
 | core/dir | 32 | 0 | 0 | 1 | 0 | 33 |
 | core/file | 67 | 0 | 0 | 1 | 0 | 68 |
-| core/time | 63 | 1 | 0 | 2 | 0 | 66 |
+| core/time | 64 | 0 | 0 | 2 | 0 | 66 |
 | core/io | 78 | 1 | 0 | 1 | 0 | 80 |
 | library/date | 56 | 0 | 0 | 42 | 0 | 98 |
 | library/etc | 15 | 0 | 0 | 4 | 0 | 19 |
@@ -115,7 +115,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/file/stat | 39 | 0 | 0 | 4 | 0 | 43 |
 | core/gc/profiler | 5 | 0 | 0 | 2 | 0 | 7 |
 | core/io/buffer | 14 | 0 | 0 | 0 | 0 | 14 |
-| core/marshal | 3 | 3 | 0 | 0 | 0 | 6 |
+| core/marshal | 6 | 0 | 0 | 0 | 0 | 6 |
 | core/objectspace/weakkeymap | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/objectspace/weakmap | 15 | 0 | 0 | 0 | 0 | 15 |
 | core/process | 38 | 0 | 0 | 2 | 0 | 40 |
@@ -161,7 +161,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | library/openssl | 3 | 0 | 0 | 0 | 0 | 3 |
 | library/openssl/digest | 8 | 0 | 0 | 0 | 0 | 8 |
 | library/openssl/hmac | 2 | 0 | 0 | 0 | 0 | 2 |
-| library/openssl/kdf | 0 | 2 | 0 | 0 | 0 | 2 |
+| library/openssl/kdf | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/openssl/random | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/openssl/x509/name | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/openssl/x509/store | 1 | 0 | 0 | 0 | 0 | 1 |
