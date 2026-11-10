@@ -13797,7 +13797,17 @@ and builtin_arity_msg_b = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
 // arity refusal below and the arms ahead of dispatch_prim (Hash#fetch's
 // KeyError, Array#first's ArgumentError) are the builtin's own refusals, and
 // ruby puts the builtin's frame on top of them.
+and native_module_allocation = fn world ->
+  mro_cache_on () && map_len flow_sig == 0 && map_len trace_fn == 0
+  && (if map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
+         || map_has undef_names "new" || map_has blt_alias_names "new" then false else true)
+  && (if core_new_overridden world "Module" || meth_private world "(sng:Module)" "new" then false else true)
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
+  // Plain Module.new reaches this door, while an explicit &nil reaches the
+  // with-block door. Both use the same proof for an unobserved allocation.
+  if str_eq name0 "new" && (match recv0 with VClass c -> str_eq c "Module" | _ -> false)
+     && (match args0 with Nil -> true | _ -> false) && native_module_allocation world
+  then make_anon_cls world "Module" Nil else
   let (pn, pr, pd) = bi_reg_get () in
   let _ = bi_reg_set name0 recv0 (caller_depth ()) in
   // (main's private helpers, called with a receiver other than a literal
@@ -17445,6 +17455,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   else
   match recv with
   | VClass c ->
+    // User mixin methods run before builtin validation or mutation. A saved
+    // builtin alias consumes bi_skip here and retains the native protocol.
+    let mixin_own = (str_eq name "include" || str_eq name "prepend")
+                    && cls_meth_own world c name && bi_skip_pass name in
     // (an ivar written on the singleton class of a frozen class names the
     //  singleton, "can't modify frozen Class: #<Class:A>": rb_check_frozen
     //  on it, not rb_class_modify_check on the class it stands for)
@@ -17460,7 +17474,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // (...and a singleton class whose object is frozen, which cls_frozen
     //  does not record. A constant or class variable write asks the class
     //  itself, rb_check_frozen: "can't modify frozen Class: #<Class:#<...>>")
-    let _ = (if (map_len cls_frozen > 0 || is_sng_cls c) && cls_frozen_refuses name args
+    let _ = (if (map_len cls_frozen > 0 || is_sng_cls c) && (if mixin_own then false else cls_frozen_refuses name args)
              then (if frz_const_name name then frz_const_check world c else frz_cls_check world c) else ()) in
     // ⚠ A PROGRAM'S OWN class method of a CORE class comes before the
     //   builtin of that name: `class << File; def dirname`, a module
@@ -17509,11 +17523,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // include / prepend of something that is not a module: a CLASS is refused
     // by name, and an instance of a Module subclass is its module half
     else if ((str_len name == 7 && str_eq name "include") || (str_len name == 7 && str_eq name "prepend"))
-            && (if cls_meth_own world c name then false else true)
+            && (if mixin_own then false else true)
             && (match args with Nil -> true | _ -> false) then
       raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1+)"
     else if ((str_len name == 7 && str_eq name "include") || (str_len name == 7 && str_eq name "prepend"))
-            && (if cls_meth_own world c name then false else true)
+            && (if mixin_own then false else true)
             && list_any_val args (fn (a9: Val) ->
                  (match a9 with
                   | VClass ac9 -> (if map_has modules ac9 then false else true)
@@ -20455,10 +20469,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // own ancestor chain); a Proc/lambda installs its body as the method.
     // `include <module value>` — the runtime form, for when the module is the
     // result of an expression rather than a constant path.
-    else if (str_len name == 7 && str_eq name "include") && (match args with Cons (VClass _, _) -> true | _ -> false) then
+    else if (str_len name == 7 && str_eq name "include") && (if mixin_own then false else true)
+            && (match args with Cons (VClass _, _) -> true | _ -> false) then
       (let _ = incl_each world c args in recv)
     // Module#prepend(M): like include, but M goes in FRONT of the class.
-    else if (str_len name == 7 && str_eq name "prepend") && (match args with Cons (VClass _, _) -> true | _ -> false) then
+    else if (str_len name == 7 && str_eq name "prepend") && (if mixin_own then false else true)
+            && (match args with Cons (VClass _, _) -> true | _ -> false) then
       (let _ = prep_each world c args in recv)
     // ⚠ THE MIXIN HOOKS' OWN DEFAULTS, which were missing entirely: a module
     //   could be included but could not say how. `include` is documented as
@@ -30252,10 +30268,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
   else if str_eq name "new" && (match recv with VClass c -> str_eq c "Module" | _ -> false)
           && (match args with Nil -> true | _ -> false)
           && (match newblk with (false, _, _, _) -> true | _ -> false)
-          && mro_cache_on () && map_len flow_sig == 0 && map_len trace_fn == 0
-          && (if map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
-                 || map_has undef_names "new" || map_has blt_alias_names "new" then false else true)
-          && (if core_new_overridden world "Module" || meth_private world "(sng:Module)" "new" then false else true)
+          && native_module_allocation world
   then make_anon_cls world "Module" Nil
   else if bi_frameless world recv name || gen_routed world recv name args newblk
   then invoke_with_block0 env world blk recv name args newblk
@@ -44462,6 +44475,34 @@ and pristine_include_defaults = fn world -> fn (mq: str) ->
         let _ = vec_set include_defaults_cache 1 (if defaults then 1 else 0) in
         let _ = vec_set include_defaults_cache 0 (mro_now ()) in
         defaults
+// Only an untouched Object subclass and an unobserved anonymous leaf can
+// take this path. There is no cyclic edge or prior insertion to reconcile;
+// preserve the same keep row and mutation bookkeeping as append_features_raw.
+// Overrides anywhere in the permanent metaclass chain, hooks, aliases, undef,
+// freezing, refinements and tracing retain the ordinary protocol.
+and unobserved_first_include = fn world -> fn (base: str) -> fn (mq: str) ->
+  if (if mro_cache_on () then false else true) || ref_on ()
+     || map_len flow_sig > 0 || map_len trace_fn > 0 || map_len mro_lookup_root > 0
+     || map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
+     || map_has undef_names "include" || map_has blt_alias_names "include"
+     || (if map_has anonymous_classes base then map_get anonymous_classes base != 1 else true)
+     || map_has class_sng_exists base || map_has sng_shown base || map_has mro_external base
+     || map_has includes base || map_has prepends base || map_has cls_frozen base
+  then false
+  else let (_, sup, _, _) = world in
+    if (if map_has sup base then (if str_eq (map_get sup base) "Object" then false else true) else true)
+       || (if pristine_include_defaults world mq then false else true)
+       || map_has mro_external mq || map_has includes mq || map_has prepends mq || map_has sup mq
+    then false
+    else
+      let generation = mro_now () in
+      let defaults = (if vec_get include_defaults_cache 2 == generation then vec_get include_defaults_cache 3 == 1
+                      else let answer = (if has_meth world "(sng:Object)" "include" then false else true) in
+                           let _ = vec_set include_defaults_cache 3 (if answer then 1 else 0) in
+                           let _ = vec_set include_defaults_cache 2 (mro_now ()) in answer) in
+      defaults
+and add_first_native_include = fn (base: str) -> fn (mq: str) ->
+  let _ = map_set inc_keep base (mq ++ (if map_has inc_keep base then "|" ++ map_get inc_keep base else "")) in set_inc base mq
 and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   // (inside Marshal's dump and load a core class answers with its builtin:
   //  see core_only)
@@ -46222,6 +46263,15 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
     (match recv with
      | VClass m9 -> (match args with Cons (target, _) -> do_extend_one world m9 target | _ -> VNil)
      | _ -> VNil)
+  // Module's mixin entry points remain native ancestors of a Class/Module
+  // override. Re-enter with the existing one-call builtin bypass so arity,
+  // coercion and frozen checks stay shared with ordinary dispatch.
+  else if (str_eq meth "include" || str_eq meth "prepend")
+          && (match recv with VClass _ -> true | _ -> false) then
+    (let _ = map_set bi_skip "n" meth in
+     let answer = try_or_msg (fn (u: unit) -> invoke_val_c gc_cenv0 world superblk recv meth args false)
+                    (fn (message: str) -> (let _ = map_clear bi_skip in fail message)) in
+     let _ = map_clear bi_skip in answer)
   // `super` from an `append_features` / `prepend_features` override IS the
   // default include: adding the module to the base's ancestors is what
   // Module#append_features does, and ActiveSupport::Concern's override ends
@@ -47822,28 +47872,6 @@ and fnm_extglob = fn (args: Val list) ->
 // ⚠ A non-Class superclass is REFUSED. `Class.new(1)` used to answer a fresh
 //   class with the argument dropped, and silently discarding an argument is
 //   the permissive direction.
-and make_anon_cls_block = fn world -> fn (c: str) -> fn (args: Val list) -> fn newblk ->
-(match make_anon_cls world c args with
-          | VClass anon9 ->
-            (let (h3, ps3, bb3, e3) = newblk in
-             // a block is not a constant scope: classes/constants defined in
-             // it go to the block's LEXICAL scope (its captured cref;
-             // "" = toplevel).
-             let bcref = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s9 -> sget s9 | _ -> "") else "") in
-             // ...and `Class.new { |c| }` is handed the new class, which
-             // neither branch used to bind. Bound in a CHILD of the block's
-             // env, as module_eval does, so the outer scope keeps its own.
-             let e3b = (match ps3 with
-                        | Nil -> e3
-                        | Cons (p3, _) -> (let ch3 = lv_child e3 in let _ = brk_carry e3 ch3 in
-                                           let _ = lv_set ch3 p3 (VClass anon9) in ch3)) in
-             // ...and a `break` out of the body is the value of Class.new
-             // (test_array's `obj1, obj2 = Class.new { ...; break [new, new] }`)
-             (match register_class_blk world anon9 bb3 bcref e3b with
-              | FBreak bv9 -> bv9
-              | _ -> VClass anon9))
-          | other9 -> other9)
-
 and make_anon_cls = fn world -> fn (c: str) -> fn (args: Val list) ->
   let (meths2, sup2, ocls2, iv2) = world in
   if str_eq c "Module" then
@@ -47867,6 +47895,62 @@ and make_anon_cls = fn world -> fn (c: str) -> fn (args: Val list) ->
      let _ = call_inherited world gc_cenv0
                (match args with Cons (VClass sc, _) -> sc | _ -> "Object") anon in
      VClass anon)
+
+// A block consisting solely of source positions and one native inclusion
+// needs no writable class scope when neither inclusion nor its hooks can run
+// Ruby. Prove that before executing; all other bodies use register_class_blk.
+// This is the same first-inclusion operation used by the statement walker.
+and native_include_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn denv ->
+  let rec argument_name = fn (xs: Stmt list) -> fn (name: str) ->
+    match xs with
+    | Nil -> name
+    | Cons (SLine _, rest) -> argument_name rest name
+    | Cons (SLineQ _, rest) -> argument_name rest name
+    | Cons (SFile _, rest) -> argument_name rest name
+    | Cons (SInclude (m, false), rest) when str_eq name "" && (if str_eq m "self" then false else true) -> argument_name rest m
+    | _ -> "" in
+  let name = argument_name body "" in
+  if str_eq name "" then false
+  else let (found, owner) = lv_owner denv name in
+    if (if found then false else true) then false else
+    match map_get owner name with
+    | VClass mq when unobserved_first_include world cls mq ->
+      let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+      let _ = (if map_has pending_home "v" then map_delete pending_home "v" else ()) in
+      let rec positions = fn (xs: Stmt list) ->
+        match xs with
+        | Nil -> ()
+        | Cons (SLine n, rest) -> let _ = (if n < 0 then () else cur_line_set n) in positions rest
+        | Cons (SLineQ n, rest) -> let _ = (if n < 0 then () else cur_line_set n) in positions rest
+        | Cons (SFile file, rest) -> let _ = (if str_eq file (cur_file ()) then () else cur_file_set file) in positions rest
+        | Cons (_, rest) -> positions rest in
+      let _ = positions body in
+      let _ = add_first_native_include cls mq in true
+    | _ -> false
+and make_anon_cls_block = fn world -> fn (c: str) -> fn (args: Val list) -> fn newblk ->
+  (match make_anon_cls world c args with
+          | VClass anon9 ->
+            (let (h3, ps3, bb3, e3) = newblk in
+             if (match ps3 with Nil -> true | _ -> false) && native_include_body world anon9 bb3 e3 then VClass anon9
+             else
+             // a block is not a constant scope: classes/constants defined in
+             // it go to the block's LEXICAL scope (its captured cref;
+             // "" = toplevel).
+             let bcref = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s9 -> sget s9 | _ -> "") else "") in
+             // ...and `Class.new { |c| }` is handed the new class, which
+             // neither branch used to bind. Bound in a CHILD of the block's
+             // env, as module_eval does, so the outer scope keeps its own.
+             let e3b = (match ps3 with
+                        | Nil -> e3
+                        | Cons (p3, _) -> (let ch3 = lv_child e3 in let _ = brk_carry e3 ch3 in
+                                           let _ = lv_set ch3 p3 (VClass anon9) in ch3)) in
+             // ...and a `break` out of the body is the value of Class.new
+             // (test_array's `obj1, obj2 = Class.new { ...; break [new, new] }`)
+             (match register_class_blk world anon9 bb3 bcref e3b with
+              | FBreak bv9 -> bv9
+              | _ -> VClass anon9))
+          | other9 -> other9)
+
 
 // UNIVERSAL NEWLINE on read (text mode "rt", textmode: true, newline:
 // :universal): CRLF and a lone CR read as LF, in the code units of the
@@ -55020,6 +55104,17 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
   | Cons (SFile f, rest) ->
     let _ = (if str_eq f (cur_file ()) then () else cur_file_set f) in
     register_class_v world cls rest vis cenv
+  // This native statement cannot change visibility or call Ruby when both
+  // receiver and module pass the unobserved first-inclusion proof. Resolve
+  // the lexical local once and retain the checked statement for every miss.
+  | Cons (SInclude (name, false), rest) when (if str_eq name "self" then false else true) ->
+    let (found, owner) = lv_owner cenv name in
+    let done = (if found then (match map_get owner name with
+                  | VClass mq -> (if unobserved_first_include world cls mq
+                                  then (let _ = add_first_native_include cls mq in true) else false)
+                  | _ -> false) else false) in
+    if done then (match rest with Nil -> FNext (VClass cls) | _ -> register_class_v world cls rest vis cenv)
+    else register_class_statement world cls body vis cenv
   | _ -> register_class_statement world cls body vis cenv
 and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (vis: str) -> fn cenv ->
   let (meths, sup, ocls, ivars) = world in
@@ -55054,6 +55149,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
     // (...and an object's singleton class asks whether its OBJECT is frozen,
     //  which cls_frozen does not record: `o.freeze; class << o; def x; end`)
     let _ = (if (map_len cls_frozen > 0 || is_sng_cls cls) && cls_body_writes s
+                && (match s with SInclude (_, pre) -> (if cls_meth_own world cls (if pre then "prepend" else "include") then false else true) | _ -> true)
              then (match s with SAssign (_, _) -> frz_const_check world cls | _ -> frz_cls_check world cls) else ()) in
     // (a constant or class variable written in a `refine` body lands on the
     //  module around it, and ruby says so, Bug #10103)
@@ -55473,6 +55569,13 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
        | SAlias (n1, n2) -> let _ = do_class_alias world cls n1 n2 in FNext VNil
        // `include M` records the module for method lookup fallback.
        | SInclude (m, pre) ->
+         let method_name = (if pre then "prepend" else "include") in
+         if cls_meth_own world cls method_name then
+           (let argument = (if lv_has cenv m then lv_get cenv m else eval_e cenv world noblk (EConst m)) in
+            FNext (invoke_val_c cenv world noblk (VClass cls) method_name (Cons (argument, Nil)) false))
+         else
+         let (local_found, local_owner) = lv_owner cenv m in
+         let local_value = (if local_found then map_get local_owner m else VNil) in
          // resolve the module name in the enclosing lexical scope so a nested
          // `include ModA` records the qualified name (NS::ModA), matching where
          // its methods live.
@@ -55484,17 +55587,17 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
          // local up all along; this is the copy inside a class body.
          // (a local that holds something that is not a module at all is
          //  ruby's TypeError, "wrong argument type Object (expected Module)")
-         let notmod9 = (if lv_has cenv m
-                        then (match lv_get cenv m with
+         let notmod9 = (if local_found
+                        then (match local_value with
                               | VClass _ -> false
                               | VObj o9 -> (if str_list_has (ancestors_of world (dispatch_cls_of world (VObj o9))) "Module" then false else true)
                               | _ -> true)
                         else false) in
          if notmod9 then
-           (let _ = raise_exc world "TypeError" ("wrong argument type " ++ class_name (lv_get cenv m) ++ " (expected Module)") in FNext VNil)
+           (let _ = raise_exc world "TypeError" ("wrong argument type " ++ class_name (local_value) ++ " (expected Module)") in FNext VNil)
          else
-         let mq = (if lv_has cenv m
-                   then (match lv_get cenv m with
+         let mq = (if local_found
+                   then (match local_value with
                          | VClass mc9 -> mc9
                          // (an instance of a Module subclass: its module half)
                          | VObj o9 when mod_inst_is world (VObj o9) ->
@@ -55506,7 +55609,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
          // every namespace, so `module Outer; class << obj; include H` recorded
          // a bare "H" -- no such module, and none of H's methods were found
          // (tool/lib's AssertFile, whose include of Assertions left mu_pp out)
-         let mq = (if map_has consts mq || (if lv_has cenv "__cref" then false else true) then mq
+         let mq = (if local_found || map_has consts mq || (if lv_has cenv "__cref" then false else true) then mq
                    else (let cr9 = (match lv_get cenv "__cref" with VStr h9 -> sget h9 | _ -> "") in
                          let k9 = lex_const_key cr9 m in
                          if str_eq k9 "" then mq
@@ -55515,7 +55618,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
          // the constant expression it is: a qualifier may come from
          // const_missing (`include URI::REGEXP::PATTERN`, URI::REGEXP being
          // RFC2396_REGEXP) and the text was recorded, matching nothing
-         let mq = (if map_has consts mq || (if str_contains m "::" then false else true) || lv_has cenv m then mq
+         let mq = (if map_has consts mq || (if str_contains m "::" then false else true) || local_found then mq
                    else (match defined_eval_recv cenv world noblk (EConst m) with VClass c9 -> c9 | _ -> mq)) in
          let _ = (if pre then do_prepend world cls mq else do_include world cls mq) in
          FNext (VClass cls)
@@ -56141,7 +56244,7 @@ and undef_check = fn world -> fn (cls: str) -> fn (names: str list) ->
        || (is_sng_cls cls && (str_eq n "new" || str_eq n "allocate" || builtin_has_meth "Class" n))
        // (...and Module's, the private hooks among them: singleton.rb takes
        //  extend_object away from Singleton's own singleton class)
-       || (is_sng_cls cls && (builtin_has_meth "Module" n || sng_module_hook n))
+       || (is_sng_cls cls && (builtin_has_meth "Module" n || map_has (name_set "modpub") n || sng_module_hook n))
        // (in a refine body, a method of the REFINED class: `refine String do
        //  undef + end` takes `+` away where the refinement is active)
        || (is_refine_impl cls && (let t9 = refine_target_of cls in
@@ -57808,6 +57911,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
         let _ = (if pre then do_prepend world "Object" mq else do_include world "Object" mq) in
         FNext (VClass "Object"))
      | VClass c ->
+       let method_name = (if pre then "prepend" else "include") in
+       if cls_meth_own world c method_name then
+         (let argument = (if lv_has env m then lv_get env m else eval_e env world blk (EConst m)) in
+          FNext (invoke_val_c env world blk (VClass c) method_name (Cons (argument, Nil)) false))
+       else
        // (a local may hold an instance of a Module subclass: its module half)
        let mq = (if lv_has env m then (match lv_get env m with
                                        | VClass mc -> mc
