@@ -763,6 +763,125 @@ let _ = vec_recycle gc_obj_pend;
 // `remove_const(:A)` kept every one ever made (test_struct's
 // named_structs_are_not_rooted). gc_sweep_structs drops the rest.
 let gc_live_cls = map_new ();
+let _ = map_compact gc_live_cls;
+let gc_cls_pend = vec_new ();
+let gc_ref_live = map_new ();
+let gc_ref_pend = vec_new ();
+// Candidate registries and metadata indexes must live on the collector's
+// stack. A global registry can be reached through an evaluator closure and
+// would then conservatively root the very names being tested.
+let gc_metadata_new = fn (u: unit) ->
+  (map_new (), vec_new (), vec_new (), map_new (), vec_new (), vec_new (), map_new ());
+let rec gc_class_base = fn (c: str) ->
+  if str_starts_with c "(sng:" && str_len c > 6 then
+    (let rec close = fn (i: int) -> fn (depth: int) ->
+       if i >= str_len c then 0 - 1
+       else if str_eq (char_at c i) "(" then close (i + 1) (depth + 1)
+       else if str_eq (char_at c i) ")" then
+         (if depth == 1 then i else close (i + 1) (depth - 1))
+       else close (i + 1) depth in
+     let stop = close 5 1 in
+     if stop == str_len c - 1 then gc_class_base (substring c 5 stop) else c)
+  else c;
+let gc_class_collectible = fn (c: str) ->
+  str_starts_with c "AnonClass_" || str_starts_with c "AnonModule_"
+  || str_starts_with c "Refine_" || str_starts_with c "Struct_";
+// Reject named owners before allocating parser substrings. Most metadata
+// belongs to permanent core classes; scanning every character of every key
+// at each collection creates substantial scratch churn.
+let gc_prefix_at = fn (key: str) -> fn (prefix: str) -> fn (start: int) ->
+  if start == 0 then str_starts_with key prefix
+  else start >= 0 && start + str_len prefix <= str_len key
+       && str_eq (substring key start (start + str_len prefix)) prefix;
+let rec gc_owner_possible = fn (key: str) -> fn (start: int) ->
+  if start < 0 || start >= str_len key then false
+  else let first = char_at key start in
+    if str_eq first "A" then
+      gc_prefix_at key "AnonClass_" start || gc_prefix_at key "AnonModule_" start
+    else if str_eq first "S" then gc_prefix_at key "Struct_" start
+    else if str_eq first "R" then gc_prefix_at key "Refine_" start
+    else if str_eq first "(" && gc_prefix_at key "(sng:" start
+    then gc_owner_possible key (start + 5)
+    else false;
+let rec gc_owner_refinement = fn (key: str) -> fn (start: int) ->
+  if gc_prefix_at key "Refine_" start then true
+  else if gc_prefix_at key "(sng:" start then gc_owner_refinement key (start + 5)
+  else false;
+let gc_class_owner = fn (k0: str) ->
+  let from = (if str_starts_with k0 "cls:" then 4 else if str_starts_with k0 "modbk:" then 6 else 0) in
+  if (if gc_owner_possible k0 from then false else true) then "" else
+  let k = (if str_starts_with k0 "cls:" then substring k0 4 (str_len k0)
+           else if str_starts_with k0 "modbk:" then substring k0 6 (str_len k0) else k0) in
+  // A key starts with its owner. A method name merely containing an
+  // anonymous-looking spelling cannot change the ownership of its class.
+  let rec cut = fn (i: int) ->
+    if i >= str_len k then i
+    else let c = char_at k i in
+      if ord c < 33 || str_eq c "#" || str_eq c "@" || str_eq c "|"
+         || (str_eq c ":" && (if i >= 4 then str_eq (substring k (i - 4) (i + 1)) "(sng:" else false) == false)
+    then i else cut (i + 1) in
+  let rec trim_ref = fn (c: str) ->
+    if map_has modules c then c
+    else let i = str_rindex_go c "::" (str_len c - 2) in
+      if i < 0 then c else trim_ref (substring c 0 i) in
+  let rec field_end = fn (i: int) ->
+    if i >= str_len k then i
+    else let c = char_at k i in
+      if ord c < 33 || str_eq c "#" || str_eq c "@" || str_eq c "|" then i
+      else field_end (i + 1) in
+  let c = (if gc_owner_refinement k 0 then
+             (let raw = gc_class_base (substring k 0 (field_end 0)) in
+              if str_starts_with raw "Refine_" then trim_ref raw
+              else gc_class_base (substring k 0 (cut 0)))
+           else gc_class_base (substring k 0 (cut 0))) in
+  if gc_class_collectible c then c else "";
+let gc_source_owner = fn (k: str) ->
+  let direct = gc_class_owner k in
+  if str_len direct > 0 then direct
+  else if str_len k > 1 && (str_eq (char_at k 0) "f" || str_eq (char_at k 0) "e" || str_eq (char_at k 0) "~")
+  then gc_class_owner (substring k 1 (str_len k)) else "";
+let gc_class_mark = fn (c: str) ->
+  let raw = gc_class_base c in
+  let base = gc_class_owner raw in
+  if str_len base > 0 && (if map_has gc_live_cls base then false else true)
+  then (let _ = map_set gc_live_cls base 1 in vec_push gc_cls_pend base) else ();
+let gc_ref_mark = fn (id: int) ->
+  if id > 0 && (if map_has gc_ref_live id then false else true)
+  then (let _ = map_set gc_ref_live id 1 in vec_push gc_ref_pend id) else ();
+// Only internal fields use this parser. Ordinary Ruby String contents are
+// not class references, even when they happen to spell an anonymous name.
+let gc_class_prefixes = Cons ("AnonClass_", Cons ("AnonModule_", Cons ("Struct_", Cons ("Refine_", Nil))));
+let gc_class_text = fn (text: str) ->
+  let rec scan = fn (from: int) ->
+    if from >= str_len text then ()
+    else
+      let rec find = fn (ps: str list) -> fn (best: int) -> fn (width: int) ->
+        match ps with
+        | Nil -> (best, width)
+        | Cons (pre, rest) ->
+          let i = str_find_from text pre from in
+          if i >= 0 && (best < 0 || i < best) then find rest i (str_len pre) else find rest best width in
+      let (start, width) = find gc_class_prefixes (0 - 1) 0 in
+      if start < 0 then ()
+      else
+        let rec digits = fn (i: int) -> if i < str_len text && is_digit (char_at text i) then digits (i + 1) else i in
+        let stop = digits (start + width) in
+        let _ = (if str_eq (substring text start (start + width)) "Refine_" then
+          (let rec finish = fn (i: int) ->
+             if i >= str_len text then i
+             else let c = char_at text i in
+               if ord c < 33 || str_eq c "#" || str_eq c "|" || str_eq c ")" || str_eq c "@"
+               then i else finish (i + 1) in
+           let end = finish (start + width) in
+           gc_class_mark (substring text start end)) else ()) in
+        let _ = (if stop > start + width then gc_class_mark (substring text start stop) else ()) in
+        scan (if stop > start then stop else start + 1) in
+  let _ = scan 0 in gc_ref_mark (pack_rf text);
+let gc_handle_class = fn (prefix: str) -> fn (id: int) ->
+  if map_len hng_store == 0 && map_len hng_sng_base == 0 then ()
+  else let key = prefix ++ str_of_int id in
+    let _ = (if map_has hng_store key then gc_class_mark (map_get hng_store key) else ()) in
+    if map_has hng_sng_base key then gc_class_mark (map_get hng_sng_base key) else ();
 // Sparse words retain the exact tagged key set without one Map entry per
 // marked value. Thirty bits also fit the narrow integer backends.
 // Keep the eight handle kinds in separate words. Consecutive handles of
@@ -791,17 +910,15 @@ let gc_live_count = fn live ->
 
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
-  | VClass c9 when str_len c9 > 7 && str_eq (substring c9 0 7) "Struct_" ->
-    map_set gc_live_cls c9 1
   | VObj id -> let k = id * 8 in
-               (if gc_live_mark live k then vec_push gc_obj_pend id else ())
+               (if gc_live_mark live k then (let _ = (if map_has obj_cls id then gc_class_mark (map_get obj_cls id) else ()) in vec_push gc_obj_pend id) else ())
   | VStr id -> let k = id * 8 + 1 in
-               (let _ = gc_live_mark live k in ())
+               (if gc_live_mark live k then gc_handle_class "str:" id else ())
   | VArr id -> let k = id * 8 + 2 in
                (if (if gc_live_mark live k then false else true) then ()
                 // every element, the queued ones (and the Vec form's) too,
                 // read where they are: marking builds no list (note 278)
-                else arr_each_val id (fn (x: Val) -> gc_mark_val live x))
+                else let _ = gc_handle_class "arr:" id in arr_each_val id (fn (x: Val) -> gc_mark_val live x))
   | VHsh id -> let k = id * 8 + 3 in
                (if (if gc_live_mark live k then false else true) then ()
                 // read where the pairs are -- the list, the values the index
@@ -809,7 +926,7 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                 // fold here copies the hash into hash_store's arena, which a
                 // loop on the stack pins, so a collection every 64k queues
                 // left a copy of every live hash each time (note 303)
-                else                      let _ = gc_mark_vals live (hsettled id) in
+                else let _ = gc_handle_class "hsh:" id in                      let _ = gc_mark_vals live (hsettled id) in
                      // (its default and default proc live as long as it does,
                      //  and no longer: rooted from the tables, every
                      //  `Hash.new { }` ever made kept its block, note 441)
@@ -825,7 +942,7 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                       else ()))
   | VProc id -> let k = id * 8 + 4 in
                 (if (if gc_live_mark live k then false else true) then ()
-                 else                       let pk = str_of_int id in
+                 else let _ = gc_handle_class "prc:" id in                       let pk = str_of_int id in
                       let _ = (if map_has proc_store pk
                                then (let (_, _, _, penv) = proc_get pk in gc_mark_env live penv)
                                else ()) in
@@ -850,15 +967,20 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                        else ()))
   | VBind id -> let k = id * 8 + 5 in
                 (if (if gc_live_mark live k then false else true) then ()
-                 else let _ = (if map_len bind_yblk > 0 && map_has bind_yblk id then gc_mark_val live (VProc (map_get bind_yblk id)) else ()) in
+                 else let _ = gc_handle_class "bnd:" id in let _ = (if map_len bind_yblk > 0 && map_has bind_yblk id then gc_mark_val live (VProc (map_get bind_yblk id)) else ()) in
                       (if map_has bind_store (str_of_int id)
                        then gc_mark_env live (map_get bind_store (str_of_int id))
                        else ()))
   | VRange (a, b, _) -> let _ = gc_mark_val live a in gc_mark_val live b
   | VCpx (a, b) -> let _ = gc_mark_val live a in gc_mark_val live b
+  | VExc (c, _) -> gc_class_mark c
+  | VRegex (pattern, flags, encoding) ->
+    let key = "rx:" ++ flags ++ chr 1 ++ encoding ++ chr 1 ++ pattern in
+    let _ = (if map_has hng_store key then gc_class_mark (map_get hng_store key) else ()) in
+    if map_has hng_sng_base key then gc_class_mark (map_get hng_sng_base key) else ()
   // an object's singleton class, held as a value (`o.singleton_class`), keeps
   // its object: the class's methods are swept with the object (note 272)
-  | VClass c -> (let i = sng_key_id c in if i >= 0 then gc_mark_val live (VObj i) else ())
+  | VClass c -> (let _ = gc_class_mark c in let i = sng_key_id c in if i >= 0 then gc_mark_val live (VObj i) else ())
   | _ -> ()
 // an env and, through lv_up, the chain of scopes it reads through (note 272):
 // each frame id once (kind 6 of the live set). The chain used to be rooted
@@ -867,6 +989,10 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
 // a live proc, a binding, a stack -- and lv_cap's that nothing reached are
 // given back after the mark (gc_sweep_captured).
 and gc_mark_env = fn live -> fn e ->
+  let _ = map_iter e (fn (key: str) -> fn (v: Val) ->
+    if str_eq key "__rf" then (match v with VInt id -> gc_ref_mark id | _ -> ())
+    else if str_eq key "__cref" || str_eq key "__defcls" || str_eq key "__cvcls" || str_eq key "__visc" || str_eq key "__nest" || str_eq key "__definee_cls" || str_eq key "__ie_cls" || str_eq key "__cscope" || str_eq key "__blex" || str_eq key "__bnest"
+    then (match v with VStr h -> gc_class_text (sget h) | VClass c -> gc_class_mark c | _ -> ()) else ()) in
   match (if map_has e "__eid" then map_get e "__eid" else VNil) with
   | VInt n -> (let k = n * 8 + 6 in
                if (if gc_live_mark live k then false else true) then ()
@@ -886,6 +1012,31 @@ and gc_mark_vals = fn live -> fn (xs: Val list) ->
   match xs with
   | Nil -> ()
   | Cons (v, rest) -> let _ = gc_mark_val live v in gc_mark_vals live rest;
+let gc_native_add = fn metadata -> fn (text: str) ->
+  let (_, _, _, _, _, _, names) = metadata in
+  if (str_index_of text "AnonClass_" >= 0 || str_index_of text "AnonModule_" >= 0
+      || str_index_of text "Refine_" >= 0 || str_index_of text "Struct_" >= 0)
+     && (if map_has names text then false else true)
+  then map_set names text 1 else ();
+let gc_meta_add = fn metadata -> fn live -> fn (owner: str) -> fn (v: Val) ->
+  let (gc_meta_head, gc_meta_vals, gc_meta_prev, _, _, _, _) = metadata in
+  if str_len owner == 0 then gc_mark_val live v
+  else (let i = vec_len gc_meta_vals in
+        let _ = vec_push gc_meta_vals v in
+        let _ = vec_push gc_meta_prev (if map_has gc_meta_head owner then map_get gc_meta_head owner else 0 - 1) in
+        map_set gc_meta_head owner i);
+let gc_edge_add = fn metadata -> fn (owner: str) -> fn (text: str) ->
+  let (_, _, _, gc_edge_head, gc_edge_text, gc_edge_prev, gc_native_names) = metadata in
+  let _ = gc_native_add metadata text in
+  if str_len owner == 0 then gc_class_text text
+  else (let i = vec_len gc_edge_text in
+        let _ = vec_push gc_edge_text text in
+        let _ = vec_push gc_edge_prev (if map_has gc_edge_head owner then map_get gc_edge_head owner else 0 - 1) in
+        map_set gc_edge_head owner i);
+let gc_internal_ivar = fn live -> fn (key: str) -> fn (v: Val) ->
+  let _ = gc_mark_val live v in
+  if str_index_of key "@__m_" >= 0 || str_index_of key "@__um_" >= 0
+  then (match v with VStr h -> gc_class_text (sget h) | _ -> ()) else ();
 // an id a half-evaluated statement built (fb_stack_wm): kind 0 object, 1 array,
 // 2 string, 3 hash. An id no store holds any more is skipped, not dereferenced.
 // An object id is marked only if it is an object still: a stopped stack's
@@ -1005,10 +1156,11 @@ let gc_owner_of = fn (k: str) ->
 //   only reached one more link of a chain pointing at older objects (the
 //   table is in the order the entries were made): 100000 `l = S.new(l)` was
 //   100000 passes over 100000 entries, and test_gc never finished.
-let gc_fixpoint = fn ivars -> fn live ->
+let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
   // (the owner index in a region of its own: one per collection went to the
   //  default region)
   region GFX {
+  let (gc_meta_head, gc_meta_vals, gc_meta_prev, gc_edge_head, gc_edge_text, gc_edge_prev, gc_native_names) = metadata in
   // ⚠ A CHAIN, NOT A LIST PER OWNER: a map's value is copied on every store,
   //   so `map_set idx owner (Cons (v, map_get idx owner))` copied the owner's
   //   whole list once per ivar -- quadratic in one object's ivars, a 50 MB
@@ -1016,16 +1168,18 @@ let gc_fixpoint = fn ivars -> fn live ->
   //   head: the owner's last value; prevs: each value's previous one.
   let head = map_new () in
   let vals = vec_new () in
+  let keys = vec_new () in
   let prevs = vec_new () in
   let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
     let owner = gc_owner_of k in
-    if owner < 0 then gc_mark_val live v
+    if owner < 0 then gc_meta_add metadata live (gc_class_owner k) v
     else (let i = vec_len vals in
           let _ = vec_push vals v in
+          let _ = vec_push keys k in
           let _ = vec_push prevs (if map_has head owner then map_get head owner else 0 - 1) in
           map_set head owner i)) in
   let rec mark_chain = fn (j: int) ->
-    (if j < 0 then () else (let _ = gc_mark_val live (vec_get vals j) in mark_chain (vec_get prevs j))) in
+    (if j < 0 then () else (let _ = gc_internal_ivar live (vec_get keys j) (vec_get vals j) in mark_chain (vec_get prevs j))) in
   let _ = (if gc_log_on ()
            then print_err ("gc: owned ivars=" ++ str_of_int (vec_len vals) ++ " owners=" ++ str_of_int (map_len head))
            else ()) in
@@ -1041,8 +1195,40 @@ let gc_fixpoint = fn ivars -> fn live ->
                let _ = (if map_has head o then mark_chain (map_get head o) else ()) in
                each (i + 1)) in
        let _ = each start in drain stop (rounds + 1)) in
-  let n = drain 0 0 in
-  let _ = vec_recycle gc_obj_pend in
+  let names_vec = vec_new () in
+  let _ = map_iter gc_native_names (fn (name: str) -> fn (_v: int) -> vec_push names_vec name) in
+  let names = vec_to_list names_vec in
+  let _ = (if gc_log_on () then print_err ("gc: classes before native=" ++ str_of_int (map_len gc_live_cls) ++ " native candidates=" ++ str_of_int (vec_len names_vec) ++ " active refs=" ++ str_of_int (map_len ref_active)) else ()) in
+  let _ = list_iter stacks (fn (stack: int) -> fb_scan_names stack names gc_class_text) in
+  let _ = (if gc_log_on () then print_err ("gc: classes after native=" ++ str_of_int (map_len gc_live_cls)) else ()) in
+  let rec values = fn (i: int) ->
+    if i < 0 then () else (let _ = gc_mark_val live (vec_get gc_meta_vals i) in values (vec_get gc_meta_prev i)) in
+  let rec edges = fn (i: int) ->
+    if i < 0 then () else (let _ = gc_class_text (vec_get gc_edge_text i) in edges (vec_get gc_edge_prev i)) in
+  let rec settle = fn (objects: int) -> fn (classes: int) -> fn (refs: int) -> fn (rounds: int) ->
+    let _ = drain objects 0 in
+    let drained = vec_len gc_obj_pend in
+    let stop = vec_len gc_cls_pend in
+    let rec classes_go = fn (i: int) ->
+      if i >= stop then ()
+      else (let c = vec_get gc_cls_pend i in
+            let _ = (if map_has gc_meta_head c then values (map_get gc_meta_head c) else ()) in
+            let _ = (if map_has gc_edge_head c then edges (map_get gc_edge_head c) else ()) in
+            classes_go (i + 1)) in
+    let _ = classes_go classes in
+    let refstop = vec_len gc_ref_pend in
+    let rec refs_go = fn (i: int) ->
+      if i >= refstop then ()
+      else (let key = str_of_int (vec_get gc_ref_pend i) in
+            let _ = (if map_has ref_snaps key then
+              (let v = map_get ref_snaps key in
+               let _ = gc_mark_val live v in
+               match v with VStr h -> gc_class_text (sget h) | _ -> ()) else ()) in refs_go (i + 1)) in
+    let _ = refs_go refs in
+    let objectstop = vec_len gc_obj_pend in
+    if objectstop > drained || vec_len gc_cls_pend > stop || vec_len gc_ref_pend > refstop
+    then settle drained stop refstop (rounds + 1) else rounds in
+  let n = settle 0 0 0 0 in
   (if gc_log_on () then print_err ("gc: fixpoint rounds=" ++ str_of_int n ++ " live=" ++ str_of_int (gc_live_count live)) else ())
   };
 
@@ -1053,11 +1239,37 @@ let gc_fixpoint = fn ivars -> fn live ->
 // (Monitor#synchronize then raised ThreadError). The type checker keeps this
 // list honest in one direction: a non-Val map here is a build error. A MISSING
 // map is the direction to fear when adding a new global store.
-let gc_mark_roots = fn env -> fn live ->
+let gc_mark_roots = fn metadata -> fn env -> fn live ->
+  let (_, _, _, _, _, _, gc_native_names) = metadata in
+  let _ = map_recycle gc_live_cls in
+  let _ = vec_recycle gc_cls_pend in
+  let _ = map_recycle gc_ref_live in
+  let _ = vec_recycle gc_ref_pend in
   let _ = vec_recycle gc_obj_pend in
   // (the frame texts: one handle each, shared by every frame -- frame_text)
+  let _ = map_iter modules (fn (key: str) -> fn _v -> gc_native_add metadata key) in
+  let _ = map_iter cls_sup (fn (key: str) -> fn _v -> gc_native_add metadata key) in
+  let _ = map_iter meths_g (fn (key: str) -> fn _v -> gc_native_add metadata key) in
+  let _ = map_iter meth_src (fn (key: str) -> fn _v -> gc_native_add metadata key) in
+  let _ = map_iter struct_mem (fn (key: str) -> fn _v -> gc_native_add metadata key) in
+  let _ = map_iter refine_cnt (fn (key: str) -> fn _v -> gc_native_add metadata key) in
   let _ = map_iter frame_str_ids (fn (k: str) -> fn (h: int) -> gc_mark_val live (VStr h)) in
   let mk = fn (k: str) -> fn (v: Val) -> gc_mark_val live v in
+  let _ = map_iter cls_sup (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter includes (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter prepends (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter inc_keep (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter inc_excl (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter pre_excl (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+
+  let _ = map_iter class_meta (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter meth_cref (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter meth_cvcls (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter alias_origin (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter prim_sub (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = map_iter prim_copy (fn (key: str) -> fn (text: str) -> let _ = gc_native_add metadata key in gc_edge_add metadata (gc_class_owner key) text) in
+  let _ = gc_class_text (cur_lex ()) in
+  let _ = gc_class_text (cur_nest ()) in
   let _ = gc_mark_env live env in
   // (the env a TracePoint hook is running for: a method's frame whose body
   //  has ended is no longer the running frame of its depth -- tp_env)
@@ -1065,12 +1277,12 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter globals mk in
   let _ = map_iter rx_parked (fn (k: int) -> fn (i: int) -> gc_mark_val live (VObj i)) in
   let _ = gc_mark_val live (rx_md_get ()) in
-  let _ = map_iter consts mk in
+  let _ = map_iter consts (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter enc_objs mk in
   let _ = map_iter signal_traps mk in
-  let _ = map_iter dm_captured mk in
-  let _ = map_iter dm_closenv mk in
-  let _ = map_iter dm_methods mk in
+  let _ = map_iter dm_captured (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
+  let _ = map_iter dm_closenv (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
+  let _ = map_iter dm_methods (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter flow_sig mk in
   // (a `break` value on its way out of Lazy#each)
   let _ = map_iter lz_brk mk in
@@ -1086,11 +1298,11 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter cli_argv mk in
   let _ = map_iter all_thr mk in
   let _ = map_iter at_exits mk in
-  let _ = map_iter autoloads mk in
-  let _ = map_iter cls_name_str mk in
+  let _ = map_iter autoloads (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
+  let _ = map_iter cls_name_str (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter catch_depth mk in
   let _ = map_iter cur_thr mk in
-  let _ = map_iter cvars mk in
+  let _ = map_iter cvars (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter deco_memo mk in
   let _ = map_iter pm_why_v mk in
   let _ = map_iter def_ext_enc mk in
@@ -1122,34 +1334,34 @@ let gc_mark_roots = fn env -> fn live ->
   // collected arguments are all reached from nowhere but these tables.
   let _ = map_iter proc_src mk in
   let _ = map_iter proc_symsrc mk in
-  let _ = map_iter meth_params mk in
-  let _ = map_iter meth_src mk in
+  let _ = map_iter meth_params (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
+  let _ = map_iter meth_src (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_source_owner k) v) in
   let _ = map_iter curry_args mk in
   let _ = map_iter comp_inner mk in
   let _ = map_iter comp_outer mk in
   let _ = map_iter loaded_files mk in
-  let _ = map_iter modules mk in
+  let _ = map_iter modules (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter parser_flags mk in
   let _ = map_iter pending_home mk in
   let _ = map_iter prim_missing mk in
-  let _ = map_iter private_consts mk in
-  let _ = map_iter privates mk in
+  let _ = map_iter private_consts (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
+  let _ = map_iter privates (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter proc_arity mk in
   let _ = map_iter proc_home mk in
-  let _ = map_iter protecteds mk in
+  let _ = map_iter protecteds (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter r2k_methods mk in
   let _ = map_iter raise_bt mk in
-  let _ = map_iter refine_cnt mk in
+  let _ = map_iter refine_cnt (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter resc_ctr mk in
   let _ = map_iter rx_bad mk in
   let _ = map_iter rx_gnums mk in
   let _ = map_iter rx_lenient mk in
-  let _ = map_iter struct_mem mk in
+  let _ = map_iter struct_mem (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter tcp_buf mk in
   let _ = map_iter thread_flag mk in
   let _ = map_iter tmp_ctr mk in
   let _ = map_iter trace_fn mk in
-  let _ = map_iter undefs mk in
+  let _ = map_iter undefs (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter warn_cats mk in
   let _ = map_iter hstored mk in
   let _ = map_iter sym_all mk in
@@ -1162,20 +1374,29 @@ let gc_mark_roots = fn env -> fn live ->
   // and directory as VStr, a collection at a new moment blanked those
   // strings, and bundler's Gemfile resolution died three calls later.
   let _ = map_iter load_ctx mk in
-  let _ = map_iter anon_name mk in
+  let _ = map_iter anon_name (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter cli_inc mk in
-  let _ = map_iter dm_had_blk mk in
+  let _ = map_iter dm_had_blk (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter ref_active mk in
-  let _ = map_iter ref_snaps mk in
-  let _ = map_iter refine_cls mk in
-  let _ = map_iter refine_tgt mk in
+  let _ = gc_ref_mark (ref_cur_id ()) in
+  let _ = map_iter refine_cls (fn (k: str) -> fn (v: Val) ->
+    let _ = (match v with VStr h ->
+      (let impl_name = sget h in
+       let _ = gc_edge_add metadata (gc_class_owner k) impl_name in
+       let owner = gc_class_owner k in
+       // A held refinement module keeps its refinery and target, including
+       // when the refinery has a public name and therefore no GC owner.
+       let _ = gc_edge_add metadata impl_name (if str_len owner > 0 then owner else k) in
+       if map_has refine_tgt k then (match map_get refine_tgt k with VStr t -> gc_edge_add metadata impl_name (sget t) | _ -> ()) else ())
+      | _ -> ()) in gc_meta_add metadata live (gc_class_owner k) v) in
+  let _ = map_iter refine_tgt (fn (k: str) -> fn (v: Val) -> let _ = (match v with VStr h -> gc_edge_add metadata (gc_class_owner k) (sget h) | _ -> ()) in gc_meta_add metadata live (gc_class_owner k) v) in
   let _ = map_iter rx_cur mk in
   let _ = map_iter rx_gbodies mk in
   let _ = map_iter rx_pending mk in
   let _ = map_iter warn_pending mk in
   let _ = map_iter rx_prog_names mk in
   let _ = map_iter gc_cenv0 mk in
-  let _ = map_iter gc_hold mk in
+  let _ = map_iter gc_hold (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_class_owner k) v) in
   // the Fiber objects, the value crossing a switch, and the saved contexts of
   // suspended stacks
   let fbx = map_has gc_state "fbx" in
@@ -1269,7 +1490,13 @@ let gc_mark_roots = fn env -> fn live ->
   //   depth of the call the tuple is handed to (yblk_pin).
   let _ = map_iter yblk_pin (fn (d: int) -> fn (pid: int) -> gc_mark_val live (VProc pid)) in
   let _ = map_iter meths_g (fn (k: str) -> fn (m: Meth) ->
-    match m with Meth (ps9, _, _) -> gc_mark_yblk_params live ps9) in
+    let owner = gc_class_owner k in
+    let rec params = fn (ps: str list) -> match ps with
+      | Nil -> ()
+      | Cons (name, rest) ->
+        let _ = (if str_starts_with name yblk_marker && str_len name > 9
+                 then gc_meta_add metadata live owner (VProc (int_of_str (substring name 9 (str_len name)))) else ()) in params rest in
+    match m with Meth (ps9, _, _) -> params ps9) in
   let _ = map_iter bind_store (fn (k: str) -> fn (benv) -> gc_mark_env live benv) in
   // the scope-chain parents: env maps linked by id, each holding Vals
   // (...and the parent links of a suspended fiber's active blocks, likewise)
@@ -1422,6 +1649,112 @@ let gc_purge_cls = fn tbl -> fn dead ->
               if str_index_of k "Struct_" >= 0 && map_has dead (gc_key_cls k) then vec_push dk k else ()) in
     gc_drop_s tbl dk
   };
+let gc_sweep_class_table = fn tbl -> fn (source_keys: bool) -> fn (compact: bool) ->
+  region CSD {
+    let dead = vec_new () in
+    let _ = map_iter tbl (fn (key: str) -> fn _v ->
+      let owner = (if source_keys then gc_source_owner key else gc_class_owner key) in
+      if str_len owner > 0 && (if map_has gc_live_cls owner then false else true)
+      then vec_push dead key else ()) in
+    let _ = gc_drop_s tbl dead in
+    if compact && vec_len dead > 0 then map_compact tbl else ()
+  };
+let gc_sweep_classes = fn (nc: bool) ->
+  let _ = (if gc_log_on () then print_err ("gc: class graph live=" ++ str_of_int (map_len gc_live_cls)
+     ++ " modules=" ++ str_of_int (map_len modules) ++ " supers=" ++ str_of_int (map_len cls_sup)
+     ++ " methods=" ++ str_of_int (map_len meths_g) ++ " snapshots=" ++ str_of_int (map_len ref_snaps)) else ()) in
+  let compact = (if nc then false else true) in
+  let _ = gc_sweep_class_table cls_sup false compact in
+  let _ = gc_sweep_class_table cls_frozen false compact in
+  let _ = gc_sweep_class_table class_meta false compact in
+  let _ = gc_sweep_class_table class_sng_exists false compact in
+  let _ = gc_sweep_class_table sng_shown false compact in
+  let _ = gc_sweep_class_table cls_oids false compact in
+  let _ = gc_sweep_class_table cls_removed false compact in
+  let _ = gc_sweep_class_table anon_name false compact in
+  let _ = gc_sweep_class_table cls_name_str false compact in
+  let _ = gc_sweep_class_table prim_sub false compact in
+  let _ = gc_sweep_class_table prim_copy false compact in
+  let _ = gc_sweep_class_table struct_mem false compact in
+  let _ = gc_sweep_class_table struct_gen false compact in
+  let _ = gc_sweep_class_table struct_initializers false compact in
+  let _ = gc_sweep_class_table includes false compact in
+  let _ = gc_sweep_class_table prepends false compact in
+  let _ = gc_sweep_class_table inc_excl false compact in
+  let _ = gc_sweep_class_table inc_keep false compact in
+  let _ = gc_sweep_class_table pre_excl false compact in
+  let _ = gc_sweep_class_table meths_g false compact in
+  let _ = gc_sweep_class_table bi_owner_memo false compact in
+  let _ = gc_sweep_class_table meth_cfn false compact in
+  let _ = gc_sweep_class_table builtin_alias false compact in
+  let _ = gc_sweep_class_table ie_def_meths false compact in
+
+  let _ = gc_sweep_class_table meth_owner_seen false compact in
+  let _ = gc_sweep_class_table meth_cref false compact in
+  let _ = gc_sweep_class_table meth_cvcls false compact in
+  let _ = gc_sweep_class_table alias_origin false compact in
+  let _ = gc_sweep_class_table alias_srcname false compact in
+  let _ = gc_sweep_class_table meth_params false compact in
+  let _ = gc_sweep_class_table meth_src true compact in
+  let _ = gc_sweep_class_table dm_methods false compact in
+  let _ = gc_sweep_class_table dm_captured false compact in
+  let _ = gc_sweep_class_table dm_closenv false compact in
+  let _ = gc_sweep_class_table dm_had_blk false compact in
+  let _ = gc_sweep_class_table privates false compact in
+  let _ = gc_sweep_class_table protecteds false compact in
+  let _ = gc_sweep_class_table undefs false compact in
+  let _ = gc_sweep_class_table undef_names false compact in
+  let _ = gc_sweep_class_table vis_marks false compact in
+  let _ = gc_sweep_class_table consts false compact in
+  let _ = gc_sweep_class_table const_src false compact in
+  let _ = gc_sweep_class_table const_src_pend false compact in
+  let _ = gc_sweep_class_table private_consts false compact in
+  let _ = gc_sweep_class_table deprecated_consts false compact in
+  let _ = gc_sweep_class_table autoloads false compact in
+  let _ = gc_sweep_class_table autoload_busy false compact in
+  let _ = gc_sweep_class_table cvars false compact in
+  let _ = gc_sweep_class_table ivars_g false compact in
+  let _ = gc_sweep_class_table refine_cnt false compact in
+  let _ = gc_sweep_class_table refine_tgt false compact in
+  let _ = gc_sweep_class_table refine_cls false compact in
+  let _ = gc_sweep_class_table gc_hold false compact in
+  let _ = gc_sweep_class_table mro_anc false compact in
+  let _ = gc_sweep_class_table mro_anc_gen false compact in
+  let _ = gc_sweep_class_table mro_mods false compact in
+  let _ = gc_sweep_class_table mro_mods_gen false compact in
+  let _ = gc_sweep_class_table hm_memo false compact in
+  let _ = gc_sweep_class_table hm_memo_gen false compact in
+  let _ = gc_sweep_class_table mro_local_epoch false compact in
+  let _ = gc_sweep_class_table mro_external false compact in
+  let _ = gc_sweep_class_table meth_obj_seen false compact in
+  let _ = gc_sweep_class_table snap_meths false compact in
+  let _ = gc_sweep_class_table snap_bounds false compact in
+  let _ = gc_sweep_class_table msnap_inst false compact in
+  let dead_tags = vec_new () in
+  let tags = map_new () in
+  let note = fn (key: str) -> fn (name: str) ->
+    let owner = gc_class_owner name in
+    if str_len owner > 0 && (if map_has gc_live_cls owner then false else true)
+       && (if map_has tags key then false else true)
+    then (let _ = map_set tags key 1 in vec_push dead_tags key) else () in
+  let _ = map_iter hng_store note in
+  let _ = map_iter hng_sng_base note in
+  let _ = gc_drop_sh hng_store dead_tags "" in
+  let _ = gc_drop_sh hng_sng_base dead_tags "" in
+  let _ = (if compact && vec_len dead_tags > 0 then
+    (let _ = map_compact hng_store in map_compact hng_sng_base) else ()) in
+  let dead_refs = vec_new () in
+  let _ = map_iter ref_snaps (fn (key: str) -> fn (_v: Val) ->
+    if map_has gc_ref_live (int_of_str key) then () else vec_push dead_refs key) in
+  let _ = gc_drop_s ref_snaps dead_refs in
+  let _ = (if compact && vec_len dead_refs > 0 then map_compact ref_snaps else ()) in
+  // Keep the module registry until owner parsing has finished for every table.
+  let _ = gc_sweep_class_table modules false compact in
+  let _ = mro_bump () in
+  let _ = (if gc_log_on () then print_err ("gc: class survivors modules=" ++ str_of_int (map_len modules)
+     ++ " supers=" ++ str_of_int (map_len cls_sup) ++ " methods=" ++ str_of_int (map_len meths_g)
+     ++ " snapshots=" ++ str_of_int (map_len ref_snaps)) else ()) in
+  ();
 let gc_sweep_structs = fn world -> fn live -> fn (nc: bool) ->
   let (meths, sup, ocls, ivars) = world in
   if map_len struct_mem == 0 then ()
@@ -1430,7 +1763,7 @@ let gc_sweep_structs = fn world -> fn live -> fn (nc: bool) ->
     let is_s = fn (c: str) -> str_len c > 7 && str_eq (substring c 0 7) "Struct_" in
     let keep = map_new () in
     let _ = map_iter gc_live_cls (fn (c: str) -> fn (x: int) -> map_set keep c 1) in
-    let _ = map_clear gc_live_cls in
+    let _ = map_recycle gc_live_cls in
     let candidates = vec_new () in
     let _ = map_iter struct_mem (fn (c: str) -> fn (_v: Val) -> vec_push candidates c) in
     let names = vec_to_list candidates in
@@ -1513,6 +1846,12 @@ let weak_ident = fn (v: Val) ->
   | VClass c -> "c" ++ c
   | _ -> "v" ++ inspect v;
 // a handle the marking did not reach (an immediate is never collected)
+let weak_class_dead = fn (c: str) ->
+  let owner = gc_class_owner c in
+  str_len owner > 0 && (if map_has gc_live_cls owner then false else true);
+let weak_native_dead = fn (key: str) ->
+  (map_has hng_store key && weak_class_dead (map_get hng_store key))
+  || (map_has hng_sng_base key && weak_class_dead (map_get hng_sng_base key));
 let weak_dead = fn live -> fn (v: Val) ->
   match v with
   | VObj i -> (if gc_live_has live (i * 8) then false else true)
@@ -1520,6 +1859,9 @@ let weak_dead = fn live -> fn (v: Val) ->
   | VArr i -> (if gc_live_has live (i * 8 + 2) then false else true)
   | VHsh i -> (if gc_live_has live (i * 8 + 3) then false else true)
   | VProc i -> (if gc_live_has live (i * 8 + 4) then false else true)
+  | VClass c -> weak_class_dead c
+  | VExc (c, _) -> weak_class_dead c
+  | VRegex (p, f, e) -> weak_native_dead ("rx:" ++ f ++ chr 1 ++ e ++ chr 1 ++ p)
   | _ -> false;
 // WeakMap's sweep: an entry whose map, key or value died goes with it (the
 // dead are gathered first, then deleted; deleting allocates nothing)
@@ -1575,8 +1917,13 @@ let gc_collect = fn env -> fn world ->
                                  ++ " bytes=" ++ str_of_int (gc_store_bytes ()) ++ " base=" ++ str_of_int (vec_get gc_knob 1)
                                  ++ " stub=" ++ str_of_int (vec_get gc_knob 12)) else ()) in
     let live = map_new () in
-    let _ = gc_mark_roots env live in
-    let _ = gc_fixpoint ivars live in
+    let metadata = gc_metadata_new () in
+    let _ = gc_mark_roots metadata env live in
+    let stack_ids = vec_new () in
+    let _ = vec_push stack_ids (fb_cur ()) in
+    let _ = map_iter fb_state (fn (id: int) -> fn (st: int) -> if (st == 1 || st == 2) && id != fb_cur () then vec_push stack_ids id else ()) in
+    let stacks = vec_to_list stack_ids in
+    let _ = gc_fixpoint metadata ivars live stacks in
     // (a MatchData still a record holds its subject and its pattern key by
     //  handle: what its ivars would have kept, for the ones that are live --
     //  strings point at nothing, so no further fixpoint pass is needed)
@@ -1593,7 +1940,7 @@ let gc_collect = fn env -> fn world ->
       if key >= 0 && (if gc_live_has live key then false else true)
       then map_set fin_ready id 1 else ()) in
     let _ = gc_sweep_captured live in
-    let _ = gc_sweep_structs world live nc in
+    let _ = gc_sweep_classes nc in
     // THE PROCS NOTHING REACHED (the VProc arm of gc_mark_val marks the ones
     // something does), and what was kept beside each by its id. Before note
     // 270 every proc was a root, and with it everything it had captured.
@@ -2017,7 +2364,8 @@ let fb_reclaim = fn env -> fn world ->
            | VInt n -> map_set fb_rc_eid n 1
            | _ -> ())) in
        let _ = map_set gc_state "fbx" 1 in
-       let _ = gc_mark_roots env live in
+       let metadata = gc_metadata_new () in
+    let _ = gc_mark_roots metadata env live in
        let _ = map_delete gc_state "fbx" in
        // a stack's frames and saved slots are marked when the stack is: every
        // non-candidate at once, a candidate once its Fiber object is reached.
@@ -2045,8 +2393,10 @@ let fb_reclaim = fn env -> fn world ->
            (let bar = str_index_of k "|" in
             let o = (if bar > 0 then int_of_str (substring k 0 bar) else 0 - 2) in
             if map_has inq o || o < 0 then gc_mark_val live v else ())) in
+         let stacks = vec_new () in
+         let _ = map_iter inq (fn (id: int) -> fn (_v: int) -> vec_push stacks id) in
          let _ = map_clear inq in
-         gc_fixpoint ivars live in
+         gc_fixpoint metadata ivars live (vec_to_list stacks) in
        let _ = mark_queued () in
        let rec settle = fn (guard: int) ->
          let _ = map_iter cand (fn (i: int) -> fn (done: int) ->
@@ -34321,8 +34671,11 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
            let _ = (if map_has protecteds k then map_set protecteds nk VNil else ()) in
            if map_has alias_srcname k then map_set alias_srcname nk (map_get alias_srcname k) else ())
         | _ -> ()))) in
-  let _ = rec_pfx (c ++ "#") (nc ++ "#") in
-  let _ = rec_pfx ("(sng:" ++ c ++ ")#") ("(sng:" ++ nc ++ ")#") in
+  let _ = (if mro_local_name c && (if map_has meth_owner_seen c then false else true)
+           then () else rec_pfx (c ++ "#") (nc ++ "#")) in
+  let sc = "(sng:" ++ c ++ ")" in
+  let _ = (if mro_local_name sc && (if map_has meth_owner_seen sc then false else true)
+           then () else rec_pfx (sc ++ "#") ("(sng:" ++ nc ++ ")#")) in
   // Module dup/clone copies an existing singleton even when it has no methods.
   let _ = (if map_has class_sng_exists c || map_has sng_shown c
            then map_set class_sng_exists nc 1 else ()) in
@@ -43521,6 +43874,23 @@ and undef_blocked = fn world -> fn (cls: str) -> fn (name: str) ->
   else undef_blocked_anc world (ancestors_of world cls) name
 
 
+// A pristine anonymous singleton adds no lookup rows before its parent.
+// Share only the existence-cache key, while a miss still walks the original
+// receiver and records its dependencies. Exposing or changing the singleton
+// makes it ineligible; aliases and undef tombstones use their ordinary keys.
+and has_meth_cache_class = fn world -> fn (cls: str) -> fn (name: str) ->
+  if (str_starts_with cls "(sng:AnonClass_" || str_starts_with cls "(sng:AnonModule_")
+     && str_len cls > 16 && str_index_from cls ")" 5 == str_len cls - 1
+     && str_index_from cls ":" 5 < 0
+     && (if map_has undef_names name || map_has blt_alias_names name then false else true)
+  then
+    let inner = substring cls 5 (str_len cls - 1) in
+    let (_, sup, _, _) = world in
+    if map_has class_sng_exists inner || map_has sng_shown inner
+       || map_has meth_owner_seen cls || map_has sup cls
+       || map_has includes cls || map_has prepends cls then cls
+    else sng_supername world cls
+  else cls
 and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   // (inside Marshal's dump and load a core class answers with its builtin:
   //  see core_only)
@@ -43537,8 +43907,10 @@ and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   else if (if mro_cache_on () then false else true) then has_meth_b world cls name false false
   else
     let _ = mro_cached_dependency cls in
-  let g = mro_now_class cls in
-    let k = cls ++ "#" ++ name in
+    let cache_cls = has_meth_cache_class world cls name in
+    let _ = (if str_eq cache_cls cls then () else mro_cached_dependency cache_cls) in
+    let g = mro_now_class cache_cls in
+    let k = cache_cls ++ "#" ++ name in
     if map_has hm_memo_gen k && map_get hm_memo_gen k == g then map_get hm_memo k
     else
       (let owned = mro_lookup_enter cls in
@@ -44340,7 +44712,6 @@ and modfunc_promote_hooked = fn world -> fn (cls: str) -> fn (names: str list) -
 //   alias_method, define_method, attr_* -- comes through here, and none of
 //   them told the attached object.
 and run_method_added = fn world -> fn (cls: str) -> fn (nm: str) ->
-  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   if is_sng_cls cls then
     (let inner9 = sng_inner cls in
      if str_len inner9 > 0 && is_digit (char_at inner9 0)
@@ -44355,7 +44726,8 @@ and run_method_added = fn world -> fn (cls: str) -> fn (nm: str) ->
   else if str_len (ma_blt_owner world cls) > 0 then
     (if map_has hook_flags "tp" then tp_c_hook_in world "method_added" cls (ma_blt_owner world cls) else ())
   else if has_meth world ("(sng:" ++ cls ++ ")") "method_added"
-  then (let _ = invoke world noblk (VClass cls) ("(sng:" ++ cls ++ ")") "method_added" (Cons (VSym nm, Nil)) in ())
+  then (let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+        let _ = invoke world noblk (VClass cls) ("(sng:" ++ cls ++ ")") "method_added" (Cons (VSym nm, Nil)) in ())
   // (some other class's Ruby hook set the flag: this one's is Module's)
   else if map_has hook_flags "tp" then tp_c_hook world "method_added" cls
   else ()
@@ -44416,9 +44788,9 @@ and run_singleton_method_added = fn world -> fn (recv: Val) -> fn (nm: str) ->
 // fire a module's `self.included(base)` hook, if defined, after `base`
 // includes it (the ActiveSupport::Concern entry point).
 and run_included_hook = fn world -> fn (mq: str) -> fn (base: str) ->
-  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   if has_meth world ("(sng:" ++ mq ++ ")") "included"
-  then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "included" (Cons (VClass base, Nil)) in ())
+  then (let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+        let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "included" (Cons (VClass base, Nil)) in ())
   else ()
 
 // Hand one event to the installed trace func. Ruby passes six arguments
@@ -44762,9 +45134,9 @@ and tp_bare_builtin = fn env -> fn world -> fn (name: str) ->
   && (if lv_has env name then false else true)
   && tp_builtin_target world (match s9 with VMain -> VMain | _ -> s9) name
 and run_prepended_hook = fn world -> fn (mq: str) -> fn (base: str) ->
-  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   if has_meth world ("(sng:" ++ mq ++ ")") "prepended"
-  then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "prepended" (Cons (VClass base, Nil)) in ())
+  then (let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+        let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "prepended" (Cons (VClass base, Nil)) in ())
   else ()
 
 // fire each extended module's `self.extended(base)` hook.
@@ -53149,7 +53521,7 @@ and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: St
   //   activated.
   let existing = refine_impl_for world refinery target 0 i in
   if (if str_eq existing "" then false else true) then
-    (let _ = flow_value (register_class_blk world existing bb refinery (refine_body_env denv refinery)) in VClass existing)
+    (let _ = flow_value (register_refine_body world existing bb refinery denv) in VClass existing)
   else
   let impl_cls = "Refine_" ++ refinery ++ "_" ++ str_of_int i in
   // The body is a BLOCK, so it does not open a constant scope: `refine String
@@ -53169,7 +53541,7 @@ and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: St
   let _ = map_set refine_tgt (refinery ++ "#" ++ str_of_int i) (mkstr target) in
   let _ = map_set refine_cls (refinery ++ "#" ++ str_of_int i) (mkstr impl_cls) in
   let _ = map_set refine_cnt refinery (VInt (i + 1)) in
-  let _ = flow_value (register_class_blk world impl_cls bb refinery (refine_body_env denv refinery)) in
+  let _ = flow_value (register_refine_body world impl_cls bb refinery denv) in
   VClass impl_cls
 
 // ⚠ THE REFINE BODY HAS ITS OWN MODULE'S REFINEMENTS ACTIVE, on top of what
@@ -53180,6 +53552,15 @@ and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: St
 //   to_json_format refines Integer, Array and Hash, and Array's calls Hash's).
 //   Neither held: the body ran with the caller's table. The env handed to the
 //   body carries a snapshot with the refinery as a LIVE entry (ref_snapshot).
+// The refinement's lexical snapshot is an intermediate child scope. Its
+// parent link must end with the body, or each refine permanently roots its
+// snapshot and the classes it names. Captured scopes stay in lv_capx and are
+// reached through their live Proc/Method owners instead.
+and register_refine_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (refinery: str) -> fn denv ->
+  let scope = refine_body_env denv refinery in
+  let result = try_or_msg (fn (u: unit) -> register_class_blk world cls body refinery scope)
+                (fn (message: str) -> (let _ = blk_env_put scope in fail message)) in
+  let _ = blk_env_put scope in result
 and refine_body_env = fn denv -> fn (refinery: str) ->
   let _ = map_set ref_flag 0 1 in
   let prev = ref_cur_id () in
@@ -53189,7 +53570,7 @@ and refine_body_env = fn denv -> fn (refinery: str) ->
   let id = ref_snapshot () in
   let _ = map_clear ref_active in
   let _ = ref_install prev in
-  let e = lv_child denv in
+  let e = blk_env_get denv in
   let _ = map_set e "__rf" (VInt id) in
   e
 
@@ -53686,7 +54067,7 @@ and with_env_nest = fn env -> fn (f: unit -> Flow) ->
      let _ = set_nest s9 in r9)
   else f ()
 and register_class_sng_in = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (lex: str) ->
-  let saved = map_copy ref_active in
+  let saved = ref_save_active () in
   // ⚠ the scope arrives as an ARGUMENT rather than from cur_lex (). Read from
   // there it is "" inside a class body or a method body, so a bare constant in
   // the singleton's body was looked up at top level. `class << self` hid that:
@@ -53754,7 +54135,7 @@ and register_class_ieval = fn world -> fn (cls: str) -> fn (body: Stmt list) -> 
   // (the pending `&pr` source is spent here too; see register_class_blk)
   let _ = if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else () in
   let _ = if map_has pending_home "v" then map_delete pending_home "v" else () in
-  let saved = map_copy ref_active in
+  let saved = ref_save_active () in
   let cenv = lv_child denv in
   // the body is a BLOCK, so its refinements are the ones where it was written
   // (its env chain), not the caller's -- as run_block does
@@ -53811,7 +54192,7 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
            else ()) in
   let _ = fire_trace world "class" cls cls in
   // a `using` inside this body is scoped to it: snapshot/restore ref_active.
-  let saved = map_copy ref_active in
+  let saved = ref_save_active () in
   let cenv = map_new () in
   let _ = map_set cenv "self" (VClass cls) in
   let _ = cls_home_take cenv in
@@ -53875,8 +54256,8 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   //   the first ran the first one's block (its initialize, its methods).
   let _ = if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else () in
   let _ = if map_has pending_home "v" then map_delete pending_home "v" else () in
-  let saved = map_copy ref_active in
-  let cenv = lv_child denv in
+  let saved = ref_save_active () in
+  let cenv = blk_env_get denv in
   // ⚠ the refinements of a class_eval / Module.new BLOCK are the ones where
   //   the block was written: `klass.class_eval { "1".to_s }` outside the
   //   `using` that was inside `Class.new do ... end` is not refined, and a
@@ -53903,7 +54284,7 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   // left the refinement active for the rest of the program), as
   // register_class does
   let r = try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) in
-  let _ = lv_child_done cenv in
+  let _ = blk_env_put cenv in
   let _ = set_lex saved_lex in
   let _ = restore_ref_active saved in
   (match r with
@@ -54816,9 +55197,9 @@ and do_include = fn world -> fn (base: str) -> fn (mq: str) ->
   // ...nor is a refinement a module anything can mix in, and the refusal
   // comes before its #append_features could be asked
   let _ = (if is_refine_impl mq then (let _ = raise_exc world "TypeError" "Cannot include refinement" in ()) else ()) in
-  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "append_features"
-           then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "append_features" (Cons (VClass base, Nil)) in ())
+           then (let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+                 let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "append_features" (Cons (VClass base, Nil)) in ())
            else append_features_raw world base mq) in
   // `include Enumerable` brings Enumerable__Impl with it -- the streaming
   // implementations, in FRONT of the list so they are searched LAST: the
@@ -54836,9 +55217,9 @@ and do_prepend = fn world -> fn (base: str) -> fn (mq: str) ->
   let _ = (if str_len base >= 7 && str_eq (substring base 0 7) "Refine_"
            then (let _ = raise_exc world "TypeError" "Refinement#prepend has been removed" in ()) else ()) in
   let _ = (if is_refine_impl mq then (let _ = raise_exc world "TypeError" "Cannot prepend refinement" in ()) else ()) in
-  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "prepend_features"
-           then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "prepend_features" (Cons (VClass base, Nil)) in ())
+           then (let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+                 let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "prepend_features" (Cons (VClass base, Nil)) in ())
            else prepend_features_raw world base mq) in
   run_prepended_hook world mq base
 
