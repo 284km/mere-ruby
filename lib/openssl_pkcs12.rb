@@ -40,12 +40,14 @@ module OpenSSL
     end
     def initialize(*args)
       raise ArgumentError, 'wrong number of arguments' if args.length > 2
+      return self if args.empty? && __native_initialized?
       data = args.empty? ? nil : PKey.data(args[0])
       password = args[1].nil? ? nil : Backend.c_string(args[1])
       native, key, cert, ca = Backend.call('pkcs12.new', data, password)
       __close_native
       __take(native)
       @key, @certificate, @ca_certs = key, cert, ca
+      self
     end
     def to_der; Backend.call('pkcs12.to_der', self); end
     def set_mac(password, salt = nil, iterations = nil, digest = nil)

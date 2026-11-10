@@ -7,6 +7,16 @@ module OpenSSL
       OpenSSL.__native_bind(self, id)
       self
     end
+    def __native_initialized?
+      OpenSSL.__native_handle(self)
+      true
+    rescue TypeError
+      false
+    end
+    def __replace_native(other)
+      __close_native
+      __take(other)
+    end
     def __take(other)
       OpenSSL.__native_move(other, self)
       self

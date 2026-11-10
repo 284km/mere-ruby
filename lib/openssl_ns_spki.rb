@@ -4,7 +4,8 @@ module OpenSSL
     class SPKI < NativeObject
       def initialize(*args)
         raise ArgumentError, 'wrong number of arguments' if args.size>1
-        __take(Backend.call('spki.new',args.empty? ? nil : PKey.string(args[0])))
+        return self if args.empty? && __native_initialized?
+        __replace_native(Backend.call('spki.new',args.empty? ? nil : PKey.string(args[0])))
       end
       def to_der; Backend.call('spki.to_der',self); end
       def to_pem; Backend.call('spki.to_pem',self); end
