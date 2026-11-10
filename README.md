@@ -332,9 +332,8 @@ before any Ruby runs in CRuby 3.x, so `require "fiber"` returns false
 there too). `socket` is answered by the interpreter itself: `TCPSocket`,
 `TCPServer` and the rest are Ruby source over Mere's own socket FFI, so a
 program here really does connect, listen, accept and exchange bytes —
-zero bytes included. UDP and UNIX sockets exist but refuse
-(`NotImplementedError`), because a socket library that silently does
-nothing moves a failure away from its cause. Native `openssl` uses OpenSSL 3
+zero bytes included. Native UDP datagrams, UNIX sockets and `Socket.pair`
+are also supported. Native `openssl` uses OpenSSL 3
 (`libssl` and `libcrypto`) for keys, certificates, TLS, digests, MACs, KDFs and
 ciphers, including authenticated modes. Install `openssl@3` on macOS or
 `libssl-dev` on Linux before `sh tools/build.sh`; `OPENSSL_PREFIX` selects an
