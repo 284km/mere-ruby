@@ -14,6 +14,7 @@
 #include <openssl/x509v3.h>
 #include <openssl/conf.h>
 #include <openssl/kdf.h>
+#include <openssl/pkcs12.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -203,6 +204,8 @@ done:
 #include "openssl/x509_constants.inc"
 #include "openssl/x509_store.inc"
 #include "openssl/config.inc"
+#include "openssl/pkcs12.inc"
+#include "openssl/pkcs7.inc"
 #include "openssl/tls_types.inc"
 #include "openssl/tls_callbacks.inc"
 #include "openssl/tls_worker.inc"
@@ -213,6 +216,10 @@ done:
 #include "openssl/cipher.inc"
 
 static void dispatch(const char *op,const arg *args,buffer *out) {
+    if(!strncmp(op,"pkcs7.",6)) { pkcs7_call(op+6,args,out); return; }
+    if(!strncmp(op,"p7si.",5)) { p7si_call(op+5,args,out); return; }
+    if(!strncmp(op,"p7ri.",5)) { p7ri_call(op+5,args,out); return; }
+    if(!strncmp(op,"pkcs12.",7)) { pkcs12_call(op+7,args,out); return; }
     if(!strcmp(op,"version")) { text(out,OpenSSL_version(OPENSSL_VERSION)); return; }
     if(!strcmp(op,"version_number")) { integer(out,(long long)OpenSSL_version_num()); return; }
     if(!strcmp(op,"errors")) {

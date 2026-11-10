@@ -2,7 +2,8 @@
  * object. Exhausted generations retire their slot instead of wrapping. */
 enum object_kind { NK_KEY=1, NK_GROUP, NK_POINT, NK_NAME, NK_CERT, NK_REQUEST, NK_CRL, NK_REVOKED, NK_EXTENSION,
                    NK_ATTRIBUTE, NK_STORE, NK_STORE_CONTEXT, NK_SSL_CONTEXT, NK_SSL_SOCKET,
-                   NK_SSL_SESSION, NK_JOB, NK_CONFIG, NK_PROVIDER, NK_DIGEST, NK_HMAC, NK_CIPHER };
+                   NK_SSL_SESSION, NK_JOB, NK_CONFIG, NK_PROVIDER, NK_DIGEST, NK_HMAC, NK_CIPHER, NK_PKCS12,
+                   NK_PKCS7, NK_P7_SIGNER, NK_P7_RECIPIENT };
 typedef void (*destroy_fn)(void *);
 typedef void *(*copy_fn)(const void *);
 typedef struct native_slot {
