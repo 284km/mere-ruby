@@ -76,16 +76,53 @@ if OpenSSL.__native_available
     module KDF
       class KDFError < OpenSSLError; end
       def self.hash_name(hash); hash.is_a?(Digest) ? hash.name : OpenSSL.__str(hash); end
-      def self.pbkdf2_hmac(password, salt:, iterations:, length:, hash:)
-        Backend.call('kdf.pbkdf2', OpenSSL.__str(password), OpenSSL.__str(salt), Integer(length), Integer(iterations), hash_name(hash))
+      # NUM2INT's conversion: an Integer, or what answers #to_int, else
+      # "no implicit conversion" (Kernel#Integer's message is "can't convert")
+      def self.__int(v)
+        return v if v.is_a?(Integer)
+        return v.to_int if !v.nil? && v.respond_to?(:to_int)
+        raise TypeError, v.nil? ? "no implicit conversion from nil to integer" : "no implicit conversion of #{v.class} into Integer"
       end
-      def self.scrypt(password, salt:, r:, p:, length:, **options)
-        cost = options.fetch(:N) { raise ArgumentError, 'missing keyword: N' }
-        raise ArgumentError, 'unknown scrypt keyword' unless options.size == 1
-        Backend.call('kdf.scrypt', OpenSSL.__str(password), OpenSSL.__str(salt), Integer(length), Integer(cost), Integer(r), Integer(p))
+      # the digest by name, as ossl_evp_md_fetch refuses an unknown one
+      def self.__digest_name(hash)
+        return hash.name if hash.is_a?(Digest)
+        name = OpenSSL.__str(hash)
+        begin
+          Digest.new(name)
+        rescue Digest::DigestError => e
+          raise Digest::DigestError, "unsupported digest algorithm: #{name}: #{e.message.sub(/\A.*?error:[0-9A-F]+:[^:]*::/, '')}"
+        end
+        name
+      end
+      def self.pbkdf2_hmac(password, salt:, iterations:, length:, hash:)
+        pw = OpenSSL.__str(password)
+        sl = OpenSSL.__str(salt)
+        iter = __int(iterations)
+        len = __int(length)
+        md = __digest_name(hash)
+        raise KDFError, "PKCS5_PBKDF2_HMAC: invalid iteration count" if iter <= 0
+        Backend.call('kdf.pbkdf2', pw, sl, len, iter, md)
+      end
+      # (N cannot be a keyword PARAMETER -- a constant is no formal argument --
+      #  so the keywords are read the way ossl_kdf_scrypt's rb_get_kwargs reads
+      #  them: all five required, named in ruby's order when missing)
+      def self.scrypt(password, **kw)
+        names = %i[salt N r p length]
+        missing = names.reject { |k| kw.key?(k) }
+        unless missing.empty?
+          raise ArgumentError, "missing keyword#{missing.size > 1 ? 's' : ''}: #{missing.map(&:inspect).join(', ')}"
+        end
+        extra = kw.keys - names
+        raise ArgumentError, "unknown keyword#{extra.size > 1 ? 's' : ''}: #{extra.map(&:inspect).join(', ')}" unless extra.empty?
+        cost = __int(kw[:N]); r = __int(kw[:r]); p = __int(kw[:p]); len = __int(kw[:length])
+        raise ArgumentError, "negative string size (or size too big)" if len < 0
+        if cost < 2 || (cost & (cost - 1)) != 0 || r <= 0 || p <= 0
+          raise KDFError, "EVP_PBE_scrypt: invalid parameter"
+        end
+        Backend.call('kdf.scrypt', OpenSSL.__str(password), OpenSSL.__str(kw[:salt]), len, cost, r, p)
       end
       def self.hkdf(key, salt:, info:, length:, hash:)
-        Backend.call('kdf.hkdf', OpenSSL.__str(key), OpenSSL.__str(salt), Integer(length), OpenSSL.__str(info), hash_name(hash))
+        Backend.call('kdf.hkdf', OpenSSL.__str(key), OpenSSL.__str(salt), __int(length), OpenSSL.__str(info), hash_name(hash))
       end
     end
     module PKCS5

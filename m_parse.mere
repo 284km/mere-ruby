@@ -4833,6 +4833,15 @@ and paren_body_go = fn toks ->
     else paren_expr_body (skip_nls toks)
   | _ -> paren_expr_body (skip_nls toks)
 
+// the operand of `defined?( ... )` after the forms above: an expression --
+// or a rightward pattern match, `defined?(1 => 1)`, which ruby answers
+// "expression" for without matching (the pattern is still parsed)
+and defined_paren_rest = fn toks -> fn (semi9: bool) ->
+  let (e, r3) = parse_andor toks in
+  match skip_nls r3 with
+  | Cons (TP c0, r4) when str_eq c0 "=>" ->
+    (let (_, r5) = parse_pattern_top r4 in (EDefined (EVar "__defined__expression"), expect (skip_nls r5) ")"))
+  | _ -> (defined_semi (semi9 || nls_has_semi r3) e, expect (skip_nls r3) ")")
 and paren_expr_body = fn toks ->
   if looks_like_multix toks then
     let (s2, r2) = parse_multix toks in paren_after_stmt s2 r2
@@ -6391,8 +6400,8 @@ and parse_primary = fn toks ->
            (match r2 with
             | Cons (TId w, Cons (TP rp, r4)) ->
               if str_eq rp ")" then (EDefined (EVar (if semi9 then "__defined__expression" else w)), r4)
-              else let (e, r3) = parse_andor r2 in (defined_semi (semi9 || nls_has_semi r3) e, expect (skip_nls r3) ")")
-            | _ -> let (e, r3) = parse_andor r2 in (defined_semi (semi9 || nls_has_semi r3) e, expect (skip_nls r3) ")"))
+              else defined_paren_rest r2 semi9
+            | _ -> defined_paren_rest r2 semi9)
          // `defined? a = 10` (no parens) — an assignment is unevaluated.
          else if defined_assignish r then
            let (st, r3) = parse_stmt r in (defined_assign_node r st, r3)
@@ -7030,6 +7039,10 @@ and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
      // (a CONSTANT's name reads the constant: `{FOO:}` is `{FOO: FOO}`)
      | ESym nm when str_len nm > 0 && char_at nm 0 >= "A" && char_at nm 0 <= "Z" ->
        hash_items_sep (skip_nls r2) (Cons (EConst nm, Cons (k, acc)))
+     // (`self:` reads a LOCAL named self, which only a binding can make --
+     //  not the receiver: see bnd_lv_key)
+     | ESym nm when str_len nm == 4 && str_eq nm "self" ->
+       hash_items_sep (skip_nls r2) (Cons (EVar (chr 3 ++ "self"), Cons (k, acc)))
      | ESym nm -> hash_items_sep (skip_nls r2) (Cons (EVar nm, Cons (k, acc)))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad hash key")) in fail "mere-ruby: bad hash key"))
   else
@@ -8139,6 +8152,10 @@ and parse_x_target1 = fn toks ->
            (let (e0, r1) = parse_primary toks in parse_x_chain e0 r1)
          else (let (ts, r2) = parse_x_group r Nil in (EArr ts, r2))
        | _ -> (let (ts, r2) = parse_x_group r Nil in (EArr ts, r2)))
+    // (an Array or Hash LITERAL as the receiver: `_, {}[:foo] = 1`,
+    //  test_compile_prism's MultiWriteNode)
+    else if str_eq lp "[" || str_eq lp " [" || str_eq lp "\{" || str_eq lp " \{" then
+      (let (e0, r1) = parse_primary toks in parse_x_chain e0 r1)
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad assignment target")) in fail "mere-ruby: bad assignment target")
   // Every other token kind, and the empty list. The two arms above are
   // `Cons (TId ..)` and `Cons (TP ..)`, so a `TStr` or a `TInt` in a target
@@ -8341,6 +8358,8 @@ and looks_like_multix = fn toks ->
     else if str_eq lp "::" || str_eq lp " ::" then scan_mx toks 0 false 0
     // a leading splat is itself a target (* = 1, *a = ...), if an = follows.
     else if str_eq lp "*" then scan_mx r 0 true 0
+    // (...and a literal's element: `{}[:foo], _ = 1`)
+    else if str_eq lp "[" || str_eq lp "\{" then scan_mx toks 0 false 0
     else false
   | _ -> false
 
@@ -8482,6 +8501,10 @@ and parse_rhs_list = fn toks -> fn (acc: Expr list) ->
     (match toks with
      | Cons (TP star, r0) ->
        if str_eq star "*" then let (inner, r1) = parse_expr r0 in let _ = cmd_refuse_eoi () in (ESplat inner, r1)
+       // (`return *a, **kw` / `return **h`: a double splat is one Hash
+       //  value, as a call's trailing keywords are -- test_compile_prism's
+       //  ReturnNode)
+       else if str_eq star "**" then let (inner, r1) = parse_expr r0 in let _ = cmd_refuse_eoi () in (EHsh (Cons (EKwSplat inner, Cons (EKwSplat inner, Nil))), r1)
        else parse_expr toks
      | _ -> parse_expr toks) in
   // (`a = b, c d` / `a = *b c`: the items of a LIST are no commands; the
@@ -9082,9 +9105,10 @@ and parse_stmt_ident = fn toks -> fn (id: str) -> fn r ->
                     if str_eq lc "!" || str_eq lc "?" then syn_refuse "unexpected write target" else ()) in
            (SAssign (id, EBin (opassign_base p, rd9, e)), r3)
          else if not (str_eq (opassign_base p) "") && is_cap id then
-           // `Const op= expr` — a bare constant op-assign (nil read when undefined).
+           // `Const op= expr` — a bare constant op-assign: `||=` reads nil for an
+           // undefined one, every other op reads it as a constant (NameError)
            let (e, r3) = parse_expr (skip_nls r2) in
-           (SAssign (id, EBin (opassign_base p, EConstOrNil id, e)), r3)
+           (SAssign (id, EBin (opassign_base p, opasgn_const_read (opassign_base p) id, e)), r3)
          else
            let (e, r4) = parse_expr toks in (SExpr e, r4)
        | _ -> let (e, r5) = parse_expr toks in (SExpr e, r5))

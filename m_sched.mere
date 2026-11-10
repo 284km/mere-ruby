@@ -185,6 +185,50 @@ let sch_sig_check = fn (u: unit) ->
      let k9 = (if m9 >= 0 && map_has sch_wait m9 then map_get sch_wait m9 else 0) in
      if k9 == 1 || k9 == 2 || sch_trap_wakes k9 then (let _ = map_set sig_queue "w" "1" in let _ = sch_unpark m9 in true)
      else false);
+// thread id -> the descriptors it waits on in IO's readiness loop (IO.__park
+// with them), "fd:bits fd:bits ...". When every thread waits, the idle wait
+// is a poll(2) on all of them and not a sleep: a reader is woken when its
+// descriptor is ready, where it woke every millisecond to ask (6% of a CPU
+// while a pipe was empty -- test_io's copy_stream_no_busy_wait).
+let sch_iofd = map_new ();
+let rec sch_iofd_parse = fn (ws: str list) -> fn (fds: Val list) -> fn (ints: Val list) -> fn (k: int) ->
+  match ws with
+  | Nil -> (fds, ints)
+  | Cons (w, r) ->
+    (match str_split w ":" with
+     | Cons (f, Cons (b, _)) -> sch_iofd_parse r (Cons (VInt (int_of_str f), fds)) (Cons (VInt (int_of_str b), ints)) k
+     | _ -> sch_iofd_parse r fds ints k);
+// the idle wait with descriptors to watch: up to ms, and every waiter whose
+// descriptor answered is runnable again
+let sch_iofd_wait = fn (ms: int) ->
+  let all9 = map_new () in
+  let _ = map_iter sch_iofd (fn (t: int) -> fn (w: str) -> map_set all9 (map_len all9) w) in
+  let rec join = fn (i: int) -> fn (acc: str) -> if i >= map_len all9 then acc else join (i + 1) (acc ++ " " ++ map_get all9 i) in
+  let (fds, ints) = sch_iofd_parse (str_split (str_trim (join 0 "")) " ") Nil Nil 0 in
+  let got = io_poll_once fds ints ms in
+  let ready = map_new () in
+  let rec mark = fn (fs: Val list) -> fn (gs: Val list) ->
+    match (fs, gs) with
+    | (Cons (VInt f, fr), Cons (VInt g, gr)) -> (let _ = (if g != 0 then map_set ready f 1 else ()) in mark fr gr)
+    | _ -> () in
+  let _ = mark fds got in
+  if map_len ready == 0 then ()
+  else
+    (let ts = map_new () in
+     let _ = map_iter sch_iofd (fn (t: int) -> fn (w: str) ->
+       let rec hit = fn (xs: str list) ->
+         (match xs with
+          | Nil -> false
+          // (only "fd:bits" words: the text ends in a space, and
+          //  int_of_str of the empty word after it fails)
+          | Cons (x, r) -> (match str_split x ":" with Cons (f, Cons (_, _)) -> map_has ready (int_of_str f) | _ -> false) || hit r) in
+       if hit (str_split w " ") then map_set ts (map_len ts) t else ()) in
+     let rec wake = fn (i: int) ->
+       if i >= map_len ts then ()
+       else (let t = map_get ts i in
+             let _ = (if map_has sch_wait t then sch_unpark t else ()) in
+             wake (i + 1)) in
+     wake 0);
 // how long the idle wait may sleep before it looks for a marked signal: the
 // whole wait when no trap waits for one, 20 ms when one does
 let sch_sig_slice = fn (ms: int) ->
@@ -202,7 +246,10 @@ let sch_pick = fn (u: unit) ->
     else (let d = sch_next_deadline () in
           if d > 0 then
             (let now = sch_now () in
-             let _ = (if d > now then fb_os_sleep (sch_sig_slice ((d - now + 999999) / 1000000)) else ()) in
+             let _ = (if d > now then
+                        (let ms9 = sch_sig_slice ((d - now + 999999) / 1000000) in
+                         if map_len sch_iofd > 0 then sch_iofd_wait ms9 else fb_os_sleep ms9)
+                      else ()) in
              let _ = (if map_len sig_armed > 0 then (let _ = sch_sig_check () in ()) else ()) in
              let _ = sch_expire (sch_now ()) in
              go ())
