@@ -27,7 +27,12 @@ raise 'AES FIPS 197 vector changed' unless encrypted.unpack1('H*')=='69c4e0d86a7
 [
   proc { OpenSSL::PKey.read('unsupported') },
   proc { OpenSSL::X509::Certificate.new },
-  proc { OpenSSL::SSL::SSLContext.new }
+  proc { OpenSSL::SSL::SSLContext.new },
+  proc { OpenSSL::PKCS12.new },
+  proc { OpenSSL::PKCS7.new },
+  proc { OpenSSL::OCSP::Request.new },
+  proc { OpenSSL::Timestamp::Request.new },
+  proc { OpenSSL::Netscape::SPKI.new }
 ].each do |operation|
   begin
     operation.call

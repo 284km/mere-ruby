@@ -2,7 +2,10 @@
  * object. Exhausted generations retire their slot instead of wrapping. */
 enum object_kind { NK_KEY=1, NK_GROUP, NK_POINT, NK_NAME, NK_CERT, NK_REQUEST, NK_CRL, NK_REVOKED, NK_EXTENSION,
                    NK_ATTRIBUTE, NK_STORE, NK_STORE_CONTEXT, NK_SSL_CONTEXT, NK_SSL_SOCKET,
-                   NK_SSL_SESSION, NK_JOB, NK_CONFIG, NK_PROVIDER, NK_DIGEST, NK_HMAC, NK_CIPHER };
+                   NK_SSL_SESSION, NK_JOB, NK_CONFIG, NK_PROVIDER, NK_DIGEST, NK_HMAC, NK_CIPHER, NK_PKCS12,
+                   NK_PKCS7, NK_P7_SIGNER, NK_P7_RECIPIENT,
+                   NK_OCSP_CERTID, NK_OCSP_REQUEST, NK_OCSP_RESPONSE, NK_OCSP_BASIC, NK_OCSP_SINGLE,
+                   NK_TS_REQUEST, NK_TS_RESPONSE, NK_TS_INFO, NK_SPKI };
 typedef void (*destroy_fn)(void *);
 typedef void *(*copy_fn)(const void *);
 typedef struct native_slot {
@@ -16,6 +19,9 @@ typedef struct native_slot {
 static native_slot *objects;
 static int object_capacity,free_head=-1,live_objects;
 static unsigned long long objects_created;
+/* A failed response must not leave handles that Ruby never received. There
+ * are at most 32768 simultaneous slots, so this per-request log is bounded. */
+static int request_created[32768],request_created_count,request_active;
 
 static native_slot *lookup(long long id,int kind) {
     if(id<=0||id>INT_MAX) return NULL;
@@ -26,6 +32,7 @@ static native_slot *lookup(long long id,int kind) {
 }
 static int own(void *ptr,int kind,const char *klass,destroy_fn destroy,copy_fn copy) {
     if(!ptr) return 0;
+    if(request_active&&request_created_count==32768) { destroy(ptr); return 0; }
     if(free_head<0) {
         int old=object_capacity,cap=old?old*2:64;
         if(old==32768) { destroy(ptr); return 0; }
@@ -40,7 +47,9 @@ static int own(void *ptr,int kind,const char *klass,destroy_fn destroy,copy_fn c
     int index=free_head; native_slot *s=&objects[index]; free_head=s->next;
     s->ptr=ptr; s->kind=kind; s->klass=klass; s->destroy=destroy; s->copy=copy;
     live_objects++; objects_created++;
-    return ((int)s->generation<<15)|index;
+    int id=((int)s->generation<<15)|index;
+    if(request_active) request_created[request_created_count++]=id;
+    return id;
 }
 static int release(long long id) {
     native_slot *s=lookup(id,0); if(!s) return 0;
