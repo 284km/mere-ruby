@@ -43,3 +43,37 @@ Dir.mktmpdir do |d|
   end
 end
 p require("enc/trans/single_byte")
+
+# Linux byte paths can have different encoding labels. Provenance belongs to
+# each File/operation and must not change existing objects or subsequent calls.
+if RUBY_PLATFORM.include?('linux')
+  Dir.mktmpdir do |d|
+    path=File.join(d,'é')
+    aliased=path.dup.force_encoding('ISO-8859-1')
+    File.write(path,'x')
+    original=File.open(path)
+    other=File.open(aliased)
+    fresh=File.open(path)
+    begin
+      p [original.path.encoding,other.path.encoding,fresh.path.encoding]
+      p [original.path==path,other.path==aliased,fresh.path==path]
+      missing=path+'-missing'
+      ['ISO-8859-1','UTF-8','ISO-8859-1','UTF-8'].each do |encoding|
+        argument=missing.dup.force_encoding(encoding)
+        begin
+          Dir.open(argument)
+        rescue Errno::ENOENT=>error
+          p [error.message.encoding,error.message.end_with?(argument)]
+        end
+      end
+      begin
+        File.open(missing)
+      rescue Errno::ENOENT=>error
+        p [error.message.encoding,error.message.end_with?(missing)]
+      end
+      p [original.path.encoding,original.path==path]
+    ensure
+      [original,other,fresh].each(&:close)
+    end
+  end
+end

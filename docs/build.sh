@@ -40,7 +40,8 @@ node "$here/smoke.mjs" --check-imports
 if [ -x "$root/mere-ruby" ] && command -v node > /dev/null; then
   prog='p [Float("1.5"), Float("-2"), 1.0 / 3]
 puts "%.5f" % (2.0 ** 0.5)
-p [1, 2, 3].map {|x| x * 2 }.sum'
+p [1, 2, 3].map {|x| x * 2 }.sum
+p 0.0.step(1.0, 0.25).to_a'
   if node --stack-size=8000 "$here/smoke.mjs" "$prog" > "$here/.smoke.wasm.out" 2>&1 &&
      "$root/mere-ruby" /dev/stdin > "$here/.smoke.native.out" 2>&1 << RUBY
 $prog

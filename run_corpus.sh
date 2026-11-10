@@ -112,34 +112,47 @@ if [ "${1:-}" = "--both" ]; then
   unset MERE_RUBY_NO_HASH_INDEX
 fi
 
+# CI can collect every platform difference in one run, still failing the gate.
+# Default callers retain the first-failure behavior.
+sb_keep="${CORPUS_KEEP_GOING:-0}"
 pass=0
+failed=0
+total=0
 for f in corpus/*.rb; do
-  # ⚠ THE EXIT STATUS IS PART OF THE ANSWER, and under `set -e` a program that
-  # ended non-zero stopped the gate on that line: no FAIL, no diff, just exit
-  # 1 -- even when both sides failed the same way and printed the same thing.
-  # Both statuses are read, and a difference in either is a FAIL that says so.
   rrc=0; "$REF_RUBY_BIN" "$f" > "$exp" 2>/dev/null || rrc=$?
   mrc=0; "$MR_BIN" "$f" > "$got" || mrc=$?
+  total=$((total + 1))
+  bad=0
   if ! diff -u "$exp" "$got" > "$dif"; then
     echo "FAIL $f"
     cat "$dif"
-    exit 1
+    bad=1
   fi
   if [ "$rrc" != "$mrc" ]; then
-    echo "FAIL $f (same output, but ruby exited $rrc and mere-ruby $mrc)"
-    exit 1
+    echo "FAIL $f (ruby exited $rrc and mere-ruby $mrc)"
+    bad=1
   fi
+  if [ "$bad" = 1 ] && [ "$sb_keep" != 1 ]; then exit 1; fi
   if [ "$sb_both" = 1 ]; then
     mrc=0; MERE_RUBY_NO_HASH_INDEX=1 "$MR_BIN" "$f" > "$got" || mrc=$?
     if ! diff -u "$exp" "$got" > "$dif" || [ "$rrc" != "$mrc" ]; then
       echo "FAIL $f (with MERE_RUBY_NO_HASH_INDEX=1; ruby exited $rrc, mere-ruby $mrc)"
       cat "$dif"
-      exit 1
+      bad=1
     fi
   fi
-  pass=$((pass + 1))
-  echo "ok   $f"
+  if [ "$bad" = 1 ]; then
+    failed=$((failed + 1))
+    if [ "$sb_keep" != 1 ]; then exit 1; fi
+  else
+    pass=$((pass + 1))
+    echo "ok   $f"
+  fi
 done
+if [ "$failed" != 0 ]; then
+  echo "$failed/$total corpus programs differ from ruby ($pass match)"
+  exit 1
+fi
 if [ "$sb_both" = 1 ]; then
   echo "$pass/$pass corpus programs match ruby, with the hash index ON and OFF"
 else

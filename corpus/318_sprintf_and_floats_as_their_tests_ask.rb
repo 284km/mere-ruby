@@ -20,3 +20,7 @@ t(8) { [1.1e-300, -1.1e-300, 1.5e-300, Float::MIN, 2.675, 1e300].map { |x| [x.ro
 t(9) { [(Float::NAN.div(2) rescue $!.class), (11.5.div(Float::NAN) rescue $!.class)] }
 t(10) { [(1.0..12.7).step(1.3).to_a.last, 1.0.step(2.0, 0.1).to_a, (0.0...1.0).step(0.1).to_a.size, 0.0.step(1.0, Float::INFINITY).to_a, (1.0.step(2.0, "0.5") {} rescue $!.message)] }
 t(11) { o = Object.new; def o.to_f = raise("x"); [Float(o, exception: false), (1.0.round(half: "up".dup.force_encoding("utf-16be")) rescue $!.class)] }
+
+# Step elements follow the reference target's fused/nonfused C expression,
+# including the first signed zero; byte output exposes each rounding.
+t(12) { [-0.0, 0.0, 1.0, -1.0].product([0.1, -0.1, 0.3, -0.3]).map { |beg, unit| beg.step(unit > 0 ? Float::INFINITY : -Float::INFINITY, unit).take(12).pack('G*').unpack1('H*') } }

@@ -241,3 +241,47 @@ ensure
   writer.close unless writer.closed?
   reader.close unless reader.closed?
 end
+
+# Native writes must not invoke an application-defined String constructor.
+reader,writer=IO.pipe
+begin
+  class << String
+    alias __deadline_original_new new
+    def new(*) = raise('unexpected constructor callback')
+  end
+  begin
+    counts=[writer.write('abc'),writer.syswrite('def')]
+    writer.puts('g')
+    writer.print('h')
+  ensure
+    class << String
+      alias new __deadline_original_new
+      remove_method :__deadline_original_new
+    end
+  end
+  writer.close
+  p [:constructor_override,counts,reader.read]
+ensure
+  writer.close unless writer.closed?
+  reader.close unless reader.closed?
+end
+
+# Snapshot bytes before waiting; later mutation must not change the write.
+reader,writer=IO.pipe
+begin
+  fill_writer(writer)
+  writer.timeout=2
+  argument=+'abc'
+  started=Queue.new
+  thread=Thread.new { started << true; writer.write(argument) }
+  started.pop
+  Thread.pass until thread.stop?
+  argument.replace('xyz')
+  drainer=Thread.new { reader.read }
+  p [:snapshot_write,thread.value]
+  writer.close
+  raise 'write used bytes mutated during wait' unless drainer.value.end_with?('abc')
+ensure
+  writer.close unless writer.closed?
+  reader.close unless reader.closed?
+end

@@ -15,6 +15,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--reference', default=os.environ.get('REF_RUBY_BIN', 'ruby'))
+parser.add_argument('--binary', type=Path, default=ROOT/'mere-ruby')
 args = parser.parse_args()
 random_source = random.Random(409)
 values = [0.0, -0.0, math.inf, -math.inf, 0.5, 1.5, 2.0, 1000.0,
@@ -44,3 +45,12 @@ with tempfile.TemporaryDirectory(prefix='mere-math-glue-') as folder:
         uncorrected = b''.join(struct.pack('!d', raw(value)) for value in values)
         assert uncorrected != expected, 'negative control failed to expose the missing glibc correction'
     print(f'native cbrt: {len(values)} bit-exact reference comparisons, special values and platform correction passed')
+
+
+# Compare the interpreter's complete step pipeline against the actual reference
+# loop, rather than assuming one architecture's multiply/add contraction.
+program="STDOUT.binmode; a=[-0.0,0.0,1.0,-1.0,12.7,-12.7]; u=[0.1,-0.1,0.3,-0.3,1.3,-1.3,1e-100,-1e-100]; STDOUT.write(a.product(u).flat_map { |b,s| b.step(s>0 ? Float::INFINITY : -Float::INFINITY,s).take(12) }.pack('G*'))"
+expected = subprocess.run([args.reference, '-e', program], capture_output=True, check=True, timeout=30)
+actual = subprocess.run([str(args.binary.resolve()), '-e', program], capture_output=True, check=True, timeout=30)
+assert actual.stdout == expected.stdout, 'step rounding differs from reference target'
+print('Float#step:576 bit-exact pipeline comparisons including signed zero passed')
