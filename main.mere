@@ -767,27 +767,61 @@ let gc_live_cls = map_new ();
 // marked value. Thirty bits also fit the narrow integer backends.
 // Keep the eight handle kinds in separate words. Consecutive handles of
 // one kind then use all 30 bits, instead of leaving seven of eight bits empty.
+// Flat pages keep container ownership in the collection's original region.
+// Only integer offsets cross nested scratch regions; a page never stores a
+// vector allocated by a deeper frame. Cache the current page of each kind.
+let gc_live_new = fn (u: unit) ->
+  let pages = map_new () in
+  let words = vec_new () in
+  let cache = vec_new () in
+  let rec init = fn (i: int) ->
+    if i == 16 then () else (let _ = vec_push cache (0 - 1) in init (i + 1)) in
+  let _ = init 0 in
+  (pages, words, cache);
+let gc_live_word = fn live -> fn (group: int) -> fn (kind: int) -> fn (create: bool) ->
+  let (pages, words, cache) = live in
+  let page = group / 64 in
+  let ck = kind * 2 in
+  let offset =
+    (if vec_get cache ck == page then vec_get cache (ck + 1)
+     else
+       (let pk = page * 8 + kind in
+        let base =
+          (if map_has pages pk then map_get pages pk
+           else if create then
+             (let start = vec_len words in
+              let rec zero = fn (i: int) ->
+                if i == 64 then () else (let _ = vec_push words 0 in zero (i + 1)) in
+              let _ = zero 0 in
+              let _ = map_set pages pk start in start)
+           else 0 - 1) in
+        let _ = (if base < 0 then () else
+          (let _ = vec_set cache ck page in vec_set cache (ck + 1) base)) in
+        base)) in
+  if offset < 0 then 0 - 1 else offset + group - page * 64;
 let gc_live_has = fn live -> fn (key: int) ->
   let id = key / 8 in
   let group = id / 30 in
-  let word = group * 8 + (key - id * 8) in
-  map_has live word && bit_and (map_get live word) (bit_shl 1 (id - group * 30)) != 0;
-// Return true only for the first mark, so recursive tracing visits once.
+  let word = gc_live_word live group (key - id * 8) false in
+  let (_, words, _) = live in
+  word >= 0 && bit_and (vec_get words word) (bit_shl 1 (id - group * 30)) != 0;
 let gc_live_mark = fn live -> fn (key: int) ->
   let id = key / 8 in
   let group = id / 30 in
-  let word = group * 8 + (key - id * 8) in
-  let bits = (if map_has live word then map_get live word else 0) in
+  let word = gc_live_word live group (key - id * 8) true in
+  let (_, words, _) = live in
+  let bits = vec_get words word in
   let mask = bit_shl 1 (id - group * 30) in
   if bit_and bits mask != 0 then false
-  else (let _ = map_set live word (bit_or bits mask) in true);
+  else (let _ = vec_set words word (bit_or bits mask) in true);
 let gc_live_count = fn live ->
-  let count = vec_new () in
-  let _ = vec_push count 0 in
+  let (_, words, _) = live in
   let rec ones = fn (bits: int) -> fn (n: int) ->
     if bits == 0 then n else ones (bit_and bits (bits - 1)) (n + 1) in
-  let _ = map_iter live (fn (word: int) -> fn (bits: int) -> vec_set count 0 (vec_get count 0 + ones bits 0)) in
-  vec_get count 0;
+  let rec go = fn (i: int) -> fn (count: int) ->
+    if i >= vec_len words then count
+    else go (i + 1) (count + ones (vec_get words i) 0) in
+  go 0 0;
 
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
@@ -1567,7 +1601,7 @@ let gc_collect = fn env -> fn world ->
     let _ = (if gclog then print_err ("gc: BEGIN ivars=" ++ str_of_int (map_len ivars) ++ " arr=" ++ str_of_int (map_len arr_store) ++ " str=" ++ str_of_int (str_count ())
                                  ++ " bytes=" ++ str_of_int (gc_store_bytes ()) ++ " base=" ++ str_of_int (vec_get gc_knob 1)
                                  ++ " stub=" ++ str_of_int (vec_get gc_knob 12)) else ()) in
-    let live = map_new () in
+    let live = gc_live_new () in
     let _ = gc_mark_roots env live in
     let _ = gc_fixpoint ivars live in
     // (a MatchData still a record holds its subject and its pattern key by
@@ -2004,7 +2038,7 @@ let gc_point = fn world ->
 let fb_reclaim = fn env -> fn world ->
   region FBR {
     let (_, _, _, ivars) = world in
-    let live = map_new () in
+    let live = gc_live_new () in
     let cand = map_new () in
     let _ = map_iter fb_state (fn (i: int) -> fn (st: int) -> if st == 2 then map_set cand i 0 else ()) in
     if map_len cand == 0 then 0
