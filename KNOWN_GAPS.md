@@ -1065,14 +1065,22 @@ See `openssl-plan.json`, `openssl-completion-plan.json`, and
 `unittest/openssl_baseline_coverage.tsv` for scope and baseline.
 
 Real HTTPS and gem-load measurements are in `gemtest/latest.json` and
-`gemtest/https_latest.json`. External Net::HTTP and direct SSLSocket pass
-trusted HTTPS and negative trust/hostname checks. Excon's TLS rejection is
-followed by a core dispatch failure: implicit `set_backtrace` inside a custom
-exception initializer raises `NoMethodError`, while explicit calls work.
-`gemtest/exception_backtrace_probe.rb` reproduces it without OpenSSL. Reference
-Excon also has EPIPE failures in this environment; they are recorded separately.
-The stdlib probe identifies `uri`/`timeout`, then `net/protocol`/`net/http`,
-`open-uri` and `resolv` as the next dependency sequence.
+`gemtest/https_latest.json`. Bundled/external Net::HTTP, direct SSLSocket and
+Excon pass trusted HTTPS and negative trust/hostname checks. Implicit
+`Exception#set_backtrace` dispatch from a custom initializer is fixed and has
+an independent regression. Reference Excon's earlier localhost EPIPE was
+isolated by using the fixture's explicit IPv4 endpoint while retaining verified
+hostname and SNI; blocking reference Excon also passed.
+
+URI, Timeout, Net::Protocol, Net::HTTP, OpenURI and Resolv are now bundled from
+pinned sources, along with net/ftp and resolv-replace. The selected upstream
+network tests and independent DNS/TLS peers run on macOS and Linux. The
+Win32Config file discovers zero tests on those references and is not counted
+as passing. See `network-stdlib-plan.json` for platform skips and coverage.
+Wasm supports URI and DNS/IP value codecs, without socket/DNS transport or
+native TLS. Nonzero asynchronous Timeout explicitly raises NotImplementedError
+on its non-suspending target; zero/nil blocks work. The actual browser host
+reserves 512 MiB for the expanded runtime and network value checks.
 
 Native handles are typed, generation-checked and owned by Ruby objects.
 GC releases native resources directly. Worker threads run OpenSSL operations

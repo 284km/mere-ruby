@@ -47,6 +47,8 @@ def main():
             result['loaded']=result['exit']==0 and result['limit'] is None and report==('OK   '+gem)
             result['report']=report or '\n'.join(lines[-3:])
             row[mode]=result
+        current_specs={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((args.gem_home/'specifications').glob('*.gemspec'))}
+        assert current_specs==specs,'installed gem manifest changed during measurement; discard this run'
         row['classification']='reference-unavailable' if not row['reference']['loaded'] else 'eligible'
         rows.append(row)
         print(gem,*(mode+':'+('OK' if row[mode]['loaded'] else 'FAIL') for mode in ('reference','bundled','external')),flush=True)

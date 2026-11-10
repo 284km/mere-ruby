@@ -1,5 +1,5 @@
-# Diagnostic for the next core task; not part of the passing OpenSSL selection.
-# Ruby 4.0.9 prints ["example:1"]. mere-ruby currently raises NoMethodError.
+# Regression for implicit native Exception dispatch from a custom initializer.
+# Both Ruby 4.0.9 and mere-ruby print ["example:1"].
 class GemtestBacktraceError < StandardError
   def initialize
     super('example')

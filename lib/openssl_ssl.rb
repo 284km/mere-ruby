@@ -43,7 +43,7 @@ module OpenSSL
         return value if value.is_a?(Integer)
         name = value.to_s
         name = name.sub(/\ATLS1/, 'TLSv1')
-        {'SSLv2'=>SSL::SSL2_VERSION, 'SSLv3'=>SSL::SSL3_VERSION, 'TLSv1'=>SSL::TLS1_VERSION,
+        {'SSL2'=>SSL::SSL2_VERSION, 'SSL3'=>SSL::SSL3_VERSION, 'SSLv2'=>SSL::SSL2_VERSION, 'SSLv3'=>SSL::SSL3_VERSION, 'TLSv1'=>SSL::TLS1_VERSION,
           'TLSv1_1'=>SSL::TLS1_1_VERSION, 'TLSv1_2'=>SSL::TLS1_2_VERSION, 'TLSv1_3'=>SSL::TLS1_3_VERSION}.fetch(name) {
           raise ArgumentError, "unrecognized version #{value.inspect}"
         }

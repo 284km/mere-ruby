@@ -305,8 +305,8 @@ RUBYLIB=/path/to/ruby/lib/ruby/3.2.0 ./mere-ruby script.rb
 ```
 
 Pointed at a CRuby installation's stdlib, mere-ruby runs a good deal of
-it directly — `fileutils` and `uri` parse and load, and `URI.parse`,
-`URI.join` and `URI.encode_www_form` answer exactly as ruby 4.0.6 does.
+it directly. `fileutils` and `uri` also ship embedded; `URI.parse`,
+`URI.join` and `URI.encode_www_form` follow the pinned Ruby 4.0.9 source.
 ⚠ MEASURED 2026-09-20, and two of the three names this sentence used to carry
 were wrong in opposite directions. `uri` did NOT load: a constant defined in a
 `class << self` body could not be read from that same body (`uri/common.rb`
@@ -372,14 +372,19 @@ Installed gem libraries are available in both modes; this does not mean every
 stdlib dependency is bundled. See `gemtest/latest.json` and
 `gemtest/README.md` for reproducible, bounded measurements.
 
-Real local HTTPS succeeds with explicit trust using the native SSLSocket and
-external Net::HTTP, including rejection of an untrusted certificate and a
-wrong hostname. Without external stdlib, `require "net/http"` fails. The next
-stdlib work is `uri` and `timeout`, followed by `net/protocol`, `net/http`,
-then `open-uri` and `resolv`. These are identified gaps, separate from the
-completed OpenSSL implementation. Excon also completes trusted HTTPS; its
-error-wrapping path exposes an implicit `Exception#set_backtrace` dispatch gap
-recorded in `gemtest/https_latest.json`.
+Real local HTTPS succeeds with explicit trust using native SSLSocket and
+bundled Net::HTTP, including rejection of an untrusted certificate and a wrong
+hostname. URI, Timeout, Net::Protocol, Net::HTTP, OpenURI and Resolv are bundled
+from pinned, licensed sources; `net/ftp` and `resolv-replace` ship with them.
+No external stdlib path is needed. Excon also passes all three TLS outcomes
+under the reference and both native modes; implicit native exception dispatch
+and the controlled localhost/IPv4 measurement are covered by regressions.
+See `network-stdlib-plan.json` and `gemtest/https_latest.json` for exact scope.
+
+The Wasm playground supports URI and DNS/IP codecs. Its host reserves 512 MiB
+for the expanded libraries. Zero/nil Timeout blocks work; nonzero asynchronous
+deadlines explicitly raise `NotImplementedError` on this target. Native socket,
+DNS transport and OpenSSL operations remain native capabilities.
 
 `json` is answered by the interpreter (json 2.18's own Ruby files, and its
 C parser and generator in Mere), which is what moved three of them.

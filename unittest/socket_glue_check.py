@@ -31,7 +31,18 @@ with tempfile.TemporaryDirectory() as directory:
     lib.mr_resolve_address.argtypes = [ctypes.c_int, ctypes.c_int]
     lib.mr_resolve_address.restype = ctypes.c_char_p
     lib.mr_connect_start.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    lib.mr_udp_connect.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
     lib.mr_ip_addresses.restype = ctypes.c_char_p
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer:
+        udp.bind(('127.0.0.1', 0))
+        peer.bind(('127.0.0.1', 0))
+        local = udp.getsockname()
+        assert lib.mr_udp_connect(udp.fileno(), b'127.0.0.1', peer.getsockname()[1]) == 0
+        assert udp.getsockname() == local and udp.getpeername() == peer.getsockname()
+        assert lib.mr_udp_connect(udp.fileno(), b'invalid.invalid', 53) == -errno.EINVAL
+        assert udp.getpeername() == peer.getsockname()
+    assert lib.mr_udp_connect(-1, b'127.0.0.1', 53) == -errno.EBADF
 
     job = lib.mr_resolve_start(b'localhost', 80, 4, 0, 0)
     assert job > 0
