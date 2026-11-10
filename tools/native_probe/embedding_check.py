@@ -109,7 +109,7 @@ run('compile', flags + ['-c', output / 'embedding.c', '-o', output / 'embedding.
 archive = output / 'libmere_embedding_probe.a'
 run('archive', ['ar', 'rcs', archive, output / 'embedding.o'])
 run('link', flags + ['-I', output, FIXTURES / 'embedding_host.c', archive,
-    ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', ROOT / 'tools/process_glue.c', ROOT / 'tools/openssl_glue.c', prism, '-pthread', *link_flags, *openssl_ldflags, '-o', output / 'host'])
+    ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', ROOT / 'tools/math_glue.c', ROOT / 'tools/process_glue.c', ROOT / 'tools/openssl_glue.c', prism, '-pthread', *link_flags, *openssl_ldflags, '-o', output / 'host'])
 expected = {
     'lifecycle': 'between_evals\nstate_preserved\nbefore_cleanup\nend_hook\nnested_hook\ncleanup_hook\nhost_survived\n',
     'cleanup-error': 'before_cleanup\nfirst_hook\nlast_hook\nhost_survived\n',
@@ -138,7 +138,7 @@ if args.reference_prefix and not args.setup_failure and not args.cleanup_failure
         FIXTURES / 'embedding_reference.c', '-L' + config['libdir'],
         *shlex.split(config['LIBRUBYARG_SHARED']), '-o', output / 'reference'])
     assert run('reference', [output / 'reference']) == expected['lifecycle']
-paths = [compiler, prism, Path(__file__).with_name('native_build_flags.py'), ROOT / 'tools/openssl_glue.c', *ROOT.glob('*.mere'), *FIXTURES.glob('embedding*'),
+paths = [compiler, prism, Path(__file__).with_name('native_build_flags.py'), ROOT / 'tools/openssl_glue.c', ROOT / 'tools/math_glue.c', *ROOT.glob('*.mere'), *FIXTURES.glob('embedding*'),
          api, output / 'embedding.c', output / 'embedding.h', archive, output / 'host']
 (output / 'sha256.json').write_text(json.dumps({str(p): hashlib.sha256(p.read_bytes()).hexdigest()
     for p in paths if p.is_file()}, indent=2) + '\n')
