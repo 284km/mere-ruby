@@ -15,6 +15,10 @@ byte-identical to ruby 4.0.9 — every `core` and `language` file the suite has,
 plus the libraries this ships — see
 [Conformance](#conformance-rubyspec) for what that covers and what it does not.
 
+Native builds require Mere **0.1.723 or later** for candidate string-root
+scanning during anonymous Class/Module metadata collection. CI pins the
+[0.1.723 compiler source](https://github.com/merelang/mere/tree/2c96a1721d35c878d2baf1b7661a7404ab4a08f1).
+
 ```sh
 ./tools/build.sh            # or, by hand, the line below
 ./tools/build.sh --fast     # -O1: faster to build than -O2, slower to run (-O0 cannot run the prelude).
