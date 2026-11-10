@@ -81,21 +81,32 @@ call read "mere-ruby: (ruby exception raised) (StandardError)".) What the
 startup and every write ask -- getpid, the signal setup, the rlimit table,
 the errno of a refused write -- is asked once and answered empty instead.
 
-## IO#timeout still does not bound every write
+## IO#timeout bounds descriptor reads and writes
 
-`r.timeout = 0.1` is kept, answered, and carried by `#dup`. Descriptor-backed
-buffered reads (`read`, `gets`, `getc`, `getbyte`, and their shared readers) and
-socket accept/receive readiness waits raise `IO::TimeoutError` when the wait
-expires. Explicit `wait_readable`/`wait_writable` use the stream timeout when
-no timeout is supplied and retain their nil-on-timeout behavior.
+`IO#timeout` validates the pinned Ruby 4.0.9 time-interval protocol and keeps
+the original value, including custom `divmod` objects. Duplication copies that
+value. Descriptor-backed buffered reads, writes, `syswrite`, `flush`, and
+readiness waits apply it; explicit readiness waits still return nil on timeout.
+A direct write timeout discards its unsent call-local bytes. A buffered flush
+or close timeout retains pending bytes and leaves the stream open for a retry.
+`sync=` changes the mode without implicitly flushing, and `syswrite` writes raw
+bytes without first flushing the pending stream buffer.
 
-The write-buffer flush loop and direct writes still do not apply the stream
-timeout. This is not a complete implementation of Ruby's timeout contract;
-regular File operations and scheduler-specific I/O paths also need separate
-coverage.
+The independent write gate stalls TCP, verified TLS, HTTP and HTTPS receivers,
+checks partial progress, interrupted/closed waiters, inherited blocking pipes
+without changing their real descriptor flags, and 20/200 cleanup cycles.
+Scheduler `io_write` receives minimum 0; its readiness hook receives the default
+nil timeout as Ruby does, and the scheduler owns that I/O policy. A false
+readiness result raises TimeoutError; nil/zero retain their errno behavior.
 
+Readiness deadlines do not preempt an arbitrary blocking kernel syscall.
+The reference Ruby itself exceeds an outer 2-second bound for a partially writable,
+inherited blocking pipe with a 65536-byte `syswrite`; regular file operations
+also have this kernel boundary. No stronger preemption is claimed here.
 `readpartial` and `sysread` retain their unlimited raw-read behavior, matching
 Ruby 4.0.9's `io_getpartial` and `rb_io_sysread` paths.
+
+See `io-deadlines-plan.json` and `unittest/io_write_timeout_check.py`.
 
 ## A child a signal killed is told from an exit code by its number
 

@@ -363,14 +363,15 @@ an exception that kept neither class nor message, `rescue *[]` swallowing
 everything, an `ensure` body consuming the exception it ran under, and
 `File.open` refusing the `Pathname` bundler writes the lockfile through.
 
-Against the existing sample of 29 installed gems, the pinned Ruby 4.0.9
-reference loads **23**. On 2026-11-10, mere-ruby loads all **23** both with
-its bundled libraries and with an external CRuby stdlib on `-I`. Six gems are
-excluded because the reference cannot load them in this gem home (Rails
-application setup or unavailable native dependencies). No run timed out.
-Installed gem libraries are available in both modes; this does not mean every
-stdlib dependency is bundled. See `gemtest/latest.json` and
-`gemtest/README.md` for reproducible, bounded measurements.
+Against the unchanged sample of 29 gems, an isolated snapshot of 278 packages
+is fixed by archive and source-tree hashes. The pinned Ruby 4.0.9 reference
+loads **22**; on 2026-11-10 mere-ruby loads all **22** with bundled libraries
+and with an external CRuby stdlib on `-I`. Six cases need Rails setup or native
+dependencies unavailable to the reference; private sidekiq-pro 7.2.0 sources
+are unavailable and remain a separate exclusion. No run timed out. This is a
+require-only measurement, with installed gem libraries available in both modes.
+See `gemtest/latest.json` and `gemtest/README.md` for locked restoration,
+source-drift detection and bounded measurements.
 
 Real local HTTPS succeeds with explicit trust using native SSLSocket and
 bundled Net::HTTP, including rejection of an untrusted certificate and a wrong

@@ -22,11 +22,13 @@ p k.encode("EUC-JP").bytes, "\x8F\xB0\xA1".force_encoding("EUC-JP").encode("UTF-
 # CP51932's half-width bytes past the katakana go through to CP50220 as themselves
 p "\x8E\xA1\x8E\xFE".force_encoding("cp51932").encode("cp50220").b, "\x8E\xA1\x8E\xFE".force_encoding("cp51932").encode("cp50221").b
 
-# a path in another encoding names the file by its UTF-8 name
+# Darwin transcodes a path; Linux keeps its raw bytes.
 require "tmpdir"
 Dir.mktmpdir do |d|
   f = File.join(d, [0x3042].pack("U"))
   File.write(f, "x")
   e = File.join(d, "\xA4\xA2".force_encoding("euc-jp"))
-  p File.stat(e).size, File.exist?(f)
+  linux = RUBY_PLATFORM.include?("linux")
+  File.write(e, "xx") if linux
+  p File.stat(e).size == (linux ? 2 : 1), File.exist?(f)
 end

@@ -58,7 +58,11 @@ class TinyScheduler
       due = @waiting.select { |_, d| d && d <= now }.keys
       due.each { |f| @waiting.delete(f); f.resume if f.alive? }
       if @ready.empty? && !@waiting.empty? && @waiting.values.all?(&:nil?)
-        break
+        # A Thread#value waiter can still be unblocked by the worker thread.
+        # Give it a scheduling point; leaving now silently abandons that fiber.
+        deadline = now + 1
+        Thread.pass while @ready.empty? && now < deadline
+        raise 'worker failed to unblock scheduler' if @ready.empty?
       end
     end
   end
