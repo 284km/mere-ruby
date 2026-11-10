@@ -3209,3 +3209,107 @@ witness.
   library/etc/getgrgid was DIFF in both sweeps and MATCH alone each time (the
   load flake of (26)), and is recorded as MATCH. After the rebase: corpus
   582/582 both ways and the gates again.
+
+## 2026-11-10 (28): the runtime round -- a pty and a terminal's settings, a child with a controlling terminal, fstat, a peer's ids, descriptors over a socket, connect(2) on a socket that exists, the interface list, a stdout its parent made non-blocking, the title
+
+Round 12 of note 537: what needed the runtime, which Mere v0.1.724
+(merelang/mere#64) and v0.1.725 (#65, sendmsg's destination) now have as
+general host calls -- the structs kept in the runtime and crossing as text,
+as sock_getopt does -- and memu 7564b42 answers fstat on RISC-V. corpus/561
+is the witness. mere >= 0.1.725.
+
+- **PTY** (lib/pty_ext.rb, over pty_open): PTY.open is [master IO, slave
+  File], the slave 0600 as pty.c's no_mesg leaves it, both closed after a
+  block; PTY.spawn / getpty run the command with the slave by path as 0, 1 and
+  2 in a NEW SESSION whose controlling terminal it is (Process.spawn's
+  internal __pty_session: proc_spawn's group -2), [read File, write File,
+  pid], the child detached after a block; PTY.check (nil while it runs, the
+  status, ChildExited with raise). The master is closed in the child (holding
+  it there, the slave never hangs up and `cat` never ends -- ruby's master is
+  close-on-exec), and both ends are non-blocking as IO.pipe's are, so a read
+  that would block waits in the readiness loop and other threads run.
+  test_pty 0 -> 15/15.
+- **The controlling terminal was the runtime's to give, and posix_spawn
+  cannot**: Darwin applies the file actions BEFORE POSIX_SPAWN_SETSID, so the
+  slave was opened by a process that led no session yet, and the child had a
+  session and no terminal (/dev/tty ENXIO). Mere's group -2 forks, calls
+  setsid, applies the actions and TIOCSCTTY, then execs (pty.c's order). The
+  first probe passed anyway: its child was a shell, which takes a terminal on
+  its own. The probe's child is stty reading /dev/tty now.
+- **io/console** (lib/io_console_ext.rb, over tty_attrs / tty_set_attrs /
+  tty_winsize / tty_set_winsize / tty_flush, the termios bits the platform's):
+  raw / raw! (console.c's set_rawmode: cfmakeraw less ECHOE|ECHOK, min / time
+  / intr), cooked / cooked!, echo= / echo? / noecho, getch (a character in the
+  stream's buffer first, IO.select's wait otherwise), getpass, winsize /
+  winsize= (2 or 4), iflush / oflush / ioflush, cursor (the "\e[6n" report)
+  and the cursor movements, beep, IO.console (/dev/tty, kept, :close, a
+  Symbol sent to it). io/console/size (ruby's own file). Under intr: the
+  terminal's interrupt key is SIGINT, which this interpreter catches only when
+  trapped, so for the block ruby's default handler is the trap (Interrupt,
+  message ""), unless the program set one. IO.console's descriptor is
+  non-blocking too: a blocking read held the signal off. io/console 3 ->
+  27/27 (the 24 that need PTY ran for the first time).
+- **expect** (ruby's own expect.rb). library/expect CRASH -> MATCH.
+- **fstat** (file_fstat): File#size and File#stat ask the descriptor. A File
+  here is a path and a buffer whose descriptor is opened when asked
+  (file_fd_of), so deleting a path first gives the Files open on it their
+  descriptor (file_open_paths, file_hold_open) -- after the delete there is no
+  name to open. core/file/size and stat DIFF -> MATCH.
+- **Sockets**: getpeereid over sock_peer_ids, and no getpeereid on an
+  IPSocket (ruby undefines it); sendmsg / recvmsg with control messages
+  (sock_sendmsg / sock_recvmsg): SCM_RIGHTS descriptors become IOs with
+  scm_rights: true and are closed without it (rsock_discard_cmsg_resource),
+  UNIXSocket#send_io / recv_io (klass, mode, nil for the number); a stream's
+  recvmsg names an empty-sockaddr sender (AF_UNSPEC) and is nil at the end;
+  a UDP recvmsg carries SO_TIMESTAMP, and AncillaryData#timestamp and its
+  inspect name the level, the type, the descriptors and the time.
+  connect(2) on the socket that exists (sock_connect): UDPSocket#connect kept
+  its family no longer (udp_open made an IPv6 socket for an AF_INET one),
+  Socket#connect waits under the IO's timeout (IO::TimeoutError),
+  connect_nonblock is EINPROGRESS / EISCONN as rsock_connect_nonblock says
+  them, and a socket bound to a port first connects from it (Addrinfo
+  #connect_from / connect_to were NotImplementedError). Socket.getifaddrs
+  (sock_ifaddrs) and Socket::Ifaddr; a scoped address is named by its
+  interface (fe80::1%lo0). sendmsg to an address with control data (a UDP
+  server's IP_PKTINFO reply: test_socket's test_udp_server, which getifaddrs'
+  NotImplementedError used to omit). BasicSocket.for_fd asks SO_TYPE; Socket.pair's
+  unknown family / type is SocketError; Socket.gethostbyname /
+  gethostbyaddr (deprecated, warned under Warning[:deprecated]).
+- **A stdout its parent made non-blocking** (ruby's IO.pipe makes both ends
+  so; a child of Open3.capture3 inherits them): Mere's print_no_nl /
+  print_err now wait on EAGAIN, and STDERR.print here (err_raw) writes all of
+  a string with the same wait (fd_put_wait). test_open3's capture3_flip.
+- **SIGPIPE**: Signal.trap('PIPE', 'SYSTEM_DEFAULT') is the OS's action, and
+  IO.pipe no longer puts the do-nothing handler back over a trap the program
+  set; PIPE's DEFAULT is ignore again. core/signal/trap.
+- **$0**: Mere's proc_set_title measured the area from the last title, so
+  after a short one every later title was cut to its length.
+  language/predefined's "actually sets the program name".
+- A read into a buffer keeps the buffer's encoding (io_read with a length).
+- **A bare `mere-ruby` on a terminal reads its program from it**, as ruby
+  does (it printed the usage line there), and a terminal's ^D is not the
+  last word: the next read waits for more. test_rubyoptions'
+  test_script_from_stdin, which PTY now lets run.
+- **Left** (with the reason): IO::Buffer's SHARED mapping across fork (a
+  buffer here is a String; sharing it needs the class's storage to live in
+  shared memory); callcc that re-enters (a continuation here can only escape:
+  re-entering needs the interpreter's stack copied, test_array's 16
+  *_with_callcc); a UNIX datagram socket made by for_fd under recvfrom; the
+  short netmask BSD hands over is shown as the mask it means
+  (255.0.0.0), where ruby shows the 5 bytes; gethostbyaddr's two IPv6
+  examples; irb (not shipped); ancillary data to a non-IP address
+  (NotImplementedError). #76's bound-UDP connect (Socket.__udp_connect, in
+  the glue) and sock_connect now do the same thing two ways; they are left as
+  they are, the bound path being #76's.
+- **Checked**: rebased onto #76 (the network stdlib) and checked there: corpus
+  588/588 with the hash index on and off; the 13 gates; corpus/561 under
+  MERE_RUBY_GC_STRESS=50 (round 11's binary cannot load pty). The 247
+  unittest files 9754 -> 9789 (test_pty 15, test_https 19 from #74-#76); two
+  that read RED, test_io_m17n's each_codepoint_need_more and test_object_id's
+  Ractor race, fail the same with round 11's binary on a rerun (load).
+  test_rubyoptions 65 MATCH, 3 BOTH. The runtime set (test_pty, io/console,
+  test_open3, test/socket, test_io_buffer): MATCH 303 -> 352 of 362, the rest
+  test_shared (left), test_bug_21210 (a skip) and four memory-leak timeouts
+  (stage 4). Mere's three probes on C and LLVM, macOS and the CI's Linux. The
+  spec records: base DIFF 31 -> 26, CRASH 1 -> 0 (expect; core/kernel/open
+  is #76's open-uri); stdlib DIFF 26 -> 11 (CRASH 6, coverage and fiddle).

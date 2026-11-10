@@ -44,7 +44,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/float | 49 | 0 | 0 | 1 | 0 | 50 |
 | core/integer | 67 | 0 | 0 | 0 | 0 | 67 |
-| core/kernel | 99 | 5 | 0 | 13 | 0 | 117 |
+| core/kernel | 100 | 4 | 0 | 13 | 0 | 117 |
 | core/matchdata | 28 | 0 | 0 | 1 | 0 | 29 |
 | core/method | 22 | 0 | 0 | 3 | 0 | 25 |
 | core/mutex | 7 | 0 | 0 | 0 | 0 | 7 |
@@ -88,7 +88,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/time | 63 | 1 | 0 | 2 | 0 | 66 |
 | core/io | 78 | 1 | 0 | 1 | 0 | 80 |
 | library/date | 56 | 0 | 0 | 42 | 0 | 98 |
-| library/etc | 14 | 0 | 0 | 4 | 1 | 19 |
+| library/etc | 15 | 0 | 0 | 4 | 0 | 19 |
 | library/pathname | 19 | 0 | 0 | 0 | 0 | 19 |
 | library/stringio | 63 | 0 | 0 | 1 | 0 | 64 |
 | library/cgi | 7 | 0 | 0 | 7 | 0 | 14 |

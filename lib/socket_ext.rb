@@ -209,10 +209,9 @@ class BasicSocket < IO
     [data, (remote_address rescue nil), 0]
   end
   private :__recvmsg_plain
-  # sendmsg(2) (Mere v0.1.724's sock_sendmsg) with control messages: each a
-  # Socket::AncillaryData or [level, type, data]. A destination with control
-  # data is not implemented (the runtime's sendmsg takes a connected socket);
-  # without control data it is send(2) / sendto(2).
+  # sendmsg(2) (Mere's sock_sendmsg) with control messages: each a
+  # Socket::AncillaryData or [level, type, data], to the destination given or
+  # the connected peer; without control data it is send(2) / sendto(2).
   def sendmsg(mesg, flags = 0, dest = nil, *controls)
     __sendmsg(mesg, flags, dest, controls, false, true)
   end
@@ -231,8 +230,14 @@ class BasicSocket < IO
         raise IO::EAGAINWaitWritable, "sendmsg(2) would block"
       end
     end
-    raise NotImplementedError, "sendmsg(2) to a destination with ancillary data is not implemented" unless dest.nil?
     __check_open
+    # (the destination as the runtime takes it: a numeric "host port")
+    to = ""
+    unless dest.nil?
+      ai = dest.is_a?(Addrinfo) ? dest : Addrinfo.new(IO.__fd_str(dest))
+      raise NotImplementedError, "sendmsg(2) to a non-IP address with ancillary data is not implemented" unless ai.ip?
+      to = "#{ai.ip_address.sub(/%.*\z/, '')} #{ai.ip_port}"
+    end
     ctl = controls.map do |c|
       if c.is_a?(Socket::AncillaryData)
         lv, ty, data = c.level, c.type, c.data
@@ -247,7 +252,8 @@ class BasicSocket < IO
       "#{lv} #{ty} #{data.unpack1('H*')}"
     end.join("\n")
     flush if respond_to?(:flush)
-    r = Socket.__sendmsg(@__io_fd, IO.__fd_str(mesg).b, fl, ctl)
+    r = Socket.__sendmsg(@__io_fd, IO.__fd_str(mesg).b, fl, to, ctl)
+    raise Errno::EAFNOSUPPORT, "sendmsg(2)" if r.nil?
     if r < 0
       if nonblock && IO.__again?(r)
         return :wait_writable unless exception
