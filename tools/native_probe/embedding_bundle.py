@@ -28,6 +28,8 @@ provenance_path = generated / 'build-provenance.json'
 provenance = json.loads(provenance_path.read_text()) if provenance_path.is_file() else None
 if provenance and provenance.get('setup_failure_injected'):
     parser.error('the setup-failure fixture cannot be packaged as an embedding library')
+if provenance and provenance.get('cleanup_failure_injected'):
+    parser.error('the cleanup-failure fixture cannot be packaged as an embedding library')
 for path in [generated / 'embedding.o', generated / 'embedding.h', prism]:
     if not path.is_file():
         parser.error(f'missing input: {path}')

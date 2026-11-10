@@ -34,7 +34,10 @@ parser.add_argument('--prism-lib', type=Path, default=ROOT / 'vendor/prism/obj/l
 parser.add_argument('--reference-prefix', type=Path)
 parser.add_argument('--setup-failure', action='store_true',
                     help='Inject an initialization failure into a separate test fixture')
+parser.add_argument('--cleanup-failure', action='store_true',
+                    help='Inject a scheduler teardown failure into a separate test fixture')
 args = parser.parse_args()
+assert not (args.setup_failure and args.cleanup_failure)
 output = args.output.resolve()
 output.mkdir(parents=True, exist_ok=False)
 compiler, prism = args.compiler.resolve(), args.prism_lib.resolve()
@@ -72,6 +75,13 @@ if args.setup_failure:
     assert original.count(call) == 1
     api = output / 'embedding_api_failure.mere'
     api.write_text(original.replace(call, 'fail "injected setup failure"'))
+if args.cleanup_failure:
+    original = api.read_text()
+    call = 'sch_terminate_all world'
+    assert original.count(call) == 2
+    api = output / 'embedding_api_failure.mere'
+    api.write_text(original.replace(call,
+        '(let _ = sch_terminate_all world in fail "injected cleanup failure")'))
 (output / 'embedding.mere').write_text(
     'import "embedding_core.mere";\nimport "' + str(api) + '";\n'
     'let setup = fn () -> vm_setup ();\n'
@@ -105,20 +115,21 @@ expected = {
     'cleanup-error': 'before_cleanup\nfirst_hook\nlast_hook\nhost_survived\n',
     'cleanup-exit': 'cleanup_hook\nhost_survived\n',
 }
-for mode, text in ({} if args.setup_failure else expected).items():
+for mode, text in ({} if args.setup_failure or args.cleanup_failure else expected).items():
     assert run(mode, [output / 'host', mode]) == text
-for mode in (['setup-failure'] if args.setup_failure else ['pending-runtime', 'pending-exit', 'handled-runtime',
+for mode in (['setup-failure'] if args.setup_failure else ['native-ownership-failure'] if args.cleanup_failure else ['pending-runtime', 'pending-exit', 'handled-runtime',
              'pending-runtime-hook-exit', 'pending-exit-hook-error',
              'pending-exit-hook-exit', 'hooks-exit-then-error',
              'hooks-error-then-exit', 'pending-runtime-normal-hook',
              'runtime-status-ivar', 'exit-subclass', 'persistent-locals',
              'bad-inspect-pending', 'bad-inspect-clear', 'bad-inspect-hook',
              'primitive-pending', 'locals-after-error', 'local-call-before-assignment', 'method-gc',
-             'object-message', 'object-spoof-message', 'object-hook-message']):
+             'object-message', 'object-spoof-message', 'object-hook-message',
+             'native-ownership', 'native-ownership-error', 'native-ownership-hook-error', 'native-ownership-exit']):
     text = run(mode, [output / 'host', mode])
     if mode == 'bad-inspect-hook':
         assert text == 'after_bad_inspect\nprotected_reporting_passed\n'
-if args.reference_prefix and not args.setup_failure:
+if args.reference_prefix and not args.setup_failure and not args.cleanup_failure:
     ruby = args.reference_prefix.resolve() / 'bin/ruby'
     config = json.loads(subprocess.check_output([str(ruby), '-rjson', '-rrbconfig', '-e',
         'puts JSON.generate(RbConfig::CONFIG.slice("rubyhdrdir", "rubyarchhdrdir", "libdir", "LIBRUBYARG_SHARED"))'], text=True))
@@ -138,6 +149,7 @@ def revision(directory):
 (output / 'build-provenance.json').write_text(json.dumps({
     'schema': 1,
     'setup_failure_injected': args.setup_failure,
+    'cleanup_failure_injected': args.cleanup_failure,
     'source_revision': revision(ROOT),
     'compiler_revision': revision(compiler.parent),
     'compiler_sha256': hashlib.sha256(compiler.read_bytes()).hexdigest(),
