@@ -83,4 +83,14 @@ module Zlib
       n
     end
   end
+
+  # ruby's are module functions (rb_define_module_function): each is a
+  # private instance method too, for a class that includes Zlib
+  def zlib_version = Zlib.zlib_version
+  def crc32(...) = Zlib.crc32(...)
+  def adler32(...) = Zlib.adler32(...)
+  def adler32_combine(...) = Zlib.adler32_combine(...)
+  def crc32_combine(...) = Zlib.crc32_combine(...)
+  def crc_table = Zlib.crc_table
+  private :zlib_version, :crc32, :adler32, :adler32_combine, :crc32_combine, :crc_table
 end

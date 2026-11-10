@@ -3367,3 +3367,123 @@ corpus/576 is the witness. No Mere change.
   test_rubyoptions' script_from_stdin). test_compile_prism 182/182. The spec
   records: base DIFF 26 -> 20 (marshal x3, time/dup, kdf x2), CRASH 0;
   stdlib DIFF 11 -> 10 (basicsocket's write_nonblock), CRASH 6.
+
+## 2026-11-11 (30): callcc goes back in -- a continuation taken inside an Array method that refuses re-entry, called after the method returned
+
+Round 14 of note 541. corpus/577 is the witness. No Mere change: the stack
+copy (Mere's `cont_capture` / `cont_resume`) is for later, behind the same
+Ruby API (note 541 §2).
+
+- **The shape**: a `callcc` taken inside an Array method whose C refuses to
+  be re-entered -- permutation, product, combination, repeated_permutation,
+  repeated_combination, sort / sort! with a block, and #to_ary asked by
+  flatten -- and called after that method returned, while the method frame
+  that called it still runs. ruby goes back into the block, its C notices it
+  is finished and raises "permute reentered" (and so on) at the call, the
+  frame's own `rescue` gets it, and the frame carries on with its locals as
+  they are now -- test_array's *_with_callcc count a local down 1000 times.
+- **Here**: while `require "continuation"` is loaded (cont_on), each call of
+  such a method is a guard for as long as it runs (cont_guarded, at the doors
+  the builtins come through: dispatch_prim, builtin_iter, and invoke_val_c /
+  invoke_with_block for flatten and sort with a block): its message, the
+  nearest live method frame below it, the line of the call. callcc keeps the
+  innermost one. Continuation#call after its callcc returned unwinds to that
+  frame with a flow signal no rescue sees ("contre", as a return's), the
+  frame runs its body again from the top-level statement holding the line
+  (cont_from_line: the last SLine at or before it), and the same method,
+  called from that frame, raises the guard's RuntimeError instead of running.
+  `require "continuation"` warns as ruby's continuation.so does.
+- **Different from ruby** (KNOWN_GAPS): what the block had left to run after
+  the callcc is not run again, and the statement holding the call is run
+  from its start. Every other re-entry -- reject's two tests (they go back
+  into reject's own loop), a continuation whose frame has returned -- still
+  raises NotImplementedError by name.
+- test_array 16 -> 4 RED (reject x2, and test_shared_marking x2, stage 9).
+
+## 2026-11-11 (31): what needed Mere v0.1.726 -- IO::Buffer's shared memory across fork, fpathconf, a datagram to a path
+
+Round 15 of note 541. merelang/mere#67 (v0.1.726) adds `mmap_anon` and its
+handle-checked byte calls, `sock_unix_sendto` and `fd_pathconf` (by name, with
+`fd_pathconf_var` / `fd_pathconf_names`), general host calls; and
+sock_recvfrom names an unbound AF_UNIX sender "unix 0 " on Linux too.
+corpus/578 is the witness. mere >= 0.1.726.
+
+- **IO::Buffer MAPPED | SHARED** is a shared anonymous mapping (@__h): @s is
+  a copy __raw reads again and __store writes through, so a forked child's
+  set_string is what the parent's get_string reads. free / transfer /
+  initialize_copy / resize keep track of the handle; a resize that
+  reallocates (not Linux within its pages, #77's mremap rule) leaves the
+  memory the process's own -- shared? false, as ruby has it (it said true
+  before) -- and one Linux keeps in place is a new shared mapping of the new
+  size. test_io_buffer's test_shared.
+- **IO#pathconf and Etc::PC_*** by the host's own names and numbers; nil for
+  no limit, Errno for a refusal. test_etc's test_pathconf.
+- **Socket#send to a sockaddr_un / Addrinfo.unix** (Socket.__unix_sendto),
+  and UNIXSocket#recvfrom of a datagram names its sender (the path, "" for an
+  unbound one) instead of always "". library/socket/unixsocket/recvfrom.
+
+## 2026-11-11 (32): what the parse knows and the runtime did not -- a scope's later locals, a heredoc interpolation's line; the first thread's turn, import_methods' refusals, a Hash's own #each, WeakKeyMap's million stores
+
+Round 16 of note 541. corpus/579 is the witness.
+
+- **binding.local_variables lists a scope's locals from where it begins**, as
+  ruby's parse-time table has them (`binding.local_variables; a = 1` is
+  [:a]). A source that names `binding` (lex_src looks for the word) puts a
+  mark at the head of its block and def bodies -- after a block's parameter
+  defaults (lvd_head), and after the opening-line and file markers a block's
+  readers look for first (a lambda's source_location read the mark and said
+  the line of `->`, corpus/397) -- and run_stmts turns it into the names the rest of
+  the body assigns (env "__lvdecl", deep_targets). The scope that has them
+  lists its parameters first and then them, in the body's order (the env's
+  own order is a hash's, and adding the key reordered it). The prelude's
+  sources get no mark; a source without the word pays nothing. Not done:
+  ruby lists the OUTER scopes' later locals too (the main script's).
+  core/binding.
+- **An interpolation in a heredoc's body runs at its own line**: the body is
+  lexed apart, at the line of `<<ID`, so a `#{}` there names how many lines
+  below it is (`(__hdline d) && __hdpop((code))`); the parser makes it a line
+  from tok_line, and __hdpop puts the statement's line back once the value is
+  made. language/heredoc. (The flag saying a heredoc's body is being lexed
+  is cleared at each lex_src: a lex that failed inside one left it set, and
+  test_syntax's invalid_break / invalid_next read the next source wrong.)
+- **The first Thread.new returns before the thread begins**: the scheduler's
+  slice count started at 0, so the statement keeping what Thread.new
+  answered handed over first, and a thread with nothing to do had begun and
+  ended (its :thread_begin hook saw no Thread to compare) before the program
+  had it. The first thread made sets a whole slice. core/tracepoint/inspect.
+  That moved test_deadlock_backtrace's deadlock into the other thread, where
+  the builtin register (bi_reg) a fiber switch did not keep came back as the
+  wrong one: fb_ctx_save / fb_ctx_restore keep it now (bit 41).
+- **Refinement#import_methods refuses what is not Ruby code**: a method with
+  no source file (the prelude's), one a library standing in for a C extension
+  defines (zlib, continuation, etc, stringio, strscan, io/nonblock, io/wait,
+  pty, nkf, fcntl, coverage, objspace -- the wholly-C ones), and a
+  define_method's. Zlib's module functions are private instance methods too
+  (rb_define_module_function). core/refinement/import_methods. Comparable
+  lists no instance methods here, so importing it is not refused.
+- **A Hash with a singleton #each goes through it** for what Enumerable gives
+  a Hash (map, flat_map, count, min_by ...), with a block or without, and not
+  for what Hash answers itself (select, reject, any?, to_a, include? ...).
+- **ObjectSpace::WeakKeyMap#[]= with no Ruby frame** while it is the
+  prelude's (invoke: wkm_aset, the same store `h[k] = v` makes): Bug #20691's
+  million stores went 18 s -> under 8 s, inside assert_normal_exit's 10.
+  test_weakkeymap's test_clear_bug_20691.
+- **Checked** (rounds 14 to 16 together, on Mere v0.1.726): corpus 596/596
+  with the hash index on and off; the 13 gates and #77's gc_roots_check;
+  corpus/577 to 579 under MERE_RUBY_GC_STRESS=50. The 247 unittest files plus
+  test_compile_prism, test_etc and test_weakkeymap: MATCH 10002 -> 10007 over
+  round 13's run (callcc x14, test_shared, pathconf, test_clear_bug_20691),
+  and nothing RED that was not RED after round 13 (test_syntax, test_thread,
+  test_fiber and test_backtrace read as before). The spec records: base DIFF
+  20 -> 16 (binding/local_variables, refinement/import_methods,
+  tracepoint/inspect, language/heredoc), CRASH 0; stdlib DIFF 10 -> 9
+  (unixsocket/recvfrom), CRASH 6. library/etc/getgrgid reads SLOW or DIFF
+  under load on main's binary as well (six at once); its record is kept.
+- **After the push**: CI's embedding stress check (#77) read allocation
+  growth with the number of evaluations (scalar 1,000 -> 100,000: 34.5 MB ->
+  36.1 MB in the default region). The driver set lvd_st "main" before each
+  main-script parse and deleted it after, and a key deleted and set again is
+  copied into the default region each time. The flags keep their keys and say
+  0 / 1 (flag_on), and the heredoc line stack keeps its depth under key -1
+  and overwrites its slots. Flat at 34,477,920 for 1,000 to 100,000; corpus
+  596/596, the gates, test_syntax as before.

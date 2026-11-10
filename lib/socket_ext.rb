@@ -412,6 +412,16 @@ class BasicSocket < IO
         # sendto(2): to the address given (an Addrinfo or a packed sockaddr)
         raise ArgumentError, "wrong number of arguments (given #{dest.size + 2}, expected 2..3)" if dest.size > 1
         ai = dest[0].is_a?(Addrinfo) ? dest[0] : Addrinfo.new(IO.__fd_str(dest[0]))
+        # (to a path: a sockaddr_un, sendto(2) through Mere's sock_unix_sendto)
+        if ai.unix?
+          loop do
+            __check_open
+            n = Socket.__unix_sendto(@__io_fd, IO.__fd_str(data), flags.to_i, ai.unix_path)
+            return n if n >= 0
+            IO.__fd_raise(n, "sendto(2)") unless IO.__again?(n) && (flags.to_i & Socket::MSG_DONTWAIT) == 0
+            IO.__sel_wait([[@__io_fd, 2, self]], -1)
+          end
+        end
         loop do
           __check_open
           n = Socket.__udp_sendto(@__io_fd, IO.__fd_str(data), flags.to_i, ai.ip_address, ai.ip_port)
@@ -944,6 +954,14 @@ class UNIXSocket < BasicSocket
     ["AF_UNIX", __unix_path_of(t)]
   end
   def recvfrom(maxlen, flags = 0, outbuf = nil)
+    # (a datagram names its sender: the path it is bound to, "" when it is
+    #  not -- the runtime writes "unix 0 <path>", the path last)
+    if @socktype == Socket::SOCK_DGRAM
+      outbuf = __fd_buf!(outbuf)
+      data, addr, = __dgram_take(maxlen, flags, false)
+      data = __fd_into(outbuf, data) if outbuf
+      return [data, ["AF_UNIX", addr.to_s.start_with?("unix ") ? addr.sub(/\Aunix \d+ ?/, "") : ""]]
+    end
     data = recv(maxlen, flags, outbuf)
     [data, ["AF_UNIX", ""]]
   end

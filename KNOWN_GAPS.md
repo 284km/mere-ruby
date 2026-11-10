@@ -485,14 +485,34 @@ as the expression inside. Telling them apart needs a token for `;` of its own,
 which every statement loop would then have to accept; one example of
 test_defined is the cost.
 
-## `callcc` escapes, but a continuation cannot be re-entered
+## `callcc` re-enters only a statement, and only to raise "reentered"
 
 `require "continuation"` gives `callcc` as an escape: calling the continuation
 inside the block, or from code the block calls, returns from `callcc` with the
-value. Calling it after `callcc` has returned -- jumping back into a finished
-frame -- raises NotImplementedError by name. Re-entry needs the stack that was
-left; every use in CRuby's test/ruby (test_hash's iteration-level checks) is
-the escape.
+value.
+
+Calling it after `callcc` has returned works in one shape (note 541 round 14):
+the `callcc` was taken inside an Array method whose C refuses to be re-entered
+(`permutation`, `product`, `combination`, `repeated_permutation`,
+`repeated_combination`, `sort!` / `sort` with a block, or `#to_ary` asked by
+`flatten`), and the method frame that called it is still running. The
+continuation goes back to that frame and runs again the frame's statement that
+holds the call. The call then raises the method's RuntimeError ("permute
+reentered", "sort reentered" ...) where ruby's C would raise it, the frame's
+own `rescue` receives it, and the frame carries on with its locals as they are
+now. Every such test in test_array passes, 14 of 16. Two things differ from
+ruby:
+
+- What the block had left to run after the `callcc` is not run again. In ruby
+  it runs once more before the method notices the re-entry.
+- If the statement holding the call did something before the call, that is
+  done again.
+
+Every other re-entry raises NotImplementedError by name. That includes
+`reject`'s two tests, which must go back inside `reject`'s own loop, and any
+continuation whose frame has returned. Those need the stack that was left:
+Mere's stack copy (`cont_capture` / `cont_resume`, note 541 §2) is to replace
+this implementation, keeping the same Ruby API.
 
 ## Reflection cannot ENUMERATE a builtin class's methods
 
