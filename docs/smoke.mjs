@@ -57,6 +57,7 @@ try { instance.exports.main(); } catch (e) {
   trapError = e;
   if (process.env.SMOKE_DEBUG) console.error(e);
 }
+if (process.env.SMOKE_STATS) console.error(JSON.stringify({heapUsed: instance.exports.__lang_bump.value, memoryBytes: instance.exports.memory.buffer.byteLength}));
 const out = host.getOut();
 process.stdout.write(out);
 if (out === "") {
