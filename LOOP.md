@@ -3479,3 +3479,11 @@ Round 16 of note 541. corpus/579 is the witness.
   tracepoint/inspect, language/heredoc), CRASH 0; stdlib DIFF 10 -> 9
   (unixsocket/recvfrom), CRASH 6. library/etc/getgrgid reads SLOW or DIFF
   under load on main's binary as well (six at once); its record is kept.
+- **After the push**: CI's embedding stress check (#77) read allocation
+  growth with the number of evaluations (scalar 1,000 -> 100,000: 34.5 MB ->
+  36.1 MB in the default region). The driver set lvd_st "main" before each
+  main-script parse and deleted it after, and a key deleted and set again is
+  copied into the default region each time. The flags keep their keys and say
+  0 / 1 (flag_on), and the heredoc line stack keeps its depth under key -1
+  and overwrites its slots. Flat at 34,477,920 for 1,000 to 100,000; corpus
+  596/596, the gates, test_syntax as before.
