@@ -18,6 +18,16 @@ static void check(const char *code, int status, const char *klass) {
  if(cl.len!=(long long)strlen(klass)||memcmp(cl.ptr,klass,(size_t)cl.len)) { fprintf(stderr,"class:%.*s expected:%s source:%s\n",(int)cl.len,cl.ptr,klass,code); exit(92); }
  mere_lib_free((void*)cl.ptr);
 }
+static void diagnostics_equal(const char *expected) {
+ mere_buf diagnostics={0},err={0};
+ mere_status result=mere_embedding_error_diagnostics(&diagnostics,&err); boundary(result,err);
+ size_t length=strlen(expected);
+ if(diagnostics.len!=(long long)length || (length && memcmp(diagnostics.ptr,expected,length))) {
+  fprintf(stderr,"diagnostics:%.*s expected:%s\n",(int)diagnostics.len,diagnostics.ptr,expected);
+  exit(94);
+ }
+ mere_lib_free((void*)diagnostics.ptr);
+}
 static void handled(const char *source, const char *klass) {
  check(source,1,klass);
  /* Inspection leaves the error pending, so another eval must be refused. */
@@ -43,6 +53,22 @@ int main(int argc,char **argv) {
  }
  if(simple(mere_embedding_setup)) return 10;
  if(simple(mere_embedding_setup)) return 11;
+ if(argc>1 && (!strcmp(argv[1],"object-message") || !strcmp(argv[1],"object-spoof-message") || !strcmp(argv[1],"object-hook-message"))) {
+  const char *mode=argv[1];
+  if(!strcmp(mode,"object-hook-message")) {
+   check("at_exit { e = RuntimeError.new('hook_original'); e.instance_variable_set(:@message, 'spoofed'); raise e }",0,"");
+   diagnostics_equal("");
+  } else {
+   check(!strcmp(mode,"object-spoof-message") ?
+     "e = RuntimeError.new('original'); e.instance_variable_set(:@message, 'spoofed'); GC.start; raise e" :
+     "e = RuntimeError.new('original'); GC.start; raise e",1,"RuntimeError");
+   diagnostics_equal("RuntimeError: original\n");
+  }
+  if(simple(mere_embedding_cleanup)!=1 || simple(mere_embedding_cleanup)!=1) return 41;
+  diagnostics_equal(!strcmp(mode,"object-hook-message") ? "RuntimeError: hook_original\n" : "RuntimeError: original\n");
+  check("puts 'must_not_run'",2,"RuntimeError");
+  mere_lib_shutdown(); puts("object_diagnostics_passed"); return 0;
+ }
  if(argc>1 && !strcmp(argv[1],"method-gc")) {
   check("def collect_inside; GC.start; 42; end; raise 'active body lost' unless collect_inside == 42",0,"");
   check("raise 'retained body lost' unless collect_inside == 42; $gc_block = proc { GC.start; 43 }; raise 'active block lost' unless $gc_block.call == 43",0,"");
@@ -85,6 +111,7 @@ int main(int argc,char **argv) {
   } else {
    if(!strcmp(mode,"bad-inspect-pending")) check("at_exit { raise 'identity lost' unless $!.equal?($original) }",0,"");
    check("raise $original",1,"BadInspect");
+   diagnostics_equal("BadInspect: original\n");
    if(!strcmp(mode,"bad-inspect-clear")) {
     if(simple(mere_embedding_clear_error)) return 35;
     check("GC.start; raise 'clear failed' unless $!.nil?; puts 'recovered'",0,"");
@@ -93,6 +120,7 @@ int main(int argc,char **argv) {
   int expected=!strcmp(mode,"bad-inspect-clear") ? 0 : 1;
   if(simple(mere_embedding_cleanup)!=expected || simple(mere_embedding_cleanup)!=expected) return 36;
   check("puts 'must_not_run'",2,!strcmp(mode,"primitive-pending") ? "ArgumentError" : expected ? "BadInspect" : "");
+  if(strcmp(mode,"primitive-pending")) diagnostics_equal(expected ? "BadInspect: original\n" : "");
   if(expected) {
    mere_buf diagnostics={0},err={0};
    mere_status result=mere_embedding_error_diagnostics(&diagnostics,&err); boundary(result,err);

@@ -17,6 +17,11 @@ python3 tools/native_probe/embedding_bundle.py \
   --output build/embedding-bundle
 ```
 
+OpenSSL 3 development headers and libraries are required, as for the native CLI.
+Provider flags come from `OPENSSL_PREFIX`, Homebrew on macOS, or `pkg-config`.
+The archive includes OpenSSL glue; consumers also link the provider libraries
+using the system flags recorded in the manifest.
+
 Use fresh output directories. On Linux, set `ulimit -s 524288` before running
 the generated interpreter. The bundle contains the generated header and a
 static archive including Prism and native glue; consumers need only that
