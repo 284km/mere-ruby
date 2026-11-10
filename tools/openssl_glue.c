@@ -95,7 +95,7 @@ static void free_arg(arg *a) {
     memset(a,0,sizeof(*a));
 }
 static int parse_arg(const unsigned char **p,const unsigned char *end,arg *a,int depth,size_t *nodes) {
-    if (*p==end || depth>64 || ++*nodes>NODE_LIMIT) return 0;
+    if (*p==end || depth>64) return 0;
     a->type=(char)*(*p)++;
     if (a->type=='n'||a->type=='t'||a->type=='f') return 1;
     uint32_t n;
@@ -108,7 +108,10 @@ static int parse_arg(const unsigned char **p,const unsigned char *end,arg *a,int
     }
     if(a->type!='a'&&a->type!='m') return 0;
     if (a->type=='m') a->len*=2;
-    if(a->len>NODE_LIMIT || a->len>(size_t)(end-*p)) return 0;
+    /* Reserve every declared child before allocating: counting only parsed
+     * nodes lets nested malformed arrays allocate the budget at each depth. */
+    if(a->len>NODE_LIMIT-*nodes || a->len>(size_t)(end-*p)) return 0;
+    *nodes+=a->len;
     a->items=calloc(a->len?a->len:1,sizeof(arg));
     if(!a->items) return 0;
     for(size_t i=0;i<a->len;i++) if(!parse_arg(p,end,&a->items[i],depth+1,nodes)) return 0;
@@ -278,7 +281,7 @@ int mr_ossl_clear_result(void) {
 }
 mere_bytes *mr_ossl_call(const char *operation,mere_bytes *input) {
     mr_ossl_clear_result();
-    buffer out={0}; arg args={0}; size_t nodes=0;
+    buffer out={0}; arg args={0}; size_t nodes=1;
     if(!input||input->len<0||input->len>WIRE_LIMIT) {
         error(&out,"ArgumentError","provider request too large");
     } else {

@@ -70,6 +70,8 @@ def unpack(source, position=0):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--prefix', type=Path)
+    parser.add_argument('--source', type=Path, default=ROOT/'tools/openssl_glue.c',
+                        help='adapter source, including a historical negative control')
     args = parser.parse_args()
     flags = []
     if args.prefix:
@@ -79,13 +81,26 @@ def main():
         flags = [f'-I{prefix}/include', f'-L{prefix}/lib', f'-Wl,-rpath,{prefix}/lib']
     with tempfile.TemporaryDirectory(prefix='mr-ossl-provider-') as temp:
         library = Path(temp)/'provider.so'
+        probe = Path(temp)/'probe.c'
+        # Observe the adapter's actual calloc requests without changing the
+        # production decoder or OpenSSL's allocator.
+        probe.write_text('''#include <stdlib.h>
+static unsigned long long requested;
+static void *probe_calloc(size_t n,size_t size) {
+    requested+=(unsigned long long)n*size;
+    return calloc(n,size);
+}
+#define calloc probe_calloc
+''' + '#include "' + str(args.source.resolve()) + '"\n' +
+            'unsigned long long mr_test_allocated(void) { return requested; }\n')
         subprocess.run(['clang', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
-                        str(ROOT/'tools/openssl_glue.c'), *flags, '-pthread', '-lssl', '-lcrypto', '-o', str(library)], check=True)
+                        str(probe), '-I'+str(ROOT/'tools'), *flags, '-pthread', '-lssl', '-lcrypto', '-o', str(library)], check=True)
         lib = ctypes.CDLL(str(library))
         lib.mr_ossl_call.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
         lib.mr_ossl_call.restype = ctypes.c_void_p
         lib.mr_ossl_clear_result.argtypes = []
         lib.mr_ossl_clear_result.restype = ctypes.c_int
+        lib.mr_test_allocated.restype = ctypes.c_ulonglong
 
         def raw(op, wire, declared_size=None):
             request = ctypes.create_string_buffer(struct.pack('q', len(wire) if declared_size is None else declared_size) + wire)
@@ -139,6 +154,15 @@ def main():
             assert raw('version', wire)[0] == 'error', wire[:20]
         assert raw('version', b'', -1)[0] == 'error'
         assert raw('version', b'', 64*1024*1024+1)[0] == 'error'
+        # Each header individually fits the node and remaining-byte limits,
+        # but their declared children exceed the aggregate allocation budget.
+        # Reject before reserving 64 large arrays for this malformed request.
+        nested=b''.join(b'a'+struct.pack('!I',900000-i*5) for i in range(64))+b't'*900000
+        before=lib.mr_test_allocated()
+        assert raw('version',nested)[0]=='error'
+        allocated=lib.mr_test_allocated()-before
+        assert 0<allocated<=64*1024*1024,('nested array allocation exceeded budget',allocated)
+        print('malformed nested wire calloc bytes:',allocated,flush=True)
         assert call('bn.add', b'12\0invalid', 3)[0] == 'error'
         key=call('pkey.generate_key','RSA',{'rsa_keygen_bits':512})
         assert key[:2] == ('handle','OpenSSL::PKey::RSA'),key
