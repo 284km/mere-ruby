@@ -237,3 +237,14 @@ const char *mr_ip_addresses(void) {
     freeifaddrs(addresses);
     return out;
 }
+
+/* Ruby passes MSG_CMSG_CLOEXEC to recvmsg when the host provides it. No
+ * ancillary descriptors are accepted by this layer; mirror the result flag. */
+int mr_recvmsg_flags(int unused) {
+    (void)unused;
+#ifdef MSG_CMSG_CLOEXEC
+    return MSG_CMSG_CLOEXEC;
+#else
+    return 0;
+#endif
+}

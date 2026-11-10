@@ -263,7 +263,9 @@ module OpenSSL
           status, result = __operation(operation, value)
           return [status, result] unless status == 'wait_readable' || status == 'wait_writable'
           timeout = @io.respond_to?(:timeout) ? @io.timeout : nil
-          if timeout
+          unless timeout.nil?
+            timeout = IO.__interval_number(timeout)
+            IO.__timeout_ms(timeout)
             timeout -= Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
             raise IO::TimeoutError, 'execution expired' if timeout <= 0
           end

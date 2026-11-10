@@ -4,6 +4,7 @@
 #   mere -w main.mere            emits WAT (the uniform-i64 Wasm backend,
 #                                Mere v0.1.127+)
 #   wat2wasm --enable-tail-call  assembles it (Mere emits return_call_indirect)
+#   wasm-opt -O1                 coalesces temporaries before the host JIT
 #
 # The page (docs/index.html) fetches the .wasm next to it and drives it with a
 # host that returns the editor's source from read_file "@mere-ruby-playground@"
@@ -18,7 +19,11 @@ root=$(cd "$here/.." && pwd)
 nt=$(sh "$root/tools/nothreads_tree.sh")
 trap 'rm -rf "$nt"' EXIT
 "${MERE:-mere}" -w "$nt/main.mere" > "$here/mere-ruby.wat"
-wat2wasm --enable-tail-call --debug-names "$here/mere-ruby.wat" -o "$here/mere-ruby.wasm"
+wat2wasm --enable-tail-call --debug-names "$here/mere-ruby.wat" -o "$nt/mere-ruby.raw.wasm"
+# The large generated dispatcher can make V8 allocate several GiB while
+# compiling it. Optimize the module before shipping; keep every smoke assertion
+# and the actual HTML host unchanged (no guest GC or Node flag workaround).
+wasm-opt --enable-tail-call -O1 "$nt/mere-ruby.raw.wasm" -o "$here/mere-ruby.wasm"
 rm -f "$here/mere-ruby.wat"
 echo "built $here/mere-ruby.wasm ($(wc -c < "$here/mere-ruby.wasm" | tr -d ' ') bytes)"
 
@@ -35,7 +40,8 @@ node "$here/smoke.mjs" --check-imports
 if [ -x "$root/mere-ruby" ] && command -v node > /dev/null; then
   prog='p [Float("1.5"), Float("-2"), 1.0 / 3]
 puts "%.5f" % (2.0 ** 0.5)
-p [1, 2, 3].map {|x| x * 2 }.sum'
+p [1, 2, 3].map {|x| x * 2 }.sum
+p 0.0.step(1.0, 0.25).to_a'
   if node --stack-size=8000 "$here/smoke.mjs" "$prog" > "$here/.smoke.wasm.out" 2>&1 &&
      "$root/mere-ruby" /dev/stdin > "$here/.smoke.native.out" 2>&1 << RUBY
 $prog
