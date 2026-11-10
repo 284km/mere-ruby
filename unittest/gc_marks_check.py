@@ -8,12 +8,12 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 MERE = os.environ.get("MERE", str(ROOT / ".mere-compiler/_build/default/bin/mere.exe"))
 source = (ROOT / "main.mere").read_text()
-start = source.index("let gc_live_has =")
+start = source.index("let gc_live_new =")
 end = source.index("let rec gc_mark_val =", start)
 helpers = source[start:end]
 probe = r'''let ensure = fn (yes: bool) -> if yes then () else fail "GC mark mismatch";
-let live = map_new ();
-let other = map_new ();
+let live = gc_live_new ();
+let other = gc_live_new ();
 let reference = map_new ();
 let check = fn (key: int) ->
   let _ = ensure (gc_live_has live key == map_has reference key) in
@@ -39,11 +39,12 @@ let _ = check 30;
 let _ = check 59;
 let _ = check 60;
 let _ = ensure (gc_live_count live == map_len reference);
-let _ = ensure (map_len live < 1400);
+let _ = (let (pages, words, _) = live in
+  let _ = ensure (map_len pages < 100) in ensure (vec_len words == map_len pages * 64));
 let _ = ensure (gc_live_count other == 0);
 let _ = ensure (gc_live_mark other 30);
 let _ = ensure (gc_live_count other == 1);
-let dense = map_new ();
+let dense = gc_live_new ();
 let rec kinds = fn (kind: int) ->
   if kind == 8 then () else
   let rec ids = fn (id: int) ->
@@ -52,10 +53,21 @@ let rec kinds = fn (kind: int) ->
     let _ = ensure (if kind == 7 then true else (if gc_live_has dense (id * 8 + kind + 1) then false else true)) in
     ids (id + 1) in
   let _ = ids 0 in
-  let _ = ensure (map_len dense == (kind + 1) * 100) in
+  let _ = (let (pages, words, _) = dense in
+    let _ = ensure (map_len pages == (kind + 1) * 2) in
+    ensure (vec_len words == (kind + 1) * 128)) in
   kinds (kind + 1);
 let _ = kinds 0;
 let _ = ensure (gc_live_count dense == 24000);
+let nested = gc_live_new ();
+let _ = region Scratch {
+  let _ = ensure (gc_live_mark nested 1000000000007) in
+  let _ = ensure (gc_live_mark nested 80000) in
+  ()
+};
+let _ = ensure (gc_live_has nested 1000000000007);
+let _ = ensure (gc_live_has nested 80000);
+let _ = ensure (gc_live_count nested == 2);
 let _ = print "packed GC marks: boundaries, sparse IDs, duplicates and independent sets";
 '''
 with tempfile.TemporaryDirectory(prefix="mere-gc-marks-") as folder:

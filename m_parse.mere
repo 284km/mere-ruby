@@ -977,9 +977,10 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
     // a byte that does not start a valid UTF-8 character, in a UTF-8 source,
     // is ruby's SyntaxError -- it was read as an identifier and failed at run
     // time as an undefined name (a UTF-16 file with a BOM)
+    // (in ruby's words, "invalid multibyte character 0xFF": a bare "syntax
+    //  error" said nothing about the byte, language/source_encoding)
     else if ord c >= 128 && lex_src_is_utf8 () && (if lex_utf8_ok s i then false else true) then
-      (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: invalid multibyte char (UTF-8)" ++ parsing_file ()))) in
-       fail ("mere-ruby: invalid multibyte char (UTF-8)" ++ parsing_file ()))
+      (let _ = lex_bad_mb_refuse s i in Nil)
     // (a name with a byte in it that is no UTF-8 character: ruby's
     //  "invalid multibyte character", not a name nobody defined)
     else if is_alpha c && lex_src_is_utf8 () && lex_bad_mb s i (scan_ident s i) >= 0 then
@@ -4742,7 +4743,9 @@ and plain_defaults = fn (ds: (str * Expr) list) ->
 
 and lambda_bare_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) list) ->
   match toks with
-  | Cons (TId n, r) ->
+  | Cons (TId n0, r) ->
+    // (a second `_`-name is its own parameter, as in a block's |...|)
+    let n = bp_under_name n0 acc in
     // `-> a=default { ... }` — an optional bare parameter. The default
     // parses with brace-blocks off: the { belongs to the lambda body.
     (match r with
@@ -5710,9 +5713,58 @@ and parse_block = fn toks ->
   // reason; a block body needs it for the same reason.
   let had = map_has parser_flags "nodo" in
   let _ = if had then map_delete parser_flags "nodo" else () in
-  let r = parse_block_inner toks in
+  let (bp0, bb0, r0) = parse_block_inner toks in
   let _ = if had then map_set parser_flags "nodo" VNil else () in
-  r
+  (blk_own_marks bp0 bb0, bb0, r0)
+
+// A name a block assigns that is not a local where the block is written is
+// the BLOCK's own (ruby decides it when it parses the block: `e =
+// Enumerator.new { |y| r = y.yield 3 }; r = []` gives the block an r of its
+// own, and #each later does not write the outer one). The parser here cannot
+// see the enclosing scope, so it lists the names the block's own statements
+// assign as `;<chr 2>name`, and the block literal decides each one when it is
+// made -- a name the enclosing scope does not have yet is the block's
+// (blk_own_locals). Only a block with parameters is marked: an empty list is
+// what lets `it` and `_1` in.
+and blk_own_marks = fn (bp: str list) -> fn (bb: Stmt list) ->
+  match bp with
+  | Nil -> bp
+  | Cons (c9, Nil) when str_eq c9 block_pass_marker -> bp
+  | _ ->
+    (let own = fn (n: str) ->
+       str_len n > 0 && (let c = char_at n 0 in str_eq c "_" || (ord c >= 97 && ord c <= 122))
+       && (if str_len n > 1 && str_eq (substring n 0 2) "__" then false else true) in
+     let rec named = fn (ps: str list) -> fn (n: str) ->
+       (match ps with
+        | Nil -> false
+        | Cons (p9, t9) -> (let q9 = bp_plain_name p9 in str_eq q9 n) || named t9 n) in
+     let rec add = fn (ns: str list) -> fn (acc: str list) ->
+       (match ns with
+        | Nil -> acc
+        | Cons (n0, t) ->
+          (let n = (if str_len n0 > 1 && str_eq (char_at n0 0) "*" then substring n0 1 (str_len n0) else n0) in
+           if own n && (if named bp n || named acc n then false else true)
+           then add t (list_append_str acc (Cons (";" ++ chr 2 ++ n, Nil)))
+           else add t acc)) in
+     let rec targets = fn (xs: Stmt list) ->
+       (match xs with
+        | Nil -> (Nil : str list)
+        | Cons (SAssign (n, _), t) -> Cons (n, targets t)
+        | Cons (SLocalFrom (n, _), t) -> Cons (n, targets t)
+        | Cons (SMultiAssign (ns, _), t) -> list_append_str ns (targets t)
+        | Cons (SMultiAssignX (ts, _), t) -> list_append_str (x_target_names ts) (targets t)
+        | Cons (_, t) -> targets t) in
+     match add (targets bb) Nil with
+     | Nil -> bp
+     | hs -> list_append_str bp hs)
+// a block parameter's bare name: `*a`, `**a`, `&a`, `a = 1`, `a:`, `;a`
+and bp_plain_name = fn (p: str) ->
+  let rec lead = fn (i: int) ->
+    if i < str_len p && (let c = char_at p i in str_eq c "*" || str_eq c "&" || str_eq c ";") then lead (i + 1) else i in
+  let a = lead 0 in
+  let rec stop = fn (i: int) ->
+    if i < str_len p && (let c = char_at p i in str_eq c "_" || is_alnum c || ord c >= 128) then stop (i + 1) else i in
+  substring p a (stop a)
 
 // the line marker for the next statement of a list: SLineQ when the one
 // before it is on the same line (`a = 1; b = 2`), which sets the line but is
@@ -5904,6 +5956,10 @@ and parse_pipe_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) li
                                   && (str_eq (char_at name (str_len name - 1)) "?" || str_eq (char_at name (str_len name - 1)) "!") ->
                syn_refuse ("identifier " ++ name ++ " is not valid to set")
              | _ -> ()) in
+    // a second `_`-name is a parameter of its own (`|_, _ = 1, _:, _: 2|`):
+    // named apart HERE, before its default or its `:` is noted against the
+    // first one's name (bp_under_dedup, afterwards, only knew positions)
+    let name = bp_under_name name acc in
     // `a=default` — an optional parameter; `k:` / `k: default` — keyword.
     (match r with
      // `|b:|` — the lexer reads `:|` as the operator symbol :| — that is a
@@ -11081,6 +11137,17 @@ and bp_under_dedup = fn (ps: str list) -> fn seen9 -> fn (i: int) ->
        (if map_has seen9 h then Cons (h ++ "~" ++ str_of_int i, bp_under_dedup t seen9 (i + 1))
         else (let _ = map_set seen9 h 1 in Cons (h, bp_under_dedup t seen9 (i + 1))))
      else Cons (h, bp_under_dedup t seen9 (i + 1)))
+// (`_a` again, after `_a` / `*_a` / `_a:`, is `_a~<n>`: param_report_name
+//  reports it as `_a`)
+and bp_under_name = fn (name: str) -> fn (acc: str list) ->
+  if str_len name > 0 && str_eq (char_at name 0) "_"
+     && (let rec seen = fn (xs: str list) ->
+           (match xs with
+            | Nil -> false
+            | Cons (h, t) -> str_eq (pbase h) name || seen t) in seen acc)
+  then (let rec len = fn (xs: str list) -> fn (n: int) -> (match xs with Nil -> n | Cons (_, t) -> len t (n + 1)) in
+        name ++ "~" ++ str_of_int (len acc 0))
+  else name
 // a block's parameters and its block-locals (`;name`) share one namespace
 and bp_dup_check = fn (ps: str list) ->
   let rec strip = fn (xs: str list) ->
