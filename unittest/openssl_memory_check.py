@@ -29,6 +29,20 @@ cert.add_extension(factory.create_extension('keyUsage','keyCertSign,digitalSigna
 cert.add_extension(factory.create_extension('subjectAltName','DNS:localhost'))
 cert.sign(key,'SHA256')
 File.binwrite(ARGV[0]+'.crt',cert.to_pem)
+tsa=OpenSSL::X509::Certificate.new
+tsa.version=2
+tsa.serial=2
+tsa.subject=OpenSSL::X509::Name.parse('/CN=memory TSA')
+tsa.issuer=cert.subject
+tsa.public_key=key
+tsa.not_before=Time.now-60
+tsa.not_after=Time.now+3600
+factory=OpenSSL::X509::ExtensionFactory.new(cert,tsa)
+tsa.add_extension(factory.create_extension('basicConstraints','CA:FALSE',true))
+tsa.add_extension(factory.create_extension('keyUsage','digitalSignature',true))
+tsa.add_extension(factory.create_extension('extendedKeyUsage','timeStamping',true))
+tsa.sign(key,'SHA256')
+File.binwrite(ARGV[0]+'.tsa.crt',tsa.to_pem)
 puts 'ephemeral test key prepared'
 '''
 LIFETIME=r'''
@@ -266,6 +280,114 @@ end
 raise 'TLS resource escaped Ruby ownership' unless live==owners
 puts 'TLS mutual authentication, negative hostname, callback GC/error, interruption and descriptor lifetimes passed'
 '''
+FORMATS_LIFETIME=r'''
+require 'openssl'
+source=File.binread(ARGV[0])
+certificate=File.binread(ARGV[0]+'.crt')
+tsa_certificate=File.binread(ARGV[0]+'.tsa.crt')
+baseline=OpenSSL::Backend.call('object.stats')[0]
+def format_round(source,certificate,tsa_certificate)
+  key=OpenSSL::PKey.read(source)
+  cert=OpenSSL::X509::Certificate.new(certificate)
+  tsa=OpenSSL::X509::Certificate.new(tsa_certificate)
+  store=OpenSSL::X509::Store.new
+  store.add_cert(cert)
+  container=OpenSSL::PKCS12.create('password','lifetime',key,cert,[cert])
+  parsed=OpenSSL::PKCS12.new(container.to_der,'password')
+  payload="format\0lifetime"
+  signed=OpenSSL::PKCS7.new(OpenSSL::PKCS7.sign(cert,key,payload,[],OpenSSL::PKCS7::BINARY).to_der)
+  encrypted=OpenSSL::PKCS7.encrypt([cert],payload,'AES-128-CBC',OpenSSL::PKCS7::BINARY)
+  id=OpenSSL::OCSP::CertificateId.new(cert,cert,'SHA256')
+  request=OpenSSL::OCSP::Request.new.add_certid(id).add_nonce('lifetime nonce')
+  basic=OpenSSL::OCSP::BasicResponse.new
+  basic.add_status(id,OpenSSL::OCSP::V_CERTSTATUS_GOOD,nil,nil,-30,300,[])
+  basic.copy_nonce(request)
+  basic.sign(cert,key,[])
+  single=basic.responses.first
+  ts_request=OpenSSL::Timestamp::Request.new
+  ts_request.algorithm='SHA256'
+  ts_request.message_imprint=OpenSSL::Digest.digest('SHA256',payload)
+  ts_request.policy_id='1.2.3.4.5'
+  ts_request.nonce=(1<<100)+1
+  factory=OpenSSL::Timestamp::Factory.new
+  factory.gen_time=Time.now
+  factory.serial_number=(1<<100)+2
+  factory.allowed_digests=['SHA256']
+  factory.additional_certs=[cert]
+  ts_response=factory.create_timestamp(key,tsa,ts_request)
+  info=ts_response.token_info
+  spki=OpenSSL::Netscape::SPKI.new
+  spki.public_key=key.public_key
+  spki.challenge=payload
+  spki.sign(key,'SHA256')
+  GC.start
+  raise 'PKCS12 key lost' unless parsed.key.public_to_der==key.public_to_der
+  raise 'PKCS7 signature lost' unless signed.verify([],store,nil,OpenSSL::PKCS7::BINARY)
+  raise 'PKCS7 payload lost' unless signed.data==payload && encrypted.decrypt(key,cert)==payload
+  raise 'OCSP signature lost' unless basic.verify([],store)
+  raise 'OCSP child lost' unless single.certid.cmp(id) && single.check_validity
+  ts_response.verify(ts_request,store)
+  raise 'timestamp child lost' unless info.nonce==(1<<100)+1
+  raise 'SPKAC signature lost' unless spki.verify(spki.public_key)
+  nil
+end
+ARGV[1].to_i.times { format_round(source,certificate,tsa_certificate) }
+GC.start
+GC.stress=false
+GC.disable
+live=OpenSSL::Backend.call('object.stats')[0]
+owners=ObjectSpace.each_object(OpenSSL::NativeObject).count do |object|
+  begin
+    OpenSSL.__native_handle(object)
+    true
+  rescue TypeError
+    false
+  end
+end
+raise 'format native object escaped its Ruby owner' unless live==owners
+puts "format native live delta: #{live-baseline}"
+puts 'all format objects and children remained valid through GC'
+'''
+FORMATS_INTERRUPT=r'''
+require 'openssl'
+key=OpenSSL::PKey.read(File.binread(ARGV[0]))
+cert=OpenSSL::X509::Certificate.new(File.binread(ARGV[0]+'.crt'))
+container=OpenSSL::PKCS12.create('password','interruption',key,cert,[cert])
+bytes=container.to_der
+baseline=OpenSSL::Backend.call('object.stats')[0]
+class << OpenSSL::Backend
+  alias __format_original_wrap wrap
+  attr_accessor :gate_thread,:ready,:proceed
+  def wrap(name,handle)
+    if name=='OpenSSL::PKCS12' && Thread.current==@gate_thread
+      @ready << true
+      @proceed.pop
+    end
+    __format_original_wrap(name,handle)
+  end
+end
+OpenSSL::Backend.ready=Queue.new
+OpenSSL::Backend.proceed=Queue.new
+worker=Thread.new do
+  Thread.current.report_on_exception=false
+  OpenSSL::Backend.gate_thread=Thread.current
+  begin
+    OpenSSL::PKCS12.new(bytes,'password')
+    raise 'interruption missing'
+  rescue RuntimeError => error
+    raise unless error.message=='format allocation stopped'
+  end
+end
+OpenSSL::Backend.ready.pop
+worker.raise(RuntimeError,'format allocation stopped')
+OpenSSL::Backend.proceed << true
+worker.value
+OpenSSL::Backend.gate_thread=nil
+GC.start
+raise 'fixture changed' unless container.to_der==bytes
+raise 'interrupted response retained container or children' unless OpenSSL::Backend.call('object.stats')[0]==baseline
+puts 'interrupted multi-handle adoption released container and every child'
+'''
 
 
 def main():
@@ -298,6 +420,20 @@ def main():
     run('large_wire',WIRE,args.binary,fixture)
     run('tls_lifetimes',TLS_LIFETIME,args.binary,fixture)
     run('tls_gc_stress',TLS_LIFETIME,args.binary,fixture,stress=True)
+    run('format_adoption_interruption',FORMATS_INTERRUPT,args.binary,fixture)
+    run('formats_gc_stress',FORMATS_LIFETIME,args.binary,fixture,3,stress=True)
+    format_retained=[]
+    format_allocated=[]
+    for n in (20,200):
+        log=run('format_lifetimes_'+str(n),FORMATS_LIFETIME,args.binary,fixture,n,stats=True)
+        format_retained.append(int(re.search(r'format native live delta: (\d+)',log)[1]))
+        format_allocated.append(int(re.search(r'region-stats default:.*alloc_total=(\d+)',log)[1]))
+    assert format_allocated[1]-format_allocated[0]<32*1024*1024,format_allocated
+    assert format_retained[1]<=256 and format_retained[1]-format_retained[0]<=128,format_retained
+    (output/'format_retained.json').write_text(json.dumps(format_retained)+'\n')
+    (output/'format_allocation.json').write_text(json.dumps(format_allocated)+'\n')
+    print('20/200 format conservative GC survivors:',format_retained,flush=True)
+    print('20/200 format default arena allocations:',format_allocated,flush=True)
     allocated=[]
     retained=[]
     for n in (20,200):

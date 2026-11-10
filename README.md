@@ -132,7 +132,8 @@ Every change is checked against the reference `ruby` before it lands:
 ./mspec/record_hygiene.sh                        # the records name no machine and no operator
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
 ./parsetest/run.sh <dir> [dir ...]               # can it READ the ruby that exists?
-./gemtest/run.sh <gem-home> <rubygems-checkout> [stdlib]   # real gems, loaded
+./gemtest/run.sh <gem-home> <rubygems-checkout> [stdlib]   # legacy gem-load report
+# gemtest/measure.py pins the reference and records all three modes (gemtest/README.md)
 ./bundlertest/run.sh <stdlib-dir> <gem-home>     # how far bundler gets, step by step
 ```
 
@@ -341,11 +342,15 @@ explicit installation. ASN.1 and BN value conversion also work in Wasm, where
 portable Digest/HMAC/AES remain available and native key/certificate/TLS
 operations raise `NotImplementedError`.
 
-The OpenSSL selection covers 27 upstream files and 500 tests from Ruby 4.0.9:
-498 match and two FIPS tests skip on both sides on macOS and Linux. Independent
-wire, cryptographic-vector, TLS-peer and resource-lifetime gates live in
-`unittest/openssl_*_check.py`. OCSP, PKCS12, PKCS7, Timestamp and Netscape SPKI
-remain unimplemented; the full inventory is recorded in `openssl-plan.json`.
+The OpenSSL selection covers all 32 nonempty upstream files and 593 tests
+from Ruby 4.0.9: 591 match and two FIPS tests skip on both sides on macOS and
+Linux. This includes PKCS12, PKCS7/S/MIME, OCSP, Timestamp and Netscape SPKI.
+Engine discovers zero reference tests and is excluded from the pass count.
+Independent wire, cryptographic-vector, cross-format, TLS-peer and
+resource-lifetime gates live in `unittest/openssl_*_check.py`; the complete
+inventory and verification are recorded in `openssl-plan.json` and
+`openssl-completion-plan.json`. Native container operations raise explicit
+capability errors in Wasm; portable cryptographic operations remain available.
 
 RubyGems and Bundler are the ones that matter, because everything else is
 loaded through them: pointed at a CRuby stdlib, `require "rubygems"` works,
@@ -358,14 +363,24 @@ an exception that kept neither class nor message, `rescue *[]` swallowing
 everything, an `ensure` body consuming the exception it ran under, and
 `File.open` refusing the `Pathname` bundler writes the lockfile through.
 
-Against a sample of 29 installed gems — of which the reference ruby itself
-loads **23** here (two need a Rails application to exist, three need a gem
-this gem home lacks, one needs protobuf's C extension) —
-`gemtest/run.sh` loads **21** with a CRuby stdlib on `-I` and **19** on
-what mere-ruby ships (measured 2026-10-01). That historical run predates the native OpenSSL provider and the bundled
-`ipaddr`; its failures included the then-missing SSL constants. These gem-load
-counts have not been remeasured for the provider change. Other missing
-libraries in that run included `net/protocol` and `open-uri`.
+Against the existing sample of 29 installed gems, the pinned Ruby 4.0.9
+reference loads **23**. On 2026-11-10, mere-ruby loads all **23** both with
+its bundled libraries and with an external CRuby stdlib on `-I`. Six gems are
+excluded because the reference cannot load them in this gem home (Rails
+application setup or unavailable native dependencies). No run timed out.
+Installed gem libraries are available in both modes; this does not mean every
+stdlib dependency is bundled. See `gemtest/latest.json` and
+`gemtest/README.md` for reproducible, bounded measurements.
+
+Real local HTTPS succeeds with explicit trust using the native SSLSocket and
+external Net::HTTP, including rejection of an untrusted certificate and a
+wrong hostname. Without external stdlib, `require "net/http"` fails. The next
+stdlib work is `uri` and `timeout`, followed by `net/protocol`, `net/http`,
+then `open-uri` and `resolv`. These are identified gaps, separate from the
+completed OpenSSL implementation. Excon also completes trusted HTTPS; its
+error-wrapping path exposes an implicit `Exception#set_backtrace` dispatch gap
+recorded in `gemtest/https_latest.json`.
+
 `json` is answered by the interpreter (json 2.18's own Ruby files, and its
 C parser and generator in Mere), which is what moved three of them.
 
