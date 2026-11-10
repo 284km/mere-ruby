@@ -1061,7 +1061,7 @@ OIDs, high tags and traversal. BN supplies conversion and native arithmetic.
 In Wasm the ASN.1 codec and BN conversions remain available, together with
 portable Digest/HMAC and AES CBC/ECB. Provider-backed operations raise
 `NotImplementedError`. The portable AES implementation uses table lookups and
-is not constant-time. The playground reserves a 256 MiB Wasm heap before
+is not constant-time. The playground reserves a 512 MiB Wasm heap before
 running the prelude and libraries; each run starts with a fresh instance.
 
 The measured selection (`unittest/openssl_files.txt`) contains 593 tests in

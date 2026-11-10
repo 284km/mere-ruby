@@ -404,8 +404,9 @@ is a single page that fetches `mere-ruby.wasm`, hands the editor's source to
 `run_cli` (via a `read_file` sentinel), and shows the output:
 
 ```sh
-mere -w main.mere | wat2wasm --enable-tail-call - -o docs/mere-ruby.wasm
-# or: docs/build.sh
+# Requires WABT (wat2wasm), Binaryen (wasm-opt) and Node.
+# Generates a no-coroutine copy, optimizes it, then checks the actual HTML host.
+MERE=/path/to/mere sh docs/build.sh
 cd docs && python3 -m http.server   # then open http://localhost:8000/
 ```
 
