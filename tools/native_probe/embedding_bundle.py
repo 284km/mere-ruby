@@ -7,6 +7,7 @@ archive and system libraries; no product C source is needed on their link line.
 The exported API is mere_embedding_*, not the Ruby C API.
 """
 from pathlib import Path
+from native_build_flags import openssl_flags
 import argparse
 import hashlib
 import json
@@ -52,18 +53,19 @@ os.chdir(objects)
 run('extract-prism', ['ar', 'x', prism])
 prism_objects = sorted(objects.glob('*.o'))
 assert prism_objects, 'Prism archive contained no object files'
-glue = [ROOT / 'tools' / (name + '.c') for name in ['prism_glue', 'socket_glue', 'process_glue']]
+openssl_cflags, openssl_ldflags = openssl_flags()
+glue = [ROOT / 'tools' / (name + '.c') for name in ['prism_glue', 'socket_glue', 'process_glue', 'openssl_glue']]
 for source in glue:
     target = objects / (source.stem + '.o')
     assert not target.exists(), f'archive member collision: {target.name}'
-    run('compile-' + source.stem, ['clang', '-O2', '-w', '-I', ROOT / 'vendor/prism/include',
+    run('compile-' + source.stem, ['clang', '-O2', '-w', '-I', ROOT / 'vendor/prism/include', *openssl_cflags,
                                   '-c', source, '-o', target])
 assert not (objects / 'embedding.o').exists(), 'archive member collision: embedding.o'
 shutil.copyfile(generated / 'embedding.o', objects / 'embedding.o')
 shutil.copyfile(generated / 'embedding.h', includes / 'embedding.h')
 archive = libraries / 'libmere-ruby-embedding.a'
 run('archive', ['ar', 'rcs', archive, *sorted(objects.glob('*.o'))])
-link = ['-pthread', '-lm']
+link = ['-pthread', '-lm'] + openssl_ldflags
 if platform.system() == 'Darwin':
     link += ['-Wl,-stack_size,0x20000000']
 else:
@@ -78,7 +80,8 @@ for mode in ['normal', 'cleanup-error']:
     run('consumer-' + mode, [output / 'consumer', mode],
         dict(os.environ, EMBED_PATH=str(output / (mode + '.txt'))))
 inputs = [generated / 'embedding.o', generated / 'embedding.h', prism, *glue,
-          FIXTURES / 'embedding_integration.c', FIXTURES / 'embedding_host.c']
+          FIXTURES / 'embedding_integration.c', FIXTURES / 'embedding_host.c',
+          Path(__file__).with_name('native_build_flags.py')]
 (output / 'manifest.json').write_text(json.dumps({
     'schema': 1,
     'build_provenance': provenance,
