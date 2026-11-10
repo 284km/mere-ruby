@@ -36,7 +36,11 @@ files = [[%w[pathname pathname.so], File.read("#{here}/lib/pathname_ext.rb")],
          [%w[singleton], File.read("#{here}/lib/singleton_ext.rb")],
          [%w[logger], File.read("#{here}/lib/logger_ext.rb")],
          [%w[pp], File.read("#{here}/lib/pp_ext.rb")],
-         [%w[prettyprint], File.read("#{here}/lib/prettyprint_ext.rb")]]
+         [%w[prettyprint], File.read("#{here}/lib/prettyprint_ext.rb")],
+         [%w[io/console io/console.so], File.read("#{here}/lib/io_console_ext.rb")],
+         [%w[io/console/size], File.read("#{here}/lib/io_console_size_ext.rb")],
+         [%w[pty pty.so], File.read("#{here}/lib/pty_ext.rb")],
+         [%w[expect], File.read("#{here}/lib/expect_ext.rb")]]
 
 def lit(line)
   line.gsub(/[\\"{}\t\r]/) { |c| { "\\" => "\\\\", '"' => '\\"', "{" => "\\{", "}" => "\\}", "\t" => "\\t", "\r" => "\\r" }[c] }
