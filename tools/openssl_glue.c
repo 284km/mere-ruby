@@ -13,6 +13,7 @@
 #include <openssl/provider.h>
 #include <openssl/x509v3.h>
 #include <openssl/conf.h>
+#include <openssl/kdf.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -21,6 +22,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
+#include <fcntl.h>
 
 struct mere_bytes { long long len; unsigned char data[]; };
 typedef struct mere_bytes mere_bytes;
@@ -65,10 +68,17 @@ static void error(buffer *b, const char *klass, const char *message) {
 }
 static void ssl_error(buffer *b, const char *klass, const char *operation) {
     unsigned long code;
-    char detail[256]="", message[512];
-    while ((code=ERR_get_error())) ERR_error_string_n(code,detail,sizeof(detail));
+    char detail[768]="", message[1024]; buffer errors={0}; uint32_t count=0;
+    const char *data=NULL; int flags=0;
+    while ((code=ERR_get_error_all(NULL,NULL,NULL,&data,&flags))) {
+        char base[256]; ERR_error_string_n(code,base,sizeof(base));
+        snprintf(detail,sizeof(detail),"%s%s%s%s",base,(flags&ERR_TXT_STRING)&&data?" (":"",(flags&ERR_TXT_STRING)&&data?data:"",(flags&ERR_TXT_STRING)&&data?")":"");
+        text(&errors,detail); count++;
+    }
     snprintf(message,sizeof(message),"%s%s%s",operation,detail[0]?": ":"",detail);
-    error(b,klass,message);
+    b->len=0; b->failed=0; byte(b,'E'); text(b,klass); text(b,message);
+    byte(b,'a'); number(b,count); put(b,errors.p,errors.len); free(errors.p);
+    ERR_clear_error();
 }
 
 static int read32(const unsigned char **p, const unsigned char *end, uint32_t *n) {
@@ -190,6 +200,14 @@ done:
 #include "openssl/x509_constants.inc"
 #include "openssl/x509_store.inc"
 #include "openssl/config.inc"
+#include "openssl/tls_types.inc"
+#include "openssl/tls_callbacks.inc"
+#include "openssl/tls_worker.inc"
+#include "openssl/tls_context.inc"
+#include "openssl/tls_socket.inc"
+#include "openssl/tls_constants.inc"
+#include "openssl/primitives.inc"
+#include "openssl/cipher.inc"
 
 static void dispatch(const char *op,const arg *args,buffer *out) {
     if(!strcmp(op,"version")) { text(out,OpenSSL_version(OPENSSL_VERSION)); return; }
@@ -215,6 +233,24 @@ static void dispatch(const char *op,const arg *args,buffer *out) {
     if(!strncmp(op,"xctx.",5)) { x509_context_call(op+5,args,out); return; }
     if(!strcmp(op,"x509.constants")) { x509_constants(out); return; }
     if(!strncmp(op,"config.",7)) { config_call(op+7,args,out); return; }
+    if(!strcmp(op,"tls.constants")) { tls_constants(out); return; }
+    if(!strcmp(op,"tls.npn_available")) {
+#ifdef OPENSSL_NO_NEXTPROTONEG
+        boolean(out,0);
+#else
+        boolean(out,1);
+#endif
+        return;
+    }
+    if(!strncmp(op,"tls_context.",12)) { tls_context_call(op+12,args,out); return; }
+    if(!strncmp(op,"tls_socket.",11)) { tls_socket_call(op+11,args,out); return; }
+    if(!strncmp(op,"tls_job.",8)) { tls_job_call(op+8,args,out); return; }
+    if(!strncmp(op,"tls_session.",12)) { tls_session_call(op+12,args,out); return; }
+    if(!strncmp(op,"digest.",7)) { digest_call(op+7,args,out); return; }
+    if(!strncmp(op,"hmac.",5)) { hmac_call(op+5,args,out); return; }
+    if(!strncmp(op,"kdf.",4)) { kdf_call(op+4,args,out); return; }
+    if(!strncmp(op,"provider.",9)) { provider_call(op+9,args,out); return; }
+    if(!strncmp(op,"cipher.",7)) { cipher_call(op+7,args,out); return; }
     if(!strcmp(op,"oid.register")) {
         if(!count(args,3,3,out)) return;
         const arg *oid=at(args,0),*sn=at(args,1),*ln=at(args,2);
@@ -225,6 +261,11 @@ static void dispatch(const char *op,const arg *args,buffer *out) {
         return;
     }
     if(!strcmp(op,"fips_mode")) { boolean(out,EVP_default_properties_is_fips_enabled(NULL)); return; }
+    if(!strcmp(op,"set_fips_mode")) {
+        if(EVP_default_properties_enable_fips(NULL,truth(at(args,0)))) byte(out,'n');
+        else ssl_error(out,"OpenSSL::OpenSSLError","setting FIPS mode failed");
+        return;
+    }
     error(out,"NotImplementedError","unknown native OpenSSL operation");
 }
 

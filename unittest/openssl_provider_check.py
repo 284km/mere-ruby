@@ -3,14 +3,19 @@
 import argparse
 import ctypes
 import hashlib
+import hmac
 import math
 from pathlib import Path
 import random
+import select
+import socket
+import ssl
 import struct
 import subprocess
 import sys
 import tempfile
 import time
+import threading
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -39,9 +44,12 @@ def unpack(source, position=0):
     position += 1
     if kind in (b'n', b't', b'f'):
         return {b'n': None, b't': True, b'f': False}[kind], position
-    if kind == b'e':
+    if kind in (b'e', b'E'):
         name, position = unpack(source, position)
         message, position = unpack(source, position)
+        if kind == b'E':
+            errors, position = unpack(source, position)
+            return ('error', name, message, errors), position
         return ('error', name, message), position
     size, = struct.unpack_from('!I', source, position)
     position += 4
@@ -93,6 +101,22 @@ def main():
             return raw(op, pack(list(args)))
 
         assert call('version').startswith(b'OpenSSL 3.')
+        payload=b'independent primitive\0binary vector'
+        for algorithm in ('SHA256','SHA384','SHA512','SHA3-256'):
+            digest=call('digest.new',algorithm)
+            assert digest[0]=='handle',digest
+            assert call('digest.update',digest[2],payload) is None
+            assert call('digest.final',digest[2])==hashlib.new(algorithm.lower().replace('-','_'),payload).digest()
+            assert call('object.release',digest[2]) is True
+        mac=call('hmac.new',b'key\0bytes','SHA256')
+        assert call('hmac.update',mac[2],payload) is None
+        assert call('hmac.final',mac[2])==hmac.digest(b'key\0bytes',payload,'sha256')
+        assert call('object.release',mac[2]) is True
+        assert call('kdf.pbkdf2',payload,b'salt',48,1200,'SHA256')==hashlib.pbkdf2_hmac('sha256',payload,b'salt',1200,48)
+        # RFC 7914's empty-password/salt vector; Python on macOS may lack scrypt.
+        assert call('kdf.scrypt',b'',b'',64,16,1,1)==bytes.fromhex('77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906')
+        # RFC 5869 test case 1, independent published HKDF output.
+        assert call('kdf.hkdf',b'\x0b'*22,bytes(range(13)),42,bytes(range(0xf0,0xfa)),'SHA256')==bytes.fromhex('3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865')
         rng = random.Random(7731)
         for _ in range(200):
             a, b = rng.randrange(-10**40, 10**40), rng.randrange(1, 10**20)
@@ -169,7 +193,7 @@ def main():
             assert call('object.release',handle[2]) is True
         assert call('object.stats')[0]==0
         assert call('errors') == []
-        print('OpenSSL provider ABI: wire bounds, BN, RSA signatures, typed ownership, EC lifetime, generation callbacks and X509 chains pass')
+        print('OpenSSL provider ABI: wire bounds, primitive vectors, BN, RSA signatures, typed ownership, EC lifetime, generation callbacks, X509 chains and independent TLS peers pass')
 
 
 def check_x509(call, directory):
@@ -193,10 +217,18 @@ def check_x509(call, directory):
             assert call('xcert.set_'+field,result,value) is None,(field,value)
         return result
     root=cert(root_name,2**100,root_name)
-    ext=owned('xext.create','basicConstraints','critical,CA:TRUE',False,root,root,None,None,None)
-    assert call('xcert.add_extension',root,ext) is None
+    def extension(target,issuer,oid,value):
+        ext=owned('xext.create',oid,value,False,issuer,target,None,None,None)
+        assert call('xcert.add_extension',target,ext) is None
+    extension(root,root,'basicConstraints','critical,CA:TRUE')
+    extension(root,root,'keyUsage','critical,keyCertSign,cRLSign')
+    extension(root,root,'subjectKeyIdentifier','hash')
+    extension(root,root,'authorityKeyIdentifier','keyid:always')
     assert call('xcert.sign',root,key,'SHA256') is None
     leaf=cert(leaf_name,2,root_name)
+    extension(leaf,root,'authorityKeyIdentifier','keyid:always')
+    extension(leaf,root,'subjectAltName','DNS:example.test')
+    extension(leaf,root,'keyUsage','critical,digitalSignature,keyEncipherment')
     assert call('xcert.sign',leaf,key,'SHA256') is None
     assert call('xcert.verify',leaf,key) is True
     assert call('xcert.serial',root)==str(2**100).encode()
@@ -243,6 +275,9 @@ raise 'DER round trip changed' unless OpenSSL::X509::Certificate.new(leaf.to_der
         return result,error
     assert verify(leaf)==(True,constants[b'V_OK'])
     assert verify(leaf,True)==(False,constants[b'V_ERR_APPLICATION_VERIFICATION'])
+    key_path=directory/'key.pem'
+    key_path.write_bytes(call('pkey.export',key,'private_pem',None,None))
+    check_tls(call,owned,store,root_path,leaf_path,key_path,leaf,key)
     expired=owned('object.copy',leaf)
     assert call('xcert.set_not_after',expired,now-1) is None
     assert call('xcert.sign',expired,key,'SHA256') is None
@@ -250,6 +285,143 @@ raise 'DER round trip changed' unless OpenSSL::X509::Certificate.new(leaf.to_der
     assert call('xcert.new',b'bad DER')[0]=='error'
     for handle in reversed(handles):
         assert call('object.release',handle) is True
+
+
+def check_tls(call,owned,store,root_path,leaf_path,key_path,certificate,key):
+    def operation(handle,transport,kind,data=None,callbacks=None,allow_error=False):
+        assert call('tls_job.start',handle,kind,data) is None
+        deadline=time.monotonic()+10
+        try:
+            while True:
+                assert time.monotonic()<deadline,'TLS operation stalled'
+                step=call('tls_job.poll',handle)
+                if allow_error and isinstance(step,tuple) and step[0]=='error':
+                    return step
+                assert not (isinstance(step,tuple) and step[0]=='error'),(step,peer_errors)
+                if step[0]==b'pending':
+                    time.sleep(0.001)
+                elif step[0]==b'callback':
+                    assert callbacks is not None,step[:2]
+                    response=callbacks(step[1],step[2])
+                    assert call('tls_job.respond',handle,response) is None
+                else:
+                    assert step[0]==b'done',step
+                    status,result=step[1:]
+                    if status in (b'wait_readable',b'wait_writable'):
+                        assert call('tls_job.stop',handle) is None
+                        ready=select.select([transport] if status==b'wait_readable' else [],[transport] if status==b'wait_writable' else [],[],max(0,deadline-time.monotonic()))
+                        assert ready[0] or ready[1],'TLS transport stalled'
+                        assert call('tls_job.start',handle,kind,data) is None
+                    else:
+                        assert status==b'ok',(status,result)
+                        return result
+        finally:
+            assert call('tls_job.stop',handle) is None
+
+    payload=b'independent TLS peer\0binary payload'
+    observed=[]
+    def native_callbacks(kind,data):
+        observed.append(kind)
+        if kind==1:
+            ok,context=data
+            assert ok is True
+            cert=call('xctx.current_cert',context[2]); assert cert[0]=='handle'
+            assert call('object.release',cert[2]) is True
+            return True
+        if kind==2:
+            assert data==b'example.test'
+            return None
+        if kind==4:
+            assert data==b'\x02h2\x08http/1.1'
+            return b'h2'
+        if kind==16:
+            assert len(data.split())==3
+            return True
+        raise AssertionError(kind)
+
+    peer_errors=[]
+    def launch(function):
+        def run():
+            try: function()
+            except BaseException as exc: peer_errors.append(exc)
+        thread=threading.Thread(target=run,daemon=True)
+        thread.start()
+        return thread
+
+    for native_server in (False,True):
+        transport,peer=socket.socketpair()
+        peer.settimeout(10)
+        if native_server:
+            context=owned('tls_context.new')
+            for field,value in [('cert',certificate),('key',key),('verify_mode',0)]:
+                assert call('tls_context.set_'+field,context,value) is None
+            assert call('tls_context.callbacks',context,2|4|16) is None
+            python_context=ssl.create_default_context(cafile=str(root_path))
+            python_context.set_alpn_protocols(['h2','http/1.1'])
+            def peer_work():
+                with python_context.wrap_socket(peer,server_hostname='example.test') as secured:
+                    assert secured.selected_alpn_protocol()=='h2'
+                    secured.sendall(payload)
+                    assert secured.recv(4096)==payload
+            thread=launch(peer_work)
+        else:
+            context=owned('tls_context.new')
+            assert call('tls_context.set_cert_store',context,store) is None
+            assert call('tls_context.set_verify_mode',context,1) is None
+            assert call('tls_context.callbacks',context,1|16) is None
+            assert call('tls_context.set_alpn_protocols',context,b'\x02h2') is None
+            python_context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            python_context.load_cert_chain(str(leaf_path),str(key_path))
+            python_context.set_alpn_protocols(['h2'])
+            def peer_work():
+                with python_context.wrap_socket(peer,server_side=True) as secured:
+                    assert secured.selected_alpn_protocol()=='h2'
+                    assert secured.recv(4096)==payload
+                    secured.sendall(payload)
+            thread=launch(peer_work)
+        handle=owned('tls_socket.new',context,transport.fileno())
+        if not native_server:
+            assert call('tls_socket.set_hostname',handle,'example.test',True) is None
+        operation(handle,transport,2 if native_server else 1,callbacks=native_callbacks)
+        assert call('tls_socket.alpn_protocol',handle)==b'h2'
+        if native_server:
+            assert operation(handle,transport,3,4096,native_callbacks)==payload
+            assert operation(handle,transport,4,payload,native_callbacks)==len(payload)
+        else:
+            assert operation(handle,transport,4,payload,native_callbacks)==len(payload)
+            assert operation(handle,transport,3,4096,native_callbacks)==payload
+            session=owned('tls_socket.session',handle)
+            copy=owned('tls_session.new',call('tls_session.to_der',session))
+            assert call('tls_session.equal',session,copy) is True
+            assert call('tls_socket.verify_result',handle)==0
+        thread.join(10)
+        assert not thread.is_alive(),'independent TLS peer stalled'
+        assert not peer_errors,peer_errors
+        transport.close()
+    assert {1,2,4,16}.issubset(observed),observed
+    # A Python peer presents a valid trusted chain for another hostname.
+    transport,peer=socket.socketpair()
+    peer.settimeout(10)
+    python_context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    python_context.load_cert_chain(str(leaf_path),str(key_path))
+    def rejected_peer():
+        try:
+            with python_context.wrap_socket(peer,server_side=True):
+                raise AssertionError('wrong-hostname client completed a handshake')
+        except ssl.SSLError:
+            pass
+    thread=launch(rejected_peer)
+    context=owned('tls_context.new')
+    assert call('tls_context.set_cert_store',context,store) is None
+    assert call('tls_context.set_verify_mode',context,1) is None
+    handle=owned('tls_socket.new',context,transport.fileno())
+    assert call('tls_socket.set_hostname',handle,'wrong.example',True) is None
+    error=operation(handle,transport,1,allow_error=True)
+    assert error[0]=='error' and b'certificate verify failed' in error[2],error
+    assert call('tls_socket.verify_result',handle)!=0
+    thread.join(10)
+    assert not thread.is_alive() and not peer_errors,peer_errors
+    transport.close()
 
 
 if __name__ == '__main__':

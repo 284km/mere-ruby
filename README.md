@@ -334,10 +334,19 @@ there too). `socket` is answered by the interpreter itself: `TCPSocket`,
 program here really does connect, listen, accept and exchange bytes —
 zero bytes included. UDP and UNIX sockets exist but refuse
 (`NotImplementedError`), because a socket library that silently does
-nothing moves a failure away from its cause. `openssl` is not answered: a
-TLS stack is a binding to a third-party C library, deliberately out of
-scope, and linking one would make the (native-only) dependency reach the
-Wasm build too.
+nothing moves a failure away from its cause. Native `openssl` uses OpenSSL 3
+(`libssl` and `libcrypto`) for keys, certificates, TLS, digests, MACs, KDFs and
+ciphers, including authenticated modes. Install `openssl@3` on macOS or
+`libssl-dev` on Linux before `sh tools/build.sh`; `OPENSSL_PREFIX` selects an
+explicit installation. ASN.1 and BN value conversion also work in Wasm, where
+portable Digest/HMAC/AES remain available and native key/certificate/TLS
+operations raise `NotImplementedError`.
+
+The OpenSSL selection covers 27 upstream files and 500 tests from Ruby 4.0.9:
+498 match and two FIPS tests skip on both sides on macOS and Linux. Independent
+wire, cryptographic-vector, TLS-peer and resource-lifetime gates live in
+`unittest/openssl_*_check.py`. OCSP, PKCS12, PKCS7, Timestamp and Netscape SPKI
+remain unimplemented; the full inventory is recorded in `openssl-plan.json`.
 
 RubyGems and Bundler are the ones that matter, because everything else is
 loaded through them: pointed at a CRuby stdlib, `require "rubygems"` works,
@@ -354,11 +363,10 @@ Against a sample of 29 installed gems — of which the reference ruby itself
 loads **23** here (two need a Rails application to exist, three need a gem
 this gem home lacks, one needs protobuf's C extension) —
 `gemtest/run.sh` loads **21** with a CRuby stdlib on `-I` and **19** on
-what mere-ruby ships (measured 2026-10-01). With the stdlib, the two that do
-not both stop at OpenSSL (aws-sdk-s3's `OpenSSL::SSL::SSLError`, excon's
-`SSLSocket`; a TLS stack is out of scope, above). Without it, the pure-Ruby
-libraries mere-ruby does not ship are what is missing: `net/protocol`
-(aws-sdk-s3), `ipaddr` (excon, http-cookie) and `open-uri` (openapi_parser).
+what mere-ruby ships (measured 2026-10-01). That historical run predates the native OpenSSL provider and the bundled
+`ipaddr`; its failures included the then-missing SSL constants. These gem-load
+counts have not been remeasured for the provider change. Other missing
+libraries in that run included `net/protocol` and `open-uri`.
 `json` is answered by the interpreter (json 2.18's own Ruby files, and its
 C parser and generator in Mere), which is what moved three of them.
 

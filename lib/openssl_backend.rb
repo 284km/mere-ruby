@@ -70,10 +70,15 @@ module OpenSSL
       when 110 then return [nil, position]
       when 116 then return [true, position]
       when 102 then return [false, position]
-      when 101
+      when 101, 69
         name, position = item(source, position, owners)
         message, position = item(source, position, owners)
-        raise Object.const_get(name), message
+        exception = Object.const_get(name).new(message)
+        if kind == 69
+          errors, position = item(source, position, owners)
+          exception.instance_variable_set(:@errors, errors)
+        end
+        raise exception
       end
       raise OpenSSLError, 'invalid provider response' unless position + 4 <= source.bytesize
       size = source.byteslice(position, 4).unpack1('N')
