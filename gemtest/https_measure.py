@@ -51,9 +51,12 @@ begin
     end
     raise 'HTTP body changed' unless bytes.split("\r\n\r\n",2)[1]=="https\0verified\n"
   elsif mode=='excon'
-    options={ssl_verify_peer:true,ssl_ca_file:cert_file,connect_timeout:5,read_timeout:5,write_timeout:5}
+    options={ssl_verify_peer_host:host,ssl_verify_peer:true,ssl_ca_file:cert_file,connect_timeout:5,read_timeout:5,write_timeout:5}
     options[:ssl_ca_file]=cert_file+'.untrusted' if scenario=='trust'
-    response=Excon.get("https://#{host}:#{port}/",**options)
+    # The independent listener binds IPv4. Keep certificate/SNI hostname
+    # verification explicit so localhost's ::1 candidate cannot select a
+    # different, unlistened endpoint in Excon's nonblocking fallback.
+    response=Excon.get("https://127.0.0.1:#{port}/",**options)
     raise 'HTTP status/body changed' unless response.status==200 && response.body=="https\0verified\n"
   else
     http=Net::HTTP.new(host,port.to_i,nil)
@@ -85,6 +88,7 @@ def main():
     parser.add_argument('--binary',default=str(ROOT/'mere-ruby'))
     parser.add_argument('--reference',required=True)
     parser.add_argument('--output',required=True,type=Path)
+    parser.add_argument('--modes',nargs='+',choices=['reference','direct','bundled','external','reference-excon','excon','external-excon'])
     parser.add_argument('--gem-home',type=Path)
     parser.add_argument('--rubygems',type=Path)
     args=parser.parse_args()
@@ -104,7 +108,7 @@ def main():
     listener.listen(8)
     listener.settimeout(.2)
     stop=threading.Event()
-    server={'http_responses':0,'tls_rejections':0,'peer_closed_before_http':0,'errors':[]}
+    server={'http_responses':0,'tls_rejections':0,'peer_closed_before_http':0,'tls_events':[],'errors':[]}
     workers=[]
     def handle(connection):
         try:
@@ -126,7 +130,9 @@ def main():
                 # is a truncated TLS stream, which strict readers reject.
                 try:secure.unwrap().close()
                 except (ssl.SSLError,socket.timeout):pass
-        except ssl.SSLError:server['tls_rejections']+=1
+        except ssl.SSLError as error:
+            server['tls_rejections']+=1
+            server['tls_events'].append(str(error))
         except Exception as error:server['errors'].append(str(error))
         finally:connection.close()
     def serve():
@@ -146,6 +152,7 @@ def main():
     try:
         modes=['reference','direct','bundled','external']
         if args.gem_home:modes+=['reference-excon','excon','external-excon']
+        if args.modes:modes=args.modes
         for mode in modes:
             for scenario in ('success','trust','hostname'):
                 env=os.environ.copy()

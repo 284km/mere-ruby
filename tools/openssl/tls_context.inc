@@ -130,6 +130,6 @@ static void tls_context_call(const char *op,const arg *args,buffer *out) {
             const char *reason=ERR_reason_error_string(ERR_peek_last_error()); char message[512];
             snprintf(message,sizeof(message),"%s: %s",!strcmp(op,"set_ciphers")?"SSL_CTX_set_cipher_list":"SSL_CTX_set_ciphersuites",reason?reason:"no cipher match");
             error(out,klass,message);
-        } else ssl_error(out,klass,op);
+        } else ssl_error(out,klass,!strcmp(op,"set_min_version")?"SSL_CTX_set_min_proto_version":!strcmp(op,"set_max_version")?"SSL_CTX_set_max_proto_version":op);
     } else if(!out->len) byte(out,'n');
 }
