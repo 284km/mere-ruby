@@ -29,7 +29,7 @@ def certificate(name,serial,key,issuer,issuer_key,ca: false,usage: nil)
   cert.public_key=key
   cert.not_before=Time.now-60
   cert.not_after=Time.now+3600
-  factory=OpenSSL::X509::ExtensionFactory.new(cert,issuer || cert)
+  factory=OpenSSL::X509::ExtensionFactory.new(issuer || cert,cert)
   cert.add_extension(factory.create_extension('basicConstraints',ca ? 'CA:TRUE' : 'CA:FALSE',true))
   key_usage=ca ? 'keyCertSign,cRLSign' : usage=='timeStamping' ? 'digitalSignature' : 'digitalSignature,keyEncipherment'
   cert.add_extension(factory.create_extension('keyUsage',key_usage,true))
@@ -380,25 +380,34 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source',type=Path,default=ROOT/'tools/openssl_glue.c')
     parser.add_argument('--keep',type=Path)
+    parser.add_argument('--cc',default='clang')
+    parser.add_argument('--sanitize',action='store_true',help='ASan/UBSan; preload the compiler ASan runtime when using ctypes')
     args=parser.parse_args()
-    reference=subprocess.check_output(['sh','-c','. "$1/tools/ref_ruby.sh"; printf "%s" "$REF_RUBY_BIN"','sh',str(ROOT)],text=True)
+    child_env=os.environ.copy()
+    if args.sanitize:
+        # Instrument the provider loaded in this process. The independent
+        # reference and compiler are separate subjects and need no preload.
+        child_env.pop('LD_PRELOAD',None)
+        child_env.pop('DYLD_INSERT_LIBRARIES',None)
+    reference=subprocess.check_output(['sh','-c','. "$1/tools/ref_ruby.sh"; printf "%s" "$REF_RUBY_BIN"','sh',str(ROOT)],text=True,env=child_env)
     with tempfile.TemporaryDirectory(prefix='mr-openssl-formats-') as temp:
         directory=args.keep.resolve() if args.keep else Path(temp)
         directory.mkdir(parents=True,exist_ok=True)
         script=directory/'prepare.rb';script.write_text(PREPARE)
-        subprocess.run([reference,str(script),str(directory)],check=True,timeout=60)
+        subprocess.run([reference,str(script),str(directory)],check=True,timeout=60,env=child_env)
         flags=[]
         if sys.platform=='darwin':
             prefix=subprocess.check_output(['brew','--prefix','openssl@3'],text=True).strip()
             flags=[f'-I{prefix}/include',f'-L{prefix}/lib',f'-Wl,-rpath,{prefix}/lib']
         library=Path(temp)/'provider.so'
-        subprocess.run(['clang','-shared','-fPIC','-Wall','-Wextra','-Werror','-I'+str(ROOT/'tools'),str(args.source.resolve()),*flags,'-pthread','-lssl','-lcrypto','-o',str(library)],check=True,timeout=60)
+        if args.sanitize:flags+=['-fsanitize=address,undefined','-fno-omit-frame-pointer']
+        subprocess.run([args.cc,'-shared','-fPIC','-Wall','-Wextra','-Werror','-I'+str(ROOT/'tools'),str(args.source.resolve()),*flags,'-pthread','-lssl','-lcrypto','-o',str(library)],check=True,timeout=60,env=child_env)
         api=Provider(library)
         def files(name):return (directory/name).read_bytes()
         def verify(kind,content):
             target=directory/('native-'+kind+'.der');target.write_bytes(content)
             script=directory/'verify.rb';script.write_text(VERIFY)
-            subprocess.run([reference,str(script),kind,str(target),str(directory)],check=True,timeout=20)
+            subprocess.run([reference,str(script),kind,str(target),str(directory)],check=True,timeout=20,env=child_env)
         check_pkcs12(api,files,verify)
         check_pkcs7(api,files,verify)
         check_ocsp(api,files,verify)

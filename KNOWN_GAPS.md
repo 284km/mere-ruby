@@ -1053,13 +1053,26 @@ portable Digest/HMAC and AES CBC/ECB. Provider-backed operations raise
 is not constant-time. The playground reserves a 256 MiB Wasm heap before
 running the prelude and libraries; each run starts with a fresh instance.
 
-The measured selection (`unittest/openssl_files.txt`) contains 500 tests in
-27 Ruby 4.0.9 files: 498 MATCH, zero RED, two shared FIPS skips on macOS
-(OpenSSL 3.6.3) and Linux (3.5.7). The complete 33-file inventory has 593 tests;
-OCSP (22), PKCS12 (12), PKCS7 (19), Timestamp (38) and Netscape SPKI (2) are
-outside this implementation. Engine discovers zero tests on the reference;
-zero discovery is not counted as success. See `openssl-plan.json` and
+The measured selection (`unittest/openssl_files.txt`) contains 593 tests in
+all 32 nonempty Ruby 4.0.9 files: 591 MATCH, zero RED, two shared FIPS skips
+on macOS (OpenSSL 3.6.3) and Linux (3.5.7). PKCS12, PKCS7/S/MIME, OCSP,
+Timestamp and Netscape SPKI use genuine native operations and pass all 93
+previously remaining tests. Independent reference Ruby checks cover signatures,
+encryption, trust, purpose, expiry, nonce and tampering in both directions.
+OpenSSL 3.0 also passes the native ABI and format checks. Engine discovers
+zero tests on the reference; zero discovery is not counted as success.
+See `openssl-plan.json`, `openssl-completion-plan.json`, and
 `unittest/openssl_baseline_coverage.tsv` for scope and baseline.
+
+Real HTTPS and gem-load measurements are in `gemtest/latest.json` and
+`gemtest/https_latest.json`. External Net::HTTP and direct SSLSocket pass
+trusted HTTPS and negative trust/hostname checks. Excon's TLS rejection is
+followed by a core dispatch failure: implicit `set_backtrace` inside a custom
+exception initializer raises `NoMethodError`, while explicit calls work.
+`gemtest/exception_backtrace_probe.rb` reproduces it without OpenSSL. Reference
+Excon also has EPIPE failures in this environment; they are recorded separately.
+The stdlib probe identifies `uri`/`timeout`, then `net/protocol`/`net/http`,
+`open-uri` and `resolv` as the next dependency sequence.
 
 Native handles are typed, generation-checked and owned by Ruby objects.
 GC releases native resources directly. Worker threads run OpenSSL operations
@@ -1073,7 +1086,7 @@ without disabling that scan, and checks native ownership separately.
 
 Build with `sh tools/build.sh` after installing OpenSSL 3 development headers,
 or set `OPENSSL_PREFIX`. Run `python3 unittest/openssl_provider_check.py`,
-`python3 unittest/openssl_asn1_check.py`, and
+`python3 unittest/openssl_asn1_check.py`, `python3 unittest/openssl_formats_check.py`, and
 `python3 unittest/openssl_memory_check.py --output /tmp/openssl-memory` for
 independent provider, wire and lifetime checks. The memory output directory
 must not already exist.
@@ -3603,7 +3616,7 @@ exactly, because the other half would have to invent something:
 |---|---|
 | `cgi` — escapeHTML, unescapeHTML, the URI encoders, escapeElement | the request-shaped instance methods `#params`, `#header`, `#out`, `#[]`: they need a request environment, and this process is not a CGI script. ⚠ `CGI.new` itself SUCCEEDS and hands back an object none of them answer for -- the one row here that fails somewhere other than the name you asked for |
 | `io/console` — `StringIO#getch` | `#getpass`: ruby consumes one character more than "a line without the newline", and a method that is close but not the same is a wrong answer where a missing one is an honest refusal |
-| `openssl` — native OpenSSL 3 keys, X509, TLS, primitives; portable ASN.1 | OCSP, PKCS12, PKCS7, Timestamp and Netscape SPKI; native keys/certificates/TLS unavailable in Wasm |
+| `openssl` — native OpenSSL 3 keys, X509, TLS, primitives and container formats; portable ASN.1 | Native provider operations unavailable in Wasm; algorithms depend on linked OpenSSL/providers; Engine has zero reference tests |
 | `socket` — Addrinfo, Option, AncillaryData, constants; TCP in both families, addressed UDP | `UDPSocket` supports addressed send/receive; generic socket datagram paths and binding preservation across UDP connect remain limited (see the `socket` entry) |
 
 ⚠ Each of these was added because something failed by NAME rather than by

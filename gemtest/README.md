@@ -1,67 +1,69 @@
-# gemtest
+# Gem and HTTPS measurements
 
-Load a fixed list of real, installed gems under mere-ruby and report which
-ones come up. The point is not the count: it is that **every failure names
-its own cause**, so the list doubles as a work queue.
+`measure.py` runs the existing 29-gem list in separate processes under a pinned
+Ruby 4.0.9 reference and mere-ruby, with and without an external stdlib. Both
+interpreters use the same installed gem home and RubyGems source checkout.
+Each process family is limited to 120 seconds and 2 GiB; stdout, stderr, exit,
+resource limits and reference availability are recorded. Use a fresh output
+directory for every run.
 
 ```sh
-./gemtest/run.sh <gem-home> <rubygems-checkout> [stdlib-dir]
+python3 gemtest/measure.py --binary ./mere-ruby \
+  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --gem-home /path/to/installed/gem-home \
+  --rubygems /path/to/ruby-source-3e93b23 \
+  --output /tmp/gem-measure-new
 ```
 
-- `<gem-home>` — a CRuby installation's `gems/<abi>` directory (the tree that
-  holds `gems/` and `specifications/`). mere-ruby reads it; it cannot install
-  into it, because installing needs TLS. See [KNOWN_GAPS.md](../KNOWN_GAPS.md).
-- `<rubygems-checkout>` — a rubygems source checkout; its `lib/` goes on the
-  load path so `require "rubygems"` runs the real thing.
-- `[stdlib-dir]` — optional. With it, mere-ruby is pointed at that
-  installation's pure-Ruby stdlib via `-I`. Without it, mere-ruby runs on the
-  libraries it ships, which is the stricter number.
+The Ruby source checkout must be `3e93b23afcec3433f6aecc34b5d832799d754238`.
+The external stdlib comes from the reference installation's `rubylibdir` and
+installed bundled/default gem `lib` directories. Installed gem libraries are
+available in both native modes; “bundled” means no additional stdlib `-I`,
+not an empty gem home. Loading a gem does not establish that its operations
+work. Reference-unavailable gems are recorded separately from divergences.
 
-Both numbers are worth keeping: the first says how far mere-ruby gets when it
-is allowed to read a CRuby stdlib, the second how far it gets alone.
+On 2026-11-10, the reference loads 23 of 29 gems. Both native modes load all
+23, with no timeouts, crashes or memory-limit hits. The other six require
+Rails application setup or native dependencies unavailable to the reference.
+`latest.json` records each result, exclusions, binary identity and a digest
+of the installed gemspec manifest. The manifest itself stays local.
 
-The gem list is `gems.txt`; point `GEMLIST` at another file to use a different
-one. The harness itself carries no paths — everything comes from the arguments
-and the environment, so it survives a clean machine. (It did not always: it
-lived in /tmp, and a cleared /tmp took the measurement with it.)
+`https_measure.py` uses a local Python TLS server and independently generated
+reference certificates. It checks real binary HTTP responses, explicit trust,
+wrong trust and hostname rejection. The server sends TLS `close_notify`;
+clients never disable certificate validation. Each child is bounded to 30
+seconds and 1 GiB. It records missing libraries and operational errors as
+distinct results.
 
-**One gem per process** (`load_one.rb`). A gem that crashes the interpreter
-outright — a native signal, not a Ruby exception — used to take every gem
-after it down with it, and the tally silently shrank to whatever came before
-the crash. Twenty-nine startups is the price of a gate that keeps reporting;
-a signal shows up as `CRASH <gem>`.
+```sh
+python3 gemtest/https_measure.py --binary ./mere-ruby \
+  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --gem-home /path/to/installed/gem-home \
+  --rubygems /path/to/ruby-source-3e93b23 \
+  --output /tmp/https-measure-new
+```
 
-**Every gem is loaded under the reference ruby too**, and a gem ruby cannot
-load here either is reported as `SKIP`, not as a failure. Two in the list
-(`action_tracer`, `letter_opener_web`) require a Rails application to exist:
-CRuby fails them with `uninitialized constant Rails` exactly as mere-ruby
-does, and counting those against the interpreter overstated the gap by two.
-The denominator in the summary line is the number of gems ruby itself loads.
+Omit both `--gem-home` and `--rubygems` to measure SSLSocket and Net::HTTP
+alone. With them, the existing Excon gem is measured too. See
+`https_latest.json` for successes and remaining client failures.
 
-## Where it stands (2026-08-19)
+The standalone availability probe is in `stdlib_availability.tsv`. The next
+stdlib work is `uri` and `timeout`, then `net/protocol`, `net/http`, `open-uri`
+and `resolv`. External Net::HTTP already exercises the implemented native TLS
+provider successfully. These measurements remain optional because they need
+an installed gem home; independent OpenSSL format and resource gates run in CI.
 
-The denominator is the number of gems the reference ruby itself loads here: 27
-of the 29, the other two needing a Rails application to exist.
+The legacy `run.sh <gem-home> <rubygems-checkout> [stdlib-dir]` remains
+available; `GEMLIST` selects another gem list for that script. It reports
+`SKIP` when its reference cannot load a gem. Use `measure.py` for the pinned
+reference, saved logs and bounded process-family measurements above.
 
-| | loads |
-|---|---|
-| on what mere-ruby ships | **17 / 27** |
-| with a CRuby stdlib on `-I` | **21 / 27** |
-
-Every remaining failure names its own cause, and with a stdlib on `-I` all six
-are boundaries that are already written down: `openssl` (aws-sdk-s3, excon,
-fog-aws), `bigdecimal.so` (devise), protobuf (sassc-embedded), and
-rubocop-rails past the 120-second budget (a slowdown, not a hang; see
-[KNOWN_GAPS.md](../KNOWN_GAPS.md)). Two of those used to stop earlier, at a
-character class written out of raw control bytes that the regex engine
-rejected — the kind of finding this list exists to produce.
-
-Without the stdlib, ten fail, and the four extra ones are what that stdlib was
-answering: seven are a pure-Ruby library that is not here (`net/protocol`,
-`ipaddr` ×3, `open-uri`, `shellwords`, `cgi/escape`) and two ask for
-`File#fileno`. That difference is what the two numbers are for: the first says
-how far mere-ruby gets alone, the second what is left when the libraries it
-does not ship are handed to it.
-
-That breakdown is the value of the run: it is a list of named work, not a
-score.
+Excon 0.110.0 completes trusted HTTPS in both native modes. Its negative-peer
+paths hit an interpreter dispatch gap while wrapping the correctly rejected
+TLS peer: an implicit `set_backtrace` call in a custom exception initializer
+raises `NoMethodError`. Run `gemtest/exception_backtrace_probe.rb` under both
+interpreters for the independent minimal reproduction. Reference Excon also
+fails its trusted and wrong-CA runs with `EPIPE` in this environment; these
+failures remain explicit in the record and are not called matching successes.
+The next small core task is that implicit exception-method dispatch, before
+the stdlib dependency sequence above.
