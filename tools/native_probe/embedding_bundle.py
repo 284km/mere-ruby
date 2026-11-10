@@ -57,7 +57,7 @@ os.chdir(objects)
 run('extract-prism', ['ar', 'x', prism])
 prism_objects = sorted(objects.glob('*.o'))
 assert prism_objects, 'Prism archive contained no object files'
-glue = [ROOT / 'tools' / (name + '.c') for name in ['prism_glue', 'socket_glue', 'process_glue', 'openssl_glue']]
+glue = [ROOT / 'tools' / (name + '.c') for name in ['prism_glue', 'socket_glue', 'math_glue', 'process_glue', 'openssl_glue']]
 for source in glue:
     target = objects / (source.stem + '.o')
     assert not target.exists(), f'archive member collision: {target.name}'

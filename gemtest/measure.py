@@ -11,6 +11,7 @@ import sys
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT/'unittest'))
 from ci import supervise
+from snapshot import verify_snapshot
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
@@ -19,6 +20,7 @@ def main():
     parser.add_argument('--gem-home',required=True,type=Path)
     parser.add_argument('--rubygems',required=True,type=Path)
     parser.add_argument('--output',required=True,type=Path)
+    parser.add_argument('--snapshot-lock',type=Path)
     args=parser.parse_args()
     args.output.mkdir(parents=True,exist_ok=False)
     assert (args.gem_home/'specifications').is_dir()
@@ -29,6 +31,7 @@ def main():
         'print ([RbConfig::CONFIG["rubylibdir"]]+Dir[File.join(Gem.default_dir,"gems","*","lib")].sort).join(":")'],text=True)
     gems=[s.strip() for s in (ROOT/'gemtest/gems.txt').read_text().splitlines() if s.strip() and not s.startswith('#')]
     specs={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((args.gem_home/'specifications').glob('*.gemspec'))}
+    snapshot=verify_snapshot(args.gem_home,args.snapshot_lock,gems) if args.snapshot_lock else None
     rows=[]
     for gem in gems:
         row={'gem':gem}
@@ -52,7 +55,8 @@ def main():
         row['classification']='reference-unavailable' if not row['reference']['loaded'] else 'eligible'
         rows.append(row)
         print(gem,*(mode+':'+('OK' if row[mode]['loaded'] else 'FAIL') for mode in ('reference','bundled','external')),flush=True)
-        (args.output/'results.json').write_text(json.dumps({'reference_version':version,'gemspec_sha256':specs,'rows':rows},indent=2)+'\n')
+        (args.output/'results.json').write_text(json.dumps({'reference_version':version,'gemspec_sha256':specs,'snapshot':snapshot,'rows':rows},indent=2)+'\n')
+    if args.snapshot_lock:assert verify_snapshot(args.gem_home,args.snapshot_lock,gems)==snapshot,'snapshot changed during measurement'
     eligible=[r for r in rows if r['classification']=='eligible']
     summary={'date':'2026-11-10','reference_version':version,'listed':len(rows),'reference_loads':len(eligible),
              'reference_unavailable':len(rows)-len(eligible),
