@@ -2271,7 +2271,7 @@ class Socket < BasicSocket
   # the deprecated hostent lookups (sock_s_gethostbyname / _gethostbyaddr):
   # [name, aliases, family, *addresses as packed bytes]
   def self.gethostbyname(name)
-    warn("Socket.gethostbyname is deprecated; use Addrinfo.getaddrinfo instead.", uplevel: 1, category: :deprecated)
+    warn("Socket.gethostbyname is deprecated; use Addrinfo.getaddrinfo instead.", uplevel: 1)
     host = name.is_a?(String) ? name : name.to_str
     host = "255.255.255.255" if host == "<broadcast>"
     host = "0.0.0.0" if host == "<any>"
@@ -2281,7 +2281,7 @@ class Socket < BasicSocket
     [ais[0].canonname || host, [], fam, *addrs]
   end
   def self.gethostbyaddr(addr, family = nil)
-    warn("Socket.gethostbyaddr is deprecated; use Addrinfo#getnameinfo instead.", uplevel: 1, category: :deprecated)
+    warn("Socket.gethostbyaddr is deprecated; use Addrinfo#getnameinfo instead.", uplevel: 1)
     raw = (addr.is_a?(String) ? addr : addr.to_str).b
     fam = family.nil? ? (raw.bytesize == 16 ? Socket::AF_INET6 : Socket::AF_INET) : Constants.__family_arg(family)
     need = fam == Socket::AF_INET6 ? 16 : (fam == Socket::AF_INET ? 4 : nil)

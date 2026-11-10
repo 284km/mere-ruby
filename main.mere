@@ -2803,6 +2803,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     then map_get consts (substring name 8 (str_len name))
     else if str_len name > 2 && str_eq (substring name 0 2) "::" && map_has consts (substring name 2 (str_len name))
     then map_get consts (substring name 2 (str_len name))
+    // (...and the name as the scope sees it: `X ||= 1` in `class Foo` reads
+    //  Foo::X, which the flat table holds under that name and not X)
+    else if (match eval_e env world blk (EDefined (EConst name)) with VNil -> false | _ -> true)
+    then eval_e env world blk (EConst name)
     else VNil
   | EScopedRead (recv_e, cn) ->
     (match scope_mod_val world (eval_e env world blk recv_e) with
@@ -2923,6 +2927,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        (let _ = declare_nils env (stmt_targets st) in mkstr "assignment")
      | ENil -> mkstr "nil"
      | EBool b -> if b then mkstr "true" else mkstr "false"
+     // a backtick / %x literal is an expression, though it calls #`
+     | ECall (bt9, _) when str_len bt9 == 1 && str_eq bt9 "`" -> mkstr "expression"
+     | EMethod (_, bt9, _) when str_len bt9 == 1 && str_eq bt9 "`" -> mkstr "expression"
+     // ...and so is a symbol built by interpolation, `:"#{x}"`
+     | EMethod (r9, ts9, Nil) when str_eq ts9 "to_sym" && interp_literal r9 -> mkstr "expression"
+     // ...and a regexp LITERAL with named groups on the left of =~ (it
+     // assigns the captures: ruby's NODE_MATCH2 with locals)
+     | EBin (op9, ERegex (p9, _), _) when str_eq op9 "=~" && str_contains p9 "(?<" -> mkstr "expression"
      // `&&`, `||`, `and` and `or` are CONTROL FLOW, not method calls: ruby
      // answers "expression" for them however undefined their operands are,
      // and evaluates nothing. That is most of what defined? is asked in
@@ -2969,7 +2981,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // `defined?(__LINE__)` would be an EInt and `defined?(break)` an EFlow,
        // and both answer "expression" in ruby. Read as names they were neither
        // a local nor a method, so every one of them was nil.
-       else if (str_len name == 8 && str_eq name "__FILE__") || (str_len name == 8 && str_eq name "__LINE__") || (str_len name == 12 && str_eq name "__ENCODING__")
+       // (...and with the file or the encoding attached, as `defined?
+       //  __FILE__` without parentheses reads them: "__FILE__~path",
+       //  "__ENCODING__<enc>", "__dir__~")
+       else if (str_len name >= 8 && (str_eq (substring name 0 8) "__FILE__" || str_eq (substring name 0 8) "__LINE__"))
+               || (str_len name >= 12 && str_eq (substring name 0 12) "__ENCODING__")
                || (str_len name == 5 && str_eq name "break") || (str_len name == 4 && str_eq name "next") || (str_len name == 4 && str_eq name "redo")
                || (str_len name == 5 && str_eq name "retry") || (str_len name == 6 && str_eq name "return") then mkstr "expression"
        else if (str_len name == 5 && str_eq name "yield") then (let (has, _, _, _) = blk in if has then mkstr "yield" else VNil)
@@ -3510,16 +3526,24 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let _ = (match argvals with
              | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
                        then map_set raise_bt "keep" (VInt 1) else ())
+             // (...and `raise e` of the pair whose frames are beside it: a
+             //  rescued builtin refusal re-raised keeps where it happened)
+             | Cons (VExc (_, _), Nil) ->
+               (if ((map_has raise_bt "e" && map_has raise_bt "eb" && rb_eq (map_get raise_bt "e") exc) || (map_has raise_bt "vx" && map_has raise_bt "v" && rb_eq (map_get raise_bt "vx") exc))
+                then map_set raise_bt "keep" (VInt 1) else ())
              | _ -> ()) in
     let _ = debug_raise_note world exc in
     // (the :raise's binding is this frame's: tp_env)
     let _ = (if tpr9 then tp_env_set env else ()) in
     raise_exc_val world exc
   | EVar name ->
+    // `{self:}`: a local named self (bnd_lv_key), else the call #self
+    if str_len name == 5 && str_eq name (chr 3 ++ "self") then
+      (if lv_has env name then lv_get env name else eval_e env world blk (ECall ("self", Nil)))
     // a name the lexer found was not a local YET where it stands (it is
     // assigned further on in its scope): ruby's parser made it a call
     // (lvt_vcall_tag)
-    if str_len name > 1 && ord (char_at name 0) == 2 then
+    else if str_len name > 1 && ord (char_at name 0) == 2 then
       eval_e env world blk (ECall (substring name 1 (str_len name), Nil))
     // a bare `bg!` -- no parentheses, no arguments -- that names an alias of
     // block_given? / raise is the call the ECall arm resolves (a name that
@@ -4085,6 +4109,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             && (if lv_has env "self" then
                   (match lv_get env "self" with
                    | VObj id -> let (mm, sp, ocls, iv) = world in (if has_meth world (map_get ocls id) "`" then false else true)
+                   // (a class body's self: its own `def self.\`` answers
+                   //  the literal there -- test_compile_prism's XStringNode)
+                   | VClass c9 -> (if has_meth world ("(sng:" ++ c9 ++ ")") "`" then false else true)
                    | _ -> true)
                 else true) then
       (let self9 = (if lv_has env "self" then lv_get env "self" else VMain) in
@@ -5419,12 +5446,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                && (str_eq ocl "Enumerator::ArithmeticSequence" || str_eq ocl "Method" || str_eq ocl "UnboundMethod"
                    // (a Time keeps being one behind a singleton class: `def t.x`
                    // made `t == Time.utc(1970)` fall through to identity)
-                   || obj_is_a world (display_cls world ocl) "Time"
+                   || time_cls world (display_cls world ocl)
                    || exc_is_a world ocl "Exception")
                && (if has_meth world ocl op then false else true) then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // Time's arithmetic is a primitive, not an entry in the method table.
-       else if obj_is_a world (display_cls world ocl) "Time" && (str_eq op "+" || str_eq op "-") then
+       else if time_cls world (display_cls world ocl) && (str_eq op "+" || str_eq op "-") then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // an object with no operator of its own but a method_missing: ruby
        // dispatches the operator like any other message (a matcher's =~).
@@ -8243,7 +8270,7 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // recursive lambdas raise Ruby's catchable error instead of exhausting the
   // native stack. No depth, refinement or caller state has changed yet.
   if bcd9 - fb_depth_base () >= ruby_call_depth_limit then
-    (let _ = raise_exc world "SystemStackError" "stack level too deep" in FRaise VNil)
+    (let _ = raise_stack_too_deep world in FRaise VNil)
   else
   // (and the caller's FILE comes back with it: a block written in another
   //  file -- `eval("proc { }", nil, "f.rb")` -- starts with its own SFile, and
@@ -11972,7 +11999,7 @@ and has_own_eq = fn world -> fn (v: Val) ->
   match v with
   | VObj _ ->
     (let c = dispatch_cls_of world v in
-     has_meth world c "==" || obj_is_a world (display_cls world c) "Time" || cmp_mixin_eq world v
+     has_meth world c "==" || time_cls world (display_cls world c) || cmp_mixin_eq world v
      // (a Range held in an object -- a subclass's, a #dup's -- compares as the
      //  Range it holds: its == arm)
      || rng_sub_held world v || num_sub_held world v)
@@ -13362,7 +13389,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     //   "#<Time:0x... @__t=0, @__epoch=0>". A subclass that defines its own
     //   #inspect still gets it, below.
     else if (if usr9 then false else true)
-            && map_has iv2 (str_of_int oid ++ "@__t") && obj_is_a world (display_cls world cls) "Time"
+            && map_has iv2 (str_of_int oid ++ "@__t") && time_cls world (display_cls world cls)
     then time_str_of world v true
     // ...and `p fiber` is Fiber#inspect, `#<Fiber:0x.. file:line (status)>`,
     // for the same reason: the generic form printed the bookkeeping ivars
@@ -16153,7 +16180,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
            //  Array#== too; the operator path already asked it)
            | VObj oid -> (let (_, _, ocls9, _) = world in
                           let c9 = map_get ocls9 oid in
-                          obj_is_a world (display_cls world c9) "Time" && (if time_user_meth world c9 name then false else true))
+                          time_cls world (display_cls world c9) && (if time_user_meth world c9 name then false else true))
            | _ -> false)
           && ((str_len name == 3 && str_eq name "utc") || (str_len name == 6 && str_eq name "getutc") || (str_len name == 9 && str_eq name "localtime")
               || (str_len name == 8 && str_eq name "getlocal") || (str_len name == 5 && str_eq name "round") || (str_len name == 4 && str_eq name "to_i")
@@ -17366,6 +17393,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                          | VStr _ -> true | VArr _ -> true | VHsh _ -> true
                                          // (main too: `extend M` at the top level)
                                          | VMain -> true
+                                         // (and a Regexp: one made at run time
+                                         //  has an id of its own, a literal is
+                                         //  frozen and refuses below -- Marshal's
+                                         //  extended Regexp)
+                                         | VRegex (_, _, _) -> true
                                          | _ -> false) then
     // extend mixes a module's instance methods in as singleton methods of the
     // receiver. For an object that means materialising its singleton class (so
@@ -17391,12 +17423,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      let _ = (match recv with
               | VClass c9 -> frz_cls_check world c9
               | _ -> ()) in
-     let _ = (if val_frozen_mut recv
+     let _ = (if val_frozen_mut recv || (match recv with VRegex (_, _, _) -> val_is_frozen recv | _ -> false)
               then (let _ = raise_exc world "FrozenError"
                       ("can't modify frozen " ++ display_cls_msg world (dispatch_cls_of world recv)
                        ++ ": " ++ inspect_w env world recv) in ()) else ()) in
      let sc = (match recv with
                | VClass c -> "(sng:" ++ c ++ ")"
+               | VRegex (_, _, _) -> prim_sng_cls world recv "Regexp"
                | VObj id -> singleton_cls_of world id
                | VStr _ -> prim_sng_cls world recv "String"
                | VArr _ -> prim_sng_cls world recv "Array"
@@ -17719,8 +17752,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // "returns an instance of Time, even if called on a subclass". The object
     // is tagged with the RECEIVER's class, not with "Time", so the subclass's
     // own methods dispatch and `super` still reaches Time.
-    else if ((str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm")
-              || (str_len name == 5 && str_eq name "local") || (str_len name == 6 && str_eq name "mktime")) && obj_is_a world c "Time" then
+    else if time_cls world c && ((str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm")
+                                || (str_len name == 5 && str_eq name "local") || (str_len name == 6 && str_eq name "mktime")) then
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
        let _ = map_set ocls9 id c in
@@ -17765,7 +17798,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let _ = (if str_eq cyc9 "0" then () else (let _ = time_x_mark () in map_set iv9 (str_of_int id ++ "@__tyc") (norm_big cyc9))) in
        let _ = (if (str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm") then map_set iv9 (str_of_int id ++ "@__utc") (VBool true) else ()) in
        VObj id)
-    else if ((str_len name == 3 && str_eq name "now") || (str_len name == 2 && str_eq name "at")) && obj_is_a world c "Time" then
+    else if time_cls world c && ((str_len name == 3 && str_eq name "now") || (str_len name == 2 && str_eq name "at")) then
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
        let _ = map_set ocls9 id c in
@@ -18625,9 +18658,28 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // thread run first (the prelude's readiness loop asks again after it)
     // ...and the thread is "sleep" for the whole wait, not only during each
     // millisecond (sch_io, read by #status, #stop? and #inspect)
+    // (with the descriptors it waits on -- [fds], [bits] -- the scheduler's
+    //  idle wait polls them, so the park can be long: 100 ms, where it was a
+    //  millisecond of asking again; sch_iofd)
     else if str_eq c "IO" && (str_len name == 6 && str_eq name "__park") && fb_can_suspend then
-      (let _ = map_set sch_io (sch_me ()) 1 in
-       let _ = sch_block world 1 0 (sch_now () + 1000000) in VNil)
+      (let me9 = sch_me () in
+       let _ = map_set sch_io me9 1 in
+       let w9 = (match args with
+                 | Cons (VArr fa9, Cons (VArr ia9, _)) ->
+                   (let rec pairs = fn (fs: Val list) -> fn (is: Val list) ->
+                      (match (fs, is) with
+                       | (Cons (VInt f, fr), Cons (VInt b, ir)) -> str_of_int f ++ ":" ++ str_of_int b ++ " " ++ pairs fr ir
+                       | _ -> "") in
+                    pairs (deref fa9) (deref ia9))
+                 | _ -> "") in
+       let long9 = str_len w9 > 0 in
+       // (never past what is left of the caller's own timeout, in ms)
+       let left9 = (match args with Cons (_, Cons (_, Cons (VInt l9, _))) -> l9 | _ -> 0 - 1) in
+       let ns9 = (if long9 then (if left9 >= 0 && left9 < 100 then (if left9 < 1 then 1 else left9) * 1000000 else 100000000) else 1000000) in
+       let _ = (if long9 then map_set sch_iofd me9 w9 else ()) in
+       let _ = sch_block world 1 0 (sch_now () + ns9) in
+       let _ = (if map_has sch_iofd me9 then map_delete sch_iofd me9 else ()) in
+       VNil)
     // every thread waiting for a descriptor polls again: a stream was closed
     // under it (test_io's recycled_fd_close joined a reader 300 times and
     // waited out a millisecond for each, while another thread ran laps)
@@ -27767,7 +27819,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let rec walk9 = fn e9 ->
          (let _ = map_iter e9 (fn (k9: str) -> fn (v9: Val) ->
                     if bnd_is_local k9 && (if map_has seen9 k9 then false else true)
-                    then (let _ = map_set seen9 k9 1 in map_set acc9 (str_of_int (map_len acc9)) (VSym k9))
+                    then (let _ = map_set seen9 k9 1 in map_set acc9 (str_of_int (map_len acc9)) (VSym (bnd_lv_name k9)))
                     else ()) in
           let (has9, p9) = lv_parent_of e9 in
           if has9 then walk9 p9 else ()) in
@@ -27799,7 +27851,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // ⚠ a name the binding does not hold is a NameError, not nil. Answering
           // nil made `binding.local_variable_get(:it)` look like a local holding
           // nothing -- and the same for every misspelt name.
-          else if lv_has benv n then lv_get benv n
+          else if lv_has benv (bnd_lv_key n) then lv_get benv (bnd_lv_key n)
           // a declared toplevel local not assigned yet holds nil
           else if tl_is bid && tl_declared n then VNil
           else raise_exc world "NameError"
@@ -27812,7 +27864,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
           // lv_set: a variable the binding already has is assigned where it
           // lives (a copy shares it); a new one is the binding's own
-          else (let _ = lv_set benv n v in
+          else (let _ = lv_set benv (bnd_lv_key n) v in
                 let _ = (if tl_is bid && (if map_has tl_dyn n then false else true)
                          then map_set tl_dyn n (map_len tl_dyn) else ()) in v))
        | _ -> VNil)
@@ -27821,7 +27873,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Cons (VSym n, _) ->
          (if numbered_digit n > 0
           then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
-          else VBool (lv_has benv n || (tl_is bid && tl_declared n)))
+          else VBool (lv_has benv (bnd_lv_key n) || (tl_is bid && tl_declared n)))
        | _ -> VBool false)
     // Binding#implicit_parameters / #implicit_parameter_get /
     // #implicit_parameter_defined? (ruby 4.0): the numbered parameters up to
@@ -32695,6 +32747,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                  // ...and so is a Proc (core/proc/dup_spec and clone_spec set
                  // one before copying; it was "can't modify frozen Proc")
                  | VProc p9 -> "prc:" ++ str_of_int p9
+                 // ...and so is a Regexp made at run time (Regexp.new, #dup,
+                 // Marshal's): it carries an id of its own (rx_with_new_id),
+                 // and its key is per object. A literal is frozen and refuses.
+                 | VRegex (_, _, e9) when str_len (rx_ev_id e9) > 0 -> hng_key recv
                  | _ -> "") in
      // ⚠ the interpreter's OWN bookkeeping rides in ivars named "@__..."
      //   (a File's @__f_path and @__f_pos, an Enumerator's @__e_pos, a
@@ -34807,7 +34863,7 @@ and obj_answers_eq = fn world -> fn (v: Val) ->
   //  structural comparison would compare the instants exactly)
   | VObj _ -> (let c9 = dispatch_cls_of world v in
                has_meth world c9 "==" || builtin_obj_has (display_cls world c9) "==" || cmp_mixin_eq world v
-               || obj_is_a world (display_cls world c9) "Time")
+               || time_cls world (display_cls world c9))
   | _ -> false
 // an object whose == is Comparable's: it includes the module and has a <=>
 and cmp_mixin_eq = fn world -> fn (v: Val) ->
@@ -35110,6 +35166,9 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
            else set_sup s9 nc (if map_has s9 c then map_get s9 c else "Object")) in
   let _ = (let b9 = prim_base_name c in
            if str_len b9 > 0 then (let _ = map_set prim_sub nc b9 in map_set prim_copy nc b9) else ()) in
+  // (which class this is a copy of: a copy of Time answers Time's class
+  //  methods -- `Time.dup.now` -- though it is no subclass, cls_copy_of)
+  let _ = map_set cls_copy_of nc c in
   // the pairs to copy are collected first: the tables are written while
   // being read otherwise
   let rec_pfx = fn (src: str) -> fn (dst: str) ->
@@ -38937,6 +38996,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // c.object_id` (test_object_id) was true for a copy that is not equal?
      | VClass c -> VInt (cls_oid c)
      | VMain -> VInt 16
+     | VRegex (_, _, _) -> VInt (rx_oid_of (hng_key recv))
      | _ -> VInt 0)
   // #nan? / #next_float / #prev_float belong to Float alone: an Integer
   // answering false (or a Float) for them is a name Integer does not have.
@@ -44309,6 +44369,11 @@ and class_parent_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
     else if str_eq cls "Enumerator::ArithmeticSequence" || str_eq cls "Enumerator::Lazy" || str_eq cls "Enumerator::Chain"
     then class_parent_is_a world "Enumerator" target
     else false
+// a Time, a subclass of it, or a copy of either (Time.dup / #clone): the
+// class methods Time answers by name (cls_copy_of)
+and time_cls = fn world -> fn (c: str) ->
+  obj_is_a world c "Time"
+  || (map_len cls_copy_of > 0 && map_has cls_copy_of c && time_cls world (map_get cls_copy_of c))
 and obj_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
   // membership in the full ancestor chain, which unlike the bare `sup` chain
   // also counts included modules (Comparable, Enumerable, Kernel, ...), so
@@ -46661,7 +46726,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
               else print_err ("[stack] innermost frames:\n" ++ stack_dump cd 40 "")) in
      let _ = // ruby's message is the four words; the class in parentheses is what the
      // REPORTER adds when nothing rescues it, so having it here printed it twice
-     raise_exc world "SystemStackError" "stack level too deep" in FRaise VNil)
+     raise_stack_too_deep world in FRaise VNil)
   else
   let _ = cd_set (cd + 1) in
   // A method body may run with UNROOTED values in flight above it (the
@@ -51469,6 +51534,17 @@ and debug_raise_note = fn world -> fn (exc: Val) ->
      | VNil -> print_err (substring line9 0 (str_len line9 - 1))
      | _ -> (let _ = try_or (fn (u: unit) -> invoke_val_c gc_cenv0 world nb9 se9 "write" (Cons (lv9, Nil)) false) VNil in ()))
   else ()
+// SystemStackError as an exception OBJECT, which keeps its frames: as the
+// class-and-message pair its frames lived beside the LAST raise, so `raise e`
+// of a rescued one (test_exception's stackoverflow) gave it the re-raise's
+// one frame where ruby keeps its 15000.
+and raise_stack_too_deep = fn world ->
+  let (_, _, ocls9, ivars9) = world in
+  let id9 = alloc_oid ocls9 in
+  let _ = map_set ocls9 id9 "SystemStackError" in
+  let _ = map_set ivars9 (str_of_int id9 ++ "@__exception_message") (mkstr "stack level too deep") in
+  let _ = map_set ivars9 "$exc" (VObj id9) in
+  raise_exc_val world (VObj id9)
 and kernel_raise_now = fn world -> fn (args: Val list) ->
   let (_, _, _, iv0) = world in
   let exc = (match args with
@@ -51488,6 +51564,11 @@ and kernel_raise_now = fn world -> fn (args: Val list) ->
                       let _ = (match args with
                                | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
                                          then map_set raise_bt "keep" (VInt 1) else ())
+                               // (...and so does `raise e` of the pair raised
+                               //  last, whose frames are still beside it)
+                               | Cons (VExc (_, _), Nil) ->
+                                 (if ((map_has raise_bt "e" && map_has raise_bt "eb" && rb_eq (map_get raise_bt "e") exc) || (map_has raise_bt "vx" && map_has raise_bt "v" && rb_eq (map_get raise_bt "vx") exc))
+                                  then map_set raise_bt "keep" (VInt 1) else ())
                                | _ -> ()) in
                       let _ = map_set globals "!" VNil in
                       raise_exc world c9 m9)
@@ -52914,7 +52995,7 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
   // ⚠ a SUBCLASS of Time (Class.new(Time).new(...)) is built here too and
   //   tagged with its own class; it used to fall through to a plain object
   //   with no instant at all.
-  else if str_eq cls "Time" || (obj_is_a world cls "Time" && not (has_meth world cls "initialize")) then
+  else if str_eq cls "Time" || (time_cls world cls && not (has_meth world cls "initialize")) then
     (let (meths, sup, ocls, ivars) = world in
      let pos9 = (match args with
                  | Nil -> Nil
@@ -54226,6 +54307,10 @@ and cls_display = fn world -> fn (c0: str) ->
            "#<Class:#<" ++ ocn ++ ":0x" ++ hex_pad16 (oid - handle_base) ++ ">>")
      // (main's is an Object's, as ruby prints it: #<Class:#<Object:0x...>>)
      else if str_eq inner "main:0" then "#<Class:#<Object:0x" ++ hex_pad16 8 ++ ">>"
+     // (a Regexp's is the object's too, #<Class:#<Regexp:0x...>>: its key is
+     //  hng_key's, and its id rx_oid_of's)
+     else if str_len inner > 3 && str_eq (substring inner 0 3) "rx:" then
+       "#<Class:#<Regexp:0x" ++ hex_pad16 (rx_oid_of inner) ++ ">>"
      // a String's, an Array's (... hng_key) singleton is the object's too:
      // #<Class:#<String:0x...>>, not the bookkeeping key "str:N"
      else if str_len inner > 4 && str_eq (char_at inner 3) ":" && is_digit (char_at inner 4) then
@@ -55566,6 +55651,9 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
            FNext v
          else exec_stmt cenv world noblk s   // a local / scoped assign in the body
        // `alias new old` inside the class copies the method entry.
+       // (`alias $a $b` in a class body aliases a GLOBAL, as anywhere: the
+       //  statement's own arm does that)
+       | SAlias (n1, _) when str_len n1 > 0 && str_eq (char_at n1 0) "$" -> exec_stmt cenv world noblk s
        | SAlias (n1, n2) -> let _ = do_class_alias world cls n1 n2 in FNext VNil
        // `include M` records the module for method lookup fallback.
        | SInclude (m, pre) ->
@@ -58844,6 +58932,8 @@ and bare_yield_expr = fn (e: Expr) ->
   // is not a `yield` for the "Invalid yield" check, which ruby does not raise
   // for it anywhere. The capture reader sets the flag.
   | EDefined (EVar w) when str_eq w "yield" -> map_has yscan_defined "y"
+  // (`defined? yield` without parentheses is the yield node itself)
+  | EDefined (EYield _) -> map_has yscan_defined "y"
   | EDefined a -> bare_yield_expr a
   | EAssign (_, a) -> bare_yield_expr a
   | EFlow (_, a) -> bare_yield_expr a

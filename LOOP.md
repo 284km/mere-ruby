@@ -3313,3 +3313,57 @@ is the witness. mere >= 0.1.725.
   (stage 4). Mere's three probes on C and LLVM, macOS and the CI's Linux. The
   spec records: base DIFF 31 -> 26, CRASH 1 -> 0 (expect; core/kernel/open
   is #76's open-uri); stdlib DIFF 26 -> 11 (CRASH 6, coverage and fiddle).
+
+## 2026-11-10 (29): the small items of stage 3 -- a binding's local named self, a re-raised SystemStackError's frames, a run-time Regexp's own state, a copy of Time, defined? and the parse shapes test_compile_prism names, OpenSSL::KDF's refusals, a copy_stream that waits
+
+Round 13 of note 541 (the leftovers of stage 3, re-surveyed after note 540).
+corpus/576 is the witness. No Mere change.
+
+- **A binding's local named self** (and one named for a keyword): it is kept
+  under a key of its own (bnd_lv_key), because "self" in an env is the
+  receiver -- `b.local_variable_set(:self, v)` changed what `self` meant for
+  the rest of the method. `{self:}` (hash value omission) reads it, or calls
+  #self. test_literal's test_hash_value_omission.
+- **`raise e` of a rescued SystemStackError keeps its frames** (15000 of them,
+  not the 26 of the re-raise), as ruby keeps a backtrace an exception already
+  has; the exception is an object (raise_stack_too_deep), so it carries them.
+  test_exception's test_stackoverflow.
+- **IO.copy_stream waits on its descriptors** (IO.__park with them): when
+  every thread waits, the scheduler's idle wait is a poll(2) on all of them
+  (sch_iofd), not a millisecond sleep -- a reader of an empty pipe used 6% of
+  a CPU. test_io's copy_stream_no_busy_wait. The waiter list ends in a space,
+  and the first version woke a waiter by `int_of_str` of the empty word after
+  it, which failed: corpus/260's accepting thread died with "(ruby exception
+  raised)". Only "fd:bits" words are read now.
+- **A Regexp made at run time has a self of its own**: instance variables,
+  #extend and its singleton class, an object_id (`Regexp.new("x")` twice was
+  one id), and Marshal's dump / load / restore of one with ivars or modules;
+  a literal is frozen (FrozenError).
+- **A copy of Time answers Time's class methods** (`Time.dup.at(0)`,
+  cls_copy_of): the arms asked `is_a?(Time)` of the class, which a copy is
+  not. core/time/dup.
+- **test_compile_prism's eight**: `alias $a $b` and a backtick method in a
+  class body; `defined?` of `__FILE__`, `%x[]`, `:"#{}"`, a named-capture `=~`
+  and `1 => 1` (expression); `defined?(yield)` in a class body; a literal's
+  element as a multiple-assignment target (`_, {}[:k] = 1`); `Const op= v` in
+  a class body; `return *a, **kw`; InstructionSequence#to_a's misc hash
+  (node_id, code_location) and compile_file's errno naming only the path.
+  182/182.
+- **OpenSSL::KDF's refusals**: an iteration count that is no Integer is
+  NUM2INT's TypeError, an unknown digest DigestError, iterations <= 0 and an
+  N / r / p scrypt refuses KDFError, scrypt's missing and unknown keywords
+  ArgumentError. library/openssl/kdf.
+- **write_nonblock leaves the stream non-blocking** (#nonblock? true after
+  it), except a socket on Linux, which ruby writes with MSG_DONTWAIT.
+- gethostbyname / gethostbyaddr warn with no category (ruby always warns).
+- **Moved to round 15** (they need Mere): a UNIX datagram to a path
+  (unixsocket/recvfrom_spec's for_fd) and fpathconf (test_etc's pathconf).
+- **Checked**: corpus 589/589 with the hash index on and off; the 13 gates;
+  corpus/576 under MERE_RUBY_GC_STRESS=50, and it fails on round 12's binary.
+  The 247 unittest files plus test_compile_prism and test_etc: nothing new is
+  RED; test_exception's stackoverflow and test_literal's hash_value_omission
+  are MATCH (and three that were RED under load in round 12's run read MATCH:
+  test_io_m17n's each_codepoint_need_more, test_https' max_version,
+  test_rubyoptions' script_from_stdin). test_compile_prism 182/182. The spec
+  records: base DIFF 26 -> 20 (marshal x3, time/dup, kdf x2), CRASH 0;
+  stdlib DIFF 11 -> 10 (basicsocket's write_nonblock), CRASH 6.
