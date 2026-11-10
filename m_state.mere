@@ -486,6 +486,7 @@ let qv_drain = fn (u: unit) ->
   let _ = go 0 in
   vec_set qv_ctr 1 0;
 let arr_pending = map_new ();
+let _ = map_compact arr_pending; // Own resize storage so collection can reclaim it.
 let rec vec_tail_list = fn (v) -> fn (i: int) -> fn (acc: Val list) ->
   if i < 0 then acc else vec_tail_list v (i - 1) (Cons (vec_get v i, acc));
 // ⚠ AND SHIFTS ARE A COUNT, NOT A COPY. `shift` stored the rest of the list,
@@ -506,8 +507,11 @@ let arr_plen = map_new ();
 // alternates with a whole-array read takes it back instead of copying the
 // list into a new Vec every time (note 278 §4)
 let arr_vc = map_new ();
+let _ = map_compact arr_vc; // Own resize storage so collection can reclaim it.
 let arr_vc_ver = map_new ();
+let _ = map_compact arr_vc_ver; // Own resize storage so collection can reclaim it.
 let arr_vc_len = map_new ();
+let _ = map_compact arr_vc_len; // Own resize storage so collection can reclaim it.
 let rec list_drop_k = fn (xs: Val list) -> fn (k: int) ->
   if k <= 0 then xs else (match xs with Nil -> xs | Cons (_, t) -> list_drop_k t (k - 1));
 let arr_off_of = fn (id: int) -> (if map_len arr_off > 0 && map_has arr_off id then map_get arr_off id else 0);
@@ -563,6 +567,7 @@ let deref = fn (id: int) ->
   else (let o = arr_off_of id in
         if o == 0 then map_get arr_store id else list_drop_k (map_get arr_store id) o);
 let arr_vers = map_new ();
+let _ = map_compact arr_vers; // Own resize storage so collection can reclaim it.
 let arr_ver = fn (id: int) -> (if map_has arr_vers id then map_get arr_vers id else 0);
 // push without writing the map or the array: O(1) per element
 let rec vec_push_all = fn (v) -> fn (xs: Val list) ->
@@ -672,107 +677,94 @@ let arr_each_val = fn (id: int) -> fn f ->
      gq 0)
   else ();
 
-// strings are mutable reference types too (Ruby semantics): VStr is a HANDLE
-// into str_store, so aliases share one mutable string. Fresh id per literal
-// evaluation — entries are never removed. A vec gives O(1) alloc/get/set
-// (string allocation is far hotter than array allocation).
-// ⚠ IN PAGES OF 4096 SLOTS, each with an arena of its own. A handle is a
-//   position and is never handed out again (the collector's watermarks read
-//   "made since" as "a handle above"), so one Vec grew by a slot for every
-//   String the program ever made, a dead one's blanked but kept:
-//   `3_000_000.times { "abc" + "d" }` left 9M slots, 369 MB (note 405). Most
-//   strings die young and their handles are neighbours, so a page whose slots
-//   are all dead is wound back (vec_recycle, at the sweep) -- the slots stay
-//   numbered, a read of one answers "", and the bytes go back.
-let str_store = vec_new ();
-let str_pg_dead = vec_new ();
-// a wound-back page keeps its first block (vec_recycle), so it is not left
-// where it was: its place in str_store gets the one empty page, and it goes to
-// a pool the next page is taken from -- the bytes are a page's per page live
+// Strings use monotonically issued handles: GC watermarks rely on their
+// order. Page payloads and metadata, however, exist only for live pages.
+// A historical page number must not leave a permanent slot in a dense Vec.
+// Each page holds 4096 strings in its own reclaimable arena.
+let str_store = map_new ();
+let _ = map_compact str_store;
+// Recycled payloads retain a first block. Pool them independently of logical
+// page numbers; the pool tracks peak simultaneous demand, not issued IDs.
 let str_pg_empty = vec_new ();
 let str_pg_pool = vec_new ();
 let str_pg_pool_n = vec_new ();
 let _ = vec_push str_pg_pool_n 0;
-// the handles issued so far (handle_base + this is the next one)
 let str_n = vec_new ();
 let _ = vec_push str_n 0;
 let str_count = fn (u: unit) -> vec_get str_n 0;
-// ⚠ THE PAGES' BYTES ARE KEPT, NOT WALKED. The byte axis asked str_bytes at
-//   every safepoint where something was made, and it summed every page ever
-//   issued (vec_bytes walks a page's blocks): a fourth of `each_line.count {
-//   l =~ re }`, which makes a String per line. A page's bytes change only when
-//   it is written (mkstr, sput) or swept, so a written page is queued once
-//   (str_pg_dq) and str_bytes measures just those, keeping the sum.
-let str_pg_bytes = vec_new ();
-let str_pg_dirty = vec_new ();
-// Measurement dirtiness is cleared by str_bytes. Compaction needs its own
-// mutation bit: an unchanged live page has no overwritten bytes to reclaim.
-let str_pg_changed = vec_new ();
+// Byte accounting measures only pages queued by writes. A missing page has
+// already returned its payload to the pool and contributes no bytes.
+let str_pg_bytes = map_new ();
+let _ = map_compact str_pg_bytes;
+let str_pg_dirty = map_new ();
+let _ = map_compact str_pg_dirty;
+let str_pg_changed = map_new ();
+let _ = map_compact str_pg_changed;
 let str_pg_dq = vec_new ();
 let str_pg_dq_n = vec_new ();
 let _ = vec_push str_pg_dq_n 0;
 let str_pg_tot = vec_new ();
 let _ = vec_push str_pg_tot 0;
-// ...and an APPEND is not a write to measure: the page mkstr pushes onto is
-// the one every safepoint would measure again (its block chain walked each
-// time). The lengths appended since it was last measured are added up
-// instead, and it is measured once they pass a megabyte.
 let str_pg_add = vec_new ();
 let _ = vec_push str_pg_add 0;
 let str_pg_touch = fn (p: int) ->
-  if vec_get str_pg_dirty p == 1 then ()
-  else (let _ = vec_set str_pg_dirty p 1 in
+  if (if map_has str_store p then false else true) || map_has str_pg_dirty p then ()
+  else (let _ = map_set str_pg_dirty p 1 in
         let k = vec_get str_pg_dq_n 0 in
         let _ = (if k < vec_len str_pg_dq then vec_set str_pg_dq k p else vec_push str_pg_dq p) in
         vec_set str_pg_dq_n 0 (k + 1));
 let sraw = fn (id: int) ->
   let i = id - handle_base in
-  let pg = vec_get str_store (i / 4096) in
+  let pg = (if map_has str_store (i / 4096) then map_get str_store (i / 4096) else str_pg_empty) in
   let o = i - (i / 4096) * 4096 in
   if o < vec_len pg then vec_get pg o else "";
 let sput = fn (id: int) -> fn (s: str) ->
   let i = id - handle_base in
-  let pg = vec_get str_store (i / 4096) in
+  let pg = (if map_has str_store (i / 4096) then map_get str_store (i / 4096) else str_pg_empty) in
   let o = i - (i / 4096) * 4096 in
   if o < vec_len pg then
-    (let _ = vec_set str_pg_changed (i / 4096) 1 in
+    (let _ = map_set str_pg_changed (i / 4096) 1 in
      let _ = str_pg_touch (i / 4096) in vec_set pg o s) else ();
-// (the sweep: surv holds the slots that lived, k of them -- a page with none
-//  is wound back, the others compacted unless nc)
-let str_pg_live = vec_new ();
-// vec_compact returns unit even when a native pin defers the copy. Only a
-// strict capacity decrease proves reclamation with the current compiler API.
-// Equal-capacity copies conservatively remain pending for another collection.
+// vec_compact can defer a pinned page. Keep its mutation bit until its
+// capacity actually decreases, as in the dense-page implementation.
 let str_pg_try_compact = fn pg ->
   let before = vec_bytes pg in
   let _ = vec_compact pg in
   vec_bytes pg < before;
 let str_pages_sweep = fn surv -> fn (k: int) -> fn (nc: bool) ->
-  let rec pz = fn (p: int) -> (if p >= vec_len str_store then () else (let _ = (if p < vec_len str_pg_live then vec_set str_pg_live p 0 else vec_push str_pg_live 0) in pz (p + 1))) in
-  let _ = pz 0 in
-  let rec pc = fn (j: int) -> (if j >= k then () else (let p9 = vec_get surv j / 4096 in let _ = vec_set str_pg_live p9 (vec_get str_pg_live p9 + 1) in pc (j + 1))) in
+  region STRING_PAGES {
+  let live = map_new () in
+  let dead = vec_new () in
+  let cur = (str_count () - 1) / 4096 in
+  let rec pc = fn (j: int) ->
+    if j >= k then () else
+    (let _ = map_set live (vec_get surv j / 4096) 1 in pc (j + 1)) in
   let _ = pc 0 in
-  let rec pw = fn (p: int) ->
-    (if p >= vec_len str_store then ()
-     else (let _ = (if vec_get str_pg_dead p == 1 then ()
-                    else if vec_get str_pg_live p == 0 && p < vec_len str_store - 1
-                    then (let pg = vec_get str_store p in
-                          let _ = vec_set str_pg_tot 0 (vec_get str_pg_tot 0 - vec_get str_pg_bytes p) in
-                          let _ = vec_set str_pg_bytes p 0 in
-                          let _ = vec_recycle pg in
-                          let n9 = vec_get str_pg_pool_n 0 in
-                          let _ = (if n9 < vec_len str_pg_pool then vec_set str_pg_pool n9 pg else vec_push str_pg_pool pg) in
-                          let _ = vec_set str_pg_pool_n 0 (n9 + 1) in
-                          let _ = vec_set str_store p str_pg_empty in
-                          vec_set str_pg_dead p 1)
-                    else if nc || vec_get str_pg_changed p == 0 then ()
-                    else (let _ = str_pg_touch p in
-                          if str_pg_try_compact (vec_get str_store p)
-                          then vec_set str_pg_changed p 0 else ())) in
-           pw (p + 1))) in
-  pw 0;
-// the bytes of the pages not wound back: the kept sum, after measuring the
-// pages written since it was last asked
+  // Defer deletions until iteration finishes, so map ordering cannot cause
+  // an adjacent dead page to be skipped. The current partial page stays open.
+  let _ = map_iter str_store (fn (p: int) -> fn pg ->
+    if (if map_has live p then false else true) && p < cur then
+      (let _ = vec_set str_pg_tot 0 (vec_get str_pg_tot 0 - map_get str_pg_bytes p) in
+       let _ = vec_recycle pg in
+       let n = vec_get str_pg_pool_n 0 in
+       let _ = (if n < vec_len str_pg_pool then vec_set str_pg_pool n pg else vec_push str_pg_pool pg) in
+       let _ = vec_set str_pg_pool_n 0 (n + 1) in
+       vec_push dead p)
+    else if nc || map_get str_pg_changed p == 0 then ()
+    else (let _ = str_pg_touch p in
+          if str_pg_try_compact pg then map_set str_pg_changed p 0 else ())) in
+  let rec remove = fn (j: int) ->
+    if j >= vec_len dead then () else
+    (let p = vec_get dead j in
+     let _ = map_delete str_store p in
+     let _ = map_delete str_pg_bytes p in
+     let _ = map_delete str_pg_dirty p in
+     let _ = map_delete str_pg_changed p in remove (j + 1)) in
+  let _ = remove 0 in
+  let _ = map_compact str_store in
+  let _ = map_compact str_pg_bytes in
+  let _ = map_compact str_pg_dirty in
+  map_compact str_pg_changed };
 let str_bytes = fn (u: unit) ->
   let cur = (vec_get str_n 0 - 1) / 4096 in
   let _ = (if vec_get str_pg_add 0 >= 1048576 && cur >= 0 then str_pg_touch cur else ()) in
@@ -780,12 +772,13 @@ let str_bytes = fn (u: unit) ->
   let rec go = fn (j: int) ->
     if j >= k then ()
     else (let p = vec_get str_pg_dq j in
-          let _ = vec_set str_pg_dirty p 0 in
+          let _ = map_delete str_pg_dirty p in
           let _ = (if p == cur then vec_set str_pg_add 0 0 else ()) in
-          let _ = (if vec_get str_pg_dead p == 1 then ()
-                   else (let b = vec_bytes (vec_get str_store p) in
-                         let _ = vec_set str_pg_tot 0 (vec_get str_pg_tot 0 + b - vec_get str_pg_bytes p) in
-                         vec_set str_pg_bytes p b)) in
+          let _ = (if map_has str_store p then
+                     (let b = vec_bytes (map_get str_store p) in
+                      let _ = vec_set str_pg_tot 0 (vec_get str_pg_tot 0 + b - map_get str_pg_bytes p) in
+                      map_set str_pg_bytes p b)
+                   else ()) in
           go (j + 1)) in
   let _ = go 0 in
   let _ = vec_set str_pg_dq_n 0 0 in
@@ -804,29 +797,28 @@ let rx_src_last = map_new ();
 let rx_src_hnd = map_new ();
 let str_slot_prepare = fn (u: unit) ->
   let n = vec_get str_n 0 in
-  let _ = (if n - (n / 4096) * 4096 == 0
+  let p = n / 4096 in
+  let _ = (if n - p * 4096 == 0
            then (let np = vec_get str_pg_pool_n 0 in
                  let _ = (if np > 0
                           then (let pg = vec_get str_pg_pool (np - 1) in
                                 let _ = vec_set str_pg_pool_n 0 (np - 1) in
-                                vec_push str_store pg)
+                                map_set str_store p pg)
                           else (let pg = vec_new () in
                                 let _ = vec_compact pg in
-                                vec_push str_store pg)) in
-                 let _ = vec_push str_pg_bytes 0 in
-                 let _ = vec_push str_pg_dirty 0 in
-                 let _ = vec_push str_pg_changed 1 in
-                 let _ = vec_push str_pg_dead 0 in
-                 // (the page it fills next, and the one it filled, are measured)
-                 let _ = (if n > 0 then str_pg_touch (n / 4096 - 1) else ()) in
-                 str_pg_touch (n / 4096))
+                                map_set str_store p pg)) in
+                 let _ = map_set str_pg_bytes p 0 in
+                 let _ = map_set str_pg_changed p 1 in
+                 let _ = (if n > 0 then str_pg_touch (p - 1) else ()) in
+                 str_pg_touch p)
            else ()) in
   n;
 let mkstr = fn (s: str) ->
   let n = str_slot_prepare () in
+  let p = n / 4096 in
   let _ = vec_set str_pg_add 0 (vec_get str_pg_add 0 + str_len s) in
-  let _ = vec_set str_pg_changed (n / 4096) 1 in
-  let _ = vec_push (vec_get str_store (n / 4096)) s in
+  let _ = map_set str_pg_changed p 1 in
+  let _ = vec_push (map_get str_store p) s in
   let _ = vec_set str_n 0 (n + 1) in
   VStr (handle_base + n);
 // Build a joined value directly in its owning page on compilers that fuse
@@ -836,8 +828,8 @@ let mkstr_join = fn (parts: str list) ->
   let rec size = fn (xs: str list) -> fn (total: int) ->
     match xs with Nil -> total | Cons (x, rest) -> size rest (total + str_len x) in
   let _ = vec_set str_pg_add 0 (vec_get str_pg_add 0 + size parts 0) in
-  let _ = vec_set str_pg_changed (n / 4096) 1 in
-  let _ = vec_push (vec_get str_store (n / 4096)) (str_join "" parts) in
+  let _ = map_set str_pg_changed (n / 4096) 1 in
+  let _ = vec_push (map_get str_store (n / 4096)) (str_join "" parts) in
   let _ = vec_set str_n 0 (n + 1) in
   VStr (handle_base + n);
 // ⚠ AN APPEND GOES INTO A QUEUE BESIDE THE STRING, AND THE NEXT READ FOLDS IT IN.
@@ -1082,6 +1074,9 @@ let _ = map_compact hash_indexed;  // (its own arena: a write per hash / string 
 // for it. A forward declaration is exactly the tool for that; it is the one
 // the compiler grew today (v0.1.483) for cases like this.
 let fn hderef_fwd: int -> Val list;
+// ...and whether an object key is compared by identity alone (no #hash of its
+// own, not a Time or MatchData): main.mere answers, where the method tables are.
+let fn hkey_obj_ident_fwd: Val -> bool;
 // the containers whose digest is being taken right now: one met again inside
 // itself (`h = {}; h[:x] = [h]`) makes the key undigestible, and the walk
 // answers instead -- it used to recurse until the native stack ran out, which
@@ -1120,6 +1115,11 @@ let rec hkey_digest = fn (k: Val) ->
   // front: no separator can be confused with content.
   | VArr id -> hkey_cont ("A" ++ str_of_int id) "A" (deref id)
   | VHsh id -> hkey_cont ("H" ++ str_of_int id) "H" (hderef_fwd id)
+  // ⚠ A PLAIN OBJECT KEY IS ITS IDENTITY. It answered "" and every hash keyed
+  // by objects was scanned: 20,000 inserts took 48 s (WeakKeyMap's Bug #20691
+  // test timed out). One with a #hash of its own still answers "" -- its code
+  // is the program's, and only the protocol path asks it.
+  | VObj id -> (if hkey_obj_ident_fwd k then "o" ++ str_of_int id else "")
   | _ -> ""
 and hkey_cont = fn (b: str) -> fn (tag: str) -> fn (xs: Val list) ->
   if map_has hkey_busy b then ""
@@ -2093,11 +2093,17 @@ let _ = vec_push int_fast_st 0;
 // mro_mods_gen below, and the same MERE_RUBY_NO_MRO_CACHE switch turns it off
 // -- which is also how it is tested: the corpus and the spec sweep have to
 // give the same answers with the memo off as with it on.
+// ...and is_a? by (class, target), the same generation: `Object.new` asked it
+// about a dozen times, each a walk of the ancestor list with a str_eq per name
+// (16% of a profile of that loop). The value is generation * 2 + the answer.
+let isa_memo = map_new ();
+let _ = map_compact isa_memo;  // (its own arena: gc_churn_bytes, note 270)
 let hm_memo = map_new ();
 let _ = map_compact hm_memo;  // (its own arena: gc_churn_bytes, note 270)
 let hm_memo_gen = map_new ();
 
-let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
+let lv_up = map_new ();
+let _ = map_compact lv_up; // Own resize storage so collection can reclaim it.    // "<frame id>" -> that frame's parent env
 // THE CAPTURED FRAMES THAT HAVE LEFT THE STACK, by frame id (note 272). A
 // block's env or a method's frame that a proc captured is not given back to
 // the frame pool when its call ends (the proc reads and writes through it),
@@ -2107,11 +2113,13 @@ let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
 // is a lambda in its own frame, 69 KB per assertion. A collection marks the
 // envs it reaches (gc_mark_env) and gives the rest of these back.
 let lv_cap = map_new ();
+let _ = map_compact lv_cap; // Own resize storage so collection can reclaim it.
 // ...and the scope envs lv_child made (an eval's, an instance_exec's, a
 // class_exec body's) once their run is over, captured by a proc made in them:
 // their links go the same way, but they are not pool frames and are not
 // handed back to the pool (lv_child_done)
 let lv_capx = map_new ();
+let _ = map_compact lv_capx; // Own resize storage so collection can reclaim it.
 let lv_ctr = map_new ();   // "n" -> next frame id
 // the Range pairs being compared (rng_eq_w), to stop a recursive one
 let rng_eq_seen = map_new ();
@@ -2398,6 +2406,11 @@ let name_spec = fn (tag: str) ->
   if str_eq tag "builtin_cls_name" then ("String|Array|Hash|Integer|Float|Numeric|Complex|Rational|Range|"
     ++ "Symbol|TrueClass|FalseClass|NilClass|Kernel|Comparable"
     )
+  // the core classes and modules whose CLASS methods are the dispatcher's
+  // builtins, which a program's own definition of the name comes before
+  else if str_eq tag "core_sng_cls" then ("File|IO|FileTest|Dir|Time|Process|Math|Marshal|GC|ObjectSpace|"
+    ++ "Signal|Random|Regexp|Thread|Fiber|Encoding|Struct|Proc|Warning|Etc"
+    )
   else if str_eq tag "enc_preserving" then ("upcase|downcase|capitalize|swapcase|reverse|strip|lstrip|rstrip|"
     ++ "chomp|chop|chr|squeeze|delete|succ|next|*|gsub|sub|"
     ++ "concat|prepend|replace|delete_prefix|delete_suffix|byteslice|dup|"
@@ -2661,6 +2674,66 @@ let cur_file = fn () -> vec_get pos_names (vec_get cur_fm 0);
 // created as the call that takes it is evaluated.
 let proc_src = map_new ();
 let _ = map_compact proc_src;  // (its own arena from birth, compacted by the sweep: note 300)
+// Default source locations are shared by every Proc from the same site.
+// proc_src holds only explicit overrides; the per-Proc table stores one int.
+let proc_source_defaults = map_new ();
+let _ = map_compact proc_source_defaults;
+let proc_source_sites = map_new ();
+let proc_source_lines = map_new ();
+let proc_source_paths = map_new ();
+let proc_source_keys = map_new ();
+let proc_source_refs = map_new ();
+let proc_source_next = vec_new ();
+let _ = vec_push proc_source_next 0;
+let _ = map_compact proc_source_sites;
+let _ = map_compact proc_source_lines;
+let _ = map_compact proc_source_paths;
+let _ = map_compact proc_source_keys;
+let _ = map_compact proc_source_refs;
+let proc_source_key = fn (k: str) ->
+  let file = str_len k > 0 && str_eq (char_at k 0) "f" in
+  (int_of_str (if file then substring k 1 (str_len k) else k), file);
+let proc_source_has = fn (k: str) ->
+  map_has proc_src k || (let (id, _) = proc_source_key k in map_has proc_source_defaults id);
+let proc_source_get = fn (k: str) ->
+  if map_has proc_src k then map_get proc_src k
+  else (let (id, file) = proc_source_key k in
+        let site = map_get proc_source_defaults id in
+        if file then map_get proc_source_paths site else VInt (map_get proc_source_lines site));
+let proc_source_init = fn (k: str) -> fn (line: int) -> fn (file: str) ->
+  let id = int_of_str k in
+  if map_has proc_source_defaults id then ()
+  else (let key = str_of_int line ++ ":" ++ file in
+        let site = (if map_has proc_source_sites key then map_get proc_source_sites key
+                    else (let i = vec_get proc_source_next 0 in
+                          let _ = vec_set proc_source_next 0 (i + 1) in
+                          let _ = map_set proc_source_lines i line in
+                          let _ = map_set proc_source_paths i (frame_text file) in
+                          let _ = map_set proc_source_keys i key in
+                          let _ = map_set proc_source_refs i 0 in
+                          let _ = map_set proc_source_sites key i in i)) in
+        let _ = map_set proc_source_refs site (map_get proc_source_refs site + 1) in
+        let _ = map_set proc_source_defaults id site in ());
+let proc_source_drop = fn (id: int) ->
+  if map_has proc_source_defaults id then
+    (let site = map_get proc_source_defaults id in
+     let n = map_get proc_source_refs site in
+     let _ = map_delete proc_source_defaults id in
+     if n > 1 then (let _ = map_set proc_source_refs site (n - 1) in ())
+     else (let _ = map_delete proc_source_sites (map_get proc_source_keys site) in
+           let _ = map_delete proc_source_keys site in
+           let _ = map_delete proc_source_lines site in
+           let _ = map_delete proc_source_paths site in
+           let _ = map_delete proc_source_refs site in ()))
+  else ();
+let proc_sources_compact = fn (u: unit) ->
+  let _ = map_compact proc_source_defaults in
+  let _ = map_compact proc_source_sites in
+  let _ = map_compact proc_source_keys in
+  let _ = map_compact proc_source_lines in
+  let _ = map_compact proc_source_paths in
+  map_compact proc_source_refs;
+
 let proc_symsrc = map_new ();    // Symbol#to_proc's proc id -> the symbol name
 // Symbol#to_proc's proc, one per symbol name (ruby caches it)
 let sym_proc_cache = map_new ();
@@ -2715,9 +2788,9 @@ let copy_meth_src = fn (dst: str) -> fn (src: str) ->
 // installs it is not where it was defined.
 let stamp_meth_src_proc = fn (key: str) -> fn (pk: str) ->
   let _ = (if map_has meth_cfn key then map_delete meth_cfn key else ()) in
-  if map_has proc_src pk && map_has proc_src ("f" ++ pk)
-  then (let _ = map_set meth_src key (map_get proc_src pk) in
-        map_set meth_src ("f" ++ key) (map_get proc_src ("f" ++ pk)))
+  if proc_source_has pk && proc_source_has ("f" ++ pk)
+  then (let _ = map_set meth_src key (proc_source_get pk) in
+        map_set meth_src ("f" ++ key) (proc_source_get ("f" ++ pk)))
   else ();
 // ⚠ HOW MANY PROC IDS WERE EVER ISSUED, not how many procs there are (note
 //   270). A new proc's id was `handle_base + map_len proc_store` at forty
@@ -2795,8 +2868,7 @@ let store_proc = fn (k: str) -> fn entry ->
                                        | Cons (st9, t9) -> (if dflt_prologue_stmt st9 then ol9 t9 else 0)
                                        | _ -> 0) in
   let ln9 = ol9 body in
-  let _ = (if map_has proc_src k then () else map_set proc_src k (VInt (if ln9 > 0 then ln9 else cur_line ()))) in
-  let _ = (if map_has proc_src ("f" ++ k) then () else map_set proc_src ("f" ++ k) (frame_text (cur_file ()))) in
+  let _ = proc_source_init k (if ln9 > 0 then ln9 else cur_line ()) (cur_file ()) in
   let _ = map_set proc_bkey k (blk_intern ps body) in
   map_set proc_store k (h, ps, (Nil : Stmt list), penv);
 let store_yblk = fn (k: str) -> fn b ->
@@ -3236,6 +3308,12 @@ let unused_blk_seen = map_new ();
 let super_call_pend = map_new ();
 // "y" once a finalizer has been defined (ObjectSpace.__fin_flag)
 let fin_on = map_new ();
+// Weak target identities, never Vals: callbacks are rooted by ObjectSpace's
+// Ruby registry, but registration must not itself keep the target alive.
+let fin_targets = map_new (); // Ruby object_id -> collector mark key
+let fin_ready = map_new ();   // dead target ids awaiting a Ruby safepoint
+let _ = map_compact fin_targets;
+let _ = map_compact fin_ready;
 // std_fd_closed's answers, "1" / "2" -> 1 (closed at start) or 0
 let std_fd_shut = map_new ();
 let rx_progs = map_new ();
@@ -3551,6 +3629,9 @@ let warn_note = fn (s: str) ->
 // is taken as equal, so the walk terminates and `[1,[...]] == [2,[...]]` is
 // still false because the 1 and the 2 differ before the cycle closes.
 let eq_seen = map_new ();
+// the Kernel module functions being answered with Kernel as self (`Kernel.load`
+// from a class that has #load of its own): see invoke_val_c0's Kernel arm
+let kmf_busy = map_new ();
 let insp_seen = map_new ();
 // ObjectSpace::WeakMap's entries, by insertion number. weak_k and weak_v are
 // NOT GC roots: a collection drops an entry once its map, its key or its value
@@ -4635,8 +4716,17 @@ let gc_churn_bytes = fn (u: unit) ->
   //  its values are str). ⚠ Given back HERE and not at each parse: a
   //  map_compact asks every suspended stack for its pins, and a gem that
   //  parses inside an Enumerator (csv) made it most of its time, note 441.
-  + map_bytes rx_gnums + map_bytes rx_gbodies;
+  + map_bytes rx_gnums + map_bytes rx_gbodies
+  + map_bytes arr_pending + map_bytes arr_vc + map_bytes arr_vc_ver + map_bytes arr_vc_len + map_bytes arr_vers + map_bytes lv_up + map_bytes lv_cap + map_bytes lv_capx;
 let gc_churn_compact = fn (u: unit) ->
+  let _ = map_compact_big arr_pending in
+  let _ = map_compact_big arr_vc in
+  let _ = map_compact_big arr_vc_ver in
+  let _ = map_compact_big arr_vc_len in
+  let _ = map_compact_big arr_vers in
+  let _ = map_compact_big lv_up in
+  let _ = map_compact_big lv_cap in
+  let _ = map_compact_big lv_capx in
   let _ = map_compact_big bind_mark_s in
   let _ = map_compact_big rx_gnums in
   let _ = map_compact_big rx_gbodies in

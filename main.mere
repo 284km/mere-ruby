@@ -756,34 +756,60 @@ let ary_max_size = 1152921504606846975;
 let ary_rlen = fn (v: Val) -> match v with VArr a -> val_list_len (deref a) | _ -> 1;
 // the objects marked live that gc_fixpoint has not yet marked the ivars of
 // (emptied where a mark begins, in gc_mark_roots)
-let gc_obj_pend = map_new ();
+let gc_obj_pend = vec_new ();
+let _ = vec_recycle gc_obj_pend;
 // the Struct classes (Struct_N) a value names, seen while marking: a class
 // is a name and was never collected, so `Struct.new("A")` then
 // `remove_const(:A)` kept every one ever made (test_struct's
 // named_structs_are_not_rooted). gc_sweep_structs drops the rest.
 let gc_live_cls = map_new ();
+// Sparse words retain the exact tagged key set without one Map entry per
+// marked value. Thirty bits also fit the narrow integer backends.
+// Keep the eight handle kinds in separate words. Consecutive handles of
+// one kind then use all 30 bits, instead of leaving seven of eight bits empty.
+let gc_live_has = fn live -> fn (key: int) ->
+  let id = key / 8 in
+  let group = id / 30 in
+  let word = group * 8 + (key - id * 8) in
+  map_has live word && bit_and (map_get live word) (bit_shl 1 (id - group * 30)) != 0;
+// Return true only for the first mark, so recursive tracing visits once.
+let gc_live_mark = fn live -> fn (key: int) ->
+  let id = key / 8 in
+  let group = id / 30 in
+  let word = group * 8 + (key - id * 8) in
+  let bits = (if map_has live word then map_get live word else 0) in
+  let mask = bit_shl 1 (id - group * 30) in
+  if bit_and bits mask != 0 then false
+  else (let _ = map_set live word (bit_or bits mask) in true);
+let gc_live_count = fn live ->
+  let count = vec_new () in
+  let _ = vec_push count 0 in
+  let rec ones = fn (bits: int) -> fn (n: int) ->
+    if bits == 0 then n else ones (bit_and bits (bits - 1)) (n + 1) in
+  let _ = map_iter live (fn (word: int) -> fn (bits: int) -> vec_set count 0 (vec_get count 0 + ones bits 0)) in
+  vec_get count 0;
+
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
   | VClass c9 when str_len c9 > 7 && str_eq (substring c9 0 7) "Struct_" ->
     map_set gc_live_cls c9 1
   | VObj id -> let k = id * 8 in
-               (if map_has live k then () else (let _ = map_set live k VNil in let _ = map_set gc_obj_pend id 0 in ()))
+               (if gc_live_mark live k then vec_push gc_obj_pend id else ())
   | VStr id -> let k = id * 8 + 1 in
-               (if map_has live k then () else (let _ = map_set live k VNil in ()))
+               (let _ = gc_live_mark live k in ())
   | VArr id -> let k = id * 8 + 2 in
-               (if map_has live k then ()
+               (if (if gc_live_mark live k then false else true) then ()
                 // every element, the queued ones (and the Vec form's) too,
                 // read where they are: marking builds no list (note 278)
-                else let _ = map_set live k VNil in arr_each_val id (fn (x: Val) -> gc_mark_val live x))
+                else arr_each_val id (fn (x: Val) -> gc_mark_val live x))
   | VHsh id -> let k = id * 8 + 3 in
-               (if map_has live k then ()
+               (if (if gc_live_mark live k then false else true) then ()
                 // read where the pairs are -- the list, the values the index
                 // overwrote since, the queue -- and not folded (hderef): a
                 // fold here copies the hash into hash_store's arena, which a
                 // loop on the stack pins, so a collection every 64k queues
                 // left a copy of every live hash each time (note 303)
-                else let _ = map_set live k VNil in
-                     let _ = gc_mark_vals live (hsettled id) in
+                else                      let _ = gc_mark_vals live (hsettled id) in
                      // (its default and default proc live as long as it does,
                      //  and no longer: rooted from the tables, every
                      //  `Hash.new { }` ever made kept its block, note 441)
@@ -798,9 +824,8 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                          gq 0)
                       else ()))
   | VProc id -> let k = id * 8 + 4 in
-                (if map_has live k then ()
-                 else let _ = map_set live k VNil in
-                      let pk = str_of_int id in
+                (if (if gc_live_mark live k then false else true) then ()
+                 else                       let pk = str_of_int id in
                       let _ = (if map_has proc_store pk
                                then (let (_, _, _, penv) = proc_get pk in gc_mark_env live penv)
                                else ()) in
@@ -824,9 +849,8 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                        then (let (_, _, _, benv) = yblk_get pk in gc_mark_env live benv)
                        else ()))
   | VBind id -> let k = id * 8 + 5 in
-                (if map_has live k then ()
-                 else let _ = map_set live k VNil in
-                      let _ = (if map_len bind_yblk > 0 && map_has bind_yblk id then gc_mark_val live (VProc (map_get bind_yblk id)) else ()) in
+                (if (if gc_live_mark live k then false else true) then ()
+                 else let _ = (if map_len bind_yblk > 0 && map_has bind_yblk id then gc_mark_val live (VProc (map_get bind_yblk id)) else ()) in
                       (if map_has bind_store (str_of_int id)
                        then gc_mark_env live (map_get bind_store (str_of_int id))
                        else ()))
@@ -845,9 +869,8 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
 and gc_mark_env = fn live -> fn e ->
   match (if map_has e "__eid" then map_get e "__eid" else VNil) with
   | VInt n -> (let k = n * 8 + 6 in
-               if map_has live k then ()
-               else (let _ = map_set live k VNil in
-                     let _ = map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in
+               if (if gc_live_mark live k then false else true) then ()
+               else (                     let _ = map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in
                      if map_has lv_up n then gc_mark_env live (map_get lv_up n) else ()))
   | _ -> map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)
 // a parameter list's yield-block markers (`yblk_marker ++ pid`, proc_as_block):
@@ -1006,21 +1029,21 @@ let gc_fixpoint = fn ivars -> fn live ->
   let _ = (if gc_log_on ()
            then print_err ("gc: owned ivars=" ++ str_of_int (vec_len vals) ++ " owners=" ++ str_of_int (map_len head))
            else ()) in
-  let rec drain = fn (rounds: int) ->
-    (if map_len gc_obj_pend == 0 then rounds
-     else
-       (let ks = vec_new () in
-        let _ = map_iter gc_obj_pend (fn (o: int) -> fn (u: int) -> vec_push ks o) in
-        let _ = map_clear gc_obj_pend in
-        let rec each = fn (i: int) ->
-          (if i >= vec_len ks then ()
-           else (let o = vec_get ks i in
-                 let _ = (if map_has head o then mark_chain (map_get head o) else ()) in
-                 each (i + 1))) in
-        let _ = each 0 in
-        drain (rounds + 1))) in
-  let n = drain 0 in
-  (if gc_log_on () then print_err ("gc: fixpoint rounds=" ++ str_of_int n ++ " live=" ++ str_of_int (map_len live)) else ())
+  // gc_mark_val enqueues an object only on its first mark. Drain the
+  // growing queue directly; newly reached owners form the next round.
+  let rec drain = fn (start: int) -> fn (rounds: int) ->
+    let stop = vec_len gc_obj_pend in
+    if start >= stop then rounds
+    else
+      (let rec each = fn (i: int) ->
+         if i >= stop then ()
+         else (let o = vec_get gc_obj_pend i in
+               let _ = (if map_has head o then mark_chain (map_get head o) else ()) in
+               each (i + 1)) in
+       let _ = each start in drain stop (rounds + 1)) in
+  let n = drain 0 0 in
+  let _ = vec_recycle gc_obj_pend in
+  (if gc_log_on () then print_err ("gc: fixpoint rounds=" ++ str_of_int n ++ " live=" ++ str_of_int (gc_live_count live)) else ())
   };
 
 // the root scan, shared by every collection. EVERY top-level map that holds
@@ -1031,7 +1054,7 @@ let gc_fixpoint = fn ivars -> fn live ->
 // list honest in one direction: a non-Val map here is a build error. A MISSING
 // map is the direction to fear when adding a new global store.
 let gc_mark_roots = fn env -> fn live ->
-  let _ = map_clear gc_obj_pend in
+  let _ = vec_recycle gc_obj_pend in
   // (the frame texts: one handle each, shared by every frame -- frame_text)
   let _ = map_iter frame_str_ids (fn (k: str) -> fn (h: int) -> gc_mark_val live (VStr h)) in
   let mk = fn (k: str) -> fn (v: Val) -> gc_mark_val live v in
@@ -1270,7 +1293,7 @@ let gc_sweep_captured = fn live ->
   then
     (let dead = vec_new () in
      let _ = map_iter lv_cap (fn (k: int) -> fn (e) ->
-       if map_has live (k * 8 + 6) then () else vec_push dead k) in
+       if gc_live_has live (k * 8 + 6) then () else vec_push dead k) in
      let rec go = fn (i: int) ->
        if i >= vec_len dead then ()
        else (let k = vec_get dead i in
@@ -1282,7 +1305,7 @@ let gc_sweep_captured = fn live ->
      let _ = go 0 in
      let deadx = vec_new () in
      let _ = map_iter lv_capx (fn (k: int) -> fn (e) ->
-       if map_has live (k * 8 + 6) then () else vec_push deadx k) in
+       if gc_live_has live (k * 8 + 6) then () else vec_push deadx k) in
      let rec gox = fn (i: int) ->
        if i >= vec_len deadx then ()
        else (let k = vec_get deadx i in
@@ -1411,7 +1434,7 @@ let gc_sweep_structs = fn world -> fn live -> fn (nc: bool) ->
     let _ = map_iter consts (fn (k: str) -> fn (v: Val) ->
               (match v with VClass c -> (if is_s c then map_set keep c 1 else ()) | _ -> ())) in
     let _ = map_iter ocls (fn (id: int) -> fn (c: str) ->
-              if is_s c && map_has live (id * 8) then map_set keep c 1 else ()) in
+              if is_s c && gc_live_has live (id * 8) then map_set keep c 1 else ()) in
     // (a Method / UnboundMethod names its class and its method key as
     //  Strings -- @__m_owner, @__um_cls, "Struct_5#q" -- and so may other
     //  internal ivars: any live one that mentions a Struct_N keeps it)
@@ -1485,11 +1508,11 @@ let weak_ident = fn (v: Val) ->
 // a handle the marking did not reach (an immediate is never collected)
 let weak_dead = fn live -> fn (v: Val) ->
   match v with
-  | VObj i -> (if map_has live (i * 8) then false else true)
-  | VStr i -> (if map_has live (i * 8 + 1) then false else true)
-  | VArr i -> (if map_has live (i * 8 + 2) then false else true)
-  | VHsh i -> (if map_has live (i * 8 + 3) then false else true)
-  | VProc i -> (if map_has live (i * 8 + 4) then false else true)
+  | VObj i -> (if gc_live_has live (i * 8) then false else true)
+  | VStr i -> (if gc_live_has live (i * 8 + 1) then false else true)
+  | VArr i -> (if gc_live_has live (i * 8 + 2) then false else true)
+  | VHsh i -> (if gc_live_has live (i * 8 + 3) then false else true)
+  | VProc i -> (if gc_live_has live (i * 8 + 4) then false else true)
   | _ -> false;
 // WeakMap's sweep: an entry whose map, key or value died goes with it (the
 // dead are gathered first, then deleted; deleting allocates nothing)
@@ -1551,12 +1574,17 @@ let gc_collect = fn env -> fn world ->
     //  handle: what its ivars would have kept, for the ones that are live --
     //  strings point at nothing, so no further fixpoint pass is needed)
     let _ = map_iter md_lz_ix (fn (id: int) -> fn (o: int) ->
-      if map_has live (id * 8) then
+      if gc_live_has live (id * 8) then
         (let _ = gc_mark_val live (VStr (vec_get md_lz_v (o + 3))) in
          let kh9 = vec_get md_lz_v (o + 4) in
          if kh9 >= 0 then gc_mark_val live (VStr kh9) else ())
       else ()) in
     let _ = gc_weak_prune live in
+    // Only enqueue here. Ruby callbacks may allocate, collect recursively or
+    // change the registry; none may execute while mark/sweep is in progress.
+    let _ = map_iter fin_targets (fn (id: int) -> fn (key: int) ->
+      if key >= 0 && (if gc_live_has live key then false else true)
+      then map_set fin_ready id 1 else ()) in
     let _ = gc_sweep_captured live in
     let _ = gc_sweep_structs world live nc in
     // THE PROCS NOTHING REACHED (the VProc arm of gc_mark_val marks the ones
@@ -1567,7 +1595,7 @@ let gc_collect = fn env -> fn world ->
     let dP = vec_new () in
     let _ = (if map_has gc_state "keepprocs" then ()
              else map_iter proc_store (fn (k: str) -> fn pe ->
-                    if map_has live (int_of_str k * 8 + 4) then () else vec_push dP k)) in
+                    if gc_live_has live (int_of_str k * 8 + 4) then () else vec_push dP k)) in
     let _ = gc_drop_s proc_store dP in
     let _ = gc_drop_sh proc_yblk dP "" in
     // (and the ids of their bodies; the bodies stay, once each, note 273)
@@ -1575,6 +1603,11 @@ let gc_collect = fn env -> fn world ->
     let _ = gc_drop_sh yblk_bkey dP "" in
     let _ = gc_drop_sh proc_src dP "" in
     let _ = gc_drop_sh proc_src dP "f" in
+    let rec drop_proc_sources = fn (i: int) ->
+      if i >= vec_len dP then () else
+        (let _ = proc_source_drop (int_of_str (vec_get dP i)) in drop_proc_sources (i + 1)) in
+    let _ = drop_proc_sources 0 in
+    let _ = (if nc then () else proc_sources_compact ()) in
     let _ = gc_drop_sh proc_home dP "" in
     let _ = gc_drop_sh proc_arity dP "" in
     let _ = gc_drop_sh proc_arity dP "m" in
@@ -1616,7 +1649,7 @@ let gc_collect = fn env -> fn world ->
     let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
       let owner = gc_owner_of k in
       if owner < 0 then ()
-      else if map_has live (owner * 8) then ()
+      else if gc_live_has live (owner * 8) then ()
       else
         (let _ = (if str_ends_with k "@__f_fd" then
                     (match v with
@@ -1655,7 +1688,7 @@ let gc_collect = fn env -> fn world ->
     // used to guard it has nothing left to keep.
     let dOC = vec_new () in
     let _ = map_iter ocls (fn (k: int) -> fn (v: str) ->
-      if map_has live (k * 8) then () else vec_push dOC k) in
+      if gc_live_has live (k * 8) then () else vec_push dOC k) in
     let _ = gc_drop_i ocls dOC in
     let _ = gc_purge_sng world dOC in
     let _ = (if nc then () else map_compact ocls) in
@@ -1666,25 +1699,25 @@ let gc_collect = fn env -> fn world ->
     // sweep is ocls's.
     let dMW = vec_new () in
     let _ = map_iter md_whole (fn (k: int) -> fn (v: str) ->
-      if map_has live (k * 8) then () else vec_push dMW k) in
+      if gc_live_has live (k * 8) then () else vec_push dMW k) in
     let _ = gc_drop_i md_whole dMW in
     let _ = (if nc then () else map_compact md_whole) in
     // ...and the records of the ones nothing reached, then the slab moved down
     // over what they held
     let dLZ = vec_new () in
     let _ = map_iter md_lz_ix (fn (k: int) -> fn (o: int) ->
-      if map_has live (k * 8) then () else vec_push dLZ k) in
+      if gc_live_has live (k * 8) then () else vec_push dLZ k) in
     let _ = gc_drop_i md_lz_ix dLZ in
     let _ = md_lz_compact () in
     let dAK = vec_new () in
     let _ = map_iter arr_store (fn (k: int) -> fn (xs: Val list) ->
-      if map_has live (k * 8 + 2) then () else vec_push dAK k) in
+      if gc_live_has live (k * 8 + 2) then () else vec_push dAK k) in
     // ⚠ and the values queued for an array but not yet folded into it -- they
     // are as reachable as the array is, and dropping them here would free a
     // value the program is about to see.
     let dPK = vec_new () in
     let _ = map_iter arr_pending (fn (k: int) -> fn (v: Vec['p, Val]) ->
-      if map_has live (k * 8 + 2) then () else vec_push dPK k) in
+      if gc_live_has live (k * 8 + 2) then () else vec_push dPK k) in
     // (the queues go back through the quarantine: qv_drop, m_state)
     let rec dropPK = fn (i: int) -> (if i >= vec_len dPK then () else (let _ = arr_drop_q (vec_get dPK i) in dropPK (i + 1))) in
     let _ = dropPK 0 in
@@ -1704,7 +1737,7 @@ let gc_collect = fn env -> fn world ->
     //  are swept below)
     let dHK = vec_new () in
     let _ = map_iter hash_store (fn (k: int) -> fn (xs: Val list) ->
-      if map_has live (k * 8 + 3) then () else vec_push dHK k) in
+      if gc_live_has live (k * 8 + 3) then () else vec_push dHK k) in
     let rec dropHK = fn (i: int) -> (if i >= vec_len dHK then () else (let _ = hpend_drop (vec_get dHK i) in dropHK (i + 1))) in
     let _ = dropHK 0 in
     let _ = gc_drop_i hash_store dHK in
@@ -1716,18 +1749,18 @@ let gc_collect = fn env -> fn world ->
     // the table does not grow with every hash ever made.
     let dHQ = vec_new () in
     let _ = map_iter hash_pending (fn (k: int) -> fn (q: Vec['q, Val]) ->
-      if map_has live (k * 8 + 3) then () else vec_push dHQ k) in
+      if gc_live_has live (k * 8 + 3) then () else vec_push dHQ k) in
     let rec dropHQ = fn (i: int) -> (if i >= vec_len dHQ then () else (let _ = hpend_drop (vec_get dHQ i) in dropHQ (i + 1))) in
     let _ = dropHQ 0 in
     let dHI = vec_new () in
     let _ = map_iter hash_index (fn (k: int) -> fn (ix: Map['i, str, Val]) ->
-      if map_has live (k * 8 + 3) then () else vec_push dHI k) in
+      if gc_live_has live (k * 8 + 3) then () else vec_push dHI k) in
     // (wound back into the pool, not just forgotten: see hidx_release)
     let rec relI = fn (i: int) -> (if i >= vec_len dHI then () else (let _ = hidx_release (vec_get dHI i) in relI (i + 1))) in
     let _ = relI 0 in
     let dHM = vec_new () in
     let _ = map_iter hash_indexed (fn (k: int) -> fn (b: bool) ->
-      if map_has live (k * 8 + 3) then () else vec_push dHM k) in
+      if gc_live_has live (k * 8 + 3) then () else vec_push dHM k) in
     let _ = gc_drop_i hash_indexed dHM in
     let _ = (if nc then () else map_compact_big hash_indexed) in
     // (a dead hash's stale mark goes too; a live one keeps its own, and the
@@ -1735,19 +1768,19 @@ let gc_collect = fn env -> fn world ->
     //  kept a collection longer, never lost)
     let dHS = vec_new () in
     let _ = map_iter hash_stale (fn (k: int) -> fn (b: bool) ->
-      if map_has live (k * 8 + 3) then () else vec_push dHS k) in
+      if gc_live_has live (k * 8 + 3) then () else vec_push dHS k) in
     let _ = gc_drop_i hash_stale dHS in
     let _ = (if nc then () else map_compact_big hash_stale) in
     // ...and a dead hash's compare_by_identity mark (one per such hash made)
     let dCI = vec_new () in
     let _ = map_iter hcbi (fn (k: int) -> fn (b: int) ->
-      if map_has live (k * 8 + 3) then () else vec_push dCI k) in
+      if gc_live_has live (k * 8 + 3) then () else vec_push dCI k) in
     let _ = gc_drop_i hcbi dCI in
     let _ = (if nc then () else map_compact_big hcbi) in
     // ...and its default, default proc and keyword marks (keyed as text)
     let dsh = fn tbl -> fn (d: Vec['d, str]) ->
       let _ = map_iter tbl (fn (k: str) -> fn (v: Val) ->
-        if map_has live (int_of_str k * 8 + 3) then () else vec_push d k) in
+        if gc_live_has live (int_of_str k * 8 + 3) then () else vec_push d k) in
       let _ = gc_drop_s tbl d in
       (if nc then () else map_compact_big tbl) in
     let _ = dsh hash_dflt (vec_new ()) in
@@ -1763,14 +1796,14 @@ let gc_collect = fn env -> fn world ->
     let pks = map_new () in
     let _ = map_iter str_pend (fn (k: int) -> fn (n: int) -> map_set pks k n) in
     let _ = map_iter pks (fn (k: int) -> fn (n: int) ->
-      if map_has live (k * 8 + 1) then (let _ = str_flush k in ()) else str_pend_drop k) in
+      if gc_live_has live (k * 8 + 1) then (let _ = str_flush k in ()) else str_pend_drop k) in
     let _ = map_clear str_pch in
     let _ = (if nc then () else map_compact str_pch) in
     let _ = (if nc then () else map_compact str_pend) in
     // (as for the hashes above: the last sweep's survivors, then the new slots)
     let blank_s1 = fn (i: int) -> fn (k: int) ->
       let s9 = handle_base + i in
-      if map_has live (s9 * 8 + 1) then (let _ = gc_surv_put gc_str_surv k i in k + 1)
+      if gc_live_has live (s9 * 8 + 1) then (let _ = gc_surv_put gc_str_surv k i in k + 1)
       else (let _ = (if str_eq (sget s9) "" then () else sset s9 "") in k) in
     let sold = vec_get gc_knob 10 in
     let rec blank_so = fn (j: int) -> fn (k: int) ->
@@ -1786,19 +1819,19 @@ let gc_collect = fn env -> fn world ->
     let _ = str_pages_sweep gc_str_surv sk nc in
     let dE = vec_new () in
     let _ = map_iter str_enc (fn (k: int) -> fn (v: int) ->
-      if map_has live (k * 8 + 1) then () else vec_push dE k) in
+      if gc_live_has live (k * 8 + 1) then () else vec_push dE k) in
     let _ = gc_drop_i str_enc dE in
     let _ = (if nc then () else map_compact str_enc) in
     let dF = vec_new () in
     let _ = map_iter str_frozen (fn (k: int) -> fn (v: int) ->
-      if map_has live (k * 8 + 1) then () else vec_push dF k) in
+      if gc_live_has live (k * 8 + 1) then () else vec_push dF k) in
     let _ = gc_drop_i str_frozen dF in
     let _ = (if nc then () else map_compact str_frozen) in
     // ...and the ASCII / valid-UTF-8 answers kept per string: one per string
     // ever asked, kept forever (note 441)
     let dsb = fn tbl -> fn (d: Vec['d, int]) ->
       let _ = map_iter tbl (fn (k: int) -> fn (v: bool) ->
-        if map_has live (k * 8 + 1) then () else vec_push d k) in
+        if gc_live_has live (k * 8 + 1) then () else vec_push d k) in
       let _ = gc_drop_i tbl d in
       (if nc then () else map_compact_big tbl) in
     let _ = dsb str_ascii (vec_new ()) in
@@ -1808,11 +1841,11 @@ let gc_collect = fn env -> fn world ->
     // evaluated and per Symbol#to_s, kept forever.
     let dC = vec_new () in
     let _ = map_iter str_chilled (fn (k: int) -> fn (v: int) ->
-      if map_has live (k * 8 + 1) then () else vec_push dC k) in
+      if gc_live_has live (k * 8 + 1) then () else vec_push dC k) in
     let _ = gc_drop_i str_chilled dC in
     let dCS = vec_new () in
     let _ = map_iter str_chilled_sym (fn (k: int) -> fn (v: str) ->
-      if map_has live (k * 8 + 1) then () else vec_push dCS k) in
+      if gc_live_has live (k * 8 + 1) then () else vec_push dCS k) in
     let _ = gc_drop_i str_chilled_sym dCS in
     let _ = (if nc then () else map_compact str_chilled) in
     // The call-bookkeeping maps: one write per name/file/meth/line PER CALL
@@ -1857,7 +1890,7 @@ let gc_collect = fn env -> fn world ->
     let _ = (if nc then () else qv_drain ()) in
     let _ = (if nc then () else hidx_drain ()) in
     let _ = vec_set qv_ctr 3 0 in
-    let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (map_len live) ++ " ivars2=" ++ str_of_int (map_len ivars)
+    let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (gc_live_count live) ++ " ivars2=" ++ str_of_int (map_len ivars)
                                      ++ " str_store=" ++ str_of_int (str_bytes ()) ++ " str_pch=" ++ str_of_int (map_bytes str_pch)
                                      ++ " arr_store=" ++ str_of_int (map_bytes arr_store) ++ " hash_store=" ++ str_of_int (map_bytes hash_store)
                                      ++ " churn=" ++ str_of_int (gc_churn_bytes ()) ++ " nc=" ++ (if nc then "1" else "0")
@@ -1874,7 +1907,10 @@ let gc_collect = fn env -> fn world ->
     //  issued: that grew the gap between two collections for as long as the
     //  program ran, and 100k `s.gsub(/a/, "")` went from 4k objects a
     //  collection to 120k, note 441)
-    let scan = map_len arr_store + map_len hash_store + vec_get gc_knob 10 in
+    // Objects retained by closures cost marking work too. Without their
+    // population, an object-heavy live heap collected every 4,000 allocations
+    // regardless of its size, repeatedly scanning all earlier survivors.
+    let scan = map_len arr_store + map_len hash_store + map_len ocls + vec_get gc_knob 10 in
     let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
     let _ = vec_set gc_knob 0 (map_len ivars + map_len ocls + delta) in
     let _ = vec_set gc_knob 1 (gc_store_bytes ()) in
@@ -2024,7 +2060,7 @@ let fb_reclaim = fn env -> fn world ->
          let _ = map_iter cand (fn (i: int) -> fn (done: int) ->
            if done == 1 then ()
            else (match (if map_has fb_obj i then map_get fb_obj i else VNil) with
-                 | VObj oid -> (if map_has live (oid * 8) then (let _ = map_set cand i 1 in map_set inq i 1) else ())
+                 | VObj oid -> (if gc_live_has live (oid * 8) then (let _ = map_set cand i 1 in map_set inq i 1) else ())
                  | _ -> ())) in
          if map_len inq > 0 && guard > 0 then (let _ = mark_queued () in settle (guard - 1)) else () in
        let _ = settle 100000 in
@@ -2999,9 +3035,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let recv = eval_e env world blk recv_e in
     (match recv with
      | VNil -> VNil
+     // ⚠ a block-PASS is resolved as EMethodB resolves it: `x&.each(&pr)` ran
+     //   the marker as a literal block, so the block never got pr -- resolv's
+     //   Hosts#each_address (`@name2addr[name]&.each(&proc)`) found nothing
      | _ ->
        let args = eval_args env world blk arges in
-       invoke_with_block env world blk recv name args (true, bp, bb, env))
+       (match bp with
+        | Cons (c, Nil) when str_eq c block_pass_marker ->
+          invoke_with_block env world blk recv name args
+            (coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil))
+        | _ -> invoke_with_block env world blk recv name args (true, bp, bb, env)))
   | ESafe (recv_e, name, arges) ->
     (match eval_e env world blk recv_e with
      | VNil -> VNil
@@ -4365,6 +4408,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (if (str_len name == 4 && str_eq name "puts") then
          (let vs = eval_args env world blk arges in
           let _ = (match vs with Nil -> out_emit world "\n" | _ -> puts_each world vs) in VNil)
+       // ⚠ ...but a bare call asks the CALLER's self first, and a caller with
+       //   a method of that name of its own got THAT: `Kernel.load(f)` inside
+       //   a class that defines #load called itself forever (irb's
+       //   IRB::Locale#load). Then the call runs with Kernel as self, in a
+       //   child of the caller's frame (the arguments are the caller's).
+       else if lv_has env "self" && has_meth world (dispatch_cls_of world (lv_get env "self")) name then
+         (let vs9 = eval_args env world blk arges in
+          let e9 = lv_child env in
+          let _ = map_set e9 "self" (VClass "Kernel") in
+          let _ = map_set e9 "__kmfa" (arr_new vs9) in
+          let r9 = eval_e e9 world blk (ECall (name, Cons (ESplat (EVar "__kmfa"), Nil))) in
+          let _ = lv_child_done e9 in
+          r9)
        else eval_e env world blk (ECall (name, arges)))
     else
     // a trailing &proc / &var argument becomes the call's block.
@@ -5069,6 +5125,39 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
 // can evaluating this operand do anything but read? (ebin's once-only rule)
 // the ASCII-compatible encodings in which every byte is one character
 // (ruby 4.0.9's table, read by asking each for 0x80..0xFF)
+// Deliver outside the collector, once per registry batch. A callback's
+// GC.start may queue more targets, but cannot recursively drain this batch.
+and fin_protected = fn world -> fn work ->
+  if map_has fin_on "busy" then work ()
+  else
+    (let _ = map_set fin_on "busy" 1 in
+     let tid = sch_me () in
+     let _ = map_set fin_on "tid" tid in
+     let (_, _, _, iv) = world in
+     let prev = (if map_has iv "$exc" then map_get iv "$exc" else VNil) in
+     let gprev = (if map_has globals "!" then map_get globals "!" else VNil) in
+     let _ = map_set gc_hold "finalizer:exc" prev in
+     let _ = map_set gc_hold "finalizer:global_exc" gprev in
+     let result = try_or work VNil in
+     // A nil value must remain absence: pending_exc uses key presence to
+     // decide whether primitive failure metadata still needs materializing.
+     let _ = (match prev with VNil -> map_delete iv "$exc"
+              | _ -> map_set iv "$exc" prev) in
+     let _ = map_set globals "!" gprev in
+     let _ = map_delete gc_hold "finalizer:exc" in
+     let _ = map_delete gc_hold "finalizer:global_exc" in
+     let _ = map_delete fin_on "tid" in
+     let _ = map_delete fin_on "busy" in
+     // Deliver asynchronous interrupts outside callback exception handlers.
+     let _ = sch_deliver_at world tid false in result)
+and fin_drain = fn world ->
+  if map_len fin_ready == 0 || map_has fin_on "busy" then ()
+  else (let _ = fin_protected world (fn (u: unit) ->
+    invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
+      (VClass "ObjectSpace") "__run_ready_finalizers" Nil false) in ())
+and gc_point_finalizers = fn world ->
+  let _ = gc_point world in fin_drain world
+
 and chr_single_byte_encs = fn (u: unit) -> str_split "ASCII-8BIT ISO-8859-1 ISO-8859-2 ISO-8859-3 ISO-8859-4 ISO-8859-5 ISO-8859-6 ISO-8859-7 ISO-8859-8 ISO-8859-9 ISO-8859-10 ISO-8859-11 ISO-8859-13 ISO-8859-14 ISO-8859-15 ISO-8859-16 KOI8-R KOI8-U Windows-1250 Windows-1251 Windows-1252 Windows-1253 Windows-1254 Windows-1257 IBM437 IBM720 IBM737 IBM775 CP850 IBM852 CP852 IBM855 CP855 IBM857 IBM860 IBM861 IBM862 IBM863 IBM864 IBM865 IBM866 IBM869 Windows-1258 GB1988 macCentEuro macCroatian macCyrillic macGreek macIceland macRoman macRomania macThai macTurkish macUkraine Windows-1256 Windows-1255 TIS-620 Windows-874" " "
 and ebin_rhs_effects = fn (e: Expr) ->
   match e with
@@ -8005,7 +8094,7 @@ and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
   // in flight above it, so its statement boundaries are not safepoints.
   let _ = gc_unsafe_push () in
   // ...but each run of it is a safepoint off the stack (gc_point)
-  let _ = gc_point world in
+  let _ = gc_point_finalizers world in
   let f = try_or_msg (fn (u: unit) -> run_stmts cenv world encl body)
             (fn (m: str) -> let _ = note_extern_refused m in FRaise VNil) in
   let _ = gc_unsafe_pop () in
@@ -9877,6 +9966,9 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        // have -- the hash went to to_f and came back as "not a number", so
        // 1.0.step(to: 10.0, by: 2.0) failed while the positional spelling of
        // the same walk worked.
+       // (a `by:` that is no number is compared with 0 first, as positionally)
+       | Cons (VHsh hid9, Nil) when (match aseq_kw (hderef hid9) "by" with VNil -> false | b9 -> (if is_num b9 then false else true)) ->
+         raise_exc world "ArgumentError" ("comparison of " ++ display_cls_msg world (dispatch_cls_of world (aseq_kw (hderef hid9) "by")) ++ " with 0 failed")
        | Cons (VHsh hid9, Nil) ->
          (let by9 = aseq_kw (hderef hid9) "by" in
           let to9 = aseq_kw (hderef hid9) "to" in
@@ -9896,6 +9988,8 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
          (let sf9 = (match rest9 with Cons (sv9, _) -> to_f sv9 | _ -> 1.0) in
           let lf9 = (match lim9 with VNil -> (if sf9 < 0.0 then 0.0 - 1.0 / 0.0 else 1.0 / 0.0) | _ -> to_f lim9) in
           iter_each_result (flt_step world encl theblk fb lf9 sf9) recv)
+       // (no limit at all: on without end, by 1.0 -- `1.0.step.first(5)`)
+       | Nil -> iter_each_result (flt_step world encl theblk fb (1.0 / 0.0) 1.0) recv
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: step needs a limit")) in fail "mere-ruby: step needs a limit"))
     else prim_method recv name args
   // an Integer walk whose endpoints a machine int cannot hold. `times` is
@@ -10006,6 +10100,11 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
            // was always +max, so `10.step(by: -2)` stopped before 10)
            | (VInt b9, VNil) -> iter_each_result (range_step world encl theblk n (if b9 < 0 then 0 - int_max else int_max) b9) recv
            | (VNil, VNil) -> iter_each_result (range_step world encl theblk n int_max 1) recv
+           // (an infinite Float `to:` in the walk's direction is no limit,
+           //  and the walk stays Integer: num_step's `inf`)
+           | (VInt b9, VFlt t9) when b9 != 0 && flt_is_inf t9 && (t9 > 0.0) == (b9 > 0) ->
+             iter_each_result (range_step world encl theblk n (if b9 < 0 then 0 - int_max else int_max) b9) recv
+           | (VNil, VFlt t9) when flt_is_inf t9 && t9 > 0.0 -> iter_each_result (range_step world encl theblk n int_max 1) recv
            // (a `by:` that is no number is compared with 0, and a `to:` with
            //  the receiver -- ruby's two refusals)
            | (b9, _) when (match b9 with VNil -> false | _ -> (if is_num b9 then false else true)) ->
@@ -10022,6 +10121,12 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        // (a nil step with a block is "step must be numeric", and one that is
        //  not a number is compared with 0 first: "comparison of String with
        //  0 failed", as for a Float receiver)
+       // ⚠ an INFINITE Float limit in the walk's direction is no limit, and
+       //   the walk stays Integer -- num_step's `inf` (`42.step(Float::INFINITY,
+       //   1)` is 42, 43, ...). It was a Float walk, 42.0, 43.0, ...
+       | Cons (VFlt f9, Cons (VInt by, _)) when by != 0 && flt_is_inf f9 && (f9 > 0.0) == (by > 0) ->
+         iter_each_result (range_step world encl theblk n (if by < 0 then 0 - int_max else int_max) by) recv
+       | Cons (VFlt f9, Nil) when flt_is_inf f9 && f9 > 0.0 -> iter_each_result (range_step world encl theblk n int_max 1) recv
        | Cons (_, Cons (VNil, _)) -> raise_exc world "TypeError" "step must be numeric"
        // (a Hash step is ruby's odd refusal from adding to it)
        | Cons (_, Cons (VHsh _, _)) -> raise_exc world "TypeError" "no implicit conversion of Integer into Hash"
@@ -10100,7 +10205,13 @@ and flt_step = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (lim: flo
 and flt_step_x = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (lim: float) -> fn (st: float) -> fn (excl: bool) ->
   if flt_is_inf st then
     (if (if st > 0.0 then b <= lim else b >= lim) then flt_step_go world encl theblk b st lim 0 0 else FNext VNil)
+  // (...and from the SAME infinity it is nothing: the count is NaN, and
+  //  ruby's `i < n` never holds -- `inf.step(inf, 1)` yielded inf forever)
+  else if flt_is_inf lim && flt_is_inf b && (b > 0.0) == (lim > 0.0) then FNext VNil
   else if flt_is_inf lim then (if (lim > 0.0) == (st > 0.0) then flt_step_go world encl theblk b st lim 0 int_max else FNext VNil)
+  // (...and from an infinite BEGIN toward a finite end the count is infinite:
+  //  `(-Float::INFINITY..0.0).step(2)` yields -Infinity until the block breaks)
+  else if flt_is_inf b then (if (st > 0.0) == (b < lim) then flt_step_go world encl theblk b st lim 0 int_max else FNext VNil)
   else
     (let n = flt_step_count b lim st excl in
      if n <= 0 then FNext VNil else flt_step_go world encl theblk b st lim 0 (n - 1))
@@ -10520,7 +10631,7 @@ and arr_each_idx = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (
 // `80_000.times { |i| proc { i } }` kept every one of its procs alive through
 // the loop (note 272). Here only break / return values leave the turn.
 and run_block_turn = fn world -> fn encl -> fn theblk -> fn (args: Val list) ->
-  let _ = gc_point world in
+  let _ = gc_point_finalizers world in
   region TURN {
     match run_block world encl theblk args with
     | FNext _ -> flow_next_nil
@@ -10534,21 +10645,21 @@ and run_block_turn = fn world -> fn encl -> fn theblk -> fn (args: Val list) ->
 // that called the iterator, open for the whole loop -- 48 bytes a turn,
 // `3_000_000.times {}` held 146 MB until it ended (note 403)
 and run_block_turn1 = fn world -> fn encl -> fn theblk -> fn (x: Val) ->
-  let _ = gc_point world in
+  let _ = gc_point_finalizers world in
   region TURN {
     match run_block world encl theblk (Cons (x, Nil)) with
     | FNext _ -> flow_next_nil
     | f -> f
   }
 and run_block_turn_i = fn world -> fn encl -> fn theblk -> fn (i: int) ->
-  let _ = gc_point world in
+  let _ = gc_point_finalizers world in
   region TURN {
     match run_block world encl theblk (Cons (VInt i, Nil)) with
     | FNext _ -> flow_next_nil
     | f -> f
   }
 and run_block_turn_vi = fn world -> fn encl -> fn theblk -> fn (x: Val) -> fn (i: int) ->
-  let _ = gc_point world in
+  let _ = gc_point_finalizers world in
   region TURN {
     match run_block world encl theblk (Cons (x, Cons (VInt i, Nil))) with
     | FNext _ -> flow_next_nil
@@ -10556,14 +10667,14 @@ and run_block_turn_vi = fn world -> fn encl -> fn theblk -> fn (x: Val) -> fn (i
   }
 // (Hash#each's [key, value] pair, made in the turn too)
 and run_block_turn_kv = fn world -> fn encl -> fn theblk -> fn (k: Val) -> fn (v: Val) ->
-  let _ = gc_point world in
+  let _ = gc_point_finalizers world in
   region TURN {
     match run_block world encl theblk (Cons (arr_new (Cons (k, Cons (v, Nil))), Nil)) with
     | FNext _ -> flow_next_nil
     | f -> f
   }
 and run_block_turn_s = fn world -> fn encl -> fn theblk -> fn (cur: str) ->
-  let _ = gc_point world in
+  let _ = gc_point_finalizers world in
   region TURN {
     match run_block world encl theblk (Cons (mkstr cur, Nil)) with
     | FNext _ -> flow_next_nil
@@ -13684,6 +13795,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                   | VBool x9 -> x9 | _ -> false)
                  b9 (str_eq name0 "eql?")))
      | _ -> VBool false)
+  // Numeric#eql? on an instance of a program's own Numeric: the same TYPE
+  // (two plain objects, whatever their classes) and then rb_equal -- the
+  // same object, or #== says so. It was identity alone (core/numeric/eql,
+  // measured since the shim has an eql matcher).
+  else if str_eq name0 "eql?"
+          && (match recv0 with VObj _ -> true | _ -> false)
+          && (let oc9 = dispatch_cls_of world recv0 in
+              obj_is_a world oc9 "Numeric" && (if has_meth world oc9 "eql?" then false else true)
+              && (if builtin_obj_has (display_cls world oc9) "eql?" then false else true)) then
+    (match args0 with
+     | Cons (VObj b9, _) ->
+       VBool (rb_identical recv0 (VObj b9)
+              || truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv0 "==" (Cons (VObj b9, Nil)) false))
+     | _ -> VBool false)
   else if str_eq name0 "=="
           && (match recv0 with VObj _ -> true | _ -> false)
           && (let oc9 = dispatch_cls_of world recv0 in
@@ -13780,8 +13905,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // `1.step(nil, 2)` (a Range's step takes no nil)
          | Cons (VNil, _) -> (match recv0 with VRange (_, _, _) -> false | _ -> true)
          | _ -> false)
+     // (...and for a NUMBER's step, the step is the SECOND argument or `by:`)
+     && (match recv0 with VRange (_, _, _) -> true | _ -> num_step_args_numeric args0)
      && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" || map_has mm9 "Range#step" then false else true))
   then aseq_of world recv0 args0
+  else if str_eq name0 "step"
+          && (match recv0 with VInt _ -> true | VFlt _ -> true | VRat (_, _) -> true | VBig _ -> true | _ -> false)
+          && (if num_step_args_numeric args0 then false else true)
+          && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" then false else true)) then
+    make_enum_a world recv0 "step" args0
   else if str_eq name0 "step"
           && (match recv0 with VRange (_, _, _) -> true | VInt _ -> true | VFlt _ -> true | _ -> false)
           && (match args0 with Cons (VObj _, _) -> true | _ -> false)
@@ -14360,6 +14492,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                           || (str_len name == 7 && str_eq name "product")
                           || (str_len name == 3 && str_eq name "zip"))
               then coerce_dyck_args env world recv args0
+              // (...but a FROZEN receiver of the writing three refuses before
+              //  an argument is asked #to_hash, as ruby's rb_hash_modify_check
+              //  comes first: `frozen.send(:update, obj)`)
+              else if (match recv with VHsh h9 -> cfrozen_get 1 h9 | _ -> false)
+                      && ((str_len name == 6 && str_eq name "merge!") || (str_len name == 6 && str_eq name "update")
+                          || (str_len name == 7 && str_eq name "replace")) then
+                (let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect env world recv)
+                           (Cons (("__recv", recv), Nil)) in args0)
               // Hash's hash-taking methods accept anything with #to_hash
               // (merge, update, replace) -- an object argument was skipped
               // entirely, so `h.merge(obj)` answered h unchanged.
@@ -16886,8 +17026,21 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     //  itself, rb_check_frozen: "can't modify frozen Class: #<Class:#<...>>")
     let _ = (if (map_len cls_frozen > 0 || is_sng_cls c) && cls_frozen_refuses name args
              then (if frz_const_name name then frz_const_check world c else frz_cls_check world c) else ()) in
+    // ⚠ A PROGRAM'S OWN class method of a CORE class comes before the
+    //   builtin of that name: `class << File; def dirname`, a module
+    //   prepended to File's singleton (pathname's test_split), a stub of
+    //   Time.now (logger's shift_period_suffix), Process.pid, Math.sqrt --
+    //   the builtin arms below answered first. Only a definition the program
+    //   wrote (sng_user_owner: the prelude's are the builtins); one the
+    //   singleton has directly, or in a module prepended to it -- an
+    //   INCLUDED module comes after the builtin, as in ruby.
+    if (builtin_cls_name c || map_has (name_set "core_sng_cls") c)
+       && ((let (m8, _, _, _) = world in map_has m8 ("(sng:" ++ c ++ ")#" ++ name)) || map_has prepends ("(sng:" ++ c ++ ")"))
+       && (if str_len name > 2 && str_eq (substring name 0 2) "__" then false else true)
+       && (if str_eq (sng_user_owner world c name) "" then false else true) then
+      invoke world blk recv ("(sng:" ++ c ++ ")") name args
     // a singleton class cannot be instantiated: new / allocate raise TypeError.
-    if is_sng_cls c && ((str_len name == 3 && str_eq name "new") || (str_len name == 8 && str_eq name "allocate")) then
+    else if is_sng_cls c && ((str_len name == 3 && str_eq name "new") || (str_len name == 8 && str_eq name "allocate")) then
       raise_exc world "TypeError" "can't create instance of singleton class"
     // Exception.exception(*args) is Exception.new(*args) -- the class half of
     // the protocol raise uses (a class that defines its own still decides)
@@ -17475,7 +17628,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let out = map_new () in
        let _ = map_iter enc_objs (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
        arr_new (idx_to_list out 0 (map_len out)))
-    else if str_eq c "Encoding" && (str_len name == 14 && str_eq name "locale_charmap") then mkstr "UTF-8"
+    else if str_eq c "Encoding" && (str_len name == 14 && str_eq name "locale_charmap") then mkstr (locale_codeset ())
     // Encoding.compatible?(a, b): the encoding a combination of the two would
     // carry, or nil. Strings (and Symbols, Regexps) bring their bytes; an
     // Encoding brings none, so it is never "empty" nor "ASCII only" -- and
@@ -17916,15 +18069,6 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                    else ()) in
           VInt rc9)
        | _ -> VInt (0 - 1))
-    // ⚠ A PROGRAM'S OWN class method of File, IO or FileTest comes before the
-    //   builtin of that name: `class << File; def dirname(*) = ...` and a
-    //   module prepended to File's singleton (pathname's test_split) were
-    //   never asked -- the builtin arms below answered first. Only a
-    //   definition the program wrote: the prelude's are the builtins.
-    else if (str_eq c "File" || str_eq c "IO" || str_eq c "FileTest")
-            && (if str_len name > 2 && str_eq (substring name 0 2) "__" then false else true)
-            && (if str_eq (sng_user_owner world c name) "" then false else true) then
-      invoke world blk recv ("(sng:" ++ c ++ ")") name args
     else if str_eq c "File" && (str_len name == 11 && str_eq name "__fifo_made") then
       (match args with Cons (VStr ph9, _) -> (let _ = map_set fifo_paths (abs_path_of (sget ph9)) 1 in VNil) | _ -> VNil)
     // umask(2): sets the mask and answers the old one (File.umask reads by
@@ -21164,10 +21308,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let _ = (if fb_off_stack then () else map_set gc_state "oncall" 1) in
           let _ = gc_collect_any env world in
           let _ = (if map_has gc_state "oncall" then map_delete gc_state "oncall" else ()) in
-          VNil)
+          let _ = fin_drain world in VNil)
        // ...and in the middle of a body, on a stack of its own (note 270), where
        // this build has one
-       else if gc_collect_off_stack world then VNil
+       else if gc_collect_off_stack world then (let _ = fin_drain world in VNil)
        else
          (let _ = map_set gc_state "n" ((if map_has gc_state "n" then map_get gc_state "n" else 0) + 1) in
           let _ = vec_set gc_knob 5 1 in
@@ -21915,6 +22059,106 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (match args with Cons (value, _) -> objectspace_class_of world value | _ -> VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 10 && str_eq name "__fin_flag") then
       (let _ = map_set fin_on "y" 1 in VNil)
+    else if str_eq c "ObjectSpace" && str_eq name "__fin_run_batch" then
+      fin_protected world (fn (u: unit) -> (match args with
+       | Cons (VHsh batch, Cons (VHsh extras, _)) ->
+         (let rec run_extra = fn (id: Val) -> fn (xs: Val list) ->
+            match xs with
+            | Nil -> ()
+            | Cons (callback, rest) ->
+              (let _ = region FINCALL {
+                 let _ = invoke_val_c env world noblk (VClass "ObjectSpace") "__call_finalizer" (Cons (id, Cons (callback, Nil))) false in ()
+               } in run_extra id rest) in
+          let rec run = fn (xs: Val list) ->
+            match xs with
+            | Cons (VInt id, Cons (first, rest)) ->
+              (let _ = region FINCALL {
+                 let more = (if hix_has_lazy extras false (VInt id) then hix_get extras false (hderef extras) (VInt id) else VNil) in
+                 let _ = map_delete fin_targets id in
+                 let _ = map_delete fin_ready id in
+                 let _ = invoke_val_c env world noblk (VClass "ObjectSpace") "__call_finalizer" (Cons (VInt id, Cons (first, Nil))) false in
+                 match more with VArr aid -> run_extra (VInt id) (deref aid) | _ -> ()
+               } in run rest)
+            | _ -> () in
+          // A stale index needs the general snapshot path. Otherwise the
+          // detached registry is immutable during this batch: registrations
+          // made by callbacks go to the next registry in the Ruby wrapper.
+          let _ = (if map_has hash_stale batch then run (hderef batch)
+                   else
+                     (let pending = (if hpending_on batch then hpending_vec batch else vec_new ()) in
+                      let count = vec_len pending in
+                      let _ = run (hsettled batch) in
+                      let rec queued = fn (i: int) ->
+                        if i + 1 >= count then ()
+                        else (let _ = region FINPAIR {
+                                let _ = run (Cons (vec_get pending i, Cons (vec_get pending (i + 1), Nil))) in ()
+                              } in
+                              queued (i + 2)) in
+                      queued 0)) in VNil)
+       | _ -> VNil))
+    else if str_eq c "ObjectSpace" && str_eq name "__fin_fast" then
+      // The frequent fresh Object/Proc registration needs no duplicate list.
+      // Observable overrides and all other shapes retain the Ruby path.
+      (match args with
+       | Cons (VObj oid, Cons (VProc pid, _)) ->
+         (let object = VObj oid in
+          let callable = VProc pid in
+          let cls = dispatch_cls_of world object in
+          let (_, _, _, captured) = proc_as_block pid in
+          let receiver = (if lv_has captured "self" then lv_get captured "self" else VNil) in
+          if ofrozen_get oid || has_meth world cls "frozen?" || has_meth world cls "object_id"
+             || rb_identical receiver object then VNil
+          else if (if truthy (invoke_val_c env world noblk callable "respond_to?" (Cons (VSym "call", Nil)) false) then false else true) then VNil
+          else
+            (let (_, _, _, iv) = world in
+             let registry = (if map_has iv "cls:ObjectSpace@__fin" then map_get iv "cls:ObjectSpace@__fin" else VNil) in
+             match registry with
+             | VHsh hid ->
+               (let id = 1000000 + (oid - handle_base) * 8 in
+                let key = VInt id in
+                if hix_has_lazy hid false key then VNil
+                else
+                  (let _ = (if map_has iv "cls:ObjectSpace@__fin_hooked" && truthy (map_get iv "cls:ObjectSpace@__fin_hooked") then ()
+                            else (let _ = invoke_val_c env world noblk (VClass "ObjectSpace") "__install_finalizer_hook" Nil false in ())) in
+                   let _ = map_set fin_on "y" 1 in
+                   let _ = map_set fin_targets id (oid * 8) in
+                   let _ = hput_or_queue hid false key callable (fn (u: unit) -> hash_put_x false (hderef hid) key callable) in
+                   arr_new (Cons (VInt 0, Cons (callable, Nil)))))
+             | _ -> VNil))
+       | _ -> VNil)
+    else if str_eq c "ObjectSpace" && str_eq name "__fin_proc_receiver" then
+      (match args with
+       | Cons (VProc id, _) ->
+         (let (_, _, _, captured) = proc_as_block id in
+          if lv_has captured "self" then lv_get captured "self" else VNil)
+       | _ -> VNil)
+    else if str_eq c "ObjectSpace" && str_eq name "__fin_watch" then
+      (match args with
+       | Cons (v, Cons (VInt id, _)) ->
+         (let key = (match v with
+           | VObj n -> n * 8 | VStr n -> n * 8 + 1
+           | VArr n -> n * 8 + 2 | VHsh n -> n * 8 + 3
+           | VProc n -> n * 8 + 4 | VBind n -> n * 8 + 5
+           | _ -> 0 - 1) in
+          let _ = map_set fin_targets id key in VNil)
+       | _ -> VNil)
+    else if str_eq c "ObjectSpace" && str_eq name "__fin_forget" then
+      (match args with
+       | Cons (VInt id, _) ->
+         (let _ = map_delete fin_targets id in let _ = map_delete fin_ready id in VNil)
+       | _ -> VNil)
+    else if str_eq c "ObjectSpace" && str_eq name "__fin_take_ready" then
+      (let ids = vec_new () in
+       let _ = map_iter fin_ready (fn (id: int) -> fn (x: int) -> vec_push ids (VInt id)) in
+       let rec take = fn (i: int) -> fn (xs: Val list) ->
+         if i < 0 then xs else
+           (let v = vec_get ids i in
+            let _ = (match v with VInt id -> map_delete fin_targets id | _ -> ()) in
+            take (i - 1) (Cons (v, xs))) in
+       let xs = take (vec_len ids - 1) Nil in
+       let _ = map_clear fin_ready in
+       let _ = map_compact fin_targets in
+       let _ = map_compact fin_ready in arr_new xs)
     else if str_eq c "ObjectSpace" && (str_len name == 11 && str_eq name "__sym_of_id") then
       (match args with
        | Cons (VInt i9, _) -> (let n9 = sym_name_of_id i9 in if str_eq n9 "" then VNil else VSym n9)
@@ -22634,6 +22878,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let e2 = map_new () in
           let _ = map_set e2 "__ka" (arr_new args) in
           eval_e e2 world blk (ECall ("system", Cons (ESplat (EVar "__ka"), Nil))))
+       // ⚠ the implicit-self route asks the CALLER's self first, so a caller
+       //   with a method of that name of its own got THAT one: `Kernel.load(f)`
+       //   inside a class defining #load called itself forever (irb's
+       //   IRB::Locale#load). Then the module function runs with Kernel as
+       //   self, in a child of the caller's frame.
+       // (kmf_busy: the module function's own road may come back here, and
+       //  then it is answered the plain way)
+       else if lv_has env "self" && (if map_has kmf_busy name then false else true)
+               && has_meth world (dispatch_cls_of world (lv_get env "self")) name then
+         (let e9 = lv_child env in
+          let _ = map_set e9 "self" recv in
+          let _ = map_set kmf_busy name 1 in
+          let r9 = try_self_call_x e9 world recv name args true in
+          let _ = map_delete kmf_busy name in
+          let _ = lv_child_done e9 in
+          r9)
        else try_self_call_x env world recv name args true)
     // a class that does `extend Enumerable` and defines `self.each` gets the
     // Enumerable surface on the class object itself (Gem::Specification is
@@ -25974,7 +26234,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                             if str_len k > str_len mpre && str_eq (substring k 0 (str_len mpre)) mpre
                             then map_set tm (nsng ++ "#" ++ substring k (str_len mpre) (str_len k)) v
                             else ()) in
-                  let _ = map_iter tm (fn (k: str) -> fn (v: Meth) -> set_meth meths k v) in
+                  // (...with what each body was written in: a define_method
+                  //  body's closure, so `define_singleton_method(name) {
+                  //  @table[name] }` -- every OpenStruct accessor -- still
+                  //  reads `name` on the copy; copy_meth_src)
+                  let _ = map_iter tm (fn (k: str) -> fn (v: Meth) ->
+                            (let _ = set_meth meths k v in
+                             copy_meth_src k (mpre ++ substring k (str_len nsng + 1) (str_len k)))) in
                   let cpre = ocls0 ++ "::" in
                   let tc = map_new () in
                   let _ = map_iter consts (fn (k: str) -> fn (v: Val) ->
@@ -25994,7 +26260,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                             then map_set ts (ssn ++ "#" ++ substring k (str_len spre) (str_len k)) v
                             else ()) in
                   let _ = (if map_len ts > 0 && map_has sup ss0 then set_sup sup ssn (map_get sup ss0) else ()) in
-                  let _ = map_iter ts (fn (k: str) -> fn (v: Meth) -> set_meth meths k v) in ())
+                  let _ = map_iter ts (fn (k: str) -> fn (v: Meth) ->
+                            (let _ = set_meth meths k v in
+                             copy_meth_src k (spre ++ substring k (str_len ssn + 1) (str_len k)))) in ())
                else map_set ocls nid realcls in
        let cp9 = VObj nid in
        // the copy hook runs BEFORE the copy is frozen (ruby freezes last), and
@@ -26548,24 +26816,24 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // the file and the lines a proc's body spans, for a TracePoint that
     // targets it: [file, first, last] (its statements' lines, the nested
     // blocks' inside them)
-    else if (str_len name == 10 && str_eq name "__tp_lines") && map_has proc_store (str_of_int pid) && map_has proc_src (str_of_int pid) then
+    else if (str_len name == 10 && str_eq name "__tp_lines") && map_has proc_store (str_of_int pid) && proc_source_has (str_of_int pid) then
       (let (_, _, body9, _) = proc_get (str_of_int pid) in
-       let lo9 = (match map_get proc_src (str_of_int pid) with VInt n9 -> n9 | _ -> 0) in
+       let lo9 = (match proc_source_get (str_of_int pid) with VInt n9 -> n9 | _ -> 0) in
        let rec hi9 = fn (b9: Stmt list) -> fn (acc: int) ->
          (match b9 with
           | Cons (SLine n9, t9) -> hi9 t9 (let a9 = (if n9 < 0 then 0 - n9 else n9) in if a9 > acc then a9 else acc)
           | Cons (_, t9) -> hi9 t9 acc
           | Nil -> acc) in
-       let f9 = (if map_has proc_src ("f" ++ str_of_int pid) then (match map_get proc_src ("f" ++ str_of_int pid) with VStr h9 -> sget h9 | _ -> "") else "") in
+       let f9 = (if proc_source_has ("f" ++ str_of_int pid) then (match proc_source_get ("f" ++ str_of_int pid) with VStr h9 -> sget h9 | _ -> "") else "") in
        arr_new (Cons (mkstr f9, Cons (VInt lo9, Cons (VInt (hi9 body9 lo9), Nil)))))
     else if (str_len name == 15 && str_eq name "source_location") then
-      (if map_has proc_src (str_of_int pid)
-       then (let f9 = (if map_has proc_src ("f" ++ str_of_int pid) then map_get proc_src ("f" ++ str_of_int pid) else mkstr "") in
+      (if proc_source_has (str_of_int pid)
+       then (let f9 = (if proc_source_has ("f" ++ str_of_int pid) then proc_source_get ("f" ++ str_of_int pid) else mkstr "") in
              match f9 with
              | VStr h9 -> (if str_eq (sget h9) "" then VNil
                            // (a copy: the file's text is one handle shared by every
                            //  proc written there -- frame_text)
-                           else arr_new (Cons (mkstr (sget h9), Cons (map_get proc_src (str_of_int pid), Nil))))
+                           else arr_new (Cons (mkstr (sget h9), Cons (proc_source_get (str_of_int pid), Nil))))
              | _ -> VNil)
        else VNil)
     // currying a curried proc curries THAT proc, with what it has already
@@ -26746,7 +27014,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                //  "unexpected break", [ruby-dev:45041])
                then raise_exc_iv world "LocalJumpError"
                       (if (let fk9 = "f" ++ str_of_int pid in
-                           map_has proc_src fk9 && (match map_get proc_src fk9 with VStr h9 -> str_eq (sget h9) "<internal:prelude>" | _ -> false))
+                           proc_source_has fk9 && (match proc_source_get fk9 with VStr h9 -> str_eq (sget h9) "<internal:prelude>" | _ -> false))
                           || ibreak_val bv9
                        then "unexpected break" else "break from proc-closure")
                       (Cons (("__exit_value", (if ibreak_val bv9 then VNil else bv9)), Cons (("__reason", VSym "break"), Nil)))
@@ -26787,8 +27055,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let _ = map_set bind_store (str_of_int bid) (bnd_live cenv9) in
        // (its #source_location is the proc's: where the block was written, or
        //  for Method#to_proc's, where the method was)
-       let _ = (if map_has proc_src (str_of_int pid) && map_has proc_src ("f" ++ str_of_int pid) then
-                  (match (map_get proc_src ("f" ++ str_of_int pid), map_get proc_src (str_of_int pid)) with
+       let _ = (if proc_source_has (str_of_int pid) && proc_source_has ("f" ++ str_of_int pid) then
+                  (match (proc_source_get ("f" ++ str_of_int pid), proc_source_get (str_of_int pid)) with
                    | (VStr fh9, VInt ln9) -> (if str_eq (sget fh9) "" then () else map_set bind_loc (str_of_int bid) (sget fh9 ++ "\n" ++ str_of_int ln9))
                    | _ -> ())
                 else ()) in
@@ -28197,6 +28465,34 @@ and rel_file_base = fn (f: str) ->
   if str_len f > 0 && str_eq f s9 && map_has load_ctx "cwd0"
   then (match map_get load_ctx "cwd0" with VStr h -> sget h | _ -> env_get "PWD")
   else env_get "PWD"
+// A Hash derived from another (merge) is of the other's CLASS: a subclass's
+// merge is that subclass, as rb_hash_dup makes it -- and a value with a
+// singleton class gives the class it had before the singleton.
+and hsh_class_like = fn (src: Val) -> fn (dst: Val) ->
+  let hk9 = hng_key src in
+  let c9 = (if map_has hng_store hk9 then map_get hng_store hk9 else "") in
+  let c9 = (if is_sng_cls c9 then (if map_has hng_sng_base hk9 then map_get hng_sng_base hk9 else "") else c9) in
+  if str_eq c9 "" || str_eq c9 "Hash" then () else map_set hng_store (hng_key dst) c9
+// What nl_langinfo(CODESET) answers after setlocale(LC_CTYPE, ""), read the
+// way setlocale reads it: LC_ALL, else LC_CTYPE, else LANG; the codeset after
+// the dot (up to an @modifier), "UTF-8" however a UTF-8 one is spelled; and
+// for C, POSIX or nothing the platform's ASCII name (US-ASCII on Darwin,
+// ANSI_X3.4-1968 on glibc). It was "UTF-8" whatever the environment said.
+and locale_codeset = fn (u: unit) ->
+  let a9 = env_get "LC_ALL" in
+  let b9 = env_get "LC_CTYPE" in
+  let pick = (if str_len a9 > 0 then a9 else if str_len b9 > 0 then b9 else env_get "LANG") in
+  let ascii = (if str_eq (sys_os ()) "darwin" then "US-ASCII" else "ANSI_X3.4-1968") in
+  let dot = str_index_of pick "." in
+  if dot < 0 then ascii
+  else
+    (let rest = substring pick (dot + 1) (str_len pick) in
+     let at = str_index_of rest "@" in
+     let cs = (if at >= 0 then substring rest 0 at else rest) in
+     let lc = str_downcase_ascii cs in
+     if str_eq lc "utf-8" || str_eq lc "utf8" then "UTF-8"
+     else if str_eq cs "" then ascii
+     else cs)
 and mm_reason_take = fn (u: unit) ->
   if vec_get mm_vcall 0 == 1 then (let _ = vec_set mm_vcall 0 0 in 2) else 0
 and amp_src_note = fn (u: unit) ->
@@ -30962,7 +31258,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        else if ((str_len name == 5 && str_eq name "merge") || (str_len name == 6 && str_eq name "merge!") || (str_len name == 6 && str_eq name "update")) && (match recv with VHsh _ -> true | _ -> false) then
          (match recv with
           | VHsh h ->
-            (if (str_len name == 5 && str_eq name "merge") then mkhash (hash_merge_block world newblk (hderef h) args)
+            (if (str_len name == 5 && str_eq name "merge") then (let r9 = mkhash (hash_merge_block world newblk (hderef h) args) in let _ = hsh_class_like recv r9 in r9)
              // ⚠ the bang forms take each pair AS THEY GO, as ruby's does: a
              //   block that freezes the hash, or raises, leaves the pairs
              //   before it in place (test_update5); while the block runs the
@@ -33765,8 +34061,14 @@ and cmp_member_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
   if rb_eq x y then true
   else
     (match (x, y) with
-     | (VArr a3, VArr b3) -> arr_eq_w env world (deref a3) (deref b3)
-     | (VHsh h3, VHsh g3) -> hash_eq_w env world h3 g3
+     // ⚠ under rb_eq's cycle guard: a pair met again inside itself is equal
+     //   (ruby's rb_exec_recursive_paired). Two arrays that each hold
+     //   themselves, one with an object answering #== in it, recursed here
+     //   forever -- core/array/equal_value was SLOW for it.
+     | (VArr a3, VArr b3) -> cmp_cycle_guard ("e" ++ str_of_int a3 ++ ":e" ++ str_of_int b3)
+                               (fn (u: unit) -> arr_eq_w env world (deref a3) (deref b3))
+     | (VHsh h3, VHsh g3) -> cmp_cycle_guard ("h" ++ str_of_int h3 ++ ":h" ++ str_of_int g3)
+                               (fn (u: unit) -> hash_eq_w env world h3 g3)
      // a NUMBER against an object asks the object (num_equal: rb_equal(y,
      // x)) -- `[pid, 0] == Process.wait2` is a Status's own ==
      | (VInt _, VObj _) -> cmp_num_obj_w env world x y
@@ -33777,6 +34079,13 @@ and cmp_member_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
      | (VRange (_, _, _), VObj _) -> rng_sub_held world y && rb_eq x (rng_sub_as_range world y)
      | (VObj _, VRange (_, _, _)) -> rng_sub_held world x && rb_eq (rng_sub_as_range world x) y
      | (_, _) -> false)
+and cmp_cycle_guard = fn (k9: str) -> fn (go: unit -> bool) ->
+  if map_has eq_seen k9 then true
+  else
+    (let _ = map_set eq_seen k9 (VInt 1) in
+     let r9 = go () in
+     let _ = map_delete eq_seen k9 in
+     r9)
 and cmp_num_obj_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
   (if obj_answers_eq world y
    then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) y "==" (Cons (x, Nil)) false)
@@ -34566,7 +34875,9 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
   else if responds_real world recv nm
      || (if str_eq (refined_impl_for world recv nm) "" then false else true) then
     (if all then VBool true
-     else if meth_protected world c9 nm then rtm9 ()
+     // (a CLASS receiver's methods are its metaclass's: `class << self;
+     //  protected :m` was answered true -- weakref's delegation then called it)
+     else if meth_protected world (match recv with VClass c8 -> "(sng:" ++ c8 ++ ")" | _ -> c9) nm then rtm9 ()
      else VBool true)
   else if all
           // include_all: the private ones too. A class receiver answers through
@@ -37016,7 +37327,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr h -> (match args with Cons (VStr o, _) -> let _ = sset h (sget o) in recv | _ -> recv)
      | _ -> recv)
   else if (str_len name == 6 && str_eq name "to_str") then
-    (match recv with VStr _ -> recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_str") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'to_str'")) in fail "mere-ruby: undefined method 'to_str'")))
+    (match recv with
+     // (a SUBCLASS's #to_str is a new String of the same text, as #to_s is)
+     | VStr h9 when (let hk9 = hng_key recv in
+                     map_has hng_store hk9 && (if is_sng_cls (map_get hng_store hk9) then false else true)) ->
+       mkstr_e (sget h9) (senc_get h9)
+     | VStr _ -> recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_str") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'to_str'")) in fail "mere-ruby: undefined method 'to_str'")))
   else if (str_len name == 6 && str_eq name "to_ary") then
     (match recv with VArr _ -> recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_ary") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'to_ary'")) in fail "mere-ruby: undefined method 'to_ary'")))
   else if (str_len name == 6 && str_eq name "to_int") then
@@ -37236,7 +37552,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VInt n -> VInt n | VFlt f -> flt_trunc_v f
      | VBig s -> recv
-     | VRat (n, d) -> norm_big (big_div_s n d)
+     // (TRUNCATED, toward zero: big_div_s floors, and `Rational(-7, 4).to_i`
+     //  was -2 -- the denominator is positive, so only a negative numerator
+     //  with a remainder moves)
+     | VRat (n, d) ->
+       (match big_divmod_s n d with
+        | (q9, r9) -> if str_eq r9 "0" || (if str_len n > 0 && str_eq (char_at n 0) "-" then false else true)
+                      then norm_big q9 else norm_big (big_add_s q9 "1"))
      | VStr s -> let s = sget s in (match args with
                                     | Cons (VInt base, _) ->
                                       (if (base < 2 || base > 36) && base != 0
@@ -37430,7 +37752,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VArr id -> VBool (arr_len id == 0) | VStr s -> VBool (str_blen s == 0)
      // (whether there is a first pair, not how many: counting walked them all,
      //  and `h.shift until h.empty?` was quadratic)
-     | VHsh xs -> let xs = hderef xs in VBool (match xs with Nil -> true | _ -> false) | _ -> prim_raise "NoMethodError" ("undefined method 'empty?' for " ++ for_recv_name recv))
+     | VHsh hid -> VBool ((match hsettled hid with Nil -> true | _ -> false) && (if hpending_on hid then vec_len (hpending_vec hid) == 0 else true)) | _ -> prim_raise "NoMethodError" ("undefined method 'empty?' for " ++ for_recv_name recv))
   else if (str_len name == 2 && str_eq name "[]") then
     (match recv with
      // one index reads the element where it is, folding nothing (arr_at)
@@ -39615,10 +39937,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                                               | VProc pp -> (let _ = hdproc_set d9 (VProc pp) in ())
                                               | _ -> ()))
                                           | _ -> ()) in
+                                 // (...and its CLASS: hsh_class_like)
+                                 let _ = hsh_class_like recv r9 in
                                  r9)
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "merge") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'merge'")) in fail "mere-ruby: undefined method 'merge'")))
   else if (str_len name == 6 && str_eq name "merge!") || (str_len name == 6 && str_eq name "update") then
     (match recv with
+     // (a frozen receiver refuses BEFORE an argument is asked #to_hash:
+     //  `frozen.send(:update, obj)` reached here past the call's own check)
+     | VHsh h when cfrozen_get 1 h -> prim_raise "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
      | VHsh h ->
        (let rec go9 = fn (az: Val list) ->
           (match az with
@@ -43332,7 +43659,14 @@ and obj_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
   // also counts included modules (Comparable, Enumerable, Kernel, ...), so
   // is_a?/kind_of? agree with Module#ancestors.
   str_eq cls target || str_eq target "Object" || str_eq target "BasicObject"
-  || pp_mem (ancestors_of world cls) target
+  || (if mro_cache_on () then
+        (let k9 = cls ++ chr 1 ++ target in
+         let g9 = mro_now () in
+         if map_has isa_memo k9 && map_get isa_memo k9 / 2 == g9 then map_get isa_memo k9 % 2 == 1
+         else (let r9 = pp_mem (ancestors_of world cls) target in
+               let _ = map_set isa_memo k9 (g9 * 2 + (if r9 then 1 else 0)) in
+               r9))
+      else pp_mem (ancestors_of world cls) target)
 
 // walk the ancestor chain: does `cls` (or a superclass) define `name`?
 // The Kernel module functions this interpreter implements as implicit-self
@@ -47246,16 +47580,27 @@ and time_tzo_off_at = fn world -> fn (zone: Val) -> fn (ep: int) ->
   else (let _ = raise_exc world "TypeError" ("can't convert " ++ class_name zone ++ " into an exact number") in 0)
 
 // The epoch of civil fields `civ` read in a timezone object: its
-// #local_to_utc of those fields (as a UTC Time), or, lacking that, the
-// civil value less the offset #utc_to_local gives there.
+// #local_to_utc of those fields (as a UTC Time). ⚠ Lacking that, ruby's
+// zone_timelocal gives up and the zone is read as an OFFSET, which an object
+// is not -- TypeError. This fell back to the offset #utc_to_local gives there.
 and time_tzo_epoch = fn world -> fn (zone: Val) -> fn (civ: int) ->
   let (_, _, _, iv9) = world in
   let blk9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
   if has_meth world (dispatch_cls_of world zone) "local_to_utc" then
     (let tl9 = make_time_at_ns world civ 0 in
      let _ = (match tl9 with VObj o9 -> map_set iv9 (str_of_int o9 ++ "@__utc") (VBool true) | _ -> ()) in
-     time_tzo_secs world (invoke_val_c gc_cenv0 world blk9 zone "local_to_utc" (Cons (tl9, Nil)) false))
-  else civ - time_tzo_off_at world zone civ
+     // ...and a Time it answers is its INSTANT (extract_time), not the wall
+     // clock #utc_to_local's answer is read as; an offset of a day or more
+     // between the fields and that instant is refused (zone_set_offset)
+     let r9 = invoke_val_c gc_cenv0 world blk9 zone "local_to_utc" (Cons (tl9, Nil)) false in
+     let ep9 = (match r9 with
+                | VObj o9 when map_has iv9 (str_of_int o9 ++ "@__t") ->
+                  (match prim_time_epoch world r9 with VInt n -> n | _ -> 0)
+                | _ -> time_tzo_secs world r9) in
+     if civ - ep9 >= 86400 || ep9 - civ >= 86400
+     then (let _ = raise_exc world "ArgumentError" "utc_offset out of range" in ep9)
+     else ep9)
+  else (let _ = raise_exc world "TypeError" ("can't convert " ++ class_name zone ++ " into an exact number") in 0)
 
 // A zone NAME ("Asia/Colombo") given to a Time subclass that defines
 // .find_timezone becomes what that method answers. A string that reads as
@@ -49098,7 +49443,8 @@ and sch_deliver_at = fn world -> fn (me: int) -> fn (blocking: bool) ->
   let (_, _, _, iv) = world in
   let k = str_of_int me ++ "@__tpend" in
   let mode = (if map_has iv k then sch_mask_mode world me (map_get iv k) else "immediate") in
-  if map_has iv k && (if str_eq mode "never" || (str_eq mode "on_blocking" && (if blocking then false else true)) then false else true) then
+  let finalizing = map_has fin_on "busy" && map_has fin_on "tid" && map_get fin_on "tid" == me in
+  if (if finalizing then false else true) && map_has iv k && (if str_eq mode "never" || (str_eq mode "on_blocking" && (if blocking then false else true)) then false else true) then
     (let e = map_get iv k in
      let _ = map_delete iv k in
      match e with
@@ -51679,7 +52025,9 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
                  | _ -> (let rec strip9 = fn (xs: Val list) ->
                            (match xs with
                             | Nil -> (Nil : Val list)
-                            | Cons (VHsh _, Nil) -> Nil
+                            // (only the KEYWORDS: a `{}` written in the zone's
+                            //  place is a zone, and not one -- TypeError)
+                            | Cons (VHsh h9, Nil) when is_kw_hash (VHsh h9) -> Nil
                             | Cons (x9, t9) -> Cons (x9, strip9 t9)) in strip9 args)) in
      match pos9 with
      | Nil ->
@@ -55155,7 +55503,8 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
           // suspended stack, rooted as a suspended fiber's is.
           let _ = (if gc_safe_now ()
                    then (if gc_pressure world then (let _ = gc_collect_any env world in ()) else ())
-                   else gc_point world) in
+                   else gc_point_finalizers world) in
+          let _ = fin_drain world in
           run_stmts env world blk rest))
 
 // a feature named as it was given, already in $LOADED_FEATURES as an
@@ -55412,6 +55761,17 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
              // FileUtils, see pathname_lib_src)
              false then
        FNext (VBool true)
+     // ⚠ a C EXTENSION that IS there is not a missing file: ruby finds it and
+     //   fails in dlopen, and that LoadError has no #path (core/kernel's
+     //   require spec asks for nil). This interpreter loads no C extensions,
+     //   and says that instead of "cannot load such file".
+     else if (if is_reg_file full then false else true) && str_eq shipped "" && str_len p0 > 0 && str_eq (char_at p0 0) "/"
+             && (let dl9 = (if str_eq (sys_os ()) "linux" then ".so" else ".bundle") in
+                 (str_len p0 > str_len dl9 && str_eq (substring p0 (str_len p0 - str_len dl9) (str_len p0)) dl9 && is_reg_file p0)
+                 || is_reg_file (p0 ++ dl9)) then
+       (let dl9 = (if str_eq (sys_os ()) "linux" then ".so" else ".bundle") in
+        let f9 = (if is_reg_file (p0 ++ dl9) then p0 ++ dl9 else p0) in
+        FRaise (raise_exc world "LoadError" ("mere-ruby loads no C extensions -- " ++ f9)))
      else if (if is_reg_file full then false else true) && str_eq shipped "" then
        // (require_relative's path is named canonically: "/d/x", not
        //  "/d/core/../x")
@@ -57078,7 +57438,7 @@ and run_while = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body: Stm
   // iteration creates no frame of its own, so no region-polymorphic helper is
   // needed -- the same reason the statement region could be taken.
   // Each turn is a safepoint off the stack (gc_point, note 270).
-  let _ = gc_point world in
+  let _ = gc_point_finalizers world in
   // (a turn that goes on answers the one flow_next_nil, and the end the one
   //  flow_break_nil: the region's value is copied out into the region around
   //  the loop -- the statement's, open for all of it -- and a fresh FNext per
@@ -58300,7 +58660,8 @@ and when_matches = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (vs: Expr l
 and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
   // (a NUMBER's === is its ==, and that asks an object on the right
   //  (num_equal: `1 === obj` is `obj == 1`) -- rb_eq_w; it answered false)
-  if (match cand with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat (_, _) -> true | VCpx (_, _) -> true | _ -> false)
+  // (...and a String's: rb_str_equal asks an object that answers #to_str)
+  if (match cand with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat (_, _) -> true | VCpx (_, _) -> true | VStr _ -> true | _ -> false)
      && (match v with VObj _ -> true | _ -> false)
      && (if prim_user_has world cand "===" then false else true)
   then rb_eq_w gc_cenv0 world cand v
@@ -62641,6 +63002,7 @@ and puts_each_in = fn world -> fn (seen: int list) -> fn (xs: Val list) ->
 // and the load-path dir. run_prog reads a file and delegates here; a Wasm/browser
 // host can call run_src with source handed in as a string.
 // the file that was loading when the error was raised, else the entry script.
+let hkey_obj_ident_fwd = fn (k: Val) -> (if key_has_user_hash (fb_world ()) k then false else true);
 import "m_driver.mere";
 
 
