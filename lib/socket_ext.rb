@@ -152,6 +152,9 @@ class BasicSocket < IO
     end
     cap = dlen.nil? ? 65536 : IO.__fd_cint(dlen)
     fl = flags.nil? ? 0 : IO.__fd_cint(flags)
+    # Request close-on-exec in the kernel for received descriptors, as Ruby
+    # does; Linux also returns this bit in msg_flags without control data.
+    fl |= Socket.__recvmsg_flags
     ccap = clen.nil? ? 4096 : IO.__fd_cint(clen)
     if nonblock
       fl |= Socket::MSG_DONTWAIT
@@ -198,7 +201,8 @@ class BasicSocket < IO
       pk = __dgram_take(cap, flags, nonblock, "recvmsg(2)")
       return __would_block("recvmsg(2)", exception) if pk.nil?
       data, addr, size = pk
-      rflags = size && size > cap ? Socket::MSG_TRUNC : 0
+      rflags = Socket.__recvmsg_flags
+      rflags |= Socket::MSG_TRUNC if size && size > cap
       # (macOS hands MSG_DONTWAIT back in msg_flags for a non-blocking one)
       rflags |= Socket::MSG_DONTWAIT if nonblock && RUBY_PLATFORM.include?("darwin")
       return [data, __dgram_ai(addr, "recvmsg(2)"), rflags]
@@ -206,7 +210,9 @@ class BasicSocket < IO
     len = dlen.nil? ? 65536 : dlen
     data = nonblock ? recv_nonblock(len, flags, exception: exception) : recv(len, flags)
     return data if data == :wait_readable
-    [data, (remote_address rescue nil), 0]
+    rflags = Socket.__recvmsg_flags
+    rflags |= Socket::MSG_DONTWAIT if nonblock && RUBY_PLATFORM.include?("darwin")
+    [data, (remote_address rescue nil), rflags]
   end
   private :__recvmsg_plain
   # sendmsg(2) (Mere's sock_sendmsg_to) with control messages: each a

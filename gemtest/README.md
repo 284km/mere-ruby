@@ -2,7 +2,7 @@
 
 `measure.py` runs the existing 29-gem list in separate processes under a pinned
 Ruby 4.0.9 reference and mere-ruby, with and without an external stdlib. Both
-interpreters use the same installed gem home and RubyGems source checkout.
+interpreters use the same isolated gem home and RubyGems source checkout.
 Each process family is limited to 120 seconds and 2 GiB; stdout, stderr, exit,
 resource limits and reference availability are recorded. Use a fresh output
 directory for every run.
@@ -10,8 +10,9 @@ directory for every run.
 ```sh
 python3 gemtest/measure.py --binary ./mere-ruby \
   --reference /path/to/ruby-4.0.9/bin/ruby \
-  --gem-home /path/to/installed/gem-home \
+  --gem-home /path/to/snapshot \
   --rubygems /path/to/ruby-source-3e93b23 \
+  --snapshot-lock gemtest/snapshot.lock.json \
   --output /tmp/gem-measure-new
 ```
 
@@ -22,13 +23,34 @@ available in both native modes; “bundled” means no additional stdlib `-I`,
 not an empty gem home. Loading a gem does not establish that its operations
 work. Reference-unavailable gems are recorded separately from divergences.
 
-On 2026-11-10, the reference loads 23 of 29 gems. Both native modes load all
-23, with no timeouts, crashes or memory-limit hits. The other six require
-Rails application setup or native dependencies unavailable to the reference.
-`latest.json` records each result, exclusions, binary identity and a digest
-of the installed gemspec manifest. The manifest itself stays local. A later
-rerun is excluded because the shared Ruby 3.2.2 gem home disappeared during
-the final gem; the complete earlier run and its exact binary hash are retained.
+The source environment is independent of the user's Ruby installation. Restore
+it from the committed lock into a fresh directory with the pinned reference:
+
+```sh
+/path/to/ruby-4.0.9/bin/ruby gemtest/restore_snapshot.rb \
+  --lock gemtest/snapshot.lock.json --output /path/to/snapshot \
+  --cache /path/to/package-cache
+```
+
+The lock records 278 package archives, versions, runtime dependencies and source
+tree SHA256 digests. Public archives come from RubyGems; a replay refuses changed
+archives or extracted source. `measure.py --snapshot-lock` verifies sources
+before and after the complete run and preserves the per-row gemspec guard.
+Packages are extracted without rebuilding native extensions, keeping the prior
+load-only boundary. Implicit stdlib roots such as logger are included. The
+original version inventory is only needed when regenerating a lock with
+`--inventory`; `--private-archive` can then supply the exact private package.
+Archives and extracted sources remain outside this repository. This lock keeps
+the original macOS package platforms; it does not establish Linux gem loading.
+
+On 2026-11-10, the reference loads 22 of the unchanged 29-name list. Both native
+modes load all 22, with no timeouts, crashes or memory-limit hits. Six cases
+require Rails setup or unavailable native dependencies. Private sidekiq-pro
+7.2.0 could not be recovered after the old shared home disappeared; it remains
+an explicit source-unavailable case, with no replacement package. The prior
+23-case result remains in Git history. `latest.json` records current rows,
+exclusions, final binary identity, lock digest and gemspec manifest digest.
+A source-mutation negative control and a fresh locked replay were verified.
 
 `https_measure.py` uses a local Python TLS server and independently generated
 reference certificates. It checks real binary HTTP responses, explicit trust,
@@ -40,14 +62,14 @@ distinct results.
 ```sh
 python3 gemtest/https_measure.py --binary ./mere-ruby \
   --reference /path/to/ruby-4.0.9/bin/ruby \
-  --gem-home /path/to/installed/gem-home \
+  --gem-home /path/to/snapshot \
   --rubygems /path/to/ruby-source-3e93b23 \
   --output /tmp/https-measure-new
 ```
 
 Omit both `--gem-home` and `--rubygems` to measure SSLSocket and Net::HTTP
 alone. With them, the existing Excon gem is measured too. See
-`https_latest.json` for successes and remaining client failures.
+`https_latest.json` for all 21 passing cases on the same final binary and locked sources.
 
 `uri` 1.1.1, `timeout` 0.6.0, `net/protocol` 0.2.2, `net/http` 0.9.1,
 `open-uri` 0.5.0 and `resolv` 0.7.2 are embedded from the pinned Ruby source,

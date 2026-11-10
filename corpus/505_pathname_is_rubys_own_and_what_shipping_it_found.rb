@@ -46,7 +46,7 @@ Dir.mktmpdir("pn") do |dir|
     Pathname("d/m").mkdir; Pathname("d/m").rmdir; Pathname("d/x").unlink; p pn.children.map(&:to_s)
     Pathname("d/w").write("w"); p Pathname("d/w").read, Pathname("d/w").realpath == Pathname(File.realpath("d/w")), Pathname("d/nope").realdirpath.basename
     File.chmod(0, "d")
-    p((File.lstat("d/w") rescue $!.class), (File.stat("d/w") rescue $!.class))
+    p((File.lstat("d/w").class rescue $!.class), (File.stat("d/w").class rescue $!.class))
     File.chmod(0755, "d")
     tmp = Pathname.mktmpdir; p tmp.directory?; tmp.rmtree
   end
