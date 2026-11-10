@@ -290,8 +290,7 @@ class BasicSocket < IO
       # Connected UDP reports ICMP errors here (notably ECONNREFUSED on Linux).
       # Buffering a packet separately would also discard recv flags.
       d, = __dgram_take(maxlen, flags, false, "recvfrom(2)")
-      out = d.byteslice(0, maxlen) || "".b
-      return outbuf ? __fd_into(outbuf, out) : out
+      return outbuf ? __fd_into(outbuf, d) : d
     end
     __fd_reading!
     __fd_fill if @__io_rbuf.empty?
@@ -326,10 +325,15 @@ class BasicSocket < IO
           IO.__sel_wait([[@__io_fd, 2, self]], -1)
         end
       end
-      return send(data, flags, @__dg_peer) if @__dg_peer
-      n = Socket.__udp_send(@__io_fd, data.to_s)
-      raise Errno::EDESTADDRREQ, "send(2)" if n < 0
-      return n
+      data = IO.__fd_str(data)
+      flags = IO.__fd_cint(flags)
+      loop do
+        __check_open
+        n = Socket.__udp_sendto(@__io_fd, data, flags, nil, 0)
+        return n if n >= 0
+        IO.__fd_raise(n, "send(2)") unless IO.__again?(n) && (flags & Socket::MSG_DONTWAIT) == 0
+        IO.__sel_wait([[@__io_fd, 2, self]], -1)
+      end
     end
     write(data)
   end
@@ -368,15 +372,10 @@ class BasicSocket < IO
   end
   def remote_address
     __check_open
-    return @__dg_peer if @__dg_peer
     Socket::Endpoint__.addrinfo(Socket.__peername(@__io_fd), "getpeername(2)", @socktype)
   end
-  # A BOUND datagram socket that connects keeps its descriptor -- and so the
-  # port it was bound to: the runtime's connect makes a new socket, which a
-  # peer sending to the bound port never reaches (test/socket's udp_pair).
-  # The peer is remembered instead, and send without an address, getpeername
-  # and peeraddr use it. (An unbound one takes the runtime's connected
-  # socket, as before.)
+  # Connect the existing datagram descriptor in the kernel so its bound port,
+  # receive filtering and asynchronous error reporting stay intact.
   def __dgram_bound?
     return false unless @socktype == Socket::SOCK_DGRAM
     t = Socket.__sockname(@__io_fd)
@@ -386,7 +385,9 @@ class BasicSocket < IO
   end
   private :__dgram_bound?
   def __dgram_peer!(ai)
-    @__dg_peer = ai
+    __check_open
+    result = Socket.__udp_connect(@__io_fd, ai.ip_address, ai.ip_port)
+    IO.__fd_raise(result, "connect(2)") if result < 0
     0
   end
   private :__dgram_peer!
@@ -691,7 +692,6 @@ class UDPSocket < IPSocket
     elsif dest.length == 1
       ai = dest[0].is_a?(Addrinfo) ? dest[0] : Addrinfo.new(IO.__fd_str(dest[0]))
     end
-    ai ||= @__dg_peer
     host = ai ? ai.ip_address : nil
     port = ai ? ai.ip_port : 0
     loop do

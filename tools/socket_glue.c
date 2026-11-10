@@ -166,6 +166,26 @@ int mr_connect_start(const char *host, int port, const char *local, int local_po
     freeaddrinfo(a);
     return fd < 0 ? -e : fd;
 }
+/* Connect an already-bound UDP descriptor in the kernel. Recording just a
+ * Ruby peer would neither filter incoming senders nor deliver ICMP errors. */
+int mr_udp_connect(int fd, const char *host, int port) {
+    struct sockaddr_storage local;
+    socklen_t length = sizeof(local);
+    if (getsockname(fd, (struct sockaddr *)&local, &length)) return -errno;
+    struct addrinfo hints = {0}, *address = NULL;
+    char service[16];
+    snprintf(service, sizeof(service), "%d", port);
+    hints.ai_family = local.ss_family;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    if (getaddrinfo(host, service, &hints, &address)) return -EINVAL;
+    int result;
+    do { result = connect(fd, address->ai_addr, address->ai_addrlen); }
+    while (result < 0 && errno == EINTR);
+    int error = result < 0 ? errno : 0;
+    freeaddrinfo(address);
+    return -error;
+}
 int mr_connect_error(int fd) {
     int e = 0;
     socklen_t n = sizeof(e);

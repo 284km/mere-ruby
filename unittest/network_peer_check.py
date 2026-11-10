@@ -67,6 +67,24 @@ closed=UDPSocket.new
 closed.bind('127.0.0.1',0)
 closed_port=closed.addr[1]
 closed.close
+if ARGV.fetch(1)=='linux'
+  socket=UDPSocket.new
+  begin
+    socket.bind('127.0.0.1',0)
+    socket.connect('127.0.0.1',closed_port)
+    socket.send('probe',0)
+    Timeout.timeout(1) do
+      raise 'closed connected UDP port did not become readable' unless socket.wait_readable(0.5)
+      begin
+        socket.recv(64)
+        raise 'closed connected UDP port did not raise ECONNREFUSED'
+      rescue Errno::ECONNREFUSED
+      end
+    end
+  ensure
+    socket.close
+  end
+end
 resolver=Resolv::DNS.new(nameserver_port:[['127.0.0.1',closed_port]],search:[],ndots:1)
 resolver.timeouts=[0.05]
 begin
@@ -191,7 +209,9 @@ def main():
             env['MERE_RUBY_NO_GEMS']='1'
             log=args.output/(name+'.log')
             start=len(peer.events)
-            result=supervise([binary,str(script),str(peer.port)],env,log,2097152,60)
+            command=[binary]
+            if name=='reference':command+=['-I',str(ROOT/'vendor/network/lib')]
+            result=supervise(command+[str(script),str(peer.port),sys.platform],env,log,2097152,60)
             events=peer.events[start:]
             result['events']=events
             records[name]=result

@@ -163,6 +163,7 @@ def main():
                 if 'excon' in mode:
                     env.update(GEM_HOME=str(args.gem_home.resolve()),GEM_PATH=str(args.gem_home.resolve()),RUBYGEMS_LIB=str((args.rubygems/'lib').resolve()))
                 command=[args.reference,'--disable-gems'] if mode.startswith('reference') else [args.binary]
+                if mode.startswith('reference'):command+=['-I',str(ROOT/'vendor/network/lib')]
                 if mode.startswith('external'):command+=['-I',stdlib]
                 command += [str(script),'excon' if 'excon' in mode else 'direct' if mode=='direct' else 'http',str(fixture)+'.crt',str(listener.getsockname()[1]),scenario]
                 log=args.output/(mode+'-'+scenario+'.log')

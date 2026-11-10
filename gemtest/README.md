@@ -26,7 +26,9 @@ On 2026-11-10, the reference loads 23 of 29 gems. Both native modes load all
 23, with no timeouts, crashes or memory-limit hits. The other six require
 Rails application setup or native dependencies unavailable to the reference.
 `latest.json` records each result, exclusions, binary identity and a digest
-of the installed gemspec manifest. The manifest itself stays local.
+of the installed gemspec manifest. The manifest itself stays local. A later
+rerun is excluded because the shared Ruby 3.2.2 gem home disappeared during
+the final gem; the complete earlier run and its exact binary hash are retained.
 
 `https_measure.py` uses a local Python TLS server and independently generated
 reference certificates. It checks real binary HTTP responses, explicit trust,
