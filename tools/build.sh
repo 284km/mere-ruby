@@ -79,7 +79,10 @@ fi
 #   -lm               Linux needs it spelled out
 case "$(uname -s)" in
   Darwin) plat="-Wl,-stack_size,0x20000000 -fbracket-depth=1024" ;;
-  *)      plat="-fbracket-depth=1024 -lm" ;;
+  *)      plat="-fbracket-depth=1024 -lm"
+          # Clang's parser also uses the process stack for the emitted C.
+          # Match the interpreter's stack budget during compilation itself.
+          ulimit -s 524288 || exit 2 ;;
 esac
 
 if [ "$emit" = 1 ]; then
