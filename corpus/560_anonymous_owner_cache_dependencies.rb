@@ -43,4 +43,20 @@ mix.module_eval { def value; 7; end }
 raise unless MroDependencyHost.new.value == 7 && object.value == 17
 GC.start
 raise unless singleton_child.answer == 21 && object.value == 17
+[:include, :prepend].each do |mode|
+  leaf = Module.new
+  begin
+    leaf.send(mode, leaf)
+    raise 'self cycle accepted'
+  rescue ArgumentError
+  end
+  left = Module.new
+  right = Module.new
+  left.send(mode, right)
+  begin
+    right.send(mode, left)
+    raise 'indirect cycle accepted'
+  rescue ArgumentError
+  end
+end
 puts "anonymous cache dependencies preserved"
