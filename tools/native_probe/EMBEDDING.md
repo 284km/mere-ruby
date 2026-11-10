@@ -45,8 +45,11 @@ Ruby methods such as an overridden `inspect`. Primitive errors are retained
 as Ruby's pending `$!`, just like explicitly raised exceptions.
 
 Cleanup runs exit hooks in Ruby's order, flushes open output, and terminates
-the scheduler. A later hook failure or SystemExit replaces the pending exit
-status. Diagnostics remain available independently of the final status.
+the scheduler, then releases the native OpenSSL handles owned by this
+instance. Hooks and thread ensure clauses can still use those objects before
+teardown; unrelated native handles owned by the host remain intact. Native
+ownership is drained even after a protected cleanup failure. A later hook
+failure or SystemExit replaces the pending exit status. Diagnostics remain available independently of the final status.
 Repeated cleanup returns the same status and does not rerun hooks. A failed
 setup may also be cleaned up. Afterwards, release generated return buffers
 with `mere_lib_free` and call `mere_lib_shutdown` to release instance storage.
@@ -59,6 +62,9 @@ The tests compare lifecycle behavior with Ruby and exercise cleanup
 precedence, retained state, output flushing, and fixed scalar/string workloads
 at 1,000, 10,000, and 100,000 evaluations. Those allocation checks do not
 establish bounded memory for every Ruby program or full Ruby compatibility.
-CI also builds a separate `--setup-failure` fixture to check cleanup after
-partial initialization; that fixture cannot be packaged as a consumer library.
+Native ownership tests repeat initialization, cleanup and shutdown in one C
+process, checking live native counts after GC, hooks, thread teardown, pending
+exceptions and SystemExit. CI also builds separate `--setup-failure` and
+`--cleanup-failure` fixtures for partial initialization and failed scheduler
+teardown. Injected failure fixtures cannot be packaged as consumer libraries.
 C compilation has a 3-GiB memory budget; interpreter runs retain the 2-GiB limit.

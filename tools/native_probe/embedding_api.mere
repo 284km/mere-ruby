@@ -113,6 +113,13 @@ let vm_eval = fn (source: str) ->
 let vm_clear_error = fn () ->
   if (if map_has vm_phase "v" then map_get vm_phase "v" else 0) != 1 then 2
   else (let _ = vm_clear_pending () in 0);
+// OpenSSL owns C allocations outside Mere regions. Release only this VM's
+// registered owners, after hooks and thread teardown can no longer use them.
+let vm_release_native = fn () ->
+  let _ = map_iter openssl_owned (fn (_owner: int) -> fn (handle: int) ->
+    let _ = mr_ossl_release handle in ()) in
+  let _ = map_clear openssl_owned in
+  map_clear openssl_owner;
 let vm_cleanup = fn () ->
   let phase = (if map_has vm_phase "v" then map_get vm_phase "v" else 0) in
   if phase == 3 then (if map_has vm_exit_code "cleanup" then map_get vm_exit_code "cleanup" else 0)
@@ -122,14 +129,26 @@ let vm_cleanup = fn () ->
   // applies only when no later hook failure or SystemExit replaces it.
   let pending_status = (if map_has vm_exit_code "status" then map_get vm_exit_code "status" else 0) in
   let world = (meths_g, cls_sup, obj_cls, ivars_g) in
+  let terminated = vec_new () in
+  let _ = vec_push terminated false in
   let result = try_or_msg (fn (u: unit) ->
     let status = (if phase == 4 then 0 - 1 else
       run_at_exits_r world (fn (exc: Val) ->
         let _ = map_set vm_error "class" (exc_cls_of world exc) in
         vm_record_diagnostic world exc)) in
     let _ = sch_terminate_all world in
+    let _ = vec_set terminated 0 true in
     let signal = (if map_has at_exit_sig "s" then map_get at_exit_sig "s" else 0) in
     if signal > 0 then 128 + signal else if status >= 0 then status else pending_status)
+    (fn (message: str) -> let _ = vm_capture_error message in
+      if map_has vm_exit_code "status" then map_get vm_exit_code "status" else 1) in
+  // A protected failure in hooks must not skip teardown. Native resources
+  // are drained even when scheduler termination itself reports a failure.
+  let result = (if vec_get terminated 0 then result else
+    try_or_msg (fn (u: unit) -> let _ = sch_terminate_all world in result)
+      (fn (message: str) -> let _ = vm_capture_error message in
+        if map_has vm_exit_code "status" then map_get vm_exit_code "status" else 1)) in
+  let result = try_or_msg (fn (u: unit) -> let _ = vm_release_native () in result)
     (fn (message: str) -> let _ = vm_capture_error message in
       if map_has vm_exit_code "status" then map_get vm_exit_code "status" else 1) in
   let _ = map_set vm_exit_code "cleanup" result in
