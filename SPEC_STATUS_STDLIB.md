@@ -67,7 +67,7 @@ them, is what ships; the two are not added together.
 | library/timeout | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/find | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/net-http/httprequest | 1 | 0 | 0 | 0 | 0 | 1 |
-| library/socket/unixsocket | 14 | 1 | 0 | 0 | 0 | 15 |
+| library/socket/unixsocket | 15 | 0 | 0 | 0 | 0 | 15 |
 | library/socket/udpsocket | 11 | 0 | 0 | 0 | 0 | 11 |
 | library/socket/tcpsocket | 9 | 0 | 0 | 0 | 0 | 9 |
 | library/win32ole/win32ole_variable | 0 | 0 | 0 | 8 | 0 | 8 |

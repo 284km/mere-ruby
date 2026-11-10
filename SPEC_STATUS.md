@@ -32,7 +32,7 @@ dropped, every platform-guarded Process file. 335 files moved from MATCH to SKIP
 so MATCH 2722 before it and 2410 on it are not the same question either.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 65 | 1 | 0 | 0 | 0 | 66 |
+| language | 66 | 0 | 0 | 0 | 0 | 66 |
 | core/string | 114 | 0 | 0 | 0 | 0 | 114 |
 | core/array | 101 | 0 | 0 | 1 | 0 | 102 |
 | core/hash | 69 | 0 | 0 | 0 | 0 | 69 |
@@ -77,8 +77,8 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/objectspace | 6 | 0 | 0 | 1 | 0 | 7 |
 | core/main | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/gc | 9 | 1 | 0 | 0 | 0 | 10 |
-| core/binding | 8 | 1 | 0 | 0 | 0 | 9 |
-| core/refinement | 6 | 1 | 0 | 1 | 0 | 8 |
+| core/binding | 9 | 0 | 0 | 0 | 0 | 9 |
+| core/refinement | 7 | 0 | 0 | 1 | 0 | 8 |
 | core/warning | 4 | 0 | 0 | 0 | 0 | 4 |
 | core/conditionvariable | 4 | 0 | 0 | 0 | 0 | 4 |
 | core/builtin_constants | 1 | 0 | 0 | 0 | 0 | 1 |
@@ -132,7 +132,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/thread | 40 | 3 | 0 | 2 | 0 | 45 |
 | core/thread/backtrace | 1 | 0 | 0 | 0 | 0 | 1 |
 | core/thread/backtrace/location | 7 | 0 | 0 | 0 | 0 | 7 |
-| core/tracepoint | 18 | 1 | 0 | 0 | 0 | 19 |
+| core/tracepoint | 19 | 0 | 0 | 0 | 0 | 19 |
 | language/predefined | 2 | 0 | 0 | 0 | 0 | 2 |
 | language/regexp | 11 | 0 | 0 | 0 | 0 | 11 |
 | library/cgi/cookie | 0 | 0 | 0 | 9 | 0 | 9 |
