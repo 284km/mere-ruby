@@ -286,13 +286,10 @@ class BasicSocket < IO
   def recv(maxlen, flags = 0, outbuf = nil)
     if @socktype == Socket::SOCK_DGRAM && @__io_rbuf.empty?
       __check_open
-      d = @__dg_peek
-      unless d
-        __wait_readable
-        d = Socket.__udp_recv(@__io_fd, 65536)
-        raise Errno::EAGAIN, "recvfrom(2)" if d.nil?
-      end
-      @__dg_peek = (flags.to_i & Socket::MSG_PEEK) != 0 ? d : nil
+      # Use the errno-preserving packet path, just like recvfrom/recvmsg.
+      # Connected UDP reports ICMP errors here (notably ECONNREFUSED on Linux).
+      # Buffering a packet separately would also discard recv flags.
+      d, = __dgram_take(maxlen, flags, false, "recvfrom(2)")
       out = d.byteslice(0, maxlen) || "".b
       return outbuf ? __fd_into(outbuf, out) : out
     end
@@ -1143,7 +1140,7 @@ class Socket < BasicSocket
   end
   def recvfrom(maxlen, flags = 0)
     # a datagram's sender is the one recvfrom(2) names
-    if @socktype == Socket::SOCK_DGRAM && @__io_rbuf.empty? && !@__dg_peek
+    if @socktype == Socket::SOCK_DGRAM && @__io_rbuf.empty?
       data, addr = __dgram_take(maxlen, flags, false)
       return [data, __dgram_ai(addr, "recvfrom(2)")]
     end

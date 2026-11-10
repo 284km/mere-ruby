@@ -57,3 +57,4 @@ else
   echo "skipping the comparison: it needs ../mere-ruby and node"
 fi
 python3 "$root/unittest/openssl_wasm_check.py"
+python3 "$root/unittest/network_wasm_check.py"

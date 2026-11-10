@@ -89,6 +89,7 @@ def main():
     parser.add_argument('--reference',required=True)
     parser.add_argument('--output',required=True,type=Path)
     parser.add_argument('--modes',nargs='+',choices=['reference','direct','bundled','external','reference-excon','excon','external-excon'])
+    parser.add_argument('--require-bundled',action='store_true',help='require all three standalone Net::HTTP outcomes')
     parser.add_argument('--gem-home',type=Path)
     parser.add_argument('--rubygems',type=Path)
     args=parser.parse_args()
@@ -156,7 +157,7 @@ def main():
         for mode in modes:
             for scenario in ('success','trust','hostname'):
                 env=os.environ.copy()
-                for name in ('RUBYOPT','RUBYLIB','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'):
+                for name in ('RUBYOPT','RUBYLIB','GEM_HOME','GEM_PATH','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'):
                     env.pop(name,None)
                 env['MERE_RUBY_NO_GEMS']='1'
                 if 'excon' in mode:
@@ -178,5 +179,8 @@ def main():
     (args.output/'results.json').write_text(json.dumps({'rows':rows,'server':server},indent=2)+'\n')
     assert not thread.is_alive() and not any(worker.is_alive() for worker in workers) and not server['errors'],server
     assert all(row['passed'] for row in rows if row['mode'] in ('reference','direct')),rows
+    if args.require_bundled:
+        bundled=[row for row in rows if row['mode']=='bundled']
+        assert len(bundled)==3 and all(row['passed'] for row in bundled),bundled
 
 if __name__=='__main__':main()
