@@ -15,6 +15,8 @@
 #include <openssl/conf.h>
 #include <openssl/kdf.h>
 #include <openssl/pkcs12.h>
+#include <openssl/ocsp.h>
+#include <openssl/ts.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -30,7 +32,7 @@ struct mere_bytes { long long len; unsigned char data[]; };
 typedef struct mere_bytes mere_bytes;
 enum { WIRE_LIMIT = 64 * 1024 * 1024, NODE_LIMIT = 1048576 };
 typedef struct arg { char type; size_t len; char *s; struct arg *items; } arg;
-typedef struct buffer { unsigned char *p; size_t len, cap; int failed; } buffer;
+typedef struct buffer { unsigned char *p; size_t len, cap; int failed,raised; } buffer;
 static mere_bytes *result;
 static size_t result_cap;
 
@@ -47,6 +49,7 @@ static int reserve(buffer *b, size_t n) {
     return 1;
 }
 static void put(buffer *b, const void *p, size_t n) {
+    if(b->raised) return;
     if (!reserve(b,n)) return;
     if(n) memcpy(b->p+b->len,p,n); b->len+=n;
 }
@@ -64,10 +67,13 @@ static void integer(buffer *b, long long n) {
 }
 static void boolean(buffer *b, int truth) { byte(b,truth?'t':'f'); }
 static void error(buffer *b, const char *klass, const char *message) {
+    if(b->raised) { ERR_clear_error(); return; }
     b->len=0; b->failed=0; byte(b,'e'); text(b,klass); text(b,message);
+    b->raised=1;
     ERR_clear_error();
 }
 static void ssl_error(buffer *b, const char *klass, const char *operation) {
+    if(b->raised) { ERR_clear_error(); return; }
     unsigned long code;
     char detail[768]="", message[1024]; buffer errors={0}; uint32_t count=0;
     const char *data=NULL; int flags=0;
@@ -79,6 +85,7 @@ static void ssl_error(buffer *b, const char *klass, const char *operation) {
     snprintf(message,sizeof(message),"%s%s%s",operation,detail[0]?": ":"",detail);
     b->len=0; b->failed=0; byte(b,'E'); text(b,klass); text(b,message);
     byte(b,'a'); number(b,count); put(b,errors.p,errors.len); free(errors.p);
+    b->raised=1;
     ERR_clear_error();
 }
 
@@ -206,6 +213,9 @@ done:
 #include "openssl/config.inc"
 #include "openssl/pkcs12.inc"
 #include "openssl/pkcs7.inc"
+#include "openssl/ocsp.inc"
+#include "openssl/ts.inc"
+#include "openssl/ns_spki.inc"
 #include "openssl/tls_types.inc"
 #include "openssl/tls_callbacks.inc"
 #include "openssl/tls_worker.inc"
@@ -216,6 +226,9 @@ done:
 #include "openssl/cipher.inc"
 
 static void dispatch(const char *op,const arg *args,buffer *out) {
+    if(!strncmp(op,"spki.",5)) { spki_call(op+5,args,out); return; }
+    if(!strncmp(op,"ts.",3)) { ts_call(op+3,args,out); return; }
+    if(!strncmp(op,"ocsp.",5)) { ocsp_call(op+5,args,out); return; }
     if(!strncmp(op,"pkcs7.",6)) { pkcs7_call(op+6,args,out); return; }
     if(!strncmp(op,"p7si.",5)) { p7si_call(op+5,args,out); return; }
     if(!strncmp(op,"p7ri.",5)) { p7ri_call(op+5,args,out); return; }
@@ -288,6 +301,7 @@ int mr_ossl_clear_result(void) {
 }
 mere_bytes *mr_ossl_call(const char *operation,mere_bytes *input) {
     mr_ossl_clear_result();
+    request_created_count=0; request_active=1;
     buffer out={0}; arg args={0}; size_t nodes=1;
     if(!input||input->len<0||input->len>WIRE_LIMIT) {
         error(&out,"ArgumentError","provider request too large");
@@ -300,6 +314,11 @@ mere_bytes *mr_ossl_call(const char *operation,mere_bytes *input) {
     if(out.failed) {
         int memory=out.failed==2;
         error(&out,memory?"NoMemoryError":"RangeError",memory?"native provider allocation failed":"native provider response exceeds wire budget");
+    }
+    request_active=0;
+    if(out.len&&(out.p[0]=='e'||out.p[0]=='E')) {
+        for(int i=request_created_count-1;i>=0;i--) release(request_created[i]);
+        ERR_clear_error();
     }
     if(result_cap<out.len || (result_cap>8*1024*1024 && out.len<4096)) {
         size_t cap=out.len<4096?4096:out.len;

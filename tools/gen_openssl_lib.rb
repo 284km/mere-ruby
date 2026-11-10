@@ -1,7 +1,7 @@
 # ruby tools/gen_openssl_lib.rb > m_openssl_lib.mere
 require 'pathname'
 root = Pathname.new(__dir__).parent
-names = %w[core bn oid asn1 backend primitives native_cipher pkey ec config x509 pkcs12 pkcs7]
+names = %w[core bn oid asn1 backend primitives native_cipher pkey ec config x509 pkcs12 pkcs7 ocsp ts ns_spki]
 source = names.map { |name| root.join("lib/openssl_#{name}.rb").read }.join("\n")
 source = root.join('vendor/openssl/BSDL').read.lines.map { |line| '# ' + line }.join + source
 %w[cipher marshal pkey x509].each do |name|

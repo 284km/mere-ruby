@@ -1,5 +1,12 @@
 module OpenSSL
   module Backend
+    def self.int64(value)
+      original=value
+      value=value.to_int if !value.is_a?(Integer) && value.respond_to?(:to_int)
+      raise TypeError, "no implicit conversion of #{original.class} into Integer" unless value.is_a?(Integer)
+      raise RangeError, 'integer out of range for long' unless (-9223372036854775808..9223372036854775807).include?(value)
+      value
+    end
     def self.int32(value)
       original = value
       value = value.to_int if !value.is_a?(Integer) && value.respond_to?(:to_int)
