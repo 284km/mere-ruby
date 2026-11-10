@@ -25,7 +25,8 @@ source = (ROOT / 'm_state.mere').read_text()
 # Compile the production functions, supplying only their value tag and handle
 # offset. The intervening regexp snapshot tables are unrelated to this test.
 pages = source[source.index('let str_store ='):source.index('// ⚠ ONE SNAPSHOT PER SUBJECT')]
-allocate = source[source.index('let str_slot_prepare ='):source.index('// ⚠ AN APPEND GOES')]
+allocate = (source[source.index('let str_slot_prepare ='):source.index('// Build a joined value')]
+            + source[source.index('let mkstr_join ='):source.index('// ⚠ AN APPEND GOES')])
 (output / 'pages.mere').write_text(
     'type Val = VStr of int;\nlet handle_base = 1000000;\n' + pages + allocate +
     (ROOT / 'tools/string_pages_regression.mere').read_text())

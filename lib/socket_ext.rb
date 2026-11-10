@@ -152,6 +152,9 @@ class BasicSocket < IO
     end
     cap = dlen.nil? ? 65536 : IO.__fd_cint(dlen)
     fl = flags.nil? ? 0 : IO.__fd_cint(flags)
+    # Request close-on-exec in the kernel for received descriptors, as Ruby
+    # does; Linux also returns this bit in msg_flags without control data.
+    fl |= Socket.__recvmsg_flags
     ccap = clen.nil? ? 4096 : IO.__fd_cint(clen)
     if nonblock
       fl |= Socket::MSG_DONTWAIT

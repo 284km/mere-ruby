@@ -54,3 +54,26 @@ expected = subprocess.run([args.reference, '-e', program], capture_output=True, 
 actual = subprocess.run([str(args.binary.resolve()), '-e', program], capture_output=True, check=True, timeout=30)
 assert actual.stdout == expected.stdout, 'step rounding differs from reference target'
 print('Float#step:576 bit-exact pipeline comparisons including signed zero passed')
+
+# Infinite bounds bypass the count helper. Exercise finite, inclusive and
+# exclusive ends exactly at a computed boundary and one adjacent double away.
+program = """
+a=[-0.0,0.0,1.0,-1.0,12.7,-12.7]
+u=[0.1,-0.1,0.3,-0.3,1.3,-1.3]
+a.product(u).each do |b,s|
+  [0,1,2,9,11].each do |n|
+    e=b+n*s
+    [e.prev_float,e,e.next_float].each do |endpoint|
+      [false,true].each do |exclude|
+        sequence=Range.new(b,endpoint,exclude).step(s)
+        values=sequence.to_a
+        p [sequence.size,values.length,values.pack('G*').unpack1('H*')]
+      end
+    end
+  end
+end
+"""
+expected = subprocess.run([args.reference, '-e', program], capture_output=True, check=True, timeout=30)
+actual = subprocess.run([str(args.binary.resolve()), '-e', program], capture_output=True, check=True, timeout=30)
+assert actual.stdout == expected.stdout, 'finite step size/cardinality/bits differ from reference target'
+print('Float#step:1080 finite boundary size/cardinality/bit comparisons passed')

@@ -24,3 +24,5 @@ t(11) { o = Object.new; def o.to_f = raise("x"); [Float(o, exception: false), (1
 # Step elements follow the reference target's fused/nonfused C expression,
 # including the first signed zero; byte output exposes each rounding.
 t(12) { [-0.0, 0.0, 1.0, -1.0].product([0.1, -0.1, 0.3, -0.3]).map { |beg, unit| beg.step(unit > 0 ? Float::INFINITY : -Float::INFINITY, unit).take(12).pack('G*').unpack1('H*') } }
+# Finite exclusive ranges count separately from their yielded-value rounding.
+t(13) { [[12.7, -1.3], [-12.7, 1.3]].map { |beg, unit| seq = (beg...(beg + 9 * unit)).step(unit); [seq.size, seq.to_a.size] } }
