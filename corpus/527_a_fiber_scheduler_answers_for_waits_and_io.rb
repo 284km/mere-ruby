@@ -58,7 +58,9 @@ class TinyScheduler
       due = @waiting.select { |_, d| d && d <= now }.keys
       due.each { |f| @waiting.delete(f); f.resume if f.alive? }
       if @ready.empty? && !@waiting.empty? && @waiting.values.all?(&:nil?)
-        break
+        # A joined thread can still be running outside this ready queue.
+        # Give it a turn and wait for its unblock instead of dropping its fiber.
+        Thread.pass
       end
     end
   end
