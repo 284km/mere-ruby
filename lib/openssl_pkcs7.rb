@@ -7,10 +7,12 @@ module OpenSSL
     attr_accessor :error_string
     def initialize(*args)
       raise ArgumentError, 'wrong number of arguments' if args.size>1
+      return self if args.empty? && __native_initialized?
       native=Backend.call('pkcs7.new', args.empty? ? nil : PKey.data(args[0]))
       __close_native
       __take(native)
       @data=@error_string=nil
+      self
     end
     def self.sign(cert,key,data,certs=nil,flags=0)
       data=PKey.data(data)
@@ -99,16 +101,16 @@ module OpenSSL
     alias to_s to_pem
     def to_text; Backend.call('pkcs7.to_text',self); end
     class SignerInfo < NativeObject
-      def initialize(cert,key,digest); __take(Backend.call('p7si.new',cert,key,PKey.digest_name(digest))); end
+      def initialize(cert,key,digest); __replace_native(Backend.call('p7si.new',cert,key,PKey.digest_name(digest))); end
       def issuer; Backend.call('p7si.issuer',self); end
-      def serial; Backend.call('p7si.serial',self).to_i; end
+      def serial; BN.new(Backend.call('p7si.serial',self)); end
       def signed_time; value=Backend.call('p7si.signed_time',self); value.nil? ? nil : Time.at(value).utc; end
     end
     Signer=SignerInfo
     class RecipientInfo < NativeObject
-      def initialize(cert); __take(Backend.call('p7ri.new',cert)); end
+      def initialize(cert); __replace_native(Backend.call('p7ri.new',cert)); end
       def issuer; Backend.call('p7ri.issuer',self); end
-      def serial; Backend.call('p7ri.serial',self).to_i; end
+      def serial; BN.new(Backend.call('p7ri.serial',self)); end
       def enc_key; Backend.call('p7ri.enc_key',self); end
     end
   end

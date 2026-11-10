@@ -4,7 +4,8 @@ module OpenSSL
     class Request < NativeObject
       def initialize(*args)
         raise ArgumentError, 'wrong number of arguments' if args.size>1
-        __take(Backend.call('ts.req.new',args.empty? ? nil : PKey.data(args[0])))
+        return self if args.empty? && __native_initialized?
+        __replace_native(Backend.call('ts.req.new',args.empty? ? nil : PKey.data(args[0])))
       end
       def version; Backend.call('ts.req.version',self); end
       def version=(value); X509.mutable(self); Backend.call('ts.req.set_version',self,Backend.int64(value)); value; end
@@ -14,7 +15,7 @@ module OpenSSL
       def message_imprint=(value); X509.mutable(self); Backend.call('ts.req.set_message_imprint',self,PKey.string(value)); value; end
       def policy_id; Backend.call('ts.req.policy_id',self); end
       def policy_id=(value); X509.mutable(self); Backend.call('ts.req.set_policy_id',self,Backend.c_string(value)); value; end
-      def nonce; value=Backend.call('ts.req.nonce',self); value.nil? ? nil : value.to_i; end
+      def nonce; value=Backend.call('ts.req.nonce',self); value.nil? ? nil : BN.new(value); end
       def nonce=(value); X509.mutable(self); Backend.call('ts.req.set_nonce',self,BN.number(value).to_s); value; end
       def cert_requested?; Backend.call('ts.req.cert_requested',self); end
       def cert_requested=(value); X509.mutable(self); Backend.call('ts.req.set_cert_requested',self,!!value); value; end
@@ -22,12 +23,12 @@ module OpenSSL
       def to_text; Backend.call('ts.req.to_text',self); end
     end
     class TokenInfo < NativeObject
-      def initialize(data); __take(Backend.call('ts.info.new',PKey.data(data))); end
+      def initialize(data); __replace_native(Backend.call('ts.info.new',PKey.data(data))); end
       [:version,:policy_id,:algorithm,:message_imprint,:ordering].each do |field|
         define_method(field) { Backend.call('ts.info.'+field.to_s,self) }
       end
       [:nonce,:serial_number].each do |field|
-        define_method(field) { value=Backend.call('ts.info.'+field.to_s,self); value.nil? ? nil : value.to_i }
+        define_method(field) { value=Backend.call('ts.info.'+field.to_s,self); value.nil? ? nil : BN.new(value) }
       end
       def gen_time; Time.at(Backend.call('ts.info.gen_time',self)).utc; end
       def to_der; Backend.call('ts.info.to_der',self); end
@@ -40,7 +41,7 @@ module OpenSSL
       WAITING=3
       REVOCATION_WARNING=4
       REVOCATION_NOTIFICATION=5
-      def initialize(data); __take(Backend.call('ts.res.new',PKey.data(data))); end
+      def initialize(data); __replace_native(Backend.call('ts.res.new',PKey.data(data))); end
       def status; Backend.call('ts.res.status',self); end
       def status_text; Backend.call('ts.res.status_text',self).map { |v| v.force_encoding('UTF-8') }; end
       def failure_info; Backend.call('ts.res.failure_info',self)&.to_sym; end

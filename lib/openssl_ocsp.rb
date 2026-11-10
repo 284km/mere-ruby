@@ -16,18 +16,18 @@ module OpenSSL
         else
           Backend.call('ocsp.cid.new',nil,args[0],args[1],PKey.digest_name(args[2]))
         end
-        __take(value)
+        __replace_native(value)
       end
       def cmp(other); Backend.call('ocsp.cid.cmp',self,other); end
       def cmp_issuer(other); Backend.call('ocsp.cid.cmp_issuer',self,other); end
-      def serial; Backend.call('ocsp.cid.serial',self).to_i; end
+      def serial; BN.new(Backend.call('ocsp.cid.serial',self)); end
       def issuer_name_hash; Backend.call('ocsp.cid.issuer_name_hash',self).unpack1('H*'); end
       def issuer_key_hash; Backend.call('ocsp.cid.issuer_key_hash',self).unpack1('H*'); end
       def hash_algorithm; Backend.call('ocsp.cid.hash_algorithm',self); end
       def to_der; Backend.call('ocsp.cid.to_der',self); end
     end
     class Request < NativeObject
-      def initialize(data=nil); __take(Backend.call('ocsp.req.new',data.nil? ? nil : OCSP.der(data))); end
+      def initialize(data=nil); return self if data.nil? && __native_initialized?; __replace_native(Backend.call('ocsp.req.new',data.nil? ? nil : OCSP.der(data))); end
       def add_nonce(value=nil)
         X509.mutable(self)
         Backend.call('ocsp.req.add_nonce',self,value.nil? ? nil : PKey.string(value)); self
@@ -44,7 +44,7 @@ module OpenSSL
       def to_der; Backend.call('ocsp.req.to_der',self); end
     end
     class Response < NativeObject
-      def initialize(data=nil); __take(Backend.call('ocsp.res.new',data.nil? ? nil : OCSP.der(data))); end
+      def initialize(data=nil); return self if data.nil? && __native_initialized?; __replace_native(Backend.call('ocsp.res.new',data.nil? ? nil : OCSP.der(data))); end
       def self.create(status,basic); Backend.call('ocsp.res.create',Backend.int32(status),basic); end
       def status; Backend.call('ocsp.res.status',self); end
       def status_string; Backend.call('ocsp.res.status_string',self); end
@@ -52,7 +52,7 @@ module OpenSSL
       def to_der; Backend.call('ocsp.res.to_der',self); end
     end
     class BasicResponse < NativeObject
-      def initialize(data=nil); __take(Backend.call('ocsp.bres.new',data.nil? ? nil : OCSP.der(data))); end
+      def initialize(data=nil); return self if data.nil? && __native_initialized?; __replace_native(Backend.call('ocsp.bres.new',data.nil? ? nil : OCSP.der(data))); end
       def copy_nonce(request); X509.mutable(self); Backend.call('ocsp.bres.copy_nonce',self,request); end
       def add_nonce(value=nil)
         X509.mutable(self)
@@ -84,7 +84,7 @@ module OpenSSL
       def to_der; Backend.call('ocsp.bres.to_der',self); end
     end
     class SingleResponse < NativeObject
-      def initialize(data); __take(Backend.call('ocsp.single.new',OCSP.der(data))); end
+      def initialize(data); __replace_native(Backend.call('ocsp.single.new',OCSP.der(data))); end
       def check_validity(seconds=0,max_seconds=-1)
         Backend.call('ocsp.single.check_validity',self,seconds.nil? ? 0 : Backend.int32(seconds),max_seconds.nil? ? -1 : Backend.int32(max_seconds))
       end

@@ -3088,3 +3088,124 @@ witness.
   RSS ratio round 5's binary fails as well when run again; the numeric,
   hash, time, array and range files again with the final binary,
   unchanged; psych's 635 (#72) 635.
+
+## 2026-11-10 (27): the interpreter's structure and the stream's class -- the block #each is given, a block's own locals, block labels as written, `break` in a Thread body, $LOADED_FEATURES as ruby matches it, $: with ruby's shape, pp shipped
+
+Rounds 10 and 11 of note 537, verified in one cycle. corpus/560 is the
+witness.
+
+- **Enumerable#map gives #each a block of the user block's arity** (ruby's
+  enum_collect, rb_lambda_call): an #each that asks `block.arity` saw -2 for
+  every block. Proc.__ifunc makes that proc (its arity in proc_arity, no
+  lambda), and Hash#each yields such a proc the key and the value APART when
+  its fewest arguments are two or more (rb_block_pair_yield_optimizable for an
+  ifunc). Hash#map, which is native here, does the same for a block that takes
+  two -- a lambda too: `{1 => 2}.map(&obj.method(:two))` and
+  `.map(&->(k, v) { })` refused the pair.
+- **A name a block assigns is the block's own when the enclosing scope does
+  not have it yet.** `e = Enumerator.new { |y| r = y.yield 3 }; r = []`: the
+  block wrote the outer r when #each ran it later. parse_block lists the
+  names a block's own statements assign as `;<chr 2>name` (only for a block
+  with parameters -- an empty list is what lets `it` and `_1` in), and the
+  block literal keeps as `;name` each one the enclosing env does not hold
+  when it is made (blk_own_locals: ECallB / EMethodB / ESafeB / ESuperB).
+  Shallow (top-level statements) and decided at capture, AFTER the receiver
+  and the arguments (`(s << m = 58).lines { m += n }` -- trick2013's mame --
+  assigns m before the block): a miss is the old behaviour. A `;` entry is no
+  parameter anywhere a parameter list is read as one -- Proc#ruby2_keywords'
+  check (delegate.rb's delegating lambda warned), and define_method with a
+  proc or a lambda (`define_method(:x, lambda { |*a| t = 1 })` took only one
+  argument). define_method's method takes no `;` entries as parameters --
+  `define_method(:g) { |x; z| }` was arity 2 before any of this.
+- **A second `_`-name is a parameter of its own** (`|_, _ = 1, _:, _: 2|`,
+  `-> _, _, _ = 1 {}`): named apart as it is read (bp_under_name), so its
+  default and its `:` no longer land on the first -- parameters said
+  [:opt, :_] three times and [:key, :_] twice.
+- **A def inside a proc that define_method installed goes where the proc was
+  written**: the frame's parent is that scope (`__in_dm`), and its self names
+  the class.
+- **main.using in a wrapped load**: the wrapped self (Module#__wrap_main's copy
+  of main, marked @__wmain) is main to `using`, so `load(f, true)` with a
+  top-level `using` works and the method / module-body forms are main.using's
+  RuntimeError (main_like).
+- **Block labels count the blocks as written** -- `block (6 levels)` for a
+  block four deep once the blocks around it had been passed on as `&b` and
+  run by instance_exec (mspec's describe/it). A level is a frame a block
+  invocation made (run_block's `__bki`) or a define_method body's, not every
+  env with a parent; END { } keeps its extra level by marking its own.
+- **`break` in a Thread body is LocalJumpError where it is** (the body's own
+  rescue sees it): run_block marks a Thread body's frame `__thrbody`, and a
+  while loop in it counts itself (`__wd`) so a `break` there is the loop's.
+- **Thread#raise(e)** with a rescued pair: the pair's backtrace lives beside
+  the thread that rescued it, so it goes over as an object carrying it, and
+  Exception#== takes a pair of the class as one (class, message, backtrace).
+- **`K.raise { }`** for a class with its own `def self.raise`: the Kernel#raise
+  arms asked the class's INSTANCE methods (recv_defines).
+- **Lazy**: #with_object (lazy_super), and grep's `$~` is the `$~` of the code
+  walking the lazy -- the collector block's home was the top level, so inside
+  a method the match went to the top level's `$~`.
+- **TracePoint#enable(target_line:)**: an Integer through #to_int, and a line
+  in the target's range ("can not enable any hooks").
+- **Location#absolute_path** is the loaded file's realpath as it was at load
+  (file_rp): a symlink's target, even once the link is removed.
+- **A byte that is no UTF-8 in a UTF-8 source** is "invalid multibyte
+  character 0xFF" (a UTF-16 file with a BOM), not a bare syntax error.
+- **$LOADED_FEATURES as ruby matches it** (rb_feature_p): an entry that IS
+  the name asked for (`./f.rb`, `../f.rb`, `code/../code/f.rb`, a `code/f`
+  with no extension -- while no .rb of it is found); a bare name whose entry
+  is `<dir>/<name>.rb` with dir on $: now, through its symlinks
+  (lf_under_load_path), even when an earlier dir has the file; a .so/.bundle
+  entry does not stand for a .rb that is found (req_rb_found); an unreadable
+  file is LoadError. require_spec 32 → 0 (the rest of its DIFF is the count
+  of ruby's encdb/transdb entries, which have no file here).
+- **$: has ruby's shape**: after -I and RUBYLIB, the versioned site, vendor
+  and library directories with their arch directories, named under the
+  stdlib fiction RbConfig tells (/usr/lib/ruby/4.0.0) -- never under a
+  GEM_HOME the prefix may come from, and not the bare site_ruby/vendor_ruby a
+  Linux host's own ruby fills. None of them exists to find anything in.
+  RbConfig's sitelibdir was the prefix itself; it and sitedir, sitearchdir,
+  vendordir, vendorlibdir, vendorarchdir, archdir have ruby's layout.
+  `$LOAD_PATH.resolve_feature_path` is $:'s singleton method (`def
+  $LOAD_PATH.m` looked the global up without its alias, and defined a bare
+  method), answering a shipped library under the fiction and as the
+  extension ruby's is (cext_feature).
+- **pp and prettyprint are shipped** (ruby's own files, lib/pp_ext.rb and
+  lib/prettyprint_ext.rb): `require "pp"` was a LoadError.
+- **Round 11**: `File.new(fd)` / `File.open(fd)` is a File (the descriptor
+  layer answers File as it answers IO, fdio_cls); IO#reopen(io) takes the
+  other's mode and class (IO.__reclass, rb_io_reopen's RBASIC_SET_CLASS) --
+  and does so for a stream with a singleton method too: fdio_route read the
+  singleton class as the class (`def io.to_io` sent #reopen to the standard
+  streams', which kept the old mode: "not opened for reading"). RbConfig's
+  MAKEFILE_CONFIG names sitearchdir, vendordir, vendorlibdir, vendorarchdir
+  and archdir as configure does ($(sitearch)).
+- An Errno's message holding a binary path is BINARY (`e.message.include?
+  (path)` raised Encoding::CompatibilityError).
+- **Left** (with the reason): binding.local_variables' later locals of a
+  block with no parameters (the parser has no table that `it` cannot be
+  confused by); an interpolation's line in a heredoc (no expression-level line
+  mark that is set before the expression); TracePoint's thread_begin inspect
+  (a new Thread runs before Thread.new returns here); import_methods refusing a
+  C extension's methods (a shipped C extension is Ruby here, and nothing marks
+  it as the extension it stands for); a Hash with a singleton #each under
+  #map (native); Module#constants, gc/stat, symbol/all_symbols,
+  thread/list ... are counts of the reference's own; Gem and DidYouMean (not
+  shipped). Round 11's values: a Regexp, an Integer past a word and a File
+  of a path are values (or a handle) here, with no identity of their own to
+  hold instance variables, a singleton module, an object_id, or a FRESH
+  singleton class after #reopen; a File of a path cannot become an IO; a copy
+  of Time (`Time.dup`) is not answered by Time's arms, which ask is_a?(Time),
+  and answering them through is_a? would make the copy's instances Times.
+  `$0`'s process title, File#size / File.stat on a deleted open
+  file (fstat by fd) and SIGPIPE's SYSTEM_DEFAULT are the runtime round.
+- **Checked**: corpus 575/575 with the hash index on and off; the 13 gates;
+  corpus/560 under MERE_RUBY_GC_STRESS=50 and with no hash index; the 247
+  unittest files 9754 = 9754 against round 9's binary (test_method +1;
+  test_thread -1, which is 97 for both binaries on a rerun -- a flake;
+  test_trick's mame and test_rbconfig, which the first run of this round
+  broke, are whole again); the spec records, swept again on main with #74's
+  OpenSSL under this: base DIFF 53 -> 31 (SLOW 0, CRASH 2 -> 1; x509 name /
+  store and scrypt's CRASH are #74's), stdlib DIFF 26 (CRASH 6) unchanged.
+  library/etc/getgrgid was DIFF in both sweeps and MATCH alone each time (the
+  load flake of (26)), and is recorded as MATCH. After the rebase: corpus
+  582/582 both ways and the gates again.

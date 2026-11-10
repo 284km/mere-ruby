@@ -32,7 +32,7 @@ dropped, every platform-guarded Process file. 335 files moved from MATCH to SKIP
 so MATCH 2722 before it and 2410 on it are not the same question either.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 62 | 4 | 0 | 0 | 0 | 66 |
+| language | 64 | 2 | 0 | 0 | 0 | 66 |
 | core/string | 114 | 0 | 0 | 0 | 0 | 114 |
 | core/array | 101 | 0 | 0 | 1 | 0 | 102 |
 | core/hash | 69 | 0 | 0 | 0 | 0 | 69 |
@@ -59,11 +59,11 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/true | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/unboundmethod | 14 | 0 | 0 | 5 | 0 | 19 |
 | core/systemexit | 2 | 0 | 0 | 0 | 0 | 2 |
-| core/proc | 22 | 1 | 0 | 0 | 0 | 23 |
+| core/proc | 23 | 0 | 0 | 0 | 0 | 23 |
 | core/set | 51 | 0 | 0 | 1 | 0 | 52 |
 | core/regexp | 24 | 0 | 0 | 0 | 0 | 24 |
-| core/enumerable | 59 | 2 | 0 | 0 | 0 | 61 |
-| core/module | 80 | 2 | 0 | 1 | 0 | 83 |
+| core/enumerable | 61 | 0 | 0 | 0 | 0 | 61 |
+| core/module | 81 | 1 | 0 | 1 | 0 | 83 |
 | core/filetest | 17 | 0 | 0 | 7 | 0 | 24 |
 | core/data | 12 | 0 | 0 | 1 | 0 | 13 |
 | core/math | 27 | 0 | 0 | 0 | 0 | 27 |
@@ -71,20 +71,20 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/argf | 34 | 0 | 0 | 0 | 0 | 34 |
 | core/class | 8 | 0 | 0 | 0 | 0 | 8 |
 | core/encoding | 14 | 0 | 0 | 3 | 0 | 17 |
-| core/enumerator | 21 | 1 | 0 | 0 | 0 | 22 |
+| core/enumerator | 22 | 0 | 0 | 0 | 0 | 22 |
 | core/random | 10 | 0 | 0 | 0 | 0 | 10 |
 | core/signal | 2 | 1 | 0 | 0 | 0 | 3 |
 | core/objectspace | 6 | 0 | 0 | 1 | 0 | 7 |
-| core/main | 6 | 1 | 0 | 0 | 0 | 7 |
+| core/main | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/gc | 9 | 1 | 0 | 0 | 0 | 10 |
 | core/binding | 8 | 1 | 0 | 0 | 0 | 9 |
 | core/refinement | 6 | 1 | 0 | 1 | 0 | 8 |
 | core/warning | 4 | 0 | 0 | 0 | 0 | 4 |
 | core/conditionvariable | 4 | 0 | 0 | 0 | 0 | 4 |
 | core/builtin_constants | 1 | 0 | 0 | 0 | 0 | 1 |
-| core/fiber | 10 | 1 | 0 | 0 | 0 | 11 |
+| core/fiber | 11 | 0 | 0 | 0 | 0 | 11 |
 | core/dir | 32 | 0 | 0 | 1 | 0 | 33 |
-| core/file | 63 | 4 | 0 | 1 | 0 | 68 |
+| core/file | 65 | 2 | 0 | 1 | 0 | 68 |
 | core/time | 63 | 1 | 0 | 2 | 0 | 66 |
 | core/io | 78 | 1 | 0 | 1 | 0 | 80 |
 | library/date | 56 | 0 | 0 | 42 | 0 | 98 |
@@ -109,7 +109,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/encoding/undefined_conversion_error | 5 | 0 | 0 | 0 | 0 | 5 |
 | core/enumerator/arithmetic_sequence | 12 | 0 | 0 | 0 | 0 | 12 |
 | core/enumerator/chain | 5 | 0 | 0 | 0 | 0 | 5 |
-| core/enumerator/lazy | 26 | 4 | 0 | 0 | 0 | 30 |
+| core/enumerator/lazy | 30 | 0 | 0 | 0 | 0 | 30 |
 | core/enumerator/product | 6 | 0 | 0 | 0 | 0 | 6 |
 | core/file/constants | 1 | 0 | 0 | 0 | 0 | 1 |
 | core/file/stat | 39 | 0 | 0 | 4 | 0 | 43 |
@@ -129,10 +129,10 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/set/sortedset | 0 | 0 | 0 | 1 | 0 | 1 |
 | core/string/unpack | 24 | 0 | 0 | 0 | 0 | 24 |
 | core/string/valid_encoding | 1 | 0 | 0 | 0 | 0 | 1 |
-| core/thread | 38 | 5 | 0 | 2 | 0 | 45 |
+| core/thread | 40 | 3 | 0 | 2 | 0 | 45 |
 | core/thread/backtrace | 1 | 0 | 0 | 0 | 0 | 1 |
-| core/thread/backtrace/location | 6 | 1 | 0 | 0 | 0 | 7 |
-| core/tracepoint | 17 | 2 | 0 | 0 | 0 | 19 |
+| core/thread/backtrace/location | 7 | 0 | 0 | 0 | 0 | 7 |
+| core/tracepoint | 18 | 1 | 0 | 0 | 0 | 19 |
 | language/predefined | 2 | 0 | 0 | 0 | 0 | 2 |
 | language/regexp | 11 | 0 | 0 | 0 | 0 | 11 |
 | library/cgi/cookie | 0 | 0 | 0 | 9 | 0 | 9 |
@@ -161,10 +161,10 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | library/openssl | 3 | 0 | 0 | 0 | 0 | 3 |
 | library/openssl/digest | 8 | 0 | 0 | 0 | 0 | 8 |
 | library/openssl/hmac | 2 | 0 | 0 | 0 | 0 | 2 |
-| library/openssl/kdf | 0 | 1 | 1 | 0 | 0 | 2 |
+| library/openssl/kdf | 0 | 2 | 0 | 0 | 0 | 2 |
 | library/openssl/random | 2 | 0 | 0 | 0 | 0 | 2 |
-| library/openssl/x509/name | 0 | 1 | 0 | 0 | 0 | 1 |
-| library/openssl/x509/store | 0 | 1 | 0 | 0 | 0 | 1 |
+| library/openssl/x509/name | 1 | 0 | 0 | 0 | 0 | 1 |
+| library/openssl/x509/store | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/rbconfig | 2 | 1 | 0 | 0 | 0 | 3 |
 | library/readline/history | 0 | 0 | 0 | 13 | 0 | 13 |
 | library/singleton | 7 | 0 | 0 | 0 | 0 | 7 |
@@ -185,7 +185,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | library/zlib/inflate | 4 | 0 | 0 | 0 | 0 | 4 |
 | library/zlib/zstream | 5 | 0 | 0 | 0 | 0 | 5 |
 | library/digest | 2 | 0 | 0 | 0 | 0 | 2 |
-| command_line | 29 | 3 | 0 | 0 | 0 | 32 |
+| command_line | 31 | 1 | 0 | 0 | 0 | 32 |
 | library/logger | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/bigdecimal | 57 | 0 | 0 | 0 | 0 | 57 |
 
