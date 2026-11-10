@@ -40,6 +40,20 @@ extern fn udp_recv: int -> int -> int -> int;
 // Addressed datagrams use the same byte arena and preserve the socket fd.
 extern fn sock_sendto: int -> int -> int -> int -> str -> int -> int;
 extern fn sock_recvfrom: int -> int -> int -> int -> str;
+// a peer's ids, the interface list, and a message with control data, each
+// struct kept in the runtime and crossing as text (Mere v0.1.724)
+extern fn sock_peer_ids: int -> str;
+extern fn sock_connect: int -> str -> int -> int;
+extern fn sock_ifaddrs: unit -> str;
+extern fn sock_sendmsg_to: int -> int -> int -> int -> str -> str -> int;
+extern fn sock_recvmsg: int -> int -> int -> int -> int -> str;
+// a pseudo-terminal, and a descriptor's termios / window size (v0.1.724)
+extern fn pty_open: unit -> str;
+extern fn tty_attrs: int -> str;
+extern fn tty_set_attrs: int -> int -> str -> int;
+extern fn tty_winsize: int -> str;
+extern fn tty_set_winsize: int -> int -> int -> int -> int -> int;
+extern fn tty_flush: int -> int -> int;
 // socket(2), listen(2) and shutdown(2) take and answer plain ints, and every
 // build that uses the tcp_* family above has <sys/socket.h> in it, so these
 // three are ordinary libc externs -- the prototype Mere writes is the one the
@@ -222,6 +236,8 @@ extern fn file_umask: int -> int;
 // its length. File.symlink? / File.readlink / File.realpath asked the shell
 // (`test -L`, `readlink`, `cd -P && pwd -P`), a child per question.
 extern fn file_lstat: str -> int;
+// fstat(2) of an open descriptor into the same snapshot (Mere 0.1.724)
+extern fn file_fstat: int -> int;
 extern fn file_stat_field: int -> int;
 extern fn file_readlink: str -> int -> int -> int;
 extern fn file_stat: str -> int;
@@ -824,6 +840,12 @@ let mkstr = fn (s: str) ->
   VStr (handle_base + n);
 // Build a joined value directly in its owning page on compilers that fuse
 // vec_push/str_join. The ordinary builtin composition remains equivalent.
+// a list of decimal fields as Integers, and of texts as Strings (what the
+// runtime's text answers are split into)
+let rec val_list_of_ints = fn (xs: str list) ->
+  match xs with Nil -> (Nil : Val list) | Cons (x, t) -> Cons (VInt (int_of_str x), val_list_of_ints t);
+let rec str_list_vals = fn (xs: str list) ->
+  match xs with Nil -> (Nil : Val list) | Cons (x, t) -> Cons (mkstr x, str_list_vals t);
 let mkstr_join = fn (parts: str list) ->
   let n = str_slot_prepare () in
   let rec size = fn (xs: str list) -> fn (total: int) ->
@@ -2470,6 +2492,12 @@ let pack_live = map_new ();
 // descriptor still writes, but a File here writes through its path (path ->
 // the mode to give it)
 let file_perm_at_close = map_new ();
+// the Files open on a path (its absolute path -> their ids, " "-separated).
+// unlink(2) takes the NAME and not the file: a File open on it still has its
+// data, its size and its stat (rb_io_t holds the descriptor). A File here
+// takes a descriptor only when asked (file_fd_of), so deleting a path first
+// gives the Files still open on it theirs -- see file_hold_open.
+let file_open_paths = map_new ();
 let name_sets = map_new ();
 let name_spec = fn (tag: str) ->
   if str_eq tag "builtin_cls_name" then ("String|Array|Hash|Integer|Float|Numeric|Complex|Rational|Range|"
@@ -3230,7 +3258,9 @@ let rec stdin_more = fn (u: unit) ->
      let n = fd_read 0 p 65536 in
      if n < 0 && (let e9 = fd_last_errno () in e9 == 35 || e9 == 11) then
        (let _ = sleep_ms 1 in stdin_more ())
-     else if n <= 0 then (let _ = map_set stdin_src "done" "1" in false)
+     // (a terminal's end of input is ^D, and it is not the last word: the
+     //  next read waits for more, as ruby's does -- a pipe's or a file's is)
+     else if n <= 0 then (let _ = (if n == 0 && fd_isatty 0 == 1 then () else map_set stdin_src "done" "1") in false)
      else
        (let _ = map_set stdin_src "s" ((if map_has stdin_src "s" then map_get stdin_src "s" else "") ++ mem_to_str p n) in
         true));
@@ -4159,6 +4189,24 @@ let io_ps = map_new ();
 let io_ps_id = fn (u: unit) ->
   if map_has io_ps 0 then map_get io_ps 0
   else (let s = io_poll_new 0 in let _ = map_set io_ps 0 s in s);
+// all of a string to a descriptor that may be non-blocking (a stderr a parent
+// made so, as ruby's IO.pipe makes both ends): a full pipe's EAGAIN waits
+// until it can be written, where a bare fd_put dropped the rest. Stops at any
+// other refusal. ruby's write to a standard stream does the same
+// (rb_io_wait_writable).
+let rec fd_put_wait = fn (fd: int) -> fn (s: str) ->
+  if str_eq s "" then ()
+  else
+    (let e = (if str_len s > 65536 then 65536 else str_len s) in
+     let n = fd_put fd (substring s 0 e) in
+     if n > 0 then fd_put_wait fd (substring s n (str_len s))
+     else if n < 0 && (let e9 = fd_last_errno () in if str_eq (sys_os ()) "linux" then e9 == 11 else e9 == 35) then
+       (let ps = io_ps_id () in
+        let _ = io_poll_add ps fd 2 in
+        let _ = io_poll_wait ps (0 - 1) in
+        let _ = io_poll_del ps fd in
+        fd_put_wait fd s)
+     else ());
 let rec io_poll_fill = fn (s: int) -> fn (fds: Val list) -> fn (ints: Val list) ->
   match fds with
   | Cons (VInt fd, rest) ->

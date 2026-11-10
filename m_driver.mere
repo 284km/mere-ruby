@@ -6223,6 +6223,7 @@ let core_prelude_f =
   "    rdl = []\n" ++
   "    latel = []\n" ++
   "    pg_num = -1\n" ++
+  "    pty_session = false\n" ++
   "    chdir_d = nil\n" ++
   "    shell_only = false\n" ++
   "    newpg = false\n" ++
@@ -6290,6 +6291,12 @@ let core_prelude_f =
   "      elsif k == :unsetenv_others\n" ++
   "        # (first of all: the env given to spawn is set AFTER it)\n" ++
   "        unset_others = true if v\n" ++
+  "      elsif k == :__pty_session\n" ++
+  "        # (PTY.spawn's: a new session, so the pty slave the child opens by\n" ++
+  "        #  path is its controlling terminal -- the direct spawn only)\n" ++
+  "        pgroup = true\n" ++
+  "        pg_num = -2\n" ++
+  "        pty_session = true\n" ++
   "      elsif k == :close_others || k == :new_pgroup\n" ++
   "      elsif k.is_a?(Symbol) && k.to_s.start_with?(\"rlimit_\") && (u = __ulimit_flag(k))\n" ++
   "        # a resource limit for the child: the shell that starts it sets it\n" ++
@@ -6394,6 +6401,7 @@ let core_prelude_f =
   "    #   interpreter, the writer among them (test_execopts_redirect_open_fifo\n" ++
   "    #   deadlocked). The shell path opens it in the child's own shell.\n" ++
   "    fifo = rdl.any? \{ |_, v| pth = v.is_a?(Array) ? v[0] : v; pth.is_a?(String) && File.pipe?(pth) }\n" ++
+  "    raise NotImplementedError, \"a new session needs the direct spawn\" if pty_session && (shell_only || fifo)\n" ++
   "    unless shell_only || fifo\n" ++
   "      STDOUT.flush\n" ++
   "      STDERR.flush\n" ++
@@ -6912,9 +6920,26 @@ let core_prelude_f =
   "      f = File.__stat_fields(path, follow)\n" ++
   "      return __raw_sh(path, follow) if f == :unavailable\n" ++
   "      return nil if f.nil?\n" ++
+  "      __fields(f, path, follow)\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def self.__fields(f, path, follow)\n" ++
   "      \{ dev: f[0], ino: f[1], mode: f[2], nlink: f[3], uid: f[4], gid: f[5],\n" ++
   "        rdev: f[6], size: f[7], atime: f[8], mtime: f[9], ctime: f[10],\n" ++
   "        blksize: f[11], blocks: f[12], path: path, follow: follow }\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    # fstat(2) of an open descriptor (rb_io_stat): a file unlinked while it\n" ++
+  "    # is open still has its snapshot, where its path has none. nil where the\n" ++
+  "    # target has no fstat, and the caller asks the path; a failure is the\n" ++
+  "    # errno's error.\n" ++
+  "    def self.__fd(fd, path)\n" ++
+  "      f = File.__fstat_fields(fd)\n" ++
+  "      return nil if f == :unavailable\n" ++
+  "      raise SystemCallError.new(nil, f) if f.is_a?(Integer)\n" ++
+  "      s = allocate\n" ++
+  "      s.instance_variable_set(:@h, __fields(f, path, true))\n" ++
+  "      s\n" ++
   "    end\n" ++
   "\n" ++
   "    def self.__raw_sh(path, follow = true)\n" ++
@@ -7533,14 +7558,19 @@ let core_prelude_h =
   "  end\n" ++
   "  private :__closed!\n" ++
   "\n" ++
-  "  def stat = (__closed!; File::Stat.new(@__f_path))\n" ++
+  "  def stat = (__closed!; File::Stat.__fd(fileno, @__f_path) || File::Stat.new(@__f_path))\n" ++
   "  def lstat = (__closed!; File::Stat.__lstat(@__f_path))\n" ++
   "  def atime = (__closed!; File.atime(@__f_path))\n" ++
   "  def mtime = (__closed!; File.mtime(@__f_path))\n" ++
   "  def ctime = (__closed!; File.ctime(@__f_path))\n" ++
   "  def birthtime = (__closed!; File.birthtime(@__f_path))\n" ++
   "  # what is still in the write buffer counts, as ruby flushes first\n" ++
-  "  def size = (__closed!; flush; File.size(@__f_path))\n" ++
+  "  def size\n" ++
+  "    __closed!\n" ++
+  "    flush\n" ++
+  "    st = File::Stat.__fd(fileno, @__f_path)\n" ++
+  "    st ? st.size : File.size(@__f_path)\n" ++
+  "  end\n" ++
   "  # ⚠ these two answered only in the dispatcher's File arm, which a\n" ++
   "  #   method table does not see: respond_to?(:truncate) was false, and a\n" ++
   "  #   Delegator (Tempfile) asks exactly that before it forwards a call\n" ++
@@ -10022,9 +10052,8 @@ let core_prelude_k =
   "      return nil\n" ++
   "    end\n" ++
   "    s = __fd_take(len)\n" ++
-  "    return s if buf.nil?\n" ++
-  "    buf.replace(s)\n" ++
-  "    buf.force_encoding(Encoding::BINARY)\n" ++
+  "    # (a buffer keeps its encoding: io_read with a length, ruby 3.3 on)\n" ++
+  "    __fd_into(buf, s)\n" ++
   "  end\n" ++
   "\n" ++
   "  def __fd_readpartial(len, buf = nil)\n" ++
@@ -14184,14 +14213,14 @@ let run_cli = fn () ->
     // try_or falls back to "" -- so a bare `mere-ruby` still prints usage.
     let src = try_or (fn () -> read_file "@mere-ruby-playground@") "" in
     if str_eq src "" then
-      // A bare `mere-ruby` reads its program from stdin, as ruby does -- but
-      // only when stdin is NOT a terminal. read_stdin blocks until EOF, so a
-      // person who types `mere-ruby` would sit at a silent prompt; the usage
-      // line is kinder there. Redirected or piped, the program is on stdin,
-      // and ruby/spec asks for exactly that (`ruby_exe(nil, args: "< file")`,
+      // A bare `mere-ruby` reads its program from stdin, as ruby does --
+      // ruby/spec asks for exactly that (`ruby_exe(nil, args: "< file")`,
       // all of language/magic_comment_spec). -v alone still just prints.
+      // ⚠ A TERMINAL TOO: this printed the usage line on a tty, which is
+      //   kinder to a person who types `mere-ruby` and not what ruby does --
+      //   test_rubyoptions' test_script_from_stdin runs the program a pty
+      //   types (^D ends it, and the rest is the program's own stdin).
       (if map_has cli_opt "ver" then 0
-       else if fd_isatty 0 == 1 then let _ = print usage_line in 2
        else
          (let _ = map_set cli_file "p" "-" in
           let _ = map_set cli_argv "v" (arr_new (Nil : Val list)) in

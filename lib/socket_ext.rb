@@ -32,7 +32,10 @@ class BasicSocket < IO
     # (rsock_init_sock asks fstat(2) first: a descriptor that is none is EBADF)
     raise Errno::EBADF, "fstat(2)" if IO.__fd_int(fd) < 0
     s = allocate
-    s.__setup(fd)
+    # (the kernel's SO_TYPE: a datagram socket wrapped by for_fd is one)
+    h = Socket.__getopt(IO.__fd_int(fd), Socket::SOL_SOCKET, Socket::SO_TYPE)
+    ty = h.is_a?(String) && h.size >= 8 ? [h].pack("H*").unpack1("i") : nil
+    ty ? s.__setup(fd, ty) : s.__setup(fd)
     s
   end
   # rsock_init_sock: a read-write stream, binary (ASCII-8BIT, binmode?), sync,
@@ -127,16 +130,69 @@ class BasicSocket < IO
     raise IO::EAGAINWaitReadable, "#{what} would block"
   end
   private :__would_block
-  # recvmsg(2) without ancillary data: [message, sender Addrinfo, flags] --
+  # recvmsg(2): [message, sender Addrinfo, flags, *Socket::AncillaryData] --
   # MSG_TRUNC when the datagram was longer than asked for; with no length
-  # given, the whole datagram (ruby grows its buffer to fit)
+  # given, the whole datagram (ruby grows its buffer to fit). The control
+  # messages are Mere v0.1.724's sock_recvmsg; a descriptor that arrives with
+  # SCM_RIGHTS is an IO when scm_rights: is true, and closed when it is not
+  # (rsock_discard_cmsg_resource).
   def recvmsg(dlen = nil, flags = 0, clen = nil, scm_rights: false)
-    __recvmsg(dlen, flags, false, true)
+    __recvmsg(dlen, flags, clen, scm_rights, false, true)
   end
   def recvmsg_nonblock(dlen = nil, flags = 0, clen = nil, scm_rights: false, exception: true)
-    __recvmsg(dlen, flags, true, exception)
+    __recvmsg(dlen, flags, clen, scm_rights, true, exception)
   end
-  def __recvmsg(dlen, flags, nonblock, exception)
+  def __recvmsg(dlen, flags, clen, scm_rights, nonblock, exception)
+    __check_open
+    rb = @__io_rbuf
+    # (a datagram socket whose peer is remembered here, or that holds a
+    #  peeked datagram, is the datagram layer's; the rest is recvmsg(2))
+    if (@socktype == Socket::SOCK_DGRAM && (@__dg_peer || @__dg_peek)) || (rb.is_a?(String) && !rb.empty?)
+      return __recvmsg_plain(dlen, flags, nonblock, exception)
+    end
+    cap = dlen.nil? ? 65536 : IO.__fd_cint(dlen)
+    fl = flags.nil? ? 0 : IO.__fd_cint(flags)
+    ccap = clen.nil? ? 4096 : IO.__fd_cint(clen)
+    if nonblock
+      fl |= Socket::MSG_DONTWAIT
+    else
+      IO.select([self])
+    end
+    r = Socket.__recvmsg(@__io_fd, cap, fl, ccap)
+    if r.is_a?(Integer)
+      if IO.__again?(r)
+        return :wait_readable unless exception
+        raise IO::EAGAINWaitReadable, "recvmsg(2) would block"
+      end
+      raise SystemCallError.new("recvmsg(2)", -r)
+    end
+    head, data, ctls = r
+    count, rflags, addr = head.split(" ", 3)
+    # (the end of a stream -- the peer's orderly shutdown -- is nil)
+    return nil if count == "0" && ctls.empty? && (@socktype.nil? || @socktype == Socket::SOCK_STREAM)
+    fam = __opt_family
+    # (no address from the kernel -- a connected stream -- is ruby's
+    #  empty-sockaddr Addrinfo, AF_UNSPEC, of the socket's type)
+    sender = addr.start_with?("none ") || addr.start_with?("other ") ?
+      Addrinfo.allocate.__init("", 0, @socktype || Socket::SOCK_STREAM, 0, nil, nil) :
+      Socket::Endpoint__.addrinfo(addr, "recvmsg(2)", @socktype || Socket::SOCK_STREAM)
+    anc = ctls.map do |line|
+      lv, ty, hex = line.split(" ", 3)
+      a = Socket::AncillaryData.__new(fam, lv.to_i, ty.to_i, [hex.to_s].pack("H*"))
+      if lv.to_i == Socket::SOL_SOCKET && ty.to_i == Socket::SCM_RIGHTS
+        fds = a.data.unpack("i*")
+        if scm_rights == true
+          a.instance_variable_set(:@unix_rights, fds.map { |fd| IO.for_fd(fd) })
+        elsif scm_rights != :keep
+          fds.each { |fd| IO.__fdclose(fd) }
+        end
+      end
+      a
+    end
+    [data, sender, rflags.to_i, *anc]
+  end
+  private :__recvmsg
+  def __recvmsg_plain(dlen, flags, nonblock, exception)
     if @socktype == Socket::SOCK_DGRAM
       cap = dlen.nil? ? 65536 : IO.__fd_cint(dlen)
       pk = __dgram_take(cap, flags, nonblock, "recvmsg(2)")
@@ -152,23 +208,62 @@ class BasicSocket < IO
     return data if data == :wait_readable
     [data, (remote_address rescue nil), 0]
   end
-  private :__recvmsg
-  # sendmsg(2) without ancillary data is send(2) (with ancillary data it is
-  # not implemented: the runtime has no sendmsg)
+  private :__recvmsg_plain
+  # sendmsg(2) (Mere's sock_sendmsg_to) with control messages: each a
+  # Socket::AncillaryData or [level, type, data], to the destination given or
+  # the connected peer; without control data it is send(2) / sendto(2).
   def sendmsg(mesg, flags = 0, dest = nil, *controls)
-    raise NotImplementedError, "sendmsg(2) with ancillary data is not implemented" unless controls.empty?
-    dest.nil? ? send(mesg, flags) : send(mesg, flags, dest)
+    __sendmsg(mesg, flags, dest, controls, false, true)
   end
   def sendmsg_nonblock(mesg, flags = 0, dest = nil, *controls, exception: true)
-    raise NotImplementedError, "sendmsg(2) with ancillary data is not implemented" unless controls.empty?
-    fl = (flags.nil? ? 0 : IO.__fd_cint(flags)) | Socket::MSG_DONTWAIT
-    begin
-      dest.nil? ? send(mesg, fl) : send(mesg, fl, dest)
-    rescue Errno::EAGAIN
-      return :wait_writable unless exception
-      raise IO::EAGAINWaitWritable, "sendmsg(2) would block"
-    end
+    __sendmsg(mesg, flags, dest, controls, true, exception)
   end
+  def __sendmsg(mesg, flags, dest, controls, nonblock, exception)
+    fl = (flags.nil? ? 0 : IO.__fd_cint(flags))
+    fl |= Socket::MSG_DONTWAIT if nonblock
+    if controls.empty?
+      begin
+        return dest.nil? ? send(mesg, fl) : send(mesg, fl, dest)
+      rescue Errno::EAGAIN
+        raise unless nonblock
+        return :wait_writable unless exception
+        raise IO::EAGAINWaitWritable, "sendmsg(2) would block"
+      end
+    end
+    __check_open
+    # (the destination as the runtime takes it: a numeric "host port")
+    to = ""
+    unless dest.nil?
+      ai = dest.is_a?(Addrinfo) ? dest : Addrinfo.new(IO.__fd_str(dest))
+      raise NotImplementedError, "sendmsg(2) to a non-IP address with ancillary data is not implemented" unless ai.ip?
+      to = "#{ai.ip_address.sub(/%.*\z/, '')} #{ai.ip_port}"
+    end
+    ctl = controls.map do |c|
+      if c.is_a?(Socket::AncillaryData)
+        lv, ty, data = c.level, c.type, c.data
+      else
+        c = c.to_ary
+        raise ArgumentError, "unexpected ancillary data size" unless c.size == 3
+        fam = __opt_family
+        lv = Socket::Constants.__level_arg(fam, c[0])
+        ty = Socket::Constants.__cmsg_type_arg(fam, lv, c[1])
+        data = c[2].to_str
+      end
+      "#{lv} #{ty} #{data.unpack1('H*')}"
+    end.join("\n")
+    flush if respond_to?(:flush)
+    r = Socket.__sendmsg(@__io_fd, IO.__fd_str(mesg).b, fl, to, ctl)
+    raise Errno::EAFNOSUPPORT, "sendmsg(2)" if r.nil?
+    if r < 0
+      if nonblock && IO.__again?(r)
+        return :wait_writable unless exception
+        raise IO::EAGAINWaitWritable, "sendmsg(2) would block"
+      end
+      raise SystemCallError.new("sendmsg(2)", -r)
+    end
+    r
+  end
+  private :__sendmsg
   def recvfrom_nonblock(maxlen, flags = 0, outbuf = nil, exception: true)
     if @socktype == Socket::SOCK_DGRAM
       pk = __dgram_take(maxlen, flags, true)
@@ -243,18 +338,13 @@ class BasicSocket < IO
     raise SystemCallError.new("getsockopt(2)", -h) if h.is_a?(Integer)
     Socket::Option.__new(fam, level, option, [h].pack("H*"))
   end
-  # getpeereid(3): the peer's effective uid and gid, read from what the
-  # kernel says of the peer -- LOCAL_PEERCRED's xucred on macOS (the uid,
-  # then the groups, the first of them the gid), SO_PEERCRED's ucred on Linux
+  # getpeereid(3): the peer's effective uid and gid (Mere v0.1.724's
+  # sock_peer_ids: getpeereid, SO_PEERCRED on Linux)
   def getpeereid
     __check_open
-    if RUBY_PLATFORM.include?("darwin")
-      d = getsockopt(0, Socket::LOCAL_PEERCRED).data
-      [d.unpack1("L", offset: 4), d.unpack1("L", offset: 12)]
-    else
-      _, uid, gid = getsockopt(Socket::SOL_SOCKET, Socket::SO_PEERCRED).data.unpack("l3")
-      [uid, gid]
-    end
+    r = Socket.__peer_ids(@__io_fd)
+    raise SystemCallError.new("getpeereid(3)", -r) if r.is_a?(Integer)
+    r
   end
   # rsock_getfamily: the family of the socket's own address
   def __opt_family
@@ -418,6 +508,9 @@ class BasicSocket < IO
 end
 
 class IPSocket < BasicSocket
+  # ruby undefines it here (rsock_init_ipsocket): an IP socket has no peer
+  # credentials to ask about
+  undef_method :getpeereid
   def self.getaddress(host)
     Addrinfo.__getaddrinfo(host, nil, 0, 0, 0, 0, false)[0].ip_address
   end
@@ -677,9 +770,15 @@ class UDPSocket < IPSocket
       ai = Addrinfo.__getaddrinfo(h, Addrinfo.__port_of(port, "udp"), @family, Socket::SOCK_DGRAM, 0, 0, false)[0]
       return __dgram_peer!(ai)
     end
-    fd = Socket.__udp_open(h, Addrinfo.__port_of(port, "udp"))
-    raise Errno::ECONNREFUSED, "connect(2) for #{host}:#{port}" if fd < 0
-    __move_to(fd)
+    # connect(2) on this descriptor (Mere v0.1.724's sock_connect): the
+    # socket keeps its family -- udp_open made one of its own, so an AF_INET
+    # UDPSocket connected to "localhost" became an IPv6 one. No host is the
+    # loopback address (getaddrinfo(NULL) without AI_PASSIVE).
+    h = @family == Socket::AF_INET6 ? "::1" : "127.0.0.1" if h.empty?
+    ai = Addrinfo.__getaddrinfo(h, Addrinfo.__port_of(port, "udp"), @family, Socket::SOCK_DGRAM, 0, 0, false)[0]
+    r = Socket.__sock_connect(@__io_fd, ai.ip_address, ai.ip_port)
+    raise SystemCallError.new("connect(2) for #{ai.inspect_sockaddr}", -r) if r.is_a?(Integer) && r < 0
+    raise Errno::EAFNOSUPPORT, "connect(2) for #{ai.inspect_sockaddr}" if r.nil?
     0
   end
   def send(mesg, flags, *dest)
@@ -794,6 +893,29 @@ class UNIXSocket < BasicSocket
   def initialize(path)
     __new_block_warn if block_given?
     __unix_init(path, false)
+  end
+  # a descriptor sent with SCM_RIGHTS beside one NUL byte, as ruby's
+  # unix_send_io does (an IO, or an Integer descriptor)
+  def send_io(io)
+    fd = io.is_a?(Integer) ? io : (io.respond_to?(:to_io) ? io.to_io.fileno : nil)
+    raise TypeError, "neither IO nor file descriptor" if fd.nil?
+    sendmsg("\0", 0, nil, [Socket::SOL_SOCKET, Socket::SCM_RIGHTS, [fd].pack("i")])
+    nil
+  end
+  # ...and the one received: klass.for_fd(fd[, mode]), the bare descriptor
+  # when klass is nil (unix_recv_io)
+  def recv_io(klass = IO, mode = nil)
+    # (:keep: the descriptors stay open and stay Integers)
+    _, _, _, *ctls = __recvmsg(1, 0, nil, :keep, false, true)
+    fds = nil
+    ctls.each do |c|
+      next unless c.level == Socket::SOL_SOCKET && c.type == Socket::SCM_RIGHTS
+      fds = c.data.unpack("i*")
+    end
+    raise SocketError, "file descriptor was not passed" if fds.nil? || fds.empty?
+    fd = fds[0]
+    return fd if klass.nil?
+    mode.nil? ? klass.for_fd(fd) : klass.for_fd(fd, mode)
   end
   # the path this end has: a server's own, else what getsockname(2) says
   def path
@@ -1089,29 +1211,41 @@ class Socket < BasicSocket
     end
     raise Errno::EISCONN, "connect(2) for #{ai.inspect_sockaddr}" if @__connected
     return __dgram_peer!(ai) if __dgram_bound?
-    if @bind_addr && @bind_addr.ip_port != 0
-      raise NotImplementedError, "connecting from a chosen local port is not implemented (bind(2) takes a sockaddr)"
+    # connect(2) on this descriptor (Mere v0.1.724's sock_connect): it keeps
+    # its family, its binding and its options. The socket is non-blocking,
+    # so a connection under way is waited for here and its outcome is
+    # SO_ERROR's.
+    r = Socket.__sock_connect(@__io_fd, ai.ip_address, ai.ip_port)
+    if r.is_a?(Integer) && r == -Errno::EINPROGRESS::Errno
+      # (the IO's timeout bounds the wait, rsock_connect's IO::TimeoutError)
+      if IO.select(nil, [self], nil, @__io_timeout).nil?
+        raise IO::TimeoutError, "Connect timed out!"
+      end
+      h = Socket.__getopt(@__io_fd, Socket::SOL_SOCKET, Socket::SO_ERROR)
+      r = h.is_a?(String) ? -[h].pack("H*").unpack1("i") : r
     end
-    fd = if @socktype == Socket::SOCK_DGRAM
-      Socket.__udp_open(ai.ip_address, ai.ip_port)
-    else
-      Socket.__connect(ai.ip_address, ai.ip_port)
-    end
-    raise Errno::ECONNREFUSED, "connect(2) for #{ai.inspect_sockaddr}" if fd < 0
-    __move_to(fd)
-    Socket::Endpoint__.check_local(self, @bind_addr.ip_address, 0) if @bind_addr
+    raise SystemCallError.new("connect(2) for #{ai.inspect_sockaddr}", -r) if r.is_a?(Integer) && r < 0
+    raise Errno::EAFNOSUPPORT, "connect(2) for #{ai.inspect_sockaddr}" if r.nil?
     @__connected = true unless @socktype == Socket::SOCK_DGRAM
     0
   end
   def connect_nonblock(addr, exception: true)
-    # (a stream connected already is EISCONN -- 0 without exceptions, as
-    #  rsock_connect_nonblock answers it: the runtime's connect makes a NEW
-    #  descriptor, and a second call silently replaced the first connection)
-    if @__connected
-      return 0 unless exception
-      raise Errno::EISCONN, "connect(2) for #{__sockaddr_ai(addr).inspect_sockaddr}"
+    __check_open
+    ai = __sockaddr_ai(addr)
+    return connect(addr) if ai.unix? || __dgram_bound?
+    r = Socket.__sock_connect(@__io_fd, ai.ip_address, ai.ip_port)
+    if r.is_a?(Integer) && r < 0
+      if r == -Errno::EINPROGRESS::Errno
+        return :wait_writable unless exception
+        raise IO::EINPROGRESSWaitWritable, "connect(2) would block"
+      end
+      # (connected already: 0 without exceptions, rsock_connect_nonblock)
+      return 0 if r == -Errno::EISCONN::Errno && !exception
+      raise SystemCallError.new("connect(2) for #{ai.inspect_sockaddr}", -r)
     end
-    connect(addr)
+    raise Errno::EAFNOSUPPORT, "connect(2) for #{ai.inspect_sockaddr}" if r.nil?
+    @__connected = true unless @socktype == Socket::SOCK_DGRAM
+    0
   end
   def accept
     __check_open
@@ -2128,8 +2262,37 @@ class Socket < BasicSocket
   # getifaddrs(3) needs the interfaces' names, flags and masks, which the
   # runtime does not give (Socket.__ip_addresses is the addresses alone):
   # ruby's own answer where the function is missing
+  # the deprecated hostent lookups (sock_s_gethostbyname / _gethostbyaddr):
+  # [name, aliases, family, *addresses as packed bytes]
+  def self.gethostbyname(name)
+    warn("Socket.gethostbyname is deprecated; use Addrinfo.getaddrinfo instead.", uplevel: 1, category: :deprecated)
+    host = name.is_a?(String) ? name : name.to_str
+    host = "255.255.255.255" if host == "<broadcast>"
+    host = "0.0.0.0" if host == "<any>"
+    ais = Addrinfo.getaddrinfo(host, nil, nil, :STREAM, nil, Socket::AI_CANONNAME)
+    fam = ais[0].afamily
+    addrs = ais.select { |a| a.afamily == fam }.map { |a| fam == Socket::AF_INET ? a.to_sockaddr.b[4, 4] : a.to_sockaddr.b[8, 16] }.uniq
+    [ais[0].canonname || host, [], fam, *addrs]
+  end
+  def self.gethostbyaddr(addr, family = nil)
+    warn("Socket.gethostbyaddr is deprecated; use Addrinfo#getnameinfo instead.", uplevel: 1, category: :deprecated)
+    raw = (addr.is_a?(String) ? addr : addr.to_str).b
+    fam = family.nil? ? (raw.bytesize == 16 ? Socket::AF_INET6 : Socket::AF_INET) : Constants.__family_arg(family)
+    need = fam == Socket::AF_INET6 ? 16 : (fam == Socket::AF_INET ? 4 : nil)
+    raise SocketError, "unknown address family: #{fam}" if need.nil?
+    raise SocketError, "host not found" unless raw.bytesize == need
+    ip = fam == Socket::AF_INET ? raw.unpack("C4").join(".") : Addrinfo.__ntop6(raw)
+    [Addrinfo.ip(ip).getnameinfo[0], [], fam, raw]
+  end
+
+  # getifaddrs(3) (Mere v0.1.724's sock_ifaddrs), an entry a Socket::Ifaddr
   def self.getifaddrs
-    raise NotImplementedError, "getifaddrs() function is unimplemented on this machine"
+    t = Socket.__ifaddrs
+    raise SystemCallError.new("getifaddrs", -t) if t.is_a?(Integer)
+    t.split("\n").map do |line|
+      name, idx, flags, *addrs = line.split("\t", -1)
+      Socket::Ifaddr.__new(name, idx.to_i, flags.to_i, *addrs.map { |a| Socket::Ifaddr.__addr(a, name, idx.to_i) })
+    end
   end
   def self.sockaddr_in(port, host)
     Addrinfo.__getaddrinfo(host, port, 0, 0, 0, 0, true)[0].to_sockaddr
@@ -2149,7 +2312,10 @@ class Socket < BasicSocket
   end
   # (a pair of Sockets, not UNIXSockets: the class asked)
   def self.socketpair(domain, type, protocol = 0, &b)
-    t = type.is_a?(Symbol) || type.is_a?(String) ? Socket.const_get("SOCK_" + type.to_s.sub(/\ASOCK_/, "")) : type
+    # (a domain and a type as ruby reads them: an unknown name is SocketError,
+    #  a #to_str that is no String TypeError)
+    Socket::Constants.__family_arg(domain)
+    t = Socket::Constants.__socktype_arg(type)
     kind = t == Socket::SOCK_DGRAM ? 2 : (t == Socket::SOCK_SEQPACKET ? 5 : (t == Socket::SOCK_STREAM ? 1 : 0))
     r = Socket.__sockpair(kind)
     raise SystemCallError.new("socketpair(2)", -r) if r.is_a?(Integer)
@@ -2814,8 +2980,19 @@ class Addrinfo
     raw = @sockaddr[8, 16]
     h = Addrinfo.__ntop6(raw)
     scope = @sockaddr[24, 4].unpack1("L")
-    h += "%" + scope.to_s if scope != 0
+    h += "%" + (Addrinfo.__ifname(scope) || scope.to_s) if scope != 0
     h
+  end
+  # the interface a scope id names, as getnameinfo(3) writes it (its
+  # if_indextoname), from the interface list; nil for an index none has
+  def self.__ifname(idx)
+    t = Socket.__ifaddrs
+    return nil unless t.is_a?(String)
+    t.each_line do |l|
+      n, i, = l.split("\t", 3)
+      return n if i.to_i == idx
+    end
+    nil
   end
   def getnameinfo(flags = 0)
     fl = Socket::Constants.__int(flags)
@@ -3291,6 +3468,87 @@ class Socket < BasicSocket
     end
   end
 
+  # an interface's entry (ext/socket/ifaddr.c): its name, index, IFF_* flags
+  # and the addresses, as Addrinfo or nil
+  class Ifaddr
+    attr_reader :name, :ifindex, :flags, :addr, :netmask
+    def self.__new(name, idx, flags, addr, netmask, broad, dst)
+      i = allocate
+      i.instance_variable_set(:@name, name)
+      i.instance_variable_set(:@ifindex, idx)
+      i.instance_variable_set(:@flags, flags)
+      i.instance_variable_set(:@addr, addr)
+      i.instance_variable_set(:@netmask, netmask)
+      i.instance_variable_set(:@broadaddr, broad)
+      i.instance_variable_set(:@dstaddr, dst)
+      i
+    end
+    def broadaddr = (@flags & Socket::IFF_BROADCAST) != 0 ? @broadaddr : nil
+    def dstaddr = (@flags & Socket::IFF_POINTOPOINT) != 0 ? @dstaddr : nil
+
+    # the runtime's address text as an Addrinfo: an IP address, or a
+    # link-layer one as the platform's sockaddr (sockaddr_dl on BSD,
+    # sockaddr_ll on Linux) -- nil for none
+    def self.__addr(t, name, ifindex)
+      return nil if t.nil? || t.empty?
+      fam, idx, rest = t.split(" ", 3)
+      if fam == "link"
+        hw = rest.to_s.split(":").map { |h| h.to_i(16) }
+        if RUBY_PLATFORM.include?("linux")
+          sa = [Socket::AF_PACKET, 0, idx.to_i, 0, 0, hw.size].pack("S n l S C C") + hw.pack("C*").ljust(8, "\0")
+        else
+          body = name.b + hw.pack("C*")
+          len = [8 + body.bytesize, 20].max
+          sa = ([len, Socket::AF_LINK, idx.to_i, 0, name.bytesize, hw.size, 0].pack("C C S C C C C") + body).ljust(len, "\0")
+        end
+        a = Addrinfo.new(sa)
+        a.instance_variable_set(:@__link, [name, hw])
+        return a
+      end
+      return nil unless fam == "inet" || fam == "inet6"
+      host, zone = rest.to_s.split("%", 2)
+      a = Socket::Endpoint__.addrinfo("#{fam} #{idx} #{host}", "getifaddrs", 0)
+      return a if zone.nil?
+      # a scoped (link-local) address: the zone is the entry's interface,
+      # sin6_scope_id at the same offset on both hosts
+      sa = a.to_sockaddr.b
+      sa[24, 4] = [ifindex].pack("L")
+      Addrinfo.new(sa, Socket::AF_INET6, 0, 0)
+    end
+
+    # ruby's ifaddr_inspect_flags order, then any bit it has no name for
+    FLAG_NAMES = %w[UP BROADCAST DEBUG LOOPBACK POINTOPOINT RUNNING NOARP PROMISC
+                    NOTRAILERS ALLMULTI MASTER SLAVE MULTICAST PORTSEL AUTOMEDIA
+                    DYNAMIC LOWER_UP DORMANT ECHO OACTIVE SIMPLEX LINK0 LINK1 LINK2
+                    ALTPHYS CANTCONFIG]
+    def self.__sockaddr_text(a)
+      if (l = a.instance_variable_get(:@__link))
+        hw = l[1].map { |b| format("%02x", b) }.join(":")
+        return RUBY_PLATFORM.include?("linux") ? "PACKET[#{l[0]}#{hw.empty? ? '' : ' hwaddr=' + hw}]" : "LINK[#{l[0]}#{hw.empty? ? '' : ' ' + hw}]"
+      end
+      a.inspect_sockaddr
+    end
+    def inspect
+      out = +"#<#{self.class} #{@name}"
+      f = @flags
+      names = []
+      FLAG_NAMES.each do |n|
+        next unless Socket.const_defined?("IFF_" + n)
+        bit = Socket.const_get("IFF_" + n)
+        next if bit == 0 || (f & bit) == 0
+        names << n
+        f &= ~bit
+      end
+      names << format("0x%x", f) if f != 0
+      out << " " << names.join(",") unless names.empty?
+      out << " " << Ifaddr.__sockaddr_text(@addr) if @addr
+      out << " netmask=" << Ifaddr.__sockaddr_text(@netmask) if @netmask
+      out << " broadcast=" << Ifaddr.__sockaddr_text(broadaddr) if broadaddr
+      out << " dstaddr=" << Ifaddr.__sockaddr_text(dstaddr) if dstaddr
+      out << ">"
+    end
+  end
+
   class AncillaryData
     def initialize(family, level, type, data)
       @family = Constants.__family_arg(family)
@@ -3386,9 +3644,43 @@ class Socket < BasicSocket
     def ipv6_pktinfo_ifindex
       __ipv6_pktinfo[1]
     end
+    # SCM_TIMESTAMP's struct timeval (a long and a suseconds_t: 4 bytes and
+    # padding on macOS, 8 on Linux) as a Time
+    def timestamp
+      unless @level == Socket::SOL_SOCKET && @type == Socket::SCM_TIMESTAMP
+        raise TypeError, "SCM_TIMESTAMP ancillary data expected"
+      end
+      sec, usec = @data.unpack(RUBY_PLATFORM.include?("linux") ? "q q" : "q l")
+      Time.at(sec, usec)
+    end
+    # (anc_inspect: the level and the type by name where they have one, the
+    #  descriptors of SCM_RIGHTS, the time of SCM_TIMESTAMP)
+    LEVEL_NAMES__ = { "SOL_SOCKET" => "SOCKET", "IPPROTO_IP" => "IP", "IPPROTO_IPV6" => "IPV6",
+                      "IPPROTO_TCP" => "TCP", "IPPROTO_UDP" => "UDP" }
+    def __level_name
+      LEVEL_NAMES__.each { |c, n| return n if Socket.const_defined?(c) && Socket.const_get(c) == @level }
+      nil
+    end
+    def __type_name(lname)
+      pre = { "SOCKET" => "SCM_", "IP" => "IP_", "IPV6" => "IPV6_", "TCP" => "TCP_", "UDP" => "UDP_" }[lname]
+      return nil unless pre
+      c = Socket.constants.map(&:to_s).find { |k| k.start_with?(pre) && Socket.const_get(k) == @type }
+      c && c.delete_prefix(pre)
+    end
     def inspect
       fid = Constants.__intern(@family, /\AAF_/, /\AAF_/)
-      "#<#{self.class}: #{fid || "family:#{@family}"} #{@level} #{@type} #{@data.inspect}>"
+      lname = __level_name
+      tname = lname && __type_name(lname)
+      out = "#<#{self.class}: #{fid || "family:#{@family}"} #{lname || "level:#{@level}"} #{tname || "type:#{@type}"}"
+      if lname == "SOCKET" && tname == "RIGHTS" && @data.bytesize % 4 == 0
+        out << " " << @data.unpack("i*").join(" ")
+      elsif lname == "SOCKET" && tname == "TIMESTAMP" && @data.bytesize >= 12
+        t = timestamp
+        out << " " << t.strftime("%Y-%m-%d %H:%M:%S") << format(".%06d", t.usec)
+      else
+        out << " " << @data.inspect
+      end
+      out << ">"
     end
   end
 end
