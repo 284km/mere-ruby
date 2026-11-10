@@ -32,7 +32,7 @@ dropped, every platform-guarded Process file. 335 files moved from MATCH to SKIP
 so MATCH 2722 before it and 2410 on it are not the same question either.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 64 | 2 | 0 | 0 | 0 | 66 |
+| language | 65 | 1 | 0 | 0 | 0 | 66 |
 | core/string | 114 | 0 | 0 | 0 | 0 | 114 |
 | core/array | 101 | 0 | 0 | 1 | 0 | 102 |
 | core/hash | 69 | 0 | 0 | 0 | 0 | 69 |
@@ -73,7 +73,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/encoding | 14 | 0 | 0 | 3 | 0 | 17 |
 | core/enumerator | 22 | 0 | 0 | 0 | 0 | 22 |
 | core/random | 10 | 0 | 0 | 0 | 0 | 10 |
-| core/signal | 2 | 1 | 0 | 0 | 0 | 3 |
+| core/signal | 3 | 0 | 0 | 0 | 0 | 3 |
 | core/objectspace | 6 | 0 | 0 | 1 | 0 | 7 |
 | core/main | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/gc | 9 | 1 | 0 | 0 | 0 | 10 |
@@ -84,11 +84,11 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/builtin_constants | 1 | 0 | 0 | 0 | 0 | 1 |
 | core/fiber | 11 | 0 | 0 | 0 | 0 | 11 |
 | core/dir | 32 | 0 | 0 | 1 | 0 | 33 |
-| core/file | 65 | 2 | 0 | 1 | 0 | 68 |
+| core/file | 67 | 0 | 0 | 1 | 0 | 68 |
 | core/time | 63 | 1 | 0 | 2 | 0 | 66 |
 | core/io | 78 | 1 | 0 | 1 | 0 | 80 |
 | library/date | 56 | 0 | 0 | 42 | 0 | 98 |
-| library/etc | 15 | 0 | 0 | 4 | 0 | 19 |
+| library/etc | 14 | 0 | 0 | 4 | 1 | 19 |
 | library/pathname | 19 | 0 | 0 | 0 | 0 | 19 |
 | library/stringio | 63 | 0 | 0 | 1 | 0 | 64 |
 | library/cgi | 7 | 0 | 0 | 7 | 0 | 14 |
@@ -99,7 +99,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | library/monitor | 6 | 0 | 0 | 0 | 0 | 6 |
 | library/securerandom | 5 | 0 | 0 | 0 | 0 | 5 |
 | library/time | 6 | 0 | 0 | 0 | 0 | 6 |
-| library/expect | 0 | 0 | 1 | 0 | 0 | 1 |
+| library/expect | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/base64 | 6 | 0 | 0 | 0 | 0 | 6 |
 | library/shellwords | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/observer | 5 | 0 | 0 | 0 | 0 | 5 |
