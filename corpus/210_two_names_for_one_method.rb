@@ -54,4 +54,13 @@ p Thread.method(:fork) == Thread.method(:start)
 p [Marshal.method(:load).owner, Thread.method(:start).owner]
 
 d = Dir.new(".")
-p [d.pos, d.read.class, d.pos, (d.pos = 0), d.rewind.class]
+# telldir cookies are opaque (for example, filesystem hash cookies on Linux).
+p [d.pos, d.read.class, d.pos.is_a?(Integer) && d.pos != 0, (d.pos = 0), d.rewind.class]
+first = d.read
+position = d.pos
+following = d.read
+d.seek(position)
+p d.read == following
+d.rewind
+p d.read == first
+d.close

@@ -57,7 +57,7 @@ rescue Errno::EMFILE => e
   p e.class
 end
 p((Dir.glob(File.join(__dir__, "*")) rescue $!.message.sub(__dir__, "DIR")))
-p Dir.glob(File.join(__dir__, "no_such_dir", "*"))
+p((Dir.glob(File.join(__dir__, "no_such_dir", "*")) rescue $!.class))
 files.each(&:close)
 Process.setrlimit(:NOFILE, soft, hard)
 p Dir.glob(File.join(__dir__, "465_*")).size

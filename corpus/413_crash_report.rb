@@ -5,10 +5,12 @@
 require "rbconfig"
 require "tmpdir"
 ruby = RbConfig.ruby
+# Kernel core images contain process-specific bytes and are not crash reports.
+Process.setrlimit(:CORE, 0)
 
 out = IO.popen([ruby, "-e", "Process.kill :SEGV, $$"], err: [:child, :out], &:read)
 st = $?
-puts out.lines[0]
+puts out.lines[0].sub(/ at 0x[0-9a-f]+/, ' at <address>')
 p out.lines[1] == RUBY_DESCRIPTION + "\n"
 p out.include?("\n-- Control frame information ---")
 puts out[/-- Ruby level backtrace information -+\n(.*?)\n\n/m, 1]
@@ -26,9 +28,10 @@ Dir.mktmpdir do |d|
   File.write(File.join(d, "bug.rb"), "Process.kill :SEGV, $$\n")
   pid = spawn({ "RUBY_CRASH_REPORT" => "%e.%f.%p.log" }, ruby, "bug.rb", chdir: d, err: File::NULL)
   Process.wait(pid)
-  files = Dir.children(d).sort - ["bug.rb"]
-  p files == ["#{File.basename(ruby)}.bug.rb.#{pid}.log"]
-  puts File.read(File.join(d, files[0])).lines[0] unless files.empty?
+  files = Dir.children(d).grep(/\.log\z/).sort
+  expected = ["#{File.basename(ruby)}.bug.rb.#{pid}.log"]
+  p files == expected
+  puts File.read(File.join(d, files[0])).lines[0].sub(/ at 0x[0-9a-f]+/, ' at <address>') unless files.empty?
 end
 
 # trapping one of them is refused
