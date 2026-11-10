@@ -49,11 +49,12 @@ def run(name, command, env=None):
     assert result['exit'] == 0 and result['limit'] is None, (name, result, log.read_text()[-2000:])
     print(name, 'passed', flush=True)
 
+# Resolve a relative OPENSSL_PREFIX before archive extraction changes cwd.
+openssl_cflags, openssl_ldflags = openssl_flags()
 os.chdir(objects)
 run('extract-prism', ['ar', 'x', prism])
 prism_objects = sorted(objects.glob('*.o'))
 assert prism_objects, 'Prism archive contained no object files'
-openssl_cflags, openssl_ldflags = openssl_flags()
 glue = [ROOT / 'tools' / (name + '.c') for name in ['prism_glue', 'socket_glue', 'process_glue', 'openssl_glue']]
 for source in glue:
     target = objects / (source.stem + '.o')
