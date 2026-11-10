@@ -18,7 +18,7 @@ root=$(cd "$here/.." && pwd)
 nt=$(sh "$root/tools/nothreads_tree.sh")
 trap 'rm -rf "$nt"' EXIT
 "${MERE:-mere}" -w "$nt/main.mere" > "$here/mere-ruby.wat"
-wat2wasm --enable-tail-call "$here/mere-ruby.wat" -o "$here/mere-ruby.wasm"
+wat2wasm --enable-tail-call --debug-names "$here/mere-ruby.wat" -o "$here/mere-ruby.wasm"
 rm -f "$here/mere-ruby.wat"
 echo "built $here/mere-ruby.wasm ($(wc -c < "$here/mere-ruby.wasm" | tr -d ' ') bytes)"
 
@@ -27,14 +27,7 @@ echo "built $here/mere-ruby.wasm ($(wc -c < "$here/mere-ruby.wasm" | tr -d ' ') 
 # broke the last two times. Ask the module what it wants, and ask the page for it.
 # (v0.1.277 added __lang_float_of_str_ok this way: validity comes back separately
 # from the value, because the host answers NaN for both "nan" and "not a float".)
-missing=""
-for name in $(wasm-objdump -x "$here/mere-ruby.wasm" \
-              | sed -n '/^Import\[/,/^Function\[/p' \
-              | sed -n 's/.*<- env\.//p'); do
-  grep -q "$name" "$here/index.html" || missing="$missing $name"
-done
-[ -z "$missing" ] || { echo "index.html has no stub for:$missing"; exit 1; }
-echo "every import has a stub in index.html"
+node "$here/smoke.mjs" --check-imports
 
 # ... and the page has to AGREE with the native build, not merely run. smoke.mjs
 # drives this .wasm with index.html's own host code; a bigger JS stack than
@@ -63,3 +56,4 @@ RUBY
 else
   echo "skipping the comparison: it needs ../mere-ruby and node"
 fi
+python3 "$root/unittest/openssl_wasm_check.py"

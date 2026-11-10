@@ -43,14 +43,24 @@ const wasm = process.env.SMOKE_WASM ?? new URL("mere-ruby.wasm", here);
 const host = mod.makeInstance();
 const { instance } = await WebAssembly.instantiate(readFileSync(wasm), { env: host.env });
 host.bind(instance);
+if (process.argv[2] === '--check-imports') {
+  console.log('every import instantiates with index.html\'s actual host');
+  process.exit(0);
+}
 // `exit(status)` lowers to `unreachable` on this backend, so a NORMAL program
 // ends in a trap once its output is flushed -- the page treats a trap that
 // produced output as success, and so does this.
 let trapped = false;
-try { instance.exports.main(); } catch (e) { trapped = true; }
+let trapError;
+try { instance.exports.main(); } catch (e) {
+  trapped = true;
+  trapError = e;
+  if (process.env.SMOKE_DEBUG) console.error(e);
+}
 const out = host.getOut();
 process.stdout.write(out);
 if (out === "") {
+  if (trapError && !process.env.SMOKE_DEBUG) console.error(trapError);
   console.error("smoke: no output" + (trapped ? " (trapped before printing anything)" : ""));
   process.exit(1);
 }
