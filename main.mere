@@ -1700,6 +1700,21 @@ let gc_collect = fn env -> fn world ->
             let _ = (if fd_close fd9 == 0 then fd_forget fd9 else ()) in
             close_fds (i + 1)) in
     let _ = close_fds 0 in
+    // Native destructors cannot call Ruby or access Mere regions. Collect
+    // weak ownership entries first; releasing one may free other C resources.
+    let dSSL = vec_new () in
+    let _ = map_iter openssl_owned (fn (owner: int) -> fn (handle: int) ->
+      if gc_live_has live ((owner + handle_base) * 8) then () else vec_push dSSL owner) in
+    let rec release_ssl = fn (i: int) ->
+      if i >= vec_len dSSL then () else
+      (let owner = vec_get dSSL i in
+       let handle = map_get openssl_owned owner in
+       let _ = mr_ossl_release handle in
+       let _ = map_delete openssl_owner handle in
+       let _ = map_delete openssl_owned owner in release_ssl (i + 1)) in
+    let _ = release_ssl 0 in
+    let _ = (if nc then () else map_compact openssl_owned) in
+    let _ = (if nc then () else map_compact openssl_owner) in
     let _ = gc_drop_s ivars dIV in
     let _ = (if nc then () else map_compact ivars) in
     // every key here IS an object id now -- the one non-numeric entry ("$next")
@@ -2108,6 +2123,8 @@ let fb_reclaim = fn env -> fn world ->
   };
 
 import "m_openssl_cipher.mere";
+import "m_openssl_lib.mere";
+import "m_ipaddr_lib.mere";
 import "m_zlib_lib.mere";
 import "m_psych_lib.mere";
 import "m_eval_leaf.mere";
@@ -21471,6 +21488,55 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // `require "prism/prism"` answers). Each answer is the parser's serialized
     // form, which Prism's own Ruby library reads. Only names starting with
     // __prism_ are answered, as for Syslog above.
+    else if str_eq c "OpenSSL" && str_eq name "__native_available" then
+      VBool (try_or_msg (fn (u: unit) -> mr_ossl_available () == 1) (fn (m: str) -> false))
+    else if str_eq c "OpenSSL" && str_eq name "__native_bind" then
+      (match args with
+       | Cons (VObj owner, Cons (VInt handle, Nil)) ->
+         let owner = owner - handle_base in
+         if handle <= 0 || handle > 2147483647 || mr_ossl_valid handle != 1 then
+           raise_exc world "TypeError" "invalid native OpenSSL handle"
+         else if map_has openssl_owned owner || map_has openssl_owner handle then
+           raise_exc world "TypeError" "native OpenSSL object already has an owner"
+         else (let _ = map_set openssl_owned owner handle in
+               let _ = map_set openssl_owner handle owner in VNil)
+       | _ -> raise_exc world "TypeError" "invalid native OpenSSL owner")
+    else if str_eq c "OpenSSL" && str_eq name "__native_handle" then
+      (match args with
+       | Cons (VObj owner, Nil) ->
+         let owner = owner - handle_base in
+         if map_has openssl_owned owner && mr_ossl_valid (map_get openssl_owned owner) == 1 then VInt (map_get openssl_owned owner)
+         else raise_exc world "TypeError" "native OpenSSL object wasn't initialized"
+       | _ -> raise_exc world "TypeError" "invalid native OpenSSL owner")
+    else if str_eq c "OpenSSL" && str_eq name "__native_move" then
+      (match args with
+       | Cons (VObj source, Cons (VObj target, Nil)) ->
+         let source = source - handle_base in
+         let target = target - handle_base in
+         if source == target then VNil
+         else if map_has openssl_owned source && (if map_has openssl_owned target then false else true) then
+           (let handle = map_get openssl_owned source in
+            let _ = map_delete openssl_owned source in
+            let _ = map_set openssl_owned target handle in
+            let _ = map_set openssl_owner handle target in VNil)
+         else raise_exc world "TypeError" "invalid native OpenSSL ownership transfer"
+       | _ -> raise_exc world "TypeError" "invalid native OpenSSL owner")
+    else if str_eq c "OpenSSL" && str_eq name "__native_release" then
+      (match args with
+       | Cons (VObj owner, Nil) ->
+         let owner = owner - handle_base in
+         if map_has openssl_owned owner then
+           (let handle = map_get openssl_owned owner in
+            let _ = map_delete openssl_owned owner in
+            let _ = map_delete openssl_owner handle in VBool (mr_ossl_release handle == 1))
+         else VBool false
+       | _ -> raise_exc world "TypeError" "invalid native OpenSSL owner")
+    else if str_eq c "OpenSSL" && str_eq name "__native_call" then
+      (match args with
+       | Cons (VStr operation, Cons (VStr payload, Nil)) ->
+         (let reply = str_of_bytes (mr_ossl_call (sget operation) (bytes_of_str (sget payload))) in
+          let _ = mr_ossl_clear_result () in mkstr_e reply "ASCII-8BIT")
+       | _ -> raise_exc world "ArgumentError" "invalid OpenSSL provider arguments")
     else if str_eq c "Prism" && str_len name > 8 && str_eq (substring name 0 8) "__prism_"
             && (str_eq name "__prism_ser" || str_eq name "__prism_ok" || str_eq name "__prism_more"
                 || str_eq name "__prism_query" || str_eq name "__prism_version") then
@@ -49259,7 +49325,7 @@ and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) ->
           let _ = map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run") in
           // where it was made, which #inspect shows
           let _ = map_set iv3 (str_of_int tid ++ "@__tloc") (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()))) in
-          let _ = map_set all_thr (str_of_int (map_len all_thr)) (VObj tid) in
+          let _ = map_set all_thr (str_of_int tid) (VObj tid) in
           let savedcur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
           let savedthr = (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) in
           let _ = map_set cur_thr "v" (VObj tid) in
@@ -49346,6 +49412,9 @@ and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) ->
                let _ = map_set iv3 (str_of_int tid ++ "@__tval")
                          (if map_has iv3 (str_of_int tid ++ "@__tkill") then VNil else flow_value other) in
                map_set iv3 (str_of_int tid ++ "@__tst") (VBool false)) in
+          let _ = (match (if map_has iv3 (str_of_int tid ++ "@__tst") then map_get iv3 (str_of_int tid ++ "@__tst") else VNil) with
+                   | VStr _ -> ()
+                   | _ -> map_delete all_thr (str_of_int tid)) in
           VObj tid)
 // ---- the scheduler, the evaluator's half --------------------------------------
 // m_sched.mere keeps the tables and says what the rules are; this half starts
@@ -49620,7 +49689,7 @@ and thread_start_sch = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list
   let k = str_of_int tid in
   let _ = map_set iv3 (k ++ "@__tst") (mkstr "run") in
   let _ = map_set iv3 (k ++ "@__tloc") (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()))) in
-  let _ = map_set all_thr (str_of_int (map_len all_thr)) (VObj tid) in
+  let _ = map_set all_thr k (VObj tid) in
   let _ = (let (_, _, _, tcenv) = newblk in mark_captured tcenv) in
   let pid = (proc_next ()) in
   let _ = store_proc (str_of_int pid) newblk in
@@ -49731,6 +49800,10 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
                  if sch_waiting m then sch_unpark m else ())
            else ()) in
   let _ = (if map_has iv3 (k ++ "@__targs") then map_delete iv3 (k ++ "@__targs") else ()) in
+  // A finished thread keeps its result/exception, but no longer needs the
+  // startup Proc. Keeping it retained the entire captured scope even when
+  // callers only needed the completed Thread's result or exception.
+  let _ = (if map_has iv3 (k ++ "@__tblk") then map_delete iv3 (k ++ "@__tblk") else ()) in
   // (a thread that FORKED is its child's main thread -- sch_forget_others --
   //  and when it ends, the program ends: there is no other thread to hand
   //  over to. `Thread.start { unless IO.popen("-"); exit; end }` died in the
@@ -49764,6 +49837,10 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
   let _ = map_delete sch_ending tid in
   let _ = thread_release world tid in
   let _ = map_delete sch_live tid in
+  // Only live threads belong to the registry. A caller holding a finished
+  // Thread still reaches its result normally; the registry must not keep
+  // every completed thread and every object it returned alive forever.
+  let _ = map_delete all_thr k in
   let _ = map_set fb_state r 3 in
   let _ = fb_live_add (0 - 1) in
   let _ = sch_wake_all 8 tid in

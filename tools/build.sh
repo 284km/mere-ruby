@@ -79,7 +79,10 @@ fi
 #   -lm               Linux needs it spelled out
 case "$(uname -s)" in
   Darwin) plat="-Wl,-stack_size,0x20000000 -fbracket-depth=1024" ;;
-  *)      plat="-fbracket-depth=1024 -lm" ;;
+  *)      plat="-fbracket-depth=1024 -lm"
+          # Clang's parser also uses the process stack for the emitted C.
+          # Match the interpreter's stack budget during compilation itself.
+          ulimit -s 524288 || exit 2 ;;
 esac
 
 if [ "$emit" = 1 ]; then
@@ -113,12 +116,28 @@ if [ "$pneed" = 1 ]; then
   ar rcs "$plib" "$pobj"/*.o || { rm -rf "$pobj"; exit 1; }
 fi
 
-printf 'cc     clang %s %s mr.c tools/prism_glue.c tools/socket_glue.c tools/process_glue.c libprism.a -o mere-ruby\n' "$opt" "$plat"
+# Native key, certificate and TLS operations use OpenSSL 3. Its provider
+# owns cryptographic objects; no host Ruby interpreter or CLI is involved.
+ossl_prefix="${OPENSSL_PREFIX:-}"
+if [ -z "$ossl_prefix" ] && [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null 2>&1; then
+  ossl_prefix="$(brew --prefix openssl@3 2>/dev/null)" || exit 2
+fi
+if [ -n "$ossl_prefix" ]; then
+  [ -f "$ossl_prefix/include/openssl/ssl.h" ] || { echo 'build.sh: OPENSSL_PREFIX has no OpenSSL headers' >&2; exit 2; }
+  set -- "-I$ossl_prefix/include" "-L$ossl_prefix/lib" "-Wl,-rpath,$ossl_prefix/lib" -lssl -lcrypto
+elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists 'openssl >= 3.0'; then
+  # pkg-config emits compiler arguments for the selected provider.
+  # shellcheck disable=SC2046
+  set -- $(pkg-config --cflags --libs openssl)
+else
+  set -- -lssl -lcrypto
+fi
+printf 'cc     clang %s %s mr.c tools/*_glue.c libprism.a with OpenSSL -> mere-ruby\n' "$opt" "$plat"
 # ⚠ NEVER `cp` OVER A RUNNING BINARY -- the text pages of a process that is
 # mid-run are backed by that file, and overwriting them SIGKILLs it or, worse,
 # gives it another build's instructions. Build beside it and rename.
 # shellcheck disable=SC2086
-clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/process_glue.c" -pthread "$plib" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
+clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
 
 # ...and say which build this is, where something that must not be misled can
