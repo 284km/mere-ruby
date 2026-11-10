@@ -34,10 +34,67 @@ static void handled(const char *source, const char *klass) {
  check("raise 'must not execute'",2,klass);
  if(simple(mere_embedding_clear_error)) exit(93);
 }
+/* Native provider storage outlives Mere regions. Inspect its existing ABI
+ * directly, including while no VM exists, rather than relying on Ruby GC. */
+struct mere_bytes { long long len; unsigned char data[]; };
+extern struct mere_bytes *mr_ossl_call(const char *, struct mere_bytes *);
+extern int mr_ossl_clear_result(void);
+extern int mr_ossl_valid(int);
+extern int mr_ossl_release(int);
+static unsigned long wire_u32(const unsigned char *p) {
+ return ((unsigned long)p[0]<<24)|((unsigned long)p[1]<<16)|((unsigned long)p[2]<<8)|p[3];
+}
+static struct mere_bytes *native_empty(const char *operation, int nil_arg) {
+ struct mere_bytes *input=malloc(sizeof(*input)+6);
+ if(!input) exit(50);
+ input->len=nil_arg?6:5;
+ const unsigned char payload[6]={'a',0,0,0,0,'n'};
+ memcpy(input->data,payload,(size_t)input->len); input->data[4]=(unsigned char)nil_arg;
+ struct mere_bytes *result=mr_ossl_call(operation,input); free(input); return result;
+}
+static long long native_live(void) {
+ struct mere_bytes *r=native_empty("object.stats",0);
+ if(!r || r->len<10 || r->data[0]!='a' || wire_u32(r->data+1)!=3 || r->data[5]!='i') exit(50);
+ unsigned long n=wire_u32(r->data+6); char text[32],*end=NULL;
+ if(n==0 || n>=sizeof(text) || (unsigned long long)r->len<10+n) exit(50);
+ memcpy(text,r->data+10,n); text[n]=0;
+ long long count=strtoll(text,&end,10); if(*end || count<0) exit(50);
+ mr_ossl_clear_result(); return count;
+}
+static int native_lifetimes(const char *mode) {
+ long long initial=native_live();
+ struct mere_bytes *outside=native_empty("xcert.new",1);
+ if(!outside || outside->len<5 || outside->data[0]!='h') return 50;
+ int sentinel=(int)wire_u32(outside->data+1); mr_ossl_clear_result();
+ long long baseline=native_live();
+ if(baseline!=initial+1 || !mr_ossl_valid(sentinel)) return 50;
+ for(int cycle=0;cycle<3;cycle++) {
+  mere_lib_init(); if(simple(mere_embedding_setup)) return 51;
+  check("require 'openssl'; $held_ssl = Array.new(32) { OpenSSL::X509::Certificate.new }; GC.start",0,"");
+  check("$ssl_ready=Queue.new; $ssl_worker=Thread.new { begin; $thread_ssl=OpenSSL::X509::Certificate.new; $ssl_ready << true; sleep; ensure; raise 'native owner lost before thread teardown' unless $thread_ssl.version==0; $thread_end_ssl=OpenSSL::X509::Certificate.new; end }; $ssl_ready.pop",0,"");
+  check("at_exit { raise 'native owner lost before hooks' unless $held_ssl.all? { |cert| cert.version==0 }; $hook_ssl=OpenSSL::X509::Certificate.new }",0,"");
+  int expected=0;
+  if(!strcmp(mode,"native-ownership-error")) { check("raise 'pending_native'",1,"RuntimeError"); expected=1; }
+  if(!strcmp(mode,"native-ownership-hook-error")) { check("at_exit { $error_ssl=OpenSSL::X509::Certificate.new; raise 'native_hook' }",0,""); expected=1; }
+  if(!strcmp(mode,"native-ownership-exit")) { check("at_exit { $exit_ssl=OpenSSL::X509::Certificate.new; exit 7 }",0,""); expected=7; }
+  if(!strcmp(mode,"native-ownership-failure")) expected=1;
+  long long status=simple(mere_embedding_cleanup);
+  if(status!=expected || simple(mere_embedding_cleanup)!=expected) return 51;
+  long long live=native_live();
+  if(live!=baseline || !mr_ossl_valid(sentinel)) {
+   fprintf(stderr,"native live after cleanup cycle %d: %lld baseline:%lld\n",cycle,live,baseline); return 52;
+  }
+  mere_lib_shutdown();
+  if(native_live()!=baseline || !mr_ossl_valid(sentinel)) return 53;
+ }
+ if(mr_ossl_release(sentinel)!=1 || native_live()!=initial) return 54;
+ puts("native_ownership_cleanup_passed"); return 0;
+}
 static void host_signal(int sig) { (void)sig; }
 int main(int argc,char **argv) {
  setvbuf(stdout,NULL,_IOLBF,0);
  struct sigaction action={0}, observed={0}; action.sa_handler=host_signal; sigemptyset(&action.sa_mask); sigaction(SIGPIPE,&action,NULL);
+ if(argc>1 && !strncmp(argv[1],"native-ownership",16)) return native_lifetimes(argv[1]);
  mere_lib_init();
  check("puts 'must_not_run'",2,"");
  if(argc>1 && !strcmp(argv[1],"setup-failure")) {
