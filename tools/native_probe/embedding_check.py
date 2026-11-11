@@ -111,6 +111,16 @@ archive = output / 'libmere_embedding_probe.a'
 run('archive', ['ar', 'rcs', archive, output / 'embedding.o'])
 run('link', flags + ['-I', output, FIXTURES / 'embedding_host.c', archive,
     ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', ROOT / 'tools/math_glue.c', ROOT / 'tools/process_glue.c', ROOT / 'tools/openssl_glue.c', ROOT / 'tools/nkf_glue.c', prism, '-pthread', *link_flags, *openssl_ldflags, '-o', output / 'host'])
+if not args.setup_failure and not args.cleanup_failure:
+    # Reuse the exact interpreter object. Fault injection exists only in this
+    # separate NKF object/host, never in the distributed native archive.
+    nkf_test_object = output / 'nkf-test.o'
+    run('nkf-fault-compile', ['clang', '-O2', '-DMR_NKF_TEST', '-c', ROOT / 'tools/nkf_glue.c', '-o', nkf_test_object])
+    run('nkf-fault-link', flags + ['-DMR_NKF_TEST', '-I', output, FIXTURES / 'embedding_host.c', archive,
+        ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', ROOT / 'tools/math_glue.c',
+        ROOT / 'tools/process_glue.c', ROOT / 'tools/openssl_glue.c', nkf_test_object, prism,
+        '-pthread', *link_flags, *openssl_ldflags, '-o', output / 'nkf-fault-host'])
+    assert run('nkf-faults', [output / 'nkf-fault-host', 'nkf-faults']) == 'native_nkf_allocation_exception_recovery_passed\n'
 expected = {
     'lifecycle': 'between_evals\nstate_preserved\nbefore_cleanup\nend_hook\nnested_hook\ncleanup_hook\nhost_survived\n',
     'cleanup-error': 'before_cleanup\nfirst_hook\nlast_hook\nhost_survived\n',

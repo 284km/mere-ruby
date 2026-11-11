@@ -96,10 +96,38 @@ static int native_lifetimes(const char *mode) {
  if(mr_ossl_release(sentinel)!=1 || native_live()!=initial) return 54;
  puts("native_ownership_cleanup_passed"); return 0;
 }
+#ifdef MR_NKF_TEST
+extern void mr_nkf_test_fail_after(long long);
+extern long long mr_nkf_cleanup(void);
+static int nkf_fault_lifetimes(void) {
+ mere_lib_init(); if(simple(mere_embedding_setup)) return 60;
+ check("require 'nkf'",0,"");
+ int failures=0;
+ for(int at=0;at<40;at++) {
+  mr_nkf_cleanup(); mr_nkf_test_fail_after(at);
+  /* The real Ruby rescue must catch NoMemoryError, including failures while
+   * initializing the engine, growing output, or copying encoding names. */
+  check("$nkf_oom=false; begin; r=NKF.nkf('-w -MB', 'A'*2000); raise 'bad MIME result' if r.empty? || r.encoding!=Encoding::US_ASCII; rescue NoMemoryError; $nkf_oom=true; end",0,"");
+  mr_nkf_test_fail_after(-1);
+  if(mr_nkf_owned_allocations()==0) { failures++; check("raise 'OOM not rescued' unless $nkf_oom",0,""); }
+  else check("raise 'false OOM result' if $nkf_oom",0,"");
+  check("raise 'NKF recovery changed' unless NKF.nkf('-w', 'abc')=='abc'",0,"");
+  mr_nkf_cleanup();
+  if(mr_nkf_owned_allocations()!=0 || mr_nkf_result()!=NULL) return 61;
+ }
+ if(failures<8 || simple(mere_embedding_cleanup)) return 62;
+ mere_lib_shutdown();
+ if(mr_nkf_owned_allocations()!=0 || mr_nkf_result()!=NULL) return 63;
+ puts("native_nkf_allocation_exception_recovery_passed"); return 0;
+}
+#endif
 static void host_signal(int sig) { (void)sig; }
 int main(int argc,char **argv) {
  setvbuf(stdout,NULL,_IOLBF,0);
  struct sigaction action={0}, observed={0}; action.sa_handler=host_signal; sigemptyset(&action.sa_mask); sigaction(SIGPIPE,&action,NULL);
+#ifdef MR_NKF_TEST
+ if(argc>1 && !strcmp(argv[1],"nkf-faults")) return nkf_fault_lifetimes();
+#endif
  if(argc>1 && !strncmp(argv[1],"native-ownership",16)) return native_lifetimes(argv[1]);
  mere_lib_init();
  check("puts 'must_not_run'",2,"");
