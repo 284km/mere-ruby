@@ -3640,3 +3640,39 @@ Round 18 of note 543 (stage 4, memory and time).
   on the final build: test_udp bind / connect / send 4.0 / 4.0 / 2.2 s,
   gunzip 5.6 s, pow 11.1 s (passes; its own limit), blocking_backtrace,
   yaml store binary, WeakKeyMap clear, syntax invalid_symbol -- MATCH.
+
+## 2026-11-11 (35): stage 4, round 19 -- the captured-frame threshold grows with the heap, and IO's poll answer has a region of its own
+
+Round 19 of note 543 (case_comprehensive inside CI's limits).
+
+- **ruby/enc/test_case_comprehensive collected 14 times a second.** Main's
+  CI on round 18 (92d97333) was green with MEMORY_LIMIT at 0 (test_thread,
+  test_http and test_trick back: MATCH 30,266 -> 30,472), and this file was
+  the one WALL_LIMIT left. A third of its run was the collector (sample:
+  gc_collect 1,177 of 3,244), and a log of why each collection was asked for
+  (MERE_RUBY_GC_LOG plus the three axes, in a scratch build) said it was the
+  captured frames: lv_cap at 2,048, the floor its threshold went back to
+  after every collection. The file captures a frame per call while it holds
+  a 120 MB Unicode table, so every 2,048 captures (8 MB) marked all of it --
+  1,721 collections in its first 120 s. The floor is now the larger of 2,048
+  and half the live stores' bytes at 4 KB a frame (gc_store_bytes / 8192):
+  the same 2,048 for a small heap, about 15,000 for this one.
+  442 -> 307 s locally, 422/422; the peak 702 -> 1,211 MB (2 GiB is the
+  limit; round 18's other changes had taken it down from 1.9 GB).
+- **io_poll_once's answer map was made in the default region** at every
+  IO.select and every idle wait with a descriptor: 115 MB over test_http
+  once the idle wait had its own region (round 18). It is in one now: the
+  default region ends at 84 MB there (199 MB).
+- **Checked** on Mere v0.1.729: corpus 598/598 with the hash index on and
+  off (LANG set); loop_rss_check 8/8; the five gates; the embedding check and
+  its stress; encoding_search; prism_query_boundary. unittest on round 18's
+  list plus test_io: MATCH 9,957 -- against round 18's 9,958 the difference
+  is test_array's shared_marking for the subclass too (it omits itself past
+  5 s: 12 - 16 s on every build here) and settracefunc's
+  thread_end_with_exception, F once under load and MATCH three times alone
+  on round 18's binary and on this one. snippets_test 504 MB in 285 s.
+- **CI on round 18, the files that moved down by one**: test_integer's
+  test_pow and test_object's copied_ivar_memory_leak timed out (60 s on CI;
+  `a.clone.set` is 6.4 - 6.9 s per 100,000 on every build from round 17 on,
+  so 500,000 is about 33 s locally and at the edge there), and test_method
+  has one test EXTRA (the reference failed it). None is this round's.
