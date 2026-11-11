@@ -958,7 +958,14 @@ let gc_live_count = fn live ->
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
   | VObj id -> let k = id * 8 in
-               (if gc_live_mark live k then (let _ = (if map_has obj_cls id then gc_class_mark (map_get obj_cls id) else ()) in vec_push gc_obj_pend id) else ())
+               (if gc_live_mark live k then
+                  (let _ = (if map_has obj_cls id then gc_class_mark (map_get obj_cls id) else ()) in
+                   let _ = (if map_has method_cores id then
+                     (let (name, owner, receiver, extra) = map_get method_cores id in
+                      let _ = gc_mark_val live name in
+                      let _ = gc_mark_val live owner in
+                      let _ = gc_mark_val live receiver in gc_mark_val live extra) else ()) in
+                   vec_push gc_obj_pend id) else ())
   | VStr id -> let k = id * 8 + 1 in
                (if gc_live_mark live k then gc_handle_class "str:" id else ())
   | VArr id -> let k = id * 8 + 2 in
@@ -1313,11 +1320,9 @@ let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
     let refstop = vec_len gc_ref_pend in
     let rec refs_go = fn (i: int) ->
       if i >= refstop then ()
-      else (let key = str_of_int (vec_get gc_ref_pend i) in
-            let _ = (if map_has ref_snaps key then
-              (let v = map_get ref_snaps key in
-               let _ = gc_mark_val live v in
-               match v with VStr h -> gc_class_text (sget h) | _ -> ()) else ()) in refs_go (i + 1)) in
+      else (let key = vec_get gc_ref_pend i in
+            let _ = (if map_has ref_snaps key then gc_class_text (map_get ref_snaps key) else ()) in
+            refs_go (i + 1)) in
     let _ = refs_go refs in
     let objectstop = vec_len gc_obj_pend in
     if objectstop > drained || vec_len gc_cls_pend > stop || vec_len gc_ref_pend > refstop
@@ -1453,7 +1458,6 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter protecteds (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
   let _ = map_iter r2k_methods mk in
   let _ = map_iter raise_bt mk in
-  let _ = map_iter refine_cnt (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
   let _ = map_iter resc_ctr mk in
   let _ = map_iter rx_bad mk in
   let _ = map_iter rx_gnums mk in
@@ -1481,17 +1485,14 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter dm_had_blk (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
   let _ = map_iter ref_active mk in
   let _ = gc_ref_mark (ref_cur_id ()) in
-  let _ = map_iter refine_cls (fn (k: str) -> fn (v: Val) ->
-    let _ = (match v with VStr h ->
-      (let impl_name = sget h in
-       let _ = gc_owned_edge_add metadata k impl_name in
-       let owner = gc_class_owner k in
-       // A held refinement module keeps its refinery and target, including
-       // when the refinery has a public name and therefore no GC owner.
-       let _ = gc_edge_add metadata impl_name (if str_len owner > 0 then owner else k) in
-       if map_has refine_tgt k then (match map_get refine_tgt k with VStr t -> gc_edge_add metadata impl_name (sget t) | _ -> ()) else ())
-      | _ -> ()) in gc_owned_meta_add metadata live k v) in
-  let _ = map_iter refine_tgt (fn (k: str) -> fn (v: Val) -> let _ = (match v with VStr h -> gc_owned_edge_add metadata k (sget h) | _ -> ()) in gc_owned_meta_add metadata live k v) in
+  let _ = map_iter refine_cls (fn (k: str) -> fn (impl_name: str) ->
+    let _ = gc_owned_edge_add metadata k impl_name in
+    let owner = gc_class_owner k in
+    // A held refinement keeps both its refinery and target, including a
+    // named refinery whose key itself has no collectible owner.
+    let _ = gc_edge_add metadata impl_name (if str_len owner > 0 then owner else k) in
+    if map_has refine_tgt k then gc_edge_add metadata impl_name (map_get refine_tgt k) else ()) in
+  let _ = map_iter refine_tgt (fn (k: str) -> fn (target: str) -> gc_owned_edge_add metadata k target) in
   let _ = map_iter rx_cur mk in
   let _ = map_iter rx_gbodies mk in
   let _ = map_iter rx_pending mk in
@@ -1773,6 +1774,7 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = gc_sweep_class_table meths_g 0 false in
   let _ = (if map_len meths_g < methods_before then vec_set method_store_dirty 0 1 else ()) in
   let methods_compacted = (if compact then compact_method_store () else false) in
+  let _ = rebuild_refinement_method_names () in
   let _ = gc_sweep_class_table bi_owner_memo 0 compact in
   let _ = gc_sweep_class_table meth_cfn 0 compact in
   let _ = gc_sweep_class_table builtin_alias 0 compact in
@@ -1868,9 +1870,9 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = (if compact && vec_len dead_tags > 0 then
     (let _ = map_compact hng_store in map_compact hng_sng_base) else ()) in
   let dead_refs = vec_new () in
-  let _ = map_iter ref_snaps (fn (key: str) -> fn (_v: Val) ->
-    if map_has gc_ref_live (int_of_str key) then () else vec_push dead_refs key) in
-  let _ = gc_drop_s ref_snaps dead_refs in
+  let _ = map_iter ref_snaps (fn (key: int) -> fn (_text: str) ->
+    if map_has gc_ref_live key then () else vec_push dead_refs key) in
+  let _ = gc_drop_i ref_snaps dead_refs in
   let _ = (if compact && vec_len dead_refs > 0 then map_compact ref_snaps else ()) in
   // Keep identity records while the final module rows are classified.
   let _ = gc_sweep_class_table modules 0 compact in
@@ -2102,6 +2104,8 @@ let gc_collect = fn env -> fn world ->
     let _ = map_iter ocls (fn (k: int) -> fn (v: str) ->
       if gc_live_has live (k * 8) then () else vec_push dOC k) in
     let _ = gc_drop_i ocls dOC in
+    let _ = gc_drop_i method_cores dOC in
+    let _ = (if nc then () else map_compact method_cores) in
     let _ = gc_purge_sng world dOC in
     let _ = (if nc then () else map_compact ocls) in
     // ⚠ md_whole had NO sweep. It is one entry per successful match -- the
@@ -3325,6 +3329,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                  (if lv_has env "__params" then
                     (match lv_get env "__params" with
                      | VArr pid -> zsuper_all env (deref pid)
+                     | VNil -> Nil
                      | _ -> (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                   else (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
@@ -3389,6 +3394,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                  (if lv_has env "__params" then
                     (match lv_get env "__params" with
                      | VArr pid -> zsuper_all env (deref pid)
+                     | VNil -> Nil
                      | _ -> (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                   else (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
@@ -13707,10 +13713,14 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // a Method / UnboundMethod prints as ruby writes it, not as the object it
     // is made of: `p method(:foo)` showed @~m_name and the rest.
     else if str_eq cls "Method" || str_eq cls "UnboundMethod" then
-      (let gv9 = fn (k: str) -> (if map_has iv2 (str_of_int oid ++ k) then (match map_get iv2 (str_of_int oid ++ k) with VStr h -> sget h | _ -> "") else "") in
+      (let gv9 = fn (k: str) ->
+         if str_eq k "@~m_name" then method_text (method_core_field oid 0)
+         else if str_eq k "@~m_owner" || str_eq k "@~um_cls" then method_text (method_core_field oid 1)
+         else if str_eq k "@~um_name" then method_text (method_core_field oid 0)
+         else if map_has iv2 (str_of_int oid ++ k) then method_text (map_get iv2 (str_of_int oid ++ k)) else "" in
        let own9 = (if str_eq cls "Method" then gv9 "@~m_owner" else gv9 "@~um_cls") in
        let nm9 = (if str_eq cls "Method" then gv9 "@~m_name" else gv9 "@~um_name") in
-       let rcv9 = (if map_has iv2 (str_of_int oid ++ "@~m_recv") then map_get iv2 (str_of_int oid ++ "@~m_recv") else VMain) in
+       let rcv9 = (if str_eq cls "Method" && map_has method_cores oid then method_core_field oid 2 else VMain) in
        let own9 = (if str_eq own9 "" then class_name rcv9 else own9) in
        (if str_eq cls "Method" && map_has iv2 (str_of_int oid ++ "@~m_bound") && (if str_eq (gv9 "@~m_owner") "" then false else true)
         then meth_inspect_str world "Method" (gv9 "@~m_owner") nm9 (bm_params world (gv9 "@~m_owner") nm9) (meth_source_location world (gv9 "@~m_owner") nm9 rcv9)
@@ -14084,6 +14094,42 @@ and cont_rerun = fn frame -> fn world -> fn blk -> fn (body: Stmt list) -> fn (f
 // arity refusal below and the arms ahead of dispatch_prim (Hash#fetch's
 // KeyError, Array#first's ArgumentError) are the builtin's own refusals, and
 // ruby puts the builtin's frame on top of them.
+// Copy a Method's existing definition into a fresh UnboundMethod. Both the
+// ordinary dispatcher and the guarded native allocation use this same writer.
+and method_unbind_fields = fn world -> fn (id: int) -> fn method_name_value -> fn method_owner_value -> fn mrecv ->
+  let (_, _, ocls, ivars) = world in
+  let mown = method_text method_owner_value in
+  let uid = alloc_oid ocls in
+          let _ = map_set ocls uid "UnboundMethod" in
+          // These fields are internal immutable metadata, as in Method#dup.
+          // Class values trace their owners directly; names are symbols.
+          let owner_value = (if str_eq mown "" then VClass (dispatch_cls_of world mrecv) else method_owner_value) in
+
+          // (the receiver's class is the one whose ancestors #super_method walks)
+          let from = dispatch_cls_of world mrecv in
+          let _ = store_unbound_method_core uid method_name_value owner_value
+                    (if str_eq mown "" then VNil else method_owner_value)
+                    (if str_eq from mown then owner_value else VClass from) in
+          // (...and the definition it holds, not the one the name has now)
+          let _ = msnap_carry world id "Method" uid "UnboundMethod" in
+          // (and its owner as it is now: a later remove_method does not move it)
+
+          VObj uid
+and method_unbind_object = fn world -> fn (id: int) ->
+  if map_has method_cores id then
+    let (name, owner, receiver, extra) = map_get method_cores id in
+    method_unbind_fields world id name owner receiver
+  else method_unbind_fields world id VNil VNil VMain
+and native_method_unbind_allowed = fn world -> fn (recv: Val) -> fn (vischeck: bool) ->
+  mro_cache_on () && vec_get core_only 0 == 0
+  && (if map_has flow_sig "k" then false else true)
+  && map_len trace_fn == 0 && map_len signal_traps == 0 && map_len sig_armed == 0
+  && map_len all_thr <= 1 && fb_live () == 0 && vec_get thr_body_v 0 == 0
+  && (if map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
+         || map_has undef_names "unbind" || map_has blt_alias_names "unbind" then false else true)
+  && (if vischeck && (map_has privates "Method#unbind" || map_has protecteds "Method#unbind") then false else true)
+  && (if has_meth world "Method" "unbind" then false else true)
+  && str_eq (refined_impl_for world recv "unbind") ""
 and native_module_allocation = fn world ->
   // Consumed returns can leave payload fields behind; only k is active flow.
   // A lexical refinement can replace even the otherwise-native constructor.
@@ -14097,6 +14143,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   if str_eq name0 "new" && (match recv0 with VClass c -> str_eq c "Module" | _ -> false)
      && (match args0 with Nil -> true | _ -> false) && native_module_allocation world
   then make_anon_cls world "Module" Nil else
+  // Unbind is only a native allocation when its public protocol cannot run
+  // Ruby or expose a builtin frame; all observed/overridden calls dispatch.
+  if str_eq name0 "unbind" && (match args0 with Nil -> true | _ -> false)
+     && (match recv0 with VObj id -> map_has obj_cls id && str_eq (map_get obj_cls id) "Method" | _ -> false)
+     && native_method_unbind_allowed world recv0 vischeck
+  then (match recv0 with VObj id -> method_unbind_object world id | _ -> VNil) else
   // (Array#flatten asks #to_ary here, before dispatch_prim: its guard is
   //  this call -- cont_guarded)
   if vec_get cont_on 0 == 1 && (str_eq name0 "flatten" || str_eq name0 "flatten!") && (match recv0 with VArr _ -> true | _ -> false) then
@@ -14326,7 +14378,23 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                 else args0))
                         else ())
            | _ -> ()) in
+  let native_method_owner =
+    (if str_eq __am "" && str_eq name0 "method" then
+       match (recv0, args0) with
+       | (VObj _, Cons (VSym target, Nil)) -> native_bound_method_owner world recv0 target vischeck
+       | _ -> ""
+     else "") in
   if (if str_eq __am "" then false else true) then raise_exc world "ArgumentError" __am
+  else if str_len native_method_owner > 0 then
+    (match args0 with
+     | Cons (VSym target, Nil) -> mk_bound_method world recv0 native_method_owner target
+     | _ -> VNil)
+  // An issued class directly under Object has no native container/Time/
+  // Fiber payload to construct. Retain constructor dispatch and initialize,
+  // but avoid testing every unrelated primitive allocation protocol.
+  else if str_eq name0 "new" && (match args0 with Nil -> true | _ -> false)
+          && (match recv0 with VClass c -> native_plain_object_constructor world c vischeck | _ -> false)
+  then (match recv0 with VClass c -> new_plain_object world c args0 | _ -> VNil)
   // a Regexp SUBCLASS instance (an object carrying @__rx_src, see
   // seed_builtin_subclass_ivars) compares, matches and prints as the Regexp
   // it holds. These names were answered before the Regexp readers' arm was
@@ -14490,9 +14558,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let (_, _, oc9, iv9) = world in
        match args0 with
        | Cons (_, Cons (VObj mo9, _)) ->
-         (let own9 = (match (if map_has iv9 (str_of_int mo9 ++ "@~m_owner") then map_get iv9 (str_of_int mo9 ++ "@~m_owner")
-                           else if map_has iv9 (str_of_int mo9 ++ "@~um_cls") then map_get iv9 (str_of_int mo9 ++ "@~um_cls")
-                             else VNil) with VStr h9 -> sget h9 | _ -> "") in
+         (let own9 = (method_text ((if map_has method_cores mo9 then method_core_field mo9 1
+                           else if method_core_has_field mo9 1 then method_core_field mo9 1
+                             else VNil))) in
           let rcls9 = dispatch_cls_of world recv0 in
           if is_sng_cls own9 && (if str_eq own9 rcls9 then false else true) then
             raise_exc world "TypeError" "can't bind singleton method to a different class"
@@ -17802,8 +17870,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // before trying unrelated Time, container, Fiber or Thread protocols.
     else if (str_eq c "Class" || str_eq c "Module") && str_eq name "new" then
       (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name then
-         raise_exc world "NoMethodError"
-           ("private method '" ++ name ++ "' called for class " ++ display_cls_msg world c)
+         private_constructor_error world c name args
        else if has_meth world ("(sng:" ++ c ++ ")") name then
          invoke world noblk recv ("(sng:" ++ c ++ ")") name args
        else make_anon_cls world c args)
@@ -17972,8 +18039,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // Singleton's allocate was still answering a second instance.
     else if ((str_len name == 3 && str_eq name "new") || (str_len name == 8 && str_eq name "allocate"))
             && vischeck && meth_private world ("(sng:" ++ c ++ ")") name then
-      raise_exc world "NoMethodError"
-        ("private method '" ++ name ++ "' called for class " ++ display_cls_msg world c)
+      private_constructor_error world c name args
     // A user-defined `def self.new` (an interning cache, a factory) is an
     // ordinary class method and outranks the built-in allocation, which its
     // `super` still reaches (see the singleton branch of ESuper).
@@ -20550,9 +20616,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let rest9 = substring c 7 (str_len c) in
        let u9 = str_rfind rest9 "_" 0 (0 - 1) in
        let k9 = (if u9 < 0 then "" else substring rest9 0 u9 ++ "#" ++ substring rest9 (u9 + 1) (str_len rest9)) in
-       match (if map_has refine_tgt k9 then map_get refine_tgt k9 else VNil) with
-       | VStr h9 -> VClass (sget h9)
-       | _ -> VNil)
+       if map_has refine_tgt k9 then VClass (map_get refine_tgt k9) else VNil)
     else if (str_len name == 4 && str_eq name "name") && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
       mod_name_val c
     // Class#superclass: the recorded superclass, else Object (BasicObject has
@@ -20797,7 +20861,6 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else
          (let id = alloc_oid ocls0 in
           let _ = map_set ocls0 id "UnboundMethod" in
-          let _ = map_set ivars0 (str_of_int id ++ "@~um_cls") (mkstr origin) in
           let _ = msnap_note world id "UnboundMethod" origin mname in
           let _ = bi_meth_mark world id origin mname in
           // ...and the OWNER separately, because they are not the same class
@@ -20812,12 +20875,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       else (let _ = bo_ensure () in
                             let l9 = bo_walk (ancestors_of world c) mname in
                             if str_len l9 > 0 then substring l9 0 (str_index_of l9 "#") else origin)) in
-          let _ = map_set ivars0 (str_of_int id ++ "@~um_owner") (mkstr own9) in
-          let _ = map_set ivars0 (str_of_int id ++ "@~um_name") (mkstr mname) in
+
           // ...and the class it was asked of: #super_method walks THAT class's
           // ancestors, so a module's method taken through a class has the
           // class's superclasses above it (see super_method)
-          let _ = map_set ivars0 (str_of_int id ++ "@~um_from") (mkstr c) in
+          let _ = store_unbound_method_core id (VSym mname) (VClass origin) (VClass own9) (VClass c) in
           // the definition it was made from (see make_unbound_method)
           let k9 = origin ++ "#" ++ mname in
           let _ = (if map_has meth_src k9 && map_has meth_src ("f" ++ k9) then
@@ -21021,12 +21083,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           (let ocl9 = map_get ocls0 uid in
            let (scls, snm) =
              (if str_eq ocl9 "UnboundMethod" then
-                ((match map_get ivars0 (str_of_int uid ++ "@~um_cls") with VStr h -> sget h | _ -> ""),
-                 (match map_get ivars0 (str_of_int uid ++ "@~um_name") with VStr h -> sget h | _ -> ""))
+                ((method_text (method_core_field uid 1)),
+                 (method_text (method_core_field uid 0)))
               else if str_eq ocl9 "Method" then
-                (let mo = (match map_get ivars0 (str_of_int uid ++ "@~m_owner") with VStr h -> sget h | _ -> "") in
-                 let mn = (match map_get ivars0 (str_of_int uid ++ "@~m_name") with VStr h -> sget h | _ -> "") in
-                 let mo = (if str_eq mo "" then (match map_get ivars0 (str_of_int uid ++ "@~m_recv") with r9 -> class_name r9) else mo) in
+                (let mo = (method_text (method_core_field uid 1)) in
+                 let mn = (method_text (method_core_field uid 0)) in
+                 let mo = (if str_eq mo "" then (match method_core_field uid 2 with r9 -> class_name r9) else mo) in
                  (mo, mn))
               else ("", "")) in
            if str_eq snm "" then raise_exc world "TypeError" ("wrong argument type " ++ ocl9 ++ " (expected Proc/Method/UnboundMethod)")
@@ -21078,14 +21140,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           (let ocl9 = map_get ocls0 uid in
            let (scls, snm) =
              (if str_eq ocl9 "UnboundMethod" then
-                ((match map_get ivars0 (str_of_int uid ++ "@~um_cls") with VStr h -> sget h | _ -> ""),
-                 (match map_get ivars0 (str_of_int uid ++ "@~um_name") with VStr h -> sget h | _ -> ""))
+                ((method_text (method_core_field uid 1)),
+                 (method_text (method_core_field uid 0)))
               else if str_eq ocl9 "Method" then
-                (let mo = (match map_get ivars0 (str_of_int uid ++ "@~m_owner") with VStr h -> sget h | _ -> "") in
-                 let mn = (match map_get ivars0 (str_of_int uid ++ "@~m_name") with VStr h -> sget h | _ -> "") in
+                (let mo = (method_text (method_core_field uid 1)) in
+                 let mn = (method_text (method_core_field uid 0)) in
                  // #owner is "" for a builtin; the receiver's class is then the
                  // only place the definition could have come from.
-                 let mo = (if str_eq mo "" then (match map_get ivars0 (str_of_int uid ++ "@~m_recv") with r9 -> class_name r9) else mo) in
+                 let mo = (if str_eq mo "" then (match method_core_field uid 2 with r9 -> class_name r9) else mo) in
                  (mo, mn))
               else ("", "")) in
            // (an object that is neither a Method nor an UnboundMethod is no body:
@@ -21793,14 +21855,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       let m7 = map_len tmp7 in map_set tmp7 (str_of_int m7) (VClass rf7))))) in
        arr_new (idx_to_list tmp7 0 (map_len tmp7)))
     else if (str_len name == 11 && str_eq name "refinements") then
-      (let n9 = (if map_has refine_cnt c then (match map_get refine_cnt c with VInt k -> k | _ -> 0) else 0) in
+      (let n9 = (if map_has refine_cnt c then map_get refine_cnt c else 0) in
        let tmp9 = map_new () in
        let seen9 = map_new () in
        let rec go9 = fn (i9: int) ->
          (if i9 >= n9 then ()
           else (let k9 = c ++ "#" ++ str_of_int i9 in
                 let _ = (if map_has refine_cls k9 then
-                           (let im9 = (match map_get refine_cls k9 with VStr h -> sget h | _ -> "") in
+                           (let im9 = map_get refine_cls k9 in
                             if str_eq im9 "" || map_has seen9 im9 then ()
                             else (let _ = map_set seen9 im9 1 in
                                   let m9 = map_len tmp9 in map_set tmp9 (str_of_int m9) (VClass im9)))
@@ -23923,6 +23985,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if has_meth world cls "method_missing" then (let _ = vec_set mm_priv 0 (mm_reason_take ()) in invoke world noblk recv cls "method_missing" (Cons (VSym name, args)))
        else raise_exc_iv world "NoMethodError" (refused9 ++ " method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
               (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
+    // A visibility-only entry has no Ruby method row. Native Method#unbind
+    // must still refuse the call and give method_missing its usual chance.
+    else if vischeck && str_eq cls "Method" && str_eq name "unbind"
+            && (map_has privates "Method#unbind"
+                || (map_has protecteds "Method#unbind" && (if protected_ok_m env world cls name then false else true))) then
+      (let refused = (if map_has privates "Method#unbind" then "private" else "protected") in
+       if has_meth world cls "method_missing"
+       then (let _ = vec_set mm_priv 0 (mm_reason_take ()) in
+             invoke world noblk recv cls "method_missing" (Cons (VSym name, args)))
+       else raise_exc_iv world "NoMethodError" (refused ++ " method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
+              (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
     // a private Kernel method a class (or an object's singleton) made PUBLIC
     // -- `class << obj; public :raise; end`, which is how ruby/spec gets a
     // public #raise to share examples with Thread#raise -- is called on the
@@ -24079,11 +24152,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
         (msnap_src world id "Method" (msnap_obj_cls world id "Method") (msnap_obj_name world id "Method"))
         (fn (u: unit) -> invoke_val_c env world blk recv name args vischeck)
     else if str_eq cls "Method" then
-      (let method_name_value = map_get ivars (str_of_int id ++ "@~m_name") in
-       let method_owner_value = map_get ivars (str_of_int id ++ "@~m_owner") in
-       let mnm = (match method_name_value with VStr h -> sget h | _ -> "") in
-       let mown = (match method_owner_value with VStr h -> sget h | _ -> "") in
-       let mrecv = (if map_has ivars (str_of_int id ++ "@~m_recv") then map_get ivars (str_of_int id ++ "@~m_recv") else VMain) in
+      (let method_name_value = method_core_field id 0 in
+       let method_owner_value = method_core_field id 1 in
+       let mnm = (method_text (method_name_value)) in
+       let mown = (method_text (method_owner_value)) in
+       let mrecv = (if map_has method_cores id then method_core_field id 2 else VMain) in
        if (str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "===") then
          (if map_has ivars (str_of_int id ++ "@~m_mm")
           then invoke_val_c env world blk mrecv "method_missing" (Cons (VSym mnm, args)) false
@@ -24288,9 +24361,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else
             (let nid = alloc_oid ocls in
              let _ = map_set ocls nid "Method" in
-             let _ = map_set ivars (str_of_int nid ++ "@~m_name") (mkstr mnm) in
-             let _ = map_set ivars (str_of_int nid ++ "@~m_owner") (mkstr above) in
-             let _ = map_set ivars (str_of_int nid ++ "@~m_recv") mrecv in
+             let _ = store_bound_method_core nid (VSym mnm) (VClass above) mrecv in
              let _ = msnap_note world nid "Method" above mnm in
              VObj nid))
        // Method#==: the same receiver, the same owner, and the same definition --
@@ -24305,9 +24376,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | Cons (VObj oid2, _) ->
             (let (_, _, ocls2, ivars2) = world in
              if str_eq (map_get ocls2 oid2) "Method" then
-               (let own2 = (match map_get ivars2 (str_of_int oid2 ++ "@~m_owner") with VStr h -> sget h | _ -> "") in
-                let nm2 = (match map_get ivars2 (str_of_int oid2 ++ "@~m_name") with VStr h -> sget h | _ -> "") in
-                let rc2 = (if map_has ivars2 (str_of_int oid2 ++ "@~m_recv") then map_get ivars2 (str_of_int oid2 ++ "@~m_recv") else VMain) in
+               (let own2 = (method_text (method_core_field oid2 1)) in
+                let nm2 = (method_text (method_core_field oid2 0)) in
+                let rc2 = (if map_has method_cores oid2 then method_core_field oid2 2 else VMain) in
                 // A PRIMITIVE receiver's Method has no owner recorded, and the
                 // alias table is keyed by CLASS: `false.method(:inspect) ==
                 // false.method(:to_s)` compared "" against "" and never
@@ -24371,9 +24442,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           //  m.bar` -- by sharing its singleton class; for a Method ruby's #dup
           //  keeps them as well as #clone)
           let _ = map_set ocls nid (if is_sng_cls (map_get ocls id) then map_get ocls id else "Method") in
-          let _ = map_set ivars (str_of_int nid ++ "@~m_name") (mkstr mnm) in
-          let _ = map_set ivars (str_of_int nid ++ "@~m_owner") (mkstr mown) in
-          let _ = map_set ivars (str_of_int nid ++ "@~m_recv") mrecv in
+          let _ = store_bound_method_core nid (VSym mnm) (VClass mown) mrecv in
           // (...and the instance variables a program gave it)
           let _ = ivars_copy_pfx world (str_of_int id ++ "@") (str_of_int nid ++ "@") in
           let _ = (if (str_len name == 5 && str_eq name "clone") && ofrozen_get id then ofrozen_set nid else ()) in
@@ -24428,22 +24497,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                              else dispatch_cls_of world mrecv)
                           else mown) mnm
        else if (str_len name == 6 && str_eq name "unbind") then
-         (let uid = alloc_oid ocls in
-          let uid_text = str_of_int uid in
-          let _ = map_set ocls uid "UnboundMethod" in
-          // These fields are internal immutable metadata, as in Method#dup.
-          // Sharing their handles also keeps the original definition alive.
-          let owner_value = (if str_eq mown "" then mkstr (dispatch_cls_of world mrecv) else method_owner_value) in
-          let _ = map_set ivars (uid_text ++ "@~um_cls") owner_value in
-          let _ = map_set ivars (uid_text ++ "@~um_name") method_name_value in
-          // (the receiver's class is the one whose ancestors #super_method walks)
-          let from = dispatch_cls_of world mrecv in
-          let _ = map_set ivars (uid_text ++ "@~um_from") (if str_eq from mown then owner_value else mkstr from) in
-          // (...and the definition it holds, not the one the name has now)
-          let _ = msnap_carry world id "Method" uid "UnboundMethod" in
-          // (and its owner as it is now: a later remove_method does not move it)
-          let _ = (if str_eq mown "" then () else map_set ivars (uid_text ++ "@~um_owner") method_owner_value) in
-          VObj uid)
+         method_unbind_fields world id method_name_value method_owner_value mrecv
        else if (str_len name == 7 && str_eq name "to_proc") then
          // The proc calls the method with the receiver as SELF and no explicit
           // receiver, because `method(:x)` may name a private method and a
@@ -26240,8 +26294,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
         (msnap_src world id "UnboundMethod" (msnap_obj_cls world id "UnboundMethod") (msnap_obj_name world id "UnboundMethod"))
         (fn (u: unit) -> invoke_val_c env world blk recv name args vischeck)
     else if str_eq cls "UnboundMethod" then
-      (let ucls = (match map_get ivars (str_of_int id ++ "@~um_cls") with VStr h -> sget h | _ -> "") in
-       let unm = (match map_get ivars (str_of_int id ++ "@~um_name") with VStr h -> sget h | _ -> "") in
+      (let ucls = (method_text (method_core_field id 1)) in
+       let unm = (method_text (method_core_field id 0)) in
        if (str_len name == 4 && str_eq name "bind") || (str_len name == 9 && str_eq name "bind_call") then
          (let target = (match args with Cons (v, _) -> v | _ -> VNil) in
           let tcls = dispatch_cls_of world target in
@@ -26301,10 +26355,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else raise_exc world "TypeError" ("bind argument must be an instance of " ++ cls_display world (if str_eq rt9 "" then ucls else rt9)))
        else if (str_len name == 4 && str_eq name "name") then VSym unm
        else if (str_len name == 5 && str_eq name "owner") then
-         VClass (impl_public (if map_has ivars (str_of_int id ++ "@~um_owner")
-                 then (match map_get ivars (str_of_int id ++ "@~um_owner") with
-                       | VStr h9 -> sget h9
-                       | _ -> ucls)
+         VClass (impl_public (if method_core_has_field id 2
+                 then method_text_or ucls (method_core_field id 2)
                  // (a builtin's: where ruby defines it, as for Method#owner)
                  // ⚠ the ANCESTOR that defines it, not the class asked: has_meth
                  //   answers through the chain, so `Object.instance_method(:tap)`
@@ -26338,8 +26390,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // ...from the OWNER when it is not where the body is (a class that
          // only published an inherited method is the owner; its chain is the
          // one with the rest above it)
-         (let own8 = (if map_has ivars (str_of_int id ++ "@~um_owner")
-                      then (match map_get ivars (str_of_int id ++ "@~um_owner") with VStr h8 -> sget h8 | _ -> ucls)
+         (let own8 = (if method_core_has_field id 2
+                      then (method_text_or ucls (method_core_field id 2))
                       // ...and a BUILTIN's owner is where ruby defines it, as
                       // #owner says: `Object.instance_method(:tap)` is
                       // Kernel's, and Kernel has nothing above it
@@ -26348,8 +26400,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       else (let _ = bo_ensure () in
                             let l8 = bo_walk (ancestors_of world ucls) unm in
                             if str_len l8 > 0 then substring l8 0 (str_index_of l8 "#") else ucls)) in
-          let from8 = (if map_has ivars (str_of_int id ++ "@~um_from")
-                       then (match map_get ivars (str_of_int id ++ "@~um_from") with VStr h8 -> sget h8 | _ -> own8)
+          let from8 = (if method_core_has_field id 3
+                       then (method_text_or own8 (method_core_field id 3))
                        else own8) in
           let anc = ancestors_of world (if anc_has (ancestors_of world from8) own8 then from8 else own8) in
           let unm = original_name_of world ucls unm in
@@ -26365,7 +26417,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              then make_unbound_method world "Kernel" unm
              else VNil)
           else (match make_unbound_method world above unm with
-                | VObj nu8 -> (let _ = map_set ivars (str_of_int nu8 ++ "@~um_from") (mkstr from8) in VObj nu8)
+                | VObj nu8 -> (let _ = method_core_set_from nu8 (VClass from8) in VObj nu8)
                 | v8 -> v8))
        // clone: a Method object is immutable here, so a copy is a fresh handle
        // onto the same (class, name) pair -- which is what ruby's clone gives
@@ -26374,11 +26426,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // a NEW UnboundMethod, carrying the frozen status only for #clone
          (let nid = alloc_oid ocls in
           let _ = map_set ocls nid "UnboundMethod" in
-          let _ = map_set ivars (str_of_int nid ++ "@~um_cls") (mkstr ucls) in
-          let _ = map_set ivars (str_of_int nid ++ "@~um_name") (mkstr unm) in
+          let _ = copy_method_core id nid in
           // (and where it was asked, owned and defined: a copy's #super_method
           //  and #== are the original's)
-          let _ = list_iter (Cons ("@~um_owner", Cons ("@~um_from", Cons ("@~um_def", Nil)))) (fn (k9: str) ->
+          let _ = list_iter (Cons ("@~um_def", Nil)) (fn (k9: str) ->
                     if map_has ivars (str_of_int id ++ k9) then map_set ivars (str_of_int nid ++ k9) (map_get ivars (str_of_int id ++ k9)) else ()) in
           let _ = msnap_carry world id "UnboundMethod" nid "UnboundMethod" in
           let _ = ivars_copy_pfx world (str_of_int id ++ "@") (str_of_int nid ++ "@") in
@@ -26404,8 +26455,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // through canon_alias (String#size == String#length).
          (match args with
           | Cons (VObj oid2, _) ->
-            (let uc2 = to_s (map_get ivars (str_of_int oid2 ++ "@~um_cls")) in
-             let un2 = to_s (map_get ivars (str_of_int oid2 ++ "@~um_name")) in
+            (let uc2 = method_text (method_core_field oid2 1) in
+             let un2 = method_text (method_core_field oid2 0) in
              // ⚠ ...through the alias ORIGIN, and each side under its own
              // class: `B.instance_method(:ali)` records B and
              // `B.instance_method(:pub)` records A, so comparing the recorded
@@ -27151,6 +27202,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // asking the dispatch one made clone drop every singleton it was
        // supposed to copy.
        let ocls0 = map_get ocls id in
+       let _ = copy_method_core id nid in
        // clone(freeze:) takes true, false or nil and nothing else.
        let (fz9, kw9) =
          (match args with
@@ -30662,6 +30714,18 @@ and invoke_with_block2 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
     invoke_val_c env world blk recv name args false
   else if str_len name == 5 && str_eq name "match" && rx_own_match world recv args then rx_own_match_call env world blk recv args newblk
   else if rx_sub_args_needed world recv name args then invoke_with_block env world blk recv name (rx_sub_args world args) newblk
+  // A refined constructor is a Ruby call, including its block and frame.
+  // Resolve it before either the native allocator or a builtin frame.
+  else if str_eq name "new" && (match recv with VClass c -> str_eq c "Class" || str_eq c "Module" | _ -> false)
+          && (match newblk with (true, _, _, _) -> true | _ -> false)
+          && not (str_eq (refined_impl_for world recv name) "")
+  then refined_constructor_block env world blk recv args newblk
+  // A declaration-only constructor body cannot expose a builtin frame when
+  // constructors, inherited/definition hooks and observers are all native.
+  // Run the existing allocator/body and restore the caller's source position.
+  else if str_eq name "new" && (match args with Nil -> true | _ -> false)
+          && (match recv with VClass c -> native_constructor_declaration_allowed world c newblk | _ -> false)
+  then (match recv with VClass c -> native_constructor_declaration world c newblk | _ -> VNil)
   // An unobserved, argument-less Module.new performs only native metadata
   // allocation. It cannot run Ruby code or raise a Ruby arity/coercion error,
   // so it needs neither a temporary builtin receiver nor a visible frame.
@@ -30772,7 +30836,7 @@ and bi_skip_pass = fn (name: str) ->
   else true
 and bi_meth_own = fn world -> fn (id: int) ->
   let (_, _, _, ivars) = world in
-  if map_has ivars (str_of_int id ++ "@~m_biown") then (match map_get ivars (str_of_int id ++ "@~m_biown") with VStr h9 -> sget h9 | _ -> "") else ""
+  if map_has ivars (str_of_int id ++ "@~m_biown") then (method_text (map_get ivars (str_of_int id ++ "@~m_biown"))) else ""
 and bi_meth_shadowed = fn world -> fn (id: int) -> fn (mown: str) -> fn (mnm: str) -> fn (mrecv: Val) ->
   let (_, _, _, ivars) = world in
   let own9 = bi_meth_own world id in
@@ -31148,9 +31212,9 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
       (match recv with
        | VObj mid ->
          (let (_, _, _, ivars9) = world in
-          let mnm = (match map_get ivars9 (str_of_int mid ++ "@~m_name") with VStr h -> sget h | _ -> "") in
-          let mrecv = (if map_has ivars9 (str_of_int mid ++ "@~m_recv") then map_get ivars9 (str_of_int mid ++ "@~m_recv") else VMain) in
-          let mown = (match map_get ivars9 (str_of_int mid ++ "@~m_owner") with VStr h -> sget h | _ -> "") in
+          let mnm = (method_text (method_core_field mid 0)) in
+          let mrecv = (if map_has method_cores mid then method_core_field mid 2 else VMain) in
+          let mown = (method_text (method_core_field mid 1)) in
           match mrecv with
           | VMain -> (if (let (m8, _, _, _) = world in map_has m8 mnm) then call_method (env_as_main env) world newblk mnm args else invoke_with_block env world blk VMain mnm args newblk)
           | _ ->
@@ -45100,7 +45164,7 @@ and msnap_era = fn world -> fn (id: int) -> fn (ocl: str) ->
 and msnap_cls = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) ->
   let (_, _, _, iv9) = world in
   let k9 = str_of_int id ++ (if str_eq ocl "Method" then "@~m_dk" else "@~um_dk") in
-  if map_has iv9 k9 then (match map_get iv9 k9 with VStr h -> sget h | _ -> cls) else cls
+  if map_has iv9 k9 then (method_text_or cls (map_get iv9 k9)) else cls
 // a Method or UnboundMethod is being made for cls#name: mark the key that has
 // the body (only a marked key is copied when it is written)
 and msnap_note = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) -> fn (name: str) ->
@@ -45110,7 +45174,7 @@ and msnap_note = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) -> f
   let k = dc ++ "#" ++ name in
   if (if str_eq dc "" then false else true) && map_has m9 k then
     (let _ = (if str_eq dc cls then ()
-              else map_set iv9 (str_of_int id ++ (if str_eq ocl "Method" then "@~m_dk" else "@~um_dk")) (mkstr dc)) in
+              else map_set iv9 (str_of_int id ++ (if str_eq ocl "Method" then "@~m_dk" else "@~um_dk")) (VClass dc)) in
      if map_has meth_obj_seen k then () else map_set meth_obj_seen k 1)
   else ()
 // a made-from object (nid) is dated and placed as its source (id) is
@@ -45170,13 +45234,9 @@ and msnap_reflect_name = fn (n: str) ->
   str_eq n "parameters" || str_eq n "arity" || str_eq n "inspect" || str_eq n "to_s"
   || str_eq n "source_location" || str_eq n "super_method"
 and msnap_obj_cls = fn world -> fn (id: int) -> fn (ocl: str) ->
-  let (_, _, _, iv9) = world in
-  let k9 = str_of_int id ++ (if str_eq ocl "Method" then "@~m_owner" else "@~um_cls") in
-  if map_has iv9 k9 then (match map_get iv9 k9 with VStr h -> sget h | _ -> "") else ""
+  method_text (method_core_field id 1)
 and msnap_obj_name = fn world -> fn (id: int) -> fn (ocl: str) ->
-  let (_, _, _, iv9) = world in
-  let k9 = str_of_int id ++ (if str_eq ocl "Method" then "@~m_name" else "@~um_name") in
-  if map_has iv9 k9 then (match map_get iv9 k9 with VStr h -> sget h | _ -> "") else ""
+  method_text (method_core_field id 0)
 // run f with the copy sk installed as k's definition -- the method table
 // too, for the questions that read it (parameters, source) -- and k marked as
 // installed so nothing inside goes looking for the copy again; everything k
@@ -45370,7 +45430,11 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
        | Cons (p, Nil) -> str_len p > 1 && str_eq (char_at p 0) "*"
                           && not (str_eq (char_at p 1) "*") && not (str_eq p "*__fwd")
        | _ -> false) && (match vlast args with VHsh _ -> false | _ -> true) in
-    let _ = (if share_rest_args then () else map_set frame "__args" (arr_new args)) in
+    // Empty argument and parameter lists carry no heap references. Keep an
+    // explicit empty parameter sentinel so zsuper does not fall back to an
+    // original empty keyword hash that binding may have consumed.
+    let _ = (if share_rest_args then () else map_set frame "__args"
+               (match args with Nil -> VNil | _ -> arr_new args)) in
     // ⚠ ONE Array per METHOD, not per call. `__params` holds the parameter
     // NAMES, which the method fixed at `def`; bare `super` (the only reader,
     // see the zsuper arm in eval_e) looks each name up in the frame to get the
@@ -45378,10 +45442,11 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     // counter bump, an id, and a copy of the list into arr_store's region on
     // every method call in the program.
     let _ = map_set frame "__params"
-              (if map_has meth_params dk then map_get meth_params dk
-               else (let pv = arr_new (param_names_vals params) in
-                     let _ = map_set meth_params dk pv in
-                     pv)) in
+              (match params with
+               | Nil -> VNil
+               | _ -> if map_has meth_params dk then map_get meth_params dk
+                      else (let pv = arr_new (param_names_vals params) in
+                            let _ = map_set meth_params dk pv in pv)) in
     let vs9 = map_has super_call_pend "v" in
     let _ = (if vs9 then map_delete super_call_pend "v" else ()) in
     let _ = bind_params_m frame world blk name params defaults args in
@@ -48394,6 +48459,57 @@ and make_anon_cls_block = fn world -> fn (c: str) -> fn (args: Val list) -> fn n
               | FBreak bv9 -> bv9
               | _ -> VClass anon9))
           | other9 -> other9)
+
+and native_constructor_declaration_allowed = fn world -> fn (factory: str) -> fn block ->
+  (str_eq factory "Class" || str_eq factory "Module")
+  && mro_cache_on () && vec_get core_only 0 == 0 && not (map_has flow_sig "k")
+  && map_len trace_fn == 0 && map_len signal_traps == 0 && map_len sig_armed == 0
+  && map_len all_thr <= 1 && fb_live () == 0 && vec_get thr_body_v 0 == 0
+  && not (map_has hook_flags "ma" || map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y")
+  && core_metadata_methods world
+  && not (meth_protected world ("(sng:" ++ factory ++ ")") "new")
+  && str_eq (refined_impl_for world (VClass factory) "new") ""
+  && (match block with
+      | (true, Nil, body, defining_env) ->
+        (match native_definition_shape body with
+         | Cons (_, Nil) -> true
+         | _ ->
+           if ref_env_id defining_env != 0 || ref_cur_id () != 0 then false else
+           match core_metadata_stmts body with
+           | Cons (SExpr (ECall (name, Cons (argument, Nil))), rest) when str_eq name "using" ->
+             let refinery = native_declaration_argument defining_env argument in
+             str_len refinery > 0 && map_has modules refinery && not (is_refine_impl refinery)
+             && not (lv_has defining_env "__meth")
+             && (match native_definition_shape rest with Cons (_, Nil) -> true | _ -> false)
+             && not (map_has undef_names name || map_has blt_alias_names name)
+             && (let (methods, _, _, _) = world in not (map_has methods name))
+             && not (has_meth world factory name)
+           | Cons (SExpr (ECallB (name, Cons (argument, Nil), Nil, inner)), tail)
+             when str_eq factory "Module" && str_eq name "refine" && core_mixin_tail tail ->
+             str_len (native_declaration_argument defining_env argument) > 0
+             && (match native_definition_shape inner with Cons (_, Nil) -> true | _ -> false)
+             && not (map_has undef_names name || map_has blt_alias_names name)
+             && (let (methods, _, _, _) = world in not (map_has methods name))
+             && not (has_meth world "Module" name)
+           | _ -> false)
+      | _ -> false)
+and native_constructor_declaration = fn world -> fn (factory: str) -> fn block ->
+  let file = cur_file () in
+  let line = cur_line () in
+  let result = try_or_msg (fn (u: unit) -> make_anon_cls_block world factory Nil block)
+    (fn (message: str) -> let _ = cur_file_set file in let _ = cur_line_set line in fail message) in
+  let _ = cur_file_set file in
+  let _ = cur_line_set line in result
+and refined_constructor_block = fn env -> fn world -> fn blk -> fn (receiver: Val) -> fn (args: Val list) -> fn block ->
+  let owner = refined_impl_for world receiver "new" in
+  if map_has privates (owner ++ "#new") then
+    (match receiver with VClass c -> private_constructor_error world c "new" args | _ -> VNil)
+  else if map_has builtin_alias (owner ++ "#new") && not (has_meth world owner "new") then
+    let source = map_get builtin_alias (owner ++ "#new") in
+    if str_eq source "new" then
+      (match receiver with VClass c -> make_anon_cls_block world c args block | _ -> VNil)
+    else invoke_with_block env world blk receiver source args block
+  else ref_call world block receiver owner "new" args
 
 
 // UNIVERSAL NEWLINE on read (text mode "rt", textmode: true, newline:
@@ -53305,6 +53421,51 @@ and loc_base_label = fn (label: str) ->
      if j9 >= 0 then substring l9 (j9 + 1) (str_len l9) else l9)
 
 
+and native_bound_method_owner = fn world -> fn (receiver: Val) -> fn (target: str) -> fn (vischeck: bool) ->
+  let cls = dispatch_cls_of world receiver in
+  if not (mro_cache_on ()) || vec_get core_only 0 != 0 || map_has flow_sig "k"
+     || map_len trace_fn > 0 || map_len signal_traps > 0 || map_len sig_armed > 0
+     || map_len all_thr > 1 || fb_live () > 0 || vec_get thr_body_v 0 != 0
+     || map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
+     || map_has undef_names "method" || map_has blt_alias_names "method"
+     || map_has undef_names target || map_has blt_alias_names target || map_has bi_skip "n"
+     || (vischeck && (meth_private world cls "method" || meth_protected world cls "method"))
+     || has_meth world cls "method"
+     || not (str_eq (refined_impl_for world receiver "method") "") then ""
+  else
+    let refined = refined_impl_for world receiver target in
+    let owner = (if str_eq refined "" then bm_owner_of world receiver target else refined) in
+    let (methods, _, _, _) = world in
+    // A real definition requires no respond_to_missing? callback. Builtin,
+    // missing, alias and undef cases retain the ordinary reflection path.
+    if str_len owner > 0 && map_has methods (owner ++ "#" ++ target) then owner else ""
+and private_constructor_error = fn world -> fn (cls: str) -> fn (name: str) -> fn (args: Val list) ->
+  raise_exc_iv world "NoMethodError"
+    ("private method '" ++ name ++ "' called for class " ++ display_cls_msg world cls)
+    (Cons (("__name", VSym name), Cons (("__recv", VClass cls), Cons (("__args", arr_new args), Nil))))
+and native_plain_object_constructor = fn world -> fn (cls: str) -> fn (vischeck: bool) ->
+  mro_cache_on () && vec_get core_only 0 == 0
+  && map_has anonymous_classes cls && map_get anonymous_classes cls == 1
+  && map_has cls_sup cls && str_eq (map_get cls_sup cls) "Object"
+  && not (map_has modules cls || map_has prim_sub cls || map_has prim_copy cls
+          || map_has cls_copy_of cls || map_has struct_mem cls)
+  && not (map_has flow_sig "k") && map_len trace_fn == 0
+  && map_len signal_traps == 0 && map_len sig_armed == 0
+  && map_len all_thr <= 1 && fb_live () == 0 && vec_get thr_body_v 0 == 0
+  && not (map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
+          || map_has undef_names "new" || map_has blt_alias_names "new" || map_has bi_skip "n")
+  && not (vischeck && meth_private world ("(sng:" ++ cls ++ ")") "new")
+  && not (has_meth world ("(sng:" ++ cls ++ ")") "new")
+  && str_eq (refined_impl_for world (VClass cls) "new") ""
+and new_plain_object = fn world -> fn (cls: str) -> fn (args: Val list) ->
+  let (_, _, ocls, _) = world in
+  let id = alloc_oid ocls in
+  let _ = map_set ocls id cls in
+  let object = VObj id in
+  if has_meth world cls "initialize" then
+    let block = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+    let _ = invoke world block object cls "initialize" args in object
+  else tp_init_around world object (fn (u: unit) -> init_arity_refuse world cls args object)
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
   // (a Regexp itself is the value Regexp.new builds: see new_obj_wb)
   if str_eq cls "Regexp" && (if has_meth world cls "initialize" then false else true) then
@@ -54715,7 +54876,7 @@ and cls_display = fn world -> fn (c0: str) ->
      let u9 = str_rfind rest9 "_" 0 (0 - 1) in
      let refinery9 = (if u9 < 0 then rest9 else substring rest9 0 u9) in
      let k9 = (if u9 < 0 then "" else refinery9 ++ "#" ++ substring rest9 (u9 + 1) (str_len rest9)) in
-     let tgt9 = (match (if map_has refine_tgt k9 then map_get refine_tgt k9 else VNil) with VStr h9 -> sget h9 | _ -> "") in
+     let tgt9 = (if map_has refine_tgt k9 then map_get refine_tgt k9 else "") in
      "#<refinement:" ++ cls_display world tgt9 ++ "@" ++ cls_display world refinery9 ++ ">")
   // a class named inside an ANONYMOUS module: the module as ruby prints it,
   // then the rest of the path (`#<Module:0x..>::M`)
@@ -54753,12 +54914,12 @@ and refine_impl_for = fn world -> fn (refinery: str) -> fn (target: str) -> fn (
   if i >= n then ""
   else (let k = refinery ++ "#" ++ str_of_int i in
         if map_has refine_tgt k
-           && str_eq (match map_get refine_tgt k with VStr h -> sget h | _ -> "") target
-        then (match map_get refine_cls k with VStr h -> sget h | _ -> "")
+           && str_eq (map_get refine_tgt k) target
+        then map_get refine_cls k
         else refine_impl_for world refinery target (i + 1) n)
 
 and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: Stmt list) -> fn denv ->
-  let i = (if map_has refine_cnt refinery then (match map_get refine_cnt refinery with VInt n -> n | _ -> 0) else 0) in
+  let i = (if map_has refine_cnt refinery then map_get refine_cnt refinery else 0) in
   // ⚠ REFINING THE SAME CLASS TWICE REOPENS THE SAME MODULE. `refine String`
   //   written a second time in one refinery adds to the module the first one
   //   made -- ruby answers the identical object, and a program that refines in
@@ -54785,9 +54946,9 @@ and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: St
   //   class) asks while it is still running.
   let _ = map_set anonymous_classes impl_cls 4 in
   let _ = map_set modules impl_cls VNil in
-  let _ = map_set refine_tgt (refinery ++ "#" ++ str_of_int i) (mkstr target) in
-  let _ = map_set refine_cls (refinery ++ "#" ++ str_of_int i) (mkstr impl_cls) in
-  let _ = map_set refine_cnt refinery (VInt (i + 1)) in
+  let _ = map_set refine_tgt (refinery ++ "#" ++ str_of_int i) target in
+  let _ = map_set refine_cls (refinery ++ "#" ++ str_of_int i) impl_cls in
+  let _ = map_set refine_cnt refinery (i + 1) in
   let _ = flow_value (register_refine_body world impl_cls bb refinery denv) in
   VClass impl_cls
 
@@ -54804,6 +54965,29 @@ and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: St
 // snapshot and the classes it names. Captured scopes stay in lv_capx and are
 // reached through their live Proc/Method owners instead.
 and register_refine_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (refinery: str) -> fn denv ->
+  let declaration = native_definition_shape body in
+  let can_declare = (match declaration with
+    | Cons (SDef (name, _, _, _), Nil) -> native_definition_allowed world cls name
+    | _ -> false) in
+  if can_declare then
+    let saved = ref_save_active () in
+    let lexical = cur_lex () in
+    let result = try_or_msg (fn (u: unit) ->
+      let _ = map_set ref_flag 0 1 in
+      let _ = ref_install (ref_env_id denv) in
+      let _ = map_set ref_active ("@" ++ refinery) VNil in
+      let _ = ref_live refinery in
+      let _ = ref_snapshot () in
+      let _ = set_lex refinery in
+      let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+      let _ = (if map_has pending_home "v" then map_delete pending_home "v" else ()) in
+      match declaration with
+      | Cons (stmt, Nil) -> FNext (native_definition_commit world cls body stmt)
+      | _ -> FNext VNil)
+      (fn (message: str) -> let _ = set_lex lexical in let _ = restore_ref_active saved in fail message) in
+    let _ = set_lex lexical in
+    let _ = restore_ref_active saved in result
+  else
   let scope = refine_body_env denv refinery in
   let result = try_or_msg (fn (u: unit) -> register_class_blk world cls body refinery scope)
                 (fn (message: str) -> (let _ = blk_env_put scope in fail message)) in
@@ -54881,7 +55065,7 @@ and do_using = fn env -> fn world -> fn (args: Val list) ->
         | Nil -> ()
         | Cons (m, t) ->
           (let _ = act t in
-           let n = (if map_has refine_cnt m then (match map_get refine_cnt m with VInt k -> k | _ -> 0) else 0) in
+           let n = (if map_has refine_cnt m then map_get refine_cnt m else 0) in
            activate_refinements m 0 n)) in
      let _ = act (mod_ancestors world r) in
      let id = ref_snapshot () in
@@ -55515,8 +55699,8 @@ and yblk_env = fn denv -> fn blk ->
 // Ruby when method/line/trace hooks are absent. Retain full method writers,
 // lexical/refinement snapshots, source stamps and visibility, without building
 // a mutable class-body scope that the definition cannot read or capture.
-and native_definition_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
-    let rec definition = fn (xs: Stmt list) -> fn (found: Stmt list) ->
+and native_definition_shape = fn (body: Stmt list) ->
+  let rec definition = fn (xs: Stmt list) -> fn (found: Stmt list) ->
       match xs with
       | Nil -> found
       | Cons (SLine _, rest) -> definition rest found
@@ -55529,23 +55713,24 @@ and native_definition_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -
         then (Nil : Stmt list) else definition rest (Cons (stmt, Nil))
          | _ -> (Nil : Stmt list))
       | _ -> (Nil : Stmt list) in
-    match definition body Nil with
-    | Cons (SDef (name, params, defaults, method_body), Nil) ->
-      let key = cls ++ "#" ++ name in
-      let (methods, _, _, _) = world in
-      if map_has methods key || (if mro_cache_on () then false else true) || vec_get core_only 0 != 0
+  definition body Nil
+and native_definition_allowed = fn world -> fn (cls: str) -> fn (name: str) ->
+  let key = cls ++ "#" ++ name in
+  let (methods, _, _, _) = world in
+  not (map_has methods key || (if mro_cache_on () then false else true) || vec_get core_only 0 != 0
          || map_has flow_sig "k" || map_len trace_fn > 0 || map_len signal_traps > 0 || map_len sig_armed > 0
          || map_len all_thr > 1 || fb_live () > 0 || vec_get thr_body_v 0 != 0
          || map_has hook_flags "ma" || map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
          || (if map_has anonymous_classes cls then false else true)
          || map_has meth_owner_seen cls || map_has cls_frozen cls || map_has consts cls
-         || map_has builtin_alias key || map_has undefs key then (false, VNil)
-      else
-        let saved = ref_save_active () in
-        let saved_lex = cur_lex () in
-        let _ = (if ref_on () then ref_install (ref_env_id denv) else ()) in
-        let _ = set_lex cscope in
-        let install = fn (u: unit) ->
+         || map_has builtin_alias key || map_has undefs key)
+
+// The caller proved a fresh, callback-free definition and installed the
+// lexical state. This writer also serves a native using/declaration body.
+and native_definition_commit = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (stmt: Stmt) ->
+  match stmt with
+  | SDef (name, params, defaults, method_body) ->
+    let key = cls ++ "#" ++ name in
           let rec positions = fn (xs: Stmt list) -> fn (value: Val) ->
             match xs with
             | Nil -> value
@@ -55554,21 +55739,107 @@ and native_definition_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -
             | Cons (SFile file, rest) -> let _ = (if str_eq file (cur_file ()) then () else cur_file_set file) in positions rest VNil
             | Cons (SDef (_, _, _, _), rest) ->
               let (methods, _, _, _) = world in
-              let _ = set_meth methods key (Meth (params, defaults, method_body)) in
+              let _ = set_fresh_meth methods cls key (Meth (params, defaults, method_body)) in
               let _ = map_set meth_cref key (lex_pack ()) in
-              let _ = stamp_meth_src key in
+              let _ = stamp_named_meth_src key name in
               let _ = (if map_has r2k_methods key then map_delete r2k_methods key else ()) in
               let _ = (if map_has protecteds key then map_delete protecteds key else ()) in
               let _ = (if always_private_meth name then set_private key VNil
                        else if map_has privates key then map_delete privates key else ()) in
               positions rest (VSym name)
             | _ -> VNil in
-          positions body VNil in
-        let result = try_or_msg install (fn (message: str) ->
-                       let _ = set_lex saved_lex in let _ = restore_ref_active saved in fail message) in
-        let _ = set_lex saved_lex in
-        let _ = restore_ref_active saved in (true, result)
-    | _ -> (false, VNil)
+  positions body VNil
+
+  | _ -> VNil
+and native_definition_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
+  match native_definition_shape body with
+  | Cons (stmt, Nil) ->
+    let name = (match stmt with SDef (n, _, _, _) -> n | _ -> "") in
+    if not (native_definition_allowed world cls name) then (false, VNil)
+    else
+      let saved = ref_save_active () in
+      let saved_lex = cur_lex () in
+      let _ = (if ref_on () then ref_install (ref_env_id denv) else ()) in
+      let _ = set_lex cscope in
+      let result = try_or_msg (fn (u: unit) -> native_definition_commit world cls body stmt)
+        (fn (message: str) -> let _ = set_lex saved_lex in let _ = restore_ref_active saved in fail message) in
+      let _ = set_lex saved_lex in
+      let _ = restore_ref_active saved in (true, result)
+  | _ -> (false, VNil)
+// Only existing lexical locals and ordinary global slots can be read here.
+// Missing names, special globals, aliases and constant lookup retain eval_e.
+and native_declaration_argument = fn denv -> fn (argument: Expr) ->
+  match argument with
+  | EVar name when str_len name > 1 && str_eq (char_at name 0) "$"
+       && (is_alpha (char_at name 1) || str_eq (char_at name 1) "_") ->
+    let slot = substring name 1 (str_len name) in
+    if map_has gvar_alias slot || not (map_has globals slot) then ""
+    else (match map_get globals slot with VClass c -> c | _ -> "")
+  | EVar name when str_len name > 0
+       && ((ord (char_at name 0) >= 97 && ord (char_at name 0) <= 122) || str_eq (char_at name 0) "_")
+       && not (str_starts_with name "__") && lv_has denv name ->
+    (match lv_get denv name with VClass c -> c | _ -> "")
+  | _ -> ""
+and native_declaration_protocol = fn world -> fn (cls: str) -> fn (name: str) -> fn denv ->
+  ref_env_id denv == 0 && ref_cur_id () == 0
+  && not (map_has undef_names name || map_has blt_alias_names name)
+  && (let (methods, _, _, _) = world in not (map_has methods name))
+  && not (has_meth world ("(sng:" ++ cls ++ ")") name)
+and native_declaration_positions = fn (body: Stmt list) ->
+  match body with
+  | Cons (SLine n, rest) -> let _ = (if n < 0 then () else cur_line_set n) in native_declaration_positions rest
+  | Cons (SLineQ n, rest) -> let _ = (if n < 0 then () else cur_line_set n) in native_declaration_positions rest
+  | Cons (SFile file, rest) -> let _ = cur_file_set file in native_declaration_positions rest
+  | _ -> ()
+// A using followed by one ordinary def, or a refine containing one def,
+// does not expose a mutable class scope when none of its protocols can call
+// Ruby. Arbitrary statements, hooks and observed owners retain the walker.
+and native_refinement_declaration_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
+  match core_metadata_stmts body with
+  | Cons (SExpr (ECall (using_name, Cons (argument, Nil))), rest) when str_eq using_name "using" ->
+    (match native_definition_shape rest with
+     | Cons (stmt, Nil) ->
+       let name = (match stmt with SDef (n, _, _, _) -> n | _ -> "") in
+       let refinery = native_declaration_argument denv argument in
+       if str_eq refinery "" || not (map_has modules refinery) || is_refine_impl refinery
+          || lv_has denv "__meth" || not (native_definition_allowed world cls name)
+          || not (native_declaration_protocol world cls "using" denv) then (false, VNil)
+       else
+         let saved = ref_save_active () in
+         let saved_lex = cur_lex () in
+         let result = try_or_msg (fn (u: unit) ->
+           let _ = native_declaration_positions body in
+           let _ = map_set ref_flag 0 1 in
+           let rec activate = fn (owners: str list) ->
+             match owners with
+             | Nil -> ()
+             | Cons (owner, tail) ->
+               let _ = activate tail in
+               activate_refinements owner 0 (if map_has refine_cnt owner then map_get refine_cnt owner else 0) in
+           let _ = activate (mod_ancestors world refinery) in
+           let _ = ref_snapshot () in
+           let _ = set_lex cscope in
+           native_definition_commit world cls rest stmt)
+           (fn (message: str) -> let _ = set_lex saved_lex in let _ = restore_ref_active saved in fail message) in
+         let _ = set_lex saved_lex in
+         let _ = restore_ref_active saved in (true, result)
+     | _ -> (false, VNil))
+  | Cons (SExpr (ECallB (refine_name, Cons (argument, Nil), Nil, inner)), tail)
+    when str_eq refine_name "refine" && core_mixin_tail tail ->
+    (match native_definition_shape inner with
+     | Cons (stmt, Nil) ->
+       let name = (match stmt with SDef (n, _, _, _) -> n | _ -> "") in
+       let target = native_declaration_argument denv argument in
+       if str_eq target "" || not (map_has modules cls) || map_has refine_cnt cls
+          || not (native_definition_allowed world cls name)
+          || not (native_declaration_protocol world cls "refine" denv) then (false, VNil)
+       else
+         let _ = native_declaration_positions body in
+         let value = do_refine world cls target inner denv in
+         let _ = native_declaration_positions tail in
+         (true, (match tail with Nil -> value | _ -> VNil))
+     | _ -> (false, VNil))
+  | _ -> (false, VNil)
 and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
   // ⚠ a block body is starting, so the pending `&pr` source is spent -- as
   //   run_block says for the same reason. A class body never reached it, so
@@ -55579,6 +55850,9 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   let _ = if map_has pending_home "v" then map_delete pending_home "v" else () in
   let (native_hit, native_value) = native_definition_body world cls body cscope denv in
   if native_hit then FNext native_value
+  else
+  let (refinement_hit, refinement_value) = native_refinement_declaration_body world cls body cscope denv in
+  if refinement_hit then FNext refinement_value
   else
   let saved = ref_save_active () in
   let cenv = blk_env_get denv in
@@ -56624,9 +56898,7 @@ and refine_target_of = fn (c: str) ->
     (let rest9 = substring c 7 (str_len c) in
      let u9 = str_rfind rest9 "_" 0 (0 - 1) in
      let k9 = (if u9 < 0 then "" else substring rest9 0 u9 ++ "#" ++ substring rest9 (u9 + 1) (str_len rest9)) in
-     match (if map_has refine_tgt k9 then map_get refine_tgt k9 else VNil) with
-     | VStr h9 -> sget h9
-     | _ -> "")
+     if map_has refine_tgt k9 then map_get refine_tgt k9 else "")
   else ""
 
 // Refinement#import_methods(*modules): each module's OWN instance methods are
@@ -60565,6 +60837,8 @@ and match_eqq = fn env -> fn world -> fn blk -> fn (cand: Val) -> fn (v: Val) ->
 // active, so a normal call pays only one map_len check.
 and refined_impl_for = fn world -> fn (recv: Val) -> fn (name: str) ->
   if map_len ref_active == 0 then ""
+  else if mro_cache_on () && (if refinement_method_possible name || map_has blt_alias_names name || map_has undef_names name then false else true)
+  then ""
   // ⚠ a CLASS receiver answers from its singleton chain: dispatch_cls_of says
   //   the class itself, so `refine c do ... end` handed its INSTANCE methods
   //   to `c.whatever` -- and, with a top-level `def include` in Object (the

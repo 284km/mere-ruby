@@ -2039,15 +2039,15 @@ let proc_origin = map_new ();
 // refined methods. `using refinery` activates them into ref_active (target
 // class name -> impl_cls class name); register_class save/restores ref_active so a
 // `using` inside a module body is scoped to that body (Ruby's lexical scope).
-let refine_cnt = map_new ();   // "<refinery>"      -> VInt count
-let refine_tgt = map_new ();   // "<refinery>#<i>"  -> VStr target class
-let refine_cls = map_new ();   // "<refinery>#<i>"  -> VStr impl_cls class
+let refine_cnt = map_new ();   // "<refinery>"      -> native count
+let refine_tgt = map_new ();   // "<refinery>#<i>"  -> native target class name
+let refine_cls = map_new ();   // "<refinery>#<i>"  -> native implementation class name
 // (ref_active itself is defined above lex_pack, which reads it)
 // Each distinct table `using` has produced, encoded (see ref_snapshot): the
 // packed cref of a method and the "__rf" slot of an env name one by its id.
 let ref_snap_counter = vec_new ();
 let _ = vec_push ref_snap_counter 0;
-let ref_snaps = map_new ();    // "<id>"            -> VStr the encoded table
+let ref_snaps = map_new ();    // integer id -> immutable encoded lexical table
 // per-case memo of #deconstruct / #deconstruct_keys results, so a case with
 // several `in` clauses calls the method once (Ruby caches). Keyed by value
 // handle; cleared at the start of each case.
@@ -2884,6 +2884,38 @@ let proc_symsrc = map_new ();    // Symbol#to_proc's proc id -> the symbol name
 // Symbol#to_proc's proc, one per symbol name (ruby caches it)
 let sym_proc_cache = map_new ();
 let _ = map_compact proc_symsrc;  // (its own arena from birth, compacted by the sweep: note 300)
+// Private Method fields carry symbols and class references directly. Keep a
+// text decoder for their shared readers and legacy packed-definition strings.
+let method_text_or = fn (fallback: str) -> fn (value: Val) ->
+  match value with
+  | VClass owner -> owner
+  | VSym name -> name
+  | VStr handle -> sget handle
+  | _ -> fallback;
+let method_text = fn (value: Val) -> method_text_or "" value;
+// Method and UnboundMethod payloads are native object metadata. Each row
+// is reached only through its live Method and swept with that object's id.
+let method_cores = map_new ();
+let _ = map_compact method_cores;
+let store_bound_method_core = fn (id: int) -> fn (name: Val) -> fn (owner: Val) -> fn (receiver: Val) ->
+  map_set method_cores id (name, owner, receiver, VNil);
+let method_core_field = fn (id: int) -> fn (slot: int) ->
+  if map_has method_cores id then
+    let (name, owner, receiver, from) = map_get method_cores id in
+    if slot == 0 then name else if slot == 1 then owner else if slot == 2 then receiver else from
+  else VNil;
+let store_unbound_method_core = fn (id: int) -> fn (name: Val) -> fn (body_class: Val) -> fn (owner: Val) -> fn (from: Val) ->
+  map_set method_cores id (name, body_class, owner, from);
+let method_core_has_field = fn (id: int) -> fn (slot: int) ->
+  match method_core_field id slot with VNil -> false | _ -> true;
+let method_core_set_from = fn (id: int) -> fn (from: Val) ->
+  let name = method_core_field id 0 in
+  let body_class = method_core_field id 1 in
+  let owner = method_core_field id 2 in
+  store_unbound_method_core id name body_class owner from;
+let copy_method_core = fn (src: int) -> fn (dst: int) ->
+  if map_has method_cores src then map_set method_cores dst (map_get method_cores src) else ();
+
 let meth_params = map_new ();   // "cls#name" -> the Array of parameter names
 let meth_src = map_new ();       // "cls#name" -> line, "f" ++ key -> file
 // "cls#name" -> 1 for a method the prelude wrote: ruby's C method, which has
@@ -2896,9 +2928,9 @@ let def_bare_name = fn (k: str) ->
      else (let c9 = char_at k i in
            from (i + 1) (if str_eq c9 "#" || (str_eq c9 "." && i + 1 < str_len k && i > 0) then i + 1 else st))) in
   let st9 = from 0 0 in substring k st9 (str_len k);
-let stamp_meth_src = fn (key: str) ->
+let stamp_named_meth_src = fn (key: str) -> fn (name: str) ->
   let _ = map_set meth_src key (VInt (cur_line ())) in
-  let _ = (let k9 = def_bare_name key ++ ":" ++ str_of_int (cur_line ()) in
+  let _ = (let k9 = name ++ ":" ++ str_of_int (cur_line ()) in
            let _ = (if map_has def_end_lines k9 then map_set meth_src ("e" ++ key) (map_get def_end_lines k9) else ()) in
            if map_has def_end_lines ("~" ++ k9) then map_set meth_src ("~" ++ key) (VInt 1)
            else if map_has meth_src ("~" ++ key) then map_delete meth_src ("~" ++ key) else ()) in
@@ -2907,6 +2939,7 @@ let stamp_meth_src = fn (key: str) ->
            else if map_has meth_cfn key then map_delete meth_cfn key else ()) in
   // Source paths are internal metadata; public readers create frozen fstrings.
   map_set meth_src ("f" ++ key) (frame_text f);
+let stamp_meth_src = fn (key: str) -> stamp_named_meth_src key (def_bare_name key);
 // the definition site of one method is the definition site of another when
 // the second was made FROM the first (an alias, or a define_method given a
 // Method). The three lines that move it were written out at each `alias` site
@@ -3093,7 +3126,7 @@ let ref_snapshot = fn (u: unit) ->
             else map_set acc 0 (map_get acc 0 ++ k ++ chr 1 ++ (match v with VClass c -> c | _ -> "") ++ chr 2)) in
   let id = vec_get ref_snap_counter 0 + 1 in
   let _ = vec_set ref_snap_counter 0 id in
-  let _ = map_set ref_snaps (str_of_int id) (mkstr (map_get acc 0)) in
+  let _ = map_set ref_snaps id (map_get acc 0) in
   let _ = map_set ref_active "~rid" (VInt id) in
   id
   };
@@ -3101,15 +3134,15 @@ let ref_snapshot = fn (u: unit) ->
 let rec ref_live_go = fn (r: str) -> fn (i: int) -> fn (n: int) ->
   if i >= n then ()
   else (let k = r ++ "#" ++ str_of_int i in
-        let t = (if map_has refine_tgt k then (match map_get refine_tgt k with VStr h -> sget h | _ -> "") else "") in
-        let c = (if map_has refine_cls k then (match map_get refine_cls k with VStr h -> sget h | _ -> "") else "") in
+        let t = (if map_has refine_tgt k then map_get refine_tgt k else "") in
+        let c = (if map_has refine_cls k then map_get refine_cls k else "") in
         // (in FRONT of what is already active for t, which stays behind it:
         //  `using R1` inside R2's refine body leaves R1's refinement of the
         //  same class reachable from a method R2 defines there)
         let _ = (if str_eq t "" || str_eq c "" then () else ref_put t c) in
         ref_live_go r (i + 1) n);
 let ref_live = fn (r: str) ->
-  ref_live_go r 0 (if map_has refine_cnt r then (match map_get refine_cnt r with VInt k -> k | _ -> 0) else 0);
+  ref_live_go r 0 (if map_has refine_cnt r then map_get refine_cnt r else 0);
 // make ref_active the snapshot `id` (0: no refinement active). A no-op when
 // it already is, which is the common case: most calls stay in one scope.
 let ref_install = fn (id: int) ->
@@ -3118,8 +3151,7 @@ let ref_install = fn (id: int) ->
     (let _ = map_clear ref_active in
      if id == 0 then ()
      else
-       (let enc = (if map_has ref_snaps (str_of_int id)
-                   then (match map_get ref_snaps (str_of_int id) with VStr h -> sget h | _ -> "") else "") in
+       (let enc = (if map_has ref_snaps id then map_get ref_snaps id else "") in
         let ents = str_split enc (chr 2) in
         // the fixed entries first, then the live ones over them: a refine
         // body's own module wins over what was active around it
@@ -4775,8 +4807,29 @@ let struct_gen = map_new ();
 // owner has no method rows to copy.
 let meth_owner_seen = map_new ();
 let _ = map_compact meth_owner_seen;
+// A fixed bucket filter never holds names or class identities. Collisions
+// only cause a full lookup. Rebuild it from live method rows at each GC.
+let refinement_method_bits = vec_new ();
+let _ = (let rec init = fn (i: int) -> if i >= 256 then () else
+           (let _ = vec_push refinement_method_bits 0 in init (i + 1)) in init 0);
+let _ = vec_compact refinement_method_bits;
+let refinement_method_bucket = fn (name: str) ->
+  let n = str_len name in
+  if n == 0 then 0 else (n + ord (char_at name 0) * 17 + ord (char_at name (n - 1)) * 131) % 256;
+let refinement_method_possible = fn (name: str) ->
+  vec_get refinement_method_bits (refinement_method_bucket name) != 0;
+let note_refinement_method_name = fn (key: str) ->
+  if str_starts_with key "Refine_"
+  then vec_set refinement_method_bits (refinement_method_bucket (meth_key_base key)) 1
+  else ();
+let rebuild_refinement_method_names = fn (u: unit) ->
+  let rec clear = fn (i: int) -> if i >= 256 then () else
+    (let _ = vec_set refinement_method_bits i 0 in clear (i + 1)) in
+  let _ = clear 0 in
+  map_iter meths_g (fn (key: str) -> fn (_value: Meth) -> note_refinement_method_name key);
 // All primary method writes, including raw singleton copies, mark their arena.
 let store_meth = fn tbl -> fn (key: str) -> fn (value: Meth) ->
+  let _ = note_refinement_method_name key in
   let _ = vec_set method_store_dirty 0 1 in map_set tbl key value;
 let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
   let _ = class_sng_method_note k in
@@ -4806,6 +4859,13 @@ let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
            else ()) in
   let _ = (if map_len struct_gen > 0 && map_has struct_gen k then map_delete struct_gen k else ()) in
   let _ = map_delete meth_params k in store_meth tbl k v;
+// native_definition_body proves an unobserved anonymous owner, an absent
+// method row and no alias/undef/generated-method or notification-hook state.
+// Retain cache invalidation, owner presence and parameter-cache invalidation.
+let set_fresh_meth = fn tbl -> fn (owner: str) -> fn (key: str) -> fn (value: Meth) ->
+  let _ = mro_bump_class owner in
+  let _ = map_set meth_owner_seen owner 1 in
+  let _ = map_delete meth_params key in store_meth tbl key value;
 let del_meth = fn tbl -> fn (k: str) ->
   let _ = vec_set method_store_dirty 0 1 in
   let _ = msnap_save tbl k in
@@ -5112,7 +5172,7 @@ let _ = map_compact gvar_wname;
 let gc_churn_bytes = fn (u: unit) ->
   vec_bytes metadata_methods_cache + vec_bytes method_store_floor + vec_bytes method_store_dirty + vec_bytes include_defaults_cache + vec_bytes core_new_cache + vec_bytes private_new_seen + map_bytes gvar_wname +
   map_bytes meth_name_ids + map_bytes meth_names + vec_bytes meth_name_next +
-  map_bytes anonymous_classes + map_bytes cls_copy_of +
+  map_bytes anonymous_classes + map_bytes cls_copy_of + map_bytes method_cores + vec_bytes refinement_method_bits +
   map_bytes bi_class_name +
   map_bytes bi_owner_memo + map_bytes meth_cfn + map_bytes builtin_alias + map_bytes ie_def_meths + map_bytes hng_store + map_bytes hng_sng_base
   +   map_bytes meth_owner_seen +
