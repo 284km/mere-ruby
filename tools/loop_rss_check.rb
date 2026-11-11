@@ -33,6 +33,10 @@ CASES = {
     fb = Hash.new { raise LoopRssError }
     (100_000 / d).times { begin; "\ufffd".encode(Encoding::US_ASCII, fallback: fb); rescue LoopRssError; end }
   },
+  # a Class key is not plain, so the hash has an index; past 4096 pooled
+  # indexes a dead one was dropped and never freed (4 KB a turn) -- the
+  # mask of Thread.handle_interrupt(Exception => :immediate)
+  "a hash with a Class key" => ->(d) { (100_000 / d).times { { Exception => :immediate }.size } },
 }
 
 name, body = CASES.to_a.fetch(Integer(ARGV.fetch(0)))
