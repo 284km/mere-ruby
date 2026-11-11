@@ -2637,7 +2637,7 @@ let name_spec = fn (tag: str) ->
     ++ "send|__send__|public_send|hash|object_id|__id__|==|!=|equal?|eql?|!~|"
     ++ "instance_variable_get|instance_variable_set|"
     ++ "instance_variable_defined?|instance_variables|singleton_class|"
-    ++ "methods|public_methods|singleton_methods|method|extend|"
+    ++ "methods|public_methods|singleton_methods|method|public_method|extend|"
     ++ "define_singleton_method|<=>"
     )
   else if str_eq tag "hash_iter" then ("each|each_pair|each_key|each_value|each_with_index|each_with_object|each_entry|"
@@ -3119,14 +3119,18 @@ let ref_save_active = fn (u: unit) ->
   };
 let ref_snapshot = fn (u: unit) ->
   region RFSNAP {
-  let acc = map_new () in
-  let _ = map_set acc 0 "" in
-  let _ = map_iter ref_active (fn (k: str) -> fn (v: Val) ->
-            if str_eq k "~rid" then ()
-            else map_set acc 0 (map_get acc 0 ++ k ++ chr 1 ++ (match v with VClass c -> c | _ -> "") ++ chr 2)) in
+  let encoded = strbuf_new () in
+  let pair_separator = chr 1 in
+  let entry_separator = chr 2 in
+  let _ = map_iter ref_active (fn (key: str) -> fn (value: Val) ->
+    if str_eq key "~rid" then () else
+      (let _ = strbuf_push encoded key in
+       let _ = strbuf_push encoded pair_separator in
+       let _ = strbuf_push encoded (match value with VClass cls -> cls | _ -> "") in
+       strbuf_push encoded entry_separator)) in
   let id = vec_get ref_snap_counter 0 + 1 in
   let _ = vec_set ref_snap_counter 0 id in
-  let _ = map_set ref_snaps id (map_get acc 0) in
+  let _ = map_set ref_snaps id (strbuf_to_str encoded) in
   let _ = map_set ref_active "~rid" (VInt id) in
   id
   };
@@ -3152,19 +3156,34 @@ let ref_install = fn (id: int) ->
      if id == 0 then ()
      else
        (let enc = (if map_has ref_snaps id then map_get ref_snaps id else "") in
-        let ents = str_split enc (chr 2) in
-        // the fixed entries first, then the live ones over them: a refine
-        // body's own module wins over what was active around it
-        let _ = list_iter ents (fn (e: str) ->
-                  let j = str_index_of e (chr 1) in
-                  if j <= 0 || str_eq (char_at e 0) "@" then ()
-                  else map_set ref_active (substring e 0 j) (VClass (substring e (j + 1) (str_len e)))) in
-        let _ = list_iter ents (fn (e: str) ->
-                  let j = str_index_of e (chr 1) in
-                  if j <= 1 || (if str_eq (char_at e 0) "@" then false else true) then ()
-                  else (let r = substring e 1 j in
-                        let _ = map_set ref_active ("@" ++ r) VNil in
-                        ref_live r)) in
+        let size = str_len enc in
+        let pair_separator = chr 1 in
+        let entry_separator = chr 2 in
+        // Read the immutable encoding in place. Fixed entries still precede
+        // all live refinery expansion, preserving shadowing and activation
+        // order without a split list or copies of each whole entry.
+        let end_of_entry = fn (start: int) ->
+          let stop = str_find_from enc entry_separator start in
+          if stop < 0 then size else stop in
+        let rec fixed = fn (start: int) -> fn (has_live: bool) ->
+          if start >= size then has_live else
+            let stop = end_of_entry start in
+            let separator = str_find_from enc pair_separator start in
+            let live = str_eq (char_at enc start) "@" in
+            let _ = (if separator > start && separator < stop && not live then
+              map_set ref_active (substring enc start separator)
+                (VClass (substring enc (separator + 1) stop)) else ()) in
+            fixed (stop + 1) (has_live || live) in
+        let rec live = fn (start: int) ->
+          if start >= size then () else
+            let stop = end_of_entry start in
+            let separator = str_find_from enc pair_separator start in
+            let _ = (if separator > start + 1 && separator < stop && str_eq (char_at enc start) "@" then
+              (let refinery = substring enc (start + 1) separator in
+               let _ = map_set ref_active ("@" ++ refinery) VNil in
+               ref_live refinery) else ()) in
+            live (stop + 1) in
+        let _ = (if fixed 0 false then live 0 else ()) in
         map_set ref_active "~rid" (VInt id)));
 // the snapshot an env's lexical scope was written under
 let ref_env_id = fn env -> (match lv_get env "__rf" with VInt n -> n | _ -> 0);
@@ -4827,9 +4846,21 @@ let rebuild_refinement_method_names = fn (u: unit) ->
     (let _ = vec_set refinement_method_bits i 0 in clear (i + 1)) in
   let _ = clear 0 in
   map_iter meths_g (fn (key: str) -> fn (_value: Meth) -> note_refinement_method_name key);
+// Fixed conservative flag: before any definition or visibility change of
+// method/unbind, both native reflection protocols are still the defaults.
+// It never holds class identities and never resets after a mutation.
+let reflection_protocol_changed = vec_new ();
+let _ = vec_push reflection_protocol_changed 0;
+let _ = vec_compact reflection_protocol_changed;
+let note_reflection_protocol = fn (key: str) ->
+  if vec_get reflection_protocol_changed 0 != 0 then ()
+  else if str_eq key "method" || str_eq key "unbind" || str_eq key "public_method"
+       || str_ends_with key "#method" || str_ends_with key "#unbind" || str_ends_with key "#public_method"
+  then vec_set reflection_protocol_changed 0 1 else ();
 // All primary method writes, including raw singleton copies, mark their arena.
 let store_meth = fn tbl -> fn (key: str) -> fn (value: Meth) ->
   let _ = note_refinement_method_name key in
+  let _ = note_reflection_protocol key in
   let _ = vec_set method_store_dirty 0 1 in map_set tbl key value;
 let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
   let _ = class_sng_method_note k in
@@ -4882,6 +4913,7 @@ let private_new_seen = vec_new ();
 let _ = vec_push private_new_seen 0;
 let _ = vec_compact private_new_seen;
 let set_private = fn (key: str) -> fn (value: Val) ->
+  let _ = note_reflection_protocol key in
   let _ = (if vec_get private_new_seen 0 == 0 && (str_eq key "new" || str_ends_with key "#new")
            then vec_set private_new_seen 0 1 else ()) in
   map_set privates key value;
@@ -4892,6 +4924,9 @@ let set_private = fn (key: str) -> fn (value: Val) ->
 //   statement named a method, so the owner walk can stop there.
 let vis_marks = map_new ();   // "cls#name" -> VNil, where a visibility statement named it
 let protecteds = map_new ();  // protected methods (callable only same-class)
+let set_protected = fn (key: str) -> fn (value: Val) ->
+  let _ = note_reflection_protocol key in map_set protecteds key value;
+
 let num_names_memo = map_new ();  // numeric kind -> its method-name set
 // prim_method has no `world` to build an exception, so its terminal
 // "undefined method" failure parks the method name here; the begin/rescue
@@ -5172,7 +5207,7 @@ let _ = map_compact gvar_wname;
 let gc_churn_bytes = fn (u: unit) ->
   vec_bytes metadata_methods_cache + vec_bytes method_store_floor + vec_bytes method_store_dirty + vec_bytes include_defaults_cache + vec_bytes core_new_cache + vec_bytes private_new_seen + map_bytes gvar_wname +
   map_bytes meth_name_ids + map_bytes meth_names + vec_bytes meth_name_next +
-  map_bytes anonymous_classes + map_bytes cls_copy_of + map_bytes method_cores + vec_bytes refinement_method_bits +
+  map_bytes anonymous_classes + map_bytes cls_copy_of + map_bytes method_cores + vec_bytes refinement_method_bits + vec_bytes reflection_protocol_changed +
   map_bytes bi_class_name +
   map_bytes bi_owner_memo + map_bytes meth_cfn + map_bytes builtin_alias + map_bytes ie_def_meths + map_bytes hng_store + map_bytes hng_sng_base
   +   map_bytes meth_owner_seen +
