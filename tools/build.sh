@@ -92,13 +92,24 @@ if [ "$emit" = 1 ]; then
 fi
 [ -f mr.c ] || { echo "build.sh: no mr.c to compile" >&2; exit 2; }
 
-# Some compiler releases retain 64 regions but predate the configurable cap.
-# Refuse a silently ignored build flag instead of restoring the RSS regression.
+# The native region cache is the compiler's default (64 a thread). Between
+# v0.1.727 and v0.1.728 a deep cache handed a region back NOT zeroed, the
+# conservative scan read stale handles in it, and prism's snippets_test went
+# past 2 GiB -- so the build then pinned eight (#79). v0.1.729 zeroes what a
+# cached region was used for and adds mem_trim (GC.start calls it): 64 is
+# back at snippets_test's old peak, and the UDP leak checks fit their child's
+# 10 seconds again (at eight they do not). Refuse an emitted runtime without
+# the zeroing rather than bring the regression back.
+if ! grep -q '__lang_mem_trim' mr.c; then
+  echo 'build.sh: mr.c predates Mere v0.1.729 (cached regions are not zeroed); use the pinned Mere compiler' >&2
+  exit 2
+fi
+# Reject a runtime that silently changes the compiler's native default.
 if ! printf '%s\n' '#include "mr.c"' \
-  '#if !defined(__LANG_REGION_CACHE_CAP) || __LANG_REGION_CACHE_CAP != 8' \
-  '#error native region cache must be eight; use the pinned Mere compiler' \
-  '#endif' | clang -w -E -x c -I "$root" -DMERE_REGION_CACHE_CAP=8 - >/dev/null; then
-  echo 'build.sh: compiler cannot enforce the native region-cache policy; use the pinned Mere compiler' >&2
+  '#if !defined(__LANG_REGION_CACHE_CAP) || __LANG_REGION_CACHE_CAP != 64' \
+  '#error native region cache must use the compiler default of 64' \
+  '#endif' | clang -w -E -x c -I "$root" - >/dev/null; then
+  echo 'build.sh: compiler does not provide the required native cache policy' >&2
   exit 2
 fi
 
@@ -146,11 +157,8 @@ printf 'cc     clang %s %s mr.c tools/*_glue.c libprism.a with OpenSSL -> mere-r
 # ⚠ NEVER `cp` OVER A RUNNING BINARY -- the text pages of a process that is
 # mid-run are backed by that file, and overwriting them SIGKILLs it or, worse,
 # gives it another build's instructions. Build beside it and rename.
-# Retain eight native region seeds per thread. Nested Ruby calls otherwise
-# leave a much larger idle cache after deep dispatch; preserve the native
-# interpreter's existing RSS headroom while keeping allocation lifetimes.
 # shellcheck disable=SC2086
-clang $opt -w $plat -DMERE_REGION_CACHE_CAP=8 -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
+clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
 
 # ...and say which build this is, where something that must not be misled can

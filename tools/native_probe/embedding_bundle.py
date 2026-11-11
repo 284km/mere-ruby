@@ -15,6 +15,7 @@ import os
 import platform
 import shutil
 import sys
+sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent
