@@ -41,6 +41,8 @@ extern struct mere_bytes *mr_ossl_call(const char *, struct mere_bytes *);
 extern int mr_ossl_clear_result(void);
 extern int mr_ossl_valid(int);
 extern int mr_ossl_release(int);
+extern long long mr_nkf_owned_allocations(void);
+extern const struct mere_bytes *mr_nkf_result(void);
 static unsigned long wire_u32(const unsigned char *p) {
  return ((unsigned long)p[0]<<24)|((unsigned long)p[1]<<16)|((unsigned long)p[2]<<8)|p[3];
 }
@@ -70,9 +72,12 @@ static int native_lifetimes(const char *mode) {
  if(baseline!=initial+1 || !mr_ossl_valid(sentinel)) return 50;
  for(int cycle=0;cycle<3;cycle++) {
   mere_lib_init(); if(simple(mere_embedding_setup)) return 51;
+  check("require 'nkf'; raise 'nkf conversion' unless NKF.nkf('-w', 'abc')=='abc'",0,"");
+  if(mr_nkf_owned_allocations()!=7 || mr_nkf_result()!=NULL) return 55;
   check("require 'openssl'; $held_ssl = Array.new(32) { OpenSSL::X509::Certificate.new }; GC.start",0,"");
   check("$ssl_ready=Queue.new; $ssl_worker=Thread.new { begin; $thread_ssl=OpenSSL::X509::Certificate.new; $ssl_ready << true; sleep; ensure; raise 'native owner lost before thread teardown' unless $thread_ssl.version==0; $thread_end_ssl=OpenSSL::X509::Certificate.new; end }; $ssl_ready.pop",0,"");
   check("at_exit { raise 'native owner lost before hooks' unless $held_ssl.all? { |cert| cert.version==0 }; $hook_ssl=OpenSSL::X509::Certificate.new }",0,"");
+  check("at_exit { raise 'nkf lost before hooks' unless NKF.nkf('-s', 'abc')=='abc' }; $nkf_ready=Queue.new; $nkf_worker=Thread.new { begin; $nkf_ready << true; sleep; ensure; raise 'nkf lost before thread teardown' unless NKF.nkf('-w', 'abc')=='abc'; end }; $nkf_ready.pop",0,"");
   int expected=0;
   if(!strcmp(mode,"native-ownership-error")) { check("raise 'pending_native'",1,"RuntimeError"); expected=1; }
   if(!strcmp(mode,"native-ownership-hook-error")) { check("at_exit { $error_ssl=OpenSSL::X509::Certificate.new; raise 'native_hook' }",0,""); expected=1; }
@@ -80,6 +85,7 @@ static int native_lifetimes(const char *mode) {
   if(!strcmp(mode,"native-ownership-failure")) expected=1;
   long long status=simple(mere_embedding_cleanup);
   if(status!=expected || simple(mere_embedding_cleanup)!=expected) return 51;
+  if(mr_nkf_owned_allocations()!=0 || mr_nkf_result()!=NULL) return 56;
   long long live=native_live();
   if(live!=baseline || !mr_ossl_valid(sentinel)) {
    fprintf(stderr,"native live after cleanup cycle %d: %lld baseline:%lld\n",cycle,live,baseline); return 52;
