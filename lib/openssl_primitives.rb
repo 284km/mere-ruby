@@ -52,7 +52,8 @@ if OpenSSL.__native_available
         def initialize(data = nil); super('SHA224', data); end
       end
     end
-    def self.Digest(name); Digest.const_get(OpenSSL.__str(name)); end
+    # (a Symbol names the digest as a String does: OpenSSL::Digest(:SHA512))
+    def self.Digest(name); Digest.const_get(name.is_a?(Symbol) ? name : OpenSSL.__str(name)); end
 
     class HMAC
       def initialize(key, digest)

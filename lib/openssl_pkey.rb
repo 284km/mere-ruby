@@ -118,6 +118,7 @@ module OpenSSL
       def to_der; export_format('traditional_der'); end
       def export(*args, &block); export_format('traditional_pem', *args, &block); end
       alias to_pem export
+      alias to_s export  # (ossl_pkey_*.c: to_s is export, as to_pem is)
       def sign_pss(digest, data, salt_length:, mgf1_hash:)
         salt = {digest: -1, max: -2}.fetch(salt_length, salt_length)
         sign(digest, data, {'rsa_padding_mode'=>'pss','rsa_pss_saltlen'=>salt,'rsa_mgf1_md'=>::OpenSSL::PKey.digest_name(mgf1_hash)})
@@ -136,6 +137,7 @@ module OpenSSL
       def to_der; export_format('traditional_der'); end
       def export(*args, &block); export_format('traditional_pem', *args, &block); end
       alias to_pem export
+      alias to_s export  # (ossl_pkey_*.c: to_s is export, as to_pem is)
     end
     class DH < PKey
       def initialize(value, password = nil, &block)
@@ -146,6 +148,7 @@ module OpenSSL
       def to_der; export_format('traditional_der'); end
       def export; export_format('traditional_pem'); end
       alias to_pem export
+      alias to_s export  # (ossl_pkey_*.c: to_s is export, as to_pem is)
       def params_ok?; Backend.call('pkey.params_ok', self); end
     end
     class EC < PKey

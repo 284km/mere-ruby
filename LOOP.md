@@ -3754,3 +3754,61 @@ Round 20 of note 544 (the plan after stage 4: stage 5 first, then RubyGems).
   File#chmod on a handle that writes now opens its descriptor first, and a
   flush the path refuses goes through that descriptor at the write position
   (a refused flush with no descriptor is Errno::EACCES). test_gem 127/129.
+
+## 2026-11-12 (37): stage 6, round 21 -- RubyGems' remainder, a class body's value and the env pool, Comparable's !=, rubygems before -r, GB9c
+
+Round 21 of note 544: the RubyGems files that were left after round 20,
+surveyed again file by file against the reference run locally (a test the
+reference also fails here -- no rust toolchain, the binary's path, a
+different install layout -- is not counted), and the small items the stage 3
+tail turned up on the way.
+
+- **A class body's value outlived its env.** #78 moved register_class_blk's
+  env into the frame pool (blk_env_get), and the walker's answer was read out
+  of that env's arena: `show(c.module_eval("self"))` answered show's own
+  receiver, and at the top level the String "show" -- the next call's frame
+  had been written over it. The body's value is now copied out (a region
+  around the walk) before the env goes back. test_eval's module_eval basics
+  had come back RED on main.
+- **`!=` of an object whose == is Comparable's** negates that == (it was
+  identity): Gem::Version's 1.2.003.0.0 and 1.02.3 are equal, and the
+  uninstaller's `s.version != spec.version` kept every executable. **Array#eql?**
+  asks each pair #eql? (it asked ==), so "~> 1.3" and "~> 1.3.0" differ; an
+  Array of rows that hold objects sorts with their <=> (Requirement#hash).
+- **super into Exception#message** from an exception made by `raise Cls,
+  msg` (the built-in form): RuntimeRequirementNotMetError's decoration was
+  "super: no superclass method" (install_command's 3, update's 1).
+- **A standard stream's #pos / #seek / #rewind** are its descriptor's offset:
+  capture_subprocess_io reopens $stdout onto a Tempfile and rewinds it (nine
+  tests in five files). ESPIPE is named per method; #lineno of an output
+  stream is "not opened for reading".
+- **defined?(X) inside `class A::B::C`** asks the nesting as written, as
+  reading X does: it found rubygems' vendored Gem::SecureRandom, and net-http
+  never required the real one (push_command's attestation).
+- **A loop modifier's assignment is a local in its condition**
+  (`line = out.shift until line == "x"`), as an `if` modifier's already was.
+- **`class E < X` inside `class S < Base`** finds X among Base's constants
+  (rake's Scope::EmptyScope < EmptyLinkedList made a new top-level class).
+- **rubygems is loaded before -r's libraries**, as ruby_opt_init does, and a
+  load that raises ends the program reported (operating_system.rb's message,
+  test_rubygems); `ruby -r ./activate.rb` with `gem(...)` in it works.
+- **OpenSSL::Digest(:SHA512)** takes a Symbol; PKey::RSA / DSA / DH #to_s is
+  #export (lib/, regenerated with tools/gen_openssl_lib.rb).
+- **GB9c**: a consonant, linkers and extends, and a consonant are one
+  grapheme cluster ("क्त"). The Indic_Conjunct_Break sets come from the pinned
+  ruby source's name2ctype.h (tools/gen_incb_table.rb; ruby's regexp does not
+  name the property). test_grapheme_breaks 2,923/2,923.
+- **Left, measured**: the rubygems tests that build a native extension
+  (mkmf needs RbConfig's CC and friends: stage 8, and exec_command's runner
+  exit is the same build failing); test_download_local_read_only (a failure
+  with no Ruby exception under the read-only cache, one test); the AST of
+  `_=1` (test_pp, stage 5's tree).
+- **Checked** on Mere v0.1.731: corpus 671/671 both ways (641 added after,
+  checked alone both ways); loop_rss_check 8/8; nkf, encoding_search and
+  class_module checks. Locally: rubygems' test_gem 127/129 (2 env),
+  requirement 35/35, kernel 14/14, rubygems 3/3, signer 18/18, package
+  59/59, uninstaller 40/41 and installer 119/127 (extensions), and the
+  files the changes touch (array, hash, class, module, syntax, io, eval,
+  string, comparable, enumerator, rubyoptions, regexp, exception, object,
+  file, range, struct, require, autoload, super, delegate, openssl's
+  pkey_rsa and digest) at or above round 20's CI counts.

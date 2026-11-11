@@ -3158,7 +3158,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                      if str_eq cref9 "" || str_contains cref9 "(sng:" || map_has modules cref9 || (if map_has sup9 cref9 then false else true) then true
                      else str_list_has (ancestors_of world cref9) "Object")) then mkstr "constant"
         else if (let cref9 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s9 -> sget s9 | _ -> "") else cur_lex ()) in
-                 (if str_eq (lex_const_key cref9 name) "" then false else true)
+                 (if str_eq (lex_const_key_nested env cref9 name) "" then false else true)
                  || (if str_eq (anc_const_key world cref9 name) "" then false else true)
                  // ...and one registered along the lexical nesting: inside
                  // `module Q; autoload :R, f`, `defined?(R)` is "constant"
@@ -5484,6 +5484,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
        let dc = dispatch_cls_of world va0 in
        VBool (if truthy (invoke world noblk va0 dc "==" (Cons (eval_e env world blk b, Nil))) then false else true))
+    // ...and an object whose == is Comparable's, over its own <=>: `!=` is
+    // the negation of THAT ==, not of identity (Gem::Version's "1.2.003.0.0"
+    // and "1.02.3" are equal, so `!= 1.02.3` is not satisfied)
+    else if str_eq op "!=" && (match va0 with VObj _ -> true | _ -> false)
+       && (let dc = dispatch_cls_of world va0 in
+           has_meth world dc "<=>" && (if has_meth world dc "!=" then false else true)
+           && str_list_has (ancestors_of world dc) "Comparable") then
+      (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+       VBool (if truthy (invoke_val_c env world noblk va0 "==" (Cons (eval_e env world blk b, Nil)) false) then false else true))
     else
     (match va0 with
      | VObj oid ->
@@ -16480,7 +16489,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               | _ -> false) then
     (match recv with
      | VArr a1 -> (match args with
-                   | Cons (VArr a2, _) -> VBool (arr_eq_w env world (deref a1) (deref a2))
+                   // (#eql? asks each pair #eql?, not #==: Gem::Requirement
+                   //  tells "~> 1.3" from "~> 1.3.0" by its versions' eql?)
+                   | Cons (VArr a2, _) -> VBool (if str_len name == 4 then rb_eql_w env world recv (VArr a2)
+                                                 else arr_eq_w env world (deref a1) (deref a2))
                    | _ -> VBool false)
      | _ -> VBool false)
   // The METHOD forms of the arithmetic take the coerce protocol too: `1.div(o)`
@@ -25522,7 +25534,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          raise_exc world "IOError" "closed stream"
        else if fd == 0 && stdin_read_name name then stdin_io_call env world blk recv name args
        // ...and the other two were never readable
-       else if (fd == 1 || fd == 2) && stdin_read_name name then raise_exc world "IOError" "not opened for reading"
+       else if (fd == 1 || fd == 2) && (stdin_read_name name || (str_len name == 6 && str_eq name "lineno")) then raise_exc world "IOError" "not opened for reading"
        // ...and standard INPUT's output methods are IO's, through its #write:
        // a refusal while it reads, the reopened stream's descriptor once
        // IO#reopen made it writable (bootstraptest's test_io: they went to
@@ -25593,6 +25605,29 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 4 && str_eq name "sync") then VBool (fd == 2)
        // (#to_i is #fileno: `$stdout.to_i` was a NoMethodError)
        else if (str_len name == 6 && str_eq name "fileno") || (str_len name == 4 && str_eq name "to_i") then VInt fd
+       // #pos / #seek / #rewind of a standard stream: the descriptor's own
+       // offset, which is a file's once #reopen put one under it (rubygems'
+       // capture_subprocess_io reopens $stdout onto a Tempfile and rewinds
+       // it); a terminal or a pipe has none (ESPIPE, as ruby's lseek says).
+       // Nothing waits in a buffer: the writes above are write(2) as they come.
+       else if (fd == 1 || fd == 2) && ((str_len name == 3 && str_eq name "pos") || (str_len name == 4 && str_eq name "tell")
+                                        || (str_len name == 4 && str_eq name "seek") || (str_len name == 6 && str_eq name "rewind")
+                                        || (str_len name == 4 && str_eq name "pos=") || (str_len name == 7 && str_eq name "sysseek")) then
+         (let (off9, wh9) = (if str_eq name "pos" || str_eq name "tell" then (0, 1)
+                             else if str_eq name "rewind" then (0, 0)
+                             else (match coerce_int_args env world args with
+                                   | Cons (VInt o9, Cons (VInt w9, _)) -> (o9, w9)
+                                   | Cons (VInt o9, _) -> (o9, 0)
+                                   | _ -> (0, 1))) in
+          let r9 = fd_seek fd off9 wh9 in
+          if r9 < 0 then raise_exc world "Errno::ESPIPE" ("Illegal seek @ rb_io_"
+                                                          ++ (if str_eq name "pos" || str_eq name "tell" then "tell"
+                                                              else if str_eq name "rewind" || str_eq name "sysseek" then name
+                                                              else if str_eq name "pos=" then "set_pos" else "seek")
+                                                          ++ " - " ++ (if fd == 2 then "<STDERR>" else "<STDOUT>"))
+          else if str_eq name "pos" || str_eq name "tell" || str_eq name "sysseek" then VInt r9
+          else if str_eq name "pos=" then VInt off9
+          else VInt 0)
        // #binmode / #binmode? on the three standard streams (both were a
        // NoMethodError; DATA of a program read from stdin is STDIN, and
        // test_io asks `DATA.binmode?`). The bytes go out as they are either
@@ -34948,7 +34983,9 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         arr_new (val_take (if (str_len name == 3 && str_eq name "max") then rev_vals st9 else st9) k9))
      | _ -> recv)
   // sort/min/max of an array of user objects use their <=> (pure cmp_vals can't).
-  else if (str_len name == 4 && str_eq name "sort") && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
+  // (...and an array of rows that hold such objects: Gem::Requirement#hash
+  //  sorts [op, Gem::Version] pairs, and the world-free sort refused them)
+  else if (str_len name == 4 && str_eq name "sort") && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | xs9 -> rows_hold_obj xs9) | _ -> false) then
     (match recv with VArr id -> arr_new (sort_w world (deref id)) | _ -> recv)
   else if (str_len name == 3 && str_eq name "min") && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
     (match recv with VArr id -> (match sort_w world (deref id) with Nil -> VNil | Cons (h, _) -> h) | _ -> VNil)
@@ -42300,6 +42337,15 @@ and cmp_vals_w = fn world -> fn (a: Val) -> fn (b: Val) ->
          r
      | _ -> cmp_vals a b)
   | _ -> cmp_vals a b
+// does any element of xs, an Array, hold an object (whose <=> only a
+// comparison with the world can reach)?
+and rows_hold_obj = fn (xs: Val list) ->
+  (match xs with
+   | Nil -> false
+   | Cons (VArr r9, t9) ->
+     (let rec any = fn (ys: Val list) -> (match ys with Nil -> false | Cons (VObj _, _) -> true | Cons (_, u9) -> any u9) in
+      any (deref r9) || rows_hold_obj t9)
+   | Cons (_, t9) -> rows_hold_obj t9)
 and arr_cmp_w = fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
   | Nil -> (match ys with Nil -> 0 | _ -> 0 - 1)
@@ -46306,7 +46352,15 @@ and named_class_of_al = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (nm
            if j < 0 then () else go (j + 2)) in
         let _ = go 0 in
         named_class_of cref nm)
-     else r)
+     // ...and a name the nesting does not hold is the enclosing class's
+     // ANCESTORS' constant, as a read of it would be: rake's `class Scope <
+     // LinkedList; class EmptyScope < EmptyLinkedList` is LinkedList's
+     // EmptyLinkedList. Taken as written it made a new top-level class.
+     else
+       (let a9 = (if str_eq cref "" then "" else anc_const_key world cref nm) in
+        if (if str_eq a9 "" then false else true) && map_has consts a9 then
+          (match map_get consts a9 with VClass c9 -> c9 | _ -> a9)
+        else r))
 
 // `send` is the one universal name a class is allowed to TAKE BACK: Ractor
 // defines its own #send, and Ruby dispatches that one. The primitive arms
@@ -46823,6 +46877,23 @@ and anc_const_key_q = fn world -> fn (cref: str) -> fn (name: str) ->
 // IS visible to a qualified lookup: `Z2::KT` finds M's constant while
 // `Z2::OC` -- assigned in `class Object` -- does not. Cutting the chain at
 // Object took both away.
+// lex_const_key kept to the nesting as written, the way a constant READ keeps
+// it (eval_e's EConst): a hit in a scope the cref's name passes through but
+// the nesting does not hold is dropped. `class Gem::Net::HTTPGenericRequest`
+// sees Gem::Net::HTTPGenericRequest and the top level, not Gem -- so
+// `defined?(SecureRandom)` there was "constant" for rubygems' vendored
+// Gem::SecureRandom while reading it was a NameError, and net-http never
+// required the real one.
+and lex_const_key_nested = fn env -> fn (cref: str) -> fn (name: str) ->
+  let key = lex_const_key cref name in
+  let nest9 = (if lv_has env "__nest" then (match lv_get env "__nest" with VStr h9 -> sget h9 | _ -> "")
+               else if lv_has env "__meth" then ""
+               else cur_nest ()) in
+  if str_eq nest9 "" || str_eq key "" then key
+  else (let nests9 = str_split nest9 (chr 10) in
+        let own9 = substring key 0 (str_len key - str_len name - 2) in
+        if str_list_has nests9 own9 || str_contains own9 "(sng:" then key else "")
+
 and anc_const_key = fn world -> fn (cref: str) -> fn (name: str) ->
   // ⚠ NO lexical scope still has ancestors: at top level the cref is Object,
   // and `include M` there puts M among Object's. Treating an empty cref as
@@ -47139,6 +47210,15 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
         else if str_eq meth "full_message" then
           mkstr (exc_full_message gc_cenv0 world recv args (kw_flag args "highlight" false) (str_eq (kw_sym args "order" "top") "bottom"))
         else (if map_has iv9 (str_of_int id9 ++ "@__cause") then map_get iv9 (str_of_int id9 ++ "@__cause") else VNil))
+     | _ -> VNil)
+  // ...and the same from an exception `raise Cls, "msg"` made in its built-in
+  // form (a class and a message): rubygems' RuntimeRequirementNotMetError
+  // decorates #message with super, and the error the test expected became
+  // "super: no superclass method"
+  else if (str_eq meth "to_s" || str_eq meth "message" || str_eq meth "cause")
+          && (match recv with VExc (_, _) -> true | _ -> false) then
+    (match recv with
+     | VExc (c9, m9) -> (if str_eq meth "cause" then VNil else vexc_text world c9 m9)
      | _ -> VNil)
   else if (str_eq meth "exception" || str_eq meth "set_backtrace" || str_eq meth "backtrace")
      && (match recv with VObj _ -> true | _ -> false) && exc_is_a world dcls "Exception" then
@@ -56470,7 +56550,12 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   // refinements back (a `using` in a `Module.new do` block whose body raised
   // left the refinement active for the rest of the program), as
   // register_class does
-  let r = try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) in
+  // ⚠ ...and the body's value is copied out of the env before the env goes
+  //   back to the pool: the walker answers what it read, `self` in the env's
+  //   arena among it, and a pooled env's arena is the NEXT call's frame.
+  //   `show(c.module_eval("self"))` answered show's own receiver (and at the
+  //   top level, the String "show"): test_eval's module_eval basics.
+  let r = region RCB { try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) } in
   let _ = blk_env_put cenv in
   let _ = set_lex saved_lex in
   let _ = restore_ref_active saved in
