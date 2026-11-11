@@ -18,8 +18,8 @@ plus the libraries this ships — see
 Use the [pinned Mere compiler source](https://github.com/merelang/mere/tree/b92d73358e77a1577400c83aff7d61ea886984f9)
 for native builds. Anonymous Class/Module metadata collection requires its
 candidate string-root scanning and bounded-word string Map hashing.
-`tools/build.sh` checks that it supports the native region-cache limit used
-by CI.
+`tools/build.sh` requires native cache trimming and verifies the compiler’s
+default 64-region cache with zeroed reuse.
 
 ```sh
 ./tools/build.sh            # or, by hand, the line below
