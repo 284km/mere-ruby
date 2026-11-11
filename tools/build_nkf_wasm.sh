@@ -20,4 +20,5 @@ fi
 # clang 23 invokes wasm-opt automatically when it happens to be on PATH.
 # Disable that optional post-link pass and strip SDK debug paths so both
 # pinned host archives produce the same portable reactor.
-"$cc" --no-wasm-opt -O2 -DMR_NKF_WASM -mexec-model=reactor -Wl,--strip-debug "$root/tools/nkf_engine.c" "$@" -o "${NKF_WASM_OUTPUT:-$root/docs/nkf.wasm}"
+"$cc" --no-wasm-opt -O2 -DMR_NKF_WASM -mexec-model=reactor -Wl,--strip-debug \
+  "-ffile-prefix-map=$root=." "$root/tools/nkf_engine.c" "$@" -o "${NKF_WASM_OUTPUT:-$root/docs/nkf.wasm}"
