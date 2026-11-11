@@ -60,3 +60,17 @@ p Outer::State.empty.class
 # a deep read of a long Array, and a Float sample count
 big = Array.new(100_000) { _1 }
 p big[99_999], big[50_000], big[-1], [1, 2, 3, 4].sample(2.7).size
+
+# an open File keeps writing after a chmod takes the write bit off its path
+# (rubygems writes a bin stub, chmods it 0510, and closes it)
+require "tmpdir"
+Dir.mktmpdir do |d|
+  path = File.join(d, "stub")
+  File.open(path, "wb", 0o755) do |f|
+    f.write "x"
+    p f.chmod(0o500)
+    f.write "y"
+  end
+  p File.read(path), File.stat(path).mode & 0o777
+  File.chmod(0o700, path)
+end

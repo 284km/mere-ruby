@@ -3740,3 +3740,17 @@ Round 20 of note 544 (the plan after stage 4: stage 5 first, then RubyGems).
   2,664 tests, 12 F / 86 E (958 RED before), 317 s locally, the process's
   peak 1.45 - 1.89 GB with the test order. The rubygems files above pass but
   install_command's 4 and exec_command (a native extension build, stage 8).
+- **Moved onto main after #78 and #80** (Mere v0.1.731). Two conflicts:
+  collect_cls_methods keeps NKF's own class functions and the `__` filter;
+  the builtin-class singleton arm takes bi_skip_pass for every name, which
+  is what NKF's arm asked only for its own.
+- **An open File writes on after a chmod takes its write bit.** The first
+  CI run of the round stopped rubygems/test_gem.rb before its first result
+  (112 MATCH before, 0 after): the resolver now got far enough to install a
+  gem with `prog_mode: 0510`, and the bin stub is written, chmodded and
+  closed. A File here is a path and a buffer, and the flush wrote the path
+  again; the path refused (EACCES) and the failure was not a Ruby
+  exception at all, so it went past every rescue and ended the runner.
+  File#chmod on a handle that writes now opens its descriptor first, and a
+  flush the path refuses goes through that descriptor at the write position
+  (a refused flush with no descriptor is Errno::EACCES). test_gem 127/129.
