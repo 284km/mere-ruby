@@ -1448,11 +1448,12 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter proc_src mk in
   let _ = map_iter proc_symsrc mk in
   let _ = map_iter meth_params (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
-  let _ = map_iter meth_src (fn (k: str) -> fn (v: Val) ->
-    // Lines carry no handles. Source paths already marked through frame_text
-    // need no second conditional metadata entry for every method definition.
-    if gc_meta_leaf v || (match v with VStr h -> gc_live_has live (h * 8 + 1) | _ -> false) then ()
-    else gc_meta_add metadata live (gc_source_owner k) v) in
+  let _ = map_iter meth_src (fn (k: str) -> fn row ->
+    let (line, file, last, endless) = row in
+    let mark = fn (v: Val) ->
+      if gc_meta_leaf v || (match v with VStr h -> gc_live_has live (h * 8 + 1) | _ -> false) then ()
+      else gc_meta_add metadata live (gc_source_owner k) v in
+    let _ = mark line in let _ = mark file in let _ = mark last in mark endless) in
   let _ = map_iter curry_args mk in
   let _ = map_iter comp_inner mk in
   let _ = map_iter comp_outer mk in
@@ -1663,8 +1664,8 @@ let gc_sweep_captured = fn live ->
 // list stayed in the class tables for the life of the process (2000 objects
 // made that way kept 6 table rows and an array each). The tables are walked
 // only when one of the dead had such a class.
-// (a key may carry a one-letter prefix: meth_src keeps a method's file under
-// "f" ++ its "cls#name")
+// (the legacy tables may carry a one-letter field prefix; method source
+// locations now keep one row under the unprefixed method owner key)
 let gc_purge_tbl = fn tbl -> fn dead ->
   let dk = vec_new () in
   let _ = map_iter tbl (fn (k: str) -> fn v ->
@@ -1797,7 +1798,7 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = gc_sweep_class_table alias_origin 0 compact in
   let _ = gc_sweep_class_table alias_srcname 0 compact in
   let _ = gc_sweep_class_table meth_params 0 compact in
-  let _ = gc_sweep_class_table meth_src 1 compact in
+  let _ = gc_sweep_class_table meth_src 0 compact in
   let _ = gc_sweep_class_table dm_methods 0 compact in
   let _ = gc_sweep_class_table dm_captured 0 compact in
   let _ = gc_sweep_class_table dm_closenv 0 compact in
@@ -8239,15 +8240,17 @@ and tp_blk_fire_at_c = fn world -> fn (ev: str) -> fn (mid: str) -> fn (cls: str
   let _ = fire_tp_vlc world ev mid cls rv slf line path callee in
   if map_has trace_fn "tpblk" then map_delete trace_fn "tpblk" else ()
 and tp_meth_path = fn (dk: str) -> fn (defcls: str) -> fn (name: str) ->
-  if map_has meth_src ("f" ++ dk) then (match map_get meth_src ("f" ++ dk) with VStr h9 -> sget h9 | _ -> "")
-  else if str_eq defcls "Object" && map_has meth_src ("f" ++ name) then (match map_get meth_src ("f" ++ name) with VStr h9 -> sget h9 | _ -> "")
-  else ""
+  match meth_source_get dk 1 with
+  | VStr h -> sget h
+  | VNil when str_eq defcls "Object" -> (match meth_source_get name 1 with VStr h -> sget h | _ -> "")
+  | _ -> ""
 and tp_blk_path = fn (cls: str) -> fn (mid: str) ->
-  let k9 = cls ++ "#" ++ mid in
-  if str_len mid > 0 && map_has meth_src ("f" ++ k9) then (match map_get meth_src ("f" ++ k9) with VStr h9 -> sget h9 | _ -> "")
-  else if str_len mid > 0 && map_has meth_src ("f" ++ mid) then (match map_get meth_src ("f" ++ mid) with VStr h9 -> sget h9 | _ -> "")
-  else if str_len mid == 0 && map_has load_ctx "file" then (match map_get load_ctx "file" with VStr h9 -> sget h9 | _ -> "")
-  else ""
+  if str_len mid == 0 then
+    (match (if map_has load_ctx "file" then map_get load_ctx "file" else VNil) with VStr h -> sget h | _ -> "")
+  else (match meth_source_get (cls ++ "#" ++ mid) 1 with
+        | VStr h -> sget h
+        | VNil -> (match meth_source_get mid 1 with VStr h -> sget h | _ -> "")
+        | _ -> "")
 and tp_meth_flow = fn world -> fn frame -> fn blk -> fn body -> fn (mnm: str) -> fn (callee: str) -> fn (cls: str) -> fn (slf: Val) ->
   let d9 = (if map_has tp_mstack "d" then int_of_str (map_get tp_mstack "d") else 0) + 1 in
   let _ = map_set tp_mstack "d" (str_of_int d9) in
@@ -20978,9 +20981,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let _ = store_unbound_method_core id (VSym mname) (VClass origin) (VClass own9) (VClass c) in
           // the definition it was made from (see make_unbound_method)
           let k9 = origin ++ "#" ++ mname in
-          let _ = (if map_has meth_src k9 && map_has meth_src ("f" ++ k9) then
+          let _ = (if meth_source_has k9 0 && meth_source_has (k9) 1 then
                      map_set ivars0 (str_of_int id ++ "@~um_def")
-                       (mkstr (to_s (map_get meth_src ("f" ++ k9)) ++ ":" ++ to_s (map_get meth_src k9)))
+                       (mkstr (to_s (meth_source_get (k9) 1) ++ ":" ++ to_s (meth_source_get k9 0)))
                    else ()) in
           VObj id))
     // define_method(:name, unbound_or_proc): the non-block form. An
@@ -30524,8 +30527,8 @@ and sng_user_owner = fn world -> fn (c: str) -> fn (name: str) ->
      | Cons (a9, t9) ->
        if str_eq a9 "Class" || str_eq a9 "Module" || str_eq a9 "Object" then ""
        else if map_has m9 (a9 ++ "#" ++ name) then
-         (let k9 = "f" ++ a9 ++ "#" ++ name in
-          let f9 = (if map_has meth_src k9 then (match map_get meth_src k9 with VStr h -> sget h | _ -> "") else "") in
+         (let k9 = a9 ++ "#" ++ name in
+          let f9 = (if meth_source_has (k9) 1 then (match meth_source_get (k9) 1 with VStr h -> sget h | _ -> "") else "") in
           if str_eq f9 "" || warn_internal_file f9 then "" else a9)
        // (a singleton whose BUILTIN answers the name is where the walk ends:
        //  a module INCLUDED in File's singleton comes after File.basename)
@@ -30567,8 +30570,8 @@ and warn_redef = fn world -> fn (key: str) -> fn (name: str) ->
      // Kernel#pp -- must not make every -w child process warn)
      if map_has meth_aliased key then map_delete meth_aliased key
      else if map_has meths key && rb_verbose_true () then
-       (let f9 = (if map_has meth_src ("f" ++ key) then (match map_get meth_src ("f" ++ key) with VStr h -> sget h | _ -> "") else "") in
-        let l9 = (if map_has meth_src key then (match map_get meth_src key with VInt n -> n | _ -> 0) else 0) in
+       (let f9 = (if meth_source_has (key) 1 then (match meth_source_get (key) 1 with VStr h -> sget h | _ -> "") else "") in
+        let l9 = (if meth_source_has key 0 then (match meth_source_get key 0 with VInt n -> n | _ -> 0) else 0) in
         if str_eq f9 "" || l9 <= 0 || warn_internal_file f9 then ()
         else
           (let _ = rb_warning world ("method redefined; discarding old " ++ name) in
@@ -30592,7 +30595,7 @@ and warn_perf_redef = fn world -> fn (key: str) ->
      && (if map_has perf_replaced key then false else true)
      // (still the builtin: no definition of the program's own is there)
      && (if map_has meths key
-         then (let f9 = (if map_has meth_src ("f" ++ key) then (match map_get meth_src ("f" ++ key) with VStr h -> sget h | _ -> "") else "") in
+         then (let f9 = (if meth_source_has (key) 1 then (match meth_source_get (key) 1 with VStr h -> sget h | _ -> "") else "") in
                str_eq f9 "" || warn_internal_file f9)
          else true)
   then
@@ -36614,11 +36617,11 @@ and meth_source_location = fn world -> fn (own0: str) -> fn (nm: str) -> fn (rec
                | VMain -> nm
                | other9 -> class_name other9 ++ "#" ++ nm)
             else own ++ "#" ++ nm) in
-  let k9 = (if map_has meth_src k9 then k9 else nm) in
-  if map_has meth_src k9 && map_has meth_src ("f" ++ k9)
-  then (match map_get meth_src ("f" ++ k9) with
+  let k9 = (if meth_source_has k9 0 then k9 else nm) in
+  if meth_source_has k9 0 && meth_source_has (k9) 1
+  then (match meth_source_get (k9) 1 with
         | VStr h9 -> (if str_eq (sget h9) "" then VNil
-                      else arr_new (Cons (fstr_of (sget h9), Cons ((match map_get meth_src k9 with VInt l9 -> VInt (line_shown l9) | v9 -> v9), Nil))))
+                      else arr_new (Cons (fstr_of (sget h9), Cons ((match meth_source_get k9 0 with VInt l9 -> VInt (line_shown l9) | v9 -> v9), Nil))))
         | _ -> VNil)
   // ...and a builtin ruby writes in Ruby is where ruby's own source has it
   // (`"".method(:unpack).source_location` is ["<internal:pack>", 25]); one
@@ -44851,7 +44854,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      // (on the line it was defined on, note 435)
      let _ = (if map_has hook_flags "tp" then tp_env_meth frame body else ()) in
      let _ = fire_tp_vl world "call" name "Object" VNil slf9
-               (match (if map_has meth_src name then map_get meth_src name else VNil) with VInt l9 -> l9 | _ -> cur_line ()) "" in
+               (match (meth_source_get name 0) with VInt l9 -> l9 | _ -> cur_line ()) "" in
      // (as run_meth: tp_meth_flow while a TracePoint is armed)
      let flow9 = (if map_has hook_flags "tp" then tp_meth_flow world frame blk body name name "Object" slf9
                   else method_body_flow frame world blk body) in
@@ -44868,7 +44871,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let _ = fire_trace world "return" name "Object" in
      let _ = (if tpf9 then tp_env_set frame else ()) in
      let _ = fire_tp_vl world "return" name "Object" (match flow9 with FBreak _ -> VNil | _ -> out) slf9
-               (match (if map_has meth_src ("e" ++ name) then map_get meth_src ("e" ++ name) else VNil) with VInt l9 -> l9 | _ -> cur_line ()) "" in
+               (match (meth_source_get (name) 2) with VInt l9 -> l9 | _ -> cur_line ()) "" in
      let _ = (if tpf9 then frame_done frame else ()) in
      out)
 
@@ -45594,8 +45597,8 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
              else if attr9 then fire_tp_vlc world "c_call" mnm defcls VNil slf9 (cur_line ()) "" name
              else (let _ = (if map_has hook_flags "tp" then tp_env_meth frame body else ()) in
                    // (a top-level def is kept under its bare name)
-                   let cl9 = (match (if map_has meth_src dk then map_get meth_src dk
-                                     else if str_eq defcls "Object" && map_has meth_src name then map_get meth_src name
+                   let cl9 = (match (if meth_source_has dk 0 then meth_source_get dk 0
+                                     else if str_eq defcls "Object" && meth_source_has name 0 then meth_source_get name 0
                                      else VNil) with VInt l9 -> l9 | _ -> cur_line ()) in
                    // (...in the file it was written in, not the caller's)
                    let cp9 = (if map_has hook_flags "tp" then tp_meth_path dk defcls name else "") in
@@ -45637,11 +45640,11 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                (let rv9 = (match flow9 with FBreak _ -> (if map_has dm_methods dk then out else VNil) | _ -> out) in
                 // (a body that ran to its end returns at the `end`)
                 let rl9 = (match flow9 with
-                           | FNext _ -> (match (if map_has meth_src ("e" ++ dk) then map_get meth_src ("e" ++ dk)
-                                                else if str_eq defcls "Object" && map_has meth_src ("e" ++ name) then map_get meth_src ("e" ++ name)
+                           | FNext _ -> (match (if meth_source_has (dk) 2 then meth_source_get (dk) 2
+                                                else if str_eq defcls "Object" && meth_source_has (name) 2 then meth_source_get (name) 2
                                                 // (a define_method body has no `end` of its own on record:
                                                 //  the block's line, which an empty `{}` returns on)
-                                                else if map_has dm_methods dk && map_has meth_src dk then map_get meth_src dk
+                                                else if map_has dm_methods dk && meth_source_has dk 0 then meth_source_get dk 0
                                                 else VNil) with VInt l9 -> (if attr9 then cur_line () else l9) | _ -> cur_line ())
                            | FReturn _ when map_has tp_mstack "rl" ->
                              (let l9 = int_of_str (map_get tp_mstack "rl") in let _ = map_delete tp_mstack "rl" in l9)
@@ -54710,8 +54713,8 @@ and rt_dep_warn = fn world -> fn (rv: Val) -> fn (cls0: str) ->
                 let k9 = ow9 ++ "#respond_to?" in
                 let _ = warning_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: " ++ who9
                                             ++ "respond_to?(:respond_to_missing?) uses the deprecated method signature, which takes one parameter\n") (VSym "deprecated") in
-                if map_has meth_src k9 && map_has meth_src ("f" ++ k9) then
-                  warning_emit world (to_s (map_get meth_src ("f" ++ k9)) ++ ":" ++ to_s (map_get meth_src k9) ++ ": warning: respond_to? is defined here\n") (VSym "deprecated")
+                if meth_source_has k9 0 && meth_source_has (k9) 1 then
+                  warning_emit world (to_s (meth_source_get (k9) 1) ++ ":" ++ to_s (meth_source_get k9 0) ++ ": warning: respond_to? is defined here\n") (VSym "deprecated")
                 else ())
            | _ -> ())))
   else ()
@@ -57107,7 +57110,7 @@ and wkm_fast = fn world -> fn (recv: Val) ->
   | VObj o ->
     (let (_, _, ocls9, _) = world in
      map_has ocls9 o && str_eq (map_get ocls9 o) "ObjectSpace::WeakKeyMap"
-     && (match (if map_has meth_src "fObjectSpace::WeakKeyMap#[]=" then map_get meth_src "fObjectSpace::WeakKeyMap#[]=" else VNil) with
+     && (match (if meth_source_has "ObjectSpace::WeakKeyMap#[]=" 1 then meth_source_get "ObjectSpace::WeakKeyMap#[]=" 1 else VNil) with
          | VStr h9 -> (let f9 = sget h9 in str_eq f9 "" || str_starts_with f9 "<internal")
          | VNil -> true
          | _ -> false))
@@ -57177,8 +57180,8 @@ and refine_import_methods = fn env -> fn world -> fn (rimpl: str) -> fn (args: V
         //  source file -- the prelude's, as #source_location answers nil for
         //  it --, one a library standing in for a C extension defines
         //  (cext_lib_file), and a define_method's block)
-        let c9 = (if map_has meth_src ("f" ++ k)
-                  then (match map_get meth_src ("f" ++ k) with VStr h9 -> (let f9 = sget h9 in str_eq f9 "" || cext_lib_file f9) | _ -> false)
+        let c9 = (if meth_source_has (k) 1
+                  then (match meth_source_get (k) 1 with VStr h9 -> (let f9 = sget h9 in str_eq f9 "" || cext_lib_file f9) | _ -> false)
                   else true)
                  || map_has dm_methods k in
         if map_has meths k && (if c9 then false else true) then
@@ -58192,7 +58195,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                              else if lv_has env "__defcls" then (match lv_get env "__defcls" with VClass c8 -> c8 | _ -> "")
                              else "Object") in
                    // (an endless def's body makes none: ruby's has no line of its own)
-                   if str_len c9 > 0 && (map_has meth_src ("~" ++ c9 ++ "#" ++ m9) || (str_eq c9 "Object" && map_has meth_src ("~" ++ m9))) then ()
+                   if str_len c9 > 0 && (meth_source_has (c9 ++ "#" ++ m9) 3 || (str_eq c9 "Object" && meth_source_has (m9) 3)) then ()
                    else (let _ = tp_env_set env in
                          fire_tp_v world "line" (if str_eq c9 "" then "" else m9) c9 VNil (if lv_has env "self" then lv_get env "self" else VMain)))
              else ()) in
@@ -59739,8 +59742,8 @@ and unused_blk_warn = fn world -> fn (key: str) -> fn (defcls: str) -> fn (name:
   //  warning each, a second of either is none -- ruby's dup check)
   let amp9 = map_len ub_amp > 0 in
   let _ = (if amp9 then map_clear ub_amp else ()) in
-  let seen9 = key ++ "@" ++ (if map_has meth_src ("f" ++ key) then (match map_get meth_src ("f" ++ key) with VStr h -> sget h | _ -> "") else "")
-              ++ ":" ++ (if map_has meth_src key then (match map_get meth_src key with VInt n -> str_of_int n | _ -> "") else "")
+  let seen9 = key ++ "@" ++ (if meth_source_has (key) 1 then (match meth_source_get (key) 1 with VStr h -> sget h | _ -> "") else "")
+              ++ ":" ++ (if meth_source_has key 0 then (match meth_source_get key 0 with VInt n -> str_of_int n | _ -> "") else "")
               ++ (if amp9 then "&" else "") in
   // (a call through send passes its block with no warning)
   if map_len ub_skip > 0 then map_clear ub_skip
@@ -59748,7 +59751,7 @@ and unused_blk_warn = fn world -> fn (key: str) -> fn (defcls: str) -> fn (name:
   else if (if map_has warn_cats "strict_unused_block" then truthy (map_get warn_cats "strict_unused_block") else rb_verbose_true ())
           && (if map_has meth_cfn key || map_has dm_closenv key || map_has dm_captured key || str_eq name "initialize" then false else true)
           && (if str_eq (block_param_name params) "" then true else false)
-          && map_has meth_src key
+          && meth_source_has key 0
           && (if ub_stmts body then false else true)
           // (ruby says nothing when some method of the same name does use
           //  a block: the call may be duck typing -- ub_name_used)
@@ -59763,8 +59766,8 @@ and unused_blk_warn = fn world -> fn (key: str) -> fn (defcls: str) -> fn (name:
                      then display_cls_msg world in9 ++ "." ++ name else name)
                   else (let d9 = display_cls_msg world defcls in
                         if str_len d9 > 1 && str_eq (substring d9 0 2) "#<" then name else d9 ++ "#" ++ name)) in
-     let f9 = (if map_has meth_src ("f" ++ key) then (match map_get meth_src ("f" ++ key) with VStr h -> sget h | _ -> "") else "") in
-     let l9 = (match map_get meth_src key with VInt n -> n | _ -> 0) in
+     let f9 = (if meth_source_has (key) 1 then (match meth_source_get (key) 1 with VStr h -> sget h | _ -> "") else "") in
+     let l9 = (match meth_source_get key 0 with VInt n -> n | _ -> 0) in
      rb_warn world ("the block passed to '" ++ shown ++ "' defined at " ++ f9 ++ ":" ++ str_of_int l9 ++ " may be ignored"))
   else ()
 // does a method body use its block: a `yield` or a `super` anywhere in it
