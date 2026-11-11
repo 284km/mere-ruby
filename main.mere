@@ -4703,7 +4703,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // string literals.
     // (...unless String#freeze is redefined: ruby's opt_str_freeze then calls
     //  it, test_string_freeze)
-    if (str_len name == 6 && str_eq name "freeze") && (match arges with Nil -> true | _ -> false)
+    if str_eq name "unbind" && (match arges with Nil -> true | _ -> false)
+       && (match recv_e with
+           | EMethod (EVar local, method_name, Cons (ESym target, Nil)) ->
+             str_eq method_name "method" && unbound_chain_allowed env world local target
+           | _ -> false) then
+      (match recv_e with
+       | EMethod (EVar local, _, Cons (ESym target, Nil)) -> core_unbound_chain world (lv_get env local) target
+       | _ -> VNil)
+    else if (str_len name == 6 && str_eq name "freeze") && (match arges with Nil -> true | _ -> false)
        && (if has_meth world "String" "freeze" || (map_len undefs > 0 && undef_blocked world "String" "freeze") then false else true)
        && (let rec statstr = fn (e9: Expr) ->
              (match e9 with
@@ -8312,6 +8320,22 @@ and core_metadata_allowed = fn world -> fn captured ->
   && (if map_has consts "Module" then (match map_get consts "Module" with VClass c -> str_eq c "Module" | _ -> false) else false)
   && (if map_has consts "Class" then (match map_get consts "Class" with VClass c -> str_eq c "Class" | _ -> false) else false)
   && core_metadata_methods world
+and core_metadata_build = fn world -> fn captured -> fn (local: str) -> fn (body: Stmt list) -> fn (inner: Stmt list) ->
+  let _ = core_mixin_positions body in
+  // Eligibility proves both constructors and all mixin/inherited hooks
+  // are the core defaults. These are fresh, empty metadata identities:
+  // no existing ancestry can already contain either one.
+  let module_name = fresh_anon "AnonModule_" in
+  let _ = map_set modules module_name VNil in
+  let mixin = VClass module_name in
+  let _ = (if lv_has captured local then lv_set captured local mixin else ()) in
+  let base = fresh_anon "AnonClass_" in
+  let (_, supers, _, _) = world in
+  let _ = set_sup supers base "Object" in
+  let _ = core_mixin_positions inner in
+  let _ = map_set inc_keep base module_name in
+  let _ = set_inc base module_name in
+  VClass base
 and core_metadata_run = fn world -> fn captured -> fn (local: str) -> fn (body: Stmt list) -> fn (inner: Stmt list) ->
   let depth = cd_get () in
   let file = vec_get cur_fm 0 in
@@ -8325,21 +8349,7 @@ and core_metadata_run = fn world -> fn captured -> fn (local: str) -> fn (body: 
   let _ = gc_unsafe_push () in
   let result = try_or_msg (fn (u: unit) -> region BLK {
     let _ = gc_point_finalizers world in
-    let _ = core_mixin_positions body in
-    // Eligibility proves both constructors and all mixin/inherited hooks
-    // are the core defaults. These are fresh, empty metadata identities:
-    // no existing ancestry can already contain either one.
-    let module_name = fresh_anon "AnonModule_" in
-    let _ = map_set modules module_name VNil in
-    let mixin = VClass module_name in
-    let _ = (if lv_has captured local then lv_set captured local mixin else ()) in
-    let base = fresh_anon "AnonClass_" in
-    let (_, supers, _, _) = world in
-    let _ = set_sup supers base "Object" in
-    let _ = core_mixin_positions inner in
-    let _ = map_set inc_keep base module_name in
-    let _ = set_inc base module_name in
-    FNext (VClass base)
+    FNext (core_metadata_build world captured local body inner)
   }) (fn (message: str) -> let _ = note_extern_refused message in FRaise VNil) in
   let _ = gc_unsafe_pop () in
   let _ = cd_set depth in
@@ -11239,17 +11249,37 @@ and run_block_turn_s = fn world -> fn encl -> fn theblk -> fn (cur: str) ->
 // local module. It executes no Ruby callback, so its eligibility cannot change
 // between iterations. Retain both original safepoints and the block frame.
 and range_metadata_each = fn world -> fn captured -> fn (local: str) -> fn (body: Stmt list) -> fn (inner: Stmt list) -> fn (i: int) -> fn (last: int) ->
-  let _ = gc_point_finalizers world in
-  let flow = region TURN {
-    match core_metadata_run world captured local body inner with
-    | FNext _ -> flow_next_nil
-    | other -> other
-  } in
-  match flow with
-  | FBreak v -> FBreak v
-  | FReturn v -> FReturn v
-  | _ -> if i == last then FNext VNil
-         else range_metadata_each world captured local body inner (i + 1) last
+  let depth = cd_get () in
+  let file = vec_get cur_fm 0 in
+  // Eligibility excludes callbacks, observers and concurrent mutation. These
+  // three frame entries are constant throughout this integer loop. Keep the
+  // watermark, line, depth, unsafe interval and both safepoints per turn.
+  let _ = map_set_si call_names_s depth blk_frame_mark in
+  let _ = map_set_si call_files_s depth (cur_file ()) in
+  let _ = map_set fb_env_at depth captured in
+  let rec loop = fn (turn: int) ->
+    let _ = gc_point_finalizers world in
+    let flow = region TURN {
+      let _ = fb_wm_call (depth - 1) in
+      let _ = map_set call_lines depth (cur_line ()) in
+      let _ = fb_wm_put (depth * 8) in
+      let _ = cd_set (depth + 1) in
+      let _ = gc_unsafe_push () in
+      let result = try_or_msg (fn (u: unit) -> region BLK {
+        let _ = gc_point_finalizers world in
+        let _ = core_metadata_build world captured local body inner in
+        flow_next_nil
+      }) (fn (message: str) -> let _ = note_extern_refused message in FRaise VNil) in
+      let _ = gc_unsafe_pop () in
+      let _ = cd_set depth in
+      let _ = vec_set cur_fm 0 file in
+      result
+    } in
+    match flow with
+    | FBreak v -> FBreak v
+    | FReturn v -> FReturn v
+    | _ -> if turn == last then FNext VNil else loop (turn + 1) in
+  loop i
 and range_each = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) ->
   if i > last then FNext VNil
   else (match run_block_turn_i world encl theblk i with
@@ -21984,7 +22014,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                     // ...as it is seen FROM HERE: `public :m` in this class makes an
                     // inherited private m public, and its alias is public too
                     let _ = if meth_private world c n2 then set_private (c ++ "#" ++ n1) VNil else () in
-                    let _ = if meth_protected world c n2 then map_set protecteds (c ++ "#" ++ n1) VNil else () in
+                    let _ = if meth_protected world c n2 then set_protected (c ++ "#" ++ n1) VNil else () in
                     // ⚠ an alias OF AN ALIAS names the first definition: its
                     //   origin and its source name are the alias's, not the
                     //   alias itself. `alias_method :a, :m; alias_method :m, :a`
@@ -35590,7 +35620,7 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
                     then map_set meth_cvcls nk dst_cls9 else ()) in
            let _ = copy_meth_src nk k in
            let _ = (if map_has privates k then set_private nk VNil else ()) in
-           let _ = (if map_has protecteds k then map_set protecteds nk VNil else ()) in
+           let _ = (if map_has protecteds k then set_protected nk VNil else ()) in
            if map_has alias_srcname k then map_set alias_srcname nk (map_get alias_srcname k) else ())
         | _ -> ()))) in
   let _ = (if mro_local_name c && (if map_has meth_owner_seen c then false else true)
@@ -35634,7 +35664,7 @@ and dm_scope_vis = fn env -> fn world -> fn (c: str) -> fn (nm: str) ->
     (let m9 = (match lv_get env "__vis" with VStr h9 -> sget h9 | _ -> "public") in
      let k9 = c ++ "#" ++ nm in
      if str_eq m9 "private" then set_private k9 VNil
-     else if str_eq m9 "protected" then map_set protecteds k9 VNil
+     else if str_eq m9 "protected" then set_protected k9 VNil
      else if str_eq m9 "module_function" then
        (let _ = set_private k9 VNil in modfunc_promote_hooked world c (Cons (nm, Nil)))
      else dm_vis_public c nm)
@@ -45084,6 +45114,45 @@ and lookup_meth_cls = fn world -> fn (cls: str) -> fn (name: str) ->
 // ---- a Method object's definition (see msnap_save) -----------------------
 // the id that dates an object: its own, or, for one made from another (an
 // unbind, a bind, a clone), the original's (slot "@__m_era" / "@__um_era")
+// Fuse a direct local receiver's core method(:symbol).unbind. The temporary
+// bound Method has no observer and no intervening callback; retain the actual
+// lookup and construct the resulting UnboundMethod with its current definition.
+and unbound_chain_owner = fn world -> fn (recv: Val) -> fn (name: str) ->
+  let refined = refined_impl_for world recv name in
+  if str_len refined > 0 then refined else bm_owner_of world recv name
+and unbound_chain_allowed = fn env -> fn world -> fn (local: str) -> fn (name: str) ->
+  mro_cache_on () && vec_get core_only 0 == 0 && lv_has env local
+  && map_len trace_fn == 0 && map_len flow_sig == 0 && map_len signal_traps == 0
+  && map_len all_thr <= 1 && fb_live () == 0 && vec_get thr_body_v 0 == 0
+  && (if map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
+         || map_has undef_names "method" || map_has undef_names "unbind"
+         || map_has blt_alias_names "method" || map_has blt_alias_names "unbind" then false else true)
+  && (match lv_get env local with
+      | VObj id ->
+        let (methods, _, classes, _) = world in
+        let cls = map_get classes id in
+        (vec_get reflection_changed 0 == 0 ||
+         ((if has_meth world cls "method" || has_meth world "Method" "unbind"
+              || meth_private world cls "method" || meth_protected world cls "method"
+              || meth_private world "Method" "unbind" || meth_protected world "Method" "unbind" then false else true)
+          && str_eq (refined_impl_for world (VObj id) "method") ""
+          && str_eq (refined_impl_go world (ancestors_of world "Method") "unbind") ""))
+        && (let owner = unbound_chain_owner world (VObj id) name in
+            let key = owner ++ "#" ++ name in
+            str_len owner > 0 && map_has methods key && (if map_has undefs key then false else true))
+      | _ -> false)
+and core_unbound_chain = fn world -> fn (recv: Val) -> fn (name: str) ->
+  let (_, _, classes, ivars) = world in
+  let owner = unbound_chain_owner world recv name in
+  let uid = alloc_oid classes in
+  let prefix = str_of_int uid in
+  let _ = map_set classes uid "UnboundMethod" in
+  let _ = map_set ivars (prefix ++ "@__um_cls") (mkstr owner) in
+  let _ = map_set ivars (prefix ++ "@__um_name") (mkstr name) in
+  let _ = map_set ivars (prefix ++ "@__um_from") (mkstr (dispatch_cls_of world recv)) in
+  let _ = msnap_note world uid "UnboundMethod" owner name in
+  let _ = map_set ivars (prefix ++ "@__um_owner") (mkstr owner) in
+  VObj uid
 and msnap_era = fn world -> fn (id: int) -> fn (ocl: str) ->
   let (_, _, _, iv9) = world in
   let k9 = str_of_int id ++ (if str_eq ocl "Method" then "@__m_era" else "@__um_era") in
@@ -45193,6 +45262,12 @@ and msnap_with = fn world -> fn (k: str) -> fn (sk: str) -> fn f ->
   match r9 with
   | FNext v9 -> v9
   | _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
+// Core construction ignores initialize's normal return value. Keep the
+// ordinary frame and flow handling, carrying only permission to omit an
+// unobserved reflection result at the end of that specific invocation.
+and invoke_initializer = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (args: Val list) ->
+  let (method, owner) = lookup_meth_cls world cls "initialize" in
+  run_meth_result world blk recv owner "initialize" method args true
 and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: str) -> fn (args: Val list) ->
   // (ObjectSpace::WeakKeyMap#[]= with no Ruby frame, while it is the
   //  prelude's: Bug #20691's million stores are a test's whole time)
@@ -45259,6 +45334,8 @@ and idx_in9 = fn (xs: str list) -> fn (x: str) ->
   let rec go = fn (ys: str list) -> fn (i: int) -> (match ys with Nil -> 0 - 1 | Cons (h, t) -> (if str_eq h x then i else go t (i + 1))) in
   go xs 0
 and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (name: str) -> fn (m: Meth) -> fn (args: Val list) ->
+  run_meth_result world blk recv defcls name m args false
+and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (name: str) -> fn (m: Meth) -> fn (args: Val list) -> fn (discard_result: bool) ->
   // (the ancestor position a `super` handed over, taken at once -- see
   //  super_idx_pend)
   let defidx9 = vec_get super_idx_pend 0 in
@@ -45417,7 +45494,7 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     //  this frame: the ordinary call pays nothing for it.)
     let flow9 = (if map_has hook_flags "tp" && (if cfn9 || attr9 then false else true)
                  then tp_meth_flow world frame blk body mnm name defcls slf9
-                 else method_body_flow frame world blk body) in
+                 else method_body_flow_result frame world blk body discard_result) in
     let _ = (if rfprev8 >= 0 then ref_install rfprev8 else ()) in
     let out = (match flow9 with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
     // whether THIS call ended because its block broke out of it (meth_broke):
@@ -47063,6 +47140,8 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
 // run a method body, converting a `return` flow signal into the method's
 // return value (any other signal or a real exception keeps unwinding).
 and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
+  method_body_flow_result frame world blk body false
+and method_body_flow_result = fn frame -> fn world -> fn blk -> fn (body: Stmt list) -> fn (discard_result: bool) ->
   // Interpreter recursion guard: each Ruby method call adds native frames, so
   // unbounded Ruby recursion would eventually overflow the native stack and
   // SIGSEGV. Count call depth and, past a limit chosen safely below where the
@@ -47154,7 +47233,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   let rxf9 = (if fidk < 0 then 0 else fidk) in
   let rxc9 = map_has frame "__rxf" in
   let rx0 = (if rxc9 then 0 else rx_call_enter rxf9) in
-  let f = try_or_msg (fn (u: unit) -> region MCALL { run_stmts frame world blk body })
+  let f = try_or_msg (fn (u: unit) -> region MCALL { run_stmts_result frame world blk body discard_result })
             (fn (m: str) -> let _ = note_extern_refused m in FRaise VNil) in
   // (a continuation re-entered into this frame: cont_rerun)
   let f = (if vec_get cont_on 0 == 1 then cont_rerun frame world blk body fidk f else f) in
@@ -50436,7 +50515,7 @@ and attr_mark_vis = fn (cls: str) -> fn (mode: str) -> fn (syms: str list) -> fn
            set_private k9 VNil)
         else
           (let _ = (if map_has privates k9 then map_delete privates k9 else ()) in
-           map_set protecteds k9 VNil)) in
+           set_protected k9 VNil)) in
      let _ = (if str_eq mode "r" || str_eq mode "rw" then mark (cls ++ "#" ++ n9) else ()) in
      let _ = (if str_eq mode "w" || str_eq mode "rw" then mark (cls ++ "#" ++ n9 ++ "=") else ()) in
      attr_mark_vis cls mode rest9 priv)
@@ -53405,7 +53484,7 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
   let obj = VObj id in
   let _ = seed_builtin_subclass_ivars world cls id args in
   if has_meth world cls "initialize" then
-    let _ = invoke world noblk obj cls "initialize" args in obj
+    let _ = invoke_initializer world noblk obj cls args in obj
   else tp_init_around world obj (fn (u: unit) -> init_arity_refuse world cls args obj)
 // (BasicObject#initialize, a C method: the :c_call / :c_return a TracePoint
 //  sees inside `new` when the class wrote none)
@@ -53439,7 +53518,7 @@ and new_obj_wb = fn world -> fn (cls: str) -> fn (args: Val list) -> fn theblk -
   let _ = seed_builtin_subclass_ivars world cls id args in
   if has_meth world cls "initialize" then
     // ...and a block that BREAKS out of #initialize is the value of `new`
-    (let r9 = invoke world theblk obj cls "initialize" args in
+    (let r9 = invoke_initializer world theblk obj cls args in
      if map_has meth_broke 0 then (let _ = map_delete meth_broke 0 in r9) else obj)
   else tp_init_around world obj (fn (u: unit) -> init_arity_refuse world cls args obj)
 
@@ -54729,6 +54808,27 @@ and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: St
 // snapshot and the classes it names. Captured scopes stay in lv_capx and are
 // reached through their live Proc/Method owners instead.
 and register_refine_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (refinery: str) -> fn denv ->
+  // A body containing only first plain definitions cannot observe a scope
+  // environment. Install its live refinery once, then use the shared writer
+  // directly instead of encoding, restoring and decoding the same snapshot.
+  if plain_declarations world cls body then
+    (let saved = ref_save_active () in
+     let _ = map_set ref_flag 0 1 in
+     let _ = ref_install (ref_env_id denv) in
+     let _ = map_set ref_active ("@" ++ refinery) VNil in
+     let _ = ref_live refinery in
+     let _ = ref_snapshot () in
+     let previous_lex = cur_lex () in
+     let _ = set_lex refinery in
+     let cenv = frame_pool_get () in
+     let result = try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) in
+     let _ = frame_pool_put cenv in
+     let _ = set_lex previous_lex in
+     let _ = restore_ref_active saved in
+     match result with
+     | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
+     | other -> other)
+  else
   let scope = refine_body_env denv refinery in
   let result = try_or_msg (fn (u: unit) -> register_class_blk world cls body refinery scope)
                 (fn (message: str) -> (let _ = blk_env_put scope in fail message)) in
@@ -54966,7 +55066,7 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
            let _ = (if map_has privates k1 then map_delete privates k1 else ()) in
            let _ = (if map_has protecteds k1 then map_delete protecteds k1 else ()) in
            if (if zs9 then meth_private world cls n2 else map_has privates k2) then (let _ = set_private k1 VNil in ())
-           else if (if zs9 then meth_protected world cls n2 else map_has protecteds k2) then (let _ = map_set protecteds k1 VNil in ())
+           else if (if zs9 then meth_protected world cls n2 else map_has protecteds k2) then (let _ = set_protected k1 VNil in ())
            else ()) in
   // an alias ADDS a method, so `method_added` fires for the new name --
   // rubocop-ast registers its visitors from that hook and writes
@@ -55453,6 +55553,42 @@ and yblk_env = fn denv -> fn blk ->
      let _ = map_set ch9 "__yblk" (VProc ypid) in
      ch9)
   | _ -> denv
+// Declaration-only anonymous bodies do not read or capture their block
+// environment. Keep lexical/refinement scope and the shared definition
+// writer, without installing locals that no statement can observe.
+and plain_declarations = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
+  let (methods, _, _, _) = world in
+  let rec scan = fn (statements: Stmt list) -> fn (seen: str list) -> fn (count: int) ->
+    match statements with
+    | Nil -> count > 0
+    | Cons (SLine _, rest) -> scan rest seen count
+    | Cons (SLineQ _, rest) -> scan rest seen count
+    | Cons (SFile _, rest) -> scan rest seen count
+    | Cons (SDef (name, _, _, _), rest) ->
+      count < 16 && (if str_contains name "#" || str_starts_with name "self."
+        || str_eq name "method_added" || str_eq name "const_added"
+        || str_eq name "object_id" || str_eq name "__id__" || str_eq name "__send__"
+        || str_list_has seen name || map_has methods (cls ++ "#" ++ name) then false else true)
+      && scan rest (Cons (name, seen)) (count + 1)
+    | _ -> false in
+  mro_cache_on () && map_has anonymous_classes cls
+  && (if map_has cls_frozen cls || is_sng_cls cls then false else true)
+  && map_len trace_fn == 0 && map_len flow_sig == 0 && map_len brk_wraps == 0
+  && (if map_has hook_flags "tp" || map_has hook_flags "ma" || map_has hook_flags "stf" then false else true)
+  && scan body Nil 0
+and register_plain_declarations = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
+  let saved = ref_save_active () in
+  let cenv = frame_pool_get () in
+  let _ = (if ref_on () then ref_install (ref_env_id denv) else ()) in
+  let previous_lex = cur_lex () in
+  let _ = set_lex cscope in
+  let result = try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) in
+  let _ = frame_pool_put cenv in
+  let _ = set_lex previous_lex in
+  let _ = restore_ref_active saved in
+  match result with
+  | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
+  | other -> other
 and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
   // ⚠ a block body is starting, so the pending `&pr` source is spent -- as
   //   run_block says for the same reason. A class body never reached it, so
@@ -55461,6 +55597,8 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   //   the first ran the first one's block (its initialize, its methods).
   let _ = if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else () in
   let _ = if map_has pending_home "v" then map_delete pending_home "v" else () in
+  if plain_declarations world cls body then register_plain_declarations world cls body cscope denv
+  else
   let saved = ref_save_active () in
   let cenv = blk_env_get denv in
   // ⚠ the refinements of a class_eval / Module.new BLOCK are the ones where
@@ -55537,7 +55675,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
              else (let _ = map_set cenv "__vis" (frame_text vis) in
                    if map_has cenv "__visc" then () else map_set cenv "__visc" (VClass cls))) in
     let _ = (if map_has meth_aliased key then map_delete meth_aliased key else ()) in
-    let _ = set_meth methods key (Meth (params, defaults, method_body)) in
+    let _ = set_first_anon_meth methods cls key (Meth (params, defaults, method_body)) in
     let _ = map_set meth_cref key (lex_pack ()) in
     let _ = stamp_meth_src key in
     let _ = (if map_has r2k_methods key then map_delete r2k_methods key else ()) in
@@ -55761,7 +55899,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                        set_private key VNil)
                     else if str_eq vis2 "protected" then
                       (let _ = (if map_has privates key then map_delete privates key else ()) in
-                       map_set protecteds key VNil)
+                       set_protected key VNil)
                     else
                       (let _ = (if map_has privates key then map_delete privates key else ()) in
                        (if map_has protecteds key then map_delete protecteds key else ())))
@@ -56093,7 +56231,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                        // ...under the body's default visibility, as a def is:
                        // in `module_function` mode it is a module function too
                        let _ = (if str_eq vis2 "private" then set_private (cls ++ "#" ++ nm) VNil
-                                else if str_eq vis2 "protected" then map_set protecteds (cls ++ "#" ++ nm) VNil
+                                else if str_eq vis2 "protected" then set_protected (cls ++ "#" ++ nm) VNil
                                 else if str_eq vis2 "module_function" then
                                   (let _ = set_private (cls ++ "#" ++ nm) VNil in
                                    modfunc_promote_hooked world cls (Cons (nm, Nil)))
@@ -56618,7 +56756,7 @@ and refine_import_methods = fn env -> fn world -> fn (rimpl: str) -> fn (args: V
            let _ = (if map_has privates nk then map_delete privates nk else ()) in
            let _ = (if map_has protecteds nk then map_delete protecteds nk else ()) in
            let _ = (if map_has privates k then set_private nk VNil
-                    else if map_has protecteds k then map_set protecteds nk VNil else ()) in
+                    else if map_has protecteds k then set_protected nk VNil else ()) in
            copy_one m t)
         else
           (let _ = raise_exc world "ArgumentError"
@@ -56901,8 +57039,15 @@ and run_pre_f = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
 // the caller, while avoiding an empty region for these markers. Other
 // statements retain their region, and only an unused normal result is dropped
 // before copy-out; return, break, next and exception flow still escape intact.
+and discarded_unbound_chain = fn env -> fn world -> fn (statement: Stmt) ->
+  match statement with
+  | SExpr (EMethod (EMethod (EVar local, method_name, Cons (ESym target, Nil)), unbind_name, Nil)) ->
+    str_eq unbind_name "unbind" && str_eq method_name "method"
+    && unbound_chain_allowed env world local target
+  | _ -> false
 and exec_stmt_region = fn env -> fn world -> fn blk -> fn (s: Stmt) -> fn (keep_result: bool) ->
-  match s with
+  if (if keep_result then false else true) && discarded_unbound_chain env world s then FNext VNil
+  else match s with
   | SLine n when n < 0 -> FNext VNil
   | SLine n when (if map_has hook_flags "tp" then false else true) ->
     let _ = cur_line_set n in FNext VNil
@@ -56914,6 +57059,8 @@ and exec_stmt_region = fn env -> fn world -> fn blk -> fn (s: Stmt) -> fn (keep_
       | flow -> flow
     }
 and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
+  run_stmts_result env world blk prog false
+and run_stmts_result = fn env -> fn world -> fn blk -> fn (prog: Stmt list) -> fn (discard_result: bool) ->
   match prog with
   | Nil -> FNext VNil
   // (a scope's mark, lvd_head: the locals the rest of its body assigns, for
@@ -56924,7 +57071,7 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
        | Nil -> acc
        | Cons (x, r) -> join9 r (if str_eq acc "" then x else acc ++ chr 10 ++ x) in
      let _ = map_set env "__lvdecl" (mkstr (join9 (deep_targets rest) "")) in
-     run_stmts env world blk rest)
+     run_stmts_result env world blk rest discard_result)
   | Cons (s, rest) ->
     // where this statement's allocations begin (fb_wm in m_fiber.mere)
     let _ = fb_wm_stmt () in
@@ -56944,6 +57091,7 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
      // all chained through this arm. The value leaves by the same per-type
      // deep copy the other arm has always used, and stores copy in on write,
      // so wrapping the last statement is sound by the same argument.
+     | Nil when discard_result && discarded_unbound_chain env world s -> FNext VNil
      | Nil ->
        (match exec_stmt_region env world blk s true with
         | FReturn v -> FReturn v
@@ -56957,7 +57105,7 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
      // no side effects
      // (the parse says it is useless with -w: vw_check)
      | _ when (match s with SExpr (EDefined _) -> true | _ -> false) ->
-       run_stmts env world blk rest
+       run_stmts_result env world blk rest discard_result
      | _ ->
        // A REGION PER STATEMENT whose value is discarded -- every statement but
        // the last of a body. What a statement builds and throws away (the
@@ -57005,7 +57153,7 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
                    then (if gc_pressure world then (let _ = gc_collect_any env world in ()) else ())
                    else gc_point_finalizers world) in
           let _ = fin_drain world in
-          run_stmts env world blk rest))
+          run_stmts_result env world blk rest discard_result))
 
 // a feature named as it was given, already in $LOADED_FEATURES as an
 // extension library (`$LOADED_FEATURES << "foo.so"` satisfies `require "foo"`).
@@ -58017,7 +58165,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                    let _ = (if map_has privates key then map_delete privates key else ()) in
                    let _ = (if map_has protecteds key then map_delete protecteds key else ()) in
                    if str_eq m9 "private" then set_private key VNil
-                   else if str_eq m9 "protected" then map_set protecteds key VNil
+                   else if str_eq m9 "protected" then set_protected key VNil
                    else if str_eq m9 "module_function" then
                      (let mk9 = "(sng:" ++ c9 ++ ")#" ++ name in
                       let _ = set_meth meths mk9 (Meth (params, defs, body)) in

@@ -137,7 +137,7 @@ printf 'cc     clang %s %s mr.c tools/*_glue.c libprism.a with OpenSSL -> mere-r
 # mid-run are backed by that file, and overwriting them SIGKILLs it or, worse,
 # gives it another build's instructions. Build beside it and rename.
 # shellcheck disable=SC2086
-clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
+clang $opt -w $plat -DMERE_REGION_CACHE_CAP=8 -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
 
 # ...and say which build this is, where something that must not be misled can
