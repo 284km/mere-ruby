@@ -92,6 +92,16 @@ if [ "$emit" = 1 ]; then
 fi
 [ -f mr.c ] || { echo "build.sh: no mr.c to compile" >&2; exit 2; }
 
+# Some compiler releases retain 64 regions but predate the configurable cap.
+# Refuse a silently ignored build flag instead of restoring the RSS regression.
+if ! printf '%s\n' '#include "mr.c"' \
+  '#if !defined(__LANG_REGION_CACHE_CAP) || __LANG_REGION_CACHE_CAP != 8' \
+  '#error native region cache must be eight; use the pinned Mere compiler' \
+  '#endif' | clang -w -E -x c -I "$root" -DMERE_REGION_CACHE_CAP=8 - >/dev/null; then
+  echo 'build.sh: compiler cannot enforce the native region-cache policy; use the pinned Mere compiler' >&2
+  exit 2
+fi
+
 # libprism (vendor/prism, see its README): compiled once into vendor/prism/obj
 # and kept, since it changes only when the vendored copy does. Always -O2 --
 # it is not the interpreter, and the sweep's CPU bound measures the parser
@@ -136,8 +146,11 @@ printf 'cc     clang %s %s mr.c tools/*_glue.c libprism.a with OpenSSL -> mere-r
 # ⚠ NEVER `cp` OVER A RUNNING BINARY -- the text pages of a process that is
 # mid-run are backed by that file, and overwriting them SIGKILLs it or, worse,
 # gives it another build's instructions. Build beside it and rename.
+# Retain eight native region seeds per thread. Nested Ruby calls otherwise
+# leave a much larger idle cache after deep dispatch; preserve the native
+# interpreter's existing RSS headroom while keeping allocation lifetimes.
 # shellcheck disable=SC2086
-clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
+clang $opt -w $plat -DMERE_REGION_CACHE_CAP=8 -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
 
 # ...and say which build this is, where something that must not be misled can
