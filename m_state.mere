@@ -480,7 +480,8 @@ let arr_new = fn (xs: Val list) ->
 let qv_pool = vec_new ();
 let qv_quar = vec_new ();
 // 0: in the pool, 1: in quarantine, 2: queues with an arena of their own,
-// 3: bytes charged for the queues made since the last collection
+// 3: bytes charged for the queues (and hash indexes, hidx_start) made since
+//    the last collection
 let qv_ctr = vec_new ();
 let _ = vec_push qv_ctr 0;
 let _ = vec_push qv_ctr 0;
@@ -1281,17 +1282,23 @@ let hidx_release = fn (id: int) ->
      vec_set hidx_pool_n 1 (n + 1))
   else ();
 // (gc_collect, where it compacts)
+// ⚠ EVERY INDEX GOES BACK TO THE POOL. Past 4096 pooled ones an index used to
+//   be dropped -- and a dropped Map gives nothing back (its private arena hangs
+//   off the default region), so it was a leak of the whole index, not a bound.
+//   A loop of `Thread.handle_interrupt(Exception => :immediate) { }` makes one
+//   indexed hash a call (a Class key is not plain) and some 10,000 between two
+//   collections: 3.9 KB a call stayed, and test_thread's 500,000 of them went
+//   past 2 GiB. The pool is at most the indexes that were alive at once.
 let hidx_drain = fn (u: unit) ->
   let rec go = fn (i: int) ->
     if i >= vec_get hidx_pool_n 1 then ()
     else
       (let ix = vec_get hidx_quar i in
        let n = vec_get hidx_pool_n 0 in
-       let _ = (if n >= 4096 then ()
-                else (let _ = map_clear ix in
-                      let _ = map_compact ix in
-                      let _ = (if n < vec_len hidx_pool then vec_set hidx_pool n ix else vec_push hidx_pool ix) in
-                      vec_set hidx_pool_n 0 (n + 1))) in
+       let _ = map_clear ix in
+       let _ = map_compact ix in
+       let _ = (if n < vec_len hidx_pool then vec_set hidx_pool n ix else vec_push hidx_pool ix) in
+       let _ = vec_set hidx_pool_n 0 (n + 1) in
        go (i + 1)) in
   let _ = go 0 in
   vec_set hidx_pool_n 1 0;
@@ -1305,6 +1312,11 @@ let hidx_drop = fn (id: int) ->
   else ();
 let hidx_start = fn (id: int) ->
   let _ = map_set hash_indexed id true in
+  // an index has an arena of its own (a 4 KB seed): it counts toward the next
+  // collection the way a queue does (qv_take), or a loop making nothing but
+  // small indexed hashes -- `{Exception => :immediate}` -- piled up dead ones
+  // between two collections, and the pool grew to hold them all
+  let _ = vec_set qv_ctr 3 (vec_get qv_ctr 3 + 4096) in
   let n = vec_get hidx_pool_n 0 in
   let ix = (if n > 0 then (let _ = vec_set hidx_pool_n 0 (n - 1) in vec_get hidx_pool (n - 1))
             else (let m = map_new () in let _ = map_recycle m in m)) in
@@ -2398,14 +2410,15 @@ let frame_pool_put = fn f ->
   //   unittest/repro/269_frame_pool_overflow.rb is the witness.
   let _ = map_recycle f in
   let n = vec_get frame_pool_n 0 in
-  // cap the pool at the deepest call stack seen; past that, drop the frame
-  // (its arena was already wound back, so the residue is the struct alone).
-  if n >= 4096 then (pool_ctr 4)
-  else
-    (let _ = pool_ctr 3 in
-     let _ = (if n < vec_len frame_pool then vec_set frame_pool n f
-              else vec_push frame_pool f) in
-     vec_set frame_pool_n 0 (n + 1));
+  // ⚠ NO CAP: past 4096 pooled frames one used to be dropped, on the belief
+  //   that the residue was the struct alone. The wound-back arena keeps its
+  //   4 KB seed, and a dropped Map gives nothing back -- so every return below
+  //   the 4096th frame of a deep recursion kept 4 KB for good. The pool is at
+  //   most the deepest call stack seen. (pool_drops, counter 4, stays 0.)
+  (let _ = pool_ctr 3 in
+   let _ = (if n < vec_len frame_pool then vec_set frame_pool n f
+            else vec_push frame_pool f) in
+   vec_set frame_pool_n 0 (n + 1));
 // A method's frame when its call is over: back to the pool unless something
 // captured it (a captured one waits in lv_cap for a collection that does not
 // reach it). A define_method body's frame is a pooled scope-chain child too;

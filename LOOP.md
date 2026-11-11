@@ -3560,3 +3560,83 @@ Round 17 of note 543 (stage 4, memory and time).
   marshal, the tracepoint pair, string_empty?, and #78's four. The spec
   records: base DIFF 16, CRASH 0 (library/etc/getgrgid read DIFF in the
   sweep and MATCH alone twice: the load flake of (32); its record is kept).
+
+## 2026-11-11 (34): stage 4, round 18 -- Mere v0.1.729 and the 64-deep cache again, a hash index the pool dropped and never freed, the idle wait's and a bignum addition's scratch in the default region
+
+Round 18 of note 543 (stage 4, memory and time).
+
+- **Mere v0.1.729** (merelang/mere#74, merged as a3deab36): a region that
+  goes into the per-thread cache is zeroed where it was used, and `mem_trim`
+  hands back what the runtime keeps for reuse (cache entries past 8, and on
+  Darwin the kept mapped blocks). mere.toml and MERE_REF move to it, and
+  GC.start calls `mem_trim ()` after its collection (both the in-stack and
+  the off-stack one) -- what assert_no_memory_leak reads right after GC.start
+  no longer counts up to 16 MB of kept blocks.
+- **The cache is 64 deep again.** #79 built with `-DMERE_REGION_CACHE_CAP=8`
+  for two reasons, both of them v0.1.727's and both gone in v0.1.729: the
+  un-zeroed reuse (snippets_test past 2 GiB) and test_kwarg_eval_memory_leak
+  at 1.44. Side by side on v0.1.729, under the same load: test_udp's bind /
+  connect / send leak checks pass at 64 (4.8 / 4.8 / 2.4 s) and run into
+  their child's 10 s at 8; kwarg_eval passes at both (1.9 s, 128 MiB at 64;
+  2.1 s, 203 MiB at 8). build.sh builds with the compiler's default and
+  refuses an mr.c without `__lang_mem_trim` (one older than v0.1.729).
+- **A hash index the pool dropped was never freed.** A hash whose keys are
+  not all plain (a Class key -- `{Exception => :immediate}`, the mask of
+  every Thread.handle_interrupt) gets an index: a Map with an arena of its
+  own. A dead hash's index goes back to a pool at the next collection --
+  and past 4096 pooled ones it was dropped. A dropped Map gives nothing back
+  (its arena hangs off the default region), so the cap was a leak of every
+  index past it: 3.9 KB a call in a handle_interrupt loop, found with
+  MallocStackLogging (16,054 live 3.9 KB blocks from map_recycle in
+  hidx_start). test_thread's handle_interrupt_with_return_and_trap_handler
+  (500,000 calls) went past 1.8 GB in its child, which is why test_thread
+  read MEMORY_LIMIT on main's CI. Every index goes back to the pool now, and
+  each one taken counts 4 KB toward the next collection (as a queue counts
+  512 B), or the pool grew to hold what piled up between two collections.
+  The frame pool had the same cap (past 4096 frames, a returning frame kept
+  its 4 KB seed for good): gone too. That loop: 59 -> 64 MB for 200,000
+  calls (was -> 511 MB), and 1.8 s (was 16 s). tools/loop_rss_check.rb has
+  the case "a hash with a Class key": 4.90 before, 1.08 now.
+- **The scheduler's idle wait wrote into the default region at every
+  wait.** sch_iofd_wait (every thread waiting, some on a descriptor) built
+  three maps, a joined text and the split words in the default region, and
+  sch_next_deadline / sch_expire / sch_waiters_n their maps: 4.27 GB
+  allocated there over net/http/test_http's 85 tests, found with `mere -c
+  --region-sites` (m_sched.mere:204 1.25 GB, :217 0.83 GB). Each is in a
+  region of its own now: the default region ends at 222 MB, and the file's
+  largest RSS is 726 MB (1.2 - 1.8 GB before, with the cache 8 or 64 deep).
+- **A bignum addition's buffer was in the default region**: mag_add and
+  mag_sub (rev_str beside them already had a region, note 300). 656 MB of
+  test_trick's child; `a + b; a - b` on 2,400- and 3,400-digit Integers
+  20,000 times: 216 -> 59 MB.
+- **What does not fit a leak check's 10 s, and why it is not this round's.**
+  test_hash replace (500,000 `h.dup.replace(h)` of 676 pairs), test_alias
+  (500,000 define_method / alias / remove_method), test_settracefunc's two
+  (1,000,000 TracePoint.new; enable(target:)), test_addrinfo's marshal
+  (20,000), test_io's select (threads and IO.select for 60 s) and
+  test_optimization's string_empty? child: none of them is held back by a
+  leak any more -- each is an interpreter at 10 - 40 times ruby's time per
+  call. An empty `Foo.new(:a) {}` is 10 us here and 0.3 us in ruby, `proc
+  {}` 3 us against 0.2, a Hash#dup of 676 pairs 125 us against 2.5 (the
+  pair list and the digest index are copied whole). Taking the two blocks
+  out of TracePoint#initialize changed nothing measurable. A path made
+  cheaper does not close a 20x gap; the VM layer (note 511, stage 10) is
+  where these are, and the ledger says so. test_syntax's SyntaxError eval
+  (1,000,000) does fit now, at 10.0 s locally -- at the edge on CI.
+- **Checked** on Mere v0.1.729 (a3deab36): corpus 598/598 with the hash
+  index on and off (with LANG set: corpus/492 asks ENV for its encoding,
+  which follows the locale and not -Eutf-8 -- under an empty LANG the
+  reference answers BINARY, on round 16's binary too); loop_rss_check 8/8;
+  psych_scalar / tmpdir_fileutils / unicode_normalize / yaml_store /
+  record_hygiene; the embedding check and its stress; encoding_search;
+  prism_query_boundary. unittest on round 17's list plus test_thread,
+  test_http and test_trick: MATCH 9,958 (round 17: 9,954), newly all MATCH
+  in test_exception, test_integer, test_syntax and test_method
+  (kwarg_eval); test_array's shared_marking omits itself past 5 s on every
+  build here (12 - 16 s on round 17's binary too). Integer, bignum,
+  numeric, rational and test_trick: 180/180. Peak RSS (process family):
+  snippets_test 411 MB in 307 s (1,490 MB / 405 s on #74's measurement),
+  test_trick 392 MB, test_http 1,114 MB, test_thread 850 MB. Stage-4 list
+  on the final build: test_udp bind / connect / send 4.0 / 4.0 / 2.2 s,
+  gunzip 5.6 s, pow 11.1 s (passes; its own limit), blocking_backtrace,
+  yaml store binary, WeakKeyMap clear, syntax invalid_symbol -- MATCH.
