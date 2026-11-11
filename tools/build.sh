@@ -92,6 +92,16 @@ if [ "$emit" = 1 ]; then
 fi
 [ -f mr.c ] || { echo "build.sh: no mr.c to compile" >&2; exit 2; }
 
+# Some compiler releases retain 64 regions but predate the configurable cap.
+# Refuse a silently ignored build flag instead of restoring the RSS regression.
+if ! printf '%s\n' '#include "mr.c"' \
+  '#if !defined(__LANG_REGION_CACHE_CAP) || __LANG_REGION_CACHE_CAP != 8' \
+  '#error native region cache must be eight; use the pinned Mere compiler' \
+  '#endif' | clang -w -E -x c -I "$root" -DMERE_REGION_CACHE_CAP=8 - >/dev/null; then
+  echo 'build.sh: compiler cannot enforce the native region-cache policy; use the pinned Mere compiler' >&2
+  exit 2
+fi
+
 # libprism (vendor/prism, see its README): compiled once into vendor/prism/obj
 # and kept, since it changes only when the vendored copy does. Always -O2 --
 # it is not the interpreter, and the sweep's CPU bound measures the parser
