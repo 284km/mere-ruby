@@ -5,9 +5,11 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 : "${WASI_SDK_PATH:?set WASI_SDK_PATH to the extracted wasi-sdk-34.0 directory}"
 cc="$WASI_SDK_PATH/bin/clang"
-"$cc" --version | head -1 | rg 'clang version 23\.1\.' >/dev/null || {
-  echo 'NKF reactor requires WASI SDK 34.0 / clang 23.1' >&2; exit 1;
-}
+nkf_cc_version=$("$cc" --version)
+case "$nkf_cc_version" in
+  *"clang version 23.1."*) ;;
+  *) echo 'NKF reactor requires WASI SDK 34.0 / clang 23.1' >&2; exit 1 ;;
+esac
 set --
 for name in reset options convert guess result encoding_bytes base_encoding_bytes clear_result cleanup wasm_alloc wasm_free; do
   set -- "$@" "-Wl,--export=mr_nkf_$name"
