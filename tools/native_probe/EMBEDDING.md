@@ -19,7 +19,7 @@ python3 tools/native_probe/embedding_bundle.py \
 
 OpenSSL 3 development headers and libraries are required, as for the native CLI.
 Provider flags come from `OPENSSL_PREFIX`, Homebrew on macOS, or `pkg-config`.
-The archive includes OpenSSL glue; consumers also link the provider libraries
+The archive includes OpenSSL and NKF glue; consumers also link the provider libraries
 using the system flags recorded in the manifest.
 
 Use fresh output directories. On Linux, set `ulimit -s 524288` before running
@@ -45,7 +45,7 @@ Ruby methods such as an overridden `inspect`. Primitive errors are retained
 as Ruby's pending `$!`, just like explicitly raised exceptions.
 
 Cleanup runs exit hooks in Ruby's order, flushes open output, and terminates
-the scheduler, then releases the native OpenSSL handles owned by this
+the scheduler, then releases NKF engine buffers and the native OpenSSL handles owned by this
 instance. Hooks and thread ensure clauses can still use those objects before
 teardown; unrelated native handles owned by the host remain intact. Native
 ownership is drained even after a protected cleanup failure. A later hook

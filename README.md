@@ -330,6 +330,10 @@ class/symbol loading, and String subclasses can call `super` into `match?`.
 including autoload and direct require. The existing YAML parser/emitter is
 still a subset; full Parser, Nodes, aliases, tags and serialization remain work.
 
+`nkf` uses the pinned NKF 2.1.5 core for conversion, MIME processing and encoding
+guessing in native and browser builds. `kconv` ships its original Ruby API and
+String extensions. See [NKF.md](NKF.md) for source provenance and verification.
+
 A C extension is not automatically out of reach, but it has to be
 answered rather than found. `digest`, `date` and `etc` ship as Ruby
 source, `zlib`'s compression comes from a vendored Mere package (above)

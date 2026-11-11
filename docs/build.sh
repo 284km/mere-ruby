@@ -12,6 +12,7 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
+sh "$root/tools/build_nkf_wasm.sh"
 # MERE overrides the compiler, for a checkout that is not on PATH.
 # ⚠ From a copy with no threads (tools/nothreads_tree.sh): a module that
 # spawns needs a shared memory the page cannot have, and the Wasm backend

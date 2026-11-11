@@ -4616,6 +4616,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       invoke_val_c env world newblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
     // Math ignores a passed block. Its private functions also belong to
     // main after include, while real Object methods keep precedence.
+    else if (if str_eq (nkf_instance_owner world "Object" name) "" then false else true)
+            && (match (if lv_has env "self" then lv_get env "self" else VMain) with VMain -> true | _ -> false) then
+      (if has_meth world "Object" name then invoke world newblk VMain "Object" name args
+       else invoke_val_c env world newblk (VClass "NKF") name args false)
     else if ns_class_method "Math" name && str_list_has (ancestors_of world "Object") "Math"
             && (match (if lv_has env "self" then lv_get env "self" else VMain) with VMain -> true | _ -> false) then
       (if has_meth world "Object" name then invoke world newblk VMain "Object" name args
@@ -4918,7 +4922,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let recv = eval_e env world blk recv_e in
        let args = eval_args env world blk (rev_app rrest Nil) in
        (match eval_e env world blk be with
-        | VProc pid -> invoke_with_block env world blk recv name args (proc_as_block pid)
+        | VProc pid ->
+          if (match recv_e with ESelf -> false | _ -> true) && nkf_private_receiver world recv name
+          then invoke_val_c env world (proc_as_block pid) recv name args true
+          else invoke_with_block env world blk recv name args (proc_as_block pid)
         | VSym snm ->
           let cenv2 = map_new () in
           invoke_with_block env world blk recv name args
@@ -5087,7 +5094,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                           if str_len s9 > 0 then coerce_to_block env world blk (VSym s9)
                           else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
                                 blk_capture blk (true, bp, bb, env) bb))) in
-    invoke_with_block env world blk recv name args newblk
+    if (match recv_e with ESelf -> false | _ -> true) && nkf_private_receiver world recv name
+    then invoke_val_c env world newblk recv name args true
+    else invoke_with_block env world blk recv name args newblk
   | EArr items -> arr_new (eval_args env world blk items)
   // fold the evaluated pairs through hash_put so duplicate keys (from an
   // explicit repeat or a **splat then override) collapse last-value-wins,
@@ -17970,7 +17979,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     if (builtin_cls_name c || map_has (name_set "core_sng_cls") c)
        && ((let (m8, _, _, _) = world in map_has m8 ("(sng:" ++ c ++ ")#" ++ name)) || map_has prepends ("(sng:" ++ c ++ ")"))
        && (if str_len name > 2 && str_eq (substring name 0 2) "__" then false else true)
-       && (if str_eq (sng_user_owner world c name) "" then false else true) then
+       && (if str_eq (sng_user_owner world c name) "" then false else true)
+       && (if nkf_native_owner ("(sng:" ++ c ++ ")") name then bi_skip_pass name else true) then
       invoke world blk recv ("(sng:" ++ c ++ ")") name args
     // Core class/module construction has already passed the user-override
     // check. Keep its visibility and inherited-hook behavior, then construct
@@ -18563,7 +18573,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // (always UTF-8 in this interpreter — no locale probing).
     else if str_eq c "Encoding" && (str_len name == 4 && str_eq name "list") then
       (let out = map_new () in
-       let _ = map_iter enc_objs (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
+       // Ruby registers BINARY first. Kconv uses list[0] to distinguish
+       // unlabelled bytes from an input encoding it must pass to NKF.
+       let _ = map_set out "0" (map_get enc_objs "ASCII-8BIT") in
+       let _ = map_iter enc_objs (fn (k: str) -> fn (v: Val) ->
+         if str_eq k "ASCII-8BIT" then () else let i = map_len out in map_set out (str_of_int i) v) in
        arr_new (idx_to_list out 0 (map_len out)))
     else if str_eq c "Encoding" && (str_len name == 14 && str_eq name "locale_charmap") then mkstr (locale_codeset ())
     // Encoding.compatible?(a, b): the encoding a combination of the two would
@@ -20392,6 +20406,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                              then "US-ASCII" else renc9) in
                let ufl = (if str_eq final9 "ASCII-8BIT" then "n" else "") in
                VRegex (usrc, ufl, final9))))
+    else if str_eq name "__native_init" && map_has consts "NKF"
+            && (match map_get consts "NKF" with VClass owner -> str_eq c owner | _ -> false)
+    then nkf_initialize world c
+    else if nkf_module c && nkf_class_function name then
+      (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name then
+         raise_exc_iv world "NoMethodError" ("private method '" ++ name ++ "' called for module " ++ cls_display world c)
+           (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
+       else nkf_invoke env world name args)
     // Math.sqrt of a Complex is a Complex: rb_math_sqrt's own T_COMPLEX arm
     // (the root with the imaginary part's sign), not the Float of to_f --
     // Math.sqrt(c * c.conj) is (2.23606797749979+0.0i) (note 311)
@@ -21457,6 +21479,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        //  it: `Module.public_method_defined?(:include)` found the private
        //  top-level `def include` mspec's shim makes on Object, ahead of
        //  Module's own -- a builtin has no row for the walk to stop at)
+       let origin0 = (if str_eq origin0 "" && nkf_native_owner c nm then c
+                      else if str_eq origin0 "" && inh2 then nkf_instance_owner world c nm
+                      else origin0) in
        let origin = (if str_eq origin0 "" || str_eq origin0 c then origin0
                      else if (if str_eq c "Module" then (map_has (name_set "modpriv") nm || map_has (name_set "modpub") nm)
                               else if str_eq c "BasicObject" then bo_defines c nm
@@ -21590,6 +21615,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
             else ()) in
           // (...and its aliases of builtins, as collect_cls_methods lists them)
+          let _ = (if nkf_module c && vec_get nkf_loaded 0 != 0 then
+                     list_iter (str_split (name_spec "nkfns") "|") (fn (nm: str) ->
+                       if not (nkf_class_function nm) || map_has meths0 (pfx ++ nm) || map_has builtin_alias (pfx ++ nm) || map_has privates (pfx ++ nm) then ()
+                       else let m = map_len tmp in map_set tmp (str_of_int m) (VSym nm))
+                   else ()) in
           let _ = (if map_len builtin_alias == 0 then ()
                    else map_iter builtin_alias (fn (k: str) -> fn (v: str) ->
                           if str_len k > plen && str_eq (substring k 0 plen) pfx && (if map_has privates k then false else true)
@@ -21737,6 +21767,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let _ = (if str_eq cx "Math" && want_priv then
                      list_iter (str_split "acos|acosh|asin|asinh|atan|atan2|atanh|cbrt|cos|cosh|erf|erfc|exp|expm1|frexp|gamma|hypot|ldexp|lgamma|log|log10|log1p|log2|sin|sinh|sqrt|tan|tanh" "|")
                        (fn (nm9: str) -> (if map_has meths0 (pfx ++ nm9) then () else push9 nm9))
+                   else ()) in
+          let _ = (if nkf_module cx && want_priv && vec_get nkf_loaded 0 != 0 then
+                     list_iter (Cons ("nkf", Cons ("guess", Nil)))
+                       (fn (nm9: str) -> if not (nkf_instance_function nm9) || map_has meths0 (pfx ++ nm9) then () else push9 nm9)
                    else ()) in
           // ...each core class's own public ones (m_builtin_lists), which the
           // dispatcher answers and no table row names: `String
@@ -24056,6 +24090,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                if is_sng_cls c0 && (if has_meth world c0 name then false else true)
                   && (if enum_by_each name && has_meth world c0 "each"
                          && str_list_has (ancestors_of world c0) "Enumerable" then false else true)
+                  && (if str_eq (nkf_instance_owner world c0 name) "" then true else false)
                   // (...nor when the singleton holds an ALIAS of a builtin under
                   //  this name: `class << o; alias orig_to_s to_s; end`)
                   //  -- on the singleton or a module the object was extended
@@ -24262,7 +24297,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // (a question about the definition -- its parameters, arity, source,
     //  inspect, super_method -- asked of an object holding one its name has
     //  lost is answered from that definition: msnap_with)
-    else if msnap_reflect_name name && (if str_eq (msnap_src world id "Method" (msnap_obj_cls world id "Method") (msnap_obj_name world id "Method")) "" then false else true) then
+    else if msnap_reflect_name name && str_eq (nkf_method_name world id (msnap_obj_name world id "Method")) "" && (if str_eq (msnap_src world id "Method" (msnap_obj_cls world id "Method") (msnap_obj_name world id "Method")) "" then false else true) then
       msnap_with world (msnap_cls world id "Method" (msnap_obj_cls world id "Method") ++ "#" ++ msnap_obj_name world id "Method")
         (msnap_src world id "Method" (msnap_obj_cls world id "Method") (msnap_obj_name world id "Method"))
         (fn (u: unit) -> invoke_val_c env world blk recv name args vischeck)
@@ -24596,15 +24631,19 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // built a chain ruby refuses: curry checks the arity it was given
        // against the lambda's, and -1 means "variadic, anything goes".
        else if (str_len name == 5 && str_eq name "arity") then
-         VInt (bm_arity world (if str_eq mown "" then dispatch_cls_of world mrecv else mown) mnm)
+         (let native_name = nkf_method_name world id mnm in
+          VInt (if str_len native_name > 0 then builtin_arity_of world "NKF" native_name
+                else bm_arity world (if str_eq mown "" then dispatch_cls_of world mrecv else mown) mnm))
        // Method#source_location: [file, line] of the `def`, or nil for a
        // builtin (there is no ruby source behind one).
-       else if (str_len name == 15 && str_eq name "source_location") then meth_source_location world mown mnm mrecv
+       else if (str_len name == 15 && str_eq name "source_location") then (if str_len (nkf_method_name world id mnm) > 0 then VNil else meth_source_location world mown mnm mrecv)
        else if (str_len name == 10 && str_eq name "parameters") then
          // (a builtin SINGLETON method -- `Dir.method(:glob)` -- is named by
          //  its frame label "(sng:Dir)#glob", as #owner above reads it; the
          //  dispatch class of the receiver is the class's own, and the
          //  internal-ruby table keys the method "Dir.glob")
+         let native_name = nkf_method_name world id mnm in
+         if str_len native_name > 0 then arr_new (bm_kind_meta "req" (builtin_arity_of world "NKF" native_name)) else
          bm_params world (if str_eq mown "" then
                             (let l9 = builtin_frame_label world mrecv mnm in
                              if str_len l9 > 5 && str_eq (substring l9 0 5) "(sng:" && str_index_of l9 "#" > 0
@@ -26404,7 +26443,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // (a question about the definition -- its parameters, arity, source,
     //  inspect, super_method -- asked of an object holding one its name has
     //  lost is answered from that definition: msnap_with)
-    else if msnap_reflect_name name && (if str_eq (msnap_src world id "UnboundMethod" (msnap_obj_cls world id "UnboundMethod") (msnap_obj_name world id "UnboundMethod")) "" then false else true) then
+    else if msnap_reflect_name name && str_eq (nkf_method_name world id (msnap_obj_name world id "UnboundMethod")) "" && (if str_eq (msnap_src world id "UnboundMethod" (msnap_obj_cls world id "UnboundMethod") (msnap_obj_name world id "UnboundMethod")) "" then false else true) then
       msnap_with world (msnap_cls world id "UnboundMethod" (msnap_obj_cls world id "UnboundMethod") ++ "#" ++ msnap_obj_name world id "UnboundMethod")
         (msnap_src world id "UnboundMethod" (msnap_obj_cls world id "UnboundMethod") (msnap_obj_name world id "UnboundMethod"))
         (fn (u: unit) -> invoke_val_c env world blk recv name args vischeck)
@@ -26482,9 +26521,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                  else (let _ = bo_ensure () in
                        let l9 = bo_walk (ancestors_of world ucls) unm in
                        if str_len l9 > 0 then substring l9 0 (str_index_of l9 "#") else ucls)))
-       else if (str_len name == 15 && str_eq name "source_location") then meth_source_location world ucls unm VNil
-       else if (str_len name == 5 && str_eq name "arity") then VInt (bm_arity world ucls unm)
-       else if (str_len name == 10 && str_eq name "parameters") then bm_params world ucls unm
+       else if (str_len name == 15 && str_eq name "source_location") then
+         (if str_len (nkf_method_name world id unm) > 0 then VNil else meth_source_location world ucls unm VNil)
+       else if (str_len name == 5 && str_eq name "arity") then
+         (let native_name = nkf_method_name world id unm in
+          VInt (if str_len native_name > 0 then builtin_arity_of world "NKF" native_name else bm_arity world ucls unm))
+       else if (str_len name == 10 && str_eq name "parameters") then
+         (let native_name = nkf_method_name world id unm in
+          if str_len native_name > 0 then arr_new (bm_kind_meta "req" (builtin_arity_of world "NKF" native_name)) else bm_params world ucls unm)
        // original_name: the name this method was DEFINED as, which differs from
        // #name only for an alias -- and alias_srcname already records that pair
        // (it exists so that `super` inside an aliased method searches for the
@@ -27465,6 +27509,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     //   the method table. The implicit-self path learned this; the explicit
     //   one (`self.sin(0)`, `obj.send(:sin, 0)`) comes through here and had
     //   to learn it too -- one rule, two call shapes.
+    else if (if str_eq (nkf_instance_owner world cls name) "" then false else true) then
+      (if vischeck && meth_private world cls name then
+         (if has_meth world cls "method_missing" then
+            invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
+          else raise_exc_iv world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
+                 (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
+       else invoke_val_c env world blk (VClass "NKF") name args false)
     else if ns_class_method "Math" name && str_list_has (ancestors_of world cls) "Math" then
       invoke_val_c env world blk (VClass "Math") name args false
     // a method_missing defined on the object's SINGLETON (def o.method_missing)
@@ -30800,6 +30851,16 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
   else invoke_with_block2 env world blk recv name args newblk0
 and invoke_with_block2 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk0 ->
   let newblk = (if blk_is_lambda newblk0 then blk_spread_for world recv name newblk0 else newblk0) in
+  // Native NKF functions ignore a block. Resolve a real Ruby override first;
+  // the native entry has no AST body for the generic block dispatcher to run.
+  if nkf_function name &&
+     (match recv with
+      | VClass c -> nkf_module c && str_eq (lookup_anc world (ancestors_of world ("(sng:" ++ c ++ ")")) name) ""
+      | _ -> let c = dispatch_cls_of world recv in
+             (if str_eq (nkf_instance_owner world c name) "" then false else true)
+             && str_eq (lookup_anc world (ancestors_of world c) name) "") then
+    invoke_val_c env world blk recv name args false
+  else
   // (a builtin's subclass value with an alias of a builtin under this name:
   //  the builtin it names, as the block-less call does in invoke_val_c0)
   if map_len builtin_alias > 0
@@ -30979,6 +31040,8 @@ and bi_meth_call = fn env -> fn world -> fn blk -> fn (id: int) -> fn (mnm: str)
                  | _ -> invoke_val_c env world blk mrecv mnm args false))
                 (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
      let _ = map_clear bi_skip in r9) in
+  let nkf_name = nkf_method_name world id mnm in
+  if str_len nkf_name > 0 then nkf_invoke env world nkf_name args else
   match (mrecv, newblk) with
   // (an uninitialized Rational / Complex is its zero: `Class.instance_method
   //  (:allocate).bind_call(Rational)` is (0/1), test_uninitialized)
@@ -34939,6 +35002,7 @@ and bm_arity = fn world -> fn (owner0: str) -> fn (nm: str) ->
   // ...and the arity is the BODY's, whatever class owns the method (see
   // body_cls_of: `public :m` in a subclass owns it without defining it).
   let owner = body_cls_of world owner0 nm in
+  let nm = nkf_metadata_name world owner nm in
   if str_len nm == 10 && str_eq nm "initialize" && map_has struct_mem owner then 0 - 1 else
   // the explicit-but-empty `||` sentinel is not a parameter, here either: a
   // `define_method(:m) { || }` counted it and answered arity 1 for a method
@@ -34967,7 +35031,8 @@ and builtin_arity_of = fn world -> fn (cls: str) -> fn (nm: str) ->
   let _ = (if map_has arity_state "l" then ()
            else (let _ = map_set arity_state "l" 1 in
                  if str_eq (env_get "MERE_RUBY_NO_ARITY") "" then arity_build () else ())) in
-  let key0 = cls ++ "#" ++ nm in
+  let key0 = (if nkf_native_owner cls nm || (if str_eq (nkf_instance_owner world cls nm) "" then false else true)
+              then "NKF" else cls) ++ "#" ++ nm in
   let key = (if map_has arity_num_tbl key0 then key0
              else if obj_is_a world cls "Enumerable" && map_has arity_num_tbl ("Enumerable#" ++ nm)
              then "Enumerable#" ++ nm
@@ -34989,6 +35054,7 @@ and bm_params = fn world -> fn (owner0: str) -> fn (nm: str) ->
   // the owner may be a class that only PUBLISHED the method; the parameters
   // are the body's.
   let owner = body_cls_of world owner0 nm in
+  let nm = nkf_metadata_name world owner nm in
   let key = owner ++ "#" ++ nm in
   // the builtins ruby writes in Ruby have NAMED parameters (m_internal_ruby's
   // 5th column; Prism's unpack1 polyfill reads them): asked first, by the
@@ -35029,7 +35095,8 @@ and bm_params = fn world -> fn (owner0: str) -> fn (nm: str) ->
   else
     (let a9 = builtin_arity_of world owner nm in
      let k9 = owner ++ "#" ++ nm in
-     let has9 = (if map_has arity_num_tbl k9 then true
+     let has9 = (if nkf_native_owner owner nm || (if str_eq (nkf_instance_owner world owner nm) "" then false else true) then true
+                 else if map_has arity_num_tbl k9 then true
                  else if obj_is_a world owner "Enumerable"
                          && map_has arity_num_tbl ("Enumerable#" ++ nm) then true
                  else if obj_is_a world owner "Comparable"
@@ -35713,6 +35780,7 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
   // prototype rather than retaining a chain of anonymous copy sources;
   // ordinary modules/classes need no native Time entry at all.
   let _ = (if ismod then () else if time_cls world c then map_set cls_copy_of nc "Time" else ()) in
+  let _ = (if nkf_module c && vec_get nkf_loaded 0 != 0 then map_set cls_copy_of nc "NKF" else ()) in
   // the pairs to copy are collected first: the tables are written while
   // being read otherwise
   let rec_pfx = fn (src: str) -> fn (dst: str) ->
@@ -35778,6 +35846,34 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
   // one feature -- loading it through either answers both (autoload_keys_for)
   let _ = copy_kv autoloads (c ++ "::") (nc ++ "::") "::" in
   let _ = copy_kv cvars (c ++ "@") (nc ++ "@") "" in
+  let _ = (if nkf_module c && vec_get nkf_loaded 0 != 0 then
+             let copy_aliases = fn (owner: str) -> fn (target: str) ->
+               let prefix = owner ++ "#" in
+               let keys = vec_new () in
+               let _ = map_iter builtin_alias (fn (key: str) -> fn (_value: str) ->
+                 if str_starts_with key prefix then vec_push keys key else ()) in
+               let rec copy = fn (i: int) ->
+                 if i >= vec_len keys then () else
+                 let key = vec_get keys i in
+                 let destination = target ++ "#" ++ substring key (str_len prefix) (str_len key) in
+                 let _ = map_set builtin_alias destination (map_get builtin_alias key) in
+                 let _ = (if map_has alias_srcname key then map_set alias_srcname destination (map_get alias_srcname key) else ()) in
+                 let _ = (if map_has privates key then set_private destination VNil else ()) in
+                 let _ = (if map_has protecteds key then set_protected destination VNil else ()) in
+                 copy (i + 1) in copy 0 in
+             let _ = copy_aliases c nc in
+             copy_aliases ("(sng:" ++ c ++ ")") ("(sng:" ++ nc ++ ")")
+           else ()) in
+  let _ = (if nkf_module c && vec_get nkf_loaded 0 != 0 then
+             list_iter (str_split (name_spec "nkfns") "|") (fn (nm: str) ->
+               let copy_vis = fn (source: str) -> fn (target: str) ->
+                 let _ = (if map_has privates source then set_private target VNil else ()) in
+                 let _ = (if map_has protecteds source then set_protected target VNil else ()) in
+                 let _ = (if map_has vis_marks source then map_set vis_marks target (map_get vis_marks source) else ()) in
+                 if map_has undefs source then set_undef target else () in
+               let _ = copy_vis (c ++ "#" ++ nm) (nc ++ "#" ++ nm) in
+               copy_vis ("(sng:" ++ c ++ ")#" ++ nm) ("(sng:" ++ nc ++ ")#" ++ nm))
+           else ()) in
   let _ = copy_kv iv9 ("cls:" ++ c ++ "@") ("cls:" ++ nc ++ "@") "" in
   let _ = (if keep_frozen && map_has cls_frozen c then map_set cls_frozen nc (map_get cls_frozen c) else ()) in
   VClass nc
@@ -36117,8 +36213,10 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
               | VClass c8 ->
                 (let sng8 = "(sng:" ++ c8 ++ ")" in
                  if map_has undef_names nm && undef_blocked world sng8 nm then false
-                 else has_meth world sng8 nm || str_eq nm "ruby2_keywords" || (str_eq nm "new" && meth_private world sng8 "new"))
-              | _ -> has_meth world c9 nm) then VBool true
+                 else has_meth world sng8 nm || nkf_native_owner sng8 nm || str_eq nm "ruby2_keywords" || (str_eq nm "new" && meth_private world sng8 "new"))
+              | _ -> has_meth world c9 nm
+                     || ((if str_eq (nkf_instance_owner world c9 nm) "" then false else true)
+                         && (if undef_blocked world c9 nm then false else true))) then VBool true
   // ...and Kernel's private functions (fork, sleep, exit!, trace_var), which
   // have no table entry: every receiver whose chain has Kernel answers them
   // (`respond_to?(:fork, true)` is how test_process decides to run its fork
@@ -36223,6 +36321,8 @@ and responds_x0 = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: 
     // a private method does not answer respond_to? (ruby needs the
     // include_all argument for that), so `private :m` really hides it.
     (has_meth world cls name && (if meth_private world cls name then false else true))
+    || ((if str_eq (nkf_instance_owner world cls name) "" then false else true)
+        && (if meth_private world cls name then false else true))
     || (is_kernel_builtin name && kernel_made_public world cls name)
     || is_prim_method name || builtin_obj_has cls name
     // (...asked of the class UNDER a singleton class too: `s = $stdout.dup;
@@ -36292,7 +36392,7 @@ and responds_x0 = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: 
   // undef _load; end` left U.respond_to?(:_load, true) true, and Marshal then
   // called it rather than refusing)
   | VClass c when map_has undef_names name && undef_blocked world ("(sng:" ++ c ++ ")") name -> false
-  | VClass c when (if str_eq name "new" then false else has_meth world ("(sng:" ++ c ++ ")") name)
+  | VClass c when (if str_eq name "new" then false else has_meth world ("(sng:" ++ c ++ ")") name || nkf_native_owner ("(sng:" ++ c ++ ")") name)
                   && meth_private world ("(sng:" ++ c ++ ")") name -> false
   | VClass c ->
     ((str_len name == 3 && str_eq name "new") && (if meth_private world ("(sng:" ++ c ++ ")") "new" then false else true))
@@ -41526,6 +41626,139 @@ and rng_succ_member = fn env -> fn world -> fn (cur: Val) -> fn (hi: Val) -> fn 
 // are all different: a String (or something that yields one) is looked for on
 // the walk, something that yields a NON-String is a TypeError, and something
 // with no #to_str at all is simply not a member.
+// Native NKF module functions. Arity is checked before touching engine state;
+// each to_str callback occurs between the same native phases as ruby/nkf.
+and nkf_instance_owner = fn world -> fn (cls: str) -> fn (name: str) ->
+  let rec find = fn (xs: str list) ->
+    match xs with
+    | Nil -> ""
+    | Cons (owner, rest) -> if nkf_module owner then owner else find rest in
+  if nkf_instance_function name then find (ancestors_of world cls) else ""
+and nkf_metadata_name = fn world -> fn (owner: str) -> fn (name: str) ->
+  let source = blt_alias_lookup world (ancestors_of world owner) name in
+  if nkf_native_owner owner source || (if str_eq (nkf_instance_owner world owner source) "" then false else true)
+  then source else name
+and nkf_method_name = fn world -> fn (id: int) -> fn (name: str) ->
+  if vec_get nkf_loaded 0 == 0 then "" else
+  let owner = bi_meth_own world id in
+  if str_eq owner "" then "" else
+  let source = nkf_metadata_name world owner name in
+  if nkf_native_owner owner source || (if str_eq (nkf_instance_owner world owner source) "" then false else true)
+  then source else ""
+and nkf_private_receiver = fn world -> fn (recv: Val) -> fn (name: str) ->
+  if vec_get nkf_loaded 0 == 0 then false else
+  let owner = (match recv with VClass c -> "(sng:" ++ c ++ ")" | _ -> dispatch_cls_of world recv) in
+  let source = nkf_metadata_name world owner name in
+  (nkf_native_owner owner source || (if str_eq (nkf_instance_owner world owner source) "" then false else true))
+  && meth_private world owner name
+and nkf_status_check = fn world -> fn (status: int) ->
+  if status == 0 then () else
+  let _ = raise_exc world (if status == 1 then "ArgumentError" else if status == 2 then "NoMemoryError"
+                          else if status == 3 then "RangeError" else "RuntimeError")
+    (if status == 1 then "no output encoding given" else if status == 2 then "failed to allocate NKF buffer"
+     else if status == 3 then "string length too big" else "NKF engine failure") in ()
+and nkf_string_value = fn env -> fn world -> fn (value: Val) ->
+  match pack_cv env world 0 "str" value with
+  | VStr id -> sget id
+  | _ -> ""
+and nkf_canonical_encoding = fn world -> fn (name: str) -> fn (base: str) ->
+  let canonical = enc_find_canon name in
+  let canonical = (if str_eq canonical "" then enc_find_canon base else canonical) in
+  if str_eq canonical "" || not (map_has enc_objs canonical) then
+    (let _ = raise_exc world "EncodingError" ("unknown NKF output encoding - " ++ name) in "")
+  else canonical
+and nkf_copy_result = fn world ->
+  let copied = try_or_msg (fn (u: unit) ->
+      (str_of_bytes (mr_nkf_result ()), str_of_bytes (mr_nkf_encoding_bytes ()),
+       str_of_bytes (mr_nkf_base_encoding_bytes ())))
+    (fn (message: str) -> let _ = mr_nkf_clear_result () in fail message) in
+  let _ = mr_nkf_clear_result () in
+  let (body, name, base) = copied in (body, nkf_canonical_encoding world name base)
+and nkf_invoke = fn env -> fn world -> fn (name: str) -> fn (args: Val list) ->
+  let guessing = str_eq name "guess" in
+  let wanted = (if guessing then 1 else 2) in
+  if vlen args != wanted then
+    raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args)
+                                     ++ ", expected " ++ str_of_int wanted ++ ")")
+  else
+    let _ = nkf_status_check world (mr_nkf_reset (if guessing then 1 else 0)) in
+    if guessing then
+      (match args with
+       | Cons (source, Nil) ->
+         let bytes = nkf_string_value env world source in
+         let _ = nkf_status_check world (mr_nkf_guess (bytes_of_str bytes)) in
+         let (_, encoding) = nkf_copy_result world in map_get enc_objs encoding
+       | _ -> VNil)
+    else
+      (match args with
+       | Cons (options, Cons (source, Nil)) ->
+         let options = nkf_string_value env world options in
+         let _ = (if str_has_nul options 0 then
+                    let _ = raise_exc world "ArgumentError" "string contains null byte" in () else ()) in
+         let _ = nkf_status_check world (mr_nkf_options options) in
+         let bytes = nkf_string_value env world source in
+         let _ = nkf_status_check world (mr_nkf_convert (bytes_of_str bytes)) in
+         let (body, encoding) = nkf_copy_result world in mkstr_e body encoding
+       | _ -> VNil)
+and nkf_initialize = fn world -> fn (owner: str) ->
+  if vec_get nkf_loaded 0 == 2 then VClass owner else
+  if map_has cls_frozen owner then
+    raise_exc_iv world "FrozenError" ("can't modify frozen module: " ++ cls_display world owner)
+      (Cons (("__recv", VClass owner), Nil)) else
+  let _ = (if str_eq owner "NKF" then () else map_set cls_copy_of owner "NKF") in
+  let _ = bo_ensure () in
+  let _ = builtin_arity_of world "Object" "object_id" in
+  let (methods, _, _, _) = world in
+  let _ = vec_set nkf_loaded 0 1 in
+  let clear_entry = fn (key: str) ->
+    let _ = (if map_has methods key then del_meth methods key else ()) in
+    let _ = (if map_has builtin_alias key then map_delete builtin_alias key else ()) in
+    let _ = (if map_has undefs key then del_undef key else ()) in
+    let _ = (if map_has privates key then map_delete privates key else ()) in
+    let _ = (if map_has protecteds key then map_delete protecteds key else ()) in
+    if map_has vis_marks key then map_delete vis_marks key else () in
+  let register = fn (name: str) -> fn (arity: int) ->
+    let _ = map_set bi_owner_set ("NKF#" ++ name) 1 in
+    let _ = map_set arity_num_tbl ("NKF#" ++ name) arity in
+    let _ = map_set arity_num_tbl ("(sng:NKF)#" ++ name) arity in
+    let _ = map_set arity_tbl ("NKF#" ++ name) (arity * 1024 + arity + 1) in
+    let _ = map_set arity_blk_tbl ("NKF#" ++ name) (arity * 1024 + arity + 1) in
+    let _ = map_set arity_names name 1 in
+    let _ = clear_entry (owner ++ "#" ++ name) in
+    let index = nkf_entry_index name in
+    let _ = vec_set nkf_loaded index (if vec_get nkf_loaded index >= 2 then 3 else 1) in
+    let _ = set_private (owner ++ "#" ++ name) VNil in
+    let _ = mro_bump () in
+    let _ = run_method_added world owner name in
+    let singleton = "(sng:" ++ owner ++ ")" in
+    let _ = (if map_has cls_frozen singleton then frz_cls_check world singleton else ()) in
+    let _ = clear_entry (singleton ++ "#" ++ name) in
+    let _ = vec_set nkf_loaded index 3 in
+    let _ = map_set bi_owner_set ("NKF." ++ name) 1 in
+    let _ = mro_bump () in
+    run_method_added world singleton name in
+  let _ = register "nkf" 2 in let _ = register "guess" 1 in
+  let _ = set_builtin_alias world ("(sng:" ++ owner ++ ")") "guess" "guess" in
+  let _ = run_method_added world ("(sng:" ++ owner ++ ")") "guess" in
+  let _ = mro_bump () in
+  let encoding = fn (name: str) -> map_get enc_objs (enc_find_canon name) in
+  let _ = const_store world (owner ++ "::AUTO") VNil in
+  let _ = const_store world (owner ++ "::NOCONV") VNil in
+  let _ = const_store world (owner ++ "::UNKNOWN") VNil in
+  let _ = const_store world (owner ++ "::BINARY") (encoding "ASCII-8BIT") in
+  let _ = const_store world (owner ++ "::ASCII") (encoding "US-ASCII") in
+  let _ = const_store world (owner ++ "::JIS") (encoding "ISO-2022-JP") in
+  let _ = const_store world (owner ++ "::EUC") (encoding "EUC-JP") in
+  let _ = const_store world (owner ++ "::SJIS") (encoding "Shift_JIS") in
+  let _ = const_store world (owner ++ "::UTF8") (encoding "UTF-8") in
+  let _ = const_store world (owner ++ "::UTF16") (encoding "UTF-16BE") in
+  let _ = const_store world (owner ++ "::UTF32") (encoding "UTF-32BE") in
+  let _ = const_store world (owner ++ "::VERSION") (mkstr_e "2.1.5 (2018-12-15)" "ASCII-8BIT") in
+  let _ = const_store world (owner ++ "::NKF_VERSION") (mkstr_e "2.1.5" "ASCII-8BIT") in
+  let _ = const_store world (owner ++ "::NKF_RELEASE_DATE") (mkstr_e "2018-12-15" "ASCII-8BIT") in
+  let _ = const_store world (owner ++ "::GEM_VERSION") (mkstr_e "0.2.0" "ASCII-8BIT") in
+  let _ = vec_set nkf_loaded 0 2 in
+  VClass owner
 and rng_str_arg = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VStr _ -> v
@@ -44134,6 +44367,8 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        //   the Math receiver -- so `class C; include Math; def t; sin(0); end;
        //   end` was a NoMethodError, and twenty-five of core/math's files have
        //   an example for exactly that.
+       else if (if str_eq (nkf_instance_owner world cls name) "" then false else true) then
+         invoke_val_c env world noblk (VClass "NKF") name args false
        else if ns_class_method "Math" name && str_list_has (ancestors_of world cls) "Math" then
          invoke_val_c env world noblk (VClass "Math") name args false
        // ⚠ ...and a KERNEL method, which every object has as a private
@@ -44165,6 +44400,8 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        else if has_meth world "Object" name then invoke world noblk VMain "Object" name args
        else if has_meth world "Kernel" name then invoke world noblk VMain "Kernel" name args
        // Namespace-backed private functions need the same fallback as VObj.
+       else if (if str_eq (nkf_instance_owner world "Object" name) "" then false else true) then
+         invoke_val_c env world noblk (VClass "NKF") name args false
        else if ns_class_method "Math" name && str_list_has (ancestors_of world "Object") "Math" then
          invoke_val_c env world noblk (VClass "Math") name args false
        // the top-level self answers respond_to? like any other object; this
@@ -44200,6 +44437,8 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
      | other -> prim_self_send env world other name args)
   // ...and with NO self bound at all, which is the ordinary top level: the
   // same Kernel route as the two arms above (see there).
+  else if (if str_eq (nkf_instance_owner world "Object" name) "" then false else true) then
+    invoke_val_c env world noblk (VClass "NKF") name args false
   else if ns_class_method "Math" name && str_list_has (ancestors_of world "Object") "Math" then
     invoke_val_c env world noblk (VClass "Math") name args false
   else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
@@ -44664,6 +44903,8 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        //   `singleton_class` into "undefined local variable or method" for a
        //   method it has. The with-arguments path next door asks
        //   is_prim_method; two paths, two rules, and only one of them right.
+       else if (if str_eq (nkf_instance_owner world cls name) "" then false else true) then
+         invoke_val_c env world noblk (VClass "NKF") name args false
        else if ns_class_method "Math" name && str_list_has (ancestors_of world cls) "Math" then
          invoke_val_c env world noblk (VClass "Math") name args false
        else if is_enum_method name || is_prim_method name
@@ -44707,6 +44948,8 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        // callable bare, and so is a universal primitive.
        else if has_meth world "Object" name then invoke world noblk VMain "Object" name args
        else if has_meth world "Kernel" name then invoke world noblk VMain "Kernel" name args
+       else if (if str_eq (nkf_instance_owner world "Object" name) "" then false else true) then
+         invoke_val_c env world noblk (VClass "NKF") name args false
        else if ns_class_method "Math" name && str_list_has (ancestors_of world "Object") "Math" then
          invoke_val_c env world noblk (VClass "Math") name args false
        else if is_prim_method name then dispatch_prim env world noblk VMain name args false
@@ -44733,6 +44976,8 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        // methods first, then the built-in prims (implicit-self upcase etc.).
        prim_self_send env world other name args)
   // ...and with no self bound at all, which is the ordinary top level.
+  else if (if str_eq (nkf_instance_owner world "Object" name) "" then false else true) then
+    invoke_val_c env world noblk (VClass "NKF") name args false
   else if ns_class_method "Math" name && str_list_has (ancestors_of world "Object") "Math" then
     invoke_val_c env world noblk (VClass "Math") name args false
   else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
@@ -45397,6 +45642,8 @@ and invoke_result = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn 
   //  prelude's: Bug #20691's million stores are a test's whole time)
   if str_len name == 3 && str_eq name "[]=" && str_len cls == 23 && str_eq cls "ObjectSpace::WeakKeyMap" && wkm_fast world recv then
     wkm_aset world blk recv args
+  else if nkf_native_owner cls name && (if has_meth world cls name then false else true) then
+    (let (_, _, _, env) = blk in nkf_invoke env world name args)
   else
   let (m, defcls) = lookup_meth_cls world cls name in
   run_meth_result world blk recv defcls name m args discard_result
@@ -57778,7 +58025,8 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
   // fiber, rational, thread and ruby2_keywords raised LoadError here
   if (if rel then false else true) && builtin_feature p0 then FNext (VBool false)
   else
-     let p1 = if ends_with_rb p0 then p0 else p0 ++ ".rb" in
+     let p1 = if str_eq p0 "nkf.so" then ruby_platform ++ "/nkf" ++ (if str_eq (sys_os ()) "darwin" then ".bundle" else ".so")
+              else if ends_with_rb p0 then p0 else p0 ++ ".rb" in
      let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> let d = sget d in d | _ -> ".") else ".") in
      // require_relative goes from the REAL file the call is in: a script run
      // through a symlink requires its own siblings, not the link's
@@ -57827,7 +58075,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                      && str_eq (substring pship (str_len pship - str_len dlx9) (str_len pship)) dlx9
                   then substring pship (str_len prx9) (str_len pship - str_len dlx9) else "") in
      if str_len extx9 > 0 && cext_feature extx9 && (if str_eq (shipped_lib_src extx9) "" then false else true) then
-       do_require env world blk false extx9
+       do_require env world blk false (if str_eq extx9 "nkf" then "nkf.so" else extx9)
      else
      let shipped = shipped_lib_src pship in
      // (a shipped library's own "pathname.so" entry is set before its source
@@ -58154,6 +58402,9 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
         // failure resurfaces somewhere unrelated (excon dies on openssl.so,
         // then fog-aws reports a missing Process.clock_gettime).
         | FRaise v ->
+          let _ = (if str_eq shipped (nkf_lib_src ()) then
+                     (let _ = unmark9 () in map_delete stdlib_ran shipped)
+                   else ()) in
           let _ = map_delete loaded_files full in
           let _ = (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
                    | VArr lfid -> arr_set lfid (vals_without (deref lfid) full)

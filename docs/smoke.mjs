@@ -28,6 +28,8 @@ const PAGE = (page.match(/const PAGE = (\d+)/) || [])[1] ?? "65536";
 if (!SENTINEL) throw new Error("smoke: no SENTINEL in index.html");
 
 const code = [
+  `import { createNkfBridge } from ${JSON.stringify(new URL('nkf.mjs', here).href)};`,
+  `let nkfModule; export const setNkfModule = value => { nkfModule = value; };`,
   `const SENTINEL = ${JSON.stringify(SENTINEL)};`,
   `const PAGE = ${PAGE};`,
   `export let currentSrc = "";`,
@@ -37,8 +39,10 @@ const code = [
   `export { makeInstance };`,
 ].join("\n");
 const mod = await import("data:text/javascript," + encodeURIComponent(code));
+mod.setNkfModule(await WebAssembly.compile(readFileSync(new URL('nkf.wasm', here))));
 
-mod.setSrc(process.argv[2] ?? "puts 1 + 1");
+mod.setSrc(process.argv[2] === '--file'
+  ? readFileSync(process.argv[3], 'utf8') : process.argv[2] ?? "puts 1 + 1");
 const wasm = process.env.SMOKE_WASM ?? new URL("mere-ruby.wasm", here);
 const host = mod.makeInstance();
 const { instance } = await WebAssembly.instantiate(readFileSync(wasm), { env: host.env });

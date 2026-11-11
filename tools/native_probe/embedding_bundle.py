@@ -15,6 +15,7 @@ import os
 import platform
 import shutil
 import sys
+sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent
@@ -57,7 +58,7 @@ os.chdir(objects)
 run('extract-prism', ['ar', 'x', prism])
 prism_objects = sorted(objects.glob('*.o'))
 assert prism_objects, 'Prism archive contained no object files'
-glue = [ROOT / 'tools' / (name + '.c') for name in ['prism_glue', 'socket_glue', 'math_glue', 'process_glue', 'openssl_glue']]
+glue = [ROOT / 'tools' / (name + '.c') for name in ['prism_glue', 'socket_glue', 'math_glue', 'process_glue', 'openssl_glue', 'nkf_glue']]
 for source in glue:
     target = objects / (source.stem + '.o')
     assert not target.exists(), f'archive member collision: {target.name}'
@@ -83,6 +84,8 @@ for mode in ['normal', 'cleanup-error']:
     run('consumer-' + mode, [output / 'consumer', mode],
         dict(os.environ, EMBED_PATH=str(output / (mode + '.txt'))))
 inputs = [generated / 'embedding.o', generated / 'embedding.h', prism, *glue,
+          ROOT / 'tools/nkf_engine.c', ROOT / 'tools/nkf_symbols.h',
+          *[p for p in ROOT.glob('vendor/nkf/**/*') if p.is_file()],
           FIXTURES / 'embedding_integration.c', FIXTURES / 'embedding_host.c',
           Path(__file__).with_name('native_build_flags.py')]
 (output / 'manifest.json').write_text(json.dumps({
