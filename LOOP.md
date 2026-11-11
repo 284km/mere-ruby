@@ -3487,3 +3487,76 @@ Round 16 of note 541. corpus/579 is the witness.
   0 / 1 (flag_on), and the heredoc line stack keeps its depth under key -1
   and overwrites its slots. Flat at 34,477,920 for 1,000 to 100,000; corpus
   596/596, the gates, test_syntax as before.
+
+## 2026-11-11 (33): stage 4 begins -- Mere v0.1.727's region cache, zlib under its archdir name, and what every eval copied into the default region
+
+Round 17 of note 543 (stage 4, memory and time).
+
+- **Mere v0.1.727** (merelang/mere#70): the per-thread cache of released block
+  regions is 64 deep instead of 8. The interpreter nests a region per
+  statement, method body and block at each level of a call, and a release
+  past the cache gave back the region's 1 MB seed, which on Darwin is a kept
+  mapping filled with 0xAA as it is kept and zeroed as it is handed out: two
+  1 MB memsets per region per call. Marshal.load(1) 0.6 -> 0.1 ms; corpus
+  190.6 -> 186.0 s, peak RSS summed 50.5 -> 45.0 GB (largest the same,
+  1.29 GB). test_udp's bind / connect / send no-leak loops now finish inside
+  their 10 s (5.9 / 5.4 / 2.7 s). test_addrinfo's marshal loop is 5x faster
+  and still over (20,000 loads, about 47 s).
+- **A library standing in for a C extension is loaded under its archdir
+  name too**: zlib's feature is `<stdlib>/<platform>/zlib.bundle` (DLEXT) in
+  $LOADED_FEATURES beside the .rb, and `-r` of that path loads the library.
+  test_zlib's gunzip_no_memory_leak looks the path up to run its child with
+  it: it passes (6.8 s).
+- **Three things every Kernel#eval wrote into the default region**, found
+  because v0.1.727 lowered test_kwarg_eval_memory_leak's starting RSS (the
+  kept seeds of round 16 had been filling it before the measurement began)
+  and the ratio went 1.17 -> 1.43. `eval("1")` grew the default region 49
+  bytes an eval (`mere -c --region-sites` + MERE_REGION_STATS, 100 against
+  100,000 evals):
+  - fsl_ctx "v" (the frozen_string_literal answer) was a str set and put back
+    around each eval, and a str value is copied at each set. It holds 0 / 1 /
+    2 now, behind fsl_get / fsl_put; a fiber saves it as an int map.
+  - ind_ctl's "off" / "no" were set and deleted: 0 / 1 now (flag_on).
+  - the eval's caller's local names (lvt_outer, vw_outer) were cleared and
+    filled at every eval, a copy of each name each time. A name's value is
+    the table's generation now, kept under "" (no local is named that), and a
+    clear moves the generation on (lvo_clear / lvo_fill / lvo_has): a name is
+    copied the first time any eval's caller has it.
+  Flat: 35,372,632 -> 35,466,048 bytes for 100 -> 100,000 `eval("1")` (was
+  -> 40,266,128), and the kwargs eval 35.73 -> 35.77 MB.
+- **What is left of test_kwarg_eval_memory_leak is Mere's**: the RSS still
+  went 67 -> 88 MB (limit 1.2x). The string pages are not it
+  (MERE_RUBY_STORE_STATS now prints str_pages and str_pg_pool: 6 live, 7
+  pooled); the mapped blocks Darwin keeps for reuse are -- up to 16 MB,
+  resident, empty when the run's START is read and full at its end. A build
+  with the kept list off reads 66 -> 69 MB. madvise cannot give them back on
+  Darwin (MADV_FREE_REUSABLE and MADV_DONTNEED leave ps's RSS as it was;
+  only munmap lowers it), so merelang/mere#74 (v0.1.729) adds `mem_trim`, the
+  Go `debug.FreeOSMemory` of the runtime, for GC.start to call once it is
+  merged. Until then the test is RED here (it was MATCH on round 16's binary
+  only because the seeds had already filled the list before START).
+- **v0.1.727 on main's CI went over 2 GiB on three files** (run of
+  b71a9a91, the first on the pin): prism/snippets_test (3,833 tests),
+  net/http/test_http and test_trick read MEMORY_LIMIT, MATCH 30,407 ->
+  26,953. snippets_test's peak: 1.5 GB with the cache 8 deep, 1.6 GB at 9,
+  2.6 GB at 64. Not the cache's own bytes (64 MB at most): a region reused
+  from the cache is not zeroed, the bump allocator leaves bytes it does not
+  write under top, and the conservative scan reads them -- the handles a
+  previous use left there kept their objects alive. Past depth 8 a region
+  had always come from a zeroed mapping. merelang/mere#74 zeroes what a use
+  wrote as the region goes into the cache: 1.49 GB, and 405 s against the
+  8-deep cache's 524 (Marshal.load(1) 0.14 ms). test_http is at the edge
+  either way (2.0 GB locally on round 16's binary too) -- a stage-4 item of
+  its own.
+- **Checked** on Mere v0.1.727: corpus 598/598 with the hash index on and
+  off (after the rebase onto #70's encoding work; 596 before it); the gates, gc_roots_check and meth_writes_check; #77's embedding check
+  and embedding stress check (flat). The 247 unittest files plus
+  test_compile_prism, test_etc, test_weakkeymap, test_zlib, test_addrinfo,
+  test_udp and test_method: MATCH 10197, nothing RED that was not RED after
+  round 16 except test_kwarg_eval_memory_leak (above). The stage-4 tests one at
+  a time (note 543 §2): passing now -- test_udp x3, gunzip_no_memory_leak,
+  test_pow, blocking_backtrace, the yaml store, test_clear_bug_20691; still
+  over -- hash replace, alias, io select, syntax invalid_symbol, addrinfo
+  marshal, the tracepoint pair, string_empty?, and #78's four. The spec
+  records: base DIFF 16, CRASH 0 (library/etc/getgrgid read DIFF in the
+  sweep and MATCH alone twice: the load flake of (32); its record is kept).
