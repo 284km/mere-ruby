@@ -1328,7 +1328,11 @@ let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
     let rec refs_go = fn (i: int) ->
       if i >= refstop then ()
       else (let key = vec_get gc_ref_pend i in
-            let _ = (if map_has ref_snaps key then gc_class_text (map_get ref_snaps key) else ()) in
+            let _ = (if map_has ref_snaps key then
+              list_iter (map_get ref_snaps key) (fn entry ->
+                let (target, implementation) = entry in
+                let _ = gc_class_text target in gc_class_text implementation)
+              else ()) in
             refs_go (i + 1)) in
     let _ = refs_go refs in
     let objectstop = vec_len gc_obj_pend in
@@ -1877,7 +1881,7 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = (if compact && vec_len dead_tags > 0 then
     (let _ = map_compact hng_store in map_compact hng_sng_base) else ()) in
   let dead_refs = vec_new () in
-  let _ = map_iter ref_snaps (fn (key: int) -> fn (_text: str) ->
+  let _ = map_iter ref_snaps (fn (key: int) -> fn (_entries: (str * str) list) ->
     if map_has gc_ref_live key then () else vec_push dead_refs key) in
   let _ = gc_drop_i ref_snaps dead_refs in
   let _ = (if compact && vec_len dead_refs > 0 then map_compact ref_snaps else ()) in
@@ -5049,6 +5053,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EMethodB (recv_e, name, arges, bp0, bb) ->
     let recv = eval_e env world blk recv_e in
     let args = eval_args env world blk arges in
+    // These literal declaration bodies cannot capture the surrounding
+    // method's yield block. Keep receiver/argument evaluation, then use the
+    // same constructor proof before block capture and generic routing.
+    let declaration_block = (true, bp0, bb, env) in
+    if str_eq name "new" && (match args with Nil -> true | _ -> false)
+       && (match bp0 with Nil -> true | _ -> false)
+       && (match recv with VClass c -> native_constructor_declaration_allowed world c declaration_block | _ -> false)
+    then
+      (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+       match recv with VClass c -> native_constructor_declaration world c declaration_block | _ -> VNil)
+    else
     // (after the receiver and the arguments: `(s << m = 58).lines { m += 1 }`
     //  assigns m before the block, which shares it)
     let bp = blk_own_locals env bp0 in
@@ -14188,12 +14203,27 @@ and native_module_allocation = fn world ->
   && (if map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
          || map_has undef_names "new" || map_has blt_alias_names "new" then false else true)
   && (if core_new_overridden world "Module" || meth_private world "(sng:Module)" "new" then false else true)
+// An issued Object subclass without mixins or an initialize row shares
+// Object's default initializer. Its zero-argument allocation cannot call
+// Ruby or expose the dispatch register; retain every constructor observer
+// and mutation guard before bypassing that register and its arity routing.
+and native_empty_object_constructor = fn world -> fn (cls: str) -> fn (vischeck: bool) ->
+  map_has anonymous_classes cls && map_get anonymous_classes cls == 1
+  && map_has cls_sup cls && str_eq (map_get cls_sup cls) "Object"
+  && not (map_has includes cls || map_has prepends cls
+          || map_has undef_names "initialize" || map_has blt_alias_names "initialize")
+  && (let (methods, _, _, _) = world in not (map_has methods (cls ++ "#initialize")))
+  && not (has_meth world "Object" "initialize")
+  && native_plain_object_constructor world cls vischeck
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
   // Plain Module.new reaches this door, while an explicit &nil reaches the
   // with-block door. Both use the same proof for an unobserved allocation.
   if str_eq name0 "new" && (match recv0 with VClass c -> str_eq c "Module" | _ -> false)
      && (match args0 with Nil -> true | _ -> false) && native_module_allocation world
   then make_anon_cls world "Module" Nil else
+  if str_eq name0 "new" && (match args0 with Nil -> true | _ -> false)
+     && (match recv0 with VClass c -> native_empty_object_constructor world c vischeck | _ -> false)
+  then (match recv0 with VClass c -> allocate_plain_object world c | _ -> VNil) else
   // Unbind is only a native allocation when its public protocol cannot run
   // Ruby or expose a builtin frame; all observed/overridden calls dispatch.
   if str_eq name0 "unbind" && (match args0 with Nil -> true | _ -> false)
@@ -48579,7 +48609,23 @@ and native_constructor_declaration_allowed = fn world -> fn (factory: str) -> fn
 and native_constructor_declaration = fn world -> fn (factory: str) -> fn block ->
   let file = cur_file () in
   let line = cur_line () in
-  let result = try_or_msg (fn (u: unit) -> make_anon_cls_block world factory Nil block)
+  let (_, _, body, defining_env) = block in
+  let result = try_or_msg (fn (u: unit) ->
+    match native_definition_shape body with
+    | Cons (stmt, Nil) ->
+      // The constructor proof excludes every callback/observer and retains
+      // the real allocator. The issued owner is fresh, so its definition
+      // needs no second absence/frozen/observer proof after allocation.
+      let created = make_anon_cls world factory Nil in
+      (match created with
+       | VClass cls ->
+         let lexical = (match lv_get defining_env "__cref" with VStr h -> sget h | _ -> "") in
+         let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+         let _ = (if map_has pending_home "v" then map_delete pending_home "v" else ()) in
+         let _ = native_definition_apply world cls body lexical defining_env stmt in
+         created
+       | _ -> created)
+    | _ -> make_anon_cls_block world factory Nil block)
     (fn (message: str) -> let _ = cur_file_set file in let _ = cur_line_set line in fail message) in
   let _ = cur_file_set file in
   let _ = cur_line_set line in result
@@ -53566,15 +53612,25 @@ and native_plain_object_constructor = fn world -> fn (cls: str) -> fn (vischeck:
   && map_len all_thr <= 1 && fb_live () == 0 && vec_get thr_body_v 0 == 0
   && not (map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y"
           || map_has undef_names "new" || map_has blt_alias_names "new" || map_has bi_skip "n")
-  && not (vischeck && meth_private world ("(sng:" ++ cls ++ ")") "new")
+  && not (vischeck && vec_get private_new_seen 0 != 0
+          && meth_private world ("(sng:" ++ cls ++ ")") "new")
   && not (has_meth world ("(sng:" ++ cls ++ ")") "new")
   && str_eq (refined_impl_for world (VClass cls) "new") ""
-and new_plain_object = fn world -> fn (cls: str) -> fn (args: Val list) ->
+and allocate_plain_object = fn world -> fn (cls: str) ->
   let (_, _, ocls, _) = world in
   let id = alloc_oid ocls in
   let _ = map_set ocls id cls in
-  let object = VObj id in
-  if has_meth world cls "initialize" then
+  VObj id
+and new_plain_object = fn world -> fn (cls: str) -> fn (args: Val list) ->
+  let object = allocate_plain_object world cls in
+  let (methods, _, _, _) = world in
+  let key = cls ++ "#initialize" in
+  if not (map_has prepends cls || map_has undef_names "initialize") && map_has methods key then
+    // The class is first in its ordinary lookup chain. Reuse the exact
+    // owned definition through the same method/frame/argument machinery.
+    let block = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+    let _ = run_meth_result world block object cls "initialize" (map_get methods key) args true in object
+  else if has_meth world cls "initialize" then
     let block = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
     let _ = invoke_result world block object cls "initialize" args true in object
   else tp_init_around world object (fn (u: unit) -> init_arity_refuse world cls args object)
@@ -55869,15 +55925,17 @@ and native_definition_body = fn world -> fn (cls: str) -> fn (body: Stmt list) -
     let name = (match stmt with SDef (n, _, _, _) -> n | _ -> "") in
     if not (native_definition_allowed world cls name) then (false, VNil)
     else
-      let saved = ref_save_active () in
-      let saved_lex = cur_lex () in
-      let _ = (if ref_on () then ref_install (ref_env_id denv) else ()) in
-      let _ = set_lex cscope in
-      let result = try_or_msg (fn (u: unit) -> native_definition_commit world cls body stmt)
-        (fn (message: str) -> let _ = set_lex saved_lex in let _ = restore_ref_active saved in fail message) in
-      let _ = set_lex saved_lex in
-      let _ = restore_ref_active saved in (true, result)
+      (true, native_definition_apply world cls body cscope denv stmt)
   | _ -> (false, VNil)
+and native_definition_apply = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv -> fn (stmt: Stmt) ->
+  let saved = ref_save_active () in
+  let saved_lex = cur_lex () in
+  let _ = (if ref_on () then ref_install (ref_env_id denv) else ()) in
+  let _ = set_lex cscope in
+  let result = try_or_msg (fn (u: unit) -> native_definition_commit world cls body stmt)
+    (fn (message: str) -> let _ = set_lex saved_lex in let _ = restore_ref_active saved in fail message) in
+  let _ = set_lex saved_lex in
+  let _ = restore_ref_active saved in result
 // Only existing lexical locals and ordinary global slots can be read here.
 // Missing names, special globals, aliases and constant lookup retain eval_e.
 and native_declaration_argument = fn denv -> fn (argument: Expr) ->
@@ -60981,7 +61039,15 @@ and refined_impl_for = fn world -> fn (recv: Val) -> fn (name: str) ->
   //   the class itself, so `refine c do ... end` handed its INSTANCE methods
   //   to `c.whatever` -- and, with a top-level `def include` in Object (the
   //   spec helper's matcher), `c.include m` went to the refinement and died
-  else refined_impl_go world (ancestors_of world (match recv with VClass c -> "(sng:" ++ c ++ ")" | _ -> dispatch_cls_of world recv)) name
+  else
+    let cls = (match recv with VClass c -> "(sng:" ++ c ++ ")" | _ -> dispatch_cls_of world recv) in
+    // Without a prepend, this class is the first ancestor. Its own active
+    // refinement can answer before building/caching the remaining chain.
+    // Misses and the cache-off oracle retain the complete priority walk.
+    let own = (if mro_cache_on () && not (map_has prepends cls) && map_has ref_active cls
+               then refined_impl_in world (ref_chain cls) name else "") in
+    if str_len own > 0 then own
+    else refined_impl_go world (ancestors_of world cls) name
 and refined_impl_in = fn world -> fn (ics: str list) -> fn (name: str) ->
   match ics with
   | Nil -> ""
