@@ -39,7 +39,9 @@ archive SHA-256 is
 `9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9`
 for arm64 macOS and
 `b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4`
-for x86-64 Linux. The build does not download a toolchain implicitly.
+for x86-64 Linux. The build does not download a toolchain implicitly. It disables
+Clang's optional automatic `wasm-opt` pass and strips SDK debug paths, so the
+installed Binaryen tools do not change the reactor build.
 
 Reproducible checks (the reference Ruby must have nkf 0.2.0 installed):
 

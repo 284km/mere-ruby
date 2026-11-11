@@ -17,4 +17,7 @@ done
 if [ "${NKF_WASM_TEST:-0}" = 1 ]; then
   set -- "$@" -DMR_NKF_TEST -Wl,--export=mr_nkf_test_fail_after -Wl,--export=mr_nkf_test_allocations
 fi
-"$cc" -O2 -DMR_NKF_WASM -mexec-model=reactor "$root/tools/nkf_engine.c" "$@" -o "${NKF_WASM_OUTPUT:-$root/docs/nkf.wasm}"
+# clang 23 invokes wasm-opt automatically when it happens to be on PATH.
+# Disable that optional post-link pass and strip SDK debug paths so both
+# pinned host archives produce the same portable reactor.
+"$cc" --no-wasm-opt -O2 -DMR_NKF_WASM -mexec-model=reactor -Wl,--strip-debug "$root/tools/nkf_engine.c" "$@" -o "${NKF_WASM_OUTPUT:-$root/docs/nkf.wasm}"

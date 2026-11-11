@@ -9,6 +9,13 @@ export function createNkfBridge(module, getMemory, allocate) {
     instance = new WebAssembly.Instance(module, {
       env: { mr_nkf_abort: status => { throw new NkfAbort(status); } },
       wasi_snapshot_preview1: {
+        clock_time_get: (clock, _precision, pointer) => {
+          if (clock !== 0 && clock !== 1) return 28;
+          const nanos = clock === 0 ? BigInt(Date.now()) * 1000000n
+            : BigInt(Math.floor(performance.now() * 1000000));
+          new DataView(instance.exports.memory.buffer).setBigUint64(pointer, nanos, true);
+          return 0;
+        },
         fd_close: () => 8, fd_seek: () => 8, fd_write: () => 8,
         proc_exit: status => { throw new Error(`unexpected NKF reactor exit ${status}`); },
       },
