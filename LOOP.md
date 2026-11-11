@@ -3676,3 +3676,67 @@ Round 19 of note 543 (case_comprehensive inside CI's limits).
   `a.clone.set` is 6.4 - 6.9 s per 100,000 on every build from round 17 on,
   so 500,000 is about 33 s locally and at the edge there), and test_method
   has one test EXTRA (the reference failed it). None is this round's.
+
+## 2026-11-12 (36): stage 5, round 20 -- parse.y's tokens from Prism's lexer, a deep Array read, retry and ensure, a Hash copy's default, builtin class-method aliases, nested autoloads and a Struct's lexical scope
+
+Round 20 of note 544 (the plan after stage 4: stage 5 first, then RubyGems).
+
+- **RubyVM::AbstractSyntaxTree.parse(keep_tokens: true) answers #all_tokens.**
+  test_ast's test_all_tokens is one test per file under test/ (851 of the
+  file's 958 RED). parse.y's tokens and Prism's lexer's are nearly one to one
+  -- Prism's names come from parse.y -- and the differences are four rules,
+  measured against the reference over test/**/*.rb (869 files: text and
+  places agree in all, names in 862): the gaps are tSP (word_sep inside a
+  %w list), cut after each newline and each `\` newline; a newline that ends a
+  statement is made after the comment lines that follow it (parse.y looks past
+  them for a leading `.`); a <<~ body is one token a line until a line with no
+  indentation, and an expanding <<- / <<~ body is cut after a line ending in
+  `\`; a `do` is keyword_do_block when its block belongs to a call with
+  arguments and no parentheses (decided on Prism's tree). The tokens are made
+  in C (tools/prism_glue.c, prism_tokens: 1.4 s for all 869 files) and the
+  arrays in Mere (the builtin __all_tokens; a Ruby loop was 17 us a token),
+  and counted toward the next collection (qv_ctr 3, 128 B a token).
+- **An Array is a cons list, and `a[i]` walked to i.** Reading near the end
+  of a 340,000-element Array was 0.6 ms a read; unpack's answer read seven at
+  a time took 14 s. arr_at moves the array to its Vec form once for a read
+  past the first 32, and the reads after it are a slot.
+- **retry ran the ensure clause every time.** It now runs once, when the
+  begin is left, as ruby does. rubygems' Specification._load sets
+  Object::YAML in its rescue, retries and removes it in its ensure: the
+  retried load found no YAML.
+- **Hash#dup and #clone dropped the default value and the default proc.**
+  rubygems' tests restore `specific_extra_args_hash.dup`, a Hash.new with a
+  block, and read a missing command from it ("no implicit conversion of nil
+  into Array", exec_command's 27). A program's own Hash#initialize_copy still
+  leaves the copy without either (test_dup's user_flags).
+- **An alias of a builtin class method is that builtin** after the name is
+  redefined or undefined in the singleton (bi_skip past the singleton's Ruby
+  body and its tombstone), and undef_method takes such an alias. Class#methods
+  and #singleton_methods list a class's builtin class methods from ruby's own
+  rows (`Time.` -> now ...) and not the prelude's `__` helpers. minitest's
+  Object#stub asks `methods` whether a name is the object's own; Time.now was
+  not, so it defined a super-calling one and the stub reached nothing (five
+  rubygems files stopped there: install_command, tar_writer,
+  remote_fetcher_s3, update_suggestion, and owner's TCPServer.new).
+- **A reopened Struct class sees the nesting it was written in.**
+  `State = Struct.new(...)` and then `class State` inside `module
+  Gem::Molinillo` reads DependencyGraph: the cref's name (Struct_N) says
+  nothing about the nesting, so each scope of it is asked in turn (the
+  resolver's 140 errors).
+- **`class A::B::C < A::B::D` loads A::B's autoload first**, so the autoloads
+  A::B's file registers are there for D (rdoc's Markup::Formatter: the rdoc
+  plugin, test_gem_rdoc).
+- **Array#sample takes a Float count** (NUM2LONG), and the ivar listings
+  compare a key's prefix without building a substring per key.
+- **Left out, measured**: ripper's assert_parse_files hits
+  Prism::Translation::Ripper's `arguments&.any?` on an event's own answer.
+  Transcribing visit_call_node with that one condition made the files pass,
+  but a parse of lib/mkmf.rb (95 KB) then takes 1.46 GB and 190 s -- lib's
+  5% sample would hit CI's limits at random. It waits for a faster, smaller
+  translation. error_highlight needs the call's node_id (stage 2').
+- **Checked** on Mere v0.1.729: corpus 598/598 with the hash index on and off
+  (before 640 was added); loop_rss_check 8/8; the five gates; the embedding
+  check and its stress; encoding_search; prism_query_boundary. test_ast
+  2,664 tests, 12 F / 86 E (958 RED before), 317 s locally, the process's
+  peak 1.45 - 1.89 GB with the test order. The rubygems files above pass but
+  install_command's 4 and exec_command (a native extension build, stage 8).
