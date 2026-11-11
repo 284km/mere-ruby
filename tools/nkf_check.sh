@@ -17,6 +17,7 @@ else
   echo 'mode must be native or browser' >&2; exit 2
 fi
 python3 unittest/nkf_boundary_check.py --ruby "$reference" --output "$output/boundary"
+python3 unittest/nkf_protocol_check.py --ruby "$reference" --output "$output/protocols"
 python3 unittest/nkf_upstream_check.py --ruby "$reference" --ruby-source "$source" --output "$output/upstream"
 python3 unittest/nkf_memory_check.py --output "$output/memory"
 python3 unittest/nkf_tool_check.py --ruby "$reference" --source "$source" --output "$output/tool"
