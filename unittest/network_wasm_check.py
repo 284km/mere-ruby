@@ -25,6 +25,14 @@ message.add_question('example.invalid',Resolv::DNS::Resource::IN::A)
 decoded=Resolv::DNS::Message.decode(message.encode)
 raise 'DNS wire round trip changed' unless decoded.id==1234 && decoded.question.first[0].to_s=='example.invalid'
 raise 'HTTP response parser changed' unless Net::HTTPResponse::CODE_TO_OBJ['200']==Net::HTTPOK
+# The page has no native shared-memory mappings. Import stubs must fail the
+# allocation rather than pretending a private byte string is shared memory.
+Warning[:experimental] = false
+begin
+  IO::Buffer.new(16, IO::Buffer::MAPPED | IO::Buffer::SHARED)
+  raise 'native shared mapping silently succeeded'
+rescue IO::Buffer::AllocationError
+end
 puts 'portable URI, network loading, DNS/IP codecs and explicit asynchronous Timeout capability passed'
 '''
 
