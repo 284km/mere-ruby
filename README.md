@@ -15,10 +15,11 @@ byte-identical to ruby 4.0.9 — every `core` and `language` file the suite has,
 plus the libraries this ships — see
 [Conformance](#conformance-rubyspec) for what that covers and what it does not.
 
-Use the [pinned Mere compiler source](https://github.com/merelang/mere/tree/c38a27c2336fc4251b944463ebdba93d6a779b09)
+Use the [pinned Mere compiler source](https://github.com/merelang/mere/tree/87483585de7343c630b12f203032286b9e323277)
 for native builds. Anonymous Class/Module metadata collection requires its
-candidate string-root scanning, and `tools/build.sh` checks that it supports
-the native region-cache limit used by CI.
+candidate string-root scanning and bounded-word string Map hashing.
+`tools/build.sh` checks that it supports the native region-cache limit used
+by CI.
 
 ```sh
 ./tools/build.sh            # or, by hand, the line below

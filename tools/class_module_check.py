@@ -62,7 +62,8 @@ def main():
     summary = parsed['summary'] or {}
     passed = (execution['exit'] == 0 and execution['limit'] is None
               and parsed['state'] == 'COMPLETE' and parsed['discovered'] == 195
-              and summary.get('tests') == 195 and summary.get('failures') == 0
+              and summary.get('tests') == 195 and summary.get('assertions') == 1240
+              and summary.get('failures') == 0
               and summary.get('errors') == 0 and summary.get('skips') == 0)
     return 0 if passed else 1
 

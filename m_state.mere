@@ -2051,11 +2051,11 @@ let refine_cnt = map_new ();   // "<refinery>"      -> native count
 let refine_tgt = map_new ();   // "<refinery>#<i>"  -> native target class name
 let refine_cls = map_new ();   // "<refinery>#<i>"  -> native implementation class name
 // (ref_active itself is defined above lex_pack, which reads it)
-// Each distinct table `using` has produced, encoded (see ref_snapshot): the
+// Each distinct immutable table `using` has produced (see ref_snapshot): the
 // packed cref of a method and the "__rf" slot of an env name one by its id.
 let ref_snap_counter = vec_new ();
 let _ = vec_push ref_snap_counter 0;
-let ref_snaps = map_new ();    // integer id -> immutable encoded lexical table
+let ref_snaps = map_new ();    // integer id -> immutable (target/live refinery, implementation) entries
 // per-case memo of #deconstruct / #deconstruct_keys results, so a case with
 // several `in` clauses calls the method once (Ruby caches). Keyed by value
 // handle; cleared at the start of each case.
@@ -3112,7 +3112,7 @@ let lv_set = fn env -> fn (n: str) -> fn (v: Val) ->
 // Nothing is switched until a program has called `using` (ref_on), so a
 // program that never does pays one map_len per call and per block.
 
-// the table ref_active holds, as one string: "<target>\1<impl>\2" per entry.
+// Immutable entries preserve the active table without encoding and reparsing it.
 // A key "@<refinery>" is a LIVE entry -- every refinement that refinery has
 // when the table is installed, which is what a refine body sees (its own
 // module's refinements, including the ones refined after it; see do_refine).
@@ -3127,20 +3127,15 @@ let ref_save_active = fn (u: unit) ->
   };
 let ref_snapshot = fn (u: unit) ->
   region RFSNAP {
-  let encoded = strbuf_new () in
-  let pair_separator = chr 1 in
-  let entry_separator = chr 2 in
-  let _ = map_iter ref_active (fn (key: str) -> fn (value: Val) ->
-    if str_eq key "~rid" then () else
-      (let _ = strbuf_push encoded key in
-       let _ = strbuf_push encoded pair_separator in
-       let _ = strbuf_push encoded (match value with VClass cls -> cls | _ -> "") in
-       strbuf_push encoded entry_separator)) in
-  let id = vec_get ref_snap_counter 0 + 1 in
-  let _ = vec_set ref_snap_counter 0 id in
-  let _ = map_set ref_snaps id (strbuf_to_str encoded) in
-  let _ = map_set ref_active "~rid" (VInt id) in
-  id
+    let entries = vec_new () in
+    let _ = map_iter ref_active (fn (key: str) -> fn (value: Val) ->
+      if str_eq key "~rid" then () else
+        vec_push entries (key, (match value with VClass cls -> cls | _ -> ""))) in
+    let id = vec_get ref_snap_counter 0 + 1 in
+    let _ = vec_set ref_snap_counter 0 id in
+    let _ = map_set ref_snaps id (vec_to_list entries) in
+    let _ = map_set ref_active "~rid" (VInt id) in
+    id
   };
 // every refinement `r` has right now, into ref_active (a live entry)
 let rec ref_live_go = fn (r: str) -> fn (i: int) -> fn (n: int) ->
@@ -3163,35 +3158,25 @@ let ref_install = fn (id: int) ->
     (let _ = map_clear ref_active in
      if id == 0 then ()
      else
-       (let enc = (if map_has ref_snaps id then map_get ref_snaps id else "") in
-        let size = str_len enc in
-        let pair_separator = chr 1 in
-        let entry_separator = chr 2 in
-        // Read the immutable encoding in place. Fixed entries still precede
-        // all live refinery expansion, preserving shadowing and activation
-        // order without a split list or copies of each whole entry.
-        let end_of_entry = fn (start: int) ->
-          let stop = str_find_from enc entry_separator start in
-          if stop < 0 then size else stop in
-        let rec fixed = fn (start: int) -> fn (has_live: bool) ->
-          if start >= size then has_live else
-            let stop = end_of_entry start in
-            let separator = str_find_from enc pair_separator start in
-            let live = str_eq (char_at enc start) "@" in
-            let _ = (if separator > start && separator < stop && not live then
-              map_set ref_active (substring enc start separator)
-                (VClass (substring enc (separator + 1) stop)) else ()) in
-            fixed (stop + 1) (has_live || live) in
-        let rec live = fn (start: int) ->
-          if start >= size then () else
-            let stop = end_of_entry start in
-            let separator = str_find_from enc pair_separator start in
-            let _ = (if separator > start + 1 && separator < stop && str_eq (char_at enc start) "@" then
-              (let refinery = substring enc (start + 1) separator in
-               let _ = map_set ref_active ("@" ++ refinery) VNil in
-               ref_live refinery) else ()) in
-            live (stop + 1) in
-        let _ = (if fixed 0 false then live 0 else ()) in
+       (let entries = (if map_has ref_snaps id then map_get ref_snaps id else (Nil : (str * str) list)) in
+        // Install fixed entries first, then expand live refinery entries.
+        // Preserve the original map iteration order within each pass.
+        let rec fixed = fn (items: (str * str) list) -> fn (has_live: bool) ->
+          match items with
+          | Nil -> has_live
+          | Cons ((key, implementation), rest) ->
+            let live = str_starts_with key "@" in
+            let _ = (if str_len key > 0 && not live then map_set ref_active key (VClass implementation) else ()) in
+            fixed rest (has_live || live) in
+        let rec live = fn (items: (str * str) list) ->
+          match items with
+          | Nil -> ()
+          | Cons ((key, _impl), rest) ->
+            let _ = (if str_len key > 1 && str_starts_with key "@" then
+              (let _ = map_set ref_active key VNil in
+               ref_live (substring key 1 (str_len key))) else ()) in
+            live rest in
+        let _ = (if fixed entries false then live entries else ()) in
         map_set ref_active "~rid" (VInt id)));
 // the snapshot an env's lexical scope was written under
 let ref_env_id = fn env -> (match lv_get env "__rf" with VInt n -> n | _ -> 0);
