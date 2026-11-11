@@ -30,7 +30,7 @@ if [ -n "$bad" ]; then
   echo "Use set_meth / del_meth / set_undef / del_undef (m_state.mere)."
   exit 1
 fi
-n=$(grep -cohE '\b(set_meth|del_meth|set_undef|del_undef) ' *.mere | awk -F: '{s+=$1} END {print s+0}')
+n=$(grep -cohE '\b(set_meth|set_fresh_meth|del_meth|set_undef|del_undef) ' *.mere | awk -F: '{s+=$1} END {print s+0}')
 # A gate whose subject vanished is not a gate that passed: these writes exist.
 if [ "$n" -lt 40 ]; then
   echo "meth writes: only $n writes found through the setters -- expected dozens." >&2

@@ -104,6 +104,14 @@ if ! grep -q '__lang_mem_trim' mr.c; then
   echo 'build.sh: mr.c predates Mere v0.1.729 (cached regions are not zeroed); use the pinned Mere compiler' >&2
   exit 2
 fi
+# Reject a runtime that silently changes the compiler's native default.
+if ! printf '%s\n' '#include "mr.c"' \
+  '#if !defined(__LANG_REGION_CACHE_CAP) || __LANG_REGION_CACHE_CAP != 64' \
+  '#error native region cache must use the compiler default of 64' \
+  '#endif' | clang -w -E -x c -I "$root" - >/dev/null; then
+  echo 'build.sh: compiler does not provide the required native cache policy' >&2
+  exit 2
+fi
 
 # libprism (vendor/prism, see its README): compiled once into vendor/prism/obj
 # and kept, since it changes only when the vendored copy does. Always -O2 --

@@ -375,6 +375,10 @@ extern fn sock_send: int -> int -> int -> int -> int;
 // answers. What the program SEES is unchanged: object_id and the inspect
 // address subtract the base.
 let handle_base = 281474976710656;
+// Public identities use disjoint even tags, rather than fixed million-wide
+// ranges that overlap after enough allocations. Internal collector handles
+// keep their separate encoding. The first serial starts above immediates.
+let public_identity_id = fn (kind: int) -> fn (serial: int) -> (serial + 1) * 32 + kind;
 // (the next object id, 0 until the first object; a slot rather than a
 //  string key because every statement reads it -- fb_wm_put)
 let oid_next_v = vec_new ();
@@ -1603,6 +1607,7 @@ let script_file = fn () -> if map_has cli_file "p" then map_get cli_file "p" els
 // ("" = top level). Captured per method at `def` time (meth_cref) and consulted
 // when resolving a bare Constant, so `Const` means the lexically-nearest one.
 let lex_cref = map_new ();
+let _ = map_compact lex_cref;
 let cur_lex = fn () -> if map_has lex_cref "c" then map_get lex_cref "c" else "";
 // ⚠ `Module.nesting` is the list of scopes AS WRITTEN, and the cref alone
 // cannot reconstruct it: `module A; module B` and `module A::B` leave the same
@@ -1611,6 +1616,7 @@ let cur_lex = fn () -> if map_has lex_cref "c" then map_get lex_cref "c" else ""
 // `class`/`module` keyword actually entered, innermost first, joined by \n
 // because a scope name can contain "::" but never a newline.
 let lex_nest = map_new ();
+let _ = map_compact lex_nest;
 let cur_nest = fn () -> if map_has lex_nest "n" then map_get lex_nest "n" else "";
 let set_nest = fn (s: str) -> let _ = map_set lex_nest "n" s in ();
 // entering `c`: it goes on the FRONT of whatever was open.
@@ -1632,7 +1638,8 @@ let set_lex = fn (c: str) -> let _ = map_set lex_cref "c" c in ();
 // at all -- until then the packed value is byte-for-byte what it always was.
 // ref_active lives here rather than beside the rest of the refinement tables
 // because this is the first thing that reads it.
-let ref_active = map_new ();   // "<target>"        -> VClass impl_cls
+let ref_active = map_new ();
+let _ = map_compact ref_active;   // "<target>"        -> VClass impl_cls
 // (0 -> 1 once any `using` or refine body has run; see ref_on)
 let ref_flag = map_new ();
 let ref_on = fn (u: unit) -> map_len ref_flag > 0;
@@ -2056,13 +2063,15 @@ let proc_origin = map_new ();
 // refined methods. `using refinery` activates them into ref_active (target
 // class name -> impl_cls class name); register_class save/restores ref_active so a
 // `using` inside a module body is scoped to that body (Ruby's lexical scope).
-let refine_cnt = map_new ();   // "<refinery>"      -> VInt count
-let refine_tgt = map_new ();   // "<refinery>#<i>"  -> VStr target class
-let refine_cls = map_new ();   // "<refinery>#<i>"  -> VStr impl_cls class
+let refine_cnt = map_new ();   // "<refinery>"      -> native count
+let refine_tgt = map_new ();   // "<refinery>#<i>"  -> native target class name
+let refine_cls = map_new ();   // "<refinery>#<i>"  -> native implementation class name
 // (ref_active itself is defined above lex_pack, which reads it)
-// Each distinct table `using` has produced, encoded (see ref_snapshot): the
+// Each distinct immutable table `using` has produced (see ref_snapshot): the
 // packed cref of a method and the "__rf" slot of an env name one by its id.
-let ref_snaps = map_new ();    // "<id>"            -> VStr the encoded table
+let ref_snap_counter = vec_new ();
+let _ = vec_push ref_snap_counter 0;
+let ref_snaps = map_new ();    // integer id -> immutable (target/live refinery, implementation) entries
 // per-case memo of #deconstruct / #deconstruct_keys results, so a case with
 // several `in` clauses calls the method once (Ruby caches). Keyed by value
 // handle; cleared at the start of each case.
@@ -2095,16 +2104,6 @@ let gc_cenv0 = map_new ();
 // to collect; this one is above them all.
 let gc_hold = map_new ();
 let bind_store = map_new ();
-// snapshot a locals env by value: `binding` must capture the scope AS IT IS
-// at capture time, isolated from same-named variables assigned in an
-// enclosing scope afterward. The copy is still a persistent mutable Map, so
-// eval(str, b) can define and read locals in the binding's own scope across
-// calls. (A chained env is flattened first — see lv_flat.)
-let map_copy = fn m ->
-  let d = map_new () in
-  let _ = map_iter m (fn (k: str) -> fn (v: Val) -> map_set d k v) in
-  d;
-
 // ---- lexical scope chain ------------------------------------------------
 // A locals env is a Map, but Ruby blocks nest scopes: a block's params and
 // the locals it first assigns are block-local, while a name bound further
@@ -2125,8 +2124,37 @@ let map_copy = fn m ->
 // MERE_RUBY_NO_MRO_CACHE=1 turns the memo off and recomputes every time: the
 // old definition kept as an oracle, so the two can be compared over the whole
 // corpus rather than trusted.
-//   0 n (the generation)   1 off (MERE_RUBY_NO_MRO_CACHE, read once)
-let mro_gen = map_new ();
+// 0 global generation, 1 cache switch (-1 until read), 2 next epoch.
+// Fixed integer slots avoid hash probes on every cached lookup.
+let mro_gen = vec_new ();
+let _ = vec_push mro_gen 0;
+let _ = vec_push mro_gen (0 - 1);
+let _ = vec_push mro_gen 0;
+let _ = vec_compact mro_gen;
+// Two permanent receivers only: (generation, override) for Module and Class.
+let core_new_cache = vec_new ();
+let _ = vec_push core_new_cache (0 - 1);
+let _ = vec_push core_new_cache 0;
+let _ = vec_push core_new_cache (0 - 1);
+let _ = vec_push core_new_cache 0;
+let _ = vec_compact core_new_cache;
+// Only the two permanent Module hook lookups are cached here. Anonymous
+// receivers must still prove that their singleton adds no lookup rows.
+// Permanent native constructor/mixin facts, indexed only by global generations
+// and monotonic blocker sets. This never retains an anonymous owner.
+let metadata_methods_cache = vec_new ();
+let _ = vec_push metadata_methods_cache (0 - 1);
+let _ = vec_push metadata_methods_cache (0 - 1);
+let _ = vec_push metadata_methods_cache (0 - 1);
+let _ = vec_push metadata_methods_cache 0;
+let _ = vec_compact metadata_methods_cache;
+let include_defaults_cache = vec_new ();
+let _ = vec_push include_defaults_cache (0 - 1);
+let _ = vec_push include_defaults_cache 0;
+// Slots2/3 cache the permanent Object metaclass's include lookup.
+let _ = vec_push include_defaults_cache (0 - 1);
+let _ = vec_push include_defaults_cache 0;
+let _ = vec_compact include_defaults_cache;
 let mro_anc = map_new ();      // cls -> its linearized ancestors
 let _ = map_compact mro_anc;  // (its own arena: gc_churn_bytes, note 270)
 let mro_anc_gen = map_new ();  // cls -> the generation that list was built at
@@ -2139,10 +2167,50 @@ let rec strs_same = fn (a: str list) -> fn (b: str list) ->
   match a with
   | Nil -> (match b with Nil -> true | _ -> false)
   | Cons (x, xs) -> (match b with Cons (y, ys) -> str_eq x y && strs_same xs ys | Nil -> false);
-let mro_bump = fn () ->
-  let n = (if map_has mro_gen 0 then map_get mro_gen 0 else 0) in
-  map_set mro_gen 0 (n + 1);
-let mro_now = fn () -> if map_has mro_gen 0 then map_get mro_gen 0 else 0;
+// Anonymous owners invalidate locally until another receiver has cached a
+// dependency on them. Epochs come from one monotonic counter, so max(global,
+// local) remains a collision-free token for the receiver's caches.
+let mro_local_epoch = map_new ();
+let mro_external = map_new ();
+let mro_lookup_root = map_new ();
+let _ = map_compact mro_local_epoch;
+let _ = map_compact mro_external;
+let _ = map_compact mro_lookup_root;
+let rec mro_local_name = fn (c: str) ->
+  if str_len c > 6 && str_starts_with c "(sng:" then mro_local_name (substring c 5 (str_len c - 1))
+  else str_starts_with c "AnonClass_" || str_starts_with c "AnonModule_"
+       || str_starts_with c "Struct_" || str_starts_with c "Refine_";
+let mro_next_epoch = fn () ->
+  let n = vec_get mro_gen 2 + 1 in
+  let _ = vec_set mro_gen 2 n in n;
+let mro_bump = fn () -> vec_set mro_gen 0 (mro_next_epoch ());
+let mro_now = fn () -> vec_get mro_gen 0;
+let mro_now_class = fn (c: str) ->
+  let all = mro_now () in
+  let own = (if map_has mro_local_epoch c then map_get mro_local_epoch c else 0) in
+  if own > all then own else all;
+let mro_observe = fn (c: str) ->
+  if mro_local_name c &&
+     (if map_has mro_lookup_root 0 then (if str_eq (map_get mro_lookup_root 0) c then false else true) else true)
+  then (if map_has mro_external c then () else map_set mro_external c 1) else ();
+let mro_cached_dependency = fn (c: str) ->
+  if map_has mro_lookup_root 0 then mro_observe c else ();
+let mro_lookup_enter = fn (c: str) ->
+  if map_has mro_lookup_root 0 then false
+  else (// A local generation is needed only after a lookup can cache it.
+        // Dependencies observed from another root still invalidate globally.
+        let _ = (if mro_local_name c && (if map_has mro_local_epoch c then false else true)
+                 then map_set mro_local_epoch c 0 else ()) in
+        let _ = map_set mro_lookup_root 0 c in true);
+let mro_lookup_leave = fn (owned: bool) ->
+  if owned then map_delete mro_lookup_root 0 else ();
+let mro_bump_class = fn (c: str) ->
+  // If a pure lookup fails, its armed context forces subsequent mutations
+  // to invalidate globally rather than relying on partial dependencies.
+  if map_has mro_lookup_root 0 || (if mro_local_name c then false else true) || map_has mro_external c
+  then mro_bump ()
+  else if map_has mro_local_epoch c then map_set mro_local_epoch c (mro_next_epoch ())
+  else ();
 // the generation at which Integer's operators were last found to be the
 // builtins (slot 0), the answer (slot 1), and whether there is one (slot 2):
 // see int_ops_plain
@@ -2187,7 +2255,8 @@ let _ = map_compact lv_cap; // Own resize storage so collection can reclaim it.
 // handed back to the pool (lv_child_done)
 let lv_capx = map_new ();
 let _ = map_compact lv_capx; // Own resize storage so collection can reclaim it.
-let lv_ctr = map_new ();   // "n" -> next frame id
+let lv_ctr = vec_new ();   // next frame id; fixed slot on every scope entry
+let _ = vec_push lv_ctr 0;
 // the Range pairs being compared (rng_eq_w), to stop a recursive one
 let rng_eq_seen = map_new ();
 // the names whose class remove_const took away (a new `class` of the name
@@ -2212,13 +2281,17 @@ let class_sng_method_note = fn (k: str) ->
   else ();
 // a class's object_id, handed out on the first ask (keyed by its name)
 let cls_oids = map_new ();
+let cls_oid_counter = vec_new ();
+let _ = vec_push cls_oid_counter 0;
 let cls_oid = fn (c: str) ->
   if map_has cls_oids c then map_get cls_oids c
-  else (let n = 8000000 + map_len cls_oids * 8 in let _ = map_set cls_oids c n in n);
+  else (let serial = vec_get cls_oid_counter 0 in
+        let _ = vec_set cls_oid_counter 0 (serial + 1) in
+        let n = public_identity_id 22 serial in let _ = map_set cls_oids c n in n);
 let lv_child = fn parent ->
   let e = map_new () in
-  let n = (if map_has lv_ctr "n" then map_get lv_ctr "n" else 0) in
-  let _ = map_set lv_ctr "n" (n + 1) in
+  let n = vec_get lv_ctr 0 in
+  let _ = vec_set lv_ctr 0 (n + 1) in
   let _ = map_set e "__eid" (VInt n) in
   let _ = map_set lv_up n parent in
   e;
@@ -2257,8 +2330,8 @@ let rec mark_captured = fn env ->
   else
     let _ = map_set env "__captured" (VBool true) in
     let _ = (if map_has env "__eid" then ()
-             else (let n = (if map_has lv_ctr "n" then map_get lv_ctr "n" else 0) in
-                   let _ = map_set lv_ctr "n" (n + 1) in
+             else (let n = vec_get lv_ctr 0 in
+                   let _ = vec_set lv_ctr 0 (n + 1) in
                    map_set env "__eid" (VInt n))) in
     (match lv_parent_of env with
      | (true, p) -> mark_captured p
@@ -2277,7 +2350,15 @@ let frame_pool = vec_new ();
 // `frame_pool_get` and `frame_pool_put` between them probe this table about
 // fifteen times per method call, so the keys are slots:
 //   0 n   1 hits   2 news   3 puts   4 drops   5 bytes   6 blk_kept   7 blk_puts
-let frame_pool_n = map_new ();
+let frame_pool_n = vec_new ();
+let _ = vec_push frame_pool_n 0;
+let _ = vec_push frame_pool_n 0;
+let _ = vec_push frame_pool_n 0;
+let _ = vec_push frame_pool_n 0;
+let _ = vec_push frame_pool_n 0;
+let _ = vec_push frame_pool_n 0;
+let _ = vec_push frame_pool_n 0;
+let _ = vec_push frame_pool_n 0;
 // Can this target measure an arena at all? `map_bytes` / `vec_bytes` report the
 // arena BYTES behind a store, and on RV32I -- where a program is the machine --
 // a Vec is a plain heap block with no arena behind it, so there is no number to
@@ -2290,14 +2371,14 @@ let frame_pool_n = map_new ();
 // The false branch does not substitute 0. A byte count of 0 reads as "nothing
 // was held", which is a measurement, and this is the absence of one -- so the
 // counters are simply not kept, and the diagnostic rows that print them say so.
-let arena_measurable = try_or (fn (u: unit) -> let _ = map_bytes frame_pool_n in true) false;
+let arena_measurable = try_or (fn (u: unit) -> let _ = map_bytes lv_cap in true) false;
 let pool_ctr = fn (k: int) ->
-  map_set frame_pool_n k ((if map_has frame_pool_n k then map_get frame_pool_n k else 0) + 1);
+  vec_set frame_pool_n k (vec_get frame_pool_n k + 1);
 let frame_pool_get = fn (u: unit) ->
-  let n = (if map_has frame_pool_n 0 then map_get frame_pool_n 0 else 0) in
+  let n = vec_get frame_pool_n 0 in
   if n > 0 then
     (let _ = pool_ctr 1 in
-     let _ = map_set frame_pool_n 0 (n - 1) in
+     let _ = vec_set frame_pool_n 0 (n - 1) in
      vec_get frame_pool (n - 1))
   else
     (let _ = pool_ctr 2 in
@@ -2310,8 +2391,8 @@ let frame_pool_put = fn f ->
   // (peak RSS above a few GB varies 2x between identical runs, recorded below).
   let _ =
     if arena_measurable then
-      map_set frame_pool_n 5
-        ((if map_has frame_pool_n 5 then map_get frame_pool_n 5 else 0) + map_bytes f)
+      vec_set frame_pool_n 5
+        (vec_get frame_pool_n 5 + map_bytes f)
     else () in
   // ⚠ Until Mere v0.1.589 a frame whose arena grew past its seed could not be
   //   wound back by map_recycle. Recycling keeps the OLDEST block and called
@@ -2328,7 +2409,7 @@ let frame_pool_put = fn f ->
   //   frame is wound back again (note 270);
   //   unittest/repro/269_frame_pool_overflow.rb is the witness.
   let _ = map_recycle f in
-  let n = (if map_has frame_pool_n 0 then map_get frame_pool_n 0 else 0) in
+  let n = vec_get frame_pool_n 0 in
   // ⚠ NO CAP: past 4096 pooled frames one used to be dropped, on the belief
   //   that the residue was the struct alone. The wound-back arena keeps its
   //   4 KB seed, and a dropped Map gives nothing back -- so every return below
@@ -2337,7 +2418,7 @@ let frame_pool_put = fn f ->
   (let _ = pool_ctr 3 in
    let _ = (if n < vec_len frame_pool then vec_set frame_pool n f
             else vec_push frame_pool f) in
-   map_set frame_pool_n 0 (n + 1));
+   vec_set frame_pool_n 0 (n + 1));
 // A method's frame when its call is over: back to the pool unless something
 // captured it (a captured one waits in lv_cap for a collection that does not
 // reach it). A define_method body's frame is a pooled scope-chain child too;
@@ -2376,8 +2457,8 @@ let frame_done = fn frame ->
 // enclosing env directly.
 let blk_env_get = fn parent ->
   let e = frame_pool_get () in
-  let n = (if map_has lv_ctr "n" then map_get lv_ctr "n" else 0) in
-  let _ = map_set lv_ctr "n" (n + 1) in
+  let n = vec_get lv_ctr 0 in
+  let _ = vec_set lv_ctr 0 (n + 1) in
   let _ = map_set e "__eid" (VInt n) in
   let _ = map_set lv_up n parent in
   e;
@@ -2425,15 +2506,26 @@ let lv_child_done = fn e ->
 let cur_line_v = vec_new ();
 let _ = vec_push cur_line_v 0;
 let cur_line_set = fn (n: int) -> vec_set cur_line_v 0 n;
-// THE CURRENT FILE AND METHOD, as numbers into a table of names: they were
+// THE CURRENT FILE AND METHOD, as numbers into tables of names: they were
 // cur_pos_s's "f" and "m", and every call and return between two files or two
 // methods rewrote them -- a string copied into the map's arena each time,
 // half a gigabyte of old copies in test_integer_comb before a collection
-// compacted it. The names are few (one per file and method) and kept once.
+// compacted it. File names are permanent. Method labels can belong to a
+// short-lived anonymous class, so they use a separately swept index. IDs
+// are monotonic: a suspended Fiber's saved position never names a new label.
 let pos_name_ids = map_new ();
 let pos_names = vec_new ();
 let _ = vec_push pos_names "";
 let _ = map_set pos_name_ids "" 0;
+let meth_name_ids = map_new ();
+let meth_names = map_new ();
+let meth_name_next = vec_new ();
+let _ = map_set meth_name_ids "" 0;
+let _ = map_set meth_names 0 "";
+let _ = vec_push meth_name_next 1;
+let _ = map_compact meth_name_ids;
+let _ = map_compact meth_names;
+let _ = vec_compact meth_name_next;
 let pos_name_id = fn (s: str) ->
   if map_has pos_name_ids s then map_get pos_name_ids s
   else (let i = vec_len pos_names in
@@ -2444,7 +2536,13 @@ let cur_fm = vec_new ();
 let _ = vec_push cur_fm 0;
 let _ = vec_push cur_fm 0;
 let cur_file_set = fn (s: str) -> vec_set cur_fm 0 (pos_name_id s);
-let cur_meth_set = fn (s: str) -> vec_set cur_fm 1 (pos_name_id s);
+let cur_meth_set = fn (s: str) ->
+  let i = (if map_has meth_name_ids s then map_get meth_name_ids s
+           else (let n = vec_get meth_name_next 0 in
+                 let _ = vec_set meth_name_next 0 (n + 1) in
+                 let _ = map_set meth_names n s in
+                 let _ = map_set meth_name_ids s n in n)) in
+  vec_set cur_fm 1 i;
 // ⚠ A NAME-MEMBERSHIP TEST IS A SET LOOKUP, NOT A CHAIN OF COMPARISONS. These
 // three predicates ran 23-24 `str_eq` against literals, once per dispatch, and
 // the answer for almost every name is "no" -- so almost every call paid all 24.
@@ -2565,7 +2663,7 @@ let name_spec = fn (tag: str) ->
     ++ "send|__send__|public_send|hash|object_id|__id__|==|!=|equal?|eql?|!~|"
     ++ "instance_variable_get|instance_variable_set|"
     ++ "instance_variable_defined?|instance_variables|singleton_class|"
-    ++ "methods|public_methods|singleton_methods|method|extend|"
+    ++ "methods|public_methods|singleton_methods|method|public_method|extend|"
     ++ "define_singleton_method|<=>"
     )
   else if str_eq tag "hash_iter" then ("each|each_pair|each_key|each_value|each_with_index|each_with_object|each_entry|"
@@ -2812,8 +2910,59 @@ let proc_symsrc = map_new ();    // Symbol#to_proc's proc id -> the symbol name
 // Symbol#to_proc's proc, one per symbol name (ruby caches it)
 let sym_proc_cache = map_new ();
 let _ = map_compact proc_symsrc;  // (its own arena from birth, compacted by the sweep: note 300)
+// Private Method fields carry symbols and class references directly. Keep a
+// text decoder for their shared readers and legacy packed-definition strings.
+let method_text_or = fn (fallback: str) -> fn (value: Val) ->
+  match value with
+  | VClass owner -> owner
+  | VSym name -> name
+  | VStr handle -> sget handle
+  | _ -> fallback;
+let method_text = fn (value: Val) -> method_text_or "" value;
+// Method and UnboundMethod payloads are native object metadata. Each row
+// is reached only through its live Method and swept with that object's id.
+let method_cores = map_new ();
+let _ = map_compact method_cores;
+let store_bound_method_core = fn (id: int) -> fn (name: Val) -> fn (owner: Val) -> fn (receiver: Val) ->
+  map_set method_cores id (name, owner, receiver, VNil);
+let method_core_field = fn (id: int) -> fn (slot: int) ->
+  if map_has method_cores id then
+    let (name, owner, receiver, from) = map_get method_cores id in
+    if slot == 0 then name else if slot == 1 then owner else if slot == 2 then receiver else from
+  else VNil;
+let store_unbound_method_core = fn (id: int) -> fn (name: Val) -> fn (body_class: Val) -> fn (owner: Val) -> fn (from: Val) ->
+  map_set method_cores id (name, body_class, owner, from);
+let method_core_has_field = fn (id: int) -> fn (slot: int) ->
+  match method_core_field id slot with VNil -> false | _ -> true;
+let method_core_set_from = fn (id: int) -> fn (from: Val) ->
+  let name = method_core_field id 0 in
+  let body_class = method_core_field id 1 in
+  let owner = method_core_field id 2 in
+  store_unbound_method_core id name body_class owner from;
+let copy_method_core = fn (src: int) -> fn (dst: int) ->
+  if map_has method_cores src then map_set method_cores dst (map_get method_cores src) else ();
+
 let meth_params = map_new ();   // "cls#name" -> the Array of parameter names
-let meth_src = map_new ();       // "cls#name" -> line, "f" ++ key -> file
+// One owned row per definition: line, source path, end line, endless flag.
+// Missing fields are VNil; writers only publish VInt or String handles.
+// Keeping the fields together avoids hashing and copying three prefixed owner
+// keys for every anonymous method, and lets the collector scan its owner once.
+let meth_src = map_new ();
+let meth_source_get = fn (key: str) -> fn (field: int) ->
+  if map_has meth_src key then
+    (let (line, file, last, endless) = map_get meth_src key in
+     if field == 0 then line else if field == 1 then file else if field == 2 then last else endless)
+  else VNil;
+let meth_source_has = fn (key: str) -> fn (field: int) ->
+  match meth_source_get key field with VNil -> false | _ -> true;
+let meth_source_set = fn (key: str) -> fn (field: int) -> fn (value: Val) ->
+  let (line, file, last, endless) = (if map_has meth_src key then map_get meth_src key else (VNil, VNil, VNil, VNil)) in
+  map_set meth_src key (if field == 0 then (value, file, last, endless)
+                       else if field == 1 then (line, value, last, endless)
+                       else if field == 2 then (line, file, value, endless)
+                       else (line, file, last, value));
+let meth_source_delete = fn (key: str) -> fn (field: int) ->
+  if map_has meth_src key then meth_source_set key field VNil else ();
 // "cls#name" -> 1 for a method the prelude wrote: ruby's C method, which has
 // no `$~` of its own -- it matches into its caller's (see rx_cfunc_frame)
 let meth_cfn = map_new ();
@@ -2824,16 +2973,16 @@ let def_bare_name = fn (k: str) ->
      else (let c9 = char_at k i in
            from (i + 1) (if str_eq c9 "#" || (str_eq c9 "." && i + 1 < str_len k && i > 0) then i + 1 else st))) in
   let st9 = from 0 0 in substring k st9 (str_len k);
-let stamp_meth_src = fn (key: str) ->
-  let _ = map_set meth_src key (VInt (cur_line ())) in
-  let _ = (let k9 = def_bare_name key ++ ":" ++ str_of_int (cur_line ()) in
-           let _ = (if map_has def_end_lines k9 then map_set meth_src ("e" ++ key) (map_get def_end_lines k9) else ()) in
-           if map_has def_end_lines ("~" ++ k9) then map_set meth_src ("~" ++ key) (VInt 1)
-           else if map_has meth_src ("~" ++ key) then map_delete meth_src ("~" ++ key) else ()) in
+let stamp_named_meth_src = fn (key: str) -> fn (name: str) ->
+  let line = cur_line () in
+  let site = name ++ ":" ++ str_of_int line in
+  let last = (if map_has def_end_lines site then map_get def_end_lines site else meth_source_get key 2) in
+  let endless = (if map_has def_end_lines ("~" ++ site) then VInt 1 else VNil) in
   let f = cur_file () in
   let _ = (if str_len f > 10 && str_eq (substring f 0 10) "<internal:" then map_set meth_cfn key 1
            else if map_has meth_cfn key then map_delete meth_cfn key else ()) in
-  map_set meth_src ("f" ++ key) (mkstr f);
+  map_set meth_src key (VInt line, frame_text f, last, endless);
+let stamp_meth_src = fn (key: str) -> stamp_named_meth_src key (def_bare_name key);
 // the definition site of one method is the definition site of another when
 // the second was made FROM the first (an alias, or a define_method given a
 // Method). The three lines that move it were written out at each `alias` site
@@ -2853,9 +3002,9 @@ let copy_meth_src = fn (dst: str) -> fn (src: str) ->
   let _ = copy_dm_tbl dm_had_blk dst src in
   let _ = (if map_has meth_cfn src then map_set meth_cfn dst 1
            else if map_has meth_cfn dst then map_delete meth_cfn dst else ()) in
-  if map_has meth_src src && map_has meth_src ("f" ++ src)
-  then (let _ = map_set meth_src dst (map_get meth_src src) in
-        map_set meth_src ("f" ++ dst) (map_get meth_src ("f" ++ src)))
+  if meth_source_has src 0 && meth_source_has (src) 1
+  then (let _ = meth_source_set dst 0 (meth_source_get src 0) in
+        meth_source_set (dst) 1 (meth_source_get (src) 1))
   else ();
 // a BLOCK's definition site is the call that takes it, so `stamp_meth_src` is
 // right for `define_method(:m) { }`. A PROC handed to define_method was
@@ -2864,8 +3013,8 @@ let copy_meth_src = fn (dst: str) -> fn (src: str) ->
 let stamp_meth_src_proc = fn (key: str) -> fn (pk: str) ->
   let _ = (if map_has meth_cfn key then map_delete meth_cfn key else ()) in
   if proc_source_has pk && proc_source_has ("f" ++ pk)
-  then (let _ = map_set meth_src key (proc_source_get pk) in
-        map_set meth_src ("f" ++ key) (proc_source_get ("f" ++ pk)))
+  then (let _ = meth_source_set key 0 (proc_source_get pk) in
+        meth_source_set (key) 1 (proc_source_get ("f" ++ pk)))
   else ();
 // ⚠ HOW MANY PROC IDS WERE EVER ISSUED, not how many procs there are (note
 //   270). A new proc's id was `handle_base + map_len proc_store` at forty
@@ -2962,10 +3111,16 @@ let yblk_get = fn (k: str) ->
   if map_has yblk_bkey k then (h, ps, map_get blk_bodies (map_get yblk_bkey k), env)
   else (h, ps, body, env);
 
-let lv_has = fn env -> fn (n: str) -> let (found, _) = lv_owner env n in found;
-let lv_get = fn env -> fn (n: str) ->
-  let (found, f) = lv_owner env n in
-  if found then map_get f n else VNil;
+// Reads do not need the owner/frame pair used by assignments. In
+// particular, a method's own self and parameters can return directly.
+let rec lv_has = fn env -> fn (n: str) ->
+  if map_has env n then true
+  else let (has, parent) = lv_parent_of env in
+       if has then lv_has parent n else false;
+let rec lv_get = fn env -> fn (n: str) ->
+  if map_has env n then map_get env n
+  else let (has, parent) = lv_parent_of env in
+       if has then lv_get parent n else VNil;
 let lv_set = fn env -> fn (n: str) -> fn (v: Val) ->
   let (found, f) = lv_owner env n in
   map_set (if found then f else env) n v;
@@ -2992,33 +3147,44 @@ let lv_set = fn env -> fn (n: str) -> fn (v: Val) ->
 // Nothing is switched until a program has called `using` (ref_on), so a
 // program that never does pays one map_len per call and per block.
 
-// the table ref_active holds, as one string: "<target>\1<impl>\2" per entry.
+// Immutable entries preserve the active table without encoding and reparsing it.
 // A key "@<refinery>" is a LIVE entry -- every refinement that refinery has
 // when the table is installed, which is what a refine body sees (its own
 // module's refinements, including the ones refined after it; see do_refine).
+// Detached immutable entries preserve the exact active table without
+// allocating an unpooled Map for every class body. Most bodies save Nil.
+let ref_save_active = fn (u: unit) ->
+  if map_len ref_active == 0 then (Nil : (str * Val) list)
+  else region RFSAVE {
+    let entries = vec_new () in
+    let _ = map_iter ref_active (fn (key: str) -> fn (value: Val) -> vec_push entries (key, value)) in
+    vec_to_list entries
+  };
 let ref_snapshot = fn (u: unit) ->
-  let acc = map_new () in
-  let _ = map_set acc 0 "" in
-  let _ = map_iter ref_active (fn (k: str) -> fn (v: Val) ->
-            if str_eq k "~rid" then ()
-            else map_set acc 0 (map_get acc 0 ++ k ++ chr 1 ++ (match v with VClass c -> c | _ -> "") ++ chr 2)) in
-  let id = map_len ref_snaps + 1 in
-  let _ = map_set ref_snaps (str_of_int id) (mkstr (map_get acc 0)) in
-  let _ = map_set ref_active "~rid" (VInt id) in
-  id;
+  region RFSNAP {
+    let entries = vec_new () in
+    let _ = map_iter ref_active (fn (key: str) -> fn (value: Val) ->
+      if str_eq key "~rid" then () else
+        vec_push entries (key, (match value with VClass cls -> cls | _ -> ""))) in
+    let id = vec_get ref_snap_counter 0 + 1 in
+    let _ = vec_set ref_snap_counter 0 id in
+    let _ = map_set ref_snaps id (vec_to_list entries) in
+    let _ = map_set ref_active "~rid" (VInt id) in
+    id
+  };
 // every refinement `r` has right now, into ref_active (a live entry)
 let rec ref_live_go = fn (r: str) -> fn (i: int) -> fn (n: int) ->
   if i >= n then ()
   else (let k = r ++ "#" ++ str_of_int i in
-        let t = (if map_has refine_tgt k then (match map_get refine_tgt k with VStr h -> sget h | _ -> "") else "") in
-        let c = (if map_has refine_cls k then (match map_get refine_cls k with VStr h -> sget h | _ -> "") else "") in
+        let t = (if map_has refine_tgt k then map_get refine_tgt k else "") in
+        let c = (if map_has refine_cls k then map_get refine_cls k else "") in
         // (in FRONT of what is already active for t, which stays behind it:
         //  `using R1` inside R2's refine body leaves R1's refinement of the
         //  same class reachable from a method R2 defines there)
         let _ = (if str_eq t "" || str_eq c "" then () else ref_put t c) in
         ref_live_go r (i + 1) n);
 let ref_live = fn (r: str) ->
-  ref_live_go r 0 (if map_has refine_cnt r then (match map_get refine_cnt r with VInt k -> k | _ -> 0) else 0);
+  ref_live_go r 0 (if map_has refine_cnt r then map_get refine_cnt r else 0);
 // make ref_active the snapshot `id` (0: no refinement active). A no-op when
 // it already is, which is the common case: most calls stay in one scope.
 let ref_install = fn (id: int) ->
@@ -3027,21 +3193,25 @@ let ref_install = fn (id: int) ->
     (let _ = map_clear ref_active in
      if id == 0 then ()
      else
-       (let enc = (if map_has ref_snaps (str_of_int id)
-                   then (match map_get ref_snaps (str_of_int id) with VStr h -> sget h | _ -> "") else "") in
-        let ents = str_split enc (chr 2) in
-        // the fixed entries first, then the live ones over them: a refine
-        // body's own module wins over what was active around it
-        let _ = list_iter ents (fn (e: str) ->
-                  let j = str_index_of e (chr 1) in
-                  if j <= 0 || str_eq (char_at e 0) "@" then ()
-                  else map_set ref_active (substring e 0 j) (VClass (substring e (j + 1) (str_len e)))) in
-        let _ = list_iter ents (fn (e: str) ->
-                  let j = str_index_of e (chr 1) in
-                  if j <= 1 || (if str_eq (char_at e 0) "@" then false else true) then ()
-                  else (let r = substring e 1 j in
-                        let _ = map_set ref_active ("@" ++ r) VNil in
-                        ref_live r)) in
+       (let entries = (if map_has ref_snaps id then map_get ref_snaps id else (Nil : (str * str) list)) in
+        // Install fixed entries first, then expand live refinery entries.
+        // Preserve the original map iteration order within each pass.
+        let rec fixed = fn (items: (str * str) list) -> fn (has_live: bool) ->
+          match items with
+          | Nil -> has_live
+          | Cons ((key, implementation), rest) ->
+            let live = str_starts_with key "@" in
+            let _ = (if str_len key > 0 && not live then map_set ref_active key (VClass implementation) else ()) in
+            fixed rest (has_live || live) in
+        let rec live = fn (items: (str * str) list) ->
+          match items with
+          | Nil -> ()
+          | Cons ((key, _impl), rest) ->
+            let _ = (if str_len key > 1 && str_starts_with key "@" then
+              (let _ = map_set ref_active key VNil in
+               ref_live (substring key 1 (str_len key))) else ()) in
+            live rest in
+        let _ = (if fixed entries false then live entries else ()) in
         map_set ref_active "~rid" (VInt id)));
 // the snapshot an env's lexical scope was written under
 let ref_env_id = fn env -> (match lv_get env "__rf" with VInt n -> n | _ -> 0);
@@ -3106,6 +3276,12 @@ let rec idx_to_list = fn tmp -> fn (i: int) -> fn (n: int) ->
 // would name the subclass after its superclass, giving a sup self-loop — so
 // draw fresh names from a dedicated counter instead).
 let struct_ctr = map_new ();
+let _ = map_compact struct_ctr;
+// Monotonic identities: 0 anonymous class/name, 1 method or block frame.
+let scope_ids = vec_new ();
+let _ = vec_push scope_ids 0;
+let _ = vec_push scope_ids 0;
+let _ = vec_compact scope_ids;
 // THE CALL DEPTH, which was struct_ctr's "cd" key: every statement reads it
 // (fb_wm_stmt marks where the statement's allocations begin, by depth), and a
 // string-keyed lookup per statement was a measurable share of a bare loop.
@@ -3152,17 +3328,18 @@ let _ = vec_push bind_mark_p (0 - 1);
 // so it can be reproduced byte for byte -- but only if the member ORDER is
 // kept, which the generated #members method cannot be asked for cheaply.
 let struct_mem = map_new ();
-let fresh_anon = fn (prefix: str) ->
-  let n = (if map_has struct_ctr "n" then map_get struct_ctr "n" else 0) in
-  let _ = map_set struct_ctr "n" (n + 1) in
-  prefix ++ str_of_int n;
+// Only names issued by the runtime are anonymous identities. A user may
+// legitimately declare AnonClass_User, Struct_User or Refine_User.
+// Native scan candidates are still built separately on the collector stack.
+let anonymous_classes = map_new (); // internal class name -> creation kind
+let _ = map_compact anonymous_classes;
 // break-through-yield home tracking: each method invocation gets a unique
 // frame id; a block captured by a `&blk` param remembers the frame it was
 // passed to (its "home"), so a `break` inside it — even after the block has
 // been delegated down through other methods — unwinds to that home method.
 let next_fid = fn () ->
-  let n = (if map_has struct_ctr "f" then map_get struct_ctr "f" else 0) in
-  let _ = map_set struct_ctr "f" (n + 1) in
+  let n = vec_get scope_ids 1 in
+  let _ = vec_set scope_ids 1 (n + 1) in
   n + 1;
 let proc_home = map_new ();     // str(proc id) -> VInt home-frame-id
 let _ = map_compact proc_home;  // (its own arena from birth, compacted by the sweep: note 300)
@@ -3242,15 +3419,10 @@ let rx_frame = vec_new ();
 let _ = vec_push rx_frame 0;
 // the counter in an internal anonymous name ("AnonClass_7" -> 7), used as the
 // address Ruby shows. Stable for the life of the program, like an object id.
-let is_anon_cls = fn (c: str) ->
-  (str_len c >= 10 && str_eq (substring c 0 10) "AnonClass_") || (str_len c >= 11 && str_eq (substring c 0 11) "AnonModule_")
-  // a struct class is anonymous too until something names it: ruby answers
-  // nil for `Struct.new(:a).name`, and "Struct::Foo" once it is given one.
-  || (str_len c >= 7 && str_eq (substring c 0 7) "Struct_")
-  // ...and a REFINEMENT module, which ruby never gives a name: `refine String
-  // do ... end` answers a module whose #name is nil, and the block's self is
-  // that module. Its internal name is bookkeeping, not a constant.
-  || (str_len c >= 7 && str_eq (substring c 0 7) "Refine_");
+let rec is_anon_cls = fn (c: str) ->
+  if map_has anonymous_classes c then true
+  else let i = str_last_index_of c "::" in
+    if i < 0 then false else is_anon_cls (substring c 0 i);
 // name_anon (records a constant name for an anonymous class/module the first
 // time it is assigned to a constant) is defined in the mutual-recursion block
 // below, since it recurses through the receiver's constants.
@@ -3949,7 +4121,7 @@ let call_names_s = map_new ();
 let call_files_s = map_new ();
 let call_meths_s = map_new ();
 // the method the innermost frame is running ("" at the top level)
-let cur_meth = fn () -> vec_get pos_names (vec_get cur_fm 1);
+let cur_meth = fn () -> map_get meth_names (vec_get cur_fm 1);
 // The label ruby writes in a frame. Through 3.3 it was the method alone, so
 // this stripped the owner off the "Cls#meth" the call stack records; 3.4 names
 // the owner -- `Object#top` for a top-level def, `K#inst` for an instance
@@ -4537,11 +4709,15 @@ let prim_base_name = fn (c: str) ->
 // ...and the copies alone: a copy OWNS the builtin's methods (they are its
 // instance_methods(false)), where a subclass inherits them.
 let prim_copy = map_new ();
+// Copies of Time retain its native allocator/class methods without retaining
+// an otherwise unreachable source class. The stored prototype is always Time.
+let cls_copy_of = map_new ();
+let _ = map_compact cls_copy_of;
 let prim_copy_q = fn (c: str) ->
   map_len prim_copy > 0 && map_has prim_copy c
   && (let b = map_get prim_copy c in str_eq b "Queue" || str_eq b "SizedQueue");
 let set_sup = fn tbl -> fn (k: str) -> fn (v: str) ->
-  let _ = mro_bump () in
+  let _ = mro_bump_class k in
   let b = prim_base_name v in
   let _ = (if str_len b > 0 then map_set prim_sub k b else ()) in
   map_set tbl k v;
@@ -4566,8 +4742,27 @@ let inc_keep = map_new ();
 // whose chain already held m2 does not add m2 there again (CRuby's
 // include propagation skips what the chain has); included first, it would
 let pre_excl = map_new ();
-let set_inc = fn (k: str) -> fn (v: str) -> let _ = class_sng_note k in let _ = mro_bump () in map_set includes k v;
-let set_pre = fn (k: str) -> fn (v: str) -> let _ = class_sng_note k in let _ = mro_bump () in map_set prepends k v;
+// Remember mixins when their edges are installed, including prepend edges.
+// Raw singleton copies reuse existing edges; bootstrap edges name core modules.
+// An unobserved anonymous leaf cannot already occur in an ancestor chain.
+let mro_note_mixin = fn (m: str) ->
+  if mro_local_name m && (if map_has mro_external m then false else true)
+  then map_set mro_external m 1 else ();
+let mro_note_mixins = fn (names: str) ->
+  if str_index_of names "|" < 0 then mro_note_mixin names
+  else
+    let rec note = fn (xs: str list) ->
+      match xs with Nil -> () | Cons (m, rest) -> let _ = mro_note_mixin m in note rest in
+    note (str_split names "|");
+let set_inc = fn (k: str) -> fn (v: str) ->
+  let _ = mro_note_mixins v in let _ = class_sng_note k in let _ = mro_bump_class k in map_set includes k v;
+// After the unobserved first-inclusion proof, base is a bare Object subclass
+// with no dependency epoch, and mixin is an unobserved anonymous leaf. The
+// general writer would only mark mixin external and store this same edge.
+let set_fresh_inc = fn (base: str) -> fn (mixin: str) ->
+  let _ = map_set mro_external mixin 1 in map_set includes base mixin;
+let set_pre = fn (k: str) -> fn (v: str) ->
+  let _ = mro_note_mixins v in let _ = class_sng_note k in let _ = mro_bump_class k in map_set prepends k v;
 // ⚠ AND THE SAME FOR THE METHOD TABLE AND ITS TOMBSTONES, for a reason the
 // three above did not have: `has_meth` MEMOISES the whole ancestor walk on
 // this generation, so a definition that does not bump it is a definition the
@@ -4644,8 +4839,8 @@ let msnap_copy_tables = fn (dst: str) -> fn (k: str) ->
   let _ = msnap_copy meth_cvcls dst k in
   let _ = msnap_copy meth_cfn dst k in
   let _ = msnap_copy meth_params dst k in
-  let _ = msnap_copy meth_src dst k in
-  msnap_copy meth_src ("f" ++ dst) ("f" ++ k);
+  let _ = (if meth_source_has k 0 then meth_source_set dst 0 (meth_source_get k 0) else meth_source_delete dst 0) in
+  if meth_source_has k 1 then meth_source_set dst 1 (meth_source_get k 1) else meth_source_delete dst 1;
 let msnap_save = fn tbl -> fn (k: str) ->
   if map_has meth_obj_seen k && map_has tbl k && (if map_has msnap_inst k then false else true) then
     (let b = oid_peek (handle_base + 1) in
@@ -4659,12 +4854,56 @@ let msnap_save = fn tbl -> fn (k: str) ->
 // each, size, ...): ruby's are Struct's own, so the class does not list them
 // as its own. A later `def` of the name makes it the class's (set_meth).
 let struct_gen = map_new ();
+// Conservative owner presence: removal need not clear it. Every method
+// installation uses set_meth, so an absent entry proves that an anonymous
+// owner has no method rows to copy.
+let meth_owner_seen = map_new ();
+let _ = map_compact meth_owner_seen;
+// A fixed bucket filter never holds names or class identities. Collisions
+// only cause a full lookup. Rebuild it from live method rows at each GC.
+let refinement_method_bits = vec_new ();
+let _ = (let rec init = fn (i: int) -> if i >= 256 then () else
+           (let _ = vec_push refinement_method_bits 0 in init (i + 1)) in init 0);
+let _ = vec_compact refinement_method_bits;
+let refinement_method_bucket = fn (name: str) ->
+  let n = str_len name in
+  if n == 0 then 0 else (n + ord (char_at name 0) * 17 + ord (char_at name (n - 1)) * 131) % 256;
+let refinement_method_possible = fn (name: str) ->
+  vec_get refinement_method_bits (refinement_method_bucket name) != 0;
+let note_refinement_method_name = fn (key: str) ->
+  if str_starts_with key "Refine_"
+  then vec_set refinement_method_bits (refinement_method_bucket (meth_key_base key)) 1
+  else ();
+let rebuild_refinement_method_names = fn (u: unit) ->
+  let rec clear = fn (i: int) -> if i >= 256 then () else
+    (let _ = vec_set refinement_method_bits i 0 in clear (i + 1)) in
+  let _ = clear 0 in
+  map_iter meths_g (fn (key: str) -> fn (_value: Meth) -> note_refinement_method_name key);
+// Fixed conservative flag: before any definition or visibility change of
+// method/unbind, both native reflection protocols are still the defaults.
+// It never holds class identities and never resets after a mutation.
+let reflection_protocol_changed = vec_new ();
+let _ = vec_push reflection_protocol_changed 0;
+let _ = vec_compact reflection_protocol_changed;
+let note_reflection_protocol = fn (key: str) ->
+  if vec_get reflection_protocol_changed 0 != 0 then ()
+  else if str_eq key "method" || str_eq key "unbind" || str_eq key "public_method"
+       || str_ends_with key "#method" || str_ends_with key "#unbind" || str_ends_with key "#public_method"
+  then vec_set reflection_protocol_changed 0 1 else ();
+// All primary method writes, including raw singleton copies, mark their arena.
 let store_meth = fn tbl -> fn (key: str) -> fn (value: Meth) ->
+  let _ = note_refinement_method_name key in
+  let _ = note_reflection_protocol key in
   let _ = vec_set method_store_dirty 0 1 in map_set tbl key value;
 let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
   let _ = class_sng_method_note k in
   let _ = msnap_save tbl k in
-  let _ = mro_bump () in
+  let sep = str_index_of k "#" in
+  let _ = (if sep > 0 then mro_bump_class (substring k 0 sep) else mro_bump ()) in
+  let _ = (if sep > 0 then
+    (let owner = substring k 0 sep in
+     if mro_local_name owner && (if map_has meth_owner_seen owner then false else true)
+     then map_set meth_owner_seen owner 1 else ()) else ()) in
   let _ = (if map_len undefs > 0 && map_has undefs k then del_undef k else ()) in
   // (...and a delegation to a builtin under this name: `alias to_f _to_f`
   //  then `def to_f` is the def, and the alias answered in its place)
@@ -4684,6 +4923,13 @@ let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
            else ()) in
   let _ = (if map_len struct_gen > 0 && map_has struct_gen k then map_delete struct_gen k else ()) in
   let _ = map_delete meth_params k in store_meth tbl k v;
+// native_definition_body proves an unobserved anonymous owner, an absent
+// method row and no alias/undef/generated-method or notification-hook state.
+// Retain cache invalidation, owner presence and parameter-cache invalidation.
+let set_fresh_meth = fn tbl -> fn (owner: str) -> fn (key: str) -> fn (value: Meth) ->
+  let _ = mro_bump_class owner in
+  let _ = map_set meth_owner_seen owner 1 in
+  let _ = map_delete meth_params key in store_meth tbl key value;
 let del_meth = fn tbl -> fn (k: str) ->
   let _ = vec_set method_store_dirty 0 1 in
   let _ = msnap_save tbl k in
@@ -4693,6 +4939,17 @@ let modules = map_new ();
 // private methods: "Cls#name" -> present. Checked only on explicit-receiver
 // dispatch (implicit-self calls and send bypass, as in Ruby).
 let privates = map_new ();
+// Once any constructor has been made private, retain the full visibility
+// walk. This fixed flag is conservative across removal, aliasing and copies;
+// it never retains method or class names and cannot grow with class churn.
+let private_new_seen = vec_new ();
+let _ = vec_push private_new_seen 0;
+let _ = vec_compact private_new_seen;
+let set_private = fn (key: str) -> fn (value: Val) ->
+  let _ = note_reflection_protocol key in
+  let _ = (if vec_get private_new_seen 0 == 0 && (str_eq key "new" || str_ends_with key "#new")
+           then vec_set private_new_seen 0 1 else ()) in
+  map_set privates key value;
 // ⚠ `public :m` / `private :m` on a class that INHERITS m is a method entry of
 //   its own in ruby (a zsuper entry), which is why #owner then answers that
 //   class and not the ancestor. The visibility marks cannot say so: "public"
@@ -4700,6 +4957,17 @@ let privates = map_new ();
 //   statement named a method, so the owner walk can stop there.
 let vis_marks = map_new ();   // "cls#name" -> VNil, where a visibility statement named it
 let protecteds = map_new ();  // protected methods (callable only same-class)
+// Like private_new_seen, this fixed monotonic flag permits a negative
+// constructor-visibility answer only until a protected new was installed.
+let protected_new_seen = vec_new ();
+let _ = vec_push protected_new_seen 0;
+let _ = vec_compact protected_new_seen;
+let set_protected = fn (key: str) -> fn (value: Val) ->
+  let _ = note_reflection_protocol key in
+  let _ = (if vec_get protected_new_seen 0 == 0 && (str_eq key "new" || str_ends_with key "#new")
+           then vec_set protected_new_seen 0 1 else ()) in
+  map_set protecteds key value;
+
 let num_names_memo = map_new ();  // numeric kind -> its method-name set
 // prim_method has no `world` to build an exception, so its terminal
 // "undefined method" failure parks the method name here; the begin/rescue
@@ -4849,6 +5117,11 @@ let bi_nix = fn (n: str) ->
   else (let i = vec_len bi_names in
         let _ = vec_push bi_names n in
         let _ = map_set bi_name_ix n i in i);
+// A receiver class name is temporary context, not an interned method name.
+// bi_reg_get copies the stand-in before nested calls and restores it through
+// bi_reg_set, so one compactable slot suffices without permanent class names.
+let bi_class_name = map_new ();
+let _ = map_compact bi_class_name;
 let bi_reg_n = map_new ();
 let _ = map_compact bi_reg_n;  // (its own arena: gc_churn_bytes, note 270)
 let bi_reg_r = map_new ();
@@ -4866,10 +5139,124 @@ let _ = map_compact bi_reg_r;  // (its own arena: gc_churn_bytes, note 270)
 //   for the pins into the arena (__lang_coro_pins), and csv parses inside an
 //   Enumerator -- twenty tables compacted at every collection took parse_line
 //   from 3.3 to 4.3 s (note 441). The small ones wait until they are worth it.
+let _ = map_compact modules;
+let _ = map_compact cls_sup;
+let _ = map_compact cls_frozen;
+let _ = map_compact class_meta;
+let _ = map_compact class_sng_exists;
+let _ = map_compact sng_shown;
+let _ = map_compact cls_oids;
+let _ = map_compact cls_removed;
+let _ = map_compact anon_name;
+let _ = map_compact cls_name_str;
+let _ = map_compact prim_sub;
+let _ = map_compact prim_copy;
+let _ = map_compact struct_mem;
+let _ = map_compact struct_gen;
+let _ = map_compact includes;
+let _ = map_compact prepends;
+let _ = map_compact inc_excl;
+let _ = map_compact inc_keep;
+let _ = map_compact pre_excl;
+let _ = map_compact meths_g;
+let _ = map_compact meth_cref;
+let _ = map_compact meth_cvcls;
+let _ = map_compact alias_origin;
+let _ = map_compact alias_srcname;
+let _ = map_compact meth_params;
+let _ = map_compact meth_src;
+let _ = map_compact dm_methods;
+let _ = map_compact dm_captured;
+let _ = map_compact dm_closenv;
+let _ = map_compact dm_had_blk;
+let _ = map_compact privates;
+let _ = map_compact protecteds;
+let _ = map_compact undefs;
+let _ = map_compact undef_names;
+let _ = map_compact vis_marks;
+let _ = map_compact r2k_methods;
+let _ = map_compact consts;
+let _ = map_compact const_src;
+let _ = map_compact const_src_pend;
+let _ = map_compact private_consts;
+let _ = map_compact deprecated_consts;
+let _ = map_compact autoloads;
+let _ = map_compact autoload_busy;
+let _ = map_compact cvars;
+let _ = map_compact ivars_g;
+let _ = map_compact refine_cnt;
+let _ = map_compact refine_tgt;
+let _ = map_compact refine_cls;
+let _ = map_compact gc_hold;
+let _ = map_compact mro_anc;
+let _ = map_compact mro_anc_gen;
+let _ = map_compact mro_mods;
+let _ = map_compact mro_mods_gen;
+let _ = map_compact hm_memo;
+let _ = map_compact hm_memo_gen;
+let _ = map_compact mro_local_epoch;
+let _ = map_compact mro_external;
+let _ = map_compact meth_obj_seen;
+let _ = map_compact snap_meths;
+let _ = map_compact snap_bounds;
+let _ = map_compact msnap_inst;
+let _ = map_compact ref_snaps;
+let _ = map_compact bi_owner_memo;
+let _ = map_compact meth_cfn;
+let _ = map_compact builtin_alias;
+let _ = map_compact ie_def_meths;
+let _ = map_compact hng_store;
+let _ = map_compact hng_sng_base;
+// A generated identity must not alias an existing named constant or class.
+let rec fresh_anon = fn (prefix: str) ->
+  let n = vec_get scope_ids 0 in
+  let _ = vec_set scope_ids 0 (n + 1) in
+  let name = prefix ++ str_of_int n in
+  let kind = (if str_eq prefix "AnonClass_" then 1 else if str_eq prefix "AnonModule_" then 2
+              else if str_eq prefix "Struct_" then 3 else 0) in
+  if kind == 0 then name
+  // Previously issued identities have a smaller counter. Namespace rows
+  // still reject collisions with program-defined or removed constants.
+  else if map_has consts name || map_has cls_sup name || map_has modules name then fresh_anon prefix
+  else (let _ = map_set anonymous_classes name kind in name);
+// Reclaim dead method rows on every collection, but copy their surviving ASTs
+// only after the private arena doubles or its live row count halves. Rewriting
+// one anonymous method must not recopy the entire permanent prelude each time.
+// Targets without arena measurements retain unconditional compaction.
+let method_store_floor = vec_new ();
+let _ = vec_push method_store_floor 0;
+let _ = vec_push method_store_floor 0;
+let _ = vec_compact method_store_floor;
+let compact_method_store = fn (u: unit) ->
+  if vec_get method_store_dirty 0 == 0 then false
+  else
+    (let floor = vec_get method_store_floor 0 in
+     let rows = map_len meths_g in
+     let due = (if arena_measurable then floor == 0
+                 || map_bytes meths_g > floor * 2
+                 || rows * 2 < vec_get method_store_floor 1 else true) in
+     let _ = (if due then
+       (let _ = map_compact meths_g in
+        let _ = (if arena_measurable then vec_set method_store_floor 0 (map_bytes meths_g) else ()) in
+        vec_set method_store_floor 1 rows) else ()) in
+     let _ = vec_set method_store_dirty 0 0 in due);
 let map_compact_big = fn m -> if map_bytes m > 262144 then map_compact m else ();
+// The spelling is a one-write warning baton, consumed by gvar_write. Its
+// deleted strings must not accumulate in the process-wide default arena.
+let gvar_wname = map_new ();
+let _ = map_compact gvar_wname;
 let gc_churn_bytes = fn (u: unit) ->
-  vec_bytes method_store_dirty +
-  map_bytes mro_anc + map_bytes mro_mods + map_bytes hm_memo
+  vec_bytes metadata_methods_cache + vec_bytes method_store_floor + vec_bytes method_store_dirty + vec_bytes include_defaults_cache + vec_bytes core_new_cache + vec_bytes private_new_seen + vec_bytes protected_new_seen + map_bytes gvar_wname +
+  map_bytes meth_name_ids + map_bytes meth_names + vec_bytes meth_name_next +
+  map_bytes anonymous_classes + map_bytes cls_copy_of + map_bytes method_cores + vec_bytes refinement_method_bits + vec_bytes reflection_protocol_changed +
+  map_bytes bi_class_name +
+  map_bytes bi_owner_memo + map_bytes meth_cfn + map_bytes builtin_alias + map_bytes ie_def_meths + map_bytes hng_store + map_bytes hng_sng_base
+  +   map_bytes meth_owner_seen +
+  map_bytes struct_ctr + map_bytes lex_cref + map_bytes lex_nest + vec_bytes mro_gen + vec_bytes scope_ids + map_bytes ref_active
+  +   map_bytes modules + map_bytes cls_sup + map_bytes class_meta + map_bytes refine_cnt + map_bytes refine_tgt + map_bytes refine_cls + map_bytes ref_snaps + map_bytes cls_oids + map_bytes anon_name + map_bytes consts + map_bytes cvars + map_bytes includes + map_bytes prepends + map_bytes dm_captured + map_bytes dm_closenv + map_bytes dm_methods + map_bytes struct_mem
+  +   map_bytes mro_anc + map_bytes mro_mods + map_bytes hm_memo
+  + map_bytes isa_memo
+  + map_bytes mro_local_epoch + map_bytes mro_external + map_bytes mro_lookup_root
   + map_bytes prim_missing + map_bytes bi_reg_n + map_bytes bi_reg_r
   // ...and the method table: a `def` copies the body's AST in, and redefining
   // it (test_yield instance_evals thousands of generated definitions) leaves
@@ -4892,7 +5279,22 @@ let gc_churn_bytes = fn (u: unit) ->
   //  parses inside an Enumerator (csv) made it most of its time, note 441.
   + map_bytes rx_gnums + map_bytes rx_gbodies
   + map_bytes arr_pending + map_bytes arr_vc + map_bytes arr_vc_ver + map_bytes arr_vc_len + map_bytes arr_vers + map_bytes lv_up + map_bytes lv_cap + map_bytes lv_capx;
-let gc_churn_compact = fn (u: unit) ->
+let gc_churn_compact = fn (already: int) ->
+  let _ = map_compact_big gvar_wname in
+  let _ = map_compact_big bi_class_name in
+  let _ = map_compact_big bi_owner_memo in
+  let _ = map_compact_big meth_cfn in
+  let _ = map_compact_big builtin_alias in
+  let _ = map_compact_big ie_def_meths in
+  let _ = map_compact_big hng_store in
+  let _ = map_compact_big hng_sng_base in
+  let _ = map_compact_big struct_ctr in
+  let _ = map_compact_big lex_cref in
+  let _ = map_compact_big lex_nest in
+  let _ = map_compact_big ref_active in
+  let _ = map_compact_big mro_local_epoch in
+  let _ = map_compact_big mro_external in
+  let _ = map_compact_big mro_lookup_root in
   let _ = map_compact_big arr_pending in
   let _ = map_compact_big arr_vc in
   let _ = map_compact_big arr_vc_ver in
@@ -4912,13 +5314,12 @@ let gc_churn_compact = fn (u: unit) ->
   let _ = map_compact_big raise_bt in
   let _ = map_compact_big rx_lenient in
   let _ = map_compact_big rx_wq in
-  let _ = map_compact mro_anc in
-  let _ = map_compact mro_mods in
-  let _ = map_compact hm_memo in
+  let _ = (if already / 2 % 2 == 0 then map_compact mro_anc else ()) in
+  let _ = (if already / 4 % 2 == 0 then map_compact mro_mods else ()) in
+  let _ = (if already / 8 % 2 == 0 then map_compact hm_memo else ()) in
   let _ = map_compact prim_missing in
   let _ = map_compact bi_reg_n in
-  let _ = (if vec_get method_store_dirty 0 != 0
-           then (let _ = map_compact meths_g in vec_set method_store_dirty 0 0) else ()) in
+  let _ = (if already % 2 == 0 then (let _ = compact_method_store () in ()) else ()) in
   map_compact bi_reg_r;
 // ⚠ the name is a COPY: the caller holds it across the builtin it brackets,
 //   and a collection inside that builtin compacts bi_reg_n (gc_churn_compact),
@@ -4929,9 +5330,11 @@ let bi_reg_recv = fn (u: unit) ->
     (let k = map_get bi_reg_r 0 in
      let p = (if map_has bi_reg_r 1 then map_get bi_reg_r 1 else 0) in
      let nm = (fn (u2: unit) -> (if map_has bi_reg_r 2 then (let n9 = vec_get bi_names (map_get bi_reg_r 2) in substring n9 0 (str_len n9)) else "")) in
+     let cn = (fn (u2: unit) -> (if map_has bi_class_name 0 then
+                 (let name = map_get bi_class_name 0 in substring name 0 (str_len name)) else "")) in
      if k == 1 then VInt p else if k == 2 then VStr p else if k == 3 then VArr p
      else if k == 4 then VHsh p else if k == 5 then VObj p else if k == 7 then VBool (p == 1)
-     else if k == 8 then VSym (nm ()) else if k == 9 then VClass (nm ()) else if k == 10 then VExc (nm (), "")
+     else if k == 8 then VSym (nm ()) else if k == 9 then VClass (cn ()) else if k == 10 then VExc (cn (), "")
      else if k == 11 then VBig "1" else if k == 12 then VRat ("0", "1") else if k == 13 then VFlt 0.0
      else if k == 14 then VCpx (VInt 0, VInt 0) else if k == 15 then VRange (VInt 0, VInt 0, false)
      else if k == 16 then VProc p else if k == 17 then VBind p else if k == 18 then VRegex ("", "", "")
@@ -4946,13 +5349,20 @@ let bi_reg_get = fn (u: unit) ->
 // the receiver as (kind, handle or int, name index) -- what its class needs:
 // a stand-in of the same class for anything that carries more (an
 // exception's message, a big Integer's digits, a Range's bounds)
+// Saved contexts own copies from bi_reg_get. No caller borrows the slot's
+// arena across a write, so recycle it before storing a different class name.
+let bi_class_set = fn (name: str) ->
+  if map_has bi_class_name 0 && str_eq (map_get bi_class_name 0) name then ()
+  else (let _ = map_recycle bi_class_name in map_set bi_class_name 0 name);
 let bi_reg_set = fn (n: str) -> fn (r: Val) -> fn (d: int) ->
   let _ = map_set bi_reg_n 0 (bi_nix n) in
   let (k, p, ni) = (match r with
                     | VInt x -> (1, x, 0 - 1) | VStr h -> (2, h, 0 - 1) | VArr h -> (3, h, 0 - 1)
                     | VHsh h -> (4, h, 0 - 1) | VObj h -> (5, h, 0 - 1) | VNil -> (6, 0, 0 - 1)
                     | VBool b -> (7, (if b then 1 else 0), 0 - 1)
-                    | VSym x -> (8, 0, bi_nix x) | VClass c -> (9, 0, bi_nix c) | VExc (c, _) -> (10, 0, bi_nix c)
+                    | VSym x -> (8, 0, bi_nix x)
+                    | VClass c -> (let _ = bi_class_set c in (9, 0, 0 - 1))
+                    | VExc (c, _) -> (let _ = bi_class_set c in (10, 0, 0 - 1))
                     | VBig _ -> (11, 0, 0 - 1) | VRat (_, _) -> (12, 0, 0 - 1) | VFlt _ -> (13, 0, 0 - 1)
                     | VCpx (_, _) -> (14, 0, 0 - 1) | VRange (_, _, _) -> (15, 0, 0 - 1) | VProc h -> (16, h, 0 - 1)
                     | VBind h -> (17, h, 0 - 1) | VRegex (_, _, _) -> (18, 0, 0 - 1) | VMain -> (19, 0, 0 - 1)) in
@@ -5255,12 +5665,10 @@ let rx_ev_enc = fn (e: str) -> (let k = str_index_of e (chr 3) in if k < 0 then 
 // a Regexp's object_id, handed out on the first ask by its key (hng_key:
 // a run-time Regexp's own id, or a literal's pattern) and kept -- every
 // Regexp answered 0
-// a class made by Class#dup / #clone -> the class it copies (cls_copy)
-let cls_copy_of = map_new ();
 let rx_oids = map_new ();
 let rx_oid_of = fn (k: str) ->
   if map_has rx_oids k then map_get rx_oids k
-  else (let n = 11000000 + map_len rx_oids * 8 in let _ = map_set rx_oids k n in n);
+  else (let n = public_identity_id 24 (map_len rx_oids) in let _ = map_set rx_oids k n in n);
 let rx_ev_id = fn (e: str) -> (let k = str_index_of e (chr 3) in if k < 0 then "" else substring e (k + 1) (str_len e));
 let rx_frz = map_new ();
 let rx_idc = vec_new ();
@@ -5716,7 +6124,6 @@ let _ = vec_push rxv_steps 0;
 // reported start past the attempt still counts as a match there.
 // the spelling of the global being assigned ("$fs" for an alias of $;),
 // handed from gvar_assign_checked to gvar_write's deprecation warning
-let gvar_wname = map_new ();
 let rxv_once = vec_new ();
 let _ = vec_push rxv_once 0;
 // (450 million: it was 20 million while a run kept every choice it had made,

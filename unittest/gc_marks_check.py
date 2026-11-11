@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the production packed GC set at word boundaries and sparse IDs."""
+"""Exercise packed marks and the production class/constant ownership parsers."""
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +11,15 @@ source = (ROOT / "main.mere").read_text()
 start = source.index("let gc_live_new =")
 end = source.index("let rec gc_mark_val =", start)
 helpers = source[start:end]
+owner_helpers = source[source.index("let rec gc_class_base ="):source.index("let gc_source_owner =")]
+state = (ROOT / "m_state.mere").read_text()
+identity_helper = state[state.index("let rec is_anon_cls ="):state.index("// name_anon (")]
+owner_header = """let anonymous_classes = map_new ();
+let _ = map_set anonymous_classes "AnonClass_1" 1;
+let _ = map_set anonymous_classes "AnonModule_2" 2;
+let _ = map_set anonymous_classes "Struct_3" 3;
+let _ = map_set anonymous_classes "Refine_M::R_0" 4;
+"""
 probe = r'''let ensure = fn (yes: bool) -> if yes then () else fail "GC mark mismatch";
 let live = gc_live_new ();
 let other = gc_live_new ();
@@ -70,10 +79,39 @@ let _ = ensure (gc_live_has nested 80000);
 let _ = ensure (gc_live_count nested == 2);
 let _ = print "packed GC marks: boundaries, sparse IDs, duplicates and independent sets";
 '''
+owner_probe = r'''let check_owner = fn (key: str) -> fn (expected: str) ->
+  if str_eq (gc_class_owner key) expected then () else fail ("class owner mismatch: " ++ key);
+let check_const = fn (key: str) -> fn (expected: str) ->
+  if str_eq (gc_const_owner key) expected then () else fail ("constant owner mismatch: " ++ key);
+let _ = check_owner "AnonClass_1#answer" "AnonClass_1";
+let _ = check_owner "(sng:(sng:AnonClass_1))#answer" "AnonClass_1";
+let _ = check_owner "AnonClass_1::Nested#answer" "AnonClass_1";
+let _ = check_owner "cls:AnonClass_1@state" "AnonClass_1";
+let _ = check_owner ("AnonClass_1#answer" ++ chr 9 ++ "lookup") "AnonClass_1";
+let _ = check_owner "Refine_M::R_0#answer" "Refine_M::R_0";
+let _ = check_owner "Refine_M::R_0::Nested#answer" "Refine_M::R_0";
+let _ = check_owner "AnonClass_User#answer" "";
+let _ = check_owner "AnonModule_User::State" "";
+let _ = check_owner "Struct_User#answer" "";
+let _ = check_owner "Refine_User#answer" "";
+let _ = check_const "AnonClass_1" "";
+let _ = check_const "AnonModule_2" "";
+let _ = check_const "Refine_M::R_0" "";
+let _ = check_const "AnonClass_1::State" "AnonClass_1";
+let _ = check_const "(sng:AnonClass_1)::State" "AnonClass_1";
+let _ = check_const "AnonClass_1::Nested::State" "AnonClass_1";
+let _ = check_const "Refine_M::R_0::State" "Refine_M::R_0";
+let _ = check_const "Refine_M::R_0::Nested::State" "Refine_M::R_0";
+let _ = check_const "AnonClass_User::State" "";
+let _ = ensure (is_anon_cls "AnonClass_1::Nested");
+let _ = ensure (is_anon_cls "Refine_M::R_0::Nested");
+let _ = ensure (if is_anon_cls "AnonClass_User" then false else true);
+let _ = ensure (if is_anon_cls "Refine_User" then false else true);
+'''
 with tempfile.TemporaryDirectory(prefix="mere-gc-marks-") as folder:
     folder = Path(folder)
     main = folder / "marks.mere"
-    main.write_text(helpers + probe)
+    main.write_text(owner_header + identity_helper + owner_helpers + helpers + probe + owner_probe)
     generated = subprocess.run([MERE, "-c", str(main)], capture_output=True)
     assert generated.returncode == 0, generated.stderr.decode()
     cfile = folder / "marks.c"

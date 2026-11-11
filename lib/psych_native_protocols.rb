@@ -33,6 +33,7 @@ module Psych
     class YAMLTree
       class Registrar
         IDENTITY = BasicObject.instance_method(:__id__)
+        SAME_OBJECT = BasicObject.instance_method(:equal?)
 
         def initialize
           @obj_to_id = {}
@@ -44,30 +45,52 @@ module Psych
 
         def register(target, node)
           key = IDENTITY.bind(target).call
-          table = key == 0 ? @unboxed_nodes : @obj_to_node
-          table[key == 0 ? target : key] = [target, node]
+          if key == 0
+            @unboxed_nodes[target] = [target, node]
+          elsif entry = entry_for(@obj_to_node, key, target)
+            entry[1] = node
+          else
+            @obj_to_node[key] = [target, node, @obj_to_node[key]]
+          end
         end
 
         def key?(target)
           key = IDENTITY.bind(target).call
-          key == 0 ? @unboxed_nodes.key?(target) : @obj_to_node.key?(key)
+          key == 0 ? @unboxed_nodes.key?(target) : !!entry_for(@obj_to_node, key, target)
         end
 
         def id_for(target)
           key = IDENTITY.bind(target).call
           table = key == 0 ? @unboxed_ids : @obj_to_id
-          key = target if key == 0
-          entry = table[key]
+          entry = key == 0 ? table[target] : entry_for(table, key, target)
           unless entry
             @counter += 1
-            table[key] = entry = [target, @counter]
+            if key == 0
+              table[target] = entry = [target, @counter]
+            else
+              table[key] = entry = [target, @counter, table[key]]
+            end
           end
           entry[1]
         end
 
         def node_for(target)
           key = IDENTITY.bind(target).call
-          (key == 0 ? @unboxed_nodes[target] : @obj_to_node[key])[1]
+          (key == 0 ? @unboxed_nodes[target] : entry_for(@obj_to_node, key, target))[1]
+        end
+
+        private
+
+        # Numeric IDs from different native value stores can overlap. Keep the
+        # indexed lookup, but resolve collisions by actual, unoverridden identity.
+        # Each entry retains its target for the entire visitor lifetime.
+        def entry_for(table, key, target)
+          entry = table[key]
+          while entry
+            return entry if SAME_OBJECT.bind(entry[0]).call(target)
+            entry = entry[2]
+          end
+          nil
         end
       end
     end
