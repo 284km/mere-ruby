@@ -110,14 +110,23 @@ prism_more(mere_bytes *src, mere_bytes *opts) {
  * -1 is PM_STRING_QUERY_ERROR (the encoding is not ASCII-compatible). */
 int
 prism_query(int kind, mere_bytes *s, const char *encoding_name) {
-    const uint8_t *source = (const uint8_t *) s->data;
     size_t length = (size_t) s->len;
+    if (s->len < 0 || (unsigned long long) s->len >= SIZE_MAX) abort();
+    /* StringQuery's identifier scanner inspects the byte after the logical
+     * slice. Mere bytes have no trailing sentinel; provide the same NUL
+     * boundary as Prism's Ruby/FFI string inputs, independent of reused
+     * region storage. The parser's source-buffer API needs no such copy. */
+    uint8_t *source = (uint8_t *) malloc(length + 1);
+    if (source == NULL) abort();
+    memcpy(source, s->data, length);
+    source[length] = 0;
     pm_string_query_t result;
     switch (kind) {
       case 0: result = pm_string_query_local(source, length, encoding_name); break;
       case 1: result = pm_string_query_constant(source, length, encoding_name); break;
       default: result = pm_string_query_method_name(source, length, encoding_name); break;
     }
+    free(source);
     return (int) result;
 }
 
