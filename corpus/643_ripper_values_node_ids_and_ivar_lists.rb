@@ -2,6 +2,7 @@
 # value an event returned (test/ripper's parse-files Parser answers
 # Object.new for every event).
 require "ripper"
+require "prism"
 
 class Opaque < Ripper
   PARSER_EVENTS.each { |n| define_method("on_#{n}") { |*a| Object.new } }
@@ -28,6 +29,15 @@ begin
   1.+(nil)
 rescue TypeError => e
   p e.backtrace_locations.map { |l| RubyVM::AbstractSyntaxTree.node_id_for_backtrace_location(l) }
+end
+# Two calls of one name on the line: the node is the one that raised, or none
+# at all -- never the call that succeeded.
+begin
+  'first'.upcase; nil.upcase
+rescue NoMethodError => e
+  id = RubyVM::AbstractSyntaxTree.node_id_for_backtrace_location(e.backtrace_locations.first)
+  node = Prism.parse_file(__FILE__).value.breadth_first_search { |n| n.node_id == id }
+  p node.nil? || node.slice == "nil.upcase"
 end
 p((RubyVM::AbstractSyntaxTree.node_id_for_backtrace_location(1) rescue $!))
 p((RubyVM::AbstractSyntaxTree.of(proc { 1 }) rescue $!))

@@ -3909,6 +3909,18 @@ remainder (Ripper) and error_highlight.
     clean with it after the second pass (the first found Random's `__gid`).
     ⚠ A Map made per listing (to drop repeated names) took the same run to
     1.1 GB: a Mere Map is never given back.
+    ⚠ (review) A class's ivars are in the same table under its NAME
+    ("cls:AnonClass_..@"), and they were indexed too -- but the collector's
+    sweep knows object owners only, so every discarded Class.new kept its
+    entry, and a long first name went past the 4 KB bound: 1,200 classes with
+    a 64 KB ivar name, 66 -> 209 MB. Only object ids are indexed now (the
+    reader asks by object id), and the bound holds for a first name;
+    loop_rss_check has the case (2.05x before, 1.04x after). The same entries
+    were what the first push's CI tripped on: class_module_check's
+    test_complemented_method_entry_memory_leak (300,000 turns of Class.new
+    and a refinement, in 10 s) timed out. A key that is no object's is now
+    written without asking the table first, and that loop runs as main's
+    does (5.8 s and 5.7 s locally).
 - **error_highlight goes through Prism in ruby 4.0**: AST.of raises a
   RuntimeError naming prism, and prism_find parses the file and looks for the
   node with node_id_for_backtrace_location's id. Neither existed. A frame
@@ -3919,6 +3931,13 @@ remainder (Ripper) and error_highlight.
   the arguments), and Prism.__node_id_for_location picks that call among the
   line's in the file's Prism tree. The ids are the tree's, the ones ruby's
   Prism compiler numbers: corpus 643 prints the same numbers both ways.
+  ⚠ (review) A line and a name do not identify a call: `'a'.upcase;
+  nil.upcase` raised from the second and the first one answered, so
+  error_highlight would point at a call that succeeded. When more than one
+  node answers, the id is -1 (no node, no snippet) -- unknown rather than
+  wrong. (An operator write and the constant path it writes are one
+  construct: `::X += 1` answers the write.) Two of error_highlight's tests
+  expect no snippet for exactly such a line, and pass for it.
 - **What error_highlight's tests found on the way** (each is a defect outside
   it too):
   - **An exception held as a (class, message) pair had no frames of its
@@ -3971,7 +3990,7 @@ remainder (Ripper) and error_highlight.
   ivar index check on; loop gates (bracket depth 977 of 1024, dead defs, gc
   roots). Locally, against round 21's CI: ripper's six files 55/55 (lib 119 s
   and test_2 83 s, under 1 GB -- 257 s and 242 s before the index),
-  parser_events 165 -> 197, error_highlight 1 -> 105 (274 s), test_ast 2,557
+  parser_events 165 -> 197, error_highlight 1 -> 107 (274 s), test_ast 2,557
   -> 2,559 (313 s, 864 MB; round 20 recorded 1.1 GB); and with the index
   check on, the files the changes touch (exception, backtrace, keyword,
   method, proc, object, struct, module, marshal, class, eval, syntax,

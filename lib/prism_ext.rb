@@ -423,7 +423,9 @@ module Prism
   # Location, which Exception#backtrace_locations writes: the method of the
   # frame inside it, or the innermost frame's NameError name. A frame named
   # like a def on its line is that def (an ArgumentError's callee). With no
-  # name to go by, the first call the line evaluates. -1 when there is no file.
+  # name to go by, the line's only call. -1 when there is no file, and when
+  # more than one node answers: the line and a name do not tell two calls of
+  # one name apart.
   class << self
     def __node_id_for_location(loc) # :nodoc:
       path = loc.absolute_path
@@ -436,21 +438,33 @@ module Prism
       __nid_walk(@__nid_tree[1], line, cands)
       want = loc.instance_variable_get(:@__callee)
       own = loc.base_label.to_s.to_sym
-      pick =
+      tiers =
         if want == :"(entry)"
           # (the frame an ArgumentError of the arguments was raised entering:
           #  the def, or the lambda / block define_method was given)
-          cands.find { |n| n.type == :def_node && n.name == own } ||
-            cands.find { |n| n.type == :lambda_node || n.type == :block_node }
+          [cands.select { |n| n.type == :def_node && n.name == own },
+           cands.select { |n| n.type == :lambda_node || n.type == :block_node }]
         else
-          (want && cands.find { |n| __nid_call?(n) && __nid_names(n).include?(want) }) ||
-            # (a method written in C has a frame of its own, on its caller's
-            #  line, named for the method: Integer#+)
-            cands.find { |n| __nid_call?(n) && __nid_names(n).include?(own) } ||
-            cands.find { |n| n.type == :call_node } ||
-            cands.find { |n| __nid_call?(n) }
+          [want ? cands.select { |n| __nid_call?(n) && __nid_names(n).include?(want) } : [],
+           # (a method written in C has a frame of its own, on its caller's
+           #  line, named for the method: Integer#+)
+           cands.select { |n| __nid_call?(n) && __nid_names(n).include?(own) },
+           cands.select { |n| n.type == :call_node },
+           cands.select { |n| __nid_call?(n) }]
         end
-      pick ? pick.node_id : -1
+      # (the first way of asking that finds anything decides, and it must
+      #  find ONE: `'a'.upcase; nil.upcase` has two calls named upcase on
+      #  the line, and which one raised is not known here -- -1, no node,
+      #  rather than a call that succeeded)
+      found = tiers.find { |t| !t.empty? }
+      # (...but an operator write and the constant path it writes are one
+      #  construct, not two calls: `::X += 1` answers the write, as ruby's id
+      #  does)
+      if found && found.size > 1
+        targets = found.filter_map { |n| n.target.node_id if n.respond_to?(:target) }
+        found = found.reject { |n| targets.include?(n.node_id) }
+      end
+      found && found.size == 1 ? found[0].node_id : -1
     end
 
     private
