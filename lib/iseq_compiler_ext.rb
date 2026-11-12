@@ -577,6 +577,17 @@ class RubyVM::InstructionSequence
       end
     end
 
+    # (parse_string_symbol: an escape can force the symbol's encoding --
+    #  UTF-8, binary, US-ASCII -- over the source's)
+    def symbol_value(n)
+      str = n.unescaped.dup
+      if n.forced_utf8_encoding? then str.force_encoding(Encoding::UTF_8)
+      elsif n.forced_binary_encoding? then str.force_encoding(Encoding::BINARY)
+      elsif n.forced_us_ascii_encoding? then str.force_encoding(Encoding::US_ASCII)
+      end
+      str.to_sym
+    end
+
     def static_value(n)
       case n
       when Prism::ArrayNode then n.elements.map { |e| static_value(e) }.freeze
@@ -584,7 +595,7 @@ class RubyVM::InstructionSequence
       when Prism::TrueNode then true
       when Prism::FalseNode then false
       when Prism::StringNode then n.unescaped.dup.freeze
-      when Prism::SymbolNode then n.unescaped.to_sym
+      when Prism::SymbolNode then symbol_value(n)
       when Prism::HashNode then n.elements.to_h { |e| [static_value(e.key), static_value(e.value)] }.freeze
       when Prism::RangeNode
         Range.new(n.left && static_value(n.left), n.right && static_value(n.right), n.exclude_end?).freeze

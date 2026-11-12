@@ -4292,3 +4292,45 @@ Round 32 of note 548. corpus 653.
   ruby/test_optimization 8 -> 7.
 - Still refused: shareable_constant_value beyond `X = literal`, pattern
   matching, interpolated regexps, class variables, ensure inlining; the VM.
+
+## 2026-11-13 (50): round 33 -- the VM's first form: ISeq#eval runs a top-level sequence's instructions
+
+Round 33 of note 548 (§6). corpus 654.
+
+- **The VM** (main.mere, `and` members of the eval_e chain; entered as
+  RubyVM::InstructionSequence.__vm_run with the sequence's to_a): the body
+  decoded once (labels to indices), a value stack and a pc, its own
+  top-level frame (backtraces as ruby's), locals by name through the
+  local table. ISeq#eval runs a :top sequence on it when every instruction
+  is one it has: the stack and literal instructions, locals (level 0),
+  ivars, globals, constant reads and a top-level constant write, sends
+  (FCALL / VCALL, keywords, splats, &.) and every opt_* that is a send,
+  the freeze / newarray / duparray forms, interpolation, splat / concat /
+  expandarray, jump / branchif / branchunless / branchnil / leave,
+  opt_case_dispatch (its key popped and the `===` sends that follow run,
+  ruby's own path when === is redefined), opt_new (its plain send).
+- **A send is the parser's expression for it** (EBin / EUn / ECall /
+  EMethod / SPuts) evaluated with the values in hidden locals: invoke_val_c
+  alone skips EMethod's frozen, chilled-string and in-place paths. Each
+  send's hidden scope is pooled and given back; the stack's live values are
+  rooted. Peak memory does not grow with the loop.
+- **Refused, the whole sequence before it starts** (it runs on the evaluator
+  as before): blocks, definemethod, defineclass, throw, invokeblock,
+  invokesuper, checkmatch, defined, a kept catch table, a local above level
+  0, a block argument, Kernel functions that read the caller's frame, a
+  TracePoint hook, the frozen-string-literal debug options, and a
+  sequence the compiler refuses or fails on. `MERE_ISEQ_VM=strict` raises
+  instead of falling back; `#__vm?` says which way it would run.
+- **Checked**: tools/iseq/vm_check.sh compares ruby's ISeq#eval with this VM
+  (strict) on 61 snippets: 61 / 61. The compiler took a symbol's encoding
+  from Prism's forced-encoding flags (parse_string_symbol): a US-ASCII
+  source's `:"\xC3\xA9"` raised EncodingError (test_compile_prism's
+  test_SymbolNode). ⚠ `:"\xC3\xA9"` in a UTF-8 source is BINARY in ruby
+  though Prism's flag says UTF-8: not matched yet, not among the snippets.
+- **The cost**: every ISeq#eval now compiles its source with the Ruby-written
+  compiler -- 0.5 s and ~220 MB to load it once, then ~15 ms to parse and
+  ~30 ms to compile a few lines. test_compile_prism 4 s -> 85 s (within
+  the 600 s bound). The VM's loop is about twice the evaluator's time.
+  Both are for later rounds (note 548: the target is the evaluator's speed).
+- Next: blocks (a small AST forwarder into run_block), def / class, the
+  catch table (try_or and flow_sig), line / call events.
