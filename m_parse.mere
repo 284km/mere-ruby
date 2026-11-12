@@ -5971,7 +5971,7 @@ and line_mark = fn (ln: int) -> fn (acc: Stmt list) ->
   let p9 = prev_line_mark acc in
   if p9 == ln then SLineQ ln
   else if p9 < 0 && ln == pstmt_cur () then SLineQ ln
-  else SLine ln
+  else (let _ = cov_note ln in SLine ln)
 // A `begin ... end` statement is no :line itself: its body's first statement
 // is, on the begin's line too (ruby marks the body, not the keyword)
 and begin_mark = fn toks -> fn (s: Stmt) -> fn (ln: int) -> fn (acc: Stmt list) ->
@@ -5982,7 +5982,7 @@ and begin_mark = fn toks -> fn (s: Stmt) -> fn (ln: int) -> fn (acc: Stmt list) 
 and head_fire = fn (b: Stmt list) -> fn (ln: int) ->
   match b with
   | Cons (SFile f, t) -> Cons (SFile f, head_fire t ln)
-  | Cons (SLineQ n, t) when n == ln -> Cons (SLine n, t)
+  | Cons (SLineQ n, t) when n == ln -> (let _ = cov_note n in Cons (SLine n, t))
   | _ -> b
 // `..` / `...` with nothing after it on its line: a range's operator, not
 // the start of a beginless one
@@ -7857,15 +7857,49 @@ and scv_lit = fn (n: str) -> fn (e: Expr) ->
   | _ -> if scv_is_lit e then e else scv_call "__scv_check" (Cons (e, Cons (EStrL n, Nil)))
 and scv_lits = fn (n: str) -> fn (es: Expr list) ->
   match es with Nil -> Nil | Cons (x, t) -> Cons (scv_lit n x, scv_lits n t)
+// A literal statement whose value nothing uses -- one that is not the last
+// of its list, or the last of a branch of an if / case / while body that is
+// itself unused -- compiles to nothing in ruby and has no :line event (nor a
+// line in Coverage's lines): its SLine is an SLineQ. The last statement of a
+// list is used unless what holds the list says otherwise (`3` ending a file
+// or a method answers; `:yes` in an `if` with more after it does not).
+and void_lit = fn (e: Expr) ->
+  match e with
+  | EInt _ -> true | EBig _ -> true | EFlt _ -> true | ERat _ -> true | EImag _ -> true | EImagF _ -> true
+  | EImagRat _ -> true | EStrL _ -> true | EBool _ -> true | ENil -> true | ESym _ -> true | ESelf -> true
+  | _ -> false
+and void_real = fn (ss: Stmt list) ->
+  match ss with
+  | Nil -> false
+  | Cons (SLine _, t) -> void_real t | Cons (SLineQ _, t) -> void_real t | Cons (SFile _, t) -> void_real t
+  | Cons (_, _) -> true
+and void_marks = fn (ss: Stmt list) -> fn (lastvoid: bool) ->
+  match ss with
+  | Nil -> ss
+  | Cons (SLine n, Cons (SExpr e, rest)) when n > 0 && void_lit e && (lastvoid || void_real rest) ->
+    let _ = cov_unnote n in
+    Cons (SLineQ n, Cons (SExpr e, void_marks rest lastvoid))
+  | Cons (SIf (cl, el), rest) ->
+    (let v = lastvoid || void_real rest in
+     let rec cls = fn (xs: (Expr * Stmt list) list) ->
+       (match xs with Nil -> xs | Cons ((c, b), t) -> Cons ((c, void_marks b v), cls t)) in
+     Cons (SIf (cls cl, void_marks el v), void_marks rest lastvoid))
+  | Cons (SCase (subj, ws, el), rest) ->
+    (let v = lastvoid || void_real rest in
+     let rec cls = fn (xs: (Expr list * Stmt list) list) ->
+       (match xs with Nil -> xs | Cons ((c, b), t) -> Cons ((c, void_marks b v), cls t)) in
+     Cons (SCase (subj, cls ws, void_marks el v), void_marks rest lastvoid))
+  | Cons (SWhile (c, b), rest) -> Cons (SWhile (c, void_marks b true), void_marks rest lastvoid)
+  | Cons (s, rest) -> Cons (s, void_marks rest lastvoid)
 and parse_stmts = fn toks -> fn (acc: Stmt list) ->
   let (t, skipped) = skip_nls_n toks 0 in
   let _ = parse_line_add skipped in
   match t with
-  | Cons (TEOF, _) -> (unreach_list (rev_app acc Nil), t)
+  | Cons (TEOF, _) -> (void_marks (unreach_list (rev_app acc Nil)) false, t)
   // (a shareable_constant_value comment: the mode for what follows)
   | Cons (TId id, r9) when scv_marker id -> (let _ = scv_set id in parse_stmts r9 acc)
   | Cons (TId id, _) ->
-    if is_block_stop id then (unreach_list (rev_app acc Nil), t)
+    if is_block_stop id then (void_marks (unreach_list (rev_app acc Nil)) false, t)
     else
       let ln = tok_line t in
       let acc = (match acc with
@@ -10006,7 +10040,7 @@ and parse_if_tail = fn toks ->
       // ...as an `if` in the else, behind a line marker: the elsif's
       // condition is a :line of its own (Bug #10763), unless it is on the
       // if's line
-      (Nil, Cons ((if eln > 0 && (if eln == pstmt_cur () then false else true) then SLine eln else SLineQ eln),
+      (Nil, Cons ((if eln > 0 && (if eln == pstmt_cur () then false else true) then (let _ = cov_note eln in SLine eln) else SLineQ eln),
                   Cons (SIf (Cons ((c, b), clauses), els), Nil)), r4)
     else (let __fm = ("mere-ruby: expected elsif/else/end, got " ++ id ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated if" ++ parsing_file ()))) in fail ("mere-ruby: unterminated if" ++ parsing_file ()))
@@ -11264,7 +11298,12 @@ and parse_def_tail_in = fn (name: str) -> fn (params: str list) -> fn (defs: (st
        // (a body of parenthesised statements -- `def one = (a = 1; a)` -- is
        //  a statement list of the method's own, and ruby's :line fires for it)
        let _ = (if endless_stmts_body e then map_set parser_flags "defstmts" VNil else ()) in
-       let b4 = (if ln4 > 0 then Cons (SLine ln4, Cons (SExpr e, Nil)) else Cons (SExpr e, Nil)) in
+       // (an SLineQ: it sets the line -- `def m = caller(0)` -- and is no :line
+       //  event, ruby's endless body having no line of its own; Coverage
+       //  does not count the line again at every call. A body of
+       //  parenthesised statements is a list of its own, and makes one.)
+       let b4 = (if ln4 > 0 then Cons ((if endless_stmts_body e then (let _ = cov_note ln4 in SLine ln4) else SLineQ ln4), Cons (SExpr e, Nil))
+                 else Cons (SExpr e, Nil)) in
        (SDef (name, params, defs, (if str_eq f4 "" then b4 else Cons (SFile (bx_tag f4), b4))), r4)
      else parse_def_body name params defs r2
    | _ -> parse_def_body name params defs r2)

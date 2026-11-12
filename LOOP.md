@@ -4060,3 +4060,43 @@ corpus 647.
 - Left: test_prelude_gems_and_loaded_features (ruby preloads bundled_gems
   and error_highlight at boot; stage 6 / error_highlight's), -ext-/box (C
   extensions), a fiber resumed mid-body keeps its resumer's box.
+
+## 2026-11-12 (44): round 27 -- Coverage over the interpreter's own counts, and line events where ruby puts them
+
+Round 27 of note 545 (stage 10's coverage): coverage/test_coverage 46 RED
+(the file died on `coverage.so`) -> 12 locally, all ten branch tests and
+the two that need ruby's line for a multi-line statement's event. corpus 648.
+
+- **Coverage** ships as Ruby (lib/coverage_ext.rb through
+  gen_pathname_lib.rb, `require "coverage"` and "coverage.so") over natives
+  on Coverage: setup / start / resume / suspend / result(stop:, clear:) /
+  peek_result / state / running? / supported? / line_stub with ruby's
+  refusals and the compatible mode's bare Array.
+- **Lines**: a file read while coverage is set up (require, load; an eval
+  given a file name with eval: true, numbered from the line given; the main
+  script when -r started it, its lines noted by parsing it again) is
+  covered. Its executable lines are the parser's SLine marks (cov_note) --
+  exactly where TracePoint's :line fires, so the two cannot disagree -- and
+  each SLine run counts (cov_line: the statement arms, the class-body walker
+  and the native definition paths that replay positions). oneshot_lines keeps
+  the first-run order; clear leaves a oneshot line run, as ruby's hook is
+  gone.
+- **Methods**: counted where a method body starts (run_meth_result, and
+  call_method for a top-level one), an alias's calls for its original
+  (alias_srcname); the result's [owner, name, first line/column, last
+  line/column] is the definition read with the shipped Prism -- a def, a
+  define_method's block, or the proc handed to it.
+- **Line events where ruby puts them** (TracePoint too): a literal statement
+  whose value nothing uses -- not last in its list, or last in a branch of
+  an unused if / case / while body -- compiles to nothing in ruby and has no
+  :line event (void_marks makes its SLine an SLineQ); an endless def's body
+  marker is an SLineQ (it sets the line for caller(0), no event, no count);
+  TracePoint#lineno of an eval numbered from below 1 is unbiased (it said
+  1073741822 for -2).
+- General fixes on the way: `define_method(:m, &pr)` reports the proc's
+  source_location; Array/Hash#inspect asks a String subclass's own #inspect
+  (test_coverage's DummyConstant is `def inspect = self`).
+- Left: branch coverage (the structure needs each if / while / case / &.
+  target's execution tied to Prism's node; the AST keeps no position), and
+  the line of a multi-line statement's event (ruby's is its first
+  instruction's: `FOO = [` with a hash on the next line fires on that line).
