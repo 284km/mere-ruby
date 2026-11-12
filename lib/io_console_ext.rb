@@ -153,6 +153,43 @@ class IO
     self
   end
 
+  # The terminal's settings as an object (console.c's conmode): read off the
+  # descriptor -- a stream that is no terminal is its errno, ENOTTY --
+  # changed on the object, and written back with #console_mode=.
+  class ConsoleMode
+    VERSION = "0.8.1"
+    class << self
+      undef_method :new
+    end
+    def self.__of(a)
+      m = allocate
+      m.instance_variable_set(:@__a, a)
+      m
+    end
+    def initialize_copy(o)
+      a = o.instance_variable_get(:@__a)
+      @__a = a[0, 6] + [a[6].dup]
+      self
+    end
+    def echo=(on)
+      ConsoleTermios__.echo!(@__a, on)
+      self
+    end
+    def raw!(min: nil, time: nil, intr: nil)
+      ConsoleTermios__.raw!(@__a, *ConsoleTermios__.raw_opts(min, time, intr))
+      self
+    end
+    def raw(min: nil, time: nil, intr: nil) = dup.raw!(min: min, time: time, intr: intr)
+  end
+
+  def console_mode = ConsoleMode.__of(ConsoleTermios__.get(self))
+
+  def console_mode=(mode)
+    raise TypeError, "wrong argument type #{mode.class} (expected io/console/conmode)" unless ConsoleMode === mode
+    ConsoleTermios__.set(self, mode.instance_variable_get(:@__a))
+    mode
+  end
+
   def echo=(on)
     IO::ConsoleTermios__.set(self, IO::ConsoleTermios__.echo!(IO::ConsoleTermios__.get(self), on))
     on

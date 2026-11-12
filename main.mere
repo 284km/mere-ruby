@@ -6758,7 +6758,9 @@ and ractor_ivar_check = fn env -> fn world -> fn (self9: Val) -> fn (name: str) 
         else raise_exc world "Ractor::IsolationError"
                ("can not get unshareable values from instance variables of classes/modules from non-main Ractors (@" ++ name ++ " from " ++ cls_display world c9 ++ ")"))
      | VObj _ ->
+       // (...and ENV's: shareable, not frozen -- test_env)
        (if str_eq (dispatch_cls_of world self9) "Ractor" || str_eq (dispatch_cls_of world self9) "Ractor::Port"
+           || env_is_recv world self9 "instance_variable_get"
         then raise_exc world "Ractor::IsolationError" "can not access instance variables of shareable objects from non-main Ractors"
         else v)
      | _ -> v)
@@ -14061,8 +14063,11 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // printers, and only one of them could see the groups.
     // a Method / UnboundMethod prints as ruby writes it, not as the object it
     // is made of: `p method(:foo)` showed @~m_name and the rest.
-    else if str_eq cls "Method" || str_eq cls "UnboundMethod" then
-      (let gv9 = fn (k: str) ->
+    // (...through a singleton class too: `def m.to_s` on one does not make
+    //  it an object of some other kind -- test_ractor's shareability error)
+    else if (let c9 = (if is_sng_cls cls then sng_supername world cls else cls) in str_eq c9 "Method" || str_eq c9 "UnboundMethod") then
+      (let cls = (if is_sng_cls cls then sng_supername world cls else cls) in
+       let gv9 = fn (k: str) ->
          if str_eq k "@~m_name" then method_text (method_core_field oid 0)
          else if str_eq k "@~m_owner" || str_eq k "@~um_cls" then method_text (method_core_field oid 1)
          else if str_eq k "@~um_name" then method_text (method_core_field oid 0)
@@ -18429,6 +18434,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // for Ractor.new, which refused outer locals already
     else if str_eq c "Ractor" && (str_len name == 9 && str_eq name "__isolate") then
       (match args with
+       // (how 4: only the C-function check -- vm.c refuses such a block
+       //  before it looks at the block's self)
+       | Cons (VProc pid9, Cons (VInt 4, _)) ->
+         (let (_, _, _, ce9) = map_get proc_store (str_of_int pid9) in
+          if map_has ce9 "__h_self" || map_has ce9 "__m_self" then raise_exc world "RuntimeError" "not supported yet" else VNil)
        | Cons (VProc pid9, Cons (VInt how9, rest9)) -> proc_isolate env world pid9 how9 (match rest9 with Cons (s9, _) -> s9 | Nil -> VNil)
        | _ -> VNil)
     // the standard streams of the ractor this thread runs
@@ -24847,7 +24857,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        then arr_new own9
        else arr_new (list_append own9 (sng_mixin_syms world (map_get ocls id) own9)))
     else if (str_len name == 21 && str_eq name "instance_variable_get") then
-      (match args with Cons (v, _) -> let k = str_of_int id ++ "@" ++ ivar_name_val_r env world recv v in (if map_has ivars k then map_get ivars k else VNil) | _ -> VNil)
+      (match args with
+       | Cons (v, _) ->
+         let n9 = ivar_name_val_r env world recv v in
+         let k = str_of_int id ++ "@" ++ n9 in
+         let v9 = (if map_has ivars k then map_get ivars k else VNil) in
+         // (a shareable object's, from a non-main ractor, as `@x` is)
+         if map_len ractor_thr == 0 then v9 else ractor_ivar_check env world recv n9 false v9
+       | _ -> VNil)
     else if (str_len name == 21 && str_eq name "instance_variable_set") then
       // the NAME is checked first: `nil.instance_variable_set(:foo, 42)` is a
       // NameError about the name, not a FrozenError about nil.
@@ -25467,7 +25484,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | Cons (VObj tid2, _) ->
             // moving into an enclosed group — or out of one — is ThreadError.
             let cur_grp = (if map_has ivars (str_of_int tid2 ++ "@__tgrp") then map_get ivars (str_of_int tid2 ++ "@__tgrp")
-                           else if map_has dfl_tg "v" then map_get dfl_tg "v" else VNil) in
+                           else dfl_tg_of world tid2) in
             let grp_enc = fn (g: Val) ->
               (match g with VObj gid2 -> map_has ivars (str_of_int gid2 ++ "@__tgenc") | _ -> false) in
             let grp_frz = fn (g: Val) -> (match g with VObj gid2 -> ofrozen_get gid2 | _ -> false) in
@@ -25487,7 +25504,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              | VObj tid2 ->
                (let alive2 = (match (if map_has ivars (str_of_int tid2 ++ "@__tst") then map_get ivars (str_of_int tid2 ++ "@__tst") else VBool false) with VStr _ -> true | _ -> false) in
                 let grp = (if map_has ivars (str_of_int tid2 ++ "@__tgrp") then map_get ivars (str_of_int tid2 ++ "@__tgrp")
-                           else if map_has dfl_tg "v" then map_get dfl_tg "v" else VNil) in
+                           else dfl_tg_of world tid2) in
                 if alive2 && rb_eq grp recv then (let i2 = map_len out in map_set out (str_of_int i2) t) else ())
              | _ -> ())) in
           arr_new (idx_to_list out 0 (map_len out)))
@@ -26272,11 +26289,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if str_eq cls "EnvHash"
             && (str_len name == 6 && str_eq name "freeze") then
       raise_exc world "TypeError" "cannot freeze ENV"
+    // (...but ENV is an object of its own to instance_eval and its instance
+    //  variables: `ENV.instance_eval { @a = 1 }` sets ENV's, and a non-main
+    //  ractor is refused them -- test_env)
     else if str_eq cls "EnvHash"
             && (if is_prim_method name
                 then (str_len name == 4 && str_eq name "to_s") || (str_len name == 7 && str_eq name "inspect")
                      || (str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone")
-                else true) then
+                else (if str_eq name "instance_eval" || str_eq name "instance_exec" || str_eq name "instance_variable_get"
+                         || str_eq name "instance_variable_set" || str_eq name "instance_variables"
+                         || str_eq name "instance_variable_defined?" || str_eq name "remove_instance_variable"
+                      then false else true)) then
       // ENV takes STRINGS, and ruby asks an object for #to_str before using it
       // as one. Delegating to a plain Hash without asking meant an object that
       // names a key looked up NOTHING (no match, no error), and a value that
@@ -28383,7 +28406,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             thread_fetch env world blk tid args (false, (Nil : str list), (Nil : Stmt list), env)
           else if (str_len name == 5 && str_eq name "group") then
             (if map_has ivars (k ++ "@__tgrp") then map_get ivars (k ++ "@__tgrp")
-             else if map_has dfl_tg "v" then map_get dfl_tg "v" else VNil)
+             else dfl_tg_of world tid)
           // the two flags are remembered (a thread here never runs after
           // it is made, so nothing ever consults them)
           else if (str_len name == 18 && str_eq name "abort_on_exception") then
@@ -29347,6 +29370,12 @@ and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                               | VObj oid9 ->
                                                 (let (_, _, oc9, _) = world in
                                                  ("#<" ++ cls_display world (obj_print_cls world (map_get oc9 oid9)) ++ ":0x" ++ hex_pad16 (oid9 - handle_base) ++ ">", "UTF-8"))
+                                              // (...an immediate too -- nil, true, an Integer, a
+                                              //  Symbol -- whose address is its object_id in ruby 4)
+                                              | VNil -> (any_to_s_imm env world blk v, "UTF-8")
+                                              | VBool _ -> (any_to_s_imm env world blk v, "UTF-8")
+                                              | VInt _ -> (any_to_s_imm env world blk v, "UTF-8")
+                                              | VSym _ -> (any_to_s_imm env world blk v, "UTF-8")
                                               | _ -> (to_s other, "UTF-8")))))
                        | _ -> ("", "UTF-8")) in
        // (a US-ASCII piece is ASCII only: a UTF-8 string takes it as it is,
@@ -29363,6 +29392,22 @@ and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
               (if str_eq ie "" && (match dstr_lit_of p with (true, _, _) -> false | _ -> true) && (if str_eq (enc_canon_name e9) "US-ASCII" then false else true)
                then enc_canon_name e9 else ie)) in
   go ps "" (if multi then "" else seed_enc) ""
+// the ThreadGroup a thread is in when none was chosen: ThreadGroup::Default,
+// or -- in a ractor other than main -- that ractor's own default group, made
+// when first asked (a ractor's threads are not main's)
+and dfl_tg_of = fn world -> fn (tid: int) ->
+  if map_len ractor_thr > 0 && map_has ractor_thr tid && map_get ractor_thr tid != 0 then
+    (let k9 = "r" ++ str_of_int (map_get ractor_thr tid) in
+     if map_has dfl_tg k9 then map_get dfl_tg k9
+     else (let (_, _, oc9, _) = world in
+           let g9 = alloc_oid oc9 in
+           let _ = map_set oc9 g9 "ThreadGroup" in
+           let _ = map_set dfl_tg k9 (VObj g9) in
+           VObj g9))
+  else if map_has dfl_tg "v" then map_get dfl_tg "v" else VNil
+and any_to_s_imm = fn env -> fn world -> fn blk -> fn (v: Val) ->
+  "#<" ++ display_cls world (dispatch_cls_of world v) ++ ":0x"
+  ++ hex_pad16 (match invoke_val_c env world blk v "object_id" Nil false with VInt n9 -> n9 | _ -> 0) ++ ">"
 // does the program redefine + - or * on a class a Complex's parts can be?
 and cpx_ops_redef = fn world ->
   let rec cls = fn (cs: str list) ->
@@ -30585,6 +30630,11 @@ and raise_exc_str = fn world -> fn (cls: str) -> fn (msg: str) ->
 and proc_isolate = fn env -> fn world -> fn (pid9: int) -> fn (how9: int) -> fn (self9: Val) ->
   let k9 = str_of_int pid9 in
   let (h9, ps9, body0, cenv9) = map_get proc_store k9 in
+  // (a proc the interpreter made for a Hash's or a Method's #to_proc is
+  //  ruby's C-function block, which vm.c will not isolate)
+  let _ = (if map_has cenv9 "__h_self" || map_has cenv9 "__m_self" then
+             (let _ = raise_exc world "RuntimeError" "not supported yet" in ())
+           else ()) in
   let (_, _, body9, _) = proc_as_block pid9 in
   let outer9 = proc_outer_names pid9 in
   // (the parser's chr 7 note on the block: its scope's names assigned twice)
@@ -32268,7 +32318,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
     // own semantics for each / each_pair / select / reject / delete_if /
     // keep_if / partition / group_by / sum / min_by / ... instead of an arm per
     // name, each written once and each able to be subtly different.
-    else if env_is_recv world recv name then
+    // (instance_eval / instance_exec run on ENV itself: its own ivars)
+    else if env_is_recv world recv name && (if str_eq name "instance_eval" || str_eq name "instance_exec" then false else true) then
       (// ⚠ a mutator this does not know about must not run on the copy and
        //   report success while the environment stands still. Ends in ! or = is
        //   a rule; the ones that end in neither are named.
@@ -40444,7 +40495,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VInt n when n > 0 - 4611686018427387903 && n < 4611686018427387903 -> VInt (2 * n + 1)
      | VInt n -> arith_bin "+" (arith_bin "*" (VInt 2) (VInt n)) (VInt 1)
      | VBig _ -> arith_bin "+" (arith_bin "*" (VInt 2) recv) (VInt 1)
-     | VNil -> VInt 8
+     // (ruby 4.0's Qnil is 4 -- 8 was 3.x's)
+     | VNil -> VInt 4
      | VBool b -> VInt (if b then 20 else 0)
      | VSym sy -> VInt (sym_id_of sy)
      | VObj id -> VInt (public_identity_id 2 (id - handle_base))

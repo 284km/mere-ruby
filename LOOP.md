@@ -4100,3 +4100,48 @@ the two that need ruby's line for a multi-line statement's event. corpus 648.
   target's execution tied to Prism's node; the AST keeps no position), and
   the line of a multi-line statement's event (ruby's is its first
   instruction's: `FOO = [` with a hash on the next line fires on that line).
+
+## 2026-11-12 (45): round 28 -- the stage 3 tail's Ractor edges, ENV as an object, and immediates interpolated as ruby 4.0 writes them
+
+Round 28 of note 545: the stage 3 tail (31 files, 51 RED in round 25's CI)
+run locally, its Ractor and object items fixed; ruby/test_ractor 4 -> 0,
+test_env 1 -> 0, etc/test_etc 1 -> 0, io/console/test_ractor 1 -> 0, and
+test_optimization's objtostring / optimized_rescue. corpus 649.
+
+- **A non-main ractor**: `fork` is Ractor::IsolationError ("can not fork
+  from non-main Ractors", rb_fork_ruby); Etc's database calls -- what
+  etc.c defines after RB_EXT_RACTOR_SAFE(false) -- are Ractor::UnsafeError;
+  ENV's instance variables are refused (ENV is shareable and not frozen),
+  through instance_variable_get as through `@x`; each ractor has its own
+  default ThreadGroup, made when first asked (dfl_tg_of).
+- **make_shareable**: a Method's error names it as it inspects -- through a
+  singleton class too (`def m.to_s` on one no longer printed the object's
+  bookkeeping) -- "because it refers unshareable objects"; a Hash's or a
+  Method's #to_proc is ruby's C-function block, refused "not supported yet"
+  before its self is looked at (vm.c's order).
+- **ENV is an object of its own** to instance_eval / instance_exec and to
+  instance_variable_get/set (they went to a Hash copy of the environment).
+- **Immediates**: `"#{x}"` where x's #to_s answers no String is rb_any_to_s
+  for nil, true, an Integer and a Symbol too (their address is the object
+  id in ruby 4.0), and nil's object_id is 4 (Qnil in 4.0; 8 was 3.x's).
+- `ruby ""` reads the program from standard input, $0 "-" (ruby treats an
+  empty script name as `-`; assert_in_out_err("", ...) passes one).
+- IO#console_mode / #console_mode= and IO::ConsoleMode (echo=, raw, raw!,
+  dup) over the termios the io/console port already reads -- a stream that
+  is no terminal is its errno.
+- RubyVM.keep_script_lines as the option it is.
+- ⚠ **Backticks in several threads read one another's output**: a backtick
+  off the main thread runs through Process.__bt_async, which named its
+  output file from a counter taken in two steps -- two threads met in
+  between and shared a file (`echo 4` answered "3\n"). Found as test_etc's
+  ractor_parallel failing now and then (ten ractors asking getconf through
+  Etc.sysconf), on Linux CI and here. The counter is taken once, and the
+  file is the thread's.
+- Left in the tail, on purpose: the heap-shape ones (size pools, embedding,
+  shapes, memsize, warmup's old/compact), the memory-leak tests that time
+  out on this interpreter's speed, callcc, `<internal:gc>`'s line event,
+  three that depend on which earlier test loaded tmpdir/tempfile (ruby
+  errors too when they run alone), and two performance items found here:
+  a compare_by_identity Hash has no index (every lookup walks it), and
+  #instance_variables walks every object's ivars -- test_object_id_race_free
+  times out on both.
