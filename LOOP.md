@@ -4264,3 +4264,31 @@ Round 31 of note 548: the ISeq compiler's second round. corpus 652.
   required; the test order decides).
 - Not yet: the VM; ensure inlining; pattern matching; interpolated regexps;
   a splat with keywords; class variables.
+
+## 2026-11-12 (49): round 32 -- every call argument shape, the op-assigns, alias / undef / backticks, and the parameters left
+
+Round 32 of note 548. corpus 653.
+
+- **pm_setup_args as a whole**: keyword hashes with any key and ** (KW_SPLAT
+  / KW_SPLAT_MUT, pm_compile_hash_elements, which hash literals now share),
+  several splats, a splat with keywords (compile.c's splatarray false +
+  duphash rule is reached now), *, ** and & passed on, `...` both through
+  its locals and in a forwardable method (sendforward, invokesuperforward),
+  splatkw, yield and super through the same setup.
+- **The op-assigns**: $g / C / A::B / r.x / r[i] with ||=, &&= and op=, &.
+  included; constant paths through a value and constants without the
+  inline cache (pm_compile_constant_path); alias (methods and globals),
+  undef, `backticks` with and without interpolation.
+- **Parameters**: destructured ones (the hidden locals, expandarray before the
+  body), `...`, keyword defaults that are not literals (checkkeyword).
+- Found by comparing about 27,000 methods of ruby's lib/ and test/ against
+  ruby: getblockparam / setblockparam only for the method's own block
+  parameter; `initialize` is use_block; a def or `class << x` has no
+  parent_iseq, so a rescue in it gives the block around no catch table.
+- Each_child takes the catch table's sequences first (iseq_iterate_children):
+  a line inside a rescue clause was missed.
+- **Checked against ruby itself**: 383 snippets exact. prism/newline_test
+  passes whole (54 / 54; 52 failing on main), ruby/test_iseq 33 -> 31,
+  ruby/test_optimization 8 -> 7.
+- Still refused: shareable_constant_value beyond `X = literal`, pattern
+  matching, interpolated regexps, class variables, ensure inlining; the VM.
