@@ -975,6 +975,23 @@ class RubyVM::InstructionSequence
       end
     end
 
+    # -- trace_points: iseq.c's push_event_info order ----------------------
+    def trace_points(u)
+      out = []
+      u.elements.each do |e|
+        next unless e.is_a?(Insn) && !e.events.empty?
+        ev = e.events
+        out << [u.first_lineno, :class] if ev.include?(:class)
+        out << [u.first_lineno, :call] if ev.include?(:call)
+        out << [u.first_lineno, :b_call] if ev.include?(:b_call)
+        out << [e.line, :line] if ev.include?(:line)
+        out << [e.line, :end] if ev.include?(:end)
+        out << [e.line, :return] if ev.include?(:return)
+        out << [e.line, :b_return] if ev.include?(:b_return)
+      end
+      out
+    end
+
     # -- disasm --------------------------------------------------------------
     INSN_NAME_WIDTH = 38
 

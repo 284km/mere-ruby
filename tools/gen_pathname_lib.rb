@@ -39,6 +39,7 @@ files = [[%w[pathname pathname.so], File.read("#{here}/lib/pathname_ext.rb")],
          [%w[prettyprint], File.read("#{here}/lib/prettyprint_ext.rb")],
          [%w[io/console io/console.so], File.read("#{here}/lib/io_console_ext.rb")],
          [%w[coverage coverage.so], File.read("#{here}/lib/coverage_ext.rb")],
+         [%w[__iseq_compiler], File.read("#{here}/lib/iseq_insns_ext.rb") + File.read("#{here}/lib/iseq_compiler_ext.rb").sub(/\A# frozen_string_literal: \w+\n/, "")],
          [%w[io/console/size], File.read("#{here}/lib/io_console_size_ext.rb")],
          [%w[pty pty.so], File.read("#{here}/lib/pty_ext.rb")],
          [%w[expect], File.read("#{here}/lib/expect_ext.rb")]]
