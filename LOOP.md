@@ -3949,6 +3949,13 @@ remainder (Ripper) and error_highlight.
     name needed). A pair kept from `$!` in an ensure and compared with the
     object a later rescue made asks the object's Exception#== (test_exception's
     circular_cause).
+    ⚠ (PR CI) The same in an Array: test_settracefunc's test_tracepoint
+    compares the event list, which holds the pair a TracePoint saw as the
+    self of Exception#initialize, with the object the rescue bound, and
+    Array#== compares structurally unless an element answers a #== of its
+    own -- and it looked only at the left array for one. An object made from
+    a pair is marked (@__from_pair) and equals a pair of its class and
+    message, as two pairs did; Array#== looks at both sides.
   - **A pair's #detailed_message / #full_message went past the program's
     own** (error_highlight prepends one to TypeError and ArgumentError), and
     super from one did not reach Exception's.

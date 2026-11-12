@@ -92,3 +92,12 @@ S3 = Struct.new(:x)
 s = S3.new(1)
 s.instance_variable_set(:@q, 2)
 p s.instance_variables
+
+# The exception a rescue binds equals the one a TracePoint saw being made,
+# alone and inside arrays, from either side.
+seen = nil
+tp = TracePoint.new(:c_call) { |t| seen = t.self if t.method_id == :initialize && t.defined_class == Exception }
+tp.enable
+begin; raise RuntimeError; rescue RuntimeError => bound; end
+tp.disable
+p bound == seen, seen == bound, [bound] == [seen], [seen] == [bound], [[1, seen]] == [[1, bound]]
