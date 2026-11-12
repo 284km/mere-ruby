@@ -3960,3 +3960,33 @@ runner with --ruby=mere-ruby).
   trace_object_allocations (objspace/test_ractor), and GC.start reports no
   `<internal:gc>` line event (test_settracefunc's
   tp_ractor_local_untargeted).
+
+## 2026-11-12 (42): round 25 -- where an object was made, and ObjectSpace.dump's honest fields
+
+Round 25 of note 545 (§5's objspace): objspace/test_objspace 44 failing ->
+32 locally, objspace/test_ractor 2 -> 1.
+
+- **trace_object_allocations records**: while tracing (one per _start not
+  yet stopped, so starts nest), each Object, String, Array and Hash notes
+  its file, line, GC.count and method as it is made -- in alloc_oid,
+  arr_new, mkstr / mkstr_join and mkhash, one slot read when nothing traces.
+  allocation_class_path / _method_id answer the method's class and name; a
+  block's allocations are its own method's (run_block notes the block's home
+  while tracing), a top-level def's class is Object, a singleton method's
+  class path nil, as ruby's. A Float is not recorded (it has no identity
+  here), nor is an allocation charged to the C method that makes it in
+  CRuby (`"x".dup` is String#dup's there). `objspace.so` is the stand-in too,
+  so objspace/trace loads.
+- **ObjectSpace.dump**: an immediate is its own JSON (null, true, 0, a
+  Symbol's `{"type":"SYMBOL", "value":...}`, a flonum's `%#g`), a heap
+  Float's NaN / Inf / -Inf value, a String's value as a JSON string (control
+  characters as `\u00xx`), a class's name, superclass, singleton and
+  real_class_name, an object's ivars, the allocation fields when traced, and
+  shareable. Left out on purpose: shape_id, slot_size, embedded, age and the
+  other flags -- CRuby's heap, not this one's (the ledger's heap shape).
+- ⚠ Round 23's own-locals marker was taken by `BEGIN{q=...}` / `END{...}`,
+  whose `{` the lexer opens as a block's: their body is the top level's, and
+  the marker reached the program as a method call `blocal:q` (test_trick's
+  chopsticks, -1 in round 23's CI). The BEGIN / END parse drops it.
+- Left: reachable_objects_from over each_object (which walks objects, not
+  Arrays); count_symbols' dynamic symbols.
