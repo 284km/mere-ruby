@@ -48,7 +48,11 @@ class RubyVM::InstructionSequence
     Label = Struct.new(:id, :pos, :refs, :sp, :unremovable)
     Insn = Struct.new(:name, :ops, :line, :node_id, :events)
     Trace = Struct.new(:event)
-    Adjust = Struct.new(:label)
+    # (restore: an ADJUST_RESTORE, which only sets the depth; one that is not
+    #  lowers the stack to its label's -- `pop` / `adjuststack` -- at layout)
+    Adjust = Struct.new(:label, :line, :node_id, :restore)
+    IVC = Struct.new(:index)
+    IC = Struct.new(:index, :segments)
     CallData = Struct.new(:mid, :flag, :argc, :kwargs)
 
     # one instruction sequence being built, and what to_a / disasm read off it
@@ -84,7 +88,9 @@ class RubyVM::InstructionSequence
       #  the instruction that follows it when the sequence is laid out, and
       #  goes away with an unreachable chunk)
       def event(e) = @elements << Trace.new(e)
-      def adjust(l) = @elements << Adjust.new(l)
+      def adjust(l, restore = true) = @elements << Adjust.new(l, @line, @node, restore)
+      def next_is = (@is_n = (@is_n || -1) + 1)
+      def next_ic = (@ic_n = (@ic_n || -1) + 1)
       def at(line, node_id) = (@line, @node = line, node_id)
       def line = @line
 
@@ -158,7 +164,7 @@ class RubyVM::InstructionSequence
         body = n.body
         body.each_with_index { |s, i| node(u, s, popped || i < body.size - 1) }
       when Prism::IntegerNode, Prism::FloatNode, Prism::RationalNode, Prism::ImaginaryNode, Prism::SymbolNode
-        u.insn(:putobject, n.value) unless popped
+        u.insn(:putobject, static_value(n)) unless popped
       when Prism::NilNode then u.insn(:putnil) unless popped
       when Prism::TrueNode then u.insn(:putobject, true) unless popped
       when Prism::FalseNode then u.insn(:putobject, false) unless popped
@@ -191,6 +197,39 @@ class RubyVM::InstructionSequence
       when Prism::WhileNode, Prism::UntilNode then loop_node(u, n, popped)
       when Prism::DefNode then define(u, n, popped)
       when Prism::BreakNode then break_node(u, n)
+      when Prism::InstanceVariableReadNode
+        u.insn(:getinstancevariable, n.name, IVC.new(u.next_is)) unless popped
+      when Prism::InstanceVariableWriteNode
+        node(u, n.value, false)
+        here(u, n)
+        u.insn(:dup) unless popped
+        u.insn(:setinstancevariable, n.name, IVC.new(u.next_is))
+      when Prism::GlobalVariableReadNode
+        u.insn(:getglobal, n.name)
+        u.insn(:pop) if popped
+      when Prism::GlobalVariableWriteNode
+        node(u, n.value, false)
+        here(u, n)
+        u.insn(:dup) unless popped
+        u.insn(:setglobal, n.name)
+      when Prism::ConstantWriteNode
+        node(u, n.value, false)
+        here(u, n)
+        u.insn(:dup) unless popped
+        u.insn(:putspecialobject, 3)
+        u.insn(:setconstant, n.name)
+      when Prism::ConstantReadNode, Prism::ConstantPathNode
+        segs = constant_path(n)
+        raise NotImplementedError, "RubyVM::InstructionSequence: a constant path through a value is not compiled yet" unless segs
+        u.insn(:opt_getconstant_path, IC.new(u.next_ic, segs))
+        u.insn(:pop) if popped
+      when Prism::InterpolatedStringNode then dstr(u, n, popped)
+      when Prism::HashNode then hash_node(u, n, popped)
+      when Prism::RangeNode then range_node(u, n, popped)
+      when Prism::AndNode, Prism::OrNode then logical(u, n, popped)
+      when Prism::ReturnNode then return_node(u, n, popped)
+      when Prism::YieldNode then yield_node(u, n, popped)
+      when Prism::ClassNode, Prism::ModuleNode then class_node(u, n, popped)
       when Prism::ParenthesesNode
         if n.body then node(u, n.body, popped) else (u.insn(:putnil) unless popped) end
       else
@@ -229,6 +268,7 @@ class RubyVM::InstructionSequence
       when Prism::TrueNode then true
       when Prism::FalseNode then false
       when Prism::StringNode then n.unescaped.dup.freeze
+      when Prism::SymbolNode then n.unescaped.to_sym
       else n.value
       end
     end
@@ -318,6 +358,7 @@ class RubyVM::InstructionSequence
       if body.is_a?(Prism::StatementsNode)
         node(child, body, false)
       elsif body.nil?
+        child.at(child.line, 0)
         child.insn(:putnil)
       else
         node(child, body, false)
@@ -330,6 +371,174 @@ class RubyVM::InstructionSequence
       here(u, n)
       u.insn(:definemethod, n.name, child)
       u.insn(:putobject, n.name) unless popped
+    end
+
+    # a constant path made of names alone -- `X`, `A::B`, `::C` -- is one
+    # opt_getconstant_path over its segments
+    def constant_path(n)
+      case n
+      when Prism::ConstantReadNode then [n.name]
+      when Prism::ConstantPathNode
+        if n.parent.nil? then [:"", n.name]
+        else (p = constant_path(n.parent)) && p + [n.name]
+        end
+      end
+    end
+
+    # pm_interpolated_node_compile: adjacent literal pieces are one, the
+    # first at the string's own place, a later one at its part's end
+    def dstr(u, n, popped)
+      count = 0
+      cur = nil
+      cur_at = [n.location.start_line, n.node_id]
+      flush = lambda do
+        next unless cur
+        u.at(*cur_at)
+        u.insn(:putobject, cur.freeze)
+        count += 1
+        cur = nil
+      end
+      n.parts.each_with_index do |part, i|
+        case part
+        when Prism::StringNode
+          if cur
+            cur << part.unescaped
+          else
+            cur = part.unescaped.dup
+            cur_at = [part.location.end_line, part.node_id] if i != 0
+          end
+        when Prism::EmbeddedStatementsNode
+          if part.statements.nil? || part.statements.body.empty?
+            raise NotImplementedError, "RubyVM::InstructionSequence: an empty interpolation is not compiled yet"
+          end
+          flush.call
+          node(u, part.statements, false)
+          here(u, part)
+          u.insn(:dup)
+          u.insn(:objtostring, CallData.new(:to_s, CALL_FCALL | CALL_ARGS_SIMPLE, 0, nil))
+          u.insn(:anytostring)
+          count += 1
+        else
+          raise NotImplementedError, "RubyVM::InstructionSequence: #{part.type} in a string is not compiled yet"
+        end
+      end
+      flush.call
+      here(u, n)
+      u.insn(:concatstrings, count)
+      u.insn(:pop) if popped
+    end
+
+    def static_hash?(n)
+      n.elements.all? { |e| e.is_a?(Prism::AssocNode) && static_literal?(e.key) && static_literal?(e.value) }
+    end
+
+    def hash_node(u, n, popped)
+      if n.elements.empty?
+        u.insn(:newhash, 0) unless popped
+      elsif static_hash?(n)
+        h = {}
+        n.elements.each { |e| h[static_value(e.key)] = static_value(e.value) }
+        u.insn(:duphash, h.freeze) unless popped
+      else
+        n.elements.each do |e|
+          raise NotImplementedError, "RubyVM::InstructionSequence: ** in a hash is not compiled yet" unless e.is_a?(Prism::AssocNode)
+          node(u, e.key, false)
+          node(u, e.value, false)
+        end
+        here(u, n)
+        u.insn(:newhash, n.elements.size * 2)
+        u.insn(:pop) if popped
+      end
+    end
+
+    def range_node(u, n, popped)
+      excl = n.exclude_end?
+      lo, hi = n.left, n.right
+      if (lo.nil? || lo.is_a?(Prism::IntegerNode)) && (hi.nil? || hi.is_a?(Prism::IntegerNode))
+        u.insn(:putobject, Range.new(lo&.value, hi&.value, excl)) unless popped
+      else
+        if lo then node(u, lo, false) else u.insn(:putnil) end
+        if hi then node(u, hi, false) else u.insn(:putnil) end
+        here(u, n)
+        u.insn(:newrange, excl ? 1 : 0)
+        u.insn(:pop) if popped
+      end
+    end
+
+    def logical(u, n, popped)
+      l_end = u.new_label
+      node(u, n.left, false)
+      here(u, n)
+      u.insn(:dup) unless popped
+      u.insn(n.is_a?(Prism::AndNode) ? :branchunless : :branchif, l_end)
+      u.insn(:pop) unless popped
+      node(u, n.right, popped)
+      u.emit_label(l_end)
+    end
+
+    # pm_compile_return_node, in a method: leave, with an ADJUST before (the
+    # stack down to the method's) and an ADJUST_RESTORE after
+    def return_node(u, n, popped)
+      scope = u
+      raise NotImplementedError, "RubyVM::InstructionSequence: return from a block is not compiled yet" if scope.type == :block
+      sp_l = u.new_label
+      u.emit_label(sp_l)
+      u.adjust(nil, false)
+      args = n.arguments&.arguments || []
+      raise NotImplementedError, "RubyVM::InstructionSequence: return with values is not compiled yet" if args.size > 1
+      if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+      here(u, n)
+      u.event(:return)
+      u.insn(:leave)
+      u.adjust(sp_l, true)
+      u.insn(:putnil) unless popped
+    end
+
+    def yield_node(u, n, popped)
+      m = u
+      m = m.parent while m.type == :block
+      m.params[:use_block] = true if m.type == :method
+      args = n.arguments&.arguments || []
+      args.each { |a| node(u, a, false) }
+      here(u, n)
+      u.insn(:invokeblock, CallData.new(nil, CALL_ARGS_SIMPLE, args.size, nil))
+      u.insn(:pop) if popped
+    end
+
+    def class_node(u, n, popped)
+      mod = n.is_a?(Prism::ModuleNode)
+      name = n.constant_path.is_a?(Prism::ConstantReadNode) ? n.constant_path.name : n.constant_path.name
+      l = n.location
+      child = Unit.new(:class, "<#{mod ? "module" : "class"}:#{name}>", u.path, u.abs_path, l.start_line, n.locals, u,
+                       [l.start_line, l.start_column, l.end_line, l.end_column], n.node_id)
+      u.children << child
+      child.at(l.start_line, n.node_id)
+      child.event(:class)
+      # (an empty body's putnil is synthetic: node 0)
+      if n.body then node(child, n.body, false) else (child.at(l.start_line, 0); child.insn(:putnil)) end
+      child.event(:end)
+      child.last_line = l.end_line
+      child.at(child.last_line, n.node_id)
+      child.insn(:leave)
+      finish(child)
+      flags = mod ? 2 : 0
+      if n.constant_path.is_a?(Prism::ConstantPathNode)
+        flags |= 8
+        if n.constant_path.parent then node(u, n.constant_path.parent, false) else (here(u, n); u.insn(:putobject, Object)) end
+      else
+        here(u, n)
+        u.insn(:putspecialobject, 3)
+      end
+      if !mod && n.superclass
+        flags |= 16
+        node(u, n.superclass, false)
+      else
+        here(u, n)
+        u.insn(:putnil)
+      end
+      here(u, n)
+      u.insn(:defineclass, name, child, flags)
+      u.insn(:pop) if popped
     end
 
     # prism_compile.c's pm_compile_conditional: the condition jumps to the
@@ -458,13 +667,13 @@ class RubyVM::InstructionSequence
       specialize(u)
       unify(u)
       attach_traces(u)
+      u.stack_max = stack_max(u)
       pos = 0
       u.elements.each do |e|
         if e.is_a?(Label) then e.pos = pos
         elsif e.is_a?(Insn) then pos += 1 + e.ops.size
         end
       end
-      u.stack_max = stack_max(u)
     end
 
     def insn_at(els, i)
@@ -679,12 +888,17 @@ class RubyVM::InstructionSequence
     # an adjust goes back to its label's
     def stack_max(u)
       sp = max = 0
+      lowered = []
       u.elements.each do |e|
         case e
         when Label
           if e.sp.nil? then e.sp = sp else sp = e.sp end
         when Adjust
-          sp = e.label.sp || 0
+          to = e.label ? (e.label.sp || 0) : 0
+          if !e.restore && sp - to > 0
+            lowered << [e, Insn.new(sp - to == 1 ? :pop : :adjuststack, sp - to == 1 ? [] : [sp - to], e.line, e.node_id, [])]
+          end
+          sp = to
         when Insn
           pop, push = stack_effect(e)
           sp = sp - pop + push
@@ -692,6 +906,8 @@ class RubyVM::InstructionSequence
           e.ops.each { |o| o.sp = sp if o.is_a?(Label) && o.sp.nil? }
         end
       end
+      lowered.each { |a, i| u.elements[u.elements.index { |x| x.equal?(a) }] = i }
+      u.elements.reject! { |x| x.is_a?(Adjust) }
       max
     end
 
@@ -705,6 +921,15 @@ class RubyVM::InstructionSequence
       when :newarray then [e.ops[0], 1]
       when :opt_send_without_block, :send then [e.ops[0].argc + 1, 1]
       when :definemethod, :jump then [0, 0]
+      when :getinstancevariable, :getglobal, :opt_getconstant_path, :putspecialobject, :duphash, :invokeblock_dummy then [0, 1]
+      when :setinstancevariable, :setglobal then [1, 0]
+      when :setconstant then [2, 0]
+      when :objtostring, :anytostring then [e.name == :anytostring ? 2 : 1, 1]
+      when :concatstrings, :newhash then [e.ops[0], 1]
+      when :newrange then [2, 1]
+      when :invokeblock then [e.ops[0].argc, 1]
+      when :defineclass then [2, 1]
+      when :adjuststack then [e.ops[0], 0]
       else
         e.name.to_s.start_with?("opt_") ? [e.ops[0].argc + 1, 1] : [0, 0]
       end
@@ -733,6 +958,7 @@ class RubyVM::InstructionSequence
       params = {}
       params[:lead_num] = u.params[:lead_num] if u.params[:lead_num] > 0
       params[:ambiguous_param0] = true if u.params[:ambiguous_param0]
+      params[:use_block] = true if u.params[:use_block]
       ["YARVInstructionSequence/SimpleDataFormat", 4, 0, 1, misc, u.label, u.path, u.abs_path || u.path,
        u.first_lineno, u.type, u.locals, params, [], body]
     end
@@ -742,6 +968,8 @@ class RubyVM::InstructionSequence
       when CallData then { mid: o.mid, flag: o.flag, orig_argc: o.argc }
       when Label then :"label_#{o.pos}"
       when LocalOp then o.idx
+      when IVC then o.index
+      when IC then o.segments
       when Unit then to_a(o)
       else o
       end
@@ -804,7 +1032,9 @@ class RubyVM::InstructionSequence
       case o
       when CallData
         flags = CALL_FLAG_NAMES.select { |b, _| o.flag & b != 0 }.map(&:last)
-        "<calldata!mid:#{o.mid}, argc:#{o.argc}#{flags.empty? ? "" : ", " + flags.join("|")}>"
+        "<calldata!#{o.mid ? "mid:#{o.mid}, " : ""}argc:#{o.argc}#{flags.empty? ? "" : ", " + flags.join("|")}>"
+      when IVC then "<is:#{o.index}>"
+      when IC then "<ic:#{o.index} #{o.segments.join("::")}>"
       when Label then o.pos.to_s
       when LocalOp then "#{o.name}@#{o.index}"
       when Unit then o.label
