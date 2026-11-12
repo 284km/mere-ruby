@@ -130,3 +130,17 @@ def twin.==(x)
   false
 end
 p seen == twin, [seen] == [twin], [seen].include?(twin), $calls
+
+# ...comparing what the exceptions hold, not what #message / #backtrace
+# present: an override neither changes the answer nor runs (third round).
+shown = bound.dup
+$calls = 0
+def shown.message
+  $calls += 1
+  "different"
+end
+loud = bound.dup
+def loud.message = raise("called")
+def loud.backtrace = raise("called")
+p seen == shown, [seen] == [shown], [seen].include?(shown), $calls
+p seen == loud, [seen] == [loud]

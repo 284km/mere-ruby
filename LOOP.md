@@ -3964,8 +3964,15 @@ remainder (Ripper) and error_highlight.
     Exception#== (exc_pair_equal: same class, its #message and #backtrace),
     so an exception on the right that overrides #== (`def twin.==`) still
     equals the pair as in ruby, and its override is not called. Its class is
-    read through the singleton the `def` gave it. corpus 643 has both
-    witnesses, `include?` and a nested Array included.
+    read through the singleton the `def` gave it. Third round: the
+    same-class branch reads the other's STORED message and backtrace, as
+    exc_equal's rb_attr_get does, and the pair's frames from the raise
+    record (pair_bt_raw) -- calling #message let an override decide the
+    answer and run, or raise, inside ==. Array#include? / #index took the
+    structural path for them (it asks the semantic one only for an element
+    or argument with an == of its own) and now asks it for an exception too.
+    corpus 643 has the three rounds' witnesses, `include?` and a nested
+    Array included.
   - **A pair's #detailed_message / #full_message went past the program's
     own** (error_highlight prepends one to TypeError and ArgumentError), and
     super from one did not reach Exception's.
