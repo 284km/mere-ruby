@@ -5417,7 +5417,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        && (match va0 with VHsh _ -> true | VArr _ -> true | _ -> false)
        && (let bv8 = eval_e env world blk b in
            (match (va0, bv8) with
-            | (VHsh h8, VHsh _) -> (if rb_eq va0 bv8 then false else hash_has_obj world (hderef h8))
+            | (VHsh h8, VHsh g8) -> (if rb_eq va0 bv8 then false else hash_has_obj world (hderef h8) || hash_has_obj world (hderef g8))
             | (VArr a8, VArr b8) -> (if rb_eq va0 bv8 then false else arr_has_obj world (deref a8) || arr_has_obj world (deref b8))
             | (_, _) -> false)) then
       // ...compared HERE rather than through the dispatcher: a binary operator
@@ -12695,7 +12695,8 @@ and elem_has_user_eq = fn world -> fn (xs: Val list) ->
   | Nil -> false
   | Cons (h, t) ->
     (match h with
-     | VObj _ -> if has_own_eq world h then true else elem_has_user_eq world t
+     | VObj _ -> if has_own_eq world h || exc_cmp_val world h then true else elem_has_user_eq world t
+     | VExc (_, _) -> if exc_cmp_val world h then true else elem_has_user_eq world t
      // one level in, for the pairs assoc/rassoc look at — and no deeper, or a
      // self-referential array (a = []; a << a) would never bottom out.
      | VArr aid -> if shallow_has_user_eq world (deref aid) then true else elem_has_user_eq world t
@@ -17438,7 +17439,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   else if ((str_len name == 3 && str_eq name "key") || (str_len name == 10 && str_eq name "has_value?") || (str_len name == 6 && str_eq name "value?"))
           && (match recv with VHsh _ -> true | _ -> false)
           && (match args with Cons (_, _) -> true | _ -> false)
-          && (match recv with VHsh h -> elem_has_user_eq world (hash_values_of (hderef h)) | _ -> false) then
+          && ((match recv with VHsh h -> elem_has_user_eq world (hash_values_of (hderef h)) | _ -> false)
+              || (match args with Cons (a9, _) -> exc_cmp_val world a9 | _ -> false)) then
     (match recv with
      | VHsh h ->
        (let xs = hderef h in
@@ -17456,7 +17458,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           && (match recv with
               | VArr id -> elem_has_user_eq world (deref id) || prim_eq_redefined world
                            // (...or the ARGUMENT's: `5 == obj` asks obj)
-                           || (match args with Cons (a9, _) -> has_own_eq world a9 | _ -> false)
+                           || (match args with Cons (a9, _) -> has_own_eq world a9 || exc_cmp_val world a9 | _ -> false)
               | _ -> false) then
     (match (recv, args) with
      | (VArr cid9, Cons (v, _)) ->
@@ -17488,10 +17490,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            || (match args with Cons (a9, _) -> has_own_eq world a9 | _ -> false)
                            // (...or an exception, which a pair and an object of
                            //  it compare equal across: exc_pair_equal)
-                           || (match args with
-                               | Cons (VExc (_, _), _) -> true
-                               | Cons (a9, _) -> exc_bridge_peer world a9
-                               | _ -> false)
+                           || (match args with Cons (a9, _) -> exc_cmp_val world a9 | _ -> false)
               | _ -> false) then
     (match recv with
      | VArr id ->
@@ -36011,6 +36010,17 @@ and exc_bridge_peer = fn world -> fn (v: Val) ->
   match v with
   | VObj _ -> exc_is_a world (dispatch_cls_of world v) "Exception"
   | _ -> false
+// A value whose equality is an exception's -- a pair or an exception object.
+// The two representations of one exception (exc_pin_bt) compare equal only
+// through exc_pair_equal, so a container's fast structural path must not be
+// chosen when either side holds one. One predicate for every entry point:
+// Array#== / #include? / #index / #count, Hash#== / #value? / #key (PR #81's
+// review, fourth round).
+and exc_cmp_val = fn world -> fn (v: Val) ->
+  match v with
+  | VExc (c9, _) -> (if str_starts_with c9 "__" then false else true)
+  | VObj _ -> exc_bridge_peer world v
+  | _ -> false
 // ruby's exc_equal with the pair (class c, message m) as the receiver, in
 // its same-class branch: the other's STORED message and backtrace
 // (rb_attr_get of mesg and bt), not its #message / #backtrace -- an override
@@ -36043,9 +36053,6 @@ and pair_bt_raw = fn (v: Val) ->
   if map_has raise_bt "e" && map_has raise_bt "eb" && rb_eq (map_get raise_bt "e") v then map_get raise_bt "eb"
   else if map_has raise_bt "v" && map_has globals "!" && rb_eq (map_get globals "!") v then map_get raise_bt "v"
   else VNil
-and exc_from_pair = fn world -> fn (oid: int) ->
-  let (_, _, _, iv9) = world in
-  map_has iv9 (str_of_int oid ++ "@__from_pair")
 and arr_has_obj = fn world -> fn (xs: Val list) -> arr_has_obj_d world xs 8
 // ⚠ ...and inside a nested container too, as cmp_member_w compares: a Hash
 //   whose values are Arrays of Dates (YAML's complex-key example) answered
@@ -36054,9 +36061,10 @@ and arr_has_obj = fn world -> fn (xs: Val list) -> arr_has_obj_d world xs 8
 and arr_has_obj_d = fn world -> fn (xs: Val list) -> fn (d: int) ->
   match xs with
   | Nil -> false
-  // (...or is an exception a rescue made from a pair, which a copy of the
-  //  pair equals: exc_pin_bt)
-  | Cons (VObj o9, t) -> (if obj_answers_eq world (VObj o9) || exc_from_pair world o9 then true else arr_has_obj_d world t d)
+  // (...or is an exception, whose pair and object compare equal only
+  //  semantically: exc_cmp_val)
+  | Cons (VObj o9, t) -> (if obj_answers_eq world (VObj o9) || exc_cmp_val world (VObj o9) then true else arr_has_obj_d world t d)
+  | Cons (VExc (c9, m9), t) -> (if exc_cmp_val world (VExc (c9, m9)) then true else arr_has_obj_d world t d)
   | Cons (VArr a9, t) -> (if d > 0 && arr_has_obj_d world (deref a9) (d - 1) then true else arr_has_obj_d world t d)
   | Cons (VHsh h9, t) -> (if d > 0 && arr_has_obj_d world (hderef h9) (d - 1) then true else arr_has_obj_d world t d)
   | Cons (_, t) -> arr_has_obj_d world t d

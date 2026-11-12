@@ -144,3 +144,14 @@ def loud.message = raise("called")
 def loud.backtrace = raise("called")
 p seen == shown, [seen] == [shown], [seen].include?(shown), $calls
 p seen == loud, [seen] == [loud]
+
+# ...and every container entry point compares them the same way: Array#count,
+# Hash#value? / #has_value? / #key, and Hash#== from either side (fourth round).
+plain = bound.dup
+p [seen].count(plain), [plain].count(seen)
+h = { key: seen }
+p h.value?(plain), h.has_value?(plain), h.key(plain), { key: plain }.has_value?(seen)
+p h == { key: plain }, { key: plain } == h
+p [seen].index(plain), [plain].include?(seen), [[seen]] == [[plain]], [[plain]] == [[seen]]
+# (twin overrides == to say false: from its side the answer is its own)
+p [twin].count(seen), { key: twin } == h

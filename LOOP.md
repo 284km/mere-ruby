@@ -3971,6 +3971,13 @@ remainder (Ripper) and error_highlight.
     answer and run, or raise, inside ==. Array#include? / #index took the
     structural path for them (it asks the semantic one only for an element
     or argument with an == of its own) and now asks it for an exception too.
+    Fourth round: one predicate (exc_cmp_val: a pair, or an exception
+    object) for every container entry point that picks between the
+    structural and the semantic comparison -- the elements' check
+    (elem_has_user_eq, which include? / count / delete / value? / key read),
+    the argument's check of count / value? / key, Array#== and Hash#== (the
+    latter looking at BOTH hashes' values; it looked at the left one only,
+    so `h == g` and `g == h` differed).
     corpus 643 has the three rounds' witnesses, `include?` and a nested
     Array included.
   - **A pair's #detailed_message / #full_message went past the program's
