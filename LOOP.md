@@ -4145,3 +4145,32 @@ test_optimization's objtostring / optimized_rescue. corpus 649.
   a compare_by_identity Hash has no index (every lookup walks it), and
   #instance_variables walks every object's ivars -- test_object_id_race_free
   times out on both.
+
+## 2026-11-12 (46): round 29 -- a compare_by_identity hash indexed by identity, and Ractor._require as main's
+
+Round 29 of note 545: two things round 28 and round 27's CI turned up.
+corpus 650.
+
+- **compare_by_identity had no index**: the content digest makes two equal
+  Strings one key, so marking a hash dropped its index for good and every
+  lookup walked the pairs -- 2,000 object keys 0.125 s, 4,000 0.476 s
+  (Ractor.make_shareable's `seen`, __deep_copy's, Marshal's). The index now
+  keys such a hash by identity (hkey_ident: an object's, a String's, an
+  Array's or a Hash's handle; an immediate's value; a Float walks, 0.0 and
+  -0.0 being two objects) at every index door (hkey_dig), a container key
+  needs no "is it still equal" check there, compare_by_identity and a
+  derived hash (hcbi_copy) build the identity index in place of the content
+  one. 8,000 keys: 0.024 s. The corpus agrees with the index on and off.
+- **Ractor._require** called Kernel#require inside the ractor: with
+  RubyGems loaded that is RubyGems' Ruby require, which reads Gem's class
+  ivars, and a non-main ractor is refused them (bootstrap test_ractor #112,
+  `require 'tempfile'` through a prepended require, red in round 27's CI).
+  The whole call now runs as the main ractor's (__as_main_require, the
+  do_require trick around the call), as ractor.c hands it to main.
+- ⚠ A prelude class method calling a native of its own class by implicit
+  self (`__as_main_require(f)`, `__gems`) does not reach the native: it hung
+  here. Call it as `Ractor.__x` / `Box.__x`.
+- Left: #instance_variables still walks every object's ivars (no per-object
+  list to keep in step at ~330 write and ~50 delete sites);
+  test_object_id_race_free stays slow for that. Bootstrap test_ractor #153
+  (1,000 ractors, 35 s here) and #99 sit at the runner's time limit.

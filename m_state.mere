@@ -1197,6 +1197,7 @@ let fn hkey_obj_ident_fwd: Val -> bool;
 // itself (`h = {}; h[:x] = [h]`) makes the key undigestible, and the walk
 // answers instead -- it used to recurse until the native stack ran out, which
 // killed test_hash at the 20th of its 306 tests.
+let fn hcbi_fwd: int -> bool;
 let hkey_busy = map_new ();
 let rec hkey_digest = fn (k: Val) ->
   match k with
@@ -1257,6 +1258,24 @@ and hkey_seq_go = fn (xs: Val list) -> fn (acc: str) ->
        (let rest = hkey_seq_go t (acc ++ str_of_int (str_len d) ++ ":" ++ d) in
         // a later element that is not digestible poisons the whole key
         if str_eq rest (chr 1) then chr 1 else rest));
+// A compare_by_identity hash is indexed too, by IDENTITY: an object's,
+// a String's, an Array's or a Hash's handle, an immediate's value. Two equal
+// Strings are two keys there, and a content digest would make them one -- so
+// such a hash went without an index, and every lookup walked it (Ractor
+// .make_shareable's `seen` over 10,000 objects, test_object_id_race_free). A
+// Float has no identity digest (0.0 and -0.0 are two objects): it walks.
+let hkey_ident = fn (k: Val) ->
+  match k with
+  | VObj id -> "o" ++ str_of_int id
+  | VStr h -> "S" ++ str_of_int h
+  | VArr id -> "a" ++ str_of_int id
+  | VHsh id -> "h" ++ str_of_int id
+  | VInt n -> "i" ++ str_of_int n
+  | VSym y -> "y" ++ y
+  | VNil -> "n"
+  | VBool b -> (if b then "t" else "f")
+  | _ -> "";
+let hkey_dig = fn (id: int) -> fn (k: Val) -> if hcbi_fwd id then hkey_ident k else hkey_digest k;
 // (the off-switch lives in main.mere, where env_get is in scope; this is the
 //  plain question "does this hash have an index", asked while maintaining it)
 let hidx_off = map_new ();
@@ -1306,7 +1325,7 @@ let _ = map_compact hash_stale;  // (its own arena: a write per hash / string ma
 let rec hstale_vals = fn (id: int) -> fn (xs: Val list) ->
   match xs with
   | Cons (k, Cons (v, t)) ->
-    (let d = hkey_digest k in
+    (let d = hkey_dig id k in
      let ix = map_get hash_index id in
      Cons (k, Cons ((if str_len d > 0 && map_has ix d then map_get ix d else v), hstale_vals id t)))
   | other -> other;
@@ -1400,7 +1419,6 @@ let hidx_start = fn (id: int) ->
 // (a String key is plain only FROZEN: Hash[] stores the caller's own string,
 //  which the caller may still change -- test_s_AREF_key_tampering)
 let fn sfrozen_fwd: int -> bool;
-let fn hcbi_fwd: int -> bool;
 let hplain_key = fn (k: Val) ->
   match k with
   | VInt _ -> true | VSym _ -> true | VNil -> true | VBool _ -> true | VStr h -> sfrozen_fwd h
@@ -1430,7 +1448,7 @@ let rec hidx_seed = fn (id: int) -> fn (ys: Val list) ->
   match ys with
   | Nil -> true
   | Cons (k, Cons (v, t)) ->
-    (let d = hkey_digest k in
+    (let d = hkey_dig id k in
      if str_eq d "" then false
      else (let _ = hidx_put id d v in hidx_seed id t))
   | _ -> false;
@@ -1500,8 +1518,8 @@ let hderef_fwd = fn (id: int) -> hderef id;
 // 0.583 s against 0.010 s without it.
 let hdel_indexed = fn (id: int) -> fn (k: Val) -> fn (xs: Val list) ->
   let _ = hcnt_add id (0 - 1) in
-  let keep = hidx_on id && (if str_eq (hkey_digest k) "" then false else true) in
-  let _ = (if keep then (let _ = map_delete (map_get hash_index id) (hkey_digest k) in ()) else ()) in
+  let keep = hidx_on id && (if str_eq (hkey_dig id k) "" then false else true) in
+  let _ = (if keep then (let _ = map_delete (map_get hash_index id) (hkey_dig id k) in ()) else ()) in
   // (xs came from hderef, so it is current: nothing is stale any more)
   let _ = (if map_len hash_stale > 0 && map_has hash_stale id then map_delete hash_stale id else ()) in
   // hset would drop the index; write the list underneath it instead
@@ -1523,7 +1541,7 @@ let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
   // loop runs, so the copies piled up, 961 -> 1601 MB for 300k hashes of ten
   // insertions, note 302.)
   let qn9 = (if map_len hash_pending > 0 && map_has hash_pending id then vec_len (map_get hash_pending id) / 2 else 0) in
-  let plain9 = (if hidx_on id || hcbi_fwd id then false
+  let plain9 = (if hidx_on id then false
                 else if map_has hidx_off "o" then (match map_get hidx_off "o" with 1 -> false | _ -> true)
                 else true) in
   let _ = (if plain9 && (if hplain_key k && hpairs_upto (hsettled id) 0 hsmall_max + qn9 < hsmall_max then false else true)
@@ -1535,7 +1553,7 @@ let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
   // keep the index in step, or give it up: a key it cannot digest means the
   // index no longer knows everything in this hash.
   let _ = (if hidx_on id then
-             (let d = hkey_digest k in
+             (let d = hkey_dig id k in
               if str_eq d "" then hidx_drop id else hidx_put id d v)
            else ()) in
   // ...and only THEN the queue: the digest of a Hash key folds that hash
@@ -4079,9 +4097,14 @@ let fm_kw = map_new ();
 // a hash DERIVED from one that compares by identity keeps the flag: select,
 // reject, except, slice, dup and clone all answer a compare_by_identity? hash
 // in ruby. Every derived hash was built with a plain mkhash, which loses it.
+// (an index over what a hash holds, as mkhash seeds one -- after the hash
+//  changed how it compares)
+let hidx_reseed = fn (id: int) ->
+  let xs = hsettled id in
+  if hplain_small xs then () else (let _ = hidx_start id in if hidx_seed id xs then () else hidx_drop id);
 let hcbi_copy = fn (src: int) -> fn (dst: Val) ->
   match dst with
-  | VHsh d -> (if map_has hcbi src then (let _ = hidx_drop d in map_set hcbi d 1) else ())
+  | VHsh d -> (if map_has hcbi src then (let _ = hidx_drop d in let _ = map_set hcbi d 1 in hidx_reseed d) else ())
   | _ -> ();
 
 
