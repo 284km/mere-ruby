@@ -3872,7 +3872,7 @@ out (the ledger's "CRuby heap shape"). What has a real answer here was done.
   without the finalizer; objspace/test_ractor's copy_finalizer, which passed
   while ractors ran one after another, now times out.
 
-## 2026-11-12 (39): round 23 -- a block's own locals, decided where ruby decides them
+## 2026-11-12 (40): round 23 -- a block's own locals, decided where ruby decides them
 
 Round 23 of note 545, found in round 22 (test_settracefunc's
 ractor_local_method counted 110 for 100).
