@@ -3872,6 +3872,116 @@ out (the ledger's "CRuby heap shape"). What has a real answer here was done.
   without the finalizer; objspace/test_ractor's copy_finalizer, which passed
   while ractors ran one after another, now times out.
 
+## 2026-11-12 (39): stage 5, parallel round A -- Ripper on values it cannot read, error_highlight through Prism, a per-object ivar index, and exceptions that keep their own frames
+
+Run beside round 22 (stage 9) on a branch of its own, for note 545's stage 5
+remainder (Ripper) and error_highlight.
+
+- **Ripper's files tests (55) were one line.** test/ripper's parse-files
+  Parser answers `Object.new` for every event, and the translation decided
+  whether a call without parentheses is a command by asking the VALUE its
+  argument events returned (`arguments&.any?`, prism's ripper.rb:1101). The C
+  core never looks inside a handler's answer. lib/ripper_ext.rb carries
+  visit_call_node with that line deciding by the node, as the receiver branch
+  already did. Checked first on the reference: every .rb of ruby's lib, ext,
+  test and sample through an Object.new Parser over the translation -- that
+  line was the only place it broke.
+- **Round 20 had made the same fix and taken it back** (mkmf.rb alone was 1.46
+  GB and 190 s). Two costs behind it, both gone:
+  - **Prism's Loader read the serialized bytes through StringIO, one #getbyte
+    per byte** (serialize.rb's FastStringIO is ::StringIO everywhere but
+    TruffleRuby), and StringIO#getbyte here is six or seven method calls on
+    the state a dup shares, 20 µs each: 3 of mkmf.rb's 5.5 s of Prism.parse.
+    The Loader is given the bare reader TruffleRuby's branch writes
+    (Prism.serialize in lib/prism_ext.rb): 2.2x on every load.
+  - **Object#inspect walked every object's instance variables** to list one
+    object's (the second item of round 20's hidden linear scans, left then
+    because the table had "about a hundred" writers). It has 380, through
+    thirty names for world's fourth map, parameters and the global. Every
+    `map_set` on it is `iv_put` now, which files a NEW key's name under its
+    object (iv_idx, m_state); a delete leaves the name and the reader asks the
+    table; the collector drops a dead owner's names. mkmf.rb through the
+    Object.new Parser: 19.5 s -> 9.5 s user, 817 -> 782 MB.
+    ⚠ The first pass at finding the writers read a match arm's guard
+    (`| X when map_has ivars ...`) and a `||` as bindings and missed 63 of
+    them. MERE_RUBY_IVAR_INDEX_CHECK=1 lists every object both ways and says
+    on stderr where they differ: the corpus and ~90 of ruby's test files ran
+    clean with it after the second pass (the first found Random's `__gid`).
+    ⚠ A Map made per listing (to drop repeated names) took the same run to
+    1.1 GB: a Mere Map is never given back.
+- **error_highlight goes through Prism in ruby 4.0**: AST.of raises a
+  RuntimeError naming prism, and prism_find parses the file and looks for the
+  node with node_id_for_backtrace_location's id. Neither existed. A frame
+  here has no column and m_parse's nodes are not Prism's, so
+  Exception#backtrace_locations writes on each Location the call that frame
+  was making (the method of the frame inside it; the innermost one's is a
+  NameError's name, or the callee's own definition for an ArgumentError of
+  the arguments), and Prism.__node_id_for_location picks that call among the
+  line's in the file's Prism tree. The ids are the tree's, the ones ruby's
+  Prism compiler numbers: corpus 643 prints the same numbers both ways.
+- **What error_highlight's tests found on the way** (each is a defect outside
+  it too):
+  - **An exception held as a (class, message) pair had no frames of its
+    own**: #backtrace_locations read the LAST raise's, so after anything else
+    raised -- AST.of's RuntimeError, raised and rescued inside spot -- it
+    answered another exception's frames, or nil. `rescue => e` now makes the
+    pair it binds an object carrying its frames, and `$!` that same object
+    (exc_pin_bt; its text through vexc_text, which corpus 449's EUC-JP class
+    name needed). A pair kept from `$!` in an ensure and compared with the
+    object a later rescue made asks the object's Exception#== (test_exception's
+    circular_cause).
+  - **A pair's #detailed_message / #full_message went past the program's
+    own** (error_highlight prepends one to TypeError and ArgumentError), and
+    super from one did not reach Exception's.
+  - **A Location read from "f.rb:3:in 'T::M.baz'" had the path "f.rb:3:in 'T"
+    and line 0**: the last colon of the string was the label's. It is cut
+    where ":in '" starts.
+  - `nil[0] = 1`'s message lacked " for nil"; `+nil`, `-nil`, `+:a` answered
+    their operand (NoMethodError now); `A::NotDefined::Foo` is the head's
+    NameError ("uninitialized constant A::NotDefined"), and `B::Nope` inside
+    `module A` is named A::B::Nope.
+- **Ripper's #parse reports as parse.y does** (lib/ripper_ext.rb): a magic
+  comment's `-` is `_`; a warning goes to #warn where parse.y's is rb_warn and
+  to #warning where it is rb_warning, with parse.y's format and arguments (the
+  translation had the two levels the other way round and passed the message
+  as the format); an ambiguous binary operator is operator_ambiguous; the
+  lexer's errors are #compile_error in parse.y's words; and when the only
+  errors are ones parse.y builds the tree through (a write to $&, self or a
+  constant in a method, alias of $1, a formal argument, an endless setter,
+  a misplaced retry) the tree is built and the write wrapped in assign_error /
+  alias_error. A heredoc's end token has the state its body left.
+  ⚠ The fast loop for all of this was the reference itself: test/ripper run
+  on ruby 4.0.9 with ::Ripper replaced by the translation and
+  lib/ripper_ext.rb (ripper's names added to $LOADED_FEATURES so the C
+  extension is never loaded), seconds per file; mere-ruby then differs only
+  where the interpreter does.
+- **Left, measured**: test_ast's tree (107: a parse.y-shaped AST built from
+  Prism's -- and test_ranges / test_not_cared parse all 869 test files, which
+  today pass by having no children; a real tree in Ruby at today's ~250 µs a
+  node would not fit 600 s / 2 GiB, so Prism's load wants building in a Mere
+  builtin first, as all_tokens is); a bare name with a builtin value as self
+  is NoMethodError, not NameError (prim_self_send); IO#lineno=; `::E += 1`;
+  scanner events during #parse (ignored_nl, heredoc_beg), lex_compat's escape
+  splits and embexpr_end, `/[\xC0-\xF0]/u` not refused. Seen and not
+  touched: `1 + nil` pushes no Integer#+ frame (`1.+(nil)` does); ruby loads
+  error_highlight at boot and mere-ruby does not; a `case` declares every
+  when-body's locals each time it runs (declare_nils, a tenth of Prism's
+  load).
+- **Checked** on Mere v0.1.731, rebased on round 22: corpus 674/674 with the
+  ivar index check on; loop gates (bracket depth 977 of 1024, dead defs, gc
+  roots). Locally, against round 21's CI: ripper's six files 55/55 (lib 119 s
+  and test_2 83 s, under 1 GB -- 257 s and 242 s before the index),
+  parser_events 165 -> 197, error_highlight 1 -> 105 (274 s), test_ast 2,557
+  -> 2,559 (313 s, 864 MB; round 20 recorded 1.1 GB); and with the index
+  check on, the files the changes touch (exception, backtrace, keyword,
+  method, proc, object, struct, module, marshal, class, eval, syntax,
+  iterator, fiber, thread, io, array, hash, string, numeric, range, regexp,
+  require, refinement, lambda, variable, const, autoload, super, pp,
+  delegate, timeout, json, did_you_mean, prism's ripper_test) at or above
+  round 21's counts (test_keyword needs a -test- extension the local
+  reference does not have; test_array's shared_marking is the reference's
+  known wobble).
+
 ## 2026-11-12 (40): round 23 -- a block's own locals, decided where ruby decides them
 
 Round 23 of note 545, found in round 22 (test_settracefunc's
