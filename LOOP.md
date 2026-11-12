@@ -4029,9 +4029,9 @@ corpus 647.
 - **Which box runs**: a file read while boxes are on is marked with the box
   reading it (its SFile, "\1<box>\1<name>"); running it enters that box, and
   a call's box comes back with its file (box_put / box_take beside
-  call_files_s). "<internal:...>" is never marked: the prelude's method
-  bodies are parsed when first called, and they run in their caller's box,
-  as a C function does in ruby. So a method, a block and a proc run where
+  call_files_s). "<internal:...>" is never marked -- by name: the prelude is
+  parsed after the main script (driver_setup), when files are already being
+  marked -- and it runs in its caller's box, as a C function does in ruby. So a method, a block and a proc run where
   they were written; `box::Foo.yield_block { Ruby::Box.current }` is main.
 - **Boot**: RUBY_BOX=1 marks the main script for main (box_st 0 = 2: the
   script is read before the prelude runs), and after the prelude box_boot
