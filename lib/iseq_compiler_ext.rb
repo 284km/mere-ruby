@@ -230,6 +230,23 @@ class RubyVM::InstructionSequence
       when Prism::ReturnNode then return_node(u, n, popped)
       when Prism::YieldNode then yield_node(u, n, popped)
       when Prism::ClassNode, Prism::ModuleNode then class_node(u, n, popped)
+      when Prism::SourceFileNode
+        u.insn(:putchilledstring, u.path.dup.freeze) unless popped
+      when Prism::SourceLineNode
+        u.insn(:putobject, n.location.start_line) unless popped
+      when Prism::RegularExpressionNode
+        u.insn(:putobject, Regexp.new(n.unescaped, n.options & 7)) unless popped
+      when Prism::BeginNode
+        if n.rescue_clause || n.ensure_clause || n.else_clause
+          raise NotImplementedError, "RubyVM::InstructionSequence: begin with rescue / else / ensure is not compiled yet"
+        end
+        if n.statements then node(u, n.statements, popped) else (u.insn(:putnil) unless popped) end
+      when Prism::NextNode then next_node(u, n)
+      when Prism::InterpolatedSymbolNode
+        dstr(u, n, false)
+        here(u, n)
+        u.insn(:intern)
+        u.insn(:pop) if popped
       when Prism::ParenthesesNode
         if n.body then node(u, n.body, popped) else (u.insn(:putnil) unless popped) end
       else
@@ -345,7 +362,6 @@ class RubyVM::InstructionSequence
     end
 
     def define(u, n, popped)
-      raise NotImplementedError, "RubyVM::InstructionSequence: a singleton def is not compiled yet" if n.receiver
       l = n.location
       child = Unit.new(:method, n.name.to_s, u.path, u.abs_path, l.start_line, n.locals, u,
                        [l.start_line, l.start_column, l.end_line, l.end_column], n.node_id)
@@ -368,8 +384,14 @@ class RubyVM::InstructionSequence
       child.at(child.last_line, n.node_id)
       child.insn(:leave)
       finish(child)
-      here(u, n)
-      u.insn(:definemethod, n.name, child)
+      if n.receiver
+        node(u, n.receiver, false)
+        here(u, n)
+        u.insn(:definesmethod, n.name, child)
+      else
+        here(u, n)
+        u.insn(:definemethod, n.name, child)
+      end
       u.insn(:putobject, n.name) unless popped
     end
 
@@ -579,36 +601,64 @@ class RubyVM::InstructionSequence
       if part
         node(u, part, popped)
       elsif !popped
-        here(u, owner)
-        u.insn(:putnil)
+        synthetic_putnil(u)
       end
     end
 
-    # pm_compile_branch_condition
-    def branch_condition(u, cond, then_l, else_l)
+    # PUSH_SYNTHETIC_PUTNIL: on the last line, of no node (-1)
+    def synthetic_putnil(u)
+      u.at(u.last_line || u.line, -1)
+      u.insn(:putnil)
+    end
+
+    # pm_compile_logical: one side of && / || in a condition, falling through
+    # to a label of its own for the other
+    def compile_logical(u, cond, then_l, else_l)
+      lbl = u.new_label
+      then_l ||= lbl
+      else_l ||= lbl
+      start = u.elements.size
+      branch_condition(u, cond, then_l, else_l)
+      chunk = u.elements[start..]
+      insns = chunk.grep(Insn)
+      if insns.size == 1 && insns[0].name == :jump && insns[0].ops[0].equal?(lbl)
+        unref(insns[0])
+        u.elements.slice!(start..)
+        return
+      end
+      u.emit_label(lbl) if lbl.refs > 0
+    end
+
+    # pm_compile_branch_condition (its location is the condition it was
+    # given, kept as it walks into && / ||)
+    def branch_condition(u, cond, then_l, else_l, at = cond)
       case cond
       when Prism::FalseNode, Prism::NilNode
-        here(u, cond)
+        here(u, at)
         u.insn(:jump, else_l)
         return
       when Prism::FloatNode, Prism::ImaginaryNode, Prism::IntegerNode, Prism::RationalNode,
            Prism::StringNode, Prism::SymbolNode, Prism::TrueNode
-        here(u, cond)
+        here(u, at)
         u.insn(:jump, then_l)
         return
-      when Prism::AndNode, Prism::OrNode
-        raise NotImplementedError, "RubyVM::InstructionSequence: && / || in a condition is not compiled yet"
+      when Prism::AndNode
+        compile_logical(u, cond.left, nil, else_l)
+        return branch_condition(u, cond.right, then_l, else_l, at)
+      when Prism::OrNode
+        compile_logical(u, cond.left, then_l, nil)
+        return branch_condition(u, cond.right, then_l, else_l, at)
       end
       start = u.elements.size
       node(u, cond, false)
       chunk = u.elements[start..].grep(Insn)
       if chunk.size == 1 && chunk[0].name == :putobject
         u.elements.delete(chunk[0])
-        here(u, cond)
+        here(u, at)
         u.insn(:jump, chunk[0].ops[0] ? then_l : else_l)
         return
       end
-      here(u, cond)
+      here(u, at)
       u.insn(:branchunless, else_l)
       u.insn(:jump, then_l)
     end
@@ -649,6 +699,18 @@ class RubyVM::InstructionSequence
       u.insn(:putnil)
       u.emit_label(break_l)
       u.insn(:pop) if popped
+    end
+
+    # (a `next` in a loop: its value, the stack back to the loop's -- an
+    #  ADJUST to the redo label -- and the condition again)
+    def next_node(u, n)
+      lp = u.loops.last or raise NotImplementedError, "RubyVM::InstructionSequence: next in a block is not compiled yet"
+      args = n.arguments&.arguments || []
+      raise NotImplementedError, "RubyVM::InstructionSequence: next with values" if args.size > 1
+      if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+      here(u, n)
+      u.adjust(lp[2], false)
+      u.insn(:jump, lp[0])
     end
 
     def break_node(u, n)
@@ -896,7 +958,8 @@ class RubyVM::InstructionSequence
         when Adjust
           to = e.label ? (e.label.sp || 0) : 0
           if !e.restore && sp - to > 0
-            lowered << [e, Insn.new(sp - to == 1 ? :pop : :adjuststack, sp - to == 1 ? [] : [sp - to], e.line, e.node_id, [])]
+            # (an instruction the layout makes is of no node: -1)
+            lowered << [e, Insn.new(sp - to == 1 ? :pop : :adjuststack, sp - to == 1 ? [] : [sp - to], e.line, -1, [])]
           end
           sp = to
         when Insn
@@ -921,6 +984,8 @@ class RubyVM::InstructionSequence
       when :newarray then [e.ops[0], 1]
       when :opt_send_without_block, :send then [e.ops[0].argc + 1, 1]
       when :definemethod, :jump then [0, 0]
+      when :definesmethod then [1, 0]
+      when :intern then [1, 1]
       when :getinstancevariable, :getglobal, :opt_getconstant_path, :putspecialobject, :duphash, :invokeblock_dummy then [0, 1]
       when :setinstancevariable, :setglobal then [1, 0]
       when :setconstant then [2, 0]
