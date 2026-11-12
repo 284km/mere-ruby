@@ -4,7 +4,7 @@
 #
 #   ruby tools/iseq/compare_with_ruby.rb lib/iseq_compiler_ext.rb tools/iseq/snippets.txt
 
-require_relative ARGV[0]
+require File.expand_path(ARGV[0])
 C = RubyVM::InstructionSequence::Compiler__
 ok = 0; bad = 0
 snippets = File.read(ARGV[1]).split("\n----\n")
