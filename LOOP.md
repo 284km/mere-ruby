@@ -3956,6 +3956,12 @@ remainder (Ripper) and error_highlight.
     own -- and it looked only at the left array for one. An object made from
     a pair is marked (@__from_pair) and equals a pair of its class and
     message, as two pairs did; Array#== looks at both sides.
+    ⚠ (review) The first version of that bridge asked ANY object on the right
+    of a pair: `[pair] == [obj]` called obj's #== -- an object whose #==
+    answers true made it true, where ruby says false and never calls it. The
+    bridge goes only to an exception answering the built-in #==
+    (exc_bridge_peer); corpus 643 has the witness, `include?` and a nested
+    Array included.
   - **A pair's #detailed_message / #full_message went past the program's
     own** (error_highlight prepends one to TypeError and ArgumentError), and
     super from one did not reach Exception's.

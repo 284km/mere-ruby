@@ -101,3 +101,17 @@ tp.enable
 begin; raise RuntimeError; rescue RuntimeError => bound; end
 tp.disable
 p bound == seen, seen == bound, [bound] == [seen], [seen] == [bound], [[1, seen]] == [[1, bound]]
+
+# ...but that exception does not hand its comparison to an unrelated object:
+# one whose #== says true to anything is not asked, from inside an Array
+# either (PR #81's review).
+class EqualAnything
+  def ==(other)
+    $calls += 1
+    true
+  end
+end
+$calls = 0
+other = EqualAnything.new
+p seen == other, [seen] == [other], [[1, seen]] == [[1, other]], [seen].include?(other), $calls
+p other == seen, $calls
