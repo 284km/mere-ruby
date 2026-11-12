@@ -4007,3 +4007,56 @@ Round 25 of note 545 (§5's objspace): objspace/test_objspace 44 failing ->
   4-5 % slower on that loop, and growing. The defining ractor is a mark on
   the block's env now (set only in a non-main ractor), asked only while a
   ractor runs.
+
+## 2026-11-12 (43): round 26 -- Ruby::Box: a journal of each box's writes, and code that runs in the box it was read in
+
+Round 26 of note 545 (§6, Ruby::Box): ruby/test_box 28 failing (RED; the 30
+BOTH are setup_box's pend in the main process, ruby's too) -> 1 locally.
+corpus 647.
+
+- **What a box sees**: the booted interpreter (the master) and its own
+  writes. The tables stay shared and are read everywhere as they are (several
+  hundred readers); a box's writes are kept by JOURNAL (m_state, bx_note):
+  the first time a box writes a key the master owns -- a top-level constant
+  or one in a class there at boot, a method of such a class, its include or
+  prepend, a global -- the master's value is noted under that box, and the
+  box writes the table itself. Leaving a box (bx_out) saves what it wrote and
+  puts the master's back; entering one (bx_in) does the reverse; a switch
+  costs what the two boxes wrote. The doors: store_meth / del_meth, set_inc /
+  set_pre, gvar_write, and consts_put / consts_del in the six functions that
+  write a program's constants. A class made after boot is its box's alone
+  (ruby's non-boxable class) and is written for everyone.
+- **Which box runs**: a file read while boxes are on is marked with the box
+  reading it (its SFile, "\1<box>\1<name>"); running it enters that box, and
+  a call's box comes back with its file (box_put / box_take beside
+  call_files_s). "<internal:...>" is never marked: the prelude's method
+  bodies are parsed when first called, and they run in their caller's box,
+  as a C function does in ruby. So a method, a block and a proc run where
+  they were written; `box::Foo.yield_block { Ruby::Box.current }` is main.
+- **Boot**: RUBY_BOX=1 marks the main script for main (box_st 0 = 2: the
+  script is read before the prelude runs), and after the prelude box_boot
+  records the classes there are, gives root and main load lists of their own
+  ($LOADED_FEATURES and $LOAD_PATH, journaled copies), and enters main. Root
+  and every Box.new load RubyGems for themselves when main did (gem_prelude's
+  BUNDLER_SETUP rule), and a shipped library runs once per box (stdlib_ran).
+- **The API** (prelude, Ruby::Box < Module): enabled?, current / main / root
+  / master, main? / root? / master?, inspect as ruby's, eval in a fresh top
+  level of the box (Box.__scope: main as self, the box in the scope, so a
+  Binding made there evaluates in the box), require / require_relative /
+  load, `box::X` (Box#const_missing), constants.
+- A class a box makes under a name another box's class has is a new class:
+  an anonymous internal name shown as the constant's (bx_int "m:" -- a class
+  of no written superclass has no cls_sup entry to tell it exists).
+- Two general fixes on the way: `X = Module.new; class X::Y` defines Y in
+  the module (it went to a separate "X::Y"), and `MM.new::X` with MM < Module
+  asks MM#const_missing without falling to the top level.
+- ⚠ The emitted C hit the 1024 nesting budget twice: the first version's
+  forty-odd top-level lets, then a 21-element tuple -- a tuple's elements are
+  a level EACH. Six lets (a slot vec, four maps by value type, call_box);
+  tools/bracket_depth_check.sh says 1009 now.
+- ⚠ The journal holds Vals (a box's own $LOADED_FEATURES array): rooted in
+  gc_mark_roots (bx_val), and a parked box's methods keep their metadata.
+  test_mark_box_object_referred_only_from_binding (GC.stress) found it.
+- Left: test_prelude_gems_and_loaded_features (ruby preloads bundled_gems
+  and error_highlight at boot; stage 6 / error_highlight's), -ext-/box (C
+  extensions), a fiber resumed mid-body keeps its resumer's box.

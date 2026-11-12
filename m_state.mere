@@ -2606,7 +2606,6 @@ let pos_name_id = fn (s: str) ->
         let _ = vec_push pos_names s in
         let _ = map_set pos_name_ids s i in
         i);
-let cur_file_set = fn (s: str) -> vec_set cur_fm 0 (pos_name_id s);
 let cur_meth_set = fn (s: str) ->
   let i = (if map_has meth_name_ids s then map_get meth_name_ids s
            else (let n = vec_get meth_name_next 0 in
@@ -4835,7 +4834,157 @@ let mro_note_mixins = fn (names: str) ->
     let rec note = fn (xs: str list) ->
       match xs with Nil -> () | Cons (m, rest) -> let _ = mro_note_mixin m in note rest in
     note (str_split names "|");
+// THE BOX JOURNAL (Ruby::Box, note 545 §6). Every box sees the booted
+// interpreter -- the master -- and its own writes, and nothing another box
+// wrote. The tables are shared and read everywhere as they are, so a box's
+// writes are kept by journal: the first time a box writes a key that the
+// master owns (a constant at the top level or in a class that was there at
+// boot, a method of such a class, its include or prepend, a global), the
+// master's value is noted under that box ("under"), and the box goes on
+// writing the table itself. Leaving the box (bx_out) saves what it wrote and
+// puts the master's values back; entering one (bx_in) does the reverse. The
+// readers -- several hundred of them -- see whichever box is live and never
+// know. A switch costs what the two boxes wrote, and only a program that set
+// RUBY_BOX ever switches.
+// A class or module made after boot belongs to the box that made it alone
+// (ruby's "non-boxable" class): its tables are written for everyone, as a
+// box's class is reached only through that box.
+// box_st's slots: 0 box_on -- 1 once boxes are enabled, after boot, and 2
+// before that, from when the main script is read (it is read before the
+// prelude runs): files are marked, nothing switches or journals; 1 box_cur,
+// the box the running code belongs to; 2 box_live, the box whose writes the
+// shared tables hold right now (bx_switch); 3 the next id; 4 box_gems, 1 when
+// the driver loaded rubygems, which every box then loads for itself. Ids: 1
+// the master (the booted interpreter), 2 root, 3 main, 4 on from Box.new.
+// bx_int: "s:" ++ kind ++ "<box>\1<key>" -> 1 once journaled, "n:" ++ kind ++
+// "<box>" -> how many keys that box wrote, "b:<class>" -> the class was
+// there at boot, "m:<class>" -> a `class`/`module` keyword made it while
+// boxes were on (a class of no written superclass has no cls_sup entry to
+// tell it exists). bx_str: "l:" ++ kind ++ "<box>:<i>" -> the i-th key that
+// box wrote, and the includes' and prepends' values. bx_val (constants,
+// globals) and bx_meth (methods): "v<kind><box>\1<key>" -> the box's own
+// value, "u<kind><box>\1<key>" -> the master's where it had one. The kinds:
+// constants (c), globals (g), methods (m), includes (i), prepends (p).
+// ⚠ SIX `let`s, no tuples: each top-level binding is a level of nesting in
+//   the emitted C, a tuple's elements are one level EACH, and the build
+//   passes 1024 (tools/bracket_depth_check.sh -- this round met it twice).
+let box_st = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v 1 in let _ = vec_push v 1 in
+              let _ = vec_push v 4 in let _ = vec_push v 0 in v);
+let bx_int = map_new ();
+let bx_str = map_new ();
+let bx_val = map_new ();
+let bx_meth = map_new ();
+let call_box = map_new ();  // call depth -> the box at the call (box_put / box_take)
+// bx_note: the first write of a key by the live box notes the master's value
+// under it; bx_out / bx_in: leaving a box saves what it wrote and puts the
+// master's back, entering one puts its own back
+// (three lets, not a tuple of three: a tuple's functions are not generalized,
+//  and these are used over tables of four value types)
+let bx_note = fn live -> fn store -> fn (kind: str) -> fn (k: str) ->
+  let b = vec_get box_st 2 in
+  let jk = kind ++ str_of_int b ++ chr 1 ++ k in
+  if map_has bx_int ("s:" ++ jk) then () else
+  (let _ = map_set bx_int ("s:" ++ jk) 1 in
+   let _ = (if map_has live k then map_set store ("u" ++ jk) (map_get live k) else map_delete store ("u" ++ jk)) in
+   let ck = kind ++ str_of_int b in
+   let n = (if map_has bx_int ("n:" ++ ck) then map_get bx_int ("n:" ++ ck) else 0) in
+   let _ = map_set bx_str ("l:" ++ ck ++ ":" ++ str_of_int n) k in
+   map_set bx_int ("n:" ++ ck) (n + 1));
+let bx_out = fn live -> fn store -> fn (kind: str) -> fn (b: int) ->
+  let ck = kind ++ str_of_int b in
+  let n = (if map_has bx_int ("n:" ++ ck) then map_get bx_int ("n:" ++ ck) else 0) in
+  let rec go = fn (i: int) -> if i >= n then () else
+    (let k = map_get bx_str ("l:" ++ ck ++ ":" ++ str_of_int i) in
+     let jk = ck ++ chr 1 ++ k in
+     let _ = (if map_has live k then map_set store ("v" ++ jk) (map_get live k) else map_delete store ("v" ++ jk)) in
+     let _ = (if map_has store ("u" ++ jk) then map_set live k (map_get store ("u" ++ jk)) else map_delete live k) in
+     go (i + 1)) in
+  go 0;
+let bx_in = fn live -> fn store -> fn (kind: str) -> fn (b: int) ->
+  let ck = kind ++ str_of_int b in
+  let n = (if map_has bx_int ("n:" ++ ck) then map_get bx_int ("n:" ++ ck) else 0) in
+  let rec go = fn (i: int) -> if i >= n then () else
+    (let k = map_get bx_str ("l:" ++ ck ++ ":" ++ str_of_int i) in
+     let jk = ck ++ chr 1 ++ k in
+     let _ = (if map_has live k then map_set store ("u" ++ jk) (map_get live k) else map_delete store ("u" ++ jk)) in
+     let _ = (if map_has store ("v" ++ jk) then map_set live k (map_get store ("v" ++ jk)) else map_delete live k) in
+     go (i + 1)) in
+  go 0;
+// A file parsed while boxes are on belongs to the box parsing it: its SFile
+// says so ("\1<box>\1<name>"), and running it enters that box. The prelude's
+// files have no mark, so the interpreter's own Ruby runs in its caller's box,
+// as a C function does in ruby -- and that is "<internal:...>" by NAME, not
+// "parsed during boot": the prelude's method bodies are parsed when first
+// called, by then in whichever box called them.
+let rec bx_tag = fn (f: str) ->
+  if vec_get box_st 0 > 0 && (if str_starts_with f "<internal:" then false else true)
+  then chr 1 ++ str_of_int (vec_get box_st 1) ++ chr 1 ++ f else f
+// (the class a key names: "Cls#m" -> Cls, "(sng:Cls)" -> Cls)
+and bx_key_cls = fn (k: str) ->
+  let c = (let i = str_index_of k "#" in if i < 0 then k else substring k 0 i) in
+  if str_len c > 6 && str_eq (substring c 0 5) "(sng:" then substring c 5 (str_len c - 1) else c
+and bx_writing = fn (u: unit) -> vec_get box_st 0 == 1 && vec_get box_st 2 != 1
+and bx_master_cls = fn (c: str) -> map_has bx_int ("b:" ++ c)
+and bx_walk = fn (kind: str) -> fn (b: int) -> fn (each: str -> unit) ->
+  let ck = kind ++ str_of_int b in
+  let n = (if map_has bx_int ("n:" ++ ck) then map_get bx_int ("n:" ++ ck) else 0) in
+  let rec go = fn (i: int) -> if i >= n then () else
+    (let _ = each (map_get bx_str ("l:" ++ ck ++ ":" ++ str_of_int i)) in go (i + 1)) in
+  go 0
+// (the doors: each asks before it writes)
+and bx_note_const = fn (k: str) ->
+  if bx_writing () then
+    (let i = str_last_index_of k "::" in
+     if i < 0 || bx_master_cls (substring k 0 i) then bx_note consts bx_val "c" k else ())
+  else ()
+and bx_note_gvar = fn (slot: str) -> if bx_writing () then bx_note globals bx_val "g" slot else ()
+and bx_note_meth = fn (k: str) ->
+  if bx_writing () && bx_master_cls (bx_key_cls k) then bx_note meths_g bx_meth "m" k else ()
+and bx_note_inc = fn (k: str) -> if bx_writing () && bx_master_cls k then bx_note includes bx_str "i" k else ()
+and bx_note_pre = fn (k: str) -> if bx_writing () && bx_master_cls k then bx_note prepends bx_str "p" k else ()
+// (a method key changing hands drops its parameter-name memo, as a write does)
+and bx_meth_memo = fn (b: int) -> bx_walk "m" b (fn (k: str) -> map_delete meth_params k)
+and bx_switch = fn (b: int) ->
+  let l = vec_get box_st 2 in
+  if l == b then () else
+  (let _ = (if l == 1 then () else
+             (let _ = bx_out consts bx_val "c" l in
+              let _ = bx_out globals bx_val "g" l in
+              let _ = bx_out meths_g bx_meth "m" l in
+              let _ = bx_out includes bx_str "i" l in
+              let _ = bx_out prepends bx_str "p" l in
+              bx_meth_memo l)) in
+   let _ = (if b == 1 then () else
+             (let _ = bx_in consts bx_val "c" b in
+              let _ = bx_in globals bx_val "g" b in
+              let _ = bx_in meths_g bx_meth "m" b in
+              let _ = bx_in includes bx_str "i" b in
+              let _ = bx_in prepends bx_str "p" b in
+              bx_meth_memo b)) in
+   let _ = vec_set box_st 2 b in
+   mro_bump ())
+// the running code's box: entered at once
+and box_set = fn (b: int) ->
+  let _ = vec_set box_st 1 b in
+  if vec_get box_st 0 == 1 then bx_switch b else ()
+// ...and a call's box comes back with its file when the call returns: the
+// depth's box is kept beside call_files_s (box_put / box_take), and the
+// frames that save a file in a local save the box with it (box_back)
+and box_put = fn (d: int) -> if vec_get box_st 0 == 1 then map_set call_box d (vec_get box_st 1) else ()
+and box_take = fn (d: int) -> if vec_get box_st 0 == 1 && map_has call_box d then box_set (map_get call_box d) else ()
+and box_back = fn (b: int) -> if vec_get box_st 0 == 1 then box_set b else ()
+// (the constant table's doors for a program's own writes)
+and consts_put = fn (k: str) -> fn (v: Val) -> let _ = bx_note_const k in map_set consts k v
+and consts_del = fn (k: str) -> let _ = bx_note_const k in map_delete consts k
+// (a marked file name enters its box; the name is the rest)
+and cur_file_set = fn (s: str) ->
+  if str_len s > 2 && str_eq (substring s 0 1) (chr 1) then
+    (let j = 1 + str_index_of (substring s 1 (str_len s)) (chr 1) in
+     let _ = box_set (int_of_str (substring s 1 j)) in
+     vec_set cur_fm 0 (pos_name_id (substring s (j + 1) (str_len s))))
+  else vec_set cur_fm 0 (pos_name_id s);
 let set_inc = fn (k: str) -> fn (v: str) ->
+  let _ = bx_note_inc k in
   let _ = mro_note_mixins v in let _ = class_sng_note k in let _ = mro_bump_class k in map_set includes k v;
 // After the unobserved first-inclusion proof, base is a bare Object subclass
 // with no dependency epoch, and mixin is an unobserved anonymous leaf. The
@@ -4843,6 +4992,7 @@ let set_inc = fn (k: str) -> fn (v: str) ->
 let set_fresh_inc = fn (base: str) -> fn (mixin: str) ->
   let _ = map_set mro_external mixin 1 in map_set includes base mixin;
 let set_pre = fn (k: str) -> fn (v: str) ->
+  let _ = bx_note_pre k in
   let _ = mro_note_mixins v in let _ = class_sng_note k in let _ = mro_bump_class k in map_set prepends k v;
 // ⚠ AND THE SAME FOR THE METHOD TABLE AND ITS TOMBSTONES, for a reason the
 // three above did not have: `has_meth` MEMOISES the whole ancestor walk on
@@ -4973,6 +5123,7 @@ let note_reflection_protocol = fn (key: str) ->
   then vec_set reflection_protocol_changed 0 1 else ();
 // All primary method writes, including raw singleton copies, mark their arena.
 let store_meth = fn tbl -> fn (key: str) -> fn (value: Meth) ->
+  let _ = bx_note_meth key in
   let _ = note_refinement_method_name key in
   let _ = note_reflection_protocol key in
   let _ = vec_set method_store_dirty 0 1 in map_set tbl key value;
@@ -5012,6 +5163,7 @@ let set_fresh_meth = fn tbl -> fn (owner: str) -> fn (key: str) -> fn (value: Me
   let _ = map_set meth_owner_seen owner 1 in
   let _ = map_delete meth_params key in store_meth tbl key value;
 let del_meth = fn tbl -> fn (k: str) ->
+  let _ = bx_note_meth k in
   let _ = vec_set method_store_dirty 0 1 in
   let _ = msnap_save tbl k in
   let _ = mro_bump () in let _ = map_delete meth_params k in map_delete tbl k;

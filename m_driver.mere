@@ -27,7 +27,11 @@ let core_prelude_a =
   // none of Object's constants) and why BasicObject.constants lists it
   "class BasicObject\n  BasicObject = self\nend\n" ++
   // ruby 4.0's toplevel `Ruby` module: the identity constants again, and
-  // Ruby::Box, which is never enabled here (RUBY_BOX is a CRuby build switch).
+  // Ruby::Box (RUBY_BOX=1 at startup; note 545 §6 -- the journal in m_state).
+  // A box is a Module (`box::X` is X at the box's top level), its code runs
+  // in it, and __in enters it around what it runs: the running code's box
+  // is where that code was read, so the block given to __in -- the
+  // prelude's own, marked by no box -- runs in the box entered.
   "module Ruby\n" ++
   "  VERSION = RUBY_VERSION\n" ++
   "  PATCHLEVEL = RUBY_PATCHLEVEL\n" ++
@@ -38,9 +42,61 @@ let core_prelude_a =
   "  PLATFORM = RUBY_PLATFORM\n" ++
   "  DESCRIPTION = RUBY_DESCRIPTION\n" ++
   "  COPYRIGHT = RUBY_COPYRIGHT\n" ++
-  "  class Box\n" ++
-  "    def self.enabled?; false; end\n" ++
-  "    def self.current; nil; end\n" ++
+  "  class Box < Module\n" ++
+  "    def self.enabled? = __on\n" ++
+  "    ALL = \{}\n" ++
+  "    def self.__obj(id) = (ALL[id] || (@__boxing = id; o = new; @__boxing = nil; o))\n" ++
+  "    def self.current = (__on ? __obj(__cur) : nil)\n" ++
+  "    def self.main = (__on ? __obj(3) : nil)\n" ++
+  "    def self.root = (__on ? __obj(2) : nil)\n" ++
+  "    def self.master = (__on ? __obj(1) : nil)\n" ++
+  "    def initialize\n" ++
+  "      @__id = Box.instance_variable_get(:@__boxing) || Box.__new\n" ++
+  "      ALL[@__id] = self\n" ++
+  "      __in \{ Box.__lp_fix } if @__id > 3\n" ++
+  // (a box other than main loads RubyGems for itself, as ruby's gem_prelude
+  //  does in each -- Bundler's setup is main's alone)
+  "      __in \{ Box.__gem_prelude } if @__id == 2 || @__id > 3\n" ++
+  "    end\n" ++
+  "    def self.__gem_prelude\n" ++
+  "      return unless Box.__gems\n" ++
+  "      bs = ENV.delete(\"BUNDLER_SETUP\")\n" ++
+  "      begin\n" ++
+  "        require 'rubygems'\n" ++
+  "      ensure\n" ++
+  "        ENV[\"BUNDLER_SETUP\"] = bs if bs\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    def self.__lp_fix\n" ++
+  "      def $LOAD_PATH.resolve_feature_path(feature)\n" ++
+  "        f = feature.respond_to?(:to_path) ? feature.to_path : feature\n" ++
+  "        raise TypeError, \"no implicit conversion of #\{feature.class} into String\" unless f.respond_to?(:to_str)\n" ++
+  "        Kernel.__resolve_feature(f.to_str)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    def __in\n" ++
+  "      prev = Box.__switch(@__id)\n" ++
+  "      begin\n" ++
+  "        yield\n" ++
+  "      ensure\n" ++
+  "        Box.__switch(prev)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    def main? = @__id == 3\n" ++
+  "    def root? = @__id == 2\n" ++
+  "    def master? = @__id == 1\n" ++
+  "    def inspect = \"#<Ruby::Box:#\{@__id},#\{@__id == 1 ? 'master' : @__id == 2 ? 'root' : @__id == 3 ? 'user,main' : 'user,optional'}>\"\n" ++
+  "    alias to_s inspect\n" ++
+  "    def eval(src) = __in \{ ::Kernel.eval(src, Box.__scope(@__id), \"eval\", 1) }\n" ++
+  "    def require(f) = __in \{ ::Kernel.require(f) }\n" ++
+  "    def require_relative(f)\n" ++
+  "      d = ::File.dirname(caller_locations(1, 1)[0].absolute_path)\n" ++
+  "      __in \{ ::Kernel.require(::File.expand_path(f, d)) }\n" ++
+  "    end\n" ++
+  "    def load(f, wrap = false) = __in \{ ::Kernel.load(f, wrap) }\n" ++
+  "    def load_path = __in \{ $LOAD_PATH }\n" ++
+  "    def const_missing(n) = __in \{ ::Object.const_get(n) }\n" ++
+  "    def constants(inherit = true) = __in \{ ::Object.constants }\n" ++
   "  end\n" ++
   "end\n" ++
   // the self of a wrapped load (`load(file, true)` / `load(file, mod)`): a
@@ -13211,6 +13267,15 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   // meant a -r library never ran at all. The parse still happens here (the
   // world below is built around it), but a failure is held in cli_opt
   // "synerr" and reported where ruby would have reached the parse.
+  // (RUBY_BOX=1: what is read from here on is read in the main box -- the
+  //  boxes themselves come on after the prelude, box_boot -- and ruby says
+  //  the feature is experimental)
+  let _ = (if str_eq (env_get "RUBY_BOX") "1" && vec_get box_st 0 == 0 then
+             (let _ = print_err ("mere-ruby: warning: Ruby::Box is experimental, and the behavior may change in the future!\n"
+                                 ++ "See https://docs.ruby-lang.org/en/4.0/Ruby/Box.html for known issues, etc.") in
+              let _ = vec_set box_st 0 2 in
+              vec_set box_st 1 3)
+           else ()) in
   let pok9 = map_new () in
   // (the main script is a program's own source: lvd_head marks its scopes)
   let _ = map_set lvd_st "main" 1 in
@@ -13258,6 +13323,7 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   let gc_mids = filter_mid prog in
   let gc_total = list_len gc_mids in
   let _ = (if embedded then () else driver_setup env src name) in
+  let _ = (if vec_get box_st 0 == 2 then box_boot () else ()) in
   let world = (meths_g, cls_sup, obj_cls, ivars_g) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let _ = (if embedded && src_coding_bad_line src > 0 then
@@ -13293,7 +13359,7 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   //  operating_system.rb warns and re-raises, test_rubygems)
   let gems_ok = (if str_eq (env_get "MERE_RUBY_NO_GEMS") "" && (if map_has cli_opt "nogems" then false else true)
               && (if str_eq (load_path_find world "rubygems.rb") "" then false else true)
-           then try_or_msg (fn (u: unit) -> (match do_require env world noblk false "rubygems" with _ -> true))
+           then try_or_msg (fn (u: unit) -> (match do_require env world noblk false "rubygems" with _ -> let _ = vec_set box_st 4 1 in true))
                   (fn (m: str) -> let _ = note_extern_refused m in false)
            else true) in
   // -r's libraries, required as the script itself would require them.

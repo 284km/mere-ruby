@@ -1359,6 +1359,10 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter anonymous_classes (fn (key: str) -> fn _v -> gc_native_add metadata key) in
   let _ = map_iter modules (fn (key: str) -> fn _v -> gc_native_add metadata key) in
   let _ = map_iter meths_g (fn (key: str) -> fn _v -> gc_native_add metadata key) in
+  // (...and a box's methods while another box is live: parked in its
+  //  journal, they are still its methods -- Ruby::Box)
+  let _ = (if map_len bx_meth > 0 then map_iter bx_meth (fn (key: str) -> fn _v ->
+             (let i9 = str_index_of key (chr 1) in if i9 > 0 then gc_native_add metadata (substring key (i9 + 1) (str_len key)) else ())) else ()) in
   let _ = map_iter meth_src (fn (key: str) -> fn _v -> gc_native_add metadata key) in
   let _ = map_iter struct_mem (fn (key: str) -> fn _v -> gc_native_add metadata key) in
   let _ = map_iter refine_cnt (fn (key: str) -> fn _v -> gc_native_add metadata key) in
@@ -1395,6 +1399,9 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter signal_traps mk in
   // (a non-main ractor's own standard streams, while it runs)
   let _ = map_iter ractor_stdio mk in
+  // (a box's own constants and globals while another box is live -- its
+  //  $LOADED_FEATURES among them -- and the master's under a live box's)
+  let _ = map_iter bx_val mk in
   let _ = map_iter dm_captured (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
   let _ = map_iter dm_closenv (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
   let _ = map_iter dm_methods (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
@@ -2891,7 +2898,22 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     then eval_e env world blk (EConst name)
     else VNil
   | EScopedRead (recv_e, cn) ->
-    (match scope_mod_val world (eval_e env world blk recv_e) with
+    let rv0 = eval_e env world blk recv_e in
+    // (an instance of a Module subclass whose class has a #const_missing of
+    //  its own -- Ruby::Box's -- asks it for a name its module does not
+    //  have, and the scope operator does not reach the top level from a
+    //  module: `MM.new::X` is MM#const_missing(:X) in ruby, X at the top or not)
+    if mod_inst_hook world rv0 then
+      (match scope_mod_val world rv0 with
+       | VClass c ->
+         (let key = c ++ "::" ++ cn in
+          let akey = (if map_has consts key then "" else anc_const_key_q world c cn) in
+          if map_has consts key then map_get consts key
+          else if (if str_eq akey "" then false else true) then map_get consts akey
+          else invoke_val_c env world blk rv0 "const_missing" (Cons (VSym cn, Nil)) false)
+       | _ -> VNil)
+    else
+    (match scope_mod_val world rv0 with
      | VClass c ->
        let key = c ++ "::" ++ cn in
        // `Logger::WARN` where WARN comes from an INCLUDED module (or a
@@ -6856,7 +6878,7 @@ and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
                    //  other global: only the same slot's spelling is used)
                    if str_len n9 > 1 && str_eq (gvar_slot (substring n9 1 (str_len n9))) slot then n9 else "$" ++ slot)
              else "$" ++ slot) in
-  let _ = (if str_eq slot "~" then rx_md_set v else map_set globals slot v) in
+  let _ = (if str_eq slot "~" then rx_md_set v else (let _ = bx_note_gvar slot in map_set globals slot v)) in
   // (the warning comes AFTER the store: a Warning.warn that prints sees the
   //  new $\ already, as ruby's does -- its line ends with it)
   // (and $\, the output record separator: rb_output_rs_setter warns too)
@@ -7144,7 +7166,7 @@ and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
                     else ())
                  else ())
            else ()) in
-  let _ = map_set consts key v in
+  let _ = consts_put key v in
   // ⚠ ...and an ANONYMOUS class or module gains its name here. Two of the
   //   assignment paths called name_anon and the rest did not, so
   //   `M.const_set(:Z, Class.new)` and `m::X = Class.new` left the class
@@ -8666,7 +8688,7 @@ and core_metadata_run = fn world -> fn captured -> fn (local: str) -> fn (body: 
   let _ = fb_wm_call (depth - 1) in
   let _ = map_set_si call_names_s depth blk_frame_mark in
   let _ = map_set call_lines depth (cur_line ()) in
-  let _ = map_set_si call_files_s depth (cur_file ()) in
+  let _ = (let _ = box_put depth in map_set_si call_files_s depth (cur_file ())) in
   let _ = map_set fb_env_at depth captured in
   let _ = fb_wm_put (depth * 8) in
   let _ = cd_set (depth + 1) in
@@ -8678,6 +8700,7 @@ and core_metadata_run = fn world -> fn captured -> fn (local: str) -> fn (body: 
   let _ = gc_unsafe_pop () in
   let _ = cd_set depth in
   let _ = vec_set cur_fm 0 file in
+  let _ = box_take depth in
   result
 and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // consume any pending forwarded-block home: a `&proc` passed to a BUILTIN
@@ -8740,7 +8763,7 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   let _ = cd_set (bcd9 + 1) in
   let _ = map_set_si call_names_s bcd9 blk_frame_mark in
   let _ = map_set call_lines bcd9 (cur_line ()) in
-  let _ = map_set_si call_files_s bcd9 (cur_file ()) in
+  let _ = (let _ = box_put bcd9 in map_set_si call_files_s bcd9 (cur_file ())) in
   // a proc/lambda that captured its defining method's block carries a yblk
   // marker: strip it and use that captured block as `encl` so `yield` inside
   // the proc body resolves to the defining method's block, not the caller's.
@@ -8924,6 +8947,7 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // turned a raise into FRaise above).
   let _ = cd_set bcd9 in
   let _ = vec_set cur_fm 0 fm9 in
+  let _ = box_take bcd9 in
   let _ = rx_blk_leave rxs9 rxb9 rxh9 in
   // the env dies here unless a closure captured it (see blk_env_put). On every
   // exit path: try_or has already turned a raise into FRaise, so this runs
@@ -11576,7 +11600,7 @@ and range_metadata_each = fn world -> fn captured -> fn (local: str) -> fn (body
   let depth = cd_get () in
   let file = vec_get cur_fm 0 in
   let _ = map_set_si call_names_s depth blk_frame_mark in
-  let _ = map_set_si call_files_s depth (cur_file ()) in
+  let _ = (let _ = box_put depth in map_set_si call_files_s depth (cur_file ())) in
   let _ = map_set fb_env_at depth captured in
   let rec loop = fn (turn: int) ->
     let _ = gc_point_finalizers world in
@@ -11593,7 +11617,7 @@ and range_metadata_each = fn world -> fn captured -> fn (local: str) -> fn (body
       }) (fn (message: str) -> let _ = note_extern_refused message in FRaise VNil) in
       let _ = gc_unsafe_pop () in
       let _ = cd_set depth in
-      let _ = vec_set cur_fm 0 file in result
+      let _ = vec_set cur_fm 0 file in let _ = box_take depth in result
     } in
     match flow with
     | FNext _ -> if turn == last then flow_next_nil else loop (turn + 1)
@@ -17493,7 +17517,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            if str_len k > str_len cpre9 && str_eq (substring k 0 (str_len cpre9)) cpre9
                            then map_set tc9 (nsng9 ++ "::" ++ substring k (str_len cpre9) (str_len k)) v
                            else ()) in
-                 let _ = map_iter tc9 (fn (k: str) -> fn (v: Val) -> map_set consts k v) in
+                 let _ = map_iter tc9 (fn (k: str) -> fn (v: Val) -> consts_put k v) in
                  map_set hng_store (hng_key cp) nsng9)
               else if tagged9 then map_set hng_store (hng_key cp) tag9 else ()) in
      // ...and so does a CHILLED literal's state: #clone of one is chilled
@@ -18833,10 +18857,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          //  name; it comes back after, raised or not, as Kernel#eval's does --
          //  every block written after `m.module_eval("...")` reported the
          //  eval as its file: test_thread's test_inspect)
-         let of9 = cur_file () in
+         let of9 = cur_file () in let ob9 = vec_get box_st 1 in
          let ol9 = cur_line () in
          let r = try_or (fn (u: unit) -> (let v9 = flow_value (register_class_blk world c p2 c env) in let _ = map_set ok9 "y" 1 in v9)) VNil in
-         let _ = cur_file_set of9 in
+         let _ = cur_file_set of9 in let _ = box_back ob9 in
          let _ = cur_line_set ol9 in
          let _ = set_lex saved in
          let _ = eval_pfile_pop savedpf in
@@ -23737,6 +23761,40 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 if str_starts_with c9 "(sng:" then VNil else mkstr c9)
              else VSym (substring l9 (cut9 + 1) (str_len l9))))
        | _ -> VNil)
+    // Ruby::Box's machinery (the prelude's class): __on, __cur (the running
+    // code's box), __switch(id) (enter a box, answering the one left),
+    // __new (a box id, with load lists of its own), __scope(id) (a fresh
+    // top level in that box, as a Binding)
+    else if str_eq c "Ruby::Box" && (str_eq name "__on" || str_eq name "__cur" || str_eq name "__gems"
+                                     || str_eq name "__switch" || str_eq name "__scope" || str_eq name "__new") then
+      (if str_eq name "__on" then VBool (vec_get box_st 0 == 1)
+       else if str_eq name "__cur" then VInt (vec_get box_st 1)
+       else if str_eq name "__gems" then VBool (vec_get box_st 4 == 1)
+       else if str_eq name "__switch" then
+         (match args with
+          | Cons (VInt b9, _) -> (let o9 = vec_get box_st 1 in let _ = box_set b9 in VInt o9)
+          | _ -> VNil)
+       else if str_eq name "__scope" then
+         // a top level of the box's own: main as self, no locals but its
+         // own, the box noted where a later Binding#eval finds it
+         (match args with
+          | Cons (VInt b9, _) ->
+            (let p9 = map_new () in
+             let _ = map_set p9 "self" VMain in
+             let _ = map_set p9 "__box" (VInt b9) in
+             let c9 = bnd_live p9 in
+             let _ = map_set c9 "__blex" (mkstr "") in
+             let _ = map_set c9 "__bnest" (mkstr "") in
+             let id = handle_base + map_len bind_store in
+             let _ = map_set bind_store (str_of_int id) c9 in
+             let _ = map_set bind_loc (str_of_int id) ("eval\n1") in
+             VBind id)
+          | _ -> VNil)
+       else if str_eq name "__new" then
+         (let b9 = vec_get box_st 3 in
+          let _ = vec_set box_st 3 (b9 + 1) in
+          let _ = box_seed b9 in VInt b9)
+       else VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 11 && str_eq name "__val_of_id") then
       (match args with
        | Cons (VInt i9, _) ->
@@ -23971,7 +24029,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          let old = if map_has consts n then map_get consts n else VNil in
          let _ = const_read_note world n in
          let _ = if map_has deprecated_consts n then map_delete deprecated_consts n else () in
-         let _ = if map_has consts n then map_delete consts n else () in
+         let _ = if map_has consts n then consts_del n else () in
          let _ = if auto9 then map_delete autoloads al9 else () in
          // (a class removed under its own name: the next `class` of that name
          //  is a NEW class, and must not find this one's constants -- see
@@ -27910,7 +27968,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                             if str_len k > str_len cpre && str_eq (substring k 0 (str_len cpre)) cpre
                             then map_set tc (nsng ++ "::" ++ substring k (str_len cpre) (str_len k)) v
                             else ()) in
-                  let _ = map_iter tc (fn (k: str) -> fn (v: Val) -> map_set consts k v) in
+                  let _ = map_iter tc (fn (k: str) -> fn (v: Val) -> consts_put k v) in
                   // ...and the singleton class's OWN singleton class: a method
                   // defined on `o.singleton_class.singleton_class` answers
                   // `clone.singleton_class.m` too (rb_singleton_class_clone)
@@ -34573,11 +34631,11 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
        //   the same rule living in one of its two places.
        let _ = map_set env2 "__definee_recv" recv in
        // (...and the run-time file comes back after, as module_eval's does)
-       let of9 = cur_file () in
+       let of9 = cur_file () in let ob9 = vec_get box_st 1 in
        let ol9 = cur_line () in
        let ok9 = map_new () in
        let r2 = try_or (fn (u: unit) -> (let v9 = eval_run env2 world blk p2 in let _ = map_set ok9 "y" 1 in v9)) VNil in
-       let _ = cur_file_set of9 in
+       let _ = cur_file_set of9 in let _ = box_back ob9 in
        let _ = cur_line_set ol9 in
        let _ = lv_child_done env2 in
        if map_has ok9 "y" then r2
@@ -36316,6 +36374,45 @@ and prim_q_init = fn world -> fn (id: int) -> fn (cls: str) -> fn (args: Val lis
         else (let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in VNil))
      | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
   else VNil
+// RUBY_BOX=1: boxes come on once the interpreter has booted (the driver
+// marked the main script for main already, box_st 0 is 2). What there is now
+// is the master's: its class names (bx_int "b:") are the ones a box writes by
+// journal. Main (3) and root (2) get
+// load lists of their own, and the program starts in main.
+and box_boot = fn (u: unit) ->
+  let _ = map_iter cls_sup (fn (k9: str) -> fn (_v9: str) -> map_set bx_int ("b:" ++ k9) 1) in
+  let _ = map_iter modules (fn (k9: str) -> fn (_v9: Val) -> map_set bx_int ("b:" ++ k9) 1) in
+  let _ = map_iter consts (fn (k9: str) -> fn (v9: Val) ->
+            match v9 with VClass c9 -> (let _ = map_set bx_int ("b:" ++ c9) 1 in map_set bx_int ("b:" ++ k9) 1) | _ -> ()) in
+  let _ = map_set bx_int "b:Object" 1 in
+  let _ = map_set bx_int "b:BasicObject" 1 in
+  let _ = vec_set box_st 0 1 in
+  let _ = box_seed 2 in
+  let _ = box_seed 3 in
+  box_set 3
+// a new box's $LOADED_FEATURES and $LOAD_PATH: copies of the master's, its
+// own from then on (journaled as the box's writes, so the master's stay)
+and box_seed = fn (b: int) ->
+  let o9 = vec_get box_st 1 in
+  let _ = box_set b in
+  let cp9 = fn (slot: str) ->
+    (match (if map_has globals slot then map_get globals slot else VNil) with
+     | VArr a9 ->
+       (let rec go = fn (i: int) -> fn (acc: Val list) -> if i < 0 then acc else go (i - 1) (Cons (arr_at a9 i, acc)) in
+        let _ = bx_note_gvar slot in
+        map_set globals slot (arr_new (go (arr_len a9 - 1) Nil)))
+     | _ -> ()) in
+  let _ = cp9 (gvar_slot "LOADED_FEATURES") in
+  let _ = cp9 (gvar_slot "LOAD_PATH") in
+  box_set o9
+and mod_inst_hook = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id ->
+    (let (_, _, oc9, _) = world in
+     map_has oc9 id && obj_is_a world (map_get oc9 id) "Module"
+     && (let ow9 = owner_anc world (ancestors_of world (map_get oc9 id)) "const_missing" in
+         (if str_eq ow9 "" || str_eq ow9 "Module" then false else true)))
+  | _ -> false
 and mod_inst_is = fn world -> fn (v: Val) ->
   match v with
   | VObj id -> (let (_, _, oc9, _) = world in map_has oc9 id && str_list_has (ancestors_of world (map_get oc9 id)) "Module")
@@ -48160,7 +48257,7 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
                  // (the warning names the receiver as ruby shows it: a class
                  // made by Class.new is its constant's path, not AnonClass_k)
                  let _ = (if map_has consts cn then rb_warn world ("redefining constant " ++ (if str_eq parent "" then "Struct" else to_s (VClass parent)) ++ "::" ++ nm9) else ()) in
-                 let _ = map_set consts cn (VClass anon) in
+                 let _ = consts_put cn (VClass anon) in
                  name_anon cn (VClass anon)))
            | _ -> ()) in
   let _ = map_set struct_mem anon (arr_new (struct_sym_vals members)) in
@@ -48268,7 +48365,7 @@ and method_body_flow_result = fn frame -> fn world -> fn blk -> fn (body: Stmt l
   // because the line is one global: without this, the current line after a call
   // returns would be the last line the CALLEE ran.
   let _ = map_set call_lines cd (cur_line ()) in
-  let _ = map_set_si call_files_s cd (cur_file ()) in
+  let _ = (let _ = box_put cd in map_set_si call_files_s cd (cur_file ())) in
   let _ = map_set_si call_meths_s cd (cur_meth ()) in
   let _ = cur_meth_set mlabel9 in
   // mark this frame live so a break targeting it (via a block's home) can find
@@ -48323,7 +48420,7 @@ and method_body_flow_result = fn frame -> fn world -> fn blk -> fn (body: Stmt l
   let _ = (if map_has frame "__tpkeep" then map_set tp_mstack "fl" (str_of_int (cur_line ())) else ()) in
   // ... and with it the caller's line and file, for the same reason
   let _ = cur_line_set (if map_has call_lines cd then map_get call_lines cd else 0) in
-  let _ = cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "") in
+  let _ = (let _ = box_take cd in cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "")) in
   let _ = cur_meth_set (if map_has call_meths_s cd then map_get call_meths_s cd else "") in
   // read, compare, write only if it differs -- the body may have left the flag
   // set (a nested Thread.new), so "skip the restore because we skipped the
@@ -48627,6 +48724,7 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
      //  program's own SFile set it, and nothing set it back -- a raise after
      //  `load "x.rb"` was reported at x.rb)
      let savedcf9 = cur_file () in
+     let savedbx9 = vec_get box_st 1 in
      // (...and a `return` in it ends the file there, as it does the
      //  top level's own)
      let rec pre9 = fn (ss: Stmt list) ->
@@ -48654,6 +48752,7 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
                               (fn (m: str) -> (if top_return_taken () then FNext VNil else fail m))) in
      let _ = rx_call_leave fid9 rx0 (map_has fenv "__captured") in
      let _ = cur_file_set savedcf9 in
+     let _ = box_back savedbx9 in
      let _ = ref_install rfprev in
      let _ = set_lex (pack_cref savedlex) in
      let _ = set_nest (pack_nest savedlex) in
@@ -54491,7 +54590,7 @@ and loc_obj = fn world -> fn (path: str) -> fn (line: int) -> fn (label: str) ->
   let (meths, sup, ocls, ivars) = world in
   let cls = "Thread::Backtrace::Location" in
   let _ = (if map_has consts cls then ()
-           else (let _ = map_set consts cls (VClass cls) in
+           else (let _ = consts_put cls (VClass cls) in
                  let _ = add_attrs world cls "r" (Cons ("path", Cons ("lineno", Cons ("label", Cons ("absolute_path", Cons ("base_label", Nil)))))) in
                  ())) in
   (match new_obj world cls Nil with
@@ -56626,7 +56725,7 @@ and bi_frame_put = fn (d: int) -> fn (l: str) ->
   let _ = fb_wm_put (d * 8) in
   let _ = map_set_si call_names_s d l in
   let _ = map_set call_lines d (cur_line ()) in
-  let _ = map_set_si call_files_s d (cur_file ()) in
+  let _ = (let _ = box_put d in map_set_si call_files_s d (cur_file ())) in
   // (no env: a stale one left at this depth must not be read as this frame's)
   if map_has fb_env_at d then map_delete fb_env_at d else ()
 // the frame a builtin's refusal was raised in, on top of the raiser's: what
@@ -56644,7 +56743,7 @@ and in_scope_frame = fn (label: str) -> fn senv -> fn (body: unit -> Flow) ->
   let _ = cd_set (cd + 1) in
   let _ = map_set_si call_names_s cd label in
   let _ = map_set call_lines cd (cur_line ()) in
-  let _ = map_set_si call_files_s cd (cur_file ()) in
+  let _ = (let _ = box_put cd in map_set_si call_files_s cd (cur_file ())) in
   let _ = map_set_si call_meths_s cd (cur_meth ()) in
   let _ = cur_meth_set label in
   let _ = map_set fb_env_at cd senv in
@@ -56652,7 +56751,7 @@ and in_scope_frame = fn (label: str) -> fn senv -> fn (body: unit -> Flow) ->
   let r = try_or body (FRaise VNil) in
   let _ = cd_set cd in
   let _ = cur_line_set (if map_has call_lines cd then map_get call_lines cd else 0) in
-  let _ = cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "") in
+  let _ = (let _ = box_take cd in cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "")) in
   let _ = cur_meth_set (if map_has call_meths_s cd then map_get call_meths_s cd else "") in
   r
 // `<class:Name>` / `<module:Name>`: the last segment of the name
@@ -57458,7 +57557,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                  then let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ full) in ()
                  else () in
          let _ = if str_eq qsuper "" then () else set_sup sup full qsuper in
-         let _ = if map_has consts full then () else map_set consts full (VClass full) in
+         let _ = if map_has consts full then () else consts_put full (VClass full) in
          let _ = if was_new then const_added_hook world full else () in
          let _ = if was_new then call_inherited world cenv qsuper full else () in
          let saved_lex = cur_lex () in
@@ -57502,7 +57601,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                 // X.superclass is the old class object.
                 (let internal = fresh_anon "AnonClass_" in
                  let _ = set_sup sup internal sc in
-                 let _ = map_set consts full (VClass internal) in
+                 let _ = consts_put full (VClass internal) in
                  let _ = name_anon full (VClass internal) in
                  let _ = call_inherited world cenv sc internal in
                  let saved_lex = cur_lex () in
@@ -57513,7 +57612,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                  r)
               else
               let _ = if str_eq sc full then () else set_sup sup full sc in
-              let _ = if map_has consts full then () else map_set consts full (VClass full) in
+              let _ = if map_has consts full then () else consts_put full (VClass full) in
               let _ = if was_new then const_added_hook world full else () in
               let _ = if was_new && (if str_eq sc full then false else true) then call_inherited world cenv sc full else () in
               let saved_lex = cur_lex () in
@@ -59000,10 +59099,13 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
        // `require "digest/sha2"` -- but the SOURCE is the one that already
        // ran, and running it again re-assigns every constant in it. See
        // stdlib_ran for why the test is the body and not a list of names.
-       if (if str_eq shipped "" then false else true) && map_has stdlib_ran shipped then
+       // (...once per BOX: each loads the library for itself, as a box's
+       //  $LOADED_FEATURES says it has not -- Ruby::Box)
+       let srk9 = (if vec_get box_st 0 == 1 then shipped ++ chr 1 ++ str_of_int (vec_get box_st 1) else shipped) in
+       if (if str_eq shipped "" then false else true) && map_has stdlib_ran srk9 then
          FNext (VBool true)
        else
-       let _ = (if str_eq shipped "" then () else map_set stdlib_ran shipped VNil) in
+       let _ = (if str_eq shipped "" then () else map_set stdlib_ran srk9 VNil) in
        let _ = (if str_eq shipped "" then () else map_set shipped_files full "1") in
        // A library mere-ruby SHIPS (see stdlib_src) is its implementation of
        // that feature, so it wins over a file of the same name on the load
@@ -59134,7 +59236,7 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
         // then fog-aws reports a missing Process.clock_gettime).
         | FRaise v ->
           let _ = (if str_eq shipped (nkf_lib_src ()) then
-                     (let _ = unmark9 () in map_delete stdlib_ran shipped)
+                     (let _ = unmark9 () in map_delete stdlib_ran srk9)
                    else ()) in
           let _ = map_delete loaded_files full in
           let _ = (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
@@ -59732,6 +59834,17 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // resolve a variable-qualified base (`module m::N` with m a local) to the
     // module's real name before registration.
     let name = resolve_scoped_base env name in
+    // ...and a base that is a CONSTANT holding an anonymous module is that
+    // module: `X = Module.new; class X::Y; end` defines Y in it (X.constants
+    // is [:Y]), as a box's own `module Gem` -- anonymous inside, Ruby::Box --
+    // is where `class Gem::E < ...` goes. It went to a separate "X::Y".
+    let name = (let i9 = str_index_of name "::" in
+                if i9 > 0 && map_has consts (substring name 0 i9) then
+                  (match map_get consts (substring name 0 i9) with
+                   | VClass r9 -> if is_anon_cls r9 && (if str_eq r9 (substring name 0 i9) then false else true)
+                                  then r9 ++ substring name i9 (str_len name) else name
+                   | _ -> name)
+                else name) in
     // (...and under Object is the top level: `class Object::Integer`, or a
     //  scope that evaluates to Object -- `class x::String` with x = Object --
     //  reopens ::Integer. It made a second class beside it)
@@ -59752,7 +59865,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                 let ks9 = map_new () in
                 let _ = map_iter consts (fn (k9: str) -> fn (_v9: Val) ->
                           if str_len k9 > str_len pfx9 && str_eq (substring k9 0 (str_len pfx9)) pfx9 then map_set ks9 k9 1 else ()) in
-                map_iter ks9 (fn (k9: str) -> fn (_u9: int) -> map_delete consts k9))
+                map_iter ks9 (fn (k9: str) -> fn (_u9: int) -> consts_del k9))
              else ()) in
     // `class << target` at top level: open the target's singleton class.
     if (str_len name == 11 && str_eq name "<<singleton") then
@@ -59887,12 +60000,34 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                       if str_eq existing super0 then false else true) then
                let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ name) in ()
              else ()) in
+    // ⚠ ...and IN A BOX a name another box's class already has is a NEW
+    //   class (Ruby::Box): the box does not see that one (bx_note_const kept
+    //   its constant out), and the table keys a class by its name. Made as
+    //   `Foo = Class.new` would be -- an anonymous internal name, `Foo` to
+    //   show -- so both stay what they are.
+    if vec_get box_st 0 == 1 && (if already then false else true)
+       && (map_has sup name || map_has modules name || map_has bx_int ("m:" ++ name) || map_has bx_int ("b:" ++ name)) then
+      (let internal = fresh_anon (if is_module then "AnonModule_" else "AnonClass_") in
+       let _ = (if is_module then map_set modules internal VNil
+                else set_sup sup internal (if str_eq super0 "" then "Object" else super0)) in
+       let _ = consts_put name (VClass internal) in
+       let _ = name_anon name (VClass internal) in
+       let _ = const_added_hook world name in
+       let _ = (if is_module then () else call_inherited world env (if str_eq super0 "" then "Object" else super0) internal) in
+       let saved_lex = cur_lex () in
+       let _ = set_lex internal in
+       let r = try_or (fn (u: unit) -> (let _ = cls_home_note env in register_class world internal body)) (FRaise VNil) in
+       let _ = set_lex saved_lex in
+       (match r with
+        | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
+        | _ -> r))
+    else
     if (if already then false else true) && (if is_module then false else true) && str_eq super0 name then
       // `class X < remove_const(:X)` at the top level: same collision-rename
       // as the nested path (the constant/display name stays `name`).
       (let internal = fresh_anon "AnonClass_" in
        let _ = set_sup sup internal super0 in
-       let _ = map_set consts name (VClass internal) in
+       let _ = consts_put name (VClass internal) in
        let _ = name_anon name (VClass internal) in
        let _ = call_inherited world env super0 internal in
        let saved_lex = cur_lex () in
@@ -59908,7 +60043,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let super = (if is_module then (let _ = map_set modules name VNil in "") else super0) in
     let _ = if str_eq super "" || str_eq super name then () else set_sup sup name super in
     // record the class itself as a defined constant (const_defined? etc.).
-    let _ = if map_has consts name then () else map_set consts name (VClass name) in
+    let _ = if map_has consts name then () else consts_put name (VClass name) in
+    let _ = (if vec_get box_st 0 == 1 && (if already then false else true) then map_set bx_int ("m:" ++ name) 1 else ()) in
     // fire the inherited hook for a freshly-created subclass.
     let _ = if already then () else const_added_hook world name in
     let _ = if already then () else call_inherited world env super name in
@@ -61118,7 +61254,23 @@ and iso_eval_check = fn env -> fn world -> fn (code: str) ->
            else go j9)
         else go (i + 1)) in
      go 0)
+// (an eval through a Binding made in a box runs in that box -- the binding
+//  holds where it was made, `__box` in its scope, set by Box#eval)
 and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
+  if vec_get box_st 0 == 1 then
+    (let be9 = (match args with Cons (_, Cons (VBind bid, _)) -> map_get bind_store (str_of_int bid) | _ -> env) in
+     match (if lv_has be9 "__box" then lv_get be9 "__box" else VNil) with
+     | VInt b9 ->
+       (let ob9 = vec_get box_st 1 in
+        let _ = box_set b9 in
+        let r9 = try_or (fn (u: unit) -> FNext (do_eval0 env world blk args)) (FRaise VNil) in
+        let _ = box_set ob9 in
+        match r9 with
+        | FNext v9 -> v9
+        | _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception"))
+     | _ -> do_eval0 env world blk args)
+  else do_eval0 env world blk args
+and do_eval0 = fn env -> fn world -> fn blk -> fn (args: Val list) ->
   // (the frame this eval draws, named by the caller -- see eval_framed --
   //  and taken now, so an eval that never runs leaves no name behind)
   let efl9 = (if map_has eval_frame_lbl "l"
@@ -61592,7 +61744,7 @@ and eval_framed = fn (lbl9: str) -> fn (rest: Val list) -> fn cenv -> fn eenv ->
         let _ = cd_set (cd + 1) in
         let _ = map_set_si call_names_s cd label in
         let _ = map_set call_lines cd (cur_line ()) in
-        let _ = map_set_si call_files_s cd (cur_file ()) in
+        let _ = (let _ = box_put cd in map_set_si call_files_s cd (cur_file ())) in
         let _ = map_set_si call_meths_s cd (cur_meth ()) in
         let _ = cur_meth_set (if str_eq label blk_frame_mark then cur_meth () else label) in
         let _ = map_set fb_env_at cd senv in
@@ -61600,7 +61752,7 @@ and eval_framed = fn (lbl9: str) -> fn (rest: Val list) -> fn cenv -> fn eenv ->
      let pop9 = fn (cd: int) ->
        (let _ = cd_set cd in
         let _ = cur_line_set (if map_has call_lines cd then map_get call_lines cd else 0) in
-        let _ = cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "") in
+        let _ = (let _ = box_take cd in cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "")) in
         cur_meth_set (if map_has call_meths_s cd then map_get call_meths_s cd else "")) in
      let d1 = push9 lbl9 eenv in
      let d2 = push9 inner9 (if str_eq inner9 blk_frame_mark then cenv else eenv) in
@@ -61643,7 +61795,7 @@ and eval_run_at0 = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (
     // the parsed program carries an SFile naming the eval'd SOURCE, which
     // would overwrite the file the caller named the moment it runs.
     (let prog2 = drop_file_marks prog2 in
-     let of9 = (cur_file ()) in
+     let of9 = (cur_file ()) in let ob9 = vec_get box_st 1 in
      let ol9 = (cur_line ()) in
      let _ = cur_file_set efile in
      let _ = cur_line_set eline in
@@ -61652,7 +61804,7 @@ and eval_run_at0 = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (
      region EVA {
      let ok9 = map_new () in
      let r9 = try_or (fn (u: unit) -> (let v9 = eval_run env world blk prog2 in let _ = map_set ok9 "y" 1 in v9)) VNil in
-     let _ = cur_file_set of9 in
+     let _ = cur_file_set of9 in let _ = box_back ob9 in
      let _ = cur_line_set ol9 in
      if map_has ok9 "y" then r9
      else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (passed on past an eval)")) in
