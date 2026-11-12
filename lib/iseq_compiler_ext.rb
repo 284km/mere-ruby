@@ -45,8 +45,10 @@ class RubyVM::InstructionSequence
                  "|": :opt_or }.freeze
     SPECIAL2 = { "[]=": :opt_aset }.freeze
 
-    Label = Struct.new(:id, :pos, :refs)
+    Label = Struct.new(:id, :pos, :refs, :sp, :unremovable)
     Insn = Struct.new(:name, :ops, :line, :node_id, :events)
+    Trace = Struct.new(:event)
+    Adjust = Struct.new(:label)
     CallData = Struct.new(:mid, :flag, :argc, :kwargs)
 
     # one instruction sequence being built, and what to_a / disasm read off it
@@ -76,15 +78,19 @@ class RubyVM::InstructionSequence
       attr_accessor :last_line
       attr_reader :loops
 
-      def new_label = Label.new(@labels += 1, nil, 0)
+      def new_label = Label.new(@labels += 1, nil, 0, nil, false)
       def emit_label(l) = @elements << l
-      def event(e) = @pending << e
+      # (a trace event is an element of its own, as in compile.c: it goes to
+      #  the instruction that follows it when the sequence is laid out, and
+      #  goes away with an unreachable chunk)
+      def event(e) = @elements << Trace.new(e)
+      def adjust(l) = @elements << Adjust.new(l)
       def at(line, node_id) = (@line, @node = line, node_id)
       def line = @line
 
       def insn(name, *ops)
-        i = Insn.new(name, ops, @line, @node, @pending)
-        @pending = []
+        ops.each { |o| o.refs += 1 if o.is_a?(Label) }
+        i = Insn.new(name, ops, @line, @node, [])
         @elements << i
         i
       end
@@ -326,29 +332,76 @@ class RubyVM::InstructionSequence
       u.insn(:putobject, n.name) unless popped
     end
 
+    # prism_compile.c's pm_compile_conditional: the condition jumps to the
+    # then- or else-label, each part runs if a jump reaches it, and the
+    # peephole optimiser (finish) tidies the jumps up as compile.c's does
     def branch(u, n, popped)
       unless_ = n.is_a?(Prism::UnlessNode)
-      then_body = n.statements
-      else_body = unless_ ? n.else_clause&.statements : (n.subsequent.is_a?(Prism::ElseNode) ? n.subsequent.statements : n.subsequent)
-      l_else = u.new_label
-      l_end = u.new_label
-      node(u, n.predicate, false)
-      u.insn(unless_ ? :branchif : :branchunless, l_else)
-      l_else.refs += 1
-      if then_body then node(u, then_body, popped) else (u.insn(:putnil) unless popped) end
-      if else_body || !popped
-        u.insn(:jump, l_end)
-        l_end.refs += 1
-        u.emit_label(l_else)
-        if else_body
-          node(u, else_body, popped)
-        else
-          u.insn(:putnil) unless popped
-        end
-        u.emit_label(l_end)
+      if unless_
+        then_body = n.else_clause
+        else_body = n.statements
       else
-        u.emit_label(l_else)
+        then_body = n.statements
+        else_body = n.subsequent
       end
+      then_l = u.new_label
+      else_l = u.new_label
+      end_l = nil
+      branch_condition(u, n.predicate, then_l, else_l)
+      if then_l.refs > 0
+        u.emit_label(then_l)
+        compile_part(u, then_body, popped, n)
+        if else_l.refs > 0
+          end_l = u.new_label
+          here(u, n)
+          u.insn(:jump, end_l)
+          u.insn(:pop) unless popped
+        end
+      end
+      if else_l.refs > 0
+        u.emit_label(else_l)
+        compile_part(u, else_body, popped, n)
+      end
+      u.emit_label(end_l) if end_l
+    end
+
+    def compile_part(u, part, popped, owner)
+      part = part.statements if part.is_a?(Prism::ElseNode)
+      if part
+        node(u, part, popped)
+      elsif !popped
+        here(u, owner)
+        u.insn(:putnil)
+      end
+    end
+
+    # pm_compile_branch_condition
+    def branch_condition(u, cond, then_l, else_l)
+      case cond
+      when Prism::FalseNode, Prism::NilNode
+        here(u, cond)
+        u.insn(:jump, else_l)
+        return
+      when Prism::FloatNode, Prism::ImaginaryNode, Prism::IntegerNode, Prism::RationalNode,
+           Prism::StringNode, Prism::SymbolNode, Prism::TrueNode
+        here(u, cond)
+        u.insn(:jump, then_l)
+        return
+      when Prism::AndNode, Prism::OrNode
+        raise NotImplementedError, "RubyVM::InstructionSequence: && / || in a condition is not compiled yet"
+      end
+      start = u.elements.size
+      node(u, cond, false)
+      chunk = u.elements[start..].grep(Insn)
+      if chunk.size == 1 && chunk[0].name == :putobject
+        u.elements.delete(chunk[0])
+        here(u, cond)
+        u.insn(:jump, chunk[0].ops[0] ? then_l : else_l)
+        return
+      end
+      here(u, cond)
+      u.insn(:branchunless, else_l)
+      u.insn(:jump, then_l)
     end
 
     # prism_compile.c's pm_compile_loop: the next / redo / break labels,
@@ -362,18 +415,27 @@ class RubyVM::InstructionSequence
       redo_l = u.new_label
       break_l = u.new_label
       end_l = u.new_label
-      u.insn(:jump, next_l); next_l.refs += 1
+      adjust_l = u.new_label
+      next_catch_l = u.new_label
+      # (the catch table's break / next / redo entries mark these: no jump
+      #  reaches the adjust block a `next` lands in, and it stays)
+      [redo_l, break_l, next_catch_l].each { |x| x.unremovable = true }
+      u.insn(:jump, next_l)
+      u.emit_label(adjust_l)
       u.insn(:putnil)
+      u.emit_label(next_catch_l)
       u.insn(:pop)
-      u.insn(:jump, next_l); next_l.refs += 1
+      u.insn(:jump, next_l)
       u.emit_label(redo_l)
       u.loops.push([next_l, break_l, redo_l])
       node(u, n.statements, true) if n.statements
       u.loops.pop
       u.emit_label(next_l)
-      node(u, n.predicate, false)
-      u.insn(until_ ? :branchunless : :branchif, redo_l); redo_l.refs += 1
+      if until_ then branch_condition(u, n.predicate, end_l, redo_l)
+      else branch_condition(u, n.predicate, redo_l, end_l)
+      end
       u.emit_label(end_l)
+      u.adjust(adjust_l)
       here(u, n)
       u.insn(:putnil)
       u.emit_label(break_l)
@@ -386,24 +448,185 @@ class RubyVM::InstructionSequence
       raise NotImplementedError, "RubyVM::InstructionSequence: break with values" if args.size > 1
       if args.empty? then u.insn(:putnil) else node(u, args[0], false) end
       here(u, n)
-      u.insn(:jump, lp[1]); lp[1].refs += 1
+      u.insn(:jump, lp[1])
     end
 
-    # -- the backend: specialise, unify, lay out ---------------------------
+    # -- the backend (compile.c's iseq_setup): peephole and specialised
+    # instructions, operand unification, the stack depth, the layout ----
     def finish(u)
+      peephole(u)
+      specialize(u)
+      unify(u)
+      attach_traces(u)
+      pos = 0
+      u.elements.each do |e|
+        if e.is_a?(Label) then e.pos = pos
+        elsif e.is_a?(Insn) then pos += 1 + e.ops.size
+        end
+      end
+      u.stack_max = stack_max(u)
+    end
+
+    def insn_at(els, i)
+      i += 1 while i < els.size && !(els[i].is_a?(Insn) || els[i].is_a?(Adjust))
+      i < els.size ? i : nil
+    end
+
+    def dest_index(els, label) = insn_at(els, els.index { |x| x.equal?(label) } + 1)
+
+    def unref(e) = e.ops.each { |o| o.refs -= 1 if o.is_a?(Label) }
+
+    # compile.c's iseq_peephole_optimize, the rules about jumps, branches and
+    # unreachable code (more as the compiler meets them)
+    def peephole(u)
       els = u.elements
-      # a send with no block and plain arguments is opt_send_without_block,
-      # or one of the opt_* that the VM answers for the builtin classes
-      els.each do |e|
+      i = 0
+      while i < els.size
+        e = els[i]
+        if e.is_a?(Insn)
+          changed = peephole_insn(els, i)
+          next if changed == :again
+        end
+        i += 1
+      end
+    end
+
+    def peephole_insn(els, i)
+      e = els[i]
+      case e.name
+      when :jump
+        d = dest_index(els, e.ops[0])
+        nx = insn_at(els, i + 1)
+        if d && d == nx
+          unref(e)
+          els.delete_at(i)
+          return :again
+        end
+        de = d && els[d]
+        if de.is_a?(Insn) && de.name == :jump && !de.ops[0].equal?(e.ops[0]) && traces_before(els, d).empty?
+          e.ops[0].refs -= 1
+          e.ops[0] = de.ops[0]
+          e.ops[0].refs += 1
+          remove_unreachable(els, i + 1)
+          return :again
+        elsif de.is_a?(Insn) && de.name == :leave
+          unref(e)
+          e.name = :leave
+          e.ops = []
+          e.line, e.node_id = de.line, de.node_id
+          return :again
+        end
+        pi = prev_insn(els, i)
+        if pi && els[pi].is_a?(Insn) && (els[pi].name == :branchif || els[pi].name == :branchunless)
+          pe = els[pi]
+          pd = dest_index(els, pe.ops[0])
+          if nx && pd == nx
+            lbl_after = els[pi + 1].is_a?(Label) ? els[pi + 1] : nil
+            refcnt = lbl_after ? lbl_after.refs : 0
+            pe.name = pe.name == :branchif ? :branchunless : :branchif
+            pe.ops[0].refs -= 1
+            pe.ops[0] = e.ops[0]
+            e.ops[0].refs += 1
+            if refcnt <= 1
+              unref(e)
+              els.delete_at(i)
+            end
+            return nil
+          end
+        end
+        return :again if remove_unreachable(els, i + 1)
+      when :leave
+        remove_unreachable(els, i + 1)
+      end
+      nil
+    end
+
+    def prev_insn(els, i)
+      i -= 1
+      i -= 1 while i >= 0 && !(els[i].is_a?(Insn) || els[i].is_a?(Adjust))
+      i >= 0 ? i : nil
+    end
+
+    def traces_before(els, d)
+      out = []
+      j = d - 1
+      while j >= 0 && (els[j].is_a?(Trace) || els[j].is_a?(Label))
+        out << els[j] if els[j].is_a?(Trace)
+        j -= 1
+      end
+      out
+    end
+
+    # compile.c's remove_unreachable_chunk: from first, up to a label some
+    # jump from outside still reaches
+    def remove_unreachable(els, first)
+      return false if first >= els.size
+      counts = Hash.new(0)
+      last = nil
+      pending = nil
+      pending_end = nil
+      j = first
+      while j < els.size
+        x = els[j]
+        if x.is_a?(Insn)
+          if x.name == :leave
+            break if pending
+            last = j
+            break
+          end
+          x.ops.each do |o|
+            next unless o.is_a?(Label)
+            counts[o] += 1
+            pending = nil if o.equal?(pending) && o.refs <= counts[o]
+          end
+        elsif x.is_a?(Label)
+          if x.unremovable
+            break if pending
+            return false
+          end
+          if x.refs > counts[x]
+            break if pending
+            pending = x
+            pending_end = (j == first) ? nil : last
+          end
+          j += 1
+          next
+        elsif x.is_a?(Adjust)
+          break if pending
+          return false
+        end
+        last = j unless pending
+        j += 1
+      end
+      if pending
+        return false unless pending_end
+        last = pending_end
+      end
+      return false unless last
+      removed = false
+      (last).downto(first) do |k|
+        x = els[k]
+        next if x.is_a?(Label)
+        unref(x) if x.is_a?(Insn)
+        els.delete_at(k)
+        removed = true
+      end
+      removed
+    end
+
+    # a send with no block and plain arguments is opt_send_without_block,
+    # or one of the opt_* the VM answers for the builtin classes
+    def specialize(u)
+      u.elements.each do |e|
         next unless e.is_a?(Insn) && e.name == :send && e.ops[1].nil?
         cd = e.ops[0]
-        if cd.flag & (CALL_ARGS_SPLAT | CALL_ARGS_BLOCKARG | CALL_KWARG | CALL_KW_SPLAT) == 0 && cd.flag & CALL_ARGS_SIMPLE != 0
+        if cd.flag & (CALL_ARGS_SPLAT | CALL_ARGS_BLOCKARG | CALL_KWARG | CALL_KW_SPLAT) == 0 &&
+           cd.flag & CALL_ARGS_SIMPLE != 0 && cd.flag & CALL_FCALL == 0
           sp = case cd.argc
                when 0 then SPECIAL0[cd.mid]
                when 1 then SPECIAL1[cd.mid]
                when 2 then SPECIAL2[cd.mid]
                end
-          sp = nil if cd.flag & CALL_FCALL != 0
           if sp
             e.name = sp
             e.ops = [cd]
@@ -414,8 +637,11 @@ class RubyVM::InstructionSequence
         e.name = :opt_send_without_block
         e.ops = [cd]
       end
-      # operand unification (defs/opt_operand.def)
-      els.each do |e|
+    end
+
+    # operand unification (defs/opt_operand.def)
+    def unify(u)
+      u.elements.each do |e|
         next unless e.is_a?(Insn)
         case e.name
         when :getlocal, :setlocal
@@ -430,24 +656,41 @@ class RubyVM::InstructionSequence
           end
         end
       end
-      # positions
-      pos = 0
-      els.each do |e|
-        if e.is_a?(Label) then e.pos = pos
-        else pos += 1 + e.ops.size
-        end
-      end
-      u.stack_max = stack_max(u)
     end
 
-    def stack_max(u)
-      depth = max = 0
+    # (each trace's event goes to the instruction after it)
+    def attach_traces(u)
+      pend = []
+      kept = []
       u.elements.each do |e|
-        next unless e.is_a?(Insn)
-        pop, push = stack_effect(e)
-        depth -= pop
-        depth += push
-        max = depth if depth > max
+        case e
+        when Trace then pend << e.event
+        when Insn
+          e.events = (pend + e.events).uniq
+          pend = []
+          kept << e
+        else kept << e
+        end
+      end
+      u.elements.replace(kept)
+    end
+
+    # compile.c's fix_sp_depth: a label's depth is the first jump's to it,
+    # an adjust goes back to its label's
+    def stack_max(u)
+      sp = max = 0
+      u.elements.each do |e|
+        case e
+        when Label
+          if e.sp.nil? then e.sp = sp else sp = e.sp end
+        when Adjust
+          sp = e.label.sp || 0
+        when Insn
+          pop, push = stack_effect(e)
+          sp = sp - pop + push
+          max = sp if sp > max
+          e.ops.each { |o| o.sp = sp if o.is_a?(Label) && o.sp.nil? }
+        end
       end
       max
     end
@@ -457,18 +700,13 @@ class RubyVM::InstructionSequence
       when :putnil, :putself, :putobject, :putchilledstring, :putstring, :duparray,
            :getlocal, :getlocal_WC_0, :getlocal_WC_1, :putobject_INT2FIX_0_, :putobject_INT2FIX_1_
         [0, 1]
-      when :setlocal, :setlocal_WC_0, :setlocal_WC_1, :pop, :branchif, :branchunless then [1, 0]
+      when :setlocal, :setlocal_WC_0, :setlocal_WC_1, :pop, :branchif, :branchunless, :leave then [1, 0]
       when :dup then [1, 2]
       when :newarray then [e.ops[0], 1]
       when :opt_send_without_block, :send then [e.ops[0].argc + 1, 1]
-      when :leave then [1, 0]
       when :definemethod, :jump then [0, 0]
       else
-        if e.name.to_s.start_with?("opt_")
-          [e.ops[0].argc + 1, 1]
-        else
-          [0, 0]
-        end
+        e.name.to_s.start_with?("opt_") ? [e.ops[0].argc + 1, 1] : [0, 0]
       end
     end
 
@@ -484,6 +722,7 @@ class RubyVM::InstructionSequence
           body << :"label_#{e.pos}" if e.refs > 0
           next
         end
+        next unless e.is_a?(Insn)
         if e.line != last
           body << e.line
           last = e.line
@@ -537,7 +776,7 @@ class RubyVM::InstructionSequence
       pos = 0
       prev_line = 0
       u.elements.each do |e|
-        next if e.is_a?(Label)
+        next unless e.is_a?(Insn)
         s = format("%04d %-*s ", pos, INSN_NAME_WIDTH, e.name)
         s << e.ops.map { |o| operand_disasm(o) }.join(", ")
         if e.line && e.line != prev_line
