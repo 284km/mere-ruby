@@ -3990,3 +3990,10 @@ Round 25 of note 545 (§5's objspace): objspace/test_objspace 44 failing ->
   chopsticks, -1 in round 23's CI). The BEGIN / END parse drops it.
 - Left: reachable_objects_from over each_object (which walks objects, not
   Arrays); count_symbols' dynamic symbols.
+- ⚠ **Round 24's CI stopped at the embedding stress check**
+  (embedding_stress_check's churn: the same `scratch = 'x' * 1024` eval
+  100,000 times grew the default region by 24 bytes each). The lexer's
+  assignment count (lvt_asg) was a map write per assignment on every eval,
+  for a question only a shareable_proc block asks: it is kept now only for a
+  source that names `shareable_` (as `binding` gates lvd_st), and churn is
+  flat again (34,404,640 bytes at 1,000 and at 100,000).
