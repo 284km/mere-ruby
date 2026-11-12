@@ -3997,3 +3997,13 @@ Round 25 of note 545 (§5's objspace): objspace/test_objspace 44 failing ->
   for a question only a shareable_proc block asks: it is kept now only for a
   source that names `shareable_` (as `binding` gates lvd_st), and churn is
   flat again (34,404,640 bytes at 1,000 and at 100,000).
+- ⚠ **Two more from round 25's CI.** (1) tools/string_pages_check.py
+  compiles mkstr / mkstr_join out of m_state on their own, and the
+  allocation-trace call in them was unbound there: the harness supplies the
+  switch (off) beside the value tag and handle offset now. (2) test_module's
+  complemented_method_entry_memory_leak timed out on Linux (10.04 s of 10):
+  round 24's define_method ractor check kept a table beside dm_closenv that
+  every anonymous class's methods added a key to and no sweep removed --
+  4-5 % slower on that loop, and growing. The defining ractor is a mark on
+  the block's env now (set only in a non-main ractor), asked only while a
+  ractor runs.
