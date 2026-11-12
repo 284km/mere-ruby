@@ -4174,3 +4174,48 @@ corpus 650.
   list to keep in step at ~330 write and ~50 delete sites);
   test_object_id_race_free stays slow for that. Bootstrap test_ractor #153
   (1,000 ractors, 35 s here) and #99 sit at the runner's time limit.
+
+## 2026-11-12 (47): round 30 -- RubyVM::InstructionSequence compiled for real (note 548, stage 10)
+
+Round 30 of note 548: the first stage-10 round. A sequence from source is
+now compiled from Prism's tree to ruby 4.0.9's instructions (lib/
+iseq_compiler_ext.rb, shipped as `__iseq_compiler` and required when a
+sequence is first asked for to_a, disasm, each_child or trace_points). It
+ports prism_compile.c, the parts of compile.c's backend it needs (peephole,
+specialised instructions, operand unification, the stack depth, the
+layout) and iseq.c's to_a and disasm. corpus 651.
+
+- **What it compiles**: literals, locals, ivars, globals, constants, string
+  interpolation, arrays (pm_compile_array_node's chunks and splats), hashes,
+  ranges, regexps, calls (arguments, one splat, keyword arguments, a block
+  argument, a literal block, attribute writes with setn, `&.`, opt_new,
+  opt_str_freeze / opt_str_uminus, getblockparamproxy), if / unless / while
+  / until / break / next, case (opt_case_dispatch's hash, the `===` chain,
+  splat `when`s, a case with no subject), `for`, ||= / &&= on locals and
+  ivars, def and singleton defs (every parameter but a destructured one,
+  `...`, and a keyword default that is not a literal), class, module and
+  `class << x`, return (top level too), yield, the line / call /
+  return / class / end / b_call / b_return events.
+- **Compile options**: ISeq.compile's fifth argument as make_compile_option
+  takes it (false, true, a Hash). Off, peephole_optimization,
+  specialized_instruction, operands_unification and inline_const_cache
+  each turn off what they do; a tail call and instruction pairs are refused.
+- **Refused** with NotImplementedError naming the node: rescue / ensure,
+  super, defined?, multiple assignment, return / break / next out of a
+  block (they need the catch table), constant paths through a value,
+  pattern matching, and the rest. Nothing is emitted that was not derived.
+- **Checked against ruby itself**: tools/iseq/compare_with_ruby.rb compiles
+  each of tools/iseq/snippets.txt (87, some under `#opt:` compile options)
+  with ruby 4.0.9 and with this compiler and compares to_a and disasm byte
+  for byte: 87 exact. Found on the way: disasm's header line is the code
+  location's, not first_lineno; an `ic:` index counts past the ivar caches;
+  two labels on one position are one in to_a; a jump turned into the leave
+  it jumped to takes that leave's events; compile.c goes on past a pop it
+  kept.
+- **What it moved**: prism/newline_test 52 -> 16 failing, ruby/test_iseq
+  36 -> 33, ruby/test_syntax 1 -> 0. The six tests the empty stand-in
+  passed by coincidence pass again (case, class << self, top-level return,
+  for, `**nil`, compile option false).
+- Not yet: the VM. The instructions are not executed; ISeq#eval still runs
+  the source the way the program runs (note 548 §3). Next: the catch
+  table and the nodes refused above, then the VM.

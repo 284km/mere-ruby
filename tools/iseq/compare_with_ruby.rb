@@ -1,6 +1,8 @@
 # The ISeq compiler against ruby itself: run under the reference ruby, it
 # compiles each snippet (separated by "----" lines) with both and compares
-# to_a and disasm byte for byte.
+# to_a and disasm byte for byte. A snippet whose first line is
+# `#opt: <literal>` is compiled with that compile option (false, true or a
+# Hash), as ISeq.compile's fifth argument.
 #
 #   ruby tools/iseq/compare_with_ruby.rb lib/iseq_compiler_ext.rb tools/iseq/snippets.txt
 
@@ -8,10 +10,16 @@ require File.expand_path(ARGV[0])
 C = RubyVM::InstructionSequence::Compiler__
 ok = 0; bad = 0
 snippets = File.read(ARGV[1]).split("\n----\n")
+DEFAULTS = RubyVM::InstructionSequence.compile_option
 snippets.each do |src|
-  ref = RubyVM::InstructionSequence.compile(src)
+  opt = src[/\A#opt: (.*)$/, 1]&.then { |o| eval(o) }
+  ref = RubyVM::InstructionSequence.compile(src, "<compiled>", "<compiled>", 1, opt)
+  full = case opt
+         when true, false then DEFAULTS.to_h { |k, v| [k, k == :debug_level ? v : opt] }
+         when Hash then DEFAULTS.merge(opt)
+         end
   begin
-    u = C.compile(src, "<compiled>", "<compiled>", 1)
+    u = C.compile(src, "<compiled>", "<compiled>", 1, "<compiled>", full)
     mine_a = C.to_a(u); mine_d = C.disasm(u)
   rescue NotImplementedError => e
     puts "SKIP #{src.lines.first.strip}: #{e.message}"; next
