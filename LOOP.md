@@ -3871,3 +3871,36 @@ out (the ledger's "CRuby heap shape"). What has a real answer here was done.
   stack): 4 threads x 2000 clones of such an object take 2.3 s against 0.05 s
   without the finalizer; objspace/test_ractor's copy_finalizer, which passed
   while ractors ran one after another, now times out.
+
+## 2026-11-12 (39): round 23 -- a block's own locals, decided where ruby decides them
+
+Round 23 of note 545, found in round 22 (test_settracefunc's
+ractor_local_method counted 110 for 100).
+
+- **A name a block assigns before any enclosing scope has it is the
+  block's own**, also when the enclosing scope assigns the same name later:
+  `pr = proc { x = 1 }; x = 5; pr.call; x` is 5, and a method's `q = proc {
+  y = 1 }; y = 5` likewise. A scope here predeclares every name it assigns
+  anywhere (the top level's tl_decl, a method's frame), so the block found
+  the outer y and wrote it. ruby decides this when it parses the block; so
+  does this now: the lexer's local table (lvt) notes a block-frame
+  assignment of a name no visible scope has yet (and no eval caller has),
+  and, since lex_go builds a block's `{` / `do` token after lexing the rest
+  of the source, it knows by then whether an enclosing scope assigns that
+  name at all -- only those names are marked (the others are made in the
+  block anyway). The marker token rides after the `{` / `do`; a block with
+  parameters gets them as `|;x|` block-locals, one without keeps an empty
+  parameter list (that is what lets `it` and _1 in) and opens its body with
+  a declaration that makes the name the block's at its FIRST assignment
+  (lv_set's chr 8 marks): a read before it still reaches outward, as ruby
+  reads `prior_name || (prior_name = ...)` as a call first (corpus 527).
+  `it` is never marked (test_syntax's test_it). A hash literal's `{` may
+  carry the marker too and drops it. Binding#local_variables lists the
+  block's own from its start, as ruby's table does.
+- ⚠ Marking every such name cost each call of the block two writes:
+  test_module's iclass_memory_leak (3M calls of `proc do mod = ...`) went
+  4.98 -> 10.09 s, past its 10 s bound; marking only the names an enclosing
+  scope also assigns brought it back.
+- The blk_own_marks mechanism (blocks with parameters, decided at block
+  creation by whether the enclosing env has the name) stays; it cannot see
+  a later assignment, which the predeclaration already holds.
