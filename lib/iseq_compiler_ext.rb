@@ -23,9 +23,18 @@ class RubyVM::InstructionSequence
     CALL_ARGS_SIMPLE = 16
     CALL_KWARG = 32
     CALL_KW_SPLAT = 64
-    CALL_FLAG_NAMES = [[CALL_ARGS_SPLAT, "ARGS_SPLAT"], [CALL_ARGS_BLOCKARG, "ARGS_BLOCKARG"],
-                       [CALL_FCALL, "FCALL"], [CALL_VCALL, "VCALL"], [CALL_ARGS_SIMPLE, "ARGS_SIMPLE"],
-                       [CALL_KWARG, "KWARG"], [CALL_KW_SPLAT, "KW_SPLAT"]].freeze
+    CALL_TAILCALL = 128
+    CALL_SUPER = 256
+    CALL_ZSUPER = 512
+    CALL_KW_SPLAT_MUT = 2048
+    CALL_ARGS_SPLAT_MUT = 4096
+    CALL_FORWARDING = 8192
+    # (iseq.c's order, not the bits')
+    CALL_FLAG_NAMES = [[CALL_ARGS_SPLAT, "ARGS_SPLAT"], [CALL_ARGS_SPLAT_MUT, "ARGS_SPLAT_MUT"],
+                       [CALL_ARGS_BLOCKARG, "ARGS_BLOCKARG"], [CALL_FCALL, "FCALL"], [CALL_VCALL, "VCALL"],
+                       [CALL_ARGS_SIMPLE, "ARGS_SIMPLE"], [CALL_TAILCALL, "TAILCALL"], [CALL_SUPER, "SUPER"],
+                       [CALL_ZSUPER, "ZSUPER"], [CALL_KWARG, "KWARG"], [CALL_KW_SPLAT, "KW_SPLAT"],
+                       [CALL_KW_SPLAT_MUT, "KW_SPLAT_MUT"], [CALL_FORWARDING, "FORWARDING"]].freeze
 
     EVENT_BITS = { line: 0x01, class: 0x02, end: 0x04, call: 0x08, return: 0x10,
                    c_call: 0x20, c_return: 0x40, b_call: 0x100, b_return: 0x200 }.freeze
@@ -179,7 +188,15 @@ class RubyVM::InstructionSequence
         end
       when Prism::ArrayNode then array(u, n, popped)
       when Prism::LocalVariableReadNode
-        u.insn(:getlocal, *local_ref(u, n.name, n.depth)) unless popped
+        unless popped
+          ref = local_ref(u, n.name, n.depth)
+          lv, owner = u.level_of(n.name)
+          if owner.params[:block_start] && owner.locals[owner.params[:block_start]] == n.name
+            u.insn(:getblockparam, *ref)
+          else
+            u.insn(:getlocal, *ref)
+          end
+        end
       when Prism::LocalVariableWriteNode
         node(u, n.value, false)
         here(u, n)
@@ -310,16 +327,13 @@ class RubyVM::InstructionSequence
         u.insn(:putself)
         flag |= CALL_FCALL
       end
-      args = n.arguments ? n.arguments.arguments : []
-      if args.any? { |a| a.is_a?(Prism::SplatNode) || a.is_a?(Prism::KeywordHashNode) || a.is_a?(Prism::BlockArgumentNode) } ||
-         n.block.is_a?(Prism::BlockArgumentNode)
-        raise NotImplementedError, "RubyVM::InstructionSequence: this call's arguments are not compiled yet"
-      end
-      args.each { |a| node(u, a, false) }
+      argc, aflag, kws = setup_args(u, n.arguments ? n.arguments.arguments : [], n.block, n)
+      flag |= aflag
       flag |= CALL_VCALL if n.variable_call?
-      flag |= CALL_ARGS_SIMPLE unless n.block.is_a?(Prism::BlockNode)
+      flag |= CALL_ARGS_SIMPLE if (flag & (CALL_ARGS_SPLAT | CALL_ARGS_BLOCKARG | CALL_KWARG | CALL_KW_SPLAT)) == 0 &&
+                                  !n.block.is_a?(Prism::BlockNode)
       here(u, n)
-      cd = CallData.new(n.name, flag, args.size, nil)
+      cd = CallData.new(n.name, flag, argc, kws)
       if n.block.is_a?(Prism::BlockNode)
         blk = block_unit(u, n.block)
         u.insn(:send, cd, blk)
@@ -327,6 +341,57 @@ class RubyVM::InstructionSequence
         u.insn(:send, cd, nil)
       end
       u.insn(:pop) if popped
+    end
+
+    # pm_setup_args, for the shapes compiled so far: plain arguments, one
+    # splat (`splatarray false` when it is last, otherwise the array built
+    # on with pushtoarray -- ARGS_SPLAT_MUT), keyword arguments with symbol
+    # keys (KWARG), and a block argument (ARGS_BLOCKARG)
+    def setup_args(u, args, block, owner)
+      flag = 0
+      kws = nil
+      args = args.dup
+      kwh = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
+      si = args.index { |a| a.is_a?(Prism::SplatNode) }
+      if si
+        raise NotImplementedError, "RubyVM::InstructionSequence: two splats are not compiled yet" if args.count { |a| a.is_a?(Prism::SplatNode) } > 1
+        raise NotImplementedError, "RubyVM::InstructionSequence: a splat with keywords is not compiled yet" if kwh
+        args[0...si].each { |a| node(u, a, false) }
+        sp = args[si]
+        post = args[(si + 1)..]
+        raise NotImplementedError, "RubyVM::InstructionSequence: an anonymous splat is not compiled yet" unless sp.expression
+        node(u, sp.expression, false)
+        here(u, owner)
+        if post.empty?
+          u.insn(:splatarray, false)
+          flag |= CALL_ARGS_SPLAT
+        else
+          u.insn(:splatarray, true) unless sp.expression.is_a?(Prism::ArrayNode)
+          post.each { |a| node(u, a, false) }
+          here(u, owner)
+          u.insn(:pushtoarray, post.size)
+          flag |= CALL_ARGS_SPLAT | CALL_ARGS_SPLAT_MUT
+        end
+        argc = si + 1
+      else
+        args.each { |a| node(u, a, false) }
+        argc = args.size
+      end
+      if kwh
+        unless kwh.elements.all? { |e| e.is_a?(Prism::AssocNode) && e.key.is_a?(Prism::SymbolNode) }
+          raise NotImplementedError, "RubyVM::InstructionSequence: these keyword arguments are not compiled yet"
+        end
+        kws = kwh.elements.map { |e| e.key.unescaped.to_sym }
+        kwh.elements.each { |e| node(u, e.value, false) }
+        argc += kws.size
+        flag |= CALL_KWARG
+      end
+      if block.is_a?(Prism::BlockArgumentNode)
+        raise NotImplementedError, "RubyVM::InstructionSequence: an anonymous block argument is not compiled yet" unless block.expression
+        node(u, block.expression, false)
+        flag |= CALL_ARGS_BLOCKARG
+      end
+      [argc, flag, kws]
     end
 
     def block_unit(u, b)
@@ -339,26 +404,98 @@ class RubyVM::InstructionSequence
                        [l.start_line, l.start_column, l.end_line, l.end_column], b.node_id)
       params(child, b.parameters.is_a?(Prism::BlockParametersNode) ? b.parameters.parameters : nil, b.parameters)
       u.children << child
+      opt_defaults(child)
       child.at(l.start_line, b.node_id)
       child.event(:b_call)
+      # (after optional defaults the b_call is a nop's of its own)
+      child.insn(:nop) if child.params[:opt]
       compile_body(child, b.body.is_a?(Prism::StatementsNode) ? b.body : nil, b.node_id, l.end_line)
       finish(child)
       child
     end
 
-    # (a block's one parameter and nothing else -- `|y|`, not `|y,|` -- is
-    #  ambiguous_param0: the block takes an Array's first element or the
-    #  whole value, as yield passes it)
-    def params(unit, ps, outer)
+    # The parameters, as ruby lays them out in the local table: lead, opt,
+    # rest, post, keywords, the hidden kwbits slot, kwrest, block, then the
+    # body's own locals. (a block's one parameter and nothing else -- `|y|`,
+    # not `|y,|` -- is ambiguous_param0: the block takes an Array's first
+    # element or the whole value, as yield passes it.)
+    def params(unit, ps, owner)
       return unless ps
-      if ps.optionals.any? || (ps.rest && !ps.rest.is_a?(Prism::ImplicitRestNode)) || ps.posts.any? ||
-         ps.keywords.any? || ps.keyword_rest || ps.block
+      if ps.requireds.any? { |r| !r.is_a?(Prism::RequiredParameterNode) } ||
+         ps.posts.any? { |r| !r.is_a?(Prism::RequiredParameterNode) } ||
+         ps.keyword_rest.is_a?(Prism::ForwardingParameterNode) || ps.keyword_rest.is_a?(Prism::NoKeywordsParameterNode)
         raise NotImplementedError, "RubyVM::InstructionSequence: these parameters are not compiled yet"
       end
-      unit.params[:lead_num] = ps.requireds.size
-      if unit.type == :block && ps.requireds.size == 1 && ps.rest.nil?
-        unit.params[:ambiguous_param0] = true
+      pr = unit.params
+      names = []
+      ps.requireds.each { |r| names << r.name }
+      pr[:lead_num] = ps.requireds.size
+      unless ps.optionals.empty?
+        pr[:opt_nodes] = ps.optionals
+        ps.optionals.each { |o| names << o.name }
       end
+      if ps.rest && !ps.rest.is_a?(Prism::ImplicitRestNode)
+        pr[:rest_start] = names.size
+        pr[:anon_rest] = ps.rest.name.nil?
+        names << (ps.rest.name || :*)
+      end
+      unless ps.posts.empty?
+        pr[:post_start] = names.size
+        pr[:post_num] = ps.posts.size
+        ps.posts.each { |r| names << r.name }
+      end
+      unless ps.keywords.empty?
+        kw = ps.keywords.map do |k|
+          if k.is_a?(Prism::RequiredKeywordParameterNode) then k.name
+          elsif static_literal?(k.value) then [k.name, static_value(k.value)]
+          else raise NotImplementedError, "RubyVM::InstructionSequence: a keyword default that is not a literal is not compiled yet"
+          end
+        end
+        # (required ones first, as ruby keeps them)
+        req = kw.select { |k| k.is_a?(Symbol) }
+        opt = kw.reject { |k| k.is_a?(Symbol) }
+        pr[:keyword] = req + opt
+        pr[:kw_required] = req.size
+        (req + opt.map(&:first)).each { |k| names << k }
+        pr[:kwbits] = names.size
+        names << names.size
+      end
+      if ps.keyword_rest
+        pr[:kwrest] = names.size
+        pr[:anon_kwrest] = ps.keyword_rest.name.nil?
+        names << (ps.keyword_rest.name || :**)
+      end
+      if ps.block
+        pr[:block_start] = names.size
+        names << (ps.block.name || :&)
+        pr[:use_block] = true
+      end
+      rest_locals = unit.locals.reject { |l| names.include?(l) }
+      unit.locals.replace(names + rest_locals)
+      if unit.type == :block && ps.requireds.size == 1 && ps.rest.nil? && ps.optionals.empty? && ps.posts.empty? &&
+         ps.keywords.empty? && ps.keyword_rest.nil? && ps.block.nil?
+        pr[:ambiguous_param0] = true
+      end
+    end
+
+    # optional parameters' defaults: each behind a label of the opt table,
+    # and one after the last -- the body's start
+    def opt_defaults(unit)
+      nodes = unit.params[:opt_nodes] or return
+      labels = []
+      nodes.each do |o|
+        l = unit.new_label
+        unit.emit_label(l)
+        labels << l
+        node(unit, o.value, false)
+        here(unit, o)
+        unit.insn(:setlocal, *local_ref(unit, o.name, 0))
+      end
+      l = unit.new_label
+      unit.emit_label(l)
+      labels << l
+      labels.each { |x| x.unremovable = true; x.refs += 1 }
+      unit.params[:opt] = labels
     end
 
     def define(u, n, popped)
@@ -369,6 +506,7 @@ class RubyVM::InstructionSequence
       u.children << child
       body = n.body
       first = body.is_a?(Prism::StatementsNode) ? body.body.first : nil
+      opt_defaults(child)
       child.at(first ? first.location.start_line : l.start_line, n.node_id)
       child.event(:call)
       if body.is_a?(Prism::StatementsNode)
@@ -891,6 +1029,7 @@ class RubyVM::InstructionSequence
       u.elements.each do |e|
         next unless e.is_a?(Insn) && e.name == :send && e.ops[1].nil?
         cd = e.ops[0]
+        next if cd.flag & CALL_ARGS_BLOCKARG != 0
         if cd.flag & (CALL_ARGS_SPLAT | CALL_ARGS_BLOCKARG | CALL_KWARG | CALL_KW_SPLAT) == 0 &&
            cd.flag & CALL_ARGS_SIMPLE != 0 && cd.flag & CALL_FCALL == 0
           sp = case cd.argc
@@ -982,9 +1121,14 @@ class RubyVM::InstructionSequence
       when :setlocal, :setlocal_WC_0, :setlocal_WC_1, :pop, :branchif, :branchunless, :leave then [1, 0]
       when :dup then [1, 2]
       when :newarray then [e.ops[0], 1]
-      when :opt_send_without_block, :send then [e.ops[0].argc + 1, 1]
+      when :opt_send_without_block, :send
+        [e.ops[0].argc + 1 + (e.ops[0].flag & CALL_ARGS_BLOCKARG != 0 ? 1 : 0), 1]
       when :definemethod, :jump then [0, 0]
       when :definesmethod then [1, 0]
+      when :getblockparam then [0, 1]
+      when :nop then [0, 0]
+      when :splatarray then [1, 1]
+      when :pushtoarray then [e.ops[0] + 1, 1]
       when :intern then [1, 1]
       when :getinstancevariable, :getglobal, :opt_getconstant_path, :putspecialobject, :duphash, :invokeblock_dummy then [0, 1]
       when :setinstancevariable, :setglobal then [1, 0]
@@ -1002,7 +1146,7 @@ class RubyVM::InstructionSequence
 
     # -- to_a ----------------------------------------------------------------
     def to_a(u)
-      misc = { arg_size: u.params[:lead_num], local_size: u.locals.size, stack_max: u.stack_max,
+      misc = { arg_size: arg_size(u), local_size: u.locals.size, stack_max: u.stack_max,
                node_id: u.node_id, code_location: u.code_location,
                node_ids: u.elements.grep(Insn).map(&:node_id), parser: :prism }
       body = []
@@ -1020,17 +1164,36 @@ class RubyVM::InstructionSequence
         EVENT_DISASM.each { |ev, _| body << EVENT_TO_A[ev] if e.events.include?(ev) && EVENT_TO_A[ev] }
         body << [e.name, *e.ops.map { |o| operand_to_a(o) }]
       end
+      pr = u.params
       params = {}
-      params[:lead_num] = u.params[:lead_num] if u.params[:lead_num] > 0
-      params[:ambiguous_param0] = true if u.params[:ambiguous_param0]
-      params[:use_block] = true if u.params[:use_block]
+      params[:opt] = pr[:opt].map { |l| :"label_#{l.pos}" } if pr[:opt]
+      params[:lead_num] = pr[:lead_num] if pr[:lead_num] > 0
+      if pr[:post_num]
+        params[:post_num] = pr[:post_num]
+        params[:post_start] = pr[:post_start]
+      end
+      params[:rest_start] = pr[:rest_start] if pr[:rest_start]
+      params[:block_start] = pr[:block_start] if pr[:block_start]
+      if pr[:keyword]
+        params[:kwbits] = pr[:kwbits]
+        params[:keyword] = pr[:keyword]
+      end
+      params[:kwrest] = pr[:kwrest] if pr[:kwrest]
+      params[:ambiguous_param0] = true if pr[:ambiguous_param0]
+      params[:use_block] = true if pr[:use_block]
+      # (a hidden local -- kwbits -- is numbered as iseq_data_to_ary numbers it)
+      locals = u.locals.each_with_index.map { |l, i| l.is_a?(Integer) ? u.locals.size - i + 1 : l }
       ["YARVInstructionSequence/SimpleDataFormat", 4, 0, 1, misc, u.label, u.path, u.abs_path || u.path,
-       u.first_lineno, u.type, u.locals, params, [], body]
+       u.first_lineno, u.type, locals, params, [], body]
     end
 
     def operand_to_a(o)
       case o
-      when CallData then { mid: o.mid, flag: o.flag, orig_argc: o.argc }
+      when CallData
+        h = { mid: o.mid, flag: o.flag }
+        h[:kw_arg] = o.kwargs if o.kwargs
+        h[:orig_argc] = o.argc - (o.kwargs ? o.kwargs.size : 0)
+        h
       when Label then :"label_#{o.pos}"
       when LocalOp then o.idx
       when IVC then o.index
@@ -1057,6 +1220,15 @@ class RubyVM::InstructionSequence
       out
     end
 
+    def arg_size(u)
+      pr = u.params
+      n = pr[:lead_num] + (pr[:opt] ? pr[:opt].size - 1 : 0) + (pr[:rest_start] ? 1 : 0) + (pr[:post_num] || 0)
+      n += pr[:keyword].size + 1 if pr[:keyword]
+      n += 1 if pr[:kwrest]
+      n += 1 if pr[:block_start]
+      n
+    end
+
     # -- disasm --------------------------------------------------------------
     INSN_NAME_WIDTH = 38
 
@@ -1066,18 +1238,30 @@ class RubyVM::InstructionSequence
       #  string's end, which never shows: the header is printed as is)
       out << "== disasm: #{inspect_unit(u)}" << "\n"
       unless u.locals.empty?
-        out << format("local table (size: %d, argc: %d [opts: 0, rest: -1, post: 0, block: -1, kw: -1@-1, kwrest: -1])\n",
-                      u.locals.size, u.params[:lead_num])
+        pr = u.params
+        out << format("local table (size: %d, argc: %d [opts: %d, rest: %d, post: %d, block: %d, kw: %d@%d, kwrest: %d])\n",
+                      u.locals.size, pr[:lead_num], pr[:opt] ? pr[:opt].size - 1 : 0, pr[:rest_start] || -1,
+                      pr[:post_num] || 0, pr[:block_start] || -1, pr[:keyword] ? pr[:keyword].size : -1,
+                      pr[:keyword] ? pr[:kw_required] : -1, pr[:kwrest] || -1)
         line = +""
         n = u.locals.size
         u.locals.each_with_index do |name, li|
           i = n - li - 1
           entry = format("[%2d] ", i + 1)
           width = line.size + entry.size + 11
-          line << entry << "#{name}@#{li}"
-          if li < u.params[:lead_num]
-            line << (u.params[:ambiguous_param0] ? "<AmbiguousArg>" : "<Arg>")
+          shown = name.is_a?(Integer) ? "?" : (name.to_s.match?(/\A[a-z_][A-Za-z0-9_]*\z/) ? name.to_s : name.to_s.inspect)
+          line << entry << "#{shown}@#{li}"
+          pr = u.params
+          argi = +""
+          argi << (pr[:ambiguous_param0] ? "AmbiguousArg" : "Arg") if li < pr[:lead_num]
+          if pr[:opt] && li >= pr[:lead_num] && li < pr[:lead_num] + pr[:opt].size - 1
+            argi << "Opt=#{pr[:opt][li - pr[:lead_num]].pos}"
           end
+          argi << (pr[:anon_rest] ? "AnonRest" : "Rest") if pr[:rest_start] == li
+          argi << "Post" if pr[:post_start] && li >= pr[:post_start] && li < pr[:post_start] + pr[:post_num]
+          argi << (pr[:anon_kwrest] ? "AnonKwrest" : "Kwrest") if pr[:kwrest] == li
+          argi << "Block" if pr[:block_start] == li
+          line << "<#{argi}>" unless argi.empty?
           pad = width - line.size
           line << " " * pad if pad > 0
         end
@@ -1114,7 +1298,7 @@ class RubyVM::InstructionSequence
       case o
       when CallData
         flags = CALL_FLAG_NAMES.select { |b, _| o.flag & b != 0 }.map(&:last)
-        "<calldata!#{o.mid ? "mid:#{o.mid}, " : ""}argc:#{o.argc}#{flags.empty? ? "" : ", " + flags.join("|")}>"
+        "<calldata!#{o.mid ? "mid:#{o.mid}, " : ""}argc:#{o.argc}#{o.kwargs ? ", kw:[#{o.kwargs.join(",")}]" : ""}#{flags.empty? ? "" : ", " + flags.join("|")}>"
       when IVC then "<is:#{o.index}>"
       when IC then "<ic:#{o.index} #{o.segments.join("::")}>"
       when Label then o.pos.to_s
