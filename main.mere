@@ -12622,8 +12622,10 @@ and rb_eq_w0 = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
   | VObj _ ->
     if has_own_eq world a
     then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "==" (Cons (b, Nil)) false)
-    // (an exception against one held as a pair asks Exception#==, which
-    //  knows an object a rescue made from a pair: exc_pin_bt)
+    // (an exception asks its built-in Exception#== -- of an object, or of a
+    //  pair, which it knows: exc_same_class_equal)
+    else if exc_bridge_peer world a
+    then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "==" (Cons (b, Nil)) false)
     else (match b with
           | VExc (_, _) -> truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "==" (Cons (b, Nil)) false)
           | _ -> rb_eq a b)
@@ -27465,30 +27467,23 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // (a raised PAIR of the class is one too: its backtrace is the one
           //  #backtrace answers -- what Thread#raise made of `t.raise(e)` is
           //  == e)
-          let ours = fn (v: Val) -> (match v with VObj u9 -> str_eq (map_get ocls u9) cls | VExc (c9, _) -> str_eq c9 cls | _ -> false) in
-          let bt_of = fn (v: Val) ->
-            (match v with
-             | VObj u9 -> (if map_has ivars (str_of_int u9 ++ "@__bt") then map_get ivars (str_of_int u9 ++ "@__bt") else VNil)
-             | VExc (_, _) -> invoke_val_c env world noblk v "backtrace" Nil false
-             | _ -> VNil) in
+          // (the class as rb_obj_class sees it: not the singleton a `def
+          //  obj.x` gave either side)
+          let mine9 = exc_real_cls world recv in
+          let ours = fn (v: Val) -> (match v with VObj _ -> str_eq (exc_real_cls world v) mine9 | VExc (c9, _) -> str_eq c9 mine9 | _ -> false) in
           if rb_identical recv o9 then VBool true
-          // (an object a rescue made from a pair, against a copy of that pair:
-          //  the class and the message, as pairs compare -- exc_pin_bt)
-          else if (match (recv, o9) with
-                   | (VObj r9, VExc (c9, m9)) ->
-                     map_has ivars (str_of_int r9 ++ "@__from_pair") && str_eq c9 cls
-                     && map_has ivars (str_of_int r9 ++ "@__exception_message")
-                     && rb_eq (map_get ivars (str_of_int r9 ++ "@__exception_message")) (vexc_text world c9 m9)
-                   | _ -> false) then VBool true
+          // (the same class: what the two HOLD, nothing called --
+          //  exc_same_class_equal)
+          else if ours o9 then VBool (exc_same_class_equal world recv o9)
           else
-            (let cv = (if ours o9 then o9
-                       else if responds world o9 "exception"
+            // (another class: what #exception converts it to, and ITS #message
+            //  and #backtrace, as exc_equal's rb_check_funcall asks them)
+            (let cv = (if responds world o9 "exception"
                        then try_or (fn (u: unit) -> invoke_val_c env world noblk o9 "exception" Nil false) VNil
                        else VNil) in
              if ours cv then
-               VBool (rb_eq (invoke_val_c env world noblk recv "message" Nil false)
-                            (invoke_val_c env world noblk cv "message" Nil false)
-                      && rb_eq (bt_of recv) (bt_of cv))
+               VBool (rb_eq (exc_msg_held world recv) (invoke_val_c env world noblk cv "message" Nil false)
+                      && rb_eq (exc_bt_held world recv) (invoke_val_c env world noblk cv "backtrace" Nil false))
              else VBool false))
        | _ -> VBool false)
     // Exception#to_s: @__exception_message (class name when nil). This is the default;
@@ -36021,29 +36016,51 @@ and exc_cmp_val = fn world -> fn (v: Val) ->
   | VExc (c9, _) -> (if str_starts_with c9 "__" then false else true)
   | VObj _ -> exc_bridge_peer world v
   | _ -> false
-// ruby's exc_equal with the pair (class c, message m) as the receiver, in
-// its same-class branch: the other's STORED message and backtrace
-// (rb_attr_get of mesg and bt), not its #message / #backtrace -- an override
-// of those neither changes equality nor runs during it (PR #81's review,
-// third round). An object a rescue made from a pair (exc_pin_bt) is compared
-// by class and message, as two pairs were: the pair's own backtrace is the
-// last raise's and says nothing about it.
+// ruby's exc_equal with the pair (class c, message m) as the receiver: an
+// exception object of the same class compares what it holds
+// (exc_same_class_equal); nothing of it is called (PR #81's review).
 and exc_pair_equal = fn env -> fn world -> fn (c: str) -> fn (m: str) -> fn (o: Val) ->
   match o with
-  | VObj o9 ->
-    (let (_, _, ocls9, iv9) = world in
-     // (its class, not the singleton a `def obj.==` gave it)
-     let k9 = map_get ocls9 o9 in
-     let k9 = (if is_sng_cls k9 then sng_supername world k9 else k9) in
-     if (if str_eq k9 c then false else true) then false
-     else
-       (let mk9 = str_of_int o9 ++ "@__exception_message" in
-        let mine9 = vexc_text world c m in
-        let theirs9 = (if map_has iv9 mk9 then map_get iv9 mk9 else exc_name_msg world c) in
-        rb_eq theirs9 mine9
-        && (map_has iv9 (str_of_int o9 ++ "@__from_pair")
-            || rb_eq (if map_has iv9 (str_of_int o9 ++ "@__bt") then map_get iv9 (str_of_int o9 ++ "@__bt") else VNil)
-                     (pair_bt_raw (VExc (c, m))))))
+  | VObj _ -> str_eq (exc_real_cls world o) c && exc_same_class_equal world (VExc (c, m)) o
+  | _ -> false
+// exc_equal's same-class branch, for any two exceptions -- pairs or objects,
+// either way round: the stored message (rb_attr_get mesg; the class's name
+// when there is none, as the pair holds it) and the stored backtrace
+// (exc_backtrace). An object a rescue made from a pair (exc_pin_bt) and a
+// pair are compared by class and message, as two pairs were: the pair's own
+// frames are the last raise's and say nothing about it.
+and exc_same_class_equal = fn world -> fn (a: Val) -> fn (b: Val) ->
+  rb_eq (exc_msg_held world a) (exc_msg_held world b)
+  && ((match (a, b) with
+       | (VExc (_, _), VExc (_, _)) -> true
+       | (VExc (_, _), _) -> exc_pinned world b
+       | (_, VExc (_, _)) -> exc_pinned world a
+       | _ -> false)
+      || rb_eq (exc_bt_held world a) (exc_bt_held world b))
+and exc_real_cls = fn world -> fn (v: Val) ->
+  match v with
+  | VObj u9 -> (let (_, _, oc9, _) = world in
+                let k9 = map_get oc9 u9 in
+                if is_sng_cls k9 then sng_supername world k9 else k9)
+  | VExc (c9, _) -> c9
+  | _ -> ""
+and exc_msg_held = fn world -> fn (v: Val) ->
+  match v with
+  | VObj u9 -> (let (_, _, _, iv9) = world in
+                let k9 = str_of_int u9 ++ "@__exception_message" in
+                if map_has iv9 k9 then map_get iv9 k9 else exc_name_msg world (exc_real_cls world v))
+  | VExc (c9, m9) -> vexc_text world c9 m9
+  | _ -> VNil
+and exc_bt_held = fn world -> fn (v: Val) ->
+  match v with
+  | VObj u9 -> (let (_, _, _, iv9) = world in
+                let k9 = str_of_int u9 ++ "@__bt" in
+                if map_has iv9 k9 then map_get iv9 k9 else VNil)
+  | VExc (_, _) -> pair_bt_raw v
+  | _ -> VNil
+and exc_pinned = fn world -> fn (v: Val) ->
+  match v with
+  | VObj u9 -> (let (_, _, _, iv9) = world in map_has iv9 (str_of_int u9 ++ "@__from_pair"))
   | _ -> false
 // A pair's frames as recorded, without calling #backtrace: the last raise's
 // when it is that pair (raise_bt "e"/"eb"), or the frames of the raise $! is
@@ -36205,7 +36222,11 @@ and obj_answers_eq = fn world -> fn (v: Val) ->
   //  structural comparison would compare the instants exactly)
   | VObj _ -> (let c9 = dispatch_cls_of world v in
                has_meth world c9 "==" || builtin_obj_has (display_cls world c9) "==" || cmp_mixin_eq world v
-               || time_cls world (display_cls world c9))
+               || time_cls world (display_cls world c9)
+               // (...and an exception: its built-in Exception#== compares what
+               //  it holds, which identity does not -- a rescued exception
+               //  and its #dup are == inside an Array or a Hash too)
+               || exc_is_a world c9 "Exception")
   | _ -> false
 // an object whose == is Comparable's: it includes the module and has a <=>
 and cmp_mixin_eq = fn world -> fn (v: Val) ->

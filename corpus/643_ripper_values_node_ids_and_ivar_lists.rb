@@ -155,3 +155,21 @@ p h == { key: plain }, { key: plain } == h
 p [seen].index(plain), [plain].include?(seen), [[seen]] == [[plain]], [[plain]] == [[seen]]
 # (twin overrides == to say false: from its side the answer is its own)
 p [twin].count(seen), { key: twin } == h
+
+# ...and two exception objects (a rescued one and its #dup) compare by what
+# they hold, directly and in every container, even when one presents a
+# different #message (fifth round). The four combinations of the pair and
+# the object.
+begin
+  raise RuntimeError, "same"
+rescue RuntimeError => obj1
+end
+obj2 = obj1.dup
+p obj1 == obj2, [obj1].include?(obj2), [obj1].count(obj2), [obj1].index(obj2), [obj1].rindex(obj2)
+hh = { key: obj1 }
+p hh.value?(obj2), hh.has_value?(obj2), hh.key(obj2), hh == { key: obj2 }, { key: obj2 } == hh, [obj1] == [obj2]
+odd = obj1.dup
+def odd.message = "different"
+p obj1 == odd, odd == obj1, [obj1] == [odd], { k: odd } == { k: obj1 }
+pair_seen = seen
+p pair_seen == pair_seen, pair_seen == plain, plain == pair_seen, plain == plain.dup

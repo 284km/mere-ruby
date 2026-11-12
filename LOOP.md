@@ -3978,6 +3978,18 @@ remainder (Ripper) and error_highlight.
     the argument's check of count / value? / key, Array#== and Hash#== (the
     latter looking at BOTH hashes' values; it looked at the left one only,
     so `h == g` and `g == h` differed).
+    Fifth round: two exception OBJECTS -- a rescued exception and its #dup,
+    with no TracePoint and no == of the program's -- were identical-or-not
+    inside containers (obj_answers_eq did not count an exception, and
+    rb_eq_w0 fell back to identity), and the built-in Exception#== itself
+    compared the raw class names (a `def odd.message` singleton made
+    `obj == odd` false) and called #message on both sides. It is now ruby's
+    exc_equal: identical; else the same class (rb_obj_class, through the
+    singleton) compares what both HOLD (exc_same_class_equal: the stored
+    message and backtrace, for pairs and objects alike); else the other
+    converted by #exception, whose #message / #backtrace are asked, as
+    rb_check_funcall does. corpus 643 has the pair/object matrix, all four
+    ways round.
     corpus 643 has the three rounds' witnesses, `include?` and a nested
     Array included.
   - **A pair's #detailed_message / #full_message went past the program's
