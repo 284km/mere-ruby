@@ -3959,9 +3959,13 @@ remainder (Ripper) and error_highlight.
     ⚠ (review) The first version of that bridge asked ANY object on the right
     of a pair: `[pair] == [obj]` called obj's #== -- an object whose #==
     answers true made it true, where ruby says false and never calls it. The
-    bridge goes only to an exception answering the built-in #==
-    (exc_bridge_peer); corpus 643 has the witness, `include?` and a nested
-    Array included.
+    bridge goes only to an exception (exc_bridge_peer), and -- second round
+    -- its #== is not asked at all: the comparison is the PAIR's
+    Exception#== (exc_pair_equal: same class, its #message and #backtrace),
+    so an exception on the right that overrides #== (`def twin.==`) still
+    equals the pair as in ruby, and its override is not called. Its class is
+    read through the singleton the `def` gave it. corpus 643 has both
+    witnesses, `include?` and a nested Array included.
   - **A pair's #detailed_message / #full_message went past the program's
     own** (error_highlight prepends one to TypeError and ArgumentError), and
     super from one did not reach Exception's.

@@ -115,3 +115,18 @@ $calls = 0
 other = EqualAnything.new
 p seen == other, [seen] == [other], [[1, seen]] == [[1, other]], [seen].include?(other), $calls
 p other == seen, $calls
+
+# ...and an exception on the right that overrides #== is compared by the
+# left one's Exception#== (class, message, backtrace), without calling the
+# override (PR #81's review, second round).
+tp2 = TracePoint.new(:c_call) { |t| seen = t.self if t.method_id == :initialize && t.defined_class == Exception }
+tp2.enable
+begin; raise RuntimeError, "same"; rescue RuntimeError => bound; end
+tp2.disable
+twin = bound.dup
+$calls = 0
+def twin.==(x)
+  $calls += 1
+  false
+end
+p seen == twin, [seen] == [twin], [seen].include?(twin), $calls
