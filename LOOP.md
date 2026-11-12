@@ -4219,3 +4219,48 @@ layout) and iseq.c's to_a and disasm. corpus 651.
 - Not yet: the VM. The instructions are not executed; ISeq#eval still runs
   the source the way the program runs (note 548 §3). Next: the catch
   table and the nodes refused above, then the VM.
+
+## 2026-11-12 (48): round 31 -- the catch table, rescue / ensure, super, defined?, and compile.c's peephole rules
+
+Round 31 of note 548: the ISeq compiler's second round. corpus 652.
+
+- **The catch table** as compile.c keeps it: entries pushed as ADD_CATCH_ENTRY
+  pushes them (start unremovable, end and cont referenced), kept only when
+  the sequence may catch something (a throw in it or in a sequence inside
+  it, or an entry other than break / next / redo -- update_catch_except_
+  flags); to_a and disasm show it, each entry's sequence under it one "| "
+  deeper. A block has its redo / next entries and start / end labels, a
+  while loop its break / next / redo, a call whose block keeps a table a
+  break entry, super always one. An ADJUST makes its label unremovable.
+- **Out of blocks**: break throws TAG_BREAK, return TAG_RETURN, next jumps to
+  the block's end; from a rescue or ensure sequence, break / next are thrown
+  to the block or loop around (VM_THROW_NO_ESCAPE_FLAG for a loop's).
+  iseq_optimize's leading nop of a block goes unless a throw or a jump back
+  needs it.
+- **rescue / else / ensure, `x rescue y`, retry**: the rescue clauses and the
+  ensure clause as sequences of their own ($! their one local, the RESCUE
+  event), the ensure clause also inline after the body (compiled first,
+  as pm_compile_ensure does), iseq_insert_nop_between_end_and_cont. Leaving
+  an ensure region by return / break / next is refused (pm_add_ensure_iseq
+  inlines the clause there; not yet).
+- **super and zsuper** (the method's own parameters read where they are),
+  **defined?** (with its "defined guard" rescue sequence, and true as the
+  answer in a condition), **->{}**, **multiple assignment** (the target
+  state's topn fixed after the writes), a block body with rescue.
+- **compile.c's peephole and specialisation, per element as iseq_optimize
+  runs them**: opt_ary_freeze / opt_hash_freeze, opt_newarray_send (max,
+  min, hash, pack, pack with buffer:, include?), opt_duparray_send,
+  newarray / duparray + expandarray, string-literal ranges, the
+  concatstrings rules, dup / getlocal / setlocal, getblockparamproxy before
+  a branch, the KW_SPLAT_MUT rule, a branch before a jump to the same place
+  as a pop, opt_neq's two calldatas, FCALL sends specialised too. String
+  interpolation as pm_interpolated_node_compile joins it.
+- **Checked against ruby itself**: 181 snippets exact (tools/iseq).
+- **What it moved** (against round 30): ruby/test_optimization 15 -> 8
+  failing (opt_duparray_send / opt_newarray_send include?, the freeze and
+  string-range peepholes), prism/newline_test 16 -> 10, ruby/test_iseq 33
+  -> 33. test_settracefunc's single_raise_inside_load and
+  tp_ractor_local_untargeted fail alone on main too (FileUtils not yet
+  required; the test order decides).
+- Not yet: the VM; ensure inlining; pattern matching; interpolated regexps;
+  a splat with keywords; class variables.
