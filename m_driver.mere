@@ -699,6 +699,9 @@ let core_prelude_c =
   "  class ClosedError < StopIteration; end\n" ++
   "  class IsolationError < Error; end\n" ++
   "  class MovedError < Error; end\n" ++
+  "  class MovedObject < BasicObject\n" ++
+  "    def method_missing(*a); ::Kernel.raise ::Ractor::MovedError, \"can not send any methods to a moved object\"; end\n" ++
+  "  end\n" ++
   "  class UnsafeError < Error; end\n" ++
   "\n" ++
   //  A port is a queue its creator reads. A read of an EMPTY port waits: the
@@ -788,6 +791,7 @@ let core_prelude_c =
   //  Mutex has no allocator to copy with)
   "  def self.__deep_copy(v); __copy(v, Hash.new.compare_by_identity); end\n" ++
   "  def self.__copy(o, seen)\n" ++
+  "    return o if Ractor::MovedObject === o\n" ++
   "    return o if shareable?(o)\n" ++
   "    return seen[o] if seen.key?(o)\n" ++
   "    if o.is_a?(Thread) || o.is_a?(Thread::Mutex) || o.is_a?(Thread::Queue) || o.is_a?(Proc) || o.is_a?(Method)\n" ++
@@ -804,7 +808,27 @@ let core_prelude_c =
   "    c.freeze if o.frozen?\n" ++
   "    c\n" ++
   "  end\n" ++
-  "  def self.__moved(v); v; end\n" ++
+  // what was moved is gone from the sender: it and every unshareable thing
+  // it holds turn into Ractor::MovedObject (ractor.c's move_leave). The walk
+  // finishes before the first mark, since a marked object answers nothing;
+  // the marked are kept, so no later object is made under a marked key.
+  "  def self.__moved(v)\n" ++
+  "    seen = Hash.new.compare_by_identity\n" ++
+  "    __moved_walk(v, seen)\n" ++
+  "    keep = (@__moved_keep ||= [])\n" ++
+  "    seen.each_key do |o| keep << o; __moved_mark(o) end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "  def self.__moved_walk(o, seen)\n" ++
+  "    return if Ractor::MovedObject === o\n" ++
+  "    return if seen.key?(o) || shareable?(o)\n" ++
+  "    seen[o] = true\n" ++
+  "    if o.is_a?(Array) then o.each do |x| __moved_walk(x, seen) end\n" ++
+  "    elsif o.is_a?(Hash) then o.each do |k, x| __moved_walk(k, seen); __moved_walk(x, seen) end\n" ++
+  "    elsif o.is_a?(Struct) then o.each do |x| __moved_walk(x, seen) end\n" ++
+  "    end\n" ++
+  "    o.instance_variables.each do |n| __moved_walk(o.instance_variable_get(n), seen) end\n" ++
+  "  end\n" ++
   "  def self.__move(v)\n" ++
   "    c = __deep_copy(v)\n" ++
   "    __moved(v)\n" ++
@@ -816,6 +840,7 @@ let core_prelude_c =
   //  make_shareable freezes all the way down, a copy first with copy: true
   "  def self.shareable?(o); __shr_p(o, Hash.new.compare_by_identity); end\n" ++
   "  def self.__shr_p(o, seen)\n" ++
+  "    return false if Ractor::MovedObject === o\n" ++
   "    return true if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module) || o.is_a?(Ractor) || o.is_a?(Ractor::Port)\n" ++
   // (an Encoding is immutable, and ENV is the process's: both are shareable
   //  in ruby, which keeps them frozen or behind a lock)
@@ -839,20 +864,40 @@ let core_prelude_c =
   "    __shr_make(o, Hash.new.compare_by_identity)\n" ++
   "    o\n" ++
   "  end\n" ++
+  // ruby's order (ractor.c's make_shareable_check_shareable): an object is
+  // frozen by its OWN #freeze when it is entered -- a #freeze that sets an
+  // ivar has that ivar frozen too -- and what it holds after that is walked;
+  // a Proc needs a shareable self, a Method a shareable receiver
   "  def self.__shr_make(o, seen)\n" ++
-  "    return if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module) || o.is_a?(Ractor)\n" ++
+  "    return if Ractor::MovedObject === o\n" ++
+  "    return if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module) || o.is_a?(Ractor) || o.is_a?(Ractor::Port)\n" ++
   "    raise Ractor::Error, \"cannot make Psych backend session shareable\" if defined?(Psych::Parser) && (o.is_a?(Psych::Parser) || o.is_a?(Psych::Emitter))\n" ++
   "    return if seen.key?(o)\n" ++
   "    seen[o] = true\n" ++
-  "    if o.is_a?(Proc) then o.freeze; return; end\n" ++
+  "    if o.is_a?(Proc)\n" ++
+  "      rs = ObjectSpace.__fin_proc_receiver(o)\n" ++
+  "      raise Ractor::IsolationError, \"Proc's self is not shareable: \" + o.to_s unless shareable?(rs)\n" ++
+  "      __isolate(o, 0, nil) unless o.frozen?\n" ++
+  "      o.freeze; return\n" ++
+  "    end\n" ++
+  "    if o.is_a?(Method)\n" ++
+  "      raise Ractor::Error, \"can not make shareable object for \" + o.inspect unless shareable?(o.receiver)\n" ++
+  "      o.freeze; return\n" ++
+  "    end\n" ++
+  "    if o.is_a?(UnboundMethod) then o.freeze; return; end\n" ++
+  "    if o.is_a?(Thread) || o.is_a?(Thread::Mutex) || o.is_a?(Thread::Queue)\n" ++
+  "      raise Ractor::Error, \"can not make shareable object for \" + o.inspect\n" ++
+  "    end\n" ++
+  "    o.freeze unless o.frozen?\n" ++
+  "    raise Ractor::Error, \"#freeze does not freeze object correctly\" unless o.frozen?\n" ++
   "    if o.is_a?(Array) then o.each do |x| __shr_make(x, seen) end\n" ++
-  "    elsif o.is_a?(Hash) then o.each do |k, v| __shr_make(k, seen); __shr_make(v, seen) end\n" ++
+  "    elsif o.is_a?(Hash) then o.each do |k, v| __shr_make(k, seen); __shr_make(v, seen) end; __shr_make(o.default, seen)\n" ++
   "    elsif o.is_a?(Range) then __shr_make(o.begin, seen); __shr_make(o.end, seen)\n" ++
   "    elsif o.is_a?(Struct) then o.to_a.each do |x| __shr_make(x, seen) end\n" ++
+  "    elsif o.is_a?(Complex) then __shr_make(o.real, seen); __shr_make(o.imaginary, seen)\n" ++
+  "    elsif o.is_a?(Rational) then __shr_make(o.numerator, seen); __shr_make(o.denominator, seen)\n" ++
   "    end\n" ++
   "    o.instance_variables.each do |n| __shr_make(o.instance_variable_get(n), seen) end\n" ++
-  "    o.freeze\n" ++
-  "    raise Ractor::Error, \"#freeze does not freeze object correctly\" unless o.frozen?\n" ++
   "  end\n" ++
   "  def self.__shr_copy(o, seen)\n" ++
   "    return o if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module)\n" ++
@@ -875,8 +920,22 @@ let core_prelude_c =
   "    v\n" ++
   "  end\n" ++
   "  def self.__scv_copy(v); make_shareable(v, copy: true); end\n" ++
-  "  def self.shareable_proc(&b); b.freeze; end\n" ++
-  "  def self.shareable_lambda(&b); b.freeze; end\n" ++
+  // (a copy cut from where the block was written: self is the `self:`
+  //  given, nil by default, and the outer locals it reads are copied in --
+  //  shareable ones its scope assigns once -- vm.c's
+  //  rb_proc_ractor_make_shareable)
+  "  def self.shareable_proc(**kw, &b)\n" ++
+  "    raise ArgumentError, \"tried to create Proc object without a block\" unless b\n" ++
+  "    s = kw.fetch(:self, nil)\n" ++
+  "    raise Ractor::IsolationError, \"self should be shareable: \" + s.to_s unless shareable?(s)\n" ++
+  "    __isolate(b, 1, s).freeze\n" ++
+  "  end\n" ++
+  "  def self.shareable_lambda(**kw, &b)\n" ++
+  "    raise ArgumentError, \"tried to create Proc object without a block\" unless b\n" ++
+  "    s = kw.fetch(:self, nil)\n" ++
+  "    raise Ractor::IsolationError, \"self should be shareable: \" + s.to_s unless shareable?(s)\n" ++
+  "    __isolate(b, 3, s).freeze\n" ++
+  "  end\n" ++
   "  def self.[](k); current[k]; end\n" ++
   "  def self.[]=(k, v); current[k] = v; end\n" ++
   "  def self.store_if_absent(k)\n" ++
@@ -895,6 +954,7 @@ let core_prelude_c =
   "    unless outer.empty?\n" ++
   "      raise ArgumentError, \"can not isolate a Proc because it accesses outer variables (\" + outer.join(\", \") + \").\"\n" ++
   "    end\n" ++
+  "    block = __isolate(block, 2, nil)\n" ++
   // (the first ractor made says the API is experimental, from where it was
   //  made: ruby_single_main_ractor in ractor.rb)
   "    if __live.empty? && !@__made\n" ++
@@ -926,7 +986,9 @@ let core_prelude_c =
   "    Ractor.__live.push(me)\n" ++
   "    @__thread = Thread.new do\n" ++
   "      Thread.current.thread_variable_set(:__ractor, me)\n" ++
+  "      io = [IO.new(0, \"r\", autoclose: false), IO.new(1, \"w\", autoclose: false), IO.new(2, \"w\", autoclose: false)]\n" ++
   "      Ractor.__nonmain_on\n" ++
+  "      Ractor.__stdio(*io)\n" ++
   "      begin\n" ++
   "        @__value = me.instance_exec(*args, &block)\n" ++
   "      rescue Exception => e\n" ++
@@ -2618,6 +2680,8 @@ let core_prelude_d =
   //  listed: ten thousand round trips took 18 s the other way round)
   "    s = ObjectSpace.__str_of_id(id)\n" ++
   "    return __id2ref_here(id, s) if s\n" ++
+  "    v = ObjectSpace.__val_of_id(id)\n" ++
+  "    return __id2ref_here(id, v) unless nil.equal?(v)\n" ++
   "    objs, classes = ObjectSpace.__objects(nil)\n" ++
   "    (objs + classes).each \{ |o| return __id2ref_here(id, o) if o.object_id == id }\n" ++
   // (ruby 4.0.9 names the id as a number; 4.0.6 quoted it)

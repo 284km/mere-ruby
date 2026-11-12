@@ -1393,6 +1393,8 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter consts (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_const_owner k) v) in
   let _ = map_iter enc_objs mk in
   let _ = map_iter signal_traps mk in
+  // (a non-main ractor's own standard streams, while it runs)
+  let _ = map_iter ractor_stdio mk in
   let _ = map_iter dm_captured (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
   let _ = map_iter dm_closenv (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
   let _ = map_iter dm_methods (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
@@ -3730,6 +3732,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_len name > 0 && str_eq (char_at name 0) "$" then
       (let k = gvar_slot (substring name 1 (str_len name)) in
        let _ = ractor_gvar_check world k in
+       if map_len ractor_stdio > 0 && map_has ractor_stdio (str_of_int (ractor_cur_key ()) ++ ":" ++ k)
+       then map_get ractor_stdio (str_of_int (ractor_cur_key ()) ++ ":" ++ k) else
        // `$=` is deprecated in Ruby and reading it warns -- through Warning.warn,
        // which a program can override (a test suite that turns warnings into
        // failures does exactly that). No warning was emitted at all here, so the
@@ -4026,6 +4030,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if (if str_eq ka9 "" then false else (if str_eq ka9 name then false else true)) then eval_e env world blk (ECall (ka9, arges))
     else
     let args = eval_args env world blk arges in
+    let _ = (if vec_get moved_on 0 == 1 then moved_guard world VNil name args else VNil) in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     // (with main as self, `extend M` is main's, and a method main's singleton
     //  class has -- `def self.x`, an extended module's -- is found there before
@@ -4951,6 +4956,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | _ ->
        let recv = eval_e env world blk recv_e in
        let args = eval_args env world blk arges in
+       let _ = (if vec_get moved_on 0 == 1 then moved_guard world recv name args else VNil) in
        // a mutating call on a frozen String/Array/Hash raises FrozenError
        // before the in-place fast paths below (which bypass invoke_val_c) --
        // except for a yielder called with NO block, which mutates nothing and
@@ -5253,6 +5259,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else
     // an object whose class defines the operator dispatches to it.
     let va0 = eval_e env world blk a in
+    let _ = (if vec_get moved_on 0 == 1 && is_moved va0 then moved_guard world va0 op Nil else VNil) in
     // (an operator a class has UNDEFINED -- `class Integer; undef +; end` --
     //  is a NoMethodError like any undefined method; nothing is asked of
     //  the operand. One length test while nothing is undefined, note 302.)
@@ -6777,6 +6784,9 @@ and ovr_stmt = fn acc -> fn own -> fn (s: Stmt) ->
   | SAndThen (a, b) -> (let _ = ovr_stmt acc own a in ovr_stmt acc own b)
   | SOrElse (a, b) -> (let _ = ovr_stmt acc own a in ovr_stmt acc own b)
   | SLocalFrom (_, s2) -> ovr_stmt acc own s2
+  // (a name the parser found the block's own -- its chr 8 marks -- is not an
+  //  outer one, whatever the enclosing scope assigns later)
+  | SDeclare ns -> list_iter ns (fn (n9: str) -> if str_len n9 > 1 && ord (char_at n9 0) == 8 then map_set own (substring n9 1 (str_len n9)) 1 else ())
   | _ -> ()
 and ovr_exprs = fn acc -> fn own -> fn (es: Expr list) -> list_iter es (fn (e9: Expr) -> ovr_expr acc own e9)
 and ovr_blk = fn acc -> fn own -> fn (ps: str list) -> fn (b: Stmt list) -> (let _ = ovr_params own ps in ovr_stmts acc own b)
@@ -14443,6 +14453,7 @@ and native_empty_object_constructor = fn world -> fn (cls: str) -> fn (vischeck:
   && not (has_meth world "Object" "initialize")
   && native_plain_object_constructor world cls vischeck
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
+  let _ = (if vec_get moved_on 0 == 1 then moved_guard world recv0 name0 args0 else VNil) in
   // Plain Module.new reaches this door, while an explicit &nil reaches the
   // with-block door. Both use the same proof for an unobserved allocation.
   if str_eq name0 "new" && (match recv0 with VClass c -> str_eq c "Module" | _ -> false)
@@ -18355,21 +18366,44 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // reach too, as ruby counts it)
     else if str_eq c "Ractor" && (str_len name == 12 && str_eq name "__outer_vars") then
       (match args with
-       | Cons (VProc pid9, _) ->
-         (let (_, ps9, body9, cenv9) = proc_as_block pid9 in
-          let acc9 = map_new () in
-          let own9 = map_new () in
-          let _ = ovr_params own9 ps9 in
-          let _ = ovr_stmts acc9 own9 body9 in
-          let out9 = map_new () in
-          let _ = map_iter acc9 (fn (n9: str) -> fn (_u: int) ->
-                    if map_has own9 n9 then ()
-                    else if lv_has cenv9 n9 then map_set out9 (str_of_int (map_len out9)) (VSym n9) else ()) in
-          let rec col = fn (i: int) -> (if i >= map_len out9 then (Nil : Val list) else Cons (map_get out9 (str_of_int i), col (i + 1))) in
-          arr_new (col 0))
+       | Cons (VProc pid9, _) -> arr_new (list_map_sv (proc_outer_names pid9))
        | _ -> arr_new Nil)
+    // marks what Ractor#send(move: true) took: every later call on it is
+    // Ractor::MovedError, and it answers Ractor::MovedObject to ===
+    // an isolated Proc (vm.c's rb_proc_isolate / rb_proc_ractor_make_shareable):
+    // __isolate(pr, how, self) -- how 0 in place, keeping self (make_shareable);
+    // 1 a copy whose self is the third argument (shareable_proc); 2 a copy
+    // for Ractor.new, which refused outer locals already
+    else if str_eq c "Ractor" && (str_len name == 9 && str_eq name "__isolate") then
+      (match args with
+       | Cons (VProc pid9, Cons (VInt how9, rest9)) -> proc_isolate env world pid9 how9 (match rest9 with Cons (s9, _) -> s9 | Nil -> VNil)
+       | _ -> VNil)
+    // the standard streams of the ractor this thread runs
+    else if str_eq c "Ractor" && (str_len name == 7 && str_eq name "__stdio") then
+      (match args with
+       | Cons (i9, Cons (o9, Cons (e9, _))) ->
+         (let r9 = str_of_int (ractor_cur_key ()) in
+          let _ = map_set ractor_stdio (r9 ++ ":stdin") i9 in
+          let _ = map_set ractor_stdio (r9 ++ ":stdout") o9 in
+          let _ = map_set ractor_stdio (r9 ++ ":stderr") e9 in VNil)
+       | _ -> VNil)
+    else if str_eq c "Ractor" && (str_len name == 12 && str_eq name "__moved_mark") then
+      (match args with
+       | Cons (v9, _) ->
+         (let k9 = moved_key v9 in
+          if str_eq k9 "" then VNil
+          else (let _ = map_set moved_set k9 1 in
+                let _ = vec_set moved_on 0 1 in
+                let _ = (match v9 with
+                         | VObj id9 -> (let (_, _, ocls9, _) = world in map_set ocls9 id9 "Ractor::MovedObject")
+                         | _ -> map_set hng_store k9 "Ractor::MovedObject") in
+                VNil))
+       | Nil -> VNil)
     else if str_eq c "Ractor" && (str_len name == 13 && str_eq name "__nonmain_off") then
-      (let _ = map_delete ractor_thr (fb_thread_of (fb_cur ())) in VNil)
+      (let t9 = fb_thread_of (fb_cur ()) in
+       let r9 = str_of_int t9 in
+       let _ = (if map_len ractor_stdio > 0 then (let _ = map_delete ractor_stdio (r9 ++ ":stdin") in let _ = map_delete ractor_stdio (r9 ++ ":stdout") in map_delete ractor_stdio (r9 ++ ":stderr")) else ()) in
+       let _ = map_delete ractor_thr t9 in VNil)
     else if str_eq c "Ractor" && (str_len name == 12 && str_eq name "__nonmain_on") then
       (let t9 = fb_thread_of (fb_cur ()) in let _ = map_set ractor_thr t9 t9 in VNil)
     // the Thread that runs the body of the ractor this thread belongs to (its
@@ -23652,6 +23686,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // ObjectSpace.__str_of_id(id): the String whose tagged object_id it is,
     // or nil -- _id2ref reads a String's id
     // back, as ruby's does (test_id2ref_geniv_liveness, ruby 4.0.9)
+    // ...and an Array's or a Hash's, from theirs (public_identity_id's kinds
+    // 6 and 10), when it is still in its store
+    else if str_eq c "ObjectSpace" && (str_len name == 11 && str_eq name "__val_of_id") then
+      (match args with
+       | Cons (VInt i9, _) ->
+         (let k9 = i9 - (i9 / 32) * 32 in
+          let s9 = i9 / 32 - 1 in
+          if s9 < 0 then VNil
+          else if k9 == 6 && map_has arr_store (handle_base + s9) then VArr (handle_base + s9)
+          else if k9 == 10 && map_has hash_store (handle_base + s9) then VHsh (handle_base + s9)
+          else VNil)
+       | _ -> VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 11 && str_eq name "__str_of_id") then
       (match args with
        | Cons (VInt i9, _) ->
@@ -25251,17 +25297,19 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let cls = prim_base_name cls in
        let k = str_of_int id in
        let qv = (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else arr_new Nil) in
-       let items = (match qv with VArr aid -> deref aid | _ -> Nil) in
+       // (asked for, not made up front: folding the array and inspecting
+       //  the queue on every push made a long queue quadratic)
+       let items = fn (u: unit) -> (match qv with VArr aid -> deref aid | _ -> Nil) in
        let closed = map_has ivars (k ++ "@__qclosed") in
        // (one made by allocate was never initialized: ruby's TypeError,
        //  "#<Thread::Queue:0x...> not initialized")
        // (ruby names the class Thread::Queue there)
-       let qname9 = (let s9 = inspect_w env world recv in
+       let qname9 = fn (u: unit) -> (let s9 = inspect_w env world recv in
                      if str_len s9 > 2 && str_eq (substring s9 0 2) "#<" && (if str_contains s9 "#<Thread::" then false else true)
                      then "#<Thread::" ++ substring s9 2 (str_len s9) else s9) in
        if str_len name == 10 && str_eq name "initialize" then prim_q_init world id cls args
        else if (if map_has ivars (k ++ "@__q") then false else true) && queue_sch_name name then
-         raise_exc world "TypeError" (qname9 ++ " not initialized")
+         raise_exc world "TypeError" (qname9 () ++ " not initialized")
        // (SizedQueue#max= takes a positive size, under the scheduler too)
        else if (str_len name == 4 && str_eq name "max=") && (match args with Cons (VInt mx, _) -> mx <= 0 | _ -> false) then
          raise_exc world "ArgumentError" "queue size must be positive"
@@ -25269,13 +25317,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                && ((str_len name == 4 && str_eq name "push") || (str_len name == 2 && str_eq name "<<") || (str_len name == 3 && str_eq name "enq")
                    || (str_len name == 4 && str_eq name "size") || (str_len name == 6 && str_eq name "length") || (str_len name == 6 && str_eq name "empty?")
                    || (str_len name == 5 && str_eq name "clear") || (str_len name == 5 && str_eq name "close")) then
-         raise_exc world "TypeError" (qname9 ++ " not initialized")
+         raise_exc world "TypeError" (qname9 () ++ " not initialized")
        else if fb_can_suspend && queue_sch_name name then queue_sch env world recv id cls name args
        else if (str_len name == 4 && str_eq name "push") || (str_len name == 2 && str_eq name "<<") || (str_len name == 3 && str_eq name "enq") then
          (if closed then raise_exc world "ClosedQueueError" "queue closed"
           else
             let full = (match (if map_has ivars (k ++ "@__qmax") then map_get ivars (k ++ "@__qmax") else VNil) with
-                        | VInt mx -> val_list_len items >= mx
+                        | VInt mx -> val_list_len (items ()) >= mx
                         | _ -> false) in
             if full && (match args with Cons (_, Cons (VBool true, _)) -> false | _ -> true) then
               // a blocking push with no consumer: parks a thread, fatal
@@ -25285,10 +25333,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             else if full then raise_exc world "ThreadError" "queue full"
             else
               (match args with
-               | Cons (v, _) -> let _ = (match qv with VArr aid -> arr_set aid (list_append items (Cons (v, Nil))) | _ -> ()) in recv
+               | Cons (v, _) -> let _ = (match qv with VArr aid -> arr_set aid (list_append (items ()) (Cons (v, Nil))) | _ -> ()) in recv
                | _ -> recv))
        else if (str_len name == 3 && str_eq name "pop") || (str_len name == 5 && str_eq name "shift") || (str_len name == 3 && str_eq name "deq") then
-         (match items with
+         (match items () with
           | Cons (h, t) ->
             let _ = (match qv with VArr aid -> arr_set aid t | _ -> ()) in h
           | Nil ->
@@ -25299,8 +25347,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              // deadlock on the main thread.
              else if in_thread () then raise_exc world "__ThreadPark" "sleep"
              else raise_exc world "fatal" "No live threads left. Deadlock?"))
-       else if (str_len name == 6 && str_eq name "empty?") then VBool (match items with Nil -> true | _ -> false)
-       else if (str_len name == 4 && str_eq name "size") || (str_len name == 6 && str_eq name "length") then VInt (val_list_len items)
+       else if (str_len name == 6 && str_eq name "empty?") then VBool (match items () with Nil -> true | _ -> false)
+       else if (str_len name == 4 && str_eq name "size") || (str_len name == 6 && str_eq name "length") then VInt (val_list_len (items ()))
        else if (str_len name == 5 && str_eq name "clear") then
          (let _ = (match qv with VArr aid -> arr_set aid Nil | _ -> ()) in recv)
        else if (str_len name == 5 && str_eq name "close") then
@@ -28382,6 +28430,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if map_has curry_target (str_of_int pid) && (str_len name == 15 && str_eq name "source_location") then VNil
     // ...and has no binding: it was not written anywhere (ruby says C level)
     // (so does Symbol#to_proc's)
+    // ...nor does an isolated one: what it was written in is cut away
+    else if map_len iso_procs > 0 && map_has iso_procs (str_of_int pid) && (str_len name == 7 && str_eq name "binding") then
+      raise_exc world "ArgumentError" "Can't create Binding from isolated Proc"
     else if (map_has curry_target (str_of_int pid) || map_has comp_inner (str_of_int pid) || map_has proc_symsrc (str_of_int pid)) && (str_len name == 7 && str_eq name "binding") then
       raise_exc world "ArgumentError" "Can't create Binding from C level Proc"
     else if map_has comp_inner (str_of_int pid) && (str_len name == 15 && str_eq name "source_location") then VNil
@@ -30320,7 +30371,86 @@ and signal_arg_named = fn world -> fn (nm0: str) ->
   else raise_exc_str world "ArgumentError" ("unsupported signal 'SIG" ++ nm ++ "'")
 and raise_exc_str = fn world -> fn (cls: str) -> fn (msg: str) ->
   let _ = raise_exc world cls msg in ""
+and proc_isolate = fn env -> fn world -> fn (pid9: int) -> fn (how9: int) -> fn (self9: Val) ->
+  let k9 = str_of_int pid9 in
+  let (h9, ps9, body0, cenv9) = map_get proc_store k9 in
+  let (_, _, body9, _) = proc_as_block pid9 in
+  let outer9 = proc_outer_names pid9 in
+  // (the parser's chr 7 note on the block: its scope's names assigned twice)
+  let rec reasg = fn (b: Stmt list) -> fn (n: int) ->
+    (match b with
+     | Cons (SDeclare ns, t) when n < 6 ->
+       (match list_find_pfx ns (chr 7 ++ "reasg:") with
+        | "" -> reasg t (n + 1)
+        | m9 -> str_split (substring m9 7 (str_len m9)) ",")
+     // (past the line marks the parser puts first)
+     | Cons (_, t) when n < 6 -> reasg t (n + 1)
+     | _ -> (Nil : str list)) in
+  let re9 = reasg body9 0 in
+  let e9 = map_new () in
+  let _ = list_iter outer9 (fn (n9: str) ->
+            if list_has_str re9 n9 then
+              (let _ = raise_exc world "Ractor::IsolationError" ("cannot make a shareable Proc because the outer variable '" ++ n9 ++ "' may be reassigned.") in ())
+            else
+              (let v9 = lv_get cenv9 n9 in
+               if ractor_shareable env world v9 then map_set e9 n9 v9
+               else (let _ = raise_exc world "Ractor::IsolationError"
+                               ("cannot make a shareable Proc because it can refer unshareable object " ++ inspect_w env world v9 ++ " from variable '" ++ n9 ++ "'") in ()))) in
+  // what the env needs of where it was written -- self, the class a def
+  // goes to, the visibility -- nearest first; and the names it could see
+  let seen9 = map_new () in
+  let rec walk = fn en -> fn (d: int) ->
+    (let _ = map_iter en (fn (n9: str) -> fn (v9: Val) ->
+               if str_eq n9 "__eid" || str_eq n9 "__captured" || map_has e9 n9 then ()
+               else if str_starts_with n9 "__" || str_eq n9 "self" then map_set e9 n9 v9
+               else if lv_name_hidden n9 then ()
+               else map_set seen9 n9 1) in
+     let (has9, p9) = lv_parent_of en in
+     if has9 && d < 64 then walk p9 (d + 1) else ()) in
+  let _ = walk cenv9 0 in
+  let out9 = map_new () in
+  let _ = map_set out9 0 "" in
+  let _ = map_iter seen9 (fn (n9: str) -> fn (_u: int) ->
+            (let o9 = map_get out9 0 in map_set out9 0 (if str_eq o9 "" then n9 else o9 ++ "," ++ n9))) in
+  let _ = map_set e9 "__isoout" (mkstr (map_get out9 0)) in
+  let _ = (if how9 == 0 then () else map_set e9 "self" self9) in
+  let n9 = vec_get lv_ctr 0 in
+  let _ = vec_set lv_ctr 0 (n9 + 1) in
+  let _ = map_set e9 "__eid" (VInt n9) in
+  let _ = map_set e9 "__captured" (VBool true) in
+  let np9 = (if how9 == 0 then pid9 else proc_copy pid9) in
+  let _ = map_set proc_store (str_of_int np9) (h9, ps9, body0, e9) in
+  let _ = map_set iso_procs (str_of_int np9) 1 in
+  let _ = (if how9 == 3 then map_set lambda_ids (str_of_int np9) VNil else ()) in
+  VProc np9
+and list_find_pfx = fn (xs: str list) -> fn (p: str) ->
+  match xs with Nil -> "" | Cons (x, t) -> if str_starts_with x p then x else list_find_pfx t p
+and list_has_str = fn (xs: str list) -> fn (x: str) ->
+  match xs with Nil -> false | Cons (y, t) -> str_eq x y || list_has_str t x
+// the outer locals a block reaches, in the order its body names them
+and proc_outer_names = fn (pid9: int) ->
+  let (_, ps9, body9, cenv9) = proc_as_block pid9 in
+  let acc9 = map_new () in
+  let own9 = map_new () in
+  let _ = ovr_params own9 ps9 in
+  let _ = ovr_stmts acc9 own9 body9 in
+  let out9 = map_new () in
+  let _ = map_iter acc9 (fn (n9: str) -> fn (_u: int) ->
+            if map_has own9 n9 then ()
+            else if lv_has cenv9 n9 then map_set out9 (str_of_int (map_len out9)) n9 else ()) in
+  let rec col = fn (i: int) -> (if i >= map_len out9 then (Nil : str list) else Cons (map_get out9 (str_of_int i), col (i + 1))) in
+  col 0
+and list_map_sv = fn (xs: str list) -> match xs with Nil -> (Nil : Val list) | Cons (x, t) -> Cons (VSym x, list_map_sv t)
+and isolate_refusal = fn world -> fn (names: str list) ->
+  raise_exc world "ArgumentError" ("can not isolate a Proc because it accesses outer variables (" ++ str_join_c names ++ ").")
+and str_join_c = fn (xs: str list) -> match xs with Nil -> "" | Cons (x, Nil) -> x | Cons (x, t) -> x ++ ", " ++ str_join_c t
 and signal_trap = fn env -> fn world -> fn (args: Val list) -> fn (hnd: Val) ->
+  // (a non-main ractor's handler runs isolated: one that reads the ractor's
+  //  locals is refused, as rb_proc_isolate refuses it)
+  let _ = (match hnd with
+           | VProc hp9 when ractor_cur_key () != 0 ->
+             (match proc_outer_names hp9 with Nil -> VNil | ns9 -> isolate_refusal world ns9)
+           | _ -> VNil) in
   let sg = (match args with Cons (v9, _) -> signal_arg_name env world v9 | Nil -> "") in
   let _ = (if str_eq sg "SEGV" || str_eq sg "BUS" || str_eq sg "ILL" || str_eq sg "FPE" || str_eq sg "VTALRM"
            then (let _ = raise_exc world "ArgumentError" ("can't trap reserved signal: SIG" ++ sg) in ())
@@ -31245,6 +31375,7 @@ and builtin_answers = fn world -> fn (recv: Val) -> fn (name: str) ->
 // 'Integer#times', and that frame above the caller's. The program's own
 // methods (and the prelude's, which are Ruby) push theirs in invoke.
 and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk0 ->
+  let _ = (if vec_get moved_on 0 == 1 then moved_guard world recv name args else VNil) in
   // (Array#sort! / #sort with a block sort here, before builtin_iter: their
   //  guard is this call -- cont_guarded)
   if vec_get cont_on 0 == 1 && (str_eq name "sort!" || str_eq name "sort") && (match recv with VArr _ -> true | _ -> false) then
@@ -37315,6 +37446,29 @@ and fstr_of = fn (s: str) ->
 // warning comes once. Giving it a singleton class or an instance variable is
 // a change too. The warning is a deprecation, so it is said only while
 // Warning[:deprecated] is on (and $VERBOSE is not nil, see rb_warn).
+// a call on what Ractor#send(move: true) took is refused, as ruby's
+// MovedObject refuses every method (inspect too, so printing one is the
+// refusal); a moved value handed to a String's, Array's or Hash's own method
+// is not one of theirs any more (TypeError), except to the methods that keep
+// or compare any object
+and moved_guard = fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  if is_moved recv then raise_exc world "Ractor::MovedError" "can not send any methods to a moved object"
+  else if (match args with Nil -> true | _ -> false) then VNil
+  else if (str_eq name "p" || str_eq name "pp" || str_eq name "puts" || str_eq name "print" || str_eq name "inspect" || str_eq name "format" || str_eq name "sprintf")
+          && moved_any args then
+    raise_exc world "Ractor::MovedError" "can not send any methods to a moved object"
+  else if (match recv with VArr _ -> true | VHsh _ -> true | VStr _ -> true | _ -> false)
+          && (if moved_keeps_any name then false else true) && moved_any args then
+    raise_exc world "TypeError" ("no implicit conversion of Ractor::MovedObject into " ++ class_name recv)
+  else VNil
+and moved_keeps_any = fn (n: str) ->
+  str_eq n "<<" || str_eq n "push" || str_eq n "append" || str_eq n "unshift"
+  || str_eq n "insert" || str_eq n "[]=" || str_eq n "store" || str_eq n "include?" || str_eq n "member?"
+  || str_eq n "index" || str_eq n "find_index" || str_eq n "rindex" || str_eq n "delete" || str_eq n "count"
+  || str_eq n "==" || str_eq n "!=" || str_eq n "eql?" || str_eq n "equal?" || str_eq n "fill"
+  || str_eq n "key?" || str_eq n "has_key?" || str_eq n "has_value?" || str_eq n "value?" || str_eq n "key"
+  || str_eq n "fetch" || str_eq n "dig" || str_eq n "[]" || str_eq n "default=" || str_eq n "assoc" || str_eq n "rassoc"
+  || str_eq n "each_with_index" || str_eq n "each" || str_eq n "map"
 and chill_touch = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VStr h ->
@@ -43460,8 +43614,14 @@ and kernel_rational_go = fn env -> fn world -> fn (a10: Val) -> fn (a20: Val) ->
          // ruby divides instead of pairing when either side is not an integer,
          // which is how Rational(1, Complex(2,1)) is a Complex and
          // Rational(1, 0.0) is a ZeroDivisionError.
-         (let d1 = (match c1 with VRat (_, _) -> c1 | VInt _ -> c1 | VBig _ -> c1 | _ -> kern_to_rational env world c1) in
-          arith_bin "/" d1 c2)
+         // (the to_rational of a side is protected: a Numeric with no #to_r
+         //  divides as itself, `Rational(N.new, 0)` is N#/'s answer)
+         (let d1 = (match c1 with VRat (_, _) -> c1 | VInt _ -> c1 | VBig _ -> c1
+                    | _ -> (match conv_protect world (fn (u: unit) -> kern_to_rational env world c1) with
+                            | VNil -> c1 | r -> r)) in
+          match d1 with
+          | VObj _ -> invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) d1 "/" (Cons (c2, Nil)) false
+          | _ -> arith_bin "/" d1 c2)
        else
          (let n9 = kern_int_value env world c1 in
           let d9 = kern_int_value env world c2 in
@@ -45497,6 +45657,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      // a top-level `define_method` is a CLOSURE: its body reads the locals of
      // the scope it was written in, so the frame is a child of that scope
      // rather than a fresh one. (run_meth does the same for a class's.)
+     let _ = dm_ractor_check world name in
      let frame = (if map_has dm_closenv name then
                     (match map_get dm_closenv name with
                      | VProc pid -> (match proc_get (str_of_int pid) with (_, _, _, cenv) -> blk_env_get cenv)
@@ -46163,6 +46324,7 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     // below unless captured); a define_method body's frame is a scope-chain
     // child and stays unpooled -- its parent chain is captured by definition.
     let from_pool = (if map_has dm_closenv dk then false else true) in
+    let _ = dm_ractor_check world dk in
     let frame = (if map_has dm_closenv dk then
                    (match map_get dm_closenv dk with
                     | VProc pid -> (match proc_get (str_of_int pid) with (_, _, _, cenv) -> blk_env_get cenv)
@@ -49696,6 +49858,8 @@ and lz_offset = fn env -> fn world -> fn (args: Val list) ->
 // spellings that no longer contain any interpreter state.
 and ivar_is_internal = fn (k: str) -> fn (plen: int) ->
   (str_len k > plen && str_eq (char_at k plen) "~")
+  // (a name no ivar can have: a MatchData's groups are kept as "0", "1", ...)
+  || (str_len k > plen && is_digit (char_at k plen))
   || (str_len k >= plen + 2 && str_eq (substring k plen (plen + 2)) "__"
       && (if str_starts_with (substring k plen (str_len k)) "__m_"
              || str_starts_with (substring k plen (str_len k)) "__um_" then false else true))
@@ -52280,6 +52444,18 @@ and queue_sch = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (cls:
     match (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else VNil) with
     | VArr aid -> arr_set aid xs
     | _ -> map_set ivars (k ++ "@__q") (arr_new xs) in
+  // (one at a time in O(1): the array's own queued push and counted shift --
+  //  a push that rebuilt the list made 20,000 unread messages take 6 s)
+  let qlen = fn (u: unit) ->
+    match (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else VNil) with
+    | VArr aid -> arr_len aid | _ -> 0 in
+  let qpush = fn (v: Val) ->
+    match (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else VNil) with
+    | VArr aid -> arr_push_many aid (Cons (v, Nil))
+    | _ -> map_set ivars (k ++ "@__q") (arr_new (Cons (v, Nil))) in
+  let qshift = fn (u: unit) ->
+    match (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else VNil) with
+    | VArr aid -> arr_shift1 aid | _ -> VNil in
   let closed = fn (u: unit) -> map_has ivars (k ++ "@__qclosed") in
   let tmo = sch_kw_timeout args in
   let has_tmo = (match tmo with VNil -> false | _ -> true) in
@@ -52313,13 +52489,13 @@ and queue_sch = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (cls:
           if closed () then raise_exc world "ClosedQueueError" "queue closed"
           else
             (let full = (match (if map_has ivars (k ++ "@__qmax") then map_get ivars (k ++ "@__qmax") else VNil) with
-                         | VInt mx -> val_list_len (items ()) >= mx
+                         | VInt mx -> qlen () >= mx
                          | _ -> false) in
              if full then
                (if nb then raise_exc world "ThreadError" "queue full"
                 else if blk_wait world 5 id recv dl then VNil
                 else go ())
-             else (let _ = put (list_append (items ()) (Cons (v, Nil))) in
+             else (let _ = qpush v in
                    let _ = fsw_wake_one world 4 id in
                    recv)) in
         go ()))
@@ -52329,9 +52505,8 @@ and queue_sch = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (cls:
      else
        (let dl = sch_deadline env world tmo in
         let rec go = fn (u: unit) ->
-          match items () with
-          | Cons (h, t) -> (let _ = put t in let _ = fsw_wake_one world 5 id in h)
-          | Nil ->
+          if qlen () > 0 then (let h = qshift () in let _ = fsw_wake_one world 5 id in h)
+          else
             (if nb then raise_exc world "ThreadError" "queue empty"
              else if closed () then VNil
              else if blk_wait world 4 id recv dl then VNil
@@ -60873,6 +61048,27 @@ and lex_parse_eval_src = fn (h: int) -> fn (el: int) -> fn (reset: bool) ->
                    (fn (m: str) -> ((Nil : Stmt list), (if str_eq m "" then " " else m))) in
   let _ = map_set load_ctx "coding" savedc9 in
   if str_eq m9 "" then p9 else fail m9
+and iso_eval_check = fn env -> fn world -> fn (code: str) ->
+  let out9 = (match lv_get env "__isoout" with VStr h -> sget h | _ -> "") in
+  if str_eq out9 "" then ()
+  else
+    (let names9 = map_new () in
+     let _ = list_iter (str_split out9 ",") (fn (n9: str) -> map_set names9 n9 1) in
+     let n = str_len code in
+     let idc = fn (c: str) -> is_alnum c || str_eq c "_" in
+     let rec go = fn (i: int) ->
+       (if i >= n then ()
+        else if idc (char_at code i) then
+          (let rec fin = fn (j: int) -> (if j < n && idc (char_at code j) then fin (j + 1) else j) in
+           let j9 = fin i in
+           let w9 = substring code i j9 in
+           let pc9 = (if i > 0 then char_at code (i - 1) else " ") in
+           if map_has names9 w9 && (if lv_has env w9 then false else true)
+              && (if str_eq pc9 "." || str_eq pc9 "@" || str_eq pc9 "$" || str_eq pc9 ":" then false else true)
+           then (let _ = raise_exc world "SyntaxError" ("can not access variable '" ++ w9 ++ "' from isolated Proc") in ())
+           else go j9)
+        else go (i + 1)) in
+     go 0)
 and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
   // (the frame this eval draws, named by the caller -- see eval_framed --
   //  and taken now, so an eval that never runs leaves no name behind)
@@ -60917,6 +61113,12 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     let bom9 = (let c1 = sget code in str_len c1 >= 3 && str_eq (substring c1 0 3) (chr 239 ++ chr 187 ++ chr 191)) in
     let code = (let c1 = sget code in
                 if bom9 then substring c1 3 (str_len c1) else c1) in
+    // (in an isolated Proc the locals of where it was written are out of
+    //  reach, and ruby's compile says so: compile.c's "can not access
+    //  variable ... from isolated Proc")
+    let _ = (match rest with
+             | Cons (VBind _, _) -> ()
+             | _ -> (if map_len iso_procs > 0 && lv_has env "__isoout" then iso_eval_check env world code else ())) in
     // (without a binding an eval is a scope of its own under the caller's:
     //  it reads and writes the caller's locals, and the ones it makes end
     //  with it -- `eval("a = 2"); eval("p a")` is a NameError)

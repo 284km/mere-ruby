@@ -3904,3 +3904,59 @@ ractor_local_method counted 110 for 100).
 - The blk_own_marks mechanism (blocks with parameters, decided at block
   creation by whether the enclosing env has the name) stays; it cannot see
   a later assignment, which the predeclaration already holds.
+
+## 2026-11-12 (41): stage 9, round 24 -- moving, isolated Procs, a ractor's own streams, and a Queue that was quadratic
+
+Round 24 of note 545: what round 22 measured and left. bootstraptest's
+test_ractor, 21 failing of 154 here before the round -> 0 (locally, the
+runner with --ruby=mere-ruby).
+
+- **`send(obj, move: true)` takes the object away** (ractor.c's move): the
+  receiver gets the copy, and the sender's object -- and every unshareable
+  thing it holds -- answers every method with Ractor::MovedError and
+  Ractor::MovedObject to `===`. Arrays, Strings and Hashes are values here,
+  so a moved one is a key in a set (moved_set, asked only once something
+  has moved: moved_on) rather than an object whose class changed; the call
+  paths that reach a receiver -- a method call, an operator, a call with a
+  block, a send -- refuse it, a builtin of a String, Array or Hash handed one
+  is the TypeError ruby's type check gives (the methods that keep or compare
+  any object aside), and printing one is the refusal its #inspect is. An
+  object's class becomes Ractor::MovedObject. The moved are kept, so no later
+  value is made under a moved key.
+- **make_shareable in ruby's order**: an object is frozen by its own
+  #freeze when it is entered and what it holds is walked after, so a #freeze
+  that sets an instance variable has it frozen too; Complex's and
+  Rational's parts are walked; a Proc needs a shareable self ("Proc's self
+  is not shareable: ...") and a Method a shareable receiver ("can not make
+  shareable object for ..."); a Ractor or a Port is not frozen. On the way:
+  `Rational(N.new, 0)` of a Numeric with no #to_r divides as itself (ruby
+  protects the to_r), and a MatchData's groups no longer show as
+  instance variables `@0`.
+- **Isolated Procs** (vm.c's rb_proc_isolate / rb_proc_ractor_make_shareable):
+  shareable_proc / shareable_lambda make a copy whose self is the `self:`
+  given (nil by default, refused when unshareable); make_shareable isolates
+  the Proc itself; Ractor.new isolates its block. An isolated Proc's env is
+  its own, cut from where it was written: the outer locals it reads are
+  copied in -- refused when unshareable, or when the scope assigns the name
+  more than once, also after the block (the parse's lvar_reassigned: the
+  lexer counts each scope's assignment sites, and a block written straight
+  after shareable_proc / shareable_lambda carries the names its scopes
+  assign twice on a marker, as round 23's own-locals marker rides) -- and
+  an eval inside that names a local of where it was written is ruby's
+  SyntaxError "can not access variable ... from isolated Proc"; its #binding
+  is refused.
+- **A non-main ractor has its own $stdin, $stdout, $stderr** -- IOs of its
+  own on the same descriptors; a method define_method made from an
+  unshareable block answers only in the ractor that made it ("defined with
+  an un-shareable Proc in a different Ractor"; an isolated block's answers
+  anywhere); a non-main ractor's trap handler that reads the ractor's locals
+  is refused; ObjectSpace._id2ref finds an Array or a Hash by its id.
+- ⚠ **Thread::Queue#push rebuilt the whole list**, and the dispatch arm
+  folded and inspected the queue on every call: 20,000 unread messages took
+  6 s, 100,000 never finished (test_ractor's port flood timed out at 180 s).
+  It uses the array's own queued push and counted shift now: 40,000 in 0.8 s.
+- **Left, measured** (the same before this round, so not its doing): an
+  allocation inside a ractor has no allocation_sourcefile under
+  trace_object_allocations (objspace/test_ractor), and GC.start reports no
+  `<internal:gc>` line event (test_settracefunc's
+  tp_ractor_local_untargeted).
