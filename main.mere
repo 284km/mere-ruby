@@ -2942,7 +2942,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else
     if lv_has env "self" then
       (let k = ivar_self_key (lv_get env "self") name in
-       if (if str_eq k "" then false else true) && map_has ivars k then map_get ivars k else VNil)
+       let v9 = (if (if str_eq k "" then false else true) && map_has ivars k then map_get ivars k else VNil) in
+       if map_len ractor_thr == 0 then v9 else ractor_ivar_check env world (lv_get env "self") name false v9)
     else VNil
   // the flip-flop operator: off -> the left condition may switch it on;
   // on -> the right condition may switch it off. `...` (exclusive) skips
@@ -3728,6 +3729,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else VBool false)
     else if str_len name > 0 && str_eq (char_at name 0) "$" then
       (let k = gvar_slot (substring name 1 (str_len name)) in
+       let _ = ractor_gvar_check world k in
        // `$=` is deprecated in Ruby and reading it warns -- through Warning.warn,
        // which a program can override (a test suite that turns warnings into
        // failures does exactly that). No warning was emitted at all here, so the
@@ -6684,7 +6686,156 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
 
 // run the tracer for a global that has one. Every global write goes through
 // gvar_write, so a traced variable fires wherever it is assigned.
+// Is this thread running a non-main Ractor's body? (one lookup, and none at
+// all until a ractor has started)
+and ractor_nonmain = fn (u: unit) -> map_len ractor_thr > 0 && map_has ractor_thr (fb_thread_of (fb_cur ()))
+  // (...in the program's own code: the interpreter's prelude is what ruby
+  //  does in C, and reads its own tables -- Process::SHELL_WORDS -- freely)
+  //  ...and so are the shipped files that stand for one of ruby's C
+  //  extensions, whose names start with __ (__marshal.rb))
+  //  ...and the ones that stand in for a C extension's object file
+  //  (digest/md5.bundle: its tables are C data in ruby)
+  && (let f9 = cur_file () in
+      if str_starts_with f9 "<internal:" || str_ends_with f9 ".bundle" || str_ends_with f9 ".so" then false
+      else (let i9 = str_last_index_of f9 "/" in
+            if i9 >= 0 && str_len f9 > i9 + 2 && str_eq (substring f9 (i9 + 1) (i9 + 3)) "__" then false else true))
+// the globals each ractor has its own of, or that are safe to share
+// (rb_gvar_ractor_local in eval.c, io.c, process.c, re.c), and the numbered
+// match groups, which read $~
+and ractor_local_gvar = fn (slot: str) ->
+  str_eq slot "!" || str_eq slot "@" || str_eq slot "$" || str_eq slot "?" || str_eq slot "~"
+  || str_eq slot "&" || str_eq slot "'" || str_eq slot "`" || str_eq slot "+" || str_eq slot "_"
+  || str_eq slot "/" || str_eq slot "-0" || str_eq slot ">" || str_eq slot "stdin" || str_eq slot "stdout"
+  || str_eq slot "stderr" || str_eq slot "-i" || str_eq slot "VERBOSE" || str_eq slot "DEBUG"
+  || str_eq slot "-v" || str_eq slot "-w" || str_eq slot "-W" || str_eq slot "-d" || str_eq slot "-a"
+  || str_eq slot "-l" || str_eq slot "-p"
+  || (str_len slot > 0 && ord (char_at slot 0) >= 48 && ord (char_at slot 0) <= 57)
+// a global read or written from a non-main ractor (variable.c's rb_gvar_lookup)
+// an instance variable of a SHAREABLE object, from a non-main ractor
+// (variable.c): a class's or module's is read only when its value is
+// shareable and never written; any other shareable object's (a Ractor's own)
+// is neither. The interpreter's own (@__...) are its business. Answers the
+// value read.
+and ractor_ivar_check = fn env -> fn world -> fn (self9: Val) -> fn (name: str) -> fn (write: bool) -> fn (v: Val) ->
+  if str_starts_with name "__" || (if ractor_nonmain () then false else true) then v
+  else
+    (match self9 with
+     | VClass c9 ->
+       (if write then
+          raise_exc world "Ractor::IsolationError" "can not set instance variables of classes/modules by non-main Ractors"
+        else if ractor_shareable env world v then v
+        else raise_exc world "Ractor::IsolationError"
+               ("can not get unshareable values from instance variables of classes/modules from non-main Ractors (@" ++ name ++ " from " ++ cls_display world c9 ++ ")"))
+     | VObj _ ->
+       (if str_eq (dispatch_cls_of world self9) "Ractor" || str_eq (dispatch_cls_of world self9) "Ractor::Port"
+        then raise_exc world "Ractor::IsolationError" "can not access instance variables of shareable objects from non-main Ractors"
+        else v)
+     | _ -> v)
+// a class variable from a non-main ractor, read or written (variable.c's
+// CVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR)
+and ractor_cvar_check = fn world -> fn (cls: str) -> fn (name: str) ->
+  if map_len ractor_thr == 0 || str_eq cls "" then ()
+  else if ractor_nonmain () then
+    (let _ = raise_exc world "Ractor::IsolationError"
+               ("can not access class variables from non-main Ractors (@@" ++ name ++ " from " ++ cls_display world cls ++ ")") in ())
+  else ()
+// The local names a block's body reads or writes, the names its own nested
+// blocks take as parameters set aside (Ractor.new isolates the block: one that
+// reaches a variable outside it is refused, proc.c's proc_isolate). `acc`
+// gathers the names, `own` the nested parameters.
+and ovr_name = fn acc -> fn (n: str) ->
+  if str_len n > 0 && (if str_starts_with n "__" then false else true)
+     && ((ord (char_at n 0) >= 97 && ord (char_at n 0) <= 122) || str_eq (char_at n 0) "_")
+  then map_set acc n 1 else ()
+and ovr_params = fn own -> fn (ps: str list) ->
+  list_iter ps (fn (p9: str) ->
+    (let q9 = (if str_starts_with p9 "**" then substring p9 2 (str_len p9)
+               // (`|x; y|`: a block-local is ";y", a name of its own)
+               else if str_starts_with p9 "*" || str_starts_with p9 "&" || str_starts_with p9 ";" then substring p9 1 (str_len p9) else p9) in
+     map_set own q9 1))
+and ovr_stmts = fn acc -> fn own -> fn (body: Stmt list) -> list_iter body (fn (s9: Stmt) -> ovr_stmt acc own s9)
+and ovr_stmt = fn acc -> fn own -> fn (s: Stmt) ->
+  match s with
+  | SExpr e -> ovr_expr acc own e
+  | SAssign (n, e) -> (let _ = ovr_name acc n in ovr_expr acc own e)
+  | SIVarAssign (_, e) -> ovr_expr acc own e
+  | SReturn e -> ovr_expr acc own e
+  | SBreak e -> ovr_expr acc own e
+  | SNext e -> ovr_expr acc own e
+  | SPuts es -> ovr_exprs acc own es
+  | SWhile (c, b) -> (let _ = ovr_expr acc own c in ovr_stmts acc own b)
+  | SDoWhile (b, c) -> (let _ = ovr_stmt acc own b in ovr_expr acc own c)
+  | SIf (cl, els) -> (let _ = list_iter cl (fn (cb: (Expr * Stmt list)) -> (match cb with (c9, b9) -> (let _ = ovr_expr acc own c9 in ovr_stmts acc own b9))) in ovr_stmts acc own els)
+  | SCase (e, cl, els) -> (let _ = ovr_expr acc own e in
+                          let _ = list_iter cl (fn (cb: (Expr list * Stmt list)) -> (match cb with (cs9, b9) -> (let _ = ovr_exprs acc own cs9 in ovr_stmts acc own b9))) in
+                          ovr_stmts acc own els)
+  | SBegin (b, rs, el, en) -> (let _ = ovr_stmts acc own b in
+                               let _ = list_iter rs (fn (r9: (str list * str * Stmt list)) -> (match r9 with (_, v9, rb9) -> (let _ = ovr_name acc v9 in ovr_stmts acc own rb9))) in
+                               let _ = ovr_stmts acc own el in ovr_stmts acc own en)
+  | SMultiAssign (ns, es) -> (let _ = list_iter ns (fn (n9: str) -> ovr_name acc n9) in ovr_exprs acc own es)
+  | SMultiAssignX (ts, es) -> (let _ = ovr_exprs acc own ts in ovr_exprs acc own es)
+  | SAndThen (a, b) -> (let _ = ovr_stmt acc own a in ovr_stmt acc own b)
+  | SOrElse (a, b) -> (let _ = ovr_stmt acc own a in ovr_stmt acc own b)
+  | SLocalFrom (_, s2) -> ovr_stmt acc own s2
+  | _ -> ()
+and ovr_exprs = fn acc -> fn own -> fn (es: Expr list) -> list_iter es (fn (e9: Expr) -> ovr_expr acc own e9)
+and ovr_blk = fn acc -> fn own -> fn (ps: str list) -> fn (b: Stmt list) -> (let _ = ovr_params own ps in ovr_stmts acc own b)
+and ovr_expr = fn acc -> fn own -> fn (e: Expr) ->
+  match e with
+  | EVar n -> ovr_name acc n
+  | ECall (n, args) -> (let _ = (match args with Nil -> ovr_name acc n | _ -> ()) in ovr_exprs acc own args)
+  | EAssign (n, v) -> (let _ = ovr_name acc n in ovr_expr acc own v)
+  | EBin (_, a, b) -> (let _ = ovr_expr acc own a in ovr_expr acc own b)
+  | EUn (_, a) -> ovr_expr acc own a
+  | EMethod (r, _, args) -> (let _ = ovr_expr acc own r in ovr_exprs acc own args)
+  | ESafe (r, _, args) -> (let _ = ovr_expr acc own r in ovr_exprs acc own args)
+  | EMethodB (r, _, args, ps, b) -> (let _ = ovr_expr acc own r in let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
+  | ESafeB (r, _, args, ps, b) -> (let _ = ovr_expr acc own r in let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
+  | ECallB (_, args, ps, b) -> (let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
+  | ESuperB (_, args, ps, b) -> (let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
+  | ELambda (ps, b) -> ovr_blk acc own ps b
+  | EArr es -> ovr_exprs acc own es
+  | EHsh es -> ovr_exprs acc own es
+  | EKwHash es -> ovr_exprs acc own es
+  | ETern (a, b, c) -> (let _ = ovr_expr acc own a in let _ = ovr_expr acc own b in ovr_expr acc own c)
+  | EYield es -> ovr_exprs acc own es
+  | ERaise es -> ovr_exprs acc own es
+  | ESuper (_, es) -> ovr_exprs acc own es
+  | ESplat a -> ovr_expr acc own a
+  | EKwSplat a -> ovr_expr acc own a
+  | EBlockPass a -> ovr_expr acc own a
+  | EDefined a -> ovr_expr acc own a
+  | ERange (a, b, _) -> (let _ = ovr_expr acc own a in ovr_expr acc own b)
+  | EAttrOp (r, _, _, v) -> (let _ = ovr_expr acc own r in ovr_expr acc own v)
+  | EIdxOp (r, ix, _, v) -> (let _ = ovr_expr acc own r in let _ = ovr_exprs acc own ix in ovr_expr acc own v)
+  | EAmbigIdx (n, items) -> (let _ = ovr_name acc n in ovr_exprs acc own items)
+  | EAmbigIdxC (n, a, b) -> (let _ = ovr_name acc n in let _ = ovr_expr acc own a in ovr_expr acc own b)
+  | EScopedAssign (r, _, v) -> (let _ = ovr_expr acc own r in ovr_expr acc own v)
+  | EScopedRead (r, _) -> ovr_expr acc own r
+  | EStmt s2 -> ovr_stmt acc own s2
+  | EFlow (_, a) -> ovr_expr acc own a
+  | EMatchTest (a, _) -> ovr_expr acc own a
+  | EMatchBind (a, _) -> ovr_expr acc own a
+  | _ -> ()
+and ractor_shareable = fn env -> fn world -> fn (v: Val) ->
+  (match v with
+   | VNil -> true | VBool _ -> true | VInt _ -> true | VFlt _ -> true | VSym _ -> true | VClass _ -> true
+   // (Ractor.shareable? is Ruby and reads constants itself -- ENV, Psych --
+   //  whose checks would ask it again: one question at a time)
+   | _ -> if map_has ractor_thr (0 - 1) then true
+          else (let _ = map_set ractor_thr (0 - 1) 1 in
+                let r9 = try_or_msg (fn (u: unit) -> truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass "Ractor") "shareable?" (Cons (v, Nil)) false))
+                           (fn (m: str) -> let _ = map_delete ractor_thr (0 - 1) in fail m) in
+                let _ = map_delete ractor_thr (0 - 1) in
+                r9))
+and ractor_gvar_check = fn world -> fn (slot: str) ->
+  if map_len ractor_thr == 0 then ()
+  else if ractor_local_gvar slot then ()
+  else if ractor_nonmain () then
+    (let _ = raise_exc world "Ractor::IsolationError" ("can not access global variable $" ++ slot ++ " from non-main Ractor") in ())
+  else ()
 and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
+  let _ = ractor_gvar_check world slot in
   // a non-nil $; or $, is deprecated, and ruby says so when the deprecation
   // warnings are on
   // (and so is a non-nil $/, every one of them -- "\n" included)
@@ -6953,6 +7104,17 @@ and const_seg_last = fn (key: str) ->
   let i9 = dcolon_at key 0 in
   if i9 + 2 >= str_len key then key else const_seg_last (substring key (i9 + 2) (str_len key))
 and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
+  // (a constant a SHIPPED library defines is the interpreter's: where ruby
+  //  has a C extension -- cgi/escape's escapeHTML -- this one runs the Ruby
+  //  fallback, and its tables are C data to ruby. A non-main ractor reads
+  //  them as the extension would: const_read_note)
+  let _ = (let lf9 = (match (if map_has load_ctx "file" then map_get load_ctx "file" else VNil) with VStr h -> sget h | _ -> "") in
+           let sd9 = (match (if map_has load_ctx "stdlibdir" then map_get load_ctx "stdlibdir" else VNil) with VStr h -> sget h | _ -> "") in
+           if str_len sd9 > 0 && str_starts_with lf9 sd9 then map_set ractor_int_const key 1 else ()) in
+  // (a non-main ractor sets only a shareable value: rb_const_set)
+  let _ = (if map_len ractor_thr > 0 && ractor_nonmain () && (if ractor_shareable gc_cenv0 world v then false else true) then
+             (let _ = raise_exc world "Ractor::IsolationError" "can not set constants with non-shareable objects by non-main Ractors" in ())
+           else ()) in
   let _ = (if map_has consts key
            // (an anonymous namespace is said as it inspects, `#<Class:0x...>`,
            //  not by the name the interpreter keeps it under)
@@ -7060,6 +7222,13 @@ and tp_c_hook_in = fn world -> fn (hook: str) -> fn (owner: str) -> fn (dc: str)
 //    the top level as "::X", when the deprecated category is on and $VERBOSE
 //    is not nil.
 and const_read_note = fn world -> fn (key: str) ->
+  // (a non-main ractor reads only a shareable constant: variable.c's
+  //  rb_const_get_0 names the class it was found in, Object at the top)
+  let _ = (if map_len ractor_thr > 0 && map_has consts key && (if map_has ractor_int_const key then false else true) && ractor_nonmain ()
+              && (if ractor_shareable gc_cenv0 world (map_get consts key) then false else true) then
+             (let _ = raise_exc world "Ractor::IsolationError"
+                        ("can not access non-shareable objects in constant " ++ (if str_contains key "::" then key else "Object::" ++ key) ++ " by non-main Ractor.") in ())
+           else ()) in
   let _ = (if map_len autoload_busy > 0 && fb_can_suspend && map_has autoload_busy key
               && (if map_get autoload_busy key == al_me () then false else true) then
              // ...PARKED, not passing: a thread that passed until the load
@@ -13532,7 +13701,20 @@ and autoload_busy_other = fn (key: str) ->
 // (test/fiber's test_autoload, whose file sleeps)
 and al_me = fn (u: unit) ->
   if fb_sched_here () then 0 - (1000 + fb_cur ()) else sch_me ()
+// An autoload a non-main ractor sets off is loaded by the main ractor, as
+// ruby's autoload_load_body has it: rubygems' Ruby-level require reads Gem's
+// tables, which a non-main ractor may not
 and autoload_fire = fn env -> fn world -> fn blk -> fn (key: str) ->
+  if map_len ractor_thr > 0 && map_has ractor_thr (fb_thread_of (fb_cur ())) then
+    (let t9 = fb_thread_of (fb_cur ()) in
+     let root9 = map_get ractor_thr t9 in
+     let _ = map_delete ractor_thr t9 in
+     let r9 = try_or_msg (fn (u: unit) -> autoload_fire0 env world blk key)
+                (fn (m: str) -> let _ = map_set ractor_thr t9 root9 in fail m) in
+     let _ = map_set ractor_thr t9 root9 in
+     r9)
+  else autoload_fire0 env world blk key
+and autoload_fire0 = fn env -> fn world -> fn blk -> fn (key: str) ->
   if map_has autoloads key then
     (let path = (match map_get autoloads key with VStr h -> sget h | _ -> "") in
      let me9 = al_me () in
@@ -18165,6 +18347,36 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // through this private door instead. An alias cannot stand in for it: an
     // alias of a builtin resolves by NAME at call time, so it would find the
     // refusal too.
+    // the thread running a ractor's body says so at its start and its end
+    // (ractor_nonmain reads it)
+    // the outer locals a block reaches (Ractor.new refuses such a block):
+    // names its body uses that its defining scope has, less its parameters
+    // and what it assigns before... (an assignment to an outer name is a
+    // reach too, as ruby counts it)
+    else if str_eq c "Ractor" && (str_len name == 12 && str_eq name "__outer_vars") then
+      (match args with
+       | Cons (VProc pid9, _) ->
+         (let (_, ps9, body9, cenv9) = proc_as_block pid9 in
+          let acc9 = map_new () in
+          let own9 = map_new () in
+          let _ = ovr_params own9 ps9 in
+          let _ = ovr_stmts acc9 own9 body9 in
+          let out9 = map_new () in
+          let _ = map_iter acc9 (fn (n9: str) -> fn (_u: int) ->
+                    if map_has own9 n9 then ()
+                    else if lv_has cenv9 n9 then map_set out9 (str_of_int (map_len out9)) (VSym n9) else ()) in
+          let rec col = fn (i: int) -> (if i >= map_len out9 then (Nil : Val list) else Cons (map_get out9 (str_of_int i), col (i + 1))) in
+          arr_new (col 0))
+       | _ -> arr_new Nil)
+    else if str_eq c "Ractor" && (str_len name == 13 && str_eq name "__nonmain_off") then
+      (let _ = map_delete ractor_thr (fb_thread_of (fb_cur ())) in VNil)
+    else if str_eq c "Ractor" && (str_len name == 12 && str_eq name "__nonmain_on") then
+      (let t9 = fb_thread_of (fb_cur ()) in let _ = map_set ractor_thr t9 t9 in VNil)
+    // the Thread that runs the body of the ractor this thread belongs to (its
+    // own, or its creator's), nil in the main ractor
+    else if str_eq c "Ractor" && (str_len name == 6 && str_eq name "__root") then
+      (let t9 = fb_thread_of (fb_cur ()) in
+       if map_has ractor_thr t9 then VObj (map_get ractor_thr t9) else VNil)
     else if str_eq c "Ractor" && (str_len name == 7 && str_eq name "__alloc") then
       (let (meths0, sup0, ocls0, ivars0) = world in
        let id = alloc_oid ocls0 in
@@ -21513,6 +21725,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let origin0 = (if map_has meths0 (c ++ "#" ++ nm) then c
                       else if inh2 then lookup_anc world (ancestors_of world c) nm
                       else "") in
+       // (...and an undef nearer than where the walk found it is the answer:
+       //  `undef_method :m` in a subclass leaves no m, as ruby's UNDEF entry)
+       let origin0 = (if str_eq origin0 "" || str_eq origin0 c || map_len undefs == 0 then origin0
+                      else (let rec nearer = fn (xs: str list) ->
+                              (match xs with
+                               | Nil -> origin0
+                               | Cons (a9, t9) -> (if str_eq a9 origin0 then origin0
+                                                   else if map_has undefs (a9 ++ "#" ++ nm) then ""
+                                                   else nearer t9)) in
+                            nearer (ancestors_of world c))) in
        // (...but a builtin of the class ITSELF comes before an ancestor past
        //  it: `Module.public_method_defined?(:include)` found the private
        //  top-level `def include` mspec's shim makes on Object, ahead of
@@ -21763,6 +21985,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let add_from9 = fn (cx: str) ->
          (let pfx = cx ++ "#" in
           let plen = str_len pfx in
+          // (an undef here settles the name too: test/unit's test_methods is
+          //  public_instance_methods(true), and a subclass's undef_method of
+          //  an inherited test listed it -- "undefined method" when it ran)
+          let _ = (if map_len undefs > 0 then
+                     map_iter undefs (fn (k: str) -> fn (_v: Val) ->
+                       if str_len k > plen && str_starts_with k pfx then map_set seen9 (substring k plen (str_len k)) 1 else ())
+                   else ()) in
           // ⚠ the NEAREST class decides a name: one found here with a
           //   different visibility is settled (seen) and not listed, so a
           //   farther class cannot list it -- a public Object#m with a
@@ -23431,6 +23660,41 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           if d9 >= 32 && (serial9 + 1) * 32 == d9 && serial9 < str_count ()
           then VStr (handle_base + serial9) else VNil)
        | _ -> VNil)
+    // the live Arrays and Hashes: they are values in their own stores (not
+    // objects in the object table), and the collector deletes the dead ones,
+    // so a store's size is how many are alive -- count_objects' T_ARRAY and
+    // T_HASH, which test_allocation reads with the collector off
+    //
+    // ⚠ count_objects is Ruby here and makes Arrays and Hashes of its own,
+    //   where ruby's makes none: with the collector off, the first call's
+    //   leftovers were counted by the second as if the program had made them.
+    //   Ids are handed out in order, so each call's own are one range of ids
+    //   (__store_counts at its start, __store_done at its end); the survivors
+    //   of those ranges are not counted, and a range with none left is dropped.
+    else if str_eq c "ObjectSpace" && (str_len name == 14 && str_eq name "__store_counts") then
+      (let a0 = (if map_has arr_ctr 0 then map_get arr_ctr 0 else handle_base) in
+       let h0 = hash_next () in
+       let _ = vec_set cobj_entry 0 a0 in
+       let _ = vec_set cobj_entry 1 h0 in
+       let own = fn st -> fn rg ->
+         (let dead = map_new () in
+          let acc = map_new () in
+          let _ = map_iter rg (fn (lo: int) -> fn (hi: int) ->
+                    (let rec live = fn (k: int) -> fn (n: int) -> (if k >= hi then n else live (k + 1) (if map_has st k then n + 1 else n)) in
+                     let n9 = live lo 0 in
+                     if n9 == 0 then map_set dead lo 1
+                     else map_set acc 0 ((if map_has acc 0 then map_get acc 0 else 0) + n9))) in
+          let _ = map_iter dead (fn (lo: int) -> fn (_u: int) -> map_delete rg lo) in
+          (if map_has acc 0 then map_get acc 0 else 0)) in
+       let oa = own arr_store cobj_arr in
+       let oh = own hash_store cobj_hsh in
+       arr_new (Cons (VInt (map_len arr_store - oa), Cons (VInt (map_len hash_store - oh), Nil))))
+    else if str_eq c "ObjectSpace" && (str_len name == 12 && str_eq name "__store_done") then
+      (let a1 = (if map_has arr_ctr 0 then map_get arr_ctr 0 else handle_base) in
+       let h1 = hash_next () in
+       let _ = (if a1 > vec_get cobj_entry 0 then map_set cobj_arr (vec_get cobj_entry 0) a1 else ()) in
+       let _ = (if h1 > vec_get cobj_entry 1 then map_set cobj_hsh (vec_get cobj_entry 1) h1 else ()) in
+       VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 9 && str_eq name "__objects") then
       (let (_, sup9, ocls9, _) = world in
        let want9 = (match args with Cons (VClass w9, _) -> w9 | _ -> "") in
@@ -46189,6 +46453,7 @@ and meth_vis_walk = fn world -> fn (anc: str list) -> fn (name: str) -> fn (want
 //   in this file, and the rule must not be written twice.
 and cvar_get = fn env -> fn world -> fn (name: str) ->
   let cls = cvar_cls env world in
+  let _ = ractor_cvar_check world cls name in
   // a class variable accessed at the top-level scope is a RuntimeError.
   if str_eq cls "" then raise_exc world "RuntimeError" "class variable access from toplevel"
   // reading an uninitialised class variable is a NameError in Ruby.
@@ -46245,6 +46510,7 @@ and cvar_get_from = fn world -> fn (cls: str) -> fn (name: str) ->
   if str_eq o9 "" then VNil else map_get cvars (o9 ++ "@" ++ name)
 
 and cvar_set = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
+  let _ = ractor_cvar_check world (cvar_cls env world) name in
   let cls = cvar_cls env world in
   if str_eq cls "" then (let _ = raise_exc world "RuntimeError" "class variable access from toplevel" in ())
   else
@@ -51715,6 +51981,11 @@ and thread_start_sch = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list
   let _ = map_set iv3 (k ++ "@__tst") (mkstr "run") in
   let _ = map_set iv3 (k ++ "@__tloc") (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()))) in
   let _ = map_set all_thr k (VObj tid) in
+  // (a thread made inside a ractor belongs to that ractor)
+  let _ = (if map_len ractor_thr > 0 then
+             (let par9 = fb_thread_of (fb_cur ()) in
+              if map_has ractor_thr par9 then map_set ractor_thr tid (map_get ractor_thr par9) else ())
+           else ()) in
   let _ = (let (_, _, _, tcenv) = newblk in mark_captured tcenv) in
   let pid = (proc_next ()) in
   let _ = store_proc (str_of_int pid) newblk in
@@ -51821,11 +52092,16 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
                   //  thread.c's `th->vm->thread_abort_on_exception || RTEST(ruby_debug)`)
                   || (if map_has globals "DEBUG" then truthy (map_get globals "DEBUG") else false)
                   || thr_exc_is_exit world (map_get iv3 (k ++ "@__texc")))
-           then (let m = sch_main () in
+           // (...the main thread of the RACTOR it belongs to: a ractor's
+           //  `exit` ends that ractor, as its body's SystemExit)
+           then (let m = (if map_has ractor_thr tid && map_get ractor_thr tid != tid then map_get ractor_thr tid else sch_main ()) in
                  let _ = map_set iv3 (str_of_int m ++ "@__tpend") (map_get iv3 (k ++ "@__texc")) in
                  if sch_waiting m then sch_unpark m else ())
            else ()) in
   let _ = (if map_has iv3 (k ++ "@__targs") then map_delete iv3 (k ++ "@__targs") else ()) in
+  // (a ractor's own thread leaves the ractor's table when it ends; its body's
+  //  thread is taken out by the body itself, __nonmain_off)
+  let _ = (if map_len ractor_thr > 0 && map_has ractor_thr tid && map_get ractor_thr tid != tid then map_delete ractor_thr tid else ()) in
   // A finished thread keeps its result/exception, but no longer needs the
   // startup Proc. Keeping it retained the entire captured scope even when
   // callers only needed the completed Thread's result or exception.
@@ -58232,7 +58508,20 @@ and req_wait_other = fn world -> fn (p0: str) -> fn (full: str) ->
   if req_other_loading p0 full
   then (let _ = sch_block world 1 0 (sch_now () + 1000000) in req_wait_other world p0 full)
   else ()
+// A non-main ractor's require is the main ractor's, as ruby 4.0 has it (the
+// load is run by main): the file's constants and globals are set as main
+// would, and the thread is a non-main ractor's again after, raised or not.
 and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) ->
+  if map_len ractor_thr > 0 && map_has ractor_thr (fb_thread_of (fb_cur ())) then
+    (let t9 = fb_thread_of (fb_cur ()) in
+     let root9 = map_get ractor_thr t9 in
+     let _ = map_delete ractor_thr t9 in
+     let r9 = try_or_msg (fn (u: unit) -> do_require0 env world blk rel p0)
+                (fn (m: str) -> let _ = map_set ractor_thr t9 root9 in fail m) in
+     let _ = map_set ractor_thr t9 root9 in
+     r9)
+  else do_require0 env world blk rel p0
+and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) ->
   // (`require "etc.so"` -- tmpdir's -- is the shipped etc, one feature with
   //  `require "etc"`)
   let p0 = (if str_eq p0 "etc.so" then "etc" else p0) in
@@ -58812,6 +59101,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     if skip then FNext v else
     if str_len name > 0 && str_eq (char_at name 0) "@" then
       let _ = cvar_set env world (substring name 1 (str_len name)) v in FNext v
+    else if map_len ractor_thr > 0 && lv_has env "self"
+            && (let _ = ractor_ivar_check env world (lv_get env "self") name true v in false) then FNext v
     else
     // freezing an object seals its ivars: `@x = v` on a frozen self raises,
     // which is what an attr writer on a frozen receiver has to do.

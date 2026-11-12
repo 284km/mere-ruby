@@ -679,14 +679,14 @@ let core_prelude_b =
   "end\n";
 
 let core_prelude_c =
-  // Ractor, sequentially: this interpreter has one thread of control (Thread
-  // runs its block where it is created), so a Ractor keeps its block and runs
-  // it when someone asks for the VALUE. A message sent before that is in the
-  // mailbox by the time the body asks for it, which is the shape the tests
-  // use; what this cannot model is two bodies running at once, and the pairs
-  // that need that are recorded in KNOWN_GAPS.
+  // Ractor on the scheduler's threads (m_sched): each body is a Thread, a
+  // port is a Thread::Queue its creator reads, and a read of an empty port
+  // waits while the other bodies run. Concurrent, not parallel -- one thread
+  // of control at a time, as every Thread here. (It used to run each body
+  // sequentially when its value was asked for, so two ractors that talk to
+  // each other could not be written: bootstraptest's test_ractor.)
   "class Ractor\n" ++
-  "  class Error < StandardError; end\n" ++
+  "  class Error < RuntimeError; end\n" ++
   "  class RemoteError < Error\n" ++
   "    attr_reader :ractor\n" ++
   "    def initialize(msg = nil, ractor = nil, cause = nil)\n" ++
@@ -696,40 +696,53 @@ let core_prelude_c =
   "    end\n" ++
   "    def cause; @__cause; end\n" ++
   "  end\n" ++
-  "  class ClosedError < Error; end\n" ++
+  "  class ClosedError < StopIteration; end\n" ++
   "  class IsolationError < Error; end\n" ++
   "  class MovedError < Error; end\n" ++
   "  class UnsafeError < Error; end\n" ++
   "\n" ++
-  // A port is a queue with a closed flag. Reading an EMPTY one is what "wait
-  // for the other side" means here, and the other side is a ractor nobody has
-  // asked anything of yet -- so the read is the demand that runs it.
+  //  A port is a queue its creator reads. A read of an EMPTY port waits: the
+  //  ractors here are threads of the scheduler (m_sched), so the writer runs
+  //  while the reader waits. Values travel in a one-element Array, so that a
+  //  nil message and "the queue was closed" are two answers.
   "  class Port\n" ++
-  "    def initialize; @q = []; @closed = false; end\n" ++
-  "    def <<(v)\n" ++
-  "      raise Ractor::ClosedError, \"The port was already closed\" if @closed\n" ++
-  "      @q.push(v)\n" ++
+  "    def initialize(owner = nil)\n" ++
+  "      @__q = Thread::Queue.new\n" ++
+  "      @__owner = owner || Ractor.current\n" ++
+  "      @__closed = false\n" ++
+  "    end\n" ++
+  "    def __owner=(r); @__owner = r; end\n" ++
+  "    def <<(v); send(v); end\n" ++
+  "    def send(v, move: false)\n" ++
+  "      raise Ractor::ClosedError, \"The port was already closed\" if @__closed\n" ++
+  "      @__q.push([Ractor.__pass(v, move)])\n" ++
   "      self\n" ++
   "    end\n" ++
-  "    def send(v); self << v; end\n" ++
   "    def receive\n" ++
-  "      Ractor.__run_pending if @q.empty?\n" ++
-  "      if @q.empty?\n" ++
-  "        raise Ractor::ClosedError, \"The port was already closed\" if @closed\n" ++
-  "        raise Ractor::Error, \"No other ractor can write to this port: this interpreter runs ractors sequentially\"\n" ++
+  "      unless Ractor.current.equal?(@__owner)\n" ++
+  "        raise Ractor::Error, \"only the creator Ractor can receive from this port\"\n" ++
   "      end\n" ++
-  "      @q.shift\n" ++
+  "      raise Ractor::ClosedError, \"The port was already closed\" if @__closed && @__q.empty?\n" ++
+  "      box = @__q.pop\n" ++
+  "      raise Ractor::ClosedError, \"The port was already closed\" if box.nil?\n" ++
+  "      box[0]\n" ++
   "    end\n" ++
-  "    def close; @closed = true; self; end\n" ++
-  "    def closed?; @closed; end\n" ++
-  "    def inspect; \"#<Ractor::Port>\"; end\n" ++
-  "    def __empty?; @q.empty?; end\n" ++
+  "    def close\n" ++
+  "      raise Ractor::Error, \"closing port by other ractors is not allowed\" unless Ractor.current.equal?(@__owner)\n" ++
+  "      @__closed = true\n" ++
+  "      @__q.close\n" ++
+  "      self\n" ++
+  "    end\n" ++
+  "    def closed?; @__closed; end\n" ++
+  "    def inspect; \"#<Ractor::Port to:#\" + (@__owner.__id + 1).to_s + \" id:\" + __id__.to_s + \">\"; end\n" ++
+  "    def __ready?; !@__q.empty?; end\n" ++
+  "    def __closed_empty?; @__closed && @__q.empty?; end\n" ++
   "  end\n" ++
   "\n" ++
-  // `Ractor.allocate` is a refusal in ruby -- a Ractor is its block, and there
-  // is nothing to allocate without one -- so the public name raises and the
-  // class builds its instances through `__alloc`, a private door the
-  // interpreter opens for this class alone.
+  //  `Ractor.allocate` is a refusal in ruby -- a Ractor is its block, and there
+  //  is nothing to allocate without one -- so the public name raises and the
+  //  class builds its instances through `__alloc`, a private door the
+  //  interpreter opens for this class alone.
   "  class << self\n" ++
   "    def allocate; raise TypeError, \"allocator undefined for Ractor\"; end\n" ++
   "  end\n" ++
@@ -742,47 +755,73 @@ let core_prelude_c =
   "    @__main ||= (m = __alloc; m.__init_main; m)\n" ++
   "  end\n" ++
   "\n" ++
+  //  the ractor a thread belongs to: its own, set when its body starts
   "  def self.current\n" ++
-  "    @__cur || main\n" ++
+  "    t = __root\n" ++
+  "    (t && t.thread_variable_get(:__ractor)) || main\n" ++
   "  end\n" ++
   "\n" ++
   "  def self.main?\n" ++
   "    current.equal?(main)\n" ++
   "  end\n" ++
   "\n" ++
-  "  def self.__with_current(r)\n" ++
-  "    prev = @__cur\n" ++
-  "    @__cur = r\n" ++
-  "    begin\n" ++
-  "      yield\n" ++
-  "    ensure\n" ++
-  "      @__cur = prev\n" ++
+  "  def self.__live; @__live ||= []; end\n" ++
+  "  def self.count; 1 + __live.size; end\n" ++
+  // (ractor.rb's private door: a non-main ractor's require, run as the main
+  //  ractor's -- which is what every require here already is, do_require)
+  "  def self._require(feature); Kernel.instance_method(:require).bind_call(Object.new, feature); end\n" ++
+  "  def self.receive; current.__port.receive; end\n" ++
+  "  def self.recv; receive; end\n" ++
+  "  def self.receive_if(&b); receive; end\n" ++
+  "\n" ++
+  //  what crosses into another ractor: a shareable object as itself, anything
+  //  else as a deep copy (ractor.c's ractor_copy), or MOVED -- the sender's
+  //  object is emptied out, and every later call on it is Ractor::MovedError
+  "  def self.__pass(v, move)\n" ++
+  "    return v if shareable?(v)\n" ++
+  "    return __move(v) if move\n" ++
+  "    __deep_copy(v)\n" ++
+  "  end\n" ++
+  // (ractor.c's ractor_copy: an unshareable object is copied all the way
+  //  down -- a shareable part is passed as itself -- and a copy keeps the
+  //  original's frozen state and its instance variables; a Thread or a
+  //  Mutex has no allocator to copy with)
+  "  def self.__deep_copy(v); __copy(v, Hash.new.compare_by_identity); end\n" ++
+  "  def self.__copy(o, seen)\n" ++
+  "    return o if shareable?(o)\n" ++
+  "    return seen[o] if seen.key?(o)\n" ++
+  "    if o.is_a?(Thread) || o.is_a?(Thread::Mutex) || o.is_a?(Thread::Queue) || o.is_a?(Proc) || o.is_a?(Method)\n" ++
+  "      raise TypeError, \"allocator undefined for \" + o.class.to_s\n" ++
   "    end\n" ++
+  "    c = if o.is_a?(Array) then seen[o] = (a = []); o.each do |x| a << __copy(x, seen) end; a\n" ++
+  "        elsif o.is_a?(Hash) then h = o.dup; h.clear; seen[o] = h; o.each do |k, x| h[__copy(k, seen)] = __copy(x, seen) end; h\n" ++
+  "        elsif o.is_a?(String) then seen[o] = o.dup\n" ++
+  "        elsif o.is_a?(Struct) then t = o.dup; seen[o] = t; o.each_pair do |m, x| t[m] = __copy(x, seen) end; t\n" ++
+  "        elsif o.is_a?(Range) then seen[o] = Range.new(__copy(o.begin, seen), __copy(o.end, seen), o.exclude_end?)\n" ++
+  "        else seen[o] = o.clone(freeze: false)\n" ++
+  "        end\n" ++
+  "    o.instance_variables.each do |n| c.instance_variable_set(n, __copy(o.instance_variable_get(n), seen)) end\n" ++
+  "    c.freeze if o.frozen?\n" ++
+  "    c\n" ++
+  "  end\n" ++
+  "  def self.__moved(v); v; end\n" ++
+  "  def self.__move(v)\n" ++
+  "    c = __deep_copy(v)\n" ++
+  "    __moved(v)\n" ++
+  "    c\n" ++
   "  end\n" ++
   "\n" ++
-  // Every ractor made and not yet run waits here. Anything that would BLOCK in
-  // a parallel ruby -- reading an empty port, selecting -- runs them instead:
-  // that is the whole scheduler.
-  "  def self.__pending; @__pending ||= []; end\n" ++
-  "  def self.__run_pending\n" ++
-  "    until __pending.empty?\n" ++
-  "      r = __pending.shift\n" ++
-  "      r.__run\n" ++
-  "    end\n" ++
-  "  end\n" ++
-  "\n" ++
-  "  def self.count; 1; end\n" ++
-  "  def self.receive; current.__take; end\n" ++
-  "  def self.recv; current.__take; end\n" ++
-  "  def self.receive_if(&b); current.__take; end\n" ++
-  // shareable: an immediate, a module, or a frozen object whose elements and
-  // instance variables are shareable too (ractor.c's rb_ractor_shareable_p);
-  // make_shareable freezes all the way down, a copy first with copy: true
+  //  shareable: an immediate, a module, or a frozen object whose elements and
+  //  instance variables are shareable too (ractor.c's rb_ractor_shareable_p);
+  //  make_shareable freezes all the way down, a copy first with copy: true
   "  def self.shareable?(o); __shr_p(o, Hash.new.compare_by_identity); end\n" ++
   "  def self.__shr_p(o, seen)\n" ++
-  "    return true if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module)\n" ++
-  // These classes represent mutable parser/emitter sessions, matching Psych's
-  // native typed-data contract even when their public object is frozen.
+  "    return true if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module) || o.is_a?(Ractor) || o.is_a?(Ractor::Port)\n" ++
+  // (an Encoding is immutable, and ENV is the process's: both are shareable
+  //  in ruby, which keeps them frozen or behind a lock)
+  "    return true if o.is_a?(Encoding) || ENV.equal?(o)\n" ++
+  //    These classes represent mutable parser/emitter sessions, matching Psych's
+  //    native typed-data contract even when their public object is frozen.
   "    return false if defined?(Psych::Parser) && (o.is_a?(Psych::Parser) || o.is_a?(Psych::Emitter))\n" ++
   "    return true if seen.key?(o)\n" ++
   "    return false unless o.frozen?\n" ++
@@ -801,7 +840,7 @@ let core_prelude_c =
   "    o\n" ++
   "  end\n" ++
   "  def self.__shr_make(o, seen)\n" ++
-  "    return if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module)\n" ++
+  "    return if nil == o || true == o || false == o || o.is_a?(Integer) || o.is_a?(Float) || o.is_a?(Symbol) || o.is_a?(Module) || o.is_a?(Ractor)\n" ++
   "    raise Ractor::Error, \"cannot make Psych backend session shareable\" if defined?(Psych::Parser) && (o.is_a?(Psych::Parser) || o.is_a?(Psych::Emitter))\n" ++
   "    return if seen.key?(o)\n" ++
   "    seen[o] = true\n" ++
@@ -829,8 +868,8 @@ let core_prelude_c =
   "      c\n" ++
   "    end\n" ++
   "  end\n" ++
-  // what `# shareable_constant_value:` makes of a constant assignment (the
-  // parser's scv_wrap): a literal's non-literal part has to be shareable already
+  //  what `# shareable_constant_value:` makes of a constant assignment (the
+  //  parser's scv_wrap): a literal's non-literal part has to be shareable already
   "  def self.__scv_check(v, name)\n" ++
   "    raise Ractor::IsolationError, \"cannot assign unshareable object to \" + name unless shareable?(v)\n" ++
   "    v\n" ++
@@ -850,133 +889,183 @@ let core_prelude_c =
   "    unless name.nil? || name.is_a?(String) || name.is_a?(Symbol)\n" ++
   "      raise TypeError, \"no implicit conversion of \" + name.class.to_s + \" into String\"\n" ++
   "    end\n" ++
+  // (the block runs in the new ractor and may not reach the scope it was
+  //  written in: proc.c's proc_isolate refuses it here, at creation)
+  "    outer = __outer_vars(block)\n" ++
+  "    unless outer.empty?\n" ++
+  "      raise ArgumentError, \"can not isolate a Proc because it accesses outer variables (\" + outer.join(\", \") + \").\"\n" ++
+  "    end\n" ++
+  // (the first ractor made says the API is experimental, from where it was
+  //  made: ruby_single_main_ractor in ractor.rb)
+  "    if __live.empty? && !@__made\n" ++
+  "      @__made = true\n" ++
+  "      Kernel.warn(\"Ractor API is experimental and may change in future versions of Ruby.\", uplevel: 1, category: :experimental)\n" ++
+  "    end\n" ++
+  "    loc = caller_locations(1, 1).first\n" ++
   "    r = __alloc\n" ++
-  "    r.__init(args, name.nil? ? nil : name.to_s, block)\n" ++
+  "    r.__init(args, name.nil? ? nil : name.to_s, block, loc ? loc.path.to_s + \":\" + loc.lineno.to_s : nil)\n" ++
   "    r\n" ++
   "  end\n" ++
   "\n" ++
-  // Every ractor here runs SEQUENTIALLY, in the thread that asks for what it
-  // produced: the block is kept and run on the first #value / #join / port
-  // read, so a message sent before then is already in the mailbox when the
-  // body asks for it. There is no parallelism and no interleaving.
-  "  def __init(args, name, block)\n" ++
-  "    @args = args\n" ++
-  "    @name = name\n" ++
-  "    @block = block\n" ++
-  "    @port = Ractor::Port.new\n" ++
-  "    @locals = \{}\n" ++
-  "    @monitors = []\n" ++
-  "    @done = false\n" ++
-  "    @error = nil\n" ++
-  "    @value = nil\n" ++
-  "    @main = false\n" ++
-  "    @id = Ractor.__seq\n" ++
-  "    Ractor.__pending.push(self)\n" ++
+  //  Each ractor is a thread of the scheduler: concurrent, not parallel. Its
+  //  arguments are copied in, its body runs with the ractor as self, and its
+  //  end closes its port and tells whoever monitors it.
+  "  def __init(args, name, block, loc)\n" ++
+  "    @__name = name\n" ++
+  "    @__loc = loc\n" ++
+  "    @__port = Ractor::Port.new(self)\n" ++
+  "    @__locals = \{}\n" ++
+  "    @__monitors = []\n" ++
+  "    @__done = false\n" ++
+  "    @__error = nil\n" ++
+  "    @__value = nil\n" ++
+  "    @__main = false\n" ++
+  "    @__id = Ractor.__seq\n" ++
+  "    args = args.map do |a| Ractor.__pass(a, false) end\n" ++
+  "    me = self\n" ++
+  "    Ractor.__live.push(me)\n" ++
+  "    @__thread = Thread.new do\n" ++
+  "      Thread.current.thread_variable_set(:__ractor, me)\n" ++
+  "      Ractor.__nonmain_on\n" ++
+  "      begin\n" ++
+  "        @__value = me.instance_exec(*args, &block)\n" ++
+  "      rescue Exception => e\n" ++
+  "        @__error = e\n" ++
+  "      ensure\n" ++
+  "        Ractor.__nonmain_off\n" ++
+  "        @__done = true\n" ++
+  "        Ractor.__live.delete(me)\n" ++
+  "        @__port.__close_by_end\n" ++
+  "        @__monitors.each do |p| p << (@__error ? :aborted : :exited) rescue nil end\n" ++
+  "        @__monitors = []\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    @__thread.report_on_exception = false\n" ++
   "  end\n" ++
   "\n" ++
   "  def __init_main\n" ++
-  "    @args = []\n" ++
-  "    @name = nil\n" ++
-  "    @block = nil\n" ++
-  "    @port = Ractor::Port.new\n" ++
-  "    @locals = \{}\n" ++
-  "    @monitors = []\n" ++
-  "    @done = true\n" ++
-  "    @error = nil\n" ++
-  "    @value = nil\n" ++
-  "    @main = true\n" ++
-  "    @id = 0\n" ++
+  "    @__name = nil\n" ++
+  "    @__loc = nil\n" ++
+  "    @__port = Ractor::Port.new(self)\n" ++
+  "    @__locals = \{}\n" ++
+  "    @__monitors = []\n" ++
+  "    @__done = false\n" ++
+  "    @__error = nil\n" ++
+  "    @__value = nil\n" ++
+  "    @__main = true\n" ++
+  "    @__id = 0\n" ++
+  "    @__thread = nil\n" ++
   "  end\n" ++
+  // (a Ractor is shareable and not frozen: a non-main ractor may not reach
+  //  its instance variables by name either, as by @iv -- variable.c)
+  "  def instance_variable_get(n)\n" ++
+  "    raise Ractor::IsolationError, \"can not access instance variables of shareable objects from non-main Ractors\" unless Ractor.main? || n.to_s.start_with?(\"@__\")\n" ++
+  "    Kernel.instance_method(:instance_variable_get).bind_call(self, n)\n" ++
+  "  end\n" ++
+  "  def instance_variable_set(n, v)\n" ++
+  "    raise Ractor::IsolationError, \"can not access instance variables of shareable objects from non-main Ractors\" unless Ractor.main? || n.to_s.start_with?(\"@__\")\n" ++
+  "    Kernel.instance_method(:instance_variable_set).bind_call(self, n, v)\n" ++
+  "  end\n" ++
+  "  def __id; @__id; end\n" ++
+  "  def __port; @__port; end\n" ++
   "\n" ++
-  "  def name; @name; end\n" ++
-  "  def default_port; @port; end\n" ++
+  "  def name; @__name; end\n" ++
+  "  def default_port; @__port; end\n" ++
   "  def inspect\n" ++
-  "    \"#<Ractor:#\" + (@id + 1).to_s + (@name.nil? ? \"\" : \" \" + @name) +\n" ++
-  "      ((@done && !@main) ? \" terminated\" : \" running\") + \">\"\n" ++
+  "    \"#<Ractor:#\" + (@__id + 1).to_s + (@__name.nil? ? \"\" : \" \" + @__name) + (@__loc.nil? ? \"\" : \" \" + @__loc) +\n" ++
+  "      ((@__done && !@__main) ? \" terminated\" : \" running\") + \">\"\n" ++
   "  end\n" ++
   "  def to_s; inspect; end\n" ++
-  // a ractor cannot be copied: it IS its block, and both routes reach the
-  // refused allocator.
+  //  a ractor cannot be copied: it IS its block, and both routes reach the
+  //  refused allocator.
   "  def dup; raise TypeError, \"allocator undefined for Ractor\"; end\n" ++
   "  def clone(freeze: nil); raise TypeError, \"allocator undefined for Ractor\"; end\n" ++
   "\n" ++
-  // ractor-local storage.
-  "  def [](k); @locals[k]; end\n" ++
-  "  def []=(k, v); @locals[k] = v; end\n" ++
-  "  def key?(k); @locals.key?(k); end\n" ++
+  //  ractor-local storage.
+  "  def [](k)\n" ++
+  "    raise RuntimeError, \"Cannot get ractor local storage for non-current ractor\" unless equal?(Ractor.current)\n" ++
+  "    @__locals[k.to_sym]\n" ++
+  "  end\n" ++
+  "  def []=(k, v)\n" ++
+  "    raise RuntimeError, \"Cannot set ractor local storage for non-current ractor\" unless equal?(Ractor.current)\n" ++
+  "    @__locals[k.to_sym] = v\n" ++
+  "  end\n" ++
+  "  def key?(k); @__locals.key?(k.to_sym); end\n" ++
   "\n" ++
   "  def send(v, move: false)\n" ++
-  "    @port << v\n" ++
+  "    @__port.send(v, move: move)\n" ++
   "    self\n" ++
   "  end\n" ++
   "  def <<(v); send(v); end\n" ++
   "\n" ++
-  "  def close; @port.close; self; end\n" ++
+  //  the body calls these with the ractor as self
+  "  private def receive; Ractor.receive; end\n" ++
+  "  private def recv; Ractor.receive; end\n" ++
   "\n" ++
-  // a monitoring port is told `:exited` when the body finishes -- at once if it
-  // already has.
+  "  def close; @__port.close; self; end\n" ++
+  "\n" ++
+  //  a monitoring port is told `:exited` when the body finishes -- at once if it
+  //  already has.
+  // (an ended ractor is told about at once, and the answer is false:
+  //  nothing is being monitored; one that raised ended :aborted)
   "  def monitor(port)\n" ++
-  "    if @done\n" ++
-  "      port << :exited\n" ++
+  "    if @__done\n" ++
+  "      port << (@__error ? :aborted : :exited)\n" ++
+  "      false\n" ++
   "    else\n" ++
-  "      @monitors.push(port)\n" ++
+  "      @__monitors.push(port)\n" ++
+  "      true\n" ++
   "    end\n" ++
-  "    self\n" ++
   "  end\n" ++
   "  def unmonitor(port)\n" ++
-  "    @monitors.delete(port)\n" ++
+  "    @__monitors.delete(port)\n" ++
   "    self\n" ++
   "  end\n" ++
   "\n" ++
-  "  def __take\n" ++
-  "    @port.receive\n" ++
-  "  end\n" ++
+  "  def __done?; @__done; end\n" ++
   "\n" ++
-  "  def __run\n" ++
-  "    return if @done || @block.nil?\n" ++
-  "    Ractor.__pending.delete(self)\n" ++
-  "    @done = true\n" ++
-  "    begin\n" ++
-  "      @value = Ractor.__with_current(self) \{ @block.call(*@args) }\n" ++
-  "    rescue Exception => e\n" ++
-  "      @error = e\n" ++
-  "    end\n" ++
-  // a terminated ractor takes no more messages, which is how a program sees
-  // that it finished.
-  "    @port.close\n" ++
-  "    @monitors.each \{ |p| p << :exited }\n" ++
-  "    @monitors = []\n" ++
-  "  end\n" ++
-  "\n" ++
+  // (one ractor takes the value -- the first to ask, its successor -- and
+  //  may take it again; any other is refused: ractor_sync.c)
   "  def value\n" ++
-  "    __run\n" ++
-  "    if @error\n" ++
-  "      raise Ractor::RemoteError.new(nil, self, @error)\n" ++
-  "    end\n" ++
-  "    @value\n" ++
+  "    raise Ractor::Error, \"can not take a value of main Ractor\" if @__main\n" ++
+  "    me = Ractor.current\n" ++
+  "    @__successor ||= me\n" ++
+  "    raise Ractor::Error, \"Only the successor ractor can take a value\" unless @__successor.equal?(me)\n" ++
+  "    @__thread.join\n" ++
+  "    raise Ractor::RemoteError.new(nil, self, @__error) if @__error\n" ++
+  "    @__value\n" ++
   "  end\n" ++
   "\n" ++
+  // (join waits; it takes no value, so it does not make a successor)
   "  def join\n" ++
-  "    value\n" ++
+  "    raise Ractor::Error, \"can not wait for the main Ractor\" if @__main\n" ++
+  "    @__thread.join\n" ++
+  "    raise Ractor::RemoteError.new(nil, self, @__error) if @__error\n" ++
   "    self\n" ++
   "  end\n" ++
   "\n" ++
-  // select answers the FIRST argument that has something: a port with a value
-  // in it, or a ractor that has finished. Pending bodies run first, since in a
-  // parallel ruby they would have been running all along.
-  "  def self.select(*ractors)\n" ++
-  "    raise ArgumentError, \"specify at least one ractor or `yield_value`\" if ractors.empty?\n" ++
-  "    ractors.each do |r|\n" ++
-  "      return [r, r.receive] if r.is_a?(Ractor::Port) && !r.__empty?\n" ++
+  //  select answers the first argument that has something: a port with a value
+  //  in it, or a ractor that has finished. Until one has, the others run.
+  "  def self.select(*ports)\n" ++
+  "    raise ArgumentError, \"specify at least one Ractor::Port or Ractor\" if ports.empty?\n" ++
+  "    loop do\n" ++
+  "      ports.each do |p|\n" ++
+  "        if p.is_a?(Ractor::Port)\n" ++
+  "          return [p, p.receive] if p.__ready? || p.__closed_empty?\n" ++
+  "        elsif p.is_a?(Ractor)\n" ++
+  "          return [p, p.value] if p.__done?\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "      Thread.pass\n" ++
   "    end\n" ++
-  "    __run_pending\n" ++
-  "    ractors.each do |r|\n" ++
-  "      return [r, r.receive] if r.is_a?(Ractor::Port) && !r.__empty?\n" ++
-  "    end\n" ++
-  "    ractors.each do |r|\n" ++
-  "      return [r, r.value] if r.is_a?(Ractor)\n" ++
-  "    end\n" ++
-  "    nil\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class Ractor::Port\n" ++
+  "  def __close_by_end\n" ++
+  "    @__closed = true\n" ++
+  "    @__q.close\n" ++
+  "    self\n" ++
   "  end\n" ++
   "end\n";
 
@@ -2503,6 +2592,14 @@ let core_prelude_d =
   "  # deprecated in ruby 4.0 (and says so where deprecations are shown). The\n" ++
   "  # immediates are computed from the id; anything else is looked for among\n" ++
   "  # the live objects each_object walks.\n" ++
+  // (a non-main ractor is not handed an object it may not share: gc.c's
+  //  id2ref refuses it there)
+  "  def self.__id2ref_here(id, o)\n" ++
+  "    if !Ractor.main? && !Ractor.shareable?(o)\n" ++
+  "      raise RangeError, \"#\{id} is id of the unshareable object on multi-ractor\"\n" ++
+  "    end\n" ++
+  "    o\n" ++
+  "  end\n" ++
   "  def self._id2ref(id)\n" ++
   "    warn(\"ObjectSpace._id2ref is deprecated\", uplevel: 1, category: :deprecated)\n" ++
   "    unless id.is_a?(Integer)\n" ++
@@ -2520,9 +2617,9 @@ let core_prelude_d =
   // (a String's id is told from its own range, before every live object is
   //  listed: ten thousand round trips took 18 s the other way round)
   "    s = ObjectSpace.__str_of_id(id)\n" ++
-  "    return s if s\n" ++
+  "    return __id2ref_here(id, s) if s\n" ++
   "    objs, classes = ObjectSpace.__objects(nil)\n" ++
-  "    (objs + classes).each \{ |o| return o if o.object_id == id }\n" ++
+  "    (objs + classes).each \{ |o| return __id2ref_here(id, o) if o.object_id == id }\n" ++
   // (ruby 4.0.9 names the id as a number; 4.0.6 quoted it)
   "    raise RangeError, \"#\{id} is not an id value\"\n" ++
   "  end\n" ++
@@ -2575,6 +2672,9 @@ let core_prelude_d =
   "      raise TypeError, \"class or module required\"\n" ++
   "    end\n" ++
   "    objs, classes = ObjectSpace.__objects(mod)\n" ++
+  // (a non-main ractor sees only the shareable objects: gc.c's
+  //  os_obj_of skips the rest there)
+  "    objs = objs.select do |o| Ractor.shareable?(o) end unless Ractor.main?\n" ++
   "    n = 0\n" ++
   "    objs.each do |o|\n" ++
   "      n += 1\n" ++
@@ -2611,15 +2711,22 @@ let core_prelude_d =
   "  end\n" ++
   "  def self.count_objects(h = nil)\n" ++
   "    raise TypeError, \"non-hash given\" unless h.nil? || h.is_a?(Hash)\n" ++
+  "    na, nh = ObjectSpace.__store_counts\n" ++
   "    h ||= \{}\n" ++
   "    h.each_key \{ |k| h[k] = 0 }\n" ++
   "    objs, classes = ObjectSpace.__objects(nil)\n" ++
   "    t = Hash.new(0)\n" ++
   "    objs.each \{ |o| t[__type_of(o)] += 1 }\n" ++
   "    classes.each \{ |c| t[__type_of(c)] += 1 }\n" ++
-  "    h[:TOTAL] = objs.size + classes.size\n" ++
+  "    # (Arrays and Hashes are values in stores of their own: counted there,\n" ++
+  "    #  first thing, and without the ones count_objects itself makes --\n" ++
+  "    #  __store_done marks them)\n" ++
+  "    t[:T_ARRAY] += na if na > 0\n" ++
+  "    t[:T_HASH] += nh if nh > 0\n" ++
+  "    h[:TOTAL] = objs.size + classes.size + na + nh\n" ++
   "    h[:FREE] = 0\n" ++
   "    t.each \{ |k, v| h[k] = v }\n" ++
+  "    ObjectSpace.__store_done\n" ++
   "    h\n" ++
   "  end\n" ++
   "  # a full collection here is GC.start's, and answers nil as ruby's does\n" ++
@@ -3411,7 +3518,12 @@ let core_prelude_d =
   "      tg = pts.select \{ |t| t.__targeted? }\n" ++
   "      pts = (pts - tg) + tg.reverse\n" ++
   "    end\n" ++
+  // (a hook is its ractor's, targeted or not: one made in the main ractor
+  //  sees nothing a ractor's thread does, and the other way round --
+  //  vm_trace.c keeps the hooks per ractor)
+  "    cur = Ractor.current\n" ++
   "    pts.each do |tp|\n" ++
+  "      next unless tp.__ractor_of.equal?(cur)\n" ++
   "      tp.__call_ev(ev, mid, cls, path, rv, slf, line, callee)\n" ++
   "    end\n" ++
   "    nil\n" ++
@@ -3444,7 +3556,9 @@ let core_prelude_d =
   "    tp\n" ++
   "  end\n" ++
   "  EVENT_NAMES = [:line, :class, :end, :call, :return, :c_call, :c_return, :raise, :b_call, :b_return, :a_call, :a_return, :thread_begin, :thread_end, :fiber_switch, :script_compiled, :rescue]\n" ++
+  "  def __ractor_of; @__ractor ||= Ractor.main; end\n" ++
   "  def initialize(*events, &blk)\n" ++
+  "    @__ractor = Ractor.current\n" ++
   "    # an event is named by a Symbol, or by anything that converts to one\n" ++
   "    events = events.map do |e|\n" ++
   "      s = if e.is_a?(Symbol) then e\n" ++
@@ -12883,20 +12997,20 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   // that ruby's, so RUBY_VERSION has to be the one whose rubygems, bundler and
   // bundled_gems.rb branch on it. 3.2.2 until 2026-09-05, 4.0.6 until
   // 2026-10-25, then 4.0.9.
-  let _ = map_set consts "RUBY_VERSION" (mkstr "4.0.9") in
-  let _ = map_set consts "RUBY_ENGINE" (mkstr "ruby") in
-  let _ = map_set consts "RUBY_ENGINE_VERSION" (mkstr "4.0.9") in
+  let _ = map_set consts "RUBY_VERSION" (fstr_const (mkstr "4.0.9")) in
+  let _ = map_set consts "RUBY_ENGINE" (fstr_const (mkstr "ruby")) in
+  let _ = map_set consts "RUBY_ENGINE_VERSION" (fstr_const (mkstr "4.0.9")) in
   let _ = map_set consts "RUBY_PATCHLEVEL" (VInt 0) in
-  let _ = map_set consts "RUBY_RELEASE_DATE" (mkstr "2026-10-23") in
+  let _ = map_set consts "RUBY_RELEASE_DATE" (fstr_const (mkstr "2026-10-23")) in
   // The reference ruby's own revision. Like the RbConfig paths this is a
   // borrowed fact rather than a description of this interpreter -- there is no
   // git revision of mere-ruby to report here -- and it is what a program that
   // prints its ruby's identity expects to find. bundler's version command reads
   // it, so its absence was a NameError in the middle of `bundle --version`.
-  let _ = map_set consts "RUBY_REVISION" (mkstr "3e93b23afcec3433f6aecc34b5d832799d754238") in
-  let _ = map_set consts "RUBY_PLATFORM" (mkstr ruby_platform) in
-  let _ = map_set consts "RUBY_DESCRIPTION" (mkstr ruby_desc) in
-  let _ = map_set consts "RUBY_COPYRIGHT" (mkstr "ruby - Copyright (C) 1993-2026 Yukihiro Matsumoto") in
+  let _ = map_set consts "RUBY_REVISION" (fstr_const (mkstr "3e93b23afcec3433f6aecc34b5d832799d754238")) in
+  let _ = map_set consts "RUBY_PLATFORM" (fstr_const (mkstr ruby_platform)) in
+  let _ = map_set consts "RUBY_DESCRIPTION" (fstr_const (mkstr ruby_desc)) in
+  let _ = map_set consts "RUBY_COPYRIGHT" (fstr_const (mkstr "ruby - Copyright (C) 1993-2026 Yukihiro Matsumoto")) in
   let _ = map_set consts "STDOUT" (VObj outid) in
   let _ = map_set globals "stdout" (VObj outid) in
   let errid = alloc_oid ocls in

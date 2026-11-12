@@ -3812,3 +3812,62 @@ tail turned up on the way.
   string, comparable, enumerator, rubyoptions, regexp, exception, object,
   file, range, struct, require, autoload, super, delegate, openssl's
   pkey_rsa and digest) at or above round 20's CI counts.
+
+## 2026-11-12 (38): stage 9, round 22 -- Ractor on the scheduler's threads, its isolation, live Array/Hash counts
+
+Round 22 of note 545 (the plan after round 21). Stage 9 was surveyed first:
+most of its RED is CRuby's heap shape -- GC.stat_heap, GC::INTERNAL_CONSTANTS,
+GC::OPTS, generations, a moving compactor -- which this collector does not
+have; GC.start's own comment says why those are not invented, and they stay
+out (the ledger's "CRuby heap shape"). What has a real answer here was done.
+
+- **Ractor runs on the scheduler's threads.** Each body is a Thread, a port
+  a Thread::Queue its creator reads (a value travels boxed, so nil and
+  "closed" are two answers), #value / #join wait on the thread, select looks
+  at its ports and ractors and passes. It used to run each body sequentially
+  when its value was asked for, so two ractors that talk could not be
+  written. bootstraptest's test_ractor: 62 failing of 154 -> 22.
+- **What crosses is copied, frozen state and instance variables kept** (an
+  Array's and a Hash's too); a shareable object is passed as itself, a Thread
+  or a Mutex refused by its allocator. Only the first ractor to ask takes a
+  value (its successor); #join takes none. #monitor answers false for an
+  ended ractor and tells it at once (:aborted when it raised). Ractor-local
+  storage refuses another ractor. The first Ractor.new warns that the API is
+  experimental; #inspect names where the ractor was made.
+- **A non-main ractor's isolation** (variable.c, proc.c): a global
+  (rb_gvar_ractor_local's list aside), a class variable, a class's or
+  module's unshareable instance variable, a Ractor's own instance variables
+  (by @iv or by name), a non-shareable constant read or written; the block
+  may not reach an outer local (a walk of its body, block-locals and nested
+  parameters aside). RUBY_VERSION and the other RUBY_* are frozen, an
+  Encoding and ENV shareable. The interpreter's own code is exempt, as ruby's
+  C is: the prelude, the __*.rb files that stand for a C extension, the
+  .bundle stand-ins, and the constants a shipped library defines (cgi/escape's
+  tables are C data in ruby). A require or an autoload set off in a non-main
+  ractor runs as the main ractor's, as ruby 4.0 hands them to main (rubygems'
+  Ruby require read Gem's tables otherwise); Ractor._require exists.
+- **A thread belongs to the ractor that made it**: Ractor.current is its
+  ractor's, and an `exit` in it ends that ractor (its body's SystemExit), not
+  the program. each_object there sees only the shareable objects and
+  _id2ref refuses an unshareable one. A TracePoint is its ractor's.
+- **count_objects counts the live Arrays and Hashes** (T_ARRAY / T_HASH from
+  their stores, without the ones count_objects itself makes), so
+  test_allocation now compares real allocations; mere-ruby's call path makes
+  two Arrays where CRuby makes none for `anon_splat()`, which is the VM's
+  work (stage 10), not this one's.
+- **undef_method in a subclass** hides the inherited method from
+  public_instance_methods(true) and method_defined? (test/unit's test list
+  ran an undefined test).
+- **Left, measured**: moving (`send(obj, move: true)` -- the sender's Array /
+  String / Hash would have to answer MovedError, and those are values here);
+  $stdin / $stdout per ractor; Binding / eval / shareable_proc isolation;
+  define_method's and trap's unshareable-Proc refusals. ⚠ Two found on the
+  way and left for their own rounds: (1) a block that assigns a name the
+  enclosing scope assigns only LATER shares it, where ruby makes it the
+  block's own (`pr = proc { x = 1 }; x = 5; pr.call; x` is 1 here, 5 in
+  ruby) -- the top level and methods predeclare every local; test_settracefunc's
+  ractor_local_method counts 110 for it. (2) Threads with finalizer-holding
+  objects collect far too often (each collection scans every coroutine's
+  stack): 4 threads x 2000 clones of such an object take 2.3 s against 0.05 s
+  without the finalizer; objspace/test_ractor's copy_finalizer, which passed
+  while ractors ran one after another, now times out.
