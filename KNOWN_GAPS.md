@@ -4489,6 +4489,39 @@ CRuby extension ABI or compiler/linker flags.
 **What fixing the remaining build integration takes.** An installation
 layout and build metadata of mere-ruby's own.
 
+**What the native stage needs from it (inventory, 2026-11-13).** Facts for
+whoever takes extensions on (stage 7′ / 8); nothing here is answered yet,
+and which of them mere-ruby can answer truthfully is that stage's call.
+
+- `require "mkmf"` and `create_makefile` read **5 `RbConfig::CONFIG` keys**
+  mere-ruby does not have -- rubyhdrdir rubyarchhdrdir CC_WRAPPER topdir
+  POSTLINK -- and **79 `MAKEFILE_CONFIG` keys**: the compiler and its flags
+  (CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS DLDFLAGS ARCH_FLAG optflags
+  debugflags warnflags cflags cxxflags cppflags CCDLFLAGS DEFS EXTDLDFLAGS
+  ADDITIONAL_DLDFLAGS GCC), the link (LDSHARED LDSHAREDXX LINK_SO TRY_LINK
+  TRY_LINK_CXX LIBRUBY LIBRUBY_A LIBRUBYARG LIBRUBYARG_SHARED
+  LIBRUBYARG_STATIC RUBY_SO_NAME LIBS DLDLIBS LIBPATHFLAG RPATHFLAG LIBARG
+  libdirname AR LD), the rules (COMPILE_C COMPILE_CXX COMPILE_RULES
+  RULE_SUBST ASSEMBLE_C ASSEMBLE_CXX OUTFLAG COUTFLAG CSRCFLAG CPPOUTFILE
+  COMMON_MACROS COMMON_HEADERS COMMON_LIBS MAIN_DOES_NOTHING UNIVERSAL_INTS
+  EXPORT_PREFIX CXX_EXT LIBEXT OBJEXT ASMEXT hdrdir), the install and clean
+  commands (INSTALL INSTALL_PROG INSTALL_DATA CP RM RMALL RMDIRS MAKEDIRS
+  NULLCMD CLEANFILES DISTCLEANFILES DISTCLEANDIRS cleanlibs
+  RUBY_INSTALL_NAME), and build_os ENABLE_SHARED PATH_SEPARATOR
+  BUILD_FILE_SEPARATOR MKMF_VERBOSE CC_WRAPPER. With those filled from a
+  reference installation (a survey only), mkmf loads and writes a Makefile.
+  Without them it stops at `mkmf.rb:6689` (`nil + ...`).
+- What waits on it in CRuby's tests (CI, main `35f8f34c`): mkmf/* 17 files,
+  148 RED; rubygems about 60 RED -- test_gem_commands_exec_command (28: its
+  one native test fails the build, and MockGemUi's TermError is a SystemExit
+  that ends the runner), test_gem_installer 7, test_gem_ext_builder 5,
+  test_gem_ext_cargo_builder_unit 5, test_gem_ext_ext_conf_builder 5,
+  test_gem_ext_cargo_builder 4, test_gem_dependency_installer 2, and one each
+  in install, pristine, update, uninstaller, resolver_git_specification and
+  test_require (dash_i_respects_default_library_extension_priority). The
+  -ext-/* files (94, 811 RED) need CRuby's own test extensions built against
+  a C API, which is that stage's other half.
+
 ## A Proc's instance variables are not carried by #dup / #clone
 
 A Proc can hold instance variables now (they were refused as if it were
