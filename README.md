@@ -39,11 +39,12 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ru
 #                    MEASURED 2026-09-19: the emitted C needs 270, so the flag is
 #                    LOAD-BEARING -- a build without it does not compile. It was
 #                    240 on 2026-09-10 and that note said the default of 256
-#                    would do by sixteen; the sixteen are gone. What grew is the
-#                    count of TOP-LEVEL `let`s (each is a nesting level in the
-#                    emitted C): m_state.mere went 316 to 361. tools/
-#                    bracket_depth_check.sh bisects clang's own answer and
-#                    prints both distances on every CI run.
+#                    would do by sixteen; the sixteen are gone. What grows is the
+#                    count of top-level VALUES a function reads, plus each run of
+#                    `let _`s between two of them -- not every top-level `let`
+#                    (functions cost nothing; measured 2026-11-13, see the head
+#                    of tools/bracket_depth_check.sh, which bisects clang's own
+#                    answer and prints both distances on every CI run).
 #   -lm              libm is separate there and part of libSystem here
 #
 # The CORPUS is a macOS gate on purpose. run_corpus.sh diffs this interpreter

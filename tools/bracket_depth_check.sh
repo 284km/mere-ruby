@@ -16,17 +16,44 @@
 #     the next commit          256      exactly at it
 #     today                    269      over by thirteen
 #
-# The flag is LOAD-BEARING now, not headroom: a build without it does not compile. What
-# grew is the count of TOP-LEVEL `let`s -- each one is a nesting level in the emitted C,
-# and m_state.mere alone went 316 -> 361 while the hash index, the array queue and the
-# memo tables were added. Merging a few of those maps buys a few levels and not thirteen,
-# so the budget moves instead, deliberately, to the number the build line actually passes.
-# What this check is FOR is unchanged: catching the growth before it reaches the flag.
+# The flag is LOAD-BEARING now, not headroom: a build without it does not compile, so
+# the budget moved, deliberately, to the number the build line actually passes. What
+# this check is FOR is unchanged: catching the growth before it reaches the flag.
 #
-# The number moves for two reasons and this reports both: mere's codegen changing how
-# deeply it nests (v0.1.449 and v0.1.450 both cut it), and this interpreter's own source
-# growing another long `++` chain. Either way, what matters is the distance to 256, so
-# that is what is printed.
+# ⚠ WHAT THE LEVELS ARE -- not "every top-level `let`", which this note used to say.
+# Measured 2026-11-13, when the need was 1012. The emitted C's main initializes every
+# top-level VALUE in one statement expression, and a value some function reads (a C
+# global) is assigned in a `({ mu_x = ...; ({ <the rest of the program> }) })` of its
+# own: one level that everything after it sits inside. Between two globals, a run of
+# anything else -- `let _ = ...`, a value only main reads -- is flattened into one more
+# `({ ... })`. Functions are lifted out and cost nothing. The deepest point is the end
+# of that chain plus what the last values nest inside themselves. In mr.c's main:
+#
+#     992 links:  825 globals + 160 `let _` runs + 6 other runs + the final `exit`
+#     + 17        inside the last value, cli_feature_names (a list literal)
+#     = 1009 parentheses deep, which clang reports as 1012
+#
+# and in small programs, one kind of `let` at a time (n of them):
+#
+#     a value a function reads                 n = 50 / 100 / 200:  56 / 106 / 206
+#     the same, each followed by a `let _`                         106 / 206 / 406
+#     values only main reads; functions; a 201-member `let rec`     15, flat
+#     a 200-link `++` chain; a 20-tuple                            flat; one, as any global
+#     a list literal [a, b, ...]       TWO PER ELEMENT, on top of where in the chain it sits
+#
+# Clang counts each kind of bracket separately: a link is one `(` and one `{`, and it
+# is the parentheses that reach the cap first.
+#
+# So the cheap levels were the `let _` runs. `let x = vec_new (); let _ = vec_push x 0;`
+# is two levels where `let x = (let v = vec_new () in let _ = vec_push v 0 in v)` is
+# one -- the same effects, in the same order, on the same container. 142 runs written
+# that way took the need from 1012 to 870 (see oid_next_v in m_state.mere). What is
+# left grows by one per new global a function reads, by one per `let _` written between
+# two of them, and by two per element of a list literal written late in the program.
+#
+# The number also moves when mere's codegen changes how deeply it nests (v0.1.449 and
+# v0.1.450 both cut it). Either way, what matters is the distance to the flag, and to
+# 256, so both are printed.
 #
 # Usage:  MERE=/path/to/mere.exe sh tools/bracket_depth_check.sh
 #         BUDGET=... to change the ceiling this fails at (default 1024, the build's flag)
@@ -72,7 +99,7 @@ fi
 # property that matters: the fast path can only ever CONFIRM, never conclude.
 # A seed that made the check unable to report a larger value would be a check
 # that can only agree with what it was told.
-SEED="${BRACKET_SEED:-273}"
+SEED="${BRACKET_SEED:-870}"
 sb_bd_fast=0
 if [ "$SEED" -gt 1 ] && [ "$SEED" -le "$BUDGET" ] \
    && "$CC" -O0 -w -fsyntax-only -fbracket-depth="$SEED" "$SRC" 2>/dev/null \
