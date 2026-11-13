@@ -301,7 +301,7 @@ is left under clang's nesting cap.
 
 ---
 
-## 6. Five things that will save you a day
+## 6. Six things that will save you a day
 
 1. **Pin the reference.** `. ./tools/ref_ruby.sh` and use `$REF_RUBY_BIN`.
    A hand-run against `ruby` on `PATH` asks a different question from the sweep.
@@ -312,6 +312,14 @@ is left under clang's nesting cap.
    embed. Then `mere -c main.mere > /dev/null` before a full build.
 5. **One sweep at a time**, and if `record_hygiene.sh` complains, stop and fix
    the record before reading any number next to it.
+6. **Work on one CRuby test file with `unittest/try.sh`**, not a hand-made
+   command line: `./unittest/try.sh <ruby-src> rubygems/test_require.rb -n
+   /realworld/` (add `--ref` for the reference). It is run.sh's environment
+   for that side -- rubygems/* read the source tree's `lib/` first, mere-ruby
+   gets the reference's library on RUBYLIB, the binary is named `mere-ruby`
+   and reached by an absolute path, the seed is 1 -- and a command line
+   without them answers a different question (a rubygems test fails that
+   passes in CI). It records nothing; run.sh is the measurement.
 
 ---
 

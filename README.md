@@ -137,6 +137,7 @@ Every change is checked against the reference `ruby` before it lands:
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
 ./mspec/record_hygiene.sh                        # the records name no machine and no operator
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
+./unittest/try.sh <ruby-src> <test file> [-n ...]  # one CRuby test file, one side, as run.sh runs it
 ./parsetest/run.sh <dir> [dir ...]               # can it READ the ruby that exists?
 ./gemtest/run.sh <gem-home> <rubygems-checkout> [stdlib]   # legacy gem-load report
 # gemtest/measure.py pins the reference and records all three modes (gemtest/README.md)
