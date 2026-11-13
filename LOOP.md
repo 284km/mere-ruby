@@ -4527,3 +4527,47 @@ over in is note 548 §8; in short:
   parser's expression, not invoke_val_c alone; the bracket depth at 1012 /
   1024 (VM functions are `and` members of the eval_e chain). The
   compiler's known gaps and refusals are listed in note 548 §8.
+
+## 2026-11-13 (52): the rubygems round -- the non-native rubygems failures
+
+The first round after the VM went to the Fable session (note 550): the
+rubygems failures that are not native extensions. corpus 655.
+
+- **Sorting the 67 RED of CI** (round 33): the native ones -- extconf /
+  mkmf (`mkmf.rb:6689`, an RbConfig key it adds to), make, cargo -- are
+  stage 7′ / 8's (the Fable session's). test_gem_commands_exec_command's
+  28 are among them: its one native test builds an extension, fails, and
+  MockGemUi's TermError is a SystemExit, which ends the runner (CRuby too,
+  were that build to fail). Locally, rubygems tests need ruby's lib/ first
+  on RUBYLIB as unittest/run.sh gives it, and a binary named mere-ruby (a
+  bin wrapper's shebang must say "ruby").
+- **`recv.meth arg, &blk` passed the block as an argument**: a `break` in it
+  no longer ended the method it was given to (`recv.meth(arg, &blk)` and
+  `meth arg, &blk` were right). rubygems' Util.traverse_parents (`Dir.chdir
+  here, &block`) walked on past the Gemfile it had found:
+  BundlerVersionFinder never read the lockfile (test_gem's
+  activate_bin_path_selects_exact_bundler_version_if_present).
+- **File.open with an integer mode or a permission** first creates the file
+  (for O_CREAT and the perm); in a read-only directory that step failed
+  with no Ruby exception, and the open came out as "(ruby exception
+  raised)" instead of Errno::EACCES. FileUtils.cp opens that way:
+  RemoteFetcher#download's fallback for a read-only cache
+  (test_download_local_read_only). `MERE_RUBY_LOST_EXC=1` named the place.
+- **Default gems**: rubygems loaded from source (`-I lib`) built
+  Gem.default_dir from RbConfig's fictional /usr/lib/ruby, and found no
+  default spec. rubylibprefix is now taken from the standard library
+  RUBYLIB hands mere-ruby (`<x>/lib/ruby/4.0.0` with its default specs
+  beside it) when GEM_HOME is no gem tree; rubylibdir and the shipped
+  libraries' directory stay as they were. And that library goes where
+  ruby keeps its own, after site and vendor in $LOAD_PATH, not in front:
+  in front of rubygems' insertion point it was "-I beats a default gem",
+  and `require "json"` never activated the default json spec
+  (test_realworld_default_gem).
+- Left, with their reasons: test_activate_via_require_respects_loaded_files
+  (File.realdirpath of the fictional rubylibdir follows macOS's own
+  /usr/lib/ruby symlink into the system Ruby framework);
+  test_realworld_upgraded_default_gem (a newer json in GEM_HOME is
+  activated -- 999.99.9 -- but `require "json"` loads the shipped json, as
+  it is meant to: a real json gem's json.rb goes on to its C extension).
+- Locally: test_gem 1 -> 0, test_gem_remote_fetcher 1 -> 0, test_require
+  3 -> 2 non-native.
