@@ -37,6 +37,13 @@ CASES = {
   # indexes a dead one was dropped and never freed (4 KB a turn) -- the
   # mask of Thread.handle_interrupt(Exception => :immediate)
   "a hash with a Class key" => ->(d) { (100_000 / d).times { { Exception => :immediate }.size } },
+  # ivar_names_of's index filed a class's ivars too, under its name, and the
+  # collector's sweep knows object owners only: every discarded Class.new
+  # kept its entry, a long name all of it (PR #81's review: 66 -> 209 MB)
+  "a discarded class's ivar" => ->(d) {
+    ivn = "@" + "x" * 65536
+    (1_200 / d).times { |i| k = Class.new; k.instance_variable_set(ivn, i); GC.start if i % 10 == 9 }
+  },
 }
 
 name, body = CASES.to_a.fetch(Integer(ARGV.fetch(0)))

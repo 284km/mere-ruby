@@ -353,6 +353,10 @@ unless defined?(::Ripper)
           tok = tok[/\A__END__\n?/] if event == :on___end__
           # (an unterminated heredoc has no end token: `EOS ` is not it)
           next if event == :on_heredoc_end && tok.empty?
+          # (a heredoc's end line leaves the state where its body left it:
+          #  parse.y scans the body and the end as one string, and Prism
+          #  gives the end the state after the whole literal)
+          st = state if event == :on_heredoc_end
           elems << Elem.new(pos, event, tok, st)
           cursor = start + tok.bytesize if start && start + tok.bytesize > cursor
           prev_state = state
@@ -519,6 +523,445 @@ unless defined?(::Ripper)
 
       def on_default(event, token, data)
         data
+      end
+    end
+  end
+
+  # (reopened nested, so that the node classes the method below names
+  #  resolve as they do in the translation's own file)
+  module Prism
+    module Translation
+      class Ripper
+        # The translation's #parse (prism 1.9), with parse.y's way of reporting:
+        #
+        # - a magic comment's name has its "-" as "_" (parser_magic_comment);
+        # - a warning goes to #warn when parse.y's is rb_warn and to #warning when
+        #   it is rb_warning, with parse.y's format and arguments -- the
+        #   translation sent Prism's :default level to #warning and the rest to
+        #   #warn, the other way round, and the message as the format;
+        # - an ambiguous binary operator is the operator_ambiguous parser event;
+        # - an error the lexer finds is #compile_error with parse.y's words
+        #   (Prism's add "unterminated heredoc; " or "; expected a closing
+        #   delimiter" around them), the rest on_parse_error as before.
+        # (under the name #parse above calls, which keeps the parser's
+        #  position readers and yydebug around it)
+        def __translation_parse
+          result.comments.each do |comment|
+            location = comment.location
+            bounds(location)
+
+            if comment.is_a?(InlineComment)
+              on_comment(comment.slice)
+            else
+              offset = location.start_offset
+              lines = comment.slice.lines
+
+              lines.each_with_index do |line, index|
+                bounds(location.copy(start_offset: offset))
+
+                if index == 0
+                  on_embdoc_beg(line)
+                elsif index == lines.size - 1
+                  on_embdoc_end(line)
+                else
+                  on_embdoc(line)
+                end
+
+                offset += line.bytesize
+              end
+            end
+          end
+
+          result.magic_comments.each do |magic_comment|
+            on_magic_comment(magic_comment.key.tr("-", "_"), magic_comment.value)
+          end
+
+          unless result.data_loc.nil?
+            on___end__(result.data_loc.slice.each_line.first)
+          end
+
+          result.warnings.each do |warning|
+            bounds(warning.location)
+            __parse_y_warning(warning)
+          end
+
+          # (parse.y builds the tree on through the errors below -- a write
+          #  it refuses is wrapped in assign_error, an alias of $1 is
+          #  alias_error -- so the parse answers it; any other error, and
+          #  the parse answers nil as the translation did)
+          @__verrs = nil
+          if error?
+            walk = result.errors.all? { |error| PARSE_Y_WALKS.include?(error.type) }
+            @__verrs = {} if walk
+            heredoc_id = false
+            result.errors.each do |error|
+              location = error.location
+              bounds(location)
+
+              # (`<<"` with nothing after: Prism ignores the `<<` and finds a
+              #  string that does not end; parse.y says the one thing)
+              if error.type == :unexpected_token_ignore && location.slice == "<<"
+                heredoc_id = true
+                on_parse_error("unterminated here document identifier")
+              elsif heredoc_id && error.type == :string_literal_eof
+                # (the same error, already reported)
+              elsif walk && PARSE_Y_AT_NODE.include?(error.type)
+                @__verrs[location.start_offset] = error
+              elsif walk && error.type == :invalid_retry_without_rescue
+                # (a misplaced retry is the compiler's refusal, not the parser's)
+              else
+                __parse_y_error(error, location)
+              end
+            end
+
+            walk ? result.value.accept(self) : nil
+          else
+            result.value.accept(self)
+          end
+        end
+
+        PARSE_Y_AT_NODE = %i[write_target_readonly expression_not_writable_self write_target_in_method
+                             alias_argument_numbered_reference].freeze
+        PARSE_Y_WALKS = (PARSE_Y_AT_NODE + %i[invalid_retry_without_rescue def_endless_setter
+                                              argument_formal_class argument_formal_constant
+                                              argument_formal_global argument_formal_ivar]).freeze
+        private_constant :PARSE_Y_AT_NODE, :PARSE_Y_WALKS
+
+        private
+
+        # (one error, dispatched as parse.y reports it)
+        def __parse_y_error(error, location)
+          case error.type
+          when :alias_argument, :alias_argument_numbered_reference
+            on_alias_error("can't make alias for the number variables", location.slice)
+          when :argument_formal_class
+            on_param_error("formal argument cannot be a class variable", location.slice)
+          when :argument_format_constant, :argument_formal_constant
+            on_param_error("formal argument cannot be a constant", location.slice)
+          when :argument_formal_global
+            on_param_error("formal argument cannot be a global variable", location.slice)
+          when :argument_formal_ivar
+            on_param_error("formal argument cannot be an instance variable", location.slice)
+          when :class_name, :module_name
+            on_class_name_error("class/module name must be CONSTANT", location.slice)
+          when :incomplete_variable_instance, :incomplete_variable_class, :instance_variable_bare,
+               :class_variable_bare, :invalid_variable_global, :global_variable_bare
+            compile_error(error.message)
+          when :regexp_term
+            compile_error(error.message.delete_suffix("; expected a closing delimiter"))
+          when :heredoc_term
+            compile_error(error.message.delete_prefix("unterminated heredoc; "))
+          when :argument_no_forwarding_star, :argument_no_forwarding_star_star, :argument_no_forwarding_ampersand
+            compile_error(error.message.sub(/\Aunexpected `[^`]*`; /, ""))
+          else
+            on_parse_error(error.message)
+          end
+        end
+
+        # (a write parse.y refused, at the offset its error was found at)
+        def __assign_error(offset, field)
+          error = @__verrs && @__verrs.delete(offset)
+          error ? on_assign_error(error.message, field) : field
+        end
+
+        public
+
+        def visit_global_variable_write_node(node)
+          bounds(node.name_loc)
+          target = __assign_error(node.name_loc.start_offset, on_var_field(on_gvar(node.name.to_s)))
+          value = visit_write_value(node.value)
+
+          bounds(node.location)
+          on_assign(target, value)
+        end
+
+        def visit_global_variable_operator_write_node(node)
+          bounds(node.name_loc)
+          target = on_var_field(on_gvar(node.name.to_s))
+
+          bounds(node.binary_operator_loc)
+          operator = on_op("#{node.binary_operator}=")
+          value = visit_write_value(node.value)
+
+          bounds(node.location)
+          __assign_error(node.name_loc.start_offset, on_opassign(target, operator, value))
+        end
+
+        # (`$&, _ = 1`: Prism has the back reference as the target)
+        def visit_back_reference_read_node(node)
+          bounds(node.location)
+          error = @__verrs && @__verrs.delete(node.location.start_offset)
+          error ? on_assign_error(error.message, on_var_field(on_backref(node.slice))) : on_backref(node.slice)
+        end
+
+        def visit_constant_write_node(node)
+          bounds(node.name_loc)
+          target = __assign_error(node.name_loc.start_offset, on_var_field(on_const(node.name.to_s)))
+          value = visit_write_value(node.value)
+
+          bounds(node.location)
+          on_assign(target, value)
+        end
+
+        def visit_constant_target_node(node)
+          bounds(node.location)
+          __assign_error(node.location.start_offset, on_var_field(on_const(node.name.to_s)))
+        end
+
+        def visit_constant_path_write_node(node)
+          target = __assign_error(node.target.location.start_offset, visit_constant_path_write_node_target(node.target))
+          value = visit_write_value(node.value)
+
+          bounds(node.location)
+          on_assign(target, value)
+        end
+
+        def visit_constant_path_target_node(node)
+          __assign_error(node.location.start_offset, visit_constant_path_write_node_target(node))
+        end
+
+        # (`self = 1`: a write Prism names "self", refused at its `=`)
+        def visit_local_variable_write_node(node)
+          bounds(node.name_loc)
+          target =
+            if node.name == :self && @__verrs && (key = @__verrs.keys.find { |o| o >= node.location.start_offset && o < node.location.end_offset })
+              on_assign_error(@__verrs.delete(key).message, on_var_field(on_kw("self")))
+            else
+              on_var_field(on_ident(node.name_loc.slice))
+            end
+          value = visit_write_value(node.value)
+
+          bounds(node.location)
+          on_assign(target, value)
+        end
+
+        def visit_alias_global_variable_node(node)
+          new_name = visit_alias_global_variable_node_value(node.new_name)
+          # (`$1` is a numbered reference, which the translation's reader of
+          #  an alias's names did not take: parse.y's token is a backref)
+          old_name =
+            if node.old_name.is_a?(NumberedReferenceReadNode)
+              bounds(node.old_name.location)
+              on_backref(node.old_name.slice)
+            else
+              visit_alias_global_variable_node_value(node.old_name)
+            end
+
+          bounds(node.location)
+          error = @__verrs && @__verrs.delete(node.old_name.location.start_offset)
+          error ? on_alias_error("can't make alias for the number variables", old_name) : on_var_alias(new_name, old_name)
+        end
+
+        private
+
+        # (one Prism warning as parse.y gives it: the method, the format and its
+        #  arguments, read back out of Prism's words where parse.y passes them)
+        def __parse_y_warning(warning)
+          message = warning.message
+          case warning.type
+          when :ambiguous_first_argument_plus
+            on_arg_ambiguous("+")
+          when :ambiguous_first_argument_minus
+            on_arg_ambiguous("-")
+          when :ambiguous_slash
+            on_arg_ambiguous("/")
+          when :ambiguous_binary_operator
+            if (m = message.match(/\A'(.+)' after local variable or literal is interpreted as binary operator even though it seems like (.+)\z/))
+              on_operator_ambiguous(m[1].to_sym, m[2])
+            end
+          when :duplicated_hash_key
+            if (m = message.match(/\Akey (.+) is duplicated and overwritten on line (\d+)\z/))
+              warn("key %s is duplicated and overwritten on line %d", __parse_y_literal(m[1]), m[2].to_i)
+            else
+              warn(message)
+            end
+          when :duplicated_when_clause
+            if (m = message.match(/\A'when' clause on line (\d+) duplicates 'when' clause on line (\d+) and is ignored\z/))
+              warning("'when' clause on line %d duplicates 'when' clause on line %d and is ignored", m[1].to_i, m[2].to_i)
+            else
+              warning(message)
+            end
+          when :invalid_magic_comment_value
+            if (m = message.match(/\Ainvalid value for (.+): (.*)\z/))
+              warning("invalid value for %s: %s", m[1], m[2])
+            else
+              warning(message)
+            end
+          when :ignored_frozen_string_literal
+            warning("'%s' is ignored after any tokens", "frozen_string_literal")
+          when :indentation_mismatch
+            if (m = message.match(/\Amismatched indentations at '(.+)' with '(.+)' at (\d+)\z/))
+              warn("mismatched indentations at '%s' with '%s' at %d", m[1], m[2], m[3].to_i)
+            else
+              warn(message)
+            end
+          else
+            warning.level == :default ? warn(message) : warning(message)
+          end
+        end
+
+        # (a key as Prism writes it -- an inspected Symbol, String or Integer --
+        #  back into the value parse.y passes)
+        def __parse_y_literal(text)
+          case text
+          when /\A:(\w+[?!=]?)\z/ then $1.to_sym
+          when /\A-?\d+\z/ then text.to_i
+          when /\A"(.*)"\z/m then $1
+          else text
+          end
+        end
+
+        public
+
+        # The translation's visit_call_node (prism 1.9, ruby 4.0.9), one line
+        # changed. A receiverless call without parentheses is a command when the
+        # NODE has arguments; the translation asked the VALUE its args events
+        # returned (`arguments&.any?`), and a value is whatever the subclass's
+        # handlers answer. test/ripper's parse-files Parser answers Object.new for
+        # every event, so every such call raised NoMethodError (55 tests). The C
+        # core never looks inside what a handler returns. The receiver branch
+        # below already decides by the node; this decides the same way.
+        def visit_call_node(node)
+          if node.call_operator_loc.nil?
+            case node.name
+            when :[]
+              receiver = visit(node.receiver)
+              arguments, block = visit_call_node_arguments(node.arguments, node.block, trailing_comma?(node.arguments&.location || node.location, node.closing_loc))
+
+              bounds(node.location)
+              call = on_aref(receiver, arguments)
+
+              if block.nil?
+                call
+              else
+                bounds(node.location)
+                on_method_add_block(call, block)
+              end
+            when :[]=
+              receiver = visit(node.receiver)
+
+              *arguments, last_argument = node.arguments.arguments
+              arguments << node.block if !node.block.nil?
+
+              arguments =
+                if arguments.any?
+                  args = visit_arguments(arguments)
+
+                  if !node.block.nil?
+                    args
+                  else
+                    bounds(arguments.first.location)
+                    on_args_add_block(args, false)
+                  end
+                end
+
+              bounds(node.location)
+              call = on_aref_field(receiver, arguments)
+              value = visit_write_value(last_argument)
+
+              bounds(last_argument.location)
+              on_assign(call, value)
+            when :-@, :+@, :~
+              receiver = visit(node.receiver)
+
+              bounds(node.location)
+              on_unary(node.name, receiver)
+            when :!
+              if node.message == "not"
+                receiver =
+                  if !node.receiver.is_a?(ParenthesesNode) || !node.receiver.body.nil?
+                    visit(node.receiver)
+                  end
+
+                bounds(node.location)
+                on_unary(:not, receiver)
+              else
+                receiver = visit(node.receiver)
+
+                bounds(node.location)
+                on_unary(:!, receiver)
+              end
+            when *BINARY_OPERATORS
+              receiver = visit(node.receiver)
+              value = visit(node.arguments.arguments.first)
+
+              bounds(node.location)
+              on_binary(receiver, node.name, value)
+            else
+              bounds(node.message_loc)
+              message = visit_token(node.message, false)
+
+              if node.variable_call?
+                on_vcall(message)
+              else
+                arguments, block = visit_call_node_arguments(node.arguments, node.block, trailing_comma?(node.arguments&.location || node.location, node.closing_loc || node.location))
+                call =
+                  if node.opening_loc.nil? && (!node.arguments.nil? || node.block.is_a?(BlockArgumentNode))
+                    bounds(node.location)
+                    on_command(message, arguments)
+                  elsif !node.opening_loc.nil?
+                    bounds(node.location)
+                    on_method_add_arg(on_fcall(message), on_arg_paren(arguments))
+                  else
+                    bounds(node.location)
+                    on_method_add_arg(on_fcall(message), on_args_new)
+                  end
+
+                if block.nil?
+                  call
+                else
+                  bounds(node.block.location)
+                  on_method_add_block(call, block)
+                end
+              end
+            end
+          else
+            receiver = visit(node.receiver)
+
+            bounds(node.call_operator_loc)
+            call_operator = visit_token(node.call_operator)
+
+            message =
+              if node.message_loc.nil?
+                :call
+              else
+                bounds(node.message_loc)
+                visit_token(node.message, false)
+              end
+
+            if node.name.end_with?("=") && !node.message.end_with?("=") && !node.arguments.nil? && node.block.nil?
+              value = visit_write_value(node.arguments.arguments.first)
+
+              bounds(node.location)
+              on_assign(on_field(receiver, call_operator, message), value)
+            else
+              arguments, block = visit_call_node_arguments(node.arguments, node.block, trailing_comma?(node.arguments&.location || node.location, node.closing_loc || node.location))
+              call =
+                if node.opening_loc.nil?
+                  bounds(node.location)
+
+                  if node.arguments.nil? && !node.block.is_a?(BlockArgumentNode)
+                    on_call(receiver, call_operator, message)
+                  else
+                    on_command_call(receiver, call_operator, message, arguments)
+                  end
+                else
+                  bounds(node.opening_loc)
+                  arguments = on_arg_paren(arguments)
+
+                  bounds(node.location)
+                  on_method_add_arg(on_call(receiver, call_operator, message), arguments)
+                end
+
+              if block.nil?
+                call
+              else
+                bounds(node.block.location)
+                on_method_add_block(call, block)
+              end
+            end
+          end
+        end
       end
     end
   end
