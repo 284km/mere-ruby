@@ -4506,3 +4506,24 @@ Round 33 of note 548 (§6). corpus 654.
   Both are for later rounds (note 548: the target is the evaluator's speed).
 - Next: blocks (a small AST forwarder into run_block), def / class, the
   catch table (try_or and flow_sig), line / call events.
+
+## 2026-11-13 (51): the VM is handed over -- round 34 on is the Fable session's
+
+By the user's decision (note 550 §2), the VM goes to a Fable session from
+round 34, which carries it on to stage 11 (the JIT). The state it is handed
+over in is note 548 §8; in short:
+
+- main `1f007da0` holds rounds 30-33 (the ISeq compiler, 383 snippets
+  exact against ruby, tools/iseq/compare_with_ruby.rb; the VM's first form,
+  61 / 61, tools/iseq/vm_check.sh, MERE_ISEQ_VM=strict). No branch holds
+  unmerged work.
+- Next, in this order: blocks (an AST forwarder into run_block), def /
+  class (definemethod, defineclass), the catch table (try_or and
+  flow_sig), line / call / b_call / c_call events and Coverage, then whole
+  files on the VM, then speed, then stage 11.
+- The traps as they stand: the compiler's first load 0.5 s / ~220 MB and
+  ~45 ms per short source on every ISeq#eval; test_compile_prism 4 s -> 85
+  s; the VM's loop about twice the evaluator's; a send must go through the
+  parser's expression, not invoke_val_c alone; the bracket depth at 1012 /
+  1024 (VM functions are `and` members of the eval_e chain). The
+  compiler's known gaps and refusals are listed in note 548 §8.
