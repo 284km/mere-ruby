@@ -458,3 +458,55 @@ BOTH), rather than losing their totals. These are parser/recovery checks on
 saved evidence, not new interpreter-conformance results. A fresh reference Rand
 run also verifies all 41 cases before diagnostic address masking, which can
 collapse hexadecimal seeds in archived human-readable labels.
+
+## Known noise: results that move without the change
+
+What follows moves between runs of the SAME code. Before reading a one-test
+difference between two runs as a regression, check it against this list, and
+run the file on both builds with `unittest/try.sh` (a regression reproduces
+there; these do not). Each entry was seen on main as well as on a branch.
+
+**Order-dependent tests.** They lean on a library an earlier test happened to
+load, so the seed decides them; run alone they fail on main too.
+
+| file | test | why |
+|---|---|---|
+| ruby/test_syntax.rb | test_return_toplevel, test_eval_return_toplevel | use Tempfile without requiring it |
+| ruby/test_settracefunc.rb | test_single_raise_inside_load | uses FileUtils without requiring it |
+| ruby/test_settracefunc.rb | test_tp_ractor_local_untargeted | fails alone on main as well |
+| ruby/test_syntax.rb | test_invalid_symbol_in_hash_memory_leak | intermittent on main |
+| ruby/test_thread.rb | test_handle_interrupt_with_return_and_trap_handler | intermittent (±1 between runs) |
+
+`ruby/test_object.rb` and `ruby/test_object_id.rb` have also moved by one test
+between CI runs of the same code; locally both builds agree.
+
+**Timing at the edge of a bound on CI runners.** The bounds stay; a slow
+runner crosses them.
+
+- build-linux's Module check: `TestModule#test_complemented_method_entry_memory_leak`
+  takes 5.5-8.5 s and has 10 s (`upstream_leak_seconds`). A slow runner gives
+  10.04 s, a Timeout, and the job fails. Rerun the job.
+- `ruby/enc/test_case_comprehensive.rb` takes 360-400 s of its 600; one run
+  took 616 s (WALL_LIMIT, all 422 tests RED) while the run's median file was
+  at 0.98 of main's. Rerun its shard.
+- bootstraptest test_ractor #153 (1,000 ractors) and #99 sit at the runner's
+  limit.
+
+**Jobs that never ran.** A `macos-26` job can wait without a runner and be
+cancelled after 15-30 min (the job has no `runner_name`). A shard that reaches
+its job timeout is cancelled the same way, and every file it held comes back
+MISSING_SHARD: the totals drop by thousands and the comparison is meaningless.
+`gh run rerun <run> --failed` reruns the cancelled and failed jobs;
+`gh run rerun <run> --job <job-id>` one of them. To find the shard that holds a
+file, search the shard jobs' logs (`gh api --allow-escape-sequences
+repos/<owner>/<repo>/actions/jobs/<id>/logs`).
+
+**A local run that is not CI's.** These make a test fail locally that passes
+in CI; `unittest/try.sh` sets all of them.
+
+- rubygems/* need the ruby source tree's `lib/` first on RUBYLIB (`Gem.prefix`,
+  the default gem specs).
+- The binary must be named `mere-ruby`: a bin wrapper's shebang is read back
+  only if it mentions "ruby".
+- The corpus needs `LANG=en_US.UTF-8` (corpus/492 reads ENV keys under the
+  locale's encoding).
