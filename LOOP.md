@@ -4571,3 +4571,49 @@ rubygems failures that are not native extensions. corpus 655.
   it is meant to: a real json gem's json.rb goes on to its C extension).
 - Locally: test_gem 1 -> 0, test_gem_remote_fetcher 1 -> 0, test_require
   3 -> 2 non-native.
+
+## 2026-11-14 (53): the stage 3 tail -- what is left, file by file, and the stack size
+
+The RED of CI (main `407b07b3`) outside every other stage: 45 in 27 files.
+Run with `unittest/try.sh` (run.sh's environment: bootstrap.rb's preloads,
+the seed), not by hand -- by hand, test_eval's tmpdir and test_settracefunc's
+FileUtils looked like defects. corpus 656.
+
+- **Fixed: RUBY_THREAD_VM_STACK_SIZE and RubyVM::DEFAULT_PARAMS**
+  (test_thread's test_vm_machine_stack_size and test_stack_size). The size
+  is read as vm.c's get_param reads it (atol, the 16 KB minimum, rounded up
+  to 4 KB), before the prelude, and the call depth budget follows it: 15000
+  calls for the 1 MB default, in proportion, never under 2000 (the prelude
+  and rubygems run in the same budget), never past 19000 (each stack's
+  depths are a band of 20000). DEFAULT_PARAMS has the two thread sizes that
+  are this interpreter's own: that size, and the machine stack a thread runs
+  on -- a thread's root is a coroutine, and mere.toml gives every coroutine
+  512 MB. The budget is a slot (call_depth_v) the depth checks read: m_state
+  cannot read ENV (env_get is m_eval_leaf's, through a subprocess).
+- **Not this stage's**, each with where it belongs:
+  - GC internals (stage 9, not fabricated; the user's call): GC::
+    INTERNAL_CONSTANTS (test_file_exhaustive, test_string ×2, test_struct
+    ×2), objspace's "embedded" / "old" flags (test_object, test_process ×2),
+    GC.stat's compact_count / heap_available_slots (test_process ×2), and
+    every "compaction is not supported" skip (test_weakmap, test_weakkeymap,
+    test_set, test_proc, test_method, test_io_buffer, test_eval).
+  - Speed (stage 10 / 11): the assert_no_memory_leak tests at the runner's
+    10 s (test_alias, test_hash, test_io, test_settracefunc ×3, test_syntax,
+    socket/test_addrinfo).
+  - The native stage: `require '-test-/class'` (test_class
+    test_redefinition_mismatch), cgi's C extension (test_cgi_escape ×2).
+  - Stage 5: RubyVM::AbstractSyntaxTree::Node#empty? (test_pp).
+  - Fibers' sizes (test_stack, already in the VM row): a fiber's budget does
+    not follow RUBY_FIBER_VM_STACK_SIZE yet, so DEFAULT_PARAMS reports no
+    fiber size.
+  - callcc re-entry (test_array ×2, test_hash's skips): KNOWN_GAPS.
+  - An IO nothing references is not collected, so its finalizer never
+    closes the descriptor (test_io autoclose_*_closed_by_finalizer, two
+    skips; a plain object is collected): GC lifetimes, stage 9.
+  - Object shapes: Warning[:performance]'s "reached 8 shape variations"
+    (test_object) describes CRuby's shape tree.
+  - Noise (unittest/README "Known noise"): test_settracefunc
+    tp_ractor_local_untargeted, test_thread's interrupt test, the ±1 of
+    test_object_id / test_module / test_class / test_integer, test_fiber
+    test_fatal_in_fiber and test_process test_rlimit_nofile (both fail on
+    the reference here too).
