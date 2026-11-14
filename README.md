@@ -252,7 +252,7 @@ hook that never fired) was one test away.
 
 ## Vendored packages
 
-`zlib` is a C extension in CRuby. Here it is [mgz](https://github.com/284km/mgz)
+`zlib` is a C extension in CRuby. Here it is [mgz](https://github.com/merelang/mgz)
 — gzip in pure Mere — vendored under `.mere_modules/` and imported, so a
 checkout needs its submodule:
 
