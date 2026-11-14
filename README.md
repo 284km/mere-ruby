@@ -1,19 +1,47 @@
 # mere-ruby
 
-A Ruby subset interpreter written in [Mere](https://merelang.org/), in
-pure Mere. It runs literals, operators, variables, control flow, methods,
-classes and inheritance, blocks and iterators, exceptions, and a broad set of
-core methods — every corpus program (FizzBuzz, class hierarchies,
-`map`/`select`/`reduce` chains, hashes) prints byte-identical output to the
-reference `ruby`. `set`, `pathname` and `digest` are compiled in; the real
-`csv` gem is not, and pointed at it with `-I` this parses CSV byte-identically
-to ruby 4.0.6 (`bench/csv.sh`).
+A Ruby implementation written in [Mere](https://merelang.org/), in pure
+Mere, measured against ruby 4.0.9. It is measured by CRuby's own test suites
+and by [ruby/spec](https://github.com/ruby/spec): of the 34,559 tests in
+CRuby's `test/`, **32,462 pass here as they pass under ruby**; all of
+`basictest` passes; and **2,673 of 2,994 ruby/spec files** are byte-identical
+to ruby — see [Where it stands](#where-it-stands) for every suite and what the
+rest is. `set`, `pathname` and `digest` are compiled in; the real `csv` gem is
+not, and pointed at it with `-I` this parses CSV byte-identically to ruby
+(`bench/csv.sh`).
 
-The milestones below (M0-M6) are how it was built. What it is measured by now
-is [ruby/spec](https://github.com/ruby/spec): **2488 of 2980 spec files**
-byte-identical to ruby 4.0.9 — every `core` and `language` file the suite has,
-plus the libraries this ships — see
-[Conformance](#conformance-rubyspec) for what that covers and what it does not.
+The milestones further down (M0-M6) are how it was first built.
+
+## Where it stands
+
+Measured by CI on main `baa6422d` (2026-11-14), against ruby 4.0.9. MATCH:
+passes under both. RED: passes under ruby and not here -- the number to work
+on. BOTH: fails under ruby as well, and is not counted.
+
+| suite | measured | MATCH | RED | BOTH |
+|---|---:|---:|---:|---:|
+| CRuby `test/` (758 files, [unittest/](unittest/README.md)) | 34,559 tests | 32,462 | 1,952 | 134 |
+| `bootstraptest` ([bootstraptest/](bootstraptest/README.md)) | 2,044 | 2,018 | 20 | 5 |
+| `basictest` | 894 | 894 | 0 | 0 |
+| `tool/test` | 205 | 194 | 0 | 11 |
+| ruby/spec ([SPEC_STATUS.md](SPEC_STATUS.md)) | 2,994 files | 2,673 | DIFF 16 | SKIP 305 |
+| the corpus (`corpus/`, byte-for-byte) | 687 programs | 687 | 0 | |
+
+What the 1,952 RED of `test/` are, by what they wait on:
+
+| | RED | |
+|---|---:|---|
+| C extensions and mkmf | 1,118 | CRuby's C API, its `-ext-` test extensions, building native gems ([KNOWN_GAPS.md](KNOWN_GAPS.md) lists what mkmf reads) |
+| JIT | 444 | test_zjit, test_yjit: a method JIT on top of the VM |
+| GC and ObjectSpace internals | 159 | CRuby's heap layout, compaction and internal constants, which are not answered with made-up values |
+| AST and Ripper | 120 | parse.y-shaped trees (`RubyVM::AbstractSyntaxTree`) |
+| VM, ISeq, coverage | 55 | `RubyVM::InstructionSequence` compiles to ruby's own instructions, to_a and disasm byte for byte (`tools/iseq/`), and a first VM runs a part of them |
+| error_highlight | 12 | |
+| the rest | 44 | each sorted in [LOOP.md](LOOP.md) (52) and (53): a test at a timing bound, callcc re-entry, a test that leans on another's load order |
+
+Divergences understood and deliberately left are in
+[KNOWN_GAPS.md](KNOWN_GAPS.md); results that move between runs of the same
+code are listed in [unittest/README.md](unittest/README.md#known-noise-results-that-move-without-the-change).
 
 Use the [pinned Mere compiler source](https://github.com/merelang/mere/tree/b92d73358e77a1577400c83aff7d61ea886984f9)
 for native builds. Anonymous Class/Module metadata collection requires its
@@ -130,7 +158,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 213 programs, byte-for-byte
+./run_corpus.sh                                  # 687 programs, byte-for-byte
 ./run_corpus.sh --both                           # ...with the hash index ON and OFF,
                                                  # running the reference once, not twice
                                                  # (and eight SOURCE gates, see tools/)
@@ -217,8 +245,8 @@ this machine down once: bootstraptest extracts a 121k-line generated program,
 and the two peaks land together.
 
 `MERE_RUBY_STACKTRACE=1` makes the recursion guard dump the innermost call
-names before it raises. mere-ruby keeps no backtrace, so this is the only
-view into a runaway recursion — it is what named rubocop's as an eight-frame
+names before it raises. A SystemStackError's backtrace stops at the guard, so
+this is the view into a runaway recursion — it is what named rubocop's as an eight-frame
 cycle through a fallback visitor, and from there the cause (a `method_added`
 hook that never fired) was one test away.
 
@@ -567,8 +595,8 @@ C backend.
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
-and under `./mere-ruby` and diffs the output byte-for-byte: **213 programs,
-213 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
+and under `./mere-ruby` and diffs the output byte-for-byte: **687 programs,
+687 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
 index cannot hide behind the walk it replaced. The corpus covers the semantic corners above. A deliberate negative control (lossy float
 printing, see PAIN.md) confirms the harness actually detects divergence.
 
@@ -596,8 +624,8 @@ The existing scoreboard below measures its recorded groups and source tree;
 it is not a complete inventory. CI's `measurement-plan/suites.json` separately
 lists the broader target suites and inputs still awaiting measurement.
 
-The record covers **2980 spec files** across 154 groups: **2488 MATCH, 149
-DIFF, 3 CRASH**, 335 SKIP, 5 SLOW, against ruby 4.0.9. Run with no
+The record covers **2994 spec files**: **2673 MATCH, 16 DIFF, 0 CRASH**,
+305 SKIP, 0 SLOW, against ruby 4.0.9. Run with no
 directories, the sweep refreshes exactly the groups the table already has, so
 the numbers above are reproducible rather than a snapshot -- and every row of
 one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
