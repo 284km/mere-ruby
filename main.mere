@@ -62605,6 +62605,36 @@ and vm_names = fn (locs: Val list) -> fn (depth: int) -> fn (from: int) -> fn (n
 //  `if x.nil? then x = d end` of its body, block_defaults -- so a block's
 //  optional parameter given nil takes its default, the evaluator's
 //  convention for blocks.)
+// Parameters named `_` more than once -- `|_, _|`, `def m(_, _ = 1, *_)`:
+// the second and later are other variables under the parser's names for
+// them (uniq_param: `_~N`, N the `_` before it; a keyword `_:` only after
+// another keyword `_:`), so the first is what `_` reads and #parameters
+// still says `_` for each.
+and vm_kw_first = fn (ps: Val list) ->
+  let num = fn (k: str) -> (match vm_hget ps k with VInt n -> n | _ -> 0 - 1) in
+  let lead = (let n = num "lead_num" in if n < 0 then 0 else n) in
+  let nopt = (match vm_hget ps "opt" with VArr o -> (let n = list_len_v (deref o) 0 in if n > 0 then n - 1 else 0) | _ -> 0) in
+  lead + nopt + (if num "rest_start" >= 0 then 1 else 0) + (let n = num "post_num" in if n < 0 then 0 else n)
+and vm_uniq_locs = fn (locs: Val list) -> fn (ph: Val) ->
+  let rec cnt = fn (xs: Val list) ->
+    (match xs with
+     | Nil -> 0
+     | Cons (VSym s, t) -> (if str_eq s "_" then 1 else 0) + cnt t
+     | Cons (_, t) -> cnt t) in
+  if cnt locs < 2 then locs
+  else
+    (let ps = (match ph with VHsh h -> hderef h | _ -> Nil) in
+     let kw0 = vm_kw_first ps in
+     let nkw = (match vm_hget ps "keyword" with VArr k -> list_len_v (deref k) 0 | _ -> 0) in
+     let rec go = fn (xs: Val list) -> fn (i: int) -> fn (seen: int) -> fn (kseen: int) ->
+       (match xs with
+        | Nil -> (Nil : Val list)
+        | Cons (VSym s, t) when str_eq s "_" ->
+          (let kw = i >= kw0 && i < kw0 + nkw in
+           let again = (if kw then kseen > 0 else seen > 0) in
+           Cons (VSym (if again then "_~" ++ str_of_int seen else "_"), go t (i + 1) (seen + 1) (if kw then kseen + 1 else kseen)))
+        | Cons (x, t) -> Cons (x, go t (i + 1) seen kseen)) in
+     go locs 0 0 0)
 and vm_params = fn (kind: int) -> fn (locs: Val list) -> fn (depth: int) -> fn (ph: Val) ->
   let ps = (match ph with VHsh h -> hderef h | _ -> Nil) in
   let num = fn (k: str) -> (match vm_hget ps k with VInt n -> n | _ -> 0 - 1) in
@@ -62634,18 +62664,24 @@ and vm_params = fn (kind: int) -> fn (locs: Val list) -> fn (depth: int) -> fn (
   let bparam = (if fwd then Cons ("&__anonblk", (Nil : str list)) else bparam) in
   // (keywords: a required one is its name, an optional one [name] or
   //  [name, literal])
-  let rec kws = fn (xs: Val list) ->
+  // (...under the table's name for its slot when that is a repeated `_`'s:
+  //  vm_uniq_locs)
+  let kw0 = vm_kw_first ps in
+  let slotn = fn (k: str) -> fn (i: int) ->
+    (if str_eq k "_" then (match vm_nth locs (kw0 + i) with VSym s -> s | _ -> k) else k) in
+  let rec kws = fn (xs: Val list) -> fn (i: int) ->
     (match xs with
      | Nil -> ("", (Nil : str list), (Nil : str list), (Nil : (str * Expr) list))
      | Cons (x, t) ->
-       (let (w, names, opts, ds) = kws t in
+       (let (w, names, opts, ds) = kws t (i + 1) in
         match x with
-        | VSym k -> (w, Cons (k ++ ":", names), opts, ds)
+        | VSym k0 -> (let k = slotn k0 i in (w, Cons (k ++ ":", names), opts, ds))
         | VArr e ->
           (match deref e with
-           | Cons (VSym k, Nil) -> (w, Cons (k ++ ":", names), Cons (k, opts), Cons ((k ++ ":", EVmArg), ds))
-           | Cons (VSym k, Cons (d, Nil)) ->
-             (let (ok, de) = (match d with
+           | Cons (VSym k0, Nil) -> (let k = slotn k0 i in (w, Cons (k ++ ":", names), Cons (k, opts), Cons ((k ++ ":", EVmArg), ds)))
+           | Cons (VSym k0, Cons (d, Nil)) ->
+             (let k = slotn k0 i in
+              let (ok, de) = (match d with
                               | VInt n -> (true, EInt n)
                               | VNil -> (true, ENil)
                               | VBool b -> (true, EBool b)
@@ -62657,7 +62693,7 @@ and vm_params = fn (kind: int) -> fn (locs: Val list) -> fn (depth: int) -> fn (
                Cons (k ++ ":", names), Cons (k, opts), Cons ((k ++ ":", de), ds)))
            | _ -> ("a keyword parameter it cannot read", names, opts, ds))
         | _ -> ("a keyword parameter it cannot read", names, opts, ds))) in
-  let (kwhy, kwnames, kwopts, kwds) = kws (match vm_hget ps "keyword" with VArr k -> deref k | _ -> Nil) in
+  let (kwhy, kwnames, kwopts, kwds) = kws (match vm_hget ps "keyword" with VArr k -> deref k | _ -> Nil) 0 in
   let rec optds = fn (ns: str list) -> (match ns with Nil -> kwds | Cons (n, t) -> Cons ((n, EVmArg), optds t)) in
   let rec app = fn (a: str list) -> fn (b: str list) -> (match a with Nil -> b | Cons (h, t) -> Cons (h, app t b)) in
   // (`**nil`, which ruby's to_a does not show and the compiler's export for
@@ -62873,6 +62909,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   //  evaluator's `_1`, where a Binding looks for it)
   let ipn = (match (match vm_nth top 11 with VHsh ph -> vm_hget (hderef ph) "implicit" | _ -> VNil) with VInt k -> k | _ -> 0 - 1) in
   let locs = (if ipn == 0 then (match locs0 with Cons (VInt _, t) -> Cons (VSym "_1", t) | _ -> locs0) else locs0) in
+  let locs = vm_uniq_locs locs (vm_nth top 11) in
   let nloc = list_len_v locs 0 in
   let scopes = Cons ((locs, nloc, depth, kind == 4 || kind == 5), outer) in
   let body = (match vm_nth top 13 with VArr id -> deref id | _ -> Nil) in
@@ -63362,13 +63399,15 @@ and vm_argl = fn env -> fn (fl: int) -> fn (argc: int) -> fn (kws: Val list) -> 
               let _ = (if is_lit then () else map_set env k v) in
               // (`**h` is the parser's keyword hash of one doubled splat:
               //  that arm converts with #to_hash and refuses what has none)
-              let x = (if kwsp && i == argc - 1 then EKwHash (Cons (EKwSplat (EVar k), Cons (EKwSplat (EVar k), (Nil : Expr list))))
-                       else if splat && i == argc - 1 - (if kwsp then 1 else 0) then ESplat (EVar k)
-                       else if is_lit then lit
-                       else EVar k) in
-              // (`**nil` -- what ruby compiles `**{}` to as well -- passes nothing)
-              if kwsp && i == argc - 1 && (match v with VNil -> true | _ -> false) then pos t (i + 1)
-              else Cons (x, pos t (i + 1))))) in
+              // (a literal value is its own expression: its hidden local is
+              //  not bound)
+              let ke = (if is_lit then lit else EVar k) in
+              let x = (if kwsp && i == argc - 1 then EKwHash (Cons (EKwSplat ke, Cons (EKwSplat ke, (Nil : Expr list))))
+                       else if splat && i == argc - 1 - (if kwsp then 1 else 0) then ESplat ke
+                       else ke) in
+              // (`**nil` -- what ruby compiles `**{}` to as well -- passes
+              //  nothing, and that arm still notes that keywords were given)
+              Cons (x, pos t (i + 1))))) in
   let rec kwp = fn (ks: Val list) -> fn (xs: Val list) -> fn (i: int) ->
     (match ks with
      | Cons (VSym kn, kt) ->
@@ -63749,7 +63788,20 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
                       (match xs with
                        | Nil -> (Nil : (Val * str) list)
                        | Cons (x, t) -> Cons ((x, (if i < str_len kinds then char_at kinds i else "C")), zip t (i + 1))) in
-                    vm_push st (invoke_val_c env world blk (rx_dregexp world (zip ps 0) fl) "__regex" (Cons (mkstr fl, Nil)) false)))
+                    // (a computed piece is read on its own first, in its own
+                    //  encoding, as the evaluator's __rx_frag reads it: an
+                    //  escape cut short is its ArgumentError)
+                    let rec frag = fn (xs: (Val * str) list) ->
+                      (match xs with
+                       | Nil -> ()
+                       | Cons ((VStr sp, k9), t) when (if str_len k9 > 0 && str_eq (char_at k9 0) "L" then false else true) ->
+                         (let why = rx_frag_why (sget sp) in
+                          let why = (if str_eq why "" then rx_frag_mb_why (sget sp) (enc_canon_name (senc_get sp)) else why) in
+                          if str_eq why "" then frag t else (let _ = raise_exc world "ArgumentError" why in ()))
+                       | Cons (_, t) -> frag t) in
+                    let zs = zip ps 0 in
+                    let _ = frag zs in
+                    vm_push st (invoke_val_c env world blk (rx_dregexp world zs fl) "__regex" (Cons (mkstr fl, Nil)) false)))
               else if o == 68 then vm_push st (vm_ev env world blk (EVar n))
               else if o == 72 || o == 73 then vm_forward env world blk st o n a (vec_get ib pc) (vec_get ov pc)
               // (getconstant: the constant under the class the value below
@@ -63874,7 +63926,7 @@ and vm_value_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n:
      let _ = vm_push st (match h9 with
                          | VHsh _ -> h9
                          | VNil -> h9
-                         | _ -> vm_eval env world blk (Cons (h9, Nil)) (fn (es: Expr list) -> EHsh (Cons (EKwSplat (vm_nth_e es 0), Nil)))) in
+                         | _ -> vm_eval env world blk (Cons (h9, Nil)) (fn (es: Expr list) -> EHsh (Cons (EKwSplat (vm_nth_e es 0), Cons (EKwSplat (vm_nth_e es 0), Nil))))) in
      vm_push st b9)
   else if o == 31 then vm_push st (vm_ev env world blk (EMethod (EStrL n, "freeze", Nil)))
   else if o == 32 then vm_push st (vm_ev env world blk (EUn ("-", EStrL n)))
@@ -64115,6 +64167,14 @@ and vm_region = fn env -> fn world -> fn blk -> fn cd -> fn (ct: (int * int * in
        (let _ = vm_jump ct st s v how in FRaise VNil)) in
   let nodecl = fn (u: unit) -> () in
   let noflow = fn (u: unit) -> FNext VNil in
+  // (the line a rescue clause's caller sees the frame at -- resc_at, which
+  //  run_begin_f reads as the current line on entry: the one of the
+  //  instruction before where the frame goes on, as ruby leaves the frame's
+  //  pc there. That is the `begin`'s, or the def's.)
+  let _ = (if ty == 1 then
+             (let (_, _, _, _, _, _, ln, _) = cd in
+              if cont >= 1 && cont - 1 < vec_len ln then cur_line_set (vec_get ln (cont - 1)) else ())
+           else ()) in
   let _ =
     (if ty == 1 then
        run_begin_f env world blk body_f nodecl true
