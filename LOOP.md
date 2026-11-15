@@ -5210,3 +5210,86 @@ different.
   is Ruby running on mere-ruby, about 3 ms a line; and the VM's loop is
   1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
   fallbacks, then the compiler made native, then speed.
+
+## 2026-11-15 (57): RubyVM::AbstractSyntaxTree answers parse.y's tree
+
+The second half of stage 5's second part (note 550 §1, note 551). test_ast
+was 92 RED of 2,664 (main's CI run 43548292351): `parse` answered a SCOPE with
+no children. Here it gives the same result as the reference -- 2,664 tests,
+2,633,172 assertions, no failure, no error, the same 13 skips -- and the file
+costs 1.345 times the instructions it did (3.208e12 -> 4.315e12, `time -l`),
+which from the baseline's 414 s on CI is about 557 s of the 600 it has. Peak
+RSS 1.85 GB -> 1.79 GB here. corpus 660 (658 and 659 are the VM rounds', #85).
+
+- **The tree is made from Prism's, in Mere.** libprism's serialized bytes are
+  decoded into flat integer tables (m_prism_dec.mere), translated to
+  parse.y's nodes (m_ast.mere, m_ast_out.mere) and made into Node objects
+  (m_ast_obj.mere) with no line of Ruby run: 9.8 µs a node for
+  `parse_file`, libprism's own parse included. The translation is parse.y's
+  grammar actions replayed -- block_append, list_append, arg_append,
+  new_args, reduce_nodes, literal_concat and the rest under their own names
+  with a `p_` in front, moving locations as they do -- and `#children` is
+  ast.c's node_children. The readers of Prism's fields and the dispatch on a
+  node's type are generated from Prism's `config.yml`
+  (tools/gen_prism_schema.rb nodes -> m_prism_nodes.mere; only the names the
+  sources use are written, the rest being definitions dead_defs refuses).
+- **Checked against the reference's parse.y, node by node.**
+  `tools/ast_on_cruby.rb text` writes the reference's tree a node a line
+  (values by their bytes, with `--locations` the other locations too) and
+  `tools/ast_dump` -- the translation alone, compiled without the
+  interpreter in about a second -- writes this one's; `tools/ast_text_diff.rb`
+  compares. All 850 files test_ast reads agree (1,002,706 lines, locations
+  included); 956 of Prism's 976 fixtures do (5 of the rest are where the
+  reference's own `#children` raises, `::A ||= 1`). Which programs are
+  refused agrees for the 201 tried (break / next / redo / retry / yield /
+  return in every place test_ast puts them, and the like).
+- **A program that does not parse (`error_tolerant: true`).** parse.y and
+  Prism recover differently, and what test_ast pins is translated back: a
+  construct whose `end` never came ends at the last token; something after a
+  whole statement at the top level (`1q`) ends the program there; a missing
+  condition's ERROR is the token the parser was looking at; an `end` that
+  closes a class or module by its indent (parse.y's enforce_keyword_end:
+  `foo.` / `end`) closes it, the statements Prism nested under it going back
+  out one construct at a time; a literal that is no regexp holds nil. Not
+  translated: where parse.y makes the whole statement an ERROR -- the same
+  junk after a statement inside a def, an expression cut off at the end of
+  its line (`a = 1 +`), an unclosed bracket before an `end` -- and the
+  indent rule anywhere but directly in a class or module body.
+- **This interpreter's own parser is no longer the judge of whether the
+  program parses.** `parse` reads the program with it first, for what parse.y
+  says besides the tree -- its warnings (corpus 502 pins them) and a
+  SyntaxError in its wording (corpus 467) -- and that parser refused programs
+  that are fine (a pattern with a range and a guard), which was a
+  SyntaxError out of `parse`. Its error now stands only when the tree's
+  parser refuses the program too. Prism's errors refuse what parse.y refuses;
+  the two it does not report -- a `retry` in an `END { }` inside a rescue, a
+  literal that is no regexp -- are found by the translation, and an error
+  only Prism reports is its text in parse.y's layout (the text, the line, a
+  `^~~` under the place).
+- **Two things that made the tests' own loops slow, found by timing their
+  pieces inside and outside test/unit.**
+  - `#inspect` of an Array or Hash asked pp's cycle table
+    (`Thread.current[:__recursive_key__]`) with four method calls, for every
+    container, once pp.rb had run at all -- and test/unit loads it. An array
+    holding one array: 2.9 µs before pp.rb, 14.4 µs after; now the table is
+    read where Thread#[] keeps it (3.4 µs). test_all_tokens builds two such
+    strings a token, 2.37 million tokens: 296.8 s -> 242.0 s.
+  - An attribute reader called with nothing reads the instance variable
+    where it is, with no frame (2.6 µs -> 1.7 µs). ruby's is a C function
+    too. A TracePoint, set_trace_func, Coverage's method table, a Ractor or
+    a block given take the full path.
+- **Where the rest of the time is** (note 551 §5): collection is about 18%
+  of the file, and three fifths of one collection is the runtime walking the
+  running stack for pointers into arenas (`__lang_coro_pins`,
+  `__lang_coro_scan_ints`) -- deep under test/unit, deeper in a recursive
+  walk; interning a block's body compares the whole tree each time a block
+  becomes a Proc (6.7% of test_all_tokens: assert_equal's message is thirty
+  lines); the rest is the fixed cost of a call. None of it is touched here.
+- **Also**: a Symbol literal keeps the encoding it was written into
+  (`:"r\u{e9}sum\u{e9}"` in a US-ASCII file is UTF-8 -- test_struct.rb and
+  test_data.rb could not be read); `AbstractSyntaxTree.of` answers nil for an
+  attribute method; tools/ast_dump lost its development stubs. Kernel#pp of
+  a Node before pp.rb is loaded still prints `#inspect` (ruby loads pp.rb on
+  the first `pp`).
+- Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 898 of 1024 (was
+  873: the translation's tables are top-level values).

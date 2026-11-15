@@ -151,7 +151,7 @@ prism_version(void) {
  *     is keyword_do_block (parse.y's CMDARG_P(); Prism decides it in the
  *     parser, so the tree is walked for those calls);
  *   - the gaps between tokens are tSP / word_sep, cut after each newline and
- *     each `\` newline;
+ *     each `\` newline (a `\` that continues no line is `backslash`);
  *   - a newline that ends a statement is made after the comment lines that
  *     follow it (parse.y looks past them for a leading `.`);
  *   - a <<~ heredoc's body is one token per line until a line with no
@@ -256,7 +256,7 @@ static const char *const ast_table[][2] = {
     {"WORDS_SEP", "word_sep"},
 };
 
-enum { AST_SP, AST_WORD_SEP, AST_DO_BLOCK, AST_DO_LAMBDA, AST_LPAREN, AST_LBRACE, AST_LBRACE_ARG, AST_BACKTICK };
+enum { AST_SP, AST_WORD_SEP, AST_DO_BLOCK, AST_DO_LAMBDA, AST_LPAREN, AST_LBRACE, AST_LBRACE_ARG, AST_BACKTICK, AST_BACKSLASH };
 
 static void
 ast_names_init(void) {
@@ -264,6 +264,7 @@ ast_names_init(void) {
     /* (the names this file chooses by context, at fixed indexes) */
     ast_intern("tSP"); ast_intern("word_sep"); ast_intern("keyword_do_block"); ast_intern("keyword_do_LAMBDA");
     ast_intern("tLPAREN"); ast_intern("tLBRACE"); ast_intern("tLBRACE_ARG"); ast_intern("`");
+    ast_intern("backslash");
     for (int t = 0; t <= PM_TOKEN_MAXIMUM; t++) ast_type_name[t] = AST_SP;
     for (int t = PM_TOKEN_EOF; t < PM_TOKEN_MISSING; t++) {
         const char *pn = pm_token_type_name((pm_token_type_t) t);
@@ -377,16 +378,18 @@ ast_emit_gap(const uint8_t *s, size_t from, size_t to, int name) {
     size_t i = from;
     while (i < to) {
         size_t j = i;
+        int piece = name;
         if (s[i] == '\\') {
             if (i + 1 < to && s[i + 1] == '\n') j = i + 2;
             else if (i + 2 < to && s[i + 1] == '\r' && s[i + 2] == '\n') j = i + 3;
-            else j = i + 1;
+            /* (a `\` that continues no line: parse.y's own token for it) */
+            else { j = i + 1; piece = AST_BACKSLASH; }
         } else if (s[i] == '\n') {
             j = i + 1;
         } else {
             while (j < to && s[j] != '\\' && s[j] != '\n') j++;
         }
-        ast_emit(name, i, j);
+        ast_emit(piece, i, j);
         i = j;
     }
 }
