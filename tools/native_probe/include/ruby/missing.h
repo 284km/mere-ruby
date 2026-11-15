@@ -1,0 +1,1 @@
+/* nextafter.c needs no declarations here on this host. */
