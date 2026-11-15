@@ -4489,9 +4489,22 @@ CRuby extension ABI or compiler/linker flags.
 **What fixing the remaining build integration takes.** An installation
 layout and build metadata of mere-ruby's own.
 
-**What the native stage needs from it (inventory, 2026-11-13).** Facts for
-whoever takes extensions on (stage 7′ / 8); nothing here is answered yet,
-and which of them mere-ruby can answer truthfully is that stage's call.
+**The build is answered where there is one (2026-11-16, stage 7′ / 8).** An
+interpreter that finds `capi/include/ruby.h` beside its executable says its
+own build in RbConfig -- the header directory, the executable's directory
+and name, clang and the flags an extension for it is built with -- and
+ruby's `mkmf.rb` works from that (capi/README.md, "Building an extension").
+These are mere-ruby's facts, not a reference installation's table: about 60
+keys, where CRuby has 254, so rbconfig_spec's count is still not met, and a
+build without the C API still has only the facts above. What is left a
+stand-in is the installation layout (`prefix`, `libdir`, the site
+directories), and `ENABLE_SHARED` and a libruby name are deliberately not
+said.
+
+**What the native stage needed from it (inventory, 2026-11-13; kept as the
+record of where it started).** Facts for whoever takes extensions on (stage
+7′ / 8); which of them mere-ruby can answer truthfully was that stage's
+call, and the paragraph above is the answer.
 
 - `require "mkmf"` and `create_makefile` read **5 `RbConfig::CONFIG` keys**
   mere-ruby does not have -- rubyhdrdir rubyarchhdrdir CC_WRAPPER topdir

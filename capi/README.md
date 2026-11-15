@@ -122,9 +122,35 @@ clang -bundle -undefined dynamic_lookup -fPIC -I capi/include x.c -o x.bundle   
 clang -shared -fPIC -I capi/include x.c -o x.so                                 # Linux
 ```
 
-`tools/capi_ext_build.py --ruby-source <tree> --output <dir>` does this for
-every directory of ruby's `ext/-test-`, reading each `extconf.rb` for the
-feature name and the sources (it does not run it; mkmf is the next step).
+or, as a gem does it, with ruby's own mkmf:
+
+```
+mere-ruby extconf.rb && make && make install
+```
+
+`require "mkmf"` is ruby's `mkmf.rb`, unchanged. What it reads is RbConfig,
+and an interpreter that finds `capi/include/ruby.h` beside its executable
+says its build there: `rubyhdrdir` and `rubyarchhdrdir` (that directory),
+`topdir` and `bindir` (the executable's), `ruby_install_name` (its name --
+mkmf writes it into the Makefile as `$(RUBY)`, and RubyGems starts
+`extconf.rb` with it), `CC` = clang and the flags above as `CCDLFLAGS`,
+`LDSHARED` and `DLDFLAGS`, no libruby (`LIBRUBYARG` is empty: an extension
+finds the API in the executable), and the POSIX tools a Makefile calls. The
+values are how `tools/build.sh` builds the interpreter and how the two
+commands above build an extension; nothing is copied from a CRuby
+installation. A build without the C API has none of these keys.
+
+Two answers of mkmf differ from CRuby's because there is no libruby to link
+a test PROGRAM against: `have_func` of a ruby API function (`ruby_init`,
+`rb_ary_new`) says no, since its test program does not link; and
+`ENABLE_SHARED` is not said (see the comment where the keys are, in
+m_driver.mere). The installation directories (`prefix`, `libdir`,
+`sitearchdir`) are still the stand-ins they were: `make install` is given
+its directory, as RubyGems gives it.
+
+`tools/capi_ext_build.py --ruby-source <tree> --output <dir>` builds every
+directory of ruby's `ext/-test-` without running its `extconf.rb` (those are
+written for ruby's own build tree: they reach into its internal headers).
 
 ## What is missing
 
@@ -156,6 +182,17 @@ feature name and the sources (it does not run it; mkmf is the next step).
   contracts that depend on each must fail.
 - The unit test run builds all of `ext/-test-` and runs `test/-ext-` against
   it, file by file, like every other directory of ruby's tests.
+- `tools/capi_mkmf_check.py` (CI, macOS and Linux): an extension whose
+  `extconf.rb` asks the compiler about headers, functions, a macro, a size
+  and a library, and ruby's `ext/-test-/float` by its own `extconf.rb`, are
+  built with `extconf.rb`, `make`, `make install` on both rubies; the built
+  libraries say what mkmf answered, and the contracts in
+  `capi/check/mkmf.rb` print the same on both sides. A source that does not
+  compile must fail at `make` on both, and mere-ruby given the libraries the
+  reference's mkmf built must fail.
+- `test/mkmf` runs in a build tree staged for mere-ruby
+  (`unittest/mkmf_context.sh`: links to `capi/include` in the places mkmf's
+  build-tree mode looks, and a Makefile mere-ruby's own mkmf wrote).
 
 ## The files
 
