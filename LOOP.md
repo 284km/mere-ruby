@@ -4710,9 +4710,23 @@ runs on the evaluator.
   statement (an eval'd body, under an `if` in a class body) was public --
   ruby keeps initialize, initialize_copy / _clone / _dup and
   respond_to_missing? private wherever the def runs.
-- **Programs are given back.** A loaded tree is freed when its run ends
-  unless something still names it (a Proc captured its frame, a method was
-  defined from it): 1,500 evals in a row peak at 258 MB, 300 at 255 MB.
+- **Programs are given back, by who can still run them** (the review of
+  #85). The programs of one loaded Array are a tree. A tree is freed when no
+  frame runs a program of it, no Proc was made in such a frame and no
+  method's body is one of its programs: a top, method or class body frame
+  carries the tree's id (the env's `__vm~p`; a block's env chains to the
+  frame it was written in), marking an env that carries one marks the tree,
+  the method table is read for bodies that are programs, and what nothing
+  named in a collection is freed after its marking (m_state's vm_sweep).
+  ISeq#eval frees its tree at once unless a Proc took the frame or a def of
+  it actually ran. Counted with `RubyVM::InstructionSequence.__vm_trees`:
+  100 evals of a sequence whose def is never taken hold 0 trees, of one
+  that redefines a method 1; trees a dead Proc held go as the collector
+  stops reaching the Proc (about 50 linger whether 400 or 6,000 were made).
+- **The VM's own names cannot be Ruby's** (the same review): the hidden
+  locals and the helper bindings carry a `~` (`__vm~r`, `__vm~0`,
+  `__vh~1_3`), which no source spells -- `__vmr = 1; [1].map { __vmr }` read
+  the call's receiver -- and Proc#parameters hides only those.
 - **Events (round 37).** A sequence is no longer refused while a TracePoint
   or Coverage is on. A line event on an instruction is Coverage's count and
   the TracePoint's :line, a rescue clause's first instruction its :rescue;
