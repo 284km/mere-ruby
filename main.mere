@@ -8555,8 +8555,10 @@ and run_block_tp = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
      //  SLine parse_block_inner puts in front -- and both events are in the
      //  file the block is written in: its method's, else the program's)
      let (_, _, body9, _) = theblk in
-     let l9 = (match body9 with Cons (SLine n9, _) -> (if n9 < 0 then 0 - n9 else n9) | _ -> cur_line ()) in
-     let path9 = tp_blk_path cls9 mid9 in
+     // (a block the ISeq VM runs knows both: its sequence's)
+     let (vp9, vl9) = vm_body_pos body9 in
+     let l9 = (if vl9 > 0 then vl9 else (match body9 with Cons (SLine n9, _) -> (if n9 < 0 then 0 - n9 else n9) | _ -> cur_line ())) in
+     let path9 = (if str_eq vp9 "" then tp_blk_path cls9 mid9 else vp9) in
      // (callee_id: the name the method it is written in was called by -- an
      //  alias's, which that frame keeps in __callee)
      let ce9 = (if lv_has cenv9 "__callee" then (match lv_get cenv9 "__callee" with VStr ch9 -> sget ch9 | _ -> mid9) else mid9) in
@@ -62789,8 +62791,9 @@ and vm_free_all = fn (ids: int list) ->
 // instruction -- opcode, name, two ints, a block's program, operand, line,
 // and whether a line event starts a statement there. Labels are instruction
 // indices; the line numbers and events are folded into the instructions
-// they precede. `outer` is the local tables of the sequences around it,
-// nearest first.
+// they precede (the events as bits: 1 a line event, 2 a protected region
+// may be entered here, 4 a rescue event). `outer` is the local tables of the
+// sequences around it, nearest first.
 and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool) list) -> fn (depth: int) ->
   let kname = vm_sym (vm_nth top 9) in
   let kind = (if str_eq kname "top" then 0 else if str_eq kname "block" then 1
@@ -62832,7 +62835,8 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
      | Nil -> ("", yld, ids, outs)
      | Cons (VInt n, t) -> go t n evt prev yld ids outs
      | Cons (VSym s, t) ->
-       if str_eq s "RUBY_EVENT_LINE" then go t line 1 prev yld ids outs
+       if str_eq s "RUBY_EVENT_LINE" then go t line (if evt % 2 == 1 then evt else evt + 1) prev yld ids outs
+       else if str_eq s "RUBY_EVENT_RESCUE" then go t line (if evt >= 4 then evt else evt + 4) prev yld ids outs
        else if str_len s > 6 && str_eq (substring s 0 6) "label_" then go t line evt (0 - 1) yld ids outs
        else go t line evt prev yld ids outs
      | Cons (VArr iid, t) ->
@@ -62891,9 +62895,9 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
         //  the compiler put in it, and a branch past a copy lands inside
         //  the next piece)
         let _ = (if str_eq w2 "" && (k == 1 || k == 2) && e9 > s9 && e9 <= vec_len ev then
-                   (let _ = vec_set ev s9 (vec_get ev s9 % 2 + 2) in
-                    map_iter labels (fn (ln9: str) -> fn (li: int) ->
-                      if li > s9 && li < e9 then vec_set ev li (vec_get ev li % 2 + 2) else ()))
+                   (let mark = fn (i: int) -> (let e0 = vec_get ev i in if (e0 / 2) % 2 == 1 then () else vec_set ev i (e0 + 2)) in
+                    let _ = mark s9 in
+                    map_iter labels (fn (ln9: str) -> fn (li: int) -> if li > s9 && li < e9 then mark li else ()))
                  else ()) in
         let (w3, y3, ids3, outs3, rest) = cgo t w2 (yld || cy) (vm_iapp cids ids) (lift couts outs) in
         (w3, y3, ids3, outs3, Cons ((k, cid, s9, e9, c9, sp), rest)))) in
@@ -62925,11 +62929,18 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   //  or a class body: the file and that statement.)
   let rec pro = fn (ds: (str * Expr) list) ->
     (match ds with
-     | Nil -> Cons (SFile pth, Cons (SLine (0 - line0), Cons (SVm (id, gen), Nil)))
+     | Nil -> Cons (SLine (0 - line0), Cons (SFile pth, Cons (SVm (id, gen), Nil)))
      | Cons ((k, d), t) ->
        (let n = (if str_len k > 1 && str_eq (char_at k (str_len k - 1)) ":" then substring k 0 (str_len k - 1) else k) in
         Cons (SIf (Cons ((EMethod (EVar n, "nil?", Nil), Cons (SAssign (n, d), Nil)), Nil), Nil), pro t))) in
-  let bb = (if kind == 1 then pro defs else Cons (SFile pth, Cons (SVm (id, gen), Nil))) in
+  // (...led by the line its `end` is on, as a parsed class body is -- a
+  //  TracePoint's :end and :return are there: class_end_line, vm_define)
+  let endl = (match vm_nth top 4 with
+              | VHsh m -> (match vm_hget (hderef m) "code_location" with
+                           | VArr c -> (match vm_nth (deref c) 2 with VInt n -> n | _ -> line0)
+                           | _ -> line0)
+              | _ -> line0) in
+  let bb = (if kind == 1 then pro defs else Cons (SLineQ (0 - endl), Cons (SFile pth, Cons (SVm (id, gen), Nil)))) in
   // (a rescue or an ensure sequence's one local is its `$!`: the name the
   //  frame holds it under goes where a sequence's optional names go)
   let optn = (if kind == 4 || kind == 5 then Cons (vm_lname locs 0 depth, (Nil : str list)) else optn) in
@@ -62947,14 +62958,10 @@ and vm_has_sym = fn (ls: Val list) -> fn (n: str) ->
 and vm_load = fn (a: Val) ->
   let top = (match a with VArr id -> deref id | _ -> Nil) in
   let why0 =
-    // (a TracePoint's line / call / c_call events are not fired from here yet,
-    //  and Coverage's counts are not kept)
-    (if map_len hook_flags > 0 && map_has hook_flags "tp" then "a sequence while a TracePoint is on"
-     else if vec_get cov_st 0 != 0 then "a sequence while Coverage is on"
-     // (--debug=frozen-string-literal records where each literal was made,
-     //  and the command line's frozen-string-literal flags are not among the
-     //  options the sequence was compiled under)
-     else if map_has cli_opt "dbg_fsl" then "a sequence under --debug=frozen-string-literal"
+    // (--debug=frozen-string-literal records where each literal was made,
+    //  and the command line's frozen-string-literal flags are not among the
+    //  options the sequence was compiled under)
+    (if map_has cli_opt "dbg_fsl" then "a sequence under --debug=frozen-string-literal"
      else if map_len cli_fsl > 0 then "a sequence under a frozen-string-literal command-line flag"
      else if (match vm_nth top 9 with VSym t -> str_eq t "top" | _ -> false) then ""
      else "a sequence that is not a top-level one") in
@@ -62969,8 +62976,36 @@ and vm_load = fn (a: Val) ->
            | Nil -> false
            | Cons (k, t) -> (let (_, _, kd, _, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta k in kd == 2 || has_meth t)) in
         let _ = (if has_meth ids then map_set vm_keep (0 - 1 - id) VNil else ()) in
-        let _ = map_set vm_keep id a in ("", id))
+        let _ = map_set vm_keep id a in
+        // (while Coverage is set up, the sequence is covered as a file read
+        //  then is: its length -- where its code ends -- and each line a
+        //  line event is on, as cov_begin and cov_note keep a parsed file's)
+        let _ = (if vec_get cov_st 0 > 0 then vm_cov_note top ids else ()) in
+        ("", id))
      else (let _ = vm_free_all ids in (why, 0 - 1)))
+and vm_cov_note = fn (top: Val list) -> fn (ids: int list) ->
+  let pth = (match vm_nth top 6 with VStr h -> sget h | _ -> "") in
+  let last = (match vm_nth top 4 with
+              | VHsh m -> (match vm_hget (hderef m) "code_location" with
+                           | VArr c -> (match vm_nth (deref c) 2 with VInt n -> n | _ -> 0)
+                           | _ -> 0)
+              | _ -> 0) in
+  let _ = (if map_has cov_tab ("F:" ++ pth) then () else map_set cov_tab ("F:" ++ pth) last) in
+  let rec each = fn (xs: int list) ->
+    (match xs with
+     | Nil -> ()
+     | Cons (id, t) ->
+       (let (_, _, _, _, _, _, ln, ev) = vec_get vm_code id in
+        let rec lines = fn (i: int) ->
+          (if i >= vec_len ev then ()
+           else (let _ = (if vec_get ev i % 2 == 1 && vec_get ln i > 0 then
+                            (let k = "L:" ++ pth ++ chr 1 ++ str_of_int (vec_get ln i) in
+                             if map_has cov_tab k then () else map_set cov_tab k 0)
+                          else ()) in
+                 lines (i + 1))) in
+        let _ = lines 0 in
+        each t)) in
+  each ids
 // a loaded tree given back: its programs and the Array that roots their
 // operands
 and vm_unload = fn (id: int) ->
@@ -62978,6 +63013,17 @@ and vm_unload = fn (id: int) ->
   let _ = vm_free_all kids in
   let _ = vm_free id in
   if map_has vm_keep id then map_delete vm_keep id else ()
+// where a body the VM runs was written -- (path, line) -- and ("", 0) for a
+// body that is not one
+and vm_body_pos = fn (body: Stmt list) ->
+  let rec go = fn (ss: Stmt list) -> fn (line: int) -> fn (path: str) ->
+    (match ss with
+     | Nil -> ("", 0)
+     | Cons (SVm (_, _), _) -> (path, line)
+     | Cons (SLine n, t) -> go t (if n < 0 then 0 - n else n) path
+     | Cons (SFile f, t) -> go t line f
+     | Cons (_, t) -> go t line path) in
+  go body 0 ""
 // whether the program, or a block in it, yields (bare_yield_stmt: the
 // method's block is kept for a block that does)
 and vm_yields = fn (id: int) ->
@@ -63123,7 +63169,9 @@ and vm_argl = fn env -> fn (fl: int) -> fn (argc: int) -> fn (kws: Val list) -> 
               let x = (if kwsp && i == argc - 1 then EKwSplat (EVar k)
                        else if splat && i == argc - 1 - (if kwsp then 1 else 0) then ESplat (EVar k)
                        else EVar k) in
-              Cons (x, pos t (i + 1))))) in
+              // (`**nil` -- what ruby compiles `**{}` to as well -- passes nothing)
+              if kwsp && i == argc - 1 && (match v with VNil -> true | _ -> false) then pos t (i + 1)
+              else Cons (x, pos t (i + 1))))) in
   let rec kwp = fn (ks: Val list) -> fn (xs: Val list) -> fn (i: int) ->
     (match ks with
      | Cons (VSym kn, kt) ->
@@ -63202,14 +63250,15 @@ and vm_send = fn env -> fn world -> fn blk -> fn st -> fn (mid: str) -> fn (fl: 
   // core#hash_merge_ptr(h, k, v, ...) and core#hash_merge_kwd(h, kw): the
   // Hash a literal with `**` in it is built as -- `{**h, k => v}`, `{**h,
   // **kw}` -- which the evaluator's EHsh builds (the `**` operand converted
-  // by #to_hash, nil nothing)
+  // by #to_hash, nil nothing; a `**` among a literal's items is the
+  // parser's pair of EKwSplat, which keeps the items in twos)
   else if str_eq mid "core#hash_merge_ptr" then
     vm_push st (vm_eval env world blk args (fn (es: Expr list) ->
-                  (match es with Cons (h, t) -> EHsh (Cons (EKwSplat h, t)) | Nil -> EHsh Nil)))
+                  (match es with Cons (h, t) -> EHsh (Cons (EKwSplat h, Cons (EKwSplat h, t))) | Nil -> EHsh Nil)))
   else if str_eq mid "core#hash_merge_kwd" then
     vm_push st (vm_eval env world blk args (fn (es: Expr list) ->
                   (match es with
-                   | Cons (h, Cons (k, Nil)) -> EHsh (Cons (EKwSplat h, Cons (EKwSplat k, Nil)))
+                   | Cons (h, Cons (k, Nil)) -> EHsh (Cons (EKwSplat h, Cons (EKwSplat h, Cons (EKwSplat k, Cons (EKwSplat k, Nil)))))
                    | _ -> EHsh Nil)))
   else vm_push st (vm_call env world blk recv mid fl argc kws args bid)
 // whether a parameter's value is "not given" (EVmArg's)
@@ -63224,6 +63273,12 @@ and vm_unset = fn (v: Val) ->
 // The parameters are the sequence's as the evaluator binds them (vm_params).
 and vm_define = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: str) -> fn (a: int) -> fn (cid: int) ->
   let (_, _, _, _, _, _, _, _, bp, bb, _, _, defs, _) = vec_get vm_meta cid in
+  // (where the def's `end` is, by its name and line, as the parser notes
+  //  it for stamp_meth_src: a :return event is on that line)
+  let _ = (if o == 61 then ()
+           else (match bb with
+                 | Cons (SLineQ el, _) when el < 0 -> map_set def_end_lines (n ++ ":" ++ str_of_int (cur_line ())) (VInt (0 - el))
+                 | _ -> ())) in
   if o == 59 then (let _ = exec_stmt env world blk (SDef (n, bp, defs, bb)) in ())
   else if o == 60 then
     (let recv = vm_pop st in
@@ -63323,6 +63378,12 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
               let _ = fb_wm_stmt () in
               gc_point_finalizers world)
            else ()) in
+  // the events ruby put on the instruction: a line is Coverage's count and
+  // a TracePoint's :line, and a rescue clause's first instruction its
+  // :rescue. A hook runs Ruby: what the stack holds is rooted first.
+  let _ = (if vec_get ev pc == 0 then ()
+           else if vec_get cov_st 0 != 2 && (if map_len hook_flags > 0 && map_has hook_flags "tp" then false else true) then ()
+           else (let _ = vm_root env st (vec_get regs 0) in vm_events env world (vec_get ev pc) (vec_get ln pc))) in
   let n = vec_get na pc in
   let a = vec_get ia pc in
   let _ = (if o == 11 || o == 12 || (o >= 22 && o <= 45) || o == 55 || (o >= 59 && o <= 64)
@@ -63365,6 +63426,27 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
                  vm_push st (vm_ev env world blk (ELambda (bp, bb))))
               else vm_value_op env world blk st o n a (vec_get ib pc) (vec_get ov pc)) in
      pc + 1)
+// (the method an event names, as the evaluator's :line names it: the frame's
+//  method and its class; none at the top level or in a class body)
+and vm_events = fn env -> fn world -> fn (e: int) -> fn (line: int) ->
+  let tp = map_len hook_flags > 0 && map_has hook_flags "tp"
+           && (let f9 = cur_file () in if str_len f9 > 10 && str_eq (substring f9 0 10) "<internal:" then false else true) in
+  let self9 = fn (u: unit) -> (if lv_has env "self" then lv_get env "self" else VMain) in
+  let _ = (if e % 2 == 1 then
+             (let _ = cov_line line in
+              if tp then
+                (let m9 = (if lv_has env "__meth" then (match lv_get env "__meth" with VStr h9 -> sget h9 | _ -> "") else "") in
+                 let c9 = (if str_eq m9 "" || str_eq (substring m9 0 1) "<" then ""
+                           else if lv_has env "__defcls" then (match lv_get env "__defcls" with VClass c8 -> c8 | _ -> "")
+                           else "Object") in
+                 let _ = tp_env_set env in
+                 let _ = fire_tp_v world "line" (if str_eq c9 "" then "" else m9) c9 VNil (self9 ()) in ())
+              else ())
+           else ()) in
+  if e >= 4 && tp then
+    (let _ = tp_env_set env in
+     let _ = fire_tp_v world "rescue" "" "" (if map_has globals "!" then map_get globals "!" else VNil) (self9 ()) in ())
+  else ()
 and vm_stack_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: str) -> fn (a: int) -> fn (v: Val) ->
   if o == 0 then ()
   else if o == 1 then vm_push st VNil
@@ -63504,7 +63586,9 @@ and vm_checkmatch = fn env -> fn world -> fn blk -> fn st -> fn (f: int) ->
   let one = fn (p: Val) ->
     (if ty == 3 then
        (match p with
-        | VClass c -> rescue_matches_eqq env world blk tgt (Cons (c, Nil))
+        // (under a TracePoint the class asked is Module#===, a :c_call)
+        | VClass c -> if map_len hook_flags > 0 && map_has hook_flags "tp" then tp_rescue_match env world blk tgt (Cons (c, Nil))
+                      else rescue_matches_eqq env world blk tgt (Cons (c, Nil))
         | _ -> (let _ = raise_exc world "TypeError" "class or module required for rescue clause" in false))
      else if ty == 2 then
        truthy (vm_eval env world blk (Cons (p, Cons (tgt, Nil))) (fn (es: Expr list) -> EBin ("===", vm_nth_e es 0, vm_nth_e es 1)))
@@ -63697,7 +63781,7 @@ and vm_loop = fn env -> fn world -> fn blk -> fn cd -> fn (ct: (int * int * int 
      else pc)
   else
     (let (_, _, _, _, _, _, _, ev) = cd in
-     let k = (if vec_get ev pc >= 2 then vm_region_at ct pc act else 0 - 1) in
+     let k = (if (vec_get ev pc / 2) % 2 == 1 then vm_region_at ct pc act else 0 - 1) in
      if k >= 0 then vm_loop env world blk cd ct st (vm_region env world blk cd ct st k pc act) lo hi act
      else (let nx = region VMI { vm_step env world blk cd st pc } in vm_loop env world blk cd ct st nx lo hi act))
 // A program run in the frame `env`: the value it leaves and how it left

@@ -1170,6 +1170,10 @@ class RubyVM::InstructionSequence
       #  element as `|x|` does: ambiguous_param0.)
       case b.parameters
       when Prism::NumberedParametersNode
+        # (the parameters come first in the table, whatever the body named
+        #  before them)
+        nums = (1..b.parameters.maximum).map { |i| :"_#{i}" }
+        child.locals.replace(nums + (child.locals - nums))
         child.params[:lead_num] = b.parameters.maximum
         child.params[:ambiguous_param0] = true if b.parameters.maximum == 1
       when Prism::ItParametersNode
