@@ -542,7 +542,6 @@
 #define HAVE_DLOPEN 1
 #define HAVE_DUP 1
 #define HAVE_DUP2 1
-#define HAVE_DUP3 1
 #define HAVE_ENDGRENT 1
 #define HAVE_ERF 1
 #define HAVE_EXECL 1
@@ -625,7 +624,6 @@
 #define HAVE_OPENAT 1
 #define HAVE_PCLOSE 1
 #define HAVE_PIPE 1
-#define HAVE_PIPE2 1
 #define HAVE_POLL 1
 #define HAVE_POPEN 1
 #define HAVE_POSIX_MADVISE 1
@@ -720,6 +718,10 @@
 # define BROKEN_CRYPT 1
 # define vfork fork
 #else
+/* (dup3 and pipe2 are in newer macOS releases too, and not in the ones
+ *  before them: said for Linux alone, where every release has them) */
+#define HAVE_DUP3 1
+#define HAVE_PIPE2 1
 #define HAVE_ACCEPT4 1
 #define HAVE_CLOCK_NANOSLEEP 1
 #define HAVE_CLOSEFROM 1
