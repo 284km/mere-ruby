@@ -84,6 +84,10 @@ for side,binary in [('reference',REF),('mere',MERE)]:
         if side=='mere':libs+=[str(WT/'unittest/shim'),stdlib]
         env.update(RUBY=str(binary),UNITTEST_CHILD_RUBY=str(binary),UNITTEST_TEST_FILE=str(file.relative_to(SRC/'test')) if name not in ['contracts','stress'] else '',PATH=str(WT/'unittest/child-bin')+os.pathsep+env['PATH'],RUBYLIB=os.pathsep.join(libs),LOADER_LIB=str(lib))
         if side=='mere':env['MERE_LOADER_TEST']='1'
+        # (a collection at every safepoint: the contracts need only their own library;
+        #  with the standard library on the path a refused require goes on through
+        #  RubyGems' search, which is minutes under that load)
+        if name=='stress':env['RUBYLIB']=str(lib)
         env.update(extra)
         cmd=[str(binary)]
         if name not in ['contracts','stress']:cmd+=['-r','test/unit','-r',str(WT/'unittest/bootstrap.rb')]

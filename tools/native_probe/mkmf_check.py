@@ -130,6 +130,10 @@ for side, binary in [('reference', REF), ('mere', MERE)]:
     ]:
         if side == 'reference' and name.endswith('-stress'): continue
         e = dict(env, **extra)
+        # A collection at every safepoint: the contracts need only their own
+        # library. With the standard library on the path, a require that is
+        # refused goes on through RubyGems' search, which is minutes here.
+        if name.endswith('-stress'): e['RUBYLIB'] = str(lib)
         args = ['-r', 'test/unit', '-r', str(WT/'unittest/bootstrap.rb')] if name == 'nextafter' else []
         run(name+'.'+side, [binary, *args, file, *(['-v', '--seed=1'] if name == 'nextafter' else [])], e, work, expected)
     run('mkmf-global.'+side,

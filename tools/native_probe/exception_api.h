@@ -47,6 +47,7 @@ extern int mr_native_resources(void);
 extern int mr_native_depth(void);
 extern int mr_native_ensures(void);
 extern int mr_typed_load(const char*);
+extern int mr_typed_probe(const char*);
 extern char* mr_typed_error(void);
 extern int mr_typed_find(const char*);
 extern char* mr_typed_class_name(int);

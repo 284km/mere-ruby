@@ -141,6 +141,19 @@ int mr_typed_load(const char *path) {
     int i=library_count++; strcpy(libraries[i].path,path);
     libraries[i].handle=handle; libraries[i].init=init; return 1000000+i;
 }
+/* Is this file an extension compiled against this interpreter's header?
+ * `require` asks before it takes a .bundle / .so for the feature: one built
+ * for another ruby is not a candidate at all, and the search goes on to
+ * whatever provided the feature before (a .rb, the shipped library). */
+int mr_typed_probe(const char *path) {
+    for(int i=0;i<library_count;i++) if(!strcmp(libraries[i].path,path)) return 1;
+    void *handle=dlopen(path,RTLD_LAZY|RTLD_LOCAL);
+    if(!handle) return 0;
+    const unsigned *abi=(const unsigned *)dlsym(handle,"mere_extension_abi");
+    int ours=abi && *abi==0x4d520002U;
+    dlclose(handle);
+    return ours;
+}
 int mr_typed_loader_stat(int field) {
     if(field==0) return library_count;
     if(field==1) return open_failures;
