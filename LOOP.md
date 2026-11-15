@@ -5215,11 +5215,22 @@ different.
 
 The second half of stage 5's second part (note 550 §1, note 551). test_ast
 was 92 RED of 2,664 (main's CI run 43548292351): `parse` answered a SCOPE with
-no children. Here it gives the same result as the reference -- 2,664 tests,
-2,633,172 assertions, no failure, no error, the same 13 skips -- and the file
-costs 1.345 times the instructions it did (3.208e12 -> 4.315e12, `time -l`),
-which from the baseline's 414 s on CI is about 557 s of the 600 it has. Peak
-RSS 1.85 GB -> 1.79 GB here. corpus 660 (658 and 659 are the VM rounds', #85).
+no children. With this it gives the reference's result here -- 2,664 tests,
+2,633,172 assertions, no failure, no error, the same 13 skips. corpus 660
+(658 and 659 are the VM rounds', #85).
+
+**It does not fit CI's 600 s yet, and is not merged.** CI run 43711089264
+stopped the file at 623.9 s (WALL_LIMIT, 2,416 of its tests named), which
+reads as 0 MATCH where the baseline has 2,559. From that run's log, for all
+850 files: test_all_tokens about 360 s, the two walks over real trees
+(test_ranges, test_not_cared) about 280 s that were 4 s, the rest 26 s --
+about 670 s on a runner that was a tenth faster than the baseline's. The
+estimate made here from instruction counts (1.345 times the baseline's, so
+557 s) was wrong: on the runner the token test took the same time as before
+although it executes 0.85 of the instructions. Since then the walks are 18%
+cheaper (the two fast paths below, measured under test/unit: 141.7e9 ->
+116.6e9 instructions for 200 files), which is about 616 s on that runner.
+What is left to take off, and where it is, is the last item.
 
 - **The tree is made from Prism's, in Mere.** libprism's serialized bytes are
   decoded into flat integer tables (m_prism_dec.mere), translated to
@@ -5278,18 +5289,46 @@ RSS 1.85 GB -> 1.79 GB here. corpus 660 (658 and 659 are the VM rounds', #85).
     where it is, with no frame (2.6 µs -> 1.7 µs). ruby's is a C function
     too. A TracePoint, set_trace_func, Coverage's method table, a Ractor or
     a block given take the full path.
-- **Where the rest of the time is** (note 551 §5): collection is about 18%
-  of the file, and three fifths of one collection is the runtime walking the
-  running stack for pointers into arenas (`__lang_coro_pins`,
-  `__lang_coro_scan_ints`) -- deep under test/unit, deeper in a recursive
-  walk; interning a block's body compares the whole tree each time a block
-  becomes a Proc (6.7% of test_all_tokens: assert_equal's message is thirty
-  lines); the rest is the fixed cost of a call. None of it is touched here.
+- **Two fast paths for the walks' own code** (after the CI run above), each
+  where ruby has a C function or nothing to look at:
+  - *An attribute read is answered at the dispatcher's door.* `obj.name`
+    with no argument went the whole way a call goes -- the tests by name,
+    the ancestor walk, the visibility walk -- before run_meth_result's arm
+    read the slot: 12,900 instructions. The first time, for a class directly
+    under Object, the whole way is gone and what it ended at is kept under
+    the lookup generation and the count of private / protected marks
+    (attr_ic in m_state.mere); after that it is 3,300. Both doors, with a
+    receiver (invoke_val_c) and without (try_self_call).
+    `MERE_RUBY_ATTR_IC_CHECK=1` asks the dispatcher every time as well and
+    stops on a different answer.
+  - *A method that only stores its arguments runs with no frame*
+    (`def initialize(a, b); @a = a; @b = b; end`): `Point.new(1, 2)` 62,800
+    -> 38,100 instructions.
+  The walk benchmark (200 files, both walks and the parse): 167.7e9 ->
+  135.5e9 instructions. corpus 661 holds what can change an answer after
+  the short way was learnt -- it caught the cache learning a `super` from a
+  prepended module's method as the call itself: learning stops as soon as
+  any method or block body starts to run. The corpus is 690 of 690 with
+  the check on.
+- **Where the rest of the time is** (note 551 §5), none of it touched here:
+  - collection: 30% of an allocation loop, 20% of an assertion loop, a
+    quarter of the walks. Three fifths of one collection is the runtime
+    gathering and sorting the suspended stack's words (`__lang_coro_pins`,
+    `__lang_coro_scan_ints`) -- deep under test/unit, deeper in a recursive
+    walk -- and a small live set collects every 4,000 entries. Raising that
+    floor to 32,000 in a local build (not in this PR: the collector's
+    constants are not this round's to change) took another 11% of the
+    walks' instructions and nothing off the token test;
+  - interning a block's body compares the whole tree each time a block
+    becomes a Proc: 6.7% of test_all_tokens (assert_equal's message is
+    thirty lines);
+  - the fixed cost of a call into a builtin (12,000 instructions for
+    `array.last`) and of a method call (25,000).
 - **Also**: a Symbol literal keeps the encoding it was written into
   (`:"r\u{e9}sum\u{e9}"` in a US-ASCII file is UTF-8 -- test_struct.rb and
   test_data.rb could not be read); `AbstractSyntaxTree.of` answers nil for an
   attribute method; tools/ast_dump lost its development stubs. Kernel#pp of
   a Node before pp.rb is loaded still prints `#inspect` (ruby loads pp.rb on
   the first `pp`).
-- Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 898 of 1024 (was
+- Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 902 of 1024 (was
   873: the translation's tables are top-level values).

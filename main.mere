@@ -9047,6 +9047,9 @@ and blk_head_pos = fn (body: Stmt list) ->
 // method the block was WRITTEN in as method_id (blocks the prelude writes
 // stand where ruby's C does, and report nothing).
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
+  // (a block's body is about to run: the attribute reader cache learns
+  //  nothing from what it calls -- see run_meth_result)
+  let _ = (if vec_get attr_ic_st 3 == 1 then vec_set attr_ic_st 3 0 else ()) in
   if vec_get atr_on 0 > 0 then run_block_atr world encl theblk argvals
   else run_block1 world encl theblk argvals
 and run_block1 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
@@ -15145,7 +15148,111 @@ and native_empty_object_constructor = fn world -> fn (cls: str) -> fn (vischeck:
   && (let (methods, _, _, _) = world in not (map_has methods (cls ++ "#initialize")))
   && not (has_meth world "Object" "initialize")
   && native_plain_object_constructor world cls vischeck
+// The attribute reader cache, at the dispatcher's door (what it is and what
+// its token means: attr_ic in m_state.mere).
+// (the token an entry is good under)
+and attr_ic_tok_now = fn (u: unit) -> mro_now () * 1048576 + vec_get attr_ic_st 0 % 1048576
+// (may a call `obj.name`, no argument, be answered by the cache or teach it?
+//  Not with a block; not while a TracePoint, set_trace_func, Coverage's
+//  method table, a Ractor, a moved object, Marshal's core-only mode or a
+//  builtin's Method that skips overrides is at work -- each takes the call
+//  another way; not a name a refinement defines, since which refinement is
+//  active depends on where the call is written; and only an object of a
+//  named class directly under Object, whose calls nothing builtin stands
+//  in front of)
+and attr_ic_plain = fn blk -> fn (cls: str) -> fn (name0: str) ->
+  (match blk with (true, _, _, _) -> false | _ -> true)
+  && vec_get cov_st 0 != 2 && vec_get moved_on 0 == 0 && vec_get core_only 0 == 0
+  && (if map_len hook_flags == 0 then true
+      else if map_has hook_flags "tp" || map_has hook_flags "stf" then false else true)
+  && map_len ractor_thr == 0 && map_len bi_skip == 0 && map_len bm_bypass == 0
+  && mro_cache_on ()
+  && (if refinement_method_possible name0 then false else true)
+  && (if mro_local_name cls || is_sng_cls cls then false else true)
+  // (a class written with no superclass has no entry: it is under Object,
+  //  unless its name is one of the interpreter's own classes)
+  && (if map_has cls_sup cls then str_eq (map_get cls_sup cls) "Object"
+      else (if builtin_cls_name cls then false else true))
+  && (if map_has modules cls || map_has prim_sub cls || map_has prim_copy cls
+         || map_has cls_copy_of cls || map_has struct_mem cls then false else true)
+and attr_ic_checking = fn (u: unit) ->
+  if vec_get attr_ic_st 2 >= 0 then vec_get attr_ic_st 2 == 1
+  else (let on9 = (if str_eq (env_get "MERE_RUBY_ATTR_IC_CHECK") "" then 0 else 1) in
+        let _ = vec_set attr_ic_st 2 on9 in
+        on9 == 1)
+// (MERE_RUBY_ATTR_IC_CHECK=1: the dispatcher is asked too, and has to
+//  answer the very object the cache did)
+and attr_ic_same = fn (recv0: Val) -> fn (name0: str) -> fn (r9: Val) -> fn (v9: Val) ->
+  if rb_identical r9 v9 then v9
+  else (let _ = print_err ("mere-ruby: attr_ic: the cache and the dispatcher disagree on " ++ class_name recv0 ++ "#" ++ name0 ++ "\n") in
+        fail "mere-ruby: attr_ic mismatch")
+// The cache asked about `obj.name` (no argument; `vischeck`: written with a
+// receiver). Answers in attr_ic_st 1 -- 1: the value returned is the answer;
+// 2: no entry under today's token, so the caller goes the whole way between
+// attr_ic_arm and attr_ic_store; 0: not a call for the cache, or a name it
+// knows is no attribute reader.
+and attr_ic_ask = fn world -> fn blk -> fn (oid9: int) -> fn (name0: str) -> fn (vischeck: bool) ->
+  let (_, _, ocl9, iv9) = world in
+  let cls9 = (if map_has ocl9 oid9 then map_get ocl9 oid9 else "") in
+  if (if attr_ic_plain blk cls9 name0 then false else true) then (let _ = vec_set attr_ic_st 1 0 in VNil)
+  else
+    (let k9 = (if vischeck then cls9 ++ "#" ++ name0 else cls9 ++ "#" ++ name0 ++ "!") in
+     if map_has attr_ic_tok k9 && map_get attr_ic_tok k9 == attr_ic_tok_now () then
+       (let ivn9 = map_get attr_ic k9 in
+        if str_len ivn9 == 0 then (let _ = vec_set attr_ic_st 1 0 in VNil)
+        else
+          (let ik9 = str_of_int oid9 ++ "@" ++ ivn9 in
+           let _ = vec_set attr_ic_st 1 1 in
+           if map_has iv9 ik9 then map_get iv9 ik9 else VNil))
+     else (let _ = vec_set attr_ic_st 1 2 in VNil))
+// (before the whole way is gone for a call the cache has no entry for: the
+//  fast arm of run_meth_result is told which call is being asked about. A
+//  name Object answers natively is not asked about -- the builtin in front
+//  of a program's method of that name may do more than call it -- and is
+//  kept as no reader. Answers the token to hand to attr_ic_store.)
+and attr_ic_arm = fn (oid9: int) -> fn (name0: str) ->
+  let tok9 = attr_ic_tok_now () in
+  let _ = (if builtin_owns_here "Object" name0 || builtin_owns_here "Kernel" name0 || builtin_owns_here "BasicObject" name0
+           then vec_set attr_ic_st 3 0
+           else (let _ = vec_set attr_ic_st 4 oid9 in
+                 let _ = vec_set attr_ic_note 0 name0 in
+                 vec_set attr_ic_st 3 1)) in
+  tok9
+// (...and after it: what the call turned out to be is kept under the token
+//  -- the instance variable, when the fast arm answered this very call, the
+//  reader is the class's own and it is public or the call asks nothing
+//  about that; "" otherwise -- unless what decides a call changed while it
+//  ran)
+and attr_ic_store = fn world -> fn (oid9: int) -> fn (name0: str) -> fn (vischeck: bool) -> fn (tok9: int) ->
+  let got9 = vec_get attr_ic_st 3 == 2 && vec_get attr_ic_st 4 == oid9 in
+  let _ = vec_set attr_ic_st 3 0 in
+  if attr_ic_tok_now () == tok9 then
+    (let (mt9, _, ocl9, _) = world in
+     let cls9 = (if map_has ocl9 oid9 then map_get ocl9 oid9 else "") in
+     let k9 = (if vischeck then cls9 ++ "#" ++ name0 else cls9 ++ "#" ++ name0 ++ "!") in
+     let ivn9 = (if got9 && map_has mt9 (cls9 ++ "#" ++ name0)
+                    && (if vischeck
+                        then (if meth_private world cls9 name0 || meth_protected world cls9 name0 then false else true)
+                        else true)
+                 then vec_get attr_ic_note 1 else "") in
+     let _ = map_set attr_ic k9 ivn9 in
+     map_set attr_ic_tok k9 tok9)
+  else ()
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
+  match recv0 with
+  | VObj oid9 when (match args0 with Nil -> true | _ -> false) ->
+    (let v9 = attr_ic_ask world blk oid9 name0 vischeck in
+     let st9 = vec_get attr_ic_st 1 in
+     if st9 == 1 then
+       (if attr_ic_checking () then attr_ic_same recv0 name0 (invoke_val_c1 env world blk recv0 name0 Nil vischeck) v9 else v9)
+     else if st9 == 2 then
+       (let tok9 = attr_ic_arm oid9 name0 in
+        let r9 = invoke_val_c1 env world blk recv0 name0 Nil vischeck in
+        let _ = attr_ic_store world oid9 name0 vischeck tok9 in
+        r9)
+     else invoke_val_c1 env world blk recv0 name0 args0 vischeck)
+  | _ -> invoke_val_c1 env world blk recv0 name0 args0 vischeck
+and invoke_val_c1 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
   let _ = (if vec_get moved_on 0 == 1 then moved_guard world recv0 name0 args0 else VNil) in
   // Plain Module.new reaches this door, while an explicit &nil reaches the
   // with-block door. Both use the same proof for an unobserved allocation.
@@ -46680,7 +46787,27 @@ and self_defines = fn env -> fn world -> fn (name: str) ->
      | _ -> false)
   else false
 
+// (a call written with no receiver and no argument, of an object: the
+//  attribute reader cache is asked first -- attr_ic, "!" keys)
 and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) ->
+  match args with
+  | Nil ->
+    (match (if lv_has env "self" then lv_get env "self" else VMain) with
+     | VObj oid9 ->
+       (let slf9 = VObj oid9 in
+        let v9 = attr_ic_ask world (false, (Nil : str list), (Nil : Stmt list), env) oid9 name false in
+        let st9 = vec_get attr_ic_st 1 in
+        if st9 == 1 then
+          (if attr_ic_checking () then attr_ic_same slf9 name (try_self_call1 env world blame name Nil) v9 else v9)
+        else if st9 == 2 then
+          (let tok9 = attr_ic_arm oid9 name in
+           let r9 = try_self_call1 env world blame name Nil in
+           let _ = attr_ic_store world oid9 name false tok9 in
+           r9)
+        else try_self_call1 env world blame name args)
+     | _ -> try_self_call1 env world blame name args)
+  | _ -> try_self_call1 env world blame name args
+and try_self_call1 = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let blamed = fn (v: Val) -> (match blame with VNil -> v | b -> b) in
@@ -47546,6 +47673,50 @@ and super_next_plain = fn world -> fn env -> fn (recv: Val) -> fn (defcls: str) 
 and idx_in9 = fn (xs: str list) -> fn (x: str) ->
   let rec go = fn (ys: str list) -> fn (i: int) -> (match ys with Nil -> 0 - 1 | Cons (h, t) -> (if str_eq h x then i else go t (i + 1))) in
   go xs 0
+// (is `body` nothing but `@ivar = parameter` statements, with the line and
+//  file marks between them? `seen`: one was met. A class variable -- its
+//  name keeps the second "@" -- and `_`, which may be written twice in a
+//  parameter list, are not such statements.)
+and triv_store_body = fn (params: str list) -> fn (body: Stmt list) -> fn (seen: bool) ->
+  match body with
+  | Nil -> seen
+  | Cons (SIVarAssign (iv9, EVar p9), t9) ->
+    (if str_len iv9 > 0 && str_eq (char_at iv9 0) "@" then false else true)
+    && (if str_len p9 == 1 && str_eq p9 "_" then false else true)
+    && str_list_has params p9 && triv_store_body params t9 true
+  | Cons (SLine n9, t9) -> n9 >= 0 && triv_store_body params t9 seen
+  | Cons (SFile _, t9) -> triv_store_body params t9 seen
+  | _ -> false
+// (one argument for each parameter, every parameter a plain required one --
+//  no `*`, `&`, keyword, `(a, b)` or `...` -- and no Hash among the arguments)
+and triv_store_args = fn (params: str list) -> fn (args: Val list) ->
+  match params with
+  | Nil -> (match args with Nil -> true | _ -> false)
+  | Cons (p9, pt9) ->
+    (match args with
+     | Cons (a9, at9) ->
+       (let c9 = ord (char_at p9 0) in
+        str_len p9 > 0 && ((c9 >= 97 && c9 <= 122) || c9 == 95)
+        && (if str_eq (char_at p9 (str_len p9 - 1)) ":" then false else true)
+        && (match a9 with VHsh _ -> false | _ -> true)
+        && triv_store_args pt9 at9)
+     | Nil -> false)
+and triv_store_arg = fn (params: str list) -> fn (args: Val list) -> fn (p: str) ->
+  match params with
+  | Cons (p9, pt9) ->
+    (match args with
+     | Cons (a9, at9) -> (if str_eq p9 p then a9 else triv_store_arg pt9 at9 p)
+     | Nil -> VNil)
+  | Nil -> VNil
+and triv_store_run = fn world -> fn (recv: Val) -> fn (params: str list) -> fn (args: Val list) -> fn (body: Stmt list) -> fn (last: Val) ->
+  match body with
+  | Cons (SIVarAssign (iv9, EVar p9), t9) ->
+    (let (_, _, _, ivars9) = world in
+     let v9 = triv_store_arg params args p9 in
+     let _ = iv_put ivars9 (ivar_self_key recv iv9) v9 in
+     triv_store_run world recv params args t9 v9)
+  | Cons (_, t9) -> triv_store_run world recv params args t9 last
+  | Nil -> last
 and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (name: str) -> fn (m: Meth) -> fn (args: Val list) ->
   run_meth_result world blk recv defcls name m args false
 and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (name: str) -> fn (m: Meth) -> fn (args: Val list) -> fn (discard_result: bool) ->
@@ -47573,9 +47744,44 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
            && vec_get cov_st 0 != 2 && map_len ractor_thr == 0
            && (if str_len iv9 > 0 && str_eq (char_at iv9 0) "@" then false else true) ->
     (let (_, _, _, ivars9) = world in
+     // (the attribute reader cache is asking about this very call: attr_ic)
+     let _ = (if vec_get attr_ic_st 3 == 1 then
+                (match recv with
+                 | VObj o9 when o9 == vec_get attr_ic_st 4 && str_eq name (vec_get attr_ic_note 0) ->
+                   (let _ = vec_set attr_ic_note 1 iv9 in vec_set attr_ic_st 3 2)
+                 | _ -> ())
+              else ()) in
      let k9 = ivar_self_key recv iv9 in
      if (if str_eq k9 "" then false else true) && map_has ivars9 k9 then map_get ivars9 k9 else VNil)
+  // A method that only stores its arguments -- `def initialize(a, b); @a = a;
+  // @b = b; end`, `def x=(v); @x = v; end` -- called with exactly that many,
+  // of an object that is not frozen: the instance variables are written
+  // where they are, through iv_put as every write is, and the last value is
+  // the answer. ruby makes a frame for it; nothing in such a body can look
+  // at one (no call, no block, no local but the parameters), so there is
+  // none here, and with it go the frame from the pool, the side tables
+  // asked by "Class#name" and the parameter binding -- 25,000 instructions
+  // of the 63,000 a `Point.new(1, 2)` was. A block given, a TracePoint,
+  // set_trace_func, Coverage, a Ractor, a Hash among the arguments (which
+  // may be keywords: bind_params decides) or a frozen receiver (the
+  // FrozenError is the statement's) take the full path.
+  | Meth (params, Nil, body)
+      when (match recv with VObj _ -> true | _ -> false)
+           && (match blk with (true, _, _, _) -> false | _ -> true)
+           && triv_store_body params body false
+           && (if map_len hook_flags == 0 then true
+               else if map_has hook_flags "tp" || map_has hook_flags "stf" then false else true)
+           && vec_get cov_st 0 == 0 && map_len ractor_thr == 0
+           && triv_store_args params args
+           && (if val_frozen_mut recv then false else true) ->
+    triv_store_run world recv params args body VNil
   | Meth (params, defaults, body) ->
+    // (a method body is about to run: whatever attribute read comes next is
+    //  not the call the attribute reader cache was asking about -- it is one
+    //  this body makes, a `super` from a prepended module's method of the
+    //  same name included. The cache learns only from a call that reached
+    //  the fast arm above with nothing run in between.)
+    let _ = (if vec_get attr_ic_st 3 == 1 then vec_set attr_ic_st 3 0 else ()) in
     // ⚠ ONE key for the whole body. `defcls ++ "#" ++ name` is how six
     // different side tables are addressed here (dm_captured, dm_closenv,
     // dm_had_blk, alias_origin, alias_srcname, meth_cref) and it was rebuilt
