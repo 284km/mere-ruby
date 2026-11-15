@@ -54,6 +54,33 @@ module Prism
     def initialize(source, serialized)
       super
       @io = ByteReader.new(serialized)
+      @__serialized = serialized
+    end
+
+    # The node tree is built by the interpreter itself, from the same bytes
+    # at the same position (Prism.__prism_load_node, m_prism_load.mere):
+    # the generated load_node below this one is a `case` of 151 arms with a
+    # method call per field, and run here it was 230 µs a node. The objects
+    # are the ones it would have made -- each node's class, the instance
+    # variables its initialize assigns. A frozen tree (every Location made at
+    # once, everything frozen) is still read by the generated code.
+    def load_node(constant_pool, encoding, freeze)
+      return super if freeze
+      node, @io.pos = Prism.__prism_load_node(@__serialized, @io.pos, source, input,
+                                               constant_pool.instance_variable_get(:@base), encoding.name)
+      node
+    end
+
+    # The line offsets and the end of the constant pool, the same way: in
+    # Ruby they are a block call a line and one a name.
+    def load_line_offsets(freeze)
+      offsets, @io.pos = Prism.__prism_load_varuints(@__serialized, @io.pos)
+      offsets.freeze if freeze
+      offsets
+    end
+
+    def load_constant_pool(constant_pool)
+      @io.pos = Prism.__prism_cpool_end(@__serialized, @io.pos, constant_pool.size)
     end
   end
   private_constant :ByteReader, :LoaderBytes
