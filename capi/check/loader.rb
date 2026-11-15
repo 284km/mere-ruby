@@ -27,6 +27,12 @@ check('singleton receiver', LoaderFixture::Box.receiver.equal?(LoaderFixture::Bo
 check('operator method registration', box[3,4] == 7)
 check('zero argument module function', LoaderFixture.count == 1)
 check('two arguments', box.sum(3,4) == 7)
+# A C int crosses whole, whatever its sign; one that does not fit is refused.
+check('negative int', box.sum(-1, 2) == 1)
+check('least int', box.sum(-2147483648, 2) == -2147483646)
+check('greatest int', box.sum(2147483647, 0) == 2147483647)
+check('zero int', box.sum(0, 0) == 0)
+check('int out of range', raised(RangeError) { box.sum(2147483648, 0) }.message == "integer 2147483648 too big to convert to 'int'")
 check('native arity', box.method(:sum).arity == 2)
 check('zero argument arity', box.method(:value).arity == 0)
 raised(ArgumentError) { box.sum(1) }
