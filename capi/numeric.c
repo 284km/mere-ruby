@@ -263,8 +263,8 @@ VALUE rb_check_to_integer(VALUE v, const char *method) {
     VALUE r = mr_callv(v, rb_intern(method), 0, NULL, Qnil, 0);
     return RB_INTEGER_TYPE_P(r) ? r : Qnil;
 }
-VALUE rb_Integer(VALUE v) { return mr_call(rb_mKernel, "Integer", 1, v); }
-VALUE rb_Float(VALUE v) { return mr_call(rb_mKernel, "Float", 1, v); }
+VALUE rb_Integer(VALUE v) { return mr_call(mr_main(), "Integer", 1, v); }
+VALUE rb_Float(VALUE v) { return mr_call(mr_main(), "Float", 1, v); }
 VALUE rb_dbl2big(double d) {
     if (isnan(d) || isinf(d)) rb_raise(rb_eFloatDomainError, "%s", isnan(d) ? "NaN" : d < 0 ? "-Infinity" : "Infinity");
     return mr_call(rb_float_new(d), "to_i", 0);
@@ -297,7 +297,7 @@ VALUE rb_cstr_to_inum(const char *str, int base, int badcheck) {
     return rb_str_to_inum(s, base, badcheck);
 }
 VALUE rb_str_to_inum(VALUE str, int base, int badcheck) {
-    if (badcheck) return mr_call(rb_mKernel, "Integer", 2, str, INT2FIX(base));
+    if (badcheck) return mr_call(mr_main(), "Integer", 2, str, INT2FIX(base));
     return mr_call(str, "to_i", 1, INT2FIX(base < 0 ? -base : base));
 }
 VALUE rb_cstr2inum(const char *str, int base) { return rb_cstr_to_inum(str, base, base == 2); }
@@ -307,7 +307,7 @@ double rb_cstr_to_dbl(const char *str, int badcheck) {
     return rb_str_to_dbl(s, badcheck);
 }
 double rb_str_to_dbl(VALUE str, int badcheck) {
-    return rb_float_value(badcheck ? mr_call(rb_mKernel, "Float", 1, str) : mr_call(str, "to_f", 0));
+    return rb_float_value(badcheck ? mr_call(mr_main(), "Float", 1, str) : mr_call(str, "to_f", 0));
 }
 
 void rb_cmperr(VALUE a, VALUE b) {
@@ -346,16 +346,16 @@ VALUE rb_num_coerce_relop(VALUE x, VALUE y, ID op) {
 VALUE rb_num_coerce_bit(VALUE x, VALUE y, ID op) { return coerced(x, y, op); }
 
 /* ---- Rational and Complex --------------------------------------------------- */
-VALUE rb_Rational(VALUE num, VALUE den) { return mr_call(rb_mKernel, "Rational", 2, num, den); }
-VALUE rb_rational_new(VALUE num, VALUE den) { return mr_call(rb_mKernel, "Rational", 2, num, den); }
-VALUE rb_rational_raw(VALUE num, VALUE den) { return mr_call(rb_mKernel, "Rational", 2, num, den); }
+VALUE rb_Rational(VALUE num, VALUE den) { return mr_call(mr_main(), "Rational", 2, num, den); }
+VALUE rb_rational_new(VALUE num, VALUE den) { return mr_call(mr_main(), "Rational", 2, num, den); }
+VALUE rb_rational_raw(VALUE num, VALUE den) { return mr_call(mr_main(), "Rational", 2, num, den); }
 VALUE rb_rational_num(VALUE r) { return mr_call(r, "numerator", 0); }
 VALUE rb_rational_den(VALUE r) { return mr_call(r, "denominator", 0); }
 VALUE rb_flt_rationalize(VALUE f) { return mr_call(f, "rationalize", 0); }
 VALUE rb_flt_rationalize_with_prec(VALUE f, VALUE prec) { return mr_call(f, "rationalize", 1, prec); }
-VALUE rb_Complex(VALUE real, VALUE imag) { return mr_call(rb_mKernel, "Complex", 2, real, imag); }
-VALUE rb_complex_new(VALUE real, VALUE imag) { return mr_call(rb_mKernel, "Complex", 2, real, imag); }
-VALUE rb_complex_raw(VALUE real, VALUE imag) { return mr_call(rb_mKernel, "Complex", 2, real, imag); }
+VALUE rb_Complex(VALUE real, VALUE imag) { return mr_call(mr_main(), "Complex", 2, real, imag); }
+VALUE rb_complex_new(VALUE real, VALUE imag) { return mr_call(mr_main(), "Complex", 2, real, imag); }
+VALUE rb_complex_raw(VALUE real, VALUE imag) { return mr_call(mr_main(), "Complex", 2, real, imag); }
 VALUE rb_complex_new_polar(VALUE abs, VALUE arg) { return mr_call(rb_cComplex, "polar", 2, abs, arg); }
 VALUE rb_complex_real(VALUE z) { return mr_call(z, "real", 0); }
 VALUE rb_complex_imag(VALUE z) { return mr_call(z, "imaginary", 0); }

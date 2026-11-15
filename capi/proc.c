@@ -104,7 +104,7 @@ VALUE rb_obj_instance_eval(int argc, const VALUE *argv, VALUE self) { return mr_
 VALUE rb_obj_instance_exec(int argc, const VALUE *argv, VALUE self) { return mr_callv(self, rb_intern("instance_exec"), argc, argv, mr_frame_block(), 0); }
 VALUE rb_mod_module_eval(int argc, const VALUE *argv, VALUE module) { return mr_callv(module, rb_intern("module_eval"), argc, argv, mr_frame_block(), 0); }
 VALUE rb_mod_module_exec(int argc, const VALUE *argv, VALUE module) { return mr_callv(module, rb_intern("module_exec"), argc, argv, mr_frame_block(), 0); }
-VALUE rb_require_string(VALUE feature) { return mr_call(rb_mKernel, "require", 1, feature); }
+VALUE rb_require_string(VALUE feature) { return mr_call(mr_main(), "require", 1, feature); }
 VALUE rb_require(const char *feature) { return rb_require_string(rb_str_new_cstr(feature)); }
 VALUE rb_f_require(VALUE obj, VALUE feature) { (void)obj; return rb_require_string(feature); }
 void rb_provide(const char *feature) { mr_call(rb_gv_get("$LOADED_FEATURES"), "push", 1, rb_str_new_cstr(feature)); }
@@ -113,7 +113,7 @@ int rb_provided(const char *feature) {
                          "call", 1, rb_str_new_cstr(feature)));
 }
 int rb_feature_provided(const char *feature, const char **loading) { if (loading) *loading = NULL; return rb_provided(feature); }
-void rb_load(VALUE path, int wrap) { mr_call(rb_mKernel, "load", 2, path, wrap ? Qtrue : Qfalse); }
+void rb_load(VALUE path, int wrap) { mr_call(mr_main(), "load", 2, path, wrap ? Qtrue : Qfalse); }
 static VALUE load_body(VALUE args) { rb_load(((VALUE *)args)[0], (int)((VALUE *)args)[1]); return Qnil; }
 void rb_load_protect(VALUE path, int wrap, int *state) {
     VALUE args[2] = { path, (VALUE)wrap };

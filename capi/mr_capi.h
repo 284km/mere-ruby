@@ -86,6 +86,9 @@ double mr_got_dbl(void);
 /* Call a method by name: mr_call(recv, "name", n, a1 .. an). */
 VALUE mr_call(VALUE recv, const char *name, int argc, ...);
 VALUE mr_callv(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int flags);
+/* The top-level object: Kernel's functions (Integer(), throw, sleep ...) are
+ * private methods, and it is as good a receiver as any. */
+VALUE mr_main(void);
 /* A piece of Ruby this side is written in (a lambda, mostly): evaluated once
  * at the top level and kept. `source` is a string literal -- its address is
  * the key. */

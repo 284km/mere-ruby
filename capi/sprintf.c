@@ -198,7 +198,7 @@ VALUE rb_str_format(int argc, const VALUE *argv, VALUE fmt) {
     VALUE args = rb_ary_new_from_values(argc, argv);
     return mr_call(fmt, "%", 1, args);
 }
-VALUE rb_f_sprintf(int argc, const VALUE *argv) { return mr_callv(rb_mKernel, rb_intern("sprintf"), argc, argv, Qnil, 0); }
+VALUE rb_f_sprintf(int argc, const VALUE *argv) { return mr_callv(mr_main(), rb_intern("sprintf"), argc, argv, Qnil, 0); }
 int ruby_snprintf(char *str, size_t n, char const *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

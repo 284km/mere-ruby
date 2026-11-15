@@ -161,7 +161,7 @@ static void warn_formatted(const char *fmt, va_list ap, int verbose_only) {
     if (verbose_only && !RTEST(rb_gv_get("$VERBOSE"))) return;
     if (NIL_P(rb_gv_get("$VERBOSE"))) return;
     VALUE message = rb_vsprintf(fmt, ap);
-    mr_call(rb_mKernel, "warn", 1, rb_sprintf("warning: %" PRIsVALUE, message));
+    mr_call(mr_main(), "warn", 1, rb_sprintf("warning: %" PRIsVALUE, message));
 }
 void rb_warn(const char *fmt, ...) { va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 0); va_end(ap); }
 void rb_warning(const char *fmt, ...) { va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 1); va_end(ap); }
@@ -255,11 +255,11 @@ VALUE rb_rescue(VALUE (*body)(VALUE), VALUE data1, VALUE (*handler)(VALUE, VALUE
 
 /* ---- throw and catch --------------------------------------------------------- */
 void rb_throw_obj(VALUE tag, VALUE value) {
-    mr_call(rb_mKernel, "throw", 2, tag, value);
+    mr_call(mr_main(), "throw", 2, tag, value);
     mr_fatal("a throw returned");
 }
 void rb_throw(const char *tag, VALUE value) { rb_throw_obj(ID2SYM(rb_intern(tag)), value); }
 VALUE rb_catch_obj(VALUE tag, rb_block_call_func_t func, VALUE data) {
-    return rb_block_call(rb_mKernel, rb_intern("catch"), 1, &tag, func, data);
+    return rb_block_call(mr_main(), rb_intern("catch"), 1, &tag, func, data);
 }
 VALUE rb_catch(const char *tag, rb_block_call_func_t func, VALUE data) { return rb_catch_obj(ID2SYM(rb_intern(tag)), func, data); }

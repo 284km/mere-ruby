@@ -34,7 +34,7 @@ VALUE rb_check_array_type(VALUE obj) {
     if (!RB_TYPE_P(a, T_ARRAY)) rb_raise(rb_eTypeError, "can't convert %s to Array (%s#to_ary gives %s)", rb_obj_classname(obj), rb_obj_classname(obj), rb_obj_classname(a));
     return a;
 }
-VALUE rb_Array(VALUE obj) { return mr_call(rb_mKernel, "Array", 1, obj); }
+VALUE rb_Array(VALUE obj) { return mr_call(mr_main(), "Array", 1, obj); }
 VALUE rb_ary_to_ary(VALUE obj) {
     VALUE a = rb_check_array_type(obj);
     return NIL_P(a) ? rb_ary_new_from_values(1, &obj) : a;
@@ -110,7 +110,7 @@ VALUE rb_check_hash_type(VALUE obj) {
     if (!RB_TYPE_P(h, T_HASH)) rb_raise(rb_eTypeError, "can't convert %s to Hash (%s#to_hash gives %s)", rb_obj_classname(obj), rb_obj_classname(obj), rb_obj_classname(h));
     return h;
 }
-VALUE rb_Hash(VALUE obj) { return mr_call(rb_mKernel, "Hash", 1, obj); }
+VALUE rb_Hash(VALUE obj) { return mr_call(mr_main(), "Hash", 1, obj); }
 VALUE rb_hash_aset(VALUE hash, VALUE key, VALUE value) { mr_call(hash, "[]=", 2, key, value); return value; }
 VALUE rb_hash_aref(VALUE hash, VALUE key) { return mr_call(hash, "[]", 1, key); }
 VALUE rb_hash_lookup2(VALUE hash, VALUE key, VALUE fallback) {
@@ -223,7 +223,12 @@ VALUE rb_struct_alloc(VALUE klass, VALUE values) { return mr_callv(klass, rb_int
 VALUE rb_struct_initialize(VALUE self, VALUE values) { mr_callv(self, rb_intern("initialize"), RARRAY_LENINT(values), RARRAY_CONST_PTR(values), Qnil, 0); return Qnil; }
 VALUE rb_struct_aref(VALUE s, VALUE index) { return mr_call(s, "[]", 1, index); }
 VALUE rb_struct_aset(VALUE s, VALUE index, VALUE value) { return mr_call(s, "[]=", 2, index, value); }
-VALUE rb_struct_getmember(VALUE s, ID id) { return mr_call(s, "[]", 1, ID2SYM(id)); }
+VALUE rb_struct_getmember(VALUE s, ID id) {
+    VALUE sym = ID2SYM(id);
+    if (!RTEST(mr_call(mr_call(s, "members", 0), "include?", 1, sym)))
+        rb_exc_raise(mr_call(rb_eNameError, "new", 2, rb_sprintf("'%" PRIsVALUE "' is not a struct member", rb_sym2str(sym)), sym));
+    return mr_call(s, "[]", 1, sym);
+}
 VALUE rb_struct_members(VALUE s) { return mr_call(s, "members", 0); }
 VALUE rb_struct_s_members(VALUE klass) { return mr_call(klass, "members", 0); }
 VALUE rb_struct_size(VALUE s) { return mr_call(s, "size", 0); }

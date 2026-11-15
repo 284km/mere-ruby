@@ -211,13 +211,15 @@ VALUE mr_const(const char *path) {
     mr_put_text(path);
     return mr_up1(MR_CONST, Qnil);
 }
+VALUE mr_main(void) { return mr_ruby("self"); }
 void mr_unsupported_symbol(const char *name) { mr_unsupported(name); }
 VALUE mr_ruby(const char *source) {
     static struct { const char *source; VALUE value; } kept[128];
     static int count;
     for (int i = 0; i < count; i++) if (kept[i].source == source) return kept[i].value;
     if (count == 128) mr_fatal("too many pieces of Ruby kept by the C API");
-    VALUE value = mr_call(mr_const("TOPLEVEL_BINDING"), "eval", 1, rb_str_new_cstr(source));
+    /* (UTF-8, as a source file is: the literals in it are then UTF-8 too) */
+    VALUE value = mr_call(mr_const("TOPLEVEL_BINDING"), "eval", 1, rb_utf8_str_new_cstr(source));
     rb_gc_register_mark_object(value);
     kept[count].source = source;
     kept[count].value = value;

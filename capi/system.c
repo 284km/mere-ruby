@@ -36,11 +36,11 @@ void rb_thread_schedule(void) { mr_call(rb_cThread, "pass", 0); }
 void rb_thread_check_ints(void) {}
 int rb_thread_interrupted(VALUE thread) { (void)thread; return 0; }
 int rb_thread_alone(void) { return NUM2LONG(mr_call(mr_call(rb_cThread, "list", 0), "size", 0)) == 1; }
-void rb_thread_sleep(int seconds) { mr_call(rb_mKernel, "sleep", 1, INT2FIX(seconds)); }
-void rb_thread_sleep_forever(void) { mr_call(rb_mKernel, "sleep", 0); }
-void rb_thread_sleep_deadly(void) { mr_call(rb_mKernel, "sleep", 0); }
+void rb_thread_sleep(int seconds) { mr_call(mr_main(), "sleep", 1, INT2FIX(seconds)); }
+void rb_thread_sleep_forever(void) { mr_call(mr_main(), "sleep", 0); }
+void rb_thread_sleep_deadly(void) { mr_call(mr_main(), "sleep", 0); }
 void rb_thread_wait_for(struct timeval tv) {
-    mr_call(rb_mKernel, "sleep", 1, rb_float_new((double)tv.tv_sec + (double)tv.tv_usec / 1e6));
+    mr_call(mr_main(), "sleep", 1, rb_float_new((double)tv.tv_sec + (double)tv.tv_usec / 1e6));
 }
 VALUE rb_thread_wakeup(VALUE thread) { return mr_call(thread, "wakeup", 0); }
 VALUE rb_thread_wakeup_alive(VALUE thread) { return RTEST(mr_call(thread, "alive?", 0)) ? mr_call(thread, "wakeup", 0) : Qnil; }
@@ -82,7 +82,7 @@ static VALUE end_proc_body(VALUE yielded, VALUE data, int argc, const VALUE *arg
 }
 void rb_set_end_proc(void (*fn)(VALUE), VALUE data) {
     VALUE pair = rb_assoc_new(ULONG2NUM((uintptr_t)fn), data);
-    rb_block_call(rb_mKernel, rb_intern("at_exit"), 0, NULL, end_proc_body, pair);
+    rb_block_call(mr_main(), rb_intern("at_exit"), 0, NULL, end_proc_body, pair);
 }
 static VALUE vm_exit_body(VALUE yielded, VALUE data, int argc, const VALUE *argv, VALUE block) {
     (void)yielded; (void)argc; (void)argv; (void)block;
@@ -91,7 +91,7 @@ static VALUE vm_exit_body(VALUE yielded, VALUE data, int argc, const VALUE *argv
     return Qnil;
 }
 void ruby_vm_at_exit(void (*fn)(ruby_vm_t *)) {
-    rb_block_call(rb_mKernel, rb_intern("at_exit"), 0, NULL, vm_exit_body, ULONG2NUM((uintptr_t)fn));
+    rb_block_call(mr_main(), rb_intern("at_exit"), 0, NULL, vm_exit_body, ULONG2NUM((uintptr_t)fn));
 }
 
 /* ---- time ----------------------------------------------------------------------- */

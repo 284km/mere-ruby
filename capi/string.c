@@ -176,7 +176,7 @@ VALUE rb_str_succ(VALUE str) { return mr_call(str, "succ", 0); }
 VALUE rb_str_scrub(VALUE str, VALUE repl) { return NIL_P(repl) ? mr_call(str, "scrub", 0) : mr_call(str, "scrub", 1, repl); }
 VALUE rb_str_ellipsize(VALUE str, long len) {
     if (len < 0) rb_raise(rb_eIndexError, "negative length %ld", len);
-    return mr_call(mr_ruby("->(s, n) { s.length <= n ? s : n <= 3 ? '...'[0, n] : s[0, n - 3] + '...' }"), "call", 2, str, LONG2NUM(len));
+    return mr_call(mr_ruby("->(s, n) { d = '...'.encode(s.encoding); s.length <= n ? s : n <= 3 ? d[0, n] : s[0, n - 3] + d }"), "call", 2, str, LONG2NUM(len));
 }
 VALUE rb_str_drop_bytes(VALUE str, long len) { mr_call(str, "replace", 1, mr_call(str, "byteslice", 2, LONG2NUM(len), LONG2NUM(RSTRING_LEN(str)))); return changed(str); }
 VALUE rb_str_locktmp(VALUE str) { return str; }
@@ -189,15 +189,28 @@ VALUE rb_str_encode(VALUE str, VALUE to, int ecflags, VALUE ecopts) {
     VALUE argv[2] = { to, ecopts };
     return mr_callv(str, rb_intern("encode"), 2, argv, Qnil, MR_SEND_KW);
 }
+/* string.c's rb_str_conv_enc: the same object when there is nothing to
+ * convert, a relabelled copy when it is ASCII alone, and the String itself
+ * when the conversion cannot be done. */
 VALUE rb_str_conv_enc(VALUE str, rb_encoding *from, rb_encoding *to) {
-    if (!to || from == to) return str;
-    VALUE outcome;
-    VALUE args[3] = { str, rb_enc_from_encoding(to), from ? rb_enc_from_encoding(from) : rb_obj_encoding(str) };
-    (void)outcome;
-    int state = 0;
-    VALUE helper = mr_ruby("->(s, to, from) { s.encode(to, from) rescue s }");
-    (void)state;
-    return mr_callv(helper, rb_intern("call"), 3, args, Qnil, 0);
+    if (!to) return str;
+    if (!from) from = rb_enc_get(str);
+    if (from == to) return str;
+    /* (ASCII alone as `from` reads it: 7-bit bytes of an ASCII-compatible encoding) */
+    int ascii = rb_enc_asciicompat(from);
+    if (ascii) {
+        const char *p = RSTRING_PTR(str);
+        for (long i = 0, n = RSTRING_LEN(str); i < n; i++) if ((unsigned char)p[i] >= 0x80) { ascii = 0; break; }
+    }
+    if ((rb_enc_asciicompat(to) && ascii) || to == rb_ascii8bit_encoding()) {
+        if (rb_enc_get(str) != to) {
+            str = rb_str_dup(str);
+            rb_enc_associate(str, to);
+        }
+        return str;
+    }
+    VALUE args[3] = { str, rb_enc_from_encoding(to), rb_enc_from_encoding(from) };
+    return mr_callv(mr_ruby("->(s, to, from) { s.encode(to, from) rescue s }"), rb_intern("call"), 3, args, Qnil, 0);
 }
 VALUE rb_str_conv_enc_opts(VALUE str, rb_encoding *from, rb_encoding *to, int ecflags, VALUE ecopts) {
     (void)ecflags; (void)ecopts;
@@ -221,18 +234,30 @@ VALUE rb_str_to_str(VALUE obj) {
     }
     return s;
 }
-VALUE rb_String(VALUE obj) { return mr_call(rb_mKernel, "String", 1, obj); }
+VALUE rb_String(VALUE obj) { return mr_call(mr_main(), "String", 1, obj); }
 VALUE rb_string_value(volatile VALUE *ptr) {
     VALUE s = *ptr;
     if (!RB_TYPE_P(s, T_STRING)) { s = rb_str_to_str(s); *ptr = s; }
     return s;
 }
 char *rb_string_value_ptr(volatile VALUE *ptr) { return RSTRING_PTR(rb_string_value(ptr)); }
+/* A String as a C string: no NUL character inside it -- a NUL as wide as the
+ * encoding's narrowest character, at a character boundary of that width. */
 char *rb_string_value_cstr(volatile VALUE *ptr) {
     VALUE str = rb_string_value(ptr);
     char *s = RSTRING_PTR(str);
     long len = RSTRING_LEN(str);
-    if (memchr(s, 0, (size_t)len)) rb_raise(rb_eArgError, "string contains null byte");
+    int width = rb_enc_mbminlen(rb_enc_get(str));
+    if (width <= 1) {
+        if (memchr(s, 0, (size_t)len)) rb_raise(rb_eArgError, "string contains null byte");
+    }
+    else {
+        for (long i = 0; i + width <= len; i += width) {
+            int zero = 1;
+            for (int k = 0; k < width; k++) if (s[i + k]) { zero = 0; break; }
+            if (zero) rb_raise(rb_eArgError, "string contains null char");
+        }
+    }
     return s;
 }
 VALUE rb_str_export_to_enc(VALUE str, rb_encoding *enc) { return rb_str_conv_enc(str, rb_enc_get(str), enc); }
