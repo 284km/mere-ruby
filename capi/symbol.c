@@ -97,11 +97,11 @@ ID rb_sym2id(VALUE sym) {
     if (!RB_STATIC_SYM_P(sym)) rb_raise(rb_eTypeError, "wrong argument type %s (expected Symbol)", rb_obj_classname(sym));
     return (ID)(sym >> RUBY_SPECIAL_SHIFT);
 }
+/* The String a Symbol is the name of: the interpreter's own, one object per
+ * Symbol (Symbol#name). */
 VALUE rb_id2str(ID id) {
-    long len = 0;
-    const char *s = mr_id_name(id, &len);
-    if (!s) return Qfalse;
-    return rb_obj_freeze(rb_utf8_str_new(s, len));
+    if (!mr_id_name(id, NULL)) return Qfalse;
+    return mr_call(rb_id2sym(id), "name", 0);
 }
 VALUE rb_sym2str(VALUE sym) { return rb_id2str(rb_sym2id(sym)); }
 VALUE rb_to_symbol(VALUE name) {
@@ -131,38 +131,64 @@ VALUE rb_check_symbol(volatile VALUE *namep) {
 }
 ID rb_check_id_cstr(const char *ptr, long len, rb_encoding *enc) { (void)enc; return intern(ptr, len); }
 VALUE rb_check_symbol_cstr(const char *ptr, long len, rb_encoding *enc) { (void)enc; return rb_id2sym(intern(ptr, len)); }
+/* What kind of name an ID is, as the parser would read it. */
+enum kind { K_NONE, K_LOCAL, K_CONST, K_GLOBAL, K_INSTANCE, K_CLASS, K_ATTRSET, K_JUNK };
+static int ident_char(unsigned char c) {
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80;
+}
+static int ident_start(unsigned char c) { return ident_char(c) && !(c >= '0' && c <= '9'); }
+static int identifier(const char *s, long n) {
+    if (n <= 0 || !ident_start((unsigned char)s[0])) return 0;
+    for (long i = 1; i < n; i++) if (!ident_char((unsigned char)s[i])) return 0;
+    return 1;
+}
+static enum kind kind_of(const char *s, long n, int attrset_ok) {
+    if (n <= 0) return K_NONE;
+    if (attrset_ok && n > 1 && s[n - 1] == '=') {
+        enum kind base = kind_of(s, n - 1, 0);
+        if (base == K_LOCAL || base == K_CONST || base == K_GLOBAL || base == K_INSTANCE || base == K_CLASS || base == K_JUNK)
+            return K_ATTRSET;
+        return K_NONE;
+    }
+    if (s[0] == '$') {
+        if (n == 2 && strchr("~*$?!@/\\;,.=:<>\"&`'+0", s[1])) return K_GLOBAL;
+        if (n == 3 && s[1] == '-' && ident_char((unsigned char)s[2])) return K_GLOBAL;
+        if (n > 1 && s[1] >= '0' && s[1] <= '9') {
+            for (long i = 1; i < n; i++) if (!(s[i] >= '0' && s[i] <= '9')) return K_NONE;
+            return K_GLOBAL;
+        }
+        return identifier(s + 1, n - 1) ? K_GLOBAL : K_NONE;
+    }
+    if (s[0] == '@') {
+        if (n > 1 && s[1] == '@') return identifier(s + 2, n - 2) ? K_CLASS : K_NONE;
+        return identifier(s + 1, n - 1) ? K_INSTANCE : K_NONE;
+    }
+    if (!ident_start((unsigned char)s[0])) return K_NONE;
+    int upper = s[0] >= 'A' && s[0] <= 'Z';
+    if (s[n - 1] == '?' || s[n - 1] == '!') return identifier(s, n - 1) ? K_JUNK : K_NONE;
+    if (!identifier(s, n)) return K_NONE;
+    return upper ? K_CONST : K_LOCAL;
+}
+static enum kind kind_of_id(ID id) {
+    long len = 0;
+    const char *s = mr_id_name(id, &len);
+    return s ? kind_of(s, len, 1) : K_NONE;
+}
+int rb_is_const_id(ID id) { return kind_of_id(id) == K_CONST; }
+int rb_is_global_id(ID id) { return kind_of_id(id) == K_GLOBAL; }
+int rb_is_instance_id(ID id) { return kind_of_id(id) == K_INSTANCE; }
+int rb_is_class_id(ID id) { return kind_of_id(id) == K_CLASS; }
+int rb_is_attrset_id(ID id) { return kind_of_id(id) == K_ATTRSET; }
+int rb_is_local_id(ID id) { return kind_of_id(id) == K_LOCAL; }
+int rb_is_junk_id(ID id) { return kind_of_id(id) == K_JUNK; }
 ID rb_id_attrset(ID id) {
     long len = 0;
     const char *s = mr_id_name(id, &len);
     if (!s) rb_raise(rb_eNameError, "invalid ID");
+    if (kind_of(s, len, 1) == K_ATTRSET) return id;
     char *buffer = alloca((size_t)len + 2);
     memcpy(buffer, s, (size_t)len);
     buffer[len] = '=';
     return intern(buffer, len + 1);
 }
-
-static int first_is(ID id, int (*test)(const char *, long)) {
-    long len = 0;
-    const char *s = mr_id_name(id, &len);
-    return s && len > 0 && test(s, len);
-}
-static int is_const(const char *s, long n) { (void)n; return s[0] >= 'A' && s[0] <= 'Z'; }
-static int is_global(const char *s, long n) { (void)n; return s[0] == '$'; }
-static int is_instance(const char *s, long n) { return s[0] == '@' && (n < 2 || s[1] != '@'); }
-static int is_class(const char *s, long n) { return n > 1 && s[0] == '@' && s[1] == '@'; }
-static int is_attrset(const char *s, long n) {
-    return n > 1 && s[n - 1] == '=' && s[n - 2] != '=' && s[n - 2] != '!' && s[n - 2] != '<' && s[n - 2] != '>' && s[0] != '[';
-}
-static int is_junk(const char *s, long n) { (void)n; return !(s[0] == '_' || (s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z') || (unsigned char)s[0] >= 0x80 || s[0] == '$' || s[0] == '@'); }
-static int is_local(const char *s, long n) {
-    return (s[0] == '_' || (s[0] >= 'a' && s[0] <= 'z') || (unsigned char)s[0] >= 0x80)
-        && s[n - 1] != '=' && s[n - 1] != '?' && s[n - 1] != '!';
-}
-int rb_is_const_id(ID id) { return first_is(id, is_const); }
-int rb_is_global_id(ID id) { return first_is(id, is_global); }
-int rb_is_instance_id(ID id) { return first_is(id, is_instance); }
-int rb_is_class_id(ID id) { return first_is(id, is_class); }
-int rb_is_attrset_id(ID id) { return first_is(id, is_attrset); }
-int rb_is_local_id(ID id) { return first_is(id, is_local); }
-int rb_is_junk_id(ID id) { return first_is(id, is_junk); }
 VALUE rb_sym_all_symbols(void) { return mr_call(rb_cSymbol, "all_symbols", 0); }

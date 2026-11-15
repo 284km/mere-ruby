@@ -31,7 +31,7 @@ static const struct known known[] = {
     { "EUC-TW", 1, 4, F_OTHER, 0 }, { "Big5", 1, 2, F_OTHER, 0 }, { "Big5-HKSCS", 1, 2, F_OTHER, 0 },
     { "Big5-UAO", 1, 2, F_OTHER, 0 }, { "CP950", 1, 2, F_OTHER, 0 }, { "CP951", 1, 2, F_OTHER, 0 },
     { "GB2312", 1, 2, F_OTHER, 0 }, { "GBK", 1, 2, F_OTHER, 0 }, { "CP936", 1, 2, F_OTHER, 0 },
-    { "GB12345", 1, 2, F_OTHER, 0 }, { "GB18030", 1, 4, F_OTHER, 0 }, { "EMACS-MULE", 1, 4, F_OTHER, 0 },
+    { "GB12345", 1, 2, F_OTHER, 0 }, { "GB18030", 1, 4, F_OTHER, 0 }, { "Emacs-Mule", 1, 4, F_OTHER, 0 },
     { "UTF-7", 1, 1, F_SINGLE, 1 }, { "ISO-2022-JP", 1, 1, F_SINGLE, 1 }, { "ISO-2022-JP-2", 1, 1, F_SINGLE, 1 },
     { "ISO-2022-JP-KDDI", 1, 1, F_SINGLE, 1 }, { "CP50220", 1, 1, F_SINGLE, 1 }, { "CP50221", 1, 1, F_SINGLE, 1 },
     { "IBM037", 1, 1, F_SINGLE, 1 },

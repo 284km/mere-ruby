@@ -178,21 +178,22 @@ static void int_range(long n) {
     if (n < INT_MIN || n > INT_MAX)
         rb_raise(rb_eRangeError, "integer %ld too %s to convert to 'int'", n, n < 0 ? "small" : "big");
 }
-static void uint_range(unsigned long n, int negative_allowed) {
-    /* (a negative number given as unsigned is taken as its two's complement) */
-    if (negative_allowed ? ((long)n < INT_MIN || (long)n > (long)UINT_MAX) : n > UINT_MAX)
-        rb_raise(rb_eRangeError, "integer %lu too big to convert to 'unsigned int'", n);
-}
 long rb_num2int(VALUE v) { long n = rb_num2long(v); int_range(n); return n; }
 long rb_fix2int(VALUE v) { long n = RB_FIXNUM_P(v) ? RB_FIX2LONG(v) : rb_num2long(v); int_range(n); return n; }
+static int negative_p(VALUE v) {
+    if (RB_FIXNUM_P(v)) return RB_FIX2LONG(v) < 0;
+    if (RB_FLOAT_TYPE_P(v)) return rb_float_value(v) < 0.0;
+    return RTEST(mr_call(v, "<", 1, INT2FIX(0)));
+}
+/* (a negative number given for an unsigned type is taken as its two's
+ *  complement, as CRuby takes it, when it fits the signed type) */
 unsigned long rb_num2uint(VALUE v) {
-    if (RB_FIXNUM_P(v) || (RB_FLOAT_TYPE_P(v) && rb_float_value(v) < 0)) {
-        long n = rb_num2long(v);
-        if (n < INT_MIN || n > (long)UINT_MAX) rb_raise(rb_eRangeError, "integer %ld too %s to convert to 'unsigned int'", n, n < 0 ? "small" : "big");
-        return (unsigned long)n;
-    }
+    int negative = negative_p(v);
     unsigned long n = rb_num2ulong(v);
-    uint_range(n, 0);
+    if (negative) {
+        if ((long)n < INT_MIN) rb_raise(rb_eRangeError, "integer %ld too small to convert to 'unsigned int'", (long)n);
+    }
+    else if (n > UINT_MAX) rb_raise(rb_eRangeError, "integer %lu too big to convert to 'unsigned int'", n);
     return n;
 }
 unsigned long rb_fix2uint(VALUE v) { return rb_num2uint(v); }
@@ -203,8 +204,12 @@ short rb_num2short(VALUE v) {
 }
 short rb_fix2short(VALUE v) { return rb_num2short(v); }
 unsigned short rb_num2ushort(VALUE v) {
-    long n = rb_num2long(v);
-    if (n < SHRT_MIN || n > USHRT_MAX) rb_raise(rb_eRangeError, "integer %ld too %s to convert to 'unsigned short'", n, n < 0 ? "small" : "big");
+    int negative = negative_p(v);
+    unsigned long n = rb_num2ulong(v);
+    if (negative) {
+        if ((long)n < SHRT_MIN) rb_raise(rb_eRangeError, "integer %ld too small to convert to 'unsigned short'", (long)n);
+    }
+    else if (n > USHRT_MAX) rb_raise(rb_eRangeError, "integer %lu too big to convert to 'unsigned short'", n);
     return (unsigned short)n;
 }
 unsigned short rb_fix2ushort(VALUE v) { return rb_num2ushort(v); }

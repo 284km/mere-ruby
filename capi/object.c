@@ -115,12 +115,28 @@ int rb_const_defined(VALUE klass, ID id) { return RTEST(mr_call(klass, "const_de
 int rb_const_defined_at(VALUE klass, ID id) { return RTEST(mr_call(klass, "const_defined?", 2, ID2SYM(id), Qfalse)); }
 int rb_const_defined_from(VALUE klass, ID id) { return RTEST(mr_call(klass, "const_defined?", 1, ID2SYM(id))); }
 VALUE rb_const_remove(VALUE klass, ID id) { return mr_call(klass, "remove_const", 1, ID2SYM(id)); }
-VALUE rb_path2class(const char *path) {
-    VALUE v = mr_call(rb_cObject, "const_get", 1, rb_str_new_cstr(path));
-    if (!RB_TYPE_P(v, T_CLASS) && !RB_TYPE_P(v, T_MODULE)) rb_raise(rb_eTypeError, "%s does not refer to class/module", path);
-    return v;
+/* "A::B::C" to the class it names: each part looked up in the one before it
+ * and nowhere else (Object's constants are not every module's). */
+VALUE rb_path_to_class(VALUE path) {
+    StringValue(path);
+    VALUE parts = mr_call(path, "split", 2, rb_str_new_cstr("::"), INT2FIX(-1));
+    VALUE c = rb_cObject;
+    long n = RARRAY_LEN(parts);
+    if (n == 0 || RSTRING_LEN(path) == 0) rb_raise(rb_eArgError, "can't retrieve anonymous class %" PRIsVALUE, path);
+    if (RSTRING_PTR(path)[0] == '#') rb_raise(rb_eArgError, "can't retrieve anonymous class %" PRIsVALUE, path);
+    for (long i = 0; i < n; i++) {
+        VALUE name = rb_ary_entry(parts, i);
+        VALUE so_far = mr_call(mr_call(parts, "first", 1, LONG2NUM(i + 1)), "join", 1, rb_str_new_cstr("::"));
+        VALUE sym = rb_str_intern(name);
+        if (!RTEST(mr_call(c, "const_defined?", 2, sym, Qfalse)))
+            rb_raise(rb_eArgError, "undefined class/module %" PRIsVALUE, so_far);
+        c = mr_call(c, "const_get", 2, sym, Qfalse);
+        if (!RB_TYPE_P(c, T_CLASS) && !RB_TYPE_P(c, T_MODULE))
+            rb_raise(rb_eTypeError, "%" PRIsVALUE " does not refer to class/module", so_far);
+    }
+    return c;
 }
-VALUE rb_path_to_class(VALUE path) { return rb_path2class(StringValueCStr(path)); }
+VALUE rb_path2class(const char *path) { return rb_path_to_class(rb_str_new_cstr(path)); }
 
 VALUE rb_ivar_get(VALUE obj, ID id) { return mr_call(obj, "instance_variable_get", 1, ID2SYM(id)); }
 VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_call(obj, "instance_variable_set", 2, ID2SYM(id), value); return value; }
@@ -155,8 +171,15 @@ VALUE rb_gv_set(const char *name, VALUE value) {
 /* ---- objects ---------------------------------------------------------------- */
 VALUE rb_obj_class(VALUE obj) { return mr_call(obj, "class", 0); }
 VALUE rb_class_of(VALUE obj);
+/* The class an object is "of" to a reader: not the singleton class a
+ * `def obj.x` hung on it. */
+VALUE rb_class_real(VALUE klass) {
+    if (NIL_P(klass) || klass == 0) return klass;
+    while (RB_TYPE_P(klass, T_CLASS) && RTEST(mr_call(klass, "singleton_class?", 0))) klass = mr_call(klass, "superclass", 0);
+    return klass;
+}
 const char *rb_class2name(VALUE klass) {
-    VALUE name = mr_call(klass, "to_s", 0);
+    VALUE name = mr_call(rb_class_real(klass), "to_s", 0);
     return StringValueCStr(name);
 }
 const char *rb_obj_classname(VALUE obj) { return rb_class2name(rb_obj_class(obj)); }
@@ -165,7 +188,6 @@ VALUE rb_class_path(VALUE klass) { return mr_call(klass, "to_s", 0); }
 VALUE rb_mod_name(VALUE module) { return mr_call(module, "name", 0); }
 VALUE rb_class_superclass(VALUE klass) { return mr_call(klass, "superclass", 0); }
 VALUE rb_class_get_superclass(VALUE klass) { return mr_call(klass, "superclass", 0); }
-VALUE rb_class_real(VALUE klass) { return klass; }
 VALUE rb_mod_ancestors(VALUE module) { return mr_call(module, "ancestors", 0); }
 VALUE rb_class_inherited_p(VALUE module, VALUE other) { return mr_call(module, "<=", 1, other); }
 VALUE rb_obj_is_kind_of(VALUE obj, VALUE klass) { return mr_call(obj, "is_a?", 1, klass); }
@@ -234,14 +256,16 @@ static const char *type_name(int type) {
     }
     return "unknown";
 }
-static const char *value_name(VALUE obj) {
-    if (NIL_P(obj)) return "nil";
-    if (obj == Qtrue) return "true";
-    if (obj == Qfalse) return "false";
-    return rb_obj_classname(obj);
+/* What a type error calls the value it was given: nil, true and false by
+ * name, anything else by its class (a String, in the class name's encoding). */
+static VALUE value_name(VALUE obj) {
+    if (NIL_P(obj)) return rb_usascii_str_new_cstr("nil");
+    if (obj == Qtrue) return rb_usascii_str_new_cstr("true");
+    if (obj == Qfalse) return rb_usascii_str_new_cstr("false");
+    return mr_call(rb_class_real(rb_obj_class(obj)), "to_s", 0);
 }
 void rb_unexpected_type(VALUE obj, int type) {
-    rb_raise(rb_eTypeError, "wrong argument type %s (expected %s)", value_name(obj), type_name(type));
+    rb_raise(rb_eTypeError, "wrong argument type %" PRIsVALUE " (expected %s)", value_name(obj), type_name(type));
 }
 void rb_check_type(VALUE obj, int type) {
     if (obj == Qundef) rb_bug("undef leaked to the Ruby space");
@@ -260,7 +284,7 @@ int rb_typeddata_is_instance_of(VALUE obj, const rb_data_type_t *type) {
 }
 void *rb_check_typeddata(VALUE obj, const rb_data_type_t *type) {
     if (RB_SPECIAL_CONST_P(obj) || !RB_TYPE_P(obj, T_DATA) || !RTYPEDDATA_P(obj))
-        rb_raise(rb_eTypeError, "wrong argument type %s (expected %s)", value_name(obj), type->wrap_struct_name);
+        rb_raise(rb_eTypeError, "wrong argument type %" PRIsVALUE " (expected %s)", value_name(obj), type->wrap_struct_name);
     if (!rb_typeddata_inherited_p(RTYPEDDATA_TYPE(obj), type))
         rb_raise(rb_eTypeError, "wrong argument type %s (expected %s)", RTYPEDDATA_TYPE(obj)->wrap_struct_name, type->wrap_struct_name);
     return RTYPEDDATA_GET_DATA(obj);

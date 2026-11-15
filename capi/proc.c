@@ -103,13 +103,10 @@ void rb_iter_break_value(VALUE value) { rb_throw_obj(break_tag(), value); }
 void rb_iter_break(void) { rb_throw_obj(break_tag(), Qnil); }
 
 /* ---- evaluation and loading ---------------------------------------------------- */
+/* In the frame that called the C method in progress: its self, its locals. */
 VALUE rb_eval_string(const char *source) {
-    static VALUE top;
-    if (!top) {
-        top = mr_const("TOPLEVEL_BINDING");
-        rb_gc_register_mark_object(top);
-    }
-    return mr_call(top, "eval", 3, rb_str_new_cstr(source), rb_str_new_cstr("(eval)"), INT2FIX(1));
+    mr_put_bytes(source, (long)strlen(source));
+    return mr_up(MR_EVAL, 0, 0, 0, 0, 0);
 }
 static VALUE eval_body(VALUE source) { return rb_eval_string((const char *)source); }
 VALUE rb_eval_string_protect(const char *source, int *state) { return rb_protect(eval_body, (VALUE)source, state); }

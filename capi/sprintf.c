@@ -29,6 +29,15 @@ static void out_pad(struct out *o, char c, long n) {
     for (; n > 0; n--) out_bytes(o, &c, 1);
 }
 
+static VALUE quote_unprintable(void) {
+    static VALUE helper;
+    if (!helper) {
+        helper = rb_eval_string("->(s) { (s.valid_encoding? && s !~ /[^[:print:]]/) ? s : s.inspect[1..-2].gsub(/\\\\([\"\\\\#])/) { $1 } }");
+        rb_gc_register_mark_object(helper);
+    }
+    return helper;
+}
+
 /* Format into a malloc'd buffer. `carried` is set to the first VALUE string
  * printed into it (its encoding is the result's when none was given). */
 static char *format(const char *fmt, va_list ap, size_t *len, VALUE *carried) {
@@ -47,11 +56,12 @@ static char *format(const char *fmt, va_list ap, size_t *len, VALUE *carried) {
         char spec[64];
         size_t sn = 0;
         spec[sn++] = '%';
-        int left = 0, plus = 0;
+        int left = 0, plus = 0, space = 0;
         long width = -1, precision = -1;
         for (; *f && strchr("-+ #0'", *f); f++) {
             if (*f == '-') left = 1;
             if (*f == '+') plus = 1;
+            if (*f == ' ') space = 1;
             if (sn < 40) spec[sn++] = *f;
         }
         if (*f == '*') { width = va_arg(ap, int); if (width < 0) { left = 1; width = -width; } f++; }
@@ -78,7 +88,9 @@ static char *format(const char *fmt, va_list ap, size_t *len, VALUE *carried) {
             f++;
             VALUE value = va_arg(ap, VALUE);
             VALUE str = plus ? rb_inspect(value) : rb_obj_as_string(value);
-            if (carried && *carried == Qundef) *carried = str;
+            /* (`% ` prints it escaped when it holds what cannot be printed) */
+            if (space && !plus) str = mr_call(quote_unprintable(), "call", 1, str);
+            if (carried && *carried == Qundef && !rb_enc_str_asciionly_p(str)) *carried = str;
             long n = RSTRING_LEN(str);
             if (precision >= 0 && n > precision) n = precision;
             if (!left && width > n) out_pad(&o, ' ', width - n);
@@ -150,8 +162,10 @@ VALUE rb_enc_vsprintf(rb_encoding *enc, const char *fmt, va_list ap) {
     VALUE carried = Qundef;
     char *p = format(fmt, ap, &len, &carried);
     VALUE str;
-    if (enc) str = rb_enc_str_new(p, (long)len, enc);
-    else if (carried != Qundef) str = rb_enc_str_new(p, (long)len, rb_enc_get(carried));
+    /* (a String printed into it that is not ASCII alone gives the result its
+     *  encoding, as CRuby's does when the two are compatible) */
+    if (carried != Qundef) str = rb_enc_str_new(p, (long)len, rb_enc_get(carried));
+    else if (enc) str = rb_enc_str_new(p, (long)len, enc);
     else str = rb_usascii_str_new(p, (long)len);
     free(p);
     return str;

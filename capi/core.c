@@ -290,6 +290,20 @@ static long library_count, library_cap;
  * for CRuby reads objects as addresses and must not be run here. */
 #define MR_EXTENSION_ABI 0x4d520101U
 
+/* Was this file compiled against mere-ruby's ruby.h? One built for another
+ * ruby is not a candidate for the feature at all: `require` goes on to
+ * whatever provided it before (a .rb, the shipped library). */
+int mr_capi_probe(const char *path) {
+    for (long i = 0; i < library_count; i++)
+        if (!strcmp(libraries[i].path, path)) return 1;
+    void *handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) return 0;
+    const unsigned int *abi = (const unsigned int *)dlsym(handle, "rb_mere_extension_abi");
+    int ours = abi && *abi == MR_EXTENSION_ABI;
+    dlclose(handle);
+    return ours;
+}
+
 int mr_capi_open(const char *path) {
     for (long i = 0; i < library_count; i++)
         if (!strcmp(libraries[i].path, path)) return (int)i;

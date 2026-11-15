@@ -8201,7 +8201,7 @@ and capi_send = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
        (if public then EMethod (EVar "__capi_r", name, pass)
         else EMethod (EVar "__capi_r", "__send__", Cons (ESym name, pass))))
 // One request from C.
-and capi_up = fn env -> fn world -> fn (r: CapiReq) ->
+and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let (_, _, ocls, _) = world in
   if r.op == 1 then capi_describe env world (capi_in r.a)
@@ -8236,7 +8236,18 @@ and capi_up = fn env -> fn world -> fn (r: CapiReq) ->
     (let args = capi_args r.c in
      if bit_and r.e 8 != 0 then
        (if bit_and r.e 16 != 0 then capi_out (eval_e env world noblk ESelf)
-        else (let _ = raise_exc world "NotImplementedError" "rb_call_super is not provided by mere-ruby's C API" in 0))
+        else
+          // rb_call_super: `super(*args, &block)` written in the method's own body
+          (let _ = map_set env "__capi_sa" (arr_new args) in
+           let _ = map_set env "__capi_sb" (capi_in r.d) in
+           let _ = (if bit_and r.e 2 != 0 then
+                      (let rec last = fn (xs: Val list) -> match xs with
+                         | Cons (VHsh id, Nil) -> mark_kw id
+                         | Cons (_, rest) -> last rest
+                         | Nil -> () in last args)
+                    else ()) in
+           capi_out (eval_e env world noblk
+                       (ESuper (false, Cons (ESplat (EVar "__capi_sa"), Cons (EBlockPass (EVar "__capi_sb"), Nil)))))))
      else capi_out (capi_send env world (capi_in r.a) (mr_capi_id_name r.b) args (capi_in r.d) r.e))
   else if r.op == 7 then capi_out (mkstr_e (str_of_bytes (mr_capi_bytes ())) (mr_capi_text ()))
   else if r.op == 8 then capi_out_boxed (VFlt (mr_capi_dbl ()))
@@ -8291,6 +8302,11 @@ and capi_up = fn env -> fn world -> fn (r: CapiReq) ->
   else if r.op == 19 then
     (if r.a == 0 then capi_out (if map_has globals "!" then map_get globals "!" else VNil)
      else (let _ = map_set globals "!" (capi_in r.b) in 0))
+  else if r.op == 20 then
+    // rb_eval_string: in the frame that called the C method -- its self, its locals
+    (let cnoblk = (false, (Nil : str list), (Nil : Stmt list), cenv) in
+     capi_out (invoke_val_c cenv world cnoblk (eval_e cenv world cnoblk ESelf) "eval"
+                 (Cons (mkstr (str_of_bytes (mr_capi_bytes ())), Nil)) false))
   else if r.op == 21 then
     capi_out (capi_proc world r.a (if r.c == 2 then VNil else capi_in r.b) r.c (if r.c == 2 then r.b else 0 - 1) r.d)
   else if r.op == 23 then
@@ -8308,8 +8324,11 @@ and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) 
     | Nil -> ()
     | Cons (v, rest) -> let _ = mr_capi_set i (CapiWord { w = capi_out v }) in put (i + 1) rest in
   let _ = put 0 args in
+  // (the frame that made the call: the one a depth above the C method's own)
+  let depth = cd_get () in
+  let cenv = (if depth > 0 && map_has fb_env_at (depth - 1) then map_get fb_env_at (depth - 1) else env) in
   let up = fn (r: CapiReq) ->
-    try_or_msg (fn (u: unit) -> capi_up env world r)
+    try_or_msg (fn (u: unit) -> capi_up env cenv world r)
       (fn (message: str) ->
         let out = try_or_msg (fn (u: unit) -> capi_capture world)
                     (fn (again: str) ->
@@ -8330,13 +8349,19 @@ and capi_proc = fn world -> fn (number: int) -> fn (data: Val) -> fn (kind: int)
   let _ = map_set benv "__capi_m" (VInt mid) in
   let body = Cons (SExpr (ECapi (kind, number, arity)), Nil) in
   let pid = proc_next () in
-  let _ = store_proc (str_of_int pid) (true, Cons ("*__a", Cons ("&__b", Nil)), body, benv) in
+  // (`**__k`: what the caller wrote as keywords stays apart from a Hash it
+  //  passed as an argument, and reaches C as the last argument with the
+  //  call's keyword flag set -- rb_keyword_given_p, rb_scan_args' ":")
+  let _ = store_proc (str_of_int pid) (true, Cons ("*__a", Cons ("**__k", Cons ("&__b", Nil))), body, benv) in
   let _ = (if kind != 0 then map_set lambda_ids (str_of_int pid) VNil else ()) in
   let _ = (if kind == 2 then map_set proc_arity (str_of_int pid) (VInt (if arity == 0 - 2 then 0 - 1 else arity)) else ()) in
   VProc pid
 // ECapi: the body of such a Proc.
 and capi_run = fn env -> fn world -> fn blk -> fn (kind: int) -> fn (number: int) -> fn (arity: int) ->
-  let args = (match eval_e env world blk (EVar "__a") with VArr id -> deref id | _ -> (Nil : Val list)) in
+  let positional = (match eval_e env world blk (EVar "__a") with VArr id -> deref id | _ -> (Nil : Val list)) in
+  let keywords = eval_e env world blk (EVar "__k") in
+  let kw = (match keywords with VHsh h -> (match hderef h with Nil -> 0 | _ -> 1) | _ -> 0) in
+  let args = (if kw == 1 then list_append positional (Cons (keywords, Nil)) else positional) in
   let block = eval_e env world blk (EVar "__b") in
   let n = vlen args in
   if kind == 2 then
@@ -8344,14 +8369,10 @@ and capi_run = fn env -> fn world -> fn blk -> fn (kind: int) -> fn (number: int
        raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int n ++ ", expected " ++ str_of_int arity ++ ")")
      else
        (let self = eval_e env world blk ESelf in
-        let rec kw = fn (xs: Val list) -> match xs with
-          | Cons (v, Nil) -> (if is_kw_hash v then 1 else 0)
-          | Cons (_, rest) -> kw rest
-          | Nil -> 0 in
         let mid = (match eval_e env world blk (EVar "__capi_m") with VInt m -> m | _ -> 0) in
         let argv = (if arity == 0 - 2 then Cons (arr_new args, Nil) else args) in
         capi_enter env world (CapiReq { op = 1, a = number, b = capi_out self, c = vlen argv, d = capi_out block,
-                                        e = mid + kw args * 4294967296 }) argv))
+                                        e = mid + kw * 4294967296 }) argv))
   else
     capi_enter env world (CapiReq { op = 3, a = number, b = capi_out (eval_e env world blk (EVar "__capi_data")),
                                     c = n, d = capi_out block, e = 0 }) args
@@ -59706,7 +59727,10 @@ and native_feature_path = fn env -> fn world -> fn (rel: bool) -> fn (dir: str) 
                 else if rel then dir ++ "/" ++ name
                 else if str_starts_with name "./" || str_starts_with name "../" then env_get "PWD" ++ "/" ++ name
                 else load_path_find_conv env world name in
-      if (if str_eq hit "" then false else is_reg_file hit) then path_norm hit else find rest in
+      // (a library built for another ruby is no candidate: the feature is
+      //  then whatever provided it before -- a .rb, the shipped library)
+      if (if str_eq hit "" then false else is_reg_file hit) && mr_capi_probe (path_norm hit) == 1
+      then path_norm hit else find rest in
   find candidates
 and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) ->
   if map_len ractor_thr > 0 && map_has ractor_thr (fb_thread_of (fb_cur ())) then

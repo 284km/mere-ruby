@@ -4,6 +4,9 @@
 #   ./tools/build.sh            -O2 -- the build that sweeps and the build that ships
 #   ./tools/build.sh --fast     -O1 -- the build for "edit, run one witness, edit again"
 #   ./tools/build.sh --cc-only  skip the emit and compile the mr.c that is there
+#   ./tools/build.sh --relink   the same, and mr.c itself is compiled only when it
+#                               is newer than the mr.o kept from the last --relink
+#                               (for work on the C beside it: capi/, tools/*_glue.c)
 #
 # Measured 2026-09-22 on this machine (Apple silicon), `/usr/bin/time -p`:
 #
@@ -42,10 +45,12 @@ cd "$root" || exit 2
 mode=O2
 opt=-O2
 emit=1
+relink=0
 for a in "$@"; do
   case "$a" in
     --fast|-O1)  mode=O1; opt=-O1 ;;
     --cc-only)   emit=0 ;;
+    --relink)    emit=0; relink=1 ;;
     -h|--help)   sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "build.sh: unknown argument '$a'" >&2; exit 2 ;;
   esac
@@ -159,8 +164,20 @@ printf 'cc     clang %s %s mr.c tools/*_glue.c libprism.a with OpenSSL -> mere-r
 # ⚠ NEVER `cp` OVER A RUNNING BINARY -- the text pages of a process that is
 # mid-run are backed by that file, and overwriting them SIGKILLs it or, worse,
 # gives it another build's instructions. Build beside it and rename.
+# (--relink keeps the interpreter's own object: its two minutes are most of a
+#  build, and none of them is the C being worked on. The object is kept per
+#  optimisation level, and never used by a build that did not ask for it.)
+main_c=mr.c
+if [ "$relink" = 1 ]; then
+  main_o="mr.$mode.o"
+  if [ ! -f "$main_o" ] || [ mr.c -nt "$main_o" ]; then
+    # shellcheck disable=SC2086
+    clang $opt -w ${plat%%-Wl,*} -fbracket-depth=1024 -c mr.c -o "$main_o" || { rm -f "$main_o"; exit 1; }
+  fi
+  main_c="$main_o"
+fi
 # shellcheck disable=SC2086
-clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" -DMR_CAPI_BUILD -I "$root/capi/include" -I "$root/capi" "$root"/capi/*.c -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
+clang $opt -w $plat -I "$root/vendor/prism/include" "$main_c" "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" -DMR_CAPI_BUILD -I "$root/capi/include" -I "$root/capi" "$root"/capi/*.c -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
 
 # ...and say which build this is, where something that must not be misled can
