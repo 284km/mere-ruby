@@ -4851,6 +4851,36 @@ is the description; this is what was decided and what was measured.
   `assert_no_memory_leak` waits for: its tests (34 files use it) were
   pended as "unsupported platform" on this side and now run.
 
+**What the review found** (PR #87; each has a contract in
+`capi/check/api.rb` now, 34 checks on both sides, and the first has the
+control that makes them fail):
+
+- A primitive called whatever the receiver's class had made of the name:
+  `rb_ary_push` on an instance of `class A < Array; def push` ran A's
+  `push` and left the Array empty; the same for `rb_str_append`,
+  `rb_str_strlen`, `rb_obj_freeze`, `rb_hash_aset`. The primitives of the
+  C API now name the class whose operation they are (Array, String, Hash,
+  Kernel), and where the receiver's class or singleton overrides the name
+  the call goes the way `super` from that override would -- to the next
+  definition from the builtin class on, or the builtin itself. Only an
+  override pays for it; a redefinition IN the builtin class itself
+  (`class Array; def push`) is still what gets called.
+- The watch on a struct C may have written (a String's bytes through
+  `RSTRING_PTR`) ended when ANY C call at that depth ended. A Fiber stopped
+  inside a C call lost it to an unrelated call on another stack, and what
+  its C wrote after resuming never reached the String. The watch belongs to
+  the C frame that took the pointer now.
+- `rb_get_kwargs` is class.c's again: with a place for the values, what it
+  finds is taken out of the Hash (also when other keywords may stay);
+  without one, the Hash is only read.
+- `rb_proc_new` made a lambda; it makes a Proc.
+- (Found here, from a gem: redcarpet.) A class C defines is the class
+  statement itself where its scope and superclass have names. Made
+  anonymous and set as the constant, a class under two modules made the
+  same way was not found again as a superclass -- `class Custom <
+  Redcarpet::Render::Base` then was not a Base -- and ruby's own
+  `-test-/memory_status` did not define what `tool/lib` looks for.
+
 **Measured here** (this machine, the interpreter's side only; CI's shards
 are the record and go in below when they have run): of `test/-ext-`'s 94
 files, 94 reach their summary (12 did at the baseline, CI run 43548292351 on

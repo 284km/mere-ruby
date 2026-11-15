@@ -60,7 +60,14 @@ enum mr_op {
     MR_ARY_NEW,         /* a: length; words: elements -> Array */
     MR_BREAK            /* a: value -- `break value` from the block this C was called in */
 };
-enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8 };
+enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
+    /* (16: the receiver is the current one)
+     * THE BUILTIN, NOT WHAT THE RECEIVER'S CLASS MADE OF THE NAME. rb_ary_push
+     * is CRuby's own push, whatever `class A < Array; def push` says; a
+     * primitive of the C API names the class whose method it is, and where
+     * the receiver's class (or its singleton) overrides the name, that
+     * class's own method is called instead of the override. */
+    MR_SEND_ARRAY = 32, MR_SEND_STRING = 64, MR_SEND_HASH = 128, MR_SEND_KERNEL = 256 };
 enum mr_method_kind { MR_M_INSTANCE = 0, MR_M_SINGLETON, MR_M_MODULE_FUNCTION, MR_M_PRIVATE, MR_M_PROTECTED, MR_M_GLOBAL };
 enum mr_outcome_ask { MR_O_TAG = 0, MR_O_EXCEPTION, MR_O_ENTER, MR_O_VALUE };
 /* What the interpreter asks C to run (mr_capi_enter's req.op). */
@@ -85,6 +92,12 @@ void mr_put_dbl(double d);
 double mr_got_dbl(void);
 /* Call a method by name: mr_call(recv, "name", n, a1 .. an). */
 VALUE mr_call(VALUE recv, const char *name, int argc, ...);
+/* (...the same, as the builtin of the class `owner` names: MR_SEND_ARRAY, ...) */
+VALUE mr_callo(int owner, VALUE recv, const char *name, int argc, ...);
+#define mr_calla(recv, ...) mr_callo(MR_SEND_ARRAY, recv, __VA_ARGS__)
+#define mr_calls(recv, ...) mr_callo(MR_SEND_STRING, recv, __VA_ARGS__)
+#define mr_callh(recv, ...) mr_callo(MR_SEND_HASH, recv, __VA_ARGS__)
+#define mr_callk(recv, ...) mr_callo(MR_SEND_KERNEL, recv, __VA_ARGS__)
 VALUE mr_callv(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int flags);
 /* The top-level object: Kernel's functions (Integer(), throw, sleep ...) are
  * private methods, and it is as good a receiver as any. */
@@ -105,7 +118,7 @@ VALUE mr_frame_block(void);
 /* A C function registered to be run by number. */
 long mr_register_function(void *fn, int arity);
 RBIMPL_ATTR_NORETURN() void mr_fatal(const char *message);
-/* MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch|fileprobe: one guarantee switched off, for
+/* MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch|fileprobe|builtin: one guarantee switched off, for
  * the negative controls of tools/capi_check.py. UNSOUND; a diagnostic. */
 int mr_without(const char *what);
 /* An API this C side does not provide: NotImplementedError, never a guess. */

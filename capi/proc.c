@@ -56,7 +56,8 @@ VALUE rb_yield_block(VALUE yielded, VALUE data, int argc, const VALUE *argv, VAL
 
 /* ---- procs ------------------------------------------------------------------ */
 static VALUE block_proc(rb_block_call_func_t func, VALUE data, int lambda);
-VALUE rb_proc_new(rb_block_call_func_t func, VALUE data) { return block_proc(func, data, 1); }
+/* (a Proc, not a lambda: `rb_proc_new(f, v).lambda?` is false in ruby) */
+VALUE rb_proc_new(rb_block_call_func_t func, VALUE data) { return block_proc(func, data, 0); }
 VALUE rb_obj_is_proc(VALUE obj) { return rb_obj_is_kind_of(obj, rb_cProc); }
 VALUE rb_obj_is_method(VALUE obj) { return rb_obj_is_kind_of(obj, rb_cMethod); }
 VALUE rb_proc_call(VALUE proc, VALUE args) { return mr_callv(proc, rb_intern("call"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, 0); }
@@ -199,37 +200,52 @@ VALUE rb_extract_keywords(VALUE *options) {
     *options = RTEST(mr_call(others, "empty?", 0)) ? 0 : others;
     return RTEST(mr_call(symbols, "empty?", 0)) ? 0 : symbols;
 }
+/* class.c's rb_get_kwargs, as it is in 4.0. With `values` a keyword that is
+ * found is TAKEN OUT of the Hash (also when a negative `optional` lets others
+ * stay), and one that is not found is Qundef; without `values` the Hash is
+ * only looked at. What is left in a Hash that may not have a rest is the
+ * unknown keywords. */
+static VALUE keyword_error(const char *what, VALUE keys) {
+    return rb_exc_new_str(rb_eArgError, rb_sprintf("%s keyword%s: %" PRIsVALUE, what, RARRAY_LEN(keys) > 1 ? "s" : "",
+                          mr_call(mr_ruby("->(a) { a.map(&:inspect).join(', ') }"), "call", 1, keys)));
+}
+static int extract_keyword(VALUE keywords, VALUE key, VALUE *values, int at) {
+    if (!RTEST(mr_callh(keywords, "key?", 1, key))) {
+        if (values) values[at] = Qundef;
+        return 0;
+    }
+    if (values) values[at] = mr_callh(keywords, "delete", 1, key);
+    return 1;
+}
 int rb_get_kwargs(VALUE keywords, const ID *table, int required, int optional, VALUE *values) {
-    int rest = 0, found = 0;
-    if (optional < 0) { rest = 1; optional = -1 - optional; }
+    int i = 0, j, rest = 0;
     VALUE missing = Qnil;
-    for (int i = 0; i < required + optional; i++) {
-        VALUE key = ID2SYM(table[i]);
-        if (!NIL_P(keywords) && RTEST(mr_call(keywords, "key?", 1, key))) {
-            if (values) values[i] = rb_hash_aref(keywords, key);
-            if (!rest) rb_hash_delete(keywords, key);
-            found++;
+    if (NIL_P(keywords)) keywords = 0;
+    if (optional < 0) { rest = 1; optional = -1 - optional; }
+    if (required) {
+        for (; i < required; i++) {
+            VALUE key = ID2SYM(table[i]);
+            if (keywords && extract_keyword(keywords, key, values, i)) continue;
+            if (NIL_P(missing)) missing = rb_ary_new();
+            rb_ary_push(missing, key);
         }
-        else {
-            if (values) values[i] = Qundef;
-            if (i < required) {
-                if (NIL_P(missing)) missing = rb_ary_new();
-                rb_ary_push(missing, key);
-            }
+        if (!NIL_P(missing)) rb_exc_raise(keyword_error("missing", missing));
+    }
+    j = i;
+    if (optional && keywords) {
+        for (i = 0; i < optional; i++)
+            if (extract_keyword(keywords, ID2SYM(table[required + i]), values, required + i)) j++;
+    }
+    if (!rest && keywords) {
+        if (RHASH_SIZE(keywords) > (size_t)(values ? 0 : j)) {
+            for (i = 0; i < required + optional; i++) mr_callh(keywords, "delete", 1, ID2SYM(table[i]));
+            rb_exc_raise(keyword_error("unknown", mr_callh(keywords, "keys", 0)));
         }
     }
-    if (!NIL_P(missing)) {
-        VALUE names = mr_call(mr_call(missing, "map", 0), "to_a", 0);
-        (void)names;
-        rb_raise(rb_eArgError, "missing keyword%s: %" PRIsVALUE, RARRAY_LEN(missing) > 1 ? "s" : "",
-                 mr_call(mr_ruby("->(a) { a.map(&:inspect).join(', ') }"), "call", 1, missing));
+    if (values && !keywords) {
+        for (i = 0; i < required + optional; i++) values[i] = Qundef;
     }
-    if (!rest && !NIL_P(keywords) && !RTEST(mr_call(keywords, "empty?", 0))) {
-        VALUE keys = mr_call(keywords, "keys", 0);
-        rb_raise(rb_eArgError, "unknown keyword%s: %" PRIsVALUE, RARRAY_LEN(keys) > 1 ? "s" : "",
-                 mr_call(mr_ruby("->(a) { a.map(&:inspect).join(', ') }"), "call", 1, keys));
-    }
-    return found;
+    return j;
 }
 
 /* ---- recursion guards --------------------------------------------------------------- */
