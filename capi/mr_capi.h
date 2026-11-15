@@ -57,7 +57,8 @@ enum mr_op {
     MR_PROC_NEW,        /* a: function number, c: 0 a block (b: its data), 1 the same as a lambda, 2 a method body (b: arity, d: its name) -> Proc */
     MR_SYMBOL,          /* bytes: a name with bytes text cannot carry -> Symbol (its ID) */
     MR_GC,              /* a: 0 collect, 1 stress on, 2 stress off, 3 enable, 4 disable, 5 count */
-    MR_ARY_NEW          /* a: length; words: elements -> Array */
+    MR_ARY_NEW,         /* a: length; words: elements -> Array */
+    MR_BREAK            /* a: value -- `break value` from the block this C was called in */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8 };
 enum mr_method_kind { MR_M_INSTANCE = 0, MR_M_SINGLETON, MR_M_MODULE_FUNCTION, MR_M_PRIVATE, MR_M_PROTECTED, MR_M_GLOBAL };
@@ -85,6 +86,10 @@ double mr_got_dbl(void);
 /* Call a method by name: mr_call(recv, "name", n, a1 .. an). */
 VALUE mr_call(VALUE recv, const char *name, int argc, ...);
 VALUE mr_callv(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int flags);
+/* A piece of Ruby this side is written in (a lambda, mostly): evaluated once
+ * at the top level and kept. `source` is a string literal -- its address is
+ * the key. */
+VALUE mr_ruby(const char *source);
 /* The constant at a path from Object, kept by path ("Comparable", "File::Stat"). */
 VALUE mr_const(const char *path);
 /* Unwind C to the nearest guard with an outcome on its way out. */

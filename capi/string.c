@@ -176,7 +176,7 @@ VALUE rb_str_succ(VALUE str) { return mr_call(str, "succ", 0); }
 VALUE rb_str_scrub(VALUE str, VALUE repl) { return NIL_P(repl) ? mr_call(str, "scrub", 0) : mr_call(str, "scrub", 1, repl); }
 VALUE rb_str_ellipsize(VALUE str, long len) {
     if (len < 0) rb_raise(rb_eIndexError, "negative length %ld", len);
-    return mr_call(rb_eval_string("->(s, n) { s.length <= n ? s : n <= 3 ? '...'[0, n] : s[0, n - 3] + '...' }"), "call", 2, str, LONG2NUM(len));
+    return mr_call(mr_ruby("->(s, n) { s.length <= n ? s : n <= 3 ? '...'[0, n] : s[0, n - 3] + '...' }"), "call", 2, str, LONG2NUM(len));
 }
 VALUE rb_str_drop_bytes(VALUE str, long len) { mr_call(str, "replace", 1, mr_call(str, "byteslice", 2, LONG2NUM(len), LONG2NUM(RSTRING_LEN(str)))); return changed(str); }
 VALUE rb_str_locktmp(VALUE str) { return str; }
@@ -195,7 +195,7 @@ VALUE rb_str_conv_enc(VALUE str, rb_encoding *from, rb_encoding *to) {
     VALUE args[3] = { str, rb_enc_from_encoding(to), from ? rb_enc_from_encoding(from) : rb_obj_encoding(str) };
     (void)outcome;
     int state = 0;
-    VALUE helper = rb_eval_string("->(s, to, from) { s.encode(to, from) rescue s }");
+    VALUE helper = mr_ruby("->(s, to, from) { s.encode(to, from) rescue s }");
     (void)state;
     return mr_callv(helper, rb_intern("call"), 3, args, Qnil, 0);
 }

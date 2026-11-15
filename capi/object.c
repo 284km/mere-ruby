@@ -138,9 +138,22 @@ VALUE rb_path_to_class(VALUE path) {
 }
 VALUE rb_path2class(const char *path) { return rb_path_to_class(rb_str_new_cstr(path)); }
 
-VALUE rb_ivar_get(VALUE obj, ID id) { return mr_call(obj, "instance_variable_get", 1, ID2SYM(id)); }
-VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_call(obj, "instance_variable_set", 2, ID2SYM(id), value); return value; }
-VALUE rb_ivar_defined(VALUE obj, ID id) { return mr_call(obj, "instance_variable_defined?", 1, ID2SYM(id)); }
+/* An instance variable by ID. A name with no `@` is one only C sees (CRuby's
+ * "internal" variables): it is kept under a name of the interpreter's hidden
+ * kind, which instance_variables and Marshal pass over. */
+static VALUE ivar_name(ID id) {
+    long len = 0;
+    const char *s = mr_id_name(id, &len);
+    if (!s) rb_raise(rb_eNameError, "invalid instance variable ID");
+    if (len > 0 && s[0] == '@') return ID2SYM(id);
+    char *buffer = alloca((size_t)len + 16);
+    memcpy(buffer, "@__capi_", 8);
+    memcpy(buffer + 8, s, (size_t)len);
+    return ID2SYM(rb_intern2(buffer, len + 8));
+}
+VALUE rb_ivar_get(VALUE obj, ID id) { return mr_call(obj, "instance_variable_get", 1, ivar_name(id)); }
+VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_call(obj, "instance_variable_set", 2, ivar_name(id), value); return value; }
+VALUE rb_ivar_defined(VALUE obj, ID id) { return mr_call(obj, "instance_variable_defined?", 1, ivar_name(id)); }
 VALUE rb_attr_get(VALUE obj, ID id) { return rb_ivar_get(obj, id); }
 VALUE rb_iv_get(VALUE obj, const char *name) { return rb_ivar_get(obj, rb_intern(name)); }
 VALUE rb_iv_set(VALUE obj, const char *name, VALUE value) { return rb_ivar_set(obj, rb_intern(name), value); }
@@ -161,10 +174,10 @@ static VALUE global_name(const char *name) {
 }
 /* (the value travels as a block's argument, never through source text) */
 VALUE rb_gv_get(const char *name) {
-    return mr_call(rb_eval_string("->(n) { eval(n) }"), "call", 1, global_name(name));
+    return mr_call(mr_ruby("->(n) { eval(n) }"), "call", 1, global_name(name));
 }
 VALUE rb_gv_set(const char *name, VALUE value) {
-    mr_call(rb_eval_string("->(n, v) { eval(\"#{n} = v\") }"), "call", 2, global_name(name), value);
+    mr_call(mr_ruby("->(n, v) { eval(\"#{n} = v\") }"), "call", 2, global_name(name), value);
     return value;
 }
 

@@ -211,6 +211,18 @@ VALUE mr_const(const char *path) {
     mr_put_text(path);
     return mr_up1(MR_CONST, Qnil);
 }
+VALUE mr_ruby(const char *source) {
+    static struct { const char *source; VALUE value; } kept[128];
+    static int count;
+    for (int i = 0; i < count; i++) if (kept[i].source == source) return kept[i].value;
+    if (count == 128) mr_fatal("too many pieces of Ruby kept by the C API");
+    VALUE value = mr_call(mr_const("TOPLEVEL_BINDING"), "eval", 1, rb_str_new_cstr(source));
+    rb_gc_register_mark_object(value);
+    kept[count].source = source;
+    kept[count].value = value;
+    count++;
+    return value;
+}
 void mr_unsupported(const char *what) {
     rb_raise(rb_eNotImpError, "%s is not provided by mere-ruby's C API", what);
 }
@@ -402,6 +414,12 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
         frame.method = (ID)(req.mu_e & 0xffffffffLL);
         frame.keywords = (int)((req.mu_e >> 32) & 1);
     }
+    else if (req.mu_op == MR_RUN_BLOCK) {
+        /* A C function run as a block belongs to the C method that made it:
+         * that method's name, and (after the arguments) that method's block. */
+        frame.method = (ID)(req.mu_e & 0xffffffffLL);
+        frame.block = mr_word(argc);
+    }
     guard.prev = NULL;
     frame.guard = &guard;
     cur = &frame;
@@ -437,6 +455,21 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
     ret.mu_w = (long long)result;
     ret.mu_raised = raised;
     return ret;
+}
+
+/* A symbol of an extension that is loaded, by the feature it was required as. */
+void *rb_ext_resolve_symbol(const char *feature, const char *symbol) {
+    size_t n = strlen(feature);
+    for (long i = 0; i < library_count; i++) {
+        const char *path = libraries[i].path;
+        size_t len = strlen(path);
+        const char *dot = strrchr(path, '.');
+        size_t stem = dot ? (size_t)(dot - path) : len;
+        if (stem >= n && !strncmp(path + stem - n, feature, n) && (stem == n || path[stem - n - 1] == '/'))
+            return dlsym(libraries[i].handle, symbol);
+        if (len >= n && !strcmp(path + len - n, feature)) return dlsym(libraries[i].handle, symbol);
+    }
+    return NULL;
 }
 
 int mr_capi_depth(void) { return depth; }

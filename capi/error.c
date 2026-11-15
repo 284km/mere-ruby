@@ -95,7 +95,13 @@ void rb_error_frozen(const char *what) { rb_raise(rb_eFrozenError, "can't modify
 void rb_check_frozen(VALUE obj) {
     if (RB_SPECIAL_CONST_P(obj) || RTEST(rb_obj_frozen_p(obj))) rb_error_frozen_object(obj);
 }
-void rb_notimplement(void) { rb_raise(rb_eNotImpError, "function is unimplemented on this machine"); }
+extern ID mr_frame_method(void);
+void rb_notimplement(void) {
+    ID name = mr_frame_method();
+    const char *s = name ? rb_id2name(name) : NULL;
+    if (s) rb_raise(rb_eNotImpError, "%s() function is unimplemented on this machine", s);
+    rb_raise(rb_eNotImpError, "function is unimplemented on this machine");
+}
 VALUE rb_f_notimplement(int argc, const VALUE *argv, VALUE obj, VALUE marker) {
     (void)argc; (void)argv; (void)obj; (void)marker;
     rb_notimplement();

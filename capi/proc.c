@@ -46,15 +46,17 @@ VALUE rb_yield_splat_kw(VALUE ary, int kw) {
     if (NIL_P(args)) rb_raise(rb_eArgError, "not an array");
     return yield_values(RARRAY_LENINT(args), RARRAY_CONST_PTR(args), kw ? MR_SEND_KW : 0);
 }
+/* A block function that yields what it was given to the C method's block,
+ * and the block it was given as that block's own (`{ |x, &b| }`). */
 VALUE rb_yield_block(VALUE yielded, VALUE data, int argc, const VALUE *argv, VALUE block) {
-    (void)yielded; (void)data; (void)block;
-    return yield_values(argc, argv, 0);
+    (void)yielded; (void)data;
+    rb_need_block();
+    return mr_callv(mr_frame_block(), rb_intern("call"), argc, argv, block, 0);
 }
 
 /* ---- procs ------------------------------------------------------------------ */
-VALUE rb_proc_new(rb_block_call_func_t func, VALUE data) {
-    return mr_up(MR_PROC_NEW, (VALUE)mr_register_function((void *)func, -3), data, 1, 0, 0);
-}
+static VALUE block_proc(rb_block_call_func_t func, VALUE data, int lambda);
+VALUE rb_proc_new(rb_block_call_func_t func, VALUE data) { return block_proc(func, data, 1); }
 VALUE rb_obj_is_proc(VALUE obj) { return rb_obj_is_kind_of(obj, rb_cProc); }
 VALUE rb_obj_is_method(VALUE obj) { return rb_obj_is_kind_of(obj, rb_cMethod); }
 VALUE rb_proc_call(VALUE proc, VALUE args) { return mr_callv(proc, rb_intern("call"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, 0); }
@@ -68,39 +70,26 @@ VALUE rb_method_call_kw(int argc, const VALUE *argv, VALUE method, int kw) { ret
 VALUE rb_method_call_with_block(int argc, const VALUE *argv, VALUE method, VALUE block) { return mr_callv(method, rb_intern("call"), argc, argv, block, 0); }
 VALUE rb_binding_new(void) { mr_unsupported("rb_binding_new"); }
 
-/* A call with a C function as its block. rb_iter_break leaves it: the call
- * is made under a catch, and the break is a throw to it. */
-static VALUE break_tag(void) {
-    static VALUE tag;
-    if (!tag) {
-        tag = rb_obj_alloc(rb_cObject);
-        rb_gc_register_mark_object(tag);
-    }
-    return tag;
-}
-static VALUE call_under_catch(void) {
-    static VALUE helper;
-    if (!helper) {
-        helper = rb_eval_string("->(tag, obj, mid, args, blk) { catch(tag) { obj.__send__(mid, *args, &blk) } }");
-        rb_gc_register_mark_object(helper);
-    }
-    return helper;
-}
-static VALUE block_call(VALUE obj, ID mid, int argc, const VALUE *argv, rb_block_call_func_t func, VALUE data, int flags) {
-    VALUE block = func ? mr_up(MR_PROC_NEW, (VALUE)mr_register_function((void *)func, -3), data, 0, 0, 0) : Qnil;
-    if (flags) return mr_callv(obj, mid, argc, argv, block, flags);
-    VALUE argv2[5] = { break_tag(), obj, ID2SYM(mid), rb_ary_new_from_values(argc, argv), block };
-    return mr_callv(call_under_catch(), rb_intern("call"), 5, argv2, Qnil, 0);
+/* A call with a C function as its block. The block is the C method's own:
+ * it carries that method's name and block (rb_frame_this_func, rb_yield). */
+static VALUE block_proc(rb_block_call_func_t func, VALUE data, int lambda) {
+    return mr_up(MR_PROC_NEW, (VALUE)mr_register_function((void *)func, -3), data, (VALUE)lambda,
+                 (VALUE)mr_frame_method(), mr_frame_block());
 }
 VALUE rb_block_call(VALUE obj, ID mid, int argc, const VALUE *argv, rb_block_call_func_t func, VALUE data) {
-    return block_call(obj, mid, argc, argv, func, data, 0);
+    VALUE block = func ? block_proc(func, data, 0) : Qnil;
+    return mr_callv(obj, mid, argc, argv, block, 0);
 }
 VALUE rb_block_call_kw(VALUE obj, ID mid, int argc, const VALUE *argv, rb_block_call_func_t func, VALUE data, int kw) {
-    return block_call(obj, mid, argc, argv, func, data, kw ? MR_SEND_KW : 0);
+    VALUE block = func ? block_proc(func, data, 0) : Qnil;
+    return mr_callv(obj, mid, argc, argv, block, kw ? MR_SEND_KW : 0);
 }
 VALUE rb_each(VALUE obj) { return mr_callv(obj, rb_intern("each"), 0, NULL, mr_frame_block(), 0); }
-void rb_iter_break_value(VALUE value) { rb_throw_obj(break_tag(), value); }
-void rb_iter_break(void) { rb_throw_obj(break_tag(), Qnil); }
+void rb_iter_break_value(VALUE value) {
+    mr_up1(MR_BREAK, value);
+    mr_fatal("a break returned");
+}
+void rb_iter_break(void) { rb_iter_break_value(Qnil); }
 
 /* ---- evaluation and loading ---------------------------------------------------- */
 /* In the frame that called the C method in progress: its self, its locals. */
@@ -120,7 +109,7 @@ VALUE rb_require(const char *feature) { return rb_require_string(rb_str_new_cstr
 VALUE rb_f_require(VALUE obj, VALUE feature) { (void)obj; return rb_require_string(feature); }
 void rb_provide(const char *feature) { mr_call(rb_gv_get("$LOADED_FEATURES"), "push", 1, rb_str_new_cstr(feature)); }
 int rb_provided(const char *feature) {
-    return RTEST(mr_call(rb_eval_string("->(f) { $LOADED_FEATURES.any? { |x| x == f || x.end_with?('/' + f) || File.basename(x, '.*') == f } }"),
+    return RTEST(mr_call(mr_ruby("->(f) { $LOADED_FEATURES.any? { |x| x == f || x.end_with?('/' + f) || File.basename(x, '.*') == f } }"),
                          "call", 1, rb_str_new_cstr(feature)));
 }
 int rb_feature_provided(const char *feature, const char **loading) { if (loading) *loading = NULL; return rb_provided(feature); }
@@ -203,8 +192,8 @@ int rb_scan_args_kw(int kw_flag, int argc, const VALUE *argv, const char *fmt, .
 VALUE rb_extract_keywords(VALUE *options) {
     VALUE hash = *options;
     if (NIL_P(hash)) return Qnil;
-    VALUE keywords = rb_eval_string("->(h) { h.select { |k, _| k.is_a?(Symbol) } }");
-    VALUE rest = rb_eval_string("->(h) { h.reject { |k, _| k.is_a?(Symbol) } }");
+    VALUE keywords = mr_ruby("->(h) { h.select { |k, _| k.is_a?(Symbol) } }");
+    VALUE rest = mr_ruby("->(h) { h.reject { |k, _| k.is_a?(Symbol) } }");
     VALUE symbols = mr_call(keywords, "call", 1, hash);
     VALUE others = mr_call(rest, "call", 1, hash);
     *options = RTEST(mr_call(others, "empty?", 0)) ? 0 : others;
@@ -233,12 +222,12 @@ int rb_get_kwargs(VALUE keywords, const ID *table, int required, int optional, V
         VALUE names = mr_call(mr_call(missing, "map", 0), "to_a", 0);
         (void)names;
         rb_raise(rb_eArgError, "missing keyword%s: %" PRIsVALUE, RARRAY_LEN(missing) > 1 ? "s" : "",
-                 mr_call(rb_eval_string("->(a) { a.map(&:inspect).join(', ') }"), "call", 1, missing));
+                 mr_call(mr_ruby("->(a) { a.map(&:inspect).join(', ') }"), "call", 1, missing));
     }
     if (!rest && !NIL_P(keywords) && !RTEST(mr_call(keywords, "empty?", 0))) {
         VALUE keys = mr_call(keywords, "keys", 0);
         rb_raise(rb_eArgError, "unknown keyword%s: %" PRIsVALUE, RARRAY_LEN(keys) > 1 ? "s" : "",
-                 mr_call(rb_eval_string("->(a) { a.map(&:inspect).join(', ') }"), "call", 1, keys));
+                 mr_call(mr_ruby("->(a) { a.map(&:inspect).join(', ') }"), "call", 1, keys));
     }
     return found;
 }

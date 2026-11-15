@@ -319,7 +319,7 @@ int mr_capi_enc_index(const char *name) { return mr_enc_index_of_name(name); }
 static int index_by_lookup(const char *name) {
     fill();
     for (int i = 0; i < entry_count; i++) if (same_name(entries[i]->type.name, name)) return i;
-    VALUE found = mr_call(rb_eval_string("->(n) { (Encoding.find(n).name rescue nil) }"), "call", 1, rb_str_new_cstr(name));
+    VALUE found = mr_call(mr_ruby("->(n) { (Encoding.find(n).name rescue nil) }"), "call", 1, rb_str_new_cstr(name));
     if (NIL_P(found)) return -1;
     return mr_enc_index_of_name(StringValueCStr(found));
 }
@@ -486,7 +486,7 @@ int rb_enc_str_asciionly_p(VALUE str) { return RTEST(mr_call(str, "ascii_only?",
 int rb_enc_symname_p(const char *name, rb_encoding *enc) { return rb_enc_symname2_p(name, (long)strlen(name), enc); }
 int rb_enc_symname2_p(const char *name, long len, rb_encoding *enc) {
     VALUE s = rb_enc_str_new(name, len, enc);
-    return RTEST(mr_call(rb_eval_string("->(s) { s.to_sym.inspect !~ /\\A:\"/ }"), "call", 1, s));
+    return RTEST(mr_call(mr_ruby("->(s) { s.to_sym.inspect !~ /\\A:\"/ }"), "call", 1, s));
 }
 int rb_enc_unicode_p(rb_encoding *enc) { return (enc->flags & ONIGENC_FLAG_UNICODE) != 0; }
 long rb_str_coderange_scan_restartable(const char *s, const char *e, rb_encoding *enc, int *cr) {

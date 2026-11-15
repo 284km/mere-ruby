@@ -30,12 +30,7 @@ static void out_pad(struct out *o, char c, long n) {
 }
 
 static VALUE quote_unprintable(void) {
-    static VALUE helper;
-    if (!helper) {
-        helper = rb_eval_string("->(s) { (s.valid_encoding? && s !~ /[^[:print:]]/) ? s : s.inspect[1..-2].gsub(/\\\\([\"\\\\#])/) { $1 } }");
-        rb_gc_register_mark_object(helper);
-    }
-    return helper;
+    return mr_ruby("->(s) { (s.valid_encoding? && s !~ /[^[:print:]]/) ? s : s.inspect[1..-2].gsub(/\\\\([\"\\\\#])/) { $1 } }");
 }
 
 /* Format into a malloc'd buffer. `carried` is set to the first VALUE string
