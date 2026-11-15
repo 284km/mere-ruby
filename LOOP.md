@@ -4732,6 +4732,12 @@ is the description; this is what was decided and what was measured.
   in the middle of `rb_block_call`; each stack has its own chain of C calls
   (`mr_capi_switch`, called from the one place the interpreter switches
   stacks).
+- **Whether a file is an extension of ours is asked of the file.** The
+  intake asked by `dlopen` and `dlclose`, which gave an accepted library an
+  extra constructor / destructor cycle before its `Init_` and ran a foreign
+  library's constructors (PR #83's review). The file is read for the name
+  every extension compiled against these headers defines; the library is
+  opened once, and the number behind the name is compared then.
 - **What is refused**: `capi/unsupported.c` lists 66 functions that exist so
   that a library using them loads, and raise NotImplementedError by name
   when called -- CRuby's internal bignum routines (`rb_big_mul_toom3`, ...:
@@ -4746,10 +4752,10 @@ is the description; this is what was decided and what was measured.
   build-linux: ruby's `ext/-test-/exception`, `typeddata`, `float`, `iter`
   and the fixtures of `capi/check`, built against the reference's headers
   and against these; five contract scripts print the same on both sides
-  (ensure 58, typeddata 78, loader 46 and one of our own, numeric 13, fiber
+  (ensure 58, typeddata 78, loader 48 and one of our own, numeric 13, fiber
   16), again under a collection at every safepoint; and with dmark, dfree,
-  the ensure cleanup and the stack switch each switched off, the contracts
-  that depend on it fail. Run here on macOS (reference 3.4.9, the one
+  the ensure cleanup, the stack switch and the load-free ABI question each
+  switched off, the contracts that depend on it fail. Run here on macOS (reference 3.4.9, the one
   installed) and in a Linux container with ruby 4.0.9: both agree.
 - The unit test shards build all of `ext/-test-` with
   `tools/capi_ext_build.py` (72 of 75 directories build; the three that do

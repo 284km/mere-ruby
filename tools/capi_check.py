@@ -23,6 +23,9 @@ What each run is for:
   no-switch            (negative) a call into C in progress is not kept with
                        the stack it is on when fibers switch: the fiber
                        contracts must FAIL
+  no-fileprobe         (negative) a file is asked whether it is an extension
+                       by loading it: its constructors run twice, and the
+                       loader contracts must FAIL
 
 A negative control that passes means the check was not looking at the thing
 it names. Each run is bounded: 120 seconds, 2 GiB (its children included).
@@ -104,6 +107,9 @@ def run(name, side, script, lib, extra=None):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith('MERE_RUBY_') and k not in ('RUBYOPT', 'RUBYLIB', 'MERE_LOADER_TEST')}
     env.update(RUBYLIB=str(lib), LOADER_LIB=str(lib), LANG='en_US.UTF-8')
+    events = OUT / f'{name}.{script}.{side}.events'
+    events.unlink(missing_ok=True)
+    env['LOADER_EVENTS'] = str(events)
     if side == 'mere':
         env['MERE_LOADER_TEST'] = '1'
     env.update(extra or {})
@@ -137,7 +143,8 @@ for script in scripts:
     if count['mere'] - count['reference'] != (1 if script == 'loader' else 0):
         problems.append(f"{script}: {count['reference']} checks on the reference, {count['mere']} on mere-ruby")
 for name, knob, script in [('no-dmark', 'dmark', 'typeddata'), ('no-dfree', 'dfree', 'typeddata'),
-                           ('no-ensure', 'ensure', 'ensure'), ('no-switch', 'switch', 'fiber')]:
+                           ('no-ensure', 'ensure', 'ensure'), ('no-switch', 'switch', 'fiber'),
+                           ('no-fileprobe', 'fileprobe', 'loader')]:
     result = run(name, 'mere', script, libs['mere'], {'MERE_RUBY_CAPI_WITHOUT': knob})
     failed_as_it_must = passed(result) is None and result['limit'] is None
     print(f"{name:10s} {script}: {'fails, as it must' if failed_as_it_must else 'PASSED -- the check does not see ' + knob}", flush=True)

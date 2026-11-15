@@ -104,11 +104,14 @@ a Ruby Thread whose body is the C function.
 ## Loading
 
 `require 'x'` finds `x.bundle` (macOS) or `x.so` on the load path. Before a
-file is a candidate at all, it is opened and asked for
-`rb_mere_extension_abi`: a library compiled for another ruby does not have
-it, is passed over, and the feature is whatever provided it before (a `.rb`,
-the shipped library). A library that has it is opened, its `Init_x` is run
-once, and the feature is recorded the way a `.rb` is. On Linux the
+file is a candidate at all, the file is read for the name
+`rb_mere_extension_abi`, which every extension compiled against these
+headers defines: a library compiled for another ruby does not have it, is
+passed over without being loaded (none of its code runs), and the feature
+is whatever provided it before (a `.rb`, the shipped library). A library
+that has it is opened once -- its constructors run once -- the number
+behind the name is compared (a different one is a LoadError), its `Init_x`
+is run, and the feature is recorded the way a `.rb` is. On Linux the
 executable is linked with `-rdynamic`: the library finds `rb_*` in the
 interpreter that loads it.
 
@@ -148,9 +151,9 @@ feature name and the sources (it does not run it; mkmf is the next step).
   fixtures in `capi/check` are built twice, against the reference ruby's
   headers and against these. The five contract scripts in `capi/check` must
   print the same on both sides, and again on this side with a collection at
-  every safepoint. Then four guarantees are switched off one at a time
-  (`MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch`) and the contracts
-  that depend on each must fail.
+  every safepoint. Then five guarantees are switched off one at a time
+  (`MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch|fileprobe`) and the
+  contracts that depend on each must fail.
 - The unit test run builds all of `ext/-test-` and runs `test/-ext-` against
   it, file by file, like every other directory of ruby's tests.
 

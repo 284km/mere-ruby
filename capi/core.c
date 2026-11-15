@@ -313,16 +313,45 @@ static long library_count, library_cap;
 
 /* Was this file compiled against mere-ruby's ruby.h? One built for another
  * ruby is not a candidate for the feature at all: `require` goes on to
- * whatever provided it before (a .rb, the shipped library). */
+ * whatever provided it before (a .rb, the shipped library).
+ *
+ * The question is asked of the FILE, not of the loaded library: opening a
+ * library runs its constructors, and closing it its destructors, so asking
+ * by dlopen gave an accepted library a whole extra life before its Init_,
+ * and ran a foreign library's constructors in this process. Every extension
+ * compiled against these headers defines rb_mere_extension_abi, so its
+ * symbol table names it; the number itself is read when the library is
+ * really opened (mr_capi_open), which refuses a different one aloud. */
+static int file_names(const char *path, const char *needle) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    size_t n = strlen(needle), kept = 0, got;
+    char buffer[65536 + 64];
+    int found = 0;
+    while (!found && (got = fread(buffer + kept, 1, 65536, f)) > 0) {
+        size_t have = kept + got;
+        for (size_t i = 0; i + n <= have; i++) {
+            if (buffer[i] == needle[0] && !memcmp(buffer + i, needle, n)) { found = 1; break; }
+        }
+        /* (a name that straddles two reads: keep the tail) */
+        kept = have < n - 1 ? have : n - 1;
+        memmove(buffer, buffer + have - kept, kept);
+    }
+    fclose(f);
+    return found;
+}
 int mr_capi_probe(const char *path) {
     for (long i = 0; i < library_count; i++)
         if (!strcmp(libraries[i].path, path)) return 1;
-    void *handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
-    if (!handle) return 0;
-    const unsigned int *abi = (const unsigned int *)dlsym(handle, "rb_mere_extension_abi");
-    int ours = abi && *abi == MR_EXTENSION_ABI;
-    dlclose(handle);
-    return ours;
+    if (mr_without("fileprobe")) {
+        void *handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) return 0;
+        const unsigned int *abi = (const unsigned int *)dlsym(handle, "rb_mere_extension_abi");
+        int ours = abi && *abi == MR_EXTENSION_ABI;
+        dlclose(handle);
+        return ours;
+    }
+    return file_names(path, "rb_mere_extension_abi");
 }
 
 int mr_capi_open(const char *path) {

@@ -1,4 +1,15 @@
 #include <ruby.h>
+#include <stdio.h>
+#include <stdlib.h>
+/* What the dynamic loader does with this library, in order: one line per
+ * constructor, Init_ and destructor, in the file LOADER_EVENTS names. */
+static void event(const char *what) {
+    const char *path = getenv("LOADER_EVENTS");
+    FILE *f = path ? fopen(path, "a") : NULL;
+    if (f) { fprintf(f, "%s\n", what); fclose(f); }
+}
+__attribute__((constructor)) static void loaded(void) { event("constructor"); }
+__attribute__((destructor)) static void unloaded(void) { event("destructor"); }
 static int inits;
 typedef struct { VALUE value; } box;
 static void mark(void *p) { rb_gc_mark(((box *)p)->value); }
@@ -13,6 +24,7 @@ static VALUE explode(VALUE self) { (void)self; rb_raise(rb_eRuntimeError,"native
 static VALUE count(VALUE self) { (void)self; return INT2NUM(inits); }
 static VALUE echo(VALUE self,VALUE v) { (void)self; return v; }
 void Init_loader_fixture(void) {
+    event("Init");
     inits++;
     VALUE mod=rb_define_module("LoaderFixture");
     VALUE klass=rb_define_class_under(mod,"Box",rb_cObject);
