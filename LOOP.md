@@ -4841,6 +4841,16 @@ is the description; this is what was decided and what was measured.
   round adds is witnessed by the two-sided contracts above, each with the
   control that makes it fail.
 
+**What CI found** (PR #87):
+
+- `config.h` claimed `dup3` and `pipe2` for macOS: this machine's macOS has
+  them and the runner's release does not, and `config_probe.py --check`
+  refused the claim on the runner. They are said for Linux alone now.
+- With the file asked instead of loaded (above), ruby's own
+  `-test-/memory_status` extension loads, which is what `tool/lib`'s
+  `assert_no_memory_leak` waits for: its tests (34 files use it) were
+  pended as "unsupported platform" on this side and now run.
+
 **Measured here** (this machine, the interpreter's side only; CI's shards
 are the record and go in below when they have run): of `test/-ext-`'s 94
 files, 94 reach their summary (12 did at the baseline, CI run 43548292351 on
