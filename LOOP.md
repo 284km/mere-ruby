@@ -4718,6 +4718,13 @@ runs on the evaluator.
   frame it was written in), marking an env that carries one marks the tree,
   the method table is read for bodies that are programs, and what nothing
   named in a collection is freed after its marking (m_state's vm_sweep).
+  A body a Method or UnboundMethod object still holds after its name was
+  defined again or removed is read too (the evaluator's snapshot table,
+  snap_meths, and a box's own methods, bx_meth): `saved =
+  Object.instance_method(:m)`, a second `def m`, two GC.start, and
+  `saved.bind(o).call` raised "no longer loaded" (the second review of #85).
+  Those two tables keep a body for as long as they keep the entry, so its
+  tree stays that long.
   ISeq#eval frees its tree at once unless a Proc took the frame or a def of
   it actually ran. Counted with `RubyVM::InstructionSequence.__vm_trees`:
   100 evals of a sequence whose def is never taken hold 0 trees, of one
