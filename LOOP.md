@@ -4927,6 +4927,19 @@ the reference.
   the scope and the superclass have names, C's definition now runs `class
   Outer::Name < Super; end` itself. The anonymous way is kept for the rest,
   and the interpreter's own gap is still there for plain Ruby.
+- **`have_func` of a ruby function is answered by whether this interpreter
+  has it.** mkmf answers by linking a program that names the function, and
+  there was nothing to link a program against -- the C API is in the
+  executable -- so the answer was "no" for every ruby function and an
+  extension compiled its own substitutes. tools/build.sh now writes an
+  import library after the link (capi/tools/import_library.py:
+  `capi/lib/libmere-ruby-api`, one empty symbol for each of the 781
+  functions and 101 variables of the C API the executable exports), and
+  RbConfig names it as `LIBRUBYARG`, which mkmf puts on the link line of
+  its test programs and not on an extension's. The 66 functions of
+  capi/unsupported.c are left out of it: for those the answer is "no", so
+  an extension takes its other path instead of meeting NotImplementedError
+  when it runs.
 - **test/mkmf has a build tree to run in.** ruby's mkmf tests are written
   for a ruby build tree (`$extmk`, topdir's Makefile, ruby.h under the
   source tree, config.h under `.ext`). The reference side runs them in its
@@ -4941,13 +4954,14 @@ the reference.
   extconf.rb asks about headers, functions, macros, a size and a library,
   and ruby's `ext/-test-/float` by its own extconf.rb, built with
   `extconf.rb`, `make`, `make install` on both rubies. What mkmf answered
-  is read out of the built library: 11 contracts, the same on both sides
-  and under a collection at every safepoint. A source that does not compile
+  is read out of the built library: 14 contracts, the same on both sides
+  and under a collection at every safepoint (`rb_ary_new` yes on both,
+  `rb_tracepoint_new` yes on the reference and no here). A source that does not compile
   fails at `make` on both; mere-ruby given the libraries the reference's
   mkmf built fails.
 - `tools/capi_gem_check.py` (CI, macOS and Linux): fast_blank 1.0.1,
   redcarpet 3.6.1 and msgpack 1.8.7 are installed by each ruby with `gem
-  install` from the same .gem files; `capi/check/gems.rb` uses them (30
+  install` from the same .gem files; `capi/check/gems.rb` uses them (34
   lines of output: blank tests, HTML and a Ruby-defined renderer called back
   from C, packing and unpacking Integers, Floats, binary and UTF-8 Strings,
   a streaming unpacker, a malformed input's exception) and prints the same
@@ -4959,9 +4973,9 @@ the reference.
 record and go in below when they have run):
 
 - `test/mkmf`: 144 of 148 pass and all 17 files reach their summary (0 and
-  none at the baseline). The four left: `have_func("ruby_init")` -- a
-  program cannot be linked against the C API, which lives in the
-  executable, so mkmf's answer for a ruby API function is "no"; two of
+  none at the baseline). The four left: `have_func("ruby_init")` -- the
+  embedding entry point is not part of this C API, and the answer is a
+  true "no"; two of
   test_have_library, which take the platform's library prefix from
   `LIBRUBY_A`'s name, and there is no such archive; `test_dir_config`,
   which wants `libdir` written in terms of `exec_prefix`.
@@ -4985,6 +4999,5 @@ on any build):
   it is then EISDIR, at random. capi_gem_check.py runs with a home of its
   own.
 
-**Next**: an import library so that mkmf's `have_func` of a ruby API
-function answers truthfully (gems probe for functions and define their own
-when the answer is no), then a gem that brings a library with it (nokogiri).
+**Next**: a gem that brings a library with it (nokogiri), and the C API
+functions such gems turn out to need.

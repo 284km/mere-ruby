@@ -11,6 +11,13 @@ check(answers['stdint.h'] == true)
 check(answers['no_such_header_anywhere.h'] == false)
 check(answers['strlen'] == true)
 check(answers['no_such_function_anywhere'] == false)
+# A function of the C API is there when this ruby has it. TracePoint from C
+# is one mere-ruby does not provide (capi/unsupported.c): there the answer is
+# no, and an extension takes its other path instead of meeting
+# NotImplementedError when it runs.
+check(answers['rb_ary_new'] == true)
+check(answers['rb_no_such_function_anywhere'] == false)
+check(answers['rb_tracepoint_new'] == (ENV['CAPI_CHECK_SIDE'] != 'mere'))
 check(answers['__STDC__'] == true)
 check(answers['NO_SUCH_MACRO_ANYWHERE'] == false)
 check(answers['sizeof(long)'] == [0].pack('l!').bytesize)

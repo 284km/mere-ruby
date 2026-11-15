@@ -11,8 +11,9 @@ says of its own build (the compiler, the flags, where ruby.h is).
 What each run is for:
 
   probe                capi/check/mkmf/probe: extconf.rb asks the compiler
-                       about headers, functions, a macro, a size and a
-                       library; the built library says what was answered
+                       about headers, functions (the C library's and
+                       ruby's own), a macro, a size and a library; the
+                       built library says what was answered
   float                ruby's ext/-test-/float through its own extconf.rb
   contracts            capi/check/mkmf.rb loads both libraries, on both
                        sides, and must print the same; on mere-ruby again
@@ -63,6 +64,7 @@ def run(key, side, command, cwd, extra=None, lib=None):
     if path:
         env['RUBYLIB'] = os.pathsep.join(path)
     env['LANG'] = 'en_US.UTF-8'
+    env['CAPI_CHECK_SIDE'] = side
     env.update(extra or {})
     log = OUT / f'{key}.{side}.out'
     old = Path.cwd()

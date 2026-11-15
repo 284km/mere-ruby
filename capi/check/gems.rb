@@ -16,7 +16,10 @@ data = { "a" => [1, 2.5, nil, true, "str", :sym.to_s, 2**40, -3, { "n" => [] }],
 packed = MessagePack.pack(data)
 p packed.bytesize, packed.encoding
 p MessagePack.unpack(packed) == data
-p MessagePack.unpack(MessagePack.pack([1.5, "日本語", [[]], {}]))
+# (bytes and encoding, not the String's inspect: how that is written depends
+#  on the locale the reference was started in)
+back = MessagePack.unpack(MessagePack.pack([1.5, "日本語", [[]], {}]))
+p back[0], back[1].encoding, back[1].bytes, back[2], back[3]
 u = MessagePack::Unpacker.new
 u.feed_each(MessagePack.pack(1) + MessagePack.pack("two") + MessagePack.pack([3])) { |o| p o }
 pk = MessagePack::Packer.new

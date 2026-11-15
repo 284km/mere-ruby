@@ -181,6 +181,10 @@ fi
 # shellcheck disable=SC2086
 clang $opt -w $plat -I "$root/vendor/prism/include" "$main_c" "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" -DMR_CAPI_BUILD -I "$root/capi/include" -I "$root/capi" -I "$root/capi/vendor" "$root"/capi/*.c -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
+# The import library of the C API (capi/tools/import_library.py): what mkmf
+# links its test programs against, so that `have_func` of a ruby function is
+# answered by whether this executable has it.
+python3 "$root/capi/tools/import_library.py" "$root/mere-ruby" "$root/capi/lib" >/dev/null || { echo 'build.sh: the import library of the C API was not written' >&2; exit 1; }
 
 # ...and say which build this is, where something that must not be misled can
 # read it. mspec/scoreboard.sh does.

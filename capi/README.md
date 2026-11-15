@@ -140,11 +140,15 @@ values are how `tools/build.sh` builds the interpreter and how the two
 commands above build an extension; nothing is copied from a CRuby
 installation. A build without the C API has none of these keys.
 
-Two answers of mkmf differ from CRuby's because there is no libruby to link
-a test PROGRAM against: `have_func` of a ruby API function (`ruby_init`,
-`rb_ary_new`) says no, since its test program does not link; and
-`ENABLE_SHARED` is not said (see the comment where the keys are, in
-m_driver.mere). The installation directories (`prefix`, `libdir`,
+`have_func("rb_ary_new")` -- mkmf links a test PROGRAM that names the
+function -- is answered by an import library, `capi/lib/libmere-ruby-api`,
+which tools/build.sh writes after the link
+(`capi/tools/import_library.py`): one empty symbol for each function and
+variable of the C API the executable exports. RbConfig names it as
+`LIBRUBYARG`, which mkmf puts on the link line of its test programs only.
+The functions of `capi/unsupported.c` are left out of it, so for them the
+answer is "no" and an extension takes its other path. `ENABLE_SHARED` is
+not said (see the comment where the keys are, in m_driver.mere). The installation directories (`prefix`, `libdir`,
 `sitearchdir`) are still the stand-ins they were: `make install` is given
 its directory, as RubyGems gives it.
 
