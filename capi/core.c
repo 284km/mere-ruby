@@ -491,6 +491,7 @@ struct mr_parked { int stack; struct mr_frame *frame; int depth; };
 static struct mr_parked *parked;
 static long parked_count, parked_cap;
 int mr_capi_switch(int from, int to) {
+    if (mr_without("switch")) return 0;
     if (cur) {
         if (parked_count == parked_cap) {
             parked_cap = parked_cap ? parked_cap * 2 : 8;

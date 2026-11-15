@@ -3,14 +3,14 @@
 
     capi_check.py --ruby-source <ruby> --reference <ruby binary> --output <dir>
 
-The same C -- Ruby's own ext/-test-/exception, typeddata and float, and the
+The same C -- Ruby's own ext/-test-/exception, typeddata, float and iter, and the
 fixtures in capi/check -- is built twice: against the reference's headers and
 against mere-ruby's (tools/capi_ext_build.py does both). The contract scripts
 in capi/check then run on both sides and must print the same thing.
 
 What each run is for:
 
-  contracts            the four scripts on both sides, the same output
+  contracts            the five scripts on both sides, the same output
   stress               the same on mere-ruby with a collection at every
                        safepoint: what C holds must outlive each of them
   no-dmark             (negative) a data object's dmark is not called: the
@@ -19,6 +19,9 @@ What each run is for:
   no-dfree             (negative) dfree is not called: the count of freed
                        structs stays 0 and the TypedData contracts must FAIL
   no-ensure            (negative) rb_ensure skips its cleanup: the ensure
+                       contracts must FAIL
+  no-switch            (negative) a call into C in progress is not kept with
+                       the stack it is on when fibers switch: the fiber
                        contracts must FAIL
 
 A negative control that passes means the check was not looking at the thing
@@ -64,7 +67,7 @@ extras = {
 def build(side):
     lib = OUT / (side + '-lib')
     command = [sys.executable, str(ROOT / 'tools' / 'capi_ext_build.py'), '--ruby-source', str(SRC),
-               '--output', str(lib), '--only=-test-/exception', '--only=-test-/float']
+               '--output', str(lib), '--only=-test-/exception', '--only=-test-/float', '--only=-test-/iter']
     if side == 'reference':
         for directory in reference_headers:
             command += ['--headers', directory]
@@ -73,7 +76,7 @@ def build(side):
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
     report = json.loads((lib / 'build.json').read_text())
     failed = [r for r in report if not r['built']]
-    if failed or len(report) != 2 + len(extras):
+    if failed or len(report) != 3 + len(extras):
         sys.exit(f'{side}: extensions not built: {failed or report}')
     # what the loader contracts ask for beside the extensions themselves
     (lib / 'alias').mkdir()
@@ -120,7 +123,7 @@ def passed(result):
 
 
 libs = {side: build(side) for side in ('reference', 'mere')}
-scripts = ['ensure', 'typeddata', 'loader', 'numeric']
+scripts = ['ensure', 'typeddata', 'loader', 'numeric', 'fiber']
 problems = []
 for script in scripts:
     answers = {side: passed(run('contracts', side, script, libs[side])) for side in ('reference', 'mere')}
@@ -135,7 +138,7 @@ for script in scripts:
     if count['mere'] - count['reference'] != (1 if script == 'loader' else 0):
         problems.append(f"{script}: {count['reference']} checks on the reference, {count['mere']} on mere-ruby")
 for name, knob, script in [('no-dmark', 'dmark', 'typeddata'), ('no-dfree', 'dfree', 'typeddata'),
-                           ('no-ensure', 'ensure', 'ensure')]:
+                           ('no-ensure', 'ensure', 'ensure'), ('no-switch', 'switch', 'fiber')]:
     result = run(name, 'mere', script, libs['mere'], {'MERE_RUBY_CAPI_WITHOUT': knob})
     failed_as_it_must = passed(result) is None and result['limit'] is None
     print(f"{name:10s} {script}: {'fails, as it must' if failed_as_it_must else 'PASSED -- the check does not see ' + knob}", flush=True)
