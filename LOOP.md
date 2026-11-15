@@ -4664,3 +4664,62 @@ loading alone was past the 600 s a file has on CI. corpus 657.
 - Not done here: the tree RubyVM::AbstractSyntaxTree answers. That is the
   translation from Prism's tree to parse.y's, in progress on its own branch
   (note 551).
+
+## 2026-11-15 (56): rounds 34-36 -- the VM runs blocks, methods, classes and rescue / ensure
+
+Rounds 34 to 36 of note 548 (the record from here on is note 552). corpus 658.
+
+**In one line**: `RubyVM::InstructionSequence#eval` now runs on the VM a
+sequence that has blocks, defines methods and classes, calls super, and
+rescues, ensures and retries -- 227 snippets identical to ruby 4.0.9 with
+the VM forced (tools/iseq/vm_check.sh, was 61); the compiler is 410 / 410
+against ruby (tools/iseq/compare_with_ruby.rb, was 383). What the VM cannot
+run it still refuses whole, before the first instruction, and the sequence
+runs on the evaluator.
+
+- **A sequence's parts are programs of their own, run in the evaluator's
+  frames.** A block's, a method's and a class body's sequence is decoded
+  once into a program (vm_code / vm_meta, m_state.mere), and the evaluator
+  is handed the SAME statements its parser would have made -- EMethodB /
+  ECallB with the block, SDef, SClass / SClassE / SSingletonE, ESuper,
+  SVis, SAlias, SUndef -- whose body is one statement, `SVm`, that runs the
+  program. So a block's frame and arity, break / next, a Proc made of it,
+  a method's key, visibility, method_added, `super`, reopening a class are
+  the evaluator's, once; only what the body does is the VM's. Parameters
+  are bound by the evaluator from the sequence's own table (vm_params); an
+  optional parameter that was not given is bound to a marker (EVmArg) and
+  the sequence's own default code runs, entered at the label for how many
+  were given.
+- **rescue / ensure are the evaluator's begin, given functions.** run_begin
+  is now a wrapper over run_begin_f, which takes the body, the rescue
+  clauses, the else and the ensure as functions. The VM hands it a catch
+  table entry's protected instructions and its rescue / ensure sequence
+  (vm_region), so `$!`, retry, an ensure's own escape and what a pending
+  exception means are one implementation. A break / next / redo / return
+  thrown out of a rescue or ensure sequence travels as a flow signal, so
+  the ensures between it and where it lands run (vm_jump, vm_seg).
+- **The compiler** (lib/iseq_compiler_ext.rb): `it` and `_1`.. blocks, redo,
+  return with several values, and an ensure clause inlined where a return /
+  break / next / redo leaves its region (pm_add_ensure_iseq, its region cut
+  around the copy; thrown instead under a rescue's body:
+  can_add_ensure_iseq). `to_a(u, true)` is the VM's export: ruby's Array
+  plus what ruby's leaves out that a run needs (a for loop's parameter,
+  `**nil`).
+- **Found on the way, in the evaluator**: a `def initialize` run as a
+  statement (an eval'd body, under an `if` in a class body) was public --
+  ruby keeps initialize, initialize_copy / _clone / _dup and
+  respond_to_missing? private wherever the def runs.
+- **Programs are given back.** A loaded tree is freed when its run ends
+  unless something still names it (a Proc captured its frame, a method was
+  defined from it): 1,500 evals in a row peak at 258 MB, 300 at 255 MB.
+- **Still refused** (the sequence runs on the evaluator): a TracePoint or
+  Coverage on, `...`, binding / eval / local_variables called bare, class
+  variables and pattern matching (the compiler), a String literal that is
+  not UTF-8.
+- **Speed, measured, not yet worked on** (local, -O2, the same program on
+  the evaluator and on the VM): a method-call mix 1.0 s / 1.8 s, a block
+  mix 1.3 s / 2.3 s, a 3M-turn integer loop 1.7 s / 4.5 s. The compiler in
+  Ruby takes 2.1 s for pp.rb's 738 lines: before whole files run on the VM
+  it has to be native (note 552).
+- Next: line / call events and Coverage on the VM, then whole files, then
+  speed.

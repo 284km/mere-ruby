@@ -100,7 +100,7 @@ class RubyVM::InstructionSequence
       #  pushes them; it is kept only when the sequence may catch something
       #  -- catch_except_p)
       attr_reader :catch
-      attr_accessor :catch_except, :block_labels, :block_nop
+      attr_accessor :catch_except, :block_labels, :block_nop, :in_rescue
 
       def add_catch(type, ls, le, iseq, lc)
         ls.unremovable = true
@@ -314,6 +314,9 @@ class RubyVM::InstructionSequence
       when Prism::ArrayNode then array(u, n, popped)
       when Prism::LocalVariableReadNode
         u.insn(:getlocal, *local_ref(u, n.name, n.depth)) unless popped
+      # (`it`: the hidden parameter of the block it is read in, IT_PARAM)
+      when Prism::ItLocalVariableReadNode
+        u.insn(:getlocal, *local_ref(u, IT_PARAM, 0)) unless popped
       when Prism::LocalVariableWriteNode
         node(u, n.value, false)
         here(u, n)
@@ -419,6 +422,7 @@ class RubyVM::InstructionSequence
         u.insn(:throw, 4)
         u.insn(:pop) if popped
       when Prism::NextNode then next_node(u, n, popped)
+      when Prism::RedoNode then redo_node(u, n, popped)
       when Prism::InterpolatedSymbolNode
         dstr(u, n, false)
         here(u, n)
@@ -565,6 +569,9 @@ class RubyVM::InstructionSequence
     end
 
     LocalOp = Struct.new(:name, :index, :idx)
+    # (the name of the hidden local a block that reads `it` has for it: no
+    #  position a destructured parameter is named by)
+    IT_PARAM = -1
 
     def static_literal?(n)
       case n
@@ -1157,6 +1164,19 @@ class RubyVM::InstructionSequence
       child = Unit.new(:block, label, u.path, u.abs_path, first_line || l.start_line, b.locals, u,
                        [start[0], start[1], l.end_line, l.end_column], b.node_id)
       params(child, b.parameters.is_a?(Prism::BlockParametersNode) ? b.parameters.parameters : nil, b.parameters)
+      # (implicit parameters: `_1` .. `_9` are the block's first locals, as
+      #  many required parameters as the highest one named; `it` is one hidden
+      #  required parameter. One alone takes an Array whole or its first
+      #  element as `|x|` does: ambiguous_param0.)
+      case b.parameters
+      when Prism::NumberedParametersNode
+        child.params[:lead_num] = b.parameters.maximum
+        child.params[:ambiguous_param0] = true if b.parameters.maximum == 1
+      when Prism::ItParametersNode
+        child.locals.replace([IT_PARAM] + child.locals.reject { |x| x == IT_PARAM })
+        child.params[:lead_num] = 1
+        child.params[:ambiguous_param0] = true
+      end
       u.children << child
       opt_defaults(child)
       param_prologue(child, [l.start_line, 0])
@@ -1655,26 +1675,43 @@ class RubyVM::InstructionSequence
     def return_node(u, n, popped)
       unless u.type == :method || u.type == :top
         raise NotImplementedError, "RubyVM::InstructionSequence: return from here is not compiled yet" unless THROUGH.include?(u.type)
-        args = n.arguments&.arguments || []
-        raise NotImplementedError, "RubyVM::InstructionSequence: return with values is not compiled yet" if args.size > 1
-        if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+        return_value(u, n)
+        here(u, n)
+        u.insn(:throw, 1)
+        u.insn(:pop) if popped
+        return
+      end
+      sp_l = u.new_label
+      u.emit_label(sp_l)
+      u.adjust(nil, false)
+      return_value(u, n)
+      unless can_add_ensure?(u)
         here(u, n)
         u.insn(:throw, 1)
         u.insn(:pop) if popped
         return
       end
       no_ensure_escape(u, true)
-      sp_l = u.new_label
-      u.emit_label(sp_l)
-      u.adjust(nil, false)
-      args = n.arguments&.arguments || []
-      raise NotImplementedError, "RubyVM::InstructionSequence: return with values is not compiled yet" if args.size > 1
-      if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
       here(u, n)
       u.event(:return)
       u.insn(:leave)
       u.adjust(sp_l, true)
       u.insn(:putnil) unless popped
+    end
+
+    # what a return (or a break, a next) answers: nil, its one value, or the
+    # Array of several (PM_ARGUMENTS_NODE compiled as a value: never the
+    # duparray of a literal Array)
+    ArgsArray = Struct.new(:elements, :location, :node_id) do
+      def static_literal? = false
+    end
+
+    def return_value(u, n)
+      args = n.arguments&.arguments || []
+      if args.empty? then (here(u, n); u.insn(:putnil))
+      elsif args.size == 1 then node(u, args[0], false)
+      else array(u, ArgsArray.new(args, n.arguments.location, n.arguments.node_id), false)
+      end
     end
 
     # -- multiple assignment -------------------------------------------------
@@ -2038,7 +2075,10 @@ class RubyVM::InstructionSequence
       child.insn(:throw, 0)
       finish(child)
       u.emit_label(lstart)
+      was = u.in_rescue
+      u.in_rescue = true
       if n.statements then node(u, n.statements, false) else (here(u, rc); u.insn(:putnil)) end
+      u.in_rescue = was
       u.emit_label(lend)
       if n.else_clause
         here(u, n)
@@ -2129,7 +2169,10 @@ class RubyVM::InstructionSequence
       lend = u.new_label
       lcont = u.new_label
       u.emit_label(lstart)
+      was = u.in_rescue
+      u.in_rescue = true
       node(u, n.expression, false)
+      u.in_rescue = was
       u.emit_label(lend)
       here(u, n)
       u.insn(:nop)
@@ -2151,7 +2194,8 @@ class RubyVM::InstructionSequence
       lcont = u.new_label
       ensr = u.capture { node(u, stmts, true) if stmts }
       last_leave = ensr.reverse.find { |e| !e.is_a?(Trace) }.then { |e| e.is_a?(Insn) && e.name == :leave }
-      u.ensures.push(true)
+      en = EnsureEntry.new(ec, [[lstart, lend]])
+      u.ensures.push(en)
       u.emit_label(lstart)
       if n.rescue_clause then rescue_part(u, n, popped || last_leave)
       elsif n.statements then node(u, n.statements, popped || last_leave)
@@ -2171,17 +2215,49 @@ class RubyVM::InstructionSequence
       child.insn(:getlocal, *local_ref(child, ERRINFO, 0))
       child.insn(:throw, 0)
       finish(child)
-      i = u.elements.index { |x| x.equal?(lstart) }
-      u.add_catch(:ensure, lstart, lend, child, lcont) unless u.elements[i + 1].equal?(lend)
+      # (one entry for each piece of the region an inlined copy of the
+      #  ensure left: add_ensure_range)
+      en.ranges.each do |st, ed|
+        i = u.elements.index { |x| x.equal?(st) }
+        u.add_catch(:ensure, st, ed, child, lcont) unless u.elements[i + 1].equal?(ed)
+      end
     end
 
-    # (an ensure clause run on the way out of its region -- return, break,
-    #  next -- is inlined by pm_add_ensure_iseq; not yet)
-    def no_ensure_escape(u, past_loops)
-      list = u.ensures
-      list = list[((list.rindex(:loop) || -1) + 1)..] unless past_loops
-      return unless list.include?(true)
-      raise NotImplementedError, "RubyVM::InstructionSequence: leaving an ensure region this way is not compiled yet"
+    # can_add_ensure_iseq: under a rescue's protected body, an ensure
+    # around it is not inlined -- the jump is thrown and the catch table
+    # runs it
+    def can_add_ensure?(u) = !(u.in_rescue && u.ensures.any? { |e| e != :loop })
+
+    # an ensure being compiled under: its clause, and the pieces of its
+    # region (compile.c's ensure_range list)
+    EnsureEntry = Struct.new(:node, :ranges)
+
+    # pm_add_ensure_iseq: on the way out of ensure regions -- a return, a
+    # loop's break / next / redo -- each ensure clause left is run here, the
+    # innermost first, compiled again in place; and the copy is cut out of
+    # its region (add_ensure_range), since the region's exception path would
+    # run it a second time. A jump inside a loop stops at the loop.
+    def no_ensure_escape(u, is_return)
+      saved = u.ensures.dup
+      i = saved.size - 1
+      while i >= 0
+        en = saved[i]
+        if en == :loop
+          break unless is_return
+        else
+          lstart = u.new_label
+          lend = u.new_label
+          last = en.ranges.last
+          en.ranges << [lend, last[1]]
+          last[1] = lstart
+          u.ensures.replace(saved[0...i])
+          u.emit_label(lstart)
+          node(u, en.node.statements, true) if en.node.statements
+          u.emit_label(lend)
+        end
+        i -= 1
+      end
+      u.ensures.replace(saved)
     end
 
     # prism_compile.c's pm_compile_case_node: the conditions and the bodies
@@ -2879,18 +2955,19 @@ class RubyVM::InstructionSequence
       args = n.arguments&.arguments || []
       raise NotImplementedError, "RubyVM::InstructionSequence: next with values" if args.size > 1
       sp = u.new_label
-      no_ensure_escape(u, false) if u.loops.last || u.type == :block
-      if (lp = u.loops.last)
+      if (lp = u.loops.last) && can_add_ensure?(u)
         u.emit_label(sp)
         if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+        no_ensure_escape(u, false)
         here(u, n)
         u.adjust(lp[2], false)
         u.insn(:jump, lp[0])
-      elsif u.type == :block
+      elsif u.type == :block && can_add_ensure?(u)
         u.emit_label(sp)
         here(u, n)
         u.adjust(u.block_labels[0], false)
         if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+        no_ensure_escape(u, false)
         here(u, n)
         u.insn(:jump, u.block_labels[1])
         u.adjust(sp, true)
@@ -2908,6 +2985,38 @@ class RubyVM::InstructionSequence
         raise NotImplementedError, "RubyVM::InstructionSequence: next here is not compiled yet"
       end
       u.adjust(sp, true)
+      u.insn(:putnil) unless popped
+    end
+
+    # pm_compile_redo_node. In a loop: the stack back to the loop's and its
+    # redo label again. In a block: the stack back to the block's start and
+    # the body again. From a rescue / ensure sequence: thrown.
+    def redo_node(u, n, popped)
+      sp = u.new_label
+      if (lp = u.loops.last) && can_add_ensure?(u)
+        u.emit_label(sp)
+        here(u, n)
+        u.adjust(lp[2], false)
+        no_ensure_escape(u, false)
+        here(u, n)
+        u.insn(:jump, lp[2])
+      elsif u.type == :block && can_add_ensure?(u)
+        u.emit_label(sp)
+        no_ensure_escape(u, false)
+        here(u, n)
+        u.adjust(u.block_labels[0], false)
+        u.insn(:jump, u.block_labels[0])
+      elsif escape_scope(u)
+        here(u, n)
+        u.insn(:putnil)
+        u.insn(:throw, THROW_NO_ESCAPE | 5)
+        u.insn(:pop) if popped
+        return
+      else
+        raise NotImplementedError, "RubyVM::InstructionSequence: redo here is not compiled yet"
+      end
+      u.adjust(sp, true)
+      sp.unremovable = false
       u.insn(:putnil) unless popped
     end
 
@@ -2931,13 +3040,13 @@ class RubyVM::InstructionSequence
     def break_node(u, n, popped)
       args = n.arguments&.arguments || []
       raise NotImplementedError, "RubyVM::InstructionSequence: break with values" if args.size > 1
-      if (lp = u.loops.last)
-        no_ensure_escape(u, false)
+      if (lp = u.loops.last) && can_add_ensure?(u)
         sp = u.new_label
         u.emit_label(sp)
         here(u, n)
         u.adjust(lp[2], false)
         if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+        no_ensure_escape(u, false)
         here(u, n)
         u.insn(:jump, lp[1])
         u.adjust(sp, true)
@@ -3727,7 +3836,10 @@ class RubyVM::InstructionSequence
     end
 
     # -- to_a ----------------------------------------------------------------
-    def to_a(u)
+    # (`vm`: for the VM's loader, which reads this -- the same Array, and what
+    #  ruby's own to_a leaves out that a run needs: a for loop's block has
+    #  one required parameter)
+    def to_a(u, vm = false)
       misc = { arg_size: arg_size(u), local_size: u.locals.size, stack_max: u.stack_max,
                node_id: u.node_id, code_location: u.code_location,
                node_ids: u.elements.grep(Insn).map(&:node_id), parser: u.parser }
@@ -3739,7 +3851,7 @@ class RubyVM::InstructionSequence
       exception = u.kept_catch.map do |c|
         st, ed, cont, sp = catch_positions(c)
         [st, ed, cont].each { |x| named[x] = true }
-        [c[0], c[3] && to_a(c[3]), :"label_#{st}", :"label_#{ed}", :"label_#{cont}", sp]
+        [c[0], c[3] && to_a(c[3], vm), :"label_#{st}", :"label_#{ed}", :"label_#{cont}", sp]
       end
       u.elements.each do |e|
         next unless e.is_a?(Insn)
@@ -3760,13 +3872,13 @@ class RubyVM::InstructionSequence
           last = e.line
         end
         EVENT_DISASM.each { |ev, _| body << EVENT_TO_A[ev] if e.events.include?(ev) && EVENT_TO_A[ev] }
-        body << [e.name, *e.ops.map { |o| operand_to_a(o) }]
+        body << [e.name, *e.ops.map { |o| operand_to_a(o, vm) }]
       end
       pr = u.params
       params = {}
       params[:opt] = pr[:opt].map { |l| :"label_#{l.pos}" } if pr[:opt]
       # (a for loop's block counts its hidden parameter without has_lead)
-      params[:lead_num] = pr[:lead_num] if pr[:lead_num] > 0 && !pr[:for]
+      params[:lead_num] = pr[:lead_num] if pr[:lead_num] > 0 && (vm || !pr[:for])
       if pr[:post_num]
         params[:post_num] = pr[:post_num]
         params[:post_start] = pr[:post_start]
@@ -3779,6 +3891,7 @@ class RubyVM::InstructionSequence
       end
       params[:kwrest] = pr[:kwrest] if pr[:kwrest]
       params[:ambiguous_param0] = true if pr[:ambiguous_param0]
+      params[:accepts_no_kwarg] = true if vm && pr[:no_kwarg]
       params[:use_block] = true if pr[:use_block]
       # (a hidden local -- kwbits -- is numbered as iseq_data_to_ary numbers it)
       locals = u.locals.each_with_index.map { |l, i| l.is_a?(Integer) ? u.locals.size - i + 1 : l }
@@ -3786,7 +3899,7 @@ class RubyVM::InstructionSequence
        u.first_lineno, u.type, locals, params, exception, body]
     end
 
-    def operand_to_a(o)
+    def operand_to_a(o, vm = false)
       case o
       when CallData
         h = { mid: o.mid, flag: o.flag }
@@ -3799,7 +3912,7 @@ class RubyVM::InstructionSequence
       when IC then o.segments
       when DefType then o.n
       when CDHash then o.entries.flat_map { |k, l| [k, :"label_#{l.pos}"] }
-      when Unit then to_a(o)
+      when Unit then to_a(o, vm)
       else o
       end
     end
@@ -3939,6 +4052,8 @@ class RubyVM::InstructionSequence
 
     # (a hidden local is "?", one that is no plain identifier is quoted)
     def local_name(name)
+      # (ruby names the hidden parameter of `it` in its disasm, not in to_a)
+      return "<it>".inspect if name == IT_PARAM
       return "?" if name.is_a?(Integer)
       name.to_s.match?(/\A[a-z_][A-Za-z0-9_]*\z/) ? name.to_s : name.to_s.inspect
     end
