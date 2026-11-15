@@ -82,9 +82,11 @@ fi
 #                     more; Apple's clang allows more by default but the flag is
 #                     harmless there. tools/bracket_depth_check.sh is the gate.
 #   -lm               Linux needs it spelled out
+#   -rdynamic -ldl    an extension library finds Ruby's C API (capi/*.c) in the
+#                     executable that loads it; Mach-O exports those by default
 case "$(uname -s)" in
   Darwin) plat="-Wl,-stack_size,0x20000000 -fbracket-depth=1024" ;;
-  *)      plat="-fbracket-depth=1024 -lm"
+  *)      plat="-fbracket-depth=1024 -lm -rdynamic -ldl"
           # Clang's parser also uses the process stack for the emitted C.
           # Match the interpreter's stack budget during compilation itself.
           ulimit -s 524288 || exit 2 ;;

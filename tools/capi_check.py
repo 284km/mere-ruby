@@ -43,12 +43,11 @@ parser.add_argument('--reference', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--mere', type=Path, default=ROOT / 'mere-ruby')
 args = parser.parse_args()
-if sys.platform != 'darwin':
-    parser.error('the extensions are built as .bundle: macOS only, for now')
 SRC, REF, OUT, MERE = (p.resolve() for p in (args.ruby_source, args.reference, args.output, args.mere))
 OUT.mkdir(parents=True, exist_ok=True)
 if any(OUT.iterdir()):
     parser.error('--output must be empty, to exclude stale build products')
+DLEXT, LINK = ('.bundle', ['-bundle', '-undefined', 'dynamic_lookup']) if sys.platform == 'darwin' else ('.so', ['-shared', '-fPIC'])
 sys.path.insert(0, str(ROOT / 'unittest'))
 from ci import supervise  # noqa: E402
 
@@ -80,21 +79,21 @@ def build(side):
         sys.exit(f'{side}: extensions not built: {failed or report}')
     # what the loader contracts ask for beside the extensions themselves
     (lib / 'alias').mkdir()
-    (lib / 'alias' / 'loader_fixture.bundle').symlink_to(lib / 'loader_fixture.bundle')
+    (lib / 'alias' / ('loader_fixture' + DLEXT)).symlink_to(lib / ('loader_fixture' + DLEXT))
     (lib / 'loader_shadow.rb').write_text('$loader_shadow = :ruby\n')
-    (lib / 'loader_shadow.bundle').symlink_to(lib / 'loader_fixture.bundle')
+    (lib / ('loader_shadow' + DLEXT)).symlink_to(lib / ('loader_fixture' + DLEXT))
     (lib / 'relative_driver.rb').write_text("$relative_native = require_relative 'loader_fixture'\n")
     scratch = OUT / (side + '-scratch')
     scratch.mkdir()
     includes = [x for d in (reference_headers if side == 'reference' else [ROOT / 'capi' / 'include'])
                 for x in ('-I', str(d))]
     (scratch / 'missing.c').write_text('#include <ruby.h>\nvoid Init_other(void) {}\n')
-    subprocess.run(['clang', '-bundle', '-undefined', 'dynamic_lookup', '-w', *includes, str(scratch / 'missing.c'),
-                    '-o', str(lib / 'loader_missing_init.bundle')], check=True)
+    subprocess.run(['clang', *LINK, '-w', *includes, str(scratch / 'missing.c'),
+                    '-o', str(lib / ('loader_missing_init' + DLEXT))], check=True)
     # (no ruby.h at all: nothing says which ruby it was built for)
     (scratch / 'foreign.c').write_text('void Init_loader_wrongabi(void) {}\n')
-    subprocess.run(['clang', '-bundle', str(scratch / 'foreign.c'), '-o', str(lib / 'loader_wrongabi.bundle')],
-                   check=True)
+    subprocess.run(['clang', LINK[0], '-fPIC', str(scratch / 'foreign.c'),
+                    '-o', str(lib / ('loader_wrongabi' + DLEXT))], check=True)
     return lib
 
 

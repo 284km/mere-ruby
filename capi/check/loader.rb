@@ -1,3 +1,5 @@
+require 'rbconfig'
+DLEXT = '.' + RbConfig::CONFIG['DLEXT']
 $checks=0
 def check(name, value)
   raise name unless value
@@ -15,10 +17,10 @@ check('first require', require('loader_fixture') == true)
 check('repeat require', require('loader_fixture') == false)
 check('native suffix alias', require('loader_fixture.so') == false)
 check('one Init call', LoaderFixture.init_count == 1)
-loaded = $LOADED_FEATURES.find { |f| f.end_with?('/loader_fixture.bundle') }
+loaded = $LOADED_FEATURES.find { |f| f.end_with?("/loader_fixture#{DLEXT}") }
 check('loaded feature has native suffix', !loaded.nil?)
 check('absolute path identity', require(loaded) == false)
-check('symlink identity', require(File.join(ENV.fetch('LOADER_LIB'), 'alias', 'loader_fixture.bundle')) == false)
+check('symlink identity', require(File.join(ENV.fetch('LOADER_LIB'), 'alias', "loader_fixture#{DLEXT}")) == false)
 box = LoaderFixture::Box.new('payload')
 GC.start
 check('native initialize and getter', box.value == 'payload')
@@ -67,14 +69,14 @@ check('nested native require', require('loader_nested') == true)
 check('nested definition', defined?(LoaderNested) == 'constant')
 check('nested dependency did not reinitialize', LoaderFixture.init_count == 1)
 raised(RuntimeError) { require 'loader_retry' }
-check('failed Init not loaded', !$LOADED_FEATURES.any? { |f| f.end_with?('/loader_retry.bundle') })
+check('failed Init not loaded', !$LOADED_FEATURES.any? { |f| f.end_with?("/loader_retry#{DLEXT}") })
 check('partial method remains callable', LoaderRetry.attempts == 1)
 check('retry succeeds', require('loader_retry') == true)
 check('same resident library state', LoaderRetry.ready == 2)
 check('successful retry cached', require('loader_retry') == false)
 check('Ruby source wins same-name extension', require('loader_shadow') == true && $loader_shadow == :ruby)
 raised(LoadError) { require 'loader_missing_init' }
-check('missing Init not loaded', !$LOADED_FEATURES.any? { |f| f.end_with?('/loader_missing_init.bundle') })
+check('missing Init not loaded', !$LOADED_FEATURES.any? { |f| f.end_with?("/loader_missing_init#{DLEXT}") })
 check('relative require from Ruby file', require('relative_driver') == true && $relative_native == false)
 # Removing a loaded feature permits reinitialization, as in CRuby.
 $LOADED_FEATURES.delete(loaded)
@@ -85,6 +87,6 @@ check('reload invokes Init', LoaderFixture.init_count == 2)
 if ENV['MERE_LOADER_TEST'] == '1'
   raised(LoadError) { require 'loader_wrongabi' }
   raised(LoadError) { require 'loader_wrongabi' }
-  check('a foreign library is not cached as loaded', !$LOADED_FEATURES.any? { |f| f.end_with?('/loader_wrongabi.bundle') })
+  check('a foreign library is not cached as loaded', !$LOADED_FEATURES.any? { |f| f.end_with?("/loader_wrongabi#{DLEXT}") })
 end
 puts "native loader contracts: #{$checks} passed"
