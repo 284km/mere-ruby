@@ -21,12 +21,13 @@ static VALUE define_class(VALUE outer, const char *name, VALUE super, int module
             rb_raise(rb_eTypeError, "superclass mismatch for class %s", name);
         return found;
     }
-    VALUE made;
-    if (module) made = mr_call(rb_cModule, "new", 0);
-    else {
-        if (NIL_P(super) || super == 0) rb_raise(rb_eArgError, "no super class for '%s'", name);
-        made = mr_call(rb_cClass, "new", 1, super);
-    }
+    if (!module && (NIL_P(super) || super == 0)) rb_raise(rb_eArgError, "no super class for '%s'", name);
+    /* The class statement itself, where the scope and the superclass have
+     * names; else an anonymous class, set as the constant. */
+    mr_put_text(name);
+    VALUE made = mr_up(MR_DEFINE_CLASS, outer, module ? Qnil : super, (VALUE)(module ? 1 : 0), 0, 0);
+    if (made != 0) return made;
+    made = module ? mr_call(rb_cModule, "new", 0) : mr_call(rb_cClass, "new", 1, super);
     mr_call(outer, "const_set", 2, sym, made);
     return made;
 }

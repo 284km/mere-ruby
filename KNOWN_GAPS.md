@@ -4494,8 +4494,8 @@ interpreter that finds `capi/include/ruby.h` beside its executable says its
 own build in RbConfig -- the header directory, the executable's directory
 and name, clang and the flags an extension for it is built with -- and
 ruby's `mkmf.rb` works from that (capi/README.md, "Building an extension").
-These are mere-ruby's facts, not a reference installation's table: about 60
-keys, where CRuby has 254, so rbconfig_spec's count is still not met, and a
+These are mere-ruby's facts, not a reference installation's table: 97
+keys in all, where CRuby has 254, so rbconfig_spec's count is still not met, and a
 build without the C API still has only the facts above. What is left a
 stand-in is the installation layout (`prefix`, `libdir`, the site
 directories), and `ENABLE_SHARED` and a libruby name are deliberately not
