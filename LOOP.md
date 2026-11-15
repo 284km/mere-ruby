@@ -4657,7 +4657,8 @@ on this from the next round.
   ensure_check 9 runs, typeddata_check 9, loader_check 7, mkmf_check (ruby's
   nextafter.c built by mkmf and its 400 tests through `require`), 
   configure_headers_check 7 -- each with its negative controls, are a step
-  of CI's corpus job now. The corpus is 686 of 686. The embedding archive
+  of CI's corpus job now. The corpus matched 687 of 687 (run before the
+  duplicate witness was removed; 686 remain). The embedding archive
   links the five bridge sources too (tools/native_probe/native_build_flags.py
   lists them once for build.sh's two other callers).
 - **Not done here**: mkmf_suite_check (mkmf's 17 files on both sides) needs
