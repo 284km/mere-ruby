@@ -35,17 +35,23 @@ static void rehash(void) {
     buckets = fresh;
     bucket_cap = cap;
 }
-static ID intern(const char *s, long n) {
+/* The ID a name has here already, or 0. */
+static ID find(const char *s, long n) {
     if (operator_char(s, n)) return (ID)(unsigned char)s[0];
+    if (!bucket_cap) return 0;
     uint64_t h = hash_name(s, n);
-    if (bucket_cap) {
-        long at = (long)(h & (uint64_t)(bucket_cap - 1));
-        while (buckets[at]) {
-            struct name *e = &names[buckets[at] - 1];
-            if (e->hash == h && e->len == n && !memcmp(e->text, s, (size_t)n)) return (ID)(ID_FIRST + buckets[at] - 1);
-            at = (at + 1) & (bucket_cap - 1);
-        }
+    long at = (long)(h & (uint64_t)(bucket_cap - 1));
+    while (buckets[at]) {
+        struct name *e = &names[buckets[at] - 1];
+        if (e->hash == h && e->len == n && !memcmp(e->text, s, (size_t)n)) return (ID)(ID_FIRST + buckets[at] - 1);
+        at = (at + 1) & (bucket_cap - 1);
     }
+    return 0;
+}
+static ID intern(const char *s, long n) {
+    ID found = find(s, n);
+    if (found) return found;
+    uint64_t h = hash_name(s, n);
     if (name_count == name_cap) {
         name_cap = name_cap ? name_cap * 2 : 512;
         names = realloc(names, sizeof(*names) * (size_t)name_cap);
@@ -114,23 +120,36 @@ ID rb_to_id(VALUE name) { return rb_sym2id(rb_to_symbol(name)); }
 VALUE rb_str_intern(VALUE str) { return rb_id2sym(rb_intern_str(str)); }
 VALUE rb_sym_to_s(VALUE sym) { return mr_call(sym, "to_s", 0); }
 VALUE rb_sym_proc(VALUE sym) { return mr_call(sym, "to_proc", 0); }
-/* The ID a name has when it is one already. Every name the interpreter has
- * seen is a Symbol there, and this side cannot ask "without making it": the
- * answer is the ID, made if need be. */
+/* The ID a name has when it is a Symbol already, and 0 when it is not: the
+ * asking must not make it one. A name C has interned is one; any other is
+ * asked of the interpreter, which knows the Symbols a program has made. */
+static int symbol_exists(VALUE str) {
+    return RTEST(mr_call(mr_ruby("->(s) { Symbol.all_symbols.any? { |x| x.name == s } }"), "call", 1, str));
+}
 ID rb_check_id(volatile VALUE *namep) {
     VALUE name = *namep;
     if (RB_SYMBOL_P(name)) return rb_sym2id(name);
     VALUE str = rb_check_string_type(name);
     if (NIL_P(str)) rb_raise(rb_eTypeError, "%" PRIsVALUE " is not a symbol nor a string", rb_inspect(name));
     *namep = str;
-    return rb_intern_str(str);
+    ID id = find(RSTRING_PTR(str), RSTRING_LEN(str));
+    if (id) return id;
+    return symbol_exists(str) ? rb_intern_str(str) : 0;
 }
 VALUE rb_check_symbol(volatile VALUE *namep) {
     ID id = rb_check_id(namep);
     return id ? rb_id2sym(id) : Qnil;
 }
-ID rb_check_id_cstr(const char *ptr, long len, rb_encoding *enc) { (void)enc; return intern(ptr, len); }
-VALUE rb_check_symbol_cstr(const char *ptr, long len, rb_encoding *enc) { (void)enc; return rb_id2sym(intern(ptr, len)); }
+ID rb_check_id_cstr(const char *ptr, long len, rb_encoding *enc) {
+    ID id = find(ptr, len);
+    if (id) return id;
+    VALUE str = rb_enc_str_new(ptr, len, enc);
+    return symbol_exists(str) ? intern(ptr, len) : 0;
+}
+VALUE rb_check_symbol_cstr(const char *ptr, long len, rb_encoding *enc) {
+    ID id = rb_check_id_cstr(ptr, len, enc);
+    return id ? rb_id2sym(id) : Qnil;
+}
 /* What kind of name an ID is, as the parser would read it. */
 enum kind { K_NONE, K_LOCAL, K_CONST, K_GLOBAL, K_INSTANCE, K_CLASS, K_ATTRSET, K_JUNK };
 static int ident_char(unsigned char c) {

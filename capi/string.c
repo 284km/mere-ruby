@@ -87,7 +87,7 @@ void rb_str_modify_expand(VALUE str, long expand) {
     if (expand < 0) rb_raise(rb_eArgError, "negative expanding string size");
     rb_str_modify(str);
     long len = RSTRING_LEN(str);
-    if (expand > LONG_MAX - len) rb_raise(rb_eArgError, "string size too big");
+    if (expand >= LONG_MAX - len) rb_raise(rb_eArgError, "string size too big");
     mr_string_reserve(str, len + expand);
 }
 size_t rb_str_capacity(VALUE str) { return (size_t)mr_string_capacity(str); }

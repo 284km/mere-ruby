@@ -18,6 +18,7 @@
  *     gone (mr_capi_release), and its dfree runs then.
  */
 #include "mr_capi.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -178,10 +179,13 @@ void mr_mirror_forget(VALUE obj) {
 static void string_room(struct mr_mirror *m, long capa) {
     if (m->as.string.as.heap.ptr && capa <= m->capa) return;
     long want = m->capa > 0 ? m->capa : 15;
-    while (want < capa) want = want * 2 + 1;
+    while (want < capa) {
+        if (want > LONG_MAX / 2 - 1) { want = capa; break; }
+        want = want * 2 + 1;
+    }
     /* (four more bytes: the terminator of the widest encoding) */
     char *p = realloc(m->as.string.as.heap.ptr, (size_t)want + 4);
-    if (!p) mr_fatal("out of memory");
+    if (!p) rb_memerror();
     memset(p + m->capa, 0, (size_t)(want - m->capa) + 4);
     m->as.string.as.heap.ptr = p;
     m->as.string.as.heap.aux.capa = want;
@@ -219,7 +223,7 @@ static void array_room(struct mr_mirror *m, long capa) {
     long want = m->capa > 0 ? m->capa : 4;
     while (want < capa) want *= 2;
     VALUE *p = realloc((void *)m->as.array.as.heap.ptr, sizeof(VALUE) * (size_t)want);
-    if (!p) mr_fatal("out of memory");
+    if (!p) rb_memerror();
     for (long i = m->capa; i < want; i++) p[i] = Qnil;
     m->as.array.as.heap.ptr = p;
     m->as.array.as.heap.aux.capa = want;
