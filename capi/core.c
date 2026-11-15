@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <unistd.h>
 
 /* ---- calls in progress --------------------------------------------------- */
 struct mr_guard { jmp_buf jump; struct mr_guard *prev; };
@@ -516,6 +518,28 @@ void *rb_ext_resolve_symbol(const char *feature, const char *symbol) {
     VALUE loaded = mr_call(mr_ruby("->(name) { $LOADED_FEATURES.any? { |f| f == name + '.so' || f == name + '.rb' || f.end_with?('/' + name + '.rb') } }"),
                            "call", 1, name);
     return RTEST(loaded) ? dlsym(RTLD_DEFAULT, symbol) : NULL;
+}
+
+/* The file this process is running: where the interpreter was built, which
+ * is where its headers are (RbConfig's rubyhdrdir, bindir, topdir). "" when
+ * the OS does not say. */
+#ifdef __APPLE__
+# include <mach-o/dyld.h>
+#endif
+char *mr_capi_exe(void) {
+    static char resolved[PATH_MAX];
+    if (resolved[0]) return resolved;
+    char raw[PATH_MAX];
+#ifdef __APPLE__
+    uint32_t size = sizeof(raw);
+    if (_NSGetExecutablePath(raw, &size) != 0) return "";
+#else
+    ssize_t n = readlink("/proc/self/exe", raw, sizeof(raw) - 1);
+    if (n <= 0) return "";
+    raw[n] = 0;
+#endif
+    if (!realpath(raw, resolved)) { resolved[0] = 0; return ""; }
+    return resolved;
 }
 
 int mr_capi_depth(void) { return depth; }
