@@ -39,15 +39,15 @@ VALUE rb_ary_to_ary(VALUE obj) {
     VALUE a = rb_check_array_type(obj);
     return NIL_P(a) ? rb_ary_new_from_values(1, &obj) : a;
 }
-VALUE rb_ary_push(VALUE ary, VALUE item) { mr_call(ary, "push", 1, item); return changed(ary); }
+VALUE rb_ary_push(VALUE ary, VALUE item) { mr_calla(ary, "push", 1, item); return changed(ary); }
 VALUE rb_ary_cat(VALUE ary, const VALUE *items, long n) {
-    mr_call(ary, "concat", 1, rb_ary_new_from_values(n, items));
+    mr_calla(ary, "concat", 1, rb_ary_new_from_values(n, items));
     return changed(ary);
 }
-VALUE rb_ary_pop(VALUE ary) { VALUE v = mr_call(ary, "pop", 0); changed(ary); return v; }
-VALUE rb_ary_shift(VALUE ary) { VALUE v = mr_call(ary, "shift", 0); changed(ary); return v; }
-VALUE rb_ary_unshift(VALUE ary, VALUE item) { mr_call(ary, "unshift", 1, item); return changed(ary); }
-void rb_ary_store(VALUE ary, long index, VALUE value) { mr_call(ary, "[]=", 2, LONG2NUM(index), value); changed(ary); }
+VALUE rb_ary_pop(VALUE ary) { VALUE v = mr_calla(ary, "pop", 0); changed(ary); return v; }
+VALUE rb_ary_shift(VALUE ary) { VALUE v = mr_calla(ary, "shift", 0); changed(ary); return v; }
+VALUE rb_ary_unshift(VALUE ary, VALUE item) { mr_calla(ary, "unshift", 1, item); return changed(ary); }
+void rb_ary_store(VALUE ary, long index, VALUE value) { mr_calla(ary, "[]=", 2, LONG2NUM(index), value); changed(ary); }
 VALUE rb_ary_entry(VALUE ary, long index) {
     long len = RARRAY_LEN(ary);
     if (index < 0) index += len;
@@ -55,24 +55,24 @@ VALUE rb_ary_entry(VALUE ary, long index) {
     return RARRAY_CONST_PTR(ary)[index];
 }
 VALUE rb_ary_aref(int argc, const VALUE *argv, VALUE ary) { return mr_callv(ary, rb_intern("[]"), argc, argv, Qnil, 0); }
-VALUE rb_ary_subseq(VALUE ary, long beg, long len) { return mr_call(ary, "[]", 2, LONG2NUM(beg), LONG2NUM(len)); }
-VALUE rb_ary_dup(VALUE ary) { return mr_call(ary, "dup", 0); }
-VALUE rb_ary_clear(VALUE ary) { mr_call(ary, "clear", 0); return changed(ary); }
-VALUE rb_ary_concat(VALUE ary, VALUE other) { mr_call(ary, "concat", 1, other); return changed(ary); }
-VALUE rb_ary_plus(VALUE a, VALUE b) { return mr_call(a, "+", 1, b); }
-VALUE rb_ary_join(VALUE ary, VALUE sep) { return mr_call(ary, "join", 1, sep); }
-VALUE rb_ary_reverse(VALUE ary) { mr_call(ary, "reverse!", 0); return changed(ary); }
-VALUE rb_ary_rotate(VALUE ary, long n) { mr_call(ary, "rotate!", 1, LONG2NUM(n)); return changed(ary); }
-VALUE rb_ary_sort(VALUE ary) { return mr_call(ary, "sort", 0); }
-VALUE rb_ary_sort_bang(VALUE ary) { mr_call(ary, "sort!", 0); return changed(ary); }
-VALUE rb_ary_includes(VALUE ary, VALUE item) { return mr_call(ary, "include?", 1, item); }
-VALUE rb_ary_delete(VALUE ary, VALUE item) { VALUE v = mr_call(ary, "delete", 1, item); changed(ary); return v; }
-VALUE rb_ary_delete_at(VALUE ary, long index) { VALUE v = mr_call(ary, "delete_at", 1, LONG2NUM(index)); changed(ary); return v; }
-VALUE rb_ary_to_s(VALUE ary) { return mr_call(ary, "to_s", 0); }
-VALUE rb_ary_cmp(VALUE a, VALUE b) { return mr_call(a, "<=>", 1, b); }
-VALUE rb_ary_replace(VALUE ary, VALUE other) { mr_call(ary, "replace", 1, other); return changed(ary); }
-VALUE rb_ary_assoc(VALUE ary, VALUE key) { return mr_call(ary, "assoc", 1, key); }
-VALUE rb_ary_rassoc(VALUE ary, VALUE value) { return mr_call(ary, "rassoc", 1, value); }
+VALUE rb_ary_subseq(VALUE ary, long beg, long len) { return mr_calla(ary, "[]", 2, LONG2NUM(beg), LONG2NUM(len)); }
+VALUE rb_ary_dup(VALUE ary) { return mr_calla(ary, "dup", 0); }
+VALUE rb_ary_clear(VALUE ary) { mr_calla(ary, "clear", 0); return changed(ary); }
+VALUE rb_ary_concat(VALUE ary, VALUE other) { mr_calla(ary, "concat", 1, other); return changed(ary); }
+VALUE rb_ary_plus(VALUE a, VALUE b) { return mr_calla(a, "+", 1, b); }
+VALUE rb_ary_join(VALUE ary, VALUE sep) { return mr_calla(ary, "join", 1, sep); }
+VALUE rb_ary_reverse(VALUE ary) { mr_calla(ary, "reverse!", 0); return changed(ary); }
+VALUE rb_ary_rotate(VALUE ary, long n) { mr_calla(ary, "rotate!", 1, LONG2NUM(n)); return changed(ary); }
+VALUE rb_ary_sort(VALUE ary) { return mr_calla(ary, "sort", 0); }
+VALUE rb_ary_sort_bang(VALUE ary) { mr_calla(ary, "sort!", 0); return changed(ary); }
+VALUE rb_ary_includes(VALUE ary, VALUE item) { return mr_calla(ary, "include?", 1, item); }
+VALUE rb_ary_delete(VALUE ary, VALUE item) { VALUE v = mr_calla(ary, "delete", 1, item); changed(ary); return v; }
+VALUE rb_ary_delete_at(VALUE ary, long index) { VALUE v = mr_calla(ary, "delete_at", 1, LONG2NUM(index)); changed(ary); return v; }
+VALUE rb_ary_to_s(VALUE ary) { return mr_calla(ary, "to_s", 0); }
+VALUE rb_ary_cmp(VALUE a, VALUE b) { return mr_calla(a, "<=>", 1, b); }
+VALUE rb_ary_replace(VALUE ary, VALUE other) { mr_calla(ary, "replace", 1, other); return changed(ary); }
+VALUE rb_ary_assoc(VALUE ary, VALUE key) { return mr_calla(ary, "assoc", 1, key); }
+VALUE rb_ary_rassoc(VALUE ary, VALUE value) { return mr_calla(ary, "rassoc", 1, value); }
 VALUE rb_ary_freeze(VALUE ary) { return rb_obj_freeze(ary); }
 VALUE rb_ary_each(VALUE ary) { return mr_callv(ary, rb_intern("each"), 0, NULL, mr_frame_block(), 0); }
 VALUE rb_ary_resize(VALUE ary, long len) {
@@ -111,34 +111,34 @@ VALUE rb_check_hash_type(VALUE obj) {
     return h;
 }
 VALUE rb_Hash(VALUE obj) { return mr_call(mr_main(), "Hash", 1, obj); }
-VALUE rb_hash_aset(VALUE hash, VALUE key, VALUE value) { mr_call(hash, "[]=", 2, key, value); return value; }
-VALUE rb_hash_aref(VALUE hash, VALUE key) { return mr_call(hash, "[]", 1, key); }
+VALUE rb_hash_aset(VALUE hash, VALUE key, VALUE value) { mr_callh(hash, "[]=", 2, key, value); return value; }
+VALUE rb_hash_aref(VALUE hash, VALUE key) { return mr_callh(hash, "[]", 1, key); }
 VALUE rb_hash_lookup2(VALUE hash, VALUE key, VALUE fallback) {
-    return RTEST(mr_call(hash, "key?", 1, key)) ? mr_call(hash, "fetch", 1, key) : fallback;
+    return RTEST(mr_callh(hash, "key?", 1, key)) ? mr_callh(hash, "fetch", 1, key) : fallback;
 }
 VALUE rb_hash_lookup(VALUE hash, VALUE key) { return rb_hash_lookup2(hash, key, Qnil); }
-VALUE rb_hash_fetch(VALUE hash, VALUE key) { return mr_call(hash, "fetch", 1, key); }
-VALUE rb_hash_delete(VALUE hash, VALUE key) { return mr_call(hash, "delete", 1, key); }
+VALUE rb_hash_fetch(VALUE hash, VALUE key) { return mr_callh(hash, "fetch", 1, key); }
+VALUE rb_hash_delete(VALUE hash, VALUE key) { return mr_callh(hash, "delete", 1, key); }
 VALUE rb_hash_delete_if(VALUE hash) { return mr_callv(hash, rb_intern("delete_if"), 0, NULL, mr_frame_block(), 0); }
-VALUE rb_hash_clear(VALUE hash) { return mr_call(hash, "clear", 0); }
-VALUE rb_hash_size(VALUE hash) { return mr_call(hash, "size", 0); }
-size_t rb_hash_size_num(VALUE hash) { return (size_t)NUM2LONG(mr_call(hash, "size", 0)); }
-VALUE rb_hash_keys(VALUE hash) { return mr_call(hash, "keys", 0); }
-VALUE rb_hash_values(VALUE hash) { return mr_call(hash, "values", 0); }
-VALUE rb_hash_has_key(VALUE hash, VALUE key) { return mr_call(hash, "key?", 1, key); }
-VALUE rb_hash_dup(VALUE hash) { return mr_call(hash, "dup", 0); }
+VALUE rb_hash_clear(VALUE hash) { return mr_callh(hash, "clear", 0); }
+VALUE rb_hash_size(VALUE hash) { return mr_callh(hash, "size", 0); }
+size_t rb_hash_size_num(VALUE hash) { return (size_t)NUM2LONG(mr_callh(hash, "size", 0)); }
+VALUE rb_hash_keys(VALUE hash) { return mr_callh(hash, "keys", 0); }
+VALUE rb_hash_values(VALUE hash) { return mr_callh(hash, "values", 0); }
+VALUE rb_hash_has_key(VALUE hash, VALUE key) { return mr_callh(hash, "key?", 1, key); }
+VALUE rb_hash_dup(VALUE hash) { return mr_callh(hash, "dup", 0); }
 VALUE rb_hash_freeze(VALUE hash) { return rb_obj_freeze(hash); }
-VALUE rb_hash_set_ifnone(VALUE hash, VALUE ifnone) { mr_call(hash, "default=", 1, ifnone); return hash; }
+VALUE rb_hash_set_ifnone(VALUE hash, VALUE ifnone) { mr_callh(hash, "default=", 1, ifnone); return hash; }
 VALUE rb_hash_update_by(VALUE hash, VALUE other, rb_hash_update_func *func) {
     if (func) mr_unsupported("rb_hash_update_by with a function");
-    return mr_call(hash, "update", 1, other);
+    return mr_callh(hash, "update", 1, other);
 }
 void rb_hash_bulk_insert(long argc, const VALUE *argv, VALUE hash) {
     for (long i = 0; i + 1 < argc; i += 2) rb_hash_aset(hash, argv[i], argv[i + 1]);
 }
 VALUE rb_hash(VALUE obj) { return mr_call(obj, "hash", 0); }
 void rb_hash_foreach(VALUE hash, int (*func)(VALUE, VALUE, VALUE), VALUE arg) {
-    VALUE pairs = mr_call(hash, "to_a", 0);
+    VALUE pairs = mr_callh(hash, "to_a", 0);
     long n = RARRAY_LEN(pairs);
     for (long i = 0; i < n; i++) {
         VALUE pair = rb_ary_entry(pairs, i);
@@ -244,8 +244,8 @@ VALUE rb_struct_define_without_accessor(const char *name, VALUE super, rb_alloc_
     mr_unsupported("rb_struct_define_without_accessor");
 }
 VALUE rb_hash_delete_entry(VALUE hash, VALUE key) {
-    if (!RTEST(mr_call(hash, "key?", 1, key))) return Qundef;
-    return mr_call(hash, "delete", 1, key);
+    if (!RTEST(mr_callh(hash, "key?", 1, key))) return Qundef;
+    return mr_callh(hash, "delete", 1, key);
 }
 VALUE rb_data_define(VALUE super, ...) {
     VALUE members = rb_ary_new();

@@ -10,7 +10,7 @@ in capi/check then run on both sides and must print the same thing.
 
 What each run is for:
 
-  contracts            the five scripts on both sides, the same output
+  contracts            the six scripts on both sides, the same output
   stress               the same on mere-ruby with a collection at every
                        safepoint: what C holds must outlive each of them
   no-dmark             (negative) a data object's dmark is not called: the
@@ -23,6 +23,10 @@ What each run is for:
   no-switch            (negative) a call into C in progress is not kept with
                        the stack it is on when fibers switch: the fiber
                        contracts must FAIL
+  no-builtin           (negative) a primitive (rb_ary_push, rb_str_append,
+                       rb_obj_freeze, ...) calls whatever the receiver's
+                       class defines under that name: the api contracts
+                       must FAIL
   no-fileprobe         (negative) a file is asked whether it is an extension
                        by loading it: its constructors run twice, and the
                        loader contracts must FAIL
@@ -63,6 +67,7 @@ extras = {
     'loader_fixture': [CHECK / 'loader_fixture.c'],
     'loader_nested': [CHECK / 'loader_nested.c'],
     'loader_retry': [CHECK / 'loader_retry.c'],
+    'api_fixture': [CHECK / 'api_fixture.c'],
 }
 
 
@@ -128,7 +133,7 @@ def passed(result):
 
 
 libs = {side: build(side) for side in ('reference', 'mere')}
-scripts = ['ensure', 'typeddata', 'loader', 'numeric', 'fiber']
+scripts = ['ensure', 'typeddata', 'loader', 'numeric', 'fiber', 'api']
 problems = []
 for script in scripts:
     answers = {side: passed(run('contracts', side, script, libs[side])) for side in ('reference', 'mere')}
@@ -144,7 +149,7 @@ for script in scripts:
         problems.append(f"{script}: {count['reference']} checks on the reference, {count['mere']} on mere-ruby")
 for name, knob, script in [('no-dmark', 'dmark', 'typeddata'), ('no-dfree', 'dfree', 'typeddata'),
                            ('no-ensure', 'ensure', 'ensure'), ('no-switch', 'switch', 'fiber'),
-                           ('no-fileprobe', 'fileprobe', 'loader')]:
+                           ('no-fileprobe', 'fileprobe', 'loader'), ('no-builtin', 'builtin', 'api')]:
     result = run(name, 'mere', script, libs['mere'], {'MERE_RUBY_CAPI_WITHOUT': knob})
     failed_as_it_must = passed(result) is None and result['limit'] is None
     print(f"{name:10s} {script}: {'fails, as it must' if failed_as_it_must else 'PASSED -- the check does not see ' + knob}", flush=True)

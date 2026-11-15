@@ -209,6 +209,15 @@ VALUE mr_call(VALUE recv, const char *name, int argc, ...) {
     va_end(ap);
     return mr_callv(recv, rb_intern(name), argc, argv, Qnil, 0);
 }
+VALUE mr_callo(int owner, VALUE recv, const char *name, int argc, ...) {
+    VALUE argv[16];
+    va_list ap;
+    if (argc > 16) mr_fatal("mr_callo: too many arguments");
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) argv[i] = va_arg(ap, VALUE);
+    va_end(ap);
+    return mr_callv(recv, rb_intern(name), argc, argv, Qnil, mr_without("builtin") ? 0 : owner);
+}
 VALUE mr_const(const char *path) {
     mr_put_text(path);
     return mr_up1(MR_CONST, Qnil);
@@ -431,7 +440,7 @@ static VALUE run(const CapiReq *req, long argc, VALUE *argv) {
     mr_fatal("an unknown request to run C");
 }
 
-extern void mr_mirrors_leave(int depth);
+extern void mr_mirrors_leave(const void *frame, int outermost);
 
 CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
     struct mr_frame frame;
@@ -488,7 +497,7 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
         raised = 1;
         result = frame.pending;
     }
-    mr_mirrors_leave(depth);
+    mr_mirrors_leave(&frame, frame.prev == NULL);
     cur = frame.prev;
     depth--;
     mr_epoch++;
@@ -543,6 +552,7 @@ char *mr_capi_exe(void) {
 }
 
 int mr_capi_depth(void) { return depth; }
+const void *mr_capi_frame(void) { return cur; }
 int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which] : -1; }
 
 /* A coroutine switch. The calls in progress are a chain through C stack

@@ -44,12 +44,16 @@ struct mr_mirror {
 
 static struct mr_mirror **table;
 static long table_cap;
-/* (structs C may have written since they were fetched, with the depth of the
- *  C call that touched them: checked at every crossing until that call ends) */
-struct touched { struct mr_mirror *mirror; VALUE handle; int depth; };
+/* (structs C may have written since they were fetched, with the C call that
+ *  touched them: checked at every crossing until THAT call ends. The call is
+ *  named by its frame and not by how deep it is: a Fiber that is stopped
+ *  inside a C call has frames of its own, and another stack's call at the
+ *  same depth must not end their watch -- what the stopped C writes through
+ *  the pointer it holds, after it is resumed, still has to go back.) */
+struct touched { struct mr_mirror *mirror; VALUE handle; const void *owner; };
 static struct touched *touched;
 static long touched_count, touched_cap;
-extern int mr_capi_depth(void);
+extern const void *mr_capi_frame(void);
 struct mr_transit { VALUE *words; long nwords; mere_bytes *bytes; char *text; double dbl; };
 extern void mr_transit_save(struct mr_transit *, long);
 extern void mr_transit_restore(struct mr_transit *);
@@ -132,7 +136,7 @@ static void touch(struct mr_mirror *m, VALUE obj) {
     }
     touched[touched_count].mirror = m;
     touched[touched_count].handle = obj;
-    touched[touched_count].depth = mr_capi_depth();
+    touched[touched_count].owner = mr_capi_frame();
     touched_count++;
     m->listed = 1;
 }
@@ -163,10 +167,16 @@ void mr_mirrors_flush(void) {
     for (long i = 0; i < touched_count; i++)
         write_back(touched[i].mirror, touched[i].handle);
 }
-void mr_mirrors_leave(int depth) {
-    while (touched_count > 0 && touched[touched_count - 1].depth >= depth) {
-        touched[--touched_count].mirror->listed = 0;
+/* The C call `frame` ends: what it touched is no longer watched. (`outermost`:
+ *  it is the last call on its stack, and what C touched outside any call --
+ *  from a mark function, say -- goes with it.) */
+void mr_mirrors_leave(const void *frame, int outermost) {
+    long kept = 0;
+    for (long i = 0; i < touched_count; i++) {
+        if (touched[i].owner == frame || (outermost && !touched[i].owner)) touched[i].mirror->listed = 0;
+        else touched[kept++] = touched[i];
     }
+    touched_count = kept;
 }
 void mr_mirror_forget(VALUE obj) {
     if (!MR_HANDLE_P(obj)) return;

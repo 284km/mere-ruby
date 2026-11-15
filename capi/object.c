@@ -102,8 +102,8 @@ void rb_attr(VALUE klass, ID id, int read, int write, int ex) {
 }
 void rb_include_module(VALUE klass, VALUE module) { mr_call(klass, "include", 1, module); }
 void rb_prepend_module(VALUE klass, VALUE module) { mr_call(klass, "prepend", 1, module); }
-void rb_extend_object(VALUE obj, VALUE module) { mr_call(obj, "extend", 1, module); }
-VALUE rb_singleton_class(VALUE obj) { return mr_call(obj, "singleton_class", 0); }
+void rb_extend_object(VALUE obj, VALUE module) { mr_callk(obj, "extend", 1, module); }
+VALUE rb_singleton_class(VALUE obj) { return mr_callk(obj, "singleton_class", 0); }
 
 /* ---- constants and variables --------------------------------------------- */
 void rb_define_const(VALUE klass, const char *name, VALUE value) { mr_call(klass, "const_set", 2, ID2SYM(rb_intern(name)), value); }
@@ -152,13 +152,13 @@ static VALUE ivar_name(ID id) {
     memcpy(buffer + 8, s, (size_t)len);
     return ID2SYM(rb_intern2(buffer, len + 8));
 }
-VALUE rb_ivar_get(VALUE obj, ID id) { return mr_call(obj, "instance_variable_get", 1, ivar_name(id)); }
-VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_call(obj, "instance_variable_set", 2, ivar_name(id), value); return value; }
-VALUE rb_ivar_defined(VALUE obj, ID id) { return mr_call(obj, "instance_variable_defined?", 1, ivar_name(id)); }
+VALUE rb_ivar_get(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_get", 1, ivar_name(id)); }
+VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_callk(obj, "instance_variable_set", 2, ivar_name(id), value); return value; }
+VALUE rb_ivar_defined(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_defined?", 1, ivar_name(id)); }
 VALUE rb_attr_get(VALUE obj, ID id) { return rb_ivar_get(obj, id); }
 VALUE rb_iv_get(VALUE obj, const char *name) { return rb_ivar_get(obj, rb_intern(name)); }
 VALUE rb_iv_set(VALUE obj, const char *name, VALUE value) { return rb_ivar_set(obj, rb_intern(name), value); }
-VALUE rb_obj_instance_variables(VALUE obj) { return mr_call(obj, "instance_variables", 0); }
+VALUE rb_obj_instance_variables(VALUE obj) { return mr_callk(obj, "instance_variables", 0); }
 VALUE rb_obj_remove_instance_variable(VALUE obj, VALUE name) { return mr_call(obj, "remove_instance_variable", 1, name); }
 st_index_t rb_ivar_count(VALUE obj) { return (st_index_t)NUM2LONG(mr_call(rb_obj_instance_variables(obj), "size", 0)); }
 VALUE rb_cvar_get(VALUE klass, ID id) { return mr_call(klass, "class_variable_get", 1, ID2SYM(id)); }
@@ -183,7 +183,7 @@ VALUE rb_gv_set(const char *name, VALUE value) {
 }
 
 /* ---- objects ---------------------------------------------------------------- */
-VALUE rb_obj_class(VALUE obj) { return mr_call(obj, "class", 0); }
+VALUE rb_obj_class(VALUE obj) { return mr_callk(obj, "class", 0); }
 VALUE rb_class_of(VALUE obj);
 /* The class an object is "of" to a reader: not the singleton class a
  * `def obj.x` hung on it. */
@@ -204,8 +204,8 @@ VALUE rb_class_superclass(VALUE klass) { return mr_call(klass, "superclass", 0);
 VALUE rb_class_get_superclass(VALUE klass) { return mr_call(klass, "superclass", 0); }
 VALUE rb_mod_ancestors(VALUE module) { return mr_call(module, "ancestors", 0); }
 VALUE rb_class_inherited_p(VALUE module, VALUE other) { return mr_call(module, "<=", 1, other); }
-VALUE rb_obj_is_kind_of(VALUE obj, VALUE klass) { return mr_call(obj, "is_a?", 1, klass); }
-VALUE rb_obj_is_instance_of(VALUE obj, VALUE klass) { return mr_call(obj, "instance_of?", 1, klass); }
+VALUE rb_obj_is_kind_of(VALUE obj, VALUE klass) { return mr_callk(obj, "is_a?", 1, klass); }
+VALUE rb_obj_is_instance_of(VALUE obj, VALUE klass) { return mr_callk(obj, "instance_of?", 1, klass); }
 int rb_respond_to(VALUE obj, ID id) { return RTEST(mr_call(obj, "respond_to?", 2, ID2SYM(id), Qtrue)); }
 int rb_obj_respond_to(VALUE obj, ID id, int priv) { return RTEST(mr_call(obj, "respond_to?", 2, ID2SYM(id), priv ? Qtrue : Qfalse)); }
 int rb_method_boundp(VALUE klass, ID id, int ex) {
@@ -223,11 +223,11 @@ int rb_method_basic_definition_p(VALUE klass, ID id) {
         || !strcmp(s, "Symbol") || !strcmp(s, "NilClass") || !strcmp(s, "Numeric");
 }
 VALUE rb_obj_freeze(VALUE obj) {
-    if (!RB_SPECIAL_CONST_P(obj)) { mr_call(obj, "freeze", 0); mr_mirror_forget(obj); }
+    if (!RB_SPECIAL_CONST_P(obj)) { mr_callk(obj, "freeze", 0); mr_mirror_forget(obj); }
     return obj;
 }
 void rb_obj_freeze_inline(VALUE obj) { rb_obj_freeze(obj); }
-VALUE rb_obj_frozen_p(VALUE obj) { return mr_call(obj, "frozen?", 0); }
+VALUE rb_obj_frozen_p(VALUE obj) { return mr_callk(obj, "frozen?", 0); }
 VALUE rb_equal(VALUE a, VALUE b) { return a == b ? Qtrue : (RTEST(mr_call(a, "==", 1, b)) ? Qtrue : Qfalse); }
 int rb_eql(VALUE a, VALUE b) { return a == b || RTEST(mr_call(a, "eql?", 1, b)); }
 VALUE rb_obj_equal(VALUE a, VALUE b) { return mr_call(a, "equal?", 1, b); }
@@ -238,10 +238,10 @@ VALUE rb_obj_as_string(VALUE obj) {
     return RB_TYPE_P(s, T_STRING) ? s : rb_any_to_s(obj);
 }
 VALUE rb_any_to_s(VALUE obj) { return mr_call(mr_call(mr_call(rb_mKernel, "instance_method", 1, ID2SYM(rb_intern("to_s"))), "bind", 1, obj), "call", 0); }
-VALUE rb_obj_dup(VALUE obj) { return mr_call(obj, "dup", 0); }
-VALUE rb_obj_clone(VALUE obj) { return mr_call(obj, "clone", 0); }
+VALUE rb_obj_dup(VALUE obj) { return mr_callk(obj, "dup", 0); }
+VALUE rb_obj_clone(VALUE obj) { return mr_callk(obj, "clone", 0); }
 VALUE rb_obj_init_copy(VALUE obj, VALUE orig) { (void)orig; return obj; }
-VALUE rb_obj_id(VALUE obj) { return mr_call(obj, "object_id", 0); }
+VALUE rb_obj_id(VALUE obj) { return mr_callk(obj, "object_id", 0); }
 VALUE rb_obj_hide(VALUE obj) { return obj; }
 VALUE rb_obj_reveal(VALUE obj, VALUE klass) { (void)klass; return obj; }
 VALUE rb_obj_alloc(VALUE klass) { return mr_call(klass, "allocate", 0); }
@@ -252,8 +252,8 @@ VALUE rb_class_new_instance_kw(int argc, const VALUE *argv, VALUE klass, int kw)
 VALUE rb_class_new_instance_pass_kw(int argc, const VALUE *argv, VALUE klass) { return rb_class_new_instance(argc, argv, klass); }
 void rb_obj_call_init(VALUE obj, int argc, const VALUE *argv) { mr_callv(obj, rb_intern("initialize"), argc, argv, mr_frame_block(), 0); }
 void rb_obj_call_init_kw(VALUE obj, int argc, const VALUE *argv, int kw) { mr_callv(obj, rb_intern("initialize"), argc, argv, mr_frame_block(), kw ? MR_SEND_KW : 0); }
-VALUE rb_obj_method(VALUE obj, VALUE name) { return mr_call(obj, "method", 1, name); }
-int rb_obj_method_arity(VALUE obj, ID id) { return NUM2INT(mr_call(mr_call(obj, "method", 1, ID2SYM(id)), "arity", 0)); }
+VALUE rb_obj_method(VALUE obj, VALUE name) { return mr_callk(obj, "method", 1, name); }
+int rb_obj_method_arity(VALUE obj, ID id) { return NUM2INT(mr_call(mr_callk(obj, "method", 1, ID2SYM(id)), "arity", 0)); }
 int rb_mod_method_arity(VALUE module, ID id) { return NUM2INT(mr_call(mr_call(module, "instance_method", 1, ID2SYM(id)), "arity", 0)); }
 VALUE rb_obj_singleton_methods(int argc, const VALUE *argv, VALUE obj) { return mr_callv(obj, rb_intern("singleton_methods"), argc, argv, Qnil, 0); }
 

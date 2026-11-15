@@ -77,7 +77,7 @@ VALUE rb_interned_str(const char *ptr, long len) { return mr_call(rb_usascii_str
 VALUE rb_interned_str_cstr(const char *ptr) { return rb_interned_str(ptr, (long)strlen(ptr)); }
 VALUE rb_enc_interned_str(const char *ptr, long len, rb_encoding *enc) { return mr_call(rb_enc_str_new(ptr, len, enc), "-@", 0); }
 VALUE rb_enc_interned_str_cstr(const char *ptr, rb_encoding *enc) { return rb_enc_interned_str(ptr, (long)strlen(ptr), enc); }
-VALUE rb_str_to_interned_str(VALUE str) { return mr_call(str, "-@", 0); }
+VALUE rb_str_to_interned_str(VALUE str) { return mr_calls(str, "-@", 0); }
 
 /* ---- through the buffer ------------------------------------------------------ */
 void rb_str_modify(VALUE str) {
@@ -138,33 +138,33 @@ VALUE rb_enc_str_buf_cat(VALUE str, const char *ptr, long len, rb_encoding *enc)
 static VALUE changed(VALUE str) { mr_mirror_forget(str); return str; }
 VALUE rb_str_append(VALUE str, VALUE other) {
     StringValue(other);
-    mr_call(str, "<<", 1, other);
+    mr_calls(str, "<<", 1, other);
     return changed(str);
 }
 VALUE rb_str_buf_append(VALUE str, VALUE other) { return rb_str_append(str, other); }
-VALUE rb_str_concat(VALUE str, VALUE other) { mr_call(str, "<<", 1, other); return changed(str); }
-VALUE rb_str_replace(VALUE str, VALUE other) { mr_call(str, "replace", 1, other); return changed(str); }
-void rb_str_update(VALUE str, long beg, long len, VALUE val) { mr_call(str, "[]=", 3, LONG2NUM(beg), LONG2NUM(len), val); changed(str); }
-VALUE rb_str_dup(VALUE str) { return mr_call(str, "dup", 0); }
-VALUE rb_str_resurrect(VALUE str) { return mr_call(str, "+@", 0); }
-VALUE rb_str_plus(VALUE a, VALUE b) { return mr_call(a, "+", 1, b); }
-VALUE rb_str_times(VALUE str, VALUE n) { return mr_call(str, "*", 1, n); }
-VALUE rb_str_length(VALUE str) { return mr_call(str, "length", 0); }
-long rb_str_strlen(VALUE str) { return NUM2LONG(mr_call(str, "length", 0)); }
-VALUE rb_str_substr(VALUE str, long beg, long len) { return mr_call(str, "[]", 2, LONG2NUM(beg), LONG2NUM(len)); }
-VALUE rb_str_subseq(VALUE str, long beg, long len) { return mr_call(str, "byteslice", 2, LONG2NUM(beg), LONG2NUM(len)); }
+VALUE rb_str_concat(VALUE str, VALUE other) { mr_calls(str, "<<", 1, other); return changed(str); }
+VALUE rb_str_replace(VALUE str, VALUE other) { mr_calls(str, "replace", 1, other); return changed(str); }
+void rb_str_update(VALUE str, long beg, long len, VALUE val) { mr_calls(str, "[]=", 3, LONG2NUM(beg), LONG2NUM(len), val); changed(str); }
+VALUE rb_str_dup(VALUE str) { return mr_calls(str, "dup", 0); }
+VALUE rb_str_resurrect(VALUE str) { return mr_calls(str, "+@", 0); }
+VALUE rb_str_plus(VALUE a, VALUE b) { return mr_calls(a, "+", 1, b); }
+VALUE rb_str_times(VALUE str, VALUE n) { return mr_calls(str, "*", 1, n); }
+VALUE rb_str_length(VALUE str) { return mr_calls(str, "length", 0); }
+long rb_str_strlen(VALUE str) { return NUM2LONG(mr_calls(str, "length", 0)); }
+VALUE rb_str_substr(VALUE str, long beg, long len) { return mr_calls(str, "[]", 2, LONG2NUM(beg), LONG2NUM(len)); }
+VALUE rb_str_subseq(VALUE str, long beg, long len) { return mr_calls(str, "byteslice", 2, LONG2NUM(beg), LONG2NUM(len)); }
 long rb_str_offset(VALUE str, long pos) {
-    VALUE head = mr_call(str, "[]", 2, INT2FIX(0), LONG2NUM(pos));
+    VALUE head = mr_calls(str, "[]", 2, INT2FIX(0), LONG2NUM(pos));
     return NIL_P(head) ? RSTRING_LEN(str) : RSTRING_LEN(head);
 }
-long rb_str_sublen(VALUE str, long pos) { return rb_str_strlen(mr_call(str, "byteslice", 2, INT2FIX(0), LONG2NUM(pos))); }
-int rb_str_cmp(VALUE a, VALUE b) { return NUM2INT(mr_call(a, "<=>", 1, b)); }
-VALUE rb_str_equal(VALUE a, VALUE b) { return RTEST(mr_call(a, "==", 1, b)) ? Qtrue : Qfalse; }
-st_index_t rb_str_hash(VALUE str) { return (st_index_t)NUM2LONG(mr_call(str, "hash", 0)); }
-int rb_str_hash_cmp(VALUE a, VALUE b) { return !RTEST(mr_call(a, "eql?", 1, b)); }
-VALUE rb_str_inspect(VALUE str) { return mr_call(str, "inspect", 0); }
-VALUE rb_str_dump(VALUE str) { return mr_call(str, "dump", 0); }
-VALUE rb_str_split(VALUE str, const char *sep) { return mr_call(str, "split", 1, rb_str_new_cstr(sep)); }
+long rb_str_sublen(VALUE str, long pos) { return rb_str_strlen(mr_calls(str, "byteslice", 2, INT2FIX(0), LONG2NUM(pos))); }
+int rb_str_cmp(VALUE a, VALUE b) { return NUM2INT(mr_calls(a, "<=>", 1, b)); }
+VALUE rb_str_equal(VALUE a, VALUE b) { return RTEST(mr_calls(a, "==", 1, b)) ? Qtrue : Qfalse; }
+st_index_t rb_str_hash(VALUE str) { return (st_index_t)NUM2LONG(mr_calls(str, "hash", 0)); }
+int rb_str_hash_cmp(VALUE a, VALUE b) { return !RTEST(mr_calls(a, "eql?", 1, b)); }
+VALUE rb_str_inspect(VALUE str) { return mr_calls(str, "inspect", 0); }
+VALUE rb_str_dump(VALUE str) { return mr_calls(str, "dump", 0); }
+VALUE rb_str_split(VALUE str, const char *sep) { return mr_calls(str, "split", 1, rb_str_new_cstr(sep)); }
 VALUE rb_str_freeze(VALUE str) { return rb_obj_freeze(str); }
 VALUE rb_str_new_frozen(VALUE str) {
     if (RB_OBJ_FROZEN(str)) return str;
@@ -172,20 +172,20 @@ VALUE rb_str_new_frozen(VALUE str) {
 }
 VALUE rb_str_dup_frozen(VALUE str) { return rb_str_new_frozen(str); }
 VALUE rb_str_new_shared(VALUE str) { return rb_str_dup(str); }
-VALUE rb_str_succ(VALUE str) { return mr_call(str, "succ", 0); }
-VALUE rb_str_scrub(VALUE str, VALUE repl) { return NIL_P(repl) ? mr_call(str, "scrub", 0) : mr_call(str, "scrub", 1, repl); }
+VALUE rb_str_succ(VALUE str) { return mr_calls(str, "succ", 0); }
+VALUE rb_str_scrub(VALUE str, VALUE repl) { return NIL_P(repl) ? mr_calls(str, "scrub", 0) : mr_calls(str, "scrub", 1, repl); }
 VALUE rb_str_ellipsize(VALUE str, long len) {
     if (len < 0) rb_raise(rb_eIndexError, "negative length %ld", len);
     return mr_call(mr_ruby("->(s, n) { d = '...'.encode(s.encoding); s.length <= n ? s : n <= 3 ? d[0, n] : s[0, n - 3] + d }"), "call", 2, str, LONG2NUM(len));
 }
-VALUE rb_str_drop_bytes(VALUE str, long len) { mr_call(str, "replace", 1, mr_call(str, "byteslice", 2, LONG2NUM(len), LONG2NUM(RSTRING_LEN(str)))); return changed(str); }
+VALUE rb_str_drop_bytes(VALUE str, long len) { mr_calls(str, "replace", 1, mr_calls(str, "byteslice", 2, LONG2NUM(len), LONG2NUM(RSTRING_LEN(str)))); return changed(str); }
 VALUE rb_str_locktmp(VALUE str) { return str; }
 VALUE rb_str_unlocktmp(VALUE str) { return str; }
 VALUE rb_str_export(VALUE str) { return str; }
 VALUE rb_str_export_locale(VALUE str) { return str; }
 VALUE rb_str_encode(VALUE str, VALUE to, int ecflags, VALUE ecopts) {
     (void)ecflags;
-    if (NIL_P(ecopts)) return mr_call(str, "encode", 1, to);
+    if (NIL_P(ecopts)) return mr_calls(str, "encode", 1, to);
     VALUE argv[2] = { to, ecopts };
     return mr_callv(str, rb_intern("encode"), 2, argv, Qnil, MR_SEND_KW);
 }
