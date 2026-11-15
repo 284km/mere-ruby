@@ -4618,6 +4618,53 @@ FileUtils looked like defects. corpus 656.
     test_fatal_in_fiber and test_process test_rlimit_nofile (both fail on
     the reference here too).
 
+## 2026-11-15 (54): Prism's node tree is built by the interpreter, not by Prism's Ruby loader
+
+The first half of stage 5's second part (note 550 §1, note 551). `Prism.parse`
+here is libprism's serialized answer read back into Prism::Node objects, and
+the reading was Prism's own generated Ruby -- `Serialize::Loader#load_node`,
+a `case` of 151 arms with a method call per field. Run by this interpreter it
+was 230 µs a node, which is why RubyVM::AbstractSyntaxTree could not be given
+a real tree: test_ast parses ruby's 850 test files more than once, and the
+loading alone was past the 600 s a file has on CI. corpus 657.
+
+- **The loader is Mere now** (m_prism_load.mere, `Prism.__prism_load_node`):
+  one pass over the same bytes at the same position, each node made as `new`
+  would have made it -- an object of the node's class with the instance
+  variables its `initialize` assigns, in that order -- without a line of Ruby
+  run. What a node is made of is not written in it: m_prism_schema.mere is
+  generated from Prism's own `config.yml` (tools/gen_prism_schema.rb, the
+  file Prism's templates generate node.rb and serialize.rb from), so a new
+  Prism regenerates the table. The line offsets and the walk to the end of
+  the constant pool, the loader's two other loops that run once per line and
+  once per name, are read the same way. `freeze: true` (every Location made
+  at once, everything frozen) still runs the generated Ruby.
+- **Measured** (this machine, -O2, ruby's `test/**/*.rb`: 850 files, 8.0 MB,
+  1,016,782 nodes, one process, each tree dropped after its file):
+  `Prism.parse_file` over all of them 234 s -> 9.0 s, 230 µs -> 8.9 µs a
+  node, with libprism's own parse inside that; peak RSS 547 MB -> 325 MB.
+  mkmf.rb (10,907 nodes) 2.73 s -> 0.11 s. The reference does the 850 files
+  in 0.6 s.
+- **A node's instance variables are filed once.** The index of an object's
+  instance variable names (iv_idx, note 547) grew by one name per write; a
+  node has a dozen. `iv_file_new` files a new object's whole entry -- the
+  names are known from the table -- and `iv_put_new` writes under it.
+  `MERE_RUBY_IVAR_INDEX_CHECK=1` holds it to the table as before.
+- **Checked**: every file of test/prism, test/ripper and
+  test/error_highlight (76 files, 14,123 tests) gives the same MATCH and RED
+  as main's CI run 43548292351, file by file. Every node of the 850 files'
+  trees -- 1,016,782 nodes: its type, flags, node id, location and each
+  field, a String by its encoding and bytes, a Float by its bits -- is the
+  one the reference ruby's Prism makes (`tools/prism_tree_dump.rb` run on
+  both, compared with diff: no file differs).
+- **Found beside it: `unpack("D")` lost the sign of -0.0.** flt_from64 /
+  flt_from32 negated with `0.0 - x`, which is +0.0 for a zero, so Prism's
+  FloatNode for `-0.0` held 0.0 (the Ruby loader reads doubles with
+  unpack1). Fixed where it was; the new loader does not go through unpack.
+- Not done here: the tree RubyVM::AbstractSyntaxTree answers. That is the
+  translation from Prism's tree to parse.y's, in progress on its own branch
+  (note 551).
+
 ## 2026-11-15 (55): the native extension prototype is taken in -- stage 7′ / 8 starts from it
 
 The first unit of the C extension stage (note 550 §3, note 553): the
@@ -4664,7 +4711,7 @@ on this from the next round.
 - **Not done here**: mkmf_suite_check (mkmf's 17 files on both sides) needs
   the reference's static libruby, which this machine's reference
   installation does not have; CI's unit test run measures test/mkmf on both
-  sides as before. Bracket depth is 887 of 1024 (was 870): the probe's
+  sides as before. Bracket depth is 890 of 1024 (873 on main): the probe's
   tables are top-level values, and the next round replaces them.
 - **What CI and the review found** (PR #83):
   - Linux's corpus job failed on `corpus/403_bigdecimal.rb`. The prototype
@@ -4787,8 +4834,8 @@ is the description; this is what was decided and what was measured.
   not want CRuby's internal headers) and `unittest/shim/-test-/`, three Ruby
   stand-ins for C extensions, is deleted.
 - Gates: dead_defs, dup_defs, gc_roots (`capi_tab` is an entry),
-  meth_writes, name_len, ns_names pass. Bracket depth is 880 of 1024 (887
-  with the prototype, 870 before it).
+  meth_writes, name_len, ns_names pass. Bracket depth is 883 of 1024 (890
+  with the prototype, 873 on main).
 - The corpus matches 687 of 687 (O2 build, this machine). There is no new
   corpus program: a corpus program cannot build a library, and what this
   round adds is witnessed by the two-sided contracts above, each with the
