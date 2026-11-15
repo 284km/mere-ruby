@@ -102,7 +102,7 @@ python3 tools/native_probe/loader_check.py \
 ```
 
 This validator uses native bundles directly through `require`, with no
-extension-specific Ruby routing files in its load path. It checks 41 shared
+extension-specific Ruby routing files in its load path. It checks 46 shared
 contracts plus 4 native bookkeeping contracts, including GC stress, repeated
 require, absolute/symlink identity, `.so` aliases, `require_relative`, nested
 and circular loading, Ruby-file precedence, and initialization failure/retry.

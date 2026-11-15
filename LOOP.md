@@ -4618,7 +4618,7 @@ FileUtils looked like defects. corpus 656.
     test_fatal_in_fiber and test_process test_rlimit_nofile (both fail on
     the reference here too).
 
-## 2026-11-15 (54): the native extension prototype is taken in -- stage 7′ / 8 starts from it
+## 2026-11-15 (55): the native extension prototype is taken in -- stage 7′ / 8 starts from it
 
 The first unit of the C extension stage (note 550 §3, note 553): the
 prototype another session had built and left unpublished is on main's
@@ -4666,3 +4666,30 @@ on this from the next round.
   installation does not have; CI's unit test run measures test/mkmf on both
   sides as before. Bracket depth is 887 of 1024 (was 870): the probe's
   tables are top-level values, and the next round replaces them.
+- **What CI and the review found** (PR #83):
+  - Linux's corpus job failed on `corpus/403_bigdecimal.rb`. The prototype
+    had changed the file name `require "x.so"` looks for from `x.so.rb` to
+    `x.so`; on Linux the reference's own `bigdecimal.so` is on the load
+    path, and it was read as Ruby source. The name is main's again, and a
+    `.bundle` / `.so` is asked whether it was compiled against this
+    interpreter's header before it is a candidate for a feature at all (a
+    library built for another ruby is passed over; what provided the
+    feature before -- a .rb, the shipped library -- still does).
+  - A negative C int could not come back from `NUM2INT`: the answer of a
+    request to the interpreter was one number, positive a value's token and
+    negative an exception's, so -1 read as an exception and INT_MIN
+    aborted. The int travels beside the answer now, range-checked on the
+    interpreter's side; the loader contracts gained INT_MIN, -1, 0, INT_MAX
+    and an out-of-range value (41 -> 46 shared checks).
+  - The Wasm build's source tree (tools/nothreads_tree.sh) copies top-level
+    .mere files only and could not find the externs under
+    tools/native_probe/. Every native extern is declared in
+    m_native_api.mere now, and the tree gets m_native_none.mere in its
+    place: the same names as functions that answer "no library". `mere -w`
+    emits again.
+  - embedding_stress_check.py has a link line of its own: the bridge
+    sources go there too.
+  - The collect-at-every-safepoint runs of loader_check.py and
+    mkmf_check.py have only the contracts' library on the load path: with
+    the standard library there, a refused require goes on through RubyGems'
+    search, which is minutes at that load.

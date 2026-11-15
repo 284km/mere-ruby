@@ -174,7 +174,7 @@ VALUE rb_str_new_cstr(const char *s) {
     const char *old=text; text=s;
     VALUE result=probe_dispatch(10,0,0,0,0,0); text=old; return result;
 }
-int probe_typed_num(VALUE v) { return (int)probe_dispatch(13,v,0,0,0,0); }
+int probe_typed_num(VALUE v) { probe_dispatch(13,v,0,0,0,0); return (int)number; }
 VALUE probe_typed_int(int n) { return probe_dispatch(14,(VALUE)n,0,0,0,0); }
 void ruby_xfree(void *p) { free(p); }
 VALUE probe_typed_wrap(VALUE klass, const rb_data_type_t *type, void *p, size_t owned) {
