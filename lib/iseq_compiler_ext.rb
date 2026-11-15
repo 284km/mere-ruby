@@ -61,7 +61,8 @@ class RubyVM::InstructionSequence
     NEWARRAY_SEND_INCLUDE_P = 6
 
     Label = Struct.new(:id, :pos, :refs, :sp, :unremovable)
-    Insn = Struct.new(:name, :ops, :line, :node_id, :events)
+    # (vmx: what the VM's export adds after the operands -- to_a(u, true))
+    Insn = Struct.new(:name, :ops, :line, :node_id, :events, :vmx)
     Trace = Struct.new(:event)
     # (restore: an ADJUST_RESTORE, which only sets the depth; one that is not
     #  lowers the stack to its label's -- `pop` / `adjuststack` -- at layout)
@@ -426,9 +427,14 @@ class RubyVM::InstructionSequence
           u.insn(:putobject, regexp_literal(static_concat(n.parts), n)) unless popped
           return
         end
-        count = dstr(u, n, false, true)
+        count, kinds = dstr(u, n, false, true)
         here(u, n)
-        u.insn(:toregexp, n.options & 0xff, count)
+        ins = u.insn(:toregexp, n.options & 0xff, count)
+        # (for the VM: the literal's flags as written and which pieces are
+        #  its own text, L, and which were computed, C -- what decides the
+        #  pattern's encoding and whose clash is whose error)
+        ins.vmx = [("i" if n.ignore_case?), ("x" if n.extended?), ("m" if n.multi_line?), ("n" if n.ascii_8bit?),
+                   ("u" if n.utf_8?), ("e" if n.euc_jp?), ("s" if n.windows_31j?)].join + "|" + kinds
         u.insn(:pop) if popped
       # $1 .. $9: getspecial of the number doubled; $&, $`, $', $+: of the
       # character doubled, plus 1
@@ -1513,6 +1519,7 @@ class RubyVM::InstructionSequence
         return
       end
       count = 0
+      kinds = +""
       cur = nil
       interpolated = false
       cur_at = [n.location.start_line, n.node_id]
@@ -1542,6 +1549,7 @@ class RubyVM::InstructionSequence
           u.at(*cur_at)
           u.insn(:putobject, cur.freeze)
           count += 1
+          kinds << "L"
           cur = nil
         end
         case part
@@ -1561,6 +1569,7 @@ class RubyVM::InstructionSequence
         u.insn(:objtostring, CallData.new(:to_s, CALL_FCALL | CALL_ARGS_SIMPLE, 0, nil))
         u.insn(:anytostring)
         count += 1
+        kinds << "C"
       end
       if cur
         u.at(*cur_at)
@@ -1570,9 +1579,10 @@ class RubyVM::InstructionSequence
                else :putchilledstring
                end, cur.freeze)
         count += 1
+        kinds << "L"
       end
       # (a regexp's pieces are toregexp's, however many)
-      return count if regexp
+      return [count, kinds] if regexp
       here(u, n)
       u.insn(:concatstrings, count) if count > 1
       u.insn(:pop) if popped
@@ -1737,6 +1747,11 @@ class RubyVM::InstructionSequence
         u.insn(:throw, 1)
         u.insn(:pop) if popped
         return
+      end
+      # (a file's own return answers nothing: rb_warn at compile, which a
+      #  file compiled for the VM to run says as ruby says it)
+      if u.type == :top && u.opts[:vm_file] && n.arguments
+        Warning.warn("#{u.path}:#{n.location.start_line}: warning: argument of top-level return is ignored\n")
       end
       sp_l = u.new_label
       u.emit_label(sp_l)
@@ -4021,7 +4036,7 @@ class RubyVM::InstructionSequence
           last = e.line
         end
         EVENT_DISASM.each { |ev, _| body << EVENT_TO_A[ev] if e.events.include?(ev) && EVENT_TO_A[ev] }
-        body << [e.name, *e.ops.map { |o| operand_to_a(o, vm) }]
+        body << [e.name, *e.ops.map { |o| operand_to_a(o, vm) }, *(vm && e.vmx ? [e.vmx] : [])]
       end
       pr = u.params
       params = {}

@@ -2,11 +2,14 @@
 # tools/iseq/vm_corpus.sh — the corpus with each FILE on the ISeq VM
 # (MERE_RUBY_VM, note 552).
 #
-# Every corpus program is run by ./mere-ruby with MERE_RUBY_VM=report: the
-# main script and each file it requires run on the VM when the compiler and
-# the VM take the whole file, and on the evaluator otherwise, saying so on
-# stderr ("mere-ruby: vm: <file>: <why>"). The run's stdout and exit status
-# are compared with the reference ruby's, as run_corpus.sh compares them.
+# Every corpus program is run by ./mere-ruby with MERE_RUBY_VM=1: the main
+# script and each file it requires run on the VM when the compiler and the
+# VM take the whole file, and on the evaluator otherwise. The run's stdout
+# and exit status are compared with the reference ruby's, as run_corpus.sh
+# compares them. Which of the two ran the main script is asked apart, with
+# MERE_RUBY_VM=why (it answers "mere-ruby: vm: <file>: <why>" and does not
+# run the program) -- a note on the run's own stderr would be read by the
+# programs that start a child ruby and compare what it wrote.
 # Each program is then one of
 #
 #   vm        the main script ran on the VM and the run matches ruby
@@ -37,8 +40,9 @@ cat > "$OUT/one.sh" <<'ONE'
 #!/bin/sh
 f="$1"; b="$(basename "$f" .rb)"
 rrc=0; "$RUBY" -Eutf-8 "$f" > "$OUT/$b.exp" 2>/dev/null || rrc=$?
-mrc=0; MERE_RUBY_VM=report perl -e 'alarm 300; exec @ARGV' "$MR" "$f" > "$OUT/$b.got" 2> "$OUT/$b.err" || mrc=$?
-why="$(grep -a "^mere-ruby: vm: $f: " "$OUT/$b.err" | head -1 | sed "s|^mere-ruby: vm: $f: ||")"
+mrc=0; MERE_RUBY_VM=1 perl -e 'alarm 300; exec @ARGV' "$MR" "$f" > "$OUT/$b.got" 2> "$OUT/$b.err" || mrc=$?
+why="$(MERE_RUBY_VM=why perl -e 'alarm 120; exec @ARGV' "$MR" "$f" 2>&1 < /dev/null | grep -a "^mere-ruby: vm: $f: " | head -1 | sed "s|^mere-ruby: vm: $f: ||")"
+[ "$why" = "on the VM" ] && why=""
 if cmp -s "$OUT/$b.exp" "$OUT/$b.got" && [ "$rrc" = "$mrc" ]; then
   if [ -n "$why" ]; then printf 'fallback\t%s\t%s\n' "$f" "$why"; else printf 'vm\t%s\t\n' "$f"; fi
 else

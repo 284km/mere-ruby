@@ -24413,6 +24413,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                        (if map_has meths0 key
                            || (if str_eq (lookup_anc world (ancestors_of world c) n9) "" then false else true)
                            || builtin_has_meth c n9
+                           // (a class's singleton class inherits Class's and
+                           //  Module's own: `C.singleton_class.undef_method
+                           //  :include` -- found when the statement is read
+                           //  by the class body's walker, not when it is
+                           //  called under an `if` or from a sequence)
+                           || (str_starts_with c "(sng:"
+                               && (map_has (name_set "modpub") n9 || map_has (name_set "modpriv") n9 || is_module_method n9))
                            // (an alias of a builtin, here or inherited: minitest's
                            //  stub undefs the `__minitest_stub__now` it made of
                            //  Time.now)
@@ -62681,16 +62688,21 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
   else if o == 3 then
     (let v = (if str_eq nm "putobject_INT2FIX_0_" then VInt 0 else if str_eq nm "putobject_INT2FIX_1_" then VInt 1 else o1) in
      match v with
-     // (a String in another encoding: the operand itself, frozen as the
-     //  compiler made it)
-     | VStr h -> if utf8 v then (o, sget h, 1, 0, v, "") else (o, "", 0, 0, v, "")
+     // (a String or a Regexp literal in an encoding other than UTF-8 is not
+     //  run here yet: what a literal's bytes, its escapes and the source's
+     //  encoding make of it is the evaluator's lexer's to say, and the
+     //  compiler does not carry all of it)
+     | VStr h -> if utf8 v then (o, sget h, 1, 0, v, "") else bad " (a String in another encoding)"
+     // (the value's third field is its encoding and, after it, its identity)
+     | VRegex (_, _, e9) -> (let e8 = rx_ev_enc e9 in
+                             if str_eq e8 "" || str_eq e8 "UTF-8" || str_eq e8 "US-ASCII" then (o, "", 0, 0, v, "")
+                             else bad " (a Regexp in another encoding)")
      | _ -> (o, "", 0, 0, v, ""))
   else if o == 6 || o == 7 || o == 31 || o == 32 then
     (match o1 with
      // (...and a literal in another encoding: a copy of the operand each
      //  time, in its encoding -- a = 1)
      | VStr h -> if utf8 o1 then (o, sget h, 0, 0, VNil, "")
-                 else if o == 6 || o == 7 then (o, sget h, 1, 0, o1, "")
                  else bad " (a String in another encoding)"
      | _ -> bad "")
   else if o == 8 || o == 33 then (match o1 with VArr _ -> (o, "", 0, 0, o1, "") | _ -> bad "")
@@ -62772,7 +62784,15 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
   else if o == 66 then
     (if str_eq (vm_sym o1) "" then bad "" else (o, vm_sym o1, 2, (match vm_nth ins 3 with VStr _ -> 1 | _ -> 0), VNil, ""))
   // toregexp: the options and how many pieces
-  else if o == 67 then (if vm_int o1 >= 0 && vm_int o2 >= 0 then (o, "", vm_int o1, vm_int o2, VNil, "") else bad "")
+  // (...and, from the compiler's export for the VM, the literal's flags as
+  //  written and each piece's kind: "im|LCL")
+  else if o == 67 then
+    (let fk = (match vm_nth ins 3 with VStr h -> sget h | _ -> "") in
+     let fl = (let b9 = str_index_of fk "|" in if b9 < 0 then "" else substring fk 0 b9) in
+     if vm_int o1 < 0 || vm_int o2 < 0 then bad ""
+     // (a pattern whose flags name an encoding: as a literal in one, above)
+     else if str_contains fl "n" || str_contains fl "u" || str_contains fl "e" || str_contains fl "s" then bad " (a Regexp in another encoding)"
+     else (o, fk, vm_int o1, vm_int o2, VNil, ""))
   // getspecial: a match reference (key 1) -- the number doubled, or the
   // character doubled plus 1 -- as the global it is; `$_` (key 0)
   else if o == 68 then
@@ -62890,6 +62910,11 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
            let cy = (if isdef then 0 else cy0) in
            let couts = (if isdef then (Nil : (str * int) list) else couts0) in
            let ids2 = vm_iapp cids ids in
+           // (a call of `name=` or `[]=` whose answer is used -- `o.[]=(0, 1)`
+           //  written as a call -- answers what the method answers; an
+           //  assignment's is popped, its value being the one assigned. The
+           //  flag's bit 1048576 says the answer is used: vm_call_in.)
+           let x = (if o == 29 && cid < 0 && vm_setter n && (if vm_next_pops t then false else true) then x + 1048576 else x) in
            if str_eq cw "" then
              (let _ = vec_push op o in
               let _ = vec_push na n in
@@ -63004,6 +63029,17 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
 // (two flag sets joined: 1 yields, 2 reads its frame's locals)
 and vm_bor = fn (a: int) -> fn (b: int) ->
   (if a % 2 == 1 || b % 2 == 1 then 1 else 0) + (if (a / 2) % 2 == 1 || (b / 2) % 2 == 1 then 2 else 0)
+// a setter's name: `x=`, `[]=` (not a comparison's)
+and vm_setter = fn (m: str) ->
+  let n = str_len m in
+  n >= 2 && str_eq (char_at m (n - 1)) "="
+  && (if str_eq m "==" || str_eq m "!=" || str_eq m "<=" || str_eq m ">=" || str_eq m "===" then false else true)
+// whether the next instruction of a body is a pop
+and vm_next_pops = fn (xs: Val list) ->
+  match xs with
+  | Nil -> false
+  | Cons (VArr i, _) -> (match deref i with Cons (VSym s, Nil) -> str_eq s "pop" | _ -> false)
+  | Cons (_, t) -> vm_next_pops t
 and vm_iapp = fn (a: int list) -> fn (b: int list) ->
   match a with Nil -> b | Cons (h, t) -> Cons (h, vm_iapp t b)
 and vm_has_sym = fn (ls: Val list) -> fn (n: str) ->
@@ -63069,7 +63105,8 @@ and vm_cov_note = fn (top: Val list) -> fn (ids: int list) ->
 // compiler compiles the file and the VM takes every instruction of it.
 // Otherwise the parser's statements, unchanged: the file runs on the
 // evaluator as it always has. MERE_RUBY_VM=1 says nothing of which;
-// =report notes each file that fell back and why on stderr; =strict raises.
+// =report notes each file that fell back and why on stderr; =strict raises;
+// =why answers for the main script alone and does not run it.
 // (The compiler is Ruby, loaded by require: what is loaded while it
 //  compiles is not asked again -- its own files among them. A file with a
 //  BEGIN keeps the evaluator's order of running it.)
@@ -63078,8 +63115,12 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
   else
     (let rec has_pre = fn (ss: Stmt list) -> (match ss with Nil -> false | Cons (SPreexe _, _) -> true | Cons (_, t) -> has_pre t) in
      let mode = map_get cli_opt "vm" in
+     // (=why: say whether the main script would run on the VM, and why not,
+     //  and stop there -- a question, asked without running the program)
+     let asked = str_eq mode "why" && str_eq label "<main>" in
      let refused = fn (why: str) ->
-       (let _ = (if str_eq mode "report" then print_err ("mere-ruby: vm: " ++ path ++ ": " ++ why) else ()) in
+       (let _ = (if str_eq mode "report" || asked then print_err ("mere-ruby: vm: " ++ path ++ ": " ++ why) else ()) in
+        let _ = (if asked then exit 0 else ()) in
         if str_eq mode "strict" then
           (let _ = raise_exc world "NotImplementedError" ("the ISeq VM refuses " ++ path ++ ": " ++ why) in prog)
         else prog) in
@@ -63107,6 +63148,7 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
           (let (why, id) = vm_load r in
            if str_eq why "" then
              (let (_, _, _, gen, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
+              let _ = (if asked then (let _ = print_err ("mere-ruby: vm: " ++ path ++ ": on the VM") in exit 0) else ()) in
               // (led by the file, as the parsed statements are: the head's SFile)
               match prog with
               | Cons (SFile f, _) -> Cons (SFile f, Cons (SVm (id, gen), (Nil : Stmt list)))
@@ -63258,7 +63300,12 @@ and vm_ident = fn (m: str) ->
 // way -- its frame, its arity, break and next, a Proc made of it -- and only
 // what its body does is the VM's.
 and vm_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) -> fn (fl: int) -> fn (argc: int) -> fn (kws: Val list) -> fn (args: Val list) -> fn (bid: int) ->
-  vm_scoped env (fn ce -> vm_call_in ce world blk recv mid fl argc kws args bid)
+  // (a call without a receiver is made in the frame itself, as the parser's
+  //  ECall of it would be: what such a call reads of its frame -- the class
+  //  body it is in, the definee -- it reads off the env it is evaluated in,
+  //  not through the chain: `class_eval { undef_method :m }`)
+  if vm_bit fl 4 then vm_call_in env world blk recv mid fl argc kws args bid
+  else vm_scoped env (fn ce -> vm_call_in ce world blk recv mid fl argc kws args bid)
 // A value that is its own literal -- a Symbol, an Integer, a Float, nil,
 // true, false -- as the literal the parser would have written for it: the
 // evaluator reads a call's literal arguments (`private :m`, `attr_reader
@@ -63327,6 +63374,9 @@ and vm_call_in = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str)
      else vm_ev env world blk (EMethodB ((if vm_bit fl 4 then ESelf else EVar "__vm~r"), mid, all, bp, bb)))
   else if plain && argc == 1 && vm_binop mid then
     vm_ev env world blk (EBin (mid, EVar "__vm~r", (match all with Cons (x, _) -> x | Nil -> ENil)))
+  // (a setter called for its answer: the parser's own form of that call)
+  else if vm_bit fl 1048576 then
+    vm_ev env world blk (EMethod ((if vm_bit fl 4 then ESelf else EVar "__vm~r"), (if vm_bit fl 4 then "__send__" else "public_send"), Cons (ESym mid, all)))
   else if plain && argc == 0 && (if str_eq (vm_unop mid) "" then false else true) then vm_ev env world blk (EUn (vm_unop mid, EVar "__vm~r"))
   // (a VCALL's name may be a local by now -- assigned further on, and this
   //  is a later turn of a loop -- and is still the call: the parser's
@@ -63618,13 +63668,27 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
               else if o == 65 || o == 66 then vm_defined env world blk st o n a (vec_get ib pc) (vec_get ov pc)
               // (toregexp: the pieces joined as an interpolation's are, and
               //  the Regexp of that source with the literal's options)
+              // (...as the evaluator makes a pattern with interpolation:
+              //  rx_dregexp over the pieces, each its own text or computed,
+              //  then the pattern of the joined source under the flags)
               else if o == 67 then
-                (let rec spine = fn (xs: Expr list) -> fn (acc: Expr) ->
-                   (match xs with
-                    | Nil -> acc
-                    | Cons (x, t) -> spine t (EBin ("+", acc, EMethod (x, "__interp_str", Nil)))) in
-                 vm_push st (vm_eval env world blk (vm_popn st (vec_get ib pc)) (fn (es: Expr list) ->
-                               EMethod (EConst "::Regexp", "new", Cons (spine es (EStrL ""), Cons (EInt a, Nil))))))
+                (let ps = vm_popn st (vec_get ib pc) in
+                 let bar = str_index_of n "|" in
+                 if bar < 0 then
+                   (let rec spine = fn (xs: Expr list) -> fn (acc: Expr) ->
+                      (match xs with
+                       | Nil -> acc
+                       | Cons (x, t) -> spine t (EBin ("+", acc, EMethod (x, "__interp_str", Nil)))) in
+                    vm_push st (vm_eval env world blk ps (fn (es: Expr list) ->
+                                  EMethod (EConst "::Regexp", "new", Cons (spine es (EStrL ""), Cons (EInt a, Nil))))))
+                 else
+                   (let fl = substring n 0 bar in
+                    let kinds = substring n (bar + 1) (str_len n) in
+                    let rec zip = fn (xs: Val list) -> fn (i: int) ->
+                      (match xs with
+                       | Nil -> (Nil : (Val * str) list)
+                       | Cons (x, t) -> Cons ((x, (if i < str_len kinds then char_at kinds i else "C")), zip t (i + 1))) in
+                    vm_push st (invoke_val_c env world blk (rx_dregexp world (zip ps 0) fl) "__regex" (Cons (mkstr fl, Nil)) false)))
               else if o == 68 then vm_push st (vm_ev env world blk (EVar n))
               else if o == 72 || o == 73 then vm_forward env world blk st o n a (vec_get ib pc) (vec_get ov pc)
               // (getconstant: the constant under the class the value below
@@ -63828,6 +63892,10 @@ and vm_defined = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: 
      else if ty == 15 then
        (let k = (match v with VInt i -> i | _ -> 0) in
         vm_ev env world blk (EDefined (EVar (if k % 2 == 1 then "$" ++ chr (k / 2) else "$" ++ str_of_int (k / 2)))))
+     // (a constant under a class is the parser's path -- `Object::X` -- which
+     //  answers for an autoload without loading it)
+     else if ty == 17 && (match under with VClass _ -> true | _ -> false) then
+       vm_ev env world blk (EDefined (EConst ((match under with VClass c9 -> c9 | _ -> "") ++ "::" ++ n)))
      else
        vm_scoped env (fn ce ->
          (let _ = map_set ce "__vm~0" under in
