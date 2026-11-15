@@ -4652,9 +4652,11 @@ loading alone was past the 600 s a file has on CI. corpus 657.
   `MERE_RUBY_IVAR_INDEX_CHECK=1` holds it to the table as before.
 - **Checked**: every file of test/prism, test/ripper and
   test/error_highlight (76 files, 14,123 tests) gives the same MATCH and RED
-  as main's CI run 43548292351, file by file. Each of the 850 files' trees
-  was compared by `#inspect` with the one the generated loader makes; the
-  one difference was the generated loader's.
+  as main's CI run 43548292351, file by file. Every node of the 850 files'
+  trees -- 1,016,782 nodes: its type, flags, node id, location and each
+  field, a String by its encoding and bytes, a Float by its bits -- is the
+  one the reference ruby's Prism makes (`tools/prism_tree_dump.rb` run on
+  both, compared with diff: no file differs).
 - **Found beside it: `unpack("D")` lost the sign of -0.0.** flt_from64 /
   flt_from32 negated with `0.0 - x`, which is +0.0 for a zero, so Prism's
   FloatNode for `-0.0` held 0.0 (the Ruby loader reads doubles with
