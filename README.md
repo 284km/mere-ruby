@@ -43,7 +43,7 @@ Divergences understood and deliberately left are in
 [KNOWN_GAPS.md](KNOWN_GAPS.md); results that move between runs of the same
 code are listed in [unittest/README.md](unittest/README.md#known-noise-results-that-move-without-the-change).
 
-Use the [pinned Mere compiler source](https://github.com/merelang/mere/tree/b92d73358e77a1577400c83aff7d61ea886984f9)
+Use the [pinned Mere compiler source](https://github.com/merelang/mere/tree/2e3cc433d470842a07c79cc50bd217441c889dc0)
 for native builds. Anonymous Class/Module metadata collection requires its
 candidate string-root scanning and bounded-word string Map hashing.
 `tools/build.sh` requires native cache trimming and verifies the compiler’s
