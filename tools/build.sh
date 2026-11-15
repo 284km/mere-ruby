@@ -92,7 +92,7 @@ esac
 
 if [ "$emit" = 1 ]; then
   # (Ruby's C API: what capi/*.c know of the interpreter's side)
-  "$MERE" --ffi-header capi/mere_capi.mere > capi/mere_capi.h || exit 1
+  "$MERE" --ffi-header m_capi_api.mere > capi/mere_capi.h || exit 1
   printf 'emit   %s -c main.mere > mr.c\n' "$MERE"
   "$MERE" -c main.mere > mr.c.new || { echo "build.sh: emit failed" >&2; rm -f mr.c.new; exit 1; }
   mv -f mr.c.new mr.c

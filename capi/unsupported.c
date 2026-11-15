@@ -15,8 +15,8 @@
  *   - TracePoint from C, the debug inspector, profile frames, postponed
  *     jobs, internal thread event hooks, the bug reporter, ISeq loading:
  *     the VM's own structures.
- *   - memory views, the Random interface, encoding converters, integer
- *     packing: not written yet.
+ *   - memory views, the Random interface, encoding converters: not written
+ *     yet.
  */
 extern void mr_unsupported_symbol(const char *name) __attribute__((__noreturn__));
 #define UNSUPPORTED(name) void name(void) { mr_unsupported_symbol(#name); }
@@ -27,9 +27,6 @@ UNSUPPORTED(rb_big_mul_normal) UNSUPPORTED(rb_big_mul_toom3) UNSUPPORTED(rb_big_
 UNSUPPORTED(rb_big_sq_fast) UNSUPPORTED(rb_big2str_generic) UNSUPPORTED(rb_big2str_poweroftwo)
 UNSUPPORTED(rb_str2big_karatsuba) UNSUPPORTED(rb_str2big_normal) UNSUPPORTED(rb_str2big_poweroftwo)
 UNSUPPORTED(rb_gcd_normal)
-/* integer packing */
-UNSUPPORTED(rb_absint_numwords) UNSUPPORTED(rb_absint_singlebit_p) UNSUPPORTED(rb_absint_size)
-UNSUPPORTED(rb_integer_pack) UNSUPPORTED(rb_integer_unpack)
 /* the VM's own structures */
 UNSUPPORTED(rb_tracepoint_new) UNSUPPORTED(rb_tracepoint_enable) UNSUPPORTED(rb_tracepoint_disable)
 UNSUPPORTED(rb_tracearg_from_tracepoint) UNSUPPORTED(rb_tracearg_event_flag) UNSUPPORTED(rb_tracearg_object)

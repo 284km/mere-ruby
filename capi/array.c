@@ -77,7 +77,7 @@ VALUE rb_ary_freeze(VALUE ary) { return rb_obj_freeze(ary); }
 VALUE rb_ary_each(VALUE ary) { return mr_callv(ary, rb_intern("each"), 0, NULL, mr_frame_block(), 0); }
 VALUE rb_ary_resize(VALUE ary, long len) {
     if (len < 0) rb_raise(rb_eIndexError, "index %ld too small for array; minimum: -%ld", len, RARRAY_LEN(ary));
-    mr_call(mr_ruby("->(a, n) { n < a.size ? a.slice!(n..) : a.fill(nil, a.size, n - a.size); a }"), "call", 2, ary, LONG2NUM(len));
+    mr_call(mr_ruby("->(a, n) { n < a.size ? a.slice!(n, a.size - n) : a.fill(nil, a.size, n - a.size); a }"), "call", 2, ary, LONG2NUM(len));
     return changed(ary);
 }
 VALUE rb_ary_shared_with_p(VALUE a, VALUE b) { (void)a; (void)b; return Qfalse; }
