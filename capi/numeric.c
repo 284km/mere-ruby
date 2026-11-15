@@ -233,7 +233,12 @@ double rb_num2dbl(VALUE v) {
       case T_BIGNUM: case T_RATIONAL: return rb_float_value(mr_call(v, "to_f", 0));
       default: break;
     }
-    return rb_float_value(rb_to_float(v));
+    /* (anything else is asked for its to_f, whatever its class) */
+    if (!rb_respond_to(v, rb_intern("to_f"))) rb_raise(rb_eTypeError, "can't convert %s into Float", class_for_message(v));
+    VALUE f = mr_call(v, "to_f", 0);
+    if (!RB_FLOAT_TYPE_P(f))
+        rb_raise(rb_eTypeError, "can't convert %s to Float (%s#to_f gives %s)", class_for_message(v), class_for_message(v), class_for_message(f));
+    return rb_float_value(f);
 }
 VALUE rb_to_float(VALUE v) {
     if (RB_FLOAT_TYPE_P(v)) return v;

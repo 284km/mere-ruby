@@ -130,9 +130,9 @@ for script in scripts:
         problems.append(f'{script}: a side did not finish its contracts')
         continue
     count = {side: int(answers[side].split()[-2]) for side in answers}
-    # (the loader contracts have three checks of mere-ruby's own: a library
+    # (the loader contracts have one check of mere-ruby's own: a library
     #  built for no ruby in particular is passed over)
-    if count['mere'] - count['reference'] != (3 if script == 'loader' else 0):
+    if count['mere'] - count['reference'] != (1 if script == 'loader' else 0):
         problems.append(f"{script}: {count['reference']} checks on the reference, {count['mere']} on mere-ruby")
 for name, knob, script in [('no-dmark', 'dmark', 'typeddata'), ('no-dfree', 'dfree', 'typeddata'),
                            ('no-ensure', 'ensure', 'ensure')]:
