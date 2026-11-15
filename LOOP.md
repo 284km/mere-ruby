@@ -4750,6 +4750,19 @@ is the description; this is what was decided and what was measured.
   library's constructors (PR #83's review). The file is read for the name
   every extension compiled against these headers defines; the library is
   opened once, and the number behind the name is compared then.
+- **A long division is not one uninterruptible step** (the interpreter, not
+  the C API; it is here because `ruby/test_bignum.rb` could not finish
+  without it). The file ran nothing at the baseline -- its first line
+  requires `-test-/integer` -- and with the extension there, one of its
+  tests grows two numbers until two signals arrive during a division.
+  Threads take turns at statement boundaries and a trap runs at one, so
+  they never arrived, and the operands grew until a single division took
+  minutes (the file would have ended at CI's 600 seconds). The long
+  division now counts the limbs it has gone over and, every four million,
+  takes the look a statement boundary takes: another thread that can run
+  gets its turn, a trap that is waiting runs (`long_op_hook` in
+  m_numeric.mere, `long_op_tick` in main.mere). The test's scenario is met
+  at its sixth round, in 4 seconds.
 - **What is refused**: `capi/unsupported.c` lists 66 functions that exist so
   that a library using them loads, and raise NotImplementedError by name
   when called -- CRuby's internal bignum routines (`rb_big_mul_toom3`, ...:
@@ -4767,14 +4780,14 @@ is the description; this is what was decided and what was measured.
   (ensure 58, typeddata 78, loader 48 and one of our own, numeric 13, fiber
   16), again under a collection at every safepoint; and with dmark, dfree,
   the ensure cleanup, the stack switch and the load-free ABI question each
-  switched off, the contracts that depend on it fail. Run here on macOS (reference 3.4.9, the one
-  installed) and in a Linux container with ruby 4.0.9: both agree.
+  switched off, the contracts that depend on it fail. Run here on macOS and in
+  a Linux container, each against ruby 4.0.9: both agree.
 - The unit test shards build all of `ext/-test-` with
   `tools/capi_ext_build.py` (72 of 75 directories build; the three that do
   not want CRuby's internal headers) and `unittest/shim/-test-/`, three Ruby
   stand-ins for C extensions, is deleted.
 - Gates: dead_defs, dup_defs, gc_roots (`capi_tab` is an entry),
-  meth_writes, name_len, ns_names pass. Bracket depth is 878 of 1024 (887
+  meth_writes, name_len, ns_names pass. Bracket depth is 880 of 1024 (887
   with the prototype, 870 before it).
 - The corpus matches 687 of 687 (O2 build, this machine). There is no new
   corpus program: a corpus program cannot build a library, and what this
@@ -4785,6 +4798,13 @@ is the description; this is what was decided and what was measured.
 are the record and go in below when they have run): of `test/-ext-`'s 94
 files, 94 reach their summary (12 did at the baseline, CI run 43548292351 on
 main f7b2579a, where 811 of 823 tests were RED); 657 tests pass of 831 run.
+
+`ruby/test_bignum.rb`: 65 of 74 pass (0 at the baseline). The nine left are
+the interpreter's numeric semantics (`Integer#to_s` and `#digits` with an
+invalid radix, the Float-range warnings of `to_f` and `/`, `fdiv` past
+1e300, `Integer#[]` with a range past the top) and two that ask about
+CRuby's representation (`Bug::Integer.bignum?(0)` of a bignum-typed zero,
+an interrupt during `to_s`, which is not long here).
 
 **What is still RED in `test/-ext-`, by cause** (174 tests):
 
@@ -4806,9 +4826,7 @@ main f7b2579a, where 811 of 823 tests were RED); 657 tests pass of 831 run.
   `rb_f_notimplement`'s effect on `respond_to?`, `rb_data_define` with a
   superclass, `st_table` of a Hash.
 - The interpreter, not the C API: `String#encode` on a subclass answers a
-  String; `IO#wait` on a descriptor closed behind it does not raise EBADF;
-  a Bignum operation is not interrupted by `Thread#raise`
-  (`ruby/test_bignum.rb`'s two interrupt tests do not finish).
+  String; `IO#wait` on a descriptor closed behind it does not raise EBADF.
 
 **Next**: RbConfig's keys from this build's real environment and mkmf on
 these headers (`test/mkmf`, and `capi_ext_build.py` replaced by ruby's own
