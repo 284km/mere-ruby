@@ -194,10 +194,11 @@ written for ruby's own build tree: they reach into its internal headers).
   `capi/check/mkmf.rb` print the same on both sides. A source that does not
   compile must fail at `make` on both, and mere-ruby given the libraries the
   reference's mkmf built must fail.
-- `tools/capi_gem_check.py` (CI, macOS and Linux): fast_blank, redcarpet
-  and msgpack, at fixed versions, are installed by each ruby with RubyGems'
-  `gem install` from the same .gem files, and `capi/check/gems.rb` uses them
-  on both sides and must print the same. mere-ruby pointed at the gems the
+- `tools/capi_gem_check.py` (CI, macOS and Linux): fast_blank, redcarpet,
+  msgpack, racc and nokogiri (from source, on the system's libxml2), at
+  fixed versions, are installed by each ruby with RubyGems' `gem install`
+  from the same .gem files, and `capi/check/gems.rb` uses them on both
+  sides and must print the same. mere-ruby pointed at the gems the
   reference built must fail.
 - `test/mkmf` runs in a build tree staged for mere-ruby
   (`unittest/mkmf_context.sh`: links to `capi/include` in the places mkmf's

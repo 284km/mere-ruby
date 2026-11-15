@@ -86,7 +86,13 @@ void rb_define_alias(VALUE klass, const char *fresh, const char *old) {
     mr_call(klass, "alias_method", 2, ID2SYM(rb_intern(fresh)), ID2SYM(rb_intern(old)));
 }
 void rb_alias(VALUE klass, ID fresh, ID old) { mr_call(klass, "alias_method", 2, ID2SYM(fresh), ID2SYM(old)); }
-void rb_undef_method(VALUE klass, const char *name) { mr_call(klass, "undef_method", 1, ID2SYM(rb_intern(name))); }
+/* (C's rb_undef_method is not Module#undef_method: it does not warn that
+ *  undefining `initialize` "may cause serious problems", and a name nothing
+ *  defines is not an error) */
+void rb_undef_method(VALUE klass, const char *name) {
+    mr_call(mr_ruby("->(k, n) { v = $VERBOSE; $VERBOSE = nil; begin; k.send(:undef_method, n); rescue NameError; ensure; $VERBOSE = v; end }"),
+            "call", 2, klass, ID2SYM(rb_intern(name)));
+}
 void rb_undef(VALUE klass, ID id) { mr_call(klass, "undef_method", 1, ID2SYM(id)); }
 void rb_remove_method(VALUE klass, const char *name) { mr_call(klass, "remove_method", 1, ID2SYM(rb_intern(name))); }
 void rb_remove_method_id(VALUE klass, ID id) { mr_call(klass, "remove_method", 1, ID2SYM(id)); }

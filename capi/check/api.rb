@@ -1,4 +1,11 @@
+require 'stringio'
+# (what loading the extension says on stderr: nothing -- its Init_ undefines
+#  `initialize` from C, which is not the warning Module#undef_method gives)
+stderr = $stderr
+$stderr = StringIO.new
 require 'api_fixture'
+said = $stderr.string
+$stderr = stderr
 $count = 0
 def check(value)
   raise 'api contract failed' unless value
@@ -13,6 +20,7 @@ else
   raise "expected #{kind}"
 end
 A = ApiFixture
+check(said == '')
 
 # What C writes through a pointer it took before its Fiber was stopped goes
 # back to the object -- also when another stack ran a C call of its own
@@ -114,7 +122,8 @@ module ApiFixture
     end
   end
 end
-check(ApiFixture::Mid::Leaf.new.extra == :reopened)
+check(ApiFixture::Mid::Leaf.allocate.extra == :reopened)
+check(raises(NoMethodError) { ApiFixture::Mid::Leaf.new }.name == :new)
 check(Custom.new.extra == :reopened)
 
 # rb_proc_new makes a Proc, not a lambda.

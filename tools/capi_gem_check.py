@@ -3,16 +3,20 @@
 
     capi_gem_check.py --reference <ruby binary> --output <dir> [--gems <dir>]
 
-Three published gems, at fixed versions, each with a C extension and no
-library of its own to find: fast_blank (one function over a String's bytes),
-redcarpet (a Markdown renderer whose C calls back into Ruby renderers), and
-msgpack (a serializer: buffers, Integers of every size, Floats, encodings,
-its own exception classes). The .gem files are fetched once by the reference
+Published gems with C extensions, at fixed versions: fast_blank (one
+function over a String's bytes), redcarpet (a Markdown renderer whose C calls
+back into Ruby renderers), msgpack (a serializer: buffers, Integers of every
+size, Floats, encodings, its own exception classes), racc (the parser
+runtime's C core), and nokogiri, built from source against the system's
+libxml2 and libxslt (`--use-system-libraries`; mini_portile2, which its
+extconf.rb requires, is installed with it): typed data wrapping the
+library's structs, callbacks from the library into Ruby (SAX), error
+objects. The .gem files are fetched once by the reference
 ruby (or taken from --gems), and then each ruby installs them from those
 files into a gem directory of its own with RubyGems' ordinary `gem install`:
 extconf.rb, make, make install, all driven by that ruby.
 
-capi/check/gems.rb then uses the three gems on both sides and must print the
+capi/check/gems.rb then uses the gems on both sides and must print the
 same. As the control, mere-ruby is pointed at the gem directory the REFERENCE
 installed into: it must fail there (those extensions were built for another
 ruby), so what passed was mere-ruby's own build.
@@ -29,7 +33,10 @@ import sys
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-GEMS = [('fast_blank', '1.0.1'), ('redcarpet', '3.6.1'), ('msgpack', '1.8.7')]
+# (name, version, what `gem fetch` is given, what `gem install` is given)
+GEMS = [('fast_blank', '1.0.1', [], []), ('redcarpet', '3.6.1', [], []), ('msgpack', '1.8.7', [], []),
+        ('racc', '1.8.1', [], []), ('mini_portile2', '2.8.9', [], []),
+        ('nokogiri', '1.19.7', ['--platform', 'ruby'], ['--', '--use-system-libraries'])]
 parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 parser.add_argument('--reference', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
@@ -49,13 +56,13 @@ stdlib = subprocess.check_output([str(REF), '-rrbconfig', '-e', 'print RbConfig:
 fetched = OUT / 'fetched'
 fetched.mkdir()
 (OUT / 'home').mkdir()
-for name, version in GEMS:
+for name, version, fetch_options, _ in GEMS:
     file = f'{name}-{version}.gem'
     if args.gems:
         shutil.copy(args.gems.resolve() / file, fetched / file)
     else:
-        subprocess.run([str(REF), gem_command, 'fetch', name, '--version', version], cwd=fetched, check=True,
-                       stdout=subprocess.DEVNULL)
+        subprocess.run([str(REF), gem_command, 'fetch', name, '--version', version, *fetch_options], cwd=fetched,
+                       check=True, stdout=subprocess.DEVNULL)
     if not (fetched / file).is_file():
         sys.exit(f'capi_gem_check: {file} was not fetched')
 results = {}
@@ -88,9 +95,9 @@ homes = {}
 for side, ruby in (('reference', REF), ('mere', MERE)):
     homes[side] = OUT / side / 'installed'
     homes[side].mkdir(parents=True)
-    for name, version in GEMS:
+    for name, version, _, install_options in GEMS:
         installed = run(f'install-{name}', side, [ruby, gem_command, 'install', '--local', '--no-document',
-                                                   f'{name}-{version}.gem'], homes[side], 600)
+                                                   f'{name}-{version}.gem', *install_options], homes[side], 600)
         print(f"{side:10s} gem install {name} {version}: {'installed' if installed['ok'] else 'FAILED'}", flush=True)
         if not installed['ok']:
             problems.append(f'{side}: gem install {name} failed')
@@ -112,4 +119,4 @@ if not refused:
     problems.append('mere-ruby used the gems the reference built')
 if problems:
     sys.exit('capi_gem_check: ' + '; '.join(problems))
-print('capi_gem_check: three gems with C extensions install with `gem install` and behave the same on both sides')
+print('capi_gem_check: five gems with C extensions install with `gem install` and behave the same on both sides')

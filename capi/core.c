@@ -551,6 +551,16 @@ char *mr_capi_exe(void) {
     return resolved;
 }
 
+/* The C library this interpreter was compiled against, as a configure
+ * triplet names it after the OS ("gnu" in x86_64-pc-linux-gnu): "" where the
+ * triplet has no such part (macOS) or the library does not say. */
+char *mr_capi_libc(void) {
+#ifdef __GLIBC__
+    return "gnu";
+#else
+    return "";
+#endif
+}
 int mr_capi_depth(void) { return depth; }
 const void *mr_capi_frame(void) { return cur; }
 int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which] : -1; }

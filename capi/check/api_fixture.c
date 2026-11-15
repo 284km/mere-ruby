@@ -66,5 +66,9 @@ void Init_api_fixture(void) {
      * C defines is a class by that name like any other */
     VALUE mid = rb_define_module_under(mod, "Mid");
     VALUE base = rb_define_class_under(mid, "Base", rb_cObject);
-    rb_define_class_under(mid, "Leaf", base);
+    VALUE leaf = rb_define_class_under(mid, "Leaf", base);
+    /* (from C, undefining says nothing on stderr and a missing name is not an error) */
+    rb_undef_method(rb_singleton_class(leaf), "new");
+    rb_undef_method(leaf, "initialize");
+    rb_undef_method(leaf, "no_such_method_anywhere");
 }

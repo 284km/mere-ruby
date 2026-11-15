@@ -1,4 +1,4 @@
-# Three gems with C extensions, as their users call them. The same script
+# Gems with C extensions, as their users call them. The same script
 # runs on both rubies, each with the gems its own `gem install` built
 # (tools/capi_gem_check.py), and must print the same.
 require 'fast_blank'
@@ -30,3 +30,39 @@ begin
 rescue => e
   p e.class
 end
+
+# racc: the parser runtime is the C one when its extension loaded
+require 'racc/parser'
+p Racc::Parser::Racc_Runtime_Core_Version_C == Racc::Parser::Racc_Runtime_Core_Version, Racc::Parser::Racc_Runtime_Type
+
+# nokogiri, on the system's libxml2
+require 'nokogiri'
+html = Nokogiri::HTML('<html><body><div id="a" class="x y"><p>Hello <b>world</b></p><a href="/one">1</a><a href="/two">2</a></div></body></html>')
+p html.css('a').map { |a| [a['href'], a.text] }
+p html.at_css('#a')['class'], html.at_css('p').text, html.xpath('//b').first.name
+node = html.at_css('p')
+node.content = 'changed & escaped'
+node['data-k'] = 'v'
+puts html.at_css('div').to_html
+xml = Nokogiri::XML('<root xmlns:n="urn:x"><n:item id="1">one</n:item><n:item id="2">two</n:item><plain/></root>')
+p xml.root.name, xml.xpath('//n:item', 'n' => 'urn:x').map { |i| [i['id'], i.text] }
+p xml.errors.size, xml.root.children.select(&:element?).map(&:name)
+built = Nokogiri::XML::Builder.new { |x| x.list { x.entry('a', n: 1); x.entry('b', n: 2) } }
+puts built.to_xml
+bad = Nokogiri::XML('<a><b></a>')
+p bad.errors.map(&:class).uniq, bad.errors.size > 0
+begin
+  Nokogiri::XML('<a><b></a>') { |config| config.strict }
+rescue => e
+  p e.class
+end
+fragment = Nokogiri::HTML::DocumentFragment.parse('<i>x</i><u>y</u>')
+p fragment.children.map(&:name), fragment.to_html
+p html.css('a').first.ancestors.map(&:name)
+handler = Class.new(Nokogiri::XML::SAX::Document) do
+  attr_reader :seen
+  def initialize = @seen = []
+  def start_element(name, attrs = []) = @seen << name
+end.new
+Nokogiri::XML::SAX::Parser.new(handler).parse('<r><x/><y><z/></y></r>')
+p handler.seen

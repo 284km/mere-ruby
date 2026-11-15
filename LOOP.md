@@ -4919,13 +4919,14 @@ an interrupt during `to_s`, which is not long here).
 these headers (`test/mkmf`, and `capi_ext_build.py` replaced by ruby's own
 extconf.rb runs), then RubyGems' native builds and a real gem.
 
-## 2026-11-16 (59): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and three published gems install with `gem install`
+## 2026-11-16 (59): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and published gems -- nokogiri among them -- install with `gem install`
 
 Stage 7′ / 8, third unit (note 553), on the C API of (58). Until now
 `require "mkmf"` stopped at a nil RbConfig key, so nothing that builds an
 extension the way a gem does could start. Now `mere-ruby extconf.rb && make
 && make install` works with ruby's unchanged mkmf.rb, RubyGems' `gem
-install` builds a gem's C extension, and three published gems behave as on
+install` builds a gem's C extension, and five published gems -- nokogiri
+built from source against the system's libxml2 among them -- behave as on
 the reference.
 
 - **RbConfig says the build where there is one.** An interpreter that finds
@@ -4990,12 +4991,17 @@ the reference.
   fails at `make` on both; mere-ruby given the libraries the reference's
   mkmf built fails.
 - `tools/capi_gem_check.py` (CI, macOS and Linux): fast_blank 1.0.1,
-  redcarpet 3.6.1 and msgpack 1.8.7 are installed by each ruby with `gem
-  install` from the same .gem files; `capi/check/gems.rb` uses them (34
-  lines of output: blank tests, HTML and a Ruby-defined renderer called back
-  from C, packing and unpacking Integers, Floats, binary and UTF-8 Strings,
-  a streaming unpacker, a malformed input's exception) and prints the same
-  on both sides. mere-ruby pointed at the reference's gem directory fails.
+  redcarpet 3.6.1, msgpack 1.8.7, racc 1.8.1 and nokogiri 1.19.7 (from
+  source, `--use-system-libraries`) are installed by each ruby with `gem
+  install` from the same .gem files; `capi/check/gems.rb` uses them (60
+  lines of output: blank tests; HTML and a Ruby-defined renderer called back
+  from C; packing and unpacking Integers, Floats, binary and UTF-8 Strings,
+  a streaming unpacker, a malformed input's exception; racc's C runtime;
+  nokogiri's CSS and XPath queries, namespaces, node edits and
+  serialization, the Builder, syntax errors as objects and as a raised
+  exception, a fragment, a SAX handler called back from libxml2) and prints
+  the same on both sides. mere-ruby pointed at the reference's gem
+  directory fails.
 - Local, O2: gates dead_defs, dup_defs, gc_roots pass; bracket depth 883 of
   1024; capi_check as before.
 
@@ -5029,5 +5035,11 @@ on any build):
   it is then EISDIR, at random. capi_gem_check.py runs with a home of its
   own.
 
-**Next**: a gem that brings a library with it (nokogiri), and the C API
-functions such gems turn out to need.
+nokogiri needed two things beyond what the smaller gems did: RbConfig's
+`host` (the configure triplet -- cpu, vendor, os and, on Linux, the C
+library the interpreter was compiled against -- and an empty `host_alias`),
+and `rb_undef_method` being C's, which says nothing when it undefines
+`initialize` and does not mind a name nothing defines.
+
+**Next**: the larger groups of the C API not written yet (capi/README.md,
+"What is missing"), by what the next gems need.
