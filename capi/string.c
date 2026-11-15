@@ -237,3 +237,5 @@ char *rb_string_value_cstr(volatile VALUE *ptr) {
 }
 VALUE rb_str_export_to_enc(VALUE str, rb_encoding *enc) { return rb_str_conv_enc(str, rb_enc_get(str), enc); }
 VALUE rb_obj_encoding(VALUE obj) { return mr_call(obj, "encoding", 0); }
+VALUE rb_str_tmp_frozen_acquire(VALUE str) { return rb_str_new_frozen(str); }
+void rb_str_tmp_frozen_release(VALUE str, VALUE tmp) { (void)str; (void)tmp; }

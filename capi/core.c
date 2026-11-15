@@ -211,6 +211,7 @@ VALUE mr_const(const char *path) {
     mr_put_text(path);
     return mr_up1(MR_CONST, Qnil);
 }
+void mr_unsupported_symbol(const char *name) { mr_unsupported(name); }
 VALUE mr_ruby(const char *source) {
     static struct { const char *source; VALUE value; } kept[128];
     static int count;

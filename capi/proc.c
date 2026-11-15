@@ -231,3 +231,68 @@ int rb_get_kwargs(VALUE keywords, const ID *table, int required, int optional, V
     }
     return found;
 }
+
+/* ---- recursion guards --------------------------------------------------------------- */
+/* What rb_exec_recursive remembers: (function, object, paired object) for
+ * each call in progress. An object met again is recursion. */
+struct recursive { void *func; VALUE obj, paired; int outer; };
+static struct recursive *recursing;
+static long recursing_count, recursing_cap;
+struct recursive_call { VALUE (*func)(VALUE, VALUE, int); VALUE obj, arg; };
+static VALUE recursive_body(VALUE p) {
+    struct recursive_call *c = (struct recursive_call *)p;
+    return c->func(c->obj, c->arg, 0);
+}
+static VALUE exec_recursive(VALUE (*func)(VALUE, VALUE, int), VALUE obj, VALUE paired, VALUE arg, int outer) {
+    for (long i = recursing_count - 1; i >= 0; i--) {
+        if (recursing[i].func == (void *)func && recursing[i].obj == obj && recursing[i].paired == paired) {
+            if (outer) {
+                /* unwind to the outermost call of this function, which answers */
+                rb_throw_obj(rb_ary_entry(mr_ruby("[Object.new]"), 0), ULONG2NUM((uintptr_t)func));
+            }
+            return func(obj, arg, 1);
+        }
+    }
+    if (recursing_count == recursing_cap) {
+        recursing_cap = recursing_cap ? recursing_cap * 2 : 32;
+        recursing = realloc(recursing, sizeof(*recursing) * (size_t)recursing_cap);
+        if (!recursing) mr_fatal("out of memory");
+    }
+    long mine = recursing_count++;
+    recursing[mine].func = (void *)func;
+    recursing[mine].obj = obj;
+    recursing[mine].paired = paired;
+    recursing[mine].outer = outer;
+    struct recursive_call call = { func, obj, arg };
+    VALUE leaving;
+    VALUE result = mr_guarded(recursive_body, (VALUE)&call, &leaving);
+    recursing_count = mine;
+    if (leaving != Qundef) mr_throw(leaving);
+    return result;
+}
+VALUE rb_exec_recursive(VALUE (*func)(VALUE, VALUE, int), VALUE obj, VALUE arg) { return exec_recursive(func, obj, Qundef, arg, 0); }
+VALUE rb_exec_recursive_paired(VALUE (*func)(VALUE, VALUE, int), VALUE obj, VALUE paired, VALUE arg) { return exec_recursive(func, obj, paired, arg, 0); }
+struct outer_call { VALUE (*func)(VALUE, VALUE, int); VALUE obj, paired, arg; };
+static VALUE outer_body(VALUE yielded, VALUE data, int argc, const VALUE *argv, VALUE block) {
+    (void)yielded; (void)argc; (void)argv; (void)block;
+    struct outer_call *c = (struct outer_call *)(uintptr_t)NUM2ULONG(data);
+    return exec_recursive(c->func, c->obj, c->paired, c->arg, 1);
+}
+static VALUE exec_recursive_outer(VALUE (*func)(VALUE, VALUE, int), VALUE obj, VALUE paired, VALUE arg) {
+    /* Is a call of this function already in progress? Then this one is inner. */
+    for (long i = recursing_count - 1; i >= 0; i--)
+        if (recursing[i].func == (void *)func && recursing[i].outer) return exec_recursive(func, obj, paired, arg, 1);
+    struct outer_call call = { func, obj, paired, arg };
+    VALUE tag = rb_ary_entry(mr_ruby("[Object.new]"), 0);
+    VALUE result = rb_catch_obj(tag, outer_body, ULONG2NUM((uintptr_t)&call));
+    /* (the throw's value is the function's address: recursion was met below) */
+    if (RB_INTEGER_TYPE_P(result) && rb_num2ulong(result) == (uintptr_t)func && recursing_count >= 0) {
+        long saved = recursing_count;
+        VALUE answer = func(obj, arg, 1);
+        recursing_count = saved;
+        return answer;
+    }
+    return result;
+}
+VALUE rb_exec_recursive_outer(VALUE (*func)(VALUE, VALUE, int), VALUE obj, VALUE arg) { return exec_recursive_outer(func, obj, Qundef, arg); }
+VALUE rb_exec_recursive_paired_outer(VALUE (*func)(VALUE, VALUE, int), VALUE obj, VALUE paired, VALUE arg) { return exec_recursive_outer(func, obj, paired, arg); }

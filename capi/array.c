@@ -231,3 +231,82 @@ VALUE rb_struct_define_without_accessor(const char *name, VALUE super, rb_alloc_
     (void)name; (void)super; (void)alloc;
     mr_unsupported("rb_struct_define_without_accessor");
 }
+VALUE rb_hash_delete_entry(VALUE hash, VALUE key) {
+    if (!RTEST(mr_call(hash, "key?", 1, key))) return Qundef;
+    return mr_call(hash, "delete", 1, key);
+}
+VALUE rb_data_define(VALUE super, ...) {
+    VALUE members = rb_ary_new();
+    va_list ap;
+    va_start(ap, super);
+    const char *member;
+    while ((member = va_arg(ap, const char *)) != NULL) rb_ary_push(members, ID2SYM(rb_intern(member)));
+    va_end(ap);
+    VALUE base = (super == 0 || NIL_P(super)) ? mr_const("Data") : super;
+    return mr_callv(base, rb_intern("define"), RARRAY_LENINT(members), RARRAY_CONST_PTR(members), Qnil, 0);
+}
+
+/* ---- Enumerator ------------------------------------------------------------------ */
+VALUE rb_enumeratorize(VALUE obj, VALUE meth, int argc, const VALUE *argv) {
+    VALUE args = rb_ary_new_from_values(argc, argv);
+    rb_ary_unshift(args, meth);
+    return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, 0);
+}
+/* (the size function is C's and takes the receiver, the arguments and the
+ *  enumerator: the Enumerator made here answers size as nil -- "not known" --
+ *  rather than ask a function this side cannot hand to it) */
+#undef rb_enumeratorize_with_size
+#undef rb_enumeratorize_with_size_kw
+VALUE rb_enumeratorize_with_size(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size) {
+    (void)size;
+    return rb_enumeratorize(obj, meth, argc, argv);
+}
+VALUE rb_enumeratorize_with_size_kw(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size, int kw) {
+    (void)size;
+    VALUE args = rb_ary_new_from_values(argc, argv);
+    rb_ary_unshift(args, meth);
+    return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, kw ? MR_SEND_KW : 0);
+}
+int rb_arithmetic_sequence_extract(VALUE obj, rb_arithmetic_sequence_components_t *component) {
+    if (RTEST(rb_obj_is_kind_of(obj, mr_const("Enumerator::ArithmeticSequence")))) {
+        component->begin = mr_call(obj, "begin", 0);
+        component->end = mr_call(obj, "end", 0);
+        component->step = mr_call(obj, "step", 0);
+        component->exclude_end = RTEST(mr_call(obj, "exclude_end?", 0));
+        return 1;
+    }
+    if (RTEST(rb_obj_is_kind_of(obj, rb_cRange))) {
+        component->begin = mr_call(obj, "begin", 0);
+        component->end = mr_call(obj, "end", 0);
+        component->step = INT2FIX(1);
+        component->exclude_end = RTEST(mr_call(obj, "exclude_end?", 0));
+        return 1;
+    }
+    return 0;
+}
+/* enumerator.c's rb_arithmetic_sequence_beg_len_step: what `ary[seq]` reads. */
+VALUE rb_arithmetic_sequence_beg_len_step(VALUE obj, long *begp, long *lenp, long *stepp, long len, int err) {
+    rb_arithmetic_sequence_components_t aseq;
+    if (!rb_arithmetic_sequence_extract(obj, &aseq)) return Qfalse;
+    long step = NIL_P(aseq.step) ? 1 : NUM2LONG(aseq.step);
+    *stepp = step;
+    if (step < 0) {
+        if (aseq.exclude_end && !NIL_P(aseq.end)) {
+            /* Handle exclusion before range reversal */
+            aseq.end = LONG2NUM(NUM2LONG(aseq.end) + 1);
+            /* Don't exclude the previous beginning */
+            aseq.exclude_end = 0;
+        }
+        VALUE tmp = aseq.begin;
+        aseq.begin = aseq.end;
+        aseq.end = tmp;
+    }
+    if (err == 0 && (step < -1 || step > 1)) {
+        /* rb_range_component_beg_len with err = 0 for a stepped sequence */
+        long beg = NIL_P(aseq.begin) ? 0 : NUM2LONG(aseq.begin);
+        if (beg < 0) beg += len;
+        if (beg < 0 || beg > len) return Qnil;
+    }
+    VALUE range = rb_range_new(aseq.begin, aseq.end, aseq.exclude_end);
+    return rb_range_beg_len(range, begp, lenp, len, err);
+}
