@@ -1,4 +1,6 @@
-require '-test-/typeddata'
+# Ruby's own ext/-test-/typeddata and exception/dataerror, with typed_fixture.c
+# beside them (capi_check.py builds the three as one extension).
+require 'typed_probe'
 $checks = 0
 def check(name, condition)
   raise name unless condition
@@ -14,17 +16,9 @@ end
 def collect
   3.times { GC.start }
 end
-native = defined?(NativeProbe)
 errors = Array.new(16) { Bug::Exception::DataError.new('message') }
 collect
-begin
-  errors.each { |error| check('original dmark preserves native payload', error.__payload == '[Bug #9167] error') }
-rescue ArgumentError
-  # The negative control returns an expired C VALUE. Its error path must also
-  # release the invocation's temporary roots before propagating the failure.
-  raise 'expired result leaked temporary roots' if native && NativeProbe.__typed_stat(11) != 0
-  raise
-end
+errors.each { |error| check('original dmark preserves native payload', error.__payload == '[Bug #9167] error') }
 # New payloads originate in C and have never been returned to Ruby.
 boxes = Array.new(48) { Bug::NativeBox.new }
 collect
@@ -92,15 +86,8 @@ def dynamic_garbage
   100.times { Bug::TypedData.new }
   nil
 end
-before_native = native ? NativeProbe.__typed_stat(1) : 0
 dynamic_garbage
 collect
 check('dynamic descriptor cleanup returned', true)
-if native
-  check('original dfree callbacks ran', NativeProbe.__typed_stat(1) > before_native)
-  check('active typed roots released', NativeProbe.__typed_stat(11) == 0)
-  check('no stale dmark tokens', NativeProbe.__typed_stat(13) == 0)
-  check('C and Ruby owner counts agree', NativeProbe.__typed_stat(0) == NativeProbe.__typed_stat(12))
-end
 check('live owners remain usable', boxes.last.value == 'native-only-box-payload')
 puts "typeddata contracts: #{$checks} passed"

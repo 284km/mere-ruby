@@ -31,9 +31,6 @@ def ensured(body, cleanup)
   Bug::Exception.ensured(EnsureFixture.new(body, cleanup))
 end
 
-native = defined?(NativeProbe)
-baseline = native ? NativeProbe.__count : 0
-ensures_before = native ? NativeProbe.__native_ensures : 0
 [Object.new, nil, false, 'return value'].each do |value|
   calls = 0
   result = ensured(-> { value }, -> { calls += 1; :ignored })
@@ -164,10 +161,4 @@ end
 check('one Ruby raise event', events.length == 1)
 check('backtrace preserved', traced.backtrace == ['native-witness.rb:17'])
 
-if native
-  check('all temporary roots released', NativeProbe.__count == baseline)
-  check('all C resources released', NativeProbe.__native_resources == 0)
-  check('C invocation stack empty', NativeProbe.__native_depth == 0)
-  check('real C cleanup ran', NativeProbe.__native_ensures > ensures_before)
-end
 puts "native ensure contracts: #{$checks} passed"

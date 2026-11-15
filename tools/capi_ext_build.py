@@ -35,6 +35,11 @@ parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--cc', default=os.environ.get('CC', 'clang'))
 parser.add_argument('--cxx', default=os.environ.get('CXX', 'clang++'))
 parser.add_argument('--only', action='append', default=[], help='a feature name to build (repeatable)')
+parser.add_argument('--headers', action='append', type=Path, default=[],
+                    help="build against these include directories instead of mere-ruby's "
+                         "(repeatable): the same sources for a reference ruby")
+parser.add_argument('--extra', action='append', default=[], metavar='FEATURE=SOURCE[,SOURCE...]',
+                    help='one more extension, from the given C sources (repeatable)')
 args = parser.parse_args()
 SRC = args.ruby_source.resolve()
 EXT = SRC / 'ext' / '-test-'
@@ -42,7 +47,9 @@ OUT = args.output.resolve()
 darwin = platform.system() == 'Darwin'
 DLEXT = '.bundle' if darwin else '.so'
 LINK = ['-bundle', '-undefined', 'dynamic_lookup'] if darwin else ['-shared']
-CFLAGS = ['-O2', '-fPIC', '-w', '-I', str(ROOT / 'capi' / 'include')]
+CFLAGS = ['-O2', '-fPIC', '-w']
+for directory in (args.headers or [ROOT / 'capi' / 'include']):
+    CFLAGS += ['-I', str(Path(directory).resolve())]
 
 
 def plan(extconf):
@@ -100,6 +107,11 @@ def build(item):
 items = [plan(p) for p in sorted(EXT.rglob('extconf.rb')) if 'win32' not in p.parts]
 if args.only:
     items = [i for i in items if i['feature'] in args.only]
+for extra in args.extra:
+    feature, sources = extra.split('=', 1)
+    paths = [Path(x).resolve() for x in sources.split(',')]
+    items.append({'feature': feature, 'directory': 'extra/' + feature, 'sources': paths,
+                  'defines': [], 'includes': ['-I', str(paths[0].parent)], 'notes': []})
 OUT.mkdir(parents=True, exist_ok=True)
 with ThreadPoolExecutor(max_workers=os.cpu_count() or 2) as pool:
     results = list(pool.map(build, items))

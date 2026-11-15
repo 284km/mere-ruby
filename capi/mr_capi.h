@@ -105,6 +105,9 @@ VALUE mr_frame_block(void);
 /* A C function registered to be run by number. */
 long mr_register_function(void *fn, int arity);
 RBIMPL_ATTR_NORETURN() void mr_fatal(const char *message);
+/* MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure: one guarantee switched off, for
+ * the negative controls of tools/capi_check.py. UNSOUND; a diagnostic. */
+int mr_without(const char *what);
 /* An API this C side does not provide: NotImplementedError, never a guess. */
 RBIMPL_ATTR_NORETURN() void mr_unsupported(const char *what);
 

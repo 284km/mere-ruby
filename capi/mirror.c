@@ -302,6 +302,7 @@ void mr_mark_value(VALUE v) {
 int mr_capi_mark(closure_int_int visit, int number) {
     struct mr_mirror *m = mirror_at(number, 0);
     if (!m) return 0;
+    if (m->data && mr_without("dmark")) return 0;
     closure_int_int before = marker;
     int was = marking;
     marker = visit;
@@ -345,6 +346,7 @@ int mr_capi_release(int number) {
     if (m->body == T_STRING) free(m->as.string.as.heap.ptr);
     if (m->body == T_ARRAY) free((void *)m->as.array.as.heap.ptr);
     int ran = 0;
+    if (m->data && mr_without("dfree")) { free(m); return 0; }
     if (m->data == 2) {
         /* Read everything first: a dfree may free the type it came from. */
         const rb_data_type_t *type = (const rb_data_type_t *)(m->as.typed.type & TYPED_DATA_PTR_MASK);

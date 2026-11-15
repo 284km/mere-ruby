@@ -209,7 +209,8 @@ VALUE rb_ensure(VALUE (*body)(VALUE), VALUE data1, VALUE (*cleanup)(VALUE), VALU
     volatile VALUE result = mr_guarded(body, data1, &leaving);
     if (leaving != Qundef) mr_up2(MR_OUTCOME, leaving, MR_O_ENTER);
     volatile VALUE kept = leaving;      /* (on this stack: a collection in the cleanup finds it) */
-    mr_guarded(cleanup, data2, &cleanup_leaving);
+    if (mr_without("ensure")) cleanup_leaving = Qundef;
+    else mr_guarded(cleanup, data2, &cleanup_leaving);
     mr_up2(MR_ERRINFO, 1, before);
     if (cleanup_leaving != Qundef) mr_throw(cleanup_leaving);
     if (kept != Qundef) mr_throw(kept);

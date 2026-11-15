@@ -211,6 +211,12 @@ VALUE mr_const(const char *path) {
     mr_put_text(path);
     return mr_up1(MR_CONST, Qnil);
 }
+int mr_without(const char *what) {
+    static const char *knob;
+    static int read;
+    if (!read) { knob = getenv("MERE_RUBY_CAPI_WITHOUT"); read = 1; }
+    return knob && !strcmp(knob, what);
+}
 VALUE mr_main(void) { return mr_ruby("self"); }
 void mr_unsupported_symbol(const char *name) { mr_unsupported(name); }
 VALUE mr_ruby(const char *source) {
