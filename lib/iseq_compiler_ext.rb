@@ -1222,10 +1222,12 @@ class RubyVM::InstructionSequence
         nums = (1..b.parameters.maximum).map { |i| :"_#{i}" }
         child.locals.replace(nums + (child.locals - nums))
         child.params[:lead_num] = b.parameters.maximum
+        child.params[:implicit] = b.parameters.maximum
         child.params[:ambiguous_param0] = true if b.parameters.maximum == 1
       when Prism::ItParametersNode
         child.locals.replace([IT_PARAM] + child.locals.reject { |x| x == IT_PARAM })
         child.params[:lead_num] = 1
+        child.params[:implicit] = 0
         child.params[:ambiguous_param0] = true
       end
       u.children << child
@@ -4039,6 +4041,8 @@ class RubyVM::InstructionSequence
       params[:kwrest] = pr[:kwrest] if pr[:kwrest]
       params[:ambiguous_param0] = true if pr[:ambiguous_param0]
       params[:accepts_no_kwarg] = true if vm && pr[:no_kwarg]
+      # (...and which implicit parameters a block has: N for _1 .. _N, 0 for `it`)
+      params[:implicit] = pr[:implicit] if vm && pr[:implicit]
       params[:use_block] = true if pr[:use_block]
       # (a hidden local -- kwbits -- is numbered as iseq_data_to_ary numbers it)
       locals = u.locals.each_with_index.map { |l, i| l.is_a?(Integer) ? u.locals.size - i + 1 : l }
