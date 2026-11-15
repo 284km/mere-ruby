@@ -70,6 +70,9 @@ class RubyVM::InstructionSequence
     # (is_entries holds the ivar caches first and the constant caches after
     #  them: an IC's place there, which disasm shows, is past every IVC)
     IC = Struct.new(:index, :segments, :base)
+    # (a class variable's cache: one a name in a sequence, after the ivar
+    #  caches and before the constant caches)
+    CVC = Struct.new(:index, :base)
     CallData = Struct.new(:mid, :flag, :argc, :kwargs)
     # (defined's first operand: a number in to_a, a name in disasm)
     DefType = Struct.new(:n)
@@ -171,6 +174,8 @@ class RubyVM::InstructionSequence
       def next_is = (@is_n = (@is_n || -1) + 1)
       def next_ic = (@ic_n = (@ic_n || -1) + 1)
       def ivc_size = (@is_n || -1) + 1
+      def cvc(name) = CVC.new((@cvcs ||= {})[name] ||= @cvcs.size, nil)
+      def cvc_size = (@cvcs ||= {}).size
       def at(line, node_id) = (@line, @node = line, node_id)
       def line = @line
 
@@ -248,7 +253,8 @@ class RubyVM::InstructionSequence
       l = root.location
       unit = Unit.new(:top, label, path, abs_path, line, root.locals, nil,
                       [l.start_line, l.start_column, l.end_line, l.end_column], root.node_id)
-      unit.opts = opts
+      # (__ENCODING__: the source's, which a magic comment may have named)
+      unit.opts = opts.merge(source_encoding: (result.respond_to?(:encoding) && result.encoding) || src.encoding)
       compile_body(unit, root.statements, root.node_id)
       finish(unit)
       unit
@@ -405,8 +411,49 @@ class RubyVM::InstructionSequence
         u.insn(:putchilledstring, u.path.dup.freeze) unless popped
       when Prism::SourceLineNode
         u.insn(:putobject, n.location.start_line) unless popped
+      when Prism::SourceEncodingNode
+        u.insn(:putobject, u.opts[:source_encoding]) unless popped
       when Prism::RegularExpressionNode
-        u.insn(:putobject, Regexp.new(n.unescaped, n.options & 7)) unless popped
+        u.insn(:putobject, regexp_literal(n.unescaped, n)) unless popped
+      # pm_compile_regexp_dynamic: the pieces as an interpolated string's,
+      # and toregexp of them with the literal's options
+      when Prism::InterpolatedRegularExpressionNode
+        if n.once?
+          raise NotImplementedError, "RubyVM::InstructionSequence: an interpolated regexp with /o is not compiled yet"
+        end
+        # (every piece a literal: the Regexp itself)
+        if n.static_literal?
+          u.insn(:putobject, regexp_literal(static_concat(n.parts), n)) unless popped
+          return
+        end
+        count = dstr(u, n, false, true)
+        here(u, n)
+        u.insn(:toregexp, n.options & 0xff, count)
+        u.insn(:pop) if popped
+      # $1 .. $9: getspecial of the number doubled; $&, $`, $', $+: of the
+      # character doubled, plus 1
+      when Prism::NumberedReferenceReadNode
+        unless popped
+          if n.number == 0 then u.insn(:putnil) else u.insn(:getspecial, 1, n.number << 1) end
+        end
+      when Prism::BackReferenceReadNode
+        u.insn(:getspecial, 1, (n.name.to_s[1].ord << 1) | 1) unless popped
+      when Prism::MatchWriteNode then match_write(u, n, popped)
+      when Prism::ClassVariableReadNode
+        u.insn(:getclassvariable, n.name, u.cvc(n.name)) unless popped
+      when Prism::ClassVariableWriteNode
+        node(u, n.value, false)
+        here(u, n)
+        u.insn(:dup) unless popped
+        u.insn(:setclassvariable, n.name, u.cvc(n.name))
+      when Prism::ClassVariableOperatorWriteNode
+        u.insn(:getclassvariable, n.name, u.cvc(n.name))
+        node(u, n.value, false)
+        here(u, n)
+        push_send(u, n.binary_operator, 1)
+        u.insn(:dup) unless popped
+        u.insn(:setclassvariable, n.name, u.cvc(n.name))
+      when Prism::ClassVariableOrWriteNode, Prism::ClassVariableAndWriteNode then cvar_or_and_write(u, n, popped)
       when Prism::BeginNode
         if n.ensure_clause then ensure_part(u, n, popped)
         elsif n.rescue_clause then rescue_part(u, n, popped)
@@ -606,7 +653,7 @@ class RubyVM::InstructionSequence
       when Prism::HashNode then n.elements.to_h { |e| [static_value(e.key), static_value(e.value)] }.freeze
       when Prism::RangeNode
         Range.new(n.left && static_value(n.left), n.right && static_value(n.right), n.exclude_end?).freeze
-      when Prism::RegularExpressionNode then Regexp.new(n.unescaped, n.options & 7)
+      when Prism::RegularExpressionNode then regexp_literal(n.unescaped, n)
       else n.value
       end
     end
@@ -1454,7 +1501,7 @@ class RubyVM::InstructionSequence
     # interpolation of a string alone is a literal piece, at the part's
     # start); a lone interpolation has an empty string before it, and
     # pieces that are all literal are one string pushed as it is
-    def dstr(u, n, popped)
+    def dstr(u, n, popped, regexp = false)
       if n.is_a?(Prism::InterpolatedStringNode) && n.static_literal?
         # (a static one -- `"#{"a"}"` -- is its string, at its own place)
         unless popped
@@ -1502,6 +1549,8 @@ class RubyVM::InstructionSequence
           end
           node(u, part.statements, false)
         when Prism::InterpolatedStringNode then node(u, part, false)
+        # ("#@a", "#$g", "#@@c": the variable read)
+        when Prism::EmbeddedVariableNode then node(u, part.variable, false)
         else
           raise NotImplementedError, "RubyVM::InstructionSequence: #{part.type} in a string is not compiled yet"
         end
@@ -1520,6 +1569,8 @@ class RubyVM::InstructionSequence
                end, cur.freeze)
         count += 1
       end
+      # (a regexp's pieces are toregexp's, however many)
+      return count if regexp
       here(u, n)
       u.insn(:concatstrings, count) if count > 1
       u.insn(:pop) if popped
@@ -1794,6 +1845,8 @@ class RubyVM::InstructionSequence
         winsn(writes, t, :setinstancevariable, t.name, IVC.new(u.next_is))
       when Prism::GlobalVariableTargetNode
         winsn(writes, t, :setglobal, t.name)
+      when Prism::ClassVariableTargetNode
+        winsn(writes, t, :setclassvariable, t.name, u.cvc(t.name))
       when Prism::ConstantTargetNode
         winsn(writes, t, :putspecialobject, 3)
         winsn(writes, t, :setconstant, t.name)
@@ -1926,6 +1979,12 @@ class RubyVM::InstructionSequence
       when Prism::InstanceVariableReadNode
         loc.()
         return u.insn(:definedivar, n.name, IVC.new(u.next_is), val.(:ivar))
+      # (a match reference: the number doubled, or the character doubled plus 1)
+      when Prism::NumberedReferenceReadNode, Prism::BackReferenceReadNode
+        ref = n.is_a?(Prism::NumberedReferenceReadNode) ? n.number << 1 : (n.name.to_s[1].ord << 1) | 1
+        loc.()
+        u.insn(:putnil)
+        return u.insn(:defined, DefType.new(DEFINED[:ref]), ref, val.(:gvar))
       when Prism::GlobalVariableReadNode, Prism::ClassVariableReadNode, Prism::ConstantReadNode
         t = { Prism::GlobalVariableReadNode => :gvar, Prism::ClassVariableReadNode => :cvar }[n.class] || :const
         loc.()
@@ -2132,6 +2191,7 @@ class RubyVM::InstructionSequence
         when Prism::LocalVariableTargetNode then u.insn(:setlocal, *local_ref(u, r.name, r.depth))
         when Prism::InstanceVariableTargetNode then u.insn(:setinstancevariable, r.name, IVC.new(u.next_is))
         when Prism::GlobalVariableTargetNode then u.insn(:setglobal, r.name)
+        when Prism::ClassVariableTargetNode then u.insn(:setclassvariable, r.name, u.cvc(r.name))
         else raise NotImplementedError, "RubyVM::InstructionSequence: rescue into #{r.type} is not compiled yet"
         end
       end
@@ -2379,6 +2439,83 @@ class RubyVM::InstructionSequence
       when Prism::SourceFileNode then [u.path.dup.freeze]
       when Prism::StringNode then [c.unescaped.dup.freeze]
       end
+    end
+
+    # a Regexp literal's value: its source, its i / x / m, and the encoding
+    # its n / u / e / s names (parse_regexp_encoding)
+    def regexp_literal(src, n)
+      o = n.options & 7
+      if n.ascii_8bit? then Regexp.new(src.b, o | Regexp::NOENCODING)
+      elsif n.utf_8? then Regexp.new(src.dup.force_encoding(Encoding::UTF_8), o | Regexp::FIXEDENCODING)
+      elsif n.euc_jp? then Regexp.new(src.dup.force_encoding(Encoding::EUC_JP), o | Regexp::FIXEDENCODING)
+      elsif n.windows_31j? then Regexp.new(src.dup.force_encoding(Encoding::Windows_31J), o | Regexp::FIXEDENCODING)
+      else Regexp.new(src, o)
+      end
+    end
+
+    # pm_compile_node's PM_MATCH_WRITE_NODE: `/(?<n>..)/ =~ s` -- the match,
+    # then $~'s named groups into their locals, nil each when it failed
+    def match_write(u, n, popped)
+      fail_l = u.new_label
+      end_l = u.new_label
+      node(u, n.call, false)
+      here(u, n)
+      u.insn(:getglobal, :$~)
+      u.insn(:dup)
+      u.insn(:branchunless, fail_l)
+      if n.targets.size == 1
+        t = n.targets[0]
+        u.insn(:putobject, t.name)
+        push_send(u, :[], 1)
+        u.emit_label(fail_l)
+        u.insn(:setlocal, *local_ref(u, t.name, t.depth))
+        u.insn(:pop) if popped
+        return
+      end
+      fails = []
+      n.targets.each_with_index do |t, i|
+        u.insn(:dup) if i < n.targets.size - 1
+        u.insn(:putobject, t.name)
+        push_send(u, :[], 1)
+        u.insn(:setlocal, *local_ref(u, t.name, t.depth))
+        fails << t
+      end
+      u.insn(:jump, end_l)
+      u.emit_label(fail_l)
+      u.insn(:pop)
+      fails.each do |t|
+        u.insn(:putnil)
+        u.insn(:setlocal, *local_ref(u, t.name, t.depth))
+      end
+      u.emit_label(end_l)
+      u.insn(:pop) if popped
+    end
+
+    # @@x ||= v (defined first: reading one that is not is a NameError) and
+    # @@x &&= v
+    def cvar_or_and_write(u, n, popped)
+      end_l = u.new_label
+      if n.is_a?(Prism::ClassVariableOrWriteNode)
+        set_l = u.new_label
+        u.insn(:putnil)
+        u.insn(:defined, DefType.new(DEFINED[:cvar]), n.name, true)
+        u.insn(:branchunless, set_l)
+        u.insn(:getclassvariable, n.name, u.cvc(n.name))
+        u.insn(:dup) unless popped
+        u.insn(:branchif, end_l)
+        u.insn(:pop) unless popped
+        u.emit_label(set_l)
+      else
+        u.insn(:getclassvariable, n.name, u.cvc(n.name))
+        u.insn(:dup) unless popped
+        u.insn(:branchunless, end_l)
+        u.insn(:pop) unless popped
+      end
+      node(u, n.value, false)
+      here(u, n)
+      u.insn(:dup) unless popped
+      u.insn(:setclassvariable, n.name, u.cvc(n.name))
+      u.emit_label(end_l)
     end
 
     # x ||= v / x &&= v, of a local or an instance variable; a local's ||=
@@ -2957,11 +3094,10 @@ class RubyVM::InstructionSequence
     # block's end.
     def next_node(u, n, popped)
       args = n.arguments&.arguments || []
-      raise NotImplementedError, "RubyVM::InstructionSequence: next with values" if args.size > 1
       sp = u.new_label
       if (lp = u.loops.last) && can_add_ensure?(u)
         u.emit_label(sp)
-        if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+        return_value(u, n)
         no_ensure_escape(u, false)
         here(u, n)
         u.adjust(lp[2], false)
@@ -2970,7 +3106,7 @@ class RubyVM::InstructionSequence
         u.emit_label(sp)
         here(u, n)
         u.adjust(u.block_labels[0], false)
-        if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+        return_value(u, n)
         no_ensure_escape(u, false)
         here(u, n)
         u.insn(:jump, u.block_labels[1])
@@ -2980,7 +3116,7 @@ class RubyVM::InstructionSequence
         return
       elsif escape_scope(u)
         # (from a rescue / ensure sequence: thrown to the block or loop)
-        if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+        return_value(u, n)
         here(u, n)
         u.insn(:throw, THROW_NO_ESCAPE | 3)
         u.insn(:pop) if popped
@@ -3043,13 +3179,12 @@ class RubyVM::InstructionSequence
     # catches
     def break_node(u, n, popped)
       args = n.arguments&.arguments || []
-      raise NotImplementedError, "RubyVM::InstructionSequence: break with values" if args.size > 1
       if (lp = u.loops.last) && can_add_ensure?(u)
         sp = u.new_label
         u.emit_label(sp)
         here(u, n)
         u.adjust(lp[2], false)
-        if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+        return_value(u, n)
         no_ensure_escape(u, false)
         here(u, n)
         u.insn(:jump, lp[1])
@@ -3058,7 +3193,7 @@ class RubyVM::InstructionSequence
       elsif (ip = escape_scope(u))
         # (a loop's break from a rescue / ensure sequence does not escape
         #  the frame: VM_THROW_NO_ESCAPE_FLAG)
-        if args.empty? then (here(u, n); u.insn(:putnil)) else node(u, args[0], false) end
+        return_value(u, n)
         here(u, n)
         u.insn(:throw, ip.loops.empty? ? 2 : THROW_NO_ESCAPE | 2)
         u.insn(:pop) if popped
@@ -3070,7 +3205,13 @@ class RubyVM::InstructionSequence
     # -- the backend (compile.c's iseq_setup): peephole and specialised
     # instructions, operand unification, the stack depth, the layout ----
     def finish(u)
-      u.elements.each { |e| e.ops.each { |o| o.base = u.ivc_size if o.is_a?(IC) } if e.is_a?(Insn) }
+      u.elements.each do |e|
+        next unless e.is_a?(Insn)
+        e.ops.each do |o|
+          o.base = u.ivc_size + u.cvc_size if o.is_a?(IC)
+          o.base = u.ivc_size if o.is_a?(CVC)
+        end
+      end
       optimize(u)
       drop_block_nop(u)
       nop_between_end_and_cont(u)
@@ -3730,7 +3871,7 @@ class RubyVM::InstructionSequence
           e.ops = [e.ops[0]]
         end
       when :putobject
-        if e.ops[0].equal?(0) || e.ops[0].equal?(1)
+        if e.ops[0].is_a?(Integer) && (e.ops[0] == 0 || e.ops[0] == 1)
           e.name = :"putobject_INT2FIX_#{e.ops[0]}_"
           e.ops = []
         end
@@ -3797,7 +3938,9 @@ class RubyVM::InstructionSequence
       when :splatkw then [2, 2]
       when :pushtoarraykwsplat then [2, 1]
       when :dupn then [e.ops[0], e.ops[0] * 2]
-      when :checkkeyword, :getspecial then [0, 1]
+      when :checkkeyword, :getspecial, :getclassvariable then [0, 1]
+      when :setclassvariable then [1, 0]
+      when :toregexp then [e.ops[1], 1]
       when :definemethod, :jump then [0, 0]
       when :definesmethod then [1, 0]
       when :getblockparam then [0, 1]
@@ -3913,6 +4056,7 @@ class RubyVM::InstructionSequence
       when Label then :"label_#{o.pos}"
       when LocalOp then o.idx
       when IVC then o.index
+      when CVC then o.index
       when IC then o.segments
       when DefType then o.n
       when CDHash then o.entries.flat_map { |k, l| [k, :"label_#{l.pos}"] }
@@ -4024,7 +4168,13 @@ class RubyVM::InstructionSequence
       u.elements.each do |e|
         next unless e.is_a?(Insn)
         s = format("%04d %-*s ", pos, INSN_NAME_WIDTH, e.name)
-        s << e.ops.map { |o| operand_disasm(o) }.join(", ")
+        ops = e.ops.map { |o| operand_disasm(o) }
+        # (defined's match reference is shown by name: $1, $&)
+        if e.name == :defined && e.ops[0].is_a?(DefType) && e.ops[0].n == DEFINED[:ref] && e.ops[1].is_a?(Integer)
+          r = e.ops[1]
+          ops[1] = (r.odd? ? :"$#{(r >> 1).chr}" : :"$#{r >> 1}").inspect
+        end
+        s << ops.join(", ")
         if e.line && e.line > 0 && e.line != prev_line
           slen = s.size > 70 ? 0 : 70 - s.size
           s << " " * slen << format("(%4d)", e.line)
@@ -4074,6 +4224,7 @@ class RubyVM::InstructionSequence
         flags = CALL_FLAG_NAMES.select { |b, _| o.flag & b != 0 }.map(&:last)
         "<calldata!#{o.mid ? "mid:#{o.mid}, " : ""}argc:#{o.argc}#{o.kwargs ? ", kw:[#{o.kwargs.join(",")}]" : ""}#{flags.empty? ? "" : ", " + flags.join("|")}>"
       when IVC then "<is:#{o.index}>"
+      when CVC then "<is:#{o.index + (o.base || 0)}>"
       when IC then "<ic:#{o.index + (o.base || 0)} #{o.segments.join("::")}>"
       when DefType then DEFINED_NAMES[o.n]
       when CDHash then "<cdhash>"

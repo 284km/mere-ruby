@@ -57,7 +57,8 @@ for f in "$TMP"/s*.rb; do
   b=$(basename "$f")
   n=$((n + 1))
   (cd "$TMP" && "$RUBY" "$b" > r.out 2> r.err)
-  (cd "$TMP" && MERE_ISEQ_VM=strict "$MR" "$b" > m.out 2> m.err)
+  # (bounded: a snippet that never ends is a difference, not a hang)
+  (cd "$TMP" && MERE_ISEQ_VM=strict perl -e 'alarm 120; exec @ARGV' "$MR" "$b" > m.out 2> m.err)
   if cmp -s "$TMP/r.out" "$TMP/m.out" && cmp -s "$TMP/r.err" "$TMP/m.err"; then
     ok=$((ok + 1))
   else
