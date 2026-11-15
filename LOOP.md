@@ -4617,3 +4617,51 @@ FileUtils looked like defects. corpus 656.
     test_object_id / test_module / test_class / test_integer, test_fiber
     test_fatal_in_fiber and test_process test_rlimit_nofile (both fail on
     the reference here too).
+
+## 2026-11-15 (54): the native extension prototype is taken in -- stage 7′ / 8 starts from it
+
+The first unit of the C extension stage (note 550 §3, note 553): the
+prototype another session had built and left unpublished is on main's
+line now, checked, and in CI. It does not change what the unit tests
+measure yet -- `-ext-` and mkmf wait for the C API proper, which is built
+on this from the next round.
+
+- **What came in** (prototype/native-target-config, 8 commits on a base 274
+  commits behind main): a table that keeps Ruby values alive while C holds
+  them; a boundary where an exception or a `throw` raised under a C function
+  comes back to C first, so `rb_ensure`'s cleanup runs before it goes on;
+  TypedData with dmark called for live owners and dfree at the sweep;
+  `rb_define_*` registering into the ordinary method tables and `require`
+  opening a `.bundle` and calling its `Init_`; an opt-in RbConfig that lets
+  ruby's own mkmf.rb write a Makefile and build; the environment mkmf's 17
+  test files need; and headers generated for the target compiler with
+  compile-only size checks. All of it is under tools/native_probe/ and
+  described in tools/native_probe/NATIVE.md. The value C sees is a 32-bit
+  token, not CRuby's VALUE: Ruby's own ext/-test-/float, exception and
+  typeddata sources compile unchanged against the probe header, and little
+  else does.
+- **The merge**: 5 files, 12 places. The collector had changed most (class
+  and metadata passes, the live set no longer a map): the TypedData owner
+  visit sits in the new drain, the native sweep after the fixpoint asks
+  gc_live_has. The rest is both sides kept. The prototype's README sections
+  moved beside the probes; its two writes to the ivar table go through
+  iv_put; corpus/516_string_format_super.rb is gone (526 is the same
+  witness, grown, from PR #50).
+- **One contract no longer held**: a ZeroDivisionError raised under
+  `rb_ensure` must be the same object in the cleanup's `$!` and in the
+  `rescue => e` after it. Since the prototype's base, a rescue makes the
+  object out of a class-and-message pair (exc_pin_bt), so the two were a
+  pair and an object. The boundary now makes that object when it captures
+  the exception.
+- **Checks** (all on this machine, O2 build): the prototype's own --
+  ensure_check 9 runs, typeddata_check 9, loader_check 7, mkmf_check (ruby's
+  nextafter.c built by mkmf and its 400 tests through `require`), 
+  configure_headers_check 7 -- each with its negative controls, are a step
+  of CI's corpus job now. The corpus is 686 of 686. The embedding archive
+  links the five bridge sources too (tools/native_probe/native_build_flags.py
+  lists them once for build.sh's two other callers).
+- **Not done here**: mkmf_suite_check (mkmf's 17 files on both sides) needs
+  the reference's static libruby, which this machine's reference
+  installation does not have; CI's unit test run measures test/mkmf on both
+  sides as before. Bracket depth is 887 of 1024 (was 870): the probe's
+  tables are top-level values, and the next round replaces them.
