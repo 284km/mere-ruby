@@ -121,11 +121,11 @@ for side, binary in [('reference', REF), ('mere', MERE)]:
     (lib/'relative_driver.rb').write_text("$relative_native = require_relative 'loader_fixture'\n")
     work = OUT/side/'run'
     for name, file, extra, expected in [
-        ('loader', WT/'tools/native_probe/loader.rb', {}, f"native loader contracts: {46 if side=='reference' else 50} passed"),
+        ('loader', WT/'tools/native_probe/loader.rb', {}, f"native loader contracts: {48 if side=='reference' else 52} passed"),
         ('numeric', WT/'tools/native_probe/numeric.rb', {}, 'native numeric contracts: 13 passed'),
         ('private', WT/'tools/native_probe/implicit_private_block.rb', {}, ':no_block\n:block\n:direct\nexplicit_private_refused\n:singleton\n'),
         ('nextafter', SRC/'test/-ext-/float/test_nextafter.rb', {}, '400 tests, 1225 assertions, 0 failures, 0 errors, 0 skips'),
-        ('loader-stress', WT/'tools/native_probe/loader.rb', {'MERE_RUBY_GC_STRESS':'1'}, 'native loader contracts: 50 passed'),
+        ('loader-stress', WT/'tools/native_probe/loader.rb', {'MERE_RUBY_GC_STRESS':'1'}, 'native loader contracts: 52 passed'),
         ('numeric-stress', WT/'tools/native_probe/numeric.rb', {'MERE_RUBY_GC_STRESS':'1'}, 'native numeric contracts: 13 passed'),
     ]:
         if side == 'reference' and name.endswith('-stress'): continue
@@ -134,6 +134,7 @@ for side, binary in [('reference', REF), ('mere', MERE)]:
         # library. With the standard library on the path, a require that is
         # refused goes on through RubyGems' search, which is minutes here.
         if name.endswith('-stress'): e['RUBYLIB'] = str(lib)
+        events = OUT/(name+'.'+side+'.events'); events.unlink(missing_ok=True); e['LOADER_EVENTS'] = str(events)
         args = ['-r', 'test/unit', '-r', str(WT/'unittest/bootstrap.rb')] if name == 'nextafter' else []
         run(name+'.'+side, [binary, *args, file, *(['-v', '--seed=1'] if name == 'nextafter' else [])], e, work, expected)
     run('mkmf-global.'+side,

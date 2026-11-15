@@ -144,15 +144,32 @@ int mr_typed_load(const char *path) {
 /* Is this file an extension compiled against this interpreter's header?
  * `require` asks before it takes a .bundle / .so for the feature: one built
  * for another ruby is not a candidate at all, and the search goes on to
- * whatever provided the feature before (a .rb, the shipped library). */
+ * whatever provided the feature before (a .rb, the shipped library).
+ *
+ * The question is asked of the FILE, not of the loaded library: opening a
+ * library runs its constructors and closing it its destructors, so asking
+ * by dlopen gave an accepted library a whole extra life before its Init_,
+ * and ran a foreign library's constructors in this process. Every extension
+ * compiled against the header defines mere_extension_abi, so its symbol
+ * table names it; the number itself is read when the library is really
+ * opened (mr_typed_load), which refuses a different one aloud. */
 int mr_typed_probe(const char *path) {
+    static const char needle[]="mere_extension_abi";
     for(int i=0;i<library_count;i++) if(!strcmp(libraries[i].path,path)) return 1;
-    void *handle=dlopen(path,RTLD_LAZY|RTLD_LOCAL);
-    if(!handle) return 0;
-    const unsigned *abi=(const unsigned *)dlsym(handle,"mere_extension_abi");
-    int ours=abi && *abi==0x4d520002U;
-    dlclose(handle);
-    return ours;
+    FILE *f=fopen(path,"rb");
+    if(!f) return 0;
+    size_t n=sizeof(needle)-1,kept=0,got;
+    char buffer[65536+64];
+    int found=0;
+    while(!found && (got=fread(buffer+kept,1,65536,f))>0) {
+        size_t have=kept+got;
+        for(size_t i=0;i+n<=have;i++) if(buffer[i]==needle[0] && !memcmp(buffer+i,needle,n)) { found=1; break; }
+        /* (a name that straddles two reads: keep the tail) */
+        kept=have<n-1 ? have : n-1;
+        memmove(buffer,buffer+have-kept,kept);
+    }
+    fclose(f);
+    return found;
 }
 int mr_typed_loader_stat(int field) {
     if(field==0) return library_count;

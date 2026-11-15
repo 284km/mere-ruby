@@ -89,6 +89,7 @@ for side,binary in [('reference',REF),('mere',MERE)]:
         #  RubyGems' search, which is minutes under that load)
         if name=='stress':env['RUBYLIB']=str(lib)
         env.update(extra)
+        events=HERE/(key+'.events');events.unlink(missing_ok=True);env['LOADER_EVENTS']=str(events)
         cmd=[str(binary)]
         if name not in ['contracts','stress']:cmd+=['-r','test/unit','-r',str(WT/'unittest/bootstrap.rb')]
         cmd+=[str(file)]
@@ -96,7 +97,7 @@ for side,binary in [('reference',REF),('mere',MERE)]:
         if name=='marshal':cmd+=['--name=test_marshal']
         log=HERE/(key+'.out');r=supervise(cmd,env,log,2*1024*1024,90);output=log.read_text()
         if name in ['contracts','stress']:
-            expected=f"native loader contracts: {46 if side=='reference' else 50} passed"
+            expected=f"native loader contracts: {48 if side=='reference' else 52} passed"
         else:
             tests,assertions={'typed':(3,17),'ensured':(1,4),'throwing':(1,5),'dataerror':(1,3),'marshal':(1,2)}[name]
             expected=f'{tests} tests, {assertions} assertions, 0 failures, 0 errors, 0 skips'

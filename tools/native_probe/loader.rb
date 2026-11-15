@@ -12,6 +12,9 @@ def raised(kind)
   raise "expected #{kind}"
 end
 check('first require', require('loader_fixture') == true)
+# The library is opened once: its constructors run once, then its Init_, and
+# nothing closes it (asking a file whether it is an extension must not load it).
+check('one constructor, then Init', File.read(ENV.fetch('LOADER_EVENTS')) == "constructor\nInit\n")
 check('repeat require', require('loader_fixture') == false)
 check('native suffix alias', require('loader_fixture.so') == false)
 check('one Init call', LoaderFixture.init_count == 1)
@@ -80,6 +83,7 @@ check('relative require from Ruby file', require('relative_driver') == true && $
 $LOADED_FEATURES.delete(loaded)
 check('feature removal permits reload', require('loader_fixture') == true)
 check('reload invokes Init', LoaderFixture.init_count == 2)
+check('a reload does not load the library again', File.read(ENV.fetch('LOADER_EVENTS')) == "constructor\nInit\nInit\n")
 if ENV['MERE_LOADER_TEST'] == '1'
   class NativeProbe; end
   before = NativeProbe.__loader_stat(0)
