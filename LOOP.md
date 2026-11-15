@@ -4888,3 +4888,103 @@ an interrupt during `to_s`, which is not long here).
 **Next**: RbConfig's keys from this build's real environment and mkmf on
 these headers (`test/mkmf`, and `capi_ext_build.py` replaced by ruby's own
 extconf.rb runs), then RubyGems' native builds and a real gem.
+
+## 2026-11-16 (59): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and three published gems install with `gem install`
+
+Stage 7′ / 8, third unit (note 553), on the C API of (58). Until now
+`require "mkmf"` stopped at a nil RbConfig key, so nothing that builds an
+extension the way a gem does could start. Now `mere-ruby extconf.rb && make
+&& make install` works with ruby's unchanged mkmf.rb, RubyGems' `gem
+install` builds a gem's C extension, and three published gems behave as on
+the reference.
+
+- **RbConfig says the build where there is one.** An interpreter that finds
+  `capi/include/ruby.h` beside its executable adds its own build to
+  RbConfig: the header directory (`rubyhdrdir`, `rubyarchhdrdir`), the
+  executable's directory and name (`topdir`, `bindir`,
+  `ruby_install_name`), clang and the flags an extension for it is built
+  with, no libruby, and the POSIX tools a Makefile calls -- 97 keys in all
+  (36 before; CRuby has 254). Each value is how tools/build.sh builds the
+  interpreter or how capi/README.md says an extension is built; none is
+  copied from a CRuby installation, and a build without the C API (the Wasm
+  playground) gets none. `bindir` and the install name had been `/usr/bin`
+  and `ruby`: mkmf writes them into every Makefile as `$(RUBY)`, and
+  RubyGems starts `extconf.rb` with them, so with the stand-ins a build ran
+  the system's ruby.
+- **Left unsaid, on purpose**: `ENABLE_SHARED` ("no" is true, but RubyGems
+  names the directory of built extensions after it, and the gems this
+  interpreter reads are the reference installation's: every gem with an
+  extension was then reported as not built, seven lines on stderr in any
+  process whose `require` missed); a libruby name; and the installation
+  layout (`prefix`, `libdir`, the site directories stay the stand-ins --
+  `make install` is given its directory, as RubyGems gives it).
+- **A class C defines is the class statement.** `rb_define_class_under`
+  made an anonymous class and set it as the constant. Under two modules
+  made the same way the interpreter then lost the link: `class Custom <
+  Redcarpet::Render::Base` did not find its superclass again
+  (`Custom <= Redcarpet::Render::Base` was nil -- plain Ruby shows it too:
+  `Module.new` twice, `const_set` twice, a `Class.new` under them). Where
+  the scope and the superclass have names, C's definition now runs `class
+  Outer::Name < Super; end` itself. The anonymous way is kept for the rest,
+  and the interpreter's own gap is still there for plain Ruby.
+- **test/mkmf has a build tree to run in.** ruby's mkmf tests are written
+  for a ruby build tree (`$extmk`, topdir's Makefile, ruby.h under the
+  source tree, config.h under `.ext`). The reference side runs them in its
+  own (build_reference.sh); for mere-ruby, unittest/mkmf_context.sh stages
+  one of links to capi/include, a Makefile mere-ruby's own mkmf writes, and
+  a launcher the test and its children run through. Nothing about the
+  compiler or the flags is overridden there.
+
+**Checks.**
+
+- `tools/capi_mkmf_check.py` (CI, macOS and Linux): an extension whose
+  extconf.rb asks about headers, functions, macros, a size and a library,
+  and ruby's `ext/-test-/float` by its own extconf.rb, built with
+  `extconf.rb`, `make`, `make install` on both rubies. What mkmf answered
+  is read out of the built library: 11 contracts, the same on both sides
+  and under a collection at every safepoint. A source that does not compile
+  fails at `make` on both; mere-ruby given the libraries the reference's
+  mkmf built fails.
+- `tools/capi_gem_check.py` (CI, macOS and Linux): fast_blank 1.0.1,
+  redcarpet 3.6.1 and msgpack 1.8.7 are installed by each ruby with `gem
+  install` from the same .gem files; `capi/check/gems.rb` uses them (30
+  lines of output: blank tests, HTML and a Ruby-defined renderer called back
+  from C, packing and unpacking Integers, Floats, binary and UTF-8 Strings,
+  a streaming unpacker, a malformed input's exception) and prints the same
+  on both sides. mere-ruby pointed at the reference's gem directory fails.
+- Local, O2: gates dead_defs, dup_defs, gc_roots pass; bracket depth 883 of
+  1024; capi_check as before.
+
+**Measured here** (this machine, the interpreter's side; CI's shards are the
+record and go in below when they have run):
+
+- `test/mkmf`: 144 of 148 pass and all 17 files reach their summary (0 and
+  none at the baseline). The four left: `have_func("ruby_init")` -- a
+  program cannot be linked against the C API, which lives in the
+  executable, so mkmf's answer for a ruby API function is "no"; two of
+  test_have_library, which take the platform's library prefix from
+  `LIBRUBY_A`'s name, and there is no such archive; `test_dir_config`,
+  which wants `libdir` written in terms of `exec_prefix`.
+- `test/rubygems`: 2773 of 2780 pass (the baseline's MATCH was 2712), no
+  file lower than its baseline row. test_gem_ext_ext_conf_builder 3 -> 8 of
+  8, test_gem_ext_builder 18 -> 22 of 23, test_gem_installer 120 -> 127 of
+  127, test_gem_commands_exec_command 0 -> 28 of 28,
+  test_gem_ext_cargo_builder_unit 0 -> 5 of 5.
+- `test/-ext-`: 659 of 831, as at (58).
+
+**Found on the way, not this round's to fix** (both are the interpreter's,
+on any build):
+
+- A program started with SIGINT ignored (a shell's `&` job) keeps it
+  ignored in ruby and does not here: corpus/394 prints one more line in
+  that case alone. `run_corpus.sh` in the foreground, as CI runs it, is not
+  affected; two local runs started with `&` were.
+- The directory test is `stat("<path>/")`, and on this machine's macOS the
+  kernel answers that for one symlink to a file (a `~/.gemrc` pointing into
+  another directory) with success about four times in ten: `File.read` of
+  it is then EISDIR, at random. capi_gem_check.py runs with a home of its
+  own.
+
+**Next**: an import library so that mkmf's `have_func` of a ruby API
+function answers truthfully (gems probe for functions and define their own
+when the answer is no), then a gem that brings a library with it (nokogiri).
