@@ -4681,6 +4681,18 @@ on this from the next round.
     aborted. The int travels beside the answer now, range-checked on the
     interpreter's side; the loader contracts gained INT_MIN, -1, 0, INT_MAX
     and an out-of-range value (41 -> 46 shared checks).
+  - Asking a file whether it is an extension loaded it. The question added
+    for the Linux failure above was a `dlopen` and a `dlclose`, so a library
+    that was accepted ran its constructors, its destructors and its
+    constructors again before `Init_`, and a library built for another ruby
+    had its constructors run here. The file is read for the name every
+    extension compiled against the header defines, and the library is opened
+    once, when it is loaded; the number behind the name is compared then.
+    The loader fixture writes down its constructor, `Init_` and destructor:
+    "constructor, Init" after the first require and "constructor, Init,
+    Init" after a reload, on both sides (46 -> 48 shared checks). Against
+    the previous head the first of those fails with "constructor,
+    destructor, constructor, Init".
   - The Wasm build's source tree (tools/nothreads_tree.sh) copies top-level
     .mere files only and could not find the externs under
     tools/native_probe/. Every native extern is declared in
