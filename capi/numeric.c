@@ -353,7 +353,20 @@ VALUE rb_num_coerce_bit(VALUE x, VALUE y, ID op) { return coerced(x, y, op); }
 /* ---- Rational and Complex --------------------------------------------------- */
 VALUE rb_Rational(VALUE num, VALUE den) { return mr_call(mr_main(), "Rational", 2, num, den); }
 VALUE rb_rational_new(VALUE num, VALUE den) { return mr_call(mr_main(), "Rational", 2, num, den); }
-VALUE rb_rational_raw(VALUE num, VALUE den) { return mr_call(mr_main(), "Rational", 2, num, den); }
+/* rational.c's rb_rational_raw: Integers (or what to_int gives), the sign on
+ * the numerator, and no reduction. A Rational here is always in lowest terms,
+ * so the pair that is not is refused instead of being answered reduced. */
+VALUE rb_rational_raw(VALUE num, VALUE den) {
+    if (!RB_INTEGER_TYPE_P(num)) num = rb_to_int(num);
+    if (!RB_INTEGER_TYPE_P(den)) den = rb_to_int(den);
+    if (RTEST(mr_call(den, "<", 1, INT2FIX(0)))) {
+        num = mr_call(num, "-@", 0);
+        den = mr_call(den, "-@", 0);
+    }
+    if (!RTEST(mr_call(mr_call(num, "gcd", 1, den), "==", 1, INT2FIX(1))) && !RTEST(mr_call(den, "==", 1, INT2FIX(0))))
+        mr_unsupported("rb_rational_raw (a Rational that is not in lowest terms)");
+    return mr_call(mr_main(), "Rational", 2, num, den);
+}
 VALUE rb_rational_num(VALUE r) { return mr_call(r, "numerator", 0); }
 VALUE rb_rational_den(VALUE r) { return mr_call(r, "denominator", 0); }
 VALUE rb_flt_rationalize(VALUE f) { return mr_call(f, "rationalize", 0); }

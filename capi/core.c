@@ -467,18 +467,26 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
 }
 
 /* A symbol of an extension that is loaded, by the feature it was required as. */
+/* A symbol of the library a feature was loaded from. The feature is named as
+ * `require` names it, with or without a suffix (".so" stands for whatever the
+ * platform's is). A feature that is loaded but came from no library is part
+ * of this executable -- ruby's "statically linked" extensions. */
 void *rb_ext_resolve_symbol(const char *feature, const char *symbol) {
     size_t n = strlen(feature);
+    const char *suffix = strrchr(feature, '.');
+    if (suffix && (!strcmp(suffix, ".so") || !strcmp(suffix, ".bundle") || !strcmp(suffix, ".dll")))
+        n = (size_t)(suffix - feature);
     for (long i = 0; i < library_count; i++) {
         const char *path = libraries[i].path;
-        size_t len = strlen(path);
         const char *dot = strrchr(path, '.');
-        size_t stem = dot ? (size_t)(dot - path) : len;
+        size_t stem = dot ? (size_t)(dot - path) : strlen(path);
         if (stem >= n && !strncmp(path + stem - n, feature, n) && (stem == n || path[stem - n - 1] == '/'))
             return dlsym(libraries[i].handle, symbol);
-        if (len >= n && !strcmp(path + len - n, feature)) return dlsym(libraries[i].handle, symbol);
     }
-    return NULL;
+    VALUE name = rb_str_new(feature, (long)n);
+    VALUE loaded = mr_call(mr_ruby("->(name) { $LOADED_FEATURES.any? { |f| f == name + '.so' || f == name + '.rb' || f.end_with?('/' + name + '.rb') } }"),
+                           "call", 1, name);
+    return RTEST(loaded) ? dlsym(RTLD_DEFAULT, symbol) : NULL;
 }
 
 int mr_capi_depth(void) { return depth; }

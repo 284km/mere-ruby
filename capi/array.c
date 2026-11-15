@@ -163,19 +163,21 @@ int rb_range_values(VALUE range, VALUE *begp, VALUE *endp, int *exclp) {
     *exclp = RTEST(mr_call(range, "exclude_end?", 0));
     return (int)Qtrue;
 }
-VALUE rb_range_beg_len(VALUE range, long *begp, long *lenp, long len, int err) {
-    VALUE b, e;
-    int excl;
-    if (!rb_range_values(range, &b, &e, &excl)) return Qfalse;
+/* range.c's rb_range_component_beg_len and rb_range_beg_len, as they are in
+ * 4.0: the bounds are clipped when err is 0 or 2, and err says whether out of
+ * range is nil or a RangeError. */
+static VALUE range_component_beg_len(VALUE b, VALUE e, int excl, long *begp, long *lenp, long len, int err) {
     long beg = NIL_P(b) ? 0 : NUM2LONG(b);
     long end = NIL_P(e) ? -1 : NUM2LONG(e);
     if (NIL_P(e)) excl = 0;
-    long origbeg = beg, origend = end;
-    if (beg < 0) { beg += len; if (beg < 0) goto out_of_range; }
+    if (beg < 0) {
+        beg += len;
+        if (beg < 0) return Qnil;
+    }
     if (end < 0) end += len;
     if (!excl) end++;
-    if (err) {
-        if (beg > len) goto out_of_range;
+    if (err == 0 || err == 2) {
+        if (beg > len) return Qnil;
         if (end > len) end = len;
     }
     len = end - beg;
@@ -183,9 +185,14 @@ VALUE rb_range_beg_len(VALUE range, long *begp, long *lenp, long len, int err) {
     *begp = beg;
     *lenp = len;
     return Qtrue;
-  out_of_range:
-    if (err == 1) rb_raise(rb_eRangeError, "%ld..%s%ld out of range", origbeg, excl ? "." : "", origend);
-    return Qnil;
+}
+VALUE rb_range_beg_len(VALUE range, long *begp, long *lenp, long len, int err) {
+    VALUE b, e;
+    int excl;
+    if (!rb_range_values(range, &b, &e, &excl)) return Qfalse;
+    VALUE res = range_component_beg_len(b, e, excl, begp, lenp, len, err);
+    if (NIL_P(res) && err) rb_raise(rb_eRangeError, "%+" PRIsVALUE " out of range", range);
+    return res;
 }
 
 /* ---- Struct ------------------------------------------------------------------- */
@@ -307,11 +314,16 @@ VALUE rb_arithmetic_sequence_beg_len_step(VALUE obj, long *begp, long *lenp, lon
         aseq.end = tmp;
     }
     if (err == 0 && (step < -1 || step > 1)) {
-        /* rb_range_component_beg_len with err = 0 for a stepped sequence */
-        long beg = NIL_P(aseq.begin) ? 0 : NUM2LONG(aseq.begin);
-        if (beg < 0) beg += len;
-        if (beg < 0 || beg > len) return Qnil;
+        if (range_component_beg_len(aseq.begin, aseq.end, aseq.exclude_end, begp, lenp, len, 1) == Qtrue) {
+            if (*begp > len) goto out_of_range;
+            if (*lenp > len) goto out_of_range;
+            return Qtrue;
+        }
     }
-    VALUE range = rb_range_new(aseq.begin, aseq.end, aseq.exclude_end);
-    return rb_range_beg_len(range, begp, lenp, len, err);
+    else {
+        return range_component_beg_len(aseq.begin, aseq.end, aseq.exclude_end, begp, lenp, len, err);
+    }
+  out_of_range:
+    rb_raise(rb_eRangeError, "%+" PRIsVALUE " out of range", obj);
+    return Qnil;
 }
