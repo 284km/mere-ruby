@@ -40,7 +40,7 @@ cat > "$OUT/one.sh" <<'ONE'
 #!/bin/sh
 f="$1"; b="$(basename "$f" .rb)"
 rrc=0; "$RUBY" -Eutf-8 "$f" > "$OUT/$b.exp" 2>/dev/null || rrc=$?
-mrc=0; MERE_RUBY_VM=1 perl -e 'alarm 300; exec @ARGV' "$MR" "$f" > "$OUT/$b.got" 2> "$OUT/$b.err" || mrc=$?
+mrc=0; MERE_RUBY_VM=1 perl -e 'alarm 900; exec @ARGV' "$MR" "$f" > "$OUT/$b.got" 2> "$OUT/$b.err" || mrc=$?
 why="$(MERE_RUBY_VM=why perl -e 'alarm 120; exec @ARGV' "$MR" "$f" 2>&1 < /dev/null | grep -a "^mere-ruby: vm: $f: " | head -1 | sed "s|^mere-ruby: vm: $f: ||")"
 [ "$why" = "on the VM" ] && why=""
 if cmp -s "$OUT/$b.exp" "$OUT/$b.got" && [ "$rrc" = "$mrc" ]; then

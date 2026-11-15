@@ -32857,8 +32857,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
             && (match recv with VClass _ -> false | _ -> true) then
       (let (h3, ps3, bb3, e3) = newblk in
        // defining on an immediate's (absent) singleton class is a TypeError.
-       if imm_no_singleton recv && body_defines bb3 then raise_exc world "TypeError" "can't define singleton"
-       else
+       // (a def, an undef or an alias in the block is refused when it RUNS,
+       //  on a value that has no singleton class: see the SDef arm)
        // rebind self in a COPY of the block's captured env, not the shared
        // env itself: a nested call of the same proc (`pr.call` inside the
        // instance_eval'd pr) must still see the proc's own lexical self.
@@ -34976,8 +34976,6 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
        // pfile is a PARSE-time slot (see parse_time_file), so it comes back
        // down as soon as the parse is over -- the body runs without it.
        let _ = eval_pfile_pop savedpf in
-       if imm_no_singleton recv && body_defines p2 then raise_exc world "TypeError" "can't define singleton"
-       else
        // ⚠ the string runs in a child of the CALLER's scope, as ruby's does:
        //   the caller's locals are visible, its cref is the lexical scope
        //   (so a class variable is the caller's), and the receiver's
@@ -60196,6 +60194,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           // (true and false: their singleton class IS TrueClass / FalseClass)
           | VBool true -> "TrueClass#" ++ name
           | VBool false -> "FalseClass#" ++ name
+          // (a value with no singleton class to hold the method: ruby's
+          //  TypeError, raised when the def runs and not for a def the block
+          //  only contains)
+          | v9 when imm_no_singleton v9 -> (let _ = raise_exc world "TypeError" "can't define singleton" in name)
           | _ -> name)
        // ...and in a body define_method made of a block or a proc, a `def`
        // goes where it would where the block was WRITTEN (its default
@@ -60738,6 +60740,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      | _ -> FNext VNil)
   | SUndef names ->
     let (meths, sup, ocls, ivars) = world in
+    if lv_has env "__definee_recv" && imm_no_singleton (lv_get env "__definee_recv") then
+      (let _ = raise_exc world "TypeError" "can't define singleton" in FNext VNil)
+    else
     // when self is a class (class_eval / a block run as a class body), undef
     // targets that class and raises NameError for a missing name.
     let dcls = definee_cls_of env world in
@@ -61538,6 +61543,7 @@ and ub_stmt = fn (s: Stmt) ->
   | SWhile (c, b) -> ub_expr c || ub_stmts b
   | SIf (cl, els) -> ub_clauses cl || ub_stmts els
   | SBegin (b, rs, el, en) -> ub_stmts b || ub_rescues rs || ub_stmts el || ub_stmts en
+  | SVm (id, _) -> vm_uses_block id
   | SMultiAssign (_, es) -> ub_exprs es
   | SAndThen (a, b) -> ub_stmt a || ub_stmt b
   | SOrElse (a, b) -> ub_stmt a || ub_stmt b
@@ -62935,7 +62941,8 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
               go t line 0 (if o == 27 then 27 + 100 * x else o)
                  (vm_bor (vm_bor yld cy)
                     // (a yield, or `defined?(yield)`, asks for the method's block)
-                    ((if o == 55 || (o == 65 && x == 8) then 1 else 0)
+                    // (...and so does a `super`, which passes it on)
+                    ((if o == 55 || (o == 65 && x == 8) || o == 62 || o == 73 then 1 else 0)
                      // (binding, eval and local_variables read the frame's
                      //  locals as the source declares them: flag 2)
                      + (if o == 29 && vm_bit x 4 && (str_eq n "binding" || str_eq n "eval" || str_eq n "local_variables") then 2 else 0)))
@@ -63029,7 +63036,11 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
      | Cons (VSym s9, t) -> if str_eq s9 "$!" || str_eq s9 "*" || str_eq s9 "**" || str_eq s9 "&" || str_eq s9 "..." then named t else Cons (s9, named t)
      | Cons (_, t) -> named t) in
   let decl = (if (yld / 2) % 2 == 1 then named locs else shadow locs) in
-  let _ = vec_set vm_meta id (lbl, pth, kind, gen, optn, optp optl, decl, kids, bp, bb, yld % 2 == 1, onames outs, defs, ctab) in
+  let _ = vec_set vm_meta id (lbl, pth, kind, gen, optn, optp optl, decl, kids, bp, bb,
+                              // (1: a yield, a `defined?(yield)` or a super is in it; 2: the
+                              //  method takes a block as ruby's compiler decides it -- use_block)
+                              yld % 2 + (match (match vm_nth top 11 with VHsh ph -> vm_hget (hderef ph) "use_block" | _ -> VNil) with VBool true -> 2 | _ -> 0),
+                              onames outs, defs, ctab) in
   // (a block's implicit parameters, plus 1, where a tree's top keeps its
   //  state: a block is never a top -- vm_enter writes the frame's "__ip")
   let _ = (if kind == 1 && ipn >= 0 then vec_set vm_own (3 * id + 2) (ipn + 1) else ()) in
@@ -63133,6 +63144,10 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
           (let _ = raise_exc world "NotImplementedError" ("the ISeq VM refuses " ++ path ++ ": " ++ why) in prog)
         else prog) in
      if has_pre prog then refused "a BEGIN block"
+     // (-K, -n / -p, -x, -s, -a / -l: the script is not read as written)
+     else if map_has cli_opt "enc_source" || map_has cli_opt "loop_n" || map_has cli_opt "loop_p" || map_has cli_opt "xflag"
+             || map_has cli_opt "sflag" || map_has cli_opt "flag_a" || map_has cli_opt "flag_l"
+     then refused "a command-line option that changes how the script is read"
      else
        (let _ = map_set cli_opt "vmbusy" "1" in
         let line9 = cur_line () in
@@ -63179,7 +63194,12 @@ and vm_body_pos = fn (body: Stmt list) ->
 // method's block is kept for a block that does)
 and vm_yields = fn (id: int) ->
   let (_, _, _, _, _, _, _, _, _, _, y, _, _, _) = vec_get vm_meta id in
-  y
+  y % 2 == 1
+// whether the method a program is takes a block, as ruby's compiler decides
+// it (unused_blk_warn: a block given to one that does not is warned about)
+and vm_uses_block = fn (id: int) ->
+  let (_, _, _, _, _, _, _, _, _, _, y, _, _, _) = vec_get vm_meta id in
+  y >= 2
 // the locals of sequences around it that the program, or a block in it,
 // reads or writes (ovr_stmt: what an isolated Proc must not reach, and what
 // a shareable one is given copies of)
@@ -63340,7 +63360,9 @@ and vm_argl = fn env -> fn (fl: int) -> fn (argc: int) -> fn (kws: Val list) -> 
               let lit = vm_lit v in
               let is_lit = (match lit with EVar _ -> false | _ -> true) in
               let _ = (if is_lit then () else map_set env k v) in
-              let x = (if kwsp && i == argc - 1 then EKwSplat (EVar k)
+              // (`**h` is the parser's keyword hash of one doubled splat:
+              //  that arm converts with #to_hash and refuses what has none)
+              let x = (if kwsp && i == argc - 1 then EKwHash (Cons (EKwSplat (EVar k), Cons (EKwSplat (EVar k), (Nil : Expr list))))
                        else if splat && i == argc - 1 - (if kwsp then 1 else 0) then ESplat (EVar k)
                        else if is_lit then lit
                        else EVar k) in
@@ -63376,7 +63398,13 @@ and vm_call_in = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str)
     //  one marker parameter and the expression as the body, which
     //  coerce_to_block makes the block of -- a Proc, a Symbol, nil, or
     //  whatever answers #to_proc)
-    (let (bp, bb) = (if barg then (Cons (block_pass_marker, (Nil : str list)), Cons (SExpr (EVar "__vm~b"), (Nil : Stmt list)))
+    // (...and a Symbol is the block the parser writes for `&:sym`: a lambda
+    //  that sends it to its first argument with the rest and its own block)
+    (let bsym = (if barg then (match (if map_has env "__vm~b" then map_get env "__vm~b" else VNil) with VSym y when str_len y > 0 -> y | _ -> "") else "") in
+     let (bp, bb) = (if (if str_eq bsym "" then false else true) then
+                       (Cons (lambda_blk_marker, Cons ("__bp", Cons ("*__ba", Cons ("&__bb", (Nil : str list))))),
+                        Cons (SExpr (EMethod (EVar "__bp", bsym, Cons (ESplat (EVar "__ba"), Cons (EBlockPass (EVar "__bb"), Nil)))), (Nil : Stmt list)))
+                     else if barg then (Cons (block_pass_marker, (Nil : str list)), Cons (SExpr (EVar "__vm~b"), (Nil : Stmt list)))
                      else (let (_, _, _, _, _, _, _, _, bp9, bb9, _, _, _, _) = vec_get vm_meta bid in (bp9, bb9))) in
      // (`define_method(:m) { }` as a class body's statement is the class
      //  body's walker's to read -- the refinements in use where it is
@@ -63541,6 +63569,12 @@ and vm_define = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: s
                       let s9 = (match recv with
                                 | VNil -> SSingletonE (EVar "__vm~r", Cons (SDef (n, bp, defs, bb), (Nil : Stmt list)))
                                 | VBool _ -> SSingletonE (EVar "__vm~r", Cons (SDef (n, bp, defs, bb), (Nil : Stmt list)))
+                                // (...and on a value that has no singleton
+                                //  class, where that form refuses: TypeError)
+                                | VInt _ -> SSingletonE (EVar "__vm~r", Cons (SDef (n, bp, defs, bb), (Nil : Stmt list)))
+                                | VFlt _ -> SSingletonE (EVar "__vm~r", Cons (SDef (n, bp, defs, bb), (Nil : Stmt list)))
+                                | VBig _ -> SSingletonE (EVar "__vm~r", Cons (SDef (n, bp, defs, bb), (Nil : Stmt list)))
+                                | VSym _ -> SSingletonE (EVar "__vm~r", Cons (SDef (n, bp, defs, bb), (Nil : Stmt list)))
                                 | _ -> SDef ("__vm~r#" ++ n, bp, defs, bb)) in
                       match exec_stmt ce world blk s9 with FNext v -> v | _ -> VNil)) in ()))
   else
@@ -63555,7 +63589,10 @@ and vm_define = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: s
                     | VClass c -> (if str_eq c "Object" then "::" ++ n else c ++ "::" ++ n)
                     | _ -> (let _ = raise_exc world "TypeError" (inspect_w env world cbase ++ " is not a class/module") in n))
                  else n) in
-     if ty == 1 then
+     // (`class << self`: the parser's own form of it, by name)
+     if ty == 1 && rb_identical cbase (if lv_has env "self" then lv_get env "self" else VMain) then
+       vm_push st (run (SClass ("<<singleton", "self", bb)))
+     else if ty == 1 then
        vm_push st (vm_scoped env (fn ce ->
                      (let _ = map_set ce "__vm~0" cbase in
                       match exec_stmt ce world blk (SSingletonE (EVar "__vm~0", bb)) with FNext v -> v | _ -> VNil)))
@@ -63823,7 +63860,11 @@ and vm_var_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: s
   else
     (let k = vm_pop st in
      let v = vm_pop st in
-     let _ = vm_eval env world blk (Cons (k, Cons (v, Nil))) (fn (es: Expr list) -> EScopedAssign (vm_nth_e es 0, n, vm_nth_e es 1)) in ())
+     // (`::X = v`, and `Object::X = v`: the top level's own name for it,
+     //  where a second assignment finds the first to warn about)
+     match k with
+     | VClass "Object" -> (let _ = const_store world n v in name_anon n v)
+     | _ -> (let _ = vm_eval env world blk (Cons (k, Cons (v, Nil))) (fn (es: Expr list) -> EScopedAssign (vm_nth_e es 0, n, vm_nth_e es 1)) in ()))
 and vm_value_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: str) -> fn (a: int) -> fn (b: int) -> fn (v: Val) ->
   // splatkw: the `**` operand under a block argument made a Hash (#to_hash;
   // nil and a Hash as they are)
