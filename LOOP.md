@@ -5137,3 +5137,11 @@ No collector body, m_state, VM, AST, C API or gemtest change is introduced.
 The pre-publication origin check found witness 675 newly used by the VM
 branch. This branch's Proc/Binding witness moved to the first free number,
 680, leaving the concurrent branch unchanged.
+
+Final ObjectSpace remeasurement: 46 tests, MATCH 37, RED 9, with 16 audited
+exclusions. The ractor dump passes again; the remaining raw loss from #91 is
+the unaccepted memsize_of_all estimate described above. Combining that final
+file with the unchanged six-file measurement gives 207 tests: MATCH 109,
+RED 88, BOTH 5, EXTRA 5, plus 57 separately reported exclusions. Against the
+latest main the target raw gain is now 12, all accepted implementation
+matches. Both final store witnesses and the extended dump witness pass.
