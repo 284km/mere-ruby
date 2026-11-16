@@ -5073,9 +5073,9 @@ as ruby's does and the VM runs the result.
   space, with the slots a single pattern keeps for its error (the string,
   whether it is a key error, that error's matchee and key); the error
   handler that raises NoMatchingPatternError / NoMatchingPatternKeyError.
-  Against ruby: 444 / 444 snippets, 22 / 22 under branch coverage (`in`
+  Against ruby: 447 / 447 snippets, 22 / 22 under branch coverage (`in`
   clauses are branches), and every corpus file that has a pattern.
-- **Whole files, again** (compare_files: 693 files, 683 the same, 10
+- **Whole files, again** (compare_files: 694 files, 687 the same, 7
   refused, 0 different -- it was 672 / 21): a Range nobody reads is what
   its bounds do, with no newrange; `nil&.m(args)` is the receiver's nil and
   none of the rest; #to_a says an instruction's events once an
@@ -5095,10 +5095,14 @@ as ruby's does and the VM runs the result.
     running (vm_cur).
   - `defined?(name)` of a private method a refinement in use gives, in an
     instance_eval'd block: asked as the bare name the parser reads it as.
-- **Still refused by the compiler**, of the corpus: flip-flops 3, a `for`
-  over a target that is not a local 3, `/o` 2, END 1, a
-  shareable_constant_value write 1.
+- **Flip-flops** too (pm_compile_flip_flop): `a..b` as a condition and as
+  a value, an Integer bound as `$. ==` it. The state is a special variable
+  of the method's frame in ruby (getspecial / setspecial of a number from
+  2); the VM keeps it as the evaluator keeps one, a thread's, under the
+  program and that number.
+- **Still refused by the compiler**, of the corpus: a `for` over a target
+  that is not a local 3, `/o` 2, END 1, a shareable_constant_value write 1.
 - **Checked** (local, the commit before this note): vm_check 243 / 243,
-  the compiler 444 / 444 snippets, 683 / 683 compiled files, 22 / 22 under
+  the compiler 447 / 447 snippets, 687 / 687 compiled files, 22 / 22 under
   branch coverage, corpus RESULT_EV on the evaluator and RESULT_VM on the
   VM, the gates. Witness 666.
