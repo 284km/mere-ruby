@@ -5067,14 +5067,14 @@ rack-test 7 / 1, public_suffix 7 / 0 and base64 1 / 0.
   dispatch, so a stub worked without a block but opened a real path with
   one. Ruby overrides now receive the block. A restored prelude IO alias
   still uses File's native path handling; the method's native flag and
-  actual prelude source metadata identify that case. Witness 673 covers
+  actual prelude source metadata identify that case. Witness 676 covers
   keyword/block forwarding and restoring the original alias. The original
   mock file improves from 2 failures / 13 errors to 1 / 8 across 94 tests,
   while remaining RED.
 - `core_prelude_b` attaches the existing Enumerable implementation to
   Chain, whose advertised ancestry alone did not provide its private
   helpers. `chunk_while` and `slice_when` construct deferred enumerators
-  over the source rather than eagerly gathering it. Witness 674 covers
+  over the source rather than eagerly gathering it. Witness 677 covers
   deferred predicates, infinite inputs stopped by take, multiple yielded
   values, empty inputs, argument errors and reflected owner/ancestors.
   Minitest's original reporter file becomes MATCH (22 tests / 52 assertions).

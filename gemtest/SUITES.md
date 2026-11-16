@@ -90,6 +90,6 @@ and StringIO tests report 96/96 and 103/103 MATCH respectively.
 Rounds 6-7 respect block-bearing File overrides and defer Chain grouping
 until iteration. The same inventory now gives 51 MATCH / 10 RED / 1 MEMORY;
 minitest's original reporter becomes MATCH (22 tests / 52 assertions).
-Witnesses 673 and 674 cover restoring native File aliases, keyword/block
+Witnesses 676 and 677 cover restoring native File aliases, keyword/block
 forwarding, deferred predicates and early termination of infinite inputs.
 Only `invoke_with_block0` and `core_prelude_b` change in these rounds.

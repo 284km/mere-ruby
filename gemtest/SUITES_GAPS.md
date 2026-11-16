@@ -57,11 +57,11 @@ Resolved in follow-up rounds 6-7:
 - Block calls to File.open/new now respect Ruby overrides. The native File
   path remains available when a saved prelude IO alias is restored; its
   actual source metadata distinguishes that alias from a Ruby replacement.
-  Only the File condition in `invoke_with_block0` changes. Witness 673.
+  Only the File condition in `invoke_with_block0` changes. Witness 676.
 - Chain receives Enumerable's existing implementation module, and
   `chunk_while` / `slice_when` defer the source and predicate until iteration.
   Early `take` stops infinite inputs, multiple yields retain their values,
   and reflected owner/ancestry remain consistent with the reference.
-  Only `core_prelude_b` changes. Witness 674. The original minitest reporter
+  Only `core_prelude_b` changes. Witness 677. The original minitest reporter
   now passes all 22 tests / 52 assertions and becomes MATCH. Enum and
   Enumerator report 159 MATCH / 0 RED / 1 BOTH; corpus reports 697/697.
