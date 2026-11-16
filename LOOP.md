@@ -5374,5 +5374,61 @@ last item.
   attribute method; tools/ast_dump lost its development stubs. Kernel#pp of
   a Node before pp.rb is loaded still prints `#inspect` (ruby loads pp.rb on
   the first `pp`).
-- Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 926 of 1024 (was
-  895 on main: the translation and the caches keep top-level tables).
+- Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 923 of 1024 (was
+  892 on main: the translation and the caches keep top-level tables).
+
+## 2026-11-17 (73): test_ast's margin -- what every assertion runs, and a block's number
+
+test_ast fits CI's 600 s since LOOP (57), with 47 s to spare on the slower of
+two runners (553.4 s in run 43793344878). This round takes what every
+assertion and every Proc pays. corpus 680.
+
+- **A store-only method and a memo reader run with no frame where
+  test/unit has them.** Every assertion calls `self._assertions += 1`, and
+  both halves went the whole way of a method call. `_assertions=` is the
+  store-only shape LOOP (57) gives no frame, but core_assertions.rb says
+  `binding` (in a method no test calls), and in a file that does the parser
+  puts a mark in front of every body naming the locals it assigns (lvd_head)
+  -- a statement the store-only check did not know, so the setter was off
+  the short way under test/unit and on it everywhere else. The mark is read
+  past now. `_assertions` is `@_assertions ||= 0`: a reader whose body is
+  `@x ||= <literal>` is answered with no frame. An `assert_equal(1, 1)`
+  524,500 -> 483,300 instructions.
+- **`@x ||= v` / `@x &&= v` used as a value no longer writes back what the
+  short circuit decided.** The statement form (SIVarAssign) never wrote; the
+  expression form -- `def n = @n ||= 0`, `(@n ||= 0)` -- did, and a frozen
+  object raised FrozenError for a memo it already had. Found by the
+  witness of the memo reader.
+- **A block made into a Proc again is found by its number** (blk_intern).
+  Interning a body compared it with the bodies already kept under its key,
+  and comparing two trees that ARE the same goes to the end of both: 6% of
+  test_ast's token test, assert_equal's thirty-line message block each
+  time. The parser now numbers each block it reads and puts the number in
+  the mark that already carries the line of its `{` or `do`:
+  `SLine -(line + number * 2^24)`, read with blk_line_of / blk_id_of (five
+  readers took the line as `0 - n`; the VM's vm_body_pos is one of them).
+  A body seen under its number and key is the one interned the first time.
+  The key stays beside the number because the interpreter rewrites block
+  bodies at run time keeping the mark in front.
+  `MERE_RUBY_BLK_ID_CHECK=1` compares anyway; it found that a body with a
+  Float literal is never equal to itself here -- Mere's generated eq_float
+  answers 0 -- so before the numbers every Proc of such a block added its
+  body again and compared against every copy kept: 8,000 Procs of one block
+  35.6e9 instructions, 1.1e9 now.
+- **The attribute reader cache asks about the class only before an entry
+  is made.** What it asks -- a singleton, a superclass other than Object, a
+  builtin name -- is fixed when the class is made, or changes through
+  set_sup / set_meth, which move the token an entry is kept under. Asking
+  it at every hit was 6% of the walks.
+- **Measured** (instructions, under test/unit, this machine): the token
+  test over 150 files 158.9e9 -> 141.8e9 (-11%); the walks over 200 files
+  100.5e9 -> 97.6e9 (-3%).
+- **Why it is in #86.** On CI run 43873004686 (the translation, the fast
+  paths and the collector's floor, on main with the VM's round 38) test_ast
+  ran 625.6 s and was stopped at the wall: the shard's runner ran the other
+  files at 1.15 times the baseline's time, and 625.6 / 1.15 is 546 s -- the
+  same file as before, with too little room for a slow runner. With this
+  round the same file is about 7% less work.
+- Checked: corpus 694 of 694, and with MERE_RUBY_BLK_ID_CHECK,
+  MERE_RUBY_ATTR_IC_CHECK and MERE_RUBY_IVAR_INDEX_CHECK on; test_ast's
+  individual tests 114 as the reference; the gates.

@@ -157,3 +157,32 @@ class Bang86b
 end
 o2 = Bang86b.new
 p o2.x!, o2.read, o2.x!, o2.read
+
+# a reader that fills its variable the first time (`@n ||= 0`, as
+# test/unit's _assertions), and the same two kinds of method in a file that
+# says `binding` -- this one -- where the parser puts a mark in front of
+# every body
+class Count
+  def n = @n ||= 0
+  def n=(v)
+    @n = v
+  end
+  def flag = @flag ||= :set
+  def none = @none ||= nil
+  def off = @off ||= false
+  def name = @name ||= "s"
+end
+c = Count.new
+p c.n, (c.n += 1), (c.n += 1), c.n, c.instance_variables
+c.n = nil
+p c.n, c.n.class
+c.n = false
+p c.n
+p c.flag, c.none, c.none, c.off, c.instance_variables, c.name, c.name.frozen?, c.name.equal?(c.name)
+fc = Count.new
+p((fc.freeze.n rescue $!.class))
+fc2 = Count.new
+fc2.n = 5
+fc2.freeze
+p fc2.n, begin; fc2.n = 6; rescue => e; e.class; end
+p binding.local_variable_defined?(:c), Count.instance_method(:n).arity
