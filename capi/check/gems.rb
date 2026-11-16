@@ -35,6 +35,44 @@ end
 require 'racc/parser'
 p Racc::Parser::Racc_Runtime_Core_Version_C == Racc::Parser::Racc_Runtime_Core_Version, Racc::Parser::Racc_Runtime_Type
 
+# bcrypt: the hash of a fixed salt, and a password checked against its own hash
+require 'bcrypt'
+hashed = BCrypt::Password.create('secret', cost: 4)
+p hashed.class, hashed.cost, BCrypt::Password.new(hashed.to_s) == 'secret', BCrypt::Password.new(hashed.to_s) == 'wrong'
+p BCrypt::Engine.hash_secret('secret', '$2a$04$abcdefghijklmnopqrstuu')
+
+# nio4r: a selector over real descriptors (libev, through RFILE's struct)
+require 'nio'
+p NIO::ENGINE
+selector = NIO::Selector.new
+reader, writer = IO.pipe
+monitor = selector.register(reader, :r)
+p monitor.interests, monitor.io.equal?(reader), selector.registered?(reader), selector.empty?
+p selector.select(0.01)
+writer.write('ping')
+ready = selector.select(1)
+p ready.size, ready.first.readable?, ready.first.io.read_nonblock(4)
+monitor.value = :payload
+p monitor.value
+selector.deregister(reader)
+p selector.registered?(reader), monitor.closed?
+selector.register(writer, :w)
+seen = []
+selector.select(1) { |m| seen << [m.writable?, m.io.equal?(writer)] }
+p seen
+reader.close
+begin
+  selector.register(reader, :r)
+rescue => e
+  p e.class
+end
+selector.close
+p selector.closed?
+buffer = NIO::ByteBuffer.new(16)
+buffer << 'hello'
+buffer.flip
+p buffer.get, buffer.position, buffer.limit, buffer.capacity
+
 # nokogiri, on the system's libxml2
 require 'nokogiri'
 html = Nokogiri::HTML('<html><body><div id="a" class="x y"><p>Hello <b>world</b></p><a href="/one">1</a><a href="/two">2</a></div></body></html>')

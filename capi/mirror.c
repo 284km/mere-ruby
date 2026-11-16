@@ -18,6 +18,8 @@
  *     gone (mr_capi_release), and its dfree runs then.
  */
 #include "mr_capi.h"
+#include "ruby/io.h"
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,8 +35,10 @@ struct mr_mirror {
     int data;                   /* 0, 1 RData, 2 RTypedData */
     int listed;                 /* in the list of structs C may have written */
     size_t embedded;            /* a typed struct's own bytes, after it */
+    struct rb_io *io;           /* an IO's, made when RFILE first asks for it */
     union {
         struct RBasic basic;
+        struct RFile file;
         struct RString string;
         struct RArray array;
         struct RData data;
@@ -265,7 +269,46 @@ void *rb_mere_array(VALUE obj) {
     return &m->as.array;
 }
 
-void *rb_mere_file(VALUE obj) { (void)obj; mr_unsupported("RFILE (the struct behind an IO)"); }
+/* RFILE(io)->fptr: what an IO is to C. The struct is filled from the IO each
+ * time it is asked for -- the descriptor (-1 when closed), how it was opened
+ * (the descriptor's own access mode, sync, binmode, tty), the path -- and
+ * nothing C writes into it goes back: the functions that take the pointer
+ * (rb_io_check_closed, rb_io_set_nonblock, ...) act on the IO it names. Its
+ * buffers and converters are CRuby's own and stay empty. */
+void *rb_mere_file(VALUE obj) {
+    struct mr_mirror *m = mr_mirror_of(obj);
+    if (!m->io) {
+        m->io = calloc(1, sizeof(struct rb_io));
+        if (!m->io) rb_memerror();
+    }
+    struct rb_io *f = m->io;
+    f->self = obj;
+    f->pathv = rb_respond_to(obj, rb_intern("path")) ? mr_call(mr_ruby("->(io) { io.path rescue nil }"), "call", 1, obj) : Qnil;
+    f->tied_io_for_writing = 0;
+    f->timeout = Qnil;
+    f->write_lock = Qnil;
+    f->writeconv_asciicompat = Qnil;
+    f->writeconv_pre_ecopts = Qnil;
+    f->encs.ecopts = Qnil;
+    int mode = 0;
+    if (RTEST(mr_call(obj, "closed?", 0))) f->fd = -1;
+    else {
+        f->fd = NUM2INT(mr_call(obj, "fileno", 0));
+        int flags = fcntl(f->fd, F_GETFL);
+        if (flags != -1) {
+            int access = flags & O_ACCMODE;
+            if (access == O_RDONLY || access == O_RDWR) mode |= FMODE_READABLE;
+            if (access == O_WRONLY || access == O_RDWR) mode |= FMODE_WRITABLE;
+            if (flags & O_APPEND) mode |= FMODE_APPEND;
+        }
+        if (RTEST(mr_call(obj, "sync", 0))) mode |= FMODE_SYNC;
+        if (RTEST(mr_call(obj, "binmode?", 0))) mode |= FMODE_BINMODE;
+        if (isatty(f->fd)) mode |= FMODE_TTY;
+    }
+    f->mode = mode;
+    m->as.file.fptr = f;
+    return &m->as.file;
+}
 void *rb_mere_match(VALUE obj) { (void)obj; mr_unsupported("RMATCH (the struct behind a MatchData)"); }
 void *rb_mere_regexp(VALUE obj) { (void)obj; mr_unsupported("RREGEXP (the struct behind a Regexp)"); }
 
@@ -357,6 +400,7 @@ int mr_capi_release(int number) {
                 i--;
             }
     }
+    free(m->io);
     if (m->body == T_STRING) free(m->as.string.as.heap.ptr);
     if (m->body == T_ARRAY) free((void *)m->as.array.as.heap.ptr);
     int ran = 0;

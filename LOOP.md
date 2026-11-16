@@ -5020,7 +5020,7 @@ Stage 7′ / 8, third unit (note 553), on the C API of (58). Until now
 `require "mkmf"` stopped at a nil RbConfig key, so nothing that builds an
 extension the way a gem does could start. Now `mere-ruby extconf.rb && make
 && make install` works with ruby's unchanged mkmf.rb, RubyGems' `gem
-install` builds a gem's C extension, and five published gems -- nokogiri
+install` builds a gem's C extension, and seven published gems -- nokogiri
 built from source against the system's libxml2 among them -- behave as on
 the reference.
 
@@ -5086,12 +5086,14 @@ the reference.
   fails at `make` on both; mere-ruby given the libraries the reference's
   mkmf built fails.
 - `tools/capi_gem_check.py` (CI, macOS and Linux): fast_blank 1.0.1,
-  redcarpet 3.6.1, msgpack 1.8.7, racc 1.8.1 and nokogiri 1.19.7 (from
-  source, `--use-system-libraries`) are installed by each ruby with `gem
-  install` from the same .gem files; `capi/check/gems.rb` uses them (60
-  lines of output: blank tests; HTML and a Ruby-defined renderer called back
-  from C; packing and unpacking Integers, Floats, binary and UTF-8 Strings,
-  a streaming unpacker, a malformed input's exception; racc's C runtime;
+  redcarpet 3.6.1, msgpack 1.8.7, racc 1.8.1, bcrypt 3.1.22, nio4r 2.7.5
+  and nokogiri 1.19.7 (from source, `--use-system-libraries`) are installed
+  by each ruby with `gem install` from the same .gem files;
+  `capi/check/gems.rb` uses them (84 lines of output: blank tests; HTML and
+  a Ruby-defined renderer called back from C; packing and unpacking
+  Integers, Floats, binary and UTF-8 Strings, a streaming unpacker, a
+  malformed input's exception; racc's C runtime; a bcrypt hash of a fixed
+  salt; nio4r's selector over a pipe's two ends and its byte buffer;
   nokogiri's CSS and XPath queries, namespaces, node edits and
   serialization, the Builder, syntax errors as objects and as a raised
   exception, a fragment, a SAX handler called back from libxml2) and prints
@@ -5145,6 +5147,27 @@ nokogiri needed two things beyond what the smaller gems did: RbConfig's
 library the interpreter was compiled against -- and an empty `host_alias`),
 and `rb_undef_method` being C's, which says nothing when it undefines
 `initialize` and does not mind a name nothing defines.
+
+**What more gems asked for.** Eleven more source gems were built with `gem
+install` here -- bcrypt, oj, nio4r, websocket-driver, json, date, stringio,
+bigdecimal, puma, unf_ext (C++), strscan -- and for each built library the
+C API symbols it asks for and the executable does not export were listed
+(`nm -u` against `nm -gU`). Ten of sixteen libraries missed nothing. What
+the others missed and is written now (capi/needed.c, capi/mirror.c):
+`rb_convert_type` / `rb_check_convert_type`, `rb_memhash`,
+`rb_must_asciicompat`, `rb_ivar_foreach`, `rb_copy_generic_ivar`,
+`rb_backref_get` / `set`, `rb_reg_new`, `rb_reg_nth_match`,
+`rb_marshal_load`, `ruby_scan_digits`, `ruby_strtoul`, and the IO struct:
+`RFILE(io)->fptr` is filled from the IO each time it is asked for (the
+descriptor, how it was opened, the path), and `rb_io_check_closed`,
+`rb_io_check_readable` / `writable`, `rb_io_set_nonblock`,
+`rb_io_taint_check` take it. With those, oj, date's and json's extensions
+load and answer, and nio4r's selector (libev) behaves as on the reference;
+bcrypt and nio4r joined capi_gem_check.py (seven gems, 84 lines). Still
+out: strscan (written against Onigmo's own structs: its substitute for
+`rb_reg_onig_match` collides with the header's declaration) and stringio
+(`rb_io_extract_modeenc`, Onigmo's `onigenc_get_right_adjust_char_head`);
+this interpreter has its own StringScanner and StringIO.
 
 **Next**: the larger groups of the C API not written yet (capi/README.md,
 "What is missing"), by what the next gems need.

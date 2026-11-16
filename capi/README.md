@@ -168,8 +168,9 @@ written for ruby's own build tree: they reach into its internal headers).
   ledger is an undefined symbol: `require` of a library that uses one raises
   LoadError with the loader's message, which names it. Of the roughly 1,300
   functions the headers declare, about 800 are written; the larger groups
-  not yet written are Onigmo's own API, `rb_io_*` on `rb_io_t`, the fiber
-  scheduler hooks, `rb_econv_*`, `rb_reg_*` and Ractor.
+  not yet written are Onigmo's own API, most of `rb_io_*` (the struct
+  behind `RFILE` is there, filled from the IO; its buffers are not), the
+  fiber scheduler hooks, `rb_econv_*`, `rb_reg_*` and Ractor.
 - Internals a test may read and this has no equivalent of: a String's
   embedded / shared state and capacity classes, coderange caching, a Hash's
   `st_table` (`rb_hash_tbl`), a Rational that is not in lowest terms.
@@ -195,7 +196,8 @@ written for ruby's own build tree: they reach into its internal headers).
   compile must fail at `make` on both, and mere-ruby given the libraries the
   reference's mkmf built must fail.
 - `tools/capi_gem_check.py` (CI, macOS and Linux): fast_blank, redcarpet,
-  msgpack, racc and nokogiri (from source, on the system's libxml2), at
+  msgpack, racc, bcrypt, nio4r and nokogiri (from source, on the system's
+  libxml2), at
   fixed versions, are installed by each ruby with RubyGems' `gem install`
   from the same .gem files, and `capi/check/gems.rb` uses them on both
   sides and must print the same. mere-ruby pointed at the gems the
@@ -218,6 +220,7 @@ written for ruby's own build tree: they reach into its internal headers).
 | `array.c` | Array, Hash, Range, Struct, Enumerator |
 | `proc.c` | blocks, Procs, `rb_block_call`, `rb_funcall_with_block` |
 | `system.c` | threads, time, IO, utilities |
+| `needed.c` | what real gems asked for and nothing else had: conversions by method name, `rb_memhash`, `rb_ivar_foreach`, the calling frame's last match |
 | `st.c`, `memory_view.c`, `vendor/`, `standin/` | CRuby's `st.c` and `memory_view.c`, compiled unchanged |
 | `unsupported.c` | the ledger |
 | `mr_capi.h` | what the files above share; not for extensions |

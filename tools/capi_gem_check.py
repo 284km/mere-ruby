@@ -7,7 +7,9 @@ Published gems with C extensions, at fixed versions: fast_blank (one
 function over a String's bytes), redcarpet (a Markdown renderer whose C calls
 back into Ruby renderers), msgpack (a serializer: buffers, Integers of every
 size, Floats, encodings, its own exception classes), racc (the parser
-runtime's C core), and nokogiri, built from source against the system's
+runtime's C core), bcrypt (a C library wrapped in two functions), nio4r (a
+selector on libev, which the gem brings: the IO struct behind RFILE, and
+readiness of real descriptors), and nokogiri, built from source against the system's
 libxml2 and libxslt (`--use-system-libraries`; mini_portile2, which its
 extconf.rb requires, is installed with it): typed data wrapping the
 library's structs, callbacks from the library into Ruby (SAX), error
@@ -35,7 +37,8 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 # (name, version, what `gem fetch` is given, what `gem install` is given)
 GEMS = [('fast_blank', '1.0.1', [], []), ('redcarpet', '3.6.1', [], []), ('msgpack', '1.8.7', [], []),
-        ('racc', '1.8.1', [], []), ('mini_portile2', '2.8.9', [], []),
+        ('racc', '1.8.1', [], []), ('bcrypt', '3.1.22', [], []), ('nio4r', '2.7.5', [], []),
+        ('mini_portile2', '2.8.9', [], []),
         ('nokogiri', '1.19.7', ['--platform', 'ruby'], ['--', '--use-system-libraries'])]
 parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 parser.add_argument('--reference', type=Path, required=True)
@@ -119,4 +122,4 @@ if not refused:
     problems.append('mere-ruby used the gems the reference built')
 if problems:
     sys.exit('capi_gem_check: ' + '; '.join(problems))
-print('capi_gem_check: five gems with C extensions install with `gem install` and behave the same on both sides')
+print('capi_gem_check: seven gems with C extensions install with `gem install` and behave the same on both sides')
