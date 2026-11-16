@@ -8,7 +8,8 @@
 # class, the frame's line under a rescue clause, a break in a Thread's body,
 # the unused-block and reassigned-constant warnings, a TracePoint's binding
 # of a frame, an interpolated pattern's pieces, a shareable Proc's outer
-# locals, a builtin operator's own frame.
+# locals, a builtin operator's own frame, literals made without the
+# program's Regexp.new and frozen.
 require "rbconfig"
 require "tmpdir"
 
@@ -101,6 +102,12 @@ MAIN = <<~'RUBY'
 
   # a builtin operator is a frame of what it refuses
   t("operator frame") { begin; 1 + nil; rescue TypeError => e; e.backtrace_locations.map(&:label); end }
+  # a literal is the source's own: no Regexp.new or Range.new of the
+  # program's is called for one (the file is compiled when it is required,
+  # after these two are defined), and a Regexp literal is frozen
+  def Regexp.new(*) = :intercepted
+  def Range.new(*) = :intercepted
+  require_relative "lits663"
   t("side file") { [Side663.where, Side663.new.each_pair.to_a, File.basename(__dir__) == File.basename(File.dirname(__FILE__))] }
 RUBY
 
@@ -128,9 +135,15 @@ SIDE = <<~'RUBY'
   end
 RUBY
 
+LITS = <<~'RUBY'
+  t("literals") { [/abc/.class, /a#{1}c/.class, (1..2).class, (nil..nil).class, /x/n.encoding, /abc/.frozen?, (1..).frozen?] }
+  t("a frozen literal") { r = /abc/; r.instance_variable_set(:@changed, true) }
+RUBY
+
 Dir.mktmpdir do |d|
   File.write(File.join(d, "main663.rb"), MAIN)
   File.write(File.join(d, "side663.rb"), SIDE)
+  File.write(File.join(d, "lits663.rb"), LITS)
   runs = [{}, { "MERE_RUBY_VM" => "strict" }].map do |env|
     IO.popen([env, RbConfig.ruby, File.join(d, "main663.rb"), err: [:child, :out]], &:read).gsub(d, "DIR")
   end

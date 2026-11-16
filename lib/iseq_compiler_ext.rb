@@ -669,7 +669,7 @@ class RubyVM::InstructionSequence
       when Prism::SymbolNode then symbol_value(n)
       when Prism::HashNode then n.elements.to_h { |e| [static_value(e.key), static_value(e.value)] }.freeze
       when Prism::RangeNode
-        Range.new(n.left && static_value(n.left), n.right && static_value(n.right), n.exclude_end?).freeze
+        range_literal(n.left && static_value(n.left), n.right && static_value(n.right), n.exclude_end?)
       when Prism::RegularExpressionNode then regexp_literal(n.unescaped, n)
       # (pm_static_literal_value: __LINE__ is its line -- an element of a
       #  literal Array or Hash, a `when`'s value)
@@ -1749,7 +1749,7 @@ class RubyVM::InstructionSequence
       lit = ->(e) { e.nil? || e.is_a?(Prism::IntegerNode) || e.is_a?(Prism::NilNode) }
       val = ->(e) { e.is_a?(Prism::IntegerNode) ? e.value : nil }
       if lit.(lo) && lit.(hi)
-        u.insn(:putobject, Range.new(val.(lo), val.(hi), excl)) unless popped
+        u.insn(:putobject, range_literal(val.(lo), val.(hi), excl)) unless popped
       else
         # (an absent bound's nil is the range node's own instruction)
         if lo then node(u, lo, false) else here(u, n); u.insn(:putnil) end
@@ -2501,16 +2501,41 @@ class RubyVM::InstructionSequence
     # its n / u / e / s names (parse_regexp_encoding)
     def regexp_literal(src, n)
       o = n.options & 7
-      if n.ascii_8bit? then Regexp.new(src.b, o | Regexp::NOENCODING)
-      elsif n.utf_8? then Regexp.new(src.dup.force_encoding(Encoding::UTF_8), o | Regexp::FIXEDENCODING)
-      elsif n.euc_jp? then Regexp.new(src.dup.force_encoding(Encoding::EUC_JP), o | Regexp::FIXEDENCODING)
-      elsif n.windows_31j? then Regexp.new(src.dup.force_encoding(Encoding::Windows_31J), o | Regexp::FIXEDENCODING)
+      if n.ascii_8bit? then literal_regexp(src.b, o, "n")
+      elsif n.utf_8? then literal_regexp(src.dup.force_encoding(Encoding::UTF_8), o, "u")
+      elsif n.euc_jp? then literal_regexp(src.dup.force_encoding(Encoding::EUC_JP), o, "e")
+      elsif n.windows_31j? then literal_regexp(src.dup.force_encoding(Encoding::Windows_31J), o, "s")
       # (...or binary, which an escape in it can force: parse_regexp_encoding
       #  reads no other forced encoding)
-      elsif n.forced_binary_encoding? then Regexp.new(src.b, o)
-      else Regexp.new(src, o)
+      elsif n.forced_binary_encoding? then literal_regexp(src.b, o, "")
+      else literal_regexp(src, o, "")
       end
     end
+
+    # A literal's value is made without calling a method the program can
+    # define: this compiler runs while the program does (a file is compiled
+    # when it is required), and `def Regexp.new` or `def Range.new` there is
+    # not what a literal means.
+    # (a Regexp: the interpreter's own maker, the native one behind
+    #  Regexp.new -- Regexp.__rx_new, which reads the source in the encoding
+    #  it is given as Regexp.new does and is no method a program defines --
+    #  and the literal frozen. Under ruby itself, where the comparison tools
+    #  run this file, there is no such maker and nothing redefined:
+    #  Regexp.new.)
+    NATIVE_REGEXP = begin
+      Regexp.__rx_new("", 0)
+      true
+    rescue NoMethodError
+      false
+    end
+
+    def literal_regexp(src, o, enc)
+      o |= (enc == "n" ? Regexp::NOENCODING : enc.empty? ? 0 : Regexp::FIXEDENCODING)
+      (NATIVE_REGEXP ? Regexp.__rx_new(src, o) : Regexp.new(src, o)).freeze
+    end
+
+    # (a Range: the literal's own syntax)
+    def range_literal(lo, hi, excl) = (excl ? (lo...hi) : (lo..hi)).freeze
 
     # pm_compile_node's PM_MATCH_WRITE_NODE: `/(?<n>..)/ =~ s` -- the match,
     # then $~'s named groups into their locals, nil each when it failed
@@ -3484,7 +3509,7 @@ class RubyVM::InstructionSequence
         ei = prev_insn(els, i)
         bi = ei && prev_insn(els, ei)
         if bi && string_push?(els[ei]) && string_push?(els[bi]) && !label_before?(els, bi) && !label_before?(els, ei)
-          range = Range.new(els[bi].ops[0], els[ei].ops[0], e.ops[0] == 1).freeze
+          range = range_literal(els[bi].ops[0], els[ei].ops[0], e.ops[0] == 1)
           els.delete_at(ei)
           els.delete_at(bi)
           i -= 2

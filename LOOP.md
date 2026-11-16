@@ -4845,6 +4845,22 @@ different.
   flip-flops 3, a `for` over a target that is not a local 3, `/o` 2, an
   empty `#{}` 2, END 1, a keyword hash node 1, a shareable_constant_value
   write 1.
+- **The review of #88** (three points, all taken):
+  - a literal's value is made without a method the program can define. The
+    compiler runs while the program does -- a file is compiled when it is
+    required -- and called `Regexp.new` and `Range.new`: `def Regexp.new(*)
+    = :intercepted` in the main script made every `/abc/` of a required
+    file a Symbol. A Regexp literal is now the interpreter's own maker's
+    (Regexp.__rx_new, the native behind Regexp.new), a Range the literal
+    syntax's.
+  - a Regexp literal is frozen (`/abc/.frozen?` was false on the VM).
+    compare_files.rb cannot see that -- Regexp#== does not ask -- so
+    witness 663 does: a third file required after the two redefinitions.
+  - `MERE_RUBY_VM=why` is answered before the BEGIN blocks run, of the
+    program as it was parsed ("a BEGIN block"); it ran them first.
+  ⚠ What this does not reach: the compiler is Ruby, so a program that
+  redefines what the compiler itself calls -- Array#map, String#<< -- still
+  changes what it compiles. That ends with the compiler made native.
 - **Checked** (local, the commit before this note): vm_check 243 / 243,
   the compiler 431 / 431 snippets and 667 / 667 compiled files, corpus
   691 / 691 on the evaluator and 691 with 0 different on the VM, the gates
