@@ -5209,3 +5209,50 @@ compiled with it. Requiring optparse.rb (2,463 lines) on the VM: 6.70 s ->
   test_pattern_matching 30, test_iseq 63 / 68, test_optimization 84 / 89
   (the RED as before).
 
+
+## 2026-11-16 (67): what the VM did otherwise than the evaluator in whole test files
+
+**The point.** Forty of ruby's test files run once on the evaluator and once
+under MERE_RUBY_VM=1 (local, same build): the VM answered 115 fewer tests.
+The ones fixed here, with corpus 673 as the witness (a child runs it as it
+is and under MERE_RUBY_VM=strict, and both print ruby's lines):
+
+- **test_thread** hung: a loop on the VM never let another thread or a
+  trapped signal run. A jump back and a statement's start now do what a
+  statement boundary does in the evaluator (vm_poll). test_thread 99 / 100
+  on the VM, as on the evaluator.
+- **test_module**: `c.instance_eval { include m }` included m into c's
+  singleton -- the class body walker ran the statement for the singleton
+  the body defines into. It is Module#include on c. The evaluator did the
+  same for `include m` written without parentheses. `private [:a, :b]` (one
+  Array of names) at the top level was "private method 'private' called for
+  main"; define_method as a class body's statement answered nil, not the
+  name.
+- **test_proc**: `proc { it }.parameters` named the slot `_1`; the VM's
+  block sequence now says its parameter is `it` (vm_it_seqs), and
+  Proc#parameters answers `[[:opt]]` for it.
+- **test_variable**: `1.instance_eval { @a = 1 }` wrote the ivar; the VM's
+  setinstancevariable goes through assign_one, which refused only a frozen
+  object's. An immediate's is refused too, as SIVarAssign refuses it.
+- **test_refinement**: a constant or class variable written in a refine
+  body said nothing on the VM (Bug #10103's warning).
+- **test_syntax**: the Ruby compiler's "argument of top-level return is
+  ignored" was printed under -W0.
+- On the evaluator too: a bare `private_methods` / `protected_methods` at
+  the top level was a NameError.
+- CI: the embedding check copies main.mere and rewrites its imports to the
+  repository's paths; the `ic/` ones were not rewritten, so it failed on
+  #89 (a8c2fe5a).
+
+Still different on the VM: test_module's two memory-leak tests (3M
+`Class.new do ... end`, past the 10 s bound: the VM runs that block about
+2.7 times slower than the evaluator), and test_sprintf's test_rational
+fails after a certain set of earlier tests and passes alone or with any
+smaller set (an exception value is lost when a collection falls in a
+particular place; not found yet).
+
+Checked (local): corpus 694 / 694 on the evaluator and under MERE_RUBY_VM=1
+(before 673; 673 alone the same as ruby both ways); vm_check 245 / 245;
+the gates; the embedding check; test_module 195 (2 timeouts on the VM),
+test_proc 118, test_variable 32, test_refinement 122, test_syntax 170 the
+same on both.
