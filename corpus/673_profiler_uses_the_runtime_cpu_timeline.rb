@@ -1,6 +1,5 @@
 def process_cpu
-  times = Process.times
-  times.utime + times.stime
+  Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID)
 end
 
 def burn_cpu(seconds)

@@ -5052,3 +5052,24 @@ Witness 673 spends CPU before enabling, checks clear and re-enable, and checks
 that sleep does not advance the CPU timeline as wall time would. Ruby passes;
 the old build fails at the delayed-enable assertion; the corrected build
 passes. The C clock glue also passes strict compiler warnings.
+
+### PR #91 platform review: the browser CPU clock ABI and Linux witness
+
+The browser host now supplies mr_gc_process_cpu_time as a pointer to a boxed
+negative Float, matching the Wasm backend's custom-extern ABI. Returning a raw
+negative number would instantiate but trap during collector initialization.
+The host import check validates the box; the browser build also executes the
+full interpreter and checks that Profiler.enable raises NotImplementedError.
+A fresh emitted module starts normally and reports the unavailable CPU clock.
+
+Witness 673 now reads Process.clock_gettime(CLOCK_PROCESS_CPUTIME_ID), using
+the same native process clock as the profiler. It no longer depends on the
+platform-specific ps output behind the existing Process.times implementation.
+The unchanged witness and measurement witness 669 pass on Darwin and Linux.
+The native process-clock unit selection preserves the existing conversion
+checks; all 19 upstream clock tests pass locally.
+
+dump_all hoists its main-ractor check and reuses the shareability result
+already needed by non-main ractors. This removes repeated interpreter calls
+without changing its object selection or the subprocess timeout. The ractor
+dump witness passes in 6.76 seconds under the unchanged ten-second bound.

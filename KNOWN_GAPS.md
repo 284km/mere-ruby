@@ -17,6 +17,9 @@ is excluded instead of changing the reference's collector identity.
 Profiler records real process CPU durations around gc_collect_any, using a
 startup epoch that survives enable/disable/clear (review witness 673); latest_gc_info
 reports actual causes and weak-reference counts, without invented heap keys.
+Process.clock_gettime(CLOCK_PROCESS_CPUTIME_ID) shares that native CPU reader.
+The browser host has no process CPU clock: startup receives an ABI-correct
+boxed unavailable value, and enabling the profiler raises NotImplementedError.
 
 The final classification gains 13 raw MATCH and separately records 57 exclusions.
 One of those raw gains, memsize_of_all, still uses the inherited slot guesses;
