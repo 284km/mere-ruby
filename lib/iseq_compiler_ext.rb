@@ -85,6 +85,9 @@ class RubyVM::InstructionSequence
     # (opt_case_dispatch's hash: the first `when` of a key wins; its labels
     #  are not counted as references, as compile.c's TS_CDHASH is not)
     CDHash = Struct.new(:entries)
+    # (checktype's operand: a type number, shown by its name)
+    CheckType = Struct.new(:n)
+    CHECK_TYPES = { 7 => "T_ARRAY", 8 => "T_HASH" }.freeze
 
     # rb_compile_option_t's defaults (the ones ISeq.compile_option shows)
     DEFAULT_OPTIONS = { inline_const_cache: true, peephole_optimization: true, tailcall_optimization: false,
@@ -366,6 +369,9 @@ class RubyVM::InstructionSequence
         here(u, n)
         u.insn(:splatarray, true) unless popped
       when Prism::IfNode, Prism::UnlessNode then branch(u, n, popped)
+      when Prism::CaseMatchNode then case_match_node(u, n, popped)
+      when Prism::MatchPredicateNode then match_predicate(u, n, popped)
+      when Prism::MatchRequiredNode then match_required(u, n, popped)
       when Prism::WhileNode, Prism::UntilNode then loop_node(u, n, popped)
       when Prism::DefNode then define(u, n, popped)
       when Prism::BreakNode then break_node(u, n, popped)
@@ -808,6 +814,17 @@ class RubyVM::InstructionSequence
     def call(u, n, popped, recv_done = false)
       line = (n.message_loc || n.location).start_line
       at = -> { u.at(line, n.node_id) }
+      # (`nil&.m(...)` is nil, and nothing of it is evaluated: compile.c's
+      #  optimiser folds the branchnil of a written nil and drops what
+      #  follows, leaving the receiver's own putnil)
+      #  (under branch coverage the branch's own nop keeps all of it)
+      if !recv_done && n.safe_navigation? && n.receiver.is_a?(Prism::NilNode) && !branch_coverage?(u)
+        unless popped
+          here(u, n.receiver)
+          u.insn(:putnil)
+        end
+        return
+      end
       # (a call with a block starts at a label a break entry may name)
       start = u.new_label
       u.emit_label(start) if n.block && !recv_done
@@ -1791,12 +1808,14 @@ class RubyVM::InstructionSequence
       if lit.(lo) && lit.(hi)
         u.insn(:putobject, range_literal(val.(lo), val.(hi), excl)) unless popped
       else
-        # (an absent bound's nil is the range node's own instruction)
-        if lo then node(u, lo, false) else here(u, n); u.insn(:putnil) end
-        if hi then node(u, hi, false) else here(u, n); u.insn(:putnil) end
-        here(u, n)
-        u.insn(:newrange, excl ? 1 : 0)
-        u.insn(:pop) if popped
+        # (an absent bound's nil is the range node's own instruction; a
+        #  Range nobody reads is only what its bounds do)
+        if lo then node(u, lo, popped) elsif !popped then here(u, n); u.insn(:putnil) end
+        if hi then node(u, hi, popped) elsif !popped then here(u, n); u.insn(:putnil) end
+        unless popped
+          here(u, n)
+          u.insn(:newrange, excl ? 1 : 0)
+        end
       end
     end
 
@@ -2423,6 +2442,635 @@ class RubyVM::InstructionSequence
     # prism_compile.c's pm_compile_case_node: the conditions and the bodies
     # built apart; with a subject, a dispatch hash of the literal `when`s,
     # the `===` chain, the else part, then the bodies
+    # -- pattern matching (prism_compile.c's pm_compile_pattern and the nodes
+    # that use it: `case / in`, `expr => pattern`, `expr in pattern`) ---------
+    # The stack is the scratch space, as there: under the value being matched
+    # sit a deconstruct cache and, for a single pattern, the error string, the
+    # "is it a key error" flag and that error's matchee and key. `base` is how
+    # far down they are from where the pattern started.
+    PAT_CACHE = 0
+    PAT_ERROR_STRING = 1
+    PAT_KEY_ERROR_P = 2
+    PAT_KEY_ERROR_MATCHEE = 3
+    PAT_KEY_ERROR_KEY = 4
+
+    def pat_str(s) = s.encode(Encoding::US_ASCII).freeze
+
+    # pm_compile_pattern_generic_error
+    def pattern_generic_error(u, n, message, base)
+      ok = u.new_label
+      here(u, n)
+      u.insn(:dup)
+      u.insn(:branchif, ok)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str(message))
+      u.insn(:topn, 3)
+      push_send(u, :"core#sprintf", 2)
+      u.insn(:setn, base + PAT_ERROR_STRING + 1)
+      u.insn(:putobject, false)
+      u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+      u.insn(:pop)
+      u.insn(:pop)
+      u.emit_label(ok)
+    end
+
+    # pm_compile_pattern_length_error
+    def pattern_length_error(u, n, message, length, base)
+      ok = u.new_label
+      here(u, n)
+      u.insn(:dup)
+      u.insn(:branchif, ok)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str(message))
+      u.insn(:topn, 3)
+      u.insn(:dup)
+      push_send(u, :length, 0)
+      u.insn(:putobject, length)
+      push_send(u, :"core#sprintf", 4)
+      u.insn(:setn, base + PAT_ERROR_STRING + 1)
+      u.insn(:putobject, false)
+      u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+      u.insn(:pop)
+      u.insn(:pop)
+      u.emit_label(ok)
+    end
+
+    # pm_compile_pattern_eqq_error
+    def pattern_eqq_error(u, n, base)
+      ok = u.new_label
+      here(u, n)
+      u.insn(:dup)
+      u.insn(:branchif, ok)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str("%p === %p does not return true"))
+      u.insn(:topn, 3)
+      u.insn(:topn, 5)
+      push_send(u, :"core#sprintf", 3)
+      u.insn(:setn, base + PAT_ERROR_STRING + 1)
+      u.insn(:putobject, false)
+      u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+      u.insn(:pop)
+      u.insn(:pop)
+      u.emit_label(ok)
+      u.insn(:setn, 2)
+      u.insn(:pop)
+      u.insn(:pop)
+    end
+
+    # pm_compile_pattern_match: falls through when the pattern matches
+    def pattern_match(u, n, unmatched, single, cache, base)
+      matched = u.new_label
+      pattern(u, n, matched, unmatched, single, cache, base)
+      u.emit_label(matched)
+    end
+
+    # pm_compile_pattern_deconstruct
+    def pattern_deconstruct(u, n, deconstruct, match_failed, deconstructed, type_error, single, cache, base)
+      here(u, n)
+      if cache
+        u.insn(:topn, base + PAT_CACHE)
+        u.insn(:branchnil, deconstruct)
+        u.insn(:topn, base + PAT_CACHE)
+        u.insn(:branchunless, match_failed)
+        u.insn(:pop)
+        u.insn(:topn, base + PAT_CACHE - 1)
+        u.insn(:jump, deconstructed)
+      else
+        u.insn(:jump, deconstruct)
+      end
+      u.emit_label(deconstruct)
+      u.insn(:dup)
+      u.insn(:putobject, :deconstruct)
+      push_send(u, :respond_to?, 1)
+      u.insn(:setn, base + PAT_CACHE + 1) if cache
+      pattern_generic_error(u, n, "%p does not respond to #deconstruct", base + 1) if single
+      here(u, n)
+      u.insn(:branchunless, match_failed)
+      push_send(u, :deconstruct, 0)
+      u.insn(:setn, base + PAT_CACHE) if cache
+      u.insn(:dup)
+      u.insn(:checktype, CheckType.new(7))
+      u.insn(:branchunless, type_error)
+      u.emit_label(deconstructed)
+    end
+
+    # pm_compile_pattern_constant: the constant an array, find or hash
+    # pattern is written under
+    def pattern_constant(u, n, match_failed, single, base)
+      here(u, n)
+      u.insn(:dup)
+      node(u, n, false)
+      here(u, n)
+      u.insn(:dupn, 2) if single
+      u.insn(:checkmatch, 2)
+      pattern_eqq_error(u, n, base + 3) if single
+      here(u, n)
+      u.insn(:branchunless, match_failed)
+    end
+
+    # pm_compile_pattern_error_handler: what a single pattern that did not
+    # match raises
+    def pattern_error_handler(u, n, done, popped)
+      key_error = u.new_label
+      cleanup = u.new_label
+      here(u, n)
+      u.insn(:putspecialobject, 1)
+      u.insn(:topn, PAT_KEY_ERROR_P + 2)
+      u.insn(:branchif, key_error)
+      u.insn(:putobject, NoMatchingPatternError)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str("%p: %s"))
+      u.insn(:topn, 4)
+      u.insn(:topn, PAT_ERROR_STRING + 6)
+      push_send(u, :"core#sprintf", 3)
+      push_send(u, :"core#raise", 2)
+      u.insn(:jump, cleanup)
+      u.emit_label(key_error)
+      u.insn(:putobject, NoMatchingPatternKeyError)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str("%p: %s"))
+      u.insn(:topn, 4)
+      u.insn(:topn, PAT_ERROR_STRING + 6)
+      push_send(u, :"core#sprintf", 3)
+      u.insn(:topn, PAT_KEY_ERROR_MATCHEE + 4)
+      u.insn(:topn, PAT_KEY_ERROR_KEY + 5)
+      push_send(u, :new, 1, CALL_KWARG, %i[matchee key])
+      push_send(u, :"core#raise", 1)
+      u.emit_label(cleanup)
+      u.insn(:adjuststack, 7)
+      u.insn(:putnil) unless popped
+      u.insn(:jump, done)
+      u.insn(:dupn, 5)
+      u.insn(:putnil) if popped
+    end
+
+    # the TypeError a #deconstruct or #deconstruct_keys of the wrong type is
+    def pattern_type_error(u, n, type_error, message)
+      u.emit_label(type_error)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, TypeError)
+      u.insn(:putobject, pat_str(message))
+      push_send(u, :"core#raise", 2)
+      u.insn(:pop)
+    end
+
+    # pm_compile_pattern
+    def pattern(u, n, matched, unmatched, single, cache, base)
+      at = -> { here(u, n) }
+      case n
+      when Prism::ArrayPatternNode
+        req = n.requireds
+        posts = n.posts
+        min = req.size + posts.size
+        rest_named = n.rest.is_a?(Prism::SplatNode) && !n.rest.expression.nil?
+        use_rest_size = !n.rest.nil? && (rest_named || posts.size > 0)
+        match_failed = u.new_label
+        type_error = u.new_label
+        deconstruct = u.new_label
+        deconstructed = u.new_label
+        at.()
+        if use_rest_size
+          u.insn(:putobject, 0)
+          u.insn(:swap)
+          base += 1
+        end
+        pattern_constant(u, n.constant, match_failed, single, base) if n.constant
+        pattern_deconstruct(u, n, deconstruct, match_failed, deconstructed, type_error, single, cache, base)
+        at.()
+        u.insn(:dup)
+        push_send(u, :length, 0)
+        u.insn(:putobject, min)
+        push_send(u, n.rest.nil? ? :== : :>=, 1)
+        if single
+          pattern_length_error(u, n, n.rest.nil? ? "%p length mismatch (given %p, expected %p)" : "%p length mismatch (given %p, expected %p+)", min, base + 1)
+        end
+        at.()
+        u.insn(:branchunless, match_failed)
+        req.each_with_index do |r, i|
+          at.()
+          u.insn(:dup)
+          u.insn(:putobject, i)
+          push_send(u, :[], 1)
+          pattern_match(u, r, match_failed, single, false, base + 1)
+        end
+        if n.rest
+          if rest_named
+            at.()
+            u.insn(:dup)
+            u.insn(:putobject, req.size)
+            u.insn(:topn, 1)
+            push_send(u, :length, 0)
+            u.insn(:putobject, min)
+            push_send(u, :-, 1)
+            u.insn(:setn, 4)
+            push_send(u, :[], 2)
+            pattern_match(u, n.rest.expression, match_failed, single, false, base + 1)
+          elsif posts.size > 0
+            at.()
+            u.insn(:dup)
+            push_send(u, :length, 0)
+            u.insn(:putobject, min)
+            push_send(u, :-, 1)
+            u.insn(:setn, 2)
+            u.insn(:pop)
+          end
+        end
+        posts.each_with_index do |q, i|
+          at.()
+          u.insn(:dup)
+          u.insn(:putobject, req.size + i)
+          u.insn(:topn, 3)
+          push_send(u, :+, 1)
+          push_send(u, :[], 1)
+          pattern_match(u, q, match_failed, single, false, base + 1)
+        end
+        at.()
+        u.insn(:pop)
+        u.insn(:pop) if use_rest_size
+        u.insn(:jump, matched)
+        u.insn(:putnil)
+        u.insn(:putnil) if use_rest_size
+        pattern_type_error(u, n, type_error, "deconstruct must return Array")
+        u.emit_label(match_failed)
+        u.insn(:pop)
+        u.insn(:pop) if use_rest_size
+        u.insn(:jump, unmatched)
+      when Prism::FindPatternNode
+        size = n.requireds.size
+        match_failed = u.new_label
+        type_error = u.new_label
+        deconstruct = u.new_label
+        deconstructed = u.new_label
+        pattern_constant(u, n.constant, match_failed, single, base) if n.constant
+        pattern_deconstruct(u, n, deconstruct, match_failed, deconstructed, type_error, single, cache, base)
+        at.()
+        u.insn(:dup)
+        push_send(u, :length, 0)
+        u.insn(:putobject, size)
+        push_send(u, :>=, 1)
+        pattern_length_error(u, n, "%p length mismatch (given %p, expected %p+)", size, base + 1) if single
+        at.()
+        u.insn(:branchunless, match_failed)
+        while_begin = u.new_label
+        next_loop = u.new_label
+        find_succeeded = u.new_label
+        find_failed = u.new_label
+        u.insn(:dup)
+        push_send(u, :length, 0)
+        u.insn(:dup)
+        u.insn(:putobject, size)
+        push_send(u, :-, 1)
+        u.insn(:putobject, 0)
+        u.emit_label(while_begin)
+        u.insn(:dup)
+        u.insn(:topn, 2)
+        push_send(u, :<=, 1)
+        u.insn(:branchunless, find_failed)
+        n.requireds.each_with_index do |r, i|
+          at.()
+          u.insn(:topn, 3)
+          u.insn(:topn, 1)
+          if i != 0
+            u.insn(:putobject, i)
+            push_send(u, :+, 1)
+          end
+          push_send(u, :[], 1)
+          pattern_match(u, r, next_loop, single, false, base + 4)
+        end
+        if n.left.expression
+          at.()
+          u.insn(:topn, 3)
+          u.insn(:putobject, 0)
+          u.insn(:topn, 2)
+          push_send(u, :[], 2)
+          pattern_match(u, n.left.expression, find_failed, single, false, base + 4)
+        end
+        if n.right.expression
+          at.()
+          u.insn(:topn, 3)
+          u.insn(:topn, 1)
+          u.insn(:putobject, size)
+          push_send(u, :+, 1)
+          u.insn(:topn, 3)
+          push_send(u, :[], 2)
+          pattern_match(u, n.right.expression, find_failed, single, false, base + 4)
+        end
+        at.()
+        u.insn(:jump, find_succeeded)
+        u.emit_label(next_loop)
+        u.insn(:putobject, 1)
+        push_send(u, :+, 1)
+        u.insn(:jump, while_begin)
+        u.emit_label(find_failed)
+        u.insn(:adjuststack, 3)
+        if single
+          u.insn(:putspecialobject, 1)
+          u.insn(:putobject, pat_str("%p does not match to find pattern"))
+          u.insn(:topn, 2)
+          push_send(u, :"core#sprintf", 2)
+          u.insn(:setn, base + PAT_ERROR_STRING + 1)
+          u.insn(:putobject, false)
+          u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+          u.insn(:pop)
+          u.insn(:pop)
+        end
+        u.insn(:jump, match_failed)
+        u.insn(:dupn, 3)
+        u.emit_label(find_succeeded)
+        u.insn(:adjuststack, 3)
+        u.insn(:pop)
+        u.insn(:jump, matched)
+        u.insn(:putnil)
+        pattern_type_error(u, n, type_error, "deconstruct must return Array")
+        u.emit_label(match_failed)
+        u.insn(:pop)
+        u.insn(:jump, unmatched)
+      when Prism::HashPatternNode
+        has_rest = !n.rest.nil? && !(n.rest.is_a?(Prism::AssocSplatNode) && n.rest.value.nil?)
+        has_keys = n.elements.size > 0 || !n.rest.nil?
+        match_failed = u.new_label
+        type_error = u.new_label
+        keys = (has_keys && !has_rest) ? n.elements.map { |e| symbol_value(e.key) }.freeze : nil
+        pattern_constant(u, n.constant, match_failed, single, base) if n.constant
+        at.()
+        u.insn(:dup)
+        u.insn(:putobject, :deconstruct_keys)
+        push_send(u, :respond_to?, 1)
+        pattern_generic_error(u, n, "%p does not respond to #deconstruct_keys", base + 1) if single
+        at.()
+        u.insn(:branchunless, match_failed)
+        if keys.nil? then u.insn(:putnil) else u.insn(:duparray, keys) end
+        push_send(u, :deconstruct_keys, 1)
+        u.insn(:dup)
+        u.insn(:checktype, CheckType.new(8))
+        u.insn(:branchunless, type_error)
+        push_send(u, :dup, 0) if has_rest
+        if has_keys
+          values = []
+          n.elements.each do |e|
+            sym = symbol_value(e.key)
+            at.()
+            u.insn(:dup)
+            u.insn(:putobject, sym)
+            push_send(u, :key?, 1)
+            if single
+              ok = u.new_label
+              u.insn(:dup)
+              u.insn(:branchif, ok)
+              u.insn(:putobject, key_not_found(sym))
+              u.insn(:setn, base + PAT_ERROR_STRING + 2)
+              u.insn(:putobject, true)
+              u.insn(:setn, base + PAT_KEY_ERROR_P + 3)
+              u.insn(:topn, 3)
+              u.insn(:setn, base + PAT_KEY_ERROR_MATCHEE + 4)
+              u.insn(:putobject, sym)
+              u.insn(:setn, base + PAT_KEY_ERROR_KEY + 5)
+              u.insn(:adjuststack, 4)
+              u.emit_label(ok)
+            end
+            u.insn(:branchunless, match_failed)
+            values << u.capture do
+              at.()
+              u.insn(:dup)
+              u.insn(:putobject, sym)
+              push_send(u, has_rest ? :delete : :[], 1)
+              v = e.value
+              v = v.value if v.is_a?(Prism::ImplicitNode)
+              pattern_match(u, v, match_failed, single, false, base + 1)
+            end
+          end
+          values.each { |v| u.append(v) }
+        else
+          u.insn(:dup)
+          push_send(u, :empty?, 0)
+          pattern_generic_error(u, n, "%p is not empty", base + 1) if single
+          at.()
+          u.insn(:branchunless, match_failed)
+        end
+        if has_rest
+          at.()
+          if n.rest.is_a?(Prism::NoKeywordsParameterNode)
+            u.insn(:dup)
+            push_send(u, :empty?, 0)
+            pattern_generic_error(u, n, "rest of %p is not empty", base + 1) if single
+            at.()
+            u.insn(:branchunless, match_failed)
+          else
+            u.insn(:dup)
+            pattern_match(u, n.rest.value, match_failed, single, false, base + 1)
+          end
+        end
+        at.()
+        u.insn(:pop)
+        u.insn(:jump, matched)
+        u.insn(:putnil)
+        pattern_type_error(u, n, type_error, "deconstruct_keys must return Hash")
+        u.emit_label(match_failed)
+        u.insn(:pop)
+        u.insn(:jump, unmatched)
+      when Prism::CapturePatternNode
+        match_failed = u.new_label
+        at.()
+        u.insn(:dup)
+        pattern_match(u, n.value, match_failed, single, cache, base + 1)
+        pattern(u, n.target, matched, match_failed, single, false, base)
+        at.()
+        u.insn(:putnil)
+        u.emit_label(match_failed)
+        u.insn(:pop)
+        u.insn(:jump, unmatched)
+      when Prism::LocalVariableTargetNode
+        at.()
+        u.insn(:setlocal, *local_ref(u, n.name, n.depth))
+        u.insn(:jump, matched)
+      when Prism::AlternationPatternNode
+        matched_left = u.new_label
+        unmatched_left = u.new_label
+        at.()
+        u.insn(:dup)
+        pattern(u, n.left, matched_left, unmatched_left, single, cache, base + 1)
+        at.()
+        u.emit_label(matched_left)
+        u.insn(:pop)
+        u.insn(:jump, matched)
+        u.insn(:putnil)
+        u.emit_label(unmatched_left)
+        pattern(u, n.right, matched, unmatched, single, cache, base)
+      when Prism::ParenthesesNode
+        pattern(u, n.body, matched, unmatched, single, cache, base)
+      when Prism::PinnedVariableNode
+        pattern(u, n.variable, matched, unmatched, single, true, base)
+      when Prism::IfNode, Prism::UnlessNode
+        if_ = n.is_a?(Prism::IfNode)
+        pattern_match(u, n.statements.body[0], unmatched, single, cache, base)
+        node(u, n.predicate, false)
+        at.()
+        if single
+          ok = u.new_label
+          u.insn(:dup)
+          u.insn(if_ ? :branchif : :branchunless, ok)
+          u.insn(:putobject, pat_str("guard clause does not return true"))
+          u.insn(:setn, base + PAT_ERROR_STRING + 1)
+          u.insn(:putobject, false)
+          u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+          u.insn(:pop)
+          u.insn(:pop)
+          u.emit_label(ok)
+        end
+        u.insn(if_ ? :branchunless : :branchif, unmatched)
+        u.insn(:jump, matched)
+      else
+        # (a value: `===` of it. A pinned expression is its expression.)
+        v = n.is_a?(Prism::PinnedExpressionNode) ? n.expression : n
+        at.()
+        node(u, v, false)
+        at.()
+        u.insn(:dupn, 2) if single
+        u.insn(:checkmatch, 2)
+        pattern_eqq_error(u, v, base + 2) if single
+        at.()
+        u.insn(:branchif, matched)
+        u.insn(:jump, unmatched)
+      end
+    end
+
+    # "key not found: :name", as rb_sprintf's %+ makes it
+    # (a binary String: rb_sprintf's)
+    def key_not_found(sym) = "key not found: #{sym.inspect}".b.freeze
+
+    # pm_compile_case_match_node
+    def case_match_node(u, n, popped)
+      end_l = u.new_label
+      else_l = u.new_label
+      cloc = branches = nil
+      bid = 0
+      if branch_coverage?(u)
+        cloc = code_loc(n)
+        branches = branch_base(u, n, cloc, :case)
+      end
+      single = n.else_clause.nil? && n.conditions.size == 1
+      here(u, n)
+      if single
+        u.insn(:putnil)
+        u.insn(:putnil)
+        u.insn(:putobject, false)
+        u.insn(:putnil)
+      end
+      u.insn(:putnil)
+      node(u, n.predicate, false)
+      bodies = []
+      conds = u.capture do
+        n.conditions.each do |c|
+          body_l = u.new_label
+          bodies << u.capture do
+            here(u, c)
+            u.insn(:putnil) if bid > 0
+            u.emit_label(body_l)
+            u.insn(:adjuststack, single ? 6 : 2)
+            if branches
+              bloc = code_loc(c.statements || c)
+              branch_cov(u, branches, bloc, bloc[1], bid, :in)
+            end
+            bid += 1
+            if c.statements then node(u, c.statements, popped) elsif !popped then synthetic_putnil(u) end
+            here(u, c)
+            u.insn(:jump, end_l)
+          end
+          next_l = u.new_label
+          here(u, c.pattern)
+          u.insn(:dup)
+          pattern(u, c.pattern, body_l, next_l, single, true, 2)
+          u.emit_label(next_l)
+          next_l.unremovable = true
+        end
+        if (e = n.else_clause)
+          u.emit_label(else_l)
+          here(u, n)
+          u.insn(:pop)
+          u.insn(:pop)
+          if branches
+            bloc = code_loc(e.statements || e)
+            branch_cov(u, branches, bloc, bloc[1], bid, :else)
+          end
+          node(u, e, popped)
+          here(u, n)
+          u.insn(:jump, end_l)
+          u.insn(:putnil)
+          u.insn(:putnil) if popped
+        else
+          u.emit_label(else_l)
+          branch_cov(u, branches, cloc, cloc[1], bid, :else) if branches
+          if single
+            pattern_error_handler(u, n, end_l, popped)
+          else
+            here(u, n)
+            u.insn(:putspecialobject, 1)
+            u.insn(:putobject, NoMatchingPatternError)
+            u.insn(:topn, 2)
+            push_send(u, :"core#raise", 2)
+            u.insn(:adjuststack, 3)
+            u.insn(:putnil) unless popped
+            u.insn(:jump, end_l)
+            u.insn(:dupn, 1)
+            u.insn(:putnil) if popped
+          end
+        end
+      end
+      u.append(conds)
+      bodies.each { |b| u.append(b) }
+      u.emit_label(end_l)
+    end
+
+    # PM_MATCH_PREDICATE_NODE: `expr in pattern`
+    def match_predicate(u, n, popped)
+      here(u, n)
+      u.insn(:putnil)
+      node(u, n.value, false)
+      here(u, n)
+      u.insn(:dup)
+      matched = u.new_label
+      unmatched = u.new_label
+      done = u.new_label
+      pattern(u, n.pattern, matched, unmatched, false, true, 2)
+      here(u, n)
+      u.emit_label(unmatched)
+      u.insn(:pop)
+      u.insn(:pop)
+      u.insn(:putobject, false) unless popped
+      u.insn(:jump, done)
+      u.insn(:putnil)
+      u.emit_label(matched)
+      u.insn(:adjuststack, 2)
+      u.insn(:putobject, true) unless popped
+      u.insn(:jump, done)
+      u.emit_label(done)
+    end
+
+    # pm_compile_match_required_node: `expr => pattern`
+    def match_required(u, n, popped)
+      matched = u.new_label
+      unmatched = u.new_label
+      done = u.new_label
+      here(u, n)
+      u.insn(:putnil)
+      u.insn(:putnil)
+      u.insn(:putobject, false)
+      u.insn(:putnil)
+      u.insn(:putnil)
+      node(u, n.value, false)
+      here(u, n)
+      u.insn(:dup)
+      pattern(u, n.pattern, matched, unmatched, true, true, 2)
+      u.emit_label(unmatched)
+      pattern_error_handler(u, n, done, popped)
+      u.emit_label(matched)
+      here(u, n)
+      u.insn(:adjuststack, 6)
+      u.insn(:putnil) unless popped
+      u.insn(:jump, done)
+      u.emit_label(done)
+    end
+
     def case_node(u, n, popped)
       end_l = u.new_label
       bodies = []
@@ -4213,6 +4861,7 @@ class RubyVM::InstructionSequence
       when :splatkw then [2, 2]
       when :pushtoarraykwsplat then [2, 1]
       when :dupn then [e.ops[0], e.ops[0] * 2]
+      when :checktype then [1, 1]
       when :checkkeyword, :getspecial, :getclassvariable then [0, 1]
       when :setclassvariable then [1, 0]
       when :toregexp then [e.ops[1], 1]
@@ -4284,6 +4933,7 @@ class RubyVM::InstructionSequence
       end
       body = []
       last = nil
+      prev_info = nil
       pos = 0
       u.elements.each do |e|
         next unless e.is_a?(Insn)
@@ -4293,7 +4943,15 @@ class RubyVM::InstructionSequence
           body << e.line
           last = e.line
         end
-        EVENT_DISASM.each { |ev, _| body << EVENT_TO_A[ev] if e.events.include?(ev) && EVENT_TO_A[ev] }
+        # (events are said where an instruction-info entry starts, and one
+        #  entry covers the instructions that follow with the same line, node
+        #  and events -- add_insn_info: a second `leave` after the first
+        #  repeats nothing. The VM's export says them for each.)
+        info = [e.line, e.node_id, e.events]
+        if vm || info != prev_info
+          EVENT_DISASM.each { |ev, _| body << EVENT_TO_A[ev] if e.events.include?(ev) && EVENT_TO_A[ev] }
+        end
+        prev_info = info
         body << [e.name, *e.ops.map { |o| operand_to_a(o, vm) }, *(vm && e.vmx ? [e.vmx] : [])]
       end
       pr = u.params
@@ -4338,6 +4996,7 @@ class RubyVM::InstructionSequence
       when IC then o.segments
       when DefType then o.n
       when CDHash then o.entries.flat_map { |k, l| [k, :"label_#{l.pos}"] }
+      when CheckType then o.n
       when Unit then to_a(o, vm)
       else o
       end
@@ -4509,6 +5168,7 @@ class RubyVM::InstructionSequence
       when IC then "<ic:#{o.index + (o.base || 0)} #{o.segments.join("::")}>"
       when DefType then DEFINED_NAMES[o.n]
       when CDHash then "<cdhash>"
+      when CheckType then CHECK_TYPES[o.n] || o.n.to_s
       when Label then o.pos.to_s
       when LocalOp then "#{local_name(o.name)}@#{o.index}"
       when Unit then o.label
