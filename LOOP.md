@@ -5036,3 +5036,19 @@ different.
   is Ruby running on mere-ruby, about 3 ms a line; and the VM's loop is
   1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
   fallbacks, then the compiler made native, then speed.
+
+### PR #91 review: GC::Profiler keeps the runtime CPU epoch
+
+P2 found that GC_INVOKE_TIME began at Profiler.enable instead of runtime
+startup. The existing gc_state initializer now captures the process CPU clock
+once, before Ruby execution; enable/disable/clear preserve it. GC_TIME uses
+that same process CPU clock, so sleeps and scheduling waits are not charged
+as collection CPU. tools/process_glue.c adds mr_gc_process_cpu_time using
+CLOCK_PROCESS_CPUTIME_ID with the standard C clock fallback; it is a new
+function, separate from the stat/utime functions in the concurrent C API work.
+No top-level value or collector-body change is introduced.
+
+Witness 671 spends CPU before enabling, checks clear and re-enable, and checks
+that sleep does not advance the CPU timeline as wall time would. Ruby passes;
+the old build fails at the delayed-enable assertion; the corrected build
+passes. The C clock glue also passes strict compiler warnings.
