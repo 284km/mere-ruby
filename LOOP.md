@@ -4958,3 +4958,64 @@ different.
   is Ruby running on mere-ruby, about 3 ms a line; and the VM's loop is
   1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
   fallbacks, then the compiler made native, then speed.
+
+## 2026-11-16 (60): round 39 -- what test_iseq and test_optimization still asked
+
+**The point.** `ruby/test_iseq.rb` goes from 42 of 70 to 62 of 68 (the two
+tests of `ISeq.load` are not defined in ruby, where the method is private,
+and no longer are here), `ruby/test_optimization.rb` from 82 to 84 of 89.
+None of it is the VM's loop: it is `RubyVM::InstructionSequence`'s own
+surface, the compiler, and four things the evaluator had wrong.
+
+- **`ISeq.of` answers a sequence.** For a Method, a Proc or a backtrace's
+  Location it answered an object that knew a name and a line and nothing
+  else. It is now the sequence the file's own compilation has: the file is
+  compiled once (per path), and the method's sequence that starts on that
+  line -- a block's, the innermost; a frame's by its label and line -- is
+  what #to_a, #disasm, #label, #base_label and #first_lineno read. The same
+  code answers the same object; a sequence answers itself; a file that does
+  not compile leaves the name and the line, as before.
+- **What compile refuses.** After the evaluator's own parse, Prism is asked:
+  "Invalid break" and its kin, and a stray `end` the evaluator's parser let
+  by, are a SyntaxError as Prism frames one (the line, two around it, the
+  extent under it); a `yield` outside any method is prism_compile.c's
+  one-line "Invalid yield". A source String in another encoding is read in
+  it, and its disassembly answers in it. `ISeq.allocate` has no allocator;
+  `debug_level: ""` and `load_from_binary(0)` are TypeErrors; a File is read
+  by its path, open or closed.
+- **`ruby --dump=insns`** prints the main script's sequences (the program
+  is not run; what runs in its place prints the disassembly).
+- **The compiler**: an empty `#{}` is a nil no node stands for; a keyword
+  hash as a value (`return **h`); a pattern's literal pieces in the
+  encoding its n / u / e / s names. compare_files: 671 the same, 21
+  refused, 0 different.
+- **In the evaluator** (each wrong without the VM):
+  - a shareable Proc whose block ASSIGNS an outer local is ruby's
+    ArgumentError naming every such local, before anything else is asked;
+    a local whose name is not ASCII was not seen as one; a bare `super` in
+    the block reads the method's parameters (the anonymous `*` shown as
+    `*`). A VM block answers the same from its program (vm_outer_writes).
+  - the operand after `and` / `or` takes its own one-line pattern match:
+    `true or 1 in 1` was `(true or 1) in 1`, and a SyntaxError as a
+    statement.
+  - a `===` the program gave TrueClass, FalseClass or NilClass is the one
+    `when true` calls.
+  - `-x`, `~x` and `+x` are calls a TracePoint sees (:c_call of String#-@),
+    not a String literal's `-"s"`; a negative Integer's own address is the
+    64 bits it is (`#<Integer:0xffffffffffffffff>`).
+- **Still RED, and why**:
+  - test_iseq 6: two loops of a million `ISeq.new(nil)` / `load_from_binary`
+    inside 10 s (28 and 39 s here: the evaluator's speed, the speed stage's);
+    two that read a builtin's own sequence (`[].method(:pack)`); a Ractor
+    that redefines Kernel#Float; `case / in` in the compiler.
+  - test_optimization 5: tail calls that must not grow the stack (2), a
+    million `"".empty?` in time, the memory a frozen IO buffer gives back,
+    and `!x` as a :c_call -- the parser writes `unless` and `until` with the
+    same node as `!`, so it cannot be told apart yet.
+  - test_coverage 12: branch coverage (10) is not counted anywhere. The
+    plan: a file under branch coverage runs on the VM, the compiler puts
+    the branches in its sequences (prism_compile.c's
+    add_trace_branch_coverage) and the VM counts them.
+- **Checked** (local, the commit before this note): vm_check 243 / 243,
+  the compiler 433 / 433 snippets and 671 / 671 compiled files, corpus
+  692 / 692 on the evaluator and RESULT_VM on the VM, the gates. Witness 664.
