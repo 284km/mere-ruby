@@ -15,6 +15,48 @@ end
 callback = proc { |hash, key| [hash.class, key] }
 hash = ForwardedHash.new(&callback)
 p [hash[:missing], hash.default_proc.equal?(callback), hash.default]
+
+class ImplicitHash < Hash
+  def initialize
+    1.times { :unrelated }
+    super
+  end
+end
+class ImplicitParenHash < Hash
+  attr_reader :incoming
+  def initialize(&block)
+    @incoming = block
+    super()
+  end
+end
+class ImplicitRelayHash < ImplicitHash
+  def initialize
+    super
+  end
+end
+[ImplicitHash, ImplicitParenHash, ImplicitRelayHash].each do |type|
+  captured = type.new(&callback)
+  p [captured.default_proc.equal?(callback), captured[:key]]
+  begin
+    type.new(&->(one) { one })
+  rescue => error
+    p [error.class, error.message]
+  end
+end
+literal = ImplicitParenHash.new { |object, key| key }
+p [literal.default_proc.equal?(literal.incoming), literal[:literal]]
+class ReplacedBlockHash < Hash
+  def initialize
+    super() { :replacement }
+  end
+end
+p ReplacedBlockHash.new(&callback)[:key]
+class DroppedBlockHash < Hash
+  def initialize
+    super(&nil)
+  end
+end
+p DroppedBlockHash.new(&callback).default_proc
 hash[:present] = :value
 hash.send(:initialize) { |object, key| [object.class, key.to_s] }
 p [hash[:present], hash[:missing]]
