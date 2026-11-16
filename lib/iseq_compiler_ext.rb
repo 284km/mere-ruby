@@ -98,6 +98,10 @@ class RubyVM::InstructionSequence
       attr_reader :type, :label, :path, :abs_path, :first_lineno, :locals, :params,
                   :children, :elements, :code_location, :node_id, :parent
       attr_accessor :stack_max
+      # (branch coverage, kept by the file's top sequence: the bases by their
+      #  node -- [type, line, column, line, column, {branch id => [type,
+      #  line, column, line, column, counter]}] -- and how many counters)
+      attr_accessor :cov_bases, :cov_counters
       attr_writer :opts, :parser
       def parser = (@parser || :prism)
       # (the catch table: [type, start, end, iseq, cont] as ADD_CATCH_ENTRY
@@ -832,12 +836,22 @@ class RubyVM::InstructionSequence
       end
       fcall = r.nil? || n.ignore_visibility?
       else_l = end_l = nil
+      safe_cov = safe_loc = nil
       if n.safe_navigation?
         else_l = u.new_label
         end_l = u.new_label
+        if branch_coverage?(u)
+          # (from the call's start to the last of its closing parenthesis,
+          #  its arguments and its name)
+          last = [n.closing_loc, n.arguments&.location, n.message_loc].compact.max_by(&:end_offset)
+          sl = n.location
+          safe_loc = [sl.start_line, sl.start_column, last.end_line, last.end_column]
+          safe_cov = branch_base(u, n, safe_loc, :"&.")
+        end
         at.()
         u.insn(:dup)
         u.insn(:branchnil, else_l)
+        branch_cov(u, safe_cov, safe_loc, n.node_id, 0, :then) if safe_cov
       end
       prelude = u.elements.size
       argc, flag, kws = setup_args(u, n.arguments, n.block, [line, n.node_id])
@@ -896,6 +910,7 @@ class RubyVM::InstructionSequence
       if else_l
         u.insn(:jump, end_l)
         u.emit_label(else_l)
+        branch_cov(u, safe_cov, safe_loc, n.node_id, 1, :else) if safe_cov
         u.emit_label(end_l)
       end
       u.insn(:pop) if write
@@ -2411,12 +2426,26 @@ class RubyVM::InstructionSequence
     def case_node(u, n, popped)
       end_l = u.new_label
       bodies = []
+      # (branch coverage: each `when` and the else, written or not)
+      cloc = cbranches = nil
+      bid = 0
+      if branch_coverage?(u)
+        cloc = code_loc(n)
+        cbranches = branch_base(u, n, cloc, :case)
+      end
+      when_cov = lambda do |clause|
+        next unless cbranches
+        bloc = code_loc(clause.statements || clause)
+        branch_cov(u, cbranches, bloc, bloc[1], bid, :when)
+        bid += 1
+      end
       if n.predicate.nil?
         conds = u.capture do
           n.conditions.each do |clause|
             label = u.new_label
             bodies << u.capture do
               u.emit_label(label)
+              when_cov.(clause)
               if clause.statements then node(u, clause.statements, popped) elsif !popped then synthetic_putnil(u) end
               here(u, n)
               u.insn(:jump, end_l)
@@ -2435,6 +2464,11 @@ class RubyVM::InstructionSequence
                 u.emit_label(next_l)
               end
             end
+          end
+          if cbranches
+            e = n.else_clause
+            bloc = e.nil? ? cloc : code_loc(e.statements || e)
+            branch_cov(u, cbranches, bloc, bloc[1], bid, :else)
           end
           if n.else_clause then node(u, n.else_clause, popped) elsif !popped then synthetic_putnil(u) end
           here(u, n)
@@ -2476,6 +2510,7 @@ class RubyVM::InstructionSequence
               u.emit_label(label)
               here(u, clause)
               u.insn(:pop)
+              when_cov.(clause)
               if clause.statements then node(u, clause.statements, popped) elsif !popped then synthetic_putnil(u) end
               here(u, clause)
               u.insn(:jump, end_l)
@@ -2493,12 +2528,20 @@ class RubyVM::InstructionSequence
         if (e = n.else_clause)
           here(u, e.statements || e)
           u.insn(:pop)
+          if cbranches
+            bloc = code_loc(e.statements || e)
+            branch_cov(u, cbranches, bloc, bloc[1], bid, :else)
+          end
           node(u, e, popped)
           here(u, e.statements || e)
           u.insn(:jump, end_l)
         else
           here(u, n)
           u.insn(:pop)
+          if cbranches
+            branch_cov(u, cbranches, cloc, cloc[1], bid, :else)
+            here(u, n)
+          end
           u.insn(:putnil) unless popped
           u.insn(:jump, end_l)
         end
@@ -3064,8 +3107,24 @@ class RubyVM::InstructionSequence
       else_l = u.new_label
       end_l = nil
       branch_condition(u, n.predicate, then_l, else_l)
+      cov = branch_coverage?(u)
+      cloc = branches = nil
+      if then_l.refs > 0 && else_l.refs > 0 && cov
+        cloc = code_loc(n)
+        branches = branch_base(u, n, cloc, unless_ ? :unless : :if)
+      end
       if then_l.refs > 0
         u.emit_label(then_l)
+        if else_l.refs > 0 && cov
+          # (the part's own statements; an `if` without any, where its
+          #  condition ends; an `unless` without an else, the whole of it)
+          st = then_body.is_a?(Prism::ElseNode) ? then_body.statements : then_body
+          bloc = if st then code_loc(st)
+                 elsif !unless_ then (pl = n.predicate.location; [pl.end_line, pl.end_column, pl.end_line, pl.end_column])
+                 else cloc
+                 end
+          branch_cov(u, branches, bloc, bloc[1], 0, unless_ ? :else : :then)
+        end
         compile_part(u, then_body, popped, n)
         if else_l.refs > 0
           end_l = u.new_label
@@ -3076,9 +3135,61 @@ class RubyVM::InstructionSequence
       end
       if else_l.refs > 0
         u.emit_label(else_l)
+        if then_l.refs > 0 && cov
+          bloc = if else_body.nil? then cloc
+                 elsif else_body.is_a?(Prism::ElseNode) then code_loc(else_body.statements || else_body)
+                 else code_loc(else_body)
+                 end
+          branch_cov(u, branches, bloc, bloc[1], 1, unless_ ? :then : :else)
+        end
         compile_part(u, else_body, popped, n)
       end
       u.emit_label(end_l) if end_l
+    end
+
+    # -- branch coverage (compile.c's decl_branch_base and
+    # add_trace_branch_coverage; ruby compiles it in while Coverage counts
+    # branches, here under the :coverage_branches option) --------------------
+    def branch_coverage?(u) = u.opts[:coverage_branches] ? true : false
+
+    # pm_code_location: a node's [first line, first column, last line, last column]
+    def code_loc(n)
+      l = n.location
+      [l.start_line, l.start_column, l.end_line, l.end_column]
+    end
+
+    def cov_top(u)
+      u = u.parent while u.parent
+      u
+    end
+
+    # the branches of the construct `n` is: declared once a node
+    def branch_base(u, n, loc, type)
+      return nil unless loc[0] > 0
+      bases = (cov_top(u).cov_bases ||= {})
+      (bases[n.object_id] ||= [type, *loc, {}])[5]
+    end
+
+    # one branch taken: its counter's event, on a nop of its own at the
+    # branch's last line (the node id it is given is what ruby passes there)
+    def branch_cov(u, branches, loc, node_id, branch_id, type)
+      return unless branches && loc[0] > 0
+      top = cov_top(u)
+      b = (branches[branch_id] ||= begin
+        idx = top.cov_counters || 0
+        top.cov_counters = idx + 1
+        [type, *loc, idx]
+      end)
+      u.event([:coverage_branch, b[5]])
+      u.at(loc[2], node_id)
+      u.insn(:nop)
+    end
+
+    # what the file's branches are, in the order they were declared:
+    # [[type, line, column, line, column, [[type, line, column, line,
+    # column, counter], ...]], ...] -- Coverage's own structure
+    def branch_structure(u)
+      (cov_top(u).cov_bases || {}).values.map { |b| [*b[0, 5], b[5].values] }
     end
 
     def compile_part(u, part, popped, owner)
@@ -3177,6 +3288,12 @@ class RubyVM::InstructionSequence
       u.insn(:jump, next_l)
       u.emit_label(tmp_l) if tmp_l
       u.emit_label(redo_l)
+      if branch_coverage?(u)
+        lloc = code_loc(n)
+        lcov = branch_base(u, n, lloc, until_ ? :until : :while)
+        bloc = n.statements ? code_loc(n.statements) : lloc
+        branch_cov(u, lcov, bloc, bloc[1], 0, :body)
+      end
       u.loops.push([next_l, break_l, redo_l])
       u.ensures.push(:loop)
       node(u, n.statements, true) if n.statements
@@ -4343,7 +4460,9 @@ class RubyVM::InstructionSequence
         prev_line = e.line
         ev = e.events
         unless ev.empty?
-          s << "[" << EVENT_DISASM.select { |k, _| ev.include?(k) }.map(&:last).join << "]"
+          s << "[" << EVENT_DISASM.select { |k, _| ev.include?(k) }.map(&:last).join
+          s << "Cbr" if ev.any?(Array)
+          s << "]"
         end
         out << indent << s.rstrip << "\n"
         pos += 1 + e.ops.size
