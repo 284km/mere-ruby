@@ -4711,7 +4711,7 @@ on this from the next round.
 - **Not done here**: mkmf_suite_check (mkmf's 17 files on both sides) needs
   the reference's static libruby, which this machine's reference
   installation does not have; CI's unit test run measures test/mkmf on both
-  sides as before. Bracket depth is 890 of 1024 (873 on main): the probe's
+  sides as before. Bracket depth is 895 of 1024 (878 on main): the probe's
   tables are top-level values, and the next round replaces them.
 - **What CI and the review found** (PR #83):
   - Linux's corpus job failed on `corpus/403_bigdecimal.rb`. The prototype
@@ -4752,3 +4752,98 @@ on this from the next round.
     mkmf_check.py have only the contracts' library on the load path: with
     the standard library there, a refused require goes on through RubyGems'
     search, which is minutes at that load.
+
+## 2026-11-15 (56): rounds 34-37 -- the VM runs blocks, methods, classes, rescue / ensure, and fires events
+
+Rounds 34 to 37 of note 548 (the record from here on is note 552). corpus 658, 659.
+
+**In one line**: `RubyVM::InstructionSequence#eval` now runs on the VM a
+sequence that has blocks, defines methods and classes, calls super, and
+rescues, ensures and retries, with a TracePoint or Coverage on as well --
+230 snippets identical to ruby 4.0.9 with the VM forced
+(tools/iseq/vm_check.sh, was 61); the compiler is 413 / 413 against ruby
+(tools/iseq/compare_with_ruby.rb, was 383). What the VM cannot
+run it still refuses whole, before the first instruction, and the sequence
+runs on the evaluator.
+
+- **A sequence's parts are programs of their own, run in the evaluator's
+  frames.** A block's, a method's and a class body's sequence is decoded
+  once into a program (vm_code / vm_meta, m_state.mere), and the evaluator
+  is handed the SAME statements its parser would have made -- EMethodB /
+  ECallB with the block, SDef, SClass / SClassE / SSingletonE, ESuper,
+  SVis, SAlias, SUndef -- whose body is one statement, `SVm`, that runs the
+  program. So a block's frame and arity, break / next, a Proc made of it,
+  a method's key, visibility, method_added, `super`, reopening a class are
+  the evaluator's, once; only what the body does is the VM's. Parameters
+  are bound by the evaluator from the sequence's own table (vm_params); an
+  optional parameter that was not given is bound to a marker (EVmArg) and
+  the sequence's own default code runs, entered at the label for how many
+  were given.
+- **rescue / ensure are the evaluator's begin, given functions.** run_begin
+  is now a wrapper over run_begin_f, which takes the body, the rescue
+  clauses, the else and the ensure as functions. The VM hands it a catch
+  table entry's protected instructions and its rescue / ensure sequence
+  (vm_region), so `$!`, retry, an ensure's own escape and what a pending
+  exception means are one implementation. A break / next / redo / return
+  thrown out of a rescue or ensure sequence travels as a flow signal, so
+  the ensures between it and where it lands run (vm_jump, vm_seg).
+- **The compiler** (lib/iseq_compiler_ext.rb): `it` and `_1`.. blocks, redo,
+  return with several values, and an ensure clause inlined where a return /
+  break / next / redo leaves its region (pm_add_ensure_iseq, its region cut
+  around the copy; thrown instead under a rescue's body:
+  can_add_ensure_iseq). `to_a(u, true)` is the VM's export: ruby's Array
+  plus what ruby's leaves out that a run needs (a for loop's parameter,
+  `**nil`).
+- **Found on the way, in the evaluator**: a `def initialize` run as a
+  statement (an eval'd body, under an `if` in a class body) was public --
+  ruby keeps initialize, initialize_copy / _clone / _dup and
+  respond_to_missing? private wherever the def runs.
+- **Programs are given back, by who can still run them** (the review of
+  #85). The programs of one loaded Array are a tree. A tree is freed when no
+  frame runs a program of it, no Proc was made in such a frame and no
+  method's body is one of its programs: a top, method or class body frame
+  carries the tree's id (the env's `__vm~p`; a block's env chains to the
+  frame it was written in), marking an env that carries one marks the tree,
+  the method table is read for bodies that are programs, and what nothing
+  named in a collection is freed after its marking (m_state's vm_sweep).
+  A body a Method or UnboundMethod object still holds after its name was
+  defined again or removed is read too (the evaluator's snapshot table,
+  snap_meths, and a box's own methods, bx_meth): `saved =
+  Object.instance_method(:m)`, a second `def m`, two GC.start, and
+  `saved.bind(o).call` raised "no longer loaded" (the second review of #85).
+  Those two tables keep a body for as long as they keep the entry, so its
+  tree stays that long.
+  ISeq#eval frees its tree at once unless a Proc took the frame or a def of
+  it actually ran. Counted with `RubyVM::InstructionSequence.__vm_trees`:
+  100 evals of a sequence whose def is never taken hold 0 trees, of one
+  that redefines a method 1; trees a dead Proc held go as the collector
+  stops reaching the Proc (about 50 linger whether 400 or 6,000 were made).
+- **The VM's own names cannot be Ruby's** (the same review): the hidden
+  locals and the helper bindings carry a `~` (`__vm~r`, `__vm~0`,
+  `__vh~1_3`), which no source spells -- `__vmr = 1; [1].map { __vmr }` read
+  the call's receiver -- and Proc#parameters hides only those.
+- **Events (round 37).** A sequence is no longer refused while a TracePoint
+  or Coverage is on. A line event on an instruction is Coverage's count and
+  the TracePoint's :line, a rescue clause's first instruction its :rescue;
+  :call / :return, :b_call / :b_return, :class / :end and :c_call /
+  :c_return come from the evaluator's frames and sends as before, at the
+  lines ruby has them (a def's and a class's `end`, a block's opening line
+  and file, a rescue clause's `===`). A sequence loaded while Coverage is
+  set up is covered as ruby covers it: its lines are noted from its line
+  events. Witness 659: all eleven event kinds in ruby's order.
+  ⚠ Branch coverage is still not counted anywhere (test_coverage's 10), and
+  a covered sequence's methods are reported only when its path is a file.
+- **Still refused** (the sequence runs on the evaluator): `...`, binding /
+  eval / local_variables called bare, class variables and pattern matching
+  (the compiler), a String literal that is not UTF-8.
+- **CRuby's tests, locally against the baseline run 43548292351**:
+  ruby/test_iseq 39 -> 42, ruby/test_ractor 16 -> 17, and the same counts
+  for test_compile_prism (182), test_optimization (82), test_settracefunc
+  (97), coverage/test_coverage (34), test_syntax, test_proc, test_method,
+  test_exception, test_eval.
+- **Speed, measured, not yet worked on** (local, -O2, the same program on
+  the evaluator and on the VM): a method-call mix 1.0 s / 1.8 s, a block
+  mix 1.3 s / 2.3 s, a 3M-turn integer loop 1.7 s / 4.5 s. The compiler in
+  Ruby takes 2.1 s for pp.rb's 738 lines: before whole files run on the VM
+  it has to be native (note 552).
+- Next: whole files on the VM (the compiler made native first), then speed.
