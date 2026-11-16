@@ -5048,7 +5048,7 @@ CLOCK_PROCESS_CPUTIME_ID with the standard C clock fallback; it is a new
 function, separate from the stat/utime functions in the concurrent C API work.
 No top-level value or collector-body change is introduced.
 
-Witness 671 spends CPU before enabling, checks clear and re-enable, and checks
+Witness 673 spends CPU before enabling, checks clear and re-enable, and checks
 that sleep does not advance the CPU timeline as wall time would. Ruby passes;
 the old build fails at the delayed-enable assertion; the corrected build
 passes. The C clock glue also passes strict compiler warnings.

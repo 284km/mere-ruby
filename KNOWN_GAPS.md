@@ -15,7 +15,7 @@ compaction operations raise NotImplementedError and respond_to? is false.
 `GC.config[:implementation]` is `mere-ruby`; the CRuby GC-library-name test
 is excluded instead of changing the reference's collector identity.
 Profiler records real process CPU durations around gc_collect_any, using a
-startup epoch that survives enable/disable/clear (review witness 671); latest_gc_info
+startup epoch that survives enable/disable/clear (review witness 673); latest_gc_info
 reports actual causes and weak-reference counts, without invented heap keys.
 
 The final classification gains 13 raw MATCH and separately records 57 exclusions.
