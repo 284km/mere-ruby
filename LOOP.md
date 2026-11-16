@@ -5058,3 +5058,47 @@ by construct and count by count, for a file the VM takes.
   the compiler 433 / 433 snippets, 671 / 671 compiled files and 19 / 19
   under branch coverage, corpus RESULT_EV on the evaluator and RESULT_VM
   on the VM, the gates. Witness 665.
+
+## 2026-11-16 (62): round 41 -- pattern matching, compiled and run on the VM
+
+**The point.** `case / in`, `expr => pattern` and `expr in pattern` were
+the largest thing the compiler refused: 11 corpus programs fell back to the
+evaluator for it, and two tests waited on it. The compiler now takes them
+as ruby's does and the VM runs the result.
+
+- **The compiler** is prism_compile.c's pm_compile_pattern, ported: array,
+  find and hash patterns (the constant they may be under, #deconstruct with
+  its cache, #deconstruct_keys with the keys it is asked for), captures,
+  alternatives, pins, guards, values by `===`; the stack as the scratch
+  space, with the slots a single pattern keeps for its error (the string,
+  whether it is a key error, that error's matchee and key); the error
+  handler that raises NoMatchingPatternError / NoMatchingPatternKeyError.
+  Against ruby: 444 / 444 snippets, 22 / 22 under branch coverage (`in`
+  clauses are branches), and every corpus file that has a pattern.
+- **Whole files, again** (compare_files: 693 files, 683 the same, 10
+  refused, 0 different -- it was 672 / 21): a Range nobody reads is what
+  its bounds do, with no newrange; `nil&.m(args)` is the receiver's nil and
+  none of the rest; #to_a says an instruction's events once an
+  instruction-info entry (a second `leave` after the first repeats none).
+- **The VM**: checktype (what a #deconstruct answered), the two calls a
+  failed pattern makes on the VM's own object (core#sprintf, core#raise --
+  the frame's format and raise), pushtoarraykwsplat (`return 1, **h`).
+- **Found on the way**:
+  - `raise Cls, obj` with a message that is no String says the object's own
+    #to_s -- "3", "sym", an object's -- where it said the class's name
+    (the evaluator's; a multi-clause `case / in` raises exactly that).
+  - #deconstruct / #deconstruct_keys of the wrong type: ruby 4.0's
+    "deconstruct must return Array", without the class before it.
+  - a NameError raised by a send on the VM lists the locals its frame's
+    program declares, assigned yet or not, as the evaluator's assignment
+    does (`g = no_such` in a block has g): the VM keeps which program is
+    running (vm_cur).
+  - `defined?(name)` of a private method a refinement in use gives, in an
+    instance_eval'd block: asked as the bare name the parser reads it as.
+- **Still refused by the compiler**, of the corpus: flip-flops 3, a `for`
+  over a target that is not a local 3, `/o` 2, END 1, a
+  shareable_constant_value write 1.
+- **Checked** (local, the commit before this note): vm_check 243 / 243,
+  the compiler 444 / 444 snippets, 683 / 683 compiled files, 22 / 22 under
+  branch coverage, corpus RESULT_EV on the evaluator and RESULT_VM on the
+  VM, the gates. Witness 666.
