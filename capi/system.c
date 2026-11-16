@@ -242,13 +242,16 @@ VALUE rb_stat_new(const struct stat *st) {
     VALUE btime = INT2FIX(0);
 # endif
 #endif
-    VALUE fields = rb_ary_new_from_args(14,
+    struct timespec a = MR_ST_TIME(st, a), m = MR_ST_TIME(st, m), c = MR_ST_TIME(st, c);
+    /* (the fields in File.__stat_fields' order: the times' seconds, and their
+     *  nanoseconds after the 13; then the birth time) */
+    VALUE fields = rb_ary_new_from_args(17,
         dev, ULL2NUM((unsigned long long)st->st_ino), UINT2NUM((unsigned int)st->st_mode),
         ULL2NUM((unsigned long long)st->st_nlink), UINT2NUM((unsigned int)st->st_uid), UINT2NUM((unsigned int)st->st_gid),
-        rdev, LL2NUM((long long)st->st_size), stat_time(MR_ST_TIME(st, a)),
-        stat_time(MR_ST_TIME(st, m)), stat_time(MR_ST_TIME(st, c)), blksize,
-        LL2NUM((long long)st->st_blocks), btime);
-    return mr_call(mr_ruby("->(f) { s = File::Stat.allocate; h = File::Stat.__fields(f, nil, true); h[:btime] = f[13]; "
+        rdev, LL2NUM((long long)st->st_size), LL2NUM((long long)a.tv_sec),
+        LL2NUM((long long)m.tv_sec), LL2NUM((long long)c.tv_sec), blksize,
+        LL2NUM((long long)st->st_blocks), LONG2NUM(a.tv_nsec), LONG2NUM(m.tv_nsec), LONG2NUM(c.tv_nsec), btime);
+    return mr_call(mr_ruby("->(f) { s = File::Stat.allocate; h = File::Stat.__fields(f, nil, true); h[:btime] = f[16]; "
                            "s.instance_variable_set(:@h, h); s }"), "call", 1, fields);
 }
 VALUE rb_io_binmode(VALUE io) { return mr_call(io, "binmode", 0); }

@@ -5015,11 +5015,21 @@ reproduced by the same C on both rubies, each with contracts now):
   now, and the birth time is kept; File::Stat#<=> compares the Times, not
   their seconds. (On Linux ruby keeps a statx and copies neither the device
   numbers, the block size nor a birth time from a struct stat: those read 0
-  there and #birthtime is NotImplementedError, on both sides.) NOT the
-  same: this interpreter's own `File.stat` has whole seconds (Mere's
-  `file_stat_field` gives no more), so a C-made snapshot of a file with
-  sub-second times and `File.stat` of the same file are not `==` here
-  where they are in ruby. That is File.stat's, and needs Mere.
+  there and #birthtime is NotImplementedError, on both sides.) That made
+  `-ext-/file/test_stat.rb` 0 again: it compares the C-made snapshot with
+  `File.stat` of the same file, and this interpreter's own File.stat had
+  whole seconds (Mere's `file_stat_field` gives no more). File.stat and
+  File#stat now have the nanoseconds too, read by `mr_stat_times`
+  (tools/process_glue.c) from one stat call that also gives the seconds,
+  so `File.mtime` and the rest are exact as in ruby. With the times exact,
+  `File.utime` / `File.lutime` had to be too: utime(2) took whole seconds,
+  and lutime ran `touch -h` in a shell. Both are utimensat(2) now
+  (`mr_utimens`, the same glue), to the nanosecond and with no shell; the
+  old ways stay where a target refuses the call. (On this machine a
+  freshly written file's atime is moved a few ms later by something
+  outside the process -- ruby sees it as well. `test_lutime` in
+  pathname, which reads the atime right after writing, then passes or not
+  by how fast the steps between are: ruby's pass, ours sometimes do not.)
 - The regexp parse depth was one level too lenient: Onigmo counts the
   pattern itself (its outermost parse_subexp) as the first level, so at
   limit 1 `/(a)/` and `/[a]/` are refused. Counted the same way now, with

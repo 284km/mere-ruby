@@ -207,10 +207,8 @@ check([st.size, st.ino, st.mode, st.nlink, st.uid, st.gid] == [own.size, own.ino
 #  the device numbers and the block size out: they read 0)
 linux = RUBY_PLATFORM.include?('linux')
 check([st.dev, st.rdev, st.blksize] == (linux ? [0, 0, 0] : [own.dev, own.rdev, own.blksize]))
-# (to the second: this interpreter's own File.stat has whole seconds -- the
-#  stat calls it is built on give no more -- where ruby's has nanoseconds;
-#  the nanoseconds of rb_stat_new are the contracts below)
-check(st.file? && !st.directory? && st.mtime.to_i == own.mtime.to_i)
+check(st.file? && !st.directory? && st.mtime == own.mtime && st.atime == own.atime && st.ctime == own.ctime)
+check((st <=> own) == 0 && st == own)
 check(A.stat_new(__dir__).directory?)
 check(raises(Errno::ENOENT) { A.stat_new(__FILE__ + '.absent') }.is_a?(SystemCallError))
 # the struct's times to the nanosecond, and on macOS its birth time
