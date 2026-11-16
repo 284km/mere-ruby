@@ -7,37 +7,45 @@
 #include "ruby/util.h"
 #include <errno.h>
 #include <limits.h>
+#include <string.h>
 
-/* ---- object.c's convert_type ---------------------------------------------- */
-static const char *special_name(VALUE val) {
-    if (NIL_P(val)) return "nil";
-    if (val == Qtrue) return "true";
-    if (val == Qfalse) return "false";
-    return NULL;
+/* ---- object.c's convert_type ----------------------------------------------
+ * As in 4.0: the seven conversions ruby makes on its own (to_int, to_ary,
+ * to_str, to_sym, to_hash, to_proc, to_io) are refused as "no implicit
+ * conversion of X into T", any other as "can't convert X into T"; a method
+ * that answers the wrong type is "can't convert X to T (X#m gives Y)". */
+static int implicit_conversion(const char *method) {
+    static const char *const names[] = { "to_int", "to_ary", "to_str", "to_sym", "to_hash", "to_proc", "to_io" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (!strcmp(names[i], method)) return 1;
+    return 0;
+}
+static VALUE convert_by(VALUE val, const char *tname, const char *method, int raise) {
+    VALUE r = rb_check_funcall(val, rb_intern(method), 0, 0);
+    if (r != Qundef) return r;
+    if (!raise) return Qnil;
+    const char *msg = implicit_conversion(method) ? "no implicit conversion of" : "can't convert";
+    const char *cname = NIL_P(val) ? "nil" : val == Qtrue ? "true" : val == Qfalse ? "false" : NULL;
+    if (cname) rb_raise(rb_eTypeError, "%s %s into %s", msg, cname, tname);
+    rb_raise(rb_eTypeError, "%s %" PRIsVALUE " into %s", msg, rb_obj_class(val), tname);
 }
 NORETURN(static void conversion_mismatch(VALUE val, const char *tname, const char *method, VALUE result));
 static void conversion_mismatch(VALUE val, const char *tname, const char *method, VALUE result) {
-    const char *name = special_name(val);
-    if (name) rb_raise(rb_eTypeError, "can't convert %s to %s (%s#%s gives %s)", name, tname, name, method, rb_obj_classname(result));
-    rb_raise(rb_eTypeError, "can't convert %s to %s (%s#%s gives %s)", rb_obj_classname(val), tname, rb_obj_classname(val),
-             method, rb_obj_classname(result));
+    VALUE cname = rb_obj_class(val);
+    rb_raise(rb_eTypeError, "can't convert %" PRIsVALUE " to %s (%" PRIsVALUE "#%s gives %" PRIsVALUE ")",
+             cname, tname, cname, method, rb_obj_class(result));
 }
 VALUE rb_convert_type(VALUE val, int type, const char *tname, const char *method) {
     if (TYPE(val) == type) return val;
-    VALUE v = rb_check_funcall(val, rb_intern(method), 0, 0);
-    if (v == Qundef) {
-        const char *name = special_name(val);
-        if (name) rb_raise(rb_eTypeError, "can't convert %s into %s", name, tname);
-        rb_raise(rb_eTypeError, "can't convert %s into %s", rb_obj_classname(val), tname);
-    }
+    VALUE v = convert_by(val, tname, method, 1);
     if (TYPE(v) != type) conversion_mismatch(val, tname, method, v);
     return v;
 }
 VALUE rb_check_convert_type(VALUE val, int type, const char *tname, const char *method) {
     /* always convert T_DATA */
     if (TYPE(val) == type && type != T_DATA) return val;
-    VALUE v = rb_check_funcall(val, rb_intern(method), 0, 0);
-    if (v == Qundef || NIL_P(v)) return Qnil;
+    VALUE v = convert_by(val, tname, method, 0);
+    if (NIL_P(v)) return Qnil;
     if (TYPE(v) != type) conversion_mismatch(val, tname, method, v);
     return v;
 }
@@ -72,17 +80,11 @@ void rb_copy_generic_ivar(VALUE clone, VALUE obj) {
 }
 
 /* ---- the last match and the last line, of the Ruby frame that called C --------- */
-VALUE rb_backref_get(void) { return rb_eval_string("$~"); }
-void rb_backref_set(VALUE match) {
-    rb_gv_set("$__mere_capi_carry", match);
-    rb_eval_string("$~ = $__mere_capi_carry");
-    rb_gv_set("$__mere_capi_carry", Qnil);
-}
-void rb_lastline_set(VALUE line) {
-    rb_gv_set("$__mere_capi_carry", line);
-    rb_eval_string("$_ = $__mere_capi_carry");
-    rb_gv_set("$__mere_capi_carry", Qnil);
-}
+/* (`$~` is kept per method frame, and a C method has a frame of its own:
+ *  what C reads and writes is the one of the Ruby frame that called it) */
+VALUE rb_backref_get(void) { return mr_up(MR_BACKREF, 0, 0, 0, 0, 0); }
+void rb_backref_set(VALUE match) { mr_up(MR_BACKREF, 1, match, 0, 0, 0); }
+void rb_lastline_set(VALUE line) { rb_gv_set("$_", line); }
 /* (ruby marks a match "busy" so that the next match does not reuse its
  *  object; a match here is never reused) */
 void rb_match_busy(VALUE match) { (void)match; }

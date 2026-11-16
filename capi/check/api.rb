@@ -131,4 +131,49 @@ pr = A.new_proc
 check(pr.lambda? == false)
 check(pr.call(5, 6) == [5, 2, :data])
 check([[1, 2]].map(&pr) == [[[1, 2], 1, :data]])
+# What real gems asked for. A conversion by method name, and its three
+# refusals; equal bytes hash equally; every instance variable is visited; the
+# last match is the calling frame's; digits of a base; the struct behind an IO.
+class ToHash
+  def initialize(v) = @v = v
+  def to_hash = @v
+end
+check(A.convert({ a: 1 }, false) == { a: 1 })
+check(A.convert(ToHash.new({ b: 2 }), false) == { b: 2 })
+check(raises(TypeError) { A.convert(3, false) }.message == 'no implicit conversion of Integer into Hash')
+check(raises(TypeError) { A.convert(nil, false) }.message == 'no implicit conversion of nil into Hash')
+check(raises(TypeError) { A.convert(ToHash.new(5), false) }.message == "can't convert ToHash to Hash (ToHash#to_hash gives Integer)")
+check(A.convert(3, true).nil?)
+check(A.convert(ToHash.new(nil), true).nil?)
+check(A.convert(ToHash.new({ c: 3 }), true) == { c: 3 })
+check(raises(TypeError) { A.convert(ToHash.new(5), true) }.message == "can't convert ToHash to Hash (ToHash#to_hash gives Integer)")
+check(A.memhash_equal('same bytes', +'same bytes') == true)
+check(A.memhash_equal('same bytes', 'other') == false)
+holder = Object.new
+holder.instance_variable_set(:@one, 1)
+holder.instance_variable_set(:@two, [2])
+check(A.ivars(holder) == [[:@one, 1], [:@two, [2]]])
+check(A.ivars(Object.new) == [])
+def matched
+  'key=value' =~ /(\w+)=(\w+)/
+  [A.last_match(0), A.last_match(2), A.last_match(5)]
+end
+check(matched == ['key=value', 'value', nil])
+def carried(m)
+  A.set_match(m)
+  [$~.equal?(m), $1]
+end
+check(carried(/(b)/.match('abc')) == [true, 'b'])
+check(A.strtoul('  0x1fz', 0) == [31, 6])
+check(A.strtoul('-12', 10) == [2**64 - 12, 3])
+check(A.strtoul('777', 8) == [511, 3])
+File.open(__FILE__) do |f|
+  check(A.io_facts(f) == [1, true, false])
+end
+rd, wr = IO.pipe
+check(A.io_facts(rd) == [1, true, false])
+check(raises(IOError) { A.io_facts(wr) }.message == 'not opened for reading')
+rd.close
+check(raises(IOError) { A.io_facts(rd) }.message == 'closed stream')
+wr.close
 puts "api contracts: #{$count} passed"

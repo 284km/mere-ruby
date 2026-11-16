@@ -5163,7 +5163,12 @@ descriptor, how it was opened, the path), and `rb_io_check_closed`,
 `rb_io_check_readable` / `writable`, `rb_io_set_nonblock`,
 `rb_io_taint_check` take it. With those, oj, date's and json's extensions
 load and answer, and nio4r's selector (libev) behaves as on the reference;
-bcrypt and nio4r joined capi_gem_check.py (seven gems, 84 lines). Still
+bcrypt and nio4r joined capi_gem_check.py (seven gems, 84 lines), and
+each of these functions has contracts in capi/check/api.rb (65 on both
+sides now). Writing those against the reference corrected two of them
+before they shipped: the refusal of an implicit conversion reads "no
+implicit conversion of X into T" in 4.0, and `$~` read from C is the
+calling Ruby frame's, which is parked while the C method's frame runs. Still
 out: strscan (written against Onigmo's own structs: its substitute for
 `rb_reg_onig_match` collides with the header's declaration) and stringio
 (`rb_io_extract_modeenc`, Onigmo's `onigenc_get_right_adjust_char_head`);

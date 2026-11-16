@@ -58,7 +58,8 @@ enum mr_op {
     MR_SYMBOL,          /* bytes: a name with bytes text cannot carry -> Symbol (its ID) */
     MR_GC,              /* a: 0 collect, 1 stress on, 2 stress off, 3 enable, 4 disable, 5 count */
     MR_ARY_NEW,         /* a: length; words: elements -> Array */
-    MR_BREAK            /* a: value -- `break value` from the block this C was called in */
+    MR_BREAK,            /* a: value -- `break value` from the block this C was called in */
+    MR_BACKREF          /* a: 0 read, 1 write (b: the MatchData or nil) -- `$~` of the Ruby frame that called C */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
     /* (16: the receiver is the current one)

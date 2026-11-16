@@ -49,6 +49,45 @@ static VALUE proc_body(RB_BLOCK_CALL_FUNC_ARGLIST(yielded, data)) {
 }
 static VALUE new_proc(VALUE self) { (void)self; return rb_proc_new(proc_body, ID2SYM(rb_intern("data"))); }
 
+/* What real gems asked for (capi/needed.c). */
+static VALUE convert(VALUE self, VALUE val, VALUE check) {
+    (void)self;
+    return RTEST(check) ? rb_check_convert_type(val, T_HASH, "Hash", "to_hash") : rb_convert_type(val, T_HASH, "Hash", "to_hash");
+}
+static VALUE memhash_equal(VALUE self, VALUE a, VALUE b) {
+    (void)self;
+    return rb_memhash(RSTRING_PTR(a), RSTRING_LEN(a)) == rb_memhash(RSTRING_PTR(b), RSTRING_LEN(b)) ? Qtrue : Qfalse;
+}
+static int each_ivar(ID name, VALUE value, st_data_t arg) {
+    rb_ary_push((VALUE)arg, rb_assoc_new(ID2SYM(name), value));
+    return ST_CONTINUE;
+}
+static VALUE ivars(VALUE self, VALUE obj) {
+    VALUE pairs = rb_ary_new();
+    (void)self;
+    rb_ivar_foreach(obj, each_ivar, (st_data_t)pairs);
+    return pairs;
+}
+static VALUE last_match(VALUE self, VALUE nth) { (void)self; return rb_reg_nth_match(NUM2INT(nth), rb_backref_get()); }
+static VALUE set_match(VALUE self, VALUE match) { (void)self; rb_backref_set(match); return Qnil; }
+static VALUE strtoul_of(VALUE self, VALUE str, VALUE base) {
+    char *end;
+    const char *s = StringValueCStr(str);
+    (void)self;
+    unsigned long n = ruby_strtoul(s, &end, NUM2INT(base));
+    return rb_ary_new_from_args(2, ULONG2NUM(n), LONG2NUM(end - s));
+}
+#include <ruby/io.h>
+#include <ruby/util.h>
+static VALUE io_facts(VALUE self, VALUE io) {
+    rb_io_t *fptr;
+    (void)self;
+    RB_IO_POINTER(io, fptr);
+    rb_io_check_readable(fptr);
+    return rb_ary_new_from_args(3, INT2FIX(fptr->fd == rb_io_descriptor(io)), (fptr->mode & FMODE_READABLE) ? Qtrue : Qfalse,
+                                (fptr->mode & FMODE_WRITABLE) ? Qtrue : Qfalse);
+}
+
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
     rb_define_singleton_method(mod, "ptr_after_yield", ptr_after_yield, 1);
@@ -62,6 +101,13 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "kind_of", kind_of, 2);
     rb_define_singleton_method(mod, "kwargs", kwargs, 4);
     rb_define_singleton_method(mod, "new_proc", new_proc, 0);
+    rb_define_singleton_method(mod, "convert", convert, 2);
+    rb_define_singleton_method(mod, "memhash_equal", memhash_equal, 2);
+    rb_define_singleton_method(mod, "ivars", ivars, 1);
+    rb_define_singleton_method(mod, "last_match", last_match, 1);
+    rb_define_singleton_method(mod, "set_match", set_match, 1);
+    rb_define_singleton_method(mod, "strtoul", strtoul_of, 2);
+    rb_define_singleton_method(mod, "io_facts", io_facts, 1);
     /* classes under a module under a module, all of them made here: a class
      * C defines is a class by that name like any other */
     VALUE mid = rb_define_module_under(mod, "Mid");
