@@ -5045,7 +5045,7 @@ The store count is the last sweep's survivor count plus handles issued since
 its sweep boundary. Empty strings count, reclaimed slots do not, and TOTAL
 includes the same live Strings. No collector function or m_state.mere changed.
 
-Witness 672 checks empty/live/reclaimed Strings, hash reuse, zeroed old keys
+Witness 674 checks empty/live/reclaimed Strings, hash reuse, zeroed old keys
 and the total's arithmetic. It fails on PR #91's old binary (missing T_STRING)
 and agrees with Ruby after this fix. Core test_objectspace remains 37/37;
 objspace stays MATCH 38 and string_memory stays MATCH 2. The original 159-case
