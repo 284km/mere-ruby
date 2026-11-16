@@ -236,6 +236,69 @@ check(raises(IOError) { A.io_facts(wr) }.message == 'not opened for reading')
 rd.close
 check(raises(IOError) { A.io_facts(rd) }.message == 'closed stream')
 wr.close
+# An IO's struct says the directions of THAT IO, not of its descriptor: a
+# read-only wrapper on a descriptor opened for both is read-only to C too.
+# (a file of its own, not Tempfile: loading tempfile under a collection at
+#  every safepoint takes minutes)
+path = File.join(ENV.fetch('TMPDIR', '/tmp'), "capi-io-#{Process.pid}")
+begin
+  both = File.open(path, 'w+')
+  ro = IO.for_fd(both.fileno, 'r', autoclose: false)
+  wo = IO.for_fd(both.fileno, 'w', autoclose: false)
+  check(A.io_mode(both) == [true, true, false])
+  check(A.io_mode(ro) == [true, false, false])
+  check(A.io_mode(wo) == [false, true, false])
+  check(raises(IOError) { A.io_check_writable(ro) }.message == 'not opened for writing')
+  check(A.io_check_writable(wo) == true)
+  File.open(path, 'a') { |app| check(A.io_mode(app) == [false, true, true]) }
+  both.close
+  # FMODE_EXTERNAL: the descriptor stays C's
+  fd = IO.sysopen(path)
+  ext = A.open_descriptor(fd, true)
+  check(ext.autoclose? == false)
+  ext.close
+  check(IO.for_fd(fd, autoclose: false).fileno == fd)
+  own = A.open_descriptor(fd, false)
+  check(own.autoclose? == true)
+  own.close
+ensure
+  File.delete(path) if File.exist?(path)
+end
+check(A.io_mode($stdin)[0..1] == [true, false] && A.io_mode($stdout)[0..1] == [false, true])
+
+# A global C keeps, defined under a name aliased before: both names are the
+# variable C holds.
+alias $capi_dest $capi_src
+A.keep_variable('$capi_dest')
+A.kept_set(5)
+check($capi_dest == 5 && $capi_src == 5)
+$capi_src = 7
+check(A.kept_get == 7 && $capi_dest == 7)
+$capi_dest = 8
+check(A.kept_get == 8 && $capi_src == 8)
+A.keep_variable('$capi_plain')
+$capi_plain = :p
+check(A.kept_get == :p)
+
+# The Set functions are set.c's operations: an override of the Ruby
+# interface -- in a singleton or a subclass -- does not change them.
+s = Set[1]
+class << s
+  %i[add? add include? delete? delete size each to_a clear].each do |m|
+    define_method(m) { |*| raise "#{m} intercepted" }
+  end
+end
+check(A.set_ops(s) == [true, false, true, false, 2, true, false, [2]])
+check(A.set_clear(s) == 0)
+class SubSet < Set
+  def add?(*) = raise('intercepted')
+  def include?(*) = raise('intercepted')
+end
+sub = SubSet[1]
+check(A.set_ops(sub) == [true, false, true, false, 2, true, false, [2]])
+check(A.set_ops(Set[1]) == [true, false, true, false, 2, true, false, [2]])
+frozen = Set[1].freeze
+check(raises(FrozenError) { A.set_add(frozen, 3) }.message.start_with?("can't modify frozen Set"))
 
 # A block function C passed is told whether it was yielded keywords, and
 # rb_yield_block hands them to the C method's block as keywords.

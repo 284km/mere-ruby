@@ -288,13 +288,41 @@ VALUE rb_reg_regcomp(VALUE str) { return rb_funcall(rb_cRegexp, rb_intern("new")
 /* ---- Set (the C API 4.0 added) ----------------------------------------------------------- */
 VALUE rb_set_new(void) { return rb_funcall(mr_const("Set"), rb_intern("new"), 0); }
 VALUE rb_set_new_capa(size_t capa) { (void)capa; return rb_set_new(); }
-bool rb_set_add(VALUE set, VALUE element) { return RTEST(rb_funcall(set, rb_intern("add?"), 1, element)); }
-bool rb_set_delete(VALUE set, VALUE element) { return RTEST(rb_funcall(set, rb_intern("delete?"), 1, element)); }
-bool rb_set_lookup(VALUE set, VALUE element) { return RTEST(rb_funcall(set, rb_intern("include?"), 1, element)); }
-VALUE rb_set_clear(VALUE set) { return rb_funcall(set, rb_intern("clear"), 0); }
-size_t rb_set_size(VALUE set) { return NUM2SIZET(rb_funcall(set, rb_intern("size"), 0)); }
+/* What set.c does to a Set's table, without asking the Set: an override of
+ * add?, include?, delete?, size, each or to_a -- in a subclass or a
+ * singleton -- does not change what C adds, finds, removes, counts or walks.
+ * A Set here is its table, the Hash in @hash (the interpreter's set.rb), and
+ * the Hash functions are the C API's own (Hash's operations, not its
+ * overrides). A frozen Set refuses as ruby's does. */
+static VALUE set_table(VALUE set) {
+    VALUE table = rb_ivar_get(set, rb_intern("@hash"));
+    if (!RB_TYPE_P(table, T_HASH))
+        rb_raise(rb_eTypeError, "wrong argument type %" PRIsVALUE " (expected Set)", rb_obj_class(set));
+    return table;
+}
+bool rb_set_lookup(VALUE set, VALUE element) { return rb_hash_lookup2(set_table(set), element, Qundef) != Qundef; }
+bool rb_set_add(VALUE set, VALUE element) {
+    rb_check_frozen(set);
+    VALUE table = set_table(set);
+    if (rb_hash_lookup2(table, element, Qundef) != Qundef) return false;
+    rb_hash_aset(table, element, Qtrue);
+    return true;
+}
+bool rb_set_delete(VALUE set, VALUE element) {
+    rb_check_frozen(set);
+    VALUE table = set_table(set);
+    if (rb_hash_lookup2(table, element, Qundef) == Qundef) return false;
+    rb_hash_delete(table, element);
+    return true;
+}
+VALUE rb_set_clear(VALUE set) {
+    rb_check_frozen(set);
+    rb_hash_clear(set_table(set));
+    return set;
+}
+size_t rb_set_size(VALUE set) { return rb_hash_size_num(set_table(set)); }
 void rb_set_foreach(VALUE set, int (*func)(VALUE element, VALUE arg), VALUE arg) {
-    VALUE elements = rb_funcall(set, rb_intern("to_a"), 0);
+    VALUE elements = mr_callh(set_table(set), "keys", 0);
     for (long i = 0; i < RARRAY_LEN(elements); i++)
         if (func(rb_ary_entry(elements, i), arg) == ST_STOP) break;
 }
@@ -342,7 +370,17 @@ VALUE rb_io_path(VALUE io) {
 VALUE rb_io_open_descriptor(VALUE klass, int descriptor, int mode, VALUE path, VALUE timeout, struct rb_io_encoding *encoding) {
     (void)path; (void)encoding;
     const char *how = (mode & FMODE_READWRITE) == FMODE_READWRITE ? "r+" : (mode & FMODE_WRITABLE) ? ((mode & FMODE_APPEND) ? "a" : "w") : "r";
-    VALUE io = rb_funcall(klass, rb_intern("for_fd"), 2, INT2NUM(descriptor), rb_str_new_cstr(how));
+    /* (FMODE_EXTERNAL: the descriptor stays the caller's -- the IO does not
+     *  close it, at #close or when it is collected) */
+    VALUE args[3] = { INT2NUM(descriptor), rb_str_new_cstr(how), Qnil };
+    int argc = 2, flags = 0;
+    if (mode & FMODE_EXTERNAL) {
+        args[2] = rb_hash_new();
+        rb_hash_aset(args[2], ID2SYM(rb_intern("autoclose")), Qfalse);
+        argc = 3;
+        flags = MR_SEND_KW;
+    }
+    VALUE io = mr_callv(klass, rb_intern("for_fd"), argc, args, Qnil, flags);
     if (mode & FMODE_BINMODE) rb_funcall(io, rb_intern("binmode"), 0);
     if (mode & FMODE_SYNC) rb_funcall(io, rb_intern("sync="), 1, Qtrue);
     if (!NIL_P(timeout)) rb_funcall(io, rb_intern("timeout="), 1, timeout);
@@ -516,12 +554,17 @@ static VALUE gvar_access(VALUE self, VALUE slot, VALUE write, VALUE value) {
     }
     rb_bug("a global variable C keeps has no record: %s", RSTRING_PTR(name));
 }
+/* The record is kept under the name the interpreter keeps the variable
+ * under, which it answers: for a name aliased before C defines it
+ * (`alias $dest $src`), the original's -- that is the name gvar_access is
+ * called with. */
 static void keep_global(const char *name, VALUE *data, rb_gvar_getter_t *getter, rb_gvar_setter_t *setter) {
     static long access = -1;
     if (access < 0) access = mr_register_function((void *)gvar_access, 3);
     const char *bare = name[0] == '$' ? name + 1 : name;
-    VALUE full = rb_str_plus(rb_str_new_cstr("$"), rb_str_new_cstr(bare));
-    ID id = rb_intern_str(full);
+    mr_put_text(bare);
+    VALUE slot = mr_up(MR_DEFINE_GVAR, (VALUE)access, 0, 0, 0, 0);
+    ID id = rb_intern_str(rb_str_plus(rb_str_new_cstr("$"), slot));
     for (long i = 0; i < kept_count; i++)
         if (kept_globals[i].id == id) { kept_globals[i] = (struct kept_global){ id, data, getter, setter }; return; }
     if (kept_count == kept_cap) {
@@ -530,8 +573,6 @@ static void keep_global(const char *name, VALUE *data, rb_gvar_getter_t *getter,
         if (!kept_globals) rb_memerror();
     }
     kept_globals[kept_count++] = (struct kept_global){ id, data, getter, setter };
-    mr_put_text(bare);
-    mr_up(MR_DEFINE_GVAR, (VALUE)access, 0, 0, 0, 0);
 }
 void rb_define_hooked_variable(const char *name, VALUE *var, rb_gvar_getter_t *getter, rb_gvar_setter_t *setter) {
     /* (the VALUE C holds in the variable lives as long as the process does) */

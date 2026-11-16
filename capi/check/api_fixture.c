@@ -102,6 +102,52 @@ static VALUE io_facts(VALUE self, VALUE io) {
     return rb_ary_new_from_args(3, INT2FIX(fptr->fd == rb_io_descriptor(io)), (fptr->mode & FMODE_READABLE) ? Qtrue : Qfalse,
                                 (fptr->mode & FMODE_WRITABLE) ? Qtrue : Qfalse);
 }
+/* The directions an IO's struct says, without a check in front. */
+static VALUE io_mode(VALUE self, VALUE io) {
+    rb_io_t *fptr;
+    (void)self;
+    RB_IO_POINTER(io, fptr);
+    return rb_ary_new_from_args(3, (fptr->mode & FMODE_READABLE) ? Qtrue : Qfalse, (fptr->mode & FMODE_WRITABLE) ? Qtrue : Qfalse,
+                                (fptr->mode & FMODE_APPEND) ? Qtrue : Qfalse);
+}
+static VALUE io_check_writable(VALUE self, VALUE io) {
+    rb_io_t *fptr;
+    (void)self;
+    RB_IO_POINTER(io, fptr);
+    rb_io_check_writable(fptr);
+    return Qtrue;
+}
+/* An IO on a descriptor C opened; FMODE_EXTERNAL keeps the descriptor C's. */
+static VALUE open_descriptor(VALUE self, VALUE fd, VALUE external) {
+    (void)self;
+    return rb_io_open_descriptor(rb_cIO, NUM2INT(fd), FMODE_READABLE | (RTEST(external) ? FMODE_EXTERNAL : 0), Qnil, Qnil, NULL);
+}
+/* A global C keeps, defined under a name Ruby may have aliased already. */
+static VALUE kept_value = Qnil;
+static VALUE keep_variable(VALUE self, VALUE name) {
+    (void)self;
+    rb_define_variable(StringValueCStr(name), &kept_value);
+    return Qnil;
+}
+static VALUE kept_get(VALUE self) { (void)self; return kept_value; }
+static VALUE kept_set(VALUE self, VALUE v) { (void)self; kept_value = v; return v; }
+/* The Set functions: what C adds, finds, removes, counts and walks. */
+static int set_collect(VALUE element, VALUE into) { rb_ary_push(into, element); return ST_CONTINUE; }
+static VALUE set_ops(VALUE self, VALUE set) {
+    (void)self;
+    VALUE walked = rb_ary_new();
+    VALUE added = rb_set_add(set, INT2FIX(2)) ? Qtrue : Qfalse;
+    VALUE again = rb_set_add(set, INT2FIX(2)) ? Qtrue : Qfalse;
+    VALUE found = rb_set_lookup(set, INT2FIX(2)) ? Qtrue : Qfalse;
+    VALUE missing = rb_set_lookup(set, INT2FIX(9)) ? Qtrue : Qfalse;
+    VALUE size = SIZET2NUM(rb_set_size(set));
+    VALUE removed = rb_set_delete(set, INT2FIX(1)) ? Qtrue : Qfalse;
+    VALUE absent = rb_set_delete(set, INT2FIX(1)) ? Qtrue : Qfalse;
+    rb_set_foreach(set, set_collect, walked);
+    return rb_ary_new_from_args(8, added, again, found, missing, size, removed, absent, walked);
+}
+static VALUE set_clear(VALUE self, VALUE set) { (void)self; rb_set_clear(set); return SIZET2NUM(rb_set_size(set)); }
+static VALUE set_add(VALUE self, VALUE set, VALUE v) { (void)self; return rb_set_add(set, v) ? Qtrue : Qfalse; }
 
 /* A block function is told whether it was yielded keywords, and
  * rb_yield_block hands them on as keywords. */
@@ -181,6 +227,15 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "set_match", set_match, 1);
     rb_define_singleton_method(mod, "strtoul", strtoul_of, 2);
     rb_define_singleton_method(mod, "io_facts", io_facts, 1);
+    rb_define_singleton_method(mod, "io_mode", io_mode, 1);
+    rb_define_singleton_method(mod, "io_check_writable", io_check_writable, 1);
+    rb_define_singleton_method(mod, "open_descriptor", open_descriptor, 2);
+    rb_define_singleton_method(mod, "keep_variable", keep_variable, 1);
+    rb_define_singleton_method(mod, "kept_get", kept_get, 0);
+    rb_define_singleton_method(mod, "kept_set", kept_set, 1);
+    rb_define_singleton_method(mod, "set_ops", set_ops, 1);
+    rb_define_singleton_method(mod, "set_clear", set_clear, 1);
+    rb_define_singleton_method(mod, "set_add", set_add, 2);
     rb_define_singleton_method(mod, "block_keywords", block_keywords, 2);
     rb_define_singleton_method(mod, "yield_through", yield_through, 2);
     rb_define_singleton_method(mod, "stat_new", stat_new, 1);

@@ -5414,6 +5414,29 @@ reference to its recorded count and mere-ruby to no less than its own.
   and digest_spec (no `ruby/digest.h`). The rest of the difference is
   examples, file by file, in the record.
 
+**What the review found** (PR #95; four, each reproduced by the same C on
+both rubies, each with contracts in `capi/check/api.rb` now -- 166 on both
+sides):
+
+- A global C keeps (`rb_define_variable`), defined under a name Ruby had
+  aliased already (`alias $dest $src`), aborted the first read with "[BUG]
+  a global variable C keeps has no record": the interpreter keeps the
+  variable under the alias's original and called C with that name, while C
+  had recorded the alias. The request that defines it answers the name it
+  is kept under, and C records that.
+- The struct behind an IO said the DESCRIPTOR's directions (F_GETFL): an
+  `IO.for_fd(fd, "r")` on a descriptor opened for both read as writable,
+  and `rb_io_check_writable` let C write through an IO Ruby holds
+  read-only. The directions are the IO's own now -- a File's mode, a
+  descriptor IO's two flags, or the standard stream it is; O_APPEND still
+  comes from the descriptor, whose property it is.
+- `rb_io_open_descriptor` dropped FMODE_EXTERNAL, so the IO owned (and
+  would close) a descriptor the caller keeps. It is `autoclose: false` now.
+- `rb_set_*` dispatched: a Set whose singleton or subclass overrides
+  `add?`, `include?`, `size`, ... changed what C added, found or walked.
+  They act on the Set's table with the Hash primitives now, as set.c does
+  on its own, and a frozen Set refuses with ruby's FrozenError.
+
 **Next**: the examples of `optional/capi` that differ, largest files first
 (string_spec, encoding_spec, class_spec, struct_spec, globals_spec's `$/`
 and `$stdin` as C variables that follow the interpreter's), and io_spec /

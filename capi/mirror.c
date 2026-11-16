@@ -309,13 +309,30 @@ void *rb_mere_file(VALUE obj) {
     if (RTEST(mr_call(obj, "closed?", 0))) f->fd = -1;
     else {
         f->fd = NUM2INT(mr_call(obj, "fileno", 0));
+        /* Which directions are this IO's own (bit 1 read, 2 write, 4 append),
+         * as the interpreter keeps them: a File's mode string, a descriptor
+         * IO's two flags, or the standard stream the descriptor is. Not the
+         * descriptor's F_GETFL: an IO.for_fd(fd, "r") on a descriptor opened
+         * for both is read-only to ruby. The descriptor still says O_APPEND,
+         * which is its own property. */
+        int own = NUM2INT(mr_call(mr_ruby(
+            "->(io) { m = io.instance_variable_get(:@__f_mode); "
+            "r = io.instance_variable_get(:@__io_r); w = io.instance_variable_get(:@__io_w); "
+            "if m.is_a?(String) && !m.empty? then a = m.split(':').first.to_s.delete('bt'); "
+            "(a.match?(/[r+]/) ? 1 : 0) | (a.match?(/[wa+]/) ? 2 : 0) | (a.include?('a') ? 4 : 0) "
+            "elsif !r.nil? || !w.nil? then (r ? 1 : 0) | (w ? 2 : 0) "
+            "else case io.fileno when 0 then 1 when 1, 2 then 2 else -1 end end }"), "call", 1, obj));
         int flags = fcntl(f->fd, F_GETFL);
-        if (flags != -1) {
+        if (own < 0 && flags != -1) {
             int access = flags & O_ACCMODE;
-            if (access == O_RDONLY || access == O_RDWR) mode |= FMODE_READABLE;
-            if (access == O_WRONLY || access == O_RDWR) mode |= FMODE_WRITABLE;
-            if (flags & O_APPEND) mode |= FMODE_APPEND;
+            own = (access == O_RDONLY || access == O_RDWR ? 1 : 0) | (access == O_WRONLY || access == O_RDWR ? 2 : 0);
         }
+        if (own > 0) {
+            if (own & 1) mode |= FMODE_READABLE;
+            if (own & 2) mode |= FMODE_WRITABLE;
+            if (own & 4) mode |= FMODE_APPEND;
+        }
+        if (flags != -1 && (flags & O_APPEND)) mode |= FMODE_APPEND;
         if (RTEST(mr_call(obj, "sync", 0))) mode |= FMODE_SYNC;
         if (RTEST(mr_call(obj, "binmode?", 0))) mode |= FMODE_BINMODE;
         if (isatty(f->fd)) mode |= FMODE_TTY;
