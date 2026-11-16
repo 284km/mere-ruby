@@ -4847,3 +4847,39 @@ runs on the evaluator.
   Ruby takes 2.1 s for pp.rb's 738 lines: before whole files run on the VM
   it has to be native (note 552).
 - Next: whole files on the VM (the compiler made native first), then speed.
+
+## 2026-11-16: stage 9 GC remainder, round 1 -- measured profiling and explicit exclusions
+
+Baseline: main c64d0ae4, successful CI run 43807166928. The six target files
+have 159 RED: allocation 76, objspace 35, gc 23, gc_compact 22, string_memory 3.
+The GC policy follows CRuby's alternate MMTk collector: actual measurements,
+NotImplementedError for unavailable operations, and a reasoned ledger for
+tests of the default collector. No slot or page constants are invented.
+
+- GC.auto_compact now raises like the other unavailable compaction methods;
+  respond_to? remains false. INTERNAL_CONSTANTS and stat_heap are empty,
+  and OPTS does not advertise generational collection.
+- gc_collect_any records actual collection durations for GC::Profiler and
+  the inspected/retained weak references for latest_gc_info. The profiler
+  reports measured per-run times and supports clear. No per-slot sizes are
+  fabricated. gc_fixpoint, gc_mark_roots and gc_collect are untouched, to
+  avoid overlapping PR #87. The allocation counter uses issued Proc handles,
+  rather than the shrinking live Proc table.
+- each_object snapshots String, Array and Hash stores, using real String
+  survivors and post-sweep allocations. count_objects keeps its separate
+  Array/Hash accounting, avoiding double counting.
+- The upstream EXCLUDES mechanism applies the same reasoned ledger to both
+  interpreters. Actual removed methods are audited and counted separately
+  in local STATUS.md/EXCLUSIONS.tsv and CI summary.json/files.tsv/exclusions.tsv.
+  The GC implementation-name comparison is excluded: the reference keeps
+  its own default collector, and Mere truthfully reports mere-ruby.
+- Local round 1: objspace MATCH 28 -> 29; gc 29 -> 32; string_memory 0 -> 2;
+  55 exclusions, identical per side. Compaction's unsupported-API checks stay
+  enabled (five EXTRA, one BOTH). Missing local -test-/stack makes two GC
+  finalizer tests BOTH locally; they are RED in CI and belong to PR #87.
+- Left: WeakMap's freed-object test retains 66 objects against a bound of
+  10, despite real counts; conservative roots are shared with PR #87. One
+  string_memory test sees interpreter parameter-name Strings on the first
+  call into each_object (VM allocation provenance). Neither is excluded.
+- Witness 667 checks actual profiling, latest info, unsupported compaction,
+  empty slot information and each_object over real value stores.

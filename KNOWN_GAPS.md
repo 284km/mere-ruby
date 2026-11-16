@@ -1,5 +1,29 @@
 # Known gaps
 
+## Stage 9: alternate collector policy and remaining GC observations
+
+Baseline main c64d0ae4, CI run 43807166928: 159 RED across allocation,
+objspace, gc, gc_compact and string_memory. `unittest/excludes-gc/` records
+individual default-GC slot/page/generation/compaction/internal-layout tests,
+with reasons. The upstream EXCLUDES mechanism removes the same methods
+from both interpreters, audits actual removals and reports exclusions apart
+from MATCH/RED. It does not exclude allocation comparisons.
+
+`GC::INTERNAL_CONSTANTS` and `GC.stat_heap` describe no RVALUE slot heap;
+they are empty. `GC::OPTS` advertises no generational GC. Unavailable
+compaction operations raise NotImplementedError and respond_to? is false.
+`GC.config[:implementation]` is `mere-ruby`; the CRuby GC-library-name test
+is excluded instead of changing the reference's collector identity.
+Profiler records real durations around gc_collect_any; latest_gc_info
+reports actual causes and weak-reference counts, without invented heap keys.
+
+The first local round gains six MATCH and separately records 55 exclusions.
+The WeakMap lifetime test still retains 66 objects against its bound of 10;
+conservative root ownership overlaps the native C API work in PR #87.
+String-memory's first call sees VM parameter-name Strings attributed to its
+caller. The allocation suite's 76 real comparisons remain VM work. These
+failures remain visible; none is excluded as default-GC behavior.
+
 Divergences from CRuby that are understood, reproduced, and deliberately
 not fixed yet — as opposed to the things nobody has looked at. Each entry
 says what it costs and what fixing it would take, so the decision can be

@@ -33,6 +33,28 @@ their dependencies and runtime behavior may require substantial work.
 
 ## Records and diagnostics
 
+`unittest/excludes-gc/` is the reasoned ledger for tests of the default
+CRuby collector's slots, pages, generations, compaction and internal heap
+representations. Both interpreters receive this absolute directory through
+the upstream runner's `EXCLUDES` setting (the same mechanism as
+`--excludes-dir` and CRuby's MMTk CI). Allocation comparisons remain enabled.
+`try.sh` uses the same ledger. Additional `EXCLUDES` directories are retained.
+
+The upstream `ExcludedMethods` still removes methods. An audit records the
+methods actually removed, with their reasons, and compares their identities
+between interpreters. Different lists fail collection. `run.sh` writes a
+separate exclusion count in `STATUS.md` and the entries in `EXCLUSIONS.tsv`;
+CI publishes `excluded_tests` in `summary.json`, an `excluded` column in
+`files.tsv`, a separate summary line and `exclusions.tsv`. Exclusions are
+never MATCH, RED, BOTH or EXTRA. A resource stop before discovery leaves an
+explicit incomplete exclusion audit instead of claiming no exclusions.
+
+`GC.config[:implementation]` remains `mere-ruby`. Its upstream test compares
+the name of the selected CRuby GC library and is excluded with that reason;
+`RUBY_GC_LIBRARY` is not forged on the reference process. Slot heap tests are
+excluded individually; generic argument checks, actual allocation tracing
+and GC::Profiler tests remain enabled. Passing MMTk exclusions are not copied.
+
 ```sh
 UNITTEST_RECORD_DIR=/path/to/run/records \
 UNITTEST_KEEP=/path/to/run/raw \
