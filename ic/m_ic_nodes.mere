@@ -197,7 +197,10 @@ let ic_array = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
      else
        (let _ = ic_here cx u n in
         if cnt == 0 then ic_in cx u "newarray" 0 else ic_i1 cx u "duparray" (OVal (ic_static_value cx n))))
-  else
+  else ic_array_core cx u n off cnt popped;
+// (the elements at `off`, of the node n -- an Array, or the arguments of a
+//  return / break / next, which are never one literal)
+let ic_array_core = fn cx -> fn (u: int) -> fn (n: int) -> fn (off: int) -> fn (cnt: int) -> fn (popped: bool) ->
     (let container = fn (e: int) -> (let t = ic_ty cx e in t == pt_array () || t == pt_hash () || t == pt_range ()) in
      // (the elements not yet in the array, and whether there is one yet)
      let flush = fn (size: int) -> fn (first: bool) ->
@@ -1374,5 +1377,822 @@ let ic_node3 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (t
      let _ = ic_here cx u n in
      let _ = ic_in cx u "putspecialobject" 1 in
      let _ = ic_i2 cx u "send" (ic_cd "lambda" 4 0) (OSeq blk) in
+     ic_pop_if cx u popped)
+  else ic_node4 cx u n popped ty;
+
+// -- conditions -------------------------------------------------------------------
+let ic_truthy = fn (v: Iv) -> match v with | IvNil -> false | IvFalse -> false | _ -> true;
+// PUSH_SYNTHETIC_PUTNIL: on the last line, of no node (-1)
+let ic_synthetic_putnil = fn cx -> fn (u: int) ->
+  let _ = ic_at cx u (if ic_u_last_line cx u >= 0 then ic_u_last_line cx u else ic_u_line cx u) (0 - 1) in
+  ic_i0 cx u "putnil";
+// (the instructions after `mark` in the list being built)
+let ic_insns_after = fn cx -> fn (u: int) -> fn (mark: int) ->
+  let rec go = fn (e: int) ->
+    if ic_is_end cx e then (Nil : int list) else if ic_kind cx e == 0 then Cons (e, go (ic_next cx e)) else go (ic_next cx e) in
+  go (ic_next cx mark);
+// pm_compile_branch_condition (its location is the condition it was given,
+// kept as it walks into && / ||)
+let rec ic_branch_condition = fn cx -> fn (u: int) -> fn (cond: int) -> fn (then_l: int) -> fn (else_l: int) -> fn (at: int) ->
+  let ty = ic_ty cx cond in
+  if ty == pt_false () || ty == pt_nil () then (let _ = ic_here cx u at in ic_il cx u "jump" else_l)
+  else if ty == pt_float () || ty == pt_imaginary () || ty == pt_integer () || ty == pt_rational () || ty == pt_string ()
+          || ty == pt_symbol () || ty == pt_true () || ty == pt_lambda () || ty == pt_regular_expression () then
+    (let _ = ic_here cx u at in ic_il cx u "jump" then_l)
+  else if ty == pt_defined () then ic_refuse "defined? in a condition is not compiled yet"
+  else if ty == pt_flip_flop () then ic_refuse "a flip-flop is not compiled yet"
+  else if ty == pt_and () then
+    (let _ = ic_compile_logical cx u (pn_and_left cx cond) (0 - 1) else_l in
+     ic_branch_condition cx u (pn_and_right cx cond) then_l else_l at)
+  else if ty == pt_or () then
+    (let _ = ic_compile_logical cx u (pn_or_left cx cond) then_l (0 - 1) in
+     ic_branch_condition cx u (pn_or_right cx cond) then_l else_l at)
+  else
+    (let mark = ic_last cx (ic_u_list cx u) in
+     let _ = ic_node cx u cond false in
+     match ic_insns_after cx u mark with
+     | Cons (e, Nil) when str_eq (ic_name cx e) "putobject" ->
+       (let v = (match ic_op0 cx e with | OVal x -> x | _ -> IvTrue) in
+        let _ = ic_unlink cx e in
+        let _ = ic_here cx u at in
+        ic_il cx u "jump" (if ic_truthy v then then_l else else_l))
+     | _ ->
+       (let _ = ic_here cx u at in
+        let _ = ic_il cx u "branchunless" else_l in
+        ic_il cx u "jump" then_l));
+// pm_compile_logical: one side of && / || in a condition, falling through
+// to a label of its own for the other (-1: that one)
+let ic_compile_logical = fn cx -> fn (u: int) -> fn (cond: int) -> fn (then0: int) -> fn (else0: int) ->
+  let lbl = ic_new_label cx u in
+  let then_l = (if then0 >= 0 then then0 else lbl) in
+  let else_l = (if else0 >= 0 then else0 else lbl) in
+  let mark = ic_last cx (ic_u_list cx u) in
+  let _ = ic_branch_condition cx u cond then_l else_l cond in
+  match ic_insns_after cx u mark with
+  | Cons (e, Nil) when str_eq (ic_name cx e) "jump" && ic_lab_of (ic_op0 cx e) == lbl ->
+    (let _ = ic_unref_ops cx (ic_ops cx e) in
+     let rec cut = fn (x: int) -> if ic_is_end cx x then () else (let nx = ic_next cx x in let _ = ic_unlink cx x in cut nx) in
+     cut (ic_next cx mark))
+  | _ -> if ic_refs cx lbl > 0 then ic_emit_label cx u lbl else ();
+// a part of an if / unless / else: its statements, or a synthetic nil
+let ic_compile_part = fn cx -> fn (u: int) -> fn (part0: int) -> fn (popped: bool) ->
+  let part = (if part0 >= 0 && ic_ty cx part0 == pt_else () then pn_else_statements cx part0 else part0) in
+  if part >= 0 then ic_node cx u part popped else if popped then () else ic_synthetic_putnil cx u;
+// prism_compile.c's pm_compile_conditional: the condition jumps to the then-
+// or else-label, each part runs if a jump reaches it, and the peephole
+// optimiser tidies the jumps up as compile.c's does
+let ic_branch = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let unless_ = ic_ty cx n == pt_unless () in
+  let pred = (if unless_ then pn_unless_predicate cx n else pn_if_predicate cx n) in
+  let then_body = (if unless_ then pn_unless_else_clause cx n else pn_if_statements cx n) in
+  let else_body = (if unless_ then pn_unless_statements cx n else pn_if_subsequent cx n) in
+  let then_l = ic_new_label cx u in
+  let else_l = ic_new_label cx u in
+  let _ = ic_branch_condition cx u pred then_l else_l pred in
+  let end_l =
+    (if ic_refs cx then_l > 0 then
+       (let _ = ic_emit_label cx u then_l in
+        let _ = ic_compile_part cx u then_body popped in
+        if ic_refs cx else_l > 0 then
+          (let l = ic_new_label cx u in
+           let _ = ic_here cx u n in
+           let _ = ic_il cx u "jump" l in
+           let _ = (if popped then () else ic_i0 cx u "pop") in
+           l)
+        else 0 - 1)
+     else 0 - 1) in
+  let _ = (if ic_refs cx else_l > 0 then (let _ = ic_emit_label cx u else_l in ic_compile_part cx u else_body popped) else ()) in
+  if end_l >= 0 then ic_emit_label cx u end_l else ();
+
+// -- classes ------------------------------------------------------------------
+let ic_class_body = fn cx -> fn (child: int) -> fn (n: int) -> fn (body: int) -> fn (events: bool) ->
+  let _ = ic_at cx child (ic_start_line cx n) (ic_nid cx n) in
+  let _ = (if events then ic_event cx child (ic_ev_class ()) else ()) in
+  // (an empty body's putnil is synthetic: node 0)
+  let _ = (if body >= 0 then ic_node cx child body false else (let _ = ic_at cx child (ic_start_line cx n) 0 in ic_i0 cx child "putnil")) in
+  let _ = (if events then (let _ = ic_event cx child (ic_ev_end ()) in ic_u_set cx child 11 (ic_end_line cx n)) else ()) in
+  let _ = (if ic_u_last_line cx child < 0 then ic_u_set cx child 11 (ic_start_line cx n) else ()) in
+  let _ = ic_at cx child (ic_u_last_line cx child) (ic_nid cx n) in
+  let _ = ic_i0 cx child "leave" in
+  ic_finish cx child;
+let ic_class_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let mod_ = ic_ty cx n == pt_module () in
+  let name = ic_cname cx (if mod_ then pn_module_name cx n else pn_class_name cx n) in
+  let locals = (if mod_ then ic_cnames cx (pn_module_locals cx n) (pn_module_locals_b cx n) else ic_cnames cx (pn_class_locals cx n) (pn_class_locals_b cx n)) in
+  let child = ic_unit_new cx 3 ("<" ++ (if mod_ then "module" else "class") ++ ":" ++ name ++ ">") (ic_u_path cx u) (ic_u_abs_path cx u)
+                (ic_start_line cx n) locals u (ic_loc4 cx n) (ic_nid cx n) in
+  let _ = ic_add_child cx u child in
+  let _ = ic_class_body cx child n (if mod_ then pn_module_body cx n else pn_class_body cx n) true in
+  let cp = (if mod_ then pn_module_constant_path cx n else pn_class_constant_path cx n) in
+  let f0 = (if mod_ then 2 else 0) in
+  let f1 =
+    (if ic_ty cx cp == pt_constant_path () then
+       (let _ = (if pn_constant_path_parent cx cp >= 0 then ic_node cx u (pn_constant_path_parent cx cp) false
+                 else (let _ = ic_here cx u n in ic_i1 cx u "putobject" (OVal (IvCls "Object")))) in
+        f0 + 8)
+     else (let _ = ic_here cx u n in let _ = ic_in cx u "putspecialobject" 3 in f0)) in
+  let sup = (if mod_ then 0 - 1 else pn_class_superclass cx n) in
+  let flags = (if sup >= 0 then (let _ = ic_node cx u sup false in f1 + 16) else (let _ = ic_here cx u n in let _ = ic_i0 cx u "putnil" in f1)) in
+  let _ = ic_here cx u n in
+  let _ = ic_i3 cx u "defineclass" (ic_osym cx name) (OSeq child) (ONum flags) in
+  ic_pop_if cx u popped;
+// (a singleton class has no class / end events, and its leave stays on the
+//  last line)
+let ic_singleton_class = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let child = ic_unit_new cx 3 "singleton class" (ic_u_path cx u) (ic_u_abs_path cx u) (ic_start_line cx n)
+                (ic_cnames cx (pn_singleton_class_locals cx n) (pn_singleton_class_locals_b cx n)) u (ic_loc4 cx n) (ic_nid cx n) in
+  let _ = ic_u_set cx child 18 1 in
+  let _ = ic_add_child cx u child in
+  let _ = ic_class_body cx child n (pn_singleton_class_body cx n) false in
+  let _ = ic_node cx u (pn_singleton_class_expression cx n) false in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_i3 cx u "defineclass" (ic_osym cx "singletonclass") (OSeq child) (ONum 1) in
+  ic_pop_if cx u popped;
+
+// -- loops, jumps, ensures ------------------------------------------------------
+let ic_loops = fn cx -> fn (u: int) -> vec_get (ic_up cx) u;
+let ic_ensures = fn cx -> fn (u: int) -> vec_get (ic_un cx) u;
+let ic_set_ensures = fn cx -> fn (u: int) -> fn (es: (int * int) list) -> vec_set (ic_un cx) u es;
+// can_add_ensure_iseq: under a rescue's protected body, an ensure around it
+// is not inlined -- the jump is thrown and the catch table runs it
+let ic_can_add_ensure = fn cx -> fn (u: int) ->
+  let rec any = fn (es: (int * int) list) -> (match es with | Nil -> false | Cons ((k, _), t) -> if k >= 0 then true else any t) in
+  if ic_u_in_rescue cx u && any (ic_ensures cx u) then false else true;
+// the sequence a throwing break / next goes to: the nearest one that is in a
+// loop or is a block, out through rescue and ensure sequences (-1: none)
+let rec ic_escape_scope = fn cx -> fn (ip: int) ->
+  if ip < 0 then 0 - 1
+  else if (match ic_loops cx ip with | Nil -> false | _ -> true) || ic_u_type cx ip == 1 then ip
+  else if ic_through (ic_u_type cx ip) then ic_escape_scope cx (ic_u_parent cx ip)
+  else 0 - 1;
+// pm_add_ensure_iseq: on the way out of ensure regions -- a return, a loop's
+// break / next / redo -- each ensure clause left is run here, the innermost
+// first, compiled again in place; and the copy is cut out of its region
+// (add_ensure_range), since the region's exception path would run it a
+// second time. A jump inside a loop stops at the loop.
+let ic_no_ensure_escape = fn cx -> fn (u: int) -> fn (is_return: bool) ->
+  let saved = ic_ensures cx u in
+  let rec go = fn (es: (int * int) list) ->
+    (match es with
+     | Nil -> ()
+     | Cons ((k, id), outer) ->
+       if k < 0 then (if is_return then go outer else ())
+       else
+         (let lstart = ic_new_label cx u in
+          let lend = ic_new_label cx u in
+          let ur = ic_ur cx in
+          let rs = vec_get ur id in
+          // (the last piece now ends at the copy; a new one starts after it)
+          let rec split = fn (xs: (int * int) list) ->
+            (match xs with
+             | Nil -> (Nil : (int * int) list)
+             | Cons ((st, ed), Nil) -> Cons ((st, lstart), Cons ((lend, ed), Nil))
+             | Cons (x, t) -> Cons (x, split t)) in
+          let _ = vec_set ur id (split rs) in
+          let _ = ic_set_ensures cx u outer in
+          let _ = ic_emit_label cx u lstart in
+          let st = pn_ensure_statements cx k in
+          let _ = (if st >= 0 then ic_node cx u st true else ()) in
+          let _ = ic_emit_label cx u lend in
+          go outer)) in
+  let _ = go saved in
+  ic_set_ensures cx u saved;
+
+// what a return (or a break, a next) answers: nil, its one value, or the
+// Array of several (compiled as a value: never the duparray of a literal)
+let ic_return_value = fn cx -> fn (u: int) -> fn (n: int) -> fn (args: int) ->
+  let cnt = (if args >= 0 then pn_arguments_arguments_b cx args else 0) in
+  if cnt == 0 then (let _ = ic_here cx u n in ic_i0 cx u "putnil")
+  else if cnt == 1 then ic_node cx u (ic_li cx (pn_arguments_arguments cx args) 0) false
+  else ic_array_core cx u args (pn_arguments_arguments cx args) cnt false;
+
+let ic_loop_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let until_ = ic_ty cx n == pt_until () in
+  let pred = (if until_ then pn_until_predicate cx n else pn_while_predicate cx n) in
+  let stmts = (if until_ then pn_until_statements cx n else pn_while_statements cx n) in
+  let begin_mod = (if until_ then pq_until_begin_modifier cx n else pq_while_begin_modifier cx n) in
+  let next_l = ic_new_label cx u in
+  let redo_l = ic_new_label cx u in
+  let break_l = ic_new_label cx u in
+  let end_l = ic_new_label cx u in
+  let adjust_l = ic_new_label cx u in
+  let next_catch_l = ic_new_label cx u in
+  // (begin ... end while runs the body first)
+  let tmp_l = (if begin_mod then ic_new_label cx u else 0 - 1) in
+  let _ = ic_il cx u "jump" (if tmp_l >= 0 then tmp_l else next_l) in
+  let _ = ic_emit_label cx u adjust_l in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_emit_label cx u next_catch_l in
+  let _ = ic_i0 cx u "pop" in
+  let _ = ic_il cx u "jump" next_l in
+  let _ = (if tmp_l >= 0 then ic_emit_label cx u tmp_l else ()) in
+  let _ = ic_emit_label cx u redo_l in
+  let loops0 = ic_loops cx u in
+  let ens0 = ic_ensures cx u in
+  let _ = vec_set (ic_up cx) u (Cons ((next_l, break_l, redo_l), loops0)) in
+  let _ = ic_set_ensures cx u (Cons ((0 - 1, 0 - 1), ens0)) in
+  let _ = (if stmts >= 0 then ic_node cx u stmts true else ()) in
+  let _ = ic_set_ensures cx u ens0 in
+  let _ = vec_set (ic_up cx) u loops0 in
+  let _ = ic_emit_label cx u next_l in
+  let _ = (if until_ then ic_branch_condition cx u pred end_l redo_l pred else ic_branch_condition cx u pred redo_l end_l pred) in
+  let _ = ic_emit_label cx u end_l in
+  let _ = ic_adjust cx u adjust_l true in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_emit_label cx u break_l in
+  let _ = ic_pop_if cx u popped in
+  let _ = ic_add_catch cx u 4 redo_l break_l (0 - 1) break_l in
+  let _ = ic_add_catch cx u 6 redo_l break_l (0 - 1) next_catch_l in
+  ic_add_catch cx u 5 redo_l break_l (0 - 1) redo_l;
+
+// THROW_NO_ESCAPE 0x8000
+let ic_break_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let args = pn_break_arguments cx n in
+  match ic_loops cx u with
+  | Cons ((_, brk, redo), _) when ic_can_add_ensure cx u ->
+    (let sp = ic_new_label cx u in
+     let _ = ic_emit_label cx u sp in
+     let _ = ic_here cx u n in
+     let _ = ic_adjust cx u redo false in
+     let _ = ic_return_value cx u n args in
+     let _ = ic_no_ensure_escape cx u false in
+     let _ = ic_here cx u n in
+     let _ = ic_il cx u "jump" brk in
+     let _ = ic_adjust cx u sp true in
+     if popped then () else ic_i0 cx u "putnil")
+  | _ ->
+    (let ip = ic_escape_scope cx u in
+     if ip < 0 then ic_refuse "break here is not compiled yet"
+     else
+       // (a loop's break from a rescue / ensure sequence does not escape the
+       //  frame: VM_THROW_NO_ESCAPE_FLAG)
+       (let _ = ic_return_value cx u n args in
+        let _ = ic_here cx u n in
+        let _ = ic_in cx u "throw" (match ic_loops cx ip with | Nil -> 2 | _ -> 32768 + 2) in
+        ic_pop_if cx u popped));
+
+let ic_next_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let args = pn_next_arguments cx n in
+  let sp = ic_new_label cx u in
+  match ic_loops cx u with
+  | Cons ((nxt, _, redo), _) when ic_can_add_ensure cx u ->
+    (let _ = ic_emit_label cx u sp in
+     let _ = ic_return_value cx u n args in
+     let _ = ic_no_ensure_escape cx u false in
+     let _ = ic_here cx u n in
+     let _ = ic_adjust cx u redo false in
+     let _ = ic_il cx u "jump" nxt in
+     let _ = ic_adjust cx u sp true in
+     if popped then () else ic_i0 cx u "putnil")
+  | _ ->
+    if ic_u_type cx u == 1 && ic_can_add_ensure cx u then
+      (let _ = ic_emit_label cx u sp in
+       let _ = ic_here cx u n in
+       let _ = ic_adjust cx u (ic_u_block_label0 cx u) false in
+       let _ = ic_return_value cx u n args in
+       let _ = ic_no_ensure_escape cx u false in
+       let _ = ic_here cx u n in
+       let _ = ic_il cx u "jump" (ic_u_block_label1 cx u) in
+       let _ = ic_adjust cx u sp true in
+       let _ = ic_e_set cx sp 9 0 in
+       if popped then () else ic_i0 cx u "putnil")
+    else if ic_escape_scope cx u >= 0 then
+      // (from a rescue / ensure sequence: thrown to the block or loop)
+      (let _ = ic_return_value cx u n args in
+       let _ = ic_here cx u n in
+       let _ = ic_in cx u "throw" (32768 + 3) in
+       ic_pop_if cx u popped)
+    else ic_refuse "next here is not compiled yet";
+
+let ic_redo_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let sp = ic_new_label cx u in
+  let tail = fn (x: unit) ->
+    (let _ = ic_adjust cx u sp true in
+     let _ = ic_e_set cx sp 9 0 in
+     if popped then () else ic_i0 cx u "putnil") in
+  match ic_loops cx u with
+  | Cons ((_, _, redo), _) when ic_can_add_ensure cx u ->
+    (let _ = ic_emit_label cx u sp in
+     let _ = ic_here cx u n in
+     let _ = ic_adjust cx u redo false in
+     let _ = ic_no_ensure_escape cx u false in
+     let _ = ic_here cx u n in
+     let _ = ic_il cx u "jump" redo in
+     tail ())
+  | _ ->
+    if ic_u_type cx u == 1 && ic_can_add_ensure cx u then
+      (let _ = ic_emit_label cx u sp in
+       let _ = ic_no_ensure_escape cx u false in
+       let _ = ic_here cx u n in
+       let _ = ic_adjust cx u (ic_u_block_label0 cx u) false in
+       let _ = ic_il cx u "jump" (ic_u_block_label0 cx u) in
+       tail ())
+    else if ic_escape_scope cx u >= 0 then
+      (let _ = ic_here cx u n in
+       let _ = ic_i0 cx u "putnil" in
+       let _ = ic_in cx u "throw" (32768 + 5) in
+       ic_pop_if cx u popped)
+    else ic_refuse "redo here is not compiled yet";
+
+// pm_compile_return_node, in a method: leave, with an ADJUST before (the
+// stack down to the method's) and an ADJUST_RESTORE after (at the top level
+// the scope itself is as a method; from a block ruby throws TAG_RETURN,
+// which needs the catch table)
+let ic_return_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let args = pn_return_arguments cx n in
+  let ty = ic_u_type cx u in
+  if ty != 2 && ty != 0 then
+    (if ic_through ty then
+       (let _ = ic_return_value cx u n args in
+        let _ = ic_here cx u n in
+        let _ = ic_in cx u "throw" 1 in
+        ic_pop_if cx u popped)
+     else ic_refuse "return from here is not compiled yet")
+  // (a file's own return answers nothing, and ruby warns as it compiles:
+  //  the Ruby compiler says that)
+  else if ty == 0 && args >= 0 then ic_refuse "a top-level return with a value is not compiled yet"
+  else
+    (let sp_l = ic_new_label cx u in
+     let _ = ic_emit_label cx u sp_l in
+     let _ = ic_adjust cx u (0 - 1) false in
+     let _ = ic_return_value cx u n args in
+     if (if ic_can_add_ensure cx u then false else true) then
+       (let _ = ic_here cx u n in
+        let _ = ic_in cx u "throw" 1 in
+        ic_pop_if cx u popped)
+     else
+       (let _ = ic_no_ensure_escape cx u true in
+        let _ = ic_here cx u n in
+        let _ = ic_event cx u (ic_ev_return ()) in
+        let _ = ic_i0 cx u "leave" in
+        let _ = ic_adjust cx u sp_l true in
+        if popped then () else ic_i0 cx u "putnil"));
+
+let ic_yield_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let m = ic_local_iseq cx u in
+  let _ = (if ic_u_type cx m == 2 then ic_u_set_pflag cx m 4 else ()) in
+  let (argc, flag, kws, has_kws) = ic_setup_args cx u (pn_yield_arguments cx n) (0 - 1) (ic_start_line cx n) (ic_nid cx n) 0 in
+  let _ = ic_here cx u n in
+  let _ = ic_i1 cx u "invokeblock" (ic_ci (chr 0) argc flag kws has_kws false) in
+  ic_pop_if cx u popped;
+
+// -- super ----------------------------------------------------------------------
+// the method's parameters as zsuper passes them on
+let ic_zsuper_args = fn cx -> fn (u: int) -> fn (n: int) -> fn (local: int) ->
+  let rec lv = fn (x: int) -> fn (k: int) -> if x == local || x < 0 then k else lv (ic_u_parent cx x) (k + 1) in
+  let level = lv u 0 in
+  let get = fn (i: int) -> (let _ = ic_here cx u n in ic_i2 cx u "getlocal" (ic_local_op cx local i) (ONum level)) in
+  let rec times = fn (k: int) -> fn (from: int) -> if k <= 0 then () else (let _ = get from in times (k - 1) (from + 1)) in
+  let lead = ic_u_lead_num cx local in
+  let _ = times lead 0 in
+  let nopt = (if ic_u_pflag cx local 64 then ic_llen (vec_get (ic_uo cx) local) - 1 else 0) in
+  let _ = times nopt lead in
+  let argc0 = lead + nopt in
+  let rs = ic_u_rest_start cx local in
+  let (argc1, flag1) =
+    (if rs >= 0 then (let _ = get rs in let _ = ic_i1 cx u "splatarray" (OVal IvFalse) in (rs + 1, 1)) else (argc0, 0)) in
+  let pn = ic_u_post_num cx local in
+  let argc2 =
+    (if pn >= 0 then
+       (let _ = times pn (ic_u_post_start cx local) in
+        if rs >= 0 then (let _ = ic_in cx u "newarray" pn in let _ = ic_i0 cx u "concatarray" in argc1)
+        else pn + ic_u_post_start cx local)
+     else argc1) in
+  let kwr = ic_u_kwrest cx local in
+  if ic_u_pflag cx local 32 then
+    (let _ = ic_in cx u "putspecialobject" 1 in
+     let _ = (if kwr >= 0 then (let _ = get kwr in ic_i2 cx u "send" (ic_cd "dup" 16 0) (OSeq (0 - 1))) else ic_in cx u "newhash" 0) in
+     let names = ic_map (fn (k: Iv) -> (match k with | IvSym (s, _) -> s | IvArr (Cons (IvSym (s, _), _)) -> s | _ -> "")) (vec_get (ic_uw cx) local) in
+     let _ = list_iter names (fn (k: str) -> (let _ = ic_i1 cx u "putobject" (ic_osym cx k) in get (ic_index_of cx local k))) in
+     let _ = ic_i2 cx u "send" (ic_cd "core#hash_merge_ptr" 16 (ic_llen names * 2 + 1)) (OSeq (0 - 1)) in
+     (argc2 + 1, flag1 + 64 + 2048))
+  else if kwr >= 0 then (let _ = get kwr in (argc2 + 1, flag1 + 64))
+  else (argc2, flag1);
+
+let ic_super_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let zsuper = ic_ty cx n == pt_forwarding_super () in
+  let block = (if zsuper then pn_forwarding_super_block cx n else pn_super_block cx n) in
+  let retry_l = ic_new_label cx u in
+  let retry_end = ic_new_label cx u in
+  let _ = (if zsuper && block < 0 then () else ic_emit_label cx u retry_l) in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "putself" in
+  let local = ic_local_iseq cx u in
+  // (ZSUPER 512, SUPER 256, FCALL 4, FORWARDING 8192)
+  if zsuper && ic_u_pflag cx local 16 then
+    // (pm_compile_forwarding_super_node in a forwardable method: its `...`
+    //  passed on with invokesuperforward, and no break entry)
+    (let blk = (if block >= 0 then ic_block_unit cx u block (0 - 1) (0 - 1) (0 - 1) else 0 - 1) in
+     let _ = (if block < 0 then ic_u_set_pflag cx local 4 else ()) in
+     let _ = ic_here cx u n in
+     let _ = ic_getlocal cx u "..." in
+     let _ = ic_i2 cx u "invokesuperforward" (ic_ci (chr 0) 0 (512 + 256 + 4 + 8192) Nil false (blk >= 0)) (OSeq blk) in
+     ic_pop_if cx u popped)
+  else
+    (let (blk, argc, flag, kws, has_kws) =
+       (if zsuper then
+          (let blk = (if block >= 0 then ic_block_unit cx u block (0 - 1) (0 - 1) (0 - 1) else 0 - 1) in
+           let (argc, flag) = ic_zsuper_args cx u n local in
+           (blk, argc, bit_or flag (512 + 256 + 4), (Nil : str list), false))
+        else
+          (let (argc, flag, kws, has_kws) = ic_setup_args cx u (pn_super_arguments cx n) block (ic_start_line cx n) (ic_nid cx n) 0 in
+           let blk = (if ic_tyis cx block (pt_block ()) then ic_block_unit cx u block (0 - 1) (0 - 1) (0 - 1) else 0 - 1) in
+           (blk, argc, bit_or flag (256 + 4), kws, has_kws))) in
+     let _ = (if block < 0 then ic_u_set_pflag cx local 4 else ()) in
+     let _ = ic_here cx u n in
+     let _ = (if bit_and flag 2 != 0 && bit_and flag 64 != 0 && bit_and flag 2048 == 0 then ic_i0 cx u "splatkw" else ()) in
+     let _ =
+       (if zsuper then ic_i2 cx u "invokesuper" (ic_ci (chr 0) argc flag Nil false (blk >= 0)) (OSeq blk)
+        else
+          // (super(...) in a forwardable method: invokesuperforward)
+          (let args = pn_super_arguments cx n in
+           let fwd = args >= 0 && pq_arguments_contains_forwarding cx args && ic_u_pflag cx local 16 in
+           ic_i2 cx u (if fwd then "invokesuperforward" else "invokesuper")
+             (ic_ci (chr 0) argc (if fwd then bit_or flag 8192 else flag) kws has_kws (blk >= 0)) (OSeq blk))) in
+     let _ = (if (if zsuper then false else true) || block >= 0 then
+                (let _ = ic_emit_label cx u retry_end in ic_add_catch cx u 4 retry_l retry_end blk retry_end)
+              else ()) in
+     ic_pop_if cx u popped);
+
+// -- rescue and ensure ------------------------------------------------------------
+// a rescue / ensure sequence: its one local is the error ($!)
+let ic_exception_unit = fn cx -> fn (u: int) -> fn (ty: int) -> fn (first_line: int) -> fn (locn: int) -> fn (node_id: int) ->
+  let child = ic_unit_new cx ty ((if ty == 4 then "rescue" else "ensure") ++ " in " ++ ic_u_label cx u) (ic_u_path cx u) (ic_u_abs_path cx u)
+                first_line (Cons ("$!", Nil)) u (ic_loc4 cx locn) node_id in
+  let _ = ic_add_child cx u child in
+  child;
+
+// pm_compile_rescue_node, in the rescue sequence: each class against $!
+// (checkmatch), the error into its variable, the clause's value left, and
+// the next clause -- or $! thrown on
+let rec ic_rescue_clause = fn cx -> fn (u: int) -> fn (n: int) ->
+  let matched = ic_new_label cx u in
+  let none = ic_new_label cx u in
+  let at = fn (x: unit) -> ic_here cx u n in
+  let exs = ic_nlist cx (pn_rescue_exceptions cx n) (pn_rescue_exceptions_b cx n) in
+  let _ =
+    (match exs with
+     | Nil ->
+       (let _ = at () in
+        let _ = ic_getlocal cx u "$!" in
+        let _ = ic_i1 cx u "putobject" (OVal (IvCls "StandardError")) in
+        let _ = ic_in cx u "checkmatch" 3 in
+        ic_il cx u "branchif" matched)
+     | _ ->
+       list_iter exs (fn (ex: int) ->
+         (let _ = at () in
+          let _ = ic_getlocal cx u "$!" in
+          let _ = ic_node cx u ex false in
+          let _ = at () in
+          let _ = ic_in cx u "checkmatch" (if ic_ty cx ex == pt_splat () then 7 else 3) in
+          ic_il cx u "branchif" matched))) in
+  let _ = at () in
+  let _ = ic_il cx u "jump" none in
+  let _ = ic_emit_label cx u matched in
+  let _ = ic_event cx u (ic_ev_rescue ()) in
+  let r = pn_rescue_reference cx n in
+  let _ =
+    (if r >= 0 then
+       (let _ = at () in
+        let _ = ic_getlocal cx u "$!" in
+        let _ = ic_at cx u (ic_start_line cx r) (ic_nid cx r) in
+        let rt = ic_ty cx r in
+        if rt == pt_local_variable_target () then ic_setlocal cx u (ic_cname cx (pn_local_variable_target_name cx r))
+        else if rt == pt_instance_variable_target () then
+          ic_i2 cx u "setinstancevariable" (ic_osym cx (ic_cname cx (pn_instance_variable_target_name cx r))) (OIvc (ic_next_is cx u))
+        else if rt == pt_global_variable_target () then ic_i1 cx u "setglobal" (ic_osym cx (ic_cname cx (pn_global_variable_target_name cx r)))
+        else if rt == pt_class_variable_target () then
+          (let nm = ic_cname cx (pn_class_variable_target_name cx r) in ic_i2 cx u "setclassvariable" (ic_osym cx nm) (ic_cvc cx u nm))
+        else ic_refuse ("rescue into " ++ ic_type_name rt ++ " is not compiled yet"))
+     else ()) in
+  let _ = (if pn_rescue_statements cx n >= 0 then ic_node cx u (pn_rescue_statements cx n) false else (let _ = at () in ic_i0 cx u "putnil")) in
+  let _ = at () in
+  let _ = ic_i0 cx u "leave" in
+  let _ = ic_emit_label cx u none in
+  if pn_rescue_subsequent cx n >= 0 then ic_node cx u (pn_rescue_subsequent cx n) false
+  else (let _ = at () in ic_getlocal cx u "$!");
+
+// pm_compile_rescue: the body between lstart and lend, the else part, a nop,
+// and the rescue and retry entries; the rescue clauses are a sequence of
+// their own
+let ic_rescue_part = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let rc = pn_begin_rescue_clause cx n in
+  let lstart = ic_new_label cx u in
+  let lend = ic_new_label cx u in
+  let lcont = ic_new_label cx u in
+  let child = ic_exception_unit cx u 4 (ic_start_line cx rc) rc (ic_nid cx rc) in
+  let _ = ic_node cx child rc false in
+  let _ = ic_at cx child (ic_start_line cx rc) 0 in
+  let _ = ic_in cx child "throw" 0 in
+  let _ = ic_finish cx child in
+  let _ = ic_emit_label cx u lstart in
+  let was = ic_u_get cx u 19 in
+  let _ = ic_u_set cx u 19 1 in
+  let st = pn_begin_statements cx n in
+  let _ = (if st >= 0 then ic_node cx u st false else (let _ = ic_here cx u rc in ic_i0 cx u "putnil")) in
+  let _ = ic_u_set cx u 19 was in
+  let _ = ic_emit_label cx u lend in
+  let el = pn_begin_else_clause cx n in
+  let _ = (if el >= 0 then
+             (let _ = ic_here cx u n in
+              let _ = (if popped then () else ic_i0 cx u "pop") in
+              ic_node cx u el popped)
+           else ()) in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "nop" in
+  let _ = ic_emit_label cx u lcont in
+  let _ = ic_pop_if cx u popped in
+  let _ = ic_add_catch cx u 1 lstart lend child lcont in
+  ic_add_catch cx u 3 lend lcont (0 - 1) lstart;
+
+// x rescue y: the rescue sequence matches StandardError itself
+let ic_rescue_modifier = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let ex = pn_rescue_modifier_rescue_expression cx n in
+  let child = ic_exception_unit cx u 4 (ic_start_line cx ex) n (ic_nid cx n) in
+  let matched = ic_new_label cx child in
+  let none = ic_new_label cx child in
+  // (the scope's own location: the modifier's line -- the sequence's first
+  //  line is the rescue expression's -- and no node)
+  let _ = ic_at cx child (ic_start_line cx n) 0 in
+  let _ = ic_getlocal cx child "$!" in
+  let _ = ic_i1 cx child "putobject" (OVal (IvCls "StandardError")) in
+  let _ = ic_in cx child "checkmatch" 3 in
+  let _ = ic_il cx child "branchif" matched in
+  let _ = ic_il cx child "jump" none in
+  let _ = ic_emit_label cx child matched in
+  let _ = ic_event cx child (ic_ev_rescue ()) in
+  let _ = ic_node cx child ex false in
+  let _ = ic_at cx child (ic_start_line cx n) 0 in
+  let _ = ic_i0 cx child "leave" in
+  let _ = ic_emit_label cx child none in
+  let _ = ic_getlocal cx child "$!" in
+  let _ = ic_in cx child "throw" 0 in
+  let _ = ic_finish cx child in
+  let lstart = ic_new_label cx u in
+  let lend = ic_new_label cx u in
+  let lcont = ic_new_label cx u in
+  let _ = ic_emit_label cx u lstart in
+  let was = ic_u_get cx u 19 in
+  let _ = ic_u_set cx u 19 1 in
+  let _ = ic_node cx u (pn_rescue_modifier_expression cx n) false in
+  let _ = ic_u_set cx u 19 was in
+  let _ = ic_emit_label cx u lend in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "nop" in
+  let _ = ic_emit_label cx u lcont in
+  let _ = ic_pop_if cx u popped in
+  let _ = ic_add_catch cx u 1 lstart lend child lcont in
+  ic_add_catch cx u 3 lend lcont (0 - 1) lstart;
+
+// pm_compile_ensure: the ensure clause compiled first (inline, after the
+// body), the body between lstart and lend, then the ensure sequence and one
+// catch entry for each piece of the region the inlined copies left
+let ic_ensure_part = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let ec = pn_begin_ensure_clause cx n in
+  let stmts = pn_ensure_statements cx ec in
+  let line = (if stmts >= 0 then ic_start_line cx stmts else ic_start_line cx n) in
+  let lstart = ic_new_label cx u in
+  let lend = ic_new_label cx u in
+  let lcont = ic_new_label cx u in
+  let saved = ic_capture_begin cx u in
+  let _ = (if stmts >= 0 then ic_node cx u stmts true else ()) in
+  let ensr = ic_capture_end cx u saved in
+  let rec last_non_trace = fn (e: int) -> if ic_is_end cx e then e else if ic_kind cx e == 2 then last_non_trace (ic_prev cx e) else e in
+  let ll = last_non_trace (ic_last cx ensr) in
+  let last_leave = ic_kind cx ll == 0 && str_eq (ic_name cx ll) "leave" in
+  let ur = ic_ur cx in
+  let id = vec_len ur in
+  let _ = vec_push ur (Cons ((lstart, lend), Nil)) in
+  let ens0 = ic_ensures cx u in
+  let _ = ic_set_ensures cx u (Cons ((ec, id), ens0)) in
+  let _ = ic_emit_label cx u lstart in
+  let pp = popped || last_leave in
+  let _ = (if pn_begin_rescue_clause cx n >= 0 then ic_rescue_part cx u n pp
+           else if pn_begin_statements cx n >= 0 then ic_node cx u (pn_begin_statements cx n) pp
+           else if pp then () else ic_synthetic_putnil cx u) in
+  let _ = ic_emit_label cx u lend in
+  let _ = ic_set_ensures cx u ens0 in
+  let _ = ic_append cx u ensr in
+  let _ = ic_here cx u n in
+  let _ = (if (if popped then false else true) && last_leave then ic_i0 cx u "putnil" else ()) in
+  let _ = ic_emit_label cx u lcont in
+  let _ = (if last_leave then ic_i0 cx u "pop" else ()) in
+  let child = ic_exception_unit cx u 5 line (if stmts >= 0 then stmts else ec) (ic_nid cx ec) in
+  let _ = (if stmts >= 0 then ic_node cx child stmts true else ()) in
+  let _ = ic_at cx child (ic_start_line cx ec) (ic_nid cx ec) in
+  let _ = ic_getlocal cx child "$!" in
+  let _ = ic_in cx child "throw" 0 in
+  let _ = ic_finish cx child in
+  // (one entry for each piece of the region an inlined copy of the ensure
+  //  left: add_ensure_range)
+  list_iter (vec_get ur id) (fn (r: int * int) ->
+    (let (st, ed) = r in
+     if ic_next cx st == ed then () else ic_add_catch cx u 2 st ed child lcont));
+
+// -- multiple assignment ------------------------------------------------------------
+// (pm_multi_target_state_t: the topn instructions that reach past the values
+//  to a target's receiver, fixed once every target is known). st: a Vec of
+//  [stack_size, position]; ents: a Vec of one list of (topns, index, size,
+//  position).
+let ic_mstate_push = fn cx -> fn st -> fn ents -> fn (topns: int list) -> fn (size: int) ->
+  let _ = vec_set ents 0 (Cons ((topns, vec_get st 0 + 1, size, vec_get st 1), vec_get ents 0)) in
+  vec_set st 0 (vec_get st 0 + size);
+let ic_mstate_update = fn cx -> fn st -> fn ents ->
+  let ss = vec_get st 0 in
+  if ss == 0 then ()
+  else list_iter (vec_get ents 0) (fn (en: int list * int * int * int) ->
+         (let (topns, index, _, position) = en in
+          list_iter topns (fn (t: int) -> ic_set_ops cx t (Cons (ONum (ss - index + position), Nil)))));
+// (an instruction for the writes or the cleanup, at a target's place)
+let ic_winsn = fn cx -> fn (l: int) -> fn (t: int) -> fn (name: str) -> fn (ops: IcOp list) ->
+  let _ = ic_ref_ops cx ops in
+  let e = ic_e_new cx 0 name ops (ic_start_line cx t) (ic_nid cx t) in
+  let _ = ic_push cx l e in
+  e;
+let ic_mt_parts = fn cx -> fn (n: int) ->
+  if ic_ty cx n == pt_multi_write () then
+    (ic_nlist cx (pn_multi_write_lefts cx n) (pn_multi_write_lefts_b cx n), pn_multi_write_rest cx n,
+     ic_nlist cx (pn_multi_write_rights cx n) (pn_multi_write_rights_b cx n))
+  else
+    (ic_nlist cx (pn_multi_target_lefts cx n) (pn_multi_target_lefts_b cx n), pn_multi_target_rest cx n,
+     ic_nlist cx (pn_multi_target_rights cx n) (pn_multi_target_rights_b cx n));
+
+let rec ic_multi_target = fn cx -> fn (u: int) -> fn (n: int) -> fn (writes: int) -> fn (cleanup: int) -> fn st -> fn ents ->
+  let (lefts, rest, rights) = ic_mt_parts cx n in
+  let has_rest = rest >= 0 && ic_ty cx rest == pt_splat () && pn_splat_expression cx rest >= 0 in
+  let nl = ic_llen lefts in
+  let nr = ic_llen rights in
+  let has_posts = nr > 0 in
+  let _ = ic_winsn cx writes n "expandarray" (Cons (ONum nl, Cons (ONum (if has_rest || has_posts then 1 else 0), Nil))) in
+  let base = vec_get st 1 in
+  let splat = (if has_rest || has_posts then 1 else 0) in
+  let rec each = fn (xs: int list) -> fn (i: int) -> fn (pos: int -> int) ->
+    (match xs with
+     | Nil -> ()
+     | Cons (t, tl) -> (let _ = vec_set st 1 (pos i) in let _ = ic_target cx u t writes cleanup st ents in each tl (i + 1) pos)) in
+  let _ = each lefts 0 (fn (i: int) -> nl - i + splat + base) in
+  let _ = (if has_rest then
+             (let _ = vec_set st 1 (1 + nr + base) in
+              let _ = (if has_posts then ic_winsn cx writes n "expandarray" (Cons (ONum nr, Cons (ONum 3, Nil))) else 0) in
+              ic_target cx u (pn_splat_expression cx rest) writes cleanup st ents)
+           else ()) in
+  if has_posts then
+    (let _ = (if (if has_rest then false else true) && rest >= 0 then ic_winsn cx writes n "expandarray" (Cons (ONum nr, Cons (ONum 2, Nil))) else 0) in
+     each rights 0 (fn (i: int) -> nr - i + base))
+  else ();
+
+// pm_compile_target_node: a receiver into the main sequence, the write into
+// writes, what it leaves into cleanup
+let ic_target = fn cx -> fn (u: int) -> fn (t: int) -> fn (writes: int) -> fn (cleanup: int) -> fn st -> fn ents ->
+  let ty = ic_ty cx t in
+  if ty == pt_local_variable_target () then
+    (let ops = ic_local_ref cx u (ic_cname cx (pn_local_variable_target_name cx t)) in
+     let _ = ic_winsn cx writes t (ic_local_insn_name cx u "setlocal" ops) ops in ())
+  else if ty == pt_instance_variable_target () then
+    (let _ = ic_winsn cx writes t "setinstancevariable" (Cons (ic_osym cx (ic_cname cx (pn_instance_variable_target_name cx t)), Cons (OIvc (ic_next_is cx u), Nil))) in ())
+  else if ty == pt_global_variable_target () then
+    (let _ = ic_winsn cx writes t "setglobal" (Cons (ic_osym cx (ic_cname cx (pn_global_variable_target_name cx t)), Nil)) in ())
+  else if ty == pt_class_variable_target () then
+    (let nm = ic_cname cx (pn_class_variable_target_name cx t) in
+     let _ = ic_winsn cx writes t "setclassvariable" (Cons (ic_osym cx nm, Cons (ic_cvc cx u nm, Nil))) in ())
+  else if ty == pt_constant_target () then
+    (let _ = ic_winsn cx writes t "putspecialobject" (Cons (ONum 3, Nil)) in
+     let _ = ic_winsn cx writes t "setconstant" (Cons (ic_osym cx (ic_cname cx (pn_constant_target_name cx t)), Nil)) in ())
+  else if ty == pt_constant_path_target () then
+    (let p = pn_constant_path_target_parent cx t in
+     let _ = (if p >= 0 then ic_node cx u p false else (let _ = ic_here cx u t in ic_i1 cx u "putobject" (OVal (IvCls "Object")))) in
+     let tn = ic_winsn cx writes t "topn" (Cons (ONum 1, Nil)) in
+     let _ = ic_mstate_push cx st ents (Cons (tn, Nil)) 1 in
+     let _ = ic_winsn cx writes t "setconstant" (Cons (ic_osym cx (ic_cname cx (pn_constant_path_target_name cx t)), Nil)) in
+     let _ = ic_winsn cx cleanup t "pop" Nil in ())
+  else if ty == pt_call_target () then
+    (let _ = ic_node cx u (pn_call_target_receiver cx t) false in
+     let safe = (if pq_call_target_safe_navigation cx t then
+                   (let l = ic_new_label cx u in
+                    let _ = ic_here cx u t in
+                    let _ = ic_i0 cx u "dup" in
+                    let _ = ic_il cx u "branchnil" l in
+                    l)
+                 else 0 - 1) in
+     let tn = ic_winsn cx writes t "topn" (Cons (ONum 1, Nil)) in
+     let _ = ic_mstate_push cx st ents (Cons (tn, Nil)) 1 in
+     let _ = ic_winsn cx writes t "swap" Nil in
+     let flag = (if pq_call_target_ignore_visibility cx t then 16 + 4 else 16) in
+     let _ = ic_winsn cx writes t "send" (Cons (ic_cd (ic_cname cx (pn_call_target_name cx t)) flag 1, Cons (OSeq (0 - 1), Nil))) in
+     let _ = ic_winsn cx writes t "pop" Nil in
+     let _ = (if safe >= 0 then ic_push cx writes safe else ()) in
+     let _ = ic_winsn cx cleanup t "pop" Nil in ())
+  else if ty == pt_index_target () then
+    (let _ = ic_node cx u (pn_index_target_receiver cx t) false in
+     let (argc, flag0, _, has_kws) = ic_setup_args cx u (pn_index_target_arguments cx t) (pn_index_target_block cx t) (ic_start_line cx t) (ic_nid cx t) 0 in
+     if has_kws then ic_refuse "an index target with keywords is not compiled yet"
+     else
+       (let first = ic_winsn cx writes t "topn" (Cons (ONum (argc + 1), Nil)) in
+        let rec more = fn (k: int) -> if k <= 0 then (Nil : int list) else (let e = ic_winsn cx writes t "topn" (Cons (ONum (argc + 1), Nil)) in Cons (e, more (k - 1))) in
+        let topns =
+          (if argc == 0 then (let _ = ic_winsn cx writes t "swap" Nil in Cons (first, Nil))
+           else
+             // (the update reaches the first argc + 1 of them, not the last)
+             (let ms = more argc in
+              let _ = ic_winsn cx writes t "topn" (Cons (ONum (argc + 1), Nil)) in
+              Cons (first, ms))) in
+        let _ = ic_mstate_push cx st ents topns (argc + 1) in
+        let splat = bit_and flag0 1 != 0 in
+        let ci_argc = (if splat then argc else argc + 1) in
+        let _ = (if splat then (let _ = ic_winsn cx writes t "newarray" (Cons (ONum 1, Nil)) in let _ = ic_winsn cx writes t "concatarray" Nil in ()) else ()) in
+        let flag = (if bit_and flag0 (1 + 2 + 64) == 0 then bit_or flag0 16 else flag0) in
+        let _ = ic_winsn cx writes t "send" (Cons (ic_cd "[]=" flag ci_argc, Cons (OSeq (0 - 1), Nil))) in
+        let _ = ic_winsn cx writes t "pop" Nil in
+        let _ = (if argc != 0 then (let _ = ic_winsn cx writes t "pop" Nil in ()) else ()) in
+        let rec pops = fn (k: int) -> if k <= 0 then () else (let _ = ic_winsn cx cleanup t "pop" Nil in pops (k - 1)) in
+        pops (argc + 1)))
+  else if ty == pt_multi_target () then
+    (let before = vec_get st 1 in
+     let _ = vec_set st 1 (before - 1) in
+     let _ = ic_multi_target cx u t writes cleanup st ents in
+     vec_set st 1 before)
+  else if ty == pt_splat () then
+    (if pn_splat_expression cx t >= 0 then ic_target cx u (pn_splat_expression cx t) writes cleanup st ents else ())
+  else ic_refuse ("a " ++ ic_type_name ty ++ " target is not compiled yet");
+
+let ic_mstate_new = fn (position: int) -> (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v position in v);
+let ic_ents_new = fn (u: unit) -> (let v = vec_new () in let _ = vec_push v (Nil : (int list * int * int * int) list) in v);
+
+// pm_compile_multi_write_node: the targets' receivers first, the value, its
+// expansion and the writes, then what the receivers left
+let ic_multi_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let writes = ic_list_new cx in
+  let cleanup = ic_list_new cx in
+  let st = ic_mstate_new (if popped then 0 else 1) in
+  let ents = ic_ents_new () in
+  let _ = ic_multi_target cx u n writes cleanup st ents in
+  let _ = ic_node cx u (pn_multi_write_value cx n) false in
+  let _ = ic_here cx u n in
+  let _ = ic_dup_unless cx u popped in
+  let _ = ic_append cx u writes in
+  let _ = (if (if popped then false else true) && vec_get st 0 >= 1 then ic_in cx u "setn" (vec_get st 0) else ()) in
+  let _ = ic_mstate_update cx st ents in
+  ic_append cx u cleanup;
+
+// -- the rest of `node`, again ------------------------------------------------------
+let ic_node4 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (ty: int) ->
+  if ty == pt_if () || ty == pt_unless () then ic_branch cx u n popped
+  else if ty == pt_class () || ty == pt_module () then ic_class_node cx u n popped
+  else if ty == pt_singleton_class () then ic_singleton_class cx u n popped
+  else if ty == pt_while () || ty == pt_until () then ic_loop_node cx u n popped
+  else if ty == pt_break () then ic_break_node cx u n popped
+  else if ty == pt_next () then ic_next_node cx u n popped
+  else if ty == pt_redo () then ic_redo_node cx u n popped
+  else if ty == pt_return () then ic_return_node cx u n popped
+  else if ty == pt_yield () then ic_yield_node cx u n popped
+  else if ty == pt_super () || ty == pt_forwarding_super () then ic_super_node cx u n popped
+  else if ty == pt_multi_write () then ic_multi_write cx u n popped
+  else if ty == pt_begin () then
+    (if pn_begin_ensure_clause cx n >= 0 then ic_ensure_part cx u n popped
+     else if pn_begin_rescue_clause cx n >= 0 then ic_rescue_part cx u n popped
+     else if pn_begin_statements cx n >= 0 then ic_node cx u (pn_begin_statements cx n) popped
+     else if popped then () else ic_synthetic_putnil cx u)
+  else if ty == pt_rescue () then ic_rescue_clause cx u n
+  else if ty == pt_ensure () then (if pn_ensure_statements cx n >= 0 then ic_node cx u (pn_ensure_statements cx n) popped else ())
+  else if ty == pt_rescue_modifier () then ic_rescue_modifier cx u n popped
+  else if ty == pt_retry () then
+    (if ic_u_type cx u != 4 then ic_refuse "retry outside a rescue clause is not compiled yet"
+     else (let _ = ic_i0 cx u "putnil" in let _ = ic_in cx u "throw" 4 in ic_pop_if cx u popped))
+  else if ty == pt_else () then ic_compile_part cx u n popped
+  else if ty == pt_alias_method () then
+    // (pm_compile_alias_method_node: core#set_method_alias on the cbase)
+    (let _ = ic_in cx u "putspecialobject" 1 in
+     let _ = ic_in cx u "putspecialobject" 2 in
+     let _ = ic_node cx u (pn_alias_method_new_name cx n) false in
+     let _ = ic_node cx u (pn_alias_method_old_name cx n) false in
+     let _ = ic_here cx u n in
+     let _ = ic_push_send cx u "core#set_method_alias" 3 in
+     ic_pop_if cx u popped)
+  else if ty == pt_alias_global_variable () then
+    // (the names as they are written: $a, $&, $1)
+    (let _ = ic_in cx u "putspecialobject" 1 in
+     let _ = ic_i1 cx u "putobject" (ic_osym cx (ic_node_src cx (pn_alias_global_variable_new_name cx n))) in
+     let _ = ic_i1 cx u "putobject" (ic_osym cx (ic_node_src cx (pn_alias_global_variable_old_name cx n))) in
+     let _ = ic_push_send cx u "core#set_variable_alias" 2 in
+     ic_pop_if cx u popped)
+  else if ty == pt_undef () then
+    // (one core#undef_method a name, the ones but the last popped)
+    (let names = ic_nlist cx (pn_undef_names cx n) (pn_undef_names_b cx n) in
+     let k = ic_llen names in
+     let rec go = fn (xs: int list) -> fn (i: int) ->
+       (match xs with
+        | Nil -> ()
+        | Cons (nm, t) ->
+          (let _ = ic_here cx u n in
+           let _ = ic_in cx u "putspecialobject" 1 in
+           let _ = ic_in cx u "putspecialobject" 2 in
+           let _ = ic_node cx u nm false in
+           let _ = ic_here cx u n in
+           let _ = ic_push_send cx u "core#undef_method" 2 in
+           let _ = (if i < k - 1 then ic_i0 cx u "pop" else ()) in
+           go t (i + 1))) in
+     let _ = go names 0 in
      ic_pop_if cx u popped)
   else ic_refuse (ic_type_name ty ++ " is not compiled yet");
