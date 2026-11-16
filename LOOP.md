@@ -5300,3 +5300,30 @@ vm_check 245 / 245; gates; test_gc, test_fiber, test_thread, test_weakmap,
 test_array, test_hash on the VM the same before and after the root change.
 (Running run_corpus.sh under `( ... ) &` makes corpus/394 FAIL: the
 reference ruby keeps the SIGINT ignore a background job inherits.)
+
+## 2026-11-17 (70): test_optimization's two timeouts, and a respond_to? that split its lists
+
+- **test_string_empty?** hung in its separated child: the IO prelude's
+  write loops ran `until data.empty?`, and the child had redefined
+  String#empty? to answer nil -- the exit's flush wrote nothing forever.
+  ruby's IO calls no Ruby method; the write loops ask the byte count now.
+- **test_clear_unreachable_keyword_args** (`GC.stress = true`, 30
+  ISeq.compile) passed 60 s: ISeq.compile checked the source with Prism's
+  Ruby side (__prism_check builds the node tree in Ruby, the most of
+  compile). It asks libprism first (`pm_parse_success_p`, the
+  RubyVM::InstructionSequence.__prism_ok door) and builds the tree only
+  when there is an error to report. ISeq.compile 0.3 s -> 1.4 ms; under
+  GC.stress three of them 6.1 -> 0.44 s. test_optimization 84 -> 86 / 89,
+  the file 98 -> 37 s (left: the two tailcall tests, and the frozen IO
+  buffer's memsize).
+- **respond_to? on a builtin's name** split the builtin name lists into
+  words for every question (listed_builtin_root, nine tenths of
+  `nil.respond_to?(:read)`): 7.6 -> 2.6 us. The lists are asked as text
+  now. (test_iseq's two leak tests still take 23 us and 38 us a turn --
+  `ISeq.new(nil)` through `...`, kwargs, a raise and an interpolation, and
+  load_from_binary -- against the 8 us they need.)
+
+Checked (local): corpus 695 / 695 on the evaluator; under MERE_RUBY_VM=1
+685 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates;
+test_io, test_object, test_method, test_module as before; test_iseq 63 /
+68 and test_compile_prism 182 / 182 as before.
