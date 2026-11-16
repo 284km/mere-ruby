@@ -4959,7 +4959,7 @@ different.
   1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
   fallbacks, then the compiler made native, then speed.
 
-## 2026-11-16 (60): round 39 -- what test_iseq and test_optimization still asked
+## 2026-11-16 (61): round 39 -- what test_iseq and test_optimization still asked
 
 **The point.** `ruby/test_iseq.rb` goes from 42 of 70 to 62 of 68 (the two
 tests of `ISeq.load` are not defined in ruby, where the method is private,
@@ -5018,7 +5018,7 @@ surface, the compiler, and four things the evaluator had wrong.
   - test_coverage: round 40, below.
 - Witness 664. The counts are with round 40's, below.
 
-## 2026-11-16 (61): round 40 -- branch coverage, counted by the VM
+## 2026-11-16 (62): round 40 -- branch coverage, counted by the VM
 
 **The point.** `coverage/test_coverage.rb` goes from 34 to 45 of 46.
 Branch coverage was counted nowhere; it is now what ruby's is, construct
@@ -5057,9 +5057,9 @@ by construct and count by count, for a file the VM takes.
 - **Checked** (local, the commit before this note): vm_check 243 / 243,
   the compiler 433 / 433 snippets, 671 / 671 compiled files and 19 / 19
   under branch coverage, the gates. The corpus in both executions was
-  run with the next round's build: (62). Witness 665.
+  run with the next round's build: (63). Witness 665.
 
-## 2026-11-16 (62): round 41 -- pattern matching, compiled and run on the VM
+## 2026-11-16 (63): round 41 -- pattern matching, compiled and run on the VM
 
 **The point.** `case / in`, `expr => pattern` and `expr in pattern` were
 the largest thing the compiler refused: 11 corpus programs fell back to the
@@ -5143,3 +5143,69 @@ as ruby's does and the VM runs the result.
   VM, 10 fallen back (6 a Regexp literal in another encoding, 3 a source
   in an encoding the VM does not take, 1 the compiler's refusal above), 0
   different. It was 660 / 31 / 0 of 691 at round 38. Witness 666.
+
+## 2026-11-16 (64): the ISeq compiler in Mere, and the VM's first speed work
+
+**The point.** The compiler that turns a file into the VM's sequences was
+Ruby (lib/iseq_compiler_ext.rb) run by this interpreter, about 3 ms a line:
+the VM could not be the default execution with it. It is now Mere as well
+(ic/), reading libprism's serialized tree directly, and the VM's files are
+compiled with it. Requiring optparse.rb (2,463 lines) on the VM: 6.70 s ->
+0.15 s, start-up included.
+
+- **ic/**: `m_ic_tree.mere` reads the serialized tree into flat stores (a
+  node a number, a field two words; the reader table is generated from
+  prism/config.yml by tools/gen_ic_schema.rb); `m_ic_core.mere` the
+  instruction lists (doubly linked with sentinels, compile.c's
+  LINK_ANCHOR), labels and sequences; `m_ic_finish.mere` compile.c's
+  iseq_optimize, the events, the stack depth, the layout;
+  `m_ic_export.mere` to_a; `m_ic_nodes.mere` prism_compile.c's
+  instructions node by node, in the Ruby compiler's order. main.mere's
+  `ic_vm_native` packs Prism's options, serializes, compiles and turns the
+  answer into values (literals frozen, as the Ruby compiler freezes them).
+  What the native compiler refuses, and a file while Coverage runs (it does
+  not compile branch coverage), goes to the Ruby compiler as before;
+  MERE_RUBY_IC=ruby forces that.
+- **Held to the Ruby compiler** by tools/iseq/native/check.sh (expect.rb
+  writes the Ruby compiler's answer and the serialized tree, dump.mere the
+  native one's, compared as text): the corpus' 694 files, the 698 snippets
+  of tools/iseq, and 613 files of ruby's lib/ and test/ruby/ -- 2,001 of
+  2,006 the same, 2 refused (a hash pattern key that inspects quoted), none
+  different. The tree reader is held to Prism's own tree node by node
+  (tools/iseq/native/tree_check.sh: 694 / 694).
+- **The Ruby compiler held to ruby on ruby's own files** for the first time
+  (compare_files.rb over lib/ and test/ruby/): 50 of 613 differed, in forms
+  the corpus does not have. compile.c takes a label nothing names any more
+  out of the list at once (unref_destination, replace_destination), and
+  its branch-before-jump rule looks at the element just before the jump;
+  the inversion and the branch-to-pop rule keep a label counted that this
+  compiler let go of; an unreachable chunk's labels go too. A String
+  literal under `frozen_string_literal: false` is putstring; __FILE__ is
+  pushed as a literal is; a multi-line `/o` pattern's leave is on its last
+  line; a source declared binary that has UTF-8 bytes compiles in binary
+  (Prism's Ruby side answers UTF-8 there); `[1, "a#{"b"}"]` is static; the
+  disassembly pads the local table in bytes and does not quote a non-ASCII
+  local. Now 1,305 of 1,307 the same as ruby, 2 refused, none different.
+- **Speed** (local -O2, evaluator / VM; the VM was 1.7-2.6 times slower):
+  - two Integers and a plain operator are answered in vm_step, under the
+    evaluator's own conditions (no Integer operator redefined, no
+    TracePoint);
+  - a statement's instructions run in one region (one an instruction
+    before), and a frame's first eight statements in the frame's own --
+    a short block body makes one region a call;
+  - a program statement is not wrapped in a statement region of its own;
+  - vm_exec takes its stack and registers from a pool, given back however
+    the frame is left.
+  3M-iteration `while`: 1.74 / 1.21 s (was 1.79 / 4.34). 10M block calls
+  (`times`): 8.17 / 9.34 s (7.89 / 11.30). Method mix (fib(24), ivar
+  updates, rescues): 0.86 / 1.24 s (0.93 / 1.79). Still slower: a method
+  call (it goes through the evaluator's call with the arguments as
+  expressions), and Array#each over 2M elements, where the VM starts one
+  collection the evaluator does not.
+- **Checked** (local): vm_check 245 / 245; the corpus 694 / 694 on the
+  evaluator; under MERE_RUBY_VM=1, 684 on the VM, 10 fallen back, 0
+  different (with the native compiler and with the speed changes); the
+  gates; test_compile_prism 182, test_coverage 46, newline_test 54,
+  test_pattern_matching 30, test_iseq 63 / 68, test_optimization 84 / 89
+  (the RED as before).
+
