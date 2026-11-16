@@ -450,6 +450,13 @@ class RubyVM::InstructionSequence
         u.insn(:putobject, u.opts[:source_encoding]) unless popped
       when Prism::RegularExpressionNode
         u.insn(:putobject, regexp_literal(n.unescaped, n)) unless popped
+      # PM_MATCH_LAST_LINE_NODE: a pattern as a condition is `pattern =~ $_`
+      when Prism::MatchLastLineNode
+        here(u, n)
+        u.insn(:putobject, regexp_literal(n.unescaped, n))
+        u.insn(:getspecial, 0, 0)
+        push_send(u, :=~, 1)
+        u.insn(:pop) if popped
       # pm_compile_regexp_dynamic: the pieces as an interpolated string's,
       # and toregexp of them with the literal's options
       when Prism::InterpolatedRegularExpressionNode

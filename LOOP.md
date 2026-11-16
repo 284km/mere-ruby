@@ -5073,7 +5073,7 @@ as ruby's does and the VM runs the result.
   space, with the slots a single pattern keeps for its error (the string,
   whether it is a key error, that error's matchee and key); the error
   handler that raises NoMatchingPatternError / NoMatchingPatternKeyError.
-  Against ruby: 447 / 447 snippets, 22 / 22 under branch coverage (`in`
+  Against ruby: 448 / 448 snippets, 22 / 22 under branch coverage (`in`
   clauses are branches), and every corpus file that has a pattern.
 - **Whole files, again** (compare_files: 694 files, 687 the same, 7
   refused, 0 different -- it was 672 / 21): a Range nobody reads is what
@@ -5103,6 +5103,6 @@ as ruby's does and the VM runs the result.
 - **Still refused by the compiler**, of the corpus: a `for` over a target
   that is not a local 3, `/o` 2, END 1, a shareable_constant_value write 1.
 - **Checked** (local, the commit before this note): vm_check 243 / 243,
-  the compiler 447 / 447 snippets, 687 / 687 compiled files, 22 / 22 under
+  the compiler 448 / 448 snippets, 687 / 687 compiled files, 22 / 22 under
   branch coverage, corpus RESULT_EV on the evaluator and RESULT_VM on the
   VM, the gates. Witness 666.
