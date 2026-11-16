@@ -216,6 +216,16 @@ VALUE rb_str_conv_enc_opts(VALUE str, rb_encoding *from, rb_encoding *to, int ec
     (void)ecflags; (void)ecopts;
     return rb_str_conv_enc(str, from, to);
 }
+/* file.c's rb_str_encode_ospath: a path as the OS takes it. On macOS that is
+ * UTF-8 unless the String is binary; elsewhere the bytes as they are. */
+VALUE rb_str_encode_ospath(VALUE path) {
+#ifdef __APPLE__
+    rb_encoding *enc = rb_enc_get(path);
+    if (enc != rb_ascii8bit_encoding() && enc != rb_utf8_encoding())
+        path = rb_str_conv_enc(path, enc, rb_utf8_encoding());
+#endif
+    return path;
+}
 
 /* ---- conversion ------------------------------------------------------------------ */
 VALUE rb_check_string_type(VALUE obj) {

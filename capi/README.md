@@ -155,6 +155,8 @@ its directory, as RubyGems gives it.
 `tools/capi_ext_build.py --ruby-source <tree> --output <dir>` builds every
 directory of ruby's `ext/-test-` without running its `extconf.rb` (those are
 written for ruby's own build tree: they reach into its internal headers).
+The header, type and struct member probes an extconf.rb writes out are
+asked of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
 
 ## What is missing
 
@@ -180,10 +182,10 @@ written for ruby's own build tree: they reach into its internal headers).
 - `tools/capi_check.py` (CI, macOS and Linux): ruby's own
   `ext/-test-/exception`, `typeddata`, `float` and `iter` sources and the
   fixtures in `capi/check` are built twice, against the reference ruby's
-  headers and against these. The five contract scripts in `capi/check` must
+  headers and against these. The six contract scripts in `capi/check` must
   print the same on both sides, and again on this side with a collection at
-  every safepoint. Then five guarantees are switched off one at a time
-  (`MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch|fileprobe`) and the
+  every safepoint. Then six guarantees are switched off one at a time
+  (`MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch|fileprobe|builtin`) and the
   contracts that depend on each must fail.
 - The unit test run builds all of `ext/-test-` and runs `test/-ext-` against
   it, file by file, like every other directory of ruby's tests.

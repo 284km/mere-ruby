@@ -202,6 +202,7 @@ VALUE mr_frame_set_block(VALUE block) {
 }
 ID mr_frame_method(void) { return cur ? cur->method : 0; }
 int mr_frame_keywords(void) { return cur ? cur->keywords : 0; }
+int mr_kw(int kw) { return kw ? MR_SEND_KW : 0; }
 
 VALUE mr_callv(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int flags) {
     mr_put_words(argc, argv);
@@ -477,6 +478,8 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
         /* A C function run as a block belongs to the C method that made it:
          * that method's name, and (after the arguments) that method's block. */
         frame.method = (ID)(req.mu_e & 0xffffffffLL);
+        /* (...and whether what was yielded to it ended in keywords) */
+        frame.keywords = (int)((req.mu_e >> 32) & 1);
         frame.block = mr_word(argc);
     }
     guard.prev = NULL;

@@ -253,11 +253,11 @@ VALUE rb_obj_reveal(VALUE obj, VALUE klass) { (void)klass; return obj; }
 VALUE rb_obj_alloc(VALUE klass) { return mr_call(klass, "allocate", 0); }
 VALUE rb_class_new_instance(int argc, const VALUE *argv, VALUE klass) { return mr_callv(klass, rb_intern("new"), argc, argv, Qnil, 0); }
 VALUE rb_class_new_instance_kw(int argc, const VALUE *argv, VALUE klass, int kw) {
-    return mr_callv(klass, rb_intern("new"), argc, argv, Qnil, kw ? MR_SEND_KW : 0);
+    return mr_callv(klass, rb_intern("new"), argc, argv, Qnil, mr_kw(kw));
 }
 VALUE rb_class_new_instance_pass_kw(int argc, const VALUE *argv, VALUE klass) { return rb_class_new_instance(argc, argv, klass); }
 void rb_obj_call_init(VALUE obj, int argc, const VALUE *argv) { mr_callv(obj, rb_intern("initialize"), argc, argv, mr_frame_block(), 0); }
-void rb_obj_call_init_kw(VALUE obj, int argc, const VALUE *argv, int kw) { mr_callv(obj, rb_intern("initialize"), argc, argv, mr_frame_block(), kw ? MR_SEND_KW : 0); }
+void rb_obj_call_init_kw(VALUE obj, int argc, const VALUE *argv, int kw) { mr_callv(obj, rb_intern("initialize"), argc, argv, mr_frame_block(), mr_kw(kw)); }
 VALUE rb_obj_method(VALUE obj, VALUE name) { return mr_callk(obj, "method", 1, name); }
 int rb_obj_method_arity(VALUE obj, ID id) { return NUM2INT(mr_call(mr_callk(obj, "method", 1, ID2SYM(id)), "arity", 0)); }
 int rb_mod_method_arity(VALUE module, ID id) { return NUM2INT(mr_call(mr_call(module, "instance_method", 1, ID2SYM(id)), "arity", 0)); }
@@ -345,9 +345,9 @@ VALUE rb_data_typed_object_zalloc(VALUE klass, size_t size, const rb_data_type_t
 #undef rb_funcallv_public
 #undef rb_funcall_passing_block
 VALUE rb_funcallv(VALUE recv, ID mid, int argc, const VALUE *argv) { return mr_callv(recv, mid, argc, argv, Qnil, 0); }
-VALUE rb_funcallv_kw(VALUE recv, ID mid, int argc, const VALUE *argv, int kw) { return mr_callv(recv, mid, argc, argv, Qnil, kw ? MR_SEND_KW : 0); }
+VALUE rb_funcallv_kw(VALUE recv, ID mid, int argc, const VALUE *argv, int kw) { return mr_callv(recv, mid, argc, argv, Qnil, mr_kw(kw)); }
 VALUE rb_funcallv_public(VALUE recv, ID mid, int argc, const VALUE *argv) { return mr_callv(recv, mid, argc, argv, Qnil, MR_SEND_PUBLIC); }
-VALUE rb_funcallv_public_kw(VALUE recv, ID mid, int argc, const VALUE *argv, int kw) { return mr_callv(recv, mid, argc, argv, Qnil, MR_SEND_PUBLIC | (kw ? MR_SEND_KW : 0)); }
+VALUE rb_funcallv_public_kw(VALUE recv, ID mid, int argc, const VALUE *argv, int kw) { return mr_callv(recv, mid, argc, argv, Qnil, MR_SEND_PUBLIC | (mr_kw(kw))); }
 VALUE rb_funcall(VALUE recv, ID mid, int argc, ...) {
     VALUE *argv = argc > 0 ? alloca(sizeof(VALUE) * (size_t)argc) : NULL;
     va_list ap;
@@ -357,14 +357,14 @@ VALUE rb_funcall(VALUE recv, ID mid, int argc, ...) {
     return mr_callv(recv, mid, argc, argv, Qnil, 0);
 }
 VALUE rb_funcall_passing_block(VALUE recv, ID mid, int argc, const VALUE *argv) { return mr_callv(recv, mid, argc, argv, mr_frame_block(), MR_SEND_PUBLIC); }
-VALUE rb_funcall_passing_block_kw(VALUE recv, ID mid, int argc, const VALUE *argv, int kw) { return mr_callv(recv, mid, argc, argv, mr_frame_block(), MR_SEND_PUBLIC | (kw ? MR_SEND_KW : 0)); }
+VALUE rb_funcall_passing_block_kw(VALUE recv, ID mid, int argc, const VALUE *argv, int kw) { return mr_callv(recv, mid, argc, argv, mr_frame_block(), MR_SEND_PUBLIC | (mr_kw(kw))); }
 VALUE rb_funcall_with_block(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block) { return mr_callv(recv, mid, argc, argv, block, MR_SEND_PUBLIC); }
-VALUE rb_funcall_with_block_kw(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int kw) { return mr_callv(recv, mid, argc, argv, block, MR_SEND_PUBLIC | (kw ? MR_SEND_KW : 0)); }
+VALUE rb_funcall_with_block_kw(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int kw) { return mr_callv(recv, mid, argc, argv, block, MR_SEND_PUBLIC | (mr_kw(kw))); }
 VALUE rb_check_funcall(VALUE recv, ID mid, int argc, const VALUE *argv) {
     if (!rb_obj_respond_to(recv, mid, 1)) return Qundef;
     return mr_callv(recv, mid, argc, argv, Qnil, 0);
 }
 VALUE rb_call_super(int argc, const VALUE *argv) { return mr_callv(Qnil, 0, argc, argv, mr_frame_block(), MR_SEND_SUPER); }
-VALUE rb_call_super_kw(int argc, const VALUE *argv, int kw) { return mr_callv(Qnil, 0, argc, argv, mr_frame_block(), MR_SEND_SUPER | (kw ? MR_SEND_KW : 0)); }
+VALUE rb_call_super_kw(int argc, const VALUE *argv, int kw) { return mr_callv(Qnil, 0, argc, argv, mr_frame_block(), MR_SEND_SUPER | (mr_kw(kw))); }
 VALUE rb_current_receiver(void) { return mr_callv(Qnil, 0, 0, NULL, Qnil, MR_SEND_SUPER | 16); }
 VALUE rb_apply(VALUE recv, ID mid, VALUE args) { return mr_callv(recv, mid, RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, 0); }

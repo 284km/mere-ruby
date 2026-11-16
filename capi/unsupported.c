@@ -44,12 +44,11 @@ UNSUPPORTED(rb_postponed_job_register_one) UNSUPPORTED(rb_postponed_job_trigger)
 UNSUPPORTED(rb_internal_thread_add_event_hook) UNSUPPORTED(rb_internal_thread_remove_event_hook)
 UNSUPPORTED(rb_thread_lock_native_thread) UNSUPPORTED(rb_thread_prevent_fork)
 UNSUPPORTED(rb_bug_reporter_add) UNSUPPORTED(rb_iseq_load)
-UNSUPPORTED(onig_get_parse_depth_limit) UNSUPPORTED(onig_set_parse_depth_limit)
 UNSUPPORTED(rb_tracepoint_enabled_p) UNSUPPORTED(rb_enc_alias)
 /* the Random interface */
 UNSUPPORTED(rb_random_base_init) UNSUPPORTED(rb_random_mark)
 /* encoding converters, and the rest */
-UNSUPPORTED(rb_econv_str_append) UNSUPPORTED(rb_marshal_define_compat) UNSUPPORTED(rb_stat_new)
+UNSUPPORTED(rb_econv_str_append) UNSUPPORTED(rb_marshal_define_compat)
 UNSUPPORTED(rb_setup_fake_str) UNSUPPORTED(rb_str_normalize_ospath)
 
 /* Declared as data: an extension that names one links, and finds it empty. */

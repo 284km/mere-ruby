@@ -10,7 +10,12 @@ on the load path. The C sources are compiled unchanged.
 
 This reads extconf.rb instead of running it: mkmf needs an RbConfig this
 interpreter does not have yet. What it takes from each file is the feature
-name, auto_ext's TEST_INIT_FUNCS, and nothing else -- an extension whose
+name, auto_ext's TEST_INIT_FUNCS, and the answers to three probes when their
+arguments are written out -- have_header over a %w list, have_type and
+have_struct_member -- each asked of the compiler the way mkmf asks (a source
+that compiles or does not), and passed as mkmf would pass it (-DHAVE_...).
+ext/-test-/file is the one that needs them: without HAVE_STRUCT_STATFS_...
+its Bug::File::Fs.fsname answers nil for every path. An extension whose
 extconf.rb decides more than that (have_func, C++ probes) is built from the
 same sources without those answers, and says so in the report.
 
@@ -52,6 +57,47 @@ for directory in (args.headers or [ROOT / 'capi' / 'include']):
     CFLAGS += ['-I', str(Path(directory).resolve())]
 
 
+def compiles(source):
+    result = subprocess.run([args.cc, '-w', '-fsyntax-only', '-x', 'c', '-'], input=source,
+                            capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def macro(name):
+    """mkmf's tr_cpp: the name a probe's answer is defined under."""
+    return re.sub(r'[^A-Z0-9_]+', '_', name.strip().upper().replace('*', 'P'))
+
+
+def probes(text):
+    """(-D options, whether a probe was left unanswered) for an extconf.rb.
+
+    The file is read top to bottom; `headers` is whatever the last
+    `headers = %w[...].select {|h| have_header(h)}` kept. A member of a type
+    that does not exist does not compile either, so the `if have_type(...)`
+    around the member probes needs no evaluating."""
+    defines, headers, unanswered = [], [], False
+    for line in text.splitlines():
+        line = line.split('#')[0]
+        listed = re.search(r'headers\s*=\s*%w\[([^\]]*)\]\.select\s*\{\|h\|\s*have_header\(h\)\}', line)
+        typed = re.search(r'have_type\("([^"]+)",\s*headers\)', line)
+        member = re.search(r'have_struct_member\("([^"]+)",\s*"([^"]+)",\s*headers\)', line)
+        include = ''.join(f'#include <{h}>\n' for h in headers)
+        if listed:
+            headers = [h for h in listed.group(1).split() if compiles(f'#include <{h}>\n')]
+            defines += ['-DHAVE_' + macro(h) for h in headers]
+        elif typed:
+            if compiles(include + f'typedef {typed.group(1)} conftest_type;\n'
+                        'int conftestval[sizeof(conftest_type)?1:-1];\n'):
+                defines.append('-DHAVE_TYPE_' + macro(typed.group(1)))
+        elif member:
+            kind, name = member.groups()
+            if compiles(include + f'int s = (char *)&(({kind}*)0)->{name} - (char *)0;\n'):
+                defines += [f'-DHAVE_{macro(kind)}_{macro(name)}', '-DHAVE_ST_' + macro(name)]
+        elif re.search(r'have_(func|header|type|struct_member|library|macro)|try_(link|compile)|have_devel', line):
+            unanswered = True
+    return defines, unanswered
+
+
 def plan(extconf):
     directory = extconf.parent
     relative = directory.relative_to(EXT)
@@ -61,9 +107,11 @@ def plan(extconf):
     feature = named.group(1) if named else '-test-/' + str(relative)
     sources = sorted(p for p in directory.iterdir() if p.suffix in ('.c', '.cc', '.cpp', '.cxx'))
     notes = []
-    if re.search(r'have_(func|header|type|library|macro)|try_(link|compile)|have_devel', text):
+    defines, unanswered = probes(text)
+    if defines:
+        notes.append('probes answered by the compiler: ' + ' '.join(d[2:] for d in defines))
+    if unanswered:
         notes.append('extconf.rb probes the platform; built without its answers')
-    defines = []
     if auto:
         inits = ' '.join(f'X({p.stem})' for p in sources if p.stem != 'init')
         defines.append(f'-DTEST_INIT_FUNCS(X)={inits}')

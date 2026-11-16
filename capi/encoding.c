@@ -508,3 +508,13 @@ int mr_encoding_unit(VALUE str) {
     rb_encoding *enc = rb_enc_get(str);
     return enc ? rb_enc_mbminlen(enc) : 1;
 }
+
+/* How deep a pattern's groups and character classes may nest before it is
+ * refused ("parse depth limit over"): the regexp engine's limit, which is
+ * the interpreter's parser's here. 0 puts ruby's default (4096) back. */
+#include "ruby/onigmo.h"
+unsigned int onig_get_parse_depth_limit(void) { return (unsigned int)(uintptr_t)mr_up(MR_RX_DEPTH, 0, 0, 0, 0, 0); }
+int onig_set_parse_depth_limit(unsigned int depth) {
+    mr_up(MR_RX_DEPTH, 1, (VALUE)depth, 0, 0, 0);
+    return 0;
+}

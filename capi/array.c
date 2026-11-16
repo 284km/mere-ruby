@@ -277,7 +277,7 @@ VALUE rb_enumeratorize_with_size_kw(VALUE obj, VALUE meth, int argc, const VALUE
     (void)size;
     VALUE args = rb_ary_new_from_values(argc, argv);
     rb_ary_unshift(args, meth);
-    return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, kw ? MR_SEND_KW : 0);
+    return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, mr_kw(kw));
 }
 int rb_arithmetic_sequence_extract(VALUE obj, rb_arithmetic_sequence_components_t *component) {
     if (RTEST(rb_obj_is_kind_of(obj, mr_const("Enumerator::ArithmeticSequence")))) {

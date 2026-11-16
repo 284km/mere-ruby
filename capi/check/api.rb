@@ -176,4 +176,56 @@ check(raises(IOError) { A.io_facts(wr) }.message == 'not opened for reading')
 rd.close
 check(raises(IOError) { A.io_facts(rd) }.message == 'closed stream')
 wr.close
+
+# A block function C passed is told whether it was yielded keywords, and
+# rb_yield_block hands them to the C method's block as keywords.
+class Yielder
+  def keywords = yield(a: 1)
+  def hash = yield({ a: 1 })
+  def both = yield(1, b: 2)
+end
+y = Yielder.new
+check(A.block_keywords(y, :keywords) == [1, true])
+check(A.block_keywords(y, :hash) == [1, false])
+check(A.block_keywords(y, :both) == [2, true])
+check(A.yield_through(y, :keywords) { |*a, **kw| [a, kw] } == [[], { a: 1 }])
+check(A.yield_through(y, :hash) { |*a, **kw| [a, kw] } == [[{ a: 1 }], {}])
+check(A.yield_through(y, :both) { |*a, **kw| [a, kw] } == [[1], { b: 2 }])
+
+# rb_stat_new: the File::Stat of a struct stat C filled.
+st = A.stat_new(__FILE__)
+own = File.stat(__FILE__)
+check(st.instance_of?(File::Stat))
+# (not the device: on Linux ruby keeps a statx, and what it copies from a
+#  struct stat leaves the device numbers out)
+check([st.size, st.ino, st.mode, st.nlink, st.uid, st.gid] == [own.size, own.ino, own.mode, own.nlink, own.uid, own.gid])
+check(st.file? && !st.directory? && st.mtime == own.mtime)
+check((st <=> own) == 0)
+check(A.stat_new(__dir__).directory?)
+check(raises(Errno::ENOENT) { A.stat_new(__FILE__ + '.absent') }.is_a?(SystemCallError))
+
+# The regexp parser's nesting bound is one number: what C sets, the parser
+# obeys, and 0 puts the default back.
+default = A.parse_depth
+check(default == 4096)
+nested = '(' * 30 + 'a' + ')' * 30
+check(Regexp.new(nested).match?('a'))
+check(A.set_parse_depth(10) == 0)
+check(A.parse_depth == 10)
+check(raises(RegexpError) { Regexp.new(nested) }.message.start_with?('parse depth limit over: /(((('))
+check(raises(RegexpError) { Regexp.new('[' * 30 + 'a' + ']' * 30) }.message.start_with?('parse depth limit over: /[[[['))
+check(Regexp.new('((a))').match?('a'))
+check(A.set_parse_depth(0) == 0)
+check(A.parse_depth == default)
+check(Regexp.new(nested).match?('a'))
+
+# rb_str_encode_ospath: UTF-8 on macOS unless the String is binary; the
+# String itself elsewhere.
+euc = "\u3042".encode('EUC-JP')
+mac = RUBY_PLATFORM.include?('darwin')
+check(A.ospath(euc).encoding == (mac ? Encoding::UTF_8 : Encoding::EUC_JP))
+check(A.ospath(euc).bytes == (mac ? "\u3042".bytes : euc.bytes))
+check(A.ospath(euc.b).equal?(euc.b) == false && A.ospath(euc.b).encoding == Encoding::BINARY)
+utf = "\u3042"
+check(A.ospath(utf).equal?(utf))
 puts "api contracts: #{$count} passed"

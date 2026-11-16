@@ -1,6 +1,10 @@
 /* Shared test extension: points of the C API where what C does must not
  * depend on what Ruby code around it did. Compiled for both runtimes. */
 #include <ruby.h>
+#include <ruby/encoding.h>
+#include <ruby/onigmo.h>
+#include <ruby/io.h>
+#include <sys/stat.h>
 
 /* A pointer C took before the block it yields to gave up the Fiber: the
  * write through it, after the Fiber is resumed, is a write to the String. */
@@ -88,6 +92,38 @@ static VALUE io_facts(VALUE self, VALUE io) {
                                 (fptr->mode & FMODE_WRITABLE) ? Qtrue : Qfalse);
 }
 
+/* A block function is told whether it was yielded keywords, and
+ * rb_yield_block hands them on as keywords. */
+static VALUE kw_body(RB_BLOCK_CALL_FUNC_ARGLIST(yielded, data)) {
+    (void)yielded; (void)data; (void)blockarg; (void)argv;
+    return rb_ary_new_from_args(2, INT2FIX(argc), rb_keyword_given_p() ? Qtrue : Qfalse);
+}
+static VALUE block_keywords(VALUE self, VALUE obj, VALUE name) {
+    (void)self;
+    return rb_block_call(obj, SYM2ID(name), 0, 0, kw_body, Qnil);
+}
+static VALUE yield_through(VALUE self, VALUE obj, VALUE name) {
+    (void)self;
+    return rb_block_call(obj, SYM2ID(name), 0, 0, rb_yield_block, Qnil);
+}
+
+/* rb_stat_new: a File::Stat of what stat(2) answered to C. */
+static VALUE stat_new(VALUE self, VALUE path) {
+    struct stat st;
+    (void)self;
+    if (stat(StringValueCStr(path), &st) != 0) rb_sys_fail_str(path);
+    return rb_stat_new(&st);
+}
+
+/* The regexp parser's nesting bound, read and set from C. */
+static VALUE parse_depth(VALUE self) { (void)self; return UINT2NUM(onig_get_parse_depth_limit()); }
+static VALUE set_parse_depth(VALUE self, VALUE depth) {
+    (void)self;
+    return INT2FIX(onig_set_parse_depth_limit(NUM2UINT(depth)));
+}
+
+static VALUE ospath(VALUE self, VALUE path) { (void)self; return rb_str_encode_ospath(path); }
+
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
     rb_define_singleton_method(mod, "ptr_after_yield", ptr_after_yield, 1);
@@ -108,6 +144,12 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "set_match", set_match, 1);
     rb_define_singleton_method(mod, "strtoul", strtoul_of, 2);
     rb_define_singleton_method(mod, "io_facts", io_facts, 1);
+    rb_define_singleton_method(mod, "block_keywords", block_keywords, 2);
+    rb_define_singleton_method(mod, "yield_through", yield_through, 2);
+    rb_define_singleton_method(mod, "stat_new", stat_new, 1);
+    rb_define_singleton_method(mod, "parse_depth", parse_depth, 0);
+    rb_define_singleton_method(mod, "set_parse_depth", set_parse_depth, 1);
+    rb_define_singleton_method(mod, "ospath", ospath, 1);
     /* classes under a module under a module, all of them made here: a class
      * C defines is a class by that name like any other */
     VALUE mid = rb_define_module_under(mod, "Mid");

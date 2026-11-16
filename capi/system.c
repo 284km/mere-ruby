@@ -208,6 +208,19 @@ VALUE rb_io_getbyte(VALUE io) { return mr_call(io, "getbyte", 0); }
 VALUE rb_io_close(VALUE io) { return mr_call(io, "close", 0); }
 VALUE rb_io_flush(VALUE io) { return mr_call(io, "flush", 0); }
 VALUE rb_io_eof(VALUE io) { return mr_call(io, "eof?", 0); }
+/* A File::Stat of a struct stat C filled (stat(2), fstat(2)): the snapshot a
+ * File::Stat is here, made of the struct's fields. */
+#include <sys/stat.h>
+VALUE rb_stat_new(const struct stat *st) {
+    VALUE fields = rb_ary_new_from_args(13,
+        ULL2NUM((unsigned long long)st->st_dev), ULL2NUM((unsigned long long)st->st_ino), UINT2NUM((unsigned int)st->st_mode),
+        ULL2NUM((unsigned long long)st->st_nlink), UINT2NUM((unsigned int)st->st_uid), UINT2NUM((unsigned int)st->st_gid),
+        ULL2NUM((unsigned long long)st->st_rdev), LL2NUM((long long)st->st_size), LL2NUM((long long)st->st_atime),
+        LL2NUM((long long)st->st_mtime), LL2NUM((long long)st->st_ctime), LL2NUM((long long)st->st_blksize),
+        LL2NUM((long long)st->st_blocks));
+    return mr_call(mr_ruby("->(f) { s = File::Stat.allocate; s.instance_variable_set(:@h, File::Stat.__fields(f, nil, true)); s }"),
+                   "call", 1, fields);
+}
 VALUE rb_io_binmode(VALUE io) { return mr_call(io, "binmode", 0); }
 /* (what takes RFILE(io)->fptr: the IO the struct names is what is asked) */
 void rb_io_check_closed(rb_io_t *fptr) {
