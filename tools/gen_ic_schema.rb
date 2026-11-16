@@ -2,7 +2,7 @@
 # note 552) knows of Prism's nodes -- each type's number, how its fields are
 # written in the serialized form, a reader for every field, and the flags.
 #
-#   . ./tools/ref_ruby.sh && ruby tools/gen_ic_schema.rb <ruby-src> > m_ic_schema.mere
+#   . ./tools/ref_ruby.sh && ruby tools/gen_ic_schema.rb <ruby-src> > ic/m_ic_schema.mere
 #
 # The source is <ruby-src>/prism/config.yml, the file Prism's own templates
 # generate node.rb, serialize.rb and serialize.c from: a node's type number
