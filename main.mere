@@ -4637,139 +4637,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | _ ->
        let recv = eval_e env world blk recv_e in
        let args = eval_args env world blk arges in
-       let _ = (if vec_get moved_on 0 == 1 then moved_guard world recv name args else VNil) in
-       // a mutating call on a frozen String/Array/Hash raises FrozenError
-       // before the in-place fast paths below (which bypass invoke_val_c) --
-       // except for a yielder called with NO block, which mutates nothing and
-       // hands back an Enumerator (the error waits for its #each).
-       let _ = chill_touch world recv name in
-       let _ = (if builtin_mut_on_frozen world recv name
-                   && (if enum_needs_block name || transform_bang_bare name args then false else true)
-                   && (if delete_is_noop env world recv name args then false else true)
-                   && (if arr_mut_arity_wrong recv name args then false else true)
-                   && (if str_mut_arity_first world recv name args then false else true)
-                then let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect env world recv) (Cons (("__recv", recv), Nil)) in ()
-                else ()) in
-       // a `self.`-receiver call may reach private methods (always for a
-       // setter, and generally in modern Ruby).
-       let vis = (match recv_e with ESelf -> false | _ -> true) in
-       // send / __send__ dispatch a runtime method name; respond_to? probes.
-       if ((str_len name == 4 && str_eq name "send") || (str_len name == 8 && str_eq name "__send__") || (str_len name == 11 && str_eq name "public_send"))
-          && (if user_defines_send world recv name then false else true) then
-         // public_send respects visibility; send/__send__ bypass it.
-         ps_frame (str_len name == 11 && str_eq name "public_send") (fn (u: unit) ->
-         let vis = (str_len name == 11 && str_eq name "public_send") in
-         let m = send_name_arg env world args in
-         let rest = (match args with Cons (_, r) -> r | Nil -> Nil) in
-         let _ = (if vis then public_send_guard world recv m else ()) in
-         (if str_eq m "eval" then do_eval env world blk rest
-          // (main.using, private, reached by send: see do_using_main)
-          else if (str_len m == 5 && str_eq m "using") && (if vis then false else true)
-                  && main_like world recv then do_using_main env world rest
-          else invoke_val_c env world blk recv m rest vis))
-       // ⚠ a class that DEFINES #respond_to? answers with it, and with whatever
-       // it returns: this arm used to answer for every receiver, so an override
-       // was reached only through the internal probe (which reads it for
-       // truthiness) and `def respond_to?(s, a=false); :MINE; end` answered
-       // `true`. Falling through dispatches it like any other method.
-       else if (str_len name == 11 && str_eq name "respond_to?")
-               && (if has_meth world (dispatch_cls_of world recv) "respond_to?" then false else true) then
-         respond_to_answer env world recv args
-       // in-place string mutation: rewrite the receiver's store entry, so
-       // every alias sees it (unless the class redefines the method).
-       else if (match recv with VStr _ -> true | _ -> false)
-               && (is_str_mut name || (str_len name == 3 && str_eq name "[]="))
-               && (if has_meth world (dispatch_cls_of world recv) name then false else true)
-               // (...nor one an active refinement redefines: `refine(String) {
-               //  def chop! }` was passed by, Bug #8880)
-               && (map_len ref_active == 0 || str_eq (refined_impl_for world recv name) "") then
-         // the count first, as invoke_val_c0 asks it: `"foo".slice!` and
-         // `s.chomp!("", "")` came here and never met the table.
-         let __am = builtin_arity_msg world recv name args in
-         if (if str_eq __am "" then false else true) then raise_exc world "ArgumentError" __am else
-         (match recv with
-          | VStr h ->
-            // []= duck-types its index: something with #begin AND #end is a
-            // Range (ruby asks before #to_int, which is how a permissive mock
-            // becomes a nil..nil range replacing the whole string); otherwise
-            // to_str then to_int, as everywhere else.
-            let args = (if (str_len name == 3 && str_eq name "[]=") then
-                          (match args with
-                           // the range protocol applies only to the 2-arg form
-                           // (index, value); (index, count, value) converts
-                           // both counts with #to_int.
-                           | Cons (VObj _, Cons (_, Nil)) ->
-                             (match args with
-                              | Cons (a0, _) ->
-                                (if range_like_obj world a0 then
-                                   (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-                                    let bv = invoke_val_c env world nb a0 "begin" Nil false in
-                                    let ev = invoke_val_c env world nb a0 "end" Nil false in
-                                    let ex = truthy (invoke_val_c env world nb a0 "exclude_end?" Nil false) in
-                                    Cons (VRange (bv, ev, ex), coerce_str_int_args env world (match args with Cons (_, r9) -> r9 | _ -> Nil)))
-                                 else coerce_str_int_args env world args)
-                              | _ -> args)
-                           | _ ->
-                             (let cv = coerce_str_int_args env world args in
-                              // a capture index whose #to_int answered a
-                              // non-Integer is ruby's own conversion error.
-                              match cv with
-                              | Cons (VRegex (_, _, _), Cons (VObj o2, Cons (_, Nil))) ->
-                                (if responds world (VObj o2) "to_int" then
-                                   (let nb2 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                                    match invoke_val_c env world nb2 (VObj o2) "to_int" Nil false with
-                                    | VInt _ -> cv
-                                    | ov -> (match raise_exc world "TypeError"
-                                                     ("can't convert " ++ class_name (VObj o2) ++ " to Integer ("
-                                                      ++ class_name (VObj o2) ++ "#to_int gives " ++ class_name ov ++ ")") with
-                                             | _ -> cv))
-                                 else cv)
-                              | _ -> cv))
-                        // slice! shares slice's index conversions (range
-                        // protocol, per-bound #to_int, Float truncation).
-                        else if (str_len name == 6 && str_eq name "slice!") then coerce_slice_args env world args
-                        // append_as_bytes refuses #to_str -- the same exception
-                        // the explicit-receiver path makes, and the same reason
-                        // (see there). Two callers of is_str_mut, two places.
-                        else if (str_len name == 15 && str_eq name "append_as_bytes") then args
-                        else coerce_dyck_args env world recv args) in
-            (if (str_len name == 6 && str_eq name "slice!") && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false)
-             then str_slice_bang_rx env world h args
-             else str_mut_do h name args)
-          | _ -> VNil)
-       // in-place hash mutation: rewrite the receiver's store entry.
-       // ⚠ "does the program define it" is asked of the RECEIVER'S class, not
-       //   of Hash: a subclass's own #[]= (test-unit's StringifyKeyHash turns
-       //   every key into a String) was bypassed by `h[k] = v` and `h[k] ||= v`
-       //   while its #[] was honoured, so a value stored under :a was looked up
-       //   as "a" and test-unit could not load.
-       else if (match recv with VHsh _ -> true | _ -> false)
-               && ((str_len name == 3 && str_eq name "[]=") || (str_len name == 5 && str_eq name "store"))
-               && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
-         (match recv with
-          | VHsh h -> (match args with
-                       | Cons (k, Cons (v, _)) ->
-                         (let k9 = hash_store_key env world h k in
-                          hput_or_queue_w env world h (hcbi_on h) k9 v (fn (u: unit) -> hash_put_wx env world h (hcbi_on h) (hderef h) k9 v))
-                       | _ -> VNil)
-          | _ -> VNil)
-       // an attribute-writer call (`recv.foo = v`, `recv[i] = v`) has the
-       // assigned value as its expression result, not the writer's return.
-       // A call with no block literal and no `&` passes NO block. `blk` here
-       // is the FRAME's block -- the one this method or block body was itself
-       // given, which is what `yield` reads -- and handing it on made every
-       // builtin that asks "was a block given?" see one that was never passed.
-       // The frame block is present exactly when a proc is invoked through an
-       // `&b` parameter (`def w(&b); b.call; end`): inside `w { (0...2**64)
-       // .min(2) }` the arithmetic arm stood aside for a "given" block and the
-       // iterating path answered [], while the same expression at the prompt
-       // answered [0, 1]. Every ruby/spec example runs in that shape.
-       // (...a writer called with NOTHING -- `o.[]=`, a method named by the
-       //  call syntax, not an assignment -- answers its own value)
-       else if is_setter_name name && (match args with Nil -> false | _ -> true) then
-         let _ = invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv name args vis in
-         (match rev_app args Nil with Cons (v, _) -> v | Nil -> VNil)
-       else invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv name args vis)
+       emethod_args env world blk recv name args (match recv_e with ESelf -> false | _ -> true))
   | EMethodB (recv_e, name, arges, bp0, bb) ->
     let recv = eval_e env world blk recv_e in
     let args = eval_args env world blk arges in
@@ -46287,6 +46155,143 @@ and main_sng_has = fn world -> fn (name: str) ->
                             else go9 t9)) in
      go9 (ancestors_of world sc9))
   else false
+// a call with a receiver, its receiver and arguments values already: what the
+// EMethod arm does past its written-receiver forms (vis: not self -- a
+// receiver written other than `self`, which may not reach a private method)
+and emethod_args = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vis: bool) ->
+  let (meths, sup, ocls, ivars) = world in
+       let _ = (if vec_get moved_on 0 == 1 then moved_guard world recv name args else VNil) in
+       // a mutating call on a frozen String/Array/Hash raises FrozenError
+       // before the in-place fast paths below (which bypass invoke_val_c) --
+       // except for a yielder called with NO block, which mutates nothing and
+       // hands back an Enumerator (the error waits for its #each).
+       let _ = chill_touch world recv name in
+       let _ = (if builtin_mut_on_frozen world recv name
+                   && (if enum_needs_block name || transform_bang_bare name args then false else true)
+                   && (if delete_is_noop env world recv name args then false else true)
+                   && (if arr_mut_arity_wrong recv name args then false else true)
+                   && (if str_mut_arity_first world recv name args then false else true)
+                then let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect env world recv) (Cons (("__recv", recv), Nil)) in ()
+                else ()) in
+       // a `self.`-receiver call may reach private methods (always for a
+       // setter, and generally in modern Ruby).
+       // send / __send__ dispatch a runtime method name; respond_to? probes.
+       if ((str_len name == 4 && str_eq name "send") || (str_len name == 8 && str_eq name "__send__") || (str_len name == 11 && str_eq name "public_send"))
+          && (if user_defines_send world recv name then false else true) then
+         // public_send respects visibility; send/__send__ bypass it.
+         ps_frame (str_len name == 11 && str_eq name "public_send") (fn (u: unit) ->
+         let vis = (str_len name == 11 && str_eq name "public_send") in
+         let m = send_name_arg env world args in
+         let rest = (match args with Cons (_, r) -> r | Nil -> Nil) in
+         let _ = (if vis then public_send_guard world recv m else ()) in
+         (if str_eq m "eval" then do_eval env world blk rest
+          // (main.using, private, reached by send: see do_using_main)
+          else if (str_len m == 5 && str_eq m "using") && (if vis then false else true)
+                  && main_like world recv then do_using_main env world rest
+          else invoke_val_c env world blk recv m rest vis))
+       // ⚠ a class that DEFINES #respond_to? answers with it, and with whatever
+       // it returns: this arm used to answer for every receiver, so an override
+       // was reached only through the internal probe (which reads it for
+       // truthiness) and `def respond_to?(s, a=false); :MINE; end` answered
+       // `true`. Falling through dispatches it like any other method.
+       else if (str_len name == 11 && str_eq name "respond_to?")
+               && (if has_meth world (dispatch_cls_of world recv) "respond_to?" then false else true) then
+         respond_to_answer env world recv args
+       // in-place string mutation: rewrite the receiver's store entry, so
+       // every alias sees it (unless the class redefines the method).
+       else if (match recv with VStr _ -> true | _ -> false)
+               && (is_str_mut name || (str_len name == 3 && str_eq name "[]="))
+               && (if has_meth world (dispatch_cls_of world recv) name then false else true)
+               // (...nor one an active refinement redefines: `refine(String) {
+               //  def chop! }` was passed by, Bug #8880)
+               && (map_len ref_active == 0 || str_eq (refined_impl_for world recv name) "") then
+         // the count first, as invoke_val_c0 asks it: `"foo".slice!` and
+         // `s.chomp!("", "")` came here and never met the table.
+         let __am = builtin_arity_msg world recv name args in
+         if (if str_eq __am "" then false else true) then raise_exc world "ArgumentError" __am else
+         (match recv with
+          | VStr h ->
+            // []= duck-types its index: something with #begin AND #end is a
+            // Range (ruby asks before #to_int, which is how a permissive mock
+            // becomes a nil..nil range replacing the whole string); otherwise
+            // to_str then to_int, as everywhere else.
+            let args = (if (str_len name == 3 && str_eq name "[]=") then
+                          (match args with
+                           // the range protocol applies only to the 2-arg form
+                           // (index, value); (index, count, value) converts
+                           // both counts with #to_int.
+                           | Cons (VObj _, Cons (_, Nil)) ->
+                             (match args with
+                              | Cons (a0, _) ->
+                                (if range_like_obj world a0 then
+                                   (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+                                    let bv = invoke_val_c env world nb a0 "begin" Nil false in
+                                    let ev = invoke_val_c env world nb a0 "end" Nil false in
+                                    let ex = truthy (invoke_val_c env world nb a0 "exclude_end?" Nil false) in
+                                    Cons (VRange (bv, ev, ex), coerce_str_int_args env world (match args with Cons (_, r9) -> r9 | _ -> Nil)))
+                                 else coerce_str_int_args env world args)
+                              | _ -> args)
+                           | _ ->
+                             (let cv = coerce_str_int_args env world args in
+                              // a capture index whose #to_int answered a
+                              // non-Integer is ruby's own conversion error.
+                              match cv with
+                              | Cons (VRegex (_, _, _), Cons (VObj o2, Cons (_, Nil))) ->
+                                (if responds world (VObj o2) "to_int" then
+                                   (let nb2 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                                    match invoke_val_c env world nb2 (VObj o2) "to_int" Nil false with
+                                    | VInt _ -> cv
+                                    | ov -> (match raise_exc world "TypeError"
+                                                     ("can't convert " ++ class_name (VObj o2) ++ " to Integer ("
+                                                      ++ class_name (VObj o2) ++ "#to_int gives " ++ class_name ov ++ ")") with
+                                             | _ -> cv))
+                                 else cv)
+                              | _ -> cv))
+                        // slice! shares slice's index conversions (range
+                        // protocol, per-bound #to_int, Float truncation).
+                        else if (str_len name == 6 && str_eq name "slice!") then coerce_slice_args env world args
+                        // append_as_bytes refuses #to_str -- the same exception
+                        // the explicit-receiver path makes, and the same reason
+                        // (see there). Two callers of is_str_mut, two places.
+                        else if (str_len name == 15 && str_eq name "append_as_bytes") then args
+                        else coerce_dyck_args env world recv args) in
+            (if (str_len name == 6 && str_eq name "slice!") && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false)
+             then str_slice_bang_rx env world h args
+             else str_mut_do h name args)
+          | _ -> VNil)
+       // in-place hash mutation: rewrite the receiver's store entry.
+       // ⚠ "does the program define it" is asked of the RECEIVER'S class, not
+       //   of Hash: a subclass's own #[]= (test-unit's StringifyKeyHash turns
+       //   every key into a String) was bypassed by `h[k] = v` and `h[k] ||= v`
+       //   while its #[] was honoured, so a value stored under :a was looked up
+       //   as "a" and test-unit could not load.
+       else if (match recv with VHsh _ -> true | _ -> false)
+               && ((str_len name == 3 && str_eq name "[]=") || (str_len name == 5 && str_eq name "store"))
+               && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+         (match recv with
+          | VHsh h -> (match args with
+                       | Cons (k, Cons (v, _)) ->
+                         (let k9 = hash_store_key env world h k in
+                          hput_or_queue_w env world h (hcbi_on h) k9 v (fn (u: unit) -> hash_put_wx env world h (hcbi_on h) (hderef h) k9 v))
+                       | _ -> VNil)
+          | _ -> VNil)
+       // an attribute-writer call (`recv.foo = v`, `recv[i] = v`) has the
+       // assigned value as its expression result, not the writer's return.
+       // A call with no block literal and no `&` passes NO block. `blk` here
+       // is the FRAME's block -- the one this method or block body was itself
+       // given, which is what `yield` reads -- and handing it on made every
+       // builtin that asks "was a block given?" see one that was never passed.
+       // The frame block is present exactly when a proc is invoked through an
+       // `&b` parameter (`def w(&b); b.call; end`): inside `w { (0...2**64)
+       // .min(2) }` the arithmetic arm stood aside for a "given" block and the
+       // iterating path answered [], while the same expression at the prompt
+       // answered [0, 1]. Every ruby/spec example runs in that shape.
+       // (...a writer called with NOTHING -- `o.[]=`, a method named by the
+       //  call syntax, not an assignment -- answers its own value)
+       else if is_setter_name name && (match args with Nil -> false | _ -> true) then
+         let _ = invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv name args vis in
+         (match rev_app args Nil with Cons (v, _) -> v | Nil -> VNil)
+       else invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv name args vis
 and ecall_alias_target = fn env -> fn world -> fn (name: str) ->
   let (meths, _, _, _) = world in
   (if map_len builtin_alias == 0 || map_has meths name then ""
@@ -64309,6 +64314,10 @@ and vm_call_in = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str)
   // (`Kernel.format(..)`: Kernel's functions called on Kernel itself are
   //  what the evaluator makes of that receiver written out)
   else if (match recv with VClass c9 -> str_eq c9 "Kernel" | _ -> false) then vm_ev env world blk (EMethod (EConst "Kernel", mid, all))
+  // (a call of positional values on a receiver: the evaluator's call with
+  //  the values as they are -- emethod_args, the EMethod arm's own half past
+  //  its written-receiver forms)
+  else if plain && (if str_len mid > 2 && str_eq (substring mid 0 2) "__" then false else true) then emethod_args env world blk recv mid args true
   else vm_ev env world blk (EMethod (EVar "__vm~r", mid, all))
 and vm_send = fn env -> fn world -> fn blk -> fn st -> fn (mid: str) -> fn (fl: int) -> fn (argc: int) -> fn (kw: Val) -> fn (bid: int) ->
   let kws = (match kw with VArr k -> deref k | _ -> Nil) in
