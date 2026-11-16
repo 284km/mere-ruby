@@ -5159,3 +5159,15 @@ Witness 681 round-trips held objects and stores, checks conversion calls,
 private/dynamic conversion, one-argument respond_to? overrides, invalid
 return types, Float conversion and preservation after collection. Ruby
 passes; the previous interpreter fails at the first to_int argument.
+
+## 2026-11-17: stage 9, round 7 -- reject swept String identities
+
+_id2ref's String path used the issued-handle boundary alone, so an old ID
+could recover a swept slot as an empty String. __str_of_id now checks the
+existing gc_str_present predicate. This reads actual survivors and fresh
+handles without changing the collector, its roots or its sweep behavior.
+
+Witness 682 releases dynamic Strings, collects and requires rejection of
+collected IDs, while retained empty/nonempty Strings and a fresh empty String
+still round-trip. The reference rejects collected IDs; the old interpreter
+rejects none. No default-collector exclusion or allocation comparison changes.
