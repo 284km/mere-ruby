@@ -576,6 +576,11 @@ let _ = vec_push gc_knob 0;
 let _ = vec_push gc_knob 0;
 //   12 the bytes of the dead string slots inside knob 1's baseline (below)
 let _ = vec_push gc_knob 0;
+//   13 how many classes had been made (cls_made) at the last collection
+//   14 the entry threshold while classes are being made: knob 0 with the
+//      floor it had before, 4,000
+let _ = vec_push gc_knob 0;
+let _ = vec_push gc_knob 4000;
 let gc_str_surv = vec_new ();
 let _ = vec_push gc_str_surv 0;
 let gc_hash_surv = vec_new ();
@@ -708,6 +713,16 @@ let gc_pressure = fn world ->
   if gc_auto_off () then false
   else vec_get gc_knob 5 == 1
   || map_len ivars + map_len ocls > limit
+  // ...with the floor it had before, 4,000 entries, once a class has been
+  // made since the last collection. Dead classes are not small, and a loop
+  // that makes them beside its objects held twice the memory under the
+  // higher floor (test_module's complemented_method_entry leak test: 2.03
+  // times its starting RSS before, 2.43 with the floor at 32,000, against a
+  // limit of 2.0 it already sits on); and a `clone` of an object with a
+  // method of its own, which makes a singleton class, copies that method
+  // out of the whole method table, so `a.clone.set` in a loop ran four
+  // times the instructions. Those loops collect as they did.
+  || (vec_get cls_made 0 != vec_get gc_knob 13 && map_len ivars + map_len ocls > vec_get gc_knob 14)
   // ...and the captured frames waiting in lv_cap, each a frame's arena (4 KB
   // and up) that no store's byte count sees: a loop that makes a lambda per
   // turn and nothing else ran 80k turns without one collection (note 272)
@@ -2471,7 +2486,7 @@ let gc_collect = fn env -> fn world ->
                                      ++ " meths_g=" ++ str_of_int (map_bytes meths_g) ++ " proc_store=" ++ str_of_int (map_bytes proc_store)
                                      ++ " proc_yblk=" ++ str_of_int (map_bytes proc_yblk) ++ "]") else ()) in
     // the next thresholds, set HERE so any caller at any depth inherits the
-    // same amortization: entries = live + max(scan/2, 4000); bytes = the
+    // same amortization: entries = live + max(scan/2, 32000); bytes = the
     // post-collection baseline (gc_pressure fires at 2x it plus 32 MB).
     // (the strings that LIVED, knob 10 -- not str_count, every handle ever
     //  issued: that grew the gap between two collections for as long as the
@@ -2480,9 +2495,22 @@ let gc_collect = fn env -> fn world ->
     // Objects retained by closures cost marking work too. Without their
     // population, an object-heavy live heap collected every 4,000 allocations
     // regardless of its size, repeatedly scanning all earlier survivors.
+    // (the floor was 4,000 entries. A collection has a cost that does not
+    //  depend on what is live -- the suspended stack's words are gathered
+    //  and sorted, the class graph is walked -- and under a deep stack it is
+    //  10 ms and more, so a program with little live that makes small
+    //  objects collected every 1,300 of them: 30% of `Point.new(1, 2)` in a
+    //  loop, a quarter of test_ast's walks, which make six position objects
+    //  a node. At 32,000 the walks execute 11% fewer instructions, the peak
+    //  RSS is the same, and every program of tools/loop_rss_check.sh holds
+    //  its bound; a small program's peak RSS is 20 to 40 MB higher. While
+    //  classes are being made the floor is the old one: knob 14, and
+    //  gc_pressure. Note 551 §8.)
     let scan = map_len arr_store + map_len hash_store + map_len ocls + vec_get gc_knob 10 in
-    let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
+    let delta = (if scan / 2 > 32000 then scan / 2 else 32000) in
     let _ = vec_set gc_knob 0 (map_len ivars + map_len ocls + delta) in
+    let _ = vec_set gc_knob 13 (vec_get cls_made 0) in
+    let _ = vec_set gc_knob 14 (map_len ivars + map_len ocls + (if scan / 2 > 4000 then scan / 2 else 4000)) in
     let _ = vec_set gc_knob 1 (gc_store_bytes ()) in
     // ⚠ the dead slots' share of that baseline. A string handle is never
     //   reused, so every String ever made leaves a stub in str_store that no
@@ -7160,7 +7188,7 @@ and gvar_assign_checked = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
        (let (_, _, _, iv9) = world in
         let pfx9 = hng_key v ++ "@" in
         let ivs9 = map_new () in
-        let _ = (if sfrozen_get h9 then
+        let _ = (if sfrozen_get h9 && vec_get hiv_made 0 > 0 then
                    map_iter iv9 (fn (k9: str) -> fn (x9: Val) ->
                      if str_len k9 > str_len pfx9 && str_eq (substring k9 0 (str_len pfx9)) pfx9 then map_set ivs9 "y" 1 else ())
                  else ()) in
@@ -18239,7 +18267,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      let oldp = hng_key recv ++ "@" in
      let newp = hng_key cp ++ "@" in
      let tmp9 = map_new () in
-     let _ = (if str_eq (hng_key cp) "" then () else
+     let _ = (if str_eq (hng_key cp) "" || vec_get hiv_made 0 == 0 then () else
                 map_iter ivars9 (fn (k: str) -> fn (v: Val) ->
                   if str_len k > str_len oldp && str_eq (substring k 0 (str_len oldp)) oldp
                   then map_set tmp9 (newp ++ substring k (str_len oldp) (str_len k)) v
@@ -19530,10 +19558,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       let oldp9 = hng_key (VHsh h9) ++ "@" in
                       let newp9 = hng_key cp9 ++ "@" in
                       let tmp9 = map_new () in
-                      let _ = map_iter iv9k (fn (k9: str) -> fn (v9: Val) ->
+                      let _ = (if vec_get hiv_made 0 == 0 then () else
+                               map_iter iv9k (fn (k9: str) -> fn (v9: Val) ->
                                 if str_len k9 > str_len oldp9 && str_eq (substring k9 0 (str_len oldp9)) oldp9
                                 then map_set tmp9 (newp9 ++ substring k9 (str_len oldp9) (str_len k9)) v9
-                                else ()) in
+                                else ())) in
                       let _ = map_iter tmp9 (fn (k9: str) -> fn (v9: Val) -> iv_put iv9k k9 v9) in
                       let _ = map_set r2k_marks (str_of_int d9) VNil in
                       mark_kw d9)
@@ -25856,17 +25885,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (str_len name == 18 && str_eq name "instance_variables") then
       (let pfx = str_of_int id ++ "@" in
        let plen = str_len pfx in
-       let tmp = map_new () in
-       let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
-         // a Struct's member SLOTS are not instance variables (struct_slot):
-         // ruby keeps members outside this table entirely, so a struct with
-         // nothing else set answers [].
-         if str_len k > plen && str_starts_with k pfx
-            && (if struct_is_slot k then false else true)
-            && (if ivar_is_internal k plen then false else true)
-         then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym ("@" ++ substring k plen (str_len k))))
-         else ()) in
-       arr_new (idx_to_list tmp 0 (map_len tmp)))
+       // (the object's own list of names -- ivar_names_of's index, which
+       //  #inspect reads too -- and not a walk of every object's variables.
+       //  A Struct's member SLOTS are not instance variables (struct_slot)
+       //  and are not in that list: ruby keeps members outside this table
+       //  entirely, so a struct with nothing else set answers [].)
+       let rec ivs9 = fn (ns9: str list) ->
+         (match ns9 with
+          | Nil -> (Nil : Val list)
+          | Cons (nm9, t9) ->
+            (let k9 = pfx ++ nm9 in
+             if map_has ivars k9 && (if struct_is_slot k9 then false else true)
+                && (if ivar_is_internal k9 plen then false else true)
+             then Cons (VSym ("@" ++ nm9), ivs9 t9) else ivs9 t9)) in
+       arr_new (ivs9 (ivar_names_of ivars id)))
     else if (str_len name == 5 && str_eq name "is_a?") || (str_len name == 8 && str_eq name "kind_of?") || (str_len name == 12 && str_eq name "instance_of?") then
       (match args with
        | Cons (VClass c9, _) ->
@@ -29003,13 +29035,35 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | _ -> (2, false)) in
        let realcls = if is_sng_cls ocls0 then (if map_has sup ocls0 then map_get sup ocls0 else "Object") else ocls0 in
        // copy the object's instance variables (id@name -> nid@name).
+       // (by the object's own list of names -- ivar_names_of's index -- and
+       //  not by walking the table of every object's variables for the ones
+       //  that start with its id: that walk made a `dup` as long as the
+       //  table, five times as long once a collection waited for 32,000
+       //  entries instead of 4,000. A Struct's member slots are in the table
+       //  and not in the index: they are copied by the members' names.)
        let oldp = str_of_int id ++ "@" in
        let newp = str_of_int nid ++ "@" in
        let tmp = map_new () in
-       let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
-                 if str_len k > str_len oldp && str_eq (substring k 0 (str_len oldp)) oldp
-                 then map_set tmp (newp ++ substring k (str_len oldp) (str_len k)) v
-                 else ()) in
+       let rec cp9 = fn (ns9: str list) ->
+         (match ns9 with
+          | Nil -> ()
+          | Cons (nm9, t9) ->
+            (let k9 = oldp ++ nm9 in
+             let _ = (if map_has ivars k9 then map_set tmp (newp ++ nm9) (map_get ivars k9) else ()) in
+             cp9 t9)) in
+       // (a Struct's members first, as they were first in the table: each
+       //  in its slot, by the members its class names)
+       let _ = (if is_struct_obj_cls world realcls then
+                  (let mc9 = struct_members_cls world (ancestors_of world realcls) in
+                   let rec sl9 = fn (ms9: Val list) ->
+                     (match ms9 with
+                      | Cons (VSym m9, t9) -> Cons (struct_slot m9, sl9 t9)
+                      | Cons (_, t9) -> sl9 t9
+                      | Nil -> (Nil : str list)) in
+                   cp9 (sl9 (if str_eq mc9 "" then Nil
+                             else (match map_get struct_mem mc9 with VArr a9 -> deref a9 | _ -> Nil))))
+                else ()) in
+       let _ = cp9 (ivar_names_of ivars id) in
        let _ = map_iter tmp (fn (k: str) -> fn (v: Val) -> iv_put ivars k v) in
        // clone copies the singleton class (its methods + constants); dup drops
        // it (the new id has none).
@@ -35125,7 +35179,11 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
        (let pfx = base ++ "@" in
         let plen = str_len pfx in
         let tmp = map_new () in
-        let _ = if str_eq base "" then () else
+        let _ = if str_eq base ""
+                   // (a String, an Array, a Hash, and none of them has ever
+                   //  been given one: hiv_made)
+                   || (vec_get hiv_made 0 == 0
+                       && (str_starts_with base "str:" || str_starts_with base "arr:" || str_starts_with base "hsh:")) then () else
           map_iter ivars0 (fn (k: str) -> fn (v: Val) ->
             if str_len k > plen && str_starts_with k pfx
                && (if ivar_is_internal k plen then false else true)
@@ -36041,9 +36099,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
        (let (m9i, s9i, o9i, iv9i) = world in
         let pfx = "str:" ++ str_of_int h ++ "@" in
         let found = map_new () in
-        let _ = map_iter iv9i (fn (k: str) -> fn (v: Val) ->
+        let _ = (if vec_get hiv_made 0 == 0 then () else
+                 map_iter iv9i (fn (k: str) -> fn (v: Val) ->
           (if str_len k > str_len pfx && str_eq (substring k 0 (str_len pfx)) pfx
-           then map_set found "y" VNil else ())) in
+           then map_set found "y" VNil else ()))) in
         // (a SUBCLASS's unfrozen string is not interned: it is a frozen
         //  dup of its own class -- rb_str_uminus asks BARE_STRING_P)
         if map_has hng_store (hng_key recv) && (if sfrozen_get h then false else true) then
@@ -47685,6 +47744,7 @@ and triv_store_body = fn (params: str list) -> fn (body: Stmt list) -> fn (seen:
     && (if str_len p9 == 1 && str_eq p9 "_" then false else true)
     && str_list_has params p9 && triv_store_body params t9 true
   | Cons (SLine n9, t9) -> n9 >= 0 && triv_store_body params t9 seen
+  | Cons (SLineQ n9, t9) -> n9 >= 0 && triv_store_body params t9 seen
   | Cons (SFile _, t9) -> triv_store_body params t9 seen
   | _ -> false
 // (one argument for each parameter, every parameter a plain required one --

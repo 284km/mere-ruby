@@ -5219,7 +5219,7 @@ no children. With this it gives the reference's result here -- 2,664 tests,
 2,633,172 assertions, no failure, no error, the same 13 skips. corpus 660
 (658 and 659 are the VM rounds', #85).
 
-**It does not fit CI's 600 s yet, and is not merged.** CI run 43711089264
+**It did not fit CI's 600 s at first.** CI run 43711089264
 stopped the file at 623.9 s (WALL_LIMIT, 2,416 of its tests named), which
 reads as 0 MATCH where the baseline has 2,559. From that run's log, for all
 850 files: test_all_tokens about 360 s, the two walks over real trees
@@ -5227,10 +5227,18 @@ reads as 0 MATCH where the baseline has 2,559. From that run's log, for all
 about 670 s on a runner that was a tenth faster than the baseline's. The
 estimate made here from instruction counts (1.345 times the baseline's, so
 557 s) was wrong: on the runner the token test took the same time as before
-although it executes 0.85 of the instructions. Since then the walks are 18%
-cheaper (the two fast paths below, measured under test/unit: 141.7e9 ->
-116.6e9 instructions for 200 files), which is about 616 s on that runner.
-What is left to take off, and where it is, is the last item.
+although it executes 0.85 of the instructions. With the two fast paths
+below (the walks 17% cheaper, measured under test/unit: 141.7e9 -> 117.2e9
+instructions for 200 files) CI run 43736889826 finished the file in 500.3 s
+on a runner as fast as the baseline's: 2,651 MATCH, 0 RED, 13 BOTH, where
+the baseline has 2,559 and 92. The collector's floor (below) takes the walks
+down further; with it, run 43793344878 finished the file in 553.4 s -- 2,651
+MATCH, 0 RED -- on a runner whose other files ran at 0.92 of the
+baseline's time. The same code's instructions here did not change between
+the two (the token test 159.4e9 / 160.3e9, the walks 101.1e9 / 100.5e9), so
+the spread between 500 s and 553 s is the runners'. That leaves 47 s of the
+600 on the slower one, which is thin. What is left, and where it is, is the
+last item.
 
 - **The tree is made from Prism's, in Mere.** libprism's serialized bytes are
   decoded into flat integer tables (m_prism_dec.mere), translated to
@@ -5310,15 +5318,51 @@ What is left to take off, and where it is, is the last item.
   prepended module's method as the call itself: learning stops as soon as
   any method or block body starts to run. The corpus is 690 of 690 with
   the check on.
+- **The collector waits for 32,000 new entries, not 4,000, while no class
+  is being made** (the owner's decision, 2026-11-16; note 551 §8). A
+  collection has a cost that does not depend on what is live, and a program
+  with little live that makes small objects paid it every 1,300 objects:
+  30% of `Point.new(1, 2)` in a loop, a quarter of test_ast's walks. With
+  the floor at 32,000 the walks execute another 14% fewer instructions
+  (117.2e9 -> 101.1e9 for 200 files under test/unit) and the file's peak
+  memory footprint is no higher (3.93 GB before any of this, 3.62 GB now).
+  Raising it found what the low floor had been hiding, and each is dealt
+  with here:
+  - *Dead classes are not small, so a loop that makes classes keeps the old
+    floor.* test_module's complemented_method_entry leak test -- two classes
+    and a refinement a turn -- already sits on its limit (1.94 to 2.01 times
+    its starting RSS here, limit 2.0) and went to 2.43; `a.clone.set`, `a`
+    having a method of its own, ran four times the instructions, since a
+    clone copies its singleton's methods out of the whole method table. The
+    count of classes ever given a superclass (cls_made) is kept at each
+    collection, and once it has moved the entry threshold is the one with
+    the old floor (gc_knob 13, 14). Those loops collect exactly as they did
+    (11 collections in 21,000 turns of the leak test, before and after).
+  - *Copies and `instance_variables` walked the table of every object's
+    variables.* `obj.dup`, a Struct's, an exception's, `"abc".dup`,
+    `[1].dup`, `{}.dup`, `-str`, `obj.instance_variables`: each looked
+    through every instance variable alive for the ones of its receiver,
+    which made them two to five times slower once more garbage waited. An
+    object's are now found by its own list of names (ivar_names_of's
+    index, and a Struct's members by its class); a String's, an Array's and
+    a Hash's are looked for only once one of them has ever been given a
+    variable (hiv_made). Against the build before the floor moved, with
+    objects being made beside them: `obj.dup` 0.37 of the instructions,
+    `"abc".dup` 0.68, `instance_variables` 0.55, `-str` 0.73. corpus 662.
+  - Thirty-six kinds of allocation loop (objects, fibers, threads, classes,
+    modules, structs, singletons, finalizers, procs, enumerators,
+    exceptions, strings, ...) and twenty operations beside an allocation
+    were measured before and after: none executes more than 1.05 times the
+    instructions it did. A small program's peak RSS is 20 to 40 MB higher
+    (75 -> 100 MB for a loop of `Struct.new(1, 2)`): that is what now waits
+    for a collection. tools/loop_rss_check.sh holds all nine of its bounds,
+    and the memory-leak tests of test_object, test_module and test_class
+    pass as before.
 - **Where the rest of the time is** (note 551 §5), none of it touched here:
-  - collection: 30% of an allocation loop, 20% of an assertion loop, a
-    quarter of the walks. Three fifths of one collection is the runtime
-    gathering and sorting the suspended stack's words (`__lang_coro_pins`,
+  - what one collection costs: three fifths of it is the runtime gathering
+    and sorting the suspended stack's words (`__lang_coro_pins`,
     `__lang_coro_scan_ints`) -- deep under test/unit, deeper in a recursive
-    walk -- and a small live set collects every 4,000 entries. Raising that
-    floor to 32,000 in a local build (not in this PR: the collector's
-    constants are not this round's to change) took another 11% of the
-    walks' instructions and nothing off the token test;
+    walk. 20% of an assertion loop is still collection;
   - interning a block's body compares the whole tree each time a block
     becomes a Proc: 6.7% of test_all_tokens (assert_equal's message is
     thirty lines);
@@ -5330,5 +5374,5 @@ What is left to take off, and where it is, is the last item.
   attribute method; tools/ast_dump lost its development stubs. Kernel#pp of
   a Node before pp.rb is loaded still prints `#inspect` (ruby loads pp.rb on
   the first `pp`).
-- Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 902 of 1024 (was
-  873: the translation's tables are top-level values).
+- Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 926 of 1024 (was
+  895 on main: the translation and the caches keep top-level tables).
