@@ -5050,3 +5050,18 @@ and the total's arithmetic. It fails on PR #91's old binary (missing T_STRING)
 and agrees with Ruby after this fix. Core test_objectspace remains 37/37;
 objspace stays MATCH 38 and string_memory stays MATCH 2. The original 159-case
 classification is unchanged; this is an additional real API correction.
+### PR #91 review: GC::Profiler keeps the runtime CPU epoch
+
+P2 found that GC_INVOKE_TIME began at Profiler.enable instead of runtime
+startup. The existing gc_state initializer now captures the process CPU clock
+once, before Ruby execution; enable/disable/clear preserve it. GC_TIME uses
+that same process CPU clock, so sleeps and scheduling waits are not charged
+as collection CPU. tools/process_glue.c adds mr_gc_process_cpu_time using
+CLOCK_PROCESS_CPUTIME_ID with the standard C clock fallback; it is a new
+function, separate from the stat/utime functions in the concurrent C API work.
+No top-level value or collector-body change is introduced.
+
+Witness 673 spends CPU before enabling, checks clear and re-enable, and checks
+that sleep does not advance the CPU timeline as wall time would. Ruby passes;
+the old build fails at the delayed-enable assertion; the corrected build
+passes. The C clock glue also passes strict compiler warnings.
