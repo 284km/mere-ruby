@@ -1399,8 +1399,13 @@ let rec ic_branch_condition = fn cx -> fn (u: int) -> fn (cond: int) -> fn (then
   else if ty == pt_float () || ty == pt_imaginary () || ty == pt_integer () || ty == pt_rational () || ty == pt_string ()
           || ty == pt_symbol () || ty == pt_true () || ty == pt_lambda () || ty == pt_regular_expression () then
     (let _ = ic_here cx u at in ic_il cx u "jump" then_l)
-  else if ty == pt_defined () then ic_refuse "defined? in a condition is not compiled yet"
-  else if ty == pt_flip_flop () then ic_refuse "a flip-flop is not compiled yet"
+  else if ty == pt_defined () then
+    // (in a condition the answer is true, at the condition's place)
+    (let _ = ic_defined_node cx u cond false at true in
+     let _ = ic_here cx u at in
+     let _ = ic_il cx u "branchunless" else_l in
+     ic_il cx u "jump" then_l)
+  else if ty == pt_flip_flop () then ic_flip_flop cx u cond else_l then_l (ic_start_line cx cond) false
   else if ty == pt_and () then
     (let _ = ic_compile_logical cx u (pn_and_left cx cond) (0 - 1) else_l in
      ic_branch_condition cx u (pn_and_right cx cond) then_l else_l at)
@@ -2194,5 +2199,770 @@ let ic_node4 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (t
            let _ = (if i < k - 1 then ic_i0 cx u "pop" else ()) in
            go t (i + 1))) in
      let _ = go names 0 in
+     ic_pop_if cx u popped)
+  else ic_node5 cx u n popped ty;
+
+// -- defined? -------------------------------------------------------------------
+// (the type's number, and its name -- rb_iseq_defined_string)
+let ic_dnum = fn (t: str) ->
+  if str_eq t "nil" then 1 else if str_eq t "ivar" then 2 else if str_eq t "lvar" then 3 else if str_eq t "gvar" then 4
+  else if str_eq t "cvar" then 5 else if str_eq t "const" then 6 else if str_eq t "method" then 7 else if str_eq t "yield" then 8
+  else if str_eq t "zsuper" then 9 else if str_eq t "self" then 10 else if str_eq t "true" then 11 else if str_eq t "false" then 12
+  else if str_eq t "asgn" then 13 else if str_eq t "expr" then 14 else if str_eq t "ref" then 15 else if str_eq t "func" then 16 else 17;
+let ic_dname = fn (t: str) ->
+  if str_eq t "nil" then "nil" else if str_eq t "ivar" then "instance-variable" else if str_eq t "lvar" then "local-variable"
+  else if str_eq t "gvar" then "global-variable" else if str_eq t "cvar" then "class variable" else if str_eq t "const" then "constant"
+  else if str_eq t "method" then "method" else if str_eq t "yield" then "yield" else if str_eq t "zsuper" then "super"
+  else if str_eq t "self" then "self" else if str_eq t "true" then "true" else if str_eq t "false" then "false"
+  else if str_eq t "asgn" then "assignment" else "expression";
+let ic_asgn_type = fn (s: str) ->
+  ic_has_str ["CallAndWriteNode", "CallOperatorWriteNode", "CallOrWriteNode", "ClassVariableAndWriteNode",
+    "ClassVariableOperatorWriteNode", "ClassVariableOrWriteNode", "ClassVariableWriteNode", "ConstantAndWriteNode",
+    "ConstantOperatorWriteNode", "ConstantOrWriteNode", "ConstantPathAndWriteNode", "ConstantPathOperatorWriteNode",
+    "ConstantPathOrWriteNode", "ConstantPathWriteNode", "ConstantWriteNode", "GlobalVariableAndWriteNode",
+    "GlobalVariableOperatorWriteNode", "GlobalVariableOrWriteNode", "GlobalVariableWriteNode", "IndexAndWriteNode",
+    "IndexOperatorWriteNode", "IndexOrWriteNode", "InstanceVariableAndWriteNode", "InstanceVariableOperatorWriteNode",
+    "InstanceVariableOrWriteNode", "InstanceVariableWriteNode", "LocalVariableAndWriteNode",
+    "LocalVariableOperatorWriteNode", "LocalVariableOrWriteNode", "LocalVariableWriteNode", "MultiWriteNode"] s;
+let ic_expr_type = fn (s: str) ->
+  ic_has_str ["AliasGlobalVariableNode", "AliasMethodNode", "AndNode", "BreakNode", "CaseMatchNode", "CaseNode",
+    "ClassNode", "DefNode", "DefinedNode", "FlipFlopNode", "FloatNode", "ForNode", "IfNode", "ImaginaryNode", "IntegerNode",
+    "InterpolatedMatchLastLineNode", "InterpolatedRegularExpressionNode", "InterpolatedStringNode",
+    "InterpolatedSymbolNode", "InterpolatedXStringNode", "LambdaNode", "MatchLastLineNode", "MatchPredicateNode",
+    "MatchRequiredNode", "MatchWriteNode", "ModuleNode", "NextNode", "OrNode", "PostExecutionNode", "RangeNode", "RationalNode",
+    "RedoNode", "RegularExpressionNode", "RescueModifierNode", "RetryNode", "ReturnNode", "SingletonClassNode",
+    "SourceEncodingNode", "SourceFileNode", "SourceLineNode", "StringNode", "SymbolNode", "UndefNode", "UnlessNode", "UntilNode",
+    "WhileNode", "XStringNode", "BlockArgumentNode", "ForwardingArgumentsNode"] s;
+
+// pm_compile_defined_expr0: every instruction at the defined? node's place;
+// in a condition the answer is true, otherwise the type's name. lfin: a Vec
+// of three labels (-1: none yet) -- the end, the "not defined" one a part
+// that may raise jumps to, and the one past a call's receiver.
+let rec ic_defined0 = fn cx -> fn (u: int) -> fn (n: int) -> fn (at: int) -> fn (cond: bool) -> fn lfin -> fn (explicit: bool) ->
+  let val = fn (t: str) -> OVal (if cond then IvTrue else IvStr (ic_dname t, "US-ASCII")) in
+  let loc = fn (x: unit) -> ic_here cx u at in
+  let dins = fn (t: str) -> fn (operand: IcOp) -> fn (v: str) -> ic_i3 cx u "defined" (ODef (ic_dnum t)) operand (val v) in
+  let fin = fn (t: str) -> (let _ = ic_here cx u at in ic_i1 cx u "putobject" (val t)) in
+  let need = fn (k: int) -> if vec_get lfin k < 0 then vec_set lfin k (ic_new_label cx u) else () in
+  let ty = ic_ty cx n in
+  let tn = ic_type_name ty in
+  if ty == pt_nil () then fin "nil"
+  else if ty == pt_self () then fin "self"
+  else if ty == pt_true () then fin "true"
+  else if ty == pt_false () then fin "false"
+  else if ty == pt_local_variable_read () then fin "lvar"
+  else if ty == pt_instance_variable_read () then
+    (let _ = loc () in
+     ic_i3 cx u "definedivar" (ic_osym cx (ic_cname cx (pn_instance_variable_read_name cx n))) (OIvc (ic_next_is cx u)) (val "ivar"))
+  // (a match reference: the number doubled, or the character doubled plus 1)
+  else if ty == pt_numbered_reference_read () || ty == pt_back_reference_read () then
+    (let r = (if ty == pt_numbered_reference_read () then pn_numbered_reference_read_number cx n * 2
+              else ord (char_at (ic_cname cx (pn_back_reference_read_name cx n)) 1) * 2 + 1) in
+     let _ = loc () in
+     let _ = ic_i0 cx u "putnil" in
+     dins "ref" (OVal (IvInt r)) "gvar")
+  else if ty == pt_global_variable_read () || ty == pt_class_variable_read () || ty == pt_constant_read () then
+    (let (t, nm) = (if ty == pt_global_variable_read () then ("gvar", pn_global_variable_read_name cx n)
+                    else if ty == pt_class_variable_read () then ("cvar", pn_class_variable_read_name cx n)
+                    else ("const", pn_constant_read_name cx n)) in
+     let _ = loc () in
+     let _ = ic_i0 cx u "putnil" in
+     dins t (ic_osym cx (ic_cname cx nm)) t)
+  else if ty == pt_yield () then
+    (let _ = ic_u_set_pflag cx (ic_local_iseq cx u) 4 in
+     let _ = loc () in
+     let _ = ic_i0 cx u "putnil" in
+     dins "yield" (OVal IvFalse) "yield")
+  else if ty == pt_super () || ty == pt_forwarding_super () then
+    (let b = (if ty == pt_super () then pn_super_block cx n else pn_forwarding_super_block cx n) in
+     if b >= 0 && (ty == pt_forwarding_super () || ic_ty cx b != pt_block_argument ()) then fin "expr"
+     else (let _ = loc () in let _ = ic_i0 cx u "putnil" in dins "zsuper" (OVal IvFalse) "zsuper"))
+  else if ty == pt_constant_path () then
+    (let p = pn_constant_path_parent cx n in
+     let _ =
+       (if p >= 0 then
+          (let _ = need 1 in
+           let _ = ic_defined0 cx u p at true lfin false in
+           let _ = loc () in
+           let _ = ic_il cx u "branchunless" (vec_get lfin 1) in
+           ic_node cx u p false)
+        else (let _ = loc () in ic_i1 cx u "putobject" (OVal (IvCls "Object")))) in
+     let _ = loc () in
+     dins "const_from" (ic_osym cx (ic_cname cx (pn_constant_path_name cx n))) "const")
+  else if ty == pt_begin () then
+    (if pn_begin_rescue_clause cx n < 0 && pn_begin_ensure_clause cx n < 0 && pn_begin_else_clause cx n < 0 then
+       (let st = pn_begin_statements cx n in
+        if st < 0 then fin "nil"
+        else if pn_statements_body_b cx st == 1 then ic_defined0 cx u (ic_li cx (pn_statements_body cx st) 0) at cond lfin false
+        else fin "expr")
+     else fin "expr")
+  else if ty == pt_parentheses () then
+    (let b = pn_parentheses_body cx n in
+     if b < 0 then fin "nil"
+     else if ic_ty cx b == pt_statements () && (if pq_parentheses_multiple_statements cx n then false else true) then
+       ic_defined0 cx u (ic_li cx (pn_statements_body cx b) 0) at cond lfin false
+     else fin "expr")
+  else if ty == pt_array () || ty == pt_hash () || ty == pt_keyword_hash () || ty == pt_arguments () then
+    (let (off, cnt) = (if ty == pt_array () then (pn_array_elements cx n, pn_array_elements_b cx n)
+                       else if ty == pt_arguments () then (pn_arguments_arguments cx n, pn_arguments_arguments_b cx n)
+                       else if ty == pt_hash () then (pn_hash_elements cx n, pn_hash_elements_b cx n)
+                       else (pn_keyword_hash_elements cx n, pn_keyword_hash_elements_b cx n)) in
+     let _ = (if cnt == 0 || ty == pt_arguments () then () else need 1) in
+     let _ = list_iter (ic_nlist cx off cnt) (fn (e: int) ->
+               (let _ = ic_defined0 cx u e at (if ty == pt_arguments () then cond else true) lfin false in
+                let _ = loc () in
+                ic_il cx u "branchunless" (vec_get lfin 1))) in
+     fin "expr")
+  else if ty == pt_assoc () then
+    (let _ = ic_defined0 cx u (pn_assoc_key cx n) at true lfin false in
+     let _ = loc () in
+     let _ = ic_il cx u "branchunless" (vec_get lfin 1) in
+     ic_defined0 cx u (pn_assoc_value cx n) at true lfin false)
+  else if ty == pt_assoc_splat () then
+    (if pn_assoc_splat_value cx n >= 0 then ic_defined0 cx u (pn_assoc_splat_value cx n) at true lfin false else fin "expr")
+  else if ty == pt_implicit () then ic_defined0 cx u (pn_implicit_value cx n) at cond lfin false
+  else if ty == pt_splat () then
+    (if pn_splat_expression cx n < 0 then fin "expr"
+     else
+       (let _ = ic_defined0 cx u (pn_splat_expression cx n) at cond lfin false in
+        let _ = need 1 in
+        let _ = loc () in
+        let _ = ic_il cx u "branchunless" (vec_get lfin 1) in
+        fin "expr"))
+  else if ty == pt_call () then
+    (let b = pn_call_block cx n in
+     if b >= 0 && ic_ty cx b == pt_block () then fin "expr"
+     else
+       (let blockarg = b >= 0 in
+        let r = pn_call_receiver cx n in
+        let args = pn_call_arguments cx n in
+        let name = ic_osym cx (ic_cname cx (pn_call_name cx n)) in
+        let _ = (if r >= 0 || args >= 0 || blockarg then (let _ = need 1 in need 2) else ()) in
+        let _ = (if args >= 0 then
+                   (let _ = ic_defined0 cx u args at true lfin false in
+                    let _ = loc () in
+                    ic_il cx u "branchunless" (vec_get lfin 1))
+                 else ()) in
+        let _ = (if blockarg then
+                   (let _ = ic_defined0 cx u b at true lfin false in
+                    let _ = loc () in
+                    ic_il cx u "branchunless" (vec_get lfin 1))
+                 else ()) in
+        if r >= 0 then
+          (let _ =
+             (if ic_ty cx r == pt_call () && (if ic_tyis cx (pn_call_block cx r) (pt_block ()) then false else true) then
+                (let _ = ic_defined0 cx u r at true lfin true in
+                 let _ = loc () in
+                 let _ = ic_il cx u "branchunless" (vec_get lfin 2) in
+                 ic_call cx u r false true)
+              else
+                (let _ = ic_defined0 cx u r at true lfin false in
+                 let _ = loc () in
+                 let _ = ic_il cx u "branchunless" (vec_get lfin 1) in
+                 ic_node cx u r false)) in
+           let _ = loc () in
+           let _ = (if explicit then ic_i0 cx u "dup" else ()) in
+           dins "method" name "method")
+        else
+          (let _ = loc () in
+           let _ = ic_i0 cx u "putself" in
+           let _ = (if explicit then ic_i0 cx u "dup" else ()) in
+           dins "func" name "method")))
+  else if ic_asgn_type tn then fin "asgn"
+  else if ic_expr_type tn then fin "expr"
+  else ic_refuse ("defined?(" ++ tn ++ ") is not compiled yet");
+
+// pm_compile_defined_expr: nothing when popped; otherwise the test, and when
+// a part of it may raise, a putnil before and a swap / pop after for the
+// "defined guard" rescue to land on
+let ic_defined_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (at: int) -> fn (cond: bool) ->
+  let lfin = vec_new () in
+  let _ = vec_push lfin (ic_new_label cx u) in
+  let _ = vec_push lfin (0 - 1) in
+  let _ = vec_push lfin (0 - 1) in
+  let mark = ic_last cx (ic_u_list cx u) in
+  let _ =
+    (if popped then ()
+     else
+       (let _ = ic_defined0 cx u (pn_defined_value cx n) at cond lfin false in
+        if vec_get lfin 1 >= 0 then
+          (let lstart = ic_new_label cx u in
+           let lend = ic_new_label cx u in
+           let guard = ic_unit_new cx 4 ("defined guard in " ++ ic_u_label cx u) (ic_u_path cx u) (ic_u_abs_path cx u) 0
+                         (Cons ("$!", Nil)) u (0, 0, 0 - 1, 0 - 1) 0 in
+           let _ = ic_add_child cx u guard in
+           let _ = ic_u_set_pflag cx guard 512 in
+           let _ = ic_at cx guard 0 (0 - 1) in
+           let _ = ic_i0 cx guard "putnil" in
+           let _ = ic_i0 cx guard "leave" in
+           let _ = ic_finish cx guard in
+           let _ = ic_ins_after cx mark lstart in
+           let _ = ic_emit_label cx u lend in
+           ic_add_catch cx u 1 lstart lend guard (vec_get lfin 1))
+        else ())) in
+  let _ =
+    (if vec_get lfin 1 >= 0 then
+       (let _ = ic_ins_after cx mark (ic_mk cx "putnil" Nil (ic_start_line cx at) (ic_nid cx at)) in
+        let _ = ic_here cx u at in
+        let _ = ic_i0 cx u "swap" in
+        let _ = (if vec_get lfin 2 >= 0 then ic_emit_label cx u (vec_get lfin 2) else ()) in
+        let _ = ic_i0 cx u "pop" in
+        ic_emit_label cx u (vec_get lfin 1))
+     else ()) in
+  ic_emit_label cx u (vec_get lfin 0);
+
+// -- flip-flops -------------------------------------------------------------------
+// (an Integer bound is the line just read: `if 2..4` is `$. == 2`)
+let ic_flip_flop_bound = fn cx -> fn (u: int) -> fn (b: int) -> fn (popped: bool) ->
+  if ic_ty cx b == pt_integer () then
+    (let _ = ic_node cx u b false in
+     let _ = ic_here cx u b in
+     let _ = ic_i1 cx u "getglobal" (ic_osym cx "$.") in
+     let _ = ic_push_send cx u "==" 1 in
+     ic_pop_if cx u popped)
+  else ic_node cx u b popped;
+// (each one's state is a special variable of the method's frame, numbered
+//  from 2)
+let ic_flip_flop = fn cx -> fn (u: int) -> fn (n: int) -> fn (else_l: int) -> fn (then_l: int) -> fn (line: int) -> fn (popped: bool) ->
+  let lend = ic_new_label cx u in
+  let again = (if pq_flip_flop_exclude_end cx n then false else true) in
+  let local = ic_local_iseq cx u in
+  let key = ic_u_flip_cnt cx local + 2 in
+  let _ = ic_u_set cx local 23 (ic_u_flip_cnt cx local + 1) in
+  let _ = ic_at cx u line (0 - 1) in
+  let _ = ic_i2 cx u "getspecial" (ONum key) (ONum 0) in
+  let _ = ic_il cx u "branchif" lend in
+  let _ = (if pn_flip_flop_left cx n >= 0 then ic_flip_flop_bound cx u (pn_flip_flop_left cx n) popped else ic_i0 cx u "putnil") in
+  let _ = ic_at cx u line (0 - 1) in
+  let _ = ic_il cx u "branchunless" else_l in
+  let _ = ic_i1 cx u "putobject" (OVal IvTrue) in
+  let _ = ic_in cx u "setspecial" key in
+  let _ = (if again then () else ic_il cx u "jump" then_l) in
+  let _ = ic_emit_label cx u lend in
+  let _ = (if pn_flip_flop_right cx n >= 0 then ic_flip_flop_bound cx u (pn_flip_flop_right cx n) popped else ic_i0 cx u "putnil") in
+  let _ = ic_at cx u line (0 - 1) in
+  let _ = ic_il cx u "branchunless" then_l in
+  let _ = ic_i1 cx u "putobject" (OVal IvFalse) in
+  let _ = ic_in cx u "setspecial" key in
+  ic_il cx u "jump" then_l;
+
+// -- case / when ------------------------------------------------------------------
+// (a whole Float is its Integer's key: finite, its own floor)
+let ic_float_key = fn (v: float) ->
+  let lim = 4.0e18 in
+  if v == v && v < lim && v > 0.0 - lim && floor v == v then IvInt (int_of_float v) else IvFlt v;
+// pm_compile_case_node_dispatch: the key a literal `when` is under, or none
+// (and the hash is given up)
+let ic_case_key = fn cx -> fn (u: int) -> fn (c: int) ->
+  let ty = ic_ty cx c in
+  if ty == pt_float () then
+    (let v = (vec_get (ic_dbls cx) (pn_float_value cx c) : float) in
+     (true, ic_float_key v))
+  else if ty == pt_false () || ty == pt_integer () || ty == pt_nil () || ty == pt_symbol () || ty == pt_true () then (true, ic_static_value cx c)
+  else if ty == pt_source_line () then (true, IvInt (ic_start_line cx c))
+  else if ty == pt_source_file () then (true, IvStr (ic_u_path cx u, "UTF-8"))
+  else if ty == pt_string () then (true, ic_string_value cx c)
+  else (false, IvNil);
+let rec ic_cdh_has = fn (es: (Iv * int) list) -> fn (k: Iv) ->
+  match es with | Nil -> false | Cons ((k0, _), t) -> if ic_iv_eq k0 k then true else ic_cdh_has t k;
+
+// prism_compile.c's pm_compile_case_node: the conditions and the bodies built
+// apart; with a subject, a dispatch hash of the literal `when`s, the `===`
+// chain, the else part, then the bodies
+let ic_case_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let end_l = ic_new_label cx u in
+  let bodies = ic_list_new cx in
+  let clauses = ic_nlist cx (pn_case_conditions cx n) (pn_case_conditions_b cx n) in
+  let els = pn_case_else_clause cx n in
+  let pred = pn_case_predicate cx n in
+  let body_of = fn (clause: int) -> fn (label: int) -> fn (with_pop: bool) ->
+    (let saved = ic_capture_begin cx u in
+     let _ = ic_emit_label cx u label in
+     let _ = (if with_pop then (let _ = ic_here cx u clause in ic_i0 cx u "pop") else ()) in
+     let st = pn_when_statements cx clause in
+     let _ = (if st >= 0 then ic_node cx u st popped else if popped then () else ic_synthetic_putnil cx u) in
+     let _ = (if with_pop then ic_here cx u clause else ic_here cx u n) in
+     let _ = ic_il cx u "jump" end_l in
+     ic_list_append cx bodies (ic_capture_end cx u saved)) in
+  let conds_of = fn (clause: int) -> ic_nlist cx (pn_when_conditions cx clause) (pn_when_conditions_b cx clause) in
+  let _ =
+    (if pred < 0 then
+       (let saved = ic_capture_begin cx u in
+        let _ = list_iter clauses (fn (clause: int) ->
+                  (let label = ic_new_label cx u in
+                   let _ = body_of clause label false in
+                   list_iter (conds_of clause) (fn (c: int) ->
+                     if ic_ty cx c == pt_splat () then
+                       (let _ = ic_here cx u c in
+                        let _ = ic_i0 cx u "putnil" in
+                        let _ = ic_node cx u c false in
+                        let _ = ic_here cx u c in
+                        let _ = ic_in cx u "checkmatch" 5 in
+                        ic_il cx u "branchif" label)
+                     else
+                       (let next_l = ic_new_label cx u in
+                        let _ = ic_branch_condition cx u c label next_l c in
+                        ic_emit_label cx u next_l)))) in
+        let _ = (if els >= 0 then ic_node cx u els popped else if popped then () else ic_synthetic_putnil cx u) in
+        let _ = ic_here cx u n in
+        let _ = ic_il cx u "jump" end_l in
+        ic_append cx u (ic_capture_end cx u saved))
+     else
+       (let else_l = ic_new_label cx u in
+        // (the dispatch hash: still being built, and its entries)
+        let disp = vec_new () in
+        let _ = vec_push disp 1 in
+        let ents = vec_new () in
+        let _ = vec_push ents (Nil : (Iv * int) list) in
+        let saved = ic_capture_begin cx u in
+        let _ = list_iter clauses (fn (clause: int) ->
+                  (let label = ic_new_label cx u in
+                   let _ = list_iter (conds_of clause) (fn (c: int) ->
+                             (let _ =
+                                (if vec_get disp 0 == 1 then
+                                   (let (ok, key) = ic_case_key cx u c in
+                                    if (if ok then false else true) then vec_set disp 0 0
+                                    else if ic_cdh_has (vec_get ents 0) key then ()
+                                    else vec_set ents 0 (ic_cat (vec_get ents 0) (Cons ((key, label), Nil))))
+                                 else ()) in
+                              let _ =
+                                (if ic_ty cx c == pt_splat () then
+                                   (let _ = ic_here cx u c in
+                                    let _ = ic_i0 cx u "dup" in
+                                    let _ = ic_node cx u c false in
+                                    let _ = ic_here cx u c in
+                                    ic_in cx u "checkmatch" 6)
+                                 else
+                                   (let _ = (if ic_ty cx c == pt_string () then
+                                               (let _ = ic_here cx u c in ic_i1 cx u "putobject" (OVal (ic_string_value cx c)))
+                                             else ic_node cx u c false) in
+                                    let _ = ic_here cx u c in
+                                    let _ = ic_in cx u "topn" 1 in
+                                    ic_i2 cx u "send" (ic_cd "===" 20 1) (OSeq (0 - 1)))) in
+                              let _ = ic_here cx u c in
+                              ic_il cx u "branchif" label)) in
+                   body_of clause label true)) in
+        let conds = ic_capture_end cx u saved in
+        let _ = ic_node cx u pred false in
+        let _ = (if vec_get disp 0 == 1 then
+                   (let es = vec_get ents 0 in
+                    let _ = list_iter es (fn (kl: Iv * int) -> (let (_, l) = kl in ic_ref cx l)) in
+                    let _ = list_iter es (fn (kl: Iv * int) -> (let (_, l) = kl in ic_unref cx l)) in
+                    let _ = ic_here cx u n in
+                    let _ = ic_i0 cx u "dup" in
+                    ic_i2 cx u "opt_case_dispatch" (OCdh es) (OLab else_l))
+                 else ()) in
+        let _ = ic_append cx u conds in
+        let _ = ic_emit_label cx u else_l in
+        if els >= 0 then
+          (let at = (if pn_else_statements cx els >= 0 then pn_else_statements cx els else els) in
+           let _ = ic_here cx u at in
+           let _ = ic_i0 cx u "pop" in
+           let _ = ic_node cx u els popped in
+           let _ = ic_here cx u at in
+           ic_il cx u "jump" end_l)
+        else
+          (let _ = ic_here cx u n in
+           let _ = ic_i0 cx u "pop" in
+           let _ = (if popped then () else ic_i0 cx u "putnil") in
+           ic_il cx u "jump" end_l))) in
+  let _ = ic_append cx u bodies in
+  ic_emit_label cx u end_l;
+
+// -- writes -----------------------------------------------------------------------
+let ic_push_send_k = fn cx -> fn (u: int) -> fn (mid: str) -> fn (argc: int) -> fn (flag: int) -> fn (kws: str list) -> fn (has_kws: bool) ->
+  ic_i2 cx u "send" (ic_ci mid argc flag kws has_kws false) (OSeq (0 - 1));
+
+// x ||= v / x &&= v, of a local or an instance variable; a local's ||= opens
+// with `putobject true; branchunless` (the peephole drops it)
+let ic_or_and_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let ty = ic_ty cx n in
+  let or_ = ty == pt_local_variable_or_write () || ty == pt_instance_variable_or_write () in
+  let local = ty == pt_local_variable_or_write () || ty == pt_local_variable_and_write () in
+  let (name, value) =
+    (if ty == pt_local_variable_or_write () then (pn_local_variable_or_write_name cx n, pn_local_variable_or_write_value cx n)
+     else if ty == pt_local_variable_and_write () then (pn_local_variable_and_write_name cx n, pn_local_variable_and_write_value cx n)
+     else if ty == pt_instance_variable_or_write () then (pn_instance_variable_or_write_name cx n, pn_instance_variable_or_write_value cx n)
+     else (pn_instance_variable_and_write_name cx n, pn_instance_variable_and_write_value cx n)) in
+  let nm = ic_cname cx name in
+  let end_l = ic_new_label cx u in
+  let set_l = (if local && or_ then ic_new_label cx u else 0 - 1) in
+  let _ = (if set_l >= 0 then (let _ = ic_i1 cx u "putobject" (OVal IvTrue) in ic_il cx u "branchunless" set_l) else ()) in
+  let _ = (if local then ic_getlocal cx u nm else ic_i2 cx u "getinstancevariable" (ic_osym cx nm) (OIvc (ic_next_is cx u))) in
+  let _ = ic_dup_unless cx u popped in
+  let _ = ic_il cx u (if or_ then "branchif" else "branchunless") end_l in
+  let _ = (if popped then () else ic_i0 cx u "pop") in
+  let _ = (if set_l >= 0 then ic_emit_label cx u set_l else ()) in
+  let _ = ic_node cx u value false in
+  let _ = ic_here cx u n in
+  let _ = ic_dup_unless cx u popped in
+  let _ = (if local then ic_setlocal cx u nm else ic_i2 cx u "setinstancevariable" (ic_osym cx nm) (OIvc (ic_next_is cx u))) in
+  ic_emit_label cx u end_l;
+
+// $g / X &&= v and ||= v: an ||= asks defined? first, so that reading what is
+// not there yet does not warn or raise
+let ic_var_and_or_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let ty = ic_ty cx n in
+  let or_ = ty == pt_global_variable_or_write () || ty == pt_constant_or_write () in
+  let const = ty == pt_constant_and_write () || ty == pt_constant_or_write () in
+  let (name, value, nloc) =
+    (if ty == pt_global_variable_or_write () then (pn_global_variable_or_write_name cx n, pn_global_variable_or_write_value cx n, 0)
+     else if ty == pt_global_variable_and_write () then (pn_global_variable_and_write_name cx n, pn_global_variable_and_write_value cx n, 0)
+     else if ty == pt_constant_or_write () then (pn_constant_or_write_name cx n, pn_constant_or_write_value cx n, pn_constant_or_write_name_loc cx n)
+     else (pn_constant_and_write_name cx n, pn_constant_and_write_value cx n, pn_constant_and_write_name_loc cx n)) in
+  let nm = ic_cname cx name in
+  let end_l = ic_new_label cx u in
+  let set_l = (if or_ then ic_new_label cx u else 0 - 1) in
+  let _ = (if or_ then
+             (let _ = ic_i0 cx u "putnil" in
+              let _ = ic_i3 cx u "defined" (ODef (ic_dnum (if const then "const" else "gvar"))) (ic_osym cx nm) (OVal IvTrue) in
+              ic_il cx u "branchunless" set_l)
+           else ()) in
+  let _ = (if const then ic_constant_read cx u nm (ic_line_of cx nloc) n else ic_i1 cx u "getglobal" (ic_osym cx nm)) in
+  let _ = ic_here cx u n in
+  let _ = ic_dup_unless cx u popped in
+  let _ = ic_il cx u (if or_ then "branchif" else "branchunless") end_l in
+  let _ = (if popped then () else ic_i0 cx u "pop") in
+  let _ = (if set_l >= 0 then ic_emit_label cx u set_l else ()) in
+  let _ = ic_node cx u value false in
+  let _ = ic_here cx u n in
+  let _ = ic_dup_unless cx u popped in
+  let _ = (if const then (let _ = ic_in cx u "putspecialobject" 3 in ic_i1 cx u "setconstant" (ic_osym cx nm))
+           else ic_i1 cx u "setglobal" (ic_osym cx nm)) in
+  ic_emit_label cx u end_l;
+
+// @@x ||= v (defined first: reading one that is not is a NameError) and
+// @@x &&= v
+let ic_cvar_or_and_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let or_ = ic_ty cx n == pt_class_variable_or_write () in
+  let nm = ic_cname cx (if or_ then pn_class_variable_or_write_name cx n else pn_class_variable_and_write_name cx n) in
+  let value = (if or_ then pn_class_variable_or_write_value cx n else pn_class_variable_and_write_value cx n) in
+  let end_l = ic_new_label cx u in
+  let _ =
+    (if or_ then
+       (let set_l = ic_new_label cx u in
+        let _ = ic_i0 cx u "putnil" in
+        let _ = ic_i3 cx u "defined" (ODef 5) (ic_osym cx nm) (OVal IvTrue) in
+        let _ = ic_il cx u "branchunless" set_l in
+        let _ = ic_i2 cx u "getclassvariable" (ic_osym cx nm) (ic_cvc cx u nm) in
+        let _ = ic_dup_unless cx u popped in
+        let _ = ic_il cx u "branchif" end_l in
+        let _ = (if popped then () else ic_i0 cx u "pop") in
+        ic_emit_label cx u set_l)
+     else
+       (let _ = ic_i2 cx u "getclassvariable" (ic_osym cx nm) (ic_cvc cx u nm) in
+        let _ = ic_dup_unless cx u popped in
+        let _ = ic_il cx u "branchunless" end_l in
+        if popped then () else ic_i0 cx u "pop")) in
+  let _ = ic_node cx u value false in
+  let _ = ic_here cx u n in
+  let _ = ic_dup_unless cx u popped in
+  let _ = ic_i2 cx u "setclassvariable" (ic_osym cx nm) (ic_cvc cx u nm) in
+  ic_emit_label cx u end_l;
+
+// pm_compile_constant_path_*_write_node: the owner (Object for ::X) stays
+// under the value; the constant is read with getconstant
+let ic_constant_path_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let ty = ic_ty cx n in
+  let (t, value) =
+    (if ty == pt_constant_path_write () then (pn_constant_path_write_target cx n, pn_constant_path_write_value cx n)
+     else if ty == pt_constant_path_operator_write () then (pn_constant_path_operator_write_target cx n, pn_constant_path_operator_write_value cx n)
+     else if ty == pt_constant_path_or_write () then (pn_constant_path_or_write_target cx n, pn_constant_path_or_write_value cx n)
+     else (pn_constant_path_and_write_target cx n, pn_constant_path_and_write_value cx n)) in
+  let name = ic_osym cx (ic_cname cx (pn_constant_path_name cx t)) in
+  let _ = (if pn_constant_path_parent cx t >= 0 then ic_node cx u (pn_constant_path_parent cx t) false else ic_i1 cx u "putobject" (OVal (IvCls "Object"))) in
+  let _ = ic_here cx u n in
+  if ty == pt_constant_path_write () then
+    (let _ = ic_node cx u value false in
+     let _ = ic_here cx u n in
+     let _ = (if popped then () else (let _ = ic_i0 cx u "swap" in ic_in cx u "topn" 1)) in
+     let _ = ic_i0 cx u "swap" in
+     ic_i1 cx u "setconstant" name)
+  else if ty == pt_constant_path_operator_write () then
+    (let _ = ic_i0 cx u "dup" in
+     let _ = ic_i1 cx u "putobject" (OVal IvTrue) in
+     let _ = ic_i1 cx u "getconstant" name in
+     let _ = ic_node cx u value false in
+     let _ = ic_here cx u n in
+     let _ = ic_i2 cx u "send" (ic_cd (ic_cname cx (pn_constant_path_operator_write_binary_operator cx n)) 20 1) (OSeq (0 - 1)) in
+     let _ = ic_i0 cx u "swap" in
+     let _ = (if popped then () else (let _ = ic_in cx u "topn" 1 in ic_i0 cx u "swap")) in
+     ic_i1 cx u "setconstant" name)
+  else
+    (let or_ = ty == pt_constant_path_or_write () in
+     let lfin = ic_new_label cx u in
+     let lassign = (if or_ then ic_new_label cx u else 0 - 1) in
+     let _ = (if or_ then
+                (let _ = ic_i0 cx u "dup" in
+                 let _ = ic_i3 cx u "defined" (ODef 17) name (OVal IvTrue) in
+                 ic_il cx u "branchunless" lassign)
+              else ()) in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_i1 cx u "putobject" (OVal IvTrue) in
+     let _ = ic_i1 cx u "getconstant" name in
+     let _ = ic_dup_unless cx u popped in
+     let _ = ic_il cx u (if or_ then "branchif" else "branchunless") lfin in
+     let _ = (if popped then () else ic_i0 cx u "pop") in
+     let _ = (if lassign >= 0 then ic_emit_label cx u lassign else ()) in
+     let _ = ic_node cx u value false in
+     let _ = ic_here cx u n in
+     let _ = (if popped then ic_in cx u "topn" 1 else (let _ = ic_in cx u "dupn" 2 in ic_i0 cx u "swap")) in
+     let _ = ic_i1 cx u "setconstant" name in
+     let _ = ic_emit_label cx u lfin in
+     let _ = (if popped then () else ic_i0 cx u "swap") in
+     ic_i0 cx u "pop");
+
+// pm_compile_call_and_or_write_node: r.x &&= v / r.x ||= v (FCALL for self
+// alone), with &. skipping it all on nil
+let ic_call_and_or_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let and_ = ic_ty cx n == pt_call_and_write () in
+  let r = (if and_ then pn_call_and_write_receiver cx n else pn_call_or_write_receiver cx n) in
+  if r < 0 then ic_refuse "a call write without a receiver is not compiled yet"
+  else
+    (let safe = (if and_ then pq_call_and_write_safe_navigation cx n else pq_call_or_write_safe_navigation cx n) in
+     let rname = ic_cname cx (if and_ then pn_call_and_write_read_name cx n else pn_call_or_write_read_name cx n) in
+     let wname = ic_cname cx (if and_ then pn_call_and_write_write_name cx n else pn_call_or_write_write_name cx n) in
+     let value = (if and_ then pn_call_and_write_value cx n else pn_call_or_write_value cx n) in
+     let lfin = ic_new_label cx u in
+     let lcfin = ic_new_label cx u in
+     let flag = (if ic_ty cx r == pt_self () then 4 else 0) in
+     let _ = ic_node cx u r false in
+     let _ = ic_here cx u n in
+     let lskip = (if safe then (let l = ic_new_label cx u in let _ = ic_i0 cx u "dup" in let _ = ic_il cx u "branchnil" l in l) else 0 - 1) in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_push_send_f cx u rname 0 flag in
+     let _ = ic_dup_unless cx u popped in
+     let _ = ic_il cx u (if and_ then "branchunless" else "branchif") lcfin in
+     let _ = (if popped then () else ic_i0 cx u "pop") in
+     let _ = ic_node cx u value false in
+     let _ = ic_here cx u n in
+     let _ = (if popped then () else (let _ = ic_i0 cx u "swap" in ic_in cx u "topn" 1)) in
+     let _ = ic_push_send_f cx u wname 1 flag in
+     let _ = ic_il cx u "jump" lfin in
+     let _ = ic_emit_label cx u lcfin in
+     let _ = (if popped then () else ic_i0 cx u "swap") in
+     let _ = ic_emit_label cx u lfin in
+     let _ = (if lskip >= 0 && popped then ic_emit_label cx u lskip else ()) in
+     let _ = ic_i0 cx u "pop" in
+     if lskip >= 0 && (if popped then false else true) then ic_emit_label cx u lskip else ());
+
+// pm_compile_call_operator_write_node: r.x op= v
+let ic_call_operator_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let flag = (if pq_call_operator_write_ignore_visibility cx n then 4 else 0) in
+  let _ = ic_node cx u (pn_call_operator_write_receiver cx n) false in
+  let _ = ic_here cx u n in
+  let safe = (if pq_call_operator_write_safe_navigation cx n then
+                (let l = ic_new_label cx u in let _ = ic_i0 cx u "dup" in let _ = ic_il cx u "branchnil" l in l)
+              else 0 - 1) in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_push_send_f cx u (ic_cname cx (pn_call_operator_write_read_name cx n)) 0 flag in
+  let _ = ic_node cx u (pn_call_operator_write_value cx n) false in
+  let _ = ic_here cx u n in
+  let _ = ic_push_send cx u (ic_cname cx (pn_call_operator_write_binary_operator cx n)) 1 in
+  let _ = (if popped then () else (let _ = ic_i0 cx u "swap" in ic_in cx u "topn" 1)) in
+  let _ = ic_push_send_f cx u (ic_cname cx (pn_call_operator_write_write_name cx n)) 1 flag in
+  let _ = (if safe >= 0 && popped then ic_emit_label cx u safe else ()) in
+  let _ = ic_i0 cx u "pop" in
+  if safe >= 0 && (if popped then false else true) then ic_emit_label cx u safe else ();
+
+// pm_compile_index_operator_write_node and
+// pm_compile_index_control_flow_write_node: the receiver and the arguments
+// kept (dupn) for the [] and then the []=, the new value moved in under them
+// as the last argument -- onto a splat's array, or past keywords (opt_reverse)
+let ic_index_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let ty = ic_ty cx n in
+  let op = ty == pt_index_operator_write () in
+  let (recv, args, block, value) =
+    (if op then (pn_index_operator_write_receiver cx n, pn_index_operator_write_arguments cx n, pn_index_operator_write_block cx n, pn_index_operator_write_value cx n)
+     else if ty == pt_index_and_write () then (pn_index_and_write_receiver cx n, pn_index_and_write_arguments cx n, pn_index_and_write_block cx n, pn_index_and_write_value cx n)
+     else (pn_index_or_write_receiver cx n, pn_index_or_write_arguments cx n, pn_index_or_write_block cx n, pn_index_or_write_value cx n)) in
+  let line = ic_start_line cx n in
+  let nid = ic_nid cx n in
+  let at = fn (x: unit) -> ic_at cx u line nid in
+  let _ = (if popped then () else ic_i0 cx u "putnil") in
+  let _ = ic_node cx u recv false in
+  let boff = (if block >= 0 then 1 else 0) in
+  let flag0 = (if ic_ty cx recv == pt_self () then 4 else 0) in
+  let (argc, flag1, kws, has_kws) = ic_setup_args cx u args block line nid flag0 in
+  let _ = at () in
+  let _ = (if (argc > 0 || boff == 1) && bit_and flag1 64 != 0 then
+             (if boff == 1 then ic_i0 cx u "splatkw"
+              else (let _ = ic_i0 cx u "dup" in let _ = ic_i0 cx u "splatkw" in ic_i0 cx u "pop"))
+           else ()) in
+  let klen = (if has_kws then ic_llen kws else 0) in
+  let dup_argn = argc + 1 + boff + klen in
+  let _ = ic_in cx u "dupn" dup_argn in
+  let _ = ic_push_send_k cx u "[]" argc (flag1 - bit_and flag1 4096 - bit_and flag1 2048) kws has_kws in
+  let (label, lfin) =
+    (if op then
+       (let _ = ic_node cx u value false in
+        let _ = at () in
+        let _ = ic_push_send cx u (ic_cname cx (pn_index_operator_write_binary_operator cx n)) 1 in
+        (0 - 1, 0 - 1))
+     else
+       (let label = ic_new_label cx u in
+        let lfin = ic_new_label cx u in
+        let _ = ic_i0 cx u "dup" in
+        let _ = ic_il cx u (if ty == pt_index_and_write () then "branchunless" else "branchif") label in
+        let _ = ic_i0 cx u "pop" in
+        let _ = ic_node cx u value false in
+        let _ = at () in
+        (label, lfin))) in
+  let _ = (if popped then () else ic_in cx u "setn" (dup_argn + 1)) in
+  let flag =
+    (if bit_and flag1 1 != 0 then
+       (let f2 =
+          (if bit_and flag1 64 != 0 then
+             (let _ = ic_in cx u "topn" (2 + boff) in
+              let f = (if bit_and flag1 4096 == 0 then (let _ = ic_i1 cx u "splatarray" (OVal IvTrue) in bit_or flag1 4096) else flag1) in
+              let _ = ic_i0 cx u "swap" in
+              let _ = ic_in cx u "pushtoarray" 1 in
+              let _ = ic_in cx u "setn" (2 + boff) in
+              let _ = ic_i0 cx u "pop" in
+              f)
+           else
+             (let _ = (if boff > 0 then (let _ = ic_in cx u "dupn" 3 in let _ = ic_i0 cx u "swap" in ic_i0 cx u "pop") else ()) in
+              let f = (if bit_and flag1 4096 == 0 then
+                         (let _ = ic_i0 cx u "swap" in let _ = ic_i1 cx u "splatarray" (OVal IvTrue) in let _ = ic_i0 cx u "swap" in bit_or flag1 4096)
+                       else flag1) in
+              let _ = ic_in cx u "pushtoarray" 1 in
+              let _ = (if boff > 0 then (let _ = ic_in cx u "setn" 3 in let _ = ic_i0 cx u "pop" in ic_i0 cx u "pop") else ()) in
+              f)) in
+        let _ = ic_push_send_k cx u "[]=" argc f2 kws has_kws in
+        f2)
+     else if bit_and flag1 64 != 0 then
+       (let _ = (if boff > 0 then (let _ = ic_in cx u "topn" 2 in let _ = ic_i0 cx u "swap" in let _ = ic_in cx u "setn" 3 in ic_i0 cx u "pop") else ()) in
+        let _ = ic_i0 cx u "swap" in
+        let _ = ic_push_send_k cx u "[]=" (argc + 1) flag1 kws has_kws in
+        flag1)
+     else if klen > 0 then
+       (let _ = (if op then
+                   (let _ = ic_i0 cx u "dup" in
+                    let _ = ic_in cx u "opt_reverse" (klen + boff + 2) in
+                    let _ = ic_in cx u "opt_reverse" (klen + boff + 1) in
+                    ic_i0 cx u "pop")
+                 else
+                   (let _ = ic_in cx u "opt_reverse" (klen + boff + 1) in
+                    ic_in cx u "opt_reverse" (klen + boff))) in
+        let _ = ic_push_send_k cx u "[]=" (argc + 1) flag1 kws has_kws in
+        flag1)
+     else
+       (let _ = (if boff > 0 then ic_i0 cx u "swap" else ()) in
+        let _ = ic_push_send_k cx u "[]=" (argc + 1) flag1 kws has_kws in
+        flag1)) in
+  let _ = flag in
+  let _ = ic_i0 cx u "pop" in
+  if op then ()
+  else
+    (let _ = ic_il cx u "jump" lfin in
+     let _ = ic_emit_label cx u label in
+     let _ = (if popped then () else ic_in cx u "setn" (dup_argn + 1)) in
+     let _ = ic_in cx u "adjuststack" (dup_argn + 1) in
+     ic_emit_label cx u lfin);
+
+// pm_compile_node's PM_MATCH_WRITE_NODE: `/(?<n>..)/ =~ s` -- the match, then
+// $~'s named groups into their locals, nil each when it failed
+let ic_match_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let fail_l = ic_new_label cx u in
+  let end_l = ic_new_label cx u in
+  let targets = ic_nlist cx (pn_match_write_targets cx n) (pn_match_write_targets_b cx n) in
+  let tname = fn (t: int) -> ic_cname cx (pn_local_variable_target_name cx t) in
+  let _ = ic_node cx u (pn_match_write_call cx n) false in
+  let _ = ic_here cx u n in
+  let _ = ic_i1 cx u "getglobal" (ic_osym cx "$~") in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_il cx u "branchunless" fail_l in
+  match targets with
+  | Cons (t, Nil) ->
+    (let _ = ic_i1 cx u "putobject" (ic_osym cx (tname t)) in
+     let _ = ic_push_send cx u "[]" 1 in
+     let _ = ic_emit_label cx u fail_l in
+     let _ = ic_setlocal cx u (tname t) in
+     ic_pop_if cx u popped)
+  | _ ->
+    (let k = ic_llen targets in
+     let rec each = fn (ts: int list) -> fn (i: int) ->
+       (match ts with
+        | Nil -> ()
+        | Cons (t, rest) ->
+          (let _ = (if i < k - 1 then ic_i0 cx u "dup" else ()) in
+           let _ = ic_i1 cx u "putobject" (ic_osym cx (tname t)) in
+           let _ = ic_push_send cx u "[]" 1 in
+           let _ = ic_setlocal cx u (tname t) in
+           each rest (i + 1))) in
+     let _ = each targets 0 in
+     let _ = ic_il cx u "jump" end_l in
+     let _ = ic_emit_label cx u fail_l in
+     let _ = ic_i0 cx u "pop" in
+     let _ = list_iter targets (fn (t: int) -> (let _ = ic_i0 cx u "putnil" in ic_setlocal cx u (tname t))) in
+     let _ = ic_emit_label cx u end_l in
+     ic_pop_if cx u popped);
+
+// `x op= v` for an instance variable, a global, a class variable, a constant
+let ic_var_op_write = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let ty = ic_ty cx n in
+  let _ =
+    (if ty == pt_instance_variable_operator_write () then
+       ic_i2 cx u "getinstancevariable" (ic_osym cx (ic_cname cx (pn_instance_variable_operator_write_name cx n))) (OIvc (ic_next_is cx u))
+     else if ty == pt_global_variable_operator_write () then
+       ic_i1 cx u "getglobal" (ic_osym cx (ic_cname cx (pn_global_variable_operator_write_name cx n)))
+     else if ty == pt_class_variable_operator_write () then
+       (let nm = ic_cname cx (pn_class_variable_operator_write_name cx n) in ic_i2 cx u "getclassvariable" (ic_osym cx nm) (ic_cvc cx u nm))
+     else
+       ic_constant_read cx u (ic_cname cx (pn_constant_operator_write_name cx n)) (ic_line_of cx (pn_constant_operator_write_name_loc cx n)) n) in
+  let (value, op) =
+    (if ty == pt_instance_variable_operator_write () then (pn_instance_variable_operator_write_value cx n, pn_instance_variable_operator_write_binary_operator cx n)
+     else if ty == pt_global_variable_operator_write () then (pn_global_variable_operator_write_value cx n, pn_global_variable_operator_write_binary_operator cx n)
+     else if ty == pt_class_variable_operator_write () then (pn_class_variable_operator_write_value cx n, pn_class_variable_operator_write_binary_operator cx n)
+     else (pn_constant_operator_write_value cx n, pn_constant_operator_write_binary_operator cx n)) in
+  let _ = ic_node cx u value false in
+  let _ = ic_here cx u n in
+  let _ = ic_push_send cx u (ic_cname cx op) 1 in
+  let _ = ic_dup_unless cx u popped in
+  if ty == pt_instance_variable_operator_write () then
+    ic_i2 cx u "setinstancevariable" (ic_osym cx (ic_cname cx (pn_instance_variable_operator_write_name cx n))) (OIvc (ic_next_is cx u))
+  else if ty == pt_global_variable_operator_write () then
+    ic_i1 cx u "setglobal" (ic_osym cx (ic_cname cx (pn_global_variable_operator_write_name cx n)))
+  else if ty == pt_class_variable_operator_write () then
+    (let nm = ic_cname cx (pn_class_variable_operator_write_name cx n) in ic_i2 cx u "setclassvariable" (ic_osym cx nm) (ic_cvc cx u nm))
+  else
+    (let _ = ic_in cx u "putspecialobject" 3 in
+     ic_i1 cx u "setconstant" (ic_osym cx (ic_cname cx (pn_constant_operator_write_name cx n))));
+
+let ic_node5 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (ty: int) ->
+  if ty == pt_defined () then ic_defined_node cx u n popped n false
+  else if ty == pt_case () then ic_case_node cx u n popped
+  else if ty == pt_local_variable_or_write () || ty == pt_local_variable_and_write ()
+          || ty == pt_instance_variable_or_write () || ty == pt_instance_variable_and_write () then ic_or_and_write cx u n popped
+  else if ty == pt_global_variable_or_write () || ty == pt_global_variable_and_write ()
+          || ty == pt_constant_or_write () || ty == pt_constant_and_write () then ic_var_and_or_write cx u n popped
+  else if ty == pt_class_variable_or_write () || ty == pt_class_variable_and_write () then ic_cvar_or_and_write cx u n popped
+  else if ty == pt_instance_variable_operator_write () || ty == pt_global_variable_operator_write ()
+          || ty == pt_class_variable_operator_write () || ty == pt_constant_operator_write () then ic_var_op_write cx u n popped
+  else if ty == pt_constant_path_write () || ty == pt_constant_path_operator_write () || ty == pt_constant_path_or_write ()
+          || ty == pt_constant_path_and_write () then ic_constant_path_write cx u n popped
+  else if ty == pt_call_and_write () || ty == pt_call_or_write () then ic_call_and_or_write cx u n popped
+  else if ty == pt_call_operator_write () then ic_call_operator_write cx u n popped
+  else if ty == pt_index_operator_write () || ty == pt_index_and_write () || ty == pt_index_or_write () then ic_index_write cx u n popped
+  else if ty == pt_match_write () then ic_match_write cx u n popped
+  // (PM_FLIP_FLOP_NODE as a value: true or false of it)
+  else if ty == pt_flip_flop () then
+    (let final = ic_new_label cx u in
+     let then_l = ic_new_label cx u in
+     let else_l = ic_new_label cx u in
+     let _ = ic_flip_flop cx u n else_l then_l (ic_start_line cx n) popped in
+     let _ = ic_here cx u n in
+     let _ = ic_emit_label cx u then_l in
+     let _ = ic_i1 cx u "putobject" (OVal IvTrue) in
+     let _ = ic_il cx u "jump" final in
+     let _ = ic_emit_label cx u else_l in
+     let _ = ic_i1 cx u "putobject" (OVal IvFalse) in
+     ic_emit_label cx u final)
+  // PM_MATCH_LAST_LINE_NODE: a pattern as a condition is `pattern =~ $_`
+  else if ty == pt_match_last_line () then
+    (let _ = ic_here cx u n in
+     let _ = ic_i1 cx u "putobject" (OVal (ic_regexp_literal cx (ic_str cx (pn_match_last_line_unescaped cx n), ic_enc cx) n)) in
+     let _ = ic_i2 cx u "getspecial" (ONum 0) (ONum 0) in
+     let _ = ic_push_send cx u "=~" 1 in
      ic_pop_if cx u popped)
   else ic_refuse (ic_type_name ty ++ " is not compiled yet");
