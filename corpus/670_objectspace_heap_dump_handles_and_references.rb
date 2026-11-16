@@ -37,4 +37,6 @@ raise 'uninitialized File type' unless JSON.parse(ObjectSpace.dump(File.allocate
   range = JSON.parse(ObjectSpace.dump(text)).fetch('coderange')
   raise 'incorrect encoding classification' unless range == (text.ascii_only? ? '7bit' : 'valid')
 end
+escaped = ('plain ASCII' * 1000) + "\"\\\n\r\t\f\b\x00\x01\x1f\x7f"
+raise 'dump escaping changed the value' unless JSON.parse(ObjectSpace.dump(escaped))['value'] == escaped
 puts 'heap dumps preserve handles, references and allocation generations'

@@ -5098,3 +5098,14 @@ including 20/200 owner counts, interrupted allocation and worker lifetimes.
 All six affected GC/ObjectSpace files preserve their local counts: MATCH 110,
 RED 11, BOTH 5, EXTRA 5, plus 57 separately audited exclusions. Allocation
 comparisons remain enabled; no collector body, timeout or memory limit changed.
+
+The latest successful main run is now 43869939788 at 535ad955. Its target
+RED counts are unchanged: 76 allocation, 35 objspace including ractor, 23 GC,
+22 compaction and 3 string-memory. The 159-case inventory remains applicable.
+
+Dump string escaping now scans bytes into a Mere buffer, copying plain runs
+and using the existing JSON byte-escape helper for control characters. It
+preserves quotes, backslashes, all controls and DEL without a Ruby call for
+every character. Witness 670 round-trips a long ASCII string and those bytes;
+the unchanged ractor dump test still passes its ten-second limit. No new
+top-level value or JSON engine changes are introduced.
