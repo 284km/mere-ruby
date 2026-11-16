@@ -5210,11 +5210,11 @@ compiled with it. Requiring optparse.rb (2,463 lines) on the VM: 6.70 s ->
   (the RED as before).
 
 
-## 2026-11-16 (67): what the VM did otherwise than the evaluator in whole test files
+## 2026-11-16 (68): what the VM did otherwise than the evaluator in whole test files
 
 **The point.** Forty of ruby's test files run once on the evaluator and once
 under MERE_RUBY_VM=1 (local, same build): the VM answered 115 fewer tests.
-The ones fixed here, with corpus 673 as the witness (a child runs it as it
+The ones fixed here, with corpus 675 as the witness (a child runs it as it
 is and under MERE_RUBY_VM=strict, and both print ruby's lines):
 
 - **test_thread** hung: a loop on the VM never let another thread or a
@@ -5252,7 +5252,51 @@ smaller set (an exception value is lost when a collection falls in a
 particular place; not found yet).
 
 Checked (local): corpus 694 / 694 on the evaluator and under MERE_RUBY_VM=1
-(before 673; 673 alone the same as ruby both ways); vm_check 245 / 245;
+(675 among them); vm_check 245 / 245;
 the gates; the embedding check; test_module 195 (2 timeouts on the VM),
 test_proc 118, test_variable 32, test_refinement 122, test_syntax 170 the
 same on both.
+
+## 2026-11-17 (69): the evaluator's shape shortcut on the VM, and the VM's own frame costs
+
+**The point.** test_module's test_iclass_memory_leak runs `Class.new do
+include mod end` three million times in 10 s. The evaluator does it by a
+shortcut that reads the block's statements (core_metadata_plan); without
+it the evaluator takes 4.9 us a turn too. A block run on the VM is one SVm
+statement, so the VM never took it and needed 6.3 us.
+
+- **The shortcut on the VM.** The loader recognises the same shape in a
+  block sequence's instructions (`opt_getconstant_path Module`, `opt_new`,
+  `setlocal`, `opt_getconstant_path Class`, `send new` with a block whose
+  sequence is `putself; getlocal_WC_1; include`) and keeps the statements
+  the evaluator would have had, with their lines (vm_metadata_shape,
+  vm_plan_body); core_metadata_vm hands them to the shortcut. 1.5M turns:
+  3.3 s on both; test_iclass_memory_leak 5.8 s on the VM. The other leak
+  test (refine, using, def; 300k turns) has several shapes and is the VM's
+  method call cost, not a shortcut: 43 us a turn on the VM, 24 on the
+  evaluator.
+- **No stack copy per send.** vm_root wrote what lay below a send's inputs
+  into an Array in the frame's env before every send that had something
+  there, so that a value held by the stack alone survives a collection.
+  The collector reads the pool's stacks in use instead (gc_mark_roots, up
+  to each stack's depth); vm_root and __vm~stk are gone. `h[i] = i.to_s`
+  300k: 1.10 -> 0.83 s (evaluator 0.73).
+- **A body of one value needs no VM frame.** A block's or a method's
+  sequence of two instructions -- putnil / putself / putobject /
+  getinstancevariable, then leave -- is answered by vm_enter without
+  vm_exec when no TracePoint and no Coverage is on (vm_trivial). `def m0;
+  end` called in a while: 1,184 -> 1,056 ns a turn (evaluator 1,124);
+  `n.times { 1 }` 633 -> 474 ns (487).
+- Measured, not changed: a VM method call costs the evaluator's call plus
+  the VM's frame (vm_exec's pool, region and try) and a copy per push
+  (vm_push into a Vec outside the statement's region); calling a method
+  the VM defined runs about 2.5 times as many collections as the
+  evaluator (`k.new` 2M: 2,487 against 999), each turn allocating about
+  1.2 KB more.
+
+Checked (local): corpus 695 / 695 on the evaluator; under MERE_RUBY_VM=1
+685 on the VM, 10 fallen back, 0 different (tools/iseq/vm_corpus.sh);
+vm_check 245 / 245; gates; test_gc, test_fiber, test_thread, test_weakmap,
+test_array, test_hash on the VM the same before and after the root change.
+(Running run_corpus.sh under `( ... ) &` makes corpus/394 FAIL: the
+reference ruby keeps the SIGINT ignore a background job inherits.)
