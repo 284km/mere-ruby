@@ -57,4 +57,10 @@ hash = { text => array }
 end
 raise 'missing array references' unless ObjectSpace.reachable_objects_from(array).any? { |item| item.equal?(text) }
 GC.enable
+
+empty_class = Class.new
+GC.start
+collections = GC.count
+ObjectSpace.each_object(empty_class) { raise 'unexpected instance' }
+raise 'iterator forced an extra collection' unless GC.count == collections
 puts 'real GC measurements and value store enumeration'
