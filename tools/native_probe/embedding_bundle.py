@@ -7,7 +7,7 @@ archive and system libraries; no product C source is needed on their link line.
 The exported API is mere_embedding_*, not the Ruby C API.
 """
 from pathlib import Path
-from native_build_flags import openssl_flags, native_bridge_sources
+from native_build_flags import openssl_flags, native_bridge_sources, NATIVE_CFLAGS
 import argparse
 import hashlib
 import json
@@ -61,9 +61,12 @@ assert prism_objects, 'Prism archive contained no object files'
 glue = [ROOT / 'tools' / (name + '.c') for name in ['prism_glue', 'socket_glue', 'math_glue', 'process_glue', 'openssl_glue', 'nkf_glue']]
 glue += native_bridge_sources()
 for source in glue:
-    target = objects / (source.stem + '.o')
+    # (Ruby's C API has an encoding.c and so does Prism: its members are
+    #  named for their directory, so no two sources share a member name)
+    member = ('capi_' if source.parent.name == 'capi' else '') + source.stem
+    target = objects / (member + '.o')
     assert not target.exists(), f'archive member collision: {target.name}'
-    run('compile-' + source.stem, ['clang', '-O2', '-w', '-I', ROOT / 'vendor/prism/include', *openssl_cflags,
+    run('compile-' + member, ['clang', '-O2', '-w', '-I', ROOT / 'vendor/prism/include', *openssl_cflags, *NATIVE_CFLAGS,
                                   '-c', source, '-o', target])
 assert not (objects / 'embedding.o').exists(), 'archive member collision: embedding.o'
 shutil.copyfile(generated / 'embedding.o', objects / 'embedding.o')
