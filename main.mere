@@ -8541,70 +8541,44 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
 
 
 
-// class names of the VClass values in a list (for rescue *arr).
-
-// expand "*var" (rescue *var) into the array's class names, and "@rexpr~N"
-// (a non-constant class expression) by evaluating the stashed expression at
-// match time. A "*"-prefixed sentinel splats the evaluated array.
-and resc_all_classes = fn (xs: Val list) ->
-  match xs with
-  | Nil -> true
-  | Cons (VClass _, t) -> resc_all_classes t
-  | Cons (_, _) -> false
-and expand_rescue_classes = fn env -> fn world -> fn blk -> fn (classes: str list) ->
+// Match a splat's values in order, preserving Module#=== and TracePoint's
+// events for the candidates actually reached.
+and rescue_values_match = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn (values: Val list) ->
+  match values with
+  | Nil -> false
+  | Cons (VClass c, rest) ->
+    (let one = Cons (c, Nil) in
+     let hit = (if map_len hook_flags > 0 && map_has hook_flags "tp"
+                then tp_rescue_match env world blk exc one
+                else rescue_matches_eqq env world blk exc one) in
+     hit || rescue_values_match env world blk exc rest)
+  | Cons (_, _) ->
+    (let _ = raise_exc world "TypeError" "class or module required for rescue clause" in false)
+// Match before evaluating the next class expression or validating the next
+// splatted value. `rescue *[ArgumentError, /message/]` catches ArgumentError;
+// the later invalid value is reached only when the earlier class misses.
+and rescue_clause_matches = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn (classes: str list) ->
   match classes with
-  | Nil -> Nil
-  | Cons (c, rest) ->
-    if str_len c > 0 && str_eq (char_at c 0) "*" then
-      let inner = substring c 1 (str_len c) in
-      // "*@rexpr~N": splat the evaluated expression; "*var": splat the local.
-      let arr = if str_len inner > 0 && str_eq (char_at inner 0) "@" && str_contains inner "rexpr~"
-                then eval_e env world blk (map_get resc_exprs (substring inner 7 (str_len inner)))
-                else (if lv_has env inner then lv_get env inner else VNil) in
-      (match arr with
-       // every member must be a class or a module (`rescue *Array(1)` is
-       // ruby's TypeError, and it was a clause that matched nothing)
-       | VArr id when (if resc_all_classes (deref id) then false else true) ->
-         (let _ = raise_exc world "TypeError" "class or module required for rescue clause" in Nil)
-       | VArr id ->
-         (let names = class_names_of (deref id) in
-          let rest2 = expand_rescue_classes env world blk rest in
-          match names with
-          // An EMPTY splat rescues NOTHING in ruby -- `rescue *[]` is not a bare
-          // `rescue`, which rescues StandardError. Both arrived here as an empty
-          // list, so this clause caught everything and swallowed the exception:
-          // bundler writes `rescue *[const_get_safely(:ENOTSUP, Errno)].compact`,
-          // and when that constant is absent the array is empty. A name nothing
-          // can be keeps the two apart.
-          | Nil -> Cons ("(empty rescue splat)", rest2)
-          | _ -> list_append_str names rest2)
-       // (anything else is converted with #to_a, as a splat is)
-       | VObj _ when responds world arr "to_a" ->
-         (match invoke_val_c env world blk arr "to_a" Nil false with
-          | VArr id -> list_append_str (class_names_of (deref id)) (expand_rescue_classes env world blk rest)
-          | _ -> expand_rescue_classes env world blk rest)
-       | VClass cn -> Cons (cn, expand_rescue_classes env world blk rest)
-       | _ -> expand_rescue_classes env world blk rest)
-    else if str_len c > 6 && str_eq (substring c 0 7) "@rexpr~" then
-      // a non-constant class expression: evaluate; a Class/Module contributes
-      // its name, anything else is a TypeError (class or module required).
-      (match eval_e env world blk (map_get resc_exprs (substring c 7 (str_len c))) with
-       | VClass cn -> Cons (cn, expand_rescue_classes env world blk rest)
-       | _ -> (let _ = raise_exc world "TypeError" "class or module required for rescue clause" in Nil))
-    // A plain name in a rescue clause is a CONSTANT, and it resolves through the
-    // lexical scope like any other: inside `module Ns`, `rescue MyError` means
-    // `Ns::MyError`. It used to be passed through as the bare text, so the clause
-    // never matched the class that was raised -- `Bundler.settings` rescues its
-    // own `GemfileNotFound` that way, which is why every `bundle` subcommand
-    // answered "Could not locate Gemfile" (ruby answers the settings object).
-    // Resolve through the normal constant evaluator, including its errors.
-    else
-      // Evaluate the constant, including aliases and constants inherited
-      // through included modules. The qualified spelling need not itself
-      // be a registered class name (Container::Denied can be Errors::Denied).
-      (match eval_e env world blk (EConst c) with
-       | VClass cn -> Cons (cn, expand_rescue_classes env world blk rest)
-       | _ -> (let _ = raise_exc world "TypeError" "class or module required for rescue clause" in Nil))
+  | Nil -> rescue_values_match env world blk exc (Cons (VClass "StandardError", Nil))
+  | _ ->
+    let rec go = fn (remaining: str list) ->
+      (match remaining with
+       | Nil -> false
+       | Cons (c, rest) ->
+         let values =
+           (if str_len c > 0 && str_eq (char_at c 0) "*" then
+              (let inner = substring c 1 (str_len c) in
+               let arr = (if str_len inner > 0 && str_eq (char_at inner 0) "@" && str_contains inner "rexpr~"
+                          then eval_e env world blk (map_get resc_exprs (substring inner 7 (str_len inner)))
+                          else (if lv_has env inner then lv_get env inner else VNil)) in
+               coerce_splat_rhs env world arr)
+            else if str_len c > 6 && str_eq (substring c 0 7) "@rexpr~" then
+              Cons (eval_e env world blk (map_get resc_exprs (substring c 7 (str_len c))), Nil)
+            // Resolve constants through the lexical scope, including aliases
+            // and included modules, exactly when this candidate is reached.
+            else Cons (eval_e env world blk (EConst c), Nil)) in
+         rescue_values_match env world blk exc values || go rest) in
+    go classes
 
 // a rescue clause asks each class with #=== (ruby's rule): one whose
 // singleton defines its own === answers for itself, the rest by kind
@@ -8664,12 +8638,11 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
   | Nil -> re_raise world exc
   | Cons (rc, rest) ->
     let (classes0, var, handler) = rc in
-    let classes = expand_rescue_classes env world blk classes0 in
     let tp9 = map_len hook_flags > 0 && map_has hook_flags "tp" in
     // (under a TracePoint the match is made on the `rescue`'s line, and each
     //  class asked is Module#=== -- a :c_call / :c_return)
     let _ = (if tp9 then (match handler with Cons (SLineQ n9, _) when n9 < 0 -> cur_line_set (0 - n9) | _ -> ()) else ()) in
-    if (if tp9 then tp_rescue_match env world blk exc classes else rescue_matches_eqq env world blk exc classes) then
+    if rescue_clause_matches env world blk exc classes0 then
       // (a pair bound to a name is made an object with its own frames, and
       //  $! is that same object: exc_pin_bt)
       let exc = (if str_eq var "" then exc else exc_pin_bt world exc) in
