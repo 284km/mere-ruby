@@ -5359,3 +5359,48 @@ Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
 686 on the VM, 10 fallen back, 0 different; vm_check 245 / 245;
 compare_with_ruby 460 / 460, coverage 22 / 22; gates; test_iseq 63 / 68
 as before.
+
+## 2026-11-17 (72): what still differed on the VM in 40 whole test files -- freed memory, a loop with no safepoint, collections that marked too much
+
+**The point.** The 40 files of (68) run again on both, same build: the VM
+3,805 MATCH against the evaluator's 3,810 (it was 3,695). The five left,
+and what they were:
+
+- **test_sprintf's test_rational** (failed after one set of earlier tests
+  and not another): `vm_scoped` gave its scope env back to the pool --
+  which compacts the env's arena -- while the value the call answered
+  could still point into it. Found with tools/asan_build.sh (brought up to
+  the current Mere runtime, and linking the glue and libprism as
+  tools/build.sh does), which also caught vm_tail_call reading the waiting
+  call's name from a map it had cleared. The answer is made in a region
+  of its own and copied out before the scope goes back; the waiting tail
+  call is one Array with its name as a String handle. The VM corpus under
+  ASan: no report but corpus/524's deliberately deep recursion, where ASan
+  trips over its own stack.
+- **A loop written on one line** has no statement start inside it, so the
+  VM never reached a safepoint: `while i < 3_000_000; s += i; i += 1;
+  end` ran no collection and grew to 1.4 GB (the evaluator: 85 MB, 30
+  collections). One jump back in 64 now ends the turn: the stack's Vec is
+  wound back when it is empty, a collection may run, and vm_loop starts
+  the next turn in a region of its own. 102 MB, 1.24 s (evaluator 1.48).
+- **test_fiber's test_many_fibers_with_threads** (60 s on the VM, 3 s on
+  the evaluator): the stack's Vec was recycled at every statement, and a
+  Vec's recycle asks every suspended coroutine whether it points into the
+  arena -- with 100 threads parked and a fiber switched each turn, that
+  was nearly all the run. Wound back only when its arena passes 64 KB
+  (asked one statement in 64): 8.3 s.
+- **test_thread's test_thread_join_during_finalizers** (`GC.stress =
+  true`, past 60 s on the VM, 27.5 s on the evaluator): every collection
+  marked the to_a Array of every loaded program -- each instruction's
+  Array and call data -- and a frame's first statement was a second
+  safepoint right after the block run that entered it. The collector
+  marks each program's operands instead (vm_keep keeps the tree's id
+  only), and a frame's first statement is no safepoint of its own: 50 s.
+- test_integer's test_pow and test_exception's test_blocking_backtrace
+  pass on the VM now as on the evaluator (bound-edge timings). Left:
+  test_module's complemented-method-entry leak test (the evaluator's
+  shape shortcuts, LOOP (69)).
+
+Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
+686 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates;
+test_sprintf 33 / 33 on the VM, also under ASan.
