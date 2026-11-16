@@ -5036,3 +5036,17 @@ different.
   is Ruby running on mere-ruby, about 3 ms a line; and the VM's loop is
   1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
   fallbacks, then the compiler made native, then speed.
+
+## 2026-11-16: stage 9, round 4 -- count the actual live String store
+
+While PR #91 waits for CI, an independent probe found that count_objects
+omitted T_STRING although each_object(String) now visits the actual store.
+The store count is the last sweep's survivor count plus handles issued since
+its sweep boundary. Empty strings count, reclaimed slots do not, and TOTAL
+includes the same live Strings. No collector function or m_state.mere changed.
+
+Witness 672 checks empty/live/reclaimed Strings, hash reuse, zeroed old keys
+and the total's arithmetic. It fails on PR #91's old binary (missing T_STRING)
+and agrees with Ruby after this fix. Core test_objectspace remains 37/37;
+objspace stays MATCH 38 and string_memory stays MATCH 2. The original 159-case
+classification is unchanged; this is an additional real API correction.
