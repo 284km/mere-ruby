@@ -8402,6 +8402,79 @@ and core_metadata_stmts = fn (body: Stmt list) ->
   | Cons (SLineQ _, rest) -> core_metadata_stmts rest
   | Cons (SFile _, rest) -> core_metadata_stmts rest
   | _ -> body
+// A block run on the VM is a program, not the statements core_metadata_plan
+// reads: the loader recognised the same shape in its instructions and kept
+// the statements the evaluator would have had (vm_metadata_shape), which are
+// read in its place -- so `n.times(&code)` over that block takes the same
+// way on the VM as on the evaluator (test_module's memory-leak tests).
+and core_metadata_vm = fn (body: Stmt list) ->
+  match core_metadata_stmts body with
+  | Cons (SVm (i, g), Nil) when map_has vm_plan_body (str_of_int i) ->
+    (match map_get vm_plan_body (str_of_int i) with
+     | Cons (SVm (_, g2), rest) when g2 == g -> rest
+     | _ -> body)
+  | _ -> body
+// ruby's instructions for `mod = Module.new; Class.new do include mod end`
+// as a block with no parameters and that one local, and its inner block's
+// `include mod`: the statements the parser makes of them, with the lines
+// (Nil when it is anything else)
+and vm_metadata_shape = fn (top: Val list) ->
+  let rec ins = fn (xs: Val list) -> (match xs with
+    | Nil -> (Nil : Val list)
+    | Cons (VArr a, t) -> Cons (VArr a, ins t)
+    | Cons (_, t) -> ins t) in
+  let rec first_line = fn (xs: Val list) -> (match xs with Nil -> 0 | Cons (VInt n, _) -> n | Cons (_, t) -> first_line t) in
+  // (the line in force at the instruction that reads the constant `Class`)
+  let rec class_line = fn (xs: Val list) -> fn (l: int) -> (match xs with
+    | Nil -> 0
+    | Cons (VInt n, t) -> class_line t n
+    | Cons (VArr a, t) -> (match deref a with
+                           | Cons (VSym o, Cons (VArr c, _)) when str_eq o "opt_getconstant_path" && (match deref c with Cons (VSym k, Nil) -> str_eq k "Class" | _ -> false) -> l
+                           | _ -> class_line t l)
+    | Cons (_, t) -> class_line t l) in
+  let op = fn (v: Val) -> (match v with VArr a -> (match deref a with Cons (VSym o, _) -> o | _ -> "") | _ -> "") in
+  let arg = fn (v: Val) -> fn (i: int) -> (match v with VArr a -> vm_nth (deref a) i | _ -> VNil) in
+  let cd = fn (v: Val) -> fn (k: str) -> (match arg v 1 with VHsh h -> vm_hget (hderef h) k | _ -> VNil) in
+  let is_mid = fn (v: Val) -> fn (m: str) -> fn (argc: int) ->
+    (match (cd v "mid", cd v "orig_argc") with (VSym x, VInt n) -> str_eq x m && n == argc | _ -> false) in
+  let cpath = fn (v: Val) -> fn (k: str) ->
+    str_eq (op v) "opt_getconstant_path" && (match arg v 1 with VArr c -> (match deref c with Cons (VSym x, Nil) -> str_eq x k | _ -> false) | _ -> false) in
+  let no_params = fn (t: Val list) -> (match vm_nth t 11 with VHsh h -> (match hderef h with Nil -> true | _ -> false) | _ -> false) in
+  let locals = fn (t: Val list) -> (match vm_nth t 10 with VArr l -> deref l | _ -> (Nil : Val list)) in
+  let body = (match vm_nth top 13 with VArr b -> deref b | _ -> (Nil : Val list)) in
+  match (locals top, ins body) with
+  | (Cons (VSym local, Nil),
+     Cons (m1, Cons (m2, Cons (m3, Cons (m4, Cons (m5, Cons (m6, Cons (m7, Cons (m8, Cons (m9, Cons (m10,
+     Cons (c1, Cons (c2, Cons (c3, Nil))))))))))))))
+    when no_params top && str_len local > 0 && (if is_upper_first local || str_starts_with local "_" || str_eq local "it" then false else true)
+         && cpath m1 "Module" && str_eq (op m2) "putnil" && str_eq (op m3) "swap"
+         && str_eq (op m4) "opt_new" && is_mid m4 "new" 0
+         && str_eq (op m5) "opt_send_without_block" && is_mid m5 "initialize" 0
+         && str_eq (op m6) "jump" && str_eq (op m7) "opt_send_without_block" && is_mid m7 "new" 0
+         && str_eq (op m8) "swap" && str_eq (op m9) "pop"
+         && str_eq (op m10) "setlocal_WC_0"
+         && cpath c1 "Class" && str_eq (op c2) "send" && is_mid c2 "new" 0
+         && (match cd c2 "flag" with VInt f -> f == 0 | _ -> false)
+         && str_eq (op c3) "leave" ->
+    (match arg c2 2 with
+     | VArr kid ->
+       (let kt = deref kid in
+        let kb = (match vm_nth kt 13 with VArr b -> deref b | _ -> (Nil : Val list)) in
+        match (locals kt, ins kb) with
+        | (Nil, Cons (k1, Cons (k2, Cons (k3, Cons (k4, Nil)))))
+          when no_params kt && str_eq (op k1) "putself"
+               && str_eq (op k2) "getlocal_WC_1" && (match (arg k2 1, arg m10 1) with (VInt a, VInt b) -> a == b | _ -> false)
+               && str_eq (op k3) "opt_send_without_block" && is_mid k3 "include" 1
+               && str_eq (op k4) "leave" ->
+          Cons (SLine (first_line body),
+                Cons (SAssign (local, EMethod (EConst "Module", "new", Nil)),
+                      Cons (SLine (class_line body 0),
+                            Cons (SExpr (EMethodB (EConst "Class", "new", Nil, Nil,
+                                                   Cons (SLine (first_line kb), Cons (SInclude (local, false), Nil)))),
+                                  Nil))))
+        | _ -> (Nil : Stmt list))
+     | _ -> (Nil : Stmt list))
+  | _ -> (Nil : Stmt list)
 and core_metadata_plan = fn (body: Stmt list) ->
   match core_metadata_stmts body with
   | Cons (SAssign (local, EMethod (EConst factory, method, Nil)), rest)
@@ -8520,12 +8593,12 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   let _ = (if map_len ub_amp > 0 then map_clear ub_amp else ()) in
   let (has, params00, body, cenv) = theblk in
   let (metadata_local, metadata_inner) = (match params00 with
-    | Nil -> core_metadata_plan body
+    | Nil -> core_metadata_plan (core_metadata_vm body)
     | _ -> ("", (Nil : Stmt list))) in
   if has && str_len metadata_local > 0
      && cd_get () - fb_depth_base () < vec_get call_depth_v 0
      && core_metadata_allowed world cenv
-  then core_metadata_run world cenv metadata_local body metadata_inner
+  then core_metadata_run world cenv metadata_local (core_metadata_vm body) metadata_inner
   else
   // ⚠ A BLOCK INVOCATION IS A FRAME. ruby's backtrace carries
   // `block in <where the block was WRITTEN>` between the block body and
@@ -10737,6 +10810,7 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
   | VInt n ->
     if (str_len name == 5 && str_eq name "times") then
       (let (has_block, parameters, body, captured) = theblk in
+       let body = (match parameters with Nil -> core_metadata_vm body | _ -> body) in
        let (local, inner) = (match parameters with Nil -> core_metadata_plan body | _ -> ("", (Nil : Stmt list))) in
        if has_block && n > 0 && str_len local > 0
           && cd_get () - fb_depth_base () < vec_get call_depth_v 0
@@ -63761,6 +63835,9 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   let decl = (if (yld / 2) % 2 == 1 then named locs else dapp (shadow locs) (Cons ("", named locs))) in
   let _ = (if ipn == 0 && kind == 1 then map_set vm_it_seqs (str_of_int id) (VInt gen)
            else if map_has vm_it_seqs (str_of_int id) then map_delete vm_it_seqs (str_of_int id) else ()) in
+  let _ = (match (if kind == 1 then vm_metadata_shape top else (Nil : Stmt list)) with
+           | Nil -> (if map_has vm_plan_body (str_of_int id) then map_delete vm_plan_body (str_of_int id) else ())
+           | plan -> map_set vm_plan_body (str_of_int id) (Cons (SVm (id, gen), plan))) in
   let _ = vec_set vm_meta id (lbl, pth, kind, gen, optn, optp optl, decl, kids, bp, bb,
                               // (1: a yield, a `defined?(yield)` or a super is in it; 2: the
                               //  method takes a block as ruby's compiler decides it -- use_block)
