@@ -186,3 +186,40 @@ fc2.n = 5
 fc2.freeze
 p fc2.n, begin; fc2.n = 6; rescue => e; e.class; end
 p binding.local_variable_defined?(:c), Count.instance_method(:n).arity
+
+# a method whose name holds a control byte, defined beside a warmed reader
+class ControlCache86
+  attr_reader :x
+  def initialize = @x = :reader
+  def read = x
+  define_method("x\x01") { :control_name }
+  define_method("x#") { :hash_name }
+end
+cc = ControlCache86.new
+p cc.read, cc.public_send("x\x01"), cc.read, cc.public_send("x\x01"), cc.public_send("x#"), cc.x
+
+# an assignment that spells out `@x || v` writes, and on a frozen object
+# raises; only the op-assignment `@x ||= v` reads its memo without writing
+class Assign86
+  def initialize = (@x = :present; @n = nil)
+  def e1 = (@x = @x || :fb)
+  def e2 = (@n = @n && :fb)
+  def s1
+    @x = @x || :fb
+  end
+  def s2
+    @n = @n && :fb
+  end
+  def o1 = (@x ||= :fb)
+  def o2 = (@n &&= :fb)
+  def so1
+    @x ||= :fb
+  end
+  def so2
+    @n &&= :fb
+  end
+end
+fa = Assign86.new.freeze
+p %i[e1 e2 s1 s2 o1 o2 so1 so2].map { |m| [m, (fa.send(m) rescue $!.class)] }
+ua = Assign86.new
+p %i[e1 e2 s1 s2 o1 o2 so1 so2].map { |m| [m, ua.send(m)] }, ua.instance_variables
