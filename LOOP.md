@@ -5327,3 +5327,35 @@ Checked (local): corpus 695 / 695 on the evaluator; under MERE_RUBY_VM=1
 685 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates;
 test_io, test_object, test_method, test_module as before; test_iseq 63 /
 68 and test_compile_prism 182 / 182 as before.
+
+## 2026-11-17 (71): tail calls -- compiled as compile.c marks them, made by the caller on the VM
+
+**The point.** test_optimization's two tail call tests compile with
+`tailcall_optimization: true` and call a method a million levels deep
+(test_tailcall_not_to_grow_stack) or twice as deep as the stack allows
+without it (test_tailcall_condition_block). The compiler refused the
+option, so the sequence ran on the evaluator and the stack ran out.
+
+- **The compiler** marks a `send` / `invokesuper` with no block that the
+  sequence leaves right after -- through nops, and through the jumps an
+  `if` makes -- VM_CALL_TAILCALL, in iseq_peephole_optimize's place among
+  the rules; not in a top, eval, main, rescue or ensure sequence, and not
+  between a rescue region's labels (a block's whole body is one, as
+  prism_compile.c marks it). Five snippets with the option join
+  tools/iseq/snippets.txt: 460 / 460 the same as ruby, to_a and disasm.
+- **The VM** makes a TAILCALL send of positional values from a method
+  frame whose caller is a VM send that takes it: the frame is left (how 7)
+  with the call waiting (vm_tail), and the caller's send makes it, one
+  frame at a time at its own depth (vm_tail_call). The callee is told by
+  depth and name, and only that frame's vm_enter takes it, so the mark
+  never reaches a builtin's call or a block. A million-deep self call:
+  3.4 s.
+- test_optimization 86 -> 88 / 89 (left: the frozen IO buffer's
+  memsize). Corpus 676 is the witness: deep self and mutual recursion,
+  another receiver, a private callee, a rescue region and a block that
+  are not tail calls, the label a tail-called method sees.
+
+Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
+686 on the VM, 10 fallen back, 0 different; vm_check 245 / 245;
+compare_with_ruby 460 / 460, coverage 22 / 22; gates; test_iseq 63 / 68
+as before.

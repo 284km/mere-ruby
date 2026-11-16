@@ -60,7 +60,9 @@ class RubyVM::InstructionSequence
     NEWARRAY_SEND_PACK_BUFFER = 5
     NEWARRAY_SEND_INCLUDE_P = 6
 
-    Label = Struct.new(:id, :pos, :refs, :sp, :unremovable)
+    # (rescued: compile.c's LABEL_RESCUE_BEG / _END, :beg / :end -- a region
+    #  no tail call is made in, iseq_optimize)
+    Label = Struct.new(:id, :pos, :refs, :sp, :unremovable, :rescued)
     # (vmx: what the VM's export adds after the operands -- to_a(u, true))
     Insn = Struct.new(:name, :ops, :line, :node_id, :events, :vmx)
     Trace = Struct.new(:event)
@@ -260,7 +262,6 @@ class RubyVM::InstructionSequence
       opts = DEFAULT_OPTIONS.merge(opts || {})
       # (what this compiler does not do yet it refuses: a tail call, the
       #  unified instruction pairs)
-      raise NotImplementedError, "RubyVM::InstructionSequence: tailcall_optimization is not compiled yet" if opts[:tailcall_optimization]
       raise NotImplementedError, "RubyVM::InstructionSequence: instructions_unification is not compiled yet" if opts[:instructions_unification]
       po = { filepath: path, line: line }
       # (a source String in another encoding is read in it, as ruby reads
@@ -296,6 +297,8 @@ class RubyVM::InstructionSequence
       #  redo / next entries and a `next` in it name)
       if unit.type == :block
         unit.block_labels = [unit.new_label, unit.new_label]
+        unit.block_labels[0].rescued = :beg
+        unit.block_labels[1].rescued = :end
         unit.emit_label(unit.block_labels[0])
       end
       # (a body with rescue / ensure is a BeginNode)
@@ -414,6 +417,8 @@ class RubyVM::InstructionSequence
         outer.event(:b_call)
         outer.block_nop = outer.insn(:nop)
         outer.block_labels = [outer.new_label, outer.new_label]
+        outer.block_labels[0].rescued = :beg
+        outer.block_labels[1].rescued = :end
         outer.emit_label(outer.block_labels[0])
         st = n.statements
         sl = st ? st.location : l
@@ -2247,6 +2252,8 @@ class RubyVM::InstructionSequence
       return unless lfin[1]
       lstart = u.new_label
       lend = u.new_label
+      lstart.rescued = :beg
+      lend.rescued = :end
       guard = Unit.new(:rescue, "defined guard in #{u.label}", u.path, u.abs_path, 0, [ERRINFO], u, [0, 0, -1, -1], 0)
       guard.parser = :"parse.y"
       guard.at(0, -1)
@@ -2428,6 +2435,8 @@ class RubyVM::InstructionSequence
       rc = n.rescue_clause
       lstart = u.new_label
       lend = u.new_label
+      lstart.rescued = :beg
+      lend.rescued = :end
       lcont = u.new_label
       child = exception_unit(u, :rescue, rc.location.start_line, rc.location, rc.node_id)
       node(child, rc, false)
@@ -2529,6 +2538,8 @@ class RubyVM::InstructionSequence
       finish(child)
       lstart = u.new_label
       lend = u.new_label
+      lstart.rescued = :beg
+      lend.rescued = :end
       lcont = u.new_label
       u.emit_label(lstart)
       was = u.in_rescue
@@ -4463,17 +4474,31 @@ class RubyVM::InstructionSequence
     def optimize(u)
       o = u.opts
       els = u.elements
+      # (tailcallable_p: not a top, eval, main, rescue or ensure sequence; and
+      #  not between a rescue region's labels -- a block's whole body is one)
+      do_tail = o[:tailcall_optimization] && !%i[top eval main rescue ensure].include?(u.type)
+      tail = do_tail
+      rescue_level = 0
       i = 0
       while i < els.size
         e = els[i]
         unless e.is_a?(Insn)
+          if e.is_a?(Label)
+            if e.rescued == :beg
+              rescue_level += 1
+              tail = false
+            elsif e.rescued == :end
+              rescue_level -= 1
+              tail = do_tail if rescue_level == 0
+            end
+          end
           i += 1
           next
         end
         cont = i
         if o[:peephole_optimization]
           loop do
-            r = peephole_insn(u, els, i)
+            r = peephole_insn(u, els, i, tail)
             # (`goto again`: the same instruction, wherever it is now)
             if r == :again && (j = locate(els, e, i))
               i = j
@@ -4539,7 +4564,7 @@ class RubyVM::InstructionSequence
     # refuses, nor opt_invokebuiltin_delegate, which it never emits). It
     # answers :again to run them all again on the instruction (`goto
     # again`), or, when it took the instruction out, where to go on
-    def peephole_insn(u, els, i)
+    def peephole_insn(u, els, i, tail = false)
       e = els[i]
       if e.name == :jump
         d = dest_index(els, e.ops[0])
@@ -4745,13 +4770,36 @@ class RubyVM::InstructionSequence
             ni = insn_at(els, els.index { |x| x.equal?(jmp) } + 1)
             if ni && (ne = els[ni]).is_a?(Insn)
               loop do
-                break unless peephole_insn(u, els, ni) == :again && (ni = locate(els, ne, ni))
+                break unless peephole_insn(u, els, ni, tail) == :again && (ni = locate(els, ne, ni))
               end
             end
           else
             els.delete_at(k)
           end
         end
+      end
+
+      # (the tail call: a send or an invokesuper with no block that the
+      #  sequence leaves right after -- through nops, and jumps to where they
+      #  land -- calls with VM_CALL_TAILCALL)
+      if tail && (e.name == :send || e.name == :invokesuper) && e.ops[1].nil?
+        k = i + 1
+        steps = 0
+        hit = false
+        while k && k < els.size && (steps += 1) < 10_000
+          x = els[k]
+          unless x.is_a?(Insn)
+            k += 1
+            next
+          end
+          if x.name == :nop then k += 1
+          elsif x.name == :jump then k = els.index { |y| y.equal?(x.ops[0]) }
+          else
+            hit = x.name == :leave
+            break
+          end
+        end
+        e.ops[0] = e.ops[0].dup.tap { |cd| cd.flag |= CALL_TAILCALL } if hit
       end
 
       if e.name == :dup && insn_named?(els[i + 1], :setlocal)

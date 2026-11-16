@@ -1447,6 +1447,8 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter flow_sig mk in
   // (the to_a Arrays the ISeq VM's loaded programs were decoded from)
   let _ = map_iter vm_keep (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
+  // (a tail call waiting to be made: vm_tail_call)
+  let _ = map_iter vm_tail (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
   // (the ISeq VM's operand stacks in use, up to their depth: a value can be
   //  held by a stack alone -- `[$g, ($g = nil)]`. A slot in the free list is
   //  no frame's; one a suspended fiber's frame holds is not in it.)
@@ -64429,6 +64431,22 @@ and vm_send = fn env -> fn world -> fn blk -> fn st -> fn (mid: str) -> fn (fl: 
   let kws = (match kw with VArr k -> deref k | _ -> Nil) in
   let args = vm_popn st (argc + list_len_v kws 0 + (if vm_bit fl 2 then 1 else 0)) in
   let recv = vm_pop st in
+  // (a tail call -- VM_CALL_TAILCALL, positional values only, no block --
+  //  from a method frame whose caller takes it: the frame is left, and the
+  //  caller makes the call (vm_tail_call). So a method that calls itself
+  //  last does not grow the stack, as ruby's tailcall_optimization has it.)
+  if vm_bit fl 128 && bid < 0 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 32 || vm_bit fl 64 then false else true)
+     && (match kws with Nil -> true | _ -> false)
+     && map_has env "__vm~tc" && (if map_len hook_flags > 0 && map_has hook_flags "tp" then false else true)
+  then
+    (let (_, regs) = st in
+     let _ = map_set vm_tail 0 recv in
+     let _ = map_set vm_tail 1 (VSym mid) in
+     let _ = map_set vm_tail 2 (arr_new args) in
+     let _ = map_set vm_tail 3 (VBool (if vm_bit fl 4 then false else true)) in
+     let _ = vec_set regs 2 7 in
+     vm_push st VNil)
+  else
   let stmt = fn (s: Stmt) -> (match vm_cls_stmt env world blk s with FNext v -> v | _ -> VNil) in
   let in_cls = map_has env "__cscope" && (match (if map_has env "self" then map_get env "self" else VNil) with VClass _ -> true | _ -> false) in
   let rec syms = fn (xs: Val list) -> (match xs with Cons (VSym y, t) -> Cons (y, syms t) | _ -> (Nil : str list)) in
@@ -64518,7 +64536,30 @@ and vm_send = fn env -> fn world -> fn blk -> fn st -> fn (mid: str) -> fn (fl: 
   //  called in: the call is made in the frame itself, not in a scope of it)
   else if vm_bit fl 4 && bid < 0 && (str_eq mid "binding" || str_eq mid "eval" || str_eq mid "local_variables")
   then vm_push st (vm_call_in env world blk recv mid fl argc kws args bid)
-  else vm_push st (vm_call env world blk recv mid fl argc kws args bid)
+  else vm_push st (vm_tail_call env world blk recv mid (fn (u: unit) -> vm_call env world blk recv mid fl argc kws args bid))
+// A call whose callee may leave its frame to have a tail call made here
+// (vm_send): the callee is told by depth and name (vm_tail_ready, taken by
+// its vm_enter), and while it answers the mark the waiting call is made --
+// one frame at a time, at this depth.
+and vm_tail_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) -> fn (call: unit -> Val) ->
+  let ready = fn (m: str) -> (let _ = map_set vm_tail_name 0 m in vec_set vm_tail_ready 0 (cd_get () + 1)) in
+  let _ = ready mid in
+  let v0 = call () in
+  let _ = vec_set vm_tail_ready 0 0 in
+  let rec go = fn (v: Val) ->
+    (match v with
+     | VExc (c9, _) when str_eq c9 "~vmtail~" ->
+       (let r9 = (if map_has vm_tail 0 then map_get vm_tail 0 else VNil) in
+        let m9 = (match (if map_has vm_tail 1 then map_get vm_tail 1 else VNil) with VSym y -> y | _ -> "") in
+        let a9 = (match (if map_has vm_tail 2 then map_get vm_tail 2 else VNil) with VArr k -> deref k | _ -> (Nil : Val list)) in
+        let x9 = (match (if map_has vm_tail 3 then map_get vm_tail 3 else VNil) with VBool b -> b | _ -> true) in
+        let _ = map_clear vm_tail in
+        let _ = ready m9 in
+        let v9 = emethod_args env world blk r9 m9 a9 x9 in
+        let _ = vec_set vm_tail_ready 0 0 in
+        go v9)
+     | _ -> v) in
+  go v0
 // A statement that declares -- a def, a visibility or attribute statement,
 // alias, undef -- run where the frame is: in a class body (or a class_eval
 // block's), by the class body's own walker (register_class_v), which is
@@ -64842,7 +64883,8 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
                  let (_, _, _, _, _, _, _, _, bp, bb, _, _, _, _) = vec_get vm_meta (vec_get ic pc) in
                  vm_push st (vm_ev env world blk (ELambda (bp, bb))))
               else vm_value_op env world blk st o n a (vec_get ib pc) (vec_get ov pc)) in
-     pc + 1)
+     // (a tail call made by the caller: the frame is left -- vm_send)
+     if vec_get regs 2 == 7 then 0 - 1 else pc + 1)
 // (the method an event names, as the evaluator's :line names it: the frame's
 //  method and its class; none at the top level or in a class body)
 and vm_events = fn env -> fn world -> fn (e: int) -> fn (line: int) ->
@@ -65482,8 +65524,19 @@ and vm_enter = fn env -> fn world -> fn blk -> fn (id: int) -> fn (gen: int) ->
         && vec_get cov_st 0 != 2 && (if map_len hook_flags > 0 && map_has hook_flags "tp" then false else true)
      then FNext (vm_trivial_value env world blk id)
      else
+     // (a method frame its caller's VM send will make a tail call for:
+     //  vm_tail_call)
+     let _ = (if kind == 2 && vec_get vm_tail_ready 0 > 0 then
+                (let ok9 = vec_get vm_tail_ready 0 == cd_get ()
+                           && (match (if map_has env "__meth" then map_get env "__meth" else VNil) with
+                               | VStr h9 -> map_has vm_tail_name 0 && str_eq (sget h9) (map_get vm_tail_name 0)
+                               | _ -> false) in
+                 let _ = vec_set vm_tail_ready 0 0 in
+                 if ok9 then map_set env "__vm~tc" VBool true else ())
+              else ()) in
      let (v, how) = vm_exec env world blk id pc0 in
-     if how == 1 then FReturn v else if how == 2 then FBreak v else if how == 3 then FLoopNext v
+     if how == 7 then FNext (VExc ("~vmtail~", ""))
+     else if how == 1 then FReturn v else if how == 2 then FBreak v else if how == 3 then FLoopNext v
      // (a retry or a redo nothing in the frame took: there is nothing it is of)
      else if how == 4 then FRaise (raise_exc world "SyntaxError" "Invalid retry")
      else if how == 5 then FRaise (raise_exc world "SyntaxError" "Invalid redo")
