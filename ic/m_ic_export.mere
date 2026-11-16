@@ -1,0 +1,208 @@
+// The native ISeq compiler's answer (note 552 §11): a finished sequence as
+// lib/iseq_compiler_ext.rb's to_a(u, true) shows it to the VM's loader, and
+// that as the text tools/iseq/native/expect.rb writes of the Ruby
+// compiler's -- which is how the two are held to each other.
+import "m_ic_finish.mere";
+
+let ic_s = fn (s: str) -> IvSym (s, "US-ASCII");
+let ic_label_sym = fn (pos: int) -> ic_s ("label_" ++ str_of_int pos);
+let ic_type_sym = fn (ty: int) ->
+  ic_s (if ty == 0 then "top" else if ty == 1 then "block" else if ty == 2 then "method" else if ty == 3 then "class"
+        else if ty == 4 then "rescue" else if ty == 5 then "ensure" else "plain");
+let ic_catch_sym = fn (ty: int) ->
+  ic_s (if ty == 1 then "rescue" else if ty == 2 then "ensure" else if ty == 3 then "retry" else if ty == 4 then "break"
+        else if ty == 5 then "redo" else "next");
+
+// (the catch table that is kept: only when the sequence may catch
+//  something -- catch_except_p; in the order the entries were added)
+let ic_kept_catch = fn cx -> fn (u: int) ->
+  if ic_u_catch_except cx u then ic_rev (ic_u_catch cx u) else (Nil : (int * int * int * int * int) list);
+
+let ic_arg_size = fn cx -> fn (u: int) ->
+  let opt = vec_get (ic_uo cx) u in
+  ic_u_lead_num cx u
+  + (if ic_u_pflag cx u 64 then ic_llen opt - 1 else 0)
+  + (if ic_u_rest_start cx u >= 0 then 1 else 0)
+  + (if ic_u_post_num cx u >= 0 then ic_u_post_num cx u else 0)
+  + (if ic_u_pflag cx u 32 then ic_llen (vec_get (ic_uw cx) u) + 1 else 0)
+  + (if ic_u_kwrest cx u >= 0 then 1 else 0)
+  + (if ic_u_block_start cx u >= 0 then 1 else 0)
+  // (a forwardable method's `...` is passed as a parameter)
+  + (if ic_u_pflag cx u 16 then 1 else 0);
+
+// catch_positions: an entry's start, end, continuation and stack depth
+let ic_catch_positions = fn cx -> fn (c: int * int * int * int * int) ->
+  let (ty, ls, le, _, lc) = c in
+  let sp0 = (if lc >= 0 && ic_sp cx lc >= 0 then ic_sp cx lc else 0) in
+  let sp = (if (ty == 1 || ty == 4 || ty == 6) && sp0 > 0 then sp0 - 1 else sp0) in
+  (ic_pos cx ls, ic_pos cx le, (if lc >= 0 then ic_pos cx lc else 0), sp);
+
+let rec ic_to_a = fn cx -> fn (u: int) ->
+  let els = ic_u_elements cx u in
+  (
+    // (iseq_data_to_ary's labels_table: a position some operand, the opt
+    //  table, a cdhash or a catch entry names, shown before the instruction
+    //  there)
+    let named = map_new () in
+    let name = fn (pos: int) -> map_set named pos 1 in
+    let _ = list_iter (vec_get (ic_uo cx) u) (fn (l: int) -> name (ic_pos cx l)) in
+    let kept = ic_kept_catch cx u in
+    let _ = list_iter kept (fn (c: int * int * int * int * int) ->
+              (let (st, ed, cont, _) = ic_catch_positions cx c in
+               let _ = name st in
+               let _ = name ed in
+               name cont)) in
+    let rec name_ops = fn (ops: IcOp list) ->
+      (match ops with
+       | Nil -> ()
+       | Cons (OLab l, t) -> (let _ = name (ic_pos cx l) in name_ops t)
+       | Cons (OCdh es, t) -> (let _ = list_iter es (fn (kl: Iv * int) -> (let (_, l) = kl in name (ic_pos cx l))) in name_ops t)
+       | Cons (_, t) -> name_ops t) in
+    let rec name_all = fn (e: int) ->
+      if ic_is_end cx e then () else (let _ = (if ic_kind cx e == 0 then name_ops (ic_ops cx e) else ()) in name_all (ic_next cx e)) in
+    let _ = name_all (ic_first cx els) in
+    let op = fn (o: IcOp) ->
+      (match o with
+       | ONum k -> IvInt k
+       | OVal v -> v
+       | OLab l -> ic_label_sym (ic_pos cx l)
+       | OLoc (_, _, idx) -> IvInt idx
+       | OCall (mid, flag, argc, kws, has) ->
+         (let nk = ic_llen kws in
+          let head = Cons ((ic_s "mid", (if str_eq mid (chr 0) then IvNil else ic_sym cx mid)), Cons ((ic_s "flag", IvInt flag), Nil)) in
+          let tail = Cons ((ic_s "orig_argc", IvInt (argc - (if has then nk else 0))), Nil) in
+          IvHsh (ic_cat head (if has then Cons ((ic_s "kw_arg", IvArr (ic_map (fn (k: str) -> ic_sym cx k) kws)), tail) else tail)))
+       | OSeq s -> if s < 0 then IvNil else ic_to_a cx s
+       | OIvc k -> IvInt k
+       | OIse k -> IvInt k
+       | OCvc k -> IvInt k
+       | OIc segs -> IvArr segs
+       | ODef k -> IvInt k
+       | OChk k -> IvInt k
+       | OCdh es ->
+         (let rec flat = fn (xs: (Iv * int) list) ->
+            (match xs with | Nil -> (Nil : Iv list) | Cons ((k, l), t) -> Cons (k, Cons (ic_label_sym (ic_pos cx l), flat t))) in
+          IvArr (flat es))) in
+    // the body, built backwards
+    let ev = fn (bits: int) -> fn (acc: Iv list) ->
+      (let a1 = (if bit_and bits 1 != 0 then Cons (ic_s "RUBY_EVENT_LINE", acc) else acc) in
+       let a2 = (if bit_and bits 2 != 0 then Cons (ic_s "RUBY_EVENT_CLASS", a1) else a1) in
+       let a3 = (if bit_and bits 4 != 0 then Cons (ic_s "RUBY_EVENT_END", a2) else a2) in
+       let a4 = (if bit_and bits 8 != 0 then Cons (ic_s "RUBY_EVENT_CALL", a3) else a3) in
+       let a5 = (if bit_and bits 16 != 0 then Cons (ic_s "RUBY_EVENT_RETURN", a4) else a4) in
+       let a6 = (if bit_and bits 256 != 0 then Cons (ic_s "RUBY_EVENT_B_CALL", a5) else a5) in
+       let a7 = (if bit_and bits 512 != 0 then Cons (ic_s "RUBY_EVENT_B_RETURN", a6) else a6) in
+       if bit_and bits 16384 != 0 then Cons (ic_s "RUBY_EVENT_RESCUE", a7) else a7) in
+    let rec body = fn (e: int) -> fn (pos: int) -> fn (last: int) -> fn (acc: Iv list) -> fn (ids: Iv list) ->
+      if ic_is_end cx e then (ic_rev acc, ic_rev ids)
+      else if ic_kind cx e != 0 then body (ic_next cx e) pos last acc ids
+      else
+        (let a1 = (if map_has named pos then Cons (ic_label_sym pos, acc) else acc) in
+         let line = ic_eline cx e in
+         let fresh = line > 0 && line != last in
+         let a2 = (if fresh then Cons (IvInt line, a1) else a1) in
+         let a3 = ev (ic_events cx e) a2 in
+         let ops = ic_ops cx e in
+         let insn = IvArr (Cons (ic_s (ic_name cx e), ic_cat (ic_map op ops) (ic_map op (ic_vmx cx e)))) in
+         body (ic_next cx e) (pos + 1 + ic_llen ops) (if fresh then line else last) (Cons (insn, a3)) (Cons (IvInt (ic_enode cx e), ids))) in
+    let (bd, node_ids) = body (ic_first cx els) 0 (0 - 1) Nil Nil in
+    let exception = ic_map (fn (c: int * int * int * int * int) ->
+                      (let (ty, _, _, iseq, _) = c in
+                       let (st, ed, cont, sp) = ic_catch_positions cx c in
+                       IvArr (Cons (ic_catch_sym ty, Cons ((if iseq >= 0 then ic_to_a cx iseq else IvNil),
+                              Cons (ic_label_sym st, Cons (ic_label_sym ed, Cons (ic_label_sym cont, Cons (IvInt sp, Nil))))))))) kept in
+    let misc = IvHsh (Cons ((ic_s "arg_size", IvInt (ic_arg_size cx u)),
+               Cons ((ic_s "local_size", IvInt (ic_llen (ic_u_locals cx u))),
+               Cons ((ic_s "stack_max", IvInt (ic_u_stack_max cx u)),
+               Cons ((ic_s "node_id", IvInt (ic_u_node_id cx u)),
+               Cons ((ic_s "code_location", IvArr (Cons (IvInt (ic_u_get cx u 3), Cons (IvInt (ic_u_get cx u 4),
+                                                   Cons (IvInt (ic_u_get cx u 5), Cons (IvInt (ic_u_get cx u 6), Nil)))))),
+               Cons ((ic_s "node_ids", IvArr node_ids),
+               Cons ((ic_s "parser", ic_s "prism"), Nil)))))))) in
+    // the parameters, in to_a's order
+    let pr = fn (cond: bool) -> fn (k: str) -> fn (v: Iv) -> fn (rest: (Iv * Iv) list) -> if cond then Cons ((ic_s k, v), rest) else rest in
+    let opt = vec_get (ic_uo cx) u in
+    let params =
+      pr (ic_u_pflag cx u 64) "opt" (IvArr (ic_map (fn (l: int) -> ic_label_sym (ic_pos cx l)) opt))
+      (pr (ic_u_lead_num cx u > 0) "lead_num" (IvInt (ic_u_lead_num cx u))
+      (pr (ic_u_post_num cx u >= 0) "post_num" (IvInt (ic_u_post_num cx u))
+      (pr (ic_u_post_num cx u >= 0) "post_start" (IvInt (ic_u_post_start cx u))
+      (pr (ic_u_rest_start cx u >= 0) "rest_start" (IvInt (ic_u_rest_start cx u))
+      (pr (ic_u_block_start cx u >= 0) "block_start" (IvInt (ic_u_block_start cx u))
+      (pr (ic_u_pflag cx u 32) "kwbits" (IvInt (ic_u_kwbits cx u))
+      (pr (ic_u_pflag cx u 32) "keyword" (IvArr (vec_get (ic_uw cx) u))
+      (pr (ic_u_kwrest cx u >= 0) "kwrest" (IvInt (ic_u_kwrest cx u))
+      (pr (ic_u_pflag cx u 1) "ambiguous_param0" IvTrue
+      (pr (ic_u_pflag cx u 2) "accepts_no_kwarg" IvTrue
+      (pr (ic_u_implicit cx u >= 0) "implicit" (IvInt (ic_u_implicit cx u))
+      (pr (ic_u_pflag cx u 4) "use_block" IvTrue Nil)))))))))))) in
+    // (a hidden local -- kwbits -- is numbered as iseq_data_to_ary numbers it)
+    let nloc = ic_llen (ic_u_locals cx u) in
+    let rec locals = fn (ls: str list) -> fn (i: int) ->
+      (match ls with
+       | Nil -> (Nil : Iv list)
+       | Cons (l, t) -> Cons ((if str_len l > 0 && ord (char_at l 0) == 1 then IvInt (nloc - i + 1) else ic_sym cx l), locals t (i + 1))) in
+    IvArr (Cons (IvStr ("YARVInstructionSequence/SimpleDataFormat", "BINARY"),
+           Cons (IvInt 4, Cons (IvInt 0, Cons (IvInt 1, Cons (misc,
+           Cons (IvStr (ic_u_label cx u, "UTF-8"), Cons (IvStr (ic_u_path cx u, "UTF-8"), Cons (IvStr (ic_u_abs_path cx u, "UTF-8"),
+           Cons (IvInt (ic_u_first_lineno cx u), Cons (ic_type_sym (ic_u_type cx u),
+           Cons (IvArr (locals (ic_u_locals cx u) 0), Cons (IvHsh params, Cons (IvArr exception, Cons (IvArr bd, Nil)))))))))))))))
+  );
+
+// -- the text ---------------------------------------------------------------------
+let ic_hex2 = fn (b: int) ->
+  let d = fn (k: int) -> char_at "0123456789ABCDEF" k in
+  d (b / 16) ++ d (b % 16);
+// (a byte outside 0x20..0x7e, a `"` and a `\` as \xHH)
+let ic_esc = fn (s: str) ->
+  let n = str_len s in
+  let rec plain = fn (i: int) ->
+    if i >= n then true
+    else (let c = ord (char_at s i) in if c < 32 || c > 126 || c == 34 || c == 92 then false else plain (i + 1)) in
+  if plain 0 then s
+  else
+    (let rec go = fn (i: int) -> fn (acc: str list) ->
+       if i >= n then ic_join (ic_rev acc) ""
+       else (let c = ord (char_at s i) in
+             go (i + 1) (Cons ((if c < 32 || c > 126 || c == 34 || c == 92 then "\\x" ++ ic_hex2 c else char_at s i), acc))) in
+     go 0 Nil);
+let ic_hex8 = fn (w: int) ->
+  let d = fn (k: int) -> char_at "0123456789abcdef" (bit_and (bit_shr w k) 15) in
+  d 28 ++ d 24 ++ d 20 ++ d 16 ++ d 12 ++ d 8 ++ d 4 ++ d 0;
+let rec ic_pad = fn (k: int) -> if k <= 0 then "" else " " ++ ic_pad (k - 1);
+
+let rec ic_canon = fn (v: Iv) -> fn (ind: int) ->
+  match v with
+  | IvNil -> "nil"
+  | IvTrue -> "true"
+  | IvFalse -> "false"
+  | IvInt k -> str_of_int k
+  | IvBig s -> s
+  | IvFlt f -> "f" ++ ic_hex8 (float_bits_hi f) ++ ic_hex8 (float_bits_lo f)
+  | IvSym (s, e) -> ":" ++ ic_esc s ++ (if str_eq e "US-ASCII" then "" else "@" ++ e)
+  | IvStr (s, e) -> "\"" ++ ic_esc s ++ "\"@" ++ e
+  | IvRx (s, o, e) -> "/" ++ ic_esc s ++ "/" ++ str_of_int o ++ "@" ++ e
+  | IvRng (a, b, excl) -> "(" ++ ic_canon a ind ++ (if excl then "..." else "..") ++ ic_canon b ind ++ ")"
+  | IvRat (a, b) -> "(r " ++ ic_canon a ind ++ " " ++ ic_canon b ind ++ ")"
+  | IvCpx (a, b) -> "(c " ++ ic_canon a ind ++ " " ++ ic_canon b ind ++ ")"
+  | IvCls s -> "<" ++ s ++ ">"
+  | IvEnc s -> "<enc " ++ s ++ ">"
+  | IvHsh ps -> "\{" ++ ic_join (ic_map (fn (kv: Iv * Iv) -> (let (k, x) = kv in ic_canon k ind ++ "=>" ++ ic_canon x ind)) ps) " " ++ "\}"
+  | IvArr xs ->
+    (match xs with
+     | Cons (IvStr (f, _), Cons (_, Cons (_, Cons (_, rest)))) when str_starts_with f "YARVInstructionSequence" ->
+       (let pad = ic_pad (ind + 1) in
+        // (the nine heads -- the label and the two paths as their bytes --
+        //  then the body, an item a line)
+        let rec heads = fn (ys: Iv list) -> fn (i: int) -> fn (acc: str list) ->
+          (match ys with
+           | Cons (IvArr bd, Nil) ->
+             (let lines = ic_map (fn (x: Iv) -> pad ++ " " ++ ic_canon x (ind + 2) ++ "\n") bd in
+              ic_join (ic_rev acc) "" ++ ic_join lines "")
+           | Cons (y, t) ->
+             heads t (i + 1) (Cons (pad ++ (match y with
+                                            | IvStr (s, _) when i >= 5 && i <= 7 -> "\"" ++ ic_esc s ++ "\""
+                                            | _ -> ic_canon y (ind + 1)) ++ "\n", acc))
+           | Nil -> ic_join (ic_rev acc) "") in
+        "(seq\n" ++ heads rest 4 Nil ++ ic_pad ind ++ ")")
+     | _ -> "[" ++ ic_join (ic_map (fn (x: Iv) -> ic_canon x ind) xs) " " ++ "]");
