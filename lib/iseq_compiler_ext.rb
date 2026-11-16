@@ -68,6 +68,9 @@ class RubyVM::InstructionSequence
     #  lowers the stack to its label's -- `pop` / `adjuststack` -- at layout)
     Adjust = Struct.new(:label, :line, :node_id, :restore)
     IVC = Struct.new(:index)
+    # (`once`'s inline storage entry: numbered on its own, shown after the
+    #  ivar and cvar caches)
+    ISE = Struct.new(:index, :base)
     # (is_entries holds the ivar caches first and the constant caches after
     #  them: an IC's place there, which disasm shows, is past every IVC)
     IC = Struct.new(:index, :segments, :base)
@@ -94,7 +97,8 @@ class RubyVM::InstructionSequence
                         specialized_instruction: true, operands_unification: true,
                         instructions_unification: false, frozen_string_literal: false }.freeze
 
-    THROUGH = %i[block rescue ensure].freeze
+    # (...and `once`'s own sequence, a :plain one)
+    THROUGH = %i[block rescue ensure plain].freeze
 
     # one instruction sequence being built, and what to_a / disasm read off it
     class Unit
@@ -185,6 +189,8 @@ class RubyVM::InstructionSequence
       def next_is = (@is_n = (@is_n || -1) + 1)
       def next_ic = (@ic_n = (@ic_n || -1) + 1)
       def ivc_size = (@is_n || -1) + 1
+      def next_ise = (@ise_n = (@ise_n || -1) + 1)
+      def ise_size = (@ise_n || -1) + 1
       def cvc(name) = CVC.new((@cvcs ||= {})[name] ||= @cvcs.size, nil)
       def cvc_size = (@cvcs ||= {}).size
       def at(line, node_id) = (@line, @node = line, node_id)
@@ -385,6 +391,39 @@ class RubyVM::InstructionSequence
         u.emit_label(else_l)
         u.insn(:putobject, false)
         u.emit_label(final)
+      # PM_POST_EXECUTION_NODE: `END { }` -- once, a block that hands the
+      # block of the statements to core#set_postexe
+      when Prism::PostExecutionNode
+        l = n.location
+        outer = Unit.new(:block, block_label(u), u.path, u.abs_path, l.start_line, [], u,
+                         [l.start_line, l.start_column, l.end_line, l.end_column], n.node_id)
+        u.children << outer
+        outer.at(outer.first_lineno, n.node_id)
+        outer.event(:b_call)
+        outer.block_nop = outer.insn(:nop)
+        outer.block_labels = [outer.new_label, outer.new_label]
+        outer.emit_label(outer.block_labels[0])
+        st = n.statements
+        sl = st ? st.location : l
+        inner = Unit.new(:block, block_label(u), u.path, u.abs_path, l.start_line, [], outer,
+                         [sl.start_line, sl.start_column, sl.end_line, sl.end_column], st ? st.node_id : n.node_id)
+        outer.children << inner
+        inner.at(inner.first_lineno, inner.node_id)
+        inner.event(:b_call)
+        inner.block_nop = inner.insn(:nop)
+        compile_body(inner, st, inner.node_id, sl.end_line)
+        finish(inner)
+        outer.at(l.start_line, n.node_id)
+        outer.insn(:putspecialobject, 1)
+        outer.insn(:send, ci(:"core#set_postexe", 0, CALL_FCALL, nil, true), inner)
+        outer.emit_label(outer.block_labels[1])
+        outer.event(:b_return)
+        outer.at(l.end_line, n.node_id)
+        outer.insn(:leave)
+        finish(outer)
+        here(u, n)
+        u.insn(:once, outer, ISE.new(u.next_ise))
+        u.insn(:pop) if popped
       when Prism::CaseMatchNode then case_match_node(u, n, popped)
       when Prism::MatchPredicateNode then match_predicate(u, n, popped)
       when Prism::MatchRequiredNode then match_required(u, n, popped)
@@ -460,23 +499,31 @@ class RubyVM::InstructionSequence
       # pm_compile_regexp_dynamic: the pieces as an interpolated string's,
       # and toregexp of them with the literal's options
       when Prism::InterpolatedRegularExpressionNode
+        # (`/#{x}/o`: a sequence of its own -- the pieces and toregexp --
+        #  that `once` runs the first time and whose Regexp it answers from
+        #  then on, kept in an inline storage entry of this sequence)
         if n.once?
-          raise NotImplementedError, "RubyVM::InstructionSequence: an interpolated regexp with /o is not compiled yet"
+          l = n.location
+          child = Unit.new(:plain, block_label(u), u.path, u.abs_path, l.start_line, [], u,
+                           [l.start_line, l.start_column, l.end_line, l.end_column], n.node_id)
+          u.children << child
+          # (in its own sequence the pattern's instructions are the scope's,
+          #  of no node; the leave is the node's)
+          dregexp(child, Renumbered.new(n, 0), false)
+          here(child, n)
+          child.insn(:leave)
+          finish(child)
+          here(u, n)
+          u.insn(:once, child, ISE.new(u.next_ise))
+          u.insn(:pop) if popped
+          return
         end
         # (every piece a literal: the Regexp itself)
         if n.static_literal?
           u.insn(:putobject, regexp_literal(static_concat(n.parts), n)) unless popped
           return
         end
-        count, kinds = dstr(u, n, false, true)
-        here(u, n)
-        ins = u.insn(:toregexp, n.options & 0xff, count)
-        # (for the VM: the literal's flags as written and which pieces are
-        #  its own text, L, and which were computed, C -- what decides the
-        #  pattern's encoding and whose clash is whose error)
-        ins.vmx = [("i" if n.ignore_case?), ("x" if n.extended?), ("m" if n.multi_line?), ("n" if n.ascii_8bit?),
-                   ("u" if n.utf_8?), ("e" if n.euc_jp?), ("s" if n.windows_31j?)].join + "|" + kinds
-        u.insn(:pop) if popped
+        dregexp(u, n, popped)
       # $1 .. $9: getspecial of the number doubled; $&, $`, $', $+: of the
       # character doubled, plus 1
       when Prism::NumberedReferenceReadNode
@@ -960,9 +1007,6 @@ class RubyVM::InstructionSequence
     # `for x in c`: c.each with a block whose one parameter is hidden and
     # written to x (a local of the scope around) before the block's b_call
     def for_node(u, n, popped)
-      unless n.index.is_a?(Prism::LocalVariableTargetNode)
-        raise NotImplementedError, "RubyVM::InstructionSequence: a for loop over this target is not compiled yet"
-      end
       retry_l = u.new_label
       retry_end = u.new_label
       u.emit_label(retry_l)
@@ -975,13 +1019,13 @@ class RubyVM::InstructionSequence
       hidden = 0
       child = Unit.new(:block, label, u.path, u.abs_path, l.start_line, [hidden], u,
                        [l.start_line, l.start_column, l.end_line, l.end_column], n.node_id)
-      child.params[:lead_num] = 1
+      t = n.index
+      if t.is_a?(Prism::LocalVariableTargetNode) then child.params[:lead_num] = 1
+      else child.params[:rest_start] = 0
+      end
       child.params[:for] = true
       u.children << child
-      t = n.index
-      child.at(t.location.start_line, t.node_id)
-      child.insn(:getlocal, *local_ref(child, hidden, 0))
-      child.insn(:setlocal, *local_ref(child, t.name, t.depth + 1))
+      for_index(child, t, hidden)
       child.at(l.start_line, n.node_id)
       child.event(:b_call)
       child.block_nop = child.insn(:nop)
@@ -992,6 +1036,67 @@ class RubyVM::InstructionSequence
       u.emit_label(retry_end)
       u.insn(:pop) if popped
       u.add_catch(:break, retry_l, retry_end, child, retry_end)
+    end
+
+    # pm_compile_for_node_index: the block's one parameter written to the
+    # loop's target -- a local as it is; any other single target as the one
+    # element of the parameters; several targets as the parameters, or as
+    # the one parameter when it converts to an Array
+    def for_index(child, t, hidden)
+      child.at(t.location.start_line, t.node_id)
+      case t
+      when Prism::LocalVariableTargetNode
+        child.insn(:getlocal, *local_ref(child, hidden, 0))
+        child.insn(:setlocal, *local_ref(child, t.name, t.depth + 1))
+      when Prism::SplatNode, Prism::MultiTargetNode
+        writes = []
+        cleanup = []
+        st = MState.new(0, 0, [])
+        # (no state is handed down here, so a call or an index target's topn
+        #  stays as it was written -- reaching a value, not its receiver:
+        #  ruby 4.0's `for o.x, y in [[1, 2]]` calls x= on the 2. The
+        #  sequence is ruby's, and so is what it does.)
+        if t.is_a?(Prism::MultiTargetNode) then multi_target(child, t, writes, cleanup, st)
+        else target(child, t, writes, cleanup, st)
+        end
+        # (the four calls are on the value, with FCALL as ruby writes them:
+        #  marked for the VM, to which FCALL is a call without a receiver)
+        not_single = child.new_label
+        not_ary = child.new_label
+        child.at(t.location.start_line, t.node_id)
+        child.insn(:getlocal, *local_ref(child, hidden, 0))
+        child.insn(:dup)
+        child.insn(:send, CallData.new(:length, CALL_FCALL | CALL_ARGS_SIMPLE, 0, nil), nil).vmx = :recv
+        child.insn(:putobject, 1)
+        child.insn(:send, CallData.new(:==, CALL_FCALL | CALL_ARGS_SIMPLE, 1, nil), nil).vmx = :recv
+        child.insn(:branchunless, not_single)
+        child.insn(:dup)
+        child.insn(:putobject, 0)
+        child.insn(:send, CallData.new(:[], CALL_FCALL | CALL_ARGS_SIMPLE, 1, nil), nil).vmx = :recv
+        child.insn(:putobject, Array)
+        child.insn(:swap)
+        child.insn(:send, CallData.new(:try_convert, CALL_FCALL | CALL_ARGS_SIMPLE, 1, nil), nil).vmx = :recv
+        child.insn(:dup)
+        child.insn(:branchunless, not_ary)
+        child.insn(:swap)
+        child.emit_label(not_ary)
+        child.insn(:pop)
+        child.emit_label(not_single)
+        child.insn(:expandarray, 0, t.expression.nil? ? 0 : 1) if t.is_a?(Prism::SplatNode)
+        child.append(writes)
+        child.append(cleanup)
+      else
+        writes = []
+        cleanup = []
+        st = MState.new(0, 1, [])
+        target(child, t, writes, cleanup, st)
+        child.at(t.location.start_line, t.node_id)
+        child.insn(:getlocal, *local_ref(child, hidden, 0))
+        child.insn(:expandarray, 1, 0)
+        child.append(writes)
+        child.append(cleanup)
+        mstate_update(st)
+      end
     end
 
     # make_name_for_block: one, and one more for each block from the scope
@@ -1302,6 +1407,41 @@ class RubyVM::InstructionSequence
 
     # (a lambda's sequence starts at its opening and its location at its
     #  parameters, or just after the ->)
+    # a node under another node id: the same node, but for where its
+    # instructions say they are from
+    class Renumbered
+      def initialize(n, id)
+        @n = n
+        @id = id
+      end
+      def node_id = @id
+      def is_a?(k) = @n.is_a?(k)
+      alias kind_of? is_a?
+      def method_missing(m, *a, &b) = @n.__send__(m, *a, &b)
+      def respond_to_missing?(m, priv = false) = @n.respond_to?(m, priv)
+    end
+
+    # pm_compile_regexp_dynamic: the pieces, and toregexp of them with the
+    # literal's options
+    def dregexp(u, n, popped)
+      count, kinds = dstr(u, n, false, true)
+      here(u, n)
+      ins = u.insn(:toregexp, n.options & 0xff, count)
+      # (for the VM: the literal's flags as written and which pieces are
+      #  its own text, L, and which were computed, C -- what decides the
+      #  pattern's encoding and whose clash is whose error)
+      ins.vmx = [("i" if n.ignore_case?), ("x" if n.extended?), ("m" if n.multi_line?), ("n" if n.ascii_8bit?),
+                 ("u" if n.utf_8?), ("e" if n.euc_jp?), ("s" if n.windows_31j?)].join + "|" + kinds
+      u.insn(:pop) if popped
+    end
+
+    # make_name_for_block: "block in m", "block (2 levels) in m"
+    def block_label(u)
+      levels = block_levels(u)
+      name = u.local_iseq.label
+      levels == 1 ? "block in #{name}" : "block (#{levels} levels) in #{name}"
+    end
+
     def block_unit(u, b, first_line = nil, start = nil)
       method_unit = u
       method_unit = method_unit.local_iseq
@@ -4192,8 +4332,11 @@ class RubyVM::InstructionSequence
       u.elements.each do |e|
         next unless e.is_a?(Insn)
         e.ops.each do |o|
-          o.base = u.ivc_size + u.cvc_size if o.is_a?(IC)
+          # (ISEQ_IS_ENTRY_START: ivar caches, cvar caches, once's entries,
+          #  then the constant caches)
+          o.base = u.ivc_size + u.cvc_size + u.ise_size if o.is_a?(IC)
           o.base = u.ivc_size if o.is_a?(CVC)
+          o.base = u.ivc_size + u.cvc_size if o.is_a?(ISE)
         end
       end
       optimize(u)
@@ -4929,6 +5072,7 @@ class RubyVM::InstructionSequence
       when :pushtoarraykwsplat then [2, 1]
       when :dupn then [e.ops[0], e.ops[0] * 2]
       when :checktype then [1, 1]
+      when :once then [0, 1]
       when :checkkeyword, :getspecial, :getclassvariable then [0, 1]
       when :setclassvariable, :setspecial then [1, 0]
       when :toregexp then [e.ops[1], 1]
@@ -5059,6 +5203,7 @@ class RubyVM::InstructionSequence
       when Label then :"label_#{o.pos}"
       when LocalOp then o.idx
       when IVC then o.index
+      when ISE then o.index
       when CVC then o.index
       when IC then o.segments
       when DefType then o.n
@@ -5231,6 +5376,7 @@ class RubyVM::InstructionSequence
         flags = CALL_FLAG_NAMES.select { |b, _| o.flag & b != 0 }.map(&:last)
         "<calldata!#{o.mid ? "mid:#{o.mid}, " : ""}argc:#{o.argc}#{o.kwargs ? ", kw:[#{o.kwargs.join(",")}]" : ""}#{flags.empty? ? "" : ", " + flags.join("|")}>"
       when IVC then "<is:#{o.index}>"
+      when ISE then "<is:#{o.index + (o.base || 0)}>"
       when CVC then "<is:#{o.index + (o.base || 0)}>"
       when IC then "<ic:#{o.index + (o.base || 0)} #{o.segments.join("::")}>"
       when DefType then DEFINED_NAMES[o.n]

@@ -57,6 +57,26 @@ MAIN = <<~'RUBY'
   t(34) { o = Object.new; def o.to_s = "mine"; begin; raise TypeError, o; rescue => e; e.message; end }
   # values as nobody reads them: an unread range is its bounds, nil&.m is nil
   t(35) { r = 0; (r = 1)..(r += 1); x = nil&.never_called(r += 5); [r, x] }
+  # a flip-flop's state, a pattern alone as a condition (the last line read)
+  t(36) { (1..10).select { |i| true if (i == 3)..(i == 5) } + (1..10).select { |i| true if (i % 4 == 0)...(i % 2 == 0) } }
+  t(37) { $_ = "a line"; [(/line/ ? :hit : :miss), (/none/ ? :hit : :miss)] }
+  # once: `/o` builds its pattern the first time it is reached, a thread that
+  # arrives meanwhile waits for it; END registers its block the first time
+  t(38) { f = ->(x) { /a#{x}/o }; [f.(1), f.(2), f.(1).equal?(f.(3))] }
+  t(39) do
+    g = proc { |s, c| /#{c.call; s}/o }
+    i = 0
+    b = Thread.new { sleep 0.01 until i == 1; i = 2; g.call("late", proc { sleep 0.2 }); nil }
+    a = Thread.new { g.call("first", proc { i = 1; sleep 0.01 until i == 2; sleep 0.01 }); nil }
+    [a, b].each(&:join)
+    g.call.source
+  end
+  # a for loop's target that is no local: the block's parameters written to it
+  t(41) { o = Struct.new(:x).new; h = {}; for @iv in [1, 2]; end; for $g666 in [3]; end; for o.x in [7]; end; for h[1] in [8]; end; [@iv, $g666, o.x, h] }
+  t(42) { r = []; for a, b in [[1, 2], 5, [6, 7, 8], nil]; r << [a, b]; end; for *s in [[1, 2], 3]; r << s; end; for i, in [[4, 5]]; r << i; end; r }
+  n666 = 40
+  t(40) { 3.times { END { puts "END, registered once: #{n666}" } }; n666 += 1 }
+  at_exit { puts "at_exit, before the END registered earlier" }
 RUBY
 
 Dir.mktmpdir do |d|
