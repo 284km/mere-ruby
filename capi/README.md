@@ -54,8 +54,26 @@ wrote into one (`RSTRING_PTR(str)[0] = 'x'`, `rb_str_set_len`,
 into it. A frozen String written through its pointer raises FrozenError at
 that point.
 
+A pointer C took stays good across a Fiber switch: a mirror that a C call
+in progress touched is watched -- written back at every crossing -- until
+the last such call has ended, so two Fibers stopped inside C calls that hold
+pointers into one String each write through their own when resumed.
+
 A data object (`TypedData_Make_Struct`, `Data_Wrap_Struct`) is an ordinary
 object of its class whose entry carries the C pointer and the type.
+
+## Primitives
+
+A function that is ruby's operation on a builtin class -- `rb_ary_push`,
+`rb_str_strlen`, `rb_hash_aset`, `rb_obj_freeze`, ... -- does what ruby's C
+does, whatever Ruby code made of the name: an override in a subclass or a
+singleton, a module prepended to the builtin class, or a definition in the
+builtin class itself. The call names its class (Array, String, Hash,
+Kernel); where something overrides the name it goes to the definition from
+the builtin class on, and where the program redefined the builtin class's
+own, to the one the prelude made (or the native one). Functions whose
+contract IS a method call -- `rb_funcall`, `rb_respond_to`, the
+conversions, `rb_equal`, `rb_inspect` -- call the method.
 
 ## What keeps a value alive
 

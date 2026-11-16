@@ -31,7 +31,7 @@ struct mr_mirror {
     long capa;                  /* bytes or elements the buffer holds */
     int body;                   /* 0 none yet, T_STRING, T_ARRAY */
     int data;                   /* 0, 1 RData, 2 RTypedData */
-    int listed;                 /* in the list of structs C may have written */
+    int listed;                 /* how many C calls in progress watch it (entries of `touched`) */
     size_t embedded;            /* a typed struct's own bytes, after it */
     union {
         struct RBasic basic;
@@ -127,8 +127,15 @@ struct mr_mirror *mr_mirror_of(VALUE obj) {
 }
 void *rb_mere_basic(VALUE obj) { return &mr_mirror_of(obj)->as.basic; }
 
+/* (every C call that may hold a pointer into the struct watches it: two
+ *  Fibers stopped in C calls that took the same String's bytes each write
+ *  through their own pointer when resumed, and the watch lasts until the
+ *  last of them has ended) */
 static void touch(struct mr_mirror *m, VALUE obj) {
-    if (m->listed) return;
+    const void *frame = mr_capi_frame();
+    if (m->listed)
+        for (long i = touched_count - 1; i >= 0; i--)
+            if (touched[i].mirror == m && touched[i].owner == frame) return;
     if (touched_count == touched_cap) {
         touched_cap = touched_cap ? touched_cap * 2 : 64;
         touched = realloc(touched, sizeof(*touched) * (size_t)touched_cap);
@@ -136,9 +143,9 @@ static void touch(struct mr_mirror *m, VALUE obj) {
     }
     touched[touched_count].mirror = m;
     touched[touched_count].handle = obj;
-    touched[touched_count].owner = mr_capi_frame();
+    touched[touched_count].owner = frame;
     touched_count++;
-    m->listed = 1;
+    m->listed++;
 }
 
 /* Write one struct back when C changed it. Answers whether it did. */
@@ -173,7 +180,7 @@ void mr_mirrors_flush(void) {
 void mr_mirrors_leave(const void *frame, int outermost) {
     long kept = 0;
     for (long i = 0; i < touched_count; i++) {
-        if (touched[i].owner == frame || (outermost && !touched[i].owner)) touched[i].mirror->listed = 0;
+        if (touched[i].owner == frame || (outermost && !touched[i].owner)) touched[i].mirror->listed--;
         else touched[kept++] = touched[i];
     }
     touched_count = kept;

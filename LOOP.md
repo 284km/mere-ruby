@@ -4929,7 +4929,7 @@ is the description; this is what was decided and what was measured.
   not want CRuby's internal headers) and `unittest/shim/-test-/`, three Ruby
   stand-ins for C extensions, is deleted.
 - Gates: dead_defs, dup_defs, gc_roots (`capi_tab` is an entry),
-  meth_writes, name_len, ns_names pass. Bracket depth is 889 of 1024 (895
+  meth_writes, name_len, ns_names pass. Bracket depth is 892 of 1024 (895
   with the prototype, 878 on main).
 - The corpus matches 687 of 687 (O2 build, this machine). There is no new
   corpus program: a corpus program cannot build a library, and what this
@@ -4986,8 +4986,8 @@ found" -- and the first has the control that makes them fail):
   Kernel), and where the receiver's class or singleton overrides the name
   the call goes the way `super` from that override would -- to the next
   definition from the builtin class on, or the builtin itself. Only an
-  override pays for it; a redefinition IN the builtin class itself
-  (`class Array; def push`) is still what gets called.
+  override pays for it. (A redefinition IN the builtin class itself was
+  still what got called; the second review below.)
 - The watch on a struct C may have written (a String's bytes through
   `RSTRING_PTR`) ended when ANY C call at that depth ended. A Fiber stopped
   inside a C call lost it to an unrelated call on another stack, and what
@@ -5003,6 +5003,42 @@ found" -- and the first has the control that makes them fail):
   same way was not found again as a superclass -- `class Custom <
   Redcarpet::Render::Base` then was not a Base -- and ruby's own
   `-test-/memory_status` did not define what `tool/lib` looks for.
+
+**What the second review found** (PR #87, after the CI fixes; five, each
+reproduced by the same C on both rubies, each with contracts now):
+
+- `rb_stat_new(NULL)` -- file.c's way of allocating a File::Stat -- read
+  through the NULL and the process died. It is an uninitialized File::Stat
+  now, whose readers raise TypeError.
+- `rb_stat_new` kept whole seconds: the struct's nanoseconds and, on
+  macOS, its birth time were dropped. The times are seconds plus a Rational
+  now, and the birth time is kept; File::Stat#<=> compares the Times, not
+  their seconds. (On Linux ruby keeps a statx and copies neither the device
+  numbers, the block size nor a birth time from a struct stat: those read 0
+  there and #birthtime is NotImplementedError, on both sides.) NOT the
+  same: this interpreter's own `File.stat` has whole seconds (Mere's
+  `file_stat_field` gives no more), so a C-made snapshot of a file with
+  sub-second times and `File.stat` of the same file are not `==` here
+  where they are in ruby. That is File.stat's, and needs Mere.
+- The regexp parse depth was one level too lenient: Onigmo counts the
+  pattern itself (its outermost parse_subexp) as the first level, so at
+  limit 1 `/(a)/` and `/[a]/` are refused. Counted the same way now, with
+  contracts at the limit and one past it.
+- Two C calls stopped in two Fibers, holding pointers into the SAME String:
+  the mirror's watch recorded only the first call, and when that call
+  ended the second one's write was lost (`"Xbc"` where ruby says `"Ybc"`).
+  A mirror is watched by every C call in progress that touched it, and
+  until the last of them has ended.
+- The primitives: `rb_ary_aref` still dispatched (a subclass's `[]`
+  answered), and a redefinition in the builtin class itself (`class
+  String; def length`) was still what `rb_str_strlen` called. The first is
+  routed like the others. For the second, what the prelude defines in
+  Array, String, Hash and Kernel is the builtin here: when a program
+  redefines or removes one of those names afterwards, the method table's
+  setter keeps the prelude's definition aside (`capi_boot_defs`; none where
+  the name is native), and the primitive calls that, or the native one.
+  A module prepended to the builtin class (`Array.prepend`) is passed over
+  the same way an override in a subclass is.
 
 **Measured here** (this machine, the interpreter's side only; CI's shards
 are the record and go in below when they have run): of `test/-ext-`'s 94

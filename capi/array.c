@@ -54,7 +54,9 @@ VALUE rb_ary_entry(VALUE ary, long index) {
     if (index < 0 || index >= len) return Qnil;
     return RARRAY_CONST_PTR(ary)[index];
 }
-VALUE rb_ary_aref(int argc, const VALUE *argv, VALUE ary) { return mr_callv(ary, rb_intern("[]"), argc, argv, Qnil, 0); }
+VALUE rb_ary_aref(int argc, const VALUE *argv, VALUE ary) {
+    return mr_callv(ary, rb_intern("[]"), argc, argv, Qnil, mr_without("builtin") ? 0 : MR_SEND_ARRAY);
+}
 VALUE rb_ary_subseq(VALUE ary, long beg, long len) { return mr_calla(ary, "[]", 2, LONG2NUM(beg), LONG2NUM(len)); }
 VALUE rb_ary_dup(VALUE ary) { return mr_calla(ary, "dup", 0); }
 VALUE rb_ary_clear(VALUE ary) { mr_calla(ary, "clear", 0); return changed(ary); }
