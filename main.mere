@@ -43,6 +43,7 @@ type Expr = EInt of int | EBig of str | ERat of str * str | EImag of int | EImag
           // M3 object model:
           | ESym of str          // :name
           | ESelf                // self
+          | ENativeCall of int * Expr list * Expr
           | EStructInit          // generated Struct member initialization; never parsed
           | EConst of str        // a capitalized name (a class reference)
           | EConstOrNil of str   // a const read that yields nil when undefined
@@ -659,7 +660,7 @@ let gc_store_bytes = fn (u: unit) ->
                            + map_bytes str_ascii + map_bytes str_valid8
                            + vec_get qv_ctr 3
                            + (if map_has top_env_reg 0 then map_bytes (map_get top_env_reg 0) else 0)
-                           + frame_env_bytes_fwd ()
+                           + frame_env_bytes_fwd () + mr_typed_stat 5
   else 0;
 
 // Pressure is INCREMENTAL on both axes. Entries: the amortized threshold in
@@ -1321,6 +1322,16 @@ let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
          if i >= stop then ()
          else (let o = vec_get gc_obj_pend i in
                let _ = (if map_has head o then mark_chain (map_get head o) else ()) in
+               // (a live TypedData owner: its dmark names the values its C
+               //  struct holds, and each is marked like any other reference)
+               let _ = (if map_len native_typed_owners > 0 && map_has native_typed_owners o then
+                 let visit = fn (token: int) ->
+                   if map_has native_typed_values token then
+                     (let _ = map_set native_typed_marked token 1 in
+                      let _ = gc_mark_val live (native_typed_get token) in 0)
+                   else (let _ = vec_set native_typed_counter 1 ((vec_get native_typed_counter 1) + 1) in 0) in
+                 let _ = mr_typed_mark visit (map_get native_typed_owners o) in ()
+                 else ()) in
                each (i + 1)) in
        let _ = each start in drain stop (rounds + 1)) in
   let names_vec = gc_native_names in
@@ -1375,6 +1386,9 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_recycle gc_ref_live in
   let _ = vec_recycle gc_ref_pend in
   let _ = vec_recycle gc_obj_pend in
+  let _ = map_clear native_typed_marked in
+  let _ = map_iter native_typed_active (fn (token: int) -> fn (flag: int) ->
+    gc_mark_val live (native_typed_get token)) in
   // (the frame texts: one handle each, shared by every frame -- frame_text)
   let _ = map_iter anonymous_classes (fn (key: str) -> fn _v -> gc_native_add metadata key) in
   let _ = map_iter modules (fn (key: str) -> fn _v -> gc_native_add metadata key) in
@@ -1412,6 +1426,9 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   //  has ended is no longer the running frame of its depth -- tp_env)
   let _ = map_iter tp_env (fn (k: int) -> fn (e) -> gc_mark_env live e) in
   let _ = map_iter globals mk in
+  let _ = if mr_probe_mark () == 1 then
+    map_iter native_handle_values (fn (slot: int) -> fn (value: Val) -> gc_mark_val live value)
+    else () in
   let _ = map_iter rx_parked (fn (k: int) -> fn (i: int) -> gc_mark_val live (VObj i)) in
   let _ = gc_mark_val live (rx_md_get ()) in
   let _ = map_iter consts (fn (k: str) -> fn (v: Val) -> gc_meta_add metadata live (gc_const_owner k) v) in
@@ -2035,6 +2052,25 @@ let gc_collect = fn env -> fn world ->
     let _ = map_iter fb_state (fn (id: int) -> fn (st: int) -> if (st == 1 || st == 2) && id != fb_cur () then vec_push stack_ids id else ()) in
     let stacks = vec_to_list stack_ids in
     let _ = gc_fixpoint metadata ivars live stacks in
+    // Native finalizers cannot invoke Ruby or allocate. Cache descriptor fields
+    // in C before dfree: an original test frees the descriptor from dfree.
+    let dead_native = vec_new () in
+    let _ = map_iter native_typed_owners (fn (oid: int) -> fn (slot: int) ->
+      if gc_live_has live (oid * 8) then () else vec_push dead_native oid) in
+    let rec free_native = fn (i: int) ->
+      if i >= vec_len dead_native then () else
+        let oid = vec_get dead_native i in
+        let _ = mr_typed_free (map_get native_typed_owners oid) in
+        let _ = map_delete native_typed_owners oid in free_native (i + 1) in
+    let _ = free_native 0 in
+    let dead_tokens = vec_new () in
+    let _ = map_iter native_typed_values (fn (token: int) -> fn (v: Val) ->
+      if map_has native_typed_active token || map_has native_typed_marked token then ()
+      else vec_push dead_tokens token) in
+    let rec forget_tokens = fn (i: int) ->
+      if i >= vec_len dead_tokens then () else
+        let _ = map_delete native_typed_values (vec_get dead_tokens i) in forget_tokens (i + 1) in
+    let _ = forget_tokens 0 in
     // (a MatchData still a record holds its subject and its pattern key by
     //  handle: what its ivars would have kept, for the ones that are live --
     //  strings point at nothing, so no further fixpoint pass is needed)
@@ -2603,6 +2639,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   if map_len hook_flags > 0 && tp_hook_on () && tp_traced env world e then eval_tp env world blk e
   else if map_len hook_flags > 0 && tp_enum_each env world e then eval_tp_enum_each env world blk e else
   match e with
+  | ENativeCall (id, arguments, block) ->
+    native_probe_invoke env world id true (eval_args env world blk arguments) (eval_e env world blk block)
   | EStructInit -> struct_initialize_members env world blk
   | ESplat inner -> eval_e env world blk inner   // bare splat: evaluate inner
   // `**h` reaching HERE means no list-level walker took it. eval_args and
@@ -8027,6 +8065,190 @@ and tp_raise_at = fn env ->
             else "Object") in
   if str_eq c9 "" then (if map_has tp_mstack "xm" then (let _ = map_delete tp_mstack "xm" in map_delete tp_mstack "xk") else ())
   else (let _ = map_set tp_mstack "xm" m9 in map_set tp_mstack "xk" c9)
+// Synchronous native investigation boundary. A callback returns its rooted
+// outcome before C unwinds; no Mere exception crosses a foreign stack frame.
+and native_probe_invoke = fn env -> fn world -> fn (method: int) -> fn (typed: bool) -> fn (arguments: Val list) -> fn (block: Val) ->
+  let (_, _, _, ivars) = world in
+  let scope = vec_new () in
+  let keep = fn (v: Val) ->
+    let token = if typed then native_typed_keep v else native_handle_retain v in
+    if token == 0 then
+      (let _ = raise_exc world "NoMemoryError" "native handle token space exhausted" in 0)
+    else (let _ = vec_push scope token in token) in
+  let get = fn (token: int) ->
+    if token == 0 then VNil
+    else if typed && token > 2147483647 then VClass (mr_typed_class_name (token - 2147483648))
+    else if typed then
+      (if map_has native_typed_values token then native_typed_get token
+       else raise_exc world "ArgumentError" "invalid or expired typed VALUE")
+    else if native_handle_valid token then native_handle_get token
+    else raise_exc world "ArgumentError" "invalid native VALUE" in
+  let clear = fn (u: unit) ->
+    let _ = map_delete flow_sig "k" in
+    let _ = map_delete ivars "$exc" in
+    let rec drop_keys = fn keys -> match keys with
+      | Nil -> ()
+      | Cons (k, rest) -> let _ = map_delete prim_missing k in drop_keys rest in
+    let _ = drop_keys (Cons ("n", Cons ("rv", Cons ("rvc", Cons ("rvn", Cons ("rvv", Cons ("av", Cons ("c", Cons ("m", Cons ("i", Cons ("f", Cons ("rl", Cons ("rd", Cons ("rbt", Cons ("rm", Cons ("rf", Nil)))))))))))))))) in
+    bi_rescued () in
+  let saved = fn (k: str) -> if map_has flow_sig k then map_get flow_sig k else VNil in
+  let capture = fn (u: unit) ->
+    let kind = saved "k" in
+    // (a class-and-message pair becomes the object a `rescue => e` would
+    //  make of it, here: the cleanup C runs reads $!, and the rescue after
+    //  the boundary must bind that same object)
+    let exc = if map_has flow_sig "k" then VNil else exc_pin_bt world (pending_exc world) in
+    let out = arr_new (Cons (exc, Cons (kind, Cons (saved "v", Cons (saved "tag", Cons (saved "fid", Nil)))))) in
+    let token = keep out in
+    let _ = clear () in 0 - token in
+  let finish = fn (u: unit) ->
+    let rec release = fn (i: int) ->
+      if i >= vec_len scope then ()
+      else (let _ = (if typed then native_typed_end (vec_get scope i)
+                    else let _ = native_handle_release (vec_get scope i) in ()) in release (i + 1)) in
+    release 0 in
+  // Reserved before C entry, so even token exhaustion returns to C cleanup.
+  let emergency = keep (arr_new (Cons (VExc ("NoMemoryError", "native outcome capture failed"), Cons (VNil, Cons (VNil, Cons (VNil, Cons (VNil, Nil))))))) in
+  let outcome = try_or_msg (fn (u: unit) ->
+    let block_token = keep block in
+    let first = (match arguments with Cons (v, _) -> keep v | _ -> 0) in
+    let second = (match arguments with Cons (_, Cons (v, _)) -> keep v | _ -> 0) in
+    let third = (match arguments with Cons (_, Cons (_, Cons (v, _))) -> keep v | _ -> 0) in
+    let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+    let callback = fn (request: native_request) ->
+      try_or_msg (fn (u: unit) ->
+        if request.op == 1 then
+          (let args = if request.argc == 0 then Nil
+                      else if request.argc == 1 then Cons (get request.a0, Nil)
+                      else Cons (get request.a0, Cons (get request.a1, Nil)) in
+           keep (invoke_val_c env world noblk (get request.recv) (mr_native_method_name request.mid) args false))
+        else if request.op == 2 then
+          (match get block_token with
+           | VNil -> let _ = raise_exc world "LocalJumpError" "no block given" in 0
+           | proc -> keep (invoke_val_c env world noblk proc "call" (Cons (get request.recv, Nil)) false))
+        else if request.op == 3 then let _ = raise_exc_val world (get request.recv) in 0
+        else if request.op == 4 then keep (if map_has globals "!" then map_get globals "!" else VNil)
+        else if request.op == 5 then
+          (let _ = (match get request.recv with
+                    | VArr a -> (match deref a with Cons (exc, Cons (VNil, _)) -> map_set globals "!" exc | _ -> ())
+                    | _ -> ()) in 0)
+        else if request.op == 6 then (let _ = map_set globals "!" (get request.recv) in 0)
+        else if request.op == 10 then keep (mkstr (mr_typed_text ()))
+        else if request.op == 11 then
+          (let (_, _, ocls, _) = world in
+           let oid = alloc_oid ocls in
+           let _ = map_set ocls oid (mr_typed_class_name request.mid) in
+           let _ = map_set native_typed_owners oid request.recv in keep (VObj oid))
+        else if request.op == 12 then
+          (match get request.recv with VObj oid ->
+             if map_has native_typed_owners oid then map_get native_typed_owners oid else 0
+           | _ -> 0)
+        else if request.op == 13 then
+          // (the answer of a request is a token, and a negative one an
+          //  outcome: the C int travels in the number beside it, checked)
+          (match get request.recv with
+           | VInt n ->
+             if n < 0 - 2147483648 || n > 2147483647 then
+               (let _ = raise_exc world "RangeError" ("integer " ++ str_of_int n ++ " too " ++ (if n < 0 then "small" else "big") ++ " to convert to 'int'") in 0)
+             else mr_typed_set_number (float_of_int n)
+           | VBig _ -> let _ = raise_exc world "RangeError" "bignum too big to convert into 'long'" in 0
+           | _ -> let _ = raise_exc world "TypeError" "expected Integer" in 0)
+        else if request.op == 14 then keep (VInt (if request.recv > 2147483647 then request.recv - 4294967296 else request.recv))
+        else if request.op == 15 then
+          (let v = get request.recv in
+           let cls = (match v with VBool false -> "false" | VBool true -> "true" | VNil -> "nil"
+                      | VObj oid -> let (_, _, ocls, _) = world in map_get ocls oid
+                      | _ -> class_name v) in
+           let _ = raise_exc world "TypeError" ("wrong argument type " ++ cls ++ " (expected " ++ mr_typed_text () ++ ")") in 0)
+        else if request.op == 16 then
+          (match get request.recv with
+           | VClass c -> let i = mr_typed_class_index c in
+                         if i > 0 then i else let _ = raise_exc world "LoadError" "native class capacity exhausted" in 0
+           | _ -> let _ = raise_exc world "TypeError" "native allocator expects Class" in 0)
+        else if request.op == 17 then keep (get request.recv)
+        else if request.op == 18 then
+          (let c = (match get request.recv with VClass c -> c | _ -> "RuntimeError") in
+           let _ = raise_exc world c (mr_typed_text ()) in 0)
+        else if request.op == 19 then
+          keep (flow_value (do_require env world noblk false (mr_typed_text ())))
+        else if request.op == 20 then
+          (let cls = mr_typed_class_name request.recv in
+           let sup = if request.mid == 1 then "(module)" else mr_typed_class_name request.argc in
+           let declaration_env = map_new () in
+           let _ = map_set declaration_env "__cref" (mkstr "") in
+           let _ = map_set declaration_env "self" VMain in
+           let _ = exec_stmt declaration_env world noblk (SClass ("::" ++ cls, sup, Nil)) in 0)
+        else if request.op == 21 then
+          (let _ = native_register world request.recv in 0)
+        else if request.op == 22 then
+          (let value = get request.recv in
+           let converted = (match value with
+             | VFlt _ -> value
+             | VInt n -> VFlt (float_of_int n)
+             | VBig _ -> VFlt (to_f value)
+             | VRat (_, _) -> VFlt (to_f value)
+             | VStr _ -> raise_exc world "TypeError" "no implicit conversion to float from string"
+             | VNil -> raise_exc world "TypeError" "no implicit conversion to float from nil"
+             | _ -> if responds world value "to_f" then invoke_val_c env world noblk value "to_f" Nil false
+                    else raise_exc world "TypeError" ("can't convert " ++ class_name value ++ " into Float")) in
+           match converted with
+           | VFlt f -> mr_typed_set_number f
+           | _ -> let _ = raise_exc world "TypeError" "to_f did not return Float" in 0)
+        else if request.op == 23 then keep (VFlt (mr_typed_number ()))
+        else let _ = raise_exc world "ArgumentError" "unsupported native API request" in 0)
+        (fn (message: str) ->
+          try_or_msg capture (fn (capture_message: str) -> let _ = clear () in 0 - emergency)) in
+    mr_native_invoke callback (if typed then 0 - method - 1 else method) first second third)
+    (fn (message: str) -> let _ = finish () in fail message) in
+  let value = try_or_msg (fn (u: unit) -> get (if outcome < 0 then 0 - outcome else outcome))
+                (fn (message: str) -> let _ = finish () in fail message) in
+  let _ = finish () in
+  if outcome >= 0 then value
+  else (match value with
+    | VArr a -> (match deref a with
+      | Cons (exc, Cons (kind, Cons (v, Cons (tag, Cons (fid, _))))) ->
+        (let _ = (match kind with
+          | VNil -> iv_put ivars "$exc" exc
+          | _ -> let _ = map_set flow_sig "k" kind in
+                 let _ = map_set flow_sig "v" v in
+                 let _ = map_set flow_sig "tag" tag in map_set flow_sig "fid" fid) in
+         fail "mere-ruby: native outcome")
+      | _ -> raise_exc world "RuntimeError" "invalid native outcome")
+    | _ -> raise_exc world "RuntimeError" "invalid native outcome")
+// Native functions use ordinary method entries, so lookup, inheritance,
+// visibility, aliasing and arity checks follow the interpreter's normal path.
+and native_register = fn world -> fn (id: int) ->
+  let cls = mr_typed_class_name (mr_typed_method_info id 0) in
+  let arity = mr_typed_method_info id 1 in
+  let kind = mr_typed_method_info id 2 in
+  if kind == 2 then map_set native_allocators cls id
+  else
+    let name = mr_typed_method_name id in
+    let params = if arity == 0 then Nil else if arity == 1 then Cons ("a0", Nil)
+                 else Cons ("a0", Cons ("a1", Nil)) in
+    let args = if arity == 0 then Nil else if arity == 1 then Cons (EVar "a0", Nil)
+               else Cons (EVar "a0", Cons (EVar "a1", Nil)) in
+    let body = Cons (SReturn (ENativeCall (id, Cons (ESelf, args), EVar "native_block")), Nil) in
+    let entry_def = SDef ((if kind == 1 then "self." ++ name else name),
+                   list_append_str params (Cons ("&native_block", Nil)), Nil, body) in
+    let _ = register_class_lex world cls (Cons (entry_def, Nil)) in
+    if kind == 3 then map_set privates (cls ++ "#" ++ name) VNil else ()
+and native_allocator = fn world -> fn (cls: str) ->
+  let rec find = fn (xs: str list) -> match xs with
+    | Nil -> 0 - 1
+    | Cons (c, rest) -> if map_has native_allocators c then map_get native_allocators c else find rest in
+  find (ancestors_of world cls)
+and native_construct = fn world -> fn (cls: str) -> fn (args: Val list) -> fn blk ->
+  let obj = native_probe_invoke gc_cenv0 world (native_allocator world cls) true (Cons (VClass cls, Nil)) VNil in
+  let _ = (match obj with VObj oid -> seed_builtin_subclass_ivars world cls oid args | _ -> ()) in
+  if has_meth world cls "initialize" then
+    (let result = invoke world blk obj cls "initialize" args in
+     if map_has meth_broke 0 then (let _ = map_delete meth_broke 0 in result) else obj)
+  else tp_init_around world obj (fn (u: unit) -> init_arity_refuse world cls args obj)
+and native_require_file = fn env -> fn world -> fn (path: str) ->
+  let id = mr_typed_load (feat_realpath path) in
+  if id < 0 then raise_exc world "LoadError" (mr_typed_error ())
+  else native_probe_invoke env world id true Nil VNil
 and raise_exc_val = fn world -> fn (exc: Val) ->
   let (meths, sup, ocls, ivars) = world in
   let _ = iv_put ivars "$exc" exc in
@@ -18641,6 +18863,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       // else is a plain object of that class. allocate takes no arguments.
       (if (match args with Nil -> false | _ -> true) then
          raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
+       else if map_len native_allocators > 0 && native_allocator world c >= 0 then
+         native_probe_invoke env world (native_allocator world c) true (Cons (VClass c, Nil)) VNil
        else alloc_empty world c)
     // `private_class_method :new` (or `private :new` inside `class << self`)
     // makes .new private: the constructor is hidden and the class hands out
@@ -23093,6 +23317,165 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let reply = str_of_bytes (mr_ossl_call (sget operation) (bytes_of_str (sget payload))) in
           let _ = mr_ossl_clear_result () in mkstr_e reply "ASCII-8BIT")
        | _ -> raise_exc world "ArgumentError" "invalid OpenSSL provider arguments")
+    else if str_eq c "NativeProbe" && str_len name > 2 && str_eq (substring name 0 2) "__" then
+      (let retain9 = fn (v: Val) ->
+         let token = native_handle_retain v in
+         if token == 0 then
+           (let _ = raise_exc world "NoMemoryError" "native handle token space exhausted" in 0)
+         else token in
+       let get9 = fn (token: int) ->
+         if native_handle_valid token then native_handle_get token
+         else raise_exc world "ArgumentError" "native handle is invalid or released" in
+       let bad9 = fn (u: unit) -> raise_exc world "ArgumentError" "invalid native handle arguments" in
+       if str_eq name "__retain" then
+         (match args with Cons (v, Nil) -> VInt (retain9 v) | _ -> bad9 ())
+       else if str_eq name "__get" then
+         (match args with Cons (VInt t, Nil) -> get9 t | _ -> bad9 ())
+       else if str_eq name "__release" then
+         (match args with Cons (VInt t, Nil) ->
+            if native_handle_release t then VNil else bad9 ()
+          | _ -> bad9 ())
+       else if str_eq name "__update" then
+         (match args with Cons (VInt t, Cons (v, Nil)) ->
+            if native_handle_update t v then VNil else bad9 ()
+          | _ -> bad9 ())
+       else if str_eq name "__count" then VInt (native_handle_count ())
+       else if str_eq name "__typed_load" then
+         (match args with Cons (VStr path, Nil) ->
+           native_require_file env world (sget path)
+          | _ -> bad9 ())
+       else if str_eq name "__typed_call" then
+         (match args with Cons (VStr method, Cons (a, Cons (b, Nil))) ->
+           let id = mr_typed_find (sget method) in
+           if id < 0 then raise_exc world "NameError" "unknown typed method"
+           else let receiver = (match a with VNil -> VClass (mr_typed_class_name (mr_typed_method_info id 0)) | _ -> a) in
+             native_probe_invoke env world id true (Cons (receiver, Cons (b, Nil))) VNil
+          | _ -> bad9 ())
+       else if str_eq name "__loader_stat" then
+         (match args with Cons (VInt k, Nil) -> VInt (mr_typed_loader_stat k) | _ -> bad9 ())
+       else if str_eq name "__typed_stat" then
+         (match args with Cons (VInt k, Nil) ->
+           if k == 10 then VInt (map_len native_typed_values)
+           else if k == 11 then VInt (map_len native_typed_active)
+           else if k == 12 then VInt (map_len native_typed_owners)
+           else if k == 13 then VInt (vec_get native_typed_counter 1)
+           else VInt (mr_typed_stat k)
+          | _ -> bad9 ())
+       else if str_eq name "__native_resources" then VInt (mr_native_resources ())
+       else if str_eq name "__native_depth" then VInt (mr_native_depth ())
+       else if str_eq name "__native_ensures" then VInt (mr_native_ensures ())
+       else if str_eq name "__native_load" then
+         (match args with Cons (VStr path, Nil) ->
+           let rc = mr_native_load (sget path) in
+           if rc < 0 then raise_exc world "LoadError" (mr_native_error ()) else VInt rc
+          | _ -> bad9 ())
+       else if str_eq name "__native_call" then
+         (match args with Cons (VStr method, Cons (VArr av, Cons (proc, Nil))) ->
+           let id = mr_native_find (sget method) in
+           if id < 0 then raise_exc world "NameError" "unknown native method"
+           else if list_len (deref av) != mr_native_arity id then
+             raise_exc world "ArgumentError" "wrong native argument count"
+           else native_probe_invoke env world id false (deref av) proc
+          | _ -> bad9 ())
+       else if str_eq name "__capacity" then VInt (native_handle_capacity ())
+       else if str_eq name "__table_bytes" then VInt (native_handle_bytes ())
+       else if str_eq name "__c_store" then
+         (match args with Cons (VInt slot, Cons (VInt t, Nil)) ->
+            if slot < 0 || slot >= 256 || (if native_handle_valid t then false else true) then bad9 ()
+            else (let _ = mr_probe_slot_put slot t in VNil)
+          | _ -> bad9 ())
+       else if str_eq name "__c_get" || str_eq name "__c_forget" then
+         (match args with Cons (VInt slot, Nil) ->
+            if slot < 0 || slot >= 256 then bad9 ()
+            else if str_eq name "__c_get" then get9 (mr_probe_slot_get slot)
+            else (let _ = mr_probe_slot_put slot 0 in VNil)
+          | _ -> bad9 ())
+       else if str_eq name "__watch" then
+         (match args with Cons (VInt t, Nil) ->
+            (match get9 t with VStr h ->
+               // Ruby's internal id includes handle_base (2^48). The test
+               // observer transports only a checked page-store index in C int.
+               let index = h - handle_base in
+               if index < 0 || index > native_handle_max then bad9 ()
+               else (let _ = mr_probe_watch_string index in VNil)
+             | _ -> bad9 ())
+          | _ -> bad9 ())
+       else if str_eq name "__watched_size" then VInt (str_len (sget (handle_base + mr_probe_watched_string ())))
+       else if str_eq name "__seed_handle" then
+         (match args with Cons (VInt kind, Nil) ->
+            if kind == 0 then VInt (retain9 (mkstr ("native-seed-" ++ str_repeat "x" 4096)))
+            else if kind == 1 then
+              (let a = arr_new Nil in
+               let _ = (match a with VArr id -> arr_set id (Cons (mkstr "native-cycle", Cons (a, Nil))) | _ -> ()) in
+               VInt (retain9 a))
+            else if kind == 2 then
+              (let (_, _, ocls, ivars) = world in
+               let oid = alloc_oid ocls in
+               let _ = map_set ocls oid "Object" in
+               let _ = iv_put ivars (str_of_int oid ++ "@payload") (mkstr ("native-object-" ++ str_repeat "y" 4096)) in
+               VInt (retain9 (VObj oid)))
+            else bad9 ()
+          | _ -> bad9 ())
+       else if str_eq name "__load" then
+         (match args with
+          | Cons (VStr h, Nil) ->
+            let rc = mr_probe_load (sget h) in
+            if rc < 0 then raise_exc world "LoadError" (mr_probe_error ()) else VInt rc
+          | _ -> raise_exc world "ArgumentError" "probe load expects a path")
+       else if str_eq name "__call" then
+         (match args with
+          | Cons (VStr h, Cons (VFlt x, Cons (VFlt y, Nil))) ->
+            let id = mr_probe_find (sget h) in
+            if id < 0 then raise_exc world "NameError" "unknown probe method"
+            else VFlt (mr_probe_call id x y)
+          | _ -> raise_exc world "TypeError" "probe supports two Float arguments only")
+       else if str_eq name "__seed" then
+         (let token = retain9 (mkstr ("native-seed-" ++ str_repeat "x" 4096)) in
+          let _ = native_handle_release (mr_probe_held ()) in
+          let _ = mr_probe_hold token in VNil)
+       else if str_eq name "__phase" then VInt (mr_probe_phase ())
+       else if str_eq name "__resources" then VInt (mr_probe_live_resources ())
+       else if str_eq name "__callback" then
+         (match args with
+          | Cons (proc, Cons (VInt n, Nil)) ->
+            // Reserve roots before entering C, including the exception slot:
+            // exhaustion must not interrupt foreign cleanup on the raise path.
+            let exception_token = retain9 VNil in
+            let proc_token = native_handle_retain proc in
+            let _ = if proc_token == 0 then
+              (let _ = native_handle_release exception_token in
+               let _ = raise_exc world "NoMemoryError" "native handle token space exhausted" in ()) else () in
+            let pending = map_new () in
+            let safe_cb = fn (x: int) ->
+              try_or_msg (fn (u: unit) ->
+                match invoke_val_c env world blk (native_handle_get proc_token) "call" (Cons (VInt x, Nil)) false with
+                | VInt r -> r
+                | _ -> let _ = raise_exc world "TypeError" "probe callback expects Integer result" in 0)
+                (fn (m: str) ->
+                  let (_, _, _, iv) = world in
+                  let _ = map_set pending "raised" true in
+                  let _ = native_handle_update exception_token (map_get iv "$exc") in
+                  0 - 1) in
+            // Capture Ruby's exception before returning to C. The native call
+            // completes its cleanup before we re-raise that same Ruby object.
+            let r = mr_probe_reenter safe_cb n in
+            let _ = native_handle_release proc_token in
+            if map_has pending "raised" then
+              (let e = native_handle_get exception_token in
+               let _ = native_handle_release exception_token in raise_exc_val world e)
+            else (let _ = native_handle_release exception_token in VInt r)
+          | _ -> raise_exc world "ArgumentError" "probe callback expects a callable and Integer")
+       else if str_eq name "__hold" then
+         (match args with
+          | Cons (v, Nil) -> let token = retain9 v in
+                            let _ = native_handle_release (mr_probe_held ()) in
+                            let _ = mr_probe_hold token in VNil
+          | _ -> raise_exc world "ArgumentError" "probe hold expects one object")
+       else if str_eq name "__fetch" then
+         (if native_handle_valid (mr_probe_held ()) then native_handle_get (mr_probe_held ()) else VNil)
+       else if str_eq name "__clear" then
+         (let _ = native_handle_release (mr_probe_held ()) in let _ = mr_probe_hold 0 in VNil)
+       else raise_exc world "NoMethodError" "unknown probe operation")
     else if str_eq c "Prism" && str_len name > 8 && str_eq (substring name 0 8) "__prism_"
             && (str_eq name "__prism_ser" || str_eq name "__prism_ok" || str_eq name "__prism_more"
                 || str_eq name "__prism_query" || str_eq name "__prism_version") then
@@ -55279,6 +55662,9 @@ and new_plain_object = fn world -> fn (cls: str) -> fn (args: Val list) ->
     let _ = invoke_result world block object cls "initialize" args true in object
   else tp_init_around world object (fn (u: unit) -> init_arity_refuse world cls args object)
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
+  if map_len native_allocators > 0 && native_allocator world cls >= 0 then
+    native_construct world cls args (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
+  else
   // (a Regexp itself is the value Regexp.new builds: see new_obj_wb)
   if str_eq cls "Regexp" && (if has_meth world cls "initialize" then false else true) then
     invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) (VClass "Regexp") "new" args false
@@ -55474,6 +55860,8 @@ and tp_init_around = fn world -> fn (obj: Val) -> fn k ->
 // like new_obj but forwards a block to initialize, so `C.new { } ` /
 // `C.new(&pr)` reaches an `initialize(&b)`. Containers keep their own paths.
 and new_obj_wb = fn world -> fn (cls: str) -> fn (args: Val list) -> fn theblk ->
+  if map_len native_allocators > 0 && native_allocator world cls >= 0 then native_construct world cls args theblk
+  else
   if str_eq cls "Hash" || str_eq cls "Array" || str_eq cls "String" then new_obj world cls args
   // (a Regexp itself -- `new(s, o)` in Regexp.json_create -- is the value
   //  Regexp.new builds, not an object holding one, which only a subclass's is)
@@ -59395,6 +59783,25 @@ and req_wait_other = fn world -> fn (p0: str) -> fn (full: str) ->
 // A non-main ractor's require is the main ractor's, as ruby 4.0 has it (the
 // load is run by main): the file's constants and globals are set as main
 // would, and the thread is a non-main ractor's again after, raised or not.
+and native_feature_path = fn env -> fn world -> fn (rel: bool) -> fn (dir: str) -> fn (path: str) ->
+  if ends_with_rb path then "" else
+  let explicit = str_ends_with path ".bundle" || str_ends_with path ".so" in
+  let candidates = if str_ends_with path ".so" then
+                     Cons (substring path 0 (str_len path - 3) ++ ".bundle", Cons (path, Nil))
+                   else if explicit then Cons (path, Nil)
+                   else Cons (path ++ ".bundle", Cons (path ++ ".so", Nil)) in
+  let rec find = fn (xs: str list) -> match xs with
+    | Nil -> ""
+    | Cons (name, rest) ->
+      let hit = if str_len name > 0 && str_eq (char_at name 0) "/" then name
+                else if rel then dir ++ "/" ++ name
+                else if str_starts_with name "./" || str_starts_with name "../" then env_get "PWD" ++ "/" ++ name
+                else load_path_find_conv env world name in
+      // (a library built for another ruby is no candidate: the feature is
+      //  then whatever provided it before -- a .rb, the shipped library)
+      if (if str_eq hit "" then false else is_reg_file hit) && mr_typed_probe (path_norm hit) == 1
+      then path_norm hit else find rest in
+  find candidates
 and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) ->
   if map_len ractor_thr > 0 && map_has ractor_thr (fb_thread_of (fb_cur ())) then
     (let t9 = fb_thread_of (fb_cur ()) in
@@ -59534,6 +59941,10 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
      let full = (let n0 = path_norm full in
                  if str_len n0 > 0 && str_eq (char_at n0 0) "/" then n0
                  else path_norm (env_get "PWD" ++ "/" ++ n0)) in
+     let native_path = if str_eq shipped "" &&
+                            (str_ends_with p0 ".bundle" || str_ends_with p0 ".so" || (if is_reg_file full then false else true))
+                       then native_feature_path env world rel dir p0 else "" in
+     let full = if str_eq native_path "" then full else native_path in
      let _ = (if gc_log_on () then print_err ("gc: require " ++ full) else ()) in
      // ...and the same file reached by another name (a symlink) is the same
      // feature: ruby keeps the realpath of every loaded feature beside
@@ -59672,6 +60083,11 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
        // that feature, so it wins over a file of the same name on the load
        // path -- CRuby's monitor.rb would only `require "monitor.so"` here.
        // (a required file's __END__ ends it too, but DATA is the main script's)
+       if (if str_eq native_path "" then false else true) then
+         (let _ = try_or_msg (fn (u: unit) -> native_require_file env world full)
+                    (fn (message: str) -> let _ = unmark9 () in fail message) in
+          FNext (VBool true))
+       else
        let src = (if str_eq shipped "" then (match src_prepare (read_file full) with (b9, _) -> b9) else shipped) in
        // the file's magic comment sets the script encoding for parse (a
        // parse-time __ENCODING__ capture) and while it runs; a file with no

@@ -4665,6 +4665,94 @@ loading alone was past the 600 s a file has on CI. corpus 657.
   translation from Prism's tree to parse.y's, in progress on its own branch
   (note 551).
 
+## 2026-11-15 (55): the native extension prototype is taken in -- stage 7′ / 8 starts from it
+
+The first unit of the C extension stage (note 550 §3, note 553): the
+prototype another session had built and left unpublished is on main's
+line now, checked, and in CI. It does not change what the unit tests
+measure yet -- `-ext-` and mkmf wait for the C API proper, which is built
+on this from the next round.
+
+- **What came in** (prototype/native-target-config, 8 commits on a base 274
+  commits behind main): a table that keeps Ruby values alive while C holds
+  them; a boundary where an exception or a `throw` raised under a C function
+  comes back to C first, so `rb_ensure`'s cleanup runs before it goes on;
+  TypedData with dmark called for live owners and dfree at the sweep;
+  `rb_define_*` registering into the ordinary method tables and `require`
+  opening a `.bundle` and calling its `Init_`; an opt-in RbConfig that lets
+  ruby's own mkmf.rb write a Makefile and build; the environment mkmf's 17
+  test files need; and headers generated for the target compiler with
+  compile-only size checks. All of it is under tools/native_probe/ and
+  described in tools/native_probe/NATIVE.md. The value C sees is a 32-bit
+  token, not CRuby's VALUE: Ruby's own ext/-test-/float, exception and
+  typeddata sources compile unchanged against the probe header, and little
+  else does.
+- **The merge**: 5 files, 12 places. The collector had changed most (class
+  and metadata passes, the live set no longer a map): the TypedData owner
+  visit sits in the new drain, the native sweep after the fixpoint asks
+  gc_live_has. The rest is both sides kept. The prototype's README sections
+  moved beside the probes; its two writes to the ivar table go through
+  iv_put; corpus/516_string_format_super.rb is gone (526 is the same
+  witness, grown, from PR #50).
+- **One contract no longer held**: a ZeroDivisionError raised under
+  `rb_ensure` must be the same object in the cleanup's `$!` and in the
+  `rescue => e` after it. Since the prototype's base, a rescue makes the
+  object out of a class-and-message pair (exc_pin_bt), so the two were a
+  pair and an object. The boundary now makes that object when it captures
+  the exception.
+- **Checks** (all on this machine, O2 build): the prototype's own --
+  ensure_check 9 runs, typeddata_check 9, loader_check 7, mkmf_check (ruby's
+  nextafter.c built by mkmf and its 400 tests through `require`), 
+  configure_headers_check 7 -- each with its negative controls, are a step
+  of CI's corpus job now. The corpus matched 687 of 687 (run before the
+  duplicate witness was removed; 686 remain). The embedding archive
+  links the five bridge sources too (tools/native_probe/native_build_flags.py
+  lists them once for build.sh's two other callers).
+- **Not done here**: mkmf_suite_check (mkmf's 17 files on both sides) needs
+  the reference's static libruby, which this machine's reference
+  installation does not have; CI's unit test run measures test/mkmf on both
+  sides as before. Bracket depth is 895 of 1024 (878 on main): the probe's
+  tables are top-level values, and the next round replaces them.
+- **What CI and the review found** (PR #83):
+  - Linux's corpus job failed on `corpus/403_bigdecimal.rb`. The prototype
+    had changed the file name `require "x.so"` looks for from `x.so.rb` to
+    `x.so`; on Linux the reference's own `bigdecimal.so` is on the load
+    path, and it was read as Ruby source. The name is main's again, and a
+    `.bundle` / `.so` is asked whether it was compiled against this
+    interpreter's header before it is a candidate for a feature at all (a
+    library built for another ruby is passed over; what provided the
+    feature before -- a .rb, the shipped library -- still does).
+  - A negative C int could not come back from `NUM2INT`: the answer of a
+    request to the interpreter was one number, positive a value's token and
+    negative an exception's, so -1 read as an exception and INT_MIN
+    aborted. The int travels beside the answer now, range-checked on the
+    interpreter's side; the loader contracts gained INT_MIN, -1, 0, INT_MAX
+    and an out-of-range value (41 -> 46 shared checks).
+  - Asking a file whether it is an extension loaded it. The question added
+    for the Linux failure above was a `dlopen` and a `dlclose`, so a library
+    that was accepted ran its constructors, its destructors and its
+    constructors again before `Init_`, and a library built for another ruby
+    had its constructors run here. The file is read for the name every
+    extension compiled against the header defines, and the library is opened
+    once, when it is loaded; the number behind the name is compared then.
+    The loader fixture writes down its constructor, `Init_` and destructor:
+    "constructor, Init" after the first require and "constructor, Init,
+    Init" after a reload, on both sides (46 -> 48 shared checks). Against
+    the previous head the first of those fails with "constructor,
+    destructor, constructor, Init".
+  - The Wasm build's source tree (tools/nothreads_tree.sh) copies top-level
+    .mere files only and could not find the externs under
+    tools/native_probe/. Every native extern is declared in
+    m_native_api.mere now, and the tree gets m_native_none.mere in its
+    place: the same names as functions that answer "no library". `mere -w`
+    emits again.
+  - embedding_stress_check.py has a link line of its own: the bridge
+    sources go there too.
+  - The collect-at-every-safepoint runs of loader_check.py and
+    mkmf_check.py have only the contracts' library on the load path: with
+    the standard library there, a refused require goes on through RubyGems'
+    search, which is minutes at that load.
+
 ## 2026-11-15 (56): rounds 34-37 -- the VM runs blocks, methods, classes, rescue / ensure, and fires events
 
 Rounds 34 to 37 of note 548 (the record from here on is note 552). corpus 658, 659.
