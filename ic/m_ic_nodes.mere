@@ -3118,4 +3118,653 @@ let ic_post_execution = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool)
 let ic_node6 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (ty: int) ->
   if ty == pt_for () then ic_for_node cx u n popped
   else if ty == pt_post_execution () then ic_post_execution cx u n popped
+  else if ty == pt_case_match () then ic_case_match_node cx u n popped
+  else if ty == pt_match_predicate () then ic_match_predicate cx u n popped
+  else if ty == pt_match_required () then ic_match_required cx u n popped
+  // (a `shareable_constant_value` constant: compiled only when it is X = a
+  //  literal, which is pushed already made shareable)
+  else if ty == pt_shareable_constant () then
+    (let w = pn_shareable_constant_write cx n in
+     let (ok, v) = (if ic_ty cx w == pt_constant_write () then ic_shareable_literal cx (pn_constant_write_value cx w) else (false, IvNil)) in
+     if (if ok then false else true) then ic_refuse "a shareable_constant_value write of this is not compiled yet"
+     else
+       (let _ = ic_here cx u (pn_constant_write_value cx w) in
+        let _ = ic_i1 cx u "putobject" (OVal v) in
+        let _ = ic_here cx u n in
+        let _ = ic_dup_unless cx u popped in
+        let _ = ic_in cx u "putspecialobject" 3 in
+        ic_i1 cx u "setconstant" (ic_osym cx (ic_cname cx (pn_constant_write_name cx w)))))
   else ic_refuse (ic_type_name ty ++ " is not compiled yet");
+
+// pm_compile_shareable_constant_literal: (true, the value) when n is a
+// literal ruby makes shareable as it compiles
+let rec ic_shareable_literal = fn cx -> fn (n: int) ->
+  let ty = ic_ty cx n in
+  if ty == pt_true () || ty == pt_false () || ty == pt_nil () || ty == pt_symbol () || ty == pt_regular_expression ()
+     || ty == pt_integer () || ty == pt_float () || ty == pt_rational () || ty == pt_imaginary () then (true, ic_static_value cx n)
+  else if ty == pt_source_line () then (true, IvInt (ic_start_line cx n))
+  else if ty == pt_string () then (true, ic_string_value cx n)
+  else if ty == pt_array () then
+    (let rec go = fn (xs: int list) ->
+       (match xs with
+        | Nil -> (true, (Nil : Iv list))
+        | Cons (e, t) ->
+          (let (ok, v) = ic_shareable_literal cx e in
+           if ok then (let (ok2, vs) = go t in (ok2, Cons (v, vs))) else (false, Nil))) in
+     let (ok, vs) = go (ic_nlist cx (pn_array_elements cx n) (pn_array_elements_b cx n)) in
+     (ok, IvArr vs))
+  else if ty == pt_hash () then
+    (let rec go = fn (xs: int list) -> fn (acc: (Iv * Iv) list) ->
+       (match xs with
+        | Nil -> (true, acc)
+        | Cons (e, t) ->
+          if ic_ty cx e != pt_assoc () then (false, acc)
+          else
+            (let (ok1, k) = ic_shareable_literal cx (pn_assoc_key cx e) in
+             let (ok2, v) = ic_shareable_literal cx (pn_assoc_value cx e) in
+             if ok1 && ok2 then go t (ic_hash_put acc k v) else (false, acc))) in
+     let (ok, ps) = go (ic_nlist cx (pn_hash_elements cx n) (pn_hash_elements_b cx n)) Nil in
+     (ok, IvHsh ps))
+  else (false, IvNil);
+
+// -- pattern matching (prism_compile.c's pm_compile_pattern and the nodes that
+// use it: `case / in`, `expr => pattern`, `expr in pattern`) ----------------------
+// The stack is the scratch space, as there: under the value being matched sit
+// a deconstruct cache and, for a single pattern, the error string, the "is it
+// a key error" flag and that error's matchee and key. `base` is how far down
+// they are from where the pattern started. (PAT_CACHE 0, PAT_ERROR_STRING 1,
+// PAT_KEY_ERROR_P 2, PAT_KEY_ERROR_MATCHEE 3, PAT_KEY_ERROR_KEY 4)
+let ic_pat_str = fn (s: str) -> OVal (IvStr (s, "US-ASCII"));
+let ic_sprintf = fn cx -> fn (u: int) -> fn (argc: int) -> ic_push_send cx u "core#sprintf" argc;
+// (the error string and "not a key error" set, the two values popped)
+let ic_pat_set_error = fn cx -> fn (u: int) -> fn (base: int) ->
+  let _ = ic_in cx u "setn" (base + 1 + 1) in
+  let _ = ic_i1 cx u "putobject" (OVal IvFalse) in
+  let _ = ic_in cx u "setn" (base + 2 + 2) in
+  let _ = ic_i0 cx u "pop" in
+  ic_i0 cx u "pop";
+// pm_compile_pattern_generic_error
+let ic_pattern_generic_error = fn cx -> fn (u: int) -> fn (n: int) -> fn (message: str) -> fn (base: int) ->
+  let ok = ic_new_label cx u in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_il cx u "branchif" ok in
+  let _ = ic_in cx u "putspecialobject" 1 in
+  let _ = ic_i1 cx u "putobject" (ic_pat_str message) in
+  let _ = ic_in cx u "topn" 3 in
+  let _ = ic_sprintf cx u 2 in
+  let _ = ic_pat_set_error cx u base in
+  ic_emit_label cx u ok;
+// pm_compile_pattern_length_error
+let ic_pattern_length_error = fn cx -> fn (u: int) -> fn (n: int) -> fn (message: str) -> fn (length: int) -> fn (base: int) ->
+  let ok = ic_new_label cx u in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_il cx u "branchif" ok in
+  let _ = ic_in cx u "putspecialobject" 1 in
+  let _ = ic_i1 cx u "putobject" (ic_pat_str message) in
+  let _ = ic_in cx u "topn" 3 in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_push_send cx u "length" 0 in
+  let _ = ic_i1 cx u "putobject" (OVal (IvInt length)) in
+  let _ = ic_sprintf cx u 4 in
+  let _ = ic_pat_set_error cx u base in
+  ic_emit_label cx u ok;
+// pm_compile_pattern_eqq_error
+let ic_pattern_eqq_error = fn cx -> fn (u: int) -> fn (n: int) -> fn (base: int) ->
+  let ok = ic_new_label cx u in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_il cx u "branchif" ok in
+  let _ = ic_in cx u "putspecialobject" 1 in
+  let _ = ic_i1 cx u "putobject" (ic_pat_str "%p === %p does not return true") in
+  let _ = ic_in cx u "topn" 3 in
+  let _ = ic_in cx u "topn" 5 in
+  let _ = ic_sprintf cx u 3 in
+  let _ = ic_pat_set_error cx u base in
+  let _ = ic_emit_label cx u ok in
+  let _ = ic_in cx u "setn" 2 in
+  let _ = ic_i0 cx u "pop" in
+  ic_i0 cx u "pop";
+// pm_compile_pattern_deconstruct
+let ic_pattern_deconstruct = fn cx -> fn (u: int) -> fn (n: int) -> fn (deconstruct: int) -> fn (match_failed: int) -> fn (deconstructed: int) ->
+                             fn (type_error: int) -> fn (single: bool) -> fn (cache: bool) -> fn (base: int) ->
+  let _ = ic_here cx u n in
+  let _ =
+    (if cache then
+       (let _ = ic_in cx u "topn" base in
+        let _ = ic_il cx u "branchnil" deconstruct in
+        let _ = ic_in cx u "topn" base in
+        let _ = ic_il cx u "branchunless" match_failed in
+        let _ = ic_i0 cx u "pop" in
+        let _ = ic_in cx u "topn" (base - 1) in
+        ic_il cx u "jump" deconstructed)
+     else ic_il cx u "jump" deconstruct) in
+  let _ = ic_emit_label cx u deconstruct in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_i1 cx u "putobject" (ic_osym cx "deconstruct") in
+  let _ = ic_push_send cx u "respond_to?" 1 in
+  let _ = (if cache then ic_in cx u "setn" (base + 1) else ()) in
+  let _ = (if single then ic_pattern_generic_error cx u n "%p does not respond to #deconstruct" (base + 1) else ()) in
+  let _ = ic_here cx u n in
+  let _ = ic_il cx u "branchunless" match_failed in
+  let _ = ic_push_send cx u "deconstruct" 0 in
+  let _ = (if cache then ic_in cx u "setn" base else ()) in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_i1 cx u "checktype" (OChk 7) in
+  let _ = ic_il cx u "branchunless" type_error in
+  ic_emit_label cx u deconstructed;
+// pm_compile_pattern_constant: the constant an array, find or hash pattern
+// is written under
+let ic_pattern_constant = fn cx -> fn (u: int) -> fn (n: int) -> fn (match_failed: int) -> fn (single: bool) -> fn (base: int) ->
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_node cx u n false in
+  let _ = ic_here cx u n in
+  let _ = (if single then ic_in cx u "dupn" 2 else ()) in
+  let _ = ic_in cx u "checkmatch" 2 in
+  let _ = (if single then ic_pattern_eqq_error cx u n (base + 3) else ()) in
+  let _ = ic_here cx u n in
+  ic_il cx u "branchunless" match_failed;
+// the TypeError a #deconstruct or #deconstruct_keys of the wrong type is
+let ic_pattern_type_error = fn cx -> fn (u: int) -> fn (type_error: int) -> fn (message: str) ->
+  let _ = ic_emit_label cx u type_error in
+  let _ = ic_in cx u "putspecialobject" 1 in
+  let _ = ic_i1 cx u "putobject" (OVal (IvCls "TypeError")) in
+  let _ = ic_i1 cx u "putobject" (ic_pat_str message) in
+  let _ = ic_push_send cx u "core#raise" 2 in
+  ic_i0 cx u "pop";
+// "key not found: :name", as rb_sprintf's %+ makes it (a binary String)
+let ic_key_not_found = fn (name: str) ->
+  let n = str_len name in
+  let rec simple = fn (i: int) ->
+    if i >= n then true
+    else (let c = ord (char_at name i) in
+          let ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (i > 0 && c >= 48 && c <= 57)
+                   || (i == n - 1 && i > 0 && (c == 63 || c == 33)) in
+          if ok then simple (i + 1) else false) in
+  if n > 0 && simple 0 then OVal (IvStr ("key not found: :" ++ name, "ASCII-8BIT"))
+  else ic_refuse "a hash pattern key that inspects quoted is not compiled yet";
+
+// pm_compile_pattern_match: falls through when the pattern matches
+let rec ic_pattern_match = fn cx -> fn (u: int) -> fn (n: int) -> fn (unmatched: int) -> fn (single: bool) -> fn (cache: bool) -> fn (base: int) ->
+  let matched = ic_new_label cx u in
+  let _ = ic_pattern cx u n matched unmatched single cache base in
+  ic_emit_label cx u matched;
+
+// pm_compile_pattern
+let ic_pattern = fn cx -> fn (u: int) -> fn (n: int) -> fn (matched: int) -> fn (unmatched: int) -> fn (single: bool) -> fn (cache: bool) -> fn (base0: int) ->
+  let at = fn (x: unit) -> ic_here cx u n in
+  let ty = ic_ty cx n in
+  if ty == pt_array_pattern () then
+    (let req = ic_nlist cx (pn_array_pattern_requireds cx n) (pn_array_pattern_requireds_b cx n) in
+     let posts = ic_nlist cx (pn_array_pattern_posts cx n) (pn_array_pattern_posts_b cx n) in
+     let nreq = ic_llen req in
+     let min = nreq + ic_llen posts in
+     let rest = pn_array_pattern_rest cx n in
+     let rest_named = rest >= 0 && ic_ty cx rest == pt_splat () && pn_splat_expression cx rest >= 0 in
+     let use_rest_size = rest >= 0 && (rest_named || ic_llen posts > 0) in
+     let match_failed = ic_new_label cx u in
+     let type_error = ic_new_label cx u in
+     let deconstruct = ic_new_label cx u in
+     let deconstructed = ic_new_label cx u in
+     let _ = at () in
+     let base = (if use_rest_size then (let _ = ic_i1 cx u "putobject" (OVal (IvInt 0)) in let _ = ic_i0 cx u "swap" in base0 + 1) else base0) in
+     let _ = (if pn_array_pattern_constant cx n >= 0 then ic_pattern_constant cx u (pn_array_pattern_constant cx n) match_failed single base else ()) in
+     let _ = ic_pattern_deconstruct cx u n deconstruct match_failed deconstructed type_error single cache base in
+     let _ = at () in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_push_send cx u "length" 0 in
+     let _ = ic_i1 cx u "putobject" (OVal (IvInt min)) in
+     let _ = ic_push_send cx u (if rest < 0 then "==" else ">=") 1 in
+     let _ = (if single then ic_pattern_length_error cx u n (if rest < 0 then "%p length mismatch (given %p, expected %p)" else "%p length mismatch (given %p, expected %p+)") min (base + 1) else ()) in
+     let _ = at () in
+     let _ = ic_il cx u "branchunless" match_failed in
+     let rec reqs = fn (xs: int list) -> fn (i: int) ->
+       (match xs with
+        | Nil -> ()
+        | Cons (r, t) ->
+          (let _ = at () in
+           let _ = ic_i0 cx u "dup" in
+           let _ = ic_i1 cx u "putobject" (OVal (IvInt i)) in
+           let _ = ic_push_send cx u "[]" 1 in
+           let _ = ic_pattern_match cx u r match_failed single false (base + 1) in
+           reqs t (i + 1))) in
+     let _ = reqs req 0 in
+     let _ =
+       (if rest >= 0 then
+          (if rest_named then
+             (let _ = at () in
+              let _ = ic_i0 cx u "dup" in
+              let _ = ic_i1 cx u "putobject" (OVal (IvInt nreq)) in
+              let _ = ic_in cx u "topn" 1 in
+              let _ = ic_push_send cx u "length" 0 in
+              let _ = ic_i1 cx u "putobject" (OVal (IvInt min)) in
+              let _ = ic_push_send cx u "-" 1 in
+              let _ = ic_in cx u "setn" 4 in
+              let _ = ic_push_send cx u "[]" 2 in
+              ic_pattern_match cx u (pn_splat_expression cx rest) match_failed single false (base + 1))
+           else if ic_llen posts > 0 then
+             (let _ = at () in
+              let _ = ic_i0 cx u "dup" in
+              let _ = ic_push_send cx u "length" 0 in
+              let _ = ic_i1 cx u "putobject" (OVal (IvInt min)) in
+              let _ = ic_push_send cx u "-" 1 in
+              let _ = ic_in cx u "setn" 2 in
+              ic_i0 cx u "pop")
+           else ())
+        else ()) in
+     let rec ps = fn (xs: int list) -> fn (i: int) ->
+       (match xs with
+        | Nil -> ()
+        | Cons (q, t) ->
+          (let _ = at () in
+           let _ = ic_i0 cx u "dup" in
+           let _ = ic_i1 cx u "putobject" (OVal (IvInt (nreq + i))) in
+           let _ = ic_in cx u "topn" 3 in
+           let _ = ic_push_send cx u "+" 1 in
+           let _ = ic_push_send cx u "[]" 1 in
+           let _ = ic_pattern_match cx u q match_failed single false (base + 1) in
+           ps t (i + 1))) in
+     let _ = ps posts 0 in
+     let _ = at () in
+     let _ = ic_i0 cx u "pop" in
+     let _ = (if use_rest_size then ic_i0 cx u "pop" else ()) in
+     let _ = ic_il cx u "jump" matched in
+     let _ = ic_i0 cx u "putnil" in
+     let _ = (if use_rest_size then ic_i0 cx u "putnil" else ()) in
+     let _ = ic_pattern_type_error cx u type_error "deconstruct must return Array" in
+     let _ = ic_emit_label cx u match_failed in
+     let _ = ic_i0 cx u "pop" in
+     let _ = (if use_rest_size then ic_i0 cx u "pop" else ()) in
+     ic_il cx u "jump" unmatched)
+  else if ty == pt_find_pattern () then
+    (let base = base0 in
+     let reqs = ic_nlist cx (pn_find_pattern_requireds cx n) (pn_find_pattern_requireds_b cx n) in
+     let size = ic_llen reqs in
+     let match_failed = ic_new_label cx u in
+     let type_error = ic_new_label cx u in
+     let deconstruct = ic_new_label cx u in
+     let deconstructed = ic_new_label cx u in
+     let _ = (if pn_find_pattern_constant cx n >= 0 then ic_pattern_constant cx u (pn_find_pattern_constant cx n) match_failed single base else ()) in
+     let _ = ic_pattern_deconstruct cx u n deconstruct match_failed deconstructed type_error single cache base in
+     let _ = at () in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_push_send cx u "length" 0 in
+     let _ = ic_i1 cx u "putobject" (OVal (IvInt size)) in
+     let _ = ic_push_send cx u ">=" 1 in
+     let _ = (if single then ic_pattern_length_error cx u n "%p length mismatch (given %p, expected %p+)" size (base + 1) else ()) in
+     let _ = at () in
+     let _ = ic_il cx u "branchunless" match_failed in
+     let while_begin = ic_new_label cx u in
+     let next_loop = ic_new_label cx u in
+     let find_succeeded = ic_new_label cx u in
+     let find_failed = ic_new_label cx u in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_push_send cx u "length" 0 in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_i1 cx u "putobject" (OVal (IvInt size)) in
+     let _ = ic_push_send cx u "-" 1 in
+     let _ = ic_i1 cx u "putobject" (OVal (IvInt 0)) in
+     let _ = ic_emit_label cx u while_begin in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_in cx u "topn" 2 in
+     let _ = ic_push_send cx u "<=" 1 in
+     let _ = ic_il cx u "branchunless" find_failed in
+     let rec each = fn (xs: int list) -> fn (i: int) ->
+       (match xs with
+        | Nil -> ()
+        | Cons (r, t) ->
+          (let _ = at () in
+           let _ = ic_in cx u "topn" 3 in
+           let _ = ic_in cx u "topn" 1 in
+           let _ = (if i != 0 then (let _ = ic_i1 cx u "putobject" (OVal (IvInt i)) in ic_push_send cx u "+" 1) else ()) in
+           let _ = ic_push_send cx u "[]" 1 in
+           let _ = ic_pattern_match cx u r next_loop single false (base + 4) in
+           each t (i + 1))) in
+     let _ = each reqs 0 in
+     let le = pn_splat_expression cx (pn_find_pattern_left cx n) in
+     let _ = (if le >= 0 then
+                (let _ = at () in
+                 let _ = ic_in cx u "topn" 3 in
+                 let _ = ic_i1 cx u "putobject" (OVal (IvInt 0)) in
+                 let _ = ic_in cx u "topn" 2 in
+                 let _ = ic_push_send cx u "[]" 2 in
+                 ic_pattern_match cx u le find_failed single false (base + 4))
+              else ()) in
+     let rn = pn_find_pattern_right cx n in
+     let re = (if ic_ty cx rn == pt_splat () then pn_splat_expression cx rn else 0 - 1) in
+     let _ = (if re >= 0 then
+                (let _ = at () in
+                 let _ = ic_in cx u "topn" 3 in
+                 let _ = ic_in cx u "topn" 1 in
+                 let _ = ic_i1 cx u "putobject" (OVal (IvInt size)) in
+                 let _ = ic_push_send cx u "+" 1 in
+                 let _ = ic_in cx u "topn" 3 in
+                 let _ = ic_push_send cx u "[]" 2 in
+                 ic_pattern_match cx u re find_failed single false (base + 4))
+              else ()) in
+     let _ = at () in
+     let _ = ic_il cx u "jump" find_succeeded in
+     let _ = ic_emit_label cx u next_loop in
+     let _ = ic_i1 cx u "putobject" (OVal (IvInt 1)) in
+     let _ = ic_push_send cx u "+" 1 in
+     let _ = ic_il cx u "jump" while_begin in
+     let _ = ic_emit_label cx u find_failed in
+     let _ = ic_in cx u "adjuststack" 3 in
+     let _ = (if single then
+                (let _ = ic_in cx u "putspecialobject" 1 in
+                 let _ = ic_i1 cx u "putobject" (ic_pat_str "%p does not match to find pattern") in
+                 let _ = ic_in cx u "topn" 2 in
+                 let _ = ic_sprintf cx u 2 in
+                 ic_pat_set_error cx u base)
+              else ()) in
+     let _ = ic_il cx u "jump" match_failed in
+     let _ = ic_in cx u "dupn" 3 in
+     let _ = ic_emit_label cx u find_succeeded in
+     let _ = ic_in cx u "adjuststack" 3 in
+     let _ = ic_i0 cx u "pop" in
+     let _ = ic_il cx u "jump" matched in
+     let _ = ic_i0 cx u "putnil" in
+     let _ = ic_pattern_type_error cx u type_error "deconstruct must return Array" in
+     let _ = ic_emit_label cx u match_failed in
+     let _ = ic_i0 cx u "pop" in
+     ic_il cx u "jump" unmatched)
+  else if ty == pt_hash_pattern () then
+    (let base = base0 in
+     let rest = pn_hash_pattern_rest cx n in
+     let els = ic_nlist cx (pn_hash_pattern_elements cx n) (pn_hash_pattern_elements_b cx n) in
+     let has_rest = rest >= 0 && (if ic_ty cx rest == pt_assoc_splat () && pn_assoc_splat_value cx rest < 0 then false else true) in
+     let has_keys = ic_llen els > 0 || rest >= 0 in
+     let match_failed = ic_new_label cx u in
+     let type_error = ic_new_label cx u in
+     let key_of = fn (e: int) -> ic_symbol_value cx (pn_assoc_key cx e) in
+     let kname = fn (e: int) -> (match key_of e with | IvSym (s, _) -> s | _ -> "") in
+     let _ = (if pn_hash_pattern_constant cx n >= 0 then ic_pattern_constant cx u (pn_hash_pattern_constant cx n) match_failed single base else ()) in
+     let _ = at () in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_i1 cx u "putobject" (ic_osym cx "deconstruct_keys") in
+     let _ = ic_push_send cx u "respond_to?" 1 in
+     let _ = (if single then ic_pattern_generic_error cx u n "%p does not respond to #deconstruct_keys" (base + 1) else ()) in
+     let _ = at () in
+     let _ = ic_il cx u "branchunless" match_failed in
+     let _ = (if has_keys && (if has_rest then false else true) then ic_i1 cx u "duparray" (OVal (IvArr (ic_map key_of els))) else ic_i0 cx u "putnil") in
+     let _ = ic_push_send cx u "deconstruct_keys" 1 in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_i1 cx u "checktype" (OChk 8) in
+     let _ = ic_il cx u "branchunless" type_error in
+     let _ = (if has_rest then ic_push_send cx u "dup" 0 else ()) in
+     let _ =
+       (if has_keys then
+          (let values = ic_list_new cx in
+           let _ = list_iter els (fn (e: int) ->
+                     (let sym = OVal (key_of e) in
+                      let _ = at () in
+                      let _ = ic_i0 cx u "dup" in
+                      let _ = ic_i1 cx u "putobject" sym in
+                      let _ = ic_push_send cx u "key?" 1 in
+                      let _ = (if single then
+                                 (let ok = ic_new_label cx u in
+                                  let _ = ic_i0 cx u "dup" in
+                                  let _ = ic_il cx u "branchif" ok in
+                                  let _ = ic_i1 cx u "putobject" (ic_key_not_found (kname e)) in
+                                  let _ = ic_in cx u "setn" (base + 1 + 2) in
+                                  let _ = ic_i1 cx u "putobject" (OVal IvTrue) in
+                                  let _ = ic_in cx u "setn" (base + 2 + 3) in
+                                  let _ = ic_in cx u "topn" 3 in
+                                  let _ = ic_in cx u "setn" (base + 3 + 4) in
+                                  let _ = ic_i1 cx u "putobject" sym in
+                                  let _ = ic_in cx u "setn" (base + 4 + 5) in
+                                  let _ = ic_in cx u "adjuststack" 4 in
+                                  ic_emit_label cx u ok)
+                               else ()) in
+                      let _ = ic_il cx u "branchunless" match_failed in
+                      let saved = ic_capture_begin cx u in
+                      let _ = at () in
+                      let _ = ic_i0 cx u "dup" in
+                      let _ = ic_i1 cx u "putobject" sym in
+                      let _ = ic_push_send cx u (if has_rest then "delete" else "[]") 1 in
+                      let v0 = pn_assoc_value cx e in
+                      let v = (if ic_ty cx v0 == pt_implicit () then pn_implicit_value cx v0 else v0) in
+                      let _ = ic_pattern_match cx u v match_failed single false (base + 1) in
+                      ic_list_append cx values (ic_capture_end cx u saved))) in
+           ic_append cx u values)
+        else
+          (let _ = ic_i0 cx u "dup" in
+           let _ = ic_push_send cx u "empty?" 0 in
+           let _ = (if single then ic_pattern_generic_error cx u n "%p is not empty" (base + 1) else ()) in
+           let _ = at () in
+           ic_il cx u "branchunless" match_failed)) in
+     let _ =
+       (if has_rest then
+          (let _ = at () in
+           if ic_ty cx rest == pt_no_keywords_parameter () then
+             (let _ = ic_i0 cx u "dup" in
+              let _ = ic_push_send cx u "empty?" 0 in
+              let _ = (if single then ic_pattern_generic_error cx u n "rest of %p is not empty" (base + 1) else ()) in
+              let _ = at () in
+              ic_il cx u "branchunless" match_failed)
+           else
+             (let _ = ic_i0 cx u "dup" in
+              ic_pattern_match cx u (pn_assoc_splat_value cx rest) match_failed single false (base + 1)))
+        else ()) in
+     let _ = at () in
+     let _ = ic_i0 cx u "pop" in
+     let _ = ic_il cx u "jump" matched in
+     let _ = ic_i0 cx u "putnil" in
+     let _ = ic_pattern_type_error cx u type_error "deconstruct_keys must return Hash" in
+     let _ = ic_emit_label cx u match_failed in
+     let _ = ic_i0 cx u "pop" in
+     ic_il cx u "jump" unmatched)
+  else if ty == pt_capture_pattern () then
+    (let match_failed = ic_new_label cx u in
+     let _ = at () in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_pattern_match cx u (pn_capture_pattern_value cx n) match_failed single cache (base0 + 1) in
+     let _ = ic_pattern cx u (pn_capture_pattern_target cx n) matched match_failed single false base0 in
+     let _ = at () in
+     let _ = ic_i0 cx u "putnil" in
+     let _ = ic_emit_label cx u match_failed in
+     let _ = ic_i0 cx u "pop" in
+     ic_il cx u "jump" unmatched)
+  else if ty == pt_local_variable_target () then
+    (let _ = at () in
+     let _ = ic_setlocal cx u (ic_cname cx (pn_local_variable_target_name cx n)) in
+     ic_il cx u "jump" matched)
+  else if ty == pt_alternation_pattern () then
+    (let matched_left = ic_new_label cx u in
+     let unmatched_left = ic_new_label cx u in
+     let _ = at () in
+     let _ = ic_i0 cx u "dup" in
+     let _ = ic_pattern cx u (pn_alternation_pattern_left cx n) matched_left unmatched_left single cache (base0 + 1) in
+     let _ = at () in
+     let _ = ic_emit_label cx u matched_left in
+     let _ = ic_i0 cx u "pop" in
+     let _ = ic_il cx u "jump" matched in
+     let _ = ic_i0 cx u "putnil" in
+     let _ = ic_emit_label cx u unmatched_left in
+     ic_pattern cx u (pn_alternation_pattern_right cx n) matched unmatched single cache base0)
+  else if ty == pt_parentheses () then ic_pattern cx u (pn_parentheses_body cx n) matched unmatched single cache base0
+  else if ty == pt_pinned_variable () then ic_pattern cx u (pn_pinned_variable_variable cx n) matched unmatched single true base0
+  else if ty == pt_if () || ty == pt_unless () then
+    (let if_ = ty == pt_if () in
+     let st = (if if_ then pn_if_statements cx n else pn_unless_statements cx n) in
+     let _ = ic_pattern_match cx u (ic_li cx (pn_statements_body cx st) 0) unmatched single cache base0 in
+     let _ = ic_node cx u (if if_ then pn_if_predicate cx n else pn_unless_predicate cx n) false in
+     let _ = at () in
+     let _ = (if single then
+                (let ok = ic_new_label cx u in
+                 let _ = ic_i0 cx u "dup" in
+                 let _ = ic_il cx u (if if_ then "branchif" else "branchunless") ok in
+                 let _ = ic_i1 cx u "putobject" (ic_pat_str "guard clause does not return true") in
+                 let _ = ic_pat_set_error cx u base0 in
+                 ic_emit_label cx u ok)
+              else ()) in
+     let _ = ic_il cx u (if if_ then "branchunless" else "branchif") unmatched in
+     ic_il cx u "jump" matched)
+  else
+    // (a value: `===` of it. A pinned expression is its expression.)
+    (let v = (if ty == pt_pinned_expression () then pn_pinned_expression_expression cx n else n) in
+     let _ = at () in
+     let _ = ic_node cx u v false in
+     let _ = at () in
+     let _ = (if single then ic_in cx u "dupn" 2 else ()) in
+     let _ = ic_in cx u "checkmatch" 2 in
+     let _ = (if single then ic_pattern_eqq_error cx u v (base0 + 2) else ()) in
+     let _ = at () in
+     let _ = ic_il cx u "branchif" matched in
+     ic_il cx u "jump" unmatched);
+
+// pm_compile_pattern_error_handler: what a single pattern that did not match
+// raises
+let ic_pattern_error_handler = fn cx -> fn (u: int) -> fn (n: int) -> fn (done: int) -> fn (popped: bool) ->
+  let key_error = ic_new_label cx u in
+  let cleanup = ic_new_label cx u in
+  let _ = ic_here cx u n in
+  let _ = ic_in cx u "putspecialobject" 1 in
+  let _ = ic_in cx u "topn" (2 + 2) in
+  let _ = ic_il cx u "branchif" key_error in
+  let _ = ic_i1 cx u "putobject" (OVal (IvCls "NoMatchingPatternError")) in
+  let _ = ic_in cx u "putspecialobject" 1 in
+  let _ = ic_i1 cx u "putobject" (ic_pat_str "%p: %s") in
+  let _ = ic_in cx u "topn" 4 in
+  let _ = ic_in cx u "topn" (1 + 6) in
+  let _ = ic_sprintf cx u 3 in
+  let _ = ic_push_send cx u "core#raise" 2 in
+  let _ = ic_il cx u "jump" cleanup in
+  let _ = ic_emit_label cx u key_error in
+  let _ = ic_i1 cx u "putobject" (OVal (IvCls "NoMatchingPatternKeyError")) in
+  let _ = ic_in cx u "putspecialobject" 1 in
+  let _ = ic_i1 cx u "putobject" (ic_pat_str "%p: %s") in
+  let _ = ic_in cx u "topn" 4 in
+  let _ = ic_in cx u "topn" (1 + 6) in
+  let _ = ic_sprintf cx u 3 in
+  let _ = ic_in cx u "topn" (3 + 4) in
+  let _ = ic_in cx u "topn" (4 + 5) in
+  let _ = ic_push_send_k cx u "new" 1 32 (Cons ("matchee", Cons ("key", Nil))) true in
+  let _ = ic_push_send cx u "core#raise" 1 in
+  let _ = ic_emit_label cx u cleanup in
+  let _ = ic_in cx u "adjuststack" 7 in
+  let _ = (if popped then () else ic_i0 cx u "putnil") in
+  let _ = ic_il cx u "jump" done in
+  let _ = ic_in cx u "dupn" 5 in
+  if popped then ic_i0 cx u "putnil" else ();
+
+// pm_compile_case_match_node
+let ic_case_match_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let end_l = ic_new_label cx u in
+  let else_l = ic_new_label cx u in
+  let conds_n = ic_nlist cx (pn_case_match_conditions cx n) (pn_case_match_conditions_b cx n) in
+  let e = pn_case_match_else_clause cx n in
+  let single = e < 0 && ic_llen conds_n == 1 in
+  let _ = ic_here cx u n in
+  let _ = (if single then
+             (let _ = ic_i0 cx u "putnil" in
+              let _ = ic_i0 cx u "putnil" in
+              let _ = ic_i1 cx u "putobject" (OVal IvFalse) in
+              ic_i0 cx u "putnil")
+           else ()) in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_node cx u (pn_case_match_predicate cx n) false in
+  let bodies = ic_list_new cx in
+  let saved = ic_capture_begin cx u in
+  let rec each = fn (cs: int list) -> fn (i: int) ->
+    (match cs with
+     | Nil -> ()
+     | Cons (c, t) ->
+       (let body_l = ic_new_label cx u in
+        let saved2 = ic_capture_begin cx u in
+        let _ = ic_here cx u c in
+        let _ = (if i > 0 then ic_i0 cx u "putnil" else ()) in
+        let _ = ic_emit_label cx u body_l in
+        let _ = ic_in cx u "adjuststack" (if single then 6 else 2) in
+        let st = pn_in_statements cx c in
+        let _ = (if st >= 0 then ic_node cx u st popped else if popped then () else ic_synthetic_putnil cx u) in
+        let _ = ic_here cx u c in
+        let _ = ic_il cx u "jump" end_l in
+        let _ = ic_list_append cx bodies (ic_capture_end cx u saved2) in
+        let next_l = ic_new_label cx u in
+        let pat = pn_in_pattern cx c in
+        let _ = ic_here cx u pat in
+        let _ = ic_i0 cx u "dup" in
+        let _ = ic_pattern cx u pat body_l next_l single true 2 in
+        let _ = ic_emit_label cx u next_l in
+        let _ = ic_set_unremovable cx next_l in
+        each t (i + 1))) in
+  let _ = each conds_n 0 in
+  let _ =
+    (if e >= 0 then
+       (let _ = ic_emit_label cx u else_l in
+        let _ = ic_here cx u n in
+        let _ = ic_i0 cx u "pop" in
+        let _ = ic_i0 cx u "pop" in
+        let _ = ic_node cx u e popped in
+        let _ = ic_here cx u n in
+        let _ = ic_il cx u "jump" end_l in
+        let _ = ic_i0 cx u "putnil" in
+        if popped then ic_i0 cx u "putnil" else ())
+     else
+       (let _ = ic_emit_label cx u else_l in
+        if single then ic_pattern_error_handler cx u n end_l popped
+        else
+          (let _ = ic_here cx u n in
+           let _ = ic_in cx u "putspecialobject" 1 in
+           let _ = ic_i1 cx u "putobject" (OVal (IvCls "NoMatchingPatternError")) in
+           let _ = ic_in cx u "topn" 2 in
+           let _ = ic_push_send cx u "core#raise" 2 in
+           let _ = ic_in cx u "adjuststack" 3 in
+           let _ = (if popped then () else ic_i0 cx u "putnil") in
+           let _ = ic_il cx u "jump" end_l in
+           let _ = ic_in cx u "dupn" 1 in
+           (if popped then ic_i0 cx u "putnil" else ())))) in
+  let _ = ic_append cx u (ic_capture_end cx u saved) in
+  let _ = ic_append cx u bodies in
+  ic_emit_label cx u end_l;
+
+// PM_MATCH_PREDICATE_NODE: `expr in pattern`
+let ic_match_predicate = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_node cx u (pn_match_predicate_value cx n) false in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "dup" in
+  let matched = ic_new_label cx u in
+  let unmatched = ic_new_label cx u in
+  let done = ic_new_label cx u in
+  let _ = ic_pattern cx u (pn_match_predicate_pattern cx n) matched unmatched false true 2 in
+  let _ = ic_here cx u n in
+  let _ = ic_emit_label cx u unmatched in
+  let _ = ic_i0 cx u "pop" in
+  let _ = ic_i0 cx u "pop" in
+  let _ = (if popped then () else ic_i1 cx u "putobject" (OVal IvFalse)) in
+  let _ = ic_il cx u "jump" done in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_emit_label cx u matched in
+  let _ = ic_in cx u "adjuststack" 2 in
+  let _ = (if popped then () else ic_i1 cx u "putobject" (OVal IvTrue)) in
+  let _ = ic_il cx u "jump" done in
+  ic_emit_label cx u done;
+
+// pm_compile_match_required_node: `expr => pattern`
+let ic_match_required = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let matched = ic_new_label cx u in
+  let unmatched = ic_new_label cx u in
+  let done = ic_new_label cx u in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_i1 cx u "putobject" (OVal IvFalse) in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_i0 cx u "putnil" in
+  let _ = ic_node cx u (pn_match_required_value cx n) false in
+  let _ = ic_here cx u n in
+  let _ = ic_i0 cx u "dup" in
+  let _ = ic_pattern cx u (pn_match_required_pattern cx n) matched unmatched true true 2 in
+  let _ = ic_emit_label cx u unmatched in
+  let _ = ic_pattern_error_handler cx u n done popped in
+  let _ = ic_emit_label cx u matched in
+  let _ = ic_here cx u n in
+  let _ = ic_in cx u "adjuststack" 6 in
+  let _ = (if popped then () else ic_i0 cx u "putnil") in
+  let _ = ic_il cx u "jump" done in
+  ic_emit_label cx u done;
