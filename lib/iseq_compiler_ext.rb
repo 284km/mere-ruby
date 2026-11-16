@@ -105,6 +105,9 @@ class RubyVM::InstructionSequence
       #  node -- [type, line, column, line, column, {branch id => [type,
       #  line, column, line, column, counter]}] -- and how many counters)
       attr_accessor :cov_bases, :cov_counters
+      # (how many flip-flops the method -- with its blocks -- has: each one's
+      #  state is a special variable of the method's frame, numbered from 2)
+      attr_accessor :flip_cnt
       attr_writer :opts, :parser
       def parser = (@parser || :prism)
       # (the catch table: [type, start, end, iseq, cont] as ADD_CATCH_ENTRY
@@ -369,6 +372,19 @@ class RubyVM::InstructionSequence
         here(u, n)
         u.insn(:splatarray, true) unless popped
       when Prism::IfNode, Prism::UnlessNode then branch(u, n, popped)
+      # (PM_FLIP_FLOP_NODE as a value: true or false of it)
+      when Prism::FlipFlopNode
+        final = u.new_label
+        then_l = u.new_label
+        else_l = u.new_label
+        flip_flop(u, n, else_l, then_l, n.location.start_line, popped)
+        here(u, n)
+        u.emit_label(then_l)
+        u.insn(:putobject, true)
+        u.insn(:jump, final)
+        u.emit_label(else_l)
+        u.insn(:putobject, false)
+        u.emit_label(final)
       when Prism::CaseMatchNode then case_match_node(u, n, popped)
       when Prism::MatchPredicateNode then match_predicate(u, n, popped)
       when Prism::MatchRequiredNode then match_required(u, n, popped)
@@ -3841,6 +3857,47 @@ class RubyVM::InstructionSequence
       (cov_top(u).cov_bases || {}).values.map { |b| [*b[0, 5], b[5].values] }
     end
 
+    # pm_compile_flip_flop: `a..b` as a condition. Its state is a special
+    # variable of the method's frame: off, the left side may switch it on
+    # (and `..` asks the right side at once, `...` waits a turn); on, the
+    # right side may switch it off.
+    def flip_flop(u, n, else_l, then_l, line, popped)
+      lend = u.new_label
+      again = !n.exclude_end?
+      local = u.local_iseq
+      key = (local.flip_cnt || 0) + 2
+      local.flip_cnt = (local.flip_cnt || 0) + 1
+      u.at(line, -1)
+      u.insn(:getspecial, key, 0)
+      u.insn(:branchif, lend)
+      if n.left then flip_flop_bound(u, n.left, popped) else u.insn(:putnil) end
+      u.at(line, -1)
+      u.insn(:branchunless, else_l)
+      u.insn(:putobject, true)
+      u.insn(:setspecial, key)
+      u.insn(:jump, then_l) unless again
+      u.emit_label(lend)
+      if n.right then flip_flop_bound(u, n.right, popped) else u.insn(:putnil) end
+      u.at(line, -1)
+      u.insn(:branchunless, then_l)
+      u.insn(:putobject, false)
+      u.insn(:setspecial, key)
+      u.insn(:jump, then_l)
+    end
+
+    # (an Integer bound is the line just read: `if 2..4` is `$. == 2`)
+    def flip_flop_bound(u, b, popped)
+      if b.is_a?(Prism::IntegerNode)
+        node(u, b, false)
+        here(u, b)
+        u.insn(:getglobal, :"$.")
+        push_send(u, :==, 1)
+        u.insn(:pop) if popped
+      else
+        node(u, b, popped)
+      end
+    end
+
     def compile_part(u, part, popped, owner)
       part = part.statements if part.is_a?(Prism::ElseNode)
       if part
@@ -3893,6 +3950,9 @@ class RubyVM::InstructionSequence
         here(u, at)
         u.insn(:branchunless, else_l)
         u.insn(:jump, then_l)
+        return
+      when Prism::FlipFlopNode
+        flip_flop(u, cond, else_l, then_l, cond.location.start_line, false)
         return
       when Prism::AndNode
         compile_logical(u, cond.left, nil, else_l)
@@ -4863,7 +4923,7 @@ class RubyVM::InstructionSequence
       when :dupn then [e.ops[0], e.ops[0] * 2]
       when :checktype then [1, 1]
       when :checkkeyword, :getspecial, :getclassvariable then [0, 1]
-      when :setclassvariable then [1, 0]
+      when :setclassvariable, :setspecial then [1, 0]
       when :toregexp then [e.ops[1], 1]
       when :definemethod, :jump then [0, 0]
       when :definesmethod then [1, 0]
