@@ -313,9 +313,9 @@ class RubyVM::InstructionSequence
       when Prism::StringNode
         unless popped
           if n.frozen?
-            u.insn(:putobject, n.unescaped.dup.freeze)
+            u.insn(:putobject, string_value(n).freeze)
           else
-            u.insn(:putchilledstring, n.unescaped.dup.freeze)
+            u.insn(:putchilledstring, string_value(n).freeze)
           end
         end
       when Prism::ArrayNode then array(u, n, popped)
@@ -648,18 +648,32 @@ class RubyVM::InstructionSequence
       str.to_sym
     end
 
+    # parse_string_encoded: an escape can force a String literal's encoding
+    # over the source's -- binary for `\xFF` in a US-ASCII source, UTF-8 for
+    # `\u00e9` there
+    def string_value(n)
+      str = n.unescaped.dup
+      if n.forced_binary_encoding? then str.force_encoding(Encoding::BINARY)
+      elsif n.forced_utf8_encoding? then str.force_encoding(Encoding::UTF_8)
+      end
+      str
+    end
+
     def static_value(n)
       case n
       when Prism::ArrayNode then n.elements.map { |e| static_value(e) }.freeze
       when Prism::NilNode then nil
       when Prism::TrueNode then true
       when Prism::FalseNode then false
-      when Prism::StringNode then n.unescaped.dup.freeze
+      when Prism::StringNode then string_value(n).freeze
       when Prism::SymbolNode then symbol_value(n)
       when Prism::HashNode then n.elements.to_h { |e| [static_value(e.key), static_value(e.value)] }.freeze
       when Prism::RangeNode
         Range.new(n.left && static_value(n.left), n.right && static_value(n.right), n.exclude_end?).freeze
       when Prism::RegularExpressionNode then regexp_literal(n.unescaped, n)
+      # (pm_static_literal_value: __LINE__ is its line -- an element of a
+      #  literal Array or Hash, a `when`'s value)
+      when Prism::SourceLineNode then n.location.start_line
       else n.value
       end
     end
@@ -770,7 +784,7 @@ class RubyVM::InstructionSequence
       if !recv_done && (n.name == :-@ || n.name == :freeze) && n.receiver.is_a?(Prism::StringNode) && !n.safe_navigation? &&
          n.arguments.nil? && n.block.nil? && u.opts[:specialized_instruction]
         at.()
-        u.insn(n.name == :freeze ? :opt_str_freeze : :opt_str_uminus, n.receiver.unescaped.dup.freeze,
+        u.insn(n.name == :freeze ? :opt_str_freeze : :opt_str_uminus, string_value(n.receiver).freeze,
                CallData.new(n.name, CALL_ARGS_SIMPLE, 0, nil))
         u.insn(:pop) if popped
         return
@@ -1526,9 +1540,9 @@ class RubyVM::InstructionSequence
       n.parts.each_with_index do |part, i|
         if part.is_a?(Prism::StringNode)
           if cur
-            cur << part.unescaped
+            cur << string_value(part)
           else
-            cur = part.unescaped.dup
+            cur = string_value(part)
             cur_at = [part.location.end_line, part.node_id] if i != 0
           end
           next
@@ -1537,14 +1551,29 @@ class RubyVM::InstructionSequence
         if part.is_a?(Prism::EmbeddedStatementsNode) && part.statements && part.statements.body.size == 1 &&
            part.statements.body[0].is_a?(Prism::StringNode)
           if cur
-            cur << part.statements.body[0].unescaped
+            cur << string_value(part.statements.body[0])
           else
-            cur = part.statements.body[0].unescaped.dup
+            cur = string_value(part.statements.body[0])
             cur_at = [part.location.start_line, part.node_id]
           end
           next
         end
-        cur = +"" if cur.nil? && n.parts.size == 1
+        # (a lone interpolation starts from an empty String in the source's
+        #  encoding; a pattern's in the one its n / u / e / s names, binary
+        #  in a US-ASCII source: pm_compile_interpolated's parts_size == 1)
+        if cur.nil? && n.parts.size == 1
+          enc = u.opts[:source_encoding] || Encoding::UTF_8
+          if regexp
+            enc = if n.ascii_8bit? || n.forced_binary_encoding? then Encoding::BINARY
+                  elsif n.utf_8? then Encoding::UTF_8
+                  elsif n.euc_jp? then Encoding::EUC_JP
+                  elsif n.windows_31j? then Encoding::Windows_31J
+                  elsif enc == Encoding::US_ASCII then Encoding::BINARY
+                  else enc
+                  end
+          end
+          cur = String.new(encoding: enc)
+        end
         if cur
           u.at(*cur_at)
           u.insn(:putobject, cur.freeze)
@@ -1589,15 +1618,18 @@ class RubyVM::InstructionSequence
     end
 
     # pm_static_literal_concat: the pieces of a static string, joined
+    # (the pieces joined in their own encodings: the first one's is the
+    #  text's unless a later piece brings another)
     def static_concat(parts)
-      parts.each_with_object(+"") do |part, s|
-        case part
-        when Prism::StringNode then s << part.unescaped
-        when Prism::InterpolatedStringNode then s << static_concat(part.parts)
-        when Prism::EmbeddedStatementsNode then s << static_concat(part.statements.body)
-        else raise NotImplementedError, "RubyVM::InstructionSequence: #{part.type} in a static string is not compiled yet"
-        end
-      end
+      parts.inject(nil) do |s, part|
+        v = case part
+            when Prism::StringNode then string_value(part)
+            when Prism::InterpolatedStringNode then static_concat(part.parts)
+            when Prism::EmbeddedStatementsNode then static_concat(part.statements.body)
+            else raise NotImplementedError, "RubyVM::InstructionSequence: #{part.type} in a static string is not compiled yet"
+            end
+        s ? s << v : v.dup
+      end || +""
     end
 
     # PM_HASH_NODE: a static literal is newhash 0 or duphash; popped, only
@@ -1713,11 +1745,15 @@ class RubyVM::InstructionSequence
     def range_node(u, n, popped)
       excl = n.exclude_end?
       lo, hi = n.left, n.right
-      if (lo.nil? || lo.is_a?(Prism::IntegerNode)) && (hi.nil? || hi.is_a?(Prism::IntegerNode))
-        u.insn(:putobject, Range.new(lo&.value, hi&.value, excl)) unless popped
+      # (pm_optimizable_range_item_p: no bound, an Integer or a written nil)
+      lit = ->(e) { e.nil? || e.is_a?(Prism::IntegerNode) || e.is_a?(Prism::NilNode) }
+      val = ->(e) { e.is_a?(Prism::IntegerNode) ? e.value : nil }
+      if lit.(lo) && lit.(hi)
+        u.insn(:putobject, Range.new(val.(lo), val.(hi), excl)) unless popped
       else
-        if lo then node(u, lo, false) else u.insn(:putnil) end
-        if hi then node(u, hi, false) else u.insn(:putnil) end
+        # (an absent bound's nil is the range node's own instruction)
+        if lo then node(u, lo, false) else here(u, n); u.insn(:putnil) end
+        if hi then node(u, hi, false) else here(u, n); u.insn(:putnil) end
         here(u, n)
         u.insn(:newrange, excl ? 1 : 0)
         u.insn(:pop) if popped
@@ -1983,7 +2019,9 @@ class RubyVM::InstructionSequence
     # pm_compile_defined_expr0: every instruction at the defined? node's
     # place; in a condition the answer is true, otherwise the type's name
     def defined0(u, n, at, cond, lfin, explicit)
-      val = ->(t) { cond ? true : DEFINED_NAMES[DEFINED[t]].dup.freeze }
+      # (rb_iseq_defined_string: an interned US-ASCII String -- what
+      #  `defined?(x).encoding` answers)
+      val = ->(t) { cond ? true : DEFINED_NAMES[DEFINED[t]].encode(Encoding::US_ASCII).freeze }
       loc = -> { here(u, at) }
       type = n.class.name.split("::").last
       dtype = nil
@@ -2230,8 +2268,9 @@ class RubyVM::InstructionSequence
       child = exception_unit(u, :rescue, ex.location.start_line, n.location, n.node_id)
       matched = child.new_label
       none = child.new_label
-      # (the scope's own location: no node)
-      child.at(child.first_lineno, 0)
+      # (the scope's own location: the modifier's line -- the sequence's
+      #  first line is the rescue expression's -- and no node)
+      child.at(n.location.start_line, 0)
       child.insn(:getlocal, *local_ref(child, ERRINFO, 0))
       child.insn(:putobject, StandardError)
       child.insn(:checkmatch, 3)
@@ -2240,7 +2279,7 @@ class RubyVM::InstructionSequence
       child.emit_label(matched)
       child.event(:rescue)
       node(child, ex, false)
-      child.at(child.first_lineno, 0)
+      child.at(n.location.start_line, 0)
       child.insn(:leave)
       child.emit_label(none)
       child.insn(:getlocal, *local_ref(child, ERRINFO, 0))
@@ -2397,7 +2436,7 @@ class RubyVM::InstructionSequence
               else
                 if c.is_a?(Prism::StringNode)
                   here(u, c)
-                  u.insn(:putobject, c.unescaped.dup.freeze)
+                  u.insn(:putobject, string_value(c).freeze)
                 else
                   node(u, c, false)
                 end
@@ -2454,7 +2493,7 @@ class RubyVM::InstructionSequence
         [static_value(c)]
       when Prism::SourceLineNode then [c.location.start_line]
       when Prism::SourceFileNode then [u.path.dup.freeze]
-      when Prism::StringNode then [c.unescaped.dup.freeze]
+      when Prism::StringNode then [string_value(c).freeze]
       end
     end
 
@@ -2466,6 +2505,9 @@ class RubyVM::InstructionSequence
       elsif n.utf_8? then Regexp.new(src.dup.force_encoding(Encoding::UTF_8), o | Regexp::FIXEDENCODING)
       elsif n.euc_jp? then Regexp.new(src.dup.force_encoding(Encoding::EUC_JP), o | Regexp::FIXEDENCODING)
       elsif n.windows_31j? then Regexp.new(src.dup.force_encoding(Encoding::Windows_31J), o | Regexp::FIXEDENCODING)
+      # (...or binary, which an escape in it can force: parse_regexp_encoding
+      #  reads no other forced encoding)
+      elsif n.forced_binary_encoding? then Regexp.new(src.b, o)
       else Regexp.new(src, o)
       end
     end
@@ -2624,7 +2666,7 @@ class RubyVM::InstructionSequence
            Prism::IntegerNode, Prism::FloatNode, Prism::RationalNode, Prism::ImaginaryNode
         [static_value(n)]
       when Prism::SourceLineNode then [n.location.start_line]
-      when Prism::StringNode then [n.unescaped.dup.freeze]
+      when Prism::StringNode then [string_value(n).freeze]
       when Prism::ArrayNode
         vs = n.elements.map { |e| shareable_literal(e) or return nil }
         [vs.map(&:first).freeze]
@@ -3239,9 +3281,15 @@ class RubyVM::InstructionSequence
       attach_traces(u)
       u.stack_max = stack_max(u)
       pos = 0
+      # (iseq_set_sequence numbers a constant's inline cache as it lays the
+      #  instructions out, not as they were compiled: a block argument is
+      #  compiled before the arguments it is laid out after)
+      ic = -1
       u.elements.each do |e|
         if e.is_a?(Label) then e.pos = pos
-        elsif e.is_a?(Insn) then pos += 1 + e.ops.size
+        elsif e.is_a?(Insn)
+          pos += 1 + e.ops.size
+          e.ops.each { |o| o.index = (ic += 1) if o.is_a?(IC) }
         end
       end
     end
@@ -4061,7 +4109,8 @@ class RubyVM::InstructionSequence
       params[:use_block] = true if pr[:use_block]
       # (a hidden local -- kwbits -- is numbered as iseq_data_to_ary numbers it)
       locals = u.locals.each_with_index.map { |l, i| l.is_a?(Integer) ? u.locals.size - i + 1 : l }
-      ["YARVInstructionSequence/SimpleDataFormat", 4, 0, 1, misc, u.label, u.path, u.abs_path || u.path,
+      # (the format's name is a C string: binary)
+      ["YARVInstructionSequence/SimpleDataFormat".b, 4, 0, 1, misc, u.label, u.path, u.abs_path || u.path,
        u.first_lineno, u.type, locals, params, exception, body]
     end
 
@@ -4195,7 +4244,8 @@ class RubyVM::InstructionSequence
         end
         s << ops.join(", ")
         if e.line && e.line > 0 && e.line != prev_line
-          slen = s.size > 70 ? 0 : 70 - s.size
+          # (rb_iseq_disasm_insn counts the line's bytes, not its characters)
+          slen = s.bytesize > 70 ? 0 : 70 - s.bytesize
           s << " " * slen << format("(%4d)", e.line)
         end
         prev_line = e.line

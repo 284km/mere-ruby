@@ -4759,3 +4759,95 @@ runs on the evaluator.
   Ruby takes 2.1 s for pp.rb's 738 lines: before whole files run on the VM
   it has to be native (note 552).
 - Next: whole files on the VM (the compiler made native first), then speed.
+
+## 2026-11-16 (59): round 38 -- a whole file runs on the ISeq VM, and the corpus matches ruby that way too
+
+**The point.** With `MERE_RUBY_VM=1` the main script and every file it
+requires run on the ISeq VM: the file is compiled once and its top sequence
+is the file's one statement. A file the compiler or the VM does not take
+runs on the evaluator as before, whole. The corpus run this way matches
+ruby: 691 programs, 654 with the main script on the VM, 37 on the
+evaluator, 0 different (`tools/iseq/vm_corpus.sh`). The default execution
+is unchanged -- the evaluator -- and the corpus matches there as before.
+The first survey of this round was 410 on the VM, 188 fallen back and 91
+different.
+
+- **How a file gets there.** `MERE_RUBY_VM` is `1` (quiet), `report` (a
+  note on stderr saying which of the two ran a file and why), `strict` (a
+  file that falls back raises) or `why` (the answer for the main script,
+  without running it). The driver and `require` / `load` hand the parsed
+  statements to vm_file_stmts, which answers the file's position marks and
+  one `SVm`. Not taken, by decision: a main script under an option that
+  changes how it is read (-n, -p, -a, -l, -x, -s, -K), and a source that is
+  not UTF-8 or US-ASCII.
+- **What whole files asked of the VM** that `ISeq#eval` snippets had not:
+  `binding`, `eval` and `local_variables` called bare (the frame declares
+  its locals on entry, as the source does); `...`; a call without a
+  receiver is the parser's own call node whatever self is (`refine`,
+  `raise`, `attr_reader`, `include`, `define_method` as a class body reads
+  them); `__dir__` and `require_relative` from the frame's file; a
+  parameter named `_` twice (the parser's `_~N`); a lone `**obj` argument
+  (#to_hash, before the block's #to_proc; `**nil` passes nothing and still
+  says keywords were given); a def on a value without a singleton class;
+  `class << self`; the frame's line under a rescue clause (the instruction
+  before where the frame goes on, as ruby leaves its pc); a `break` in a
+  Thread's body (LocalJumpError where it is); `alias $new $old`; a
+  Continuation re-entered into a VM frame (run again from the statement
+  the guarded call is in; refused where values would be on the stack).
+- **What the evaluator reads off a body's AST**, a VM body now answers from
+  its program: whether the method takes a block (ruby's own `use_block`,
+  which the compiler already computed -- the unused-block warning), the
+  locals a TracePoint's binding of the frame has before they are assigned,
+  the lines a targeted TracePoint hooks, the outer locals that may be
+  reassigned (a shareable Proc's refusal; ruby's update_lvar_state, from
+  the setlocals), the box a body's file was read in.
+- **The compiler** (lib/iseq_compiler_ext.rb, 431 / 431 against ruby):
+  interpolated regexps, `$1` / `$&` and their kin (getspecial), a regexp
+  match that writes locals, class variables, `#@x` in a string,
+  `__ENCODING__`.
+- **Found on the way, in the evaluator** (each was wrong without the VM
+  too): the builtin operator is a frame of what it refuses -- `1 + nil`,
+  `1 < nil`, `1 / 0` have 'Integer#+' on top of their backtrace, as
+  `1.+(nil)` always had; a def or an undef under `1.instance_eval` is
+  refused when it runs, and a constant or a class there is not refused at
+  all (a scan of the block refused all four before anything ran);
+  `1r.equal?(1)` was true; "uninitialized constant Nope::Thing" named both;
+  undef_method of an inherited builtin on a singleton class, and of a
+  refined class's method; a method in a source that says `binding`
+  anywhere was never warned about for an unused block.
+  ⚠ Found and NOT fixed, both the evaluator's own: in a source that says
+  `binding` anywhere, a def-level rescue clause sees its frame at the
+  caller's line instead of the def's (the VM has it right; corpus 662 keeps
+  those two methods in a file of their own); and Method objects made of a
+  top-level method that is then defined again several times all call the
+  newest body.
+- **The compiler against ruby, a whole file at a time**
+  (`tools/iseq/compare_files.rb`, new): every corpus program compiled by
+  ruby and by the compiler, #to_a and #disasm compared, a String operand in
+  its encoding too. 691 files: 667 the same, 24 refused (the list below
+  without the encodings, which are the VM's refusals), 0 different. It
+  began at 587 the same. What whole files showed that snippets had not: a
+  written `nil` as a range's bound is a static Range; an absent bound's nil
+  is the range node's instruction; a constant's inline cache is numbered as
+  the instructions are laid out, not as they are compiled (`f(String,
+  &Proc.new {})`); #disasm pads by bytes; a rescue modifier's sequence is
+  at the modifier's line; an escape forces a String literal's encoding and
+  a pattern's to binary (`"\xFF"` and `"\u00e9"` in a US-ASCII source);
+  `defined?`'s answer is a US-ASCII String; `__LINE__` among a literal's
+  elements; a lone interpolation starts from an empty String in the
+  source's encoding.
+- **Still on the evaluator**, of the corpus's 37: pattern matching (`case
+  / in` 8, `=>` / `in` as an expression 3), a String or Regexp literal in
+  another encoding 10, a source in another encoding 2, flip-flops 3, a
+  `for` over a target that is not a local 3, `/o` 2, an empty `#{}` 2, END
+  1, a keyword hash node 1, a shareable_constant_value write 1, and one
+  compiler defect (`__LINE__` in a place it does not read).
+- **Checked** (local, the commit before this note): vm_check 243 / 243,
+  the compiler 431 / 431 snippets and 667 / 667 compiled files, corpus
+  691 / 691 on the evaluator and 691 with 0 different on the VM, the gates
+  (bracket depth 878). Witness 662 runs one
+  script both ways in a child and prints that the two agree.
+- **Not done yet, and why the default stays the evaluator**: the compiler
+  is Ruby running on mere-ruby, about 3 ms a line; and the VM's loop is
+  1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
+  fallbacks, then the compiler made native, then speed.
