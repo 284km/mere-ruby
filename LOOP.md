@@ -5122,6 +5122,18 @@ as ruby's does and the VM runs the result.
   - the parser does not take a group among several `for` targets when the
     group has a splat (`for a, (b, *c), d in`): a syntax error in either
     execution.
+- **A Proc made in a class body of an eval'd sequence lost its program.**
+  `ISeq.compile("class C; P = proc { 42 }; end").eval` and then `C::P.call`
+  said "a body of an ISeq sequence that is no longer loaded": the eval gave
+  its tree back when it ended unless a Proc had taken the eval's own frame
+  or a method was defined, and a class body's frame is another. A tree
+  with a class body is now the collector's to give back, as one with a
+  method is (vm_sweep finds the frame a Proc holds). In main since round
+  34; found when END went to the VM -- test_compile_prism evaluates `END {
+  }` inside a class body 10 times, each ran at exit, the process ended 1
+  and all 182 of the file's tests counted RED.
+  And the evaluator's END did not mark its frame as taken either: a frame
+  an END block was written in could be recycled before the block ran.
 - **Still refused by the compiler**, of the corpus: a
   shareable_constant_value write that is not a literal, 1 program.
 - **Checked** (local, the commit before this note): vm_check 245 / 245,

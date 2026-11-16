@@ -491,6 +491,11 @@ runner crosses them.
   at 0.98 of main's. Rerun its shard.
 - bootstraptest test_ractor #153 (1,000 ractors) and #99 sit at the runner's
   limit.
+- `ruby/test_struct.rb`'s `test_named_structs_are_not_rooted` (run for
+  TopStruct and for SubStruct) compares the process's RSS after 10,000 and
+  after 60,000 named Structs and wants less than twice. Locally the ratio is
+  1.25-1.37 on main and on a branch alike; one CI run gave 2.29 for one of
+  the two while the other passed in the same file.
 
 **Jobs that never ran.** A `macos-26` job can wait without a runner and be
 cancelled after 15-30 min (the job has no `runner_name`). A shard that reaches

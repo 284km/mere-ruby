@@ -77,6 +77,13 @@ MAIN = <<~'RUBY'
   n666 = 40
   t(40) { 3.times { END { puts "END, registered once: #{n666}" } }; n666 += 1 }
   at_exit { puts "at_exit, before the END registered earlier" }
+  # a Proc, or an END, made in a class body of a sequence that was eval'd
+  # keeps the sequence: its frame is the class body's, not the eval's
+  class Kept666; end
+  RubyVM::InstructionSequence.compile("class Kept666\n  P = proc { 42 }\n  END { puts 'END from a class body of an eval' }\nend").eval
+  GC.start
+  30.times { |k| RubyVM::InstructionSequence.compile("v#{k} = #{k}").eval }
+  t(43) { Kept666::P.call }
 RUBY
 
 Dir.mktmpdir do |d|
