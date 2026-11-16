@@ -3182,7 +3182,8 @@ class RubyVM::InstructionSequence
       end)
       u.event([:coverage_branch, b[5]])
       u.at(loc[2], node_id)
-      u.insn(:nop)
+      # (the VM's export gives the nop its counter: what the VM counts)
+      u.insn(:nop).vmx = b[5]
     end
 
     # what the file's branches are, in the order they were declared:
