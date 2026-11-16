@@ -9,13 +9,12 @@ None is excluded from the measurement to improve its score.
 |---|---|---|
 | minitest / `test_minitest_mock.rb` | Executes all 94 tests; 1 failure, 8 errors and 10 skips. File.open stubs now work with and without blocks. Remaining failures include private stubs and a dynamic method's super lookup. | Ruby semantics. Reduce the remaining alias/super witnesses; avoid dispatch functions currently edited by other sessions. |
 | minitest / `test_minitest_spec.rb` | `Minitest::Spec::DSL#name` calls super and cannot find the inherited Class/Module implementation. | Ruby semantics. Coordinate with #86, which edits `super_next_plain`; no AST tree failure is established. |
-| minitest / `test_minitest_test.rb` | Backtrace compression now works; 8 exception Marshal/equality failures and 1 missing-yield error remain. | Ruby semantics. Separate the Marshal and block-forwarding witnesses before changing implementations. |
+| minitest / `test_minitest_test.rb` | Backtrace compression now works; 8 exception Marshal/equality failures and 1 missing-yield error remain. A small exception wrapper with an overridden backtrace compares unequal after a Marshal round trip. The dump stores its delegated trace as its native trace; the reference keeps the native trace nil. | Ruby semantics. The Marshal branch is in `stdlib_src`, also edited by the GC session in #91/#94, so avoid that function until available. This is a coordination constraint, not a GC cause. The missing-yield error needs its own witness. |
 | rack / `spec_headers.rb` | Class naming through `Minitest::Spec::DSL#name` fails before a summary. | Same super lookup issue as minitest spec; coordinate with #86. |
 | rack / `spec_lint.rb` | `notice environment errors` expects Rack::Lint::LintError, but nothing is raised. | Ruby semantics; root cause not yet isolated. |
 | rack / `spec_request.rb` | The result reporter cannot resolve super from `RackRequestTest::TestProxyRequest.name`; no final summary. | Same super lookup issue as minitest spec; coordinate with #86. |
 | rack / `spec_rewindable_input.rb` | Exits with `unexpected return`, without a summary. | Ruby control-flow semantics; root cause not yet isolated. |
 | rack / `spec_sendfile.rb` | Two tests opening a File subclass reach IO's descriptor conversion and reject a path string. | Ruby constructor inheritance; reduce a File subclass witness. |
-| rack / `spec_utils.rb` | Custom query parameter hash loses `foo`; an invalid-cookie test reports a non-class rescue clause. | Ruby semantics; separate the two failures. |
 | rack / `spec_multipart.rb` | The process family crosses 2 GiB in `test_0018_rejects insanely long boundaries`, a background-thread pipe writer and multipart reader. The reference completes 85 tests / 239 assertions. | Resource investigation, not a proven GC or VM cause. A separate 10 MiB string allocation plus one nonblocking pipe write succeeds on both interpreters, each writing 65,536 bytes. The combined workload still needs isolation; keep the cap and leave collector internals untouched. |
 | rack-test / `uploaded_file_spec.rb` | All 10 tests pass on both sides, but 255 versus 368 assertions. The test enumerates `Tempfile.public_instance_methods(false)`. | Ruby reflection semantics; count discrepancy remains RED rather than concealing it. |
 
@@ -65,3 +64,28 @@ Resolved in follow-up rounds 6-7:
   Only `core_prelude_b` changes. Witness 677. The original minitest reporter
   now passes all 22 tests / 52 assertions and becomes MATCH. Enum and
   Enumerator report 159 MATCH / 0 RED / 1 BOTH; corpus reports 697/697.
+
+Resolved in follow-up rounds 8-9:
+
+- Rescue candidates are matched in order. A matching earlier candidate
+  prevents evaluating the later expression or validating the next splatted
+  value. Reached invalid values still raise TypeError. Empty/nil splats
+  remain distinct from bare rescue; conversion, lexical constants,
+  Module#=== and TracePoint matching retain their existing paths. Witness 678.
+- Hash subclasses keep the default block supplied to Hash#initialize by
+  super. The fallback retains the actual Proc, preserves existing entries,
+  validates default-lambda arity and refuses conflicting arguments or a
+  frozen receiver. Only `super_missing` changes for this behavior. Witness 679.
+  Together the two fixes make the original Rack utils file MATCH with all
+  63 tests / 285 assertions passing (previously 1 failure / 1 error).
+
+The separate existing-suite merge gate is still pending. In #90's full
+758-file report, ObjectSpace finalizer, Object copied-ivar and transcode ractor
+tests cross their existing time bounds. Zlib is also 95 rather than 96 MATCH;
+its failed case still needs confirmation. Local transcode gives 98/98 MATCH on both
+main and #90; copied-ivar passes on both. Local finalizer controls instead
+cross 2 GiB on #90 while main controls finish. Its cause remains unconfirmed;
+do not waive the lower file count or change collector internals or limits.
+The final local Hash file equals both baselines (297 MATCH / 1 RED / 8 BOTH),
+and the Exception file gives 98/98 MATCH. A cancelled bootstrap shard left
+nine files unmeasured; the ordinary hosted workflow is rerun at the same bounds.

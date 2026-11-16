@@ -93,3 +93,11 @@ minitest's original reporter becomes MATCH (22 tests / 52 assertions).
 Witnesses 676 and 677 cover restoring native File aliases, keyword/block
 forwarding, deferred predicates and early termination of infinite inputs.
 Only `invoke_with_block0` and `core_prelude_b` change in these rounds.
+
+Rounds 8-9 match rescue candidates in order and retain a Hash subclass's
+default block passed to super. Rack's original utils file becomes MATCH
+(63 tests / 285 assertions). The unchanged 62-file inventory now gives
+52 MATCH / 9 RED / 1 MEMORY, with no BOTH, TIMEOUT or baseline regression.
+Witnesses 678 and 679 cover candidate evaluation/conversion, Module#===,
+Proc identity, lambda arity, preserved entries, argument errors and freezing.
+Corpus reports 699/699 MATCH; bracket depth remains 895/1024.
