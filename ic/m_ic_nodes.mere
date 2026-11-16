@@ -1086,7 +1086,7 @@ let ic_dstr_parts = fn cx -> fn (u: int) -> fn (n: int) -> fn (regexp: bool) ->
               let _ = ic_i1 cx u "objtostring" (ic_cd "to_s" 20 0) in
               let _ = ic_i0 cx u "anytostring" in
               go t (i + 1) (count2 + 1) (kinds2 ++ "C") false ("", "UTF-8") cl cn true)))) in
-  go parts 0 0 "" false ("", "UTF-8") (ic_start_line cx n) (ic_nid cx n) false;
+  go parts 0 0 "" false ("", "UTF-8") (ic_start_line cx n) (ic_nid_in cx u n) false;
 
 let ic_dstr = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
   if ic_ty cx n == pt_interpolated_string () && ic_static_literal cx n then
@@ -1343,7 +1343,7 @@ let ic_node3 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (t
   else if ty == pt_regular_expression () then
     (if popped then () else ic_i1 cx u "putobject" (OVal (ic_regexp_literal cx (ic_str cx (pn_regular_expression_unescaped cx n), ic_enc cx) n)))
   else if ty == pt_interpolated_regular_expression () then
-    (if ic_rx cx n 32 then ic_refuse "a /o pattern is not compiled yet"
+    (if ic_rx cx n 32 then ic_once_regexp cx u n popped
      // (every piece a literal: the Regexp itself)
      else if ic_static_literal cx n then
        (if popped then () else ic_i1 cx u "putobject" (OVal (ic_regexp_literal cx (ic_static_concat cx (ic_parts cx n)) n)))
@@ -2965,4 +2965,157 @@ let ic_node5 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (t
      let _ = ic_i2 cx u "getspecial" (ONum 0) (ONum 0) in
      let _ = ic_push_send cx u "=~" 1 in
      ic_pop_if cx u popped)
+  else ic_node6 cx u n popped ty;
+
+// -- for ------------------------------------------------------------------------
+// pm_compile_for_node_index: the block's one parameter written to the loop's
+// target -- a local as it is; any other single target as the one element of
+// the parameters; several targets as the parameters, or as the one
+// parameter when it converts to an Array
+let ic_for_index = fn cx -> fn (child: int) -> fn (t: int) -> fn (hidden: str) ->
+  let _ = ic_here cx child t in
+  let ty = ic_ty cx t in
+  if ty == pt_local_variable_target () then
+    (let _ = ic_insn cx child "getlocal" (Cons (ic_local_op cx child 0, Cons (ONum 0, Nil))) in
+     // (where the name is, counted from the block: Prism's depth is the
+     //  scope's around the loop)
+     ic_setlocal cx child (ic_cname cx (pn_local_variable_target_name cx t)))
+  else if ty == pt_splat () || ty == pt_multi_target () then
+    (let writes = ic_list_new cx in
+     let cleanup = ic_list_new cx in
+     let st = ic_mstate_new 0 in
+     let ents = ic_ents_new () in
+     // (no state is handed down here, so a call or an index target's topn
+     //  stays as it was written -- reaching a value, not its receiver: ruby
+     //  4.0's `for o.x, y in [[1, 2]]` calls x= on the 2)
+     let _ = (if ty == pt_multi_target () then ic_multi_target cx child t writes cleanup st ents
+              else ic_target cx child t writes cleanup st ents) in
+     // (the four calls are on the value, with FCALL as ruby writes them:
+     //  marked for the VM, to which FCALL is a call without a receiver)
+     let recv = Cons (OVal (IvSym ("recv", "US-ASCII")), Nil) in
+     let mark = fn (mid: str) -> fn (argc: int) ->
+       (let e = ic_insn cx child "send" (Cons (ic_cd mid 20 argc, Cons (OSeq (0 - 1), Nil))) in
+        ic_set_vmx cx e recv) in
+     let not_single = ic_new_label cx child in
+     let not_ary = ic_new_label cx child in
+     let _ = ic_here cx child t in
+     let _ = ic_insn cx child "getlocal" (Cons (ic_local_op cx child 0, Cons (ONum 0, Nil))) in
+     let _ = ic_i0 cx child "dup" in
+     let _ = mark "length" 0 in
+     let _ = ic_i1 cx child "putobject" (OVal (IvInt 1)) in
+     let _ = mark "==" 1 in
+     let _ = ic_il cx child "branchunless" not_single in
+     let _ = ic_i0 cx child "dup" in
+     let _ = ic_i1 cx child "putobject" (OVal (IvInt 0)) in
+     let _ = mark "[]" 1 in
+     let _ = ic_i1 cx child "putobject" (OVal (IvCls "Array")) in
+     let _ = ic_i0 cx child "swap" in
+     let _ = mark "try_convert" 1 in
+     let _ = ic_i0 cx child "dup" in
+     let _ = ic_il cx child "branchunless" not_ary in
+     let _ = ic_i0 cx child "swap" in
+     let _ = ic_emit_label cx child not_ary in
+     let _ = ic_i0 cx child "pop" in
+     let _ = ic_emit_label cx child not_single in
+     let _ = (if ty == pt_splat () then ic_i2 cx child "expandarray" (ONum 0) (ONum (if pn_splat_expression cx t < 0 then 0 else 1)) else ()) in
+     let _ = ic_append cx child writes in
+     ic_append cx child cleanup)
+  else
+    (let writes = ic_list_new cx in
+     let cleanup = ic_list_new cx in
+     let st = ic_mstate_new 1 in
+     let ents = ic_ents_new () in
+     let _ = ic_target cx child t writes cleanup st ents in
+     let _ = ic_here cx child t in
+     let _ = ic_insn cx child "getlocal" (Cons (ic_local_op cx child 0, Cons (ONum 0, Nil))) in
+     let _ = ic_i2 cx child "expandarray" (ONum 1) (ONum 0) in
+     let _ = ic_append cx child writes in
+     let _ = ic_append cx child cleanup in
+     ic_mstate_update cx st ents);
+
+// `for x in c`: c.each with a block whose one parameter is hidden and written
+// to x (a local of the scope around) before the block's b_call
+let ic_for_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let retry_l = ic_new_label cx u in
+  let retry_end = ic_new_label cx u in
+  let _ = ic_emit_label cx u retry_l in
+  let _ = ic_node cx u (pn_for_collection cx n) false in
+  let hidden = ic_hidden 0 in
+  let child = ic_unit_new cx 1 (ic_block_label cx u) (ic_u_path cx u) (ic_u_abs_path cx u) (ic_start_line cx n)
+                (Cons (hidden, Nil)) u (ic_loc4 cx n) (ic_nid cx n) in
+  let t = pn_for_index cx n in
+  let _ = (if ic_ty cx t == pt_local_variable_target () then ic_u_set cx child 24 1 else ic_u_set cx child 27 0) in
+  let _ = ic_u_set_pflag cx child 8 in
+  let _ = ic_add_child cx u child in
+  let _ = ic_for_index cx child t hidden in
+  let _ = ic_at cx child (ic_start_line cx n) (ic_nid cx n) in
+  let _ = ic_event cx child (ic_ev_b_call ()) in
+  let nop = ic_insn cx child "nop" Nil in
+  let _ = ic_u_set cx child 20 nop in
+  let _ = ic_compile_body cx child (pn_for_statements cx n) (ic_nid cx n) (ic_end_line cx n) in
+  let _ = ic_finish cx child in
+  let _ = ic_here cx u n in
+  let _ = ic_i2 cx u "send" (ic_cd "each" 0 0) (OSeq child) in
+  let _ = ic_emit_label cx u retry_end in
+  let _ = ic_pop_if cx u popped in
+  ic_add_catch cx u 4 retry_l retry_end child retry_end;
+
+// -- once ---------------------------------------------------------------------------
+// (`/#{x}/o`: a sequence of its own -- the pieces and toregexp -- that `once`
+//  runs the first time and whose Regexp it answers from then on, kept in an
+//  inline storage entry of this sequence. In its own sequence the pattern's
+//  instructions are the scope's, of no node; the leave is the node's.)
+let ic_once_regexp = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let child = ic_unit_new cx 6 (ic_block_label cx u) (ic_u_path cx u) (ic_u_abs_path cx u) (ic_start_line cx n) Nil u (ic_loc4 cx n) (ic_nid cx n) in
+  let _ = ic_add_child cx u child in
+  let _ = ic_u_set cx child 34 (n + 1) in
+  let _ = ic_dregexp cx child n false in
+  let _ = ic_u_set cx child 34 0 in
+  let _ = ic_here cx child n in
+  let _ = ic_i0 cx child "leave" in
+  let _ = ic_finish cx child in
+  let _ = ic_here cx u n in
+  let _ = ic_i2 cx u "once" (OSeq child) (OIse (ic_next_ise cx u)) in
+  ic_pop_if cx u popped;
+
+// PM_POST_EXECUTION_NODE: `END { }` -- once, a block that hands the block of
+// the statements to core#set_postexe
+let ic_post_execution = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let sl = ic_start_line cx n in
+  let outer = ic_unit_new cx 1 (ic_block_label cx u) (ic_u_path cx u) (ic_u_abs_path cx u) sl Nil u (ic_loc4 cx n) (ic_nid cx n) in
+  let _ = ic_add_child cx u outer in
+  let _ = ic_at cx outer sl (ic_nid cx n) in
+  let _ = ic_event cx outer (ic_ev_b_call ()) in
+  let nop = ic_insn cx outer "nop" Nil in
+  let _ = ic_u_set cx outer 20 nop in
+  let b0 = ic_new_label cx outer in
+  let b1 = ic_new_label cx outer in
+  let _ = ic_u_set cx outer 21 b0 in
+  let _ = ic_u_set cx outer 22 b1 in
+  let _ = ic_emit_label cx outer b0 in
+  let st = pn_post_execution_statements cx n in
+  let sloc = (if st >= 0 then st else n) in
+  let inner = ic_unit_new cx 1 (ic_block_label cx u) (ic_u_path cx u) (ic_u_abs_path cx u) sl Nil outer (ic_loc4 cx sloc) (ic_nid cx sloc) in
+  let _ = ic_add_child cx outer inner in
+  let _ = ic_at cx inner sl (ic_nid cx sloc) in
+  let _ = ic_event cx inner (ic_ev_b_call ()) in
+  let nop2 = ic_insn cx inner "nop" Nil in
+  let _ = ic_u_set cx inner 20 nop2 in
+  let _ = ic_compile_body cx inner st (ic_nid cx sloc) (ic_end_line cx sloc) in
+  let _ = ic_finish cx inner in
+  let _ = ic_at cx outer sl (ic_nid cx n) in
+  let _ = ic_in cx outer "putspecialobject" 1 in
+  let _ = ic_i2 cx outer "send" (ic_ci "core#set_postexe" 0 4 Nil false true) (OSeq inner) in
+  let _ = ic_emit_label cx outer b1 in
+  let _ = ic_event cx outer (ic_ev_b_return ()) in
+  let _ = ic_at cx outer (ic_end_line cx n) (ic_nid cx n) in
+  let _ = ic_i0 cx outer "leave" in
+  let _ = ic_finish cx outer in
+  let _ = ic_here cx u n in
+  let _ = ic_i2 cx u "once" (OSeq outer) (OIse (ic_next_ise cx u)) in
+  ic_pop_if cx u popped;
+
+let ic_node6 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (ty: int) ->
+  if ty == pt_for () then ic_for_node cx u n popped
+  else if ty == pt_post_execution () then ic_post_execution cx u n popped
   else ic_refuse (ic_type_name ty ++ " is not compiled yet");
