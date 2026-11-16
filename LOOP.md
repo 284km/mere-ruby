@@ -5109,3 +5109,31 @@ preserves quotes, backslashes, all controls and DEL without a Ruby call for
 every character. Witness 670 round-trips a long ASCII string and those bytes;
 the unchanged ractor dump test still passes its ten-second limit. No new
 top-level value or JSON engine changes are introduced.
+
+## 2026-11-17: stage 9, round 5 -- enumerate Proc and Binding stores
+
+each_object now snapshots actual Proc and Binding handles from proc_store
+and bind_store, applying the existing class filter and preserving identity.
+count_objects includes those live store lengths in T_DATA and TOTAL. This
+does not invent native TypedData owner counts or allocator byte sizes.
+Witness 680 checks held values, unique identities, Enumerator behavior,
+returned counts and survival after collection. Witness 674 covers String
+counts, including empty and reclaimed values. The 159-case classification
+remains 12 accepted matches, 57 reasoned exclusions and 90 handoffs.
+
+The inherited Ruby memsize_of_all loop now visits Proc/Binding too, producing
+temporary Strings that enter the next String-only measurement. Its a > b
+assertion fails (1081807 versus 1844111 in the isolated reproduction). This
+is the already-recorded native allocator handoff; its guessed byte counts
+are not adjusted to retain a raw pass. It remains enabled and visible.
+
+The latest main baseline is successful CI 43869939788, main 535ad955. Its
+target 159 RED are unchanged from the original inventory. Both hash modes
+pass 696/696 corpus comparisons before the final dump escaping optimization;
+all nine RSS cases pass, with discarded-class-ivar at 1.07x. The final
+ObjectSpace file and dump witnesses are rechecked after that optimization.
+No collector body, m_state, VM, AST, C API or gemtest change is introduced.
+
+The pre-publication origin check found witness 675 newly used by the VM
+branch. This branch's Proc/Binding witness moved to the first free number,
+680, leaving the concurrent branch unchanged.
