@@ -1,6 +1,6 @@
 # mere-ruby — CRuby's own tests
 
-GC exclusion ledger (stage 9, 2026-11-16): **55 tests excluded on both
+GC exclusion ledger (stage 9, 2026-11-16): **57 tests excluded on both
 interpreters**, measured separately from MATCH/RED/BOTH/EXTRA in the four
 target files. This historical full-suite table below predates that ledger;
 fresh CI reports its actual exclusions separately in `exclusions.tsv` and

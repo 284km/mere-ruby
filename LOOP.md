@@ -4917,6 +4917,15 @@ tests of the default collector. No slot or page constants are invented.
   fixtures skipped locally), exclusion accounting's identical/asymmetric
   fixtures, transcript 17; new witnesses agree with Ruby. Full corpus, final
   source gates, RSS and whole-suite CI are recorded in the PR as they finish.
+
+Final review corrected that raw classification: test_start_full_mark and
+test_latest_gc_info_need_major_by return before assertions without USE_RGENGC.
+They are default-generational-GC tests, not honest implementation matches;
+both are now explicitly excluded on both interpreters. The final inventory
+is 12 honest MATCH, 57 reasoned exclusions, 90 handoffs (159 total). Raw MATCH
+gain is 13, including the unaccepted inherited memsize_of_all estimate.
+The GC file's expected local counts are MATCH 30 and exclusions 19; other
+target files are unchanged. Of MMTk's 38 exclusions, 22 now apply here.
 ## 2026-11-16 (59): round 38 -- a whole file runs on the ISeq VM, and the corpus matches ruby that way too
 
 **The point.** With `MERE_RUBY_VM=1` the main script and every file it

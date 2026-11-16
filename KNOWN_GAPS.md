@@ -17,10 +17,12 @@ is excluded instead of changing the reference's collector identity.
 Profiler records real durations around gc_collect_any; latest_gc_info
 reports actual causes and weak-reference counts, without invented heap keys.
 
-The two local rounds gain 15 raw MATCH and separately record 55 exclusions.
+The final classification gains 13 raw MATCH and separately records 57 exclusions.
 One of those raw gains, memsize_of_all, still uses the inherited slot guesses;
 it is not an accepted implementation match. `unittest/gc_cases.tsv` classifies
-the 159 baseline RED as 14 honest matches, 55 exclusions and 90 handoffs.
+the 159 baseline RED as 12 honest matches, 57 exclusions and 90 handoffs.
+Two generational tests return before assertions without USE_RGENGC. They are
+excluded symmetrically rather than claimed as unchecked implementation matches.
 The remaining objspace work needs actual literal pools, Float/Symbol identity
 and lifetime, native TypedData ownership and per-owner allocator byte counts.
 Heap dumps now expose real handles, class/reference edges, observed object_id,
