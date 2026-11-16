@@ -5056,8 +5056,8 @@ by construct and count by count, for a file the VM takes.
   is not compiled yet.
 - **Checked** (local, the commit before this note): vm_check 243 / 243,
   the compiler 433 / 433 snippets, 671 / 671 compiled files and 19 / 19
-  under branch coverage, corpus RESULT_EV on the evaluator and RESULT_VM
-  on the VM, the gates. Witness 665.
+  under branch coverage, the gates. The corpus in both executions was
+  run with the next round's build: (62). Witness 665.
 
 ## 2026-11-16 (62): round 41 -- pattern matching, compiled and run on the VM
 
@@ -5073,10 +5073,10 @@ as ruby's does and the VM runs the result.
   space, with the slots a single pattern keeps for its error (the string,
   whether it is a key error, that error's matchee and key); the error
   handler that raises NoMatchingPatternError / NoMatchingPatternKeyError.
-  Against ruby: 448 / 448 snippets, 22 / 22 under branch coverage (`in`
-  clauses are branches), and every corpus file that has a pattern.
-- **Whole files, again** (compare_files: 694 files, 687 the same, 7
-  refused, 0 different -- it was 672 / 21): a Range nobody reads is what
+  Against ruby: 22 / 22 snippets under branch coverage (`in` clauses are
+  branches), and every corpus file that has a pattern.
+- **Whole files, again** (compare_files: it was 672 the same and 21
+  refused of 693): a Range nobody reads is what
   its bounds do, with no newrange; `nil&.m(args)` is the receiver's nil and
   none of the rest; #to_a says an instruction's events once an
   instruction-info entry (a second `leave` after the first repeats none).
@@ -5100,9 +5100,34 @@ as ruby's does and the VM runs the result.
   of the method's frame in ruby (getspecial / setspecial of a number from
   2); the VM keeps it as the evaluator keeps one, a thread's, under the
   program and that number.
-- **Still refused by the compiler**, of the corpus: a `for` over a target
-  that is not a local 3, `/o` 2, END 1, a shareable_constant_value write 1.
-- **Checked** (local, the commit before this note): vm_check 243 / 243,
-  the compiler 448 / 448 snippets, 687 / 687 compiled files, 22 / 22 under
-  branch coverage, corpus RESULT_EV on the evaluator and RESULT_VM on the
-  VM, the gates. Witness 666.
+- **`once`** (`/#{x}/o`, `END { }`): the instruction over a sequence of
+  type `plain` that builds the Regexp, or over a block that hands the
+  block of the statements to core#set_postexe. The VM keeps the value
+  under the program and the instruction's number; a thread that arrives
+  while another is running the sequence waits for that one and takes its
+  value (ruby's vm_once_dispatch; corpus 536 has the two threads). The
+  plain sequence runs in the frame it is in, as a rescue's does; an END's
+  block is the evaluator's at-exit statement's body.
+- **A `for` over a target that is no local** (pm_compile_for_node_index):
+  an instance variable, a global, a constant, a call or an index target
+  takes the one element of the block's parameters; several targets or a
+  splat take the parameters, or the one parameter when Array.try_convert
+  answers for it. The four calls ruby writes for that are on the value
+  with FCALL set; the VM reads FCALL as a call without a receiver, so the
+  compiler's export for the VM marks them.
+  - ruby 4.0 itself: `for o.x, y in [[1, 2]]` raises NoMethodError (x= on
+    the 2) -- no state is handed down for the receivers, and the topn
+    reaches a value. The sequence is compiled as ruby's, so the VM does
+    the same; the evaluator assigns o.x the whole pair.
+  - the parser does not take a group among several `for` targets when the
+    group has a splat (`for a, (b, *c), d in`): a syntax error in either
+    execution.
+- **Still refused by the compiler**, of the corpus: a
+  shareable_constant_value write that is not a literal, 1 program.
+- **Checked** (local, the commit before this note): vm_check 245 / 245,
+  the compiler 453 / 453 snippets, 693 / 693 compiled files (694 files, 1
+  refused), 22 / 22 under branch coverage, the gates. The corpus: 694 /
+  694 on the evaluator; under MERE_RUBY_VM=1, 694 programs -- 684 on the
+  VM, 10 fallen back (6 a Regexp literal in another encoding, 3 a source
+  in an encoding the VM does not take, 1 the compiler's refusal above), 0
+  different. It was 660 / 31 / 0 of 691 at round 38. Witness 666.
