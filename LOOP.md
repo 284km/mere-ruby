@@ -5073,3 +5073,15 @@ dump_all hoists its main-ractor check and reuses the shareability result
 already needed by non-main ractors. This removes repeated interpreter calls
 without changing its object selection or the subprocess timeout. The ractor
 dump witness passes in 6.76 seconds under the unchanged ten-second bound.
+
+### PR #91 CI follow-up: enumeration preserves the current retained set
+
+The OpenSSL lifetime gate exposed an extra collection in the new iterator:
+it changed the native retained set after the caller had measured it following
+GC.start. each_object now snapshots the current stores without forcing GC.
+Witness 669 reproduces the extra collection on the previous build and agrees
+with Ruby after the correction. The existing OpenSSL memory gate passes,
+including 20/200 owner counts, interrupted allocation and worker lifetimes.
+All six affected GC/ObjectSpace files preserve their local counts: MATCH 110,
+RED 11, BOTH 5, EXTRA 5, plus 57 separately audited exclusions. Allocation
+comparisons remain enabled; no collector body, timeout or memory limit changed.
