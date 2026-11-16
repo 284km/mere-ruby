@@ -4766,7 +4766,7 @@ runs on the evaluator.
 requires run on the ISeq VM: the file is compiled once and its top sequence
 is the file's one statement. A file the compiler or the VM does not take
 runs on the evaluator as before, whole. The corpus run this way matches
-ruby: 691 programs, 654 with the main script on the VM, 37 on the
+ruby: 691 programs, 660 with the main script on the VM, 31 on the
 evaluator, 0 different (`tools/iseq/vm_corpus.sh`). The default execution
 is unchanged -- the evaluator -- and the corpus matches there as before.
 The first survey of this round was 410 on the VM, 188 fallen back and 91
@@ -4793,7 +4793,9 @@ different.
   before where the frame goes on, as ruby leaves its pc); a `break` in a
   Thread's body (LocalJumpError where it is); `alias $new $old`; a
   Continuation re-entered into a VM frame (run again from the statement
-  the guarded call is in; refused where values would be on the stack).
+  the guarded call is in; refused where values would be on the stack); a
+  String literal in any encoding (the compiler's own operand, which
+  compare_files.rb holds to ruby's encoding).
 - **What the evaluator reads off a body's AST**, a VM body now answers from
   its program: whether the method takes a block (ruby's own `use_block`,
   which the compiler already computed -- the unused-block warning), the
@@ -4825,7 +4827,8 @@ different.
   (`tools/iseq/compare_files.rb`, new): every corpus program compiled by
   ruby and by the compiler, #to_a and #disasm compared, a String operand in
   its encoding too. 691 files: 667 the same, 24 refused (the list below
-  without the encodings, which are the VM's refusals), 0 different. It
+  without the encodings, which are the VM's refusals and the driver's), 0
+  different. It
   began at 587 the same. What whole files showed that snippets had not: a
   written `nil` as a range's bound is a static Range; an absent bound's nil
   is the range node's instruction; a constant's inline cache is numbered as
@@ -4836,12 +4839,12 @@ different.
   `defined?`'s answer is a US-ASCII String; `__LINE__` among a literal's
   elements; a lone interpolation starts from an empty String in the
   source's encoding.
-- **Still on the evaluator**, of the corpus's 37: pattern matching (`case
-  / in` 8, `=>` / `in` as an expression 3), a String or Regexp literal in
-  another encoding 10, a source in another encoding 2, flip-flops 3, a
-  `for` over a target that is not a local 3, `/o` 2, an empty `#{}` 2, END
-  1, a keyword hash node 1, a shareable_constant_value write 1, and one
-  compiler defect (`__LINE__` in a place it does not read).
+- **Still on the evaluator**, of the corpus's 31: pattern matching (`case
+  / in` 8, `=>` / `in` as an expression 3), a Regexp literal in an encoding
+  other than UTF-8 or US-ASCII 5, a source in another encoding 2,
+  flip-flops 3, a `for` over a target that is not a local 3, `/o` 2, an
+  empty `#{}` 2, END 1, a keyword hash node 1, a shareable_constant_value
+  write 1.
 - **Checked** (local, the commit before this note): vm_check 243 / 243,
   the compiler 431 / 431 snippets and 667 / 667 compiled files, corpus
   691 / 691 on the evaluator and 691 with 0 different on the VM, the gates
