@@ -179,7 +179,7 @@ if [ "$relink" = 1 ]; then
   main_c="$main_o"
 fi
 # shellcheck disable=SC2086
-clang $opt -w $plat -I "$root/vendor/prism/include" "$main_c" "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" -DMR_CAPI_BUILD -I "$root/capi/include" -I "$root/capi" -I "$root/capi/vendor" "$root"/capi/*.c -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
+clang $opt -w $plat -I "$root/vendor/prism/include" "$main_c" "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" -DMR_CAPI_BUILD -I "$root/capi/include" -I "$root/capi" -I "$root/capi/vendor" -I "$root/capi/standin" "$root"/capi/*.c -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
 # The import library of the C API (capi/tools/import_library.py): what mkmf
 # links its test programs against, so that `have_func` of a ruby function is

@@ -162,8 +162,8 @@ written for ruby's own build tree: they reach into its internal headers).
   library using them loads: each raises NotImplementedError, naming itself,
   when called. Its header comment says why each group is not there (CRuby's
   internal bignum routines by name, TracePoint and the debug inspector from
-  C, profile frames, postponed jobs, memory views, the Random interface,
-  encoding converters).
+  C, profile frames, postponed jobs, the Random interface, encoding
+  converters).
 - A function that is declared in the headers and neither written nor in the
   ledger is an undefined symbol: `require` of a library that uses one raises
   LoadError with the loader's message, which names it. Of the roughly 1,300
@@ -218,7 +218,7 @@ written for ruby's own build tree: they reach into its internal headers).
 | `array.c` | Array, Hash, Range, Struct, Enumerator |
 | `proc.c` | blocks, Procs, `rb_block_call`, `rb_funcall_with_block` |
 | `system.c` | threads, time, IO, utilities |
-| `st.c`, `vendor/` | CRuby's `st.c`, compiled unchanged |
+| `st.c`, `memory_view.c`, `vendor/`, `standin/` | CRuby's `st.c` and `memory_view.c`, compiled unchanged |
 | `unsupported.c` | the ledger |
 | `mr_capi.h` | what the files above share; not for extensions |
 | `../m_capi.mere`, `../m_capi_api.mere` | the interpreter's side: the table, and what crosses |

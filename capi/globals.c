@@ -61,6 +61,9 @@ static VALUE boot_body(VALUE unused) {
     rb_default_rs = rb_rs;
     rb_output_rs = rb_gv_get("$\\");
     rb_argv0 = rb_gv_get("$0");
+    /* (the memory view registry: capi/memory_view.c) */
+    extern void Init_MemoryView(void);
+    Init_MemoryView();
     return Qnil;
 }
 void mr_capi_boot(void) {

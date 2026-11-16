@@ -4919,7 +4919,7 @@ an interrupt during `to_s`, which is not long here).
 these headers (`test/mkmf`, and `capi_ext_build.py` replaced by ruby's own
 extconf.rb runs), then RubyGems' native builds and a real gem.
 
-## 2026-11-16 (59): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and published gems -- nokogiri among them -- install with `gem install`
+## 2026-11-16 (60): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and published gems -- nokogiri among them -- install with `gem install`
 
 Stage 7′ / 8, third unit (note 553), on the C API of (58). Until now
 `require "mkmf"` stopped at a nil RbConfig key, so nothing that builds an
@@ -4964,10 +4964,10 @@ the reference.
   executable -- so the answer was "no" for every ruby function and an
   extension compiled its own substitutes. tools/build.sh now writes an
   import library after the link (capi/tools/import_library.py:
-  `capi/lib/libmere-ruby-api`, one empty symbol for each of the 781
-  functions and 101 variables of the C API the executable exports), and
+  `capi/lib/libmere-ruby-api`, one empty symbol for each function and
+  variable of the C API the executable exports -- about 800 and 100), and
   RbConfig names it as `LIBRUBYARG`, which mkmf puts on the link line of
-  its test programs and not on an extension's. The 66 functions of
+  its test programs and not on an extension's. The functions of
   capi/unsupported.c are left out of it: for those the answer is "no", so
   an extension takes its other path instead of meeting NotImplementedError
   when it runs.
@@ -5034,6 +5034,16 @@ on any build):
   another directory) with success about four times in ten: `File.read` of
   it is then EISDIR, at random. capi_gem_check.py runs with a home of its
   own.
+
+**Memory views** (`ruby/memory_view.h`) are CRuby's own memory_view.c,
+vendored unchanged like st.c and compiled through a wrapper
+(capi/memory_view.c; the two internal headers it includes are stand-ins in
+capi/standin with the one function and the one macro it uses). They leave
+the unsupported ledger, which is 56 functions now. `ruby/test_memory_view.rb`
+passes 24 of 24 here (0 at the baseline, where the file stopped at its
+require). Its last test calls the extension's methods from another Ractor:
+a method that is a C function may be called from any Ractor now, where one
+made from an ordinary Proc belongs to the Ractor that made it.
 
 nokogiri needed two things beyond what the smaller gems did: RbConfig's
 `host` (the configure triplet -- cpu, vendor, os and, on Linux, the C

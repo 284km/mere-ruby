@@ -15,8 +15,7 @@
  *   - TracePoint from C, the debug inspector, profile frames, postponed
  *     jobs, internal thread event hooks, the bug reporter, ISeq loading:
  *     the VM's own structures.
- *   - memory views, the Random interface, encoding converters: not written
- *     yet.
+ *   - the Random interface, encoding converters: not written yet.
  */
 extern void mr_unsupported_symbol(const char *name) __attribute__((__noreturn__));
 #define UNSUPPORTED(name) void name(void) { mr_unsupported_symbol(#name); }
@@ -45,12 +44,6 @@ UNSUPPORTED(rb_internal_thread_add_event_hook) UNSUPPORTED(rb_internal_thread_re
 UNSUPPORTED(rb_thread_lock_native_thread) UNSUPPORTED(rb_thread_prevent_fork)
 UNSUPPORTED(rb_bug_reporter_add) UNSUPPORTED(rb_iseq_load)
 UNSUPPORTED(onig_get_parse_depth_limit) UNSUPPORTED(onig_set_parse_depth_limit)
-/* memory views */
-UNSUPPORTED(rb_memory_view_available_p) UNSUPPORTED(rb_memory_view_extract_item_members)
-UNSUPPORTED(rb_memory_view_fill_contiguous_strides) UNSUPPORTED(rb_memory_view_get)
-UNSUPPORTED(rb_memory_view_get_item) UNSUPPORTED(rb_memory_view_init_as_byte_array)
-UNSUPPORTED(rb_memory_view_item_size_from_format) UNSUPPORTED(rb_memory_view_parse_item_format)
-UNSUPPORTED(rb_memory_view_register) UNSUPPORTED(rb_memory_view_release)
 /* the Random interface */
 UNSUPPORTED(rb_random_base_init) UNSUPPORTED(rb_random_mark)
 /* encoding converters, and the rest */
@@ -58,6 +51,4 @@ UNSUPPORTED(rb_econv_str_append) UNSUPPORTED(rb_marshal_define_compat) UNSUPPORT
 UNSUPPORTED(rb_setup_fake_str) UNSUPPORTED(rb_str_normalize_ospath)
 
 /* Declared as data: an extension that names one links, and finds it empty. */
-unsigned long rb_memory_view_exported_object_registry;
-const char rb_memory_view_exported_object_registry_data_type[128];
 const char rb_random_data_type_1_0[128];
