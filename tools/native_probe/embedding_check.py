@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and check the experimental singleton embedding API, with resource bounds."""
 from pathlib import Path
-from native_build_flags import openssl_flags, native_bridge_sources
+from native_build_flags import openssl_flags, native_bridge_sources, NATIVE_CFLAGS
 import argparse
 import hashlib
 import json
@@ -96,7 +96,7 @@ for mode in ['header', 'c']:
     run('emit-' + mode, [sys.executable, __file__, '--emit', mode, compiler, output])
 openssl_cflags, openssl_ldflags = openssl_flags()
 bridge = native_bridge_sources(compiler)
-flags = ['clang', '-O2', '-w', '-fbracket-depth=1024', '-I', ROOT / 'vendor/prism/include'] + openssl_cflags
+flags = ['clang', '-O2', '-w', '-fbracket-depth=1024', '-I', ROOT / 'vendor/prism/include'] + openssl_cflags + NATIVE_CFLAGS
 link_flags = ['-Wl,-stack_size,0x20000000'] if platform.system() == 'Darwin' else ['-lm']
 if platform.system() != 'Darwin':
     import resource

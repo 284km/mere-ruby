@@ -1,0 +1,124 @@
+// Ruby's C API: the interpreter's table of what C holds.
+//
+// C sees a value as a VALUE (capi/mr_capi.h). nil, true, false, a Fixnum, a
+// flonum and a Symbol are CRuby's own bit patterns. Anything else is a
+// HANDLE: capi_base plus eight times a NUMBER, and capi_tab says which value
+// a number stands for.
+//
+// - A value with an identity (a String, an Array, a Hash, an object, a Proc,
+//   a class) has ONE number for as long as it lives: capi_ids / capi_cls find
+//   it again, so the same object is the same VALUE every time, and a VALUE C
+//   keeps in a static variable stays good while the object does.
+// - A value without one (a Float that is no flonum, an Integer past a
+//   Fixnum, a Range, a Rational ...) gets a new number each time it crosses,
+//   and keeps it only while C can still reach it.
+//
+// capi_tab is deliberately NOT a root of the collector. A collection marks
+// a number when it finds its VALUE on a stack (C's local variables), among
+// the addresses C registered, or under a live data object's dmark
+// (gc_mark_roots, gc_fixpoint in main.mere); capi_sweep then lets go of
+// every number that is neither marked nor an identity still alive.
+let capi_base = 72057594037927936;
+let capi_tab = (let t = map_new () in let _ = map_compact t in t);
+// identity -> number. The key is the handle times 8 plus its kind, as the
+// collector's live set keys it (0 object, 1 String, 2 Array, 3 Hash, 4 Proc).
+let capi_ids = (let t = map_new () in let _ = map_compact t in t);
+let capi_cls = map_new ();
+// numbers a collection reached from C, and those it has asked C about
+let capi_marks = map_new ();
+// class name -> the C function that allocates its instances
+let capi_alloc = map_new ();
+// 0: the next number; 1: how many of capi_free are waiting; 2: a count of
+// collections that visited this table (for the checks)
+let capi_ctr =
+  (let v = vec_new () in
+   let _ = vec_push v 1 in
+   let _ = vec_push v 0 in
+   let _ = vec_push v 0 in
+   v);
+let capi_free = vec_new ();
+
+let capi_key = fn (v: Val) ->
+  match v with
+  | VObj i -> i * 8
+  | VStr i -> i * 8 + 1
+  | VArr i -> i * 8 + 2
+  | VHsh i -> i * 8 + 3
+  | VProc i -> i * 8 + 4
+  | _ -> 0 - 1;
+
+let capi_number = fn (v: Val) ->
+  let waiting = vec_get capi_ctr 1 in
+  let n = (if waiting > 0 then
+             (let m = vec_get capi_free (waiting - 1) in
+              let _ = vec_set capi_ctr 1 (waiting - 1) in m)
+           else
+             (let m = vec_get capi_ctr 0 in
+              let _ = vec_set capi_ctr 0 (m + 1) in m)) in
+  let _ = map_set capi_tab n v in
+  n;
+
+// The VALUE of a value.
+let capi_out = fn (v: Val) ->
+  match v with
+  | VNil -> 4
+  | VBool b -> (if b then 20 else 0)
+  | VInt n ->
+    (if n >= 0 - 4611686018427387903 - 1 && n <= 4611686018427387903 then n * 2 + 1
+     else capi_base + capi_number v * 8)
+  | VFlt f ->
+    (let w = mr_capi_flonum f in
+     if w.w != 0 then w.w else capi_base + capi_number v * 8)
+  | VSym s -> mr_capi_intern s * 256 + 12
+  | VClass c ->
+    (if map_has capi_cls c then capi_base + map_get capi_cls c * 8
+     else (let n = capi_number v in
+           let _ = map_set capi_cls c n in
+           capi_base + n * 8))
+  | _ ->
+    (let k = capi_key v in
+     if k < 0 then capi_base + capi_number v * 8
+     else if map_has capi_ids k then capi_base + map_get capi_ids k * 8
+     else (let n = capi_number v in
+           let _ = map_set capi_ids k n in
+           capi_base + n * 8));
+
+// A value that is to be a handle whatever it is (a Float kept by reference).
+let capi_out_boxed = fn (v: Val) -> capi_base + capi_number v * 8;
+
+let capi_is_handle = fn (x: int) ->
+  x >= capi_base && bit_and x 7 == 0 && map_has capi_tab ((x - capi_base) / 8);
+
+// The value of a VALUE. (36 is CRuby's "undef": no value was given.)
+let capi_in = fn (x: int) ->
+  if x == 4 || x == 36 then VNil
+  else if x == 0 then VBool false
+  else if x == 20 then VBool true
+  else if bit_and x 1 == 1 then VInt (bit_shr x 1)
+  else if bit_and x 3 == 2 then VFlt (mr_capi_flonum_value (CapiWord { w = x }))
+  else if bit_and x 255 == 12 then VSym (mr_capi_id_name (bit_shr x 8))
+  else if capi_is_handle x then map_get capi_tab ((x - capi_base) / 8)
+  else fail ("mere-ruby: C API: not a VALUE: " ++ str_of_int x);
+
+// Let go of a number: the collector found nothing that still means it.
+let capi_drop = fn (n: int) ->
+  let _ = (if map_has capi_tab n then
+    (let v = map_get capi_tab n in
+     let k = capi_key v in
+     let _ = (if k >= 0 && map_has capi_ids k && map_get capi_ids k == n then map_delete capi_ids k else ()) in
+     let _ = (match v with
+              | VClass c -> (if map_has capi_cls c && map_get capi_cls c == n then map_delete capi_cls c else ())
+              | _ -> ()) in
+     map_delete capi_tab n)
+    else ()) in
+  let _ = mr_capi_release n in
+  let waiting = vec_get capi_ctr 1 in
+  let _ = (if waiting < vec_len capi_free then vec_set capi_free waiting n else vec_push capi_free n) in
+  vec_set capi_ctr 1 (waiting + 1);
+
+let capi_bytes = fn (u: unit) ->
+  map_bytes capi_tab + map_bytes capi_ids + map_bytes capi_cls + map_bytes capi_marks + map_bytes capi_alloc;
+let capi_compact = fn (u: unit) ->
+  let _ = map_compact capi_tab in
+  let _ = map_compact capi_ids in
+  map_compact capi_marks;

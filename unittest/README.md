@@ -503,6 +503,9 @@ runner crosses them.
   after 60,000 named Structs and wants less than twice. Locally the ratio is
   1.25-1.37 on main and on a branch alike; one CI run gave 2.29 for one of
   the two while the other passed in the same file.
+- `ruby/test_ractor.rb`'s `test_move_nested_hash_during_gc_with_yjit` runs a
+  child with a 10 s bound and takes 9.3-10.1 s on the runners, on main as
+  well: one run in a few is a Timeout and the file is one test lower.
 
 **Jobs that never ran.** A `macos-26` job can wait without a runner and be
 cancelled after 15-30 min (the job has no `runner_name`). A shard that reaches
