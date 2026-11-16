@@ -5653,6 +5653,17 @@ and what they were:
   test_module's complemented-method-entry leak test (the evaluator's
   shape shortcuts, LOOP (69)).
 
+The other 102 files of test/ruby, on both with the same build: the VM
+5,727 MATCH against the evaluator's 5,735. One is test_ractor's
+move_nested_hash_during_gc_with_yjit, at its bound on main too
+(unittest/README). The other seven were test_random_formatter: on the VM
+`self.bytes(n)` is the receiverless call `bytes(n)` (both are FCALL in
+the sequence), and a bare call of a builtin the class answers --
+Random#bytes, which no name list has -- was a NoMethodError on the
+evaluator too. The self-call with arguments asks whether the object
+answers the name before giving up, as the one without arguments did.
+
 Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
 686 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates;
-test_sprintf 33 / 33 on the VM, also under ASan.
+test_sprintf 33 / 33 on the VM, also under ASan; test_random_formatter
+26 / 26 on both.
