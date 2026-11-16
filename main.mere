@@ -56878,7 +56878,10 @@ and collect_vis = fn world -> fn (cls: str) -> fn names -> fn blocked -> fn (wan
 and listed_builtin_root = fn world -> fn (cls: str) -> fn (nm: str) ->
   let anc9 = ancestors_of world cls in
   let w9 = " " ++ nm ++ " " in
-  let has9 = fn (l: str) -> str_contains (" " ++ l ++ " ") w9 in
+  // (a name with a space is no entry of a list of words: `:"class clone"`
+  //  would match two neighbours)
+  let one9 = (if str_contains nm " " then false else true) in
+  let has9 = fn (l: str) -> one9 && str_contains (" " ++ l ++ " ") w9 in
   (str_list_has anc9 "Kernel" && has9 (kernel_instance_words ()))
   || (let rec own9 = fn (xs: str list) ->
         (match xs with
@@ -64282,8 +64285,12 @@ and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: st
   if vec_get ok 0 == 1 then res else VNil
 // (the native compiler's values as the interpreter's: a literal frozen, as
 //  the Ruby compiler freezes what it puts in an instruction)
+// ⚠ The compiler's data, not the program's calls: this runs while a file is
+//   compiled, after the program that requires it may have redefined
+//   Encoding.find or Hash#freeze, and a literal is the parser's to make. The
+//   freeze is the primitive's and an Encoding the interpreter's own object.
 and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
-  let frozen = fn (x: Val) -> invoke_val_c env world blk x "freeze" Nil false in
+  let frozen = fn (x: Val) -> prim_method_raw x "freeze" Nil in
   match v with
   | IvNil -> VNil
   | IvTrue -> VBool true
@@ -64311,7 +64318,10 @@ and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
     (let sv = fn (x: Iv) -> (match x with IvInt k -> str_of_int k | IvBig t -> t | _ -> "0") in VRat (sv a, sv b))
   | IvCpx (a, b) -> VCpx (ic_to_val env world blk a, ic_to_val env world blk b)
   | IvCls c -> VClass c
-  | IvEnc e -> invoke_val_c env world blk (VClass "Encoding") "find" (Cons (mkstr e, Nil)) false
+  | IvEnc e ->
+    (let c = (if map_has enc_objs e then e else enc_find_canon e) in
+     if map_has enc_objs c then map_get enc_objs c
+     else invoke_val_c env world blk (VClass "Encoding") "find" (Cons (mkstr e, Nil)) false)
 // where a body the VM runs was written -- (path, line) -- and ("", 0) for a
 // body that is not one
 and vm_body_pos = fn (body: Stmt list) ->
@@ -64413,9 +64423,16 @@ and vm_ev = fn env -> fn world -> fn blk -> fn (e: Expr) -> eval_e env world blk
 // frame, every send's binding stayed in its arena -- a fresh box per write,
 // most of what a loop's run kept.) The scope is a child of the frame, so
 // self, the locals and the frame's `$~` are found through it.
+// ⚠ What f answers is copied out of a region of its own before the scope
+//   goes back: it may be a value of the scope's own arena -- a hidden local
+//   read back -- and the scope's arena is compacted when it returns to the
+//   pool. Such a value was read after it was freed, and what it read then
+//   depended on what the allocator had put there since: test_sprintf's
+//   test_rational failed after one set of tests and not another (found with
+//   tools/asan_build.sh), as run_block0's result is copied out of run_stmts'.
 and vm_scoped = fn env -> fn f ->
   let ce = blk_env_get env in
-  let (r, m) = try_or_msg (fn (u: unit) -> (f ce, "")) (fn (m: str) -> (VNil, (if str_eq m "" then " " else m))) in
+  let (r, m) = region VSC { try_or_msg (fn (u: unit) -> (f ce, "")) (fn (m: str) -> (VNil, (if str_eq m "" then " " else m))) } in
   let _ = blk_env_put ce in
   if str_eq m "" then r else fail m
 // the expression mk makes of these values, evaluated (vm_scoped)
@@ -64599,15 +64616,19 @@ and vm_send = fn env -> fn world -> fn blk -> fn st -> fn (mid: str) -> fn (fl: 
   //  from a method frame whose caller takes it: the frame is left, and the
   //  caller makes the call (vm_tail_call). So a method that calls itself
   //  last does not grow the stack, as ruby's tailcall_optimization has it.)
+  // (...only into a Ruby method of the receiver's class, and with no
+  //  refinement in effect: what the call reads of the frame it is written
+  //  in -- binding, eval, local_variables, a refinement used there -- is
+  //  gone once the frame is left, so such a call is made from the frame)
   if vm_bit fl 128 && bid < 0 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 32 || vm_bit fl 64 then false else true)
      && (match kws with Nil -> true | _ -> false)
      && map_has env "__vm~tc" && (if map_len hook_flags > 0 && map_has hook_flags "tp" then false else true)
+     && (if ref_on () then false else true) && has_meth world (dispatch_cls_of world recv) mid
   then
     (let (_, regs) = st in
-     let _ = map_set vm_tail 0 recv in
-     let _ = map_set vm_tail 1 (VSym mid) in
-     let _ = map_set vm_tail 2 (arr_new args) in
-     let _ = map_set vm_tail 3 (VBool (if vm_bit fl 4 then false else true)) in
+     // (one Array, its name a String handle: what a map's own arena holds is
+     //  gone once the entry is replaced or the map compacted)
+     let _ = map_set vm_tail 0 (arr_new (Cons (recv, Cons (mkstr mid, Cons (arr_new args, Cons (VBool (if vm_bit fl 4 then false else true), Nil)))))) in
      let _ = vec_set regs 2 7 in
      vm_push st VNil)
   else
@@ -64615,21 +64636,40 @@ and vm_send = fn env -> fn world -> fn blk -> fn st -> fn (mid: str) -> fn (fl: 
   let in_cls = map_has env "__cscope" && (match (if map_has env "self" then map_get env "self" else VNil) with VClass _ -> true | _ -> false) in
   let rec syms = fn (xs: Val list) -> (match xs with Cons (VSym y, t) -> Cons (y, syms t) | _ -> (Nil : str list)) in
   let rec all_syms = fn (xs: Val list) -> (match xs with Nil -> true | Cons (VSym _, t) -> all_syms t | _ -> false) in
-  // (`private [:a, :b]`: one Array of names is the names, as ruby's
-  //  rb_check_array_type in set_visibility reads it)
-  let vargs = (match args with Cons (VArr a9, Nil) when (match deref a9 with Nil -> false | _ -> all_syms (deref a9)) -> deref a9 | _ -> args) in
   // `private` and its kin written as bare calls with symbols are the
   // evaluator's visibility statement (the parser's SVis), run in the frame
   // itself: a bare `private` sets the frame's mode for the defs that follow
   // (...and with names only at the top level, where the parser makes the
   //  statement of them; in a class they are Module#private's arguments)
-  if bid < 0 && vm_bit fl 4 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 64 then false else true)
+  // (...and the statement answers what the method does -- the names given
+  //  for private / public / protected / module_function, self for the
+  //  constant and class-method forms -- and is not taken when the receiver
+  //  has its own method of the name: a call then)
+  // (`private [:a, :b]` at the top level: one Array of names is the names,
+  //  as ruby's rb_check_array_type in set_visibility reads it; in a class
+  //  the Array goes to Module#private as any argument does. The name is
+  //  asked first: an unrelated call with a long Array is not walked.)
+  let vis_name = str_eq mid "private" || str_eq mid "public" || str_eq mid "protected" || str_eq mid "module_function"
+                 || ((str_eq mid "private_constant" || str_eq mid "public_constant" || str_eq mid "private_class_method"
+                      || str_eq mid "public_class_method") && argc > 0 && in_cls) in
+  let top_main = (match recv with VMain -> true | _ -> false) in
+  let vargs = (if vis_name && top_main then
+                 (match args with Cons (VArr a9, Nil) when (match deref a9 with Nil -> false | _ -> all_syms (deref a9)) -> deref a9 | _ -> args)
+               else args) in
+  let own9 = (if vis_name then
+                (match recv with
+                 | VClass c9 -> has_meth world ("(sng:" ++ c9 ++ ")") mid
+                 | VMain -> has_meth world "Object" mid
+                 | _ -> false)
+              else false) in
+  if vis_name && (if own9 then false else true) && bid < 0 && vm_bit fl 4 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 64 then false else true)
      && (match kws with Nil -> true | _ -> false) && all_syms vargs
-     && (argc == 0 || in_cls || (match recv with VMain -> true | _ -> false))
-     && (str_eq mid "private" || str_eq mid "public" || str_eq mid "protected" || str_eq mid "module_function"
-         || ((str_eq mid "private_constant" || str_eq mid "public_constant" || str_eq mid "private_class_method"
-              || str_eq mid "public_class_method") && argc > 0 && in_cls))
-  then vm_push st (stmt (SVis (mid, syms vargs)))
+     && (argc == 0 || in_cls || top_main)
+  then
+    (let _ = stmt (SVis (mid, syms vargs)) in
+     vm_push st (if str_eq mid "private_constant" || str_eq mid "public_constant" || str_eq mid "private_class_method" || str_eq mid "public_class_method"
+                 then recv
+                 else (match args with Nil -> VNil | Cons (x9, Nil) -> x9 | _ -> arr_new args)))
   // (...and attr_reader / attr_writer / attr_accessor of symbols in a class
   //  body are its attribute statement)
   else if bid < 0 && in_cls && vm_bit fl 4 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 64 then false else true)
@@ -64713,11 +64753,12 @@ and vm_tail_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: st
   let rec go = fn (v: Val) ->
     (match v with
      | VExc (c9, _) when str_eq c9 "~vmtail~" ->
-       (let r9 = (if map_has vm_tail 0 then map_get vm_tail 0 else VNil) in
-        let m9 = (match (if map_has vm_tail 1 then map_get vm_tail 1 else VNil) with VSym y -> y | _ -> "") in
-        let a9 = (match (if map_has vm_tail 2 then map_get vm_tail 2 else VNil) with VArr k -> deref k | _ -> (Nil : Val list)) in
-        let x9 = (match (if map_has vm_tail 3 then map_get vm_tail 3 else VNil) with VBool b -> b | _ -> true) in
-        let _ = map_clear vm_tail in
+       (let p9 = (match (if map_has vm_tail 0 then map_get vm_tail 0 else VNil) with VArr k -> deref k | _ -> (Nil : Val list)) in
+        let _ = (if map_has vm_tail 0 then map_delete vm_tail 0 else ()) in
+        let r9 = vm_nth p9 0 in
+        let m9 = (match vm_nth p9 1 with VStr h -> sget h | _ -> "") in
+        let a9 = (match vm_nth p9 2 with VArr k -> deref k | _ -> (Nil : Val list)) in
+        let x9 = (match vm_nth p9 3 with VBool b -> b | _ -> true) in
         let _ = ready m9 in
         let v9 = emethod_args env world blk r9 m9 a9 x9 in
         let _ = vec_set vm_tail_ready 0 0 in

@@ -32,6 +32,23 @@ python3 "$here/asan_patch.py" "$tmp/mr.c" "$tmp/mr_asan.c"
 # -D__LANG_CORO_ASAN: the runtime tells ASan about each coroutine switch, which
 # it needs once a collection runs on a coroutine of its own (note 270) -- every
 # collection, in a build that has them
+# (the glue and libprism build.sh links, and OpenSSL as it finds it)
+plib="$root/vendor/prism/obj/libprism.a"
+[ -f "$plib" ] || { echo "asan_build: no $plib (run tools/build.sh once)" >&2; exit 2; }
+ossl_prefix="${OPENSSL_PREFIX:-}"
+if [ -z "$ossl_prefix" ] && [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null 2>&1; then
+  ossl_prefix="$(brew --prefix openssl@3 2>/dev/null)" || exit 2
+fi
+if [ -n "$ossl_prefix" ]; then
+  set -- "-I$ossl_prefix/include" "-L$ossl_prefix/lib" "-Wl,-rpath,$ossl_prefix/lib" -lssl -lcrypto
+else
+  set -- -lssl -lcrypto
+fi
 clang -O1 -fsanitize=address -fno-omit-frame-pointer -D__LANG_CORO_ASAN -Wl,-stack_size,0x20000000 \
-  -fbracket-depth=1024 -w "$tmp/mr_asan.c" -o "$out"
+  -fbracket-depth=1024 -w -I "$root/vendor/prism/include" "$tmp/mr_asan.c" \
+  "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" \
+  "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" "$root/tools/native_probe/bridge.c" \
+  "$root/tools/native_probe/reentry.c" "$root/tools/native_probe/handle_slots.c" \
+  "$root/tools/native_probe/exception_bridge.c" "$root/tools/native_probe/typed_bridge.c" \
+  -pthread "$plib" "$@" -o "$out"
 echo "asan_build: $out"
