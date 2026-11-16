@@ -17,7 +17,9 @@
 #   a Float                     f and its 16 hex digits
 #   a Symbol                    :name, with @ENCODING unless US-ASCII
 #   a String                    "bytes"@ENCODING
-#   a Regexp                    /source/options@ENCODING (options: its number)
+#   a Regexp                    /source/options@ENCODING -- what its maker is
+#                               handed: the source's bytes and encoding, the
+#                               options' number
 #   a Range                     (a..b) (a...b)
 #   a Rational, a Complex       (r n d) (c re im)
 #   a class, an Encoding        <Object> <enc UTF-8>
@@ -32,6 +34,21 @@ require File.expand_path(ARGV.shift)
 C = RubyVM::InstructionSequence::Compiler__
 out = ARGV.shift
 
+# A Regexp literal is written as what its maker is handed -- the source in
+# its encoding and the options -- not as the Regexp ruby makes of them: what
+# encoding and options that ends up with is the maker's business
+# (Regexp.__rx_new under mere-ruby), and the native compiler hands it the
+# same three.
+RxIn = Struct.new(:src, :o)
+# (`class << C`: the compiler has a function of its own named singleton_class)
+class << C
+  prepend(Module.new do
+    def literal_regexp(src, o, enc)
+      RxIn.new(src.dup, o | (enc == "n" ? Regexp::NOENCODING : enc.empty? ? 0 : Regexp::FIXEDENCODING)).freeze
+    end
+  end)
+end
+
 def esc(s) = s.b.gsub(/[^\x20-\x7e]|["\\]/n) { |c| format("\\x%02X", c.ord) }
 
 def canon(v, ind)
@@ -43,7 +60,8 @@ def canon(v, ind)
   when Float then "f" + [v].pack("G").unpack1("H*")
   when Symbol then ":" + esc(v.to_s) + (v.encoding == Encoding::US_ASCII ? "" : "@" + v.encoding.name)
   when String then "\"" + esc(v) + "\"@" + v.encoding.name
-  when Regexp then "/" + esc(v.source) + "/" + v.options.to_s + "@" + v.encoding.name
+  when RxIn then "/" + esc(v.src) + "/" + v.o.to_s + "@" + v.src.encoding.name
+  when Regexp then "?Regexp"
   when Range then "(" + canon(v.begin, ind) + (v.exclude_end? ? "..." : "..") + canon(v.end, ind) + ")"
   when Rational then "(r " + canon(v.numerator, ind) + " " + canon(v.denominator, ind) + ")"
   when Complex then "(c " + canon(v.real, ind) + " " + canon(v.imaginary, ind) + ")"
@@ -59,6 +77,10 @@ def canon(v, ind)
       (4..12).each { |i| s << pad << ((5..7).include?(i) ? "\"" + esc(v[i]) + "\"" : canon(v[i], ind + 1)) << "\n" }
       v[13].each { |x| s << pad << " " << canon(x, ind + 2) << "\n" }
       s << " " * ind << ")"
+    # (toregexp's note for the VM -- the flags and which pieces are literal --
+    #  as its bytes: its encoding is whatever the join left it in)
+    elsif v[0] == :toregexp && v.last.is_a?(String)
+      "[" + v[0..-2].map { |x| canon(x, ind) }.join(" ") + " \"" + esc(v.last) + "\"]"
     else
       "[" + v.map { |x| canon(x, ind) }.join(" ") + "]"
     end

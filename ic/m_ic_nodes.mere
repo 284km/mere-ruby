@@ -891,8 +891,488 @@ let ic_node2 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (t
     (if pn_block_argument_expression cx n >= 0 then ic_node cx u (pn_block_argument_expression cx n) popped
      else (let _ = ic_insn cx u "getblockparamproxy" (ic_local_ref cx u "&") in ()))
   else if ty == pt_implicit () then ic_node cx u (pn_implicit_value cx n) popped
-  else ic_refuse (ic_type_name ty ++ " is not compiled yet");
+  else ic_node3 cx u n popped ty;
 
-let ic_static_value2 = fn cx -> fn (n: int) -> ic_refuse ("a literal " ++ ic_type_name (ic_ty cx n) ++ " is not compiled yet");
+// -- strings, hashes, ranges, patterns ----------------------------------------
+// `a << b` of two Strings in their encodings (rb_enc_compatible): the bytes
+// joined, in the first's encoding unless only the second can say what its
+// bytes are
+let ic_str_cat = fn (a: str * str) -> fn (b: str * str) ->
+  let (s1, e1) = a in
+  let (s2, e2) = b in
+  let enc = (if str_eq e1 e2 || str_len s2 == 0 then e1
+             else if str_len s1 == 0 then (if ic_ascii s2 then e1 else e2)
+             else if ic_ascii s2 then e1
+             else if ic_ascii s1 then e2 else e1) in
+  (s1 ++ s2, enc);
+let ic_str_pair = fn (v: Iv) -> match v with | IvStr (s, e) -> (s, e) | _ -> ("", "UTF-8");
+
+// RegularExpressionFlags, which a pattern, an interpolated one and the two
+// match-last-line nodes share: ignore_case 4, extended 8, multi_line 16,
+// once 32, euc_jp 64, ascii_8bit 128, windows_31j 256, utf_8 512,
+// forced_utf8 1024, forced_binary 2048, forced_us_ascii 4096
+let ic_rx = fn cx -> fn (n: int) -> fn (bit: int) -> bit_and (ic_flags cx n) bit != 0;
+// (Prism's #options: IGNORECASE 1, EXTENDED 2, MULTILINE 4, FIXEDENCODING 16
+//  when it names an encoding, NOENCODING 32 for n)
+let ic_rx_options = fn cx -> fn (n: int) ->
+  (if ic_rx cx n 4 then 1 else 0) + (if ic_rx cx n 8 then 2 else 0) + (if ic_rx cx n 16 then 4 else 0)
+  + (if ic_rx cx n 64 || ic_rx cx n 256 || ic_rx cx n 512 then 16 else 0) + (if ic_rx cx n 128 then 32 else 0);
+// parse_regexp_encoding: the encoding a pattern's n / u / e / s names (or
+// binary, when an escape forces it), "" when it names none
+let ic_rx_explicit_encoding = fn cx -> fn (n: int) ->
+  if ic_rx cx n 128 || ic_rx cx n 2048 then ic_binary ()
+  else if ic_rx cx n 512 then "UTF-8"
+  else if ic_rx cx n 64 then "EUC-JP"
+  else if ic_rx cx n 256 then "Windows-31J"
+  else "";
+// A Regexp literal: what its maker is handed -- the source in the encoding
+// the pattern names (or binary, which an escape in it can force:
+// parse_regexp_encoding reads no other forced encoding), and the options
+// with NOENCODING for n and FIXEDENCODING for u / e / s.
+let ic_regexp_literal = fn cx -> fn (src: str * str) -> fn (n: int) ->
+  let (s, e) = src in
+  let o = bit_and (ic_rx_options cx n) 7 in
+  if ic_rx cx n 128 then IvRx (s, o + 32, ic_binary ())
+  else if ic_rx cx n 512 then IvRx (s, o + 16, "UTF-8")
+  else if ic_rx cx n 64 then IvRx (s, o + 16, "EUC-JP")
+  else if ic_rx cx n 256 then IvRx (s, o + 16, "Windows-31J")
+  else if ic_rx cx n 2048 then IvRx (s, o, ic_binary ())
+  else IvRx (s, o, e);
+
+// the parts of an interpolated string, symbol, command, pattern
+let ic_parts = fn cx -> fn (n: int) ->
+  let ty = ic_ty cx n in
+  if ty == pt_interpolated_string () then ic_nlist cx (pn_interpolated_string_parts cx n) (pn_interpolated_string_parts_b cx n)
+  else if ty == pt_interpolated_symbol () then ic_nlist cx (pn_interpolated_symbol_parts cx n) (pn_interpolated_symbol_parts_b cx n)
+  else if ty == pt_interpolated_xstring () then ic_nlist cx (pn_interpolated_xstring_parts cx n) (pn_interpolated_xstring_parts_b cx n)
+  else if ty == pt_interpolated_regular_expression () then
+    ic_nlist cx (pn_interpolated_regular_expression_parts cx n) (pn_interpolated_regular_expression_parts_b cx n)
+  else ic_nlist cx (pn_interpolated_match_last_line_parts cx n) (pn_interpolated_match_last_line_parts_b cx n);
+let ic_stmts_list = fn cx -> fn (st: int) ->
+  if st < 0 then (Nil : int list) else ic_nlist cx (pn_statements_body cx st) (pn_statements_body_b cx st);
+
+// pm_static_literal_concat: the pieces of a static string, joined (in their
+// own encodings: the first one's is the text's unless a later piece brings
+// another)
+let rec ic_static_concat = fn cx -> fn (parts: int list) ->
+  let rec go = fn (ps: int list) -> fn (have: bool) -> fn (acc: str * str) ->
+    (match ps with
+     | Nil -> if have then acc else ("", "UTF-8")
+     | Cons (part, t) ->
+       (let ty = ic_ty cx part in
+        let v = (if ty == pt_string () then ic_str_pair (ic_string_value cx part)
+                 else if ty == pt_interpolated_string () then ic_static_concat cx (ic_parts cx part)
+                 else if ty == pt_embedded_statements () then ic_static_concat cx (ic_stmts_list cx (pn_embedded_statements_statements cx part))
+                 else ic_refuse (ic_type_name ty ++ " in a static string is not compiled yet")) in
+        go t true (if have then ic_str_cat acc v else v))) in
+  go parts false ("", "UTF-8");
+
+// (static values, the rest: a Hash, a Range, a Regexp)
+let rec ic_iv_eq = fn (a: Iv) -> fn (b: Iv) ->
+  match (a, b) with
+  | (IvNil, IvNil) -> true
+  | (IvTrue, IvTrue) -> true
+  | (IvFalse, IvFalse) -> true
+  | (IvInt x, IvInt y) -> x == y
+  | (IvBig x, IvBig y) -> str_eq x y
+  | (IvFlt x, IvFlt y) -> float_bits_hi x == float_bits_hi y && float_bits_lo x == float_bits_lo y
+  | (IvSym (x, _), IvSym (y, _)) -> str_eq x y
+  // (two Strings are one key when their bytes are and their encodings
+  //  agree -- or both are ASCII)
+  | (IvStr (x, e1), IvStr (y, e2)) -> str_eq x y && (str_eq e1 e2 || ic_ascii x)
+  | (IvArr xs, IvArr ys) -> ic_iv_list_eq xs ys
+  | _ -> false;
+let rec ic_iv_list_eq = fn (xs: Iv list) -> fn (ys: Iv list) ->
+  match (xs, ys) with
+  | (Nil, Nil) -> true
+  | (Cons (x, t), Cons (y, s)) -> if ic_iv_eq x y then ic_iv_list_eq t s else false
+  | _ -> false;
+// a pair put in a literal Hash: a key that is there already keeps its place
+// and takes the new value
+let rec ic_hash_put = fn (ps: (Iv * Iv) list) -> fn (k: Iv) -> fn (v: Iv) ->
+  match ps with
+  | Nil -> Cons ((k, v), Nil)
+  | Cons ((k0, v0), t) -> if ic_iv_eq k0 k then Cons ((k0, v), t) else Cons ((k0, v0), ic_hash_put t k v);
+let ic_static_hash = fn cx -> fn (els: int list) ->
+  let rec go = fn (xs: int list) -> fn (acc: (Iv * Iv) list) ->
+    (match xs with
+     | Nil -> acc
+     | Cons (e, t) -> go t (ic_hash_put acc (ic_static_value cx (pn_assoc_key cx e)) (ic_static_value cx (pn_assoc_value cx e)))) in
+  IvHsh (go els Nil);
+let ic_static_value2 = fn cx -> fn (n: int) ->
+  let ty = ic_ty cx n in
+  if ty == pt_hash () then ic_static_hash cx (ic_nlist cx (pn_hash_elements cx n) (pn_hash_elements_b cx n))
+  else if ty == pt_range () then
+    (let lo = pn_range_left cx n in
+     let hi = pn_range_right cx n in
+     IvRng ((if lo >= 0 then ic_static_value cx lo else IvNil), (if hi >= 0 then ic_static_value cx hi else IvNil), pq_range_exclude_end cx n))
+  else if ty == pt_regular_expression () then ic_regexp_literal cx (ic_str cx (pn_regular_expression_unescaped cx n), ic_enc cx) n
+  else ic_refuse ("a literal " ++ ic_type_name ty ++ " is not compiled yet");
+
+// pm_interpolated_node_compile: adjacent literal pieces are one, the first at
+// the string's own place, a later one at its part's end (an interpolation of
+// a string alone is a literal piece, at the part's start); a lone
+// interpolation has an empty string before it, and pieces that are all
+// literal are one string pushed as it is. Answers how many pieces were
+// pushed and which they are: L its own text, C computed.
+let ic_dstr_parts = fn cx -> fn (u: int) -> fn (n: int) -> fn (regexp: bool) ->
+  let parts = ic_parts cx n in
+  let nparts = ic_llen parts in
+  let is_str = ic_ty cx n == pt_interpolated_string () in
+  // (a literal piece of an interpolated pattern is in the pattern's named
+  //  encoding when it names one, else as a String literal is)
+  let piece = fn (p: int) ->
+    (let v = ic_str_pair (ic_string_value cx p) in
+     if regexp then
+       (let e = ic_rx_explicit_encoding cx n in
+        if str_len e > 0 then (ic_str cx (pn_string_unescaped cx p), e) else v)
+     else v) in
+  let push = fn (cur: str * str) -> fn (line: int) -> fn (node: int) -> fn (name: str) ->
+    (let (s, e) = cur in
+     let _ = ic_at cx u line node in
+     ic_i1 cx u name (OVal (IvStr (s, e)))) in
+  let rec go = fn (ps: int list) -> fn (i: int) -> fn (count: int) -> fn (kinds: str) -> fn (have: bool) -> fn (cur: str * str) ->
+               fn (cl: int) -> fn (cn: int) -> fn (interpolated: bool) ->
+    (match ps with
+     | Nil ->
+       if have then
+         (let _ = push cur cl cn (if count > 0 || (is_str && pq_interpolated_string_frozen cx n) then "putobject"
+                                  else if (is_str && pq_interpolated_string_mutable cx n) || interpolated then "putstring"
+                                  else "putchilledstring") in
+          (count + 1, kinds ++ "L"))
+       else (count, kinds)
+     | Cons (part, t) ->
+       (let ty = ic_ty cx part in
+        if ty == pt_string () then
+          (if have then go t (i + 1) count kinds true (ic_str_cat cur (piece part)) cl cn interpolated
+           else go t (i + 1) count kinds true (piece part) (if i != 0 then ic_end_line cx part else cl) (if i != 0 then ic_nid cx part else cn) interpolated)
+        else
+          (let st = (if ty == pt_embedded_statements () then pn_embedded_statements_statements cx part else 0 - 1) in
+           let lone = (if st >= 0 && pn_statements_body_b cx st == 1 then ic_li cx (pn_statements_body cx st) 0 else 0 - 1) in
+           if lone >= 0 && ic_ty cx lone == pt_string () then
+             (if have then go t (i + 1) count kinds true (ic_str_cat cur (piece lone)) cl cn true
+              else go t (i + 1) count kinds true (piece lone) (ic_start_line cx part) (ic_nid cx part) true)
+           else
+             // (a lone interpolation starts from an empty String in the
+             //  source's encoding; a pattern's in the one its n / u / e / s
+             //  names, binary in a US-ASCII source: pm_compile_interpolated's
+             //  parts_size == 1)
+             (let (have2, cur2) =
+                (if (if have then false else true) && nparts == 1 then
+                   (let enc0 = ic_enc cx in
+                    let enc = (if regexp then
+                                 (let x = ic_rx_explicit_encoding cx n in
+                                  if str_len x > 0 then x else if str_eq enc0 "US-ASCII" then ic_binary () else enc0)
+                               else enc0) in
+                    (true, ("", enc)))
+                 else (have, cur)) in
+              let (count2, kinds2) =
+                (if have2 then (let _ = push cur2 cl cn "putobject" in (count + 1, kinds ++ "L")) else (count, kinds)) in
+              let _ =
+                (if ty == pt_embedded_statements () then
+                   // (`#{}`: a nil no node stands for -- PUSH_SYNTHETIC_PUTNIL)
+                   (if st < 0 || pn_statements_body_b cx st == 0 then
+                      (let _ = ic_at cx u (ic_start_line cx part) (0 - 1) in ic_i0 cx u "putnil")
+                    else ic_node cx u st false)
+                 else if ty == pt_interpolated_string () then ic_node cx u part false
+                 // ("#@a", "#$g", "#@@c": the variable read)
+                 else if ty == pt_embedded_variable () then ic_node cx u (pn_embedded_variable_variable cx part) false
+                 else ic_refuse (ic_type_name ty ++ " in a string is not compiled yet")) in
+              let _ = ic_here cx u part in
+              let _ = ic_i0 cx u "dup" in
+              let _ = ic_i1 cx u "objtostring" (ic_cd "to_s" 20 0) in
+              let _ = ic_i0 cx u "anytostring" in
+              go t (i + 1) (count2 + 1) (kinds2 ++ "C") false ("", "UTF-8") cl cn true)))) in
+  go parts 0 0 "" false ("", "UTF-8") (ic_start_line cx n) (ic_nid cx n) false;
+
+let ic_dstr = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  if ic_ty cx n == pt_interpolated_string () && ic_static_literal cx n then
+    // (a static one -- `"#{"a"}"` -- is its string, at its own place)
+    (if popped then ()
+     else
+       (let (s, e) = ic_static_concat cx (ic_parts cx n) in
+        let _ = ic_here cx u n in
+        ic_i1 cx u (if pq_interpolated_string_frozen cx n then "putobject"
+                    else if pq_interpolated_string_mutable cx n then "putstring" else "putchilledstring") (OVal (IvStr (s, e)))))
+  else
+    (let (count, _) = ic_dstr_parts cx u n false in
+     let _ = ic_here cx u n in
+     let _ = (if count > 1 then ic_in cx u "concatstrings" count else ()) in
+     ic_pop_if cx u popped);
+
+// pm_compile_regexp_dynamic: the pieces as an interpolated string's, and
+// toregexp of them with the literal's options. (`n` under the node id
+// `nid`: in a `once` sequence the pattern's instructions are the scope's.)
+let ic_dregexp = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let (count, kinds) = ic_dstr_parts cx u n true in
+  let _ = ic_here cx u n in
+  let ins = ic_insn cx u "toregexp" (Cons (ONum (bit_and (ic_rx_options cx n) 255), Cons (ONum count, Nil))) in
+  // (for the VM: the literal's flags as written and which pieces are its own
+  //  text, L, and which were computed, C -- what decides the pattern's
+  //  encoding and whose clash is whose error)
+  let fl = (if ic_rx cx n 4 then "i" else "") ++ (if ic_rx cx n 8 then "x" else "") ++ (if ic_rx cx n 16 then "m" else "")
+           ++ (if ic_rx cx n 128 then "n" else "") ++ (if ic_rx cx n 512 then "u" else "") ++ (if ic_rx cx n 64 then "e" else "")
+           ++ (if ic_rx cx n 256 then "s" else "") in
+  let _ = ic_set_vmx cx ins (Cons (OVal (IvStr (fl ++ "|" ++ kinds, "")), Nil)) in
+  ic_pop_if cx u popped;
+
+// pm_compile_hash_elements: runs of pairs pushed and made a hash (newhash,
+// then core#hash_merge_ptr onto it), a leading static run -- or one of 0x800
+// or more -- as a literal hash, and each ** merged in with
+// core#hash_merge_kwd (a call's lone ** is passed as it is)
 let ic_hash_elements = fn cx -> fn (u: int) -> fn (n: int) -> fn (off: int) -> fn (cnt: int) -> fn (argument: bool) ->
-  ic_refuse "a hash is not compiled yet";
+  let line = ic_start_line cx n in
+  let nid = ic_nid cx n in
+  let at = fn (x: unit) -> ic_at cx u line nid in
+  // (the pairs pushed and not yet in the hash are built aside: `anchor`)
+  let flush = fn (stack: int) -> fn (first: bool) -> fn (anchor: int) ->
+    if stack == 0 then first
+    else if first then
+      (let _ = ic_append cx u anchor in
+       let _ = at () in
+       let _ = ic_in cx u "newhash" stack in
+       false)
+    else
+      (let _ = at () in
+       let _ = ic_in cx u "putspecialobject" 1 in
+       let _ = ic_i0 cx u "swap" in
+       let _ = ic_append cx u anchor in
+       let _ = at () in
+       let _ = ic_push_send cx u "core#hash_merge_ptr" (stack + 1) in
+       false) in
+  let rec go = fn (index: int) -> fn (stack: int) -> fn (first: bool) -> fn (static_run: bool) -> fn (anchor: int) ->
+    if index >= cnt then (let _ = flush stack first anchor in ())
+    else
+      (let e = ic_li cx off index in
+       if ic_ty cx e == pt_assoc () then
+         // (MIN_TMP_HASH 0x800, MAX_HASH_STACK 0x100)
+         (let cand = ic_static_literal cx e && (((if static_run then false else true) && index + 2048 < cnt) || (first && stack == 0)) in
+          let rec run = fn (c: int) -> if index + c < cnt && ic_static_literal cx (ic_li cx off (index + c)) then run (c + 1) else c in
+          let count = (if cand then run 1 else 0) in
+          if cand && ((first && stack == 0) || count >= 2048) then
+            (let h = ic_static_hash cx (ic_nlist cx (off + index) count) in
+             let f1 = flush stack first anchor in
+             let _ = at () in
+             let _ = (if f1 then ic_i1 cx u "duphash" (OVal h)
+                      else
+                        (let _ = ic_in cx u "putspecialobject" 1 in
+                         let _ = ic_i0 cx u "swap" in
+                         let _ = ic_i1 cx u "putobject" (OVal h) in
+                         ic_push_send cx u "core#hash_merge_kwd" 2)) in
+             go (index + count) 0 false static_run (ic_list_new cx))
+          else
+            (let saved = ic_capture_begin cx u in
+             let _ = ic_node cx u e false in
+             let got = ic_capture_end cx u saved in
+             let _ = ic_list_append cx anchor got in
+             let sr = (if cand then true else (if ic_static_literal cx e && (((if static_run then false else true) && index + 2048 < cnt) || (first && stack == 0)) then static_run else false)) in
+             if stack + 2 >= 256 then go (index + 1) 0 (flush (stack + 2) first anchor) sr (ic_list_new cx)
+             else go (index + 1) (stack + 2) first sr anchor))
+       else
+         (let f0 = flush stack first anchor in
+          let v = pn_assoc_splat_value cx e in
+          let empty = v >= 0 && ((ic_ty cx v == pt_hash () && pn_hash_elements_b cx v == 0) || ic_ty cx v == pt_nil ()) in
+          let first_el = f0 in
+          let only = first_el && index == cnt - 1 in
+          let _ =
+            (if empty then
+               (let _ = at () in
+                if only && argument then ic_i0 cx u "putnil" else if first_el then ic_in cx u "newhash" 0 else ())
+             else if only && argument then ic_node cx u e false
+             else
+               (let _ = at () in
+                let _ = ic_in cx u "putspecialobject" 1 in
+                let _ = (if first_el then ic_in cx u "newhash" 0 else ic_i0 cx u "swap") in
+                let _ = ic_node cx u e false in
+                let _ = at () in
+                ic_push_send cx u "core#hash_merge_kwd" 2)) in
+          go (index + 1) 0 false false (ic_list_new cx))) in
+  go 0 0 true false (ic_list_new cx);
+
+// PM_HASH_NODE: a static literal is newhash 0 or duphash; popped, only what
+// the elements do; otherwise pm_compile_hash_elements
+let ic_hash_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let off = pn_hash_elements cx n in
+  let cnt = pn_hash_elements_b cx n in
+  if ic_static_literal cx n then
+    (if popped then () else if cnt == 0 then ic_in cx u "newhash" 0 else ic_i1 cx u "duphash" (OVal (ic_static_value cx n)))
+  else if popped then list_iter (ic_nlist cx off cnt) (fn (e: int) -> ic_node cx u e true)
+  else ic_hash_elements cx u n off cnt false;
+
+let ic_range_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let excl = pq_range_exclude_end cx n in
+  let lo = pn_range_left cx n in
+  let hi = pn_range_right cx n in
+  // (pm_optimizable_range_item_p: no bound, an Integer or a written nil)
+  let lit = fn (e: int) -> e < 0 || ic_ty cx e == pt_integer () || ic_ty cx e == pt_nil () in
+  let val = fn (e: int) -> if e >= 0 && ic_ty cx e == pt_integer () then ic_static_value cx e else IvNil in
+  if lit lo && lit hi then (if popped then () else ic_i1 cx u "putobject" (OVal (IvRng (val lo, val hi, excl))))
+  else
+    // (an absent bound's nil is the range node's own instruction; a Range
+    //  nobody reads is only what its bounds do)
+    (let side = fn (e: int) ->
+       if e >= 0 then ic_node cx u e popped
+       else if popped then () else (let _ = ic_here cx u n in ic_i0 cx u "putnil") in
+     let _ = side lo in
+     let _ = side hi in
+     if popped then () else (let _ = ic_here cx u n in ic_in cx u "newrange" (if excl then 1 else 0)));
+
+let ic_logical = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let is_and = ic_ty cx n == pt_and () in
+  let l_end = ic_new_label cx u in
+  let _ = ic_node cx u (if is_and then pn_and_left cx n else pn_or_left cx n) false in
+  let _ = ic_here cx u n in
+  let _ = ic_dup_unless cx u popped in
+  let _ = ic_il cx u (if is_and then "branchunless" else "branchif") l_end in
+  let _ = (if popped then () else ic_i0 cx u "pop") in
+  let _ = ic_node cx u (if is_and then pn_and_right cx n else pn_or_right cx n) popped in
+  ic_emit_label cx u l_end;
+
+// -- constants, definitions -----------------------------------------------------
+// pm_compile_constant_read: at the name, of the node it is read for
+let ic_constant_read = fn cx -> fn (u: int) -> fn (name: str) -> fn (line: int) -> fn (n: int) ->
+  let _ = ic_at cx u line (ic_nid cx n) in
+  ic_i1 cx u "opt_getconstant_path" (OIc (Cons (ic_sym cx name, Nil)));
+// a constant path made of names alone -- `X`, `A::B`, `::C` -- is one
+// opt_getconstant_path over its segments: (is it one, the segments)
+let rec ic_constant_path = fn cx -> fn (n: int) ->
+  let ty = ic_ty cx n in
+  if ty == pt_constant_read () then (true, Cons (ic_sym cx (ic_cname cx (pn_constant_read_name cx n)), Nil))
+  else if ty == pt_constant_path () then
+    (let nm = ic_sym cx (ic_cname cx (pn_constant_path_name cx n)) in
+     if pn_constant_path_parent cx n < 0 then (true, Cons (IvSym ("", "US-ASCII"), Cons (nm, Nil)))
+     else
+       (let (ok, segs) = ic_constant_path cx (pn_constant_path_parent cx n) in
+        if ok then (true, ic_cat segs (Cons (nm, Nil))) else (false, Nil)))
+  else (false, (Nil : Iv list));
+// (pm_compile_constant_path: what the path starts from -- nothing when it
+//  starts from a name -- into `prefix`, then a getconstant a segment into
+//  `body`)
+let rec ic_constant_path_split = fn cx -> fn (u: int) -> fn (n: int) -> fn (prefix: int) -> fn (body: int) ->
+  let ty = ic_ty cx n in
+  let saved = ic_capture_begin cx u in
+  if ty == pt_constant_read () then
+    (let _ = ic_here cx u n in
+     let _ = ic_i1 cx u "putobject" (OVal IvTrue) in
+     let _ = ic_i1 cx u "getconstant" (ic_osym cx (ic_cname cx (pn_constant_read_name cx n))) in
+     ic_list_append cx body (ic_capture_end cx u saved))
+  else if ty == pt_constant_path () then
+    (let nm = ic_osym cx (ic_cname cx (pn_constant_path_name cx n)) in
+     if pn_constant_path_parent cx n < 0 then
+       (let _ = ic_here cx u n in
+        let _ = ic_i0 cx u "pop" in
+        let _ = ic_i1 cx u "putobject" (OVal (IvCls "Object")) in
+        let _ = ic_i1 cx u "putobject" (OVal IvTrue) in
+        let _ = ic_i1 cx u "getconstant" nm in
+        ic_list_append cx body (ic_capture_end cx u saved))
+     else
+       (let _ = ic_capture_end cx u saved in
+        let _ = ic_constant_path_split cx u (pn_constant_path_parent cx n) prefix body in
+        let saved2 = ic_capture_begin cx u in
+        let _ = ic_here cx u n in
+        let _ = ic_i1 cx u "putobject" (OVal IvFalse) in
+        let _ = ic_i1 cx u "getconstant" nm in
+        ic_list_append cx body (ic_capture_end cx u saved2)))
+  else
+    (let _ = ic_node cx u n false in
+     ic_list_append cx prefix (ic_capture_end cx u saved));
+
+let ic_define = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
+  let sl = ic_start_line cx n in
+  let name = ic_cname cx (pn_def_name cx n) in
+  let child = ic_unit_new cx 2 name (ic_u_path cx u) (ic_u_abs_path cx u) sl
+                (ic_cnames cx (pn_def_locals cx n) (pn_def_locals_b cx n)) u (ic_loc4 cx n) (ic_nid cx n) in
+  let _ = ic_params cx child (pn_def_parameters cx n) in
+  let _ = ic_u_set cx child 18 1 in
+  // (iseq_location_setup: a method named initialize takes a block)
+  let _ = (if str_eq name "initialize" then ic_u_set_pflag cx child 4 else ()) in
+  let _ = ic_add_child cx u child in
+  let body = pn_def_body cx n in
+  let is_st = body >= 0 && ic_ty cx body == pt_statements () in
+  let first = (if is_st && pn_statements_body_b cx body > 0 then ic_li cx (pn_statements_body cx body) 0 else 0 - 1) in
+  let _ = ic_opt_defaults cx child in
+  let _ = ic_param_prologue cx child sl 0 in
+  let _ = ic_at cx child (if first >= 0 then ic_start_line cx first else sl) (ic_nid cx n) in
+  let _ = ic_event cx child (ic_ev_call ()) in
+  let _ = (if body < 0 then (let _ = ic_at cx child (ic_u_line cx child) 0 in ic_i0 cx child "putnil")
+           else ic_node cx child body false) in
+  let _ = ic_event cx child (ic_ev_return ()) in
+  let _ = ic_u_set cx child 11 (ic_end_line cx n) in
+  let _ = ic_at cx child (ic_end_line cx n) (ic_nid cx n) in
+  let _ = ic_i0 cx child "leave" in
+  let _ = ic_finish cx child in
+  let _ = (if pn_def_receiver cx n >= 0 then
+             (let _ = ic_node cx u (pn_def_receiver cx n) false in
+              let _ = ic_here cx u n in
+              ic_i2 cx u "definesmethod" (ic_osym cx name) (OSeq child))
+           else
+             (let _ = ic_here cx u n in
+              ic_i2 cx u "definemethod" (ic_osym cx name) (OSeq child))) in
+  if popped then () else ic_i1 cx u "putobject" (ic_osym cx name);
+
+let ic_node3 = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) -> fn (ty: int) ->
+  if ty == pt_def () then ic_define cx u n popped
+  else if ty == pt_constant_read () then
+    (let _ = ic_constant_read cx u (ic_cname cx (pn_constant_read_name cx n)) (ic_start_line cx n) n in
+     ic_pop_if cx u popped)
+  else if ty == pt_constant_path () then
+    (let (ok, segs) = ic_constant_path cx n in
+     let _ =
+       (if ok then ic_i1 cx u "opt_getconstant_path" (OIc segs)
+        else
+          (let prefix = ic_list_new cx in
+           let body = ic_list_new cx in
+           let _ = ic_constant_path_split cx u n prefix body in
+           let _ = ic_here cx u n in
+           let _ = (if ic_list_empty cx prefix then ic_i0 cx u "putnil" else ic_append cx u prefix) in
+           ic_append cx u body)) in
+     let _ = ic_here cx u n in
+     ic_pop_if cx u popped)
+  else if ty == pt_interpolated_string () then ic_dstr cx u n popped
+  else if ty == pt_hash () then ic_hash_node cx u n popped
+  // (PM_KEYWORD_HASH_NODE as a value -- `return **h`: its elements made a
+  //  Hash, never a literal one)
+  else if ty == pt_keyword_hash () then
+    (let _ = ic_hash_elements cx u n (pn_keyword_hash_elements cx n) (pn_keyword_hash_elements_b cx n) false in
+     ic_pop_if cx u popped)
+  else if ty == pt_range () then ic_range_node cx u n popped
+  else if ty == pt_and () || ty == pt_or () then ic_logical cx u n popped
+  else if ty == pt_regular_expression () then
+    (if popped then () else ic_i1 cx u "putobject" (OVal (ic_regexp_literal cx (ic_str cx (pn_regular_expression_unescaped cx n), ic_enc cx) n)))
+  else if ty == pt_interpolated_regular_expression () then
+    (if ic_rx cx n 32 then ic_refuse "a /o pattern is not compiled yet"
+     // (every piece a literal: the Regexp itself)
+     else if ic_static_literal cx n then
+       (if popped then () else ic_i1 cx u "putobject" (OVal (ic_regexp_literal cx (ic_static_concat cx (ic_parts cx n)) n)))
+     else ic_dregexp cx u n popped)
+  else if ty == pt_interpolated_symbol () then
+    (let (count, _) = ic_dstr_parts cx u n false in
+     let _ = ic_here cx u n in
+     let _ = (if count > 1 then ic_in cx u "concatstrings" count else ()) in
+     let _ = ic_here cx u n in
+     let _ = ic_i0 cx u "intern" in
+     ic_pop_if cx u popped)
+  else if ty == pt_xstring () then
+    // (`x`: self.`("x")
+    (let _ = ic_i0 cx u "putself" in
+     let _ = ic_i1 cx u "putobject" (OVal (IvStr (ic_str cx (pn_xstring_unescaped cx n), ic_enc cx))) in
+     let _ = ic_i2 cx u "send" (ic_cd "`" 20 1) (OSeq (0 - 1)) in
+     ic_pop_if cx u popped)
+  else if ty == pt_interpolated_xstring () then
+    (let _ = ic_i0 cx u "putself" in
+     let (count, _) = ic_dstr_parts cx u n false in
+     let _ = ic_here cx u n in
+     let _ = (if count > 1 then ic_in cx u "concatstrings" count else ()) in
+     let _ = ic_here cx u n in
+     let _ = ic_i2 cx u "send" (ic_cd "`" 20 1) (OSeq (0 - 1)) in
+     ic_pop_if cx u popped)
+  else if ty == pt_lambda () then
+    (let ps = pn_lambda_parameters cx n in
+     let ol = pn_lambda_operator_loc cx n + pn_lambda_operator_loc_b cx n in
+     let (l0, c0) = (if ps >= 0 then (ic_start_line cx ps, ic_start_col cx ps) else (ic_line_of cx ol, ic_col_of cx ol)) in
+     let blk = ic_block_unit cx u n (ic_line_of cx (pn_lambda_opening_loc cx n)) l0 c0 in
+     let _ = ic_here cx u n in
+     let _ = ic_in cx u "putspecialobject" 1 in
+     let _ = ic_i2 cx u "send" (ic_cd "lambda" 4 0) (OSeq blk) in
+     ic_pop_if cx u popped)
+  else ic_refuse (ic_type_name ty ++ " is not compiled yet");
