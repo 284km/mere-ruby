@@ -9,7 +9,7 @@
 # is its place in `nodes:` (from 1) and its fields are serialized in the
 # order they are listed. For `CallNode` with the field `receiver` this writes
 #
-#   pt_call ()                 the type's number
+#   px_call ()                 the type's number
 #   pn_call_receiver cx n      the field's first word
 #   pn_call_receiver_b cx n    its second (a list's or a location's length)
 #   pq_call_safe_navigation cx n    a flag of the node's
@@ -67,7 +67,7 @@ puts "  | _ -> \"?\";"
 puts ""
 nodes.each_with_index do |node, i|
   s = short.(node.fetch("name"))
-  puts "let pt_#{s} = fn (u: unit) -> #{i + 1};"
+  puts "let px_#{s} = fn (u: unit) -> #{i + 1};"
 end
 puts ""
 nodes.each do |node|

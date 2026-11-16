@@ -502,6 +502,8 @@ import "m_numeric.mere";
 import "m_unicode.mere";
 import "m_strutil.mere";
 import "m_prism_load.mere";
+// the ISeq compiler in Mere (note 552): ic/ -- read through ic_vm_native
+import "ic/m_ic_nodes.mere";
 // ---- evaluator + driver (one mutual recursion) ---------------------------
 // `env` is a Map[str, Val] of local variables (including "self" inside a
 // method). `world` is the global object model, a 4-tuple of Maps bundled
@@ -63847,7 +63849,14 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
        (let _ = map_set cli_opt "vmbusy" "1" in
         let line9 = cur_line () in
         let file9 = cur_file () in
-        let r = try_or_msg (fn (u: unit) ->
+        // (the native compiler first; what it does not take -- and a file
+        //  under Coverage, which it does not count -- the Ruby one)
+        let nat = (if vec_get cov_st 0 == 0 && (if str_eq (env_get "MERE_RUBY_IC") "ruby" then false else true)
+                   then ic_vm_native env world blk src path label else VNil) in
+        let r = (match nat with
+                 | VArr _ -> nat
+                 | _ ->
+                try_or_msg (fn (u: unit) ->
                   invoke_val_c env world blk (VClass "RubyVM::InstructionSequence") "__vm_file"
                     (Cons (mkstr src, Cons (mkstr path, Cons (mkstr label, Nil)))) false)
                   (fn (m: str) ->
@@ -63857,7 +63866,7 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
                       let _ = (if map_has ivars9 "$exc" then map_delete ivars9 "$exc" else ()) in
                       let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
                       let _ = (if map_has flow_sig "k" then map_delete flow_sig "k" else ()) in
-                      mkstr "the compiler failed")) in
+                      mkstr "the compiler failed"))) in
         let _ = map_delete cli_opt "vmbusy" in
         let _ = cur_line_set line9 in
         let _ = cur_file_set file9 in
@@ -63874,6 +63883,88 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
            else refused why)
         | VStr h -> refused (sget h)
         | _ -> refused "the compiler answered nothing"))
+// The native compiler's sequences for a file run on the VM -- the Array
+// RubyVM::InstructionSequence.__vm_file answers, built in Mere from libprism's
+// serialized tree (ic/, note 552) -- or VNil when it does not take the file:
+// a syntax error, a source in an encoding the VM does not take, a node it
+// refuses, or any failure of its own. The caller then asks the Ruby compiler.
+and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: str) -> fn (label: str) ->
+  let ok = vec_new () in
+  let _ = vec_push ok 0 in
+  let res =
+    region ICV {
+      // (Prism's options as its FFI backend packs them: the file path, the
+      //  first line, no encoding, the flags all 0, no scopes)
+      let ob = vec_new () in
+      let u32 = fn (n: int) ->
+        (let _ = vec_push ob (n % 256) in let _ = vec_push ob ((n / 256) % 256) in
+         let _ = vec_push ob ((n / 65536) % 256) in vec_push ob ((n / 16777216) % 256)) in
+      let pb = bytes_of_str path in
+      let _ = u32 (bytes_len pb) in
+      let rec pbytes = fn (i: int) -> if i >= bytes_len pb then () else (let _ = vec_push ob (bytes_get pb i) in pbytes (i + 1)) in
+      let _ = pbytes 0 in
+      let _ = u32 1 in
+      let _ = u32 0 in
+      let rec zeros = fn (k: int) -> if k <= 0 then () else (let _ = vec_push ob 0 in zeros (k - 1)) in
+      let _ = zeros 7 in
+      let _ = u32 0 in
+      let sb = bytes_of_str src in
+      let ser = prism_ser 0 sb (bytes_of_vec ob) in
+      let meta = vec_new () in
+      let _ = zeros 0 in
+      let rec fill = fn (i: int) -> if i <= 0 then () else (let _ = vec_push meta 0 in fill (i - 1)) in
+      let _ = fill 8 in
+      let tr = (ser, sb, vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), meta) in
+      let es = (vec_new (), vec_new (), vec_new (), vec_new (), vec_new ()) in
+      let us = (vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (),
+                vec_new (), vec_new (), vec_new (), vec_new ()) in
+      let cx = (tr, es, us) in
+      let why = ic_tree_load tr in
+      if (if str_eq why "" then false else true) || vec_get meta 3 > 0 then VNil
+      else
+        (let enc = ic_enc cx in
+         if (if str_eq enc "UTF-8" || str_eq enc "US-ASCII" then false else true) then VNil
+         else
+           try_or_msg (fn (x: unit) ->
+                         (let iv = ic_to_a cx (ic_compile cx path label) in
+                          let v = ic_to_val env world blk iv in
+                          let _ = vec_set ok 0 1 in
+                          v))
+                      (fn (m: str) -> VNil))
+    } in
+  if vec_get ok 0 == 1 then res else VNil
+// (the native compiler's values as the interpreter's: a literal frozen, as
+//  the Ruby compiler freezes what it puts in an instruction)
+and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
+  let frozen = fn (x: Val) -> invoke_val_c env world blk x "freeze" Nil false in
+  match v with
+  | IvNil -> VNil
+  | IvTrue -> VBool true
+  | IvFalse -> VBool false
+  | IvInt k -> VInt k
+  | IvBig s -> norm_big s
+  | IvFlt f -> VFlt f
+  | IvSym (s, e) ->
+    (let _ = (if str_eq e "US-ASCII" || str_eq e "UTF-8" || map_has sym_enc s then () else map_set sym_enc s e) in VSym s)
+  | IvStr (s, e) ->
+    (let x = mkstr_e s (if str_len e == 0 then "UTF-8" else e) in
+     let _ = (match x with VStr h -> sfrozen_set h | _ -> ()) in
+     x)
+  | IvArr xs -> arr_new (ic_map (fn (y: Iv) -> ic_to_val env world blk y) xs)
+  | IvHsh ps ->
+    (let rec flat = fn (xs: (Iv * Iv) list) ->
+       (match xs with
+        | Nil -> (Nil : Val list)
+        | Cons ((k, x), t) -> Cons (ic_to_val env world blk k, Cons (ic_to_val env world blk x, flat t))) in
+     frozen (mkhash (flat ps)))
+  | IvRx (s, o, e) ->
+    frozen (invoke_val_c env world blk (VClass "Regexp") "__rx_new" (Cons (mkstr_e s e, Cons (VInt o, Nil))) false)
+  | IvRng (a, b, excl) -> VRange (ic_to_val env world blk a, ic_to_val env world blk b, excl)
+  | IvRat (a, b) ->
+    (let sv = fn (x: Iv) -> (match x with IvInt k -> str_of_int k | IvBig t -> t | _ -> "0") in VRat (sv a, sv b))
+  | IvCpx (a, b) -> VCpx (ic_to_val env world blk a, ic_to_val env world blk b)
+  | IvCls c -> VClass c
+  | IvEnc e -> invoke_val_c env world blk (VClass "Encoding") "find" (Cons (mkstr e, Nil)) false
 // where a body the VM runs was written -- (path, line) -- and ("", 0) for a
 // body that is not one
 and vm_body_pos = fn (body: Stmt list) ->
