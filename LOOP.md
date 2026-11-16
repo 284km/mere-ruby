@@ -5097,7 +5097,7 @@ the reference.
   exception, a fragment, a SAX handler called back from libxml2) and prints
   the same on both sides. mere-ruby pointed at the reference's gem
   directory fails.
-- Local, O2: gates dead_defs, dup_defs, gc_roots pass; bracket depth 883 of
+- Local, O2: gates dead_defs, dup_defs, gc_roots pass; bracket depth 888 of
   1024; capi_check as before.
 
 **Measured here** (this machine, the interpreter's side; CI's shards are the
