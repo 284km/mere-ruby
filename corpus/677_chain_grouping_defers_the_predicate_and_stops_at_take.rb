@@ -24,6 +24,15 @@ begin
 rescue => error
   p [error.class, error.message]
 end
+
+class YieldResultEnumerable
+  include Enumerable
+  def each
+    [1, 2, 3].each { |value| break if yield(value) }
+  end
+end
+p YieldResultEnumerable.new.chunk_while { |a, b| a == b }.to_a
+p YieldResultEnumerable.new.slice_when { |a, b| a != b }.to_a
 begin
   [].chain([]).slice_when(:unexpected) { true }
 rescue => error
