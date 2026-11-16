@@ -138,3 +138,22 @@ class Mix
 end
 m = Mix.new
 p m.both(1, [2]), m.cls(9), Mix.class_variable_get(:@@c), m.under(1, 2), m.instance_variables
+
+# an implicit `x` and an explicit `x!`
+class Bang86
+  attr_reader :x
+  def initialize = @x = :reader
+  def read = x
+  def x! = :bang
+end
+o = Bang86.new
+p o.read, o.x!, o.read, o.x!
+class Bang86b
+  attr_reader :y
+  alias_method :x!, :y
+  def initialize = (@y = :y; @x = :xval)
+  def x = @x
+  def read = x
+end
+o2 = Bang86b.new
+p o2.x!, o2.read, o2.x!, o2.read

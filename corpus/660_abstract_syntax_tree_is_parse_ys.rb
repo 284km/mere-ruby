@@ -109,3 +109,44 @@ show("m 1 do\n  a\n", error_tolerant: true)
 show("x = 1 2\ny\n", error_tolerant: true)
 show("module Z\n  class Foo\n    foo.\n  end\n\n  def bar\n  end\nend\nz\n", error_tolerant: true)
 show("def m\n  if\nend\n", error_tolerant: true)
+
+# the literals a tree holds are made by the parser: a program that redefines
+# Regexp.new, Rational, Complex or Encoding.find (and parses inside it) does
+# not reach them; its Strings and Regexps are frozen; an empty program has a
+# source of its own
+# literals are not built by redefinable methods, and a nested parse does not disturb the outer one
+class Regexp
+  class << self
+    alias_method :orig_new_86, :new
+    def new(*a)
+      AST.parse("99")
+      :intercepted
+    end
+  end
+end
+def Rational(*) = :intercepted
+def Complex(*) = :intercepted
+class Encoding; def self.find(*) = :intercepted; end
+n = AST.parse("[/abc/i, 2r, 1.5r, 3i, 2ri, __ENCODING__, /x\#{1}y/]")
+pp n
+p n.children[2].children[0].children
+p AST.parse("2r").children[2].children, AST.parse("3i").children[2].children, AST.parse("1.5r").children[2].children
+p AST.parse("__ENCODING__").children[2].children
+p AST.parse("/abc/").children[2].children[0], AST.parse("/abc/").children[2].children[0].frozen?
+class Regexp
+  class << self
+    remove_method :new
+    alias_method :new, :orig_new_86
+  end
+end
+# the String and Regexp a node holds are frozen
+s = AST.parse('"hi"').children[2].children[0]
+p s, s.frozen?, (s.replace("changed") rescue $!.class)
+d = AST.parse('"a#{1}b"').children[2].children
+p d[0], d[0].frozen?
+r = AST.parse('/abc/').children[2].children[0]
+p r.frozen?, (r.instance_variable_set(:@x, 1) rescue $!.class)
+# an empty program
+e = AST.parse("", keep_script_lines: true)
+p e.script_lines, e.source
+p AST.parse("\n", keep_script_lines: true).source, AST.parse("x", keep_script_lines: true).source
