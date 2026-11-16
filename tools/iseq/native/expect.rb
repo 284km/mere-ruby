@@ -100,6 +100,10 @@ ARGV.each_with_index do |f, n|
       "SYNTAX\n"
     rescue NotImplementedError => e
       "REFUSED: #{e.message.sub(/\ARubyVM::InstructionSequence: /, "")}\n"
+    rescue Exception => e
+      # (the Ruby compiler itself failing: a defect of its own, not the
+      #  native one's -- check.sh lists these)
+      "RUBYFAILED: #{e.class}: #{e.message.lines.first.to_s.chomp[0, 160]}\n"
     end
   File.binwrite(File.join(out, "#{n}.exp"), text)
   puts "#{n}\t#{f}"

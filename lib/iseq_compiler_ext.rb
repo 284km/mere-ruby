@@ -274,7 +274,16 @@ class RubyVM::InstructionSequence
       unit = Unit.new(:top, label, path, abs_path, line, root.locals, nil,
                       [l.start_line, l.start_column, l.end_line, l.end_column], root.node_id)
       # (__ENCODING__: the source's, which a magic comment may have named)
-      unit.opts = opts.merge(source_encoding: (result.respond_to?(:encoding) && result.encoding) || src.encoding)
+      enc = (result.respond_to?(:encoding) && result.encoding) || src.encoding
+      # (Prism's Ruby side answers UTF-8 for a source declared binary that
+      #  has UTF-8 bytes in it -- load_parse's "niche use-case"; the
+      #  parser's own encoding, what ruby compiles in, is the one the
+      #  serialized header names)
+      if enc == Encoding::UTF_8 && !src.ascii_only? && Prism.respond_to?(:dump)
+        d = Prism.dump(src, **po)
+        enc = (Encoding.find(d.byteslice(10, d.getbyte(9))) rescue enc)
+      end
+      unit.opts = opts.merge(source_encoding: enc)
       compile_body(unit, root.statements, root.node_id)
       finish(unit)
       unit
@@ -331,8 +340,11 @@ class RubyVM::InstructionSequence
       when Prism::SelfNode then u.insn(:putself) unless popped
       when Prism::StringNode
         unless popped
+          # (`# frozen_string_literal: false` makes a literal mutable: putstring)
           if n.frozen?
             u.insn(:putobject, string_value(n).freeze)
+          elsif n.mutable?
+            u.insn(:putstring, string_value(n).freeze)
           else
             u.insn(:putchilledstring, string_value(n).freeze)
           end
@@ -481,8 +493,11 @@ class RubyVM::InstructionSequence
       when Prism::ReturnNode then return_node(u, n, popped)
       when Prism::YieldNode then yield_node(u, n, popped)
       when Prism::ClassNode, Prism::ModuleNode then class_node(u, n, popped)
+      # (as a String literal is pushed: frozen, mutable or chilled)
       when Prism::SourceFileNode
-        u.insn(:putchilledstring, u.path.dup.freeze) unless popped
+        unless popped
+          u.insn(n.frozen? ? :putobject : n.mutable? ? :putstring : :putchilledstring, u.path.dup.freeze)
+        end
       when Prism::SourceLineNode
         u.insn(:putobject, n.location.start_line) unless popped
       when Prism::SourceEncodingNode
@@ -510,7 +525,8 @@ class RubyVM::InstructionSequence
           # (in its own sequence the pattern's instructions are the scope's,
           #  of no node; the leave is the node's)
           dregexp(child, Renumbered.new(n, 0), false)
-          here(child, n)
+          # (the leave is on the last line an interpolation in it started)
+          child.at(child.last_line || n.location.start_line, n.node_id)
           child.insn(:leave)
           finish(child)
           here(u, n)
@@ -777,6 +793,9 @@ class RubyVM::InstructionSequence
       when Prism::RangeNode
         range_literal(n.left && static_value(n.left), n.right && static_value(n.right), n.exclude_end?)
       when Prism::RegularExpressionNode then regexp_literal(n.unescaped, n)
+      # (a static interpolated string -- `"a#{"b"}"` in a literal Array --
+      #  is its pieces joined)
+      when Prism::InterpolatedStringNode then static_concat(n.parts).freeze
       # (pm_static_literal_value: __LINE__ is its line -- an element of a
       #  literal Array or Hash, a `when`'s value)
       when Prism::SourceLineNode then n.location.start_line
@@ -4071,7 +4090,7 @@ class RubyVM::InstructionSequence
       chunk = u.elements[start..]
       insns = chunk.grep(Insn)
       if insns.size == 1 && insns[0].name == :jump && insns[0].ops[0].equal?(lbl)
-        unref(insns[0])
+        insns[0].ops.each { |o| o.refs -= 1 if o.is_a?(Label) }
         u.elements.slice!(start..)
         return
       end
@@ -4404,7 +4423,35 @@ class RubyVM::InstructionSequence
 
     def dest_index(els, label) = insn_at(els, els.index { |x| x.equal?(label) } + 1)
 
-    def unref(e) = e.ops.each { |o| o.refs -= 1 if o.is_a?(Label) }
+    # compile.c's unref_destination: a label no instruction names any more
+    # leaves the list at once -- what looks at an instruction's neighbours
+    # afterwards does not see it
+    def drop_label(els, l)
+      l.refs -= 1
+      return unless l.refs == 0
+      k = els.index { |x| x.equal?(l) }
+      els.delete_at(k) if k
+    end
+
+    def unref(els, e) = e.ops.each { |o| drop_label(els, o) if o.is_a?(Label) }
+
+    # compile.c's replace_destination: e's label is l now (false when it is
+    # already), and the old one leaves the list when nothing names it
+    def retarget(els, e, l)
+      old = e.ops[0]
+      return false if old.equal?(l)
+      l.refs += 1
+      e.ops[0] = l
+      drop_label(els, old)
+      true
+    end
+
+    # (where to go on once e is out: the first of what followed it that is
+    #  still in the list -- compile.c follows the removed element's own next)
+    def cont_index(els, succ)
+      succ.each { |x| k = els.index { |y| y.equal?(x) } and return k }
+      els.size
+    end
 
     # compile.c's iseq_optimize: each instruction in turn gets the peephole
     # rules, then its specialised instruction, then operand unification --
@@ -4497,48 +4544,50 @@ class RubyVM::InstructionSequence
         d = dest_index(els, e.ops[0])
         nx = insn_at(els, i + 1)
         if d && d == nx
-          unref(e)
+          succ = els[i + 1, 4]
           els.delete_at(i)
-          return i
+          unref(els, e)
+          return cont_index(els, succ)
         end
         de = d && els[d]
         if de.is_a?(Insn) && de.name == :jump && !de.ops[0].equal?(e.ops[0]) && traces_before(els, d).empty?
-          e.ops[0].refs -= 1
-          e.ops[0] = de.ops[0]
-          e.ops[0].refs += 1
-          remove_unreachable(els, i + 1)
-          return :again
+          if retarget(els, e, de.ops[0])
+            remove_unreachable(els, locate(els, e, i) + 1)
+            return :again
+          end
         elsif de.is_a?(Insn) && de.name == :leave
           # (it takes the leave's insn_info, the events
           #  get_destination_insn gave it included)
-          unref(e)
+          tr = traces_before(els, d).reverse.map { |t| Trace.new(t.event) }
+          unref(els, e)
           e.name = :leave
           e.ops = []
           e.line, e.node_id = de.line, de.node_id
-          tr = traces_before(els, d).reverse.map { |t| Trace.new(t.event) }
-          els.insert(i, *tr)
+          els.insert(locate(els, e, i), *tr)
           return :again
         end
-        pi = prev_insn(els, i)
-        if pi && els[pi].is_a?(Insn) && (els[pi].name == :branchif || els[pi].name == :branchunless)
+        # (the element just before must be the branch itself -- not past a
+        #  trace event or a label: compile.c's IS_INSN(iobj->link.prev))
+        pi = i > 0 && els[i - 1].is_a?(Insn) ? i - 1 : nil
+        if pi && (els[pi].name == :branchif || els[pi].name == :branchunless)
           pe = els[pi]
           pd = dest_index(els, pe.ops[0])
           if nx && pd == nx
             lbl_after = els[pi + 1].is_a?(Label) ? els[pi + 1] : nil
             refcnt = lbl_after ? lbl_after.refs : 0
             pe.name = pe.name == :branchif ? :branchunless : :branchif
-            pe.ops[0].refs -= 1
-            pe.ops[0] = e.ops[0]
-            e.ops[0].refs += 1
-            if refcnt <= 1
-              unref(e)
-              els.delete_at(i)
+            # (the jump goes without its label being let go of: the branch
+            #  names it now, and compile.c does not count the jump off)
+            if retarget(els, pe, e.ops[0]) && refcnt <= 1
+              succ = els[locate(els, e, i) + 1, 4]
+              els.delete_at(locate(els, e, i))
+              return cont_index(els, succ)
             end
-            return i
+            return locate(els, e, i) + 1
           elsif d && pd == d
             # (a branch to where the jump goes anyway is a pop, at the
-            #  jump's place)
-            unref(pe)
+            #  jump's place -- its label still counted, as compile.c's
+            #  ELEM_REPLACE leaves it)
             els[pi] = Insn.new(:pop, [], e.line, e.node_id, [])
           end
         end
@@ -4780,17 +4829,13 @@ class RubyVM::InstructionSequence
       prev_dup = pobj && pobj.name == :dup
       loop do
         if nobj.is_a?(Insn) && nobj.name == :jump
-          break if nobj.ops[0].equal?(e.ops[0])
-          e.ops[0].refs -= 1
-          e.ops[0] = nobj.ops[0]
-          e.ops[0].refs += 1
+          break unless retarget(els, e, nobj.ops[0])
+          i = locate(els, e, i)
         elsif prev_dup && nobj.is_a?(Insn) && nobj.name == :dup &&
               (nx = els[els.index { |x| x.equal?(nobj) } + 1]).is_a?(Insn) && nx.name == e.name
-          break if nx.ops[0].equal?(e.ops[0])
           nobj = nx
-          e.ops[0].refs -= 1
-          e.ops[0] = nobj.ops[0]
-          e.ops[0].refs += 1
+          break unless retarget(els, e, nobj.ops[0])
+          i = locate(els, e, i)
         elsif pobj
           pp = pobj
           pp = els[i - 2] if prev_dup && i > 1 && els[i - 2].is_a?(Insn)
@@ -4822,9 +4867,10 @@ class RubyVM::InstructionSequence
             e.name = :jump
             return :again
           end
-          unref(e)
+          succ = els[i + 1, 4]
           els.delete_at(i)
-          return i
+          unref(els, e)
+          return cont_index(els, succ)
         else
           break
         end
@@ -4897,15 +4943,13 @@ class RubyVM::InstructionSequence
         last = pending_end
       end
       return false unless last
-      removed = false
-      (last).downto(first) do |k|
-        x = els[k]
-        next if x.is_a?(Label)
-        unref(x) if x.is_a?(Insn)
-        els.delete_at(k)
-        removed = true
-      end
-      removed
+      # (every element of the chunk goes, its labels too; an instruction's
+      #  labels are let go of, and leave the list when nothing else names
+      #  them)
+      chunk = els[first..last]
+      els.slice!(first..last)
+      chunk.each { |x| unref(els, x) if x.is_a?(Insn) }
+      true
     end
 
     # compile.c's iseq_specialized_instruction: an array built only to be
@@ -5293,7 +5337,8 @@ class RubyVM::InstructionSequence
           i = n - li - 1
           entry = format("[%2d] ", i + 1)
           line << indent
-          width = line.size + entry.size + 11
+          # (in bytes, as iseq.c's RSTRING_LEN counts)
+          width = line.bytesize + entry.bytesize + 11
           shown = local_name(name)
           line << entry << "#{shown}@#{li}"
           pr = u.params
@@ -5307,7 +5352,7 @@ class RubyVM::InstructionSequence
           argi << (pr[:anon_kwrest] ? "AnonKwrest" : "Kwrest") if pr[:kwrest] == li
           argi << "Block" if pr[:block_start] == li
           line << "<#{argi}>" unless argi.empty?
-          pad = width - line.size
+          pad = width - line.bytesize
           line << " " * pad if pad > 0
         end
         out << line.rstrip << "\n"
@@ -5361,7 +5406,8 @@ class RubyVM::InstructionSequence
       # (ruby names the hidden parameter of `it` in its disasm, not in to_a)
       return "<it>".inspect if name == IT_PARAM
       return "?" if name.is_a?(Integer)
-      name.to_s.match?(/\A[a-z_][A-Za-z0-9_]*\z/) ? name.to_s : name.to_s.inspect
+      # (a local's name may be any character past ASCII: rb_is_local_name)
+      name.to_s.match?(/\A[a-z_\P{ASCII}][A-Za-z0-9_\P{ASCII}]*\z/) ? name.to_s : name.to_s.inspect
     end
 
     def inspect_unit(u)

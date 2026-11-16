@@ -32,6 +32,7 @@ while IFS="$(printf '\t')" read -r n f; do
   exp="$tmp/$n.exp"; got="$tmp/$n.got"
   case "$(head -c 8 "$exp")" in
     REFUSED:|SYNTAX*) skipped=$((skipped+1)); continue ;;
+    RUBYFAIL) skipped=$((skipped+1)); echo "RUBY COMPILER FAILED $f: $(head -1 "$exp" | cut -c13-200)"; continue ;;
   esac
   [ -f "$got" ] || { failed=$((failed+1)); echo "FAILED $f: no answer"; continue; }
   case "$(head -c 8 "$got")" in

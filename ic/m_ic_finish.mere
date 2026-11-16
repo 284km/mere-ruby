@@ -103,16 +103,17 @@ let ic_remove_unreachable = fn cx -> fn (first: int) ->
       let last = (if pending >= 0 then pend_end else last0) in
       if (if ok then false else true) || last < 0 then false
       else
-        (let rec del = fn (k: int) -> fn (removed: bool) ->
+        // (every element of the chunk goes, its labels too; an instruction's
+        //  labels are let go of, and leave the list when nothing else names
+        //  them)
+        (let rec del = fn (k: int) -> fn (insns: int list) ->
            (let nx = ic_next cx k in
-            let r2 =
-              (if ic_kind cx k == 1 then removed
-               else
-                 (let _ = (if ic_kind cx k == 0 then ic_unref_ops cx (ic_ops cx k) else ()) in
-                  let _ = ic_unlink cx k in
-                  true)) in
-            if k == last then r2 else del nx r2) in
-         del first false)
+            let ins2 = (if ic_kind cx k == 0 then Cons (k, insns) else insns) in
+            let _ = ic_unlink cx k in
+            if k == last then ins2 else del nx ins2) in
+         let removed = del first Nil in
+         let _ = list_iter (ic_rev removed) (fn (x: int) -> ic_drop_ops cx (ic_ops cx x)) in
+         true)
     };
 
 // (an instruction that only pushes, which a `pop` straight after undoes)
@@ -137,18 +138,12 @@ let ic_peephole_branch = fn cx -> fn (e: int) ->
     (let p0 = ic_prev cx e in
      let pobj = (if ic_kind cx p0 == 0 then p0 else 0 - 1) in
      let prev_dup = pobj >= 0 && str_eq (ic_name cx pobj) "dup" in
-     let retarget = fn (l: int) ->
-       (let _ = ic_unref cx (ic_lab_of (ic_op0 cx e)) in
-        let _ = ic_set_ops cx e (Cons (OLab l, Nil)) in
-        ic_ref cx l) in
      let rec go = fn (nobj: int) ->
        if ic_is cx nobj "jump" then
-         (if ic_lab_of (ic_op0 cx nobj) == ic_lab_of (ic_op0 cx e) then ic_none ()
-          else (let _ = retarget (ic_lab_of (ic_op0 cx nobj)) in more nobj))
+         (if ic_retarget cx e (ic_lab_of (ic_op0 cx nobj)) then more nobj else ic_none ())
        else if prev_dup && ic_is cx nobj "dup" && ic_is cx (ic_next cx nobj) (ic_name cx e) then
          (let nx = ic_next cx nobj in
-          if ic_lab_of (ic_op0 cx nx) == ic_lab_of (ic_op0 cx e) then ic_none ()
-          else (let _ = retarget (ic_lab_of (ic_op0 cx nx)) in more nx))
+          if ic_retarget cx e (ic_lab_of (ic_op0 cx nx)) then more nx else ic_none ())
        else if pobj >= 0 then
          (let p2 = ic_prev cx pobj in
           let pp = (if prev_dup && ic_kind cx p2 == 0 then p2 else pobj) in
@@ -183,9 +178,9 @@ let ic_peephole_branch = fn cx -> fn (e: int) ->
                 let _ = ic_set_name cx e "jump" in
                 ic_again ())
              else
-               (let _ = ic_unref_ops cx (ic_ops cx e) in
-                let nx = ic_next cx e in
+               (let nx = ic_next cx e in
                 let _ = ic_unlink cx e in
+                let _ = ic_drop_ops cx (ic_ops cx e) in
                 nx)))
        else ic_none ()
      and more = fn (nobj: int) ->
@@ -202,21 +197,20 @@ let rec ic_peephole = fn cx -> fn (u: int) -> fn (e: int) ->
      let d = ic_dest cx target in
      let nx = ic_next_insn cx e in
      if d >= 0 && d == nx then
-       (let _ = ic_unref_ops cx (ic_ops cx e) in
-        let after = ic_next cx e in
+       (let after = ic_next cx e in
         let _ = ic_unlink cx e in
+        let _ = ic_drop_ops cx (ic_ops cx e) in
         after)
      else if ic_is cx d "jump" && ic_lab_of (ic_op0 cx d) != target
              && (match ic_traces_before cx d with | Nil -> true | _ -> false) then
-       (let _ = ic_unref cx target in
-        let _ = ic_set_ops cx e (Cons (ic_op0 cx d, Nil)) in
-        let _ = ic_ref cx (ic_lab_of (ic_op0 cx d)) in
+       (let _ = ic_retarget cx e (ic_lab_of (ic_op0 cx d)) in
         let _ = ic_remove_unreachable cx (ic_next cx e) in
         ic_again ())
      else if ic_is cx d "leave" then
        // (it takes the leave's insn_info, the events get_destination_insn
        //  gave it included)
-       (let _ = ic_unref_ops cx (ic_ops cx e) in
+       (let ts = ic_traces_before cx d in
+        let _ = ic_drop_ops cx (ic_ops cx e) in
         let _ = ic_set_name cx e "leave" in
         let _ = ic_set_ops cx e Nil in
         let _ = ic_e_set cx e 3 (ic_eline cx d) in
@@ -230,10 +224,12 @@ let rec ic_peephole = fn cx -> fn (u: int) -> fn (e: int) ->
               let tr = ic_e_new cx 2 "" Nil 0 0 in
               let _ = ic_e_set cx tr 5 b in
               ic_ins_before cx e tr)) in
-        let _ = put (ic_traces_before cx d) in
+        let _ = put ts in
         ic_again ())
      else
-       (let pi = ic_prev_insn cx e in
+       // (the element just before must be the branch itself -- not past a
+       //  trace event or a label: compile.c's IS_INSN(iobj->link.prev))
+       (let pi = (let p = ic_prev cx e in if p >= 0 && ic_kind cx p == 0 then p else 0 - 1) in
         let done =
           (if pi >= 0 && (ic_is cx pi "branchif" || ic_is cx pi "branchunless") then
              (let pd = ic_dest cx (ic_lab_of (ic_op0 cx pi)) in
@@ -241,12 +237,11 @@ let rec ic_peephole = fn cx -> fn (u: int) -> fn (e: int) ->
                 (let la = ic_next cx pi in
                  let refcnt = (if ic_kind cx la == 1 then ic_refs cx la else 0) in
                  let _ = ic_set_name cx pi (if str_eq (ic_name cx pi) "branchif" then "branchunless" else "branchif") in
-                 let _ = ic_unref cx (ic_lab_of (ic_op0 cx pi)) in
-                 let _ = ic_set_ops cx pi (Cons (OLab target, Nil)) in
-                 let _ = ic_ref cx target in
-                 if refcnt <= 1 then
-                   (let _ = ic_unref_ops cx (ic_ops cx e) in
-                    let after = ic_next cx e in
+                 // (the jump goes without its label being let go of: the
+                 //  branch names it now, and compile.c does not count the
+                 //  jump off)
+                 if ic_retarget cx pi target && refcnt <= 1 then
+                   (let after = ic_next cx e in
                     let _ = ic_unlink cx e in
                     after)
                  // (the jump stays where it is: go on with it)
@@ -255,9 +250,9 @@ let rec ic_peephole = fn cx -> fn (u: int) -> fn (e: int) ->
                 (let _ =
                    (if d >= 0 && pd == d then
                       // (a branch to where the jump goes anyway is a pop, at
-                      //  the jump's place)
-                      (let _ = ic_unref_ops cx (ic_ops cx pi) in
-                       let np = ic_mk cx "pop" Nil (ic_eline cx e) (ic_enode cx e) in
+                      //  the jump's place -- its label still counted, as
+                      //  compile.c's ELEM_REPLACE leaves it)
+                      (let np = ic_mk cx "pop" Nil (ic_eline cx e) (ic_enode cx e) in
                        let _ = ic_ins_before cx pi np in
                        ic_unlink cx pi)
                     else ()) in
@@ -619,7 +614,8 @@ let ic_unify = fn cx -> fn (e: int) ->
 let ic_optimize = fn cx -> fn (u: int) ->
   let rec go = fn (e: int) ->
     if e < 0 || ic_is_end cx e then ()
-    else if ic_kind cx e != 0 then go (ic_next cx e)
+    // (one taken out, met through a stale next: on past it)
+    else if ic_kind cx e != 0 || ic_prev cx e < 0 then go (ic_next cx e)
     else
       (let nx0 = ic_next cx e in
        let rec rules = fn (x: unit) ->
