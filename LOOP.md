@@ -5145,3 +5145,17 @@ file with the unchanged six-file measurement gives 207 tests: MATCH 109,
 RED 88, BOTH 5, EXTRA 5, plus 57 separately reported exclusions. Against the
 latest main the target raw gain is now 12, all accepted implementation
 matches. Both final store witnesses and the extended dump witness pass.
+
+## 2026-11-17: stage 9, round 6 -- inverse identities and integer conversion
+
+While #91 and #94 wait for CI, a separate worktree reproduces two ObjectSpace
+gaps: _id2ref rejects to_int arguments and cannot recover retained Proc or
+Binding handles. It now converts once, including private and conventional
+respond_to_missing? conversions, rejects non-Integer results with TypeError,
+and reads the actual Proc/Binding tables for those identity tags. The
+collector and the shared conversion helpers remain unchanged.
+
+Witness 681 round-trips held objects and stores, checks conversion calls,
+private/dynamic conversion, one-argument respond_to? overrides, invalid
+return types, Float conversion and preservation after collection. Ruby
+passes; the previous interpreter fails at the first to_int argument.
