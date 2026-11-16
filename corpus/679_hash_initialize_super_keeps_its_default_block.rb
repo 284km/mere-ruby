@@ -19,6 +19,18 @@ hash[:present] = :value
 hash.send(:initialize) { |object, key| [object.class, key.to_s] }
 p [hash[:present], hash[:missing]]
 
+strict = ->(object, key) { [object.class, key] }
+strict_hash = ForwardedHash.new(capacity: 10, &strict)
+p [strict_hash[:key], strict_hash.default_proc.equal?(strict)]
+p ForwardedHash.new(&->(*args) { args.last })[:variable]
+[-> {}, ->(one) {}, ->(one, two, three) {}].each do |invalid|
+  begin
+    ForwardedHash.new(&invalid)
+  rescue => error
+    p [error.class, error.message]
+  end
+end
+
 begin
   ForwardedHash.new(:default) { |hash, key| :unused }
 rescue => error
