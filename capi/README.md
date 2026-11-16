@@ -202,6 +202,11 @@ written for ruby's own build tree: they reach into its internal headers).
   from the same .gem files, and `capi/check/gems.rb` uses them on both
   sides and must print the same. mere-ruby pointed at the gems the
   reference built must fail.
+- `tools/capi_spec_check.py` (CI, macOS): ruby/spec's `optional/capi` -- a
+  spec file and a C extension for each part of the C API, 46 files -- with
+  each extension built for both rubies. The count of passing examples per
+  file is recorded in `capi/check/spec_expect.tsv`: the reference's must be
+  the recorded one, mere-ruby's must not be lower. 2,242 of 2,584 pass.
 - `test/mkmf` runs in a build tree staged for mere-ruby
   (`unittest/mkmf_context.sh`: links to `capi/include` in the places mkmf's
   build-tree mode looks, and a Makefile mere-ruby's own mkmf wrote).

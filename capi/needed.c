@@ -175,3 +175,307 @@ unsigned long ruby_strtoul(const char *str, char **endptr, int base) {
     if (sign < 0) ret = (unsigned long)(-(long)ret);
     return ret;
 }
+
+/* ======================================================================
+ * What ruby/spec's optional/capi extensions asked for: each of its
+ * *_spec.c files is one library, and one function missing kept the whole
+ * file's examples from running.
+ * ====================================================================== */
+#include "ruby/io.h"
+#include "ruby/thread.h"
+#include <sys/select.h>
+
+/* ---- blocks ---------------------------------------------------------------------- */
+extern VALUE mr_frame_set_block(VALUE block);
+extern VALUE mr_block_function(rb_block_call_func_t func, VALUE data);
+/* rb_iterate: func1(data1), with the C function `proc` as its block. */
+struct iterate { VALUE (*func)(VALUE); VALUE data; };
+static VALUE iterate_body(VALUE p) { struct iterate *it = (struct iterate *)p; return it->func(it->data); }
+static VALUE iterate_restore(VALUE old) { mr_frame_set_block(old); return Qnil; }
+VALUE rb_iterate(VALUE (*func1)(VALUE), VALUE data1, rb_block_call_func_t proc, VALUE data2) {
+    struct iterate it = { func1, data1 };
+    VALUE old = mr_frame_set_block(mr_block_function(proc, data2));
+    return rb_ensure(iterate_body, (VALUE)&it, iterate_restore, old);
+}
+
+/* ---- classes ----------------------------------------------------------------------- */
+VALUE rb_class_instance_methods(int argc, const VALUE *argv, VALUE mod) { return rb_funcallv(mod, rb_intern("instance_methods"), argc, argv); }
+VALUE rb_class_public_instance_methods(int argc, const VALUE *argv, VALUE mod) { return rb_funcallv(mod, rb_intern("public_instance_methods"), argc, argv); }
+VALUE rb_class_protected_instance_methods(int argc, const VALUE *argv, VALUE mod) { return rb_funcallv(mod, rb_intern("protected_instance_methods"), argc, argv); }
+VALUE rb_class_private_instance_methods(int argc, const VALUE *argv, VALUE mod) { return rb_funcallv(mod, rb_intern("private_instance_methods"), argc, argv); }
+void rb_free_generic_ivar(VALUE obj) {
+    if (RB_SPECIAL_CONST_P(obj)) return;
+    VALUE names = rb_obj_instance_variables(obj);
+    for (long i = 0; i < RARRAY_LEN(names); i++) rb_funcall(obj, rb_intern("remove_instance_variable"), 1, rb_ary_entry(names, i));
+}
+
+/* ---- exceptions and where the program is ------------------------------------------- */
+/* What `raise` makes of its arguments (eval.c's rb_make_exception). */
+VALUE rb_make_exception(int argc, const VALUE *argv) {
+    return mr_callv(mr_ruby(
+        "->(*a) {\n"
+        "  case a.size\n"
+        "  when 0 then nil\n"
+        "  when 1 then next nil if a[0].nil?\n"
+        "    next RuntimeError.new(a[0]) if a[0].is_a?(String)\n"
+        "    raise TypeError, 'exception class/object expected' unless a[0].respond_to?(:exception)\n"
+        "    e = a[0].exception\n"
+        "    raise TypeError, 'exception object expected' unless e.is_a?(Exception)\n"
+        "    e\n"
+        "  when 2, 3\n"
+        "    raise TypeError, 'exception class/object expected' unless a[0].respond_to?(:exception)\n"
+        "    e = a[0].exception(a[1])\n"
+        "    raise TypeError, 'exception object expected' unless e.is_a?(Exception)\n"
+        "    e.set_backtrace(a[2]) if a.size == 3\n"
+        "    e\n"
+        "  else raise ArgumentError, \"wrong number of arguments (given #{a.size}, expected 0..3)\"\n"
+        "  end }"), rb_intern("call"), argc, argv, Qnil, 0);
+}
+VALUE rb_make_backtrace(void) { return rb_eval_string("caller(0)"); }
+const char *rb_sourcefile(void) {
+    VALUE path = rb_eval_string("caller_locations(0, 1).first&.path");
+    return NIL_P(path) ? NULL : StringValueCStr(path);
+}
+int rb_sourceline(void) {
+    VALUE line = rb_eval_string("caller_locations(0, 1).first&.lineno");
+    return NIL_P(line) ? 0 : NUM2INT(line);
+}
+VALUE rb_lastline_get(void) { return rb_gv_get("$_"); }
+VALUE rb_f_global_variables(void) { return rb_funcall(mr_main(), rb_intern("global_variables"), 0); }
+VALUE rb_gc_latest_gc_info(VALUE key) { return rb_funcall(mr_const("GC"), rb_intern("latest_gc_info"), 1, key); }
+VALUE rb_marshal_dump(VALUE obj, VALUE port) {
+    if (NIL_P(port)) return rb_funcall(mr_const("Marshal"), rb_intern("dump"), 1, obj);
+    return rb_funcall(mr_const("Marshal"), rb_intern("dump"), 2, obj, port);
+}
+int ruby_native_thread_p(void) { return 1; }
+int ruby_thread_has_gvl_p(void) { return 1; }
+
+/* ---- hashing ------------------------------------------------------------------------- */
+st_index_t rb_hash_start(st_index_t h) {
+    static char anchor;
+    return st_hash_start((st_index_t)(uintptr_t)&anchor + h);
+}
+
+/* ---- Fiber ---------------------------------------------------------------------------- */
+VALUE rb_fiber_new(rb_block_call_func_t func, VALUE obj) { return rb_block_call(mr_const("Fiber"), rb_intern("new"), 0, NULL, func, obj); }
+VALUE rb_fiber_resume(VALUE fiber, int argc, const VALUE *argv) { return rb_funcallv(fiber, rb_intern("resume"), argc, argv); }
+VALUE rb_fiber_yield(int argc, const VALUE *argv) { return rb_funcallv(mr_const("Fiber"), rb_intern("yield"), argc, argv); }
+VALUE rb_fiber_current(void) { return rb_funcall(mr_const("Fiber"), rb_intern("current"), 0); }
+VALUE rb_fiber_alive_p(VALUE fiber) { return rb_funcall(fiber, rb_intern("alive?"), 0); }
+VALUE rb_fiber_raise(VALUE fiber, int argc, VALUE *argv) { return rb_funcallv(fiber, rb_intern("raise"), argc, argv); }
+
+/* ---- Regexp --------------------------------------------------------------------------- */
+int rb_memcicmp(const void *s1, const void *s2, long n) {
+    const unsigned char *p1 = s1, *p2 = s2;
+    while (n-- > 0) {
+        int c1 = *p1++, c2 = *p2++;
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 'a' - 'A';
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 'a' - 'A';
+        if (c1 != c2) return c1 < c2 ? -1 : 1;
+    }
+    return 0;
+}
+/* (re =~ str: the position, and `$~` of the Ruby frame that called C) */
+VALUE rb_reg_match(VALUE re, VALUE str) {
+    if (NIL_P(str)) { rb_backref_set(Qnil); return Qnil; }
+    VALUE match = rb_funcall(re, rb_intern("match"), 1, str);
+    rb_backref_set(match);
+    return NIL_P(match) ? Qnil : rb_funcall(match, rb_intern("begin"), 1, INT2FIX(0));
+}
+int rb_reg_options(VALUE re) { return NUM2INT(rb_funcall(re, rb_intern("options"), 0)); }
+VALUE rb_reg_regcomp(VALUE str) { return rb_funcall(rb_cRegexp, rb_intern("new"), 1, str); }
+
+/* ---- Set (the C API 4.0 added) ----------------------------------------------------------- */
+VALUE rb_set_new(void) { return rb_funcall(mr_const("Set"), rb_intern("new"), 0); }
+VALUE rb_set_new_capa(size_t capa) { (void)capa; return rb_set_new(); }
+bool rb_set_add(VALUE set, VALUE element) { return RTEST(rb_funcall(set, rb_intern("add?"), 1, element)); }
+bool rb_set_delete(VALUE set, VALUE element) { return RTEST(rb_funcall(set, rb_intern("delete?"), 1, element)); }
+bool rb_set_lookup(VALUE set, VALUE element) { return RTEST(rb_funcall(set, rb_intern("include?"), 1, element)); }
+VALUE rb_set_clear(VALUE set) { return rb_funcall(set, rb_intern("clear"), 0); }
+size_t rb_set_size(VALUE set) { return NUM2SIZET(rb_funcall(set, rb_intern("size"), 0)); }
+void rb_set_foreach(VALUE set, int (*func)(VALUE element, VALUE arg), VALUE arg) {
+    VALUE elements = rb_funcall(set, rb_intern("to_a"), 0);
+    for (long i = 0; i < RARRAY_LEN(elements); i++)
+        if (func(rb_ary_entry(elements, i), arg) == ST_STOP) break;
+}
+
+/* ---- Strings and encodings ---------------------------------------------------------------- */
+/* (ruby frees the buffer; here the struct C sees is the interpreter's to drop) */
+void rb_str_free(VALUE str) { (void)str; }
+int rb_uv_to_utf8(char buf[6], unsigned long uv) {
+    if (uv <= 0x7f) { buf[0] = (char)uv; return 1; }
+    if (uv <= 0x7ff) { buf[0] = (char)(0xc0 | (uv >> 6)); buf[1] = (char)(0x80 | (uv & 0x3f)); return 2; }
+    if (uv <= 0xffff) {
+        buf[0] = (char)(0xe0 | (uv >> 12)); buf[1] = (char)(0x80 | ((uv >> 6) & 0x3f)); buf[2] = (char)(0x80 | (uv & 0x3f));
+        return 3;
+    }
+    if (uv <= 0x1fffff) {
+        buf[0] = (char)(0xf0 | (uv >> 18)); buf[1] = (char)(0x80 | ((uv >> 12) & 0x3f));
+        buf[2] = (char)(0x80 | ((uv >> 6) & 0x3f)); buf[3] = (char)(0x80 | (uv & 0x3f));
+        return 4;
+    }
+    if (uv <= 0x3ffffff) {
+        buf[0] = (char)(0xf8 | (uv >> 24)); buf[1] = (char)(0x80 | ((uv >> 18) & 0x3f)); buf[2] = (char)(0x80 | ((uv >> 12) & 0x3f));
+        buf[3] = (char)(0x80 | ((uv >> 6) & 0x3f)); buf[4] = (char)(0x80 | (uv & 0x3f));
+        return 5;
+    }
+    if (uv <= 0x7fffffff) {
+        buf[0] = (char)(0xfc | (uv >> 30)); buf[1] = (char)(0x80 | ((uv >> 24) & 0x3f)); buf[2] = (char)(0x80 | ((uv >> 18) & 0x3f));
+        buf[3] = (char)(0x80 | ((uv >> 12) & 0x3f)); buf[4] = (char)(0x80 | ((uv >> 6) & 0x3f)); buf[5] = (char)(0x80 | (uv & 0x3f));
+        return 6;
+    }
+    rb_raise(rb_eRangeError, "pack(U): value out of range");
+}
+
+/* ---- IO -------------------------------------------------------------------------------------- */
+VALUE rb_io_closed_p(VALUE io) { return rb_funcall(io, rb_intern("closed?"), 0); }
+int rb_io_mode(VALUE io) {
+    rb_io_t *fptr;
+    RB_IO_POINTER(io, fptr);
+    return fptr->mode;
+}
+VALUE rb_io_path(VALUE io) {
+    if (!rb_respond_to(io, rb_intern("path"))) return Qnil;
+    return rb_funcall(io, rb_intern("path"), 0);
+}
+/* An IO of class `klass` on a descriptor the caller opened. */
+VALUE rb_io_open_descriptor(VALUE klass, int descriptor, int mode, VALUE path, VALUE timeout, struct rb_io_encoding *encoding) {
+    (void)path; (void)encoding;
+    const char *how = (mode & FMODE_READWRITE) == FMODE_READWRITE ? "r+" : (mode & FMODE_WRITABLE) ? ((mode & FMODE_APPEND) ? "a" : "w") : "r";
+    VALUE io = rb_funcall(klass, rb_intern("for_fd"), 2, INT2NUM(descriptor), rb_str_new_cstr(how));
+    if (mode & FMODE_BINMODE) rb_funcall(io, rb_intern("binmode"), 0);
+    if (mode & FMODE_SYNC) rb_funcall(io, rb_intern("sync="), 1, Qtrue);
+    if (!NIL_P(timeout)) rb_funcall(io, rb_intern("timeout="), 1, timeout);
+    return io;
+}
+
+/* The descriptor sets of thread.c, for more descriptors than FD_SETSIZE:
+ * as CRuby has them (Ruby's licence: capi/include/COPYING, BSDL). */
+#ifndef howmany
+# define howmany(x, y) (((x) + ((y) - 1)) / (y))
+#endif
+void rb_fd_init(rb_fdset_t *fds) {
+    fds->maxfd = 0;
+    fds->fdset = ALLOC(fd_set);
+    FD_ZERO(fds->fdset);
+}
+void rb_fd_term(rb_fdset_t *fds) {
+    xfree(fds->fdset);
+    fds->maxfd = 0;
+    fds->fdset = 0;
+}
+void rb_fd_zero(rb_fdset_t *fds) {
+    if (fds->fdset) MEMZERO(fds->fdset, fd_mask, howmany(fds->maxfd, NFDBITS));
+}
+static void fd_resize(int n, rb_fdset_t *fds) {
+    size_t m = howmany(n + 1, NFDBITS) * sizeof(fd_mask);
+    size_t o = howmany(fds->maxfd, NFDBITS) * sizeof(fd_mask);
+    if (m < sizeof(fd_set)) m = sizeof(fd_set);
+    if (o < sizeof(fd_set)) o = sizeof(fd_set);
+    if (m > o) {
+        fds->fdset = xrealloc(fds->fdset, m);
+        memset((char *)fds->fdset + o, 0, m - o);
+    }
+    if (n >= fds->maxfd) fds->maxfd = n + 1;
+}
+void rb_fd_set(int n, rb_fdset_t *fds) {
+    fd_resize(n, fds);
+    FD_SET(n, fds->fdset);
+}
+void rb_fd_clr(int n, rb_fdset_t *fds) {
+    if (n >= fds->maxfd) return;
+    FD_CLR(n, fds->fdset);
+}
+int rb_fd_isset(int n, const rb_fdset_t *fds) {
+    if (n >= fds->maxfd) return 0;
+    return FD_ISSET(n, fds->fdset) != 0;
+}
+void rb_fd_copy(rb_fdset_t *dst, const fd_set *src, int max) {
+    size_t size = howmany(max, NFDBITS) * sizeof(fd_mask);
+    if (size < sizeof(fd_set)) size = sizeof(fd_set);
+    dst->maxfd = max;
+    dst->fdset = xrealloc(dst->fdset, size);
+    memcpy(dst->fdset, src, size);
+}
+void rb_fd_dup(rb_fdset_t *dst, const rb_fdset_t *src) {
+    size_t size = howmany(rb_fd_max(src), NFDBITS) * sizeof(fd_mask);
+    if (size < sizeof(fd_set)) size = sizeof(fd_set);
+    dst->maxfd = src->maxfd;
+    dst->fdset = xrealloc(dst->fdset, size);
+    memcpy(dst->fdset, src->fdset, size);
+}
+int rb_fd_select(int n, rb_fdset_t *readfds, rb_fdset_t *writefds, rb_fdset_t *exceptfds, struct timeval *timeout) {
+    fd_set *r = NULL, *w = NULL, *e = NULL;
+    if (readfds) { fd_resize(n - 1, readfds); r = rb_fd_ptr(readfds); }
+    if (writefds) { fd_resize(n - 1, writefds); w = rb_fd_ptr(writefds); }
+    if (exceptfds) { fd_resize(n - 1, exceptfds); e = rb_fd_ptr(exceptfds); }
+    return select(n, r, w, e, timeout);
+}
+/* Waiting on descriptors, with the other threads running meanwhile: threads
+ * here take turns on one native thread, so a select(2) of C's own would stop
+ * them all. The wait is the interpreter's (IO.select, on IOs that name the
+ * descriptors and do not close them), and its answer is put back into the
+ * sets. */
+static VALUE fd_ios(int nfds, rb_fdset_t *set) {
+    VALUE ios = rb_ary_new();
+    if (!set) return ios;
+    for (int fd = 0; fd < nfds; fd++)
+        if (rb_fd_isset(fd, set))
+            rb_ary_push(ios, rb_funcall(mr_ruby("->(fd) { IO.for_fd(fd, autoclose: false) }"), rb_intern("call"), 1, INT2NUM(fd)));
+    return ios;
+}
+static int fd_answer(rb_fdset_t *set, VALUE asked, VALUE ready) {
+    int count = 0;
+    if (!set) return 0;
+    for (long i = 0; i < RARRAY_LEN(asked); i++) {
+        VALUE io = rb_ary_entry(asked, i);
+        int fd = NUM2INT(rb_funcall(io, rb_intern("fileno"), 0));
+        if (!NIL_P(ready) && RTEST(rb_funcall(ready, rb_intern("include?"), 1, io))) count++;
+        else rb_fd_clr(fd, set);
+    }
+    return count;
+}
+int rb_thread_fd_select(int nfds, rb_fdset_t *rfds, rb_fdset_t *wfds, rb_fdset_t *efds, struct timeval *timeout) {
+    VALUE r = fd_ios(nfds, rfds), w = fd_ios(nfds, wfds), e = fd_ios(nfds, efds);
+    VALUE wait = timeout ? DBL2NUM((double)timeout->tv_sec + (double)timeout->tv_usec / 1e6) : Qnil;
+    VALUE ready = rb_funcall(rb_cIO, rb_intern("select"), 4, r, w, e, wait);
+    int count = 0;
+    count += fd_answer(rfds, r, NIL_P(ready) ? Qnil : rb_ary_entry(ready, 0));
+    count += fd_answer(wfds, w, NIL_P(ready) ? Qnil : rb_ary_entry(ready, 1));
+    count += fd_answer(efds, e, NIL_P(ready) ? Qnil : rb_ary_entry(ready, 2));
+    return count;
+}
+static int wait_one(int fd, int writable) {
+    if (fd < 0) rb_raise(rb_eIOError, "closed stream");
+    VALUE io = rb_funcall(mr_ruby("->(fd) { IO.for_fd(fd, autoclose: false) }"), rb_intern("call"), 1, INT2NUM(fd));
+    VALUE ios = rb_ary_new_from_args(1, io), none = rb_ary_new();
+    rb_funcall(rb_cIO, rb_intern("select"), 3, writable ? none : ios, writable ? ios : none, none);
+    return 1;
+}
+int rb_thread_wait_fd(int fd) { return wait_one(fd, 0); }
+int rb_thread_fd_writable(int fd) { return wait_one(fd, 1); }
+
+/* ---- allocators and encodings ----------------------------------------------------------- */
+extern void *mr_registered_function(long number);
+/* The C function that allocates a class's instances, its own or inherited. */
+/* (...and for a class no C allocator was defined on, ruby's own: a function
+ *  that makes an instance of the class it is given the builtin way. NULL is
+ *  for a class whose allocator was taken away, rb_undef_alloc_func.) */
+static VALUE default_allocator(VALUE klass) { return mr_up(MR_OBJECT_NEW, klass, 1, 0, 0, 0); }
+rb_alloc_func_t rb_get_alloc_func(VALUE klass) {
+    long number = (long)(intptr_t)mr_up(MR_DEFINE_ALLOC, klass, (VALUE)-2L, 0, 0, 0);
+    if (number == -2) return NULL;
+    return number < 0 ? default_allocator : (rb_alloc_func_t)mr_registered_function(number);
+}
+/* The first byte of the character that `s` is in (or is the first byte of). */
+OnigUChar *onigenc_get_left_adjust_char_head(OnigEncoding enc, const OnigUChar *start, const OnigUChar *s, const OnigUChar *end) {
+    const char *p = (const char *)start;
+    if (s <= start) return (OnigUChar *)s;
+    while (p < (const char *)s) {
+        int n = rb_enc_mbclen(p, (const char *)end, enc);
+        if (n < 1) n = 1;
+        if (p + n > (const char *)s) break;
+        p += n;
+    }
+    return (OnigUChar *)p;
+}

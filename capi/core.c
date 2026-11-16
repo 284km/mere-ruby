@@ -193,6 +193,13 @@ VALUE mr_guarded(VALUE (*body)(VALUE), VALUE arg, VALUE *outcome) {
     return result;
 }
 VALUE mr_frame_block(void) { return cur ? cur->block : Qnil; }
+/* (rb_iterate: the block of the call in progress, for as long as one function runs) */
+VALUE mr_frame_set_block(VALUE block) {
+    if (!cur) mr_fatal("no call in progress to give a block to");
+    VALUE old = cur->block;
+    cur->block = block;
+    return old;
+}
 ID mr_frame_method(void) { return cur ? cur->method : 0; }
 int mr_frame_keywords(void) { return cur ? cur->keywords : 0; }
 
@@ -251,6 +258,9 @@ void mr_unsupported(const char *what) {
 struct mr_function { void *fn; int arity; };
 static struct mr_function *functions;
 static long function_count, function_cap;
+void *mr_registered_function(long number) {
+    return number >= 0 && number < function_count ? functions[number].fn : NULL;
+}
 long mr_register_function(void *fn, int arity) {
     for (long i = 0; i < function_count; i++)
         if (functions[i].fn == fn && functions[i].arity == arity) return i;

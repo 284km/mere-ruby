@@ -5136,7 +5136,8 @@ on any build):
 vendored unchanged like st.c and compiled through a wrapper
 (capi/memory_view.c; the two internal headers it includes are stand-ins in
 capi/standin with the one function and the one macro it uses). They leave
-the unsupported ledger, which is 56 functions now. `ruby/test_memory_view.rb`
+the unsupported ledger, which was 56 functions then (62 with the six
+ruby/spec's extensions needed to load, below). `ruby/test_memory_view.rb`
 passes 24 of 24 here (0 at the baseline, where the file stopped at its
 require). Its last test calls the extension's methods from another Ractor:
 a method that is a C function may be called from any Ractor now, where one
@@ -5174,5 +5175,37 @@ out: strscan (written against Onigmo's own structs: its substitute for
 (`rb_io_extract_modeenc`, Onigmo's `onigenc_get_right_adjust_char_head`);
 this interpreter has its own StringScanner and StringIO.
 
-**Next**: the larger groups of the C API not written yet (capi/README.md,
-"What is missing"), by what the next gems need.
+**ruby/spec's C API specs run, on both sides.** `optional/capi` is 46 spec
+files, each with a C extension that calls the functions its examples are
+about; README.md listed them as not measured because they are built with
+mkmf. `tools/capi_spec_check.py` builds each extension for both rubies and
+runs each file on both with the spec shim; the count of passing examples per
+file is recorded in `capi/check/spec_expect.tsv`, and CI (macOS) holds the
+reference to its recorded count and mere-ruby to no less than its own.
+
+- The first run: 756 of the reference's 2,372 examples passed, and 20 files
+  did not report at all -- 55 functions were missing among them, and one
+  missing function keeps a whole extension from loading. With those written
+  (capi/needed.c: `rb_iterate`, the `rb_fiber_*` and `rb_set_*` families,
+  `rb_make_exception`, `rb_class_*instance_methods`, `rb_reg_match`,
+  `rb_io_open_descriptor`, the descriptor sets of thread.c,
+  `rb_thread_fd_select` and `rb_thread_wait_fd` as the interpreter's own
+  wait so that other threads run meanwhile, ...) and six more in the ledger
+  (global variables backed by C, an encoding's alias, a TracePoint's state):
+  **2,242 of 2,584** (the reference's count grew as files that had not
+  loaded there either, for a helper this tool had left out, came in).
+  16 files pass every example the reference passes.
+- It found a crash: `rb_get_alloc_func` answered NULL for a class no C
+  allocator was defined on, and ruby/spec's allocator calls its
+  superclass's. It answers ruby's own allocator now (an instance made the
+  builtin way), and NULL only after `rb_undef_alloc_func` -- which is kept
+  apart from "no C allocator": `allocate` and `new` raise "allocator
+  undefined for C" then.
+- Not reporting yet on this side: io_spec and thread_spec (both reach the
+  120-second bound: a wait in C that the interpreter's threads cannot end),
+  and digest_spec (no `ruby/digest.h`). The rest of the difference is
+  examples, file by file, in the record.
+
+**Next**: the examples of `optional/capi` that differ, largest files first
+(string_spec 280 of 314, globals_spec 17 of 44 -- global variables backed
+by C -- class_spec, struct_spec, encoding_spec), and io_spec / thread_spec.
