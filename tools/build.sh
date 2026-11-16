@@ -4,6 +4,9 @@
 #   ./tools/build.sh            -O2 -- the build that sweeps and the build that ships
 #   ./tools/build.sh --fast     -O1 -- the build for "edit, run one witness, edit again"
 #   ./tools/build.sh --cc-only  skip the emit and compile the mr.c that is there
+#   ./tools/build.sh --relink   the same, and mr.c itself is compiled only when it
+#                               is newer than the mr.o kept from the last --relink
+#                               (for work on the C beside it: capi/, tools/*_glue.c)
 #
 # Measured 2026-09-22 on this machine (Apple silicon), `/usr/bin/time -p`:
 #
@@ -42,10 +45,12 @@ cd "$root" || exit 2
 mode=O2
 opt=-O2
 emit=1
+relink=0
 for a in "$@"; do
   case "$a" in
     --fast|-O1)  mode=O1; opt=-O1 ;;
     --cc-only)   emit=0 ;;
+    --relink)    emit=0; relink=1 ;;
     -h|--help)   sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "build.sh: unknown argument '$a'" >&2; exit 2 ;;
   esac
@@ -77,17 +82,19 @@ fi
 #                     more; Apple's clang allows more by default but the flag is
 #                     harmless there. tools/bracket_depth_check.sh is the gate.
 #   -lm               Linux needs it spelled out
+#   -rdynamic -ldl    an extension library finds Ruby's C API (capi/*.c) in the
+#                     executable that loads it; Mach-O exports those by default
 case "$(uname -s)" in
   Darwin) plat="-Wl,-stack_size,0x20000000 -fbracket-depth=1024" ;;
-  *)      plat="-fbracket-depth=1024 -lm"
+  *)      plat="-fbracket-depth=1024 -lm -rdynamic -ldl"
           # Clang's parser also uses the process stack for the emitted C.
           # Match the interpreter's stack budget during compilation itself.
           ulimit -s 524288 || exit 2 ;;
 esac
 
 if [ "$emit" = 1 ]; then
-  "$MERE" --ffi-header tools/native_probe/reentry.mere > tools/native_probe/reentry.h || exit 1
-  "$MERE" --ffi-header tools/native_probe/exception_api.mere > tools/native_probe/exception_api.h || exit 1
+  # (Ruby's C API: what capi/*.c know of the interpreter's side)
+  "$MERE" --ffi-header m_capi_api.mere > capi/mere_capi.h || exit 1
   printf 'emit   %s -c main.mere > mr.c\n' "$MERE"
   "$MERE" -c main.mere > mr.c.new || { echo "build.sh: emit failed" >&2; rm -f mr.c.new; exit 1; }
   mv -f mr.c.new mr.c
@@ -159,8 +166,20 @@ printf 'cc     clang %s %s mr.c tools/*_glue.c libprism.a with OpenSSL -> mere-r
 # ⚠ NEVER `cp` OVER A RUNNING BINARY -- the text pages of a process that is
 # mid-run are backed by that file, and overwriting them SIGKILLs it or, worse,
 # gives it another build's instructions. Build beside it and rename.
+# (--relink keeps the interpreter's own object: its two minutes are most of a
+#  build, and none of them is the C being worked on. The object is kept per
+#  optimisation level, and never used by a build that did not ask for it.)
+main_c=mr.c
+if [ "$relink" = 1 ]; then
+  main_o="mr.$mode.o"
+  if [ ! -f "$main_o" ] || [ mr.c -nt "$main_o" ]; then
+    # shellcheck disable=SC2086
+    clang $opt -w ${plat%%-Wl,*} -fbracket-depth=1024 -c mr.c -o "$main_o" || { rm -f "$main_o"; exit 1; }
+  fi
+  main_c="$main_o"
+fi
 # shellcheck disable=SC2086
-clang $opt -w $plat -I "$root/vendor/prism/include" mr.c "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" "$root/tools/native_probe/bridge.c" "$root/tools/native_probe/reentry.c" "$root/tools/native_probe/handle_slots.c" "$root/tools/native_probe/exception_bridge.c" "$root/tools/native_probe/typed_bridge.c" -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
+clang $opt -w $plat -I "$root/vendor/prism/include" "$main_c" "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" -DMR_CAPI_BUILD -I "$root/capi/include" -I "$root/capi" -I "$root/capi/vendor" "$root"/capi/*.c -pthread "$plib" "$@" -o mere-ruby.new || { rm -f mere-ruby.new; exit 1; }
 /bin/mv -f mere-ruby.new mere-ruby
 
 # ...and say which build this is, where something that must not be misled can
