@@ -2027,7 +2027,8 @@ class RubyVM::InstructionSequence
       end
       # (a file's own return answers nothing: rb_warn at compile, which a
       #  file compiled for the VM to run says as ruby says it)
-      if u.type == :top && u.opts[:vm_file] && n.arguments
+      # (rb_warn: nothing at all under -W0, where $VERBOSE is nil)
+      if u.type == :top && u.opts[:vm_file] && n.arguments && !$VERBOSE.nil?
         Warning.warn("#{u.path}:#{n.location.start_line}: warning: argument of top-level return is ignored\n")
       end
       sp_l = u.new_label

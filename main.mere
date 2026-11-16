@@ -6636,7 +6636,9 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
     // freezing an object seals its ivars too, so an attr writer (or any @x =)
     // on a frozen receiver is a FrozenError, not a silent write.
     (let slf = lv_get env "self" in
-     let _ = (if val_frozen_mut slf && (if str_len n > 2 && str_eq (substring n 0 2) "__" then false else true)
+     // (...and so does an immediate's, as SIVarAssign refuses it: the VM's
+     //  setinstancevariable comes here -- `1.instance_eval { @a = 1 }`)
+     let _ = (if (val_frozen_mut slf || val_is_immediate slf) && (if str_len n > 2 && str_eq (substring n 0 2) "__" then false else true)
               // ⚠ inspect_w, not inspect, and raise_exc_iv, not raise_exc.
               //   The bare `inspect` has no world and answers the placeholder
               //   "#<object>" for every object, so a frozen attr writer
@@ -29028,6 +29030,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       | _ -> false) ->
             arr_new (Cons (arr_new (Cons (VSym "req", Nil)),
                            Cons (arr_new (Cons (VSym "rest", Nil)), Nil)))
+          // (...and so has it on the VM, whose block names the slot `_1`)
+          | Cons (n9, Nil) when str_eq n9 "_1" && vm_it_body body ->
+            arr_new (Cons (arr_new (Cons (VSym (if is_lam then "req" else "opt"), Nil)), Nil))
           | ps1 -> arr_new (param_kw_order (param_meta_of is_lam ps1 (block_defaults body)))))
     else if (str_len name == 5 && str_eq name "arity") && map_has proc_arity (str_of_int pid) then
       map_get proc_arity (str_of_int pid)
@@ -29316,6 +29321,12 @@ and responds_pm = fn env -> fn world -> fn (recv: Val) -> fn (name: str) ->
 // ⚠ It is NOT the same answer as _1, only the same arity: the parameter has no
 // NAME (`[[:req]]`, not `[[:req, :_1]]`), because `it` is a keyword rather
 // than a variable the caller can see.
+// whether a block's body is a VM sequence whose parameter is `it`
+and vm_it_body = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (SVm (i, g), _) -> map_has vm_it_seqs (str_of_int i) && (match map_get vm_it_seqs (str_of_int i) with VInt g9 -> g9 == g | _ -> false)
+  | Cons (_, t) -> vm_it_body t
 and uses_it_stmts = fn (body: Stmt list) ->
   match body with
   | Nil -> false
@@ -58707,6 +58718,9 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
        | SAlias (n1, n2) -> let _ = do_class_alias world cls n1 n2 in FNext VNil
        // `include M` records the module for method lookup fallback.
        | SInclude (m, pre) ->
+         // (in an instance_eval on a class, `include m` is Module#include called
+         //  on the class itself -- not on the singleton the body defines into)
+         let cls = (if map_has cenv "__ieval" then (match map_get cenv "__ieval" with VClass c9 -> c9 | _ -> cls) else cls) in
          let method_name = (if pre then "prepend" else "include") in
          if cls_meth_own world cls method_name then
            (let argument = (if lv_has cenv m then lv_get cenv m else eval_e cenv world noblk (EConst m)) in
@@ -58826,7 +58840,9 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                        // define_method adds a method, so the hook fires for it too
                        run_method_added world cls nm)
                     | _ -> ()) in
-           FNext VNil
+           // (define_method answers the name, as a statement too: `retvals <<
+           //  define_method(:foo) {}` on the VM comes here)
+           FNext (match fargs with Cons (ESym nm, _) -> VSym nm | _ -> VNil)
          else exec_stmt cenv world noblk s
        // everything else is plain code — a class body executes.
        | _ -> exec_stmt cenv world noblk s) in
@@ -63740,6 +63756,8 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   //  empty one, for a TracePoint's binding of the frame to ask: vm_named)
   let rec dapp = fn (a: str list) -> fn (b: str list) -> (match a with Nil -> b | Cons (h, t) -> Cons (h, dapp t b)) in
   let decl = (if (yld / 2) % 2 == 1 then named locs else dapp (shadow locs) (Cons ("", named locs))) in
+  let _ = (if ipn == 0 && kind == 1 then map_set vm_it_seqs (str_of_int id) (VInt gen)
+           else if map_has vm_it_seqs (str_of_int id) then map_delete vm_it_seqs (str_of_int id) else ()) in
   let _ = vec_set vm_meta id (lbl, pth, kind, gen, optn, optp optl, decl, kids, bp, bb,
                               // (1: a yield, a `defined?(yield)` or a super is in it; 2: the
                               //  method takes a block as ruby's compiler decides it -- use_block)
@@ -64332,18 +64350,21 @@ and vm_send = fn env -> fn world -> fn blk -> fn st -> fn (mid: str) -> fn (fl: 
   let in_cls = map_has env "__cscope" && (match (if map_has env "self" then map_get env "self" else VNil) with VClass _ -> true | _ -> false) in
   let rec syms = fn (xs: Val list) -> (match xs with Cons (VSym y, t) -> Cons (y, syms t) | _ -> (Nil : str list)) in
   let rec all_syms = fn (xs: Val list) -> (match xs with Nil -> true | Cons (VSym _, t) -> all_syms t | _ -> false) in
+  // (`private [:a, :b]`: one Array of names is the names, as ruby's
+  //  rb_check_array_type in set_visibility reads it)
+  let vargs = (match args with Cons (VArr a9, Nil) when (match deref a9 with Nil -> false | _ -> all_syms (deref a9)) -> deref a9 | _ -> args) in
   // `private` and its kin written as bare calls with symbols are the
   // evaluator's visibility statement (the parser's SVis), run in the frame
   // itself: a bare `private` sets the frame's mode for the defs that follow
   // (...and with names only at the top level, where the parser makes the
   //  statement of them; in a class they are Module#private's arguments)
   if bid < 0 && vm_bit fl 4 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 64 then false else true)
-     && (match kws with Nil -> true | _ -> false) && all_syms args
+     && (match kws with Nil -> true | _ -> false) && all_syms vargs
      && (argc == 0 || in_cls || (match recv with VMain -> true | _ -> false))
      && (str_eq mid "private" || str_eq mid "public" || str_eq mid "protected" || str_eq mid "module_function"
          || ((str_eq mid "private_constant" || str_eq mid "public_constant" || str_eq mid "private_class_method"
               || str_eq mid "public_class_method") && argc > 0 && in_cls))
-  then vm_push st (stmt (SVis (mid, syms args)))
+  then vm_push st (stmt (SVis (mid, syms vargs)))
   // (...and attr_reader / attr_writer / attr_accessor of symbols in a class
   //  body are its attribute statement)
   else if bid < 0 && in_cls && vm_bit fl 4 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 64 then false else true)
@@ -64818,7 +64839,9 @@ and vm_var_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: s
                              | v9 -> v9)
   else if o == 21 then (if a == 0 then map_set env n (vm_pop st) else vm_setup env n a (vm_pop st))
   else if o == 22 then vm_push st (vm_ev env world blk (EIVar (substring n 1 (str_len n))))
-  else if o == 23 then assign_one env world n (vm_pop st)
+  else if o == 23 then
+    (let _ = (if str_len n > 1 && str_eq (substring n 0 2) "@@" then vm_refine_warn env world else ()) in
+     assign_one env world n (vm_pop st))
   else if o == 24 then vm_push st (vm_ev env world blk (EVar n))
   else if o == 25 then (let _ = gvar_assign_checked env world n (vm_pop st) in ())
   else if o == 26 then vm_push st (vm_ev env world blk (EConst n))
@@ -64828,6 +64851,7 @@ and vm_var_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: s
   else if a == 0 then
     (let _ = vm_pop st in
      let v = vm_pop st in
+     let _ = vm_refine_warn env world in
      let key = const_assign_key env n in
      let _ = const_store world key v in
      name_anon key v)
@@ -64840,6 +64864,15 @@ and vm_var_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: s
      match k with
      | VClass "Object" -> (let _ = const_store world n v in name_anon n v)
      | _ -> (let _ = vm_eval env world blk (Cons (k, Cons (v, Nil))) (fn (es: Expr list) -> EScopedAssign (vm_nth_e es 0, n, vm_nth_e es 1)) in ()))
+// (a constant or class variable written in a `refine` body lands on the
+//  module around it, and ruby says so, Bug #10103 -- register_class_v's
+//  warning, for the body the VM runs)
+and vm_refine_warn = fn env -> fn world ->
+  if map_has env "__cscope" then
+    (match (if map_has env "self" then map_get env "self" else VNil) with
+     | VClass c when is_refine_impl c -> rb_warn world "not defined at the refinement, but at the outer class/module"
+     | _ -> ())
+  else ()
 and vm_value_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: str) -> fn (a: int) -> fn (b: int) -> fn (v: Val) ->
   // splatkw: the `**` operand under a block argument made a Hash (#to_hash;
   // nil and a Hash as they are)
