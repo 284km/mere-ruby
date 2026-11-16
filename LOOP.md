@@ -4847,3 +4847,61 @@ runs on the evaluator.
   Ruby takes 2.1 s for pp.rb's 738 lines: before whole files run on the VM
   it has to be native (note 552).
 - Next: whole files on the VM (the compiler made native first), then speed.
+
+## 2026-11-16 (65): five real pure Ruby gems run their own upstream test files
+
+Gem-suite rounds 1-3, on main c64d0ae4, independently of #86 (AST), #87
+(C API) and #88 (VM). This measures original upstream tests, beyond the
+29-gem require-only inventory. The final lock has 62 files and 1,969
+reference tests. Counts below are FILE verdicts, not case counts:
+
+| suite | initial MATCH / RED / BOTH | latest MATCH / RED / BOTH | other |
+|---|---|---|---|
+| minitest 5.25.5 | 3 / 4 / 0 | 3 / 4 / 0 | mock now completes all 94 tests |
+| rack 3.2.0 | 29 / 9 / 0 | 30 / 8 / 0 | 1 MEMORY on both builds |
+| rack-test 2.2.0 | 7 / 1 / 0 | 7 / 1 / 0 | assertion-count reflection difference |
+| public_suffix 6.0.2 | 7 / 0 / 0 | 7 / 0 / 0 | |
+| base64 0.2.0 | 1 / 0 / 0 | 1 / 0 / 0 | |
+
+- **Reproducible sources and measurements.** `gemtest/suites.lock.json`
+  pins release commits, full source digests, test-file inventory, commands
+  and every pure Ruby development dependency's archive and extracted tree.
+  Restore checks the runtime dependency closure and rejects C extensions.
+  Sources stay in an external cache; measurement retrieves nothing. Each
+  side/file gets its own source copy and seed 1. Raw stdout, stderr and exit
+  are saved separately. Existing CI supervision bounds the whole process
+  family to 600 seconds and 2 GiB, with no option to increase either.
+- **Honest file verdicts.** MATCH requires successful exits, non-skipped
+  tests, assertions and identical summaries. No summary, zero tests and all
+  skips cannot pass. Reference failures remain BOTH, and resource limits
+  remain explicit. The final baseline has no BOTH or timeout; its remaining
+  memory failure is Rack's multipart file. Initial and latest results are
+  saved separately and compared file by file, with no lost MATCH or changed
+  reference coverage. `SUITES_GAPS.md` records every remaining difference,
+  distinguishing confirmed symptoms from causes still under investigation.
+- **Two local semantic fixes.** `pct_strict_value` follows escaped newlines
+  backwards before deciding whether `%` starts a literal. Minitest's
+  continued format string now parses; its original mock file runs 94 tests
+  instead of stopping with SyntaxError (still 2 failures / 13 errors).
+  `cls_meth_own` respects a local builtin alias before an inherited Ruby
+  class method: Rack::MockResponse's `alias [] new` no longer calls
+  Rack::Response.[] with its different argument order. The original mock
+  response file becomes MATCH (24 tests / 100 assertions). Witnesses 667
+  and 668. These are the only interpreter functions changed; no new global
+  let, VM, AST tree, C API or collector change.
+- **Selection and reference readiness.** Rack 3.1.12 requires removed
+  cgi/cookie, so 3.2.0 was selected before the final baseline. Hoe and logger
+  are explicitly pinned so minitest's task file and Rack's logger tests run
+  on the reference. These environment repairs are not interpreter gains.
+  Kramdown 2.5.1's conversion tests depend on tidy and optional Rouge and
+  stringex (reference 19 failures / 11 errors); it is explicitly deferred
+  in the lock, not selectively patched or counted as passing.
+- **Validation.** Corpus 690/690 before and 692/692 after; test_alias
+  17 MATCH / 1 RED and test_syntax 167 MATCH / 1 RED / 2 BOTH, identical
+  file counts to both handoff CI 43548292351 and main CI 43807166928.
+  Dead/duplicate definitions, GC roots and loop RSS gates pass; generated
+  bracket depth stays 895/1024. Six harness negative controls cover zero
+  tests, missing summaries/files, reference failures, limits and source
+  mutation/shadowing. The separate `Gem suites` workflow uses actions/cache
+  and runs on macOS and Linux, without changing existing job durations or
+  any per-file limits. Full existing-suite regression checks still gate merge.
