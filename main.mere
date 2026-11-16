@@ -1447,6 +1447,22 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter flow_sig mk in
   // (the to_a Arrays the ISeq VM's loaded programs were decoded from)
   let _ = map_iter vm_keep (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
+  // (the ISeq VM's operand stacks in use, up to their depth: a value can be
+  //  held by a stack alone -- `[$g, ($g = nil)]`. A slot in the free list is
+  //  no frame's; one a suspended fiber's frame holds is not in it.)
+  let _ = (let nfree = vec_get vm_pool_free 0 in
+           let free = map_new () in
+           let rec fr = fn (i: int) -> (if i > nfree then () else (let _ = map_set free (vec_get vm_pool_free i) 1 in fr (i + 1))) in
+           let _ = fr 1 in
+           let rec slots = fn (k: int) ->
+             (if k >= vec_len vm_pool then ()
+              else (let _ = (if map_has free k then ()
+                             else (let (stk, regs) = vec_get vm_pool k in
+                                   let sp = vec_get regs 0 in
+                                   let rec each = fn (i: int) -> (if i >= sp || i >= vec_len stk then () else (let _ = gc_mark_val live (vec_get stk i) in each (i + 1))) in
+                                   each 0)) in
+                    slots (k + 1))) in
+           slots 0) in
   // (a `break` value on its way out of Lazy#each)
   let _ = map_iter lz_brk mk in
   // (defined?'s shared answers)
@@ -8408,6 +8424,7 @@ and core_metadata_stmts = fn (body: Stmt list) ->
 // read in its place -- so `n.times(&code)` over that block takes the same
 // way on the VM as on the evaluator (test_module's memory-leak tests).
 and core_metadata_vm = fn (body: Stmt list) ->
+  if map_len vm_plan_body == 0 then body else
   match core_metadata_stmts body with
   | Cons (SVm (i, g), Nil) when map_has vm_plan_body (str_of_int i) ->
     (match map_get vm_plan_body (str_of_int i) with
@@ -64183,54 +64200,11 @@ and vm_popn = fn st -> fn (n: int) ->
   let xs = vm_peekn st n in
   let _ = vec_set regs 0 (vec_get regs 0 - n) in
   xs
-// The stack's values, where a collection looks for them: an Array in the
-// frame's env, written before anything that may run Ruby (a send, a
-// conversion, a constant's autoload). A value can be held by the stack ALONE
-// -- `[$g, ($g = nil)]` -- and the stack is a Vec the collector does not read.
-// Only what lies BELOW the instruction's own inputs: those are in the hands
-// of what runs by then -- its receiver and arguments, held as the evaluator
-// holds the values of its own call. (Most sends have nothing below them --
-// `s += i` -- and write nothing: an Array rewritten per send was most of
-// what a loop's run kept.)
-and vm_root = fn env -> fn st -> fn (below: int) ->
-  let (stk, regs) = st in
-  // (values that hold nothing a collection could free -- an Integer, nil, a
-  //  Symbol -- need no root: when that is all there is below, nothing is
-  //  written, and what an earlier send rooted is let go of once)
-  let rec plain = fn (i: int) ->
-    (if i >= below then true
-     else (match vec_get stk i with
-           | VInt _ -> plain (i + 1) | VBool _ -> plain (i + 1) | VNil -> plain (i + 1)
-           | VSym _ -> plain (i + 1) | VFlt _ -> plain (i + 1) | VClass _ -> plain (i + 1) | VMain -> plain (i + 1)
-           | _ -> false)) in
-  if below <= 0 && vec_get regs 1 == 0 then ()
-  else if below > 0 && vec_get regs 1 == 0 && plain 0 then ()
-  else
-    (match (if map_has env "__vm~stk" then map_get env "__vm~stk"
-            else (let a9 = arr_new Nil in let _ = map_set env "__vm~stk" a9 in a9)) with
-     | VArr sid ->
-       (let rec bottom = fn (i: int) -> (if i >= below then (Nil : Val list) else Cons (vec_get stk i, bottom (i + 1))) in
-        let _ = arr_set sid (bottom 0) in
-        vec_set regs 1 (if below > 0 then below else 0))
-     | _ -> ())
-// how many values an instruction that may run Ruby takes off the stack
-and vm_inputs = fn (o: int) -> fn (a: int) -> fn (b: int) -> fn (v: Val) ->
-  if o == 29 || o == 62 then b + 1 + (match v with VArr k -> arr_len k | _ -> 0) + (if vm_bit a 2 then 1 else 0)
-  else if o == 60 then 1
-  else if o == 61 || o == 63 || o == 64 then 2
-  else if o == 74 then 1
-  else if o == 75 then 2
-  else if o == 76 then 1
-  else if o == 65 then 1
-  else if o == 67 then b
-  else if o == 71 then 2
-  else if o == 72 || o == 73 then b + 2 + (match v with VArr k -> arr_len k | _ -> 0)
-  else if o == 55 then b + (match v with VArr k -> arr_len k | _ -> 0)
-  else if o == 11 || o == 35 || o == 36 || o == 37 then a
-  else if o == 44 then a + 1
-  else if o == 12 || o == 28 || o == 42 || o == 43 then 2
-  else if o == 23 || o == 25 || o == 38 || o == 40 || o == 41 || o == 45 then 1
-  else 0
+// (the stack's values are roots where the collector reads them: the pool's
+//  stacks in use, gc_mark_roots -- a value can be held by the stack alone,
+//  `[$g, ($g = nil)]`. They were written into an Array in the frame's env
+//  before every send that had something below its inputs, which was a tenth
+//  of `h[k] = i.to_s` in a loop.)
 // values handed to an expression: each bound to a hidden local (`__vm<i>`,
 // from i), read back by an EVar
 and vm_bind = fn env -> fn (xs: Val list) -> fn (i: int) ->
@@ -64694,7 +64668,7 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
   // :rescue. A hook runs Ruby: what the stack holds is rooted first.
   let _ = (if vec_get ev pc == 0 then ()
            else if vec_get cov_st 0 != 2 && (if map_len hook_flags > 0 && map_has hook_flags "tp" then false else true) then ()
-           else (let _ = vm_root env st (vec_get regs 0) in vm_events env world (vec_get ev pc) (vec_get ln pc))) in
+           else vm_events env world (vec_get ev pc) (vec_get ln pc)) in
   let n = vec_get na pc in
   let a = vec_get ia pc in
   // (two Integers and a plain operator -- `i < n`, `s += i` -- answered here,
@@ -64704,8 +64678,6 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
   if o == 29 && vec_get ib pc == 1 && vec_get ic pc < 0 && vm_bit a 16 && (if vm_bit a 4 then false else true)
      && vm_int_fast world st n then pc + 1
   else
-  let _ = (if o == 11 || o == 12 || (o >= 22 && o <= 45) || o == 55 || (o >= 59 && o <= 73)
-           then vm_root env st (vec_get regs 0 - vm_inputs o a (vec_get ib pc) (vec_get ov pc)) else ()) in
   // throw: the sequence is left with the value on top, and regs' slot 2 says
   // how -- 1 return, 2 break, 3 next, 4 retry, 5 redo, 6 the exception again
   // (throw 0) -- for whoever ran it to act on (vm_enter, vm_region)
@@ -65344,7 +65316,7 @@ and vm_run_stmt = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int)
 // A program run in the frame `env`: the value it leaves and how it left
 // (0 leave, 1 return, 2 break, 3 next, 4 retry, 5 redo, 6 the exception
 // again). The stack and its registers are this run's own and go with its
-// region: 0 the depth, 1 how much of it vm_root last wrote, 2 how the
+// region: 0 the depth, 1 (unused), 2 how the
 // sequence was left, 3 where a throw was, 4 and 5 vm_region's, 6 to 11 a jump in flight (where
 // it lands, the stack there, whether its value is pushed, its catch
 // entry's start and end, and how the frame is left when it lands nowhere).
@@ -65419,6 +65391,21 @@ and vm_pc_of_line = fn (id: int) -> fn (ln: int) ->
 // its parameters bound there. The optional parameters' defaults are the
 // sequence's own code, entered at the label for how many were given: one
 // the evaluator bound to EVmArg's value was not.
+// a program of two instructions, the second a leave and the first one that
+// puts a value no Ruby code runs for: nil, self, a literal, an ivar
+and vm_trivial = fn (id: int) ->
+  let (op, _, _, _, _, _, _, _) = vec_get vm_code id in
+  vec_len op == 2 && vec_get op 1 == 50
+  && (let o = vec_get op 0 in o == 1 || o == 2 || o == 3 || o == 22)
+// ...and that value, as vm_stack_op puts it
+and vm_trivial_value = fn env -> fn world -> fn blk -> fn (id: int) ->
+  let (op, na, ia, _, _, ov, ln, _) = vec_get vm_code id in
+  let _ = cur_line_set (vec_get ln 0) in
+  let o = vec_get op 0 in
+  if o == 1 then VNil
+  else if o == 2 then lv_get env "self"
+  else if o == 3 then (if vec_get ia 0 == 1 then str_fstring_text (vec_get na 0) else vec_get ov 0)
+  else (let n = vec_get na 0 in vm_ev env world blk (EIVar (substring n 1 (str_len n))))
 and vm_enter = fn env -> fn world -> fn blk -> fn (id: int) -> fn (gen: int) ->
   let (_, _, kind, g, optn, optp, shadow, _, _, _, _, _, _, _) = vec_get vm_meta id in
   if g != gen || kind < 0 then
@@ -65459,6 +65446,13 @@ and vm_enter = fn env -> fn world -> fn blk -> fn (id: int) -> fn (gen: int) ->
                      (let _ = raise_exc world "NotImplementedError" "mere-ruby: a Continuation re-entered into the middle of an expression on the ISeq VM" in 0)
                    else p)
                 else entry optn optp) in
+     // (a body that only puts one value and leaves -- an empty block or
+     //  method, `{ 1 }`, `def x; @x; end` -- answers it without a frame of
+     //  the VM's own: vm_trivial)
+     if pc0 == 0 && (kind == 1 || kind == 2) && vm_trivial id
+        && vec_get cov_st 0 != 2 && (if map_len hook_flags > 0 && map_has hook_flags "tp" then false else true)
+     then FNext (vm_trivial_value env world blk id)
+     else
      let (v, how) = vm_exec env world blk id pc0 in
      if how == 1 then FReturn v else if how == 2 then FBreak v else if how == 3 then FLoopNext v
      // (a retry or a redo nothing in the frame took: there is nothing it is of)
@@ -65470,7 +65464,7 @@ and vm_enter = fn env -> fn world -> fn blk -> fn (id: int) -> fn (gen: int) ->
 // no refinement, its own `$~`), labelled as the sequence is -- ruby's
 // `<compiled>:2:in '<compiled>'` -- over the ISeq#eval that called it. The
 // env holds the sequence's locals under their own names, and is rooted by
-// depth like any frame's; so is the stack's Array (vm_root). The to_a array
+// depth like any frame's; so is the stack (gc_mark_roots). The to_a array
 // the programs were decoded from is rooted while they are loaded (vm_keep).
 // All of it is put back however the run ends, and the programs given back
 // with it unless something the run made still names them: a Proc, which
