@@ -247,6 +247,9 @@ class RubyVM::InstructionSequence
       raise NotImplementedError, "RubyVM::InstructionSequence: tailcall_optimization is not compiled yet" if opts[:tailcall_optimization]
       raise NotImplementedError, "RubyVM::InstructionSequence: instructions_unification is not compiled yet" if opts[:instructions_unification]
       po = { filepath: path, line: line }
+      # (a source String in another encoding is read in it, as ruby reads
+      #  the String it is given: pm_options_encoding_set)
+      po[:encoding] = src.encoding.name unless src.encoding == Encoding::UTF_8 || src.encoding == Encoding::US_ASCII
       po[:frozen_string_literal] = true if opts[:frozen_string_literal]
       result = Prism.parse(src, **po)
       raise SyntaxError, result.errors.map(&:message).join("\n") unless result.success?

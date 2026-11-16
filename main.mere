@@ -6885,9 +6885,14 @@ and ractor_cvar_check = fn world -> fn (cls: str) -> fn (name: str) ->
 // reaches a variable outside it is refused, proc.c's proc_isolate). `acc`
 // gathers the names, `own` the nested parameters.
 and ovr_name = fn acc -> fn (n: str) ->
+  // (a local's name starts with a lower-case letter, `_`, or a character
+  //  that is not ASCII -- `あ = []`; and the anonymous `*` and `**` are
+  //  locals under the evaluator's names for them)
   if str_len n > 0 && (if str_starts_with n "__" then false else true)
-     && ((ord (char_at n 0) >= 97 && ord (char_at n 0) <= 122) || str_eq (char_at n 0) "_")
-  then map_set acc n 1 else ()
+     && ((ord (char_at n 0) >= 97 && ord (char_at n 0) <= 122) || str_eq (char_at n 0) "_" || ord (char_at n 0) >= 128)
+  then map_set acc n 1
+  else if str_eq n "__anonrest" || str_eq n "__anonkw" then map_set acc n 1
+  else ()
 and ovr_params = fn own -> fn (ps: str list) ->
   list_iter ps (fn (p9: str) ->
     (let q9 = (if str_starts_with p9 "**" then substring p9 2 (str_len p9)
@@ -6940,7 +6945,10 @@ and ovr_expr = fn acc -> fn own -> fn (e: Expr) ->
   | EMethodB (r, _, args, ps, b) -> (let _ = ovr_expr acc own r in let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
   | ESafeB (r, _, args, ps, b) -> (let _ = ovr_expr acc own r in let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
   | ECallB (_, args, ps, b) -> (let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
-  | ESuperB (_, args, ps, b) -> (let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
+  // (a bare `super` reads every parameter of the method it is in: noted,
+  //  for proc_outer_names to name them)
+  | ESuperB (z, args, ps, b) -> (let _ = (if z then map_set acc (ovr_zsuper_key ()) 1 else ()) in
+                                 let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
   | ELambda (ps, b) -> ovr_blk acc own ps b
   | EArr es -> ovr_exprs acc own es
   | EHsh es -> ovr_exprs acc own es
@@ -6948,7 +6956,7 @@ and ovr_expr = fn acc -> fn own -> fn (e: Expr) ->
   | ETern (a, b, c) -> (let _ = ovr_expr acc own a in let _ = ovr_expr acc own b in ovr_expr acc own c)
   | EYield es -> ovr_exprs acc own es
   | ERaise es -> ovr_exprs acc own es
-  | ESuper (_, es) -> ovr_exprs acc own es
+  | ESuper (z, es) -> (let _ = (if z then map_set acc (ovr_zsuper_key ()) 1 else ()) in ovr_exprs acc own es)
   | ESplat a -> ovr_expr acc own a
   | EKwSplat a -> ovr_expr acc own a
   | EBlockPass a -> ovr_expr acc own a
@@ -31256,6 +31264,17 @@ and proc_isolate = fn env -> fn world -> fn (pid9: int) -> fn (how9: int) -> fn 
      | Cons (_, t) when n < 6 -> reasg t (n + 1)
      | _ -> (Nil : str list)) in
   let re9 = reasg body9 0 in
+  // (a block that ASSIGNS a local of the scope around it is refused first,
+  //  with every such local named: ruby's read_only check)
+  let wr9 = (let vid9 = vm_body_id body9 8 in if vid9 >= 0 then vm_outer_writes vid9 else deep_targets body9) in
+  let rec written9 = fn (ns: str list) ->
+    (match ns with
+     | Nil -> (Nil : str list)
+     | Cons (n9, t9) -> if list_has_str wr9 n9 then Cons (n9, written9 t9) else written9 t9) in
+  let _ = (match written9 outer9 with
+           | Nil -> ()
+           | ws9 -> (let _ = raise_exc world "ArgumentError"
+                               ("can not make a Proc shareable because it accesses outer variables (" ++ str_join_c ws9 ++ ").") in ())) in
   let e9 = map_new () in
   let _ = list_iter outer9 (fn (n9: str) ->
             if list_has_str re9 n9 then
@@ -31264,7 +31283,7 @@ and proc_isolate = fn env -> fn world -> fn (pid9: int) -> fn (how9: int) -> fn 
               (let v9 = lv_get cenv9 n9 in
                if ractor_shareable env world v9 then map_set e9 n9 v9
                else (let _ = raise_exc world "Ractor::IsolationError"
-                               ("cannot make a shareable Proc because it can refer unshareable object " ++ inspect_w env world v9 ++ " from variable '" ++ n9 ++ "'") in ()))) in
+                               ("cannot make a shareable Proc because it can refer unshareable object " ++ inspect_w env world v9 ++ " from variable '" ++ ovr_shown n9 ++ "'") in ()))) in
   // what the env needs of where it was written -- self, the class a def
   // goes to, the visibility -- nearest first; and the names it could see
   let seen9 = map_new () in
@@ -31304,11 +31323,26 @@ and proc_outer_names = fn (pid9: int) ->
   let _ = ovr_params own9 ps9 in
   let _ = ovr_stmts acc9 own9 body9 in
   let out9 = map_new () in
-  let _ = map_iter acc9 (fn (n9: str) -> fn (_u: int) ->
-            if map_has own9 n9 then ()
-            else if lv_has cenv9 n9 then map_set out9 (str_of_int (map_len out9)) n9 else ()) in
+  let seen9 = map_new () in
+  let add9 = fn (n9: str) ->
+    (if map_has own9 n9 || map_has seen9 n9 then ()
+     else if lv_has cenv9 n9 then (let _ = map_set seen9 n9 1 in map_set out9 (str_of_int (map_len out9)) n9) else ()) in
+  let _ = map_iter acc9 (fn (n9: str) -> fn (_u: int) -> if str_eq n9 (ovr_zsuper_key ()) then () else add9 n9) in
+  // (a bare `super` in the block: the method's parameters, as it passes them)
+  let _ = (if map_has acc9 (ovr_zsuper_key ()) && lv_has cenv9 "__params" then
+             (match lv_get cenv9 "__params" with
+              | VArr pid -> list_iter (deref pid) (fn (pv: Val) ->
+                              (match pv with
+                               | VStr ph -> (let q9 = pbase (sget ph) in if str_eq q9 "" then () else add9 q9)
+                               | _ -> ()))
+              | _ -> ())
+           else ()) in
   let rec col = fn (i: int) -> (if i >= map_len out9 then (Nil : str list) else Cons (map_get out9 (str_of_int i), col (i + 1))) in
   col 0
+// (the walk's note of a bare `super`: no local's name)
+and ovr_zsuper_key = fn (u: unit) -> chr 6 ++ "zsuper"
+// a local's name as ruby shows it: the anonymous `*` and `**` by their signs
+and ovr_shown = fn (n: str) -> if str_eq n "__anonrest" then "*" else if str_eq n "__anonkw" then "**" else n
 and list_map_sv = fn (xs: str list) -> match xs with Nil -> (Nil : Val list) | Cons (x, t) -> Cons (VSym x, list_map_sv t)
 and isolate_refusal = fn world -> fn (names: str list) ->
   raise_exc world "ArgumentError" ("can not isolate a Proc because it accesses outer variables (" ++ str_join_c names ++ ").")
@@ -63529,7 +63563,11 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   let rec onames = fn (cs: (str * int) list) ->
     (match cs with
      | Nil -> (Nil : str list)
-     | Cons ((n, _), t) -> if str_len n > 0 && (str_eq (char_at n 0) "=" || str_eq (char_at n 0) "!") then onames t else Cons (n, onames t)) in
+     // (...but a write of a local of a sequence around this one stays, as
+     //  "=name": what a shareable Proc may not do -- vm_outer_writes)
+     | Cons ((n, l), t) -> if str_len n > 0 && str_eq (char_at n 0) "!" then onames t
+                           else if str_len n > 0 && str_eq (char_at n 0) "=" then (if l >= 1 then Cons (n, onames t) else onames t)
+                           else Cons (n, onames t)) in
   let gen = vec_get vm_ctl 0 in
   let rec optp = fn (ls: Val list) ->
     (match ls with
@@ -63770,7 +63808,19 @@ and vm_uses_block = fn (id: int) ->
 // a shareable one is given copies of)
 and vm_outer = fn (id: int) ->
   let (_, _, _, _, _, _, _, _, _, _, _, o, _, _) = vec_get vm_meta id in
-  o
+  let rec plain = fn (ns: str list) ->
+    (match ns with
+     | Nil -> (Nil : str list)
+     | Cons (n, t) -> if str_len n > 0 && str_eq (char_at n 0) "=" then plain t else Cons (n, plain t)) in
+  plain o
+// ...and the ones among them it, or a block in it, assigns
+and vm_outer_writes = fn (id: int) ->
+  let (_, _, _, _, _, _, _, _, _, _, _, o, _, _) = vec_get vm_meta id in
+  let rec ws = fn (ns: str list) ->
+    (match ns with
+     | Nil -> (Nil : str list)
+     | Cons (n, t) -> if str_len n > 1 && str_eq (char_at n 0) "=" then Cons (substring n 1 (str_len n), ws t) else ws t) in
+  ws o
 
 // ---- the stack ----
 and vm_push = fn st -> fn (v: Val) ->
