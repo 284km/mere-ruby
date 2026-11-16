@@ -59604,6 +59604,12 @@ and exec_stmt_region_result = fn env -> fn world -> fn blk -> fn (s: Stmt) -> fn
     let _ = cov_line n in FNext VNil
   | SLineQ n -> let _ = (if n < 0 then () else cur_line_set n) in FNext VNil
   | SFile f when str_eq f (cur_file ()) -> FNext VNil
+  // (a program the ISeq VM runs: vm_exec has a region of its own, and one a
+  //  statement inside it -- this one would be a third around them)
+  | SVm (_, _) ->
+    (match exec_stmt env world blk s with
+     | FNext v -> FNext (if keep_result then v else VNil)
+     | flow -> flow)
   | SExpr expression when (not keep_result || discard_native) && discard_native_reflection env world expression ->
     let _ = (if map_has gc_bare "y" then map_delete gc_bare "y" else ()) in
     FNext VNil
@@ -64529,6 +64535,13 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
            else (let _ = vm_root env st (vec_get regs 0) in vm_events env world (vec_get ev pc) (vec_get ln pc))) in
   let n = vec_get na pc in
   let a = vec_get ia pc in
+  // (two Integers and a plain operator -- `i < n`, `s += i` -- answered here,
+  //  as the evaluator's EBin answers them: when no Integer operator is
+  //  redefined and no TracePoint wants the call. ARGS_SIMPLE, no FCALL, one
+  //  argument, no block.)
+  if o == 29 && vec_get ib pc == 1 && vec_get ic pc < 0 && vm_bit a 16 && (if vm_bit a 4 then false else true)
+     && vm_int_fast world st n then pc + 1
+  else
   let _ = (if o == 11 || o == 12 || (o >= 22 && o <= 45) || o == 55 || (o >= 59 && o <= 73)
            then vm_root env st (vec_get regs 0 - vm_inputs o a (vec_get ib pc) (vec_get ov pc)) else ()) in
   // throw: the sequence is left with the value on top, and regs' slot 2 says
@@ -64873,6 +64886,17 @@ and vm_defined = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: 
          (let _ = map_set ce "__vm~0" under in
           vm_ev ce world blk (EDefined (if ty == 7 then EMethod (EVar "__vm~0", n, Nil) else EScopedRead (EVar "__vm~0", n)))))) in
   vm_push st (match r with VNil -> VNil | _ -> if desc == 1 then r else VBool true)
+// (vm_step's Integer fast path: the two values on top, the operator, the
+//  answer in their place -- or false, and nothing changed)
+and vm_int_fast = fn world -> fn st -> fn (op: str) ->
+  match (vm_topn st 1, vm_topn st 0) with
+  | (VInt x, VInt y) ->
+    if map_len hook_flags > 0 && map_has hook_flags "tp" then false
+    else if int_ops_plain world then
+      (let (ok, v) = int_fast_op op x y in
+       if ok then (let _ = vm_pop st in let _ = vm_pop st in let _ = vm_push st v in true) else false)
+    else false
+  | _ -> false
 // the name a flip-flop's state is kept under: the running program (its
 // generation with it: an id is used again), the state's number, the thread
 and vm_ff_key = fn st -> fn (k: int) ->
@@ -65110,7 +65134,30 @@ and vm_loop = fn env -> fn world -> fn blk -> fn cd -> fn (ct: (int * int * int 
     (let (_, _, _, _, _, _, _, ev) = cd in
      let k = (if (vec_get ev pc / 2) % 2 == 1 then vm_region_at ct pc act else 0 - 1) in
      if k >= 0 then vm_loop env world blk cd ct st (vm_region env world blk cd ct st k pc act) lo hi act
-     else (let nx = region VMI { vm_step env world blk cd st pc } in vm_loop env world blk cd ct st nx lo hi act))
+     // (one region a statement, as the evaluator's run_stmts has: the
+     //  instructions up to the next statement's start or protected region
+     //  run in it -- vm_run_stmt)
+     // (...but the first few of a frame run in the frame's own region,
+     //  vm_exec's: a block's body of a statement or two then makes one
+     //  region a call, not two. Past them -- a loop, a long body -- one a
+     //  statement, so what a statement made does not pile up. regs' slot
+     //  14 counts them.)
+     else
+       (let (_, regs) = st in
+        let c = vec_get regs 14 in
+        if c < 8 then
+          (let _ = vec_set regs 14 (c + 1) in
+           let nx = vm_run_stmt env world blk cd st pc lo hi in
+           vm_loop env world blk cd ct st nx lo hi act)
+        else (let nx = region VMI { vm_run_stmt env world blk cd st pc lo hi } in vm_loop env world blk cd ct st nx lo hi act)))
+// the instructions from pc on, until one that starts a statement (a line
+// event) or a protected region, or a jump out of [lo, hi): the pc reached
+and vm_run_stmt = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) -> fn (lo: int) -> fn (hi: int) ->
+  let nx = vm_step env world blk cd st pc in
+  if nx < lo || nx >= hi then nx
+  else
+    (let (_, _, _, _, _, _, _, ev) = cd in
+     if vec_get ev nx % 4 != 0 then nx else vm_run_stmt env world blk cd st nx lo hi)
 // A program run in the frame `env`: the value it leaves and how it left
 // (0 leave, 1 return, 2 break, 3 next, 4 retry, 5 redo, 6 the exception
 // again). The stack and its registers are this run's own and go with its
@@ -65123,11 +65170,27 @@ and vm_exec = fn env -> fn world -> fn blk -> fn (id: int) -> fn (pc0: int) ->
   let (_, _, kind, _, _, _, _, _, _, _, _, _, _, ct) = vec_get vm_meta id in
   let (op, _, _, _, _, _, _, _) = cd in
   let n = vec_len op in
+  // (a stack and registers from the pool, made outside the frame's region:
+  //  they outlive it. Given back however the frame is left.)
+  let nf = vec_get vm_pool_free 0 in
+  let k = (if nf > 0 then (let i = vec_get vm_pool_free nf in let _ = vec_set vm_pool_free 0 (nf - 1) in i)
+           else
+             (let s0 = vec_new () in let _ = vec_recycle s0 in
+              let r0 = vec_new () in let _ = vec_recycle r0 in
+              let rec fill = fn (i: int) -> (if i <= 0 then () else (let _ = vec_push r0 0 in fill (i - 1))) in
+              let _ = fill 15 in
+              let _ = vec_push vm_pool (s0, r0) in
+              vec_len vm_pool - 1)) in
+  let give_back = fn (u: unit) ->
+    (let m = vec_get vm_pool_free 0 + 1 in
+     let _ = (if m < vec_len vm_pool_free then vec_set vm_pool_free m k else vec_push vm_pool_free k) in
+     vec_set vm_pool_free 0 m) in
+  let (stk, regs) = vec_get vm_pool k in
+  let _ = vec_recycle stk in
+  let rec clear = fn (i: int) -> (if i >= 15 then () else (let _ = vec_set regs i 0 in clear (i + 1))) in
+  let _ = clear 0 in
+  let r = try_or_msg (fn (u: unit) ->
   region VMF {
-    let stk = vec_new () in
-    let regs = vec_new () in
-    let rec fill = fn (i: int) -> (if i <= 0 then () else (let _ = vec_push regs 0 in fill (i - 1))) in
-    let _ = fill 14 in
     let _ = vec_set regs 3 (0 - 1) in
     // (slot 12: the sequence's kind, for what a throw out of it means; 13:
     //  the program, which vm_cur is set back to when an exception a frame
@@ -65142,7 +65205,9 @@ and vm_exec = fn env -> fn world -> fn blk -> fn (id: int) -> fn (pc0: int) ->
              else vm_loop env world blk cd ct (stk, regs) pc0 0 n (Nil : int list)) in
     let _ = vec_set vm_cur 0 was in
     (vm_topn (stk, regs) 0, vec_get regs 2)
-  }
+  }) (fn (m: str) -> (let _ = give_back () in fail m)) in
+  let _ = give_back () in
+  r
 // Where a frame is run again from, for a Continuation re-entered into it
 // (cont_rerun: the evaluator runs the body again from the statement that
 // holds the guarded call's line). The first instruction a statement on that
