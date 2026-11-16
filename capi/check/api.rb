@@ -44,11 +44,31 @@ f = Fiber.new { A.ptr_after_yield(s) { Fiber.yield } }
 f.resume
 f.resume
 check(s == 'Xbc')
+# Two stopped C calls hold pointers into the SAME String: each one's write
+# goes back when it is resumed, the first to end does not end the other's
+# watch (and the other order; two Strings are the control).
+[[:a, :b, 'Ybc'], [:b, :a, 'Xbc']].each do |first, second, want|
+  s = +'abc'
+  fibers = { a: Fiber.new { A.byte_after_yield(s, 'X'.ord) { Fiber.yield } },
+             b: Fiber.new { A.byte_after_yield(s, 'Y'.ord) { Fiber.yield } } }
+  fibers[:a].resume
+  fibers[:b].resume
+  fibers[first].resume
+  check(s == (first == :a ? 'Xbc' : 'Ybc'))
+  fibers[second].resume
+  check(s == want)
+end
+s1, s2 = +'abc', +'abc'
+fa = Fiber.new { A.byte_after_yield(s1, 'X'.ord) { Fiber.yield } }
+fb = Fiber.new { A.byte_after_yield(s2, 'Y'.ord) { Fiber.yield } }
+fa.resume; fb.resume; fa.resume; fb.resume
+check([s1, s2] == ['Xbc', 'Ybc'])
 
 # A primitive is ruby's operation, not the method a subclass (or the object's
 # singleton) defined under its name.
 class OverArray < Array
   def push(*) = :intercepted
+  def [](*) = :intercepted
 end
 class OverString < String
   def <<(other) = :intercepted
@@ -88,6 +108,46 @@ check(single == [1, 2])
 plain = []
 A.push(plain, 1)
 check(plain == [1])
+check(A.aref(oa, 0) == 7)
+check(A.aref([5, 6], 1) == 6)
+# ...nor a definition the program made in the builtin class itself
+class String
+  alias_method :__capi_length, :length
+  def length = 999
+end
+check('abc'.length == 999)
+check(A.length('abc') == 3)
+class String
+  alias_method :length, :__capi_length
+  remove_method :__capi_length
+end
+check('abc'.length == 3 && A.length('abc') == 3)
+class Array
+  alias_method :__capi_push, :push
+  def push(*) = :intercepted
+end
+redef = []
+check(redef.push(1) == :intercepted)
+A.push(redef, 2)
+check(redef == [2])
+class Array
+  alias_method :push, :__capi_push
+  remove_method :__capi_push
+end
+check([].push(1) == [1])
+# ...nor a module prepended to the builtin class (switched off afterwards:
+# a prepend cannot be undone)
+module CapiPrepended
+  def push(*items) = ($capi_prepended ? :intercepted : super)
+end
+Array.prepend(CapiPrepended)
+$capi_prepended = true
+pre = []
+check(pre.push(1) == :intercepted)
+A.push(pre, 2)
+check(pre == [2])
+$capi_prepended = false
+check([].push(1) == [1])
 
 # rb_get_kwargs takes what it found out of the Hash when it is given a place
 # for the values -- whether or not other keywords may stay -- and only looks
@@ -196,13 +256,33 @@ check(A.yield_through(y, :both) { |*a, **kw| [a, kw] } == [[1], { b: 2 }])
 st = A.stat_new(__FILE__)
 own = File.stat(__FILE__)
 check(st.instance_of?(File::Stat))
-# (not the device: on Linux ruby keeps a statx, and what it copies from a
-#  struct stat leaves the device numbers out)
 check([st.size, st.ino, st.mode, st.nlink, st.uid, st.gid] == [own.size, own.ino, own.mode, own.nlink, own.uid, own.gid])
-check(st.file? && !st.directory? && st.mtime == own.mtime)
-check((st <=> own) == 0)
+# (on Linux ruby keeps a statx, and what it copies from a struct stat leaves
+#  the device numbers and the block size out: they read 0)
+linux = RUBY_PLATFORM.include?('linux')
+check([st.dev, st.rdev, st.blksize] == (linux ? [0, 0, 0] : [own.dev, own.rdev, own.blksize]))
+check(st.file? && !st.directory? && st.mtime == own.mtime && st.atime == own.atime && st.ctime == own.ctime)
+check((st <=> own) == 0 && st == own)
 check(A.stat_new(__dir__).directory?)
 check(raises(Errno::ENOENT) { A.stat_new(__FILE__ + '.absent') }.is_a?(SystemCallError))
+# the struct's times to the nanosecond, and on macOS its birth time
+made = A.stat_made_up(444555666)
+check([made.atime, made.mtime, made.ctime].map { |t| [t.to_i, t.nsec] } == [[100, 111222333], [200, 444555666], [300, 777888999]])
+check(made.size == 42 && made.file? && made.mode == 0o100644)
+if RUBY_PLATFORM.include?('darwin')
+  check([made.birthtime.to_i, made.birthtime.nsec] == [50, 123456789])
+else
+  check(raises(NotImplementedError) { made.birthtime }.message.include?('birthtime'))
+end
+# two snapshots a nanosecond apart are not the same, and are ordered by it
+check((made <=> A.stat_made_up(444555667)) == -1)
+check((made <=> A.stat_made_up(444555666)) == 0)
+check(made != A.stat_made_up(444555665))
+# NULL: an uninitialized File::Stat
+blank = A.stat_null
+check(blank.instance_of?(File::Stat))
+check(raises(TypeError) { blank.mtime }.message == 'uninitialized File::Stat')
+check(raises(TypeError) { blank.size }.message == 'uninitialized File::Stat')
 
 # The regexp parser's nesting bound is one number: what C sets, the parser
 # obeys, and 0 puts the default back.
@@ -215,6 +295,15 @@ check(A.parse_depth == 10)
 check(raises(RegexpError) { Regexp.new(nested) }.message.start_with?('parse depth limit over: /(((('))
 check(raises(RegexpError) { Regexp.new('[' * 30 + 'a' + ']' * 30) }.message.start_with?('parse depth limit over: /[[[['))
 check(Regexp.new('((a))').match?('a'))
+# at the bound and one past it: the pattern itself is the first level
+check(A.set_parse_depth(1) == 0)
+check(Regexp.new('a').match?('a'))
+%w[(a) (?:a) [a]].each { |src| check(raises(RegexpError) { Regexp.new(src) }.message.start_with?('parse depth limit over')) }
+check(A.set_parse_depth(2) == 0)
+%w[(a) (?:a) [a] a|(b)].each { |src| check(Regexp.new(src).match?('a') || Regexp.new(src).match?('b')) }
+%w[((a)) [[a]] ([a]) (?:(?:a))].each { |src| check(raises(RegexpError) { Regexp.new(src) }.message.start_with?('parse depth limit over')) }
+check(A.set_parse_depth(3) == 0)
+check(Regexp.new('((a))').match?('a') && Regexp.new('[[a]]').match?('a'))
 check(A.set_parse_depth(0) == 0)
 check(A.parse_depth == default)
 check(Regexp.new(nested).match?('a'))

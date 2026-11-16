@@ -8212,7 +8212,9 @@ and capi_overridden = fn world -> fn (recv: Val) -> fn (owner: str) -> fn (name:
   if hng_sng_has world recv name then true
   else
     (let c = dispatch_cls_of world recv in
-     if str_eq c "" || str_eq c owner then false
+     // (the builtin class itself overrides nothing -- unless a module is
+     //  prepended to it, whose method comes first)
+     if str_eq c "" || (str_eq c owner && (if map_has prepends owner then false else true)) then false
      else
        (let anc = ancestors_of world c in
         let first = owner_anc world anc name in
@@ -8240,12 +8242,19 @@ and capi_send = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
   // (...reached the way `super` from the override reaches it: the next
   //  definition from that class on, and where there is none in Ruby, the
   //  builtin itself -- super_missing, which never consults an override)
-  | VNil when str_len own9 > 0 && capi_overridden world recv own9 name ->
+  //  A definition the program made in the builtin class itself after the
+  //  prelude is passed over too: the prelude's (capi_boot_defs), or the
+  //  native one where the prelude had none.
+  | VNil when str_len own9 > 0 && (map_has capi_redefs (own9 ++ "#" ++ name) || capi_overridden world recv own9 name) ->
     (let (meths9, _, _, _) = world in
      let from9 = Cons (own9, anc_after_or_all (ancestors_of world (dispatch_cls_of world recv)) own9) in
      let a9 = lookup_anc world from9 name in
-     if str_eq a9 "" then super_missing world noblk recv name args
-     else run_meth world noblk recv a9 name (map_get meths9 (a9 ++ "#" ++ name)) args)
+     let k9 = (if str_eq a9 "" then own9 ++ "#" ++ name else a9 ++ "#" ++ name) in
+     if map_has capi_redefs k9 then
+       (if map_has capi_boot_defs k9 then run_meth world noblk recv (if str_eq a9 "" then own9 else a9) name (map_get capi_boot_defs k9) args
+        else super_missing world noblk recv name args)
+     else if str_eq a9 "" then super_missing world noblk recv name args
+     else run_meth world noblk recv a9 name (map_get meths9 k9) args)
   | VNil -> invoke_val_c env world noblk recv name args public
   | _ ->
     // a block goes the way `recv.name(*args, &block)` sends one
@@ -20060,7 +20069,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let rc9 = try_or (fn (u: unit) -> (if follow9 then file_stat (sget ph9) else file_lstat (sget ph9))) (0 - 2) in
           if rc9 == 0 - 2 then VSym "unavailable"
           else if rc9 != 0 then VNil
-          else arr_new (stat_fields_from 0))
+          else arr_new (stat_fields_ns (mr_stat_times (sget ph9) (if follow9 then 1 else 0) 0) (stat_fields_from 0)))
        | _ -> VNil)
     // File.__fstat_fields(fd): the same 13 numbers of fstat(2) on an open
     // descriptor -- a file unlinked while open still has them -- the errno
@@ -20071,10 +20080,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let rc9 = try_or (fn (u: unit) -> file_fstat fd9) (0 - 2) in
           if rc9 == 0 - 2 then VSym "unavailable"
           else if rc9 != 0 then VInt (fd_last_errno ())
-          else arr_new (stat_fields_from 0))
+          else arr_new (stat_fields_ns (mr_stat_times "" 2 fd9) (stat_fields_from 0)))
        | _ -> VSym "unavailable")
     // File.__utime(path, atime, mtime): utime(2) in seconds, 0 or -1, and
     // :unavailable where the device is refused (File.utime then runs touch)
+    // File.__utimens(path, follow, "asec ansec msec mnsec"): utimensat(2), to
+    // the nanosecond and (follow false) of a link itself -- 0, the errno, or
+    // :unavailable where the target refuses the call
+    else if str_eq c "File" && (str_len name == 9 && str_eq name "__utimens") then
+      (match args with
+       | Cons (VStr ph9, Cons (fl9, Cons (VStr sp9, _))) ->
+         (let f9 = (match fl9 with VBool false -> 0 | VNil -> 0 | _ -> 1) in
+          let r9 = try_or (fn (u: unit) -> mr_utimens (sget ph9) f9 (sget sp9)) (0 - 2) in
+          if r9 == 0 - 2 then VSym "unavailable" else VInt r9)
+       | _ -> VInt (0 - 1))
     else if str_eq c "File" && (str_len name == 7 && str_eq name "__utime") then
       (match args with
        | Cons (VStr ph9, Cons (VInt a9, Cons (VInt m9, _))) ->
@@ -51917,6 +51936,19 @@ and dir_errno_raise = fn world -> fn (e: int) -> fn (fn9: str) -> fn (p: str) ->
 // the fields of the snapshot file_stat / file_lstat just took, from i on
 and stat_fields_from = fn (i: int) ->
   if i >= 13 then Nil else Cons (VInt (file_stat_field i), stat_fields_from (i + 1))
+// The 13 fields with the times' seconds and, after them, their nanoseconds
+// (14th to 16th), both from mr_stat_times; the fields as they are when that
+// call did not answer.
+and stat_fields_ns = fn (t: str) -> fn (fields: Val list) ->
+  match str_split t " " with
+  | Cons (as9, Cons (an9, Cons (ms9, Cons (mn9, Cons (cs9, Cons (cn9, _)))))) ->
+    (let rec go = fn (i: int) -> fn (xs: Val list) -> match xs with
+       | Nil -> Cons (VInt (int_of_str an9), Cons (VInt (int_of_str mn9), Cons (VInt (int_of_str cn9), Nil)))
+       | Cons (x, rest) ->
+         Cons ((if i == 8 then VInt (int_of_str as9) else if i == 9 then VInt (int_of_str ms9)
+                else if i == 10 then VInt (int_of_str cs9) else x), go (i + 1) rest) in
+     go 0 fields)
+  | _ -> fields
 and fpred_arity = fn (name: str) ->
   if (str_len name == 10 && str_eq name "identical?") then 2 else 1
 and fpred_names = fn (name: str) ->
@@ -65374,7 +65406,10 @@ and rxp_parse = fn (pat: str) -> fn (fl: str) ->
   let _ = map_clear rx_gbodies in
   let _ = map_delete rx_named_mode "ref" in
   let _ = (if rxp_has_named pat 0 false then map_set rx_named_mode "on" 1 else map_delete rx_named_mode "on") in
+  // (the pattern itself is the first level, as Onigmo's outermost
+  //  parse_subexp is: at limit 1 `/a/` is taken and `/(a)/` and `/[a]/` are not)
   let _ = map_set rx_depth "d" 0 in
+  let _ = rxp_enter () in
   let (n, p, g) = rxp_alt pat 0 fl 1 in
   if p < str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp parse: unmatched )")) in fail "mere-ruby: regexp parse: unmatched )")
   // ⚠ a reference past the last group is refused once the groups are all

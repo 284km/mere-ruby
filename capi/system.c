@@ -209,17 +209,50 @@ VALUE rb_io_close(VALUE io) { return mr_call(io, "close", 0); }
 VALUE rb_io_flush(VALUE io) { return mr_call(io, "flush", 0); }
 VALUE rb_io_eof(VALUE io) { return mr_call(io, "eof?", 0); }
 /* A File::Stat of a struct stat C filled (stat(2), fstat(2)): the snapshot a
- * File::Stat is here, made of the struct's fields. */
+ * File::Stat is here, made of the struct's fields, its times to the
+ * nanosecond (seconds plus a Rational). NULL is file.c's allocation alone:
+ * a File::Stat whose readers raise TypeError ("uninitialized File::Stat").
+ *
+ * On Linux ruby keeps a statx, and rb_stat_new copies into it only the basic
+ * fields -- not the device numbers, not the block size, and no birth time
+ * (the struct has none): those read 0, and #birthtime is NotImplementedError,
+ * as on the reference. On macOS the struct is ruby's own and carries the
+ * birth time. */
 #include <sys/stat.h>
+#ifdef __APPLE__
+# define MR_ST_TIME(st, f) (st)->st_##f##timespec
+#else
+# define MR_ST_TIME(st, f) (st)->st_##f##tim
+#endif
+static VALUE stat_time(struct timespec ts) {
+    VALUE sec = LL2NUM((long long)ts.tv_sec);
+    if (!ts.tv_nsec) return sec;
+    return rb_funcall(sec, '+', 1, rb_rational_new(LONG2NUM(ts.tv_nsec), LONG2NUM(1000000000L)));
+}
 VALUE rb_stat_new(const struct stat *st) {
-    VALUE fields = rb_ary_new_from_args(13,
-        ULL2NUM((unsigned long long)st->st_dev), ULL2NUM((unsigned long long)st->st_ino), UINT2NUM((unsigned int)st->st_mode),
+    if (!st) return mr_call(mr_ruby("->() { File::Stat.allocate }"), "call", 0);
+#ifdef __linux__
+    VALUE dev = INT2FIX(0), rdev = INT2FIX(0), blksize = INT2FIX(0), btime = INT2FIX(0);
+#else
+    VALUE dev = ULL2NUM((unsigned long long)st->st_dev), rdev = ULL2NUM((unsigned long long)st->st_rdev);
+    VALUE blksize = LL2NUM((long long)st->st_blksize);
+# ifdef __APPLE__
+    VALUE btime = stat_time(st->st_birthtimespec);
+# else
+    VALUE btime = INT2FIX(0);
+# endif
+#endif
+    struct timespec a = MR_ST_TIME(st, a), m = MR_ST_TIME(st, m), c = MR_ST_TIME(st, c);
+    /* (the fields in File.__stat_fields' order: the times' seconds, and their
+     *  nanoseconds after the 13; then the birth time) */
+    VALUE fields = rb_ary_new_from_args(17,
+        dev, ULL2NUM((unsigned long long)st->st_ino), UINT2NUM((unsigned int)st->st_mode),
         ULL2NUM((unsigned long long)st->st_nlink), UINT2NUM((unsigned int)st->st_uid), UINT2NUM((unsigned int)st->st_gid),
-        ULL2NUM((unsigned long long)st->st_rdev), LL2NUM((long long)st->st_size), LL2NUM((long long)st->st_atime),
-        LL2NUM((long long)st->st_mtime), LL2NUM((long long)st->st_ctime), LL2NUM((long long)st->st_blksize),
-        LL2NUM((long long)st->st_blocks));
-    return mr_call(mr_ruby("->(f) { s = File::Stat.allocate; s.instance_variable_set(:@h, File::Stat.__fields(f, nil, true)); s }"),
-                   "call", 1, fields);
+        rdev, LL2NUM((long long)st->st_size), LL2NUM((long long)a.tv_sec),
+        LL2NUM((long long)m.tv_sec), LL2NUM((long long)c.tv_sec), blksize,
+        LL2NUM((long long)st->st_blocks), LONG2NUM(a.tv_nsec), LONG2NUM(m.tv_nsec), LONG2NUM(c.tv_nsec), btime);
+    return mr_call(mr_ruby("->(f) { s = File::Stat.allocate; h = File::Stat.__fields(f, nil, true); h[:btime] = f[16]; "
+                           "s.instance_variable_set(:@h, h); s }"), "call", 1, fields);
 }
 VALUE rb_io_binmode(VALUE io) { return mr_call(io, "binmode", 0); }
 /* (what takes RFILE(io)->fptr: the IO the struct names is what is asked) */

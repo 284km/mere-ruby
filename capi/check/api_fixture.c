@@ -15,6 +15,16 @@ static VALUE ptr_after_yield(VALUE self, VALUE str) {
     p[0] = 'X';
     return str;
 }
+/* The same, with the byte to write given: two calls holding pointers into
+ * one String, each in its own stopped Fiber. */
+static VALUE byte_after_yield(VALUE self, VALUE str, VALUE byte) {
+    char c = (char)NUM2INT(byte);
+    char *p = RSTRING_PTR(str);
+    (void)self;
+    rb_yield(Qnil);
+    p[0] = c;
+    return str;
+}
 static VALUE ary_ptr_after_yield(VALUE self, VALUE ary) {
     VALUE *p = RARRAY_PTR(ary);
     (void)self;
@@ -27,6 +37,7 @@ static VALUE noop(VALUE self) { (void)self; return Qnil; }
 /* The primitives are ruby's own operations, whatever a subclass defines
  * under the same name. */
 static VALUE push(VALUE self, VALUE ary, VALUE item) { (void)self; rb_ary_push(ary, item); return Qnil; }
+static VALUE aref(VALUE self, VALUE ary, VALUE index) { (void)self; return rb_ary_aref(1, &index, ary); }
 static VALUE append(VALUE self, VALUE str, VALUE other) { (void)self; rb_str_append(str, other); return Qnil; }
 static VALUE length(VALUE self, VALUE str) { (void)self; return LONG2NUM(rb_str_strlen(str)); }
 static VALUE freeze(VALUE self, VALUE obj) { (void)self; rb_obj_freeze(obj); return Qnil; }
@@ -115,6 +126,30 @@ static VALUE stat_new(VALUE self, VALUE path) {
     return rb_stat_new(&st);
 }
 
+/* rb_stat_new of a struct C made up, its times below the second (and on
+ * macOS its birth time); and of NULL. */
+#include <string.h>
+static VALUE stat_made_up(VALUE self, VALUE mtime_nsec) {
+    struct stat st;
+    (void)self;
+    memset(&st, 0, sizeof(st));
+    st.st_mode = S_IFREG | 0644;
+    st.st_size = 42;
+    st.st_nlink = 1;
+#ifdef __APPLE__
+    st.st_atimespec.tv_sec = 100; st.st_atimespec.tv_nsec = 111222333;
+    st.st_mtimespec.tv_sec = 200; st.st_mtimespec.tv_nsec = NUM2LONG(mtime_nsec);
+    st.st_ctimespec.tv_sec = 300; st.st_ctimespec.tv_nsec = 777888999;
+    st.st_birthtimespec.tv_sec = 50; st.st_birthtimespec.tv_nsec = 123456789;
+#else
+    st.st_atim.tv_sec = 100; st.st_atim.tv_nsec = 111222333;
+    st.st_mtim.tv_sec = 200; st.st_mtim.tv_nsec = NUM2LONG(mtime_nsec);
+    st.st_ctim.tv_sec = 300; st.st_ctim.tv_nsec = 777888999;
+#endif
+    return rb_stat_new(&st);
+}
+static VALUE stat_null(VALUE self) { (void)self; return rb_stat_new(NULL); }
+
 /* The regexp parser's nesting bound, read and set from C. */
 static VALUE parse_depth(VALUE self) { (void)self; return UINT2NUM(onig_get_parse_depth_limit()); }
 static VALUE set_parse_depth(VALUE self, VALUE depth) {
@@ -128,10 +163,12 @@ void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
     rb_define_singleton_method(mod, "ptr_after_yield", ptr_after_yield, 1);
     rb_define_singleton_method(mod, "ary_ptr_after_yield", ary_ptr_after_yield, 1);
+    rb_define_singleton_method(mod, "byte_after_yield", byte_after_yield, 2);
     rb_define_singleton_method(mod, "noop", noop, 0);
     rb_define_singleton_method(mod, "push", push, 2);
     rb_define_singleton_method(mod, "append", append, 2);
     rb_define_singleton_method(mod, "length", length, 1);
+    rb_define_singleton_method(mod, "aref", aref, 2);
     rb_define_singleton_method(mod, "freeze", freeze, 1);
     rb_define_singleton_method(mod, "aset", aset, 3);
     rb_define_singleton_method(mod, "kind_of", kind_of, 2);
@@ -147,6 +184,8 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "block_keywords", block_keywords, 2);
     rb_define_singleton_method(mod, "yield_through", yield_through, 2);
     rb_define_singleton_method(mod, "stat_new", stat_new, 1);
+    rb_define_singleton_method(mod, "stat_made_up", stat_made_up, 1);
+    rb_define_singleton_method(mod, "stat_null", stat_null, 0);
     rb_define_singleton_method(mod, "parse_depth", parse_depth, 0);
     rb_define_singleton_method(mod, "set_parse_depth", set_parse_depth, 1);
     rb_define_singleton_method(mod, "ospath", ospath, 1);
