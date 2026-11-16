@@ -2474,6 +2474,7 @@ let gc_off_env = map_new ();
 let gc_collect_any = fn env -> fn world ->
   let before9 = int_of_float (time () * 1000000000.0) in
   let countweak9 = fn (u9: unit) ->
+    if map_len weak_k == 0 then 0 else
     (let n9 = vec_new () in
      let _ = vec_push n9 0 in
      let markable9 = fn (v9: Val) -> match v9 with
@@ -2485,7 +2486,7 @@ let gc_collect_any = fn env -> fn world ->
                      + (if markable9 (map_get weak_v slot9) then 1 else 0))) in
      vec_get n9 0) in
   let weak9 = countweak9 () in
-  let by9 = (if flag_on gc_state "oncall" then 1 else 0) in
+  let by9 = (if flag_on gc_state "explicit" then 1 else 0) in
   let _ = (if fb_off_stack then
     (let _ = map_set gc_off_env 0 env in
      let _ = map_set gc_state "inbody" 1 in
@@ -2497,6 +2498,24 @@ let gc_collect_any = fn env -> fn world ->
   let _ = map_set gc_state "latest_by" by9 in
   let _ = map_set gc_state "weak_seen" weak9 in
   let _ = map_set gc_state "weak_kept" (countweak9 ()) in
+  // Lazy public object-id observations are metadata, not roots. Reclaim them
+  // at this boundary without touching the collector's marking or sweeping.
+  let gone9 = vec_new () in
+  let _ = map_iter gc_state (fn (k9: str) -> fn _value9 ->
+    if str_starts_with k9 "oidseen:" then
+      (let kind9 = substring k9 8 12 in
+       let id9 = int_of_str (substring k9 12 (str_len k9)) in
+       let present9 = (if str_eq kind9 "obj:" then map_has obj_cls id9
+                       else if str_eq kind9 "str:" then gc_str_present id9
+                       else if str_eq kind9 "arr:" then map_has arr_store id9
+                       else if str_eq kind9 "hsh:" then map_has hash_store id9
+                       else true) in
+       if present9 then () else vec_push gone9 k9)
+    else ()) in
+  let rec drop9 = fn (i9: int) ->
+    if i9 >= vec_len gone9 then ()
+    else (let _ = map_delete gc_state (vec_get gone9 i9) in drop9 (i9 + 1)) in
+  let _ = drop9 0 in
   if flag_on gc_state "prof" then
     (let n9 = (if map_has gc_state "prof_n" then map_get gc_state "prof_n" else 0) in
      let k9 = "prof:" ++ str_of_int n9 in
@@ -23117,7 +23136,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     //   count spec calls GC.start inside a block and expects GC.count to move),
     //   with the real one requested for the next safepoint.
     else if str_eq c "GC" && (str_len name == 5 && str_eq name "start") then
-      (let _ = map_set gc_state "oncall" 1 in
+      (let _ = map_set gc_state "explicit" 1 in
        let _ = (if gc_safe_now () then
          (let _ = (if fb_off_stack then () else map_set gc_state "oncall" 1) in
           let _ = gc_collect_any env world in
@@ -23136,7 +23155,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // An explicit collection also returns unused native region caches and
        // allocator pages to the OS. Active arenas and the automatic collector's
        // thresholds are unchanged; non-native backends have nothing to trim.
-       let _ = map_set gc_state "oncall" 0 in
+       let _ = map_set gc_state "explicit" 0 in
        let _ = mem_trim () in VNil)
     else if str_eq c "GC" && ((str_len name == 6 && str_eq name "enable") || (str_len name == 7 && str_eq name "disable")) then
       // ruby answers the state BEFORE the call: enable on an enabled GC is
@@ -24400,6 +24419,23 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 if str_starts_with c9 "(sng:" then VNil else mkstr c9)
              else VSym (substring l9 (cut9 + 1) (str_len l9))))
        | _ -> VNil)
+    else if str_eq c "ObjectSpace" && str_eq name "__dump_identity" then
+      (match args with
+       | Cons (v9, _) ->
+         (let k9 = moved_key v9 in
+          let id9 = (match v9 with
+            | VObj n9 -> public_identity_id 2 (n9 - handle_base)
+            | VStr n9 -> public_identity_id 4 (n9 - handle_base)
+            | VArr n9 -> public_identity_id 6 (n9 - handle_base)
+            | VHsh n9 -> public_identity_id 10 (n9 - handle_base)
+            | VProc n9 -> public_identity_id 12 (n9 - handle_base)
+            | VBind n9 -> public_identity_id 14 (n9 - handle_base)
+            | VClass c9 -> cls_oid c9
+            | VMain -> 16
+            | VRegex _ -> rx_oid_of (hng_key v9)
+            | _ -> 0) in
+          arr_new (Cons (VInt id9, Cons (VBool (map_has gc_state ("oidseen:" ++ k9)), Nil))))
+       | _ -> VNil)
     // Ruby::Box's machinery (the prelude's class): __on, __cur (the running
     // code's box), __switch(id) (enter a box, answering the one left),
     // __new (a box id, with load lists of its own), __scope(id) (a fresh
@@ -24584,6 +24620,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 9 && str_eq name "__objects") then
       (let (_, sup9, ocls9, _) = world in
+       // The public iterator snapshots live values. Reclaim expired runtime
+       // temporaries before pinning its snapshot, while respecting GC.disable.
+       // count_objects does not request this path: allocation comparisons
+       // retain exactly their own before/after collections and counts.
+       let _ = (match args with
+         | Cons (_, Cons (VBool true, _)) ->
+           if fb_off_stack && not (gc_auto_off ()) then gc_collect_any env world else ()
+         | _ -> ()) in
        let want9 = (match args with Cons (VClass w9, _) -> w9 | _ -> "") in
        let objs9 = map_new () in
        // each_object requests value stores too. count_objects counts Array
@@ -41237,7 +41281,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           && (match args with Nil -> false | _ -> true) then
     prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
   else if (str_len name == 9 && str_eq name "object_id") || (str_len name == 6 && str_eq name "__id__") then
-    (match recv with
+    (let k9 = moved_key recv in
+     let _ = (if str_eq k9 "" then () else map_set gc_state ("oidseen:" ++ k9) 1) in
+     match recv with
      // (2n+1 past a machine int is a bignum, and a bignum's own id is the
      //  same 2n+1: ObjectSpace._id2ref reads every odd id back as (id-1)/2,
      //  and 0x4000000000000000's id wrapped to a negative number)
