@@ -479,3 +479,69 @@ OnigUChar *onigenc_get_left_adjust_char_head(OnigEncoding enc, const OnigUChar *
     }
     return (OnigUChar *)p;
 }
+
+/* ---- global variables whose value C keeps -------------------------------------------------
+ * rb_define_variable ties `$name` to a C VALUE; the hooked and virtual kinds
+ * tie it to a pair of C functions. The interpreter calls one registered
+ * function for every such variable (gvar_access) with the name, whether it
+ * is a write, and the value; the record found by the name says which C
+ * getter or setter that is. variable.c's defaults are here as ruby has
+ * them. */
+struct kept_global { ID id; VALUE *data; rb_gvar_getter_t *getter; rb_gvar_setter_t *setter; };
+static struct kept_global *kept_globals;
+static long kept_count, kept_cap;
+VALUE rb_gvar_undef_getter(ID id, VALUE *data) { (void)id; (void)data; return Qnil; }
+void rb_gvar_undef_setter(VALUE val, ID id, VALUE *data) { (void)val; (void)id; (void)data; }
+void rb_gvar_undef_marker(VALUE *var) { (void)var; }
+VALUE rb_gvar_val_getter(ID id, VALUE *data) { (void)id; return (VALUE)data; }
+void rb_gvar_val_setter(VALUE val, ID id, VALUE *data) { (void)val; (void)id; (void)data; }
+void rb_gvar_val_marker(VALUE *var) { if (var) rb_gc_mark((VALUE)var); }
+VALUE rb_gvar_var_getter(ID id, VALUE *var) { (void)id; return var ? *var : Qnil; }
+void rb_gvar_var_setter(VALUE val, ID id, VALUE *var) { (void)id; *var = val; }
+void rb_gvar_var_marker(VALUE *var) { if (var) rb_gc_mark(*var); }
+void rb_gvar_readonly_setter(VALUE val, ID id, VALUE *data) {
+    (void)val; (void)data;
+    rb_name_error(id, "%" PRIsVALUE " is a read-only variable", rb_id2str(id));
+}
+static VALUE gvar_access(VALUE self, VALUE slot, VALUE write, VALUE value) {
+    (void)self;
+    VALUE name = rb_str_plus(rb_str_new_cstr("$"), slot);
+    ID id = rb_intern_str(name);
+    for (long i = 0; i < kept_count; i++) {
+        struct kept_global *g = &kept_globals[i];
+        if (g->id != id) continue;
+        if (!RTEST(write)) return g->getter(id, g->data);
+        g->setter(value, id, g->data);
+        return value;
+    }
+    rb_bug("a global variable C keeps has no record: %s", RSTRING_PTR(name));
+}
+static void keep_global(const char *name, VALUE *data, rb_gvar_getter_t *getter, rb_gvar_setter_t *setter) {
+    static long access = -1;
+    if (access < 0) access = mr_register_function((void *)gvar_access, 3);
+    const char *bare = name[0] == '$' ? name + 1 : name;
+    VALUE full = rb_str_plus(rb_str_new_cstr("$"), rb_str_new_cstr(bare));
+    ID id = rb_intern_str(full);
+    for (long i = 0; i < kept_count; i++)
+        if (kept_globals[i].id == id) { kept_globals[i] = (struct kept_global){ id, data, getter, setter }; return; }
+    if (kept_count == kept_cap) {
+        kept_cap = kept_cap ? kept_cap * 2 : 8;
+        kept_globals = realloc(kept_globals, sizeof(*kept_globals) * (size_t)kept_cap);
+        if (!kept_globals) rb_memerror();
+    }
+    kept_globals[kept_count++] = (struct kept_global){ id, data, getter, setter };
+    mr_put_text(bare);
+    mr_up(MR_DEFINE_GVAR, (VALUE)access, 0, 0, 0, 0);
+}
+void rb_define_hooked_variable(const char *name, VALUE *var, rb_gvar_getter_t *getter, rb_gvar_setter_t *setter) {
+    /* (the VALUE C holds in the variable lives as long as the process does) */
+    if (var) rb_gc_register_address(var);
+    keep_global(name, var, getter ? getter : rb_gvar_var_getter, setter ? setter : rb_gvar_var_setter);
+}
+void rb_define_variable(const char *name, VALUE *var) { rb_define_hooked_variable(name, var, 0, 0); }
+void rb_define_readonly_variable(const char *name, const VALUE *var) {
+    rb_define_hooked_variable(name, (VALUE *)var, 0, rb_gvar_readonly_setter);
+}
+void rb_define_virtual_variable(const char *name, rb_gvar_getter_t *getter, rb_gvar_setter_t *setter) {
+    keep_global(name, 0, getter ? getter : rb_gvar_val_getter, setter ? setter : rb_gvar_readonly_setter);
+}

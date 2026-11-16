@@ -5099,7 +5099,7 @@ the reference.
   exception, a fragment, a SAX handler called back from libxml2) and prints
   the same on both sides. mere-ruby pointed at the reference's gem
   directory fails.
-- Local, O2: gates dead_defs, dup_defs, gc_roots pass; bracket depth 888 of
+- Local, O2: gates dead_defs, dup_defs, gc_roots pass; bracket depth 889 of
   1024; capi_check as before.
 
 **Measured here** (this machine, the interpreter's side; CI's shards are the
@@ -5191,8 +5191,9 @@ reference to its recorded count and mere-ruby to no less than its own.
   `rb_io_open_descriptor`, the descriptor sets of thread.c,
   `rb_thread_fd_select` and `rb_thread_wait_fd` as the interpreter's own
   wait so that other threads run meanwhile, ...) and six more in the ledger
-  (global variables backed by C, an encoding's alias, a TracePoint's state):
-  **2,242 of 2,584** (the reference's count grew as files that had not
+  (an encoding's alias, a TracePoint's state, and at first the global
+  variables C keeps):
+  **2,242 of 2,584** then, 2,269 with what follows (the reference's count grew as files that had not
   loaded there either, for a helper this tool had left out, came in).
   16 files pass every example the reference passes.
 - It found a crash: `rb_get_alloc_func` answered NULL for a class no C
@@ -5201,11 +5202,21 @@ reference to its recorded count and mere-ruby to no less than its own.
   builtin way), and NULL only after `rb_undef_alloc_func` -- which is kept
   apart from "no C allocator": `allocate` and `new` raise "allocator
   undefined for C" then.
+- Two things the examples then asked for, written: **a global variable C
+  keeps** (`rb_define_variable`, the read-only, hooked and virtual kinds:
+  the interpreter's read and write of `$name` call the C getter or setter
+  the name was defined with; globals_spec 17 -> 33 of 44), and **the bytes
+  past a String's length are C's too** -- what C writes there, to reveal
+  with `rb_str_set_len`, is no longer cleared by the next fetch, and a
+  String ends in the terminator of its own encoding (one NUL, or a UTF-16 /
+  UTF-32 code unit) where four NULs were written; `StringValueCStr` puts
+  the terminator back (string_spec 280 -> 291 of 314).
 - Not reporting yet on this side: io_spec and thread_spec (both reach the
   120-second bound: a wait in C that the interpreter's threads cannot end),
   and digest_spec (no `ruby/digest.h`). The rest of the difference is
   examples, file by file, in the record.
 
 **Next**: the examples of `optional/capi` that differ, largest files first
-(string_spec 280 of 314, globals_spec 17 of 44 -- global variables backed
-by C -- class_spec, struct_spec, encoding_spec), and io_spec / thread_spec.
+(string_spec, encoding_spec, class_spec, struct_spec, globals_spec's `$/`
+and `$stdin` as C variables that follow the interpreter's), and io_spec /
+thread_spec.

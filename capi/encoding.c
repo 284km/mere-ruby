@@ -501,3 +501,10 @@ long rb_str_coderange_scan_restartable(const char *s, const char *e, rb_encoding
     *cr = seen_high ? RUBY_ENC_CODERANGE_VALID : RUBY_ENC_CODERANGE_7BIT;
     return (long)(e - s);
 }
+
+/* The width of the smallest character of a String's encoding (its code unit
+ * for UTF-16 and UTF-32): what its terminator is as wide as. */
+int mr_encoding_unit(VALUE str) {
+    rb_encoding *enc = rb_enc_get(str);
+    return enc ? rb_enc_mbminlen(enc) : 1;
+}

@@ -219,9 +219,17 @@ void *rb_mere_string(VALUE obj) {
     }
     mr_up1(MR_STR_GET, obj);
     const mere_bytes *b = mr_got_bytes();
-    string_room(m, (long)b->len);
-    memcpy(m->as.string.as.heap.ptr, b->data, (size_t)b->len);
-    memset(m->as.string.as.heap.ptr + b->len, 0, 4);
+    /* The buffer is the String as far as C can tell, also past its length:
+     * what C wrote there (to reveal with rb_str_set_len later) stays, and
+     * so does everything when the interpreter has the very bytes the
+     * buffer holds. Only a String that changed is copied in, and ends in
+     * its encoding's terminator. */
+    if (!(m->body == T_STRING && m->as.string.as.heap.ptr && m->as.string.len == (long)b->len
+          && !memcmp(m->as.string.as.heap.ptr, b->data, (size_t)b->len))) {
+        string_room(m, (long)b->len);
+        memcpy(m->as.string.as.heap.ptr, b->data, (size_t)b->len);
+        memset(m->as.string.as.heap.ptr + b->len, 0, (size_t)mr_string_terminator(obj));
+    }
     m->as.string.len = (long)b->len;
     m->body = T_STRING;
     m->hash = body_hash(m);
@@ -313,6 +321,13 @@ void *rb_mere_match(VALUE obj) { (void)obj; mr_unsupported("RMATCH (the struct b
 void *rb_mere_regexp(VALUE obj) { (void)obj; mr_unsupported("RREGEXP (the struct behind a Regexp)"); }
 
 /* ---- capacity, for the String functions that promise room ------------------ */
+/* How many NUL bytes end a String of this one's encoding: 1, or the width of
+ * a UTF-16 / UTF-32 code unit. */
+int mr_string_terminator(VALUE str) {
+    extern int mr_encoding_unit(VALUE str);
+    int n = mr_encoding_unit(str);
+    return n > 1 && n <= 4 ? n : 1;
+}
 long mr_string_capacity(VALUE str) {
     rb_mere_string(str);
     return mirror_at(MR_NUMBER(str), 1)->capa;
