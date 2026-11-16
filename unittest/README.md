@@ -491,6 +491,9 @@ runner crosses them.
   at 0.98 of main's. Rerun its shard.
 - bootstraptest test_ractor #153 (1,000 ractors) and #99 sit at the runner's
   limit.
+- `ruby/test_ractor.rb`'s `test_move_nested_hash_during_gc_with_yjit` runs a
+  child with a 10 s bound and takes 9.3-10.1 s on the runners, on main as
+  well: one run in a few is a Timeout and the file is one test lower.
 
 **Jobs that never ran.** A `macos-26` job can wait without a runner and be
 cancelled after 15-30 min (the job has no `runner_name`). A shard that reaches

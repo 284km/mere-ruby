@@ -24,8 +24,8 @@ d="$(mktemp -d)"
 cp "$here"/*.mere "$d"/
 [ "$coro" -eq 1 ] || cp "$here/m_fiber_nothreads.mere" "$d/m_fiber_coro.mere"
 [ "$coro" -eq 1 ] || python3 "$here/tools/wasm_lexer.py" "$d"
-# (no C beside this tree: the native extension externs become functions that
-#  answer "no library" -- m_native_none.mere)
-cp "$here/m_native_none.mere" "$d/m_native_api.mere"
+# (no C beside this tree: the C API's externs become functions that answer
+#  "no library" -- m_capi_none.mere)
+cp "$here/m_capi_none.mere" "$d/m_capi_api.mere"
 [ -d "$here/.mere_modules" ] && ln -s "$here/.mere_modules" "$d/.mere_modules"
 printf '%s\n' "$d"
