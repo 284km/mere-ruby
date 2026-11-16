@@ -6,7 +6,7 @@ it does not assert bounded memory for arbitrary Ruby programs. The same gate
 checks both per-evaluation temporaries and historical string-page metadata.
 """
 from pathlib import Path
-from native_build_flags import openssl_flags
+from native_build_flags import openssl_flags, native_bridge_sources
 import argparse
 import json
 import os
@@ -47,7 +47,7 @@ flags = ['clang', '-O2', '-w', '-I', library, '-I', FIXTURES,
          '-I', ROOT / 'vendor/prism/include'] + openssl_cflags
 libs = [library / 'libmere_embedding_probe.a', ROOT / 'tools/prism_glue.c',
         ROOT / 'tools/socket_glue.c', ROOT / 'tools/math_glue.c', ROOT / 'tools/process_glue.c',
-        ROOT / 'tools/openssl_glue.c', ROOT / 'tools/nkf_glue.c', prism, '-pthread', *openssl_ldflags]
+        ROOT / 'tools/openssl_glue.c', ROOT / 'tools/nkf_glue.c', *native_bridge_sources(), prism, '-pthread', *openssl_ldflags]
 if platform.system() == 'Darwin':
     libs += ['-Wl,-stack_size,0x20000000']
 else:

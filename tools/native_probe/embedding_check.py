@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build and check the experimental singleton embedding API, with resource bounds."""
 from pathlib import Path
-from native_build_flags import openssl_flags
+from native_build_flags import openssl_flags, native_bridge_sources
 import argparse
 import hashlib
 import json
@@ -95,6 +95,7 @@ if args.cleanup_failure:
 for mode in ['header', 'c']:
     run('emit-' + mode, [sys.executable, __file__, '--emit', mode, compiler, output])
 openssl_cflags, openssl_ldflags = openssl_flags()
+bridge = native_bridge_sources(compiler)
 flags = ['clang', '-O2', '-w', '-fbracket-depth=1024', '-I', ROOT / 'vendor/prism/include'] + openssl_cflags
 link_flags = ['-Wl,-stack_size,0x20000000'] if platform.system() == 'Darwin' else ['-lm']
 if platform.system() != 'Darwin':
@@ -110,7 +111,7 @@ run('compile', flags + ['-c', output / 'embedding.c', '-o', output / 'embedding.
 archive = output / 'libmere_embedding_probe.a'
 run('archive', ['ar', 'rcs', archive, output / 'embedding.o'])
 run('link', flags + ['-I', output, FIXTURES / 'embedding_host.c', archive,
-    ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', ROOT / 'tools/math_glue.c', ROOT / 'tools/process_glue.c', ROOT / 'tools/openssl_glue.c', ROOT / 'tools/nkf_glue.c', prism, '-pthread', *link_flags, *openssl_ldflags, '-o', output / 'host'])
+    ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', ROOT / 'tools/math_glue.c', ROOT / 'tools/process_glue.c', ROOT / 'tools/openssl_glue.c', ROOT / 'tools/nkf_glue.c', *bridge, prism, '-pthread', *link_flags, *openssl_ldflags, '-o', output / 'host'])
 if not args.setup_failure and not args.cleanup_failure:
     # Reuse the exact interpreter object. Fault injection exists only in this
     # separate NKF object/host, never in the distributed native archive.
@@ -118,7 +119,7 @@ if not args.setup_failure and not args.cleanup_failure:
     run('nkf-fault-compile', ['clang', '-O2', '-DMR_NKF_TEST', '-c', ROOT / 'tools/nkf_glue.c', '-o', nkf_test_object])
     run('nkf-fault-link', flags + ['-DMR_NKF_TEST', '-I', output, FIXTURES / 'embedding_host.c', archive,
         ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', ROOT / 'tools/math_glue.c',
-        ROOT / 'tools/process_glue.c', ROOT / 'tools/openssl_glue.c', nkf_test_object, prism,
+        ROOT / 'tools/process_glue.c', ROOT / 'tools/openssl_glue.c', nkf_test_object, *bridge, prism,
         '-pthread', *link_flags, *openssl_ldflags, '-o', output / 'nkf-fault-host'])
     assert run('nkf-faults', [output / 'nkf-fault-host', 'nkf-faults']) == 'native_nkf_allocation_exception_recovery_passed\n'
 expected = {
@@ -149,7 +150,7 @@ if args.reference_prefix and not args.setup_failure and not args.cleanup_failure
         FIXTURES / 'embedding_reference.c', '-L' + config['libdir'],
         *shlex.split(config['LIBRUBYARG_SHARED']), '-o', output / 'reference'])
     assert run('reference', [output / 'reference']) == expected['lifecycle']
-paths = [compiler, prism, Path(__file__).with_name('native_build_flags.py'), ROOT / 'tools/openssl_glue.c', ROOT / 'tools/math_glue.c', ROOT / 'tools/nkf_glue.c', ROOT / 'tools/nkf_engine.c', ROOT / 'tools/nkf_symbols.h', *ROOT.glob('vendor/nkf/**/*'), *ROOT.glob('*.mere'), *FIXTURES.glob('embedding*'),
+paths = [compiler, prism, Path(__file__).with_name('native_build_flags.py'), ROOT / 'tools/openssl_glue.c', ROOT / 'tools/math_glue.c', ROOT / 'tools/nkf_glue.c', ROOT / 'tools/nkf_engine.c', ROOT / 'tools/nkf_symbols.h', *ROOT.glob('vendor/nkf/**/*'), *ROOT.glob('*.mere'), *FIXTURES.glob('embedding*'), *bridge,
          api, output / 'embedding.c', output / 'embedding.h', archive, output / 'host']
 (output / 'sha256.json').write_text(json.dumps({str(p): hashlib.sha256(p.read_bytes()).hexdigest()
     for p in paths if p.is_file()}, indent=2) + '\n')

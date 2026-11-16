@@ -1,0 +1,1 @@
+class NativeProbe; end

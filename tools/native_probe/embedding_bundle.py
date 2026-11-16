@@ -7,7 +7,7 @@ archive and system libraries; no product C source is needed on their link line.
 The exported API is mere_embedding_*, not the Ruby C API.
 """
 from pathlib import Path
-from native_build_flags import openssl_flags
+from native_build_flags import openssl_flags, native_bridge_sources
 import argparse
 import hashlib
 import json
@@ -59,6 +59,7 @@ run('extract-prism', ['ar', 'x', prism])
 prism_objects = sorted(objects.glob('*.o'))
 assert prism_objects, 'Prism archive contained no object files'
 glue = [ROOT / 'tools' / (name + '.c') for name in ['prism_glue', 'socket_glue', 'math_glue', 'process_glue', 'openssl_glue', 'nkf_glue']]
+glue += native_bridge_sources()
 for source in glue:
     target = objects / (source.stem + '.o')
     assert not target.exists(), f'archive member collision: {target.name}'
