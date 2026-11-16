@@ -5030,6 +5030,18 @@ reproduced by the same C on both rubies, each with contracts now):
   outside the process -- ruby sees it as well. `test_lutime` in
   pathname, which reads the atime right after writing, then passes or not
   by how fast the steps between are: ruby's pass, ours sometimes do not.)
+
+**What the CI of c32cc30c found** (run 43841373314: every job green; MATCH
+33,183, 718 above the baseline, RED 1,231; 70 files higher, one lower):
+`ruby/test_dir.rb` 38 -> 37, `test_symlink`: `Dir.glob("*/")` listed
+symlinks to FILES. Not this branch's -- main's build does it too, 29 runs
+in 40 here, and the baseline's run happened to pass -- but its cause is the
+interpreter's directory test, `dir_there`, which asked `stat("<p>/")`; macOS
+answers that with success at random for a link to a file. The same cause
+made `File.read("~/.gemrc")` (a link to a file) raise EISDIR in one run of
+`gem` in five here. `dir_there` stats the path and reads the type bits now
+(a 0000 directory is still a directory, as before): 0 runs in 40 list a
+link to a file, and `~/.gemrc` reads 30 times in 30.
 - The regexp parse depth was one level too lenient: Onigmo counts the
   pattern itself (its outermost parse_subexp) as the first level, so at
   limit 1 `/(a)/` and `/[a]/` are refused. Counted the same way now, with
