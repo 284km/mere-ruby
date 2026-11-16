@@ -4963,7 +4963,7 @@ different.
 
 **The point.** `ruby/test_iseq.rb` goes from 42 of 70 to 62 of 68 (the two
 tests of `ISeq.load` are not defined in ruby, where the method is private,
-and no longer are here), `ruby/test_optimization.rb` from 82 to 84 of 89.
+and no longer are here), `ruby/test_optimization.rb` from 82 to 85 of 89.
 None of it is the VM's loop: it is `RubyVM::InstructionSequence`'s own
 surface, the compiler, and four things the evaluator had wrong.
 
@@ -5000,22 +5000,61 @@ surface, the compiler, and four things the evaluator had wrong.
     statement.
   - a `===` the program gave TrueClass, FalseClass or NilClass is the one
     `when true` calls.
-  - `-x`, `~x` and `+x` are calls a TracePoint sees (:c_call of String#-@),
-    not a String literal's `-"s"`; a negative Integer's own address is the
-    64 bits it is (`#<Integer:0xffffffffffffffff>`).
+  - `-x`, `~x`, `+x` and `!x` are calls a TracePoint sees (:c_call of
+    String#-@; one that raises still returns), not a String literal's
+    `-"s"`; a builtin `!=` is a call of `==` inside it. `unless` and
+    `until` were written with the same node as `!x`, so a class's own `!`
+    was called for them, which ruby never does: they are an operator of
+    their own now (neg_op), the condition's truth turned over with no call.
+  - a negative Integer's own address is the 64 bits it is
+    (`#<Integer:0xffffffffffffffff>`).
 - **Still RED, and why**:
   - test_iseq 6: two loops of a million `ISeq.new(nil)` / `load_from_binary`
     inside 10 s (28 and 39 s here: the evaluator's speed, the speed stage's);
     two that read a builtin's own sequence (`[].method(:pack)`); a Ractor
     that redefines Kernel#Float; `case / in` in the compiler.
-  - test_optimization 5: tail calls that must not grow the stack (2), a
-    million `"".empty?` in time, the memory a frozen IO buffer gives back,
-    and `!x` as a :c_call -- the parser writes `unless` and `until` with the
-    same node as `!`, so it cannot be told apart yet.
-  - test_coverage 12: branch coverage (10) is not counted anywhere. The
-    plan: a file under branch coverage runs on the VM, the compiler puts
-    the branches in its sequences (prism_compile.c's
-    add_trace_branch_coverage) and the VM counts them.
+  - test_optimization 4: tail calls that must not grow the stack (2), a
+    million `"".empty?` in time, the memory a frozen IO buffer gives back.
+  - test_coverage: round 40, below.
+- Witness 664. The counts are with round 40's, below.
+
+## 2026-11-16 (61): round 40 -- branch coverage, counted by the VM
+
+**The point.** `coverage/test_coverage.rb` goes from 34 to 45 of 46.
+Branch coverage was counted nowhere; it is now what ruby's is, construct
+by construct and count by count, for a file the VM takes.
+
+- **A file read while Coverage is set up runs on the ISeq VM**, when the VM
+  takes it (vm_file_stmts; otherwise the evaluator runs it as before and
+  the file has no branches). With branches asked for, the compiler is given
+  `coverage_branches`.
+- **The compiler puts the branches where ruby's does** (compile.c's
+  decl_branch_base and add_trace_branch_coverage, at prism_compile.c's
+  sites): `if` / `unless` / the ternary (then, else), `while` / `until`
+  (body), `&.` (then, else), `case` / `when` with and without a subject
+  (each when, the else written or not). Each branch is a `nop` of its own
+  with the coverage event, at the branch's last line. ruby compiles the
+  same into a sequence made while Coverage counts branches, so this too is
+  compared with ruby itself: `tools/iseq/compare_coverage.rb` (new) -- the
+  disassembly, and the structure as Coverage.peek_result shows it -- 19 /
+  19 snippets.
+- **The VM counts** at that nop (the VM's export gives it the branch's
+  counter), and `Coverage.result` answers `{[type, id, line, column, line,
+  column] => {[type, id, ...] => count}}` with ruby's numbering: a
+  construct, then its branches. `result(clear: true)` zeroes the counts and
+  keeps the structure.
+- **Lines.** A covered file's lines are the compiled code's line events
+  when the VM runs it, and the lines the evaluator's parser had noted for
+  it are dropped: `some =\n  'value'` counts on the value's line, a
+  literal Array's first element's. That is test_line_coverage_for_multiple_
+  lines and test_oneshot_line_coverage.
+  ⚠ A file of more than 2,000 lines under Coverage for its lines alone
+  stays on the evaluator: the compiler is Ruby, about 3 ms a line, and
+  test_big_code's 10,003 lines took past its limit. Branches use the VM
+  whatever the length. The bound goes when the compiler is native.
+- **Still RED**: test_branch_coverage_for_pattern_matching -- `case / in`
+  is not compiled yet.
 - **Checked** (local, the commit before this note): vm_check 243 / 243,
-  the compiler 433 / 433 snippets and 671 / 671 compiled files, corpus
-  692 / 692 on the evaluator and RESULT_VM on the VM, the gates. Witness 664.
+  the compiler 433 / 433 snippets, 671 / 671 compiled files and 19 / 19
+  under branch coverage, corpus RESULT_EV on the evaluator and RESULT_VM
+  on the VM, the gates. Witness 665.
