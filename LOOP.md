@@ -5079,7 +5079,8 @@ the reference.
   (`Custom <= Redcarpet::Render::Base` was nil -- plain Ruby shows it too:
   `Module.new` twice, `const_set` twice, a `Class.new` under them). Where
   the scope and the superclass have names, C's definition now runs `class
-  Outer::Name < Super; end` itself. The anonymous way is kept for the rest,
+  Outer::Name < Super; end` itself (taken to #87 as well, where it went
+  first). The anonymous way is kept for the rest,
   and the interpreter's own gap is still there for plain Ruby.
 - **`have_func` of a ruby function is answered by whether this interpreter
   has it.** mkmf answers by linking a program that names the function, and
@@ -5194,7 +5195,7 @@ descriptor, how it was opened, the path), and `rb_io_check_closed`,
 load and answer, and nio4r's selector (libev) behaves as on the reference;
 bcrypt and nio4r joined capi_gem_check.py (seven gems, 84 lines), and
 each of these functions has contracts in capi/check/api.rb (65 on both
-sides now). Writing those against the reference corrected two of them
+sides then; 94 with those #87's CI added). Writing those against the reference corrected two of them
 before they shipped: the refusal of an implicit conversion reads "no
 implicit conversion of X into T" in 4.0, and `$~` read from C is the
 calling Ruby frame's, which is parked while the C method's frame runs. Still
