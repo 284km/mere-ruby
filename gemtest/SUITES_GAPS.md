@@ -11,15 +11,13 @@ None is excluded from the measurement to improve its score.
 | minitest / `test_minitest_reporter.rb` | 1 error while compressing a SystemStackError backtrace. `[0].chain([1,1,2].each_slice(1)).chunk_while { ... }.to_a` raises ArgumentError about a missing block; the same operation without Chain succeeds. | Ruby semantics. The Chain block dispatcher is in `invoke_with_block0`, also edited by the VM session in #88; recorded for coordination, not attributed to an ISeq failure. |
 | minitest / `test_minitest_spec.rb` | `Minitest::Spec::DSL#name` calls super and cannot find the inherited Class/Module implementation. | Ruby semantics. Coordinate with #86, which edits `super_next_plain`; no AST tree failure is established. |
 | minitest / `test_minitest_test.rb` | Backtrace compression errors as above, exception Marshal/equality failures, and a missing yield under the backtrace filter helper. | Ruby semantics. Separate the Marshal and block-forwarding witnesses before changing implementations. |
-| rack / `spec_deflater.rb` | Aborting a gzip stream raises Zlib::DataError instead of the test's FakeDisconnect. | Ruby semantics in the streaming zlib API; no native extension is requested by this suite. Reduce the incomplete-stream witness. |
 | rack / `spec_headers.rb` | Class naming through `Minitest::Spec::DSL#name` fails before a summary. | Same super lookup issue as minitest spec; coordinate with #86. |
 | rack / `spec_lint.rb` | `notice environment errors` expects Rack::Lint::LintError, but nothing is raised. | Ruby semantics; root cause not yet isolated. |
-| rack / `spec_mock_request.rb` | Psych tries to revive an instance variable named `@` when loading the test's environment dump. | Ruby semantics; trace the dump/load boundary before attributing a parser or object-model cause. |
 | rack / `spec_request.rb` | The result reporter cannot resolve super from `RackRequestTest::TestProxyRequest.name`; no final summary. | Same super lookup issue as minitest spec; coordinate with #86. |
 | rack / `spec_rewindable_input.rb` | Exits with `unexpected return`, without a summary. | Ruby control-flow semantics; root cause not yet isolated. |
 | rack / `spec_sendfile.rb` | Two tests opening a File subclass reach IO's descriptor conversion and reject a path string. | Ruby constructor inheritance; reduce a File subclass witness. |
 | rack / `spec_utils.rb` | Custom query parameter hash loses `foo`; an invalid-cookie test reports a non-class rescue clause. | Ruby semantics; separate the two failures. |
-| rack / `spec_multipart.rb` | The mere-ruby process family crosses 2 GiB. | Resource investigation, not a proven GC or VM cause. Keep the cap. Record a specific hot test before assigning a fix to the VM session; collector internals remain untouched. |
+| rack / `spec_multipart.rb` | The process family crosses 2 GiB in `test_0018_rejects insanely long boundaries`, a background-thread pipe writer and multipart reader. The reference completes 85 tests / 239 assertions. | Resource investigation, not a proven GC or VM cause. A separate 10 MiB string allocation plus one nonblocking pipe write succeeds on both interpreters, each writing 65,536 bytes. The combined workload still needs isolation; keep the cap and leave collector internals untouched. |
 | rack-test / `uploaded_file_spec.rb` | All 10 tests pass on both sides, but 255 versus 368 assertions. The test enumerates `Tempfile.public_instance_methods(false)`. | Ruby reflection semantics; count discrepancy remains RED rather than concealing it. |
 
 The first batch establishes no confirmed dependency on C API/mkmf, native gem
@@ -40,3 +38,17 @@ Resolved in this batch:
 Kramdown is deferred for explicit dependency reasons in the lock, not
 classified as an interpreter failure. Rack 3.1.12 was replaced before the
 baseline by 3.2.0 because the older test suite requires removed `cgi/cookie`.
+
+Resolved in follow-up rounds 4-5:
+
+- Rack's `spec_deflater.rb`: GzipWriter now consumes pending output before
+  calling the destination. A consumer that accepts bytes and then raises
+  no longer receives the same gzip prefix again from ensure's finish.
+  `GzipWriter#__write_output` is the only zlib method changed; the original
+  file becomes MATCH, as do all 96 CRuby zlib tests. Witness 671.
+- Rack's `spec_mock_request.rb`: StringIO's eight backing ivars now use the
+  existing internal namespace, so Psych sees only caller-added variables,
+  as on the reference. It no longer serializes the stream's private State
+  object. A caller's `@st` and `@label` remain visible and round-trip, while
+  the stream still reads its own buffer. The original file becomes MATCH
+  and all 103 CRuby StringIO tests pass. Witness 672.

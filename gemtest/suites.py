@@ -174,6 +174,8 @@ def run_side(args, suite, file, side, env, output, lock):
         binary = args.reference if side == 'reference' else args.binary
         command = [str(binary), '--disable-gems', '-I', os.pathsep.join(map(str, libraries)),
                    '-r', 'rubygems', file, '--seed', '1']
+        if args.verbose:
+            command += ['--verbose']
         stdout = output / (side + '.stdout')
         stderr = output / (side + '.stderr')
         result = supervise([sys.executable, '-c', EXEC, str(source), str(stdout), str(stderr)] + command,
@@ -270,6 +272,7 @@ def main():
     parser.add_argument('--gem', action='append')
     parser.add_argument('--file', action='append')
     parser.add_argument('--baseline', type=Path)
+    parser.add_argument('--verbose', action='store_true', help='ask the upstream runner to name each test')
     args = parser.parse_args()
     for key in ('lock', 'cache', 'reference', 'binary', 'ruby_src', 'output', 'baseline'):
         value = getattr(args, key)

@@ -1,3 +1,4 @@
+# A consumer may accept a chunk before reporting disconnection.
 require 'zlib'
 
 class Disconnect < StandardError; end

@@ -1,3 +1,4 @@
+# Stream backing state is separate from variables added by callers.
 require 'stringio'
 require 'yaml'
 

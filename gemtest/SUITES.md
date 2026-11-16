@@ -37,6 +37,8 @@ peak family RSS, elapsed time and original test summary in `results.json`.
 Logs live under `<gem>/<test-file>/<reference|mere>.stdout` and `.stderr`.
 Use a fresh output directory. `--gem NAME` and `--file PATH` select individual
 files for diagnosis; baseline comparisons require the full file inventory.
+Add `--verbose` to record the upstream runner's individual test names while
+diagnosing a resource limit; the default seed, bounds and verdicts stay the same.
 
 | Verdict | Meaning |
 |---|---|
@@ -76,3 +78,11 @@ Remaining runtime differences and their ownership are in
 [SUITES_GAPS.md](SUITES_GAPS.md). The interpreter changes for the first batch
 are limited to `pct_strict_value` and `cls_meth_own`, with corpus witnesses
 667 and 668. No VM, AST tree, C API or collector implementation is changed.
+
+Follow-up rounds 4-5 fix gzip output replay after a destination raises and
+StringIO backing state leaking into Ruby-visible ivars and YAML. With the
+same 62 files and lock, the latest record is 50 MATCH / 11 RED / 1 MEMORY,
+up from 48 MATCH / 13 RED / 1 MEMORY in the first PR. The original initial
+record stays unchanged. These changes are in the Ruby libraries and their
+generated embedded copies, with witnesses 671 and 672; the full CRuby zlib
+and StringIO tests report 96/96 and 103/103 MATCH respectively.
