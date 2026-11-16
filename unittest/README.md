@@ -55,6 +55,16 @@ the name of the selected CRuby GC library and is excluded with that reason;
 excluded individually; generic argument checks, actual allocation tracing
 and GC::Profiler tests remain enabled. Passing MMTk exclusions are not copied.
 
+`gc_cases.tsv` classifies all 159 target RED from successful main CI
+43807166928 (c64d0ae4): 14 honest implementation matches, 55 reasoned
+exclusions and 90 named handoffs. This is a dated triage inventory, not a
+replacement for measured results. In particular, `memsize_of_all` now passes
+the raw comparison but still sums the inherited guessed `memsize_of` values;
+it remains a native allocator handoff. Heap dumps omit that unmeasured field.
+The handoff tests stay enabled. Native test extensions, allocator attribution,
+VM argument/literal allocation and conservative stack roots retain concrete
+test names and reasons, rather than disappearing from the denominator.
+
 ```sh
 UNITTEST_RECORD_DIR=/path/to/run/records \
 UNITTEST_KEEP=/path/to/run/raw \

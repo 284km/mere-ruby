@@ -4883,6 +4883,40 @@ tests of the default collector. No slot or page constants are invented.
   call into each_object (VM allocation provenance). Neither is excluded.
 - Witness 667 checks actual profiling, latest info, unsupported compaction,
   empty slot information and each_object over real value stores.
+
+### Stage 9 GC remainder, rounds 2 and 3 -- real heap dumps and complete triage
+
+- dump_all snapshots real objects and value stores, emits actual handles,
+  class/reference edges and allocation generation filters, and returns the
+  requested stream/string/file. dump includes observed object_id in flags,
+  File's type and String encoding information. It omits the inherited guessed
+  memsize field. Witness 668 checks real membership, references and provenance.
+- A snapshot can otherwise retain many expired runtime temporaries. When GC
+  is enabled it collects before the public value-store snapshot; GC.disable
+  and count_objects allocation comparisons retain their existing behavior.
+- All 159 baseline RED are listed in unittest/gc_cases.tsv: 14 honest MATCH,
+  55 reasoned exclusions, 90 reasoned handoffs. All 76 allocation tests remain
+  enabled and RED locally. VM handoffs cover call-path allocation/provenance,
+  actual literal pools, Float identity and Symbol lifetime; native handoffs
+  cover -test-/stack, TypedData owners, allocator attribution and stack roots.
+- Raw standalone results: objspace MATCH 28 -> 38, GC 29 -> 32, string_memory
+  0 -> 2; objspace/ractor stays 3. The 15 raw gains include memsize_of_all,
+  which still sums pre-existing guessed sizes and remains a handoff, not an
+  accepted honest implementation match. The exclusion count remains 55 on
+  both interpreters. Missing local -test-/stack remains BOTH, not a pass.
+- The RSS gate caught a real regression: cause recording reused oncall and
+  suppressed native arena compaction during explicit off-stack GC. A separate
+  explicit cause flag restores the original collection behavior; the
+  discarded-class-ivar ratio returns from 2.25x to baseline 1.06x. No resource
+  limit was changed. The collector's gc_fixpoint/gc_mark_roots/gc_collect and
+  m_state.mere remain untouched.
+- Main advanced through PR #88 to 535ad955 during this work. It was merged
+  into this branch; only the appended LOOP.md sections conflicted, and both
+  were retained. Final verification uses that main plus the GC changes.
+- Validation: runner 20, CI collector 47 (five existing optional real-reference
+  fixtures skipped locally), exclusion accounting's identical/asymmetric
+  fixtures, transcript 17; new witnesses agree with Ruby. Full corpus, final
+  source gates, RSS and whole-suite CI are recorded in the PR as they finish.
 ## 2026-11-16 (59): round 38 -- a whole file runs on the ISeq VM, and the corpus matches ruby that way too
 
 **The point.** With `MERE_RUBY_VM=1` the main script and every file it

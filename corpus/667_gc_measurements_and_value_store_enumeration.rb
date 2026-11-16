@@ -24,6 +24,7 @@ GC::Profiler.clear
 raise 'records not cleared' unless GC::Profiler.raw_data.empty?
 GC::Profiler.disable
 raise 'disabled raw data' unless GC::Profiler.raw_data.nil?
+raise 'profiler time type' unless GC::Profiler.total_time.is_a?(Float)
 
 unless GC.respond_to?(:compact)
   [:compact, :auto_compact, :latest_compact_info, :verify_compaction_references].each do |method|

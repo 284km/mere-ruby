@@ -17,12 +17,24 @@ is excluded instead of changing the reference's collector identity.
 Profiler records real durations around gc_collect_any; latest_gc_info
 reports actual causes and weak-reference counts, without invented heap keys.
 
-The first local round gains six MATCH and separately records 55 exclusions.
+The two local rounds gain 15 raw MATCH and separately record 55 exclusions.
+One of those raw gains, memsize_of_all, still uses the inherited slot guesses;
+it is not an accepted implementation match. `unittest/gc_cases.tsv` classifies
+the 159 baseline RED as 14 honest matches, 55 exclusions and 90 handoffs.
+The remaining objspace work needs actual literal pools, Float/Symbol identity
+and lifetime, native TypedData ownership and per-owner allocator byte counts.
+Heap dumps now expose real handles, class/reference edges, observed object_id,
+allocation-generation filters, File type and String encoding information;
+they omit the guessed memsize field. The memsize_of APIs still need actual
+allocator attribution; their pre-existing guesses are not endorsed here.
 The WeakMap lifetime test still retains 66 objects against its bound of 10;
 conservative root ownership overlaps the native C API work in PR #87.
 String-memory's first call sees VM parameter-name Strings attributed to its
 caller. The allocation suite's 76 real comparisons remain VM work. These
-failures remain visible; none is excluded as default-GC behavior.
+failures remain visible; none is excluded as default-GC behavior. The initial
+RSS regression came from reusing the collector's oncall safety flag to label
+explicit collections; a separate cause flag restores native arena collection.
+The discarded-class-ivar gate again measures 1.06x, the baseline ratio.
 
 Divergences from CRuby that are understood, reproduced, and deliberately
 not fixed yet — as opposed to the things nobody has looked at. Each entry
