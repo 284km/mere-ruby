@@ -1,5 +1,8 @@
 require 'objspace'
 
+if GC.count.zero?
+  raise 'invented collection cause' unless GC.latest_gc_info[:gc_by].nil?
+end
 GC.start
 info = GC.latest_gc_info
 raise 'explicit collection cause' unless info[:gc_by] == :method
@@ -11,6 +14,12 @@ begin
   raise 'unknown stat accepted'
 rescue ArgumentError
 end
+
+garbage = Array.new(300) { proc {} }
+issued = GC.stat(:total_allocated_objects)
+garbage = nil
+GC.start
+raise 'allocation count decreased after sweep' if GC.stat(:total_allocated_objects) < issued
 
 GC::Profiler.enable
 GC::Profiler.clear
