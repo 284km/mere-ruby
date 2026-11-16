@@ -9230,11 +9230,14 @@ let core_prelude_j =
   "      catch(:__isq_ok) \{ TOPLEVEL_BINDING.receiver.__send__(:__isq_eval, code, file, line - 1) }\n" ++
   "    end\n" ++
   "    def self.compile(src, file = nil, path = nil, line = 1, opt = nil, **kw)\n" ++
+  "      # (a File is read by its path, open or closed: pm_load_parse_file)\n" ++
+  "      src = File.read(src.path) if src.is_a?(File) && src.path\n" ++
   "      src = src.read if !src.is_a?(String) && src.respond_to?(:read)\n" ++
   "      raise TypeError, \"no implicit conversion of #\{src.class} into String\" unless src.is_a?(String)\n" ++
   "      file ||= \"<compiled>\"\n" ++
   "      line = Integer(line || 1)\n" ++
   "      __syntax(src, file, line)\n" ++
+  "      __prism_check(src, file, line)\n" ++
   "      i = __new(src, file, path || file, line, \"<compiled>\")\n" ++
   // (make_compile_option: false is every optimisation off, true every one
   //  on, a Hash over the defaults)
@@ -9244,10 +9247,46 @@ let core_prelude_j =
   "          when nil then @@__opt.dup\n" ++
   "          else raise TypeError, \"Compile option must be Hash/true/false/nil\"\n" ++
   "          end.merge(kw)\n" ++
+  "      # (the debug level is read as an int: NUM2INT)\n" ++
+  "      unless o[:debug_level].is_a?(Integer)\n" ++
+  "        raise TypeError, \"no implicit conversion of #\{o[:debug_level].class} into Integer\"\n" ++
+  "      end\n" ++
   "      i.instance_variable_set(:@__copt, o)\n" ++
   "      i.instance_variable_set(:@__fsl, o[:frozen_string_literal] ? true : nil)\n" ++
   "      i.instance_variable_set(:@__dfsl, o[:debug_frozen_string_literal] ? true : nil)\n" ++
   "      i\n" ++
+  "    end\n" ++
+  "    # What ruby refuses at compile time and the evaluator's parser lets\n" ++
+  "    # through: a jump written where there is nothing to jump out of\n" ++
+  "    # (\"Invalid break\", Prism's own error, reported as Prism frames it) and a\n" ++
+  "    # yield outside any method (\"Invalid yield\", prism_compile.c's).\n" ++
+  "    def self.__prism_check(src, file, line)\n" ++
+  "      return unless src =~ /\\b(?:break|next|redo|retry|yield)\\b/\n" ++
+  "      require \"prism\"\n" ++
+  "      r = Prism.parse(src, filepath: file, line: line)\n" ++
+  "      # (a yield outside a method is the compiler's refusal in ruby, one\n" ++
+  "      #  line and no frame; Prism reports it here as an error of its own)\n" ++
+  "      ys, errs = r.errors.partition \{ |e| e.message == \"Invalid yield\" }\n" ++
+  "      raise SyntaxError, __prism_report(src, file, line, errs) unless errs.empty?\n" ++
+  "      raise SyntaxError, \"#\{file}:#\{ys[0].location.start_line}: Invalid yield\" unless ys.empty?\n" ++
+  "    end\n" ++
+  "    # pm_parse_errors_format: the first error's line in the heading, each\n" ++
+  "    # error's line with two lines around it, the error's extent under it\n" ++
+  "    def self.__prism_report(src, file, line, errs)\n" ++
+  "      lines = src.lines\n" ++
+  "      last = line + lines.size - 1\n" ++
+  "      at = errs.group_by \{ |e| e.location.start_line }\n" ++
+  "      shown = at.keys.flat_map \{ |l| ((l - 2)..(l + 2)).to_a }.uniq.sort.select \{ |l| l >= line && l <= last }\n" ++
+  "      w = shown.last.to_s.size\n" ++
+  "      out = +\"#\{file}:#\{at.keys.min}: syntax error#\{errs.size > 1 ? \"s\" : \"\"} found\\n\"\n" ++
+  "      shown.each do |l|\n" ++
+  "        out << (at[l] ? \"> \" : \"  \") << l.to_s.rjust(w) << \" | \" << lines[l - line].chomp << \"\\n\"\n" ++
+  "        (at[l] || []).each do |e|\n" ++
+  "          len = [e.location.length, 1].max\n" ++
+  "          out << \" \" * (w + 3) << \"| \" << \" \" * e.location.start_column << \"^\" << \"~\" * (len - 1) << \" \" << e.message << \"\\n\"\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "      out\n" ++
   "    end\n" ++
   "    def self.new(...) = compile(...)\n" ++
   "    def self.compile_prism(...) = compile(...)\n" ++
@@ -9265,8 +9304,19 @@ let core_prelude_j =
   "      i\n" ++
   "    end\n" ++
   "    def self.compile_file_prism(...) = compile_file(...)\n" ++
+  "    # (ruby's has no allocator; __new is the one maker)\n" ++
+  "    @@__mk = false\n" ++
+  "    def self.allocate\n" ++
+  "      raise TypeError, \"allocator undefined for #\{self}\" unless @@__mk\n" ++
+  "      super\n" ++
+  "    end\n" ++
   "    def self.__new(src, file, path, line, label)\n" ++
-  "      i = allocate\n" ++
+  "      @@__mk = true\n" ++
+  "      i = begin\n" ++
+  "        allocate\n" ++
+  "      ensure\n" ++
+  "        @@__mk = false\n" ++
+  "      end\n" ++
   "      i.instance_variable_set(:@__src, src)\n" ++
   "      i.instance_variable_set(:@__file, file)\n" ++
   "      i.instance_variable_set(:@__path, path)\n" ++
@@ -9275,27 +9325,63 @@ let core_prelude_j =
   "      i\n" ++
   "    end\n" ++
   "    private_class_method :__new, :__syntax\n" ++
-  "    # a method or proc written in ruby has a sequence; a builtin has none\n" ++
+  "    # a method or proc written in ruby has a sequence; a builtin has none.\n" ++
+  "    # The same code answers the same object. What the sequence IS -- its\n" ++
+  "    # instructions, its label -- is read off the file's own compilation\n" ++
+  "    # when first asked (__unit): the method's sequence that starts on that\n" ++
+  "    # line, a block's, or a frame's by its label and line.\n" ++
+  "    @@__ofs = \{}\n" ++
+  "    @@__tops = \{}\n" ++
   "    def self.of(body)\n" ++
+  "      return body if body.is_a?(self)\n" ++
+  "      # (a backtrace's Location: what answers a line and a label)\n" ++
+  "      if body.respond_to?(:lineno) && body.respond_to?(:base_label) && body.respond_to?(:absolute_path)\n" ++
+  "        file = body.absolute_path || body.path\n" ++
+  "        return nil unless file\n" ++
+  "        key = [file, body.lineno, body.label]\n" ++
+  "        return @@__ofs[key] ||= begin\n" ++
+  "          i = __new(nil, body.path, file, body.lineno, body.label)\n" ++
+  "          i.instance_variable_set(:@__find, [:frame, body.lineno, body.label])\n" ++
+  "          i\n" ++
+  "        end\n" ++
+  "      end\n" ++
   "      loc = (body.source_location rescue nil)\n" ++
   "      return nil unless loc\n" ++
-  "      label = (body.respond_to?(:name) && body.name) ? body.name.to_s : \"block in <main>\"\n" ++
+  "      name = (body.respond_to?(:name) && body.name) ? body.name.to_s : nil\n" ++
+  "      key = [loc[0], loc[1], name]\n" ++
+  "      got = @@__ofs[key]\n" ++
+  "      return got if got\n" ++
+  "      label = name || \"block in <main>\"\n" ++
   "      i = __new(nil, loc[0], loc[0], loc[1], label)\n" ++
+  "      i.instance_variable_set(:@__find, name ? [:method, loc[1], name] : [:block, loc[1], nil])\n" ++
   "      # (a builtin ruby writes in Ruby disassembles as that ruby prints it)\n" ++
   "      if loc[0].start_with?(\"<internal:\") && body.respond_to?(:owner)\n" ++
   "        own = body.owner\n" ++
-  "        key = own.singleton_class? ? own.inspect[/\\A#<Class:(.*)>\\z/, 1].to_s + \".\" + label : own.name.to_s + \"#\" + label\n" ++
-  "        i.instance_variable_set(:@__dis, TracePoint.__bdisasm(key))\n" ++
+  "        key2 = own.singleton_class? ? own.inspect[/\\A#<Class:(.*)>\\z/, 1].to_s + \".\" + label : own.name.to_s + \"#\" + label\n" ++
+  "        i.instance_variable_set(:@__dis, TracePoint.__bdisasm(key2))\n" ++
   "      end\n" ++
-  "      i\n" ++
+  "      @@__ofs[key] = i\n" ++
+  "    end\n" ++
+  "    # the file's compilation, once a file (nil when it does not compile)\n" ++
+  "    def self.__top(file)\n" ++
+  "      return @@__tops[file] if @@__tops.key?(file)\n" ++
+  "      require \"__iseq_compiler\"\n" ++
+  "      @@__tops[file] = begin\n" ++
+  "        File.file?(file) ? Compiler__.compile(File.read(file), file, File.expand_path(file), 1, \"<main>\", nil) : nil\n" ++
+  "      rescue Exception\n" ++
+  "        nil\n" ++
+  "      end\n" ++
   "    end\n" ++
   "    def self.disasm(body) = of(body)&.disasm\n" ++
   "    def self.load_from_binary(bin)\n" ++
-  "      raise ArgumentError, \"unknown binary format\" unless bin.is_a?(String) && bin.start_with?(\"MRISEQ\\0\")\n" ++
+  "      raise TypeError, \"no implicit conversion of #\{bin.class} into String\" unless bin.is_a?(String)\n" ++
+  "      raise ArgumentError, \"unknown binary format\" unless bin.start_with?(\"MRISEQ\\0\")\n" ++
   "      f, p, l, lb, s = bin.byteslice(7, bin.bytesize - 7).split(\"\\0\", 5)\n" ++
   "      __new(s, f, p, Integer(l), lb)\n" ++
   "    end\n" ++
+  "    # (ruby keeps it private: `defined?(RubyVM::InstructionSequence.load)` is nil)\n" ++
   "    def self.load(...) = raise(NotImplementedError, \"RubyVM::InstructionSequence.load is not supported\")\n" ++
+  "    private_class_method :load\n" ++
   "    def eval\n" ++
   "      raise NotImplementedError, \"this sequence has no source here\" unless @__src\n" ++
   // (on the VM when it runs every instruction of the sequence -- round 33
@@ -9315,9 +9401,10 @@ let core_prelude_j =
   "    end\n" ++
   "    def path = @__file\n" ++
   "    def absolute_path = (@__path == \"<compiled>\" ? nil : @__path)\n" ++
-  "    def label = @__label\n" ++
-  "    def base_label = @__label\n" ++
-  "    def first_lineno = @__line\n" ++
+  "    # (one ISeq.of answered: its own sequence's, when the file compiles)\n" ++
+  "    def label = (@__find && (u = __unit) ? -u.label : @__label)\n" ++
+  "    def base_label = (@__find && (u = __unit) ? -Compiler__.base_label(u) : @__label)\n" ++
+  "    def first_lineno = (@__find && (u = __unit) ? u.first_lineno : @__line)\n" ++
   "    def script_lines = nil\n" ++
   "    def inspect = \"<RubyVM::InstructionSequence:#\{@__label}@#\{@__file}:#\{@__line}>\"\n" ++
   // (a sequence compiled from source is compiled for real -- Prism's tree to
@@ -9325,6 +9412,14 @@ let core_prelude_j =
   //  asked for its instructions; one ISeq.of answers has no source yet)
   "    def __unit\n" ++
   "      return @__unit if @__unit\n" ++
+  "      if @__find\n" ++
+  "        return nil if @__find == :none\n" ++
+  "        kind, line, name = @__find\n" ++
+  "        top = RubyVM::InstructionSequence.__top(@__path)\n" ++
+  "        u = top && (kind == :frame ? Compiler__.unit_for_frame(top, name, line) : Compiler__.unit_at(top, kind, line, name))\n" ++
+  "        @__find = :none unless u\n" ++
+  "        return @__unit = u\n" ++
+  "      end\n" ++
   "      return nil unless @__src\n" ++
   "      require \"__iseq_compiler\"\n" ++
   "      @__unit = Compiler__.compile(@__src, @__file, @__path, @__line, @__label, @__copt)\n" ++

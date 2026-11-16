@@ -3308,6 +3308,48 @@ class RubyVM::InstructionSequence
       end
     end
 
+    # -- finding a sequence in a compiled file: what
+    # RubyVM::InstructionSequence.of answers for a Method, a Proc or a
+    # backtrace's Location is the sequence of the file's own compilation ---
+    # every sequence under `u`, itself first
+    def each_unit(u, depth = 0, &blk)
+      yield u, depth
+      u.children.each { |c| each_unit(c, depth + 1, &blk) }
+    end
+
+    # the sequence of `type` that starts on `line` (and is labelled `name`,
+    # when one is given); of several -- blocks opened on one line -- the
+    # innermost, which is the one a Proc made on that line most often is
+    def unit_at(top, type, line, name = nil)
+      best = nil
+      best_depth = -1
+      each_unit(top) do |u, d|
+        next unless u.type == type && u.first_lineno == line && (name.nil? || u.label == name)
+        (best = u; best_depth = d) if d > best_depth
+      end
+      best
+    end
+
+    # the innermost sequence labelled `label` whose lines cover `line`: a
+    # frame's
+    def unit_for_frame(top, label, line)
+      best = nil
+      best_depth = -1
+      each_unit(top) do |u, d|
+        cl = u.code_location
+        next unless u.label == label && cl && cl[0] <= line && line <= cl[2]
+        (best = u; best_depth = d) if d > best_depth
+      end
+      best
+    end
+
+    # ISeq#base_label: the label of the method, class body or file a block
+    # or a rescue / ensure clause is written in
+    def base_label(u)
+      u = u.parent while u.parent && THROUGH.include?(u.type)
+      u.label
+    end
+
     # -- the backend (compile.c's iseq_setup): peephole and specialised
     # instructions, operand unification, the stack depth, the layout ----
     def finish(u)
