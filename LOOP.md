@@ -4817,7 +4817,7 @@ different.
   anywhere was never warned about for an unused block.
   ⚠ Found and NOT fixed, both the evaluator's own: in a source that says
   `binding` anywhere, a def-level rescue clause sees its frame at the
-  caller's line instead of the def's (the VM has it right; corpus 662 keeps
+  caller's line instead of the def's (the VM has it right; corpus 663 keeps
   those two methods in a file of their own); and Method objects made of a
   top-level method that is then defined again several times all call the
   newest body.
@@ -4845,7 +4845,7 @@ different.
 - **Checked** (local, the commit before this note): vm_check 243 / 243,
   the compiler 431 / 431 snippets and 667 / 667 compiled files, corpus
   691 / 691 on the evaluator and 691 with 0 different on the VM, the gates
-  (bracket depth 878). Witness 662 runs one
+  (bracket depth 878). Witness 663 runs one
   script both ways in a child and prints that the two agree.
 - **Not done yet, and why the default stays the evaluator**: the compiler
   is Ruby running on mere-ruby, about 3 ms a line; and the VM's loop is

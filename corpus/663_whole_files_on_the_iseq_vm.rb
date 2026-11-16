@@ -13,7 +13,7 @@ require "rbconfig"
 require "tmpdir"
 
 MAIN = <<~'RUBY'
-  require_relative "side662"
+  require_relative "side663"
   def t(label)
     r = yield
     puts "#{label}: #{r.inspect}"
@@ -27,10 +27,10 @@ MAIN = <<~'RUBY'
 
   # `**obj` converts with #to_hash, before the block's #to_proc; `**nil` and
   # `**{}` pass nothing but still say keywords were given
-  class NoHash662; end
+  class NoHash663; end
   def kw(*a, **k) = [a, k]
   pr = proc { |x, y = 0| [x, y] }
-  t("double splat") { kw(**NoHash662.new) }
+  t("double splat") { kw(**NoHash663.new) }
   t("empty splats") { [kw(**nil), kw(1, **{}), pr.call([1, 2, 3], **{}), pr.call([1, 2, 3])] }
   order = []
   o = Object.new
@@ -40,14 +40,14 @@ MAIN = <<~'RUBY'
 
   # a def, an undef and an alias run where there is no singleton class: the
   # TypeError is theirs, when they run -- a constant or a class is not refused
-  t("def on 1") { 1.instance_eval { def none662 = 1 } }
+  t("def on 1") { 1.instance_eval { def none663 = 1 } }
   t("undef on 1") { 1.instance_eval { undef to_s } }
-  t("const on 1") { 1.instance_eval { C662 = 1 }; C662 }
-  t("untaken def") { 1.instance_eval { if false then def never662 = 1 end; :ok } }
+  t("const on 1") { 1.instance_eval { C663 = 1 }; C663 }
+  t("untaken def") { 1.instance_eval { if false then def never663 = 1 end; :ok } }
 
   # under a rescue clause the frame is seen at its def's / begin's line
   # (the two methods are in the side file)
-  t("rescue frames") { [def_level662, begin_level662] }
+  t("rescue frames") { [def_level663, begin_level663] }
 
   # a break in a Thread's body that no loop takes
   t("thread break") do
@@ -65,17 +65,17 @@ MAIN = <<~'RUBY'
   warned = []
   Warning.singleton_class.define_method(:warn) { |m, **| warned << m.sub(/\A.*?warning: /, "").sub(/ defined at .*? may/, " defined at ... may").chomp }
   $VERBOSE = true
-  def unused662 = 42
-  def yields662 = yield
-  unused662 { }
-  yields662 { }
-  Again662 = 1
-  class Holder662; ::Again662 = 2; end
+  def unused663 = 42
+  def yields663 = yield
+  unused663 { }
+  yields663 { }
+  Again663 = 1
+  class Holder663; ::Again663 = 2; end
   $VERBOSE = false
   t("warnings") { warned.map { |w| w.sub(/\A.*: /, "") } }
 
   # a TracePoint's binding sees the frame's locals, assigned yet or not
-  class Traced662
+  class Traced663
     def run(n)
       k = n * 2
       k + 1
@@ -83,10 +83,10 @@ MAIN = <<~'RUBY'
   end
   seen = []
   tp = TracePoint.new(:call, :line, :return) do |tr|
-    next unless tr.defined_class == Traced662
+    next unless tr.defined_class == Traced663
     seen << [tr.event, tr.binding.local_variable_defined?(:k), tr.binding.eval("k")]
   end
-  tp.enable { Traced662.new.run(3) }
+  tp.enable { Traced663.new.run(3) }
   t("binding") { seen }
 
   # each computed piece of a pattern is read on its own, in its encoding
@@ -101,16 +101,16 @@ MAIN = <<~'RUBY'
 
   # a builtin operator is a frame of what it refuses
   t("operator frame") { begin; 1 + nil; rescue TypeError => e; e.backtrace_locations.map(&:label); end }
-  t("side file") { [Side662.where, Side662.new.each_pair.to_a, File.basename(__dir__) == File.basename(File.dirname(__FILE__))] }
+  t("side file") { [Side663.where, Side663.new.each_pair.to_a, File.basename(__dir__) == File.basename(File.dirname(__FILE__))] }
 RUBY
 
 SIDE = <<~'RUBY'
-  def def_level662
+  def def_level663
     raise
   rescue
     caller_locations(1, 1)[0].lineno - __LINE__
   end
-  def begin_level662
+  def begin_level663
     x = 0
     begin
       raise
@@ -118,7 +118,7 @@ SIDE = <<~'RUBY'
       caller_locations(1, 1)[0].lineno - __LINE__
     end
   end
-  class Side662
+  class Side663
     def self.where = File.basename(__FILE__)
     def initialize = @h = { a: 1, b: 2 }
     def each_pair
@@ -129,10 +129,10 @@ SIDE = <<~'RUBY'
 RUBY
 
 Dir.mktmpdir do |d|
-  File.write(File.join(d, "main662.rb"), MAIN)
-  File.write(File.join(d, "side662.rb"), SIDE)
+  File.write(File.join(d, "main663.rb"), MAIN)
+  File.write(File.join(d, "side663.rb"), SIDE)
   runs = [{}, { "MERE_RUBY_VM" => "strict" }].map do |env|
-    IO.popen([env, RbConfig.ruby, File.join(d, "main662.rb"), err: [:child, :out]], &:read).gsub(d, "DIR")
+    IO.popen([env, RbConfig.ruby, File.join(d, "main663.rb"), err: [:child, :out]], &:read).gsub(d, "DIR")
   end
   puts runs[0]
   puts "the same on the VM: #{runs[0] == runs[1]}"
