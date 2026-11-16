@@ -4929,7 +4929,7 @@ is the description; this is what was decided and what was measured.
   not want CRuby's internal headers) and `unittest/shim/-test-/`, three Ruby
   stand-ins for C extensions, is deleted.
 - Gates: dead_defs, dup_defs, gc_roots (`capi_tab` is an entry),
-  meth_writes, name_len, ns_names pass. Bracket depth is 888 of 1024 (895
+  meth_writes, name_len, ns_names pass. Bracket depth is 889 of 1024 (895
   with the prototype, 878 on main).
 - The corpus matches 687 of 687 (O2 build, this machine). There is no new
   corpus program: a corpus program cannot build a library, and what this
@@ -4945,10 +4945,38 @@ is the description; this is what was decided and what was measured.
   `-test-/memory_status` extension loads, which is what `tool/lib`'s
   `assert_no_memory_leak` waits for: its tests (34 files use it) were
   pended as "unsupported platform" on this side and now run.
+- The unit test run of 80e41026 (run 43792242051): MATCH 33,175, 710 above
+  the baseline (run 43745055106 on main ba088b2f: 32,465), RED 1,239;
+  INCOMPLETE files 19 (82 at the baseline); 68 files higher, and five
+  LOWER. One of the five is noise (`ruby/test_ractor.rb`, in
+  `unittest/README.md` now). The other four were real, each from a test
+  reaching code it had not reached before, and each is fixed here with a
+  contract in `capi/check/api.rb`:
+  - `ruby/test_dir_m17n.rb` 22 -> 20. `Bug::File::Fs.fsname` is ruby's C
+    now, and `capi_ext_build.py` built it without extconf.rb's answers: no
+    `HAVE_STRUCT_STATFS_F_FSTYPENAME`, so it said nil for every path where
+    the reference says "apfs", and two tests that return early on APFS ran
+    on. The builder asks the compiler the three probes that file writes out
+    (`have_header` over a list, `have_type`, `have_struct_member`) and
+    passes the answers as mkmf does. `rb_str_encode_ospath`, which the
+    function then calls, is written.
+  - `-ext-/file/test_stat.rb` 2 -> 0: `rb_stat_new` was in the ledger. It
+    makes a `File::Stat` from the struct C filled.
+  - `ruby/test_keyword.rb` 114 -> 113: a block function C passed
+    (`rb_block_call`) was not told that it had been yielded keywords, and
+    `rb_yield_block` handed them on as a Hash. The request that runs a C
+    block carries the flag; `rb_keyword_given_p` answers from it.
+  - `ruby/test_regexp.rb` 161 -> 160: `onig_get_parse_depth_limit` /
+    `onig_set_parse_depth_limit` were in the ledger, and the regexp parser
+    had no such bound (deep nesting ended at the stack). The parser counts
+    its nesting -- groups and character classes -- and refuses past the
+    limit with Onigmo's message ("parse depth limit over"); the default is
+    Onigmo's 4096, and C reads and sets the same number. The file is at
+    162 here, one above the baseline.
 
 **What the review found** (PR #87; each has a contract in
-`capi/check/api.rb` now, 34 checks on both sides, and the first has the
-control that makes them fail):
+`capi/check/api.rb` now -- 63 checks on both sides with those of "What CI
+found" -- and the first has the control that makes them fail):
 
 - A primitive called whatever the receiver's class had made of the name:
   `rb_ary_push` on an instance of `class A < Array; def push` ran A's

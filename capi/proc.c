@@ -35,7 +35,7 @@ VALUE rb_yield_values(int argc, ...) {
     return yield_values(argc, argv, 0);
 }
 VALUE rb_yield_values2(int argc, const VALUE *argv) { return yield_values(argc, argv, 0); }
-VALUE rb_yield_values_kw(int argc, const VALUE *argv, int kw) { return yield_values(argc, argv, kw ? MR_SEND_KW : 0); }
+VALUE rb_yield_values_kw(int argc, const VALUE *argv, int kw) { return yield_values(argc, argv, mr_kw(kw)); }
 VALUE rb_yield_splat(VALUE ary) {
     VALUE args = rb_check_array_type(ary);
     if (NIL_P(args)) rb_raise(rb_eArgError, "not an array");
@@ -44,14 +44,15 @@ VALUE rb_yield_splat(VALUE ary) {
 VALUE rb_yield_splat_kw(VALUE ary, int kw) {
     VALUE args = rb_check_array_type(ary);
     if (NIL_P(args)) rb_raise(rb_eArgError, "not an array");
-    return yield_values(RARRAY_LENINT(args), RARRAY_CONST_PTR(args), kw ? MR_SEND_KW : 0);
+    return yield_values(RARRAY_LENINT(args), RARRAY_CONST_PTR(args), mr_kw(kw));
 }
 /* A block function that yields what it was given to the C method's block,
  * and the block it was given as that block's own (`{ |x, &b| }`). */
 VALUE rb_yield_block(VALUE yielded, VALUE data, int argc, const VALUE *argv, VALUE block) {
     (void)yielded; (void)data;
     rb_need_block();
-    return mr_callv(mr_frame_block(), rb_intern("call"), argc, argv, block, 0);
+    /* (keywords the block function was yielded stay keywords for the block) */
+    return mr_callv(mr_frame_block(), rb_intern("call"), argc, argv, block, mr_frame_keywords() ? MR_SEND_KW : 0);
 }
 
 /* ---- procs ------------------------------------------------------------------ */
@@ -61,13 +62,13 @@ VALUE rb_proc_new(rb_block_call_func_t func, VALUE data) { return block_proc(fun
 VALUE rb_obj_is_proc(VALUE obj) { return rb_obj_is_kind_of(obj, rb_cProc); }
 VALUE rb_obj_is_method(VALUE obj) { return rb_obj_is_kind_of(obj, rb_cMethod); }
 VALUE rb_proc_call(VALUE proc, VALUE args) { return mr_callv(proc, rb_intern("call"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, 0); }
-VALUE rb_proc_call_kw(VALUE proc, VALUE args, int kw) { return mr_callv(proc, rb_intern("call"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, kw ? MR_SEND_KW : 0); }
+VALUE rb_proc_call_kw(VALUE proc, VALUE args, int kw) { return mr_callv(proc, rb_intern("call"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, mr_kw(kw)); }
 VALUE rb_proc_call_with_block(VALUE proc, int argc, const VALUE *argv, VALUE block) { return mr_callv(proc, rb_intern("call"), argc, argv, block, 0); }
-VALUE rb_proc_call_with_block_kw(VALUE proc, int argc, const VALUE *argv, VALUE block, int kw) { return mr_callv(proc, rb_intern("call"), argc, argv, block, kw ? MR_SEND_KW : 0); }
+VALUE rb_proc_call_with_block_kw(VALUE proc, int argc, const VALUE *argv, VALUE block, int kw) { return mr_callv(proc, rb_intern("call"), argc, argv, block, mr_kw(kw)); }
 int rb_proc_arity(VALUE proc) { return NUM2INT(mr_call(proc, "arity", 0)); }
 VALUE rb_proc_lambda_p(VALUE proc) { return mr_call(proc, "lambda?", 0); }
 VALUE rb_method_call(int argc, const VALUE *argv, VALUE method) { return mr_callv(method, rb_intern("call"), argc, argv, Qnil, 0); }
-VALUE rb_method_call_kw(int argc, const VALUE *argv, VALUE method, int kw) { return mr_callv(method, rb_intern("call"), argc, argv, Qnil, kw ? MR_SEND_KW : 0); }
+VALUE rb_method_call_kw(int argc, const VALUE *argv, VALUE method, int kw) { return mr_callv(method, rb_intern("call"), argc, argv, Qnil, mr_kw(kw)); }
 VALUE rb_method_call_with_block(int argc, const VALUE *argv, VALUE method, VALUE block) { return mr_callv(method, rb_intern("call"), argc, argv, block, 0); }
 VALUE rb_binding_new(void) { mr_unsupported("rb_binding_new"); }
 
@@ -83,7 +84,7 @@ VALUE rb_block_call(VALUE obj, ID mid, int argc, const VALUE *argv, rb_block_cal
 }
 VALUE rb_block_call_kw(VALUE obj, ID mid, int argc, const VALUE *argv, rb_block_call_func_t func, VALUE data, int kw) {
     VALUE block = func ? block_proc(func, data, 0) : Qnil;
-    return mr_callv(obj, mid, argc, argv, block, kw ? MR_SEND_KW : 0);
+    return mr_callv(obj, mid, argc, argv, block, mr_kw(kw));
 }
 VALUE rb_each(VALUE obj) { return mr_callv(obj, rb_intern("each"), 0, NULL, mr_frame_block(), 0); }
 void rb_iter_break_value(VALUE value) {
