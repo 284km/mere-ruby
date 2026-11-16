@@ -7,10 +7,9 @@ None is excluded from the measurement to improve its score.
 
 | Suite / file | Observed difference | Ownership and next step |
 |---|---|---|
-| minitest / `test_minitest_mock.rb` | Now executes all 94 tests; 2 failures, 13 errors and 10 skips. Stubbing `File.open` still reaches the real file operation, and a dynamic method's super lookup fails. | Ruby semantics. Inspect builtin aliases and super lookup. Shared dispatch functions are being edited by PRs #86–#88; do not edit those functions concurrently. |
-| minitest / `test_minitest_reporter.rb` | 1 error while compressing a SystemStackError backtrace. `[0].chain([1,1,2].each_slice(1)).chunk_while { ... }.to_a` raises ArgumentError about a missing block; the same operation without Chain succeeds. | Ruby semantics. The Chain block dispatcher is in `invoke_with_block0`, also edited by the VM session in #88; recorded for coordination, not attributed to an ISeq failure. |
+| minitest / `test_minitest_mock.rb` | Executes all 94 tests; 1 failure, 8 errors and 10 skips. File.open stubs now work with and without blocks. Remaining failures include private stubs and a dynamic method's super lookup. | Ruby semantics. Reduce the remaining alias/super witnesses; avoid dispatch functions currently edited by other sessions. |
 | minitest / `test_minitest_spec.rb` | `Minitest::Spec::DSL#name` calls super and cannot find the inherited Class/Module implementation. | Ruby semantics. Coordinate with #86, which edits `super_next_plain`; no AST tree failure is established. |
-| minitest / `test_minitest_test.rb` | Backtrace compression errors as above, exception Marshal/equality failures, and a missing yield under the backtrace filter helper. | Ruby semantics. Separate the Marshal and block-forwarding witnesses before changing implementations. |
+| minitest / `test_minitest_test.rb` | Backtrace compression now works; 8 exception Marshal/equality failures and 1 missing-yield error remain. | Ruby semantics. Separate the Marshal and block-forwarding witnesses before changing implementations. |
 | rack / `spec_headers.rb` | Class naming through `Minitest::Spec::DSL#name` fails before a summary. | Same super lookup issue as minitest spec; coordinate with #86. |
 | rack / `spec_lint.rb` | `notice environment errors` expects Rack::Lint::LintError, but nothing is raised. | Ruby semantics; root cause not yet isolated. |
 | rack / `spec_request.rb` | The result reporter cannot resolve super from `RackRequestTest::TestProxyRequest.name`; no final summary. | Same super lookup issue as minitest spec; coordinate with #86. |
@@ -52,3 +51,17 @@ Resolved in follow-up rounds 4-5:
   object. A caller's `@st` and `@label` remain visible and round-trip, while
   the stream still reads its own buffer. The original file becomes MATCH
   and all 103 CRuby StringIO tests pass. Witness 672.
+
+Resolved in follow-up rounds 6-7:
+
+- Block calls to File.open/new now respect Ruby overrides. The native File
+  path remains available when a saved prelude IO alias is restored; its
+  actual source metadata distinguishes that alias from a Ruby replacement.
+  Only the File condition in `invoke_with_block0` changes. Witness 673.
+- Chain receives Enumerable's existing implementation module, and
+  `chunk_while` / `slice_when` defer the source and predicate until iteration.
+  Early `take` stops infinite inputs, multiple yields retain their values,
+  and reflected owner/ancestry remain consistent with the reference.
+  Only `core_prelude_b` changes. Witness 674. The original minitest reporter
+  now passes all 22 tests / 52 assertions and becomes MATCH. Enum and
+  Enumerator report 159 MATCH / 0 RED / 1 BOTH; corpus reports 697/697.

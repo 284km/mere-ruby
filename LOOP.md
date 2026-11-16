@@ -5055,3 +5055,39 @@ with no lost MATCH or reference coverage change. Rack alone moves from
   with identical reference counts and the recorded 48 / 13 / 1 verdicts;
   an independent review of #90 repeated all 62 files with no regression or
   actionable finding. Full existing-suite CI remains a merge gate.
+
+## 2026-11-17 (67): gem rounds 6-7 -- File overrides and deferred Chain groups
+
+The same 62 locked upstream files now give 51 MATCH / 10 RED / 1 MEMORY,
+with zero BOTH or timeout, no lost MATCH and no reference coverage change.
+Minitest improves from 3 MATCH / 4 RED to 4 / 3; Rack remains 32 / 6 / 1,
+rack-test 7 / 1, public_suffix 7 / 0 and base64 1 / 0.
+
+- `invoke_with_block0` previously handled File.open/new before Ruby method
+  dispatch, so a stub worked without a block but opened a real path with
+  one. Ruby overrides now receive the block. A restored prelude IO alias
+  still uses File's native path handling; the method's native flag and
+  actual prelude source metadata identify that case. Witness 673 covers
+  keyword/block forwarding and restoring the original alias. The original
+  mock file improves from 2 failures / 13 errors to 1 / 8 across 94 tests,
+  while remaining RED.
+- `core_prelude_b` attaches the existing Enumerable implementation to
+  Chain, whose advertised ancestry alone did not provide its private
+  helpers. `chunk_while` and `slice_when` construct deferred enumerators
+  over the source rather than eagerly gathering it. Witness 674 covers
+  deferred predicates, infinite inputs stopped by take, multiple yielded
+  values, empty inputs, argument errors and reflected owner/ancestors.
+  Minitest's original reporter file becomes MATCH (22 tests / 52 assertions).
+  Its test file loses the backtrace-compression errors but retains 8 Marshal
+  failures and 1 yield error.
+- Corpus 697/697; Enum/Enumerator 159 MATCH / 0 RED / 1 BOTH, with no
+  decrease from either required CI baseline. GC roots pass and bracket
+  depth remains 895/1024. No new top-level let or resource bound change.
+  After #88 merged, the current open branches no longer changed either
+  function; their diffs were checked again before publishing this batch.
+- #90's completed existing-suite shard 3 has one lower file count:
+  test_transcode.rb is 97 rather than 98 MATCH because its ractor encoding
+  test reaches its existing 10-second timeout. The isolated test passes
+  locally on both the PR binary (5.35 s) and a CI artifact whose relevant
+  runtime sources equal main (5.79 s). This does not yet establish a cause;
+  rerun CI without changing the limit before accepting the merge gate.
