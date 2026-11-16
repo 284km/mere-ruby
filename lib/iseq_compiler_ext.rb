@@ -403,6 +403,11 @@ class RubyVM::InstructionSequence
         u.insn(:pop) if popped
       when Prism::InterpolatedStringNode then dstr(u, n, popped)
       when Prism::HashNode then hash_node(u, n, popped)
+      # (PM_KEYWORD_HASH_NODE as a value -- `return **h`: its elements made
+      #  a Hash, never a literal one)
+      when Prism::KeywordHashNode
+        hash_elements(u, n, n.elements, false)
+        u.insn(:pop) if popped
       when Prism::RangeNode then range_node(u, n, popped)
       when Prism::AndNode, Prism::OrNode then logical(u, n, popped)
       when Prism::ReturnNode then return_node(u, n, popped)
@@ -657,6 +662,24 @@ class RubyVM::InstructionSequence
       elsif n.forced_utf8_encoding? then str.force_encoding(Encoding::UTF_8)
       end
       str
+    end
+
+    # parse_regexp_encoding: the encoding a pattern's n / u / e / s names
+    # (or binary, when an escape forces it), nil when it names none
+    def regexp_explicit_encoding(n)
+      if n.ascii_8bit? || n.forced_binary_encoding? then Encoding::BINARY
+      elsif n.utf_8? then Encoding::UTF_8
+      elsif n.euc_jp? then Encoding::EUC_JP
+      elsif n.windows_31j? then Encoding::Windows_31J
+      end
+    end
+
+    # parse_regexp_string_part: a literal piece of an interpolated pattern
+    # is in the pattern's named encoding when it names one, else as a
+    # String literal is
+    def regexp_part_value(n, part)
+      enc = regexp_explicit_encoding(n)
+      enc ? part.unescaped.dup.force_encoding(enc) : string_value(part)
     end
 
     def static_value(n)
@@ -1539,10 +1562,11 @@ class RubyVM::InstructionSequence
       cur_at = [n.location.start_line, n.node_id]
       n.parts.each_with_index do |part, i|
         if part.is_a?(Prism::StringNode)
+          v = regexp ? regexp_part_value(n, part) : string_value(part)
           if cur
-            cur << string_value(part)
+            cur << v
           else
-            cur = string_value(part)
+            cur = v
             cur_at = [part.location.end_line, part.node_id] if i != 0
           end
           next
@@ -1550,10 +1574,11 @@ class RubyVM::InstructionSequence
         interpolated = true
         if part.is_a?(Prism::EmbeddedStatementsNode) && part.statements && part.statements.body.size == 1 &&
            part.statements.body[0].is_a?(Prism::StringNode)
+          v = regexp ? regexp_part_value(n, part.statements.body[0]) : string_value(part.statements.body[0])
           if cur
-            cur << string_value(part.statements.body[0])
+            cur << v
           else
-            cur = string_value(part.statements.body[0])
+            cur = v
             cur_at = [part.location.start_line, part.node_id]
           end
           next
@@ -1564,13 +1589,7 @@ class RubyVM::InstructionSequence
         if cur.nil? && n.parts.size == 1
           enc = u.opts[:source_encoding] || Encoding::UTF_8
           if regexp
-            enc = if n.ascii_8bit? || n.forced_binary_encoding? then Encoding::BINARY
-                  elsif n.utf_8? then Encoding::UTF_8
-                  elsif n.euc_jp? then Encoding::EUC_JP
-                  elsif n.windows_31j? then Encoding::Windows_31J
-                  elsif enc == Encoding::US_ASCII then Encoding::BINARY
-                  else enc
-                  end
+            enc = regexp_explicit_encoding(n) || (enc == Encoding::US_ASCII ? Encoding::BINARY : enc)
           end
           cur = String.new(encoding: enc)
         end
@@ -1583,10 +1602,13 @@ class RubyVM::InstructionSequence
         end
         case part
         when Prism::EmbeddedStatementsNode
+          # (`#{}`: a nil no node stands for -- PUSH_SYNTHETIC_PUTNIL)
           if part.statements.nil? || part.statements.body.empty?
-            raise NotImplementedError, "RubyVM::InstructionSequence: an empty interpolation is not compiled yet"
+            u.at(part.location.start_line, -1)
+            u.insn(:putnil)
+          else
+            node(u, part.statements, false)
           end
-          node(u, part.statements, false)
         when Prism::InterpolatedStringNode then node(u, part, false)
         # ("#@a", "#$g", "#@@c": the variable read)
         when Prism::EmbeddedVariableNode then node(u, part.variable, false)
