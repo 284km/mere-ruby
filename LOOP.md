@@ -4881,7 +4881,7 @@ tests of the default collector. No slot or page constants are invented.
   10, despite real counts; conservative roots are shared with PR #87. One
   string_memory test sees interpreter parameter-name Strings on the first
   call into each_object (VM allocation provenance). Neither is excluded.
-- Witness 667 checks actual profiling, latest info, unsupported compaction,
+- Witness 669 checks actual profiling, latest info, unsupported compaction,
   empty slot information and each_object over real value stores.
 
 ### Stage 9 GC remainder, rounds 2 and 3 -- real heap dumps and complete triage
@@ -4890,7 +4890,7 @@ tests of the default collector. No slot or page constants are invented.
   class/reference edges and allocation generation filters, and returns the
   requested stream/string/file. dump includes observed object_id in flags,
   File's type and String encoding information. It omits the inherited guessed
-  memsize field. Witness 668 checks real membership, references and provenance.
+  memsize field. Witness 670 checks real membership, references and provenance.
 - A snapshot can otherwise retain many expired runtime temporaries. When GC
   is enabled it collects before the public value-store snapshot; GC.disable
   and count_objects allocation comparisons retain their existing behavior.
