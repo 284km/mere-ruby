@@ -27,28 +27,38 @@ if [ -z "$MERE" ]; then
 fi
 [ -n "$MERE" ] || { echo "asan_build: no Mere compiler (set MERE=)" >&2; exit 2; }
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+# (Ruby's C API header the capi/*.c sources include, as tools/build.sh writes it)
+(cd "$root" && "$MERE" --ffi-header m_capi_api.mere > capi/mere_capi.h)
 (cd "$root" && "$MERE" -c main.mere > "$tmp/mr.c")
 python3 "$here/asan_patch.py" "$tmp/mr.c" "$tmp/mr_asan.c"
-# -D__LANG_CORO_ASAN: the runtime tells ASan about each coroutine switch, which
-# it needs once a collection runs on a coroutine of its own (note 270) -- every
-# collection, in a build that has them
-# (the glue and libprism build.sh links, and OpenSSL as it finds it)
+# The sources, libraries and platform flags tools/build.sh links (the glue,
+# Ruby's C API in capi/, libprism, OpenSSL as it finds it); built once there.
 plib="$root/vendor/prism/obj/libprism.a"
 [ -f "$plib" ] || { echo "asan_build: no $plib (run tools/build.sh once)" >&2; exit 2; }
+case "$(uname -s)" in
+  Darwin) plat="-Wl,-stack_size,0x20000000" ;;
+  *)      plat="-lm -rdynamic -ldl"; ulimit -s 524288 || exit 2 ;;
+esac
 ossl_prefix="${OPENSSL_PREFIX:-}"
 if [ -z "$ossl_prefix" ] && [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null 2>&1; then
   ossl_prefix="$(brew --prefix openssl@3 2>/dev/null)" || exit 2
 fi
 if [ -n "$ossl_prefix" ]; then
   set -- "-I$ossl_prefix/include" "-L$ossl_prefix/lib" "-Wl,-rpath,$ossl_prefix/lib" -lssl -lcrypto
+elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists 'openssl >= 3.0'; then
+  # shellcheck disable=SC2046
+  set -- $(pkg-config --cflags --libs openssl)
 else
   set -- -lssl -lcrypto
 fi
-clang -O1 -fsanitize=address -fno-omit-frame-pointer -D__LANG_CORO_ASAN -Wl,-stack_size,0x20000000 \
+# -D__LANG_CORO_ASAN: the runtime tells ASan about each coroutine switch, which
+# it needs once a collection runs on a coroutine of its own (note 270) -- every
+# collection, in a build that has them
+# shellcheck disable=SC2086
+clang -O1 -fsanitize=address -fno-omit-frame-pointer -D__LANG_CORO_ASAN $plat \
   -fbracket-depth=1024 -w -I "$root/vendor/prism/include" "$tmp/mr_asan.c" \
   "$root/tools/prism_glue.c" "$root/tools/socket_glue.c" "$root/tools/math_glue.c" "$root/tools/process_glue.c" \
-  "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" "$root/tools/native_probe/bridge.c" \
-  "$root/tools/native_probe/reentry.c" "$root/tools/native_probe/handle_slots.c" \
-  "$root/tools/native_probe/exception_bridge.c" "$root/tools/native_probe/typed_bridge.c" \
+  "$root/tools/openssl_glue.c" "$root/tools/nkf_glue.c" \
+  -DMR_CAPI_BUILD -I "$root/capi/include" -I "$root/capi" -I "$root/capi/vendor" "$root"/capi/*.c \
   -pthread "$plib" "$@" -o "$out"
 echo "asan_build: $out"
