@@ -19,6 +19,10 @@
 #   ruby tools/ast_on_cruby.rb check self --ruby-src DIR
 #       the oracle against itself: every file must match, or this harness
 #       is wrong
+#   ruby tools/ast_on_cruby.rb text [--locations] [--tolerant] [--out DIR] [-e CODE | FILE...]
+#       the oracle's tree as text, one node a line (AstOracle.text below):
+#       what a candidate that is not Ruby is compared with -- the translator
+#       in Mere prints the same form (tools/ast_dump.mere)
 #
 # A candidate's node answers what RubyVM::AbstractSyntaxTree::Node answers:
 # #type, #children, #first_lineno, #first_column, #last_lineno,
@@ -97,6 +101,67 @@ module AstOracle
   def oracle(source)
     RubyVM::AbstractSyntaxTree.parse(source)
   end
+
+  # The same tree as text, one node a line, for a candidate that is not Ruby
+  # (tools/ast_dump.mere prints this form from the Mere translator, and
+  # tools/ast_text_diff.rb compares the two):
+  #
+  #   <indent>TYPE fl:fc-ll:lc child child ...
+  #
+  # A child that is a node is `*` and its own lines follow, one level in, in
+  # the order of the `*`s; an Array is `[child,child]`. Everything else is
+  # written by its bytes, so that nothing depends on how a value inspects:
+  #
+  #   nil true false     themselves
+  #   :name              a Symbol (`:x<hex>` unless every byte is printable)
+  #   I-ff               an Integer, in hex
+  #   F<16 hex>          a Float's bits
+  #   R<I>/<I>           a Rational          C<value>   an imaginary's part
+  #   S(enc)<hex>        a String            X(enc,options)<hex>   a Regexp
+  #   E(name)            an Encoding
+  #
+  # With locations: true the line ends with ` @` and each of #locations
+  # after the first as fl:fc-ll:lc (or nil), `;` between.
+  def text(node, out, depth = 0, locations: false)
+    kids = []
+    line = +"#{" " * depth}#{node.type} #{node.first_lineno}:#{node.first_column}-#{node.last_lineno}:#{node.last_column}"
+    node.children.each { |c| line << " " << text_child(c, kids) }
+    if locations
+      locs = node.locations.drop(1)
+      line << " @" << locs.map { |l| l ? "#{l.first_lineno}:#{l.first_column}-#{l.last_lineno}:#{l.last_column}" : "nil" }.join(";") unless locs.empty?
+    end
+    out << line << "\n"
+    kids.each { |k| text(k, out, depth + 1, locations: locations) }
+    out
+  end
+
+  def text_child(c, kids)
+    case c
+    when RubyVM::AbstractSyntaxTree::Node then kids << c; "*"
+    when Array then "[" + c.map { |e| text_child(e, kids) }.join(",") + "]"
+    when nil then "nil"
+    when true then "true"
+    when false then "false"
+    when Symbol then text_sym(c)
+    when Integer then text_int(c)
+    when Float then "F" + [c].pack("G").unpack1("H*")
+    when Rational then "R" + text_int(c.numerator) + "/" + text_int(c.denominator)
+    when Complex then "C" + text_child(c.imaginary, kids)
+    when String then "S(#{c.encoding.name})" + c.b.unpack1("H*")
+    when Regexp then "X(#{c.encoding.name},#{c.options})" + c.source.b.unpack1("H*")
+    when Encoding then "E(#{c.name})"
+    else raise "ast_on_cruby: a child of class #{c.class}"
+    end
+  end
+
+  def text_sym(sym)
+    b = sym.name.b
+    b.match?(/\A[!-~]+\z/) && !b.match?(/[\[\],*]/) ? ":" + b : ":x" + b.unpack1("H*")
+  end
+
+  def text_int(i)
+    "I" + (i < 0 ? "-" : "") + i.abs.to_s(16)
+  end
 end
 
 if $0 == __FILE__
@@ -105,6 +170,29 @@ if $0 == __FILE__
   when "dump"
     ARGV.each do |f|
       p AstOracle.canon(AstOracle.oracle(File.read(f)), locations: true, node_id: true)
+    end
+  when "text"
+    # text [--locations] [--tolerant] [--out DIR] [-e CODE | FILE...]: the text form of
+    # each program -- to stdout, or one file a program under DIR (the path
+    # with every `/` an `_`, and `.ast` added)
+    locations = !!ARGV.delete("--locations")
+    tolerant = !!ARGV.delete("--tolerant")
+    outdir = (i = ARGV.index("--out")) ? ARGV.slice!(i, 2)[1] : nil
+    if (i = ARGV.index("-e"))
+      print AstOracle.text(RubyVM::AbstractSyntaxTree.parse(ARGV[i + 1], error_tolerant: tolerant), +"", locations: locations)
+    else
+      ARGV.each do |f|
+        t = begin
+          AstOracle.text(RubyVM::AbstractSyntaxTree.parse_file(f, error_tolerant: tolerant), +"", locations: locations)
+        rescue SyntaxError
+          "SyntaxError\n"
+        rescue StandardError => e
+          # (a tree the reference cannot answer in full: a literal whose
+          #  value raises when it is made, say)
+          "#{e.class}\n"
+        end
+        outdir ? File.write(File.join(outdir, f.tr("/", "_") + ".ast"), t) : print(t)
+      end
     end
   when "check"
     cand = ARGV.shift or abort "usage: ast_on_cruby.rb check CANDIDATE.rb --ruby-src DIR [--locations] [--node-id] [PATH...]"
