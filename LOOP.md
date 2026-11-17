@@ -5481,3 +5481,12 @@ moved to 26.04 with Clang 21. The native build job is pinned to Ubuntu 24.04
 to preserve that baseline environment; its 90-minute limit and all test
 time/memory bounds remain unchanged. The platform explanation is checked by
 the next CI run, rather than changing Float arithmetic during GC work.
+
+The final identity branch also integrates this main and the native iterator
+correction. All 699 corpus programs agree in both hash-index modes. Its
+seven-file comparison completes with MATCH 198, RED 12, BOTH 6, EXTRA 5 and
+57 symmetric exclusions; Enumerable is 89 MATCH and core ObjectSpace 37/37.
+All nine RSS cases (class ivar 1.05x), the complete OpenSSL lifetime gate,
+root/dead/duplicate-definition checks and bracket depth 892/1024 pass.
+Rounds 6 and 7 are PR #98, stacked on #94; none of the three PRs is merged
+while the latest-main full CI and per-file comparison are pending.
