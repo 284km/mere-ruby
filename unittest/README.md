@@ -527,6 +527,18 @@ runner crosses them.
   at 0.98 of main's. Rerun its shard.
 - bootstraptest test_ractor #153 (1,000 ractors) and #99 sit at the runner's
   limit.
+- `ruby/test_integer.rb`'s `test_pow` runs 17 expressions in child
+  processes of 10 s each, and `crash03` (`-1111111**-1111*11 - -11**
+  -1111111`) takes 8.2 s of it locally on main and on a branch alike. A
+  loaded runner times it out (PR #88's run, twice).
+- `ruby/test_ractor.rb`'s `test_shareable_proc_define_method_super_method_
+  missing` (1,000,000 calls in a Ractor) takes 17-18 s of its 30 s
+  locally; a loaded runner timed it out once (PR #88).
+- `ruby/test_struct.rb`'s `test_named_structs_are_not_rooted` (run for
+  TopStruct and for SubStruct) compares the process's RSS after 10,000 and
+  after 60,000 named Structs and wants less than twice. Locally the ratio is
+  1.25-1.37 on main and on a branch alike; one CI run gave 2.29 for one of
+  the two while the other passed in the same file.
 - `ruby/test_ractor.rb`'s `test_move_nested_hash_during_gc_with_yjit` runs a
   child with a 10 s bound and takes 9.3-10.1 s on the runners, on main as
   well: one run in a few is a Timeout and the file is one test lower.
