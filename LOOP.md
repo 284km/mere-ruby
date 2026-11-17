@@ -5765,3 +5765,9 @@ ObjectSpace snapshot witness from 683 to 685, retaining the upstream cases.
 The follow-up store witness moves from its original publication number 680
 to 686. The upstream AST/Proc witness at 680 is retained unchanged. Earlier
 progress entries use their publication numbers; this records the mapping.
+
+The identity witnesses similarly move from 681/682 to 687/688 after the
+remote namespace audit. The earlier conversion-review entries retain their
+publication numbers. Only this session's witnesses are renamed; main's and
+the concurrent branches' cases are retained. This integrated branch has
+703 corpus programs, including the four cases newly imported from main.
