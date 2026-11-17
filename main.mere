@@ -15150,7 +15150,10 @@ and invoke_val_c2 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   //  object, and the pair has no Locations of its own: they are its
   //  backtrace's frames -- nil only when the program set the backtrace as
   //  Strings. `e = assert_raise(TypeError) { {**1} }` answered nil.)
-  let v = (if cls_sng_undef world recv0 name0 then cls_sng_undef_raise world recv0 name0 args0
+  let v = (if hng_undef_blocked world recv0 name0 then
+             hng_undef_call env world recv0 name0 args0
+               (false, (Nil : str list), (Nil : Stmt list), env) (if vischeck then 0 else 1)
+           else if cls_sng_undef world recv0 name0 then cls_sng_undef_raise world recv0 name0 args0
            // (an Enumerator's to_a / entries walk it under 'Enumerable#to_a'
            //  and 'Enumerator#each', as with a block: what the source sees
            //  of the stack -- Thread.each_caller_location through
@@ -32354,6 +32357,8 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
   else invoke_with_block2 env world blk recv name args newblk0
 and invoke_with_block2 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk0 ->
   let newblk = (if blk_is_lambda newblk0 then blk_spread_for world recv name newblk0 else newblk0) in
+  if hng_undef_blocked world recv name then hng_undef_call env world recv name args newblk0 0
+  else
   // Native NKF functions ignore a block. Resolve a real Ruby override first;
   // the native entry has no AST body for the generic block dispatcher to run.
   if nkf_function name &&
@@ -37819,7 +37824,7 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
                          (inspect_w env world other ++ " is not a symbol nor a string") in ""))
             | Nil -> (let _ = raise_exc world "ArgumentError"
                         "wrong number of arguments (given 0, expected 1..2)" in "")) in
-  let c9 = dispatch_cls_of world recv in
+  let c9 = hng_lookup_cls world recv in
   // ⚠ #respond_to_missing? is asked exactly when the answer would otherwise
   //   be false, and ONCE, with the include_all flag the caller gave: for a
   //   protected method without include_all, for a private one without it,
@@ -37840,7 +37845,8 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
   // the refinements of the scope that calls it)
   // (MatchData, Rational and Complex have no allocate: ruby undefines it,
   //  and the call here already refuses -- only respond_to? said yes)
-  if str_eq nm "allocate" && (match recv with
+  if hng_undef_blocked world recv nm then rtm9 ()
+  else if str_eq nm "allocate" && (match recv with
                                | VClass c8 -> str_eq c8 "MatchData" || str_eq c8 "Rational" || str_eq c8 "Complex"
                                | _ -> false) then VBool false
   else if responds_real world recv nm
@@ -37898,6 +37904,14 @@ and range_like_obj = fn world -> fn (v: Val) ->
 and responds_real = fn world -> fn (recv: Val) -> fn (name: str) -> responds_x world recv name false false
 
 and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: bool) -> fn (ask_rtm: bool) ->
+  if hng_undef_blocked world recv name then
+    (let c9 = hng_lookup_cls world recv in
+     let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     if ask_user && has_meth world c9 "respond_to?" then
+       truthy (invoke world nb9 recv c9 "respond_to?" (Cons (VSym name, Cons (VBool true, Nil))))
+     else ask_rtm && has_meth world c9 "respond_to_missing?"
+          && truthy (invoke world nb9 recv c9 "respond_to_missing?" (Cons (VSym name, Cons (VBool true, Nil)))))
+  else
   responds_x0 world recv name ask_user ask_rtm
   // ...and a VALUE answers what its class's lists name (Kernel's,
   // BasicObject's, its own core class's -- notes 431 and 433):
@@ -46965,6 +46979,30 @@ and self_user_defines = fn env -> fn world -> fn (name: str) ->
 // program undefs something, so the usual dispatch pays one map_len.
 // a class whose singleton undefined a name it inherits from Class
 // (`class << self; undef_method :new; end`) no longer answers it
+// A primitive's singleton participates in lookup without becoming its reported
+// ordinary class. dispatch_cls_of intentionally looks past this tag for super.
+and hng_lookup_cls = fn world -> fn (recv: Val) ->
+  let hk9 = hng_key recv in
+  if str_len hk9 > 0 && map_has hng_store hk9 && is_sng_cls (map_get hng_store hk9)
+  then map_get hng_store hk9 else dispatch_cls_of world recv
+and hng_undef_blocked = fn world -> fn (recv: Val) -> fn (name: str) ->
+  map_has undef_names name
+  && (match recv with VObj _ -> false | VClass _ -> false | VMain -> false | _ -> true)
+  && (if map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name then false else true)
+  && (let c9 = hng_lookup_cls world recv in
+      is_sng_cls c9 && undef_blocked world c9 name)
+and hng_undef_call = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk -> fn (priv: int) ->
+  let c9 = hng_lookup_cls world recv in
+  let reason9 = mm_reason_take () in
+  let reason9 = (if reason9 > 0 then reason9 else priv) in
+  if has_meth world c9 "method_missing" && (if str_eq name "method_missing" then false else true)
+  then (let _ = vec_set mm_priv 0 reason9 in invoke world newblk recv c9 "method_missing" (Cons (VSym name, args)))
+  else if reason9 == 2 && (match args with Nil -> true | _ -> false) then
+    raise_exc_iv world "NameError" ("undefined local variable or method '" ++ name ++ "' for " ++ for_recv_obj env world recv c9)
+      (Cons (("__name", VSym name), Cons (("__recv", recv), Nil)))
+  else raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_obj env world recv c9)
+         (Cons (("__name", VSym name), Cons (("__recv", recv), Cons (("__args", arr_new args),
+            Cons (("__priv", VBool (reason9 > 0)), Nil)))))
 and cls_sng_undef = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VClass c9 -> map_len undefs > 0 && map_has undef_names name
