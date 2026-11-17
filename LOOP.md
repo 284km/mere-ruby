@@ -5918,7 +5918,12 @@ literal_concat with `squiggly` until that line; and a regexp split at `#@`
 takes its pieces' text as tokadd_string leaves it: an escaped delimiter is
 the delimiter unless simple_re_meta, a `\` and its line end go, a `\`
 before a non-ASCII byte goes, `\cX` / `\C-X` / `\M-X` are written `\xHH`.
-Checked against 11 heredoc forms and 20 regexp forms.
+Checked against 11 heredoc forms and 20 regexp forms. The follow-up review
+(one P2 left): a control or meta escape's operand is a whole escape again,
+as in read_escape -- `\c\n` is `\x0A`, `\M-\n` is `\x8A`, `\c\x41` is
+`\x01`, an unknown `\q` is `q`; a bare `?` is DEL only right after `\c` /
+`\C-`. rx_read_escape does this over Prism's bytes. Checked against 20 more
+forms on ruby 4.0.9, among them a condition and ones ruby refuses.
 
 Not done: `/(?<y>a)#@~/ =~ x`, where parse.y's DREGX assigns no `y` (the
 scope's table comes from Prism's locals).

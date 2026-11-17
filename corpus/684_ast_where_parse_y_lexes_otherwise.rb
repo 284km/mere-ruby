@@ -49,6 +49,18 @@ show("/a\\\n#@~b/")
 show('%r{a\}#@~}')
 show('if /a\/#@~b/ then 1 end')
 p AST.parse('/a\cA#@~\M-\C-b/').children[2].children
+# ...and a control or meta escape's operand is a whole escape again
+['/a\c\n#@~/', '/a#@~\c\x41/', '/a\C-\x41#@~/', '/a\c\101#@~/', '/a\c\q#@~/',
+ '/a\c\?#@~/', '/a\c\C-a#@~/', '/a\C-\M-\c?#@~/', '/a\c\s\M-\b#@~/', '/a\M-\n#@~/',
+ '/a\c\M-a#@~/', '/a\M-\M-a#@~/'].each do |s|
+  print s, " => "
+  begin
+    p AST.parse(s).children[2].children
+  rescue SyntaxError
+    puts "SyntaxError"
+  end
+end
+show('if /a\c\n#@~b/ then 1 end')
 show('if /a#@~b/ then 1 end')
 show('"a#@~b"')
 # text a heredoc body interrupts is one token
