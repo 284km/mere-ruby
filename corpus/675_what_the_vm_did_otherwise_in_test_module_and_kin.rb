@@ -39,6 +39,24 @@ MAIN = <<~'RUBY'
     end
   end
   t(12) { R675.const_get(:W675) }
+  # the visibility methods answer what they answer -- the names, or self --
+  # and one the receiver defines itself is called; an Array goes to the
+  # method in a class, and an unrelated call with an Array is a call
+  class V675
+    def a; end
+    def b; end
+    R = [private([:a]), private(:a), private(:a, :b), public(:a), private]
+    X = 1
+    R2 = [private_constant(:X)]
+    def self.private(*args) = :intercepted
+    R3 = private([:a])
+  end
+  t(13) { [V675::R, V675::R2.size, V675::R3, V675.private_method_defined?(:a)] }
+  def takes675(v) = 1
+  t(14) { a = Array.new(1000, :same); (1..50).sum { takes675(a) } }
+  # a name with a space is no builtin: no Method, no undef, respond_to? false
+  t(15) { [nil.respond_to?(:"class clone"), Object.new.respond_to?(:"< <="), (Object.new.method(:"class clone") rescue :none)] }
+  t(16) { c = Class.new { define_method(:"class clone") { :real } }; [c.new.send(:"class clone"), (Class.new.send(:undef_method, :"class clone") rescue :refused)] }
 RUBY
 
 Dir.mktmpdir do |d|
@@ -49,6 +67,14 @@ Dir.mktmpdir do |d|
   puts runs[0]
   puts "the same on the VM: #{runs[0] == runs[1]}"
   puts runs[1] unless runs[0] == runs[1]
+  # (a required file's __ENCODING__ is the parser's, whatever the program
+  #  that requires it made of Encoding.find)
+  File.write(File.join(d, "enc675.rb"), "p __ENCODING__\n")
+  File.write(File.join(d, "main675e.rb"), "def Encoding.find(*) = :intercepted\nrequire_relative 'enc675'\n")
+  e = [{}, { "MERE_RUBY_VM" => "strict" }].map do |env|
+    IO.popen([env, RbConfig.ruby, File.join(d, "main675e.rb"), err: [:child, :out]], &:read)
+  end
+  p e
   # (-W0: a top-level return's argument is ignored silently)
   File.write(File.join(d, "ret675.rb"), "puts :before\nreturn false; raise\n")
   w = [{}, { "MERE_RUBY_VM" => "strict" }].map do |env|

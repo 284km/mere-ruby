@@ -53,3 +53,20 @@ p (begin; o.secret(1); rescue NoMethodError => e; e.message[/private method '\w+
 dis = RubyVM::InstructionSequence.compile("def f(n) = f(n - 1)", tailcall_optimization: true).disasm
 p dis.include?("TAILCALL")
 p RubyVM::InstructionSequence.compile("def f(n) = f(n - 1)").disasm.include?("TAILCALL")
+# what a call reads of the frame it is written in stays that frame's: a
+# binding, eval and local_variables at the end of a method, and a refinement
+# the method's module uses -- with the optimization on as off
+module Ref676
+  refine String do
+    def shout = :refined
+  end
+end
+module Use676
+  using Ref676
+  def self.go(s) = s.shout
+end
+[true, false].each do |on|
+  src = "def f676(x); binding; end; def g676(x); eval('x'); end; def h676(x); local_variables; end"
+  RubyVM::InstructionSequence.compile(src, nil, nil, 1, tailcall_optimization: on).eval
+  p [on, f676(42).local_variable_get(:x), g676(7), h676(1).include?(:x), Use676.go("a")]
+end

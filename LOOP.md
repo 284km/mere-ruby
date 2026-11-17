@@ -5612,6 +5612,36 @@ Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
 compare_with_ruby 460 / 460, coverage 22 / 22; gates; test_iseq 63 / 68
 as before.
 
+**Review fixes for #89** (on top of (71)):
+
+- tools/nothreads_tree.sh copies `ic/` as well: the Wasm and RISC-V
+  preparation could not resolve `ic/m_ic_nodes.mere` (the embedding check's
+  copy was fixed earlier).
+- ic_to_val builds the compiler's literals without calling the program: an
+  Encoding operand is the interpreter's own object (enc_objs), a frozen
+  Hash or Regexp is frozen by the primitive -- a program that redefined
+  Encoding.find before requiring a file got its own answer for that file's
+  `__ENCODING__` on the VM.
+- The visibility statement the VM makes of `private` and its kin answers
+  what the method answers (the names; self for the constant and class
+  method forms), is not taken when the receiver defines the method itself,
+  and takes one Array of names only at the top level -- in a class the
+  Array goes to Module#private. The name is asked before an argument Array
+  is walked, so an unrelated call with a long Array is not.
+- respond_to?'s word lists do not match a name with a space in it
+  (`:"class clone"` matched two neighbouring entries).
+- A tail call is made by the caller only into a Ruby method of the
+  receiver's class and with no refinement defined: binding, eval,
+  local_variables at a method's end and a refinement the method's module
+  uses read the frame the call is written in.
+- And from (72), already on stage10-r42: vm_scoped's answer copied out
+  before its scope goes back, the waiting tail call held as one Array.
+
+Corpus 675 and 676 carry the witnesses (return values and an overridden
+`private`, a required file's `__ENCODING__` under a redefined
+Encoding.find, multiword names, binding / eval / local_variables / a
+refinement with the optimization on and off).
+
 ## 2026-11-17 (72): what still differed on the VM in 40 whole test files -- freed memory, a loop with no safepoint, collections that marked too much
 
 **The point.** The 40 files of (68) run again on both, same build: the VM
