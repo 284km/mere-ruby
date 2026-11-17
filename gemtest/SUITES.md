@@ -58,6 +58,10 @@ which limit fired. The complete raw logs remain authoritative when diagnosing
 an early exit or a missing summary.
 
 CI runs in separate Linux and macOS jobs without extending existing jobs.
+Linux uses Ubuntu 24.04, the successful main baseline's reference environment.
+Ubuntu 26.04's GCC-built Ruby fuses Float#step multiply/add operations; the
+current x86-64 implementation evaluates them separately. That numeric
+portability gap remains open, rather than weakening the bit-parity check.
 `actions/cache` stores the exact locked sources and dependencies, which are
 verified even on cache hits. A baseline rejects missing files, lost MATCH
 files and a newly unhealthy reference. On the same OS it also rejects changed
