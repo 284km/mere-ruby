@@ -242,6 +242,11 @@ let rec skip_blank = fn (i: int) ->
   if c == 32 || c == 9 then skip_blank (i + 1) else i;
 
 // ---- the walk ------------------------------------------------------------------
+// (the offset of the newline that ends the line `i` is on; the program's
+//  length when there is none)
+let rec ast_line_end_from = fn (i: int) ->
+  let c = pm_byte i in
+  if c < 0 || c == 10 then i else ast_line_end_from (i + 1);
 // A heredoc's body and its terminator line, as the lexer reads them when it
 // meets the line end after the opener (ao_hd): where the body starts -- its
 // first text, or the terminator when there is none -- and where the
@@ -594,6 +599,19 @@ let heredoc_kind = fn (os: int) -> fn (first: int) ->
     (let c = pm_byte (ast_line_start first) in
      if first >= 0 && c != 32 && c != 9 && c != 10 then 1 else 2)
   else 1;
+// (Prism's parts are all text: what parse.y's lexer read as ONE token,
+//  which a heredoc body after a `\`-continued line splits in Prism only)
+let parts_all_text = fn (ps: int) ->
+  let rec go = fn (i: int) -> i >= pm_ls_len ps || (pm_is (pm_ls_at ps i) (pm_t_string ()) && go (i + 1)) in
+  pm_ls_len ps > 1 && go 0;
+// (a word of %w[] / %i[] that is such a token: placed as a word token is,
+//  from the start of the line it ends on)
+let word_token_place = fn (d: int) -> fn (n: int) -> fn (ps: int) ->
+  let e = pm_end n in
+  let ls = ast_line_start e in
+  if parts_all_text ps && ls > pm_start n && (a_is d (nt_str ()) || a_is d (nt_sym ())) then
+    (let _ = a_set_beg d ls in let _ = a_set_end d e in d)
+  else d;
 // string1: tSTRING_BEG string_contents tSTRING_END, then `strings`'
 // evstr2dstr -- one literal, located at the whole of it
 let tr_string1 = fn (n: int) ->
@@ -639,7 +657,7 @@ let tr_interpolated_string = fn (n: int) ->
     // a word of %W[...]: its contents, with no delimiters of its own
     (let c = tr_contents parts 0 0 in
      if c == 0 then n1 (nt_str ()) (pm_start n) (pm_end n) (lit_str "" (src_enc ()))
-     else p_evstr2dstr c)
+     else word_token_place (p_evstr2dstr c) n parts)
   else p_evstr2dstr (tr_string1 n);
 // xstring: new_xstring
 let tr_xstring = fn (n: int) ->
@@ -676,7 +694,20 @@ let tr_interpolated_symbol = fn (n: int) ->
     // a word of %I[...]: symbol_append(evstr2dstr(word))
     (let d = p_evstr2dstr c in
      if a_is d (nt_dstr ()) then (let _ = a_set_ty d (nt_dsym ()) in d)
-     else if a_is d (nt_str ()) then n1 (nt_sym ()) (a_beg d) (a_end d) (id_of_lit (a_f d 0))
+     else if a_is d (nt_str ()) then
+       (let ps = pm_interpolated_symbol_parts n in
+        let sy = n1 (nt_sym ()) (a_beg d) (a_end d) (id_of_lit (a_f d 0)) in
+        // (Prism places such a word -- and each of its parts -- where its
+        //  first line is: the token goes on past the heredoc bodies, to the
+        //  length of its last line)
+        if parts_all_text ps && pm_start (pm_ls_at ps (pm_ls_len ps - 1)) == pm_start (pm_ls_at ps 0) then
+          (let tx = lit_text (a_f d 0) in
+           let rec last_nl = fn (i: int) -> if i < 0 then 0 - 1 else if ord (char_at tx i) == 10 then i else last_nl (i - 1) in
+           let k1 = hd_skip (ast_line_end_from (pm_end n) + 1) in
+           let _ = a_set_beg sy k1 in
+           let _ = a_set_end sy (k1 + str_len tx - last_nl (str_len tx - 1) - 1) in
+           sy)
+        else word_token_place sy n ps)
      else d);
 // cond0 on a range in a condition: FLIP2 / FLIP3; an Integer end is
 // compared with the line number (range_op)
@@ -755,17 +786,15 @@ let tr_regx = fn (ty: int) -> fn (n: int) -> fn (src: str) -> fn (os: int) -> fn
 //  newline ends on that newline's line, in the column past it)
 let tok_end = fn (e: int) ->
   if e > 0 && pm_byte (e - 1) == 10 then pos_lc (ao_line_of (e - 1)) (e - vec_get pm_lo (ao_line_of (e - 1))) else e;
-let tr_regular_expression = fn (n: int) ->
-  tr_regx (nt_regx ()) n (vec_get pm_st (pm_regular_expression_unescaped n))
-    (pm_regular_expression_opening_loc_s n) (pm_regular_expression_opening_loc_e n)
-    (pm_regular_expression_closing_loc_s n) (pm_regular_expression_closing_loc_e n);
-// (a regexp literal that is a condition: cond0 makes the REGX a MATCH)
-let tr_match_last_line = fn (n: int) ->
-  tr_regx (nt_match ()) n (vec_get pm_st (pm_match_last_line_unescaped n))
-    (pm_match_last_line_opening_loc_s n) (pm_match_last_line_opening_loc_e n)
-    (pm_match_last_line_closing_loc_s n) (pm_match_last_line_closing_loc_e n);
 // regexp_contents: its own fold -- the first part becomes a DSTR (one with
 // no string when it is not text), the rest are appended
+let regx_fold = fn (acc: int) -> fn (v: int) -> fn (first_b: int) ->
+  if acc == 0 then v
+  else
+    (let head = (if a_is acc (nt_str ()) then p_str2dstr acc
+                 else if a_is acc (nt_dstr ()) then acc
+                 else p_list_append (n3 (nt_dstr ()) first_b (a_end v) 0 0 1) acc) in
+     p_list_append head v);
 let tr_regexp_contents = fn (parts: int) ->
   let cnt = pm_ls_len parts in
   let first_b = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0) in
@@ -788,10 +817,9 @@ let tr_regexp_contents = fn (parts: int) ->
                       else p_list_append (n3 (nt_dstr ()) first_b (pm_end x) 0 0 1) acc) in
           go (i + 1) (p_list_append head v))) in
   go 0 0;
-let tr_dregx = fn (n: int) -> fn (parts: int) ->
+let tr_dregx_of = fn (n: int) -> fn (c: int) ->
   let b = pm_start n in
   let e = pm_end n in
-  let c = tr_regexp_contents parts in
   let d = (if a_is c (nt_dstr ()) then c
            else if a_is c (nt_str ()) then p_str2dstr c
            else n3 (nt_dstr ()) b e (lit_str "" (src_enc ())) (p_new_list c b e) 1) in
@@ -819,8 +847,70 @@ let tr_dregx = fn (n: int) -> fn (parts: int) ->
           each (a_f cell 1)) in
   let _ = each (a_f d 1) in
   if pm_has n (pm_f_regular_expression_once ()) then n1 (nt_once ()) b e d else d;
+let tr_dregx = fn (n: int) -> fn (parts: int) -> tr_dregx_of n (tr_regexp_contents parts);
+// (where parse.y's lexer ends a regexp's text token although nothing is
+//  interpolated: before a `#` that a `@` or `$` follows -- tokadd_string
+//  stops there for parser_peek_variable_name, which finds no variable name
+//  (Prism would have made one an interpolation), and the text from that `#`
+//  is the next token. Not at the text's start, where no token has begun;
+//  not after a `\`. The offsets of those `#`s, in order.)
+let regx_splits = fn (cs: int) -> fn (ce: int) ->
+  let rec go = fn (i: int) ->
+    if i + 1 >= ce then (Nil : int list)
+    else (let c = pm_byte i in
+          if c == 92 then go (i + 2)
+          else if c == 35 && i > cs && (pm_byte (i + 1) == 64 || pm_byte (i + 1) == 36) then Cons (i, go (i + 1))
+          else go (i + 1)) in
+  go cs;
+// (those tokens are regexp_contents' pieces, folded as with interpolation)
+let regx_split_contents = fn (cs: int) -> fn (ce: int) -> fn (sp: int list) ->
+  let piece = fn (b: int) -> fn (e: int) ->
+    (let ls = ast_line_start e in
+     n1 (nt_str ()) (if ls > b then ls else b) e (lit_str (pm_text b e) (src_enc ()))) in
+  let rec go = fn (b: int) -> fn (xs: int list) -> fn (acc: int) ->
+    (match xs with
+     | Nil -> regx_fold acc (piece b ce) cs
+     | Cons (k, t) -> go k t (regx_fold acc (piece b k) cs)) in
+  go cs sp 0;
+let tr_regular_expression = fn (n: int) ->
+  let cs = pm_regular_expression_content_loc_s n in
+  let ce = pm_regular_expression_content_loc_e n in
+  let sp = (if cs >= 0 then regx_splits cs ce else Nil) in
+  match sp with
+  | Nil ->
+    tr_regx (nt_regx ()) n (vec_get pm_st (pm_regular_expression_unescaped n))
+      (pm_regular_expression_opening_loc_s n) (pm_regular_expression_opening_loc_e n)
+      (pm_regular_expression_closing_loc_s n) (pm_regular_expression_closing_loc_e n)
+  | _ -> tr_dregx_of n (regx_split_contents cs ce sp);
+// (a regexp literal that is a condition: cond0 makes the REGX a MATCH --
+//  and a DREGX, the text split as tr_regular_expression says, a MATCH2 with $_)
+let tr_match_last_line = fn (n: int) ->
+  let cs = pm_match_last_line_content_loc_s n in
+  let ce = pm_match_last_line_content_loc_e n in
+  let sp = (if cs >= 0 then regx_splits cs ce else Nil) in
+  match sp with
+  | Nil ->
+    tr_regx (nt_match ()) n (vec_get pm_st (pm_match_last_line_unescaped n))
+      (pm_match_last_line_opening_loc_s n) (pm_match_last_line_opening_loc_e n)
+      (pm_match_last_line_closing_loc_s n) (pm_match_last_line_closing_loc_e n)
+  | _ ->
+    (let d = tr_dregx_of n (regx_split_contents cs ce sp) in
+     let b = cl_b (pm_start n) in
+     let e = cl_e (pm_end n) in
+     let g = n1 (nt_gvar ()) b e (id_of "$_") in
+     n3 (nt_match2 ()) b e d g 0);
+
+// (the parts all text: one token to parse.y -- see parts_all_text -- and a REGX)
+let text_of_parts = fn (ps: int) ->
+  let rec go = fn (i: int) -> if i >= pm_ls_len ps then "" else vec_get pm_st (pm_string_unescaped (pm_ls_at ps i)) ++ go (i + 1) in
+  go 0;
 let tr_interpolated_regular_expression = fn (n: int) ->
-  tr_dregx n (pm_interpolated_regular_expression_parts n);
+  let ps = pm_interpolated_regular_expression_parts n in
+  if parts_all_text ps then
+    tr_regx (nt_regx ()) n (text_of_parts ps)
+      (pm_interpolated_regular_expression_opening_loc_s n) (pm_interpolated_regular_expression_opening_loc_e n)
+      (pm_interpolated_regular_expression_closing_loc_s n) (pm_interpolated_regular_expression_closing_loc_e n)
+  else tr_dregx n ps;
 // (an interpolated regexp that is a condition: cond0's NEW_MATCH2(node, $_))
 let tr_interpolated_match_last_line = fn (n: int) ->
   let d = tr_dregx n (pm_interpolated_match_last_line_parts n) in
@@ -1445,11 +1535,6 @@ let rec nl_after_comment = fn (i: int) ->
      if pm_byte j == 35 then nl_after_comment j
      else if pm_byte j < 0 then k + 1
      else pos_lc (ao_line_of k) (k - vec_get pm_lo (ao_line_of k) + 1));
-// (the offset of the newline that ends the line `i` is on; the program's
-//  length when there is none)
-let rec ast_line_end_from = fn (i: int) ->
-  let c = pm_byte i in
-  if c < 0 || c == 10 then i else ast_line_end_from (i + 1);
 // (the end of the `term` that starts at or after `i`: past a `;`, or at the
 //  line end a newline token is)
 let rec skip_term = fn (i: int) ->
