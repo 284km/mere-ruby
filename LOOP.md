@@ -5459,6 +5459,24 @@ says. The artifact carries both now. The same run had
 out at `assert_no_memory_leak`'s 10 s (7.2 s here, on main's build as on
 this one): unittest/README.md's Known noise.
 
+**What the CI of main's merge found** (run 44129914798 on b2ee5cb3):
+`optional/capi/regexp_spec` 28 -> 27. `rb_backref_get` answered nil for the
+match an example had just made: capi_enter finds the C method's caller one
+entry below the C method's own frame on fb_env_at, and since #89 that frame
+stands at two depths when the call is in a block a Ruby method yields to --
+mspec's `it` -- so "one below" was the C method itself, with an empty `$~`.
+Every entry that is that frame (its fid) is passed over now. A call from the
+top level read its own frame too: its caller is at -1, the main script's
+env, which `at > 0` left out. Three contracts in api.rb (a yielded block,
+the top level, rb_backref_set there); regexp_spec is 31. The same run's
+build-linux failed in the Module check at
+`test_complemented_method_entry_memory_leak` (10.05 s of 10), as main's own
+run of e40bb486 does. Not #89: other runs on main's tree took 25.5-27.0 s
+for the whole Module check where these two took 39.7-39.9 s, every test
+about 1.6 times slower -- a slow runner. The leak tests take 4.6-6.5 s of
+their 10 on an ordinary one, though, and they are being made faster (the
+limit stays).
+
 **Next**: the examples of `optional/capi` that differ, largest files first
 (string_spec, encoding_spec, class_spec, struct_spec, globals_spec's `$/`
 and `$stdin` as C variables that follow the interpreter's), and io_spec /

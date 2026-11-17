@@ -224,6 +224,15 @@ def carried(m)
   [$~.equal?(m), $1]
 end
 check(carried(/(b)/.match('abc')) == [true, 'b'])
+# (in a block a Ruby method yields to -- how mspec runs an example -- and at
+#  the top level: the C method's frame stands at two depths in the first, and
+#  the caller of the second is the main script's)
+def yielder = yield
+check(yielder { /(c)d/ =~ 'cd'; A.last_match(1) } == 'c')
+/(e)f/ =~ 'ef'
+check(A.last_match(1) == 'e')
+A.set_match(/(g)/.match('g'))
+check($1 == 'g')
 check(A.strtoul('  0x1fz', 0) == [31, 6])
 check(A.strtoul('-12', 10) == [2**64 - 12, 3])
 check(A.strtoul('777', 8) == [511, 3])
