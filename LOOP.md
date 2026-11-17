@@ -5697,3 +5697,32 @@ Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
 686 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates;
 test_sprintf 33 / 33 on the VM, also under ASan; test_random_formatter
 26 / 26 on both.
+
+## 2026-11-17 (80): ruby's test files outside test/ruby on both executions
+
+**The point.** The 594 files of CI's measurement outside test/ruby
+(rubygems, -ext-, prism, psych, openssl, mkmf, optparse, fiber, ...) run
+on both, same build: the VM 21,905 MATCH against the evaluator's 21,906.
+With test/ruby's 142 ((68), (72)) that is every file CI measures. What the
+VM did otherwise:
+
+- **test_delegate**'s Ractor test: delegate.rb's Delegator is a class under
+  BasicObject, and `kernel = ::Kernel.dup` was "uninitialized constant
+  Delegator::Kernel" on the VM -- a call on Kernel is rebuilt as the
+  evaluator's EMethod, and the receiver was written `Kernel`, which such a
+  class cannot see. It is written `::Kernel`.
+- **test_coverage's test_big_code** (a 10,000-line file under Coverage,
+  past its bound on the VM): a file under Coverage was compiled by the Ruby
+  compiler, 25 s for that file. Only branch Coverage needs it; line
+  Coverage is counted by the VM from the line events either compiler puts
+  in, so the native compiler takes the file: 0.2 s.
+- ripper/test_scanner_events differed by one in the VM's favour (a gvar
+  test that is RED on the evaluator in this run): not a VM difference.
+
+Corpus 690 is the witness (::Kernel calls inside a BasicObject subclass,
+DelegateClass, and line Coverage of a required file, each run as it is and
+under MERE_RUBY_VM=strict).
+
+Checked (local): corpus 697 / 697 on the evaluator; under MERE_RUBY_VM=1
+687 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates;
+test_coverage 46 / 46 and test_delegate 37 / 37 on both.
