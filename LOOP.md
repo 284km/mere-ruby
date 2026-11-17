@@ -5502,3 +5502,43 @@ reflected Method calls with and without blocks.
   before publication; none overlaps the functions changed in this follow-up.
 - Existing hosted per-file checks against both CI baselines remain pending;
   no lower count or incomplete coverage is waived and no PR is merged.
+
+## 2026-11-17 (72): gem rounds 12-13 -- singleton missing hooks and command blocks
+
+The unchanged five-suite inventory still gives 53 MATCH / 7 RED / 2 MEMORY,
+with zero BOTH/TIMEOUT/regressions across 62 original files / 1,969 reference
+tests. Within the RED files, Minitest spec improves from 2 failures / 4 errors /
+443 assertions to 2 failures / 0 errors / 451 assertions. Minitest test improves
+from 8 failures / 1 error to 8 failures / 0 errors, retaining its one skip.
+No entire-file MATCH gain is claimed.
+
+- `invoke_val_c2` / `invoke_with_block2` use the new `hng_missing_hook` to
+  reach a primitive singleton's Ruby method_missing for a genuinely missing
+  name. Existing Ruby methods, native aliases and the existing native owner
+  table win first; response hooks do not decide existence. The existing
+  missing-call path retains arguments, keywords, blocks and error attributes.
+- `super_missing` now reaches the extracted `missing_native_super` before
+  the generic primitive fallback. A hook's super reports the originally
+  requested name, receiver and arguments instead of method_missing itself.
+  Witness 683 includes Hash/Array/String/Proc, direct/send/public_send calls,
+  query claims, existing methods, private refusal, hook super and removal.
+- `safe_nav_bare` / `attach_block_method` respect an enclosing command's
+  existing nodo flag after parsing their own bare arguments. The outer
+  do...end no longer attaches to a nested dotted command. Witness 684 covers
+  normal/safe/nil calls, nesting, direct calls, parentheses, braces and the
+  exact regex/new/Mutex/yield shape isolated from Minitest. This is a language
+  parsing difference; AST/Ripper/Prism tree APIs are untouched.
+- Fresh O2 source 61d57736: corpus 703/703. Both added witnesses match normally
+  and under GC.stress. Method retains 97 MATCH / 1 RED, Super 50/50, Yield
+  13/13; paired latest-successful-main controls for Parse are 102/102 on both
+  and Syntax 167 MATCH / 1 RED / 2 BOTH on both. Six harness controls and the
+  structural gates pass; bracket depth remains 892/1024.
+- The remaining spec-name failures reduce to Array#join ignoring a class's
+  Ruby to_s while the direct call works. Its invoke_val_c0 branch, like the
+  exception Marshal branch in stdlib_src, is still shared with another
+  session. Keep those coordination constraints and original RED files.
+- AST #86 has merged to main 392bf810; its ordinary CI is still queued, so
+  43933582689 remains the latest successful main baseline alongside handoff
+  43548292351. Before publication, the current #99 AST, VM, C API and GC
+  branches were compared at all changed function bodies; none overlaps.
+  No top-level let, collector, shared dispatcher or resource bound changes.
