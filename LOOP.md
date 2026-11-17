@@ -5432,3 +5432,55 @@ assertion and every Proc pays. corpus 680.
 - Checked: corpus 694 of 694, and with MERE_RUBY_BLK_ID_CHECK,
   MERE_RUBY_ATTR_IC_CHECK and MERE_RUBY_IVAR_INDEX_CHECK on; test_ast's
   individual tests 114 as the reference; the gates.
+
+## 2026-11-17 (74): Prism's fixtures -- where parse.y's lexer, not its grammar, decides the tree
+
+PR #86 (main `392bf810`) left 20 of Prism's 976 fixtures whose tree is not
+parse.y's. 5 of them CRuby cannot answer itself (`#children` raises
+NoMethodError on `::A ||= 1` and the like). The other 15 now agree: 971 of
+976, measured with tools/ast_on_cruby.rb against tools/ast_dump. The 850
+files test_ast reads still all agree. Each is a place where parse.y's lexer
+cuts or places a token differently from Prism:
+
+- **A percent literal closed by a line end** (`%\nfoo\n`, `%r\nfoo\n`) ends
+  on that line, in the column past the newline -- and so does every node
+  ending with it. The offset is the next line's start, where every other
+  node that ends there ends; tr notes these literals and ao_nl_end places
+  them.
+- **A program's end** reads past a `\` continuation and past the heredoc
+  bodies a line opened; after a comment, a program that ends after those
+  bodies ends at the comment, and a last line of blanks with no newline is
+  the term's place (hd_skip, nl_after_comment, skip_terms).
+- **A regexp's text splits at a `#@` / `#$` that names no variable**
+  (`/a#@~b/`): parse.y's tokadd_string stops there to look for a variable
+  name, finds none, and the text from `#` is the next token -- a DREGX,
+  and in a condition a MATCH2. Prism keeps one RegularExpressionNode.
+- **Text a heredoc body interrupts is one token** (`<<-A.gsub(/b\` / body /
+  `b/)`, a `%w` / `%i` word): a REGX, and a word placed from the line it
+  ends on. Prism splits it into parts, and places such a `%i` word where
+  its first line is.
+- **A `<<~` heredoc with an unindented line** reads as a plain heredoc
+  (heredoc_dedent has nothing to remove); when the indentation falls to
+  none at a later line, the lines before it stay tokens of their own,
+  because literal_concat does not join while heredoc_indent is above 0. A
+  `<<~` DSTR whose pieces all joined its head is a STR.
+- **`Foo::Bar { }`** (ruby bug #18878): the call takes the block's place.
+- **A command's `do` block inside bracketed arguments** (`foo(bar baz do
+  end)`, `[bar baz do end]`, `foo[...]`, a splat, a keyword value) is a
+  SyntaxError, as in parse.y -- checked against 16 forms.
+- **An empty file's tree is at line 0** with no script lines
+  (`parse_file`); an empty String's stays at line 1.
+- A regexp in a condition: an interpolated one warns only under -w, in
+  Prism as in parse.y (it always warned); under AST.parse, one parse.y
+  splits warns so too.
+
+Not done: `/(?<y>a)#@~/ =~ x`, where parse.y's DREGX assigns no `y` (the
+scope's table comes from Prism's locals).
+
+Speed: tr reads a node's first byte once. 300 files of test_ast's walk,
+205.05e9 -> 205.34e9 instructions (+0.14%). Bracket depth 923 -> 924 (one
+table, ao_lx, holds both kinds of note). Witness corpus/684.
+
+- Checked: corpus 696 of 696, and with MERE_RUBY_BLK_ID_CHECK,
+  MERE_RUBY_ATTR_IC_CHECK and MERE_RUBY_IVAR_INDEX_CHECK on; test_ast's
+  individual tests 114 as the reference; the gates; loop memory.
