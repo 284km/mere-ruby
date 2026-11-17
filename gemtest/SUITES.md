@@ -105,3 +105,14 @@ default block passed to super. Rack's original utils file becomes MATCH
 Witnesses 678 and 679 cover candidate evaluation/conversion, Module#===,
 Proc identity, lambda arity, preserved entries, argument errors and freezing.
 Corpus reports 699/699 MATCH; bracket depth remains 895/1024.
+
+Rounds 10-11 honor singleton undef on primitive values and let name overrides
+reach Module#name through super. Rack Lint becomes MATCH (37 tests / 763
+assertions). Minitest spec and Rack headers now reach summaries with visible
+remaining failures. Request's newly reached 16 MiB NUL case crosses the
+unchanged 2 GiB cap. The same inventory gives **53 MATCH / 7 RED / 2 MEMORY**,
+zero BOTH/TIMEOUT and no lost MATCH. Round 10 alone was 53 / 8 / 1; the RED
+to MEMORY transition is not counted as an improvement. Witnesses 681/682 and
+all 701 corpus programs match Ruby. Bracket depth is 892/1024 after the incoming
+main C API merge. Paired CRuby Method and Module controls equal latest main:
+97 MATCH / 1 RED and 195/195 MATCH respectively.

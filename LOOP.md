@@ -5420,3 +5420,40 @@ extended witness matches the reference both normally and with GC.stress.
 - The separate merge gate remains open. #90's Linux build job now fails the
   Float#step bit comparison. This is not waived as known noise. Latest successful
   main CI is 43933582689; compare it and handoff 43548292351 before any merge.
+
+## 2026-11-17 (70): gem rounds 10-11 -- singleton undef and Module name super
+
+With the unchanged lock and 62 files / 1,969 reference tests, round 10 gives
+53 MATCH / 8 RED / 1 MEMORY; round 11 gives 53 MATCH / 7 RED / 2 MEMORY.
+There are no BOTH, TIMEOUT, reference changes or lost MATCH. Rack Lint becomes
+MATCH (37 tests / 763 assertions). The second memory verdict is a newly reached
+request case, not another passing file. The initial snapshot remains unchanged.
+
+- `invoke_val_c2` / `invoke_with_block2` consult a primitive singleton's undef
+  before the native path; `respond_to_answer` / `responds_x` ask the same fact.
+  `hng_lookup_cls`, `hng_undef_blocked` and `hng_undef_call` keep the actual
+  lookup class, method_missing block, query hook and NoMethodError attributes.
+  Ordinary class identity stays separate. Witness 681 includes send/public_send
+  with and without blocks, redefinition, other instances and saved aliases.
+- `super_missing` sends a class/module override's name super directly to the
+  existing `mod_name_val`, with native arity. Witness 682 checks named,
+  anonymous, late-named and singleton classes, frozen cached names and a
+  superclass undef. The shared super lookup and main dispatcher are untouched.
+  Minitest spec now executes 76 tests (2 failures / 4 errors), and Rack headers
+  51 (37 failures / 2 errors). Both stay RED. Request now reaches TestProxyRequest's
+  16 MiB ASCII NUL test and crosses 2 GiB; no VM/GC cause is established.
+- Fresh O2 source 861c74d1: corpus 701/701 and both witnesses under GC.stress
+  match Ruby. CRuby Method is 97 MATCH / 1 RED and Module 195/195, equal to the
+  same-environment latest-main controls. Six harness controls pass; bracket
+  depth stays 892/1024. No top-level let, root table or limit change.
+- Additional controls reduce RewindableInput to File rewind after chmod(0),
+  and the uploaded-file assertion count to reflected File/IO helpers.
+  A separate prepended name/undef lookup gap also predates these rounds.
+  Their shared-function constraints and remaining symptoms stay in the ledger.
+- Linux's ubuntu-latest rollout changed the reference from Ubuntu 24.04 to
+  26.04 and exposed fused versus separate Float#step rounding. Strict diagnostic
+  output confirms the differing bits. #90 pins only the runtime build and gem
+  Linux jobs to the measured Ubuntu 24.04 target; all bounds/assertions remain.
+  The newer-target numeric gap stays documented. Updated Linux jobs pass.
+  #92's separate Module leak test hit its documented 10-second known noise;
+  its raw record is retained for an unchanged-bound job rerun after completion.
