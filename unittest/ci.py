@@ -285,6 +285,9 @@ def test_environment(private, binary, ruby_version):
         env['RUSTC'] = str(rust_bin / 'rustc')
     if os.environ.get("UNITTEST_REF_EXT_PATH"):
         env["UNITTEST_REF_EXT_PATH"] = os.environ["UNITTEST_REF_EXT_PATH"]
+    # (the same test extensions, built against mere-ruby's own ruby.h)
+    if os.environ.get("UNITTEST_MERE_EXT_PATH"):
+        env["UNITTEST_MERE_EXT_PATH"] = os.environ["UNITTEST_MERE_EXT_PATH"]
     return env
 
 

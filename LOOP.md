@@ -4926,6 +4926,259 @@ is 12 honest MATCH, 57 reasoned exclusions, 90 handoffs (159 total). Raw MATCH
 gain is 13, including the unaccepted inherited memsize_of_all estimate.
 The GC file's expected local counts are MATCH 30 and exclusions 19; other
 target files are unchanged. Of MMTk's 38 exclusions, 22 now apply here.
+
+## 2026-11-15 (58): Ruby's C API on CRuby's own headers -- `test/-ext-` runs against ruby's unchanged test extensions
+
+Stage 7′ / 8, second unit (note 550 §3, note 553). The prototype taken in at
+(55) showed that the boundary could be made to hold; its value was a 32-bit
+token behind a header of its own, so almost no real extension compiled
+against it. This replaces it with the C API proper: an extension is compiled
+against ruby 4.0.9's own headers and loaded by `require`. `capi/README.md`
+is the description; this is what was decided and what was measured.
+
+- **The decision: CRuby's headers, with ten macros rerouted.** `capi/include`
+  is ruby 4.0.9's `include/`. The ten macros that cast a VALUE to a struct
+  pointer (`RBASIC`, `RSTRING`, `RARRAY`, `RDATA`, `RTYPEDDATA`, `ROBJECT`,
+  `RFILE`, `RCLASS`, `RMATCH`, `RREGEXP`) call a function instead, and
+  everything written on top of them is ruby's text. Immediates are CRuby's
+  bit for bit; any other VALUE is `2^56 + 8n`, a number in a table the
+  interpreter keeps, and the struct C asks for is a mirror made on demand,
+  refreshed when the interpreter has run and written back when C has. The
+  alternative -- a header of our own with the same names -- was the
+  prototype's, and it is where "ruby's sources compile unchanged" stopped at
+  three directories. `capi/tools/headers_check.py` holds the copy to the
+  ruby source tree: 194 headers, 10 patched by `capi/tools/headers.patch`
+  and nothing else.
+- **The prototype's code is gone**, and its contracts stayed: the scripts it
+  checked itself with (ensure 58 checks, typeddata 78, loader 46, numeric 13)
+  now run on the real headers, on both sides. `tools/native_probe/` keeps
+  only the embedding checks, which are another feature.
+- **No interpreter failure crosses a C frame.** A request from C comes back
+  with an outcome; C jumps to the nearest guard it made itself
+  (`rb_protect`, `rb_rescue2`, `rb_ensure`, `rb_catch`, the C method's
+  entry). An exception, `throw`, `break` and `return` all travel that way.
+- **What C holds is alive**: registered addresses, a conservative scan of
+  the C stack while a call is in progress (and of a stopped Fiber's or
+  Thread's stack), `dmark` to a fixpoint, the elements of live mirrors.
+  `dfree` runs once at the sweep.
+- **A call into C stays with the stack it is on.** Fibers and threads switch
+  in the middle of `rb_block_call`; each stack has its own chain of C calls
+  (`mr_capi_switch`, called from the one place the interpreter switches
+  stacks).
+- **Whether a file is an extension of ours is asked of the file.** The
+  intake asked by `dlopen` and `dlclose`, which gave an accepted library an
+  extra constructor / destructor cycle before its `Init_` and ran a foreign
+  library's constructors (PR #83's review). The file is read for the name
+  every extension compiled against these headers defines; the library is
+  opened once, and the number behind the name is compared then.
+- **A long division is not one uninterruptible step** (the interpreter, not
+  the C API; it is here because `ruby/test_bignum.rb` could not finish
+  without it). The file ran nothing at the baseline -- its first line
+  requires `-test-/integer` -- and with the extension there, one of its
+  tests grows two numbers until two signals arrive during a division.
+  Threads take turns at statement boundaries and a trap runs at one, so
+  they never arrived, and the operands grew until a single division took
+  minutes (the file would have ended at CI's 600 seconds). The long
+  division now counts the limbs it has gone over and, every four million,
+  takes the look a statement boundary takes: another thread that can run
+  gets its turn, a trap that is waiting runs (`long_op_hook` in
+  m_numeric.mere, `long_op_tick` in main.mere). The test's scenario is met
+  at its sixth round, in 4 seconds.
+- **What is refused**: `capi/unsupported.c` lists 66 functions that exist so
+  that a library using them loads, and raise NotImplementedError by name
+  when called -- CRuby's internal bignum routines (`rb_big_mul_toom3`, ...:
+  this Integer has one multiplication, and answering under another's name
+  would be a claim), TracePoint / debug inspector / profile frames /
+  postponed jobs from C, memory views, the Random interface, encoding
+  converters. Nothing in it answers.
+
+**Checks.**
+
+- `tools/capi_check.py`, a step of CI's corpus job (macOS) and of
+  build-linux: ruby's `ext/-test-/exception`, `typeddata`, `float`, `iter`
+  and the fixtures of `capi/check`, built against the reference's headers
+  and against these; five contract scripts print the same on both sides
+  (ensure 58, typeddata 78, loader 48 and one of our own, numeric 13, fiber
+  16), again under a collection at every safepoint; and with dmark, dfree,
+  the ensure cleanup, the stack switch and the load-free ABI question each
+  switched off, the contracts that depend on it fail. Run here on macOS and in
+  a Linux container, each against ruby 4.0.9: both agree.
+- The unit test shards build all of `ext/-test-` with
+  `tools/capi_ext_build.py` (72 of 75 directories build; the three that do
+  not want CRuby's internal headers) and `unittest/shim/-test-/`, three Ruby
+  stand-ins for C extensions, is deleted.
+- Gates: dead_defs, dup_defs, gc_roots (`capi_tab` is an entry),
+  meth_writes, name_len, ns_names pass. Bracket depth is 892 of 1024 (895
+  with the prototype, 878 on main).
+- The corpus matches 687 of 687 (O2 build, this machine). There is no new
+  corpus program: a corpus program cannot build a library, and what this
+  round adds is witnessed by the two-sided contracts above, each with the
+  control that makes it fail.
+
+**What CI found** (PR #87):
+
+- `config.h` claimed `dup3` and `pipe2` for macOS: this machine's macOS has
+  them and the runner's release does not, and `config_probe.py --check`
+  refused the claim on the runner. They are said for Linux alone now.
+- With the file asked instead of loaded (above), ruby's own
+  `-test-/memory_status` extension loads, which is what `tool/lib`'s
+  `assert_no_memory_leak` waits for: its tests (34 files use it) were
+  pended as "unsupported platform" on this side and now run.
+- The unit test run of 80e41026 (run 43792242051): MATCH 33,175, 710 above
+  the baseline (run 43745055106 on main ba088b2f: 32,465), RED 1,239;
+  INCOMPLETE files 19 (82 at the baseline); 68 files higher, and five
+  LOWER. One of the five is noise (`ruby/test_ractor.rb`, in
+  `unittest/README.md` now). The other four were real, each from a test
+  reaching code it had not reached before, and each is fixed here with a
+  contract in `capi/check/api.rb`:
+  - `ruby/test_dir_m17n.rb` 22 -> 20. `Bug::File::Fs.fsname` is ruby's C
+    now, and `capi_ext_build.py` built it without extconf.rb's answers: no
+    `HAVE_STRUCT_STATFS_F_FSTYPENAME`, so it said nil for every path where
+    the reference says "apfs", and two tests that return early on APFS ran
+    on. The builder asks the compiler the three probes that file writes out
+    (`have_header` over a list, `have_type`, `have_struct_member`) and
+    passes the answers as mkmf does. `rb_str_encode_ospath`, which the
+    function then calls, is written.
+  - `-ext-/file/test_stat.rb` 2 -> 0: `rb_stat_new` was in the ledger. It
+    makes a `File::Stat` from the struct C filled.
+  - `ruby/test_keyword.rb` 114 -> 113: a block function C passed
+    (`rb_block_call`) was not told that it had been yielded keywords, and
+    `rb_yield_block` handed them on as a Hash. The request that runs a C
+    block carries the flag; `rb_keyword_given_p` answers from it.
+  - `ruby/test_regexp.rb` 161 -> 160: `onig_get_parse_depth_limit` /
+    `onig_set_parse_depth_limit` were in the ledger, and the regexp parser
+    had no such bound (deep nesting ended at the stack). The parser counts
+    its nesting -- groups and character classes -- and refuses past the
+    limit with Onigmo's message ("parse depth limit over"); the default is
+    Onigmo's 4096, and C reads and sets the same number. The file is at
+    162 here, one above the baseline.
+
+**What the review found** (PR #87; each has a contract in
+`capi/check/api.rb` now -- 63 checks on both sides with those of "What CI
+found" -- and the first has the control that makes them fail):
+
+- A primitive called whatever the receiver's class had made of the name:
+  `rb_ary_push` on an instance of `class A < Array; def push` ran A's
+  `push` and left the Array empty; the same for `rb_str_append`,
+  `rb_str_strlen`, `rb_obj_freeze`, `rb_hash_aset`. The primitives of the
+  C API now name the class whose operation they are (Array, String, Hash,
+  Kernel), and where the receiver's class or singleton overrides the name
+  the call goes the way `super` from that override would -- to the next
+  definition from the builtin class on, or the builtin itself. Only an
+  override pays for it. (A redefinition IN the builtin class itself was
+  still what got called; the second review below.)
+- The watch on a struct C may have written (a String's bytes through
+  `RSTRING_PTR`) ended when ANY C call at that depth ended. A Fiber stopped
+  inside a C call lost it to an unrelated call on another stack, and what
+  its C wrote after resuming never reached the String. The watch belongs to
+  the C frame that took the pointer now.
+- `rb_get_kwargs` is class.c's again: with a place for the values, what it
+  finds is taken out of the Hash (also when other keywords may stay);
+  without one, the Hash is only read.
+- `rb_proc_new` made a lambda; it makes a Proc.
+- (Found here, from a gem: redcarpet.) A class C defines is the class
+  statement itself where its scope and superclass have names. Made
+  anonymous and set as the constant, a class under two modules made the
+  same way was not found again as a superclass -- `class Custom <
+  Redcarpet::Render::Base` then was not a Base -- and ruby's own
+  `-test-/memory_status` did not define what `tool/lib` looks for.
+
+**What the second review found** (PR #87, after the CI fixes; five, each
+reproduced by the same C on both rubies, each with contracts now):
+
+- `rb_stat_new(NULL)` -- file.c's way of allocating a File::Stat -- read
+  through the NULL and the process died. It is an uninitialized File::Stat
+  now, whose readers raise TypeError.
+- `rb_stat_new` kept whole seconds: the struct's nanoseconds and, on
+  macOS, its birth time were dropped. The times are seconds plus a Rational
+  now, and the birth time is kept; File::Stat#<=> compares the Times, not
+  their seconds. (On Linux ruby keeps a statx and copies neither the device
+  numbers, the block size nor a birth time from a struct stat: those read 0
+  there and #birthtime is NotImplementedError, on both sides.) That made
+  `-ext-/file/test_stat.rb` 0 again: it compares the C-made snapshot with
+  `File.stat` of the same file, and this interpreter's own File.stat had
+  whole seconds (Mere's `file_stat_field` gives no more). File.stat and
+  File#stat now have the nanoseconds too, read by `mr_stat_times`
+  (tools/process_glue.c) from one stat call that also gives the seconds,
+  so `File.mtime` and the rest are exact as in ruby. With the times exact,
+  `File.utime` / `File.lutime` had to be too: utime(2) took whole seconds,
+  and lutime ran `touch -h` in a shell. Both are utimensat(2) now
+  (`mr_utimens`, the same glue), to the nanosecond and with no shell; the
+  old ways stay where a target refuses the call. (On this machine a
+  freshly written file's atime is moved a few ms later by something
+  outside the process -- ruby sees it as well. `test_lutime` in
+  pathname, which reads the atime right after writing, then passes or not
+  by how fast the steps between are: ruby's pass, ours sometimes do not.)
+
+**What the CI of c32cc30c found** (run 43841373314: every job green; MATCH
+33,183, 718 above the baseline, RED 1,231; 70 files higher, one lower):
+`ruby/test_dir.rb` 38 -> 37, `test_symlink`: `Dir.glob("*/")` listed
+symlinks to FILES. Not this branch's -- main's build does it too, 29 runs
+in 40 here, and the baseline's run happened to pass -- but its cause is the
+interpreter's directory test, `dir_there`, which asked `stat("<p>/")`; macOS
+answers that with success at random for a link to a file. The same cause
+made `File.read("~/.gemrc")` (a link to a file) raise EISDIR in one run of
+`gem` in five here. `dir_there` stats the path and reads the type bits now
+(a 0000 directory is still a directory, as before): 0 runs in 40 list a
+link to a file, and `~/.gemrc` reads 30 times in 30.
+- The regexp parse depth was one level too lenient: Onigmo counts the
+  pattern itself (its outermost parse_subexp) as the first level, so at
+  limit 1 `/(a)/` and `/[a]/` are refused. Counted the same way now, with
+  contracts at the limit and one past it.
+- Two C calls stopped in two Fibers, holding pointers into the SAME String:
+  the mirror's watch recorded only the first call, and when that call
+  ended the second one's write was lost (`"Xbc"` where ruby says `"Ybc"`).
+  A mirror is watched by every C call in progress that touched it, and
+  until the last of them has ended.
+- The primitives: `rb_ary_aref` still dispatched (a subclass's `[]`
+  answered), and a redefinition in the builtin class itself (`class
+  String; def length`) was still what `rb_str_strlen` called. The first is
+  routed like the others. For the second, what the prelude defines in
+  Array, String, Hash and Kernel is the builtin here: when a program
+  redefines or removes one of those names afterwards, the method table's
+  setter keeps the prelude's definition aside (`capi_boot_defs`; none where
+  the name is native), and the primitive calls that, or the native one.
+  A module prepended to the builtin class (`Array.prepend`) is passed over
+  the same way an override in a subclass is.
+
+**Measured here** (this machine, the interpreter's side only; CI's shards
+are the record and go in below when they have run): of `test/-ext-`'s 94
+files, 94 reach their summary (12 did at the baseline, CI run 43548292351 on
+main f7b2579a, where 811 of 823 tests were RED); 657 tests pass of 831 run.
+
+`ruby/test_bignum.rb`: 65 of 74 pass (0 at the baseline). The nine left are
+the interpreter's numeric semantics (`Integer#to_s` and `#digits` with an
+invalid radix, the Float-range warnings of `to_f` and `/`, `fdiv` past
+1e300, `Integer#[]` with a range past the top) and two that ask about
+CRuby's representation (`Bug::Integer.bignum?(0)` of a bignum-typed zero,
+an interrupt during `to_s`, which is not long here).
+
+**What is still RED in `test/-ext-`, by cause** (174 tests):
+
+- CRuby's internal bignum routines by name -- `bignum/test_mul` 19,
+  `test_str2big` 3, `test_big2str` 2, `test_bigzero` 2, `test_div` 1,
+  `rational` 1: refused (above). Whether to vendor CRuby's bignum.c for them
+  is the owner's question in note 553 §4.
+- `GC::INTERNAL_CONSTANTS` and what depends on it (`string/test_capacity`,
+  `test_set_len`, `test_rb_str_dup`): an item waiting for the owner (note
+  549 §4), not touched.
+- The VM's own structures from C: `tracepoint`, `debug` (inspector, profile
+  frames), `postponed_job`, `thread/test_instrumentation_api`, `iseq_load`,
+  `bug_reporter`, `stack`, `test_bug-14834`.
+- Symbols that must not come into being (`symbol/test_inadvertent_creation`,
+  32 of 49): `rb_check_id` answers truthfully, but the interpreter's own
+  method lookup interns the name first.
+- Not written yet: memory views, the Random interface, `rb_econv_*`, dummy
+  encodings, `rb_stat_new`, `rb_marshal_define_compat`,
+  `rb_f_notimplement`'s effect on `respond_to?`, `rb_data_define` with a
+  superclass, `st_table` of a Hash.
+- The interpreter, not the C API: `String#encode` on a subclass answers a
+  String; `IO#wait` on a descriptor closed behind it does not raise EBADF.
+
+**Next**: RbConfig's keys from this build's real environment and mkmf on
+these headers (`test/mkmf`, and `capi_ext_build.py` replaced by ruby's own
+extconf.rb runs), then RubyGems' native builds and a real gem.
+
 ## 2026-11-16 (59): round 38 -- a whole file runs on the ISeq VM, and the corpus matches ruby that way too
 
 **The point.** With `MERE_RUBY_VM=1` the main script and every file it
