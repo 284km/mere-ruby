@@ -5446,3 +5446,12 @@ with 57 exclusions reported separately: objspace 37, ractor 3, Enumerable
 The local missing native stack extension remains BOTH. The native iteration
 RSS probe is 1.07x; roots/dead/duplicate checks pass and bracket depth is
 892/1024. Full CI against the new main is still required before merge.
+
+The integrated candidate passes 695/695 corpus programs with hash indexing
+ON and OFF, the original nine RSS cases (class ivar 1.05x), and the complete
+OpenSSL owner/lifetime gate. Linux CI then failed the unchanged Float#step
+bit comparison: the baseline used Ubuntu 24.04, while ubuntu-latest had
+moved to 26.04 with Clang 21. The native build job is pinned to Ubuntu 24.04
+to preserve that baseline environment; its 90-minute limit and all test
+time/memory bounds remain unchanged. The platform explanation is checked by
+the next CI run, rather than changing Float arithmetic during GC work.
