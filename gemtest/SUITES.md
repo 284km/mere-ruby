@@ -116,3 +116,13 @@ to MEMORY transition is not counted as an improvement. Witnesses 681/682 and
 all 701 corpus programs match Ruby. Bracket depth is 892/1024 after the incoming
 main C API merge. Paired CRuby Method and Module controls equal latest main:
 97 MATCH / 1 RED and 195/195 MATCH respectively.
+
+The round 10-11 review follow-up retains native Method/UnboundMethod and alias
+definitions across singleton undef, without leaking the one-dispatch bypass
+into Ruby callbacks, coercion defaults or string eval. Module#name super now
+requires the native Module entry to remain ahead of the actual method origin.
+Expanded witnesses 681/682 match normally and under GC.stress. Fresh O2 source
+a3ad911a keeps **53 MATCH / 7 RED / 2 MEMORY**, zero regressions and corpus
+**701/701**. Method, Module, TracePoint, Proc, Super and Yield retain their
+paired baseline MATCH counts. The initial snapshot and resource bounds stay
+unchanged; hosted per-file merge checks remain pending.

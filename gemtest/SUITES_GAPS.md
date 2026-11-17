@@ -10,7 +10,7 @@ None is excluded from the measurement to improve its score.
 | minitest / `test_minitest_mock.rb` | Executes all 94 tests; 1 failure, 8 errors and 10 skips. File.open stubs now work with and without blocks. Remaining failures include private stubs and a dynamic method's super lookup. | Ruby semantics. Reduce the remaining alias/super witnesses; avoid dispatch functions currently edited by other sessions. |
 | minitest / `test_minitest_spec.rb` | All 76 tests now run: 2 failures, 4 errors, 443 versus 458 assertions. Nested spec names retain an anonymous parent description; expectation aliases on Hash and one nested yield also fail. | Ruby semantics. Reduce those remaining witnesses; Module#name super now reaches its existing native value without editing the shared super lookup. |
 | minitest / `test_minitest_test.rb` | Backtrace compression now works; 8 exception Marshal/equality failures and 1 missing-yield error remain. A small exception wrapper with an overridden backtrace compares unequal after a Marshal round trip. The dump stores its delegated trace as its native trace; the reference keeps the native trace nil. | Ruby semantics. The Marshal branch is in `stdlib_src`, also edited by the GC session in #91/#94, so avoid that function until available. This is a coordination constraint, not a GC cause. The missing-yield error needs its own witness. |
-| rack / `spec_headers.rb` | All 51 tests now run: 37 failures, 2 errors, 151 versus 302 assertions. A Hash subclass's own class `[]` is bypassed by the inherited native constructor, so header keys remain uppercase. | Ruby semantics. A small subclass returning a sentinel from self.[] reproduces the bypass with both bracket and ordinary call syntax. |
+| rack / `spec_headers.rb` | All 51 tests now run: 37 failures, 2 errors, 151 versus 302 assertions. A Hash subclass's own class `[]` is bypassed by the inherited native constructor, so header keys remain uppercase. | Ruby semantics. A small subclass returning a sentinel from self.[] reproduces the bypass with both bracket and ordinary call syntax. An unaccepted priority-fix trial then exposed bare zero-argument new allocating a VObj without Hash storage, producing 51 errors. That route uses try_self_call and new_obj/new_obj_wb, edited by the AST/VM and C API sessions. The trial was reverted; this is a coordination constraint, not evidence of an AST-tree or C API cause. |
 | rack / `spec_request.rb` | After the reporter's name super becomes available, execution reaches 2 GiB in TestProxyRequest's `handles ASCII NUL input of 16777216 bytes`. The reference completes 404 tests / 1,754 assertions with 2 skips. | Resource investigation, without a proven VM or GC cause; keep the cap. It changes from RED to MEMORY, with no MATCH gain. |
 | rack / `spec_rewindable_input.rb` | Exits without a summary. A reduced Tempfile writes successfully, but rewind fails after chmod(0); the underlying File fails too. The same write/rewind without chmod succeeds. | Ruby File/IO semantics. file_flush_obj reads the path outside its guarded descriptor fallback. Completing the read path also reaches invoke_val_c0, shared with the other sessions; avoid editing that shared function. |
 | rack / `spec_sendfile.rb` | Two tests opening a File subclass reach IO's descriptor conversion and reject a path string. | Ruby constructor inheritance; reduce a File subclass witness. |
@@ -105,8 +105,28 @@ Resolved in follow-up rounds 10-11:
   Minitest spec and Rack headers now reach their original test summaries;
   their remaining failures stay RED. Rack request instead reaches its memory cap.
 
+Review corrections retain captured native Method/UnboundMethod definitions
+and saved String/Array/Proc aliases after undef. The retained dispatch bypass
+ends before Ruby block bodies, coercion methods and defaults, and string eval.
+An Enumerator returned by a retained native each still redispatches by its
+ordinary source name; its next/to_a correctly fail after that name is undefined.
+Module#name super also checks the actual method origin: replacing Module's
+own name no longer revives the native definition beyond Module. Expanded
+witnesses 681/682, all 701 corpus programs and the unchanged 62-file inventory
+pass their respective reference/baseline checks on fresh O2 source a3ad911a.
+The file totals remain 53 MATCH / 7 RED / 2 MEMORY, with no lost MATCH.
+
 An additional reduced lookup gap predates both rounds: prepending a name
 wrapper above a singleton's undef can bypass the wrapper and return nil,
 where Ruby raises from super. The before/after controls agree on that wrong
 answer; the shared lookup/dispatch path remains untouched. It is not an
 exclusion from any original upstream file or a claimed MATCH.
+
+Additional reduced controls expose pre-existing primitive lookup gaps: a
+String singleton's native to_s loses receiver identity, its concat override
+can be ignored, and an UnboundMethod owned by that singleton refuses to bind
+back to the same String. The paired base agrees on those wrong answers.
+Original native Method/UnboundMethod retention and saved-alias lookup are
+checked separately; these additional gaps are not claimed as repaired or
+removed from an upstream file. Their shared dispatch paths remain occupied
+by the other sessions.
