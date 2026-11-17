@@ -5542,3 +5542,37 @@ No entire-file MATCH gain is claimed.
   43548292351. Before publication, the current #99 AST, VM, C API and GC
   branches were compared at all changed function bodies; none overlaps.
   No top-level let, collector, shared dispatcher or resource bound changes.
+
+## 2026-11-17 (73): preserve active refinements before singleton missing hooks
+
+#100's P2 found that hng_missing_hook's real-definition probes omitted lexical
+refinements. The existing refinement dispatcher could handle the call, but the
+new earlier guard sent it to method_missing. Source 77e39520 also consults the
+existing refined_impl_for before declaring the name missing, preserving that
+dispatcher's priority without editing it.
+
+Expanded witness 683 covers Hash/Array/String/Proc refinement methods, keyword
+arguments, send/public_send and ordinary unhandled names with singleton hooks.
+It matches Ruby normally and under GC.stress. A separate block-bearing refined
+Hash control fails on the pre-round base too; that existing block-dispatch gap
+is recorded, rather than claimed as fixed or removed from an upstream file.
+
+- Fresh O2 full run: 62 files / 1,969 reference tests, 53 MATCH / 7 RED /
+  2 MEMORY, zero BOTH/TIMEOUT/regressions. Corpus 703/703. Method retains
+  97 MATCH / 1 RED, and paired #97-base/candidate Refinement both give
+  121 MATCH / 1 BOTH. Six harness controls pass; bounds are unchanged.
+- #90's newly available hosted raw artifacts cover 663/758 existing files.
+  ObjectSpace 37, Object 65, transcode 98 and zlib 96 MATCH recover their
+  earlier lower counts. TracePoint gives 96 versus handoff's 97; its extra
+  recorded error is test_thread_add_trace_func's access-from-outside error,
+  while the local paired controls give 97; its cause remains unconfirmed.
+  Bootstrap eval is still
+  48 versus handoff's 49: case 19 incorrectly allows Integer.instance_eval
+  to define a constant. Neither shortfall is waived; remaining shard coverage
+  and the two file gates still prevent merging.
+- Candidate-only measurements outside the public lock give Matrix 2 MATCH.
+  Rake has 20 BOTH because CRuby's core Test::Unit adapter refuses the tag's
+  assert_raises alias; Logger's child cannot find its locked library on the
+  reference side. These are setup defects, not interpreter verdicts accepted
+  into the baseline. The candidates need their actual pinned Test::Unit
+  dependencies and inherited locked child load paths before inclusion.

@@ -146,3 +146,15 @@ Resolved in follow-up rounds 12-13:
 - Minitest spec's 4 errors and Minitest test's 1 error are gone. Their files
   remain RED for the differences above. Fresh O2 source 61d57736 keeps the
   same 53 MATCH / 7 RED / 2 MEMORY and all 703 corpus programs match Ruby.
+
+The round 12-13 review correction also checks active refined_impl_for before
+declaring a primitive name missing. Expanded 683 covers refined Hash/Array/
+String/Proc methods with singleton missing hooks, keywords and send/public_send;
+ordinary unhandled names still reach the hook. Fresh O2 source 77e39520 keeps
+the same file totals with no regressions. Method remains 97 MATCH / 1 RED,
+and paired base/candidate Refinement files both give 121 MATCH / 1 BOTH.
+
+A separate block-bearing refined Hash call falls through to an Array receiver
+on both the pre-round base and the corrected runtime. This pre-existing block
+dispatch gap is not claimed as repaired by the missing-hook guard; the
+original upstream inventory and its file verdicts remain unchanged.
