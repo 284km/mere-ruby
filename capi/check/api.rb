@@ -1,0 +1,266 @@
+require 'api_fixture'
+$count = 0
+def check(value)
+  raise 'api contract failed' unless value
+  $count += 1
+end
+def raises(kind)
+  yield
+rescue kind => e
+  $count += 1
+  e
+else
+  raise "expected #{kind}"
+end
+A = ApiFixture
+
+# What C writes through a pointer it took before its Fiber was stopped goes
+# back to the object -- also when another stack ran a C call of its own
+# meanwhile.
+s = +'abc'
+f = Fiber.new { A.ptr_after_yield(s) { Fiber.yield } }
+f.resume
+A.noop
+f.resume
+check(s == 'Xbc')
+a = [1, 2]
+f = Fiber.new { A.ary_ptr_after_yield(a) { Fiber.yield } }
+f.resume
+A.noop
+GC.start
+f.resume
+check(a == [99, 2])
+# (...and without a call between: the control)
+s = +'abc'
+f = Fiber.new { A.ptr_after_yield(s) { Fiber.yield } }
+f.resume
+f.resume
+check(s == 'Xbc')
+# Two stopped C calls hold pointers into the SAME String: each one's write
+# goes back when it is resumed, the first to end does not end the other's
+# watch (and the other order; two Strings are the control).
+[[:a, :b, 'Ybc'], [:b, :a, 'Xbc']].each do |first, second, want|
+  s = +'abc'
+  fibers = { a: Fiber.new { A.byte_after_yield(s, 'X'.ord) { Fiber.yield } },
+             b: Fiber.new { A.byte_after_yield(s, 'Y'.ord) { Fiber.yield } } }
+  fibers[:a].resume
+  fibers[:b].resume
+  fibers[first].resume
+  check(s == (first == :a ? 'Xbc' : 'Ybc'))
+  fibers[second].resume
+  check(s == want)
+end
+s1, s2 = +'abc', +'abc'
+fa = Fiber.new { A.byte_after_yield(s1, 'X'.ord) { Fiber.yield } }
+fb = Fiber.new { A.byte_after_yield(s2, 'Y'.ord) { Fiber.yield } }
+fa.resume; fb.resume; fa.resume; fb.resume
+check([s1, s2] == ['Xbc', 'Ybc'])
+
+# A primitive is ruby's operation, not the method a subclass (or the object's
+# singleton) defined under its name.
+class OverArray < Array
+  def push(*) = :intercepted
+  def [](*) = :intercepted
+end
+class OverString < String
+  def <<(other) = :intercepted
+  def length = 999
+  def freeze = :intercepted
+end
+class OverHash < Hash
+  def []=(key, value)
+    :intercepted
+  end
+end
+class OverObject
+  def freeze = :intercepted
+  def is_a?(klass) = true
+  def kind_of?(klass) = true
+end
+oa = OverArray.new
+A.push(oa, 7)
+check(oa.to_a == [7])
+os = OverString.new('ab')
+A.append(os, 'c')
+check(os.to_s == 'abc')
+check(A.length(os) == 3)
+A.freeze(os)
+check(os.frozen?)
+oh = OverHash.new
+A.aset(oh, :k, 1)
+check(oh.fetch(:k) == 1)
+oo = OverObject.new
+A.freeze(oo)
+check(oo.frozen?)
+check(A.kind_of(oo, String) == false)
+single = [1]
+def single.push(*) = :intercepted
+A.push(single, 2)
+check(single == [1, 2])
+plain = []
+A.push(plain, 1)
+check(plain == [1])
+check(A.aref(oa, 0) == 7)
+check(A.aref([5, 6], 1) == 6)
+# ...nor a definition the program made in the builtin class itself
+class String
+  alias_method :__capi_length, :length
+  def length = 999
+end
+check('abc'.length == 999)
+check(A.length('abc') == 3)
+class String
+  alias_method :length, :__capi_length
+  remove_method :__capi_length
+end
+check('abc'.length == 3 && A.length('abc') == 3)
+class Array
+  alias_method :__capi_push, :push
+  def push(*) = :intercepted
+end
+redef = []
+check(redef.push(1) == :intercepted)
+A.push(redef, 2)
+check(redef == [2])
+class Array
+  alias_method :push, :__capi_push
+  remove_method :__capi_push
+end
+check([].push(1) == [1])
+# ...nor a module prepended to the builtin class (switched off afterwards:
+# a prepend cannot be undone)
+module CapiPrepended
+  def push(*items) = ($capi_prepended ? :intercepted : super)
+end
+Array.prepend(CapiPrepended)
+$capi_prepended = true
+pre = []
+check(pre.push(1) == :intercepted)
+A.push(pre, 2)
+check(pre == [2])
+$capi_prepended = false
+check([].push(1) == [1])
+
+# rb_get_kwargs takes what it found out of the Hash when it is given a place
+# for the values -- whether or not other keywords may stay -- and only looks
+# when it is not.
+h = { a: 1, b: 2, x: 3 }
+check(A.kwargs(h, 1, -2, true) == [2, 1, 2])
+check(h == { x: 3 })
+h = { a: 1, b: 2 }
+check(A.kwargs(h, 1, 1, false) == [2, nil, nil])
+check(h == { a: 1, b: 2 })
+h = { a: 1 }
+check(A.kwargs(h, 1, 1, true) == [1, 1, :undef])
+check(h == {})
+check(A.kwargs(nil, 0, 2, true) == [0, :undef, :undef])
+check(raises(ArgumentError) { A.kwargs({ b: 1 }, 1, 1, true) }.message == 'missing keyword: :a')
+check(raises(ArgumentError) { A.kwargs({ a: 1, z: 2, y: 3 }, 1, 1, true) }.message == 'unknown keywords: :z, :y')
+
+# A class C defined -- under a module C defined under a module C defined --
+# is the class that name finds: Ruby code subclasses it and reopens it.
+class Custom < ApiFixture::Mid::Base
+end
+check(Custom.superclass.equal?(ApiFixture::Mid::Base))
+check(Custom <= ApiFixture::Mid::Base)
+check(Custom.new.is_a?(ApiFixture::Mid::Base))
+check(A.kind_of(Custom.new, ApiFixture::Mid::Base) == true)
+check(ApiFixture::Mid::Leaf.superclass.equal?(ApiFixture::Mid::Base))
+check(ApiFixture::Mid::Base.name == 'ApiFixture::Mid::Base')
+module ApiFixture
+  module Mid
+    class Base
+      def extra = :reopened
+    end
+  end
+end
+check(ApiFixture::Mid::Leaf.new.extra == :reopened)
+check(Custom.new.extra == :reopened)
+
+# rb_proc_new makes a Proc, not a lambda.
+pr = A.new_proc
+check(pr.lambda? == false)
+check(pr.call(5, 6) == [5, 2, :data])
+check([[1, 2]].map(&pr) == [[[1, 2], 1, :data]])
+
+# A block function C passed is told whether it was yielded keywords, and
+# rb_yield_block hands them to the C method's block as keywords.
+class Yielder
+  def keywords = yield(a: 1)
+  def hash = yield({ a: 1 })
+  def both = yield(1, b: 2)
+end
+y = Yielder.new
+check(A.block_keywords(y, :keywords) == [1, true])
+check(A.block_keywords(y, :hash) == [1, false])
+check(A.block_keywords(y, :both) == [2, true])
+check(A.yield_through(y, :keywords) { |*a, **kw| [a, kw] } == [[], { a: 1 }])
+check(A.yield_through(y, :hash) { |*a, **kw| [a, kw] } == [[{ a: 1 }], {}])
+check(A.yield_through(y, :both) { |*a, **kw| [a, kw] } == [[1], { b: 2 }])
+
+# rb_stat_new: the File::Stat of a struct stat C filled.
+st = A.stat_new(__FILE__)
+own = File.stat(__FILE__)
+check(st.instance_of?(File::Stat))
+check([st.size, st.ino, st.mode, st.nlink, st.uid, st.gid] == [own.size, own.ino, own.mode, own.nlink, own.uid, own.gid])
+# (on Linux ruby keeps a statx, and what it copies from a struct stat leaves
+#  the device numbers and the block size out: they read 0)
+linux = RUBY_PLATFORM.include?('linux')
+check([st.dev, st.rdev, st.blksize] == (linux ? [0, 0, 0] : [own.dev, own.rdev, own.blksize]))
+check(st.file? && !st.directory? && st.mtime == own.mtime && st.atime == own.atime && st.ctime == own.ctime)
+check((st <=> own) == 0 && st == own)
+check(A.stat_new(__dir__).directory?)
+check(raises(Errno::ENOENT) { A.stat_new(__FILE__ + '.absent') }.is_a?(SystemCallError))
+# the struct's times to the nanosecond, and on macOS its birth time
+made = A.stat_made_up(444555666)
+check([made.atime, made.mtime, made.ctime].map { |t| [t.to_i, t.nsec] } == [[100, 111222333], [200, 444555666], [300, 777888999]])
+check(made.size == 42 && made.file? && made.mode == 0o100644)
+if RUBY_PLATFORM.include?('darwin')
+  check([made.birthtime.to_i, made.birthtime.nsec] == [50, 123456789])
+else
+  check(raises(NotImplementedError) { made.birthtime }.message.include?('birthtime'))
+end
+# two snapshots a nanosecond apart are not the same, and are ordered by it
+check((made <=> A.stat_made_up(444555667)) == -1)
+check((made <=> A.stat_made_up(444555666)) == 0)
+check(made != A.stat_made_up(444555665))
+# NULL: an uninitialized File::Stat
+blank = A.stat_null
+check(blank.instance_of?(File::Stat))
+check(raises(TypeError) { blank.mtime }.message == 'uninitialized File::Stat')
+check(raises(TypeError) { blank.size }.message == 'uninitialized File::Stat')
+
+# The regexp parser's nesting bound is one number: what C sets, the parser
+# obeys, and 0 puts the default back.
+default = A.parse_depth
+check(default == 4096)
+nested = '(' * 30 + 'a' + ')' * 30
+check(Regexp.new(nested).match?('a'))
+check(A.set_parse_depth(10) == 0)
+check(A.parse_depth == 10)
+check(raises(RegexpError) { Regexp.new(nested) }.message.start_with?('parse depth limit over: /(((('))
+check(raises(RegexpError) { Regexp.new('[' * 30 + 'a' + ']' * 30) }.message.start_with?('parse depth limit over: /[[[['))
+check(Regexp.new('((a))').match?('a'))
+# at the bound and one past it: the pattern itself is the first level
+check(A.set_parse_depth(1) == 0)
+check(Regexp.new('a').match?('a'))
+%w[(a) (?:a) [a]].each { |src| check(raises(RegexpError) { Regexp.new(src) }.message.start_with?('parse depth limit over')) }
+check(A.set_parse_depth(2) == 0)
+%w[(a) (?:a) [a] a|(b)].each { |src| check(Regexp.new(src).match?('a') || Regexp.new(src).match?('b')) }
+%w[((a)) [[a]] ([a]) (?:(?:a))].each { |src| check(raises(RegexpError) { Regexp.new(src) }.message.start_with?('parse depth limit over')) }
+check(A.set_parse_depth(3) == 0)
+check(Regexp.new('((a))').match?('a') && Regexp.new('[[a]]').match?('a'))
+check(A.set_parse_depth(0) == 0)
+check(A.parse_depth == default)
+check(Regexp.new(nested).match?('a'))
+
+# rb_str_encode_ospath: UTF-8 on macOS unless the String is binary; the
+# String itself elsewhere.
+euc = "\u3042".encode('EUC-JP')
+mac = RUBY_PLATFORM.include?('darwin')
+check(A.ospath(euc).encoding == (mac ? Encoding::UTF_8 : Encoding::EUC_JP))
+check(A.ospath(euc).bytes == (mac ? "\u3042".bytes : euc.bytes))
+check(A.ospath(euc.b).equal?(euc.b) == false && A.ospath(euc.b).encoding == Encoding::BINARY)
+utf = "\u3042"
+check(A.ospath(utf).equal?(utf))
+puts "api contracts: #{$count} passed"
