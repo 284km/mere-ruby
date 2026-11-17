@@ -5394,3 +5394,29 @@ rack-test 7 / 1, public_suffix 7 / 0 and base64 1 / 0. The initial 47 / 14 /
   2 GiB on the PR binary while main controls finish; its cause is unconfirmed.
   No lower count is waived, no limit is increased, and no GC-internal
   exclusion decision is made.
+
+## 2026-11-17 (69): retain implicit super's Proc without replacing yield wrappers
+
+The review's implicit-super witness exposed a lost default Proc identity and
+lambda arity in #96. `bind_params` now retains the incoming VProc in the method
+frame; `method_body_flow_result` carries its identity through the existing block
+metadata path, and `super_missing` recovers it for Hash#initialize. The new
+`block_source_proc` recognizes a repeated marker, distinct from the single
+marker naming a literal wrapper's enclosing yield context. No new root table,
+global pin, top-level let or collector change is needed.
+
+The first candidate confused those two meanings. The original Minitest
+assertions file and corpus 226 caught that regression, so it was corrected
+before accepting the review response or updating the snapshot. Witness 679 now
+covers implicit super/super(), an unrelated nested call, a two-level relay,
+literal captures, replacement/nil blocks and yield-containing wrappers. The
+extended witness matches the reference both normally and with GC.stress.
+
+- Fresh O2 source 5fbd80c1: all 62 original gem files remain 52 MATCH / 9 RED /
+  1 MEMORY, zero BOTH/TIMEOUT/regressions; the initial snapshot is unchanged.
+- Corpus 699/699; CRuby Proc 117 MATCH / 1 RED, Super 50/50 and Yield 13/13,
+  identical to the paired latest-main controls (96075af9). All six harness
+  controls pass; bracket depth is 892/1024 after the incoming main C API merge.
+- The separate merge gate remains open. #90's Linux build job now fails the
+  Float#step bit comparison. This is not waived as known noise. Latest successful
+  main CI is 43933582689; compare it and handoff 43548292351 before any merge.

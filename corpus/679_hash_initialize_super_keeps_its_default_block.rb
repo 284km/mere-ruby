@@ -65,6 +65,16 @@ def wrap_yield_context
   capture_yield_context { |value| yield(value + 1) }
 end
 p wrap_yield_context { |value| value * 2 }
+def wrap_yield_result
+  capture_yield_context { |value| [:wrapper, yield(value)] }
+end
+p wrap_yield_result { |value| [:yielded, value] }
+class YieldingReplacementHash < Hash
+  def initialize
+    super() { |object, key| [:replacement, yield(key)] }
+  end
+end
+p YieldingReplacementHash.new { |key| [:yielded, key] }[:key]
 hash[:present] = :value
 hash.send(:initialize) { |object, key| [object.class, key.to_s] }
 p [hash[:present], hash[:missing]]
