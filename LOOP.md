@@ -5490,3 +5490,22 @@ All nine RSS cases (class ivar 1.05x), the complete OpenSSL lifetime gate,
 root/dead/duplicate-definition checks and bracket depth 892/1024 pass.
 Rounds 6 and 7 are PR #98, stacked on #94; none of the three PRs is merged
 while the latest-main full CI and per-file comparison are pending.
+
+### PR #98 review: conversion does not require argument reflection
+
+The review found that asking the argument for method(:respond_to?) rejects
+a valid to_int object that undefines or overrides Kernel#method. The native
+ObjectSpace __id_integer arm now reads existing method metadata and calls
+through the existing dispatcher. It preserves private and dynamic conversion,
+one-argument respond_to? overrides, refusal, errors and result type checks;
+it does not call the argument's method, class, is_a? or __send__ methods.
+
+The BasicObject control exposed another dependency: scanning snapshot
+candidates through their object_id failed just because a BasicObject was
+present. Ordinary object IDs now resolve from the real obj_cls store, and
+the fallback compares existing native identity metadata. Witness 681 adds
+the review's missing-method case, reflection traps, BasicObject and held
+Class identity. It passes on Ruby and the O2 candidate; the prior binary
+fails the new missing-method case. Sixteen conversion controls have identical
+reference/candidate output. Witnesses 682/683 and root/dead/duplicate gates
+also pass; bracket depth remains 892/1024. The full comparison is rerun.
