@@ -1,0 +1,800 @@
+// The native ISeq compiler's back end (note 552 §11): what
+// lib/iseq_compiler_ext.rb does to a sequence once its instructions are
+// built -- compile.c's iseq_optimize (the peephole rules, the specialised
+// instructions, operand unification), the trace events onto their
+// instructions, the stack depth, the layout -- and the sequence as #to_a
+// shows it to the VM's loader.
+//
+// The Ruby there walks an Array by index; here an element knows its
+// neighbours, so "the element after" is ic_next and "the instruction after"
+// ic_next_insn, and one that was taken out has no neighbours (ic_linked).
+import "m_ic_core.mere";
+
+// (is e an instruction of this name -- an end of the list, a label, a
+//  trace are not)
+let ic_is = fn cx -> fn (e: int) -> fn (s: str) -> e >= 0 && ic_kind cx e == 0 && str_eq (ic_name cx e) s;
+let ic_is2 = fn cx -> fn (e: int) -> fn (a: str) -> fn (b: str) -> ic_is cx e a || ic_is cx e b;
+let ic_linked = fn cx -> fn (e: int) -> ic_prev cx e >= 0;
+let ic_op0 = fn cx -> fn (e: int) -> match ic_ops cx e with | Cons (o, _) -> o | Nil -> ONum (0 - 1);
+let ic_op1 = fn cx -> fn (e: int) -> match ic_ops cx e with | Cons (_, Cons (o, _)) -> o | _ -> ONum (0 - 1);
+let ic_num = fn (o: IcOp) -> match o with | ONum k -> k | _ -> 0 - 1;
+let ic_lab_of = fn (o: IcOp) -> match o with | OLab l -> l | _ -> 0 - 1;
+// (a new instruction of no node the compiler itself puts in)
+let ic_mk = fn cx -> fn (name: str) -> fn (ops: IcOp list) -> fn (line: int) -> fn (node: int) -> ic_e_new cx 0 name ops line node;
+
+// the instruction a label is before (dest_index): -1 when there is none
+let ic_dest = fn cx -> fn (l: int) -> if l < 0 || ic_prev cx l < 0 then 0 - 1 else ic_next_insn cx l;
+// the trace events just before an instruction, past labels: nearest first
+let ic_traces_before = fn cx -> fn (d: int) ->
+  let rec go = fn (j: int) ->
+    if ic_kind cx j == 2 then Cons (ic_events cx j, go (ic_prev cx j))
+    else if ic_kind cx j == 1 then go (ic_prev cx j)
+    else (Nil : int list) in
+  go (ic_prev cx d);
+let rec ic_any_line = fn (xs: int list) -> match xs with | Nil -> false | Cons (b, t) -> if b == 1 then true else ic_any_line t;
+
+let ic_call_simple = fn (o: IcOp) -> match o with | OCall (_, flag, _, _, _) -> bit_and flag 16 != 0 | _ -> false;
+let ic_call_argc = fn (o: IcOp) -> match o with | OCall (_, _, argc, _, _) -> argc | _ -> 0 - 1;
+let ic_call_mid = fn (o: IcOp) -> match o with | OCall (mid, _, _, _, _) -> mid | _ -> "";
+let ic_call_flag = fn (o: IcOp) -> match o with | OCall (_, flag, _, _, _) -> flag | _ -> 0;
+// (is_frozen_putstring and its like: a string pushed as it is)
+let ic_string_push = fn cx -> fn (e: int) ->
+  e >= 0 && ic_kind cx e == 0
+  && (str_eq (ic_name cx e) "putstring" || str_eq (ic_name cx e) "putchilledstring"
+      || (str_eq (ic_name cx e) "putobject" && (match ic_op0 cx e with | OVal (IvStr (_, _)) -> true | _ -> false)));
+// (the same local at the same level)
+let ic_same_local = fn cx -> fn (a: int) -> fn (b: int) ->
+  (match (ic_op0 cx a, ic_op0 cx b) with
+   | (OLoc (_, _, x), OLoc (_, _, y)) -> x == y
+   | _ -> false)
+  && ic_num (ic_op1 cx a) == ic_num (ic_op1 cx b);
+// insn_has_label_before: a label some jump still names, between it and the
+// instruction before
+let ic_label_before = fn cx -> fn (e: int) ->
+  let rec go = fn (k: int) ->
+    if k < 0 || ic_kind cx k == 0 || ic_kind cx k == 9 then false
+    else if ic_kind cx k == 1 && ic_refs cx k > 0 then true
+    else go (ic_prev cx k) in
+  go (ic_prev cx e);
+// (a send of freeze, simple, with no arguments and no block)
+let ic_freeze_send = fn cx -> fn (e: int) ->
+  ic_is cx e "send"
+  && (let cd = ic_op0 cx e in
+      ic_call_simple cd && ic_call_argc cd == 0 && str_eq (ic_call_mid cd) "freeze"
+      && (match ic_op1 cx e with | OSeq s -> s < 0 | _ -> false));
+
+// compile.c's remove_unreachable_chunk: from `first`, up to a label some
+// jump from outside still reaches. Was anything taken out?
+let ic_remove_unreachable = fn cx -> fn (first: int) ->
+  if first < 0 || ic_is_end cx first then false
+  else
+    region ICRU {
+      let counts = map_new () in
+      let cnt = fn (l: int) -> if map_has counts l then map_get counts l else 0 in
+      // (the labels an instruction names counted; is `pending` reached by
+      //  them all now)
+      let rec count_ops = fn (ops: IcOp list) -> fn (pending: int) ->
+        (match ops with
+         | Nil -> pending
+         | Cons (OLab l, t) ->
+           (let c = cnt l + 1 in
+            let _ = map_set counts l c in
+            count_ops t (if l == pending && ic_refs cx l <= c then 0 - 1 else pending))
+         | Cons (_, t) -> count_ops t pending) in
+      // answers (go on?, last): the walk's `return false` is (false, _)
+      let rec walk = fn (j: int) -> fn (last: int) -> fn (pending: int) -> fn (pend_end: int) ->
+        if ic_is_end cx j then (true, last, pending, pend_end)
+        else
+          (let k = ic_kind cx j in
+           if k == 0 then
+             (if str_eq (ic_name cx j) "leave" then (true, (if pending >= 0 then last else j), pending, pend_end)
+              else
+                (let p2 = count_ops (ic_ops cx j) pending in
+                 walk (ic_next cx j) (if p2 >= 0 then last else j) p2 pend_end))
+           else if k == 1 then
+             (if ic_unremovable cx j then (pending >= 0, last, pending, pend_end)
+              else if ic_refs cx j > cnt j then
+                (if pending >= 0 then (true, last, pending, pend_end)
+                 else walk (ic_next cx j) last j (if j == first then 0 - 1 else last))
+              else walk (ic_next cx j) last pending pend_end)
+           else if k == 3 then (pending >= 0, last, pending, pend_end)
+           else walk (ic_next cx j) (if pending >= 0 then last else j) pending pend_end) in
+      let (ok, last0, pending, pend_end) = walk first (0 - 1) (0 - 1) (0 - 1) in
+      let last = (if pending >= 0 then pend_end else last0) in
+      if (if ok then false else true) || last < 0 then false
+      else
+        // (every element of the chunk goes, its labels too; an instruction's
+        //  labels are let go of, and leave the list when nothing else names
+        //  them)
+        (let rec del = fn (k: int) -> fn (insns: int list) ->
+           (let nx = ic_next cx k in
+            let ins2 = (if ic_kind cx k == 0 then Cons (k, insns) else insns) in
+            let _ = ic_unlink cx k in
+            if k == last then ins2 else del nx ins2) in
+         let removed = del first Nil in
+         let _ = list_iter (ic_rev removed) (fn (x: int) -> ic_drop_ops cx (ic_ops cx x)) in
+         true)
+    };
+
+// (an instruction that only pushes, which a `pop` straight after undoes)
+let ic_pop_silent = fn (s: str) ->
+  str_eq s "putobject" || str_eq s "putnil" || str_eq s "putself" || str_eq s "putstring" || str_eq s "putchilledstring"
+  || str_eq s "dup" || str_eq s "getlocal" || str_eq s "getblockparam" || str_eq s "getblockparamproxy"
+  || str_eq s "getinstancevariable" || str_eq s "duparray";
+
+// What a peephole rule answers: -2 the rules again on the instruction
+// (`goto again`), -1 nothing more, or -- it took the instruction out -- the
+// element to go on from.
+let ic_again = fn (u: unit) -> 0 - 2;
+let ic_none = fn (u: unit) -> 0 - 1;
+
+// compile.c's rules for a branch: one to a jump goes where the jump goes
+// (not past a line event); one on a value known before it runs is a jump or
+// nothing
+let ic_peephole_branch = fn cx -> fn (e: int) ->
+  let d = ic_dest cx (ic_lab_of (ic_op0 cx e)) in
+  if d < 0 || ic_any_line (ic_traces_before cx d) then ic_none ()
+  else
+    (let p0 = ic_prev cx e in
+     let pobj = (if ic_kind cx p0 == 0 then p0 else 0 - 1) in
+     let prev_dup = pobj >= 0 && str_eq (ic_name cx pobj) "dup" in
+     let rec go = fn (nobj: int) ->
+       if ic_is cx nobj "jump" then
+         (if ic_retarget cx e (ic_lab_of (ic_op0 cx nobj)) then more nobj else ic_none ())
+       else if prev_dup && ic_is cx nobj "dup" && ic_is cx (ic_next cx nobj) (ic_name cx e) then
+         (let nx = ic_next cx nobj in
+          if ic_retarget cx e (ic_lab_of (ic_op0 cx nx)) then more nx else ic_none ())
+       else if pobj >= 0 then
+         (let p2 = ic_prev cx pobj in
+          let pp = (if prev_dup && ic_kind cx p2 == 0 then p2 else pobj) in
+          let ppn = ic_name cx pp in
+          let en = ic_name cx e in
+          // (0 the value is not known, 1 it branches, 2 it does not)
+          let cond =
+            (if str_eq ppn "putobject" then
+               (let f = (match ic_op0 cx pp with | OVal IvFalse -> true | _ -> false) in
+                if str_eq en "branchif" then (if f then 2 else 1)
+                else if str_eq en "branchunless" then (if f then 1 else 2)
+                else 2)
+             else if str_eq ppn "putstring" || str_eq ppn "duparray" || str_eq ppn "newarray" then (if str_eq en "branchif" then 1 else 2)
+             else if str_eq ppn "putnil" then (if str_eq en "branchif" then 2 else 1)
+             else 0) in
+          if cond == 0 then ic_none ()
+          else
+            (let _ =
+               (if prev_dup || (if str_eq ppn "newarray" then false else true) then ic_unlink cx (ic_prev cx e)
+                else
+                  // (iseq_pop_newarray: an empty one goes, a one-element one
+                  //  leaves its element to a pop, a longer one is adjuststack)
+                  (let k = ic_num (ic_op0 cx pp) in
+                   if k == 0 then ic_unlink cx pp
+                   else if k == 1 then
+                     (let np = ic_mk cx "pop" Nil (ic_eline cx pp) (ic_enode cx pp) in
+                      let _ = ic_ins_before cx pp np in
+                      ic_unlink cx pp)
+                   else ic_set_name cx pp "adjuststack")) in
+             if cond == 1 then
+               (let _ = (if prev_dup then ic_ins_after cx e (ic_mk cx "putnil" Nil (ic_eline cx pp) (ic_enode cx pp)) else ()) in
+                let _ = ic_set_name cx e "jump" in
+                ic_again ())
+             else
+               (let nx = ic_next cx e in
+                let _ = ic_unlink cx e in
+                let _ = ic_drop_ops cx (ic_ops cx e) in
+                nx)))
+       else ic_none ()
+     and more = fn (nobj: int) ->
+       (let nd = ic_dest cx (ic_lab_of (ic_op0 cx nobj)) in
+        if nd < 0 || ic_kind cx nd != 0 then ic_none () else go nd) in
+     go d);
+
+// compile.c's iseq_peephole_optimize: its rules in its order, several of
+// them on one instruction (not the tail call, which this compiler refuses,
+// nor opt_invokebuiltin_delegate, which it never emits)
+let rec ic_peephole = fn cx -> fn (u: int) -> fn (e: int) ->
+  if ic_is cx e "jump" then
+    (let target = ic_lab_of (ic_op0 cx e) in
+     let d = ic_dest cx target in
+     let nx = ic_next_insn cx e in
+     if d >= 0 && d == nx then
+       (let after = ic_next cx e in
+        let _ = ic_unlink cx e in
+        let _ = ic_drop_ops cx (ic_ops cx e) in
+        after)
+     else if ic_is cx d "jump" && ic_lab_of (ic_op0 cx d) != target
+             && (match ic_traces_before cx d with | Nil -> true | _ -> false) then
+       (let _ = ic_retarget cx e (ic_lab_of (ic_op0 cx d)) in
+        let _ = ic_remove_unreachable cx (ic_next cx e) in
+        ic_again ())
+     else if ic_is cx d "leave" then
+       // (it takes the leave's insn_info, the events get_destination_insn
+       //  gave it included)
+       (let ts = ic_traces_before cx d in
+        let _ = ic_drop_ops cx (ic_ops cx e) in
+        let _ = ic_set_name cx e "leave" in
+        let _ = ic_set_ops cx e Nil in
+        let _ = ic_e_set cx e 3 (ic_eline cx d) in
+        let _ = ic_e_set cx e 4 (ic_enode cx d) in
+        // (the traces before the leave, in their order, before this one)
+        let rec put = fn (ts: int list) ->
+          (match ts with
+           | Nil -> ()
+           | Cons (b, t) ->
+             (let _ = put t in
+              let tr = ic_e_new cx 2 "" Nil 0 0 in
+              let _ = ic_e_set cx tr 5 b in
+              ic_ins_before cx e tr)) in
+        let _ = put ts in
+        ic_again ())
+     else
+       // (the element just before must be the branch itself -- not past a
+       //  trace event or a label: compile.c's IS_INSN(iobj->link.prev))
+       (let pi = (let p = ic_prev cx e in if p >= 0 && ic_kind cx p == 0 then p else 0 - 1) in
+        let done =
+          (if pi >= 0 && (ic_is cx pi "branchif" || ic_is cx pi "branchunless") then
+             (let pd = ic_dest cx (ic_lab_of (ic_op0 cx pi)) in
+              if nx >= 0 && pd == nx then
+                (let la = ic_next cx pi in
+                 let refcnt = (if ic_kind cx la == 1 then ic_refs cx la else 0) in
+                 let _ = ic_set_name cx pi (if str_eq (ic_name cx pi) "branchif" then "branchunless" else "branchif") in
+                 // (the jump goes without its label being let go of: the
+                 //  branch names it now, and compile.c does not count the
+                 //  jump off)
+                 if ic_retarget cx pi target && refcnt <= 1 then
+                   (let after = ic_next cx e in
+                    let _ = ic_unlink cx e in
+                    after)
+                 // (the jump stays where it is: go on with it)
+                 else 0 - 3)
+              else
+                (let _ =
+                   (if d >= 0 && pd == d then
+                      // (a branch to where the jump goes anyway is a pop, at
+                      //  the jump's place -- its label still counted, as
+                      //  compile.c's ELEM_REPLACE leaves it)
+                      (let np = ic_mk cx "pop" Nil (ic_eline cx e) (ic_enode cx e) in
+                       let _ = ic_ins_before cx pi np in
+                       ic_unlink cx pi)
+                    else ()) in
+                 0 - 4))
+           else 0 - 4) in
+        if done == 0 - 4 then (if ic_remove_unreachable cx (ic_next cx e) then ic_again () else ic_none ())
+        else if done == 0 - 3 then ic_none ()
+        else done))
+  else
+    (let _ =
+       // (two strings, frozen, and a newrange of them are the range itself,
+       //  when no jump lands between)
+       (if ic_is cx e "newrange" then
+          (let ei = ic_prev_insn cx e in
+           let bi = (if ei >= 0 then ic_prev_insn cx ei else 0 - 1) in
+           if bi >= 0 && ic_string_push cx ei && ic_string_push cx bi
+              && (if ic_label_before cx bi then false else true) && (if ic_label_before cx ei then false else true) then
+             (match (ic_op0 cx bi, ic_op0 cx ei) with
+              | (OVal a, OVal b) ->
+                (let excl = ic_num (ic_op0 cx e) == 1 in
+                 let _ = ic_unlink cx ei in
+                 let _ = ic_unlink cx bi in
+                 let _ = ic_set_name cx e "putobject" in
+                 ic_set_ops cx e (Cons (OVal (IvRng (a, b, excl)), Nil)))
+              | _ -> ())
+           else ())
+        else ()) in
+     let _ = (if ic_is cx e "leave" then (let _ = ic_remove_unreachable cx (ic_next cx e) in ()) else ()) in
+     // (an array concatarray / concattoarray only reads needs no copy)
+     let _ = (if ic_is cx e "duparray" && ic_is2 cx (ic_next cx e) "concatarray" "concattoarray" then ic_set_name cx e "putobject" else ()) in
+     // (a literal array or hash, or an empty one, sent freeze is
+     //  opt_ary_freeze / opt_hash_freeze of it, the send's calldata kept)
+     let _ =
+       (let en = ic_name cx e in
+        if (str_eq en "duparray" || str_eq en "duphash"
+            || ((str_eq en "newarray" || str_eq en "newhash") && ic_num (ic_op0 cx e) == 0))
+           && ic_freeze_send cx (ic_next cx e) then
+          (let obj = (if str_eq en "duparray" || str_eq en "duphash" then ic_op0 cx e
+                      else if str_eq en "newarray" then OVal (IvArr Nil) else OVal (IvHsh Nil)) in
+           let s = ic_next cx e in
+           let _ = ic_set_name cx e (if str_eq en "duparray" || str_eq en "newarray" then "opt_ary_freeze" else "opt_hash_freeze") in
+           let _ = ic_set_ops cx e (Cons (obj, Cons (ic_op0 cx s, Nil))) in
+           ic_unlink cx s)
+        else ()) in
+     let en = ic_name cx e in
+     if str_eq en "branchif" || str_eq en "branchunless" || str_eq en "branchnil" then ic_peephole_branch cx e
+     else ic_peephole2 cx u e);
+
+// (the rules from `pop` on)
+let ic_peephole2 = fn cx -> fn (u: int) -> fn (e: int) ->
+  let pe = ic_prev cx e in
+  let popr =
+    (if ic_is cx e "pop" && ic_kind cx pe == 0 then
+       (let pn = ic_name cx pe in
+        if ic_pop_silent pn then
+          (let after = ic_next cx e in
+           let _ = ic_unlink cx e in
+           let _ = ic_unlink cx pe in
+           after)
+        else if str_eq pn "newarray" then
+          // (iseq_pop_newarray: none -- nothing; one -- the pop stays;
+          //  more -- adjuststack)
+          (let k = ic_num (ic_op0 cx pe) in
+           if k == 0 then
+             (let after = ic_next cx e in
+              let _ = ic_unlink cx e in
+              let _ = ic_unlink cx pe in
+              after)
+           // (compile.c goes on past the pop: it is not looked at again)
+           else if k == 1 then (let _ = ic_unlink cx pe in 0 - 3)
+           else
+             (let _ = ic_set_name cx pe "adjuststack" in
+              let after = ic_next cx e in
+              let _ = ic_unlink cx e in
+              after))
+        else if str_eq pn "concatarray" then
+          // (the two arrays are only popped: the one on top is still
+          //  splatted, as concatarray would)
+          (let _ = ic_ins_before cx pe (ic_mk cx "splatarray" (Cons (OVal IvFalse, Nil)) (ic_eline cx pe) (ic_enode cx pe)) in
+           let _ = ic_set_name cx pe "pop" in
+           0 - 3)
+        else if str_eq pn "concatstrings" then
+          (if ic_num (ic_op0 cx pe) == 1 then (let _ = ic_unlink cx pe in 0 - 3)
+           else
+             (let after = ic_next cx e in
+              let _ = ic_unlink cx e in
+              let _ = ic_set_name cx pe "adjuststack" in
+              after))
+        else 0 - 4)
+     else 0 - 4) in
+  if popr == 0 - 3 then ic_none ()
+  else if popr != 0 - 4 then popr
+  else
+    (let en0 = ic_name cx e in
+     // (an instruction that always pushes an array needs no splatarray)
+     let _ = (if (str_eq en0 "newarray" || str_eq en0 "duparray" || str_eq en0 "concatarray" || str_eq en0 "splatarray")
+                 && ic_is cx (ic_next cx e) "splatarray" then ic_unlink cx (ic_next cx e) else ()) in
+     // (an array built only to be taken apart again: the values as they
+     //  are -- swapped, reversed, the extra popped, the missing nil)
+     let _ =
+       (let nx = ic_next cx e in
+        if ic_is cx e "newarray" && ic_is cx nx "expandarray" && ic_num (ic_op1 cx nx) == 0 then
+          (let x = ic_num (ic_op0 cx e) in
+           let y = ic_num (ic_op0 cx nx) in
+           let _ = ic_unlink cx nx in
+           if x == y then
+             (if x == 2 then (let _ = ic_set_name cx e "swap" in ic_set_ops cx e Nil)
+              else ic_set_name cx e "opt_reverse")
+           else
+             (let _ = ic_set_name cx e "opt_reverse" in
+              let _ = ic_set_ops cx e (Cons (ONum y, Nil)) in
+              let filler = (if x > y then "pop" else "putnil") in
+              let rec fill = fn (k: int) ->
+                if k <= 0 then ()
+                else (let _ = ic_ins_before cx e (ic_mk cx filler Nil (ic_eline cx e) (ic_enode cx e)) in fill (k - 1)) in
+              fill (if x > y then x - y else y - x)))
+        else ()) in
+     // (a literal array expandarray only reads needs no copy)
+     let _ = (if ic_is cx e "duparray" && ic_is cx (ic_next cx e) "expandarray" then ic_set_name cx e "putobject" else ()) in
+     // (concatstrings of one string is that string)
+     let _ = (if ic_is cx e "anytostring" && ic_is cx (ic_next cx e) "concatstrings" && ic_num (ic_op0 cx (ic_next cx e)) == 1
+              then ic_unlink cx (ic_next cx e) else ()) in
+     // (an empty string adds nothing to a concatstrings)
+     if ic_string_push cx e && ic_is cx (ic_next cx e) "concatstrings"
+        && (match ic_op0 cx e with | OVal (IvStr (s, _)) -> str_len s == 0 | _ -> false) then
+       (let nx = ic_next cx e in
+        let k = ic_num (ic_op0 cx nx) - 1 in
+        let _ = ic_set_ops cx nx (Cons (ONum k, Nil)) in
+        let _ = (if k == 1 then ic_unlink cx nx else ()) in
+        let after = ic_next cx e in
+        let _ = ic_unlink cx e in
+        after)
+     else ic_peephole3 cx u e);
+
+// (the rules from concatstrings on)
+let ic_peephole3 = fn cx -> fn (u: int) -> fn (e: int) ->
+  // (concatstrings of a concatstrings, straight after it or past a jump, is
+  //  one: the jump then lands after the second)
+  let _ =
+    (if ic_is cx e "concatstrings" then
+       (let k0 = ic_next cx e in
+        let jmp = (if ic_is cx k0 "jump" then k0 else 0 - 1) in
+        let k = (if jmp >= 0 then ic_dest cx (ic_lab_of (ic_op0 cx jmp)) else k0) in
+        if ic_is cx k "concatstrings" then
+          (let _ = ic_set_ops cx e (Cons (ONum (ic_num (ic_op0 cx e) + ic_num (ic_op0 cx k) - 1), Nil)) in
+           if jmp >= 0 then
+             (let l0 = ic_lab_of (ic_op0 cx jmp) in
+              let _ = ic_unref cx l0 in
+              let l =
+                (if ic_refs cx l0 == 0 then (let _ = ic_unlink cx l0 in l0)
+                 else (let l2 = ic_new_label cx u in let _ = ic_set_ops cx jmp (Cons (OLab l2, Nil)) in l2)) in
+              let _ = ic_ref cx l in
+              let _ = ic_ins_after cx k l in
+              let ni = ic_next_insn cx jmp in
+              if ni >= 0 && ic_kind cx ni == 0 then
+                (let rec again = fn (x: unit) ->
+                   if ic_peephole cx u ni == ic_again () && ic_linked cx ni then again () else () in
+                 again ())
+              else ())
+           else ic_unlink cx k)
+        else ())
+     else ()) in
+  let n1 = ic_next cx e in
+  let r1 =
+    (if ic_is cx e "dup" && ic_is cx n1 "setlocal" then
+       (let n2 = ic_next cx n1 in
+        if ic_is cx n2 "setlocal" then
+          // (dup, setlocal x, setlocal x: the setlocal once)
+          (if ic_same_local cx n1 n2 then
+             (let _ = ic_unlink cx n1 in
+              let _ = ic_unlink cx e in
+              n2)
+           else 0 - 1)
+        else
+          (let n3 = (if n2 >= 0 && ic_kind cx n2 != 9 then ic_next cx n2 else 0 - 1) in
+           // (dup, setlocal x, dup, setlocal x: the first pair once)
+           let _ = (if ic_is cx n2 "dup" && ic_is cx n3 "setlocal" && ic_same_local cx n1 n3 then
+                      (let _ = ic_unlink cx n3 in ic_unlink cx n2)
+                    else ()) in
+           0 - 1))
+     else 0 - 1) in
+  if r1 >= 0 then r1
+  else
+    (let r2 =
+       // (getlocal x, a dup or not, setlocal x: the value is there already)
+       (if ic_is cx e "getlocal" then
+          (let nx = ic_next cx e in
+           let n = (if ic_is cx nx "dup" then nx else e) in
+           let s = ic_next cx n in
+           if ic_is cx s "setlocal" && ic_same_local cx e s then
+             (let after = ic_next cx s in
+              let _ = ic_unlink cx s in
+              let _ = ic_unlink cx n in
+              if n == e then after else 0 - 1)
+           else 0 - 1)
+        else 0 - 1) in
+     if r2 >= 0 then r2
+     else
+       // (a block parameter only tested needs no Proc)
+       (let _ = (if ic_is cx e "getblockparam" && ic_is2 cx (ic_next cx e) "branchif" "branchunless"
+                 then ic_set_name cx e "getblockparamproxy" else ()) in
+        // (f(*a, k: 1) and f(*a, k: 1, &b): the keywords' hash is the
+        //  literal itself, which the callee may not change -- no KW_SPLAT_MUT)
+        let _ =
+          (let h = ic_next cx e in
+           if ic_is cx e "splatarray" && (match ic_op0 cx e with | OVal IvFalse -> true | _ -> false) && ic_is cx h "duphash" then
+             (let a2 = ic_next cx h in
+              let a3 = (if a2 >= 0 && ic_kind cx a2 != 9 then ic_next cx a2 else 0 - 1) in
+              // (CALL_ARGS_SPLAT 1, BLOCKARG 2, KW_SPLAT 64, KW_SPLAT_MUT 2048)
+              let (s, set, unset) =
+                (if ic_is cx a2 "send" then (a2, 1 + 64 + 2048, 2)
+                 else if (ic_is cx a2 "getlocal" || ic_is cx a2 "getinstancevariable" || ic_is cx a2 "getblockparamproxy")
+                         && ic_is cx a3 "send" then (a3, 1 + 64 + 2048 + 2, 0)
+                 else (0 - 1, 0, 0)) in
+              if s >= 0 then
+                (match ic_ops cx s with
+                 | Cons (OCall (mid, flag, argc, kws, has), rest) ->
+                   if bit_and flag set == set && bit_and flag unset == 0 then
+                     (let _ = ic_set_name cx h "putobject" in
+                      ic_set_ops cx s (Cons (OCall (mid, flag - 2048, argc, kws, has), rest)))
+                   else ()
+                 | _ -> ())
+              else ())
+           else ()) in
+        ic_none ()));
+
+// (the send of a simple include? with one argument, past simple sends
+//  without arguments from k on; -1 if there is none)
+let rec ic_include_send = fn cx -> fn (k: int) ->
+  let cd = ic_op0 cx k in
+  if ic_call_simple cd && ic_call_argc cd == 0 && ic_is cx (ic_next cx k) "send" then ic_include_send cx (ic_next cx k)
+  else if ic_call_simple cd && ic_call_argc cd == 1 && str_eq (ic_call_mid cd) "include?" then k
+  else 0 - 1;
+
+// opt_* that a simple send with this many arguments becomes
+// (compile.c's iseq_specialized_instruction): "" for none
+let ic_special = fn (argc: int) -> fn (m: str) ->
+  if argc == 0 then
+    (if str_eq m "length" then "opt_length" else if str_eq m "size" then "opt_size"
+     else if str_eq m "empty?" then "opt_empty_p" else if str_eq m "nil?" then "opt_nil_p"
+     else if str_eq m "succ" then "opt_succ" else if str_eq m "!" then "opt_not" else "")
+  else if argc == 1 then
+    (if str_eq m "+" then "opt_plus" else if str_eq m "-" then "opt_minus" else if str_eq m "*" then "opt_mult"
+     else if str_eq m "/" then "opt_div" else if str_eq m "%" then "opt_mod" else if str_eq m "==" then "opt_eq"
+     else if str_eq m "!=" then "opt_neq" else if str_eq m "=~" then "opt_regexpmatch2" else if str_eq m "<" then "opt_lt"
+     else if str_eq m "<=" then "opt_le" else if str_eq m ">" then "opt_gt" else if str_eq m ">=" then "opt_ge"
+     else if str_eq m "<<" then "opt_ltlt" else if str_eq m "[]" then "opt_aref" else if str_eq m "&" then "opt_and"
+     else if str_eq m "|" then "opt_or" else "")
+  else if argc == 2 then (if str_eq m "[]=" then "opt_aset" else "")
+  else "";
+
+// compile.c's iseq_specialized_instruction: an array built only to be asked
+// max / min / hash / pack / include? is opt_newarray_send, a literal one
+// asked include? opt_duparray_send; a simple send is one of the opt_* the VM
+// answers for the builtin classes, a send with no block
+// opt_send_without_block
+let ic_specialize = fn cx -> fn (e: int) ->
+  let ni = ic_next cx e in
+  let n2 = (if ni >= 0 && ic_kind cx ni != 9 then ic_next cx ni else 0 - 1) in
+  let n3 = (if n2 >= 0 && ic_kind cx n2 != 9 then ic_next cx n2 else 0 - 1) in
+  let cnt = ic_num (ic_op0 cx e) in
+  let done =
+    (if ic_is cx e "newarray" && ni >= 0 && ic_kind cx ni == 0 then
+       (let d1 =
+          (if ic_is cx ni "send" then
+             (let cd = ic_op0 cx ni in
+              let m = ic_call_mid cd in
+              // (NEWARRAY_SEND: max 1, min 2, hash 3)
+              let k = (if str_eq m "max" then 1 else if str_eq m "min" then 2 else if str_eq m "hash" then 3 else 0) in
+              if ic_call_simple cd && ic_call_argc cd == 0 && k > 0 then
+                (let _ = ic_set_name cx e "opt_newarray_send" in
+                 let _ = ic_set_ops cx e (Cons (ONum cnt, Cons (ONum k, Nil))) in
+                 let _ = ic_unlink cx ni in
+                 true)
+              else false)
+           else if ic_string_push cx ni && ic_is cx n2 "send" then
+             (let cd = ic_op0 cx n2 in
+              if ic_call_simple cd && ic_call_argc cd == 1 && str_eq (ic_call_mid cd) "pack" then
+                // (it goes after the format, in the send's place: PACK 4)
+                (let _ = ic_set_name cx e "opt_newarray_send" in
+                 let _ = ic_set_ops cx e (Cons (ONum (cnt + 1), Cons (ONum 4, Nil))) in
+                 let _ = ic_unlink cx n2 in
+                 let _ = ic_unlink cx e in
+                 let _ = ic_ins_after cx ni e in
+                 true)
+              else false)
+           else if ic_string_push cx ni && ic_is cx n2 "getlocal" && ic_is cx n3 "send" then
+             (match ic_op0 cx n3 with
+              | OCall (mid, _, argc, Cons (kw, Nil), true) when str_eq mid "pack" && argc == 2 && str_eq kw "buffer" ->
+                // (after the format and the buffer: PACK_BUFFER 5)
+                (let _ = ic_set_name cx e "opt_newarray_send" in
+                 let _ = ic_set_ops cx e (Cons (ONum (cnt + 2), Cons (ONum 5, Nil))) in
+                 let _ = ic_unlink cx n3 in
+                 let _ = ic_unlink cx e in
+                 let _ = ic_ins_after cx n2 e in
+                 true)
+              | _ -> false)
+           else false) in
+        if d1 then true
+        // (include? is looked for apart from those: its argument, then any
+        //  simple calls on it without arguments, then the send: INCLUDE_P 6)
+        else if (ic_is cx ni "putstring" || ic_is cx ni "putchilledstring" || ic_is cx ni "putobject" || ic_is cx ni "putself"
+                 || ic_is cx ni "getlocal" || ic_is cx ni "getinstancevariable")
+                && ic_is cx n2 "send" && ic_include_send cx n2 >= 0 then
+          (let s = ic_include_send cx n2 in
+           let _ = ic_set_name cx s "opt_newarray_send" in
+           let _ = ic_set_ops cx s (Cons (ONum (cnt + 1), Cons (ONum 6, Nil))) in
+           let _ = ic_unlink cx e in
+           true)
+        else false)
+     else if ic_is cx e "duparray" && (ic_is cx ni "getlocal" || ic_is cx ni "getinstancevariable" || ic_is cx ni "putself")
+             && ic_is cx n2 "send" && ic_include_send cx n2 >= 0 then
+       (let s = ic_include_send cx n2 in
+        let _ = ic_set_name cx s "opt_duparray_send" in
+        let _ = ic_set_ops cx s (Cons (ic_op0 cx e, Cons (OVal (IvSym ("include?", "US-ASCII")), Cons (ONum 1, Nil)))) in
+        let _ = ic_unlink cx e in
+        true)
+     else false) in
+  if done || (if ic_is cx e "send" then false else true) then ()
+  else
+    (let cd = ic_op0 cx e in
+     let noblk = (match ic_op1 cx e with | OSeq s -> s < 0 | _ -> true) in
+     let sp = (if ic_call_simple cd then ic_special (ic_call_argc cd) (ic_call_mid cd) else "") in
+     if str_len sp > 0 then
+       // (insn_set_specialized_instruction: opt_neq carries a calldata for
+       //  the == it may ask first; each is a C call to tracing: c_call 32,
+       //  c_return 64)
+       (let _ = ic_set_name cx e sp in
+        let _ = ic_set_ops cx e (if str_eq sp "opt_neq" then Cons (OCall ("==", 16, 1, Nil, false), Cons (cd, Nil)) else Cons (cd, Nil)) in
+        ic_e_set cx e 5 (bit_or (ic_events cx e) 96))
+     // (no block argument 2, no forwarding 8192)
+     else if bit_and (ic_call_flag cd) (2 + 8192) == 0 && noblk then
+       (let _ = ic_set_name cx e "opt_send_without_block" in
+        ic_set_ops cx e (Cons (cd, Nil)))
+     else ());
+
+// operand unification (defs/opt_operand.def)
+let ic_unify = fn cx -> fn (e: int) ->
+  let en = ic_name cx e in
+  if str_eq en "getlocal" || str_eq en "setlocal" then
+    (let lv = ic_num (ic_op1 cx e) in
+     if lv == 0 || lv == 1 then
+       (let _ = ic_set_name cx e (en ++ "_WC_" ++ str_of_int lv) in
+        ic_set_ops cx e (Cons (ic_op0 cx e, Nil)))
+     else ())
+  else if str_eq en "putobject" then
+    (match ic_op0 cx e with
+     | OVal (IvInt k) when k == 0 || k == 1 ->
+       (let _ = ic_set_name cx e ("putobject_INT2FIX_" ++ str_of_int k ++ "_") in
+        ic_set_ops cx e Nil)
+     | _ -> ())
+  else ();
+
+// compile.c's iseq_optimize: each instruction in turn gets the peephole
+// rules, then its specialised instruction, then operand unification -- so a
+// rule looking back sees what came before already specialised and unified,
+// and one looking ahead sees it as it was built. (One a rule took out goes
+// on with what followed it; one a rule moved goes on from its new place.)
+let ic_optimize = fn cx -> fn (u: int) ->
+  let rec go = fn (e: int) ->
+    if e < 0 || ic_is_end cx e then ()
+    // (one taken out, met through a stale next: on past it)
+    else if ic_kind cx e != 0 || ic_prev cx e < 0 then go (ic_next cx e)
+    else
+      (let nx0 = ic_next cx e in
+       let rec rules = fn (x: unit) ->
+         (let r = ic_peephole cx u e in
+          if r == ic_again () && ic_linked cx e then rules () else r) in
+       let r = rules () in
+       if (if ic_linked cx e then false else true) then go (if r >= 0 then r else nx0)
+       else
+         (let nx1 = ic_next cx e in
+          let _ = ic_specialize cx e in
+          if (if ic_linked cx e then false else true) then go nx1
+          else (let _ = ic_unify cx e in go (ic_next cx e)))) in
+  go (ic_first cx (ic_u_elements cx u));
+
+// iseq_optimize's block optimisation: a block's leading nop goes when it is
+// the block's first instruction, no throw is in the block and no jump goes
+// back to the label after it
+let ic_drop_block_nop = fn cx -> fn (u: int) ->
+  let nop = ic_u_block_nop cx u in
+  if nop < 0 || (if ic_linked cx nop then false else true) then ()
+  else
+    (let p = ic_prev cx nop in
+     // (exactly one element before it)
+     if ic_is_end cx p || (if ic_is_end cx (ic_prev cx p) then false else true) then ()
+     else
+       (let a = ic_next cx nop in
+        let after = (if ic_kind cx a == 1 then a else 0 - 1) in
+        let rec names = fn (ops: IcOp list) ->
+          (match ops with | Nil -> false | Cons (OLab l, t) -> if l == after then true else names t | Cons (_, t) -> names t) in
+        let rec blocked = fn (e: int) ->
+          if ic_is_end cx e then false
+          else if ic_kind cx e == 0 && (str_eq (ic_name cx e) "throw" || (after >= 0 && names (ic_ops cx e))) then true
+          else blocked (ic_next cx e) in
+        if blocked (ic_first cx (ic_u_elements cx u)) then () else ic_unlink cx nop));
+
+// iseq_insert_nop_between_end_and_cont: a rescue / ensure entry whose end
+// runs straight into its continuation gets a nop between (line 0, no node)
+let ic_nop_between = fn cx -> fn (u: int) ->
+  let rec each = fn (cs: (int * int * int * int * int) list) ->
+    (match cs with
+     | Nil -> ()
+     | Cons ((ty, _, le, _, lc), t) ->
+       (let _ = each t in
+        if ty >= 4 || (if ic_linked cx le then false else true) then ()
+        else
+          (let rec look = fn (j: int) ->
+             if ic_kind cx j == 1 || ic_kind cx j == 2 then
+               (if j == lc then ic_ins_after cx le (ic_mk cx "nop" Nil 0 (0 - 1)) else look (ic_next cx j))
+             else () in
+           look le))) in
+  each (ic_u_catch cx u);
+
+// (each trace's event goes to the instruction after it)
+let ic_attach_traces = fn cx -> fn (u: int) ->
+  let rec go = fn (e: int) -> fn (pend: int) ->
+    if ic_is_end cx e then ()
+    else
+      (let nx = ic_next cx e in
+       if ic_kind cx e == 2 then (let b = ic_events cx e in let _ = ic_unlink cx e in go nx (bit_or pend b))
+       else if ic_kind cx e == 0 then (let _ = ic_e_set cx e 5 (bit_or pend (ic_events cx e)) in go nx 0)
+       else go nx pend) in
+  go (ic_first cx (ic_u_elements cx u)) 0;
+
+// how many values an instruction takes and leaves
+let ic_stack_effect = fn cx -> fn (e: int) ->
+  let s = ic_name cx e in
+  let a = ic_num (ic_op0 cx e) in
+  let sendish = fn (u: unit) ->
+    // (sp_inc_of_sendish: a block argument or the forwarded `...` is one more)
+    (let cd = ic_op0 cx e in
+     (ic_call_argc cd + 1 + (if bit_and (ic_call_flag cd) (2 + 8192) != 0 then 1 else 0), 1)) in
+  if str_eq s "putnil" || str_eq s "putself" || str_eq s "putobject" || str_eq s "putchilledstring" || str_eq s "putstring"
+     || str_eq s "duparray" || str_eq s "getlocal" || str_eq s "getlocal_WC_0" || str_eq s "getlocal_WC_1"
+     || str_eq s "putobject_INT2FIX_0_" || str_eq s "putobject_INT2FIX_1_" then (0, 1)
+  else if str_eq s "setlocal" || str_eq s "setlocal_WC_0" || str_eq s "setlocal_WC_1" || str_eq s "pop"
+          || str_eq s "branchif" || str_eq s "branchunless" || str_eq s "leave" then (1, 0)
+  else if str_eq s "dup" then (1, 2)
+  else if str_eq s "newarray" then (a, 1)
+  else if str_eq s "opt_send_without_block" || str_eq s "send" || str_eq s "invokesuper" || str_eq s "sendforward"
+          || str_eq s "invokesuperforward" then sendish ()
+  else if str_eq s "splatkw" then (2, 2)
+  else if str_eq s "pushtoarraykwsplat" then (2, 1)
+  else if str_eq s "dupn" then (a, a * 2)
+  else if str_eq s "checktype" then (1, 1)
+  else if str_eq s "once" then (0, 1)
+  else if str_eq s "checkkeyword" || str_eq s "getspecial" || str_eq s "getclassvariable" then (0, 1)
+  else if str_eq s "setclassvariable" || str_eq s "setspecial" then (1, 0)
+  else if str_eq s "toregexp" then (ic_num (ic_op1 cx e), 1)
+  else if str_eq s "definemethod" || str_eq s "jump" then (0, 0)
+  else if str_eq s "definesmethod" then (1, 0)
+  else if str_eq s "getblockparam" then (0, 1)
+  else if str_eq s "setblockparam" then (1, 0)
+  else if str_eq s "nop" || str_eq s "opt_new" then (0, 0)
+  else if str_eq s "swap" then (2, 2)
+  else if str_eq s "setn" then (1, 1)
+  else if str_eq s "getblockparamproxy" || str_eq s "opt_str_freeze" || str_eq s "opt_str_uminus" then (0, 1)
+  else if str_eq s "splatarray" then (1, 1)
+  else if str_eq s "pushtoarray" then (a + 1, 1)
+  else if str_eq s "expandarray" then (1, a + bit_and (ic_num (ic_op1 cx e)) 1)
+  else if str_eq s "concatarray" || str_eq s "concattoarray" then (2, 1)
+  else if str_eq s "intern" then (1, 1)
+  else if str_eq s "getinstancevariable" || str_eq s "getglobal" || str_eq s "opt_getconstant_path" || str_eq s "putspecialobject"
+          || str_eq s "duphash" || str_eq s "invokeblock_dummy" then (0, 1)
+  else if str_eq s "setinstancevariable" || str_eq s "setglobal" then (1, 0)
+  else if str_eq s "setconstant" then (2, 0)
+  else if str_eq s "getconstant" then (2, 1)
+  else if str_eq s "defined" then (1, 1)
+  else if str_eq s "definedivar" then (0, 1)
+  else if str_eq s "throw" then (1, 1)
+  else if str_eq s "objtostring" then (1, 1)
+  else if str_eq s "anytostring" then (2, 1)
+  else if str_eq s "concatstrings" || str_eq s "newhash" then (a, 1)
+  else if str_eq s "newrange" then (2, 1)
+  else if str_eq s "invokeblock" then (ic_call_argc (ic_op0 cx e), 1)
+  else if str_eq s "defineclass" then (2, 1)
+  else if str_eq s "adjuststack" then (a, 0)
+  else if str_eq s "topn" then (0, 1)
+  else if str_eq s "opt_case_dispatch" || str_eq s "branchnil" then (1, 0)
+  else if str_eq s "checkmatch" then (2, 1)
+  else if str_eq s "opt_ary_freeze" || str_eq s "opt_hash_freeze" then (0, 1)
+  else if str_eq s "opt_newarray_send" then (a, 1)
+  else if str_eq s "opt_duparray_send" then (ic_num (match ic_ops cx e with | Cons (_, Cons (_, Cons (o, _))) -> o | _ -> ONum 0), 1)
+  else if str_eq s "opt_reverse" then (a, a)
+  else if str_len s > 4 && str_eq (substring s 0 4) "opt_" then (ic_call_argc (ic_op0 cx e) + 1, 1)
+  else (0, 0);
+
+// compile.c's fix_sp_depth: a label's depth is the first jump's to it, an
+// adjust goes back to its label's -- and is the `pop` / `adjuststack` that
+// lowers the stack there, unless it only restores the depth
+let ic_stack_max = fn cx -> fn (u: int) ->
+  let rec mark = fn (ops: IcOp list) -> fn (sp: int) ->
+    (match ops with
+     | Nil -> ()
+     | Cons (OLab l, t) -> (let _ = (if ic_sp cx l < 0 then ic_e_set cx l 8 sp else ()) in mark t sp)
+     | Cons (_, t) -> mark t sp) in
+  let rec go = fn (e: int) -> fn (sp: int) -> fn (max: int) ->
+    if ic_is_end cx e then max
+    else
+      (let nx = ic_next cx e in
+       let k = ic_kind cx e in
+       if k == 1 then
+         (if ic_sp cx e < 0 then (let _ = ic_e_set cx e 8 sp in go nx sp max) else go nx (ic_sp cx e) max)
+       else if k == 3 then
+         (let l = ic_lab_of (ic_op0 cx e) in
+          let to = (if l >= 0 && ic_sp cx l >= 0 then ic_sp cx l else 0) in
+          let _ = (if ic_eflag cx e == 0 && sp - to > 0 then
+                     // (an instruction the layout makes is of no node: -1)
+                     ic_ins_before cx e (ic_mk cx (if sp - to == 1 then "pop" else "adjuststack")
+                                                 (if sp - to == 1 then Nil else Cons (ONum (sp - to), Nil)) (ic_eline cx e) (0 - 1))
+                   else ()) in
+          let _ = ic_unlink cx e in
+          go nx to max)
+       else if k == 0 then
+         (let (pop, push) = ic_stack_effect cx e in
+          let sp2 = sp - pop + push in
+          let _ = mark (ic_ops cx e) sp2 in
+          go nx sp2 (if sp2 > max then sp2 else max))
+       else go nx sp max) in
+  go (ic_first cx (ic_u_elements cx u)) 0 0;
+
+// finish: the sequence optimised, its events on their instructions, its
+// stack depth known and its labels' positions set
+let ic_finish = fn cx -> fn (u: int) ->
+  let _ = ic_optimize cx u in
+  let _ = ic_drop_block_nop cx u in
+  let _ = ic_nop_between cx u in
+  // (update_catch_except_flags: a throw may be caught around here; an entry
+  //  other than break / next / redo catches an exception)
+  let rec any_throw = fn (e: int) ->
+    if ic_is_end cx e then false else if ic_is cx e "throw" then true else any_throw (ic_next cx e) in
+  let _ = (if any_throw (ic_first cx (ic_u_elements cx u)) then ic_set_catch_except cx u else ()) in
+  let rec any_exc = fn (cs: (int * int * int * int * int) list) ->
+    (match cs with | Nil -> false | Cons ((ty, _, _, _, _), t) -> if ty <= 3 then true else any_exc t) in
+  let _ = (if any_exc (ic_u_catch cx u) then ic_u_set cx u 17 1 else ()) in
+  let _ = ic_attach_traces cx u in
+  let _ = ic_u_set cx u 10 (ic_stack_max cx u) in
+  let rec lay = fn (e: int) -> fn (pos: int) ->
+    if ic_is_end cx e then ()
+    else if ic_kind cx e == 1 then (let _ = ic_e_set cx e 6 pos in lay (ic_next cx e) pos)
+    else if ic_kind cx e == 0 then lay (ic_next cx e) (pos + 1 + ic_llen (ic_ops cx e))
+    else lay (ic_next cx e) pos in
+  lay (ic_first cx (ic_u_elements cx u)) 0;
