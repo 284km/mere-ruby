@@ -5728,3 +5728,62 @@ Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
 alone the same as ruby both ways, and different on the previous build);
 vm_check 245 / 245; gates; test_coverage 46 / 46 and test_delegate 37 / 37
 on both.
+
+## 2026-11-17 (81): the VM's own work per call -- what a method call and a block on a receiver paid that the evaluator does not
+
+**The point.** Profiled side by side (fib, a block reading a local of its
+frame, a method call in a loop), the call machinery the two share --
+call_method, binding, the body's bookkeeping -- costs the same on both;
+what the VM adds is its own layers around it. Five of them were work no
+call needed:
+
+- **a tail call readied on every send.** vm_tail_call wrote the callee's
+  name into a map (a copy of the string) before each call. Until a send
+  marked VM_CALL_TAILCALL is loaded (vm_cd notes it; ruby marks none unless
+  tailcall_optimization is on) no frame can leave for one, and the call is
+  made with nothing readied; once one is, the name is written only when it
+  changes.
+- **the receiver bound as a hidden local** by vm_call_in before the
+  receiverless door (`fib(n - 1)`), which passes values: it is bound after.
+- **a block on a receiver made in a scope of the frame.** `a.each { |x| s
+  += x }` went through vm_scoped, and the scope was the block's env: every
+  name the block read or wrote of the frame, and its `$~` home, was looked
+  up through one env more. Such a call (positional values, a literal block,
+  not `new`, no TracePoint) is now EMethodB's arm past its written receiver
+  and arguments, in the frame itself (vm_blk_send).
+- **a region of the frame's own for a method's or a block's body**, which
+  already runs in the region its call made (MCALL, BLK). What the frame
+  leaves is still copied out of the stack's arena before the slot goes back
+  -- a :return hook's frame takes the slot next and may wind the arena --
+  by a region around that value alone (VMR). Rescue, ensure, top and class
+  bodies keep theirs.
+- **the tree's id written into every method frame's env** (`__vm~p`). A
+  method whose program has no block in it makes nothing that can run the
+  tree after the frame is left; while the frame runs, its pool slot names
+  the program (regs' slot 13), and the collector now marks the tree from
+  there. The `__vm~re` lookup of a re-entered Continuation is asked only
+  once one is in use (cont_on).
+
+Corpus 691 is the witness: blocks on receivers (the frame's locals, `$~`,
+break / next, a block-local name, the Symbol shape, a private method,
+Struct.new), a Proc from a removed method, a :return hook that runs Ruby
+while a method's value is on its way, and a method from a file of its own
+removed while its frame waits in a Fiber, then a collection -- which stopped
+the VM run where the Fiber went on, built without the pool slot's mark.
+
+Measured (local, the least of 7 runs each, interleaved, this machine under
+other load): fib(24) on the VM 0.208 s -> 0.195 s (the evaluator 0.172);
+`(1..200_000).to_a.each { |x| s += x }` 0.176 -> 0.165 (0.141); 200,000
+calls of a two-argument method in a while loop 0.568 -> 0.548 (0.562). The
+VM is still 1.13x the evaluator on fib and 1.17x on the block: what is left
+is its per-instruction stack (every value pushed is copied into the stack's
+arena) and the frame's own entry (the pool slot, try_or, vm_step's
+statement start), against the evaluator's walk of the same expression.
+
+Checked (local): corpus 698 / 698 on the evaluator; under MERE_RUBY_VM=1
+688 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates.
+Under MERE_RUBY_VM=1, previous build against this one: test_proc,
+test_iterator, test_optimization, test_settracefunc, test_method,
+test_regexp, test_enumerator, test_fiber, test_hash the same counts;
+test_array MATCH 473 on both (one test that fails on the reference too
+moves between RED and BOTH from run to run, on either build).
