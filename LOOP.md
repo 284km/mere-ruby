@@ -5509,3 +5509,22 @@ Class identity. It passes on Ruby and the O2 candidate; the prior binary
 fails the new missing-method case. Sixteen conversion controls have identical
 reference/candidate output. Witnesses 682/683 and root/dead/duplicate gates
 also pass; bracket depth remains 892/1024. The full comparison is rerun.
+
+### PR #98 follow-up: checked method_missing conversion
+
+A further review found that a custom method_missing can supply to_int
+without advertising it through respond_to_missing?. The ObjectSpace native
+conversion arm now distinguishes an explicit query refusal from the absence
+of an advertised method. It tries custom missing-method dispatch, preserves
+explicit refusals and promised-method exceptions, and treats an unadvertised
+NoMethodError as a declined conversion. A tagged result distinguishes a
+successful nil return from a missing method. The caller's exception context
+is restored before reporting refusal. Query arity errors match Ruby's
+checked-call entry. No shared conversion helper or VM function is changed.
+
+Witness 681 covers Object/BasicObject proxies without an advertisement,
+refusal, nil results, query arity and collection inside conversion. It agrees
+with Ruby and fails on the prior binary. Existing witnesses 682/683 and 30
+comparison outputs (16 prior conversions, 12 new conversions and two exception
+context checks) agree too. Roots/dead/duplicate checks and depth 892/1024 pass.
+The complete upstream comparison and both corpus modes are rerun.
