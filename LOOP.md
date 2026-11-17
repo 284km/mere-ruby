@@ -5688,3 +5688,7 @@ The AST and VM changes are imported unchanged; there are no independent
 edits to m_state or the AST/Prism implementation. Corpus namespace auditing
 found overlapping publication numbers. This branch moves its native
 ObjectSpace snapshot witness from 683 to 685, retaining the upstream cases.
+
+The follow-up store witness moves from its original publication number 680
+to 686. The upstream AST/Proc witness at 680 is retained unchanged. Earlier
+progress entries use their publication numbers; this records the mapping.

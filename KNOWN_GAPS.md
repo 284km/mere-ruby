@@ -53,7 +53,7 @@ the same class filtering and identities. With those stores now enumerated,
 the inherited Ruby memsize_of_all loop allocates enough temporary Strings
 that its subsequent String-only sum can exceed its earlier all-object sum.
 That assertion remains a native allocator handoff, without invented byte
-counts or an exclusion. Witnesses 674 and 680 cover the actual store APIs.
+counts or an exclusion. Witnesses 674 and 686 cover the actual store APIs.
 
 The full-file comparison also exposed an Enumerable timeout from repeatedly
 enumerating Arrays. Native snapshot iteration now filters candidates before
