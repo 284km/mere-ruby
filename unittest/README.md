@@ -486,6 +486,11 @@ runner crosses them.
 - build-linux's Module check: `TestModule#test_complemented_method_entry_memory_leak`
   takes 5.5-8.5 s and has 10 s (`upstream_leak_seconds`). A slow runner gives
   10.04 s, a Timeout, and the job fails. Rerun the job.
+- ...and the same test in `ruby/test_module.rb` itself is an RSS ratio
+  (after 300,000 more refinement classes against after 1,000) bounded by
+  2.0: 1.74-1.82 locally on main 392bf810 and on PR #89's branch alike, and
+  2.30 once on a macOS runner (78.6 MB -> 180.5 MB, PR #89's last run), the
+  run before it passing. Rerun its shard.
 - `ruby/enc/test_case_comprehensive.rb` takes 360-400 s of its 600; one run
   took 616 s (WALL_LIMIT, all 422 tests RED) while the run's median file was
   at 0.98 of main's. Rerun its shard.
