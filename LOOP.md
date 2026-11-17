@@ -5750,3 +5750,18 @@ assertion and every Proc pays. corpus 680.
 - Checked: corpus 694 of 694, and with MERE_RUBY_BLK_ID_CHECK,
   MERE_RUBY_ATTR_IC_CHECK and MERE_RUBY_IVAR_INDEX_CHECK on; test_ast's
   individual tests 114 as the reference; the gates.
+
+### Integrate the AST main and keep corpus numbers unique
+
+Main 392bf810 integrates #86. Its main CI 44030304378 is still pending;
+successful PR CI 43985122856 tested source 0031da3a, whose tree is identical
+to this main, and retains the same 157 target RED. This supplements the last
+successful main baseline 96075af9 rather than claiming a completed main run.
+The AST and VM changes are imported unchanged; there are no independent
+edits to m_state or the AST/Prism implementation. Corpus namespace auditing
+found overlapping publication numbers. This branch moves its native
+ObjectSpace snapshot witness from 683 to 685, retaining the upstream cases.
+
+The follow-up store witness moves from its original publication number 680
+to 686. The upstream AST/Proc witness at 680 is retained unchanged. Earlier
+progress entries use their publication numbers; this records the mapping.

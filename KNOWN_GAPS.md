@@ -2,8 +2,11 @@
 
 ## Stage 9: alternate collector policy and remaining GC observations
 
-Latest baseline main 96075af9, CI run 43933582689: 157 RED across allocation,
-objspace, gc, gc_compact and string_memory. The original 159-case inventory
+Integrated main 392bf810; its main CI 44030304378 is pending. The last
+successful main CI 43933582689 (96075af9) has 157 target RED across allocation,
+objspace, gc, gc_compact and string_memory. The source-equivalent successful
+AST PR CI 43985122856 also has 157 target RED; it is not a completed main CI.
+The original 159-case inventory
 retains two finalizer cases now passing on main after #87; they are not new
 stage 9 gains. `unittest/excludes-gc/` records
 individual default-GC slot/page/generation/compaction/internal-layout tests,
@@ -50,14 +53,14 @@ the same class filtering and identities. With those stores now enumerated,
 the inherited Ruby memsize_of_all loop allocates enough temporary Strings
 that its subsequent String-only sum can exceed its earlier all-object sum.
 That assertion remains a native allocator handoff, without invented byte
-counts or an exclusion. Witnesses 674 and 680 cover the actual store APIs.
+counts or an exclusion. Witnesses 674 and 686 cover the actual store APIs.
 
 The full-file comparison also exposed an Enumerable timeout from repeatedly
 enumerating Arrays. Native snapshot iteration now filters candidates before
 yielding, avoids temporary Ruby snapshot Arrays, and scopes its buffers and
 callback turns. Candidates are rooted in the existing method frame, with
 normal/exception cleanup; the standard builtin frame bounds callback
-watermarks. The original bound remains ten seconds. Witness 683 covers
+watermarks. The original bound remains ten seconds. Witness 685 covers
 collection, nested enumeration, control flow and Fiber suspension.
 
 Divergences from CRuby that are understood, reproduced, and deliberately
