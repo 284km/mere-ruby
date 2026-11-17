@@ -61,6 +61,10 @@ if [ -n "${UNITTEST_REF_EXT_PATH:-}" ]; then
   ref_lib="$UNITTEST_REF_EXT_PATH:$ref_lib"
 fi
 mere_lib="$src/tool/lib:$src/test:$shim:$stdlib"
+# (the test extensions built against mere-ruby's ruby.h: tools/capi_ext_build.py)
+if [ -n "${UNITTEST_MERE_EXT_PATH:-}" ]; then
+  mere_lib="$UNITTEST_MERE_EXT_PATH:$mere_lib"
+fi
 set -- "$@"
 extra=""
 case "$rel" in
