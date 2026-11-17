@@ -52,7 +52,20 @@ with tempfile.TemporaryDirectory(prefix='mere-math-glue-') as folder:
 program="STDOUT.binmode; a=[-0.0,0.0,1.0,-1.0,12.7,-12.7]; u=[0.1,-0.1,0.3,-0.3,1.3,-1.3,1e-100,-1e-100]; STDOUT.write(a.product(u).flat_map { |b,s| b.step(s>0 ? Float::INFINITY : -Float::INFINITY,s).take(12) }.pack('G*'))"
 expected = subprocess.run([args.reference, '-e', program], capture_output=True, check=True, timeout=30)
 actual = subprocess.run([str(args.binary.resolve()), '-e', program], capture_output=True, check=True, timeout=30)
-assert actual.stdout == expected.stdout, 'step rounding differs from reference target'
+if actual.stdout != expected.stdout:
+    differences = [(index, left.hex(), right.hex())
+                   for index, (left, right) in enumerate(zip(
+                       [expected.stdout[i:i+8] for i in range(0, len(expected.stdout), 8)],
+                       [actual.stdout[i:i+8] for i in range(0, len(actual.stdout), 8)]))
+                   if left != right]
+    configuration = subprocess.run([args.reference, '-rrbconfig', '-e',
+        "p RbConfig::CONFIG.values_at('arch', 'CC', 'CFLAGS', 'configure_args')"],
+        capture_output=True, check=True, timeout=30)
+    raise AssertionError(
+        f'step rounding differs from reference target; platform={platform.platform()}; '
+        f'lengths(reference, actual)={(len(expected.stdout), len(actual.stdout))}; '
+        f'first differing doubles(index, reference, actual)={differences[:8]}; '
+        f'reference build={configuration.stdout.decode(errors="replace").strip()}')
 print('Float#step:576 bit-exact pipeline comparisons including signed zero passed')
 
 # Infinite bounds bypass the count helper. Exercise finite, inclusive and
