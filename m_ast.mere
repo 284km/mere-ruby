@@ -242,7 +242,43 @@ let rec skip_blank = fn (i: int) ->
   if c == 32 || c == 9 then skip_blank (i + 1) else i;
 
 // ---- the walk ------------------------------------------------------------------
-let tr = fn (n: int) -> if n == 0 then 0 else ast_tr_node n;
+// A heredoc's body and its terminator line, as the lexer reads them when it
+// meets the line end after the opener (ao_hd): where the body starts -- its
+// first text, or the terminator when there is none -- and where the
+// terminator line ends.
+let hd_note = fn (n: int) ->
+  let pair = (if pm_is n (pm_t_string ()) then (pm_string_content_loc_s n, pm_string_closing_loc_e n)
+              else if pm_is n (pm_t_xstring ()) then (pm_xstring_content_loc_s n, pm_xstring_closing_loc_e n)
+              else if pm_is n (pm_t_interpolated_string ()) then
+                (let ps = pm_interpolated_string_parts n in
+                 ((if pm_ls_len ps > 0 then pm_start (pm_ls_at ps 0) else pm_interpolated_string_closing_loc_s n),
+                  pm_interpolated_string_closing_loc_e n))
+              else if pm_is n (pm_t_interpolated_xstring ()) then
+                (let ps = pm_interpolated_xstring_parts n in
+                 ((if pm_ls_len ps > 0 then pm_start (pm_ls_at ps 0) else pm_interpolated_xstring_closing_loc_s n),
+                  pm_interpolated_xstring_closing_loc_e n))
+              else (0 - 1, 0 - 1)) in
+  let (bs, ce) = pair in
+  if bs >= 0 && ce >= 0 then (let _ = vec_push ao_hd bs in let _ = vec_push ao_hd ce in ()) else ();
+// (from the start of a line, `k`: past the bodies of the heredocs that start
+//  there, one after another -- what the lexer reads before it looks at the
+//  line again)
+let rec hd_skip = fn (k: int) ->
+  let rec find = fn (i: int) ->
+    if i + 1 >= vec_len ao_hd then 0 - 1
+    else if vec_get ao_hd i == k then vec_get ao_hd (i + 1)
+    else find (i + 2) in
+  if vec_len ao_hd == 0 then k
+  else (let ce = find 0 in if ce > k then hd_skip ce else k);
+let tr = fn (n: int) ->
+  if n == 0 then 0
+  else
+    (let e = pm_end n in
+     // (a percent literal closed by a line end: ao_nl_end)
+     let _ = (if pm_byte (pm_start n) == 37 && e > 0 && pm_byte (e - 1) == 10 then vec_push ao_nlc e else ()) in
+     // (a heredoc: hd_skip)
+     let _ = (if pm_byte (pm_start n) == 60 && pm_byte (pm_start n + 1) == 60 then hd_note n else ()) in
+     ast_tr_node n);
 let tr_unknown = fn (n: int) -> n0 (nt_error ()) (pm_start n) (pm_end n);
 
 // stmts: stmt_or_begin | stmts terms stmt_or_begin, each through
@@ -713,7 +749,8 @@ let rec regx_has_property = fn (src: str) -> fn (i: int) ->
 let tr_regx = fn (ty: int) -> fn (n: int) -> fn (src: str) -> fn (os: int) -> fn (oe: int) -> fn (cs: int) -> fn (ce: int) ->
   let r = n1 ty (pm_start n) (pm_end n) (regx_lit n src) in
   // (a MATCH -- the REGX of a condition -- answers only its own location)
-  if ty == nt_match () then r else a_xloc r [os, oe, oe, tok_end cs, cs, ce];
+  // (`%r\nfoo\n`: the opening and the closing each end on their line end's line)
+  if ty == nt_match () then r else a_xloc r [os, tok_end oe, tok_end oe, tok_end cs, cs, tok_end ce];
 // (where a text token that ends at offset `e` ends: one whose last byte is a
 //  newline ends on that newline's line, in the column past it)
 let tok_end = fn (e: int) ->
@@ -1388,13 +1425,25 @@ let tr_class = fn (n: int) ->
 // newline included, and looks at the next line; comment lines after it are
 // read the same way, so the token is the column past the newline on the
 // LAST of those lines. When the program ends there, no newline token is
-// placed and the last comment's own start is what the grammar sees.
+// placed and the last comment's own start is what the grammar sees -- but
+// when the line after it holds only blanks and the program ends on it with
+// no newline, the token is that line's start.
+//   When the lines after it are the bodies of heredocs the line opened, the
+// lexer reads them first: the program ending after them is the program
+// ending there, and otherwise the token is on the last of their lines, in
+// the column past the comment line's newline.
 let rec nl_after_comment = fn (i: int) ->
   let k = ast_line_end_from i in
-  if pm_byte k < 0 || pm_byte (k + 1) < 0 then i
+  let k1 = (if pm_byte k < 0 then k + 1 else hd_skip (k + 1)) in
+  if pm_byte k < 0 || pm_byte k1 < 0 then i
+  else if k1 != k + 1 then
+    (let j = skip_blank k1 in
+     if pm_byte j == 35 then nl_after_comment j
+     else pos_lc (ao_line_of (k1 - 1)) (k - vec_get pm_lo (ao_line_of k) + 1))
   else
     (let j = skip_blank (k + 1) in
      if pm_byte j == 35 then nl_after_comment j
+     else if pm_byte j < 0 then k + 1
      else pos_lc (ao_line_of k) (k - vec_get pm_lo (ao_line_of k) + 1));
 // (the offset of the newline that ends the line `i` is on; the program's
 //  length when there is none)
@@ -1566,11 +1615,18 @@ let stmts_end = fn (sn: int) -> fn (dflt: int) ->
   else if dflt < 1099511627776 then skip_semis dflt
   else dflt;
 let stmts_end_of = fn (sn: int) -> fn (dflt: int) ->
-  if sn == 0 || pm_ls_len (pm_statements_body sn) == 0 then dflt else skip_terms (pm_end sn);
+  if sn == 0 || pm_ls_len (pm_statements_body sn) == 0 then dflt
+  else
+    (let t = skip_terms (pm_end sn) in
+     // (the last statement a percent literal closed by a line end, and a
+     //  line end after it: the term is read, and the end is past it -- the
+     //  next line's start, which ao_nl_end would put back on the literal's)
+     if t == pm_end sn && pm_byte t == 10 && ao_nl_end t != t then pos_lc (ao_line_of t) (t - vec_get pm_lo (ao_line_of t))
+     else t);
 // (past the terms after offset `i`, where a statement ends: a `;` or the
 //  line end, then every `;` after it -- once a term is read the lexer is at
 //  the start of an expression, where line ends and comments are skipped)
-let skip_terms = fn (i: int) ->
+let rec skip_terms = fn (i: int) ->
   let j = skip_blank i in
   let c = pm_byte j in
   if c == 59 then skip_semis (j + 1)
@@ -1579,6 +1635,16 @@ let skip_terms = fn (i: int) ->
                         let k = ast_line_end_from j in
                         let t = skip_semis k in
                         if t == k then p0 else t)
+  // (a `\` before the line end continues the line: the lexer reads past it,
+  //  and past the bodies of heredocs the line opened, and the term is what
+  //  comes after them -- none when the program ends there)
+  else if c == 92 && (pm_byte (j + 1) == 10 || (pm_byte (j + 1) == 13 && pm_byte (j + 2) == 10)) then
+    (let k1 = hd_skip (if pm_byte (j + 1) == 10 then j + 2 else j + 3) in
+     let j2 = skip_blank k1 in
+     let c2 = pm_byte j2 in
+     if c2 == 13 && pm_byte (j2 + 1) == 10 then j2
+     else if c2 == 10 || c2 == 59 || c2 == 35 || c2 == 92 then skip_terms k1
+     else i)
   else i;
 // (past every `;` from offset `i` on, with blanks, line ends and comments
 //  between; `i` itself when there is none)
