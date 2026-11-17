@@ -242,6 +242,44 @@ let rec skip_blank = fn (i: int) ->
   if c == 32 || c == 9 then skip_blank (i + 1) else i;
 
 // ---- the walk ------------------------------------------------------------------
+// What parse.y refuses among arguments written in parentheses or brackets
+// (`foo(...)`, `foo[...]`, `[...]`): a command -- a call with arguments and
+// no parentheses -- given a `do` block, `foo(bar baz do end)`. The lexer
+// reads that `do` as a block's of a command (keyword_do_block), which
+// nothing inside the brackets takes. Also inside a splat and as a keyword
+// argument's value; not inside a `( )` of its own, not a `{ }` block, not a
+// call with no arguments. Prism gives `bar` the block. (as_er)
+let rec cmd_do_check = fn (l: int) ->
+  let rec bad = fn (x: int) ->
+    if pm_is x (pm_t_call ()) then
+      (let b = pm_call_block x in
+       pm_is b (pm_t_block ()) && pm_byte (pm_block_opening_loc_s b) == 100
+       && pm_call_arguments x != 0 && pm_call_opening_loc_s x < 0)
+    else false in
+  let rec go = fn (i: int) ->
+    if i >= pm_ls_len l then ()
+    else
+      (let x = pm_ls_at l i in
+       let _ = (if bad x then
+                  (let b = pm_call_block x in
+                   if vec_len as_er == 0 then vec_push as_er (ast_err_at "syntax error, unexpected 'do' for block" (pm_block_opening_loc_s b) (pm_block_opening_loc_e b)) else ())
+                else if pm_is x (pm_t_splat ()) && pm_splat_expression x != 0 && bad (pm_splat_expression x) then
+                  (let b = pm_call_block (pm_splat_expression x) in
+                   if vec_len as_er == 0 then vec_push as_er (ast_err_at "syntax error, unexpected 'do' for block" (pm_block_opening_loc_s b) (pm_block_opening_loc_e b)) else ())
+                else if pm_is x (pm_t_keyword_hash ()) then
+                  (let es = pm_keyword_hash_elements x in
+                   let rec kv = fn (j: int) ->
+                     if j >= pm_ls_len es then ()
+                     else (let a = pm_ls_at es j in
+                           let _ = (if pm_is a (pm_t_assoc ()) && bad (pm_assoc_value a) then
+                                      (let b = pm_call_block (pm_assoc_value a) in
+                                       if vec_len as_er == 0 then vec_push as_er (ast_err_at "syntax error, unexpected 'do' for block" (pm_block_opening_loc_s b) (pm_block_opening_loc_e b)) else ())
+                                    else ()) in
+                           kv (j + 1)) in
+                   kv 0)
+                else ()) in
+       go (i + 1)) in
+  go 0;
 // (the offset of the newline that ends the line `i` is on; the program's
 //  length when there is none)
 let rec ast_line_end_from = fn (i: int) ->
@@ -283,6 +321,12 @@ let tr = fn (n: int) ->
      let _ = (if pm_byte (pm_start n) == 37 && e > 0 && pm_byte (e - 1) == 10 then vec_push ao_nlc e else ()) in
      // (a heredoc: hd_skip)
      let _ = (if pm_byte (pm_start n) == 60 && pm_byte (pm_start n + 1) == 60 then hd_note n else ()) in
+     // (arguments in parentheses or brackets: cmd_do_check)
+     let _ = (if pm_is n (pm_t_call ()) && pm_call_opening_loc_s n >= 0 then
+                (let a = pm_call_arguments n in if a != 0 then cmd_do_check (pm_arguments_arguments a) else ())
+              else if pm_is n (pm_t_array ()) && pm_array_opening_loc_s n >= 0 && pm_byte (pm_array_opening_loc_s n) == 91 then
+                cmd_do_check (pm_array_elements n)
+              else ()) in
      ast_tr_node n);
 let tr_unknown = fn (n: int) -> n0 (nt_error ()) (pm_start n) (pm_end n);
 
@@ -589,15 +633,32 @@ let tr_contents = fn (parts: int) -> fn (hd: int) -> fn (hend: int) ->
        else
          (let v = tr x in
           go (i + 1) (p_literal_concat acc v first_b (pm_end x) false) false)) in
-  go 0 0 false;
-// (is this opener a heredoc's, and is it a `<<~`? 0, 1 or 2. `first`: where
-//  its text starts -- a `<<~` whose first line has no indentation has none
-//  to remove, and the lexer then reads it as it reads a plain one)
-let heredoc_kind = fn (os: int) -> fn (first: int) ->
+  let r = go 0 0 false in
+  // (heredoc_dedent: a `<<~` DSTR whose pieces all joined its head -- a
+  //  literal interpolated, `#{"y"}` -- is a STR)
+  if hd == 2 && r != 0 && a_is r (nt_dstr ()) && a_f r 1 == 0 then n1 (nt_str ()) (a_beg r) (a_end r) (a_f r 0)
+  else r;
+// (is this opener a heredoc's, and is it a `<<~`? 0, 1 or 2. `parts`: its
+//  text -- a `<<~` with a line that has no indentation (the first one, or
+//  any other outside an interpolation, one that starts with `#{` too) has
+//  none to remove, and the lexer then reads it as it reads a plain one)
+let heredoc_kind = fn (os: int) -> fn (parts: int) ->
+  let cnt = pm_ls_len parts in
+  let first = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0 - 1) in
+  let flush = fn (l: int) -> (let c = pm_byte l in c != 32 && c != 9 && c != 10 && c != 13) in
+  // (is offset `l` inside an interpolation -- past its start?)
+  let rec inside = fn (i: int) -> fn (l: int) ->
+    i < cnt && ((let x = pm_ls_at parts i in nott (pm_is x (pm_t_string ())) && pm_start x < l && l < pm_end x) || inside (i + 1) l) in
+  let last = (if cnt > 0 then pm_end (pm_ls_at parts (cnt - 1)) else 0) in
+  let rec any_flush = fn (ln: int) ->
+    if ln >= vec_len pm_lo then false
+    else (let l = vec_get pm_lo ln in
+          if l >= last then false
+          else if flush l && nott (inside 0 l) then true
+          else any_flush (ln + 1)) in
   if os < 0 || pm_byte os != 60 || pm_byte (os + 1) != 60 then 0
   else if pm_byte (os + 2) == 126 then
-    (let c = pm_byte (ast_line_start first) in
-     if first >= 0 && c != 32 && c != 9 && c != 10 then 1 else 2)
+    (if first >= 0 && (flush (ast_line_start first) || any_flush (ao_line_of first + 1)) then 1 else 2)
   else 1;
 // (Prism's parts are all text: what parse.y's lexer read as ONE token,
 //  which a heredoc body after a `\`-continued line splits in Prism only)
@@ -626,7 +687,7 @@ let tr_string1 = fn (n: int) ->
   else
     (let os = pm_interpolated_string_opening_loc_s n in
      let parts = pm_interpolated_string_parts n in
-     let c = tr_contents parts (heredoc_kind os (if pm_ls_len parts > 0 then pm_start (pm_ls_at parts 0) else 0 - 1)) e in
+     let c = tr_contents parts (heredoc_kind os parts) e in
      if c == 0 then n1 (nt_str ()) b e (lit_str "" (src_enc ()))
      else (let _ = a_set_beg c b in
            let _ = a_set_end c e in
@@ -666,7 +727,7 @@ let tr_interpolated_xstring = fn (n: int) ->
   let b = pm_start n in
   let e = pm_end n in
   let xparts = pm_interpolated_xstring_parts n in
-  let c = tr_contents xparts (heredoc_kind (pm_interpolated_xstring_opening_loc_s n) (if pm_ls_len xparts > 0 then pm_start (pm_ls_at xparts 0) else 0 - 1)) e in
+  let c = tr_contents xparts (heredoc_kind (pm_interpolated_xstring_opening_loc_s n) xparts) e in
   if c == 0 then n1 (nt_xstr ()) b e (lit_str "" (src_enc ()))
   else if a_is c (nt_str ()) then (let _ = a_set_ty c (nt_xstr ()) in let _ = a_set_beg c b in let _ = a_set_end c e in c)
   else if a_is c (nt_dstr ()) then (let _ = a_set_ty c (nt_dxstr ()) in let _ = a_set_beg c b in let _ = a_set_end c e in c)
@@ -781,7 +842,10 @@ let tr_regx = fn (ty: int) -> fn (n: int) -> fn (src: str) -> fn (os: int) -> fn
   let r = n1 ty (pm_start n) (pm_end n) (regx_lit n src) in
   // (a MATCH -- the REGX of a condition -- answers only its own location)
   // (`%r\nfoo\n`: the opening and the closing each end on their line end's line)
-  if ty == nt_match () then r else a_xloc r [os, tok_end oe, tok_end oe, tok_end cs, cs, tok_end ce];
+  // (no text, only a heredoc's body between the opening and the closing:
+  //  the text ends where it starts)
+  let te = (if cs > oe && hd_skip oe == cs then tok_end oe else tok_end cs) in
+  if ty == nt_match () then r else a_xloc r [os, tok_end oe, tok_end oe, te, cs, tok_end ce];
 // (where a text token that ends at offset `e` ends: one whose last byte is a
 //  newline ends on that newline's line, in the column past it)
 let tok_end = fn (e: int) ->
@@ -1363,7 +1427,13 @@ let tr_call = fn (n: int) ->
                          && pm_call_arguments recv != 0 && pm_call_opening_loc_s recv < 0 in
      // (primary_value call_op operation2 command_args cmd_brace_block: the same)
      let cmd_brace = recv != 0 && argsn != 0 && ce < 0 && pm_byte (pm_block_opening_loc_s blk) == 123 in
-     let core = tr_call_core n (if on_block_call || cmd_brace then pm_end n else en) in
+     // (primary_value tCOLON2 tCONSTANT brace_block -- `Foo::Bar { }`,
+     //  ruby bug #18878 -- the same)
+     let ms = pm_call_message_loc_s n in
+     let cop = pm_call_call_operator_loc_s n in
+     let colon_const = recv != 0 && argsn == 0 && ce < 0 && cop >= 0 && pm_byte cop == 58 && pm_byte (cop + 1) == 58
+                       && ms >= 0 && pm_byte ms >= 65 && pm_byte ms <= 90 && pm_byte (pm_block_opening_loc_s blk) == 123 in
+     let core = tr_call_core n (if on_block_call || cmd_brace || colon_const then pm_end n else en) in
      tr_iter core blk (pm_start n) (pm_end n))
   else tr_call_core n (pm_end n);
 
