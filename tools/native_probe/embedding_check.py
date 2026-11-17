@@ -62,7 +62,7 @@ def run(name, command, seconds=90, rss_kb=2097152):
 source = (ROOT / 'main.mere').read_text()
 assert source.endswith('exit (run_cli ())\n')
 source = source[:-len('exit (run_cli ())\n')] + '()\n'
-source = re.sub(r'import "(m_[^"]+\.mere)";',
+source = re.sub(r'import "((?:ic/)?m_[^"]+\.mere)";',
                 lambda m: 'import "' + str(ROOT / m[1]) + '";', source)
 source = re.sub(r'import "(mgz/[^"]+\.mere)";',
                 lambda m: 'import "' + str(ROOT / '.mere_modules' / m[1]) + '";', source)
