@@ -9018,6 +9018,9 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   if vec_get atr_on 0 > 0 then run_block_atr world encl theblk argvals
   else run_block1 world encl theblk argvals
 and run_block1 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
+  // The retained builtin's one-dispatch bypass must not reach user code
+  // yielded by that builtin and suppress another receiver's Ruby override.
+  let _ = (if map_len bi_skip > 0 then map_clear bi_skip else ()) in
   if map_has hook_flags "tp" && tp_blk_user world theblk then run_block_tp world encl theblk argvals
   else run_block0 world encl theblk argvals
 // (while allocations are traced: what the block makes is its own method's,
@@ -15076,6 +15079,10 @@ and method_unbind_fields = fn world -> fn (id: int) -> fn method_name_value -> f
                     (if str_eq from mown then owner_value else VClass from) in
           // (...and the definition it holds, not the one the name has now)
           let _ = msnap_carry world id "Method" uid "UnboundMethod" in
+          let _ = (if map_has ivars (str_of_int id ++ "@~m_bi") then
+                     iv_put ivars (str_of_int uid ++ "@~m_bi") (map_get ivars (str_of_int id ++ "@~m_bi")) else ()) in
+          let _ = (if map_has ivars (str_of_int id ++ "@~m_biown") then
+                     iv_put ivars (str_of_int uid ++ "@~m_biown") (map_get ivars (str_of_int id ++ "@~m_biown")) else ()) in
           // (and its owner as it is now: a later remove_method does not move it)
 
           VObj uid
@@ -32543,6 +32550,7 @@ and bi_meth_shadowed = fn world -> fn (id: int) -> fn (mown: str) -> fn (mnm: st
   // (...and Class#allocate held for a class that has none of its own --
   //  Rational's and Complex's are undefined, the C function is not)
   && (prim_user_has world mrecv mnm || bi_priv_over world mrecv mnm || has_meth world own9 mnm
+      || hng_undef_blocked world mrecv mnm
       || (str_eq mnm "allocate" && bi_alloc_zero mrecv)
       || (map_len ref_active > 0 && (if str_eq (refined_impl_for world mrecv mnm) "" then false else true)))
 // ...and the call: an object's builtins are the dispatcher's arms below its
@@ -32564,6 +32572,23 @@ and bi_meth_call = fn env -> fn world -> fn blk -> fn (id: int) -> fn (mnm: str)
   //  (:allocate).bind_call(Rational)` is (0/1), test_uninitialized)
   | (VClass c9, _) when str_eq mnm "allocate" && str_eq c9 "Rational" -> VRat ("0", "1")
   | (VClass c9, _) when str_eq mnm "allocate" && str_eq c9 "Complex" -> VCpx (VInt 0, VInt 0)
+  // A singleton does not make a String into a subclass. The retained String
+  // conversion returns that exact receiver, or a base String for a subclass.
+  | (VStr h9, _) when (str_eq mnm "to_s" || str_eq mnm "to_str") && str_eq (bi_meth_own world id) "String" ->
+    (match args with
+     | Nil ->
+       (let hk9 = hng_key mrecv in
+        let c9 = (if map_has hng_store hk9 then sng_base_cls world (map_get hng_store hk9) else "String") in
+        if str_eq c9 "String" then mrecv else mkstr_e (sget h9) (senc_get h9))
+     | _ -> raise_exc world "ArgumentError"
+              ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)"))
+  // Hash#to_hash ignores a block. Keep the retained native definition on
+  // the plain path; the block iterator fallback walks an Array of pairs.
+  | (VHsh _, (true, _, _, _)) when str_eq mnm "to_hash" ->
+    invoke_val_c env world blk mrecv (bi_meth_name world (bi_meth_own world id) mnm) args false
+  // A hidden iterator alias re-enters ordinary lookup to build its Enumerator.
+  // The retained call must bypass the receiver's tombstone for that dispatch.
+  | (_, (false, _, _, _)) when hng_undef_blocked world mrecv mnm -> skip9 ()
   // (an object's Object / Kernel builtins are what `super` from an override
   //  reaches: super_missing, which never consults the override)
   // (Object#initialize_copy is kernel_copy_hook: the class check and the
@@ -46990,6 +47015,19 @@ and self_user_defines = fn env -> fn world -> fn (name: str) ->
 // program undefs something, so the usual dispatch pays one map_len.
 // a class whose singleton undefined a name it inherits from Class
 // (`class << self; undef_method :new; end`) no longer answers it
+// Module's native name is a super target only while its entry remains ahead
+// of the method frame that requested super, including a prepended wrapper.
+and module_name_super_ahead = fn world -> fn (recv: Val) ->
+  let depth9 = caller_depth () - 1 in
+  if (if map_has fb_env_at depth9 then false else true) then false
+  else
+    (let frame9 = map_get fb_env_at depth9 in
+     let dc9 = (match lv_get frame9 "__defcls" with VClass c9 -> c9 | _ -> "") in
+     let anc9 = ancestors_of world (super_base world recv) in
+     let at9 = (if lv_has frame9 "__defidx" then
+                  (match lv_get frame9 "__defidx" with VInt i9 when i9 >= 0 -> i9 | _ -> idx_in9 anc9 dc9)
+                else idx_in9 anc9 dc9) in
+     at9 >= 0 && idx_in9 anc9 "Module" > at9)
 // A primitive's singleton participates in lookup without becoming its reported
 // ordinary class. dispatch_cls_of intentionally looks past this tag for super.
 and hng_lookup_cls = fn world -> fn (recv: Val) ->
@@ -48762,7 +48800,7 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   match recv with
   // A class/module's override of Module#name reaches the same builtin name
   // value as a direct call; re-dispatch would enter the override again.
-  | VClass c9 when str_eq meth "name" ->
+  | VClass c9 when str_eq meth "name" && module_name_super_ahead world recv ->
     (match args with
      | Nil -> mod_name_val c9
      | _ -> raise_exc world "ArgumentError"
@@ -54892,7 +54930,7 @@ and en_can_buffer = fn world -> fn (id: int) ->
                    | VArr _ -> true | VHsh _ -> true | VStr _ -> true
                    | VRange (VInt _, VInt _, _) -> true
                    | _ -> false) in
-     finite && (if has_meth world (dispatch_cls_of world src) meth then false else true)
+     finite && (if has_meth world (dispatch_cls_of world src) meth || hng_undef_blocked world src meth then false else true)
      && (str_eq meth "each" || str_eq meth "each_with_index" || str_eq meth "each_pair" || str_eq meth "each_key"
          || str_eq meth "each_value" || str_eq meth "each_char" || str_eq meth "each_byte" || str_eq meth "each_line"
          || str_eq meth "each_index" || str_eq meth "reverse_each" || str_eq meth "each_entry"))
@@ -55291,7 +55329,7 @@ and gen1_src = fn world -> fn (id: int) ->
                    && (if prim_user_has world r (if str_eq m "each_line" then "lines" else if str_eq m "each_char" then "chars" else "bytes")
                        then false else true)
        | _ -> false)
-      && (if prim_user_has world r m then false else true))
+      && (if prim_user_has world r m || hng_undef_blocked world r m then false else true))
 // ...and its elements, the first n (all when n < 0), made here rather than
 // by running the source with a collector block: the elements are what the
 // source would yield, and none of these sources does anything else

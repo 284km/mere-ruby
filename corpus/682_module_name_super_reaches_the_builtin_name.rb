@@ -44,3 +44,27 @@ begin
 rescue NoMethodError => error
   p [error.name, error.receiver.equal?(blocked)]
 end
+
+# Replacing Module's own entry leaves no native name above that method.
+class Module
+  alias original_name_for_gem_suite name
+  def name(*args)
+    super
+  end
+end
+begin
+  [GemNamedClass, GemNamedModule].each do |type|
+    begin
+      type.name
+    rescue NoMethodError => error
+      p [error.name, error.args, error.receiver.equal?(type)]
+    end
+  end
+ensure
+  class Module
+    remove_method :name
+    alias name original_name_for_gem_suite
+    remove_method :original_name_for_gem_suite
+  end
+end
+p GemNamedClass.name

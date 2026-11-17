@@ -54,3 +54,54 @@ class << aliased
   undef to_hash
 end
 p [aliased.saved_to_hash.equal?(aliased), aliased.respond_to?(:saved_to_hash)]
+
+# A Method keeps its definition when undef removes ordinary name lookup.
+[[{}, :to_hash, []], [[1, 2], :each, []], ['text', :to_s, []],
+ [proc { |value| value * 2 }, :call, [3]]].each do |object, name, arguments|
+  captured = object.method(name)
+  unbound = captured.unbind
+  object.singleton_class.send(:undef_method, name)
+  p [object.class, object.respond_to?(name)]
+  result = captured.call(*arguments)
+  p [result.class, result.equal?(object)]
+  p result if name == :call
+  if name == :each
+    begin
+      result.to_a
+    rescue NoMethodError => error
+      p [error.name, error.receiver.equal?(object)]
+    end
+    begin
+      result.next
+    rescue NoMethodError => error
+      p [error.name, error.receiver.equal?(object)]
+    end
+  end
+  result = unbound.bind_call(object, *arguments)
+  p [result.class, result.equal?(object)]
+  p result if name == :call
+  result = captured.call(*arguments) { |value| value }
+  p [result.class, result.equal?(object)]
+  p result if name == :call
+  result = unbound.bind_call(object, *arguments) { |value| value }
+  p [result.class, result.equal?(object)]
+  p result if name == :call
+  p captured.call { break :done } if name == :each
+end
+
+source = [1]
+held = source.method(:each)
+source.singleton_class.send(:undef_method, :each)
+other = [2]
+def other.each
+  yield :override
+end
+seen = []
+held.call { other.each { |value| seen << value } }
+p seen
+
+hash = {}
+held = hash.method(:to_hash)
+hash.singleton_class.send(:undef_method, :to_hash)
+observer = TracePoint.new(:c_call) { nil }
+observer.enable { p held.call { :ignored }.equal?(hash) }
