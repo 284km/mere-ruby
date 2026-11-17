@@ -5211,6 +5211,228 @@ different.
   1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
   fallbacks, then the compiler made native, then speed.
 
+## 2026-11-15 (57): RubyVM::AbstractSyntaxTree answers parse.y's tree
+
+The second half of stage 5's second part (note 550 §1, note 551). test_ast
+was 92 RED of 2,664 (main's CI run 43548292351): `parse` answered a SCOPE with
+no children. With this it gives the reference's result here -- 2,664 tests,
+2,633,172 assertions, no failure, no error, the same 13 skips. corpus 660
+(658 and 659 are the VM rounds', #85).
+
+**It did not fit CI's 600 s at first.** CI run 43711089264
+stopped the file at 623.9 s (WALL_LIMIT, 2,416 of its tests named), which
+reads as 0 MATCH where the baseline has 2,559. From that run's log, for all
+850 files: test_all_tokens about 360 s, the two walks over real trees
+(test_ranges, test_not_cared) about 280 s that were 4 s, the rest 26 s --
+about 670 s on a runner that was a tenth faster than the baseline's. The
+estimate made here from instruction counts (1.345 times the baseline's, so
+557 s) was wrong: on the runner the token test took the same time as before
+although it executes 0.85 of the instructions. With the two fast paths
+below (the walks 17% cheaper, measured under test/unit: 141.7e9 -> 117.2e9
+instructions for 200 files) CI run 43736889826 finished the file in 500.3 s
+on a runner as fast as the baseline's: 2,651 MATCH, 0 RED, 13 BOTH, where
+the baseline has 2,559 and 92. The collector's floor (below) takes the walks
+down further; with it, run 43793344878 finished the file in 553.4 s -- 2,651
+MATCH, 0 RED -- on a runner whose other files ran at 0.92 of the
+baseline's time. The same code's instructions here did not change between
+the two (the token test 159.4e9 / 160.3e9, the walks 101.1e9 / 100.5e9), so
+the spread between 500 s and 553 s is the runners'. That leaves 47 s of the
+600 on the slower one, which is thin. What is left, and where it is, is the
+last item.
+
+- **The tree is made from Prism's, in Mere.** libprism's serialized bytes are
+  decoded into flat integer tables (m_prism_dec.mere), translated to
+  parse.y's nodes (m_ast.mere, m_ast_out.mere) and made into Node objects
+  (m_ast_obj.mere) with no line of Ruby run: 9.8 µs a node for
+  `parse_file`, libprism's own parse included. The translation is parse.y's
+  grammar actions replayed -- block_append, list_append, arg_append,
+  new_args, reduce_nodes, literal_concat and the rest under their own names
+  with a `p_` in front, moving locations as they do -- and `#children` is
+  ast.c's node_children. The readers of Prism's fields and the dispatch on a
+  node's type are generated from Prism's `config.yml`
+  (tools/gen_prism_schema.rb nodes -> m_prism_nodes.mere; only the names the
+  sources use are written, the rest being definitions dead_defs refuses).
+- **Checked against the reference's parse.y, node by node.**
+  `tools/ast_on_cruby.rb text` writes the reference's tree a node a line
+  (values by their bytes, with `--locations` the other locations too) and
+  `tools/ast_dump` -- the translation alone, compiled without the
+  interpreter in about a second -- writes this one's; `tools/ast_text_diff.rb`
+  compares. All 850 files test_ast reads agree (1,002,706 lines, locations
+  included); 956 of Prism's 976 fixtures do (5 of the rest are where the
+  reference's own `#children` raises, `::A ||= 1`). Which programs are
+  refused agrees for the 201 tried (break / next / redo / retry / yield /
+  return in every place test_ast puts them, and the like).
+- **A program that does not parse (`error_tolerant: true`).** parse.y and
+  Prism recover differently, and what test_ast pins is translated back: a
+  construct whose `end` never came ends at the last token; something after a
+  whole statement at the top level (`1q`) ends the program there; a missing
+  condition's ERROR is the token the parser was looking at; an `end` that
+  closes a class or module by its indent (parse.y's enforce_keyword_end:
+  `foo.` / `end`) closes it, the statements Prism nested under it going back
+  out one construct at a time; a literal that is no regexp holds nil. Not
+  translated: where parse.y makes the whole statement an ERROR -- the same
+  junk after a statement inside a def, an expression cut off at the end of
+  its line (`a = 1 +`), an unclosed bracket before an `end` -- and the
+  indent rule anywhere but directly in a class or module body.
+- **This interpreter's own parser is no longer the judge of whether the
+  program parses.** `parse` reads the program with it first, for what parse.y
+  says besides the tree -- its warnings (corpus 502 pins them) and a
+  SyntaxError in its wording (corpus 467) -- and that parser refused programs
+  that are fine (a pattern with a range and a guard), which was a
+  SyntaxError out of `parse`. Its error now stands only when the tree's
+  parser refuses the program too. Prism's errors refuse what parse.y refuses;
+  the two it does not report -- a `retry` in an `END { }` inside a rescue, a
+  literal that is no regexp -- are found by the translation, and an error
+  only Prism reports is its text in parse.y's layout (the text, the line, a
+  `^~~` under the place).
+- **Two things that made the tests' own loops slow, found by timing their
+  pieces inside and outside test/unit.**
+  - `#inspect` of an Array or Hash asked pp's cycle table
+    (`Thread.current[:__recursive_key__]`) with four method calls, for every
+    container, once pp.rb had run at all -- and test/unit loads it. An array
+    holding one array: 2.9 µs before pp.rb, 14.4 µs after; now the table is
+    read where Thread#[] keeps it (3.4 µs). test_all_tokens builds two such
+    strings a token, 2.37 million tokens: 296.8 s -> 242.0 s.
+  - An attribute reader called with nothing reads the instance variable
+    where it is, with no frame (2.6 µs -> 1.7 µs). ruby's is a C function
+    too. A TracePoint, set_trace_func, Coverage's method table, a Ractor or
+    a block given take the full path.
+- **Two fast paths for the walks' own code** (after the CI run above), each
+  where ruby has a C function or nothing to look at:
+  - *An attribute read is answered at the dispatcher's door.* `obj.name`
+    with no argument went the whole way a call goes -- the tests by name,
+    the ancestor walk, the visibility walk -- before run_meth_result's arm
+    read the slot: 12,900 instructions. The first time, for a class directly
+    under Object, the whole way is gone and what it ended at is kept under
+    the lookup generation and the count of private / protected marks
+    (attr_ic in m_state.mere); after that it is 3,300. Both doors, with a
+    receiver (invoke_val_c) and without (try_self_call).
+    `MERE_RUBY_ATTR_IC_CHECK=1` asks the dispatcher every time as well and
+    stops on a different answer.
+  - *A method that only stores its arguments runs with no frame*
+    (`def initialize(a, b); @a = a; @b = b; end`): `Point.new(1, 2)` 62,800
+    -> 38,100 instructions.
+  The walk benchmark (200 files, both walks and the parse): 167.7e9 ->
+  135.5e9 instructions. corpus 661 holds what can change an answer after
+  the short way was learnt -- it caught the cache learning a `super` from a
+  prepended module's method as the call itself: learning stops as soon as
+  any method or block body starts to run. The corpus is 690 of 690 with
+  the check on.
+- **The collector waits for 32,000 new entries, not 4,000, while no class
+  is being made** (the owner's decision, 2026-11-16; note 551 §8). A
+  collection has a cost that does not depend on what is live, and a program
+  with little live that makes small objects paid it every 1,300 objects:
+  30% of `Point.new(1, 2)` in a loop, a quarter of test_ast's walks. With
+  the floor at 32,000 the walks execute another 14% fewer instructions
+  (117.2e9 -> 101.1e9 for 200 files under test/unit) and the file's peak
+  memory footprint is no higher (3.93 GB before any of this, 3.62 GB now).
+  Raising it found what the low floor had been hiding, and each is dealt
+  with here:
+  - *Dead classes are not small, so a loop that makes classes keeps the old
+    floor.* test_module's complemented_method_entry leak test -- two classes
+    and a refinement a turn -- already sits on its limit (1.94 to 2.01 times
+    its starting RSS here, limit 2.0) and went to 2.43; `a.clone.set`, `a`
+    having a method of its own, ran four times the instructions, since a
+    clone copies its singleton's methods out of the whole method table. The
+    count of classes ever given a superclass (cls_made) is kept at each
+    collection, and once it has moved the entry threshold is the one with
+    the old floor (gc_knob 13, 14). Those loops collect exactly as they did
+    (11 collections in 21,000 turns of the leak test, before and after).
+  - *Copies and `instance_variables` walked the table of every object's
+    variables.* `obj.dup`, a Struct's, an exception's, `"abc".dup`,
+    `[1].dup`, `{}.dup`, `-str`, `obj.instance_variables`: each looked
+    through every instance variable alive for the ones of its receiver,
+    which made them two to five times slower once more garbage waited. An
+    object's are now found by its own list of names (ivar_names_of's
+    index, and a Struct's members by its class); a String's, an Array's and
+    a Hash's are looked for only once one of them has ever been given a
+    variable (hiv_made). Against the build before the floor moved, with
+    objects being made beside them: `obj.dup` 0.37 of the instructions,
+    `"abc".dup` 0.68, `instance_variables` 0.55, `-str` 0.73. corpus 662.
+  - Thirty-six kinds of allocation loop (objects, fibers, threads, classes,
+    modules, structs, singletons, finalizers, procs, enumerators,
+    exceptions, strings, ...) and twenty operations beside an allocation
+    were measured before and after: none executes more than 1.05 times the
+    instructions it did. A small program's peak RSS is 20 to 40 MB higher
+    (75 -> 100 MB for a loop of `Struct.new(1, 2)`): that is what now waits
+    for a collection. tools/loop_rss_check.sh holds all nine of its bounds,
+    and the memory-leak tests of test_object, test_module and test_class
+    pass as before.
+- **Where the rest of the time is** (note 551 §5), none of it touched here:
+  - what one collection costs: three fifths of it is the runtime gathering
+    and sorting the suspended stack's words (`__lang_coro_pins`,
+    `__lang_coro_scan_ints`) -- deep under test/unit, deeper in a recursive
+    walk. 20% of an assertion loop is still collection;
+  - interning a block's body compares the whole tree each time a block
+    becomes a Proc: 6.7% of test_all_tokens (assert_equal's message is
+    thirty lines);
+  - the fixed cost of a call into a builtin (12,000 instructions for
+    `array.last`) and of a method call (25,000).
+- **Also**: a Symbol literal keeps the encoding it was written into
+  (`:"r\u{e9}sum\u{e9}"` in a US-ASCII file is UTF-8 -- test_struct.rb and
+  test_data.rb could not be read); `AbstractSyntaxTree.of` answers nil for an
+  attribute method; tools/ast_dump lost its development stubs. Kernel#pp of
+  a Node before pp.rb is loaded still prints `#inspect` (ruby loads pp.rb on
+  the first `pp`).
+- Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 923 of 1024 (was
+  892 on main: the translation and the caches keep top-level tables).
+
+## 2026-11-17 (73): test_ast's margin -- what every assertion runs, and a block's number
+
+test_ast fits CI's 600 s since LOOP (57), with 47 s to spare on the slower of
+two runners (553.4 s in run 43793344878). This round takes what every
+assertion and every Proc pays. corpus 680.
+
+- **A store-only method and a memo reader run with no frame where
+  test/unit has them.** Every assertion calls `self._assertions += 1`, and
+  both halves went the whole way of a method call. `_assertions=` is the
+  store-only shape LOOP (57) gives no frame, but core_assertions.rb says
+  `binding` (in a method no test calls), and in a file that does the parser
+  puts a mark in front of every body naming the locals it assigns (lvd_head)
+  -- a statement the store-only check did not know, so the setter was off
+  the short way under test/unit and on it everywhere else. The mark is read
+  past now. `_assertions` is `@_assertions ||= 0`: a reader whose body is
+  `@x ||= <literal>` is answered with no frame. An `assert_equal(1, 1)`
+  524,500 -> 483,300 instructions.
+- **`@x ||= v` / `@x &&= v` used as a value no longer writes back what the
+  short circuit decided.** The statement form (SIVarAssign) never wrote; the
+  expression form -- `def n = @n ||= 0`, `(@n ||= 0)` -- did, and a frozen
+  object raised FrozenError for a memo it already had. Found by the
+  witness of the memo reader.
+- **A block made into a Proc again is found by its number** (blk_intern).
+  Interning a body compared it with the bodies already kept under its key,
+  and comparing two trees that ARE the same goes to the end of both: 6% of
+  test_ast's token test, assert_equal's thirty-line message block each
+  time. The parser now numbers each block it reads and puts the number in
+  the mark that already carries the line of its `{` or `do`:
+  `SLine -(line + number * 2^24)`, read with blk_line_of / blk_id_of (five
+  readers took the line as `0 - n`; the VM's vm_body_pos is one of them).
+  A body seen under its number and key is the one interned the first time.
+  The key stays beside the number because the interpreter rewrites block
+  bodies at run time keeping the mark in front.
+  `MERE_RUBY_BLK_ID_CHECK=1` compares anyway; it found that a body with a
+  Float literal is never equal to itself here -- Mere's generated eq_float
+  answers 0 -- so before the numbers every Proc of such a block added its
+  body again and compared against every copy kept: 8,000 Procs of one block
+  35.6e9 instructions, 1.1e9 now.
+- **The attribute reader cache asks about the class only before an entry
+  is made.** What it asks -- a singleton, a superclass other than Object, a
+  builtin name -- is fixed when the class is made, or changes through
+  set_sup / set_meth, which move the token an entry is kept under. Asking
+  it at every hit was 6% of the walks.
+- **Measured** (instructions, under test/unit, this machine): the token
+  test over 150 files 158.9e9 -> 141.8e9 (-11%); the walks over 200 files
+  100.5e9 -> 97.6e9 (-3%).
+- **Why it is in #86.** On CI run 43873004686 (the translation, the fast
+  paths and the collector's floor, on main with the VM's round 38) test_ast
+  ran 625.6 s and was stopped at the wall: the shard's runner ran the other
+  files at 1.15 times the baseline's time, and 625.6 / 1.15 is 546 s -- the
+  same file as before, with too little room for a slow runner. With this
+  round the same file is about 7% less work.
+- Checked: corpus 694 of 694, and with MERE_RUBY_BLK_ID_CHECK,
+  MERE_RUBY_ATTR_IC_CHECK and MERE_RUBY_IVAR_INDEX_CHECK on; test_ast's
+  individual tests 114 as the reference; the gates.
+
 ## 2026-11-16 (61): round 39 -- what test_iseq and test_optimization still asked
 
 **The point.** `ruby/test_iseq.rb` goes from 42 of 70 to 62 of 68 (the two

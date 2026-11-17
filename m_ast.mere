@@ -1,0 +1,2567 @@
+// RubyVM::AbstractSyntaxTree's tree -- parse.y's -- made from Prism's.
+//
+// mere-ruby parses with libprism; ruby's own RubyVM::AbstractSyntaxTree
+// answers the tree parse.y builds, which is another tree: other node types
+// (a FCALL, a VCALL, an OPCALL and an ATTRASGN are one Prism CallNode), lists
+// that are chains, a BEGIN where a body is empty, locations that follow
+// parse.y's grammar. This file reads Prism's tree (m_prism_dec.mere, with
+// m_prism_nodes.mere's readers) and builds parse.y's (m_ast_out.mere).
+//
+// It is written as parse.y's own actions replayed: each `tr_<node>` builds
+// what the grammar rule for that construct builds, with parse.y's helpers
+// (block_append, list_append, arg_append, ...) ported under a `p_` prefix
+// and kept as they are, the locations they move included. Where a rule is
+// quoted in a comment, the text is parse.y's in ruby 4.0.9.
+//
+// Checked against the reference's parse.y over every file test_ast reads:
+// tools/ast_dump (this file alone, compiled in a second) prints the tree as
+// text and tools/ast_on_cruby.rb prints the reference's the same way.
+
+let nott = fn (b: bool) -> if b then false else true;
+
+// ---- the scopes ---------------------------------------------------------------
+// What kind of scope each enclosing one is, innermost last: 1 a block's or a
+// lambda's (its variables are DVAR / DASGN), 0 a method's, a class's or the
+// program's (LVAR / LASGN). as_sc[0] is how many there are.
+let as_sc = vec_new ();
+let sc_reset = fn (u: unit) ->
+  let _ = vec_recycle as_sc in
+  vec_push as_sc 0;
+let sc_push = fn (kind: int) ->
+  let d = vec_get as_sc 0 + 1 in
+  let _ = (if d < vec_len as_sc then vec_set as_sc d kind else vec_push as_sc kind) in
+  vec_set as_sc 0 d;
+let sc_pop = fn (u: unit) -> vec_set as_sc 0 (vec_get as_sc 0 - 1);
+// (the scope `depth` levels out from the innermost)
+let sc_is_block = fn (depth: int) ->
+  let i = vec_get as_sc 0 - depth in
+  i >= 1 && vec_get as_sc i == 1;
+// The argument part of the table of the scope being built (children, in
+// table order), as a stack: a parameter's default value can hold a block
+// with parameters of its own. as_nm[0] is how many are in use.
+let as_nm = vec_new ();
+let nm_reset = fn (u: unit) ->
+  let _ = vec_recycle as_nm in
+  vec_push as_nm 0;
+let nm_len = fn (u: unit) -> vec_get as_nm 0;
+let nm_push = fn (k: int) ->
+  let d = vec_get as_nm 0 + 1 in
+  let _ = (if d < vec_len as_nm then vec_set as_nm d k else vec_push as_nm k) in
+  vec_set as_nm 0 d;
+let nm_at = fn (i: int) -> vec_get as_nm (i + 1);
+// Where a `(` that is tLPAREN_ARG starts (-1: none): the parenthesis that
+// opens the first argument of a command call written with a space (`foo
+// (1), 2`). The grammar answers its statements as they are; any other
+// parenthesized expression (tLPAREN) is a BLOCK of them.
+let as_lpa = vec_new ();
+let lpa_set = fn (at: int) -> if vec_len as_lpa == 0 then vec_push as_lpa at else vec_set as_lpa 0 at;
+let lpa_get = fn (u: unit) -> if vec_len as_lpa == 0 then 0 - 1 else vec_get as_lpa 0;
+// The location cond0 was given for the condition being translated: what it
+// makes -- the `$.` an Integer flip-flop end is compared with, the `$_` an
+// interpolated regexp is matched against -- is located there.
+let as_cl = vec_new ();
+let cl_set = fn (b: int) -> fn (e: int) ->
+  if vec_len as_cl == 0 then (let _ = vec_push as_cl b in vec_push as_cl e)
+  else (let _ = vec_set as_cl 0 b in vec_set as_cl 1 e);
+let cl_b = fn (dflt: int) -> if vec_len as_cl == 0 || vec_get as_cl 0 < 0 then dflt else vec_get as_cl 0;
+let cl_e = fn (dflt: int) -> if vec_len as_cl == 0 || vec_get as_cl 0 < 0 then dflt else vec_get as_cl 1;
+// The `BEGIN { }` blocks met so far (parse.y's eval_tree_begin): each a
+// BEGIN of its statements, put in front of the program at its end.
+let as_pre = vec_new ();
+// What parse.y refuses and Prism does not, found while translating: the
+// messages, in the order met. (as_er's first slot counts the `END { }`
+// blocks the walk is inside.)
+let as_er = vec_new ();
+// as_px, a few numbers the walk keeps:
+//   0  how many `END { }` blocks it is inside
+//   1  error_tolerant, a class or module that an `end` closed by its indent
+//      (dummy_end_in) left statements behind: the list they are in, -1 when
+//      there are none; 2 the index they start at. The statement list the
+//      class is in takes them, after it.
+//   3  the statement list being cut at such an `end`, -1 when none;
+//      4 how many of its statements stay; 5, 6 the ERROR that follows them
+//   7  the `end` keyword Prism gave to a construct that was closed that way
+//      (it is the enclosing one's), -1 when none; 8 where it ends
+//   9  the body list of the class or module being translated, when the
+//      program did not parse (-1 otherwise): the list whose statements after
+//      such a construct go up to the list it is in itself
+//  10  for the caller that makes the tree's literals: 1 once the Regexp of a
+//      literal was made, 0 when making it raised
+let as_px = vec_new ();
+// (those from `base` on, in order; they are dropped)
+let nm_take = fn (base: int) ->
+  let cnt = vec_get as_nm 0 in
+  let rec go = fn (i: int) -> if i >= cnt then (Nil : int list) else Cons (vec_get as_nm (i + 1), go (i + 1)) in
+  let xs = go base in
+  let _ = vec_set as_nm 0 base in
+  xs;
+
+// ---- parse.y's helpers ----------------------------------------------------------
+// NEW_BLOCK(head, loc): its nd_end is itself
+let p_new_block = fn (head: int) -> fn (b: int) -> fn (e: int) ->
+  let r = n3 (nt_block ()) b e head 0 0 in
+  let _ = a_set r 2 r in
+  r;
+// block_append
+let p_block_append = fn (head: int) -> fn (tail: int) ->
+  if tail == 0 then head
+  else if head == 0 then tail
+  else
+    (let h = (if a_is head (nt_block ()) then head else p_new_block head (a_beg head) (a_end head)) in
+     let en = a_f h 2 in
+     let tl = (if a_is tail (nt_block ()) then tail else p_new_block tail (a_beg tail) (a_end tail)) in
+     let _ = a_set en 1 tl in
+     let _ = a_set h 2 (a_f tl 2) in
+     let _ = a_set_end h (a_end tl) in
+     h);
+// NEW_LIST(item, loc): fields head, next, alen, end
+let p_new_list = fn (item: int) -> fn (b: int) -> fn (e: int) -> n4 (nt_list ()) b e item 0 1 0;
+// list_append
+let p_list_append = fn (list: int) -> fn (item: int) ->
+  if list == 0 then p_new_list item (a_beg item) (a_end item)
+  else
+    (let last = (if a_f list 1 != 0 then a_f (a_f list 1) 3 else list) in
+     let _ = a_set list 2 (a_f list 2 + 1) in
+     let cell = p_new_list item (a_beg item) (a_end item) in
+     let _ = a_set last 1 cell in
+     let _ = a_set (a_f list 1) 3 cell in
+     let _ = a_set_end list (a_end item) in
+     list);
+// list_concat
+let p_list_concat = fn (head: int) -> fn (tail: int) ->
+  let last = (if a_f head 1 != 0 then a_f (a_f head 1) 3 else head) in
+  let _ = a_set head 2 (a_f head 2 + a_f tail 2) in
+  let _ = a_set last 1 tail in
+  let _ = a_set (a_f head 1) 3 (if a_f tail 1 != 0 then a_f (a_f tail 1) 3 else tail) in
+  let _ = a_set_end head (a_end tail) in
+  head;
+// remove_begin
+let rec p_remove_begin = fn (node: int) ->
+  if a_is node (nt_begin ()) && a_f node 0 != 0 then p_remove_begin (a_f node 0) else node;
+// NEW_BEGIN(0, loc) where a body is empty
+let p_begin_at = fn (pos: int) -> n1 (nt_begin ()) pos pos 0;
+
+// arg_blk_pass. BLOCK_PASS: head (the arguments before it), body
+let p_arg_blk_pass = fn (args: int) -> fn (bp: int) ->
+  if bp == 0 then args
+  else if args == 0 then bp
+  else (let _ = a_set bp 0 args in
+        let _ = a_set_beg bp (a_beg args) in
+        bp);
+// arg_append; (b, e) is the location an ARGSPUSH it makes is given
+let rec p_arg_append = fn (x1: int) -> fn (x2: int) -> fn (b: int) -> fn (e: int) ->
+  if x1 == 0 then p_new_list x2 (a_beg x2) (a_end x2)
+  else
+    (let t = a_ty x1 in
+     if t == nt_list () then p_list_append x1 x2
+     else if t == nt_block_pass () then
+       (let _ = a_set x1 0 (p_arg_append (a_f x1 0) x2 b e) in
+        let _ = a_set_end x1 (a_end (a_f x1 0)) in
+        x1)
+     else if t == nt_argspush () then
+       (let body = a_f x1 1 in
+        let _ = a_set x1 1 (p_list_append (p_new_list body (a_beg body) (a_end body)) x2) in
+        let _ = a_set_end x1 (a_end (a_f x1 1)) in
+        let _ = a_set_ty x1 (nt_argscat ()) in
+        x1)
+     else if t == nt_argscat () && a_is (a_f x1 1) (nt_list ()) then
+       (let _ = a_set x1 1 (p_list_append (a_f x1 1) x2) in
+        let _ = a_set_end x1 (a_end (a_f x1 1)) in
+        x1)
+     else n2 (nt_argspush ()) b e x1 x2);
+// arg_concat
+let rec p_arg_concat = fn (x1: int) -> fn (x2: int) -> fn (b: int) -> fn (e: int) ->
+  if x2 == 0 then x1
+  else
+    (let t = a_ty x1 in
+     if t == nt_block_pass () then
+       (let _ = (if a_f x1 0 != 0 then a_set x1 0 (p_arg_concat (a_f x1 0) x2 b e)
+                 else a_set x1 0 (p_new_list x2 b e)) in
+        x1)
+     else if t == nt_argspush () && a_is x2 (nt_list ()) then
+       (let _ = a_set x1 1 (p_list_concat (p_new_list (a_f x1 1) b e) x2) in
+        let _ = a_set_ty x1 (nt_argscat ()) in
+        x1)
+     else if t == nt_argscat () && a_is x2 (nt_list ()) && a_is (a_f x1 1) (nt_list ()) then
+       (let _ = a_set x1 1 (p_list_concat (a_f x1 1) x2) in
+        x1)
+     else n2 (nt_argscat ()) b e x1 x2);
+// splat_array
+let p_splat_array = fn (node: int) ->
+  let x = (if a_is node (nt_splat ()) then a_f node 0 else node) in
+  if a_is x (nt_list ()) then x else 0;
+// last_arg_append, rest_arg_append
+let p_last_arg_append = fn (args: int) -> fn (last: int) -> fn (b: int) -> fn (e: int) ->
+  let l = p_splat_array args in
+  if l != 0 then p_list_append l last else p_arg_append args last b e;
+let p_rest_arg_append = fn (args: int) -> fn (rest: int) -> fn (b: int) -> fn (e: int) ->
+  let l = (if a_is rest (nt_list ()) then p_splat_array args else 0) in
+  if l != 0 then p_list_concat l rest else p_arg_concat args rest b e;
+// reduce_nodes: what a method body's last expression is trimmed of
+let rec p_reduce_nodes = fn (node: int) ->
+  // (answers what *body becomes)
+  if node == 0 then 0
+  else
+    (let t = a_ty node in
+     if t == nt_nil () then 0
+     else if t == nt_begin () then p_reduce_nodes (a_f node 0)
+     else if t == nt_block () then
+       (let en = a_f node 2 in
+        let _ = a_set en 0 (p_reduce_nodes (a_f en 0)) in
+        node)
+     else if t == nt_if () || t == nt_unless () then
+       (let _ = p_reduce_sub node 1 2 in node)
+     else if t == nt_case () then
+       (let _ = a_set node 1 (p_reduce_nodes (a_f node 1)) in node)
+     else if t == nt_when () then
+       (if p_reduce_sub node 1 2 then node else 0)
+     else if t == nt_ensure () then
+       (let _ = a_set node 0 (p_reduce_nodes (a_f node 0)) in node)
+     else if t == nt_rescue () then
+       (if a_f node 2 != 0 then (let _ = a_set node 1 (p_reduce_nodes (a_f node 1)) in node)
+        else if p_reduce_sub node 0 1 then node else 0)
+     else node)
+// subnodes(type, n1, n2): reduce both branches; false when there is neither
+and p_reduce_sub = fn (node: int) -> fn (i1: int) -> fn (i2: int) ->
+  if a_f node i1 == 0 then
+    (if a_f node i2 != 0 then (let _ = a_set node i2 (p_reduce_nodes (a_f node i2)) in true) else false)
+  else if a_f node i2 == 0 then (let _ = a_set node i1 (p_reduce_nodes (a_f node i1)) in true)
+  else (let _ = a_set node i1 (p_reduce_nodes (a_f node i1)) in
+        let _ = a_set node i2 (p_reduce_nodes (a_f node i2)) in
+        true);
+// new_scope_body's body: remove_begin, then reduce_nodes (an absent body is
+// a NIL that reduce_nodes then drops)
+let p_scope_body = fn (body: int) -> p_reduce_nodes (p_remove_begin body);
+
+// ---- small things the walk needs -----------------------------------------------
+let pm_is = fn (n: int) -> fn (t: int) -> n != 0 && vec_get pm_nd n == t;
+let cname = fn (c: int) -> vec_get pm_cp c;
+// the first offset at or after `i` that is not a space or a tab
+let rec skip_blank = fn (i: int) ->
+  let c = pm_byte i in
+  if c == 32 || c == 9 then skip_blank (i + 1) else i;
+
+// ---- the walk ------------------------------------------------------------------
+let tr = fn (n: int) -> if n == 0 then 0 else ast_tr_node n;
+let tr_unknown = fn (n: int) -> n0 (nt_error ()) (pm_start n) (pm_end n);
+
+// stmts: stmt_or_begin | stmts terms stmt_or_begin, each through
+// newline_node (which is remove_begin); 0 when there are none
+let tr_stmt_list = fn (l: int) ->
+  let lim = vec_get pm_hd 6 in
+  // (error_tolerant: the list an `end` cuts by its indent -- as_px 3..6)
+  let cut = vec_get as_px 3 == l in
+  let cnt = (if cut then vec_get as_px 4 else pm_ls_len l) in
+  let eb = vec_get as_px 5 in
+  let ee = vec_get as_px 6 in
+  let _ = (if cut then vec_set as_px 3 (0 - 1) else ()) in
+  let rec go = fn (ll: int) -> fn (i: int) -> fn (n: int) -> fn (acc: int) ->
+    if i >= n then acc
+    else
+      (let x = pm_ls_at ll i in
+       // (error_tolerant: what Prism puts after the last token, where an
+       //  `end` never came, is no statement)
+       if lim >= 0 && pm_is x (pm_t_missing ()) && (pm_start x >= lim || (i == n - 1 && pm_end x >= lim)) then go ll (i + 1) n acc
+       else
+         (let s = p_remove_begin (tr x) in
+          let acc1 = p_block_append acc s in
+          // (...and the statements such an `end` left behind in `x` follow it)
+          let hl = vec_get as_px 1 in
+          if hl < 0 then go ll (i + 1) n acc1
+          else
+            (let hf = vec_get as_px 2 in
+             let _ = vec_set as_px 1 (0 - 1) in
+             let acc2 = go hl hf (pm_ls_len hl) acc1 in
+             // (...and when this is the body of a class or module, what
+             //  Prism put after `x` -- in that body, or among the statements
+             //  just taken in -- was written after the `end` Prism gave to
+             //  `x`, which is this class's own: those go up in turn. One
+             //  list can wait at a time; when the statements taken in have
+             //  sent theirs up already, the rest of this one stays.)
+             if vec_get as_px 9 != l then go ll (i + 1) n acc2
+             else if vec_get as_px 1 >= 0 then (if i + 1 >= n then acc2 else go ll (i + 1) n acc2)
+             else (let _ = vec_set as_px 1 ll in let _ = vec_set as_px 2 (i + 1) in acc2)))) in
+  let r = go l 0 cnt 0 in
+  if cut then p_block_append r (n0 (nt_error ()) eb ee) else r;
+let tr_statements = fn (n: int) -> tr_stmt_list (pm_statements_body n);
+// (a body Prism gives as a StatementsNode, as one node that is the only
+//  statement -- `(a = 1)` as a def's receiver -- or as nothing)
+let tr_stmts_of = fn (sn: int) ->
+  if sn == 0 then 0
+  else if pm_is sn (pm_t_statements ()) then tr_stmt_list (pm_statements_body sn)
+  else p_remove_begin (tr sn);
+// compstmt(stmts) where the grammar has it: the statements, or -- there
+// being none -- NEW_BEGIN(0) at `empty_at`, the end of the token before
+let tr_compstmt = fn (sn: int) -> fn (empty_at: int) ->
+  let body = tr_stmts_of sn in
+  // (a `;` first: the empty `stmts` is reduced before it, and the
+  //  statements follow that BEGIN)
+  if body == 0 then p_begin_at empty_at
+  else if empty_at < 1099511627776 && pm_byte (skip_space_nl empty_at) == 59 then p_block_append (p_begin_at empty_at) body
+  else body;
+// ...and where a `term` can come first (`class A; ...`, `begin; ...`): the
+// empty `stmts` is reduced before the term, so the statements follow a
+// BEGIN at `lead_at`. `lead` says whether a term does come first.
+let tr_compstmt_lead = fn (sn: int) -> fn (lead: bool) -> fn (lead_at: int) ->
+  let body = tr_stmts_of sn in
+  if lead then p_block_append (p_begin_at lead_at) body
+  else if body == 0 then p_begin_at lead_at else body;
+// is there a `;` or a line end between offset `i` and the next token?
+// (a comment runs to the line end, which is that term)
+let rec term_ahead = fn (i: int) ->
+  let c = pm_byte i in
+  if c == 32 || c == 9 || c == 13 then term_ahead (i + 1)
+  else c == 59 || c == 10 || c == 35;
+
+// A scope's local table: the names in parse.y's order -- the arguments as
+// new_args_tail orders them (`args`, already children), then the variables,
+// which are Prism's locals that are no argument.
+let scope_tbl = fn (locals: int) -> fn (args: int list) ->
+  let cnt = pm_ls_len locals in
+  let rec is_arg = fn (xs: int list) -> fn (nm: str) ->
+    (match xs with
+     | Nil -> false
+     | Cons (k, t) -> (if k_tag k == 2 && str_eq (vec_get ao_s (k_val k)) nm then true else is_arg t nm)) in
+  let rec vars = fn (i: int) ->
+    if i >= cnt then (Nil : int list)
+    else (let c = pm_ls_at locals i in
+          if is_arg args (cname c) then vars (i + 1) else Cons (k_id (id_c c), vars (i + 1))) in
+  let rec app = fn (xs: int list) -> fn (ys: int list) ->
+    (match xs with Nil -> ys | Cons (h, t) -> Cons (h, app t ys)) in
+  mk_arr (app args (vars 0));
+
+// program: compstmt(top_stmts) -> NEW_SCOPE(0, block_append(eval_tree, $2))
+// error_tolerant, a program with something after a whole statement where a
+// line end or `;` had to be (`1q`, `a = 1 2`): parse.y's recovery finds that
+// the program can end there, ends it, and reads no further -- the tree is
+// the statements before that point. Prism goes on and parses the rest as
+// more statements. Answers how many of the program's statements parse.y
+// kept, or -1 when this is not that case (the error is not Prism's first, or
+// it is inside a statement, where parse.y recovers some other way).
+let tolerant_kept = fn (l: int) ->
+  if vec_get pm_hd 6 < 0 || vec_len pm_er == 0 || vec_get pm_er 0 != pm_e_expect_eol_after_statement () then 0 - 1
+  else
+    (let at = vec_get pm_er 2 in
+     let cnt = pm_ls_len l in
+     let rec go = fn (i: int) ->
+       if i >= cnt then 0 - 1
+       else (let x = pm_ls_at l i in
+             if pm_end x <= at then go (i + 1)
+             else if pm_start x >= at && i > 0 then i
+             else 0 - 1) in
+     go 0);
+let tr_program = fn (n: int) ->
+  let _ = sc_push 0 in
+  let sn = pm_program_statements n in
+  let kept = (if sn == 0 then 0 - 1 else tolerant_kept (pm_statements_body sn)) in
+  let body1 =
+    (if kept < 0 then tr_compstmt sn 0
+     else
+       (let l = pm_statements_body sn in
+        // (nothing of the tree is past the last statement kept)
+        let _ = vec_set pm_hd 6 (pm_end (pm_ls_at l (kept - 1))) in
+        let rec go = fn (i: int) -> fn (acc: int) ->
+          if i >= kept then acc else go (i + 1) (p_block_append acc (p_remove_begin (tr (pm_ls_at l i)))) in
+        go 0 0)) in
+  // (error_tolerant: a program of nothing but an error is that ERROR)
+  let body0 = (if vec_get pm_hd 6 >= 0 && vec_len pm_er > 0 && a_is body1 (nt_begin ()) && a_f body1 0 == 0
+               then n0 (nt_error ()) (vec_get pm_er 2) (vec_get pm_er 3) else body1) in
+  let rec pre = fn (i: int) -> fn (acc: int) ->
+    if i >= vec_len as_pre then acc else pre (i + 1) (p_block_append acc (vec_get as_pre i)) in
+  let body = (if vec_len as_pre == 0 then body0 else p_block_append (pre 0 0) body0) in
+  let tbl = scope_tbl (pm_program_locals n) Nil in
+  let r = n3 (nt_scope ()) 0 (if a_is body (nt_error ()) then a_end body else stmts_end_of sn (a_end body)) tbl 0 body in
+  let _ = sc_pop () in
+  r;
+
+// ---- literals --------------------------------------------------------------------
+let tr_integer = fn (n: int) ->
+  let ig = pm_integer_value n in
+  n1 (nt_integer ()) (pm_start n) (pm_end n) (lit_int (vec_get pm_ig ig) ig);
+let tr_float = fn (n: int) ->
+  n1 (nt_float ()) (pm_start n) (pm_end n) (lit_float (pm_float_value_hi n) (pm_float_value_lo n));
+let tr_rational = fn (n: int) ->
+  n1 (nt_rational ()) (pm_start n) (pm_end n) (lit_rational (pm_rational_numerator n) (pm_rational_denominator n));
+let tr_imaginary = fn (n: int) ->
+  let x = pm_imaginary_numeric n in
+  let inner = (if pm_is x (pm_t_integer ()) then (let ig = pm_integer_value x in lit_int (vec_get pm_ig ig) ig)
+               else if pm_is x (pm_t_float ()) then lit_float (pm_float_value_hi x) (pm_float_value_lo x)
+               else lit_rational (pm_rational_numerator x) (pm_rational_denominator x)) in
+  n1 (nt_imaginary ()) (pm_start n) (pm_end n) (lit_imaginary inner);
+let tr_nil = fn (n: int) -> n0 (nt_nil ()) (pm_start n) (pm_end n);
+let tr_true = fn (n: int) -> n0 (nt_true ()) (pm_start n) (pm_end n);
+let tr_false = fn (n: int) -> n0 (nt_false ()) (pm_start n) (pm_end n);
+let tr_self = fn (n: int) -> n0 (nt_self ()) (pm_start n) (pm_end n);
+let tr_source_line = fn (n: int) -> n0 (nt_line ()) (pm_start n) (pm_end n);
+let tr_source_file = fn (n: int) ->
+  // (the node's own string is empty: the path is the tree's, not the node's)
+  n1 (nt_file ()) (pm_start n) (pm_end n) (lit_str "" (ao_enc_binary ()));
+let tr_source_encoding = fn (n: int) ->
+  n1 (nt_encoding ()) (pm_start n) (pm_end n) (lit_encoding (vec_get pm_st 0));
+
+// ---- strings ---------------------------------------------------------------------
+// A STR / DSTR / XSTR ... node's string is field 0, a literal of kind 5 in
+// ao_l (its text in ao_s, its encoding); 0 is a DSTR with no leading string.
+let lit_text = fn (l: int) -> vec_get ao_s (vec_get ao_l (l + 1));
+// literal_concat0: the tail's bytes onto the head's
+let p_lit_append = fn (head: int) -> fn (tail: int) ->
+  let i = vec_len ao_s in
+  let _ = (if str_all7 (lit_text head) 0 && nott (str_all7 (lit_text tail) 0) then vec_set ao_l (head + 2) (vec_get ao_l (tail + 2)) else ()) in
+  let _ = vec_push ao_s (lit_text head ++ lit_text tail) in
+  vec_set ao_l (head + 1) i;
+// str2dstr: the same node as a DSTR (string, next, alen) with no list yet
+let p_str2dstr = fn (node: int) -> n3 (nt_dstr ()) (a_beg node) (a_end node) (a_f node 0) 0 0;
+// new_dstr: NEW_DSTR(""), then list_append
+let p_new_dstr = fn (node: int) -> fn (b: int) -> fn (e: int) ->
+  p_list_append (n3 (nt_dstr ()) b e (lit_str "" (src_enc ())) 0 1) node;
+// (STRING_NEW0: an empty string in the program's encoding)
+let src_enc = fn (u: unit) -> if str_eq (vec_get pm_st 0) "UTF-8" then ao_enc_utf8 () else ao_enc_source ();
+// evstr2dstr
+let p_evstr2dstr = fn (node: int) ->
+  if a_is node (nt_evstr ()) then p_new_dstr node (a_beg node) (a_end node) else node;
+// string_literal_head: the literal a following STR is appended to -- the
+// DSTR's own while it has no list, else its last element when that is a STR
+let p_literal_head = fn (head: int) ->
+  if nott (a_is head (nt_dstr ())) then 0
+  else if a_f head 1 != 0 then
+    (let lastn = a_f (a_f (a_f head 1) 3) 0 in
+     if a_is lastn (nt_str ()) then a_f lastn 0 else 0)
+  else a_f head 0;
+// literal_concat. (b, e): the location of the two together. `squiggly`:
+// inside a `<<~` heredoc, whose pieces stay apart until heredoc_dedent.
+let p_literal_concat = fn (head0: int) -> fn (tail: int) -> fn (b: int) -> fn (e: int) -> fn (squiggly: bool) ->
+  if head0 == 0 then tail
+  else if tail == 0 then head0
+  else
+    (let head = (if a_is head0 (nt_evstr ()) then p_new_dstr head0 b e else head0) in
+     let hstr = a_is head (nt_str ()) in
+     if squiggly && (hstr || a_is head (nt_dstr ())) then
+       p_list_append (if hstr then p_str2dstr head else head) tail
+     else if a_is tail (nt_str ()) then
+       (let lit = (if hstr then a_f head 0 else p_literal_head head) in
+        if lit != 0 then (let _ = p_lit_append lit (a_f tail 0) in head)
+        else p_list_append head tail)
+     else if a_is tail (nt_dstr ()) then
+       (if hstr then
+          // the head's text goes in front of the tail's, and the tail is the result
+          (let i = vec_len ao_s in
+           let _ = vec_push ao_s (lit_text (a_f head 0) ++ lit_text (a_f tail 0)) in
+           let _ = vec_set ao_l (a_f tail 0 + 1) i in
+           tail)
+        else
+          (let lit = (if a_f tail 0 == 0 then 0 else p_literal_head head) in
+           if a_f tail 0 == 0 || lit != 0 then
+             (let _ = (if lit != 0 then (let _ = p_lit_append lit (a_f tail 0) in a_set tail 0 0) else ()) in
+              // append: the tail's list onto the head's
+              let _ = a_set head 2 (a_f head 2 + a_f tail 2 - 1) in
+              let _ = (if a_f head 1 == 0 then a_set head 1 (a_f tail 1)
+                       else if a_f tail 1 != 0 then
+                         (let _ = a_set (a_f (a_f head 1) 3) 1 (a_f tail 1) in
+                          a_set (a_f head 1) 3 (a_f (a_f tail 1) 3))
+                       else ()) in
+              head)
+           else
+             (let st = n1 (nt_str ()) b e (a_f tail 0) in
+              let cell = n4 (nt_list ()) b e st (a_f tail 1) (a_f tail 2) 0 in
+              let _ = a_set tail 0 0 in
+              p_list_concat head cell)))
+     else if a_is tail (nt_evstr ()) then
+       (let h = (if hstr then (let d = p_str2dstr head in let _ = a_set d 2 1 in d) else head) in
+        p_list_append h tail)
+     else head);
+// (the encoding a string part's flags give it: the program's own unless the
+//  content forced another)
+let ast_str_enc = fn (n: int) ->
+  if pm_has n (pm_f_string_forced_binary_encoding ()) then ao_enc_binary ()
+  else if pm_has n (pm_f_string_forced_utf8_encoding ()) then ao_enc_utf8 ()
+  else if str_eq (vec_get pm_st 0) "UTF-8" then ao_enc_utf8 ()
+  else ao_enc_source ();
+// (the offset the line holding `off` starts at)
+let ast_line_start = fn (off: int) -> vec_get pm_lo (ao_line_of off);
+// (the first line end at or after `i`, before `lim`; `lim` when there is none)
+let rec next_nl = fn (i: int) -> fn (lim: int) ->
+  if i >= lim then lim else if pm_byte i == 10 then i + 1 else next_nl (i + 1) lim;
+// string_content: tSTRING_DBEG compstmt string_dend (new_evstr)
+let tr_embedded_statements = fn (x: int) ->
+  let os = pm_embedded_statements_opening_loc_s x in
+  let oe = pm_embedded_statements_opening_loc_e x in
+  let cs = pm_embedded_statements_closing_loc_s x in
+  let ce = pm_embedded_statements_closing_loc_e x in
+  let body = tr_compstmt (pm_embedded_statements_statements x) oe in
+  if a_is body (nt_str ()) then p_str2dstr body
+  else if a_is body (nt_evstr ()) then body
+  else a_xloc (n1 (nt_evstr ()) (pm_start x) (pm_end x) body) [os, oe, cs, ce];
+// string_content: tSTRING_DVAR string_dvar
+let tr_embedded_variable = fn (x: int) ->
+  let v = tr (pm_embedded_variable_variable x) in
+  a_xloc (n1 (nt_evstr ()) (pm_start x) (pm_end x) v)
+    [pm_embedded_variable_operator_loc_s x, pm_embedded_variable_operator_loc_e x, 0 - 1, 0 - 1];
+// string_contents: the parts between a literal's delimiters, folded by
+// literal_concat. `hd`: 0 no heredoc, 1 a heredoc, 2 a `<<~` one; `hend`:
+// where the heredoc's opener ends. Answers 0 when there is nothing.
+//
+// A heredoc's text tokens are placed as the lexer leaves them: one that
+// runs to the terminator is returned after the lexer went back to the
+// opener (it has no width, at the opener's end); one that stops at an
+// interpolation starts on the line it stops on; in a `<<~` heredoc every
+// line is a token of its own, and a run of them keeps the first one's place.
+let tr_contents = fn (parts: int) -> fn (hd: int) -> fn (hend: int) ->
+  let cnt = pm_ls_len parts in
+  let first_b = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0) in
+  let rec run_end = fn (i: int) ->
+    if i + 1 < cnt && pm_is (pm_ls_at parts (i + 1)) (pm_t_string ()) then run_end (i + 1) else i in
+  let rec go = fn (i: int) -> fn (acc: int) -> fn (prev_str: bool) ->
+    if i >= cnt then acc
+    else
+      (let x = pm_ls_at parts i in
+       if pm_is x (pm_t_string ()) then
+         (let ps = pm_start x in
+          // (in a plain heredoc the text up to the next interpolation is one
+          //  token, however many parts Prism made of it)
+          let run = (if hd == 1 then run_end i else i) in
+          let pe = pm_end (pm_ls_at parts run) in
+          let lastp = run == cnt - 1 in
+          let b = (if hd == 1 && lastp then hend
+                   else if hd != 2 then (let ls = ast_line_start pe in if ls > ps then ls else ps)
+                   else ps) in
+          let e = (if hd == 1 && lastp then hend
+                   else if hd == 2 then
+                     (let nl = next_nl ps pe in
+                      // (the line's end as the lexer leaves it: the column past the newline)
+                      if nl > ps && pm_byte (nl - 1) == 10 then pos_lc (ao_line_of (nl - 1)) (nl - vec_get pm_lo (ao_line_of (nl - 1)))
+                      else nl)
+                   else pe) in
+          let st = n1 (nt_str ()) b e (lit_str (vec_get pm_st (pm_string_unescaped x)) (ast_str_enc x)) in
+          // (a `<<~` run of lines is one STR after heredoc_dedent: the
+          //  first's place, the text of all)
+          if hd == 2 && prev_str && acc != 0 then
+            (let lit = (if a_is acc (nt_str ()) then a_f acc 0 else p_literal_head acc) in
+             let _ = (if lit != 0 then p_lit_append lit (a_f st 0) else ()) in
+             go (i + 1) (if lit != 0 then acc else p_literal_concat acc st first_b pe false) true)
+          else go (i + 1) (p_literal_concat acc st first_b pe false) true)
+       else if pm_is x (pm_t_embedded_statements ()) then
+         (let ev = tr_embedded_statements x in
+          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) false) false)
+       else if pm_is x (pm_t_embedded_variable ()) then
+         (let ev = tr_embedded_variable x in
+          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) false) false)
+       else
+         (let v = tr x in
+          go (i + 1) (p_literal_concat acc v first_b (pm_end x) false) false)) in
+  go 0 0 false;
+// (is this opener a heredoc's, and is it a `<<~`? 0, 1 or 2. `first`: where
+//  its text starts -- a `<<~` whose first line has no indentation has none
+//  to remove, and the lexer then reads it as it reads a plain one)
+let heredoc_kind = fn (os: int) -> fn (first: int) ->
+  if os < 0 || pm_byte os != 60 || pm_byte (os + 1) != 60 then 0
+  else if pm_byte (os + 2) == 126 then
+    (let c = pm_byte (ast_line_start first) in
+     if first >= 0 && c != 32 && c != 9 && c != 10 then 1 else 2)
+  else 1;
+// string1: tSTRING_BEG string_contents tSTRING_END, then `strings`'
+// evstr2dstr -- one literal, located at the whole of it
+let tr_string1 = fn (n: int) ->
+  let b = pm_start n in
+  let e = pm_end n in
+  if pm_is n (pm_t_string ()) then
+    // (a word of %w[...] has no delimiters of its own: its token's place,
+    //  which starts on the line it ends on)
+    (let ls = ast_line_start e in
+     let b2 = (if pm_string_opening_loc_s n < 0 && ls > b then ls else b) in
+     n1 (nt_str ()) b2 e (lit_str (vec_get pm_st (pm_string_unescaped n)) (ast_str_enc n)))
+  else
+    (let os = pm_interpolated_string_opening_loc_s n in
+     let parts = pm_interpolated_string_parts n in
+     let c = tr_contents parts (heredoc_kind os (if pm_ls_len parts > 0 then pm_start (pm_ls_at parts 0) else 0 - 1)) e in
+     if c == 0 then n1 (nt_str ()) b e (lit_str "" (src_enc ()))
+     else (let _ = a_set_beg c b in
+           let _ = a_set_end c e in
+           c));
+let tr_string = fn (n: int) -> tr_string1 n;
+// string: string1 | string string1 (adjacent literals, literal_concat) --
+// Prism's InterpolatedStringNode with no opener of its own, whose parts are
+// whole literals; and one literal with interpolation
+let tr_interpolated_string = fn (n: int) ->
+  let parts = pm_interpolated_string_parts n in
+  let cnt = pm_ls_len parts in
+  let first = (if cnt > 0 then pm_ls_at parts 0 else 0) in
+  let whole = pm_interpolated_string_opening_loc_s n < 0 && first != 0
+              && ((pm_is first (pm_t_string ()) && pm_string_opening_loc_s first >= 0)
+                  || pm_is first (pm_t_interpolated_string ())) in
+  if whole then
+    (let rec go = fn (i: int) -> fn (acc: int) ->
+       if i >= cnt then acc
+       else (let x = pm_ls_at parts i in
+             // (a literal with nothing in it is no node to literal_concat)
+             let nothing = (if pm_is x (pm_t_string ()) then pm_string_content_loc_e x == pm_string_content_loc_s x
+                            else pm_is x (pm_t_interpolated_string ()) && pm_ls_len (pm_interpolated_string_parts x) == 0) in
+             let s1 = (if nothing then 0 else tr_string1 x) in
+             go (i + 1) (p_literal_concat acc s1 (pm_start n) (pm_end x) false)) in
+     let r = go 0 0 in
+     if r == 0 then n1 (nt_str ()) (pm_start n) (pm_end n) (lit_str "" (src_enc ())) else p_evstr2dstr r)
+  else if pm_interpolated_string_opening_loc_s n < 0 then
+    // a word of %W[...]: its contents, with no delimiters of its own
+    (let c = tr_contents parts 0 0 in
+     if c == 0 then n1 (nt_str ()) (pm_start n) (pm_end n) (lit_str "" (src_enc ()))
+     else p_evstr2dstr c)
+  else p_evstr2dstr (tr_string1 n);
+// xstring: new_xstring
+let tr_xstring = fn (n: int) ->
+  n1 (nt_xstr ()) (pm_start n) (pm_end n) (lit_str (vec_get pm_st (pm_xstring_unescaped n)) (ast_str_enc n));
+let tr_interpolated_xstring = fn (n: int) ->
+  let b = pm_start n in
+  let e = pm_end n in
+  let xparts = pm_interpolated_xstring_parts n in
+  let c = tr_contents xparts (heredoc_kind (pm_interpolated_xstring_opening_loc_s n) (if pm_ls_len xparts > 0 then pm_start (pm_ls_at xparts 0) else 0 - 1)) e in
+  if c == 0 then n1 (nt_xstr ()) b e (lit_str "" (src_enc ()))
+  else if a_is c (nt_str ()) then (let _ = a_set_ty c (nt_xstr ()) in let _ = a_set_beg c b in let _ = a_set_end c e in c)
+  else if a_is c (nt_dstr ()) then (let _ = a_set_ty c (nt_dxstr ()) in let _ = a_set_beg c b in let _ = a_set_end c e in c)
+  else n3 (nt_dxstr ()) b e 0 (p_new_list c b e) 1;
+// symbol: ssym | dsym (dsym_node).  SYM: the name
+let tr_symbol = fn (n: int) ->
+  let b = pm_start n in
+  let ls = ast_line_start (pm_end n) in
+  n1 (nt_sym ()) (if pm_symbol_opening_loc_s n < 0 && ls > b then ls else b) (pm_end n)
+     (id_of_enc (vec_get pm_st (pm_symbol_unescaped n))
+        (if pm_has n (pm_f_symbol_forced_utf8_encoding ()) then ao_enc_utf8 ()
+         else if pm_has n (pm_f_symbol_forced_binary_encoding ()) then ao_enc_binary ()
+         else ao_enc_source ()));
+// (the ID a string literal names as a Symbol, in the literal's encoding)
+let id_of_lit = fn (l: int) -> id_of_enc (lit_text l) (vec_get ao_l (l + 2));
+let p_dsym_node = fn (c: int) -> fn (b: int) -> fn (e: int) ->
+  if c == 0 then n1 (nt_sym ()) b e (id_of "")
+  else if a_is c (nt_dstr ()) then (let _ = a_set_ty c (nt_dsym ()) in let _ = a_set_beg c b in let _ = a_set_end c e in c)
+  else if a_is c (nt_str ()) then n1 (nt_sym ()) b e (id_of_lit (a_f c 0))
+  else n3 (nt_dsym ()) b e 0 (p_new_list c b e) 1;
+let tr_interpolated_symbol = fn (n: int) ->
+  let c = tr_contents (pm_interpolated_symbol_parts n) 0 0 in
+  if pm_interpolated_symbol_opening_loc_s n >= 0 then p_dsym_node c (pm_start n) (pm_end n)
+  else
+    // a word of %I[...]: symbol_append(evstr2dstr(word))
+    (let d = p_evstr2dstr c in
+     if a_is d (nt_dstr ()) then (let _ = a_set_ty d (nt_dsym ()) in d)
+     else if a_is d (nt_str ()) then n1 (nt_sym ()) (a_beg d) (a_end d) (id_of_lit (a_f d 0))
+     else d);
+// cond0 on a range in a condition: FLIP2 / FLIP3; an Integer end is
+// compared with the line number (range_op)
+let tr_flip_flop = fn (n: int) ->
+  let b = cl_b (pm_start n) in
+  let e = cl_e (pm_end n) in
+  let os = pm_flip_flop_operator_loc_s n in
+  let oe = pm_flip_flop_operator_loc_e n in
+  let side = fn (x: int) -> fn (at: int) ->
+    (if x == 0 then n0 (nt_nil ()) at at
+     else
+       (let v = tr x in
+        if a_is v (nt_integer ()) then
+          n3 (nt_call ()) b e v (id_of "==") (p_new_list (n1 (nt_gvar ()) b e (id_of "$.")) b e)
+        else v)) in
+  let l = side (pm_flip_flop_left n) os in
+  let r = side (pm_flip_flop_right n) oe in
+  a_xloc (n2 (if pm_has n (pm_f_range_exclude_end ()) then nt_flip3 () else nt_flip2 ()) (pm_start n) (pm_end n) l r) [os, oe];
+// assoc: tLABEL -> the label's own variable or call (gettable), at the label
+let tr_implicit = fn (n: int) ->
+  let x = pm_implicit_value n in
+  if pm_is x (pm_t_call ()) then n1 (nt_vcall ()) (pm_start n) (pm_end n) (id_c (pm_call_name x))
+  else
+    (let v = tr x in
+     let _ = a_set_beg v (pm_start n) in
+     let _ = a_set_end v (pm_end n) in
+     v);
+// regexp: tREGEXP_BEG regexp_contents tREGEXP_END (new_regexp)
+// REGX: the literal.  DREGX: string, next, alen
+let regx_opts = fn (n: int) ->
+  let fl = pm_flags n in
+  (if bit_and fl (pm_f_regular_expression_ignore_case ()) != 0 then 1 else 0)
+  + (if bit_and fl (pm_f_regular_expression_extended ()) != 0 then 2 else 0)
+  + (if bit_and fl (pm_f_regular_expression_multi_line ()) != 0 then 4 else 0);
+// (a Regexp literal: its options as Regexp#options answers them -- 16 when
+//  its encoding is fixed, 32 for /n -- and that encoding)
+let regx_lit = fn (n: int) -> fn (src: str) ->
+  let fl = pm_flags n in
+  let o = regx_opts n in
+  let ascii = str_all7 src 0 in
+  if bit_and fl (pm_f_regular_expression_ascii_8bit ()) != 0 then
+    (if ascii && nott (regx_has_property src 0) then lit_regx src (o + 32) (ao_enc_ascii ())
+     else lit_regx src (o + 48) (ao_enc_binary ()))
+  else if bit_and fl (pm_f_regular_expression_utf_8 ()) != 0 then lit_regx src (o + 16) (ao_enc_utf8 ())
+  else if bit_and fl (pm_f_regular_expression_euc_jp ()) != 0 then lit_regx src (o + 16) (ao_enc_eucjp ())
+  else if bit_and fl (pm_f_regular_expression_windows_31j ()) != 0 then lit_regx src (o + 16) (ao_enc_sjis ())
+  else if bit_and fl (pm_f_regular_expression_forced_utf8_encoding ()) != 0 then lit_regx src (o + 16) (ao_enc_utf8 ())
+  else if bit_and fl (pm_f_regular_expression_forced_binary_encoding ()) != 0 then lit_regx src (o + 16) (ao_enc_binary ())
+  // (bytes that are not ASCII, or a \p{...} property: the program's own
+  //  encoding, fixed -- re.c's has_property)
+  //  (a US-ASCII program's regexp source is made ASCII-8BIT first:
+  //   rb_reg_fragment_setenc)
+  else if nott ascii || regx_has_property src 0 then
+    lit_regx src (o + 16) (if str_eq (vec_get pm_st 0) "US-ASCII" then ao_enc_binary () else src_enc ())
+  else lit_regx src o (ao_enc_ascii ());
+let rec str_all7 = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then true else if ord (char_at s i) >= 128 then false else str_all7 s (i + 1);
+// (a \p{...} property, or an escape that writes a byte above 127 -- \xNN
+//  from 80, an octal one from \200)
+let rec regx_has_property = fn (src: str) -> fn (i: int) ->
+  if i + 1 >= str_len src then false
+  else if ord (char_at src i) == 92 then
+    (let c = ord (char_at src (i + 1)) in
+     let d = (if i + 2 < str_len src then ord (char_at src (i + 2)) else 0) in
+     if c == 112 || c == 80 then true
+     else if c == 120 && (d == 56 || d == 57 || (d >= 97 && d <= 102) || (d >= 65 && d <= 70)) then true
+     else if (c == 50 || c == 51) && d >= 48 && d <= 55 then true
+     else regx_has_property src (i + 2))
+  else regx_has_property src (i + 1);
+let tr_regx = fn (ty: int) -> fn (n: int) -> fn (src: str) -> fn (os: int) -> fn (oe: int) -> fn (cs: int) -> fn (ce: int) ->
+  let r = n1 ty (pm_start n) (pm_end n) (regx_lit n src) in
+  // (a MATCH -- the REGX of a condition -- answers only its own location)
+  if ty == nt_match () then r else a_xloc r [os, oe, oe, tok_end cs, cs, ce];
+// (where a text token that ends at offset `e` ends: one whose last byte is a
+//  newline ends on that newline's line, in the column past it)
+let tok_end = fn (e: int) ->
+  if e > 0 && pm_byte (e - 1) == 10 then pos_lc (ao_line_of (e - 1)) (e - vec_get pm_lo (ao_line_of (e - 1))) else e;
+let tr_regular_expression = fn (n: int) ->
+  tr_regx (nt_regx ()) n (vec_get pm_st (pm_regular_expression_unescaped n))
+    (pm_regular_expression_opening_loc_s n) (pm_regular_expression_opening_loc_e n)
+    (pm_regular_expression_closing_loc_s n) (pm_regular_expression_closing_loc_e n);
+// (a regexp literal that is a condition: cond0 makes the REGX a MATCH)
+let tr_match_last_line = fn (n: int) ->
+  tr_regx (nt_match ()) n (vec_get pm_st (pm_match_last_line_unescaped n))
+    (pm_match_last_line_opening_loc_s n) (pm_match_last_line_opening_loc_e n)
+    (pm_match_last_line_closing_loc_s n) (pm_match_last_line_closing_loc_e n);
+// regexp_contents: its own fold -- the first part becomes a DSTR (one with
+// no string when it is not text), the rest are appended
+let tr_regexp_contents = fn (parts: int) ->
+  let cnt = pm_ls_len parts in
+  let first_b = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0) in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i >= cnt then acc
+    else
+      (let x = pm_ls_at parts i in
+       let v = (if pm_is x (pm_t_string ()) then
+                  // (a piece that crosses lines starts on its last line, as in a string)
+                  (let ls = ast_line_start (pm_end x) in
+                   n1 (nt_str ()) (if ls > pm_start x then ls else pm_start x) (pm_end x)
+                      (lit_str (vec_get pm_st (pm_string_unescaped x)) (ast_str_enc x)))
+                else if pm_is x (pm_t_embedded_statements ()) then tr_embedded_statements x
+                else if pm_is x (pm_t_embedded_variable ()) then tr_embedded_variable x
+                else tr x) in
+       if acc == 0 then go (i + 1) v
+       else
+         (let head = (if a_is acc (nt_str ()) then p_str2dstr acc
+                      else if a_is acc (nt_dstr ()) then acc
+                      else p_list_append (n3 (nt_dstr ()) first_b (pm_end x) 0 0 1) acc) in
+          go (i + 1) (p_list_append head v))) in
+  go 0 0;
+let tr_dregx = fn (n: int) -> fn (parts: int) ->
+  let b = pm_start n in
+  let e = pm_end n in
+  let c = tr_regexp_contents parts in
+  let d = (if a_is c (nt_dstr ()) then c
+           else if a_is c (nt_str ()) then p_str2dstr c
+           else n3 (nt_dstr ()) b e (lit_str "" (src_enc ())) (p_new_list c b e) 1) in
+  let _ = a_set_ty d (nt_dregx ()) in
+  let _ = a_set_beg d b in
+  let _ = a_set_end d e in
+  // dregex_fragment_setenc: /e /s /u give the pieces that encoding, /n and
+  // a US-ASCII program give them ASCII-8BIT
+  let fl = pm_flags n in
+  let fenc = (if bit_and fl (pm_f_regular_expression_utf_8 ()) != 0 then ao_enc_utf8 ()
+              else if bit_and fl (pm_f_regular_expression_euc_jp ()) != 0 then ao_enc_eucjp ()
+              else if bit_and fl (pm_f_regular_expression_windows_31j ()) != 0 then ao_enc_sjis ()
+              else if bit_and fl (pm_f_regular_expression_ascii_8bit ()) != 0 then ao_enc_binary ()
+              else if str_eq (vec_get pm_st 0) "US-ASCII" then ao_enc_binary ()
+              else 0 - 1) in
+  // (...only when there is a list: new_regexp asks `if (dreg->nd_next)`)
+  let setenc = fn (l: int) -> if l != 0 && fenc >= 0 && a_f d 1 != 0 then vec_set ao_l (l + 2) fenc else () in
+  let _ = setenc (a_f d 0) in
+  let rec each = fn (cell: int) ->
+    if cell == 0 then ()
+    else (let h = a_f cell 0 in
+          let _ = (if a_is h (nt_str ()) then setenc (a_f h 0)
+                   else if a_is h (nt_dstr ()) then (let _ = setenc (a_f h 0) in each (a_f h 1))
+                   else ()) in
+          each (a_f cell 1)) in
+  let _ = each (a_f d 1) in
+  if pm_has n (pm_f_regular_expression_once ()) then n1 (nt_once ()) b e d else d;
+let tr_interpolated_regular_expression = fn (n: int) ->
+  tr_dregx n (pm_interpolated_regular_expression_parts n);
+// (an interpolated regexp that is a condition: cond0's NEW_MATCH2(node, $_))
+let tr_interpolated_match_last_line = fn (n: int) ->
+  let d = tr_dregx n (pm_interpolated_match_last_line_parts n) in
+  let b = cl_b (pm_start n) in
+  let e = cl_e (pm_end n) in
+  let g = n1 (nt_gvar ()) b e (id_of "$_") in
+  n3 (nt_match2 ()) b e d g 0;
+
+// ---- variables -------------------------------------------------------------------
+// gettable: inside a block every local variable is a DVAR (dvar_defined
+// walks out to the method's own table), outside one an LVAR
+let tr_local_variable_read = fn (n: int) ->
+  n1 (if sc_is_block 0 then nt_dvar () else nt_lvar ())
+     (pm_start n) (pm_end n) (id_c (pm_local_variable_read_name n));
+// (`it`: the block's one implicit parameter, whose name in the table is "<it>")
+let tr_it_local_variable_read = fn (n: int) -> n1 (nt_dvar ()) (pm_start n) (pm_end n) (id_of "<it>");
+let tr_local_variable_target = fn (n: int) ->
+  n2 (asgn_type 0) (pm_start n) (pm_end n) (id_c (pm_local_variable_target_name n)) 0;
+let tr_instance_variable_read = fn (n: int) ->
+  n1 (nt_ivar ()) (pm_start n) (pm_end n) (id_c (pm_instance_variable_read_name n));
+let tr_global_variable_read = fn (n: int) ->
+  n1 (nt_gvar ()) (pm_start n) (pm_end n) (id_c (pm_global_variable_read_name n));
+let tr_class_variable_read = fn (n: int) ->
+  n1 (nt_cvar ()) (pm_start n) (pm_end n) (id_c (pm_class_variable_read_name n));
+let tr_constant_read = fn (n: int) ->
+  n1 (nt_const ()) (pm_start n) (pm_end n) (id_c (pm_constant_read_name n));
+// primary_value tCOLON2 tCONSTANT -> NEW_COLON2; tCOLON3 tCONSTANT -> NEW_COLON3
+let tr_constant_path = fn (n: int) ->
+  let par = pm_constant_path_parent n in
+  let ds = pm_constant_path_delimiter_loc_s n in
+  let de = pm_constant_path_delimiter_loc_e n in
+  let ns = pm_constant_path_name_loc_s n in
+  let ne = pm_constant_path_name_loc_e n in
+  if par == 0 then
+    a_xloc (n1 (nt_colon3 ()) (pm_start n) (pm_end n) (id_c (pm_constant_path_name n))) [ds, de, ns, ne]
+  else
+    (let h = tr par in
+     a_xloc (n2 (nt_colon2 ()) (pm_start n) (pm_end n) h (id_c (pm_constant_path_name n))) [ds, de, ns, ne]);
+// assignable: DASGN inside a block, LASGN outside one
+let asgn_type = fn (depth: int) -> if sc_is_block 0 then nt_dasgn () else nt_lasgn ();
+let tr_local_variable_write = fn (n: int) ->
+  let v = tr (pm_local_variable_write_value n) in
+  n2 (asgn_type (pm_local_variable_write_depth n)) (pm_start n) (pm_end n) (id_c (pm_local_variable_write_name n)) v;
+let tr_instance_variable_write = fn (n: int) ->
+  let v = tr (pm_instance_variable_write_value n) in
+  n2 (nt_iasgn ()) (pm_start n) (pm_end n) (id_c (pm_instance_variable_write_name n)) v;
+let tr_global_variable_write = fn (n: int) ->
+  let v = tr (pm_global_variable_write_value n) in
+  n2 (nt_gasgn ()) (pm_start n) (pm_end n) (id_c (pm_global_variable_write_name n)) v;
+let tr_class_variable_write = fn (n: int) ->
+  let v = tr (pm_class_variable_write_value n) in
+  n2 (nt_cvasgn ()) (pm_start n) (pm_end n) (id_c (pm_class_variable_write_name n)) v;
+// CDECL: vid, value, else
+let tr_constant_write = fn (n: int) ->
+  let v = tr (pm_constant_write_value n) in
+  n3 (nt_cdecl ()) (pm_start n) (pm_end n) (id_c (pm_constant_write_name n)) v 0;
+let tr_constant_path_write = fn (n: int) ->
+  let t = pm_constant_path_write_target n in
+  let path = tr_constant_path t in
+  let v = tr (pm_constant_path_write_value n) in
+  n3 (nt_cdecl ()) (pm_start n) (pm_end n) 0 v path;
+
+// ---- arguments -------------------------------------------------------------------
+// block_arg: tAMPER arg_value -> NEW_BLOCK_PASS (operator_loc)
+let tr_block_argument = fn (n: int) ->
+  let ex = pm_block_argument_expression n in
+  let os = pm_block_argument_operator_loc_s n in
+  let oe = pm_block_argument_operator_loc_e n in
+  // (a bare `&`: the method's anonymous block parameter)
+  let v = (if ex == 0 then n1 (nt_lvar ()) os oe (id_of "&") else tr ex) in
+  a_xloc (n2 (nt_block_pass ()) (pm_start n) (pm_end n) 0 v) [os, oe];
+// assoc: one element of a hash, as the LIST of a key and a value it is
+let tr_assoc = fn (el: int) ->
+  if pm_is el (pm_t_assoc_splat ()) then
+    // tDSTAR arg_value -> list_append(NEW_LIST(0), $2); a bare `**` is the
+    // method's anonymous keyword rest
+    (let x = pm_assoc_splat_value el in
+     let v = (if x == 0 then n1 (nt_lvar ()) (pm_start el) (pm_end el) (id_of "**") else tr x) in
+     p_list_append (p_new_list 0 (pm_start el) (pm_end el)) v)
+  else
+    (let k = tr (pm_assoc_key el) in
+     let v = tr (pm_assoc_value el) in
+     p_list_append (p_new_list k (pm_start el) (pm_end el)) v);
+// assocs: assoc | assocs ',' assoc. 0 when there are none.
+let tr_assocs = fn (l: int) ->
+  let cnt = pm_ls_len l in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i >= cnt then acc
+    else
+      (let el = pm_ls_at l i in
+       let tail = tr_assoc el in
+       if acc == 0 then go (i + 1) tail
+       else
+         // (`**{...}`, a literal hash splatted: its pairs join the list)
+         (let nx = a_f tail 1 in
+          let inner = (if a_f tail 0 == 0 && a_is nx (nt_list ()) && a_is (a_f nx 0) (nt_hash ()) then a_f (a_f nx 0) 0 else 0 - 1) in
+          if inner == 0 then go (i + 1) acc
+          else go (i + 1) (p_list_concat acc (if inner > 0 then inner else tail)))) in
+  go 0 0;
+// The arguments of a call, as parse.y's `call_args` builds them: `argsn` an
+// ArgumentsNode (or 0), `bp` the BLOCK_PASS of `&blk` (or 0).
+let tr_args = fn (argsn: int) -> fn (bp: int) -> tr_args_cmd argsn bp false;
+// (`cmd`: the call is written with no parentheses of its own, so a `(`
+//  that opens its first argument after a space is tLPAREN_ARG)
+let tr_args_cmd = fn (argsn: int) -> fn (bp: int) -> fn (cmd: bool) ->
+  if argsn == 0 then bp
+  else
+    (let l = pm_arguments_arguments argsn in
+     let cnt = pm_ls_len l in
+     let last = (if cnt > 0 then pm_ls_at l (cnt - 1) else 0) in
+     let kw = (if pm_is last (pm_t_keyword_hash ()) then last else 0) in
+     let fwd = (if kw == 0 && pm_is last (pm_t_forwarding_arguments ()) then last else 0) in
+     let npos = (if kw != 0 || fwd != 0 then cnt - 1 else cnt) in
+     let first_b = (if cnt > 0 then pm_start (pm_ls_at l 0) else 0) in
+     let rec go = fn (i: int) -> fn (acc: int) ->
+       if i >= npos then acc
+       else
+         (let e = pm_ls_at l i in
+          let _ = (if i == 0 && cmd && pm_byte (pm_start e) == 40 then lpa_set (pm_start e) else ()) in
+          if pm_is e (pm_t_splat ()) then
+            (let x = pm_splat_expression e in
+             let os = pm_splat_operator_loc_s e in
+             let oe = pm_splat_operator_loc_e e in
+             let v = (if x == 0 then n1 (nt_lvar ()) os oe (id_of "*") else tr x) in
+             if acc == 0 then go (i + 1) (a_xloc (n1 (nt_splat ()) (pm_start e) (pm_end e) v) [os, oe])
+             else go (i + 1) (p_rest_arg_append acc v first_b (pm_end e)))
+          else
+            (let v = tr e in
+             let _ = (if i == 0 then lpa_set (0 - 1) else ()) in
+             if acc == 0 then go (i + 1) (p_new_list v (pm_start e) (pm_end e))
+             else go (i + 1) (p_last_arg_append acc v first_b (pm_end e)))) in
+     let args = go 0 0 in
+     // (the location of `args ',' assocs opt_block_arg`: to the block argument's end)
+     let all_e = (if bp != 0 then a_end bp else if kw != 0 then pm_end kw else 0) in
+     let args = (if fwd != 0 then tr_fwd_args args fwd else args) in
+     let args = (if kw == 0 then args
+                 else
+                   (let assocs = tr_assocs (pm_keyword_hash_elements kw) in
+                    if assocs == 0 then args
+                    else
+                      (let h = n2 (nt_hash ()) (pm_start kw) (pm_end kw) assocs 0 in
+                       if args == 0 then p_new_list h (pm_start kw) (pm_end kw)
+                       else p_arg_append args h first_b all_e))) in
+     p_arg_blk_pass args bp);
+// new_args_forward_call: `...` among a call's arguments -- the method's
+// anonymous rest, keyword rest and block. `leading`: the arguments before it.
+let tr_fwd_args = fn (leading: int) -> fn (fwd: int) ->
+  let b = pm_start fwd in
+  let e = pm_end fwd in
+  // (argsloc: the parentheses around the arguments)
+  let ab = paren_before (if leading != 0 then a_beg leading else b) in
+  let ae = paren_after e in
+  let rest = n1 (nt_lvar ()) b e (id_of "*") in
+  let kwrest = p_list_append (p_new_list 0 b e) (n1 (nt_lvar ()) b e (id_of "**")) in
+  let block = a_xloc (n2 (nt_block_pass ()) ab ae 0 (n1 (nt_lvar ()) b e (id_of "&"))) [0 - 1, 0 - 1] in
+  let args = (if leading != 0 then p_rest_arg_append leading rest ab ae
+              else a_xloc (n1 (nt_splat ()) b e rest) [0 - 1, 0 - 1]) in
+  let args = p_arg_append args (n2 (nt_hash ()) b e kwrest 0) ab ae in
+  p_arg_blk_pass args block;
+// (the `(` before offset `i` and the `)` after it, blanks and line ends between)
+let rec paren_before = fn (i: int) ->
+  let c = pm_byte (i - 1) in
+  if c == 40 then i - 1 else if c == 32 || c == 9 || c == 10 || c == 13 then paren_before (i - 1) else i;
+let rec paren_after = fn (i: int) ->
+  let c = pm_byte i in
+  if c == 41 then i + 1 else if c == 32 || c == 9 || c == 10 || c == 13 then paren_after (i + 1) else i;
+
+// ---- blocks and parameters ---------------------------------------------------------
+// One parameter list (a ParametersNode, or 0) as parse.y's ARGS -- new_args
+// over new_args_tail. `b`/`e`: its location. `blockp`: in a block or a
+// lambda (its assignments are DASGN). Answers the ARGS node and leaves the
+// argument part of the scope's table on as_nm (nm_take).
+//
+// ARGS: pre_num, pre_init, opt_args, first_post, post_num, post_init, rest,
+//       no_kwarg, kw_args, kw_rest, block
+let tr_params = fn (pn: int) -> fn (b: int) -> fn (e: int) -> fn (blockp: bool) ->
+  let asgn = (if blockp then nt_dasgn () else nt_lasgn ()) in
+  let lvar = (if blockp then nt_dvar () else nt_lvar ()) in
+  let reqs = (if pn == 0 then 0 else pm_parameters_requireds pn) in
+  let opts = (if pn == 0 then 0 else pm_parameters_optionals pn) in
+  let rest = (if pn == 0 then 0 else pm_parameters_rest pn) in
+  let posts = (if pn == 0 then 0 else pm_parameters_posts pn) in
+  let kws = (if pn == 0 then 0 else pm_parameters_keywords pn) in
+  let kwrest = (if pn == 0 then 0 else pm_parameters_keyword_rest pn) in
+  let blk = (if pn == 0 then 0 else pm_parameters_block pn) in
+  // f_arg: the names, and the MASGNs of the destructuring ones (block_append)
+  let rec pre = fn (l: int) -> fn (i: int) -> fn (init: int) ->
+    if i >= pm_ls_len l then init
+    else
+      (let x = pm_ls_at l i in
+       if pm_is x (pm_t_required_parameter ()) then
+         (let _ = nm_push (k_id (id_c (pm_required_parameter_name x))) in
+          pre l (i + 1) init)
+       else
+         // tLPAREN f_margs rparen: an internal variable holds the argument
+         (let _ = nm_push 0 in
+          let m = tr_f_margs x blockp in
+          let inner = pm_start x + 1 in
+          let _ = a_set m 0 (n1 lvar inner inner (id_internal ())) in
+          pre l (i + 1) (p_block_append init m))) in
+  let pre_init = pre reqs 0 0 in
+  // f_opt_arg: OPT_ARG (body, next)
+  let rec opt = fn (i: int) -> fn (first: int) -> fn (lastn: int) ->
+    if i >= pm_ls_len opts then first
+    else
+      (let x = pm_ls_at opts i in
+       let _ = nm_push (k_id (id_c (pm_optional_parameter_name x))) in
+       let v = tr (pm_optional_parameter_value x) in
+       let a = n2 asgn (pm_start x) (pm_end x) (id_c (pm_optional_parameter_name x)) v in
+       let o = n2 (nt_opt_arg ()) (pm_start x) (pm_end x) a 0 in
+       let _ = (if lastn != 0 then a_set lastn 1 o else ()) in
+       opt (i + 1) (if first == 0 then o else first) o) in
+  let opt_args = opt 0 0 0 in
+  let _ = chain_ends opt_args in
+  // f_rest_arg: the name, `*` for an anonymous one; an ImplicitRestNode is
+  // the excessed comma of `|a,|`
+  let rest_id =
+    (if rest == 0 then 0
+     else if pm_is rest (pm_t_implicit_rest ()) then 0 - 1
+     else if pm_rest_parameter_name rest == 0 then (let i = id_of "*" in let _ = nm_push (k_id i) in i)
+     else (let i = id_c (pm_rest_parameter_name rest) in let _ = nm_push (k_id i) in i)) in
+  let npost0 = nm_len () in
+  let post_init = pre posts 0 0 in
+  let first_post = (if pm_ls_len posts == 0 then 0
+                    else (let k = nm_at npost0 in if k == 0 then id_internal () else k_val k)) in
+  // f_kwarg: KW_ARG (body, next); the table has the required ones first
+  let rec kwnames = fn (i: int) -> fn (req: bool) ->
+    if i >= pm_ls_len kws then ()
+    else
+      (let x = pm_ls_at kws i in
+       let isreq = pm_is x (pm_t_required_keyword_parameter ()) in
+       let _ = (if isreq == req then
+                  nm_push (k_id (id_c (if isreq then pm_required_keyword_parameter_name x else pm_optional_keyword_parameter_name x)))
+                else ()) in
+       kwnames (i + 1) req) in
+  let _ = kwnames 0 true in
+  let _ = kwnames 0 false in
+  let rec kw = fn (i: int) -> fn (first: int) -> fn (lastn: int) ->
+    if i >= pm_ls_len kws then first
+    else
+      (let x = pm_ls_at kws i in
+       let a = (if pm_is x (pm_t_required_keyword_parameter ()) then
+                  n2 asgn (pm_start x) (pm_end x) (id_c (pm_required_keyword_parameter_name x)) (0 - 1)
+                else
+                  (let v = tr (pm_optional_keyword_parameter_value x) in
+                   n2 asgn (pm_start x) (pm_end x) (id_c (pm_optional_keyword_parameter_name x)) v)) in
+       let k = n2 (nt_kw_arg ()) (pm_start x) (pm_end x) a 0 in
+       let _ = (if lastn != 0 then a_set lastn 1 k else ()) in
+       kw (i + 1) (if first == 0 then k else first) k) in
+  let kw_args = kw 0 0 0 in
+  let _ = chain_ends kw_args in
+  // (the keyword bits, an internal variable after the keywords)
+  let _ = (if kw_args != 0 then nm_push 0 else ()) in
+  let fwd = pm_is kwrest (pm_t_forwarding_parameter ()) in
+  let nokw = pm_is kwrest (pm_t_no_keywords_parameter ()) in
+  // f_kwrest, and what new_args_tail makes of it: a DVAR at kw_rest_loc
+  let kwrest_id =
+    (if kwrest == 0 || nokw then 0
+     else if fwd then id_of "**"
+     else if pm_keyword_rest_parameter_name kwrest == 0 then id_of "**"
+     else id_c (pm_keyword_rest_parameter_name kwrest)) in
+  // (`...`: add_forwarding_args declares *, **, & and ... in that order)
+  let rest_id = (if fwd then (let i = id_of "*" in let _ = nm_push (k_id i) in i) else rest_id) in
+  let _ = (if kwrest_id != 0 then nm_push (k_id kwrest_id) else ()) in
+  let kwrest_node =
+    (if kw_args != 0 then
+       (if kwrest != 0 && nott nokw then n1 (nt_dvar ()) (pm_start kwrest) (pm_end kwrest) kwrest_id
+        else (let ks = pm_start (pm_ls_at kws 0) in
+              let ke = pm_end (pm_ls_at kws (pm_ls_len kws - 1)) in
+              n1 (nt_dvar ()) ks ke 0))
+     else if kwrest_id != 0 then n1 (nt_dvar ()) (pm_start kwrest) (pm_end kwrest) kwrest_id
+     else 0) in
+  let blk_id =
+    (if fwd then (let i = id_of "&" in let _ = nm_push (k_id i) in let _ = nm_push (k_sym "...") in i)
+     else if blk == 0 then 0
+     else if pm_block_parameter_name blk == 0 then (let i = id_of "&" in let _ = nm_push (k_id i) in i)
+     else (let i = id_c (pm_block_parameter_name blk) in let _ = nm_push (k_id i) in i)) in
+  let r = a_new (nt_args ()) b e in
+  let _ = vec_push ao_n (pm_ls_len reqs) in
+  let _ = vec_push ao_n pre_init in
+  let _ = vec_push ao_n opt_args in
+  let _ = vec_push ao_n first_post in
+  let _ = vec_push ao_n (pm_ls_len posts) in
+  let _ = vec_push ao_n post_init in
+  let _ = vec_push ao_n rest_id in
+  let _ = vec_push ao_n (if nokw && kw_args == 0 then 1 else 0) in
+  let _ = vec_push ao_n kw_args in
+  let _ = vec_push ao_n kwrest_node in
+  let _ = vec_push ao_n blk_id in
+  r;
+// (opt_arg_append / kwd_append: every node of the chain ends where the last does)
+let chain_ends = fn (first: int) ->
+  if first == 0 then ()
+  else
+    (let rec last = fn (x: int) -> if a_f x 1 == 0 then x else last (a_f x 1) in
+     let e = a_end (last first) in
+     let rec set = fn (x: int) -> if x == 0 then () else (let _ = a_set_end x e in set (a_f x 1)) in
+     set first);
+// f_margs (a MultiTargetNode among the parameters)
+let tr_f_margs = fn (x: int) -> fn (blockp: bool) -> tr_mlhs_of x true;
+// brace_body / do_body: NEW_ITER(args, body) -- the SCOPE of a BlockNode,
+// located at its braces (set_embraced_location)
+let tr_block_scope = fn (blk: int) ->
+  (let nbase = nm_len () in
+    let _ = sc_push 1 in
+    let os = pm_block_opening_loc_s blk in
+    let oe = pm_block_opening_loc_e blk in
+    let ce = pm_block_closing_loc_e blk in
+    let pn = pm_block_parameters blk in
+    let args =
+      (if pn == 0 then 0
+       else if pm_is pn (pm_t_block_parameters ()) then
+         (let ps = pm_block_parameters_parameters pn in
+          if ps == 0 then 0 else tr_params ps (pm_start ps) (pm_end ps) true)
+       else
+         // args_with_numbered: _1.._9 or `it`, located where the block ends
+         (let a = tr_params 0 ce ce true in
+          if pm_is pn (pm_t_numbered_parameters ()) then
+            (let mx = pm_numbered_parameters_maximum pn in
+             let _ = a_set a 0 mx in
+             let rec nm = fn (i: int) -> if i > mx then () else (let _ = nm_push (k_sym ("_" ++ str_of_int i)) in nm (i + 1)) in
+             let _ = nm 1 in
+             a)
+          else (let _ = a_set a 0 1 in let _ = nm_push (k_sym "<it>") in a))) in
+    // (where an empty body's BEGIN is: after `|...|`, else after the opener)
+    let empty_at = (if pm_is pn (pm_t_block_parameters ()) then pm_end pn else oe) in
+    let bodyn = pm_block_body blk in
+    let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt bodyn empty_at
+                else tr_compstmt bodyn empty_at) in
+    let tbl = scope_tbl (pm_block_locals blk) (nm_take nbase) in
+    let _ = sc_pop () in
+    n3 (nt_scope ()) os ce tbl args body);
+// method_add_block: the ITER of a call and its block. ITER: iter, body
+let tr_iter = fn (call: int) -> fn (blk: int) -> fn (b: int) -> fn (e: int) ->
+  let scope = tr_block_scope blk in
+  n2 (nt_iter ()) b e call scope;
+
+// ---- calls ---------------------------------------------------------------------
+let is_binop = fn (s: str) ->
+  str_eq s "+" || str_eq s "-" || str_eq s "*" || str_eq s "/" || str_eq s "%" || str_eq s "**"
+  || str_eq s "|" || str_eq s "^" || str_eq s "&" || str_eq s "<=>" || str_eq s "==" || str_eq s "==="
+  || str_eq s "!=" || str_eq s "=~" || str_eq s "!~" || str_eq s "<<" || str_eq s ">>"
+  || str_eq s "<" || str_eq s ">" || str_eq s "<=" || str_eq s ">=";
+let is_numeric = fn (x: int) ->
+  pm_is x (pm_t_integer ()) || pm_is x (pm_t_float ()) || pm_is x (pm_t_rational ()) || pm_is x (pm_t_imaginary ());
+let is_unop = fn (s: str) -> str_eq s "-@" || str_eq s "+@" || str_eq s "!" || str_eq s "~";
+// match_op
+let p_match_op = fn (x1: int) -> fn (x2: int) -> fn (b: int) -> fn (e: int) ->
+  let o1 = (if a_is x1 (nt_once ()) then a_f x1 0 else x1) in
+  let o2 = (if a_is x2 (nt_once ()) then a_f x2 0 else x2) in
+  if a_is o1 (nt_dregx ()) || a_is o1 (nt_regx ()) then n3 (nt_match2 ()) b e x1 x2 0
+  else if a_is o2 (nt_dregx ()) then n2 (nt_match3 ()) b e x2 x1
+  else n3 (nt_call ()) b e x1 (id_of "=~") (p_new_list x2 (a_beg x2) (a_end x2));
+// A CallNode without its `{ }` / `do end` block, ending at `en`.
+let tr_call_core = fn (n: int) -> fn (en: int) ->
+  let recv = pm_call_receiver n in
+  let name = cname (pm_call_name n) in
+  let mid = id_c (pm_call_name n) in
+  let b = pm_start n in
+  let blk = pm_call_block n in
+  let argsn = pm_call_arguments n in
+  let op = pm_call_call_operator_loc_s n in
+  if recv == 0 then
+    (if pm_has n (pm_f_call_variable_call ()) then n1 (nt_vcall ()) b en mid
+     else
+       (let bp = (if pm_is blk (pm_t_block_argument ()) then tr_block_argument blk else 0) in
+        n2 (nt_fcall ()) b en mid (tr_args_cmd argsn bp (pm_call_opening_loc_s n < 0))))
+  else if pm_has n (pm_f_call_attribute_write ()) then
+    // attrset / aryset, then node_assign: the value joins the arguments
+    (let r = tr recv in
+     let l = pm_arguments_arguments argsn in
+     let cnt = pm_ls_len l in
+     let vn = pm_ls_at l (cnt - 1) in
+     let idx = tr_args_first argsn (cnt - 1) in
+     let bp = (if pm_is blk (pm_t_block_argument ()) then tr_block_argument blk else 0) in
+     let idx = p_arg_blk_pass idx bp in
+     let v = tr vn in
+     // (attrset: `a&.b = v` keeps the name as it is written)
+     let mid2 = (if pm_has n (pm_f_call_safe_navigation ()) && str_len name > 1 then id_of (substring name 0 (str_len name - 1)) else mid) in
+     n3 (nt_attrasgn ()) b en r mid2 (p_arg_append idx v b en))
+  else if op < 0 && argsn == 0 && is_unop name && (pm_call_opening_loc_s n < 0 || str_eq name "!") then
+    // call_uni_op
+    (let isnot = str_eq name "!" && pm_call_message_loc_e n - pm_call_message_loc_s n == 3 in
+     let _ = (if str_eq name "!" && recv != 0 then cl_set (pm_start recv) (pm_end recv) else ()) in
+     let r = (if isnot && pm_is recv (pm_t_parentheses ()) then
+                // keyword_not '(' expr rparen: the parentheses are `not`'s;
+                // after a space they are tLPAREN_ARG, a primary of their own
+                (if pm_start recv == pm_call_message_loc_e n then
+                   (if pm_parentheses_body recv == 0 then n0 (nt_nil ()) (pm_start recv) (pm_start recv + 1)
+                    else tr_stmts_of (pm_parentheses_body recv))
+                 else tr_paren_body recv)
+              else tr recv) in
+     // tUMINUS_NUM simple_numeric tPOW arg: the power is given the whole's place
+     let _ = (if str_eq name "-@" && a_is r (nt_opcall ()) && pm_is recv (pm_t_call ())
+                 && str_eq (cname (pm_call_name recv)) "**" && pm_call_call_operator_loc_s recv < 0
+                 && is_numeric (pm_call_receiver recv)
+              then a_set_beg r b else ()) in
+     n3 (nt_opcall ()) b en r mid 0)
+  else if op < 0 && argsn != 0 && is_binop name && pm_call_opening_loc_s n < 0 then
+    // call_bin_op, match_op
+    (let r = tr recv in
+     let a = tr (pm_ls_at (pm_arguments_arguments argsn) 0) in
+     if str_eq name "=~" then p_match_op r a b en
+     else n3 (nt_opcall ()) b en r mid (p_new_list a (a_beg a) (a_end a)))
+  else
+    (let r = tr recv in
+     let bp = (if pm_is blk (pm_t_block_argument ()) then tr_block_argument blk else 0) in
+     let args = tr_args_cmd argsn bp (pm_call_opening_loc_s n < 0) in
+     n3 (if pm_has n (pm_f_call_safe_navigation ()) then nt_qcall () else nt_call ()) b en r mid args);
+// (the first `cnt` arguments of an ArgumentsNode, with no keyword hash: the
+//  index of `a[i] = v`)
+let tr_args_first = fn (argsn: int) -> fn (cnt: int) ->
+  let l = pm_arguments_arguments argsn in
+  let first_b = (if cnt > 0 then pm_start (pm_ls_at l 0) else 0) in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i >= cnt then acc
+    else
+      (let e = pm_ls_at l i in
+       if pm_is e (pm_t_splat ()) then
+         (let x = pm_splat_expression e in
+          let os = pm_splat_operator_loc_s e in
+          let oe = pm_splat_operator_loc_e e in
+          let v = (if x == 0 then n1 (nt_lvar ()) os oe (id_of "*") else tr x) in
+          if acc == 0 then go (i + 1) (a_xloc (n1 (nt_splat ()) (pm_start e) (pm_end e) v) [os, oe])
+          else go (i + 1) (p_rest_arg_append acc v first_b (pm_end e)))
+       else if pm_is e (pm_t_keyword_hash ()) then
+         (let assocs = tr_assocs (pm_keyword_hash_elements e) in
+          let h = n2 (nt_hash ()) (pm_start e) (pm_end e) assocs 0 in
+          if acc == 0 then go (i + 1) (p_new_list h (pm_start e) (pm_end e))
+          else go (i + 1) (p_arg_append acc h first_b (pm_end e)))
+       else
+         (let v = tr e in
+          if acc == 0 then go (i + 1) (p_new_list v (pm_start e) (pm_end e))
+          else go (i + 1) (p_last_arg_append acc v first_b (pm_end e)))) in
+  go 0 0;
+let tr_call = fn (n: int) ->
+  let blk = pm_call_block n in
+  if pm_is blk (pm_t_block ()) then
+    // (the call ends where its arguments do: the block is added after)
+    (let ce = pm_call_closing_loc_e n in
+     let argsn = pm_call_arguments n in
+     let en = (if ce >= 0 then ce
+               else if argsn != 0 then pm_end argsn
+               else if pm_call_message_loc_e n >= 0 then pm_call_message_loc_e n
+               else pm_block_opening_loc_s blk) in
+     let recv = pm_call_receiver n in
+     // (block_call call_op2 operation2 ... brace_block: new_command_qcall
+     //  gives the call the whole's place, its block included)
+     let on_block_call = pm_is recv (pm_t_call ()) && pm_is (pm_call_block recv) (pm_t_block ())
+                         && pm_call_arguments recv != 0 && pm_call_opening_loc_s recv < 0 in
+     // (primary_value call_op operation2 command_args cmd_brace_block: the same)
+     let cmd_brace = recv != 0 && argsn != 0 && ce < 0 && pm_byte (pm_block_opening_loc_s blk) == 123 in
+     let core = tr_call_core n (if on_block_call || cmd_brace then pm_end n else en) in
+     tr_iter core blk (pm_start n) (pm_end n))
+  else tr_call_core n (pm_end n);
+
+// ---- definitions -----------------------------------------------------------------
+// defn_head f_arglist bodystmt k_end, and the endless forms
+// DEFN: mid, defn.  DEFS: recv, mid, defn
+let tr_def = fn (n: int) ->
+  (let nbase = nm_len () in
+    let b = pm_start n in
+    let e = pm_end n in
+    let rn = pm_def_receiver n in
+    // singleton: '(' expr rparen -> the expression
+    let recv = (if rn == 0 then 0
+                else if pm_is rn (pm_t_parentheses ()) then tr_stmts_of (pm_parentheses_body rn)
+                else tr rn) in
+    let _ = sc_push 0 in
+    let pn = pm_def_parameters n in
+    let lp = pm_def_lparen_loc_s n in
+    let ne = pm_def_name_loc_e n in
+    let endless = pm_def_equal_loc_s n >= 0 in
+    let args =
+      (if pn != 0 then tr_params pn (pm_start pn) (pm_end pn) false
+       // (no parameters: where f_args' empty rule is -- the `(`, the end of
+       //  the name, or for `def f = ...` the whole head)
+       else if lp >= 0 then tr_params 0 lp (pm_def_lparen_loc_e n) false
+       else if endless then tr_params 0 b ne false
+       else tr_params 0 ne ne false) in
+    let bodyn = pm_def_body n in
+    // (f_paren_args takes no term: a `;` after `)` is the body's, whose
+    //  empty `stmts` is reduced before it)
+    let re = pm_def_rparen_loc_e n in
+    // (...and f_arglist without parentheses takes one: a `;` after THAT
+    //  term is the body's in the same way -- `def foo a` / `  ;` / `  x`)
+    let lead = (if endless then false
+                else if re >= 0 then pm_byte (skip_blank re) == 59
+                else semi_after_term (if pn != 0 then pm_end pn else ne)) in
+    // (where an empty body is: after `)`, or after the term f_arglist takes)
+    let body_at = (if re >= 0 then re else skip_term (if pn != 0 then pm_end pn else ne)) in
+    let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt_lead bodyn lead body_at
+                else if lead then tr_compstmt_lead bodyn true body_at
+                else if bodyn == 0 then 0
+                else tr_stmt_list (pm_statements_body bodyn)) in
+    let body = p_scope_body body in
+    let tbl = scope_tbl (pm_def_locals n) (nm_take nbase) in
+    let _ = sc_pop () in
+    let scope = n3 (nt_scope ()) b e tbl args body in
+    let mid = id_c (pm_def_name n) in
+    if recv == 0 then n2 (nt_defn ()) b e mid scope
+    else n3 (nt_defs ()) b e recv mid scope);
+// error_tolerant: the `end` that closes a class or module by its indent.
+// parse.y, reading a program that will not parse, takes a word `end` for
+// the keyword wherever it stands -- after a `.` too -- when it is on a later
+// line than the keyword of the construct it is inside and no further right
+// (the lexer's enforce_keyword_end). So in
+//     class Foo
+//       foo.
+//     end
+// the class ends there and `foo.` is an ERROR, where Prism reads the call
+// `foo.end` and goes on looking for the class's end. Answers the index of
+// that statement in the body `l` of a construct whose keyword starts at
+// `ks`, -1 when there is none. Only a statement that is the call itself is
+// looked at, and only directly in the body.
+let dummy_end_in = fn (l: int) -> fn (ks: int) ->
+  if vec_get pm_hd 6 < 0 || vec_len pm_er == 0 || ks < 0 then 0 - 1
+  else
+    (let kline = ao_line_of ks in
+     let kcol = ks - ast_line_start ks in
+     let cnt = pm_ls_len l in
+     let rec go = fn (i: int) ->
+       if i >= cnt then 0 - 1
+       else
+         (let x = pm_ls_at l i in
+          if pm_is x (pm_t_call ()) && pm_call_receiver x != 0 && pm_call_call_operator_loc_s x >= 0
+             && pm_call_opening_loc_s x < 0 && pm_call_arguments x == 0 && pm_call_block x == 0
+             && (let ms = pm_call_message_loc_s x in
+                 ms >= 0 && pm_call_message_loc_e x - ms == 3 && str_eq (pm_text ms (ms + 3)) "end"
+                 && ao_line_of ms > kline && ms - ast_line_start ms <= kcol)
+          then i else go (i + 1)) in
+     go 0);
+// (the body `bodyn` of a class or module whose keyword starts at `ks`: the
+//  index dummy_end_in answers, with the walk told to cut the list there)
+let dummy_end_cut = fn (bodyn: int) -> fn (ks: int) ->
+  if bodyn == 0 || nott (pm_is bodyn (pm_t_statements ())) then 0 - 1
+  else
+    (let l = pm_statements_body bodyn in
+     let de = dummy_end_in l ks in
+     if de < 0 then de
+     else
+       (let x = pm_ls_at l de in
+        let _ = vec_set as_px 3 l in
+        let _ = vec_set as_px 4 de in
+        let _ = vec_set as_px 5 (pm_start x) in
+        let _ = vec_set as_px 6 (pm_call_message_loc_e x) in
+        de));
+// (...and after the body is translated: the statements past the `end` wait
+//  for the list the construct is in)
+let dummy_end_rest = fn (bodyn: int) -> fn (de: int) ->
+  if de < 0 then ()
+  else (let _ = vec_set as_px 1 (pm_statements_body bodyn) in vec_set as_px 2 (de + 1));
+// cpath: cname -> NEW_COLON2(0, cname); the scoped forms as they are
+let tr_cpath = fn (c: int) ->
+  if pm_is c (pm_t_constant_read ()) then
+    a_xloc (n2 (nt_colon2 ()) (pm_start c) (pm_end c) 0 (id_c (pm_constant_read_name c))) [0 - 1, 0 - 1, pm_start c, pm_end c]
+  else tr c;
+// k_class cpath superclass bodystmt k_end.  CLASS: cpath, super, body
+let tr_class = fn (n: int) ->
+  let b = pm_start n in
+  let cp = pm_class_constant_path n in
+  let path = tr_cpath cp in
+  let sup = (if pm_class_superclass n == 0 then 0 else tr (pm_class_superclass n)) in
+  let _ = sc_push 0 in
+  let bodyn = pm_class_body n in
+  // (error_tolerant: an `end` that closes the class by its indent)
+  let de = dummy_end_cut bodyn (pm_class_class_keyword_loc_s n) in
+  let dx = (if de < 0 then 0 else pm_ls_at (pm_statements_body bodyn) de) in
+  let _ = vec_set as_px 7 (0 - 1) in
+  let own9 = vec_get as_px 9 in
+  let _ = vec_set as_px 9 (if vec_get pm_hd 6 >= 0 && vec_len pm_er > 0 && bodyn != 0 && pm_is bodyn (pm_t_statements ())
+                           then pm_statements_body bodyn else 0 - 1) in
+  // (`superclass` takes the term after it; with none, a term after the
+  //  path belongs to the body, whose empty `stmts` is reduced before it)
+  //  (...and with one, a `;` after the term `superclass` took is)
+  let lead = (if sup == 0 then term_ahead (pm_end cp) else semi_after_term (pm_end (pm_class_superclass n))) in
+  let lead_at = (if sup == 0 then pm_end cp else skip_term (pm_end (pm_class_superclass n))) in
+  let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt_lead bodyn lead lead_at
+              else tr_compstmt_lead bodyn lead lead_at) in
+  let _ = vec_set as_px 9 own9 in
+  let _ = dummy_end_rest bodyn de in
+  // (its `end`: the one that closed it by its indent; or, a construct in
+  //  its body having been closed that way, the `end` Prism gave to that one
+  //  -- and its own goes up in turn; or its own)
+  let hs = vec_get as_px 7 in
+  let he = vec_get as_px 8 in
+  let e = (if de >= 0 then pm_call_message_loc_e dx else if hs >= 0 then he else pm_end n) in
+  let ends = (if de >= 0 then pm_call_message_loc_s dx else if hs >= 0 then hs else pm_class_end_keyword_loc_s n) in
+  let ende = (if de >= 0 then pm_call_message_loc_e dx else if hs >= 0 then he else pm_class_end_keyword_loc_e n) in
+  let _ = (if de >= 0 || hs >= 0
+           then (let _ = vec_set as_px 7 (pm_class_end_keyword_loc_s n) in vec_set as_px 8 (pm_class_end_keyword_loc_e n))
+           else ()) in
+  let tbl = scope_tbl (pm_class_locals n) Nil in
+  let _ = sc_pop () in
+  let scope = n3 (nt_scope ()) b e tbl 0 body in
+  a_xloc (n3 (nt_class ()) b e path sup scope)
+    [pm_class_class_keyword_loc_s n, pm_class_class_keyword_loc_e n,
+     pm_class_inheritance_operator_loc_s n, pm_class_inheritance_operator_loc_e n,
+     ends, ende];
+// Where the newline token is when a comment (starting at `i`) follows a
+// statement on its line. The lexer reads the comment to the line's end, the
+// newline included, and looks at the next line; comment lines after it are
+// read the same way, so the token is the column past the newline on the
+// LAST of those lines. When the program ends there, no newline token is
+// placed and the last comment's own start is what the grammar sees.
+let rec nl_after_comment = fn (i: int) ->
+  let k = ast_line_end_from i in
+  if pm_byte k < 0 || pm_byte (k + 1) < 0 then i
+  else
+    (let j = skip_blank (k + 1) in
+     if pm_byte j == 35 then nl_after_comment j
+     else pos_lc (ao_line_of k) (k - vec_get pm_lo (ao_line_of k) + 1));
+// (the offset of the newline that ends the line `i` is on; the program's
+//  length when there is none)
+let rec ast_line_end_from = fn (i: int) ->
+  let c = pm_byte i in
+  if c < 0 || c == 10 then i else ast_line_end_from (i + 1);
+// (the end of the `term` that starts at or after `i`: past a `;`, or at the
+//  line end a newline token is)
+let rec skip_term = fn (i: int) ->
+  let c = pm_byte i in
+  if c == 32 || c == 9 || c == 13 then skip_term (i + 1)
+  else if c == 59 then i + 1
+  else if c == 35 then nl_after_comment i
+  else i;
+// (whether a `;` stands between the term that starts at or after `i` -- one
+//  a header takes: superclass's, f_arglist's -- and the first statement. The
+//  body's empty `stmts` is then reduced in front of that `;`, and the body
+//  is BLOCK[BEGIN, ...]. A line end there is not a term: the lexer is at the
+//  start of an expression and skips it.)
+let semi_after_term = fn (i: int) ->
+  let j = skip_blank i in
+  pm_byte (skip_space_nl (if pm_byte j == 59 then j + 1 else j)) == 59;
+// k_module cpath bodystmt k_end.  MODULE: cpath, body
+let tr_module = fn (n: int) ->
+  let b = pm_start n in
+  let cp = pm_module_constant_path n in
+  let path = tr_cpath cp in
+  let _ = sc_push 0 in
+  let bodyn = pm_module_body n in
+  // (error_tolerant: an `end` that closes the module by its indent)
+  let de = dummy_end_cut bodyn (pm_module_module_keyword_loc_s n) in
+  let dx = (if de < 0 then 0 else pm_ls_at (pm_statements_body bodyn) de) in
+  let _ = vec_set as_px 7 (0 - 1) in
+  let own9 = vec_get as_px 9 in
+  let _ = vec_set as_px 9 (if vec_get pm_hd 6 >= 0 && vec_len pm_er > 0 && bodyn != 0 && pm_is bodyn (pm_t_statements ())
+                           then pm_statements_body bodyn else 0 - 1) in
+  let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt_lead bodyn (term_ahead (pm_end cp)) (pm_end cp)
+              else tr_compstmt_lead bodyn (term_ahead (pm_end cp)) (pm_end cp)) in
+  let _ = vec_set as_px 9 own9 in
+  let _ = dummy_end_rest bodyn de in
+  // (its `end`: the one that closed it by its indent; or, a construct in
+  //  its body having been closed that way, the `end` Prism gave to that one
+  //  -- and its own goes up in turn; or its own)
+  let hs = vec_get as_px 7 in
+  let he = vec_get as_px 8 in
+  let e = (if de >= 0 then pm_call_message_loc_e dx else if hs >= 0 then he else pm_end n) in
+  let ends = (if de >= 0 then pm_call_message_loc_s dx else if hs >= 0 then hs else pm_module_end_keyword_loc_s n) in
+  let ende = (if de >= 0 then pm_call_message_loc_e dx else if hs >= 0 then he else pm_module_end_keyword_loc_e n) in
+  let _ = (if de >= 0 || hs >= 0
+           then (let _ = vec_set as_px 7 (pm_module_end_keyword_loc_s n) in vec_set as_px 8 (pm_module_end_keyword_loc_e n))
+           else ()) in
+  let tbl = scope_tbl (pm_module_locals n) Nil in
+  let _ = sc_pop () in
+  let scope = n3 (nt_scope ()) b e tbl 0 body in
+  a_xloc (n2 (nt_module ()) b e path scope)
+    [pm_module_module_keyword_loc_s n, pm_module_module_keyword_loc_e n,
+     ends, ende];
+// k_class tLSHFT expr_value term bodystmt k_end.  SCLASS: recv, body
+let tr_singleton_class = fn (n: int) ->
+  let b = pm_start n in
+  let e = pm_end n in
+  let ex = pm_singleton_class_expression n in
+  let recv = tr ex in
+  let _ = sc_push 0 in
+  let bodyn = pm_singleton_class_body n in
+  let at = skip_term (pm_end ex) in
+  let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt bodyn at else tr_compstmt bodyn at) in
+  let tbl = scope_tbl (pm_singleton_class_locals n) Nil in
+  let _ = sc_pop () in
+  let scope = n3 (nt_scope ()) b e tbl 0 body in
+  a_xloc (n2 (nt_sclass ()) b e recv scope)
+    [pm_singleton_class_class_keyword_loc_s n, pm_singleton_class_class_keyword_loc_e n,
+     pm_singleton_class_operator_loc_s n, pm_singleton_class_operator_loc_e n,
+     pm_singleton_class_end_keyword_loc_s n, pm_singleton_class_end_keyword_loc_e n];
+
+// ---- begin / rescue / ensure -------------------------------------------------------
+// then: term | keyword_then | term keyword_then -- where it starts and ends,
+// after the expression that ends at `after`; `kw_s`/`kw_e` is the keyword's
+// own place (-1 -1: there is none). A term is a `;` or the line end, which
+// as a token has no width.
+let then_start = fn (after: int) -> fn (kw_s: int) ->
+  let t = skip_blank after in
+  let c = pm_byte t in
+  if (c == 59 || c == 10 || c == 35 || c < 0) && (kw_s < 0 || t < kw_s) then (if c == 35 then nl_after_comment t else t)
+  else kw_s;
+let then_end = fn (after: int) -> fn (kw_e: int) ->
+  if kw_e >= 0 then kw_e else skip_term after;
+// A target that is assigned `value` (node_assign over what `lhs` builds):
+// the reference of a rescue, a for's variable, one side of a multiple
+// assignment.
+let tr_target = fn (t: int) -> fn (value: int) -> fn (b: int) -> fn (e: int) ->
+  let ty = pm_type t in
+  if ty == pm_t_local_variable_target () then
+    n2 (asgn_type 0) b e (id_c (pm_local_variable_target_name t)) value
+  else if ty == pm_t_instance_variable_target () then
+    n2 (nt_iasgn ()) b e (id_c (pm_instance_variable_target_name t)) value
+  else if ty == pm_t_global_variable_target () then
+    n2 (nt_gasgn ()) b e (id_c (pm_global_variable_target_name t)) value
+  else if ty == pm_t_class_variable_target () then
+    n2 (nt_cvasgn ()) b e (id_c (pm_class_variable_target_name t)) value
+  else if ty == pm_t_constant_target () then
+    n3 (nt_cdecl ()) b e (id_c (pm_constant_target_name t)) value 0
+  else if ty == pm_t_constant_path_target () then
+    (let par = pm_constant_path_target_parent t in
+     let ds = pm_constant_path_target_delimiter_loc_s t in
+     let de = pm_constant_path_target_delimiter_loc_e t in
+     let ns = pm_constant_path_target_name_loc_s t in
+     let ne = pm_constant_path_target_name_loc_e t in
+     let path = (if par == 0 then a_xloc (n1 (nt_colon3 ()) (pm_start t) (pm_end t) (id_c (pm_constant_path_target_name t))) [ds, de, ns, ne]
+                 else (let h = tr par in
+                       a_xloc (n2 (nt_colon2 ()) (pm_start t) (pm_end t) h (id_c (pm_constant_path_target_name t))) [ds, de, ns, ne])) in
+     n3 (nt_cdecl ()) b e 0 value path)
+  else if ty == pm_t_call_target () then
+    // attrset: the value is the one argument
+    (let r = tr (pm_call_target_receiver t) in
+     n3 (nt_attrasgn ()) b e r (id_c (pm_call_target_name t))
+        (if value == 0 then 0 else p_new_list value (a_beg value) (a_end value)))
+  else if ty == pm_t_index_target () then
+    // aryset: the value joins the index
+    (let r = tr (pm_index_target_receiver t) in
+     let argsn = pm_index_target_arguments t in
+     let idx = (if argsn == 0 then 0 else tr_args_first argsn (pm_ls_len (pm_arguments_arguments argsn))) in
+     n3 (nt_attrasgn ()) b e r (id_of "[]=")
+        (if value == 0 then idx else p_arg_append idx value b e))
+  else tr_unknown t;
+// opt_rescue: k_rescue exc_list exc_var then compstmt opt_rescue
+// RESBODY: args, exc_var, body, next
+let rec tr_rescue_clause = fn (rn: int) ->
+  let excs = pm_rescue_exceptions rn in
+  let cnt = pm_ls_len excs in
+  let ref = pm_rescue_reference rn in
+  let ks = pm_rescue_keyword_loc_s rn in
+  // exc_list: arg_value -> NEW_LIST | mrhs -> splat_array or itself
+  let first_b = (if cnt > 0 then pm_start (pm_ls_at excs 0) else 0) in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i >= cnt then acc
+    else
+      (let x = pm_ls_at excs i in
+       if pm_is x (pm_t_splat ()) then
+         (let os = pm_splat_operator_loc_s x in
+          let oe = pm_splat_operator_loc_e x in
+          let v = tr (pm_splat_expression x) in
+          if acc == 0 then go (i + 1) (a_xloc (n1 (nt_splat ()) (pm_start x) (pm_end x) v) [os, oe])
+          else go (i + 1) (p_rest_arg_append acc v first_b (pm_end x)))
+       else
+         (let v = tr x in
+          if acc == 0 then go (i + 1) (p_new_list v (pm_start x) (pm_end x))
+          else go (i + 1) (p_last_arg_append acc v first_b (pm_end x)))) in
+  let list0 = go 0 0 in
+  let list = (if list0 != 0 && p_splat_array list0 != 0 then p_splat_array list0 else list0) in
+  // exc_var: tASSOC lhs, assigned the error (NEW_ERRINFO at `=> lhs`)
+  let var = (if ref == 0 then 0
+             else (let os = pm_rescue_operator_loc_s rn in
+                   let err = n0 (nt_errinfo ()) os (pm_end ref) in
+                   tr_target ref err os (pm_end ref))) in
+  let after = (if ref != 0 then pm_end ref
+               else if cnt > 0 then pm_end (pm_ls_at excs (cnt - 1))
+               else pm_rescue_keyword_loc_e rn) in
+  let te = then_end after (pm_rescue_then_keyword_loc_e rn) in
+  let body = tr_compstmt (pm_rescue_statements rn) te in
+  let sub = pm_rescue_subsequent rn in
+  let next = (if sub == 0 then 0 else tr_rescue_clause sub) in
+  let en = (if next != 0 then a_end next else stmts_end (pm_rescue_statements rn) (a_end body)) in
+  n4 (nt_resbody ()) ks en list var body next;
+// (where a compstmt ends: its statements, then the terms that follow them)
+let stmts_end = fn (sn: int) -> fn (dflt: int) ->
+  if sn != 0 then skip_terms (pm_end sn)
+  // (no statements: only the `;`s after the place the empty body is at)
+  else if dflt < 1099511627776 then skip_semis dflt
+  else dflt;
+let stmts_end_of = fn (sn: int) -> fn (dflt: int) ->
+  if sn == 0 || pm_ls_len (pm_statements_body sn) == 0 then dflt else skip_terms (pm_end sn);
+// (past the terms after offset `i`, where a statement ends: a `;` or the
+//  line end, then every `;` after it -- once a term is read the lexer is at
+//  the start of an expression, where line ends and comments are skipped)
+let skip_terms = fn (i: int) ->
+  let j = skip_blank i in
+  let c = pm_byte j in
+  if c == 59 then skip_semis (j + 1)
+  else if c == 10 then (let t = skip_semis j in if t == j then j else t)
+  else if c == 35 then (let p0 = nl_after_comment j in
+                        let k = ast_line_end_from j in
+                        let t = skip_semis k in
+                        if t == k then p0 else t)
+  else i;
+// (past every `;` from offset `i` on, with blanks, line ends and comments
+//  between; `i` itself when there is none)
+let rec skip_semis = fn (i: int) ->
+  let j = skip_space_nl i in
+  if pm_byte j == 59 then skip_semis (j + 1) else i
+and skip_space_nl = fn (i: int) ->
+  let c = pm_byte i in
+  if c == 32 || c == 9 || c == 13 || c == 10 then skip_space_nl (i + 1)
+  else if c == 35 then skip_space_nl (ast_line_end_from i)
+  else i;
+// bodystmt (new_bodystmt): the statements of a BeginNode with its rescue /
+// else / ensure clauses. `lead`/`at`: tr_compstmt_lead's.
+let tr_bodystmt_lead = fn (bn: int) -> fn (lead0: bool) -> fn (at: int) ->
+  let lead = lead0 || (at >= 0 && at < 1099511627776 && pm_byte (skip_space_nl at) == 59) in
+  let head = tr_compstmt_lead (pm_begin_statements bn) lead at in
+  let rc = pm_begin_rescue_clause bn in
+  let ec = pm_begin_else_clause bn in
+  let en = pm_begin_ensure_clause bn in
+  let res =
+    (if rc == 0 then head
+     else
+       (let resq = tr_rescue_clause rc in
+        let els = (if ec == 0 then 0 else tr_compstmt (pm_else_statements ec) (pm_else_else_keyword_loc_e ec)) in
+        n3 (nt_rescue ()) (a_beg head) (a_end (if els != 0 then els else resq)) head resq els)) in
+  if en == 0 then res
+  else
+    // opt_ensure: k_ensure stmts terms? -- the ensure body is `stmts`
+    (let es = pm_ensure_statements en in
+     let ebody = tr_compstmt es (pm_ensure_ensure_keyword_loc_e en) in
+     let sn = pm_begin_statements bn in
+     n2 (nt_ensure ()) (if sn != 0 && nott lead then pm_start sn else a_beg head) (stmts_end es (a_end ebody)) res ebody);
+let tr_bodystmt = fn (bn: int) -> fn (empty_at: int) -> tr_bodystmt_lead bn false empty_at;
+// k_begin bodystmt k_end -> NEW_BEGIN($3)
+let tr_begin = fn (n: int) ->
+  let ke = pm_begin_begin_keyword_loc_e n in
+  let body = tr_bodystmt_lead n (pm_byte (skip_blank ke) == 59) ke in
+  n1 (nt_begin ()) (pm_start n) (pm_end n) body;
+// stmt modifier_rescue stmt / arg modifier_rescue arg (rescued_expr)
+let tr_rescue_modifier = fn (n: int) ->
+  let x = p_remove_begin (tr (pm_rescue_modifier_expression n)) in
+  let r = p_remove_begin (tr (pm_rescue_modifier_rescue_expression n)) in
+  let resq = n4 (nt_resbody ()) (pm_rescue_modifier_keyword_loc_s n) (pm_end n) 0 0 r 0 in
+  n3 (nt_rescue ()) (pm_start n) (pm_end n) x resq 0;
+
+// ---- control ---------------------------------------------------------------------
+// opt_else: k_else compstmt -> the statements
+let tr_else_body = fn (ec: int) ->
+  if ec == 0 then 0 else tr_compstmt (pm_else_statements ec) (pm_else_else_keyword_loc_e ec);
+// A condition after its keyword (which ends at `ke`). `expr_value: error`
+// when there is none: the ERROR is the token the parser was looking at when
+// it found out -- the first one after the keyword, on whatever line -- where
+// Prism's MissingNode is the keyword itself.
+let tr_cond_after = fn (pred: int) -> fn (ke: int) ->
+  if pred != 0 && pm_is pred (pm_t_missing ()) && ke >= 0 then
+    (let b = skip_space_nl ke in
+     let word = fn (c: int) -> (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c >= 128 in
+     let rec run = fn (i: int) -> if word (pm_byte i) then run (i + 1) else i in
+     let c = pm_byte b in
+     if c < 0 then n0 (nt_error ()) (pm_start pred) (pm_end pred)
+     else n0 (nt_error ()) b (if word c then run b else b + 1))
+  else tr pred;
+// (where the condition `pred`, translated as `c`, ends: the ERROR's token
+//  when there was none)
+let cond_end = fn (pred: int) -> fn (c: int) ->
+  if pred != 0 && pm_is pred (pm_t_missing ()) && c != 0 then a_end c else pm_end pred;
+// k_if expr_value then compstmt if_tail k_end | stmt modifier_if expr_value |
+// ternary | if_tail's k_elsif.  IF: cond, body, else
+let rec tr_if_node = fn (n: int) -> fn (b: int) -> fn (e: int) -> fn (elsif: bool) ->
+  let ks = pm_if_if_keyword_loc_s n in
+  let ke = pm_if_if_keyword_loc_e n in
+  let pred = pm_if_predicate n in
+  let sub = pm_if_subsequent n in
+  let es = pm_if_end_keyword_loc_s n in
+  let ee = pm_if_end_keyword_loc_e n in
+  let ths = pm_if_then_keyword_loc_s n in
+  let the = pm_if_then_keyword_loc_e n in
+  if ks < 0 then
+    // ternary: arg '?' arg ':' arg
+    (let _ = cl_set b e in
+     let c = tr pred in
+     let l = tr_statements (pm_if_statements n) in
+     let r = tr_statements (pm_else_statements sub) in
+     a_xloc (n3 (nt_if ()) b e c l r)
+       [0 - 1, 0 - 1, pm_else_else_keyword_loc_s sub, pm_else_else_keyword_loc_e sub, 0 - 1, 0 - 1])
+  else if ks > b then
+    // stmt modifier_if expr_value: the statement is written first
+    (let l = p_remove_begin (tr_statements (pm_if_statements n)) in
+     let _ = cl_set b e in
+     let c = tr_cond_after pred ke in
+     a_xloc (n3 (nt_if ()) b e c l 0) [ks, ke, 0 - 1, 0 - 1, 0 - 1, 0 - 1])
+  else
+    (let _ = cl_set b e in
+     let c = tr_cond_after pred ke in
+     let ts = then_start (cond_end pred c) ths in
+     let te = then_end (cond_end pred c) the in
+     let l = tr_compstmt (pm_if_statements n) te in
+     let r = (if sub == 0 then 0
+              else if pm_is sub (pm_t_else ()) then tr_else_body sub
+              // (an elsif runs to where the whole `if` ends its clauses)
+              else tr_if_node sub (pm_start sub) (if_tail_end sub) true) in
+     // (k_if ... if_tail k_end gives its `end` to an if_tail that is an IF:
+     //  the elsif right under it -- and an `else` whose one statement is an `if`)
+     let _ = (if nott elsif && a_is r (nt_if ()) then if_set_end r es ee else ()) in
+     a_xloc (n3 (nt_if ()) b e c l r)
+       [ks, ke, ts, te, (if elsif then 0 - 1 else es), (if elsif then 0 - 1 else ee)]);
+// (an IF's end keyword location: the third of its other locations)
+let if_set_end = fn (r: int) -> fn (es: int) -> fn (ee: int) ->
+  let x = vec_get ao_n (r + 3) in
+  let _ = vec_set ao_x (x + 5) es in
+  vec_set ao_x (x + 6) ee;
+// where an elsif's clauses end: the last clause's statements (and the terms
+// after them), or the keyword of an empty one
+let rec if_tail_end = fn (n: int) ->
+  if pm_is n (pm_t_else ()) then
+    stmts_end (pm_else_statements n) (pm_else_else_keyword_loc_e n)
+  else
+    (let sub = pm_if_subsequent n in
+     if sub != 0 then if_tail_end sub
+     else stmts_end (pm_if_statements n) (then_end (pm_end (pm_if_predicate n)) (pm_if_then_keyword_loc_e n)));
+let tr_if = fn (n: int) -> tr_if_node n (pm_start n) (pm_end n) false;
+// k_unless expr_value then compstmt opt_else k_end | stmt modifier_unless expr_value
+let tr_unless = fn (n: int) ->
+  let b = pm_start n in
+  let e = pm_end n in
+  let ks = pm_unless_keyword_loc_s n in
+  let ke = pm_unless_keyword_loc_e n in
+  let pred = pm_unless_predicate n in
+  if ks > b then
+    (let l = p_remove_begin (tr_statements (pm_unless_statements n)) in
+     let _ = cl_set b e in
+     let c = tr_cond_after pred ke in
+     a_xloc (n3 (nt_unless ()) b e c l 0) [ks, ke, 0 - 1, 0 - 1, 0 - 1, 0 - 1])
+  else
+    (let _ = cl_set b e in
+     let c = tr_cond_after pred ke in
+     let ts = then_start (cond_end pred c) (pm_unless_then_keyword_loc_s n) in
+     let te = then_end (cond_end pred c) (pm_unless_then_keyword_loc_e n) in
+     let l = tr_compstmt (pm_unless_statements n) te in
+     let r = tr_else_body (pm_unless_else_clause n) in
+     a_xloc (n3 (nt_unless ()) b e c l r)
+       [ks, ke, ts, te, pm_unless_end_keyword_loc_s n, pm_unless_end_keyword_loc_e n]);
+// k_while expr_value_do compstmt k_end | stmt modifier_while expr_value
+// WHILE, UNTIL: cond, body, state
+let tr_loop = fn (ty: int) -> fn (n: int) -> fn (ks: int) -> fn (ke: int) -> fn (cs: int) -> fn (ce: int) ->
+              fn (dke: int) -> fn (pred: int) -> fn (sn: int) ->
+  let b = pm_start n in
+  let e = pm_end n in
+  if ks > b then
+    // the modifier form: a `begin ... end` body runs once first (state 0)
+    (let l = pm_statements_body sn in
+     let st = (if pm_ls_len l == 1 then tr (pm_ls_at l 0) else tr_statements sn) in
+     let _ = cl_set (pm_start pred) (pm_end pred) in
+     let c = tr_cond_after pred ke in
+     if a_is st (nt_begin ()) then a_xloc (n3 ty b e c (a_f st 0) 0) [ks, ke, 0 - 1, 0 - 1]
+     else a_xloc (n3 ty b e c st 1) [ks, ke, 0 - 1, 0 - 1])
+  else
+    (let _ = cl_set (pm_start pred) (pm_end pred) in
+     let c = tr_cond_after pred ke in
+     // do: term | keyword_do_cond
+     let de = (if dke >= 0 then dke else skip_term (cond_end pred c)) in
+     let body = tr_compstmt sn de in
+     a_xloc (n3 ty b e c body 1) [ks, ke, cs, ce]);
+let tr_while = fn (n: int) ->
+  tr_loop (nt_while ()) n (pm_while_keyword_loc_s n) (pm_while_keyword_loc_e n) (pm_while_closing_loc_s n)
+    (pm_while_closing_loc_e n) (pm_while_do_keyword_loc_e n) (pm_while_predicate n) (pm_while_statements n);
+let tr_until = fn (n: int) ->
+  tr_loop (nt_until ()) n (pm_until_keyword_loc_s n) (pm_until_keyword_loc_e n) (pm_until_closing_loc_s n)
+    (pm_until_closing_loc_e n) (pm_until_do_keyword_loc_e n) (pm_until_predicate n) (pm_until_statements n);
+// logop: a chain of one operator hangs to the right of its first node
+let p_logop = fn (ty: int) -> fn (left: int) -> fn (right: int) -> fn (b: int) -> fn (e: int) -> fn (os: int) -> fn (oe: int) ->
+  if a_is left ty then
+    (let rec last = fn (node: int) ->
+       (let second = a_f node 1 in
+        if second != 0 && a_is second ty then last second else node) in
+     let node = last left in
+     let _ = a_set node 1 (a_xloc (n2 ty b e (a_f node 1) right) [os, oe]) in
+     let _ = a_set_end left e in
+     left)
+  else a_xloc (n2 ty b e left right) [os, oe];
+let tr_and = fn (n: int) ->
+  let l = tr (pm_and_left n) in
+  let r = tr (pm_and_right n) in
+  p_logop (nt_and ()) l r (pm_start n) (pm_end n) (pm_and_operator_loc_s n) (pm_and_operator_loc_e n);
+let tr_or = fn (n: int) ->
+  let l = tr (pm_or_left n) in
+  let r = tr (pm_or_right n) in
+  p_logop (nt_or ()) l r (pm_start n) (pm_end n) (pm_or_operator_loc_s n) (pm_or_operator_loc_e n);
+// tLPAREN compstmt ')' -> NEW_BLOCK($2)
+let tr_parentheses = fn (n: int) ->
+  let bare = lpa_get () == pm_start n in
+  let _ = (if bare then lpa_set (0 - 1) else ()) in
+  let body = tr_paren_body n in
+  // tLPAREN_ARG compstmt ')' -> $2
+  if bare then body else p_new_block body (pm_start n) (pm_end n);
+// (the statements between a ParenthesesNode's parentheses)
+let tr_paren_body = fn (n: int) ->
+  let oe = pm_parentheses_opening_loc_e n in
+  tr_compstmt_lead (pm_parentheses_body n) (pm_byte (skip_blank oe) == 59) oe;
+// ret_args
+let p_ret_args = fn (node: int) ->
+  if a_is node (nt_list ()) && a_f node 1 == 0 then a_f node 0 else node;
+// k_return call_args | k_return;  keyword_break / keyword_next the same
+let tr_return = fn (n: int) ->
+  let a = p_ret_args (tr_args (pm_return_arguments n) 0) in
+  a_xloc (n1 (nt_return ()) (pm_start n) (pm_end n) a) [pm_return_keyword_loc_s n, pm_return_keyword_loc_e n];
+let tr_break = fn (n: int) ->
+  let a = p_ret_args (tr_args (pm_break_arguments n) 0) in
+  a_xloc (n1 (nt_break ()) (pm_start n) (pm_end n) a) [pm_break_keyword_loc_s n, pm_break_keyword_loc_e n];
+let tr_next = fn (n: int) ->
+  let a = p_ret_args (tr_args (pm_next_arguments n) 0) in
+  a_xloc (n1 (nt_next ()) (pm_start n) (pm_end n) a) [pm_next_keyword_loc_s n, pm_next_keyword_loc_e n];
+// A message as parse.y's error reports it for a program given as a String:
+// the text, the line, and under it a `^~~~` across the place.
+let ast_err_at = fn (msg: str) -> fn (b: int) -> fn (e: int) ->
+  let ls = ast_line_start b in
+  let le = ast_line_end_from b in
+  let rec rep = fn (c: str) -> fn (k: int) -> fn (acc: str) -> if k <= 0 then acc else rep c (k - 1) (acc ++ c) in
+  let e1 = (if e > le then le else e) in
+  msg ++ "\n" ++ pm_text ls le ++ "\n" ++ rep " " (b - ls) "" ++ "^" ++ rep "~" (e1 - b - 1) "" ++ "\n";
+let tr_redo = fn (n: int) -> a_xloc (n0 (nt_redo ()) (pm_start n) (pm_end n)) [pm_start n, pm_end n];
+let tr_retry = fn (n: int) ->
+  // (an `END { }` block is a body of its own: a `retry` in it has no rescue
+  //  to go back to, whatever the block is written inside)
+  let _ = (if vec_len as_px > 0 && vec_get as_px 0 > 0
+           then vec_push as_er (ast_err_at "Invalid retry without rescue" (pm_start n) (pm_end n)) else ()) in
+  n0 (nt_retry ()) (pm_start n) (pm_end n);
+// k_yield '(' call_args rparen | k_yield command_args | k_yield
+let tr_yield = fn (n: int) ->
+  let argsn = pm_yield_arguments n in
+  let a = tr_args_cmd argsn 0 (pm_yield_lparen_loc_s n < 0) in
+  let rs = pm_yield_rparen_loc_s n in
+  a_xloc (n1 (nt_yield ()) (pm_start n) (pm_end n) a)
+    [pm_yield_keyword_loc_s n, pm_yield_keyword_loc_e n, pm_yield_lparen_loc_s n, pm_yield_lparen_loc_e n,
+     (if rs < 0 then rs else opt_nl_start (if argsn != 0 then pm_end argsn else pm_yield_lparen_loc_e n)),
+     pm_yield_rparen_loc_e n];
+// keyword_super paren_args | keyword_super command_args
+let tr_super = fn (n: int) ->
+  let blk = pm_super_block n in
+  let bp = (if pm_is blk (pm_t_block_argument ()) then tr_block_argument blk else 0) in
+  let a = tr_args_cmd (pm_super_arguments n) bp (pm_super_lparen_loc_s n < 0) in
+  let re = pm_super_rparen_loc_e n in
+  let ls = pm_super_lparen_loc_s n in
+  let argsn = pm_super_arguments n in
+  let iter = pm_is blk (pm_t_block ()) in
+  let en = (if nott iter then pm_end n
+            else if re >= 0 then re
+            else if argsn != 0 then pm_end argsn
+            else pm_super_keyword_loc_e n) in
+  let r = a_xloc (n1 (nt_super ()) (pm_start n) en a)
+            // (both parentheses are cut from the one location of `(...)`:
+            //  a column is moved, the line it is on is not)
+            (if ls < 0 then [pm_super_keyword_loc_s n, pm_super_keyword_loc_e n, 0 - 1, 0 - 1, 0 - 1, 0 - 1]
+             else [pm_super_keyword_loc_s n, pm_super_keyword_loc_e n,
+                   ls, pos_lc (pos_line re) (pos_col ls + 1), pos_lc (pos_line ls) (pos_col re - 1), re]) in
+  if iter then tr_iter r blk (pm_start n) (pm_end n) else r;
+// keyword_super -> NEW_ZSUPER
+let tr_forwarding_super = fn (n: int) ->
+  let blk = pm_forwarding_super_block n in
+  if blk == 0 then n0 (nt_zsuper ()) (pm_start n) (pm_end n)
+  else (let z = n0 (nt_zsuper ()) (pm_start n) (pm_start n + 5) in
+        tr_iter z blk (pm_start n) (pm_end n));
+
+// ---- arrays, hashes, ranges --------------------------------------------------------
+// tLBRACK aref_args ']' -> make_list: the arguments, located at the brackets
+let tr_array = fn (n: int) ->
+  let l = pm_array_elements n in
+  let cnt = pm_ls_len l in
+  let b = pm_start n in
+  let e = pm_end n in
+  if cnt == 0 then n0 (nt_zlist ()) b e
+  else
+    (let last = pm_ls_at l (cnt - 1) in
+     let kw = pm_is last (pm_t_keyword_hash ()) in
+     let first_b = pm_start (pm_ls_at l 0) in
+     let rec go = fn (i: int) -> fn (acc: int) ->
+       if i >= cnt then acc
+       else
+         (let x = pm_ls_at l i in
+          if pm_is x (pm_t_splat ()) then
+            (let os = pm_splat_operator_loc_s x in
+             let oe = pm_splat_operator_loc_e x in
+             let ex = pm_splat_expression x in
+             let v = (if ex == 0 then n1 (nt_lvar ()) os oe (id_of "*") else tr ex) in
+             if acc == 0 then go (i + 1) (a_xloc (n1 (nt_splat ()) (pm_start x) (pm_end x) v) [os, oe])
+             else go (i + 1) (p_rest_arg_append acc v first_b (pm_end x)))
+          else if pm_is x (pm_t_keyword_hash ()) then
+            (let assocs = tr_assocs (pm_keyword_hash_elements x) in
+             let h = n2 (nt_hash ()) (pm_start x) (pm_end x) assocs 0 in
+             if acc == 0 then go (i + 1) (p_new_list h (pm_start x) (pm_end x))
+             else go (i + 1) (p_arg_append acc h first_b (pm_end x)))
+          else
+            (let v = tr x in
+             if acc == 0 then go (i + 1) (p_new_list v (pm_start x) (pm_end x))
+             else go (i + 1) (p_last_arg_append acc v first_b (pm_end x)))) in
+     let list = go 0 0 in
+     // (make_list: located at the brackets; `a = 1, 2` has none -- mrhs)
+     let _ = (if pm_array_opening_loc_s n >= 0 then (let _ = a_set_beg list b in a_set_end list e) else ()) in
+     list);
+// tLBRACE assoc_list '}' -> new_hash.  HASH: head, brace
+let tr_hash = fn (n: int) ->
+  let assocs = tr_assocs (pm_hash_elements n) in
+  n2 (nt_hash ()) (pm_start n) (pm_end n) assocs 1;
+// range_expr: DOT2 / DOT3 (beg, end); a missing end is a NIL at the operator
+let tr_range = fn (n: int) ->
+  let os = pm_range_operator_loc_s n in
+  let oe = pm_range_operator_loc_e n in
+  let l = (if pm_range_left n == 0 then n0 (nt_nil ()) os os else tr (pm_range_left n)) in
+  let r = (if pm_range_right n == 0 then n0 (nt_nil ()) oe oe else tr (pm_range_right n)) in
+  a_xloc (n2 (if pm_has n (pm_f_range_exclude_end ()) then nt_dot3 () else nt_dot2 ()) (pm_start n) (pm_end n) l r) [os, oe];
+// ---- multiple assignment -----------------------------------------------------------
+// mlhs_basic / f_margs: the MASGN (value, head, args) of the left side of a
+// multiple assignment -- `lefts`, `rest`, `rights` are a MultiWriteNode's or
+// a MultiTargetNode's; (b, e) its location; `param`: among parameters
+// (f_margs, whose targets are parameters).
+let tr_mlhs = fn (lefts: int) -> fn (rest: int) -> fn (rights: int) -> fn (b: int) -> fn (e: int) -> fn (param: bool) ->
+  // mlhs_item / f_marg: a target with no value yet, or a nested MASGN
+  let item = fn (x: int) ->
+    (if pm_is x (pm_t_multi_target ()) then tr_mlhs_of x param
+     else if pm_is x (pm_t_required_parameter ()) then
+       (let _ = () in n2 (asgn_type 0) (pm_start x) (pm_end x) (id_c (pm_required_parameter_name x)) 0)
+     else tr_target x 0 (pm_start x) (pm_end x)) in
+  let rec items = fn (l: int) -> fn (i: int) -> fn (acc: int) ->
+    if i >= pm_ls_len l then acc
+    else
+      (let x = pm_ls_at l i in
+       let it = item x in
+       if acc == 0 then items l (i + 1) (p_new_list it (pm_start x) (pm_end x))
+       else items l (i + 1) (p_list_append acc it)) in
+  let head = items lefts 0 0 in
+  // the rest: `*name` (the target, or -1 for a bare `*`); `a,` has none
+  let restn =
+    (if rest == 0 || pm_is rest (pm_t_implicit_rest ()) then 0
+     else
+       (let x = pm_splat_expression rest in
+        if x == 0 then 0 - 1
+        else if pm_is x (pm_t_required_parameter ()) then
+          // f_rest_marg: tSTAR f_norm_arg, located with its star
+          n2 (asgn_type 0) (pm_start rest) (pm_end rest) (id_c (pm_required_parameter_name x)) 0
+        else item x)) in
+  let args = (if pm_ls_len rights == 0 then restn
+              else n2 (nt_postarg ()) b e restn (items rights 0 0)) in
+  n3 (nt_masgn ()) b e 0 head args;
+// (a MultiTargetNode in parentheses: the MASGN of what is inside them)
+let tr_mlhs_of = fn (x: int) -> fn (param: bool) ->
+  let lefts = pm_multi_target_lefts x in
+  let rest = pm_multi_target_rest x in
+  let rights = pm_multi_target_rights x in
+  let b = mlhs_beg lefts rest (pm_start x) in
+  let e = mlhs_end lefts rest rights (pm_end x) in
+  tr_mlhs lefts rest rights b e param;
+// (where the targets of an mlhs start and end, without its parentheses)
+let mlhs_beg = fn (lefts: int) -> fn (rest: int) -> fn (dflt: int) ->
+  if pm_ls_len lefts > 0 then pm_start (pm_ls_at lefts 0)
+  else if rest != 0 then pm_start rest
+  else dflt;
+let mlhs_end = fn (lefts: int) -> fn (rest: int) -> fn (rights: int) -> fn (dflt: int) ->
+  if pm_ls_len rights > 0 then pm_end (pm_ls_at rights (pm_ls_len rights - 1))
+  else if rest != 0 then pm_end rest
+  else if pm_ls_len lefts > 0 then pm_end (pm_ls_at lefts (pm_ls_len lefts - 1))
+  else dflt;
+let tr_multi_target = fn (x: int) -> tr_mlhs_of x false;
+// mlhs '=' mrhs_arg -> node_assign: the value, and the whole statement's place
+let tr_multi_write = fn (n: int) ->
+  let lefts = pm_multi_write_lefts n in
+  let rest = pm_multi_write_rest n in
+  let rights = pm_multi_write_rights n in
+  let m = tr_mlhs lefts rest rights (mlhs_beg lefts rest (pm_start n)) (mlhs_end lefts rest rights (pm_end n)) false in
+  let v = tr (pm_multi_write_value n) in
+  let _ = a_set m 0 v in
+  let _ = a_set_beg m (pm_start n) in
+  let _ = a_set_end m (pm_end n) in
+  m;
+
+// ---- op-assign -------------------------------------------------------------------
+// new_op_assign: `lhs` an assignment node with no value yet, `read` what
+// gettable gives for the same variable, `op` the operator's name
+let p_op_assign = fn (lhs: int) -> fn (read: int) -> fn (op: str) -> fn (rhs: int) -> fn (b: int) -> fn (e: int) ->
+  let vi = (if a_is lhs (nt_cdecl ()) then 1 else 1) in
+  if str_eq op "||" || str_eq op "&&" then
+    (let _ = a_set lhs vi rhs in
+     let _ = a_set_beg lhs b in
+     let _ = a_set_end lhs e in
+     n2 (if str_eq op "||" then nt_op_asgn_or () else nt_op_asgn_and ()) b e read lhs)
+  else
+    (let call = n3 (nt_call ()) b e read (id_of op) (p_new_list rhs (a_beg rhs) (a_end rhs)) in
+     let _ = a_set lhs vi call in
+     let _ = a_set_beg lhs b in
+     let _ = a_set_end lhs e in
+     lhs);
+// (the three write forms of one kind of variable: `aty` the assignment's
+//  node type, `rty` the read's; the name's place is (ns, ne))
+let tr_var_op = fn (n: int) -> fn (aty: int) -> fn (rty: int) -> fn (name: int) -> fn (ns: int) -> fn (ne: int) -> fn (op: str) -> fn (vn: int) ->
+  let id = id_c name in
+  let lhs = (if aty == nt_cdecl () then n3 aty ns ne id 0 0 else n2 aty ns ne id 0) in
+  let read = n1 rty ns ne id in
+  let v = tr vn in
+  p_op_assign lhs read op v (pm_start n) (pm_end n);
+let lvar_type = fn (u: unit) -> if sc_is_block 0 then nt_dvar () else nt_lvar ();
+let tr_local_variable_operator_write = fn (n: int) ->
+  tr_var_op n (asgn_type 0) (lvar_type ()) (pm_local_variable_operator_write_name n)
+    (pm_local_variable_operator_write_name_loc_s n) (pm_local_variable_operator_write_name_loc_e n)
+    (cname (pm_local_variable_operator_write_binary_operator n)) (pm_local_variable_operator_write_value n);
+let tr_local_variable_or_write = fn (n: int) ->
+  tr_var_op n (asgn_type 0) (lvar_type ()) (pm_local_variable_or_write_name n)
+    (pm_local_variable_or_write_name_loc_s n) (pm_local_variable_or_write_name_loc_e n) "||" (pm_local_variable_or_write_value n);
+let tr_local_variable_and_write = fn (n: int) ->
+  tr_var_op n (asgn_type 0) (lvar_type ()) (pm_local_variable_and_write_name n)
+    (pm_local_variable_and_write_name_loc_s n) (pm_local_variable_and_write_name_loc_e n) "&&" (pm_local_variable_and_write_value n);
+let tr_instance_variable_operator_write = fn (n: int) ->
+  tr_var_op n (nt_iasgn ()) (nt_ivar ()) (pm_instance_variable_operator_write_name n)
+    (pm_instance_variable_operator_write_name_loc_s n) (pm_instance_variable_operator_write_name_loc_e n)
+    (cname (pm_instance_variable_operator_write_binary_operator n)) (pm_instance_variable_operator_write_value n);
+let tr_instance_variable_or_write = fn (n: int) ->
+  tr_var_op n (nt_iasgn ()) (nt_ivar ()) (pm_instance_variable_or_write_name n)
+    (pm_instance_variable_or_write_name_loc_s n) (pm_instance_variable_or_write_name_loc_e n) "||" (pm_instance_variable_or_write_value n);
+let tr_instance_variable_and_write = fn (n: int) ->
+  tr_var_op n (nt_iasgn ()) (nt_ivar ()) (pm_instance_variable_and_write_name n)
+    (pm_instance_variable_and_write_name_loc_s n) (pm_instance_variable_and_write_name_loc_e n) "&&" (pm_instance_variable_and_write_value n);
+let tr_global_variable_operator_write = fn (n: int) ->
+  tr_var_op n (nt_gasgn ()) (nt_gvar ()) (pm_global_variable_operator_write_name n)
+    (pm_global_variable_operator_write_name_loc_s n) (pm_global_variable_operator_write_name_loc_e n)
+    (cname (pm_global_variable_operator_write_binary_operator n)) (pm_global_variable_operator_write_value n);
+let tr_global_variable_or_write = fn (n: int) ->
+  tr_var_op n (nt_gasgn ()) (nt_gvar ()) (pm_global_variable_or_write_name n)
+    (pm_global_variable_or_write_name_loc_s n) (pm_global_variable_or_write_name_loc_e n) "||" (pm_global_variable_or_write_value n);
+let tr_global_variable_and_write = fn (n: int) ->
+  tr_var_op n (nt_gasgn ()) (nt_gvar ()) (pm_global_variable_and_write_name n)
+    (pm_global_variable_and_write_name_loc_s n) (pm_global_variable_and_write_name_loc_e n) "&&" (pm_global_variable_and_write_value n);
+let tr_class_variable_operator_write = fn (n: int) ->
+  tr_var_op n (nt_cvasgn ()) (nt_cvar ()) (pm_class_variable_operator_write_name n)
+    (pm_class_variable_operator_write_name_loc_s n) (pm_class_variable_operator_write_name_loc_e n)
+    (cname (pm_class_variable_operator_write_binary_operator n)) (pm_class_variable_operator_write_value n);
+let tr_class_variable_or_write = fn (n: int) ->
+  tr_var_op n (nt_cvasgn ()) (nt_cvar ()) (pm_class_variable_or_write_name n)
+    (pm_class_variable_or_write_name_loc_s n) (pm_class_variable_or_write_name_loc_e n) "||" (pm_class_variable_or_write_value n);
+let tr_class_variable_and_write = fn (n: int) ->
+  tr_var_op n (nt_cvasgn ()) (nt_cvar ()) (pm_class_variable_and_write_name n)
+    (pm_class_variable_and_write_name_loc_s n) (pm_class_variable_and_write_name_loc_e n) "&&" (pm_class_variable_and_write_value n);
+let tr_constant_operator_write = fn (n: int) ->
+  tr_var_op n (nt_cdecl ()) (nt_const ()) (pm_constant_operator_write_name n)
+    (pm_constant_operator_write_name_loc_s n) (pm_constant_operator_write_name_loc_e n)
+    (cname (pm_constant_operator_write_binary_operator n)) (pm_constant_operator_write_value n);
+let tr_constant_or_write = fn (n: int) ->
+  tr_var_op n (nt_cdecl ()) (nt_const ()) (pm_constant_or_write_name n)
+    (pm_constant_or_write_name_loc_s n) (pm_constant_or_write_name_loc_e n) "||" (pm_constant_or_write_value n);
+let tr_constant_and_write = fn (n: int) ->
+  tr_var_op n (nt_cdecl ()) (nt_const ()) (pm_constant_and_write_name n)
+    (pm_constant_and_write_name_loc_s n) (pm_constant_and_write_name_loc_e n) "&&" (pm_constant_and_write_value n);
+// new_const_op_assign.  OP_CDECL: head, aid, value
+let tr_cpath_op = fn (n: int) -> fn (target: int) -> fn (op: str) -> fn (vn: int) ->
+  let path = tr_constant_path target in
+  let v = tr vn in
+  n3 (nt_op_cdecl ()) (pm_start n) (pm_end n) path (id_of op) v;
+let tr_constant_path_operator_write = fn (n: int) ->
+  tr_cpath_op n (pm_constant_path_operator_write_target n) (cname (pm_constant_path_operator_write_binary_operator n))
+    (pm_constant_path_operator_write_value n);
+let tr_constant_path_or_write = fn (n: int) ->
+  tr_cpath_op n (pm_constant_path_or_write_target n) "||" (pm_constant_path_or_write_value n);
+let tr_constant_path_and_write = fn (n: int) ->
+  tr_cpath_op n (pm_constant_path_and_write_target n) "&&" (pm_constant_path_and_write_value n);
+// new_attr_op_assign.  OP_ASGN2: recv, aid (&.), vid, mid, value
+let tr_call_op = fn (n: int) -> fn (recv: int) -> fn (cs: int) -> fn (ce: int) -> fn (ms: int) -> fn (me: int) ->
+                 fn (rname: int) -> fn (op: str) -> fn (os: int) -> fn (oe: int) -> fn (vn: int) ->
+  let r = tr recv in
+  let v = tr vn in
+  a_xloc (n5 (nt_op_asgn2 ()) (pm_start n) (pm_end n) r (if pm_has n (pm_f_call_safe_navigation ()) then 1 else 0)
+            (id_c rname) (id_of op) v)
+    [cs, ce, ms, me, os, oe];
+let tr_call_operator_write = fn (n: int) ->
+  tr_call_op n (pm_call_operator_write_receiver n) (pm_call_operator_write_call_operator_loc_s n)
+    (pm_call_operator_write_call_operator_loc_e n) (pm_call_operator_write_message_loc_s n)
+    (pm_call_operator_write_message_loc_e n) (pm_call_operator_write_read_name n)
+    (cname (pm_call_operator_write_binary_operator n)) (pm_call_operator_write_binary_operator_loc_s n)
+    (pm_call_operator_write_binary_operator_loc_e n) (pm_call_operator_write_value n);
+let tr_call_or_write = fn (n: int) ->
+  tr_call_op n (pm_call_or_write_receiver n) (pm_call_or_write_call_operator_loc_s n)
+    (pm_call_or_write_call_operator_loc_e n) (pm_call_or_write_message_loc_s n) (pm_call_or_write_message_loc_e n)
+    (pm_call_or_write_read_name n) "||" (pm_call_or_write_operator_loc_s n) (pm_call_or_write_operator_loc_e n)
+    (pm_call_or_write_value n);
+let tr_call_and_write = fn (n: int) ->
+  tr_call_op n (pm_call_and_write_receiver n) (pm_call_and_write_call_operator_loc_s n)
+    (pm_call_and_write_call_operator_loc_e n) (pm_call_and_write_message_loc_s n) (pm_call_and_write_message_loc_e n)
+    (pm_call_and_write_read_name n) "&&" (pm_call_and_write_operator_loc_s n) (pm_call_and_write_operator_loc_e n)
+    (pm_call_and_write_value n);
+// rbracket: '\n'? ']' and rparen: '\n'? ')' -- where they start, after the
+// token that ends at `prev`: at the line end when there is one before the
+// bracket, else where that token ends (the empty '\n'? is placed there)
+let opt_nl_start = fn (prev: int) ->
+  let j = skip_blank prev in
+  let c = pm_byte j in
+  if c == 10 then j else if c == 35 then nl_after_comment j else prev;
+// new_ary_op_assign.  OP_ASGN1: recv, mid, index, rvalue
+let tr_index_op = fn (n: int) -> fn (recv: int) -> fn (os: int) -> fn (oe: int) -> fn (argsn: int) -> fn (cs: int) -> fn (ce: int) ->
+                  fn (blk: int) -> fn (op: str) -> fn (bs: int) -> fn (be: int) -> fn (vn: int) ->
+  let r = tr recv in
+  let idx0 = (if argsn == 0 then 0 else tr_args_first argsn (pm_ls_len (pm_arguments_arguments argsn))) in
+  let bp = (if pm_is blk (pm_t_block_argument ()) then tr_block_argument blk else 0) in
+  let idx1 = p_arg_blk_pass idx0 bp in
+  // make_list(args, args_loc): the index is located between the brackets
+  let idx = (if idx1 == 0 then n0 (nt_zlist ()) oe oe
+             else (let _ = a_set_beg idx1 (pm_start argsn) in let _ = a_set_end idx1 (pm_end argsn) in idx1)) in
+  let v = tr vn in
+  let cs2 = (if argsn == 0 then cs else opt_nl_start (pm_end argsn)) in
+  a_xloc (n4 (nt_op_asgn1 ()) (pm_start n) (pm_end n) r (id_of op) idx v) [0 - 1, 0 - 1, os, oe, cs2, ce, bs, be];
+let tr_index_operator_write = fn (n: int) ->
+  tr_index_op n (pm_index_operator_write_receiver n) (pm_index_operator_write_opening_loc_s n)
+    (pm_index_operator_write_opening_loc_e n) (pm_index_operator_write_arguments n)
+    (pm_index_operator_write_closing_loc_s n) (pm_index_operator_write_closing_loc_e n) (pm_index_operator_write_block n)
+    (cname (pm_index_operator_write_binary_operator n)) (pm_index_operator_write_binary_operator_loc_s n)
+    (pm_index_operator_write_binary_operator_loc_e n) (pm_index_operator_write_value n);
+let tr_index_or_write = fn (n: int) ->
+  tr_index_op n (pm_index_or_write_receiver n) (pm_index_or_write_opening_loc_s n) (pm_index_or_write_opening_loc_e n)
+    (pm_index_or_write_arguments n) (pm_index_or_write_closing_loc_s n) (pm_index_or_write_closing_loc_e n)
+    (pm_index_or_write_block n) "||" (pm_index_or_write_operator_loc_s n) (pm_index_or_write_operator_loc_e n)
+    (pm_index_or_write_value n);
+let tr_index_and_write = fn (n: int) ->
+  tr_index_op n (pm_index_and_write_receiver n) (pm_index_and_write_opening_loc_s n) (pm_index_and_write_opening_loc_e n)
+    (pm_index_and_write_arguments n) (pm_index_and_write_closing_loc_s n) (pm_index_and_write_closing_loc_e n)
+    (pm_index_and_write_block n) "&&" (pm_index_and_write_operator_loc_s n) (pm_index_and_write_operator_loc_e n)
+    (pm_index_and_write_value n);
+
+// ---- lambda, case, for -----------------------------------------------------------
+// lambda: tLAMBDA f_larglist lambda_body.  LAMBDA: body (the SCOPE)
+let tr_lambda = fn (n: int) ->
+  let nbase = nm_len () in
+  let _ = sc_push 1 in
+  let b = pm_start n in
+  let e = pm_end n in
+  let os = pm_lambda_operator_loc_s n in
+  let oe = pm_lambda_operator_loc_e n in
+  let ops = pm_lambda_opening_loc_s n in
+  let ope = pm_lambda_opening_loc_e n in
+  let pn = pm_lambda_parameters n in
+  let isbp = pm_is pn (pm_t_block_parameters ()) in
+  let args =
+    (if pn == 0 then tr_params 0 oe oe true
+     else if isbp then
+       (let ps = pm_block_parameters_parameters pn in
+        let lps = pm_block_parameters_opening_loc_s pn in
+        if ps != 0 then tr_params ps (pm_start ps) (pm_end ps) true
+        else if lps >= 0 then tr_params 0 lps (pm_block_parameters_opening_loc_e pn) true
+        else tr_params 0 oe oe true)
+     else
+       (let a = tr_params 0 oe oe true in
+        if pm_is pn (pm_t_numbered_parameters ()) then
+          (let mx = pm_numbered_parameters_maximum pn in
+           let _ = a_set a 0 mx in
+           let rec nm = fn (i: int) -> if i > mx then () else (let _ = nm_push (k_sym ("_" ++ str_of_int i)) in nm (i + 1)) in
+           let _ = nm 1 in
+           a)
+        else (let _ = a_set a 0 1 in let _ = nm_push (k_sym "<it>") in a))) in
+  let bodyn = pm_lambda_body n in
+  let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt bodyn ope else tr_compstmt bodyn ope) in
+  let tbl = scope_tbl (pm_lambda_locals n) (nm_take nbase) in
+  let _ = sc_pop () in
+  let scope = n3 (nt_scope ()) (if isbp then pm_start pn else oe) e tbl args body in
+  a_xloc (n1 (nt_lambda ()) b e scope) [os, oe, ops, ope, pm_lambda_closing_loc_s n, pm_lambda_closing_loc_e n];
+// case_args: a `when`'s conditions, as arguments are built
+let tr_case_args = fn (l: int) ->
+  let cnt = pm_ls_len l in
+  let first_b = (if cnt > 0 then pm_start (pm_ls_at l 0) else 0) in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i >= cnt then acc
+    else
+      (let x = pm_ls_at l i in
+       if pm_is x (pm_t_splat ()) then
+         (let os = pm_splat_operator_loc_s x in
+          let oe = pm_splat_operator_loc_e x in
+          let v = tr (pm_splat_expression x) in
+          if acc == 0 then go (i + 1) (a_xloc (n1 (nt_splat ()) (pm_start x) (pm_end x) v) [os, oe])
+          else go (i + 1) (p_rest_arg_append acc v first_b (pm_end x)))
+       else
+         (let v = tr x in
+          if acc == 0 then go (i + 1) (p_new_list v (pm_start x) (pm_end x))
+          else go (i + 1) (p_last_arg_append acc v first_b (pm_end x)))) in
+  go 0 0;
+// case_body: k_when case_args then compstmt cases.  WHEN: head, body, next
+let rec tr_when_chain = fn (conds: int) -> fn (i: int) -> fn (els: int) ->
+  if i >= pm_ls_len conds then tr_else_body els
+  else
+    (let w = pm_ls_at conds i in
+     let cl = pm_when_conditions w in
+     let args = tr_case_args cl in
+     let after = pm_end (pm_ls_at cl (pm_ls_len cl - 1)) in
+     let ts = then_start after (pm_when_then_keyword_loc_s w) in
+     let te = then_end after (pm_when_then_keyword_loc_e w) in
+     let sn = pm_when_statements w in
+     let body = tr_compstmt sn te in
+     let next = tr_when_chain conds (i + 1) els in
+     // (it runs to the end of the clauses after it)
+     let en = (if a_is next (nt_when ()) then a_end next
+               else if els != 0 then stmts_end (pm_else_statements els) (pm_else_else_keyword_loc_e els)
+               else stmts_end sn te) in
+     a_xloc (n3 (nt_when ()) (pm_start w) en args body next)
+       [pm_when_keyword_loc_s w, pm_when_keyword_loc_e w, ts, te]);
+// k_case expr_value terms? case_body k_end.  CASE: head, body.  CASE2: head (none), body
+let tr_case = fn (n: int) ->
+  let pred = pm_case_predicate n in
+  let head = (if pred == 0 then 0 else tr pred) in
+  let body = tr_when_chain (pm_case_conditions n) 0 (pm_case_else_clause n) in
+  a_xloc (n2 (if pred == 0 then nt_case2 () else nt_case ()) (pm_start n) (pm_end n) head body)
+    [pm_case_case_keyword_loc_s n, pm_case_case_keyword_loc_e n, pm_case_end_keyword_loc_s n, pm_case_end_keyword_loc_e n];
+// k_for for_var keyword_in expr_value do compstmt k_end.  FOR: iter, body
+let tr_for = fn (n: int) ->
+  let b = pm_start n in
+  let e = pm_end n in
+  let ix = pm_for_index n in
+  let vs = pm_start ix in
+  let ve = pm_end ix in
+  let iter = tr (pm_for_collection n) in
+  let internal = n1 (nt_dvar ()) vs ve (id_internal ()) in
+  let multi = pm_is ix (pm_t_multi_target ()) in
+  let var = (if multi then
+               // (for a, b in ...: the targets with no parentheses of their own)
+               tr_mlhs (pm_multi_target_lefts ix) (pm_multi_target_rest ix) (pm_multi_target_rights ix) vs ve false
+             else tr_target ix 0 vs ve) in
+  let simple = a_is var (nt_lasgn ()) || a_is var (nt_dasgn ()) in
+  let init =
+    (if simple then (let _ = a_set var 1 internal in var)
+     else if multi then (let _ = a_set var 0 (n1 (nt_for_masgn ()) vs ve internal) in var)
+     else n3 (nt_masgn ()) vs ve internal (p_new_list var vs ve) 0) in
+  let args = a_new (nt_args ()) vs ve in
+  let _ = vec_push ao_n (if simple then 1 else 0) in
+  let _ = vec_push ao_n init in
+  let _ = vec_push ao_n 0 in
+  let _ = vec_push ao_n 0 in
+  let _ = vec_push ao_n 0 in
+  let _ = vec_push ao_n 0 in
+  let _ = vec_push ao_n (if simple then 0 else id_internal ()) in
+  let _ = vec_push ao_n 0 in
+  let _ = vec_push ao_n 0 in
+  let _ = vec_push ao_n 0 in
+  let _ = vec_push ao_n 0 in
+  let dke = pm_for_do_keyword_loc_e n in
+  let de = (if dke >= 0 then dke else skip_term (pm_end (pm_for_collection n))) in
+  let body = tr_compstmt (pm_for_statements n) de in
+  let scope = n3 (nt_scope ()) b e (mk_arr [0]) args body in
+  a_xloc (n2 (nt_for ()) b e iter scope)
+    [pm_for_for_keyword_loc_s n, pm_for_for_keyword_loc_e n, pm_for_in_keyword_loc_s n, pm_for_in_keyword_loc_e n,
+     pm_for_do_keyword_loc_s n, pm_for_do_keyword_loc_e n, pm_for_end_keyword_loc_s n, pm_for_end_keyword_loc_e n];
+
+// ---- pattern matching ----------------------------------------------------------------
+// p_expr: one pattern. A parenthesized one is the pattern inside.
+let rec tr_pat = fn (x: int) ->
+  if pm_is x (pm_t_parentheses ()) then tr_pat (paren_single x) else tr x
+// (the one node between a ParenthesesNode's parentheses)
+and paren_single = fn (x: int) ->
+  let b = pm_parentheses_body x in
+  if pm_is b (pm_t_statements ()) then pm_ls_at (pm_statements_body b) 0 else b;
+// p_arg lists joined by list_concat: each element a LIST located at itself
+let tr_pat_list = fn (l: int) ->
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i >= pm_ls_len l then acc
+    else
+      (let x = pm_ls_at l i in
+       let v = tr_pat x in
+       let cell = p_new_list v (pm_start x) (pm_end x) in
+       go (i + 1) (if acc == 0 then cell else p_list_concat acc cell)) in
+  go 0 0;
+// p_rest: tSTAR tIDENTIFIER -> assignable (with its star) | tSTAR -> none
+let tr_pat_rest = fn (x: int) ->
+  let t = pm_splat_expression x in
+  if t == 0 then 0 else n2 (asgn_type 0) (pm_start x) (pm_end x) (id_c (pm_local_variable_target_name t)) 0;
+// (a pattern's constant, and where the pattern then starts)
+let tr_pat_const = fn (c: int) -> if c == 0 then 0 else tr c;
+// ARYPTN: pconst, pre_args, rest (-1: unnamed), post_args
+let tr_array_pattern = fn (n: int) ->
+  let cn = pm_array_pattern_constant n in
+  let reqs = pm_array_pattern_requireds n in
+  let rest = pm_array_pattern_rest n in
+  let posts = pm_array_pattern_posts n in
+  let os = pm_array_pattern_opening_loc_s n in
+  let nreq = pm_ls_len reqs in
+  let npost = pm_ls_len posts in
+  let empty = nreq == 0 && rest == 0 && npost == 0 in
+  // (what is between the brackets: p_args's own extent)
+  let ib = (if nreq > 0 then pm_start (pm_ls_at reqs 0) else if rest != 0 then pm_start rest else pm_start n) in
+  let ie = (if npost > 0 then pm_end (pm_ls_at posts (npost - 1))
+            else if rest != 0 then pm_end rest
+            else if nreq > 0 then pm_end (pm_ls_at reqs (nreq - 1))
+            else pm_end n) in
+  let pconst = tr_pat_const cn in
+  let b = (if empty then pm_start n else if cn != 0 then pm_start cn else if os >= 0 then ib else pm_start n) in
+  let e = (if empty then pm_end n else if os >= 0 || cn != 0 then ie else pm_end n) in
+  let pre = tr_pat_list reqs in
+  // (with no brackets -- `in a, b` -- the first element is put in front by
+  //  new_array_pattern, as a LIST located at the whole pattern)
+  let _ = (if pre != 0 && os < 0 && cn == 0 && (nreq > 1 || rest != 0) then a_set_beg pre (pm_start n) else ()) in
+  let _ = (if pre != 0 && os < 0 && cn == 0 && nreq == 1 && rest != 0 then a_set_end pre (pm_end n) else ()) in
+  let restn = (if rest == 0 then 0
+               else if pm_is rest (pm_t_implicit_rest ()) then 0 - 1
+               else (let r = tr_pat_rest rest in if r == 0 then 0 - 1 else r)) in
+  let post = tr_pat_list posts in
+  n4 (nt_aryptn ()) b e pconst pre restn post;
+// FNDPTN: pconst, pre_rest (-1: unnamed), args, post_rest (-1: unnamed)
+let tr_find_pattern = fn (n: int) ->
+  let cn = pm_find_pattern_constant n in
+  let l = pm_find_pattern_left n in
+  let r = pm_find_pattern_right n in
+  let pconst = tr_pat_const cn in
+  let pre = (let x = tr_pat_rest l in if x == 0 then 0 - 1 else x) in
+  let args = tr_pat_list (pm_find_pattern_requireds n) in
+  let post = (let x = tr_pat_rest r in if x == 0 then 0 - 1 else x) in
+  n4 (nt_fndptn ()) (if cn != 0 then pm_start cn else pm_start l) (pm_end r) pconst pre args post;
+// HSHPTN: pconst, pkwargs (a HASH), pkwrestarg (-1: **nil)
+let tr_hash_pattern = fn (n: int) ->
+  let cn = pm_hash_pattern_constant n in
+  let els = pm_hash_pattern_elements n in
+  let rest = pm_hash_pattern_rest n in
+  let nel = pm_ls_len els in
+  let empty = nel == 0 && rest == 0 in
+  let os = pm_hash_pattern_opening_loc_s n in
+  let ib = (if nel > 0 then pm_start (pm_ls_at els 0) else if rest != 0 then pm_start rest else pm_start n) in
+  // (p_kwargs's own extent: to the rest, and past a trailing comma)
+  let ie0 = (if rest != 0 then pm_end rest else if nel > 0 then pm_end (pm_ls_at els (nel - 1)) else pm_end n) in
+  let ie = (if os >= 0 && pm_byte (skip_blank ie0) == 44 then skip_blank ie0 + 1 else ie0) in
+  let pconst = tr_pat_const cn in
+  let b = (if empty then pm_start n else if cn != 0 then pm_start cn else if os >= 0 then ib else pm_start n) in
+  let e = (if empty then pm_end n else if os >= 0 || cn != 0 then ie else pm_end n) in
+  // p_kw: label p_expr | label (the label's own variable)
+  let rec pairs = fn (i: int) -> fn (acc: int) ->
+    if i >= nel then acc
+    else
+      (let a = pm_ls_at els i in
+       let kn = pm_assoc_key a in
+       let vn = pm_assoc_value a in
+       let implicit = pm_is vn (pm_t_implicit ()) in
+       let key = (if implicit then n1 (nt_sym ()) (pm_start a) (pm_end a) (id_of (vec_get pm_st (pm_symbol_unescaped kn)))
+                  else tr kn) in
+       let v = (if implicit then
+                  n2 (asgn_type 0) (pm_start a) (pm_end a) (id_c (pm_local_variable_target_name (pm_implicit_value vn))) 0
+                else tr_pat vn) in
+       let pair = p_list_append (p_new_list key (pm_start a) (pm_end a)) v in
+       pairs (i + 1) (if acc == 0 then pair else p_list_concat acc pair)) in
+  let kw = pairs 0 0 in
+  let hash = (if empty then 0 else n2 (nt_hash ()) ib ie kw 0) in
+  let restn = (if rest == 0 then 0
+               else if pm_is rest (pm_t_no_keywords_parameter ()) then 0 - 1
+               else (let t = pm_assoc_splat_value rest in
+                     if t == 0 then 0 else n2 (asgn_type 0) ib ie (id_c (pm_local_variable_target_name t)) 0)) in
+  n3 (nt_hshptn ()) b e pconst hash restn;
+// p_alt: NEW_OR
+let tr_alternation_pattern = fn (n: int) ->
+  let l = tr_pat (pm_alternation_pattern_left n) in
+  let r = tr_pat (pm_alternation_pattern_right n) in
+  a_xloc (n2 (nt_or ()) (pm_start n) (pm_end n) l r)
+    [pm_alternation_pattern_operator_loc_s n, pm_alternation_pattern_operator_loc_e n];
+// p_as: p_expr tASSOC p_variable -> a HASH of the pattern and the variable
+let tr_capture_pattern = fn (n: int) ->
+  let b = pm_start n in
+  let e = pm_end n in
+  let v = tr_pat (pm_capture_pattern_value n) in
+  let t = tr (pm_capture_pattern_target n) in
+  n2 (nt_hash ()) b e (p_list_append (p_new_list v b e) t) 0;
+// p_var_ref: '^' name -> the variable, located with its caret
+let tr_pinned_variable = fn (n: int) ->
+  let v = tr (pm_pinned_variable_variable n) in
+  let _ = a_set_beg v (pm_start n) in
+  v;
+// p_expr_ref: '^' tLPAREN expr_value rparen -> NEW_BLOCK
+let tr_pinned_expression = fn (n: int) ->
+  let v = tr (pm_pinned_expression_expression n) in
+  p_new_block v (pm_start n) (pm_end n);
+// p_top_expr: a pattern, or one under a guard (`in pat if cond`)
+let tr_pat_top = fn (x: int) ->
+  if pm_is x (pm_t_if ()) && pm_if_statements x != 0 && pm_if_if_keyword_loc_s x > pm_start x then
+    (let l = tr_pat (pm_ls_at (pm_statements_body (pm_if_statements x)) 0) in
+     let c = tr (pm_if_predicate x) in
+     a_xloc (n3 (nt_if ()) (pm_start x) (pm_end x) c l 0)
+       [pm_if_if_keyword_loc_s x, pm_if_if_keyword_loc_e x, 0 - 1, 0 - 1, 0 - 1, 0 - 1])
+  else if pm_is x (pm_t_unless ()) && pm_unless_statements x != 0 && pm_unless_keyword_loc_s x > pm_start x then
+    (let l = tr_pat (pm_ls_at (pm_statements_body (pm_unless_statements x)) 0) in
+     let c = tr (pm_unless_predicate x) in
+     a_xloc (n3 (nt_unless ()) (pm_start x) (pm_end x) c l 0)
+       [pm_unless_keyword_loc_s x, pm_unless_keyword_loc_e x, 0 - 1, 0 - 1, 0 - 1, 0 - 1])
+  else tr_pat x;
+// p_case_body: keyword_in p_top_expr then compstmt p_cases.  IN: head, body, next
+let rec tr_in_chain = fn (conds: int) -> fn (i: int) -> fn (els: int) ->
+  if i >= pm_ls_len conds then tr_else_body els
+  else
+    (let w = pm_ls_at conds i in
+     let pn = pm_in_pattern w in
+     let pat = tr_pat_top pn in
+     let ts = then_start (pm_end pn) (pm_in_then_loc_s w) in
+     let te = then_end (pm_end pn) (pm_in_then_loc_e w) in
+     let sn = pm_in_statements w in
+     let body = tr_compstmt sn te in
+     let next = tr_in_chain conds (i + 1) els in
+     let en = (if a_is next (nt_in ()) then a_end next
+               else if els != 0 then stmts_end (pm_else_statements els) (pm_else_else_keyword_loc_e els)
+               else stmts_end sn te) in
+     a_xloc (n3 (nt_in ()) (pm_start w) en pat body next)
+       [pm_in_in_loc_s w, pm_in_in_loc_e w, ts, te, 0 - 1, 0 - 1]);
+// k_case expr_value terms? p_case_body k_end.  CASE3: head, body
+let tr_case_match = fn (n: int) ->
+  let pred = pm_case_match_predicate n in
+  let head = (if pred == 0 then 0 else tr pred) in
+  let body = tr_in_chain (pm_case_match_conditions n) 0 (pm_case_match_else_clause n) in
+  a_xloc (n2 (nt_case3 ()) (pm_start n) (pm_end n) head body)
+    [pm_case_match_case_keyword_loc_s n, pm_case_match_case_keyword_loc_e n,
+     pm_case_match_end_keyword_loc_s n, pm_case_match_end_keyword_loc_e n];
+// arg tASSOC p_top_expr_body: a CASE3 with one IN that has no body
+let tr_match_required = fn (n: int) ->
+  let v = tr (pm_match_required_value n) in
+  let pn = pm_match_required_pattern n in
+  let pat = tr_pat pn in
+  let inn = a_xloc (n3 (nt_in ()) (pm_start pn) (pm_end pn) pat 0 0)
+              [0 - 1, 0 - 1, 0 - 1, 0 - 1, pm_match_required_operator_loc_s n, pm_match_required_operator_loc_e n] in
+  a_xloc (n2 (nt_case3 ()) (pm_start n) (pm_end n) v inn) [0 - 1, 0 - 1, 0 - 1, 0 - 1];
+// arg keyword_in p_top_expr_body: the IN answers true, its else false
+let tr_match_predicate = fn (n: int) ->
+  let v = tr (pm_match_predicate_value n) in
+  let pn = pm_match_predicate_pattern n in
+  let pat = tr_pat pn in
+  let pb = pm_start pn in
+  let pe = pm_end pn in
+  let t = n0 (nt_true ()) pb pe in
+  let f = n0 (nt_false ()) pb pe in
+  let inn = a_xloc (n3 (nt_in ()) pb pe pat t f)
+              [pm_match_predicate_operator_loc_s n, pm_match_predicate_operator_loc_e n, 0 - 1, 0 - 1, 0 - 1, 0 - 1] in
+  a_xloc (n2 (nt_case3 ()) (pm_start n) (pm_end n) v inn) [0 - 1, 0 - 1, 0 - 1, 0 - 1];
+// match_op's named captures (reg_named_capture_assign): each name assigned
+// its own Symbol, the assignments a chain of BLOCKs under MATCH2's args
+let tr_match_write = fn (n: int) ->
+  let m = tr (pm_match_write_call n) in
+  let b = pm_start n in
+  let e = pm_end n in
+  let l = pm_match_write_targets n in
+  let rec go = fn (i: int) -> fn (first: int) -> fn (lastc: int) ->
+    if i >= pm_ls_len l then first
+    else
+      (let id = id_c (pm_local_variable_target_name (pm_ls_at l i)) in
+       let a = n2 (asgn_type 0) b e id (n1 (nt_sym ()) b e id) in
+       let cell = p_new_block a b e in
+       let _ = (if lastc != 0 then a_set lastc 1 cell else ()) in
+       go (i + 1) (if first == 0 then cell else first) cell) in
+  let args = go 0 0 0 in
+  let _ = (if a_is m (nt_match2 ()) then a_set m 2 args else ()) in
+  m;
+
+// keyword_BEGIN begin_block: the statements go to the front of the program
+// (eval_tree_begin); in their place is an empty BEGIN
+let tr_pre_execution = fn (n: int) ->
+  let os = pm_pre_execution_opening_loc_s n in
+  let ce = pm_pre_execution_closing_loc_e n in
+  let body = tr_compstmt (pm_pre_execution_statements n) (pm_pre_execution_opening_loc_e n) in
+  let _ = vec_push as_pre (n1 (nt_begin ()) os ce body) in
+  n1 (nt_begin ()) os ce 0;
+// k_END '{' compstmt '}'.  POSTEXE: body (a SCOPE with no table)
+let tr_post_execution = fn (n: int) ->
+  let b = pm_start n in
+  let e = pm_end n in
+  let _ = vec_set as_px 0 (vec_get as_px 0 + 1) in
+  let body = tr_compstmt (pm_post_execution_statements n) (pm_post_execution_opening_loc_e n) in
+  let _ = vec_set as_px 0 (vec_get as_px 0 - 1) in
+  let scope = n3 (nt_scope ()) b e (mk_arr Nil) 0 body in
+  a_xloc (n1 (nt_postexe ()) b e scope)
+    [pm_post_execution_keyword_loc_s n, pm_post_execution_keyword_loc_e n,
+     pm_post_execution_opening_loc_s n, pm_post_execution_opening_loc_e n,
+     pm_post_execution_closing_loc_s n, pm_post_execution_closing_loc_e n];
+
+// ---- alias, undef, defined? ---------------------------------------------------------
+let tr_alias_method = fn (n: int) ->
+  let a = tr (pm_alias_method_new_name n) in
+  let b2 = tr (pm_alias_method_old_name n) in
+  a_xloc (n2 (nt_alias ()) (pm_start n) (pm_end n) a b2) [pm_alias_method_keyword_loc_s n, pm_alias_method_keyword_loc_e n];
+// (the name of a global variable node of any kind, as an ID)
+let gvar_id = fn (x: int) ->
+  if pm_is x (pm_t_global_variable_read ()) then id_c (pm_global_variable_read_name x)
+  else if pm_is x (pm_t_back_reference_read ()) then id_c (pm_back_reference_read_name x)
+  else id_of (pm_text (pm_start x) (pm_end x));
+let tr_alias_global_variable = fn (n: int) ->
+  a_xloc (n2 (nt_valias ()) (pm_start n) (pm_end n) (gvar_id (pm_alias_global_variable_new_name n))
+            (gvar_id (pm_alias_global_variable_old_name n)))
+    [pm_alias_global_variable_keyword_loc_s n, pm_alias_global_variable_keyword_loc_e n];
+let tr_undef = fn (n: int) ->
+  let l = pm_undef_names n in
+  let rec go = fn (i: int) ->
+    if i >= pm_ls_len l then (Nil : int list)
+    else (let x = tr (pm_ls_at l i) in Cons (k_node x, go (i + 1))) in
+  let names = go 0 in
+  a_xloc (n1 (nt_undef ()) (pm_start n) (pm_end n) (mk_arr names)) [pm_undef_keyword_loc_s n, pm_undef_keyword_loc_e n];
+// new_defined: the expression without the BEGINs and one-statement BLOCKs
+// around it
+let tr_defined = fn (n: int) ->
+  let vn = pm_defined_value n in
+  // (what `defined?` asks about is not run: a `retry` in it is no error,
+  //  inside an `END { }` either)
+  let px = vec_get as_px 0 in
+  let _ = vec_set as_px 0 0 in
+  let x = tr vn in
+  let _ = vec_set as_px 0 px in
+  let rec strip = fn (v: int) ->
+    if a_is v (nt_begin ()) then strip (a_f v 0)
+    else if a_is v (nt_block ()) && a_f v 2 == v then strip (a_f v 0)
+    else v in
+  let st = strip x in
+  // (has_trailing_semicolon: `defined? (x;)` keeps a BLOCK around the expression)
+  let semi = pm_is vn (pm_t_parentheses ()) && pm_byte (back_blank (pm_parentheses_closing_loc_s vn - 1)) == 59 in
+  let v = (if semi && nott (a_is st (nt_block ())) then p_new_block st (pm_start n) (pm_end n) else st) in
+  a_xloc (n1 (nt_defined ()) (pm_start n) (pm_end n) v) [pm_defined_keyword_loc_s n, pm_defined_keyword_loc_e n];
+// (the last offset at or before `i` that is no blank)
+let rec back_blank = fn (i: int) ->
+  let c = pm_byte i in
+  if c == 32 || c == 9 || c == 10 || c == 13 then back_blank (i - 1) else i;
+let tr_numbered_reference_read = fn (n: int) ->
+  n1 (nt_nth_ref ()) (pm_start n) (pm_end n) (pm_numbered_reference_read_number n);
+// BACK_REF: the character after the `$`
+let tr_back_reference_read = fn (n: int) ->
+  n1 (nt_back_ref ()) (pm_start n) (pm_end n) (pm_byte (pm_start n + 1));
+
+// ---- nodes that are only parts of others ---------------------------------------------
+// Prism has a node type for each of these, and the generated dispatcher
+// (ast_tr_node) therefore names a function for each; they are read by the
+// node that holds them and never translated on their own. Reached anyway --
+// a tree Prism recovered from an error can hold anything -- each is an ERROR
+// node at its place, which is what parse.y answers where it could not parse.
+let tr_arguments = fn (n: int) -> tr_unknown n;
+let tr_assoc_splat = fn (n: int) -> tr_unknown n;
+let tr_block = fn (n: int) -> tr_unknown n;
+let tr_block_local_variable = fn (n: int) -> tr_unknown n;
+let tr_block_parameter = fn (n: int) -> tr_unknown n;
+let tr_block_parameters = fn (n: int) -> tr_unknown n;
+let tr_else = fn (n: int) -> tr_unknown n;
+let tr_ensure = fn (n: int) -> tr_unknown n;
+let tr_forwarding_arguments = fn (n: int) -> tr_unknown n;
+let tr_forwarding_parameter = fn (n: int) -> tr_unknown n;
+let tr_implicit_rest = fn (n: int) -> tr_unknown n;
+let tr_in = fn (n: int) -> tr_unknown n;
+let tr_it_parameters = fn (n: int) -> tr_unknown n;
+let tr_keyword_hash = fn (n: int) -> tr_unknown n;
+let tr_keyword_rest_parameter = fn (n: int) -> tr_unknown n;
+let tr_no_keywords_parameter = fn (n: int) -> tr_unknown n;
+let tr_numbered_parameters = fn (n: int) -> tr_unknown n;
+let tr_optional_keyword_parameter = fn (n: int) -> tr_unknown n;
+let tr_optional_parameter = fn (n: int) -> tr_unknown n;
+let tr_parameters = fn (n: int) -> tr_unknown n;
+let tr_required_keyword_parameter = fn (n: int) -> tr_unknown n;
+let tr_required_parameter = fn (n: int) -> tr_unknown n;
+let tr_rescue = fn (n: int) -> tr_unknown n;
+let tr_rest_parameter = fn (n: int) -> tr_unknown n;
+let tr_when = fn (n: int) -> tr_unknown n;
+// (what Prism puts where it found nothing it could parse: NEW_ERROR)
+let tr_missing = fn (n: int) -> tr_unknown n;
+// the targets of an assignment, met with no value (a pattern's capture is
+// translated as one already; these are the rest)
+let tr_call_target = fn (n: int) -> tr_target n 0 (pm_start n) (pm_end n);
+let tr_index_target = fn (n: int) -> tr_target n 0 (pm_start n) (pm_end n);
+let tr_class_variable_target = fn (n: int) -> tr_target n 0 (pm_start n) (pm_end n);
+let tr_constant_target = fn (n: int) -> tr_target n 0 (pm_start n) (pm_end n);
+let tr_constant_path_target = fn (n: int) -> tr_target n 0 (pm_start n) (pm_end n);
+let tr_global_variable_target = fn (n: int) -> tr_target n 0 (pm_start n) (pm_end n);
+let tr_instance_variable_target = fn (n: int) -> tr_target n 0 (pm_start n) (pm_end n);
+// arg_splat outside an argument list
+let tr_splat = fn (n: int) ->
+  let x = pm_splat_expression n in
+  let os = pm_splat_operator_loc_s n in
+  let oe = pm_splat_operator_loc_e n in
+  let v = (if x == 0 then n1 (nt_lvar ()) os oe (id_of "*") else tr x) in
+  a_xloc (n1 (nt_splat ()) (pm_start n) (pm_end n) v) [os, oe];
+// (# shareable_constant_value: the assignment it wraps; the tree is the same)
+let tr_shareable_constant = fn (n: int) -> tr (pm_shareable_constant_write n);
+
+// The tree of the program pm_decode last decoded: its SCOPE.
+let ast_translate = fn (u: unit) ->
+  let _ = ao_reset () in
+  let _ = sc_reset () in
+  let _ = nm_reset () in
+  let _ = vec_recycle as_pre in
+  let _ = vec_recycle as_er in
+  let _ = vec_recycle as_px in
+  let _ = vec_push as_px 0 in
+  let _ = vec_push as_px (0 - 1) in
+  let _ = vec_push as_px 0 in
+  let _ = vec_push as_px (0 - 1) in
+  let _ = vec_push as_px 0 in
+  let _ = vec_push as_px 0 in
+  let _ = vec_push as_px 0 in
+  let _ = vec_push as_px (0 - 1) in
+  let _ = vec_push as_px 0 in
+  let _ = vec_push as_px (0 - 1) in
+  let _ = vec_push as_px 0 in
+  let _ = lpa_set (0 - 1) in
+  let _ = cl_set (0 - 1) (0 - 1) in
+  tr (pm_root ());
