@@ -41,6 +41,14 @@ show("x <<A # c\nA\n\n")
 show('/a#@~b/i')
 show('/a#@~b#$ c/')
 show('/a\#@~b/')
+# ...its pieces are the lexer's tokens: an escaped delimiter is the
+# delimiter, a `\` and its line end go, \cX / \M-X are written \xHH
+show('/a\/#@~/')
+show('/a#@~\//')
+show("/a\\\n#@~b/")
+show('%r{a\}#@~}')
+show('if /a\/#@~b/ then 1 end')
+p AST.parse('/a\cA#@~\M-\C-b/').children[2].children
 show('if /a#@~b/ then 1 end')
 show('"a#@~b"')
 # text a heredoc body interrupts is one token
@@ -50,6 +58,8 @@ show("p <<-A, %i[n\\\nm\nA\nn]\n")
 # a <<~ heredoc with an unindented line, early or late
 show("x=<<~E\n  a\n\#{1}\n  b\n\#{2}\n  c\nE\n")
 show("x=<<~E\n  x\n  w\n\ny\n  q\nE\n")
+show("x=<<~E\n  \#{1}\nb\nE\n")
+show("x=<<~E\n  #{"a"} \#{1} c\n  b\n\#{2}\nE\n")
 show("x=<<~E\n    x\n  \#{\"  y\"}\nE\n")
 # Foo::Bar { } -- the call is placed with its block
 show("Foo::Bar { |a| 42 }")

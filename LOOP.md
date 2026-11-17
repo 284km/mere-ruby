@@ -5474,6 +5474,16 @@ cuts or places a token differently from Prism:
   Prism as in parse.y (it always warned); under AST.parse, one parse.y
   splits warns so too.
 
+Review of #99 (two P2s, both fixed): a `<<~` heredoc with interpolation
+whose indentation falls to none later also keeps its pieces before that
+line apart and placed as `<<~` pieces (`  #{1}` / `b`: the text after the
+interpolation is 2:6-2:7, not the opener's end) -- tr_contents runs
+literal_concat with `squiggly` until that line; and a regexp split at `#@`
+takes its pieces' text as tokadd_string leaves it: an escaped delimiter is
+the delimiter unless simple_re_meta, a `\` and its line end go, a `\`
+before a non-ASCII byte goes, `\cX` / `\C-X` / `\M-X` are written `\xHH`.
+Checked against 11 heredoc forms and 20 regexp forms.
+
 Not done: `/(?<y>a)#@~/ =~ x`, where parse.y's DREGX assigns no `y` (the
 scope's table comes from Prism's locals).
 
