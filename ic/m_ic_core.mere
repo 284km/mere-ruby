@@ -1,0 +1,502 @@
+// The native ISeq compiler's instruction lists and sequences (note 552 §11):
+// what lib/iseq_compiler_ext.rb's Unit, Insn, Label, Trace and Adjust are.
+//
+// The context `cx` is (tree, elements, units).
+//
+// ELEMENTS. An element is a number. es = (ei, en, eo, ex, la):
+//
+//   ei   ten words an element: kind, prev, next, line, node id, events,
+//        pos, refs, sp, flag
+//        kind  0 an instruction, 1 a label, 2 a trace event, 3 an adjust,
+//              9 the end of a list (its head or its tail)
+//        an instruction: line, node id, events (EVENT_BITS or'ed)
+//        a label: pos (-1 until laid out), refs, sp (-1: none), flag 1 unremovable
+//        a trace: events is the one event's bit
+//        an adjust: line, node id, flag 1 restore; its label is its operand
+//   en   an instruction's name
+//   eo   its operands (an adjust's label, when it has one)
+//   ex   what the VM's export adds after the operands (vmx)
+//   la   two words a list: its head and its tail, elements of kind 9 that
+//        are never moved -- so an element is taken out or put in without
+//        asking which list it is in (compile.c's LINK_ANCHOR)
+//
+// SEQUENCES. A sequence (a Unit) is a number. us = (ui, ust, ul, uc, ...):
+// see the ic_u_* readers.
+import "m_ic_tree.mere";
+
+// a value an instruction carries, as #to_a shows it
+type Iv =
+  | IvNil
+  | IvTrue
+  | IvFalse
+  | IvInt of int
+  | IvBig of str
+  | IvFlt of float
+  | IvSym of str * str
+  | IvStr of str * str
+  | IvArr of Iv list
+  | IvHsh of (Iv * Iv) list
+  | IvRx of str * int * str
+  | IvRng of Iv * Iv * bool
+  | IvRat of Iv * Iv
+  | IvCpx of Iv * Iv
+  | IvCls of str
+  | IvEnc of str;
+
+// an operand
+//   ONum    a number that is the instruction's own (a count, a flag, a level)
+//   OVal    an object
+//   OLab    a label (its element)
+//   OLoc    a local: its name, its index in its table, its slot
+//   OCall   call data: the method (chr 0: none), the flag, argc, the keywords
+//           and whether there are keywords at all
+//   OSeq    a sequence (-1: none)
+//   OIvc OIse OCvc   an inline cache's number
+//   OIc     a constant cache: the path's segments
+//   ODef OChk        defined's type, checktype's type
+//   OCdh    a case dispatch's hash: key and label
+type IcOp =
+  | ONum of int
+  | OVal of Iv
+  | OLab of int
+  | OLoc of str * int * int
+  | OCall of str * int * int * str list * bool
+  | OSeq of int
+  | OIvc of int
+  | OIse of int
+  | OCvc of int
+  | OIc of Iv list
+  | ODef of int
+  | OChk of int
+  | OCdh of (Iv * int) list;
+
+let ic_es = fn cx -> (let (_, es, _) = cx in es);
+let ic_us = fn cx -> (let (_, _, us) = cx in us);
+let ic_ei = fn cx -> (let (ei, _, _, _, _) = ic_es cx in ei);
+let ic_en = fn cx -> (let (_, en, _, _, _) = ic_es cx in en);
+let ic_eo = fn cx -> (let (_, _, eo, _, _) = ic_es cx in eo);
+let ic_ex = fn cx -> (let (_, _, _, ex, _) = ic_es cx in ex);
+let ic_la = fn cx -> (let (_, _, _, _, la) = ic_es cx in la);
+
+// -- lists of plain values ----------------------------------------------------
+let rec ic_llen = fn xs -> match xs with | Nil -> 0 | Cons (_, t) -> 1 + ic_llen t;
+let rec ic_rev_onto = fn xs -> fn acc -> match xs with | Nil -> acc | Cons (h, t) -> ic_rev_onto t (Cons (h, acc));
+let ic_rev = fn xs -> ic_rev_onto xs Nil;
+let rec ic_cat = fn xs -> fn ys -> match xs with | Nil -> ys | Cons (h, t) -> Cons (h, ic_cat t ys);
+let rec ic_map = fn f -> fn xs -> match xs with | Nil -> Nil | Cons (h, t) -> Cons (f h, ic_map f t);
+let ic_join = fn (xs: str list) -> fn (sep: str) -> str_join sep xs;
+let rec ic_has_str = fn (xs: str list) -> fn (s: str) ->
+  match xs with | Nil -> false | Cons (h, t) -> if str_eq h s then true else ic_has_str t s;
+let rec ic_index_str = fn (xs: str list) -> fn (s: str) -> fn (i: int) ->
+  match xs with | Nil -> 0 - 1 | Cons (h, t) -> if str_eq h s then i else ic_index_str t s (i + 1);
+
+// -- elements -------------------------------------------------------------------
+let ic_e_get = fn cx -> fn (e: int) -> fn (k: int) -> vec_get (ic_ei cx) (e * 10 + k);
+let ic_e_set = fn cx -> fn (e: int) -> fn (k: int) -> fn (v: int) -> vec_set (ic_ei cx) (e * 10 + k) v;
+let ic_kind = fn cx -> fn (e: int) -> ic_e_get cx e 0;
+let ic_prev = fn cx -> fn (e: int) -> ic_e_get cx e 1;
+let ic_next = fn cx -> fn (e: int) -> ic_e_get cx e 2;
+let ic_eline = fn cx -> fn (e: int) -> ic_e_get cx e 3;
+let ic_enode = fn cx -> fn (e: int) -> ic_e_get cx e 4;
+let ic_events = fn cx -> fn (e: int) -> ic_e_get cx e 5;
+let ic_pos = fn cx -> fn (e: int) -> ic_e_get cx e 6;
+let ic_refs = fn cx -> fn (e: int) -> ic_e_get cx e 7;
+let ic_sp = fn cx -> fn (e: int) -> ic_e_get cx e 8;
+let ic_eflag = fn cx -> fn (e: int) -> ic_e_get cx e 9;
+let ic_name = fn cx -> fn (e: int) -> vec_get (ic_en cx) e;
+let ic_ops = fn cx -> fn (e: int) -> vec_get (ic_eo cx) e;
+let ic_vmx = fn cx -> fn (e: int) -> vec_get (ic_ex cx) e;
+let ic_set_name = fn cx -> fn (e: int) -> fn (s: str) -> vec_set (ic_en cx) e s;
+let ic_set_ops = fn cx -> fn (e: int) -> fn (ops: IcOp list) -> vec_set (ic_eo cx) e ops;
+let ic_set_vmx = fn cx -> fn (e: int) -> fn (ops: IcOp list) -> vec_set (ic_ex cx) e ops;
+let ic_is_insn = fn cx -> fn (e: int) -> ic_kind cx e == 0;
+let ic_is_label = fn cx -> fn (e: int) -> ic_kind cx e == 1;
+let ic_is_trace = fn cx -> fn (e: int) -> ic_kind cx e == 2;
+let ic_is_adjust = fn cx -> fn (e: int) -> ic_kind cx e == 3;
+let ic_is_end = fn cx -> fn (e: int) -> ic_kind cx e == 9;
+// (is this instruction named so)
+let ic_named = fn cx -> fn (e: int) -> fn (s: str) -> ic_kind cx e == 0 && str_eq (ic_name cx e) s;
+
+// a new element, in no list
+let ic_e_new = fn cx -> fn (kind: int) -> fn (name: str) -> fn (ops: IcOp list) -> fn (line: int) -> fn (node: int) ->
+  let ei = ic_ei cx in
+  let e = vec_len ei / 10 in
+  let _ = vec_push ei kind in
+  let _ = vec_push ei (0 - 1) in
+  let _ = vec_push ei (0 - 1) in
+  let _ = vec_push ei line in
+  let _ = vec_push ei node in
+  let _ = vec_push ei 0 in
+  let _ = vec_push ei (0 - 1) in
+  let _ = vec_push ei 0 in
+  let _ = vec_push ei (0 - 1) in
+  let _ = vec_push ei 0 in
+  let _ = vec_push (ic_en cx) name in
+  let _ = vec_push (ic_eo cx) ops in
+  let _ = vec_push (ic_ex cx) (Nil : IcOp list) in
+  e;
+
+// a new list, empty: its number
+let ic_list_new = fn cx ->
+  let la = ic_la cx in
+  let h = ic_e_new cx 9 "" Nil 0 0 in
+  let t = ic_e_new cx 9 "" Nil 0 0 in
+  let _ = ic_e_set cx h 2 t in
+  let _ = ic_e_set cx t 1 h in
+  let _ = vec_push la h in
+  let _ = vec_push la t in
+  vec_len la / 2 - 1;
+let ic_list_head = fn cx -> fn (l: int) -> vec_get (ic_la cx) (l * 2);
+let ic_list_tail = fn cx -> fn (l: int) -> vec_get (ic_la cx) (l * 2 + 1);
+// the first and the last element of a list (an end when it is empty)
+let ic_first = fn cx -> fn (l: int) -> ic_next cx (ic_list_head cx l);
+let ic_last = fn cx -> fn (l: int) -> ic_prev cx (ic_list_tail cx l);
+let ic_list_empty = fn cx -> fn (l: int) -> ic_is_end cx (ic_first cx l);
+// e put before / after an element that is in a list
+let ic_ins_before = fn cx -> fn (at: int) -> fn (e: int) ->
+  let p = ic_prev cx at in
+  let _ = ic_e_set cx e 1 p in
+  let _ = ic_e_set cx e 2 at in
+  let _ = ic_e_set cx p 2 e in
+  ic_e_set cx at 1 e;
+let ic_ins_after = fn cx -> fn (at: int) -> fn (e: int) -> ic_ins_before cx (ic_next cx at) e;
+let ic_push = fn cx -> fn (l: int) -> fn (e: int) -> ic_ins_before cx (ic_list_tail cx l) e;
+// e taken out of its list. (Its own next is left as it was, as compile.c's
+// ELEM_REMOVE leaves it: the optimiser goes on from an element it took out
+// along that, past whatever else went meanwhile.)
+let ic_unlink = fn cx -> fn (e: int) ->
+  let p = ic_prev cx e in
+  let n = ic_next cx e in
+  let _ = ic_e_set cx p 2 n in
+  let _ = ic_e_set cx n 1 p in
+  ic_e_set cx e 1 (0 - 1);
+// every element of list `from` moved to the end of list `l` (Array#concat;
+// `from` is left empty)
+let ic_list_append = fn cx -> fn (l: int) -> fn (from: int) ->
+  if ic_list_empty cx from then ()
+  else
+    (let f = ic_first cx from in
+     let g = ic_last cx from in
+     let fh = ic_list_head cx from in
+     let ft = ic_list_tail cx from in
+     let _ = ic_e_set cx fh 2 ft in
+     let _ = ic_e_set cx ft 1 fh in
+     let t = ic_list_tail cx l in
+     let p = ic_prev cx t in
+     let _ = ic_e_set cx p 2 f in
+     let _ = ic_e_set cx f 1 p in
+     let _ = ic_e_set cx g 2 t in
+     ic_e_set cx t 1 g);
+// the next / previous element that is an instruction or an adjust (-1: none)
+let rec ic_next_insn = fn cx -> fn (e: int) ->
+  let n = ic_next cx e in
+  if n < 0 || ic_is_end cx n then 0 - 1
+  else if ic_kind cx n == 0 || ic_kind cx n == 3 then n
+  else ic_next_insn cx n;
+let rec ic_prev_insn = fn cx -> fn (e: int) ->
+  let p = ic_prev cx e in
+  if p < 0 || ic_is_end cx p then 0 - 1
+  else if ic_kind cx p == 0 || ic_kind cx p == 3 then p
+  else ic_prev_insn cx p;
+
+// -- labels ---------------------------------------------------------------------
+let ic_label_new = fn cx -> ic_e_new cx 1 "" Nil 0 0;
+let ic_ref = fn cx -> fn (l: int) -> ic_e_set cx l 7 (ic_refs cx l + 1);
+let ic_unref = fn cx -> fn (l: int) -> ic_e_set cx l 7 (ic_refs cx l - 1);
+let ic_unremovable = fn cx -> fn (l: int) -> ic_eflag cx l == 1;
+let ic_set_unremovable = fn cx -> fn (l: int) -> ic_e_set cx l 9 1;
+// (an instruction's label operands referenced / no longer)
+let rec ic_ref_ops = fn cx -> fn (ops: IcOp list) ->
+  match ops with
+  | Nil -> ()
+  | Cons (OLab l, t) -> (let _ = ic_ref cx l in ic_ref_ops cx t)
+  | Cons (_, t) -> ic_ref_ops cx t;
+// compile.c's unref_destination: a label no instruction names any more
+// leaves the list at once
+let ic_drop_label = fn cx -> fn (l: int) ->
+  let _ = ic_unref cx l in
+  if ic_refs cx l == 0 && ic_prev cx l >= 0 then ic_unlink cx l else ();
+let rec ic_drop_ops = fn cx -> fn (ops: IcOp list) ->
+  match ops with
+  | Nil -> ()
+  | Cons (OLab l, t) -> (let _ = ic_drop_label cx l in ic_drop_ops cx t)
+  | Cons (_, t) -> ic_drop_ops cx t;
+// compile.c's replace_destination: e's first operand is l now (false when it
+// already is), and the old label goes when nothing names it
+let ic_retarget = fn cx -> fn (e: int) -> fn (l: int) ->
+  match ic_ops cx e with
+  | Cons (OLab old, rest) ->
+    if old == l then false
+    else (let _ = ic_ref cx l in let _ = ic_set_ops cx e (Cons (OLab l, rest)) in let _ = ic_drop_label cx old in true)
+  | _ -> false;
+let rec ic_unref_ops = fn cx -> fn (ops: IcOp list) ->
+  match ops with
+  | Nil -> ()
+  | Cons (OLab l, t) -> (let _ = ic_unref cx l in ic_unref_ops cx t)
+  | Cons (_, t) -> ic_unref_ops cx t;
+
+// -- sequences ------------------------------------------------------------------
+// us = (ui, ust, ul, uc, uk, uo, uw, uv, up, un, ux, um, ur)
+//   ui   forty words a sequence (the readers below name them)
+//   ust  three strings a sequence: label, path, absolute path
+//   ul   its locals: a name, or for a hidden one chr 1 and its number
+//   uc   its children, newest first
+//   uk   its catch entries, newest first: (type, start, end, sequence, cont)
+//   uo   its optional parameters' labels
+//   uw   its keywords, as #to_a shows them
+//   uv   its class variables' names, in the order their caches were made
+//   up   the loops it is in, innermost first: (next, break, redo) labels
+//   un   the ensures it is in, innermost first: -1 a loop (which a jump
+//        stops at), else (the ensure node, the ensure's number in ur)
+//   ux   the index lookup table: a name and its slot, newest first
+//   um   the parameters' nodes: the optional ones, the keywords, and the
+//        destructured ones each with its slot
+//   ur   an ensure region's pieces, by the ensure's number (not a
+//        sequence's: un's entries name them) -- (start label, end label)
+let ic_ui = fn cx -> (let (ui, _, _, _, _, _, _, _, _, _, _, _, _) = ic_us cx in ui);
+let ic_ust = fn cx -> (let (_, ust, _, _, _, _, _, _, _, _, _, _, _) = ic_us cx in ust);
+let ic_ul = fn cx -> (let (_, _, ul, _, _, _, _, _, _, _, _, _, _) = ic_us cx in ul);
+let ic_uc = fn cx -> (let (_, _, _, uc, _, _, _, _, _, _, _, _, _) = ic_us cx in uc);
+let ic_uk = fn cx -> (let (_, _, _, _, uk, _, _, _, _, _, _, _, _) = ic_us cx in uk);
+let ic_uo = fn cx -> (let (_, _, _, _, _, uo, _, _, _, _, _, _, _) = ic_us cx in uo);
+let ic_uw = fn cx -> (let (_, _, _, _, _, _, uw, _, _, _, _, _, _) = ic_us cx in uw);
+let ic_uv = fn cx -> (let (_, _, _, _, _, _, _, uv, _, _, _, _, _) = ic_us cx in uv);
+let ic_up = fn cx -> (let (_, _, _, _, _, _, _, _, up, _, _, _, _) = ic_us cx in up);
+let ic_un = fn cx -> (let (_, _, _, _, _, _, _, _, _, un, _, _, _) = ic_us cx in un);
+let ic_ux = fn cx -> (let (_, _, _, _, _, _, _, _, _, _, ux, _, _) = ic_us cx in ux);
+let ic_um = fn cx -> (let (_, _, _, _, _, _, _, _, _, _, _, um, _) = ic_us cx in um);
+let ic_ur = fn cx -> (let (_, _, _, _, _, _, _, _, _, _, _, _, ur) = ic_us cx in ur);
+
+let ic_u_get = fn cx -> fn (u: int) -> fn (k: int) -> vec_get (ic_ui cx) (u * 40 + k);
+let ic_u_set = fn cx -> fn (u: int) -> fn (k: int) -> fn (v: int) -> vec_set (ic_ui cx) (u * 40 + k) v;
+// a sequence's type: 0 top, 1 block, 2 method, 3 class, 4 rescue, 5 ensure, 6 plain
+let ic_u_type = fn cx -> fn (u: int) -> ic_u_get cx u 0;
+let ic_u_first_lineno = fn cx -> fn (u: int) -> ic_u_get cx u 1;
+let ic_u_parent = fn cx -> fn (u: int) -> ic_u_get cx u 2;
+// (3 .. 6: the code location -- start line, start column, end line, end column)
+let ic_u_node_id = fn cx -> fn (u: int) -> ic_u_get cx u 7;
+let ic_u_line = fn cx -> fn (u: int) -> ic_u_get cx u 8;
+let ic_u_node = fn cx -> fn (u: int) -> ic_u_get cx u 9;
+let ic_u_stack_max = fn cx -> fn (u: int) -> ic_u_get cx u 10;
+// (-1: no line event yet)
+let ic_u_last_line = fn cx -> fn (u: int) -> ic_u_get cx u 11;
+// (the list being built -- another while something is captured aside)
+let ic_u_list = fn cx -> fn (u: int) -> ic_u_get cx u 12;
+// (13: the sequence's own list, which the finished instructions are in)
+let ic_u_elements = fn cx -> fn (u: int) -> ic_u_get cx u 13;
+// (14 the ivar caches made, 15 once's entries, 16 the constant caches)
+let ic_u_catch_except = fn cx -> fn (u: int) -> ic_u_get cx u 17 == 1;
+let ic_u_detached = fn cx -> fn (u: int) -> ic_u_get cx u 18 == 1;
+let ic_u_in_rescue = fn cx -> fn (u: int) -> ic_u_get cx u 19 == 1;
+// (-1: none)
+let ic_u_block_nop = fn cx -> fn (u: int) -> ic_u_get cx u 20;
+let ic_u_block_label0 = fn cx -> fn (u: int) -> ic_u_get cx u 21;
+let ic_u_block_label1 = fn cx -> fn (u: int) -> ic_u_get cx u 22;
+let ic_u_flip_cnt = fn cx -> fn (u: int) -> ic_u_get cx u 23;
+// the parameters (-1: none, but lead_num, which is 0)
+let ic_u_lead_num = fn cx -> fn (u: int) -> ic_u_get cx u 24;
+let ic_u_post_num = fn cx -> fn (u: int) -> ic_u_get cx u 25;
+let ic_u_post_start = fn cx -> fn (u: int) -> ic_u_get cx u 26;
+let ic_u_rest_start = fn cx -> fn (u: int) -> ic_u_get cx u 27;
+let ic_u_block_start = fn cx -> fn (u: int) -> ic_u_get cx u 28;
+let ic_u_kwbits = fn cx -> fn (u: int) -> ic_u_get cx u 29;
+let ic_u_kwrest = fn cx -> fn (u: int) -> ic_u_get cx u 30;
+// (31: flags -- 1 ambiguous_param0, 2 no_kwarg, 4 use_block, 8 for,
+//  16 forwardable, 32 it has keywords, 64 it has optional parameters,
+//  128 its rest is anonymous, 256 its keyword rest is, 512 it is a
+//  defined? guard -- parse.y's; 33: how many of the keywords are required)
+let ic_u_pflag = fn cx -> fn (u: int) -> fn (bit: int) -> bit_and (ic_u_get cx u 31) bit != 0;
+let ic_u_set_pflag = fn cx -> fn (u: int) -> fn (bit: int) -> ic_u_set cx u 31 (bit_or (ic_u_get cx u 31) bit);
+let ic_u_implicit = fn cx -> fn (u: int) -> ic_u_get cx u 32;
+
+let ic_u_label = fn cx -> fn (u: int) -> vec_get (ic_ust cx) (u * 3);
+let ic_u_path = fn cx -> fn (u: int) -> vec_get (ic_ust cx) (u * 3 + 1);
+let ic_u_abs_path = fn cx -> fn (u: int) -> vec_get (ic_ust cx) (u * 3 + 2);
+let ic_u_locals = fn cx -> fn (u: int) -> vec_get (ic_ul cx) u;
+let ic_u_children = fn cx -> fn (u: int) -> vec_get (ic_uc cx) u;
+let ic_u_catch = fn cx -> fn (u: int) -> vec_get (ic_uk cx) u;
+
+// a new sequence (Unit.new): its number. `loc` is the code location.
+let ic_unit_new = fn cx -> fn (ty: int) -> fn (label: str) -> fn (path: str) -> fn (abs_path: str) -> fn (first_lineno: int) ->
+                  fn (locals: str list) -> fn (parent: int) -> fn (loc: int * int * int * int) -> fn (node_id: int) ->
+  let ui = ic_ui cx in
+  let u = vec_len ui / 40 in
+  let rec fill = fn (i: int) -> if i <= 0 then () else (let _ = vec_push ui 0 in fill (i - 1)) in
+  let _ = fill 40 in
+  let (l0, c0, l1, c1) = loc in
+  let _ = ic_u_set cx u 0 ty in
+  let _ = ic_u_set cx u 1 first_lineno in
+  let _ = ic_u_set cx u 2 parent in
+  let _ = ic_u_set cx u 3 l0 in
+  let _ = ic_u_set cx u 4 c0 in
+  let _ = ic_u_set cx u 5 l1 in
+  let _ = ic_u_set cx u 6 c1 in
+  let _ = ic_u_set cx u 7 node_id in
+  let _ = ic_u_set cx u 8 first_lineno in
+  let _ = ic_u_set cx u 9 (0 - 1) in
+  let _ = ic_u_set cx u 11 (0 - 1) in
+  let l = ic_list_new cx in
+  let _ = ic_u_set cx u 12 l in
+  let _ = ic_u_set cx u 13 l in
+  let _ = ic_u_set cx u 20 (0 - 1) in
+  let _ = ic_u_set cx u 21 (0 - 1) in
+  let _ = ic_u_set cx u 22 (0 - 1) in
+  let _ = ic_u_set cx u 25 (0 - 1) in
+  let _ = ic_u_set cx u 26 (0 - 1) in
+  let _ = ic_u_set cx u 27 (0 - 1) in
+  let _ = ic_u_set cx u 28 (0 - 1) in
+  let _ = ic_u_set cx u 29 (0 - 1) in
+  let _ = ic_u_set cx u 30 (0 - 1) in
+  let _ = ic_u_set cx u 32 (0 - 1) in
+  let ust = ic_ust cx in
+  let _ = vec_push ust label in
+  let _ = vec_push ust path in
+  let _ = vec_push ust abs_path in
+  let _ = vec_push (ic_ul cx) locals in
+  let _ = vec_push (ic_uc cx) (Nil : int list) in
+  let _ = vec_push (ic_uk cx) (Nil : (int * int * int * int * int) list) in
+  let _ = vec_push (ic_uo cx) (Nil : int list) in
+  let _ = vec_push (ic_uw cx) (Nil : Iv list) in
+  let _ = vec_push (ic_uv cx) (Nil : str list) in
+  let _ = vec_push (ic_up cx) (Nil : (int * int * int) list) in
+  let _ = vec_push (ic_un cx) (Nil : (int * int) list) in
+  let _ = vec_push (ic_ux cx) (Nil : (str * int) list) in
+  let _ = vec_push (ic_um cx) ((Nil : int list), (Nil : int list), (Nil : (int * int) list)) in
+  u;
+
+// THROUGH: a block, rescue, ensure or plain sequence reads its locals
+// through to the sequence around it
+let ic_through = fn (ty: int) -> ty == 1 || ty == 4 || ty == 5 || ty == 6;
+// (the method, class or top sequence a sequence's locals end at)
+let rec ic_local_iseq = fn cx -> fn (u: int) ->
+  if ic_through (ic_u_type cx u) then ic_local_iseq cx (ic_u_parent cx u) else u;
+// make_name_for_block's count: the blocks from here out to local_iseq
+let rec ic_blocks_out = fn cx -> fn (u: int) ->
+  if ic_through (ic_u_type cx u) then (if ic_u_type cx u == 1 then 1 else 0) + ic_blocks_out cx (ic_u_parent cx u) else 0;
+
+// (the index_lookup_table: a name's slot, which for a parameter given
+//  twice -- `_` -- is the one that is not repeated)
+let ic_index_of = fn cx -> fn (u: int) -> fn (name: str) ->
+  let rec look = fn (xs: (str * int) list) ->
+    (match xs with
+     | Nil -> ic_index_str (ic_u_locals cx u) name 0
+     | Cons ((n, i), t) -> if str_eq n name then i else look t) in
+  look (vec_get (ic_ux cx) u);
+// level_of: how many sequences out a local is, and whose it is (-1: nobody's)
+let ic_level_of = fn cx -> fn (u: int) -> fn (name: str) ->
+  let rec go = fn (lv: int) -> fn (x: int) ->
+    if x < 0 then (0 - 1, 0 - 1)
+    else if ic_has_str (ic_u_locals cx x) name then (lv, x)
+    else go (lv + 1) (if ic_through (ic_u_type cx x) then ic_u_parent cx x else 0 - 1) in
+  go 0 u;
+
+// -- emitting -------------------------------------------------------------------
+let ic_at = fn cx -> fn (u: int) -> fn (line: int) -> fn (node: int) ->
+  let _ = ic_u_set cx u 8 line in
+  ic_u_set cx u 9 node;
+// an instruction is the node's that emits it: after its children a node
+// marks its own place again
+// (a node under another node id in this sequence -- word 34, the node plus
+//  one: a `once` sequence's pattern is the scope's, node 0)
+let ic_nid_in = fn cx -> fn (u: int) -> fn (n: int) -> if ic_u_get cx u 34 == n + 1 then 0 else ic_nid cx n;
+let ic_here = fn cx -> fn (u: int) -> fn (n: int) -> ic_at cx u (ic_start_line cx n) (ic_nid_in cx u n);
+let ic_new_label = fn cx -> fn (u: int) -> ic_label_new cx;
+let ic_emit_label = fn cx -> fn (u: int) -> fn (l: int) -> ic_push cx (ic_u_list cx u) l;
+// (a trace event is an element of its own: it goes to the instruction that
+//  follows it when the sequence is laid out)
+let ic_event = fn cx -> fn (u: int) -> fn (bit: int) ->
+  let e = ic_e_new cx 2 "" Nil 0 0 in
+  let _ = ic_e_set cx e 5 bit in
+  ic_push cx (ic_u_list cx u) e;
+// EVENT_BITS
+let ic_ev_line = fn (u: unit) -> 1;
+let ic_ev_class = fn (u: unit) -> 2;
+let ic_ev_end = fn (u: unit) -> 4;
+let ic_ev_call = fn (u: unit) -> 8;
+let ic_ev_return = fn (u: unit) -> 16;
+let ic_ev_b_call = fn (u: unit) -> 256;
+let ic_ev_b_return = fn (u: unit) -> 512;
+let ic_ev_rescue = fn (u: unit) -> 16384;
+
+// (iseq_add_getlocal / iseq_add_setlocal: the block parameter of a method
+//  -- a sequence that is its own local_iseq -- is read with getblockparam
+//  and written with setblockparam)
+let ic_local_insn_name = fn cx -> fn (u: int) -> fn (name: str) -> fn (ops: IcOp list) ->
+  if (if str_eq name "getlocal" || str_eq name "setlocal" then false else true) then name
+  else
+    (match ops with
+     | Cons (OLoc (_, index, _), Cons (ONum lv, _)) ->
+       (let rec out = fn (x: int) -> fn (k: int) -> if k <= 0 then x else out (ic_u_parent cx x) (k - 1) in
+        let o = out u lv in
+        if ic_through (ic_u_type cx o) || ic_u_block_start cx o != index then name
+        else if str_eq name "getlocal" then "getblockparam" else "setblockparam")
+     | _ -> name);
+// an instruction at the current place, at the end of the list being built
+let ic_insn = fn cx -> fn (u: int) -> fn (name: str) -> fn (ops: IcOp list) ->
+  let nm = ic_local_insn_name cx u name ops in
+  let _ = ic_ref_ops cx ops in
+  let e = ic_e_new cx 0 nm ops (ic_u_line cx u) (ic_u_node cx u) in
+  let _ = ic_push cx (ic_u_list cx u) e in
+  e;
+let ic_i0 = fn cx -> fn (u: int) -> fn (name: str) -> (let _ = ic_insn cx u name Nil in ());
+let ic_i1 = fn cx -> fn (u: int) -> fn (name: str) -> fn (a: IcOp) -> (let _ = ic_insn cx u name (Cons (a, Nil)) in ());
+let ic_i2 = fn cx -> fn (u: int) -> fn (name: str) -> fn (a: IcOp) -> fn (b: IcOp) ->
+  (let _ = ic_insn cx u name (Cons (a, Cons (b, Nil))) in ());
+let ic_i3 = fn cx -> fn (u: int) -> fn (name: str) -> fn (a: IcOp) -> fn (b: IcOp) -> fn (c: IcOp) ->
+  (let _ = ic_insn cx u name (Cons (a, Cons (b, Cons (c, Nil)))) in ());
+// (the usual operands)
+let ic_in = fn cx -> fn (u: int) -> fn (name: str) -> fn (k: int) -> ic_i1 cx u name (ONum k);
+let ic_il = fn cx -> fn (u: int) -> fn (name: str) -> fn (l: int) -> ic_i1 cx u name (OLab l);
+let ic_pop_if = fn cx -> fn (u: int) -> fn (popped: bool) -> if popped then ic_i0 cx u "pop" else ();
+let ic_dup_unless = fn cx -> fn (u: int) -> fn (popped: bool) -> if popped then () else ic_i0 cx u "dup";
+
+// (prism_compile.c's DECL_ANCHOR: instructions built aside, laid out later in
+//  another order). ic_capture_begin answers what to hand ic_capture_end,
+//  which answers the list that was built.
+let ic_capture_begin = fn cx -> fn (u: int) ->
+  let saved = ic_u_list cx u in
+  let _ = ic_u_set cx u 12 (ic_list_new cx) in
+  saved;
+let ic_capture_end = fn cx -> fn (u: int) -> fn (saved: int) ->
+  let got = ic_u_list cx u in
+  let _ = ic_u_set cx u 12 saved in
+  got;
+let ic_append = fn cx -> fn (u: int) -> fn (l: int) -> ic_list_append cx (ic_u_list cx u) l;
+// (new_adjust_body: its label is unremovable and referenced)
+let ic_adjust = fn cx -> fn (u: int) -> fn (l: int) -> fn (restore: bool) ->
+  let _ = (if l >= 0 then (let _ = ic_set_unremovable cx l in ic_ref cx l) else ()) in
+  let e = ic_e_new cx 3 "" (if l >= 0 then Cons (OLab l, Nil) else Nil) (ic_u_line cx u) (ic_u_node cx u) in
+  let _ = ic_e_set cx e 9 (if restore then 1 else 0) in
+  ic_push cx (ic_u_list cx u) e;
+
+// the caches' numbers
+let ic_next_is = fn cx -> fn (u: int) -> (let k = ic_u_get cx u 14 in let _ = ic_u_set cx u 14 (k + 1) in k);
+let ic_next_ise = fn cx -> fn (u: int) -> (let k = ic_u_get cx u 15 in let _ = ic_u_set cx u 15 (k + 1) in k);
+let ic_cvc = fn cx -> fn (u: int) -> fn (name: str) ->
+  let vs = vec_get (ic_uv cx) u in
+  let i = ic_index_str vs name 0 in
+  if i >= 0 then OCvc i
+  else (let _ = vec_set (ic_uv cx) u (ic_cat vs (Cons (name, Nil))) in OCvc (ic_llen vs));
+
+// the catch table. Types: 1 rescue, 2 ensure, 3 retry, 4 break, 5 redo, 6 next
+let ic_add_catch = fn cx -> fn (u: int) -> fn (ty: int) -> fn (ls: int) -> fn (le: int) -> fn (iseq: int) -> fn (lc: int) ->
+  let _ = ic_set_unremovable cx ls in
+  let _ = ic_ref cx ls in
+  let _ = ic_ref cx le in
+  let _ = (if lc >= 0 then ic_ref cx lc else ()) in
+  vec_set (ic_uk cx) u (Cons ((ty, ls, le, iseq, lc), ic_u_catch cx u));
+// set_catch_except_p: this sequence and every one around it, up to one made
+// with NEW_ISEQ -- a method, a singleton class -- which has no parent_iseq
+let rec ic_set_catch_except = fn cx -> fn (u: int) ->
+  let _ = ic_u_set cx u 17 1 in
+  if ic_u_detached cx u || ic_u_parent cx u < 0 then () else ic_set_catch_except cx (ic_u_parent cx u);
+let ic_add_child = fn cx -> fn (u: int) -> fn (c: int) -> vec_set (ic_uc cx) u (Cons (c, ic_u_children cx u));
+
+// -- names ------------------------------------------------------------------------
+// a Symbol of the source: US-ASCII when its bytes are, the source's encoding
+// otherwise
+let rec ic_ascii_from = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then true else if ord (char_at s i) >= 128 then false else ic_ascii_from s (i + 1);
+let ic_ascii = fn (s: str) -> ic_ascii_from s 0;
+let ic_sym = fn cx -> fn (s: str) -> IvSym (s, (if ic_ascii s then "US-ASCII" else ic_enc cx));
+let ic_osym = fn cx -> fn (s: str) -> OVal (ic_sym cx s);
