@@ -105,3 +105,42 @@ held = hash.method(:to_hash)
 hash.singleton_class.send(:undef_method, :to_hash)
 observer = TracePoint.new(:c_call) { nil }
 observer.enable { p held.call { :ignored }.equal?(hash) }
+
+# Coercion methods and string eval also enter Ruby while the builtin runs.
+target = +''
+held = target.method(:concat)
+target.singleton_class.send(:undef_method, :concat)
+other = Object.new
+def other.concat(value)
+  'override'
+end
+class HeldConversion
+  def initialize(other, seen)
+    @other, @seen = other, seen
+  end
+  def to_str
+    @seen << @other.concat('x')
+    'body'
+  end
+end
+seen = []
+held.call(HeldConversion.new(other, seen))
+p [target, other.class, seen]
+
+class HeldDefaultConversion < HeldConversion
+  def to_str(value = @other.concat('x'))
+    @seen << value
+    'default body'
+  end
+end
+held.call(HeldDefaultConversion.new(other, seen))
+p [target, other.class, seen]
+
+target = +''
+held = target.method(:instance_eval)
+target.singleton_class.send(:undef_method, :instance_eval)
+$held_other = Object.new
+def $held_other.instance_eval(*)
+  :override
+end
+p held.call('$held_other.instance_eval("nil")')
