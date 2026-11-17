@@ -152,6 +152,13 @@ p held.call('$held_other.instance_eval("nil")')
   captured = object.method(:saved_native)
   object.singleton_class.send(:undef_method, original)
   p [object.class, object.respond_to?(original), object.respond_to?(:saved_native)]
+  result = object.saved_native(*arguments)
+  p [result.class, result.equal?(object)]
+  p result if original != :each
+  seen = []
+  result = object.saved_native(*arguments) { |value| seen << value }
+  p [result.class, result.equal?(object), seen]
+  p result if original != :each
   [:saved_native, :send, :public_send].each do |sender|
     passed = sender == :saved_native ? arguments : [:saved_native, *arguments]
     result = object.public_send(sender, *passed)
@@ -162,7 +169,10 @@ p held.call('$held_other.instance_eval("nil")')
     p [result.class, result.equal?(object), seen]
     p result if original != :each
   end
-  [captured, captured.unbind.bind(object), object.method(:saved_native)].each do |method|
+  [captured, object.method(:saved_native)].each do |method|
+    result = method.call(*arguments)
+    p [result.class, result.equal?(object)]
+    p result if original != :each
     result = method.call(*arguments) { |value| value }
     p [result.class, result.equal?(object)]
     p result if original != :each
