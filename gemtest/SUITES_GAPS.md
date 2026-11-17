@@ -75,7 +75,10 @@ Resolved in follow-up rounds 8-9:
 - Hash subclasses keep the default block supplied to Hash#initialize by
   super. The fallback retains the actual Proc, preserves existing entries,
   validates default-lambda arity and refuses conflicting arguments or a
-  frozen receiver. Only `super_missing` changes for this behavior. Witness 679.
+  frozen receiver. `bind_params` and `method_body_flow_result` retain an incoming
+  Proc across implicit super without confusing it with a literal wrapper's
+  enclosing yield context; `block_source_proc` decodes that distinct metadata.
+  Explicit replacement blocks and `&nil` retain their own behavior. Witness 679.
   Together the two fixes make the original Rack utils file MATCH with all
   63 tests / 285 assertions passing (previously 1 failure / 1 error).
 
