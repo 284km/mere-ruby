@@ -6206,3 +6206,149 @@ Corpus 675 and 676 carry the witnesses (return values and an overridden
 `private`, a required file's `__ENCODING__` under a redefined
 Encoding.find, multiword names, binding / eval / local_variables / a
 refinement with the optimization on and off).
+
+## 2026-11-17 (72): what still differed on the VM in 40 whole test files -- freed memory, a loop with no safepoint, collections that marked too much
+
+**The point.** The 40 files of (68) run again on both, same build: the VM
+3,805 MATCH against the evaluator's 3,810 (it was 3,695). The five left,
+and what they were:
+
+- **test_sprintf's test_rational** (failed after one set of earlier tests
+  and not another): `vm_scoped` gave its scope env back to the pool --
+  which compacts the env's arena -- while the value the call answered
+  could still point into it. Found with tools/asan_build.sh (brought up to
+  the current Mere runtime, and linking the glue and libprism as
+  tools/build.sh does), which also caught vm_tail_call reading the waiting
+  call's name from a map it had cleared. The answer is made in a region
+  of its own and copied out before the scope goes back; the waiting tail
+  call is one Array with its name as a String handle. The VM corpus under
+  ASan: no report but corpus/524's deliberately deep recursion, where ASan
+  trips over its own stack.
+- **A loop written on one line** has no statement start inside it, so the
+  VM never reached a safepoint: `while i < 3_000_000; s += i; i += 1;
+  end` ran no collection and grew to 1.4 GB (the evaluator: 85 MB, 30
+  collections). One jump back in 64 now ends the turn: the stack's Vec is
+  wound back when it is empty, a collection may run, and vm_loop starts
+  the next turn in a region of its own. 102 MB, 1.24 s (evaluator 1.48).
+- **test_fiber's test_many_fibers_with_threads** (60 s on the VM, 3 s on
+  the evaluator): the stack's Vec was recycled at every statement, and a
+  Vec's recycle asks every suspended coroutine whether it points into the
+  arena -- with 100 threads parked and a fiber switched each turn, that
+  was nearly all the run. Wound back only when its arena passes 64 KB
+  (asked one statement in 64): 8.3 s.
+- **test_thread's test_thread_join_during_finalizers** (`GC.stress =
+  true`, past 60 s on the VM, 27.5 s on the evaluator): every collection
+  marked the to_a Array of every loaded program -- each instruction's
+  Array and call data -- and a frame's first statement was a second
+  safepoint right after the block run that entered it. The collector
+  marks each program's operands instead (vm_keep keeps the tree's id
+  only), and a frame's first statement is no safepoint of its own: 50 s.
+- test_integer's test_pow and test_exception's test_blocking_backtrace
+  pass on the VM now as on the evaluator (bound-edge timings). Left:
+  test_module's complemented-method-entry leak test (the evaluator's
+  shape shortcuts, LOOP (69)).
+
+The other 102 files of test/ruby, on both with the same build: the VM
+5,727 MATCH against the evaluator's 5,735. One is test_ractor's
+move_nested_hash_during_gc_with_yjit, at its bound on main too
+(unittest/README). The other seven were test_random_formatter: on the VM
+`self.bytes(n)` is the receiverless call `bytes(n)` (both are FCALL in
+the sequence), and a bare call of a builtin the class answers --
+Random#bytes, which no name list has -- was a NoMethodError on the
+evaluator too. The self-call with arguments asks whether the object
+answers the name before giving up, as the one without arguments did.
+
+Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
+686 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates;
+test_sprintf 33 / 33 on the VM, also under ASan; test_random_formatter
+26 / 26 on both.
+
+## 2026-11-17 (80): ruby's test files outside test/ruby on both executions
+
+**The point.** The 594 files of CI's measurement outside test/ruby
+(rubygems, -ext-, prism, psych, openssl, mkmf, optparse, fiber, ...) run
+on both, same build: the VM 21,905 MATCH against the evaluator's 21,906.
+With test/ruby's 142 ((68), (72)) that is every file CI measures. What the
+VM did otherwise:
+
+- **test_delegate**'s Ractor test: delegate.rb's Delegator is a class under
+  BasicObject, and `kernel = ::Kernel.dup` was "uninitialized constant
+  Delegator::Kernel" on the VM -- a call on Kernel is rebuilt as the
+  evaluator's EMethod, and the receiver was written `Kernel`, which such a
+  class cannot see. It is written `::Kernel`.
+- **test_coverage's test_big_code** (a 10,000-line file under Coverage,
+  past its bound on the VM): a file under Coverage was compiled by the Ruby
+  compiler, 25 s for that file. Only branch Coverage needs it; line
+  Coverage is counted by the VM from the line events either compiler puts
+  in, so the native compiler takes the file: 0.2 s.
+- ripper/test_scanner_events differed by one in the VM's favour (a gvar
+  test that is RED on the evaluator in this run): not a VM difference.
+
+Corpus 690 is the witness (::Kernel calls inside a BasicObject subclass,
+DelegateClass, and line Coverage of a required file, each run as it is and
+under MERE_RUBY_VM=strict).
+
+Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
+686 on the VM, 10 fallen back, 0 different (before 690 was added; 690
+alone the same as ruby both ways, and different on the previous build);
+vm_check 245 / 245; gates; test_coverage 46 / 46 and test_delegate 37 / 37
+on both.
+
+## 2026-11-17 (81): the VM's own work per call -- what a method call and a block on a receiver paid that the evaluator does not
+
+**The point.** Profiled side by side (fib, a block reading a local of its
+frame, a method call in a loop), the call machinery the two share --
+call_method, binding, the body's bookkeeping -- costs the same on both;
+what the VM adds is its own layers around it. Five of them were work no
+call needed:
+
+- **a tail call readied on every send.** vm_tail_call wrote the callee's
+  name into a map (a copy of the string) before each call. Until a send
+  marked VM_CALL_TAILCALL is loaded (vm_cd notes it; ruby marks none unless
+  tailcall_optimization is on) no frame can leave for one, and the call is
+  made with nothing readied; once one is, the name is written only when it
+  changes.
+- **the receiver bound as a hidden local** by vm_call_in before the
+  receiverless door (`fib(n - 1)`), which passes values: it is bound after.
+- **a block on a receiver made in a scope of the frame.** `a.each { |x| s
+  += x }` went through vm_scoped, and the scope was the block's env: every
+  name the block read or wrote of the frame, and its `$~` home, was looked
+  up through one env more. Such a call (positional values, a literal block,
+  not `new`, no TracePoint) is now EMethodB's arm past its written receiver
+  and arguments, in the frame itself (vm_blk_send).
+- **a region of the frame's own for a method's or a block's body**, which
+  already runs in the region its call made (MCALL, BLK). What the frame
+  leaves is still copied out of the stack's arena before the slot goes back
+  -- a :return hook's frame takes the slot next and may wind the arena --
+  by a region around that value alone (VMR). Rescue, ensure, top and class
+  bodies keep theirs.
+- **the tree's id written into every method frame's env** (`__vm~p`). A
+  method whose program has no block in it makes nothing that can run the
+  tree after the frame is left; while the frame runs, its pool slot names
+  the program (regs' slot 13), and the collector now marks the tree from
+  there. The `__vm~re` lookup of a re-entered Continuation is asked only
+  once one is in use (cont_on).
+
+Corpus 691 is the witness: blocks on receivers (the frame's locals, `$~`,
+break / next, a block-local name, the Symbol shape, a private method,
+Struct.new), a Proc from a removed method, a :return hook that runs Ruby
+while a method's value is on its way, and a method from a file of its own
+removed while its frame waits in a Fiber, then a collection -- which stopped
+the VM run where the Fiber went on, built without the pool slot's mark.
+
+Measured (local, the least of 7 runs each, interleaved, this machine under
+other load): fib(24) on the VM 0.208 s -> 0.195 s (the evaluator 0.172);
+`(1..200_000).to_a.each { |x| s += x }` 0.176 -> 0.165 (0.141); 200,000
+calls of a two-argument method in a while loop 0.568 -> 0.548 (0.562). The
+VM is still 1.13x the evaluator on fib and 1.17x on the block: what is left
+is its per-instruction stack (every value pushed is copied into the stack's
+arena) and the frame's own entry (the pool slot, try_or, vm_step's
+statement start), against the evaluator's walk of the same expression.
+
+Checked (local): corpus 698 / 698 on the evaluator; under MERE_RUBY_VM=1
+688 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates.
+Under MERE_RUBY_VM=1, previous build against this one: test_proc,
+test_iterator, test_optimization, test_settracefunc, test_method,
+test_regexp, test_enumerator, test_fiber, test_hash the same counts;
+test_array MATCH 473 on both (one test that fails on the reference too
+moves between RED and BOTH from run to run, on either build).
