@@ -2,10 +2,10 @@
 
 ## Stage 9: alternate collector policy and remaining GC observations
 
-Integrated main 392bf810; its main CI 44030304378 is pending. The last
-successful main CI 43933582689 (96075af9) has 157 target RED across allocation,
-objspace, gc, gc_compact and string_memory. The source-equivalent successful
-AST PR CI 43985122856 also has 157 target RED; it is not a completed main CI.
+Integrated main 3eb24fef (#86, #89 and #101). The last complete successful
+main measurement, CI 44030304378 at 392bf810, has 157 target RED across
+allocation, objspace, gc, gc_compact and string_memory. The later main CI
+at e40bb486 has only five of eight shards; it is not a full baseline.
 The original 159-case inventory
 retains two finalizer cases now passing on main after #87; they are not new
 stage 9 gains. `unittest/excludes-gc/` records
@@ -38,8 +38,9 @@ Heap dumps now expose real handles, class/reference edges, observed object_id,
 allocation-generation filters, File type and String encoding information;
 they omit the guessed memsize field. The memsize_of APIs still need actual
 allocator attribution; their pre-existing guesses are not endorsed here.
-The WeakMap lifetime test retains 50 objects against its bound of 10 on the
-latest main integration; conservative roots need precise VM lifetime tracking.
+The WeakMap lifetime test retained 50 objects after #87 and 56 after the
+392bf810 integration, against its bound of 10; conservative roots need
+precise VM lifetime tracking.
 String-memory's first call sees VM parameter-name Strings attributed to its
 caller. The allocation suite's 76 real comparisons remain VM work. These
 failures remain visible; none is excluded as default-GC behavior. The initial
@@ -60,8 +61,22 @@ enumerating Arrays. Native snapshot iteration now filters candidates before
 yielding, avoids temporary Ruby snapshot Arrays, and scopes its buffers and
 callback turns. Candidates are rooted in the existing method frame, with
 normal/exception cleanup; the standard builtin frame bounds callback
-watermarks. The original bound remains ten seconds. Witness 685 covers
-collection, nested enumeration, control flow and Fiber suspension.
+watermarks. Scoped vectors replace indexed snapshot maps, reuse pin keys,
+and preserve the actual candidate set. Exact builtin value filters avoid
+walking unrelated class metadata. Witness 685 covers collection, nested
+enumeration, control flow and Fiber suspension.
+
+The unchanged Enumerable subprocess still exceeds ten seconds after #101.
+In the runner's child environment about 6,800 real Arrays are visited per
+iteration: 100 iterations take 0.73 CPU seconds with an empty callback and
+1.89 with its actual body. The same 1,000-iteration program without the
+runner's loaded libraries takes 1.36 seconds. This is a VM callback-throughput
+handoff; no Array is hidden and the test remains enabled. A separate bounded
+run of core ObjectSpace reaches 2,123,504 KiB during the million-finalizer
+test. Isolated paired runs of main's actual e40 CI binary and this candidate
+pass at 1,900,768 and 2,009,040 KiB, respectively. Neither the subprocess
+timeout nor the whole-file memory regression is cleared by those isolated
+passes. They block merge until the per-file counts are restored.
 
 Divergences from CRuby that are understood, reproduced, and deliberately
 not fixed yet — as opposed to the things nobody has looked at. Each entry
