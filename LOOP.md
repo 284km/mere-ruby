@@ -5859,6 +5859,11 @@ as before.
 - And from (72), already on stage10-r42: vm_scoped's answer copied out
   before its scope goes back, the waiting tail call held as one Array.
 
+- (after CI) Each call vm_tail_call makes runs in a region of its own:
+  a million of them kept their allocations in the caller's statement, 2.1
+  GB for test_tailcall_not_to_grow_stack, past CI's 2 GiB for the file;
+  1.07 GB now.
+
 Corpus 675 and 676 carry the witnesses (return values and an overridden
 `private`, a required file's `__ENCODING__` under a redefined
 Encoding.find, multiword names, binding / eval / local_variables / a
