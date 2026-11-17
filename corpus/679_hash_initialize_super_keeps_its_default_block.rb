@@ -57,6 +57,14 @@ class DroppedBlockHash < Hash
   end
 end
 p DroppedBlockHash.new(&callback).default_proc
+
+def capture_yield_context(&block)
+  block.call(1)
+end
+def wrap_yield_context
+  capture_yield_context { |value| yield(value + 1) }
+end
+p wrap_yield_context { |value| value * 2 }
 hash[:present] = :value
 hash.send(:initialize) { |object, key| [object.class, key.to_s] }
 p [hash[:present], hash[:missing]]
