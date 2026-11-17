@@ -47,3 +47,38 @@ rescue NoMethodError => error
   p [error.name, error.receiver.equal?(hash)]
 end
 p({}.respond_to?(:value))
+
+# A real lexical refinement still wins before the singleton's missing hook.
+module PrimitiveHookRefinements
+  refine Hash do
+    def answer(value, flag: false)
+      [:refined, self.class, value, flag]
+    end
+  end
+  refine Array do
+    def answer(value, flag: false)
+      [:refined, self.class, value, flag]
+    end
+  end
+  refine String do
+    def answer(value, flag: false)
+      [:refined, self.class, value, flag]
+    end
+  end
+  refine Proc do
+    def answer(value, flag: false)
+      [:refined, self.class, value, flag]
+    end
+  end
+end
+using PrimitiveHookRefinements
+[{}, [], 'text', proc {}].each do |object|
+  def object.method_missing(name, *arguments)
+    [:missing, name, arguments]
+  end
+  p object.answer(:ordinary)
+  p object.answer(:with_keyword, flag: true)
+  p object.send(:answer, :sent)
+  p object.public_send(:answer, :public)
+  p object.unhandled(:missing)
+end
