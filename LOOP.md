@@ -5723,6 +5723,8 @@ Corpus 690 is the witness (::Kernel calls inside a BasicObject subclass,
 DelegateClass, and line Coverage of a required file, each run as it is and
 under MERE_RUBY_VM=strict).
 
-Checked (local): corpus 697 / 697 on the evaluator; under MERE_RUBY_VM=1
-687 on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates;
-test_coverage 46 / 46 and test_delegate 37 / 37 on both.
+Checked (local): corpus 696 / 696 on the evaluator; under MERE_RUBY_VM=1
+686 on the VM, 10 fallen back, 0 different (before 690 was added; 690
+alone the same as ruby both ways, and different on the previous build);
+vm_check 245 / 245; gates; test_coverage 46 / 46 and test_delegate 37 / 37
+on both.
