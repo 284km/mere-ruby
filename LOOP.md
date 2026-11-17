@@ -5096,3 +5096,28 @@ preserves quotes, backslashes, all controls and DEL without a Ruby call for
 every character. Witness 670 round-trips a long ASCII string and those bytes;
 the unchanged ractor dump test still passes its ten-second limit. No new
 top-level value or JSON engine changes are introduced.
+
+### PR #91 CI comparison: snapshot iteration without temporary Ruby Arrays
+
+The full 758-file report at 47c833e7 has three lower MATCH counts than main
+535ad955, all at the unchanged ten-second bound. Paired local runs of the
+actual CI binaries pass the Class and Zlib leak tests on both builds. The
+Enumerable reverse_each case reproduces the regression: main 2.58 seconds,
+PR 10.10 seconds and Timeout. It must not be dismissed as timing noise.
+
+The ObjectSpace snapshot now filters class candidates internally and avoids
+walking unrelated stores for exact builtin value-class filters. each_object
+yields from the native snapshot without creating Ruby snapshot Arrays that
+would enter later iterations. Actual candidate values are temporarily rooted
+in the existing Ruby method frame, with cleanup on normal and exceptional
+exits. Snapshot storage and each callback turn have scoped Mere lifetimes.
+The existing builtin-frame wrapper gives callbacks a native iterator boundary
+so statement watermarks do not retain every earlier callback's temporaries.
+No collector/root-table definition, shared block helper or limit is changed.
+
+Witness 683 covers class/module/subclass filtering, held objects across GC,
+nested enumeration, exceptions, break/nonlocal return, lambda/orphan break
+and Fiber suspension across collection. It agrees with Ruby. The scoped
+native-yield candidate passes the original Enumerable case in 7.07 seconds
+and the existing RSS harness's 3000-iteration probe at 1.07x. The complete
+corpus and the integration with newly merged main are checked separately.
