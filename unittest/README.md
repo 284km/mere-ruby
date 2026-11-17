@@ -56,8 +56,8 @@ excluded individually; generic argument checks, actual allocation tracing
 and GC::Profiler tests remain enabled. Passing MMTk exclusions are not copied.
 
 `gc_cases.tsv` retains all 159 target RED from the original successful main
-CI 43807166928 (c64d0ae4). The last successful main CI 43933582689 (96075af9) passes two
-of those finalizer cases after #87, leaving 157 target RED: 12 honest
+CI 43807166928 (c64d0ae4). The last complete successful main CI 44030304378
+(392bf810) passes two of those finalizer cases after #87, leaving 157 target RED: 12 honest
 implementation matches, 57 reasoned exclusions and 88 named handoffs.
 The two main fixes are identified separately in the inventory. This is a dated triage inventory, not a
 replacement for measured results. In particular, `memsize_of_all` now passes

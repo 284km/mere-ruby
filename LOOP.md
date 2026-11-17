@@ -6220,3 +6220,45 @@ test_iterator, test_optimization, test_settracefunc, test_method,
 test_regexp, test_enumerator, test_fiber, test_hash the same counts;
 test_array MATCH 473 on both (one test that fails on the reference too
 moves between RED and BOTH from run to run, on either build).
+
+## 2026-11-18: stage 9, complete CI comparison and remaining bounds
+
+Main CI 44030304378 completed at 392bf810: 33,277 MATCH, 1,137 RED,
+134 BOTH, 21 EXTRA, 49 incomplete files. Its GC intake remains 157 RED:
+12 honest implementation matches, 57 audited exclusions and 88 named
+handoffs. The original 159-row inventory separately identifies main's two
+finalizer fixes. Main later advanced through #89 and #101 to 3eb24fef;
+those changes are imported unchanged into this branch and its follow-ups.
+
+All three main-392 PR workflows completed green, but the per-file gate is
+not met. #91 (44043415539) has ObjectSpace memory stops and Enumerable
+89 -> 88 MATCH; #94 (44043433986) has Enumerable and several timing
+differences; #98 (44043456672) also has a core ObjectSpace memory stop.
+Duplicate summary artifacts in #91's rerun include a partial seven-shard
+report; the final eight-shard artifact is the comparison source.
+
+Native ObjectSpace snapshots now use scoped vectors instead of indexed
+maps, reuse their pin keys, and skip class metadata for exact builtin value
+filters. The ordinary-object scan, actual candidates, temporary frame roots,
+GC/Fiber behavior and callback helper are preserved. These small changes
+do not fix the unchanged ten-second Enumerable subprocess: about 6,800
+Arrays in its runner environment mean millions of real callbacks. A
+100-turn diagnostic takes 0.73 CPU seconds with an empty callback and 1.89
+with the original body. No arrays are hidden or additional GC forced.
+The VM callback-throughput handoff and this merge blocker remain explicit.
+
+On the #89 integration, seven of eight bounded files complete: 225 MATCH,
+15 RED, 6 BOTH, 5 EXTRA, with 57 identical exclusions reported separately.
+Core ObjectSpace reaches 2,123,504 KiB during its million-finalizer child.
+Paired isolated runs of the actual main e40 CI binary and this candidate
+both pass, with peaks of 1,900,768 and 2,009,040 KiB. Those isolated passes
+do not clear the whole-file memory stop. The nine RSS cases and OpenSSL
+lifetimes pass on this integration; no resource bounds are changed.
+
+The main-392 candidate previously passed all 703 corpus programs in both
+hash-index modes. The #101 integration is now being checked separately.
+Both _id2ref review findings are fixed and resolved on #98. All three PRs
+remain unmerged until current CI and the per-file comparison satisfy the
+stated gate. The next independent work outside stage 9 is VM callback cost,
+conservative frame lifetime and native allocator attribution, with concrete
+test names retained in gc_cases.tsv and KNOWN_GAPS.md.
