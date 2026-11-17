@@ -5450,6 +5450,15 @@ file is there (the plain capi/include where it is not). Also: the Linux jobs
 are pinned to ubuntu-24.04, as in #89 -- ubuntu-latest became 26.04, where
 unittest/math_glue_check.py fails on every branch.
 
+The CI of d63baee5 (run 44023829896) still had `test_rbconfig.rb` at 5:
+the shards run the executable from the build job's artifact, which carried
+the executable alone, so capi/arch -- and capi/lib, the import library --
+were not beside it there, and RbConfig said what a build without them
+says. The artifact carries both now. The same run had
+`-ext-/string/test_nofree.rb` and one test of `ruby/test_object.rb` time
+out at `assert_no_memory_leak`'s 10 s (7.2 s here, on main's build as on
+this one): unittest/README.md's Known noise.
+
 **Next**: the examples of `optional/capi` that differ, largest files first
 (string_spec, encoding_spec, class_spec, struct_spec, globals_spec's `$/`
 and `$stdin` as C variables that follow the interpreter's), and io_spec /

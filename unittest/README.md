@@ -491,6 +491,11 @@ runner crosses them.
   at 0.98 of main's. Rerun its shard.
 - bootstraptest test_ractor #153 (1,000 ractors) and #99 sit at the runner's
   limit.
+- `assert_no_memory_leak` gives a child 10 s: `-ext-/string/test_nofree.rb`
+  (`test_no_memory_leak`) takes 7.1-7.3 s on this machine, on main's build
+  and on a branch alike, and one CI run of a branch whose runners were
+  crowded took 10.10 s. `ruby/test_object.rb`'s `test_copied_ivar_memory_leak`
+  is the same kind of test, and the same run timed it out.
 - `ruby/test_ractor.rb`'s `test_move_nested_hash_during_gc_with_yjit` runs a
   child with a 10 s bound and takes 9.3-10.1 s on the runners, on main as
   well: one run in a few is a Timeout and the file is one test lower.
