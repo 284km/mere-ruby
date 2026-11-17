@@ -148,7 +148,9 @@ mere-ruby extconf.rb && make && make install
 
 `require "mkmf"` is ruby's `mkmf.rb`, unchanged. What it reads is RbConfig,
 and an interpreter that finds `capi/include/ruby.h` beside its executable
-says its build there: `rubyhdrdir` and `rubyarchhdrdir` (that directory),
+says its build there: `rubyhdrdir` (that directory) and `rubyarchhdrdir`
+(`capi/arch/<arch>`, where tools/build.sh puts this machine's
+`ruby/config.h`, as ruby's layout has it),
 `topdir` and `bindir` (the executable's), `ruby_install_name` (its name --
 mkmf writes it into the Makefile as `$(RUBY)`, and RubyGems starts
 `extconf.rb` with it), `CC` = clang and the flags above as `CCDLFLAGS`,

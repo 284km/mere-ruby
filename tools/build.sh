@@ -185,6 +185,16 @@ clang $opt -w $plat -I "$root/vendor/prism/include" "$main_c" "$root/tools/prism
 # links its test programs against, so that `have_func` of a ruby function is
 # answered by whether this executable has it.
 python3 "$root/capi/tools/import_library.py" "$root/mere-ruby" "$root/capi/lib" >/dev/null || { echo 'build.sh: the import library of the C API was not written' >&2; exit 1; }
+# The headers of this machine, where ruby's layout has them: ruby/config.h in
+# a directory of the arch's own name (RbConfig's rubyarchhdrdir, which mkmf
+# puts first on the include path and names in every Makefile's dependencies).
+# capi/include/ruby/config.h is the one config.h, written for every OS by
+# its macros; this is the copy for this build's arch, outside capi/include
+# because that directory is ruby's include/ and nothing else (headers_check).
+carch=$("$root/mere-ruby" -e 'print RbConfig::CONFIG["arch"]') && [ -n "$carch" ] \
+  && mkdir -p "$root/capi/arch/$carch/ruby" \
+  && cp "$root/capi/include/ruby/config.h" "$root/capi/arch/$carch/ruby/config.h" \
+  || { echo 'build.sh: the arch header directory of the C API was not written' >&2; exit 1; }
 
 # ...and say which build this is, where something that must not be misled can
 # read it. mspec/scoreboard.sh does.

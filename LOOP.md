@@ -5437,6 +5437,19 @@ sides):
   They act on the Set's table with the Hash primitives now, as set.c does
   on its own, and a frozen Set refuses with ruby's FrozenError.
 
+**What CI found** (run 43985130423 on b90f63af, every job green; MATCH
+33,403 against main's tree's 33,183, RED 1,011, 29 files higher, one
+lower): `test_rbconfig.rb` 6 -> 5, `test_archdirs`. Ruby's MAKEFILE_CONFIG
+names every `*arch*dir` in terms of `$(arch)` (or `$(rubyarchprefix)`), and
+this branch said `rubyarchhdrdir` as the plain path of capi/include. In
+ruby's layout that directory is the arch's own and holds `ruby/config.h`
+(mkmf puts it first on the include path and in every Makefile's
+dependencies). tools/build.sh now writes `capi/arch/<arch>/ruby/config.h`
+after the link, and RbConfig says `$(topdir)/capi/arch/$(arch)` where that
+file is there (the plain capi/include where it is not). Also: the Linux jobs
+are pinned to ubuntu-24.04, as in #89 -- ubuntu-latest became 26.04, where
+unittest/math_glue_check.py fails on every branch.
+
 **Next**: the examples of `optional/capi` that differ, largest files first
 (string_spec, encoding_spec, class_spec, struct_spec, globals_spec's `$/`
 and `$stdin` as C variables that follow the interpreter's), and io_spec /
