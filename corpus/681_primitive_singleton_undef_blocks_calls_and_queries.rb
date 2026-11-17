@@ -4,12 +4,15 @@ p [hash.class, hash.respond_to?(:to_hash), {}.respond_to?(:to_hash)]
 hash.singleton_class.send(:undef_method, :to_hash)
 p [hash.class, hash.respond_to?(:to_hash), hash.respond_to?(:to_hash, true)]
 p [hash.singleton_class.method_defined?(:to_hash), {}.respond_to?(:to_hash)]
-[:literal, :send, :public_send].each do |kind|
+[:literal, :send, :public_send, :literal_block, :send_block, :public_send_block].each do |kind|
   begin
     case kind
     when :literal then hash.to_hash
     when :send then hash.send(:to_hash)
     when :public_send then hash.public_send(:to_hash)
+    when :literal_block then hash.to_hash { :unused }
+    when :send_block then hash.send(:to_hash) { :unused }
+    when :public_send_block then hash.public_send(:to_hash) { :unused }
     end
   rescue NoMethodError => error
     p [kind, error.name, error.args, error.receiver.equal?(hash), error.private_call?]
