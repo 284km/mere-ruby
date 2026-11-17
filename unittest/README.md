@@ -483,9 +483,16 @@ between CI runs of the same code; locally both builds agree.
 **Timing at the edge of a bound on CI runners.** The bounds stay; a slow
 runner crosses them.
 
-- build-linux's Module check: `TestModule#test_complemented_method_entry_memory_leak`
-  takes 5.5-8.5 s and has 10 s (`upstream_leak_seconds`). A slow runner gives
-  10.04 s, a Timeout, and the job fails. Rerun the job.
+- build-linux's Module check: its three leak tests (iclass 3,000,000,
+  complemented 300,000, clone 1,000,000 times) take 4.3-6.7 s each of their
+  10 s (`upstream_leak_seconds`), the whole file 21.7-27.0 s. Some runners
+  are slower at everything: main e40bb486's run and PR #95's took 39.7 and
+  39.9 s for the file (test_prepend_gc 1.50 s against 0.79-0.95), and
+  complemented went to 10.04 s, a Timeout. Builds before and after PR #89
+  take the same time locally (4.6-6.5 s). Rerun the job. The clone test lost
+  a third of its time when Module#clone stopped walking the whole constant
+  table (`const_owners`); ruby 4.0.9 takes 1.7 s (complemented), 2.7 s
+  (iclass) and 0.35 s (clone) on the same Mac.
 - ...and the same test in `ruby/test_module.rb` itself is an RSS ratio
   (after 300,000 more refinement classes against after 1,000) bounded by
   2.0: 1.74-1.82 locally on main 392bf810 and on PR #89's branch alike, and
