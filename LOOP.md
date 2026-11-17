@@ -5374,3 +5374,26 @@ and Fiber suspension across collection. It agrees with Ruby. The scoped
 native-yield candidate passes the original Enumerable case in 7.07 seconds
 and the existing RSS harness's 3000-iteration probe at 1.07x. The complete
 corpus and the integration with newly merged main are checked separately.
+
+### Latest main integration and public native iteration
+
+Main 96075af9, successful CI 43933582689, supersedes the earlier baseline.
+Its native extension integration passes the two finalizer stack-overflow
+cases, leaving 157 target RED: 12 accepted implementation matches, 57
+reasoned exclusions and 88 named handoffs. The original 159-row inventory
+retains those two main fixes without claiming them as stage 9 gains.
+WeakMap still retains 50 keys against a bound of 10; moving the statistics
+sampler did not improve that count, so that experiment was discarded.
+
+The public each_object native arm accepts the original block directly,
+avoiding conversion through an extra Ruby Proc wrapper. It preserves
+blockless enumeration, argument validation, user overrides and Proc break
+semantics. The unchanged Enumerable test passes in 6.38 seconds. On the
+actual latest-main CI binary, the million-finalizer test takes 25.84 seconds;
+this candidate takes 26.97 seconds, both within its unchanged sixty seconds.
+The complete seven-file comparison is MATCH 198, RED 12, BOTH 6, EXTRA 5,
+with 57 exclusions reported separately: objspace 37, ractor 3, Enumerable
+89, GC 30, compaction 0, core ObjectSpace 37, string memory 2 MATCH.
+The local missing native stack extension remains BOTH. The native iteration
+RSS probe is 1.07x; roots/dead/duplicate checks pass and bracket depth is
+892/1024. Full CI against the new main is still required before merge.

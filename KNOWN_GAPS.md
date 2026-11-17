@@ -2,8 +2,10 @@
 
 ## Stage 9: alternate collector policy and remaining GC observations
 
-Baseline main c64d0ae4, CI run 43807166928: 159 RED across allocation,
-objspace, gc, gc_compact and string_memory. `unittest/excludes-gc/` records
+Latest baseline main 96075af9, CI run 43933582689: 157 RED across allocation,
+objspace, gc, gc_compact and string_memory. The original 159-case inventory
+retains two finalizer cases now passing on main after #87; they are not new
+stage 9 gains. `unittest/excludes-gc/` records
 individual default-GC slot/page/generation/compaction/internal-layout tests,
 with reasons. The upstream EXCLUDES mechanism removes the same methods
 from both interpreters, audits actual removals and reports exclusions apart
@@ -21,10 +23,10 @@ Process.clock_gettime(CLOCK_PROCESS_CPUTIME_ID) shares that native CPU reader.
 The browser host has no process CPU clock: startup receives an ABI-correct
 boxed unavailable value, and enabling the profiler raises NotImplementedError.
 
-The final classification gains 13 raw MATCH and separately records 57 exclusions.
-One of those raw gains, memsize_of_all, still uses the inherited slot guesses;
-it is not an accepted implementation match. `unittest/gc_cases.tsv` classifies
-the 159 baseline RED as 12 honest matches, 57 exclusions and 90 handoffs.
+The latest 157-RED intake has 12 accepted implementation matches, 57 exclusions
+and 88 handoffs. `unittest/gc_cases.tsv` retains all original 159 cases,
+including the two now passing on main. memsize_of_all still uses inherited
+slot guesses; a raw pass is not an accepted implementation match.
 Two generational tests return before assertions without USE_RGENGC. They are
 excluded symmetrically rather than claimed as unchecked implementation matches.
 The remaining objspace work needs actual literal pools, Float/Symbol identity
@@ -33,14 +35,22 @@ Heap dumps now expose real handles, class/reference edges, observed object_id,
 allocation-generation filters, File type and String encoding information;
 they omit the guessed memsize field. The memsize_of APIs still need actual
 allocator attribution; their pre-existing guesses are not endorsed here.
-The WeakMap lifetime test still retains 66 objects against its bound of 10;
-conservative root ownership overlaps the native C API work in PR #87.
+The WeakMap lifetime test retains 50 objects against its bound of 10 on the
+latest main integration; conservative roots need precise VM lifetime tracking.
 String-memory's first call sees VM parameter-name Strings attributed to its
 caller. The allocation suite's 76 real comparisons remain VM work. These
 failures remain visible; none is excluded as default-GC behavior. The initial
 RSS regression came from reusing the collector's oncall safety flag to label
 explicit collections; a separate cause flag restores native arena collection.
 The discarded-class-ivar gate again measures 1.06x, the baseline ratio.
+
+The full-file comparison also exposed an Enumerable timeout from repeatedly
+enumerating Arrays. Native snapshot iteration now filters candidates before
+yielding, avoids temporary Ruby snapshot Arrays, and scopes its buffers and
+callback turns. Candidates are rooted in the existing method frame, with
+normal/exception cleanup; the standard builtin frame bounds callback
+watermarks. The original bound remains ten seconds. Witness 683 covers
+collection, nested enumeration, control flow and Fiber suspension.
 
 Divergences from CRuby that are understood, reproduced, and deliberately
 not fixed yet — as opposed to the things nobody has looked at. Each entry

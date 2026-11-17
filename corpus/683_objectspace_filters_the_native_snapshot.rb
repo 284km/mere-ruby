@@ -1,5 +1,21 @@
 require 'objspace'
 
+raise 'blockless enumeration changed' unless ObjectSpace.each_object.is_a?(Enumerator)
+begin
+  ObjectSpace.each_object(Array, Hash)
+  raise 'extra filter accepted'
+rescue ArgumentError
+end
+begin
+  ObjectSpace.each_object(1).next
+  raise 'invalid filter accepted'
+rescue TypeError
+end
+def yield_from_enumeration
+  ObjectSpace.each_object(Array) { yield; break :outer_yield }
+end
+calls = 0
+raise 'outer block lost' unless yield_from_enumeration { calls += 1 } == :outer_yield && calls == 1
 module SnapshotMarker; end
 class SnapshotText < String
   include SnapshotMarker
@@ -70,4 +86,6 @@ end
 raise 'iteration did not suspend' unless fiber.resume == :paused
 GC.start
 raise 'suspended iteration lost its state' unless fiber.resume == :resumed
+def ObjectSpace.each_object(*) = :overridden
+raise 'user override ignored' unless ObjectSpace.each_object == :overridden
 puts 'ObjectSpace filters real classes and value stores before yielding'
