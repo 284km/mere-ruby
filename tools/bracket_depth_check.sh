@@ -99,7 +99,7 @@ fi
 # property that matters: the fast path can only ever CONFIRM, never conclude.
 # A seed that made the check unable to report a larger value would be a check
 # that can only agree with what it was told.
-SEED="${BRACKET_SEED:-892}"
+SEED="${BRACKET_SEED:-923}"
 sb_bd_fast=0
 if [ "$SEED" -gt 1 ] && [ "$SEED" -le "$BUDGET" ] \
    && "$CC" -O0 -w -fsyntax-only -fbracket-depth="$SEED" "$SRC" 2>/dev/null \
