@@ -440,6 +440,14 @@ let ivars_g = map_new ();
 // The collector drops a dead owner's entry. A prefix whose list would grow
 // past 4 KB, or a name holding chr 2, is marked chr 3 and listed by the walk.
 let iv_idx = map_new ();
+// How many instance variables of a String, an Array or a Hash -- keys
+// "str:<id>@name", "arr:..", "hsh:.." -- were ever written (iv_put counts).
+// Their owners have no index like an object's, so finding one's variables
+// is a walk of the whole table; and `dup`, `clone`, `-str` and
+// `instance_variables` of every String, Array and Hash made that walk to
+// find nothing: 100,000 instructions a `"abc".dup` in a program with 7,000
+// instance variables alive. Until the count leaves zero nobody walks.
+let hiv_made = (let v = vec_new () in let _ = vec_push v 0 in v);
 // (one `let rec`, not two: each top-level let is a level of bracket depth)
 let rec iv_idx_add = fn (k: str) ->
   let p = str_index_of k "@" + 1 in
@@ -466,7 +474,12 @@ let rec iv_idx_add = fn (k: str) ->
 //   test_module's complemented_method_entry loop)
 and iv_put = fn tbl -> fn (k: str) -> fn (v: Val) ->
   let c0 = (if str_len k > 0 then ord (char_at k 0) else 0) in
-  let _ = (if c0 >= 48 && c0 <= 57 && (if map_has tbl k then false else true) then iv_idx_add k else ()) in
+  let _ = (if c0 >= 48 && c0 <= 57 && (if map_has tbl k then false else true) then iv_idx_add k
+           // (an instance variable of a String, an Array or a Hash: hiv_made)
+           else if (c0 == 115 || c0 == 97 || c0 == 104) && str_len k > 4
+                   && (str_starts_with k "str:" || str_starts_with k "arr:" || str_starts_with k "hsh:")
+           then vec_set hiv_made 0 (vec_get hiv_made 0 + 1)
+           else ()) in
   map_set tbl k v;
 // A NEW object's index entry, filed whole, and its variables written under
 // it. `names` is what iv_idx_add would have grown a name at a time: the
@@ -3186,6 +3199,40 @@ let blk_key = fn (ps: str list) -> fn (body: Stmt list) ->
      | Cons (SFile f, t) -> go t (n + 1) line (if str_eq file "" then f else file)
      | Cons (_, t) -> go t (n + 1) line file) in
   str_join "," ps ++ "|" ++ go body 0 (0 - 1) "";
+// THE BLOCK'S NUMBER (note 551). Comparing the trees costs as much as the
+// tree is long when the two ARE the same, which is the common case -- the
+// same block made into a Proc again: assert_equal's thirty-line message
+// block, every assertion, was 6% of test_ast's token test. So the parser
+// numbers each block it reads (blk_id_new) and puts the number in the mark
+// in front of the body that already carries the line of its `{` or `do`:
+// SLine of -(line + number * 2^24). A body seen under its number is the
+// body interned for that number the first time, without comparing. Number
+// 0 is a mark with no number -- a body made elsewhere (the VM's) -- and
+// compares as before. MERE_RUBY_BLK_ID_CHECK=1 compares anyway and stops
+// when the number gave another body than the comparison would.
+// ⚠ A body with a Float literal is never equal to itself here (Mere's
+//   generated eq_float answers 0), so before the numbers every Proc made of
+//   such a block added its body to blk_bodies again: a loop of
+//   `t.wait(0.1) { }` grew the table by a whole body a turn. A numbered
+//   body is interned once.
+// (the line a block's opening mark names, and its number; a mark is
+//  negative, anything else is no block's)
+let blk_line_of = fn (n: int) -> if n < 0 then (0 - n) % 16777216 else n;
+let blk_id_of = fn (n: int) -> if n < 0 then (0 - n) / 16777216 else 0;
+let blk_mark = fn (line: int) -> fn (id: int) -> 0 - (line + id * 16777216);
+// (the numbers are kept in blk_keys beside the keys, which never start with
+//  chr 2, 3 or 4: chr 3 the last number given, chr 2 ++ number -> body id,
+//  chr 4 the check switch)
+let blk_id_new = fn (u: unit) ->
+  let k = chr 3 in
+  let n = (if map_has blk_keys k then map_get blk_keys k else 0) + 1 in
+  let _ = map_set blk_keys k n in
+  n;
+let blk_body_id = fn (body: Stmt list) ->
+  match body with
+  | Cons (SLine n, _) -> blk_id_of n
+  | Cons (SFile _, Cons (SLine n, _)) -> blk_id_of n
+  | _ -> 0;
 let blk_intern = fn (ps: str list) -> fn (body: Stmt list) ->
   let k = blk_key ps body in
   let n = (if map_has blk_keys k then map_get blk_keys k else 0) in
@@ -3199,7 +3246,36 @@ let blk_intern = fn (ps: str list) -> fn (body: Stmt list) ->
      else
        (let id = map_get blk_keys (k ++ "#" ++ str_of_int i) in
         if map_get blk_bodies id == body then id else find (i + 1))) in
-  find 0;
+  let bn = blk_body_id body in
+  // (the number with the key beside it -- the parameters, the count of
+  //  statements, the line and the file: a body the interpreter wraps or
+  //  rewrites at run time keeps the mark in front, so the number alone does
+  //  not name one body. MERE_RUBY_BLK_ID_CHECK found six such places on the
+  //  corpus.)
+  let nk = chr 2 ++ str_of_int bn ++ "|" ++ k in
+  if bn > 0 && map_has blk_keys nk then
+    (let id = map_get blk_keys nk in
+     // (the switch is read once and kept under chr 4)
+     let chk = (if map_has blk_keys (chr 4) then map_get blk_keys (chr 4)
+                else (let o = (if str_eq (env_get "MERE_RUBY_BLK_ID_CHECK") "" then 0 else 1) in
+                      let _ = map_set blk_keys (chr 4) o in o)) in
+     // (a body that the comparison finds equal to an interned one other
+     //  than the number's is the mismatch; one it finds equal to none is a
+     //  body with a Float literal, which Mere's == never finds equal to
+     //  itself -- each such Proc used to add its body again)
+     let rec seek = fn (i: int) ->
+       (if i >= n then 0 - 1
+        else (let j = map_get blk_keys (k ++ "#" ++ str_of_int i) in
+              if map_get blk_bodies j == body then j else seek (i + 1))) in
+     let found = (if chk == 1 then seek 0 else id) in
+     if chk == 1 && found >= 0 && found != id
+     then (let _ = print_err ("mere-ruby: blk_intern: block " ++ str_of_int bn ++ " is not the body its number names\n") in
+           fail "mere-ruby: blk_intern mismatch")
+     else id)
+  else
+    (let id = find 0 in
+     let _ = (if bn > 0 then map_set blk_keys nk id else ()) in
+     id);
 // a statement of a block's defaults prologue (defaults_prologue in m_parse):
 // `if n.nil? then n = d end`
 let dflt_prologue_stmt = fn (st: Stmt) ->
@@ -3217,7 +3293,7 @@ let store_proc = fn (k: str) -> fn entry ->
   let _ = mark_captured penv in
   // (the line of the block's `{` or `do`, when the parser marked it)
   let rec ol9 = fn (b9: Stmt list) -> (match b9 with
-                                       | Cons (SLine n9, _) -> (if n9 < 0 then 0 - n9 else 0)
+                                       | Cons (SLine n9, _) -> (if n9 < 0 then blk_line_of n9 else 0)
                                        | Cons (SFile _, t9) -> ol9 t9
                                        | Cons (st9, t9) -> (if dflt_prologue_stmt st9 then ol9 t9 else 0)
                                        | _ -> 0) in
@@ -5040,7 +5116,15 @@ let cls_copy_of = (let t = map_new () in let _ = map_compact t in t);
 let prim_copy_q = fn (c: str) ->
   map_len prim_copy > 0 && map_has prim_copy c
   && (let b = map_get prim_copy c in str_eq b "Queue" || str_eq b "SizedQueue");
+// How many classes have been given a superclass for the first time, ever --
+// every class and singleton class there is, as it is made. The collector
+// waits longer between collections while this does not move (gc_pressure,
+// knobs 13 and 14): dead classes are not small the way dead objects are,
+// and what is done to one -- a `clone` copies its singleton's methods out
+// of the whole method table -- costs more the more of them there are.
+let cls_made = (let v = vec_new () in let _ = vec_push v 0 in v);
 let set_sup = fn tbl -> fn (k: str) -> fn (v: str) ->
+  let _ = (if map_has tbl k then () else vec_set cls_made 0 (vec_get cls_made 0 + 1)) in
   let _ = mro_bump_class k in
   let b = prim_base_name v in
   let _ = (if str_len b > 0 then map_set prim_sub k b else ()) in
@@ -5444,7 +5528,49 @@ let private_new_seen =
    let _ = vec_push v 0 in
    let _ = vec_compact v in
    v);
+// THE ATTRIBUTE READER CACHE (note 551). `node.first_lineno` is ruby's
+// cheapest call -- a C function that reads one slot -- and here it went the
+// whole way a call goes before run_meth_result's fast arm read the slot:
+// the dispatcher's tests by name, the ancestor walk, the visibility walk,
+// about 9,000 instructions. test_ast's walks read an attribute twenty times
+// a node. The cache answers `obj.name` -- an object of a class whose
+// superclass is Object, no argument, no block -- at the dispatcher's door
+// (invoke_val_c), once the whole way has been gone for that class and name
+// and ended at the fast arm.
+//   attr_ic      attr_ic_key: "r" (a call with a receiver) or "s" (one
+//                written with no receiver, which asks nothing about
+//                visibility), the class's length and name, the method's name
+//                (a suffix marking the kind of call made `x` and `x!` -- and
+//                then `x` and a define_method("x\x01") -- one key) -> the
+//                instance variable the reader reads; "" when the name is not
+//                such a reader, so the question is not asked again
+//   attr_ic_tok  the same key -> what the entry was learnt under: the lookup
+//                generation (mro_now: every method defined, removed or
+//                undefined, every module included or prepended moves it) and
+//                the count of private / protected marks ever made (slot 0
+//                below: a public method stops being one only through
+//                set_private / set_protected). Another value is a miss.
+//   attr_ic_st   0 that count; 1 what attr_ic_ask found (1 the answer, 2 no
+//                entry yet, 0 not for the cache); 2 MERE_RUBY_ATTR_IC_CHECK (-1 until
+//                read): every answer is checked against the dispatcher's;
+//                3 learning: 1 while the dispatcher goes the whole way for a
+//                call the cache is asking about, 2 once the fast arm
+//                answered that call; 4 the object of that call
+//   attr_ic_note 0 the name of that call; 1 the instance variable the fast
+//                arm read for it
+let attr_ic = (let t = map_new () in let _ = map_compact t in t);
+let attr_ic_tok = map_new ();
+let attr_ic_st =
+  (let v = vec_new () in
+   let _ = vec_push v 0 in
+   let _ = vec_push v 0 in
+   let _ = vec_push v (0 - 1) in
+   let _ = vec_push v 0 in
+   let _ = vec_push v (0 - 1) in
+   v);
+let attr_ic_note = (let v = vec_new () in let _ = vec_push v "" in let _ = vec_push v "" in v);
 let set_private = fn (key: str) -> fn (value: Val) ->
+  let _ = vec_set attr_ic_st 0 (vec_get attr_ic_st 0 + 1) in
   let _ = note_reflection_protocol key in
   let _ = (if vec_get private_new_seen 0 == 0 && (str_eq key "new" || str_ends_with key "#new")
            then vec_set private_new_seen 0 1 else ()) in
@@ -5464,6 +5590,7 @@ let protected_new_seen =
    let _ = vec_compact v in
    v);
 let set_protected = fn (key: str) -> fn (value: Val) ->
+  let _ = vec_set attr_ic_st 0 (vec_get attr_ic_st 0 + 1) in
   let _ = note_reflection_protocol key in
   let _ = (if vec_get protected_new_seen 0 == 0 && (str_eq key "new" || str_ends_with key "#new")
            then vec_set protected_new_seen 0 1 else ()) in
