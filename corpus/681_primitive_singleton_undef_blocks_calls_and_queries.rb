@@ -144,3 +144,32 @@ def $held_other.instance_eval(*)
   :override
 end
 p held.call('$held_other.instance_eval("nil")')
+
+# Aliases also retain native definitions, including alias Method objects.
+[['ab', :upcase, []], [[1, 2], :each, []],
+ [proc { |value| value * 2 }, :call, [3]]].each do |object, original, arguments|
+  object.singleton_class.send(:alias_method, :saved_native, original)
+  captured = object.method(:saved_native)
+  object.singleton_class.send(:undef_method, original)
+  p [object.class, object.respond_to?(original), object.respond_to?(:saved_native)]
+  [:saved_native, :send, :public_send].each do |sender|
+    passed = sender == :saved_native ? arguments : [:saved_native, *arguments]
+    result = object.public_send(sender, *passed)
+    p [result.class, result == object, result] unless original == :each
+    p [result.class, result.equal?(object)] if original == :each
+    seen = []
+    result = object.public_send(sender, *passed) { |value| seen << value }
+    p [result.class, result.equal?(object), seen]
+    p result if original != :each
+  end
+  [captured, captured.unbind.bind(object), object.method(:saved_native)].each do |method|
+    result = method.call(*arguments) { |value| value }
+    p [result.class, result.equal?(object)]
+    p result if original != :each
+  end
+  begin
+    object.public_send(original, *arguments) { :ignored }
+  rescue NoMethodError => error
+    p [error.name, error.receiver.equal?(object)]
+  end
+end
