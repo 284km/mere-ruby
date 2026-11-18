@@ -34,7 +34,13 @@ GC.enable
 
 raise 'uninitialized File type' unless JSON.parse(ObjectSpace.dump(File.allocate))['type'] == 'FILE'
 class DumpedModule < Module; end
+class DumpedPlainClass; end
 raise 'Module subclass dump type' unless JSON.parse(ObjectSpace.dump(DumpedModule.new))['type'] == 'MODULE'
+[Object, BasicObject, DumpedPlainClass, Enumerator::Chain].each do |klass|
+  parent = klass.superclass
+  expected_parent = parent && JSON.parse(ObjectSpace.dump(parent))['address']
+  raise 'native superclass edge changed' unless JSON.parse(ObjectSpace.dump(klass))['superclass'] == expected_parent
+end
 uninitialized_class = JSON.parse(ObjectSpace.dump(Class.allocate))
 raise 'uninitialized Class type' unless uninitialized_class['type'] == 'CLASS'
 raise 'uninitialized Class acquired a superclass' if uninitialized_class.key?('superclass')

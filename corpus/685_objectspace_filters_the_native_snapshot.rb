@@ -17,6 +17,7 @@ end
 calls = 0
 raise 'outer block lost' unless yield_from_enumeration { calls += 1 } == :outer_yield && calls == 1
 module SnapshotMarker; end
+class SnapshotPlain; end
 class SnapshotText < String
   include SnapshotMarker
 end
@@ -32,7 +33,7 @@ def marked_class.kind_of?(*) = false
 text = SnapshotText.new('held text')
 array = [text]
 hash = { text => array }
-[[String, text], [Array, array], [Hash, hash], [Class, marked_class]].each do |filter, held|
+[[String, text], [Array, array], [Hash, hash], [Class, marked_class], [Class, SnapshotPlain]].each do |filter, held|
   found = false
   count = 0
   returned = ObjectSpace.each_object(filter) do |object|
