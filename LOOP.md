@@ -6224,3 +6224,41 @@ variation is not a new MATCH or an inferred VM/GC cause.
 File override, Chain, provenance and constant witnesses 676/677/685/693 match the reference. The earlier full corpus was 709/709 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
 The earlier full corpus was 707/707 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
 Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
+## 2026-11-18 (82): build-linux's Module check at its 10 s, and Module#clone walking every constant
+
+Main e40bb486's CI run failed the Module check:
+TestModule#test_complemented_method_entry_memory_leak took 10.04 s of the
+10 s its child process has. PR #89 was not the cause. In class-module-Linux's
+module.log, the runs with #89 in them took 25.5-27.0 s for the file: #89's
+own run, and PR #101's and PR #91's after merging main. Main's run took
+39.7 s and PR #95's 39.9 s. Those two were slower at every test, not only
+the leak ones: test_prepend_gc was 1.50 s against 0.79-0.95. Locally, a
+build of 392bf810 and one of b148d041 take the same time on the three leak
+programs at their real sizes: 4.65 / 4.79 s (iclass), 5.85 / 5.62
+(complemented), 6.52 / 5.86 (clone). That is 5-6.5 s on a usual runner,
+and a slow one crosses 10. The bound stays. The way out is to make the
+three programs faster.
+
+Ruby 4.0.9 on the same Mac takes 1.7 s (complemented), 2.7 s (iclass) and
+0.35 s (clone). Here they took 5.6, 4.7 and 4.6 s. The clone test had one
+place where the time went: Module#clone collected the copy's constants,
+autoloads, class variables and class ivars by walking each whole table for
+keys under the original's prefix. That is every constant in the
+interpreter, once per clone. `const_owners` now lists the owner of each
+key ever written to `consts` or `autoloads` (each write goes through
+const_tbl_put / autoload_tbl_put), and a class with no row there has
+nothing to copy. The class sweep drops a dead owner's row. The clone test
+went from 4.6 s to 3.2 s.
+
+The other two have no single place. A collection costs 2.25 ms with
+nothing to free. Most of that is the interrupted stack walked twice: once
+for the pin set when a scratch Vec is recycled, once for integer roots.
+The rest grows with the dead classes:
+- the class sweep's walk of about 60 tables;
+- the native candidates, every class-naming key, 122,577 in one collection
+  of the refine program;
+- the edges of each refinement method's packed scope.
+Making a class costs a few microseconds spread over a dozen tables. In the
+complemented program, collections are 27% and the rest is spread with no
+function above 6%. Halving it means fewer rows per class: work of its own,
+not this round's.
