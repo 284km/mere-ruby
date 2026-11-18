@@ -155,6 +155,34 @@ rescue ArgumentError => error
   raise 'query arity error changed' unless error.message == 'respond_to? must accept 1 or 2 arguments (requires 3)'
 end
 
+module PrimitiveIdConversion
+  def to_int = 1
+  def respond_to_missing?(*) = false
+end
+module ChangingPrimitiveIdLookup
+  def respond_to?(*)
+    singleton_class.class_eval { undef_method :to_int }
+    true
+  end
+end
+class PrimitiveStringId < String; include PrimitiveIdConversion; end
+class PrimitiveArrayId < Array; include PrimitiveIdConversion; end
+class PrimitiveHashId < Hash; include PrimitiveIdConversion; end
+class ChangingPrimitiveStringId < PrimitiveStringId; include ChangingPrimitiveIdLookup; end
+class ChangingPrimitiveArrayId < PrimitiveArrayId; include ChangingPrimitiveIdLookup; end
+class ChangingPrimitiveHashId < PrimitiveHashId; include ChangingPrimitiveIdLookup; end
+[[PrimitiveStringId, false], [PrimitiveArrayId, false], [PrimitiveHashId, false],
+ [ChangingPrimitiveStringId, true], [ChangingPrimitiveArrayId, true], [ChangingPrimitiveHashId, true]].each do |klass, mutating|
+  value = klass.new
+  value.singleton_class.class_eval { undef_method :to_int } unless mutating
+  begin
+    ObjectSpace._id2ref(value)
+    raise 'primitive singleton undef accepted a conversion'
+  rescue TypeError => error
+    raise 'primitive conversion named the wrong class' unless error.message == "no implicit conversion of #{klass} into Integer"
+  end
+end
+
 kept = [Object.new, proc { :held }, binding, [], {}, ''.dup, IdArgument]
 kept.each do |object|
   raise 'held identity did not round trip' unless ObjectSpace._id2ref(object.object_id).equal?(object)

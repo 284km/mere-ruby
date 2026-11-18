@@ -6545,3 +6545,12 @@ The final remote namespace audit found a concurrent gem witness at 685.
 This session's snapshot witness moves from 685 to the verified free 710;
 earlier entries retain their publication numbers. Its contents are unchanged
 and its renamed path is checked against Ruby with indexing ON and OFF.
+
+
+The primitive singleton-undef correction reviewed in #109 is also applied
+to this stacked ID branch. Only ObjectSpace.__id_integer changes: it reads
+the actual hng_store tag for availability and native error class names,
+re-reading after callbacks. Corpus 687 retains six String/Array/Hash controls
+for preexisting and query-created undefs. Shared lookup/VM helpers are
+unchanged. The independent extraction and this port are the same fix, not
+two additional matches in the original intake.
