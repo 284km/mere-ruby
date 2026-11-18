@@ -6542,6 +6542,6 @@ independent shared-call workload evidence, not a replacement for the failing
 upstream test. Shared block/frame/lookup/dispatch functions remain untouched.
 
 The final remote namespace audit found a concurrent gem witness at 685.
-This session's snapshot witness moves from 685 to the verified free 701;
+This session's snapshot witness moves from 685 to the verified free 710;
 earlier entries retain their publication numbers. Its contents are unchanged
 and its renamed path is checked against Ruby with indexing ON and OFF.
