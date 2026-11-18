@@ -233,6 +233,25 @@ check(yielder { /(c)d/ =~ 'cd'; A.last_match(1) } == 'c')
 check(A.last_match(1) == 'e')
 A.set_match(/(g)/.match('g'))
 check($1 == 'g')
+# (a C method has no `$~` of its own: a Fiber's and a Thread's body have
+#  theirs, and public_send / class_eval / module_eval have none in between)
+/(outer)/ =~ 'outer'
+check(Fiber.new { /(inner)/ =~ 'inner'; [$1, A.last_match(1)] }.resume == ['inner', 'inner'])
+check(Thread.new { /(inner)/ =~ 'inner'; [$1, A.last_match(1)] }.value == ['inner', 'inner'])
+check($1 == 'outer')
+written = /(written)/.match('written')
+/(outer)/ =~ 'outer'
+Fiber.new { A.set_match(written) }.resume
+check($1 == 'outer')
+Thread.new { A.set_match(written) }.join
+check($1 == 'outer')
+def through_public_send
+  /(x)/ =~ 'x'
+  [A.last_match(1), A.public_send(:last_match, 1)]
+end
+check(through_public_send == ['x', 'x'])
+check(Object.class_eval { /(y)/ =~ 'y'; [$1, A.last_match(1)] } == ['y', 'y'])
+check(Object.module_eval { /(z)/ =~ 'z'; [$1, A.last_match(1)] } == ['z', 'z'])
 check(A.strtoul('  0x1fz', 0) == [31, 6])
 check(A.strtoul('-12', 10) == [2**64 - 12, 3])
 check(A.strtoul('777', 8) == [511, 3])

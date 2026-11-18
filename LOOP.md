@@ -5477,6 +5477,22 @@ about 1.6 times slower -- a slow runner. The leak tests take 4.6-6.5 s of
 their 10 on an ordinary one, though, and they are being made faster (the
 limit stays).
 
+**What the third review found** (two, both reproduced with the same C on
+both rubies): looking the caller up was the wrong way round. A Fiber's or a
+Thread's body matches into a `$~` of its own, not its lexical home's, so C
+read the outer match there and `rb_backref_set` wrote into it; and
+`public_send`, `class_eval` and `module_eval` leave no entry on fb_env_at,
+so the lookup fell back to the C method's own empty frame. Ruby's C
+functions have no `$~` at all -- they run under their caller's -- and this
+interpreter already had that for the prelude's methods (meth_cfn,
+rx_cfunc_frame). A method whose body is a C API Proc (capi_dm_body) now
+gets it too, and rb_backref_get / set read and write rx_md as it stands. A
+`Regexp#match` that C sends now sets the caller's `$~` as in ruby, which it
+did not before. Seven contracts (a Fiber's and a Thread's reads, a write
+from each that leaves the outer match alone, public_send, class_eval,
+module_eval). regexp_spec is 35 of 35 now (the reference's), the C API's
+specs 2,277 of 2,584, the contracts 177.
+
 **Next**: the examples of `optional/capi` that differ, largest files first
 (string_spec, encoding_spec, class_spec, struct_spec, globals_spec's `$/`
 and `$stdin` as C variables that follow the interpreter's), and io_spec /
