@@ -6085,3 +6085,13 @@ Proc/Binding store lengths contribute to T_STRING, T_DATA and TOTAL. Corpus
 674 retains 1,000 ordinary Strings, 1,000 empty Strings and 200 Procs plus
 200 Bindings, checking real count deltas, totals and held identities. The
 base enumeration implementation is unchanged; no exclusion or limit changes.
+
+
+The third independent round addresses the primitive singleton-undef review.
+ObjectSpace.__id_integer now reads a primitive's full hng_store lookup tag
+for availability and native error class names, re-reading after callbacks.
+The shared super_base/dispatch helpers are unchanged. Corpus 687 adds named
+String/Array/Hash subclasses with preexisting singleton undefs and undefs
+created by respond_to? callbacks. All six controls require the reference's
+TypeError and concrete subclass name. The previous build raises NoMethodError
+or accepts conversion instead.

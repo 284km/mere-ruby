@@ -4584,3 +4584,7 @@ Strings) and retained Proc/Binding stores in T_DATA/TOTAL (corpus 674). The
 String count comes from actual sweep survivors plus new handles; issued
 handles for reclaimed slots do not count. This measurement does not require
 additional collection or the broader enumeration implementation.
+
+The ID converter also honors primitive singleton undef markers, including
+query callbacks which change String/Array/Hash lookup. Error class names
+come from the same native tag and preserve the primitive subclass name.
