@@ -54,7 +54,9 @@ enumerating Arrays. Native snapshot iteration now filters candidates before
 yielding, avoids temporary Ruby snapshot Arrays, and scopes its buffers and
 callback turns. Only the current value is rooted in the existing frame;
 unvisited snapshot candidates remain collectible, with real store presence
-checked before yielding, as MMTk's iterator does. Bulk pinning formerly kept
+checked before yielding, as MMTk's iterator does. Class presence uses the
+captured collectible owner in the identity registry, preserving named classes
+with implicit superclass rows. Bulk pinning formerly kept
 all 1,001 objects alive in a GC-during-callback control; the new build retains
 about 120 and Ruby retains three. No collection is forced. Scoped vectors
 preserve snapshot identities, and exact builtin filters use their store's

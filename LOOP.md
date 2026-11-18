@@ -6346,3 +6346,20 @@ That diagnostic is not an upstream pass. Sampling shows shared block frames,
 local lookup, hashing and primitive dispatch on the path; those helpers are
 unchanged. Full validation of the final combined candidate follows before
 publication. No ISeq/AST/m_state/collector-body or gemtest edits are added.
+
+The first combined full validation caught a class-presence regression:
+an implicit superclass row had been mistaken for a collected class.
+Class candidates now capture their collectible identity owner before the
+callbacks and consult that registry after collection. Named classes remain
+valid without explicit superclass rows. Existing corpus 226, expanded 685
+and test_each_object_singleton_class pass. Dump metadata follows the native
+implicit superclass rules too, including Object/BasicObject and Enumerator's
+builtin subclasses; expanded 670 compares their actual address edges.
+
+The intermediate bounded run completed all eight files, with core
+ObjectSpace at 1,886,512 KiB, below the unchanged 2-GiB bound. It still had
+the class-presence assertion above, so it is not the final pass. ObjectSpace
+itself completed at 533,136 KiB with 38 MATCH and eight RED; memsize_of_all's
+raw pass still uses inherited estimates and is not an honest implementation
+gain. Allocation-path tests now reach their actual frozen-literal provenance
+failures instead of the Module reflection error and remain named handoffs.
