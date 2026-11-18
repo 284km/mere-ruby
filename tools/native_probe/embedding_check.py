@@ -2,6 +2,7 @@
 """Build and check the experimental singleton embedding API, with resource bounds."""
 from pathlib import Path
 from native_build_flags import openssl_flags, native_bridge_sources, NATIVE_CFLAGS
+from embedding_build import EXPORTS, FAULT_ENV, failure_api, header_recipe, reuse_header
 import argparse
 import hashlib
 import json
@@ -33,12 +34,19 @@ parser.add_argument('--compiler', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--prism-lib', type=Path, default=ROOT / 'vendor/prism/obj/libprism.a')
 parser.add_argument('--reference-prefix', type=Path)
-parser.add_argument('--setup-failure', action='store_true',
+failures = parser.add_mutually_exclusive_group()
+failures.add_argument('--setup-failure', action='store_true',
                     help='Inject an initialization failure into a separate test fixture')
-parser.add_argument('--cleanup-failure', action='store_true',
+failures.add_argument('--cleanup-failure', action='store_true',
                     help='Inject a scheduler teardown failure into a separate test fixture')
+failures.add_argument('--failure-checks', action='store_true',
+                      help='Run both injection cases from one fault-only build')
+parser.add_argument('--reuse-header-from', type=Path,
+                    help='Reuse a verified normal build header for a fault-only build')
 args = parser.parse_args()
-assert not (args.setup_failure and args.cleanup_failure)
+fault_fixture = args.setup_failure or args.cleanup_failure or args.failure_checks
+if args.reuse_header_from and not fault_fixture:
+    parser.error('header reuse is only available to fault-only builds')
 output = args.output.resolve()
 output.mkdir(parents=True, exist_ok=False)
 compiler, prism = args.compiler.resolve(), args.prism_lib.resolve()
@@ -47,10 +55,14 @@ sys.path.insert(0, str(ROOT / 'unittest'))
 from ci import supervise
 os.chdir(ROOT)
 results = {}
-def run(name, command, seconds=90, rss_kb=2097152):
+def run(name, command, seconds=90, rss_kb=2097152, env=None):
     command = list(map(str, command))
     log = output / (name + '.out')
-    result = supervise(command, dict(os.environ), log, rss_kb, seconds)
+    environment = dict(os.environ)
+    environment.pop(FAULT_ENV, None)
+    if env:
+        environment.update(env)
+    result = supervise(command, environment, log, rss_kb, seconds)
     result['rss_limit_kb'] = rss_kb
     result['command'] = command
     results[name] = result
@@ -68,31 +80,20 @@ source = re.sub(r'import "(mgz/[^"]+\.mere)";',
                 lambda m: 'import "' + str(ROOT / '.mere_modules' / m[1]) + '";', source)
 (output / 'embedding_core.mere').write_text(source)
 api = FIXTURES / 'embedding_api.mere'
-if args.setup_failure:
+if fault_fixture:
     # Exercise the real protected setup/cleanup path with partial state. Keep
     # the injected fixture separate from the archive distributed to consumers.
-    original = api.read_text()
-    call = 'let _ = driver_setup env "" "(embedded)" in 0'
-    assert original.count(call) == 1
+    injected = failure_api(api.read_text(), args.setup_failure or args.failure_checks,
+                           args.cleanup_failure or args.failure_checks, selectable=args.failure_checks)
     api = output / 'embedding_api_failure.mere'
-    api.write_text(original.replace(call, 'fail "injected setup failure"'))
-if args.cleanup_failure:
-    original = api.read_text()
-    call = 'sch_terminate_all world'
-    assert original.count(call) == 2
-    api = output / 'embedding_api_failure.mere'
-    api.write_text(original.replace(call,
-        '(let _ = sch_terminate_all world in fail "injected cleanup failure")'))
+    api.write_text(injected)
 (output / 'embedding.mere').write_text(
     'import "embedding_core.mere";\nimport "' + str(api) + '";\n'
-    'let setup = fn () -> vm_setup ();\n'
-    'let eval_source = fn (source: str) -> vm_eval source;\n'
-    'let cleanup = fn () -> vm_cleanup ();\n'
-    'let clear_error = fn () -> vm_clear_error ();\n'
-    'let error_diagnostics = fn () -> vm_error_diagnostics ();\n'
-    'let error_class = fn () -> vm_error_class ();\n'
-    'let exception_status = fn () -> vm_exception_status ();\n()\n')
-for mode in ['header', 'c']:
+    + EXPORTS)
+recipe = header_recipe(ROOT, compiler)
+if args.reuse_header_from:
+    reuse_header(args.reuse_header_from.resolve(), output, recipe)
+for mode in (['c'] if args.reuse_header_from else ['header', 'c']):
     run('emit-' + mode, [sys.executable, __file__, '--emit', mode, compiler, output])
 openssl_cflags, openssl_ldflags = openssl_flags()
 bridge = native_bridge_sources(compiler)
@@ -112,7 +113,7 @@ archive = output / 'libmere_embedding_probe.a'
 run('archive', ['ar', 'rcs', archive, output / 'embedding.o'])
 run('link', flags + ['-I', output, FIXTURES / 'embedding_host.c', archive,
     ROOT / 'tools/prism_glue.c', ROOT / 'tools/socket_glue.c', ROOT / 'tools/math_glue.c', ROOT / 'tools/process_glue.c', ROOT / 'tools/openssl_glue.c', ROOT / 'tools/nkf_glue.c', *bridge, prism, '-pthread', *link_flags, *openssl_ldflags, '-o', output / 'host'])
-if not args.setup_failure and not args.cleanup_failure:
+if not fault_fixture:
     # Reuse the exact interpreter object. Fault injection exists only in this
     # separate NKF object/host, never in the distributed native archive.
     nkf_test_object = output / 'nkf-test.o'
@@ -127,9 +128,12 @@ expected = {
     'cleanup-error': 'before_cleanup\nfirst_hook\nlast_hook\nhost_survived\n',
     'cleanup-exit': 'cleanup_hook\nhost_survived\n',
 }
-for mode, text in ({} if args.setup_failure or args.cleanup_failure else expected).items():
+for mode, text in ({} if fault_fixture else expected).items():
     assert run(mode, [output / 'host', mode]) == text
-for mode in (['setup-failure'] if args.setup_failure else ['native-ownership-failure'] if args.cleanup_failure else ['pending-runtime', 'pending-exit', 'handled-runtime',
+if args.failure_checks:
+    assert run('failure-fixture-control', [output / 'host', 'lifecycle']) == expected['lifecycle']
+for mode in (['setup-failure', 'native-ownership-failure'] if args.failure_checks else
+             ['setup-failure'] if args.setup_failure else ['native-ownership-failure'] if args.cleanup_failure else ['pending-runtime', 'pending-exit', 'handled-runtime',
              'pending-runtime-hook-exit', 'pending-exit-hook-error',
              'pending-exit-hook-exit', 'hooks-exit-then-error',
              'hooks-error-then-exit', 'pending-runtime-normal-hook',
@@ -138,10 +142,15 @@ for mode in (['setup-failure'] if args.setup_failure else ['native-ownership-fai
              'primitive-pending', 'locals-after-error', 'local-call-before-assignment', 'method-gc',
              'object-message', 'object-spoof-message', 'object-hook-message',
              'native-ownership', 'native-ownership-error', 'native-ownership-hook-error', 'native-ownership-exit']):
-    text = run(mode, [output / 'host', mode])
+    injection = ('setup' if mode == 'setup-failure' else 'cleanup') if args.failure_checks else None
+    text = run(mode, [output / 'host', mode], env={FAULT_ENV: injection} if injection else None)
+    if mode == 'setup-failure':
+        assert text == 'failed_setup_cleanup_passed\n'
+    if mode == 'native-ownership-failure':
+        assert text == 'native_ownership_cleanup_passed\n'
     if mode == 'bad-inspect-hook':
         assert text == 'after_bad_inspect\nprotected_reporting_passed\n'
-if args.reference_prefix and not args.setup_failure and not args.cleanup_failure:
+if args.reference_prefix and not fault_fixture:
     ruby = args.reference_prefix.resolve() / 'bin/ruby'
     config = json.loads(subprocess.check_output([str(ruby), '-rjson', '-rrbconfig', '-e',
         'puts JSON.generate(RbConfig::CONFIG.slice("rubyhdrdir", "rubyarchhdrdir", "libdir", "LIBRUBYARG_SHARED"))'], text=True))
@@ -160,8 +169,12 @@ def revision(directory):
     return result.stdout.strip() if result.returncode == 0 else None
 (output / 'build-provenance.json').write_text(json.dumps({
     'schema': 1,
-    'setup_failure_injected': args.setup_failure,
-    'cleanup_failure_injected': args.cleanup_failure,
+    'setup_failure_injected': args.setup_failure or args.failure_checks,
+    'cleanup_failure_injected': args.cleanup_failure or args.failure_checks,
+    'failure_checks': args.failure_checks,
+    'header_recipe': recipe,
+    'header_sha256': hashlib.sha256((output / 'embedding.h').read_bytes()).hexdigest(),
+    'header_reused_from': str(args.reuse_header_from.resolve()) if args.reuse_header_from else None,
     'source_revision': revision(ROOT),
     'compiler_revision': revision(compiler.parent),
     'compiler_sha256': hashlib.sha256(compiler.read_bytes()).hexdigest(),
