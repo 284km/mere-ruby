@@ -4569,3 +4569,24 @@ bound is computed by walking it, so it does not return (ruby answers
 Float::INFINITY). CRuby's test_enumerator (test_size_for_downup_to) hangs
 there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
+
+
+## Rails application installation and execution (2026-11-19)
+
+`railstest/` fixes a Rails 8.1.4.1 application, 69 source archives and
+Ruby 4.0.9 as the reference. The reference passes migration, boot, six
+application tests / 31 assertions and real localhost HTTP served by Puma.
+This is an application measurement, not Rails' own framework suite.
+
+Current main 12ca1df2 installs Bundler but stops installing bigdecimal 4.1.3:
+loading mkmf raises NoMethodError because RbConfig's rubyhdrdir is absent.
+The standalone `railstest/probes/mkmf.rb` reproduces that boundary without
+Rails. [Issue #116](https://github.com/284km/mere-ruby/issues/116) records the
+reproduction and its relationship to the actual build metadata/mkmf work
+in #95. No CRuby headers or compiled gems are substituted. Mere application
+stages remain NOT_RUN, and all 600-second / 2-GiB process-family bounds stay.
+
+After dependency installation works, rerun the frozen application stages
+before claiming boot, SQLite, HTTP or test compatibility. Original Rails
+component suites and broader application workloads still need measurement.
+See [railstest/README.md](railstest/README.md) and its separate latest record.

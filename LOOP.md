@@ -6053,3 +6053,32 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+
+## 2026-11-19: Rails application intake, rounds 1–2
+
+Round 1 fixes Rails 8.1.4.1, sqlite3 2.10.2, Puma 8.1.2, Minitest 6.1.0
+and Bundler 4.0.20 in `railstest/`: all 69 Ruby-platform source archives
+have hashes and a frozen Bundler lock. Reference Ruby 4.0.9 runs a real
+small app: migration, boot, six tests / 31 assertions, and a local Puma
+HTTP request. SQLite uses its documented system-library build option;
+the first reference library was SQLite 3.46.1. No Ruby version requirement
+is bypassed, upstream gem source changed, or native extension shared.
+
+Round 2 adds repeatable measurement in fresh gem homes, separate stdout,
+stderr and resource records, and six explicit stages. Reference standard
+libraries are a fallback after activated gems. The boot source audit checks
+every locked gem's version and installed path. Missing dependent stages are
+NOT_RUN; missing/skipped tests, lower assertion counts and limit events
+cannot pass. Five harness controls run in an independent lightweight CI
+workflow; they do not imply that Rails executes successfully on mere-ruby.
+
+Main 12ca1df2 stops installing bigdecimal before its C extension builds:
+RbConfig has no rubyhdrdir, and loading mkmf raises nil-plus NoMethodError.
+A two-require probe reproduces it without Rails; issue #116 hands the
+actual build metadata/mkmf boundary to the existing #95 work. No runtime
+function, API inventory, collector, VM, AST, C API or gemtest file changes
+here. There is no claimed Rails framework-suite pass or application MATCH
+on mere-ruby. The fixed 600-second / 2-GiB bounds remain. The next action
+is the same locked workload after native installation becomes available,
+then original Rails component tests.
