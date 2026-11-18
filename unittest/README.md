@@ -580,3 +580,13 @@ in CI; `unittest/try.sh` sets all of them.
   only if it mentions "ruby".
 - The corpus needs `LANG=en_US.UTF-8` (corpus/492 reads ENV keys under the
   locale's encoding).
+
+
+The GC-only subset in #112 uses the upstream --excludes-dir/EXCLUDES
+mechanism on both interpreters: 19 GC-specific and 22 compaction cases.
+This integrated stack adds 16 ObjectSpace exclusions, for 57 total. Each
+entry explains the default collector feature that Mere lacks. Excluded
+identities and reasons are audited symmetrically and reported separately;
+allocation comparisons remain enabled. GC.config[:implementation] truthfully
+remains mere-ruby; only the CRuby GC-library-name assertion is excluded.
+No RUBY_GC_LIBRARY value is used to disguise the reference collector.

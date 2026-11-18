@@ -5290,6 +5290,19 @@ different.
   1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
   fallbacks, then the compiler made native, then speed.
 
+## 2026-11-16: stage 9, round 4 -- count the actual live String store
+
+While PR #91 waits for CI, an independent probe found that count_objects
+omitted T_STRING although each_object(String) now visits the actual store.
+The store count is the last sweep's survivor count plus handles issued since
+its sweep boundary. Empty strings count, reclaimed slots do not, and TOTAL
+includes the same live Strings. No collector function or m_state.mere changed.
+
+Witness 674 checks empty/live/reclaimed Strings, hash reuse, zeroed old keys
+and the total's arithmetic. It fails on PR #91's old binary (missing T_STRING)
+and agrees with Ruby after this fix. Core test_objectspace remains 37/37;
+objspace stays MATCH 38 and string_memory stays MATCH 2. The original 159-case
+classification is unchanged; this is an additional real API correction.
 ### PR #91 review: GC::Profiler keeps the runtime CPU epoch
 
 P2 found that GC_INVOKE_TIME began at Profiler.enable instead of runtime
@@ -5350,6 +5363,68 @@ every character. Witness 670 round-trips a long ASCII string and those bytes;
 the unchanged ractor dump test still passes its ten-second limit. No new
 top-level value or JSON engine changes are introduced.
 
+## 2026-11-17: stage 9, round 5 -- enumerate Proc and Binding stores
+
+each_object now snapshots actual Proc and Binding handles from proc_store
+and bind_store, applying the existing class filter and preserving identity.
+count_objects includes those live store lengths in T_DATA and TOTAL. This
+does not invent native TypedData owner counts or allocator byte sizes.
+Witness 680 checks held values, unique identities, Enumerator behavior,
+returned counts and survival after collection. Witness 674 covers String
+counts, including empty and reclaimed values. The 159-case classification
+remains 12 accepted matches, 57 reasoned exclusions and 90 handoffs.
+
+The inherited Ruby memsize_of_all loop now visits Proc/Binding too, producing
+temporary Strings that enter the next String-only measurement. Its a > b
+assertion fails (1081807 versus 1844111 in the isolated reproduction). This
+is the already-recorded native allocator handoff; its guessed byte counts
+are not adjusted to retain a raw pass. It remains enabled and visible.
+
+The latest main baseline is successful CI 43869939788, main 535ad955. Its
+target 159 RED are unchanged from the original inventory. Both hash modes
+pass 696/696 corpus comparisons before the final dump escaping optimization;
+all nine RSS cases pass, with discarded-class-ivar at 1.07x. The final
+ObjectSpace file and dump witnesses are rechecked after that optimization.
+No collector body, m_state, VM, AST, C API or gemtest change is introduced.
+
+The pre-publication origin check found witness 675 newly used by the VM
+branch. This branch's Proc/Binding witness moved to the first free number,
+680, leaving the concurrent branch unchanged.
+
+Final ObjectSpace remeasurement: 46 tests, MATCH 37, RED 9, with 16 audited
+exclusions. The ractor dump passes again; the remaining raw loss from #91 is
+the unaccepted memsize_of_all estimate described above. Combining that final
+file with the unchanged six-file measurement gives 207 tests: MATCH 109,
+RED 88, BOTH 5, EXTRA 5, plus 57 separately reported exclusions. Against the
+latest main the target raw gain is now 12, all accepted implementation
+matches. Both final store witnesses and the extended dump witness pass.
+
+## 2026-11-17: stage 9, round 6 -- inverse identities and integer conversion
+
+While #91 and #94 wait for CI, a separate worktree reproduces two ObjectSpace
+gaps: _id2ref rejects to_int arguments and cannot recover retained Proc or
+Binding handles. It now converts once, including private and conventional
+respond_to_missing? conversions, rejects non-Integer results with TypeError,
+and reads the actual Proc/Binding tables for those identity tags. The
+collector and the shared conversion helpers remain unchanged.
+
+Witness 681 round-trips held objects and stores, checks conversion calls,
+private/dynamic conversion, one-argument respond_to? overrides, invalid
+return types, Float conversion and preservation after collection. Ruby
+passes; the previous interpreter fails at the first to_int argument.
+
+## 2026-11-17: stage 9, round 7 -- reject swept String identities
+
+_id2ref's String path used the issued-handle boundary alone, so an old ID
+could recover a swept slot as an empty String. __str_of_id now checks the
+existing gc_str_present predicate. This reads actual survivors and fresh
+handles without changing the collector, its roots or its sweep behavior.
+
+Witness 682 releases dynamic Strings, collects and requires rejection of
+collected IDs, while retained empty/nonempty Strings and a fresh empty String
+still round-trip. The reference rejects collected IDs; the old interpreter
+rejects none. No default-collector exclusion or allocation comparison changes.
+
 ### PR #91 CI comparison: snapshot iteration without temporary Ruby Arrays
 
 The full 758-file report at 47c833e7 has three lower MATCH counts than main
@@ -5406,6 +5481,53 @@ moved to 26.04 with Clang 21. The native build job is pinned to Ubuntu 24.04
 to preserve that baseline environment; its 90-minute limit and all test
 time/memory bounds remain unchanged. The platform explanation is checked by
 the next CI run, rather than changing Float arithmetic during GC work.
+
+The final identity branch also integrates this main and the native iterator
+correction. All 699 corpus programs agree in both hash-index modes. Its
+seven-file comparison completes with MATCH 198, RED 12, BOTH 6, EXTRA 5 and
+57 symmetric exclusions; Enumerable is 89 MATCH and core ObjectSpace 37/37.
+All nine RSS cases (class ivar 1.05x), the complete OpenSSL lifetime gate,
+root/dead/duplicate-definition checks and bracket depth 892/1024 pass.
+Rounds 6 and 7 are PR #98, stacked on #94; none of the three PRs is merged
+while the latest-main full CI and per-file comparison are pending.
+
+### PR #98 review: conversion does not require argument reflection
+
+The review found that asking the argument for method(:respond_to?) rejects
+a valid to_int object that undefines or overrides Kernel#method. The native
+ObjectSpace __id_integer arm now reads existing method metadata and calls
+through the existing dispatcher. It preserves private and dynamic conversion,
+one-argument respond_to? overrides, refusal, errors and result type checks;
+it does not call the argument's method, class, is_a? or __send__ methods.
+
+The BasicObject control exposed another dependency: scanning snapshot
+candidates through their object_id failed just because a BasicObject was
+present. Ordinary object IDs now resolve from the real obj_cls store, and
+the fallback compares existing native identity metadata. Witness 681 adds
+the review's missing-method case, reflection traps, BasicObject and held
+Class identity. It passes on Ruby and the O2 candidate; the prior binary
+fails the new missing-method case. Sixteen conversion controls have identical
+reference/candidate output. Witnesses 682/683 and root/dead/duplicate gates
+also pass; bracket depth remains 892/1024. The full comparison is rerun.
+
+### PR #98 follow-up: checked method_missing conversion
+
+A further review found that a custom method_missing can supply to_int
+without advertising it through respond_to_missing?. The ObjectSpace native
+conversion arm now distinguishes an explicit query refusal from the absence
+of an advertised method. It tries custom missing-method dispatch, preserves
+explicit refusals and promised-method exceptions, and treats an unadvertised
+NoMethodError as a declined conversion. A tagged result distinguishes a
+successful nil return from a missing method. The caller's exception context
+is restored before reporting refusal. Query arity errors match Ruby's
+checked-call entry. No shared conversion helper or VM function is changed.
+
+Witness 681 covers Object/BasicObject proxies without an advertisement,
+refusal, nil results, query arity and collection inside conversion. It agrees
+with Ruby and fails on the prior binary. Existing witnesses 682/683 and 30
+comparison outputs (16 prior conversions, 12 new conversions and two exception
+context checks) agree too. Roots/dead/duplicate checks and depth 892/1024 pass.
+The complete upstream comparison and both corpus modes are rerun.
 
 ## 2026-11-15 (57): RubyVM::AbstractSyntaxTree answers parse.y's tree
 
@@ -5639,6 +5761,16 @@ The AST and VM changes are imported unchanged; there are no independent
 edits to m_state or the AST/Prism implementation. Corpus namespace auditing
 found overlapping publication numbers. This branch moves its native
 ObjectSpace snapshot witness from 683 to 685, retaining the upstream cases.
+
+The follow-up store witness moves from its original publication number 680
+to 686. The upstream AST/Proc witness at 680 is retained unchanged. Earlier
+progress entries use their publication numbers; this records the mapping.
+
+The identity witnesses similarly move from 681/682 to 687/688 after the
+remote namespace audit. The earlier conversion-review entries retain their
+publication numbers. Only this session's witnesses are renamed; main's and
+the concurrent branches' cases are retained. This integrated branch has
+703 corpus programs, including the four cases newly imported from main.
 ## 2026-11-16 (61): round 39 -- what test_iseq and test_optimization still asked
 
 **The point.** `ruby/test_iseq.rb` goes from 42 of 70 to 62 of 68 (the two
@@ -6267,6 +6399,27 @@ remain unmerged until current CI and the per-file comparison satisfy the
 stated gate. The next independent work outside stage 9 is VM callback cost,
 conservative frame lifetime and native allocator attribution, with concrete
 test names retained in gc_cases.tsv and KNOWN_GAPS.md.
+
+### Follow-up review: receiver-side undef in checked ID conversion
+
+The next #98 review found that owner metadata alone could see an inherited
+to_int, respond_to_missing? or method_missing past a child's undef marker.
+ObjectSpace.__id_integer now checks undef_blocked from the receiver's full
+lookup start (super_base) before using owner metadata. The same check guards
+the real-method probe and custom respond_to? arity; shared lookup/dispatch
+helpers are unchanged. Corpus 687 covers inherited conversion/hook/query
+undefs, a definition restored below an undef, and class singleton lookup.
+
+Ruby passes the expanded witness; the previous candidate fails its inherited
+undef assertion. The fixed O2 candidate passes witnesses 685–688, all 30
+earlier conversion/exception-context outputs, and the upstream id2ref group
+(25 tests, 54 assertions, no failures, errors or skips). Root/dead/duplicate
+checks pass and bracket depth remains 932/1024. The independent Enumerable
+P2 and whole-file finalizer memory bound remain open; no new exclusion or
+resource-limit change is made.
+
+The final review-fix build also passes 710/710 corpus programs in both
+hash-index modes, all nine RSS cases and the OpenSSL lifetime gate.
 ## 2026-11-18 (82): build-linux's Module check at its 10 s, and Module#clone walking every constant
 
 Main e40bb486's CI run failed the Module check:
@@ -6392,3 +6545,97 @@ The final remote namespace audit found a concurrent gem witness at 685.
 This session's snapshot witness moves from 685 to the verified free 710;
 earlier entries retain their publication numbers. Its contents are unchanged
 and its renamed path is checked against Ruby with indexing ON and OFF.
+
+
+The primitive singleton-undef correction reviewed in #109 is also applied
+to this stacked ID branch. Only ObjectSpace.__id_integer changes: it reads
+the actual hng_store tag for availability and native error class names,
+re-reading after callbacks. Corpus 687 retains six String/Array/Hash controls
+for preexisting and query-created undefs. Shared lookup/VM helpers are
+unchanged. The independent extraction and this port are the same fix, not
+two additional matches in the original intake.
+
+
+## 2026-11-18: stage 9, ship checked ID lookup independently
+
+The GC/ObjectSpace stack has an open Enumerable timeout finding. Its checked
+ID lookup can be reviewed independently against main 12ca1df2: this change
+ports ObjectSpace.__id_integer, live __val_of_id/__str_of_id lookup and the
+_id2ref prelude only. A small __id_value arm reads native identity for the
+fallback search, avoiding a dependency on the stack's heap dump metadata.
+Corpora 687/688 are copied unchanged from the reviewed stack, including all
+four conversion review controls. No additional corpus number is consumed.
+
+The base __objects/each_object and count_objects implementations are kept.
+There are no new exclusions, top-level values, collector-body changes or
+independent edits to shared VM/dispatch helpers, m_state, Prism, C API or
+gemtest. The full 157-test intake remains 12 honest implementation matches,
+57 reasoned exclusions and 88 named handoffs in the parent inventory. This
+port does not count the same fixes a second time.
+
+O2 verification of the independent port retains core ObjectSpace 37 MATCH,
+Enumerable 89 MATCH and Object 65 MATCH under the unchanged CI supervisor.
+The 10-second Enumerable subprocess remains enabled. All nine RSS cases pass;
+actual bracket depth is 933/1024, so the stale 923 search seed is corrected
+to that measured value. No top-level definition is added.
+
+
+The second independent round ports ObjectSpace.__store_counts and the
+count_objects prelude from #94. Actual String survivors/new handles and
+Proc/Binding store lengths contribute to T_STRING, T_DATA and TOTAL. Corpus
+674 retains 1,000 ordinary Strings, 1,000 empty Strings and 200 Procs plus
+200 Bindings, checking real count deltas, totals and held identities. The
+base enumeration implementation is unchanged; no exclusion or limit changes.
+
+
+The third independent round addresses the primitive singleton-undef review.
+ObjectSpace.__id_integer now reads a primitive's full hng_store lookup tag
+for availability and native error class names, re-reading after callbacks.
+The shared super_base/dispatch helpers are unchanged. Corpus 687 adds named
+String/Array/Hash subclasses with preexisting singleton undefs and undefs
+created by respond_to? callbacks. All six controls require the reference's
+TypeError and concrete subclass name. The previous build raises NoMethodError
+or accepts conversion instead.
+
+
+## 2026-11-18: stage 9, ship GC measurements independently
+
+Extract the GC-specific part of #91 against main 12ca1df2, preserving the
+base ObjectSpace enumeration and VM/AST/C API code. gc_collect_any wraps
+actual collections with CPU profiling and weak-map observations; its
+ObjectSpace observation cleanup is left with #91. No collector marking or
+sweeping function is independently changed. Startup CPU epoch and portable
+CPU-clock/browser bindings retain the three addressed review corrections.
+
+GC APIs expose real observations and unsupported compaction consistently.
+The upstream exclusion mechanism and symmetric audit/reporting cover only
+19 GC and 22 compaction cases in this branch; ObjectSpace's 16 exclusions
+stay with #91. Corpus 711 tests GC measurements/capabilities; existing 673
+checks delayed enablement, clear/re-enable and CPU-versus-sleep accounting.
+No new top-level value or resource-limit changes.
+
+Fresh Wasm emission also exposed an existing missing mr_utimens/mr_stat_times host imports.
+The HTML host now returns its guest wrapper's declared -2/empty-string unavailable
+sentinels, preserving startup without claiming timestamp support. The native
+File/C API implementation is unchanged.
+
+
+## 2026-11-18: consolidate the deferred GC/ObjectSpace stack
+
+Integrate the count/ID stack and the independently validated #109/#112
+changes into this remaining branch. Keep the full ObjectSpace snapshot and
+its collectible-owner checks, all ID protocol controls, real store counts,
+the ObjectSpace observation cleanup at collection, and both browser host
+fixes. The integrated ledger remains 57 (41 GC plus 16 ObjectSpace). The
+independent main-targeted PRs stay open; this is branch integration, not a
+main merge. The Enumerable P2 is still open and is not claimed as fixed.
+
+The integrated O2 candidate passes explicit corpus --both 712/712, all nine
+RSS cases and bracket depth 933/1024. All eight bounded files complete:
+263 MATCH, 14 RED, 6 BOTH, 5 EXTRA, plus 57 symmetric exclusions. Core
+ObjectSpace is 37/37 at 1,830,016 KiB; Enumerable remains 88 rather than
+main's 89. Issue #113 records the shared callback handoff: even the native
+1,000-turn diagnostic takes 13.710 CPU seconds without the Ruby wrapper.
+That diagnostic is not a passing upstream test or a changed time limit.
+The earlier stacked count/ID work is consolidated here, while #109/#112
+remain independent main-targeted deliveries. No main merge is implied.

@@ -5,6 +5,8 @@ interpreters**, measured separately from MATCH/RED/BOTH/EXTRA in the four
 target files. This historical full-suite table below predates that ledger;
 fresh CI reports its actual exclusions separately in `exclusions.tsv` and
 `summary.json`. Allocation comparisons remain enabled.
+The GC-only subset in #112 has 41 exclusions; this integrated stack also
+includes 16 ObjectSpace exclusions, for the 57 counted here.
 
 CRuby's test/ files at the reference's release, run under mere-ruby and under
 ruby 4.0.9 test by test (`unittest/run.sh`). A second yardstick beside

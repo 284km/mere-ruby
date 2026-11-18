@@ -49,6 +49,14 @@ RSS regression came from reusing the collector's oncall safety flag to label
 explicit collections; a separate cause flag restores native arena collection.
 The discarded-class-ivar gate again measures 1.06x, the baseline ratio.
 
+count_objects includes real live String, Proc and Binding stores in its type
+counts and TOTAL. each_object visits actual Proc and Binding handles, with
+the same class filtering and identities. With those stores now enumerated,
+the inherited Ruby memsize_of_all loop allocates enough temporary Strings
+that its subsequent String-only sum can exceed its earlier all-object sum.
+That assertion remains a native allocator handoff, without invented byte
+counts or an exclusion. Witnesses 674 and 686 cover the actual store APIs.
+
 The full-file comparison also exposed an Enumerable timeout from repeatedly
 enumerating Arrays. Native snapshot iteration now filters candidates before
 yielding, avoids temporary Ruby snapshot Arrays, and scopes its buffers and
@@ -4653,3 +4661,31 @@ bound is computed by walking it, so it does not return (ruby answers
 Float::INFINITY). CRuby's test_enumerator (test_size_for_downup_to) hangs
 there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
+
+
+ObjectSpace._id2ref uses checked native integer conversion and actual live
+object, Proc, Binding and String handles (corpus 687/688). It respects private
+methods, missing-method proxies, receiver-side undef markers and lookup
+changes made by a custom respond_to? callback. Resolving one ID reads native
+identity metadata instead of calling unrelated objects' object_id overrides.
+The independently deliverable count/ID subset is #109. This integrated
+stack also includes native value-store enumeration; the Enumerable callback
+timeout recorded for #91 remains unresolved.
+
+ObjectSpace.count_objects also counts live String slots (including empty
+Strings) and retained Proc/Binding stores in T_DATA/TOTAL (corpus 674). The
+String count comes from actual sweep survivors plus new handles; issued
+handles for reclaimed slots do not count. This measurement does not require
+additional collection or the broader enumeration implementation.
+
+The ID converter also honors primitive singleton undef markers, including
+query callbacks which change String/Array/Hash lookup. Error class names
+come from the same native tag and preserve the primitive subclass name.
+
+The independent stage 9 GC work records actual collection causes, weak-map
+observations and process CPU profiling records. Unsupported compaction APIs
+raise NotImplementedError and report respond_to? false. INTERNAL_CONSTANTS
+contains no invented slot/heap values; stat_heap exposes no nonexistent pools.
+The GC-only subset in #112 has 41 explicit exclusions. This integrated
+stack also includes 16 ObjectSpace exclusions, for 57 audited exclusions
+on both interpreters, reported separately. The Enumerable P2 remains open.
