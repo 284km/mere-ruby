@@ -58,7 +58,7 @@ skipping bytes shared by every input. Lists below 256 words and unsuccessful
 scratch allocations retain `qsort`. Both pin collection paths preserve every
 unsigned word and duplicate; the temporary scratch array is freed before return.
 
-CI now pins Mere `4720aa939c5f469307fa60c89edd99b4b18ce312`. On the same
+Radix-sorting validation used Mere `4720aa939c5f469307fa60c89edd99b4b18ce312`. On the same
 mere-ruby runtime source (`12ca1df2`) and O2 flags, fresh paired measurements
 compare this with the previous snapshot-update runtime (`40761fb8`). The host
 is the same arm64 macOS 26.7.1/Apple Clang environment. Three processes per
@@ -84,6 +84,49 @@ suites (1,460 assertions, no failures/errors, one existing skip, the same limits
 Upstream O2 and ASan/UBSan checks compare complete unsigned sequences against
 a reference sort in executable/library modes, force allocation failure and
 require six broken variants to produce their specific failure witnesses.
+
+### Per-scan range and own-block caches
+
+CI now pins Mere `01f5ad738748cc570cc04e3000f50b8c6965543f`. The word walker
+keeps its previous last-span fast path and adds eight exact allocation/gap
+range hints. Both paths reuse the span's classification against the walk's
+fixed own-block set. Hints are local to one zero-initialized scan state;
+collisions validate the complete half-open interval and fall back to binary
+search. The current used bump limit is still read after lookup, and no extra
+heap allocation is introduced.
+
+An instrumented 4,000-generator census reduces binary searches from 28,551,057
+to 14,369,964 and ownership lookups from 92,228,524 to 7,087,370. The additional
+cache answers 49.9% of lookups not resolved by the last-span path. The upstream
+benchmark README and `lookup_probe.py` record all counts and definitions;
+timings use separate uninstrumented interpreters.
+
+On the same runtime source (`12ca1df2`) and O2 flags, fresh paired measurements
+compare the radix-sorting parent (`4720aa93`) with the new compiler, on the
+same arm64 macOS/Apple Clang host. Three fresh processes per size and compiler
+alternate control/candidate, reversing order in the middle repetition. All
+regression workloads finished before timing began; all outputs match Ruby 4.0.9.
+
+| Generators | Parent median [range] seconds | Range/ownership cache median [range] seconds | Median peak RSS parent / cache MiB |
+|---:|---:|---:|---:|
+| 1,000 | 0.438 [0.428, 0.457] | 0.410 [0.388, 0.424] | 281.48 / 281.14 |
+| 2,000 | 1.891 [1.802, 2.050] | 1.732 [1.660, 1.913] | 340.84 / 340.70 |
+| 4,000 | 6.612 [6.400, 6.696] | 6.042 [5.967, 6.613] | 412.05 / 409.77 |
+
+The 4,000-generator median is 8.6% shorter, with overlapping ranges and
+comparable peak RSS. Earlier tables are separate measurements; these fresh
+pairs isolate range/ownership caching. Scaling remains faster than linear
+and complete workflow timings remain to be measured.
+
+All 703 corpus programs match in both hash-index modes. Corpus/216 checks the
+module-self `sleep(0)` call's integer/nonnegative return contract: the pinned
+CRuby uses `time(0)` before/after sleep and may return 1 across a clock boundary.
+Reference, parent and candidate agree on the corrected assertion in both modes.
+The 224 CRuby enum/enumerator/lazy tests retain the parent's exact named-case
+results (1,460 assertions, no failures/errors, one existing skip, the same limits).
+Upstream O2 and ASan/UBSan checks compare membership and own-block classification
+with linear oracles, including collisions, gaps, high addresses and a changing
+bump top; nine deliberate defects must each produce their specific witness.
 
 ## `yaml_cycles.rb`
 
