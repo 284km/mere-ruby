@@ -486,11 +486,28 @@ runner crosses them.
 - build-linux's Module check: `TestModule#test_complemented_method_entry_memory_leak`
   takes 5.5-8.5 s and has 10 s (`upstream_leak_seconds`). A slow runner gives
   10.04 s, a Timeout, and the job fails. Rerun the job.
+- ...and the same test in `ruby/test_module.rb` itself is an RSS ratio
+  (after 300,000 more refinement classes against after 1,000) bounded by
+  2.0: 1.74-1.82 locally on main 392bf810 and on PR #89's branch alike, and
+  2.30 once on a macOS runner (78.6 MB -> 180.5 MB, PR #89's last run), the
+  run before it passing. Rerun its shard.
 - `ruby/enc/test_case_comprehensive.rb` takes 360-400 s of its 600; one run
   took 616 s (WALL_LIMIT, all 422 tests RED) while the run's median file was
   at 0.98 of main's. Rerun its shard.
 - bootstraptest test_ractor #153 (1,000 ractors) and #99 sit at the runner's
   limit.
+- `ruby/test_integer.rb`'s `test_pow` runs 17 expressions in child
+  processes of 10 s each, and `crash03` (`-1111111**-1111*11 - -11**
+  -1111111`) takes 8.2 s of it locally on main and on a branch alike. A
+  loaded runner times it out (PR #88's run, twice).
+- `ruby/test_ractor.rb`'s `test_shareable_proc_define_method_super_method_
+  missing` (1,000,000 calls in a Ractor) takes 17-18 s of its 30 s
+  locally; a loaded runner timed it out once (PR #88).
+- `ruby/test_struct.rb`'s `test_named_structs_are_not_rooted` (run for
+  TopStruct and for SubStruct) compares the process's RSS after 10,000 and
+  after 60,000 named Structs and wants less than twice. Locally the ratio is
+  1.25-1.37 on main and on a branch alike; one CI run gave 2.29 for one of
+  the two while the other passed in the same file.
 - `ruby/test_ractor.rb`'s `test_move_nested_hash_during_gc_with_yjit` runs a
   child with a 10 s bound and takes 9.3-10.1 s on the runners, on main as
   well: one run in a few is a Timeout and the file is one test lower.
