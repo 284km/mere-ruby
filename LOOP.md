@@ -6363,3 +6363,27 @@ itself completed at 533,136 KiB with 38 MATCH and eight RED; memsize_of_all's
 raw pass still uses inherited estimates and is not an honest implementation
 gain. Allocation-path tests now reach their actual frozen-literal provenance
 failures instead of the Module reflection error and remain named handoffs.
+
+Final validation on the combined #102 candidate completes all eight files:
+288 tests, 263 MATCH, 14 RED, six BOTH and five EXTRA, with 57 identical
+exclusions separately audited (16 + 19 + 22). Core ObjectSpace is 37/37 at
+1,876,592 KiB and objspace is 38 MATCH/eight RED at 571,136 KiB. No file in
+this bounded local subset reaches the 2-GiB limit. Nine RSS cases and the
+OpenSSL interruption/stress/native-owner/thread lifetime gates pass; source
+checks pass and bracket depth is 933/1024. The remaining Enumerable test
+still reaches its ten-second limit and is not excluded.
+
+Local corpus commands in earlier progress entries omitted --both; their
+ordinary-mode results were incorrectly described as local checks of both
+hash modes. Those local mode claims are corrected here. CI's explicit
+--both jobs are separate evidence. The final candidate has now completed
+the explicit command `sh run_corpus.sh --both`: 711/711 programs agree with
+Ruby with indexing ON and OFF. Corpus 670 compares direct class edges;
+Object's inserted Kernel ICLASS is not a portable superclass-address test.
+
+A VM handoff can reproduce the callback cost without ObjectSpace at all:
+keep 6,800 empty Arrays, and repeat 1,000 times an Array#each block containing
+`array.clear if array.length == 1000`. The actual main 3eb24fef CI interpreter
+takes 14.22 wall seconds (12.88 user + 0.21 system CPU seconds). This is
+independent shared-call workload evidence, not a replacement for the failing
+upstream test. Shared block/frame/lookup/dispatch functions remain untouched.
