@@ -6108,3 +6108,17 @@ test_optimization, test_proc, test_iterator, test_method, test_integer,
 test_fixnum, test_range, test_array, test_hash and test_enumerator the same
 counts. The bracket depth needed went 923 -> 933 (BRACKET_SEED; 91 to spare
 under 1024).
+
+Then two more, each within the noise alone and kept for what they remove:
+vm_send's statement, Symbol-name and Symbol-test closures are functions of
+their own (vm_stmt_v, vm_syms, vm_all_syms), and the waiting for a tail call
+-- and the closure it is handed -- only once a send marked for one is loaded;
+and a frame's first statement no longer marks its allocations' start nor
+polls again, which the frame's entry did (vm_body_run, or the statement
+around a `once`). Where the VM is still behind is a call of a VM method from
+a VM method: 20 levels of recursion 50,000 times took 1.27 s on the VM and
+1.18 s on the evaluator, while a call from a loop is faster on the VM (a
+one-line method 1,000,000 times: 1.20 s against 1.35) and a loop of its own
+is 0.43x (3,000,000 turns: 0.68 s against 1.57). Each such call passes a
+dozen layers between call_method and vm_step that the evaluator's call does
+not; taking them away is a call path of the VM's own, not a step.
