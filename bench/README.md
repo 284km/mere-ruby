@@ -3,6 +3,19 @@
 Every harness here is meant to be run against CRuby as well, because a number
 without the reference number is not a measurement.
 
+## `enumerator_steps.rb`
+
+```sh
+./mere-ruby bench/enumerator_steps.rb 9000
+ruby bench/enumerator_steps.rb 9000
+```
+
+Isolates corpus/214's repeated suspended generators inside one statement while
+keeping another generator alive across the workload. Both interpreters must
+print `:kept1`, the requested count, and `:kept2`. Compare several counts and
+sample the O2 interpreter to distinguish iteration cost from stack pin scanning
+and captured-environment compaction. See [CI scheduling and profiles](ci_short_shards.md).
+
 ## `yaml_cycles.rb`
 
 Dump a self-referential array and compare memory use before and after identity
