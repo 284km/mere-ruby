@@ -6301,3 +6301,14 @@ variation is not a new MATCH or an inferred VM/GC cause.
 File override, Chain, provenance and constant witnesses 676/677/685/693 match the reference. The earlier full corpus was 709/709 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
 The earlier full corpus was 707/707 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
 Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
+
+Audited rounds 8-9, O2 source 72effb05 on main 3eb24fef: two consecutive
+normal full runs give 53 MATCH / 9 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY.
+All 62 files on each side audit the locked library. Ordinary comparison
+against this branch's preserved pre-audit 52 MATCH / 9 RED / 1 MEMORY gives
+zero regressions, with identical source/dependency pins and reference tallies.
+Multipart gives 85 tests / 239 assertions in both runs, with peaks about
+1.69 and 1.36 GiB. Its earlier MEMORY/RED variation remains recorded; neither
+its cause nor attribution to a specific change is established by these runs.
+The latest snapshot uses the second full run. Cross-platform hosted checks
+must retain this new MATCH under the same bounds before merge.
