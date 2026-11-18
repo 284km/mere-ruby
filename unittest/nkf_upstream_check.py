@@ -23,9 +23,11 @@ assert (helpers / 'test/unit.rb').is_file()
 libs = subprocess.check_output([a.ruby, '-e',
     'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir,"gems","*","lib")].sort).join(":"))'], text=True, timeout=20)
 results = {}
+runtime = subprocess.check_output(['sh', str(ROOT / 'tools/runtime_load_path.sh'), str(a.binary.resolve())],
+                                  text=True, timeout=20)
 for side, binary in [('reference', a.ruby), ('native', a.binary.resolve())]:
     for name, tests, assertions in [('test_nkf', 2, 3), ('test_kconv', 5, 41)]:
-        env = dict(os.environ, RUBYLIB=str(helpers) + (':' + str(ROOT / 'unittest/shim') + ':' + libs if side == 'native' else ''))
+        env = dict(os.environ, RUBYLIB=str(helpers) + (':' + str(ROOT / 'unittest/shim') + ':' + runtime + ':' + libs if side == 'native' else ''))
         key = side + '-' + name
         log = a.output / (key + '.out')
         result = supervise(list(map(str, [binary, ROOT / 'vendor/nkf/test/nkf' / (name + '.rb'),
