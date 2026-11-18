@@ -64,6 +64,58 @@ end
 class WrongQueryIdArgument < IdArgument
   def respond_to?(name, private_too, extra) = true
 end
+class InheritedDecliningIdArgument < MissingIdArgument
+  def to_int = @value
+  def respond_to_missing?(*) = false
+end
+class UndefinedIdConversion < InheritedDecliningIdArgument
+  undef_method :to_int
+end
+class UndefinedIdQueryHook < UndefinedIdConversion
+  undef_method :respond_to_missing?
+end
+class UndefinedIdMissingHook < UndefinedIdQueryHook
+  undef_method :method_missing
+end
+class RestoredIdConversion < UndefinedIdConversion
+  def to_int = @value
+end
+class UndefinedIdQuery < WrongQueryIdArgument
+  undef_method :respond_to?
+end
+class ClassIdArgument
+  def self.to_int = 1
+end
+class UndefinedClassIdArgument < ClassIdArgument
+  class << self
+    undef_method :to_int
+    def respond_to_missing?(*) = false
+    def method_missing(*) = raise('declined class conversion called')
+  end
+end
+
+[UndefinedIdConversion, UndefinedIdMissingHook].each do |klass|
+  argument = klass.new(1)
+  begin
+    ObjectSpace._id2ref(argument)
+    raise 'inherited undef conversion accepted'
+  rescue TypeError
+    raise 'undefined inherited hook called' unless argument.calls == 0
+  end
+end
+argument = UndefinedIdQueryHook.new(1)
+raise 'undefined query hook consulted' unless ObjectSpace._id2ref(argument) == 0 && argument.calls == 1
+argument = RestoredIdConversion.new(1)
+raise 'conversion restored below undef ignored' unless ObjectSpace._id2ref(argument) == 0 && argument.calls == 0
+argument = UndefinedIdQuery.new(1)
+raise 'undefined inherited query arity consulted' unless ObjectSpace._id2ref(argument) == 0 && argument.calls == 1
+raise 'class conversion missing' unless ObjectSpace._id2ref(ClassIdArgument) == 0
+begin
+  ObjectSpace._id2ref(UndefinedClassIdArgument)
+  raise 'singleton undef conversion accepted'
+rescue TypeError => error
+  raise 'singleton undef conversion error changed' unless error.message == 'no implicit conversion of Class into Integer'
+end
 
 no_method = NoIdMethod.new(1)
 raise 'conversion requires Kernel#method' unless ObjectSpace._id2ref(no_method) == 0 && no_method.calls == 1

@@ -6399,3 +6399,24 @@ remain unmerged until current CI and the per-file comparison satisfy the
 stated gate. The next independent work outside stage 9 is VM callback cost,
 conservative frame lifetime and native allocator attribution, with concrete
 test names retained in gc_cases.tsv and KNOWN_GAPS.md.
+
+### Follow-up review: receiver-side undef in checked ID conversion
+
+The next #98 review found that owner metadata alone could see an inherited
+to_int, respond_to_missing? or method_missing past a child's undef marker.
+ObjectSpace.__id_integer now checks undef_blocked from the receiver's full
+lookup start (super_base) before using owner metadata. The same check guards
+the real-method probe and custom respond_to? arity; shared lookup/dispatch
+helpers are unchanged. Corpus 687 covers inherited conversion/hook/query
+undefs, a definition restored below an undef, and class singleton lookup.
+
+Ruby passes the expanded witness; the previous candidate fails its inherited
+undef assertion. The fixed O2 candidate passes witnesses 685–688, all 30
+earlier conversion/exception-context outputs, and the upstream id2ref group
+(25 tests, 54 assertions, no failures, errors or skips). Root/dead/duplicate
+checks pass and bracket depth remains 932/1024. The independent Enumerable
+P2 and whole-file finalizer memory bound remain open; no new exclusion or
+resource-limit change is made.
+
+The final review-fix build also passes 710/710 corpus programs in both
+hash-index modes, all nine RSS cases and the OpenSSL lifetime gate.
