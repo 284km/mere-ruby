@@ -83,6 +83,12 @@ end
 class UndefinedIdQuery < WrongQueryIdArgument
   undef_method :respond_to?
 end
+class ChangingIdLookup < InheritedDecliningIdArgument
+  def respond_to?(*)
+    singleton_class.class_eval { undef_method :to_int }
+    true
+  end
+end
 class ClassIdArgument
   def self.to_int = 1
 end
@@ -101,6 +107,16 @@ end
     raise 'inherited undef conversion accepted'
   rescue TypeError
     raise 'undefined inherited hook called' unless argument.calls == 0
+  end
+end
+[false, true].each do |precreate|
+  argument = ChangingIdLookup.new(1)
+  argument.singleton_class if precreate
+  begin
+    ObjectSpace._id2ref(argument)
+    raise 'query callback retained an obsolete lookup start'
+  rescue TypeError
+    raise 'query mutation bypassed hook refusal' unless argument.calls == 0
   end
 end
 argument = UndefinedIdQueryHook.new(1)
