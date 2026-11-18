@@ -212,5 +212,16 @@ zero regressions, with identical source/dependency pins and reference tallies.
 Multipart gives 85 tests / 239 assertions in both runs, with peaks about
 1.69 and 1.36 GiB. Its earlier MEMORY/RED variation remains recorded; neither
 its cause nor attribution to a specific change is established by these runs.
-The latest snapshot uses the second full run. Cross-platform hosted checks
-must retain this new MATCH under the same bounds before merge.
+The macOS snapshot uses the second full run. Hosted Linux before the audit
+(43989409595) and after it (44248949546) both give 52 MATCH / 9 RED / 1 MEMORY,
+with no per-file regression. Multipart remains MEMORY in both Linux runs.
+Keep separate actual OS baselines and reject cross-platform comparisons;
+retain the macOS 53-MATCH gate and both original Linux observations.
+
+The subsequent rounds 10-11 candidate on the same main 12ca1df2 loses the
+parent's macOS multipart MATCH to MEMORY, both in a full run and a focused
+repeat. The parent's focused run still matches (85 tests / 239 assertions,
+1,450,768 KiB peak). This is a real per-file merge blocker despite equal
+total MATCH counts from a different gained file. Route the producer/reader
+resource investigation to the VM/performance session; no specific VM or GC
+cause is established. Keep the 600-second/2-GiB bounds and parent baseline.

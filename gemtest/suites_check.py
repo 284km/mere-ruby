@@ -51,6 +51,18 @@ class SuiteChecks(unittest.TestCase):
         self.assertEqual(len(errors), 2)
         self.assertTrue(suites.compare([], dict(rows=[row])))
 
+    def test_a_baseline_must_match_the_lock_and_platform(self):
+        row = dict(gem='fixture', file='test.rb', classification='MATCH', reference=self.side(), mere=self.side())
+        result = dict(rows=[row], lock_sha256='locked', platform='Linux')
+        self.assertEqual(suites.baseline_errors(result, result), [])
+        with self.assertRaisesRegex(ValueError, 'platform differs'):
+            suites.baseline_errors(result, dict(result, platform='Darwin'))
+        with self.assertRaisesRegex(ValueError, 'lock differs'):
+            suites.baseline_errors(result, dict(result, lock_sha256='changed'))
+        broken = copy.deepcopy(result)
+        broken['rows'][0]['classification'] = 'MEMORY'
+        self.assertTrue(suites.baseline_errors(broken, result))
+
     def test_untracked_shadow_and_source_mutation_change_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
