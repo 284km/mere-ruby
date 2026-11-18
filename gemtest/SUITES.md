@@ -35,6 +35,9 @@ Hosted Linux run 44288206768 also gives 46 MATCH with all 92 source audits
 complete. `suites_rake_linux_initial.json` preserves that first observation;
 `suites_rake_linux.json` is the strict Linux baseline. The independent Rake
 workflow requires the matching OS baseline on every PR/main/dispatch run.
+The same first hosted run completes macOS at 46 MATCH too; the latest macOS
+snapshot retains this normal-output observation and its zero-regression
+comparison with the preceding complete local baseline.
 
 These gems use their unmodified helper and actual Test::Unit framework,
 with alphabetical order instead of a Minitest seed. Preserve tests,

@@ -6664,3 +6664,10 @@ multipart gate are unchanged. The reviewed parent #107's hosted macOS
 original suite also passes that unchanged gate (54 MATCH / 7 RED / 1 MEMORY,
 multipart 2,037,376 KiB). Keep the failed local candidate as well; the resource
 variation's cause remains unconfirmed.
+
+The first hosted Rake run completes macOS as 46 MATCH too, with all source
+audits and zero per-file regression against the preceding complete local
+baseline. Preserve the original local initial snapshot; the latest macOS
+record now carries this actual hosted observation. Both OS strict jobs still
+need a repeat on the final workflow. No runtime source changed during this
+baseline adoption.
