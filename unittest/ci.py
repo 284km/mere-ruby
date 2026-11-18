@@ -20,6 +20,7 @@ from pathlib import Path
 from process_family import MARKER, ProcessFamily
 import transcript
 import test_data
+import exclusions
 
 ROOT = Path(__file__).resolve().parent.parent
 COUNTS = ("tests", "match", "red", "both", "extra")
@@ -326,6 +327,7 @@ def run_shard(args):
                   binary_sha256=build["binary_sha256"],
                   reference_sha256=digest(os.environ["REF_RUBY_BIN"]),
                   environment_policy="per-side-path-ruby-v6",
+                  exclusions_policy="upstream-excludes-gc-v1",
                   test_data=data, rust_toolchain=rust_info(),
                   case_policy=transcript.POLICY,
                   bounds=dict(wall_per_side=args.wall, rss_family_kb=args.rss_kb,
@@ -391,6 +393,17 @@ def run_shard(args):
                         parsed = transcript.load(snapshot)
                         row[side + '_summary'] = parsed['summary']
                         row[side + '_parse_issues'] = parsed['issues']
+                try:
+                    excluded = exclusions.compare(work / str(index))
+                except ValueError:
+                    if not run.get('limit'):
+                        raise
+                    # A resource stop can precede suite discovery. Preserve
+                    # cases and explicitly report that the audit is unknown.
+                    row['exclusion_audit'] = 'INCOMPLETE'
+                else:
+                    row['excluded'] = len(excluded)
+                    row['exclusions'] = excluded
             except Exception as error:
                 row.update(ref_state="INFRA_ERROR", mere_state="INFRA_ERROR", error=type(error).__name__)
                 infra_error = True
@@ -450,6 +463,7 @@ def merge(args):
     bounds = set()
     environment_policies = set()
     case_policies = set()
+    exclusion_policies = set()
     test_inputs = set()
     errors = []
     for path in sorted(args.input.rglob("result.json")):
@@ -479,6 +493,12 @@ def merge(args):
             bounds.add(json.dumps(result["bounds"], sort_keys=True))
             environment_policies.add(result.get("environment_policy", "legacy-inherited"))
             case_policies.add(result.get('case_policy', 'legacy-awk'))
+            exclusion_policies.add(result.get('exclusions_policy', 'legacy-none'))
+            for row in result['rows']:
+                entries = row.get('exclusions', {})
+                if (not isinstance(entries, dict) or row.get('excluded', 0) != len(entries)
+                        or any(not isinstance(k, str) or not isinstance(v, str) or not v for k, v in entries.items())):
+                    raise ValueError('invalid exclusion counts or reasons')
             test_inputs.add(json.dumps(dict(test_data=result.get('test_data'),
                                             rust_toolchain=result.get('rust_toolchain')), sort_keys=True))
             if result.get("infrastructure_error"):
@@ -496,6 +516,8 @@ def merge(args):
         errors.append("Different environment policies were measured")
     if len(case_policies) > 1:
         errors.append('Different case parsing policies were measured')
+    if len(exclusion_policies) > 1:
+        errors.append('Different exclusion policies were measured')
     if len(test_inputs) > 1:
         errors.append('Different test data or Rust toolchains were measured')
     conditions = {}
@@ -519,6 +541,7 @@ def merge(args):
             if condition is None:
                 unclassified.append(file)
     totals = {key: sum(row.get(key) or 0 for row in rows.values()) for key in COUNTS}
+    excluded_tests = sum(row.get('excluded', 0) for row in rows.values())
     incomplete = sum(row["ref_state"] != "COMPLETE" or row["mere_state"] != "COMPLETE" for row in rows.values())
     missing = sum(row["ref_state"] in ("MISSING_SHARD", "NOT_RUN", "INFRA_ERROR")
                   and row["mere_state"] in ("MISSING_SHARD", "NOT_RUN", "INFRA_ERROR") for row in rows.values())
@@ -529,6 +552,8 @@ def merge(args):
                    ruby_ref=manifest["ruby_ref"], expected_files=len(expected),
                    received_shards=len(shards), expected_shards=manifest["shards"],
                    incomplete_files=incomplete, missing_files=missing, totals=totals,
+                   excluded_tests=excluded_tests, exclusion_policies=sorted(exclusion_policies),
+                   incomplete_exclusion_audits=sum(row.get('exclusion_audit') == 'INCOMPLETE' for row in rows.values()),
                    ref_states=dict(Counter(row["ref_state"] for row in rows.values())),
                    ref_zero_conditions=dict(zero_conditions), ref_zero_unclassified=unclassified,
                    mere_states=dict(Counter(row["mere_state"] for row in rows.values())),
@@ -549,15 +574,22 @@ def merge(args):
                                               mere_ref=manifest['mere_ref'], ruby_ref=manifest['ruby_ref'],
                                               seconds=seconds))
     args.output.mkdir(parents=True, exist_ok=True)
-    fields = ["file", *COUNTS, *COVERAGE, 'ref_zero_condition', 'ref_zero_needed']
+    fields = ["file", *COUNTS, *COVERAGE, 'ref_zero_condition', 'ref_zero_needed', 'excluded']
     with (args.output / "files.tsv").open("w", newline="") as file:
         writer = csv.DictWriter(file, fields, delimiter="\t", lineterminator="\n", extrasaction="ignore")
         writer.writeheader(); writer.writerows(rows.values())
+    with (args.output / 'exclusions.tsv').open('w', newline='') as file:
+        writer = csv.writer(file, delimiter='\t', lineterminator='\n')
+        writer.writerow(['file', 'test', 'reason'])
+        for name, row in rows.items():
+            writer.writerows((name, test, reason) for test, reason in sorted(row.get('exclusions', {}).items()))
     lines = ["# CRuby test measurement", "",
              f"Files: {len(expected)} planned; {missing} missing; {incomplete} incomplete or zero-test.",
              f"Shards: {len(shards)}/{manifest['shards']} received.", "",
              "| named tests | MATCH | RED | BOTH | EXTRA |", "|---:|---:|---:|---:|---:|",
              "| " + " | ".join(str(totals[key]) for key in COUNTS) + " |", "",
+             f"Excluded tests (identical on both interpreters): {excluded_tests}. See exclusions.tsv.", "",
+             f"Incomplete exclusion audits: {summary['incomplete_exclusion_audits']} files.", "",
              "Counts cover named tests only. Zero-test and incomplete files remain in files.tsv.",
              "Collected results do not mean Ruby conformance: RED, BOTH, EXTRA and file coverage need review.", "",
              f"mere-ruby source: `{manifest['source_ref']}`", f"Mere compiler: `{manifest['mere_ref']}`",

@@ -1,5 +1,13 @@
 # mere-ruby — CRuby's own tests
 
+GC exclusions configured by the independent stage 9 GC work: **41 tests**
+(19 GC and 22 compaction), applied identically to both interpreters and
+reported separately from MATCH/RED/BOTH/EXTRA. The historical table below
+predates this ledger; the next complete CI report supplies measured totals.
+Allocation comparisons remain enabled. ObjectSpace's separate exclusions
+remain part of PR #91.
+
+
 CRuby's test/ files at the reference's release, run under mere-ruby and under
 ruby 4.0.9 test by test (`unittest/run.sh`). A second yardstick beside
 SPEC_STATUS.md: ruby/spec asks what the language and core classes do; these are the
