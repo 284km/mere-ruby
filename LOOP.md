@@ -6077,3 +6077,11 @@ Enumerable 89 MATCH and Object 65 MATCH under the unchanged CI supervisor.
 The 10-second Enumerable subprocess remains enabled. All nine RSS cases pass;
 actual bracket depth is 933/1024, so the stale 923 search seed is corrected
 to that measured value. No top-level definition is added.
+
+
+The second independent round ports ObjectSpace.__store_counts and the
+count_objects prelude from #94. Actual String survivors/new handles and
+Proc/Binding store lengths contribute to T_STRING, T_DATA and TOTAL. Corpus
+674 retains 1,000 ordinary Strings, 1,000 empty Strings and 200 Procs plus
+200 Bindings, checking real count deltas, totals and held identities. The
+base enumeration implementation is unchanged; no exclusion or limit changes.

@@ -4578,3 +4578,9 @@ changes made by a custom respond_to? callback. Resolving one ID reads native
 identity metadata instead of calling unrelated objects' object_id overrides.
 The broader enumeration/GC work remains tracked by PR #91; this independent
 change preserves the base ObjectSpace enumeration implementation.
+
+ObjectSpace.count_objects also counts live String slots (including empty
+Strings) and retained Proc/Binding stores in T_DATA/TOTAL (corpus 674). The
+String count comes from actual sweep survivors plus new handles; issued
+handles for reclaimed slots do not count. This measurement does not require
+additional collection or the broader enumeration implementation.
