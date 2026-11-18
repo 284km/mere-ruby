@@ -14,8 +14,11 @@ power_assert 3.1.0 archives. It uses the same restore/measure commands with
 Keep the original 62-file lock and both original OS baselines unchanged.
 The first audited macOS record is 6 MATCH / 1 RED, preserved in
 `suites_additional_initial.json`; `suites_additional_latest.json` is its
-strict macOS baseline. Initial hosted Linux measurement is pending; its
-baseline must come from that actual environment before the PR is ready.
+strict macOS baseline. Hosted Linux run 44269323039 also reports 6 MATCH /
+1 RED, with all seven reference files healthy and both sides audited.
+`suites_additional_linux_initial.json` preserves that first observation;
+`suites_additional_linux.json` is the strict Linux baseline. The separate
+additional CI jobs now enforce their own OS's baseline under the same caps.
 
 These gems use their unmodified helper and actual Test::Unit framework,
 with alphabetical order instead of a Minitest seed. Preserve tests,

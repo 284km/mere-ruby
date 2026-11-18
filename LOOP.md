@@ -6577,3 +6577,10 @@ bound; Method's compaction case is the existing skip. Both new witnesses
 also match with GC.stress under the same family bounds. The emitted C needs
 933/1024, verified with the 933 positive / 932 negative syntax checks. Only
 the search seed changes; m_state/main top-level let counts remain 1167/136.
+
+Initial hosted additional Linux run 44269323039 (source 5e73b774) gives
+6 MATCH / 1 RED, with all seven reference files healthy and both sides
+audited. Preserve its initial observation and enforce the measured Linux
+baseline; macOS retains its separate initial six MATCH files. The additional
+workflow now requires the matching OS snapshot on every PR/main/dispatch
+measurement. The original multipart gate remains unsatisfied and unchanged.
