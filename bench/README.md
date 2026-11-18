@@ -24,6 +24,8 @@ source (`12ca1df2`) and `tools/build.sh` O2 flags were built with control Mere
 `68519ed1744a05088d08dd18019ce34b6e7feb01`. The compiler change updates the
 coroutine scanner's sorted live-block snapshot from a bounded local change log,
 falling back to a full rebuild for overflow or shared-list changes.
+CI pins `40761fb8405eb3b12e70bd14bd72871332f008c0`, which adds gate registration
+and its controls to that measured candidate; compiler/runtime sources are identical.
 
 Three fresh processes per count and compiler alternated control/candidate.
 Wall time includes startup; peak RSS is from macOS `/usr/bin/time -l`.
