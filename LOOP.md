@@ -6525,3 +6525,11 @@ resource investigation to VM/performance without assuming a GC cause.
 The separate rounds 8-9 Linux runtime failure is the documented
 complemented-method-entry leak test timing out at 10.05 seconds. Its full
 log is archived; retry that job when GitHub allows it.
+
+
+Audited rounds 12-13 on main 12ca1df2, O2 source e32d84fd: 53 MATCH /
+7 RED / 0 BOTH / 0 TIMEOUT / 2 MEMORY. All 62 reference files and 60 Mere
+files finish their source audits; two Mere processes reach the RSS cap.
+Keep the nonempty multipart MATCH-to-MEMORY regression in the unadopted
+suites_candidate.json. The parent's macOS 53-MATCH baseline remains the
+merge gate. The source/dependency inventory and resource bounds are unchanged.
