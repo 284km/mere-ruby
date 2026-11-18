@@ -72,3 +72,21 @@ end
 another = AnotherHash.new
 another[:value] = 42
 p another[:value]
+
+class NativeErrorBoundary < StandardError
+  def to_s
+    super
+  end
+end
+module NativeNumberBoundary
+  def to_s
+    super
+  end
+end
+Integer.prepend NativeNumberBoundary
+Float.prepend NativeNumberBoundary
+class Object
+  undef_method :to_s
+end
+p NativeErrorBoundary.new('native exception').to_s
+p [7.to_s, 1.5.to_s]
