@@ -6053,3 +6053,27 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+
+## 2026-11-18: stage 9, ship checked ID lookup independently
+
+The GC/ObjectSpace stack has an open Enumerable timeout finding. Its checked
+ID lookup can be reviewed independently against main 12ca1df2: this change
+ports ObjectSpace.__id_integer, live __val_of_id/__str_of_id lookup and the
+_id2ref prelude only. A small __id_value arm reads native identity for the
+fallback search, avoiding a dependency on the stack's heap dump metadata.
+Corpora 687/688 are copied unchanged from the reviewed stack, including all
+four conversion review controls. No additional corpus number is consumed.
+
+The base __objects/each_object and count_objects implementations are kept.
+There are no new exclusions, top-level values, collector-body changes or
+independent edits to shared VM/dispatch helpers, m_state, Prism, C API or
+gemtest. The full 157-test intake remains 12 honest implementation matches,
+57 reasoned exclusions and 88 named handoffs in the parent inventory. This
+port does not count the same fixes a second time.
+
+O2 verification of the independent port retains core ObjectSpace 37 MATCH,
+Enumerable 89 MATCH and Object 65 MATCH under the unchanged CI supervisor.
+The 10-second Enumerable subprocess remains enabled. All nine RSS cases pass;
+actual bracket depth is 933/1024, so the stale 923 search seed is corrected
+to that measured value. No top-level definition is added.

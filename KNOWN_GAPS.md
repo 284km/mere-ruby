@@ -4569,3 +4569,12 @@ bound is computed by walking it, so it does not return (ruby answers
 Float::INFINITY). CRuby's test_enumerator (test_size_for_downup_to) hangs
 there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
+
+
+ObjectSpace._id2ref uses checked native integer conversion and actual live
+object, Proc, Binding and String handles (corpus 687/688). It respects private
+methods, missing-method proxies, receiver-side undef markers and lookup
+changes made by a custom respond_to? callback. Resolving one ID reads native
+identity metadata instead of calling unrelated objects' object_id overrides.
+The broader enumeration/GC work remains tracked by PR #91; this independent
+change preserves the base ObjectSpace enumeration implementation.
