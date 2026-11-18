@@ -9,9 +9,11 @@ Additional pinned suites: Matrix has 2 MATCH files; Logger has 4 MATCH and
 1 RED. Primitive super now stops at Hash/Array/String/Proc's actual native
 ancestor before a Ruby method farther up the chain. The actual Test::Unit
 Fixture observer registration therefore works in separated children. The
-common method-copy path also records both names in the existing alias state,
-so replacing an alias_method or define_method(Method) copy suppresses its
-first redefinition warning, while the next ordinary replacement warns.
+common method-copy path records real alias/Method-copy sharing as a private
+flag in the existing owned method-source row. Replacing such a copy suppresses
+its first redefinition warning; the next ordinary replacement warns. Clone
+and refinement-import copies retain ordinary warnings. Anonymous owners carry
+no new global warning-map entries; their flag has their method row's lifetime.
 Witnesses 701 and 702; no new top-level let or collector change.
 
 Logger's remaining test_logdevice failure compares a rotated open File with
