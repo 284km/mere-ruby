@@ -296,3 +296,12 @@ Multipart completes all 85 tests / 239 assertions with both source audits,
 at 2,037,376 KiB peak. The source of the local/hosted resource variation is
 still unconfirmed. Keep the stronger stored baseline, the failed local
 candidate and the successful hosted observation; neither erases the other.
+The subsequent strict rounds 19-21 macOS run 44292334030 again loses multipart
+to MEMORY. Keep that failure alongside #107's preceding successful hosted
+observation. The cause of this variation remains open. Separately, strict
+Linux run 44292334299 fails the new Method-copy lifetime check at 2.086x.
+copy_meth_src now publishes each destination's location/flags once and avoids
+rewriting an already-shared source. Paired unmodified controls lower peak RSS
+on macOS and Linux/aarch64; their raw series and the failed hosted x86-64
+observation are retained in method_copy_lifetime_latest.json. The unchanged
+2x check and final hosted result remain merge gates.
