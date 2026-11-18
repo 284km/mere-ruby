@@ -2,10 +2,11 @@
 
 ## Stage 9: alternate collector policy and remaining GC observations
 
-Integrated main 3eb24fef (#86, #89 and #101). The last complete successful
-main measurement, CI 44030304378 at 392bf810, has 157 target RED across
-allocation, objspace, gc, gc_compact and string_memory. The later main CI
-at e40bb486 has only five of eight shards; it is not a full baseline.
+Integrated main 12ca1df2 (#86, #89, #101 and #102). The last complete
+successful main measurement, CI 44196635193 at 3eb24fef, has 157 target RED
+across allocation, objspace, gc, gc_compact and string_memory. It measures
+33,313 MATCH, 1,101 RED, 132 BOTH and 21 EXTRA across 758 files, with 49
+incomplete/zero-test files. The #102 main CI has not completed.
 The original 159-case inventory
 retains two finalizer cases now passing on main after #87; they are not new
 stage 9 gains. `unittest/excludes-gc/` records
@@ -59,12 +60,20 @@ counts or an exclusion. Witnesses 674 and 686 cover the actual store APIs.
 The full-file comparison also exposed an Enumerable timeout from repeatedly
 enumerating Arrays. Native snapshot iteration now filters candidates before
 yielding, avoids temporary Ruby snapshot Arrays, and scopes its buffers and
-callback turns. Candidates are rooted in the existing method frame, with
-normal/exception cleanup; the standard builtin frame bounds callback
-watermarks. Scoped vectors replace indexed snapshot maps, reuse pin keys,
-and preserve the actual candidate set. Exact builtin value filters avoid
-walking unrelated class metadata. Witness 685 covers collection, nested
-enumeration, control flow and Fiber suspension.
+callback turns. Only the current value is rooted in the existing frame;
+unvisited snapshot candidates remain collectible, with real store presence
+checked before yielding, as MMTk's iterator does. Bulk pinning formerly kept
+all 1,001 objects alive in a GC-during-callback control; the new build retains
+about 120 and Ruby retains three. No collection is forced. Scoped vectors
+preserve snapshot identities, and exact builtin filters use their store's
+known base type. Subclass/module filters use the complete singleton tag,
+which includes modules extended onto Array/Hash values. Witness 685 covers
+these filters, collection, nested enumeration, control flow and suspension.
+
+Dump class facts come from native superclass/singleton metadata. This avoids
+calling unsupported reflective methods on Module-subclass wrappers or the
+superclass reader of an uninitialized Class. Corpus 670 covers both; the
+upstream Ractor dump and singleton dump pass on the #102 integration.
 
 TestEnumerable#test_reverse_each_memory_corruption in ruby/test_enum.rb
 still exceeds ten seconds after #101.

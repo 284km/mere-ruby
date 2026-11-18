@@ -20,6 +20,12 @@ module SnapshotMarker; end
 class SnapshotText < String
   include SnapshotMarker
 end
+class SnapshotArray < Array
+  include SnapshotMarker
+end
+class SnapshotHash < Hash
+  include SnapshotMarker
+end
 marked_class = Class.new
 marked_class.extend(SnapshotMarker)
 def marked_class.kind_of?(*) = false
@@ -40,6 +46,20 @@ end
 marked = ObjectSpace.each_object(SnapshotMarker).to_a
 raise 'String subclass module omitted' unless marked.any? { |o| o.equal?(text) }
 raise 'extended class module omitted' unless marked.any? { |o| o.equal?(marked_class) }
+[[Array, SnapshotArray], [Hash, SnapshotHash]].each do |base, child|
+  value = child.new
+  [base, child, SnapshotMarker].each do |filter|
+    raise 'value-store ancestry filter changed' unless ObjectSpace.each_object(filter).any? { |o| o.equal?(value) }
+  end
+end
+[Array, Hash].each do |base|
+  child = Class.new(base)
+  value = child.new
+  value.extend(SnapshotMarker)
+  [base, child, SnapshotMarker].each do |filter|
+    raise 'singleton-tagged ancestry filter changed' unless ObjectSpace.each_object(filter).any? { |o| o.equal?(value) }
+  end
+end
 group = Array.new(8) { [] }
 ids = group.map(&:object_id)
 seen = []
@@ -86,6 +106,28 @@ end
 raise 'iteration did not suspend' unless fiber.resume == :paused
 GC.start
 raise 'suspended iteration lost its state' unless fiber.resume == :resumed
+ephemeral_class = Class.new
+held_candidate = ephemeral_class.new
+previous_disabled = GC.disable
+begin
+  1000.times { ephemeral_class.new }
+  visited = 0
+  held_seen = false
+  returned = ObjectSpace.each_object(ephemeral_class) do |object|
+    visited += 1
+    held_seen ||= object.equal?(held_candidate)
+    if visited == 1
+      GC.enable
+      GC.start
+      raise 'current candidate collected in its callback' unless ephemeral_class === object
+    end
+  end
+  raise 'enumeration retained every unheld candidate' unless visited < 1001
+  raise 'held candidate lost after collection' unless held_seen
+  raise 'live iteration count disagrees' unless returned == visited
+ensure
+  previous_disabled ? GC.disable : GC.enable
+end
 def ObjectSpace.each_object(*) = :overridden
 raise 'user override ignored' unless ObjectSpace.each_object == :overridden
 puts 'ObjectSpace filters real classes and value stores before yielding'
