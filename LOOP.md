@@ -6569,3 +6569,11 @@ Logger's remaining rotated-File identical? case needs its retained fstat
 result. A /dev/fd path trial failed and was reverted; its shared native
 dispatch branch stays untouched. A paired pre-existing undef under a
 prepended Hash wrapper likewise remains recorded, not claimed as fixed.
+
+Focused original core files retain both baselines: Super 50 MATCH, Module
+195 MATCH, Method 97 MATCH / 1 RED, Hash 297 MATCH / 1 RED / 8 BOTH. Hash's
+remaining replace-memory-leak case reaches its existing 10-second child
+bound; Method's compaction case is the existing skip. Both new witnesses
+also match with GC.stress under the same family bounds. The emitted C needs
+933/1024, verified with the 933 positive / 932 negative syntax checks. Only
+the search seed changes; m_state/main top-level let counts remain 1167/136.
