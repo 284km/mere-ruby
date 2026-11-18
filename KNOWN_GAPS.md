@@ -61,7 +61,7 @@ all 1,001 objects alive in a GC-during-callback control; the new build retains
 about 120 and Ruby retains three. No collection is forced. Scoped vectors
 preserve snapshot identities, and exact builtin filters use their store's
 known base type. Subclass/module filters use the complete singleton tag,
-which includes modules extended onto Array/Hash values. Witness 701 covers
+which includes modules extended onto Array/Hash values. Witness 710 covers
 these filters, collection, nested enumeration, control flow and suspension.
 
 Dump class facts come from native superclass/singleton metadata. This avoids
