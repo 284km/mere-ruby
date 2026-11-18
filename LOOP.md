@@ -6671,3 +6671,36 @@ baseline. Preserve the original local initial snapshot; the latest macOS
 record now carries this actual hosted observation. Both OS strict jobs still
 need a repeat on the final workflow. No runtime source changed during this
 baseline adoption.
+
+## Gem round 22: publish copied method metadata once at unchanged lifetime bounds
+
+The first strict rounds 19-21 Linux check really fails the unchanged
+Method-copy lifetime control: post-GC peak/start 2.086 in run 44292334299,
+under the 600-second/2-GiB outer caps. Preserve its actual RSS series in
+method_copy_lifetime_latest.json. Do not relabel this as a timeout or silently
+retry a failure whose cause has not been established.
+
+copy_meth_src now publishes the copied source location and sharing flag in
+one existing method-source row update, retaining the destination end position
+and endless bit. An already-shared source is not rewritten per destination.
+No collector, VM or shared native dispatcher edit, and no new top-level let.
+A borrowed-operation-name trial did not improve the paired observation
+(1.780 versus 1.712 on macOS) and was rejected. An intermediate no-op flag
+check alone also left Linux near the bound (1.975).
+
+Paired O2 observations with the same unmodified control: macOS peak RSS
+179,568 to 157,856 KiB, post-GC ratios 1.712 to 1.695; offline Linux/aarch64
+199,568 to 173,416 KiB, ratios 1.980 to 1.908. The Linux container is not the
+hosted x86-64 runner; final hosted proof remains pending. Every collected
+prefix still uses the default 2x bound; no warm-up, workload or limit changes.
+Normal and GC.stress warning outputs in 702 match the reference. Corpus
+719/719 and bracket depth 933/1024. Module's complemented-method test first
+fails its known 2x RSS check at 2.0078; the complete isolated rerun retains
+195 tests / 1,240 assertions with no failures at unchanged bounds. Keep both
+observations. The additional suites retain strict 6 MATCH / 1 RED.
+
+The original batch retains 53 MATCH / 7 RED / 2 MEMORY and every paired
+actual parent outcome. Its candidate still records multipart's loss against
+the stronger stored macOS baseline and is not adopted. The latest strict
+rounds 19-21 macOS run also loses that file; the preceding successful hosted
+observation does not erase the failed run or identify the resource cause.
