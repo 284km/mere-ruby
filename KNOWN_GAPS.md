@@ -4569,3 +4569,11 @@ bound is computed by walking it, so it does not return (ruby answers
 Float::INFINITY). CRuby's test_enumerator (test_size_for_downup_to) hangs
 there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
+
+
+The independent stage 9 GC work records actual collection causes, weak-map
+observations and process CPU profiling records. Unsupported compaction APIs
+raise NotImplementedError and report respond_to? false. INTERNAL_CONSTANTS
+contains no invented slot/heap values; stat_heap exposes no nonexistent pools.
+The 41 default-GC cases are explicitly excluded on both interpreters and
+counted separately. ObjectSpace enumeration remains tracked by PR #91.

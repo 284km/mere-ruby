@@ -6053,3 +6053,25 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+
+## 2026-11-18: stage 9, ship GC measurements independently
+
+Extract the GC-specific part of #91 against main 12ca1df2, preserving the
+base ObjectSpace enumeration and VM/AST/C API code. gc_collect_any wraps
+actual collections with CPU profiling and weak-map observations; its
+ObjectSpace observation cleanup is left with #91. No collector marking or
+sweeping function is independently changed. Startup CPU epoch and portable
+CPU-clock/browser bindings retain the three addressed review corrections.
+
+GC APIs expose real observations and unsupported compaction consistently.
+The upstream exclusion mechanism and symmetric audit/reporting cover only
+19 GC and 22 compaction cases in this branch; ObjectSpace's 16 exclusions
+stay with #91. Corpus 711 tests GC measurements/capabilities; existing 673
+checks delayed enablement, clear/re-enable and CPU-versus-sleep accounting.
+No new top-level value or resource-limit changes.
+
+Fresh Wasm emission also exposed an existing missing mr_utimens/mr_stat_times host imports.
+The HTML host now returns its guest wrapper's declared -2/empty-string unavailable
+sentinels, preserving startup without claiming timestamp support. The native
+File/C API implementation is unchanged.
