@@ -6255,3 +6255,30 @@ fallen back, 0 different; vm_check 245 / 245; gates; the Module check
 COMPLETE; under both executions, the previous build against this one:
 test_exception, test_rubyoptions, test_flip, test_super, test_method,
 test_object, test_class the same counts.
+
+## 2026-11-19 (86): test_complemented_method_entry_memory_leak -- what a collection costs, and why the floor stays
+
+**The point.** The test has timed out at 10.03-10.04 s on slow runners
+(main's CI, PR #95's, the VM-default measuring branch's). Measured here, on
+its own program (the test's block, 100,000 turns after 1,000):
+
+- It is linear: 50,000 / 100,000 / 200,000 turns take 0.97 / 1.82 / 3.52 s,
+  about 18 µs a turn (ruby 5.7). Nothing grows per collection.
+- Of the time, collecting is 36%; the rest is making the classes and the
+  refinement, spread over the native declaration paths with no function
+  above a few percent. A collection is about 9 ms: the class tables' sweep
+  is near half (68 tables walked, each key's owner read from its text; a
+  turn leaves 21 rows -- methods 3 x 4 tables, modules 2, supers 2, the
+  refinement's 3, privates, mro_external), the stack's native candidates
+  about a third, the fixpoint the rest.
+- The native candidates were 42,000 a collection, most of them the same
+  `Class#name` key from meths_g, meth_src, meth_cref and meth_cvcls; they
+  are taken once now (30,000). The time did not move outside the noise.
+- The class-time floor (knob 14, 4,000 entries) is load-bearing for this
+  very test: at 8,000 its RSS ratio was 2.18 and at 16,000 2.50, against
+  the bound of 2.0, and the time did not fall (1.74-1.98 s against 1.75-1.82
+  for 100,000 turns). It stays.
+
+What is left would be structure: rows a class keeps a record of, so the
+sweep need not read every key's text, or fewer rows a refinement. Until
+then the test stays in Known noise (rerun the job).
