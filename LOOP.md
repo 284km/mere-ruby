@@ -6458,3 +6458,44 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+## 2026-11-18: stage 9 follow-up, collectible snapshots and native dump facts
+
+Main 12ca1df2 (#102) is imported unchanged. The complete main CI for
+3eb24fef (44196635193) measures 33,313 MATCH, 1,101 RED, 132 BOTH, 21 EXTRA,
+49 incomplete/zero-test files and the same 157 target RED. The 12/57/88
+inventory is unchanged. The older #94 CI now has all eight shards: 33,322
+MATCH, 1,034 RED, 131 BOTH, 23 EXTRA, 49 incomplete files and 57 exclusions.
+Its Ractor dump failure is a real Module wrapper error, not timing noise.
+
+ObjectSpace's public snapshot kept every candidate rooted through callbacks,
+unlike MMTk's each_object, which rechecks actual presence. It now roots only
+the current value in the existing frame and skips candidates collected by
+an earlier callback. A control creates 1,001 instances and collects inside
+the first callback: the old build keeps all 1,001, Ruby keeps three, and the
+new conservative collector keeps about 120. Held values and callback counts
+remain correct. No additional collection, root definition or threshold is
+introduced. Corpus 685 adds this differential regression.
+
+Exact builtin filters avoid dispatch-class/ancestry lookup for a value whose
+store already proves its base type. Other filters read the full hng_store
+singleton tag. dispatch_cls_of deliberately strips singleton tags, so using
+it had omitted extended Array/Hash values from module and subclass filters.
+The expanded 685 reproduces this omission on the old build and covers named
+subclasses and singleton-tagged ancestry as well as the existing GC/Fiber
+and block-control cases.
+
+ObjectSpace.__dump_one also called singleton_class? on Module-subclass
+wrappers and superclass on uninitialized Classes. Native __dump_class_info
+reads the actual superclass table and singleton representation. Corpus 670
+now covers both forms, with no guessed fields. The upstream Ractor dump
+and singleton dump pass: two tests, nine assertions, no skips; the Ractor
+case takes 7.33 seconds under its unchanged bound.
+
+The ten-second Enumerable test still times out. A diagnostic of its exact
+child program, with the runner's loaded libraries and without adding code
+to that program, takes 17.67 seconds on the current-value-root candidate.
+That diagnostic is not an upstream pass. Sampling shows shared block frames,
+local lookup, hashing and primitive dispatch on the path; those helpers are
+unchanged. Full validation of the final combined candidate follows before
+publication. No ISeq/AST/m_state/collector-body or gemtest edits are added.
