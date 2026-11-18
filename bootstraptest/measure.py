@@ -142,10 +142,13 @@ def measure(args):
         raise ValueError('measurement binary digest mismatch')
     result = dict(schema=1, policy=POLICY, shard=args.shard, manifest=manifest, build=build,
                   harness=dict(measure_sha256=ci.digest(Path(__file__)), audit_sha256=ci.digest(ROOT / 'bootstraptest/audit_runner.rb'),
+                               runtime_load_path_sha256=ci.digest(ROOT / 'tools/runtime_load_path.sh'),
                                child_launcher_sha256=ci.digest(ROOT / 'unittest/child-bin/ruby')),
                   reference=reference, wall_seconds=args.wall, rss_kb=args.rss_kb, rows=[], infrastructure_error=None)
     ci.save(args.output / 'result.json', result)
     os.environ['REF_RUBY_BIN'] = str(args.reference.resolve())
+    runtime = subprocess.check_output(['sh', str(ROOT / 'tools/runtime_load_path.sh'), str(args.binary.resolve())],
+                                      text=True, timeout=20)
     try:
         for index, file in enumerate(manifest['files']):
             if index % manifest['shards'] != args.shard:
@@ -169,7 +172,7 @@ def measure(args):
                     skips = work / 'skips'; skips.mkdir()
                     ledger = work / 'cases.jsonl'
                     launcher = work / 'target.sh'
-                    child_libraries = env['RUBYLIB'] if side == 'reference' else str(args.ruby_src.resolve() / 'lib') + os.pathsep + stdlib
+                    child_libraries = env['RUBYLIB'] if side == 'reference' else runtime + os.pathsep + str(args.ruby_src.resolve() / 'lib') + os.pathsep + stdlib
                     launcher.write_text('#!/bin/sh\nexport RUBYLIB=' + shlex.quote(child_libraries)
                                         + '\nexport UNITTEST_CHILD_RUBY=' + shlex.quote(str(binary.resolve()))
                                         + '\nexport PATH=' + shlex.quote(str(ROOT / 'unittest/child-bin')) + ':"$PATH"'

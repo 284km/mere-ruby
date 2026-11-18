@@ -51,6 +51,8 @@ def run_side(source, reference, binary, private, output, version, wall, rss_kb, 
             libraries.insert(0, extension)
     else:
         libraries.append(str(ROOT / 'unittest/shim'))
+        libraries += subprocess.check_output(['sh', str(ROOT / 'tools/runtime_load_path.sh'), str(binary)],
+                                              text=True, timeout=20).split(os.pathsep)
         # Only the Mere side needs explicit pure Ruby standard/default gems.
         libraries += subprocess.check_output([
             str(reference), '-e',
