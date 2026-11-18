@@ -6053,3 +6053,58 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+## 2026-11-18 (83): the VM's own steps -- an Integer operator on locals in one step, and a frame's body without two turns of marks
+
+**The point.** After (81) the VM was 1.13x the evaluator on fib and 1.16x on
+a block that adds to a local. Profiled side by side, the call machinery the
+two share cost the same; the VM's own instructions -- vm_step, the stack's
+pushes and their copies into its arena, vm_run_stmt, vm_loop, vm_exec -- were
+about 300 samples where the evaluator's walk of the same expressions was
+about 130. Four things cut it:
+
+- **three instructions in one step.** A getlocal, then a getlocal or an
+  Integer putobject, then a plain Integer operator (`n < 2`, `n - 1`, `s + x`)
+  is marked when the program is loaded (vm_fuse_mark, in the getlocal's ib,
+  which a getlocal does not use) when nothing jumps to the second or the
+  third and no event is on them. vm_step answers the three at once when both
+  values are Integers, no TracePoint wants the call and no Integer operator
+  is redefined -- the conditions of its own Integer path -- and otherwise
+  runs the getlocal as itself. A branchif / branchunless after them is taken
+  in the same step without pushing the answer (`n < 2 ?`, `while i < n`), and
+  so is a setlocal, with or without a dup before it (`s += x`).
+- **the operand read without a closure.** The first version read the two
+  operands through a closure made at every step: a tenth of the step.
+  vm_fz_rd is a function of its own.
+- **a frame's body of marks.** A method's, a class body's and a block's body
+  on the VM is three statements -- its line, its file, the program -- and
+  run_stmts_result gave each a turn (the statement's bookkeeping, another
+  thread's turn, a signal). Those three in that shape are now one turn
+  (vm_body_run), with fb_wm_stmt and the polls the program's statement had.
+- **vm_exec's closures.** Five closures were made for each frame (the run,
+  the copy-out, the giving back, the try's two); the run and the giving back
+  are functions now (vm_exec_run, vm_pool_give), the copy-out written in.
+
+Corpus 693 is the witness: fib, past a Fixnum into a Bignum, a Float, a
+String and nil where an Integer would be, while / until / a ternary on a
+comparison, a block's `+=` of a local one and two frames out as a value and
+as a statement, an optional parameter read before its default ran, a
+TracePoint's c_call on `+`, a refinement of Integer#-, and Integer#+
+redefined part-way through -- the same on ruby 4.0.9, the evaluator and the
+VM.
+
+Measured (local, the least of 7 runs each, interleaved): fib(24) on the VM
+0.189 s -> 0.174 s (the evaluator 0.165, 1.05x); `(1..200_000).to_a.each { |x|
+s += x }` 0.169 -> 0.156 (0.148, 1.05x); 200,000 calls of a two-argument
+method in a while loop 0.532 -> 0.493 (0.566, 0.87x). Over 2,000,000 elements
+three times the block is 1.025x (6.62 s against 6.46). What is left on fib
+and the block is the frame's entry (the pool slot, the 16 registers cleared,
+try_or) and the per-instruction stack, which a call still pays once each.
+
+Checked (local): corpus 704 / 704 on the evaluator; under MERE_RUBY_VM=1 694
+on the VM, 10 fallen back, 0 different; vm_check 245 / 245; gates; the Module
+check COMPLETE. Under MERE_RUBY_VM=1, the previous build against this one:
+test_optimization, test_proc, test_iterator, test_method, test_integer,
+test_fixnum, test_range, test_array, test_hash and test_enumerator the same
+counts. The bracket depth needed went 923 -> 933 (BRACKET_SEED; 91 to spare
+under 1024).

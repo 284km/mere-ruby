@@ -60486,6 +60486,11 @@ and exec_stmt_region_result = fn env -> fn world -> fn blk -> fn (s: Stmt) -> fn
     }
 and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
   run_stmts_result env world blk prog false
+and vm_body_run = fn env -> fn world -> fn blk -> fn (id: int) -> fn (gen: int) ->
+  let _ = fb_wm_stmt () in
+  let _ = (if map_len sch_live > 1 then sch_tick world else ()) in
+  let _ = (if map_len sig_armed > 0 then sig_poll env world else ()) in
+  vm_enter env world blk id gen
 and run_stmts_result = fn env -> fn world -> fn blk -> fn (prog: Stmt list) -> fn (discard_result: bool) ->
   match prog with
   | Nil -> FNext VNil
@@ -60498,6 +60503,16 @@ and run_stmts_result = fn env -> fn world -> fn blk -> fn (prog: Stmt list) -> f
        | Cons (x, r) -> join9 r (if str_eq acc "" then x else acc ++ chr 10 ++ x) in
      let _ = map_set env "__lvdecl" (mkstr (join9 (deep_targets rest) "")) in
      run_stmts_result env world blk rest discard_result)
+  // (a method's, a class body's or a block's body that is a program of the
+  //  ISeq VM is these three -- vm_load_seq's: its line, its file, the
+  //  program -- and the two marks need no turn of their own. What the
+  //  program's statement gets as any statement does: its allocations' start
+  //  (fb_wm_stmt), another thread's turn, a signal.)
+  | Cons (SLineQ n, Cons (SFile f, Cons (SVm (id9, g9), Nil))) when str_eq f (cur_file ()) ->
+    (let _ = (if n < 0 then () else cur_line_set n) in
+     vm_body_run env world blk id9 g9)
+  | Cons (SLine n, Cons (SFile f, Cons (SVm (id9, g9), Nil))) when n < 0 && str_eq f (cur_file ()) ->
+    vm_body_run env world blk id9 g9
   | Cons (s, rest) ->
     // where this statement's allocations begin (fb_wm in m_fiber.mere) --
     // not for a mark of where the source is, which allocates nothing
@@ -64487,6 +64502,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
         else (w, yld, ids, outs))
      | Cons (_, t) -> go t line evt prev yld ids outs) in
   let (why1, yld1, kids1, outs1) = go body line0 0 (0 - 1) 0 (Nil : int list) (Nil : (str * int) list) in
+  let _ = (if str_eq why1 "" then vm_fuse_mark labels id else ()) in
   // the catch table: each rescue / ensure entry's sequence a program of its
   // own, the labels instruction indices; and where a protected region
   // starts, marked in the events (2: vm_loop asks vm_region there)
@@ -64603,6 +64619,87 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   //  state: a block is never a top -- vm_enter writes the frame's "__ip")
   let _ = (if kind == 1 && ipn >= 0 then vec_set vm_own (3 * id + 2) (ipn + 1) else ()) in
   (why, id, yld, Cons (id, kids), outs)
+// A getlocal, then a getlocal or an Integer putobject, then a plain Integer
+// operator -- `n < 2`, `n - 1`, `i < n`, `s + x` -- is marked at the getlocal
+// (its ib, which a getlocal does not use) for vm_step to answer the three in
+// one step when both values are Integers: vm_fused2. Not when a jump can land
+// on the second or the third, or an event is on them.
+and vm_fuse_mark = fn labels -> fn (id: int) ->
+  let (op, na, ia, ib, ic, ov, _, ev) = vec_get vm_code id in
+  let n = vec_len op in
+  let tgt = vec_new () in
+  let rec zero = fn (i: int) -> (if i > n then () else (let _ = vec_push tgt 0 in zero (i + 1))) in
+  let _ = zero 0 in
+  let _ = map_iter labels (fn (l: str) -> fn (i: int) -> if i >= 0 && i <= n then vec_set tgt i 1 else ()) in
+  let opnd = fn (i: int) ->
+    (let o = vec_get op i in
+     o == 20 || (o == 3 && vec_get ia i != 1 && (match vec_get ov i with VInt _ -> true | _ -> false))) in
+  let rec go = fn (i: int) ->
+    (if i + 2 >= n then ()
+     else
+       (let f = vec_get ia (i + 2) in
+        let _ = (if vec_get op i == 20 && opnd (i + 1) && vec_get op (i + 2) == 29
+                    && vec_get tgt (i + 1) == 0 && vec_get tgt (i + 2) == 0
+                    && vec_get ev (i + 1) == 0 && vec_get ev (i + 2) == 0
+                    && vec_get ib (i + 2) == 1 && vec_get ic (i + 2) < 0
+                    && vm_bit f 16 && (if vm_bit f 4 then false else true)
+                    && vm_fuse_op (vec_get na (i + 2))
+                 then
+                   // (...2 when a branchif / branchunless follows that nothing
+                   //  jumps to: the answer is tested there and not pushed;
+                   //  3 when a dup and a setlocal do -- `s += x` as a value --
+                   //  and 4 a setlocal alone: the answer is stored there)
+                   (let quiet = fn (j: int) -> j < n && vec_get tgt j == 0 && vec_get ev j == 0 in
+                    let o3 = (if i + 3 < n then vec_get op (i + 3) else 0 - 1) in
+                    vec_set ib i (if quiet (i + 3) && (o3 == 47 || o3 == 48) then 2
+                                  else if quiet (i + 3) && quiet (i + 4) && o3 == 14 && vec_get op (i + 4) == 21 then 3
+                                  else if quiet (i + 3) && o3 == 21 then 4
+                                  else 1))
+                 else ()) in
+        go (i + 1))) in
+  go 0
+// ...an operand of them: the putobject's Integer, or the local as getlocal
+// reads it (a closure made for this at every step was a tenth of the step)
+and vm_fz_rd = fn env -> fn cd -> fn (i: int) ->
+  let (op, na, _, _, _, ov, _, _) = cd in
+  if vec_get op i == 3 then vec_get ov i
+  else (let n = vec_get na i in
+        match (if map_has env n then map_get env n else lv_get env n) with
+        | VExc (c9, _) when str_eq c9 "~vmarg~" -> VNil
+        | v9 -> v9)
+// ...the operators int_fast_op answers
+and vm_fuse_op = fn (m: str) ->
+  str_eq m "<" || str_eq m ">" || str_eq m "+" || str_eq m "-" || str_eq m "*"
+  || str_eq m "<=" || str_eq m ">=" || str_eq m "==" || str_eq m "!="
+// ...and the three answered: the pc reached -- the answer pushed, or tested
+// by the branch after it -- or -1 and nothing done, the getlocal then running
+// as itself. As vm_step's own Integer path: not while a TracePoint wants the
+// call or an Integer operator is redefined.
+and vm_fused2 = fn env -> fn world -> fn st -> fn cd -> fn (pc: int) -> fn (kind: int) ->
+  let (op, na, ia, _, _, _, _, _) = cd in
+  if map_len hook_flags > 0 && map_has hook_flags "tp" then 0 - 1
+  else
+    (match vm_fz_rd env cd pc with
+     | VInt x ->
+       (match vm_fz_rd env cd (pc + 1) with
+        | VInt y ->
+          if int_ops_plain world then
+            (let (ok, v) = int_fast_op (vec_get na (pc + 2)) x y in
+             if (if ok then false else true) then 0 - 1
+             else if kind == 1 then (let _ = vm_push st v in pc + 3)
+             // (the setlocal's store, as vm_var_op makes it)
+             else if kind == 3 || kind == 4 then
+               (let j = (if kind == 3 then pc + 4 else pc + 3) in
+                let n9 = vec_get na j in
+                let l9 = vec_get ia j in
+                let _ = (if l9 == 0 then map_set env n9 v else vm_setup env n9 l9 v) in
+                if kind == 3 then (let _ = vm_push st v in pc + 5) else pc + 4)
+             // (branchif jumps on a truthy answer, branchunless on a falsy one)
+             else if (if vec_get op (pc + 3) == 47 then truthy v else (if truthy v then false else true)) then vec_get ia (pc + 3)
+             else pc + 4)
+          else 0 - 1
+        | _ -> 0 - 1)
+     | _ -> 0 - 1)
 // (two flag sets joined: 1 yields, 2 reads its frame's locals)
 and vm_bor = fn (a: int) -> fn (b: int) ->
   (if a % 2 == 1 || b % 2 == 1 then 1 else 0) + (if (a / 2) % 2 == 1 || (b / 2) % 2 == 1 then 2 else 0)
@@ -65544,6 +65641,11 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
            else vm_events env world (vec_get ev pc) (vec_get ln pc)) in
   let n = vec_get na pc in
   let a = vec_get ia pc in
+  // (a getlocal marked by vm_fuse_mark: it, the operand after it and the
+  //  operator in one step -- and the branch after them, marked 2)
+  let fz = (if o == 20 then (let k = vec_get ib pc in if k > 0 then vm_fused2 env world st cd pc k else 0 - 1) else 0 - 1) in
+  if fz >= 0 then fz
+  else
   // (two Integers and a plain operator -- `i < n`, `s += i` -- answered here,
   //  as the evaluator's EBin answers them: when no Integer operator is
   //  redefined and no TracePoint wants the call. ARGS_SIMPLE, no FCALL, one
@@ -66244,45 +66346,50 @@ and vm_exec = fn env -> fn world -> fn blk -> fn (id: int) -> fn (pc0: int) ->
               let _ = fill 16 in
               let _ = vec_push vm_pool (s0, r0) in
               vec_len vm_pool - 1)) in
-  let give_back = fn (u: unit) ->
-    (let m = vec_get vm_pool_free 0 + 1 in
-     let _ = (if m < vec_len vm_pool_free then vec_set vm_pool_free m k else vec_push vm_pool_free k) in
-     vec_set vm_pool_free 0 m) in
   let (stk, regs) = vec_get vm_pool k in
   let _ = vm_stack_wind (stk, regs) in
   // (slot 1 is the slot's own: the statements since its stack was wound
   //  back, across the frames that use it -- vm_stack_wind)
   let rec clear = fn (i: int) -> (if i >= 16 then () else (let _ = (if i == 1 then () else vec_set regs i 0) in clear (i + 1))) in
   let _ = clear 0 in
-  let run = fn (u: unit) -> (
-    let _ = vec_set regs 3 (0 - 1) in
-    // (slot 12: the sequence's kind, for what a throw out of it means; 13:
-    //  the program, which vm_cur is set back to when an exception a frame
-    //  below left it at its own is caught here)
-    let _ = vec_set regs 12 kind in
-    let _ = vec_set regs 13 id in
-    // (the program being run, for what asks: vm_cur. A raise leaves it for
-    //  the frame that takes the exception to have set its own again.)
-    let was = vec_get vm_cur 0 in
-    let _ = vec_set vm_cur 0 id in
-    let _ = (if vm_ct_regions ct then vm_seg env world blk cd ct (stk, regs) pc0 0 n (Nil : int list)
-             else vm_loop env world blk cd ct (stk, regs) pc0 0 n (Nil : int list)) in
-    let _ = vec_set vm_cur 0 was in
-    vec_get regs 2) in
   // (what the frame leaves is copied out of the stack's arena before the slot
   //  is given back: the next frame to take the slot -- a :return hook's, run
   //  before the value is stored anywhere -- may wind that arena back)
-  let out = fn (how: int) -> region VMR { (vm_topn (stk, regs) 0, how) } in
   // (a method's or a block's body runs in the region its call made for it --
   //  the MCALL of method_body_flow_result, the BLK of run_block0, which the
   //  body's statements enter without one of their own
   //  (exec_stmt_region_result) -- so a second one here would only be entered
   //  and left again)
-  let r = try_or_msg (fn (u: unit) -> (if kind == 1 || kind == 2 then out (run ())
-                                       else region VMF { (let h = run () in (vm_topn (stk, regs) 0, h)) }))
-                     (fn (m: str) -> (let _ = give_back () in fail m)) in
-  let _ = give_back () in
+  // (the run and the giving back are functions of their own, not closures
+  //  made for each frame)
+  let r = try_or_msg (fn (u: unit) -> (if kind == 1 || kind == 2 then
+                                         (let how = vm_exec_run env world blk cd ct (stk, regs) id kind pc0 n in
+                                          region VMR { (vm_topn (stk, regs) 0, how) })
+                                       else region VMF { (let h = vm_exec_run env world blk cd ct (stk, regs) id kind pc0 n in (vm_topn (stk, regs) 0, h)) }))
+                     (fn (m: str) -> (let _ = vm_pool_give k in fail m)) in
+  let _ = vm_pool_give k in
   r
+and vm_pool_give = fn (k: int) ->
+  let m = vec_get vm_pool_free 0 + 1 in
+  let _ = (if m < vec_len vm_pool_free then vec_set vm_pool_free m k else vec_push vm_pool_free k) in
+  vec_set vm_pool_free 0 m
+// ...the frame's run: how it was left (regs' slot 2)
+and vm_exec_run = fn env -> fn world -> fn blk -> fn cd -> fn ct -> fn st -> fn (id: int) -> fn (kind: int) -> fn (pc0: int) -> fn (n: int) ->
+  let (_, regs) = st in
+  let _ = vec_set regs 3 (0 - 1) in
+  // (slot 12: the sequence's kind, for what a throw out of it means; 13:
+  //  the program, which vm_cur is set back to when an exception a frame
+  //  below left it at its own is caught here)
+  let _ = vec_set regs 12 kind in
+  let _ = vec_set regs 13 id in
+  // (the program being run, for what asks: vm_cur. A raise leaves it for
+  //  the frame that takes the exception to have set its own again.)
+  let was = vec_get vm_cur 0 in
+  let _ = vec_set vm_cur 0 id in
+  let _ = (if vm_ct_regions ct then vm_seg env world blk cd ct st pc0 0 n (Nil : int list)
+           else vm_loop env world blk cd ct st pc0 0 n (Nil : int list)) in
+  let _ = vec_set vm_cur 0 was in
+  vec_get regs 2
 // Where a frame is run again from, for a Continuation re-entered into it
 // (cont_rerun: the evaluator runs the body again from the statement that
 // holds the guarded call's line). The first instruction a statement on that
