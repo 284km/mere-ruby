@@ -6704,3 +6704,50 @@ actual parent outcome. Its candidate still records multipart's loss against
 the stronger stored macOS baseline and is not adopted. The latest strict
 rounds 19-21 macOS run also loses that file; the preceding successful hosted
 observation does not erase the failed run or identify the resource cause.
+
+
+## Gem rounds 23-24: real class-bracket lookup and native bare construction
+
+Rack Headers exposed two separate Ruby semantic gaps. A container subclass's
+Ruby singleton [] lost to its inherited native constructor; after restoring
+that entry, bare new allocated an ordinary object without Hash storage.
+invoke_val_c2 now selects the real singleton entry after undef/alias checks,
+respecting visibility and refinements. try_self_call1 routes bare new through
+the existing native constructor, keeping the real Hash/Array storage. The
+with-arguments twin belongs to the VM session and is unchanged. An initial
+uncommitted edit hit that identical twin; it was restored before the final
+build and commit. No other session's branch was edited.
+
+super_missing now reaches Hash/Array's native class [] only when it remains
+after the actual method origin, before any tombstone or Ruby definition.
+container_bracket_super_ahead reads the existing frame's method origin/index
+and singleton chain. Coercion callbacks on a subclass carry no native bypass;
+a prepended core override consumes only its existing one-call bypass. No new
+top-level let, VM/GC implementation or shared invoke_val_c0 changes.
+
+The unchanged original headers file improves from 37 failures / 2 errors to
+6 failures / 0 errors (51 tests, 268 versus 302 assertions). It stays RED.
+Both new witnesses 706/707 fail the paired parent and match normally and with
+GC.stress; inheritance, prepend, native aliases, native super, tombstones,
+visibility, coercions, blocks and refinements are exercised. A separate
+inherited-native undef_method availability gap is confirmed on both parent
+and candidate and remains a coordination item in the shared dispatcher.
+
+Normal O2 source 170fb4b8 runs all three unchanged locks: original 54 MATCH /
+7 RED / 1 MEMORY, Matrix/Logger 6 MATCH / 1 RED, Rake 46 MATCH. All 115
+reference files are healthy. Multipart completes 85 tests / 239 assertions at
+2,006,464 KiB; no resource-cause attribution follows from this success. Keep
+the previous 53-MATCH baseline and failed candidate independently. Ordinary
+comparison has no lost MATCH; strengthen macOS to the actual 54-MATCH record,
+including Lint. The Linux baseline and both initial records are unchanged.
+
+Corpus 724/724; bracket depth 933/1024. Original core MATCH counts retain
+Class 61, Hash 297, Array 473, Super 50 and Method 97 against handoff and
+successful main. Class's reference lacks -test-/class (one BOTH); Array's
+reference shared-marking case is healthier while Mere keeps its pre-existing
+compaction skip. Hash's replace-memory-leak child reaches the unchanged
+10-second bound. Exact counts and nonpassing cases are recorded in
+suites_runtime_r24.json; no exclusions are added. Full hosted CI remains a
+separate merge requirement. The preceding metadata correction now passes
+its actual hosted Linux lifetime control at 1.909x in run 44313194961; retain
+that series alongside its earlier 2.086x failure and local controls.

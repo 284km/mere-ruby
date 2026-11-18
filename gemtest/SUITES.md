@@ -225,3 +225,24 @@ Fresh O2 source 61d57736 keeps the full-file totals at **53 MATCH / 7 RED /
 683/684 match normally and under GC.stress, and related Method/Super/Yield/
 Parse/Syntax controls retain their baseline counts. Original files, sources,
 dependencies, the initial snapshot and all resource bounds stay unchanged.
+
+Rounds 23-24 honor Hash/Array subclasses' Ruby class `[]` before the inherited
+native constructor and route a bare `new` through normal construction. Native
+class-bracket super uses the actual remaining singleton chain and respects
+tombstones. Witnesses 706/707 cover inheritance, prepend, native aliases,
+visibility, coercion callbacks, blocks and refinements. The original Rack
+headers file improves from 37 failures / 2 errors to 6 failures / 0 errors;
+it remains RED rather than dropping any cases or assertions.
+
+O2 source 170fb4b8 completes the original batch at 54 MATCH / 7 RED / 1 MEMORY,
+with all reference files healthy and all 61 completed Mere source audits.
+Multipart is MATCH at 2,006,464 KiB; this does not establish the cause of its
+earlier resource variation. `suites_before_r24.json` and
+`suites_candidate_before_r24.json` preserve the preceding stronger baseline
+and failed candidate. The ordinary comparison loses no previous MATCH file.
+The macOS baseline is strengthened to all 54 actual matches, including Lint;
+Linux keeps its own measured snapshot until its new hosted observation.
+Additional suites remain 6 MATCH / 1 RED, and Rake retains all 46 MATCH files.
+`suites_runtime_r24.json` records the related original core controls. Corpus
+is 724/724, both witnesses match under GC.stress, and bracket depth is still
+933/1024. No VM, collector, shared native dispatcher or API exclusion changes.
