@@ -4,8 +4,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import suites
 
@@ -50,6 +52,19 @@ class SuiteChecks(unittest.TestCase):
         errors = suites.compare([broken], dict(rows=[row]))
         self.assertEqual(len(errors), 2)
         self.assertTrue(suites.compare([], dict(rows=[row])))
+
+    def test_test_unit_retains_every_count_and_rejects_all_omitted(self):
+        text = '3 tests, 4 assertions, 0 failures, 0 errors,\n1 pendings, 1 omissions, 2 notifications'
+        counts = suites.tally(text, '', 'test-unit-gem')
+        self.assertEqual(counts, dict(tests=3, assertions=4, failures=0, errors=0,
+                                      pendings=1, omissions=1, notifications=2, skips=2))
+        good = dict(self.side(), tally=counts)
+        self.assertEqual(suites.verdict(good, good), 'MATCH')
+        omitted = dict(good, tally=dict(counts, tests=2))
+        self.assertEqual(suites.verdict(omitted, omitted), 'BOTH')
+        changed = dict(good, tally=dict(counts, notifications=3))
+        self.assertEqual(suites.verdict(good, changed), 'RED')
+        self.assertIsNone(suites.tally('0 failures', '', 'test-unit-gem'))
 
     def test_a_baseline_must_match_the_lock_and_platform(self):
         row = dict(gem='fixture', file='test.rb', classification='MATCH', reference=self.side(), mere=self.side())
@@ -98,6 +113,38 @@ class SuiteChecks(unittest.TestCase):
                                 source_verified=record.exists() and bool(record.read_text().split()))
                 self.assertEqual(suites.verdict(self.side(), measured), 'MATCH' if name == 'locked' else 'RED')
                 self.assertEqual(record.read_text().strip() if record.exists() else '', 'lib/probe.rb' if name == 'locked' else '')
+
+    def test_child_ruby_uses_the_selected_interpreter_and_locked_libraries(self):
+        ruby = str(Path(shutil.which('ruby')).resolve())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'cache/probe'
+            (source / 'lib').mkdir(parents=True)
+            (source / 'lib/probe.rb').write_text('CHILD_LIBRARY = "locked"\n')
+            (source / 'test.rb').write_text('''require "probe"
+child = IO.popen(["ruby", "--disable-gems", "-e", 'require "probe"; print CHILD_LIBRARY'], &:read)
+abort "wrong child or library" unless child == "locked" && $?.success?
+puts "3 runs, 4 assertions, 0 failures, 0 errors, 0 skips"
+''')
+            shadow = root / 'shadow'
+            shadow.mkdir()
+            (shadow / 'ruby').write_text('#!/bin/sh\nexit 23\n')
+            (shadow / 'ruby').chmod(0o755)
+            output = root / 'output'
+            output.mkdir()
+            args = SimpleNamespace(cache=root / 'cache', ruby_src=root / 'fallback',
+                                   binary=Path(ruby), reference=shadow / 'ruby', verbose=False)
+            suite = dict(name='probe', load_sources=['probe'], load_paths=['lib'])
+            env = dict(os.environ, PATH=str(shadow) + os.pathsep + os.defpath, LANG='en_US.UTF-8')
+
+            def run(command, environment, log, rss, wall):
+                result = subprocess.run(command, env=environment, capture_output=True, timeout=10)
+                return dict(exit=result.returncode, limit=None)
+
+            with patch.object(suites, 'supervise', side_effect=run):
+                result = suites.run_side(args, suite, 'test.rb', 'mere', env, output, {})
+            self.assertEqual(suites.verdict(self.side(), result), 'MATCH',
+                             (output / 'mere.stderr').read_text())
 
 
 if __name__ == '__main__':

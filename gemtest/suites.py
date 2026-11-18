@@ -21,6 +21,8 @@ from ci import supervise
 WALL = 600
 RSS_KB = 2097152
 TALLY = re.compile(r'(\d+) (?:runs|tests), (\d+) assertions, (\d+) failures, (\d+) errors, (\d+) skips')
+TEST_UNIT_TALLY = re.compile(r'(\d+) tests, (\d+) assertions, (\d+) failures, (\d+) errors,\s*'
+                             r'(\d+) pendings, (\d+) omissions, (\d+) notifications')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
 
@@ -125,8 +127,17 @@ end
     print('Verified all locked sources and pure Ruby dependencies.')
 
 
-def tally(stdout, stderr):
-    found = TALLY.findall(ANSI.sub('', stdout + '\n' + stderr))
+def tally(stdout, stderr, framework=None):
+    text = ANSI.sub('', stdout + '\n' + stderr)
+    if framework == 'test-unit-gem':
+        found = TEST_UNIT_TALLY.findall(text)
+        if not found:
+            return None
+        counts = dict(zip(('tests', 'assertions', 'failures', 'errors', 'pendings', 'omissions', 'notifications'),
+                          map(int, found[-1])))
+        counts['skips'] = counts['pendings'] + counts['omissions']
+        return counts
+    found = TALLY.findall(text)
     return dict(zip(('tests', 'assertions', 'failures', 'errors', 'skips'), map(int, found[-1]))) if found else None
 
 
@@ -170,22 +181,31 @@ def run_side(args, suite, file, side, env, output, lock):
         libraries += [scratch / name / 'lib' for name in suite['load_sources'] if name != suite['name']]
         if suite.get('framework') == 'cruby-test-unit':
             libraries += [args.ruby_src / 'tool/lib']
+        if suite.get('framework') == 'test-unit-gem':
+            libraries += [args.cache / 'home/gems' / f"{p['name']}-{p['version']}" / 'lib' for p in lock['packages']]
         binary = args.reference if side == 'reference' else args.binary
         command = [str(binary), '--disable-gems', '-I', os.pathsep.join(map(str, libraries)),
-                   '-r', str(ROOT / 'gemtest/suite_bootstrap.rb'), '-r', 'rubygems', file, '--seed', '1']
+                   '-r', str(ROOT / 'gemtest/suite_bootstrap.rb'), '-r', 'rubygems']
+        for preload in suite.get('preload', []):
+            command += ['-r', str(source / preload)]
+        command += [file]
+        command += ['--order=alphabetic'] if suite.get('framework') == 'test-unit-gem' else ['--seed', '1']
         if args.verbose:
             command += ['--verbose']
         stdout = output / (side + '.stdout')
         stderr = output / (side + '.stderr')
         source_record = output / (side + '.source.txt')
         side_env = dict(env, MERE_SUITE_RUBY_LIB=str(args.ruby_src / 'lib'),
-                        MERE_SUITE_SOURCE_ROOT=str(source), MERE_SUITE_SOURCE_RECORD=str(source_record))
+                        MERE_SUITE_SOURCE_ROOT=str(source), MERE_SUITE_SOURCE_RECORD=str(source_record),
+                        RUBY=str(binary), UNITTEST_CHILD_RUBY=str(binary),
+                        RUBYLIB=os.pathsep.join(map(str, libraries)),
+                        PATH=str(ROOT / 'unittest/child-bin') + os.pathsep + env.get('PATH', os.defpath))
         result = supervise([sys.executable, '-c', EXEC, str(source), str(stdout), str(stderr)] + command,
                            side_env, output / (side + '.monitor'), RSS_KB, WALL)
         result['source_files'] = [line for line in source_record.read_text().splitlines() if line] if source_record.exists() else []
         result['source_verified'] = bool(result['source_files'])
         result['source_record'] = source_record.name
-        result['tally'] = tally(stdout.read_text(errors='replace'), stderr.read_text(errors='replace'))
+        result['tally'] = tally(stdout.read_text(errors='replace'), stderr.read_text(errors='replace'), suite.get('framework'))
         result['stdout'] = stdout.name
         result['stderr'] = stderr.name
         # Raw logs stay in the run directory; portable records contain no paths.
