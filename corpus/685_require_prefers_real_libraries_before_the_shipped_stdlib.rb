@@ -31,3 +31,12 @@ Dir.mktmpdir('mere-ruby-source-order') do |directory|
     $LOAD_PATH.delete(path_entry)
   end
 end
+
+# The core API remains usable after the program removes Ruby library paths.
+saved_load_path = $LOAD_PATH.dup
+begin
+  $LOAD_PATH.clear
+  p Marshal.load(Marshal.dump([:provided, 1]))
+ensure
+  $LOAD_PATH.replace(saved_load_path)
+end
