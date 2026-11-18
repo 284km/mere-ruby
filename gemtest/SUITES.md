@@ -246,3 +246,12 @@ Additional suites remain 6 MATCH / 1 RED, and Rake retains all 46 MATCH files.
 `suites_runtime_r24.json` records the related original core controls. Corpus
 is 724/724, both witnesses match under GC.stress, and bracket depth is still
 933/1024. No VM, collector, shared native dispatcher or API exclusion changes.
+
+Review follow-up 1d0cbe6b retains the same file counts and strict gates. Core
+Hash/Array native aliases now keep their bypass until the final native entry;
+lookup and super stop at the native owner before later singleton mixins.
+708/709 fail the pre-review binary and join 706/707 in matching normally and
+under GC.stress. Corpus is 726/726. `suites_runtime_r25.json` records current
+core controls; `suites_before_review_r25.json` preserves the preceding complete
+54-MATCH macOS observation. The lifetime record distinguishes earlier runs
+separated by compilation from the new consecutive saved-binary comparisons.

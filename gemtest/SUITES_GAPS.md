@@ -322,3 +322,14 @@ snapshot without changing sources, reference counts or bounds. Multipart's
 2,006,464-KiB success is an observation, not a proven resource fix. Linux keeps
 its own measured baseline. The additional and Rake strict comparisons retain
 6 MATCH / 1 RED and 46 MATCH respectively.
+
+
+Review of the first constructor head found two regressions: consuming a
+native alias bypass in the early guard let the final core check enter the
+Ruby override, and a singleton walk could choose an included method after
+Hash/Array's native owner. Source 1d0cbe6b preserves the bypass until the
+correct native entry, stops ordinary lookup and super at that owner, and
+retains earlier Ruby definitions/tombstones. New 708/709 detect the previous
+head; all 706-709 match normally and with GC.stress. The corrected full run
+retains the strict 54-MATCH macOS baseline, additional 6 MATCH / 1 RED and
+Rake 46 MATCH. No failed observation or stronger gate is removed.

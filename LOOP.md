@@ -6688,7 +6688,9 @@ A borrowed-operation-name trial did not improve the paired observation
 (1.780 versus 1.712 on macOS) and was rejected. An intermediate no-op flag
 check alone also left Linux near the bound (1.975).
 
-Paired O2 observations with the same unmodified control: macOS peak RSS
+The following earlier before/after observations were initially described as
+paired, but compilation separated them; use the consecutive replay below
+for a same-window comparison. With the same unmodified control: macOS peak RSS
 179,568 to 157,856 KiB, post-GC ratios 1.712 to 1.695; offline Linux/aarch64
 199,568 to 173,416 KiB, ratios 1.980 to 1.908. The Linux container is not the
 hosted x86-64 runner; final hosted proof remains pending. Every collected
@@ -6751,3 +6753,40 @@ suites_runtime_r24.json; no exclusions are added. Full hosted CI remains a
 separate merge requirement. The preceding metadata correction now passes
 its actual hosted Linux lifetime control at 1.909x in run 44313194961; retain
 that series alongside its earlier 2.086x failure and local controls.
+
+
+## Gem round 25: preserve native bracket aliases and the first actual entry
+
+Review found two real regressions in 596076bb: the early bracket guard
+consumed a native alias bypass before the final core override check, and
+Ruby lookup could pass Hash/Array's native owner to an included module.
+708/709 reproduce both on the saved pre-review O2 binary. Their final
+versions and 706/707 match normally and with GC.stress after correction.
+
+invoke_val_c2 now only peeks at a core bypass that its final native check
+must consume. A subclass/native-only constructor consumes its bypass at the
+direct native entry, before coercion callbacks. container_bracket_ruby_first
+walks actual singleton entries and stops at the native Hash/Array owner.
+The class-bracket case of super_next_plain uses that native boundary too,
+so a prepended override's super does not jump to an included method behind
+it. Earlier Ruby entries and tombstones retain priority. No shared dispatcher,
+VM or collector edits; top-level let counts remain main 136 / state 1167.
+
+Normal O2 source 1d0cbe6b retains original 54 MATCH / 7 RED / 1 MEMORY,
+additional 6 MATCH / 1 RED and Rake 46 MATCH. All three strict comparisons
+are empty, with every reference file healthy. Keep the 54-MATCH macOS gate;
+its preceding complete observation is preserved in suites_before_review_r25.json.
+Corpus 726/726; bracket depth 933/1024. Core MATCH counts remain Class 61,
+Hash 297, Array 473, Super 50, Method 97. The Array reference has two shared-
+marking skips in this run. Exact counts and unchanged lifetime-control series
+are in suites_runtime_r25.json (post-GC ratio 1.807).
+
+Correct the earlier timing separation explicitly: after both saved metadata
+binaries exist, consecutive macOS runs give peak 185,104 -> 131,664 KiB and
+post-GC ratios 1.708 -> 1.352. Consecutive offline Linux/aarch64 runs give
+205,108 -> 171,444 KiB, ratios 2.207 (negative control fails) -> 1.929 (passes).
+Keep all earlier observations, labelled as separated by builds, alongside
+these same-window pairs. The same workload and 2x/600-second/2-GiB bounds
+remain unchanged. Hosted x86-64 success at 1.909 is distinct evidence; the
+local Linux pair is not a hosted rerun. No resource-variation cause is inferred
+from multipart's further successful observation.
