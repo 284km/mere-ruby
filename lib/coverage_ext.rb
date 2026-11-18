@@ -70,7 +70,7 @@ module Coverage
             h[:lines] = __lines(f).freeze
           end
         end
-        h[:branches] = {} if mode & 2 != 0
+        h[:branches] = __branches(f) if mode & 2 != 0
         h[:methods] = {} if mode & 4 != 0
         res[f] = h
       end
@@ -96,9 +96,27 @@ module Coverage
     __clear if clear
     if stop
       __reset
+      @__branch_map = nil
       __set(0, 0)
     end
     r
+  end
+
+  # What a file's branches are, as its compilation for the VM declared them
+  # (RubyVM::InstructionSequence.__vm_file): [[type, line, column, line,
+  # column, [[type, line, column, line, column, counter], ...]], ...]. A
+  # file that ran on the evaluator has none.
+  def self.__branch_map = (@__branch_map ||= {})
+
+  # {[type, id, line, column, line, column] => {[type, id, ...] => count}}:
+  # ids as ruby numbers them, a construct and then its branches
+  def self.__branches(f)
+    st = __branch_map[f] or return {}
+    hits = __bhits(f, st.sum { |b| b[5].size })
+    id = -1
+    st.to_h do |b|
+      [[b[0], id += 1, *b[1, 4]], b[5].to_h { |br| [[br[0], id += 1, *br[1, 4]], hits[br[5]]] }]
+    end
   end
 
   def self.line_stub(file) = __stub(file.respond_to?(:to_path) ? file.to_path : file)

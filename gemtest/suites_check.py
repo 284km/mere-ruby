@@ -1,5 +1,8 @@
 """Negative controls for coverage, classification, and locked source integrity."""
 import copy
+import os
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 import unittest
@@ -48,6 +51,18 @@ class SuiteChecks(unittest.TestCase):
         self.assertEqual(len(errors), 2)
         self.assertTrue(suites.compare([], dict(rows=[row])))
 
+    def test_a_baseline_must_match_the_lock_and_platform(self):
+        row = dict(gem='fixture', file='test.rb', classification='MATCH', reference=self.side(), mere=self.side())
+        result = dict(rows=[row], lock_sha256='locked', platform='Linux')
+        self.assertEqual(suites.baseline_errors(result, result), [])
+        with self.assertRaisesRegex(ValueError, 'platform differs'):
+            suites.baseline_errors(result, dict(result, platform='Darwin'))
+        with self.assertRaisesRegex(ValueError, 'lock differs'):
+            suites.baseline_errors(result, dict(result, lock_sha256='changed'))
+        broken = copy.deepcopy(result)
+        broken['rows'][0]['classification'] = 'MEMORY'
+        self.assertTrue(suites.baseline_errors(broken, result))
+
     def test_untracked_shadow_and_source_mutation_change_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -60,6 +75,29 @@ class SuiteChecks(unittest.TestCase):
             file.write_text('VALUE = 1\n')
             (root / 'lib/shadow.rb').write_text('raise "shadow"\n')
             self.assertNotEqual(original, suites.tree(root))
+
+    def test_a_passing_summary_from_another_library_tree_is_rejected(self):
+        ruby = shutil.which('ruby')
+        self.assertIsNotNone(ruby)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('locked', 'other'):
+                (root / name / 'lib').mkdir(parents=True)
+                (root / name / 'lib/probe.rb').write_text('SOURCE_PROBE = true\n')
+            for name in ('other', 'locked', 'exit'):
+                record = root / (name + '.source.txt')
+                env = dict(os.environ, MERE_SUITE_RUBY_LIB=str(root / 'fallback'),
+                           MERE_SUITE_SOURCE_ROOT=str(root / 'locked'), MERE_SUITE_SOURCE_RECORD=str(record))
+                code = ('require "probe"; ' if name != 'exit' else '') + 'puts "3 runs, 4 assertions, 0 failures, 0 errors, 0 skips"'
+                if name == 'exit':
+                    code += '; STDOUT.flush; exit! 0'
+                result = subprocess.run([ruby, '--disable-gems', '-I', str(root / name / 'lib'),
+                                         '-r', str(suites.ROOT / 'gemtest/suite_bootstrap.rb'), '-e', code],
+                                        env=env, text=True, capture_output=True)
+                measured = dict(exit=result.returncode, limit=None, tally=suites.tally(result.stdout, result.stderr),
+                                source_verified=record.exists() and bool(record.read_text().split()))
+                self.assertEqual(suites.verdict(self.side(), measured), 'MATCH' if name == 'locked' else 'RED')
+                self.assertEqual(record.read_text().strip() if record.exists() else '', 'lib/probe.rb' if name == 'locked' else '')
 
 
 if __name__ == '__main__':

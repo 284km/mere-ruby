@@ -132,7 +132,7 @@ def tally(stdout, stderr):
 
 def healthy(side):
     counts = side['tally']
-    return (side['exit'] == 0 and side['limit'] is None and counts is not None
+    return (side['exit'] == 0 and side['limit'] is None and side.get('source_verified', True) and counts is not None
             and counts['tests'] > counts['skips'] and counts['assertions'] > 0
             and counts['failures'] == counts['errors'] == 0)
 
@@ -168,18 +168,23 @@ def run_side(args, suite, file, side, env, output, lock):
         source = scratch / suite['name']
         libraries = [source / directory for directory in suite['load_paths']]
         libraries += [scratch / name / 'lib' for name in suite['load_sources'] if name != suite['name']]
-        libraries += [args.ruby_src / 'lib']
         if suite.get('framework') == 'cruby-test-unit':
             libraries += [args.ruby_src / 'tool/lib']
         binary = args.reference if side == 'reference' else args.binary
         command = [str(binary), '--disable-gems', '-I', os.pathsep.join(map(str, libraries)),
-                   '-r', 'rubygems', file, '--seed', '1']
+                   '-r', str(ROOT / 'gemtest/suite_bootstrap.rb'), '-r', 'rubygems', file, '--seed', '1']
         if args.verbose:
             command += ['--verbose']
         stdout = output / (side + '.stdout')
         stderr = output / (side + '.stderr')
+        source_record = output / (side + '.source.txt')
+        side_env = dict(env, MERE_SUITE_RUBY_LIB=str(args.ruby_src / 'lib'),
+                        MERE_SUITE_SOURCE_ROOT=str(source), MERE_SUITE_SOURCE_RECORD=str(source_record))
         result = supervise([sys.executable, '-c', EXEC, str(source), str(stdout), str(stderr)] + command,
-                           env, output / (side + '.monitor'), RSS_KB, WALL)
+                           side_env, output / (side + '.monitor'), RSS_KB, WALL)
+        result['source_files'] = [line for line in source_record.read_text().splitlines() if line] if source_record.exists() else []
+        result['source_verified'] = bool(result['source_files'])
+        result['source_record'] = source_record.name
         result['tally'] = tally(stdout.read_text(errors='replace'), stderr.read_text(errors='replace'))
         result['stdout'] = stdout.name
         result['stderr'] = stderr.name
@@ -206,6 +211,14 @@ def compare(rows, baseline, same_platform=True):
                 (same_platform and old['reference']['tally'] != new['reference']['tally'])):
             errors.append(f'{key}: reference coverage changed')
     return errors
+
+
+def baseline_errors(result, baseline):
+    if baseline['lock_sha256'] != result['lock_sha256']:
+        raise ValueError('baseline lock differs')
+    if baseline['platform'] != result['platform']:
+        raise ValueError('baseline platform differs; select the matching platform snapshot')
+    return compare(result['rows'], baseline)
 
 
 def measure(args, lock):
@@ -250,9 +263,7 @@ def measure(args, lock):
         raise ValueError('binary or lock changed during measurement; discard this run')
     if args.baseline:
         baseline = json.loads(args.baseline.read_text())
-        if baseline['lock_sha256'] != result['lock_sha256']:
-            raise ValueError('baseline lock differs')
-        errors = compare(rows, baseline, baseline.get('platform') == result['platform'])
+        errors = baseline_errors(result, baseline)
         result['regressions'] = errors
         save(args.output / 'results.json', result)
         if errors:

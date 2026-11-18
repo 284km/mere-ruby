@@ -483,14 +483,45 @@ between CI runs of the same code; locally both builds agree.
 **Timing at the edge of a bound on CI runners.** The bounds stay; a slow
 runner crosses them.
 
-- build-linux's Module check: `TestModule#test_complemented_method_entry_memory_leak`
-  takes 5.5-8.5 s and has 10 s (`upstream_leak_seconds`). A slow runner gives
-  10.04 s, a Timeout, and the job fails. Rerun the job.
+- build-linux's Module check: its three leak tests (iclass 3,000,000,
+  complemented 300,000, clone 1,000,000 times) take 4.3-6.7 s each of their
+  10 s (`upstream_leak_seconds`), the whole file 21.7-27.0 s. Some runners
+  are slower at everything: main e40bb486's run and PR #95's took 39.7 and
+  39.9 s for the file (test_prepend_gc 1.50 s against 0.79-0.95), and
+  complemented went to 10.04 s, a Timeout. Builds before and after PR #89
+  take the same time locally (4.6-6.5 s). Rerun the job. The clone test lost
+  a third of its time when Module#clone stopped walking the whole constant
+  table (`const_owners`); ruby 4.0.9 takes 1.7 s (complemented), 2.7 s
+  (iclass) and 0.35 s (clone) on the same Mac. The same Timeout reaches
+  `ruby/test_module.rb` in the unittest shards too (PR #101's run: 10.12 s,
+  the file one test lower). Rerun its shard.
+- ...and the same test in `ruby/test_module.rb` itself is an RSS ratio
+  (after 300,000 more refinement classes against after 1,000) bounded by
+  2.0: 1.74-1.82 locally on main 392bf810 and on PR #89's branch alike, and
+  2.30 once on a macOS runner (78.6 MB -> 180.5 MB, PR #89's last run), the
+  run before it passing. Rerun its shard.
+- The reference side moves too: ruby 4.0.9 itself failed
+  `ruby/test_method.rb`'s `test_kwarg_eval_memory_leak` once on a macOS
+  runner (RSS ratio 1.23 against its 1.2, PR #101's run), which lowers the
+  file's MATCH by one without mere-ruby's result changing (`ref_exit` 1,
+  EXTRA 1). Rerun its shard.
 - `ruby/enc/test_case_comprehensive.rb` takes 360-400 s of its 600; one run
   took 616 s (WALL_LIMIT, all 422 tests RED) while the run's median file was
   at 0.98 of main's. Rerun its shard.
 - bootstraptest test_ractor #153 (1,000 ractors) and #99 sit at the runner's
   limit.
+- `ruby/test_integer.rb`'s `test_pow` runs 17 expressions in child
+  processes of 10 s each, and `crash03` (`-1111111**-1111*11 - -11**
+  -1111111`) takes 8.2 s of it locally on main and on a branch alike. A
+  loaded runner times it out (PR #88's run, twice).
+- `ruby/test_ractor.rb`'s `test_shareable_proc_define_method_super_method_
+  missing` (1,000,000 calls in a Ractor) takes 17-18 s of its 30 s
+  locally; a loaded runner timed it out once (PR #88).
+- `ruby/test_struct.rb`'s `test_named_structs_are_not_rooted` (run for
+  TopStruct and for SubStruct) compares the process's RSS after 10,000 and
+  after 60,000 named Structs and wants less than twice. Locally the ratio is
+  1.25-1.37 on main and on a branch alike; one CI run gave 2.29 for one of
+  the two while the other passed in the same file.
 - `ruby/test_ractor.rb`'s `test_move_nested_hash_during_gc_with_yjit` runs a
   child with a 10 s bound and takes 9.3-10.1 s on the runners, on main as
   well: one run in a few is a Timeout and the file is one test lower.

@@ -1,0 +1,268 @@
+// The native ISeq compiler's view of a program: Prism's serialized tree read
+// into flat stores (note 552 §11).
+//
+// lib/iseq_compiler_ext.rb compiles from Prism::Node objects, which under
+// mere-ruby are Ruby objects the interpreter has to make and then walk with
+// a method call a field. This is the same tree with no object in it: a node
+// is a number, its fields are words in one Vec, and a reader of a field is a
+// generated function (m_ic_schema.mere). The serialized form is the one
+// vendor/prism/src/serialize.c writes; m_prism_load.mere says how it reads.
+//
+// A tree is the tuple
+//
+//   (ser, src, nodes, fld, lst, strs, dbls, offs, cpool, meta)
+//
+//   ser    the serialized bytes         src    the program's bytes
+//   nodes  six words a node: type, node_id, location start, location
+//          length, flags, where its fields start in fld
+//   fld    two words a field (the generator says which, by kind)
+//   lst    the list store: a node[]'s nodes, a constant[]'s numbers
+//   strs   the strings; [0] is the source's encoding, and a big integer is
+//          here as its decimal digits
+//   dbls   the doubles
+//   offs   where each line starts
+//   cpool  the constant pool's names, by number from 0
+//   meta   [0] the first line's number, [1] the read position, [2] 1 once
+//          something could not be read, [3] how many errors the parse had,
+//          [4] where the constant pool is in ser, [5] the root node
+//
+// and the compiler's context `cx` is (tree, elements, units): ic_tr cx.
+import "m_ic_schema.mere";
+
+let ic_tr = fn cx -> (let (tr, _, _) = cx in tr);
+let ic_nodes = fn cx -> (let (_, _, nodes, _, _, _, _, _, _, _) = ic_tr cx in nodes);
+let ic_fld = fn cx -> (let (_, _, _, fld, _, _, _, _, _, _) = ic_tr cx in fld);
+let ic_lst = fn cx -> (let (_, _, _, _, lst, _, _, _, _, _) = ic_tr cx in lst);
+let ic_strs = fn cx -> (let (_, _, _, _, _, strs, _, _, _, _) = ic_tr cx in strs);
+let ic_dbls = fn cx -> (let (_, _, _, _, _, _, dbls, _, _, _) = ic_tr cx in dbls);
+let ic_offs = fn cx -> (let (_, _, _, _, _, _, _, offs, _, _) = ic_tr cx in offs);
+let ic_cpool = fn cx -> (let (_, _, _, _, _, _, _, _, cpool, _) = ic_tr cx in cpool);
+let ic_meta = fn cx -> (let (_, _, _, _, _, _, _, _, _, meta) = ic_tr cx in meta);
+let ic_src = fn cx -> (let (_, src, _, _, _, _, _, _, _, _) = ic_tr cx in src);
+
+// a node's own words
+let ic_ty = fn cx -> fn (n: int) -> vec_get (ic_nodes cx) (n * 6);
+let ic_nid = fn cx -> fn (n: int) -> vec_get (ic_nodes cx) (n * 6 + 1);
+let ic_start = fn cx -> fn (n: int) -> vec_get (ic_nodes cx) (n * 6 + 2);
+let ic_len = fn cx -> fn (n: int) -> vec_get (ic_nodes cx) (n * 6 + 3);
+let ic_flags = fn cx -> fn (n: int) -> vec_get (ic_nodes cx) (n * 6 + 4);
+// a field's two words
+let ic_fa = fn cx -> fn (n: int) -> fn (k: int) -> vec_get (ic_fld cx) (vec_get (ic_nodes cx) (n * 6 + 5) + k * 2);
+let ic_fb = fn cx -> fn (n: int) -> fn (k: int) -> vec_get (ic_fld cx) (vec_get (ic_nodes cx) (n * 6 + 5) + k * 2 + 1);
+// the i-th of a list that starts at `off`
+let ic_li = fn cx -> fn (off: int) -> fn (i: int) -> vec_get (ic_lst cx) (off + i);
+// a constant's name by its number in a field (from 1; 0 is none: "")
+let ic_cname = fn cx -> fn (ix: int) -> if ix <= 0 then "" else vec_get (ic_cpool cx) (ix - 1);
+let ic_str = fn cx -> fn (i: int) -> vec_get (ic_strs cx) i;
+let ic_enc = fn cx -> vec_get (ic_strs cx) 0;
+// (NodeFlags: NEWLINE 1, STATIC_LITERAL 2)
+let ic_newline = fn cx -> fn (n: int) -> bit_and (ic_flags cx n) 1 != 0;
+let ic_static_literal = fn cx -> fn (n: int) -> bit_and (ic_flags cx n) 2 != 0;
+
+// the source between two byte offsets
+let ic_slice = fn cx -> fn (start: int) -> fn (len: int) -> str_of_bytes (bytes_slice (ic_src cx) start len);
+let ic_node_src = fn cx -> fn (n: int) -> ic_slice cx (ic_start cx n) (ic_len cx n);
+
+// The line a byte offset is on (Source#line: the last line start at or
+// before it), and its column in bytes.
+let ic_line_index = fn cx -> fn (off: int) ->
+  let offs = ic_offs cx in
+  let rec go = fn (lo: int) -> fn (hi: int) ->
+    // (offs[lo] <= off < offs[hi], hi may be the length)
+    if hi - lo <= 1 then lo
+    else (let mid = (lo + hi) / 2 in if vec_get offs mid <= off then go mid hi else go lo mid) in
+  go 0 (vec_len offs);
+let ic_line_of = fn cx -> fn (off: int) -> vec_get (ic_meta cx) 0 + ic_line_index cx off;
+let ic_col_of = fn cx -> fn (off: int) -> off - vec_get (ic_offs cx) (ic_line_index cx off);
+let ic_start_line = fn cx -> fn (n: int) -> ic_line_of cx (ic_start cx n);
+let ic_start_col = fn cx -> fn (n: int) -> ic_col_of cx (ic_start cx n);
+let ic_end_line = fn cx -> fn (n: int) -> ic_line_of cx (ic_start cx n + ic_len cx n);
+let ic_end_col = fn cx -> fn (n: int) -> ic_col_of cx (ic_start cx n + ic_len cx n);
+
+// Reads the serialized bytes into the stores of `tr` (all empty). Answers
+// "" when the tree is read -- meta[5] is its root -- and otherwise why not.
+let ic_tree_load = fn tr ->
+  let (ser, src, nodes, fld, lst, strs, dbls, offs, cpool, meta) = tr in
+  let total = bytes_len ser in
+  let byte = fn (u: unit) ->
+    (let p = vec_get meta 1 in
+     let _ = vec_set meta 1 (p + 1) in
+     if p >= total then (let _ = vec_set meta 2 1 in 0) else bytes_get ser p) in
+  let rec varu_more = fn (n: int) -> fn (shift: int) ->
+    (let c = byte () in
+     if c >= 128 then (if shift > 56 then (let _ = vec_set meta 2 1 in 0) else varu_more (n + bit_shl (c - 128) shift) (shift + 7))
+     else n + bit_shl c shift) in
+  let varu = fn (u: unit) -> (let n = byte () in if n < 128 then n else varu_more (n - 128) 7) in
+  let u32 = fn (p: int) ->
+    if p + 4 > total then (let _ = vec_set meta 2 1 in 0)
+    else bytes_get ser p + bytes_get ser (p + 1) * 256 + bytes_get ser (p + 2) * 65536 + bytes_get ser (p + 3) * 16777216 in
+  let skip = fn (k: int) -> vec_set meta 1 (vec_get meta 1 + k) in
+  let take = fn (ln: int) ->
+    (let p = vec_get meta 1 in
+     let _ = skip ln in
+     if p + ln > total then (let _ = vec_set meta 2 1 in "") else str_of_bytes (bytes_slice ser p ln)) in
+  // (k varuints nobody reads)
+  let rec skipv = fn (k: int) -> if k <= 0 then () else (let _ = varu () in skipv (k - 1)) in
+  if total < 9 || (if str_eq (str_of_bytes (bytes_slice ser 0 5)) "PRISM" then false else true) then "not a serialized tree"
+  else if bytes_get ser 8 != 0 then "a serialized tree without locations"
+  else
+    (let _ = vec_set meta 1 9 in
+     let _ = vec_push strs (take (varu ())) in
+     // (the first line's number: a varsint)
+     let sl = varu () in
+     let _ = vec_set meta 0 (if sl % 2 == 1 then 0 - (sl + 1) / 2 else sl / 2) in
+     let rec lines = fn (k: int) -> if k <= 0 then () else (let _ = vec_push offs (varu ()) in lines (k - 1)) in
+     let _ = lines (varu ()) in
+     // (comments: a kind and a location; magic comments: two locations;
+     //  the __END__ location, when there is one)
+     let _ = skipv (varu () * 3) in
+     let _ = skipv (varu () * 4) in
+     let _ = (if byte () != 0 then skipv 2 else ()) in
+     // (errors and warnings: a type, a message, a location, a level)
+     let rec diags = fn (k: int) ->
+       if k <= 0 then ()
+       else (let _ = varu () in let _ = take (varu ()) in let _ = skipv 2 in let _ = byte () in diags (k - 1)) in
+     let nerr = varu () in
+     let _ = vec_set meta 3 nerr in
+     let _ = diags nerr in
+     let _ = diags (varu ()) in
+     let cbase = u32 (vec_get meta 1) in
+     let _ = skip 4 in
+     let csize = varu () in
+     let _ = vec_set meta 4 cbase in
+     let rec pool = fn (i: int) ->
+       if i >= csize then ()
+       else
+         (let off = cbase + i * 8 in
+          let s0 = u32 off in
+          let ln = u32 (off + 4) in
+          let s = (if s0 >= 2147483648 then
+                     (if s0 - 2147483648 + ln > total then (let _ = vec_set meta 2 1 in "") else str_of_bytes (bytes_slice ser (s0 - 2147483648) ln))
+                   else if s0 + ln > bytes_len src then (let _ = vec_set meta 2 1 in "")
+                   else str_of_bytes (bytes_slice src s0 ln)) in
+          let _ = vec_push cpool s in
+          pool (i + 1)) in
+     let _ = pool 0 in
+     // (an integer: small enough for a word, or its decimal digits among
+     //  the strings -- the words are 32 bits each, least first)
+     let lint = fn (u: unit) ->
+       (let neg = byte () != 0 in
+        let k = varu () in
+        let rec words = fn (i: int) -> fn (acc: int list) ->
+          if i >= k then acc else (let w = varu () in words (i + 1) (Cons (w, acc))) in
+        match words 0 Nil with
+        | Nil -> (0, 1)
+        | Cons (w, Nil) -> ((if neg then 0 - w else w), 1)
+        | Cons (hi, Cons (lo, Nil)) when hi < 536870912 ->
+          (let v = hi * 4294967296 + lo in ((if neg then 0 - v else v), 1))
+        | ws ->
+          (let d = ic_big_of_words ws in
+           let _ = vec_push strs (if neg then "-" ++ d else d) in
+           (vec_len strs - 1, 0))) in
+     let rec node = fn (u: unit) ->
+       (let ty = byte () in
+        let ks = ic_kinds ty in
+        if vec_get meta 2 == 1 then 0 - 1
+        else if str_len ks == 0 && ty != 0 && str_eq (ic_type_name ty) "?" then (let _ = vec_set meta 2 1 in 0 - 1)
+        else
+          (let nid = varu () in
+           let st = varu () in
+           let ln = varu () in
+           let lenp = str_len ks > 0 && str_eq (char_at ks 0) "!" in
+           let _ = (if lenp then skip 4 else ()) in
+           let flags = varu () in
+           let k0 = (if lenp then 1 else 0) in
+           let nf = str_len ks - k0 in
+           // (the node's words now, its fields' place reserved: the fields
+           //  of the nodes below it come after)
+           let me = vec_len nodes / 6 in
+           let base = vec_len fld in
+           let _ = vec_push nodes ty in
+           let _ = vec_push nodes nid in
+           let _ = vec_push nodes st in
+           let _ = vec_push nodes ln in
+           let _ = vec_push nodes flags in
+           let _ = vec_push nodes base in
+           let rec reserve = fn (i: int) -> if i >= nf * 2 then () else (let _ = vec_push fld 0 in reserve (i + 1)) in
+           let _ = reserve 0 in
+           let put = fn (j: int) -> fn (a: int) -> fn (b: int) ->
+             (let _ = vec_set fld (base + j * 2) a in vec_set fld (base + j * 2 + 1) b) in
+           let rec fields = fn (j: int) ->
+             if j >= nf then ()
+             else
+               (let k = ord (char_at ks (k0 + j)) in
+                let _ =
+                  // n node, N node?, L node[]
+                  (if k == 110 then put j (node ()) 0
+                   else if k == 78 then put j (opt_node ()) 0
+                   else if k == 76 then
+                     (let cnt = varu () in
+                      let xs = nodes_of cnt in
+                      let off = vec_len lst in
+                      let _ = list_iter xs (fn (x: int) -> vec_push lst x) in
+                      put j off cnt)
+                   // l location, o location?
+                   else if k == 108 then (let s = varu () in let l = varu () in put j s l)
+                   else if k == 111 then (if byte () == 0 then put j (0 - 1) 0 else (let s = varu () in let l = varu () in put j s l))
+                   // c constant, C constant?, K constant[]
+                   else if k == 99 || k == 67 then put j (varu ()) 0
+                   else if k == 75 then
+                     (let cnt = varu () in
+                      let off = vec_len lst in
+                      let rec cs = fn (i: int) -> if i <= 0 then () else (let _ = vec_push lst (varu ()) in cs (i - 1)) in
+                      let _ = cs cnt in
+                      put j off cnt)
+                   // s string, u uint32, b uint8, i integer, d double
+                   else if k == 115 then
+                     (let t = byte () in
+                      let s = (if t == 1 then
+                                 (let s0 = varu () in
+                                  let l = varu () in
+                                  if s0 + l > bytes_len src then (let _ = vec_set meta 2 1 in "") else str_of_bytes (bytes_slice src s0 l))
+                               else take (varu ())) in
+                      let _ = vec_push strs s in
+                      put j (vec_len strs - 1) 0)
+                   else if k == 117 then put j (varu ()) 0
+                   else if k == 98 then put j (byte ()) 0
+                   else if k == 105 then (let (a, b) = lint () in put j a b)
+                   else
+                     (let p = vec_get meta 1 in
+                      let _ = skip 8 in
+                      let _ = vec_push dbls (float_of_bits (u32 (p + 4)) (u32 p)) in
+                      put j (vec_len dbls - 1) 0)) in
+                fields (j + 1)) in
+           let _ = fields 0 in
+           me))
+     and opt_node = fn (u: unit) ->
+       (let p = vec_get meta 1 in
+        if p >= total then (let _ = vec_set meta 2 1 in 0 - 1)
+        else if bytes_get ser p == 0 then (let _ = skip 1 in 0 - 1)
+        else node ())
+     and nodes_of = fn (k: int) ->
+       if k <= 0 then (Nil : int list) else (let x = node () in Cons (x, nodes_of (k - 1))) in
+     let root = node () in
+     let _ = vec_set meta 5 root in
+     if vec_get meta 2 == 1 then "a serialized tree this cannot read" else "");
+
+// 32-bit words, most significant first, as decimal digits
+let ic_big_of_words = fn (ws: int list) ->
+  // (the number as base 10^9 limbs, least first)
+  let rec mul_add = fn (limbs: int list) -> fn (m: int) -> fn (carry: int) ->
+    (match limbs with
+     | Nil -> if carry == 0 then (Nil : int list) else Cons (carry % 1000000000, mul_add Nil m (carry / 1000000000))
+     | Cons (x, t) -> (let v = x * m + carry in Cons (v % 1000000000, mul_add t m (v / 1000000000)))) in
+  let rec go = fn (xs: int list) -> fn (limbs: int list) ->
+    (match xs with
+     | Nil -> limbs
+     // (times 2^32 in two steps of 2^16, so a limb times the factor stays in a word)
+     | Cons (w, t) -> go t (mul_add (mul_add limbs 65536 0) 65536 w)) in
+  let limbs = go ws Nil in
+  let rec pad = fn (s: str) -> if str_len s >= 9 then s else pad ("0" ++ s) in
+  let rec show = fn (xs: int list) -> fn (acc: str) ->
+    (match xs with
+     | Nil -> acc
+     | Cons (x, Nil) -> str_of_int x ++ acc
+     | Cons (x, t) -> show t (pad (str_of_int x) ++ acc)) in
+  match limbs with
+  | Nil -> "0"
+  | _ -> show limbs "";

@@ -158,3 +158,98 @@ A separate block-bearing refined Hash call falls through to an Array receiver
 on both the pre-round base and the corrected runtime. This pre-existing block
 dispatch gap is not claimed as repaired by the missing-hook guard; the
 original upstream inventory and its file verdicts remain unchanged.
+The source-audit correction also makes explicit physical gem libraries win
+before the bundled stdlib at its actual load-path position. do_require0 and
+resolve_feature share load_path_pick_shipped; witness 685 covers converted
+path entries, physical and relative imports, and real Marshal dump/load after
+clearing $LOAD_PATH. Mere's private serializer retains its existing internal
+loading behavior. This adds no public __marshal feature.
+
+The audited PR #90 build on main 3eb24fef retains 48 MATCH / 13 RED /
+1 MEMORY. All 62 reference files and 61 Mere files record a library from the
+locked gem's lib; the killed multipart process cannot finish an exit audit.
+The previous snapshot is preserved and the explicit command-only protocol
+transition reports no lost MATCH or changed reference coverage. Seven
+classification/provenance controls pass. The core runner's reference fallback
+now follows each runtime's stdlib, including the RubyGems-specific fallback.
+Require 51 MATCH / 1 BOTH, Autoload 27 / 1, GemVersion 32, Integer 38,
+TracePoint 97 and PP 36 MATCH retain the successful main controls. These
+focused results do not replace the complete hosted file-level merge gates.
+The integrated corpus is 705/705 MATCH and generated C needs bracket depth
+932, within the existing 1024 build limit. Only the check's search seed is
+updated to the measured depth; the compiler limit is unchanged.
+
+On the rounds 4-5 branch, the same source-audit correction and main 3eb24fef
+retain 50 MATCH / 11 RED / 0 BOTH / 1 MEMORY (normal O2 source f2f57fa7).
+The preserved pre-audit snapshot and transition now refer to this branch's
+own previous result; its two additional Rack MATCH files remain MATCH.
+Reference audits cover 62 files and Mere audits 61. No inventory, dependency
+or bound changes and no per-file comparison regressions.
+
+On the rounds 6-7 branch, normal audited O2 source d403f444 including main
+3eb24fef retains 51 MATCH / 10 RED / 0 BOTH / 1 MEMORY and 709/709 corpus
+matches. Reference and Mere audits cover 62 and 61 files. Its own pre-audit
+51-MATCH snapshot is preserved, and the explicit transition reports no lost
+MATCH or reference coverage. Subsequent hosted-driver and standalone-loader
+corrections are checked separately before claiming combined-head results.
+Hosted validation exposed reference-fallback ordering in other existing
+drivers and a fake interpreter that did not answer the new path query.
+runtime_load_path.sh now supplies the actual selected runtime's paths before
+reference fallbacks across core/bootstrap/tool, Unicode, NKF, Psych and YAML
+checks. The fake harness explicitly answers the query and verifies the order.
+Its 20 controls pass, as do Unicode, original NKF, Psych scalar/large-input/
+lifetime and YAML Store controls. No timeout, RSS or skip policy changes.
+
+Keep the existing standalone bundled-library contract as well: after the
+physical prefix is searched, shipped source remains available even when the
+user clears $LOAD_PATH. The original tmpdir-without-fileutils control passes;
+Marshal's internal implementation uses the same general fallback. Normal O2
+source 53e0077f retains the strict audited 48 MATCH / 13 RED / 1 MEMORY,
+zero regressions and 705/705 corpus matches.
+
+The bootstrap eval shortfall is independently corrected in const_assign_key:
+an immediate string-eval scope has no singleton constant namespace. Follow
+the existing lexical env and cref before a bare write, including iterator
+and retained Proc bodies, and raise the actual TypeError without touching
+the VM or collector. Witness 693. The original native bootstrap runner gives
+49/49 MATCH; core Eval 39 MATCH / 1 RED, Module 195 and Const 5 retain both
+baselines, and the isolated corpus gives 705/705. Combined-main validation
+is still required. Class.new blocks that change cref incorrectly and bare
+class declarations in such a scope remain separate existing lexical gaps;
+they are not claimed as fixed by the bare-write guard.
+
+Final combined rounds 6-7, normal O2 source 7a79b8db: 51 MATCH /
+11 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+Final combined rounds 4-5, normal O2 source 9730ae28: 50 MATCH /
+12 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+Final combined first gem-suite PR, normal O2 source 4ff6b54f: 48 MATCH /
+14 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+All 62 files on both sides finish the locked-library source audit. Multipart
+finishes below the RSS cap with one custom-params-hash error (test_0034),
+85 tests / 238 assertions versus the reference's 239. Its prior MEMORY/RED
+variation is not a new MATCH or an inferred VM/GC cause.
+File override, Chain, provenance and constant witnesses 676/677/685/693 match the reference. The earlier full corpus was 709/709 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
+The earlier full corpus was 707/707 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
+Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
+
+Audited rounds 8-9, O2 source 72effb05 on main 3eb24fef: two consecutive
+normal full runs give 53 MATCH / 9 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY.
+All 62 files on each side audit the locked library. Ordinary comparison
+against this branch's preserved pre-audit 52 MATCH / 9 RED / 1 MEMORY gives
+zero regressions, with identical source/dependency pins and reference tallies.
+Multipart gives 85 tests / 239 assertions in both runs, with peaks about
+1.69 and 1.36 GiB. Its earlier MEMORY/RED variation remains recorded; neither
+its cause nor attribution to a specific change is established by these runs.
+The macOS snapshot uses the second full run. Hosted Linux before the audit
+(43989409595) and after it (44248949546) both give 52 MATCH / 9 RED / 1 MEMORY,
+with no per-file regression. Multipart remains MEMORY in both Linux runs.
+Keep separate actual OS baselines and reject cross-platform comparisons;
+retain the macOS 53-MATCH gate and both original Linux observations.
+
+The subsequent rounds 10-11 candidate on the same main 12ca1df2 loses the
+parent's macOS multipart MATCH to MEMORY, both in a full run and a focused
+repeat. The parent's focused run still matches (85 tests / 239 assertions,
+1,450,768 KiB peak). This is a real per-file merge blocker despite equal
+total MATCH counts from a different gained file. Route the producer/reader
+resource investigation to the VM/performance session; no specific VM or GC
+cause is established. Keep the 600-second/2-GiB bounds and parent baseline.

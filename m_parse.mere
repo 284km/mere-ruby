@@ -568,6 +568,11 @@ let block_pass_marker = chr 1 ++ "block_pass";
 // mark (lvd_head), and run_stmts turns it into the names the rest of the
 // body assigns (env "__lvdecl"). A source without the word pays nothing.
 let lvdecl_mark = chr 1 ++ "lv";
+// The negation `unless` and `until` are written with: the condition's truth
+// turned over, and no call -- ruby compiles them to the other branch, where
+// a written `!x` is the method #!, which a class may define and a TracePoint
+// sees. (EUn's operator, beside "!".)
+let neg_op = "!u";
 let lvd_st = map_new ();
 // An interpolation in a heredoc's body runs at its own line, as ruby reports
 // it -- the body is lexed apart, at the line of `<<ID`. "on" while a body is
@@ -4643,6 +4648,13 @@ let is_setter_name = fn (name: str) ->
   // Every `===` in ruby/spec's method form went that way.
   (if (str_len name == 2 && str_eq name "==") || (str_len name == 3 && str_eq name "===") || (str_len name == 2 && str_eq name "!=") || (str_len name == 2 && str_eq name "<=") || (str_len name == 2 && str_eq name ">=") then false else true);
 
+// The read of `@x ||= v` / `@x &&= v`, wrapped (it evaluates the same) so
+// that the op-assignment can be told from the assignment `@x = @x || v`:
+// only the op-assignment skips the write when the variable already decides
+// the answer -- which is what lets a frozen object answer its memo -- and
+// the assignment writes, and raises FrozenError on a frozen object.
+let opassign_read = fn (base: str) -> fn (rd: Expr) ->
+  if str_eq base "||" || str_eq base "&&" then EStmt (SExpr rd) else rd;
 let opassign_base = fn (p: str) ->
   if str_eq p "+=" then "+" else if str_eq p "-=" then "-"
   else if str_eq p "*=" then "*" else if str_eq p "/=" then "/"
@@ -5102,6 +5114,15 @@ and parse_andor = fn toks ->
     else let (e, r2) = parse_expr toks in parse_andor_more e r2
   | _ -> let (e, r) = parse_expr toks in parse_andor_more e r
 
+// the operand after `and` / `or`, with the one-line pattern match that may
+// follow it
+and andor_match = fn (er: (Expr * Tok list)) ->
+  let (e, r) = er in
+  match r with
+  | Cons (TId w, rin) when str_eq w "in" -> (let (pat, r2) = parse_pattern_top rin in (EMatchTest (e, pat), r2))
+  | Cons (TP a, rin) when str_eq a "=>" -> (let (pat, r2) = parse_pattern_top rin in (EMatchBind (e, pat), r2))
+  | _ -> (e, r)
+
 and parse_andor_more = fn (lhs: Expr) -> fn toks ->
   match toks with
   // ruby 4.0: `and` / `or` at the start of the next line continues this one
@@ -5114,8 +5135,10 @@ and parse_andor_more = fn (lhs: Expr) -> fn toks ->
     // the right-hand side may continue on the next line (trailing `and` / `or`)
     // (`a and b c` is fine, `1 and foo = bar baz` is not: an assignment
     //  whose value is a command is a statement, not an expression)
-    if str_eq w "and" then let _ = cmd_clear () in let (rhs, r2) = parse_expr (skip_nls r) in let _ = cmd_asgn_refuse rhs in parse_andor_more (EBin ("&&", lhs, rhs)) r2
-    else if str_eq w "or" then let _ = cmd_clear () in let (rhs, r2) = parse_expr (skip_nls r) in let _ = cmd_asgn_refuse rhs in parse_andor_more (EBin ("||", lhs, rhs)) r2
+    // (the right side is an `expr`, and `arg in pat` / `arg => pat` is one:
+    //  `true or 1 in 1` is `true or (1 in 1)` -- andor_match)
+    if str_eq w "and" then let _ = cmd_clear () in let (rhs, r2) = andor_match (parse_expr (skip_nls r)) in let _ = cmd_asgn_refuse rhs in parse_andor_more (EBin ("&&", lhs, rhs)) r2
+    else if str_eq w "or" then let _ = cmd_clear () in let (rhs, r2) = andor_match (parse_expr (skip_nls r)) in let _ = cmd_asgn_refuse rhs in parse_andor_more (EBin ("||", lhs, rhs)) r2
     else (lhs, toks)
   | _ -> (lhs, toks)
 
@@ -6027,7 +6050,9 @@ and parse_block_inner = fn toks ->
   let (bp9, body9, r9) = parse_block_inner0 toks in
   // (after the defaults' nil-check prologue, which the arity and parameter
   //  readers expect at the very front)
-  (bp9, (if ol9 > 0 then dflt_prologue_then body9 (SLine (0 - ol9)) else body9), r9)
+  // (...and the block's number, which lets the same body made into a Proc
+  //  again be found without comparing it: blk_intern)
+  (bp9, (if ol9 > 0 then dflt_prologue_then body9 (SLine (blk_mark ol9 (blk_id_new ()))) else body9), r9)
 and parse_block_inner0 = fn toks ->
   match toks with
   | Cons (TP brace, r) ->
@@ -6444,7 +6469,10 @@ and parse_primary = fn toks ->
        | Cons (TP eq, r2) ->
          if str_eq eq "=" then let (e, r3) = parse_expr (skip_nls r2) in (EAssign (id, e), r3)
          else if not (str_eq (opassign_base eq) "") then
-           let (e, r3) = parse_expr (skip_nls r2) in (EAssign (id, EBin (opassign_base eq, EIVar (substring id 1 (str_len id)), e)), r3)
+           // (`@x ||= v` / `@x &&= v`: the read is wrapped, EStmt (SExpr ..),
+           //  so that it is told from `@x = @x || v`, which writes whatever
+           //  the right side is -- see opassign_read)
+           let (e, r3) = parse_expr (skip_nls r2) in (EAssign (id, EBin (opassign_base eq, opassign_read (opassign_base eq) (EIVar (substring id 1 (str_len id))), e)), r3)
          else (EIVar (substring id 1 (str_len id)), r)
        | _ -> (EIVar (substring id 1 (str_len id)), r))
     // `SP?` / `SP!` (net-imap's response parser): a capitalized name ending
@@ -8063,7 +8091,7 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
       let _ = cmd_asgn_refuse c0 in
       let _ = mrhs_refuse () in
       let c = cond_ff c0 in
-      apply_modifier (SIf (Cons ((EUn ("!", c), Cons (s, Nil)), Nil), Cons (SDeclare (Cons (mod_mark, Nil)), decl_of s))) r2
+      apply_modifier (SIf (Cons ((EUn (neg_op, c), Cons (s, Nil)), Nil), Cons (SDeclare (Cons (mod_mark, Nil)), decl_of s))) r2
     // ...and a loop modifier may be followed by another modifier, as the
     // conditional ones may: `return until x unless x` (test_syntax)
     // (their condition is read as one, as `if`'s is: a range there is a
@@ -8081,8 +8109,8 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
       let (c, r2) = (let (c00, r20) = cond_in_pattern (parse_andor (skip_nls r)) in (cond_ff c00, r20)) in
       let _ = mrhs_refuse () in
       (match s with
-       | SBegin (_, _, _, _) -> apply_modifier (SDoWhile (s, EUn ("!", c))) r2
-       | _ -> apply_modifier (loop_mod_decl s (SWhile (EUn ("!", c), Cons (s, Nil)))) r2)
+       | SBegin (_, _, _, _) -> apply_modifier (SDoWhile (s, EUn (neg_op, c))) r2
+       | _ -> apply_modifier (loop_mod_decl s (SWhile (EUn (neg_op, c), Cons (s, Nil)))) r2)
     else if str_eq id "rescue" then
       // `expr rescue fallback` — a one-line begin/rescue.
       // (after an assignment the fallback is an `arg`: a command call --
@@ -8131,6 +8159,11 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
                | SReturn _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: void value expression")) in fail "mere-ruby: void value expression")
                | _ -> ()) in
       let (s2, r2) = parse_stmt (skip_nls r) in
+      // (...and the right side's own one-line pattern match binds first:
+      //  `true or 1 in 1`)
+      let (s2, r2) = (match s2 with
+                      | SExpr e2 -> (match andor_match (e2, r2) with (e3, r3) -> (SExpr e3, r3))
+                      | _ -> (s2, r2)) in
       // (`1 and foo = bar baz`: the right side is an expression, and an
       //  assignment whose value is a command is a statement only)
       let _ = (if map_has parser_flags "stmtcmd" then
@@ -9348,7 +9381,7 @@ and parse_stmt_id = fn toks ->
            (let base = opassign_base p in
             let readx = (if str_eq base "||" && str_len nm > 0 && str_eq (char_at nm 0) "@"
                          then ECall ("__cvar_or_nil", Cons (EStrL (substring nm 1 (str_len nm)), Nil))
-                         else EIVar nm) in
+                         else opassign_read base (EIVar nm)) in
             (SIVarAssign (nm, EBin (base, readx, e)), r3))
          else let (e, r4) = parse_expr toks in (SExpr e, r4)
        | _ -> let (e, r5) = parse_expr toks in (SExpr e, r5))
@@ -10031,7 +10064,7 @@ and parse_if = fn toks -> fn (negate: bool) ->
        else (cond1, r0)
      | _ -> (cond1, r0)) in
   let cond0 = cond_ff_at r0 cond1 in
-  let cond = if negate then EUn ("!", cond0) else cond0 in
+  let cond = if negate then EUn (neg_op, cond0) else cond0 in
   let (body, r2) = parse_stmts (let _ = then_check "expected `then` or `;` or '\\n'" r in skip_then r) Nil in
   let (clauses, els, r3) = parse_if_tail r2 in
   (SIf (Cons ((cond, body), clauses), els), r3)
@@ -10292,7 +10325,7 @@ and parse_while = fn toks -> fn (negate: bool) ->
   // read as a condition, as `if`'s is: a flip-flop, a bare regexp, and the
   // literal warnings
   let cond0 = cond_ff_at r cond00 in
-  let cond = if negate then EUn ("!", cond0) else cond0 in
+  let cond = if negate then EUn (neg_op, cond0) else cond0 in
   let (body, r2) = parse_stmts (let _ = then_check "expected a predicate expression for the `while` statement" r in skip_then r) Nil in
   (SWhile (cond, body), expect_kw r2 "end")
 
@@ -10369,7 +10402,7 @@ and parse_in_guard = fn toks ->
   match toks with
   | Cons (TId id, r) ->
     if str_eq id "if" then let (c, r2) = parse_andor r in (c, r2)
-    else if str_eq id "unless" then let (c, r2) = parse_andor r in (EUn ("!", c), r2)
+    else if str_eq id "unless" then let (c, r2) = parse_andor r in (EUn (neg_op, c), r2)
     else (EBool true, toks)
   | _ -> (EBool true, toks)
 
@@ -12003,7 +12036,7 @@ and uv_targets = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (t
 and uv_cond = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (c: Expr) ->
   match c with
   | EAssign (n, v) -> (let _ = uv_def chain n true in uv_expr chain file v)
-  | EUn (op, a) when str_eq op "!" -> uv_cond chain file a
+  | EUn (op, a) when str_eq op "!" || str_eq op neg_op -> uv_cond chain file a
   | _ -> uv_expr chain file c
 and uv_exprs = fn (chain: (int * bool * bool) list) -> fn (file: str) -> fn (es: Expr list) ->
   match es with Nil -> () | Cons (e, t) -> (let _ = uv_expr chain file e in uv_exprs chain file t)
