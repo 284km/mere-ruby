@@ -24,8 +24,9 @@ source (`12ca1df2`) and `tools/build.sh` O2 flags were built with control Mere
 `68519ed1744a05088d08dd18019ce34b6e7feb01`. The compiler change updates the
 coroutine scanner's sorted live-block snapshot from a bounded local change log,
 falling back to a full rebuild for overflow or shared-list changes.
-CI pins `40761fb8405eb3b12e70bd14bd72871332f008c0`, which adds gate registration
-and its controls to that measured candidate; compiler/runtime sources are identical.
+Snapshot validation used Mere
+`40761fb8405eb3b12e70bd14bd72871332f008c0`, which adds gate registration and
+its controls to that measured candidate; compiler/runtime sources are identical.
 
 Three fresh processes per count and compiler alternated control/candidate.
 Wall time includes startup; peak RSS is from macOS `/usr/bin/time -l`.
@@ -49,6 +50,40 @@ off. The pinned CRuby `test_enum.rb`, `test_enumerator.rb` and
 control: 224 tests, 1,460 assertions, no failures/errors and one existing skip.
 The comparison used the unchanged 2 GiB process-family limit and a 180-second
 wall limit per side. These focused checks do not replace the complete CI suite.
+
+### Unsigned pin-word sorting
+
+The next compiler change sorts large pin lists with stable byte radix passes,
+skipping bytes shared by every input. Lists below 256 words and unsuccessful
+scratch allocations retain `qsort`. Both pin collection paths preserve every
+unsigned word and duplicate; the temporary scratch array is freed before return.
+
+CI now pins Mere `4720aa939c5f469307fa60c89edd99b4b18ce312`. On the same
+mere-ruby runtime source (`12ca1df2`) and O2 flags, fresh paired measurements
+compare this with the previous snapshot-update runtime (`40761fb8`). The host
+is the same arm64 macOS 26.7.1/Apple Clang environment. Three processes per
+count and compiler alternate control/candidate, reversing order in the second
+repetition. The full regression workload completed before timing began.
+
+| Generators | Previous runtime median [range] seconds | With radix sorting median [range] seconds | Median peak RSS previous / radix MiB |
+|---:|---:|---:|---:|
+| 1,000 | 0.515 [0.502, 0.562] | 0.460 [0.408, 0.509] | 280.94 / 280.92 |
+| 2,000 | 2.660 [2.657, 2.700] | 1.966 [1.914, 1.971] | 340.03 / 340.89 |
+| 4,000 | 9.318 [9.192, 9.387] | 6.977 [6.855, 7.619] | 411.98 / 412.48 |
+
+The 4,000-generator median is 25.1% shorter with comparable peak RSS. Every
+sample matches Ruby 4.0.9, including the retained generator. The earlier
+snapshot table is a separate measurement; this paired comparison isolates
+sorting. These are local workload timings, not complete workflow timings,
+and scaling is still faster than linear. Reproduce with the same build and
+benchmark commands above, retaining one interpreter from each compiler.
+
+The candidate again passes all 703 corpus programs in both hash-index modes
+and preserves all named-case results in the 224-test CRuby enum/enumerator/lazy
+suites (1,460 assertions, no failures/errors, one existing skip, the same limits).
+Upstream O2 and ASan/UBSan checks compare complete unsigned sequences against
+a reference sort in executable/library modes, force allocation failure and
+require six broken variants to produce their specific failure witnesses.
 
 ## `yaml_cycles.rb`
 
