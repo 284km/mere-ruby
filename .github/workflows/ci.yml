@@ -107,7 +107,7 @@ jobs:
           path: measurement-plan
           retention-days: 7
 
-  corpus:
+  build-macos:
     runs-on: macos-26
     timeout-minutes: 90
     outputs:
@@ -117,32 +117,12 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
-      - uses: actions/checkout@v5
-        with:
-          repository: merelang/mere
-          ref: ${{ env.MERE_REF }}
-          path: .mere-compiler
-          persist-credentials: false
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ env.REF_RUBY_VERSION }}
-      # Release downloads can return HTTP 504 before compilation. Retry setup
-      # once; a second failure still fails the job and prevents the build.
-      - uses: ocaml/setup-ocaml@v3
-        id: setup-ocaml
-        continue-on-error: true
+      - uses: ./.github/actions/setup-mere
         with:
-          ocaml-compiler: "5.1"
-      - name: Retry OCaml setup after a failed attempt
-        if: steps.setup-ocaml.outcome == 'failure'
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: "5.1"
-      - name: Build the pinned Mere compiler
-        working-directory: .mere-compiler
-        run: |
-          opam install . --deps-only
-          opam exec -- dune build bin/mere.exe
+          ref: ${{ env.MERE_REF }}
       - name: Install native OpenSSL build dependencies
         run: brew install openssl@3 pkgconf
       - name: Build the measurement binary at O2
@@ -151,6 +131,56 @@ jobs:
         run: python3 unittest/prism_query_boundary_check.py
       - name: Record binary provenance
         run: python3 unittest/ci.py build-info --compiler .mere-compiler --output build-info.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mere-ruby-macos
+          path: |
+            mere-ruby
+            .build_mode
+            build-info.json
+          include-hidden-files: true
+          retention-days: 7
+      - id: ready
+        run: echo "binary_sha=$(shasum -a 256 mere-ruby | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Package native inputs for verification
+        run: |
+          tar -czf native-build.tar.gz mr.c vendor/prism/obj/libprism.a capi/mere_capi.h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-build-macos
+          path: native-build.tar.gz
+          retention-days: 7
+
+  corpus:
+    needs: [build-macos]
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.REF_RUBY_VERSION }}
+      - uses: ./.github/actions/setup-mere
+        with:
+          ref: ${{ env.MERE_REF }}
+      - name: Install native OpenSSL build dependencies
+        run: brew install openssl@3 pkgconf
+      - uses: actions/download-artifact@v4
+        with:
+          name: mere-ruby-macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-build-macos
+      - name: Restore the exact O2 build and native inputs
+        env:
+          EXPECTED_SHA: ${{ needs.build-macos.outputs.binary_sha }}
+        run: |
+          chmod +x mere-ruby
+          test "$(shasum -a 256 mere-ruby | cut -d ' ' -f 1)" = "$EXPECTED_SHA"
+          tar -xzf native-build.tar.gz
       - name: Check deferred string-page compaction
         run: python3 unittest/string_page_compact_check.py
       - name: Check protected embedding lifecycle and archive
@@ -166,17 +196,6 @@ jobs:
         run: python3 unittest/gc_marks_check.py
       - name: Check character-device writes under backpressure
         run: python3 unittest/file_device_check.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mere-ruby-macos
-          path: |
-            mere-ruby
-            .build_mode
-            build-info.json
-          include-hidden-files: true
-          retention-days: 7
-      - id: ready
-        run: echo "binary_sha=$(shasum -a 256 mere-ruby | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
       - name: Check bounded argument-marker allocations
         run: python3 unittest/argument_marker_check.py
       - name: Check bounded Fiber scheduler handoffs and shutdown
@@ -312,10 +331,42 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rust_bin=$(dirname "$(rustup which --toolchain "$RUST_VERSION" rustc)")
           echo "UNITTEST_RUST_BIN=$rust_bin" >> "$GITHUB_ENV"
+      - name: Identify the reference native toolchain
+        id: reference-native
+        run: |
+          fingerprint=$(
+            {
+              printf '%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+              clang --version
+              xcrun --show-sdk-version
+              brew --prefix openssl@3
+              brew --prefix libyaml
+              brew list --versions openssl@3 libyaml
+            } | shasum -a 256 | cut -d ' ' -f 1
+          )
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: reference-cache
+        with:
+          path: reference-runtime.tar.gz
+          key: reference-ruby-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.RUBY_SOURCE_REF }}-${{ env.REF_RUBY_VERSION }}-${{ env.RUST_VERSION }}-${{ steps.reference-native.outputs.fingerprint }}-${{ hashFiles('unittest/build_reference.sh', 'unittest/test_data.py', 'unittest/test_data.json', '.github/workflows/ci.yml') }}
+      - name: Restore the cached reference runtime
+        if: steps.reference-cache.outputs.cache-hit == 'true'
+        run: tar -xzf reference-runtime.tar.gz
       - name: Build reference Ruby including test-only C extensions
+        if: steps.reference-cache.outputs.cache-hit != 'true'
         env:
           RUSTUP_TOOLCHAIN: ${{ env.RUST_VERSION }}
         run: sh unittest/build_reference.sh .ruby-tests "$GITHUB_WORKSPACE/.reference-ruby"
+      - name: Verify the reference runtime including both JITs and test extensions
+        run: |
+          .reference-ruby/bin/ruby --yjit -e 'abort "YJIT is unavailable" unless RubyVM::YJIT.enabled?'
+          .reference-ruby/bin/ruby --zjit -e 'abort "ZJIT is unavailable" unless RubyVM::ZJIT.enabled?'
+          arch=$(.reference-ruby/bin/ruby -rrbconfig -e 'print RbConfig::CONFIG.fetch("arch")')
+          .reference-ruby/bin/ruby -I "$GITHUB_WORKSPACE/.ruby-tests/.ext/$arch" -e '
+            abort "unexpected reference version" unless RUBY_VERSION == ENV.fetch("REF_RUBY_VERSION")
+            %w[-test-/integer -test-/file -test-/iter -test-/rb_call_super_kw].each { |name| require name }
+          '
       - name: Prepare checksum-pinned Unicode data and RubyGems fixtures
         run: python3 unittest/test_data.py .ruby-tests
       - name: Record reference provenance and package its runtime
@@ -346,6 +397,11 @@ jobs:
             "$reference" -I "$source/.unittest-reference" -I "$source/lib" \
               -I "$source/tool/lib" -I "$source/test" -r test/unit "$test" -v --seed=1
           done
+      - uses: actions/cache/save@v4
+        if: steps.reference-cache.outputs.cache-hit != 'true'
+        with:
+          path: reference-runtime.tar.gz
+          key: ${{ steps.reference-cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v4
         with:
           name: ruby-reference-macos
@@ -356,10 +412,10 @@ jobs:
 
   unittest-shards:
     name: CRuby tests / shard ${{ matrix.shard }}
-    needs: [unittest-plan, corpus, unittest-reference]
-    # Corpus differences do not suppress the measurement after a successful
-    # upload. A failed build still cannot supply an unrelated binary.
-    if: ${{ !cancelled() && needs.corpus.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
+    needs: [unittest-plan, build-macos, unittest-reference]
+    # Start as soon as both builds are ready; corpus verification runs separately.
+    # A failed build still cannot supply an unrelated binary.
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-macos.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
     runs-on: macos-26
     timeout-minutes: 330
     strategy:
@@ -458,8 +514,8 @@ jobs:
 
   bootstrap-shards:
     name: Bootstrap tests / shard ${{ matrix.shard }}
-    needs: [unittest-plan, corpus, unittest-reference]
-    if: ${{ !cancelled() && needs.corpus.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
+    needs: [unittest-plan, build-macos, unittest-reference]
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-macos.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
     runs-on: macos-26
     # Nine files per shard, two 600-second sides each, plus setup/upload.
     timeout-minutes: 210
@@ -545,8 +601,8 @@ jobs:
           retention-days: 7
 
   basic-measurement:
-    needs: [unittest-plan, corpus, unittest-reference]
-    if: ${{ !cancelled() && needs.corpus.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
+    needs: [unittest-plan, build-macos, unittest-reference]
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-macos.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -593,8 +649,8 @@ jobs:
 
   tool-shards:
     name: Tool tests / shard ${{ matrix.shard }}
-    needs: [unittest-plan, corpus, unittest-reference]
-    if: ${{ !cancelled() && needs.corpus.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
+    needs: [unittest-plan, build-macos, unittest-reference]
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-macos.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
     runs-on: macos-26
     # Twelve files, two 600-second sides each, plus setup/upload.
     timeout-minutes: 270
@@ -683,33 +739,14 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
-      - uses: actions/checkout@v5
-        with:
-          repository: merelang/mere
-          ref: ${{ env.MERE_REF }}
-          path: .mere-compiler
-          persist-credentials: false
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ env.REF_RUBY_VERSION }}
       - name: Install native OpenSSL build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config
-      # Keep the same bounded setup retry as the macOS build above.
-      - uses: ocaml/setup-ocaml@v3
-        id: setup-ocaml
-        continue-on-error: true
+      - uses: ./.github/actions/setup-mere
         with:
-          ocaml-compiler: "5.1"
-      - name: Retry OCaml setup after a failed attempt
-        if: steps.setup-ocaml.outcome == 'failure'
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: "5.1"
-      - name: Build the pinned Mere compiler
-        working-directory: .mere-compiler
-        run: |
-          opam install . --deps-only
-          opam exec -- dune build bin/mere.exe
+          ref: ${{ env.MERE_REF }}
       - name: Build mere-ruby on Linux
         run: sh tools/build.sh
       - name: Check Prism StringQuery byte boundaries
