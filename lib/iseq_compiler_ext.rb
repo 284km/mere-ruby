@@ -60,7 +60,9 @@ class RubyVM::InstructionSequence
     NEWARRAY_SEND_PACK_BUFFER = 5
     NEWARRAY_SEND_INCLUDE_P = 6
 
-    Label = Struct.new(:id, :pos, :refs, :sp, :unremovable)
+    # (rescued: compile.c's LABEL_RESCUE_BEG / _END, :beg / :end -- a region
+    #  no tail call is made in, iseq_optimize)
+    Label = Struct.new(:id, :pos, :refs, :sp, :unremovable, :rescued)
     # (vmx: what the VM's export adds after the operands -- to_a(u, true))
     Insn = Struct.new(:name, :ops, :line, :node_id, :events, :vmx)
     Trace = Struct.new(:event)
@@ -68,6 +70,9 @@ class RubyVM::InstructionSequence
     #  lowers the stack to its label's -- `pop` / `adjuststack` -- at layout)
     Adjust = Struct.new(:label, :line, :node_id, :restore)
     IVC = Struct.new(:index)
+    # (`once`'s inline storage entry: numbered on its own, shown after the
+    #  ivar and cvar caches)
+    ISE = Struct.new(:index, :base)
     # (is_entries holds the ivar caches first and the constant caches after
     #  them: an IC's place there, which disasm shows, is past every IVC)
     IC = Struct.new(:index, :segments, :base)
@@ -85,19 +90,30 @@ class RubyVM::InstructionSequence
     # (opt_case_dispatch's hash: the first `when` of a key wins; its labels
     #  are not counted as references, as compile.c's TS_CDHASH is not)
     CDHash = Struct.new(:entries)
+    # (checktype's operand: a type number, shown by its name)
+    CheckType = Struct.new(:n)
+    CHECK_TYPES = { 7 => "T_ARRAY", 8 => "T_HASH" }.freeze
 
     # rb_compile_option_t's defaults (the ones ISeq.compile_option shows)
     DEFAULT_OPTIONS = { inline_const_cache: true, peephole_optimization: true, tailcall_optimization: false,
                         specialized_instruction: true, operands_unification: true,
                         instructions_unification: false, frozen_string_literal: false }.freeze
 
-    THROUGH = %i[block rescue ensure].freeze
+    # (...and `once`'s own sequence, a :plain one)
+    THROUGH = %i[block rescue ensure plain].freeze
 
     # one instruction sequence being built, and what to_a / disasm read off it
     class Unit
       attr_reader :type, :label, :path, :abs_path, :first_lineno, :locals, :params,
                   :children, :elements, :code_location, :node_id, :parent
       attr_accessor :stack_max
+      # (branch coverage, kept by the file's top sequence: the bases by their
+      #  node -- [type, line, column, line, column, {branch id => [type,
+      #  line, column, line, column, counter]}] -- and how many counters)
+      attr_accessor :cov_bases, :cov_counters
+      # (how many flip-flops the method -- with its blocks -- has: each one's
+      #  state is a special variable of the method's frame, numbered from 2)
+      attr_accessor :flip_cnt
       attr_writer :opts, :parser
       def parser = (@parser || :prism)
       # (the catch table: [type, start, end, iseq, cont] as ADD_CATCH_ENTRY
@@ -175,6 +191,8 @@ class RubyVM::InstructionSequence
       def next_is = (@is_n = (@is_n || -1) + 1)
       def next_ic = (@ic_n = (@ic_n || -1) + 1)
       def ivc_size = (@is_n || -1) + 1
+      def next_ise = (@ise_n = (@ise_n || -1) + 1)
+      def ise_size = (@ise_n || -1) + 1
       def cvc(name) = CVC.new((@cvcs ||= {})[name] ||= @cvcs.size, nil)
       def cvc_size = (@cvcs ||= {}).size
       def at(line, node_id) = (@line, @node = line, node_id)
@@ -244,9 +262,11 @@ class RubyVM::InstructionSequence
       opts = DEFAULT_OPTIONS.merge(opts || {})
       # (what this compiler does not do yet it refuses: a tail call, the
       #  unified instruction pairs)
-      raise NotImplementedError, "RubyVM::InstructionSequence: tailcall_optimization is not compiled yet" if opts[:tailcall_optimization]
       raise NotImplementedError, "RubyVM::InstructionSequence: instructions_unification is not compiled yet" if opts[:instructions_unification]
       po = { filepath: path, line: line }
+      # (a source String in another encoding is read in it, as ruby reads
+      #  the String it is given: pm_options_encoding_set)
+      po[:encoding] = src.encoding.name unless src.encoding == Encoding::UTF_8 || src.encoding == Encoding::US_ASCII
       po[:frozen_string_literal] = true if opts[:frozen_string_literal]
       result = Prism.parse(src, **po)
       raise SyntaxError, result.errors.map(&:message).join("\n") unless result.success?
@@ -255,7 +275,16 @@ class RubyVM::InstructionSequence
       unit = Unit.new(:top, label, path, abs_path, line, root.locals, nil,
                       [l.start_line, l.start_column, l.end_line, l.end_column], root.node_id)
       # (__ENCODING__: the source's, which a magic comment may have named)
-      unit.opts = opts.merge(source_encoding: (result.respond_to?(:encoding) && result.encoding) || src.encoding)
+      enc = (result.respond_to?(:encoding) && result.encoding) || src.encoding
+      # (Prism's Ruby side answers UTF-8 for a source declared binary that
+      #  has UTF-8 bytes in it -- load_parse's "niche use-case"; the
+      #  parser's own encoding, what ruby compiles in, is the one the
+      #  serialized header names)
+      if enc == Encoding::UTF_8 && !src.ascii_only? && Prism.respond_to?(:dump)
+        d = Prism.dump(src, **po)
+        enc = (Encoding.find(d.byteslice(10, d.getbyte(9))) rescue enc)
+      end
+      unit.opts = opts.merge(source_encoding: enc)
       compile_body(unit, root.statements, root.node_id)
       finish(unit)
       unit
@@ -268,6 +297,8 @@ class RubyVM::InstructionSequence
       #  redo / next entries and a `next` in it name)
       if unit.type == :block
         unit.block_labels = [unit.new_label, unit.new_label]
+        unit.block_labels[0].rescued = :beg
+        unit.block_labels[1].rescued = :end
         unit.emit_label(unit.block_labels[0])
       end
       # (a body with rescue / ensure is a BeginNode)
@@ -312,8 +343,11 @@ class RubyVM::InstructionSequence
       when Prism::SelfNode then u.insn(:putself) unless popped
       when Prism::StringNode
         unless popped
+          # (`# frozen_string_literal: false` makes a literal mutable: putstring)
           if n.frozen?
             u.insn(:putobject, string_value(n).freeze)
+          elsif n.mutable?
+            u.insn(:putstring, string_value(n).freeze)
           else
             u.insn(:putchilledstring, string_value(n).freeze)
           end
@@ -359,6 +393,57 @@ class RubyVM::InstructionSequence
         here(u, n)
         u.insn(:splatarray, true) unless popped
       when Prism::IfNode, Prism::UnlessNode then branch(u, n, popped)
+      # (PM_FLIP_FLOP_NODE as a value: true or false of it)
+      when Prism::FlipFlopNode
+        final = u.new_label
+        then_l = u.new_label
+        else_l = u.new_label
+        flip_flop(u, n, else_l, then_l, n.location.start_line, popped)
+        here(u, n)
+        u.emit_label(then_l)
+        u.insn(:putobject, true)
+        u.insn(:jump, final)
+        u.emit_label(else_l)
+        u.insn(:putobject, false)
+        u.emit_label(final)
+      # PM_POST_EXECUTION_NODE: `END { }` -- once, a block that hands the
+      # block of the statements to core#set_postexe
+      when Prism::PostExecutionNode
+        l = n.location
+        outer = Unit.new(:block, block_label(u), u.path, u.abs_path, l.start_line, [], u,
+                         [l.start_line, l.start_column, l.end_line, l.end_column], n.node_id)
+        u.children << outer
+        outer.at(outer.first_lineno, n.node_id)
+        outer.event(:b_call)
+        outer.block_nop = outer.insn(:nop)
+        outer.block_labels = [outer.new_label, outer.new_label]
+        outer.block_labels[0].rescued = :beg
+        outer.block_labels[1].rescued = :end
+        outer.emit_label(outer.block_labels[0])
+        st = n.statements
+        sl = st ? st.location : l
+        inner = Unit.new(:block, block_label(u), u.path, u.abs_path, l.start_line, [], outer,
+                         [sl.start_line, sl.start_column, sl.end_line, sl.end_column], st ? st.node_id : n.node_id)
+        outer.children << inner
+        inner.at(inner.first_lineno, inner.node_id)
+        inner.event(:b_call)
+        inner.block_nop = inner.insn(:nop)
+        compile_body(inner, st, inner.node_id, sl.end_line)
+        finish(inner)
+        outer.at(l.start_line, n.node_id)
+        outer.insn(:putspecialobject, 1)
+        outer.insn(:send, ci(:"core#set_postexe", 0, CALL_FCALL, nil, true), inner)
+        outer.emit_label(outer.block_labels[1])
+        outer.event(:b_return)
+        outer.at(l.end_line, n.node_id)
+        outer.insn(:leave)
+        finish(outer)
+        here(u, n)
+        u.insn(:once, outer, ISE.new(u.next_ise))
+        u.insn(:pop) if popped
+      when Prism::CaseMatchNode then case_match_node(u, n, popped)
+      when Prism::MatchPredicateNode then match_predicate(u, n, popped)
+      when Prism::MatchRequiredNode then match_required(u, n, popped)
       when Prism::WhileNode, Prism::UntilNode then loop_node(u, n, popped)
       when Prism::DefNode then define(u, n, popped)
       when Prism::BreakNode then break_node(u, n, popped)
@@ -403,39 +488,63 @@ class RubyVM::InstructionSequence
         u.insn(:pop) if popped
       when Prism::InterpolatedStringNode then dstr(u, n, popped)
       when Prism::HashNode then hash_node(u, n, popped)
+      # (PM_KEYWORD_HASH_NODE as a value -- `return **h`: its elements made
+      #  a Hash, never a literal one)
+      when Prism::KeywordHashNode
+        hash_elements(u, n, n.elements, false)
+        u.insn(:pop) if popped
       when Prism::RangeNode then range_node(u, n, popped)
       when Prism::AndNode, Prism::OrNode then logical(u, n, popped)
       when Prism::ReturnNode then return_node(u, n, popped)
       when Prism::YieldNode then yield_node(u, n, popped)
       when Prism::ClassNode, Prism::ModuleNode then class_node(u, n, popped)
+      # (as a String literal is pushed: frozen, mutable or chilled)
       when Prism::SourceFileNode
-        u.insn(:putchilledstring, u.path.dup.freeze) unless popped
+        unless popped
+          u.insn(n.frozen? ? :putobject : n.mutable? ? :putstring : :putchilledstring, u.path.dup.freeze)
+        end
       when Prism::SourceLineNode
         u.insn(:putobject, n.location.start_line) unless popped
       when Prism::SourceEncodingNode
         u.insn(:putobject, u.opts[:source_encoding]) unless popped
       when Prism::RegularExpressionNode
         u.insn(:putobject, regexp_literal(n.unescaped, n)) unless popped
+      # PM_MATCH_LAST_LINE_NODE: a pattern as a condition is `pattern =~ $_`
+      when Prism::MatchLastLineNode
+        here(u, n)
+        u.insn(:putobject, regexp_literal(n.unescaped, n))
+        u.insn(:getspecial, 0, 0)
+        push_send(u, :=~, 1)
+        u.insn(:pop) if popped
       # pm_compile_regexp_dynamic: the pieces as an interpolated string's,
       # and toregexp of them with the literal's options
       when Prism::InterpolatedRegularExpressionNode
+        # (`/#{x}/o`: a sequence of its own -- the pieces and toregexp --
+        #  that `once` runs the first time and whose Regexp it answers from
+        #  then on, kept in an inline storage entry of this sequence)
         if n.once?
-          raise NotImplementedError, "RubyVM::InstructionSequence: an interpolated regexp with /o is not compiled yet"
+          l = n.location
+          child = Unit.new(:plain, block_label(u), u.path, u.abs_path, l.start_line, [], u,
+                           [l.start_line, l.start_column, l.end_line, l.end_column], n.node_id)
+          u.children << child
+          # (in its own sequence the pattern's instructions are the scope's,
+          #  of no node; the leave is the node's)
+          dregexp(child, Renumbered.new(n, 0), false)
+          # (the leave is on the last line an interpolation in it started)
+          child.at(child.last_line || n.location.start_line, n.node_id)
+          child.insn(:leave)
+          finish(child)
+          here(u, n)
+          u.insn(:once, child, ISE.new(u.next_ise))
+          u.insn(:pop) if popped
+          return
         end
         # (every piece a literal: the Regexp itself)
         if n.static_literal?
           u.insn(:putobject, regexp_literal(static_concat(n.parts), n)) unless popped
           return
         end
-        count, kinds = dstr(u, n, false, true)
-        here(u, n)
-        ins = u.insn(:toregexp, n.options & 0xff, count)
-        # (for the VM: the literal's flags as written and which pieces are
-        #  its own text, L, and which were computed, C -- what decides the
-        #  pattern's encoding and whose clash is whose error)
-        ins.vmx = [("i" if n.ignore_case?), ("x" if n.extended?), ("m" if n.multi_line?), ("n" if n.ascii_8bit?),
-                   ("u" if n.utf_8?), ("e" if n.euc_jp?), ("s" if n.windows_31j?)].join + "|" + kinds
-        u.insn(:pop) if popped
+        dregexp(u, n, popped)
       # $1 .. $9: getspecial of the number doubled; $&, $`, $', $+: of the
       # character doubled, plus 1
       when Prism::NumberedReferenceReadNode
@@ -659,6 +768,24 @@ class RubyVM::InstructionSequence
       str
     end
 
+    # parse_regexp_encoding: the encoding a pattern's n / u / e / s names
+    # (or binary, when an escape forces it), nil when it names none
+    def regexp_explicit_encoding(n)
+      if n.ascii_8bit? || n.forced_binary_encoding? then Encoding::BINARY
+      elsif n.utf_8? then Encoding::UTF_8
+      elsif n.euc_jp? then Encoding::EUC_JP
+      elsif n.windows_31j? then Encoding::Windows_31J
+      end
+    end
+
+    # parse_regexp_string_part: a literal piece of an interpolated pattern
+    # is in the pattern's named encoding when it names one, else as a
+    # String literal is
+    def regexp_part_value(n, part)
+      enc = regexp_explicit_encoding(n)
+      enc ? part.unescaped.dup.force_encoding(enc) : string_value(part)
+    end
+
     def static_value(n)
       case n
       when Prism::ArrayNode then n.elements.map { |e| static_value(e) }.freeze
@@ -671,6 +798,9 @@ class RubyVM::InstructionSequence
       when Prism::RangeNode
         range_literal(n.left && static_value(n.left), n.right && static_value(n.right), n.exclude_end?)
       when Prism::RegularExpressionNode then regexp_literal(n.unescaped, n)
+      # (a static interpolated string -- `"a#{"b"}"` in a literal Array --
+      #  is its pieces joined)
+      when Prism::InterpolatedStringNode then static_concat(n.parts).freeze
       # (pm_static_literal_value: __LINE__ is its line -- an element of a
       #  literal Array or Hash, a `when`'s value)
       when Prism::SourceLineNode then n.location.start_line
@@ -778,6 +908,17 @@ class RubyVM::InstructionSequence
     def call(u, n, popped, recv_done = false)
       line = (n.message_loc || n.location).start_line
       at = -> { u.at(line, n.node_id) }
+      # (`nil&.m(...)` is nil, and nothing of it is evaluated: compile.c's
+      #  optimiser folds the branchnil of a written nil and drops what
+      #  follows, leaving the receiver's own putnil)
+      #  (under branch coverage the branch's own nop keeps all of it)
+      if !recv_done && n.safe_navigation? && n.receiver.is_a?(Prism::NilNode) && !branch_coverage?(u)
+        unless popped
+          here(u, n.receiver)
+          u.insn(:putnil)
+        end
+        return
+      end
       # (a call with a block starts at a label a break entry may name)
       start = u.new_label
       u.emit_label(start) if n.block && !recv_done
@@ -806,12 +947,22 @@ class RubyVM::InstructionSequence
       end
       fcall = r.nil? || n.ignore_visibility?
       else_l = end_l = nil
+      safe_cov = safe_loc = nil
       if n.safe_navigation?
         else_l = u.new_label
         end_l = u.new_label
+        if branch_coverage?(u)
+          # (from the call's start to the last of its closing parenthesis,
+          #  its arguments and its name)
+          last = [n.closing_loc, n.arguments&.location, n.message_loc].compact.max_by(&:end_offset)
+          sl = n.location
+          safe_loc = [sl.start_line, sl.start_column, last.end_line, last.end_column]
+          safe_cov = branch_base(u, n, safe_loc, :"&.")
+        end
         at.()
         u.insn(:dup)
         u.insn(:branchnil, else_l)
+        branch_cov(u, safe_cov, safe_loc, n.node_id, 0, :then) if safe_cov
       end
       prelude = u.elements.size
       argc, flag, kws = setup_args(u, n.arguments, n.block, [line, n.node_id])
@@ -870,6 +1021,7 @@ class RubyVM::InstructionSequence
       if else_l
         u.insn(:jump, end_l)
         u.emit_label(else_l)
+        branch_cov(u, safe_cov, safe_loc, n.node_id, 1, :else) if safe_cov
         u.emit_label(end_l)
       end
       u.insn(:pop) if write
@@ -879,9 +1031,6 @@ class RubyVM::InstructionSequence
     # `for x in c`: c.each with a block whose one parameter is hidden and
     # written to x (a local of the scope around) before the block's b_call
     def for_node(u, n, popped)
-      unless n.index.is_a?(Prism::LocalVariableTargetNode)
-        raise NotImplementedError, "RubyVM::InstructionSequence: a for loop over this target is not compiled yet"
-      end
       retry_l = u.new_label
       retry_end = u.new_label
       u.emit_label(retry_l)
@@ -894,13 +1043,13 @@ class RubyVM::InstructionSequence
       hidden = 0
       child = Unit.new(:block, label, u.path, u.abs_path, l.start_line, [hidden], u,
                        [l.start_line, l.start_column, l.end_line, l.end_column], n.node_id)
-      child.params[:lead_num] = 1
+      t = n.index
+      if t.is_a?(Prism::LocalVariableTargetNode) then child.params[:lead_num] = 1
+      else child.params[:rest_start] = 0
+      end
       child.params[:for] = true
       u.children << child
-      t = n.index
-      child.at(t.location.start_line, t.node_id)
-      child.insn(:getlocal, *local_ref(child, hidden, 0))
-      child.insn(:setlocal, *local_ref(child, t.name, t.depth + 1))
+      for_index(child, t, hidden)
       child.at(l.start_line, n.node_id)
       child.event(:b_call)
       child.block_nop = child.insn(:nop)
@@ -911,6 +1060,67 @@ class RubyVM::InstructionSequence
       u.emit_label(retry_end)
       u.insn(:pop) if popped
       u.add_catch(:break, retry_l, retry_end, child, retry_end)
+    end
+
+    # pm_compile_for_node_index: the block's one parameter written to the
+    # loop's target -- a local as it is; any other single target as the one
+    # element of the parameters; several targets as the parameters, or as
+    # the one parameter when it converts to an Array
+    def for_index(child, t, hidden)
+      child.at(t.location.start_line, t.node_id)
+      case t
+      when Prism::LocalVariableTargetNode
+        child.insn(:getlocal, *local_ref(child, hidden, 0))
+        child.insn(:setlocal, *local_ref(child, t.name, t.depth + 1))
+      when Prism::SplatNode, Prism::MultiTargetNode
+        writes = []
+        cleanup = []
+        st = MState.new(0, 0, [])
+        # (no state is handed down here, so a call or an index target's topn
+        #  stays as it was written -- reaching a value, not its receiver:
+        #  ruby 4.0's `for o.x, y in [[1, 2]]` calls x= on the 2. The
+        #  sequence is ruby's, and so is what it does.)
+        if t.is_a?(Prism::MultiTargetNode) then multi_target(child, t, writes, cleanup, st)
+        else target(child, t, writes, cleanup, st)
+        end
+        # (the four calls are on the value, with FCALL as ruby writes them:
+        #  marked for the VM, to which FCALL is a call without a receiver)
+        not_single = child.new_label
+        not_ary = child.new_label
+        child.at(t.location.start_line, t.node_id)
+        child.insn(:getlocal, *local_ref(child, hidden, 0))
+        child.insn(:dup)
+        child.insn(:send, CallData.new(:length, CALL_FCALL | CALL_ARGS_SIMPLE, 0, nil), nil).vmx = :recv
+        child.insn(:putobject, 1)
+        child.insn(:send, CallData.new(:==, CALL_FCALL | CALL_ARGS_SIMPLE, 1, nil), nil).vmx = :recv
+        child.insn(:branchunless, not_single)
+        child.insn(:dup)
+        child.insn(:putobject, 0)
+        child.insn(:send, CallData.new(:[], CALL_FCALL | CALL_ARGS_SIMPLE, 1, nil), nil).vmx = :recv
+        child.insn(:putobject, Array)
+        child.insn(:swap)
+        child.insn(:send, CallData.new(:try_convert, CALL_FCALL | CALL_ARGS_SIMPLE, 1, nil), nil).vmx = :recv
+        child.insn(:dup)
+        child.insn(:branchunless, not_ary)
+        child.insn(:swap)
+        child.emit_label(not_ary)
+        child.insn(:pop)
+        child.emit_label(not_single)
+        child.insn(:expandarray, 0, t.expression.nil? ? 0 : 1) if t.is_a?(Prism::SplatNode)
+        child.append(writes)
+        child.append(cleanup)
+      else
+        writes = []
+        cleanup = []
+        st = MState.new(0, 1, [])
+        target(child, t, writes, cleanup, st)
+        child.at(t.location.start_line, t.node_id)
+        child.insn(:getlocal, *local_ref(child, hidden, 0))
+        child.insn(:expandarray, 1, 0)
+        child.append(writes)
+        child.append(cleanup)
+        mstate_update(st)
+      end
     end
 
     # make_name_for_block: one, and one more for each block from the scope
@@ -1221,6 +1431,41 @@ class RubyVM::InstructionSequence
 
     # (a lambda's sequence starts at its opening and its location at its
     #  parameters, or just after the ->)
+    # a node under another node id: the same node, but for where its
+    # instructions say they are from
+    class Renumbered
+      def initialize(n, id)
+        @n = n
+        @id = id
+      end
+      def node_id = @id
+      def is_a?(k) = @n.is_a?(k)
+      alias kind_of? is_a?
+      def method_missing(m, *a, &b) = @n.__send__(m, *a, &b)
+      def respond_to_missing?(m, priv = false) = @n.respond_to?(m, priv)
+    end
+
+    # pm_compile_regexp_dynamic: the pieces, and toregexp of them with the
+    # literal's options
+    def dregexp(u, n, popped)
+      count, kinds = dstr(u, n, false, true)
+      here(u, n)
+      ins = u.insn(:toregexp, n.options & 0xff, count)
+      # (for the VM: the literal's flags as written and which pieces are
+      #  its own text, L, and which were computed, C -- what decides the
+      #  pattern's encoding and whose clash is whose error)
+      ins.vmx = [("i" if n.ignore_case?), ("x" if n.extended?), ("m" if n.multi_line?), ("n" if n.ascii_8bit?),
+                 ("u" if n.utf_8?), ("e" if n.euc_jp?), ("s" if n.windows_31j?)].join + "|" + kinds
+      u.insn(:pop) if popped
+    end
+
+    # make_name_for_block: "block in m", "block (2 levels) in m"
+    def block_label(u)
+      levels = block_levels(u)
+      name = u.local_iseq.label
+      levels == 1 ? "block in #{name}" : "block (#{levels} levels) in #{name}"
+    end
+
     def block_unit(u, b, first_line = nil, start = nil)
       method_unit = u
       method_unit = method_unit.local_iseq
@@ -1539,10 +1784,11 @@ class RubyVM::InstructionSequence
       cur_at = [n.location.start_line, n.node_id]
       n.parts.each_with_index do |part, i|
         if part.is_a?(Prism::StringNode)
+          v = regexp ? regexp_part_value(n, part) : string_value(part)
           if cur
-            cur << string_value(part)
+            cur << v
           else
-            cur = string_value(part)
+            cur = v
             cur_at = [part.location.end_line, part.node_id] if i != 0
           end
           next
@@ -1550,10 +1796,11 @@ class RubyVM::InstructionSequence
         interpolated = true
         if part.is_a?(Prism::EmbeddedStatementsNode) && part.statements && part.statements.body.size == 1 &&
            part.statements.body[0].is_a?(Prism::StringNode)
+          v = regexp ? regexp_part_value(n, part.statements.body[0]) : string_value(part.statements.body[0])
           if cur
-            cur << string_value(part.statements.body[0])
+            cur << v
           else
-            cur = string_value(part.statements.body[0])
+            cur = v
             cur_at = [part.location.start_line, part.node_id]
           end
           next
@@ -1564,13 +1811,7 @@ class RubyVM::InstructionSequence
         if cur.nil? && n.parts.size == 1
           enc = u.opts[:source_encoding] || Encoding::UTF_8
           if regexp
-            enc = if n.ascii_8bit? || n.forced_binary_encoding? then Encoding::BINARY
-                  elsif n.utf_8? then Encoding::UTF_8
-                  elsif n.euc_jp? then Encoding::EUC_JP
-                  elsif n.windows_31j? then Encoding::Windows_31J
-                  elsif enc == Encoding::US_ASCII then Encoding::BINARY
-                  else enc
-                  end
+            enc = regexp_explicit_encoding(n) || (enc == Encoding::US_ASCII ? Encoding::BINARY : enc)
           end
           cur = String.new(encoding: enc)
         end
@@ -1583,10 +1824,13 @@ class RubyVM::InstructionSequence
         end
         case part
         when Prism::EmbeddedStatementsNode
+          # (`#{}`: a nil no node stands for -- PUSH_SYNTHETIC_PUTNIL)
           if part.statements.nil? || part.statements.body.empty?
-            raise NotImplementedError, "RubyVM::InstructionSequence: an empty interpolation is not compiled yet"
+            u.at(part.location.start_line, -1)
+            u.insn(:putnil)
+          else
+            node(u, part.statements, false)
           end
-          node(u, part.statements, false)
         when Prism::InterpolatedStringNode then node(u, part, false)
         # ("#@a", "#$g", "#@@c": the variable read)
         when Prism::EmbeddedVariableNode then node(u, part.variable, false)
@@ -1751,12 +1995,14 @@ class RubyVM::InstructionSequence
       if lit.(lo) && lit.(hi)
         u.insn(:putobject, range_literal(val.(lo), val.(hi), excl)) unless popped
       else
-        # (an absent bound's nil is the range node's own instruction)
-        if lo then node(u, lo, false) else here(u, n); u.insn(:putnil) end
-        if hi then node(u, hi, false) else here(u, n); u.insn(:putnil) end
-        here(u, n)
-        u.insn(:newrange, excl ? 1 : 0)
-        u.insn(:pop) if popped
+        # (an absent bound's nil is the range node's own instruction; a
+        #  Range nobody reads is only what its bounds do)
+        if lo then node(u, lo, popped) elsif !popped then here(u, n); u.insn(:putnil) end
+        if hi then node(u, hi, popped) elsif !popped then here(u, n); u.insn(:putnil) end
+        unless popped
+          here(u, n)
+          u.insn(:newrange, excl ? 1 : 0)
+        end
       end
     end
 
@@ -1786,7 +2032,8 @@ class RubyVM::InstructionSequence
       end
       # (a file's own return answers nothing: rb_warn at compile, which a
       #  file compiled for the VM to run says as ruby says it)
-      if u.type == :top && u.opts[:vm_file] && n.arguments
+      # (rb_warn: nothing at all under -W0, where $VERBOSE is nil)
+      if u.type == :top && u.opts[:vm_file] && n.arguments && !$VERBOSE.nil?
         Warning.warn("#{u.path}:#{n.location.start_line}: warning: argument of top-level return is ignored\n")
       end
       sp_l = u.new_label
@@ -2005,6 +2252,8 @@ class RubyVM::InstructionSequence
       return unless lfin[1]
       lstart = u.new_label
       lend = u.new_label
+      lstart.rescued = :beg
+      lend.rescued = :end
       guard = Unit.new(:rescue, "defined guard in #{u.label}", u.path, u.abs_path, 0, [ERRINFO], u, [0, 0, -1, -1], 0)
       guard.parser = :"parse.y"
       guard.at(0, -1)
@@ -2186,6 +2435,8 @@ class RubyVM::InstructionSequence
       rc = n.rescue_clause
       lstart = u.new_label
       lend = u.new_label
+      lstart.rescued = :beg
+      lend.rescued = :end
       lcont = u.new_label
       child = exception_unit(u, :rescue, rc.location.start_line, rc.location, rc.node_id)
       node(child, rc, false)
@@ -2287,6 +2538,8 @@ class RubyVM::InstructionSequence
       finish(child)
       lstart = u.new_label
       lend = u.new_label
+      lstart.rescued = :beg
+      lend.rescued = :end
       lcont = u.new_label
       u.emit_label(lstart)
       was = u.in_rescue
@@ -2383,15 +2636,658 @@ class RubyVM::InstructionSequence
     # prism_compile.c's pm_compile_case_node: the conditions and the bodies
     # built apart; with a subject, a dispatch hash of the literal `when`s,
     # the `===` chain, the else part, then the bodies
+    # -- pattern matching (prism_compile.c's pm_compile_pattern and the nodes
+    # that use it: `case / in`, `expr => pattern`, `expr in pattern`) ---------
+    # The stack is the scratch space, as there: under the value being matched
+    # sit a deconstruct cache and, for a single pattern, the error string, the
+    # "is it a key error" flag and that error's matchee and key. `base` is how
+    # far down they are from where the pattern started.
+    PAT_CACHE = 0
+    PAT_ERROR_STRING = 1
+    PAT_KEY_ERROR_P = 2
+    PAT_KEY_ERROR_MATCHEE = 3
+    PAT_KEY_ERROR_KEY = 4
+
+    def pat_str(s) = s.encode(Encoding::US_ASCII).freeze
+
+    # pm_compile_pattern_generic_error
+    def pattern_generic_error(u, n, message, base)
+      ok = u.new_label
+      here(u, n)
+      u.insn(:dup)
+      u.insn(:branchif, ok)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str(message))
+      u.insn(:topn, 3)
+      push_send(u, :"core#sprintf", 2)
+      u.insn(:setn, base + PAT_ERROR_STRING + 1)
+      u.insn(:putobject, false)
+      u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+      u.insn(:pop)
+      u.insn(:pop)
+      u.emit_label(ok)
+    end
+
+    # pm_compile_pattern_length_error
+    def pattern_length_error(u, n, message, length, base)
+      ok = u.new_label
+      here(u, n)
+      u.insn(:dup)
+      u.insn(:branchif, ok)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str(message))
+      u.insn(:topn, 3)
+      u.insn(:dup)
+      push_send(u, :length, 0)
+      u.insn(:putobject, length)
+      push_send(u, :"core#sprintf", 4)
+      u.insn(:setn, base + PAT_ERROR_STRING + 1)
+      u.insn(:putobject, false)
+      u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+      u.insn(:pop)
+      u.insn(:pop)
+      u.emit_label(ok)
+    end
+
+    # pm_compile_pattern_eqq_error
+    def pattern_eqq_error(u, n, base)
+      ok = u.new_label
+      here(u, n)
+      u.insn(:dup)
+      u.insn(:branchif, ok)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str("%p === %p does not return true"))
+      u.insn(:topn, 3)
+      u.insn(:topn, 5)
+      push_send(u, :"core#sprintf", 3)
+      u.insn(:setn, base + PAT_ERROR_STRING + 1)
+      u.insn(:putobject, false)
+      u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+      u.insn(:pop)
+      u.insn(:pop)
+      u.emit_label(ok)
+      u.insn(:setn, 2)
+      u.insn(:pop)
+      u.insn(:pop)
+    end
+
+    # pm_compile_pattern_match: falls through when the pattern matches
+    def pattern_match(u, n, unmatched, single, cache, base)
+      matched = u.new_label
+      pattern(u, n, matched, unmatched, single, cache, base)
+      u.emit_label(matched)
+    end
+
+    # pm_compile_pattern_deconstruct
+    def pattern_deconstruct(u, n, deconstruct, match_failed, deconstructed, type_error, single, cache, base)
+      here(u, n)
+      if cache
+        u.insn(:topn, base + PAT_CACHE)
+        u.insn(:branchnil, deconstruct)
+        u.insn(:topn, base + PAT_CACHE)
+        u.insn(:branchunless, match_failed)
+        u.insn(:pop)
+        u.insn(:topn, base + PAT_CACHE - 1)
+        u.insn(:jump, deconstructed)
+      else
+        u.insn(:jump, deconstruct)
+      end
+      u.emit_label(deconstruct)
+      u.insn(:dup)
+      u.insn(:putobject, :deconstruct)
+      push_send(u, :respond_to?, 1)
+      u.insn(:setn, base + PAT_CACHE + 1) if cache
+      pattern_generic_error(u, n, "%p does not respond to #deconstruct", base + 1) if single
+      here(u, n)
+      u.insn(:branchunless, match_failed)
+      push_send(u, :deconstruct, 0)
+      u.insn(:setn, base + PAT_CACHE) if cache
+      u.insn(:dup)
+      u.insn(:checktype, CheckType.new(7))
+      u.insn(:branchunless, type_error)
+      u.emit_label(deconstructed)
+    end
+
+    # pm_compile_pattern_constant: the constant an array, find or hash
+    # pattern is written under
+    def pattern_constant(u, n, match_failed, single, base)
+      here(u, n)
+      u.insn(:dup)
+      node(u, n, false)
+      here(u, n)
+      u.insn(:dupn, 2) if single
+      u.insn(:checkmatch, 2)
+      pattern_eqq_error(u, n, base + 3) if single
+      here(u, n)
+      u.insn(:branchunless, match_failed)
+    end
+
+    # pm_compile_pattern_error_handler: what a single pattern that did not
+    # match raises
+    def pattern_error_handler(u, n, done, popped)
+      key_error = u.new_label
+      cleanup = u.new_label
+      here(u, n)
+      u.insn(:putspecialobject, 1)
+      u.insn(:topn, PAT_KEY_ERROR_P + 2)
+      u.insn(:branchif, key_error)
+      u.insn(:putobject, NoMatchingPatternError)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str("%p: %s"))
+      u.insn(:topn, 4)
+      u.insn(:topn, PAT_ERROR_STRING + 6)
+      push_send(u, :"core#sprintf", 3)
+      push_send(u, :"core#raise", 2)
+      u.insn(:jump, cleanup)
+      u.emit_label(key_error)
+      u.insn(:putobject, NoMatchingPatternKeyError)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, pat_str("%p: %s"))
+      u.insn(:topn, 4)
+      u.insn(:topn, PAT_ERROR_STRING + 6)
+      push_send(u, :"core#sprintf", 3)
+      u.insn(:topn, PAT_KEY_ERROR_MATCHEE + 4)
+      u.insn(:topn, PAT_KEY_ERROR_KEY + 5)
+      push_send(u, :new, 1, CALL_KWARG, %i[matchee key])
+      push_send(u, :"core#raise", 1)
+      u.emit_label(cleanup)
+      u.insn(:adjuststack, 7)
+      u.insn(:putnil) unless popped
+      u.insn(:jump, done)
+      u.insn(:dupn, 5)
+      u.insn(:putnil) if popped
+    end
+
+    # the TypeError a #deconstruct or #deconstruct_keys of the wrong type is
+    def pattern_type_error(u, n, type_error, message)
+      u.emit_label(type_error)
+      u.insn(:putspecialobject, 1)
+      u.insn(:putobject, TypeError)
+      u.insn(:putobject, pat_str(message))
+      push_send(u, :"core#raise", 2)
+      u.insn(:pop)
+    end
+
+    # pm_compile_pattern
+    def pattern(u, n, matched, unmatched, single, cache, base)
+      at = -> { here(u, n) }
+      case n
+      when Prism::ArrayPatternNode
+        req = n.requireds
+        posts = n.posts
+        min = req.size + posts.size
+        rest_named = n.rest.is_a?(Prism::SplatNode) && !n.rest.expression.nil?
+        use_rest_size = !n.rest.nil? && (rest_named || posts.size > 0)
+        match_failed = u.new_label
+        type_error = u.new_label
+        deconstruct = u.new_label
+        deconstructed = u.new_label
+        at.()
+        if use_rest_size
+          u.insn(:putobject, 0)
+          u.insn(:swap)
+          base += 1
+        end
+        pattern_constant(u, n.constant, match_failed, single, base) if n.constant
+        pattern_deconstruct(u, n, deconstruct, match_failed, deconstructed, type_error, single, cache, base)
+        at.()
+        u.insn(:dup)
+        push_send(u, :length, 0)
+        u.insn(:putobject, min)
+        push_send(u, n.rest.nil? ? :== : :>=, 1)
+        if single
+          pattern_length_error(u, n, n.rest.nil? ? "%p length mismatch (given %p, expected %p)" : "%p length mismatch (given %p, expected %p+)", min, base + 1)
+        end
+        at.()
+        u.insn(:branchunless, match_failed)
+        req.each_with_index do |r, i|
+          at.()
+          u.insn(:dup)
+          u.insn(:putobject, i)
+          push_send(u, :[], 1)
+          pattern_match(u, r, match_failed, single, false, base + 1)
+        end
+        if n.rest
+          if rest_named
+            at.()
+            u.insn(:dup)
+            u.insn(:putobject, req.size)
+            u.insn(:topn, 1)
+            push_send(u, :length, 0)
+            u.insn(:putobject, min)
+            push_send(u, :-, 1)
+            u.insn(:setn, 4)
+            push_send(u, :[], 2)
+            pattern_match(u, n.rest.expression, match_failed, single, false, base + 1)
+          elsif posts.size > 0
+            at.()
+            u.insn(:dup)
+            push_send(u, :length, 0)
+            u.insn(:putobject, min)
+            push_send(u, :-, 1)
+            u.insn(:setn, 2)
+            u.insn(:pop)
+          end
+        end
+        posts.each_with_index do |q, i|
+          at.()
+          u.insn(:dup)
+          u.insn(:putobject, req.size + i)
+          u.insn(:topn, 3)
+          push_send(u, :+, 1)
+          push_send(u, :[], 1)
+          pattern_match(u, q, match_failed, single, false, base + 1)
+        end
+        at.()
+        u.insn(:pop)
+        u.insn(:pop) if use_rest_size
+        u.insn(:jump, matched)
+        u.insn(:putnil)
+        u.insn(:putnil) if use_rest_size
+        pattern_type_error(u, n, type_error, "deconstruct must return Array")
+        u.emit_label(match_failed)
+        u.insn(:pop)
+        u.insn(:pop) if use_rest_size
+        u.insn(:jump, unmatched)
+      when Prism::FindPatternNode
+        size = n.requireds.size
+        match_failed = u.new_label
+        type_error = u.new_label
+        deconstruct = u.new_label
+        deconstructed = u.new_label
+        pattern_constant(u, n.constant, match_failed, single, base) if n.constant
+        pattern_deconstruct(u, n, deconstruct, match_failed, deconstructed, type_error, single, cache, base)
+        at.()
+        u.insn(:dup)
+        push_send(u, :length, 0)
+        u.insn(:putobject, size)
+        push_send(u, :>=, 1)
+        pattern_length_error(u, n, "%p length mismatch (given %p, expected %p+)", size, base + 1) if single
+        at.()
+        u.insn(:branchunless, match_failed)
+        while_begin = u.new_label
+        next_loop = u.new_label
+        find_succeeded = u.new_label
+        find_failed = u.new_label
+        u.insn(:dup)
+        push_send(u, :length, 0)
+        u.insn(:dup)
+        u.insn(:putobject, size)
+        push_send(u, :-, 1)
+        u.insn(:putobject, 0)
+        u.emit_label(while_begin)
+        u.insn(:dup)
+        u.insn(:topn, 2)
+        push_send(u, :<=, 1)
+        u.insn(:branchunless, find_failed)
+        n.requireds.each_with_index do |r, i|
+          at.()
+          u.insn(:topn, 3)
+          u.insn(:topn, 1)
+          if i != 0
+            u.insn(:putobject, i)
+            push_send(u, :+, 1)
+          end
+          push_send(u, :[], 1)
+          pattern_match(u, r, next_loop, single, false, base + 4)
+        end
+        if n.left.expression
+          at.()
+          u.insn(:topn, 3)
+          u.insn(:putobject, 0)
+          u.insn(:topn, 2)
+          push_send(u, :[], 2)
+          pattern_match(u, n.left.expression, find_failed, single, false, base + 4)
+        end
+        if n.right.expression
+          at.()
+          u.insn(:topn, 3)
+          u.insn(:topn, 1)
+          u.insn(:putobject, size)
+          push_send(u, :+, 1)
+          u.insn(:topn, 3)
+          push_send(u, :[], 2)
+          pattern_match(u, n.right.expression, find_failed, single, false, base + 4)
+        end
+        at.()
+        u.insn(:jump, find_succeeded)
+        u.emit_label(next_loop)
+        u.insn(:putobject, 1)
+        push_send(u, :+, 1)
+        u.insn(:jump, while_begin)
+        u.emit_label(find_failed)
+        u.insn(:adjuststack, 3)
+        if single
+          u.insn(:putspecialobject, 1)
+          u.insn(:putobject, pat_str("%p does not match to find pattern"))
+          u.insn(:topn, 2)
+          push_send(u, :"core#sprintf", 2)
+          u.insn(:setn, base + PAT_ERROR_STRING + 1)
+          u.insn(:putobject, false)
+          u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+          u.insn(:pop)
+          u.insn(:pop)
+        end
+        u.insn(:jump, match_failed)
+        u.insn(:dupn, 3)
+        u.emit_label(find_succeeded)
+        u.insn(:adjuststack, 3)
+        u.insn(:pop)
+        u.insn(:jump, matched)
+        u.insn(:putnil)
+        pattern_type_error(u, n, type_error, "deconstruct must return Array")
+        u.emit_label(match_failed)
+        u.insn(:pop)
+        u.insn(:jump, unmatched)
+      when Prism::HashPatternNode
+        has_rest = !n.rest.nil? && !(n.rest.is_a?(Prism::AssocSplatNode) && n.rest.value.nil?)
+        has_keys = n.elements.size > 0 || !n.rest.nil?
+        match_failed = u.new_label
+        type_error = u.new_label
+        keys = (has_keys && !has_rest) ? n.elements.map { |e| symbol_value(e.key) }.freeze : nil
+        pattern_constant(u, n.constant, match_failed, single, base) if n.constant
+        at.()
+        u.insn(:dup)
+        u.insn(:putobject, :deconstruct_keys)
+        push_send(u, :respond_to?, 1)
+        pattern_generic_error(u, n, "%p does not respond to #deconstruct_keys", base + 1) if single
+        at.()
+        u.insn(:branchunless, match_failed)
+        if keys.nil? then u.insn(:putnil) else u.insn(:duparray, keys) end
+        push_send(u, :deconstruct_keys, 1)
+        u.insn(:dup)
+        u.insn(:checktype, CheckType.new(8))
+        u.insn(:branchunless, type_error)
+        push_send(u, :dup, 0) if has_rest
+        if has_keys
+          values = []
+          n.elements.each do |e|
+            sym = symbol_value(e.key)
+            at.()
+            u.insn(:dup)
+            u.insn(:putobject, sym)
+            push_send(u, :key?, 1)
+            if single
+              ok = u.new_label
+              u.insn(:dup)
+              u.insn(:branchif, ok)
+              u.insn(:putobject, key_not_found(sym))
+              u.insn(:setn, base + PAT_ERROR_STRING + 2)
+              u.insn(:putobject, true)
+              u.insn(:setn, base + PAT_KEY_ERROR_P + 3)
+              u.insn(:topn, 3)
+              u.insn(:setn, base + PAT_KEY_ERROR_MATCHEE + 4)
+              u.insn(:putobject, sym)
+              u.insn(:setn, base + PAT_KEY_ERROR_KEY + 5)
+              u.insn(:adjuststack, 4)
+              u.emit_label(ok)
+            end
+            u.insn(:branchunless, match_failed)
+            values << u.capture do
+              at.()
+              u.insn(:dup)
+              u.insn(:putobject, sym)
+              push_send(u, has_rest ? :delete : :[], 1)
+              v = e.value
+              v = v.value if v.is_a?(Prism::ImplicitNode)
+              pattern_match(u, v, match_failed, single, false, base + 1)
+            end
+          end
+          values.each { |v| u.append(v) }
+        else
+          u.insn(:dup)
+          push_send(u, :empty?, 0)
+          pattern_generic_error(u, n, "%p is not empty", base + 1) if single
+          at.()
+          u.insn(:branchunless, match_failed)
+        end
+        if has_rest
+          at.()
+          if n.rest.is_a?(Prism::NoKeywordsParameterNode)
+            u.insn(:dup)
+            push_send(u, :empty?, 0)
+            pattern_generic_error(u, n, "rest of %p is not empty", base + 1) if single
+            at.()
+            u.insn(:branchunless, match_failed)
+          else
+            u.insn(:dup)
+            pattern_match(u, n.rest.value, match_failed, single, false, base + 1)
+          end
+        end
+        at.()
+        u.insn(:pop)
+        u.insn(:jump, matched)
+        u.insn(:putnil)
+        pattern_type_error(u, n, type_error, "deconstruct_keys must return Hash")
+        u.emit_label(match_failed)
+        u.insn(:pop)
+        u.insn(:jump, unmatched)
+      when Prism::CapturePatternNode
+        match_failed = u.new_label
+        at.()
+        u.insn(:dup)
+        pattern_match(u, n.value, match_failed, single, cache, base + 1)
+        pattern(u, n.target, matched, match_failed, single, false, base)
+        at.()
+        u.insn(:putnil)
+        u.emit_label(match_failed)
+        u.insn(:pop)
+        u.insn(:jump, unmatched)
+      when Prism::LocalVariableTargetNode
+        at.()
+        u.insn(:setlocal, *local_ref(u, n.name, n.depth))
+        u.insn(:jump, matched)
+      when Prism::AlternationPatternNode
+        matched_left = u.new_label
+        unmatched_left = u.new_label
+        at.()
+        u.insn(:dup)
+        pattern(u, n.left, matched_left, unmatched_left, single, cache, base + 1)
+        at.()
+        u.emit_label(matched_left)
+        u.insn(:pop)
+        u.insn(:jump, matched)
+        u.insn(:putnil)
+        u.emit_label(unmatched_left)
+        pattern(u, n.right, matched, unmatched, single, cache, base)
+      when Prism::ParenthesesNode
+        pattern(u, n.body, matched, unmatched, single, cache, base)
+      when Prism::PinnedVariableNode
+        pattern(u, n.variable, matched, unmatched, single, true, base)
+      when Prism::IfNode, Prism::UnlessNode
+        if_ = n.is_a?(Prism::IfNode)
+        pattern_match(u, n.statements.body[0], unmatched, single, cache, base)
+        node(u, n.predicate, false)
+        at.()
+        if single
+          ok = u.new_label
+          u.insn(:dup)
+          u.insn(if_ ? :branchif : :branchunless, ok)
+          u.insn(:putobject, pat_str("guard clause does not return true"))
+          u.insn(:setn, base + PAT_ERROR_STRING + 1)
+          u.insn(:putobject, false)
+          u.insn(:setn, base + PAT_KEY_ERROR_P + 2)
+          u.insn(:pop)
+          u.insn(:pop)
+          u.emit_label(ok)
+        end
+        u.insn(if_ ? :branchunless : :branchif, unmatched)
+        u.insn(:jump, matched)
+      else
+        # (a value: `===` of it. A pinned expression is its expression.)
+        v = n.is_a?(Prism::PinnedExpressionNode) ? n.expression : n
+        at.()
+        node(u, v, false)
+        at.()
+        u.insn(:dupn, 2) if single
+        u.insn(:checkmatch, 2)
+        pattern_eqq_error(u, v, base + 2) if single
+        at.()
+        u.insn(:branchif, matched)
+        u.insn(:jump, unmatched)
+      end
+    end
+
+    # "key not found: :name", as rb_sprintf's %+ makes it
+    # (a binary String: rb_sprintf's)
+    def key_not_found(sym) = "key not found: #{sym.inspect}".b.freeze
+
+    # pm_compile_case_match_node
+    def case_match_node(u, n, popped)
+      end_l = u.new_label
+      else_l = u.new_label
+      cloc = branches = nil
+      bid = 0
+      if branch_coverage?(u)
+        cloc = code_loc(n)
+        branches = branch_base(u, n, cloc, :case)
+      end
+      single = n.else_clause.nil? && n.conditions.size == 1
+      here(u, n)
+      if single
+        u.insn(:putnil)
+        u.insn(:putnil)
+        u.insn(:putobject, false)
+        u.insn(:putnil)
+      end
+      u.insn(:putnil)
+      node(u, n.predicate, false)
+      bodies = []
+      conds = u.capture do
+        n.conditions.each do |c|
+          body_l = u.new_label
+          bodies << u.capture do
+            here(u, c)
+            u.insn(:putnil) if bid > 0
+            u.emit_label(body_l)
+            u.insn(:adjuststack, single ? 6 : 2)
+            if branches
+              bloc = code_loc(c.statements || c)
+              branch_cov(u, branches, bloc, bloc[1], bid, :in)
+            end
+            bid += 1
+            if c.statements then node(u, c.statements, popped) elsif !popped then synthetic_putnil(u) end
+            here(u, c)
+            u.insn(:jump, end_l)
+          end
+          next_l = u.new_label
+          here(u, c.pattern)
+          u.insn(:dup)
+          pattern(u, c.pattern, body_l, next_l, single, true, 2)
+          u.emit_label(next_l)
+          next_l.unremovable = true
+        end
+        if (e = n.else_clause)
+          u.emit_label(else_l)
+          here(u, n)
+          u.insn(:pop)
+          u.insn(:pop)
+          if branches
+            bloc = code_loc(e.statements || e)
+            branch_cov(u, branches, bloc, bloc[1], bid, :else)
+          end
+          node(u, e, popped)
+          here(u, n)
+          u.insn(:jump, end_l)
+          u.insn(:putnil)
+          u.insn(:putnil) if popped
+        else
+          u.emit_label(else_l)
+          branch_cov(u, branches, cloc, cloc[1], bid, :else) if branches
+          if single
+            pattern_error_handler(u, n, end_l, popped)
+          else
+            here(u, n)
+            u.insn(:putspecialobject, 1)
+            u.insn(:putobject, NoMatchingPatternError)
+            u.insn(:topn, 2)
+            push_send(u, :"core#raise", 2)
+            u.insn(:adjuststack, 3)
+            u.insn(:putnil) unless popped
+            u.insn(:jump, end_l)
+            u.insn(:dupn, 1)
+            u.insn(:putnil) if popped
+          end
+        end
+      end
+      u.append(conds)
+      bodies.each { |b| u.append(b) }
+      u.emit_label(end_l)
+    end
+
+    # PM_MATCH_PREDICATE_NODE: `expr in pattern`
+    def match_predicate(u, n, popped)
+      here(u, n)
+      u.insn(:putnil)
+      node(u, n.value, false)
+      here(u, n)
+      u.insn(:dup)
+      matched = u.new_label
+      unmatched = u.new_label
+      done = u.new_label
+      pattern(u, n.pattern, matched, unmatched, false, true, 2)
+      here(u, n)
+      u.emit_label(unmatched)
+      u.insn(:pop)
+      u.insn(:pop)
+      u.insn(:putobject, false) unless popped
+      u.insn(:jump, done)
+      u.insn(:putnil)
+      u.emit_label(matched)
+      u.insn(:adjuststack, 2)
+      u.insn(:putobject, true) unless popped
+      u.insn(:jump, done)
+      u.emit_label(done)
+    end
+
+    # pm_compile_match_required_node: `expr => pattern`
+    def match_required(u, n, popped)
+      matched = u.new_label
+      unmatched = u.new_label
+      done = u.new_label
+      here(u, n)
+      u.insn(:putnil)
+      u.insn(:putnil)
+      u.insn(:putobject, false)
+      u.insn(:putnil)
+      u.insn(:putnil)
+      node(u, n.value, false)
+      here(u, n)
+      u.insn(:dup)
+      pattern(u, n.pattern, matched, unmatched, true, true, 2)
+      u.emit_label(unmatched)
+      pattern_error_handler(u, n, done, popped)
+      u.emit_label(matched)
+      here(u, n)
+      u.insn(:adjuststack, 6)
+      u.insn(:putnil) unless popped
+      u.insn(:jump, done)
+      u.emit_label(done)
+    end
+
     def case_node(u, n, popped)
       end_l = u.new_label
       bodies = []
+      # (branch coverage: each `when` and the else, written or not)
+      cloc = cbranches = nil
+      bid = 0
+      if branch_coverage?(u)
+        cloc = code_loc(n)
+        cbranches = branch_base(u, n, cloc, :case)
+      end
+      when_cov = lambda do |clause|
+        next unless cbranches
+        bloc = code_loc(clause.statements || clause)
+        branch_cov(u, cbranches, bloc, bloc[1], bid, :when)
+        bid += 1
+      end
       if n.predicate.nil?
         conds = u.capture do
           n.conditions.each do |clause|
             label = u.new_label
             bodies << u.capture do
               u.emit_label(label)
+              when_cov.(clause)
               if clause.statements then node(u, clause.statements, popped) elsif !popped then synthetic_putnil(u) end
               here(u, n)
               u.insn(:jump, end_l)
@@ -2410,6 +3306,11 @@ class RubyVM::InstructionSequence
                 u.emit_label(next_l)
               end
             end
+          end
+          if cbranches
+            e = n.else_clause
+            bloc = e.nil? ? cloc : code_loc(e.statements || e)
+            branch_cov(u, cbranches, bloc, bloc[1], bid, :else)
           end
           if n.else_clause then node(u, n.else_clause, popped) elsif !popped then synthetic_putnil(u) end
           here(u, n)
@@ -2451,6 +3352,7 @@ class RubyVM::InstructionSequence
               u.emit_label(label)
               here(u, clause)
               u.insn(:pop)
+              when_cov.(clause)
               if clause.statements then node(u, clause.statements, popped) elsif !popped then synthetic_putnil(u) end
               here(u, clause)
               u.insn(:jump, end_l)
@@ -2468,12 +3370,20 @@ class RubyVM::InstructionSequence
         if (e = n.else_clause)
           here(u, e.statements || e)
           u.insn(:pop)
+          if cbranches
+            bloc = code_loc(e.statements || e)
+            branch_cov(u, cbranches, bloc, bloc[1], bid, :else)
+          end
           node(u, e, popped)
           here(u, e.statements || e)
           u.insn(:jump, end_l)
         else
           here(u, n)
           u.insn(:pop)
+          if cbranches
+            branch_cov(u, cbranches, cloc, cloc[1], bid, :else)
+            here(u, n)
+          end
           u.insn(:putnil) unless popped
           u.insn(:jump, end_l)
         end
@@ -3039,8 +3949,24 @@ class RubyVM::InstructionSequence
       else_l = u.new_label
       end_l = nil
       branch_condition(u, n.predicate, then_l, else_l)
+      cov = branch_coverage?(u)
+      cloc = branches = nil
+      if then_l.refs > 0 && else_l.refs > 0 && cov
+        cloc = code_loc(n)
+        branches = branch_base(u, n, cloc, unless_ ? :unless : :if)
+      end
       if then_l.refs > 0
         u.emit_label(then_l)
+        if else_l.refs > 0 && cov
+          # (the part's own statements; an `if` without any, where its
+          #  condition ends; an `unless` without an else, the whole of it)
+          st = then_body.is_a?(Prism::ElseNode) ? then_body.statements : then_body
+          bloc = if st then code_loc(st)
+                 elsif !unless_ then (pl = n.predicate.location; [pl.end_line, pl.end_column, pl.end_line, pl.end_column])
+                 else cloc
+                 end
+          branch_cov(u, branches, bloc, bloc[1], 0, unless_ ? :else : :then)
+        end
         compile_part(u, then_body, popped, n)
         if else_l.refs > 0
           end_l = u.new_label
@@ -3051,9 +3977,103 @@ class RubyVM::InstructionSequence
       end
       if else_l.refs > 0
         u.emit_label(else_l)
+        if then_l.refs > 0 && cov
+          bloc = if else_body.nil? then cloc
+                 elsif else_body.is_a?(Prism::ElseNode) then code_loc(else_body.statements || else_body)
+                 else code_loc(else_body)
+                 end
+          branch_cov(u, branches, bloc, bloc[1], 1, unless_ ? :then : :else)
+        end
         compile_part(u, else_body, popped, n)
       end
       u.emit_label(end_l) if end_l
+    end
+
+    # -- branch coverage (compile.c's decl_branch_base and
+    # add_trace_branch_coverage; ruby compiles it in while Coverage counts
+    # branches, here under the :coverage_branches option) --------------------
+    def branch_coverage?(u) = u.opts[:coverage_branches] ? true : false
+
+    # pm_code_location: a node's [first line, first column, last line, last column]
+    def code_loc(n)
+      l = n.location
+      [l.start_line, l.start_column, l.end_line, l.end_column]
+    end
+
+    def cov_top(u)
+      u = u.parent while u.parent
+      u
+    end
+
+    # the branches of the construct `n` is: declared once a node
+    def branch_base(u, n, loc, type)
+      return nil unless loc[0] > 0
+      bases = (cov_top(u).cov_bases ||= {})
+      (bases[n.object_id] ||= [type, *loc, {}])[5]
+    end
+
+    # one branch taken: its counter's event, on a nop of its own at the
+    # branch's last line (the node id it is given is what ruby passes there)
+    def branch_cov(u, branches, loc, node_id, branch_id, type)
+      return unless branches && loc[0] > 0
+      top = cov_top(u)
+      b = (branches[branch_id] ||= begin
+        idx = top.cov_counters || 0
+        top.cov_counters = idx + 1
+        [type, *loc, idx]
+      end)
+      u.event([:coverage_branch, b[5]])
+      u.at(loc[2], node_id)
+      # (the VM's export gives the nop its counter: what the VM counts)
+      u.insn(:nop).vmx = b[5]
+    end
+
+    # what the file's branches are, in the order they were declared:
+    # [[type, line, column, line, column, [[type, line, column, line,
+    # column, counter], ...]], ...] -- Coverage's own structure
+    def branch_structure(u)
+      (cov_top(u).cov_bases || {}).values.map { |b| [*b[0, 5], b[5].values] }
+    end
+
+    # pm_compile_flip_flop: `a..b` as a condition. Its state is a special
+    # variable of the method's frame: off, the left side may switch it on
+    # (and `..` asks the right side at once, `...` waits a turn); on, the
+    # right side may switch it off.
+    def flip_flop(u, n, else_l, then_l, line, popped)
+      lend = u.new_label
+      again = !n.exclude_end?
+      local = u.local_iseq
+      key = (local.flip_cnt || 0) + 2
+      local.flip_cnt = (local.flip_cnt || 0) + 1
+      u.at(line, -1)
+      u.insn(:getspecial, key, 0)
+      u.insn(:branchif, lend)
+      if n.left then flip_flop_bound(u, n.left, popped) else u.insn(:putnil) end
+      u.at(line, -1)
+      u.insn(:branchunless, else_l)
+      u.insn(:putobject, true)
+      u.insn(:setspecial, key)
+      u.insn(:jump, then_l) unless again
+      u.emit_label(lend)
+      if n.right then flip_flop_bound(u, n.right, popped) else u.insn(:putnil) end
+      u.at(line, -1)
+      u.insn(:branchunless, then_l)
+      u.insn(:putobject, false)
+      u.insn(:setspecial, key)
+      u.insn(:jump, then_l)
+    end
+
+    # (an Integer bound is the line just read: `if 2..4` is `$. == 2`)
+    def flip_flop_bound(u, b, popped)
+      if b.is_a?(Prism::IntegerNode)
+        node(u, b, false)
+        here(u, b)
+        u.insn(:getglobal, :"$.")
+        push_send(u, :==, 1)
+        u.insn(:pop) if popped
+      else
+        node(u, b, popped)
+      end
     end
 
     def compile_part(u, part, popped, owner)
@@ -3082,7 +4102,7 @@ class RubyVM::InstructionSequence
       chunk = u.elements[start..]
       insns = chunk.grep(Insn)
       if insns.size == 1 && insns[0].name == :jump && insns[0].ops[0].equal?(lbl)
-        unref(insns[0])
+        insns[0].ops.each { |o| o.refs -= 1 if o.is_a?(Label) }
         u.elements.slice!(start..)
         return
       end
@@ -3108,6 +4128,9 @@ class RubyVM::InstructionSequence
         here(u, at)
         u.insn(:branchunless, else_l)
         u.insn(:jump, then_l)
+        return
+      when Prism::FlipFlopNode
+        flip_flop(u, cond, else_l, then_l, cond.location.start_line, false)
         return
       when Prism::AndNode
         compile_logical(u, cond.left, nil, else_l)
@@ -3152,6 +4175,12 @@ class RubyVM::InstructionSequence
       u.insn(:jump, next_l)
       u.emit_label(tmp_l) if tmp_l
       u.emit_label(redo_l)
+      if branch_coverage?(u)
+        lloc = code_loc(n)
+        lcov = branch_base(u, n, lloc, until_ ? :until : :while)
+        bloc = n.statements ? code_loc(n.statements) : lloc
+        branch_cov(u, lcov, bloc, bloc[1], 0, :body)
+      end
       u.loops.push([next_l, break_l, redo_l])
       u.ensures.push(:loop)
       node(u, n.statements, true) if n.statements
@@ -3286,14 +4315,59 @@ class RubyVM::InstructionSequence
       end
     end
 
+    # -- finding a sequence in a compiled file: what
+    # RubyVM::InstructionSequence.of answers for a Method, a Proc or a
+    # backtrace's Location is the sequence of the file's own compilation ---
+    # every sequence under `u`, itself first
+    def each_unit(u, depth = 0, &blk)
+      yield u, depth
+      u.children.each { |c| each_unit(c, depth + 1, &blk) }
+    end
+
+    # the sequence of `type` that starts on `line` (and is labelled `name`,
+    # when one is given); of several -- blocks opened on one line -- the
+    # innermost, which is the one a Proc made on that line most often is
+    def unit_at(top, type, line, name = nil)
+      best = nil
+      best_depth = -1
+      each_unit(top) do |u, d|
+        next unless u.type == type && u.first_lineno == line && (name.nil? || u.label == name)
+        (best = u; best_depth = d) if d > best_depth
+      end
+      best
+    end
+
+    # the innermost sequence labelled `label` whose lines cover `line`: a
+    # frame's
+    def unit_for_frame(top, label, line)
+      best = nil
+      best_depth = -1
+      each_unit(top) do |u, d|
+        cl = u.code_location
+        next unless u.label == label && cl && cl[0] <= line && line <= cl[2]
+        (best = u; best_depth = d) if d > best_depth
+      end
+      best
+    end
+
+    # ISeq#base_label: the label of the method, class body or file a block
+    # or a rescue / ensure clause is written in
+    def base_label(u)
+      u = u.parent while u.parent && THROUGH.include?(u.type)
+      u.label
+    end
+
     # -- the backend (compile.c's iseq_setup): peephole and specialised
     # instructions, operand unification, the stack depth, the layout ----
     def finish(u)
       u.elements.each do |e|
         next unless e.is_a?(Insn)
         e.ops.each do |o|
-          o.base = u.ivc_size + u.cvc_size if o.is_a?(IC)
+          # (ISEQ_IS_ENTRY_START: ivar caches, cvar caches, once's entries,
+          #  then the constant caches)
+          o.base = u.ivc_size + u.cvc_size + u.ise_size if o.is_a?(IC)
           o.base = u.ivc_size if o.is_a?(CVC)
+          o.base = u.ivc_size + u.cvc_size if o.is_a?(ISE)
         end
       end
       optimize(u)
@@ -3361,7 +4435,35 @@ class RubyVM::InstructionSequence
 
     def dest_index(els, label) = insn_at(els, els.index { |x| x.equal?(label) } + 1)
 
-    def unref(e) = e.ops.each { |o| o.refs -= 1 if o.is_a?(Label) }
+    # compile.c's unref_destination: a label no instruction names any more
+    # leaves the list at once -- what looks at an instruction's neighbours
+    # afterwards does not see it
+    def drop_label(els, l)
+      l.refs -= 1
+      return unless l.refs == 0
+      k = els.index { |x| x.equal?(l) }
+      els.delete_at(k) if k
+    end
+
+    def unref(els, e) = e.ops.each { |o| drop_label(els, o) if o.is_a?(Label) }
+
+    # compile.c's replace_destination: e's label is l now (false when it is
+    # already), and the old one leaves the list when nothing names it
+    def retarget(els, e, l)
+      old = e.ops[0]
+      return false if old.equal?(l)
+      l.refs += 1
+      e.ops[0] = l
+      drop_label(els, old)
+      true
+    end
+
+    # (where to go on once e is out: the first of what followed it that is
+    #  still in the list -- compile.c follows the removed element's own next)
+    def cont_index(els, succ)
+      succ.each { |x| k = els.index { |y| y.equal?(x) } and return k }
+      els.size
+    end
 
     # compile.c's iseq_optimize: each instruction in turn gets the peephole
     # rules, then its specialised instruction, then operand unification --
@@ -3372,17 +4474,31 @@ class RubyVM::InstructionSequence
     def optimize(u)
       o = u.opts
       els = u.elements
+      # (tailcallable_p: not a top, eval, main, rescue or ensure sequence; and
+      #  not between a rescue region's labels -- a block's whole body is one)
+      do_tail = o[:tailcall_optimization] && !%i[top eval main rescue ensure].include?(u.type)
+      tail = do_tail
+      rescue_level = 0
       i = 0
       while i < els.size
         e = els[i]
         unless e.is_a?(Insn)
+          if e.is_a?(Label)
+            if e.rescued == :beg
+              rescue_level += 1
+              tail = false
+            elsif e.rescued == :end
+              rescue_level -= 1
+              tail = do_tail if rescue_level == 0
+            end
+          end
           i += 1
           next
         end
         cont = i
         if o[:peephole_optimization]
           loop do
-            r = peephole_insn(u, els, i)
+            r = peephole_insn(u, els, i, tail)
             # (`goto again`: the same instruction, wherever it is now)
             if r == :again && (j = locate(els, e, i))
               i = j
@@ -3448,54 +4564,56 @@ class RubyVM::InstructionSequence
     # refuses, nor opt_invokebuiltin_delegate, which it never emits). It
     # answers :again to run them all again on the instruction (`goto
     # again`), or, when it took the instruction out, where to go on
-    def peephole_insn(u, els, i)
+    def peephole_insn(u, els, i, tail = false)
       e = els[i]
       if e.name == :jump
         d = dest_index(els, e.ops[0])
         nx = insn_at(els, i + 1)
         if d && d == nx
-          unref(e)
+          succ = els[i + 1, 4]
           els.delete_at(i)
-          return i
+          unref(els, e)
+          return cont_index(els, succ)
         end
         de = d && els[d]
         if de.is_a?(Insn) && de.name == :jump && !de.ops[0].equal?(e.ops[0]) && traces_before(els, d).empty?
-          e.ops[0].refs -= 1
-          e.ops[0] = de.ops[0]
-          e.ops[0].refs += 1
-          remove_unreachable(els, i + 1)
-          return :again
+          if retarget(els, e, de.ops[0])
+            remove_unreachable(els, locate(els, e, i) + 1)
+            return :again
+          end
         elsif de.is_a?(Insn) && de.name == :leave
           # (it takes the leave's insn_info, the events
           #  get_destination_insn gave it included)
-          unref(e)
+          tr = traces_before(els, d).reverse.map { |t| Trace.new(t.event) }
+          unref(els, e)
           e.name = :leave
           e.ops = []
           e.line, e.node_id = de.line, de.node_id
-          tr = traces_before(els, d).reverse.map { |t| Trace.new(t.event) }
-          els.insert(i, *tr)
+          els.insert(locate(els, e, i), *tr)
           return :again
         end
-        pi = prev_insn(els, i)
-        if pi && els[pi].is_a?(Insn) && (els[pi].name == :branchif || els[pi].name == :branchunless)
+        # (the element just before must be the branch itself -- not past a
+        #  trace event or a label: compile.c's IS_INSN(iobj->link.prev))
+        pi = i > 0 && els[i - 1].is_a?(Insn) ? i - 1 : nil
+        if pi && (els[pi].name == :branchif || els[pi].name == :branchunless)
           pe = els[pi]
           pd = dest_index(els, pe.ops[0])
           if nx && pd == nx
             lbl_after = els[pi + 1].is_a?(Label) ? els[pi + 1] : nil
             refcnt = lbl_after ? lbl_after.refs : 0
             pe.name = pe.name == :branchif ? :branchunless : :branchif
-            pe.ops[0].refs -= 1
-            pe.ops[0] = e.ops[0]
-            e.ops[0].refs += 1
-            if refcnt <= 1
-              unref(e)
-              els.delete_at(i)
+            # (the jump goes without its label being let go of: the branch
+            #  names it now, and compile.c does not count the jump off)
+            if retarget(els, pe, e.ops[0]) && refcnt <= 1
+              succ = els[locate(els, e, i) + 1, 4]
+              els.delete_at(locate(els, e, i))
+              return cont_index(els, succ)
             end
-            return i
+            return locate(els, e, i) + 1
           elsif d && pd == d
             # (a branch to where the jump goes anyway is a pop, at the
-            #  jump's place)
-            unref(pe)
+            #  jump's place -- its label still counted, as compile.c's
+            #  ELEM_REPLACE leaves it)
             els[pi] = Insn.new(:pop, [], e.line, e.node_id, [])
           end
         end
@@ -3652,13 +4770,36 @@ class RubyVM::InstructionSequence
             ni = insn_at(els, els.index { |x| x.equal?(jmp) } + 1)
             if ni && (ne = els[ni]).is_a?(Insn)
               loop do
-                break unless peephole_insn(u, els, ni) == :again && (ni = locate(els, ne, ni))
+                break unless peephole_insn(u, els, ni, tail) == :again && (ni = locate(els, ne, ni))
               end
             end
           else
             els.delete_at(k)
           end
         end
+      end
+
+      # (the tail call: a send or an invokesuper with no block that the
+      #  sequence leaves right after -- through nops, and jumps to where they
+      #  land -- calls with VM_CALL_TAILCALL)
+      if tail && (e.name == :send || e.name == :invokesuper) && e.ops[1].nil?
+        k = i + 1
+        steps = 0
+        hit = false
+        while k && k < els.size && (steps += 1) < 10_000
+          x = els[k]
+          unless x.is_a?(Insn)
+            k += 1
+            next
+          end
+          if x.name == :nop then k += 1
+          elsif x.name == :jump then k = els.index { |y| y.equal?(x.ops[0]) }
+          else
+            hit = x.name == :leave
+            break
+          end
+        end
+        e.ops[0] = e.ops[0].dup.tap { |cd| cd.flag |= CALL_TAILCALL } if hit
       end
 
       if e.name == :dup && insn_named?(els[i + 1], :setlocal)
@@ -3737,17 +4878,13 @@ class RubyVM::InstructionSequence
       prev_dup = pobj && pobj.name == :dup
       loop do
         if nobj.is_a?(Insn) && nobj.name == :jump
-          break if nobj.ops[0].equal?(e.ops[0])
-          e.ops[0].refs -= 1
-          e.ops[0] = nobj.ops[0]
-          e.ops[0].refs += 1
+          break unless retarget(els, e, nobj.ops[0])
+          i = locate(els, e, i)
         elsif prev_dup && nobj.is_a?(Insn) && nobj.name == :dup &&
               (nx = els[els.index { |x| x.equal?(nobj) } + 1]).is_a?(Insn) && nx.name == e.name
-          break if nx.ops[0].equal?(e.ops[0])
           nobj = nx
-          e.ops[0].refs -= 1
-          e.ops[0] = nobj.ops[0]
-          e.ops[0].refs += 1
+          break unless retarget(els, e, nobj.ops[0])
+          i = locate(els, e, i)
         elsif pobj
           pp = pobj
           pp = els[i - 2] if prev_dup && i > 1 && els[i - 2].is_a?(Insn)
@@ -3779,9 +4916,10 @@ class RubyVM::InstructionSequence
             e.name = :jump
             return :again
           end
-          unref(e)
+          succ = els[i + 1, 4]
           els.delete_at(i)
-          return i
+          unref(els, e)
+          return cont_index(els, succ)
         else
           break
         end
@@ -3854,15 +4992,13 @@ class RubyVM::InstructionSequence
         last = pending_end
       end
       return false unless last
-      removed = false
-      (last).downto(first) do |k|
-        x = els[k]
-        next if x.is_a?(Label)
-        unref(x) if x.is_a?(Insn)
-        els.delete_at(k)
-        removed = true
-      end
-      removed
+      # (every element of the chunk goes, its labels too; an instruction's
+      #  labels are let go of, and leave the list when nothing else names
+      #  them)
+      chunk = els[first..last]
+      els.slice!(first..last)
+      chunk.each { |x| unref(els, x) if x.is_a?(Insn) }
+      true
     end
 
     # compile.c's iseq_specialized_instruction: an array built only to be
@@ -4028,8 +5164,10 @@ class RubyVM::InstructionSequence
       when :splatkw then [2, 2]
       when :pushtoarraykwsplat then [2, 1]
       when :dupn then [e.ops[0], e.ops[0] * 2]
+      when :checktype then [1, 1]
+      when :once then [0, 1]
       when :checkkeyword, :getspecial, :getclassvariable then [0, 1]
-      when :setclassvariable then [1, 0]
+      when :setclassvariable, :setspecial then [1, 0]
       when :toregexp then [e.ops[1], 1]
       when :definemethod, :jump then [0, 0]
       when :definesmethod then [1, 0]
@@ -4099,6 +5237,7 @@ class RubyVM::InstructionSequence
       end
       body = []
       last = nil
+      prev_info = nil
       pos = 0
       u.elements.each do |e|
         next unless e.is_a?(Insn)
@@ -4108,7 +5247,15 @@ class RubyVM::InstructionSequence
           body << e.line
           last = e.line
         end
-        EVENT_DISASM.each { |ev, _| body << EVENT_TO_A[ev] if e.events.include?(ev) && EVENT_TO_A[ev] }
+        # (events are said where an instruction-info entry starts, and one
+        #  entry covers the instructions that follow with the same line, node
+        #  and events -- add_insn_info: a second `leave` after the first
+        #  repeats nothing. The VM's export says them for each.)
+        info = [e.line, e.node_id, e.events]
+        if vm || info != prev_info
+          EVENT_DISASM.each { |ev, _| body << EVENT_TO_A[ev] if e.events.include?(ev) && EVENT_TO_A[ev] }
+        end
+        prev_info = info
         body << [e.name, *e.ops.map { |o| operand_to_a(o, vm) }, *(vm && e.vmx ? [e.vmx] : [])]
       end
       pr = u.params
@@ -4149,10 +5296,12 @@ class RubyVM::InstructionSequence
       when Label then :"label_#{o.pos}"
       when LocalOp then o.idx
       when IVC then o.index
+      when ISE then o.index
       when CVC then o.index
       when IC then o.segments
       when DefType then o.n
       when CDHash then o.entries.flat_map { |k, l| [k, :"label_#{l.pos}"] }
+      when CheckType then o.n
       when Unit then to_a(o, vm)
       else o
       end
@@ -4237,7 +5386,8 @@ class RubyVM::InstructionSequence
           i = n - li - 1
           entry = format("[%2d] ", i + 1)
           line << indent
-          width = line.size + entry.size + 11
+          # (in bytes, as iseq.c's RSTRING_LEN counts)
+          width = line.bytesize + entry.bytesize + 11
           shown = local_name(name)
           line << entry << "#{shown}@#{li}"
           pr = u.params
@@ -4251,7 +5401,7 @@ class RubyVM::InstructionSequence
           argi << (pr[:anon_kwrest] ? "AnonKwrest" : "Kwrest") if pr[:kwrest] == li
           argi << "Block" if pr[:block_start] == li
           line << "<#{argi}>" unless argi.empty?
-          pad = width - line.size
+          pad = width - line.bytesize
           line << " " * pad if pad > 0
         end
         out << line.rstrip << "\n"
@@ -4276,7 +5426,9 @@ class RubyVM::InstructionSequence
         prev_line = e.line
         ev = e.events
         unless ev.empty?
-          s << "[" << EVENT_DISASM.select { |k, _| ev.include?(k) }.map(&:last).join << "]"
+          s << "[" << EVENT_DISASM.select { |k, _| ev.include?(k) }.map(&:last).join
+          s << "Cbr" if ev.any?(Array)
+          s << "]"
         end
         out << indent << s.rstrip << "\n"
         pos += 1 + e.ops.size
@@ -4303,7 +5455,8 @@ class RubyVM::InstructionSequence
       # (ruby names the hidden parameter of `it` in its disasm, not in to_a)
       return "<it>".inspect if name == IT_PARAM
       return "?" if name.is_a?(Integer)
-      name.to_s.match?(/\A[a-z_][A-Za-z0-9_]*\z/) ? name.to_s : name.to_s.inspect
+      # (a local's name may be any character past ASCII: rb_is_local_name)
+      name.to_s.match?(/\A[a-z_\P{ASCII}][A-Za-z0-9_\P{ASCII}]*\z/) ? name.to_s : name.to_s.inspect
     end
 
     def inspect_unit(u)
@@ -4318,10 +5471,12 @@ class RubyVM::InstructionSequence
         flags = CALL_FLAG_NAMES.select { |b, _| o.flag & b != 0 }.map(&:last)
         "<calldata!#{o.mid ? "mid:#{o.mid}, " : ""}argc:#{o.argc}#{o.kwargs ? ", kw:[#{o.kwargs.join(",")}]" : ""}#{flags.empty? ? "" : ", " + flags.join("|")}>"
       when IVC then "<is:#{o.index}>"
+      when ISE then "<is:#{o.index + (o.base || 0)}>"
       when CVC then "<is:#{o.index + (o.base || 0)}>"
       when IC then "<ic:#{o.index + (o.base || 0)} #{o.segments.join("::")}>"
       when DefType then DEFINED_NAMES[o.n]
       when CDHash then "<cdhash>"
+      when CheckType then CHECK_TYPES[o.n] || o.n.to_s
       when Label then o.pos.to_s
       when LocalOp then "#{local_name(o.name)}@#{o.index}"
       when Unit then o.label

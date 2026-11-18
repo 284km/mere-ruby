@@ -104,6 +104,9 @@ wall="${UNITTEST_WALL:-600}"
 #   (42.upto(Float::INFINITY).size) came first the second time.
 seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
+# The reference libraries supplement mere-ruby's stdlib. Keep the runtime's
+# own entries first when require honors the actual load-path order.
+mere_stdlib="$(RUBYLIB= RUBYOPT= "$mr" --disable-gems -e 'print $LOAD_PATH.join(":")')" || exit 1
 rake_source="$("$ref" -e 'begin; print Gem.bin_path("rake", "rake"); rescue Gem::Exception; end')"
 select_rake() {
   # This file installs its own rake gem and checks RubyGems' executable
@@ -167,7 +170,11 @@ if [ "${1:-}" = "--one" ]; then
   if [ -n "${UNITTEST_REF_EXT_PATH:-}" ]; then
     ref_lib="$UNITTEST_REF_EXT_PATH:$ref_lib"
   fi
-  mere_lib="$src/tool/lib:$src/test:$shim:$stdlib"
+  mere_fallback="$stdlib"
+  case "$rel" in
+    rubygems/*) mere_fallback="$src/lib:$mere_fallback" ;;
+  esac
+  mere_lib="$src/tool/lib:$src/test:$shim:$mere_stdlib:$mere_fallback"
   # (the test extensions built against mere-ruby's ruby.h: tools/capi_ext_build.py)
   if [ -n "${UNITTEST_MERE_EXT_PATH:-}" ]; then
     mere_lib="$UNITTEST_MERE_EXT_PATH:$mere_lib"
@@ -179,8 +186,7 @@ if [ "${1:-}" = "--one" ]; then
         ref_lib="$src/.unittest-reference:$src/lib:$ref_lib"
       fi ;;
     rubygems/*)
-      ref_lib="$src/lib:$ref_lib"
-      mere_lib="$src/lib:$mere_lib" ;;
+      ref_lib="$src/lib:$ref_lib" ;;
   esac
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.

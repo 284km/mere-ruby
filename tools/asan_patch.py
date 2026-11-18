@@ -19,26 +19,28 @@ def rep(old, new, count=1):
         sys.exit("site not found (%d): %r" % (n, old[:60]))
     s = s.replace(old, new)
 s = '#include <sanitizer/asan_interface.h>\n' + s
+# (the cache keeps a region whose blocks were trimmed to the best one, and
+#  zeroes that block's tail before keeping it: unpoisoned for the memset,
+#  poisoned whole once kept)
 rep('''  r->top = r->base;
-  if (__lang_region_cache_n < __LANG_REGION_CACHE_CAP)
+  if (__lang_region_cache_n < __LANG_REGION_CACHE_CAP
+      && (__lang_region_cache_n < __LANG_REGION_CACHE_GROWN || r->cap <= (1 << 20))) {
+    if (zlen) memset(zat, 0, zlen);
     __lang_region_cache[__lang_region_cache_n++] = r;
-  else { __lang_region_free(r); free(r); }
-}''', '''  ASAN_POISON_MEMORY_REGION(r->base, r->cap);
-  r->top = r->base;
-  if (__lang_region_cache_n < __LANG_REGION_CACHE_CAP)
+  } else { __lang_region_free(r); free(r); }
+}''', '''  r->top = r->base;
+  if (__lang_region_cache_n < __LANG_REGION_CACHE_CAP
+      && (__lang_region_cache_n < __LANG_REGION_CACHE_GROWN || r->cap <= (1 << 20))) {
+    if (zlen) { ASAN_UNPOISON_MEMORY_REGION(zat, zlen); memset(zat, 0, zlen); }
+    ASAN_POISON_MEMORY_REGION(r->base, r->cap);
     __lang_region_cache[__lang_region_cache_n++] = r;
-  else { ASAN_UNPOISON_MEMORY_REGION(r->base, r->cap); __lang_region_free(r); free(r); }
+  } else { ASAN_UNPOISON_MEMORY_REGION(r->base, r->cap); __lang_region_free(r); free(r); }
 }''')
-rep('''  void* p = r->top;
-  r->top += aligned;
-  if (shared) pthread_mutex_unlock(&__lang_default_region_lock);
-  return p;
-}''', '''  void* p = r->top;
-  r->top += aligned;
-  ASAN_UNPOISON_MEMORY_REGION(p, aligned);
-  if (shared) pthread_mutex_unlock(&__lang_default_region_lock);
-  return p;
-}''')
+# (the bump allocation, with the padding an alignment above 8 asks for)
+rep('''  void* p = r->top + padding;
+  r->top += padding + aligned;''', '''  void* p = r->top + padding;
+  r->top += padding + aligned;
+  ASAN_UNPOISON_MEMORY_REGION(p, aligned);''')
 rep('''      r->top = (char*)old + new_al;
       r->alloc_total += new_al - old_al;''', '''      r->top = (char*)old + new_al;
       ASAN_UNPOISON_MEMORY_REGION(old, new_al);
@@ -46,7 +48,15 @@ rep('''      r->top = (char*)old + new_al;
 # (Mere v0.1.589: the recycle keeps the block's own capacity, b->pad, where it
 # claimed 4096 -- the overrun note 269 found -- so the seed is poisoned as far
 # as that block reaches; the old shape is still accepted for an older Mere)
-if s.count('''    r->top = r->base;
+if s.count('''    r->blocks = b;
+    r->base = (char*)(b + 1);
+    r->top = r->base;
+    r->cap = 4096;''') == 0 and s.count('''    r->top = r->base;
+    r->cap = b->pad;''') == 0:
+    # (a Mere whose recycles make a fresh region or keep the seed as it is:
+    #  nothing is wound back in place, so there is nothing to poison here)
+    pass
+elif s.count('''    r->top = r->base;
     r->cap = b->pad;''') > 0:
     rep('''    r->blocks = b;
     r->base = (char*)(b + 1);
@@ -78,4 +88,13 @@ static void __dbg_death(void) {
 }
 __attribute__((constructor)) static void __dbg_reg(void) { __sanitizer_set_death_callback(__dbg_death); }
 ''')
+# (a block handed back whole -- kept zeroed for the next one, or unmapped --
+#  and one copied into a larger one: all of it is read or written there,
+#  poisoned or not; the block allocator is not the program)
+if s.count('static void __lang_blk_raw_free(void* p, size_t total) {\n') == 1:
+    rep('static void __lang_blk_raw_free(void* p, size_t total) {\n',
+        'static void __lang_blk_raw_free(void* p, size_t total) {\n  ASAN_UNPOISON_MEMORY_REGION(p, total);\n')
+if s.count('  memcpy(q, p, old_total < new_total ? old_total : new_total);\n') == 1:
+    rep('  memcpy(q, p, old_total < new_total ? old_total : new_total);\n',
+        '  ASAN_UNPOISON_MEMORY_REGION(p, old_total);\n  memcpy(q, p, old_total < new_total ? old_total : new_total);\n')
 open(dst, 'w', encoding='latin-1').write(s)

@@ -1,0 +1,328 @@
+// Prism's serialized answer, decoded -- the table of what each node is made
+// of, and the tree as runs of integers.
+//
+// Two readers share this file. m_prism_load.mere builds Prism::Node objects
+// from the bytes (Prism.parse). m_ast.mere translates the tree to parse.y's
+// (RubyVM::AbstractSyntaxTree), and for that it needs to look at a node more
+// than once and at its children before itself, so pm_decode first lays the
+// whole answer out flat: a node is a record in pm_nd, a child is the record's
+// offset. Nothing here knows the interpreter -- no Val, no object -- so
+// tools/ast_dump.mere compiles this and m_ast.mere alone, in a second, and
+// the translator is checked against the reference's parse.y without a
+// mere-ruby build in the loop.
+//
+// The serialized format (vendor/prism/src/serialize.c writes it,
+// lib/prism/serialize.rb reads it):
+//
+//   "PRISM" major minor patch  0
+//   encoding:  length:varuint name
+//   start_line: varsint
+//   line offsets: count:varuint  offset:varuint ...
+//   comments:  count  (type:varuint location) ...
+//   magic comments: count  (location location) ...
+//   data_loc:  0 | 1 location
+//   errors:    count  (type:varuint message:embedded location level:u8) ...
+//   warnings:  the same
+//   cpool_base:u32le  cpool_size:varuint
+//   the root node
+//   the constant pool: cpool_size entries of start:u32le length:u32le (the
+//   start's top bit: the bytes are the serialization's own, not the source's)
+//
+//   node     = type:u8  node_id:varuint  location  [length:u32le]  flags:varuint  fields
+//   location = start:varuint  length:varuint
+//   string   = 1 start:varuint length:varuint | 2 length:varuint bytes
+//   constant = index:varuint, 1-based into the pool (0: none)
+//   integer  = negative:u8 words:varuint word:varuint...   (32 bits a word, least first)
+//   double   = 8 bytes, little-endian
+import "m_prism_schema.mere";
+
+// ---- the table (m_prism_schema.mere, parsed at the first use) -------------
+// prism_sch: three strings a node type -- the class ("Prism::CallNode"), the
+// index entry an object of it has (its instance variable names, chr 2
+// between), and "!" when a length follows the location (else "").
+// prism_sch_f: sixteen slots a type, the name of each field by position.
+// prism_sch_k: the same sixteen as the letter each is written by (0 ends
+// them). prism_sch_o: where each field is in a decoded record, counted from
+// the record's start; slot 15 is the record's size.
+let prism_sch = vec_new ();
+let prism_sch_f = vec_new ();
+let prism_sch_k = vec_new ();
+let prism_sch_o = vec_new ();
+let prism_sch_init = fn (u: unit) ->
+  if vec_len prism_sch > 0 then ()
+  else
+    (let pad = fn (n: int) ->
+       (let rec go = fn (i: int) ->
+          if i >= n then ()
+          else (let _ = vec_push prism_sch_f "" in
+                let _ = vec_push prism_sch_k 0 in
+                let _ = vec_push prism_sch_o 0 in
+                go (i + 1)) in
+        go 0) in
+     // (type 0 is no node)
+     let _ = vec_push prism_sch "" in
+     let _ = vec_push prism_sch "" in
+     let _ = vec_push prism_sch "" in
+     let _ = pad 16 in
+     list_iter (str_split (prism_schema_src ()) "\n") (fn (ln: str) ->
+       if str_len ln == 0 then ()
+       else
+         (match str_split ln " " with
+          | Nil -> ()
+          | Cons (cn0, fs) ->
+            (let len9 = str_eq (char_at cn0 0) "!" in
+             let cn = (if len9 then substring cn0 1 (str_len cn0) else cn0) in
+             let rec go = fn (xs: str list) -> fn (n: int) -> fn (at: int) -> fn (idx: str) ->
+               (match xs with
+                | Nil ->
+                  (let _ = pad (16 - n) in
+                   let _ = vec_set prism_sch_o (vec_len prism_sch_o - 1) at in
+                   idx)
+                | Cons (f, t) ->
+                  (let c = str_index_of f ":" in
+                   let nm = substring f 0 c in
+                   let k = ord (char_at f (c + 1)) in
+                   let _ = vec_push prism_sch_f nm in
+                   let _ = vec_push prism_sch_k k in
+                   let _ = vec_push prism_sch_o at in
+                   // (l location, o location?, d double: two integers)
+                   go t (n + 1) (at + (if k == 108 || k == 111 || k == 100 then 2 else 1)) (idx ++ chr 2 ++ nm))) in
+             let idx = go fs 0 5 ("source" ++ chr 2 ++ "node_id" ++ chr 2 ++ "location" ++ chr 2 ++ "flags") in
+             let _ = vec_push prism_sch ("Prism::" ++ cn) in
+             let _ = vec_push prism_sch idx in
+             vec_push prism_sch (if len9 then "!" else "")))));
+
+// ---- the decoded answer ----------------------------------------------------
+// One parse at a time: pm_decode empties these and fills them again.
+//
+// pm_nd  the nodes. A record is type, start, end (offsets into the source),
+//        flags, node id, then the fields at the places prism_sch_o gives (and
+//        m_prism_nodes.mere's readers know): a node or node? is its record's
+//        offset (0: none); a node[] or constant[] an offset into pm_ls; a
+//        location or location? two offsets, start and end (-1 -1: none); a
+//        constant its pool index (0: none); a string its index in pm_st; an
+//        integer an offset into pm_ig; a double its bits, high word then low.
+// pm_ls  the lists: a count, then that many node offsets or pool indexes.
+// pm_ig  the integers: 1 if negative, the number of words, the words (least
+//        significant first, 32 bits each).
+// pm_st  the strings; pm_st[0] is the encoding's name.
+// pm_cp  the constant pool's names, from 1.
+// pm_lo  the offset each line starts at.
+// pm_er  the errors, five integers each: type, message (in pm_st), start,
+//        end, level.
+// pm_hd  0 the first line's number, 1 the root's offset, 2 the offset
+//        __END__'s data starts at (-1: none), 3 the number of warnings, 4 the
+//        program's length in bytes, 5 the length of a byte order mark the
+//        program starts with (parse.y's columns do not count it), 6 where
+//        the last token of a program with errors ends, for a caller that
+//        asks for the tree anyway (-1: unset; see ao_lineno).
+let pm_nd = vec_new ();
+let pm_ls = vec_new ();
+let pm_ig = vec_new ();
+let pm_st = vec_new ();
+let pm_cp = vec_new ();
+let pm_lo = vec_new ();
+let pm_er = vec_new ();
+let pm_hd = vec_new ();
+// (the program itself, at 0; pm_hd 4 is its length)
+let pm_in = vec_new ();
+
+// Decode `b`, the serialized parse of `input`. False when the bytes are not
+// this Prism's (the header, or a node type the table does not have).
+let pm_decode = fn (b: bytes) -> fn (input: str) ->
+  let _ = prism_sch_init () in
+  let ntypes = vec_len prism_sch / 3 in
+  let _ = vec_recycle pm_nd in
+  let _ = vec_recycle pm_ls in
+  let _ = vec_recycle pm_ig in
+  let _ = vec_recycle pm_st in
+  let _ = vec_recycle pm_cp in
+  let _ = vec_recycle pm_lo in
+  let _ = vec_recycle pm_er in
+  let _ = vec_recycle pm_hd in
+  let _ = vec_recycle pm_in in
+  let _ = vec_push pm_in input in
+  // (offset 0 of the nodes and of the lists is "none" and "empty")
+  let _ = vec_push pm_nd 0 in
+  let _ = vec_push pm_ls 0 in
+  let blen = bytes_len b in
+  if blen < 9 || bytes_get b 0 != 80 || bytes_get b 1 != 82 || bytes_get b 2 != 73 || bytes_get b 3 != 83 || bytes_get b 4 != 77
+     || bytes_get b 8 != 0 then false
+  else
+  region PMD {
+    // (0: the read position; 1: 1 once a node type was unknown)
+    let st = vec_new () in
+    let _ = vec_push st 9 in
+    let _ = vec_push st 0 in
+    let byte = fn (u: unit) -> (let p = vec_get st 0 in let _ = vec_set st 0 (p + 1) in bytes_get b p) in
+    let rec varu_more = fn (n: int) -> fn (shift: int) ->
+      (let c = byte () in
+       if c >= 128 then varu_more (n + bit_shl (c - 128) shift) (shift + 7)
+       else n + bit_shl c shift) in
+    let varu = fn (u: unit) -> (let n = byte () in if n < 128 then n else varu_more (n - 128) 7) in
+    let u32 = fn (p: int) ->
+      bytes_get b p + bytes_get b (p + 1) * 256 + bytes_get b (p + 2) * 65536 + bytes_get b (p + 3) * 16777216 in
+    let take = fn (n: int) ->
+      (let p = vec_get st 0 in
+       let _ = vec_set st 0 (p + n) in
+       str_of_bytes (bytes_slice b p n)) in
+    let rec times = fn (n: int) -> fn (f: unit -> unit) -> if n <= 0 then () else (let _ = f () in times (n - 1) f) in
+    // -- the header
+    let enc = take (varu ()) in
+    let _ = vec_push pm_st enc in
+    let sl = varu () in
+    let _ = vec_push pm_hd (bit_xor (bit_shr sl 1) (0 - bit_and sl 1)) in
+    let _ = vec_push pm_hd 0 in
+    let _ = vec_push pm_hd (0 - 1) in
+    let _ = vec_push pm_hd 0 in
+    let _ = vec_push pm_hd (str_len input) in
+    let _ = vec_push pm_hd (if str_len input >= 3 && ord (char_at input 0) == 239 && ord (char_at input 1) == 187
+                               && ord (char_at input 2) == 191 then 3 else 0) in
+    let _ = vec_push pm_hd (0 - 1) in
+    let _ = times (varu ()) (fn (u: unit) -> (let _ = vec_push pm_lo (varu ()) in ())) in
+    // (comments and magic comments: nothing here asks for them)
+    let _ = times (varu ()) (fn (u: unit) -> (let _ = varu () in let _ = varu () in let _ = varu () in ())) in
+    let _ = times (varu ()) (fn (u: unit) -> (let _ = varu () in let _ = varu () in let _ = varu () in let _ = varu () in ())) in
+    let _ = (if byte () == 0 then () else (let s = varu () in let _ = varu () in vec_set pm_hd 2 s)) in
+    let diag = fn (keep: bool) -> fn (u: unit) ->
+      (let ty = varu () in
+       let msg = take (varu ()) in
+       let s = varu () in
+       let l = varu () in
+       let lv = byte () in
+       if keep then
+         (let _ = vec_push pm_er ty in
+          let _ = vec_push pm_er (vec_len pm_st) in
+          let _ = vec_push pm_st msg in
+          let _ = vec_push pm_er s in
+          let _ = vec_push pm_er (s + l) in
+          let _ = vec_push pm_er lv in
+          ())
+       else (let _ = vec_set pm_hd 3 (vec_get pm_hd 3 + 1) in ())) in
+    let _ = times (varu ()) (diag true) in
+    let _ = times (varu ()) (diag false) in
+    let cbase = u32 (vec_get st 0) in
+    let _ = vec_set st 0 (vec_get st 0 + 4) in
+    let csize = varu () in
+    // -- the constant pool, which the nodes name by index
+    let _ = vec_push pm_cp "" in
+    let rec pool = fn (i: int) ->
+      if i >= csize then ()
+      else
+        (let off = cbase + i * 8 in
+         let s0 = u32 off in
+         let ln = u32 (off + 4) in
+         let _ = vec_push pm_cp (if s0 >= 2147483648 then str_of_bytes (bytes_slice b (s0 - 2147483648) ln)
+                                 else substring input s0 (s0 + ln)) in
+         pool (i + 1)) in
+    let _ = pool 0 in
+    // -- the nodes
+    let rec zeros = fn (n: int) -> if n <= 0 then () else (let _ = vec_push pm_nd 0 in zeros (n - 1)) in
+    let rec node = fn (u: unit) ->
+      (let ty = byte () in
+       if ty <= 0 || ty >= ntypes then (let _ = vec_set st 1 1 in 0)
+       else
+         (let nid = varu () in
+          let s0 = varu () in
+          let ln = varu () in
+          let _ = (if str_eq (vec_get prism_sch (ty * 3 + 2)) "!" then vec_set st 0 (vec_get st 0 + 4) else ()) in
+          let flags = varu () in
+          let r = vec_len pm_nd in
+          let base = ty * 16 in
+          let _ = vec_push pm_nd ty in
+          let _ = vec_push pm_nd s0 in
+          let _ = vec_push pm_nd (s0 + ln) in
+          let _ = vec_push pm_nd flags in
+          let _ = vec_push pm_nd nid in
+          let _ = zeros (vec_get prism_sch_o (base + 15) - 5) in
+          let rec fields = fn (j: int) ->
+            (let k = vec_get prism_sch_k (base + j) in
+             if k == 0 then ()
+             else
+               (let o = r + vec_get prism_sch_o (base + j) in
+                let _ =
+                  // n node, N node?, L node[]
+                  (if k == 110 then (let c = node () in vec_set pm_nd o c)
+                   else if k == 78 then
+                     (if bytes_get b (vec_get st 0) == 0 then vec_set st 0 (vec_get st 0 + 1)
+                      else (let c = node () in vec_set pm_nd o c))
+                   else if k == 76 then
+                     (let n = varu () in
+                      if n == 0 then ()
+                      else
+                        (let off = vec_len pm_ls in
+                         let _ = vec_push pm_ls n in
+                         let rec room = fn (i: int) -> if i >= n then () else (let _ = vec_push pm_ls 0 in room (i + 1)) in
+                         let _ = room 0 in
+                         let rec fill = fn (i: int) ->
+                           if i >= n then () else (let c = node () in let _ = vec_set pm_ls (off + 1 + i) c in fill (i + 1)) in
+                         let _ = fill 0 in
+                         vec_set pm_nd o off))
+                   // l location, o location?
+                   else if k == 108 then
+                     (let s = varu () in
+                      let l = varu () in
+                      let _ = vec_set pm_nd o s in
+                      vec_set pm_nd (o + 1) (s + l))
+                   else if k == 111 then
+                     (if byte () == 0 then (let _ = vec_set pm_nd o (0 - 1) in vec_set pm_nd (o + 1) (0 - 1))
+                      else (let s = varu () in
+                            let l = varu () in
+                            let _ = vec_set pm_nd o s in
+                            vec_set pm_nd (o + 1) (s + l)))
+                   // c constant, C constant?, K constant[]
+                   else if k == 99 || k == 67 then vec_set pm_nd o (varu ())
+                   else if k == 75 then
+                     (let n = varu () in
+                      if n == 0 then ()
+                      else
+                        (let off = vec_len pm_ls in
+                         let _ = vec_push pm_ls n in
+                         let _ = times n (fn (u: unit) -> (let _ = vec_push pm_ls (varu ()) in ())) in
+                         vec_set pm_nd o off))
+                   // s string
+                   else if k == 115 then
+                     (let t = byte () in
+                      let s = (if t == 1 then (let s1 = varu () in let l1 = varu () in substring input s1 (s1 + l1))
+                               else take (varu ())) in
+                      let _ = vec_set pm_nd o (vec_len pm_st) in
+                      vec_push pm_st s)
+                   // u uint32, b uint8
+                   else if k == 117 then vec_set pm_nd o (varu ())
+                   else if k == 98 then vec_set pm_nd o (byte ())
+                   // i integer
+                   else if k == 105 then
+                     (let neg = byte () in
+                      let n = varu () in
+                      let _ = vec_set pm_nd o (vec_len pm_ig) in
+                      let _ = vec_push pm_ig (if neg == 0 then 0 else 1) in
+                      let _ = vec_push pm_ig n in
+                      times n (fn (u: unit) -> (let _ = vec_push pm_ig (varu ()) in ())))
+                   // d double
+                   else
+                     (let p = vec_get st 0 in
+                      let _ = vec_set st 0 (p + 8) in
+                      let _ = vec_set pm_nd o (u32 (p + 4)) in
+                      vec_set pm_nd (o + 1) (u32 p))) in
+                fields (j + 1))) in
+          let _ = fields 0 in
+          r)) in
+    let root = node () in
+    let _ = vec_set pm_hd 1 root in
+    vec_get st 1 == 0
+  };
+
+// ---- readers every node has ------------------------------------------------
+let pm_type = fn (n: int) -> vec_get pm_nd n;
+let pm_start = fn (n: int) -> vec_get pm_nd (n + 1);
+let pm_end = fn (n: int) -> vec_get pm_nd (n + 2);
+let pm_flags = fn (n: int) -> vec_get pm_nd (n + 3);
+let pm_has = fn (n: int) -> fn (flag: int) -> bit_and (vec_get pm_nd (n + 3)) flag != 0;
+// (a list: how many, and the i-th; 0 is the empty list)
+let pm_ls_len = fn (l: int) -> if l == 0 then 0 else vec_get pm_ls l;
+let pm_ls_at = fn (l: int) -> fn (i: int) -> vec_get pm_ls (l + 1 + i);
+let pm_root = fn (u: unit) -> vec_get pm_hd 1;
+// (the program's byte at an offset; -1 outside it)
+let pm_byte = fn (i: int) ->
+  if i < 0 || i >= vec_get pm_hd 4 then 0 - 1 else ord (char_at (vec_get pm_in 0) i);
+let pm_text = fn (s: int) -> fn (e: int) -> substring (vec_get pm_in 0) s e;
