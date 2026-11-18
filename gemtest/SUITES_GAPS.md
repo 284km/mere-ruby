@@ -72,3 +72,10 @@ focused results do not replace the complete hosted file-level merge gates.
 The integrated corpus is 705/705 MATCH and generated C needs bracket depth
 932, within the existing 1024 build limit. Only the check's search seed is
 updated to the measured depth; the compiler limit is unchanged.
+
+On the rounds 4-5 branch, the same source-audit correction and main 3eb24fef
+retain 50 MATCH / 11 RED / 0 BOTH / 1 MEMORY (normal O2 source f2f57fa7).
+The preserved pre-audit snapshot and transition now refer to this branch's
+own previous result; its two additional Rack MATCH files remain MATCH.
+Reference audits cover 62 files and Mere audits 61. No inventory, dependency
+or bound changes and no per-file comparison regressions.

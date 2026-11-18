@@ -6147,3 +6147,9 @@ depth 932 (the inherited search seed was 923); record 932 for the check's
 two-compile search. The existing build limit remains 1024. Before publishing,
 retain the already published main-merge history as well; its runtime sources
 are identical to the fully measured 799c55d7 build.
+
+The same audit on rounds 4-5, normal O2 source f2f57fa7 including main
+3eb24fef, retains 50 MATCH / 11 RED / 0 BOTH / 1 MEMORY. The branch's own
+pre-audit result is preserved; all 62 reference and 61 non-resource Mere
+files audit the locked gem lib. The ordinary per-file comparison reports
+zero regressions. Gzip/MockRequest retain their two additional MATCH files.
