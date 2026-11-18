@@ -58,3 +58,6 @@ now follows each runtime's stdlib, including the RubyGems-specific fallback.
 Require 51 MATCH / 1 BOTH, Autoload 27 / 1, GemVersion 32, Integer 38,
 TracePoint 97 and PP 36 MATCH retain the successful main controls. These
 focused results do not replace the complete hosted file-level merge gates.
+The integrated corpus is 705/705 MATCH and generated C needs bracket depth
+932, within the existing 1024 build limit. Only the check's search seed is
+updated to the measured depth; the compiler limit is unchanged.

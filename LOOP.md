@@ -6102,3 +6102,9 @@ Require retains 51 MATCH / 1 BOTH, Autoload 27 / 1, GemVersion 32, Integer
 38, TracePoint 97 and PP 36 MATCH in the integrated build. Full corpus and
 the hosted per-file comparisons remain independent merge gates. No collector,
 C API, ISeq or Prism implementation is changed by this correction.
+
+The integrated corpus completes at 705/705 MATCH. Generated C needs bracket
+depth 932 (the inherited search seed was 923); record 932 for the check's
+two-compile search. The existing build limit remains 1024. Before publishing,
+retain the already published main-merge history as well; its runtime sources
+are identical to the fully measured 799c55d7 build.
