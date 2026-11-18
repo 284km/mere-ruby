@@ -58,17 +58,20 @@ and preserve the actual candidate set. Exact builtin value filters avoid
 walking unrelated class metadata. Witness 685 covers collection, nested
 enumeration, control flow and Fiber suspension.
 
-The unchanged Enumerable subprocess still exceeds ten seconds after #101.
+TestEnumerable#test_reverse_each_memory_corruption in ruby/test_enum.rb
+still exceeds ten seconds after #101.
 In the runner's child environment about 6,800 real Arrays are visited per
 iteration: 100 iterations take 0.73 CPU seconds with an empty callback and
 1.89 with its actual body. The same 1,000-iteration program without the
 runner's loaded libraries takes 1.36 seconds. This is a VM callback-throughput
 handoff; no Array is hidden and the test remains enabled. A separate bounded
-run of core ObjectSpace reaches 2,123,504 KiB during the million-finalizer
-test. Isolated paired runs of main's actual e40 CI binary and this candidate
+run of TestObjectSpace#test_finalizer in ruby/test_objectspace.rb reaches
+2,123,504 KiB during its million-finalizer child (2,102,256 after #101).
+Isolated paired runs of main's actual e40 CI binary and this candidate
 pass at 1,900,768 and 2,009,040 KiB, respectively. Neither the subprocess
 timeout nor the whole-file memory regression is cleared by those isolated
-passes. They block merge until the per-file counts are restored.
+passes. They block merge until the per-file counts are restored. Full corpus
+validation after #101 is 710/710 programs matching in both hash-index modes.
 
 Divergences from CRuby that are understood, reproduced, and deliberately
 not fixed yet — as opposed to the things nobody has looked at. Each entry
