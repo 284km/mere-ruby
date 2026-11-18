@@ -6790,3 +6790,62 @@ these same-window pairs. The same workload and 2x/600-second/2-GiB bounds
 remain unchanged. Hosted x86-64 success at 1.909 is distinct evidence; the
 local Linux pair is not a hosted rerun. No resource-variation cause is inferred
 from multipart's further successful observation.
+
+
+## 2026-11-19: gem rounds 26-28 keep Hash super on its native read entries
+
+Rack Headers' unchanged tests isolated fetch arity, fetch_values' missing-key
+exception and dig's intermediate TypeError to super_missing's world-free
+leaf. Add native Hash read entries there: hash_super_lookup uses the existing
+table/key protocol, and hash_super_fetch keeps arity, key/receiver fields and
+the actual block. fetch_values invokes that native entry for each key, rather
+than calling the receiver's Ruby fetch override, and stops on block control
+flow. dig reads the first native table entry without calling the receiver's
+[] override, asks its default on a miss, then uses existing dig_next for
+nested user dispatch. The shared invoke_val_c0 remains unchanged.
+
+Witnesses 710/711 fail the saved parent binary and match normally and with
+GC.stress after correction. They include nil/present/missing keys, defaults,
+warnings, block mutation, break/return, compare-by-identity, custom key
+equality, prepend and nested dig/keywords. The normal O2 runtime is 72adb4d3.
+The original headers file changes from 6 failures / 268 assertions to
+3 failures / 282 assertions, still 51 tests and no errors (reference: 302
+assertions). It remains RED. Constructor default+block, clone behavior and
+default-proc key normalization remain visible; no upstream edits or omissions.
+
+All 115 original files across the three unchanged locks retain their strict
+MATCH gates: original 54 MATCH / 7 RED / 1 MEMORY, Matrix/Logger 6 MATCH /
+1 RED, Rake 46 MATCH. All reference files are healthy, with 2735 tests.
+Preceding snapshots are saved separately before adopting these observations.
+Multipart is MATCH at 1,748,736 KiB, but Request still reaches the 2-GiB cap;
+this does not establish the cause of the earlier resource variation.
+
+The actual parent hosted Linux run 44338965455 gives 53 MATCH / 7 RED /
+2 MEMORY. Its merge source 548582c7 and head 89dbac2e have the same tree.
+The ordinary same-OS comparison loses no previous MATCH; strengthen Linux
+to include Lint, preserving the preceding 52-MATCH snapshot and its earlier
+cross-platform gate history in suites_linux_before_r28.json. Both MEMORY
+outcomes remain visible, and RED to MEMORY is not an improvement. macOS
+retains its stronger independent 54-MATCH gate. No bounds or initial records
+change; full hosted CI and all existing-file comparisons remain merge gates.
+
+A separate custom-key fetch control still bypasses the Ruby wrapper, and
+binding its real Ruby UnboundMethod to that Hash subclass still raises
+TypeError. Both behaviors match the saved parent and differ from Ruby;
+the shared dispatcher/binding paths are coordination items, not claims of
+this correction. The retained standalone control is distinct from the
+native fetch_values key lookup exercised by 710. Ten harness controls pass,
+bracket depth remains 933/1024, and top-level let counts stay main 136 /
+state 1167. No collector, VM, AST tree, C API or API-inventory edits.
+
+Full corpus: 728/728 with the hash index ON and OFF, under the existing
+aggregate wrapper. Original core MATCH counts retain Class 61, Hash 297,
+Array 473, Super 50 and Method 97, with no preceding passing case lost.
+Array's two shared-marking reference cases are healthy in this observation;
+the candidate keeps its existing skips, so the exact result is 473 MATCH /
+4 RED rather than hiding that reference variation. Hash retains the known
+replace-memory-leak 10-second timeout; Method retains its compaction skip.
+suites_runtime_r28.json stores every nonpassing case and actual execution.
+The unchanged Method-copy lifetime control passes at post-GC peak/start
+1.686, with real RSS samples retained. No speedup or resource-cause claim
+follows from these observations.

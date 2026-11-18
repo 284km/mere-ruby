@@ -333,3 +333,21 @@ retains earlier Ruby definitions/tombstones. New 708/709 detect the previous
 head; all 706-709 match normally and with GC.stress. The corrected full run
 retains the strict 54-MATCH macOS baseline, additional 6 MATCH / 1 RED and
 Rake 46 MATCH. No failed observation or stronger gate is removed.
+
+Rounds 26-27, source 72adb4d3, repair Hash's native fetch/fetch_values/dig
+entries reached through super. The unchanged Rack Headers file now completes
+51 tests / 282 assertions with 3 failures and no errors, versus 268 assertions
+and 6 failures before this change (reference: 302 assertions). It remains RED.
+The remaining failures concern clone's subclass behavior, a constructor given
+both a default and a block, and default-proc key normalization. They are not
+new API exclusions or attributed to native gem dependencies.
+
+Separate controls retain two existing shared-dispatch gaps. With a custom
+hash/eql? key, a Hash subclass's fetch can bypass its Ruby wrapper; the
+reference returns [:ruby_wrapper, 42], while both the saved parent and this
+candidate return 42. Binding the subclass's Ruby UnboundMethod to its own
+Hash instance also raises TypeError on both implementations here, while the
+reference calls the wrapper. The custom-key lookup in witness 710 runs before
+the prepend; the native fetch_values super path still exercises that key
+protocol. These dispatcher/binding coordination items are not claimed fixed.
+The original upstream file is unchanged, and its three failures stay visible.
