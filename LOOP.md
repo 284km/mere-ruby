@@ -6611,3 +6611,45 @@ The completed original-batch review rerun at 0521f018 retains 53 MATCH /
 7 RED / 2 MEMORY and every paired-parent file outcome. Its candidate record
 still contains the multipart regression against the stronger stored macOS
 baseline, so it is not adopted. The review fixes do not waive that gate.
+
+## Gem rounds 19-21: all original Rake files with complete child dependencies
+
+Rake 13.2.1's release commit d84f6ef7 contributes 46 files / 597 reference
+tests / 1,459 assertions. Pin the real Test::Unit framework and Minitest used
+by its generated test children. Preparatory 40 MATCH / 6 RED and 45 MATCH /
+1 RED observations are not baselines: missing child stdlib paths and then
+Minitest could let an unrelated LoadError satisfy a negative assertion.
+Preserve these observations with their reasons, restore four exact pure
+packages into a separate cache, and propagate actual selected-runtime paths
+before the pinned source fallback. The real child-routing control checks
+that fallback too. Source/test inventories and all limits stay fixed.
+
+time_cmp_other now uses Time's actual comparison protocol for ordered
+comparisons, including sign conversion and nil failure (703). The local
+colon_opens_sym backscan and lex_go's quoted-symbol guard recognize a dotted
+call's adjacent Symbol argument, with ternary/keyword negative controls
+(704). No AST-tree API changes. super_base now starts a main receiver's
+super lookup in its actual singleton and extended-module chain (705).
+Rake's original FileUtils.touch already has a real Ruby implementation;
+the failed functional children were losing that chain, not missing native
+FileUtils support. No shared native dispatcher edit is needed.
+
+O2 source e44fe0bd gives 46 MATCH twice, first verbose then a normal-output
+strict repeat, all reference files healthy and all 92 source audits complete.
+The same binary gives additional Matrix/Logger 6 MATCH / 1 RED, and original
+five suites 53 MATCH / 7 RED / 2 MEMORY. The original candidate still records
+the multipart loss against the stronger stored macOS baseline; paired actual
+parent outcomes do not regress, but that does not waive the stored gate.
+Eight gems now cover 115 files and 2,735 reference tests across three locks.
+
+Corpus 722/722; 703-705 also match with GC.stress. Original controls retain
+Parse 102, Syntax 167 MATCH / 1 RED / 2 BOTH, Time 87 MATCH / 1 BOTH,
+Super 50 and Method 97 MATCH / 1 RED. In the loaded combined run, Module's
+iclass and complemented-method leak cases hit their existing 10-second
+bound (193 MATCH / 2 RED). An isolated unchanged-limit rerun finishes all
+195 tests / 1,240 assertions successfully. Retain both observations rather
+than changing their bound. Bracket depth stays 933/1024.
+
+The independent Rake workflow first records actual Linux/macOS observations;
+Linux's own initial record is pending. It extends no existing job. No VM,
+collector, Prism-tree, or C API implementation changes are part of this work.
