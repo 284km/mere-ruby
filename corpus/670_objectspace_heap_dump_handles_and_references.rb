@@ -36,7 +36,8 @@ raise 'uninitialized File type' unless JSON.parse(ObjectSpace.dump(File.allocate
 class DumpedModule < Module; end
 class DumpedPlainClass; end
 raise 'Module subclass dump type' unless JSON.parse(ObjectSpace.dump(DumpedModule.new))['type'] == 'MODULE'
-[Object, BasicObject, DumpedPlainClass, Enumerator::Chain].each do |klass|
+# Direct class edges are portable; Object's Kernel ICLASS is CRuby-specific.
+[BasicObject, DumpedPlainClass, DumpedModule, Enumerator::Chain].each do |klass|
   parent = klass.superclass
   expected_parent = parent && JSON.parse(ObjectSpace.dump(parent))['address']
   raise 'native superclass edge changed' unless JSON.parse(ObjectSpace.dump(klass))['superclass'] == expected_parent
