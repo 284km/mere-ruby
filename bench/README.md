@@ -3,6 +3,51 @@
 Every harness here is meant to be run against CRuby as well, because a number
 without the reference number is not a measurement.
 
+## `enumerator_steps.rb`
+
+```sh
+./mere-ruby bench/enumerator_steps.rb 9000
+ruby bench/enumerator_steps.rb 9000
+```
+
+Isolates corpus/214's repeated suspended generators inside one statement while
+keeping another generator alive across the workload. Both interpreters must
+print `:kept1`, the requested count, and `:kept2`. Compare several counts and
+sample the O2 interpreter to distinguish iteration cost from stack pin scanning
+and captured-environment compaction. See [CI scheduling and profiles](ci_short_shards.md).
+
+### Incremental live-allocation snapshots
+
+Measured 2026-11-18 on arm64 macOS 26.7.1 with Apple Clang. The same mere-ruby
+source (`12ca1df2`) and `tools/build.sh` O2 flags were built with control Mere
+`b1a49f336fa4c6cb200e20460e44bc44399c8424` and candidate
+`68519ed1744a05088d08dd18019ce34b6e7feb01`. The compiler change updates the
+coroutine scanner's sorted live-block snapshot from a bounded local change log,
+falling back to a full rebuild for overflow or shared-list changes.
+
+Three fresh processes per count and compiler alternated control/candidate.
+Wall time includes startup; peak RSS is from macOS `/usr/bin/time -l`.
+
+| Generators | Control median [range] seconds | Candidate median [range] seconds | Median peak RSS control / candidate MiB |
+|---:|---:|---:|---:|
+| 1,000 | 1.189 [1.035, 1.244] | 0.535 [0.480, 0.776] | 281.31 / 280.16 |
+| 2,000 | 4.750 [4.486, 4.915] | 2.440 [2.438, 2.526] | 340.50 / 340.19 |
+| 4,000 | 19.731 [16.707, 21.653] | 9.839 [8.591, 10.519] | 410.61 / 411.09 |
+
+All outputs matched Ruby 4.0.9. The 4,000-generator median is about twice as
+fast with comparable peak RSS. Growth is still faster than linear; other
+pin/reachability costs remain. These are local workload measurements, not
+end-to-end CI timings. To reproduce, build each compiler, use
+`MERE=/path/to/mere.exe sh tools/build.sh`, retain each interpreter, then run
+both against this script at 1,000, 2,000 and 4,000 with the same reference Ruby.
+
+The candidate also passed all 703 corpus programs with the hash index on and
+off. The pinned CRuby `test_enum.rb`, `test_enumerator.rb` and
+`test_lazy_enumerator.rb` retain exactly the same named-case results as the
+control: 224 tests, 1,460 assertions, no failures/errors and one existing skip.
+The comparison used the unchanged 2 GiB process-family limit and a 180-second
+wall limit per side. These focused checks do not replace the complete CI suite.
+
 ## `yaml_cycles.rb`
 
 Dump a self-referential array and compare memory use before and after identity
