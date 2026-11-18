@@ -40,3 +40,21 @@ Resolved in this batch:
 Kramdown is deferred for explicit dependency reasons in the lock, not
 classified as an interpreter failure. Rack 3.1.12 was replaced before the
 baseline by 3.2.0 because the older test suite requires removed `cgi/cookie`.
+
+The source-audit correction also makes explicit physical gem libraries win
+before the bundled stdlib at its actual load-path position. do_require0 and
+resolve_feature share load_path_pick_shipped; witness 685 covers converted
+path entries, physical and relative imports, and real Marshal dump/load after
+clearing $LOAD_PATH. Mere's private serializer retains its existing internal
+loading behavior. This adds no public __marshal feature.
+
+The audited PR #90 build on main 3eb24fef retains 48 MATCH / 13 RED /
+1 MEMORY. All 62 reference files and 61 Mere files record a library from the
+locked gem's lib; the killed multipart process cannot finish an exit audit.
+The previous snapshot is preserved and the explicit command-only protocol
+transition reports no lost MATCH or changed reference coverage. Seven
+classification/provenance controls pass. The core runner's reference fallback
+now follows each runtime's stdlib, including the RubyGems-specific fallback.
+Require 51 MATCH / 1 BOTH, Autoload 27 / 1, GemVersion 32, Integer 38,
+TracePoint 97 and PP 36 MATCH retain the successful main controls. These
+focused results do not replace the complete hosted file-level merge gates.

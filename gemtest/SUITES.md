@@ -24,11 +24,29 @@ python3 gemtest/suites.py measure --cache /path/to/suite-cache \
 
 Only `restore` retrieves sources. `measure` uses the verified cache offline,
 checks it before and after the run, and refuses a changed binary or lock.
-The pinned Ruby source provides RubyGems and the standard library; its
+The pinned Ruby source provides RubyGems and standard-library fallbacks; its
 `tool/lib` also supplies base64's original Test::Unit framework. Both sides
 use seed 1, an isolated gem home and the same explicit library paths. Each
 file and side gets a separate temporary source copy, so tests can write their
 fixtures without influencing the other interpreter or subsequent files.
+
+`suite_bootstrap.rb` appends the Ruby-source fallback after the interpreter's
+own standard library. Locked gem libraries remain first. After the upstream
+autorunner finishes, it records the physical files loaded from that gem's
+locked `lib` directory in `<side>.source.txt`. The measurement retains these
+relative names and requires a nonempty audit as well as successful tests.
+An early `exit!` cannot bypass the audit and produce MATCH.
+
+The source audit corrected an earlier provenance gap: Mere had selected its
+bundled Base64 implementation before the explicitly supplied release source.
+The old result established that the release tests passed, but did not verify
+the release library. `suites_before_source_audit.json` preserves that result;
+`suites_source_audit_transition.json` records the explicit protocol transition.
+Only command descriptions change in the lock; source SHAs, dependency digests,
+test inventory and limits are unchanged. The full new run is compared with the
+old snapshot using the ordinary per-file comparison, with zero regressions.
+The CLI still rejects a baseline whose lock digest differs. Subsequent runs
+use the audited `suites_latest.json` and the new lock normally.
 
 The existing CI process-family supervisor applies **600 seconds and 2 GiB
 per side per file**, including descendants. No command-line option relaxes
@@ -68,6 +86,8 @@ the two interpreters must still agree within that run. CI artifacts preserve
 the complete measurements and logs. `suites_check.py` includes negative
 controls for zero tests, early exits, missing files, reference failures,
 resource classification, and source mutation or shadow files.
+The seventh control runs real Ruby to reject a healthy-looking summary from
+the wrong source tree and a process that bypasses the audit with `exit!`.
 
 Kramdown 2.5.1 was measured before choosing this set. Its large conversion
 file needs an external tidy executable plus optional Rouge and stringex; the

@@ -6071,3 +6071,34 @@ test_iterator, test_optimization, test_settracefunc, test_method,
 test_regexp, test_enumerator, test_fiber, test_hash the same counts;
 test_array MATCH 473 on both (one test that fails on the reference too
 moves between RED and BOTH from run to run, on either build).
+
+## 2026-11-18: gem source provenance is checked before accepting MATCH
+
+The initial gem harness exposed a provenance gap during the next candidates'
+audit: Mere selected its bundled Base64 before the locked release library on
+-I. That result passed the upstream tests but did not establish the upstream
+library's execution. Preserve both the initial and pre-audit snapshots.
+
+do_require0 / resolve_feature now use load_path_pick_shipped and honor the
+physical prefix before the actual stdlib entry. The private Marshal loader
+keeps its previous internal behavior after a user clears $LOAD_PATH. Corpus
+685 covers real library replacements, converted entries, relative imports
+and the real Marshal API; no public __marshal feature is invented.
+
+The bootstrap appends reference fallbacks after each interpreter's stdlib,
+then records physical locked-gem files after the upstream autorunner. Healthy
+summaries alone and exit! cannot pass. All seven harness controls succeed.
+The core runner keeps the same fallback order, including RubyGems' source.
+
+Fresh normal O2 source 799c55d7, including main 3eb24fef: all 62 original
+files retain 48 MATCH / 13 RED / 0 BOTH / 1 MEMORY. Both sides audit the
+locked library on every normally completed file (reference 62, Mere 61).
+Only command descriptions change in the lock; all source/dependency digests,
+inventory and bounds stay fixed. The explicit protocol transition compares
+against the preserved snapshot with zero regressions, and the CLI still
+rejects a different lock digest.
+
+Require retains 51 MATCH / 1 BOTH, Autoload 27 / 1, GemVersion 32, Integer
+38, TracePoint 97 and PP 36 MATCH in the integrated build. Full corpus and
+the hosted per-file comparisons remain independent merge gates. No collector,
+C API, ISeq or Prism implementation is changed by this correction.
