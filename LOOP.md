@@ -6153,3 +6153,18 @@ The same audit on rounds 4-5, normal O2 source f2f57fa7 including main
 pre-audit result is preserved; all 62 reference and 61 non-resource Mere
 files audit the locked gem lib. The ordinary per-file comparison reports
 zero regressions. Gzip/MockRequest retain their two additional MATCH files.
+Hosted validation found old reference-first paths in Unicode/NKF and other
+drivers, plus a fake interpreter unable to answer the new path query. Share
+the clean runtime query in tools/runtime_load_path.sh, put reference fallbacks
+after it, and make the fake harness answer and assert that ordering. Harness
+20, Unicode, original NKF, Psych scalar/wire/store/lifetimes and YAML Store
+controls pass without changing bounds or skip rules.
+
+Also preserve the original standalone bundled-library fallback after a user
+clears $LOAD_PATH. Physical replacements still win; the existing standalone
+tmpdir check and the real Marshal API pass. Fresh O2 source 53e0077f keeps
+the strict audited 48 MATCH / 13 RED / 1 MEMORY, zero regressions and
+705/705 corpus matches. The separate bootstrap constant-assignment correction
+is now applied for a combined build; its original bootstrap eval control is
+49/49 MATCH, with isolated corpus 705/705 and unchanged core Eval/Module/Const
+counts. No combined-head or hosted result is inferred from those controls.

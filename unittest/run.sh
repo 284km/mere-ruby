@@ -106,7 +106,7 @@ seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
 # The reference libraries supplement mere-ruby's stdlib. Keep the runtime's
 # own entries first when require honors the actual load-path order.
-mere_stdlib="$(RUBYLIB= RUBYOPT= "$mr" --disable-gems -e 'print $LOAD_PATH.join(":")')" || exit 1
+mere_stdlib="$(sh "$root/tools/runtime_load_path.sh" "$mr")" || exit 1
 rake_source="$("$ref" -e 'begin; print Gem.bin_path("rake", "rake"); rescue Gem::Exception; end')"
 select_rake() {
   # This file installs its own rake gem and checks RubyGems' executable

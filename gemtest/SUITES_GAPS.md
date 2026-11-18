@@ -79,3 +79,28 @@ The preserved pre-audit snapshot and transition now refer to this branch's
 own previous result; its two additional Rack MATCH files remain MATCH.
 Reference audits cover 62 files and Mere audits 61. No inventory, dependency
 or bound changes and no per-file comparison regressions.
+Hosted validation exposed reference-fallback ordering in other existing
+drivers and a fake interpreter that did not answer the new path query.
+runtime_load_path.sh now supplies the actual selected runtime's paths before
+reference fallbacks across core/bootstrap/tool, Unicode, NKF, Psych and YAML
+checks. The fake harness explicitly answers the query and verifies the order.
+Its 20 controls pass, as do Unicode, original NKF, Psych scalar/large-input/
+lifetime and YAML Store controls. No timeout, RSS or skip policy changes.
+
+Keep the existing standalone bundled-library contract as well: after the
+physical prefix is searched, shipped source remains available even when the
+user clears $LOAD_PATH. The original tmpdir-without-fileutils control passes;
+Marshal's internal implementation uses the same general fallback. Normal O2
+source 53e0077f retains the strict audited 48 MATCH / 13 RED / 1 MEMORY,
+zero regressions and 705/705 corpus matches.
+
+The bootstrap eval shortfall is independently corrected in const_assign_key:
+an immediate string-eval scope has no singleton constant namespace. Follow
+the existing lexical env and cref before a bare write, including iterator
+and retained Proc bodies, and raise the actual TypeError without touching
+the VM or collector. Witness 693. The original native bootstrap runner gives
+49/49 MATCH; core Eval 39 MATCH / 1 RED, Module 195 and Const 5 retain both
+baselines, and the isolated corpus gives 705/705. Combined-main validation
+is still required. Class.new blocks that change cref incorrectly and bare
+class declarations in such a scope remain separate existing lexical gaps;
+they are not claimed as fixed by the bare-write guard.
