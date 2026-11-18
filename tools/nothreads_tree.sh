@@ -22,6 +22,8 @@ coro=0
 here="$(cd "$(dirname "$0")/.." && pwd)"
 d="$(mktemp -d)"
 cp "$here"/*.mere "$d"/
+# (and the ISeq compiler in Mere, which main.mere imports as ic/*.mere)
+mkdir "$d/ic" && cp "$here"/ic/*.mere "$d/ic/"
 [ "$coro" -eq 1 ] || cp "$here/m_fiber_nothreads.mere" "$d/m_fiber_coro.mere"
 [ "$coro" -eq 1 ] || python3 "$here/tools/wasm_lexer.py" "$d"
 # (no C beside this tree: the C API's externs become functions that answer
