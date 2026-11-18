@@ -27,8 +27,8 @@ GC.start
 raise 'held Proc lost after collection' unless ObjectSpace.each_object(Proc).any? { |item| item.equal?(kept_proc) }
 raise 'held Binding lost after collection' unless ObjectSpace.each_object(Binding).any? { |item| item.equal?(kept_binding) }
 module RetainedStoreMarker; end
-[kept_proc, kept_binding].each do |target|
-  target.extend(RetainedStoreMarker)
-  raise 'extended store object omitted' unless ObjectSpace.each_object(RetainedStoreMarker).any? { |item| item.equal?(target) }
+[[Proc, kept_proc], [Binding, kept_binding]].each do |klass, target|
+  klass.include(RetainedStoreMarker)
+  raise 'module filter omitted store object' unless ObjectSpace.each_object(RetainedStoreMarker).any? { |item| item.equal?(target) }
 end
 puts 'ObjectSpace visits real Proc and Binding handles with consistent counts'
