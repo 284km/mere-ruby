@@ -6584,3 +6584,30 @@ audited. Preserve its initial observation and enforce the measured Linux
 baseline; macOS retains its separate initial six MATCH files. The additional
 workflow now requires the matching OS snapshot on every PR/main/dispatch
 measurement. The original multipart gate remains unsatisfied and unchanged.
+
+Review corrections for the additional suites: preserve the previous
+native-aware super lookup outside the four primitive value kinds, and stop
+their ordered walk at each actual native owner. Expanded 701 covers Exception,
+Integer and Float before a later Object undef. Shared-definition warning flags
+now live in the existing owned meth_src row, with the endless accessor
+unchanged. copy_meth_src marks only actual native alias/Method-copy operations;
+keyword alias marks its copy explicitly. Clone/import copies do not acquire
+sharing, and a new Proc definition clears the replaced definition's flag.
+There are no new warning-map entries or collector implementation edits.
+
+Expanded 701/702 match normally and with GC.stress, including clones, singleton
+clones, refinement imports and reflective definition calls. O2 source 0521f018
+retains the strict additional 6 MATCH / 1 RED and all seven source audits,
+719/719 corpus, Super 50, Module 195, Method 97 MATCH / 1 RED and Hash
+297 MATCH / 1 RED / 8 BOTH. Bracket depth remains 933/1024; top-level lets
+remain 1167/136. The actual Method-copy lifetime control's post-GC peak ratios
+are 2.159 on the saved pre-review binary (negative control), 1.740 on the
+paired base and 1.708 after correction, with reference around 1.08. Each
+prefix is checked against core_assertions' default 2x bound under the same
+600-second/2-GiB family caps. The raw series retains the base's existing
+allocator growth; this fixes the additional warning-state retention.
+
+The completed original-batch review rerun at 0521f018 retains 53 MATCH /
+7 RED / 2 MEMORY and every paired-parent file outcome. Its candidate record
+still contains the multipart regression against the stronger stored macOS
+baseline, so it is not adopted. The review fixes do not waive that gate.

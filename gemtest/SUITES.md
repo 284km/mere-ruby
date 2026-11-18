@@ -29,6 +29,14 @@ the existing child-bin selector to the selected interpreter and propagates
 the locked libraries. A real child-process control rejects a shadow Ruby
 on PATH or a missing locked child library. Ten harness controls pass.
 
+The additional jobs also run `tools/method_copy_memory_check.py`: actual
+UnboundMethod definitions on 21,000 transient classes, with three collections
+after each batch. It records real process RSS and applies the pinned upstream
+leak assertion's default 2x bound to every collected prefix. Its outer family
+limits stay 600 seconds / 2 GiB. Separate `method-copy-memory-*` artifacts
+preserve the samples and execution records. The source, clone/import and
+native-boundary warning controls are in corpus 701/702.
+
 `suites.lock.json` records each release tag's full commit, repository URL,
 source tree SHA256, every test file, load paths and command. Development
 dependencies have exact versions, archive URLs and SHA256s, and extracted
