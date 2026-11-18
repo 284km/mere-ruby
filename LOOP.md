@@ -6387,3 +6387,8 @@ keep 6,800 empty Arrays, and repeat 1,000 times an Array#each block containing
 takes 14.22 wall seconds (12.88 user + 0.21 system CPU seconds). This is
 independent shared-call workload evidence, not a replacement for the failing
 upstream test. Shared block/frame/lookup/dispatch functions remain untouched.
+
+The final remote namespace audit found a concurrent gem witness at 685.
+This session's snapshot witness moves from 685 to the verified free 701;
+earlier entries retain their publication numbers. Its contents are unchanged
+and its renamed path is checked against Ruby with indexing ON and OFF.
