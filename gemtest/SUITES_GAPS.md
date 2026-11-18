@@ -52,3 +52,23 @@ Resolved in follow-up rounds 4-5:
   object. A caller's `@st` and `@label` remain visible and round-trip, while
   the stream still reads its own buffer. The original file becomes MATCH
   and all 103 CRuby StringIO tests pass. Witness 672.
+The source-audit correction also makes explicit physical gem libraries win
+before the bundled stdlib at its actual load-path position. do_require0 and
+resolve_feature share load_path_pick_shipped; witness 685 covers converted
+path entries, physical and relative imports, and real Marshal dump/load after
+clearing $LOAD_PATH. Mere's private serializer retains its existing internal
+loading behavior. This adds no public __marshal feature.
+
+The audited PR #90 build on main 3eb24fef retains 48 MATCH / 13 RED /
+1 MEMORY. All 62 reference files and 61 Mere files record a library from the
+locked gem's lib; the killed multipart process cannot finish an exit audit.
+The previous snapshot is preserved and the explicit command-only protocol
+transition reports no lost MATCH or changed reference coverage. Seven
+classification/provenance controls pass. The core runner's reference fallback
+now follows each runtime's stdlib, including the RubyGems-specific fallback.
+Require 51 MATCH / 1 BOTH, Autoload 27 / 1, GemVersion 32, Integer 38,
+TracePoint 97 and PP 36 MATCH retain the successful main controls. These
+focused results do not replace the complete hosted file-level merge gates.
+The integrated corpus is 705/705 MATCH and generated C needs bracket depth
+932, within the existing 1024 build limit. Only the check's search seed is
+updated to the measured depth; the compiler limit is unchanged.
