@@ -6651,5 +6651,16 @@ bound (193 MATCH / 2 RED). An isolated unchanged-limit rerun finishes all
 than changing their bound. Bracket depth stays 933/1024.
 
 The independent Rake workflow first records actual Linux/macOS observations;
-Linux's own initial record is pending. It extends no existing job. No VM,
+Linux's own initial record was pending at publication. It extends no existing job. No VM,
 collector, Prism-tree, or C API implementation changes are part of this work.
+
+Initial hosted Linux run 44288206768 completes all 46 files as MATCH, with
+597 tests / 1,459 assertions and 92 physical-source audits. Its actual merge
+source c7f36362 has the same tree as head 712befff. Preserve that observation
+independently and enforce it as Linux's baseline. macOS keeps its complete
+normal-output 46-MATCH baseline. Every Rake PR/main/dispatch measurement now
+selects its own OS's strict snapshot; caps and the original suites' stronger
+multipart gate are unchanged. The reviewed parent #107's hosted macOS
+original suite also passes that unchanged gate (54 MATCH / 7 RED / 1 MEMORY,
+multipart 2,037,376 KiB). Keep the failed local candidate as well; the resource
+variation's cause remains unconfirmed.

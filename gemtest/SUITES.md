@@ -31,8 +31,10 @@ The first complete macOS observation is `suites_rake_initial.json` (verbose);
 46 MATCH with both sides' physical source audits complete. Preparatory 40/6
 and 45/1 measurements had incomplete child environments and are explicitly
 not baselines; their reasons remain in `suites_rake_preparation.json`.
-The separate Rake workflow initially collects Linux's first observation;
-it must adopt an actual Linux baseline before becoming a strict merge gate.
+Hosted Linux run 44288206768 also gives 46 MATCH with all 92 source audits
+complete. `suites_rake_linux_initial.json` preserves that first observation;
+`suites_rake_linux.json` is the strict Linux baseline. The independent Rake
+workflow requires the matching OS baseline on every PR/main/dispatch run.
 
 These gems use their unmodified helper and actual Test::Unit framework,
 with alphabetical order instead of a Minitest seed. Preserve tests,
