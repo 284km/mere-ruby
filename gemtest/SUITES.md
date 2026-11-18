@@ -36,6 +36,10 @@ leak assertion's default 2x bound to every collected prefix. Its outer family
 limits stay 600 seconds / 2 GiB. Separate `method-copy-memory-*` artifacts
 preserve the samples and execution records. The source, clone/import and
 native-boundary warning controls are in corpus 701/702.
+`method_copy_lifetime_latest.json` retains the subsequent strict Linux failure
+and paired measurements of publishing each copied metadata row once. The
+check, workload and limits are unchanged; local Linux/aarch64 is identified
+separately from hosted x86-64. Final hosted validation of that change is pending.
 
 `suites.lock.json` records each release tag's full commit, repository URL,
 source tree SHA256, every test file, load paths and command. Development

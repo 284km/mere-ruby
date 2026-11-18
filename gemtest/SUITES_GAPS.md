@@ -277,3 +277,13 @@ repeat. The parent's focused run still matches (85 tests / 239 assertions,
 total MATCH counts from a different gained file. Route the producer/reader
 resource investigation to the VM/performance session; no specific VM or GC
 cause is established. Keep the 600-second/2-GiB bounds and parent baseline.
+
+The subsequent strict rounds 19-21 macOS run 44292334030 again loses multipart
+to MEMORY. Keep that failure alongside #107's preceding successful hosted
+observation. The cause of this variation remains open. Separately, strict
+Linux run 44292334299 fails the new Method-copy lifetime check at 2.086x.
+copy_meth_src now publishes each destination's location/flags once and avoids
+rewriting an already-shared source. Paired unmodified controls lower peak RSS
+on macOS and Linux/aarch64; their raw series and the failed hosted x86-64
+observation are retained in method_copy_lifetime_latest.json. The unchanged
+2x check and final hosted result remain merge gates.
