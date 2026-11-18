@@ -6388,7 +6388,12 @@ do not clear the whole-file memory stop. The nine RSS cases and OpenSSL
 lifetimes pass on this integration; no resource bounds are changed.
 
 The main-392 candidate previously passed all 703 corpus programs in both
-hash-index modes. The #101 integration is now being checked separately.
+hash-index modes. The #101 integration passes all 710 corpus programs in
+both hash-index modes, nine RSS cases and the OpenSSL lifetime gate.
+Root/dead/duplicate checks pass; bracket depth is 932/1024. The seven
+completed bounded files retain 225 MATCH, 15 RED, 6 BOTH, 5 EXTRA and 57
+symmetric exclusions. Core ObjectSpace still reaches the unchanged bound
+at 2,102,256 KiB.
 Both _id2ref review findings are fixed and resolved on #98. All three PRs
 remain unmerged until current CI and the per-file comparison satisfy the
 stated gate. The next independent work outside stage 9 is VM callback cost,
