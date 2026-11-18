@@ -92,3 +92,10 @@ The preserved pre-audit snapshot and transition now refer to this branch's
 own previous result; its two additional Rack MATCH files remain MATCH.
 Reference audits cover 62 files and Mere audits 61. No inventory, dependency
 or bound changes and no per-file comparison regressions.
+
+On the rounds 6-7 branch, normal audited O2 source d403f444 including main
+3eb24fef retains 51 MATCH / 10 RED / 0 BOTH / 1 MEMORY and 709/709 corpus
+matches. Reference and Mere audits cover 62 and 61 files. Its own pre-audit
+51-MATCH snapshot is preserved, and the explicit transition reports no lost
+MATCH or reference coverage. Subsequent hosted-driver and standalone-loader
+corrections are checked separately before claiming combined-head results.

@@ -6189,3 +6189,9 @@ The same audit on rounds 4-5, normal O2 source f2f57fa7 including main
 pre-audit result is preserved; all 62 reference and 61 non-resource Mere
 files audit the locked gem lib. The ordinary per-file comparison reports
 zero regressions. Gzip/MockRequest retain their two additional MATCH files.
+
+Normal audited O2 source d403f444 on rounds 6-7 retains 51 MATCH / 10 RED /
+1 MEMORY, zero regressions and 709/709 corpus matches. Preserve that branch's
+own old snapshot and audit transition (reference 62, Mere 61 library audits).
+The later hosted-driver and standalone-loader fixes still need their combined
+validation; this result does not claim that unmeasured combination.
