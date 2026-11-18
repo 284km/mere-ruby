@@ -6120,3 +6120,73 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+## 2026-11-18 (75): AbstractSyntaxTree where Prism and parse.y part ways -- captures parse.y does not assign, and two kinds of error_tolerant recovery
+
+**The point.** Two of the gaps note 551 left in stage 5, against ruby 4.0.9:
+- **Named captures in a regexp parse.y splits.** For `/(?<y>a)#@~/ =~ x`,
+  parse.y splits the text at the `#@`, so the regexp is a DREGX, and
+  reg_named_capture_assign does not run. MATCH2 has no assignments, `y` is
+  not in the table, and a later `y` is a VCALL until something else assigns
+  it. Prism does not split the regexp and assigns `y`.
+- **Two kinds of error_tolerant recovery:**
+  - in a body, what cannot follow a statement (`1q`, `a = 1 2`);
+  - an `end` after `.` that closes by its indent (`bar.` / `end`) in
+    constructs other than a class or module.
+
+**Captures.** tr_match_write sees the DREGX and records each name as a
+"ghost" of its scope (as_gh). Scopes now carry a serial (as_sc keeps kind +
+2 x serial). A program with a ghost is translated a second time; nothing
+else pays for it. The second pass records where each variable is really
+assigned: a write, a target (multiple assignment, for, rescue =>, pattern
+captures), an operator write, a parameter (nm_push), or a capture of an
+unsplit regexp. Then:
+- a read of a ghost name with no real assignment before it, in that scope
+  or one inside it, is a VCALL;
+- a ghost name that nothing assigns is left out of the table;
+- a ghost name first assigned later moves to where that assignment puts it
+  in the table;
+- in a block, an assignment to an outer scope's ghost that nothing has
+  assigned yet makes a new variable of the block (kind 4), as parse.y does.
+
+`y = y` assigns before its value is read, as assignable does. Checked
+against 33 forms.
+
+**Garbage after a statement.** parse.y pops back to the start of the
+body's `stmts`, makes everything from there to the last token it throws
+away one ERROR (`stmt: error`), and reads on after the next term. That holds
+in the body of a def, class, module, `class <<`, begin, while, until and
+lambda, and of an if or unless without else (rv_mark, as_px 11).
+tr_stmt_list replaces those statements:
+- the ERROR runs from the body's start through the statements written
+  without a term between them;
+- where the body has a leading term (class, module), the ERROR starts there
+  and takes the place of that BEGIN;
+- a second error in the same body starts from the body's start again.
+
+Other places recover differently, and those were left alone:
+- a do or brace block makes the whole outer statement an ERROR, and the
+  program ends;
+- an if with an else takes the then-branch too;
+- under when there is no tree at all (NIL);
+- a modifier after the garbage (`1q if y`) wraps the ERROR.
+
+Checked against 26 forms.
+
+**An `end` closed by its indent.** The class and module code is now two
+helpers, de_open and de_close. def, do blocks, if and unless without else,
+while and until use them as well:
+- the statements before `bar.` stay;
+- an ERROR runs from `bar` through that `end`;
+- the construct ends there;
+- the statements after it go up a level.
+
+de_open saves as_px 7 and 8, and de_close puts them back, so a sibling does
+not lose a value that is still pending. A do block's indent is the one of
+the line it opens on. Checked against 11 forms.
+
+Speed: 300 files of test_ast's walk, 203.95e9 -> 204.13e9 instructions
+(+0.09%). Bracket depth 934 -> 935 (as_gh). Witness corpus/700.
+
+- Checked: fixtures 971 of 976; the 850 files 850 of 850; corpus 705 of
+  705; test_ast's individual tests 114 as the reference; the gates.
