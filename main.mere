@@ -24457,6 +24457,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let _ = scan9 0 0 in let _ = strbuf_push b9 "\"" in
           mkstr (strbuf_to_str b9))
        | _ -> raise_exc world "TypeError" "dump JSON requires a String")
+    else if str_eq c "ObjectSpace" && str_eq name "__dump_class_info" then
+      (let (_, supers9, _, _) = world in
+       let (super9, singleton9) = (match args with
+         | Cons (VClass name9, _) ->
+           (let single9 = is_sng_whole name9 in
+            let parent9 = (if single9 then sng_supername world name9
+                           else if map_has modules name9 then ""
+                           else if map_has supers9 name9 then map_get supers9 name9 else "") in
+            ((if str_eq parent9 "" then VNil else VClass parent9), single9))
+         | _ -> (VNil, false)) in
+       arr_new (Cons (super9, Cons (VBool singleton9, Nil))))
     else if str_eq c "ObjectSpace" && str_eq name "__dump_identity" then
       (match args with
        | Cons (v9, _) ->
@@ -24693,11 +24704,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // and Hash stores separately, before making its own result objects.
        let values9 = public9 || (match args with Cons (_, Cons (VBool true, _)) -> true | _ -> false) in
        let _ = (if values9 then
-           (let addv9 = fn (v9: Val) -> fn (c9: str) ->
-              if str_eq want9 "" || obj_is_a world c9 want9
+           (let addv9 = fn (v9: Val) -> fn (base9: str) ->
+              // A value store's tag already proves its builtin ancestry;
+              // only subclass/module filters need a dispatch-class lookup.
+              if str_eq want9 "" || str_eq want9 base9
+                 || (let tagged9 = hng_key v9 in
+                     let class9 = (if str_len tagged9 > 0 && map_has hng_store tagged9 then map_get hng_store tagged9 else base9) in
+                     obj_is_a world class9 want9)
               then vec_push objs9 v9 else () in
-            let _ = (if visit9 "Array" then map_iter arr_store (fn (id9: int) -> fn _values9 -> addv9 (VArr id9) (dispatch_cls_of world (VArr id9))) else ()) in
-            let _ = (if visit9 "Hash" then map_iter hash_store (fn (id9: int) -> fn _values9 -> addv9 (VHsh id9) (dispatch_cls_of world (VHsh id9))) else ()) in
+            let _ = (if visit9 "Array" then map_iter arr_store (fn (id9: int) -> fn _values9 -> addv9 (VArr id9) "Array") else ()) in
+            let _ = (if visit9 "Hash" then map_iter hash_store (fn (id9: int) -> fn _values9 -> addv9 (VHsh id9) "Hash") else ()) in
             // Survivors plus allocations since the last sweep; blank dead
             // String slots are not objects. No Ruby allocations during this
             // snapshot, so its own result cannot enter the iteration.
@@ -24705,11 +24721,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             (let rec old9 = fn (j9: int) ->
               if j9 >= vec_get gc_knob 10 then ()
               else (let id9 = handle_base + vec_get gc_str_surv j9 in
-                    let _ = addv9 (VStr id9) (dispatch_cls_of world (VStr id9)) in old9 (j9 + 1)) in
+                    let _ = addv9 (VStr id9) "String" in old9 (j9 + 1)) in
             let rec fresh9 = fn (j9: int) -> fn (stop9: int) ->
               if j9 >= stop9 then ()
               else (let id9 = handle_base + j9 in
-                    let _ = addv9 (VStr id9) (dispatch_cls_of world (VStr id9)) in fresh9 (j9 + 1) stop9) in
+                    let _ = addv9 (VStr id9) "String" in fresh9 (j9 + 1) stop9) in
             let _ = old9 0 in
             fresh9 (vec_get gc_knob 8) (str_count ())) else ())
          else ()) in
@@ -24755,27 +24771,30 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let no9 = vec_len objs9 in let nc9 = vec_len clss9 in
           let total9 = no9 + nc9 in
           let value9 = fn (i9: int) -> if i9 < no9 then vec_get objs9 i9 else vec_get clss9 (i9 - no9) in
-          // The enclosing Ruby method frame is already a GC root. Pin the
-          // actual candidates there while callbacks may collect or suspend;
-          // no Ruby snapshot Arrays need to enter the next enumeration.
-          let prefix9 = "__objspace:" ++ str_of_int (cd_get ()) ++ ":" in
-          let keys9 = vec_new () in
-          let rec pin9 = fn (i9: int) ->
-            if i9 >= total9 then () else
-              (let key9 = prefix9 ++ str_of_int i9 in
-               let _ = vec_push keys9 key9 in
-               let _ = map_set env key9 (value9 i9) in pin9 (i9 + 1)) in
-          let rec unpin9 = fn (i9: int) ->
-            if i9 >= total9 then () else
-              (let _ = map_delete env (vec_get keys9 i9) in unpin9 (i9 + 1)) in
-          let _ = pin9 0 in
+          // Like MMTk's each_object, snapshot identities without retaining
+          // every unvisited candidate across callbacks. Recheck actual store
+          // presence after a callback may collect. Root only the current
+          // value in the enclosing frame while its block collects or yields.
+          let key9 = "__objspace:" ++ str_of_int (cd_get ()) ++ ":current" in
+          let present9 = fn (v9: Val) -> match v9 with
+            | VObj id9 -> map_has ocls9 id9
+            | VArr id9 -> map_has arr_store id9
+            | VHsh id9 -> map_has hash_store id9
+            | VStr id9 -> gc_str_present id9
+            | VProc id9 -> map_has proc_store (str_of_int id9)
+            | VBind id9 -> map_has bind_store (str_of_int id9)
+            | VClass c9 -> (let b9 = gc_class_base c9 in
+                str_eq b9 "BasicObject" || map_has sup9 c9 || map_has modules c9
+                || map_has sup9 b9 || map_has modules b9)
+            | _ -> false in
           let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
           let nonmain9 = ractor_nonmain () in
           let rec yield9 = fn (i9: int) -> fn (n9: int) ->
             if i9 >= total9 then VInt n9
             else (let v9 = value9 i9 in
-                  if nonmain9 && not (ractor_shareable env world v9) then yield9 (i9 + 1) n9
-                  else (match run_block_turn1 world nb9 blk v9 with
+                  if not (present9 v9) || (nonmain9 && not (ractor_shareable env world v9)) then yield9 (i9 + 1) n9
+                  else (let _ = map_set env key9 v9 in
+                        match run_block_turn1 world nb9 blk v9 with
                         | FBreak result9 ->
                           (match srcproc9 with
                            | VProc pid9 ->
@@ -24791,8 +24810,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                         | _ -> yield9 (i9 + 1) (n9 + 1))) in
           let result9 = try_or_msg (fn (u9: unit) ->
             with_builtin_frame world (VClass "ObjectSpace") "each_object" (fn (f9: unit) -> yield9 0 0))
-            (fn (message9: str) -> let _ = unpin9 0 in fail message9) in
-          let _ = unpin9 0 in result9)
+            (fn (message9: str) -> let _ = map_delete env key9 in fail message9) in
+          let _ = map_delete env key9 in result9)
        | _ -> arr_new (Cons (arr_new (vals9 objs9 0), Cons (arr_new (vals9 clss9 0), Nil))) })
     else if str_eq c "Process" && (str_len name == 4 && str_eq name "__sh") then
       (match args with Cons (VStr h9, _) -> VInt (run (env_sh_prefix () ++ sget h9)) | _ -> VInt (0 - 1))

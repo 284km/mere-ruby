@@ -33,6 +33,11 @@ ObjectSpace.trace_object_allocations_stop
 GC.enable
 
 raise 'uninitialized File type' unless JSON.parse(ObjectSpace.dump(File.allocate))['type'] == 'FILE'
+class DumpedModule < Module; end
+raise 'Module subclass dump type' unless JSON.parse(ObjectSpace.dump(DumpedModule.new))['type'] == 'MODULE'
+uninitialized_class = JSON.parse(ObjectSpace.dump(Class.allocate))
+raise 'uninitialized Class type' unless uninitialized_class['type'] == 'CLASS'
+raise 'uninitialized Class acquired a superclass' if uninitialized_class.key?('superclass')
 %W[ascii Fée].each do |text|
   range = JSON.parse(ObjectSpace.dump(text)).fetch('coderange')
   raise 'incorrect encoding classification' unless range == (text.ascii_only? ? '7bit' : 'valid')
