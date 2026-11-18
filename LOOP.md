@@ -6124,3 +6124,11 @@ the strict audited 48 MATCH / 13 RED / 1 MEMORY, zero regressions and
 is now applied for a combined build; its original bootstrap eval control is
 49/49 MATCH, with isolated corpus 705/705 and unchanged core Eval/Module/Const
 counts. No combined-head or hosted result is inferred from those controls.
+
+Final combined first gem-suite PR, normal O2 source 4ff6b54f: 48 MATCH /
+14 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+All 62 files on both sides finish the locked-library source audit. Multipart
+finishes below the RSS cap with one custom-params-hash error (test_0034),
+85 tests / 238 assertions versus the reference's 239. Its prior MEMORY/RED
+variation is not a new MATCH or an inferred VM/GC cause.
+Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
