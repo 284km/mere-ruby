@@ -104,3 +104,11 @@ baselines, and the isolated corpus gives 705/705. Combined-main validation
 is still required. Class.new blocks that change cref incorrectly and bare
 class declarations in such a scope remain separate existing lexical gaps;
 they are not claimed as fixed by the bare-write guard.
+
+Final combined rounds 4-5, normal O2 source 9730ae28: 50 MATCH /
+12 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+All 62 files on both sides finish the locked-library source audit. Multipart
+finishes below the RSS cap with one custom-params-hash error (test_0034),
+85 tests / 238 assertions versus the reference's 239. Its prior MEMORY/RED
+variation is not a new MATCH or an inferred VM/GC cause.
+The earlier full corpus was 707/707 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
