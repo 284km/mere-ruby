@@ -148,8 +148,11 @@ those shims entirely: Ruby can select a later .rb before an earlier native
 extension. mere-ruby keeps its own Ruby implementations.
 
 The reference runtime archive is cached by the Ruby source SHA, Ruby/Rust
-versions, build/data/workflow definitions, runner OS/architecture, image,
-Clang/SDK identity and OpenSSL/libyaml versions and prefixes. Cache hits still
+versions, build/data/archive definitions, runner OS/architecture, image,
+Clang/SDK identity and native dependency versions and prefixes. The definition
+set lives in `reference_cache_key.py`; changes to shard scheduling or unrelated
+workflow steps keep the cache. `package_reference.sh` defines the relocatable
+archive layout and is included in its key. Cache hits still
 check the Ruby version, both JITs, native test extensions, pinned test data,
 the environment smoke tests and actual mkmf compilation. Provenance is
 regenerated and the runtime is uploaded for the current run. The mere-ruby
