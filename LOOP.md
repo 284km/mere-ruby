@@ -6201,3 +6201,57 @@ fallbacks are unchanged: 6 a Regexp in another encoding -- allowing those
 moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
+
+## 2026-11-19 (85): an exception no clause can see, a constructor of stores, and super with values
+
+**The point.** After (84) the slowest of ruby's benchmarks on the VM were
+app_raise (1.72x the evaluator), so_object (1.49x) and so_exception (1.18x).
+Each was a shortcut the evaluator takes and the VM did not.
+
+- **A rescue that only matches.** run_rescues makes the exception an object
+  with its own frames (exc_pin_bt) only when the clause binds it to a name;
+  the VM made one -- an object id and three ivars -- for every exception any
+  clause took. A rescue sequence made of nothing but its local read,
+  constants and literals pushed, checkmatch, branches, nil, a pop, a leave
+  or a throw (vm_rescue_only_matches) cannot keep or show the exception, and
+  leaves it the pair, `$!` included, as the evaluator does.
+- **`$!` after a retry** (both executions, found writing the witness): a
+  retry ran the construct again by calling run_begin_f again, which took
+  the exception in `$!` as "what $! was before" and restored that once the
+  construct was done. `begin; raise if t < 2; rescue; retry; end; p $!` was
+  the exception; ruby's nil. The construct is run again from the $! it
+  started with.
+- **A method of stores.** The evaluator runs a method whose body is only
+  `@x = param` statements without a frame (triv_store_body); a VM method's
+  body is its program, which that never matched. A program of `getlocal p,
+  (dup,) setinstancevariable @x` for each parameter and a leave is run the
+  same way (vm_triv_store_ok / _run), under the same conditions (a plain
+  object, no block, no TracePoint, Coverage or Ractor, the arguments plain).
+- **super with values.** `super(a, b)` was an ESuper over hidden locals in a
+  scope, evaluated. ESuper's arm is now two halves: the arguments, and what
+  is done with them (super_vals) -- the method after the definer along the
+  receiver's ancestors, a singleton's extended modules, Class#new, a hook's
+  no-op, "no superclass method". The VM calls the second with its values
+  when there is no block written or passed, no splat or keywords, and no
+  hook (vm_super_direct, with the arm's refusals).
+
+Corpus 696 (a rescue that only matches, a bound one and `$!`, a bare raise,
+retry, `$!` in an ensure, a class's own ===), 697 (stores of one and three
+parameters, arity errors, `_`, a class variable, a literal, a frozen
+receiver, keywords and a splat) and 698 (super with values, a bare super
+after a parameter changed, a module's, `def self.new`, a hook, nothing
+above, another object's instance_eval, define_method's bare super, a
+singleton's extended module): the same on ruby 4.0.9, the evaluator and the
+VM.
+
+Measured, ruby's app_* / so_* (27; least of 3 runs, local): the whole 0.940x
+-> 0.927x the evaluator; app_raise 1.72x -> 1.06x, so_exception 1.18x ->
+1.07x, so_object 1.49x -> 1.10x. Still behind: so_nsieve_bits 1.25x,
+app_mandelbrot 1.15x (Complex), so_object 1.10x, so_pidigits 1.09x
+(Bignums), so_lists 1.07x.
+
+Checked (local): corpus 709 / 709; under MERE_RUBY_VM=1 699 on the VM, 10
+fallen back, 0 different; vm_check 245 / 245; gates; the Module check
+COMPLETE; under both executions, the previous build against this one:
+test_exception, test_rubyoptions, test_flip, test_super, test_method,
+test_object, test_class the same counts.
