@@ -5,6 +5,28 @@ stderr in CI's `gem-suites-*` artifacts identify individual failed tests.
 Symptoms below are observed; an unconfirmed cause is explicitly marked.
 None is excluded from the measurement to improve its score.
 
+Additional pinned suites: Matrix has 2 MATCH files; Logger has 4 MATCH and
+1 RED. Primitive super now stops at Hash/Array/String/Proc's actual native
+ancestor before a Ruby method farther up the chain. The actual Test::Unit
+Fixture observer registration therefore works in separated children. The
+common method-copy path also records both names in the existing alias state,
+so replacing an alias_method or define_method(Method) copy suppresses its
+first redefinition warning, while the next ordinary replacement warns.
+Witnesses 701 and 702; no new top-level let or collector change.
+
+Logger's remaining test_logdevice failure compares a rotated open File with
+its old pathname. File predicates currently discard its retained descriptor.
+A /dev/fd path conversion trial did not match the reference and was reverted;
+the real fstat primitive exists, but routing this predicate through it needs
+the shared invoke_val_c0 branch. Defer that Ruby semantics edit while the
+C API session owns the function; this is not a C extension dependency.
+
+A separate pre-existing Hash subclass undef under a prepended [] wrapper
+still reaches the primitive on both the paired parent and this candidate.
+It is not repaired by the native-super ordering change or omitted from an
+upstream file. The focused new witness tests native-super ordering and an
+undef farther behind the already selected native entry.
+
 | Suite / file | Observed difference | Ownership and next step |
 |---|---|---|
 | minitest / `test_minitest_mock.rb` | Executes all 94 tests; 1 failure, 8 errors and 10 skips. File.open stubs now work with and without blocks. Remaining failures include private stubs and a dynamic method's super lookup. | Ruby semantics. Reduce the remaining alias/super witnesses; avoid dispatch functions currently edited by other sessions. |

@@ -6,6 +6,26 @@ five suites are minitest 5.25.5, rack 3.2.0, rack-test 2.2.0, public_suffix
 6.0.2 and base64 0.2.0 (62 files). These are independent of the load-only
 snapshot in `snapshot.lock.json`.
 
+`suites_additional.lock.json` adds Matrix 0.4.3 and Logger 1.6.0 separately:
+seven original files and 169 reference tests. It pins their release commits
+and the actual pure Ruby test-unit 3.7.8, test-unit-ruby-core 1.0.16 and
+power_assert 3.1.0 archives. It uses the same restore/measure commands with
+`--lock gemtest/suites_additional.lock.json` and a separate external cache.
+Keep the original 62-file lock and both original OS baselines unchanged.
+The first audited macOS record is 6 MATCH / 1 RED, preserved in
+`suites_additional_initial.json`; `suites_additional_latest.json` is its
+strict macOS baseline. Initial hosted Linux measurement is pending; its
+baseline must come from that actual environment before the PR is ready.
+
+These gems use their unmodified helper and actual Test::Unit framework,
+with alphabetical order instead of a Minitest seed. Preserve tests,
+assertions, failures, errors, pendings, omissions and notifications; pending
+plus omitted tests count as skips when rejecting an all-skipped summary.
+Every summary field must match. Each side routes bare `ruby` children through
+the existing child-bin selector to the selected interpreter and propagates
+the locked libraries. A real child-process control rejects a shadow Ruby
+on PATH or a missing locked child library. Ten harness controls pass.
+
 `suites.lock.json` records each release tag's full commit, repository URL,
 source tree SHA256, every test file, load paths and command. Development
 dependencies have exact versions, archive URLs and SHA256s, and extracted
