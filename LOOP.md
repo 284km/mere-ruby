@@ -6135,3 +6135,23 @@ method owner reflection already reports the real Ruby definition. Issue
 #121 hands this invoke_val_c0 coordination item to the shared dispatch
 work. No framework code is patched and no registry is externally filled.
 The three remaining app stages stay NOT_RUN in provider_candidate.json.
+
+
+### Rails direct-load diagnostic and Hash subclass missing hooks (2026-11-19)
+
+While the original CLI is blocked at #121, fresh copies of the same app
+fixture were loaded directly using each interpreter's own saved installed
+gems. This diagnostic is explicitly separate from the cold paired stages:
+reference runs script/boot.rb successfully (including all source audits)
+in 3.918 s / 103,296 KiB; the unmerged provider composition 153e64f5 exits 1
+in 5.261 s / 256,368 KiB at ActiveSupport's railties_load_path= assignment.
+Neither process has a resource event; bounds remain 600 s / 2 GiB.
+
+A healthy-reference OrderedOptions-only probe confirms that construction
+and the reported method_missing owner are correct, then shows mere-ruby
+bypassing the dynamic setter. A gem-free Hash subclass with its own Ruby
+method_missing reproduces this on unmodified main and an existing gem
+candidate. The primitive missing-hook path belongs to that session; #123
+records the handoff. No shared dispatcher or Rails source is patched.
+The distinct load_diagnostics.json and two small probes preserve this
+observation without replacing original CLI FAIL/NOT_RUN stage records.

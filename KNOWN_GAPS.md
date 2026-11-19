@@ -4590,3 +4590,12 @@ After dependency installation works, rerun the frozen application stages
 before claiming boot, SQLite, HTTP or test compatibility. Original Rails
 component suites and broader application workloads still need measurement.
 See [railstest/README.md](railstest/README.md) and its separate latest record.
+
+
+An independent direct-load diagnostic of the locked Rails fixture also
+stops at ActiveSupport::OrderedOptions' dynamic setter: Hash subclass
+instances bypass a Ruby method_missing for unknown names, although their
+class and reported hook owner are correct. This reduces without Rails on
+main (#123) and belongs to the gem session's primitive missing-hook work.
+It is separate from command-registry issue #121. Saved gems are reused
+only in this diagnostic; the original cold CLI stages remain unchanged.

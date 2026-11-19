@@ -145,3 +145,30 @@ that side's environment. It does not populate the registry or change Rails.
 [Issue #121](https://github.com/284km/mere-ruby/issues/121) tracks the shared
 Ruby method-dispatch correction. The native invoke_val_c0 arm is outside
 this measurement/library work's independent scope.
+
+
+## Independent load diagnostics
+
+`load_diagnostics.json` keeps two follow-up diagnostics separate from the
+six original stages. They reuse each interpreter's own already-built gems
+and fresh copies of the unchanged app fixture; they do not repeat the cold
+installation or execute the original CLI. The original main/C API/provider
+records and their NOT_RUN stages are unchanged.
+
+Directly running the existing `script/boot.rb` on the provider composition
+153e64f5 passes reference source provenance and boot, but mere-ruby stops
+loading ActiveSupport's i18n railtie at `config.i18n.railties_load_path = []`.
+`probes/ordered_options.rb`, run with the isolated app as working directory,
+reduces this to unchanged ActiveSupport OrderedOptions. Construction has
+the correct subclass and Ruby method owner; its dynamic accessor is not
+called. The failed earlier preparation that loaded Railtie without its
+required setup is not a healthy-reference measurement and is not included.
+
+`probes/hash_missing.rb` reproduces the missing Ruby hook without any gem.
+The same Hash subclass instance reports its correct class, then ordinary
+unknown calls bypass its Ruby method_missing and raise instead. See
+[issue #123](https://github.com/284km/mere-ruby/issues/123). The gem session's
+primitive method/missing-hook paths own this boundary. Neither those shared
+functions nor another session's branch is edited here. This is separate
+from #121's command registry. The full Rails workload still needs its
+original migration/boot/test/HTTP replay after both dispatch fixes.
