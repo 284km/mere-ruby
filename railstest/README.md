@@ -172,3 +172,20 @@ primitive method/missing-hook paths own this boundary. Neither those shared
 functions nor another session's branch is edited here. This is separate
 from #121's command registry. The full Rails workload still needs its
 original migration/boot/test/HTTP replay after both dispatch fixes.
+
+
+## Class-dispatch candidate with the original CLI
+
+`class_candidate.json` is a new cold paired measurement of validation-only
+composition 5d1a0c95: current unmerged C API #95, bounded SHA-2 #120 and
+Class dispatch #125. Its exact source remains on rails-capi-probe-r1,
+which is explicitly not a merge/release branch. Each side again starts
+with an empty gem home and builds its own extensions from the same lock.
+
+Reference passes all six original stages. Mere installs all 68 dependencies
+in 231.607 seconds / 946,832 KiB, without a resource event. The original
+migration CLI now enters Rake and loads the application instead of failing
+on an empty command registry. It then fails in ActiveSupport's existing
+railties_load_path= assignment (#123), exit 1 in 3.238 seconds / 305,664 KiB.
+Boot, tests and HTTP remain NOT_RUN. Original 600-second / 2-GiB bounds,
+lock, app and source checks are unchanged. Earlier observations are kept.

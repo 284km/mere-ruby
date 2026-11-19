@@ -6155,3 +6155,15 @@ candidate. The primitive missing-hook path belongs to that session; #123
 records the handoff. No shared dispatcher or Rails source is patched.
 The distinct load_diagnostics.json and two small probes preserve this
 observation without replacing original CLI FAIL/NOT_RUN stage records.
+
+
+### Original Rails CLI passes command registration and reaches Hash hooks
+
+Cold paired source 5d1a0c95 combines unmerged C API, bounded SHA-2 and #125.
+The unchanged reference passes every original stage. Mere installs all 68
+gems in 231.607 s / 946,832 KiB, then the real migration CLI reaches Rake
+and application loading. Its next exit-1 failure is the independently
+reduced Hash missing-hook assignment (#123), 3.238 s / 305,664 KiB. There
+is no resource event. The original bounds and inputs remain; three later
+stages stay NOT_RUN. class_candidate.json is separate from main, C API-only,
+provider-only and independent-load records. This is no Rails app PASS.
