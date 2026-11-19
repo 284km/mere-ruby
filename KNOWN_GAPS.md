@@ -4605,7 +4605,7 @@ change, with new mutually recursive shipped_native_path. No additional
 top-level Mere values, C API implementation/header, collector, VM/ISeq, AST,
 gemtest, API inventory, original test or resource-limit changes.
 
-Corpus 721 independently compiles the same tiny C fixture for each runtime
+Corpus 722 (originally 721) independently compiles the same tiny C fixture for each runtime
 using that runtime's headers. It covers a real Ruby file before the native
 choice, explicit .rb lookup, native feature resolution/loading, its actual
 constant, canonical feature identity and one-time execution. The parent
@@ -4628,3 +4628,7 @@ native_candidate.json in #117 preserves the exact run. No JSON attributes,
 Rails/gem sources or original inputs/limits are patched. This own branch
 is stacked on the Hash candidate; production integration must wait for the
 parent series and required hosted gates.
+
+The native feature witness was renumbered from 721 to 722 after the
+concurrent parent published its distinct IO witness 721. Its Ruby/C source
+is byte-identical; no observation or historical source record is rewritten.
