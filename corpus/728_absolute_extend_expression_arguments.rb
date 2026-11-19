@@ -64,3 +64,20 @@ p [:parentheses, plain.extend(::RootExtendFactory::Feature).equal?(plain), plain
 extend = Object.new
 def extend.get; :local_receiver; end
 p [:local_receiver, extend.get]
+
+# ActiveSupport's isolation helper selects a module with a method and ternary.
+module ComputedInclude
+  module Forking
+    def isolated; :forking; end
+  end
+  module Subprocess
+    def isolated; :subprocess; end
+  end
+  def self.forking_env?; true; end
+  include forking_env? ? Forking : Subprocess
+end
+p [:computed_include, Object.new.extend(ComputedInclude).isolated]
+class RootedInclude
+  include ::RootExtendFactory.with(:routes), ::RootExtendFactory::Extra
+end
+p [:rooted_include, RootedInclude.new.feature, RootedInclude.new.extra]
