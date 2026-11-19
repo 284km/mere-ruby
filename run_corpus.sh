@@ -16,11 +16,20 @@ export RUBYOPT
 # moved onto ./mere-ruby, because a sweep in flight owns that path -- writing
 # it mid-measurement tests a half-written binary and invents a regression.
 MR_BIN="${MR_BIN:-./mere-ruby}"
+# A caller may supply reference stdlib paths through RUBYLIB. They are fallbacks
+# for Mere, whose C-backed libraries (including monitor) are shipped internally.
+# Do not reorder the reference side or override paths a program adds with -I
+# or $LOAD_PATH.unshift. Ask only once, before any Mere invocation.
+mere_rubylib="${RUBYLIB:-}"
+if [ -n "$mere_rubylib" ]; then
+  mere_load_path="$(sh "$(dirname "$0")/tools/runtime_load_path.sh" "$MR_BIN")"
+  mere_rubylib="$mere_load_path:$mere_rubylib"
+fi
 # One interpreter self-check first: an Errno class registered with no strerror
 # text loses its message prefix SILENTLY (`raise Errno::EXYZ, "m"` would read "m"
 # where ruby reads "<text> - m"), so the class list and the text table are asked
 # about each other rather than trusted to stay in step.
-errno_out="$(MERE_RUBY_ERRNO_CHECK=1 "$MR_BIN" corpus/01_arith.rb 2>&1 >/dev/null || true)"
+errno_out="$(MERE_RUBY_ERRNO_CHECK=1 env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" corpus/01_arith.rb 2>&1 >/dev/null || true)"
 case "$errno_out" in
   *MISSING*) echo "$errno_out"
              echo "an Errno class has no strerror text -- see errno_desc in main.mere"
@@ -120,7 +129,7 @@ failed=0
 total=0
 for f in corpus/*.rb; do
   rrc=0; "$REF_RUBY_BIN" "$f" > "$exp" 2>/dev/null || rrc=$?
-  mrc=0; "$MR_BIN" "$f" > "$got" || mrc=$?
+  mrc=0; env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" "$f" > "$got" || mrc=$?
   total=$((total + 1))
   bad=0
   if ! diff -u "$exp" "$got" > "$dif"; then
@@ -134,7 +143,7 @@ for f in corpus/*.rb; do
   fi
   if [ "$bad" = 1 ] && [ "$sb_keep" != 1 ]; then exit 1; fi
   if [ "$sb_both" = 1 ]; then
-    mrc=0; MERE_RUBY_NO_HASH_INDEX=1 "$MR_BIN" "$f" > "$got" || mrc=$?
+    mrc=0; MERE_RUBY_NO_HASH_INDEX=1 env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" "$f" > "$got" || mrc=$?
     if ! diff -u "$exp" "$got" > "$dif" || [ "$rrc" != "$mrc" ]; then
       echo "FAIL $f (with MERE_RUBY_NO_HASH_INDEX=1; ruby exited $rrc, mere-ruby $mrc)"
       cat "$dif"
