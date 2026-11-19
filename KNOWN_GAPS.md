@@ -4569,3 +4569,21 @@ bound is computed by walking it, so it does not return (ruby answers
 Float::INFINITY). CRuby's test_enumerator (test_size_for_downup_to) hangs
 there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
+
+
+## Rails command registration and Ruby subclasses definitions
+
+Ordinary Ruby subclasses definitions on modules/classes now take precedence
+over native Class enumeration. Native aliases/retained Methods and super
+retain their actual entry; Ruby lookup and reported ownership stop at the
+native Class boundary. The actual unchanged Rails RakeCommand registers
+and is found in an independent saved-gem diagnostic. This does not establish
+successful migration, full boot, app tests or HTTP. The original cold CLI
+needs replay on the integration candidate; Hash subclass missing hooks
+(#123) remain outside this Class-only correction.
+
+Redefining a generic Ruby method after aliasing it away and back can retain
+its old alias source name for super (#124). That smaller non-Class-native
+case already fails on unchanged main and the gem candidate. The separate
+Class replacement witnesses isolate mutations in fresh processes; no
+existing test is omitted and no generic metadata repair is claimed here.

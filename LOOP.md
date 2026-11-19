@@ -6053,3 +6053,42 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+
+### Rails command registration honors Ruby subclasses definitions (2026-11-19)
+
+Rails::Command defines subclasses as a Ruby registry on its module. The
+native Class#subclasses arm answered first, returning a fresh native array
+instead of that registry. Ordinary module/class singleton definitions now
+run with their real visibility and argument protocol. A module without a
+Ruby definition no longer claims Class's native-only entry.
+
+Saved native aliases, Methods/UnboundMethods and native super use the same
+real direct-superclass relation with a zero-argument check. Ruby lookup and
+Method#owner stop at Class's actual native entry before later definitions;
+replacing Class#subclasses itself does not resurrect a hidden native super.
+The fallback checks the actual current Ruby frame's remaining ancestor
+chain and introduces no new global Mere values or Ruby API/inventory rows.
+No collector, VM/ISeq, AST or C API implementation is changed. Shared
+functions are listed in the PR; their other sessions' regions are retained.
+
+On main 3b05689f with its pinned Mere 01f5ad73, normal O2: original Class
+62 MATCH, Module 195, Method 97, Super 50 and Refinement 121 (527 cases:
+525 MATCH / 1 RED / 1 BOTH). No focused file is below successful main
+12ca1df2; Module's additional observation is not attributed to this patch.
+Reference and mere-ruby each build their own unchanged -test-/class source.
+The existing Method compaction skip remains visible. Corpus 705/705 matches
+with indexing ON/OFF, including 717/718's native/override/alias/visibility/
+super/owner-boundary controls. All nine RSS controls pass. Actual generated
+C bracket depth is 155/1024 with main's newer compiler; that depth change
+from older measurements is not a result of this dispatch correction.
+
+A separate saved-gem diagnostic registers and finds the actual unchanged
+Rails RakeCommand identically on both runtimes: reference 0.661 s / 26,736
+KiB, candidate 1.575 s / 177,776 KiB, both exit 0 without a resource event.
+It does not repeat dependency installation or establish a Rails app pass.
+A fresh original-CLI paired run is being measured separately on an own
+validation-only composition with unmerged #95 and bounded SHA-2 #120.
+Hash subclass missing hooks (#123) remain a separate coordination item.
+Generic stale alias origins after redefinition (#124) also reproduce on
+unchanged main; no generic alias metadata repair is claimed here.
