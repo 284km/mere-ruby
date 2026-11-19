@@ -6082,3 +6082,21 @@ here. There is no claimed Rails framework-suite pass or application MATCH
 on mere-ruby. The fixed 600-second / 2-GiB bounds remain. The next action
 is the same locked workload after native installation becomes available,
 then original Rails component tests.
+
+
+### Rails intake round 3: isolate reference discovery (PR #117 review P2)
+
+The first metadata subprocess queried the reference before the child-stage
+environment was cleaned. Inherited RUBYOPT could load a foreign file or
+Bundler with an unrelated Gemfile and abort before any measurement record.
+`clean_environment` now supplies the same isolation to discovery and stages,
+without depending on a standard-library directory that discovery has not
+read yet. No runtime function or dependency lock changes.
+
+The new command-entry control launches the actual measurement with
+-rforeign and with -rbundler/setup plus an incompatible external Gemfile.
+Both fail at discovery on the preceding version; both now reach the intended
+invalid-archive fixture and retain REFERENCE_UNAVAILABLE/exit 2 rather than
+an unrecorded startup error/exit 1. All six harness controls pass. The small
+harness workflow selects Ruby 4.0.9 to execute that real subprocess control.
+The original main Rails measurement remains a historical snapshot.

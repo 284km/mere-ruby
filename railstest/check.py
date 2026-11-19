@@ -2,6 +2,9 @@
 """Check that missing tests, altered inputs and inherited gems cannot pass."""
 import importlib.util
 import os
+import json
+import shutil
+import subprocess
 from pathlib import Path
 import tempfile
 import sys
@@ -64,6 +67,58 @@ class MeasurementCheck(unittest.TestCase):
                         dict(exit=0, limit='MEMORY_LIMIT')]:
             self.assertFalse(measure.successful('boot', outcome, 'rails-boot-ok\n'))
         self.assertFalse(measure.successful('boot', dict(exit=0, limit=None), ''))
+
+    def test_actual_entry_point_ignores_foreign_ruby_startup(self):
+        reference = Path(os.environ.get('REF_RUBY_BIN') or shutil.which('ruby')).resolve()
+        control_env = {k: v for k, v in os.environ.items()
+                       if not k.startswith(('BUNDLE_', 'RBENV_'))
+                       and k not in ('RUBYOPT', 'RUBYLIB', 'GEM_HOME', 'GEM_PATH', 'RUBYGEMS_GEMDEPS')}
+        version = subprocess.check_output([str(reference), '--disable-gems', '-e', 'print RUBY_VERSION'],
+                                          text=True, env=control_env, timeout=10)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.git').symlink_to(measure.REPO / '.git',
+                                      target_is_directory=(measure.REPO / '.git').is_dir())
+            harness = root / 'railstest'
+            app = harness / 'app'
+            app.mkdir(parents=True)
+            for name in ('measure.py', 'bootstrap.rb'):
+                shutil.copy(measure.ROOT / name, harness / name)
+            (root / 'unittest').symlink_to(measure.REPO / 'unittest', target_is_directory=True)
+            for name in ('Gemfile', 'Gemfile.lock'):
+                shutil.copy(measure.ROOT / 'app' / name, app / name)
+            archives = root / 'archives'
+            archives.mkdir()
+            archive = archives / 'bundler-4.0.20.gem'
+            archive.write_bytes(b'not a gem: stop before any real install')
+            data = dict(schema=1, ruby_version=version, rails_version='8.1.4.1',
+                        inputs={n: measure.sha(app / n) for n in ('Gemfile', 'Gemfile.lock')},
+                        packages=[dict(file=archive.name, sha256=measure.sha(archive))])
+            (harness / 'archives.lock.json').write_text(json.dumps(data))
+            binary = root / 'mere-ruby'
+            binary.write_text('#!/bin/sh\nexit 99\n')
+            binary.chmod(0o755)
+            (root / '.build_mode').write_text('O2\n')
+            foreign = root / 'foreign.Gemfile'
+            foreign.write_text('source "https://rubygems.org"\nruby "0.0.1"\n')
+            for index, rubyopt in enumerate(('-rforeign', '-rbundler/setup')):
+                with self.subTest(RUBYOPT=rubyopt):
+                    output = root / ('run-' + str(index))
+                    env = dict(control_env, RUBYOPT=rubyopt, RUBYLIB=str(root / 'foreign'),
+                               BUNDLE_GEMFILE=str(foreign), BUNDLE_WITHOUT='test')
+                    result = subprocess.run([sys.executable, str(harness / 'measure.py'), 'measure',
+                                             '--archives', str(archives), '--reference', str(reference),
+                                             '--binary', str(binary), '--output', str(output)],
+                                            env=env, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                    record = json.loads((output / 'results.json').read_text())
+                    self.assertEqual(version, record['ruby_version'])
+                    self.assertEqual('REFERENCE_UNAVAILABLE', record['state'])
+                    self.assertEqual('FAIL', record['sides']['reference']['bundler']['state'])
+                    self.assertEqual('NOT_RUN', record['sides']['reference']['dependencies']['state'])
+                    error = (output / 'reference/bundler.stderr').read_text()
+                    self.assertNotIn('RubyVersionMismatch', error)
+                    self.assertNotIn('cannot load such file -- foreign', error)
 
 
 if __name__ == '__main__':

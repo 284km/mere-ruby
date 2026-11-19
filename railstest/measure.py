@@ -86,11 +86,17 @@ def restore(args, data):
     print(f"Verified {len(data['packages'])} source archives; no extensions are shared.")
 
 
-def environment(home, app, stdlib, user, sqlite_prefix):
+def clean_environment():
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('BUNDLE_', 'MERE_RUBY_', 'RBENV_'))
            and k not in ('RUBYOPT', 'RUBYLIB', 'GEM_HOME', 'GEM_PATH', 'GEMRC',
                          'MAKEFLAGS', 'RUBYGEMS_GEMDEPS', 'RAILS_ENV', 'RACK_ENV')}
+    env.update(LANG='en_US.UTF-8', GEMRC=os.devnull)
+    return env
+
+
+def environment(home, app, stdlib, user, sqlite_prefix):
+    env = clean_environment()
     env.update(LANG='en_US.UTF-8', GEM_HOME=str(home), GEM_PATH=str(home),
                GEMRC=os.devnull, RAILS_SMOKE_RUBY_LIB=stdlib, RAILS_ENV='test',
                RUBYOPT='-r' + str(ROOT / 'bootstrap.rb'),
@@ -124,7 +130,7 @@ def measure(args, data):
         raise ValueError('--output must not exist; use a fresh directory')
     query = 'require "rbconfig"; require "json"; puts JSON.generate([RUBY_VERSION, RbConfig::CONFIG["rubylibdir"], File.join(RbConfig::CONFIG["bindir"], "gem")])'
     version, stdlib, gem = json.loads(subprocess.check_output(
-        [str(args.reference), '-e', query], text=True, env=dict(os.environ, LANG='en_US.UTF-8'), timeout=10))
+        [str(args.reference), '-e', query], text=True, env=clean_environment(), timeout=10))
     if version != data['ruby_version']:
         raise ValueError('reference Ruby version differs from lock')
     if not args.binary.is_file() or args.binary.with_name('.build_mode').read_text().strip() != 'O2':

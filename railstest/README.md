@@ -64,7 +64,8 @@ NOT_RUN and resource events explicitly. The test stage requires all six named
 tests, exactly 31 assertions and zero failures/errors/skips.
 
 `latest.json` is the portable first measurement, including log hashes; raw
-logs and built gems are external artifacts. Its main source is recorded in
+logs and built gems are external artifacts. This initial snapshot retains the
+runner hash used for that run; later harness fixes do not rewrite history. Its main source is recorded in
 `source_ref`; it does not describe unmerged gem or C API branches.
 
 ## First blocker and next measurements
@@ -89,6 +90,11 @@ request workloads need additional explicit measurements.
 ```sh
 LANG=en_US.UTF-8 python3 railstest/check.py -v
 ```
+
+Reference discovery and all measured stages discard inherited Ruby/Bundler
+settings. The command-entry controls actually launch the measurement with
+foreign RUBYOPT and a conflicting BUNDLE_GEMFILE; they must get beyond
+discovery and report the deliberately invalid archive as reference-unavailable.
 
 The controls reject changed/extra archives, inherited foreign gem/Bundler
 settings, missing or skipped tests, reduced assertion counts, and success
