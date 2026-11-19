@@ -16,6 +16,118 @@ print `:kept1`, the requested count, and `:kept2`. Compare several counts and
 sample the O2 interpreter to distinguish iteration cost from stack pin scanning
 and captured-environment compaction. See [CI scheduling and profiles](ci_short_shards.md).
 
+### Incremental live-allocation snapshots
+
+Measured 2026-11-18 on arm64 macOS 26.7.1 with Apple Clang. The same mere-ruby
+source (`12ca1df2`) and `tools/build.sh` O2 flags were built with control Mere
+`b1a49f336fa4c6cb200e20460e44bc44399c8424` and candidate
+`68519ed1744a05088d08dd18019ce34b6e7feb01`. The compiler change updates the
+coroutine scanner's sorted live-block snapshot from a bounded local change log,
+falling back to a full rebuild for overflow or shared-list changes.
+Snapshot validation used Mere
+`40761fb8405eb3b12e70bd14bd72871332f008c0`, which adds gate registration and
+its controls to that measured candidate; compiler/runtime sources are identical.
+
+Three fresh processes per count and compiler alternated control/candidate.
+Wall time includes startup; peak RSS is from macOS `/usr/bin/time -l`.
+
+| Generators | Control median [range] seconds | Candidate median [range] seconds | Median peak RSS control / candidate MiB |
+|---:|---:|---:|---:|
+| 1,000 | 1.189 [1.035, 1.244] | 0.535 [0.480, 0.776] | 281.31 / 280.16 |
+| 2,000 | 4.750 [4.486, 4.915] | 2.440 [2.438, 2.526] | 340.50 / 340.19 |
+| 4,000 | 19.731 [16.707, 21.653] | 9.839 [8.591, 10.519] | 410.61 / 411.09 |
+
+All outputs matched Ruby 4.0.9. The 4,000-generator median is about twice as
+fast with comparable peak RSS. Growth is still faster than linear; other
+pin/reachability costs remain. These are local workload measurements, not
+end-to-end CI timings. To reproduce, build each compiler, use
+`MERE=/path/to/mere.exe sh tools/build.sh`, retain each interpreter, then run
+both against this script at 1,000, 2,000 and 4,000 with the same reference Ruby.
+
+The candidate also passed all 703 corpus programs with the hash index on and
+off. The pinned CRuby `test_enum.rb`, `test_enumerator.rb` and
+`test_lazy_enumerator.rb` retain exactly the same named-case results as the
+control: 224 tests, 1,460 assertions, no failures/errors and one existing skip.
+The comparison used the unchanged 2 GiB process-family limit and a 180-second
+wall limit per side. These focused checks do not replace the complete CI suite.
+
+### Unsigned pin-word sorting
+
+The next compiler change sorts large pin lists with stable byte radix passes,
+skipping bytes shared by every input. Lists below 256 words and unsuccessful
+scratch allocations retain `qsort`. Both pin collection paths preserve every
+unsigned word and duplicate; the temporary scratch array is freed before return.
+
+Radix-sorting validation used Mere `4720aa939c5f469307fa60c89edd99b4b18ce312`. On the same
+mere-ruby runtime source (`12ca1df2`) and O2 flags, fresh paired measurements
+compare this with the previous snapshot-update runtime (`40761fb8`). The host
+is the same arm64 macOS 26.7.1/Apple Clang environment. Three processes per
+count and compiler alternate control/candidate, reversing order in the second
+repetition. The full regression workload completed before timing began.
+
+| Generators | Previous runtime median [range] seconds | With radix sorting median [range] seconds | Median peak RSS previous / radix MiB |
+|---:|---:|---:|---:|
+| 1,000 | 0.515 [0.502, 0.562] | 0.460 [0.408, 0.509] | 280.94 / 280.92 |
+| 2,000 | 2.660 [2.657, 2.700] | 1.966 [1.914, 1.971] | 340.03 / 340.89 |
+| 4,000 | 9.318 [9.192, 9.387] | 6.977 [6.855, 7.619] | 411.98 / 412.48 |
+
+The 4,000-generator median is 25.1% shorter with comparable peak RSS. Every
+sample matches Ruby 4.0.9, including the retained generator. The earlier
+snapshot table is a separate measurement; this paired comparison isolates
+sorting. These are local workload timings, not complete workflow timings,
+and scaling is still faster than linear. Reproduce with the same build and
+benchmark commands above, retaining one interpreter from each compiler.
+
+The candidate again passes all 703 corpus programs in both hash-index modes
+and preserves all named-case results in the 224-test CRuby enum/enumerator/lazy
+suites (1,460 assertions, no failures/errors, one existing skip, the same limits).
+Upstream O2 and ASan/UBSan checks compare complete unsigned sequences against
+a reference sort in executable/library modes, force allocation failure and
+require six broken variants to produce their specific failure witnesses.
+
+### Per-scan range and own-block caches
+
+CI now pins Mere `01f5ad738748cc570cc04e3000f50b8c6965543f`. The word walker
+keeps its previous last-span fast path and adds eight exact allocation/gap
+range hints. Both paths reuse the span's classification against the walk's
+fixed own-block set. Hints are local to one zero-initialized scan state;
+collisions validate the complete half-open interval and fall back to binary
+search. The current used bump limit is still read after lookup, and no extra
+heap allocation is introduced.
+
+An instrumented 4,000-generator census reduces binary searches from 28,551,057
+to 14,369,964 and ownership lookups from 92,228,524 to 7,087,370. The additional
+cache answers 49.9% of lookups not resolved by the last-span path. The upstream
+benchmark README and `lookup_probe.py` record all counts and definitions;
+timings use separate uninstrumented interpreters.
+
+On the same runtime source (`12ca1df2`) and O2 flags, fresh paired measurements
+compare the radix-sorting parent (`4720aa93`) with the new compiler, on the
+same arm64 macOS/Apple Clang host. Three fresh processes per size and compiler
+alternate control/candidate, reversing order in the middle repetition. All
+regression workloads finished before timing began; all outputs match Ruby 4.0.9.
+
+| Generators | Parent median [range] seconds | Range/ownership cache median [range] seconds | Median peak RSS parent / cache MiB |
+|---:|---:|---:|---:|
+| 1,000 | 0.438 [0.428, 0.457] | 0.410 [0.388, 0.424] | 281.48 / 281.14 |
+| 2,000 | 1.891 [1.802, 2.050] | 1.732 [1.660, 1.913] | 340.84 / 340.70 |
+| 4,000 | 6.612 [6.400, 6.696] | 6.042 [5.967, 6.613] | 412.05 / 409.77 |
+
+The 4,000-generator median is 8.6% shorter, with overlapping ranges and
+comparable peak RSS. Earlier tables are separate measurements; these fresh
+pairs isolate range/ownership caching. Scaling remains faster than linear
+and complete workflow timings remain to be measured.
+
+All 703 corpus programs match in both hash-index modes. Corpus/216 checks the
+module-self `sleep(0)` call's integer/nonnegative return contract: the pinned
+CRuby uses `time(0)` before/after sleep and may return 1 across a clock boundary.
+Reference, parent and candidate agree on the corrected assertion in both modes.
+The 224 CRuby enum/enumerator/lazy tests retain the parent's exact named-case
+results (1,460 assertions, no failures/errors, one existing skip, the same limits).
+Upstream O2 and ASan/UBSan checks compare membership and own-block classification
+with linear oracles, including collisions, gaps, high addresses and a changing
+bump top; nine deliberate defects must each produce their specific witness.
+
 ## `yaml_cycles.rb`
 
 Dump a self-referential array and compare memory use before and after identity
