@@ -59,14 +59,17 @@ dirs="$*"
 # question: those groups with the REFERENCE's stdlib and bundled gems on
 # RUBYLIB, as gemtest's "with a stdlib" column does. It is recorded apart
 # (SPEC_STATUS_STDLIB.md, mspec/tags_stdlib/) so that neither table's number
-# means something different from row to row. RUBYLIB reaches both sides, and
-# the reference loses nothing by being shown its own library.
+# means something different from row to row. Keep these reference paths as
+# fallbacks on the Mere side: CRuby's monitor.rb requires monitor.so, whereas
+# Mere ships its own implementation. Query Mere once for the whole sweep.
 if [ "${SPEC_WITH_STDLIB:-0}" = 1 ]; then
   rec_status="SPEC_STATUS_STDLIB.md"; rec_tags="tags_stdlib"
   sb_stdlib="$("$REF_RUBY_BIN" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
   [ -n "$sb_stdlib" ] || { echo "scoreboard.sh: could not ask $REF_RUBY_BIN for its rubylibdir" >&2; exit 2; }
   RUBYLIB="$sb_stdlib${RUBYLIB:+:$RUBYLIB}"
   export RUBYLIB
+  SPEC_MERE_LOAD_PATH="$(sh "$here/../tools/runtime_load_path.sh" "${MR_BIN:-$here/../mere-ruby}")" || exit 2
+  export SPEC_MERE_LOAD_PATH
 else
   rec_status="SPEC_STATUS.md"; rec_tags="tags"
 fi
