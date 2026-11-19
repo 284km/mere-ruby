@@ -5498,6 +5498,371 @@ specs 2,277 of 2,584, the contracts 177.
 and `$stdin` as C variables that follow the interpreter's), and io_spec /
 thread_spec.
 
+## 2026-11-16 (65): five real pure Ruby gems run their own upstream test files
+
+Gem-suite rounds 1-3, on main c64d0ae4, independently of #86 (AST), #87
+(C API) and #88 (VM). This measures original upstream tests, beyond the
+29-gem require-only inventory. The final lock has 62 files and 1,969
+reference tests. Counts below are FILE verdicts, not case counts:
+
+| suite | initial MATCH / RED / BOTH | latest MATCH / RED / BOTH | other |
+|---|---|---|---|
+| minitest 5.25.5 | 3 / 4 / 0 | 3 / 4 / 0 | mock now completes all 94 tests |
+| rack 3.2.0 | 29 / 9 / 0 | 30 / 8 / 0 | 1 MEMORY on both builds |
+| rack-test 2.2.0 | 7 / 1 / 0 | 7 / 1 / 0 | assertion-count reflection difference |
+| public_suffix 6.0.2 | 7 / 0 / 0 | 7 / 0 / 0 | |
+| base64 0.2.0 | 1 / 0 / 0 | 1 / 0 / 0 | |
+
+- **Reproducible sources and measurements.** `gemtest/suites.lock.json`
+  pins release commits, full source digests, test-file inventory, commands
+  and every pure Ruby development dependency's archive and extracted tree.
+  Restore checks the runtime dependency closure and rejects C extensions.
+  Sources stay in an external cache; measurement retrieves nothing. Each
+  side/file gets its own source copy and seed 1. Raw stdout, stderr and exit
+  are saved separately. Existing CI supervision bounds the whole process
+  family to 600 seconds and 2 GiB, with no option to increase either.
+- **Honest file verdicts.** MATCH requires successful exits, non-skipped
+  tests, assertions and identical summaries. No summary, zero tests and all
+  skips cannot pass. Reference failures remain BOTH, and resource limits
+  remain explicit. The final baseline has no BOTH or timeout; its remaining
+  memory failure is Rack's multipart file. Initial and latest results are
+  saved separately and compared file by file, with no lost MATCH or changed
+  reference coverage. `SUITES_GAPS.md` records every remaining difference,
+  distinguishing confirmed symptoms from causes still under investigation.
+- **Two local semantic fixes.** `pct_strict_value` follows escaped newlines
+  backwards before deciding whether `%` starts a literal. Minitest's
+  continued format string now parses; its original mock file runs 94 tests
+  instead of stopping with SyntaxError (still 2 failures / 13 errors).
+  `cls_meth_own` respects a local builtin alias before an inherited Ruby
+  class method: Rack::MockResponse's `alias [] new` no longer calls
+  Rack::Response.[] with its different argument order. The original mock
+  response file becomes MATCH (24 tests / 100 assertions). Witnesses 667
+  and 668. These are the only interpreter functions changed; no new global
+  let, VM, AST tree, C API or collector change.
+- **Selection and reference readiness.** Rack 3.1.12 requires removed
+  cgi/cookie, so 3.2.0 was selected before the final baseline. Hoe and logger
+  are explicitly pinned so minitest's task file and Rack's logger tests run
+  on the reference. These environment repairs are not interpreter gains.
+  Kramdown 2.5.1's conversion tests depend on tidy and optional Rouge and
+  stringex (reference 19 failures / 11 errors); it is explicitly deferred
+  in the lock, not selectively patched or counted as passing.
+- **Validation.** Corpus 690/690 before and 692/692 after; test_alias
+  17 MATCH / 1 RED and test_syntax 167 MATCH / 1 RED / 2 BOTH, identical
+  file counts to both handoff CI 43548292351 and main CI 43807166928.
+  Dead/duplicate definitions, GC roots and loop RSS gates pass; generated
+  bracket depth stays 895/1024. Six harness negative controls cover zero
+  tests, missing summaries/files, reference failures, limits and source
+  mutation/shadowing. The separate `Gem suites` workflow uses actions/cache
+  and runs on macOS and Linux, without changing existing job durations or
+  any per-file limits. Full existing-suite regression checks still gate merge.
+
+## 2026-11-16 (66): gem rounds 4-5 -- gzip callbacks and StringIO reflection
+
+While #90's full CI runs, two independent Ruby-library fixes make two more
+original Rack files pass. The same locked 62 files / 1,969 reference tests
+now report 50 MATCH / 11 RED / 1 MEMORY (was 48 / 13 / 1 after rounds 1-3),
+with no lost MATCH or reference coverage change. Rack alone moves from
+30 MATCH / 8 RED / 1 MEMORY to 32 / 6 / 1; the other four gems are unchanged.
+
+- `Zlib::GzipWriter#__write_output` takes the pending bytes out of its
+  buffer BEFORE calling the destination. Rack's consumer accepts a chunk
+  and then raises FakeDisconnect. The old buffer still held that chunk,
+  so ensure's `finish` sent the gzip prefix again and replaced the caller's
+  exception with Zlib::DataError. A two-write sink that inflates bytes and
+  then raises reproduces it without Rack; now it retains the reference's
+  Disconnect and decoded `foo`. Original `spec_deflater.rb` becomes MATCH,
+  and CRuby's zlib file stays 96/96 MATCH. Witness 671.
+- StringIO's eight backing ivars use the interpreter's existing internal
+  namespace. CRuby keeps that state outside Ruby ivars; exposing `@st`,
+  `@enc` and the flags made Psych serialize the private State object and
+  fail restoring the environment dump. User-added `@st` and `@label` remain
+  visible and round-trip; assigning `@st` no longer replaces the stream's
+  real buffer state. This is a mechanical backing-name change in
+  `lib/stringio_ext.rb`, with its embedded copy regenerated. The original
+  `spec_mock_request.rb` becomes MATCH; both CRuby StringIO files give
+  103/103 MATCH. Witness 672.
+- Corpus 695/695 matches the reference, dead definitions and GC-root gates
+  pass, bracket depth stays 895/1024. No main interpreter function, VM,
+  AST tree, native API, collector, global let or resource bound is changed.
+- `suites.py --verbose` only asks the upstream runner to name each test.
+  It identifies the multipart memory file's active case as
+  `test_0018_rejects insanely long boundaries`. Both interpreters pass a
+  small control allocating 10 MiB and doing one nonblocking pipe write
+  (65,536 bytes on each); this does not establish the combined workload's
+  cause. The MEMORY verdict and 2 GiB cap remain.
+- The previous batch's Gem suites CI 43874223005 passes on Linux and macOS
+  with identical reference counts and the recorded 48 / 13 / 1 verdicts;
+  an independent review of #90 repeated all 62 files with no regression or
+  actionable finding. Full existing-suite CI remains a merge gate.
+
+## 2026-11-17 (67): gem rounds 6-7 -- File overrides and deferred Chain groups
+
+The same 62 locked upstream files now give 51 MATCH / 10 RED / 1 MEMORY,
+with zero BOTH or timeout, no lost MATCH and no reference coverage change.
+Minitest improves from 3 MATCH / 4 RED to 4 / 3; Rack remains 32 / 6 / 1,
+rack-test 7 / 1, public_suffix 7 / 0 and base64 1 / 0.
+
+- `invoke_with_block0` previously handled File.open/new before Ruby method
+  dispatch, so a stub worked without a block but opened a real path with
+  one. Ruby overrides now receive the block. A restored prelude IO alias
+  still uses File's native path handling; the method's native flag and
+  actual prelude source metadata identify that case. Witness 676 covers
+  keyword/block forwarding and restoring the original alias. The original
+  mock file improves from 2 failures / 13 errors to 1 / 8 across 94 tests,
+  while remaining RED.
+- `core_prelude_b` attaches the existing Enumerable implementation to
+  Chain, whose advertised ancestry alone did not provide its private
+  helpers. `chunk_while` and `slice_when` construct deferred enumerators
+  over the source rather than eagerly gathering it. Witness 677 covers
+  deferred predicates, infinite inputs stopped by take, multiple yielded
+  values, empty inputs, argument errors and reflected owner/ancestors.
+  Minitest's original reporter file becomes MATCH (22 tests / 52 assertions).
+  Its test file loses the backtrace-compression errors but retains 8 Marshal
+  failures and 1 yield error.
+- Corpus 697/697; Enum/Enumerator 159 MATCH / 0 RED / 1 BOTH, with no
+  decrease from either required CI baseline. GC roots pass and bracket
+  depth remains 895/1024. No new top-level let or resource bound change.
+  After #88 merged, the current open branches no longer changed either
+  function; their diffs were checked again before publishing this batch.
+- #90's completed existing-suite shard 3 has one lower file count:
+  test_transcode.rb is 97 rather than 98 MATCH because its ractor encoding
+  test reaches its existing 10-second timeout. The isolated test passes
+  locally on both the PR binary (5.35 s) and a CI artifact whose relevant
+  runtime sources equal main (5.79 s). This does not yet establish a cause;
+  rerun CI without changing the limit before accepting the merge gate.
+
+## 2026-11-17 (68): gem rounds 8-9 -- ordered rescue and Hash initialize's block
+
+The original 62 files / 1,969 reference tests now give 52 MATCH / 9 RED /
+1 MEMORY, with zero BOTH, TIMEOUT or baseline regressions. Rack improves
+from 32 MATCH / 6 RED / 1 MEMORY to 33 / 5 / 1; minitest stays 4 / 3,
+rack-test 7 / 1, public_suffix 7 / 0 and base64 1 / 0. The initial 47 / 14 /
+1 MEMORY snapshot remains unchanged.
+
+- Rescue checks one candidate before evaluating the next expression or
+  validating the next splatted value. An earlier ArgumentError match now
+  prevents an unreachable regexp from raising TypeError; a reached invalid
+  value still raises. Empty/nil splats remain different from bare rescue.
+  `rescue_clause_matches` / `rescue_values_match` reuse the existing lexical
+  constant, splat conversion, Module#=== and TracePoint machinery.
+  `run_rescues` calls the ordered matcher. The obsolete eager expansion and
+  its unused class-name filter are removed. Witness 678.
+- `super_missing` retains the actual default Proc passed to Hash#initialize
+  from a subclass. The iterator fallback previously lost the block, so
+  Rack's symbol-key fallback returned nil. Existing entries remain, lambda
+  arity is validated from Proc metadata, and invalid arguments/frozen hashes
+  keep their errors. Witness 679 includes to_h, Proc identity and variadic
+  as well as strict lambdas. The original Rack utils file passes all
+  63 tests / 285 assertions (previously 1 failure / 1 error).
+- Corpus 699/699, all six suite-harness controls and the structural gates
+  pass. Generated bracket depth stays 895/1024; no top-level let, collector,
+  VM instruction or resource bound is added or changed. The open branches'
+  corresponding function bodies were compared with main before publication;
+  none overlaps. Marshal's separately isolated exception-wrapper difference
+  remains recorded because `stdlib_src` is being edited by the GC session.
+  Final CRuby Hash gives 297 MATCH / 1 RED / 8 BOTH across 306 tests, equal
+  to both baselines; Exception gives 98/98 MATCH. The earlier local exception
+  timeout does not recur in this final measurement at the unchanged limit.
+- #93's review found that the new grouping callbacks returned true to their
+  source. Both now explicitly return nil; witness 677 includes a source that
+  stops on truthy yield results. The old O2 runtime truncates both methods to
+  [[1]], and the fixed runtime matches the reference's [[1], [2], [3]]. Its
+  latest Linux gem CI also gives 51 / 10 / 1 with zero regressions. The P2
+  thread is answered in English and resolved; hosted merge checks remain.
+- Existing-suite comparisons use latest successful main CI 43869939788 and
+  handoff CI 43548292351. #90's final report covers all 758 files. The three
+  lower counts from ObjectSpace finalizer, Object copied-ivar and transcode
+  ractor timeouts remain, and zlib is 95 rather than 96 MATCH (its case still
+  needs confirmation). Bootstrap has 9 missing files after a cancelled shard;
+  test_eval is 48 MATCH, equal to main but below handoff's 49. Basic stays
+  894/894 MATCH. The whole ordinary workflow is rerun at its existing bounds
+  to recover missing coverage and verify the lower counts. Local transcode gives 98/98 on
+  both main and #90, and copied-ivar passes on both. Finalizer controls cross
+  2 GiB on the PR binary while main controls finish; its cause is unconfirmed.
+  No lower count is waived, no limit is increased, and no GC-internal
+  exclusion decision is made.
+
+## 2026-11-17 (69): retain implicit super's Proc without replacing yield wrappers
+
+The review's implicit-super witness exposed a lost default Proc identity and
+lambda arity in #96. `bind_params` now retains the incoming VProc in the method
+frame; `method_body_flow_result` carries its identity through the existing block
+metadata path, and `super_missing` recovers it for Hash#initialize. The new
+`block_source_proc` recognizes a repeated marker, distinct from the single
+marker naming a literal wrapper's enclosing yield context. No new root table,
+global pin, top-level let or collector change is needed.
+
+The first candidate confused those two meanings. The original Minitest
+assertions file and corpus 226 caught that regression, so it was corrected
+before accepting the review response or updating the snapshot. Witness 679 now
+covers implicit super/super(), an unrelated nested call, a two-level relay,
+literal captures, replacement/nil blocks and yield-containing wrappers. The
+extended witness matches the reference both normally and with GC.stress.
+
+- Fresh O2 source 5fbd80c1: all 62 original gem files remain 52 MATCH / 9 RED /
+  1 MEMORY, zero BOTH/TIMEOUT/regressions; the initial snapshot is unchanged.
+- Corpus 699/699; CRuby Proc 117 MATCH / 1 RED, Super 50/50 and Yield 13/13,
+  identical to the paired latest-main controls (96075af9). All six harness
+  controls pass; bracket depth is 892/1024 after the incoming main C API merge.
+- The separate merge gate remains open. #90's Linux build job now fails the
+  Float#step bit comparison. This is not waived as known noise. Latest successful
+  main CI is 43933582689; compare it and handoff 43548292351 before any merge.
+
+## 2026-11-17 (70): gem rounds 10-11 -- singleton undef and Module name super
+
+With the unchanged lock and 62 files / 1,969 reference tests, round 10 gives
+53 MATCH / 8 RED / 1 MEMORY; round 11 gives 53 MATCH / 7 RED / 2 MEMORY.
+There are no BOTH, TIMEOUT, reference changes or lost MATCH. Rack Lint becomes
+MATCH (37 tests / 763 assertions). The second memory verdict is a newly reached
+request case, not another passing file. The initial snapshot remains unchanged.
+
+- `invoke_val_c2` / `invoke_with_block2` consult a primitive singleton's undef
+  before the native path; `respond_to_answer` / `responds_x` ask the same fact.
+  `hng_lookup_cls`, `hng_undef_blocked` and `hng_undef_call` keep the actual
+  lookup class, method_missing block, query hook and NoMethodError attributes.
+  Ordinary class identity stays separate. Witness 681 includes send/public_send
+  with and without blocks, redefinition, other instances and saved aliases.
+- `super_missing` sends a class/module override's name super directly to the
+  existing `mod_name_val`, with native arity. Witness 682 checks named,
+  anonymous, late-named and singleton classes, frozen cached names and a
+  superclass undef. The shared super lookup and main dispatcher are untouched.
+  Minitest spec now executes 76 tests (2 failures / 4 errors), and Rack headers
+  51 (37 failures / 2 errors). Both stay RED. Request now reaches TestProxyRequest's
+  16 MiB ASCII NUL test and crosses 2 GiB; no VM/GC cause is established.
+- Fresh O2 source 861c74d1: corpus 701/701 and both witnesses under GC.stress
+  match Ruby. CRuby Method is 97 MATCH / 1 RED and Module 195/195, equal to the
+  same-environment latest-main controls. Six harness controls pass; bracket
+  depth stays 892/1024. No top-level let, root table or limit change.
+- Additional controls reduce RewindableInput to File rewind after chmod(0),
+  and the uploaded-file assertion count to reflected File/IO helpers.
+  A separate prepended name/undef lookup gap also predates these rounds.
+  Their shared-function constraints and remaining symptoms stay in the ledger.
+- Linux's ubuntu-latest rollout changed the reference from Ubuntu 24.04 to
+  26.04 and exposed fused versus separate Float#step rounding. Strict diagnostic
+  output confirms the differing bits. #90 pins only the runtime build and gem
+  Linux jobs to the measured Ubuntu 24.04 target; all bounds/assertions remain.
+  The newer-target numeric gap stays documented. Updated Linux jobs pass.
+  #92's separate Module leak test hit its documented 10-second known noise;
+  its raw record is retained for an unchanged-bound job rerun after completion.
+
+## 2026-11-17 (71): retain native definitions through singleton undef
+
+#97's review exposed two distinct native-definition regressions and a saved
+alias path missed by the original Hash-only alias witness. A Method captured
+before undef must keep its definition, and replacing Module#name must not
+make super revive that definition beyond Module. Saved String/Array/Proc
+aliases retain their definitions too, including direct, send/public_send and
+reflected Method calls with and without blocks.
+
+- `method_unbind_fields` retains the existing native metadata;
+  `bi_meth_shadowed` / `bi_meth_call` preserve the native definition through
+  the existing one-dispatch bypass. Retained String conversion keeps the
+  correct receiver identity, and Hash#to_hash ignores its block.
+- `run_block1`, `bind_params`, `method_body_flow_result`, `run_stmts` and
+  `eval_run` clear that bypass before Ruby code. The witness includes a
+  second receiver's override, coercion defaults and string instance_eval.
+  `en_can_buffer` / `gen1_src` keep a returned Enumerator's later source lookup
+  ordinary, including NoMethodError after each has been undefined.
+- `hng_retained_alias` / `hng_retained_alias_call`, consulted by
+  `invoke_val_c2` / `invoke_with_block2`, preserve the native alias's source
+  only during redispatch. The block alias path uses the actual singleton.
+  `module_name_super_ahead` reads the current method frame and ancestry;
+  `super_missing` returns the native name only when Module remains ahead.
+- Fresh O2 source a3ad911a: all 62 original files / 1,969 reference tests give
+  53 MATCH / 7 RED / 2 MEMORY, zero BOTH/TIMEOUT/regressions. Corpus is 701/701;
+  expanded 681/682 also match under GC.stress. CRuby Method is 97 MATCH / 1 RED,
+  Module 195/195, TracePoint 97 MATCH / 4 RED / 1 BOTH, Proc 117 MATCH / 1 RED,
+  Super 50/50 and Yield 13/13, retaining the paired baseline counts. All six
+  harness controls pass; bracket depth remains 892/1024. The initial snapshot,
+  collector, shared dispatch bodies and resource limits are unchanged.
+- A preliminary corpus invocation stopped at the stale-generated-C gate;
+  regenerating and comparing C proved identical contents. A later run mixed
+  a changing alias witness/binary and was rejected. Only the final fixed-tree
+  701/701 run is accepted. A verbose ShowExceptions time control passes on
+  both pre-review and final binaries (81.73s / 82.86s inside the test runner);
+  this does not establish a review-induced slowdown.
+- An unaccepted Headers class-[] trial exposed bare new without native Hash
+  storage and worsened the file to 51 errors. It was reverted, with no trial
+  snapshot or public implementation. Its try_self_call/new_obj coordination
+  constraint, and additional pre-existing primitive lookup gaps, remain in
+  the ledger. Current remote AST/VM/C API/GC function bodies were compared
+  before publication; none overlaps the functions changed in this follow-up.
+- Existing hosted per-file checks against both CI baselines remain pending;
+  no lower count or incomplete coverage is waived and no PR is merged.
+
+## 2026-11-17 (72): gem rounds 12-13 -- singleton missing hooks and command blocks
+
+The unchanged five-suite inventory still gives 53 MATCH / 7 RED / 2 MEMORY,
+with zero BOTH/TIMEOUT/regressions across 62 original files / 1,969 reference
+tests. Within the RED files, Minitest spec improves from 2 failures / 4 errors /
+443 assertions to 2 failures / 0 errors / 451 assertions. Minitest test improves
+from 8 failures / 1 error to 8 failures / 0 errors, retaining its one skip.
+No entire-file MATCH gain is claimed.
+
+- `invoke_val_c2` / `invoke_with_block2` use the new `hng_missing_hook` to
+  reach a primitive singleton's Ruby method_missing for a genuinely missing
+  name. Existing Ruby methods, native aliases and the existing native owner
+  table win first; response hooks do not decide existence. The existing
+  missing-call path retains arguments, keywords, blocks and error attributes.
+- `super_missing` now reaches the extracted `missing_native_super` before
+  the generic primitive fallback. A hook's super reports the originally
+  requested name, receiver and arguments instead of method_missing itself.
+  Witness 683 includes Hash/Array/String/Proc, direct/send/public_send calls,
+  query claims, existing methods, private refusal, hook super and removal.
+- `safe_nav_bare` / `attach_block_method` respect an enclosing command's
+  existing nodo flag after parsing their own bare arguments. The outer
+  do...end no longer attaches to a nested dotted command. Witness 684 covers
+  normal/safe/nil calls, nesting, direct calls, parentheses, braces and the
+  exact regex/new/Mutex/yield shape isolated from Minitest. This is a language
+  parsing difference; AST/Ripper/Prism tree APIs are untouched.
+- Fresh O2 source 61d57736: corpus 703/703. Both added witnesses match normally
+  and under GC.stress. Method retains 97 MATCH / 1 RED, Super 50/50, Yield
+  13/13; paired latest-successful-main controls for Parse are 102/102 on both
+  and Syntax 167 MATCH / 1 RED / 2 BOTH on both. Six harness controls and the
+  structural gates pass; bracket depth remains 892/1024.
+- The remaining spec-name failures reduce to Array#join ignoring a class's
+  Ruby to_s while the direct call works. Its invoke_val_c0 branch, like the
+  exception Marshal branch in stdlib_src, is still shared with another
+  session. Keep those coordination constraints and original RED files.
+- AST #86 has merged to main 392bf810; its ordinary CI is still queued, so
+  43933582689 remains the latest successful main baseline alongside handoff
+  43548292351. Before publication, the current #99 AST, VM, C API and GC
+  branches were compared at all changed function bodies; none overlaps.
+  No top-level let, collector, shared dispatcher or resource bound changes.
+
+## 2026-11-17 (73): preserve active refinements before singleton missing hooks
+
+#100's P2 found that hng_missing_hook's real-definition probes omitted lexical
+refinements. The existing refinement dispatcher could handle the call, but the
+new earlier guard sent it to method_missing. Source 77e39520 also consults the
+existing refined_impl_for before declaring the name missing, preserving that
+dispatcher's priority without editing it.
+
+Expanded witness 683 covers Hash/Array/String/Proc refinement methods, keyword
+arguments, send/public_send and ordinary unhandled names with singleton hooks.
+It matches Ruby normally and under GC.stress. A separate block-bearing refined
+Hash control fails on the pre-round base too; that existing block-dispatch gap
+is recorded, rather than claimed as fixed or removed from an upstream file.
+
+- Fresh O2 full run: 62 files / 1,969 reference tests, 53 MATCH / 7 RED /
+  2 MEMORY, zero BOTH/TIMEOUT/regressions. Corpus 703/703. Method retains
+  97 MATCH / 1 RED, and paired #97-base/candidate Refinement both give
+  121 MATCH / 1 BOTH. Six harness controls pass; bounds are unchanged.
+- #90's newly available hosted raw artifacts cover 663/758 existing files.
+  ObjectSpace 37, Object 65, transcode 98 and zlib 96 MATCH recover their
+  earlier lower counts. TracePoint gives 96 versus handoff's 97; its extra
+  recorded error is test_thread_add_trace_func's access-from-outside error,
+  while the local paired controls give 97; its cause remains unconfirmed.
+  Bootstrap eval is still
+  48 versus handoff's 49: case 19 incorrectly allows Integer.instance_eval
+  to define a constant. Neither shortfall is waived; remaining shard coverage
+  and the two file gates still prevent merging.
+- Candidate-only measurements outside the public lock give Matrix 2 MATCH.
+  Rake has 20 BOTH because CRuby's core Test::Unit adapter refuses the tag's
+  assert_raises alias; Logger's child cannot find its locked library on the
+  reference side. These are setup defects, not interpreter verdicts accepted
+  into the baseline. The candidates need their actual pinned Test::Unit
+  dependencies and inherited locked child load paths before inclusion.
 ## 2026-11-15 (57): RubyVM::AbstractSyntaxTree answers parse.y's tree
 
 The second half of stage 5's second part (note 550 §1, note 551). test_ast
@@ -6302,6 +6667,94 @@ test_regexp, test_enumerator, test_fiber, test_hash the same counts;
 test_array MATCH 473 on both (one test that fails on the reference too
 moves between RED and BOTH from run to run, on either build).
 
+## 2026-11-18: gem source provenance is checked before accepting MATCH
+
+The initial gem harness exposed a provenance gap during the next candidates'
+audit: Mere selected its bundled Base64 before the locked release library on
+-I. That result passed the upstream tests but did not establish the upstream
+library's execution. Preserve both the initial and pre-audit snapshots.
+
+do_require0 / resolve_feature now use load_path_pick_shipped and honor the
+physical prefix before the actual stdlib entry. The private Marshal loader
+keeps its previous internal behavior after a user clears $LOAD_PATH. Corpus
+685 covers real library replacements, converted entries, relative imports
+and the real Marshal API; no public __marshal feature is invented.
+
+The bootstrap appends reference fallbacks after each interpreter's stdlib,
+then records physical locked-gem files after the upstream autorunner. Healthy
+summaries alone and exit! cannot pass. All seven harness controls succeed.
+The core runner keeps the same fallback order, including RubyGems' source.
+
+Fresh normal O2 source 799c55d7, including main 3eb24fef: all 62 original
+files retain 48 MATCH / 13 RED / 0 BOTH / 1 MEMORY. Both sides audit the
+locked library on every normally completed file (reference 62, Mere 61).
+Only command descriptions change in the lock; all source/dependency digests,
+inventory and bounds stay fixed. The explicit protocol transition compares
+against the preserved snapshot with zero regressions, and the CLI still
+rejects a different lock digest.
+
+Require retains 51 MATCH / 1 BOTH, Autoload 27 / 1, GemVersion 32, Integer
+38, TracePoint 97 and PP 36 MATCH in the integrated build. Full corpus and
+the hosted per-file comparisons remain independent merge gates. No collector,
+C API, ISeq or Prism implementation is changed by this correction.
+
+The integrated corpus completes at 705/705 MATCH. Generated C needs bracket
+depth 932 (the inherited search seed was 923); record 932 for the check's
+two-compile search. The existing build limit remains 1024. Before publishing,
+retain the already published main-merge history as well; its runtime sources
+are identical to the fully measured 799c55d7 build.
+
+The same audit on rounds 4-5, normal O2 source f2f57fa7 including main
+3eb24fef, retains 50 MATCH / 11 RED / 0 BOTH / 1 MEMORY. The branch's own
+pre-audit result is preserved; all 62 reference and 61 non-resource Mere
+files audit the locked gem lib. The ordinary per-file comparison reports
+zero regressions. Gzip/MockRequest retain their two additional MATCH files.
+
+Normal audited O2 source d403f444 on rounds 6-7 retains 51 MATCH / 10 RED /
+1 MEMORY, zero regressions and 709/709 corpus matches. Preserve that branch's
+own old snapshot and audit transition (reference 62, Mere 61 library audits).
+The later hosted-driver and standalone-loader fixes still need their combined
+validation; this result does not claim that unmeasured combination.
+Hosted validation found old reference-first paths in Unicode/NKF and other
+drivers, plus a fake interpreter unable to answer the new path query. Share
+the clean runtime query in tools/runtime_load_path.sh, put reference fallbacks
+after it, and make the fake harness answer and assert that ordering. Harness
+20, Unicode, original NKF, Psych scalar/wire/store/lifetimes and YAML Store
+controls pass without changing bounds or skip rules.
+
+Also preserve the original standalone bundled-library fallback after a user
+clears $LOAD_PATH. Physical replacements still win; the existing standalone
+tmpdir check and the real Marshal API pass. Fresh O2 source 53e0077f keeps
+the strict audited 48 MATCH / 13 RED / 1 MEMORY, zero regressions and
+705/705 corpus matches. The separate bootstrap constant-assignment correction
+is now applied for a combined build; its original bootstrap eval control is
+49/49 MATCH, with isolated corpus 705/705 and unchanged core Eval/Module/Const
+counts. No combined-head or hosted result is inferred from those controls.
+
+Final combined rounds 6-7, normal O2 source 7a79b8db: 51 MATCH /
+11 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+Final combined rounds 4-5, normal O2 source 9730ae28: 50 MATCH /
+12 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+Final combined first gem-suite PR, normal O2 source 4ff6b54f: 48 MATCH /
+14 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+All 62 files on both sides finish the locked-library source audit. Multipart
+finishes below the RSS cap with one custom-params-hash error (test_0034),
+85 tests / 238 assertions versus the reference's 239. Its prior MEMORY/RED
+variation is not a new MATCH or an inferred VM/GC cause.
+File override, Chain, provenance and constant witnesses 676/677/685/693 match the reference. The earlier full corpus was 709/709 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
+The earlier full corpus was 707/707 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
+Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
+
+Audited rounds 8-9, O2 source 72effb05 on main 3eb24fef: two consecutive
+normal full runs give 53 MATCH / 9 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY.
+All 62 files on each side audit the locked library. Ordinary comparison
+against this branch's preserved pre-audit 52 MATCH / 9 RED / 1 MEMORY gives
+zero regressions, with identical source/dependency pins and reference tallies.
+Multipart gives 85 tests / 239 assertions in both runs, with peaks about
+1.69 and 1.36 GiB. Its earlier MEMORY/RED variation remains recorded; neither
+its cause nor attribution to a specific change is established by these runs.
+The latest snapshot uses the second full run. Cross-platform hosted checks
+must retain this new MATCH under the same bounds before merge.
 ## 2026-11-18 (82): build-linux's Module check at its 10 s, and Module#clone walking every constant
 
 Main e40bb486's CI run failed the Module check:
@@ -6340,3 +6793,541 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+## Gem-suite OS baselines and the multipart resource gate
+
+Hosted Linux before and after the source audit (runs 43989409595 and
+44248949546) has the same 52 MATCH / 9 RED / 1 MEMORY and no per-file loss.
+Its multipart MEMORY was incorrectly compared with macOS's new MATCH.
+Keep the complete actual Linux snapshots and explicit protocol-transition
+proof, select the matching OS in CI, and reject a wrong-OS baseline in the
+CLI. Preserve the original cross-platform error in the Linux record. Eight
+harness controls pass; source pins, inventory and 600-second/2-GiB bounds
+are unchanged. macOS keeps all 53 MATCH files.
+
+The rounds 10-11 candidate really loses multipart on macOS against its
+parent, on main 12ca1df2; a focused parent run still matches. Equal total
+MATCH counts cannot waive that file loss. Keep the parent gate and route
+resource investigation to VM/performance without assuming a GC cause.
+The separate rounds 8-9 Linux runtime failure is the documented
+complemented-method-entry leak test timing out at 10.05 seconds. Its full
+log is archived; retry that job when GitHub allows it.
+
+
+Audited rounds 12-13 on main 12ca1df2, O2 source e32d84fd: 53 MATCH /
+7 RED / 0 BOTH / 0 TIMEOUT / 2 MEMORY. All 62 reference files and 60 Mere
+files finish their source audits; two Mere processes reach the RSS cap.
+Keep the nonempty multipart MATCH-to-MEMORY regression in the unadopted
+suites_candidate.json. The parent's macOS 53-MATCH baseline remains the
+merge gate. The source/dependency inventory and resource bounds are unchanged.
+
+
+## Gem rounds 16-18: real Test::Unit children and two more pinned suites
+
+Matrix 0.4.3 and Logger 1.6.0 use their original test-unit 3.7.8 /
+test-unit-ruby-core 1.0.16 / power_assert 3.1.0 framework and release libs.
+The new separate lock adds seven files / 169 reference tests; the original
+62-file lock and OS baselines remain unchanged. Offline source-audited O2
+measurement at 35cfe0d4 gives Matrix 2 MATCH, Logger 4 MATCH / 1 RED, all
+reference files healthy. Preserve its initial macOS snapshot independently.
+The first hosted Linux observation is pending; the additional workflow
+collects initial records before strict per-OS baselines are adopted.
+
+The child framework exposed primitive super skipping Hash's native [] in
+favor of Object's included Ruby []. super_next_plain now stops at the
+actual primitive native entry, after earlier Ruby definitions/undefs. The
+common copy_meth_src records both copied names in the existing meth_aliased
+state, suppressing their first replacement warning while later ordinary
+redefinitions still warn. Relocate the existing state only; the top-level
+let count does not grow. Witnesses 701/702. Both functions are unchanged on
+the current AST/VM/C API/GC remote branches. No collector or VM edit.
+
+The final corpus gives 719/719. Ten measurement controls include actual child
+interpreter/library routing and all seven Test::Unit summary fields. The
+original five suites remain 53 MATCH / 7 RED / 2 MEMORY, with no per-file
+loss against the paired parent's actual observation. Keep the nonempty
+multipart regression against the stronger stored macOS baseline in
+suites_candidate.json; do not adopt that candidate as a new baseline.
+The parent's own hosted macOS run 44259245152 also reaches 2 GiB in
+multipart (52 MATCH / 9 RED / 1 MEMORY). Its 53-MATCH local baseline is
+retained. All these PRs remain subject to that resource gate.
+
+Logger's remaining rotated-File identical? case needs its retained fstat
+result. A /dev/fd path trial failed and was reverted; its shared native
+dispatch branch stays untouched. A paired pre-existing undef under a
+prepended Hash wrapper likewise remains recorded, not claimed as fixed.
+
+Focused original core files retain both baselines: Super 50 MATCH, Module
+195 MATCH, Method 97 MATCH / 1 RED, Hash 297 MATCH / 1 RED / 8 BOTH. Hash's
+remaining replace-memory-leak case reaches its existing 10-second child
+bound; Method's compaction case is the existing skip. Both new witnesses
+also match with GC.stress under the same family bounds. The emitted C needs
+933/1024, verified with the 933 positive / 932 negative syntax checks. Only
+the search seed changes; m_state/main top-level let counts remain 1167/136.
+
+Initial hosted additional Linux run 44269323039 (source 5e73b774) gives
+6 MATCH / 1 RED, with all seven reference files healthy and both sides
+audited. Preserve its initial observation and enforce the measured Linux
+baseline; macOS retains its separate initial six MATCH files. The additional
+workflow now requires the matching OS snapshot on every PR/main/dispatch
+measurement. The original multipart gate remains unsatisfied and unchanged.
+
+Review corrections for the additional suites: preserve the previous
+native-aware super lookup outside the four primitive value kinds, and stop
+their ordered walk at each actual native owner. Expanded 701 covers Exception,
+Integer and Float before a later Object undef. Shared-definition warning flags
+now live in the existing owned meth_src row, with the endless accessor
+unchanged. copy_meth_src marks only actual native alias/Method-copy operations;
+keyword alias marks its copy explicitly. Clone/import copies do not acquire
+sharing, and a new Proc definition clears the replaced definition's flag.
+There are no new warning-map entries or collector implementation edits.
+
+Expanded 701/702 match normally and with GC.stress, including clones, singleton
+clones, refinement imports and reflective definition calls. O2 source 0521f018
+retains the strict additional 6 MATCH / 1 RED and all seven source audits,
+719/719 corpus, Super 50, Module 195, Method 97 MATCH / 1 RED and Hash
+297 MATCH / 1 RED / 8 BOTH. Bracket depth remains 933/1024; top-level lets
+remain 1167/136. The actual Method-copy lifetime control's post-GC peak ratios
+are 2.159 on the saved pre-review binary (negative control), 1.740 on the
+paired base and 1.708 after correction, with reference around 1.08. Each
+prefix is checked against core_assertions' default 2x bound under the same
+600-second/2-GiB family caps. The raw series retains the base's existing
+allocator growth; this fixes the additional warning-state retention.
+
+The completed original-batch review rerun at 0521f018 retains 53 MATCH /
+7 RED / 2 MEMORY and every paired-parent file outcome. Its candidate record
+still contains the multipart regression against the stronger stored macOS
+baseline, so it is not adopted. The review fixes do not waive that gate.
+
+## Gem rounds 19-21: all original Rake files with complete child dependencies
+
+Rake 13.2.1's release commit d84f6ef7 contributes 46 files / 597 reference
+tests / 1,459 assertions. Pin the real Test::Unit framework and Minitest used
+by its generated test children. Preparatory 40 MATCH / 6 RED and 45 MATCH /
+1 RED observations are not baselines: missing child stdlib paths and then
+Minitest could let an unrelated LoadError satisfy a negative assertion.
+Preserve these observations with their reasons, restore four exact pure
+packages into a separate cache, and propagate actual selected-runtime paths
+before the pinned source fallback. The real child-routing control checks
+that fallback too. Source/test inventories and all limits stay fixed.
+
+time_cmp_other now uses Time's actual comparison protocol for ordered
+comparisons, including sign conversion and nil failure (703). The local
+colon_opens_sym backscan and lex_go's quoted-symbol guard recognize a dotted
+call's adjacent Symbol argument, with ternary/keyword negative controls
+(704). No AST-tree API changes. super_base now starts a main receiver's
+super lookup in its actual singleton and extended-module chain (705).
+Rake's original FileUtils.touch already has a real Ruby implementation;
+the failed functional children were losing that chain, not missing native
+FileUtils support. No shared native dispatcher edit is needed.
+
+O2 source e44fe0bd gives 46 MATCH twice, first verbose then a normal-output
+strict repeat, all reference files healthy and all 92 source audits complete.
+The same binary gives additional Matrix/Logger 6 MATCH / 1 RED, and original
+five suites 53 MATCH / 7 RED / 2 MEMORY. The original candidate still records
+the multipart loss against the stronger stored macOS baseline; paired actual
+parent outcomes do not regress, but that does not waive the stored gate.
+Eight gems now cover 115 files and 2,735 reference tests across three locks.
+
+Corpus 722/722; 703-705 also match with GC.stress. Original controls retain
+Parse 102, Syntax 167 MATCH / 1 RED / 2 BOTH, Time 87 MATCH / 1 BOTH,
+Super 50 and Method 97 MATCH / 1 RED. In the loaded combined run, Module's
+iclass and complemented-method leak cases hit their existing 10-second
+bound (193 MATCH / 2 RED). An isolated unchanged-limit rerun finishes all
+195 tests / 1,240 assertions successfully. Retain both observations rather
+than changing their bound. Bracket depth stays 933/1024.
+
+The independent Rake workflow first records actual Linux/macOS observations;
+Linux's own initial record was pending at publication. It extends no existing job. No VM,
+collector, Prism-tree, or C API implementation changes are part of this work.
+
+Initial hosted Linux run 44288206768 completes all 46 files as MATCH, with
+597 tests / 1,459 assertions and 92 physical-source audits. Its actual merge
+source c7f36362 has the same tree as head 712befff. Preserve that observation
+independently and enforce it as Linux's baseline. macOS keeps its complete
+normal-output 46-MATCH baseline. Every Rake PR/main/dispatch measurement now
+selects its own OS's strict snapshot; caps and the original suites' stronger
+multipart gate are unchanged. The reviewed parent #107's hosted macOS
+original suite also passes that unchanged gate (54 MATCH / 7 RED / 1 MEMORY,
+multipart 2,037,376 KiB). Keep the failed local candidate as well; the resource
+variation's cause remains unconfirmed.
+
+The first hosted Rake run completes macOS as 46 MATCH too, with all source
+audits and zero per-file regression against the preceding complete local
+baseline. Preserve the original local initial snapshot; the latest macOS
+record now carries this actual hosted observation. Both OS strict jobs still
+need a repeat on the final workflow. No runtime source changed during this
+baseline adoption.
+
+## Gem round 22: publish copied method metadata once at unchanged lifetime bounds
+
+The first strict rounds 19-21 Linux check really fails the unchanged
+Method-copy lifetime control: post-GC peak/start 2.086 in run 44292334299,
+under the 600-second/2-GiB outer caps. Preserve its actual RSS series in
+method_copy_lifetime_latest.json. Do not relabel this as a timeout or silently
+retry a failure whose cause has not been established.
+
+copy_meth_src now publishes the copied source location and sharing flag in
+one existing method-source row update, retaining the destination end position
+and endless bit. An already-shared source is not rewritten per destination.
+No collector, VM or shared native dispatcher edit, and no new top-level let.
+A borrowed-operation-name trial did not improve the paired observation
+(1.780 versus 1.712 on macOS) and was rejected. An intermediate no-op flag
+check alone also left Linux near the bound (1.975).
+
+The following earlier before/after observations were initially described as
+paired, but compilation separated them; use the consecutive replay below
+for a same-window comparison. With the same unmodified control: macOS peak RSS
+179,568 to 157,856 KiB, post-GC ratios 1.712 to 1.695; offline Linux/aarch64
+199,568 to 173,416 KiB, ratios 1.980 to 1.908. The Linux container is not the
+hosted x86-64 runner; final hosted proof remains pending. Every collected
+prefix still uses the default 2x bound; no warm-up, workload or limit changes.
+Normal and GC.stress warning outputs in 702 match the reference. Corpus
+719/719 and bracket depth 933/1024. Module's complemented-method test first
+fails its known 2x RSS check at 2.0078; the complete isolated rerun retains
+195 tests / 1,240 assertions with no failures at unchanged bounds. Keep both
+observations. The additional suites retain strict 6 MATCH / 1 RED.
+
+The original batch retains 53 MATCH / 7 RED / 2 MEMORY and every paired
+actual parent outcome. Its candidate still records multipart's loss against
+the stronger stored macOS baseline and is not adopted. The latest strict
+rounds 19-21 macOS run also loses that file; the preceding successful hosted
+observation does not erase the failed run or identify the resource cause.
+
+
+## Gem rounds 23-24: real class-bracket lookup and native bare construction
+
+Rack Headers exposed two separate Ruby semantic gaps. A container subclass's
+Ruby singleton [] lost to its inherited native constructor; after restoring
+that entry, bare new allocated an ordinary object without Hash storage.
+invoke_val_c2 now selects the real singleton entry after undef/alias checks,
+respecting visibility and refinements. try_self_call1 routes bare new through
+the existing native constructor, keeping the real Hash/Array storage. The
+with-arguments twin belongs to the VM session and is unchanged. An initial
+uncommitted edit hit that identical twin; it was restored before the final
+build and commit. No other session's branch was edited.
+
+super_missing now reaches Hash/Array's native class [] only when it remains
+after the actual method origin, before any tombstone or Ruby definition.
+container_bracket_super_ahead reads the existing frame's method origin/index
+and singleton chain. Coercion callbacks on a subclass carry no native bypass;
+a prepended core override consumes only its existing one-call bypass. No new
+top-level let, VM/GC implementation or shared invoke_val_c0 changes.
+
+The unchanged original headers file improves from 37 failures / 2 errors to
+6 failures / 0 errors (51 tests, 268 versus 302 assertions). It stays RED.
+Both new witnesses 706/707 fail the paired parent and match normally and with
+GC.stress; inheritance, prepend, native aliases, native super, tombstones,
+visibility, coercions, blocks and refinements are exercised. A separate
+inherited-native undef_method availability gap is confirmed on both parent
+and candidate and remains a coordination item in the shared dispatcher.
+
+Normal O2 source 170fb4b8 runs all three unchanged locks: original 54 MATCH /
+7 RED / 1 MEMORY, Matrix/Logger 6 MATCH / 1 RED, Rake 46 MATCH. All 115
+reference files are healthy. Multipart completes 85 tests / 239 assertions at
+2,006,464 KiB; no resource-cause attribution follows from this success. Keep
+the previous 53-MATCH baseline and failed candidate independently. Ordinary
+comparison has no lost MATCH; strengthen macOS to the actual 54-MATCH record,
+including Lint. The Linux baseline and both initial records are unchanged.
+
+Corpus 724/724; bracket depth 933/1024. Original core MATCH counts retain
+Class 61, Hash 297, Array 473, Super 50 and Method 97 against handoff and
+successful main. Class's reference lacks -test-/class (one BOTH); Array's
+reference shared-marking case is healthier while Mere keeps its pre-existing
+compaction skip. Hash's replace-memory-leak child reaches the unchanged
+10-second bound. Exact counts and nonpassing cases are recorded in
+suites_runtime_r24.json; no exclusions are added. Full hosted CI remains a
+separate merge requirement. The preceding metadata correction now passes
+its actual hosted Linux lifetime control at 1.909x in run 44313194961; retain
+that series alongside its earlier 2.086x failure and local controls.
+
+
+## Gem round 25: preserve native bracket aliases and the first actual entry
+
+Review found two real regressions in 596076bb: the early bracket guard
+consumed a native alias bypass before the final core override check, and
+Ruby lookup could pass Hash/Array's native owner to an included module.
+708/709 reproduce both on the saved pre-review O2 binary. Their final
+versions and 706/707 match normally and with GC.stress after correction.
+
+invoke_val_c2 now only peeks at a core bypass that its final native check
+must consume. A subclass/native-only constructor consumes its bypass at the
+direct native entry, before coercion callbacks. container_bracket_ruby_first
+walks actual singleton entries and stops at the native Hash/Array owner.
+The class-bracket case of super_next_plain uses that native boundary too,
+so a prepended override's super does not jump to an included method behind
+it. Earlier Ruby entries and tombstones retain priority. No shared dispatcher,
+VM or collector edits; top-level let counts remain main 136 / state 1167.
+
+Normal O2 source 1d0cbe6b retains original 54 MATCH / 7 RED / 1 MEMORY,
+additional 6 MATCH / 1 RED and Rake 46 MATCH. All three strict comparisons
+are empty, with every reference file healthy. Keep the 54-MATCH macOS gate;
+its preceding complete observation is preserved in suites_before_review_r25.json.
+Corpus 726/726; bracket depth 933/1024. Core MATCH counts remain Class 61,
+Hash 297, Array 473, Super 50, Method 97. The Array reference has two shared-
+marking skips in this run. Exact counts and unchanged lifetime-control series
+are in suites_runtime_r25.json (post-GC ratio 1.807).
+
+Correct the earlier timing separation explicitly: after both saved metadata
+binaries exist, consecutive macOS runs give peak 185,104 -> 131,664 KiB and
+post-GC ratios 1.708 -> 1.352. Consecutive offline Linux/aarch64 runs give
+205,108 -> 171,444 KiB, ratios 2.207 (negative control fails) -> 1.929 (passes).
+Keep all earlier observations, labelled as separated by builds, alongside
+these same-window pairs. The same workload and 2x/600-second/2-GiB bounds
+remain unchanged. Hosted x86-64 success at 1.909 is distinct evidence; the
+local Linux pair is not a hosted rerun. No resource-variation cause is inferred
+from multipart's further successful observation.
+
+
+## 2026-11-19: gem rounds 26-28 keep Hash super on its native read entries
+
+Rack Headers' unchanged tests isolated fetch arity, fetch_values' missing-key
+exception and dig's intermediate TypeError to super_missing's world-free
+leaf. Add native Hash read entries there: hash_super_lookup uses the existing
+table/key protocol, and hash_super_fetch keeps arity, key/receiver fields and
+the actual block. fetch_values invokes that native entry for each key, rather
+than calling the receiver's Ruby fetch override, and stops on block control
+flow. dig reads the first native table entry without calling the receiver's
+[] override, asks its default on a miss, then uses existing dig_next for
+nested user dispatch. The shared invoke_val_c0 remains unchanged.
+
+Witnesses 710/711 fail the saved parent binary and match normally and with
+GC.stress after correction. They include nil/present/missing keys, defaults,
+warnings, block mutation, break/return, compare-by-identity, custom key
+equality, prepend and nested dig/keywords. The normal O2 runtime is 72adb4d3.
+The original headers file changes from 6 failures / 268 assertions to
+3 failures / 282 assertions, still 51 tests and no errors (reference: 302
+assertions). It remains RED. Constructor default+block, clone behavior and
+default-proc key normalization remain visible; no upstream edits or omissions.
+
+All 115 original files across the three unchanged locks retain their strict
+MATCH gates: original 54 MATCH / 7 RED / 1 MEMORY, Matrix/Logger 6 MATCH /
+1 RED, Rake 46 MATCH. All reference files are healthy, with 2735 tests.
+Preceding snapshots are saved separately before adopting these observations.
+Multipart is MATCH at 1,748,736 KiB, but Request still reaches the 2-GiB cap;
+this does not establish the cause of the earlier resource variation.
+
+The actual parent hosted Linux run 44338965455 gives 53 MATCH / 7 RED /
+2 MEMORY. Its merge source 548582c7 and head 89dbac2e have the same tree.
+The ordinary same-OS comparison loses no previous MATCH; strengthen Linux
+to include Lint, preserving the preceding 52-MATCH snapshot and its earlier
+cross-platform gate history in suites_linux_before_r28.json. Both MEMORY
+outcomes remain visible, and RED to MEMORY is not an improvement. macOS
+retains its stronger independent 54-MATCH gate. No bounds or initial records
+change; full hosted CI and all existing-file comparisons remain merge gates.
+
+A separate custom-key fetch control still bypasses the Ruby wrapper, and
+binding its real Ruby UnboundMethod to that Hash subclass still raises
+TypeError. Both behaviors match the saved parent and differ from Ruby;
+the shared dispatcher/binding paths are coordination items, not claims of
+this correction. The retained standalone control is distinct from the
+native fetch_values key lookup exercised by 710. Ten harness controls pass,
+bracket depth remains 933/1024, and top-level let counts stay main 136 /
+state 1167. No collector, VM, AST tree, C API or API-inventory edits.
+
+Full corpus: 728/728 with the hash index ON and OFF, under the existing
+aggregate wrapper. Original core MATCH counts retain Class 61, Hash 297,
+Array 473, Super 50 and Method 97, with no preceding passing case lost.
+Array's two shared-marking reference cases are healthy in this observation;
+the candidate keeps its existing skips, so the exact result is 473 MATCH /
+4 RED rather than hiding that reference variation. Hash retains the known
+replace-memory-leak 10-second timeout; Method retains its compaction skip.
+suites_runtime_r28.json stores every nonpassing case and actual execution.
+The unchanged Method-copy lifetime control passes at post-GC peak/start
+1.686, with real RSS samples retained. No speedup or resource-cause claim
+follows from these observations.
+
+
+## Gem suites, rounds 29–31: preserve native reflection and sender protocols
+
+The actual parent #115 Linux Method-copy lifetime failure remains a merge
+blocker: 2.056x in hosted run 44414103412, with the original 2x assertion and
+600-second / 2-GiB outer bounds. Consecutive saved-binary Linux/aarch64
+comparisons reproduce both pass and fail for each identical binary (parent
+1.894/2.035x, candidate 2.053/1.889x). This is evidence of variation, not an
+established resource cause or a substitute for the hosted x86_64 gate.
+A metadata-row lookup prototype also fails at 2.119x and is rejected; its
+source and extra control are restored. All failed and successful series
+remain in method_copy_lifetime_latest.json. No collector edits or bound,
+warm-up, workload or native-copy metadata changes are adopted in this round.
+
+The parent's original macOS run 44414103487 also regresses multipart from
+MATCH to MEMORY. suites_hosted_r115_macos_failure.json preserves that actual
+53-MATCH failure; it does not replace the stronger 54-MATCH macOS baseline.
+No retry is presented as a repair or a successful same-head observation.
+
+Minitest Mock exposes a separate Ruby semantics gap: a saved native
+respond_to? alias must answer using its own protocol even when respond_to?
+is overridden. send, __send__ and public_send must honor actual Ruby
+overrides, while their native aliases, retained native Methods and native
+super keep the captured implementation. native_sender_call consumes the
+one-call bypass at the actual native entry before coercion callbacks,
+preserves blocks, keywords and refinements, and keeps public visibility
+errors' real name/receiver/args. sender_super_ahead checks the remaining
+actual ancestor chain rather than reviving a nonexistent native definition.
+Class aliases keep their block and native owners precede later Ruby mixins.
+
+Only user_defines_send, blt_alias_call, invoke_val_c2, invoke_with_block2,
+invoke_with_block0, super_next_plain and super_missing change, plus the two
+new and-helpers above. An adjacent named_class_of_al comment is updated.
+The shared invoke_val_c0, VM, AST tree, C API and GC functions are untouched.
+All other active session branches have disjoint changed functions at the
+pre-publication check. Top-level let counts remain main 136 / state 1167;
+the generated C still needs bracket depth 933, below the existing 1024.
+
+Witnesses 712/713 fail the saved parent binary and match normally and with
+GC.stress on O2 source c0b06cc7. The unchanged upstream Minitest Mock file
+runs all 94 tests: 8 errors become 2, assertions rise 136 to 144, and its
+1 failure / 10 skips remain. Reference assertions are 147, so the file stays
+RED. Dynamic missing-method super and bare private Kernel stub calls remain
+separate gaps; the shared dispatcher/VM-default functions are not edited.
+
+All 115 files across the unchanged three locks retain their strict gates:
+original 54 MATCH / 7 RED / 1 MEMORY, additional 6 MATCH / 1 RED, Rake 46 MATCH;
+all reference files are healthy (2735 tests). The preceding complete
+observations are saved independently before updating the latest snapshots.
+Corpus matches 730/730 with both hash modes under its unchanged wrapper.
+These local results do not replace the pending complete hosted merge gates.
+
+Core Class/Hash/Array/Super/Method retain all preceding passing cases, with
+MATCH counts 61/297/473/50/97. Array is actually 473 MATCH / 3 RED / 1 BOTH
+in this observation; reference shared-marking variation is not hidden.
+The unchanged local lifetime control passes at 1.769x. That observation does
+not resolve the parent hosted Linux failure. suites_runtime_r31.json stores
+the exact core executions/nonpassing cases, corpus bounds and lifetime series.
+
+
+## Gem suites, rounds 32–34: add Abbrev and Singleton; reject the super trial
+
+Pin Abbrev 0.1.2 (release commit b362e8e3) and Singleton 0.3.0 (256c9117)
+in suites_small_stdlib.lock.json. Their complete original Test::Unit files
+need only the same three pinned pure Ruby development packages; both source
+gems have no native extension or runtime dependency. Sources stay outside
+the repository. On macOS and network-disabled Linux/aarch64, both files are
+MATCH: Abbrev 2 tests / 6 assertions, Singleton 13 / 17, no errors or skips.
+Each side records its own real source audit and exact summary. Initial,
+macOS and actual Linux snapshots remain separate; no macOS result is relabeled
+as Linux. Linux's build provenance records the fixed checkout, parent-emitted
+C and isolated container. A separate two-OS workflow restores the lock through
+actions/cache and measures offline under the unchanged 600-second / 2-GiB
+bounds. Existing gem workflows and their lifetime checks are unchanged.
+
+A missing-super prototype temporarily reduces Mock from 2 errors to 1, but
+additional nested missing-call controls expose a regression: a later missing
+call must replace the earlier super reason. Both an inner native refusal and
+a successfully handled missing call change it on Ruby and the saved parent;
+the prototype incorrectly retains super/private status. Withdraw all runtime
+changes and its two temporary witnesses. suites_rejected_r33.json records
+the rejected source b501dde1, actual 732/732 corpus and original core counts,
+and the additional controls that those tests missed. All three trial batches
+are retained separately and are not accepted runtime baselines. The actual
+class-hook routing and coordinated missing-reason work remain Ruby semantics
+in shared dispatch paths, including occupied invoke_val_c0, not VM/GC causes.
+New corpus 714 protects the nested-call behavior; all 730 preceding corpus
+files and every runtime source remain byte-identical to parent #118.
+
+Final O2 semantics source is the unchanged c0b06cc7 runtime (binary 8057a658).
+The full 117-file observation at checkout f5deacd3 has healthy references
+with 2750 tests: 107 MATCH / 8 RED / 0 BOTH / 2 MEMORY. The new files add two
+MATCH; original 53 MATCH / 7 RED / 2 MEMORY, additional 6 / 1 and Rake 46
+are recorded with their real verdicts. Multipart again loses MATCH to MEMORY.
+Keep its nonempty regression in suites_candidate.json and preserve the
+stronger original 54-MATCH baseline in suites_latest.json. No bounds, APIs,
+source-audit rules, upstream tests, pre-existing corpus or assertions change.
+Mock remains at its parent's 1 failure / 2 errors / 144 assertions.
+
+The final full corpus is 731/731 with both hash modes, 586.137 seconds and
+1,112,912 KiB under its unchanged aggregate wrapper. Ten harness controls,
+source guards and the YAML syntax check pass; bracket depth is 933/1024 and
+top-level let counts remain main 136 / state 1167. An initial stale generated-C
+guard is resolved by restoring the C for the byte-identical parent, without
+weakening it. suites_runtime_r34.json separates this final observation from
+the rejected trial and points to the unchanged runtime's original core proof.
+
+Parent #118's actual hosted Linux lifetime failure is 2.270x, not a timeout
+or 2-GiB event. Its complete failed RSS series is retained; reference is
+healthy and additional measurement was not reached. A reduced File subclass
+constructor gap also agrees on parent and rejected prototype, remaining a
+shared construction/allocator coordination item. No resource cause or fix
+is claimed. Full hosted CI, all existing-file comparisons and P1/P2 resolution
+remain merge gates; the new jobs do not waive any failed existing job.
+
+
+## Gem suites, rounds 35–37: pin delegation and URI original tests
+
+Add Forwardable 1.4.0 (0257b590), Delegate 0.7.0 (a5f35f35) and URI 1.1.2
+(e69a74a2), each pinned to its release commit and complete tree in
+suites_delegation_uri.lock.json. All twelve original test files are MATCH
+on macOS and network-disabled Linux/aarch64: 158 tests / 3229 assertions,
+without failures, errors or skips. Source gemspecs have neither extensions
+nor runtime dependencies. Reuse the existing three pinned Test::Unit packages;
+source audits verify each actual library. A separate two-OS workflow and
+lock-based cache retain the same 600-second / 2-GiB bounds. Existing job
+settings, locks, runtime sources and corpus are unchanged.
+
+Preserve the complete earlier preflight lock and 9 MATCH / 1 RED / 2 BOTH
+observation. Forwardable 1.3.3 expects obsolete message quoting, while URI
+1.0.3 calls Ractor#take, absent on reference Ruby 4.0.9. Newer release tests
+handle these API changes; no upstream test is edited or omitted. Delegate
+0.4.0 has a separate Mere-only keyword-forwarding error through a
+ruby2_keywords Proc used by define_method. Delegate 0.7.0 generates explicit
+`...` forwarding methods and its full original file passes. This is support
+for that release, not an interpreter repair of the old Proc path. The old
+RED and both reference failures remain visible, outside accepted baselines.
+
+The inventory now contains 13 gems / 129 files. This round measures the new
+twelve separately from the preceding 117-file observation; it does not
+present their mixed-date totals as a new complete sweep. The unchanged
+parent runtime c0b06cc7 (Mac O2 binary 8057a658) passes all 731 corpus files
+with both hash modes under the existing aggregate wrapper. The final record
+stores its exact execution. Ten harness controls, YAML syntax, source guards
+and bracket 933/1024 pass; top-level lets remain main 136 / state 1167.
+No VM, AST, C API, collector, shared dispatcher or API-inventory edits.
+
+Parent #119's real small-suite CI run 44451114499 succeeds on both OSes,
+with both files MATCH. Merge source 1c526613 and head 108e8b0e have the
+same tree 8792dba0. Adopt the actual hosted per-OS observations after ordinary
+strict comparisons, preserving both earlier local snapshots. Its additional
+Linux run 44451114073 passes the unchanged lifetime check at 1.996285x.
+Its binary SHA256 is exactly the same fbbd0199 as #118's 2.269969x failure,
+and the check digest matches. These are separate hosted runs, not a same-window
+comparison or a resource fix; retain every RSS series and all strict gates.
+
+The same parent's build-linux job 135315000164 fails only the known-noise
+Module complemented-entry memory-leak case (195 tests; 1 failure; ratio
+2.371912; outer execution 28.730 seconds, no resource-limit event). A rerun
+of that individual job was requested under unchanged bounds. GitHub returns HTTP 403
+because the containing workflow is still running, so the rerun is not accepted.
+Keep the failure and retry pending; do not report it as green or waive it.
+Complete hosted CI, all existing-file comparisons and P1/P2 resolution still
+control merging. The previous stronger 54-MATCH original macOS baseline
+and failed multipart observations remain unchanged.
+
+
+### Hash subclass options reach Ruby missing hooks (2026-11-19)
+
+Rails' ActiveSupport OrderedOptions is a Hash subclass with a Ruby
+method_missing for configuration setters/getters. The primitive hook guard
+accepted singleton lookup classes only, so a real subclass hook was skipped.
+Extend that guard to actual Hash ancestry, preserving its existing real
+method, native alias, refinement and recursion checks. Only main.mere's
+hng_missing_hook changes; no new global values, state, gemtest, VM/ISeq,
+AST, C API or collector implementation edits.
+
+On the gem-suites-r14 parent (01d5e498), normal O2 with its pinned Mere
+2e3cc433: all 732 corpus files match with hash indexing ON and OFF. Corpus
+719 covers inherited hooks, setter/getter storage, arguments/keywords/blocks,
+native methods/aliases and callbacks, refinement precedence, a Ruby method
+removed by undef and missing-error metadata. Original Hash is 297 MATCH /
+1 RED / 8 BOTH, Method 97 MATCH / 1 RED, Super 50 MATCH: 454 cases,
+444 MATCH / 2 RED / 8 BOTH. No parent file loses MATCH. All nine RSS and ten
+suite-harness controls pass; generated C depth remains 933/1024 with the
+parent's compiler. No original test, exclusion or resource limit changes.
+
+An unchanged ActiveSupport OrderedOptions probe reuses each runtime's own
+saved gems and matches: reference 0.609 s / 24,208 KiB; candidate 1.344 s /
+166,208 KiB, both exit 0 without a resource event. It is a diagnostic, not
+a fresh Rails installation or application pass. Keep the earlier complete
+gem observations and unresolved native-undef/private-alias diagnostics;
+this change does not claim their repair. A fresh combined original Rails
+workload and full hosted CI remain required before merge.
