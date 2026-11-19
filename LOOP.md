@@ -7071,8 +7071,17 @@ indexing ON/OFF. Original require/autoload/Marshal retain the exact paired
 parent result: 311 cases, 308 MATCH / 0 RED / 3 BOTH. All nine RSS checks
 pass; bracket depth remains 933/1024 with the parent's pinned compiler.
 
-The full corpus and the next unchanged Rails CLI replay are still being
-measured independently. The preceding locked replay remains RED at JSON,
-with boot/tests/HTTP NOT_RUN. No JSON attributes or external gem sources
-are patched. This own branch is stacked on the Hash candidate; production
-integration must wait for the parent series and required hosted gates.
+The full corpus is 733/733 in both modes. The unchanged C API contract
+groups agree normally and under collection stress (loader: reference 48,
+Mere 49); all six fault controls fail as required. The ordinary unchanged
+JSON 3.1 probe now matches on validation-only composition 61d01f6d.
+
+A new cold original-CLI replay on that composition installs all 68 gems
+(232.699 s / 954,624 KiB), then passes the JSON boundary and stops in the
+next ActiveModel Module#included native-super call (#129), migration exit 1
+in 4.097 s / 318,224 KiB. Reference passes all six stages; candidate boot,
+tests and HTTP remain NOT_RUN, without a resource event. The separate
+native_candidate.json in #117 preserves the exact run. No JSON attributes,
+Rails/gem sources or original inputs/limits are patched. This own branch
+is stacked on the Hash candidate; production integration must wait for the
+parent series and required hosted gates.
