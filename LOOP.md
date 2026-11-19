@@ -6092,3 +6092,37 @@ A fresh own combination with #95 installs all 68 Rails dependencies in
 unmerged candidate, not a main Rails pass: migration next stops when the
 command registry's Ruby subclasses method loses to Class's native entry.
 The standalone registry reproduction is separate from this library fix.
+
+
+### Rails SHA-2 provider input bounds (review follow-up, 2026-11-19)
+
+The first provider connection sent the complete SHA-2 input in one native
+request. Review #120 found that inputs at the provider's 64-MiB wire bound
+raise instead of hashing. Reproduced on the preceding O2 binary with a
+67,108,867-byte binary input, without a memory or wall-limit event.
+
+SHA256, SHA384 and SHA512 now update the same real native context with
+1-MiB byte slices before finalization. The provider's own wire bound and
+all test/resource limits are unchanged. Empty inputs and the existing
+portable algorithms retain their behavior. No new top-level Mere value,
+public API, dispatcher, collector, C API or provider ABI change.
+
+The same input now matches Ruby 4.0.9 for all nine combinations of the
+three algorithms and direct/incremental/file entry points, each in a
+separate supervised process under 600 seconds / 2 GiB. Mere completes each
+in 1.266–2.055 seconds; the largest observed family peak is 1,119,600 KiB.
+The reusable actual-input probe is unittest/digest_provider_large.rb;
+arguments are algorithm bits (256/384/512) and entry point
+(direct/incremental/file). Compare its complete output with the reference.
+Witness 716 covers binary bytes crossing the bounded update boundary.
+
+Original Digest/OpenSSL Digest retain all 124 MATCH. The full corpus is
+705/705 with indexing ON and OFF. All nine RSS cases, fifteen existing
+provider lifetime/interruption/worker controls and the actual bracket
+check (933/1024) pass again. The real Nokogiri checksum/metadata probe
+still matches both hash and 182 files (4.715 seconds / 352,544 KiB).
+
+The earlier 68-gem installation observation remains tied to experimental
+composition 153e64f5 before this review fix. No new full Rails workload
+pass is inferred. #121 still owns the independent command registry
+boundary, and migration/boot/tests/HTTP require their original CLI replay.

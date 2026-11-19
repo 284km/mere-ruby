@@ -4586,3 +4586,11 @@ migration: Rails::Command's Ruby subclasses registry is bypassed by the
 native Class#subclasses path. The small module/inherited reproduction also
 fails on unmodified main. Rails boot, SQLite execution, application tests
 and HTTP remain unconfirmed on mere-ruby; the reference app remains healthy.
+
+
+The SHA-2 provider connection splits updates into 1-MiB byte slices, so
+large standard Digest inputs do not inherit the private provider wire
+request limit. Actual 64-MiB-plus binary inputs match the reference for
+SHA256/384/512 through direct, buffered incremental and file entry points.
+The 64-MiB provider wire bound itself remains unchanged. This does not
+remove the existing buffered Digest implementation's memory cost.
