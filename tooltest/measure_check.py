@@ -52,6 +52,10 @@ class ToolCheck(unittest.TestCase):
         self.assertEqual(summary['totals'], dict(tests=2, match=1, red=1, both=0, extra=0))
         self.assertEqual(summary['missing_shards'], [])
 
+    def test_no_shards_is_not_a_measurement(self):
+        with self.assertRaisesRegex(ValueError, 'no tool measurement shards'):
+            self.collect()
+
     def test_missing_shard_keeps_every_planned_file_and_fails(self):
         self.report(0)
         with self.assertRaises(SystemExit):
