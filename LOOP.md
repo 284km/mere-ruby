@@ -6100,3 +6100,20 @@ invalid-archive fixture and retain REFERENCE_UNAVAILABLE/exit 2 rather than
 an unrecorded startup error/exit 1. All six harness controls pass. The small
 harness workflow selects Ruby 4.0.9 to execute that real subprocess control.
 The original main Rails measurement remains a historical snapshot.
+
+
+### Rails intake round 3 candidate result: mkmf passes, archive processing reaches 600 s
+
+A fresh own build of unmerged #95 head 54184e4e passes the standalone mkmf
+probe and builds bigdecimal, json, prism and racc during the same locked
+install. All six reference stages pass. Mere then hits WALL_LIMIT at
+600.910 s, exit -9, family peak 750,928 KiB; migration/boot/tests/HTTP stay
+NOT_RUN. `railstest/capi_candidate.json` keeps this separate from main.
+No time or memory bound is increased and no resource failure becomes PASS.
+
+The next archive, Nokogiri 1.19.7, has not been extracted yet. A checksum
+probe identifies the Ruby SHA-2 implementation as a bottleneck; the actual
+OpenSSL provider returns the same hash quickly. The package probe now
+requires RubyGems explicitly as well as rubygems/package, so its metadata
+read has the real runtime loaded. Any native-provider acceleration is a
+separate library change; this PR still changes no runtime function.

@@ -100,3 +100,26 @@ The controls reject changed/extra archives, inherited foreign gem/Bundler
 settings, missing or skipped tests, reduced assertion counts, and success
 markers accompanying nonzero exits or resource limits. They do not replace
 the actual Rails run.
+
+## Unmerged C API candidate
+
+`capi_candidate.json` is a separate fresh measurement of #95 head 54184e4e,
+not main. The same reference passes all six stages. Mere builds bigdecimal,
+json, prism and racc, but the full dependency installation reaches its
+unchanged 600-second wall bound (750,928 KiB peak). The four application
+stages remain NOT_RUN. This supersedes no main baseline and is not an
+installation PASS.
+
+The next archive is Nokogiri 1.19.7. `probes/package_spec.rb` separates its
+real SHA-256 and RubyGems metadata read without building any extension:
+
+```sh
+/path/to/ruby probes/package_spec.rb /path/to/nokogiri-1.19.7.gem
+```
+
+Run that script from this directory or use `railstest/probes/package_spec.rb`
+from the repository root. RubyGems loads OpenSSL for package security; the
+existing Digest SHA-2 implementation still evaluates its algorithm in Ruby.
+The measured 4,387,328-byte archive exposes a checksum bottleneck before
+Nokogiri's installation message. The independent SHA-2 implementation work
+is separate from this measurement-only PR.
