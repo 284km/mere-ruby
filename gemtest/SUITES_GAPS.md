@@ -1,5 +1,15 @@
 # Upstream gem suite differences
 
+The hosted Module complemented-entry check is under a separate controlled
+comparison. PR #90 fails its RSS assertion at 2.407109x; current main fails
+the same case by the original ten-second timeout. Independent O2 builds
+using their actual CI compiler show full 195-test / 1,240-assertion parity
+on macOS, with selected-case ratios near 1.67x on both. This does not rule
+out Linux-specific behavior or establish a shared cause. A separate Ubuntu
+job now compares both locked sources on one runner. Preserve the failed
+hosted observations and unchanged gate in `module_rss_pr90_r50.json`.
+There is no new gem measurement or memory fix in this round.
+
 This ledger describes file verdicts from `suites_latest.json`. Raw stdout and
 stderr in CI's `gem-suites-*` artifacts identify individual failed tests.
 Symptoms below are observed; an unconfirmed cause is explicitly marked.

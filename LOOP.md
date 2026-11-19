@@ -6170,3 +6170,46 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+## 2026-11-19: compare the original Module RSS failure with current main
+
+PR #90's Linux Module job completes 195 tests / 1,240 assertions with one
+complemented-entry RSS failure: 77,672,448 to 186,966,016 bytes, 2.407109x.
+Current main 3b05689f also fails that test in hosted CI, but by its unchanged
+ten-second timeout (10.05 seconds), not a measured RSS assertion. Both use
+compiler 01f5ad73 and the same pinned test. Preserve the distinct failure
+modes; neither establishes the other's cause. The PR CI merge's runtime
+sources equal head 949e4638. A failed job rerun is still rejected while its
+containing workflow is unfinished.
+
+Build main and the PR head independently with the actual CI compiler, then
+measure sequentially under one common environment. On macOS both full files,
+and the reference, give 195 tests / 1,240 assertions with no failure/error/skip
+and identical case dictionaries. A parent-only observer of the original
+selected case gives RSS ratios 1.668504x main / 1.668009x PR. The separate
+comparison-tool validation gives 1.669211x / 1.672658x. All original 1,000
+preparation and 300,000 workload iterations and the ten-second child bound
+remain. Captured child programs agree except their original PID/time/hex
+tokens. Raw inputs and logs are retained; canonicalization changes only
+comparison hashes, and rejects malformed tokens or changed workload text.
+
+No PR-specific worsening is demonstrated locally; Linux-specific behavior
+is still unresolved. Add a separate Ubuntu job that builds both locked
+sources before measuring the complete reference/main/PR files, then the
+observed original selected case. Missing results, skips, failures, unequal
+inputs or a ratio not strictly below 2.0 fail the comparison. Every file
+retains 600 seconds / 2 GiB. The original Module gate and existing job
+durations are unchanged. Details and reproduction are in
+tools/module_rss_compare.md; the new Linux result is pending.
+
+All twelve actual local executions complete, with the original complete-file
+and selected-case coverage. The first tool-level result failed only because
+the input-hash nonce parser omitted hexadecimal digits; preserve that result
+and revalidate all saved raw inputs with the final parser. The corrected
+parser does not change a runtime observation. YAML syntax passes; actual
+bracket depth is 155/1024 with the pinned compiler. No interpreter or
+GC/VM/AST/C API implementation, allocator policy, source lock or baseline
+changed. No gem sweep or memory repair is claimed. Keep the hosted failures,
+source/binary/log hashes and both controlled pairs in
+gemtest/module_rss_pr90_r50.json. The separate Method-copy investigation is
+not evidence for this test's cause.
