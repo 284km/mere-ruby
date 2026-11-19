@@ -5,6 +5,17 @@ stderr in CI's `gem-suites-*` artifacts identify individual failed tests.
 Symptoms below are observed; an unconfirmed cause is explicitly marked.
 None is excluded from the measurement to improve its score.
 
+PR #92 Module RSS follow-up (2026-11-20): its original complemented-entry
+case still has a preserved hosted 2.026060x failure. A single-refinery live
+snapshot no longer duplicates the fixed entry it already restores. The
+unchanged local Linux case moves from 2.168020x failure to 1.722404x success,
+with comparable initial RSS and all three original assertions. Complete
+Module and Refinement files retain their case identities and results on
+macOS and Linux/aarch64. This is a metadata-storage change in ref_snapshot,
+not a change to GC or the bounds. Fresh hosted CI remains required, and
+Method-copy and other resource failures are not waived. See
+module_rss_pr92_r55.json; no existing source lock or baseline is replaced.
+
 | Suite / file | Observed difference | Ownership and next step |
 |---|---|---|
 | minitest / `test_minitest_mock.rb` | Now executes all 94 tests; 2 failures, 13 errors and 10 skips. Stubbing `File.open` still reaches the real file operation, and a dynamic method's super lookup fails. | Ruby semantics. Inspect builtin aliases and super lookup. Shared dispatch functions are being edited by PRs #86–#88; do not edit those functions concurrently. |

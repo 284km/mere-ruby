@@ -6217,3 +6217,35 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+## 2026-11-20: a live refinement snapshot need not duplicate its first target
+
+PR #92's repeated original Module check failed its RSS assertion at
+77,643,776 -> 157,310,976 bytes, 2.026060x. Keep that failed measurement.
+A refinement scope with one live refinery and its sole matching fixed
+target stored both entries, although installing the live refinery restores
+that same target and implementation. Store its live marker once in this
+exact case. Mixed tables retain their complete snapshots, and later targets
+still expand when the live scope is installed. This changes ref_snapshot
+only; no collector, native pinning, allocator, cache size or workload changes.
+
+Separate ordinary O2 builds use the same CI compiler 01f5ad73. On local
+Linux/aarch64, the unchanged selected upstream case fails before at
+2.168020x and passes after at 1.722404x. Initial RSS is comparable,
+80,203,776 / 80,076,800 bytes; final RSS is 173,883,392 / 137,924,608.
+Outer times are 6.133 / 6.098 seconds. Both complete original Module files
+pass all 195 tests / 1,240 assertions. The corresponding macOS observation
+gives 1.219891x before / 0.809315x after; its complete files also pass.
+These local observations do not substitute for fresh hosted x86-64 CI.
+
+All 122 original Refinement tests retain the reference's per-case result:
+370 assertions with no skips on Linux, 367 assertions and the same one skip
+on macOS. All eighteen logs reparse, identities match, and the six captured
+selected-case child inputs differ only in the original two nonce tokens.
+Witness 728 checks live targets added after capture, a fixed using scope,
+reopening, enumeration and collection in four hash/MRO configurations.
+Actual bracket depth is 155/1024 and no top-level binding is added.
+The source locks, stronger suite baselines, 600-second / 2-GiB file bounds,
+original 1,000 / 300,000 iterations, ten-second child timeout and strict
+ratio below 2.0 are unchanged. Measurements and hashes are preserved in
+gemtest/module_rss_pr92_r55.json.
