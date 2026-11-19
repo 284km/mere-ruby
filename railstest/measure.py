@@ -99,7 +99,7 @@ def environment(home, app, stdlib, user, sqlite_prefix):
     env = clean_environment()
     env.update(LANG='en_US.UTF-8', GEM_HOME=str(home), GEM_PATH=str(home),
                GEMRC=os.devnull, RAILS_SMOKE_RUBY_LIB=stdlib, RAILS_ENV='test',
-               RUBYOPT='-r' + str(ROOT / 'bootstrap.rb'),
+               RUBYOPT='--disable-gems -r' + str(ROOT / 'bootstrap.rb'),
                BUNDLE_GEMFILE=str(app / 'Gemfile'), BUNDLE_FROZEN='true',
                BUNDLE_IGNORE_CONFIG='true', BUNDLE_FORCE_RUBY_PLATFORM='true',
                BUNDLE_USER_HOME=str(user), RAILS_SMOKE_GEM_HOME=str(home),

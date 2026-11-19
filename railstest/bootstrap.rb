@@ -7,3 +7,6 @@ unless fallback == RbConfig::CONFIG.fetch("rubylibdir")
   $LOAD_PATH.delete(fallback)
   $LOAD_PATH << fallback
 end
+# RUBYOPT disables automatic RubyGems startup until that order is restored.
+# Load the unchanged RubyGems source here for both interpreters and children.
+require "rubygems"
