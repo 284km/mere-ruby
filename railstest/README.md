@@ -218,3 +218,29 @@ still wins over the fallback, and reference-own path order is identical.
 The original archives/app/limits and historical JSON files are unchanged.
 The workload must be replayed cold with this bootstrap before claiming
 any later stage passes.
+
+
+## Hash candidate reaches the locked JSON generator
+
+hash_candidate.json is the fresh original-CLI replay on validation-only
+source 0b76e819, with C API #95, bounded SHA-2 #120, reviewed Class #125,
+Hash #126 and the intake child-startup correction. The runtime binary is
+unchanged from a9c8a2ff; only the measured startup inputs changed. Its full
+735-file corpus matches with indexing ON and OFF. The same frozen archives,
+fresh gem homes/native builds and 600-second / 2-GiB bounds remain.
+
+Reference passes all six stages, including six tests / 31 assertions and
+real Puma HTTP. Mere installs all 68 dependencies in 201.059 seconds /
+948,608 KiB, then the original migration CLI passes the Hash configuration
+and fails on JSON::Ext::Generator::State.default_sort_keys_proc= (2.273 s /
+268,896 KiB, exit 1, no resource event). Boot/tests/HTTP remain NOT_RUN.
+The earlier main, C API, provider, Class and load-path records are unchanged.
+
+The actual JSON 3.1.0 Ruby facade loads, but shipped parser/generator source
+is selected despite the activated gem's independently built native files
+earlier on the load path. probes/json_generator.rb is a gem-only ordinary
+require reproduction. Issue #127 tracks native feature selection; no JSON
+attribute, source patch or forced older gem conceals it. Explicitly loading
+the own native libraries after the failed facade is a separate diagnostic
+whose sorting/parsing output matches; it is not used by the original run.
+Full Rails component suites remain unmeasured, and no Rails app pass is claimed.
