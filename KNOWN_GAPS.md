@@ -4739,9 +4739,10 @@ total: 275 tests, MATCH 271, RED 3, BOTH 1, EXTRA 0
 ## 2026-11-19: restore the strict GC merge-gate cases
 
 The unchanged Optimization allocation case now passes with four assertions.
-An empty method with no defaults and no observer/scheduler can bind its
-ordinary arguments without creating an unread Proc for its named block
-parameter. TracePoint, set_trace_func, defaults, threads/fibers, signals and
+An empty method whose sole formal is its named block parameter, with no
+defaults or observer/scheduler, avoids creating an unread Proc. Positional
+formals retain the full binder: destructuring can execute to_ary and enable
+TracePoint during binding, exposing the block through call/return Bindings. TracePoint, set_trace_func, defaults, threads/fibers, signals and
 finalizers retain the full binder. Local-declaration markers are metadata,
 not reads of the block. Real none/unused/used T_DATA deltas remain 0/0/1;
 the used Proc is still present in ObjectSpace.
@@ -4779,5 +4780,19 @@ mark/sweep body or resource limit changes. The original 159-row intake and
 its 12 honest matches, 57 symmetric exclusions and 88 handoffs (plus two main
 fixes) retain their denominator. These extra merge-gate repairs are separate.
 
-Broader paired-file, complete corpus and hosted per-file validation remain
-in progress. All 76 upstream allocation comparisons stay enabled.
+The paired comparison covers 12 complete files / 1,390 cases on checkpoint
+b54452d8: MATCH 1,297 to 1,299, RED 90 to 88, BOTH 3 unchanged, no previously
+passing case lost in any file. This includes Array, Proc, Iterator, Method,
+Super, Refinement, Eval, Settracefunc and all 76 allocation comparisons;
+those allocation cases remain enabled and retain their 76 existing REDs.
+
+The final observer guard narrows the optimization to a sole named block
+formal. Its O2 binary passes the actual original allocation test (four
+assertions) and enumeration test (7.768 seconds, three assertions), the
+to_ary-activated observer control, all 715 corpus programs in both hash-index
+modes, all nine RSS controls and bracket depth 155/1024. The complete Module
+contract is repeated on this final runtime: 195 tests / 1,240 assertions,
+zero failures/errors/skips, outer 23.441 seconds / 365,632 KiB. The
+12-file checkpoint observations are not relabeled as a final-runtime rerun.
+The updated hosted CI, Linux Module memory gate and all-file comparison
+against complete main remain required before merge. No bound is changed.

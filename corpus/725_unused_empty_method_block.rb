@@ -58,3 +58,22 @@ p [:binding, body_observes_block {}]
 p [:presence, observes_presence {}, observes_presence]
 original = -> { :original }
 p [:identity, capture_used(&original).equal?(original), capture_used(&original).lambda?]
+
+# Argument coercion can arm an observer even when none was active at entry.
+$observed_conversion_block = []
+$conversion_trace = TracePoint.new(:call, :return) do |event|
+  if event.method_id == :empty_destructure
+    $observed_conversion_block << [event.event, event.binding.local_variable_get(:block).class]
+  end
+end
+def empty_destructure((first, second), &block)
+end
+class DestructureBlockObserver
+  def to_ary
+    $conversion_trace.enable
+    [1, 2]
+  end
+end
+empty_destructure(DestructureBlockObserver.new) {}
+$conversion_trace.disable
+p [:conversion_observer, $observed_conversion_block]
