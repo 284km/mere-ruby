@@ -17,7 +17,10 @@ class C
     Thread.new { sleep; :woke }
   end
 end
-p M.nap
+# CRuby measures sleep with an integer-second clock: even sleep(0) may return
+# 1 across a clock boundary. Check the module-self route and return contract.
+slept = M.nap
+p [slept.is_a?(Integer), slept >= 0]
 t = M.go
 Thread.pass while t.status == "run"
 p [t.alive?, t.status, t.stop?]
