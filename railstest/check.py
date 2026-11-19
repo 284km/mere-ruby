@@ -68,6 +68,39 @@ class MeasurementCheck(unittest.TestCase):
             self.assertFalse(measure.successful('boot', outcome, 'rails-boot-ok\n'))
         self.assertFalse(measure.successful('boot', dict(exit=0, limit=None), ''))
 
+    def test_extension_child_keeps_declared_stdlib_as_fallback(self):
+        reference = Path(os.environ.get('REF_RUBY_BIN') or shutil.which('ruby')).resolve()
+        env = measure.clean_environment()
+        bootstrap = measure.ROOT / 'bootstrap.rb'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fallback, explicit = root / 'fallback', root / 'explicit'
+            fallback.mkdir()
+            explicit.mkdir()
+            (fallback / 'monitor.rb').write_text('raise "foreign monitor wrapper selected"\n')
+            (fallback / 'intake_priority.rb').write_text('raise "fallback displaced explicit source"\n')
+            (explicit / 'intake_priority.rb').write_text('puts "explicit-source-ok"\n')
+            env['RAILS_SMOKE_RUBY_LIB'] = str(fallback)
+            command = [str(reference), '--disable-gems', '-I' + str(fallback), '-I' + str(explicit)]
+            script = 'require "monitor"; puts "monitor-ok"; require "intake_priority"'
+            failed = subprocess.run(command + ['-e', script], env=env, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(0, failed.returncode)
+            self.assertIn('foreign monitor wrapper selected', failed.stderr)
+            result = subprocess.run(command + ['-r' + str(bootstrap), '-e', script],
+                                    env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual('monitor-ok\nexplicit-source-ok\n', result.stdout)
+            stdlib = subprocess.check_output([str(reference), '--disable-gems', '-rrbconfig', '-e',
+                                              'print RbConfig::CONFIG.fetch("rubylibdir")'],
+                                             env=env, text=True, timeout=10)
+            env['RAILS_SMOKE_RUBY_LIB'] = stdlib
+            own = [str(reference), '--disable-gems', '-I' + str(explicit)]
+            script = 'puts $LOAD_PATH'
+            expected = subprocess.check_output(own + ['-e', script], env=env, text=True, timeout=10)
+            actual = subprocess.check_output(own + ['-r' + str(bootstrap), '-e', script],
+                                              env=env, text=True, timeout=10)
+            self.assertEqual(expected, actual)
+
     def test_actual_entry_point_ignores_foreign_ruby_startup(self):
         reference = Path(os.environ.get('REF_RUBY_BIN') or shutil.which('ruby')).resolve()
         control_env = {k: v for k, v in os.environ.items()
