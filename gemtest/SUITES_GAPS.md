@@ -426,3 +426,29 @@ Module complemented-entry memory-leak case at 2.371912x. A requested job
 rerun is rejected with HTTP 403 while the containing workflow remains active;
 record the retry as pending, not accepted or successful. The stronger original
 baseline, failed multipart observations, and all existing-file gates remain.
+
+The remaining stdlib-caller P2 also affected `mspec/scoreboard.sh` and
+`run_corpus.sh` when reference library directories were supplied through
+RUBYLIB. Mere now receives its own load paths before those fallback paths;
+the reference's order stays unchanged. The scoreboard queries Mere once per
+sweep, and a direct `run_spec.sh` invocation applies the same ordering.
+No interpreter function or explicit `-I`/`$LOAD_PATH.unshift` precedence changes.
+The original `core/nil/to_s_spec.rb` changes from a monitor.so startup LoadError
+to 2 passes on both sides. The stdlib-mode scoreboard gives 17 MATCH / 1 SKIP
+for all 18 core/nil files, with no DIFF/CRASH/SLOW. Corpus 01, 220, 525 and
+685 match in both hash modes with reference fallbacks supplied, including
+physical Base64 replacement; they previously failed at monitor.so startup.
+The ordinary complete corpus run gives 707/707 MATCH in both hash modes,
+589.759 seconds and peak process-family RSS 1,061,456 KiB, within the unchanged
+900-second / 2-GiB aggregate bound. Base64's original locked test file also
+retains MATCH (9 tests / 73 assertions) and both physical source audits.
+Six driver controls pass on macOS; five pass on Linux, where the BSD-time
+mspec execution control runs only on the macOS job. These controls have a
+separate two-OS workflow; existing workflow limits and gem snapshots are unchanged.
+
+A separate exploratory full-corpus run with the added reference stdlib and
+bundled-gem directories stops at corpus 178: `$_` before the first read is
+`"ext/stringio/extconf.rb"` on Mere versus nil on the reference. This is an
+observed additional environment-dependent Ruby semantic difference; its cause
+is not isolated, and it is not assigned to VM, AST, C API or GC internals.
+It is retained as an open difference, not counted as a successful full sweep.
