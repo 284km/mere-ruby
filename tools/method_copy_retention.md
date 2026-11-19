@@ -38,7 +38,8 @@ For a separate native diagnostic, compile
 `tools/method_copy_retired_observer.c` **in place of** `mr.c`, retaining the
 same compiler, O2/link flags, glue files and dependencies from `tools/build.sh`.
 Use a separate output directory. The observer reads native retired arenas
-at exit and never calls the collector, pin hook, compactor or deallocator.
+on the calling native thread at exit and never calls the collector, pin
+hook, compactor or deallocator. It is not a process-wide thread census.
 Mark its `.build_mode` as `DIAGNOSTIC O2 observer`, so the normal gate refuses
 that executable. Its private C layout is tied to the pinned compiler; this
 file is not part of the ordinary build.

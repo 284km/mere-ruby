@@ -41,8 +41,8 @@ def parse(text):
                                  last_gc_current_method_arena_bytes=arena))
     return dict(stores=stores, samples_kb=samples, timeline=timeline,
                 observed_post_gc_peak_to_initial=(
-                    max(rss for _, rss in samples) / samples[0][1]
-                    if samples and samples[0][1] > 0 else None),
+                    max(rss for _, rss in samples[1:]) / samples[0][1]
+                    if len(samples) > 1 and samples[0][1] > 0 else None),
                 region_statistics=[line for line in text.splitlines()
                                    if line.startswith('region-stats ')])
 
@@ -56,6 +56,8 @@ def main():
     binary = args.binary.resolve()
     if (binary.parent / '.build_mode').read_text().strip() != 'O2':
         parser.error('use a normal O2 build; instrumented native builds are separate diagnostics')
+    if PROGRAM.count('20.times do |batch|') != 1:
+        parser.error('the original program no longer has a unique diagnostic prefix loop')
     args.output.mkdir(parents=True, exist_ok=False)
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(('RUBY', 'GEM_', 'BUNDLE_', 'MERE_', 'MT_'))}
