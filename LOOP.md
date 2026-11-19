@@ -6639,3 +6639,48 @@ main's 89. Issue #113 records the shared callback handoff: even the native
 That diagnostic is not a passing upstream test or a changed time limit.
 The earlier stacked count/ID work is consolidated here, while #109/#112
 remain independent main-targeted deliveries. No main merge is implied.
+
+
+## Stage 9 merge audit after the complete CI run (2026-11-19)
+
+PR #91's prior complete CI 44316999605 attempt 2 is green, but comparison
+with complete main CI 44239745755 attempt 3 covers all 758 files and finds
+three lower MATCH rows: Enumerable 89 to 88, Optimization 88 to 87, zlib
+96 to 95. None is an exclusion; the 57 actual symmetric exclusions remain
+separately reported. A green measurement job does not waive these rows.
+
+Merge current main 3b05689f, keeping its compiler 01f5ad73 and bracket seed
+155. The only conflict was that seed; the actual 1024 limit and verification
+remain unchanged. Fresh independent O2 builds of main and the integrated
+GC source f6ed1792 reproduce the original cases sequentially after builds:
+
+- Enumerable: reference 0.22 s, main 1.73 s, both PASS/three assertions;
+  GC candidate reaches the original ten-second Timeout, two assertions.
+  The outer measurement is 12.357 s / 239,840 KiB without a resource event.
+  Issue #113 and its P2 remain open; do not hide real Arrays or change bounds.
+- Optimization: the unused named block parameter produces a real extra Proc
+  (T_DATA delta 1 versus reference 0). No-call/unused/used controls give
+  reference 0/0/1, main 0/0/0, candidate 0/1/1. Main's used control reveals
+  its incomplete counter. The true counts stay; issue #130 hands actual
+  lazy block-parameter materialization to the VM/evaluator work. The same
+  count path is relevant to #109. This test stays enabled, without a new
+  exclusion or fabricated zero. unittest/block_parameter_probe.rb preserves
+  the three controls in fresh processes.
+- The original zlib gunzip memory-leak case passes on all three current
+  builds: reference 1.125 s, main 6.515 s, candidate 6.551 s outer execution.
+  This selected result does not replace the required complete file/CI row.
+
+The original three files were also rerun under their normal supervisor;
+their exact current totals are recorded below. The two genuine blockers
+above are outside the original 159-row intake: that inventory remains
+two main fixes, 12 honest implementation matches, 57 exclusions and 88
+named handoffs. No collector, VM/ISeq, m_state, AST, C API, test or limit is
+changed by this audit beyond importing the already merged compiler update.
+The PR is not mergeable until these blockers and current hosted gates pass.
+
+```text
+ruby/test_enum.rb                                  90 tests  MATCH   88  RED    1  BOTH   1  EXTRA   0
+ruby/test_optimization.rb                          89 tests  MATCH   87  RED    2  BOTH   0  EXTRA   0
+zlib/test_zlib.rb                                  96 tests  MATCH   96  RED    0  BOTH   0  EXTRA   0
+total: 275 tests, MATCH 271, RED 3, BOTH 1, EXTRA 0
+```

@@ -56,8 +56,8 @@ excluded individually; generic argument checks, actual allocation tracing
 and GC::Profiler tests remain enabled. Passing MMTk exclusions are not copied.
 
 `gc_cases.tsv` retains all 159 target RED from the original successful main
-CI 43807166928 (c64d0ae4). The last complete successful main CI 44196635193
-(3eb24fef) passes two of those finalizer cases after #87, leaving 157 target RED: 12 honest
+CI 43807166928 (c64d0ae4). The last complete successful main CI 44239745755
+(12ca1df2) passes two of those finalizer cases after #87, leaving 157 target RED: 12 honest
 implementation matches, 57 reasoned exclusions and 88 named handoffs.
 The two main fixes are identified separately in the inventory. This is a dated triage inventory, not a
 replacement for measured results. In particular, `memsize_of_all` now passes
@@ -590,3 +590,16 @@ identities and reasons are audited symmetrically and reported separately;
 allocation comparisons remain enabled. GC.config[:implementation] truthfully
 remains mere-ruby; only the CRuby GC-library-name assertion is excluded.
 No RUBY_GC_LIBRARY value is used to disguise the reference collector.
+
+
+### Stage 9 merge gates after full CI
+
+The complete green #91 measurement does not itself enforce every-file
+nonregression. Its comparison against main CI 44239745755 has three lower
+rows (Enumerable, Optimization and zlib), separate from the 57 exclusions.
+On the latest compiler, the unchanged Enumerable timeout remains #113;
+honest Proc counts expose unused block-parameter allocation as #130.
+The diagnostic block_parameter_probe.rb expects none/unused/used deltas
+0/0/1. Main's old 0/0/0 omits real Procs; restoring that false zero or
+excluding the allocation test is not a valid repair. The independent
+count/ID delivery #109 must retain the same merge condition.
