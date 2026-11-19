@@ -274,3 +274,36 @@ preload workaround. Original require/autoload/Marshal counts and all 733
 native-branch corpus files match their stated comparisons; existing C API
 contracts hold normally/under stress and all six fault controls fail. These
 do not establish a Rails application or framework-suite pass.
+
+
+## Module notification candidate reaches ActionController syntax
+
+module_candidate.json preserves the fresh paired replay on validation-only
+source b9056808, including notification correction #132 and the synchronized
+native-selection parent. Both sides use the original 69 locked source
+archives, initially empty homes and independently built native extensions.
+All six reference stages pass, including six tests / 31 assertions and real
+Puma HTTP. Mere installs all 68 dependencies in 210.753 seconds / 862,800 KiB.
+
+The original migration CLI passes the preceding Module included failure and
+then exits 1 in 3.999 seconds / 318,752 KiB at unchanged ActionController
+source: extend ::AbstractController::Railties::RoutesHelpers.with(app.routes).
+The parser reports expected end of statement. Boot/tests/HTTP remain NOT_RUN;
+there is no resource event. Earlier records, app sources, lock and 600-second /
+2-GiB bounds are unchanged; all 18 new stdout/stderr hashes were verified.
+
+probes/absolute_extend.rb reduces the absolute-root factory argument without
+gems and checks lexical anchoring. Even the single original extend statement
+fails syntax checking on unchanged main and this composition, while Ruby
+accepts it. The bare absolute constant, adjacent keyword command and property
+assignment controls parse on both. Issue #134 records parse_stmt_id's special
+extend branch consuming only the scoped constant and leaving the dotted
+call unparsed. No Rails source patch or changed grammar input conceals it.
+
+The independent #132 notification branch completes 707/707 corpus programs
+with indexing ON/OFF and preserves all five core files (525 MATCH / 527 cases).
+The synchronized #128 branch separately completes 734/734 programs. Neither
+is a full-corpus claim for this combined b9056808 composition. A separate
+pre-existing saved native Method metadata gap is tracked in issue #133; its
+Array#length control fails on the parent and is not an actual Rails blocker.
+Rails application and framework-suite success remain unestablished.
