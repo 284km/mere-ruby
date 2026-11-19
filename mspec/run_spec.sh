@@ -20,6 +20,14 @@ here="$(cd "$(dirname "$0")" && pwd)"
 . "$here"/../tools/ref_ruby.sh
 # see run_corpus.sh: a candidate build is gated before it takes over the path.
 mr="${MR_BIN:-$here/../mere-ruby}"
+# Reference libraries supplement this runtime's stdlib; their C-backed wrappers
+# must not displace Mere's shipped monitor, date, etc. Leave the reference's
+# RUBYLIB unchanged. scoreboard.sh caches the query once per sweep.
+mere_rubylib="${RUBYLIB:-}"
+if [ -n "$mere_rubylib" ]; then
+  mere_load_path="${SPEC_MERE_LOAD_PATH-$(sh "$here/../tools/runtime_load_path.sh" "$mr")}" || exit 2
+  mere_rubylib="$mere_load_path:$mere_rubylib"
+fi
 # ⚠ THE CLONE IS THE SWEEP. Measured 2026-09-22: one spec file costs 2.71s
 # real of which 1.89s is SYS and only 0.15s user -- the two interpreters take
 # about 0.1s between them and the REST is copying 4,333 files (core, language,
@@ -229,6 +237,7 @@ sb_runner='
 '
 out_m="$( ( ulimit -c 0; ulimit -S -t "$sb_cpu" 2>/dev/null
             MSPEC_RUBY_EXE="$mr"; export MSPEC_RUBY_EXE
+            RUBYLIB="$mere_rubylib"
             spec_env /usr/bin/time -l -o "$tmp/ru_m" perl -e "$sb_runner" "$sb_wall" "$tmp/rc_m" "$mr" -W0 "$tmp/driver.rb"
           ) 2>/dev/null | head -c "$out_cap")"
 rc_m="$(cat "$tmp/rc_m" 2>/dev/null || echo 0)"
