@@ -203,9 +203,12 @@ the Hash hook is not reached in it.
 
 The intake bootstrap now moves only its explicitly declared reference
 fallback behind the interpreter's own libraries, including when inherited
-through a child's -I. It leaves the reference's own stdlib order and all
-other explicit source directories unchanged. No require implementation,
-RubyGems, Rails, gem source, RbConfig value or API inventory changes. This
+through a child's -I. RUBYOPT defers automatic RubyGems startup until the
+bootstrap restores that order, then requires unchanged RubyGems on both
+interpreters. Otherwise RubyGems can load monitor before any -r bootstrap.
+The reference's own stdlib order and all other explicit source directories
+remain unchanged. No require implementation, RubyGems/Rails/gem source,
+RbConfig value or API inventory changes. This
 is the intake counterpart of #90's mspec/corpus fallback-ordering repair;
 it does not change that PR or globally suppress physical library overrides.
 

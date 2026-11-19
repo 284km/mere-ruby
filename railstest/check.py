@@ -47,7 +47,7 @@ class MeasurementCheck(unittest.TestCase):
         self.assertEqual('/run/gems', env['GEM_PATH'])
         self.assertEqual('/stdlib', env['RAILS_SMOKE_RUBY_LIB'])
         self.assertNotIn('RUBYLIB', env)
-        self.assertEqual('-r' + str(measure.ROOT / 'bootstrap.rb'), env['RUBYOPT'])
+        self.assertEqual('--disable-gems -r' + str(measure.ROOT / 'bootstrap.rb'), env['RUBYOPT'])
         self.assertEqual('test', env['RAILS_ENV'])
         self.assertNotIn('BUNDLE_PATH', env)
         self.assertNotIn('BUNDLE_WITHOUT', env)
@@ -82,7 +82,8 @@ class MeasurementCheck(unittest.TestCase):
             (explicit / 'intake_priority.rb').write_text('puts "explicit-source-ok"\n')
             env['RAILS_SMOKE_RUBY_LIB'] = str(fallback)
             command = [str(reference), '--disable-gems', '-I' + str(fallback), '-I' + str(explicit)]
-            script = 'require "monitor"; puts "monitor-ok"; require "intake_priority"'
+            script = ('require "monitor"; puts "monitor-ok"; require "intake_priority"; '
+                      'abort "RubyGems not initialized" unless defined?(Gem::VERSION)')
             failed = subprocess.run(command + ['-e', script], env=env, capture_output=True, text=True, timeout=10)
             self.assertNotEqual(0, failed.returncode)
             self.assertIn('foreign monitor wrapper selected', failed.stderr)
@@ -90,13 +91,22 @@ class MeasurementCheck(unittest.TestCase):
                                     env=env, capture_output=True, text=True, timeout=10)
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             self.assertEqual('monitor-ok\nexplicit-source-ok\n', result.stdout)
+            # Automatic RubyGems startup runs before a -r bootstrap. Exercise
+            # the real inherited RUBYOPT contract with default CLI settings too.
+            env['RUBYOPT'] = measure.environment(root / 'gems', root / 'app', str(fallback),
+                                                   root / 'user', None)['RUBYOPT']
+            actual_child = [str(reference), '-I' + str(fallback), '-I' + str(explicit), '-e', script]
+            result = subprocess.run(actual_child, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual('monitor-ok\nexplicit-source-ok\n', result.stdout)
+            env.pop('RUBYOPT')
             stdlib = subprocess.check_output([str(reference), '--disable-gems', '-rrbconfig', '-e',
                                               'print RbConfig::CONFIG.fetch("rubylibdir")'],
                                              env=env, text=True, timeout=10)
             env['RAILS_SMOKE_RUBY_LIB'] = stdlib
             own = [str(reference), '--disable-gems', '-I' + str(explicit)]
             script = 'puts $LOAD_PATH'
-            expected = subprocess.check_output(own + ['-e', script], env=env, text=True, timeout=10)
+            expected = subprocess.check_output(own + ['-rrubygems', '-e', script], env=env, text=True, timeout=10)
             actual = subprocess.check_output(own + ['-r' + str(bootstrap), '-e', script],
                                               env=env, text=True, timeout=10)
             self.assertEqual(expected, actual)
