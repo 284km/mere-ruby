@@ -367,3 +367,37 @@ unmodified check digest, remain in method_copy_lifetime_latest.json. No
 threshold, warm-up, workload, metadata runtime or collector change follows
 from the native protocol correction. Allocation/owner-lifetime investigation
 remains open alongside the multipart resource issue; no resource fix is claimed.
+
+
+Rounds 32–34 add two healthy original files: Abbrev 0.1.2 and Singleton 0.3.0
+both MATCH on macOS and network-disabled Linux/aarch64. They have no native
+extension/runtime dependency and reuse the existing pinned Test::Unit closure.
+No runtime changes are adopted in this round.
+
+A missing-super prototype reaches a class receiver's singleton hook, reducing
+Mock to 1 failure / 1 error / 145 assertions, but it retains the super reason
+after nested missing calls. The saved parent and reference correctly replace
+that reason, including when the inner hook handles its missing call normally.
+This is a real regression despite the prototype's 732/732 corpus and unchanged
+core MATCH counts. All three runtime changes and both temporary witnesses are
+withdrawn, with the observations retained in suites_rejected_r33.json and the
+three named trial snapshots. New corpus 714 protects the previously passing
+nested-call behavior. Mock remains at the parent result stated above.
+Coordinated missing-reason work must cover shared dispatch paths, including
+invoke_val_c0, which remains occupied. It is a Ruby semantics coordination
+gap, not a C extension, VM or collector cause.
+
+The final 117-file candidate on the unchanged runtime again loses multipart
+to MEMORY. Preserve its failed candidate and the stronger 54-MATCH original
+baseline. Parent #118's Linux additional run 44440077865 also fails the
+unchanged lifetime assertion at 2.270x (85,032 to 193,020 KiB post-GC;
+process peak 205,760 KiB, 2.979 seconds, exit zero; reference healthy).
+Additional gem measurement is not reached. Retain every failed series;
+neither the new passing files nor a local passing lifetime observation
+resolves these resource gates.
+
+A read-only reduction of Rack Sendfile confirms File.new/open, including a
+block-bearing open, accepts a pathname on the reference but rejects it as an
+Integer conversion on both the saved parent and rejected prototype when the
+receiver subclasses File. File itself works. Keep this shared constructor/
+allocator investigation separate; no native gem is required by the reduction.
