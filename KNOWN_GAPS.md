@@ -4596,3 +4596,12 @@ the receiver undefines the source name. The focused original files retain
 525 MATCH / 1 RED / 1 BOTH. Hosted Linux has a separate unresolved
 TestModule#test_module_clone_memory_leak RSS failure (2.181378x); its
 2x limit remains unchanged and it is not classified as known noise.
+
+
+The Rails issue #129 candidate restores Module's real private notification
+entries when Ruby overrides delegate with super. All seven hooks, their method
+metadata and native-owner/undef boundaries have focused reference comparisons;
+the existing five core test files retain 525/527 MATCH without a per-file drop.
+This branch is based on the Class dispatch candidate and does not include the
+C API, SHA-2, Hash or native-require candidates needed for the separate Rails
+integration replay. Rails application success remains unconfirmed here.

@@ -6108,3 +6108,28 @@ at RSS ratio 2.181378x (71,835,648 to 156,700,672 bytes). This is not an
 established known-noise result; keep the failure, the 2x gate and the full
 series. A single-job rerun request was rejected by GitHub (cannot be rerun).
 The next source head must pass the unchanged gate before merge.
+
+
+### Rails notification delegation: real private Module entries (issue #129)
+
+ActiveModel extends its module with an `included` override that calls `super`.
+The missing native ancestor entry previously sent that call to the module's
+unrelated instance `method_missing`, failing on `respond_to_without_attributes?`.
+Resolve the seven Module notification methods at their actual Module boundary.
+Their native body accepts one argument, ignores the block and returns nil,
+matching `rb_obj_dummy1` in Ruby's object.c. Ruby replacements and intervening
+undef entries keep precedence; a native entry does not reappear below its owner.
+
+The same remaining-chain query now serves dispatch, `defined?(super)` and
+bound/unbound `super_method`. Native aliases and saved Method objects retain
+their entry. The prelude marks these existing methods private; arity, parameters
+and `respond_to?` reflect the actual native definition and Ruby visibility.
+No API inventory, VM, collector, C API or resource limit changes are required.
+
+Corpus 723 covers the ActiveModel-shaped failure, all seven entries, private
+calls, arity, bound/unbound super, saved methods, alias/undef and owner replacement.
+The original Class/Method/Module/Refinement/Super files retain 525 MATCH, 1 RED
+and 1 BOTH across 527 cases, including 195/195 Module matches. Nine RSS checks
+pass and generated C needs 155/1024 bracket levels. Full corpus and a separate
+fresh-home Rails composition are recorded after completion; the small witness
+does not establish that Rails boots or its application tests pass.
