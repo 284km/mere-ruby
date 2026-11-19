@@ -26,8 +26,11 @@ changing the input, arguments, return value or upstream ten-second timeout.
 Only the random upstream PID/time/hex tokens are normalized when comparing
 input hashes; raw input and logs remain intact.
 
-All six measurements retain their raw logs, exit/limit state, case transcript,
-source/binary hashes and actual statuses. They must complete with no failures,
+All six measurements retain their raw logs, exit/limit state, case dictionaries,
+source/binary hashes and actual statuses. Each main/candidate dictionary must
+match the reference within its mode; missing/extra cases and differing verdicts
+are recorded and fail acceptance even when aggregate counts agree. They must
+complete with no failures,
 errors or skips: 195 tests / 1,240 assertions for each full file, and one test /
 three assertions for each selected case. Missing child measurements, different
 canonical inputs, or a ratio not strictly below 2.0 fail the comparison. Each
@@ -39,3 +42,9 @@ An original selected case is diagnostic evidence, not a substitute for the full
 file. A successful local observation does not waive a hosted failure, establish
 its root cause, or prove a memory repair. The unrelated Method-copy control and
 GC/allocator release policy are unchanged.
+
+`python3 tools/module_rss_compare_check.py -v` replays captured reference
+transcripts through the real CLI parser and acceptance path. Its controls
+substitute a case identity while retaining COMPLETE state and all aggregate
+counts, in both full-file and selected-case modes. Source/build checks and
+process execution are fixtures; these replays are not runtime measurements.

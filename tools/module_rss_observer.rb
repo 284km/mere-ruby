@@ -9,7 +9,7 @@ module ModuleRssParentObserver
     end
     result = super(*args, **options, &block)
     if selected
-      STDERR.puts 'MODULE_RSS_OBSERVER_BEGIN'
+      STDERR.puts "\nMODULE_RSS_OBSERVER_BEGIN"
       STDERR.write result[1] if result[1]
       STDERR.puts 'MODULE_RSS_OBSERVER_END'
     end

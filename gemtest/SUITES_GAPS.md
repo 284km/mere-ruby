@@ -1,5 +1,16 @@
 # Upstream gem suite differences
 
+The locked same-runner Linux Module comparison completes all three original
+195-test / 1,240-assertion files. Actual dictionaries were independently
+compared after review found a coverage-identity hole in the old collector.
+The new acceptance rejects missing/extra cases or differing verdicts at equal
+counts. Selected-case RSS observations are 1.492139x main / 1.575806x PR;
+these do not waive older failures or identify a memory repair. The parent
+observer's marker now starts on a new line to preserve the real case name.
+See `module_rss_review_r53.json` for the original logs' hashes and PR audit,
+including unresolved Method-copy and Module clone RSS assertions. Existing
+baselines, workloads and resource bounds are unchanged.
+
 The hosted Module complemented-entry check is under a separate controlled
 comparison. PR #90 fails its RSS assertion at 2.407109x; current main fails
 the same case by the original ten-second timeout. Independent O2 builds

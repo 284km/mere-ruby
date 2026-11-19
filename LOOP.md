@@ -6213,3 +6213,42 @@ changed. No gem sweep or memory repair is claimed. Keep the hosted failures,
 source/binary/log hashes and both controlled pairs in
 gemtest/module_rss_pr90_r50.json. The separate Method-copy investigation is
 not evidence for this test's cause.
+
+## 2026-11-20: reject replaced case identities in the Module comparison
+
+Review P2 correctly found that equal aggregate counts could hide a missing
+original case and an extra replacement. Persist every parsed case dictionary
+and compare main/PR with the reference separately for each mode. Record
+missing/extra identities and differing verdicts; any difference rejects the
+measurement even with unchanged COMPLETE state and summary counts.
+
+Three CLI replay controls use captured successful reference transcripts,
+real parsing and acceptance, with only source/build preflight and execution
+as fixtures. The unchanged replay passes; replacing a case identity at equal
+counts fails in both complete-file and selected-case modes. Both negative
+controls reproduce the old CLI's erroneous acceptance. These are harness
+controls, not new interpreter/resource measurements. Run them in the separate
+comparison job before building. Also start the parent observer on a new line:
+its old marker joined the unfinished progress line and polluted the parsed
+selected-case name. Real reference/PR selected tests each retain one test /
+three assertions and the exact original identity. Their child input matches
+the original captured program except its upstream nonce.
+
+The earlier Linux pair has completed. Independently reparse all six raw logs
+and compare actual dictionaries before using its old collector's success.
+All complete files give 195 tests / 1,240 assertions, no failures/errors/skips,
+and identical case dictionaries. Observed selected RSS is 1.492139x main,
+1.575806x PR, 1.227229x reference. Preserve the old marker-suffixed selected
+labels in the historical record rather than rewriting the original logs.
+This passing pair does not explain or waive earlier hosted failures.
+
+Audit all 33 open PRs. The other owned branches have no unresolved review
+threads, but failed resource assertions remain: Method-copy on #110/#119/
+#131/#136 at 2.024243x / 2.213793x / 2.125194x / 2.084157x, and Module clone
+RSS on #114/#118 at 2.105955x / 2.234604x. Do not assume clone RSS is noise.
+The documented complemented-entry timeouts on #110/#136 were requested for
+job rerun; GitHub rejects each with HTTP 403 while the workflow is unfinished.
+Keep those retries pending. Other sessions' branches and PRs are untouched.
+Full audit, actual Linux logs' hashes, preserved failures and replay evidence
+are in gemtest/module_rss_review_r53.json. Workloads, limits, old snapshots,
+source locks and interpreter/GC/VM/AST/C API implementations are unchanged.

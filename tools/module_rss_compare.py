@@ -51,6 +51,14 @@ def canonical_input(source):
     return canonical
 
 
+def case_differences(reference, actual):
+    return dict(missing=sorted(reference.keys() - actual.keys()),
+                extra=sorted(actual.keys() - reference.keys()),
+                different={name: dict(reference=reference[name], actual=actual[name])
+                           for name in sorted(reference.keys() & actual.keys())
+                           if reference[name] != actual[name]})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('baseline', 'candidate', 'reference', 'ruby-src', 'compiler-root', 'output'):
@@ -82,6 +90,7 @@ def main():
     failed = False
     observed_inputs = []
     for mode in ('complete_file', 'observed_original_case'):
+        reference_cases = None
         for label, binary in sides:
             key = mode + '-' + label
             directory = args.output / key
@@ -110,9 +119,14 @@ def main():
             statuses, ratio = child_observation(log.read_text(errors='replace'))
             value = dict(execution=execution, state=parsed['state'], summary=parsed['summary'],
                          discovered=parsed['discovered'], issues=parsed['issues'],
+                         cases=parsed['cases'],
                          binary_sha256=ci.digest(binary), raw_sha256=ci.digest(log),
                          observed_child_status=statuses, observed_child_rss_ratio=ratio,
                          parent_observer_only=observed)
+            if label == 'reference':
+                reference_cases = parsed['cases']
+            differences = case_differences(reference_cases, parsed['cases'])
+            value['case_differences_from_reference'] = differences
             if label != 'reference':
                 value['binary_source_ref'] = BASE_REF if label == 'main' else CANDIDATE_REF
             child = directory / 'original_child_input.rb'
@@ -123,6 +137,7 @@ def main():
                 observed_inputs.append(value['canonical_child_input_sha256'])
             expected_tests, expected_assertions = (1, 3) if observed else (195, 1240)
             passed = (execution['exit'] == 0 and execution['limit'] is None
+                      and not any(differences.values())
                       and parsed['state'] == 'COMPLETE' and not parsed['issues']
                       and parsed['discovered'] == expected_tests
                       and parsed['summary'] == dict(tests=expected_tests, assertions=expected_assertions,
