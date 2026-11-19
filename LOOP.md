@@ -7109,3 +7109,45 @@ Leave VM/GC/allocator internals to their sessions and retain the failed 2x
 gate. Full samples, hashes and CI-only branch updates are recorded in
 gemtest/suites_ci_lifetime_r43.json. No new gem sweep is claimed here; the
 previous 129-file 120-MATCH/8-RED/1-MEMORY observation remains unchanged.
+
+## 2026-11-19: distinguish current method metadata from retired native arenas
+
+Investigate retained storage rather than the rejected receiver-elision
+candidate's transient allocation. Independent first-batch and full-program
+diagnostics show default-region allocation growing by only 340,352 bytes,
+while current method storage can grow from 4,240,408 to 33,602,136 bytes.
+Logical method counts stay near their post-GC baseline. Add eleven actual
+metadata byte counters to the existing optional store_stats output; it only
+reads stores and changes no roots or collection policy. Diagnostic output
+does not establish a repair: the unchanged ordinary paired control is
+1.079818x on the reference and 1.804522x on this macOS observation, but a
+separate full-program logged diagnostic reaches 2.163428x. Preserve both.
+
+The pinned compiler's map_bytes counts a map's current private arena, not
+older generations on the native retired list. The named kept-region counter
+does not count those retired generations either. A separate read-only native
+exit observer finds 8 retired arenas / 17,227,776 capacity bytes after the
+first batch, 16 / 153,240,752 after 19 total batches, and 16 / 95,605,176 after
+21. These independent process observations establish retained old arenas;
+capacity is not RSS, and exit time is not necessarily the largest RSS sample.
+Which pins are live versus conservative stale words remains unproven.
+
+tools/method_copy_retention.py records seven independent prefixes with the
+existing 600-second/2-GiB bounds, source/executable/log hashes, real store
+bytes and GC/RSS timelines. Only its last case is the unchanged original
+program. It is explicitly diagnostic and never replaces the original 2x
+assertion, warmup, workload or baseline. The native observer is excluded from
+the ordinary build and marked DIAGNOSTIC O2 observer; the ordinary gate
+correctly refuses it. All seven real executions complete, their raw logs
+reparse with the final parser, ordinary stdout/exit are preserved, and actual
+bracket depth is 933/1024 on the pinned compiler. No top-level Mere binding,
+GC/VM/AST/C API implementation or allocator policy changed.
+
+The next repair belongs to the GC/native allocator lifetime session: identify
+the actual pinners and retirement epochs, and inspect method-store compaction
+that updates its floor even if the native operation declined under a pin.
+That is an inspection target, not a confirmed fix. Freeing an arena while a
+real borrowed pointer survives would be unsafe. Preserve the assigned boundary
+against GC internals. Full observations are in
+gemtest/method_copy_retention_r46.json; the earlier hosted 2.224702x assertion
+and every existing-file merge gate remain open. No new gem sweep is claimed.
