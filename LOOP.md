@@ -6964,3 +6964,54 @@ constructor gap also agrees on parent and rejected prototype, remaining a
 shared construction/allocator coordination item. No resource cause or fix
 is claimed. Full hosted CI, all existing-file comparisons and P1/P2 resolution
 remain merge gates; the new jobs do not waive any failed existing job.
+
+
+## Gem suites, rounds 35–37: pin delegation and URI original tests
+
+Add Forwardable 1.4.0 (0257b590), Delegate 0.7.0 (a5f35f35) and URI 1.1.2
+(e69a74a2), each pinned to its release commit and complete tree in
+suites_delegation_uri.lock.json. All twelve original test files are MATCH
+on macOS and network-disabled Linux/aarch64: 158 tests / 3229 assertions,
+without failures, errors or skips. Source gemspecs have neither extensions
+nor runtime dependencies. Reuse the existing three pinned Test::Unit packages;
+source audits verify each actual library. A separate two-OS workflow and
+lock-based cache retain the same 600-second / 2-GiB bounds. Existing job
+settings, locks, runtime sources and corpus are unchanged.
+
+Preserve the complete earlier preflight lock and 9 MATCH / 1 RED / 2 BOTH
+observation. Forwardable 1.3.3 expects obsolete message quoting, while URI
+1.0.3 calls Ractor#take, absent on reference Ruby 4.0.9. Newer release tests
+handle these API changes; no upstream test is edited or omitted. Delegate
+0.4.0 has a separate Mere-only keyword-forwarding error through a
+ruby2_keywords Proc used by define_method. Delegate 0.7.0 generates explicit
+`...` forwarding methods and its full original file passes. This is support
+for that release, not an interpreter repair of the old Proc path. The old
+RED and both reference failures remain visible, outside accepted baselines.
+
+The inventory now contains 13 gems / 129 files. This round measures the new
+twelve separately from the preceding 117-file observation; it does not
+present their mixed-date totals as a new complete sweep. The unchanged
+parent runtime c0b06cc7 (Mac O2 binary 8057a658) passes all 731 corpus files
+with both hash modes under the existing aggregate wrapper. The final record
+stores its exact execution. Ten harness controls, YAML syntax, source guards
+and bracket 933/1024 pass; top-level lets remain main 136 / state 1167.
+No VM, AST, C API, collector, shared dispatcher or API-inventory edits.
+
+Parent #119's real small-suite CI run 44451114499 succeeds on both OSes,
+with both files MATCH. Merge source 1c526613 and head 108e8b0e have the
+same tree 8792dba0. Adopt the actual hosted per-OS observations after ordinary
+strict comparisons, preserving both earlier local snapshots. Its additional
+Linux run 44451114073 passes the unchanged lifetime check at 1.996285x.
+Its binary SHA256 is exactly the same fbbd0199 as #118's 2.269969x failure,
+and the check digest matches. These are separate hosted runs, not a same-window
+comparison or a resource fix; retain every RSS series and all strict gates.
+
+The same parent's build-linux job 135315000164 fails only the known-noise
+Module complemented-entry memory-leak case (195 tests; 1 failure; ratio
+2.371912; outer execution 28.730 seconds, no resource-limit event). A rerun
+of that individual job was requested under unchanged bounds. GitHub returns HTTP 403
+because the containing workflow is still running, so the rerun is not accepted.
+Keep the failure and retry pending; do not report it as green or waive it.
+Complete hosted CI, all existing-file comparisons and P1/P2 resolution still
+control merging. The previous stronger 54-MATCH original macOS baseline
+and failed multipart observations remain unchanged.
