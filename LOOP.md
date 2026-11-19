@@ -6117,3 +6117,21 @@ OpenSSL provider returns the same hash quickly. The package probe now
 requires RubyGems explicitly as well as rubygems/package, so its metadata
 read has the real runtime loaded. Any native-provider acceleration is a
 separate library change; this PR still changes no runtime function.
+
+
+### Rails intake: all frozen dependencies install on the provider composition
+
+Provider composition 153e64f5 (unmerged #95 and #120's library code)
+installs all 68 gems in a fresh own home at 284.529 s / 874,928 KiB, with no
+limit event. Reference installation is 169.866 s / 1,724,144 KiB, and its
+six stages pass. The same 600 s / 2 GiB bounds and 69 archive checksums
+remain. This is a distinct candidate result, not a main compatibility pass.
+
+The next actual migration exits 1 in 2.070 s / 198,064 KiB before the DB
+is migrated. Rails::Command's Ruby subclasses registry stays empty while
+its class names and namespace are correct. The five-line module registry
+probe reproduces the native Class#subclasses precedence error on main too;
+method owner reflection already reports the real Ruby definition. Issue
+#121 hands this invoke_val_c0 coordination item to the shared dispatch
+work. No framework code is patched and no registry is externally filled.
+The three remaining app stages stay NOT_RUN in provider_candidate.json.

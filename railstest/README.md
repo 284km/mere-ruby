@@ -123,3 +123,25 @@ existing Digest SHA-2 implementation still evaluates its algorithm in Ruby.
 The measured 4,387,328-byte archive exposes a checksum bottleneck before
 Nokogiri's installation message. The independent SHA-2 implementation work
 is separate from this measurement-only PR.
+
+## Provider candidate and command registration
+
+`provider_candidate.json` records the separate runtime composition at
+153e64f5: unmerged C API #95 plus the SHA-2 provider implementation in #120.
+Its exact source is retained on the explicitly validation-only
+`rails-capi-probe-r1` branch. It is not main and is not a release candidate.
+
+All six reference stages pass. Mere installs Bundler and all 68 frozen gems
+in 284.529 seconds / 874,928 KiB, without a resource-limit event. The next
+migration stage exits 1 before database migration: the command registry is
+empty, so Rails::Command.invoke_rake calls perform on nil. Boot, application
+tests and HTTP remain NOT_RUN. The earlier main and C API-only failures are
+retained rather than replaced by this result.
+
+`probes/subclasses_registry.rb` reduces the error to an ordinary Ruby module
+singleton method, without Rails. `probes/command_registry.rb` inspects the
+actual command names/namespace/registry in the installed app directory with
+that side's environment. It does not populate the registry or change Rails.
+[Issue #121](https://github.com/284km/mere-ruby/issues/121) tracks the shared
+Ruby method-dispatch correction. The native invoke_val_c0 arm is outside
+this measurement/library work's independent scope.
