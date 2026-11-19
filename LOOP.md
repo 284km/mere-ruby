@@ -7084,6 +7084,11 @@ container: working dependencies avoid the installer, installer failure is
 propagated, and a successful installer cannot hide unusable headers. A
 separate small Linux job runs these controls without extending test jobs.
 
+The new hosted control job also passes all three tests on Ubuntu image
+20261111.370.1 in 3.375 seconds. Preserve that image version separately from
+the earlier APT failures on 20261111.127.1; it does not waive their observations
+or imply that the remaining hosted test jobs have completed.
+
 Tool summaries previously ran through upstream cancellation because their
 job and collect step used always(). They then failed on zero artifacts.
 The summary now requires a non-canceled workflow and a successful or failed
