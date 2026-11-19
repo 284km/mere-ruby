@@ -6077,8 +6077,8 @@ On main 3b05689f with its pinned Mere 01f5ad73, normal O2: original Class
 525 MATCH / 1 RED / 1 BOTH). No focused file is below successful main
 12ca1df2; Module's additional observation is not attributed to this patch.
 Reference and mere-ruby each build their own unchanged -test-/class source.
-The existing Method compaction skip remains visible. Corpus 705/705 matches
-with indexing ON/OFF, including 717/718's native/override/alias/visibility/
+The existing Method compaction skip remains visible. Corpus 706/706 matches
+with indexing ON/OFF, including 717/718/720's native/override/alias/visibility/
 super/owner-boundary controls. All nine RSS controls pass. Actual generated
 C bracket depth is 155/1024 with main's newer compiler; that depth change
 from older measurements is not a result of this dispatch correction.
@@ -6087,8 +6087,24 @@ A separate saved-gem diagnostic registers and finds the actual unchanged
 Rails RakeCommand identically on both runtimes: reference 0.661 s / 26,736
 KiB, candidate 1.575 s / 177,776 KiB, both exit 0 without a resource event.
 It does not repeat dependency installation or establish a Rails app pass.
-A fresh original-CLI paired run is being measured separately on an own
-validation-only composition with unmerged #95 and bounded SHA-2 #120.
+A fresh original-CLI paired run on validation-only source 5d1a0c95 with
+unmerged #95 and bounded SHA-2 #120 installs all 68 gems (231.607 s /
+946,832 KiB), then migration fails at the real ActiveSupport OrderedOptions
+setter (3.238 s / 305,664 KiB). Reference passes all six stages. The three
+following candidate stages remain NOT_RUN; no resource limit event occurs.
 Hash subclass missing hooks (#123) remain a separate coordination item.
 Generic stale alias origins after redefinition (#124) also reproduce on
 unchanged main; no generic alias metadata repair is claimed here.
+
+Review follow-up: share the remaining native-boundary query between actual
+super, defined?(super), Method#super_method and UnboundMethod#super_method.
+The zero-argument native Method also survives a later undef of its source.
+Corpus 720 covers guarded super, native owner/binding, a preceding undef
+and a Ruby replacement of Class itself. The same five original files retain
+525 MATCH / 1 RED / 1 BOTH after this correction. No test is removed.
+
+Hosted Linux run 44474019351 fails TestModule#test_module_clone_memory_leak
+at RSS ratio 2.181378x (71,835,648 to 156,700,672 bytes). This is not an
+established known-noise result; keep the failure, the 2x gate and the full
+series. A single-job rerun request was rejected by GitHub (cannot be rerun).
+The next source head must pass the unchanged gate before merge.

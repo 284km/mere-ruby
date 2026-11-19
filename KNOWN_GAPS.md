@@ -4578,12 +4578,21 @@ over native Class enumeration. Native aliases/retained Methods and super
 retain their actual entry; Ruby lookup and reported ownership stop at the
 native Class boundary. The actual unchanged Rails RakeCommand registers
 and is found in an independent saved-gem diagnostic. This does not establish
-successful migration, full boot, app tests or HTTP. The original cold CLI
-needs replay on the integration candidate; Hash subclass missing hooks
-(#123) remain outside this Class-only correction.
+successful migration, full boot, app tests or HTTP. A fresh locked cold
+replay on a validation-only composition installs all 68 dependencies and
+passes command registration, then fails migration on the actual
+ActiveSupport OrderedOptions setter (#123). Boot/tests/HTTP remain NOT_RUN.
+Hash missing hooks remain outside this Class-only correction.
 
 Redefining a generic Ruby method after aliasing it away and back can retain
 its old alias source name for super (#124). That smaller non-Class-native
 case already fails on unchanged main and the gem candidate. The separate
 Class replacement witnesses isolate mutations in fresh processes; no
 existing test is omitted and no generic metadata repair is claimed here.
+
+The subclasses native boundary is also used by defined?(super) and bound/
+unbound Method#super_method. Saved native Methods remain callable after
+the receiver undefines the source name. The focused original files retain
+525 MATCH / 1 RED / 1 BOTH. Hosted Linux has a separate unresolved
+TestModule#test_module_clone_memory_leak RSS failure (2.181378x); its
+2x limit remains unchanged and it is not classified as known noise.

@@ -78,10 +78,15 @@ end
 refusal { PrivateRegistry.subclasses }
 p PrivateRegistry.send(:subclasses)
 class UndefRegistry; end
+class UndefRegistryChild < UndefRegistry; end
+saved_undefined = UndefRegistry.method(:subclasses)
 class << UndefRegistry
   undef_method :subclasses
 end
 refusal { UndefRegistry.subclasses }
+p direct_names(saved_undefined.call)
+p direct_names(saved_undefined.call { raise "saved native yielded after undef" })
+p direct_names(unbound.bind_call(UndefRegistry))
 module OrdinaryModule; end
 p OrdinaryModule.respond_to?(:subclasses)
 refusal { OrdinaryModule.subclasses }
