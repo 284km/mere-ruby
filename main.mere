@@ -9504,6 +9504,22 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
   // (...and when that block came from a proc, `&pr`, it is that proc:
   //  blk_amp_src, which the Proc call noted for this binding alone)
   let src9 = (if map_len blk_amp_src > 0 then (let s9 = map_get blk_amp_src "v" in let _ = map_delete blk_amp_src "v" in s9) else 0 - 1) in
+  // One ordinary positional local and one value require no destructuring,
+  // keyword/default/rest walks or temporary parameter lists. Keep the same
+  // surrounding block frame, roots, observers and flow handling.
+  if not is_lam && not kwp && (match bdefaults with Nil -> true | _ -> false)
+     && (match argvals0 with Cons (_, Nil) -> true | _ -> false)
+     && (match params0 with
+         | Cons (p9, Nil) -> str_len p9 > 0 && not (is_for_params params0)
+                            && not (str_eq (char_at p9 0) "*" || str_eq (char_at p9 0) "&"
+                                    || str_eq (char_at p9 0) ";" || str_eq (char_at p9 0) "("
+                                    || str_eq (char_at p9 0) "~")
+                            && not (str_eq (char_at p9 (str_len p9 - 1)) ":")
+         | _ -> false)
+  then (match (params0, argvals0) with
+        | (Cons (p9, Nil), Cons (v9, Nil)) -> map_set cenv p9 v9
+        | _ -> ())
+  else
   let params = strip_block_params params0 in
   let _ = (let b = block_param_name params0 in
            if str_eq b "" then ()
@@ -47114,7 +47130,29 @@ and main_sng_has = fn world -> fn (name: str) ->
 // a call with a receiver, its receiver and arguments values already: what the
 // EMethod arm does past its written-receiver forms (vis: not self -- a
 // receiver written other than `self`, which may not reach a private method)
+and native_array_query = fn world -> fn (recv: Val) -> fn (name: str) -> fn (vis: bool) ->
+  // With no prepend, subclass, singleton or Ruby override, Array itself is
+  // the native owner. Lower ancestors cannot change this entry's visibility.
+  let key9 = "Array#" ++ name in
+  vec_get moved_on 0 == 0 && vec_get core_only 0 == 0 && map_len ractor_thr == 0
+  && map_len trace_fn == 0 && not (map_has hook_flags "tp" || map_has hook_flags "stf")
+  && map_len ref_active == 0 && map_len bi_skip == 0 && map_len bm_bypass == 0
+  && not (map_has undef_names name || map_has builtin_alias key9)
+  && not (map_has prepends "Array")
+  && not (map_len hng_store > 0 && map_has hng_store (hng_key recv))
+  && not (has_meth world "Array" name)
+  && (not vis || not (map_has privates key9 || map_has protecteds key9))
 and emethod_args = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vis: bool) ->
+  // These native reads cannot invoke Ruby or observe a builtin frame.
+  // Arguments were evaluated already; all observed or altered entries keep
+  // ordinary dispatch, including wrong arity, aliases and singleton methods.
+  if (match recv with VArr _ -> true | _ -> false)
+     && (str_eq name "length" || str_eq name "size" || str_eq name "empty?")
+     && (match args with Nil -> true | _ -> false) && native_array_query world recv name vis
+  then (match recv with VArr id9 ->
+          (if str_eq name "empty?" then VBool (arr_len id9 == 0) else VInt (arr_len id9))
+        | _ -> VNil)
+  else
   let (meths, sup, ocls, ivars) = world in
        let _ = (if vec_get moved_on 0 == 1 then moved_guard world recv name args else VNil) in
        // a mutating call on a frozen String/Array/Hash raises FrozenError
@@ -47746,7 +47784,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
     let rfprev9 = (if ref_on () then ref_enter_meth frame crefv9 else 0 - 1) in
      let vs9 = map_has super_call_pend "v" in
      let _ = (if vs9 then map_delete super_call_pend "v" else ()) in
-     let _ = bind_params_m frame world blk name params defaults args in
+     let _ = bind_params_body frame world blk name params defaults args body in
      let _ = (match blk with (true, _, _, _) -> (if vs9 then () else unused_blk_warn world name "" name params body) | _ -> ()) in
      let _ = (if map_has meth_cfn name then rx_cfunc_frame frame else ()) in
      // (a top-level method is a frame too, so `$~` is scoped to it as well:
@@ -48637,7 +48675,7 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                             let _ = map_set meth_params dk pv in pv)) in
     let vs9 = map_has super_call_pend "v" in
     let _ = (if vs9 then map_delete super_call_pend "v" else ()) in
-    let _ = bind_params_m frame world blk name params defaults args in
+    let _ = bind_params_body frame world blk name params defaults args body in
     let _ = (if share_rest_args then map_set frame "__args" (map_get frame (splat_name params)) else ()) in
     let _ = (match blk with (true, _, _, _) -> (if vs9 then () else unused_blk_warn world dk defcls name params body) | _ -> ()) in
     let _ = (if map_has meth_cfn dk then rx_cfunc_frame frame else ()) in
@@ -57409,6 +57447,30 @@ and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn 
 // bind_params for a METHOD call, with the callee marked as the frame a raise
 // made while binding belongs to (bind_mark_v); the mark before it is put
 // back, since a default value may call another method that binds too.
+// An empty method with no defaults cannot read its named block parameter.
+// Bind the ordinary arguments without manufacturing an unread Ruby Proc.
+// Observers and scheduling keep the full binder, so call/line/return hooks
+// can still inspect the actual block through their Binding.
+and empty_block_binding_body = fn (body: Stmt list) ->
+  match body with
+  | Nil -> true
+  | Cons (SLine n9, rest9) -> n9 >= 0 && empty_block_binding_body rest9
+  | Cons (SLineQ n9, rest9) -> n9 >= 0 && empty_block_binding_body rest9
+  | Cons (SFile _, rest9) -> empty_block_binding_body rest9
+  | Cons (SDeclare _, rest9) -> empty_block_binding_body rest9
+  | Cons (SExpr ENil, rest9) -> empty_block_binding_body rest9
+  | _ -> false
+and bind_params_body = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params: str list) -> fn (defaults: (str * Expr) list) -> fn (args: Val list) -> fn (body: Stmt list) ->
+  let bname9 = block_param_name params in
+  if str_len bname9 > 0 && (match blk with (has9, _, _, _) -> has9)
+     && (match defaults with Nil -> true | _ -> false) && empty_block_binding_body body
+     && map_len trace_fn == 0 && map_len signal_traps == 0 && map_len sig_armed == 0
+     && map_len all_thr <= 1 && map_len ractor_thr == 0 && fb_live () == 0
+     && not (map_has hook_flags "tp" || map_has hook_flags "stf" || map_has fin_on "y")
+     && vec_get cov_st 0 == 0
+  then (let _ = map_set frame bname9 VNil in
+        bind_params_m frame world blk name (strip_block_params params) defaults args)
+  else bind_params_m frame world blk name params defaults args
 and bind_params_m = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params: str list) -> fn (defaults: (str * Expr) list) -> fn (args: Val list) ->
   // Empty binding cannot evaluate Ruby or install parameters. Keep forwarded
   // block and keyword state on the ordinary path, where it is consumed.

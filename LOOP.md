@@ -6684,3 +6684,50 @@ ruby/test_optimization.rb                          89 tests  MATCH   87  RED    
 zlib/test_zlib.rb                                  96 tests  MATCH   96  RED    0  BOTH   0  EXTRA   0
 total: 275 tests, MATCH 271, RED 3, BOTH 1, EXTRA 0
 ```
+
+
+## 2026-11-19: restore the strict GC merge-gate cases
+
+The unchanged Optimization allocation case now passes with four assertions.
+An empty method with no defaults and no observer/scheduler can bind its
+ordinary arguments without creating an unread Proc for its named block
+parameter. TracePoint, set_trace_func, defaults, threads/fibers, signals and
+finalizers retain the full binder. Local-declaration markers are metadata,
+not reads of the block. Real none/unused/used T_DATA deltas remain 0/0/1;
+the used Proc is still present in ObjectSpace.
+
+The unchanged Enumerable case now completes in 7.919 seconds with all three
+assertions under its original ten-second child bound. Native Array length,
+size and empty? reads avoid general dispatch only after proving the actual
+plain Array entry, its visibility and absence of observers, overrides,
+aliases, undef, prepends and refinements. A block with one ordinary positional
+formal and one value binds that same value directly, after consuming the
+source-Proc state; the surrounding frame, GC roots and flow handling stay.
+No objects are filtered out of enumeration and no collection is forced.
+
+The complete Enumerable file improves from 88 MATCH / 1 RED / 1 BOTH to
+89 MATCH / 0 RED / 1 BOTH across 90 cases, without losing any previously
+passing case. The original Module contract completes all 195 tests / 1,240
+assertions with zero failures/errors/skips (22.935 seconds / 359,296 KiB
+outer peak, unchanged 600-second / 2-GiB bounds). This local pass does not
+erase the earlier Linux clone RSS failure; the new hosted job must pass it.
+
+Corpus 725/726/727 cover actual Proc counts and binding observation, native
+Array read dispatch, and one-value block identity/arity/defaults/closures/
+bindings/keywords/flow. All three match Ruby with the hash index enabled or
+disabled and with MRO caching disabled. Existing native Array singleton-undef
+and private-call gaps produce identical failures on the preceding binary;
+their separate diagnostics are retained, no new exclusion is added, and the
+corresponding existing tests remain enabled. The native-undef gem work owns
+that independent behavior; it is not claimed fixed by this read path.
+
+Touched runtime functions: call_method, run_meth_result and bind_block_params,
+plus emethod_args; new and-helpers bind_params_body, empty_block_binding_body
+and native_array_query. The concurrently changed bind_params implementation
+is left alone. No m_state, VM/ISeq, AST/Prism, C API, API inventory, collector
+mark/sweep body or resource limit changes. The original 159-row intake and
+its 12 honest matches, 57 symmetric exclusions and 88 handoffs (plus two main
+fixes) retain their denominator. These extra merge-gate repairs are separate.
+
+Broader paired-file, complete corpus and hosted per-file validation remain
+in progress. All 76 upstream allocation comparisons stay enabled.
