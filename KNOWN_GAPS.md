@@ -4654,3 +4654,33 @@ attribute, source patch or forced older gem conceals it. Explicitly loading
 the own native libraries after the failed facade is a separate diagnostic
 whose sorting/parsing output matches; it is not used by the original run.
 Full Rails component suites remain unmeasured, and no Rails app pass is claimed.
+
+
+## Native-selection candidate reaches Module's included super
+
+native_candidate.json preserves the next fresh original-CLI paired run on
+validation-only source 61d01f6d, including native selection #128. Each runtime
+again installs from the same lock into an empty home and builds its own
+extensions. All six reference stages pass, including six tests / 31 assertions
+and real Puma HTTP. Mere installs all 68 dependencies in 232.699 seconds /
+954,624 KiB and passes the previous registry, Hash and JSON boundaries.
+
+Migration then exits 1 in 4.097 seconds / 318,224 KiB at ActiveModel's
+respond_to_without_attributes? on its AttributeMethods module. Boot/tests/
+HTTP remain NOT_RUN; there is no resource event. The original app, lock and
+600-second / 2-GiB bounds are unchanged, and earlier records are retained.
+
+An independent TracePoint diagnostic identifies the original missing call
+as included. probes/module_native_hook.rb reduces it without gems: a Ruby
+included override's super misses Module's native default and calls an
+unrelated instance method_missing on the module itself. Reference returns
+the real nil result. The same failure occurs on the Hash parent, so it is
+not claimed as introduced by the native-file correction. Issue #129 hands
+this ordinary native-super/notification boundary to the generic dispatch
+work. No Rails alias or notification return is fabricated to conceal it.
+
+The preceding JSON probe now matches using normal require, with no native
+preload workaround. Original require/autoload/Marshal counts and all 733
+native-branch corpus files match their stated comparisons; existing C API
+contracts hold normally/under stress and all six fault controls fail. These
+do not establish a Rails application or framework-suite pass.
