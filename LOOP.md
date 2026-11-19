@@ -6130,6 +6130,27 @@ Corpus 723 covers the ActiveModel-shaped failure, all seven entries, private
 calls, arity, bound/unbound super, saved methods, alias/undef and owner replacement.
 The original Class/Method/Module/Refinement/Super files retain 525 MATCH, 1 RED
 and 1 BOTH across 527 cases, including 195/195 Module matches. Nine RSS checks
-pass and generated C needs 155/1024 bracket levels. Full corpus and a separate
-fresh-home Rails composition are recorded after completion; the small witness
-does not establish that Rails boots or its application tests pass.
+pass and generated C needs 155/1024 bracket levels. The complete corpus now matches
+Ruby for 707/707 programs with the hash index ON and OFF. The separate fresh-home Rails
+composition passes this boundary and reaches the next syntax blocker; it does
+not establish that Rails boots or its application tests pass.
+
+
+Saved native dispatch is covered by corpus 723. A separate pre-existing generic
+limitation remains: after replacing an owner's entry with Ruby code, a saved
+native Method/UnboundMethod can report the new definition's arity/parameters.
+This also reproduces with Array#length on the parent and is distinct from the
+stale alias-origin reproduction in issue #124. It is recorded separately and
+does not establish another Rails boot blocker.
+
+
+The fresh-home Rails replay with the independent runtime candidates now passes
+this notification failure. Validation-only source b9056808 installs all 68
+locked dependency gems in 210.753 seconds / 862,800 KiB. Migration proceeds
+to unchanged ActionController source and exits 1 on an absolute-root dotted
+extend argument (issue #134; 3.999 seconds / 318,752 KiB, no resource event).
+Reference passes all six stages; mere boot/tests/HTTP remain NOT_RUN. The
+record is retained separately in intake #117 as module_candidate.json, with
+the same locks and 600-second / 2-GiB bounds. This is not an application pass.
+The independent saved-native metadata limitation is issue #133, distinct
+from issue #124's alias-origin reproduction.

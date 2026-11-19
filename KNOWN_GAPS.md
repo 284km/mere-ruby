@@ -4605,3 +4605,22 @@ the existing five core test files retain 525/527 MATCH without a per-file drop.
 This branch is based on the Class dispatch candidate and does not include the
 C API, SHA-2, Hash or native-require candidates needed for the separate Rails
 integration replay. Rails application success remains unconfirmed here.
+
+The notification candidate completes 707/707 corpus programs in both hash-index
+modes. Saved native invocation remains distinct from a generic metadata gap:
+a saved Method/UnboundMethod may report a later Ruby replacement's arity and
+parameters. The Array#length control already fails on the parent; the analogous
+Module hook control also fails on unchanged main. This separate snapshot gap
+is not claimed fixed by the notification correction.
+
+
+The fresh-home Rails replay with the independent runtime candidates now passes
+this notification failure. Validation-only source b9056808 installs all 68
+locked dependency gems in 210.753 seconds / 862,800 KiB. Migration proceeds
+to unchanged ActionController source and exits 1 on an absolute-root dotted
+extend argument (issue #134; 3.999 seconds / 318,752 KiB, no resource event).
+Reference passes all six stages; mere boot/tests/HTTP remain NOT_RUN. The
+record is retained separately in intake #117 as module_candidate.json, with
+the same locks and 600-second / 2-GiB bounds. This is not an application pass.
+The independent saved-native metadata limitation is issue #133, distinct
+from issue #124's alias-origin reproduction.
