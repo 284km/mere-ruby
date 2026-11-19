@@ -4624,3 +4624,41 @@ record is retained separately in intake #117 as module_candidate.json, with
 the same locks and 600-second / 2-GiB bounds. This is not an application pass.
 The independent saved-native metadata limitation is issue #133, distinct
 from issue #124's alias-origin reproduction.
+
+
+### Notification Method review corrections
+
+The two review reproductions exposed native-entry provenance and
+visibility-only super boundaries. A native Method selected below a Module
+prepend now records the proven native entry directly instead of asking
+has_meth on its owner again; bound/unbound super methods and bindings retain
+that entry and UnboundMethod records its selected owner explicitly. The
+Method-specific query resumes above the actual body represented by a
+visibility-only entry, while retaining an intervening visibility entry as
+an observable Method owner. Native dispatch/defined-super traversal keeps
+its existing semantics.
+
+Corpus 724 covers published native methods, a wrapper before the visibility
+owner, bound/unbound super below a Module prepend, and retained native calls
+after undef. The reference outputs match with normal caches, hash indexing
+disabled and MRO caching disabled. The five original core files again retain
+525 MATCH, 1 RED and 1 BOTH across 527 cases, per-file unchanged.
+
+The separate generic metadata gap #133 also reproduces when capturing a
+native Method before prepending a wrapper: parameters and source_location
+can follow that wrapper. This occurs on unchanged main as well. Native
+invocation and selected owner are fixed here; captured-method metadata after
+lookup mutations is not claimed fixed. The recorded b9056808 Rails replay
+uses the preceding notification implementation c4477641 and remains tied to
+that exact source; it is not relabeled as this reviewed implementation.
+
+
+Final review candidate validation: all **708/708 corpus programs** match Ruby
+with the hash index ON/OFF, including both notification witnesses. The five
+original core files again retain 525 MATCH / 527 cases with no per-file drop;
+all nine RSS checks pass and generated C needs 155/1024 bracket levels. Both
+review reproductions also match with MRO caching disabled, including when
+both the hash index and MRO cache are disabled together. The review correction
+changes only the Method/UnboundMethod super arms of invoke_val_c0 and the two
+new and-helpers module_notification_method_after/module_notification_method_mark.
+Full hosted CI and its per-file comparison remain required before merge.
