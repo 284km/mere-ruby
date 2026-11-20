@@ -4608,3 +4608,11 @@ The rooted-loading review also fixes the shadowed three-segment namespace
 regression: corpus738 verifies the lexical first constant, remaining namespace
 walk, explicit root and autoload on both definition paths. The separate
 module_eval lexical-nesting diagnostic above remains a known failure.
+
+Module review corrections retain original missing dispatch for non-native
+Regexp/notification names and send method_added to the actual Module-subclass
+receiver, including native tracing and undef. Corpus739/740 covers these
+boundaries; no original test was excluded for them. The separate native
+alias predicate diagnostic in unittest/native_alias_method_predicate_probe.rb
+prints true on Ruby and false on both main and this candidate; it remains
+unresolved and is not a passing corpus case.
