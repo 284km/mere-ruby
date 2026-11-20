@@ -4591,3 +4591,16 @@ Scoped class namespace identity does not repair the existing module_eval
 lexical-nesting bug: unittest/scoped_class_lexical_probe.rb returns :missing
 on reference Ruby and :found on both preceding main and this candidate.
 It is an explicit failing diagnostic, not a passing corpus case.
+
+
+## Module subclass factories and native mixin super (2026-11-20)
+
+Corpus 733/734 now matches real Module-subclass define_method closures,
+named visibility, frozen receivers, Ruby overrides, native mixin super
+returns and singleton missing hooks with blocks. The actual ActiveModel
+factory and Concern boundaries advance in an own Rails composition.
+The next unchanged migration failure is credentials-path construction in
+Pathname#initialize. Boot, application tests and HTTP remain NOT_RUN;
+selected ActiveSupport Hash/default/Enumerable, String gsub! super and
+Unicode-lookbehind failures remain unclaimed. No runtime or test resource
+bound, original test, or exclusion changes were made for these fixes.

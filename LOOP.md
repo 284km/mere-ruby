@@ -6254,3 +6254,46 @@ homes make this a warm diagnostic, not a new installation or Rails pass.
 The original selected ActiveSupport files are 513 MATCH / 8 RED out of 521;
 no framework-wide pass is claimed. The pre-existing module_eval lexical
 negative case remains RED and is kept as unittest/scoped_class_lexical_probe.rb.
+
+
+## 2026-11-20: Module subclass method factories and native super before missing hooks
+
+ActiveModel's AcceptsMultiparameterTime is a Module subclass whose initialize
+includes methods, defines a closure and marks its method private. The real
+module backing already existed, but its delegation predicate omitted
+`define_method` and named visibility. Admit those native operations while
+retaining Ruby overrides, the original receiver's freeze check and nil from
+an argument-free private call even on a frozen module. The SVis statement
+with names reaches that same real receiver, preserving overrides.
+
+ActiveSupport::Concern then reached super from append_features on a module
+that also defines an INSTANCE method_missing. super_missing tried that
+instance hook before the real native mixin entry. Try native ancestors first;
+missing dispatch on a class/module belongs to its singleton chain. Native
+append_features/prepend_features/extend_object reuse ordinary native dispatch
+for their actual return, validation, freeze checks and ancestry bookkeeping.
+No new top-level values or collector/state/VM/AST/C API changes.
+
+On main d9826ac9 plus the preceding rooted-loading repair, normal O2:
+**712/712 corpus files** match with the hash index ON and OFF; corpus 733/734
+also matches with normal/hash-off/MRO-off/both-off settings (eight pairs).
+All nine existing loop RSS checks, dead definitions and generated-C depth
+**155/1024** pass. Complete original Module195, Class61, Refinement121,
+Super50, Method97, Parse102, Forwardable27, Autoload27 and Require51 MATCH
+are identical to main. Module retains all 1,240 assertions and zero skips.
+The 10-file first pair discovers 906 cases: main899 MATCH/1 RED/6 BOTH,
+candidate898/2/6, with only README's known invalid-symbol Syntax memory test
+lost. Repeating the WHOLE unchanged Syntax file gives main167/candidate168
+MATCH (two BOTH each); retain both raw pairs, without a new exclusion or a
+larger limit. Every focused file has a candidate run retaining main's MATCH.
+The original 600-second/2-GiB and 10-second leak-child bounds remain intact.
+
+The own Rails validation composition passes the previous two boundaries,
+then migration fails in Pathname#initialize called by Application#encrypted
+for credentials. Reference's four application stages pass; candidate
+migration takes 8.877 seconds/1,011,920 KiB with no resource event, while
+boot/tests/HTTP remain NOT_RUN. This reused-own-gem diagnostic is not a cold
+installation or Rails pass. Hash default reads and other selected original
+ActiveSupport failures remain separate work. The constructor's captured
+Hash default-block behavior is already a separate unmerged prerequisite;
+these Module changes do not claim to supply it.
