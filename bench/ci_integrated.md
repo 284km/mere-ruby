@@ -33,6 +33,10 @@ collector never treats that as execution. Cancelled-before-start and skipped
 jobs also do not acquire invented execution time. Active-job durations are
 marked as elapsed observations. Missing timestamps remain unknown; negative
 intervals and incomplete pagination fail the report with an error artifact.
+An exception is a completed execution carried forward into a later rerun:
+GitHub can create its new record after its original completion. The report
+keeps the raw timestamps and attempt, marks start delay unavailable with
+`execution_precedes_rerun_record`, and retains the real execution duration.
 Run attempts are explicitly pinned, so a later rerun cannot replace the
 current reporter's measurements.
 

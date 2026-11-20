@@ -89,6 +89,36 @@ class TimingCheck(unittest.TestCase):
         with self.assertRaises(ValueError):
             timing.job_timing(job(started_at='2026-11-18T05:00:00Z'), OBSERVED)
 
+    def test_real_carried_forward_rerun_keeps_execution_with_unknown_wait(self):
+        # Run 44239745755, attempt 3: GitHub retained this completed execution
+        # while assigning its record a timestamp from the later rerun.
+        copied = job(id=135178318416, name='unittest-harness', run_attempt=3,
+                     created_at='2026-11-18T22:21:59Z',
+                     started_at='2026-11-18T04:47:30Z',
+                     completed_at='2026-11-18T04:48:12Z')
+        metadata = run(); metadata['run_attempt'] = 3
+        report = timing.summarize(metadata, [copied], OBSERVED)
+        row = report['jobs'][0]
+        self.assertEqual(row['run_attempt'], 3)
+        self.assertEqual(row['created_at'], copied['created_at'])
+        self.assertEqual(row['started_at'], copied['started_at'])
+        self.assertIsNone(row['start_delay_seconds'])
+        self.assertEqual(row['start_delay_unavailable_reason'],
+                         'execution_precedes_rerun_record')
+        self.assertEqual(row['execution_seconds'], 42)
+        self.assertEqual(report['unknown_start_delay_jobs'], 1)
+        self.assertEqual(report['sum_start_delay_seconds'], 0)
+        self.assertTrue(report['measured_jobs_successful'])
+        self.assertIn('Carried-forward executions', timing.markdown(report))
+
+    def test_rerun_does_not_hide_other_invalid_timestamps(self):
+        for changes in (
+            dict(started_at='2026-11-18T05:00:00Z'),
+            dict(started_at='2026-11-18T05:00:00Z', completed_at='2026-11-18T04:59:59Z'),
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                timing.job_timing(job(run_attempt=3, **changes), OBSERVED)
+
     def test_duplicate_jobs_and_mixed_attempts_are_rejected(self):
         with self.assertRaisesRegex(ValueError, 'duplicate'):
             timing.summarize(run(), [job(), job()], OBSERVED)

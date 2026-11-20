@@ -42,6 +42,16 @@ def job_timing(job, observed):
     start = instant(job.get('started_at')) if started else None
     execution_end = end if status == 'completed' else observed
     wait_end = start or (end if status == 'completed' else observed)
+    # Reruns can carry a completed execution forward under a newly created
+    # job record. Its original start/end remain useful, but that record has
+    # no observable queue interval. Require an actual later attempt and a
+    # wholly earlier completed execution; other inverted timestamps still fail.
+    copied_execution = bool(job.get('run_attempt', 1) > 1 and status == 'completed'
+                            and created and start and end and start <= end < created)
+    delay_reason = ('execution_precedes_rerun_record' if copied_execution else
+                    'missing_creation_time' if created is None else None)
+    start_delay = (None if conclusion == 'skipped' or copied_execution
+                   else seconds(created, wait_end))
     steps = []
     for step in job.get('steps', []):
         step_start = instant(step.get('started_at')) if start and step.get('conclusion') != 'skipped' else None
@@ -50,9 +60,10 @@ def job_timing(job, observed):
                           seconds=seconds(step_start, step_end)))
     return dict(id=job['id'], name=job['name'], status=status, conclusion=conclusion,
                 url=job.get('html_url'), labels=job.get('labels', []),
+                run_attempt=job.get('run_attempt'),
                 created_at=job.get('created_at'), started_at=job.get('started_at'),
                 completed_at=job.get('completed_at'), execution_started=bool(start),
-                start_delay_seconds=None if conclusion == 'skipped' else seconds(created, wait_end),
+                start_delay_seconds=start_delay, start_delay_unavailable_reason=delay_reason,
                 execution_seconds=seconds(start, execution_end),
                 execution_complete=bool(start and status == 'completed' and end), steps=steps)
 
@@ -128,6 +139,8 @@ def markdown(report):
              f'all successful/skipped: **{report["measured_jobs_successful"]}**.', '',
              'Start delay is job creation → runner start, including matrix/concurrency '
              'throttling and runner availability. Queued rows show elapsed waiting at observation. '
+             'Carried-forward executions in reruns retain their original execution time, but their '
+             'start delay is unknown when the new record was created after completion. '
              'Created-after-run time includes dependency/planning delay; it is not attributed '
              'solely to dependencies. Execution is runner wall time, including setup and cleanup.', '',
              f'Measured work span: **{duration(report["measured_work_span_seconds"])}** '
