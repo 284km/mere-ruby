@@ -5923,7 +5923,13 @@ Checked against 11 heredoc forms and 20 regexp forms. The follow-up review
 as in read_escape -- `\c\n` is `\x0A`, `\M-\n` is `\x8A`, `\c\x41` is
 `\x01`, an unknown `\q` is `q`; a bare `?` is DEL only right after `\c` /
 `\C-`. rx_read_escape does this over Prism's bytes. Checked against 20 more
-forms on ruby 4.0.9, among them a condition and ones ruby refuses.
+forms on ruby 4.0.9, among them a condition and ones ruby refuses. The
+third (one P2): looking for a split, a control or meta escape is read whole
+-- `\c#@~` is `\x03` and `@~`, no split -- in regx_splits and in
+rx_text_splits, which classifies the condition's warning. Checked against 12
+forms. Not done, and so on main too: AST.parse lets a regexp through that is
+not valid in its encoding (`/a\M-b/`, `/a\xff/` in UTF-8), where ruby
+raises SyntaxError.
 
 Not done: `/(?<y>a)#@~/ =~ x`, where parse.y's DREGX assigns no `y` (the
 scope's table comes from Prism's locals).

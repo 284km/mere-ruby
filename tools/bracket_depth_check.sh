@@ -55,6 +55,10 @@
 # v0.1.450 both cut it). Either way, what matters is the distance to the flag, and to
 # 256, so both are printed.
 #
+# Re-measured 2026-11-18 after Mere flattened top-level initializers: 155,
+# below the ordinary clang limit again. The two seed probes still prove the
+# exact answer; the budget and fallback bisection remain unchanged.
+#
 # Usage:  MERE=/path/to/mere.exe sh tools/bracket_depth_check.sh
 #         BUDGET=... to change the ceiling this fails at (default 1024, the build's flag)
 set -u
@@ -99,7 +103,7 @@ fi
 # property that matters: the fast path can only ever CONFIRM, never conclude.
 # A seed that made the check unable to report a larger value would be a check
 # that can only agree with what it was told.
-SEED="${BRACKET_SEED:-935}"
+SEED="${BRACKET_SEED:-155}"
 sb_bd_fast=0
 if [ "$SEED" -gt 1 ] && [ "$SEED" -le "$BUDGET" ] \
    && "$CC" -O0 -w -fsyntax-only -fbracket-depth="$SEED" "$SRC" 2>/dev/null \

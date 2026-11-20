@@ -61,6 +61,9 @@ p AST.parse('/a\cA#@~\M-\C-b/').children[2].children
   end
 end
 show('if /a\c\n#@~b/ then 1 end')
+# ...and a `#` that is such an escape's operand is no split
+['/a\c#@~/', '/a\C-#@~/', '/a\M-#@~/n', '/a#@~\c#@~/', '/a\c#$~/', '/a\c##@~/',
+ '/a\c\M-#@~/n', 'if /a\c#@~/ then 1 end', 'if /a#@~\c#@~b/ then 1 end'].each { |s| show(s) }
 show('if /a#@~b/ then 1 end')
 show('"a#@~b"')
 # text a heredoc body interrupts is one token
