@@ -4659,3 +4659,12 @@ lookups (corpus742). Both definition paths retain the lexical first constant,
 privacy and autoload behavior. The712-file corpus and original nine-file784-case
 comparison pass without losing a main PASS. The separate module_eval lexical
 negative remains an explicit failing diagnostic; this change does not claim it.
+
+
+The Hash native-read review fixes repeated observable #hash calls using one
+real local search code. Corpus735 retains value/call-count controls for saved
+aliases, super, collisions, changed codes, reentrant reads, empty and identity
+hashes. Both the native custom-key entry and Ruby override precedence are
+covered. The719-file corpus and original twelve-file1,302-case comparison
+retain every main PASS under unchanged limits. This does not claim to fix all
+other Hash operations' hash-call ordering or the remaining Rails boundaries.

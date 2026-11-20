@@ -6461,3 +6461,24 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+
+### Hash review: calculate a native read's search hash once (2026-11-20)
+
+The new native read helper discarded hash_touch's result, then recalculated
+#hash for each candidate through hash_lookup_w. Keep the real search hash in
+the call and reuse it with stored codes; share the post-bucket identity/eql?
+comparison without changing insertion's existing hash evaluation order.
+Identity reads skip the protocol. Ruby [] overrides run before probing keys;
+the native custom-key [] entry uses the same lookup, so super and saved aliases
+both calculate the actual hash once. Reentrant hash/eql? calls use local data.
+
+The first amendment passed the reported alias but its added super control
+found an earlier [] dispatcher bypass. Retain the16/20 failed witness run and
+stop its incomplete original-file comparison; fix that door too, then start
+a new O2 measurement. Runtime4d95d7b7 passes **719/719 corpus** ON/OFF,
+all20 comparisons for525/735-737/742 in four hash/MRO modes, nine existing RSS
+gates, dead definitions and depth155/1024. Complete original twelve-file
+comparison:1,302 cases, both main d9826ac9 and candidate **1,284 MATCH/3 RED/
+15 BOTH**, zero EXTRA, no original PASS or file MATCH lost. Original600-second/
+2-GiB/10-second child limits, bootstrap, exclusions and tests are unchanged.
