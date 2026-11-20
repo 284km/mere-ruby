@@ -7183,3 +7183,43 @@ compiler pins. Existing jobs, source locks, baselines, 600-second/2-GiB limits,
 upstream ten-second child and 2x assertions remain unchanged. This adds
 observability, not a memory repair. See tools/rss_native_probe.md and
 gemtest/native_rss_retention_r59.json for the protocol and measured evidence.
+
+## 2026-11-20: retain the method floor when native compaction is deferred
+
+The native map compactor can return without moving a pinned arena. The
+method-store wrapper nevertheless published that enlarged arena as its new
+floor, delaying later attempts under the existing growth rule. Change only
+m_state.compact_method_store: publish a measurable floor on initialization
+or an observed capacity reduction. Preserve the dirty flag, return value,
+unmeasurable-arena behavior, numeric thresholds and native pin rules. This
+specific collector bookkeeping change was authorized after the investigation;
+no compiler, pinning, marking or collection implementation changes are included.
+
+Fixed-order ordinary O2 parent/candidate/candidate/parent measurements use
+the same compiler 2e3cc433 and byte-identical original Method-copy program.
+Native Linux/aarch64 ratios are 1.900780 / 1.580659 / 1.456400 / 2.426395;
+the last parent observation fails the unchanged 2x gate. Mac ratios are
+1.689337 / 1.385431 / 1.386783 / 1.685873. Candidate initial RSS is comparable
+to the parent, not enlarged to lower the ratio. Complete Module and Refinement
+controls lose no passing cases on either OS. The Mac parent Module run fails
+the known complemented-entry RSS case; the candidate passes all 195 tests /
+1240 assertions. Preserve that failure alongside the passing selected cases.
+
+A separate native diagnostic wraps the original compaction entry exactly once
+and counts requested attempts, real arena moves and floor increases without
+a move. The parent has 9 requests / 4 moves / 4 noninitial invalid floor
+increases; the candidate has 57 requests / 7 moves / 0 such increases.
+Maximum retired capacity drops from 169,203,224 to 93,161,712 bytes in this
+diagnostic. Capacity is not RSS, and the ordinary ratios remain separate.
+The underlying native compactor, pin checks and thresholds are unchanged.
+
+The new x86-64 workflow locks repaired source 90c83c6e and both existing
+compiler pins. Prior hosted failures, including Method-copy at 2.221519x,
+are not waived. Historical clone RSS failures were not reproduced in this
+pair and are not established as repaired. File/side 600 seconds / 2 GiB,
+upstream child ten seconds and original assertions remain unchanged.
+Twelve evidence acceptance checks pass; bracket depth remains 933/1024 and
+top-level lets remain main 136 / state 1167. See
+gemtest/method_store_floor_r60.json for all ordinary pairs and diagnostic
+provenance. The broader corpus and five-gem verification are in progress;
+no baseline snapshot is replaced.

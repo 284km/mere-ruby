@@ -1,9 +1,11 @@
 # Native RSS ownership investigation
 
-`rss-native-retention.yml` builds the exact previously failing runtime
-`dde0f90c` on native Ubuntu x86-64, once for each existing CI compiler pin.
+`rss-native-retention.yml` builds the locked repaired runtime
+`90c83c6e` on native Ubuntu x86-64, once for each existing CI compiler pin.
 The pins, source commit and upstream Ruby commit are fixed in the workflow.
 This is a separate job; existing jobs, bounds and assertions do not change.
+The earlier failing runtime `dde0f90c` remains in the recorded observations;
+`--subject-ref` explicitly locks a different checkout for a paired diagnostic.
 
 Both builds finish before measurement. The ordinary interpreter first runs
 the unchanged complete upstream Module control and paired Method-copy check.
@@ -25,9 +27,13 @@ Only its child emits ownership data.
 
 Each observation records real resident memory, current native map rows,
 physical slots, pin floors and arena capacities, the default arena, the
-cache, retired arena generations,
-and their saved pinner handles and current coroutine states. It never invokes
-collection, compaction, the pin hook, retirement, deallocation or a GC API.
+cache, retired arena generations, and their saved pinner handles and current
+coroutine states. The private emitted copy also wraps the existing
+`compact_method_store` entry: its original body and return value run exactly
+once. Counters distinguish a requested compaction from an actual native arena
+move and from a floor increase without such a move (excluding initialization).
+The observation adds no collection, compaction, pinning, retirement,
+deallocation or GC API operation. Native thresholds and pin rules stay intact.
 Native layouts are private to the locked compiler; a changed observation
 site must fail the build rather than silently omit data.
 
@@ -41,7 +47,24 @@ so its ratios never replace those of the ordinary binary.
 The artifact retains the ordinary results, original child input, raw logs,
 hashes, separate diagnostic build provenance and per-sample ownership.
 Missing or truncated samples fail collection. A completed diagnostic is not
-a memory repair and does not waive any earlier failed hosted observation.
+evidence of a repair and does not waive any earlier failed hosted observation.
+
+The floor repair updates `m_state.compact_method_store` only. A measurable
+arena publishes a new floor on initialization or an observed reduction in
+capacity. A deferred native compaction keeps the previous floor, preventing
+the enlarged, still-uncompacted arena from delaying the next attempt. The
+dirty flag, return contract, numeric thresholds and native pin rules retain
+their existing behavior. Unmeasurable arenas retain their previous behavior.
+
+`gemtest/method_store_floor_r60.json` preserves ordinary fixed-order
+parent/candidate/candidate/parent comparisons with compiler `2e3cc433` on
+macOS/arm64 and native Linux/aarch64. A separate original-program diagnostic
+observed four noninitial floor increases without an arena move before the
+repair and zero afterwards. This establishes the bookkeeping defect; its
+diagnostic RSS ratios do not replace ordinary checks. The new native x86-64
+workflow measures the repaired runtime; the earlier hosted failures remain
+in the historical record. The original Module clone failure has not been
+reproduced in this comparison, so it is not established as repaired.
 
 To build and collect outside CI using separate locked checkouts:
 

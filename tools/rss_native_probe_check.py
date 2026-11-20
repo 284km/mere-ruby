@@ -5,9 +5,10 @@ from pathlib import Path
 import re
 import unittest
 
-from rss_native_probe import native_samples, emit_probe
+from rss_native_probe import native_samples, emit_probe, policy_observed
 
 FIXTURE = json.loads((Path(__file__).parent / 'fixtures/rss_native_sample.json').read_text())
+POLICY = json.loads((Path(__file__).parent / 'fixtures/method_floor_policy.json').read_text())
 
 
 class NativeEvidence(unittest.TestCase):
@@ -55,6 +56,22 @@ class NativeEvidence(unittest.TestCase):
     def test_changed_native_runtime_must_not_omit_hooks(self):
         with self.assertRaises(ValueError):
             emit_probe('int main(void) { return 0; }')
+
+    def test_real_policy_observation_is_accounted(self):
+        samples = native_samples(POLICY['raw_parent_first_sample'])
+        self.assertTrue(policy_observed(samples))
+        self.assertEqual(samples[0]['policy']['calls'], 6)
+        self.assertEqual(samples[0]['policy']['requested'], 2)
+        self.assertEqual(POLICY['parent_final_policy']['raised_without_move'], 4)
+        self.assertEqual(POLICY['candidate_final_policy']['raised_without_move'], 0)
+
+    def test_historical_capture_does_not_establish_new_policy_evidence(self):
+        self.assertFalse(policy_observed(native_samples(FIXTURE['raw_sample'])))
+
+    def test_invalid_policy_accounting_is_rejected(self):
+        raw = POLICY['raw_parent_first_sample'].replace('moved=1 deferred=1', 'moved=9 deferred=1')
+        with self.assertRaises(ValueError):
+            native_samples(raw)
 
 
 if __name__ == '__main__':

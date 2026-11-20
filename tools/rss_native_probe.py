@@ -17,7 +17,7 @@ import ci
 import transcript
 from method_copy_memory_check import PROGRAM
 
-SUBJECT = 'dde0f90cef34cd03f21cb549ad48aafb373d0ad1'
+SUBJECT = '90c83c6e525fbac7c7b9cdf670bd5e6db1ca79a5'
 RUBY = '3e93b23afcec3433f6aecc34b5d832799d754238'
 TEST_SHA = '6b9b0fe714d15e2d08ac9ac6954b5f429754b2507eec2960b9544bc54eb8cdbc'
 PROGRAM_SHA = '9bb9dd80ebc082cdb1c356e415f688598228cf8e075ddfb4ae509f5581ca38a3'
@@ -39,12 +39,41 @@ def emit_probe(source):
         source, count = re.subn(pattern, lambda match: match[1] + hook, source)
         if count != 1:
             raise ValueError('expected one locked native observation site')
-    return ('static void gem_rss_snapshot(const char *phase);\n' + source + '\n'
+    # Preserve the original entry's one call and result. Observe whether the
+    # native arena actually moved, independently of the Ruby-side due flag.
+    wrapper = r'''
+static int mu_compact_method_store__direct(int mu_u) {
+    uintptr_t before = (uintptr_t)mu_meths_g->region;
+    long long floor = mere_vec_int_get(mu_method_store_floor, 0);
+    int due = gem_floor_original_compact_method_store(mu_u);
+    gem_floor_calls++;
+    if (due) {
+        gem_floor_requested++;
+        if (before != (uintptr_t)mu_meths_g->region) gem_floor_moved++;
+        else {
+            gem_floor_deferred++;
+            if (floor > 0 && mere_vec_int_get(mu_method_store_floor, 0) > floor)
+                gem_floor_raised_without_move++;
+        }
+    }
+    return due;
+}
+'''
+    pattern = r'^static int mu_compact_method_store__direct\(int mu_u\) \{\n.*?^\}'
+    source, count = re.subn(pattern, lambda match:
+        match[0].replace('mu_compact_method_store__direct',
+                         'gem_floor_original_compact_method_store', 1) + wrapper,
+        source, flags=re.M | re.S)
+    if count != 1:
+        raise ValueError('expected one locked method compaction entry')
+    counters = ('static _Thread_local unsigned long long gem_floor_calls, gem_floor_requested, '
+                'gem_floor_moved, gem_floor_deferred, gem_floor_raised_without_move;\n')
+    return (counters + 'static void gem_rss_snapshot(const char *phase);\n' + source + '\n'
             + (ROOT / 'tools/rss_native_observer.c').read_text())
 
 
-def build(subject, output):
-    if git(subject, 'rev-parse', 'HEAD') != SUBJECT:
+def build(subject, output, expected_ref=SUBJECT):
+    if git(subject, 'rev-parse', 'HEAD') != expected_ref:
         raise ValueError('the locked subject checkout is required')
     git(subject, 'diff', '--exit-code', 'HEAD', '--', '*.mere', '*.c', '*.h', 'tools', 'unittest', 'lib')
     if (subject / '.build_mode').read_text().strip() != 'O2':
@@ -70,7 +99,7 @@ def build(subject, output):
     if (output / '.build_mode').read_text().strip() != MODE:
         raise ValueError('diagnostic mode marker was lost')
     ci.save(output / 'probe-build.json', dict(
-        diagnostic_only=True, subject_ref=SUBJECT, mode=MODE,
+        diagnostic_only=True, subject_ref=expected_ref, mode=MODE,
         ordinary_binary_sha256=ci.digest(subject / 'mere-ruby'),
         original_c_sha256=ci.digest(generated), probe_c_sha256=ci.digest(output / 'mr.c'),
         binary_sha256=ci.digest(output / 'mere-ruby'),
@@ -101,6 +130,13 @@ def native_samples(raw):
             if 'default' in active:
                 raise ValueError('duplicate native default observation')
             active['default'] = values
+        elif kind == 'RSS_NATIVE_POLICY':
+            if ('policy' in active or values['requested'] > values['calls']
+                    or values['moved'] + values['deferred'] != values['requested']
+                    or values['raised_without_move'] > values['deferred']
+                    or any(value < 0 for value in values.values())):
+                raise ValueError('invalid native compaction accounting')
+            active['policy'] = values
         elif kind == 'RSS_NATIVE_RETIRED':
             active['retired'].append(values)
         elif kind == 'RSS_NATIVE_PIN':
@@ -126,6 +162,11 @@ def native_samples(raw):
     if not samples:
         raise ValueError('missing native ownership observations')
     return samples
+
+
+def policy_observed(samples):
+    return (bool(samples) and all('policy' in sample for sample in samples)
+            and samples[-1]['policy']['calls'] > 0)
 
 
 def environment(binary, directory, reference, source):
@@ -178,7 +219,8 @@ def clone(binary, directory, reference, source, diagnostic):
     diagnostic_complete = (complete and set(statuses) == {'START', 'FINAL'}
         and parsed['summary'] is not None and parsed['summary']['errors'] == 0
         and parsed['summary']['assertions'] in (2, 3)
-        and len([s for s in samples if s['begin']['phase'] in ('status', 'ps')]) >= 2)
+        and len([s for s in samples if s['begin']['phase'] in ('status', 'ps')]) >= 2
+        and policy_observed(samples))
     return dict(execution=execution, summary=parsed['summary'], cases=parsed['cases'],
                 diagnostic_only=diagnostic, passed=passed if not diagnostic else None,
                 diagnostic_complete=diagnostic_complete if diagnostic else None,
@@ -190,7 +232,7 @@ def collect(args):
     subject, probe, reference, source, output = [getattr(args, key).resolve() for key in
                                                ('subject', 'diagnostic_root', 'reference', 'ruby_src', 'output')]
     git(subject, 'diff', '--exit-code', 'HEAD', '--', '*.mere', '*.c', '*.h', 'tools', 'unittest', 'lib')
-    if (git(subject, 'rev-parse', 'HEAD') != SUBJECT or git(source, 'rev-parse', 'HEAD') != RUBY
+    if (git(subject, 'rev-parse', 'HEAD') != args.subject_ref or git(source, 'rev-parse', 'HEAD') != RUBY
             or ci.digest(source / 'test/ruby/test_module.rb') != TEST_SHA
             or hashlib.sha256(PROGRAM.encode()).hexdigest() != PROGRAM_SHA
             or (subject / '.build_mode').read_text().strip() != 'O2'
@@ -199,7 +241,7 @@ def collect(args):
     if not subprocess.check_output([str(reference), '-v'], text=True).startswith('ruby 4.0.9 '):
         raise ValueError('reference Ruby 4.0.9 is required')
     receipt = json.loads((probe / 'probe-build.json').read_text())
-    if (receipt['subject_ref'] != SUBJECT or receipt['mode'] != MODE
+    if (receipt['subject_ref'] != args.subject_ref or receipt['mode'] != MODE
             or receipt['ordinary_binary_sha256'] != ci.digest(subject / 'mere-ruby')
             or receipt['binary_sha256'] != ci.digest(probe / 'mere-ruby')
             or receipt['original_c_sha256'] != ci.digest(subject / 'mr.c')
@@ -211,7 +253,7 @@ def collect(args):
         if git(compiler, 'rev-parse', 'HEAD') != os.environ.get('MERE_REF'):
             raise ValueError('compiler checkout differs from its locked ref')
     output.mkdir(parents=True, exist_ok=False)
-    record = dict(subject_ref=SUBJECT, ruby_ref=RUBY, compiler_ref=os.environ.get('MERE_REF'),
+    record = dict(subject_ref=args.subject_ref, ruby_ref=RUBY, compiler_ref=os.environ.get('MERE_REF'),
                   ordinary_binary_sha256=ci.digest(subject / 'mere-ruby'),
                   diagnostic_build=receipt, reference_binary_sha256=ci.digest(reference),
                   compiler_binary_sha256=ci.digest(compiler / '_build/default/bin/mere.exe') if compiler else None,
@@ -258,7 +300,8 @@ def collect(args):
     rss = [(int(b), int(r)) for b, r in re.findall(r'^RSS (\d+) (\d+)$', raw, re.M)]
     complete = (execution['exit'] == 0 and execution['limit'] is None
                 and [b for b, _ in rss] == list(range(21)) and 'METHOD_COPY_LIFETIME_COMPLETE\n' in raw
-                and len([s for s in samples if s['begin']['phase'] == 'ps']) == 21)
+                and len([s for s in samples if s['begin']['phase'] == 'ps']) == 21
+                and policy_observed(samples))
     record['cases']['diagnostic-method-copy'] = dict(diagnostic_only=True, diagnostic_complete=complete,
         execution=execution, program_sha256=ci.digest(program), samples_kb=rss, native_samples=samples,
         observed_rss_ratio=max(r for _, r in rss[1:]) / rss[0][1] if complete else None,
@@ -277,13 +320,15 @@ def main():
     builder = sub.add_parser('build')
     builder.add_argument('--subject', type=Path, required=True)
     builder.add_argument('--diagnostic-root', type=Path, required=True)
+    builder.add_argument('--subject-ref', default=SUBJECT)
     runner = sub.add_parser('collect')
     for name in ('subject', 'diagnostic-root', 'reference', 'ruby-src', 'output'):
         runner.add_argument('--' + name, type=Path, required=True)
     runner.add_argument('--compiler-root', type=Path)
+    runner.add_argument('--subject-ref', default=SUBJECT)
     args = parser.parse_args()
     if args.operation == 'build':
-        build(args.subject.resolve(), args.diagnostic_root.resolve())
+        build(args.subject.resolve(), args.diagnostic_root.resolve(), args.subject_ref)
         return 0
     return collect(args)
 

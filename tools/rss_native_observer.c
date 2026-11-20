@@ -40,6 +40,11 @@ static void gem_rss_snapshot(const char *phase) {
             index, phase, gem_rss_resident_kb(), (unsigned long)__lang_region_epoch, current, root);
     fprintf(stderr, "RSS_NATIVE_DEFAULT sample=%u capacity=%zu allocated=%zu\n", index,
             gem_rss_capacity(&__lang_default_region), __lang_default_region.alloc_total);
+    fprintf(stderr, "RSS_NATIVE_POLICY sample=%u floor=%lld rows_floor=%lld dirty=%lld calls=%llu requested=%llu moved=%llu deferred=%llu raised_without_move=%llu\n",
+            index, mere_vec_int_get(mu_method_store_floor, 0),
+            mere_vec_int_get(mu_method_store_floor, 1), mere_vec_int_get(mu_method_store_dirty, 0),
+            gem_floor_calls, gem_floor_requested, gem_floor_moved,
+            gem_floor_deferred, gem_floor_raised_without_move);
 #define GEM_RSS_MAP(name) do { \
     if (mu_##name) fprintf(stderr, \
         "RSS_NATIVE_MAP sample=%u name=" #name " rows=%d slots=%d table_capacity=%d capacity=%zu allocated=%zu pin_floor=%zu default=%d\n", \
