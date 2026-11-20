@@ -32,3 +32,13 @@ end
 obj=GenuineSingletonHookReview.new
 def obj.example; :ok; end
 p obj.example
+module HookUndefinedWrapper
+  def included(*args, &block); super; end
+end
+receiver=Module.new
+receiver.singleton_class.class_eval { undef_method :included }
+receiver.define_singleton_method(:method_missing) do |name, *args, &block|
+  [:undefined, name, args, block && block.call]
+end
+receiver.singleton_class.prepend(HookUndefinedWrapper)
+p receiver.send(:included, 3) { :block }
