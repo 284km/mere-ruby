@@ -6352,3 +6352,26 @@ unittest/native_alias_method_predicate_probe.rb: method_defined? misses a
 real native alias on both main and candidate. Notification witnesses obtain
 the installed method directly; this change does not claim that predicate
 repair or a full Rails pass. Hosted CI remains required on the corrected head.
+
+
+### Scoped namespace review: every remaining segment is a real scope lookup
+
+Resolving the first constant lexically was necessary but did not make
+const_walk_go a full scope lookup. Object::Branch uses a top-level Branch
+key; ancestor constants and intermediate const_missing results were also lost.
+Add scoped_namespace_tail to follow the actual receiver through each scope
+operator, with Object's top-level keys, ancestors, autoload, privacy and the
+real const_missing callback. Preserve the first-segment lexical correction.
+Corpus742 covers class/module definitions, nested and conditional definitions,
+Object roots, inherited namespaces, intermediate hooks, autoload and refusals.
+
+Normal O2 runtime48f8e37f: **712/712 corpus**, index ON/OFF;729-732/738/742
+match all24 hash/MRO mode comparisons. All nine existing RSS gates, dead
+definitions and C depth155/1024 pass. Complete original Class/Module/Syntax/
+Parse/Forwardable/Method/Super/Autoload/Require discover784 cases: main d9826ac9
+and candidate both777 MATCH/2 RED/5 BOTH, zero EXTRA or lost original PASS.
+Module retains195 tests and1,240 assertions. The existing invalid-symbol Syntax
+memory failure is present on both; original test files, bootstrap, exclusions
+and600-second/2-GiB/10-second child limits are unchanged. This correction
+requires new hosted checks; the previous head's known complemented-method
+10.03-second child Timeout is retained rather than waived for merge.

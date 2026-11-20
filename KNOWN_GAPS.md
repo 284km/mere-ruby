@@ -4616,3 +4616,11 @@ boundaries; no original test was excluded for them. The separate native
 alias predicate diagnostic in unittest/native_alias_method_predicate_probe.rb
 prints true on Ruby and false on both main and this candidate; it remains
 unresolved and is not a passing corpus case.
+
+
+The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
+namespace constants and intermediate const_missing results as real scope
+lookups (corpus742). Both definition paths retain the lexical first constant,
+privacy and autoload behavior. The712-file corpus and original nine-file784-case
+comparison pass without losing a main PASS. The separate module_eval lexical
+negative remains an explicit failing diagnostic; this change does not claim it.
