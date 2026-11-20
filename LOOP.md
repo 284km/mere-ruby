@@ -6391,3 +6391,35 @@ This is reused-own-gem diagnostic evidence, not cold installation or a Rails
 pass. The separately measured four original ActiveSupport files still have
 537/541 MATCH at the earlier Hash-default boundary; these new Enumerable
 changes require a new original-framework measurement before claiming more.
+
+
+## 2026-11-20: Native Range case equality through super and saved aliases
+
+ActiveSupport prepends CompareWithRange#=== and calls super for scalar values.
+The native fallback reached Object#=== instead of Range#===, so precision6 was
+rejected by0..6 during actual Rails migration. Enter the real Range comparison
+from super and native aliases. Compare begin <=> value and value <=> end once
+in that order, matching range.c r_cover_p: nil means not covered; comparator
+exceptions propagate. Preserve exclusive/beginless/endless boundaries and the
+bounds of real Range subclass instances. No invented precision exception.
+
+Normal O2 at25415a32, on the reviewed loading/Module/Hash stack: **719/719
+corpus** match with the hash index ON and OFF. Corpus741 matches in all four
+hash/MRO settings, including native alias arity, scalar/string/object bounds,
+comparison side effects and exceptions. Nine existing RSS gates, dead definitions
+and generated C depth155/1024 pass. The original Range/Super/Method/Module
+pair discovers410 cases: both main d9826ac9 and candidate409 MATCH/1 RED,
+zero BOTH/EXTRA, no original PASS lost. Range67, Super50, Method97 and Module195
+MATCH are equal under the original600-second/2-GiB and10-second child limits.
+
+The own integration fd5a68a5 passes unchanged migration in6.812 seconds with
+804,208 KiB peak family RSS and no limit event. The next boot check refuses
+Bundler's full_gem_path because it points outside that interpreter's actual
+installed gem home; candidate application tests and HTTP remain NOT_RUN.
+Reference passes all four warm stages. This reused-own-gem run does not claim
+cold installation or application success. Remeasuring the same four original
+ActiveSupport files on both interpreters gives **539 MATCH/2 RED out of541**,
+zero BOTH/EXTRA/skips: OrderedOptions31/31, Concern17/17, Inflector471/473,
+class attribute20/20. Both remaining identities are Inflector titleize cases
+(String gsub! native super and Unicode negative lookbehind); the framework-wide
+suite has not been run.

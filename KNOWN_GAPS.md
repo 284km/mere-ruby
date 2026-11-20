@@ -4634,3 +4634,21 @@ calling super compares the Range object for equality and rejects precision6.
 Boot, application tests and HTTP remain NOT_RUN. Earlier selected original
 ActiveSupport measurements remain537 MATCH/4 RED out of541; no framework-wide
 or cold application pass is claimed from these runtime fixes.
+
+
+## Range native super and the next measured Rails boundary (2026-11-20)
+
+Corpus741 repairs Range#=== through prepended super and saved native aliases
+using real bounds and comparator calls. Complete original Range/Super/Method/
+Module files retain main's409 MATCH/1 RED out of410, and the719-file corpus
+matches in both index settings. The own Rails composition now passes migration;
+boot's locked-source check then catches Bundler#full_gem_path outside the actual
+own gem home. Application tests and HTTP remain NOT_RUN; cold installation is
+not reclassified as passing.
+
+The same selected four original ActiveSupport files now give539/541 MATCH;
+the two titleize failures remain explicit work. A separate existing direct
+Range primitive/object comparison gap remains reproducible without super:
+unittest/range_primitive_object_comparison_probe.rb returns[:direct, false,
+false] on reference Ruby and an ArgumentError on main and this candidate.
+It is a failing diagnostic, not a passing corpus case or exclusion.
