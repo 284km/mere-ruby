@@ -4596,3 +4596,11 @@ The rooted-loading review also fixes the shadowed three-segment namespace
 regression: corpus738 verifies the lexical first constant, remaining namespace
 walk, explicit root and autoload on both definition paths. The separate
 module_eval lexical-nesting diagnostic above remains a known failure.
+
+
+The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
+namespace constants and intermediate const_missing results as real scope
+lookups (corpus742). Both definition paths retain the lexical first constant,
+privacy and autoload behavior. The712-file corpus and original nine-file784-case
+comparison pass without losing a main PASS. The separate module_eval lexical
+negative remains an explicit failing diagnostic; this change does not claim it.
