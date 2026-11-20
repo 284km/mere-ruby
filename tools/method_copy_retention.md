@@ -50,3 +50,9 @@ address layouts. Use these counters to identify retained ownership, not to
 claim that their difference explains every RSS byte or proves a safe fix.
 Never remove pins, change cache/GC constants or relax the original gate to
 make this diagnostic green.
+
+For ownership measured at the original RSS observations, see
+[the native probe](rss_native_probe.md). Its separate native x86-64 job
+preserves both unchanged ordinary controls and uses an explicitly different
+diagnostic binary. A completed probe never turns an ordinary RSS failure
+into a passing gate.

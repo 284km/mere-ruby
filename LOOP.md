@@ -7151,3 +7151,35 @@ real borrowed pointer survives would be unsafe. Preserve the assigned boundary
 against GC internals. Full observations are in
 gemtest/method_copy_retention_r46.json; the earlier hosted 2.224702x assertion
 and every existing-file merge gate remain open. No new gem sweep is claimed.
+
+
+## Native ownership at the original RSS samples (2026-11-20)
+
+The unchanged Method-copy control now also reproduces its actual failure on
+native Linux/aarch64: 2.040674x and 2.040880x, with a healthy 1.1039x reference,
+ordinary O2 and no resource-limit event. Preserve both failures, the earlier
+passing observation, and the earlier hosted failures. These are not retries
+selected for a green result. The validation attempts changed the diagnostic
+collector; the ordinary runtime and program were identical throughout.
+
+A separate emitted-C copy reads native ownership before the existing RSS
+reads/spawns. It records physical slots, pin floors, current map storage,
+retired generations and saved pinner states without changing collection or
+pinning. At the largest native RSS sample in the completed diagnostic, retired
+capacity is 170,070,232 bytes while the current method table has 1,275 live
+rows and 4,260,408 capacity bytes. All saved pinners identify the running root
+coroutine. Capacity is not RSS, and this does not prove the pins unnecessary.
+
+Two initial collection attempts correctly failed because native output
+contaminated the verbose parent case identifier. Setting the exclusion before
+exec, suppressing unused exit observations, and separating native lines fixed
+the collector. The final run preserves all three original clone case names,
+the exact child except its two upstream nonce tokens, and all 21 Method-copy
+samples. The ordinary gate rejects the diagnostic mode; the combined command
+still fails when its ordinary Method-copy assertion fails.
+
+The separate native x86-64 job locks the failing runtime and both existing CI
+compiler pins. Existing jobs, source locks, baselines, 600-second/2-GiB limits,
+upstream ten-second child and 2x assertions remain unchanged. This adds
+observability, not a memory repair. See tools/rss_native_probe.md and
+gemtest/native_rss_retention_r59.json for the protocol and measured evidence.
