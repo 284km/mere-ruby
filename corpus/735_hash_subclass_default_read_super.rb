@@ -105,3 +105,36 @@ super_read = NativeSuperReadHash.new
 super_read[super_key] = :super
 super_key.arm
 p [:native_super_calls, super_read[super_key], super_key.calls]
+
+# Native Hash reads use builtin key hashes even in a table containing keys
+# with Ruby hash/eql? methods. A saved alias and super have the same rule.
+class MixedNativeReadHash < Hash
+  alias raw_get []
+  def [](key); super(key); end
+end
+class MixedNativeReadKey
+  def hash; 1; end
+end
+mixed = MixedNativeReadHash.new
+mixed[MixedNativeReadKey.new] = :custom
+mixed['normal'] = :string_value
+mixed[:symbol] = :symbol_value
+class String
+  alias stage9_original_hash hash
+  def hash; raise 'String#hash must not run for a Hash key'; end
+end
+class Symbol
+  alias stage9_original_hash hash
+  def hash; raise 'Symbol#hash must not run for a Hash key'; end
+end
+p [:mixed_native_string, mixed.raw_get('normal'), mixed['normal']]
+p [:mixed_native_symbol, mixed.raw_get(:symbol), mixed[:symbol]]
+p [:mixed_native_missing_custom, mixed.raw_get(MixedNativeReadKey.new)]
+class String
+  alias hash stage9_original_hash
+  remove_method :stage9_original_hash
+end
+class Symbol
+  alias hash stage9_original_hash
+  remove_method :stage9_original_hash
+end

@@ -164,3 +164,23 @@ begin
 rescue => error
   p [:private_scope, error.class]
 end
+
+# Object:: uses the same bare autoload key as a top-level constant.
+Dir.mktmpdir('object-mixin-autoload') do |directory|
+  %w[Block ClassBody Prepend].each do |kind|
+    name = "ObjectMixinAutoload#{kind}"
+    path = File.join(directory, "#{kind}.rb")
+    File.write(path, "module #{name}; def object_mixin_value; :#{kind.downcase}; end; end")
+    Object.autoload(name, path)
+    receiver = Class.new
+    if kind == 'Block'
+      receiver.class_eval { include Object::ObjectMixinAutoloadBlock }
+    elsif kind == 'ClassBody'
+      Object.const_set(:ObjectMixinAutoloadReceiver, receiver)
+      eval('class ObjectMixinAutoloadReceiver; include Object::ObjectMixinAutoloadClassBody; end')
+    else
+      receiver.class_eval { prepend Object::ObjectMixinAutoloadPrepend }
+    end
+    p [:object_mixin_autoload, kind, receiver.new.object_mixin_value, Object.autoload?(name)]
+  end
+end
