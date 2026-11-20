@@ -56,3 +56,28 @@ begin
 rescue => error
   p [:invalid, error.class]
 end
+
+require 'tmpdir'
+module ParentAutoloadRoot
+  module Feature
+    module Item
+      def selected; :outer; end
+    end
+  end
+  module Inner
+    class Host; end
+  end
+end
+Dir.mktmpdir('parent-autoload') do |directory|
+ path=File.join(directory,'feature.rb')
+ File.write(path, 'module ParentAutoloadRoot; module Inner; module Feature; module Item; def selected; :inner; end; end; end; end; end')
+ ParentAutoloadRoot::Inner.autoload(:Feature,path)
+ module ParentAutoloadRoot
+  module Inner
+   class Host
+    include Feature::Item
+   end
+  end
+ end
+ p [:included,ParentAutoloadRoot::Inner::Host.new.selected]
+end
