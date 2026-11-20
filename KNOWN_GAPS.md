@@ -4616,3 +4616,21 @@ boundaries; no original test was excluded for them. The separate native
 alias predicate diagnostic in unittest/native_alias_method_predicate_probe.rb
 prints true on Ruby and false on both main and this candidate; it remains
 unresolved and is not a passing corpus case.
+
+
+## Rails Hash options and lexical mixins: measured boundary (2026-11-20)
+
+Corpus735-737 verifies real Hash default reads through Ruby overrides/native
+super/aliases, real Hash subclass each for count/entries, and lexical/runtime
+mixin arguments with autoload, inherited constants, privacy and const_missing.
+The full718-file corpus and complete original twelve-file1,302-case comparison
+retain every main PASS under unchanged resource bounds. A full-corpus regression
+in525 was fixed, not excluded. The captured constructor default-block behavior
+is a separate existing prerequisite; the isolated default-read witness uses
+Hash#default_proc= to set the real Proc.
+
+An own Rails composition reaches actual migration, where a prepended Range#===
+calling super compares the Range object for equality and rejects precision6.
+Boot, application tests and HTTP remain NOT_RUN. Earlier selected original
+ActiveSupport measurements remain537 MATCH/4 RED out of541; no framework-wide
+or cold application pass is claimed from these runtime fixes.
