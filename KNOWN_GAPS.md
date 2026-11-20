@@ -4569,3 +4569,26 @@ bound is computed by walking it, so it does not return (ruby answers
 Float::INFINITY). CRuby's test_enumerator (test_size_for_downup_to) hangs
 there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
+
+
+### PR90: Pathname core and physical library extensions
+
+Separating the unchanged shipped Pathname core from pathname.rb's extension
+body restores the two original Bundler binstub cases (13 to15 MATCH). Real
+pathname.rb files still win ordinary load-path lookup. The core is initialized
+when their class body needs it, and factory-first loading preserves the real
+core/library phases. Corpus746/747, the710-file corpus and five complete
+original test files retain the completed main's passing cases under unchanged
+bounds. The five-gem baseline remains48 MATCH/14 RED with both sides' actual
+library audits complete. The previous hosted30K-method Timeout remains an
+observation requiring a fresh hosted result; the same original file passes
+locally on both actual CI binaries and the candidate within60 seconds.
+
+
+The final Pathname core entry uses an internal identity anchored in the
+runtime's stdlib directory. A user's same-named ordinary Ruby file remains
+selectable, while the core body keeps its actual implementation(corpus748).
+The integrated714-file corpus and original bounded focused/gem measurements
+pass. The intermediate head's separate Linux Module clone RSS2.0991655787x
+failure remains evidence; fresh final-head hosted gates and every-file
+nonregression are still required, with original assertions and limits intact.
