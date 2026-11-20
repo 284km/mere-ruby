@@ -23,3 +23,13 @@ p "a+b+c".sub(/\+/, "+" => " ")
 p "aba".gsub(/a/, "a" => "")
 p "ab".gsub(/(?=b)/, "" => "!")
 p "".gsub(/\z/, "" => "!")
+
+[:sub, :gsub].each do |method|
+  /a/.match("a")
+  source = "a\0b".b.freeze
+  result = source.public_send(method, /not-present/, "replacement")
+  p [result.bytes, result.encoding.name, result.equal?(source), result.frozen?, $~]
+end
+source = "abc".dup
+p [source.gsub!(/not-present/, {}), source]
+p [source.sub!(/not-present/, "replacement"), source]
