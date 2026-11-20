@@ -7223,3 +7223,49 @@ top-level lets remain main 136 / state 1167. See
 gemtest/method_store_floor_r60.json for all ordinary pairs and diagnostic
 provenance. The broader corpus and five-gem verification are in progress;
 no baseline snapshot is replaced.
+
+## 2026-11-20: separate clone's cached temporary arenas from live metadata
+
+Backport the verified method floor repair to the earlier PR 119 branch,
+without changing any further runtime function. Its original native Linux
+Method-copy gate now passes at 1.618172x; the earlier 2.051319x failure remains
+recorded. Fresh local verification passes all 732 corpus programs in both hash
+modes (599.508 seconds, 1,099,200 KiB peak family RSS) and the original five-gem
+batch at 54 MATCH / 7 RED / 1 MEMORY, with no per-file regression. This does
+not establish a repair of clone's separate historical RSS failures.
+
+Read-only Linux/glibc diagnostics add allocator accounting, mapping RSS,
+coroutine stacks and active temporary-region inventories to the existing
+private observer. All ordinary generated C and allocator/pin/GC policies remain
+unchanged; the existing default diagnostic emitter is byte-identical too.
+A first attempt printed too much into the captured pipe and lost records;
+keep its rejection. Print only the existing mandatory maps plus large extra
+independent maps, while running the unchanged complete original workload.
+Missing allocator, active-region or block-capacity records fail acceptance.
+
+Two fixed local core-compiler batches each run four ordinary clone controls
+and two separate diagnostic controls. Ordinary ratios vary from 1.440821 to
+1.993544 and all pass; none reproduces the failed hosted assertion. A complete
+rich trace nevertheless identifies a separate physical-memory factor. The
+21 temporary scopes used for the final report hold 83,886,080 capacity bytes
+versus 22,020,096 initially, although allocation since acquisition is only
+32,560 versus 31,096 bytes. Several MCALL scopes reuse 16-MiB cached blocks
+without allocating any bytes in the call. Their resident pages and retained
+native generations are distinct from a growing live-module table. Capacity
+alone is not RSS; raw mappings and allocator totals remain separate evidence.
+
+A new, separate native x86-64 job locks the actual failing PR 139 merge source
+ae6bd8cc and compiler 01f5ad73. It builds ordinary and diagnostic binaries
+before measurement, then retains the full Module control, one reference,
+four ordinary clone controls and two diagnostics in fixed order. A failed
+ordinary assertion remains a failure. File/side 600 seconds / 2 GiB, the
+upstream ten-second child, original child hashes and assertions are unchanged.
+The other session's branch is only read; no edits or pushes are made there.
+No compiler or native cache implementation repair has been applied.
+
+Seven captured-data heap acceptance checks and the existing twelve native
+checks pass. The new fragment compiles and executes on native Linux; the
+existing observer remains separate from every ordinary gate. See
+tools/clone_rss_heap.md, tools/fixtures/clone_heap_sample.json and
+gemtest/clone_heap_r62.json. The local evidence does not replace the pending
+hosted observation or waive historical clone failures.

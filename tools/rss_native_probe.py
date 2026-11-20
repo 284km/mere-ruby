@@ -29,7 +29,11 @@ def git(root, *args):
     return subprocess.check_output(['git', '-C', str(root), *args], text=True).strip()
 
 
-def emit_probe(source):
+def emit_probe(source, heap=False):
+    observer = (ROOT / 'tools/rss_native_observer.c').read_text()
+    if heap:
+        from rss_heap_observer import extend
+        observer = extend(source, observer)
     hooks = [
         (r'(static long long fd_open\(const char\* path, const char\* mode, long long perm\) \{)',
          '\n  if (path && !strcmp(path, "/proc/self/status")) gem_rss_snapshot("status");'),
@@ -69,10 +73,10 @@ static int mu_compact_method_store__direct(int mu_u) {
     counters = ('static _Thread_local unsigned long long gem_floor_calls, gem_floor_requested, '
                 'gem_floor_moved, gem_floor_deferred, gem_floor_raised_without_move;\n')
     return (counters + 'static void gem_rss_snapshot(const char *phase);\n' + source + '\n'
-            + (ROOT / 'tools/rss_native_observer.c').read_text())
+            + observer)
 
 
-def build(subject, output, expected_ref=SUBJECT):
+def build(subject, output, expected_ref=SUBJECT, heap=False):
     if git(subject, 'rev-parse', 'HEAD') != expected_ref:
         raise ValueError('the locked subject checkout is required')
     git(subject, 'diff', '--exit-code', 'HEAD', '--', '*.mere', '*.c', '*.h', 'tools', 'unittest', 'lib')
@@ -81,7 +85,7 @@ def build(subject, output, expected_ref=SUBJECT):
     shutil.copytree(subject, output, ignore=shutil.ignore_patterns(
         '.git', '.mere-compiler', '.ruby-source', 'mere-ruby', 'mere-ruby.new', '__pycache__'))
     generated = subject / 'mr.c'
-    (output / 'mr.c').write_text(emit_probe(generated.read_text()))
+    (output / 'mr.c').write_text(emit_probe(generated.read_text(), heap=heap))
     script = output / 'tools/build.sh'
     original = script.read_text()
     if original.count('\nmode=O2\n') != 1:
@@ -103,7 +107,10 @@ def build(subject, output, expected_ref=SUBJECT):
         ordinary_binary_sha256=ci.digest(subject / 'mere-ruby'),
         original_c_sha256=ci.digest(generated), probe_c_sha256=ci.digest(output / 'mr.c'),
         binary_sha256=ci.digest(output / 'mere-ruby'),
-        observer_sha256=ci.digest(ROOT / 'tools/rss_native_observer.c')))
+        observer_sha256=ci.digest(ROOT / 'tools/rss_native_observer.c'),
+        heap_observer=heap,
+        heap_fragment_sha256=ci.digest(ROOT / 'tools/rss_heap_observer.c') if heap else None,
+        heap_emitter_sha256=ci.digest(ROOT / 'tools/rss_heap_observer.py') if heap else None))
 
 
 def native_samples(raw):
