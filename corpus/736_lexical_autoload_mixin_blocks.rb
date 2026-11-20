@@ -81,3 +81,45 @@ Dir.mktmpdir('parent-autoload') do |directory|
  end
  p [:included,ParentAutoloadRoot::Inner::Host.new.selected]
 end
+
+module RuntimeArgumentFeature
+  def runtime_argument; :argument; end
+  module Nested
+    def nested_argument; :nested; end
+  end
+end
+class MethodArgumentReceiver
+  def self.selected_module; RuntimeArgumentFeature; end
+  include selected_module
+end
+p [:method_argument,MethodArgumentReceiver.new.runtime_argument]
+ivar_receiver=Class.new
+ivar_receiver.instance_variable_set(:@selected_module,RuntimeArgumentFeature)
+ivar_receiver.class_eval { include @selected_module }
+p [:ivar_argument,ivar_receiver.new.runtime_argument]
+class ClassVariableArgumentReceiver
+  @@selected_module=RuntimeArgumentFeature
+  include @@selected_module
+end
+p [:class_variable_argument,ClassVariableArgumentReceiver.new.runtime_argument]
+class NamespaceArgumentReceiver
+  def self.selected_namespace; RuntimeArgumentFeature; end
+  include selected_namespace::Nested
+end
+p [:method_namespace,NamespaceArgumentReceiver.new.nested_argument]
+class RuntimeArgumentFactory < Module
+  def initialize
+    define_method(:generated) { :generated }
+  end
+end
+generated_receiver=Class.new
+generated_receiver.instance_variable_set(:@generated,RuntimeArgumentFactory.new)
+generated_receiver.class_eval { include @generated }
+p [:module_instance_argument,generated_receiver.new.generated]
+class OverrideArgumentReceiver
+  @selected_argument=9
+  def self.include(value); @received=value; end
+  include @selected_argument
+  def self.received; @received; end
+end
+p [:override_argument,OverrideArgumentReceiver.received]
