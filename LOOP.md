@@ -6375,3 +6375,19 @@ memory failure is present on both; original test files, bootstrap, exclusions
 and600-second/2-GiB/10-second child limits are unchanged. This correction
 requires new hosted checks; the previous head's known complemented-method
 10.03-second child Timeout is retained rather than waived for merge.
+
+
+### Module stack after the scoped-namespace follow-up (2026-11-20)
+
+Rebuild the Module repairs with the parent's full scoped-constant correction.
+Normal O2 runtime f6975772 passes **716/716 corpus**, hash index ON/OFF,
+all40 witness comparisons across four hash/MRO modes, all nine existing RSS
+gates, dead definitions and C depth155/1024. Twelve complete original files
+find1,170 cases: both main d9826ac9 and candidate **1,156 MATCH/6 RED/7 BOTH/
+1 EXTRA**, with no original PASS or per-file MATCH lost. Module195 with1,240
+assertions, SetTraceFunc97, Regexp161, Class61, Refinement121, Super50,
+Method97, Syntax167, Parse102, Forwardable27, Autoload27 and Require51 are
+retained. The known Syntax-memory failure remains on both sides. All original
+limits, tests, bootstrap and exclusions are unchanged. Parent documentation
+was merged after measurement; it changes no runtime source. Hosted checks
+must complete on the updated head before merge.
