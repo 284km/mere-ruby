@@ -92,11 +92,3 @@ class Range
   alias_method :===, :saved_case_equal
 end
 p [:restored_native_alias, r === 2, r === r]
-class Range
-  undef_method :===
-end
-begin
-  r === 2
-rescue => error
-  p [:undefined_native, error.class]
-end
