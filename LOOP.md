@@ -6316,3 +6316,78 @@ The known invalid-symbol Syntax memory failure occurs on both main and this
 candidate; earlier168-MATCH observations are retained, not overwritten.
 No original test, exclusion or limit changed. Hosted checks must still finish
 on the review correction before merge.
+
+### Module review: real native ancestors and original notification receivers (2026-11-20)
+
+Restrict Regexp-subclass fallback to actual Regexp methods, and empty
+notification fallback to receivers that inherit that native hook. Unknown
+super calls continue to the original receiver's missing handler, including
+arguments and blocks. Corpus739 covers both reported regressions, genuine
+native controls and an undef before the native hook.
+
+A Module subclass's anonymous module stores its methods; the original object
+receives method_added. Read the existing backing-to-object ancestry mapping,
+select a Ruby body, native alias, undef or Module's actual empty entry in
+ancestor order, and notify once after visibility is established. The Proc
+and Method argument forms now also notify after installation. The native
+empty callback emits c_call/c_return on the real receiver when observed.
+Corpus740 covers inherited/singleton/global callbacks, block/Proc/Method
+forms, private initialize, exceptions without rollback, frozen refusal,
+actual TracePoint receiver/owner, saved native callbacks and undef. The
+first unconditional invocation missed the ordinary native callback on an
+unmodified Module subclass; the original733 witness caught it and stopped
+the attempted sweep. Preserve that failed record separately.
+
+Final normal O2 ec6d6a5a: **715/715 corpus**, hash index ON/OFF, all36 witness
+comparisons in four hash/MRO modes, all nine existing RSS checks, dead
+definitions and depth155/1024 pass. Twelve original files discover1170 cases:
+main1155 MATCH/7 RED/7 BOTH/1 EXTRA, candidate1157/5/7/1, with no original
+passing identity or per-file MATCH lost. Module195/1240 assertions and
+Regexp161 MATCH are retained. Settracefunc96->97 and Syntax167->168 are
+observations, not claimed causal improvements; all raw pairs remain.
+No original test, exclusion or resource limit changes.
+
+A separate existing metadata failure stays explicit in
+unittest/native_alias_method_predicate_probe.rb: method_defined? misses a
+real native alias on both main and candidate. Notification witnesses obtain
+the installed method directly; this change does not claim that predicate
+repair or a full Rails pass. Hosted CI remains required on the corrected head.
+
+
+## 2026-11-20: Real Hash defaults, yielded entries and lexical mixin arguments
+
+ActiveSupport::OrderedOptions normalizes keys in Ruby Hash#[]; the missing-key
+shortcut ran before that override. Honor the real override, and share native
+Hash reads through super and saved aliases with the actual Hash#default.
+Hash subclass count/entries now consume the real Ruby each, including arguments,
+multiple yields and block/break, while ordinary Hash and Ruby overrides retain
+their existing paths. Count uses the existing Enumerator counting body on the
+actual Hash receiver; no proxy collection or invented size is used.
+
+Runtime include/prepend evaluates lexical constants, ivars/classvars, local
+variables and bare getters before validating the actual Module. Each scoped
+segment follows its real ancestor/autoload/const_missing result and privacy;
+explicit roots and custom include/prepend overrides are preserved. The first
+full corpus caught a missing intermediate const_missing regression in525.
+Fix it rather than removing the case. Keep the direct include-local hot path.
+
+Normal O2 eea2a983 on main d9826ac9 plus the reviewed loading/Module stack:
+**718/718 corpus**, hash index ON/OFF;525/735/736/737 in four hash/MRO modes
+match in all16 comparisons. Nine existing RSS gates, dead definitions and C
+bracket depth155/1024 pass. The complete original twelve-file paired set finds
+1,302 cases: main1,284 MATCH/3 RED/15 BOTH, candidate1,285/2/15, zero EXTRA.
+No original PASS or per-file MATCH is lost. Hash297, Enum89, Module195,
+Class61, Refinement121, Super50, Method97, Parse102, Forwardable27,
+Autoload27 and Require51 MATCH are maintained. Syntax167/168 is the known
+invalid-symbol memory observation, not claimed as a causal improvement.
+The final set was measured as eight files plus four additional files on the
+same unchanged binary. Original600-second/2-GiB and10-second child bounds,
+bootstrap, test files and exclusions remain unchanged.
+
+An own integration reaches real Rails migration and stops at Range#=== through
+ActiveSupport's prepended super, rejecting precision6 in0..6. Reference passes
+all four warm application stages; candidate boot/tests/HTTP remain NOT_RUN.
+This is reused-own-gem diagnostic evidence, not cold installation or a Rails
+pass. The separately measured four original ActiveSupport files still have
+537/541 MATCH at the earlier Hash-default boundary; these new Enumerable
+changes require a new original-framework measurement before claiming more.
