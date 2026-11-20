@@ -6893,3 +6893,23 @@ fallbacks are unchanged: 6 a Regexp in another encoding -- allowing those
 moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
+
+### Stage 9 consolidation after main's VM update (2026-11-20)
+
+Merge main d9826ac9 into the existing consolidation branch. Only concurrent
+LOOP.md appendices conflict; retain both. The runtime/driver merge is automatic,
+with no manual VM, collector or state edits. Normal O2 with the pinned Mere
+01f5ad73 passes **718/718 corpus files**, hash index ON and OFF, the 12 observer
+witness/cache combinations, all nine original RSS checks, dead definitions and
+C nesting **155/1024**. No resource bound or original test was changed.
+
+The paired 10-file checkpoint against this main discovers **559 cases**:
+main446 MATCH/102 RED/7 BOTH/4 EXTRA, candidate459/89/6/5. No original PASS
+identity or file MATCH is lost. Module remains195 MATCH with all1,240 assertions;
+Enum89 and ObjectSpace37 are unchanged; GC29->30, string-memory0->2 and
+objspace28->38. All76 allocation comparisons remain enabled and RED for the
+existing VM handoff. The same57 excluded identities apply to both sides
+(GC19, compact22, objspace16); the per-file exclusion sidecars retain each
+reason. These local observations do not replace full hosted CI or its
+per-file comparison against a completed main run. Previous hosted RSS failures
+remain historical evidence, not waived gates for this new head.
