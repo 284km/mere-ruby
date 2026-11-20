@@ -4677,3 +4677,14 @@ main's per-file PASS identities in five complete original files (530 MATCH/
 1 RED/1 BOTH out of532) plus the720-file corpus. Native Kernel Method binding
 on a Range and primitive undef bypass remain explicitly failing standalone
 probes above; neither was repaired by changing a value or hiding a test.
+
+
+Class/Module case equality now honors a real Ruby singleton === before the
+native Module entry, including inherited/private hooks and when splats. Actual
+Module/Kernel ancestor positions preserve native super semantics. Corpus743,
+the721-file corpus and eight original CRuby files retain main's passing cases.
+This resolves the observed ActiveSupport TimeWithZone cast errors in the warm
+app diagnostic; three original app errors remain (retry and unknown <=>), and
+the original direct-start Bundler selection, cold installation, HTTP and the
+whole Rails suite remain unverified. Existing native Method owner/undef probes
+above are separate gaps and are not claimed by this dispatch repair.

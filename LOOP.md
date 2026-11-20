@@ -6510,3 +6510,30 @@ an undef. Keep unittest/range_kernel_method_owner_probe.rb and
 unittest/range_case_equality_undef_probe.rb as explicit failing diagnostics;
 these are not claimed repairs, exclusions or passing corpus cases. The older
 direct primitive/object comparison diagnostic also remains unresolved.
+
+
+### Class case equality: invoke Ruby hooks and retain native super positions
+
+A class's Ruby singleton === was used by the explicit operator but skipped by
+case/when. This prevented ActiveSupport's Time.=== from accepting TimeWithZone.
+Resolve the actual singleton ancestor chain, stop at the real native Module
+entry, and call a preceding Ruby body with its actual ancestor index. Super
+continues through the real Module/Kernel entries, including after Module's own
+Ruby replacement. Splat candidates also use case equality instead of ==.
+Native entries consume pending call state before invoking Ruby comparisons.
+The obsolete equality-only leaf helper is removed; no top-level value is added.
+
+Normal O2 runtime8812a585 passes **721/721 corpus** with the hash index ON/OFF,
+all16 comparisons for735/741-743 in four hash/MRO modes, nine existing RSS
+gates, dead/duplicate definitions, GC roots and depth155/1024. The original
+Case/Class/Module/Super/Method/Refinement/Settracefunc/PatternMatching comparison
+has665 cases: both main d9826ac9 and candidate657 MATCH/5 RED/3 BOTH, zero
+EXTRA or lost original PASS, and no per-file MATCH decrease. The original
+600-second/2-GiB/10-second child bounds, files, bootstrap and exclusions remain.
+
+The separate combined Rails diagnostic explicitly activates the real installed
+Bundler on both sides and retains every locked-package source check. Migration
+and boot pass. The original six app tests improve from five errors to three:
+all TimeWithZone cast errors are gone, while one unhandled retry and two unknown
+<=> errors remain. This warm diagnostic does not establish the direct-start
+Bundler path, a cold install, HTTP success or whole-Rails compatibility.
