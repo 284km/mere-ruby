@@ -33,3 +33,7 @@ end
 source = "abc".dup
 p [source.gsub!(/not-present/, {}), source]
 p [source.sub!(/not-present/, "replacement"), source]
+p ["ab".gsub(/(a)(b)/, '\\2\\1'), $1, $2]
+observed = []
+replacement = Hash.new { |_, key| observed << [$&, $1]; key.upcase }
+p ["a1 a2".gsub(/a(\d)/, replacement), observed]
