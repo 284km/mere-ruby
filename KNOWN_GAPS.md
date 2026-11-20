@@ -4591,3 +4591,8 @@ Scoped class namespace identity does not repair the existing module_eval
 lexical-nesting bug: unittest/scoped_class_lexical_probe.rb returns :missing
 on reference Ruby and :found on both preceding main and this candidate.
 It is an explicit failing diagnostic, not a passing corpus case.
+
+The rooted-loading review also fixes the shadowed three-segment namespace
+regression: corpus738 verifies the lexical first constant, remaining namespace
+walk, explicit root and autoload on both definition paths. The separate
+module_eval lexical-nesting diagnostic above remains a known failure.
