@@ -12,6 +12,8 @@ import sys
 import rss_native_probe as native
 
 SOURCE = native.SUBJECT
+LEGACY_SOURCE = 'ae6bd8cc89a98fc01a1e129d3becc447b637d35f'
+SOURCES = (SOURCE, LEGACY_SOURCE)
 COMPILERS = dict(parent='01f5ad738748cc570cc04e3000f50b8c6965543f',
                  candidate='94da60b51e438404edf857ed09941c5db8361dca')
 ORDER = ['parent', 'candidate', 'candidate', 'parent']
@@ -67,10 +69,12 @@ def method_passed(run):
 def assess(record):
     """A successful diagnostic or later sample cannot replace a failed gate."""
     runs, core = record['method_runs'], record['core_cases']
+    subject = record.get('subject_ref', SOURCE)
     expected_keys = {mode + '-' + side for mode in MODES for side in ('reference', 'parent', 'candidate')}
     complete = (record.get('clearing_only') is True
                 and record['compiler_refs'] == COMPILERS
-                and record['source_refs'] == dict(parent=SOURCE, candidate=SOURCE)
+                and subject in SOURCES
+                and record['source_refs'] == dict(parent=subject, candidate=subject)
                 and [r['label'] for r in runs] == ORDER and set(core) == expected_keys)
     complete = complete and all(
         run['program_sha256'] == native.PROGRAM_SHA
@@ -124,11 +128,14 @@ def collect(args):
     parent, candidate, source, reference, output = [getattr(args, key).resolve()
         for key in ('parent', 'candidate', 'ruby_src', 'reference', 'output')]
     roots = dict(parent=parent, candidate=candidate)
+    subject = args.subject_ref
+    if subject not in SOURCES:
+        raise ValueError('the subject must be one of the locked runtime revisions')
     if native.git(source, 'rev-parse', 'HEAD') != native.RUBY:
         raise ValueError('the locked Ruby source is required')
     native.git(source, 'diff', '--exit-code', 'HEAD', '--', 'test', 'tool', 'lib')
     for side, root in roots.items():
-        if native.git(root, 'rev-parse', 'HEAD') != SOURCE or (root / '.build_mode').read_text().strip() != 'O2':
+        if native.git(root, 'rev-parse', 'HEAD') != subject or (root / '.build_mode').read_text().strip() != 'O2':
             raise ValueError('both ordinary O2 binaries must use the same locked runtime')
         native.git(root, 'diff', '--exit-code', 'HEAD', '--', '*.mere', '*.c', '*.h', 'tools', 'unittest', 'lib')
         compiler = getattr(args, side + '_compiler').resolve()
@@ -143,7 +150,7 @@ def collect(args):
     output.mkdir(parents=True, exist_ok=False)
     os.environ['REF_RUBY_BIN'] = str(reference)
     record = dict(purpose='Ordinary O2 compiler-only comparison; failed observations are retained',
-        source_refs={side: SOURCE for side in roots}, compiler_refs=COMPILERS, ruby_ref=native.RUBY,
+        subject_ref=subject, source_refs={side: subject for side in roots}, compiler_refs=COMPILERS, ruby_ref=native.RUBY,
         clearing_only=only, order=ORDER, platform=sys.platform,
         host_architecture=os.uname().machine,
         bounds=dict(wall_per_side=600, rss_family_kb=2097152, upstream_child_seconds=10),
@@ -217,6 +224,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('parent', 'candidate', 'parent-compiler', 'candidate-compiler', 'ruby-src', 'reference', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--subject-ref', choices=SOURCES, default=SOURCE)
     args = parser.parse_args()
     try:
         return collect(args)
