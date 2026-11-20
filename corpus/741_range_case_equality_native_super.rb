@@ -39,3 +39,28 @@ class ComparableRangeBound
 end
 bounds = ComparableRangeBound.new(1)..ComparableRangeBound.new(5)
 p [:objects, bounds === 3, bounds === 9, bounds.saved_case_equal(3)]
+
+p [:object_values, bounds === ComparableRangeBound.new(3), bounds === ComparableRangeBound.new(9)]
+class ObservedRangeBound
+  include Comparable
+  attr_reader :value
+  def initialize(value); @value = value; end
+  def <=>(other)
+    ($range_native_comparisons ||= []) << [value, other.value]
+    value <=> other.value
+  end
+end
+observed = ObservedRangeBound.new(1)..ObservedRangeBound.new(5)
+$range_native_comparisons = []
+p [:observed, observed === ObservedRangeBound.new(3), $range_native_comparisons]
+class RaisingRangeBound
+  def <=>(other)
+    raise 'actual comparison' unless other.is_a?(self.class)
+    0
+  end
+end
+begin
+  (RaisingRangeBound.new..RaisingRangeBound.new) === 3
+rescue => error
+  p [:raised, error.class, error.message]
+end
