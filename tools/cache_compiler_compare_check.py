@@ -71,6 +71,16 @@ class ComparisonEvidence(unittest.TestCase):
             value['core_cases']['module-' + side]['parsed']['cases'] = {}
         self.assertFalse(assess(value)['candidate_core_passed'])
 
+    def test_different_measured_binary_is_rejected(self):
+        value = copy.deepcopy(FIXTURE)
+        value['method_runs'][1]['result']['sides']['mere']['binary_sha256'] = '0' * 64
+        self.assertFalse(assess(value)['complete'])
+
+    def test_altered_parent_program_is_not_a_comparison(self):
+        value = copy.deepcopy(FIXTURE)
+        value['method_runs'][0]['program_sha256'] = '0' * 64
+        self.assertFalse(assess(value)['complete'])
+
     def test_instrumented_or_different_c_is_not_a_cache_only_change(self):
         self.assertFalse(clearing_only('int main(void) { return 0; }',
                                        'int main(void) { return 1; }'))

@@ -72,6 +72,13 @@ def assess(record):
                 and record['compiler_refs'] == COMPILERS
                 and record['source_refs'] == dict(parent=SOURCE, candidate=SOURCE)
                 and [r['label'] for r in runs] == ORDER and set(core) == expected_keys)
+    complete = complete and all(
+        run['program_sha256'] == native.PROGRAM_SHA
+        and run['result']['bounds'] == dict(wall_seconds=600, rss_kb=2097152, post_gc_growth=2.0)
+        and set(run['result']['sides']) == {'mere', 'reference'}
+        and run['result']['sides']['mere']['binary_sha256'] == record['binary_sha256'][run['label']]
+        and run['result']['sides']['reference']['binary_sha256'] == record['reference_binary_sha256']
+        for run in runs)
     method_ok = complete and all(method_passed(r) for r in runs if r['label'] == 'candidate')
     references_ok = complete and all(method_side_passed(r['result']['sides']['reference']) for r in runs)
     core_ok, lost = complete, {}
