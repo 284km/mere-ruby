@@ -6316,3 +6316,39 @@ The known invalid-symbol Syntax memory failure occurs on both main and this
 candidate; earlier168-MATCH observations are retained, not overwritten.
 No original test, exclusion or limit changed. Hosted checks must still finish
 on the review correction before merge.
+
+### Module review: real native ancestors and original notification receivers (2026-11-20)
+
+Restrict Regexp-subclass fallback to actual Regexp methods, and empty
+notification fallback to receivers that inherit that native hook. Unknown
+super calls continue to the original receiver's missing handler, including
+arguments and blocks. Corpus739 covers both reported regressions, genuine
+native controls and an undef before the native hook.
+
+A Module subclass's anonymous module stores its methods; the original object
+receives method_added. Read the existing backing-to-object ancestry mapping,
+select a Ruby body, native alias, undef or Module's actual empty entry in
+ancestor order, and notify once after visibility is established. The Proc
+and Method argument forms now also notify after installation. The native
+empty callback emits c_call/c_return on the real receiver when observed.
+Corpus740 covers inherited/singleton/global callbacks, block/Proc/Method
+forms, private initialize, exceptions without rollback, frozen refusal,
+actual TracePoint receiver/owner, saved native callbacks and undef. The
+first unconditional invocation missed the ordinary native callback on an
+unmodified Module subclass; the original733 witness caught it and stopped
+the attempted sweep. Preserve that failed record separately.
+
+Final normal O2 ec6d6a5a: **715/715 corpus**, hash index ON/OFF, all36 witness
+comparisons in four hash/MRO modes, all nine existing RSS checks, dead
+definitions and depth155/1024 pass. Twelve original files discover1170 cases:
+main1155 MATCH/7 RED/7 BOTH/1 EXTRA, candidate1157/5/7/1, with no original
+passing identity or per-file MATCH lost. Module195/1240 assertions and
+Regexp161 MATCH are retained. Settracefunc96->97 and Syntax167->168 are
+observations, not claimed causal improvements; all raw pairs remain.
+No original test, exclusion or resource limit changes.
+
+A separate existing metadata failure stays explicit in
+unittest/native_alias_method_predicate_probe.rb: method_defined? misses a
+real native alias on both main and candidate. Notification witnesses obtain
+the installed method directly; this change does not claim that predicate
+repair or a full Rails pass. Hosted CI remains required on the corrected head.
