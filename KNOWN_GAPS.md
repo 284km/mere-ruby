@@ -4634,3 +4634,10 @@ calling super compares the Range object for equality and rejects precision6.
 Boot, application tests and HTTP remain NOT_RUN. Earlier selected original
 ActiveSupport measurements remain537 MATCH/4 RED out of541; no framework-wide
 or cold application pass is claimed from these runtime fixes.
+
+The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
+namespace constants and intermediate const_missing results as real scope
+lookups (corpus742). Both definition paths retain the lexical first constant,
+privacy and autoload behavior. The712-file corpus and original nine-file784-case
+comparison pass without losing a main PASS. The separate module_eval lexical
+negative remains an explicit failing diagnostic; this change does not claim it.
