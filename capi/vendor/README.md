@@ -7,6 +7,13 @@ it includes are copied here unchanged from the ruby 4.0.9 source tree
 sanitizers,set_table,st,static_assert,warnings}.h`) and compiled by `capi/st.c`, which
 only says `RUBY_EXPORT` and includes it.
 
+`memory_view.c` is CRuby's memory view API (`ruby/memory_view.h`), also
+unchanged, compiled by `capi/memory_view.c`. It includes two of CRuby's
+internal headers that this C API has no equivalent of
+(`internal/variable.h`, `vm_sync.h`); those are answered by the stand-ins in
+`capi/standin/`, which are this repository's own files and hold only what
+the vendored sources use.
+
 They are under Ruby's licence (`capi/include/COPYING`, `capi/include/BSDL`).
 Nothing in this directory is edited; `capi/tools/headers_check.py` compares
 it, and `capi/include`, with a ruby source tree.
