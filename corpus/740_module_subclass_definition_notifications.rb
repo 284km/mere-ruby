@@ -66,3 +66,33 @@ Module.class_eval do
   alias_method :method_added, :__review_original_added
   remove_method :__review_original_added
 end
+fresh=Class.new(Module).new
+trace_events=[]
+trace=TracePoint.new(:c_call,:c_return) do |event|
+  trace_events << [event.event,event.defined_class == Module,event.self.equal?(fresh)] if event.method_id == :method_added && event.self.equal?(fresh)
+end
+trace.enable { fresh.define_method(:ordinary) { :ordinary } }
+p [:native,trace_events]
+class NativeAliasObserverFactory < Module
+  define_method(:method_added,Module.instance_method(:method_added))
+end
+aliased=NativeAliasObserverFactory.new
+trace_events=[]
+trace=TracePoint.new(:c_call,:c_return) do |event|
+  trace_events << [event.event,event.defined_class == NativeAliasObserverFactory,event.self.equal?(aliased)] if event.method_id == :method_added && event.self.equal?(aliased)
+end
+trace.enable { aliased.define_method(:observed) { :observed } }
+p [:alias_native,trace_events]
+undefined=Class.new(Module).new
+undefined.singleton_class.class_eval { undef_method :method_added }
+missing_events=[]
+undefined.define_singleton_method(:method_missing) { |name,*args| missing_events << [name,args] }
+undefined.define_method(:retained) { :retained }
+p [:undefined,missing_events,Class.new { include undefined }.new.retained]
+object_events=[]
+Object.class_eval do
+  define_method(:method_added) { |name| object_events << name if name == :behind_module }
+end
+fresh.define_method(:behind_module) { :kept }
+p [:native_before_object,object_events]
+Object.class_eval { remove_method :method_added }
