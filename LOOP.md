@@ -6297,3 +6297,22 @@ installation or Rails pass. Hash default reads and other selected original
 ActiveSupport failures remain separate work. The constructor's captured
 Hash default-block behavior is already a separate unmerged prerequisite;
 these Module changes do not claim to supply it.
+### Rooted loading review: choose a scoped namespace lexically (2026-11-20)
+
+Review found a real regression when both A::B and Scope::A::B exist:
+`class A::B::Child` inside Scope selected the outer namespace. Resolve an
+unrooted prefix's first segment in its lexical scope, then walk the remaining
+segments from that actual module. Preserve explicit :: roots and existing
+self/local bindings. Corpus738 covers class/module/conditional definitions,
+root anchors, aliases and lexical autoloads; it and729-732 match in all four
+hash/MRO settings (20 comparisons).
+
+Normal O2 bcb3bca9: **711/711 corpus**, hash index ON/OFF; all nine existing
+RSS checks, dead definitions and C depth155/1024 pass. The original nine-file
+pair discovers784 cases on both builds: **777 MATCH/2 RED/5 BOTH** on each,
+with no original PASS identity lost. Class61, Module195, Syntax167, Parse102,
+Forwardable27, Method97, Super50, Autoload27 and Require51 MATCH are equal.
+The known invalid-symbol Syntax memory failure occurs on both main and this
+candidate; earlier168-MATCH observations are retained, not overwritten.
+No original test, exclusion or limit changed. Hosted checks must still finish
+on the review correction before merge.

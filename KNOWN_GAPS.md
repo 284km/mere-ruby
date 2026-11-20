@@ -4604,3 +4604,7 @@ Pathname#initialize. Boot, application tests and HTTP remain NOT_RUN;
 selected ActiveSupport Hash/default/Enumerable, String gsub! super and
 Unicode-lookbehind failures remain unclaimed. No runtime or test resource
 bound, original test, or exclusion changes were made for these fixes.
+The rooted-loading review also fixes the shadowed three-segment namespace
+regression: corpus738 verifies the lexical first constant, remaining namespace
+walk, explicit root and autoload on both definition paths. The separate
+module_eval lexical-nesting diagnostic above remains a known failure.
