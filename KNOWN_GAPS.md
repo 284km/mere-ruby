@@ -4652,3 +4652,10 @@ Range primitive/object comparison gap remains reproducible without super:
 unittest/range_primitive_object_comparison_probe.rb returns[:direct, false,
 false] on reference Ruby and an ArgumentError on main and this candidate.
 It is a failing diagnostic, not a passing corpus case or exclusion.
+
+The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
+namespace constants and intermediate const_missing results as real scope
+lookups (corpus742). Both definition paths retain the lexical first constant,
+privacy and autoload behavior. The712-file corpus and original nine-file784-case
+comparison pass without losing a main PASS. The separate module_eval lexical
+negative remains an explicit failing diagnostic; this change does not claim it.
