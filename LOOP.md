@@ -6972,3 +6972,29 @@ constructor gap also agrees on parent and rejected prototype, remaining a
 shared construction/allocator coordination item. No resource cause or fix
 is claimed. Full hosted CI, all existing-file comparisons and P1/P2 resolution
 remain merge gates; the new jobs do not waive any failed existing job.
+
+## 2026-11-20: apply the verified method floor repair to the earlier small-suite branch
+
+PR 119 still fails its original Method-copy assertion at 2.051319x on native
+Linux. Backport the already verified PR 136 repair of compact_method_store
+only: a deferred native compaction must not publish its enlarged arena as
+its next floor. Dirty clearing, the return contract, numeric thresholds,
+unmeasurable-arena behavior and native pin rules remain unchanged.
+
+Same-compiler ordinary O2 parent/candidate/candidate/parent observations give
+1.899619 / 1.592149 / 1.530450 / 1.817941 on native Linux/aarch64 and
+1.790451 / 1.482855 / 1.214509 / 1.875326 on macOS/arm64. Both local parent
+observations pass too; preserve the earlier hosted failure rather than calling
+these a fresh reproduction. All original programs and 2x assertions remain.
+Complete Module (195 tests / 1240 assertions) and Refinement comparisons lose
+no passing cases on either OS. Selected clone and complemented-entry controls
+also pass; this is not an established repair of historical clone failures.
+
+The only ordinary runtime function changed by this backport is
+m_state.compact_method_store. Actual bracket depth is 933/1024; top-level
+bindings remain main 136 / state 1167. See
+gemtest/method_store_floor_pr119_r62.json for every ordinary paired sample
+and raw-log hashes. The full corpus and five-gem verification are in progress
+at this checkpoint. Baselines, locks, compiler pins, workload and resource
+bounds are unchanged. Fresh hosted CI and per-file comparisons still control
+merging.
