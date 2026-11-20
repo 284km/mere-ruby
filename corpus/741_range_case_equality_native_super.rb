@@ -64,3 +64,39 @@ begin
 rescue => error
   p [:raised, error.class, error.message]
 end
+
+# A real native Range entry wins before a lower Ruby equality override.
+module LowerRangeEquality
+  def ===(other); :lower_module; end
+end
+Range.include(LowerRangeEquality)
+p [:native_before_lower_module, (0..6) === 6]
+# Replacing Range's entry removes that native target from super's remainder.
+class Range
+  def ===(other); super; end
+end
+p [:replacement_lower_module, (0..6) === 6]
+module LowerRangeEquality
+  remove_method :===
+end
+r = (1..3)
+p [:replacement, r === 2, r === r, r === (1..3)]
+p [:saved_native_after_replacement, r.saved_case_equal(2)]
+class RangeReplacementChild < Range
+  def ===(other); super; end
+end
+child = RangeReplacementChild.new(1, 3)
+p [:replacement_child, child === 2, child === child, child === (1..3)]
+
+class Range
+  alias_method :===, :saved_case_equal
+end
+p [:restored_native_alias, r === 2, r === r]
+class Range
+  undef_method :===
+end
+begin
+  r === 2
+rescue => error
+  p [:undefined_native, error.class]
+end
