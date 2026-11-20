@@ -4668,3 +4668,12 @@ hashes. Both the native custom-key entry and Ruby override precedence are
 covered. The719-file corpus and original twelve-file1,302-case comparison
 retain every main PASS under unchanged limits. This does not claim to fix all
 other Hash operations' hash-call ordering or the remaining Rails boundaries.
+
+
+The Range super follow-up now distinguishes a prepended/subclass wrapper from
+a replacement defined on Range itself. It uses the real remaining ancestor
+position, including the native entry before lower Ruby definitions, and retains
+main's per-file PASS identities in five complete original files (530 MATCH/
+1 RED/1 BOTH out of532) plus the720-file corpus. Native Kernel Method binding
+on a Range and primitive undef bypass remain explicitly failing standalone
+probes above; neither was repaired by changing a value or hiding a test.

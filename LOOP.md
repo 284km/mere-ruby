@@ -6482,3 +6482,31 @@ gates, dead definitions and depth155/1024. Complete original twelve-file
 comparison:1,302 cases, both main d9826ac9 and candidate **1,284 MATCH/3 RED/
 15 BOTH**, zero EXTRA, no original PASS or file MATCH lost. Original600-second/
 2-GiB/10-second child limits, bootstrap, exclusions and tests are unchanged.
+
+
+### Range review: resume native lookup from the actual ancestor position
+
+A receiver-only native fallback incorrectly reentered containment when Range
+itself replaced ===: that super belongs above Range and reaches equality.
+Include the real native Range entry while resolving super's remaining ancestor
+chain. Ruby definitions and undef before it keep their precedence; a native
+Range entry stops before a lower Ruby override. Both ordinary and refined
+super retain their actual lookup positions. Only Ruby targets consume the
+pending frame index; native comparator callbacks do not inherit that index.
+
+Normal O2 runtime0824a721 passes **720/720 corpus** ON/OFF, all12 comparisons
+for735/741/742 across four hash/MRO modes, nine existing RSS gates, dead
+definitions and C depth155/1024. The original Range/Super/Method/Module pair
+remains409 MATCH/1 RED out of410. Add the whole original Refinement file on
+the same unchanged binary:121 MATCH/1 BOTH out of122 on both sides. Combined
+five-file result:532 cases, both main d9826ac9 and candidate530 MATCH/1 RED/
+1 BOTH, zero EXTRA or lost original PASS. Original600-second/2-GiB/10-second
+child limits, files, bootstrap and exclusions remain unchanged. Subsequent
+parent merges change documentation only; full hosted checks are still required.
+
+Two exploratory controls expose separate preceding-parent gaps: native Kernel
+Method binding loses its owner on a Range receiver, and primitive === bypasses
+an undef. Keep unittest/range_kernel_method_owner_probe.rb and
+unittest/range_case_equality_undef_probe.rb as explicit failing diagnostics;
+these are not claimed repairs, exclusions or passing corpus cases. The older
+direct primitive/object comparison diagnostic also remains unresolved.
