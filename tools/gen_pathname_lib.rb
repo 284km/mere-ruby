@@ -14,7 +14,13 @@
 # where it can be -- over a C half written in Ruby, each method a delegation
 # to File / Dir / IO (see the file).
 here = File.expand_path("..", __dir__)
-files = [[%w[pathname pathname.so], File.read("#{here}/lib/pathname_ext.rb")],
+pathname_core, boundary, pathname_extensions = File.read("#{here}/lib/pathname_ext.rb").partition(
+  "# ---- ruby 4.0.9 lib/pathname.rb ---------------------------------------------\n")
+abort "missing Pathname core/extension boundary" if boundary.empty?
+# Ruby 4.0 supplies the core before any pathname.rb on the load path runs.
+# Keep that body separate so a real wrapper can extend the initialized class.
+files = [[%w[pathname pathname.so], "Pathname\n" + pathname_extensions],
+         [%w[pathname_builtin], pathname_core],
          [%w[find], File.read("#{here}/lib/find_ext.rb")],
          [%w[fileutils], File.read("#{here}/lib/fileutils_ext.rb")],
          [%w[stringio stringio.so], File.read("#{here}/lib/stringio_ext.rb")],
