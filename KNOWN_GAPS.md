@@ -4583,3 +4583,12 @@ bounds. The five-gem baseline remains48 MATCH/14 RED with both sides' actual
 library audits complete. The previous hosted30K-method Timeout remains an
 observation requiring a fresh hosted result; the same original file passes
 locally on both actual CI binaries and the candidate within60 seconds.
+
+
+The final Pathname core entry uses an internal identity anchored in the
+runtime's stdlib directory. A user's same-named ordinary Ruby file remains
+selectable, while the core body keeps its actual implementation(corpus748).
+The integrated714-file corpus and original bounded focused/gem measurements
+pass. The intermediate head's separate Linux Module clone RSS2.0991655787x
+failure remains evidence; fresh final-head hosted gates and every-file
+nonregression are still required, with original assertions and limits intact.

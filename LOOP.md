@@ -6348,3 +6348,30 @@ fallbacks are unchanged: 6 a Regexp in another encoding -- allowing those
 moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
+
+
+### Pathname follow-up: retain an internal core identity and ordinary user files
+
+A same-named user file exposed a further load-order gap in the split-core
+entry. Anchor the existing autoload under the runtime's initialized internal
+stdlib directory as <internal:pathname_builtin>; the factory reads the root
+constant to trigger it. Ordinary pathname.rb and pathname_builtin.rb files
+retain physical load-path selection. Corpus748 checks both the actual core
+operations and the canonical physical loaded feature. It introduces no
+synthetic metadata, hidden library result or new top-level Mere value.
+
+Final O2 runtimeee50b4d8 includes maind9826ac9 and passes714/714 corpus in both
+hash modes,32 focused hash/MRO comparisons, RSS9, roots, dead/duplicate defs
+and depth155/1024. Corpus462.885s/1169328KiB stays inside900s/2GiB. Original
+five-file383-case comparison retains381 MATCH/2 BOTH with no lost PASS or
+file decrease. Original five-gem62-file run retains48 MATCH/14 RED, no
+resource-limit event or baseline regression, and62 physical audits per side.
+The final original30K-method bootstrap passes in34.535s/1190464KiB with the
+same60s child/600s file/2GiB bounds; source-generation parity, six load-path
+and twenty core-harness controls also pass.
+
+The intermediate head27e78973's hosted Linux Module test instead records
+clone RSS72159232 to151474176 bytes(2.0991655787x):195 tests,1240 assertions,
+one failure, no outer-limit event. Preserve this distinct failure; it is not
+waived as complemented-entry noise or replaced by a local pass. The final
+head's complete hosted result and every-file comparison remain merge gates.
