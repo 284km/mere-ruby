@@ -123,3 +123,44 @@ class OverrideArgumentReceiver
   def self.received; @received; end
 end
 p [:override_argument,OverrideArgumentReceiver.received]
+
+# Scope segments supplied by real const_missing hooks are evaluated once.
+module HookedMixinPath
+  Real = Module.new { def hooked_mixin; :hooked; end }
+  Namespace = Module.new
+  Namespace.const_set(:Feature, Real)
+  def self.const_missing(name)
+    ($mixin_scope_calls ||= []) << name
+    name == :Alias ? Namespace : super
+  end
+end
+class HookedMixinReceiver
+  include HookedMixinPath::Alias::Feature
+end
+p [:hooked_scope, HookedMixinReceiver.new.hooked_mixin, $mixin_scope_calls]
+module InheritedMixinPath
+  Feature = Module.new { def inherited_mixin; :inherited; end }
+end
+class InheritedMixinNamespace
+  include InheritedMixinPath
+end
+class InheritedMixinReceiver
+  include InheritedMixinNamespace::Feature
+end
+p [:inherited_scope, InheritedMixinReceiver.new.inherited_mixin]
+TopOnlyMixin = Module.new
+module MissingMixinNamespace; end
+begin
+  Class.new { include MissingMixinNamespace::TopOnlyMixin }
+rescue => error
+  p [:missing_scope, error.class]
+end
+module PrivateMixinNamespace
+  Feature = Module.new
+  private_constant :Feature
+end
+begin
+  Class.new { include PrivateMixinNamespace::Feature }
+rescue => error
+  p [:private_scope, error.class]
+end
