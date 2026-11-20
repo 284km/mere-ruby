@@ -6170,3 +6170,33 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+
+## PR 90 merge gate: preserve the Pathname core before physical extensions
+
+The preceding head's full hosted run was green but lost two Bundler binstub
+cases: the physical Ruby 4.0 pathname.rb extends a core class, while the lazy
+core entry pointed back to that same wrapper. Preserve the actual core body
+separately as pathname_builtin; the existing autoload and Kernel.Pathname
+factory load it, and the ordinary shipped pathname entry adds the extension
+body afterwards. Physical pathname.rb files retain their precedence and can
+extend the initialized class. The source bodies themselves are unchanged.
+
+Normal O2 runtime1e94ce39, pinned compiler01f5ad73, restores the original
+Bundler file from13 to15 MATCH. Full Pathname/Pathname Ractor/Require/Autoload
+comparisons against completed main3b05689f retain every PASS: five files,
+383 cases, both381 MATCH/2 BOTH/0 RED/0 EXTRA. Corpus746/747 cover the physical
+wrapper and factory-first core/library phases. All28 focused hash/MRO-mode
+comparisons and710/710 corpus programs with hash indexing ON/OFF pass. The
+corpus uses462.840s and1,104,448KiB under the unchanged900s/2GiB bound. Nine
+RSS cases, GC roots, dead/duplicate definitions and depth155/1024 pass.
+
+The original offline five-gem62-file run retains48 MATCH/14 RED, no BOTH or
+resource-limit event, zero baseline regressions, and62 physical-library audits
+on each side. Core harness20 and load-path controls6 pass. The unchanged
+30K-method bootstrap completes under the original60s child bound on main's
+actual CI binary(34.657s), the prior PR CI binary(33.547s) and candidate
+(33.721s), with a healthy reference. Retain the prior hosted Timeout; this is
+not a VM speed change or a timeout waiver. New hosted CI, per-file comparison
+and addressed P1/P2 findings are still required before merge. No test, helper,
+limit, exclusion, collector, VM/ISeq, AST/Prism or C API change is used here.
