@@ -7718,3 +7718,10 @@ that incomplete setup is not accepted as a passing comparison. The complete
 context is measured separately. Existing57 exclusions remain explicit and
 unchanged (GC19, compact22, objspace16), and all76 allocation cases remain
 enabled for the VM handoff. Hosted every-file comparison still gates merge.
+
+Final current-main integration checkpoint: all 730 corpus programs match in
+both hash modes after the Digest/CI changes. All 56 focused comparisons,
+including the two new Digest witnesses, pass; nine RSS workloads, roots,
+depth 155 and dead definitions also pass. GC runtime functions, the 159-row
+classification ledger, 57 symmetric exclusions and all original bounds are
+unchanged. Current hosted checks and every-file nonregression still gate merge.
