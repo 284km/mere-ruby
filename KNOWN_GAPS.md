@@ -4675,3 +4675,57 @@ both the hash index and MRO cache are disabled together. The review correction
 changes only the Method/UnboundMethod super arms of invoke_val_c0 and the two
 new and-helpers module_notification_method_after/module_notification_method_mark.
 Full hosted CI and its per-file comparison remain required before merge.
+
+## Rails loading: remaining evaluator boundaries (2026-11-20)
+
+Rooted extend/include factory expressions, real class/module singleton
+extend overrides, autoloaded scoped class namespaces and autoload's main
+require receiver have small matching witnesses in corpus 729-732. The
+original Module/Syntax/Parse/Forwardable/Method/Super/Autoload/Require files
+retain main's per-file MATCH counts (722 cases, 717 MATCH / 1 RED / 4 BOTH).
+
+A validation-only composition still stops migration at a Module subclass's
+block-bearing define_method. Boot, the application's tests and HTTP are
+not reached. The selected original ActiveSupport OrderedOptions, Concern
+and Inflector files discover all 521 cases: 513 MATCH / 8 RED. Remaining
+failures include Hash subclass default reads and Enumerable iteration,
+String-subclass gsub! super, and Unicode lookbehind. This is not the whole
+Rails test suite. No original test or exclusion was changed to obtain it.
+
+Scoped class namespace identity does not repair the existing module_eval
+lexical-nesting bug: unittest/scoped_class_lexical_probe.rb returns :missing
+on reference Ruby and :found on both preceding main and this candidate.
+It is an explicit failing diagnostic, not a passing corpus case.
+
+
+## Module subclass factories and native mixin super (2026-11-20)
+
+Corpus 733/734 now matches real Module-subclass define_method closures,
+named visibility, frozen receivers, Ruby overrides, native mixin super
+returns and singleton missing hooks with blocks. The actual ActiveModel
+factory and Concern boundaries advance in an own Rails composition.
+The next unchanged migration failure is credentials-path construction in
+Pathname#initialize. Boot, application tests and HTTP remain NOT_RUN;
+selected ActiveSupport Hash/default/Enumerable, String gsub! super and
+Unicode-lookbehind failures remain unclaimed. No runtime or test resource
+bound, original test, or exclusion changes were made for these fixes.
+The rooted-loading review also fixes the shadowed three-segment namespace
+regression: corpus738 verifies the lexical first constant, remaining namespace
+walk, explicit root and autoload on both definition paths. The separate
+module_eval lexical-nesting diagnostic above remains a known failure.
+
+Module review corrections retain original missing dispatch for non-native
+Regexp/notification names and send method_added to the actual Module-subclass
+receiver, including native tracing and undef. Corpus739/740 covers these
+boundaries; no original test was excluded for them. The separate native
+alias predicate diagnostic in unittest/native_alias_method_predicate_probe.rb
+prints true on Ruby and false on both main and this candidate; it remains
+unresolved and is not a passing corpus case.
+
+
+The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
+namespace constants and intermediate const_missing results as real scope
+lookups (corpus742). Both definition paths retain the lexical first constant,
+privacy and autoload behavior. The712-file corpus and original nine-file784-case
+comparison pass without losing a main PASS. The separate module_eval lexical
+negative remains an explicit failing diagnostic; this change does not claim it.
