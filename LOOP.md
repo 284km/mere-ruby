@@ -7199,3 +7199,193 @@ existing VM handoff. The same57 excluded identities apply to both sides
 reason. These local observations do not replace full hosted CI or its
 per-file comparison against a completed main run. Previous hosted RSS failures
 remain historical evidence, not waived gates for this new head.
+
+
+## 2026-11-20: rooted mixin arguments, scoped namespace autoload and the autoload loader
+
+Unchanged Rails loading reached three independent evaluator boundaries:
+`extend ::Factory.with(routes)` stopped at the rooted constant; Marcel's
+singleton `extend` was preempted by Kernel's native entry; and
+`class Base::Child` guessed its namespace before resolving Base's autoload.
+Parse the complete rooted expression, let real singleton definitions win,
+and resolve the actual namespace value before registering its child. Keep
+raw self/local namespace references so lexical constants cannot replace them.
+
+Bundler then exposed autoload invoking an object's unrelated `require`
+method. The normal loader now runs with main as receiver, as does the
+already supported custom main loader. It retains the original scope data.
+The small witnesses are corpus 729-732; each matches Ruby in normal mode,
+with the hash index disabled, with the MRO cache disabled, and with both
+disabled (16 comparisons). No new top-level Mere values were added.
+
+Normal O2 on main d9826ac9 plus these repairs: **710/710 corpus files**
+match with the hash index both ON and OFF; all nine original loop RSS checks,
+dead-definition checks and generated-C depth **155/1024** pass. The pinned
+Ruby 4.0.9 files compare as follows, using the same bootstrap and exclusions
+on both sides, 600 seconds per interpreter, 2 GiB per family and the original
+10-second child limits:
+
+| original file | main MATCH | candidate MATCH | RED | BOTH |
+|---|---:|---:|---:|---:|
+| ruby/test_module.rb | 195 | 195 | 0 | 0 |
+| ruby/test_syntax.rb | 168 | 168 | 0 | 2 |
+| ruby/test_parse.rb | 102 | 102 | 0 | 0 |
+| test_forwardable.rb | 27 | 27 | 0 | 0 |
+| ruby/test_method.rb | 97 | 97 | 1 | 0 |
+| ruby/test_super.rb | 50 | 50 | 0 | 0 |
+| ruby/test_autoload.rb | 27 | 27 | 0 | 1 |
+| ruby/test_require.rb | 51 | 51 | 0 | 1 |
+
+That is **722 discovered / 717 MATCH / 1 RED / 4 BOTH**, on both builds,
+with no original passing case lost. Module retains all **1,240 assertions**.
+An earlier attempt lowered every `include m` to a general method call and
+made the original iclass child exceed 10 seconds. Keep the direct include
+path for ordinary names and use expression parsing for the computed ternary
+that actually needs it. The bound and the original test stay unchanged.
+Earlier paired Syntax runs on the previous main had the same invalid-symbol
+memory-test timeout on both builds; retain those observations separately.
+
+An own validation-only composition reaches the next actual Rails failure:
+ActiveModel's Module subclass cannot define a method from a block. Migration
+fails, so boot, application tests and HTTP remain NOT_RUN. Reused own gem
+homes make this a warm diagnostic, not a new installation or Rails pass.
+The original selected ActiveSupport files are 513 MATCH / 8 RED out of 521;
+no framework-wide pass is claimed. The pre-existing module_eval lexical
+negative case remains RED and is kept as unittest/scoped_class_lexical_probe.rb.
+
+
+## 2026-11-20: Module subclass method factories and native super before missing hooks
+
+ActiveModel's AcceptsMultiparameterTime is a Module subclass whose initialize
+includes methods, defines a closure and marks its method private. The real
+module backing already existed, but its delegation predicate omitted
+`define_method` and named visibility. Admit those native operations while
+retaining Ruby overrides, the original receiver's freeze check and nil from
+an argument-free private call even on a frozen module. The SVis statement
+with names reaches that same real receiver, preserving overrides.
+
+ActiveSupport::Concern then reached super from append_features on a module
+that also defines an INSTANCE method_missing. super_missing tried that
+instance hook before the real native mixin entry. Try native ancestors first;
+missing dispatch on a class/module belongs to its singleton chain. Native
+append_features/prepend_features/extend_object reuse ordinary native dispatch
+for their actual return, validation, freeze checks and ancestry bookkeeping.
+No new top-level values or collector/state/VM/AST/C API changes.
+
+On main d9826ac9 plus the preceding rooted-loading repair, normal O2:
+**712/712 corpus files** match with the hash index ON and OFF; corpus 733/734
+also matches with normal/hash-off/MRO-off/both-off settings (eight pairs).
+All nine existing loop RSS checks, dead definitions and generated-C depth
+**155/1024** pass. Complete original Module195, Class61, Refinement121,
+Super50, Method97, Parse102, Forwardable27, Autoload27 and Require51 MATCH
+are identical to main. Module retains all 1,240 assertions and zero skips.
+The 10-file first pair discovers 906 cases: main899 MATCH/1 RED/6 BOTH,
+candidate898/2/6, with only README's known invalid-symbol Syntax memory test
+lost. Repeating the WHOLE unchanged Syntax file gives main167/candidate168
+MATCH (two BOTH each); retain both raw pairs, without a new exclusion or a
+larger limit. Every focused file has a candidate run retaining main's MATCH.
+The original 600-second/2-GiB and 10-second leak-child bounds remain intact.
+
+The own Rails validation composition passes the previous two boundaries,
+then migration fails in Pathname#initialize called by Application#encrypted
+for credentials. Reference's four application stages pass; candidate
+migration takes 8.877 seconds/1,011,920 KiB with no resource event, while
+boot/tests/HTTP remain NOT_RUN. This reused-own-gem diagnostic is not a cold
+installation or Rails pass. Hash default reads and other selected original
+ActiveSupport failures remain separate work. The constructor's captured
+Hash default-block behavior is already a separate unmerged prerequisite;
+these Module changes do not claim to supply it.
+### Rooted loading review: choose a scoped namespace lexically (2026-11-20)
+
+Review found a real regression when both A::B and Scope::A::B exist:
+`class A::B::Child` inside Scope selected the outer namespace. Resolve an
+unrooted prefix's first segment in its lexical scope, then walk the remaining
+segments from that actual module. Preserve explicit :: roots and existing
+self/local bindings. Corpus738 covers class/module/conditional definitions,
+root anchors, aliases and lexical autoloads; it and729-732 match in all four
+hash/MRO settings (20 comparisons).
+
+Normal O2 bcb3bca9: **711/711 corpus**, hash index ON/OFF; all nine existing
+RSS checks, dead definitions and C depth155/1024 pass. The original nine-file
+pair discovers784 cases on both builds: **777 MATCH/2 RED/5 BOTH** on each,
+with no original PASS identity lost. Class61, Module195, Syntax167, Parse102,
+Forwardable27, Method97, Super50, Autoload27 and Require51 MATCH are equal.
+The known invalid-symbol Syntax memory failure occurs on both main and this
+candidate; earlier168-MATCH observations are retained, not overwritten.
+No original test, exclusion or limit changed. Hosted checks must still finish
+on the review correction before merge.
+
+### Module review: real native ancestors and original notification receivers (2026-11-20)
+
+Restrict Regexp-subclass fallback to actual Regexp methods, and empty
+notification fallback to receivers that inherit that native hook. Unknown
+super calls continue to the original receiver's missing handler, including
+arguments and blocks. Corpus739 covers both reported regressions, genuine
+native controls and an undef before the native hook.
+
+A Module subclass's anonymous module stores its methods; the original object
+receives method_added. Read the existing backing-to-object ancestry mapping,
+select a Ruby body, native alias, undef or Module's actual empty entry in
+ancestor order, and notify once after visibility is established. The Proc
+and Method argument forms now also notify after installation. The native
+empty callback emits c_call/c_return on the real receiver when observed.
+Corpus740 covers inherited/singleton/global callbacks, block/Proc/Method
+forms, private initialize, exceptions without rollback, frozen refusal,
+actual TracePoint receiver/owner, saved native callbacks and undef. The
+first unconditional invocation missed the ordinary native callback on an
+unmodified Module subclass; the original733 witness caught it and stopped
+the attempted sweep. Preserve that failed record separately.
+
+Final normal O2 ec6d6a5a: **715/715 corpus**, hash index ON/OFF, all36 witness
+comparisons in four hash/MRO modes, all nine existing RSS checks, dead
+definitions and depth155/1024 pass. Twelve original files discover1170 cases:
+main1155 MATCH/7 RED/7 BOTH/1 EXTRA, candidate1157/5/7/1, with no original
+passing identity or per-file MATCH lost. Module195/1240 assertions and
+Regexp161 MATCH are retained. Settracefunc96->97 and Syntax167->168 are
+observations, not claimed causal improvements; all raw pairs remain.
+No original test, exclusion or resource limit changes.
+
+A separate existing metadata failure stays explicit in
+unittest/native_alias_method_predicate_probe.rb: method_defined? misses a
+real native alias on both main and candidate. Notification witnesses obtain
+the installed method directly; this change does not claim that predicate
+repair or a full Rails pass. Hosted CI remains required on the corrected head.
+
+
+### Scoped namespace review: every remaining segment is a real scope lookup
+
+Resolving the first constant lexically was necessary but did not make
+const_walk_go a full scope lookup. Object::Branch uses a top-level Branch
+key; ancestor constants and intermediate const_missing results were also lost.
+Add scoped_namespace_tail to follow the actual receiver through each scope
+operator, with Object's top-level keys, ancestors, autoload, privacy and the
+real const_missing callback. Preserve the first-segment lexical correction.
+Corpus742 covers class/module definitions, nested and conditional definitions,
+Object roots, inherited namespaces, intermediate hooks, autoload and refusals.
+
+Normal O2 runtime48f8e37f: **712/712 corpus**, index ON/OFF;729-732/738/742
+match all24 hash/MRO mode comparisons. All nine existing RSS gates, dead
+definitions and C depth155/1024 pass. Complete original Class/Module/Syntax/
+Parse/Forwardable/Method/Super/Autoload/Require discover784 cases: main d9826ac9
+and candidate both777 MATCH/2 RED/5 BOTH, zero EXTRA or lost original PASS.
+Module retains195 tests and1,240 assertions. The existing invalid-symbol Syntax
+memory failure is present on both; original test files, bootstrap, exclusions
+and600-second/2-GiB/10-second child limits are unchanged. This correction
+requires new hosted checks; the previous head's known complemented-method
+10.03-second child Timeout is retained rather than waived for merge.
+
+
+### Module stack after the scoped-namespace follow-up (2026-11-20)
+
+Rebuild the Module repairs with the parent's full scoped-constant correction.
+Normal O2 runtime f6975772 passes **716/716 corpus**, hash index ON/OFF,
+all40 witness comparisons across four hash/MRO modes, all nine existing RSS
+gates, dead definitions and C depth155/1024. Twelve complete original files
+find1,170 cases: both main d9826ac9 and candidate **1,156 MATCH/6 RED/7 BOTH/
+1 EXTRA**, with no original PASS or per-file MATCH lost. Module195 with1,240
+assertions, SetTraceFunc97, Regexp161, Class61, Refinement121, Super50,
+Method97, Syntax167, Parse102, Forwardable27, Autoload27 and Require51 are
+retained. The known Syntax-memory failure remains on both sides. All original
+limits, tests, bootstrap and exclusions are unchanged. Parent documentation
+was merged after measurement; it changes no runtime source. Hosted checks
+must complete on the updated head before merge.
