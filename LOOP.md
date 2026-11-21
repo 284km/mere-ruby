@@ -7156,3 +7156,33 @@ and native-super cases. The original Module/Method/Super files retain
 workloads, roots, depth 155 and dead definitions pass. The earlier 708-program
 result remains tied to its preceding integration; current hosted checks and
 every-file comparison still gate this head.
+
+
+## Deliver Class registry and Module notification repairs directly to main
+
+PR #132 previously targeted the closed, unmerged Class branch. Deliver both
+reviewed repairs together against main, preserving the Ruby subclasses registry
+and real Class native entry alongside the Module notification owner protocol.
+Integrate main 2e2ab568 without manually resolving any runtime conflict; both
+independent documentation records are retained. The generic alias-origin and
+saved native metadata issues #124/#133 remain outside this repair.
+
+Normal O2 runtime 732c99ab, compiler 01f5ad73: all 723 corpus programs match with
+hash indexing ON/OFF (538.321 seconds / 1,113,104 KiB under unchanged 900-second /
+2-GiB bounds). All 36 focused hash/MRO comparisons, nine RSS cases, roots,
+depth 155 and dead definitions pass. Original Class/Module/Method/Super/Refinement
+cover 527 cases / 525 MATCH / 1 existing RED / 1 BOTH, with no file below completed
+main d9826ac9. Class uses its unchanged native fixture built separately against
+each runtime's own headers and passes all 62 cases. The earlier missing-fixture
+context remains diagnostic; the final Class comparison has a healthy reference.
+All 49 captured Mere-source/binary hashes stay fixed.
+
+The actual unchanged Rails RakeCommand registers and is found on both runtimes
+in a separate saved-own-gems diagnostic (reference 0.692 seconds, candidate 1.490).
+The original migration CLI on a fresh unchanged app then reaches the next Hash
+configuration setter issue #123, exit 1 in 2.538 seconds / 306,800 KiB; reference
+migration passes. This diagnostic reuses each runtime's independently built
+gems and is not a cold installation or an accepted six-stage application pass.
+The previous main Rails measurement and all NOT_RUN states remain unchanged.
+No source lock, original test, exclusion, API inventory or bound changes.
+Current-head hosted CI, full file comparisons and review still gate merge.

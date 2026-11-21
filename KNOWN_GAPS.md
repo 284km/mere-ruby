@@ -4900,3 +4900,16 @@ lookups (corpus742). Both definition paths retain the lexical first constant,
 privacy and autoload behavior. The712-file corpus and original nine-file784-case
 comparison pass without losing a main PASS. The separate module_eval lexical
 negative remains an explicit failing diagnostic; this change does not claim it.
+
+
+PR #132 now targets main and includes the unmerged Class registry correction,
+so its integration no longer depends on merging into a closed parent branch.
+The actual RakeCommand registry matches Ruby in a saved-own-gems diagnostic;
+the fresh app's unchanged migration CLI advances to the separate Hash setter
+issue #123. This is not a new cold-install or Rails application/framework pass.
+The independent alias-origin and saved-native-metadata issues #124/#133 remain.
+Normal O2 validation covers 723 corpus programs in both hash modes and all 527
+original Class/Module/Method/Super/Refinement cases with 525 MATCH / 1 existing
+RED / 1 BOTH, no per-file MATCH loss against completed main d9826ac9. Class's
+native fixture is built separately against each interpreter's real headers.
+No original test, exclusion, resource bound or API inventory changes.
