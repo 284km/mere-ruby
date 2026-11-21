@@ -3965,6 +3965,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_len name > 0 && str_eq (char_at name 0) "$" then
       (let k = gvar_slot (substring name 1 (str_len name)) in
        let _ = ractor_gvar_check world k in
+       // (a global whose value C keeps: rb_define_variable)
+       if map_len capi_gvar > 0 && map_has capi_gvar k then capi_gvar_call world k false VNil else
        if map_len ractor_stdio > 0 && map_has ractor_stdio (str_of_int (ractor_cur_key ()) ++ ":" ++ k)
        then map_get ractor_stdio (str_of_int (ractor_cur_key ()) ++ ":" ++ k) else
        // `$=` is deprecated in Ruby and reading it warns -- through Warning.warn,
@@ -6621,7 +6623,10 @@ and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
                    //  other global: only the same slot's spelling is used)
                    if str_len n9 > 1 && str_eq (gvar_slot (substring n9 1 (str_len n9))) slot then n9 else "$" ++ slot)
              else "$" ++ slot) in
-  let _ = (if str_eq slot "~" then rx_md_set v else (let _ = bx_note_gvar slot in map_set globals slot v)) in
+  let _ = (if str_eq slot "~" then rx_md_set v
+           // (a global whose value C keeps: its C setter takes the value)
+           else if map_len capi_gvar > 0 && map_has capi_gvar slot then (let _ = capi_gvar_call world slot true v in ())
+           else (let _ = bx_note_gvar slot in map_set globals slot v)) in
   // (the warning comes AFTER the store: a Warning.warn that prints sees the
   //  new $\ already, as ruby's does -- its line ends with it)
   // (and $\, the output record separator: rb_output_rs_setter warns too)
@@ -7964,10 +7969,19 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
      | _ -> 0)
   else if r.op == 15 then
     (match capi_in r.a with
-     | VClass c -> (if r.b < 0 then (let _ = map_delete capi_alloc c in 0) else (let _ = map_set capi_alloc c r.b in 0))
+     // (-2: which C function allocates this class's instances -- rb_get_alloc_func)
+     | VClass c when r.b == 0 - 2 -> capi_allocator world c
+     // (-1: rb_undef_alloc_func -- the class has NO allocator from here on,
+     //  which is not the same as having ruby's own: kept as -2)
+     | VClass c -> (if r.b < 0 then (let _ = map_set capi_alloc c (0 - 2) in 0) else (let _ = map_set capi_alloc c r.b in 0))
      | _ -> let _ = raise_exc world "TypeError" "C API: an allocator is defined on a class" in 0)
   else if r.op == 16 then
     (match capi_in r.a with
+     // (b = 1: an instance the way ruby's own allocator makes one for this
+     //  class -- an empty String for a String subclass, a plain object
+     //  otherwise -- whatever C allocators the class has: what
+     //  rb_get_alloc_func answers for a class C defined no allocator on)
+     | VClass c when r.b == 1 -> capi_out (alloc_empty world c)
      | VClass c ->
        let oid = alloc_oid ocls in
        let _ = map_set ocls oid c in
@@ -8000,6 +8014,35 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
     (let cnoblk = (false, (Nil : str list), (Nil : Stmt list), cenv) in
      capi_out (invoke_val_c cenv world cnoblk VMain "eval"
                  (Cons (mkstr (str_of_bytes (mr_capi_bytes ())), Nil)) false))
+  // rb_define_variable and its kin: a global whose value C keeps. (It is
+  // given a place among the globals too, so that it is listed and defined.)
+  // (answers the name the variable is kept under -- the alias's original
+  //  where the name was aliased first -- which C records it by, since that
+  //  is the name gvar_access is called with)
+  else if r.op == 27 then
+    (let slot = gvar_slot (mr_capi_text ()) in
+     let _ = map_set capi_gvar slot r.a in
+     let _ = (if map_has globals slot then () else map_set globals slot VNil) in
+     capi_out (mkstr slot))
+  // rb_backref_get / rb_backref_set: `$~` of the frame the C method runs in.
+  // ⚠ A C METHOD HAS NO `$~` OF ITS OWN, as ruby's C functions have none: it
+  //   runs under its caller's (rx_cfunc_frame, capi_dm_body), so the value in
+  //   rx_md is the caller's however the call was reached. Looking the caller
+  //   up from the C method's frame -- the first frame below it on fb_env_at,
+  //   then its lexical home -- missed three ways: a Fiber's or a Thread's body
+  //   matches into a `$~` of its own, not its home's (rx_blk_home), so a read
+  //   there answered the outer match and a write changed it; and
+  //   `public_send`, `class_eval` and `module_eval` leave no entry of their own
+  //   there, so the lookup fell back to the C method's empty frame. And a
+  //   Regexp#match C sends now sets the caller's `$~`, as in ruby.
+  else if r.op == 26 then
+    (if r.a == 0 then
+       (let i = vec_get rx_md 0 in
+        if i < 0 then capi_out VNil else (let _ = md_force world i in capi_out (VObj i)))
+     else
+       (let i = (match capi_in r.b with VObj o -> o | _ -> 0 - 1) in
+        let _ = vec_set rx_md 0 i in
+        capi_out VNil))
   else if r.op == 21 then
     capi_out (capi_proc world r.a (if r.c == 2 then VNil else capi_in r.b) r.c (if r.c == 2 then r.b else 0 - 1) r.d (capi_in r.e))
   else if r.op == 23 then
@@ -8026,11 +8069,25 @@ and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) 
   let _ = put 0 args in
   // (the frame that made the call: the one below the C method's own frame,
   //  which is the define_method body's -- it has the body's `&__b`)
+  // ⚠ THE C METHOD'S FRAME CAN STAND AT TWO DEPTHS, and the caller is below
+  //   both: a C method called in a block that a Ruby method yields to has its
+  //   frame at the call's depth and again at the body's, so "one below" was
+  //   the C method itself. Every entry that is this frame (its fid) is passed
+  //   over. And a call from the top level has its caller at -1, the main
+  //   script's env (m_driver), which `at > 0` left out. (rb_backref_get read
+  //   its `$~` through this once, and lost the match ruby/spec's regexp_spec
+  //   had just made in mspec's blocks; it reads rx_md now -- request 26 -- and
+  //   this env is rb_eval_string's binding.)
   let depth = cd_get () in
+  let fid_of = fn e -> (if map_has e "__fid" then (match map_get e "__fid" with VInt t -> t | _ -> 0 - 1) else 0 - 1) in
+  let me9 = fid_of env in
   let own = fn (d: int) ->
-    d >= 0 && map_has fb_env_at d && map_has (map_get fb_env_at d) "__in_dm" && map_has (map_get fb_env_at d) "__b" in
+    d >= 0 && map_has fb_env_at d && map_has (map_get fb_env_at d) "__in_dm" && map_has (map_get fb_env_at d) "__b"
+    && (me9 < 0 || fid_of (map_get fb_env_at d) == me9) in
   let at = (if own depth then depth else if own (depth - 1) then depth - 1 else 0 - 1) in
-  let cenv = (if at > 0 && map_has fb_env_at (at - 1) then map_get fb_env_at (at - 1) else env) in
+  let rec below = fn (d: int) -> if own d then below (d - 1) else d in
+  let c9 = (if at >= 0 then below at else 0 - 2) in
+  let cenv = (if c9 >= 0 - 1 && map_has fb_env_at c9 then map_get fb_env_at c9 else env) in
   let up = fn (r: CapiReq) ->
     try_or_msg (fn (u: unit) -> capi_up env cenv world r)
       (fn (message: str) ->
@@ -8043,6 +8100,13 @@ and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) 
   let ret = mr_capi_enter up req in
   if ret.raised == 0 then capi_in ret.w
   else capi_resume world (capi_in ret.w)
+// whether the method dk was defined from such a Proc's body (kind 2): a C
+// method, which runs under its caller's `$~` (rx_cfunc_frame)
+and capi_dm_body = fn (dk: str) ->
+  map_has dm_closenv dk
+  && (match map_get dm_closenv dk with
+      | VProc pid -> (match proc_get (str_of_int pid) with (_, _, _, e) -> map_has e "__capi_m")
+      | _ -> false)
 // A Proc whose body runs a C function: a method body (kind 2: defined with
 // define_method, so `self` is the receiver), or a block (kind 0, 1 a lambda).
 and capi_proc = fn world -> fn (number: int) -> fn (data: Val) -> fn (kind: int) -> fn (arity: int) -> fn (mid: int) -> fn (fblock: Val) ->
@@ -8053,6 +8117,10 @@ and capi_proc = fn world -> fn (number: int) -> fn (data: Val) -> fn (kind: int)
   let _ = map_set benv "__cref" (mkstr "") in
   let _ = map_set benv "__capi_data" data in
   let _ = map_set benv "__capi_m" (VInt mid) in
+  // (a C function closes over no Ruby variable: as a method it is one any
+  //  Ractor may call -- the mark an isolated block's env carries -- where a
+  //  method made from an ordinary Proc belongs to the Ractor that made it)
+  let _ = (if kind == 2 then map_set benv "__isoout" (mkstr "") else ()) in
   let body = Cons (SExpr (ECapi (kind, number, arity)), Nil) in
   let pid = proc_next () in
   // A method of a fixed number of arguments has that many parameters, so its
@@ -8102,6 +8170,11 @@ and capi_allocator = fn world -> fn (cls: str) ->
     | Nil -> 0 - 1
     | Cons (c, rest) -> if map_has capi_alloc c then map_get capi_alloc c else find rest in
   find (ancestors_of world cls)
+// A global C keeps, read or written: the C function registered for it is
+// called with the name, whether this is a write, and the value.
+and capi_gvar_call = fn world -> fn (slot: str) -> fn (write: bool) -> fn (v: Val) ->
+  capi_enter gc_cenv0 world (CapiReq { op = 1, a = map_get capi_gvar slot, b = capi_out VMain, c = 3, d = 4, e = 0 })
+    (Cons (mkstr slot, Cons (VBool write, Cons (v, Nil))))
 and capi_allocate = fn world -> fn (cls: str) ->
   capi_enter gc_cenv0 world (CapiReq { op = 1, a = capi_allocator world cls, b = capi_out (VClass cls), c = 0, d = 4, e = 0 }) Nil
 and capi_construct = fn world -> fn (cls: str) -> fn (args: Val list) -> fn blk ->
@@ -18938,6 +19011,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (if (match args with Nil -> false | _ -> true) then
          raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
        else if map_len capi_alloc > 0 && capi_allocator world c >= 0 then capi_allocate world c
+       else if map_len capi_alloc > 0 && capi_allocator world c == 0 - 2 then
+         raise_exc world "TypeError" ("allocator undefined for " ++ cls_display world c)
        else alloc_empty world c)
     // `private_class_method :new` (or `private :new` inside `class << self`)
     // makes .new private: the constructor is hidden and the class hands out
@@ -48506,7 +48581,7 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     let _ = bind_params_m frame world blk name params defaults args in
     let _ = (if share_rest_args then map_set frame "__args" (map_get frame (splat_name params)) else ()) in
     let _ = (match blk with (true, _, _, _) -> (if vs9 then () else unused_blk_warn world dk defcls name params body) | _ -> ()) in
-    let _ = (if map_has meth_cfn dk then rx_cfunc_frame frame else ()) in
+    let _ = (if map_has meth_cfn dk || capi_dm_body dk then rx_cfunc_frame frame else ()) in
     // `$~` (and with it $1..$9, $&, $`, $') belongs to the frame that matched:
     // ruby makes a method's match invisible to its caller, and the caller's
     // invisible to the method (method_body_flow parks and restores it). A
@@ -56815,6 +56890,8 @@ and new_plain_object = fn world -> fn (cls: str) -> fn (args: Val list) ->
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
   if map_len capi_alloc > 0 && capi_allocator world cls >= 0 then
     capi_construct world cls args (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
+  else if map_len capi_alloc > 0 && capi_allocator world cls == 0 - 2 then
+    raise_exc world "TypeError" ("allocator undefined for " ++ cls_display world cls)
   else
   // (a Regexp itself is the value Regexp.new builds: see new_obj_wb)
   if str_eq cls "Regexp" && (if has_meth world cls "initialize" then false else true) then
@@ -57012,6 +57089,8 @@ and tp_init_around = fn world -> fn (obj: Val) -> fn k ->
 // `C.new(&pr)` reaches an `initialize(&b)`. Containers keep their own paths.
 and new_obj_wb = fn world -> fn (cls: str) -> fn (args: Val list) -> fn theblk ->
   if map_len capi_alloc > 0 && capi_allocator world cls >= 0 then capi_construct world cls args theblk
+  else if map_len capi_alloc > 0 && capi_allocator world cls == 0 - 2 then
+    raise_exc world "TypeError" ("allocator undefined for " ++ cls_display world cls)
   else
   if str_eq cls "Hash" || str_eq cls "Array" || str_eq cls "String" then new_obj world cls args
   // (a Regexp itself -- `new(s, o)` in Regexp.json_create -- is the value
