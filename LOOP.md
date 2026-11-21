@@ -7389,3 +7389,28 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+### Stage 9: preserve native launchers and finish current-main integration
+
+Integrate main a206da11 after the native-extension runner change. The manual
+runner resolution retains the current mr_run child launcher and Perl entry,
+and UNITTEST_EXCLUSIONS still writes the separate per-file exclusion sidecar.
+Only appended documentation requires manual resolution in the final merge;
+no collector, state, VM or C API function is manually changed.
+
+Final O2 validation: 728/728 corpus programs match in both hash modes,
+514.759 seconds / 1,113,136 KiB under the unchanged 900-second / 2-GiB bound.
+All 88 focused comparisons on the default runtime, nine RSS workloads,
+roots, depth155 and dead definitions pass. An additional forced evaluator
+comparison differs on the existing unused-block and two lexical-namespace
+witnesses; it is retained separately and is not reported as passing.
+
+On the preceding native-main integration, the actual pinned CI reference
+runtime, source and test extensions give GC 32 MATCH / 1 RED / 2 BOTH over
+35 cases with the same19 exclusions on both sides. The original two mkmf
+cases give1 MATCH / 1 RED: ruby_init remains an unsupported link symbol.
+The first local reference setup lacked its Makefile and test stack extension;
+that incomplete setup is not accepted as a passing comparison. The complete
+context is measured separately. Existing57 exclusions remain explicit and
+unchanged (GC19, compact22, objspace16), and all76 allocation cases remain
+enabled for the VM handoff. Hosted every-file comparison still gates merge.
