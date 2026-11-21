@@ -4810,6 +4810,30 @@ zero failures/errors/skips, outer 23.441 seconds / 365,632 KiB. The
 The updated hosted CI, Linux Module memory gate and all-file comparison
 against complete main remain required before merge. No bound is changed.
 
+## Rails dependency checksums and the next command boundary (2026-11-19)
+
+SHA-2 can use the real internal OpenSSL provider when already loaded, as
+RubyGems package security does. Digest-only and portable targets retain the
+original algorithms. This does not make large standalone interpreted
+hashes fast. The public algorithms and their real results are unchanged;
+no checksums are skipped or supplied from the dependency manifest.
+
+The own C API + SHA-2 candidate installs all 68 pinned Rails dependencies
+inside the existing 600-second / 2-GiB budget. Main still needs the separate
+mkmf/build metadata integration. The candidate's next failure precedes DB
+migration: Rails::Command's Ruby subclasses registry is bypassed by the
+native Class#subclasses path. The small module/inherited reproduction also
+fails on unmodified main. Rails boot, SQLite execution, application tests
+and HTTP remain unconfirmed on mere-ruby; the reference app remains healthy.
+
+
+The SHA-2 provider connection splits updates into 1-MiB byte slices, so
+large standard Digest inputs do not inherit the private provider wire
+request limit. Actual 64-MiB-plus binary inputs match the reference for
+SHA256/384/512 through direct, buffered incremental and file entry points.
+The 64-MiB provider wire bound itself remains unchanged. This does not
+remove the existing buffered Digest implementation's memory cost.
+
 ## Rails application installation and execution (2026-11-19)
 
 `railstest/` fixes a Rails 8.1.4.1 application, 69 source archives and
