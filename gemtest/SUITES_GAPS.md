@@ -91,6 +91,17 @@ It is not repaired by the native-super ordering change or omitted from an
 upstream file. The focused new witness tests native-super ordering and an
 undef farther behind the already selected native entry.
 
+PR #92 Module RSS follow-up (2026-11-20): its original complemented-entry
+case still has a preserved hosted 2.026060x failure. A single-refinery live
+snapshot no longer duplicates the fixed entry it already restores. The
+unchanged local Linux case moves from 2.168020x failure to 1.722404x success,
+with comparable initial RSS and all three original assertions. Complete
+Module and Refinement files retain their case identities and results on
+macOS and Linux/aarch64. This is a metadata-storage change in ref_snapshot,
+not a change to GC or the bounds. Fresh hosted CI remains required, and
+Method-copy and other resource failures are not waived. See
+module_rss_pr92_r55.json; no existing source lock or baseline is replaced.
+
 | Suite / file | Observed difference | Ownership and next step |
 |---|---|---|
 | minitest / `test_minitest_mock.rb` | Executes all 94 tests; 1 failure, 2 errors and 10 skips after native protocol aliases and sender fixes (previously 8 errors). The remaining cases are private Kernel stubs and a dynamic method's super fallback. | Ruby semantics. Keep the real source and exact assertion comparison; do not claim these remaining cases fixed. |
