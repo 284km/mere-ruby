@@ -6981,3 +6981,29 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+
+## Replay the original Rails native-build issue on integrated main
+
+Issue #116 was left open while the own build metadata (#95) and bounded SHA-2
+provider (#120) were unmerged. Both are now in main 2e2ab568. A fresh normal O2
+build with main's pinned compiler 01f5ad73 and the unchanged committed Rails
+runner installs Bundler and all 68 dependencies from the same 69 archives.
+Separate initially empty gem homes and independently built extensions remain;
+the same documented system SQLite 3.46.1 option is used on both interpreters.
+
+The dependency stage exits 0 in 253.379 seconds / 914,976 KiB, within the existing
+600-second/2-GiB family bounds. The original small mkmf probe matches and the
+actual bigdecimal Makefile/build uses this runtime's own headers. All 77 captured
+runtime/runner/lock input hashes stay fixed, all stored stdout/stderr hashes
+verify, and seven harness controls pass. The initial sandbox-denied ps check
+is separate setup evidence; the same harness passes with normal permissions.
+
+Reference passes all six stages, including six tests / 31 assertions and actual
+Puma HTTP. Mere's original migration then stops at the separately tracked #121
+registry error, perform on nil, exit 1 in 2.062 seconds / 199,616 KiB. Boot/tests/
+HTTP are NOT_RUN and the whole record remains RED. Keep all earlier source-
+specific records, add railstest/main_native_install.json, and correct the stale
+README statement about current main. This meets #116's first-extension-build
+acceptance condition without claiming Rails application/framework success.
+Runtime functions changed: none; no lock, test, exclusion or bound changes.
