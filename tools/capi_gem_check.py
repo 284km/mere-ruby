@@ -83,6 +83,7 @@ def run(key, side, command, home, seconds):
     env.update(GEM_HOME=str(home), GEM_PATH=str(home), LANG='en_US.UTF-8', HOME=str(OUT / 'home'))
     if side == 'mere':
         env['RUBYLIB'] = os.pathsep.join([*runtime, stdlib])
+        env['MERE_RUBY_STDLIB_FALLBACK'] = stdlib
     log = OUT / f'{key}.{side}.out'
     old = Path.cwd()
     try:
