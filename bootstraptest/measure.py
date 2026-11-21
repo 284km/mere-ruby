@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -48,10 +49,31 @@ def plan(args):
             raise ValueError('full commit SHAs required')
     if revision(args.ruby_src) != args.ruby_ref:
         raise ValueError('Ruby source does not match manifest')
-    ci.save(args.output, dict(schema=1, policy=POLICY, source_ref=args.source_ref,
-                             mere_ref=args.mere_ref, ruby_ref=args.ruby_ref,
-                             shards=args.shards, files=selected, empty_inputs=empty_inputs(args.ruby_src),
-                             input_sha256={file: ci.digest(args.ruby_src / file) for file in selected}))
+    manifest = dict(schema=1, policy=POLICY, source_ref=args.source_ref,
+                    mere_ref=args.mere_ref, ruby_ref=args.ruby_ref,
+                    shards=args.shards, files=selected, empty_inputs=empty_inputs(args.ruby_src),
+                    input_sha256={file: ci.digest(args.ruby_src / file) for file in selected})
+    timing_path = getattr(args, 'timings', None)
+    if timing_path:
+        timing = ci.load(timing_path)
+        seconds = timing['seconds']
+        if (timing['schema'] != 1 or not isinstance(seconds, dict)
+                or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                       for value in seconds.values())):
+            raise ValueError('invalid bootstrap timing estimates')
+        if timing['ruby_ref'] != args.ruby_ref:
+            seconds = {}
+        # Preserve the previous worst-case files-per-job bound: each file
+        # can consume two 600-second sides even when its estimate is short.
+        max_files = (len(selected) + args.shards - 1) // args.shards
+        groups, totals = ci.balance(selected, args.shards, seconds, max_files=max_files)
+        manifest.update(schema=2, partitions=groups,
+                        scheduling=dict(policy='longest-first-capped-v1', timing_sha256=ci.digest(timing_path),
+                                        max_files=max_files,
+                                        matched_files=sum(file in seconds for file in selected),
+                                        unknown_seconds=60, estimated_seconds=totals))
+    ci.partitions(manifest)
+    ci.save(args.output, manifest)
 
 
 def parse_cases(path, execution):
@@ -125,6 +147,7 @@ def compare(reference, mere):
 
 def measure(args):
     manifest, build, reference = ci.load(args.plan), ci.load(args.build_info), ci.load(args.reference_info)
+    groups = ci.partitions(manifest)
     args.output.mkdir(parents=True, exist_ok=True)
     if (manifest['policy'] != POLICY or files(args.ruby_src) != manifest['files']
             or manifest['empty_inputs'] != empty_inputs(args.ruby_src)
@@ -147,9 +170,7 @@ def measure(args):
     ci.save(args.output / 'result.json', result)
     os.environ['REF_RUBY_BIN'] = str(args.reference.resolve())
     try:
-        for index, file in enumerate(manifest['files']):
-            if index % manifest['shards'] != args.shard:
-                continue
+        for file in groups[args.shard]:
             row = dict(file=file, empty_input=file in manifest['empty_inputs'])
             parsed = {}
             with tempfile.TemporaryDirectory(prefix='mr-bootstrap-', dir='/tmp') as temp:
@@ -205,6 +226,7 @@ def measure(args):
 
 def merge(args):
     manifest = ci.load(args.plan)
+    groups = ci.partitions(manifest)
     rows, seen, provenance, errors = [], set(), [], []
     for path in sorted(args.input.rglob('result.json')):
         result = ci.load(path)
@@ -216,7 +238,7 @@ def merge(args):
             errors.append(dict(shard=result['shard'], error=result['infrastructure_error']))
         provenance.append(dict(build=result['build'], reference=result['reference'], harness=result['harness'], wall_seconds=result['wall_seconds'], rss_kb=result['rss_kb']))
         for row in result['rows']:
-            if row['file'] not in manifest['files'] or manifest['files'].index(row['file']) % manifest['shards'] != result['shard']:
+            if row['file'] not in groups[result['shard']]:
                 raise ValueError('unplanned bootstrap row')
             if any(type(row['counts'].get(key)) is not int or row['counts'][key] < 0 for key in ci.COUNTS):
                 raise ValueError('invalid bootstrap counts')
@@ -251,6 +273,12 @@ def merge(args):
     print(json.dumps({key: value for key, value in summary.items() if key not in ('rows', 'manifest', 'provenance')}))
     if missing or errors or summary['reference_gaps'] or seen != set(range(manifest['shards'])):
         raise SystemExit(1)
+    # Placement estimates only: execution never reuses a previous verdict.
+    seconds = {row['file']: round(sum(row[side]['execution']['seconds'] for side in ('reference', 'mere')), 3)
+               for row in rows}
+    ci.save(args.output / 'timings.json', dict(schema=1, source_ref=manifest['source_ref'],
+                                            mere_ref=manifest['mere_ref'], ruby_ref=manifest['ruby_ref'],
+                                            seconds=dict(sorted(seconds.items()))))
 
 
 def main():
@@ -260,6 +288,7 @@ def main():
     p.add_argument('--ruby-src', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--shards', type=int, default=8)
+    p.add_argument('--timings', type=Path, help='optional execution estimates; never selects or skips files')
     for name in ('source-ref', 'mere-ref', 'ruby-ref'):
         p.add_argument('--' + name, required=True)
     p.set_defaults(function=plan)
