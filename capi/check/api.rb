@@ -1,4 +1,11 @@
+require 'stringio'
+# (what loading the extension says on stderr: nothing -- its Init_ undefines
+#  `initialize` from C, which is not the warning Module#undef_method gives)
+stderr = $stderr
+$stderr = StringIO.new
 require 'api_fixture'
+said = $stderr.string
+$stderr = stderr
 $count = 0
 def check(value)
   raise 'api contract failed' unless value
@@ -13,6 +20,7 @@ else
   raise "expected #{kind}"
 end
 A = ApiFixture
+check(said == '')
 
 # What C writes through a pointer it took before its Fiber was stopped goes
 # back to the object -- also when another stack ran a C call of its own
@@ -174,7 +182,8 @@ module ApiFixture
     end
   end
 end
-check(ApiFixture::Mid::Leaf.new.extra == :reopened)
+check(ApiFixture::Mid::Leaf.allocate.extra == :reopened)
+check(raises(NoMethodError) { ApiFixture::Mid::Leaf.new }.name == :new)
 check(Custom.new.extra == :reopened)
 
 # rb_proc_new makes a Proc, not a lambda.
@@ -182,6 +191,142 @@ pr = A.new_proc
 check(pr.lambda? == false)
 check(pr.call(5, 6) == [5, 2, :data])
 check([[1, 2]].map(&pr) == [[[1, 2], 1, :data]])
+# What real gems asked for. A conversion by method name, and its three
+# refusals; equal bytes hash equally; every instance variable is visited; the
+# last match is the calling frame's; digits of a base; the struct behind an IO.
+class ToHash
+  def initialize(v) = @v = v
+  def to_hash = @v
+end
+check(A.convert({ a: 1 }, false) == { a: 1 })
+check(A.convert(ToHash.new({ b: 2 }), false) == { b: 2 })
+check(raises(TypeError) { A.convert(3, false) }.message == 'no implicit conversion of Integer into Hash')
+check(raises(TypeError) { A.convert(nil, false) }.message == 'no implicit conversion of nil into Hash')
+check(raises(TypeError) { A.convert(ToHash.new(5), false) }.message == "can't convert ToHash to Hash (ToHash#to_hash gives Integer)")
+check(A.convert(3, true).nil?)
+check(A.convert(ToHash.new(nil), true).nil?)
+check(A.convert(ToHash.new({ c: 3 }), true) == { c: 3 })
+check(raises(TypeError) { A.convert(ToHash.new(5), true) }.message == "can't convert ToHash to Hash (ToHash#to_hash gives Integer)")
+check(A.memhash_equal('same bytes', +'same bytes') == true)
+check(A.memhash_equal('same bytes', 'other') == false)
+holder = Object.new
+holder.instance_variable_set(:@one, 1)
+holder.instance_variable_set(:@two, [2])
+check(A.ivars(holder) == [[:@one, 1], [:@two, [2]]])
+check(A.ivars(Object.new) == [])
+def matched
+  'key=value' =~ /(\w+)=(\w+)/
+  [A.last_match(0), A.last_match(2), A.last_match(5)]
+end
+check(matched == ['key=value', 'value', nil])
+def carried(m)
+  A.set_match(m)
+  [$~.equal?(m), $1]
+end
+check(carried(/(b)/.match('abc')) == [true, 'b'])
+# (in a block a Ruby method yields to -- how mspec runs an example -- and at
+#  the top level: the C method's frame stands at two depths in the first, and
+#  the caller of the second is the main script's)
+def yielder = yield
+check(yielder { /(c)d/ =~ 'cd'; A.last_match(1) } == 'c')
+/(e)f/ =~ 'ef'
+check(A.last_match(1) == 'e')
+A.set_match(/(g)/.match('g'))
+check($1 == 'g')
+# (a C method has no `$~` of its own: a Fiber's and a Thread's body have
+#  theirs, and public_send / class_eval / module_eval have none in between)
+/(outer)/ =~ 'outer'
+check(Fiber.new { /(inner)/ =~ 'inner'; [$1, A.last_match(1)] }.resume == ['inner', 'inner'])
+check(Thread.new { /(inner)/ =~ 'inner'; [$1, A.last_match(1)] }.value == ['inner', 'inner'])
+check($1 == 'outer')
+written = /(written)/.match('written')
+/(outer)/ =~ 'outer'
+Fiber.new { A.set_match(written) }.resume
+check($1 == 'outer')
+Thread.new { A.set_match(written) }.join
+check($1 == 'outer')
+def through_public_send
+  /(x)/ =~ 'x'
+  [A.last_match(1), A.public_send(:last_match, 1)]
+end
+check(through_public_send == ['x', 'x'])
+check(Object.class_eval { /(y)/ =~ 'y'; [$1, A.last_match(1)] } == ['y', 'y'])
+check(Object.module_eval { /(z)/ =~ 'z'; [$1, A.last_match(1)] } == ['z', 'z'])
+check(A.strtoul('  0x1fz', 0) == [31, 6])
+check(A.strtoul('-12', 10) == [2**64 - 12, 3])
+check(A.strtoul('777', 8) == [511, 3])
+File.open(__FILE__) do |f|
+  check(A.io_facts(f) == [1, true, false])
+end
+rd, wr = IO.pipe
+check(A.io_facts(rd) == [1, true, false])
+check(raises(IOError) { A.io_facts(wr) }.message == 'not opened for reading')
+rd.close
+check(raises(IOError) { A.io_facts(rd) }.message == 'closed stream')
+wr.close
+# An IO's struct says the directions of THAT IO, not of its descriptor: a
+# read-only wrapper on a descriptor opened for both is read-only to C too.
+# (a file of its own, not Tempfile: loading tempfile under a collection at
+#  every safepoint takes minutes)
+path = File.join(ENV.fetch('TMPDIR', '/tmp'), "capi-io-#{Process.pid}")
+begin
+  both = File.open(path, 'w+')
+  ro = IO.for_fd(both.fileno, 'r', autoclose: false)
+  wo = IO.for_fd(both.fileno, 'w', autoclose: false)
+  check(A.io_mode(both) == [true, true, false])
+  check(A.io_mode(ro) == [true, false, false])
+  check(A.io_mode(wo) == [false, true, false])
+  check(raises(IOError) { A.io_check_writable(ro) }.message == 'not opened for writing')
+  check(A.io_check_writable(wo) == true)
+  File.open(path, 'a') { |app| check(A.io_mode(app) == [false, true, true]) }
+  both.close
+  # FMODE_EXTERNAL: the descriptor stays C's
+  fd = IO.sysopen(path)
+  ext = A.open_descriptor(fd, true)
+  check(ext.autoclose? == false)
+  ext.close
+  check(IO.for_fd(fd, autoclose: false).fileno == fd)
+  own = A.open_descriptor(fd, false)
+  check(own.autoclose? == true)
+  own.close
+ensure
+  File.delete(path) if File.exist?(path)
+end
+check(A.io_mode($stdin)[0..1] == [true, false] && A.io_mode($stdout)[0..1] == [false, true])
+
+# A global C keeps, defined under a name aliased before: both names are the
+# variable C holds.
+alias $capi_dest $capi_src
+A.keep_variable('$capi_dest')
+A.kept_set(5)
+check($capi_dest == 5 && $capi_src == 5)
+$capi_src = 7
+check(A.kept_get == 7 && $capi_dest == 7)
+$capi_dest = 8
+check(A.kept_get == 8 && $capi_src == 8)
+A.keep_variable('$capi_plain')
+$capi_plain = :p
+check(A.kept_get == :p)
+
+# The Set functions are set.c's operations: an override of the Ruby
+# interface -- in a singleton or a subclass -- does not change them.
+s = Set[1]
+class << s
+  %i[add? add include? delete? delete size each to_a clear].each do |m|
+    define_method(m) { |*| raise "#{m} intercepted" }
+  end
+end
+check(A.set_ops(s) == [true, false, true, false, 2, true, false, [2]])
+check(A.set_clear(s) == 0)
+class SubSet < Set
+  def add?(*) = raise('intercepted')
+  def include?(*) = raise('intercepted')
+end
+sub = SubSet[1]
+check(A.set_ops(sub) == [true, false, true, false, 2, true, false, [2]])
+check(A.set_ops(Set[1]) == [true, false, true, false, 2, true, false, [2]])
+frozen = Set[1].freeze
+check(raises(FrozenError) { A.set_add(frozen, 3) }.message.start_with?("can't modify frozen Set"))
 
 # A block function C passed is told whether it was yielded keywords, and
 # rb_yield_block hands them to the C method's block as keywords.
