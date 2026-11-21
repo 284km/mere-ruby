@@ -138,3 +138,24 @@ default block passed to super. Rack's original utils file becomes MATCH
 Witnesses 678 and 679 cover candidate evaluation/conversion, Module#===,
 Proc identity, lambda arity, preserved entries, argument errors and freezing.
 Corpus reports 699/699 MATCH; bracket depth remains 895/1024.
+
+Rounds 10-11 honor singleton undef on primitive values and let name overrides
+reach Module#name through super. Rack Lint becomes MATCH (37 tests / 763
+assertions). Minitest spec and Rack headers now reach summaries with visible
+remaining failures. Request's newly reached 16 MiB NUL case crosses the
+unchanged 2 GiB cap. The same inventory gives **53 MATCH / 7 RED / 2 MEMORY**,
+zero BOTH/TIMEOUT and no lost MATCH. Round 10 alone was 53 / 8 / 1; the RED
+to MEMORY transition is not counted as an improvement. Witnesses 681/682 and
+all 701 corpus programs match Ruby. Bracket depth is 892/1024 after the incoming
+main C API merge. Paired CRuby Method and Module controls equal latest main:
+97 MATCH / 1 RED and 195/195 MATCH respectively.
+
+The round 10-11 review follow-up retains native Method/UnboundMethod and alias
+definitions across singleton undef, without leaking the one-dispatch bypass
+into Ruby callbacks, coercion defaults or string eval. Module#name super now
+requires the native Module entry to remain ahead of the actual method origin.
+Expanded witnesses 681/682 match normally and under GC.stress. Fresh O2 source
+a3ad911a keeps **53 MATCH / 7 RED / 2 MEMORY**, zero regressions and corpus
+**701/701**. Method, Module, TracePoint, Proc, Super and Yield retain their
+paired baseline MATCH counts. The initial snapshot and resource bounds stay
+unchanged; hosted per-file merge checks remain pending.
