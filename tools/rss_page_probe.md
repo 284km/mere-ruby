@@ -22,8 +22,15 @@ two of eight anonymous pages, verifies two present pages, discards one and
 verifies one; the reader must not fault in the other pages. Another control
 denies the reader and verifies failure and errno preservation.
 
-The independent `rss-page-ownership.yml` job locks repaired source `90c83c6e`,
-released compiler `43f2994b` and Ruby source `3e93b23a` on native Linux/x86-64.
+The independent `rss-page-ownership.yml` matrix locks repaired source `90c83c6e`,
+released parent compiler `43f2994b`, the Map-slot clearing release `408b03d9`
+from [Mere #86](https://github.com/merelang/mere/pull/86), and Ruby
+source `3e93b23a` on native Linux/x86-64. Each condition has its own complete
+ordinary controls and artifact. This adds an explicit experimental compiler
+condition. The local candidate `44bc7bc0` has the same tree as that release;
+its recorded compiler SHA is retained rather than relabeled. Existing
+historical jobs and ordinary CI compiler pins are
+unchanged.
 The ordinary complete Module, Method-copy, reference and original selected
 clone gates run first. Their 600-second / 2-GiB bounds, ten-second children,
 original inputs and assertions remain unchanged. A failed ordinary gate still
@@ -34,7 +41,9 @@ Build with `python3 tools/rss_page_probe.py build --subject /path/to/subject
 --diagnostic-root /path/to/probe`. Collect with the same paths and
 `collect --compiler-root /path/to/compiler --reference /path/to/ruby
 --ruby-src /path/to/ruby-source --output /path/to/results`. The subject and
-ordinary/diagnostic C and binary hashes must match the build receipt.
+ordinary/diagnostic C and binary hashes must match the build receipt. Set
+`MERE_REF` to the full compiler SHA before collecting; the compiler checkout
+must match it, as in the workflow.
 Raw logs, child input, all original verdicts, heap/page observations and
 build receipts are uploaded even on failure. Reading and logging may change
 layout, so diagnostic ratios cannot replace ordinary ratios. A root pinner
