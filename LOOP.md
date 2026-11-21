@@ -6626,3 +6626,20 @@ fallbacks are unchanged: 6 a Regexp in another encoding -- allowing those
 moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
+
+
+### Review repair: native notification super owners (2026-11-21)
+
+Module's own private notification visibility marks describe real native
+bodies, rather than visibility-only forwarding entries. The corrected
+`module_notification_method_after` keeps that body before looking for its
+super in Object. Corpus 724 now covers bound and unbound Methods for all
+seven notifications, including an earlier prepended wrapper.
+
+Before importing the newly merged C API, all 708 corpus programs matched
+with the hash index on and off (594.362 seconds, 1,048,560 KiB, unchanged
+900-second / 2-GiB bounds). The nine RSS workloads, root, depth (155) and
+dead-definition gates passed. After integrating main `e540007c`, the O2
+build and all 12 focused comparisons (corpus 720/723/724 in four cache
+configurations) passed again. The complete hosted reports and per-file
+comparison are still required for this integrated source before merge.
