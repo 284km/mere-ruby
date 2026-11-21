@@ -1,5 +1,18 @@
 # Upstream gem suite differences
 
+Further retention diagnostics identify old native arenas that current
+map_bytes and the separate kept-region counter do not include. A read-only
+exit observer sees retired capacity 17,227,776 bytes after the first batch,
+153,240,752 after 19 total batches, and 95,605,176 after 21. These are separate
+process observations of capacity, not RSS or a safe-to-free conclusion.
+The logged full original program also reaches 2.163428x; its failed series
+is retained alongside the separate passing ordinary macOS control. Inspect
+native pinners, retirement epochs and declined method-store compaction in
+the GC/allocator session. No release rule, root, threshold or original control
+has changed. Actual metadata counters and the standalone reproduction are
+documented in `tools/method_copy_retention.md`; full records are in
+`method_copy_retention_r46.json`. This investigation is not a memory repair.
+
 Hosted Method-copy still fails at 2.224702x on the unchanged 21,000-owner
 control (reference 1.086532x). An operation-only receiver-elision candidate
 was measured and withdrawn: it reduced transient STMT-region allocation by

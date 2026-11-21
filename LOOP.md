@@ -7398,6 +7398,166 @@ gate. Full samples, hashes and CI-only branch updates are recorded in
 gemtest/suites_ci_lifetime_r43.json. No new gem sweep is claimed here; the
 previous 129-file 120-MATCH/8-RED/1-MEMORY observation remains unchanged.
 
+## 2026-11-19: distinguish current method metadata from retired native arenas
+
+Investigate retained storage rather than the rejected receiver-elision
+candidate's transient allocation. Independent first-batch and full-program
+diagnostics show default-region allocation growing by only 340,352 bytes,
+while current method storage can grow from 4,240,408 to 33,602,136 bytes.
+Logical method counts stay near their post-GC baseline. Add eleven actual
+metadata byte counters to the existing optional store_stats output; it only
+reads stores and changes no roots or collection policy. Diagnostic output
+does not establish a repair: the unchanged ordinary paired control is
+1.079818x on the reference and 1.804522x on this macOS observation, but a
+separate full-program logged diagnostic reaches 2.163428x. Preserve both.
+
+The pinned compiler's map_bytes counts a map's current private arena, not
+older generations on the native retired list. The named kept-region counter
+does not count those retired generations either. A separate read-only native
+exit observer finds 8 retired arenas / 17,227,776 capacity bytes after the
+first batch, 16 / 153,240,752 after 19 total batches, and 16 / 95,605,176 after
+21. These independent process observations establish retained old arenas;
+capacity is not RSS, and exit time is not necessarily the largest RSS sample.
+Which pins are live versus conservative stale words remains unproven.
+
+tools/method_copy_retention.py records seven independent prefixes with the
+existing 600-second/2-GiB bounds, source/executable/log hashes, real store
+bytes and GC/RSS timelines. Only its last case is the unchanged original
+program. It is explicitly diagnostic and never replaces the original 2x
+assertion, warmup, workload or baseline. The native observer is excluded from
+the ordinary build and marked DIAGNOSTIC O2 observer; the ordinary gate
+correctly refuses it. All seven real executions complete, their raw logs
+reparse with the final parser, ordinary stdout/exit are preserved, and actual
+bracket depth is 933/1024 on the pinned compiler. No top-level Mere binding,
+GC/VM/AST/C API implementation or allocator policy changed.
+
+The next repair belongs to the GC/native allocator lifetime session: identify
+the actual pinners and retirement epochs, and inspect method-store compaction
+that updates its floor even if the native operation declined under a pin.
+That is an inspection target, not a confirmed fix. Freeing an arena while a
+real borrowed pointer survives would be unsafe. Preserve the assigned boundary
+against GC internals. Full observations are in
+gemtest/method_copy_retention_r46.json; the earlier hosted 2.224702x assertion
+and every existing-file merge gate remain open. No new gem sweep is claimed.
+
+
+## Native ownership at the original RSS samples (2026-11-20)
+
+The unchanged Method-copy control now also reproduces its actual failure on
+native Linux/aarch64: 2.040674x and 2.040880x, with a healthy 1.1039x reference,
+ordinary O2 and no resource-limit event. Preserve both failures, the earlier
+passing observation, and the earlier hosted failures. These are not retries
+selected for a green result. The validation attempts changed the diagnostic
+collector; the ordinary runtime and program were identical throughout.
+
+A separate emitted-C copy reads native ownership before the existing RSS
+reads/spawns. It records physical slots, pin floors, current map storage,
+retired generations and saved pinner states without changing collection or
+pinning. At the largest native RSS sample in the completed diagnostic, retired
+capacity is 170,070,232 bytes while the current method table has 1,275 live
+rows and 4,260,408 capacity bytes. All saved pinners identify the running root
+coroutine. Capacity is not RSS, and this does not prove the pins unnecessary.
+
+Two initial collection attempts correctly failed because native output
+contaminated the verbose parent case identifier. Setting the exclusion before
+exec, suppressing unused exit observations, and separating native lines fixed
+the collector. The final run preserves all three original clone case names,
+the exact child except its two upstream nonce tokens, and all 21 Method-copy
+samples. The ordinary gate rejects the diagnostic mode; the combined command
+still fails when its ordinary Method-copy assertion fails.
+
+The separate native x86-64 job locks the failing runtime and both existing CI
+compiler pins. Existing jobs, source locks, baselines, 600-second/2-GiB limits,
+upstream ten-second child and 2x assertions remain unchanged. This adds
+observability, not a memory repair. See tools/rss_native_probe.md and
+gemtest/native_rss_retention_r59.json for the protocol and measured evidence.
+
+## 2026-11-20: retain the method floor when native compaction is deferred
+
+The native map compactor can return without moving a pinned arena. The
+method-store wrapper nevertheless published that enlarged arena as its new
+floor, delaying later attempts under the existing growth rule. Change only
+m_state.compact_method_store: publish a measurable floor on initialization
+or an observed capacity reduction. Preserve the dirty flag, return value,
+unmeasurable-arena behavior, numeric thresholds and native pin rules. This
+specific collector bookkeeping change was authorized after the investigation;
+no compiler, pinning, marking or collection implementation changes are included.
+
+Fixed-order ordinary O2 parent/candidate/candidate/parent measurements use
+the same compiler 2e3cc433 and byte-identical original Method-copy program.
+Native Linux/aarch64 ratios are 1.900780 / 1.580659 / 1.456400 / 2.426395;
+the last parent observation fails the unchanged 2x gate. Mac ratios are
+1.689337 / 1.385431 / 1.386783 / 1.685873. Candidate initial RSS is comparable
+to the parent, not enlarged to lower the ratio. Complete Module and Refinement
+controls lose no passing cases on either OS. The Mac parent Module run fails
+the known complemented-entry RSS case; the candidate passes all 195 tests /
+1240 assertions. Preserve that failure alongside the passing selected cases.
+
+A separate native diagnostic wraps the original compaction entry exactly once
+and counts requested attempts, real arena moves and floor increases without
+a move. The parent has 9 requests / 4 moves / 4 noninitial invalid floor
+increases; the candidate has 57 requests / 7 moves / 0 such increases.
+Maximum retired capacity drops from 169,203,224 to 93,161,712 bytes in this
+diagnostic. Capacity is not RSS, and the ordinary ratios remain separate.
+The underlying native compactor, pin checks and thresholds are unchanged.
+
+The new x86-64 workflow locks repaired source 90c83c6e and both existing
+compiler pins. Prior hosted failures, including Method-copy at 2.221519x,
+are not waived. Historical clone RSS failures were not reproduced in this
+pair and are not established as repaired. File/side 600 seconds / 2 GiB,
+upstream child ten seconds and original assertions remain unchanged.
+Twelve evidence acceptance checks pass; bracket depth remains 933/1024 and
+top-level lets remain main 136 / state 1167. See
+gemtest/method_store_floor_r60.json for all ordinary pairs and diagnostic
+provenance. The broader corpus and five-gem verification are in progress;
+no baseline snapshot is replaced.
+
+## 2026-11-20: separate clone's cached temporary arenas from live metadata
+
+Backport the verified method floor repair to the earlier PR 119 branch,
+without changing any further runtime function. Its original native Linux
+Method-copy gate now passes at 1.618172x; the earlier 2.051319x failure remains
+recorded. Fresh local verification passes all 732 corpus programs in both hash
+modes (599.508 seconds, 1,099,200 KiB peak family RSS) and the original five-gem
+batch at 54 MATCH / 7 RED / 1 MEMORY, with no per-file regression. This does
+not establish a repair of clone's separate historical RSS failures.
+
+Read-only Linux/glibc diagnostics add allocator accounting, mapping RSS,
+coroutine stacks and active temporary-region inventories to the existing
+private observer. All ordinary generated C and allocator/pin/GC policies remain
+unchanged; the existing default diagnostic emitter is byte-identical too.
+A first attempt printed too much into the captured pipe and lost records;
+keep its rejection. Print only the existing mandatory maps plus large extra
+independent maps, while running the unchanged complete original workload.
+Missing allocator, active-region or block-capacity records fail acceptance.
+
+Two fixed local core-compiler batches each run four ordinary clone controls
+and two separate diagnostic controls. Ordinary ratios vary from 1.440821 to
+1.993544 and all pass; none reproduces the failed hosted assertion. A complete
+rich trace nevertheless identifies a separate physical-memory factor. The
+21 temporary scopes used for the final report hold 83,886,080 capacity bytes
+versus 22,020,096 initially, although allocation since acquisition is only
+32,560 versus 31,096 bytes. Several MCALL scopes reuse 16-MiB cached blocks
+without allocating any bytes in the call. Their resident pages and retained
+native generations are distinct from a growing live-module table. Capacity
+alone is not RSS; raw mappings and allocator totals remain separate evidence.
+
+A new, separate native x86-64 job locks the actual failing PR 139 merge source
+ae6bd8cc and compiler 01f5ad73. It builds ordinary and diagnostic binaries
+before measurement, then retains the full Module control, one reference,
+four ordinary clone controls and two diagnostics in fixed order. A failed
+ordinary assertion remains a failure. File/side 600 seconds / 2 GiB, the
+upstream ten-second child, original child hashes and assertions are unchanged.
+The other session's branch is only read; no edits or pushes are made there.
+No compiler or native cache implementation repair has been applied.
+
+Seven captured-data heap acceptance checks and the existing twelve native
+checks pass. The new fragment compiles and executes on native Linux; the
+existing observer remains separate from every ordinary gate. See
+tools/clone_rss_heap.md, tools/fixtures/clone_heap_sample.json and
+gemtest/clone_heap_r62.json. The local evidence does not replace the pending
+hosted observation or waive historical clone failures.
+
 ## 2026-11-20: apply the verified method floor repair to the earlier small-suite branch
 
 PR 119 still fails its original Method-copy assertion at 2.051319x on native
@@ -8130,3 +8290,102 @@ per-file classifications to a freshly built unmodified7c0fe03d baseline.
 The existing logger logdevice failure is not hidden or reclassified as a
 success. gemtest/method_floor_backport_r81.json retains the hosted failure,
 all Method samples and the two platform results. Baselines are unchanged.
+
+### Attribute page presence separately from native region capacity
+
+Read-only page-table observations distinguish capacity from pages actually
+present in each inventoried native region. The separate diagnostic build
+still runs the original input and is rejected by the ordinary RSS gate.
+Missing ranges, overlaps, impossible counts or denied access fail evidence
+collection. Partial payload edges are explicitly omitted; presence and
+exclusive-mapping flags are not process RSS or proof of object liveness.
+
+Locked runtime90c83c6e and released compiler43f2994b on Linux/aarch64 pass
+the ordinary Module195/1240, selected clone and Method-copy1.866672891x
+(reference1.104115371x). In the separate Method-copy diagnostic, inactive
+cache payloads have8KiB of present pages at both samples0 and20. Retired
+payloads increase from11,420 to89,212KiB; default and current method payloads
+stay close to35,704/35,880 and3,956/4,032KiB. All30 final retired arenas have
+present root pinners. The observed established-floor increases without a
+move remain zero. This identifies retained old native arenas as the main
+growth in this observation; it does not establish that their pins are stale
+or safe to release. Collector and native ownership changes remain outside
+this diagnostic patch.
+
+The repaired-source native x86-64 comparison in run44867923161 also passes:
+candidate Method-copy1.730880370x /1.797650005x and all original core controls.
+Its compiler94da60b5 has the same tree as released43f2994b. The older-source
+ae6bd8cc Method-copy2.135504918x and ordinary clone2.014963587x failures are
+retained and are not repaired by relabeling the historical job.
+
+tools/rss_page_probe.md documents the reader and the independent native Linux
+job. bench/rss_page_ownership_r84.json retains ordinary verdicts, all Method
+prefixes, page totals, pin observations and the failed historical controls.
+The captured fixture and14 reader/evidence controls include real anonymous
+mapping and access-denied checks. All35 existing native/heap/comparison
+controls still pass. No runtime Mere function, GC/pin policy, original test,
+existing workflow input, exclusion or resource bound changes.
+
+### Independently validate cleared Map slots with the same pinned workload
+
+Mere86 repairs a concrete retention source: delete/clear left logically
+removed keys and values in backing arrays inspected by conservative scans.
+Independently build compiler44bc7bc0 and emit runtime90c83c6e. Reversing only
+32 clear and32 delete fragments makes its generated C byte-identical to
+parent43f2994b. The published merge408b03d9 has exactly the same source tree.
+No compiler implementation or pin rule is edited here.
+
+Fixed parent/candidate/candidate/parent ordinary Method-copy ratios are
+1.697336335 /1.920427000 /1.574114244 /1.718854905x: all pass, but one
+candidate is higher than either parent. The candidate's additional ordinary
+run is1.590390082x; complete Module195/1240 and the original selected clone
+also pass. Retain every sample rather than claim uniform improvement.
+
+Separate Method-copy diagnostics reduce final retired payload presence from
+89,212 to65,296KiB and observed process RSS from160,440 to136,632KiB. Cache
+presence remains8KiB. All Method/Super/Class/Refinement parent and candidate
+case dictionaries are identical, with no passing case lost among332 cases.
+The reference kwarg-memory and warning failures and the existing unsupported
+Method compaction skip remain visible. This is not an all-pass reference run.
+
+bench/rss_map_slots_r85.json retains the emission proof, all paired prefixes,
+ordinary controls, page data and all additional original case dictionaries.
+The new page-ownership matrix compares parent43 with published fix408 on the
+same locked runtime; existing historical jobs and ordinary CI pins remain
+unchanged. These observations support the removed-slot repair, not a claim
+that every historical RSS failure or workload variation is fixed.
+
+The first hosted page-reader checks fail before measurement: Ubuntu GCC's
+fortified pread wrapper cannot prove the partial-read buffer offset is bounded.
+Keep warning-as-error and Fortify. Read each chunk at the start of the fixed
+buffer and advance the page offset by the number of complete returned entries;
+short aligned reads retain every page, while invalid reads remain errors.
+All15 reader/evidence controls pass locally with explicit Fortify3, including
+the new short-read control. Previous measurement receipts retain their original
+observer hashes; this does not relabel them as measurements of the revised
+reader. Existing ordinary binaries, tests, limits and compiler pins are unchanged.
+
+### Replay the actual PR115 iclass timeout without changing its workload
+
+Sourcec22ad346 is the exact failed test merge and has the same tree as
+head767c7690. Its hosted Module file has195 tests /1234 assertions and two
+ten-second child timeouts, iclass and complemented-entry, with no outer memory
+event. Freeze that source and compare43f2994b with408b03d9 at normal O2.
+Generated C differs only at the32 Map clear and32 delete fragments.
+
+The local Linux/aarch64 fixed reference/parent/repair/repair/parent sequence
+is2.917 /5.929 /5.945 /6.198 /6.094 seconds, with original child hashes equal.
+User plus system CPU is close to elapsed time. Both complete Module files
+pass195/1240; Method-copy is1.543573492x /1.535259846x. This does not reproduce
+the native x86-64 timeout and does not establish an iclass speed improvement.
+
+The independent iclass-resource-replay job measures the same source, original
+input and fixed order on native Linux/x86-64. CPU observations use wait4 for
+the Ruby parent and waited descendants; all original stdout/stderr, inputs,
+case identities, exits and resource prefixes are retained. The ten-second
+child and600-second /2-GiB family bounds remain unchanged, including the
+wrapper in the latter. There is no added GC, sleep, allocation policy or
+retry-until-pass loop.11 acceptance controls reject altered input, enlarged
+bounds, missing trials and waived failures. Both compilers' original timings
+remain visible; the new job is not a claim of repair. The end-to-end runner
+validation is recorded separately from the first experiment.
