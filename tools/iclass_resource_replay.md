@@ -44,3 +44,13 @@ hashes and resource bounds are verified. The11 acceptance checks reject
 altered input, expanded timeout, omitted trial/case/prefix, missing CPU data,
 and forged success flags. Existing historical jobs, pins and snapshots are
 unchanged. This adds a measurement, not a claim that iclass has been repaired.
+
+The first native Linux/x86-64 replay completed successfully in [run
+44890097505](https://github.com/284km/mere-ruby/actions/runs/44890097505).
+Selected parent trials took 8.509 / 8.179 seconds, repair trials 8.294 / 8.287
+seconds, with CPU usage close to elapsed time. All three complete Module files
+passed 195 tests and 1,240 assertions, and both original Method-copy checks
+passed. This reproduces the original inputs and bounds, but does not reproduce
+the historical timeout or establish that the Map-slot repair fixes iclass
+speed. The original failed job remains failed evidence. The full native result
+is retained alongside the earlier aarch64 captures.
