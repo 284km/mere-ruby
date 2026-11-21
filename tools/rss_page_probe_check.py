@@ -90,7 +90,7 @@ class PageEvidence(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == 'linux', 'the native pagemap interface is Linux-specific')
 class NativeReader(unittest.TestCase):
-    def run_c(self, denied=False):
+    def run_c(self, denied=False, short_reads=False):
         headers = '''#define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
@@ -105,6 +105,12 @@ class NativeReader(unittest.TestCase):
 }
 #define open denied_open
 ''' if denied else ''
+        if short_reads:
+            override += '''static ssize_t short_pread(int fd, void *p, size_t n, off_t off) {
+    return pread(fd, p, n > sizeof(uint64_t) ? sizeof(uint64_t) : n, off);
+}
+#define pread short_pread
+'''
         main = '''
 int main(void) {
     long page = sysconf(_SC_PAGESIZE);
@@ -127,7 +133,7 @@ int main(void) {
             folder = Path(name)
             source = folder / 'reader.c'
             source.write_text(headers + override + (ROOT / 'rss_page_observer.c').read_text() + main)
-            subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', str(source), '-o', str(folder/'reader')], check=True)
+            subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', '-D_FORTIFY_SOURCE=3', str(source), '-o', str(folder/'reader')], check=True)
             return subprocess.check_output([str(folder/'reader')], stderr=subprocess.STDOUT, text=True)
 
     def test_reader_does_not_fault_in_untouched_pages(self):
@@ -139,6 +145,10 @@ int main(void) {
         self.assertEqual(output.count('RSS_PAGE_ERROR'), 2)
         self.assertIn('reason=open errno=13', output)
         self.assertNotIn(' present=', output)
+
+    def test_short_aligned_reads_keep_all_pages(self):
+        output = self.run_c(short_reads=True)
+        self.assertEqual(re.findall(r'pages=(\d+) present=(\d+)', output), [('8', '2'), ('8', '1')])
 
 
 if __name__ == '__main__':

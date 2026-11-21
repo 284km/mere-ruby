@@ -24,16 +24,13 @@ static void gem_page_region(unsigned sample, const char *kind, int arena,
         for (uintptr_t at = first; at < stop; ) {
             size_t count = (size_t)(stop - at);
             if (count > 512) count = 512;
-            size_t bytes = count * sizeof(uint64_t), done = 0;
-            while (done < bytes) {
-                ssize_t n = pread(fd, (char *)entries + done, bytes - done,
-                                  (off_t)(at * sizeof(uint64_t) + done));
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0 || n % sizeof(uint64_t)) {
-                    reason = "read"; error = n < 0 ? errno : EIO; goto failed;
-                }
-                done += (size_t)n;
+            size_t bytes = count * sizeof(uint64_t);
+            ssize_t n = pread(fd, entries, bytes, (off_t)(at * sizeof(uint64_t)));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0 || (size_t)n > bytes || n % sizeof(uint64_t)) {
+                reason = "read"; error = n < 0 ? errno : EIO; goto failed;
             }
+            count = (size_t)n / sizeof(uint64_t);
             for (size_t i = 0; i < count; ++i) {
                 unsigned p = (unsigned)(entries[i] >> 63);
                 unsigned s = (unsigned)((entries[i] >> 62) & 1);
