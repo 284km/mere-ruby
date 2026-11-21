@@ -6805,3 +6805,11 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+Final current-main validation of the retained matcher repair: all720 corpus
+programs match in both hash modes (490.781 seconds, 1,194,640 KiB under the
+unchanged900-second/2-GiB bound). The final integrated runtime retains all32
+focused comparisons across evaluator/strict VM and four hash/MRO modes.
+Nine RSS workloads, GC roots, bracket depth155 and dead definitions pass.
+The handler and $! keep the same pinned exception across rejecting matchers
+and outer propagation. No builtin-only VM matcher pins an exception.
