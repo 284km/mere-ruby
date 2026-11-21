@@ -6457,3 +6457,27 @@ clone RSS72159232 to151474176 bytes(2.0991655787x):195 tests,1240 assertions,
 one failure, no outer-limit event. Preserve this distinct failure; it is not
 waived as complemented-entry noise or replaced by a local pass. The final
 head's complete hosted result and every-file comparison remain merge gates.
+
+
+## 2026-11-21: use the released cache-clearing compiler for original Module comparisons
+
+The locked PR 90 source fails the original clone RSS assertion under compiler
+01f5ad73 even though its separately selected complemented-entry case passes.
+The collector correctly records the failed full-file case. Keep that hosted
+failure and its exact case dictionary; do not change acceptance or the input.
+
+Use released compiler 43f2994b for core CI and both locked comparison sources
+3b05689f / 949e4638. Ruby source, all 195 tests and 1240 assertions, observed
+child input, its ten-second timeout and every 600-second / 2-GiB family bound
+remain fixed. Reversing only inactive cached-payload clearing in each emitted
+C restores its old-compiler C byte for byte. No Ruby runtime function changes.
+
+On local Linux/aarch64, all six original comparison conditions pass: full
+Module on reference/main/PR90 and their selected original complemented-entry
+cases. Selected ratios are 1.232550 / 1.278365 / 1.288751 and the canonical
+child inputs match the previous hosted observation. On macOS, the current
+application passes Module 195/1240, Refinement 122/367 with the shared skip,
+and the original Method-copy control at 1.830389x. Preserve the distinct
+source and architecture provenance. Full corpus/gem controls and hosted
+released-compiler CI remain separate; older Method-copy failures are not waived.
+See gemtest/module_rss_released_compiler_r72.json and tools/module_rss_compare.md.
