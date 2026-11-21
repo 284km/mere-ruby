@@ -4489,9 +4489,22 @@ CRuby extension ABI or compiler/linker flags.
 **What fixing the remaining build integration takes.** An installation
 layout and build metadata of mere-ruby's own.
 
-**What the native stage needs from it (inventory, 2026-11-13).** Facts for
-whoever takes extensions on (stage 7′ / 8); nothing here is answered yet,
-and which of them mere-ruby can answer truthfully is that stage's call.
+**The build is answered where there is one (2026-11-16, stage 7′ / 8).** An
+interpreter that finds `capi/include/ruby.h` beside its executable says its
+own build in RbConfig -- the header directory, the executable's directory
+and name, clang and the flags an extension for it is built with -- and
+ruby's `mkmf.rb` works from that (capi/README.md, "Building an extension").
+These are mere-ruby's facts, not a reference installation's table: 97
+keys in all, where CRuby has 254, so rbconfig_spec's count is still not met, and a
+build without the C API still has only the facts above. What is left a
+stand-in is the installation layout (`prefix`, `libdir`, the site
+directories), and `ENABLE_SHARED` and a libruby name are deliberately not
+said.
+
+**What the native stage needed from it (inventory, 2026-11-13; kept as the
+record of where it started).** Facts for whoever takes extensions on (stage
+7′ / 8); which of them mere-ruby can answer truthfully was that stage's
+call, and the paragraph above is the answer.
 
 - `require "mkmf"` and `create_makefile` read **5 `RbConfig::CONFIG` keys**
   mere-ruby does not have -- rubyhdrdir rubyarchhdrdir CC_WRAPPER topdir
@@ -4632,3 +4645,235 @@ parent series and required hosted gates.
 The native feature witness was renumbered from 721 to 722 after the
 concurrent parent published its distinct IO witness 721. Its Ruby/C source
 is byte-identical; no observation or historical source record is rewritten.
+
+### PR90: Pathname core and physical library extensions
+
+Separating the unchanged shipped Pathname core from pathname.rb's extension
+body restores the two original Bundler binstub cases (13 to15 MATCH). Real
+pathname.rb files still win ordinary load-path lookup. The core is initialized
+when their class body needs it, and factory-first loading preserves the real
+core/library phases. Corpus746/747, the710-file corpus and five complete
+original test files retain the completed main's passing cases under unchanged
+bounds. The five-gem baseline remains48 MATCH/14 RED with both sides' actual
+library audits complete. The previous hosted30K-method Timeout remains an
+observation requiring a fresh hosted result; the same original file passes
+locally on both actual CI binaries and the candidate within60 seconds.
+
+
+The final Pathname core entry uses an internal identity anchored in the
+runtime's stdlib directory. A user's same-named ordinary Ruby file remains
+selectable, while the core body keeps its actual implementation(corpus748).
+The integrated714-file corpus and original bounded focused/gem measurements
+pass. The intermediate head's separate Linux Module clone RSS2.0991655787x
+failure remains evidence; fresh final-head hosted gates and every-file
+nonregression are still required, with original assertions and limits intact.
+
+## Rails application installation and execution (2026-11-19)
+
+`railstest/` fixes a Rails 8.1.4.1 application, 69 source archives and
+Ruby 4.0.9 as the reference. The reference passes migration, boot, six
+application tests / 31 assertions and real localhost HTTP served by Puma.
+This is an application measurement, not Rails' own framework suite.
+
+Current main 12ca1df2 installs Bundler but stops installing bigdecimal 4.1.3:
+loading mkmf raises NoMethodError because RbConfig's rubyhdrdir is absent.
+The standalone `railstest/probes/mkmf.rb` reproduces that boundary without
+Rails. [Issue #116](https://github.com/284km/mere-ruby/issues/116) records the
+reproduction and its relationship to the actual build metadata/mkmf work
+in #95. No CRuby headers or compiled gems are substituted. Mere application
+stages remain NOT_RUN, and all 600-second / 2-GiB process-family bounds stay.
+
+After dependency installation works, rerun the frozen application stages
+before claiming boot, SQLite, HTTP or test compatibility. Original Rails
+component suites and broader application workloads still need measurement.
+See [railstest/README.md](railstest/README.md) and its separate latest record.
+
+
+An independent direct-load diagnostic of the locked Rails fixture also
+stops at ActiveSupport::OrderedOptions' dynamic setter: Hash subclass
+instances bypass a Ruby method_missing for unknown names, although their
+class and reported hook owner are correct. This reduces without Rails on
+main (#123) and belongs to the gem session's primitive missing-hook work.
+It is separate from command-registry issue #121. Saved gems are reused
+only in this diagnostic; the original cold CLI stages remain unchanged.
+
+
+## Native-build children and the declared reference fallback
+
+The validation-only Class/Hash/gem composition a9c8a2ff has a separate cold
+record in load_path_candidate.json. Reference passes all six stages, but
+Mere dependency installation stops at bigdecimal (33.243 s / 620,816 KiB,
+exit 5, no resource event): RubyGems' unchanged native builder passes its
+reference source directory through -I, so monitor.rb asks for monitor.so.
+The four application stages remain NOT_RUN. This failed run is preserved;
+the Hash hook is not reached in it.
+
+The intake bootstrap now moves only its explicitly declared reference
+fallback behind the interpreter's own libraries, including when inherited
+through a child's -I. RUBYOPT defers automatic RubyGems startup until the
+bootstrap restores that order, then requires unchanged RubyGems on both
+interpreters. Otherwise RubyGems can load monitor before any -r bootstrap.
+The reference's own stdlib order and all other explicit source directories
+remain unchanged. No require implementation, RubyGems/Rails/gem source,
+RbConfig value or API inventory changes. This
+is the intake counterpart of #90's mspec/corpus fallback-ordering repair;
+it does not change that PR or globally suppress physical library overrides.
+
+A real child-CLI control first fails on a foreign monitor wrapper, then
+loads the runtime's monitor after the bootstrap. Another explicit source
+still wins over the fallback, and reference-own path order is identical.
+The original archives/app/limits and historical JSON files are unchanged.
+The workload must be replayed cold with this bootstrap before claiming
+any later stage passes.
+
+
+## Hash candidate reaches the locked JSON generator
+
+hash_candidate.json is the fresh original-CLI replay on validation-only
+source 0b76e819, with C API #95, bounded SHA-2 #120, reviewed Class #125,
+Hash #126 and the intake child-startup correction. The runtime binary is
+unchanged from a9c8a2ff; only the measured startup inputs changed. Its full
+735-file corpus matches with indexing ON and OFF. The same frozen archives,
+fresh gem homes/native builds and 600-second / 2-GiB bounds remain.
+
+Reference passes all six stages, including six tests / 31 assertions and
+real Puma HTTP. Mere installs all 68 dependencies in 201.059 seconds /
+948,608 KiB, then the original migration CLI passes the Hash configuration
+and fails on JSON::Ext::Generator::State.default_sort_keys_proc= (2.273 s /
+268,896 KiB, exit 1, no resource event). Boot/tests/HTTP remain NOT_RUN.
+The earlier main, C API, provider, Class and load-path records are unchanged.
+
+The actual JSON 3.1.0 Ruby facade loads, but shipped parser/generator source
+is selected despite the activated gem's independently built native files
+earlier on the load path. probes/json_generator.rb is a gem-only ordinary
+require reproduction. Issue #127 tracks native feature selection; no JSON
+attribute, source patch or forced older gem conceals it. Explicitly loading
+the own native libraries after the failed facade is a separate diagnostic
+whose sorting/parsing output matches; it is not used by the original run.
+Full Rails component suites remain unmeasured, and no Rails app pass is claimed.
+
+
+## Native-selection candidate reaches Module's included super
+
+native_candidate.json preserves the next fresh original-CLI paired run on
+validation-only source 61d01f6d, including native selection #128. Each runtime
+again installs from the same lock into an empty home and builds its own
+extensions. All six reference stages pass, including six tests / 31 assertions
+and real Puma HTTP. Mere installs all 68 dependencies in 232.699 seconds /
+954,624 KiB and passes the previous registry, Hash and JSON boundaries.
+
+Migration then exits 1 in 4.097 seconds / 318,224 KiB at ActiveModel's
+respond_to_without_attributes? on its AttributeMethods module. Boot/tests/
+HTTP remain NOT_RUN; there is no resource event. The original app, lock and
+600-second / 2-GiB bounds are unchanged, and earlier records are retained.
+
+An independent TracePoint diagnostic identifies the original missing call
+as included. probes/module_native_hook.rb reduces it without gems: a Ruby
+included override's super misses Module's native default and calls an
+unrelated instance method_missing on the module itself. Reference returns
+the real nil result. The same failure occurs on the Hash parent, so it is
+not claimed as introduced by the native-file correction. Issue #129 hands
+this ordinary native-super/notification boundary to the generic dispatch
+work. No Rails alias or notification return is fabricated to conceal it.
+
+The preceding JSON probe now matches using normal require, with no native
+preload workaround. Original require/autoload/Marshal counts and all 733
+native-branch corpus files match their stated comparisons; existing C API
+contracts hold normally/under stress and all six fault controls fail. These
+do not establish a Rails application or framework-suite pass.
+
+
+## Module notification candidate reaches ActionController syntax
+
+module_candidate.json preserves the fresh paired replay on validation-only
+source b9056808, including notification correction #132 and the synchronized
+native-selection parent. Both sides use the original 69 locked source
+archives, initially empty homes and independently built native extensions.
+All six reference stages pass, including six tests / 31 assertions and real
+Puma HTTP. Mere installs all 68 dependencies in 210.753 seconds / 862,800 KiB.
+
+The original migration CLI passes the preceding Module included failure and
+then exits 1 in 3.999 seconds / 318,752 KiB at unchanged ActionController
+source: extend ::AbstractController::Railties::RoutesHelpers.with(app.routes).
+The parser reports expected end of statement. Boot/tests/HTTP remain NOT_RUN;
+there is no resource event. Earlier records, app sources, lock and 600-second /
+2-GiB bounds are unchanged; all 18 new stdout/stderr hashes were verified.
+
+probes/absolute_extend.rb reduces the absolute-root factory argument without
+gems and checks lexical anchoring. Even the single original extend statement
+fails syntax checking on unchanged main and this composition, while Ruby
+accepts it. The bare absolute constant, adjacent keyword command and property
+assignment controls parse on both. Issue #134 records parse_stmt_id's special
+extend branch consuming only the scoped constant and leaving the dotted
+call unparsed. No Rails source patch or changed grammar input conceals it.
+
+The independent #132 notification branch completes 707/707 corpus programs
+with indexing ON/OFF and preserves all five core files (525 MATCH / 527 cases).
+The synchronized #128 branch separately completes 734/734 programs. Neither
+is a full-corpus claim for this combined b9056808 composition. A separate
+pre-existing saved native Method metadata gap is tracked in issue #133; its
+Array#length control fails on the parent and is not an actual Rails blocker.
+Rails application and framework-suite success remain unestablished.
+
+## Rails loading: remaining evaluator boundaries (2026-11-20)
+
+Rooted extend/include factory expressions, real class/module singleton
+extend overrides, autoloaded scoped class namespaces and autoload's main
+require receiver have small matching witnesses in corpus 729-732. The
+original Module/Syntax/Parse/Forwardable/Method/Super/Autoload/Require files
+retain main's per-file MATCH counts (722 cases, 717 MATCH / 1 RED / 4 BOTH).
+
+A validation-only composition still stops migration at a Module subclass's
+block-bearing define_method. Boot, the application's tests and HTTP are
+not reached. The selected original ActiveSupport OrderedOptions, Concern
+and Inflector files discover all 521 cases: 513 MATCH / 8 RED. Remaining
+failures include Hash subclass default reads and Enumerable iteration,
+String-subclass gsub! super, and Unicode lookbehind. This is not the whole
+Rails test suite. No original test or exclusion was changed to obtain it.
+
+Scoped class namespace identity does not repair the existing module_eval
+lexical-nesting bug: unittest/scoped_class_lexical_probe.rb returns :missing
+on reference Ruby and :found on both preceding main and this candidate.
+It is an explicit failing diagnostic, not a passing corpus case.
+
+
+## Module subclass factories and native mixin super (2026-11-20)
+
+Corpus 733/734 now matches real Module-subclass define_method closures,
+named visibility, frozen receivers, Ruby overrides, native mixin super
+returns and singleton missing hooks with blocks. The actual ActiveModel
+factory and Concern boundaries advance in an own Rails composition.
+The next unchanged migration failure is credentials-path construction in
+Pathname#initialize. Boot, application tests and HTTP remain NOT_RUN;
+selected ActiveSupport Hash/default/Enumerable, String gsub! super and
+Unicode-lookbehind failures remain unclaimed. No runtime or test resource
+bound, original test, or exclusion changes were made for these fixes.
+The rooted-loading review also fixes the shadowed three-segment namespace
+regression: corpus738 verifies the lexical first constant, remaining namespace
+walk, explicit root and autoload on both definition paths. The separate
+module_eval lexical-nesting diagnostic above remains a known failure.
+
+Module review corrections retain original missing dispatch for non-native
+Regexp/notification names and send method_added to the actual Module-subclass
+receiver, including native tracing and undef. Corpus739/740 covers these
+boundaries; no original test was excluded for them. The separate native
+alias predicate diagnostic in unittest/native_alias_method_predicate_probe.rb
+prints true on Ruby and false on both main and this candidate; it remains
+unresolved and is not a passing corpus case.
+
+
+The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
+namespace constants and intermediate const_missing results as real scope
+lookups (corpus742). Both definition paths retain the lexical first constant,
+privacy and autoload behavior. The712-file corpus and original nine-file784-case
+comparison pass without losing a main PASS. The separate module_eval lexical
+negative remains an explicit failing diagnostic; this change does not claim it.
+
+Native-check stdlib fallbacks are explicit: the C extension runners set
+MERE_RUBY_STDLIB_FALLBACK to the actual reference library directory. A
+RubyGems extension child can repeat it through -I; native-backed shipped
+features still use this runtime's implementation there. Other user paths
+and pure Ruby source retain ordinary ordering. Corpus525 covers a native
+wrapper, and unchanged mkmf contracts plus seven real native gem installs
+pass. The C API spec gate retains its existing unsupported cases and bounds;
+2277 candidate cases versus2584 reference is not a claim of complete C API.
