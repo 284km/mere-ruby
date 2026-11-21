@@ -6852,3 +6852,33 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+### Native extension child processes retain declared stdlib fallbacks
+
+The runtime-first native runners fixed parent mkmf loading, but RubyGems'
+unchanged extension builder repeats its physical stdlib directory in a
+child -I argument. That restores the reference monitor.rb ahead of the
+shipped implementation and raises LoadError for monitor.so before extconf.
+
+The three native runners declare their actual reference directory through
+MERE_RUBY_STDLIB_FALLBACK. load_path_pick_shipped treats a declared fallback
+entry as the shipped position for genuinely native-backed shipped features.
+This survives the child's -I without guessing reference installations,
+changing ordinary user-directory precedence, or replacing pure Ruby source.
+No runtime behavior changes when no fallback is declared. Functions touched:
+load_path_pick_shipped and run in capi_mkmf_check.py, capi_gem_check.py and
+capi_spec_check.py. No new top-level value or collector/C API body edit.
+Corpus525 retains a small native-wrapper reproduction.
+
+Released compiler43f2994b/O2: all724 corpus programs match in both hash modes
+(470.007 seconds / 1,067,584 KiB under unchanged900-second/2-GiB bounds).
+All16 focused comparisons, nine RSS workloads, roots, depth155 and dead
+definitions pass. Actual mkmf builds pass all14 contracts on reference,
+candidate and collection stress, and both negative controls fail correctly.
+All seven published native gems install by the unchanged gem install path;
+all84 use-output lines match and wrong-runtime libraries are rejected.
+The unchanged C API spec gate accepts reference2584/candidate2277 against
+its existing record. Existing digest-header, thread timeout and other
+unsupported spec results are retained, not counted as passing cases.
+The earlier runner-only attempt's six native-gem child failures remain
+separate raw evidence. Current hosted every-file validation still gates merge.

@@ -4659,3 +4659,12 @@ lookups (corpus742). Both definition paths retain the lexical first constant,
 privacy and autoload behavior. The712-file corpus and original nine-file784-case
 comparison pass without losing a main PASS. The separate module_eval lexical
 negative remains an explicit failing diagnostic; this change does not claim it.
+
+Native-check stdlib fallbacks are explicit: the C extension runners set
+MERE_RUBY_STDLIB_FALLBACK to the actual reference library directory. A
+RubyGems extension child can repeat it through -I; native-backed shipped
+features still use this runtime's implementation there. Other user paths
+and pure Ruby source retain ordinary ordering. Corpus525 covers a native
+wrapper, and unchanged mkmf contracts plus seven real native gem installs
+pass. The C API spec gate retains its existing unsupported cases and bounds;
+2277 candidate cases versus2584 reference is not a claim of complete C API.
