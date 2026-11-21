@@ -91,3 +91,24 @@ class KwChild < KwParent
   def initialize = super(x: 1)
 end
 show("monitor kwargs") { KwChild.new.instance_variable_get(:@x) }
+
+# A native wrapper reached from a declared reference fallback still uses
+# this runtime's Monitor. The wrapper is ordinary Ruby on the reference.
+require 'tmpdir'
+Dir.mktmpdir('monitor-fallback') do |dir|
+  File.write(File.join(dir, 'monitor.rb'), "require 'monitor.so'\n")
+  previous = ENV['MERE_RUBY_STDLIB_FALLBACK']
+  loaded = $LOADED_FEATURES.dup
+  $LOADED_FEATURES.delete_if { |feature| feature.end_with?('/monitor.rb') }
+  ENV['MERE_RUBY_STDLIB_FALLBACK'] = dir
+  $LOAD_PATH.unshift(dir)
+  begin
+    require 'monitor'
+    lock = Monitor.new
+    p [:native_fallback, lock.synchronize { :locked }, lock.mon_owned?]
+  ensure
+    $LOAD_PATH.delete(dir)
+    previous ? ENV['MERE_RUBY_STDLIB_FALLBACK'] = previous : ENV.delete('MERE_RUBY_STDLIB_FALLBACK')
+    $LOADED_FEATURES.replace(loaded)
+  end
+end
