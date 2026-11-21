@@ -8625,6 +8625,13 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
     let (classes0, var, handler) = rc in
     let classes = expand_rescue_classes env world blk classes0 in
     let tp9 = map_len hook_flags > 0 && map_has hook_flags "tp" in
+    let rec observes = fn (cs: str list) -> (match cs with
+      | Nil -> false
+      | Cons (c, t) -> has_meth world ("(sng:" ++ c ++ ")") "===" || observes t) in
+    // The evaluator has the same escape route as VM checkmatch: a custom
+    // matcher can keep the exception without any rescue variable.
+    let exc = (if tp9 || observes classes then exc_pin_bt world exc else exc) in
+    let _ = map_set globals "!" exc in
     // (under a TracePoint the match is made on the `rescue`'s line, and each
     //  class asked is Module#=== -- a :c_call / :c_return)
     let _ = (if tp9 then (match handler with Cons (SLineQ n9, _) when n9 < 0 -> cur_line_set (0 - n9) | _ -> ()) else ()) in
@@ -66392,6 +66399,26 @@ and vm_checkmatch = fn env -> fn world -> fn blk -> fn st -> fn (f: int) ->
   let pat = vm_pop st in
   let tgt = vm_pop st in
   let ty = f % 4 in
+  // A Ruby matcher can retain its argument even when the rescue body only
+  // matches. Pin once before exposing it; later clauses and $! use that same
+  // object. Builtin-only matching still needs no exception object.
+  let observes = fn (p: Val) -> (match p with
+    | VClass c -> has_meth world ("(sng:" ++ c ++ ")") "==="
+    | _ -> false) in
+  let rec observed = fn (ps: Val list) -> (match ps with
+    | Nil -> false | Cons (p, t) -> observes p || observed t) in
+  let expose = ty == 3 &&
+    ((map_len hook_flags > 0 && map_has hook_flags "tp") ||
+     (if f >= 4 then (match pat with VArr a -> observed (deref a) | _ -> observes pat)
+      else observes pat)) in
+  let tgt = (if expose then
+    (let pinned = exc_pin_bt world tgt in
+     let (_, regs) = st in
+     let (_, _, _, _, names, _, _, _, _, _, _, _, _, _) = vec_get vm_meta (vec_get regs 13) in
+     let _ = (match names with Cons (n, _) -> map_set env n pinned | Nil -> ()) in
+     let _ = map_set globals "!" pinned in
+     pinned)
+    else tgt) in
   let one = fn (p: Val) ->
     (if ty == 3 then
        (match p with
@@ -66558,7 +66585,11 @@ and vm_region = fn env -> fn world -> fn blk -> fn cd -> fn (ct: (int * int * in
             (let exc = (if vm_rescue_only_matches cid then exc0 else exc_pin_bt world exc0) in
              let _ = map_set globals "!" exc in
              let (v, how) = child exc in
-             after true exc v how))
+             // checkmatch may have pinned a previously hidden pair before a
+             // Ruby matcher saw it. Propagate that object if every clause
+             // rejected it, too.
+             let propagated = (match errn with Cons (n, _) -> map_get env n | Nil -> exc) in
+             after true propagated v how))
          false noflow false nodecl noflow
      else
        run_begin_f env world blk body_f nodecl false

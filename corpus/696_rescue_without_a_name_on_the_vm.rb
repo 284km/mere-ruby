@@ -79,3 +79,57 @@ begin
 rescue ArgumentError => outer
   p outer.message, outer.equal?($!)
 end
+
+# A matcher can keep the exception even when the clause binds no variable.
+class RetainingRescueMatcher
+  class << self
+    attr_accessor :accept
+    attr_reader :saved, :same_current
+    def ===(exception)
+      @saved = exception
+      @same_current = exception.equal?($!)
+      @accept
+    end
+  end
+end
+RetainingRescueMatcher.accept = true
+begin
+  boom("retained")
+rescue RetainingRescueMatcher
+end
+saved = RetainingRescueMatcher.saved
+frames = saved.backtrace.dup
+begin
+  boom("later")
+rescue ArgumentError
+end
+p saved.message, frames == saved.backtrace, RetainingRescueMatcher.same_current
+
+# A rejecting matcher and a subsequent accepting matcher see one object.
+class AcceptingRescueMatcher
+  def self.===(exception)
+    p exception.equal?(RetainingRescueMatcher.saved), exception.equal?($!)
+    true
+  end
+end
+RetainingRescueMatcher.accept = false
+begin
+  boom("next clause")
+rescue RetainingRescueMatcher
+rescue AcceptingRescueMatcher
+end
+
+# Splat patterns share the pinned object, as does propagation to an outer rescue.
+matchers = [RetainingRescueMatcher, AcceptingRescueMatcher]
+begin
+  boom("splat")
+rescue *matchers
+end
+begin
+  begin
+    boom("propagated")
+  rescue RetainingRescueMatcher
+  end
+rescue => exception
+  p exception.equal?(RetainingRescueMatcher.saved), exception.equal?($!)
+end
