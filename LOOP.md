@@ -6732,3 +6732,13 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+### Class-subclasses integration with current main
+
+Integrate main a206da11 into PR #125, preserving both subclasses and extend
+branches of defined_super_str. Documentation retains both independent
+appendices; no other runtime conflict requires manual resolution. The O2
+runtime matches corpus717/718/720/729/730 in all four hash/MRO modes (20
+comparisons), and roots/depth155 pass. Current hosted full checks remain
+required. The prior Linux clone RSS failure remains recorded; this merge
+and the focused comparisons do not establish its repair or waive its gate.
