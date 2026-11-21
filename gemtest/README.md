@@ -1,5 +1,10 @@
 # Gem and HTTPS measurements
 
+For original upstream test suites, rather than loading gems, see
+[SUITES.md](SUITES.md). Their independent source lock, file-level results and
+macOS/Linux CI live in `suites.lock.json`, `suites_latest.json` and the
+`Gem suites` workflow.
+
 `measure.py` runs the existing 29-gem list in separate processes under a pinned
 Ruby 4.0.9 reference and mere-ruby, with and without an external stdlib. Both
 interpreters use the same isolated gem home and RubyGems source checkout.

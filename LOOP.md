@@ -5211,6 +5211,64 @@ different.
   1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
   fallbacks, then the compiler made native, then speed.
 
+## 2026-11-16 (65): five real pure Ruby gems run their own upstream test files
+
+Gem-suite rounds 1-3, on main c64d0ae4, independently of #86 (AST), #87
+(C API) and #88 (VM). This measures original upstream tests, beyond the
+29-gem require-only inventory. The final lock has 62 files and 1,969
+reference tests. Counts below are FILE verdicts, not case counts:
+
+| suite | initial MATCH / RED / BOTH | latest MATCH / RED / BOTH | other |
+|---|---|---|---|
+| minitest 5.25.5 | 3 / 4 / 0 | 3 / 4 / 0 | mock now completes all 94 tests |
+| rack 3.2.0 | 29 / 9 / 0 | 30 / 8 / 0 | 1 MEMORY on both builds |
+| rack-test 2.2.0 | 7 / 1 / 0 | 7 / 1 / 0 | assertion-count reflection difference |
+| public_suffix 6.0.2 | 7 / 0 / 0 | 7 / 0 / 0 | |
+| base64 0.2.0 | 1 / 0 / 0 | 1 / 0 / 0 | |
+
+- **Reproducible sources and measurements.** `gemtest/suites.lock.json`
+  pins release commits, full source digests, test-file inventory, commands
+  and every pure Ruby development dependency's archive and extracted tree.
+  Restore checks the runtime dependency closure and rejects C extensions.
+  Sources stay in an external cache; measurement retrieves nothing. Each
+  side/file gets its own source copy and seed 1. Raw stdout, stderr and exit
+  are saved separately. Existing CI supervision bounds the whole process
+  family to 600 seconds and 2 GiB, with no option to increase either.
+- **Honest file verdicts.** MATCH requires successful exits, non-skipped
+  tests, assertions and identical summaries. No summary, zero tests and all
+  skips cannot pass. Reference failures remain BOTH, and resource limits
+  remain explicit. The final baseline has no BOTH or timeout; its remaining
+  memory failure is Rack's multipart file. Initial and latest results are
+  saved separately and compared file by file, with no lost MATCH or changed
+  reference coverage. `SUITES_GAPS.md` records every remaining difference,
+  distinguishing confirmed symptoms from causes still under investigation.
+- **Two local semantic fixes.** `pct_strict_value` follows escaped newlines
+  backwards before deciding whether `%` starts a literal. Minitest's
+  continued format string now parses; its original mock file runs 94 tests
+  instead of stopping with SyntaxError (still 2 failures / 13 errors).
+  `cls_meth_own` respects a local builtin alias before an inherited Ruby
+  class method: Rack::MockResponse's `alias [] new` no longer calls
+  Rack::Response.[] with its different argument order. The original mock
+  response file becomes MATCH (24 tests / 100 assertions). Witnesses 667
+  and 668. These are the only interpreter functions changed; no new global
+  let, VM, AST tree, C API or collector change.
+- **Selection and reference readiness.** Rack 3.1.12 requires removed
+  cgi/cookie, so 3.2.0 was selected before the final baseline. Hoe and logger
+  are explicitly pinned so minitest's task file and Rack's logger tests run
+  on the reference. These environment repairs are not interpreter gains.
+  Kramdown 2.5.1's conversion tests depend on tidy and optional Rouge and
+  stringex (reference 19 failures / 11 errors); it is explicitly deferred
+  in the lock, not selectively patched or counted as passing.
+- **Validation.** Corpus 690/690 before and 692/692 after; test_alias
+  17 MATCH / 1 RED and test_syntax 167 MATCH / 1 RED / 2 BOTH, identical
+  file counts to both handoff CI 43548292351 and main CI 43807166928.
+  Dead/duplicate definitions, GC roots and loop RSS gates pass; generated
+  bracket depth stays 895/1024. Six harness negative controls cover zero
+  tests, missing summaries/files, reference failures, limits and source
+  mutation/shadowing. The separate `Gem suites` workflow uses actions/cache
+  and runs on macOS and Linux, without changing existing job durations or
+  any per-file limits. Full existing-suite regression checks still gate merge.
+
 ## 2026-11-16 (60): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and published gems -- nokogiri among them -- install with `gem install`
 
 Stage 7′ / 8, third unit (note 553), on the C API of (58). Until now
@@ -6302,6 +6360,66 @@ test_regexp, test_enumerator, test_fiber, test_hash the same counts;
 test_array MATCH 473 on both (one test that fails on the reference too
 moves between RED and BOTH from run to run, on either build).
 
+## 2026-11-18: gem source provenance is checked before accepting MATCH
+
+The initial gem harness exposed a provenance gap during the next candidates'
+audit: Mere selected its bundled Base64 before the locked release library on
+-I. That result passed the upstream tests but did not establish the upstream
+library's execution. Preserve both the initial and pre-audit snapshots.
+
+do_require0 / resolve_feature now use load_path_pick_shipped and honor the
+physical prefix before the actual stdlib entry. The private Marshal loader
+keeps its previous internal behavior after a user clears $LOAD_PATH. Corpus
+685 covers real library replacements, converted entries, relative imports
+and the real Marshal API; no public __marshal feature is invented.
+
+The bootstrap appends reference fallbacks after each interpreter's stdlib,
+then records physical locked-gem files after the upstream autorunner. Healthy
+summaries alone and exit! cannot pass. All seven harness controls succeed.
+The core runner keeps the same fallback order, including RubyGems' source.
+
+Fresh normal O2 source 799c55d7, including main 3eb24fef: all 62 original
+files retain 48 MATCH / 13 RED / 0 BOTH / 1 MEMORY. Both sides audit the
+locked library on every normally completed file (reference 62, Mere 61).
+Only command descriptions change in the lock; all source/dependency digests,
+inventory and bounds stay fixed. The explicit protocol transition compares
+against the preserved snapshot with zero regressions, and the CLI still
+rejects a different lock digest.
+
+Require retains 51 MATCH / 1 BOTH, Autoload 27 / 1, GemVersion 32, Integer
+38, TracePoint 97 and PP 36 MATCH in the integrated build. Full corpus and
+the hosted per-file comparisons remain independent merge gates. No collector,
+C API, ISeq or Prism implementation is changed by this correction.
+
+The integrated corpus completes at 705/705 MATCH. Generated C needs bracket
+depth 932 (the inherited search seed was 923); record 932 for the check's
+two-compile search. The existing build limit remains 1024. Before publishing,
+retain the already published main-merge history as well; its runtime sources
+are identical to the fully measured 799c55d7 build.
+
+Hosted validation found old reference-first paths in Unicode/NKF and other
+drivers, plus a fake interpreter unable to answer the new path query. Share
+the clean runtime query in tools/runtime_load_path.sh, put reference fallbacks
+after it, and make the fake harness answer and assert that ordering. Harness
+20, Unicode, original NKF, Psych scalar/wire/store/lifetimes and YAML Store
+controls pass without changing bounds or skip rules.
+
+Also preserve the original standalone bundled-library fallback after a user
+clears $LOAD_PATH. Physical replacements still win; the existing standalone
+tmpdir check and the real Marshal API pass. Fresh O2 source 53e0077f keeps
+the strict audited 48 MATCH / 13 RED / 1 MEMORY, zero regressions and
+705/705 corpus matches. The separate bootstrap constant-assignment correction
+is now applied for a combined build; its original bootstrap eval control is
+49/49 MATCH, with isolated corpus 705/705 and unchanged core Eval/Module/Const
+counts. No combined-head or hosted result is inferred from those controls.
+
+Final combined first gem-suite PR, normal O2 source 4ff6b54f: 48 MATCH /
+14 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+All 62 files on both sides finish the locked-library source audit. Multipart
+finishes below the RSS cap with one custom-params-hash error (test_0034),
+85 tests / 238 assertions versus the reference's 239. Its prior MEMORY/RED
+variation is not a new MATCH or an inferred VM/GC cause.
+Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
 ## 2026-11-18 (82): build-linux's Module check at its 10 s, and Module#clone walking every constant
 
 Main e40bb486's CI run failed the Module check:
@@ -6340,6 +6458,37 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+
+## PR 90 merge gate: preserve the Pathname core before physical extensions
+
+The preceding head's full hosted run was green but lost two Bundler binstub
+cases: the physical Ruby 4.0 pathname.rb extends a core class, while the lazy
+core entry pointed back to that same wrapper. Preserve the actual core body
+separately as pathname_builtin; the existing autoload and Kernel.Pathname
+factory load it, and the ordinary shipped pathname entry adds the extension
+body afterwards. Physical pathname.rb files retain their precedence and can
+extend the initialized class. The source bodies themselves are unchanged.
+
+Normal O2 runtime1e94ce39, pinned compiler01f5ad73, restores the original
+Bundler file from13 to15 MATCH. Full Pathname/Pathname Ractor/Require/Autoload
+comparisons against completed main3b05689f retain every PASS: five files,
+383 cases, both381 MATCH/2 BOTH/0 RED/0 EXTRA. Corpus746/747 cover the physical
+wrapper and factory-first core/library phases. All28 focused hash/MRO-mode
+comparisons and710/710 corpus programs with hash indexing ON/OFF pass. The
+corpus uses462.840s and1,104,448KiB under the unchanged900s/2GiB bound. Nine
+RSS cases, GC roots, dead/duplicate definitions and depth155/1024 pass.
+
+The original offline five-gem62-file run retains48 MATCH/14 RED, no BOTH or
+resource-limit event, zero baseline regressions, and62 physical-library audits
+on each side. Core harness20 and load-path controls6 pass. The unchanged
+30K-method bootstrap completes under the original60s child bound on main's
+actual CI binary(34.657s), the prior PR CI binary(33.547s) and candidate
+(33.721s), with a healthy reference. Retain the prior hosted Timeout; this is
+not a VM speed change or a timeout waiver. New hosted CI, per-file comparison
+and addressed P1/P2 findings are still required before merge. No test, helper,
+limit, exclusion, collector, VM/ISeq, AST/Prism or C API change is used here.
+
 
 
 ## 2026-11-19: SHA-2 checksums in real gem installation
@@ -6793,6 +6942,32 @@ fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
 
 
+### Pathname follow-up: retain an internal core identity and ordinary user files
+
+A same-named user file exposed a further load-order gap in the split-core
+entry. Anchor the existing autoload under the runtime's initialized internal
+stdlib directory as <internal:pathname_builtin>; the factory reads the root
+constant to trigger it. Ordinary pathname.rb and pathname_builtin.rb files
+retain physical load-path selection. Corpus748 checks both the actual core
+operations and the canonical physical loaded feature. It introduces no
+synthetic metadata, hidden library result or new top-level Mere value.
+
+Final O2 runtimeee50b4d8 includes maind9826ac9 and passes714/714 corpus in both
+hash modes,32 focused hash/MRO comparisons, RSS9, roots, dead/duplicate defs
+and depth155/1024. Corpus462.885s/1169328KiB stays inside900s/2GiB. Original
+five-file383-case comparison retains381 MATCH/2 BOTH with no lost PASS or
+file decrease. Original five-gem62-file run retains48 MATCH/14 RED, no
+resource-limit event or baseline regression, and62 physical audits per side.
+The final original30K-method bootstrap passes in34.535s/1190464KiB with the
+same60s child/600s file/2GiB bounds; source-generation parity, six load-path
+and twenty core-harness controls also pass.
+
+The intermediate head27e78973's hosted Linux Module test instead records
+clone RSS72159232 to151474176 bytes(2.0991655787x):195 tests,1240 assertions,
+one failure, no outer-limit event. Preserve this distinct failure; it is not
+waived as complemented-entry noise or replaced by a local pass. The final
+head's complete hosted result and every-file comparison remain merge gates.
+
 ## 2026-11-20: rooted mixin arguments, scoped namespace autoload and the autoload loader
 
 Unchanged Rails loading reached three independent evaluator boundaries:
@@ -6981,3 +7156,60 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+### Native extension child processes retain declared stdlib fallbacks
+
+The runtime-first native runners fixed parent mkmf loading, but RubyGems'
+unchanged extension builder repeats its physical stdlib directory in a
+child -I argument. That restores the reference monitor.rb ahead of the
+shipped implementation and raises LoadError for monitor.so before extconf.
+
+The three native runners declare their actual reference directory through
+MERE_RUBY_STDLIB_FALLBACK. load_path_pick_shipped treats a declared fallback
+entry as the shipped position for genuinely native-backed shipped features.
+This survives the child's -I without guessing reference installations,
+changing ordinary user-directory precedence, or replacing pure Ruby source.
+No runtime behavior changes when no fallback is declared. Functions touched:
+load_path_pick_shipped and run in capi_mkmf_check.py, capi_gem_check.py and
+capi_spec_check.py. No new top-level value or collector/C API body edit.
+Corpus525 retains a small native-wrapper reproduction.
+
+Released compiler43f2994b/O2: all724 corpus programs match in both hash modes
+(470.007 seconds / 1,067,584 KiB under unchanged900-second/2-GiB bounds).
+All16 focused comparisons, nine RSS workloads, roots, depth155 and dead
+definitions pass. Actual mkmf builds pass all14 contracts on reference,
+candidate and collection stress, and both negative controls fail correctly.
+All seven published native gems install by the unchanged gem install path;
+all84 use-output lines match and wrong-runtime libraries are rejected.
+The unchanged C API spec gate accepts reference2584/candidate2277 against
+its existing record. Existing digest-header, thread timeout and other
+unsupported spec results are retained, not counted as passing cases.
+The earlier runner-only attempt's six native-gem child failures remain
+separate raw evidence. Current hosted every-file validation still gates merge.
+
+### Reference directories remain fallbacks for wrapped native libraries
+
+The declared-reference marker must describe directory ordering, not a list
+of native feature names: the Psych/YAML Ruby wrappers also require their
+own runtime's native core. load_path_pick_shipped now defers declared
+reference entries, preserves other active user paths, selects the shipped
+source at its own position, and searches deferred paths for unshipped files.
+No directory absent from LOAD_PATH is added by the marker. Behavior without
+a declaration is unchanged. Corpus 525 exercises real YAML parsing in a
+child with the fallback repeated through -I, using a genuine native-wrapper
+prerequisite on the reference. All 11 ordinary/child library controls pass;
+Psych and YAML failed the preceding child control. A real user source still
+wins over a declared fallback in the separate priority control.
+
+Current main 2e2ab568 is integrated with Digest, the cached compiler action,
+XML dependency checks and released compiler 43f2994b retained. Normal O2:
+726/726 corpus programs match in both hash modes (530.253 seconds,
+1,058,272 KiB), all 24 focused comparisons, nine RSS workloads, roots,
+depth 155 and dead definitions pass. The unchanged mkmf gate agrees on all
+14 contracts for reference/candidate/stress and rejects both negative
+controls. All seven native gems install and their 84 output lines agree;
+wrong-runtime libraries remain rejected. The C API spec gate retains its
+existing record, reference 2584/candidate 2277, including existing unsupported
+and timeout cases. Reference-cache and embedding-build controls pass, and
+workflow YAML parses. Hosted full checks and every-file nonregression remain
+required for the new head. No original assertion, exclusion or bound changes.
