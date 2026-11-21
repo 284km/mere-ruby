@@ -21,6 +21,9 @@ access is an explicit error, never an invented zero. A native control touches
 two of eight anonymous pages, verifies two present pages, discards one and
 verifies one; the reader must not fault in the other pages. Another control
 denies the reader and verifies failure and errno preservation.
+Native controls compile with Fortify enabled and retain warning-as-error;
+an aligned short-read control verifies progress without variable buffer
+offsets. These reader changes do not change the measured workload.
 
 The independent `rss-page-ownership.yml` matrix locks repaired source `90c83c6e`,
 released parent compiler `43f2994b`, the Map-slot clearing release `408b03d9`

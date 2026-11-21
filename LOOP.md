@@ -8354,3 +8354,13 @@ The new page-ownership matrix compares parent43 with published fix408 on the
 same locked runtime; existing historical jobs and ordinary CI pins remain
 unchanged. These observations support the removed-slot repair, not a claim
 that every historical RSS failure or workload variation is fixed.
+
+The first hosted page-reader checks fail before measurement: Ubuntu GCC's
+fortified pread wrapper cannot prove the partial-read buffer offset is bounded.
+Keep warning-as-error and Fortify. Read each chunk at the start of the fixed
+buffer and advance the page offset by the number of complete returned entries;
+short aligned reads retain every page, while invalid reads remain errors.
+All15 reader/evidence controls pass locally with explicit Fortify3, including
+the new short-read control. Previous measurement receipts retain their original
+observer hashes; this does not relabel them as measurements of the revised
+reader. Existing ordinary binaries, tests, limits and compiler pins are unchanged.
