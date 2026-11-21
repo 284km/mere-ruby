@@ -73,6 +73,17 @@ case "$rel" in
     if [ -f "$src/.unittest-reference/rbconfig.rb" ]; then
       extra="-I $src/.unittest-reference -I $src/lib"
       ref_lib="$src/.unittest-reference:$src/lib:$ref_lib"
+    fi
+    # (mere-ruby's side: the build tree test/mkmf expects, staged of links to
+    #  its own headers -- mkmf_context.sh; without a C API it stays as it was)
+    if [ "$side" != ref ]; then
+      ctx="${TMPDIR:-/tmp}/unittest-mkmf-context.$$"
+      if launcher="$(sh "$here/mkmf_context.sh" "$mr" "$src" "$ctx" "${stdlib%%:*}")"; then
+        mr="$launcher"
+        mere_lib="$ctx/source/lib:$mere_lib"
+      else
+        ctx=""
+      fi
     fi ;;
   rubygems/*)
     ref_lib="$src/lib:$ref_lib" ;;
@@ -84,6 +95,14 @@ if [ "$side" = ref ]; then
   # shellcheck disable=SC2086
   PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$ref" RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" \
     exec "$ref" $extra -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" "$file" -v --show-skip $seed "$@"
+elif [ -n "${ctx:-}" ]; then
+  # (the staged tree is this run's: removed when the run is over)
+  # shellcheck disable=SC2086
+  PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr" RUBY="$mr" RUBYLIB="$mere_lib" UNITTEST_TEST_FILE="$rel" \
+    "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" "$file" -v --show-skip $seed "$@"
+  code=$?
+  rm -rf "$ctx"
+  exit "$code"
 else
   # shellcheck disable=SC2086
   PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr" RUBY="$mr" RUBYLIB="$mere_lib" UNITTEST_TEST_FILE="$rel" \
