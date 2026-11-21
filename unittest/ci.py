@@ -66,12 +66,15 @@ def partitions(manifest):
     return groups
 
 
-def balance(files, count, seconds):
+def balance(files, count, seconds, max_files=None):
     # Longest processing time first; stable ties make plans reproducible.
     # Unknown files still run, with a conservative one-minute estimate.
     groups, totals = [[] for _ in range(count)], [0.0] * count
+    if max_files is not None and (type(max_files) is not int or max_files * count < len(files)):
+        raise ValueError('insufficient partition file capacity')
     for file in sorted(files, key=lambda file: (-seconds.get(file, 60), file)):
-        index = min(range(count), key=lambda i: (totals[i], len(groups[i]), i))
+        available = [i for i in range(count) if max_files is None or len(groups[i]) < max_files]
+        index = min(available, key=lambda i: (totals[i], len(groups[i]), i))
         groups[index].append(file)
         totals[index] += seconds.get(file, 60)
     return groups, [round(total, 3) for total in totals]
