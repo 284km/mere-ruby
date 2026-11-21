@@ -8118,3 +8118,17 @@ changed in this integration; all other runtime changes come from the reviewed
 parent. No top-level value, original test, exclusion, baseline or bound changes.
 Fresh O2, complete corpus and original-file checks follow this synchronization;
 the older734-program receipt remains tied to its original source.
+
+The synchronized normal O2 source b9c06a08, released compiler43f2994b,
+now completes751/751 corpus programs in both hash modes (487.638 seconds,
+1,187,808 KiB under the unchanged900-second/2-GiB aggregate bound).
+All8 focused native/fallback comparisons, nine RSS cases, roots, depth155
+and dead-definition checks pass. Original require/autoload/Marshal remain
+311 cases /308 MATCH /0 RED /3 BOTH, the same as the parent receipt.
+The original mkmf14 contracts pass on both runtimes and under GC stress;
+the real upstream context/child controls pass, and broken-source/foreign
+runtime controls fail correctly. Source/binary/check hashes stayed fixed.
+The earlier partial focused invocation named absent Digest witnesses;
+its successful525/722 rows are retained but only the corrected8-row run
+is accepted as a complete focused receipt. No case is silently omitted.
+Hosted current-head CI, per-file comparison and review gates remain required.

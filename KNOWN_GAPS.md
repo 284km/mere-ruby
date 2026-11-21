@@ -4877,3 +4877,12 @@ and pure Ruby source retain ordinary ordering. Corpus525 covers a native
 wrapper, and unchanged mkmf contracts plus seven real native gem installs
 pass. The C API spec gate retains its existing unsupported cases and bounds;
 2277 candidate cases versus2584 reference is not a claim of complete C API.
+
+The synchronized native-selection branch retains declared reference stdlib
+fallbacks through repeated child -I arguments, including actual YAML/Psych
+native prerequisites, and preserves unrelated user paths. Its new normal O2
+receipt is751/751 corpus programs in both hash modes; original require,
+autoload and Marshal retain308 MATCH/0 RED/3 BOTH across311 cases.
+The real mkmf context/child,14 contracts, stress and negative controls pass.
+These checks do not establish a Rails application/framework-suite pass or
+complete C API compatibility; earlier original Rails failures remain recorded.
