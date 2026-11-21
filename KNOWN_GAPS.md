@@ -4584,6 +4584,23 @@ there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
 
 
+## Hash subclass missing hooks used by Rails options
+
+Unknown calls on Hash subclass instances now reach their real inherited
+Ruby method_missing, using the existing primitive hook path. Real Ruby
+methods, native entries/aliases and refinements retain their precedence.
+The unchanged ActiveSupport OrderedOptions setter/getter and stored value
+match the reference in a saved-gem diagnostic. This does not establish a
+Rails application pass; the original cold six-stage workload still needs
+the Class/C API/SHA-2 composition and this change together.
+
+This correction changes only hng_missing_hook. Native undef/private-alias
+dispatch gaps already present on the parent remain unresolved; their
+diagnostic failures are not converted into exclusions or passing tests.
+Original Hash/Method/Super retain 444 MATCH / 2 RED / 8 BOTH (454 cases).
+The complete 13-gem original suites have not been rerun on this head; the
+parent observations and all resource/comparison gates remain in force.
+
 ### PR90: Pathname core and physical library extensions
 
 Separating the unchanged shipped Pathname core from pathname.rb's extension
