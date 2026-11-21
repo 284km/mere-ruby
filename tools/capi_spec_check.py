@@ -117,6 +117,7 @@ def run(file):
         env.update(CAPI_SPEC_EXT=str(extensions[side]), LANG='en_US.UTF-8')
         if side == 'mere':
             env['RUBYLIB'] = os.pathsep.join([*runtime, stdlib])
+            env['MERE_RUBY_STDLIB_FALLBACK'] = stdlib
         log = OUT / f'{file.stem}.{side}.out'
         result = supervise([str(binary), str(driver)], env, log, 2 * 1024 * 1024, 120)
         text = log.read_text(errors='replace')
