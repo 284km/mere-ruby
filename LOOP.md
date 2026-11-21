@@ -7312,6 +7312,54 @@ Complete hosted CI, all existing-file comparisons and P1/P2 resolution still
 control merging. The previous stronger 54-MATCH original macOS baseline
 and failed multipart observations remain unchanged.
 
+## 2026-11-19: nonblocking writes use bytes, and the multipart pipe stops copying
+
+Rack 3.2.0's original long-boundary test retries a 10-MiB String while a
+reader drains its pipe. IO#__fd_write_nonblock converted that String using
+the stream's encoding and called String#b for every attempt. CRuby 4.0.9's
+io_write_nonblock writes the supplied bytes directly. Besides allocating an
+unnecessary String on every retry, calling #b exposed a user override that
+CRuby never calls. The configured converter could also change the bytes.
+
+Use IO.__wstr(s, nil) and pass the resulting String directly to IO.__fdwrite.
+This changes only the embedded Ruby IO method in core_prelude_k. Ordinary
+write conversion, descriptors, polling, errno handling, the VM, collector,
+native allocator and C API are unchanged. Witness 721 covers stream encoding,
+invalid/frozen input, an overridden #b, embedded NUL, ordinary write conversion
+and the non-String #to_s protocol.
+
+Fresh paired O2 measurements use compiler 2e3cc433, the same locked Rack source
+and its complete original 85 tests / 239 assertions. The old parent matches at
+1,686,656 KiB peak family RSS; the unmodified current runtime is stopped at
+2,333,216 KiB. The corrected runtime completes at 392,672 KiB (15.304 seconds),
+and again at 487,648 KiB in the complete macOS sweep. These are measured family
+RSS values, not a timing comparison with the killed run. Linux/aarch64 also
+completes the original file below the unchanged cap. Both sides audit the
+physical locked library. Per-side/file bounds remain 600 seconds / 2 GiB.
+
+All 129 original files across the five existing locks were measured on macOS
+at the same source cb09d147 and O2 executable: 120 MATCH / 8 RED / 1 MEMORY,
+with no strict per-file regressions. Request remains MEMORY. All 732 corpus
+files match with the hash index on/off, 678.868 seconds and peak family RSS
+1,086,160 KiB under the existing 900-second / 2-GiB aggregate bound. The
+upstream test_io write_nonblock selection gives 6 tests / 5 assertions on
+each side; it does not replace the complete upstream file's CI gate. Existing
+IO deadlines, inherited pipes and stalled TCP/TLS/HTTP controls pass.
+
+Keep the failed Linux environment probes separate. Root cannot test unreadable
+directories faithfully, and its fixed-name temporary files then caused EACCES
+when the next run used an ordinary user. The final run uses an ordinary user
+and a fresh TMPDIR without changing tests or bounds. Request can be killed by
+the container's aggregate cgroup limit before the per-family RSS sample reaches
+its cap; preserve the actual signal, OOM observations and RED classification
+rather than treating that representation change as a functional improvement.
+
+The Method-copy workload and 2x bound are unchanged. New macOS and local Linux
+observations do not clear the earlier hosted x86-64 failures. An independent
+diagnostic adds only public ObjectSpace Class counts: the reference stays at
+281 and Mere ranges from 283 to 297. This is evidence for further investigation,
+not a collector or lifetime repair. No GC internals were changed.
+
 ## 2026-11-20: apply the verified method floor repair to the earlier small-suite branch
 
 PR 119 still fails its original Method-copy assertion at 2.051319x on native

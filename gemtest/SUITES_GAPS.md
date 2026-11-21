@@ -1,5 +1,30 @@
 # Upstream gem suite differences
 
+The IO byte-write correction in cb09d147 restores the complete original Rack
+multipart file below the cap on macOS and Linux/aarch64. IO#__fd_write_nonblock
+now writes the supplied bytes without the stream converter or String#b, as
+CRuby does. Its repeated 10-MiB pipe writes no longer create the unnecessary
+String on every retry. Witness 721 also reproduces the actual wrong bytes and
+unexpected user callback before the fix. No VM, GC, C API or native allocation
+policy changed. All preceding failed candidates and hosted failures below
+remain historical observations; hosted validation of this fix is still needed.
+
+The same-source macOS 129-file sweep retains all 120 strong MATCH files, eight
+RED files and Request MEMORY, with no baseline regression. Separate native
+Linux measurements retain the failed root/temporary-file probes and the final
+ordinary-user run. The container may kill Request at its cgroup limit before
+the family sampler reaches 2 GiB; its unchanged RED classification is not an
+improvement over a prior MEMORY. Existing baselines, source locks and bounds
+are preserved. The full records and resource comparisons are in the
+`suites_io_r41_*` snapshots and `suites_io_runtime_r41.json`.
+
+Method-copy growth remains open: the unchanged 21,000-owner control passes
+in these macOS and Linux/aarch64 observations, but the earlier hosted x86-64
+2x failures are not waived. An independent public ObjectSpace diagnostic sees
+281 live Classes throughout on the reference and 283–297 on Mere. The actual
+series is retained without assigning an unproven VM/GC cause or changing the
+existing control, warmup, workload, skip policy or threshold.
+
 This ledger describes file verdicts from `suites_latest.json`. Raw stdout and
 stderr in CI's `gem-suites-*` artifacts identify individual failed tests.
 Symptoms below are observed; an unconfirmed cause is explicitly marked.
