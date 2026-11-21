@@ -54,13 +54,17 @@ from ci import supervise  # noqa: E402
 # (mere-ruby reads the standard library -- mkmf.rb among it -- from the
 #  reference's directory, as everywhere else in the checks)
 stdlib = subprocess.check_output([str(REF), '-rrbconfig', '-e', 'print RbConfig::CONFIG["rubylibdir"]'], text=True)
+# Prefer this runtime's libraries before using the reference Ruby as a fallback.
+# In particular, the reference monitor.rb requires an incompatible monitor.so.
+runtime = subprocess.check_output(["sh", str(ROOT / "tools/runtime_load_path.sh"), str(MERE)],
+                                  text=True, timeout=20).split(os.pathsep)
 results = {}
 problems = []
 
 
 def run(key, side, command, cwd, extra=None, lib=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith('MERE_RUBY_') and k not in ('RUBYOPT', 'RUBYLIB', 'MAKEFLAGS')}
-    path = ([str(lib)] if lib else []) + ([stdlib] if side == 'mere' else [])
+    path = ([str(lib)] if lib else []) + ([*runtime, stdlib] if side == 'mere' else [])
     if path:
         env['RUBYLIB'] = os.pathsep.join(path)
     env['LANG'] = 'en_US.UTF-8'
