@@ -4584,6 +4584,13 @@ there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
 
 
+The independent stage 9 GC work records actual collection causes, weak-map
+observations and process CPU profiling records. Unsupported compaction APIs
+raise NotImplementedError and report respond_to? false. INTERNAL_CONSTANTS
+contains no invented slot/heap values; stat_heap exposes no nonexistent pools.
+The 41 default-GC cases are explicitly excluded on both interpreters and
+counted separately. ObjectSpace enumeration remains tracked by PR #91.
+
 ## Rails dependency checksums and the next command boundary (2026-11-19)
 
 SHA-2 can use the real internal OpenSSL provider when already loaded, as
