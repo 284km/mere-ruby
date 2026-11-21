@@ -41,3 +41,32 @@ module U
     p e.message
   end
 end
+
+# Qualified reopening contributes only the scope as written to nesting.
+# The path through PathOuter is not a lexical scope of PathOuter::Inner.
+module PathOuter
+  module R; module B; X = :phantom_outer; end; end
+  module Inner; end
+end
+module PathOuter::Inner
+  p [:qualified_reopen, Module.nesting, R::B::X]
+  def self.read = R::B::X
+  class R::B::QualifiedPathClass; end
+end
+p [:qualified_method, PathOuter::Inner.read]
+p [:qualified_class, R::B.const_defined?(:QualifiedPathClass, false),
+   PathOuter::R::B.const_defined?(:QualifiedPathClass, false)]
+
+# A rejected namespace prefix must not hide a later genuine lexical scope.
+module RealPathOuter
+  module R; module B; X = :real_outer; end; end
+  module Phantom
+    module R; module B; X = :phantom_prefix; end; end
+    module Inner; end
+  end
+  module Phantom::Inner
+    p [:real_outer, R::B::X, defined?(R::B::X)]
+    def self.read = R::B::X
+  end
+end
+p [:real_outer_method, RealPathOuter::Phantom::Inner.read]

@@ -6828,3 +6828,30 @@ head fails the new evaluator reproduction in all four cache modes. The repair
 matches corpus 696-699 in all 32 evaluator/strict-VM/cache combinations; the
 original Exception and Backtrace files pass all 129 cases. The previous
 720-program sweep predates this follow-up; a fresh complete sweep is running.
+
+
+### PR review: resolve constant path heads through actual lexical scopes
+
+Use lex_const_key_nested for the EConst qualified-path shortcut and both
+const_walk_head lookups. An absent namespace prefix is not a lexical scope.
+If that first hit is rejected, the helper continues through the actual
+nesting instead of discarding a later real outer scope. It preserves the
+existing singleton-owner mapping. Changed functions: eval_e,
+const_walk_head and lex_const_key_nested; the parent's vm_define correction
+is unchanged. Corpus760 adds qualified reopening, method reads, scoped class
+definition and the case with both an absent prefix and a real outer scope.
+Both reported and additional comparisons failed before these corrections.
+
+Final normal O2/compiler01f5ad73 validation: **721/721 corpus**, hash index
+ON/OFF, **481.274s / 1,188,480KiB** peak family RSS. All36 default/evaluator/
+strict-VM and hash/MRO comparisons of731/738/760, all nine RSS gates, roots,
+dead definitions and C depth155/1024 pass. Complete original Exception/
+Backtrace/Module/Autoload/Require discover404 cases: **402 MATCH / 0 RED /
+2 BOTH**, with both reference skips explicit and all per-file MATCH retained.
+The old invalid-symbol Syntax leak failure is not affected or reclassified.
+An initial original-file selection started before the replacement build
+finished and is explicitly ineligible; the accepted fresh run checks the O2
+build's freshness and unchanged binary hash. No collector/state, C API,
+VM/ISeq, AST/Prism, gemtest implementation, original tests, exclusions or
+limits were changed for this repair. New hosted CI and latest-main per-file
+acceptance remain required before merging.
