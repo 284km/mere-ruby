@@ -4698,3 +4698,10 @@ already fail this way; the class-case review fix does not claim it solved.
 comparison against Ruby 4.0.9. This dispatch diagnostic is separate from the related native
 Method metadata work in [#133](https://github.com/284km/mere-ruby/issues/133).
 No upstream assertion or existing corpus program is skipped or excluded.
+
+A saved Module.instance_method(:===) called through a bound native Method
+still raises unknown operator even when a forwarding Module prepend exists.
+The same call fails on the #141 parent and the preceding native-main
+integration. unittest/module_saved_comparator_method_probe.rb preserves this
+independent dispatch diagnostic. The exact-entry super repair does not claim
+saved native Method dispatch is complete; no original test is excluded.

@@ -6595,3 +6595,16 @@ in unittest/module_kernel_comparator_alias_probe.rb and KNOWN_GAPS.md; it
 fails identically on prior main, parent #141 and candidate. The ineffective
 broader alias-copy change was reverted. Hosted checks and per-file comparison
 remain required before merge.
+
+### Preserve an already-selected native comparator under Module prepends
+
+run_super_target now reads native provenance through the new exact-entry
+native_case_alias_entry_owner helper. Ordinary alias dispatch continues to
+resolve ancestors through native_case_alias_owner; selected super targets
+must not restart at an earlier prepend. Corpus 743 adds a Module-level
+forwarding comparator and both matching/nonmatching cases.
+All 16 focused comparisons and the complete Module/Method/Super files retain
+342 MATCH and one existing RED over 343 cases. A fresh full sweep is running.
+The additional saved-native-Method diagnostic fails on the preceding main
+integration and #141 parent as well as the candidate and remains explicit
+in unittest/module_saved_comparator_method_probe.rb and KNOWN_GAPS.md.

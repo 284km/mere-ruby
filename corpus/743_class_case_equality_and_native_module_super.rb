@@ -83,3 +83,17 @@ class Module
   remove_method :saved_module_native_case
 end
 p [:restored_module_case, Array === [], Array === Array]
+
+# Native super is an already-selected entry even when Module has prepends.
+module ForwardingModuleCaseComparator
+  def ===(value)
+    super
+  end
+end
+Module.prepend(ForwardingModuleCaseComparator)
+class NativeModuleCaseCandidate; end
+p [:module_prepend, case NativeModuleCaseCandidate.new
+                   when NativeModuleCaseCandidate then true
+                   else false
+                   end]
+p [:module_prepend_miss, NativeModuleCaseCandidate === Object.new]
