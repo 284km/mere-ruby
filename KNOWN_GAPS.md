@@ -4695,6 +4695,6 @@ entry, saving that rebound entry under another name still reaches an
 unsupported primitive comparator. The previous main and the #141 parent
 already fail this way; the class-case review fix does not claim it solved.
 `unittest/module_kernel_comparator_alias_probe.rb` preserves the original
-comparison against Ruby 4.0.9. It is tracked with the independent native
+comparison against Ruby 4.0.9. This dispatch diagnostic is separate from the related native
 Method metadata work in [#133](https://github.com/284km/mere-ruby/issues/133).
 No upstream assertion or existing corpus program is skipped or excluded.

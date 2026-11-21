@@ -6537,3 +6537,61 @@ and boot pass. The original six app tests improve from five errors to three:
 all TimeWithZone cast errors are gone, while one unhandled retry and two unknown
 <=> errors remain. This warm diagnostic does not establish the direct-start
 Bundler path, a cold install, HTTP success or whole-Rails compatibility.
+
+### Review repair: mixed Hash keys and Object autoloads (2026-11-21)
+
+Native Hash reads now use the internal hash for builtin search and stored
+keys even when a mixed table contains Ruby-hashed keys. Ruby hash callbacks
+still run once for keys whose protocol requires them. Object-qualified
+mixin paths normalize the constant/autoload key before firing the loader.
+Functions changed: hash_read_native and mixin_argument_value. Corpus 735
+and 736 cover String/Symbol hash overrides, missing custom keys, and block,
+class-body include and runtime prepend through Object's pending autoload.
+
+With Mere 01f5ad73 and O2, all 719 corpus programs match in both hash-index
+modes (516.823 seconds, 1,192,432 KiB under the unchanged 900-second/2-GiB
+bounds); RSS, root, depth (155) and dead-definition gates pass. The three
+focused corpus programs match in all four hash/MRO cache configurations.
+The original test_hash.rb remains 297 MATCH, 1 RED, 8 BOTH out of 306,
+without any previously passing named case lost against the retained before
+and previous candidate results. The remaining RED is test_replace_memory_leak;
+it was already RED. Full hosted per-file comparison is required before merge.
+
+
+### Review repair: removed native Range entries (2026-11-21)
+
+Native Range and Kernel comparators have entries in the existing
+builtin-alias store. Ruby replacements displace them; deleting a replacement
+does not restore the native entry. Ordinary/refined super follow the actual
+remaining entries while saved native aliases retain containment.
+
+Pinned Mere 01f5ad73/O2 passes all 720 corpus programs in both hash modes
+(510.717 seconds, 1,285,680 KiB under unchanged 900-second/2-GiB limits),
+all nine RSS workloads and root/depth155/dead-definition gates. Corpus741
+matches in four hash/MRO configurations. Original test_range/test_method/
+test_super total 215 cases: 214 MATCH and one existing Method RED, with no
+previously passing named case lost against retained candidate results.
+Full hosted per-file comparison still gates merge. Functions changed by
+the review: run_super_target, range_super_lookup and super_next_refined;
+existing builtin_alias/blt_alias_names initializers retain the native entries.
+
+
+## Native comparator review repairs: final validation
+
+PR #142 retains original native comparator owners through aliases and native
+Method installation. Module and class wrappers invoke saved native entries;
+Kernel#=== rebound as Module#=== retains equality semantics for super.
+Existing initializers record physical native entries without adding top-level
+state. Functions: invoke_val_c0, native_case_entry, native_case_alias_owner,
+run_super_target, set_builtin_alias. Corpus 743 covers the review regressions.
+
+O2: 721/721 corpus programs match in both hash modes, 480.426 seconds and
+1,284,944 KiB under unchanged 900-second/2-GiB bounds. Sixteen focused cache
+comparisons and nine RSS cases pass, as do roots, depth 155 and dead definitions.
+Original Module/Method/Super: 342 MATCH and one existing RED over 343 cases;
+no previously passing case is lost. Parent #141 documentation is integrated.
+The additional already-rebound comparator alias diagnostic remains explicit
+in unittest/module_kernel_comparator_alias_probe.rb and KNOWN_GAPS.md; it
+fails identically on prior main, parent #141 and candidate. The ineffective
+broader alias-copy change was reverted. Hosted checks and per-file comparison
+remain required before merge.
