@@ -522,9 +522,26 @@ runner crosses them.
   after 60,000 named Structs and wants less than twice. Locally the ratio is
   1.25-1.37 on main and on a branch alike; one CI run gave 2.29 for one of
   the two while the other passed in the same file.
+- `assert_no_memory_leak` gives a child 10 s: `-ext-/string/test_nofree.rb`
+  (`test_no_memory_leak`) takes 7.1-7.3 s on this machine, on main's build
+  and on a branch alike, and one CI run of a branch whose runners were
+  crowded took 10.10 s. `ruby/test_object.rb`'s `test_copied_ivar_memory_leak`
+  is the same kind of test, and the same run timed it out.
 - `ruby/test_ractor.rb`'s `test_move_nested_hash_during_gc_with_yjit` runs a
   child with a 10 s bound and takes 9.3-10.1 s on the runners, on main as
   well: one run in a few is a Timeout and the file is one test lower.
+- Two more children with a 10 s bound, both moving between runs of the
+  same tree (main 3eb24fef's run against PR #101's): `ruby/test_class.rb`'s
+  `test_classext_memory_leak` took 8.83 s and then 10.11 s (Timeout), and
+  `ruby/test_weakkeymap.rb`'s `test_clear_bug_20691` 10.09 s and then 9.12 s,
+  the Timeout falling on the other run. ruby 4.0.9 takes 1.48 s and 0.30 s.
+- `test_time.rb` (the library's, not `ruby/test_time.rb`) peaks at 1.74-1.84
+  GB of its 2 GiB on the macOS runners, on main and on a branch alike; once
+  it reached 2,150,352 KB in `test_rfc2822_nonlinear`, right after
+  `test_huge_precision`, and came back MEMORY_LIMIT with all 42 tests RED
+  (PR #102's first run). Locally main and that branch both peak at
+  1,081,6xx KB in five runs each, and the shard's rerun gave 42 / 42.
+  Rerun its shard.
 
 **Jobs that never ran.** A `macos-26` job can wait without a runner and be
 cancelled after 15-30 min (the job has no `runner_name`). A shard that reaches
