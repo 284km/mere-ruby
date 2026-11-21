@@ -660,7 +660,7 @@ other 873, counted so that they add up:
 | files | not measured | why |
 |---|---|---|
 | 781 | `library/` outside the groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before -- and which those are is now MEASURED rather than remembered: every `require` the 118 unrecorded groups make was asked of this interpreter, and the 49 groups whose libraries all loaded were swept |
-| 46 | `optional/capi` | not measured here: the C API (`capi/README.md`) is measured by ruby's own `ext/-test-` and `test/-ext-`, and these specs build their extensions with mkmf, which is not on it yet |
+| 46 | `optional/capi` | measured by `tools/capi_spec_check.py`, not by this sweep: each spec file needs its C extension built for both rubies. Its record is `capi/check/spec_expect.tsv` -- 2,269 of the reference's 2,584 examples pass (2026-11-16) |
 | 32 | `command_line` | the executable's flag handling, which `clitest/` measures directly instead |
 | 13 | `security` | CVE regressions; four of them need rubygems or optparse |
 | 1 | `optional/thread_safety` | one file; it needs the scheduling `core/thread` is still thin on |
