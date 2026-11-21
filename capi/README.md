@@ -140,11 +140,43 @@ clang -bundle -undefined dynamic_lookup -fPIC -I capi/include x.c -o x.bundle   
 clang -shared -fPIC -I capi/include x.c -o x.so                                 # Linux
 ```
 
-`tools/capi_ext_build.py --ruby-source <tree> --output <dir>` does this for
-every directory of ruby's `ext/-test-`, reading each `extconf.rb` for the
-feature name and the sources. It does not run it (mkmf is the next step);
-the header, type and struct member probes an extconf.rb writes out are asked
-of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
+or, as a gem does it, with ruby's own mkmf:
+
+```
+mere-ruby extconf.rb && make && make install
+```
+
+`require "mkmf"` is ruby's `mkmf.rb`, unchanged. What it reads is RbConfig,
+and an interpreter that finds `capi/include/ruby.h` beside its executable
+says its build there: `rubyhdrdir` (that directory) and `rubyarchhdrdir`
+(`capi/arch/<arch>`, where tools/build.sh puts this machine's
+`ruby/config.h`, as ruby's layout has it),
+`topdir` and `bindir` (the executable's), `ruby_install_name` (its name --
+mkmf writes it into the Makefile as `$(RUBY)`, and RubyGems starts
+`extconf.rb` with it), `CC` = clang and the flags above as `CCDLFLAGS`,
+`LDSHARED` and `DLDFLAGS`, no libruby (`LIBRUBYARG` is empty: an extension
+finds the API in the executable), and the POSIX tools a Makefile calls. The
+values are how `tools/build.sh` builds the interpreter and how the two
+commands above build an extension; nothing is copied from a CRuby
+installation. A build without the C API has none of these keys.
+
+`have_func("rb_ary_new")` -- mkmf links a test PROGRAM that names the
+function -- is answered by an import library, `capi/lib/libmere-ruby-api`,
+which tools/build.sh writes after the link
+(`capi/tools/import_library.py`): one empty symbol for each function and
+variable of the C API the executable exports. RbConfig names it as
+`LIBRUBYARG`, which mkmf puts on the link line of its test programs only.
+The functions of `capi/unsupported.c` are left out of it, so for them the
+answer is "no" and an extension takes its other path. `ENABLE_SHARED` is
+not said (see the comment where the keys are, in m_driver.mere). The installation directories (`prefix`, `libdir`,
+`sitearchdir`) are still the stand-ins they were: `make install` is given
+its directory, as RubyGems gives it.
+
+`tools/capi_ext_build.py --ruby-source <tree> --output <dir>` builds every
+directory of ruby's `ext/-test-` without running its `extconf.rb` (those are
+written for ruby's own build tree: they reach into its internal headers).
+The header, type and struct member probes an extconf.rb writes out are
+asked of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
 
 ## What is missing
 
@@ -152,14 +184,15 @@ of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
   library using them loads: each raises NotImplementedError, naming itself,
   when called. Its header comment says why each group is not there (CRuby's
   internal bignum routines by name, TracePoint and the debug inspector from
-  C, profile frames, postponed jobs, memory views, the Random interface,
-  encoding converters).
+  C, profile frames, postponed jobs, the Random interface, encoding
+  converters).
 - A function that is declared in the headers and neither written nor in the
   ledger is an undefined symbol: `require` of a library that uses one raises
   LoadError with the loader's message, which names it. Of the roughly 1,300
   functions the headers declare, about 800 are written; the larger groups
-  not yet written are Onigmo's own API, `rb_io_*` on `rb_io_t`, the fiber
-  scheduler hooks, `rb_econv_*`, `rb_reg_*` and Ractor.
+  not yet written are Onigmo's own API, most of `rb_io_*` (the struct
+  behind `RFILE` is there, filled from the IO; its buffers are not), the
+  fiber scheduler hooks, `rb_econv_*`, `rb_reg_*` and Ractor.
 - Internals a test may read and this has no equivalent of: a String's
   embedded / shared state and capacity classes, coderange caching, a Hash's
   `st_table` (`rb_hash_tbl`), a Rational that is not in lowest terms.
@@ -176,6 +209,29 @@ of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
   contracts that depend on each must fail.
 - The unit test run builds all of `ext/-test-` and runs `test/-ext-` against
   it, file by file, like every other directory of ruby's tests.
+- `tools/capi_mkmf_check.py` (CI, macOS and Linux): an extension whose
+  `extconf.rb` asks the compiler about headers, functions, a macro, a size
+  and a library, and ruby's `ext/-test-/float` by its own `extconf.rb`, are
+  built with `extconf.rb`, `make`, `make install` on both rubies; the built
+  libraries say what mkmf answered, and the contracts in
+  `capi/check/mkmf.rb` print the same on both sides. A source that does not
+  compile must fail at `make` on both, and mere-ruby given the libraries the
+  reference's mkmf built must fail.
+- `tools/capi_gem_check.py` (CI, macOS and Linux): fast_blank, redcarpet,
+  msgpack, racc, bcrypt, nio4r and nokogiri (from source, on the system's
+  libxml2), at
+  fixed versions, are installed by each ruby with RubyGems' `gem install`
+  from the same .gem files, and `capi/check/gems.rb` uses them on both
+  sides and must print the same. mere-ruby pointed at the gems the
+  reference built must fail.
+- `tools/capi_spec_check.py` (CI, macOS): ruby/spec's `optional/capi` -- a
+  spec file and a C extension for each part of the C API, 46 files -- with
+  each extension built for both rubies. The count of passing examples per
+  file is recorded in `capi/check/spec_expect.tsv`: the reference's must be
+  the recorded one, mere-ruby's must not be lower. 2,269 of 2,584 pass.
+- `test/mkmf` runs in a build tree staged for mere-ruby
+  (`unittest/mkmf_context.sh`: links to `capi/include` in the places mkmf's
+  build-tree mode looks, and a Makefile mere-ruby's own mkmf wrote).
 
 ## The files
 
@@ -191,7 +247,8 @@ of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
 | `array.c` | Array, Hash, Range, Struct, Enumerator |
 | `proc.c` | blocks, Procs, `rb_block_call`, `rb_funcall_with_block` |
 | `system.c` | threads, time, IO, utilities |
-| `st.c`, `vendor/` | CRuby's `st.c`, compiled unchanged |
+| `needed.c` | what real gems asked for and nothing else had: conversions by method name, `rb_memhash`, `rb_ivar_foreach`, the calling frame's last match |
+| `st.c`, `memory_view.c`, `vendor/`, `standin/` | CRuby's `st.c` and `memory_view.c`, compiled unchanged |
 | `unsupported.c` | the ledger |
 | `mr_capi.h` | what the files above share; not for extensions |
 | `../m_capi.mere`, `../m_capi_api.mere` | the interpreter's side: the table, and what crosses |
