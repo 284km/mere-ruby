@@ -4489,9 +4489,22 @@ CRuby extension ABI or compiler/linker flags.
 **What fixing the remaining build integration takes.** An installation
 layout and build metadata of mere-ruby's own.
 
-**What the native stage needs from it (inventory, 2026-11-13).** Facts for
-whoever takes extensions on (stage 7′ / 8); nothing here is answered yet,
-and which of them mere-ruby can answer truthfully is that stage's call.
+**The build is answered where there is one (2026-11-16, stage 7′ / 8).** An
+interpreter that finds `capi/include/ruby.h` beside its executable says its
+own build in RbConfig -- the header directory, the executable's directory
+and name, clang and the flags an extension for it is built with -- and
+ruby's `mkmf.rb` works from that (capi/README.md, "Building an extension").
+These are mere-ruby's facts, not a reference installation's table: 97
+keys in all, where CRuby has 254, so rbconfig_spec's count is still not met, and a
+build without the C API still has only the facts above. What is left a
+stand-in is the installation layout (`prefix`, `libdir`, the site
+directories), and `ENABLE_SHARED` and a libruby name are deliberately not
+said.
+
+**What the native stage needed from it (inventory, 2026-11-13; kept as the
+record of where it started).** Facts for whoever takes extensions on (stage
+7′ / 8); which of them mere-ruby can answer truthfully was that stage's
+call, and the paragraph above is the answer.
 
 - `require "mkmf"` and `create_makefile` read **5 `RbConfig::CONFIG` keys**
   mere-ruby does not have -- rubyhdrdir rubyarchhdrdir CC_WRAPPER topdir
@@ -4594,3 +4607,57 @@ request limit. Actual 64-MiB-plus binary inputs match the reference for
 SHA256/384/512 through direct, buffered incremental and file entry points.
 The 64-MiB provider wire bound itself remains unchanged. This does not
 remove the existing buffered Digest implementation's memory cost.
+
+## Rails loading: remaining evaluator boundaries (2026-11-20)
+
+Rooted extend/include factory expressions, real class/module singleton
+extend overrides, autoloaded scoped class namespaces and autoload's main
+require receiver have small matching witnesses in corpus 729-732. The
+original Module/Syntax/Parse/Forwardable/Method/Super/Autoload/Require files
+retain main's per-file MATCH counts (722 cases, 717 MATCH / 1 RED / 4 BOTH).
+
+A validation-only composition still stops migration at a Module subclass's
+block-bearing define_method. Boot, the application's tests and HTTP are
+not reached. The selected original ActiveSupport OrderedOptions, Concern
+and Inflector files discover all 521 cases: 513 MATCH / 8 RED. Remaining
+failures include Hash subclass default reads and Enumerable iteration,
+String-subclass gsub! super, and Unicode lookbehind. This is not the whole
+Rails test suite. No original test or exclusion was changed to obtain it.
+
+Scoped class namespace identity does not repair the existing module_eval
+lexical-nesting bug: unittest/scoped_class_lexical_probe.rb returns :missing
+on reference Ruby and :found on both preceding main and this candidate.
+It is an explicit failing diagnostic, not a passing corpus case.
+
+
+## Module subclass factories and native mixin super (2026-11-20)
+
+Corpus 733/734 now matches real Module-subclass define_method closures,
+named visibility, frozen receivers, Ruby overrides, native mixin super
+returns and singleton missing hooks with blocks. The actual ActiveModel
+factory and Concern boundaries advance in an own Rails composition.
+The next unchanged migration failure is credentials-path construction in
+Pathname#initialize. Boot, application tests and HTTP remain NOT_RUN;
+selected ActiveSupport Hash/default/Enumerable, String gsub! super and
+Unicode-lookbehind failures remain unclaimed. No runtime or test resource
+bound, original test, or exclusion changes were made for these fixes.
+The rooted-loading review also fixes the shadowed three-segment namespace
+regression: corpus738 verifies the lexical first constant, remaining namespace
+walk, explicit root and autoload on both definition paths. The separate
+module_eval lexical-nesting diagnostic above remains a known failure.
+
+Module review corrections retain original missing dispatch for non-native
+Regexp/notification names and send method_added to the actual Module-subclass
+receiver, including native tracing and undef. Corpus739/740 covers these
+boundaries; no original test was excluded for them. The separate native
+alias predicate diagnostic in unittest/native_alias_method_predicate_probe.rb
+prints true on Ruby and false on both main and this candidate; it remains
+unresolved and is not a passing corpus case.
+
+
+The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
+namespace constants and intermediate const_missing results as real scope
+lookups (corpus742). Both definition paths retain the lexical first constant,
+privacy and autoload behavior. The712-file corpus and original nine-file784-case
+comparison pass without losing a main PASS. The separate module_eval lexical
+negative remains an explicit failing diagnostic; this change does not claim it.
