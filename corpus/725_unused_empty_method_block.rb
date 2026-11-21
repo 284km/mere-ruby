@@ -77,3 +77,14 @@ end
 empty_destructure(DestructureBlockObserver.new) {}
 $conversion_trace.disable
 p [:conversion_observer, $observed_conversion_block]
+
+# Exercise the allocation diagnostic in fresh evaluator and compiled
+# processes even when the ordinary corpus runner uses the evaluator.
+require "rbconfig"
+probe = File.expand_path("../unittest/block_parameter_probe.rb", __dir__)
+["", "1", "strict"].each do |vm|
+  counts = %w[none unused used].map do |mode|
+    IO.popen({"MERE_RUBY_VM" => vm}, [RbConfig.ruby, probe, mode], &:read).strip
+  end
+  p [:empty_block_modes, vm.empty? ? "eval" : vm, counts]
+end
