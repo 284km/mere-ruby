@@ -4688,3 +4688,13 @@ app diagnostic; three original app errors remain (retry and unknown <=>), and
 the original direct-start Bundler selection, cold installation, HTTP and the
 whole Rails suite remain unverified. Existing native Method owner/undef probes
 above are separate gaps and are not claimed by this dispatch repair.
+
+
+Native comparator alias metadata: after rebinding Kernel#=== as Module's
+entry, saving that rebound entry under another name still reaches an
+unsupported primitive comparator. The previous main and the #141 parent
+already fail this way; the class-case review fix does not claim it solved.
+`unittest/module_kernel_comparator_alias_probe.rb` preserves the original
+comparison against Ruby 4.0.9. It is tracked with the independent native
+Method metadata work in [#133](https://github.com/284km/mere-ruby/issues/133).
+No upstream assertion or existing corpus program is skipped or excluded.

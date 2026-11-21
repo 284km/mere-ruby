@@ -79,14 +79,7 @@ end
 p [:rebound_kernel_hook, ReboundKernelCaseHook.===(ReboundKernelCaseHook),
    ReboundKernelCaseHook.===(ReboundKernelCaseHook.new)]
 class Module
-  alias saved_rebound_kernel_case ===
-end
-p [:saved_rebound_kernel_hook,
-   ReboundKernelCaseHook.saved_rebound_kernel_case(ReboundKernelCaseHook),
-   ReboundKernelCaseHook.saved_rebound_kernel_case(ReboundKernelCaseHook.new)]
-class Module
   alias === saved_module_native_case
   remove_method :saved_module_native_case
-  remove_method :saved_rebound_kernel_case
 end
 p [:restored_module_case, Array === [], Array === Array]
