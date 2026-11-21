@@ -36,3 +36,18 @@ p [:unbound, unbound_wrapper.owner, unbound_native.owner,
 saved = native
 target.singleton_class.send(:undef_method, :included)
 p [:saved_native, saved.call(Object), unbound_native.bind(target).call(Object)]
+
+# A native Module entry can itself have a real Object super method. Its
+# private visibility marker does not forward the native body to Object.
+%i[included extended prepended const_added method_added method_removed method_undefined].each do |name|
+  Object.send(:define_method, name) { |value| [:object_hook, name, value == Object] }
+  receiver = Module.new
+  bound = receiver.method(name)
+  unbound = Module.instance_method(name)
+  bound = bound.super_method until bound.owner == Module
+  unbound = unbound.super_method until unbound.owner == Module
+  p [:native_owner_with_super, name, bound.owner, bound.super_method.owner,
+     bound.super_method.call(Object), unbound.super_method.owner,
+     unbound.super_method.bind(receiver).call(Object)]
+  Object.send(:remove_method, name)
+end
