@@ -92,3 +92,27 @@ class Range
   alias_method :===, :saved_case_equal
 end
 p [:restored_native_alias, r === 2, r === r]
+
+# Removing a replacement leaves Range's native entry displaced; it does
+# not recreate that entry. A saved native alias remains a separate entry.
+class Range
+  alias saved_before_replacement ===
+  def ===(other); :replacement; end
+  remove_method :===
+end
+module RemovedNativeRangeWrapper
+  def ===(other); super; end
+end
+Range.prepend(RemovedNativeRangeWrapper)
+removed_native_range = (1..3)
+p [:removed_native_range, removed_native_range === 2,
+   removed_native_range === removed_native_range, removed_native_range === (1..3),
+   removed_native_range.saved_before_replacement(2)]
+module RemovedNativeRangeRefinement
+  refine Range do
+    def ===(other); super; end
+  end
+end
+using RemovedNativeRangeRefinement
+p [:removed_native_range_refinement, removed_native_range === 2,
+   removed_native_range === removed_native_range, removed_native_range === (1..3)]

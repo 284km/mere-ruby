@@ -54,3 +54,39 @@ class Module
   alias_method :===, :saved_native_module_case
 end
 p [:module_restored, case CaseSuper.new; when CaseSuper; true; else; false; end]
+
+# Saved native Module comparators call their original body, including
+# when the wrapper is defined on the individual class's singleton class.
+class SavedCaseHook
+  class << self
+    alias saved_native_case ===
+    def ===(value); saved_native_case(value); end
+  end
+end
+p [:saved_class_hook, case SavedCaseHook.new; when SavedCaseHook; true; else; false; end]
+class Module
+  alias saved_module_native_case ===
+  def ===(value); saved_module_native_case(value); end
+end
+p [:saved_module_hook, case SavedCaseHook.new; when SavedCaseHook; true; else; false; end]
+class Module
+  alias === saved_module_native_case
+  define_method(:===, Kernel.instance_method(:===))
+end
+class ReboundKernelCaseHook
+  def self.===(value); super; end
+end
+p [:rebound_kernel_hook, ReboundKernelCaseHook.===(ReboundKernelCaseHook),
+   ReboundKernelCaseHook.===(ReboundKernelCaseHook.new)]
+class Module
+  alias saved_rebound_kernel_case ===
+end
+p [:saved_rebound_kernel_hook,
+   ReboundKernelCaseHook.saved_rebound_kernel_case(ReboundKernelCaseHook),
+   ReboundKernelCaseHook.saved_rebound_kernel_case(ReboundKernelCaseHook.new)]
+class Module
+  alias === saved_module_native_case
+  remove_method :saved_module_native_case
+  remove_method :saved_rebound_kernel_case
+end
+p [:restored_module_case, Array === [], Array === Array]
