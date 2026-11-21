@@ -6342,6 +6342,144 @@ function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
 
 
+### Rails command registration honors Ruby subclasses definitions (2026-11-19)
+
+Rails::Command defines subclasses as a Ruby registry on its module. The
+native Class#subclasses arm answered first, returning a fresh native array
+instead of that registry. Ordinary module/class singleton definitions now
+run with their real visibility and argument protocol. A module without a
+Ruby definition no longer claims Class's native-only entry.
+
+Saved native aliases, Methods/UnboundMethods and native super use the same
+real direct-superclass relation with a zero-argument check. Ruby lookup and
+Method#owner stop at Class's actual native entry before later definitions;
+replacing Class#subclasses itself does not resurrect a hidden native super.
+The fallback checks the actual current Ruby frame's remaining ancestor
+chain and introduces no new global Mere values or Ruby API/inventory rows.
+No collector, VM/ISeq, AST or C API implementation is changed. Shared
+functions are listed in the PR; their other sessions' regions are retained.
+
+On main 3b05689f with its pinned Mere 01f5ad73, normal O2: original Class
+62 MATCH, Module 195, Method 97, Super 50 and Refinement 121 (527 cases:
+525 MATCH / 1 RED / 1 BOTH). No focused file is below successful main
+12ca1df2; Module's additional observation is not attributed to this patch.
+Reference and mere-ruby each build their own unchanged -test-/class source.
+The existing Method compaction skip remains visible. Corpus 706/706 matches
+with indexing ON/OFF, including 717/718/720's native/override/alias/visibility/
+super/owner-boundary controls. All nine RSS controls pass. Actual generated
+C bracket depth is 155/1024 with main's newer compiler; that depth change
+from older measurements is not a result of this dispatch correction.
+
+A separate saved-gem diagnostic registers and finds the actual unchanged
+Rails RakeCommand identically on both runtimes: reference 0.661 s / 26,736
+KiB, candidate 1.575 s / 177,776 KiB, both exit 0 without a resource event.
+It does not repeat dependency installation or establish a Rails app pass.
+A fresh original-CLI paired run on validation-only source 5d1a0c95 with
+unmerged #95 and bounded SHA-2 #120 installs all 68 gems (231.607 s /
+946,832 KiB), then migration fails at the real ActiveSupport OrderedOptions
+setter (3.238 s / 305,664 KiB). Reference passes all six stages. The three
+following candidate stages remain NOT_RUN; no resource limit event occurs.
+Hash subclass missing hooks (#123) remain a separate coordination item.
+Generic stale alias origins after redefinition (#124) also reproduce on
+unchanged main; no generic alias metadata repair is claimed here.
+
+Review follow-up: share the remaining native-boundary query between actual
+super, defined?(super), Method#super_method and UnboundMethod#super_method.
+The zero-argument native Method also survives a later undef of its source.
+Corpus 720 covers guarded super, native owner/binding, a preceding undef
+and a Ruby replacement of Class itself. The same five original files retain
+525 MATCH / 1 RED / 1 BOTH after this correction. No test is removed.
+
+Hosted Linux run 44474019351 fails TestModule#test_module_clone_memory_leak
+at RSS ratio 2.181378x (71,835,648 to 156,700,672 bytes). This is not an
+established known-noise result; keep the failure, the 2x gate and the full
+series. A single-job rerun request was rejected by GitHub (cannot be rerun).
+The next source head must pass the unchanged gate before merge.
+
+
+### Rails notification delegation: real private Module entries (issue #129)
+
+ActiveModel extends its module with an `included` override that calls `super`.
+The missing native ancestor entry previously sent that call to the module's
+unrelated instance `method_missing`, failing on `respond_to_without_attributes?`.
+Resolve the seven Module notification methods at their actual Module boundary.
+Their native body accepts one argument, ignores the block and returns nil,
+matching `rb_obj_dummy1` in Ruby's object.c. Ruby replacements and intervening
+undef entries keep precedence; a native entry does not reappear below its owner.
+
+The same remaining-chain query now serves dispatch, `defined?(super)` and
+bound/unbound `super_method`. Native aliases and saved Method objects retain
+their entry. The prelude marks these existing methods private; arity, parameters
+and `respond_to?` reflect the actual native definition and Ruby visibility.
+No API inventory, VM, collector, C API or resource limit changes are required.
+
+Corpus 723 covers the ActiveModel-shaped failure, all seven entries, private
+calls, arity, bound/unbound super, saved methods, alias/undef and owner replacement.
+The original Class/Method/Module/Refinement/Super files retain 525 MATCH, 1 RED
+and 1 BOTH across 527 cases, including 195/195 Module matches. Nine RSS checks
+pass and generated C needs 155/1024 bracket levels. The complete corpus now matches
+Ruby for 707/707 programs with the hash index ON and OFF. The separate fresh-home Rails
+composition passes this boundary and reaches the next syntax blocker; it does
+not establish that Rails boots or its application tests pass.
+
+
+Saved native dispatch is covered by corpus 723. A separate pre-existing generic
+limitation remains: after replacing an owner's entry with Ruby code, a saved
+native Method/UnboundMethod can report the new definition's arity/parameters.
+This also reproduces with Array#length on the parent and is distinct from the
+stale alias-origin reproduction in issue #124. It is recorded separately and
+does not establish another Rails boot blocker.
+
+
+The fresh-home Rails replay with the independent runtime candidates now passes
+this notification failure. Validation-only source b9056808 installs all 68
+locked dependency gems in 210.753 seconds / 862,800 KiB. Migration proceeds
+to unchanged ActionController source and exits 1 on an absolute-root dotted
+extend argument (issue #134; 3.999 seconds / 318,752 KiB, no resource event).
+Reference passes all six stages; mere boot/tests/HTTP remain NOT_RUN. The
+record is retained separately in intake #117 as module_candidate.json, with
+the same locks and 600-second / 2-GiB bounds. This is not an application pass.
+The independent saved-native metadata limitation is issue #133, distinct
+from issue #124's alias-origin reproduction.
+
+
+### Notification Method review corrections
+
+The two review reproductions exposed native-entry provenance and
+visibility-only super boundaries. A native Method selected below a Module
+prepend now records the proven native entry directly instead of asking
+has_meth on its owner again; bound/unbound super methods and bindings retain
+that entry and UnboundMethod records its selected owner explicitly. The
+Method-specific query resumes above the actual body represented by a
+visibility-only entry, while retaining an intervening visibility entry as
+an observable Method owner. Native dispatch/defined-super traversal keeps
+its existing semantics.
+
+Corpus 724 covers published native methods, a wrapper before the visibility
+owner, bound/unbound super below a Module prepend, and retained native calls
+after undef. The reference outputs match with normal caches, hash indexing
+disabled and MRO caching disabled. The five original core files again retain
+525 MATCH, 1 RED and 1 BOTH across 527 cases, per-file unchanged.
+
+The separate generic metadata gap #133 also reproduces when capturing a
+native Method before prepending a wrapper: parameters and source_location
+can follow that wrapper. This occurs on unchanged main as well. Native
+invocation and selected owner are fixed here; captured-method metadata after
+lookup mutations is not claimed fixed. The recorded b9056808 Rails replay
+uses the preceding notification implementation c4477641 and remains tied to
+that exact source; it is not relabeled as this reviewed implementation.
+
+
+Final review candidate validation: all **708/708 corpus programs** match Ruby
+with the hash index ON/OFF, including both notification witnesses. The five
+original core files again retain 525 MATCH / 527 cases with no per-file drop;
+all nine RSS checks pass and generated C needs 155/1024 bracket levels. Both
+review reproductions also match with MRO caching disabled, including when
+both the hash index and MRO cache are disabled together. The review correction
+changes only the Method/UnboundMethod super arms of invoke_val_c0 and the two
+new and-helpers module_notification_method_after/module_notification_method_mark.
+Full hosted CI and its per-file comparison remain required before merge.
+
 ## 2026-11-19: SHA-2 checksums in real gem installation
 
 The locked Rails intake (#117) gets beyond mkmf on the unmerged C API
@@ -6793,6 +6931,22 @@ fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
 
 
+### Review repair: native notification super owners (2026-11-21)
+
+Module's own private notification visibility marks describe real native
+bodies, rather than visibility-only forwarding entries. The corrected
+`module_notification_method_after` keeps that body before looking for its
+super in Object. Corpus 724 now covers bound and unbound Methods for all
+seven notifications, including an earlier prepended wrapper.
+
+Before importing the newly merged C API, all 708 corpus programs matched
+with the hash index on and off (594.362 seconds, 1,048,560 KiB, unchanged
+900-second / 2-GiB bounds). The nine RSS workloads, root, depth (155) and
+dead-definition gates passed. After integrating main `e540007c`, the O2
+build and all 12 focused comparisons (corpus 720/723/724 in four cache
+configurations) passed again. The complete hosted reports and per-file
+comparison are still required for this integrated source before merge.
+
 ## 2026-11-20: rooted mixin arguments, scoped namespace autoload and the autoload loader
 
 Unchanged Rails loading reached three independent evaluator boundaries:
@@ -6981,3 +7135,81 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+### Class-subclasses integration with current main
+
+Integrate main a206da11 into PR #125, preserving both subclasses and extend
+branches of defined_super_str. Documentation retains both independent
+appendices; no other runtime conflict requires manual resolution. The O2
+runtime matches corpus717/718/720/729/730 in all four hash/MRO modes (20
+comparisons), and roots/depth155 pass. Current hosted full checks remain
+required. The prior Linux clone RSS failure remains recorded; this merge
+and the focused comparisons do not establish its repair or waive its gate.
+
+### Native notification repair after the updated class-dispatch parent
+
+Integrate the repaired #125 parent without manually changing a runtime
+function. The normal O2 runtime matches all 721 corpus programs in both hash
+modes; all 28 focused comparisons include the new Module-subclass notification
+and native-super cases. The original Module/Method/Super files retain
+342 MATCH and one existing RED across 343 cases (Module 195/195). Nine RSS
+workloads, roots, depth 155 and dead definitions pass. The earlier 708-program
+result remains tied to its preceding integration; current hosted checks and
+every-file comparison still gate this head.
+
+
+## Deliver Class registry and Module notification repairs directly to main
+
+PR #132 previously targeted the closed, unmerged Class branch. Deliver both
+reviewed repairs together against main, preserving the Ruby subclasses registry
+and real Class native entry alongside the Module notification owner protocol.
+Integrate main 2e2ab568 without manually resolving any runtime conflict; both
+independent documentation records are retained. The generic alias-origin and
+saved native metadata issues #124/#133 remain outside this repair.
+
+Normal O2 runtime 732c99ab, compiler 01f5ad73: all 723 corpus programs match with
+hash indexing ON/OFF (538.321 seconds / 1,113,104 KiB under unchanged 900-second /
+2-GiB bounds). All 36 focused hash/MRO comparisons, nine RSS cases, roots,
+depth 155 and dead definitions pass. Original Class/Module/Method/Super/Refinement
+cover 527 cases / 525 MATCH / 1 existing RED / 1 BOTH, with no file below completed
+main d9826ac9. Class uses its unchanged native fixture built separately against
+each runtime's own headers and passes all 62 cases. The earlier missing-fixture
+context remains diagnostic; the final Class comparison has a healthy reference.
+All 49 captured Mere-source/binary hashes stay fixed.
+
+The actual unchanged Rails RakeCommand registers and is found on both runtimes
+in a separate saved-own-gems diagnostic (reference 0.692 seconds, candidate 1.490).
+The original migration CLI on a fresh unchanged app then reaches the next Hash
+configuration setter issue #123, exit 1 in 2.538 seconds / 306,800 KiB; reference
+migration passes. This diagnostic reuses each runtime's independently built
+gems and is not a cold installation or an accepted six-stage application pass.
+The previous main Rails measurement and all NOT_RUN states remain unchanged.
+No source lock, original test, exclusion, API inventory or bound changes.
+Current-head hosted CI, full file comparisons and review still gate merge.
+
+
+### PR review: retain selected native Class methods behind prepends
+
+Once the remaining-chain query selects Class's native subclasses entry,
+mark that exact owner directly instead of searching Class's prepends again.
+The new native_owner_method_mark helper is shared with Module's existing
+marker. Both bound and unbound super_method preserve the selected Class
+owner; method_unbind_fields carries an already-proven native owner into the
+UnboundMethod. Changed functions: invoke_val_c0, method_unbind_fields,
+module_notification_method_mark and new native_owner_method_mark.
+Corpus724 adds Class.prepend with bound/unbound super_method, dup, clone,
+unbind, bind and bind_call, including the native terminal super_method.
+The original review reproduction and extra unbind comparison failed before
+these repairs and now match Ruby4.0.9.
+
+Normal O2 compiler01f5ad73 validation: **723/723 corpus**, hash index ON/OFF,
+**488.378s / 1,070,864KiB** peak family RSS. All44 focused default/evaluator/
+strict-VM and hash/MRO comparisons, all nine RSS gates, roots, dead definitions
+and C depth155/1024 pass. Complete original Class/Module/Method/Super/
+Refinement discover527 cases: **525 MATCH / 1 existing RED / 1 BOTH**, with
+Class62, Module195, Method97, Super50 and Refinement121 MATCH retained.
+Class's unchanged fixture uses each interpreter's own headers. The existing
+Method compaction failure, Refinement skip and separate captured-native
+metadata issue133 remain explicit. No original tests, exclusions, limits,
+collector/state, VM/ISeq, AST/Prism, C API or gemtest code changed. Updated-head
+hosted checks and the latest-main per-file gate remain required before merge.

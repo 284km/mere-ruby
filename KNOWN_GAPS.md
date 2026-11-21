@@ -4584,6 +4584,98 @@ there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
 
 
+## Rails command registration and Ruby subclasses definitions
+
+Ordinary Ruby subclasses definitions on modules/classes now take precedence
+over native Class enumeration. Native aliases/retained Methods and super
+retain their actual entry; Ruby lookup and reported ownership stop at the
+native Class boundary. The actual unchanged Rails RakeCommand registers
+and is found in an independent saved-gem diagnostic. This does not establish
+successful migration, full boot, app tests or HTTP. A fresh locked cold
+replay on a validation-only composition installs all 68 dependencies and
+passes command registration, then fails migration on the actual
+ActiveSupport OrderedOptions setter (#123). Boot/tests/HTTP remain NOT_RUN.
+Hash missing hooks remain outside this Class-only correction.
+
+Redefining a generic Ruby method after aliasing it away and back can retain
+its old alias source name for super (#124). That smaller non-Class-native
+case already fails on unchanged main and the gem candidate. The separate
+Class replacement witnesses isolate mutations in fresh processes; no
+existing test is omitted and no generic metadata repair is claimed here.
+
+The subclasses native boundary is also used by defined?(super) and bound/
+unbound Method#super_method. Saved native Methods remain callable after
+the receiver undefines the source name. The focused original files retain
+525 MATCH / 1 RED / 1 BOTH. Hosted Linux has a separate unresolved
+TestModule#test_module_clone_memory_leak RSS failure (2.181378x); its
+2x limit remains unchanged and it is not classified as known noise.
+
+
+The Rails issue #129 candidate restores Module's real private notification
+entries when Ruby overrides delegate with super. All seven hooks, their method
+metadata and native-owner/undef boundaries have focused reference comparisons;
+the existing five core test files retain 525/527 MATCH without a per-file drop.
+This branch is based on the Class dispatch candidate and does not include the
+C API, SHA-2, Hash or native-require candidates needed for the separate Rails
+integration replay. Rails application success remains unconfirmed here.
+
+The notification candidate completes 707/707 corpus programs in both hash-index
+modes. Saved native invocation remains distinct from a generic metadata gap:
+a saved Method/UnboundMethod may report a later Ruby replacement's arity and
+parameters. The Array#length control already fails on the parent; the analogous
+Module hook control also fails on unchanged main. This separate snapshot gap
+is not claimed fixed by the notification correction.
+
+
+The fresh-home Rails replay with the independent runtime candidates now passes
+this notification failure. Validation-only source b9056808 installs all 68
+locked dependency gems in 210.753 seconds / 862,800 KiB. Migration proceeds
+to unchanged ActionController source and exits 1 on an absolute-root dotted
+extend argument (issue #134; 3.999 seconds / 318,752 KiB, no resource event).
+Reference passes all six stages; mere boot/tests/HTTP remain NOT_RUN. The
+record is retained separately in intake #117 as module_candidate.json, with
+the same locks and 600-second / 2-GiB bounds. This is not an application pass.
+The independent saved-native metadata limitation is issue #133, distinct
+from issue #124's alias-origin reproduction.
+
+
+### Notification Method review corrections
+
+The two review reproductions exposed native-entry provenance and
+visibility-only super boundaries. A native Method selected below a Module
+prepend now records the proven native entry directly instead of asking
+has_meth on its owner again; bound/unbound super methods and bindings retain
+that entry and UnboundMethod records its selected owner explicitly. The
+Method-specific query resumes above the actual body represented by a
+visibility-only entry, while retaining an intervening visibility entry as
+an observable Method owner. Native dispatch/defined-super traversal keeps
+its existing semantics.
+
+Corpus 724 covers published native methods, a wrapper before the visibility
+owner, bound/unbound super below a Module prepend, and retained native calls
+after undef. The reference outputs match with normal caches, hash indexing
+disabled and MRO caching disabled. The five original core files again retain
+525 MATCH, 1 RED and 1 BOTH across 527 cases, per-file unchanged.
+
+The separate generic metadata gap #133 also reproduces when capturing a
+native Method before prepending a wrapper: parameters and source_location
+can follow that wrapper. This occurs on unchanged main as well. Native
+invocation and selected owner are fixed here; captured-method metadata after
+lookup mutations is not claimed fixed. The recorded b9056808 Rails replay
+uses the preceding notification implementation c4477641 and remains tied to
+that exact source; it is not relabeled as this reviewed implementation.
+
+
+Final review candidate validation: all **708/708 corpus programs** match Ruby
+with the hash index ON/OFF, including both notification witnesses. The five
+original core files again retain 525 MATCH / 527 cases with no per-file drop;
+all nine RSS checks pass and generated C needs 155/1024 bracket levels. Both
+review reproductions also match with MRO caching disabled, including when
+both the hash index and MRO cache are disabled together. The review correction
+changes only the Method/UnboundMethod super arms of invoke_val_c0 and the two
+new and-helpers module_notification_method_after/module_notification_method_mark.
+Full hosted CI and its per-file comparison remain required before merge.
+
 ## Rails dependency checksums and the next command boundary (2026-11-19)
 
 SHA-2 can use the real internal OpenSSL provider when already loaded, as
@@ -4808,3 +4900,26 @@ lookups (corpus742). Both definition paths retain the lexical first constant,
 privacy and autoload behavior. The712-file corpus and original nine-file784-case
 comparison pass without losing a main PASS. The separate module_eval lexical
 negative remains an explicit failing diagnostic; this change does not claim it.
+
+
+PR #132 now targets main and includes the unmerged Class registry correction,
+so its integration no longer depends on merging into a closed parent branch.
+The actual RakeCommand registry matches Ruby in a saved-own-gems diagnostic;
+the fresh app's unchanged migration CLI advances to the separate Hash setter
+issue #123. This is not a new cold-install or Rails application/framework pass.
+The independent alias-origin and saved-native-metadata issues #124/#133 remain.
+Normal O2 validation covers 723 corpus programs in both hash modes and all 527
+original Class/Module/Method/Super/Refinement cases with 525 MATCH / 1 existing
+RED / 1 BOTH, no per-file MATCH loss against completed main d9826ac9. Class's
+native fixture is built separately against each interpreter's real headers.
+No original test, exclusion, resource bound or API inventory changes.
+
+
+## Selected native Class Method behind a prepend
+
+Class.prepend no longer makes a native subclasses super_method call the
+wrapper again. Bound/unbound selection and unbind retain the already-proven
+native owner; corpus724 checks copies and rebinding too. All723 corpus
+programs and original525 MATCH counts are retained at unchanged bounds.
+The separate issue133 about captured native metadata after later lookup
+mutations remains unresolved; this repair claims invocation and owner only.
