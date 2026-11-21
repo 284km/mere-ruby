@@ -6342,6 +6342,48 @@ function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
 
 
+## 2026-11-18: stage 9, ship checked ID lookup independently
+
+The GC/ObjectSpace stack has an open Enumerable timeout finding. Its checked
+ID lookup can be reviewed independently against main 12ca1df2: this change
+ports ObjectSpace.__id_integer, live __val_of_id/__str_of_id lookup and the
+_id2ref prelude only. A small __id_value arm reads native identity for the
+fallback search, avoiding a dependency on the stack's heap dump metadata.
+Corpora 687/688 are copied unchanged from the reviewed stack, including all
+four conversion review controls. No additional corpus number is consumed.
+
+The base __objects/each_object and count_objects implementations are kept.
+There are no new exclusions, top-level values, collector-body changes or
+independent edits to shared VM/dispatch helpers, m_state, Prism, C API or
+gemtest. The full 157-test intake remains 12 honest implementation matches,
+57 reasoned exclusions and 88 named handoffs in the parent inventory. This
+port does not count the same fixes a second time.
+
+O2 verification of the independent port retains core ObjectSpace 37 MATCH,
+Enumerable 89 MATCH and Object 65 MATCH under the unchanged CI supervisor.
+The 10-second Enumerable subprocess remains enabled. All nine RSS cases pass;
+actual bracket depth is 933/1024, so the stale 923 search seed is corrected
+to that measured value. No top-level definition is added.
+
+
+The second independent round ports ObjectSpace.__store_counts and the
+count_objects prelude from #94. Actual String survivors/new handles and
+Proc/Binding store lengths contribute to T_STRING, T_DATA and TOTAL. Corpus
+674 retains 1,000 ordinary Strings, 1,000 empty Strings and 200 Procs plus
+200 Bindings, checking real count deltas, totals and held identities. The
+base enumeration implementation is unchanged; no exclusion or limit changes.
+
+
+The third independent round addresses the primitive singleton-undef review.
+ObjectSpace.__id_integer now reads a primitive's full hng_store lookup tag
+for availability and native error class names, re-reading after callbacks.
+The shared super_base/dispatch helpers are unchanged. Corpus 687 adds named
+String/Array/Hash subclasses with preexisting singleton undefs and undefs
+created by respond_to? callbacks. All six controls require the reference's
+TypeError and concrete subclass name. The previous build raises NoMethodError
+or accepts conversion instead.
+
+
 ## 2026-11-19: SHA-2 checksums in real gem installation
 
 The locked Rails intake (#117) gets beyond mkmf on the unmerged C API
@@ -6981,3 +7023,57 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+## 2026-11-21: reduce clone cache residency without losing the Method-copy gate
+
+PR #109's Linux job 136752758452 fails the original Module clone leak check:
+71,696,384 to 144,699,392 resident bytes, **2.018224406x**, under compiler
+01f5ad73. The failed test-merge source 1533737c has the same tree as head
+5813b8d6. Both compilers are compared on that exact source, ordinary O2,
+with the original upstream input and ten-second child timeout.
+
+Published compiler 43f2994b clears discarded cached-region pages with Linux
+MADV_DONTNEED rather than writing zeros into every page. Restoring its clear
+helper and call makes the generated C byte-identical to 01f5ad73. Neither
+the native cache's default of 64 regions nor live or pinned storage changes.
+On Linux/aarch64, the predeclared parent/candidate/candidate/parent clone
+order gives **1.818147056 / 1.150605110 / 1.348688635 / 1.671946690x**.
+The old compiler also passes locally; this is evidence of reduced residency,
+not a reproduction of the x86-64 hosted failure on the same runner.
+
+The compiler-only candidate fails the independent Method-copy gate at
+**2.118446692x**, so that change alone is insufficient. Backport the existing
+compact_method_store correction from #114: if native compaction is deferred
+and the arena has not shrunk, preserve the previous measured baseline.
+The thresholds, dirty flag, initial baseline and unmeasurable fallback are
+unchanged. The combined source 6d8d563d passes two Linux clone trials at
+**1.264892127 / 1.301888908x** and two Method-copy trials at
+**1.705846868 / 1.704296585x**. Module **195/1240** and Refinement
+**122/370** match every reference case. macOS Method-copy is **1.385781495x**
+and Refinement **122/367, one reference-matching skip** is unchanged.
+
+Keep the failures: the compiler-only macOS Module runs fail complemented-entry
+at **2.051378446x** and **2.037586135x**. The first combined macOS Module run
+also fails that case at **2.018579686x** and times out in the original iclass
+child. The retained serialized comparison follows the corpus runs; no
+assertion, test or timeout is removed. In that comparison, the compiler-only
+baseline still fails complemented-entry at **2.030891254x**; the combined
+candidate passes **195/1240**, loses no passing cases, and the iclass timeout
+does not recur in either run. Both sources also pass **721/721 corpus** in
+both hash-index modes: 529.512 seconds / 1,104,752 KiB for compiler-only,
+524.786 seconds / 1,187,728 KiB for the combined candidate.
+The separate instrumented Linux clone
+observes deferred compaction with zero increases to an established baseline
+without movement.
+Its success is diagnostic evidence and cannot replace an ordinary gate.
+
+[The measurement receipt](bench/module_clone_cache_r82.json) preserves the
+hosted failure, all compiler controls, original case dictionaries, all 21
+Method-copy samples per trial, corpus results and the serialized macOS
+comparison. The identical retained Method-copy program can be rerun with
+`python3 tools/method_copy_memory_check.py --reference /path/to/ruby --output /path/to/results`.
+All per-file checks retain 600 seconds / 2 GiB; the complete corpus keeps its
+900-second / 2-GiB aggregate guard. Current hosted checks and comparison with
+the latest completed main remain required before merge. This follow-up
+changes only m_state.compact_method_store in the runtime; collector bodies,
+native pin policy, ISeq, AST/Prism and C API implementations are unchanged.
