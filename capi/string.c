@@ -97,7 +97,7 @@ void rb_str_set_len(VALUE str, long len) {
     if (len > capa || len < 0) rb_bug("probable buffer overflow: %ld for %ld", len, capa);
     struct RString *s = RSTRING(str);
     s->len = len;
-    memset(s->as.heap.ptr + len, 0, 4);
+    memset(s->as.heap.ptr + len, 0, (size_t)mr_string_terminator(str));
 }
 VALUE rb_str_resize(VALUE str, long len) {
     if (len < 0) rb_raise(rb_eArgError, "negative string size (or size too big)");
@@ -105,7 +105,7 @@ VALUE rb_str_resize(VALUE str, long len) {
     if (len > mr_string_capacity(str)) mr_string_reserve(str, len);
     struct RString *s = RSTRING(str);
     s->len = len;
-    memset(s->as.heap.ptr + len, 0, 4);
+    memset(s->as.heap.ptr + len, 0, (size_t)mr_string_terminator(str));
     return str;
 }
 VALUE rb_str_cat(VALUE str, const char *ptr, long len) {
@@ -121,7 +121,7 @@ VALUE rb_str_cat(VALUE str, const char *ptr, long len) {
     if (inside >= 0) ptr = s->as.heap.ptr + inside;
     memmove(s->as.heap.ptr + old, ptr, (size_t)len);
     s->len = old + len;
-    memset(s->as.heap.ptr + s->len, 0, 4);
+    memset(s->as.heap.ptr + s->len, 0, (size_t)mr_string_terminator(str));
     return str;
 }
 VALUE rb_str_cat_cstr(VALUE str, const char *ptr) { return rb_str_cat(str, ptr, (long)strlen(ptr)); }
@@ -268,6 +268,9 @@ char *rb_string_value_cstr(volatile VALUE *ptr) {
             if (zero) rb_raise(rb_eArgError, "string contains null char");
         }
     }
+    /* (...and it ends in its terminator, whatever C wrote there since: a C
+     *  string is asked for) */
+    memset(s + len, 0, (size_t)mr_string_terminator(str));
     return s;
 }
 VALUE rb_str_export_to_enc(VALUE str, rb_encoding *enc) { return rb_str_conv_enc(str, rb_enc_get(str), enc); }
