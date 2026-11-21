@@ -8290,3 +8290,38 @@ per-file classifications to a freshly built unmodified7c0fe03d baseline.
 The existing logger logdevice failure is not hidden or reclassified as a
 success. gemtest/method_floor_backport_r81.json retains the hosted failure,
 all Method samples and the two platform results. Baselines are unchanged.
+
+### Attribute page presence separately from native region capacity
+
+Read-only page-table observations distinguish capacity from pages actually
+present in each inventoried native region. The separate diagnostic build
+still runs the original input and is rejected by the ordinary RSS gate.
+Missing ranges, overlaps, impossible counts or denied access fail evidence
+collection. Partial payload edges are explicitly omitted; presence and
+exclusive-mapping flags are not process RSS or proof of object liveness.
+
+Locked runtime90c83c6e and released compiler43f2994b on Linux/aarch64 pass
+the ordinary Module195/1240, selected clone and Method-copy1.866672891x
+(reference1.104115371x). In the separate Method-copy diagnostic, inactive
+cache payloads have8KiB of present pages at both samples0 and20. Retired
+payloads increase from11,420 to89,212KiB; default and current method payloads
+stay close to35,704/35,880 and3,956/4,032KiB. All30 final retired arenas have
+present root pinners. The observed established-floor increases without a
+move remain zero. This identifies retained old native arenas as the main
+growth in this observation; it does not establish that their pins are stale
+or safe to release. Collector and native ownership changes remain outside
+this diagnostic patch.
+
+The repaired-source native x86-64 comparison in run44867923161 also passes:
+candidate Method-copy1.730880370x /1.797650005x and all original core controls.
+Its compiler94da60b5 has the same tree as released43f2994b. The older-source
+ae6bd8cc Method-copy2.135504918x and ordinary clone2.014963587x failures are
+retained and are not repaired by relabeling the historical job.
+
+tools/rss_page_probe.md documents the reader and the independent native Linux
+job. bench/rss_page_ownership_r84.json retains ordinary verdicts, all Method
+prefixes, page totals, pin observations and the failed historical controls.
+The captured fixture and14 reader/evidence controls include real anonymous
+mapping and access-denied checks. All35 existing native/heap/comparison
+controls still pass. No runtime Mere function, GC/pin policy, original test,
+existing workflow input, exclusion or resource bound changes.
