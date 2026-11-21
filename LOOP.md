@@ -7024,3 +7024,30 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+
+### PR review: lexer context for continuations and class method heredocs
+
+Record a continued newline only when the lexer consumes a backslash in code.
+Comment and literal scanners never record it. Nested interpolation lexers use
+separate invocation numbers and restore their parent's context; consumed
+continuation entries are removed after lexing. The existing tc_st map holds
+this context, with no additional top-level state. after_class_kw also checks
+the preceding significant character across whitespace, so receiver `. class`
+and `:: class` calls keep their bare, indented and quoted heredoc arguments.
+Changed functions: lex_go, new lex_go_step/lex_cont_key/lex_cont_go,
+lex_go_b, after_class_kw and prev_nonspace. Corpus761/762 adds both review
+reproductions, tab/newline separators, comment-ending backslashes, quoted
+hash bytes, real continuations, nested interpolation and repeated eval.
+
+Normal O2 with the CI-pinned compiler01f5ad73: **721/721 corpus** matches
+Ruby4.0.9 with hash index ON/OFF, **483.813s / 1,089,488KiB** peak family
+RSS. All nine existing RSS gates, roots, dead definitions and C depth155/1024
+pass. Corpus761-763 matches all36 evaluator/default/strict-VM and hash/MRO
+comparisons. Three complete original Parse/Syntax/Literal files retain
+**300 MATCH / 1 RED / 2 BOTH** across303 cases, identical per-file counts
+to successful main d9826ac9. The existing Syntax invalid-symbol leak Timeout
+and both reference skips stay visible. An initial nonexistent test_heredoc.rb
+selection was rejected as incomplete; only the real test_literal.rb result
+is counted here. No original tests, exclusions, API or resource limits change.
+Hosted checks must still finish on the updated head before merging.

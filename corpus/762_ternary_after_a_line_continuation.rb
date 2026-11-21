@@ -19,3 +19,23 @@ p d
 e = \
   %w[p q]
 p e
+
+# A backslash inside a comment never consumes that comment's newline.
+# self \
+/abc/.match("abc")
+p :comment_regexp
+# value ) \
+?/
+p :comment_character
+# Quoted/comment-like bytes before a real code continuation remain code.
+p "# )".empty? \
+  ? :quoted_truthy : :quoted_false
+p /#/.match?("#") \
+  ? :regexp_truthy : :regexp_false
+# Interpolation has its own continuation positions and restores its parent.
+p "#{nil.nil? \
+  ? :inside : :wrong}"
+p nil.nil? \
+  ? "#{1}" : :wrong
+# eval's next lexer invocation starts without stale continuation offsets.
+2.times { p eval("# self \\\n/abc/.match('abc'); :eval_ok") }

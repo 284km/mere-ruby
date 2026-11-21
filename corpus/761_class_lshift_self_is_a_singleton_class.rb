@@ -26,3 +26,24 @@ def o.class(*a) = a
 p o.class <<-EOS
 arg
 EOS
+
+# Whitespace between the receiver separator and `class` keeps a method name.
+p o. class <<BARE
+bare
+BARE
+p o. class <<-INDENTED
+  indented
+  INDENTED
+p o. class <<~'QUOTED'
+  quoted
+QUOTED
+p o:: class <<-COLON
+colon
+COLON
+p o.	class <<-TAB
+ tab
+TAB
+p o.
+ class <<-NEWLINE
+newline
+NEWLINE

@@ -4808,3 +4808,15 @@ lookups (corpus742). Both definition paths retain the lexical first constant,
 privacy and autoload behavior. The712-file corpus and original nine-file784-case
 comparison pass without losing a main PASS. The separate module_eval lexical
 negative remains an explicit failing diagnostic; this change does not claim it.
+
+
+## Lexer review: comments and receiver class calls
+
+A backslash at the end of a comment no longer changes the following regexp
+or character literal into continuation syntax. Only actual code continuations
+are recorded, separately for nested lexer invocations. Whitespace before a
+method named class, after `.` or `::`, keeps heredoc arguments rather than
+opening a singleton class. Corpus761/762 covers these review regressions.
+The full721-file corpus and original Parse102/Syntax167/Literal31 MATCH
+counts are retained. The pre-existing invalid-symbol Syntax leak Timeout
+and reference skips remain; these repairs do not establish a full Rails pass.
