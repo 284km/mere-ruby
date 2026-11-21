@@ -6842,3 +6842,14 @@ runtime matches corpus717/718/720/729/730 in all four hash/MRO modes (20
 comparisons), and roots/depth155 pass. Current hosted full checks remain
 required. The prior Linux clone RSS failure remains recorded; this merge
 and the focused comparisons do not establish its repair or waive its gate.
+
+### Native notification repair after the updated class-dispatch parent
+
+Integrate the repaired #125 parent without manually changing a runtime
+function. The normal O2 runtime matches all 721 corpus programs in both hash
+modes; all 28 focused comparisons include the new Module-subclass notification
+and native-super cases. The original Module/Method/Super files retain
+342 MATCH and one existing RED across 343 cases (Module 195/195). Nine RSS
+workloads, roots, depth 155 and dead definitions pass. The earlier 708-program
+result remains tied to its preceding integration; current hosted checks and
+every-file comparison still gate this head.
