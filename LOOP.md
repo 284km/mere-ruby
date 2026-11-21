@@ -6392,6 +6392,38 @@ pass. The separately measured four original ActiveSupport files still have
 537/541 MATCH at the earlier Hash-default boundary; these new Enumerable
 changes require a new original-framework measurement before claiming more.
 
+
+## 2026-11-20: Native Range case equality through super and saved aliases
+
+ActiveSupport prepends CompareWithRange#=== and calls super for scalar values.
+The native fallback reached Object#=== instead of Range#===, so precision6 was
+rejected by0..6 during actual Rails migration. Enter the real Range comparison
+from super and native aliases. Compare begin <=> value and value <=> end once
+in that order, matching range.c r_cover_p: nil means not covered; comparator
+exceptions propagate. Preserve exclusive/beginless/endless boundaries and the
+bounds of real Range subclass instances. No invented precision exception.
+
+Normal O2 at25415a32, on the reviewed loading/Module/Hash stack: **719/719
+corpus** match with the hash index ON and OFF. Corpus741 matches in all four
+hash/MRO settings, including native alias arity, scalar/string/object bounds,
+comparison side effects and exceptions. Nine existing RSS gates, dead definitions
+and generated C depth155/1024 pass. The original Range/Super/Method/Module
+pair discovers410 cases: both main d9826ac9 and candidate409 MATCH/1 RED,
+zero BOTH/EXTRA, no original PASS lost. Range67, Super50, Method97 and Module195
+MATCH are equal under the original600-second/2-GiB and10-second child limits.
+
+The own integration fd5a68a5 passes unchanged migration in6.812 seconds with
+804,208 KiB peak family RSS and no limit event. The next boot check refuses
+Bundler's full_gem_path because it points outside that interpreter's actual
+installed gem home; candidate application tests and HTTP remain NOT_RUN.
+Reference passes all four warm stages. This reused-own-gem run does not claim
+cold installation or application success. Remeasuring the same four original
+ActiveSupport files on both interpreters gives **539 MATCH/2 RED out of541**,
+zero BOTH/EXTRA/skips: OrderedOptions31/31, Concern17/17, Inflector471/473,
+class attribute20/20. Both remaining identities are Inflector titleize cases
+(String gsub! native super and Unicode negative lookbehind); the framework-wide
+suite has not been run.
+
 ### Scoped namespace review: every remaining segment is a real scope lookup
 
 Resolving the first constant lexically was necessary but did not make
@@ -6452,6 +6484,32 @@ comparison:1,302 cases, both main d9826ac9 and candidate **1,284 MATCH/3 RED/
 2-GiB/10-second child limits, bootstrap, exclusions and tests are unchanged.
 
 
+### Range review: resume native lookup from the actual ancestor position
+
+A receiver-only native fallback incorrectly reentered containment when Range
+itself replaced ===: that super belongs above Range and reaches equality.
+Include the real native Range entry while resolving super's remaining ancestor
+chain. Ruby definitions and undef before it keep their precedence; a native
+Range entry stops before a lower Ruby override. Both ordinary and refined
+super retain their actual lookup positions. Only Ruby targets consume the
+pending frame index; native comparator callbacks do not inherit that index.
+
+Normal O2 runtime0824a721 passes **720/720 corpus** ON/OFF, all12 comparisons
+for735/741/742 across four hash/MRO modes, nine existing RSS gates, dead
+definitions and C depth155/1024. The original Range/Super/Method/Module pair
+remains409 MATCH/1 RED out of410. Add the whole original Refinement file on
+the same unchanged binary:121 MATCH/1 BOTH out of122 on both sides. Combined
+five-file result:532 cases, both main d9826ac9 and candidate530 MATCH/1 RED/
+1 BOTH, zero EXTRA or lost original PASS. Original600-second/2-GiB/10-second
+child limits, files, bootstrap and exclusions remain unchanged. Subsequent
+parent merges change documentation only; full hosted checks are still required.
+
+Two exploratory controls expose separate preceding-parent gaps: native Kernel
+Method binding loses its owner on a Range receiver, and primitive === bypasses
+an undef. Keep unittest/range_kernel_method_owner_probe.rb and
+unittest/range_case_equality_undef_probe.rb as explicit failing diagnostics;
+these are not claimed repairs, exclusions or passing corpus cases. The older
+direct primitive/object comparison diagnostic also remains unresolved.
 ### Review repair: mixed Hash keys and Object autoloads (2026-11-21)
 
 Native Hash reads now use the internal hash for builtin search and stored
@@ -6470,3 +6528,21 @@ The original test_hash.rb remains 297 MATCH, 1 RED, 8 BOTH out of 306,
 without any previously passing named case lost against the retained before
 and previous candidate results. The remaining RED is test_replace_memory_leak;
 it was already RED. Full hosted per-file comparison is required before merge.
+
+
+### Review repair: removed native Range entries (2026-11-21)
+
+Native Range and Kernel comparators have entries in the existing
+builtin-alias store. Ruby replacements displace them; deleting a replacement
+does not restore the native entry. Ordinary/refined super follow the actual
+remaining entries while saved native aliases retain containment.
+
+Pinned Mere 01f5ad73/O2 passes all 720 corpus programs in both hash modes
+(510.717 seconds, 1,285,680 KiB under unchanged 900-second/2-GiB limits),
+all nine RSS workloads and root/depth155/dead-definition gates. Corpus741
+matches in four hash/MRO configurations. Original test_range/test_method/
+test_super total 215 cases: 214 MATCH and one existing Method RED, with no
+previously passing named case lost against retained candidate results.
+Full hosted per-file comparison still gates merge. Functions changed by
+the review: run_super_target, range_super_lookup and super_next_refined;
+existing builtin_alias/blt_alias_names initializers retain the native entries.
