@@ -74,3 +74,22 @@ p defined?(w)
   "until x\n  bar.\nend",
   "class A\n  def foo\n    bar.\n  end\nend",
 ].each { |s| show(s, true) }
+
+# Review regressions: relocated writes, explicit bindings and loop targets.
+[
+  '/(?<y>a)#@~/ =~ x; 1.times { y = 2; y = 3 }; y',
+  '/(?<y>a)#@~/ =~ x; 1.times { y = 2; y += 3 }; y',
+  '/(?<y>a)#@~/ =~ x; 1.times { y = 2; 1.times { y = 3 } }; y',
+  'foo { |(y)| /(?<y>a)#@~/ =~ x; y }',
+  'foo { |(x, *y)| /(?<y>a)#@~/ =~ x; y }',
+  'foo { |; y| /(?<y>a)#@~/ =~ x; y }',
+  '/(?<y>a)#@~/ =~ x; for y in y; y; end',
+  '/(?<y>a)#@~/ =~ x; for (x, y) in y; y; end',
+].each { |source| show(source) }
+[
+  "def f\nbegin; x; end; 1q\nend",
+  'if x; ; 1q; end',
+  'unless x; ; 1q; end',
+  'while x; ; 1q; end',
+  'until x; ; 1q; end',
+].each { |source| show(source, true) }

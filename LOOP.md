@@ -6196,3 +6196,27 @@ Speed: 300 files of test_ast's walk, 203.95e9 -> 204.13e9 instructions
 
 - Checked: fixtures 971 of 976; the 850 files 850 of 850; corpus 705 of
   705; test_ast's individual tests 114 as the reference; the gates.
+
+
+### AST review repairs: real bindings and recovery body starts (2026-11-21)
+
+Ghost capture assignments now keep later writes in the nearest real or
+relocated block binding, including writes in nested blocks. Destructured
+parameters and explicit block locals register real bindings before the
+body is translated. For-loop local targets register before the collection
+without changing AST node construction order. Recovery ERROR locations
+start at the original statement-list syntax, including a removed begin
+and leading empty statements.
+
+Corpus 700 adds 13 review cases. All 13 match the reference's standalone
+AST including locations, and the normal O2 runtime matches the whole corpus
+700 output in all four hash/MRO configurations. All 869 current Ruby test
+files match, including 1,002,971 textual AST lines. Prism fixtures retain
+971/976: only the same five reference children walks raise NoMethodError.
+The new two Prism readers were regenerated from the pinned config. Root,
+depth, dead-definition and duplicate-definition gates pass. Full hosted
+corpus and per-file comparison remain required for merging.
+
+Functions changed: gh_put, gh_targets, gh_parameter, gh_block_locals,
+tr_stmt_list, tr_compstmt, tr_block_scope, tr_mlhs, tr_lambda, tr_for;
+generated readers pm_block_parameters_locals and pm_block_local_variable_name.

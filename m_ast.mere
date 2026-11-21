@@ -91,10 +91,42 @@ let rec gh_unassigned = fn (depth: int) -> fn (c: int) -> fn (p: int) ->
 //  new variable of the innermost scope -- kind 4 puts it in that table)
 let gh_put = fn (depth: int) -> fn (c: int) -> fn (p: int) ->
   if vec_get as_gh 0 != 2 then ()
-  else if depth > 0 && gh_has 1 (gh_serial depth) c 1000000000000000 && gh_unassigned depth c p then
-    (let _ = gh_add 2 (gh_serial 0) c p in gh_add 4 (gh_serial 0) c p)
+  else if depth > 0 && gh_has 1 (gh_serial depth) c 1000000000000000 then
+    // A prior write may have relocated the binding into this block or an
+    // intermediate enclosing block. Subsequent writes stay at that binding.
+    (let rec binding = fn (d: int) ->
+       if d > depth then 0 - 1
+       else if gh_real (gh_serial d) c p then d else binding (d + 1) in
+     let d = binding 0 in
+     if d >= 0 then gh_add 2 (gh_serial d) c p
+     else (let _ = gh_add 2 (gh_serial 0) c p in gh_add 4 (gh_serial 0) c p))
   else gh_add 2 (gh_serial depth) c p;
 let gh_target = fn (t: int) -> gh_put (pm_local_variable_target_depth t) (pm_local_variable_target_name t) (pm_start t);
+
+// Register for-loop locals before translating the collection, without
+// creating AST nodes early or traversing receiver expressions as targets.
+let rec gh_targets = fn (t: int) ->
+  if t == 0 || vec_get as_gh 0 != 2 then ()
+  else if pm_is t (pm_t_local_variable_target ()) then gh_target t
+  else if pm_is t (pm_t_multi_target ()) then
+    (let rec each = fn (l: int) -> fn (i: int) ->
+       if i >= pm_ls_len l then ()
+       else (let _ = gh_targets (pm_ls_at l i) in each l (i + 1)) in
+     let _ = each (pm_multi_target_lefts t) 0 in
+     let _ = gh_targets (pm_multi_target_rest t) in
+     each (pm_multi_target_rights t) 0)
+  else if pm_is t (pm_t_splat ()) then gh_targets (pm_splat_expression t)
+  else ();
+let gh_parameter = fn (c: int) ->
+  if vec_get as_gh 0 == 2 then gh_add 3 (gh_serial 0) (k_id (id_c c)) 0 else ();
+let gh_block_locals = fn (pn: int) ->
+  if vec_get as_gh 0 != 2 || nott (pm_is pn (pm_t_block_parameters ())) then ()
+  else (let locals = pm_block_parameters_locals pn in
+        let rec each = fn (i: int) ->
+          if i >= pm_ls_len locals then ()
+          else (let _ = gh_parameter (pm_block_local_variable_name (pm_ls_at locals i)) in each (i + 1)) in
+        each 0);
+
 // (the name is assigned for real in scope `s` before `p`: a parameter, or an
 //  assignment that starts before it)
 let gh_real = fn (s: int) -> fn (c: int) -> fn (p: int) -> gh_has 2 s c p || gh_has 3 s c 0;
@@ -458,7 +490,7 @@ let tr_stmt_list = fn (l: int) ->
       (let x = pm_ls_at ll i in
        let gj = garbage ll i n in
        if gj >= 0 then
-         (let er = n0 (nt_error ()) (if acc != 0 then a_beg acc else pm_start x) (pm_end (pm_ls_at ll gj)) in
+         (let er = n0 (nt_error ()) (pm_start (pm_ls_at ll 0)) (pm_end (pm_ls_at ll gj)) in
           let _ = vec_set as_px 12 er in
           go ll (gj + 1) n er)
        else
@@ -500,7 +532,13 @@ let tr_compstmt = fn (sn: int) -> fn (empty_at: int) ->
   // (a `;` first: the empty `stmts` is reduced before it, and the
   //  statements follow that BEGIN)
   if body == 0 then p_begin_at empty_at
-  else if empty_at < 1099511627776 && pm_byte (skip_space_nl empty_at) == 59 then p_block_append (p_begin_at empty_at) body
+  else if empty_at < 1099511627776 && pm_byte (skip_space_nl empty_at) == 59 then
+    (let er = vec_get as_px 12 in
+     let head = (if er >= 0 && a_is body (nt_block ()) then a_f body 0 else body) in
+     if er >= 0 && head == er then
+       (let _ = a_set_beg er empty_at in
+        let _ = (if head != body then a_set_beg body empty_at else ()) in body)
+     else p_block_append (p_begin_at empty_at) body)
   else body;
 // ...and where a `term` can come first (`class A; ...`, `begin; ...`): the
 // empty `stmts` is reduced before the term, so the statements follow a
@@ -1559,6 +1597,7 @@ let tr_block_scope = fn (blk: int) ->
     let oe = pm_block_opening_loc_e blk in
     let ce = pm_block_closing_loc_e blk in
     let pn = pm_block_parameters blk in
+    let _ = gh_block_locals pn in
     let args =
       (if pn == 0 then 0
        else if pm_is pn (pm_t_block_parameters ()) then
@@ -2448,7 +2487,7 @@ let tr_mlhs = fn (lefts: int) -> fn (rest: int) -> fn (rights: int) -> fn (b: in
   let item = fn (x: int) ->
     (if pm_is x (pm_t_multi_target ()) then tr_mlhs_of x param
      else if pm_is x (pm_t_required_parameter ()) then
-       (let _ = () in n2 (asgn_type 0) (pm_start x) (pm_end x) (id_c (pm_required_parameter_name x)) 0)
+       (let _ = gh_parameter (pm_required_parameter_name x) in n2 (asgn_type 0) (pm_start x) (pm_end x) (id_c (pm_required_parameter_name x)) 0)
      else tr_target x 0 (pm_start x) (pm_end x)) in
   let rec items = fn (l: int) -> fn (i: int) -> fn (acc: int) ->
     if i >= pm_ls_len l then acc
@@ -2466,7 +2505,8 @@ let tr_mlhs = fn (lefts: int) -> fn (rest: int) -> fn (rights: int) -> fn (b: in
         if x == 0 then 0 - 1
         else if pm_is x (pm_t_required_parameter ()) then
           // f_rest_marg: tSTAR f_norm_arg, located with its star
-          n2 (asgn_type 0) (pm_start rest) (pm_end rest) (id_c (pm_required_parameter_name x)) 0
+          (let _ = gh_parameter (pm_required_parameter_name x) in
+           n2 (asgn_type 0) (pm_start rest) (pm_end rest) (id_c (pm_required_parameter_name x)) 0)
         else item x)) in
   let args = (if pm_ls_len rights == 0 then restn
               else n2 (nt_postarg ()) b e restn (items rights 0 0)) in
@@ -2665,6 +2705,7 @@ let tr_lambda = fn (n: int) ->
   let ops = pm_lambda_opening_loc_s n in
   let ope = pm_lambda_opening_loc_e n in
   let pn = pm_lambda_parameters n in
+  let _ = gh_block_locals pn in
   let isbp = pm_is pn (pm_t_block_parameters ()) in
   let args =
     (if pn == 0 then tr_params 0 oe oe true
@@ -2742,6 +2783,7 @@ let tr_for = fn (n: int) ->
   let ix = pm_for_index n in
   let vs = pm_start ix in
   let ve = pm_end ix in
+  let _ = gh_targets ix in
   let iter = tr (pm_for_collection n) in
   let internal = n1 (nt_dvar ()) vs ve (id_internal ()) in
   let multi = pm_is ix (pm_t_multi_target ()) in
