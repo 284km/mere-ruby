@@ -83,6 +83,10 @@ p defined?(w)
   'foo { |(y)| /(?<y>a)#@~/ =~ x; y }',
   'foo { |(x, *y)| /(?<y>a)#@~/ =~ x; y }',
   'foo { |; y| /(?<y>a)#@~/ =~ x; y }',
+  '/(?<y>a)#@~/ =~ x; 1.times { for y in [1]; y; end }; y',
+  '/(?<y>a)#@~/ =~ x; -> { for y in [1]; y; end }; y',
+  '/(?<y>a)#@~/ =~ x; 1.times { for (x, y) in [[1, 2]]; y; end }; y',
+  '/(?<y>a)#@~/ =~ x; 1.times { for y in y; y; end }; y',
   '/(?<y>a)#@~/ =~ x; for y in y; y; end',
   '/(?<y>a)#@~/ =~ x; for (x, y) in y; y; end',
 ].each { |source| show(source) }
