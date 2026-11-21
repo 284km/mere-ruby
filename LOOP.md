@@ -6510,3 +6510,21 @@ an undef. Keep unittest/range_kernel_method_owner_probe.rb and
 unittest/range_case_equality_undef_probe.rb as explicit failing diagnostics;
 these are not claimed repairs, exclusions or passing corpus cases. The older
 direct primitive/object comparison diagnostic also remains unresolved.
+### Review repair: mixed Hash keys and Object autoloads (2026-11-21)
+
+Native Hash reads now use the internal hash for builtin search and stored
+keys even when a mixed table contains Ruby-hashed keys. Ruby hash callbacks
+still run once for keys whose protocol requires them. Object-qualified
+mixin paths normalize the constant/autoload key before firing the loader.
+Functions changed: hash_read_native and mixin_argument_value. Corpus 735
+and 736 cover String/Symbol hash overrides, missing custom keys, and block,
+class-body include and runtime prepend through Object's pending autoload.
+
+With Mere 01f5ad73 and O2, all 719 corpus programs match in both hash-index
+modes (516.823 seconds, 1,192,432 KiB under the unchanged 900-second/2-GiB
+bounds); RSS, root, depth (155) and dead-definition gates pass. The three
+focused corpus programs match in all four hash/MRO cache configurations.
+The original test_hash.rb remains 297 MATCH, 1 RED, 8 BOTH out of 306,
+without any previously passing named case lost against the retained before
+and previous candidate results. The remaining RED is test_replace_memory_leak;
+it was already RED. Full hosted per-file comparison is required before merge.
