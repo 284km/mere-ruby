@@ -6542,6 +6542,48 @@ The original selected ActiveSupport files are 513 MATCH / 8 RED out of 521;
 no framework-wide pass is claimed. The pre-existing module_eval lexical
 negative case remains RED and is kept as unittest/scoped_class_lexical_probe.rb.
 
+
+## 2026-11-20: Module subclass method factories and native super before missing hooks
+
+ActiveModel's AcceptsMultiparameterTime is a Module subclass whose initialize
+includes methods, defines a closure and marks its method private. The real
+module backing already existed, but its delegation predicate omitted
+`define_method` and named visibility. Admit those native operations while
+retaining Ruby overrides, the original receiver's freeze check and nil from
+an argument-free private call even on a frozen module. The SVis statement
+with names reaches that same real receiver, preserving overrides.
+
+ActiveSupport::Concern then reached super from append_features on a module
+that also defines an INSTANCE method_missing. super_missing tried that
+instance hook before the real native mixin entry. Try native ancestors first;
+missing dispatch on a class/module belongs to its singleton chain. Native
+append_features/prepend_features/extend_object reuse ordinary native dispatch
+for their actual return, validation, freeze checks and ancestry bookkeeping.
+No new top-level values or collector/state/VM/AST/C API changes.
+
+On main d9826ac9 plus the preceding rooted-loading repair, normal O2:
+**712/712 corpus files** match with the hash index ON and OFF; corpus 733/734
+also matches with normal/hash-off/MRO-off/both-off settings (eight pairs).
+All nine existing loop RSS checks, dead definitions and generated-C depth
+**155/1024** pass. Complete original Module195, Class61, Refinement121,
+Super50, Method97, Parse102, Forwardable27, Autoload27 and Require51 MATCH
+are identical to main. Module retains all 1,240 assertions and zero skips.
+The 10-file first pair discovers 906 cases: main899 MATCH/1 RED/6 BOTH,
+candidate898/2/6, with only README's known invalid-symbol Syntax memory test
+lost. Repeating the WHOLE unchanged Syntax file gives main167/candidate168
+MATCH (two BOTH each); retain both raw pairs, without a new exclusion or a
+larger limit. Every focused file has a candidate run retaining main's MATCH.
+The original 600-second/2-GiB and 10-second leak-child bounds remain intact.
+
+The own Rails validation composition passes the previous two boundaries,
+then migration fails in Pathname#initialize called by Application#encrypted
+for credentials. Reference's four application stages pass; candidate
+migration takes 8.877 seconds/1,011,920 KiB with no resource event, while
+boot/tests/HTTP remain NOT_RUN. This reused-own-gem diagnostic is not a cold
+installation or Rails pass. Hash default reads and other selected original
+ActiveSupport failures remain separate work. The constructor's captured
+Hash default-block behavior is already a separate unmerged prerequisite;
+these Module changes do not claim to supply it.
 ### Rooted loading review: choose a scoped namespace lexically (2026-11-20)
 
 Review found a real regression when both A::B and Scope::A::B exist:
@@ -6561,6 +6603,42 @@ The known invalid-symbol Syntax memory failure occurs on both main and this
 candidate; earlier168-MATCH observations are retained, not overwritten.
 No original test, exclusion or limit changed. Hosted checks must still finish
 on the review correction before merge.
+
+### Module review: real native ancestors and original notification receivers (2026-11-20)
+
+Restrict Regexp-subclass fallback to actual Regexp methods, and empty
+notification fallback to receivers that inherit that native hook. Unknown
+super calls continue to the original receiver's missing handler, including
+arguments and blocks. Corpus739 covers both reported regressions, genuine
+native controls and an undef before the native hook.
+
+A Module subclass's anonymous module stores its methods; the original object
+receives method_added. Read the existing backing-to-object ancestry mapping,
+select a Ruby body, native alias, undef or Module's actual empty entry in
+ancestor order, and notify once after visibility is established. The Proc
+and Method argument forms now also notify after installation. The native
+empty callback emits c_call/c_return on the real receiver when observed.
+Corpus740 covers inherited/singleton/global callbacks, block/Proc/Method
+forms, private initialize, exceptions without rollback, frozen refusal,
+actual TracePoint receiver/owner, saved native callbacks and undef. The
+first unconditional invocation missed the ordinary native callback on an
+unmodified Module subclass; the original733 witness caught it and stopped
+the attempted sweep. Preserve that failed record separately.
+
+Final normal O2 ec6d6a5a: **715/715 corpus**, hash index ON/OFF, all36 witness
+comparisons in four hash/MRO modes, all nine existing RSS checks, dead
+definitions and depth155/1024 pass. Twelve original files discover1170 cases:
+main1155 MATCH/7 RED/7 BOTH/1 EXTRA, candidate1157/5/7/1, with no original
+passing identity or per-file MATCH lost. Module195/1240 assertions and
+Regexp161 MATCH are retained. Settracefunc96->97 and Syntax167->168 are
+observations, not claimed causal improvements; all raw pairs remain.
+No original test, exclusion or resource limit changes.
+
+A separate existing metadata failure stays explicit in
+unittest/native_alias_method_predicate_probe.rb: method_defined? misses a
+real native alias on both main and candidate. Notification witnesses obtain
+the installed method directly; this change does not claim that predicate
+repair or a full Rails pass. Hosted CI remains required on the corrected head.
 
 
 ### Scoped namespace review: every remaining segment is a real scope lookup
@@ -6584,3 +6662,19 @@ memory failure is present on both; original test files, bootstrap, exclusions
 and600-second/2-GiB/10-second child limits are unchanged. This correction
 requires new hosted checks; the previous head's known complemented-method
 10.03-second child Timeout is retained rather than waived for merge.
+
+
+### Module stack after the scoped-namespace follow-up (2026-11-20)
+
+Rebuild the Module repairs with the parent's full scoped-constant correction.
+Normal O2 runtime f6975772 passes **716/716 corpus**, hash index ON/OFF,
+all40 witness comparisons across four hash/MRO modes, all nine existing RSS
+gates, dead definitions and C depth155/1024. Twelve complete original files
+find1,170 cases: both main d9826ac9 and candidate **1,156 MATCH/6 RED/7 BOTH/
+1 EXTRA**, with no original PASS or per-file MATCH lost. Module195 with1,240
+assertions, SetTraceFunc97, Regexp161, Class61, Refinement121, Super50,
+Method97, Syntax167, Parse102, Forwardable27, Autoload27 and Require51 are
+retained. The known Syntax-memory failure remains on both sides. All original
+limits, tests, bootstrap and exclusions are unchanged. Parent documentation
+was merged after measurement; it changes no runtime source. Hosted checks
+must complete on the updated head before merge.
