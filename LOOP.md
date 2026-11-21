@@ -6654,3 +6654,10 @@ fallbacks are unchanged: 6 a Regexp in another encoding -- allowing those
 moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
+
+
+The final parent-integrated AST runtime b4bbb8d9 also passes all 708 corpus
+programs in both hash modes (468.071 seconds, 1,174,736 KiB, unchanged
+900-second/2-GiB bounds), the nine RSS workloads and root/depth/dead gates.
+Corpus 700 still matches in four independent cache configurations after
+this integration. No exclusion, budget or expected output was changed.
