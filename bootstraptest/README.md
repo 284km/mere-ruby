@@ -27,6 +27,27 @@ shards, duplicate rows, unchanged provenance and missing reference results.
 Behavior differences are measurement results. Missing inputs, infrastructure
 errors and reference gaps fail collection.
 
+CI supplies `--timings bootstraptest/timings.json` to place the longest observed
+files first into the lightest of four shards. Estimates combine both interpreter
+durations; they only choose placement. Unknown files receive a 60-second estimate,
+removed entries are ignored, and a different Ruby source SHA discards the weights.
+Each shard retains at most `ceil(files / shards)` files, preserving the previous
+worst-case job budget when several files reach both 600-second limits. With the
+pinned 35-file inventory that is at most nine files per job; the four shards,
+two concurrent jobs, 210-minute job deadline and per-file bounds are unchanged.
+
+Schema 2 plans record explicit partitions, the estimate hash and projected
+durations. Both workers and collection validate exact file coverage and shard
+assignment. Original schema 1 round-robin plans remain readable. Successful
+collection publishes `bootstrap-report/timings.json` with measured durations and
+source/compiler/Ruby revisions for the next reviewed refresh. Missing shards or
+reference gaps do not produce new timing estimates.
+
+The checked-in estimates come from [run 44205107484](https://github.com/284km/mere-ruby/actions/runs/44205107484).
+Replaying those observations changes per-shard supervised execution totals from
+134.1 / 202.1 / 518.4 / 606.3 seconds to 365.9 / 365.8 / 365.2 / 364.0 seconds.
+This is a placement replay, excluding setup, queueing and future runtime changes.
+
 The plan hashes every input. A comment-only `KNOWNBUGS.rb` is explicitly
 inventoried as an empty input: its ZERO result is reported with zero tests,
 never a passing case. Executable input that discovers no assertions remains
@@ -43,6 +64,7 @@ Artifacts:
   completion states and case comparison counts.
 - `bootstrap-report`: collected JSON and Markdown report. MATCH/RED/BOTH/EXTRA
   have the same meaning as the unittest report; skips are never passes.
+  A complete collection also includes placement-only `timings.json`.
 
 `all.sh`, `extract.rb`, `run.sh` and `triage.sh` retain the older `assert_equal`
 pair workflow for existing investigations. It is a subset and its totals must
