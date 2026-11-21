@@ -6830,6 +6830,118 @@ Keep the nonempty multipart MATCH-to-MEMORY regression in the unadopted
 suites_candidate.json. The parent's macOS 53-MATCH baseline remains the
 merge gate. The source/dependency inventory and resource bounds are unchanged.
 
+
+## Gem rounds 16-18: real Test::Unit children and two more pinned suites
+
+Matrix 0.4.3 and Logger 1.6.0 use their original test-unit 3.7.8 /
+test-unit-ruby-core 1.0.16 / power_assert 3.1.0 framework and release libs.
+The new separate lock adds seven files / 169 reference tests; the original
+62-file lock and OS baselines remain unchanged. Offline source-audited O2
+measurement at 35cfe0d4 gives Matrix 2 MATCH, Logger 4 MATCH / 1 RED, all
+reference files healthy. Preserve its initial macOS snapshot independently.
+The first hosted Linux observation is pending; the additional workflow
+collects initial records before strict per-OS baselines are adopted.
+
+The child framework exposed primitive super skipping Hash's native [] in
+favor of Object's included Ruby []. super_next_plain now stops at the
+actual primitive native entry, after earlier Ruby definitions/undefs. The
+common copy_meth_src records both copied names in the existing meth_aliased
+state, suppressing their first replacement warning while later ordinary
+redefinitions still warn. Relocate the existing state only; the top-level
+let count does not grow. Witnesses 701/702. Both functions are unchanged on
+the current AST/VM/C API/GC remote branches. No collector or VM edit.
+
+The final corpus gives 719/719. Ten measurement controls include actual child
+interpreter/library routing and all seven Test::Unit summary fields. The
+original five suites remain 53 MATCH / 7 RED / 2 MEMORY, with no per-file
+loss against the paired parent's actual observation. Keep the nonempty
+multipart regression against the stronger stored macOS baseline in
+suites_candidate.json; do not adopt that candidate as a new baseline.
+The parent's own hosted macOS run 44259245152 also reaches 2 GiB in
+multipart (52 MATCH / 9 RED / 1 MEMORY). Its 53-MATCH local baseline is
+retained. All these PRs remain subject to that resource gate.
+
+Logger's remaining rotated-File identical? case needs its retained fstat
+result. A /dev/fd path trial failed and was reverted; its shared native
+dispatch branch stays untouched. A paired pre-existing undef under a
+prepended Hash wrapper likewise remains recorded, not claimed as fixed.
+
+Focused original core files retain both baselines: Super 50 MATCH, Module
+195 MATCH, Method 97 MATCH / 1 RED, Hash 297 MATCH / 1 RED / 8 BOTH. Hash's
+remaining replace-memory-leak case reaches its existing 10-second child
+bound; Method's compaction case is the existing skip. Both new witnesses
+also match with GC.stress under the same family bounds. The emitted C needs
+933/1024, verified with the 933 positive / 932 negative syntax checks. Only
+the search seed changes; m_state/main top-level let counts remain 1167/136.
+
+Initial hosted additional Linux run 44269323039 (source 5e73b774) gives
+6 MATCH / 1 RED, with all seven reference files healthy and both sides
+audited. Preserve its initial observation and enforce the measured Linux
+baseline; macOS retains its separate initial six MATCH files. The additional
+workflow now requires the matching OS snapshot on every PR/main/dispatch
+measurement. The original multipart gate remains unsatisfied and unchanged.
+
+Review corrections for the additional suites: preserve the previous
+native-aware super lookup outside the four primitive value kinds, and stop
+their ordered walk at each actual native owner. Expanded 701 covers Exception,
+Integer and Float before a later Object undef. Shared-definition warning flags
+now live in the existing owned meth_src row, with the endless accessor
+unchanged. copy_meth_src marks only actual native alias/Method-copy operations;
+keyword alias marks its copy explicitly. Clone/import copies do not acquire
+sharing, and a new Proc definition clears the replaced definition's flag.
+There are no new warning-map entries or collector implementation edits.
+
+Expanded 701/702 match normally and with GC.stress, including clones, singleton
+clones, refinement imports and reflective definition calls. O2 source 0521f018
+retains the strict additional 6 MATCH / 1 RED and all seven source audits,
+719/719 corpus, Super 50, Module 195, Method 97 MATCH / 1 RED and Hash
+297 MATCH / 1 RED / 8 BOTH. Bracket depth remains 933/1024; top-level lets
+remain 1167/136. The actual Method-copy lifetime control's post-GC peak ratios
+are 2.159 on the saved pre-review binary (negative control), 1.740 on the
+paired base and 1.708 after correction, with reference around 1.08. Each
+prefix is checked against core_assertions' default 2x bound under the same
+600-second/2-GiB family caps. The raw series retains the base's existing
+allocator growth; this fixes the additional warning-state retention.
+
+The completed original-batch review rerun at 0521f018 retains 53 MATCH /
+7 RED / 2 MEMORY and every paired-parent file outcome. Its candidate record
+still contains the multipart regression against the stronger stored macOS
+baseline, so it is not adopted. The review fixes do not waive that gate.
+
+
+## Gem round 22: publish copied method metadata once at unchanged lifetime bounds
+
+The first strict rounds 19-21 Linux check really fails the unchanged
+Method-copy lifetime control: post-GC peak/start 2.086 in run 44292334299,
+under the 600-second/2-GiB outer caps. Preserve its actual RSS series in
+method_copy_lifetime_latest.json. Do not relabel this as a timeout or silently
+retry a failure whose cause has not been established.
+
+copy_meth_src now publishes the copied source location and sharing flag in
+one existing method-source row update, retaining the destination end position
+and endless bit. An already-shared source is not rewritten per destination.
+No collector, VM or shared native dispatcher edit, and no new top-level let.
+A borrowed-operation-name trial did not improve the paired observation
+(1.780 versus 1.712 on macOS) and was rejected. An intermediate no-op flag
+check alone also left Linux near the bound (1.975).
+
+Paired O2 observations with the same unmodified control: macOS peak RSS
+179,568 to 157,856 KiB, post-GC ratios 1.712 to 1.695; offline Linux/aarch64
+199,568 to 173,416 KiB, ratios 1.980 to 1.908. The Linux container is not the
+hosted x86-64 runner; final hosted proof remains pending. Every collected
+prefix still uses the default 2x bound; no warm-up, workload or limit changes.
+Normal and GC.stress warning outputs in 702 match the reference. Corpus
+719/719 and bracket depth 933/1024. Module's complemented-method test first
+fails its known 2x RSS check at 2.0078; the complete isolated rerun retains
+195 tests / 1,240 assertions with no failures at unchanged bounds. Keep both
+observations. The additional suites retain strict 6 MATCH / 1 RED.
+
+The original batch retains 53 MATCH / 7 RED / 2 MEMORY and every paired
+actual parent outcome. Its candidate still records multipart's loss against
+the stronger stored macOS baseline and is not adopted. The latest strict
+rounds 19-21 macOS run also loses that file; the preceding successful hosted
+observation does not erase the failed run or identify the resource cause.
+
 ## 2026-11-20: a live refinement snapshot need not duplicate its first target
 
 PR #92's repeated original Module check failed its RSS assertion at

@@ -5,6 +5,30 @@ stderr in CI's `gem-suites-*` artifacts identify individual failed tests.
 Symptoms below are observed; an unconfirmed cause is explicitly marked.
 None is excluded from the measurement to improve its score.
 
+Additional pinned suites: Matrix has 2 MATCH files; Logger has 4 MATCH and
+1 RED. Primitive super now stops at Hash/Array/String/Proc's actual native
+ancestor before a Ruby method farther up the chain. The actual Test::Unit
+Fixture observer registration therefore works in separated children. The
+common method-copy path records real alias/Method-copy sharing as a private
+flag in the existing owned method-source row. Replacing such a copy suppresses
+its first redefinition warning; the next ordinary replacement warns. Clone
+and refinement-import copies retain ordinary warnings. Anonymous owners carry
+no new global warning-map entries; their flag has their method row's lifetime.
+Witnesses 701 and 702; no new top-level let or collector change.
+
+Logger's remaining test_logdevice failure compares a rotated open File with
+its old pathname. File predicates currently discard its retained descriptor.
+A /dev/fd path conversion trial did not match the reference and was reverted;
+the real fstat primitive exists, but routing this predicate through it needs
+the shared invoke_val_c0 branch. Defer that Ruby semantics edit while the
+C API session owns the function; this is not a C extension dependency.
+
+A separate pre-existing Hash subclass undef under a prepended [] wrapper
+still reaches the primitive on both the paired parent and this candidate.
+It is not repaired by the native-super ordering change or omitted from an
+upstream file. The focused new witness tests native-super ordering and an
+undef farther behind the already selected native entry.
+
 PR #92 Module RSS follow-up (2026-11-20): its original complemented-entry
 case still has a preserved hosted 2.026060x failure. A single-refinery live
 snapshot no longer duplicates the fixed entry it already restores. The
@@ -264,6 +288,16 @@ repeat. The parent's focused run still matches (85 tests / 239 assertions,
 total MATCH counts from a different gained file. Route the producer/reader
 resource investigation to the VM/performance session; no specific VM or GC
 cause is established. Keep the 600-second/2-GiB bounds and parent baseline.
+
+The subsequent strict rounds 19-21 macOS run 44292334030 again loses multipart
+to MEMORY. Keep that failure alongside #107's preceding successful hosted
+observation. The cause of this variation remains open. Separately, strict
+Linux run 44292334299 fails the new Method-copy lifetime check at 2.086x.
+copy_meth_src now publishes each destination's location/flags once and avoids
+rewriting an already-shared source. Paired unmodified controls lower peak RSS
+on macOS and Linux/aarch64; their raw series and the failed hosted x86-64
+observation are retained in method_copy_lifetime_latest.json. The unchanged
+2x check and final hosted result remain merge gates.
 
 The remaining stdlib-caller P2 also affected `mspec/scoreboard.sh` and
 `run_corpus.sh` when reference library directories were supplied through
