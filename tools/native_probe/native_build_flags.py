@@ -31,7 +31,8 @@ ROOT = Path(__file__).resolve().parents[2]
 CAPI = ROOT / 'capi'
 
 # What compiling the C API's sources needs, as tools/build.sh passes it.
-NATIVE_CFLAGS = ['-DMR_CAPI_BUILD', '-I', str(CAPI / 'include'), '-I', str(CAPI), '-I', str(CAPI / 'vendor')]
+NATIVE_CFLAGS = ['-DMR_CAPI_BUILD', '-I', str(CAPI / 'include'), '-I', str(CAPI), '-I', str(CAPI / 'vendor'),
+                 '-I', str(CAPI / 'standin')]
 
 
 def native_bridge_sources(compiler=None):
