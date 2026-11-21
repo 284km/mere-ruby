@@ -6608,3 +6608,24 @@ All 16 focused comparisons and the complete Module/Method/Super files retain
 The additional saved-native-Method diagnostic fails on the preceding main
 integration and #141 parent as well as the candidate and remains explicit
 in unittest/module_saved_comparator_method_probe.rb and KNOWN_GAPS.md.
+
+
+### Captured native comparator Methods keep their body after prepends
+
+A captured native comparator can reach bi_meth_call after a Ruby prepend
+shadows its name. Its recorded Module, Kernel or Range owner now selects the
+existing native_case_equal body directly. The selected-super repair from
+11d87d93 is preserved. This follow-up edits bi_meth_call and adds corpus 749;
+it adds no global state or placeholder native implementation.
+
+The final ordinary O2 source is 8e060d3f, using the exact CI compiler
+01f5ad73. Corpus 741, 743 and 749 match Ruby 4.0.9 in all four hash/MRO cache
+combinations (12 comparisons). The retained saved-comparator probe now prints
+true/false on both runtimes. Original Module passes 195/1240 and Super50/109;
+Method98/554 keeps the same single compaction skip, with its complete 98-case
+verdict dictionary identical to the retained baseline. The three files retain
+342 MATCH and one existing RED over343 cases. Original Method-copy passes at
+1.679902x, reference1.084765x. All original assertions and resource bounds stay
+in force. All 722 corpus programs match in both hash modes: 520.933 seconds and
+1,290,080 KiB peak family RSS, within the original 900-second / 2-GiB bound.
+This was measured at 8e060d3f before the documentation-only follow-up.

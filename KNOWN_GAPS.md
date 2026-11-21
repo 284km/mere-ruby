@@ -4699,9 +4699,12 @@ comparison against Ruby 4.0.9. This dispatch diagnostic is separate from the rel
 Method metadata work in [#133](https://github.com/284km/mere-ruby/issues/133).
 No upstream assertion or existing corpus program is skipped or excluded.
 
-A saved Module.instance_method(:===) called through a bound native Method
-still raises unknown operator even when a forwarding Module prepend exists.
-The same call fails on the #141 parent and the preceding native-main
-integration. unittest/module_saved_comparator_method_probe.rb preserves this
-independent dispatch diagnostic. The exact-entry super repair does not claim
-saved native Method dispatch is complete; no original test is excluded.
+Saved native Module comparator calls after a prepend now retain their real
+native owner. Corpus 749 and unittest/module_saved_comparator_method_probe.rb
+cover the matching and nonmatching calls; both agree with Ruby 4.0.9.
+
+A separate Method#super_method reflection gap remains when a class receiver's
+=== comes from prepends on Module. With two forwarding comparators, Ruby
+walks SecondComparator, FirstComparator, Module and Kernel. The #141 baseline
+71e95b9a and the current implementation return SecondComparator and then nil.
+This receiver-chain lookup predates the native comparator call repairs.
