@@ -5664,6 +5664,49 @@ last item.
 - Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 923 of 1024 (was
   892 on main: the translation and the caches keep top-level tables).
 
+## 2026-11-21 (65): what Rails' own dependencies build, on the C API
+
+Rails 8.1 installs on main now (issue #116: #95 and #120), and the next
+stages -- boot, the application's tests, Puma serving HTTP -- run the C
+extensions of its dependencies. Thirteen of its 68 locked gems have one.
+`tools/capi_gem_check.py` builds five more of them at railstest/'s versions,
+on both rubies, and uses them the same way: erb (its escape, which
+ERB::Util.html_escape is), rbs (a C parser building Ruby AST objects),
+websocket-driver (the frame mask), puma (the HTTP request parser) and sqlite3
+on the system's SQLite (BLOBs, a Ruby function SQL calls, transactions,
+errors). Each prints whether the extension it loaded is the gem home's.
+json, date, bigdecimal, io-console and prism build too, but mere-ruby
+loads its own library of the same name before an activated gem's extension
+(issue #127, PR #128): what they would compare is not the C API.
+
+**What it found** (each reproduced against ruby first):
+
+- `class <<self` with no space was a here document whose terminator is
+  "self": the rest of the file was its body, and `require "rbs"` a
+  SyntaxError. parse.y opens none after the keyword `class` (EXPR_CLASS);
+  after_class_kw says so (and `obj.class <<X`, a method named class, keeps
+  its argument). corpus/761.
+- A backslash that ends a line continues it, and a `?` that starts the next
+  line was taken for a character literal at a statement's start ("unexpected
+  '?'"): prev_nonspace now looks past `\` + newline. rbs's
+  value_object_generator.rb writes `x.nil? \` and then `? a : b`.
+  corpus/762.
+- `module_function` copied a define_method body WITHOUT its closure: the copy
+  of `define_method(:x) { v }` read `v` as a method call. A C method is such
+  a body, holding the function it calls, so erb's
+  `include ERB::Escape; module_function :html_escape` -- how every Rails
+  template escapes -- raised NoMethodError for `__capi_m`. modfunc_promote
+  copies as alias does (copy_meth_src). corpus/763.
+- CLASS_OF of an instance of a builtin's subclass was the builtin: a String
+  of `class Blob < String` is a primitive tagged with its class, and
+  capi_describe answered class_name. sqlite3 binds a SQLite3::Blob as a BLOB
+  by its class, so it stored text and read it back in UTF-8. It answers
+  dispatch_cls_of now. Four contracts (`class_of` in the fixture).
+
+**Found, not fixed here**: `module_function :m` of an INHERITED m leaves no
+private `m` in the module itself (`private_instance_methods(false)` is `[]`
+where ruby lists it).
+
 ## 2026-11-17 (73): test_ast's margin -- what every assertion runs, and a block's number
 
 test_ast fits CI's 600 s since LOOP (57), with 47 s to spare on the slower of

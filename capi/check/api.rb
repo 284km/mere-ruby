@@ -252,6 +252,15 @@ end
 check(through_public_send == ['x', 'x'])
 check(Object.class_eval { /(y)/ =~ 'y'; [$1, A.last_match(1)] } == ['y', 'y'])
 check(Object.module_eval { /(z)/ =~ 'z'; [$1, A.last_match(1)] } == ['z', 'z'])
+# (CLASS_OF of an instance of a builtin's subclass is the subclass: sqlite3
+#  binds a SQLite3::Blob, a String subclass, as a BLOB by its class)
+class SubString < String; end
+class SubArray < Array; end
+class SubHash < Hash; end
+check(A.class_of(SubString.new('x')) == SubString)
+check(A.class_of(SubArray.new([1])) == SubArray)
+check(A.class_of(SubHash.new) == SubHash)
+check(A.class_of('plain') == String && A.class_of([]) == Array && A.class_of({}) == Hash)
 check(A.strtoul('  0x1fz', 0) == [31, 6])
 check(A.strtoul('-12', 10) == [2**64 - 12, 3])
 check(A.strtoul('777', 8) == [511, 3])
