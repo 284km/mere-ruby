@@ -69,6 +69,8 @@ def run(key, side, command, cwd, extra=None, lib=None):
         env['RUBYLIB'] = os.pathsep.join(path)
     env['LANG'] = 'en_US.UTF-8'
     env['CAPI_CHECK_SIDE'] = side
+    if side == 'mere':
+        env['MERE_RUBY_STDLIB_FALLBACK'] = stdlib
     env.update(extra or {})
     log = OUT / f'{key}.{side}.out'
     old = Path.cwd()
