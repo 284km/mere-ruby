@@ -5664,6 +5664,49 @@ last item.
 - Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 923 of 1024 (was
   892 on main: the translation and the caches keep top-level tables).
 
+## 2026-11-21 (65): what Rails' own dependencies build, on the C API
+
+Rails 8.1 installs on main now (issue #116: #95 and #120), and the next
+stages -- boot, the application's tests, Puma serving HTTP -- run the C
+extensions of its dependencies. Thirteen of its 68 locked gems have one.
+`tools/capi_gem_check.py` builds five more of them at railstest/'s versions,
+on both rubies, and uses them the same way: erb (its escape, which
+ERB::Util.html_escape is), rbs (a C parser building Ruby AST objects),
+websocket-driver (the frame mask), puma (the HTTP request parser) and sqlite3
+on the system's SQLite (BLOBs, a Ruby function SQL calls, transactions,
+errors). Each prints whether the extension it loaded is the gem home's.
+json, date, bigdecimal, io-console and prism build too, but mere-ruby
+loads its own library of the same name before an activated gem's extension
+(issue #127, PR #128): what they would compare is not the C API.
+
+**What it found** (each reproduced against ruby first):
+
+- `class <<self` with no space was a here document whose terminator is
+  "self": the rest of the file was its body, and `require "rbs"` a
+  SyntaxError. parse.y opens none after the keyword `class` (EXPR_CLASS);
+  after_class_kw says so (and `obj.class <<X`, a method named class, keeps
+  its argument). corpus/761.
+- A backslash that ends a line continues it, and a `?` that starts the next
+  line was taken for a character literal at a statement's start ("unexpected
+  '?'"): prev_nonspace now looks past `\` + newline. rbs's
+  value_object_generator.rb writes `x.nil? \` and then `? a : b`.
+  corpus/762.
+- `module_function` copied a define_method body WITHOUT its closure: the copy
+  of `define_method(:x) { v }` read `v` as a method call. A C method is such
+  a body, holding the function it calls, so erb's
+  `include ERB::Escape; module_function :html_escape` -- how every Rails
+  template escapes -- raised NoMethodError for `__capi_m`. modfunc_promote
+  copies as alias does (copy_meth_src). corpus/763.
+- CLASS_OF of an instance of a builtin's subclass was the builtin: a String
+  of `class Blob < String` is a primitive tagged with its class, and
+  capi_describe answered class_name. sqlite3 binds a SQLite3::Blob as a BLOB
+  by its class, so it stored text and read it back in UTF-8. It answers
+  dispatch_cls_of now. Four contracts (`class_of` in the fixture).
+
+**Found, not fixed here**: `module_function :m` of an INHERITED m leaves no
+private `m` in the module itself (`private_instance_methods(false)` is `[]`
+where ruby lists it).
+
 ## 2026-11-17 (73): test_ast's margin -- what every assertion runs, and a block's number
 
 test_ast fits CI's 600 s since LOOP (57), with 47 s to spare on the slower of
@@ -6981,3 +7024,40 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+
+### PR review: lexer context for continuations and class method heredocs
+
+Record a continued newline only when the lexer consumes a backslash in code.
+Comment and literal scanners never record it. Nested interpolation lexers use
+separate invocation numbers and restore their parent's context; consumed
+continuation entries are removed after lexing. The existing tc_st map holds
+this context, with no additional top-level state. after_class_kw also checks
+the preceding significant character across whitespace, so receiver `. class`
+and `:: class` calls keep their bare, indented and quoted heredoc arguments.
+Changed functions: lex_go, new lex_go_step/lex_cont_key/lex_cont_go,
+lex_go_b, after_class_kw and prev_nonspace. Corpus761/762 adds both review
+reproductions, tab/newline separators, comment-ending backslashes, quoted
+hash bytes, real continuations, nested interpolation and repeated eval.
+
+Normal O2 with the CI-pinned compiler01f5ad73: **721/721 corpus** matches
+Ruby4.0.9 with hash index ON/OFF, **483.813s / 1,089,488KiB** peak family
+RSS. All nine existing RSS gates, roots, dead definitions and C depth155/1024
+pass. Corpus761-763 matches all36 evaluator/default/strict-VM and hash/MRO
+comparisons. Three complete original Parse/Syntax/Literal files retain
+**300 MATCH / 1 RED / 2 BOTH** across303 cases, identical per-file counts
+to successful main d9826ac9. The existing Syntax invalid-symbol leak Timeout
+and both reference skips stay visible. An initial nonexistent test_heredoc.rb
+selection was rejected as incomplete; only the real test_literal.rb result
+is counted here. No original tests, exclusions, API or resource limits change.
+Hosted checks must still finish on the updated head before merging.
+
+The follow-up review found the receiver's separator lost again when a comment
+or a continuation stands between it and `class` (`p o. # note`, then
+` class <<-EOS`; also `o::`, and a comment-only line between). The lexer now
+records each comment it skips the way it records a continuation -- keyed by
+the newline that ends it, holding where it began, removed once the rest of
+the source is lexed (lex_comment_key) -- and after_class_kw's look back
+passes over both. corpus/761 holds the five forms, and a real
+`class <<self` after comment lines. 721/721, the VM's 761-763 the same, and
+the twelve gems the same on both sides.
