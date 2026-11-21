@@ -5,6 +5,18 @@ stderr in CI's `gem-suites-*` artifacts identify individual failed tests.
 Symptoms below are observed; an unconfirmed cause is explicitly marked.
 None is excluded from the measurement to improve its score.
 
+Rake 13.2.1 contributes 46 MATCH files with its complete four-package child
+dependency closure. Time ordering now follows the actual comparison
+protocol; adjacent Symbol arguments after dotted calls parse; main's super
+lookup retains its extended-module chain (703-705). The existing Ruby
+FileUtils.touch implementation is used unchanged. Earlier preparation counts
+with incomplete child environments are not baselines.
+
+A separate Time singleton <=> override can still recurse through the native
+ordered-comparison dispatcher on both the paired base and candidate. That
+pre-existing case is outside Rake's now-passing files. Record it as a Ruby
+semantics coordination gap in the shared dispatcher, not a VM or GC cause.
+
 Additional pinned suites: Matrix has 2 MATCH files; Logger has 4 MATCH and
 1 RED. Primitive super now stops at Hash/Array/String/Proc's actual native
 ancestor before a Ruby method farther up the chain. The actual Test::Unit
@@ -289,6 +301,12 @@ total MATCH counts from a different gained file. Route the producer/reader
 resource investigation to the VM/performance session; no specific VM or GC
 cause is established. Keep the 600-second/2-GiB bounds and parent baseline.
 
+The latest reviewed #107 hosted macOS observation (44282560161, merge source
+1d0164ee) passes the unchanged original gate: 54 MATCH / 7 RED / 1 MEMORY.
+Multipart completes all 85 tests / 239 assertions with both source audits,
+at 2,037,376 KiB peak. The source of the local/hosted resource variation is
+still unconfirmed. Keep the stronger stored baseline, the failed local
+candidate and the successful hosted observation; neither erases the other.
 The subsequent strict rounds 19-21 macOS run 44292334030 again loses multipart
 to MEMORY. Keep that failure alongside #107's preceding successful hosted
 observation. The cause of this variation remains open. Separately, strict

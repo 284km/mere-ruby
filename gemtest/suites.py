@@ -198,7 +198,7 @@ def run_side(args, suite, file, side, env, output, lock):
         side_env = dict(env, MERE_SUITE_RUBY_LIB=str(args.ruby_src / 'lib'),
                         MERE_SUITE_SOURCE_ROOT=str(source), MERE_SUITE_SOURCE_RECORD=str(source_record),
                         RUBY=str(binary), UNITTEST_CHILD_RUBY=str(binary),
-                        RUBYLIB=os.pathsep.join(map(str, libraries)),
+                        RUBYLIB=os.pathsep.join(map(str, libraries + args.runtime_paths[side] + [args.ruby_src / 'lib'])),
                         PATH=str(ROOT / 'unittest/child-bin') + os.pathsep + env.get('PATH', os.defpath))
         result = supervise([sys.executable, '-c', EXEC, str(source), str(stdout), str(stderr)] + command,
                            side_env, output / (side + '.monitor'), RSS_KB, WALL)
@@ -250,6 +250,10 @@ def measure(args, lock):
     subprocess.run(['git', '-C', str(args.ruby_src), 'diff', '--exit-code', 'HEAD', '--', 'lib'], check=True, stdout=subprocess.DEVNULL)
     if (ROOT / '.build_mode').read_text().strip() != 'O2':
         raise ValueError('measurement requires an O2 build')
+    args.runtime_paths = {
+        side: call(['sh', str(ROOT / 'tools/runtime_load_path.sh'), str(binary)], timeout=20).split(os.pathsep)
+        for side, binary in [('reference', args.reference), ('mere', args.binary)]
+    }
     args.output.mkdir(parents=True, exist_ok=False)
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(('RUBY', 'GEM_', 'BUNDLE_', 'MERE_', 'MT_')) and key not in ('COVERAGE', 'SEPARATE')}
