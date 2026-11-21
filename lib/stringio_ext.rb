@@ -5,6 +5,9 @@
 # wraps; every method was measured against the reference. Shipped through
 # tools/gen_pathname_lib.rb.
 class StringIO
+  # Keep backing state in the interpreter's internal ivar namespace. Ruby's
+  # native StringIO exposes only variables added by callers; serializers must
+  # not traverse its buffer, flags or shared position as ordinary ivars.
   VERSION = "3.2.0"
   MAX_LENGTH = 9223372036854775807
 
@@ -18,7 +21,7 @@ class StringIO
   # (StringIO.new(nil) is the null device: it has no string, reads nothing
   #  and drops what is written)
   def string
-    @st.null ? nil : @st.string
+    @__sio_st.null ? nil : @__sio_st.string
   end
   # ⚠ `attr_accessor :string` gave a plain writer, so `io.string = obj`
   #   stored WHATEVER it was handed. ruby converts with #to_str and refuses
@@ -26,19 +29,19 @@ class StringIO
   def string=(str)
     raise FrozenError, "can't modify frozen StringIO: " + inspect if frozen?
     str = StringIO.__to_str(str) unless str.is_a?(String)
-    @st.string = str
-    @st.null = false
-    @st.pos = 0
-    @st.lineno = 0
+    @__sio_st.string = str
+    @__sio_st.null = false
+    @__sio_st.pos = 0
+    @__sio_st.lineno = 0
     str
   end
-  def pos = @st.pos
+  def pos = @__sio_st.pos
   def internal_encoding; nil; end
 
   # What #set_encoding named, or else the buffer's own encoding -- which
   # follows the string if its encoding is changed behind the stream's back.
   def external_encoding
-    @enc || @st.string.encoding
+    @__sio_enc || @__sio_st.string.encoding
   end
 
   # Sets the buffer's encoding too, unless the buffer is frozen; the stream
@@ -48,7 +51,7 @@ class StringIO
     #  start names another -- which is then stepped over)
     if ext.is_a?(String) && ext.start_with?("BOM|")
       set_encoding(ext[4..])
-      set_encoding_by_bom if @readable && !@st.null
+      set_encoding_by_bom if @__sio_readable && !@__sio_st.null
       return self
     end
     enc = if ext.nil?
@@ -58,10 +61,10 @@ class StringIO
           else
             Encoding.find(ext.to_s.split(":")[0])
           end
-    @enc = enc
+    @__sio_enc = enc
     # (a chilled literal keeps its encoding: changing it would be the change
     #  ruby warns about, and strio_set_encoding leaves such a string alone)
-    @st.string.force_encoding(enc) if @st.string && !@st.string.frozen? && !@st.string.__chilled?
+    @__sio_st.string.force_encoding(enc) if @__sio_st.string && !@__sio_st.string.frozen? && !@__sio_st.string.__chilled?
     self
   end
 
@@ -79,7 +82,7 @@ class StringIO
   end
 
   def __drop_string
-    @st.string = nil
+    @__sio_st.string = nil
   end
 
   def self.__to_str(obj)
@@ -104,30 +107,30 @@ class StringIO
     attr_accessor :string, :pos, :lineno, :null
   end
   private_constant :State
-  def __st = @st
+  def __st = @__sio_st
   def initialize_copy(other)
     super
-    @st = other.__st
+    @__sio_st = other.__st
     self
   end
   def initialize(string = NO_STRING, mode = nil, **opts)
-    @st = State.new
+    @__sio_st = State.new
     # ⚠ THE STRING ITSELF, not a copy of it: ruby aliases it, which is the
     #   whole point of `StringIO.new(buf)`. And the conversion is #to_str,
     #   not #to_s -- a wrong argument must not become a plausible buffer.
     # no string at all is a new one in the default external encoding
-    @st.null = string.nil?
+    @__sio_st.null = string.nil?
     string = (+"").force_encoding(Encoding.default_external) if string.nil? || string.equal?(NO_STRING)
-    @st.string = (string.is_a?(String) ? string : StringIO.__to_str(string))
+    @__sio_st.string = (string.is_a?(String) ? string : StringIO.__to_str(string))
     # mode: may come as a keyword instead (both at once is an error)
     if opts.key?(:mode)
       raise ArgumentError, "mode specified twice" if !mode.nil? && !opts[:mode].nil?
       mode = opts[:mode] if mode.nil?
     end
-    @st.pos = 0
-    @st.lineno = 0
-    @closed = false
-    @enc = nil
+    @__sio_st.pos = 0
+    @__sio_st.lineno = 0
+    @__sio_closed = false
+    @__sio_enc = nil
     mode = StringIO.__to_str(mode) unless mode.nil? || mode.is_a?(Integer) || mode.is_a?(String)
     # the keyword options may not say again what the mode already says
     raise ArgumentError, "both textmode and binmode specified" if opts[:binmode] && opts[:textmode]
@@ -146,65 +149,65 @@ class StringIO
     if mode.is_a?(Integer)
       # IO::RDONLY / WRONLY / RDWR, with APPEND and TRUNC
       acc = mode & 3
-      @readable = acc != IO::WRONLY
-      @writable = acc != IO::RDONLY
-      @append = (mode & IO::APPEND) != 0
+      @__sio_readable = acc != IO::WRONLY
+      @__sio_writable = acc != IO::RDONLY
+      @__sio_append = (mode & IO::APPEND) != 0
       trunc = (mode & IO::TRUNC) != 0
     else
       # a frozen string is read-only when no mode says otherwise
-      m = mode.nil? ? (@st.string.frozen? ? "r" : "r+") : mode.to_s
+      m = mode.nil? ? (@__sio_st.string.frozen? ? "r" : "r+") : mode.to_s
       # (r / w / a, a +, b or t: `x`, `rx` and `rbt` are "invalid access mode")
       unless m.match?(/\A[rwa]\+?[bt]?\z/) || m.match?(/\A[rwa][bt]\+\z/)
         raise ArgumentError, "invalid access mode " + m
       end
-      @readable = m.start_with?("r") || m.include?("+")
-      @writable = !m.start_with?("r") || m.include?("+")
+      @__sio_readable = m.start_with?("r") || m.include?("+")
+      @__sio_writable = !m.start_with?("r") || m.include?("+")
       # ⚠ "a" leaves the position at 0 and sends every WRITE to the end,
       #   even after a seek.
-      @append = m.start_with?("a")
+      @__sio_append = m.start_with?("a")
       trunc = m.start_with?("w")
     end
     # a frozen buffer cannot be opened for writing: EACCES, as a read-only
     # file would be
-    raise Errno::EACCES if @writable && @st.string.frozen?
+    raise Errno::EACCES if @__sio_writable && @__sio_st.string.frozen?
     # what the stream was OPENED as, which close_read/close_write ask about --
     # the flags above are the CURRENT state and a close clears them.
-    @readable_mode = @readable
-    @writable_mode = @writable
+    @__sio_readable_mode = @__sio_readable
+    @__sio_writable_mode = @__sio_writable
     # ⚠ `StringIO.new { }` does not run the block; it warns and says to use
     # ::open.
     warn("warning: StringIO::new() does not take block; use StringIO::open() instead") if block_given?
     # "w" TRUNCATES the string it was given rather than swapping in a fresh
     # one: the caller still holds the object and expects to see it emptied.
-    @st.string.replace((+"").force_encoding(@st.string.encoding)) if trunc
+    @__sio_st.string.replace((+"").force_encoding(@__sio_st.string.encoding)) if trunc
     binmode if opts[:binmode]
     set_encoding(enc_name.split(":")[0]) if enc_name && !enc_name.empty?
   end
 
   def close
-    @closed = true
-    @readable = false
-    @writable = false
+    @__sio_closed = true
+    @__sio_readable = false
+    @__sio_writable = false
     nil
   end
 
   def closed?
-    @closed || (!@readable && !@writable)
+    @__sio_closed || (!@__sio_readable && !@__sio_writable)
   end
 
   def eof?
-    @st.pos >= @st.string.bytesize
+    @__sio_st.pos >= @__sio_st.string.bytesize
   end
 
   def size
-    @st.string.bytesize
+    @__sio_st.string.bytesize
   end
 
   alias length size
 
   def rewind
-    @st.pos = 0
-    @st.lineno = 0
+    @__sio_st.pos = 0
+    @__sio_st.lineno = 0
     0
   end
 
@@ -220,15 +223,15 @@ class StringIO
     whence = { SET: 0, CUR: 1, END: 2 }[whence] || whence if whence.is_a?(Symbol)
     raise Errno::EINVAL unless whence == 0 || whence == 1 || whence == 2
     np = if whence == 2
-           @st.string.bytesize + amount
+           @__sio_st.string.bytesize + amount
          elsif whence == 1
-           @st.pos + amount
+           @__sio_st.pos + amount
          else
            amount
          end
     # ⚠ no message: this interpreter prefixes the system text itself.
     raise Errno::EINVAL if np < 0
-    @st.pos = np
+    @__sio_st.pos = np
     0
   end
 
@@ -261,21 +264,21 @@ class StringIO
     __sio_check_read
     len = __sio_len(len)
     buf = __sio_buf(buf)
-    total = @st.string.bytesize
+    total = @__sio_st.string.bytesize
     # (the null device reads nothing but a zero length)
-    return nil if @st.null && len != 0
+    return nil if @__sio_st.null && len != 0
     if len.nil?
-      part = @st.pos >= total ? (+"").force_encoding(external_encoding) : @st.string.byteslice(@st.pos, total - @st.pos).force_encoding(external_encoding)
-      @st.pos = total if @st.pos < total
+      part = @__sio_st.pos >= total ? (+"").force_encoding(external_encoding) : @__sio_st.string.byteslice(@__sio_st.pos, total - @__sio_st.pos).force_encoding(external_encoding)
+      @__sio_st.pos = total if @__sio_st.pos < total
     else
       if len == 0
         part = "".b
-      elsif @st.pos >= total
+      elsif @__sio_st.pos >= total
         buf.replace((+"").force_encoding(buf.encoding)) if buf
         return nil
       else
-        part = @st.string.byteslice(@st.pos, len).b
-        @st.pos += part.bytesize
+        part = @__sio_st.string.byteslice(@__sio_st.pos, len).b
+        @__sio_st.pos += part.bytesize
       end
     end
     return part unless buf
@@ -298,10 +301,10 @@ class StringIO
     return (buf.nil? ? "".b : buf) if len == 0
     raise Errno::EINVAL, "pread: Invalid offset argument: " + offset.to_s if offset < 0
     buf = __sio_buf(buf)
-    if @st.null || offset >= @st.string.bytesize
+    if @__sio_st.null || offset >= @__sio_st.string.bytesize
       raise EOFError, "end of file reached"
     else
-      part = @st.string.byteslice(offset, len).b
+      part = @__sio_st.string.byteslice(offset, len).b
     end
     return part unless buf
     buf.replace(part)
@@ -311,17 +314,17 @@ class StringIO
 
   # The character boundary at or after byte `i`: a limit never splits one.
   def __sio_char_end(i)
-    total = @st.string.bytesize
+    total = @__sio_st.string.bytesize
     return total if i >= total
-    if @st.string.encoding == Encoding::UTF_8
-      i += 1 while i < total && (@st.string.getbyte(i) & 0xC0) == 0x80
+    if @__sio_st.string.encoding == Encoding::UTF_8
+      i += 1 while i < total && (@__sio_st.string.getbyte(i) & 0xC0) == 0x80
       return i
     end
-    return i if @st.string.encoding.ascii_compatible? && @st.string.ascii_only?
+    return i if @__sio_st.string.encoding.ascii_compatible? && @__sio_st.string.ascii_only?
     # (UTF-16/32 and the rest: the cut is moved until the piece is whole,
     #  at most a character's worth of bytes)
     j = i
-    while j < total && j - i < 4 && !@st.string.byteslice(@st.pos, j - @st.pos).valid_encoding?
+    while j < total && j - i < 4 && !@__sio_st.string.byteslice(@__sio_st.pos, j - @__sio_st.pos).valid_encoding?
       j += 1
     end
     j
@@ -363,7 +366,7 @@ class StringIO
     limit = nil if limit && limit < 0
     return nil if eof?
     return (+"").force_encoding(external_encoding) if limit == 0
-    total = @st.string.bytesize
+    total = @__sio_st.string.bytesize
     para_sep = false
     if sep.nil?
       stop = total
@@ -372,41 +375,41 @@ class StringIO
       if paragraph
         # (a paragraph starts past the blank lines, LF or CRLF, and ends
         #  with the blank lines after it)
-        @st.pos += __sio_nl_at(@st.pos) while @st.pos < total && __sio_nl_at(@st.pos) > 0
-        return nil if @st.pos >= total
-        r = __sio_para_end(@st.pos)
+        @__sio_st.pos += __sio_nl_at(@__sio_st.pos) while @__sio_st.pos < total && __sio_nl_at(@__sio_st.pos) > 0
+        return nil if @__sio_st.pos >= total
+        r = __sio_para_end(@__sio_st.pos)
         stop = r ? r : total
         para_sep = !r.nil?
       else
         # (the separator in the buffer's encoding: a UTF-16 buffer's "\n"
         #  is two bytes -- test_gets_utf_16)
-        if !@st.string.encoding.ascii_compatible? && sep.encoding != @st.string.encoding
+        if !@__sio_st.string.encoding.ascii_compatible? && sep.encoding != @__sio_st.string.encoding
           sep = begin
-                  sep.encode(@st.string.encoding)
+                  sep.encode(@__sio_st.string.encoding)
                 rescue EncodingError
                   sep
                 end
         end
-        idx = @st.string.b.byteindex(sep.b, @st.pos)
+        idx = @__sio_st.string.b.byteindex(sep.b, @__sio_st.pos)
         stop = idx.nil? ? total : idx + sep.bytesize
       end
     end
-    stop = __sio_char_end(@st.pos + limit) if limit && @st.pos + limit < stop
-    line = @st.string.byteslice(@st.pos, stop - @st.pos).force_encoding(external_encoding)
-    @st.pos = stop
-    @st.lineno += 1
+    stop = __sio_char_end(@__sio_st.pos + limit) if limit && @__sio_st.pos + limit < stop
+    line = @__sio_st.string.byteslice(@__sio_st.pos, stop - @__sio_st.pos).force_encoding(external_encoding)
+    @__sio_st.pos = stop
+    @__sio_st.lineno += 1
     if chomp && sep
       line = paragraph ? (para_sep ? line.sub(/(\r?\n)+\z/, "") : line) : __sio_chomp(line, sep)
     end
-    $. = @st.lineno
+    $. = @__sio_st.lineno
     line
   end
 
   # the length of the newline at byte i: 1 for LF, 2 for CRLF, 0 for none
   def __sio_nl_at(i)
-    b = @st.string.getbyte(i)
+    b = @__sio_st.string.getbyte(i)
     return 1 if b == 10
-    return 2 if b == 13 && @st.string.getbyte(i + 1) == 10
+    return 2 if b == 13 && @__sio_st.string.getbyte(i + 1) == 10
     0
   end
 
@@ -414,7 +417,7 @@ class StringIO
   # its last line and every blank line after it; nil when no blank line
   # follows (the rest of the buffer is the paragraph)
   def __sio_para_end(from)
-    total = @st.string.bytesize
+    total = @__sio_st.string.bytesize
     i = from
     while i < total
       n = __sio_nl_at(i)
@@ -463,8 +466,8 @@ class StringIO
   def getc
     __sio_check_read
     return nil if eof?
-    ch = @st.string.byteslice(@st.pos, 4).force_encoding(external_encoding)[0]
-    @st.pos += ch.bytesize
+    ch = @__sio_st.string.byteslice(@__sio_st.pos, 4).force_encoding(external_encoding)[0]
+    @__sio_st.pos += ch.bytesize
     ch
   end
 
@@ -472,22 +475,22 @@ class StringIO
   # are enough of them, otherwise in front of what is left (a position past
   # the end is padded with NULs first).
   def __sio_unget(s)
-    return nil if @st.null
-    raise IOError, "not modifiable string" if @st.string.frozen?
-    if @st.pos > @st.string.bytesize
-      @st.string.replace((@st.string.b + ("\0" * (@st.pos - @st.string.bytesize))).force_encoding(@st.string.encoding))
+    return nil if @__sio_st.null
+    raise IOError, "not modifiable string" if @__sio_st.string.frozen?
+    if @__sio_st.pos > @__sio_st.string.bytesize
+      @__sio_st.string.replace((@__sio_st.string.b + ("\0" * (@__sio_st.pos - @__sio_st.string.bytesize))).force_encoding(@__sio_st.string.encoding))
     end
     n = s.bytesize
-    enc = @st.string.encoding
-    if n <= @st.pos
-      head = @st.string.byteslice(0, @st.pos - n).b
-      tail = @st.string.byteslice(@st.pos, @st.string.bytesize - @st.pos).b
-      @st.string.replace((head + s.b + tail).force_encoding(enc))
-      @st.pos -= n
+    enc = @__sio_st.string.encoding
+    if n <= @__sio_st.pos
+      head = @__sio_st.string.byteslice(0, @__sio_st.pos - n).b
+      tail = @__sio_st.string.byteslice(@__sio_st.pos, @__sio_st.string.bytesize - @__sio_st.pos).b
+      @__sio_st.string.replace((head + s.b + tail).force_encoding(enc))
+      @__sio_st.pos -= n
     else
-      tail = @st.string.byteslice(@st.pos, @st.string.bytesize - @st.pos).b
-      @st.string.replace((s.b + tail).force_encoding(enc))
-      @st.pos = 0
+      tail = @__sio_st.string.byteslice(@__sio_st.pos, @__sio_st.string.bytesize - @__sio_st.pos).b
+      @__sio_st.string.replace((s.b + tail).force_encoding(enc))
+      @__sio_st.pos = 0
     end
     nil
   end
@@ -513,7 +516,7 @@ class StringIO
     n = 0
     args.each do |a|
       s = a.to_s
-      enc = @st.string.encoding
+      enc = @__sio_st.string.encoding
       # ⚠ into the stream's encoding, as strio_write converts: a UTF-8
       # "hello" written to a UTF-16BE stream was stored as its UTF-8 bytes.
       # BINARY and US-ASCII on either side mean the bytes are taken as they are.
@@ -534,31 +537,31 @@ class StringIO
       end
       # (a write at the very end of what a position can be: ArgumentError,
       #  not an allocation of that many NULs)
-      raise ArgumentError, "pos + len overflows" if @st.pos > MAX_LENGTH - s.bytesize
-      next if @st.null
+      raise ArgumentError, "pos + len overflows" if @__sio_st.pos > MAX_LENGTH - s.bytesize
+      next if @__sio_st.null
       # (an ASCII-only buffer labelled US-ASCII takes the encoding of the
       #  first non-ASCII string written, as rb_enc_cr_str_buf_cat does)
-      if enc == Encoding::US_ASCII && !s.ascii_only? && s.encoding != Encoding::BINARY && !@st.string.frozen?
-        @st.string.force_encoding(s.encoding)
+      if enc == Encoding::US_ASCII && !s.ascii_only? && s.encoding != Encoding::BINARY && !@__sio_st.string.frozen?
+        @__sio_st.string.force_encoding(s.encoding)
         enc = s.encoding
       end
-      @st.pos = @st.string.bytesize if @append
-      size = @st.string.bytesize
+      @__sio_st.pos = @__sio_st.string.bytesize if @__sio_append
+      size = @__sio_st.string.bytesize
       # ⚠ AT THE END OF THE STREAM A WRITE IS AN APPEND, and is made as
       #   one: the splice below rebuilds the whole string, so writing a
       #   log line by line was quadratic (20,000 writes of 2 bytes, the
       #   common case, took seconds). append_as_bytes is the same bytes
       #   with the encoding left alone, which is what the splice makes.
-      if @st.pos == size
-        @st.string.append_as_bytes(s)
+      if @__sio_st.pos == size
+        @__sio_st.string.append_as_bytes(s)
       else
-        head = @st.string.byteslice(0, @st.pos < size ? @st.pos : size).b
-        head << ("\0" * (@st.pos - size)) if @st.pos > size
-        rest_at = @st.pos + s.bytesize
-        tail = rest_at < size ? @st.string.byteslice(rest_at, size - rest_at).b : "".b
-        @st.string.replace((head + s.b + tail).force_encoding(enc))
+        head = @__sio_st.string.byteslice(0, @__sio_st.pos < size ? @__sio_st.pos : size).b
+        head << ("\0" * (@__sio_st.pos - size)) if @__sio_st.pos > size
+        rest_at = @__sio_st.pos + s.bytesize
+        tail = rest_at < size ? @__sio_st.string.byteslice(rest_at, size - rest_at).b : "".b
+        @__sio_st.string.replace((head + s.b + tail).force_encoding(enc))
       end
-      @st.pos += s.bytesize
+      @__sio_st.pos += s.bytesize
       n += s.bytesize
     end
     n
@@ -631,12 +634,12 @@ class StringIO
       len = len.to_int
     end
     raise Errno::EINVAL, "negative length" if len < 0
-    size = @st.string.bytesize
-    enc = @st.string.encoding
+    size = @__sio_st.string.bytesize
+    enc = @__sio_st.string.encoding
     if len < size
-      @st.string.replace(@st.string.byteslice(0, len).force_encoding(enc))
+      @__sio_st.string.replace(@__sio_st.string.byteslice(0, len).force_encoding(enc))
     else
-      @st.string.replace((@st.string.b + ("\0" * (len - size))).force_encoding(enc))
+      @__sio_st.string.replace((@__sio_st.string.b + ("\0" * (len - size))).force_encoding(enc))
     end
     0
   end
@@ -669,14 +672,14 @@ class StringIO
   # and each_line advance it, and #getc does not.
 
   def __sio_check_read
-    raise IOError, "not opened for reading" unless @readable
+    raise IOError, "not opened for reading" unless @__sio_readable
   end
 
   def __sio_check_write
     raise FrozenError, "can't modify frozen StringIO: " + inspect if frozen?
-    raise IOError, "not opened for writing" unless @writable
+    raise IOError, "not opened for writing" unless @__sio_writable
     # (a buffer frozen after the stream opened: ruby says the same)
-    raise IOError, "not opened for writing" if !@st.null && @st.string.frozen?
+    raise IOError, "not opened for writing" if !@__sio_st.null && @__sio_st.string.frozen?
   end
   private :__sio_check_read
   private :__sio_check_write
@@ -694,26 +697,26 @@ class StringIO
   end
 
   def closed_read?
-    !@readable
+    !@__sio_readable
   end
 
   def closed_write?
-    !@writable
+    !@__sio_writable
   end
 
   def lineno
-    @st.lineno
+    @__sio_st.lineno
   end
 
   def lineno=(n)
-    @st.lineno = n
+    @__sio_st.lineno = n
   end
 
   def getbyte
     __sio_check_read
-    return nil if @st.pos >= @st.string.bytesize
-    b = @st.string.getbyte(@st.pos)
-    @st.pos += 1
+    return nil if @__sio_st.pos >= @__sio_st.string.bytesize
+    b = @__sio_st.string.getbyte(@__sio_st.pos)
+    @__sio_st.pos += 1
     b
   end
 
@@ -814,28 +817,28 @@ class StringIO
     other = other.to_strio if mode.nil? && !other.nil? && !other.is_a?(String) && !other.is_a?(StringIO) && other.respond_to?(:to_strio)
     if other.is_a?(StringIO)
       # (shared, as dup shares it: the position moves in both)
-      @st = other.__st
-      @readable = other.__sio_readable
-      @writable = other.__sio_writable
-      @readable_mode = @readable
-      @writable_mode = @writable
-      @append = false
-      @closed = false
+      @__sio_st = other.__st
+      @__sio_readable = other.__sio_readable
+      @__sio_writable = other.__sio_writable
+      @__sio_readable_mode = @__sio_readable
+      @__sio_writable_mode = @__sio_writable
+      @__sio_append = false
+      @__sio_closed = false
       return self
     end
     initialize(other.nil? ? +"" : other, mode)
     self
   end
 
-  def __sio_readable = @readable
-  def __sio_writable = @writable
+  def __sio_readable = @__sio_readable
+  def __sio_writable = @__sio_writable
 
   # A byte-order mark picks the encoding and is stepped over. UTF-32LE's
   # mark begins with UTF-16LE's, so it is asked first.
   def set_encoding_by_bom
     raise FrozenError, "can't modify frozen StringIO: " + inspect if frozen?
-    return nil unless @readable
-    b = @st.string.byteslice(0, 4).bytes
+    return nil unless @__sio_readable
+    b = @__sio_st.string.byteslice(0, 4).bytes
     enc, len =
       if b[0, 3] == [0xEF, 0xBB, 0xBF] then [Encoding::UTF_8, 3]
       elsif b == [0xFF, 0xFE, 0, 0] then [Encoding::UTF_32LE, 4]
@@ -846,7 +849,7 @@ class StringIO
       end
     return nil unless enc
     set_encoding(enc)
-    @st.pos = len
+    @__sio_st.pos = len
     enc
   end
 
@@ -863,8 +866,8 @@ class StringIO
   # `binmode` puts the buffer into ASCII-8BIT, which is what
   # `external_encoding` reports afterwards.
   def binmode
-    @enc = Encoding::BINARY
-    @st.string.force_encoding(Encoding::BINARY) unless @st.string.frozen?
+    @__sio_enc = Encoding::BINARY
+    @__sio_st.string.force_encoding(Encoding::BINARY) unless @__sio_st.string.frozen?
     self
   end
 
@@ -873,7 +876,7 @@ class StringIO
   def pos=(n)
     n = n.to_int if !n.is_a?(Integer) && n.respond_to?(:to_int)
     raise Errno::EINVAL if n < 0
-    @st.pos = n
+    @__sio_st.pos = n
   end
 
   # ⚠ `eof` must BE `eof?`, not call it: the spec compares the two
@@ -884,17 +887,17 @@ class StringIO
   # is not an error.
   def close_read
     raise IOError, "closing non-duplex IO for reading" unless __opened_readable?
-    @readable = false
+    @__sio_readable = false
     nil
   end
 
   def close_write
     raise IOError, "closing non-duplex IO for writing" unless __opened_writable?
-    @writable = false
+    @__sio_writable = false
     nil
   end
 
-  def __opened_readable? = @readable_mode
-  def __opened_writable? = @writable_mode
+  def __opened_readable? = @__sio_readable_mode
+  def __opened_writable? = @__sio_writable_mode
   private :__opened_readable?, :__opened_writable?
 end
