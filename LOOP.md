@@ -6384,6 +6384,78 @@ TypeError and concrete subclass name. The previous build raises NoMethodError
 or accepts conversion instead.
 
 
+## 2026-11-19: SHA-2 checksums in real gem installation
+
+The locked Rails intake (#117) gets beyond mkmf on the unmerged C API
+candidate, then reaches the unchanged 600-second install bound before
+Nokogiri is extracted. Its 4,387,328-byte archive exposes the interpreted
+SHA-2 loop. The existing OpenSSL provider computes the same hash quickly.
+
+Digest::SHA256/384/512 now use that internal provider when RubyGems or
+another caller has already loaded it. Digest itself loads no extra library;
+without the provider the original portable algorithm remains. Named
+singleton methods and private portable aliases preserve Ractor use. The
+provider's binary Array/Hash packing uses explicit empty separators so $,
+cannot enter the request. Public OpenSSL::Digest overrides are not callbacks
+for these standard Digest operations. No public API, API inventory, native
+ABI, collector, VM/ISeq or dispatcher function changes, or new top-level
+Mere values. lib/openssl_backend.rb and its generated embedding agree.
+
+The original Digest files retain 80/80, 24/24 and 6/6 MATCH; OpenSSL Digest
+retains 14/14 against successful main 12ca1df2. The full corpus is 704/704
+with both hash modes. Witness 715 covers binary and block boundaries,
+files, incremental/cloned/reset state, SHA2 selection, OFS, Ractors and
+independence from public provider overrides; it was renamed byte-for-byte
+from provisional 714 after an origin collision and rechecked in both modes.
+All nine RSS cases and 15 existing provider lifetime/interruption checks
+pass. Bracket depth remains 933/1024. A freshly emitted/assembled/optimized
+Wasm module computes the twelve portable vector/clone results as the
+reference, with the provider unavailable. That smoke uses the actual host
+from the separate GC host-fix candidate (#112) for its already-declared
+file-time imports; this change adds no imports or browser host code.
+
+The final archive checksum plus RubyGems metadata probe matches reference
+(hash, Nokogiri version and 182 files), completing in 3.492 s / 381,984 KiB.
+A fresh own combination with #95 installs all 68 Rails dependencies in
+284.529 s / 874,928 KiB under the original 600 s / 2 GiB bounds. This is an
+unmerged candidate, not a main Rails pass: migration next stops when the
+command registry's Ruby subclasses method loses to Class's native entry.
+The standalone registry reproduction is separate from this library fix.
+
+
+### Rails SHA-2 provider input bounds (review follow-up, 2026-11-19)
+
+The first provider connection sent the complete SHA-2 input in one native
+request. Review #120 found that inputs at the provider's 64-MiB wire bound
+raise instead of hashing. Reproduced on the preceding O2 binary with a
+67,108,867-byte binary input, without a memory or wall-limit event.
+
+SHA256, SHA384 and SHA512 now update the same real native context with
+1-MiB byte slices before finalization. The provider's own wire bound and
+all test/resource limits are unchanged. Empty inputs and the existing
+portable algorithms retain their behavior. No new top-level Mere value,
+public API, dispatcher, collector, C API or provider ABI change.
+
+The same input now matches Ruby 4.0.9 for all nine combinations of the
+three algorithms and direct/incremental/file entry points, each in a
+separate supervised process under 600 seconds / 2 GiB. Mere completes each
+in 1.266–2.055 seconds; the largest observed family peak is 1,119,600 KiB.
+The reusable actual-input probe is unittest/digest_provider_large.rb;
+arguments are algorithm bits (256/384/512) and entry point
+(direct/incremental/file). Compare its complete output with the reference.
+Witness 716 covers binary bytes crossing the bounded update boundary.
+
+Original Digest/OpenSSL Digest retain all 124 MATCH. The full corpus is
+705/705 with indexing ON and OFF. All nine RSS cases, fifteen existing
+provider lifetime/interruption/worker controls and the actual bracket
+check (933/1024) pass again. The real Nokogiri checksum/metadata probe
+still matches both hash and 182 files (4.715 seconds / 352,544 KiB).
+
+The earlier 68-gem installation observation remains tied to experimental
+composition 153e64f5 before this review fix. No new full Rails workload
+pass is inferred. #121 still owns the independent command registry
+boundary, and migration/boot/tests/HTTP require their original CLI replay.
+
 ## 2026-11-19: Rails application intake, rounds 1–2
 
 Round 1 fixes Rails 8.1.4.1, sqlite3 2.10.2, Puma 8.1.2, Minitest 6.1.0
