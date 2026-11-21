@@ -133,3 +133,48 @@ begin
 rescue => exception
   p exception.equal?(RetainingRescueMatcher.saved), exception.equal?($!)
 end
+
+# Resolving a rescue class can itself execute Ruby and replace raise metadata.
+require 'tmpdir'
+def original_autoload_raise
+  raise 'original autoload exception'
+end
+Dir.mktmpdir('rescue-autoload') do |directory|
+  feature = File.join(directory, 'retaining_matcher.rb')
+  File.write(feature, <<~RUBY)
+    begin
+      raise 'during matcher loading'
+    rescue
+    end
+    class AutoloadRetainingRescueMatcher
+      def self.===(exception)
+        $autoload_saved_exception = exception
+        $autoload_same_exception = exception.equal?($!)
+        true
+      end
+    end
+  RUBY
+  autoload :AutoloadRetainingRescueMatcher, feature
+  begin
+    original_autoload_raise
+  rescue AutoloadRetainingRescueMatcher
+  end
+  p [:autoload_frames, $autoload_saved_exception.backtrace.first.include?('original_autoload_raise'),
+     $autoload_same_exception, $autoload_saved_exception.message]
+end
+
+class MissingRescueMatcherNamespace
+  def self.const_missing(name)
+    begin
+      raise 'during const_missing'
+    rescue
+    end
+    AutoloadRetainingRescueMatcher
+  end
+end
+begin
+  original_autoload_raise
+rescue MissingRescueMatcherNamespace::Matcher
+end
+p [:missing_constant_frames, $autoload_saved_exception.backtrace.first.include?('original_autoload_raise'),
+   $autoload_same_exception]

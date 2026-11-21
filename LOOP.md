@@ -6813,3 +6813,18 @@ focused comparisons across evaluator/strict VM and four hash/MRO modes.
 Nine RSS workloads, GC roots, bracket depth155 and dead definitions pass.
 The handler and $! keep the same pinned exception across rejecting matchers
 and outer propagation. No builtin-only VM matcher pins an exception.
+
+### Preserve exception frames before resolving a rescue constant
+
+A getconstant can run autoload or const_missing before checkmatch. Such
+handlers now leave vm_rescue_only_matches' optimization and pin the original
+exception before the lookup; lookup-free builtin operands, including bare
+rescue, keep their fast path. run_rescues likewise pins before expanding
+explicit class expressions. This deliberately avoids guessing whether a
+constant lookup can execute Ruby. No top-level state or collector change.
+Corpus 696 adds an autoload that raises/rescues internally and a const_missing
+variant, checking the original frame and identity with $!. The original
+head fails the new evaluator reproduction in all four cache modes. The repair
+matches corpus 696-699 in all 32 evaluator/strict-VM/cache combinations; the
+original Exception and Backtrace files pass all 129 cases. The previous
+720-program sweep predates this follow-up; a fresh complete sweep is running.
