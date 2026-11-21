@@ -6675,3 +6675,15 @@ Ruby test ASTs and the same 971/976 Prism fixtures remain unchanged.
 The earlier complete 708-program validation applies before this follow-up;
 its updated public-API witness and hosted full suite are validated separately.
 Functions changed in this follow-up: tr_block_scope and tr_lambda.
+
+### AST parameter defaults before block-local declarations
+
+Register explicit block-local declarations after parameter default expressions
+and before the body in tr_block_scope and tr_lambda. Three additional corpus
+700 sources cover optional and keyword defaults and a destructured parameter.
+All three location comparisons pass; the full current source sweep remains
+869/869 Ruby files and 971/976 Prism fixtures with the same five reference
+NoMethodError cases. All 13 original review reproductions and the full public
+corpus 700 in four hash/MRO modes pass on the rebuilt O2 runtime. The earlier
+708-program corpus result predates this follow-up; hosted full checks remain
+required for the final revision.
