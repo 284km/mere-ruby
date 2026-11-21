@@ -6792,6 +6792,133 @@ moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
 
+## 2026-11-19 (85): an exception no clause can see, a constructor of stores, and super with values
+
+**The point.** After (84) the slowest of ruby's benchmarks on the VM were
+app_raise (1.72x the evaluator), so_object (1.49x) and so_exception (1.18x).
+Each was a shortcut the evaluator takes and the VM did not.
+
+- **A rescue that only matches.** run_rescues makes the exception an object
+  with its own frames (exc_pin_bt) only when the clause binds it to a name;
+  the VM made one -- an object id and three ivars -- for every exception any
+  clause took. A rescue sequence made of nothing but its local read,
+  constants and literals pushed, checkmatch, branches, nil, a pop, a leave
+  or a throw (vm_rescue_only_matches) cannot keep or show the exception, and
+  leaves it the pair, `$!` included, as the evaluator does.
+- **`$!` after a retry** (both executions, found writing the witness): a
+  retry ran the construct again by calling run_begin_f again, which took
+  the exception in `$!` as "what $! was before" and restored that once the
+  construct was done. `begin; raise if t < 2; rescue; retry; end; p $!` was
+  the exception; ruby's nil. The construct is run again from the $! it
+  started with.
+- **A method of stores.** The evaluator runs a method whose body is only
+  `@x = param` statements without a frame (triv_store_body); a VM method's
+  body is its program, which that never matched. A program of `getlocal p,
+  (dup,) setinstancevariable @x` for each parameter and a leave is run the
+  same way (vm_triv_store_ok / _run), under the same conditions (a plain
+  object, no block, no TracePoint, Coverage or Ractor, the arguments plain).
+- **super with values.** `super(a, b)` was an ESuper over hidden locals in a
+  scope, evaluated. ESuper's arm is now two halves: the arguments, and what
+  is done with them (super_vals) -- the method after the definer along the
+  receiver's ancestors, a singleton's extended modules, Class#new, a hook's
+  no-op, "no superclass method". The VM calls the second with its values
+  when there is no block written or passed, no splat or keywords, and no
+  hook (vm_super_direct, with the arm's refusals).
+
+Corpus 696 (a rescue that only matches, a bound one and `$!`, a bare raise,
+retry, `$!` in an ensure, a class's own ===), 697 (stores of one and three
+parameters, arity errors, `_`, a class variable, a literal, a frozen
+receiver, keywords and a splat) and 698 (super with values, a bare super
+after a parameter changed, a module's, `def self.new`, a hook, nothing
+above, another object's instance_eval, define_method's bare super, a
+singleton's extended module): the same on ruby 4.0.9, the evaluator and the
+VM.
+
+Measured, ruby's app_* / so_* (27; least of 3 runs, local): the whole 0.940x
+-> 0.927x the evaluator; app_raise 1.72x -> 1.06x, so_exception 1.18x ->
+1.07x, so_object 1.49x -> 1.10x. Still behind: so_nsieve_bits 1.25x,
+app_mandelbrot 1.15x (Complex), so_object 1.10x, so_pidigits 1.09x
+(Bignums), so_lists 1.07x.
+
+Checked (local): corpus 709 / 709; under MERE_RUBY_VM=1 699 on the VM, 10
+fallen back, 0 different; vm_check 245 / 245; gates; the Module check
+COMPLETE; under both executions, the previous build against this one:
+test_exception, test_rubyoptions, test_flip, test_super, test_method,
+test_object, test_class the same counts.
+
+## 2026-11-19 (86): test_complemented_method_entry_memory_leak -- what a collection costs, and why the floor stays
+
+**The point.** The test has timed out at 10.03-10.04 s on slow runners
+(main's CI, PR #95's, the VM-default measuring branch's). Measured here, on
+its own program (the test's block, 100,000 turns after 1,000):
+
+- It is linear: 50,000 / 100,000 / 200,000 turns take 0.97 / 1.82 / 3.52 s,
+  about 18 µs a turn (ruby 5.7). Nothing grows per collection.
+- Of the time, collecting is 36%; the rest is making the classes and the
+  refinement, spread over the native declaration paths with no function
+  above a few percent. A collection is about 9 ms: the class tables' sweep
+  is near half (68 tables walked, each key's owner read from its text; a
+  turn leaves 21 rows -- methods 3 x 4 tables, modules 2, supers 2, the
+  refinement's 3, privates, mro_external), the stack's native candidates
+  about a third, the fixpoint the rest.
+- The native candidates were 42,000 a collection, most of them the same
+  `Class#name` key from meths_g, meth_src, meth_cref and meth_cvcls; they
+  are taken once now (30,000). The time did not move outside the noise.
+- The class-time floor (knob 14, 4,000 entries) is load-bearing for this
+  very test: at 8,000 its RSS ratio was 2.18 and at 16,000 2.50, against
+  the bound of 2.0, and the time did not fall (1.74-1.98 s against 1.75-1.82
+  for 100,000 turns). It stays.
+
+What is left would be structure: rows a class keeps a record of, so the
+sweep need not read every key's text, or fewer rows a refinement. Until
+then the test stays in Known noise (rerun the job).
+
+## 2026-11-19 (87): the VM as the default, measured over the whole suite
+
+**The point.** The measuring branch vm-default-r44 (#104's stage10-r44 with
+the VM as the default execution, MERE_RUBY_VM=0 the evaluator; not for
+merging) ran the whole CI: run 44295654770. Every job but build-linux
+passed, and the CRuby tests' MATCH is 33,312 against main's 33,313 over the
+same 758 files. Four files are a test lower, three a test higher:
+
+- ruby/test_keyword.rb's test_kwrest_overwritten: a bare super after `**h`
+  was reassigned is "wrong argument type Array (expected Hash)" -- fixed in
+  this branch (core#hash_merge_ptr's Check_Type, corpus 699).
+- ruby/test_ractor.rb: test_move_nested_hash_during_gc_with_yjit's
+  timeout, Known noise.
+- ruby/test_iseq.rb's test_parent_iseq_mark and ruby/test_thread.rb's
+  test_thread_join_during_finalizers: timeouts, and the VM is slower at
+  both. Locally, with the compiler #108 pinned (01f5ad73): 9.65 s on the
+  evaluator and 13.12 s on the VM (bound 20 s), and 23.2 s and 44.9 s (bound
+  60 s); with the compiler before it, 9.76 / 13.16 and 30.2 / 57.7. The
+  second's program alone, outside the test, is faster on the VM (23.6 s
+  against 29.4 s, 5,627 collections against 8,768): what the test adds runs
+  under GC.stress with 20 popen3 wait threads parked, and the child spends
+  nearly all its time collecting -- three quarters of that in gc_mark_roots,
+  where the suspended stacks are read (coro_scan_ints, and the pin gather
+  the recycles at its start ask for). Why the VM's parked stacks cost twice
+  the evaluator's is the next question: the C frames a Ruby call stacks are
+  of the same size on both (vm_step 960 bytes, eval_e 2,080).
+- build-linux: the Module check's test_complemented_method_entry_memory_leak
+  at 10.03 s, Known noise (LOOP (86)).
+
+So the VM as the default passes what the evaluator passes, in the whole
+suite, but for those two timeouts under GC.stress with threads parked.
+
+### Preserve exceptions exposed by a custom rescue matcher
+
+PR #144 review: checkmatch can invoke Ruby === even when the rescue body
+binds no variable. Pin such an exception before exposing it, update the
+handler's hidden exception local and $!, and propagate the same object when
+all clauses reject it. Builtin-only matching retains the allocation-free
+path. run_rescues needs the same protection in evaluator mode. TracePoint
+observers conservatively receive a pinned exception too. Functions changed:
+vm_checkmatch, vm_region, run_rescues; no new top-level state or collector edit.
+Corpus 696 covers retained backtraces across a subsequent raise, $! identity,
+multiple matcher clauses, splat matchers and outer propagation. Corpus
+696-699 matches in all four cache modes on both evaluator and strict VM
+(32 comparisons). Full integrated validation is still pending.
+
 
 ## 2026-11-20: rooted mixin arguments, scoped namespace autoload and the autoload loader
 
@@ -6981,3 +7108,53 @@ retained. The known Syntax-memory failure remains on both sides. All original
 limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
+
+Final current-main validation of the retained matcher repair: all720 corpus
+programs match in both hash modes (490.781 seconds, 1,194,640 KiB under the
+unchanged900-second/2-GiB bound). The final integrated runtime retains all32
+focused comparisons across evaluator/strict VM and four hash/MRO modes.
+Nine RSS workloads, GC roots, bracket depth155 and dead definitions pass.
+The handler and $! keep the same pinned exception across rejecting matchers
+and outer propagation. No builtin-only VM matcher pins an exception.
+
+### Preserve exception frames before resolving a rescue constant
+
+A getconstant can run autoload or const_missing before checkmatch. Such
+handlers now leave vm_rescue_only_matches' optimization and pin the original
+exception before the lookup; lookup-free builtin operands, including bare
+rescue, keep their fast path. run_rescues likewise pins before expanding
+explicit class expressions. This deliberately avoids guessing whether a
+constant lookup can execute Ruby. No top-level state or collector change.
+Corpus 696 adds an autoload that raises/rescues internally and a const_missing
+variant, checking the original frame and identity with $!. The original
+head fails the new evaluator reproduction in all four cache modes. The repair
+matches corpus 696-699 in all 32 evaluator/strict-VM/cache combinations; the
+original Exception and Backtrace files pass all 129 cases. The previous
+720-program sweep predates this follow-up; a fresh complete sweep is running.
+
+
+### PR review: resolve constant path heads through actual lexical scopes
+
+Use lex_const_key_nested for the EConst qualified-path shortcut and both
+const_walk_head lookups. An absent namespace prefix is not a lexical scope.
+If that first hit is rejected, the helper continues through the actual
+nesting instead of discarding a later real outer scope. It preserves the
+existing singleton-owner mapping. Changed functions: eval_e,
+const_walk_head and lex_const_key_nested; the parent's vm_define correction
+is unchanged. Corpus760 adds qualified reopening, method reads, scoped class
+definition and the case with both an absent prefix and a real outer scope.
+Both reported and additional comparisons failed before these corrections.
+
+Final normal O2/compiler01f5ad73 validation: **721/721 corpus**, hash index
+ON/OFF, **481.274s / 1,188,480KiB** peak family RSS. All36 default/evaluator/
+strict-VM and hash/MRO comparisons of731/738/760, all nine RSS gates, roots,
+dead definitions and C depth155/1024 pass. Complete original Exception/
+Backtrace/Module/Autoload/Require discover404 cases: **402 MATCH / 0 RED /
+2 BOTH**, with both reference skips explicit and all per-file MATCH retained.
+The old invalid-symbol Syntax leak failure is not affected or reclassified.
+An initial original-file selection started before the replacement build
+finished and is explicitly ineligible; the accepted fresh run checks the O2
+build's freshness and unchanged binary hash. No collector/state, C API,
+VM/ISeq, AST/Prism, gemtest implementation, original tests, exclusions or
+limits were changed for this repair. New hosted CI and latest-main per-file
+acceptance remain required before merging.
