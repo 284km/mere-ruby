@@ -7360,6 +7360,44 @@ diagnostic adds only public ObjectSpace Class counts: the reference stays at
 281 and Mere ranges from 283 to 297. This is evidence for further investigation,
 not a collector or lifetime repair. No GC internals were changed.
 
+## 2026-11-19: preserve failed measurements while repairing Linux CI setup
+
+The hosted Ubuntu image's APT mirror returned HTTP 503 for the clang
+metapackage before any tests ran; libssl-dev and pkg-config were already
+installed. Linux setup now first compiles, links and executes a real
+C/OpenSSL probe. A working installation needs no package download. A failed
+probe still runs the original apt-get commands, and must pass the probe
+afterwards. Three controls use real clang/OpenSSL in an offline Linux
+container: working dependencies avoid the installer, installer failure is
+propagated, and a successful installer cannot hide unusable headers. A
+separate small Linux job runs these controls without extending test jobs.
+
+The new hosted control job also passes all three tests on Ubuntu image
+20261111.370.1 in 3.375 seconds. Preserve that image version separately from
+the earlier APT failures on 20261111.127.1; it does not waive their observations
+or imply that the remaining hosted test jobs have completed.
+
+Tool summaries previously ran through upstream cancellation because their
+job and collect step used always(). They then failed on zero artifacts.
+The summary now requires a non-canceled workflow and a successful or failed
+shard job. Actual failed shards still reach the unchanged strict collector;
+empty shards remain an error. All eight collector controls pass, including
+the real reference child diagnostic. Source locks, baselines, test commands,
+600-second/2-GiB file bounds and every existing job timeout are unchanged.
+
+The latest hosted Method-copy control still fails at 2.224702x, reference
+1.086532x, without a resource-limit event. The receiver-elision hypothesis
+in copy_meth_src was built and measured, then withdrawn. Its paired unchanged
+workload reduced cumulative STMT-region allocation by 33,600,288 bytes, but
+default-region allocation fell by only 88 bytes and retained RSS did not
+improve. This is a rejected hypothesis, not a lifetime fix. The final runtime
+source is byte-identical to the parent. Existing diagnostic logs show method
+and class entries being reclaimed; they do not isolate retained native memory.
+Leave VM/GC/allocator internals to their sessions and retain the failed 2x
+gate. Full samples, hashes and CI-only branch updates are recorded in
+gemtest/suites_ci_lifetime_r43.json. No new gem sweep is claimed here; the
+previous 129-file 120-MATCH/8-RED/1-MEMORY observation remains unchanged.
+
 ## 2026-11-20: apply the verified method floor repair to the earlier small-suite branch
 
 PR 119 still fails its original Method-copy assertion at 2.051319x on native

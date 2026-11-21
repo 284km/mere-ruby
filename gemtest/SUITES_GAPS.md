@@ -1,5 +1,17 @@
 # Upstream gem suite differences
 
+Hosted Method-copy still fails at 2.224702x on the unchanged 21,000-owner
+control (reference 1.086532x). An operation-only receiver-elision candidate
+was measured and withdrawn: it reduced transient STMT-region allocation by
+33,600,288 bytes but did not improve retained RSS. Existing GC diagnostics
+show logical class/method reclamation, which does not identify the retained
+native allocation. VM/performance and GC/allocator investigation remains a
+handoff; no collector internals, workload, warmup or threshold were changed.
+Keep this failure as a merge gate. Samples and hashes are preserved in
+`suites_ci_lifetime_r43.json` alongside the Linux APT/cancellation CI repairs.
+Those repairs change setup and cancellation handling only; there is no new
+gem sweep or baseline adoption in this round.
+
 The IO byte-write correction in cb09d147 restores the complete original Rack
 multipart file below the cap on macOS and Linux/aarch64. IO#__fd_write_nonblock
 now writes the supplied bytes without the stream converter or String#b, as
