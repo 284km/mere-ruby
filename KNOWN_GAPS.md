@@ -4839,3 +4839,12 @@ and pure Ruby source retain ordinary ordering. Corpus525 covers a native
 wrapper, and unchanged mkmf contracts plus seven real native gem installs
 pass. The C API spec gate retains its existing unsupported cases and bounds;
 2277 candidate cases versus2584 reference is not a claim of complete C API.
+
+Declared reference fallback directories are now deferred for both shipped
+and unshipped feature lookup. This covers Psych/YAML wrappers whose native
+core names do not appear in the earlier native-feature filter. Ordinary
+user source paths retain precedence, and no inactive path is added to the
+search. The real YAML child reproduction and all 11 library controls pass.
+The earlier native-name-only behavior is superseded; native Method dispatch
+and other independent compatibility gaps are not claimed solved by this
+ordering repair.

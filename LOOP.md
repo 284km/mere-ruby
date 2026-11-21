@@ -7186,3 +7186,30 @@ its existing record. Existing digest-header, thread timeout and other
 unsupported spec results are retained, not counted as passing cases.
 The earlier runner-only attempt's six native-gem child failures remain
 separate raw evidence. Current hosted every-file validation still gates merge.
+
+### Reference directories remain fallbacks for wrapped native libraries
+
+The declared-reference marker must describe directory ordering, not a list
+of native feature names: the Psych/YAML Ruby wrappers also require their
+own runtime's native core. load_path_pick_shipped now defers declared
+reference entries, preserves other active user paths, selects the shipped
+source at its own position, and searches deferred paths for unshipped files.
+No directory absent from LOAD_PATH is added by the marker. Behavior without
+a declaration is unchanged. Corpus 525 exercises real YAML parsing in a
+child with the fallback repeated through -I, using a genuine native-wrapper
+prerequisite on the reference. All 11 ordinary/child library controls pass;
+Psych and YAML failed the preceding child control. A real user source still
+wins over a declared fallback in the separate priority control.
+
+Current main 2e2ab568 is integrated with Digest, the cached compiler action,
+XML dependency checks and released compiler 43f2994b retained. Normal O2:
+726/726 corpus programs match in both hash modes (530.253 seconds,
+1,058,272 KiB), all 24 focused comparisons, nine RSS workloads, roots,
+depth 155 and dead definitions pass. The unchanged mkmf gate agrees on all
+14 contracts for reference/candidate/stress and rejects both negative
+controls. All seven native gems install and their 84 output lines agree;
+wrong-runtime libraries remain rejected. The C API spec gate retains its
+existing record, reference 2584/candidate 2277, including existing unsupported
+and timeout cases. Reference-cache and embedding-build controls pass, and
+workflow YAML parses. Hosted full checks and every-file nonregression remain
+required for the new head. No original assertion, exclusion or bound changes.
