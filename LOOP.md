@@ -7051,3 +7051,13 @@ and both reference skips stay visible. An initial nonexistent test_heredoc.rb
 selection was rejected as incomplete; only the real test_literal.rb result
 is counted here. No original tests, exclusions, API or resource limits change.
 Hosted checks must still finish on the updated head before merging.
+
+The follow-up review found the receiver's separator lost again when a comment
+or a continuation stands between it and `class` (`p o. # note`, then
+` class <<-EOS`; also `o::`, and a comment-only line between). The lexer now
+records each comment it skips the way it records a continuation -- keyed by
+the newline that ends it, holding where it began, removed once the rest of
+the source is lexed (lex_comment_key) -- and after_class_kw's look back
+passes over both. corpus/761 holds the five forms, and a real
+`class <<self` after comment lines. 721/721, the VM's 761-763 the same, and
+the twelve gems the same on both sides.

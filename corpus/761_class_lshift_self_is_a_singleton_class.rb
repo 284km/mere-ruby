@@ -47,3 +47,31 @@ p o.
  class <<-NEWLINE
 newline
 NEWLINE
+
+# ...and so do a comment, a line continuation, or a comment-only line between
+# them (the receiver's `.` or `::` is still what comes before `class`)
+p o. # receiver comment
+ class <<-COMMENT
+comment
+COMMENT
+p o. \
+ class <<-CONT
+continued
+CONT
+p o:: # colon comment
+ class <<-CCOLON
+colon comment
+CCOLON
+p o::
+ # a comment-only line
+ class <<-ONLY
+comment line
+ONLY
+# while a real `class <<self` after a comment line is the singleton class
+class Foo # trailing note
+  # a comment-only line
+  class <<self
+    def after_comment = :ok
+  end
+end
+p Foo.after_comment
