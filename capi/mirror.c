@@ -18,6 +18,8 @@
  *     gone (mr_capi_release), and its dfree runs then.
  */
 #include "mr_capi.h"
+#include "ruby/io.h"
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,8 +35,10 @@ struct mr_mirror {
     int data;                   /* 0, 1 RData, 2 RTypedData */
     int listed;                 /* how many C calls in progress watch it (entries of `touched`) */
     size_t embedded;            /* a typed struct's own bytes, after it */
+    struct rb_io *io;           /* an IO's, made when RFILE first asks for it */
     union {
         struct RBasic basic;
+        struct RFile file;
         struct RString string;
         struct RArray array;
         struct RData data;
@@ -222,9 +226,17 @@ void *rb_mere_string(VALUE obj) {
     }
     mr_up1(MR_STR_GET, obj);
     const mere_bytes *b = mr_got_bytes();
-    string_room(m, (long)b->len);
-    memcpy(m->as.string.as.heap.ptr, b->data, (size_t)b->len);
-    memset(m->as.string.as.heap.ptr + b->len, 0, 4);
+    /* The buffer is the String as far as C can tell, also past its length:
+     * what C wrote there (to reveal with rb_str_set_len later) stays, and
+     * so does everything when the interpreter has the very bytes the
+     * buffer holds. Only a String that changed is copied in, and ends in
+     * its encoding's terminator. */
+    if (!(m->body == T_STRING && m->as.string.as.heap.ptr && m->as.string.len == (long)b->len
+          && !memcmp(m->as.string.as.heap.ptr, b->data, (size_t)b->len))) {
+        string_room(m, (long)b->len);
+        memcpy(m->as.string.as.heap.ptr, b->data, (size_t)b->len);
+        memset(m->as.string.as.heap.ptr + b->len, 0, (size_t)mr_string_terminator(obj));
+    }
     m->as.string.len = (long)b->len;
     m->body = T_STRING;
     m->hash = body_hash(m);
@@ -272,11 +284,74 @@ void *rb_mere_array(VALUE obj) {
     return &m->as.array;
 }
 
-void *rb_mere_file(VALUE obj) { (void)obj; mr_unsupported("RFILE (the struct behind an IO)"); }
+/* RFILE(io)->fptr: what an IO is to C. The struct is filled from the IO each
+ * time it is asked for -- the descriptor (-1 when closed), how it was opened
+ * (the descriptor's own access mode, sync, binmode, tty), the path -- and
+ * nothing C writes into it goes back: the functions that take the pointer
+ * (rb_io_check_closed, rb_io_set_nonblock, ...) act on the IO it names. Its
+ * buffers and converters are CRuby's own and stay empty. */
+void *rb_mere_file(VALUE obj) {
+    struct mr_mirror *m = mr_mirror_of(obj);
+    if (!m->io) {
+        m->io = calloc(1, sizeof(struct rb_io));
+        if (!m->io) rb_memerror();
+    }
+    struct rb_io *f = m->io;
+    f->self = obj;
+    f->pathv = rb_respond_to(obj, rb_intern("path")) ? mr_call(mr_ruby("->(io) { io.path rescue nil }"), "call", 1, obj) : Qnil;
+    f->tied_io_for_writing = 0;
+    f->timeout = Qnil;
+    f->write_lock = Qnil;
+    f->writeconv_asciicompat = Qnil;
+    f->writeconv_pre_ecopts = Qnil;
+    f->encs.ecopts = Qnil;
+    int mode = 0;
+    if (RTEST(mr_call(obj, "closed?", 0))) f->fd = -1;
+    else {
+        f->fd = NUM2INT(mr_call(obj, "fileno", 0));
+        /* Which directions are this IO's own (bit 1 read, 2 write, 4 append),
+         * as the interpreter keeps them: a File's mode string, a descriptor
+         * IO's two flags, or the standard stream the descriptor is. Not the
+         * descriptor's F_GETFL: an IO.for_fd(fd, "r") on a descriptor opened
+         * for both is read-only to ruby. The descriptor still says O_APPEND,
+         * which is its own property. */
+        int own = NUM2INT(mr_call(mr_ruby(
+            "->(io) { m = io.instance_variable_get(:@__f_mode); "
+            "r = io.instance_variable_get(:@__io_r); w = io.instance_variable_get(:@__io_w); "
+            "if m.is_a?(String) && !m.empty? then a = m.split(':').first.to_s.delete('bt'); "
+            "(a.match?(/[r+]/) ? 1 : 0) | (a.match?(/[wa+]/) ? 2 : 0) | (a.include?('a') ? 4 : 0) "
+            "elsif !r.nil? || !w.nil? then (r ? 1 : 0) | (w ? 2 : 0) "
+            "else case io.fileno when 0 then 1 when 1, 2 then 2 else -1 end end }"), "call", 1, obj));
+        int flags = fcntl(f->fd, F_GETFL);
+        if (own < 0 && flags != -1) {
+            int access = flags & O_ACCMODE;
+            own = (access == O_RDONLY || access == O_RDWR ? 1 : 0) | (access == O_WRONLY || access == O_RDWR ? 2 : 0);
+        }
+        if (own > 0) {
+            if (own & 1) mode |= FMODE_READABLE;
+            if (own & 2) mode |= FMODE_WRITABLE;
+            if (own & 4) mode |= FMODE_APPEND;
+        }
+        if (flags != -1 && (flags & O_APPEND)) mode |= FMODE_APPEND;
+        if (RTEST(mr_call(obj, "sync", 0))) mode |= FMODE_SYNC;
+        if (RTEST(mr_call(obj, "binmode?", 0))) mode |= FMODE_BINMODE;
+        if (isatty(f->fd)) mode |= FMODE_TTY;
+    }
+    f->mode = mode;
+    m->as.file.fptr = f;
+    return &m->as.file;
+}
 void *rb_mere_match(VALUE obj) { (void)obj; mr_unsupported("RMATCH (the struct behind a MatchData)"); }
 void *rb_mere_regexp(VALUE obj) { (void)obj; mr_unsupported("RREGEXP (the struct behind a Regexp)"); }
 
 /* ---- capacity, for the String functions that promise room ------------------ */
+/* How many NUL bytes end a String of this one's encoding: 1, or the width of
+ * a UTF-16 / UTF-32 code unit. */
+int mr_string_terminator(VALUE str) {
+    extern int mr_encoding_unit(VALUE str);
+    int n = mr_encoding_unit(str);
+    return n > 1 && n <= 4 ? n : 1;
+}
 long mr_string_capacity(VALUE str) {
     rb_mere_string(str);
     return mirror_at(MR_NUMBER(str), 1)->capa;
@@ -364,6 +439,7 @@ int mr_capi_release(int number) {
                 i--;
             }
     }
+    free(m->io);
     if (m->body == T_STRING) free(m->as.string.as.heap.ptr);
     if (m->body == T_ARRAY) free((void *)m->as.array.as.heap.ptr);
     int ran = 0;

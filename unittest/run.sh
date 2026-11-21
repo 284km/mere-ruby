@@ -176,11 +176,19 @@ if [ "${1:-}" = "--one" ]; then
   if [ -n "${UNITTEST_MERE_EXT_PATH:-}" ]; then
     mere_lib="$UNITTEST_MERE_EXT_PATH:$mere_lib"
   fi
+  mr_run="$mr"
   case "$rel" in
     mkmf/*)
       if [ -f "$src/.unittest-reference/rbconfig.rb" ]; then
         set -- -I "$src/.unittest-reference" -I "$src/lib"
         ref_lib="$src/.unittest-reference:$src/lib:$ref_lib"
+      fi
+      # mere-ruby's side: the build tree test/mkmf expects, staged of links
+      # to its own headers (mkmf_context.sh), and a launcher that runs the
+      # test and its children inside it. Without a C API it stays as it was.
+      if launcher="$(sh "$here/mkmf_context.sh" "$mr" "$src" "$work/$n.mkmf-context" "${stdlib%%:*}")"; then
+        mr_run="$launcher"
+        mere_lib="$work/$n.mkmf-context/source/lib:$mere_lib"
       fi ;;
     rubygems/*)
       ref_lib="$src/lib:$ref_lib"
@@ -200,7 +208,7 @@ if [ "${1:-}" = "--one" ]; then
   out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
   printf 'mere\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
-  (cd "$dir" && select_rake "$mr" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr" RUBY="$mr" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.mere.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$mr" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr_run" RUBY="$mr_run" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.mere.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr_run" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
   mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"
