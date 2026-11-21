@@ -7205,6 +7205,88 @@ The unchanged local lifetime control passes at 1.769x. That observation does
 not resolve the parent hosted Linux failure. suites_runtime_r31.json stores
 the exact core executions/nonpassing cases, corpus bounds and lifetime series.
 
+
+## Gem suites, rounds 32–34: add Abbrev and Singleton; reject the super trial
+
+Pin Abbrev 0.1.2 (release commit b362e8e3) and Singleton 0.3.0 (256c9117)
+in suites_small_stdlib.lock.json. Their complete original Test::Unit files
+need only the same three pinned pure Ruby development packages; both source
+gems have no native extension or runtime dependency. Sources stay outside
+the repository. On macOS and network-disabled Linux/aarch64, both files are
+MATCH: Abbrev 2 tests / 6 assertions, Singleton 13 / 17, no errors or skips.
+Each side records its own real source audit and exact summary. Initial,
+macOS and actual Linux snapshots remain separate; no macOS result is relabeled
+as Linux. Linux's build provenance records the fixed checkout, parent-emitted
+C and isolated container. A separate two-OS workflow restores the lock through
+actions/cache and measures offline under the unchanged 600-second / 2-GiB
+bounds. Existing gem workflows and their lifetime checks are unchanged.
+
+A missing-super prototype temporarily reduces Mock from 2 errors to 1, but
+additional nested missing-call controls expose a regression: a later missing
+call must replace the earlier super reason. Both an inner native refusal and
+a successfully handled missing call change it on Ruby and the saved parent;
+the prototype incorrectly retains super/private status. Withdraw all runtime
+changes and its two temporary witnesses. suites_rejected_r33.json records
+the rejected source b501dde1, actual 732/732 corpus and original core counts,
+and the additional controls that those tests missed. All three trial batches
+are retained separately and are not accepted runtime baselines. The actual
+class-hook routing and coordinated missing-reason work remain Ruby semantics
+in shared dispatch paths, including occupied invoke_val_c0, not VM/GC causes.
+New corpus 714 protects the nested-call behavior; all 730 preceding corpus
+files and every runtime source remain byte-identical to parent #118.
+
+Final O2 semantics source is the unchanged c0b06cc7 runtime (binary 8057a658).
+The full 117-file observation at checkout f5deacd3 has healthy references
+with 2750 tests: 107 MATCH / 8 RED / 0 BOTH / 2 MEMORY. The new files add two
+MATCH; original 53 MATCH / 7 RED / 2 MEMORY, additional 6 / 1 and Rake 46
+are recorded with their real verdicts. Multipart again loses MATCH to MEMORY.
+Keep its nonempty regression in suites_candidate.json and preserve the
+stronger original 54-MATCH baseline in suites_latest.json. No bounds, APIs,
+source-audit rules, upstream tests, pre-existing corpus or assertions change.
+Mock remains at its parent's 1 failure / 2 errors / 144 assertions.
+
+The final full corpus is 731/731 with both hash modes, 586.137 seconds and
+1,112,912 KiB under its unchanged aggregate wrapper. Ten harness controls,
+source guards and the YAML syntax check pass; bracket depth is 933/1024 and
+top-level let counts remain main 136 / state 1167. An initial stale generated-C
+guard is resolved by restoring the C for the byte-identical parent, without
+weakening it. suites_runtime_r34.json separates this final observation from
+the rejected trial and points to the unchanged runtime's original core proof.
+
+Parent #118's actual hosted Linux lifetime failure is 2.270x, not a timeout
+or 2-GiB event. Its complete failed RSS series is retained; reference is
+healthy and additional measurement was not reached. A reduced File subclass
+constructor gap also agrees on parent and rejected prototype, remaining a
+shared construction/allocator coordination item. No resource cause or fix
+is claimed. Full hosted CI, all existing-file comparisons and P1/P2 resolution
+remain merge gates; the new jobs do not waive any failed existing job.
+
+## 2026-11-20: apply the verified method floor repair to the earlier small-suite branch
+
+PR 119 still fails its original Method-copy assertion at 2.051319x on native
+Linux. Backport the already verified PR 136 repair of compact_method_store
+only: a deferred native compaction must not publish its enlarged arena as
+its next floor. Dirty clearing, the return contract, numeric thresholds,
+unmeasurable-arena behavior and native pin rules remain unchanged.
+
+Same-compiler ordinary O2 parent/candidate/candidate/parent observations give
+1.899619 / 1.592149 / 1.530450 / 1.817941 on native Linux/aarch64 and
+1.790451 / 1.482855 / 1.214509 / 1.875326 on macOS/arm64. Both local parent
+observations pass too; preserve the earlier hosted failure rather than calling
+these a fresh reproduction. All original programs and 2x assertions remain.
+Complete Module (195 tests / 1240 assertions) and Refinement comparisons lose
+no passing cases on either OS. Selected clone and complemented-entry controls
+also pass; this is not an established repair of historical clone failures.
+
+The only ordinary runtime function changed by this backport is
+m_state.compact_method_store. Actual bracket depth is 933/1024; top-level
+bindings remain main 136 / state 1167. See
+gemtest/method_store_floor_pr119_r62.json for every ordinary paired sample
+and raw-log hashes. The full corpus and five-gem verification are in progress
+at this checkpoint. Baselines, locks, compiler pins, workload and resource
+bounds are unchanged. Fresh hosted CI and per-file comparisons still control
+merging.
+
 ## 2026-11-20: a live refinement snapshot need not duplicate its first target
 
 PR #92's repeated original Module check failed its RSS assertion at
