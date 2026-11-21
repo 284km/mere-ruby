@@ -15038,6 +15038,9 @@ and invoke_val_c2 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              hng_undef_call env world recv0 name0 args0
                (false, (Nil : str list), (Nil : Stmt list), env) (if vischeck then 0 else 1)
            else if cls_sng_undef world recv0 name0 then cls_sng_undef_raise world recv0 name0 args0
+           else if (str_eq name0 "send" || str_eq name0 "__send__" || str_eq name0 "public_send")
+                   && map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name0 then
+             native_sender_call env world blk recv0 name0 args0 (false, (Nil : str list), (Nil : Stmt list), env)
            // The core override check must consume its own native bypass.
            // Subclasses (or a core without that check) enter the constructor
            // directly and clear the bypass before it can reach a coercion.
@@ -32500,6 +32503,10 @@ and invoke_with_block2 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
   else
   if hng_undef_blocked world recv name || hng_missing_hook world recv name then hng_undef_call env world recv name args newblk0 0
   else
+  if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send")
+     && map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name then
+    native_sender_call env world blk recv name args newblk0
+  else
   // Native NKF functions ignore a block. Resolve a real Ruby override first;
   // the native entry has no AST body for the generic block dispatcher to run.
   if nkf_function name &&
@@ -32825,7 +32832,9 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                       | _ -> "")) in
     // (...and of any builtin an object answers with a block: openstruct's
     //  `define_singleton_method!(name) { ... }`)
-    if (if str_eq iea9 "" then false else (if str_eq iea9 name then false else true)) then invoke_with_block env world blk recv iea9 args newblk
+    if str_eq iea9 "send" || str_eq iea9 "__send__" || str_eq iea9 "public_send" then
+      native_sender_call env world blk recv iea9 args newblk
+    else if (if str_eq iea9 "" then false else (if str_eq iea9 name then false else true)) then invoke_with_block env world blk recv iea9 args newblk
     else
     // the count is checked here too: a block is not an argument, and
     // `each_slice(2, 2) { }` is the same wrong count as without one.
@@ -33943,6 +33952,13 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                          | _ -> ())) in
           v9)
        else if (str_len name == 3 && str_eq name "new") then new_obj_wb world c args newblk
+       else if alias_first world ("(sng:" ++ c ++ ")") name
+               && not (meth_private world ("(sng:" ++ c ++ ")") name)
+               && not (meth_protected world ("(sng:" ++ c ++ ")") name)
+               && (let source9 = blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name in
+                   str_eq source9 "send" || str_eq source9 "__send__" || str_eq source9 "public_send") then
+         native_sender_call env world blk recv
+           (blt_alias_lookup world (ancestors_of world ("(sng:" ++ c ++ ")")) name) args newblk
        else if has_meth world ("(sng:" ++ c ++ ")") name then invoke world newblk recv ("(sng:" ++ c ++ ")") name args
        else if has_meth world "Module" name then invoke world newblk recv "Module" name args
        else if has_meth world "Class" name then invoke world newblk recv "Class" name args
@@ -45556,6 +45572,42 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
 // the direct call worked. They are called here directly -- not through
 // dispatch_prim, which asks the class for a user method of the same name
 // first, and the usual reason for the alias is that there is one.
+and native_sender_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn actualblk ->
+  // The native entry consumes its bypass before a name coercion or target
+  // can call another receiver's Ruby sender override.
+  let _ = (if map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name then map_clear bi_skip else ()) in
+  let pub9 = str_eq name "public_send" in
+  ps_frame pub9 (fn (u: unit) ->
+    (let target9 = send_name_arg env world args in
+     let rest9 = (match args with Cons (_, tail9) -> tail9 | Nil -> Nil) in
+     let _ = (if pub9 then public_send_guard world recv target9 else ()) in
+     if str_eq target9 "eval" then do_eval env world blk rest9
+     else if str_eq target9 "using" && not pub9 && main_like world recv then do_using_main env world rest9
+     else match actualblk with
+     | (false, _, _, _) -> invoke_val_c env world blk recv target9 rest9 pub9
+     | _ ->
+       (let cls9 = (match recv with VClass c9 -> "(sng:" ++ c9 ++ ")" | _ -> hng_lookup_cls world recv) in
+        let refined9 = refined_impl_for world recv target9 in
+        if not (str_eq refined9 "") && has_meth world refined9 target9 then
+          (if pub9 && (meth_private world refined9 target9 || meth_protected world refined9 target9) then
+             raise_exc_iv world "NoMethodError"
+               ((if meth_private world refined9 target9 then "private" else "protected")
+                ++ " method '" ++ target9 ++ "' called for " ++ for_recv_cls world (dispatch_cls_of world recv))
+               (Cons (("__name", VSym target9), Cons (("__recv", recv), Cons (("__args", arr_new rest9), Nil))))
+           else ub_skip_run (fn (u: unit) -> ref_call world actualblk recv refined9 target9 rest9))
+        else if pub9 && (meth_private world cls9 target9 || meth_protected world cls9 target9) then
+          (if has_meth world cls9 "method_missing" then
+             (let _ = vec_set mm_priv 0 (mm_reason_take ()) in
+              invoke world actualblk recv cls9 "method_missing" (Cons (VSym target9, rest9)))
+           else raise_exc_iv world "NoMethodError"
+             ((if meth_private world cls9 target9 then "private" else "protected")
+              ++ " method '" ++ target9 ++ "' called for " ++ for_recv_cls world (dispatch_cls_of world recv))
+             (Cons (("__name", VSym target9), Cons (("__recv", recv), Cons (("__args", arr_new rest9), Nil)))))
+        else if not pub9 && has_meth world cls9 target9 && not (alias_first world cls9 target9) then
+          ub_skip_run (fn (u: unit) -> invoke world actualblk recv cls9 target9 rest9)
+        else if not pub9 && not (str_eq (enum_init_cls world recv target9) "") then
+          enum_init env world recv (enum_init_cls world recv target9) rest9 actualblk
+        else ub_skip_run (fn (u: unit) -> invoke_with_block env world blk recv target9 rest9 actualblk))))
 and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn (args: Val list) ->
   match (recv, args) with
   // (an alias of a builtin definition hook is that no-op hook, not the name
@@ -45585,8 +45637,14 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
     invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VClass "Kernel") src args false
   // (BasicObject#! is the receiver's falsiness; prim_method has no "!")
   | _ when str_eq src "!" -> VBool (if truthy recv then false else true)
+  | _ when str_eq src "respond_to?" ->
+    (if val_list_len args > 2 then
+       raise_exc world "ArgumentError"
+         ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")
+     else respond_to_answer env world recv args)
   | _ when str_eq src "__send__" || str_eq src "send" || str_eq src "public_send" ->
-    invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
+    native_sender_call env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args
+      (false, (Nil : str list), (Nil : Stmt list), env)
   // ...and neither are the String MUTATORS (concat, <<, replace ...): they
   // rewrite the receiver's store entry in the dispatcher. The receiver is
   // asked for the source name, so an alias made in a class that ALSO
@@ -48319,6 +48377,7 @@ and super_next_plain = fn world -> fn env -> fn (recv: Val) -> fn (defcls: str) 
                              | VClass c9 when str_eq meth "[]" ->
                                (if obj_is_a world c9 "Hash" then "(sng:Hash)"
                                 else if obj_is_a world c9 "Array" then "(sng:Array)" else "")
+                             | _ when str_eq meth "send" || str_eq meth "__send__" || str_eq meth "public_send" -> "Kernel"
                              | _ -> "") in
   if str_eq base9 "" then
     (if map_len undefs > 0 && undef_blocked_anc world rest9 meth then ("", 0 - 1, true)
@@ -49047,7 +49106,8 @@ and named_class_of_al = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (nm
 // defines its own #send, and Ruby dispatches that one. The primitive arms
 // below answered first, so `r.send(:msg)` reported `msg` undefined on Ractor
 // -- the name was read as "dispatch this method", never as a method itself.
-// `__send__` and `public_send` stay universal, which is why they exist.
+// Each sender can have a real Ruby override. Native aliases and retained
+// Methods enter native_sender_call without asking the override again.
 // ⚠ For a CLASS receiver the question is about its singleton, not about
 //   the class's instances: dispatch_cls_of answers "Foo" for Foo itself, so a
 //   class whose INSTANCES have #send (BasicSocket's is send(2)) took the name
@@ -49055,10 +49115,10 @@ and named_class_of_al = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (nm
 //   'send' for class Foo". ruby/spec's tcpsocket/shared/new calls
 //   `TCPSocket.send(@method, ...)` for every example.
 and user_defines_send = fn world -> fn (recv: Val) -> fn (name: str) ->
-  if (str_len name == 4 && str_eq name "send") then
+  if str_eq name "send" || str_eq name "__send__" || str_eq name "public_send" then
     (match recv with
-     | VClass c -> has_meth world ("(sng:" ++ c ++ ")") "send"
-     | _ -> has_meth world (dispatch_cls_of world recv) "send")
+     | VClass c -> has_meth world ("(sng:" ++ c ++ ")") name
+     | _ -> has_meth world (hng_lookup_cls world recv) name)
   else false
 // `extend`: append each module's name to the receiver singleton's includes,
 // so its instance methods become singleton methods (found via the sng chain).
@@ -49852,12 +49912,36 @@ and hash_super_fetch = fn world -> fn superblk -> fn (hid: int) -> fn (args: Val
                        ("key not found: " ++ key_err_desc (inspect_w gc_cenv0 world key9))
                        (Cons (("__key", key9), Cons (("__recv", VHsh hid), Nil))))))
      | Nil -> FNext VNil)
+and sender_super_ahead = fn world -> fn (recv: Val) -> fn (meth: str) ->
+  let depth9 = caller_depth () - 1 in
+  if not (map_has fb_env_at depth9) then false else
+  (let frame9 = map_get fb_env_at depth9 in
+   let origin9 = (match lv_get frame9 "__defcls" with VClass c9 -> c9 | _ -> "") in
+   let ancestors9 = ancestors_of world (super_base world recv) in
+   let known9 = (match lv_get frame9 "__defidx" with VInt i9 -> i9 | _ -> 0 - 1) in
+   let rec item9 = fn (xs9: str list) -> fn (n9: int) -> match xs9 with
+     | Nil -> ""
+     | Cons (h9, t9) -> if n9 == 0 then h9 else item9 t9 (n9 - 1) in
+   let at9 = (if known9 >= 0 && str_eq (item9 ancestors9 known9) origin9
+              then known9 else idx_in9 ancestors9 origin9) in
+   let native9 = (if str_eq meth "__send__" then "BasicObject" else "Kernel") in
+   let (methods9, _, _, _) = world in
+   let rec walk9 = fn (xs9: str list) -> fn (i9: int) -> match xs9 with
+     | Nil -> false
+     | Cons (owner9, tail9) ->
+       if i9 <= at9 then walk9 tail9 (i9 + 1)
+       else if map_has undefs (owner9 ++ "#" ++ meth) || map_has methods9 (owner9 ++ "#" ++ meth) then false
+       else if str_eq owner9 native9 then true else walk9 tail9 (i9 + 1) in
+   at9 >= 0 && walk9 ancestors9 0)
 and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) -> fn (args: Val list) ->
   // super from a method of a primitive subclass (Array/String/Hash) into the
   // builtin base: use the builtin implementation.
   let hk = hng_key recv in
   // (the copy hooks are Kernel's, and a subclass's super reaches them too)
   if str_eq meth "method_missing" then missing_native_super world recv args
+  else if (str_eq meth "send" || str_eq meth "__send__" || str_eq meth "public_send")
+          && sender_super_ahead world recv meth then
+    native_sender_call gc_cenv0 world (blk_noblk superblk) recv meth args superblk
   else if (str_len meth == 15 && str_eq meth "initialize_copy") || (str_len meth == 14 && str_eq meth "initialize_dup")
      || (str_len meth == 16 && str_eq meth "initialize_clone") then
     kernel_copy_hook gc_cenv0 world recv meth args

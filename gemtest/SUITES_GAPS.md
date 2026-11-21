@@ -54,14 +54,14 @@ module_rss_pr92_r55.json; no existing source lock or baseline is replaced.
 
 | Suite / file | Observed difference | Ownership and next step |
 |---|---|---|
-| minitest / `test_minitest_mock.rb` | Executes all 94 tests; 1 failure, 8 errors and 10 skips. File.open stubs now work with and without blocks. Remaining failures include private stubs and a dynamic method's super lookup. | Ruby semantics. Reduce the remaining alias/super witnesses; avoid dispatch functions currently edited by other sessions. |
+| minitest / `test_minitest_mock.rb` | Executes all 94 tests; 1 failure, 2 errors and 10 skips after native protocol aliases and sender fixes (previously 8 errors). The remaining cases are private Kernel stubs and a dynamic method's super fallback. | Ruby semantics. Keep the real source and exact assertion comparison; do not claim these remaining cases fixed. |
 | minitest / `test_minitest_spec.rb` | All 76 tests run: 2 failures, 0 errors, 451 versus 458 assertions. Hash expectation names now reach singleton method_missing and the nested yield reaches its outer command block. Nested spec names still retain an anonymous parent description. | Ruby semantics. A reduced class overrides to_s correctly in a direct call, but Array#join still uses its native class display. The join branch is in invoke_val_c0, shared with the other sessions, so leave it untouched until available. |
 | minitest / `test_minitest_test.rb` | Backtrace compression works and the missing-yield error is resolved; 8 exception Marshal/equality failures, 0 errors and 1 skip remain. A small exception wrapper with an overridden backtrace compares unequal after a Marshal round trip. The dump stores its delegated trace as its native trace; the reference keeps the native trace nil. | Ruby semantics. The Marshal branch is in `stdlib_src`, also edited by the GC session in #91/#94, so avoid that function until available. This is a coordination constraint, not a GC cause. |
-| rack / `spec_headers.rb` | All 51 tests run: 6 failures, 0 errors, 268 versus 302 assertions. Ruby class `[]` and bare native construction now work; the earlier observation was 37 failures / 2 errors. | Remaining Ruby semantics include default-plus-block and fetch arity, fetch_values missing-key errors, dig intermediate TypeError, copied class tags and default-Proc key normalization. Some reach super_missing's leaf fallback; native validation/copy paths also reach the shared invoke_val_c0. Keep all cases and exact assertion comparisons. The earlier rejected constructor trial is superseded by the measured fixes in invoke_val_c2 / try_self_call1 and native-super chain checks; the shared dispatcher and allocator functions remain untouched. |
+| rack / `spec_headers.rb` | All 51 tests run: 3 failures, 0 errors, 282 versus 302 assertions. Hash fetch/fetch_values/dig super is corrected; the preceding result was 6 failures / 268 assertions. | Remaining Ruby semantics concern constructor default-plus-block, clone behavior and default-Proc key normalization. Native validation/copy paths reach the shared invoke_val_c0. Keep all cases and exact assertion comparisons; the shared dispatcher and allocator functions remain untouched. |
 | rack / `spec_request.rb` | After the reporter's name super becomes available, execution reaches 2 GiB in TestProxyRequest's `handles ASCII NUL input of 16777216 bytes`. The reference completes 404 tests / 1,754 assertions with 2 skips. | Resource investigation, without a proven VM or GC cause; keep the cap. It changes from RED to MEMORY, with no MATCH gain. |
 | rack / `spec_rewindable_input.rb` | Exits without a summary. A reduced Tempfile writes successfully, but rewind fails after chmod(0); the underlying File fails too. The same write/rewind without chmod succeeds. | Ruby File/IO semantics. file_flush_obj reads the path outside its guarded descriptor fallback. Completing the read path also reaches invoke_val_c0, shared with the other sessions; avoid editing that shared function. |
 | rack / `spec_sendfile.rb` | Two tests opening a File subclass reach IO's descriptor conversion and reject a path string. | Ruby constructor inheritance; reduce a File subclass witness. |
-| rack / `spec_multipart.rb` | The process family crosses 2 GiB in `test_0018_rejects insanely long boundaries`, a background-thread pipe writer and multipart reader. The reference completes 85 tests / 239 assertions. | Resource investigation, not a proven GC or VM cause. A separate 10 MiB string allocation plus one nonblocking pipe write succeeds on both interpreters, each writing 65,536 bytes. The combined workload still needs isolation; keep the cap and leave collector internals untouched. |
+| rack / `spec_multipart.rb` | Local runs match all 85 tests / 239 assertions, while parent #115's macOS run 44414103487 again loses this file to MEMORY and fails the stronger gate. Earlier failures occur in the long-boundary pipe writer/reader workload. | Resource investigation, not a proven GC or VM cause. Preserve the actual failed snapshot in suites_hosted_r115_macos_failure.json, keep the 54-MATCH macOS gate and cap, and leave collector internals untouched. |
 | rack-test / `uploaded_file_spec.rb` | All 10 tests pass on both sides, but 255 versus 368 assertions. `Tempfile.public_instance_methods(false)` exposes File/IO implementation helpers such as __fd_read and __ln_fill. | Ruby reflection/visibility semantics; count discrepancy remains RED. Do not hide Ruby APIs or change the test's enumeration to conceal it. |
 
 The first batch establishes no confirmed dependency on C API/mkmf, native gem
@@ -362,6 +362,22 @@ reference calls the wrapper. The custom-key lookup in witness 710 runs before
 the prepend; the native fetch_values super path still exercises that key
 protocol. These dispatcher/binding coordination items are not claimed fixed.
 The original upstream file is unchanged, and its three failures stay visible.
+
+The unchanged Method-copy lifetime control fails on parent #115's hosted
+Linux job 135189701023/run44414103412 at 2.056209x (85,040 to 174,860 KiB
+post-GC); reference ratio is 1.086240. It completes in 3.089 seconds without a
+600-second/2-GiB event. The raw series remains a real failed 2x assertion.
+Consecutive saved-binary Linux/aarch64 controls observe parent 1.894/2.035
+and candidate 2.053/1.889; both fixed binaries have a pass and a failure.
+This does not establish a collector cause or make the failure known noise.
+
+A trial reading each metadata row once preserves expanded warning controls,
+but Linux observes 1.900/2.119, so it is not adopted. Its source edits and
+added control are restored. All observations, including failures and the
+unmodified check digest, remain in method_copy_lifetime_latest.json. No
+threshold, warm-up, workload, metadata runtime or collector change follows
+from the native protocol correction. Allocation/owner-lifetime investigation
+remains open alongside the multipart resource issue; no resource fix is claimed.
 
 The remaining stdlib-caller P2 also affected `mspec/scoreboard.sh` and
 `run_corpus.sh` when reference library directories were supplied through

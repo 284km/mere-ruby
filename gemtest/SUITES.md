@@ -282,3 +282,25 @@ comparisons are empty. Preceding complete snapshots remain separate.
 Corpus is 728/728; Class/Hash/Array/Super/Method retain every preceding
 passing case. Exact core outcomes, the separate unresolved controls and
 the unchanged lifetime control (1.686x) are in `suites_runtime_r28.json`.
+
+
+Rounds 29–31 preserve native respond_to? aliases and the captured protocols
+of send/__send__/public_send across Ruby overrides, aliases, retained Methods
+and native super. Blocks, refinements, coercion callbacks and public visibility
+are covered by 712/713, which fail the saved parent and match normally and
+with GC.stress. Minitest Mock runs all 94 tests with 1 failure / 2 errors
+(previously 8 errors) and remains RED. On O2 source c0b06cc7 the unchanged
+115-file inventory retains 106 MATCH / 8 RED / 0 BOTH / 1 MEMORY, all strict
+comparisons are empty, and corpus is 730/730. before_r31 snapshots retain
+the preceding complete results.
+
+The parent's hosted Linux lifetime failure and macOS multipart MEMORY remain
+unresolved merge blockers. The full failed macOS observation is preserved
+separately, never adopted as the baseline. method_copy_lifetime_latest.json
+also retains consecutive Linux saved-binary comparisons and a rejected
+metadata prototype, including every failing series. No memory fix, threshold
+change or GC cause is claimed by the sender correction.
+
+The exact original core results and unchanged local lifetime observation
+(1.769x) are retained in suites_runtime_r31.json. All preceding core MATCH
+cases are retained; complete hosted CI remains pending.
