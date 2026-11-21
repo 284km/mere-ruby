@@ -1,5 +1,5 @@
-# Existing native Method dispatch gap, separate from selected-super lookup.
-# Ruby prints true/false; both the #141 parent and the candidate fail at call.
+# A captured native Module comparator keeps its body after a prepend.
+# Both runtimes print true/false; the original dispatch failed at call.
 saved = Module.instance_method(:===)
 module SavedComparatorForwarder
   def ===(value)
