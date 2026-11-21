@@ -38,6 +38,7 @@ the fault fixture's header produced exactly the normal header's bytes. The
 test-only selector was absent from both the normal generated C and consumer
 archive, and the bundler rejected the actual injected build.
 
+
 ## `enumerator_steps.rb`
 
 ```sh
