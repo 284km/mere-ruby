@@ -255,6 +255,29 @@ VALUE rb_stat_new(const struct stat *st) {
                            "s.instance_variable_set(:@h, h); s }"), "call", 1, fields);
 }
 VALUE rb_io_binmode(VALUE io) { return mr_call(io, "binmode", 0); }
+/* (what takes RFILE(io)->fptr: the IO the struct names is what is asked) */
+void rb_io_check_closed(rb_io_t *fptr) {
+    if (!fptr || fptr->fd < 0 || RTEST(mr_call(fptr->self, "closed?", 0))) rb_raise(rb_eIOError, "closed stream");
+}
+void rb_io_check_initialized(rb_io_t *fptr) {
+    if (!fptr) rb_raise(rb_eIOError, "uninitialized stream");
+}
+void rb_io_check_readable(rb_io_t *fptr) {
+    rb_io_check_closed(fptr);
+    if (!(fptr->mode & FMODE_READABLE)) rb_raise(rb_eIOError, "not opened for reading");
+}
+void rb_io_check_writable(rb_io_t *fptr) {
+    rb_io_check_closed(fptr);
+    if (!(fptr->mode & FMODE_WRITABLE)) rb_raise(rb_eIOError, "not opened for writing");
+}
+void rb_io_set_nonblock(rb_io_t *fptr) {
+    rb_io_check_closed(fptr);
+    int flags = fcntl(fptr->fd, F_GETFL);
+    if (flags == -1) rb_sys_fail(NULL);
+    if (!(flags & O_NONBLOCK) && fcntl(fptr->fd, F_SETFL, flags | O_NONBLOCK) == -1) rb_sys_fail(NULL);
+}
+VALUE rb_io_taint_check(VALUE io) { rb_check_frozen(io); return io; }
+void rb_eof_error(void) { rb_raise(rb_eEOFError, "end of file reached"); }
 VALUE rb_io_addstr(VALUE io, VALUE str) { mr_call(io, "write", 1, str); return io; }
 VALUE rb_io_fdopen(int fd, int flags, const char *path) {
     (void)path;
@@ -337,3 +360,23 @@ char *ruby_getcwd(void) {
     return buffer;
 }
 double ruby_strtod(const char *s, char **end) { return strtod(s, end); }
+
+/* ruby/util.h: a digit of any base up to 36, by its character (-1: not one) */
+const signed char ruby_digit36_to_number_table[] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, -1, -1, -1, -1, -1, -1,
+    -1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, -1, -1, -1, -1, -1,
+    -1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
+};
