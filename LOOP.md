@@ -6459,6 +6459,88 @@ complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
 
+## 2026-11-19: compare the original Module RSS failure with current main
+
+PR #90's Linux Module job completes 195 tests / 1,240 assertions with one
+complemented-entry RSS failure: 77,672,448 to 186,966,016 bytes, 2.407109x.
+Current main 3b05689f also fails that test in hosted CI, but by its unchanged
+ten-second timeout (10.05 seconds), not a measured RSS assertion. Both use
+compiler 01f5ad73 and the same pinned test. Preserve the distinct failure
+modes; neither establishes the other's cause. The PR CI merge's runtime
+sources equal head 949e4638. A failed job rerun is still rejected while its
+containing workflow is unfinished.
+
+Build main and the PR head independently with the actual CI compiler, then
+measure sequentially under one common environment. On macOS both full files,
+and the reference, give 195 tests / 1,240 assertions with no failure/error/skip
+and identical case dictionaries. A parent-only observer of the original
+selected case gives RSS ratios 1.668504x main / 1.668009x PR. The separate
+comparison-tool validation gives 1.669211x / 1.672658x. All original 1,000
+preparation and 300,000 workload iterations and the ten-second child bound
+remain. Captured child programs agree except their original PID/time/hex
+tokens. Raw inputs and logs are retained; canonicalization changes only
+comparison hashes, and rejects malformed tokens or changed workload text.
+
+No PR-specific worsening is demonstrated locally; Linux-specific behavior
+is still unresolved. Add a separate Ubuntu job that builds both locked
+sources before measuring the complete reference/main/PR files, then the
+observed original selected case. Missing results, skips, failures, unequal
+inputs or a ratio not strictly below 2.0 fail the comparison. Every file
+retains 600 seconds / 2 GiB. The original Module gate and existing job
+durations are unchanged. Details and reproduction are in
+tools/module_rss_compare.md; the new Linux result is pending.
+
+All twelve actual local executions complete, with the original complete-file
+and selected-case coverage. The first tool-level result failed only because
+the input-hash nonce parser omitted hexadecimal digits; preserve that result
+and revalidate all saved raw inputs with the final parser. The corrected
+parser does not change a runtime observation. YAML syntax passes; actual
+bracket depth is 155/1024 with the pinned compiler. No interpreter or
+GC/VM/AST/C API implementation, allocator policy, source lock or baseline
+changed. No gem sweep or memory repair is claimed. Keep the hosted failures,
+source/binary/log hashes and both controlled pairs in
+gemtest/module_rss_pr90_r50.json. The separate Method-copy investigation is
+not evidence for this test's cause.
+
+## 2026-11-20: reject replaced case identities in the Module comparison
+
+Review P2 correctly found that equal aggregate counts could hide a missing
+original case and an extra replacement. Persist every parsed case dictionary
+and compare main/PR with the reference separately for each mode. Record
+missing/extra identities and differing verdicts; any difference rejects the
+measurement even with unchanged COMPLETE state and summary counts.
+
+Three CLI replay controls use captured successful reference transcripts,
+real parsing and acceptance, with only source/build preflight and execution
+as fixtures. The unchanged replay passes; replacing a case identity at equal
+counts fails in both complete-file and selected-case modes. Both negative
+controls reproduce the old CLI's erroneous acceptance. These are harness
+controls, not new interpreter/resource measurements. Run them in the separate
+comparison job before building. Also start the parent observer on a new line:
+its old marker joined the unfinished progress line and polluted the parsed
+selected-case name. Real reference/PR selected tests each retain one test /
+three assertions and the exact original identity. Their child input matches
+the original captured program except its upstream nonce.
+
+The earlier Linux pair has completed. Independently reparse all six raw logs
+and compare actual dictionaries before using its old collector's success.
+All complete files give 195 tests / 1,240 assertions, no failures/errors/skips,
+and identical case dictionaries. Observed selected RSS is 1.492139x main,
+1.575806x PR, 1.227229x reference. Preserve the old marker-suffixed selected
+labels in the historical record rather than rewriting the original logs.
+This passing pair does not explain or waive earlier hosted failures.
+
+Audit all 33 open PRs. The other owned branches have no unresolved review
+threads, but failed resource assertions remain: Method-copy on #110/#119/
+#131/#136 at 2.024243x / 2.213793x / 2.125194x / 2.084157x, and Module clone
+RSS on #114/#118 at 2.105955x / 2.234604x. Do not assume clone RSS is noise.
+The documented complemented-entry timeouts on #110/#136 were requested for
+job rerun; GitHub rejects each with HTTP 403 while the workflow is unfinished.
+Keep those retries pending. Other sessions' branches and PRs are untouched.
+Full audit, actual Linux logs' hashes, preserved failures and replay evidence
+are in gemtest/module_rss_review_r53.json. Workloads, limits, old snapshots,
+source locks and interpreter/GC/VM/AST/C API implementations are unchanged.
+
 
 ## PR 90 merge gate: preserve the Pathname core before physical extensions
 
@@ -6967,6 +7049,30 @@ clone RSS72159232 to151474176 bytes(2.0991655787x):195 tests,1240 assertions,
 one failure, no outer-limit event. Preserve this distinct failure; it is not
 waived as complemented-entry noise or replaced by a local pass. The final
 head's complete hosted result and every-file comparison remain merge gates.
+
+
+## 2026-11-21: use the released cache-clearing compiler for original Module comparisons
+
+The locked PR 90 source fails the original clone RSS assertion under compiler
+01f5ad73 even though its separately selected complemented-entry case passes.
+The collector correctly records the failed full-file case. Keep that hosted
+failure and its exact case dictionary; do not change acceptance or the input.
+
+Use released compiler 43f2994b for core CI and both locked comparison sources
+3b05689f / 949e4638. Ruby source, all 195 tests and 1240 assertions, observed
+child input, its ten-second timeout and every 600-second / 2-GiB family bound
+remain fixed. Reversing only inactive cached-payload clearing in each emitted
+C restores its old-compiler C byte for byte. No Ruby runtime function changes.
+
+On local Linux/aarch64, all six original comparison conditions pass: full
+Module on reference/main/PR90 and their selected original complemented-entry
+cases. Selected ratios are 1.232550 / 1.278365 / 1.288751 and the canonical
+child inputs match the previous hosted observation. On macOS, the current
+application passes Module 195/1240, Refinement 122/367 with the shared skip,
+and the original Method-copy control at 1.830389x. Preserve the distinct
+source and architecture provenance. Full corpus/gem controls and hosted
+released-compiler CI remain separate; older Method-copy failures are not waived.
+See gemtest/module_rss_released_compiler_r72.json and tools/module_rss_compare.md.
 
 ## 2026-11-20: rooted mixin arguments, scoped namespace autoload and the autoload loader
 
