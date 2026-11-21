@@ -4913,3 +4913,13 @@ original Class/Module/Method/Super/Refinement cases with 525 MATCH / 1 existing
 RED / 1 BOTH, no per-file MATCH loss against completed main d9826ac9. Class's
 native fixture is built separately against each interpreter's real headers.
 No original test, exclusion, resource bound or API inventory changes.
+
+
+## Selected native Class Method behind a prepend
+
+Class.prepend no longer makes a native subclasses super_method call the
+wrapper again. Bound/unbound selection and unbind retain the already-proven
+native owner; corpus724 checks copies and rebinding too. All723 corpus
+programs and original525 MATCH counts are retained at unchanged bounds.
+The separate issue133 about captured native metadata after later lookup
+mutations remains unresolved; this repair claims invocation and owner only.

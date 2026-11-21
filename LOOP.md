@@ -7186,3 +7186,30 @@ gems and is not a cold installation or an accepted six-stage application pass.
 The previous main Rails measurement and all NOT_RUN states remain unchanged.
 No source lock, original test, exclusion, API inventory or bound changes.
 Current-head hosted CI, full file comparisons and review still gate merge.
+
+
+### PR review: retain selected native Class methods behind prepends
+
+Once the remaining-chain query selects Class's native subclasses entry,
+mark that exact owner directly instead of searching Class's prepends again.
+The new native_owner_method_mark helper is shared with Module's existing
+marker. Both bound and unbound super_method preserve the selected Class
+owner; method_unbind_fields carries an already-proven native owner into the
+UnboundMethod. Changed functions: invoke_val_c0, method_unbind_fields,
+module_notification_method_mark and new native_owner_method_mark.
+Corpus724 adds Class.prepend with bound/unbound super_method, dup, clone,
+unbind, bind and bind_call, including the native terminal super_method.
+The original review reproduction and extra unbind comparison failed before
+these repairs and now match Ruby4.0.9.
+
+Normal O2 compiler01f5ad73 validation: **723/723 corpus**, hash index ON/OFF,
+**488.378s / 1,070,864KiB** peak family RSS. All44 focused default/evaluator/
+strict-VM and hash/MRO comparisons, all nine RSS gates, roots, dead definitions
+and C depth155/1024 pass. Complete original Class/Module/Method/Super/
+Refinement discover527 cases: **525 MATCH / 1 existing RED / 1 BOTH**, with
+Class62, Module195, Method97, Super50 and Refinement121 MATCH retained.
+Class's unchanged fixture uses each interpreter's own headers. The existing
+Method compaction failure, Refinement skip and separate captured-native
+metadata issue133 remain explicit. No original tests, exclusions, limits,
+collector/state, VM/ISeq, AST/Prism, C API or gemtest code changed. Updated-head
+hosted checks and the latest-main per-file gate remain required before merge.
