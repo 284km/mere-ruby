@@ -266,8 +266,10 @@ class StringScanner
   end
 
   def skip(re)
-    s = scan(re)
-    s.nil? ? nil : s.bytesize
+    hit = __at(re, true)
+    return __miss if hit.nil?
+    __took(hit, re, true)
+    @matched.bytesize
   end
 
   # A one-character (or one-byte) read is a match too -- of that text, with
@@ -328,12 +330,14 @@ class StringScanner
   # first match of `re`, leaving the pointer there. The span comes from the
   # MatchData rather than from `r.index(m[0])`, which found the FIRST
   # occurrence of the matched text, not the position it was matched at.
-  def __search(re)
+  # Integer-valued searches need only that span's byte count. Keep the same
+  # match state without allocating a String for everything it skipped.
+  def __search(re, ret_string = true)
     hit = __at(re, false)
     return __miss if hit.nil?
     start = @pos
     __took(hit, re, true)
-    @string.byteslice(start, @pos - start)
+    ret_string ? @string.byteslice(start, @pos - start) : @pos - start
   end
   private :__search
 
@@ -342,8 +346,7 @@ class StringScanner
   end
 
   def skip_until(re)
-    s = scan_until(re)
-    s.nil? ? nil : s.bytesize
+    __search(re, false)
   end
 
   def check_until(re)
@@ -355,9 +358,9 @@ class StringScanner
 
   def exist?(re)
     saved = [@pos, @cp]
-    r = __search(re)
+    r = __search(re, false)
     @pos, @cp = saved
-    r.nil? ? nil : r.bytesize
+    r
   end
 
   # one CHARACTER of the subject's own encoding (a byte, inside one)
@@ -490,11 +493,10 @@ class StringScanner
 
   def search_full(re, advance = true, ret_string = true)
     saved = [@pos, @cp]
-    r = __search(re)
+    r = __search(re, ret_string)
     return nil if r.nil?
-    n = r.bytesize
     @pos, @cp = saved unless advance
-    ret_string ? r : n
+    r
   end
 
   def named_captures
