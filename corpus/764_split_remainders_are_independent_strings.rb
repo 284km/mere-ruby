@@ -39,3 +39,20 @@ p [source.encoding, part.encoding, source]
 before = $~
 "no separators".split(/=/, 2)
 p [before.class, $~.nil?]
+
+# StringIO whole-buffer reads go through byteslice; sharing bytes must leave
+# the returned String mutable and independent in content and encoding.
+require "stringio"
+["", "é\0日本".encode(Encoding::UTF_8), "\xFF\0".b].each do |source|
+  [proc { |s| s.byteslice(0, s.bytesize) },
+   proc { |s| s.byteslice(0, s.bytesize + 100) },
+   proc { |s| s.byteslice(0..-1) },
+   proc { |s| s.byteslice(0..100) },
+   proc { |s| StringIO.new(s).read }].each do |read|
+    original = source.dup.freeze
+    result = read.call(original)
+    p [result == original, result.equal?(original), result.frozen?, result.encoding]
+    result.replace("changed")
+    p [original.bytes, result]
+  end
+end
