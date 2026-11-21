@@ -7773,3 +7773,23 @@ its existing record. Existing digest-header, thread timeout and other
 unsupported spec results are retained, not counted as passing cases.
 The earlier runner-only attempt's six native-gem child failures remain
 separate raw evidence. Current hosted every-file validation still gates merge.
+
+
+### Retry method-store compaction after a native pin defers it
+
+The additional-suite Method-copy guard failed at 2.093697x under the released
+compiler. Bring the already-tested compact_method_store correction from the
+later gem-suite stage forward: an unchanged, pinned arena no longer advances
+the measured baseline that determines the next real compaction attempt.
+The change is confined to that existing function; collector/pin policy,
+assertions, source locks and resource bounds are preserved.
+
+Measured source6a39ade7 with compiler43f2994b: Linux Method-copy passes two
+predetermined trials at1.519007x /1.589846x, and all seven additional-suite
+files retain6 MATCH /1 RED. On macOS the control passes at1.819241x; the
+original Method file retains98 cases and its existing compaction skip.
+The seven gem files retain6 MATCH /1 MEMORY on macOS, with byte-identical
+per-file classifications to a freshly built unmodified7c0fe03d baseline.
+The existing logger logdevice failure is not hidden or reclassified as a
+success. gemtest/method_floor_backport_r81.json retains the hosted failure,
+all Method samples and the two platform results. Baselines are unchanged.
