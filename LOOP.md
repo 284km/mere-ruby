@@ -8364,3 +8364,28 @@ All15 reader/evidence controls pass locally with explicit Fortify3, including
 the new short-read control. Previous measurement receipts retain their original
 observer hashes; this does not relabel them as measurements of the revised
 reader. Existing ordinary binaries, tests, limits and compiler pins are unchanged.
+
+### Replay the actual PR115 iclass timeout without changing its workload
+
+Sourcec22ad346 is the exact failed test merge and has the same tree as
+head767c7690. Its hosted Module file has195 tests /1234 assertions and two
+ten-second child timeouts, iclass and complemented-entry, with no outer memory
+event. Freeze that source and compare43f2994b with408b03d9 at normal O2.
+Generated C differs only at the32 Map clear and32 delete fragments.
+
+The local Linux/aarch64 fixed reference/parent/repair/repair/parent sequence
+is2.917 /5.929 /5.945 /6.198 /6.094 seconds, with original child hashes equal.
+User plus system CPU is close to elapsed time. Both complete Module files
+pass195/1240; Method-copy is1.543573492x /1.535259846x. This does not reproduce
+the native x86-64 timeout and does not establish an iclass speed improvement.
+
+The independent iclass-resource-replay job measures the same source, original
+input and fixed order on native Linux/x86-64. CPU observations use wait4 for
+the Ruby parent and waited descendants; all original stdout/stderr, inputs,
+case identities, exits and resource prefixes are retained. The ten-second
+child and600-second /2-GiB family bounds remain unchanged, including the
+wrapper in the latter. There is no added GC, sleep, allocation policy or
+retry-until-pass loop.11 acceptance controls reject altered input, enlarged
+bounds, missing trials and waived failures. Both compilers' original timings
+remain visible; the new job is not a claim of repair. The end-to-end runner
+validation is recorded separately from the first experiment.
