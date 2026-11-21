@@ -6984,7 +6984,9 @@ A borrowed-operation-name trial did not improve the paired observation
 (1.780 versus 1.712 on macOS) and was rejected. An intermediate no-op flag
 check alone also left Linux near the bound (1.975).
 
-Paired O2 observations with the same unmodified control: macOS peak RSS
+The following earlier before/after observations were initially described as
+paired, but compilation separated them; use the consecutive replay below
+for a same-window comparison. With the same unmodified control: macOS peak RSS
 179,568 to 157,856 KiB, post-GC ratios 1.712 to 1.695; offline Linux/aarch64
 199,568 to 173,416 KiB, ratios 1.980 to 1.908. The Linux container is not the
 hosted x86-64 runner; final hosted proof remains pending. Every collected
@@ -7000,6 +7002,90 @@ actual parent outcome. Its candidate still records multipart's loss against
 the stronger stored macOS baseline and is not adopted. The latest strict
 rounds 19-21 macOS run also loses that file; the preceding successful hosted
 observation does not erase the failed run or identify the resource cause.
+
+
+## Gem rounds 23-24: real class-bracket lookup and native bare construction
+
+Rack Headers exposed two separate Ruby semantic gaps. A container subclass's
+Ruby singleton [] lost to its inherited native constructor; after restoring
+that entry, bare new allocated an ordinary object without Hash storage.
+invoke_val_c2 now selects the real singleton entry after undef/alias checks,
+respecting visibility and refinements. try_self_call1 routes bare new through
+the existing native constructor, keeping the real Hash/Array storage. The
+with-arguments twin belongs to the VM session and is unchanged. An initial
+uncommitted edit hit that identical twin; it was restored before the final
+build and commit. No other session's branch was edited.
+
+super_missing now reaches Hash/Array's native class [] only when it remains
+after the actual method origin, before any tombstone or Ruby definition.
+container_bracket_super_ahead reads the existing frame's method origin/index
+and singleton chain. Coercion callbacks on a subclass carry no native bypass;
+a prepended core override consumes only its existing one-call bypass. No new
+top-level let, VM/GC implementation or shared invoke_val_c0 changes.
+
+The unchanged original headers file improves from 37 failures / 2 errors to
+6 failures / 0 errors (51 tests, 268 versus 302 assertions). It stays RED.
+Both new witnesses 706/707 fail the paired parent and match normally and with
+GC.stress; inheritance, prepend, native aliases, native super, tombstones,
+visibility, coercions, blocks and refinements are exercised. A separate
+inherited-native undef_method availability gap is confirmed on both parent
+and candidate and remains a coordination item in the shared dispatcher.
+
+Normal O2 source 170fb4b8 runs all three unchanged locks: original 54 MATCH /
+7 RED / 1 MEMORY, Matrix/Logger 6 MATCH / 1 RED, Rake 46 MATCH. All 115
+reference files are healthy. Multipart completes 85 tests / 239 assertions at
+2,006,464 KiB; no resource-cause attribution follows from this success. Keep
+the previous 53-MATCH baseline and failed candidate independently. Ordinary
+comparison has no lost MATCH; strengthen macOS to the actual 54-MATCH record,
+including Lint. The Linux baseline and both initial records are unchanged.
+
+Corpus 724/724; bracket depth 933/1024. Original core MATCH counts retain
+Class 61, Hash 297, Array 473, Super 50 and Method 97 against handoff and
+successful main. Class's reference lacks -test-/class (one BOTH); Array's
+reference shared-marking case is healthier while Mere keeps its pre-existing
+compaction skip. Hash's replace-memory-leak child reaches the unchanged
+10-second bound. Exact counts and nonpassing cases are recorded in
+suites_runtime_r24.json; no exclusions are added. Full hosted CI remains a
+separate merge requirement. The preceding metadata correction now passes
+its actual hosted Linux lifetime control at 1.909x in run 44313194961; retain
+that series alongside its earlier 2.086x failure and local controls.
+
+
+## Gem round 25: preserve native bracket aliases and the first actual entry
+
+Review found two real regressions in 596076bb: the early bracket guard
+consumed a native alias bypass before the final core override check, and
+Ruby lookup could pass Hash/Array's native owner to an included module.
+708/709 reproduce both on the saved pre-review O2 binary. Their final
+versions and 706/707 match normally and with GC.stress after correction.
+
+invoke_val_c2 now only peeks at a core bypass that its final native check
+must consume. A subclass/native-only constructor consumes its bypass at the
+direct native entry, before coercion callbacks. container_bracket_ruby_first
+walks actual singleton entries and stops at the native Hash/Array owner.
+The class-bracket case of super_next_plain uses that native boundary too,
+so a prepended override's super does not jump to an included method behind
+it. Earlier Ruby entries and tombstones retain priority. No shared dispatcher,
+VM or collector edits; top-level let counts remain main 136 / state 1167.
+
+Normal O2 source 1d0cbe6b retains original 54 MATCH / 7 RED / 1 MEMORY,
+additional 6 MATCH / 1 RED and Rake 46 MATCH. All three strict comparisons
+are empty, with every reference file healthy. Keep the 54-MATCH macOS gate;
+its preceding complete observation is preserved in suites_before_review_r25.json.
+Corpus 726/726; bracket depth 933/1024. Core MATCH counts remain Class 61,
+Hash 297, Array 473, Super 50, Method 97. The Array reference has two shared-
+marking skips in this run. Exact counts and unchanged lifetime-control series
+are in suites_runtime_r25.json (post-GC ratio 1.807).
+
+Correct the earlier timing separation explicitly: after both saved metadata
+binaries exist, consecutive macOS runs give peak 185,104 -> 131,664 KiB and
+post-GC ratios 1.708 -> 1.352. Consecutive offline Linux/aarch64 runs give
+205,108 -> 171,444 KiB, ratios 2.207 (negative control fails) -> 1.929 (passes).
+Keep all earlier observations, labelled as separated by builds, alongside
+these same-window pairs. The same workload and 2x/600-second/2-GiB bounds
+remain unchanged. Hosted x86-64 success at 1.909 is distinct evidence; the
+local Linux pair is not a hosted rerun. No resource-variation cause is inferred
+from multipart's further successful observation.
 
 ## 2026-11-20: a live refinement snapshot need not duplicate its first target
 
@@ -7687,3 +7773,23 @@ its existing record. Existing digest-header, thread timeout and other
 unsupported spec results are retained, not counted as passing cases.
 The earlier runner-only attempt's six native-gem child failures remain
 separate raw evidence. Current hosted every-file validation still gates merge.
+
+
+### Retry method-store compaction after a native pin defers it
+
+The additional-suite Method-copy guard failed at 2.093697x under the released
+compiler. Bring the already-tested compact_method_store correction from the
+later gem-suite stage forward: an unchanged, pinned arena no longer advances
+the measured baseline that determines the next real compaction attempt.
+The change is confined to that existing function; collector/pin policy,
+assertions, source locks and resource bounds are preserved.
+
+Measured source6a39ade7 with compiler43f2994b: Linux Method-copy passes two
+predetermined trials at1.519007x /1.589846x, and all seven additional-suite
+files retain6 MATCH /1 RED. On macOS the control passes at1.819241x; the
+original Method file retains98 cases and its existing compaction skip.
+The seven gem files retain6 MATCH /1 MEMORY on macOS, with byte-identical
+per-file classifications to a freshly built unmodified7c0fe03d baseline.
+The existing logger logdevice failure is not hidden or reclassified as a
+success. gemtest/method_floor_backport_r81.json retains the hosted failure,
+all Method samples and the two platform results. Baselines are unchanged.
