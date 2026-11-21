@@ -6661,3 +6661,17 @@ programs in both hash modes (468.071 seconds, 1,174,736 KiB, unchanged
 900-second/2-GiB bounds), the nine RSS workloads and root/depth/dead gates.
 Corpus 700 still matches in four independent cache configurations after
 this integration. No exclusion, budget or expected output was changed.
+
+
+### AST parameter default source order (2026-11-21)
+
+A follow-up control found that registering explicit block locals before
+parameter defaults changed a ghost-capture name from VCALL to DVAR in
+`foo { |z=y; y| y }` and its keyword-default form. Registration now happens
+after translating parameters and before translating the body, in both
+blocks and lambdas. Corpus 700 adds the two regressions and a destructured
+post-parameter control. Standalone O2 comparisons pass all three; all 869
+Ruby test ASTs and the same 971/976 Prism fixtures remain unchanged.
+The earlier complete 708-program validation applies before this follow-up;
+its updated public-API witness and hosted full suite are validated separately.
+Functions changed in this follow-up: tr_block_scope and tr_lambda.

@@ -93,3 +93,10 @@ p defined?(w)
   'while x; ; 1q; end',
   'until x; ; 1q; end',
 ].each { |source| show(source, true) }
+
+# Block-local declarations occur after parameter default expressions.
+[
+  '/(?<y>a)#@~/ =~ x; foo { |z=y; y| y }',
+  '/(?<y>a)#@~/ =~ x; foo { |z: y; y| y }',
+  '/(?<y>a)#@~/ =~ x; foo { |z=y, (y)| y }',
+].each { |source| show(source) }
