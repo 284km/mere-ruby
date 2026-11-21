@@ -36053,6 +36053,17 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         let all = (str_len name == 4 && str_eq name "gsub") || (str_len name == 5 && str_eq name "gsub!") in
         let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
         let n = str_len s0 in
+        // A failed first search needs neither replacement closures nor an
+        // output buffer. Keep the search and observable no-match state once.
+        let first = rxv_search_e pat pf s0 0 e0 in
+        if (match first with RNoHit -> true | _ -> false) then
+          (let _ = rx_clear_caps 1 in
+           let _ = rx_md_set VNil in
+           let _ = rx_pub_groups s0 1 false "UTF-8" in
+           if (str_len name == 5 && str_eq name "gsub!") || (str_len name == 4 && str_eq name "sub!") then VNil
+           else (let c = mkstr s0 in
+                 match c with VStr rid -> (let _ = senc_set rid e0 in c) | _ -> c))
+        else
         // (acc, accenc) — the encoding folds along with the text, into a
         // StrBuf whose length and ASCII-ness the negotiation reads as they
         // grow (as Array#join's does): `acc ++ piece` per match copied the
@@ -36084,13 +36095,16 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         //   publish, as a block does.
         let late9 = (match repv with VStr _ -> true | _ -> false) in
         let rec go = fn (i: int) -> fn (ae: str) -> fn (found: bool) ->
-          (match rxv_search_e pat pf s0 i e0 with
+          (match (if found || i != 0 then rxv_search_e pat pf s0 i e0 else first) with
            | RNoHit ->
              (let _ = (if found then () else
                          (let _ = rx_clear_caps 1 in
                           let _ = rx_md_set VNil in
                           let _ = rx_pub_groups s0 1 false "UTF-8" in ())) in
-              fin (app ae (substring s0 i n) e0))
+              // No first match produced any output. The caller makes a fresh
+              // Ruby String without copying the untouched bytes through gb.
+              if found || i != 0 then fin (app ae (substring s0 i n) e0)
+              else (s0, ae))
            | RBadPat -> (let _ = put9 (substring s0 i n) in fin ae)
            | RHit (st, en, saves) ->
              let _ = vec_set gst 2 1 in
@@ -39023,7 +39037,12 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
      if b0 < 0 then VNil
      else
        let piece = substring s b0 b1 in
-       let _ = sset h (substring s 0 b0 ++ substring s b1 n) in
+       // An edge removal has just one surviving span. Concatenating it with
+       // an empty string otherwise copies the entire survivor a second time.
+       let rest = (if b0 == 0 then substring s b1 n
+                   else if b1 == n then substring s 0 b0
+                   else substring s 0 b0 ++ substring s b1 n) in
+       let _ = sset h rest in
        let c = mkstr piece in
        // (a String argument: the piece is a copy OF IT, with its encoding --
        //  rb_str_subpat dups the argument; note 301)
@@ -40185,7 +40204,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VInt i0, Cons (VInt n0, _)) ->
           let i = if i0 < 0 then i0 + len else i0 in
           if i < 0 || i > len || n0 < 0 then VNil
-          else mkstr (substring a i (if i + n0 > len then len else i + n0))
+          else mkstr (if i == 0 && n0 >= len then a else substring a i (if i + n0 > len then len else i + n0))
         | Cons (VInt i0, _) ->
           let i = if i0 < 0 then i0 + len else i0 in
           if i < 0 || i >= len then VNil else mkstr (substring a i (i + 1))
@@ -40194,7 +40213,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           (match rng_slice_bounds lov hiv ex len with
            | (st, en) ->
              if st < 0 || st > len then VNil
-             else mkstr (substring a st (if en > len then len else if en < st then st else en)))
+             else mkstr (if st == 0 && en >= len then a else substring a st (if en > len then len else if en < st then st else en)))
         // an index that is not an Integer is a TypeError, not a nil: the
         // conversion is what fails, and `"".byteslice(nil, nil)` says so.
         | Cons (_, _) -> prim_raise "TypeError" "no implicit conversion from nil to integer"
@@ -71684,7 +71703,9 @@ and rx_gsub_hash = fn (pairs: Val list) -> fn (pat: str) -> fn (fl: str) -> fn (
   let n = str_len s in
   match rxv_search pat fl s i with
   | RBadPat -> acc ++ substring s i n
-  | RNoHit -> acc ++ substring s i n
+  // The caller still makes a fresh Ruby String. With no first match there
+  // is no replacement text to assemble or reason to copy the entire input.
+  | RNoHit -> if i == 0 && str_eq acc "" then s else acc ++ substring s i n
   | RHit (st, en, saves) ->
     let m = substring s st en in
     let rep = (match hash_lookup pairs (mkstr m) with (true, v) -> to_s v | _ -> "") in
@@ -71713,12 +71734,14 @@ and rx_split_lim = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (lim: int)
 // of `split(/(?=X)/)` and `split(/(?<=X)/)` one character apart.
 and rx_split_go_l = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) -> fn (p: int) ->
                    fn (lim: int) -> fn (n: int) -> fn (acc: Val list) ->
-  if lim > 0 && n >= lim then rev_app acc (Cons (mkstr (substring s i (str_len s)), Nil))
-  else if p > str_len s then rev_app acc (Cons (mkstr (substring s i (str_len s)), Nil))
+  // The untouched remainder can share immutable bytes, but still needs a new
+  // Ruby String handle. A search without a separator must not copy all input.
+  if lim > 0 && n >= lim then rev_app acc (Cons (mkstr (if i == 0 then s else substring s i (str_len s)), Nil))
+  else if p > str_len s then rev_app acc (Cons (mkstr (if i == 0 then s else substring s i (str_len s)), Nil))
   else
   match rxv_search pat fl s p with
-  | RBadPat -> rev_app acc (Cons (mkstr (substring s i (str_len s)), Nil))
-  | RNoHit -> rev_app acc (Cons (mkstr (substring s i (str_len s)), Nil))
+  | RBadPat -> rev_app acc (Cons (mkstr (if i == 0 then s else substring s i (str_len s)), Nil))
+  | RNoHit -> rev_app acc (Cons (mkstr (if i == 0 then s else substring s i (str_len s)), Nil))
   | RHit (st, en, saves) ->
     let ng = rx_ng_of fl pat in
     if en <= st then
