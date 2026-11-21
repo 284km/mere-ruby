@@ -56,6 +56,10 @@ from ci import supervise  # noqa: E402
 # (RubyGems' own command, the reference installation's script: each ruby runs it)
 gem_command = subprocess.check_output([str(REF), '-rrbconfig', '-e', 'print File.join(RbConfig::CONFIG["bindir"], "gem")'], text=True)
 stdlib = subprocess.check_output([str(REF), '-rrbconfig', '-e', 'print RbConfig::CONFIG["rubylibdir"]'], text=True)
+# Prefer this runtime's libraries before using the reference Ruby as a fallback.
+# In particular, the reference monitor.rb requires an incompatible monitor.so.
+runtime = subprocess.check_output(["sh", str(ROOT / "tools/runtime_load_path.sh"), str(MERE)],
+                                  text=True, timeout=20).split(os.pathsep)
 fetched = OUT / 'fetched'
 fetched.mkdir()
 (OUT / 'home').mkdir()
@@ -78,7 +82,7 @@ def run(key, side, command, home, seconds):
     #  installed here)
     env.update(GEM_HOME=str(home), GEM_PATH=str(home), LANG='en_US.UTF-8', HOME=str(OUT / 'home'))
     if side == 'mere':
-        env['RUBYLIB'] = stdlib
+        env['RUBYLIB'] = os.pathsep.join([*runtime, stdlib])
     log = OUT / f'{key}.{side}.out'
     old = Path.cwd()
     try:
