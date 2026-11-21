@@ -54,3 +54,10 @@ passed. This reproduces the original inputs and bounds, but does not reproduce
 the historical timeout or establish that the Map-slot repair fixes iclass
 speed. The original failed job remains failed evidence. The full native result
 is retained alongside the earlier aarch64 captures.
+
+Both Method-copy pairs are required, including the pinned program, unchanged
+bounds and every original prefix from each side. The reference in each pair
+must pass. A failing before interpreter remains useful comparison evidence;
+a missing before pair or an unhealthy before reference cannot certify success.
+The 18 evidence controls cover these cases as well as the retained native
+hosted capture.

@@ -13,6 +13,27 @@ BOUNDS = dict(wall_seconds=600, rss_kb=2097152, child_seconds=10)
 CASE = 'TestModule#test_iclass_memory_leak'
 
 
+def method_complete(pair):
+    result = pair.get('result', {})
+    sides = result.get('sides', {})
+    if (pair.get('program_sha256') != PROGRAM_SHA
+            or type(pair.get('driver_exit')) is not int
+            or result.get('bounds') != dict(wall_seconds=600, rss_kb=2097152, post_gc_growth=2.0)
+            or set(sides) != {'mere', 'reference'}):
+        return False
+    for side in sides.values():
+        samples = side.get('samples_kb', [])
+        if ([r[0] for r in samples] != list(range(21))
+                or any(type(r[0]) is not int or type(r[1]) is not int or r[1] <= 0 for r in samples)
+                or type(side.get('healthy')) is not bool
+                or type(side.get('execution', {}).get('exit')) is not int
+                or 'limit' not in side['execution']):
+            return False
+        if max(r[1] for r in samples[1:]) / samples[0][1] != side.get('post_gc_peak_to_initial'):
+            return False
+    return True
+
+
 def assess(record):
     selected = record.get('selected', [])
     complete = (record.get('source_ref') == SOURCE and record.get('compiler_refs') == COMPILERS
@@ -49,11 +70,16 @@ def assess(record):
             module_ok &= (value['execution']['exit'] == 0 and value['execution']['limit'] is None
                 and value['parsed']['summary'] == dict(tests=195, assertions=1240, failures=0, errors=0, skips=0))
         module_ok &= reference['cases'] == repair['cases'] and not lost
-    method = record.get('method', {}).get('repair', {})
-    method_ok = (method.get('driver_exit') == 0 and method.get('program_sha256') == PROGRAM_SHA
-        and method.get('result', {}).get('bounds') == dict(wall_seconds=600, rss_kb=2097152, post_gc_growth=2.0)
-        and set(method.get('result', {}).get('sides', {})) == {'mere', 'reference'}
-        and all(method_side_passed(v) for v in method['result']['sides'].values()))
+    method = record.get('method', {})
+    methods_complete = (set(method) == {'before', 'repair'}
+        and all(method_complete(pair) for pair in method.values()))
+    complete &= methods_complete
+    method_ok = False
+    if methods_complete:
+        reference_ok &= all(method_side_passed(pair['result']['sides']['reference']) for pair in method.values())
+        repair = method['repair']
+        method_ok = (repair['driver_exit'] == 0
+            and all(method_side_passed(v) for v in repair['result']['sides'].values()))
     return dict(complete=bool(complete), candidate_selected_passed=bool(candidate_ok and complete),
         reference_passed=bool(reference_ok and complete), candidate_module_passed=bool(module_ok and complete),
         candidate_method_passed=bool(method_ok), lost_passing_cases=lost,
