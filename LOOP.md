@@ -8290,3 +8290,67 @@ per-file classifications to a freshly built unmodified7c0fe03d baseline.
 The existing logger logdevice failure is not hidden or reclassified as a
 success. gemtest/method_floor_backport_r81.json retains the hosted failure,
 all Method samples and the two platform results. Baselines are unchanged.
+
+### Attribute page presence separately from native region capacity
+
+Read-only page-table observations distinguish capacity from pages actually
+present in each inventoried native region. The separate diagnostic build
+still runs the original input and is rejected by the ordinary RSS gate.
+Missing ranges, overlaps, impossible counts or denied access fail evidence
+collection. Partial payload edges are explicitly omitted; presence and
+exclusive-mapping flags are not process RSS or proof of object liveness.
+
+Locked runtime90c83c6e and released compiler43f2994b on Linux/aarch64 pass
+the ordinary Module195/1240, selected clone and Method-copy1.866672891x
+(reference1.104115371x). In the separate Method-copy diagnostic, inactive
+cache payloads have8KiB of present pages at both samples0 and20. Retired
+payloads increase from11,420 to89,212KiB; default and current method payloads
+stay close to35,704/35,880 and3,956/4,032KiB. All30 final retired arenas have
+present root pinners. The observed established-floor increases without a
+move remain zero. This identifies retained old native arenas as the main
+growth in this observation; it does not establish that their pins are stale
+or safe to release. Collector and native ownership changes remain outside
+this diagnostic patch.
+
+The repaired-source native x86-64 comparison in run44867923161 also passes:
+candidate Method-copy1.730880370x /1.797650005x and all original core controls.
+Its compiler94da60b5 has the same tree as released43f2994b. The older-source
+ae6bd8cc Method-copy2.135504918x and ordinary clone2.014963587x failures are
+retained and are not repaired by relabeling the historical job.
+
+tools/rss_page_probe.md documents the reader and the independent native Linux
+job. bench/rss_page_ownership_r84.json retains ordinary verdicts, all Method
+prefixes, page totals, pin observations and the failed historical controls.
+The captured fixture and14 reader/evidence controls include real anonymous
+mapping and access-denied checks. All35 existing native/heap/comparison
+controls still pass. No runtime Mere function, GC/pin policy, original test,
+existing workflow input, exclusion or resource bound changes.
+
+### Independently validate cleared Map slots with the same pinned workload
+
+Mere86 repairs a concrete retention source: delete/clear left logically
+removed keys and values in backing arrays inspected by conservative scans.
+Independently build compiler44bc7bc0 and emit runtime90c83c6e. Reversing only
+32 clear and32 delete fragments makes its generated C byte-identical to
+parent43f2994b. The published merge408b03d9 has exactly the same source tree.
+No compiler implementation or pin rule is edited here.
+
+Fixed parent/candidate/candidate/parent ordinary Method-copy ratios are
+1.697336335 /1.920427000 /1.574114244 /1.718854905x: all pass, but one
+candidate is higher than either parent. The candidate's additional ordinary
+run is1.590390082x; complete Module195/1240 and the original selected clone
+also pass. Retain every sample rather than claim uniform improvement.
+
+Separate Method-copy diagnostics reduce final retired payload presence from
+89,212 to65,296KiB and observed process RSS from160,440 to136,632KiB. Cache
+presence remains8KiB. All Method/Super/Class/Refinement parent and candidate
+case dictionaries are identical, with no passing case lost among332 cases.
+The reference kwarg-memory and warning failures and the existing unsupported
+Method compaction skip remain visible. This is not an all-pass reference run.
+
+bench/rss_map_slots_r85.json retains the emission proof, all paired prefixes,
+ordinary controls, page data and all additional original case dictionaries.
+The new page-ownership matrix compares parent43 with published fix408 on the
+same locked runtime; existing historical jobs and ordinary CI pins remain
+unchanged. These observations support the removed-slot repair, not a claim
+that every historical RSS failure or workload variation is fixed.
