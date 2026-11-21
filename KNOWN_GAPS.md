@@ -1,5 +1,97 @@
 # Known gaps
 
+## Stage 9: alternate collector policy and remaining GC observations
+
+Integrated main 12ca1df2 (#86, #89, #101 and #102). The last complete
+successful main measurement, CI 44196635193 at 3eb24fef, has 157 target RED
+across allocation, objspace, gc, gc_compact and string_memory. It measures
+33,313 MATCH, 1,101 RED, 132 BOTH and 21 EXTRA across 758 files, with 49
+incomplete/zero-test files. The #102 main CI has not completed.
+The original 159-case inventory
+retains two finalizer cases now passing on main after #87; they are not new
+stage 9 gains. `unittest/excludes-gc/` records
+individual default-GC slot/page/generation/compaction/internal-layout tests,
+with reasons. The upstream EXCLUDES mechanism removes the same methods
+from both interpreters, audits actual removals and reports exclusions apart
+from MATCH/RED. It does not exclude allocation comparisons.
+
+`GC::INTERNAL_CONSTANTS` and `GC.stat_heap` describe no RVALUE slot heap;
+they are empty. `GC::OPTS` advertises no generational GC. Unavailable
+compaction operations raise NotImplementedError and respond_to? is false.
+`GC.config[:implementation]` is `mere-ruby`; the CRuby GC-library-name test
+is excluded instead of changing the reference's collector identity.
+Profiler records real process CPU durations around gc_collect_any, using a
+startup epoch that survives enable/disable/clear (review witness 673); latest_gc_info
+reports actual causes and weak-reference counts, without invented heap keys.
+Process.clock_gettime(CLOCK_PROCESS_CPUTIME_ID) shares that native CPU reader.
+The browser host has no process CPU clock: startup receives an ABI-correct
+boxed unavailable value, and enabling the profiler raises NotImplementedError.
+
+The latest 157-RED intake has 12 accepted implementation matches, 57 exclusions
+and 88 handoffs. `unittest/gc_cases.tsv` retains all original 159 cases,
+including the two now passing on main. memsize_of_all still uses inherited
+slot guesses; a raw pass is not an accepted implementation match.
+Two generational tests return before assertions without USE_RGENGC. They are
+excluded symmetrically rather than claimed as unchecked implementation matches.
+The remaining objspace work needs actual literal pools, Float/Symbol identity
+and lifetime, native TypedData ownership and per-owner allocator byte counts.
+Heap dumps now expose real handles, class/reference edges, observed object_id,
+allocation-generation filters, File type and String encoding information;
+they omit the guessed memsize field. The memsize_of APIs still need actual
+allocator attribution; their pre-existing guesses are not endorsed here.
+The WeakMap lifetime test retained 50 objects after #87 and 56 after the
+392bf810 integration, against its bound of 10; conservative roots need
+precise VM lifetime tracking.
+String-memory's first call sees VM parameter-name Strings attributed to its
+caller. The allocation suite's 76 real comparisons remain VM work. These
+failures remain visible; none is excluded as default-GC behavior. The initial
+RSS regression came from reusing the collector's oncall safety flag to label
+explicit collections; a separate cause flag restores native arena collection.
+The discarded-class-ivar gate again measures 1.06x, the baseline ratio.
+
+count_objects includes real live String, Proc and Binding stores in its type
+counts and TOTAL. each_object visits actual Proc and Binding handles, with
+the same class filtering and identities. With those stores now enumerated,
+the inherited Ruby memsize_of_all loop allocates enough temporary Strings
+that its subsequent String-only sum can exceed its earlier all-object sum.
+That assertion remains a native allocator handoff, without invented byte
+counts or an exclusion. Witnesses 674 and 686 cover the actual store APIs.
+
+The full-file comparison also exposed an Enumerable timeout from repeatedly
+enumerating Arrays. Native snapshot iteration now filters candidates before
+yielding, avoids temporary Ruby snapshot Arrays, and scopes its buffers and
+callback turns. Only the current value is rooted in the existing frame;
+unvisited snapshot candidates remain collectible, with real store presence
+checked before yielding, as MMTk's iterator does. Class presence uses the
+captured collectible owner in the identity registry, preserving named classes
+with implicit superclass rows. Bulk pinning formerly kept
+all 1,001 objects alive in a GC-during-callback control; the new build retains
+about 120 and Ruby retains three. No collection is forced. Scoped vectors
+preserve snapshot identities, and exact builtin filters use their store's
+known base type. Subclass/module filters use the complete singleton tag,
+which includes modules extended onto Array/Hash values. Witness 710 covers
+these filters, collection, nested enumeration, control flow and suspension.
+
+Dump class facts come from native superclass/singleton metadata. This avoids
+calling unsupported reflective methods on Module-subclass wrappers or the
+superclass reader of an uninitialized Class. Corpus 670 covers both; the
+upstream Ractor dump and singleton dump pass on the #102 integration.
+
+TestEnumerable#test_reverse_each_memory_corruption in ruby/test_enum.rb
+still exceeds ten seconds after #101.
+In the runner's child environment about 6,800 real Arrays are visited per
+iteration: 100 iterations take 0.73 CPU seconds with an empty callback and
+1.89 with its actual body. The same 1,000-iteration program without the
+runner's loaded libraries takes 1.36 seconds. This is a VM callback-throughput
+handoff; no Array is hidden and the test remains enabled. A separate bounded
+run of TestObjectSpace#test_finalizer in ruby/test_objectspace.rb reaches
+2,123,504 KiB during its million-finalizer child (2,102,256 after #101).
+Isolated paired runs of main's actual e40 CI binary and this candidate
+pass at 1,900,768 and 2,009,040 KiB, respectively. Neither the subprocess
+timeout nor the whole-file memory regression is cleared by those isolated
+passes. They block merge until the per-file counts are restored. Full corpus
+validation after #101 is 710/710 programs matching in both hash-index modes.
+
 Divergences from CRuby that are understood, reproduced, and deliberately
 not fixed yet — as opposed to the things nobody has looked at. Each entry
 says what it costs and what fixing it would take, so the decision can be
@@ -4583,6 +4675,140 @@ Float::INFINITY). CRuby's test_enumerator (test_size_for_downup_to) hangs
 there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
 
+
+ObjectSpace._id2ref uses checked native integer conversion and actual live
+object, Proc, Binding and String handles (corpus 687/688). It respects private
+methods, missing-method proxies, receiver-side undef markers and lookup
+changes made by a custom respond_to? callback. Resolving one ID reads native
+identity metadata instead of calling unrelated objects' object_id overrides.
+The independently deliverable count/ID subset is #109. This integrated
+stack also includes native value-store enumeration; the Enumerable callback
+timeout recorded for #91 remains unresolved.
+
+ObjectSpace.count_objects also counts live String slots (including empty
+Strings) and retained Proc/Binding stores in T_DATA/TOTAL (corpus 674). The
+String count comes from actual sweep survivors plus new handles; issued
+handles for reclaimed slots do not count. This measurement does not require
+additional collection or the broader enumeration implementation.
+
+The ID converter also honors primitive singleton undef markers, including
+query callbacks which change String/Array/Hash lookup. Error class names
+come from the same native tag and preserve the primitive subclass name.
+
+The independent stage 9 GC work records actual collection causes, weak-map
+observations and process CPU profiling records. Unsupported compaction APIs
+raise NotImplementedError and report respond_to? false. INTERNAL_CONSTANTS
+contains no invented slot/heap values; stat_heap exposes no nonexistent pools.
+The GC-only subset in #112 has 41 explicit exclusions. This integrated
+stack also includes 16 ObjectSpace exclusions, for 57 audited exclusions
+on both interpreters, reported separately. The Enumerable P2 remains open.
+
+
+## Stage 9 merge audit after the complete CI run (2026-11-19)
+
+PR #91's prior complete CI 44316999605 attempt 2 is green, but comparison
+with complete main CI 44239745755 attempt 3 covers all 758 files and finds
+three lower MATCH rows: Enumerable 89 to 88, Optimization 88 to 87, zlib
+96 to 95. None is an exclusion; the 57 actual symmetric exclusions remain
+separately reported. A green measurement job does not waive these rows.
+
+Merge current main 3b05689f, keeping its compiler 01f5ad73 and bracket seed
+155. The only conflict was that seed; the actual 1024 limit and verification
+remain unchanged. Fresh independent O2 builds of main and the integrated
+GC source f6ed1792 reproduce the original cases sequentially after builds:
+
+- Enumerable: reference 0.22 s, main 1.73 s, both PASS/three assertions;
+  GC candidate reaches the original ten-second Timeout, two assertions.
+  The outer measurement is 12.357 s / 239,840 KiB without a resource event.
+  Issue #113 and its P2 remain open; do not hide real Arrays or change bounds.
+- Optimization: the unused named block parameter produces a real extra Proc
+  (T_DATA delta 1 versus reference 0). No-call/unused/used controls give
+  reference 0/0/1, main 0/0/0, candidate 0/1/1. Main's used control reveals
+  its incomplete counter. The true counts stay; issue #130 hands actual
+  lazy block-parameter materialization to the VM/evaluator work. The same
+  count path is relevant to #109. This test stays enabled, without a new
+  exclusion or fabricated zero. unittest/block_parameter_probe.rb preserves
+  the three controls in fresh processes.
+- The original zlib gunzip memory-leak case passes on all three current
+  builds: reference 1.125 s, main 6.515 s, candidate 6.551 s outer execution.
+  This selected result does not replace the required complete file/CI row.
+
+The original three files were also rerun under their normal supervisor;
+their exact current totals are recorded below. The two genuine blockers
+above are outside the original 159-row intake: that inventory remains
+two main fixes, 12 honest implementation matches, 57 exclusions and 88
+named handoffs. No collector, VM/ISeq, m_state, AST, C API, test or limit is
+changed by this audit beyond importing the already merged compiler update.
+The PR is not mergeable until these blockers and current hosted gates pass.
+
+```text
+ruby/test_enum.rb                                  90 tests  MATCH   88  RED    1  BOTH   1  EXTRA   0
+ruby/test_optimization.rb                          89 tests  MATCH   87  RED    2  BOTH   0  EXTRA   0
+zlib/test_zlib.rb                                  96 tests  MATCH   96  RED    0  BOTH   0  EXTRA   0
+total: 275 tests, MATCH 271, RED 3, BOTH 1, EXTRA 0
+```
+
+
+## 2026-11-19: restore the strict GC merge-gate cases
+
+The unchanged Optimization allocation case now passes with four assertions.
+An empty method whose sole formal is its named block parameter, with no
+defaults or observer/scheduler, avoids creating an unread Proc. Positional
+formals retain the full binder: destructuring can execute to_ary and enable
+TracePoint during binding, exposing the block through call/return Bindings. TracePoint, set_trace_func, defaults, threads/fibers, signals and
+finalizers retain the full binder. Local-declaration markers are metadata,
+not reads of the block. Real none/unused/used T_DATA deltas remain 0/0/1;
+the used Proc is still present in ObjectSpace.
+
+The unchanged Enumerable case now completes in 7.919 seconds with all three
+assertions under its original ten-second child bound. Native Array length,
+size and empty? reads avoid general dispatch only after proving the actual
+plain Array entry, its visibility and absence of observers, overrides,
+aliases, undef, prepends and refinements. A block with one ordinary positional
+formal and one value binds that same value directly, after consuming the
+source-Proc state; the surrounding frame, GC roots and flow handling stay.
+No objects are filtered out of enumeration and no collection is forced.
+
+The complete Enumerable file improves from 88 MATCH / 1 RED / 1 BOTH to
+89 MATCH / 0 RED / 1 BOTH across 90 cases, without losing any previously
+passing case. The original Module contract completes all 195 tests / 1,240
+assertions with zero failures/errors/skips (22.935 seconds / 359,296 KiB
+outer peak, unchanged 600-second / 2-GiB bounds). This local pass does not
+erase the earlier Linux clone RSS failure; the new hosted job must pass it.
+
+Corpus 725/726/727 cover actual Proc counts and binding observation, native
+Array read dispatch, and one-value block identity/arity/defaults/closures/
+bindings/keywords/flow. All three match Ruby with the hash index enabled or
+disabled and with MRO caching disabled. Existing native Array singleton-undef
+and private-call gaps produce identical failures on the preceding binary;
+their separate diagnostics are retained, no new exclusion is added, and the
+corresponding existing tests remain enabled. The native-undef gem work owns
+that independent behavior; it is not claimed fixed by this read path.
+
+Touched runtime functions: call_method, run_meth_result and bind_block_params,
+plus emethod_args; new and-helpers bind_params_body, empty_block_binding_body
+and native_array_query. The concurrently changed bind_params implementation
+is left alone. No m_state, VM/ISeq, AST/Prism, C API, API inventory, collector
+mark/sweep body or resource limit changes. The original 159-row intake and
+its 12 honest matches, 57 symmetric exclusions and 88 handoffs (plus two main
+fixes) retain their denominator. These extra merge-gate repairs are separate.
+
+The paired comparison covers 12 complete files / 1,390 cases on checkpoint
+b54452d8: MATCH 1,297 to 1,299, RED 90 to 88, BOTH 3 unchanged, no previously
+passing case lost in any file. This includes Array, Proc, Iterator, Method,
+Super, Refinement, Eval, Settracefunc and all 76 allocation comparisons;
+those allocation cases remain enabled and retain their 76 existing REDs.
+
+The final observer guard narrows the optimization to a sole named block
+formal. Its O2 binary passes the actual original allocation test (four
+assertions) and enumeration test (7.768 seconds, three assertions), the
+to_ary-activated observer control, all 715 corpus programs in both hash-index
+modes, all nine RSS controls and bracket depth 155/1024. The complete Module
+contract is repeated on this final runtime: 195 tests / 1,240 assertions,
+zero failures/errors/skips, outer 23.441 seconds / 365,632 KiB. The
+12-file checkpoint observations are not relabeled as a final-runtime rerun.
+The updated hosted CI, Linux Module memory gate and all-file comparison
+against complete main remain required before merge. No bound is changed.
 
 ## Rails dependency checksums and the next command boundary (2026-11-19)
 
