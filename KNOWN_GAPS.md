@@ -4582,3 +4582,38 @@ bound is computed by walking it, so it does not return (ruby answers
 Float::INFINITY). CRuby's test_enumerator (test_size_for_downup_to) hangs
 there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
+
+
+## Rails loading: remaining evaluator boundaries (2026-11-20)
+
+Rooted extend/include factory expressions, real class/module singleton
+extend overrides, autoloaded scoped class namespaces and autoload's main
+require receiver have small matching witnesses in corpus 729-732. The
+original Module/Syntax/Parse/Forwardable/Method/Super/Autoload/Require files
+retain main's per-file MATCH counts (722 cases, 717 MATCH / 1 RED / 4 BOTH).
+
+A validation-only composition still stops migration at a Module subclass's
+block-bearing define_method. Boot, the application's tests and HTTP are
+not reached. The selected original ActiveSupport OrderedOptions, Concern
+and Inflector files discover all 521 cases: 513 MATCH / 8 RED. Remaining
+failures include Hash subclass default reads and Enumerable iteration,
+String-subclass gsub! super, and Unicode lookbehind. This is not the whole
+Rails test suite. No original test or exclusion was changed to obtain it.
+
+Scoped class namespace identity does not repair the existing module_eval
+lexical-nesting bug: unittest/scoped_class_lexical_probe.rb returns :missing
+on reference Ruby and :found on both preceding main and this candidate.
+It is an explicit failing diagnostic, not a passing corpus case.
+
+The rooted-loading review also fixes the shadowed three-segment namespace
+regression: corpus738 verifies the lexical first constant, remaining namespace
+walk, explicit root and autoload on both definition paths. The separate
+module_eval lexical-nesting diagnostic above remains a known failure.
+
+
+The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
+namespace constants and intermediate const_missing results as real scope
+lookups (corpus742). Both definition paths retain the lexical first constant,
+privacy and autoload behavior. The712-file corpus and original nine-file784-case
+comparison pass without losing a main PASS. The separate module_eval lexical
+negative remains an explicit failing diagnostic; this change does not claim it.

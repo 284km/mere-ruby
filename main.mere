@@ -6182,6 +6182,16 @@ and defined_super_str = fn env -> fn world ->
   // current method is defined in, along the receiver's ancestors. Reading only
   // the direct superclass missed every super that lands in an included module,
   // which is the shape ruby/spec uses to test super at all.
+  else if str_eq meth "extend" && (match recv9 with VClass _ -> true | _ -> false) then
+    (let rec available9 = fn (xs9: str list) ->
+       (match xs9 with
+        | Nil -> false
+        | Cons (a9, tail9) ->
+          if map_has undefs (a9 ++ "#" ++ meth) then false
+          else if map_has m2 (a9 ++ "#" ++ meth) || str_eq a9 "Kernel" then true
+          else available9 tail9) in
+     if available9 (anc_after (ancestors_of world (super_base world recv9)) defcls)
+     then mkstr "super" else VNil)
   else if is_sng_cls defcls then
     (let sc9 = sng_supername world defcls in
      if has_meth world sc9 meth then mkstr "super" else VNil)
@@ -14175,7 +14185,10 @@ and autoload_fire0 = fn env -> fn world -> fn blk -> fn (key: str) ->
         let ok9 = try_or (fn (u: unit) ->
                             (let _ = (if main_sng_has world "require" || (let (mt9, _, _, _) = world in map_has mt9 "require")
                                       then (let _ = invoke_val_c env world blk VMain "require" (Cons (mkstr path, Nil)) false in FNext VNil)
-                                      else exec_stmt env world blk (SRequire (false, EStrL path))) in true)) false in
+                                      else (let require_env9 = map_new () in
+                                            let _ = map_iter env (fn (k9: str) -> fn (v9: Val) -> map_set require_env9 k9 v9) in
+                                            let _ = map_set require_env9 "self" VMain in
+                                            exec_stmt require_env9 world blk (SRequire (false, EStrL path)))) in true)) false in
         let _ = autoload_settle world key in
         // a file that ran and did not define the constant is worth a word
         // under -w (ruby's rb_warning), once: the registration is spent
@@ -18631,7 +18644,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      recv)
   // `recv.extend(M...)` / bare `extend M` (self is a class/object): mix each
   // module's instance methods into the receiver's singleton class.
-  else if (str_len name == 6 && str_eq name "extend") && (match recv with VClass _ -> true | VObj _ -> true
+  else if (str_len name == 6 && str_eq name "extend")
+          // A Ruby class/module singleton method precedes Kernel#extend.
+          // A saved native alias or super consumes its one-call bypass here.
+          && (match recv with VClass c9 -> (if cls_meth_own world c9 name && bi_skip_pass name then false else true) | _ -> true)
+          && (match recv with VClass _ -> true | VObj _ -> true
                                          | VStr _ -> true | VArr _ -> true | VHsh _ -> true
                                          // (main too: `extend M` at the top level)
                                          | VMain -> true
@@ -48768,6 +48785,51 @@ and ancestors_of_raw = fn world -> fn (cls: str) ->
 // `autoload :Parents` on the enclosing module and never requires the file
 // itself). Referencing it has to run that file first, exactly as reading the
 // constant would.
+// A scoped class/module definition evaluates its namespace before its
+// superclass. In particular an autoload, alias or const_missing can supply
+// the actual module; a spelling guessed before loading is not its identity.
+// Resolve each scope operator from its actual receiver. Object's constants
+// use top-level keys; ancestors, autoloads and const_missing remain observable.
+and scoped_namespace_tail = fn env -> fn world -> fn blk -> fn (value9: Val) -> fn (rest9: str) ->
+  if str_eq rest9 "" then value9
+  else (match scope_mod_val world value9 with
+        | VClass owner9 ->
+          (let seg9 = const_head rest9 in
+           let key9 = (if str_eq owner9 "Object" then seg9 else owner9 ++ "::" ++ seg9) in
+           let _ = (if map_has consts key9 then () else (let _ = autoload_fire env world blk key9 in ())) in
+           let ancestor9 = (if map_has consts key9 then "" else anc_const_key_q world owner9 seg9) in
+           let found9 = (if map_has consts key9 then key9 else ancestor9) in
+           let next9 = (if str_eq found9 "" then
+                          (if mod_inst_hook world value9 then invoke_val_c env world blk value9 "const_missing" (Cons (VSym seg9, Nil)) false
+                           else scoped_read_missing env world blk owner9 seg9)
+                        else if map_has private_consts found9 then
+                          (if has_own_meth world ("(sng:" ++ owner9 ++ ")") "const_missing" || has_own_meth world owner9 "const_missing"
+                           then invoke_val_c env world blk (VClass owner9) "const_missing" (Cons (VSym seg9, Nil)) false
+                           else priv_const_err world found9)
+                        else (let _ = const_read_note world found9 in map_get consts found9)) in
+           scoped_namespace_tail env world blk next9 (const_tail rest9))
+        | other9 -> raise_exc world "TypeError" (inspect_w env world other9 ++ " is not a class/module"))
+
+and scoped_class_definition_name = fn env -> fn world -> fn blk -> fn (name9: str) ->
+  let head9 = recv_of_scoped name9 in
+  let i9 = str_len head9 in
+  let tail9 = substring name9 (i9 + 2) (str_len name9) in
+  if str_eq head9 "" then tail9
+  else
+    (let (_, sup9, _, _) = world in
+     let base9 = (if lv_has env head9 then lv_get env head9
+                  else if is_anon_cls head9 && (map_has sup9 head9 || map_has modules head9) then VClass head9
+                  else (let first9 = first_colon2 head9 0 in
+                        let local9 = (if first9 > 0 then substring head9 0 first9 else "") in
+                        if first9 > 0 then
+                          (let leading9 = (if lv_has env local9 then lv_get env local9 else eval_e env world blk (EConst local9)) in
+                           scoped_namespace_tail env world blk leading9 (substring head9 (first9 + 2) (str_len head9)))
+                        // A leading :: remains an explicit root anchor.
+                        else eval_e env world blk (EConst head9))) in
+     match base9 with
+     | VClass owner9 -> if str_eq owner9 "Object" then tail9 else owner9 ++ "::" ++ tail9
+     | other9 -> (let _ = raise_exc world "TypeError" (inspect other9 ++ " is not a class/module") in name9))
+
 and named_class_of_al = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (nm: str) ->
   let r = named_class_of cref nm in
   if map_has consts r || map_has modules r then r
@@ -49736,7 +49798,8 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // (`super` into Kernel#to_s / #inspect for a plain object is `#<Foo:0x..>`,
   //  and the ivars for #inspect: the leaf's world-free answer is "#<object>",
   //  which is replaced -- the builtin classes' own answers stand)
-  else if is_prim_method meth then
+  else if is_prim_method meth
+          && (if str_eq meth "extend" && (match recv with VClass _ -> true | _ -> false) then false else true) then
     (let r9 = prim_method recv meth args in
      match (recv, r9) with
      // (an exception's is Exception#inspect: `#<E: message>`)
@@ -49832,6 +49895,13 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   else if is_kernel_builtin meth && (if kernel_bare_special meth then false else true)
           && (if kernel_reads_frame meth then false else true) then
     kernel_super world superblk recv meth args
+  // Kernel#extend is a real ancestor before method_missing. Re-enter the
+  // native arm once, retaining its ordinary validation and mixin callbacks.
+  else if str_eq meth "extend" && (match recv with VClass _ -> true | _ -> false) then
+    (let _ = map_set bi_skip "n" meth in
+     let answer = try_or_msg (fn (u: unit) -> invoke_val_c gc_cenv0 world superblk recv meth args false)
+                    (fn (message: str) -> (let _ = map_clear bi_skip in fail message)) in
+     let _ = map_clear bi_skip in answer)
   else if has_meth world dcls "method_missing"
   then invoke world superblk recv dcls "method_missing" (Cons (VSym meth, args))
   // Ruby defines the definition hooks as no-ops on Class/Module/BasicObject,
@@ -59517,17 +59587,9 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
          let rcn9 = resolve_scoped_base cenv cname in
          // a scoped name's first segment is looked up from the nesting outward
          // (`module N; class Q::W` is ::Q::W when N::Q does not exist)
-         let scoped_in9 = fn (nm: str) ->
-           (let hd = (let k = str_index_of nm "::" in if k < 0 then nm else substring nm 0 k) in
-            let rec walk = fn (sc: str) ->
-              (if str_eq sc "" then nm
-               else if map_has consts (sc ++ "::" ++ hd) then sc ++ "::" ++ nm
-               else if str_contains sc "::" then walk (recv_of_scoped sc) else walk "") in
-            walk cscope) in
-         let full = if (if str_eq rcn9 cname then false else true) then rcn9
-                    else if str_len cname >= 2 && str_eq (substring cname 0 2) "::" then substring cname 2 (str_len cname)
+         let full = if str_contains rcn9 "::" then scoped_class_definition_name cenv world noblk cname
+                    else if (if str_eq rcn9 cname then false else true) then rcn9
                     else if str_eq cscope "" then cname
-                    else if str_contains cname "::" then scoped_in9 cname
                     else cscope ++ "::" ++ cname in
          // (under Object is the top level, as run_stmt's SClass has it)
          let full = (if str_len full > 8 && str_eq (substring full 0 8) "Object::" then substring full 8 (str_len full) else full) in
@@ -62039,15 +62101,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // the lexical scope outward: inside `class TP` it is TP::A3::B3 when TP::A3
     // exists. Taking it as written reopened a top-level A3::B3 that was not
     // there (test_primitive's constant-cache loop)
-    let scoped_in = fn (nm: str) ->
-      (let hd = (let k = str_index_of nm "::" in if k < 0 then nm else substring nm 0 k) in
-       let rec walk = fn (sc: str) ->
-         (if str_eq sc "" then nm
-          else if map_has consts (sc ++ "::" ++ hd) then sc ++ "::" ++ nm
-          else if str_contains sc "::" then walk (recv_of_scoped sc) else walk "") in
-       walk lex) in
-    let name = if toplevel || str_eq lex "" then name
-               else if str_contains name "::" then scoped_in name
+    let name = if str_contains name "::" then scoped_class_definition_name env world blk name0
+               else if toplevel || str_eq lex "" then name
                else lex ++ "::" ++ name in
     let super0 = if str_eq super0 "" || str_eq super0 "(module)" || str_eq lex "" || str_contains super0 "::" then super0
                  else if map_has consts (lex ++ "::" ++ super0) then lex ++ "::" ++ super0 else super0 in

@@ -6488,3 +6488,99 @@ fallbacks are unchanged: 6 a Regexp in another encoding -- allowing those
 moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
+
+
+## 2026-11-20: rooted mixin arguments, scoped namespace autoload and the autoload loader
+
+Unchanged Rails loading reached three independent evaluator boundaries:
+`extend ::Factory.with(routes)` stopped at the rooted constant; Marcel's
+singleton `extend` was preempted by Kernel's native entry; and
+`class Base::Child` guessed its namespace before resolving Base's autoload.
+Parse the complete rooted expression, let real singleton definitions win,
+and resolve the actual namespace value before registering its child. Keep
+raw self/local namespace references so lexical constants cannot replace them.
+
+Bundler then exposed autoload invoking an object's unrelated `require`
+method. The normal loader now runs with main as receiver, as does the
+already supported custom main loader. It retains the original scope data.
+The small witnesses are corpus 729-732; each matches Ruby in normal mode,
+with the hash index disabled, with the MRO cache disabled, and with both
+disabled (16 comparisons). No new top-level Mere values were added.
+
+Normal O2 on main d9826ac9 plus these repairs: **710/710 corpus files**
+match with the hash index both ON and OFF; all nine original loop RSS checks,
+dead-definition checks and generated-C depth **155/1024** pass. The pinned
+Ruby 4.0.9 files compare as follows, using the same bootstrap and exclusions
+on both sides, 600 seconds per interpreter, 2 GiB per family and the original
+10-second child limits:
+
+| original file | main MATCH | candidate MATCH | RED | BOTH |
+|---|---:|---:|---:|---:|
+| ruby/test_module.rb | 195 | 195 | 0 | 0 |
+| ruby/test_syntax.rb | 168 | 168 | 0 | 2 |
+| ruby/test_parse.rb | 102 | 102 | 0 | 0 |
+| test_forwardable.rb | 27 | 27 | 0 | 0 |
+| ruby/test_method.rb | 97 | 97 | 1 | 0 |
+| ruby/test_super.rb | 50 | 50 | 0 | 0 |
+| ruby/test_autoload.rb | 27 | 27 | 0 | 1 |
+| ruby/test_require.rb | 51 | 51 | 0 | 1 |
+
+That is **722 discovered / 717 MATCH / 1 RED / 4 BOTH**, on both builds,
+with no original passing case lost. Module retains all **1,240 assertions**.
+An earlier attempt lowered every `include m` to a general method call and
+made the original iclass child exceed 10 seconds. Keep the direct include
+path for ordinary names and use expression parsing for the computed ternary
+that actually needs it. The bound and the original test stay unchanged.
+Earlier paired Syntax runs on the previous main had the same invalid-symbol
+memory-test timeout on both builds; retain those observations separately.
+
+An own validation-only composition reaches the next actual Rails failure:
+ActiveModel's Module subclass cannot define a method from a block. Migration
+fails, so boot, application tests and HTTP remain NOT_RUN. Reused own gem
+homes make this a warm diagnostic, not a new installation or Rails pass.
+The original selected ActiveSupport files are 513 MATCH / 8 RED out of 521;
+no framework-wide pass is claimed. The pre-existing module_eval lexical
+negative case remains RED and is kept as unittest/scoped_class_lexical_probe.rb.
+
+### Rooted loading review: choose a scoped namespace lexically (2026-11-20)
+
+Review found a real regression when both A::B and Scope::A::B exist:
+`class A::B::Child` inside Scope selected the outer namespace. Resolve an
+unrooted prefix's first segment in its lexical scope, then walk the remaining
+segments from that actual module. Preserve explicit :: roots and existing
+self/local bindings. Corpus738 covers class/module/conditional definitions,
+root anchors, aliases and lexical autoloads; it and729-732 match in all four
+hash/MRO settings (20 comparisons).
+
+Normal O2 bcb3bca9: **711/711 corpus**, hash index ON/OFF; all nine existing
+RSS checks, dead definitions and C depth155/1024 pass. The original nine-file
+pair discovers784 cases on both builds: **777 MATCH/2 RED/5 BOTH** on each,
+with no original PASS identity lost. Class61, Module195, Syntax167, Parse102,
+Forwardable27, Method97, Super50, Autoload27 and Require51 MATCH are equal.
+The known invalid-symbol Syntax memory failure occurs on both main and this
+candidate; earlier168-MATCH observations are retained, not overwritten.
+No original test, exclusion or limit changed. Hosted checks must still finish
+on the review correction before merge.
+
+
+### Scoped namespace review: every remaining segment is a real scope lookup
+
+Resolving the first constant lexically was necessary but did not make
+const_walk_go a full scope lookup. Object::Branch uses a top-level Branch
+key; ancestor constants and intermediate const_missing results were also lost.
+Add scoped_namespace_tail to follow the actual receiver through each scope
+operator, with Object's top-level keys, ancestors, autoload, privacy and the
+real const_missing callback. Preserve the first-segment lexical correction.
+Corpus742 covers class/module definitions, nested and conditional definitions,
+Object roots, inherited namespaces, intermediate hooks, autoload and refusals.
+
+Normal O2 runtime48f8e37f: **712/712 corpus**, index ON/OFF;729-732/738/742
+match all24 hash/MRO mode comparisons. All nine existing RSS gates, dead
+definitions and C depth155/1024 pass. Complete original Class/Module/Syntax/
+Parse/Forwardable/Method/Super/Autoload/Require discover784 cases: main d9826ac9
+and candidate both777 MATCH/2 RED/5 BOTH, zero EXTRA or lost original PASS.
+Module retains195 tests and1,240 assertions. The existing invalid-symbol Syntax
+memory failure is present on both; original test files, bootstrap, exclusions
+and600-second/2-GiB/10-second child limits are unchanged. This correction
+requires new hosted checks; the previous head's known complemented-method
+10.03-second child Timeout is retained rather than waived for merge.
