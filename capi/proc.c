@@ -78,6 +78,7 @@ static VALUE block_proc(rb_block_call_func_t func, VALUE data, int lambda) {
     return mr_up(MR_PROC_NEW, (VALUE)mr_register_function((void *)func, -3), data, (VALUE)lambda,
                  (VALUE)mr_frame_method(), mr_frame_block());
 }
+VALUE mr_block_function(rb_block_call_func_t func, VALUE data) { return block_proc(func, data, 0); }
 VALUE rb_block_call(VALUE obj, ID mid, int argc, const VALUE *argv, rb_block_call_func_t func, VALUE data) {
     VALUE block = func ? block_proc(func, data, 0) : Qnil;
     return mr_callv(obj, mid, argc, argv, block, 0);
