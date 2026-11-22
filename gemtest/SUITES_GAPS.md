@@ -119,6 +119,17 @@ extensions, RubyVM/ISeq, AST/Ripper/Prism trees, or GC's internal constants.
 Overlap with another session's dispatch helper is a coordination constraint,
 not evidence that the underlying behavior belongs to that subsystem.
 
+A subsequent scanner investigation confirms a separate native UnboundMethod
+binding gap on the paired preceding runtime as well: define a String's
+singleton `length` to return `bytesize`, then bind
+`String.instance_method(:length)` to that String. For `"éx"` the reference
+returns 2, while the interpreter redispatches to the singleton and returns 3.
+This is Ruby semantics requiring coordination in the shared `invoke_val_c0`
+and `invoke_with_block0` dispatchers, rather than a native gem dependency.
+Neither dispatcher changes here. A scanner position fast path that trusted
+the overridden character count was withdrawn; corpus 767 preserves the
+correct position behavior. No API is excluded or replaced with a fixed value.
+
 Resolved in this batch:
 
 - Minitest's continued format string followed by `% [arguments]` no longer

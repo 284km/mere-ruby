@@ -10225,3 +10225,82 @@ source; require current-head hosted Linux CI. No collector, native pin,
 threshold, test workload, API exclusion, top-level value, VM, AST or C API
 implementation changed. Existing hosted Method-copy failures on other stacked
 heads also remain merge gates; this local result does not waive them.
+
+## StringScanner: keep skip entries independent and avoid unused search Strings (2026-11-22)
+
+`skip` called Ruby's `scan`, and `skip_until` called Ruby's `scan_until`.
+A subclass overriding those public methods therefore changed the skip
+results and prevented the pointer from advancing. CRuby's skip entries run
+their own scan. Use the existing internal matching worker directly instead:
+the corpus subclass now returns 1 with position 1 and then 3 with position 4,
+without calling either override. The preceding runtime returned 8 and left
+position 0 after each call.
+
+The shared search worker also built a String spanning everything from the
+pointer through the match even when `exist?`, `skip_until` or `search_full`
+only needed its byte count. Keep the same MatchData and scanner state but
+return `end - start` directly in those cases. String-valued searches retain
+their existing slice. Changed Ruby methods are `StringScanner#skip`,
+`#__search`, `#skip_until`, `#exist?` and `#search_full`; regenerate their
+existing `pathname_lib_src` body. Interpreter/GC/VM/C API implementation,
+compiler pins, source locks, accepted snapshots and top-level values do not
+change.
+
+Ordinary O2 source `0f5aae57`, compiler `408b03d9`, is compared with parent
+`9bd00c1a`. The fixed 8-MiB / 24-search workload in
+`bench/scanner_search_lengths.rb` retains the checksum
+`[8388608, 201326592, 0, "z"]` without manual collection, warmup or delay.
+The reference/before/candidate/candidate/before child peaks recorded by
+wait4 are **35,312 / 255,760 / 122,976 / 122,960 / 255,680 KiB**. The existing
+600-second / 2-GiB process-family supervisor covers the wrapper and child;
+its sampled family peaks are retained separately. The first sampled-only
+reference observation missed its short child's actual peak and reported
+32 KiB. Keep that incomplete observation, and use the kernel peaks from the
+same repeated fixed sequence for the resource comparison.
+
+The complete original Rack Request file remains MEMORY in every fixed
+before/candidate/candidate/before run: **2,399,232 / 2,224,864 / 2,127,920 /
+2,245,024 KiB**. References retain 404 tests / 1,754 assertions and two skips.
+Selected multipart observations are 1,147,792 / 1,152,416 KiB, retaining one
+test / 130 assertions. The selected 128-MiB NUL case is 1,869,552 / 1,606,400
+KiB, retaining one test / five assertions. These do not establish a repair
+of the whole file or a causal improvement of that NUL path.
+
+All named cases and summaries in the original Regexp, StringScanner, Module
+and Refinement files are identical before/after. StringScanner retains its
+existing two errors; the Regexp reference retains its own memory assertion
+failure. Module passes 195 / 1,240, Refinement retains 122 / 367 with its
+existing skip, and Method-copy passes **1.372842949x** with all 21 prefixes
+(reference 1.080407701x). The nine original loop RSS checks, dead/duplicate
+definitions, GC roots, record hygiene and bracket depth **155/1024** pass.
+
+A separate byte-position shortcut was withdrawn: it trusted a String's
+overridden `length` and made `charpos` wrong. Corpus 767 retains byte/character
+positions across mutations and encodings, including that override; corpus
+768 covers integer/String search results, match state, unscan and native skip
+dispatch. No position shortcut or its measured gains are part of this source.
+The paired preceding runtime also exposes a native UnboundMethod binding
+redispatch gap; keep it in the semantics coordination ledger rather than
+editing the shared dispatchers here.
+
+The final five-group offline sweep retains **13 gems / 129 files: 120 MATCH /
+7 RED / 0 BOTH / 2 MEMORY**, with zero lost accepted or preceding MATCH.
+Logger's formerly RED LogDevice file now reaches MEMORY; keep that changed
+verdict. Its separate fixed parent/candidate/candidate/parent recheck is also
+all MEMORY: **2,182,912 / 2,344,288 / 2,366,736 / 2,267,744 KiB**, with healthy
+27-test / 124-assertion references. No baseline is replaced. Read-only copies
+of the monitor's existing PID/RSS table show the root itself holding the large
+RSS at the guard, rather than establishing an aggregate-of-children cause.
+One parent diagnostic completes at 1,772,160 KiB with its known assertion
+failure; the candidate diagnostic remains MEMORY at 2,613,664 KiB. Keep all
+observations and the uncertainty about the retained allocation's owner.
+
+All **756 corpus programs** match Ruby 4.0.9 with the hash index ON and OFF in
+**598.656 seconds / 1,193,568 KiB**, within the unchanged 900-second / 2-GiB
+aggregate bound. `bench/scanner_search_copies_r100.json` keeps every original
+gem row, core case, Method prefix, kernel/family measurement, failed complete
+Request and Logger comparison, diagnostic and raw-log hash. Local Docker
+content-store reads still fail with input/output errors, so current-head
+hosted Linux validation remains required. Keep the candidate draft until
+hosted checks, latest-main per-file comparison, parent integration and review
+pass. The existing hosted Method-copy failures remain separate merge gates.
