@@ -106,6 +106,9 @@ wall="${UNITTEST_WALL:-600}"
 #   (42.upto(Float::INFINITY).size) came first the second time.
 seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
+# The reference libraries supplement mere-ruby's stdlib. Keep the runtime's
+# own entries first when require honors the actual load-path order.
+mere_stdlib="$(sh "$root/tools/runtime_load_path.sh" "$mr")" || exit 1
 rake_source="$("$ref" -e 'begin; print Gem.bin_path("rake", "rake"); rescue Gem::Exception; end')"
 select_rake() {
   # This file installs its own rake gem and checks RubyGems' executable
@@ -171,7 +174,11 @@ if [ "${1:-}" = "--one" ]; then
   if [ -n "${UNITTEST_REF_EXT_PATH:-}" ]; then
     ref_lib="$UNITTEST_REF_EXT_PATH:$ref_lib"
   fi
-  mere_lib="$src/tool/lib:$src/test:$shim:$stdlib"
+  mere_fallback="$stdlib"
+  case "$rel" in
+    rubygems/*) mere_fallback="$src/lib:$mere_fallback" ;;
+  esac
+  mere_lib="$src/tool/lib:$src/test:$shim:$mere_stdlib:$mere_fallback"
   # (the test extensions built against mere-ruby's ruby.h: tools/capi_ext_build.py)
   if [ -n "${UNITTEST_MERE_EXT_PATH:-}" ]; then
     mere_lib="$UNITTEST_MERE_EXT_PATH:$mere_lib"
@@ -191,8 +198,7 @@ if [ "${1:-}" = "--one" ]; then
         mere_lib="$work/$n.mkmf-context/source/lib:$mere_lib"
       fi ;;
     rubygems/*)
-      ref_lib="$src/lib:$ref_lib"
-      mere_lib="$src/lib:$mere_lib" ;;
+      ref_lib="$src/lib:$ref_lib" ;;
   esac
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.
@@ -208,7 +214,7 @@ if [ "${1:-}" = "--one" ]; then
   out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
   printf 'mere\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
-  (cd "$dir" && select_rake "$mr_run" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr_run" RUBY="$mr_run" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.mere.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr_run" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$mr" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr_run" RUBY="$mr_run" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.mere.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr_run" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
   mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"

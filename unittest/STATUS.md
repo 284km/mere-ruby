@@ -1,12 +1,12 @@
 # mere-ruby — CRuby's own tests
 
-GC exclusions configured by the independent stage 9 GC work: **41 tests**
-(19 GC and 22 compaction), applied identically to both interpreters and
-reported separately from MATCH/RED/BOTH/EXTRA. The historical table below
-predates this ledger; the next complete CI report supplies measured totals.
-Allocation comparisons remain enabled. ObjectSpace's separate exclusions
-remain part of PR #91.
-
+GC exclusion ledger (stage 9, 2026-11-16): **57 tests excluded on both
+interpreters**, measured separately from MATCH/RED/BOTH/EXTRA in the four
+target files. This historical full-suite table below predates that ledger;
+fresh CI reports its actual exclusions separately in `exclusions.tsv` and
+`summary.json`. Allocation comparisons remain enabled.
+The GC-only subset in #112 has 41 exclusions; this integrated stack also
+includes 16 ObjectSpace exclusions, for the 57 counted here.
 
 CRuby's test/ files at the reference's release, run under mere-ruby and under
 ruby 4.0.9 test by test (`unittest/run.sh`). A second yardstick beside
