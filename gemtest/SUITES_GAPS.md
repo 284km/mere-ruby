@@ -50,6 +50,27 @@ in these macOS and Linux/aarch64 observations, but the earlier hosted x86-64
 series is retained without assigning an unproven VM/GC cause or changing the
 existing control, warmup, workload, skip policy or threshold.
 
+The locked same-runner Linux Module comparison completes all three original
+195-test / 1,240-assertion files. Actual dictionaries were independently
+compared after review found a coverage-identity hole in the old collector.
+The new acceptance rejects missing/extra cases or differing verdicts at equal
+counts. Selected-case RSS observations are 1.492139x main / 1.575806x PR;
+these do not waive older failures or identify a memory repair. The parent
+observer's marker now starts on a new line to preserve the real case name.
+See `module_rss_review_r53.json` for the original logs' hashes and PR audit,
+including unresolved Method-copy and Module clone RSS assertions. Existing
+baselines, workloads and resource bounds are unchanged.
+
+The hosted Module complemented-entry check is under a separate controlled
+comparison. PR #90 fails its RSS assertion at 2.407109x; current main fails
+the same case by the original ten-second timeout. Independent O2 builds
+using their actual CI compiler show full 195-test / 1,240-assertion parity
+on macOS, with selected-case ratios near 1.67x on both. This does not rule
+out Linux-specific behavior or establish a shared cause. A separate Ubuntu
+job now compares both locked sources on one runner. Preserve the failed
+hosted observations and unchanged gate in `module_rss_pr90_r50.json`.
+There is no new gem measurement or memory fix in this round.
+
 This ledger describes file verdicts from `suites_latest.json`. Raw stdout and
 stderr in CI's `gem-suites-*` artifacts identify individual failed tests.
 Symptoms below are observed; an unconfirmed cause is explicitly marked.
