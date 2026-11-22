@@ -7556,6 +7556,12 @@ The HTML host now returns its guest wrapper's declared -2/empty-string unavailab
 sentinels, preserving startup without claiming timestamp support. The native
 File/C API implementation is unchanged.
 
+Merging main on 2026-11-22 (after #91, #99, #103, #144 and #149): #91 carried
+this same GC work, so the code, glue, exclusion files, corpus 673/711 and this
+record are already on main byte for byte. Main's wording of the ledger (41 GC
+and compaction plus 16 ObjectSpace, 57 in all) and its run.sh are kept; #112
+adds only this note.
+
 
 ## 2026-11-18: consolidate the deferred GC/ObjectSpace stack
 
