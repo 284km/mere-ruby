@@ -6,6 +6,64 @@ five suites are minitest 5.25.5, rack 3.2.0, rack-test 2.2.0, public_suffix
 6.0.2 and base64 0.2.0 (62 files). These are independent of the load-only
 snapshot in `snapshot.lock.json`.
 
+`suites_additional.lock.json` adds Matrix 0.4.3 and Logger 1.6.0 separately:
+seven original files and 169 reference tests. It pins their release commits
+and the actual pure Ruby test-unit 3.7.8, test-unit-ruby-core 1.0.16 and
+power_assert 3.1.0 archives. It uses the same restore/measure commands with
+`--lock gemtest/suites_additional.lock.json` and a separate external cache.
+Keep the original 62-file lock and both original OS baselines unchanged.
+The first audited macOS record is 6 MATCH / 1 RED, preserved in
+`suites_additional_initial.json`; `suites_additional_latest.json` is its
+strict macOS baseline. Hosted Linux run 44269323039 also reports 6 MATCH /
+1 RED, with all seven reference files healthy and both sides audited.
+`suites_additional_linux_initial.json` preserves that first observation;
+`suites_additional_linux.json` is the strict Linux baseline. The separate
+additional CI jobs now enforce their own OS's baseline under the same caps.
+
+`suites_rake.lock.json` adds Rake 13.2.1 at release commit
+`d84f6ef7f3540a1d0e95fabe451ea3a16157791b`: all 46 original test files,
+597 reference tests and 1,459 assertions. Its four pure Ruby dependencies
+are the three Test::Unit packages above and Minitest 5.25.5, which Rake's
+functional tests require in generated child tests. Use a third external cache
+with the same commands and `--lock gemtest/suites_rake.lock.json`.
+The first complete macOS observation is `suites_rake_initial.json` (verbose);
+`suites_rake_latest.json` is a strict repeat with normal output. Both report
+46 MATCH with both sides' physical source audits complete. Preparatory 40/6
+and 45/1 measurements had incomplete child environments and are explicitly
+not baselines; their reasons remain in `suites_rake_preparation.json`.
+Hosted Linux run 44288206768 also gives 46 MATCH with all 92 source audits
+complete. `suites_rake_linux_initial.json` preserves that first observation;
+`suites_rake_linux.json` is the strict Linux baseline. The independent Rake
+workflow requires the matching OS baseline on every PR/main/dispatch run.
+The same first hosted run completes macOS at 46 MATCH too; the latest macOS
+snapshot retains this normal-output observation and its zero-regression
+comparison with the preceding complete local baseline.
+
+These gems use their unmodified helper and actual Test::Unit framework,
+with alphabetical order instead of a Minitest seed. Preserve tests,
+assertions, failures, errors, pendings, omissions and notifications; pending
+plus omitted tests count as skips when rejecting an all-skipped summary.
+Every summary field must match. Each side routes bare `ruby` children through
+the existing child-bin selector to the selected interpreter and propagates
+the locked libraries. A real child-process control rejects a shadow Ruby
+on PATH, a missing locked child library or a missing child stdlib fallback.
+Child RUBYLIB retains each selected runtime's actual own paths before the
+pinned Ruby-source fallback, after the locked gem libraries. Ten controls pass.
+
+The additional jobs also run `tools/method_copy_memory_check.py`: actual
+UnboundMethod definitions on 21,000 transient classes, with three collections
+after each batch. It records real process RSS and applies the pinned upstream
+leak assertion's default 2x bound to every collected prefix. Its outer family
+limits stay 600 seconds / 2 GiB. Separate `method-copy-memory-*` artifacts
+preserve the samples and execution records. The source, clone/import and
+native-boundary warning controls are in corpus 701/702.
+`method_copy_lifetime_latest.json` retains the subsequent strict Linux failure
+and paired measurements of publishing each copied metadata row once. The
+check, workload and limits are unchanged; local Linux/aarch64 is identified
+separately from hosted x86-64. Both hosted additional jobs pass this correction
+in run 44313194961; hosted Linux's post-GC ratio is 1.909. Full CI remains a
+separate merge requirement.
+
 `suites.lock.json` records each release tag's full commit, repository URL,
 source tree SHA256, every test file, load paths and command. Development
 dependencies have exact versions, archive URLs and SHA256s, and extracted
@@ -94,15 +152,23 @@ the wrong source tree and a process that bypasses the audit with `exit!`.
 The eighth rejects wrong-platform and wrong-lock baselines and verifies that
 a previously matching file reaching the RSS cap is still a regression.
 
-The Linux baseline comes from hosted run 44248949546, with 52 MATCH /
+The earlier Linux baseline comes from hosted run 44248949546, with 52 MATCH /
 9 RED / 1 MEMORY. Its ordinary per-file comparison with this PR's earlier
 Linux run 43989409595 has no regressions. Both runs exceed 2 GiB in Rack's
 multipart file. `suites_linux_before_source_audit.json` preserves the earlier
 result; `suites_linux_transition.json` records the unchanged source/dependency
 inventory, command-only audit transition and exact comparison. The original
 gate error against macOS's 53-MATCH snapshot is preserved in the new Linux
-record. No file verdict, test count or limit is changed. The macOS baseline
-retains all 53 MATCH files, including multipart; a later macOS loss must fail.
+record. No file verdict, test count or limit is changed by that transition.
+
+Round 28 strengthens Linux to the actual 53 MATCH / 7 RED / 2 MEMORY from
+hosted run 44338965455 on parent PR #114. Its merge source 548582c7 has exactly
+the tree of head 89dbac2e. Every reference file is healthy; the ordinary
+same-OS comparison loses no previous MATCH and now requires Lint too.
+`suites_linux_before_r28.json` preserves the preceding 52-MATCH baseline,
+including its cross-platform gate history. Both Linux MEMORY outcomes remain
+visible; RED to MEMORY is not an improvement. The current macOS gate retains
+all 54 actual MATCH files, including multipart and Lint, independently.
 
 Kramdown 2.5.1 was measured before choosing this set. Its large conversion
 file needs an external tidy executable plus optional Rouge and stringex; the
@@ -159,3 +225,128 @@ a3ad911a keeps **53 MATCH / 7 RED / 2 MEMORY**, zero regressions and corpus
 **701/701**. Method, Module, TracePoint, Proc, Super and Yield retain their
 paired baseline MATCH counts. The initial snapshot and resource bounds stay
 unchanged; hosted per-file merge checks remain pending.
+
+Rounds 12-13 dispatch genuinely missing primitive names to their singleton's
+Ruby method_missing and leave do...end on the outer command when its argument
+is another dotted command. Minitest spec's errors fall from four to zero and
+Minitest test's from one to zero; both files retain their other failures.
+Fresh O2 source 61d57736 keeps the full-file totals at **53 MATCH / 7 RED /
+2 MEMORY**, zero BOTH/TIMEOUT/regressions. Corpus is **703/703**. Witnesses
+683/684 match normally and under GC.stress, and related Method/Super/Yield/
+Parse/Syntax controls retain their baseline counts. Original files, sources,
+dependencies, the initial snapshot and all resource bounds stay unchanged.
+
+Rounds 23-24 honor Hash/Array subclasses' Ruby class `[]` before the inherited
+native constructor and route a bare `new` through normal construction. Native
+class-bracket super uses the actual remaining singleton chain and respects
+tombstones. Witnesses 706/707 cover inheritance, prepend, native aliases,
+visibility, coercion callbacks, blocks and refinements. The original Rack
+headers file improves from 37 failures / 2 errors to 6 failures / 0 errors;
+it remains RED rather than dropping any cases or assertions.
+
+O2 source 170fb4b8 completes the original batch at 54 MATCH / 7 RED / 1 MEMORY,
+with all reference files healthy and all 61 completed Mere source audits.
+Multipart is MATCH at 2,006,464 KiB; this does not establish the cause of its
+earlier resource variation. `suites_before_r24.json` and
+`suites_candidate_before_r24.json` preserve the preceding stronger baseline
+and failed candidate. The ordinary comparison loses no previous MATCH file.
+The macOS baseline is strengthened to all 54 actual matches, including Lint;
+Linux keeps its own measured snapshot until its new hosted observation.
+Additional suites remain 6 MATCH / 1 RED, and Rake retains all 46 MATCH files.
+`suites_runtime_r24.json` records the related original core controls. Corpus
+is 724/724, both witnesses match under GC.stress, and bracket depth is still
+933/1024. No VM, collector, shared native dispatcher or API exclusion changes.
+
+Review follow-up 1d0cbe6b retains the same file counts and strict gates. Core
+Hash/Array native aliases now keep their bypass until the final native entry;
+lookup and super stop at the native owner before later singleton mixins.
+708/709 fail the pre-review binary and join 706/707 in matching normally and
+under GC.stress. Corpus is 726/726. `suites_runtime_r25.json` records current
+core controls; `suites_before_review_r25.json` preserves the preceding complete
+54-MATCH macOS observation. The lifetime record distinguishes earlier runs
+separated by compilation from the new consecutive saved-binary comparisons.
+
+Rounds 26-27 restore Hash's native fetch/fetch_values/dig behavior when a Ruby
+override calls super. The native entries preserve arity errors, KeyError's
+key/receiver, blocks and early exit, and nested dig dispatch/defaults without
+calling the receiver's fetch or [] override again. Witnesses 710/711 detect
+the saved parent and match normally and with GC.stress. The original Rack
+Headers file improves from 6 failures / 268 assertions to 3 failures /
+282 assertions, with the same 51 tests and no errors. It remains RED against
+the reference's 302 assertions. Its remaining failures and separate shared
+dispatcher/binding gaps stay in `SUITES_GAPS.md`; upstream tests are unchanged.
+
+Round 28 reruns all 115 files on O2 source 72adb4d3: original 54 MATCH /
+7 RED / 1 MEMORY, additional 6 MATCH / 1 RED, Rake 46 MATCH; all strict
+comparisons are empty. Preceding complete snapshots remain separate.
+Corpus is 728/728; Class/Hash/Array/Super/Method retain every preceding
+passing case. Exact core outcomes, the separate unresolved controls and
+the unchanged lifetime control (1.686x) are in `suites_runtime_r28.json`.
+
+
+Rounds 29–31 preserve native respond_to? aliases and the captured protocols
+of send/__send__/public_send across Ruby overrides, aliases, retained Methods
+and native super. Blocks, refinements, coercion callbacks and public visibility
+are covered by 712/713, which fail the saved parent and match normally and
+with GC.stress. Minitest Mock runs all 94 tests with 1 failure / 2 errors
+(previously 8 errors) and remains RED. On O2 source c0b06cc7 the unchanged
+115-file inventory retains 106 MATCH / 8 RED / 0 BOTH / 1 MEMORY, all strict
+comparisons are empty, and corpus is 730/730. before_r31 snapshots retain
+the preceding complete results.
+
+The parent's hosted Linux lifetime failure and macOS multipart MEMORY remain
+unresolved merge blockers. The full failed macOS observation is preserved
+separately, never adopted as the baseline. method_copy_lifetime_latest.json
+also retains consecutive Linux saved-binary comparisons and a rejected
+metadata prototype, including every failing series. No memory fix, threshold
+change or GC cause is claimed by the sender correction.
+
+The exact original core results and unchanged local lifetime observation
+(1.769x) are retained in suites_runtime_r31.json. All preceding core MATCH
+cases are retained; complete hosted CI remains pending.
+
+
+The separate small-stdlib batch pins Abbrev 0.1.2 and Singleton 0.3.0 by
+release SHA in suites_small_stdlib.lock.json. Their complete original files
+are MATCH on macOS and network-disabled Linux/aarch64 (15 tests / 23
+assertions total); native extensions and runtime dependencies are absent.
+Use the same restore/measure commands with that lock, selecting
+suites_small_stdlib_latest.json on macOS or suites_small_stdlib_linux.json
+on Linux. The initial observation is immutable. Sources remain in an
+external cache, and the new gem-small-stdlib-suites workflow has independent
+Linux/macOS jobs with its own actions/cache key and the same per-file bounds.
+
+Round 34 measures all 117 files on the unchanged parent runtime: 107 MATCH /
+8 RED / 0 BOTH / 2 MEMORY, with 2750 healthy reference tests. Multipart's
+MATCH-to-MEMORY regression stays in the candidate; the stronger preceding
+54-MATCH original baseline is not lowered. Corpus is 731/731. The rejected
+missing-super prototype and all three of its measured batches remain explicit
+trial records; its apparent Mock improvement is not an adopted runtime fix.
+Final runtime source files and the existing workflows are unchanged. The
+Linux lifetime failure and complete hosted comparisons remain merge blockers.
+
+
+The separate delegation/URI batch pins Forwardable 1.4.0, Delegate 0.7.0
+and URI 1.1.2 in suites_delegation_uri.lock.json. Their twelve complete
+original files MATCH on macOS and network-disabled Linux/aarch64, with
+158 tests / 3229 assertions and zero skips. Use the existing restore/measure
+commands with that lock and suites_delegation_uri_latest.json (macOS) or
+suites_delegation_uri_linux.json (Linux). Initial and actual per-OS records
+are separate; all development packages reuse the pinned Test::Unit closure.
+The independent workflow has its own source cache and unchanged file bounds.
+
+The older-version preflight remains explicit: 9 MATCH / 1 RED / 2 BOTH.
+Forwardable's old quote expectation and URI's removed Ractor#take call also
+fail on Ruby 4.0.9. Delegate 0.4.0's keyword-forwarding error remains an
+unrepaired Ruby semantics gap; its newer release emits different forwarding
+code. No tests are edited, skipped or dropped within a selected release.
+The inventory is now 13 gems / 129 files; this round's twelve-file measurement
+is kept separate from the preceding 117-file observation. Runtime and all
+731 corpus files are unchanged, and full corpus validation passes again.
+
+Hosted #119 small-suite observations now supply the latest actual OS records,
+with preceding local snapshots preserved. Its successful Linux lifetime
+observation uses the exact same executable as the earlier failed #118 run;
+all samples remain, with no resource-fix claim. Full hosted CI and existing
+file comparisons remain merge gates, including the stronger original macOS
+baseline and the pending known-noise Module-job retry.
