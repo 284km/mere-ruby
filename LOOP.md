@@ -10971,6 +10971,34 @@ private hooks the same way (nothing called), and only those rows were added
 to the table (regenerating the whole table would drop rows added since).
 corpus/777.
 
+## 2026-11-22 (91): test_ast's time, round one -- two costs paid per object and per builtin call
+
+**The point.** On a slow runner test_ast takes 590-635 s of its 600 (note 551 §13). A sample of test_all_tokens showed no single hot spot:
+- GC: about 14% of the run in this subset;
+- building assert messages: 9%;
+- a tail of 1-3% items.
+
+This round takes two of those that are per-object and per-call costs, and leaves the GC fixed cost (Mere's scan of suspended stacks) and the ivar store's string keys for later.
+
+1. **Marking asked every live String, Array, Hash, Proc and Binding for a singleton class by string key.** gc_handle_class built "kind:id" and probed hng_store and hng_sng_base for each one: 12% of a collection. Those two tables hold a handful of rows. gc_collect now builds an integer set of their handles (gc_hng_ids_build) before marking and turns it off after gc_fixpoint. Marking skips a handle not in the set. Outside a collection, and in fb_reclaim, the string path still answers.
+2. **The builtin arity check probed its table and walked the ancestors on every call.** For a class without a row of its own, that was up to three obj_is_a walks (Enumerable, Comparable, Kernel), 2% of the token test. The row a class and name resolve to -- the packed bounds, or -1 for none or for the program's own method -- changes only when a method is defined, removed or made private, or a module included. arity_memo keeps it, split out as arity_row, per entry under the class's own lookup generation (mro_now_class) and the private/protected count. The first version used attr_ic's global token, which a definition in an anonymous class does not move: `Class.new(Array)` then `def length(a)` kept Array#length's 0 and refused `o.length(5)` (review of #156, witness corpus/751). The memo is emptied past 4,096 rows. A singleton's method is the receiver's own and is still asked per call.
+
+Tried and dropped: taking gc_churn_bytes (seventy arenas summed) one check in sixteen. Each collection recomputes it for the next baseline, and collections come often enough here that the saving was within noise.
+
+Measured on test_ast's tokens, ranges and not_cared for test/ruby/test_[a-c]* (78 tests, 233,297 assertions):
+
+| build | instructions | change |
+|---|---|---|
+| main | 342.2e9 | |
+| step 1 | 336.0e9 | -1.8% |
+| step 2 | 333.7e9 | -2.5% in all |
+
+- Checked:
+  - corpus 799/800 (394, thread interrupts, passes alone three times on both builds; it lost to the load of a concurrent sample);
+  - test_array, test_string, test_hash, test_integer, test_enum, test_comparable, test_object, test_module, test_refinement, test_method, test_struct and test_range give the same results as main;
+  - test_ast's individual tests 114;
+  - gates pass, bracket depth 155.
+
 ## 2026-11-22 (88): two corpus programs main added that differed on the VM, and the VM's cost with threads parked under GC.stress
 
 - **corpus 736** (`include Feature::Item` inside `module Inner` whose
@@ -11004,6 +11032,66 @@ extra is a fixed cost per thread. The collections' time is mostly
 coro_scan_strings (the stacks read for class names) on both; the VM's
 collections see more live classes and more native candidates (22 and 423
 against 6 and 112 in the test's child), which is the next thing to follow.
+
+## 2026-11-22 (89): the VM's cost with threads parked under GC.stress was the programs' arenas
+
+What (88) left open was not the parked frames. test_thread_join_during_
+finalizers' child kept 11,909 region blocks live on the VM and 1,219 on the
+evaluator; both rebuilt the sorted list of live blocks the same number of
+times (about 9,200, __lang_scan_spans: the change log of 64 overflows
+between two scans of a stopped fiber), and each rebuild sorts every block.
+`require "test/unit"` alone made the difference: 13,607 blocks against 744.
+Counted by who made each arena (the region's creator recorded at
+__lang_region_init and symbolized at exit), all but a few hundred were
+vm_load_seq's: a program had eight Vecs (operation, name, operands a, b, c,
+value, line, events), each with an arena of its own so that vm_free could
+give it back, and an arena that grew past 256 bytes kept its first block
+and a 4 KB one.
+
+Now a program's instructions are a stretch of its tree's:
+- vm_trees holds three Vecs a tree (its ints, six to an instruction; its names; its values),
+- vm_code holds the tree, the stretch's start and its length a program (vm_prog),
+- a sequence is put together in Vecs kept one a depth (vm_scratch) and appended to the tree when it is done -- the sequences inside it first, as they are loaded before it is done (vm_tree_put),
+- a tree's Vecs are emptied when its last program is given back (vm_tree_rc); trees are given back whole (vm_unload, a failed load).
+
+Every reader adds the stretch's start (vcb) to the pc it indexes with.
+
+- `require "test/unit"` on the VM: 13,607 blocks -> 1,110 (the evaluator 747).
+- Measured with nothing else running, the evaluator, then the VM before and after:
+  - test_thread_join_during_finalizers: 24.4-24.9 s; VM 36.5 s -> 27.3 s, which is 1.47x -> 1.11x.
+  - test_parent_iseq_mark: 11.3 s; VM 12.5 s -> 12.2 s, which is 1.08x.
+
+## 2026-11-22 (90): a block called from a builtin iterator, cheaper to enter (issue #113)
+
+`TestEnumerable#test_reverse_each_memory_corruption` passes within its ten-second child limit, but with a tenth to spare. What it pays for is the callback: ObjectSpace.each_object(Array) yields each of about 6,800 Arrays to `array.clear if array.length == size`, 1,000 times.
+
+Measured on a standalone repro (the same body over 6,800 retained Arrays, `keep.each`, 200 turns), in instructions retired, which a loaded machine does not move. A block call cost 14.3k instructions on the VM before this round and costs 11.3k now; ruby takes about 800.
+
+The cost was spread over many small pieces, not one hot spot. Each change below is one of them:
+- **`$~`'s home** (rx_blk_enter): the walk up the defining env's chain for its `__fid` / `__rxfid` was made at every call. The answer belongs to the env, so it is kept there as "__rxh". The frame pool's wind-back clears it with the env.
+- **Array#length / #size / #empty?** (native_array_query):
+  - The key `"Array#" ++ name` was made at each call; it is now one of three literals.
+  - The method-table part (no prepend on Array, no method of the name on it or above it) is memoised on mro_now(), as int_ops_plain is for Integer's operators (naq_meth_free). Every write to meths, prepends and undefs moves that generation.
+- **An Array's singleton class**: the lookup built `"arr:" ++ id` for every receiver. Every write to hng_store now goes through hng_put. An "arr:" key notes the id in hng_arr_ids, and an id not noted is not looked up. An entry later dropped stays noted, which only sends that id the long way.
+- **Head positioning**: blk_head_pos sets the file and the line before parameters are bound, for a raise while binding. A block whose binding is one store (blk_simple1: one plain parameter, one value, no default, no keywords, not a lambda) cannot raise there, and its body sets both again first.
+- **is_for_params** made a one-character substring and a three-character one on every call. It now uses str_starts_with.
+- **The fiber watermark** (fb_wm_put): four writes, each making a closure to grow the Vec. Now the Vec is grown once, by a function of its own.
+- **One region a turn, not two**: run_block_turn and its kin (and `loop`) open a region for each turn. The invocation then opened BLK inside it. run_block_t enters run_block0x without its own region; the body is run_block0_in, called from inside BLK or not.
+
+Each on the repro, VM: 20.63 G -> 17.69 (`$~`, Array#length, head, is_for_params) -> 17.27 (hng_put, first form) -> 16.53 (by id) -> 16.10 (watermark) -> 15.66 G (one region). That is -24%.
+
+The ObjectSpace form (the same with ObjectSpace.each_object(Array), 100 turns): 12.45 G -> 10.14 G on the VM and 12.87 G -> 10.25 G on the evaluator.
+
+The upstream test itself on a loaded machine (load 6):
+- r46: 10.1 s on the evaluator, 9.9 s on the VM.
+- now: 8.7 s on the evaluator, 8.0 s on the VM.
+
+What is left is still spread:
+- the env's lookups by name, `size` two frames out: lv_get / lv_parent_of, each level a map_has and a map_get of the same key. Mere has no single lookup.
+- the block env from the pool and back (blk_env_get / put, the lv_up entry).
+- the frame records (call_names_s, call_lines, call_files_s, fb_env_at).
+- vm_exec's VMR region.
+- arr_len's three tables.
 
 ## 2026-11-22: CRuby's bignum.c, compiled as it is -- the algorithms an extension names
 
