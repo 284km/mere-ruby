@@ -85,6 +85,7 @@ static VALUE ivars(VALUE self, VALUE obj) {
 }
 static VALUE last_match(VALUE self, VALUE nth) { (void)self; return rb_reg_nth_match(NUM2INT(nth), rb_backref_get()); }
 static VALUE set_match(VALUE self, VALUE match) { (void)self; rb_backref_set(match); return Qnil; }
+static VALUE class_of(VALUE self, VALUE obj) { (void)self; return CLASS_OF(obj); }
 static VALUE strtoul_of(VALUE self, VALUE str, VALUE base) {
     char *end;
     const char *s = StringValueCStr(str);
@@ -225,6 +226,7 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "ivars", ivars, 1);
     rb_define_singleton_method(mod, "last_match", last_match, 1);
     rb_define_singleton_method(mod, "set_match", set_match, 1);
+    rb_define_singleton_method(mod, "class_of", class_of, 1);
     rb_define_singleton_method(mod, "strtoul", strtoul_of, 2);
     rb_define_singleton_method(mod, "io_facts", io_facts, 1);
     rb_define_singleton_method(mod, "io_mode", io_mode, 1);
