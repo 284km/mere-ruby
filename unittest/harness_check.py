@@ -20,7 +20,7 @@ class HarnessCheck(unittest.TestCase):
         self.root = Path(self.temp.name)
         for folder in ["unittest", "tools", "mspec", "src/test/ruby/enc", "src/tool/lib", "bin"]:
             (self.root / folder).mkdir(parents=True)
-        for script in ["run.sh", "list.sh", "transcript.py", "case_encodings.rb", "bootstrap.rb"]:
+        for script in ["run.sh", "list.sh", "transcript.py", "case_encodings.rb", "bootstrap.rb", "exclusions.py", "exclusions.rb"]:
             shutil.copyfile(ROOT / "unittest" / script, self.root / "unittest" / script)
         shutil.copytree(ROOT / 'unittest/child-bin', self.root / 'unittest/child-bin')
         shutil.copyfile(ROOT / "mspec/mask.sh", self.root / "mspec/mask.sh")
@@ -49,6 +49,9 @@ done
 [ -n "$script" ] && [ -f "$script" ] || { echo 'fixture script not found'; exit 1; }
 side=$(basename "$0")
 fixture_root=$(cd "$(dirname "$0")" && pwd)
+if [ -n "${UNITTEST_EXCLUSIONS:-}" ] && [ -f "$fixture_root/$side.exclusions" ]; then
+  cat "$fixture_root/$side.exclusions" >> "$UNITTEST_EXCLUSIONS"
+fi
 printf '%s' "$RUBYLIB" > "$fixture_root/$side.rubylib"
 if [ -f "$fixture_root/$side.interleave" ]; then
   printf '[1/1] Example#test_ok'
