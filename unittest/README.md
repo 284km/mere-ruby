@@ -33,6 +33,42 @@ their dependencies and runtime behavior may require substantial work.
 
 ## Records and diagnostics
 
+`unittest/excludes-gc/` is the reasoned ledger for tests of the default
+CRuby collector's slots, pages, generations, compaction and internal heap
+representations. Both interpreters receive this absolute directory through
+the upstream runner's `EXCLUDES` setting (the same mechanism as
+`--excludes-dir` and CRuby's MMTk CI). Allocation comparisons remain enabled.
+`try.sh` uses the same ledger. Additional `EXCLUDES` directories are retained.
+
+The upstream `ExcludedMethods` still removes methods. An audit records the
+methods actually removed, with their reasons, and compares their identities
+between interpreters. Different lists fail collection. `run.sh` writes a
+separate exclusion count in `STATUS.md` and the entries in `EXCLUSIONS.tsv`;
+CI publishes `excluded_tests` in `summary.json`, an `excluded` column in
+`files.tsv`, a separate summary line and `exclusions.tsv`. Exclusions are
+never MATCH, RED, BOTH or EXTRA. A resource stop before discovery leaves an
+explicit incomplete exclusion audit instead of claiming no exclusions.
+
+`GC.config[:implementation]` remains `mere-ruby`. Its upstream test compares
+the name of the selected CRuby GC library and is excluded with that reason;
+`RUBY_GC_LIBRARY` is not forged on the reference process. Slot heap tests are
+excluded individually; generic argument checks, actual allocation tracing
+and GC::Profiler tests remain enabled. Passing MMTk exclusions are not copied.
+
+`gc_cases.tsv` retains all 159 target RED from the original successful main
+CI 43807166928 (c64d0ae4). The last complete successful main CI 44239745755
+(12ca1df2) passes two of those finalizer cases after #87, leaving 157 target RED: 12 honest
+implementation matches, 57 reasoned exclusions and 88 named handoffs.
+The two main fixes are identified separately in the inventory. This is a dated triage inventory, not a
+replacement for measured results. In particular, `memsize_of_all` now passes
+the raw comparison but still sums the inherited guessed `memsize_of` values;
+it remains a native allocator handoff. Heap dumps omit that unmeasured field.
+The handoff tests stay enabled. Native test extensions, allocator attribution,
+VM argument/literal allocation and conservative stack roots retain concrete
+test names and reasons, rather than disappearing from the denominator.
+Two generational tests return before any assertion without USE_RGENGC;
+they are explicitly excluded on both sides, rather than counted as matches.
+
 ```sh
 UNITTEST_RECORD_DIR=/path/to/run/records \
 UNITTEST_KEEP=/path/to/run/raw \
@@ -127,13 +163,36 @@ The workflow pins the Mere compiler and Ruby source to full commit SHAs.
 measure a newer compiler without changing the default pin. The macOS jobs use
 `macos-26` consistently. Linux still has its separate compilation smoke test.
 
-The corpus job builds mere-ruby once with `tools/build.sh` at O2 and uploads the
-binary before running the corpus. A separate job builds Ruby 4.0.9 and its native
-test extensions and both JITs (with Rust 1.85.0), installs a relocatable
-reference, and verifies the four test
-extensions previously replaced by shims. The reference load path excludes
+The `build-macos` job builds mere-ruby once with `tools/build.sh` at O2 and uploads
+the binary and its provenance. Corpus and native lifecycle checks run in the
+separate `corpus` job, which restores that exact binary and verifies its SHA-256.
+Its generated C, Prism archive and C API header are transferred in
+`native-build-macos` rather than rebuilt. CRuby, bootstrap, basic and tool
+measurements depend on the two builds and the plan, so they can start while
+corpus verification is still running. Corpus failures still fail CI.
+
+The shared `setup-mere` action caches only the native compiler executable,
+keyed by the full Mere SHA, runner OS/architecture, image and Clang identity,
+and the action definition. A hit skips OCaml/opam setup and compilation;
+the compiler checkout and executable check still run. A miss retains the
+existing OCaml setup retry. Both native platforms use the same action.
+
+A separate job builds Ruby 4.0.9, its native test extensions and both JITs
+(with Rust 1.85.0), installs a relocatable reference, and verifies the four
+test extensions previously replaced by shims. The reference load path excludes
 those shims entirely: Ruby can select a later .rb before an earlier native
 extension. mere-ruby keeps its own Ruby implementations.
+
+The reference runtime archive is cached by the Ruby source SHA, Ruby/Rust
+versions, build/data/archive definitions, runner OS/architecture, image,
+Clang/SDK identity and native dependency versions and prefixes. The definition
+set lives in `reference_cache_key.py`; changes to shard scheduling or unrelated
+workflow steps keep the cache. `package_reference.sh` defines the relocatable
+archive layout and is included in its key. Cache hits still
+check the Ruby version, both JITs, native test extensions, pinned test data,
+the environment smoke tests and actual mkmf compilation. Provenance is
+regenerated and the runtime is uploaded for the current run. The mere-ruby
+binary is rebuilt for each run; test outcomes are always measured again.
 
 Workers launch absolute test paths from each file's directory, preserving
 the source assumptions about `__FILE__` and absolute backtrace locations.
@@ -246,7 +305,7 @@ weights. None of these cases skips a file or reuses a test verdict. Invalid
 negative, zero or non-finite estimates fail planning. The plan records the timing
 file hash, coverage and estimated shard durations.
 
-At most four macOS measurement jobs run at once. Each file runs sequentially:
+The CRuby matrix runs at most four macOS jobs at once. Each file runs sequentially:
 each interpreter has a 600-second wall limit, and the tracked process family
 has an aggregate RSS cap of 2 GiB, polled every 0.1 seconds. A worker also has
 an outer wall limit of twice the per-side limit plus 60 seconds. Polling can
@@ -276,19 +335,20 @@ openssl/test_ossl.rb, resolv/test_dns.rb, ruby/test_io_timeout.rb,
 socket/test_tcp.rb and zlib/test_zlib.rb), totaling about 60 minutes. Their
 600-second limits and incomplete-result reporting are retained. Runtime fixes
 are needed to remove that work without changing the measurement budget.
-Reference and compiler builds take only a few minutes; this change targets the
-larger repeated-job overhead without introducing native-runtime cache validity
-or ABI dependencies.
+That earlier reduction targeted repeated-job overhead; the subsequent build
+caches described above also remove fixed compiler/reference build work.
 
-The checked-in estimates now come from the [post-merge run on 2026-11-07](https://github.com/284km/mere-ruby/actions/runs/42361097257)
-at `278a46c`, after the runtime fixes. All 758 files were collected from eight
-shards. The observed execution totals ranged from 708.0 to 1,383.5 seconds per
-shard with the previous weights. Replaying the same observations with refreshed
-weights gives 959.8–960.6 seconds per shard. A four-worker replay falls from
-2,298.3 to 1,920.4 seconds (16.4%); this excludes setup, queueing and future
-runtime variation and is not an observed end-to-end speedup. The report has no
-WALL_LIMIT files, but 22 MEMORY_LIMIT files and 166 incomplete or zero-test files
-remain. Successful collection is not Ruby conformance.
+The checked-in estimates now come from the [full run on 2026-11-18](https://github.com/284km/mere-ruby/actions/runs/44205107484)
+at measurement source `3e95d2844498aac009ba76b3a9025f5bc21feb0f`, with Mere
+`2e3cc433d470842a07c79cc50bd217441c889dc0`. All 758 files were collected from
+eight shards. The observed supervised execution totals ranged from 727.4 to
+1,582.4 seconds per shard with the previous weights. Replaying the same
+observations with refreshed weights gives 1,132.2–1,133.3 seconds per shard.
+This excludes setup, queueing and future runtime variation and is not an
+observed end-to-end speedup. The run took about 313 minutes overall, with the
+last CRuby shard starting about 290 minutes after dispatch; build separation
+does not itself remove contention with other workflows. The report retains
+49 incomplete or zero-test files. Successful collection is not Ruby conformance.
 
 Successful collection writes `timings.json` into `unittest-report`, using the
 observed per-file supervisor durations and exact source/compiler/Ruby refs.
@@ -352,6 +412,7 @@ Artifacts are retained for seven days:
 |---|---|
 | `unittest-plan` | Exact candidate list, pinned revisions, partitions and scheduling estimates |
 | `mere-ruby-macos` | O2 binary, build mode and compiler/source provenance |
+| `native-build-macos` | Generated C, Prism archive and generated C API header for corpus/native verification |
 | `ruby-reference-macos` | Installed reference, native test extensions and provenance |
 | `unittest-shard-N` | Per-file results, bounds, peak family RSS and sanitized diagnostic logs |
 | `unittest-report` | `SUMMARY.md`, `summary.json`, every planned file in `files.tsv`, and successful-run `timings.json` |
@@ -561,3 +622,88 @@ in CI; `unittest/try.sh` sets all of them.
   only if it mentions "ruby".
 - The corpus needs `LANG=en_US.UTF-8` (corpus/492 reads ENV keys under the
   locale's encoding).
+
+
+The GC-only subset in #112 uses the upstream --excludes-dir/EXCLUDES
+mechanism on both interpreters: 19 GC-specific and 22 compaction cases.
+This integrated stack adds 16 ObjectSpace exclusions, for 57 total. Each
+entry explains the default collector feature that Mere lacks. Excluded
+identities and reasons are audited symmetrically and reported separately;
+allocation comparisons remain enabled. GC.config[:implementation] truthfully
+remains mere-ruby; only the CRuby GC-library-name assertion is excluded.
+No RUBY_GC_LIBRARY value is used to disguise the reference collector.
+
+
+### Stage 9 merge gates after full CI
+
+The complete green #91 measurement does not itself enforce every-file
+nonregression. Its comparison against main CI 44239745755 has three lower
+rows (Enumerable, Optimization and zlib), separate from the 57 exclusions.
+On the latest compiler, the unchanged Enumerable timeout remains #113;
+honest Proc counts expose unused block-parameter allocation as #130.
+The diagnostic block_parameter_probe.rb expects none/unused/used deltas
+0/0/1. Main's old 0/0/0 omits real Procs; restoring that false zero or
+excluding the allocation test is not a valid repair. The independent
+count/ID delivery #109 must retain the same merge condition.
+
+
+## 2026-11-19: restore the strict GC merge-gate cases
+
+The unchanged Optimization allocation case now passes with four assertions.
+An empty method whose sole formal is its named block parameter, with no
+defaults or observer/scheduler, avoids creating an unread Proc. Positional
+formals retain the full binder: destructuring can execute to_ary and enable
+TracePoint during binding, exposing the block through call/return Bindings. TracePoint, set_trace_func, defaults, threads/fibers, signals and
+finalizers retain the full binder. Local-declaration markers are metadata,
+not reads of the block. Real none/unused/used T_DATA deltas remain 0/0/1;
+the used Proc is still present in ObjectSpace.
+
+The unchanged Enumerable case now completes in 7.919 seconds with all three
+assertions under its original ten-second child bound. Native Array length,
+size and empty? reads avoid general dispatch only after proving the actual
+plain Array entry, its visibility and absence of observers, overrides,
+aliases, undef, prepends and refinements. A block with one ordinary positional
+formal and one value binds that same value directly, after consuming the
+source-Proc state; the surrounding frame, GC roots and flow handling stay.
+No objects are filtered out of enumeration and no collection is forced.
+
+The complete Enumerable file improves from 88 MATCH / 1 RED / 1 BOTH to
+89 MATCH / 0 RED / 1 BOTH across 90 cases, without losing any previously
+passing case. The original Module contract completes all 195 tests / 1,240
+assertions with zero failures/errors/skips (22.935 seconds / 359,296 KiB
+outer peak, unchanged 600-second / 2-GiB bounds). This local pass does not
+erase the earlier Linux clone RSS failure; the new hosted job must pass it.
+
+Corpus 725/726/727 cover actual Proc counts and binding observation, native
+Array read dispatch, and one-value block identity/arity/defaults/closures/
+bindings/keywords/flow. All three match Ruby with the hash index enabled or
+disabled and with MRO caching disabled. Existing native Array singleton-undef
+and private-call gaps produce identical failures on the preceding binary;
+their separate diagnostics are retained, no new exclusion is added, and the
+corresponding existing tests remain enabled. The native-undef gem work owns
+that independent behavior; it is not claimed fixed by this read path.
+
+Touched runtime functions: call_method, run_meth_result and bind_block_params,
+plus emethod_args; new and-helpers bind_params_body, empty_block_binding_body
+and native_array_query. The concurrently changed bind_params implementation
+is left alone. No m_state, VM/ISeq, AST/Prism, C API, API inventory, collector
+mark/sweep body or resource limit changes. The original 159-row intake and
+its 12 honest matches, 57 symmetric exclusions and 88 handoffs (plus two main
+fixes) retain their denominator. These extra merge-gate repairs are separate.
+
+The paired comparison covers 12 complete files / 1,390 cases on checkpoint
+b54452d8: MATCH 1,297 to 1,299, RED 90 to 88, BOTH 3 unchanged, no previously
+passing case lost in any file. This includes Array, Proc, Iterator, Method,
+Super, Refinement, Eval, Settracefunc and all 76 allocation comparisons;
+those allocation cases remain enabled and retain their 76 existing REDs.
+
+The final observer guard narrows the optimization to a sole named block
+formal. Its O2 binary passes the actual original allocation test (four
+assertions) and enumeration test (7.768 seconds, three assertions), the
+to_ary-activated observer control, all 715 corpus programs in both hash-index
+modes, all nine RSS controls and bracket depth 155/1024. The complete Module
+contract is repeated on this final runtime: 195 tests / 1,240 assertions,
+zero failures/errors/skips, outer 23.441 seconds / 365,632 KiB. The
+12-file checkpoint observations are not relabeled as a final-runtime rerun.
+The updated hosted CI, Linux Module memory gate and all-file comparison
+against complete main remain required before merge. No bound is changed.

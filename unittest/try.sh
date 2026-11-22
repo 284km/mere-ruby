@@ -23,6 +23,7 @@
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
+EXCLUDES="$here/excludes-gc${EXCLUDES:+:$EXCLUDES}"; export EXCLUDES
 src="${1:?usage: unittest/try.sh <ruby-src> [--ref] <path under test/> [runner args ...]}"
 shift
 src="$(cd "$src" && pwd)"
