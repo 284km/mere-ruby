@@ -29,6 +29,7 @@ def main():
     assert version=='4.0.9',version
     stdlib=subprocess.check_output([args.reference,'-rrbconfig','-rrubygems','-e',
         'print ([RbConfig::CONFIG["rubylibdir"]]+Dir[File.join(Gem.default_dir,"gems","*","lib")].sort).join(":")'],text=True)
+    runtime=subprocess.check_output(['sh',str(ROOT/'tools/runtime_load_path.sh'),str(Path(args.binary).resolve())],text=True)
     gems=[s.strip() for s in (ROOT/'gemtest/gems.txt').read_text().splitlines() if s.strip() and not s.startswith('#')]
     specs={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((args.gem_home/'specifications').glob('*.gemspec'))}
     snapshot=verify_snapshot(args.gem_home,args.snapshot_lock,gems) if args.snapshot_lock else None
@@ -41,7 +42,7 @@ def main():
             env.pop('RUBYLIB',None)
             env.pop('RUBYOPT',None)
             command=[args.reference,'--disable-gems'] if mode=='reference' else [args.binary]
-            if mode=='external':command+=['-I',stdlib]
+            if mode=='external':command+=['-I',runtime+os.pathsep+stdlib]
             command += [str(ROOT/'gemtest/load_one.rb'),gem]
             log=args.output/(gem+'.'+mode+'.log')
             result=supervise(command,env,log,2097152,120)

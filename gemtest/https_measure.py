@@ -147,6 +147,7 @@ def main():
     thread.start()
     stdlib=subprocess.check_output([args.reference,'-rrbconfig','-rrubygems','-e',
         'print ([RbConfig::CONFIG["rubylibdir"]]+Dir[File.join(Gem.default_dir,"gems","*","lib")].sort).join(":")'],text=True)
+    runtime=subprocess.check_output(['sh',str(ROOT/'tools/runtime_load_path.sh'),str(Path(args.binary).resolve())],text=True)
     script=args.output/'client.rb'
     script.write_text(CLIENT)
     rows=[]
@@ -164,7 +165,7 @@ def main():
                     env.update(GEM_HOME=str(args.gem_home.resolve()),GEM_PATH=str(args.gem_home.resolve()),RUBYGEMS_LIB=str((args.rubygems/'lib').resolve()))
                 command=[args.reference,'--disable-gems'] if mode.startswith('reference') else [args.binary]
                 if mode.startswith('reference'):command+=['-I',str(ROOT/'vendor/network/lib')]
-                if mode.startswith('external'):command+=['-I',stdlib]
+                if mode.startswith('external'):command+=['-I',runtime+os.pathsep+stdlib]
                 command += [str(script),'excon' if 'excon' in mode else 'direct' if mode=='direct' else 'http',str(fixture)+'.crt',str(listener.getsockname()[1]),scenario]
                 log=args.output/(mode+'-'+scenario+'.log')
                 result=supervise(command,env,log,1048576,30)
