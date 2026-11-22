@@ -7885,6 +7885,35 @@ Complete hosted CI, all existing-file comparisons and P1/P2 resolution still
 control merging. The previous stronger 54-MATCH original macOS baseline
 and failed multipart observations remain unchanged.
 
+
+### Hash subclass options reach Ruby missing hooks (2026-11-19)
+
+Rails' ActiveSupport OrderedOptions is a Hash subclass with a Ruby
+method_missing for configuration setters/getters. The primitive hook guard
+accepted singleton lookup classes only, so a real subclass hook was skipped.
+Extend that guard to actual Hash ancestry, preserving its existing real
+method, native alias, refinement and recursion checks. Only main.mere's
+hng_missing_hook changes; no new global values, state, gemtest, VM/ISeq,
+AST, C API or collector implementation edits.
+
+On the gem-suites-r14 parent (01d5e498), normal O2 with its pinned Mere
+2e3cc433: all 732 corpus files match with hash indexing ON and OFF. Corpus
+719 covers inherited hooks, setter/getter storage, arguments/keywords/blocks,
+native methods/aliases and callbacks, refinement precedence, a Ruby method
+removed by undef and missing-error metadata. Original Hash is 297 MATCH /
+1 RED / 8 BOTH, Method 97 MATCH / 1 RED, Super 50 MATCH: 454 cases,
+444 MATCH / 2 RED / 8 BOTH. No parent file loses MATCH. All nine RSS and ten
+suite-harness controls pass; generated C depth remains 933/1024 with the
+parent's compiler. No original test, exclusion or resource limit changes.
+
+An unchanged ActiveSupport OrderedOptions probe reuses each runtime's own
+saved gems and matches: reference 0.609 s / 24,208 KiB; candidate 1.344 s /
+166,208 KiB, both exit 0 without a resource event. It is a diagnostic, not
+a fresh Rails installation or application pass. Keep the earlier complete
+gem observations and unresolved native-undef/private-alias diagnostics;
+this change does not claim their repair. A fresh combined original Rails
+workload and full hosted CI remain required before merge.
+
 ## 2026-11-19: nonblocking writes use bytes, and the multipart pipe stops copying
 
 Rack 3.2.0's original long-boundary test retries a 10-MiB String while a
