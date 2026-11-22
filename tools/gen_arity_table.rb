@@ -172,6 +172,21 @@ end
   arows << "Kernel##{name}:#{Kernel.instance_method(name).arity}"
 rescue NameError, TypeError
 end
+# ...and the DEFINITION HOOKS, which are private (instance_methods above does
+# not list them): read the same way, nothing called. `Module#included` is 1,
+# and an interpreter without the row answered -1 and [] for a saved
+# Module.instance_method(:included) (issue #133).
+{
+  "Module" => %i[included extended prepended method_added method_removed method_undefined const_added],
+  "Class" => %i[inherited],
+  "BasicObject" => %i[singleton_method_added singleton_method_removed singleton_method_undefined],
+}.each do |cn, hooks|
+  klass = Object.const_get(cn)
+  hooks.each do |name|
+    arows << "#{cn}##{name}:#{klass.instance_method(name).arity}"
+  rescue NameError, TypeError
+  end
+end
 rows.uniq!
 brows.uniq!
 arows.uniq!

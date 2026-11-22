@@ -10920,3 +10920,37 @@ the source is lexed (lex_comment_key) -- and after_class_kw's look back
 passes over both. corpus/761 holds the five forms, and a real
 `class <<self` after comment lines. 721/721, the VM's 761-763 the same, and
 the twelve gems the same on both sides.
+
+## 2026-11-22 (79): an alias round trip, and a Method made of a builtin (issues #124, #133)
+
+Two of the open issues, both in what a method entry remembers about where it
+came from.
+
+**#124.** `alias saved example; alias example saved; def example = super`
+raised "super: no superclass method 'saved'", the new definition's frame
+labelled `AliasChild#saved`. The `alias` keyword (do_class_alias) recorded the
+name it was given as the source, where alias_method already resolved an alias
+of an alias to the first definition: example -> saved was kept, and a `def`
+over it kept it too. The keyword now resolves the source's own pair (name and
+origin) and drops the row when the name comes back to itself; and a new
+definition -- every `def`, `define_method` with a block, `attr_*`, through
+stamp_named_meth_src -- clears this key's alias_srcname and alias_origin. A
+Method that captured the old entry keeps its own snapshot (msnap_save), so it
+still answers for the old definition. corpus/776.
+
+**#133.** `saved = Array.instance_method(:length)` then `def length(a, b =
+nil)` made `saved.arity` -2 and its parameters the new method's. A Method or
+UnboundMethod made of a builtin is marked so where it is made (bi_meth_mark:
+`@~m_bi`, `@~m_biown`), and is called through the builtin for good; its
+#arity and #parameters now read the builtin's metadata by that owner too,
+once a Ruby definition has taken the name over (bi_meth_native;
+bm_params_core with the method table set aside) -- before that the ordinary
+reading is already the builtin's, and it alone knows a singleton's label:
+`Dir.method(:glob).parameters`, Prism's named ones, went empty when every
+marked Method took the new path (corpus/499 caught it). The
+definition hooks had no arity row at all -- `Module.instance_method(:included)`
+said -1 and [] where ruby says 1 and [[:req]] -- because the generator reads
+public instance methods only: tools/gen_arity_table.rb now reads the eleven
+private hooks the same way (nothing called), and only those rows were added
+to the table (regenerating the whole table would drop rows added since).
+corpus/777.

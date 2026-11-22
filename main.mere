@@ -26594,6 +26594,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 5 && str_eq name "arity") then
          (let native_name = nkf_method_name world id mnm in
           VInt (if str_len native_name > 0 then builtin_arity_of world "NKF" native_name
+                else if bi_meth_native world id mnm then builtin_arity_of world (bi_meth_own world id) mnm
                 else bm_arity world (if str_eq mown "" then dispatch_cls_of world mrecv else mown) mnm))
        // Method#source_location: [file, line] of the `def`, or nil for a
        // builtin (there is no ruby source behind one).
@@ -26606,7 +26607,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          //  dispatch class of the receiver is the class's own, and the
          //  internal-ruby table keys the method "Dir.glob")
          let native_name = nkf_method_name world id mnm in
-         if str_len native_name > 0 then arr_new (bm_kind_meta "req" (builtin_arity_of world "NKF" native_name)) else
+         if str_len native_name > 0 then arr_new (bm_kind_meta "req" (builtin_arity_of world "NKF" native_name))
+         else if bi_meth_native world id mnm then bm_params_core world (bi_meth_own world id) mnm true else
          bm_params world (if str_eq mown "" then
                             (let l9 = builtin_frame_label world mrecv mnm in
                              if str_len l9 > 5 && str_eq (substring l9 0 5) "(sng:" && str_index_of l9 "#" > 0
@@ -28520,10 +28522,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 13 && str_eq name "__attr_method") then VBool (meth_named_is_attr world ucls unm)
        else if (str_len name == 5 && str_eq name "arity") then
          (let native_name = nkf_method_name world id unm in
-          VInt (if str_len native_name > 0 then builtin_arity_of world "NKF" native_name else bm_arity world ucls unm))
+          VInt (if str_len native_name > 0 then builtin_arity_of world "NKF" native_name
+                else if bi_meth_native world id unm then builtin_arity_of world (bi_meth_own world id) unm
+                else bm_arity world ucls unm))
        else if (str_len name == 10 && str_eq name "parameters") then
          (let native_name = nkf_method_name world id unm in
-          if str_len native_name > 0 then arr_new (bm_kind_meta "req" (builtin_arity_of world "NKF" native_name)) else bm_params world ucls unm)
+          if str_len native_name > 0 then arr_new (bm_kind_meta "req" (builtin_arity_of world "NKF" native_name))
+          else if bi_meth_native world id unm then bm_params_core world (bi_meth_own world id) unm true
+          else bm_params world ucls unm)
        // original_name: the name this method was DEFINED as, which differs from
        // #name only for an alias -- and alias_srcname already records that pair
        // (it exists so that `super` inside an aliased method searches for the
@@ -33333,6 +33339,19 @@ and module_notification_method_mark = fn world -> fn (id9: int) ->
 and bi_skip_pass = fn (name: str) ->
   if map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name then (let _ = map_clear bi_skip in false)
   else true
+// ⚠ a Method / UnboundMethod made of a BUILTIN describes that builtin for
+//   good: its arity and parameters are the builtin's, read by the owner it
+//   was made from, not the method table's row under the name -- a Ruby `def`
+//   that replaced the name afterwards answered for it (issue #133:
+//   `Array.instance_method(:length)` said -2 after `def length(a, b = nil)`)
+and bi_meth_native = fn world -> fn (id: int) -> fn (nm: str) ->
+  let (meths9, _, _, ivars) = world in
+  let own9 = bi_meth_own world id in
+  // (...and only once a Ruby definition has taken the name over: until then
+  //  the ordinary reading is the builtin's, singleton labels -- `Dir.glob`'s
+  //  named parameters -- included)
+  map_has ivars (str_of_int id ++ "@~m_bi") && (if str_eq own9 "" then false else true)
+  && map_has meths9 (own9 ++ "#" ++ nm)
 and bi_meth_own = fn world -> fn (id: int) ->
   let (_, _, _, ivars) = world in
   if map_has ivars (str_of_int id ++ "@~m_biown") then (method_text (map_get ivars (str_of_int id ++ "@~m_biown"))) else ""
@@ -37453,8 +37472,12 @@ and builtin_arity_of = fn world -> fn (cls: str) -> fn (nm: str) ->
 
 // Method#parameters: the declaration in order. Whether a name is required or
 // optional is the presence of a DEFAULT, which is kept in its own list.
-and bm_params = fn world -> fn (owner0: str) -> fn (nm: str) ->
-  let (meths, sup, ocls, ivars) = world in
+and bm_params = fn world -> fn (owner0: str) -> fn (nm: str) -> bm_params_core world owner0 nm false
+// (native9: the parameters of the BUILTIN under this name, whatever Ruby
+//  method has replaced it since -- a Method made of the builtin, issue #133)
+and bm_params_core = fn world -> fn (owner0: str) -> fn (nm: str) -> fn (native9: bool) ->
+  let (meths0, sup, ocls, ivars) = world in
+  let meths = (if native9 then map_new () else meths0) in
   // the owner may be a class that only PUBLISHED the method; the parameters
   // are the body's.
   let owner = body_cls_of world owner0 nm in
@@ -60022,13 +60045,23 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   // answers. alias_method recorded it and the `alias` keyword did not, so the
   // same alias written two ways gave two different original_names -- one
   // fact, two writers, and only one of them wrote.
-  let _ = (if str_eq n1 n2 then () else map_set alias_srcname (cls ++ "#" ++ n1) n2) in
+  // ⚠ ...and an alias OF AN ALIAS names the first definition, as
+  //   alias_method has it: `alias saved example; alias example saved`
+  //   recorded example -> saved, and example's super then searched for
+  //   `saved` (issue #124). The source's own pair, when it has one, is the
+  //   answer; and a name that comes back to itself has none.
+  let sk9 = src ++ "#" ++ n2 in
+  let srcname9 = (if map_has alias_srcname sk9 then map_get alias_srcname sk9 else n2) in
+  let _ = (if str_eq n1 srcname9 then (if map_has alias_srcname (cls ++ "#" ++ n1) then map_delete alias_srcname (cls ++ "#" ++ n1) else ())
+           else map_set alias_srcname (cls ++ "#" ++ n1) srcname9) in
   // ...and when it CAME from an ancestor, `super` inside the copy has to
   // resume above THAT class, not above the aliasing one: alias_method records
   // the same thing in alias_origin, and without it the copy's super found the
   // module it was copied from again (bootstraptest's `include Forward; alias
   // bar foo` answered [:Forward, [:Forward, :SecondTerminus]]).
-  let _ = (if str_eq src cls then () else map_set alias_origin (cls ++ "#" ++ n1) src) in
+  let origin9 = (if map_has alias_origin sk9 then map_get alias_origin sk9 else src) in
+  let _ = (if str_eq origin9 cls then (if map_has alias_origin (cls ++ "#" ++ n1) then map_delete alias_origin (cls ++ "#" ++ n1) else ())
+           else map_set alias_origin (cls ++ "#" ++ n1) origin9) in
   let _ = if map_has meths (src ++ "#" ++ n2) then
             (let _ = set_meth meths (cls ++ "#" ++ n1) (map_get meths (src ++ "#" ++ n2)) in
              // an alias keeps the original's lexical scope (see alias_method)
