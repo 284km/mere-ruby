@@ -38,6 +38,24 @@ the fault fixture's header produced exactly the normal header's bytes. The
 test-only selector was absent from both the normal generated C and consumer
 archive, and the bundler rejected the actual injected build.
 
+## `request_subject_copy.rb`
+
+This fixed workload alternates a mutable 2-MiB regexp subject and a small
+subject 128 times. Each capture contributes to the printed checksum:
+`[2097152, 768, false]`. It contains no collection, warmup or delay.
+
+Compare ordinary O2 builds with the same compiler and the existing CI
+process-family supervisor's 600-second / 2-GiB bounds. Preserve the process
+order reference, before, candidate, candidate, before. The before build in
+`request_subject_copies_r97.json` already contains the split and byteslice
+changes, isolating the subsequent regexp-cache change.
+
+The recorded macOS peaks are 489,488 / 169,040 / 256,016 / 532,768 KiB for
+before/candidate/candidate/before, with identical output. These focused
+measurements do not replace Rack's complete original Request file: its four
+corresponding processes all exceed the unchanged cap. The receipt keeps
+both failures and successful selected-case observations, source/binary
+identities, raw-log hashes and the complete upstream/core comparisons.
 
 ## `enumerator_steps.rb`
 

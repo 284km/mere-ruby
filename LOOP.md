@@ -10083,3 +10083,145 @@ retry-until-pass loop.11 acceptance controls reject altered input, enlarged
 bounds, missing trials and waived failures. Both compilers' original timings
 remain visible; the new job is not a claim of repair. The end-to-end runner
 validation is recorded separately from the first experiment.
+
+## Gem suites: adopt released Map-slot clearing without weakening gates (2026-11-21)
+
+The released compiler `408b03d9` clears key/value backing slots after logical
+Map deletion or clearing. This independently implemented fix removes stale
+references without changing live/borrowed values, pins, retirement or collection
+policy. Adopt it consistently in ordinary CI and all five upstream suite
+workflows. Existing historical compiler/source comparisons retain their inputs.
+No Mere implementation, library, build script, source lock or accepted snapshot
+changes in this adoption.
+
+Ordinary O2 source `0bae011f` has the same runtime as the preceding integration
+`03a8ca31`. A metadata-only follow-up `8df2e278` is the actual recorded source
+for the macOS gem run; its binary is unchanged. Both macOS and native
+Linux/aarch64 retain the following original file results, identical to the
+previous compiler43 measurements. Each file/side retains 600 seconds / 2 GiB.
+
+| Gem | MATCH | RED | BOTH | MEMORY |
+|---|---:|---:|---:|---:|
+| minitest |4|3|0|0|
+| public_suffix |7|0|0|0|
+| rack |35|3|0|1|
+| rack-test |7|1|0|0|
+| base64 |1|0|0|0|
+| matrix |2|0|0|0|
+| logger |4|1|0|0|
+| abbrev |1|0|0|0|
+| singleton |1|0|0|0|
+| forwardable |1|0|0|0|
+| delegate |1|0|0|0|
+| uri |10|0|0|0|
+| rake |46|0|0|0|
+| Total |120|8|0|1|
+
+All 129 file classifications match the preceding integration; no accepted MATCH
+is lost. Tests run offline with verified external source/dependency caches.
+The original complete Rack Request file remains MEMORY.
+
+macOS matches all 751 corpus programs in both hash-index modes in 475.314 seconds,
+peak family RSS 1,085,344 KiB, under the existing 900-second / 2-GiB bound.
+Refinement has the same 122 cases / 367 assertions and existing skip as the
+reference. Method-copy passes 1.366086957x, reference 1.077448747x, retaining
+all 21 prefixes. The first complete Module attempt retains a real complemented
+RSS failure at 2.026762957x (77,135,872 to 156,336,128 bytes). Its one documented
+noise recheck passes 195 tests / 1,240 assertions. Preserve both observations.
+
+Native Linux Module passes 195 / 1,240 and Method-copy 1.612270451x. Native API 178,
+fiber 16 and mkmf 14 contracts agree across reference, candidate and collection
+stress; negative controls are rejected. These are validation results for the
+combined leaf runtime, rather than measurements of every intermediate head.
+Current-head hosted CI and latest-main per-file merge acceptance remain required.
+
+The exact historical iclass replay also succeeds on native x86-64, before
+8.509 / 8.179 seconds and repair 8.294 / 8.287 seconds. This does not establish
+a repair of the historical timeout. Require both Method-copy pairs and healthy
+reference controls in each pair; 18 evidence controls include the new P2
+mutation, missing before evidence and the intentionally allowed failing before
+interpreter. `bench/iclass_resource_r88.json` retains the native capture, while
+`bench/compiler_map_slots_r89.json` retains every gem file, all Method prefixes,
+actual source/binary identities and failed attempts.
+
+The additional Linux corpus run reaches all 751 programs with the original
+CI keep-going option, taking 394.222 seconds / 1,074,744 KiB.
+It retains 750 matching programs and the existing `corpus/55_require_and_stdlib.rb`
+difference when this private image has `HOME=/`: reference `~/x` expansion
+normalizes the separator, whereas both compiler 43 and 408 builds produce the
+same differing output. The full run remains failed; this is not counted as
+all-green corpus evidence or silently excluded.
+
+Before that run, the image's extra installed JSON 3.1.0 and Prism 1.9.0 shadowed
+Ruby 4.0.9 defaults 2.18.0 / 1.8.2. A private isolated specification directory
+retains the default versions and native bundled dependencies. Original
+JSON /BigDecimal /Prism witnesses match reference /before /repair before the
+complete run. The earlier setup failures and exact exclusion inventory remain
+in the receipt. This changes neither the public test runner nor CI bounds.
+
+## Gem suites: remove duplicate regexp-subject storage and untouched String copies (2026-11-22)
+
+`rx_publish_at` saved its subject twice: once in a rooted private String
+snapshot and again as raw bytes in a default-arena map. The released
+compiler's generated `Map.set` calls `__mcopy_str` even when replacing an
+existing value. Alternating large and small subjects therefore copied each
+large subject again into the default region. Read the existing snapshot's
+bytes instead, keep the encoding metadata, and mark that private snapshot
+immutable. Named captures read the same snapshot. The caller's original
+String is not reused as the snapshot.
+
+Unmatched regexp splits and full-span byteslices also copied the entire
+unchanged input. Share the immutable bytes beneath fresh Ruby handles.
+Positive-limit literal splits stop searching at the requested limit rather
+than splitting the whole tail and joining it again. Encoding, object
+independence, frozen receivers, capture behavior and mutation remain covered
+by corpus 764-766. The scanner matrix retains its existing implementation.
+
+The ordinary O2 application source is `3be599c2`, compiler `408b03d9`.
+`bench/request_subject_copy.rb` fixes a mutable 2-MiB input and 128 alternating
+large/small matches, checking the capture checksum without manual collection,
+warmup or delay. Compare against `ffdfa33c`, which already has the split and
+byteslice changes. The fixed reference/before/candidate/candidate/before
+peaks are **22,896 / 489,488 / 169,040 / 256,016 / 532,768 KiB**. All outputs
+are `[2097152, 768, false]` and every process finishes within 600 seconds / 2 GiB.
+These are focused observations, with the variability retained.
+
+The original isolated Rack multipart tempfile-limit case retains its one
+test / 130 assertions while moving from **1,413,056 to 1,146,704 KiB**.
+The original isolated 128-MiB NUL case passes its one test / five assertions
+at 1,745,472 / 1,744,736 KiB; no meaningful reduction is claimed for it.
+The complete original Request file still fails every process in the fixed
+before/candidate/candidate/before comparison: **2,147,360 / 2,120,784 /
+2,154,704 / 2,283,536 KiB**, all MEMORY. References retain 404 tests / 1,754
+assertions and two skips. Its stopping position varies even with the existing
+seed 1; ownership of the remaining retained pages is unproven.
+
+The five offline gem groups retain **13 gems / 129 files: 120 MATCH / 8 RED /
+0 BOTH / 1 MEMORY**, identical file verdicts to the preceding compiler-408
+integration and zero lost accepted MATCH. Sources, locks and accepted
+snapshots are unchanged. All **754 corpus programs** match Ruby 4.0.9 with
+the hash index ON and OFF in **499.256 seconds / 1,048,320 KiB**, within the
+unchanged 900-second / 2-GiB aggregate bound.
+
+The four complete core files retain identical before/after named cases and
+summaries: Regexp 162 / 62,510, StringScanner 149 / 1,042 with its existing
+two errors, Module 195 / 1,240, and Refinement 122 / 367 with its existing
+skip. The Regexp reference itself fails `test_s_timeout_memory_leak` at
+4.721222x; retain that failure. Both application sides pass its cases.
+The original Method-copy gate passes **1.369198679x**, reference 1.081050228x,
+with all 21 prefixes. All nine original loop RSS checks pass their 1.6x bound;
+dead/duplicate definitions, GC roots and bracket depth **155/1024** pass.
+
+`bench/request_subject_copies_r97.json` preserves actual source/binary/C
+identities, every gem row, core case identities, Method prefixes, complete
+failed Request comparisons and raw-log hashes. Broader frozen-caller-input
+reuse and scanner anchor rewriting were tried and withdrawn; their observations
+are not attributed to the final runtime. The private ledger retains those
+unpublished attempts and uncertain lifetime observations.
+
+Final local Linux execution was unavailable because Docker's content store
+returned input/output errors. Do not relabel earlier Linux results as this
+source; require current-head hosted Linux CI. No collector, native pin,
+threshold, test workload, API exclusion, top-level value, VM, AST or C API
+implementation changed. Existing hosted Method-copy failures on other stacked
+heads also remain merge gates; this local result does not waive them.
