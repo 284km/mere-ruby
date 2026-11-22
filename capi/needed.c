@@ -606,6 +606,8 @@ VALUE rb_io_get_write_io(VALUE io) {
         rb_hash_aset(kw, ID2SYM(rb_intern("autoclose")), Qfalse);
         VALUE argv[3] = { wfd, rb_str_new_cstr("w"), kw };
         w = rb_funcallv_kw(rb_cIO, rb_intern("for_fd"), 3, argv, RB_PASS_KEYWORDS);
+        /* (synchronous, as CRuby's tied writer is; IO#close closes it with io) */
+        rb_funcall(w, rb_intern("sync="), 1, Qtrue);
         rb_ivar_set(io, rb_intern("@__capi_wio"), w);
     }
     return w;

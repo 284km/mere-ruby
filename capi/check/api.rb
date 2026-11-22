@@ -271,6 +271,15 @@ check(A.read_pending(pr) == 0)
 pw.write("abcdef"); pw.close
 check(pr.getc == "a")
 check(A.read_pending(pr) == 5)
+# (a duplex IO's write half: the same one each time, writes reach the child,
+#  and it is closed with the IO -- CRuby's tied writer)
+dio = IO.popen(['cat'], 'r+')
+dw = A.write_io_of(dio)
+check(A.write_io_of(dio).equal?(dw))
+dw.write("duplex\n")
+check(dio.gets == "duplex\n")
+dio.close
+check(dw.closed?)
 pr.close
 check(A.strtoul('  0x1fz', 0) == [31, 6])
 check(A.strtoul('-12', 10) == [2**64 - 12, 3])

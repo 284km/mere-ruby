@@ -11135,3 +11135,24 @@ pkg-config and ran them; this RbConfig had no such key, so they were skipped
 The key is now configure's AC_CHECK_TOOLS answer, asked when RbConfig loads:
 "pkg-config" when one is on PATH, else "". (Not run here -- no pkg-config on
 this Mac; CI is where the four run.)
+
+### PR #157 review
+
+- **[Minor] The hidden module was in `IO.instance_variables`**
+  (`@__capi_hidden_const_platform_tty`, and io-console's generic_readable).
+  A name that is no constant's is now kept on the C side -- capi/hidden.c,
+  a table outer (by identity) -> name -> value, a root of the collector --
+  and nothing Ruby-visible holds it: `IO.instance_variables` is `[]` as in
+  ruby. An anonymous outer names the module by its inspect. (#160's
+  rb_const_set / rb_const_get keep such names in the same table.)
+- **[Minor] PKG_CONFIG follows the running PATH, on purpose**, and the
+  comment now says so: this interpreter builds extensions with the machine's
+  tools, so it can say "pkg-config" where a reference configured before
+  pkg-config was installed says "". File::PATH_SEPARATOR, and a file (not a
+  directory) of that name.
+- **[Suggestion] rb_io_get_write_io's duplex branch.** The write IO is
+  synchronous now, and IO#close / #close_write close it (flushed) before the
+  descriptor goes, as CRuby closes the tied writer. capi/check: on
+  `IO.popen(["cat"], "r+")` the same writer each time, a write reaches the
+  child, closed after `close`. The gem check calls io-console's oflush on
+  such an IO (Errno::ENOTTY on both sides).

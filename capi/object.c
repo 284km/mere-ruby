@@ -5,6 +5,9 @@
 #include <string.h>
 
 /* ---- defining ---------------------------------------------------------- */
+extern int mr_const_name_p(const char *name);
+extern VALUE mr_hidden_const_get(VALUE outer, const char *name, int *found);
+extern void mr_hidden_const_set(VALUE outer, const char *name, VALUE value);
 /* A class or module named under `outer`: the one that is there, or a new
  * one set as that constant (which is also what names it). */
 static VALUE define_class(VALUE outer, const char *name, VALUE super, int module) {
@@ -12,24 +15,29 @@ static VALUE define_class(VALUE outer, const char *name, VALUE super, int module
     /* A name that is not a constant's ("platform_tty", which io-console
      * defines and prepends to IO): ruby keeps it under an ID that
      * `constants` and `const_get` do not see, and the module's name is
-     * still "IO::platform_tty". Kept here in a hidden instance variable of
-     * the outer one, named by a temporary name. */
-    if (!(name[0] >= 'A' && name[0] <= 'Z') && !((unsigned char)name[0] >= 0x80)) {
-        VALUE key = rb_str_new_cstr("@__capi_hidden_const_");
-        rb_str_cat_cstr(key, name);
-        ID hid = rb_intern_str(key);
-        VALUE found = RTEST(rb_ivar_defined(outer, hid)) ? rb_ivar_get(outer, hid) : Qnil;
-        if (!NIL_P(found)) {
+     * still "IO::platform_tty". Kept on the C side (capi/hidden.c), out of
+     * Ruby's sight, and named by a temporary name -- the outer's path, or
+     * its inspect when it has none. */
+    if (!mr_const_name_p(name)) {
+        int there = 0;
+        VALUE found = mr_hidden_const_get(outer, name, &there);
+        if (there) {
             if (module ? !RB_TYPE_P(found, T_MODULE) : !RB_TYPE_P(found, T_CLASS))
                 rb_raise(rb_eTypeError, "%s is not a %s", name, module ? "module" : "class");
             return found;
         }
         if (!module && (NIL_P(super) || super == 0)) rb_raise(rb_eArgError, "no super class for '%s'", name);
         VALUE made = module ? mr_call(rb_cModule, "new", 0) : mr_call(rb_cClass, "new", 1, super);
-        VALUE full = outer == rb_cObject ? rb_str_new_cstr(name) : rb_str_dup(rb_mod_name(outer));
-        if (outer != rb_cObject) { rb_str_cat_cstr(full, "::"); rb_str_cat_cstr(full, name); }
+        VALUE full;
+        if (outer == rb_cObject) full = rb_str_new_cstr(name);
+        else {
+            VALUE path = rb_mod_name(outer);
+            full = rb_str_dup(NIL_P(path) ? rb_inspect(outer) : path);
+            rb_str_cat_cstr(full, "::");
+            rb_str_cat_cstr(full, name);
+        }
         mr_call(made, "set_temporary_name", 1, full);
-        rb_ivar_set(outer, hid, made);
+        mr_hidden_const_set(outer, name, made);
         return made;
     }
     VALUE sym = ID2SYM(rb_intern(name));

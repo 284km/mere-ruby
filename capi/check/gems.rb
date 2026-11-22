@@ -257,6 +257,10 @@ p BigDecimal('1e-20').exponent, BigDecimal('-0').sign
 gem 'io-console'
 require 'io/console'
 p native.('io/console'), IO.respond_to?(:console)
+# (oflush reaches rb_io_get_write_io: on a duplex pipe, which is no terminal)
+duplex = IO.popen(['cat'], 'r+')
+p((duplex.oflush rescue $!.class))
+duplex.close
 r, w = IO.pipe
 begin
   r.winsize
