@@ -10970,3 +10970,46 @@ public instance methods only: tools/gen_arity_table.rb now reads the eleven
 private hooks the same way (nothing called), and only those rows were added
 to the table (regenerating the whole table would drop rows added since).
 corpus/777.
+
+## 2026-11-22: json, date, bigdecimal, io-console and prism from their gems, C API and all
+
+Rails' lock pins five default gems newer than the interpreter ships; since
+#128 an activated gem's own extension is the one loaded, so they join
+tools/capi_gem_check.py (now 22 gems, 17 of them with C extensions): each
+prints whether the extension it loaded
+is the gem home's, its VERSION, and a use. Four things stood between them
+and ruby's output.
+
+- **The C API.** io-console asks for `rb_io_get_write_io` (an IO's write
+  half: the duplex one's, else itself), and prism for `ruby_version` and
+  `rb_io_read_pending` (what the stream has buffered: @__io_rbuf). Contracts
+  in capi/check/api.rb: `ruby_version == RUBY_VERSION`, the write IO of a
+  pipe end is itself, nothing pending before a read and five bytes after
+  `getc` from six.
+- **A class or module whose name is no constant's.** io-console does
+  `rb_define_module_under(rb_cIO, "platform_tty")` and prepends it to IO.
+  define_class asked `const_defined?(:platform_tty)`, which raises NameError.
+  ruby keeps it under an ID `constants` and `const_get` do not see, and the
+  module's name is "IO::platform_tty"; here it is kept in a hidden instance
+  variable of the outer one and named with set_temporary_name (which accepts
+  that name because it is not a constant path).
+- **`require 'bigdecimal.so'`**, which the gem's bigdecimal.rb writes. The
+  shipped-native lookup looked for "bigdecimal.so.bundle", and cext_feature
+  did not know "bigdecimal.so" at all, so the gem's extension was never
+  looked for and the shipped 4.0.1 answered. Both now read the name without
+  ".so".
+- **prism.** "prism/prism" was not in cext_feature, so the gem's prism.rb
+  got the shipped feature (libprism 1.8.2) and the gem's serializer refused
+  its output ("Invalid serialization"). With it there, the gem's own
+  extension (2.1.0) loads; without the gem the shipped one still answers.
+
+json and date matched once the gem check reached them.
+
+And the test/mkmf difference note 553 left open (144 of 148 here, 140 on
+CI): the four are mkmf/test_pkg_config.rb, which reads
+`RbConfig::CONFIG["PKG_CONFIG"]`. CI's macOS reference was configured with
+pkg-config and ran them; this RbConfig had no such key, so they were skipped
+(RED). This Mac's reference has "" and skips them too, so here they matched.
+The key is now configure's AC_CHECK_TOOLS answer, asked when RbConfig loads:
+"pkg-config" when one is on PATH, else "". (Not run here -- no pkg-config on
+this Mac; CI is where the four run.)

@@ -4,6 +4,7 @@
 #include <ruby/encoding.h>
 #include <ruby/onigmo.h>
 #include <ruby/io.h>
+#include <ruby/version.h>
 #include <sys/stat.h>
 
 /* A pointer C took before the block it yields to gave up the Fiber: the

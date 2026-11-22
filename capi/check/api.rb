@@ -270,7 +270,7 @@ check(A.write_io_of(pr).equal?(pr) && A.write_io_of(pw).equal?(pw))
 check(A.read_pending(pr) == 0)
 pw.write("abcdef"); pw.close
 check(pr.getc == "a")
-check(A.read_pending(pr) >= 0)
+check(A.read_pending(pr) == 5)
 pr.close
 check(A.strtoul('  0x1fz', 0) == [31, 6])
 check(A.strtoul('-12', 10) == [2**64 - 12, 3])
