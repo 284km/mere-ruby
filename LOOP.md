@@ -5587,6 +5587,45 @@ reference tests. Counts below are FILE verdicts, not case counts:
   and runs on macOS and Linux, without changing existing job durations or
   any per-file limits. Full existing-suite regression checks still gate merge.
 
+## 2026-11-16 (66): gem rounds 4-5 -- gzip callbacks and StringIO reflection
+
+While #90's full CI runs, two independent Ruby-library fixes make two more
+original Rack files pass. The same locked 62 files / 1,969 reference tests
+now report 50 MATCH / 11 RED / 1 MEMORY (was 48 / 13 / 1 after rounds 1-3),
+with no lost MATCH or reference coverage change. Rack alone moves from
+30 MATCH / 8 RED / 1 MEMORY to 32 / 6 / 1; the other four gems are unchanged.
+
+- `Zlib::GzipWriter#__write_output` takes the pending bytes out of its
+  buffer BEFORE calling the destination. Rack's consumer accepts a chunk
+  and then raises FakeDisconnect. The old buffer still held that chunk,
+  so ensure's `finish` sent the gzip prefix again and replaced the caller's
+  exception with Zlib::DataError. A two-write sink that inflates bytes and
+  then raises reproduces it without Rack; now it retains the reference's
+  Disconnect and decoded `foo`. Original `spec_deflater.rb` becomes MATCH,
+  and CRuby's zlib file stays 96/96 MATCH. Witness 671.
+- StringIO's eight backing ivars use the interpreter's existing internal
+  namespace. CRuby keeps that state outside Ruby ivars; exposing `@st`,
+  `@enc` and the flags made Psych serialize the private State object and
+  fail restoring the environment dump. User-added `@st` and `@label` remain
+  visible and round-trip; assigning `@st` no longer replaces the stream's
+  real buffer state. This is a mechanical backing-name change in
+  `lib/stringio_ext.rb`, with its embedded copy regenerated. The original
+  `spec_mock_request.rb` becomes MATCH; both CRuby StringIO files give
+  103/103 MATCH. Witness 672.
+- Corpus 695/695 matches the reference, dead definitions and GC-root gates
+  pass, bracket depth stays 895/1024. No main interpreter function, VM,
+  AST tree, native API, collector, global let or resource bound is changed.
+- `suites.py --verbose` only asks the upstream runner to name each test.
+  It identifies the multipart memory file's active case as
+  `test_0018_rejects insanely long boundaries`. Both interpreters pass a
+  small control allocating 10 MiB and doing one nonblocking pipe write
+  (65,536 bytes on each); this does not establish the combined workload's
+  cause. The MEMORY verdict and 2 GiB cap remain.
+- The previous batch's Gem suites CI 43874223005 passes on Linux and macOS
+  with identical reference counts and the recorded 48 / 13 / 1 verdicts;
+  an independent review of #90 repeated all 62 files with no regression or
+  actionable finding. Full existing-suite CI remains a merge gate.
+
 ## 2026-11-16 (60): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and published gems -- nokogiri among them -- install with `gem install`
 
 Stage 7′ / 8, third unit (note 553), on the C API of (58). Until now
@@ -6803,6 +6842,11 @@ two-compile search. The existing build limit remains 1024. Before publishing,
 retain the already published main-merge history as well; its runtime sources
 are identical to the fully measured 799c55d7 build.
 
+The same audit on rounds 4-5, normal O2 source f2f57fa7 including main
+3eb24fef, retains 50 MATCH / 11 RED / 0 BOTH / 1 MEMORY. The branch's own
+pre-audit result is preserved; all 62 reference and 61 non-resource Mere
+files audit the locked gem lib. The ordinary per-file comparison reports
+zero regressions. Gzip/MockRequest retain their two additional MATCH files.
 Hosted validation found old reference-first paths in Unicode/NKF and other
 drivers, plus a fake interpreter unable to answer the new path query. Share
 the clean runtime query in tools/runtime_load_path.sh, put reference fallbacks
@@ -6819,12 +6863,15 @@ is now applied for a combined build; its original bootstrap eval control is
 49/49 MATCH, with isolated corpus 705/705 and unchanged core Eval/Module/Const
 counts. No combined-head or hosted result is inferred from those controls.
 
+Final combined rounds 4-5, normal O2 source 9730ae28: 50 MATCH /
+12 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
 Final combined first gem-suite PR, normal O2 source 4ff6b54f: 48 MATCH /
 14 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
 All 62 files on both sides finish the locked-library source audit. Multipart
 finishes below the RSS cap with one custom-params-hash error (test_0034),
 85 tests / 238 assertions versus the reference's 239. Its prior MEMORY/RED
 variation is not a new MATCH or an inferred VM/GC cause.
+The earlier full corpus was 707/707 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
 Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
 ## 2026-11-18 (82): build-linux's Module check at its 10 s, and Module#clone walking every constant
 
@@ -6864,6 +6911,38 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+## 2026-11-20: a live refinement snapshot need not duplicate its first target
+
+PR #92's repeated original Module check failed its RSS assertion at
+77,643,776 -> 157,310,976 bytes, 2.026060x. Keep that failed measurement.
+A refinement scope with one live refinery and its sole matching fixed
+target stored both entries, although installing the live refinery restores
+that same target and implementation. Store its live marker once in this
+exact case. Mixed tables retain their complete snapshots, and later targets
+still expand when the live scope is installed. This changes ref_snapshot
+only; no collector, native pinning, allocator, cache size or workload changes.
+
+Separate ordinary O2 builds use the same CI compiler 01f5ad73. On local
+Linux/aarch64, the unchanged selected upstream case fails before at
+2.168020x and passes after at 1.722404x. Initial RSS is comparable,
+80,203,776 / 80,076,800 bytes; final RSS is 173,883,392 / 137,924,608.
+Outer times are 6.133 / 6.098 seconds. Both complete original Module files
+pass all 195 tests / 1,240 assertions. The corresponding macOS observation
+gives 1.219891x before / 0.809315x after; its complete files also pass.
+These local observations do not substitute for fresh hosted x86-64 CI.
+
+All 122 original Refinement tests retain the reference's per-case result:
+370 assertions with no skips on Linux, 367 assertions and the same one skip
+on macOS. All eighteen logs reparse, identities match, and the six captured
+selected-case child inputs differ only in the original two nonce tokens.
+Witness 728 checks live targets added after capture, a fixed using scope,
+reopening, enumeration and collection in four hash/MRO configurations.
+Actual bracket depth is 155/1024 and no top-level binding is added.
+The source locks, stronger suite baselines, 600-second / 2-GiB file bounds,
+original 1,000 / 300,000 iterations, ten-second child timeout and strict
+ratio below 2.0 are unchanged. Measurements and hashes are preserved in
+gemtest/module_rss_pr92_r55.json.
 
 ## 2026-11-18: stage 9 follow-up, collectible snapshots and native dump facts
 

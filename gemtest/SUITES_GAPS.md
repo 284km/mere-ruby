@@ -5,21 +5,30 @@ stderr in CI's `gem-suites-*` artifacts identify individual failed tests.
 Symptoms below are observed; an unconfirmed cause is explicitly marked.
 None is excluded from the measurement to improve its score.
 
+PR #92 Module RSS follow-up (2026-11-20): its original complemented-entry
+case still has a preserved hosted 2.026060x failure. A single-refinery live
+snapshot no longer duplicates the fixed entry it already restores. The
+unchanged local Linux case moves from 2.168020x failure to 1.722404x success,
+with comparable initial RSS and all three original assertions. Complete
+Module and Refinement files retain their case identities and results on
+macOS and Linux/aarch64. This is a metadata-storage change in ref_snapshot,
+not a change to GC or the bounds. Fresh hosted CI remains required, and
+Method-copy and other resource failures are not waived. See
+module_rss_pr92_r55.json; no existing source lock or baseline is replaced.
+
 | Suite / file | Observed difference | Ownership and next step |
 |---|---|---|
 | minitest / `test_minitest_mock.rb` | Now executes all 94 tests; 2 failures, 13 errors and 10 skips. Stubbing `File.open` still reaches the real file operation, and a dynamic method's super lookup fails. | Ruby semantics. Inspect builtin aliases and super lookup. Shared dispatch functions are being edited by PRs #86–#88; do not edit those functions concurrently. |
 | minitest / `test_minitest_reporter.rb` | 1 error while compressing a SystemStackError backtrace. `[0].chain([1,1,2].each_slice(1)).chunk_while { ... }.to_a` raises ArgumentError about a missing block; the same operation without Chain succeeds. | Ruby semantics. The Chain block dispatcher is in `invoke_with_block0`, also edited by the VM session in #88; recorded for coordination, not attributed to an ISeq failure. |
 | minitest / `test_minitest_spec.rb` | `Minitest::Spec::DSL#name` calls super and cannot find the inherited Class/Module implementation. | Ruby semantics. Coordinate with #86, which edits `super_next_plain`; no AST tree failure is established. |
 | minitest / `test_minitest_test.rb` | Backtrace compression errors as above, exception Marshal/equality failures, and a missing yield under the backtrace filter helper. | Ruby semantics. Separate the Marshal and block-forwarding witnesses before changing implementations. |
-| rack / `spec_deflater.rb` | Aborting a gzip stream raises Zlib::DataError instead of the test's FakeDisconnect. | Ruby semantics in the streaming zlib API; no native extension is requested by this suite. Reduce the incomplete-stream witness. |
 | rack / `spec_headers.rb` | Class naming through `Minitest::Spec::DSL#name` fails before a summary. | Same super lookup issue as minitest spec; coordinate with #86. |
 | rack / `spec_lint.rb` | `notice environment errors` expects Rack::Lint::LintError, but nothing is raised. | Ruby semantics; root cause not yet isolated. |
-| rack / `spec_mock_request.rb` | Psych tries to revive an instance variable named `@` when loading the test's environment dump. | Ruby semantics; trace the dump/load boundary before attributing a parser or object-model cause. |
 | rack / `spec_request.rb` | The result reporter cannot resolve super from `RackRequestTest::TestProxyRequest.name`; no final summary. | Same super lookup issue as minitest spec; coordinate with #86. |
 | rack / `spec_rewindable_input.rb` | Exits with `unexpected return`, without a summary. | Ruby control-flow semantics; root cause not yet isolated. |
 | rack / `spec_sendfile.rb` | Two tests opening a File subclass reach IO's descriptor conversion and reject a path string. | Ruby constructor inheritance; reduce a File subclass witness. |
 | rack / `spec_utils.rb` | Custom query parameter hash loses `foo`; an invalid-cookie test reports a non-class rescue clause. | Ruby semantics; separate the two failures. |
-| rack / `spec_multipart.rb` | The mere-ruby process family crosses 2 GiB. | Resource investigation, not a proven GC or VM cause. Keep the cap. Record a specific hot test before assigning a fix to the VM session; collector internals remain untouched. |
+| rack / `spec_multipart.rb` | The process family crosses 2 GiB in `test_0018_rejects insanely long boundaries`, a background-thread pipe writer and multipart reader. The reference completes 85 tests / 239 assertions. | Resource investigation, not a proven GC or VM cause. A separate 10 MiB string allocation plus one nonblocking pipe write succeeds on both interpreters, each writing 65,536 bytes. The combined workload still needs isolation; keep the cap and leave collector internals untouched. |
 | rack-test / `uploaded_file_spec.rb` | All 10 tests pass on both sides, but 255 versus 368 assertions. The test enumerates `Tempfile.public_instance_methods(false)`. | Ruby reflection semantics; count discrepancy remains RED rather than concealing it. |
 
 The first batch establishes no confirmed dependency on C API/mkmf, native gem
@@ -41,6 +50,19 @@ Kramdown is deferred for explicit dependency reasons in the lock, not
 classified as an interpreter failure. Rack 3.1.12 was replaced before the
 baseline by 3.2.0 because the older test suite requires removed `cgi/cookie`.
 
+Resolved in follow-up rounds 4-5:
+
+- Rack's `spec_deflater.rb`: GzipWriter now consumes pending output before
+  calling the destination. A consumer that accepts bytes and then raises
+  no longer receives the same gzip prefix again from ensure's finish.
+  `GzipWriter#__write_output` is the only zlib method changed; the original
+  file becomes MATCH, as do all 96 CRuby zlib tests. Witness 671.
+- Rack's `spec_mock_request.rb`: StringIO's eight backing ivars now use the
+  existing internal namespace, so Psych sees only caller-added variables,
+  as on the reference. It no longer serializes the stream's private State
+  object. A caller's `@st` and `@label` remain visible and round-trip, while
+  the stream still reads its own buffer. The original file becomes MATCH
+  and all 103 CRuby StringIO tests pass. Witness 672.
 The source-audit correction also makes explicit physical gem libraries win
 before the bundled stdlib at its actual load-path position. do_require0 and
 resolve_feature share load_path_pick_shipped; witness 685 covers converted
@@ -62,6 +84,12 @@ The integrated corpus is 705/705 MATCH and generated C needs bracket depth
 932, within the existing 1024 build limit. Only the check's search seed is
 updated to the measured depth; the compiler limit is unchanged.
 
+On the rounds 4-5 branch, the same source-audit correction and main 3eb24fef
+retain 50 MATCH / 11 RED / 0 BOTH / 1 MEMORY (normal O2 source f2f57fa7).
+The preserved pre-audit snapshot and transition now refer to this branch's
+own previous result; its two additional Rack MATCH files remain MATCH.
+Reference audits cover 62 files and Mere audits 61. No inventory, dependency
+or bound changes and no per-file comparison regressions.
 Hosted validation exposed reference-fallback ordering in other existing
 drivers and a fake interpreter that did not answer the new path query.
 runtime_load_path.sh now supplies the actual selected runtime's paths before
@@ -88,12 +116,15 @@ is still required. Class.new blocks that change cref incorrectly and bare
 class declarations in such a scope remain separate existing lexical gaps;
 they are not claimed as fixed by the bare-write guard.
 
+Final combined rounds 4-5, normal O2 source 9730ae28: 50 MATCH /
+12 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
 Final combined first gem-suite PR, normal O2 source 4ff6b54f: 48 MATCH /
 14 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
 All 62 files on both sides finish the locked-library source audit. Multipart
 finishes below the RSS cap with one custom-params-hash error (test_0034),
 85 tests / 238 assertions versus the reference's 239. Its prior MEMORY/RED
 variation is not a new MATCH or an inferred VM/GC cause.
+The earlier full corpus was 707/707 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
 Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
 
 The remaining stdlib-caller P2 also affected `mspec/scoreboard.sh` and
