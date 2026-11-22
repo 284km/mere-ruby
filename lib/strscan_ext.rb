@@ -482,10 +482,14 @@ class StringScanner
   end
 
   # --- the *_full family: one call, four answers -------------------------
+  # (scan_full and scan_integer take scan's own path, as skip does, not the
+  #  public #scan: a subclass's scan is no entry point of theirs in CRuby)
   def scan_full(re, advance = true, ret_string = true)
     saved = [@pos, @cp]
-    m = scan(re)
-    return nil if m.nil?
+    hit = __at(re, true)
+    return __miss if hit.nil?
+    __took(hit, re, true)
+    m = @matched
     n = m.bytesize
     @pos, @cp = saved unless advance
     ret_string ? m : n
@@ -516,9 +520,10 @@ class StringScanner
     unless @string.encoding.ascii_compatible?
       raise Encoding::CompatibilityError, "ASCII incompatible encoding: #{@string.encoding.name}"
     end
-    m = scan(re)
-    return nil if m.nil?
-    Integer(m, base)
+    hit = __at(re, true)
+    return __miss if hit.nil?
+    __took(hit, re, true)
+    Integer(@matched, base)
   end
 
   def self.must_C_version

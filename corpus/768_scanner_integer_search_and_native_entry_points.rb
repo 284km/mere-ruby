@@ -41,3 +41,13 @@ scanner = ScannerWithOverriddenScan.new("abcd")
 p [scanner.skip(/a/), scanner.pos, scanner.matched, scanner.calls]
 p [scanner.skip_until(/d/), scanner.pos, scanner.matched, scanner.calls]
 p [scanner.skip(/absent/), scanner.pos, scanner.matched, scanner.calls]
+# ...and so do scan_full and scan_integer
+scanner = ScannerWithOverriddenScan.new("abcd")
+p [scanner.scan_full(/a/, true, true), scanner.pos, scanner.calls]
+p [scanner.scan_full(/b/, false, false), scanner.pos, scanner.matched, scanner.calls]
+p [scanner.scan_full(/absent/, true, true), scanner.pos, scanner.matched, scanner.calls]
+scanner = ScannerWithOverriddenScan.new("12ab")
+p [scanner.scan_integer, scanner.pos, scanner.calls]
+p [scanner.scan_integer, scanner.pos, scanner.matched, scanner.calls]
+scanner = ScannerWithOverriddenScan.new("-0x1fz")
+p [scanner.scan_integer(base: 16), scanner.pos, scanner.calls]
