@@ -7513,11 +7513,11 @@ The HTML host now returns its guest wrapper's declared -2/empty-string unavailab
 sentinels, preserving startup without claiming timestamp support. The native
 File/C API implementation is unchanged.
 
-Merging main on 2026-11-22 (after #91, #99, #103 and #144): #91 carried this
-same GC work, so the code, glue, exclusion files and corpus 673/711 are
-already on main byte for byte. Main's wording of the ledger (41 GC and
-compaction plus 16 ObjectSpace, 57 in all) and its run.sh are kept; this
-branch now adds only this record.
+Merging main on 2026-11-22 (after #91, #99, #103, #144 and #149): #91 carried
+this same GC work, so the code, glue, exclusion files, corpus 673/711 and this
+record are already on main byte for byte. Main's wording of the ledger (41 GC
+and compaction plus 16 ObjectSpace, 57 in all) and its run.sh are kept; #112
+adds only this note.
 
 
 ## 2026-11-18: consolidate the deferred GC/ObjectSpace stack
@@ -7676,29 +7676,6 @@ actual CI binary(34.657s), the prior PR CI binary(33.547s) and candidate
 not a VM speed change or a timeout waiver. New hosted CI, per-file comparison
 and addressed P1/P2 findings are still required before merge. No test, helper,
 limit, exclusion, collector, VM/ISeq, AST/Prism or C API change is used here.
-
-
-
-## 2026-11-18: stage 9, ship GC measurements independently
-
-Extract the GC-specific part of #91 against main 12ca1df2, preserving the
-base ObjectSpace enumeration and VM/AST/C API code. gc_collect_any wraps
-actual collections with CPU profiling and weak-map observations; its
-ObjectSpace observation cleanup is left with #91. No collector marking or
-sweeping function is independently changed. Startup CPU epoch and portable
-CPU-clock/browser bindings retain the three addressed review corrections.
-
-GC APIs expose real observations and unsupported compaction consistently.
-The upstream exclusion mechanism and symmetric audit/reporting cover only
-19 GC and 22 compaction cases in this branch; ObjectSpace's 16 exclusions
-stay with #91. Corpus 711 tests GC measurements/capabilities; existing 673
-checks delayed enablement, clear/re-enable and CPU-versus-sleep accounting.
-No new top-level value or resource-limit changes.
-
-Fresh Wasm emission also exposed an existing missing mr_utimens/mr_stat_times host imports.
-The HTML host now returns its guest wrapper's declared -2/empty-string unavailable
-sentinels, preserving startup without claiming timestamp support. The native
-File/C API implementation is unchanged.
 
 
 
