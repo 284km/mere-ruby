@@ -19,22 +19,33 @@
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 mr="$1"; src="$2"; dir="$3"; stdlib="$4"
-hdr="$(RUBYLIB="$stdlib" "$mr" -e 'print RbConfig::CONFIG["rubyhdrdir"].to_s')" || exit 1
+runtime="$(sh "$here/../tools/runtime_load_path.sh" "$mr")" || exit 1
+fallback="$stdlib"
+if [ -n "${MERE_RUBY_STDLIB_FALLBACK:-}" ]; then
+  fallback="$fallback:$MERE_RUBY_STDLIB_FALLBACK"
+fi
+hdr="$(RUBYOPT= RUBYLIB="$runtime:$stdlib" MERE_RUBY_STDLIB_FALLBACK="$fallback" "$mr" -e 'print RbConfig::CONFIG["rubyhdrdir"].to_s')" || exit 1
 [ -n "$hdr" ] && [ -f "$hdr/ruby.h" ] || exit 1
-arch="$(RUBYLIB="$stdlib" "$mr" -e 'print RbConfig::CONFIG["arch"]')" || exit 1
+arch="$(RUBYOPT= RUBYLIB="$runtime:$stdlib" MERE_RUBY_STDLIB_FALLBACK="$fallback" "$mr" -e 'print RbConfig::CONFIG["arch"]')" || exit 1
 rm -rf "$dir"
 mkdir -p "$dir/source/lib" "$dir/build/.ext/include" || exit 1
 cp "$src/lib/mkmf.rb" "$dir/source/lib/mkmf.rb" || exit 1
 ln -s "$hdr" "$dir/source/include" || exit 1
 ln -s "$hdr" "$dir/build/.ext/include/$arch" || exit 1
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
 {
   printf '#!/bin/sh\n'
-  printf 'UNITTEST_MKMF_SOURCE=%s UNITTEST_MKMF_BUILD=%s exec %s -r %s "$@"\n' \
-    "'$dir/source'" "'$dir/build'" "'$mr'" "'$here/mkmf_context.rb'"
+  # Keep the caller's explicit test/extension paths intact. Only the declared
+  # reference directories are fallbacks, including when a child repeats -I.
+  printf 'MERE_RUBY_STDLIB_FALLBACK=%s UNITTEST_MKMF_SOURCE=%s UNITTEST_MKMF_BUILD=%s exec %s -r %s "$@"\n' \
+    "$(shell_quote "$fallback")" "$(shell_quote "$dir/source")" \
+    "$(shell_quote "$dir/build")" "$(shell_quote "$mr")" "$(shell_quote "$here/mkmf_context.rb")"
 } > "$dir/ruby" || exit 1
 chmod +x "$dir/ruby" || exit 1
 # (topdir's Makefile, which test/mkmf/base.rb reads for CC_WRAPPER: the one
 #  this interpreter's mkmf writes for an extension of no sources)
-(cd "$dir/build" && RUBYLIB="$dir/source/lib:$stdlib" "$dir/ruby" -rmkmf -e 'create_makefile("mkmf_environment")' >/dev/null 2>"$dir/context.err") || exit 1
+(cd "$dir/build" && RUBYOPT= RUBYLIB="$dir/source/lib:$runtime:$stdlib" "$dir/ruby" -rmkmf -e 'create_makefile("mkmf_environment")' >/dev/null 2>"$dir/context.err") || exit 1
 [ -f "$dir/build/Makefile" ] || exit 1
 printf '%s\n' "$dir/ruby"
