@@ -8955,6 +8955,33 @@ stays enabled. The159-row intake remains14 MATCH/57 EXCLUDED/88 HANDOFF.
 Original tests, locks, accepted snapshots and all bounds are unchanged.
 Fresh hosted checks and the latest-main per-file comparison remain required.
 
+## 2026-11-22: stop cancelled workflows from starting new suite summaries
+
+Cancelled runs 44921266629 and 44922636658 still started their Unit,
+Bootstrap and Tool summary jobs. The jobs had no completed shard group to
+collect, so cancellation produced additional failing summary checks. Main's
+Tool summary already checks cancellation and the shard result; apply the same
+boundary to Unit and Bootstrap.
+
+Both jobs require a successful plan and an active workflow with a successful
+or failed shard group. Their collect steps also check cancellation, covering
+a workflow cancelled after the job starts. Genuine shard failures still run
+the existing collectors; missing and partial results still fail, and the
+existing artifact uploads continue to retain diagnostics. Test inventories,
+resource bounds, runners, measurement code and runtime implementation are
+unchanged. See the [GitHub status-check documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions).
+
+Validation: actionlint 1.7.12 accepts the workflow. Four existing collection
+controls pass: missing shards retain all planned rows and fail; unattempted
+files in partial artifacts remain visible; weighted plans still reject a
+missing shard; and a monitor failure preserves reference cases while failing
+collection. This does not mark previously cancelled or failed runs successful.
+
+Latest-main integration retains the merged stage9 documentation verbatim.
+The only conflict was the append position in this log; runtime and collector
+changes come unchanged from main. The same four collector controls and
+actionlint pass again on the integrated base.
+
 
 ## 2026-11-22: keep TracePoint events on their suspended callback
 
