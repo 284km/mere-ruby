@@ -7259,3 +7259,7 @@ seven gems with C extensions, freshly install separately under both runtimes;
 all84 use-output lines match and reference-built libraries are rejected.
 Earlier compiler43 measurements stay associated with their original source.
 Fresh hosted checks and latest-main per-file acceptance remain required.
+
+The upstream gem workflow also selects compiler408b03d9, matching core CI
+and the new local O2 measurements. Its original locks, tests, accepted
+snapshots and bounds are unchanged; new hosted gem results remain required.
