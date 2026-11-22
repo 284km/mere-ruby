@@ -10492,3 +10492,57 @@ verdict dictionary identical to the retained baseline. The three files retain
 in force. All 722 corpus programs match in both hash modes: 520.933 seconds and
 1,290,080 KiB peak family RSS, within the original 900-second / 2-GiB bound.
 This was measured at 8e060d3f before the documentation-only follow-up.
+
+## 2026-11-21: reduce clone cache residency without losing the Method-copy gate
+
+PR #109's Linux job 136752758452 fails the original Module clone leak check:
+71,696,384 to 144,699,392 resident bytes, **2.018224406x**, under compiler
+01f5ad73. The failed test-merge source 1533737c has the same tree as head
+5813b8d6. Both compilers are compared on that exact source, ordinary O2,
+with the original upstream input and ten-second child timeout.
+
+Published compiler 43f2994b clears discarded cached-region pages with Linux
+MADV_DONTNEED rather than writing zeros into every page. Restoring its clear
+helper and call makes the generated C byte-identical to 01f5ad73. Neither
+the native cache's default of 64 regions nor live or pinned storage changes.
+On Linux/aarch64, the predeclared parent/candidate/candidate/parent clone
+order gives **1.818147056 / 1.150605110 / 1.348688635 / 1.671946690x**.
+The old compiler also passes locally; this is evidence of reduced residency,
+not a reproduction of the x86-64 hosted failure on the same runner.
+
+The compiler-only candidate fails the independent Method-copy gate at
+**2.118446692x**, so that change alone is insufficient. Backport the existing
+compact_method_store correction from #114: if native compaction is deferred
+and the arena has not shrunk, preserve the previous measured baseline.
+The thresholds, dirty flag, initial baseline and unmeasurable fallback are
+unchanged. The combined source 6d8d563d passes two Linux clone trials at
+**1.264892127 / 1.301888908x** and two Method-copy trials at
+**1.705846868 / 1.704296585x**. Module **195/1240** and Refinement
+**122/370** match every reference case. macOS Method-copy is **1.385781495x**
+and Refinement **122/367, one reference-matching skip** is unchanged.
+
+Keep the failures: the compiler-only macOS Module runs fail complemented-entry
+at **2.051378446x** and **2.037586135x**. The first combined macOS Module run
+also fails that case at **2.018579686x** and times out in the original iclass
+child. The retained serialized comparison follows the corpus runs; no
+assertion, test or timeout is removed. In that comparison, the compiler-only
+baseline still fails complemented-entry at **2.030891254x**; the combined
+candidate passes **195/1240**, loses no passing cases, and the iclass timeout
+does not recur in either run. Both sources also pass **721/721 corpus** in
+both hash-index modes: 529.512 seconds / 1,104,752 KiB for compiler-only,
+524.786 seconds / 1,187,728 KiB for the combined candidate.
+The separate instrumented Linux clone
+observes deferred compaction with zero increases to an established baseline
+without movement.
+Its success is diagnostic evidence and cannot replace an ordinary gate.
+
+[The measurement receipt](bench/module_clone_cache_r82.json) preserves the
+hosted failure, all compiler controls, original case dictionaries, all 21
+Method-copy samples per trial, corpus results and the serialized macOS
+comparison. The identical retained Method-copy program can be rerun with
+`python3 tools/method_copy_memory_check.py --reference /path/to/ruby --output /path/to/results`.
+All per-file checks retain 600 seconds / 2 GiB; the complete corpus keeps its
+900-second / 2-GiB aggregate guard. Current hosted checks and comparison with
+the latest completed main remain required before merge. This follow-up
+changes only m_state.compact_method_store in the runtime; collector bodies,
+native pin policy, ISeq, AST/Prism and C API implementations are unchanged.

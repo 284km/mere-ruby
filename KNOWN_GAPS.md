@@ -4685,6 +4685,9 @@ The independently deliverable count/ID subset is #109. This integrated
 stack also includes native value-store enumeration; the Enumerable callback
 timeout recorded for #91 remains unresolved.
 
+The broader enumeration/GC work remains tracked by PR #91; this independent
+change preserves the base ObjectSpace enumeration implementation.
+
 ObjectSpace.count_objects also counts live String slots (including empty
 Strings) and retained Proc/Binding stores in T_DATA/TOTAL (corpus 674). The
 String count comes from actual sweep survivors plus new handles; issued
