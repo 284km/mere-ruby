@@ -61,6 +61,10 @@ LINK = ['-bundle', '-undefined', 'dynamic_lookup'] if darwin else ['-shared']
 reference_headers = subprocess.check_output(
     [str(REF), '-rrbconfig', '-e', 'puts RbConfig::CONFIG.values_at("rubyhdrdir", "rubyarchhdrdir")'], text=True).split()
 stdlib = subprocess.check_output([str(REF), '-rrbconfig', '-e', 'print RbConfig::CONFIG["rubylibdir"]'], text=True)
+# Prefer this runtime's libraries before using the reference Ruby as a fallback.
+# In particular, the reference monitor.rb requires an incompatible monitor.so.
+runtime = subprocess.check_output(["sh", str(ROOT / "tools/runtime_load_path.sh"), str(MERE)],
+                                  text=True, timeout=20).split(os.pathsep)
 
 # The spec tree: the directories the capi specs and their fixtures require
 # from, the shim as the root spec_helper.rb, and a helper for optional/capi
@@ -112,7 +116,8 @@ def run(file):
         env = {k: v for k, v in os.environ.items() if not k.startswith('MERE_RUBY_') and k not in ('RUBYOPT', 'RUBYLIB')}
         env.update(CAPI_SPEC_EXT=str(extensions[side]), LANG='en_US.UTF-8')
         if side == 'mere':
-            env['RUBYLIB'] = stdlib
+            env['RUBYLIB'] = os.pathsep.join([*runtime, stdlib])
+            env['MERE_RUBY_STDLIB_FALLBACK'] = stdlib
         log = OUT / f'{file.stem}.{side}.out'
         result = supervise([str(binary), str(driver)], env, log, 2 * 1024 * 1024, 120)
         text = log.read_text(errors='replace')

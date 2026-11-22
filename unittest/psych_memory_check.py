@@ -79,12 +79,15 @@ def main():
     stdlib = subprocess.check_output([reference, '-e',
         'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir,"gems","*","lib")]).join(":"))'], text=True)
     results = {}
+    runtime = subprocess.check_output(['sh', str(ROOT / 'tools/runtime_load_path.sh'),
+                                       str(Path(args.binary).resolve())], text=True, timeout=20)
 
     def run(name, source, binary, *argv, stats=False):
         script = output / (name + '.rb')
         script.write_text(source)
         log = output / (name + '.out')
-        env = dict(os.environ, RUBYLIB=stdlib)
+        libraries = stdlib if Path(binary).resolve() == Path(reference).resolve() else runtime + os.pathsep + stdlib
+        env = dict(os.environ, RUBYLIB=libraries)
         if stats:
             env['MERE_REGION_STATS'] = '1'
         result = supervise([str(Path(binary).resolve()), str(script), *map(str, argv)], env,

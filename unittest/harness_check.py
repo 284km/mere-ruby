@@ -24,6 +24,7 @@ class HarnessCheck(unittest.TestCase):
             shutil.copyfile(ROOT / "unittest" / script, self.root / "unittest" / script)
         shutil.copytree(ROOT / 'unittest/child-bin', self.root / 'unittest/child-bin')
         shutil.copyfile(ROOT / "mspec/mask.sh", self.root / "mspec/mask.sh")
+        shutil.copyfile(ROOT / 'tools/runtime_load_path.sh', self.root / 'tools/runtime_load_path.sh')
         (self.root / "unittest/files.txt").write_text("ruby\n-ruby/test_vm.rb\n")
         for name in ["test_ok.rb", "test_vm.rb", "test_helper.rb", "enc/test_encoding.rb"]:
             (self.root / "src/test/ruby" / name).write_text("# fixture\n")
@@ -34,7 +35,8 @@ class HarnessCheck(unittest.TestCase):
         (self.root / "tools/ref_ruby.sh").write_text(
             'REF_RUBY_VERSION=fixture\nREF_RUBY_BIN=' + shlex.quote(str(self.root / "reference")) + '\n')
         interpreter = '''#!/bin/sh
-case "$*" in *rubylibdir*) printf '\\n'; exit 0 ;; esac
+case "$*" in *rubylibdir*) printf '/fixture/reference-stdlib'; exit 0 ;; esac
+case "$*" in *'$LOAD_PATH.join'*) printf '/fixture/runtime-stdlib'; exit 0 ;; esac
 case "$*" in *Gem.bin_path*) printf '\\n'; exit 0 ;; esac
 preload=0
 script=
@@ -50,6 +52,7 @@ fixture_root=$(cd "$(dirname "$0")" && pwd)
 if [ -n "${UNITTEST_EXCLUSIONS:-}" ] && [ -f "$fixture_root/$side.exclusions" ]; then
   cat "$fixture_root/$side.exclusions" >> "$UNITTEST_EXCLUSIONS"
 fi
+printf '%s' "$RUBYLIB" > "$fixture_root/$side.rubylib"
 if [ -f "$fixture_root/$side.interleave" ]; then
   printf '[1/1] Example#test_ok'
   printf '/fixture/test.rb:1: warning: test warning\\n' >&2
@@ -145,6 +148,8 @@ exit "$(cat "$fixture_root/$side.code")"
     def test_pass_preloads_framework_and_keeps_both_logs(self):
         result = self.run_harness("ruby/test_ok.rb")
         self.assertEqual(result.returncode, 0, result.stderr)
+        libraries = (self.root / 'mere-ruby.rubylib').read_text().split(os.pathsep)
+        self.assertLess(libraries.index('/fixture/runtime-stdlib'), libraries.index('/fixture/reference-stdlib'))
         self.assertIn("MATCH 1, RED 0, BOTH 0, EXTRA 0", result.stdout)
         row = self.coverage()[0]
         self.assertEqual(row["ref_state"], "COMPLETE")

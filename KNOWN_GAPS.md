@@ -4810,6 +4810,28 @@ zero failures/errors/skips, outer 23.441 seconds / 365,632 KiB. The
 The updated hosted CI, Linux Module memory gate and all-file comparison
 against complete main remain required before merge. No bound is changed.
 
+### PR90: Pathname core and physical library extensions
+
+Separating the unchanged shipped Pathname core from pathname.rb's extension
+body restores the two original Bundler binstub cases (13 to15 MATCH). Real
+pathname.rb files still win ordinary load-path lookup. The core is initialized
+when their class body needs it, and factory-first loading preserves the real
+core/library phases. Corpus746/747, the710-file corpus and five complete
+original test files retain the completed main's passing cases under unchanged
+bounds. The five-gem baseline remains48 MATCH/14 RED with both sides' actual
+library audits complete. The previous hosted30K-method Timeout remains an
+observation requiring a fresh hosted result; the same original file passes
+locally on both actual CI binaries and the candidate within60 seconds.
+
+
+The final Pathname core entry uses an internal identity anchored in the
+runtime's stdlib directory. A user's same-named ordinary Ruby file remains
+selectable, while the core body keeps its actual implementation(corpus748).
+The integrated714-file corpus and original bounded focused/gem measurements
+pass. The intermediate head's separate Linux Module clone RSS2.0991655787x
+failure remains evidence; fresh final-head hosted gates and every-file
+nonregression are still required, with original assertions and limits intact.
+
 ## Rails dependency checksums and the next command boundary (2026-11-19)
 
 SHA-2 can use the real internal OpenSSL provider when already loaded, as
@@ -5035,6 +5057,24 @@ privacy and autoload behavior. The712-file corpus and original nine-file784-case
 comparison pass without losing a main PASS. The separate module_eval lexical
 negative remains an explicit failing diagnostic; this change does not claim it.
 
+Native-check stdlib fallbacks are explicit: the C extension runners set
+MERE_RUBY_STDLIB_FALLBACK to the actual reference library directory. A
+RubyGems extension child can repeat it through -I; native-backed shipped
+features still use this runtime's implementation there. Other user paths
+and pure Ruby source retain ordinary ordering. Corpus525 covers a native
+wrapper, and unchanged mkmf contracts plus seven real native gem installs
+pass. The C API spec gate retains its existing unsupported cases and bounds;
+2277 candidate cases versus2584 reference is not a claim of complete C API.
+
+Declared reference fallback directories are now deferred for both shipped
+and unshipped feature lookup. This covers Psych/YAML wrappers whose native
+core names do not appear in the earlier native-feature filter. Ordinary
+user source paths retain precedence, and no inactive path is added to the
+search. The real YAML child reproduction and all 11 library controls pass.
+The earlier native-name-only behavior is superseded; native Method dispatch
+and other independent compatibility gaps are not claimed solved by this
+ordering repair.
+
 
 ## The original Rails native-install blocker is resolved on integrated main
 
@@ -5063,3 +5103,23 @@ all76 allocation cases enabled; its57 exclusion identities and reasons match
 on reference and Mere. The existing weak-reference count, VM allocation
 and native attribution gaps remain explicit. No collector value, exclusion,
 original test or limit was changed to obtain the new730-file corpus result.
+
+## Native loading after the main compiler update
+
+The PR145 compiler408b03d9 setting is retained when integrating main; the
+native/shipped fallback ordering and child-launcher implementation are
+unchanged. All726 corpus programs, actual mkmf builds and seven native gems
+retain their passing controls. Full hosted per-file acceptance remains a
+merge requirement; this configuration integration does not establish a
+complete Rails pass or change any accepted snapshot or resource bound.
+
+
+## Stage9 after the native-loading merge
+
+The PR90 native-loading repair is integrated without changing the collector
+or GC exclusion ledger. Native builds and child library loading are checked
+with the GC changes together. All738 corpus programs and the selected
+original166-case comparison retain their measured results; all57 exclusions
+remain explicit and identical across runtimes. The existing87 RED in that
+comparison, including all76 allocation cases, stay visible. This integration
+does not claim a complete Rails pass or a fix for native memory attribution.
