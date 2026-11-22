@@ -77,8 +77,11 @@ module Zlib
 
     def __write_output(force = false)
       if force || @compressed.bytesize >= 2048
-        @io.write(@compressed) unless @compressed.empty?
+        # A writer may consume the bytes and then raise (a disconnected
+        # streaming client). finish must not deliver that same prefix again.
+        pending = @compressed
         @compressed = +''.b
+        @io.write(pending) unless pending.empty?
       end
     end
 

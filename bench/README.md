@@ -3,6 +3,78 @@
 Every harness here is meant to be run against CRuby as well, because a number
 without the reference number is not a measurement.
 
+## Embedding verification builds
+
+After building Prism and the native C API header with `tools/build.sh`, run:
+
+```sh
+python3 tools/native_probe/embedding_check.py --compiler /path/to/mere.exe --output /tmp/embedding-normal
+python3 tools/native_probe/embedding_check.py --compiler /path/to/mere.exe --output /tmp/embedding-failures \
+  --failure-checks --reuse-header-from /tmp/embedding-normal
+```
+
+CI builds the normal library and a separate fault-only library. The latter
+runs setup failure and scheduler-cleanup failure in separate host processes,
+selecting the injection through a test-only environment variable. It also runs
+the normal lifecycle with injection disabled. The three native ownership cycles,
+outside-provider sentinel and NKF cleanup checks remain in the cleanup-failure
+case. The standalone `--setup-failure` and `--cleanup-failure` options still work.
+
+The shared header is accepted only from a normal build with matching compiler,
+export definitions and source-input hashes, including imported `ic/` and mgz
+sources. Its checksum must match its provenance. Normal and fault-only builds
+record their identities separately, and the consumer bundler refuses injected
+builds. The normal library uses the original API source without injection hooks.
+
+This changes CI's large interpreter builds from three to two per platform and
+header emissions from three to one. It retains O2, process-family supervision,
+the 3-GiB/300-second compilation budget and the 2-GiB runtime limits. Actual
+runner elapsed time still depends on native toolchain and queue availability.
+
+Local validation with the pinned Mere `2e3cc433d470842a07c79cc50bd217441c889dc0`
+completed all normal lifecycle, retained-state/allocation stress and packaged
+consumer checks at O2. Both combined failure cases passed. Independently emitting
+the fault fixture's header produced exactly the normal header's bytes. The
+test-only selector was absent from both the normal generated C and consumer
+archive, and the bundler rejected the actual injected build.
+
+## `scanner_search_lengths.rb`
+
+This fixed workload searches an 8-MiB subject 24 times through `exist?`,
+`skip_until` and `search_full` with an integer result. Each turn resets the
+scanner and contributes to the checksum `[8388608, 201326592, 0, "z"]`.
+There is no collection, warmup or delay.
+
+`scanner_search_copies_r100.json` retains a fixed reference/before/candidate/
+candidate/before comparison with the same released compiler. A wait4 wrapper
+records the child's kernel peak separately from CI's sampled process-family
+peak; both use the existing 600-second / 2-GiB family envelope. Child peaks
+are 35,312 / 255,760 / 122,976 / 122,960 / 255,680 KiB. All checksums match.
+The original sampled-only run is retained too: it missed the short reference
+process's actual peak, so its 32-KiB observation is not used as that peak.
+
+The original Rack Request file still exceeds its cap. This benchmark does
+not replace it or demonstrate a repair of its remaining memory failure.
+
+## `request_subject_copy.rb`
+
+This fixed workload alternates a mutable 2-MiB regexp subject and a small
+subject 128 times. Each capture contributes to the printed checksum:
+`[2097152, 768, false]`. It contains no collection, warmup or delay.
+
+Compare ordinary O2 builds with the same compiler and the existing CI
+process-family supervisor's 600-second / 2-GiB bounds. Preserve the process
+order reference, before, candidate, candidate, before. The before build in
+`request_subject_copies_r97.json` already contains the split and byteslice
+changes, isolating the subsequent regexp-cache change.
+
+The recorded macOS peaks are 489,488 / 169,040 / 256,016 / 532,768 KiB for
+before/candidate/candidate/before, with identical output. These focused
+measurements do not replace Rack's complete original Request file: its four
+corresponding processes all exceed the unchanged cap. The receipt keeps
+both failures and successful selected-case observations, source/binary
+identities, raw-log hashes and the complete upstream/core comparisons.
+
 ## `enumerator_steps.rb`
 
 ```sh
