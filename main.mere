@@ -48669,8 +48669,10 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let slf9 = (if lv_has frame "self" then lv_get frame "self" else VNil) in
      // (on the line it was defined on, note 435)
      let _ = (if map_has hook_flags "tp" then tp_env_meth frame body else ()) in
-     let _ = fire_tp_vlc world "call" mnm9 "Object" VNil slf9
-               (match (meth_source_get name 0) with VInt l9 -> l9 | _ -> cur_line ()) "" name in
+     let _ = (if map_len hook_flags > 0 && map_has hook_flags "tp" && vm_body_late body then ()
+              else (let _ = fire_tp_vlc world "call" mnm9 "Object" VNil slf9
+                              (match (meth_source_get name 0) with VInt l9 -> l9 | _ -> cur_line ()) "" name in
+                    if map_len hook_flags > 0 && map_has hook_flags "tp" then map_set frame "__tpcall" VNil else ())) in
      // (as run_meth: tp_meth_flow while a TracePoint is armed)
      let flow9 = (if map_has hook_flags "tp" then tp_meth_flow world frame blk body mnm9 name "Object" slf9
                   else method_body_flow frame world blk body) in
@@ -49773,7 +49775,12 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                                      else VNil) with VInt l9 -> l9 | _ -> cur_line ()) in
                    // (...in the file it was written in, not the caller's)
                    let cp9 = (if map_has hook_flags "tp" then tp_meth_path dk defcls name else "") in
-                   let _ = fire_tp_vlc world "call" mnm defcls VNil slf9 cl9 cp9 name in
+                   // (...not for a body whose :call comes after its prologue:
+                   //  the VM fires that one there -- vm_late_call. One fired
+                   //  here marks the frame, so the VM does not fire it again.)
+                   let _ = (if map_len hook_flags > 0 && map_has hook_flags "tp" && vm_body_late body then ()
+                            else (let _ = fire_tp_vlc world "call" mnm defcls VNil slf9 cl9 cp9 name in
+                                  if map_len hook_flags > 0 && map_has hook_flags "tp" then map_set frame "__tpcall" VNil else ())) in
                    // (a define_method body is a block too: its :b_call, and
                    //  the frame marked for a :b_return a raise makes)
                    if tpbm9 then (let _ = map_set frame "__tpbm" VNil in tp_blk_fire_at_c world "b_call" mnm defcls VNil slf9 cl9 cp9 name) else ())) in
@@ -66285,6 +66292,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   let id = vm_slot () in
   let _ = (if depth == 0 then vec_set vm_tree_cur 0 (vm_tree_new ()) else ()) in
   let (code, na, ov) = vm_scratch depth in
+  let _ = (if map_has vm_late_ids id then map_delete vm_late_ids id else ()) in
   let labels = map_new () in
   let rec scan = fn (xs: Val list) -> fn (i: int) ->
     (match xs with
@@ -66313,7 +66321,10 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
        // (a method's :call where ruby fires it, after a prologue -- the
        //  destructuring of a `(a, b)` parameter: 16, vm_late_call. At the
        //  first instruction the call made on the way in is the same one.)
-       else if str_eq s "RUBY_EVENT_CALL" then go t line (if kind == 2 && vec_len code > 0 && (evt / 16) % 2 == 0 then evt + 16 else evt) prev yld ids outs
+       else if str_eq s "RUBY_EVENT_CALL" then
+         (let late9 = kind == 2 && vec_len code > 0 in
+          let _ = (if late9 then map_set vm_late_ids id 1 else ()) in
+          go t line (if late9 && (evt / 16) % 2 == 0 then evt + 16 else evt) prev yld ids outs)
        else if str_len s > 6 && str_eq (substring s 0 6) "label_" then go t line evt (0 - 1) yld ids outs
        else go t line evt prev yld ids outs
      | Cons (VArr iid, t) ->
@@ -66862,6 +66873,16 @@ and vm_body_pos = fn (body: Stmt list) ->
      | Cons (SFile f, t) -> go t line f
      | Cons (_, t) -> go t line path) in
   go body 0 ""
+// whether a method's body is a program whose :call comes after its
+// prologue (vm_late_ids): run_meth and call_method leave that :call to it
+and vm_body_late = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (SVm (id, _), _) -> map_has vm_late_ids id
+  | Cons (SLine _, t) -> vm_body_late t
+  | Cons (SLineQ _, t) -> vm_body_late t
+  | Cons (SFile _, t) -> vm_body_late t
+  | _ -> false
 // whether the program, or a block in it, yields (bare_yield_stmt: the
 // method's block is kept for a block that does)
 and vm_yields = fn (id: int) ->
@@ -67766,12 +67787,14 @@ and vm_events = fn env -> fn world -> fn (e: int) -> fn (line: int) ->
 // A method's :call, at the instruction ruby fires it on when a prologue came
 // first: a TracePoint enabled while the prologue ran -- by a `#to_ary` that
 // destructuring `(a, b)` called -- sees the call, as ruby's does (corpus
-// 725). Not when the call was made on the way in (tp_meth_flow keeps the
-// frame: "__tpkeep"), and once a frame ("__tpcall"). As run_meth makes it:
+// 725) -- and with one on from the start, in the same place: run_meth and
+// call_method leave such a method's :call to this (vm_body_late). Once a
+// frame: one fired on the way in marks the frame "__tpcall". As run_meth
+// makes it:
 // the name it was defined as and called by, its class, the line and the file
 // it was written in.
 and vm_late_call = fn env -> fn world ->
-  if map_has env "__tpkeep" || map_has env "__tpcall" || (if lv_has env "__meth" then false else true) then ()
+  if map_has env "__tpcall" || (if lv_has env "__meth" then false else true) then ()
   else
     (let _ = map_set env "__tpcall" VNil in
      let mnm = (match lv_get env "__meth" with VStr h9 -> sget h9 | _ -> "") in

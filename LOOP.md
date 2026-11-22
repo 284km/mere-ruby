@@ -11112,3 +11112,16 @@ Corpus 795 is the witness for both. It differs on main's build.
 Results:
 - corpus 802/802; under MERE_RUBY_VM=1, 792 on the VM, 10 fallen back, 0 different.
 - test_integer, test_float, test_rational, test_complex, test_array and test_string give the same counts as main's build.
+
+**Review of #161 (to (92)).** The same mismatch could be reached with a TracePoint that was already on at entry. The VM fired :call on the way in, before the prologue:
+- before a default's own :call / :return;
+- before the destructuring `#to_ary`'s;
+- even for a default that raised, where ruby fires no :call.
+
+Now:
+- The loader notes each method whose RUBY_EVENT_CALL is past its first instruction (vm_late_ids; vm_free and a reload clear the note).
+- run_meth and call_method leave such a method's :call to the VM (vm_body_late).
+- vm_late_call fires it at the marked instruction whether or not the TracePoint was on at entry.
+- A :call fired on the way in marks the frame "__tpcall", so vm_late_call never fires a second one.
+
+All three cases now match ruby on the VM, and corpus 790 covers the first two. The evaluator still fires no :return for the raising default; that was so before #161.

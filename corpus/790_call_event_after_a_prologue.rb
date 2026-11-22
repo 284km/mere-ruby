@@ -71,3 +71,17 @@ p $events
 def pro_top = [__method__, __callee__]
 alias pro_top_alias pro_top
 p [pro_top_alias, method(:pro_top_alias).original_name]
+
+# With the TracePoint on from the start, the call still comes after the
+# prologue: after a default's own call, after the #to_ary that destructures.
+$late = []
+late_tp = TracePoint.new(:call, :return) { |t| $late << [t.event, t.method_id] if %i[pro_m1 pro_m2 pro_dflt to_ary].include?(t.method_id) }
+def pro_dflt = 1
+def pro_m1(a, b = pro_dflt, *r, k: pro_dflt, **kw) = a
+class ProPair; def to_ary = [1, 2]; end
+def pro_m2((a, b), c) = a
+late_tp.enable
+pro_m1(0)
+pro_m2(ProPair.new, 3)
+late_tp.disable
+p $late
