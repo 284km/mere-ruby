@@ -5050,6 +5050,41 @@ prints true on Ruby and false on both main and this candidate; it remains
 unresolved and is not a passing corpus case.
 
 
+## Rails Hash options and lexical mixins: measured boundary (2026-11-20)
+
+Corpus735-737 verifies real Hash default reads through Ruby overrides/native
+super/aliases, real Hash subclass each for count/entries, and lexical/runtime
+mixin arguments with autoload, inherited constants, privacy and const_missing.
+The full718-file corpus and complete original twelve-file1,302-case comparison
+retain every main PASS under unchanged resource bounds. A full-corpus regression
+in525 was fixed, not excluded. The captured constructor default-block behavior
+is a separate existing prerequisite; the isolated default-read witness uses
+Hash#default_proc= to set the real Proc.
+
+An own Rails composition reaches actual migration, where a prepended Range#===
+calling super compares the Range object for equality and rejects precision6.
+Boot, application tests and HTTP remain NOT_RUN. Earlier selected original
+ActiveSupport measurements remain537 MATCH/4 RED out of541; no framework-wide
+or cold application pass is claimed from these runtime fixes.
+
+
+## Range native super and the next measured Rails boundary (2026-11-20)
+
+Corpus741 repairs Range#=== through prepended super and saved native aliases
+using real bounds and comparator calls. Complete original Range/Super/Method/
+Module files retain main's409 MATCH/1 RED out of410, and the719-file corpus
+matches in both index settings. The own Rails composition now passes migration;
+boot's locked-source check then catches Bundler#full_gem_path outside the actual
+own gem home. Application tests and HTTP remain NOT_RUN; cold installation is
+not reclassified as passing.
+
+The same selected four original ActiveSupport files now give539/541 MATCH;
+the two titleize failures remain explicit work. A separate existing direct
+Range primitive/object comparison gap remains reproducible without super:
+unittest/range_primitive_object_comparison_probe.rb returns[:direct, false,
+false] on reference Ruby and an ArgumentError on main and this candidate.
+It is a failing diagnostic, not a passing corpus case or exclusion.
+
 The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
 namespace constants and intermediate const_missing results as real scope
 lookups (corpus742). Both definition paths retain the lexical first constant,
@@ -5075,6 +5110,23 @@ The earlier native-name-only behavior is superseded; native Method dispatch
 and other independent compatibility gaps are not claimed solved by this
 ordering repair.
 
+
+The Hash native-read review fixes repeated observable #hash calls using one
+real local search code. Corpus735 retains value/call-count controls for saved
+aliases, super, collisions, changed codes, reentrant reads, empty and identity
+hashes. Both the native custom-key entry and Ruby override precedence are
+covered. The719-file corpus and original twelve-file1,302-case comparison
+retain every main PASS under unchanged limits. This does not claim to fix all
+other Hash operations' hash-call ordering or the remaining Rails boundaries.
+
+
+The Range super follow-up now distinguishes a prepended/subclass wrapper from
+a replacement defined on Range itself. It uses the real remaining ancestor
+position, including the native entry before lower Ruby definitions, and retains
+main's per-file PASS identities in five complete original files (530 MATCH/
+1 RED/1 BOTH out of532) plus the720-file corpus. Native Kernel Method binding
+on a Range and primitive undef bypass remain explicitly failing standalone
+probes above; neither was repaired by changing a value or hiding a test.
 
 ## The original Rails native-install blocker is resolved on integrated main
 
