@@ -280,6 +280,17 @@ dw.write("duplex\n")
 check(dio.gets == "duplex\n")
 dio.close
 check(dw.closed?)
+# (closing either half unties it: io itself answers, and close_read takes
+#  the writer with it)
+dio = IO.popen(['cat'], 'r+')
+dio.close_write
+check(A.write_io_of(dio).equal?(dio))
+dio.close
+dio = IO.popen(['cat'], 'r+')
+dw = A.write_io_of(dio)
+dio.close_read
+check(dw.closed? && A.write_io_of(dio).equal?(dio))
+dio.close
 pr.close
 check(A.strtoul('  0x1fz', 0) == [31, 6])
 check(A.strtoul('-12', 10) == [2**64 - 12, 3])

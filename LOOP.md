@@ -11156,3 +11156,13 @@ this Mac; CI is where the four run.)
   `IO.popen(["cat"], "r+")` the same writer each time, a write reaches the
   child, closed after `close`. The gem check calls io-console's oflush on
   such an IO (Errno::ENOTTY on both sides).
+- (re-review) **[Suggestion] the writer after a half-close.** Closing either
+  half unties it, as CRuby does: rb_io_get_write_io answers io itself after
+  close_write or close_read, and close_read closes the writer (CRuby moves
+  the write side into io). capi/check covers both. Left, and said in the
+  comment: the writer does not own the descriptor, so C closing it leaves
+  io writable, where CRuby's says "closed stream".
+- (note) The reference ruby's `gem install prism` peaks at 1.93 GB of the
+  check's 2 GiB; run beside another heavy check it hit the limit once
+  (MEMORY_LIMIT on the reference side, not mere-ruby's). Run alone it
+  passes. The limit stays.

@@ -597,9 +597,16 @@ const char ruby_version[] = "4.0.9";
  * writing goes to a descriptor of its own (a popen "r+": @__io_wfd), which
  * ruby keeps as a separate IO -- made once, for that descriptor, and kept on
  * io so that the same one comes back */
+/* (io.c's tied writer. Once either half is closed the IO is no longer
+ *  duplex -- rb_io_close_write unties the writer, rb_io_close_read moves
+ *  the write side into io -- so io itself answers, as CRuby's does. One
+ *  difference is left: the writer does not own the descriptor (IO#close
+ *  closes @__io_wfd itself), so C closing the writer leaves io writable,
+ *  where CRuby's io then says "closed stream".) */
 VALUE rb_io_get_write_io(VALUE io) {
     VALUE wfd = rb_ivar_get(io, rb_intern("@__io_wfd"));
     if (NIL_P(wfd)) return io;
+    if (RTEST(rb_ivar_get(io, rb_intern("@__io_wclosed"))) || RTEST(rb_ivar_get(io, rb_intern("@__io_rclosed")))) return io;
     VALUE w = rb_ivar_get(io, rb_intern("@__capi_wio"));
     if (NIL_P(w)) {
         VALUE kw = rb_hash_new();
