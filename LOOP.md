@@ -11032,3 +11032,35 @@ Every reader adds the stretch's start (vcb) to the pc it indexes with.
 - Measured with nothing else running, the evaluator, then the VM before and after:
   - test_thread_join_during_finalizers: 24.4-24.9 s; VM 36.5 s -> 27.3 s, which is 1.47x -> 1.11x.
   - test_parent_iseq_mark: 11.3 s; VM 12.5 s -> 12.2 s, which is 1.08x.
+
+## 2026-11-22 (90): a block called from a builtin iterator, cheaper to enter (issue #113)
+
+`TestEnumerable#test_reverse_each_memory_corruption` passes within its ten-second child limit, but with a tenth to spare. What it pays for is the callback: ObjectSpace.each_object(Array) yields each of about 6,800 Arrays to `array.clear if array.length == size`, 1,000 times.
+
+Measured on a standalone repro (the same body over 6,800 retained Arrays, `keep.each`, 200 turns), in instructions retired, which a loaded machine does not move. A block call cost 14.3k instructions on the VM before this round and costs 11.3k now; ruby takes about 800.
+
+The cost was spread over many small pieces, not one hot spot. Each change below is one of them:
+- **`$~`'s home** (rx_blk_enter): the walk up the defining env's chain for its `__fid` / `__rxfid` was made at every call. The answer belongs to the env, so it is kept there as "__rxh". The frame pool's wind-back clears it with the env.
+- **Array#length / #size / #empty?** (native_array_query):
+  - The key `"Array#" ++ name` was made at each call; it is now one of three literals.
+  - The method-table part (no prepend on Array, no method of the name on it or above it) is memoised on mro_now(), as int_ops_plain is for Integer's operators (naq_meth_free). Every write to meths, prepends and undefs moves that generation.
+- **An Array's singleton class**: the lookup built `"arr:" ++ id` for every receiver. Every write to hng_store now goes through hng_put. An "arr:" key notes the id in hng_arr_ids, and an id not noted is not looked up. An entry later dropped stays noted, which only sends that id the long way.
+- **Head positioning**: blk_head_pos sets the file and the line before parameters are bound, for a raise while binding. A block whose binding is one store (blk_simple1: one plain parameter, one value, no default, no keywords, not a lambda) cannot raise there, and its body sets both again first.
+- **is_for_params** made a one-character substring and a three-character one on every call. It now uses str_starts_with.
+- **The fiber watermark** (fb_wm_put): four writes, each making a closure to grow the Vec. Now the Vec is grown once, by a function of its own.
+- **One region a turn, not two**: run_block_turn and its kin (and `loop`) open a region for each turn. The invocation then opened BLK inside it. run_block_t enters run_block0x without its own region; the body is run_block0_in, called from inside BLK or not.
+
+Each on the repro, VM: 20.63 G -> 17.69 (`$~`, Array#length, head, is_for_params) -> 17.27 (hng_put, first form) -> 16.53 (by id) -> 16.10 (watermark) -> 15.66 G (one region). That is -24%.
+
+The ObjectSpace form (the same with ObjectSpace.each_object(Array), 100 turns): 12.45 G -> 10.14 G on the VM and 12.87 G -> 10.25 G on the evaluator.
+
+The upstream test itself on a loaded machine (load 6):
+- r46: 10.1 s on the evaluator, 9.9 s on the VM.
+- now: 8.7 s on the evaluator, 8.0 s on the VM.
+
+What is left is still spread:
+- the env's lookups by name, `size` two frames out: lv_get / lv_parent_of, each level a map_has and a map_get of the same key. Mere has no single lookup.
+- the block env from the pool and back (blk_env_get / put, the lv_up entry).
+- the frame records (call_names_s, call_lines, call_files_s, fb_env_at).
+- vm_exec's VMR region.
+- arr_len's three tables.
