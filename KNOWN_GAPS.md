@@ -5434,3 +5434,30 @@ opening a singleton class. Corpus761/762 covers these review regressions.
 The full721-file corpus and original Parse102/Syntax167/Literal31 MATCH
 counts are retained. The pre-existing invalid-symbol Syntax leak Timeout
 and reference skips remain; these repairs do not establish a full Rails pass.
+
+## ruby/spec optional/capi: what is left (2026-11-22, 2,394 of 2,592)
+
+- **A pointer C keeps across a call** (string_spec, 2): `ptr =
+  RSTRING_PTR(s); rb_yield(s); ptr[2] = ...` expects ptr to see what Ruby
+  wrote during the yield. Here the bytes are a copy fetched when C asks; to
+  follow, every String a C call watches would be fetched again after every
+  up-call. Not done for two examples.
+- **A Regexp's encoding changed in place** (encoding_spec, 3:
+  rb_enc_associate / _index / rb_enc_copy on a Regexp). A Regexp is a value
+  without identity here; a re-encoded copy would only look right. A named
+  NotImplementedError.
+- **respond_to? of an rb_f_notimplement method** (object_spec, 2): ruby
+  answers false; here the method is an ordinary one. bo_notimpl covers the
+  interpreter's own (GC's compaction); methods C defines would need it in
+  the general lookup.
+- **rb_block_lambda on a `&proc`** (kernel_spec, 1) should hand that Proc
+  back unchanged; here every block becomes a lambda copy. The interpreter
+  knows a block came from `&` (blk_amp_src) but not at the C boundary yet.
+- **rb_set_end_proc's output** (kernel_spec, 1): the C function runs at exit
+  but what it writes is not where the spec reads it.
+- **digest_spec** (17): needs Fiddle (`require 'fiddle'` fails, and the spec
+  returns early). Fiddle is a native gem over libffi.
+- **debug_spec, tracepoint_spec** (54): the debug inspector and TracePoint
+  from C are the VM's own structures (capi/unsupported.c).
+- **class_spec, 3**: rb_define_class* with a name that is no constant's
+  (`_INVALID_CLASS`); #157's define_class answers them.

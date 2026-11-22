@@ -11092,3 +11092,76 @@ What is left is still spread:
 - the frame records (call_names_s, call_lines, call_files_s, fb_env_at).
 - vm_exec's VMR region.
 - arr_len's three tables.
+
+## 2026-11-22: ruby/spec optional/capi -- 2,282 to 2,394 (reference 2,592)
+
+Note 553 §6.1-6: what was left of ruby/spec's C API specs, file by file.
+tools/capi_spec_check.py, recorded in capi/check/spec_expect.tsv:
+
+| file | before | now | reference |
+|---|---|---|---|
+| string | 291 | 312 | 314 |
+| encoding | 160 | 177 | 180 |
+| struct | 60 | 75 | 75 |
+| class | 97 | 103 | 109 |
+| globals | 33 | 44 | 44 |
+| object | 209 | 221 | 223 |
+| util | 76 | 83 | 83 |
+| kernel | 284 | 288 | 290 |
+| hash | 61 | 65 | 65 |
+| proc | 40 | 44 | 44 |
+| module | 76 | 79 | 79 |
+| numeric | 90 | 93 | 93 |
+| gc | 20 | 25 | 25 |
+| array, fixnum, rbasic, basic_object | one each short | equal | |
+
+(The reference moved too: the spec shim gained mspec's have_constant and
+the other variable matchers, which struct_spec and object_spec use. The
+twelve ruby/spec files outside optional/capi that use them MATCH before and
+after.)
+
+What was wrong, by kind:
+
+- **Answers the C API made up.** rb_str_locktmp/unlocktmp did nothing (now
+  the interpreter's temporary lock, refusing a second lock and a frozen
+  string); rb_obj_hide did nothing (a hidden object's class reads as 0 to
+  C); rb_str_encode dropped its ECONV flags; rb_cstr2inum was strict for
+  base 2 where bignum.c is strict for base 0; rb_external_str_new_with_enc
+  and rb_str_export ignored the encodings string.c weighs; rb_hash did not
+  fold a Bignum #hash; rb_class_name answered nil for an anonymous class;
+  rb_class_get_superclass answered nil for "none"; rb_scan_args counted the
+  keyword Hash; rb_sourcefile named an eval; rb_ivar_foreach left out a
+  class's class variables; rb_class_new ran the superclass's `inherited`;
+  rb_block_call with no function dropped the C method's block, and
+  rb_iterate's block did not reach the first method its function calls.
+- **What C reads off an object's header.** RBasic.klass is the singleton
+  class once there is one (CLASS_OF); the core classes CRuby builds as
+  typed data are T_DATA; the coderange is 7BIT when the interpreter knows
+  the bytes are ASCII alone; C's global variables (rb_rs, rb_fs, rb_stdin,
+  ...) follow the program's assignments instead of keeping their values
+  from the first C call.
+- **Encodings.** Encoding.list is in ruby's order of registration, and C's
+  table is filled in that order, so an encoding's index is its place in the
+  list (rb_to_encoding_index); a character past ASCII is in a POSIX class
+  as Unicode says (the tables CRuby's encodings carry for their upper
+  halves); rb_define_dummy_encoding and rb_enc_alias make what they say
+  (with ruby's "too many encoding (> 256)"); ONIGENC_MBC_CASE_FOLD folds
+  through downcase(:fold).
+- **Names.** A Symbol whose name has a NUL crosses whole (new FFI calls
+  carrying its bytes); rb_const_set / rb_const_get take a name that is no
+  constant's, kept hidden by the key define_class uses.
+- **The interpreter itself**, found through the specs (corpus/801):
+  `Array({a: 1})` was `[{a: 1}]` (a builtin value was never asked for
+  #to_a); `String(x)` passed over a #to_str that answered a non-String to
+  #to_s instead of refusing it; `Kernel.global_variables` was no module
+  function; Encoding.list's order.
+
+Left, and why (KNOWN_GAPS.md): a pointer C keeps across a call seeing what
+Ruby wrote meanwhile (2 string examples; it would mean re-reading every
+watched String after every up-call); a Regexp's encoding changed in place
+(3; a Regexp here is a value without identity); respond_to? of a method
+defined as rb_f_notimplement (2); rb_block_lambda passing a `&proc` through
+unchanged, and rb_set_end_proc's output at shutdown (2); class_spec's three
+names that are no constant's, which #157's define_class answers; digest_spec
+(needs Fiddle, which this interpreter does not have -- the spec returns
+early); debug_spec and tracepoint_spec (the VM's own structures).
