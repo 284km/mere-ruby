@@ -211,3 +211,65 @@ end
 p db.prepare('SELECT ?1 + ?2').execute(1, 2).to_a
 db.close
 p db.closed?
+
+# The default gems Rails' lock pins newer than the interpreter ships: an
+# activated gem's own extension is the one loaded (issue #127, PR #128)
+
+# json: the C parser and generator
+gem 'json'
+require 'json'
+p native.('json/ext/parser'), native.('json/ext/generator'), JSON::VERSION
+p JSON::Parser.name, JSON.generate({ "b" => [1, 2.5, nil, true], "a" => "é\u0001" })
+p JSON.parse('{"x": [1, {"y": "z"}], "n": 1e3, "big": 12345678901234567890}')
+p JSON.parse('{"a": 1}', symbolize_names: true), JSON.pretty_generate([1, { "k" => [] }])
+p JSON.generate({ "b" => 1, "a" => 2 }, sort_keys: true) rescue p $!.class
+begin
+  JSON.parse('{"a": }')
+rescue JSON::ParserError => e
+  p e.class
+end
+
+# date: date_core
+gem 'date'
+require 'date'
+p native.('date_core'), Date::VERSION
+d = Date.new(2024, 2, 29)
+p d.to_s, d.leap?, d.jd, (d >> 12).to_s, d.strftime('%a %j %U'), d.cwday
+p Date.parse('2026-11-22T10:00:00').to_s, Date._parse('Mar 3 2001').sort
+p DateTime.new(2001, 2, 3, 4, 5, 6, '+07:00').iso8601, Date.valid_date?(2023, 2, 29)
+begin
+  Date.new(2023, 2, 30)
+rescue Date::Error => e
+  p e.class
+end
+
+# bigdecimal
+gem 'bigdecimal'
+require 'bigdecimal'
+require 'bigdecimal/util'
+p native.('bigdecimal'), BigDecimal::VERSION
+a = BigDecimal('1.1'); b = BigDecimal('2.2')
+p (a + b).to_s, (a * b).to_s('F'), (BigDecimal('1') / 3).round(20).to_s, BigDecimal('2').sqrt(20).to_s
+p BigDecimal('123.456').round(1, BigDecimal::ROUND_HALF_EVEN).to_s, BigDecimal('NaN').nan?, '3.14'.to_d.class
+p BigDecimal('1e-20').exponent, BigDecimal('-0').sign
+
+# io-console: on a pipe, which is no terminal
+gem 'io-console'
+require 'io/console'
+p native.('io/console'), IO.respond_to?(:console)
+r, w = IO.pipe
+begin
+  r.winsize
+rescue => e
+  p e.class
+end
+p r.respond_to?(:raw), r.respond_to?(:getch)
+r.close; w.close
+
+# prism: the parser as a gem
+gem 'prism'
+require 'prism'
+p native.('prism/prism'), Prism::VERSION
+res = Prism.parse("def m(a, b = 1) = a + b\nm(1)")
+p res.success?, res.value.class, res.value.statements.body.map { |n| n.class.name.split('::').last }
+p Prism.parse('1 +').errors.map { |e| e.class.name.split('::').last }.uniq, Prism.lex('a = 1').value.map { |t, _| t.type }.first(3)

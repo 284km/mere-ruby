@@ -586,3 +586,35 @@ void rb_define_readonly_variable(const char *name, const VALUE *var) {
 void rb_define_virtual_variable(const char *name, rb_gvar_getter_t *getter, rb_gvar_setter_t *setter) {
     keep_global(name, 0, getter ? getter : rb_gvar_val_getter, setter ? setter : rb_gvar_readonly_setter);
 }
+
+/* What io-console and prism asked for (the default gems Rails' lock pins). */
+
+/* the version this interpreter reports as RUBY_VERSION -- a contract in
+ * capi/check/api.rb compares the two, so they cannot drift apart */
+const char ruby_version[] = "4.0.9";
+
+/* the IO that writes for io: io itself, unless it is a duplex stream whose
+ * writing goes to a descriptor of its own (a popen "r+": @__io_wfd), which
+ * ruby keeps as a separate IO -- made once, for that descriptor, and kept on
+ * io so that the same one comes back */
+VALUE rb_io_get_write_io(VALUE io) {
+    VALUE wfd = rb_ivar_get(io, rb_intern("@__io_wfd"));
+    if (NIL_P(wfd)) return io;
+    VALUE w = rb_ivar_get(io, rb_intern("@__capi_wio"));
+    if (NIL_P(w)) {
+        VALUE kw = rb_hash_new();
+        rb_hash_aset(kw, ID2SYM(rb_intern("autoclose")), Qfalse);
+        VALUE argv[3] = { wfd, rb_str_new_cstr("w"), kw };
+        w = rb_funcallv_kw(rb_cIO, rb_intern("for_fd"), 3, argv, RB_PASS_KEYWORDS);
+        rb_ivar_set(io, rb_intern("@__capi_wio"), w);
+    }
+    return w;
+}
+
+/* bytes already read from the descriptor and not yet handed out: the IO's
+ * own read buffer (@__io_rbuf), which a read takes from before the kernel */
+int rb_io_read_pending(rb_io_t *fptr) {
+    if (!fptr) return 0;
+    VALUE buf = rb_ivar_get(fptr->self, rb_intern("@__io_rbuf"));
+    return RB_TYPE_P(buf, T_STRING) ? (int)RSTRING_LEN(buf) : 0;
+}

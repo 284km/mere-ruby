@@ -261,6 +261,17 @@ check(A.class_of(SubString.new('x')) == SubString)
 check(A.class_of(SubArray.new([1])) == SubArray)
 check(A.class_of(SubHash.new) == SubHash)
 check(A.class_of('plain') == String && A.class_of([]) == Array && A.class_of({}) == Hash)
+# (what io-console and prism asked for: ruby_version is RUBY_VERSION; the
+#  write IO of a plain IO is itself; nothing is pending before a read, and
+#  what a partial read left buffered is)
+check(A.version_text == RUBY_VERSION)
+pr, pw = IO.pipe
+check(A.write_io_of(pr).equal?(pr) && A.write_io_of(pw).equal?(pw))
+check(A.read_pending(pr) == 0)
+pw.write("abcdef"); pw.close
+check(pr.getc == "a")
+check(A.read_pending(pr) >= 0)
+pr.close
 check(A.strtoul('  0x1fz', 0) == [31, 6])
 check(A.strtoul('-12', 10) == [2**64 - 12, 3])
 check(A.strtoul('777', 8) == [511, 3])
