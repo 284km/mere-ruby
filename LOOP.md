@@ -6348,6 +6348,49 @@ last item.
 - Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 923 of 1024 (was
   892 on main: the translation and the caches keep top-level tables).
 
+## 2026-11-21 (76): what Rails' own dependencies build, on the C API
+
+Rails 8.1 installs on main now (issue #116: #95 and #120), and the next
+stages -- boot, the application's tests, Puma serving HTTP -- run the C
+extensions of its dependencies. Thirteen of its 68 locked gems have one.
+`tools/capi_gem_check.py` builds five more of them at railstest/'s versions,
+on both rubies, and uses them the same way: erb (its escape, which
+ERB::Util.html_escape is), rbs (a C parser building Ruby AST objects),
+websocket-driver (the frame mask), puma (the HTTP request parser) and sqlite3
+on the system's SQLite (BLOBs, a Ruby function SQL calls, transactions,
+errors). Each prints whether the extension it loaded is the gem home's.
+json, date, bigdecimal, io-console and prism build too, but mere-ruby
+loads its own library of the same name before an activated gem's extension
+(issue #127, PR #128): what they would compare is not the C API.
+
+**What it found** (each reproduced against ruby first):
+
+- `class <<self` with no space was a here document whose terminator is
+  "self": the rest of the file was its body, and `require "rbs"` a
+  SyntaxError. parse.y opens none after the keyword `class` (EXPR_CLASS);
+  after_class_kw says so (and `obj.class <<X`, a method named class, keeps
+  its argument). corpus/761.
+- A backslash that ends a line continues it, and a `?` that starts the next
+  line was taken for a character literal at a statement's start ("unexpected
+  '?'"): prev_nonspace now looks past `\` + newline. rbs's
+  value_object_generator.rb writes `x.nil? \` and then `? a : b`.
+  corpus/762.
+- `module_function` copied a define_method body WITHOUT its closure: the copy
+  of `define_method(:x) { v }` read `v` as a method call. A C method is such
+  a body, holding the function it calls, so erb's
+  `include ERB::Escape; module_function :html_escape` -- how every Rails
+  template escapes -- raised NoMethodError for `__capi_m`. modfunc_promote
+  copies as alias does (copy_meth_src). corpus/763.
+- CLASS_OF of an instance of a builtin's subclass was the builtin: a String
+  of `class Blob < String` is a primitive tagged with its class, and
+  capi_describe answered class_name. sqlite3 binds a SQLite3::Blob as a BLOB
+  by its class, so it stored text and read it back in UTF-8. It answers
+  dispatch_cls_of now. Four contracts (`class_of` in the fixture).
+
+**Found, not fixed here**: `module_function :m` of an INHERITED m leaves no
+private `m` in the module itself (`private_instance_methods(false)` is `[]`
+where ruby lists it).
+
 ## 2026-11-17 (73): test_ast's margin -- what every assertion runs, and a block's number
 
 test_ast fits CI's 600 s since LOOP (57), with 47 s to spare on the slower of
@@ -8557,6 +8600,88 @@ zero failures/errors/skips, outer 23.441 seconds / 365,632 KiB. The
 The updated hosted CI, Linux Module memory gate and all-file comparison
 against complete main remain required before merge. No bound is changed.
 
+## 2026-11-19: compare the original Module RSS failure with current main
+
+PR #90's Linux Module job completes 195 tests / 1,240 assertions with one
+complemented-entry RSS failure: 77,672,448 to 186,966,016 bytes, 2.407109x.
+Current main 3b05689f also fails that test in hosted CI, but by its unchanged
+ten-second timeout (10.05 seconds), not a measured RSS assertion. Both use
+compiler 01f5ad73 and the same pinned test. Preserve the distinct failure
+modes; neither establishes the other's cause. The PR CI merge's runtime
+sources equal head 949e4638. A failed job rerun is still rejected while its
+containing workflow is unfinished.
+
+Build main and the PR head independently with the actual CI compiler, then
+measure sequentially under one common environment. On macOS both full files,
+and the reference, give 195 tests / 1,240 assertions with no failure/error/skip
+and identical case dictionaries. A parent-only observer of the original
+selected case gives RSS ratios 1.668504x main / 1.668009x PR. The separate
+comparison-tool validation gives 1.669211x / 1.672658x. All original 1,000
+preparation and 300,000 workload iterations and the ten-second child bound
+remain. Captured child programs agree except their original PID/time/hex
+tokens. Raw inputs and logs are retained; canonicalization changes only
+comparison hashes, and rejects malformed tokens or changed workload text.
+
+No PR-specific worsening is demonstrated locally; Linux-specific behavior
+is still unresolved. Add a separate Ubuntu job that builds both locked
+sources before measuring the complete reference/main/PR files, then the
+observed original selected case. Missing results, skips, failures, unequal
+inputs or a ratio not strictly below 2.0 fail the comparison. Every file
+retains 600 seconds / 2 GiB. The original Module gate and existing job
+durations are unchanged. Details and reproduction are in
+tools/module_rss_compare.md; the new Linux result is pending.
+
+All twelve actual local executions complete, with the original complete-file
+and selected-case coverage. The first tool-level result failed only because
+the input-hash nonce parser omitted hexadecimal digits; preserve that result
+and revalidate all saved raw inputs with the final parser. The corrected
+parser does not change a runtime observation. YAML syntax passes; actual
+bracket depth is 155/1024 with the pinned compiler. No interpreter or
+GC/VM/AST/C API implementation, allocator policy, source lock or baseline
+changed. No gem sweep or memory repair is claimed. Keep the hosted failures,
+source/binary/log hashes and both controlled pairs in
+gemtest/module_rss_pr90_r50.json. The separate Method-copy investigation is
+not evidence for this test's cause.
+
+## 2026-11-20: reject replaced case identities in the Module comparison
+
+Review P2 correctly found that equal aggregate counts could hide a missing
+original case and an extra replacement. Persist every parsed case dictionary
+and compare main/PR with the reference separately for each mode. Record
+missing/extra identities and differing verdicts; any difference rejects the
+measurement even with unchanged COMPLETE state and summary counts.
+
+Three CLI replay controls use captured successful reference transcripts,
+real parsing and acceptance, with only source/build preflight and execution
+as fixtures. The unchanged replay passes; replacing a case identity at equal
+counts fails in both complete-file and selected-case modes. Both negative
+controls reproduce the old CLI's erroneous acceptance. These are harness
+controls, not new interpreter/resource measurements. Run them in the separate
+comparison job before building. Also start the parent observer on a new line:
+its old marker joined the unfinished progress line and polluted the parsed
+selected-case name. Real reference/PR selected tests each retain one test /
+three assertions and the exact original identity. Their child input matches
+the original captured program except its upstream nonce.
+
+The earlier Linux pair has completed. Independently reparse all six raw logs
+and compare actual dictionaries before using its old collector's success.
+All complete files give 195 tests / 1,240 assertions, no failures/errors/skips,
+and identical case dictionaries. Observed selected RSS is 1.492139x main,
+1.575806x PR, 1.227229x reference. Preserve the old marker-suffixed selected
+labels in the historical record rather than rewriting the original logs.
+This passing pair does not explain or waive earlier hosted failures.
+
+Audit all 33 open PRs. The other owned branches have no unresolved review
+threads, but failed resource assertions remain: Method-copy on #110/#119/
+#131/#136 at 2.024243x / 2.213793x / 2.125194x / 2.084157x, and Module clone
+RSS on #114/#118 at 2.105955x / 2.234604x. Do not assume clone RSS is noise.
+The documented complemented-entry timeouts on #110/#136 were requested for
+job rerun; GitHub rejects each with HTTP 403 while the workflow is unfinished.
+Keep those retries pending. Other sessions' branches and PRs are untouched.
+Full audit, actual Linux logs' hashes, preserved failures and replay evidence
+are in gemtest/module_rss_review_r53.json. Workloads, limits, old snapshots,
+source locks and interpreter/GC/VM/AST/C API implementations are unchanged.
+
 
 ## PR 90 merge gate: preserve the Pathname core before physical extensions
 
@@ -8588,6 +8713,144 @@ and addressed P1/P2 findings are still required before merge. No test, helper,
 limit, exclusion, collector, VM/ISeq, AST/Prism or C API change is used here.
 
 
+
+### Rails command registration honors Ruby subclasses definitions (2026-11-19)
+
+Rails::Command defines subclasses as a Ruby registry on its module. The
+native Class#subclasses arm answered first, returning a fresh native array
+instead of that registry. Ordinary module/class singleton definitions now
+run with their real visibility and argument protocol. A module without a
+Ruby definition no longer claims Class's native-only entry.
+
+Saved native aliases, Methods/UnboundMethods and native super use the same
+real direct-superclass relation with a zero-argument check. Ruby lookup and
+Method#owner stop at Class's actual native entry before later definitions;
+replacing Class#subclasses itself does not resurrect a hidden native super.
+The fallback checks the actual current Ruby frame's remaining ancestor
+chain and introduces no new global Mere values or Ruby API/inventory rows.
+No collector, VM/ISeq, AST or C API implementation is changed. Shared
+functions are listed in the PR; their other sessions' regions are retained.
+
+On main 3b05689f with its pinned Mere 01f5ad73, normal O2: original Class
+62 MATCH, Module 195, Method 97, Super 50 and Refinement 121 (527 cases:
+525 MATCH / 1 RED / 1 BOTH). No focused file is below successful main
+12ca1df2; Module's additional observation is not attributed to this patch.
+Reference and mere-ruby each build their own unchanged -test-/class source.
+The existing Method compaction skip remains visible. Corpus 706/706 matches
+with indexing ON/OFF, including 717/718/720's native/override/alias/visibility/
+super/owner-boundary controls. All nine RSS controls pass. Actual generated
+C bracket depth is 155/1024 with main's newer compiler; that depth change
+from older measurements is not a result of this dispatch correction.
+
+A separate saved-gem diagnostic registers and finds the actual unchanged
+Rails RakeCommand identically on both runtimes: reference 0.661 s / 26,736
+KiB, candidate 1.575 s / 177,776 KiB, both exit 0 without a resource event.
+It does not repeat dependency installation or establish a Rails app pass.
+A fresh original-CLI paired run on validation-only source 5d1a0c95 with
+unmerged #95 and bounded SHA-2 #120 installs all 68 gems (231.607 s /
+946,832 KiB), then migration fails at the real ActiveSupport OrderedOptions
+setter (3.238 s / 305,664 KiB). Reference passes all six stages. The three
+following candidate stages remain NOT_RUN; no resource limit event occurs.
+Hash subclass missing hooks (#123) remain a separate coordination item.
+Generic stale alias origins after redefinition (#124) also reproduce on
+unchanged main; no generic alias metadata repair is claimed here.
+
+Review follow-up: share the remaining native-boundary query between actual
+super, defined?(super), Method#super_method and UnboundMethod#super_method.
+The zero-argument native Method also survives a later undef of its source.
+Corpus 720 covers guarded super, native owner/binding, a preceding undef
+and a Ruby replacement of Class itself. The same five original files retain
+525 MATCH / 1 RED / 1 BOTH after this correction. No test is removed.
+
+Hosted Linux run 44474019351 fails TestModule#test_module_clone_memory_leak
+at RSS ratio 2.181378x (71,835,648 to 156,700,672 bytes). This is not an
+established known-noise result; keep the failure, the 2x gate and the full
+series. A single-job rerun request was rejected by GitHub (cannot be rerun).
+The next source head must pass the unchanged gate before merge.
+
+
+### Rails notification delegation: real private Module entries (issue #129)
+
+ActiveModel extends its module with an `included` override that calls `super`.
+The missing native ancestor entry previously sent that call to the module's
+unrelated instance `method_missing`, failing on `respond_to_without_attributes?`.
+Resolve the seven Module notification methods at their actual Module boundary.
+Their native body accepts one argument, ignores the block and returns nil,
+matching `rb_obj_dummy1` in Ruby's object.c. Ruby replacements and intervening
+undef entries keep precedence; a native entry does not reappear below its owner.
+
+The same remaining-chain query now serves dispatch, `defined?(super)` and
+bound/unbound `super_method`. Native aliases and saved Method objects retain
+their entry. The prelude marks these existing methods private; arity, parameters
+and `respond_to?` reflect the actual native definition and Ruby visibility.
+No API inventory, VM, collector, C API or resource limit changes are required.
+
+Corpus 723 covers the ActiveModel-shaped failure, all seven entries, private
+calls, arity, bound/unbound super, saved methods, alias/undef and owner replacement.
+The original Class/Method/Module/Refinement/Super files retain 525 MATCH, 1 RED
+and 1 BOTH across 527 cases, including 195/195 Module matches. Nine RSS checks
+pass and generated C needs 155/1024 bracket levels. The complete corpus now matches
+Ruby for 707/707 programs with the hash index ON and OFF. The separate fresh-home Rails
+composition passes this boundary and reaches the next syntax blocker; it does
+not establish that Rails boots or its application tests pass.
+
+
+Saved native dispatch is covered by corpus 723. A separate pre-existing generic
+limitation remains: after replacing an owner's entry with Ruby code, a saved
+native Method/UnboundMethod can report the new definition's arity/parameters.
+This also reproduces with Array#length on the parent and is distinct from the
+stale alias-origin reproduction in issue #124. It is recorded separately and
+does not establish another Rails boot blocker.
+
+
+The fresh-home Rails replay with the independent runtime candidates now passes
+this notification failure. Validation-only source b9056808 installs all 68
+locked dependency gems in 210.753 seconds / 862,800 KiB. Migration proceeds
+to unchanged ActionController source and exits 1 on an absolute-root dotted
+extend argument (issue #134; 3.999 seconds / 318,752 KiB, no resource event).
+Reference passes all six stages; mere boot/tests/HTTP remain NOT_RUN. The
+record is retained separately in intake #117 as module_candidate.json, with
+the same locks and 600-second / 2-GiB bounds. This is not an application pass.
+The independent saved-native metadata limitation is issue #133, distinct
+from issue #124's alias-origin reproduction.
+
+
+### Notification Method review corrections
+
+The two review reproductions exposed native-entry provenance and
+visibility-only super boundaries. A native Method selected below a Module
+prepend now records the proven native entry directly instead of asking
+has_meth on its owner again; bound/unbound super methods and bindings retain
+that entry and UnboundMethod records its selected owner explicitly. The
+Method-specific query resumes above the actual body represented by a
+visibility-only entry, while retaining an intervening visibility entry as
+an observable Method owner. Native dispatch/defined-super traversal keeps
+its existing semantics.
+
+Corpus 724 covers published native methods, a wrapper before the visibility
+owner, bound/unbound super below a Module prepend, and retained native calls
+after undef. The reference outputs match with normal caches, hash indexing
+disabled and MRO caching disabled. The five original core files again retain
+525 MATCH, 1 RED and 1 BOTH across 527 cases, per-file unchanged.
+
+The separate generic metadata gap #133 also reproduces when capturing a
+native Method before prepending a wrapper: parameters and source_location
+can follow that wrapper. This occurs on unchanged main as well. Native
+invocation and selected owner are fixed here; captured-method metadata after
+lookup mutations is not claimed fixed. The recorded b9056808 Rails replay
+uses the preceding notification implementation c4477641 and remains tied to
+that exact source; it is not relabeled as this reviewed implementation.
+
+
+Final review candidate validation: all **708/708 corpus programs** match Ruby
+with the hash index ON/OFF, including both notification witnesses. The five
+original core files again retain 525 MATCH / 527 cases with no per-file drop;
+all nine RSS checks pass and generated C needs 155/1024 bracket levels. Both
+review reproductions also match with MRO caching disabled, including when
+both the hash index and MRO cache are disabled together. The review correction
+changes only the Method/UnboundMethod super arms of invoke_val_c0 and the two
+new and-helpers module_notification_method_after/module_notification_method_mark.
+Full hosted CI and its per-file comparison remain required before merge.
 
 ## 2026-11-19: SHA-2 checksums in real gem installation
 
@@ -9259,6 +9522,46 @@ one failure, no outer-limit event. Preserve this distinct failure; it is not
 waived as complemented-entry noise or replaced by a local pass. The final
 head's complete hosted result and every-file comparison remain merge gates.
 
+
+## 2026-11-21: use the released cache-clearing compiler for original Module comparisons
+
+The locked PR 90 source fails the original clone RSS assertion under compiler
+01f5ad73 even though its separately selected complemented-entry case passes.
+The collector correctly records the failed full-file case. Keep that hosted
+failure and its exact case dictionary; do not change acceptance or the input.
+
+Use released compiler 43f2994b for core CI and both locked comparison sources
+3b05689f / 949e4638. Ruby source, all 195 tests and 1240 assertions, observed
+child input, its ten-second timeout and every 600-second / 2-GiB family bound
+remain fixed. Reversing only inactive cached-payload clearing in each emitted
+C restores its old-compiler C byte for byte. No Ruby runtime function changes.
+
+On local Linux/aarch64, all six original comparison conditions pass: full
+Module on reference/main/PR90 and their selected original complemented-entry
+cases. Selected ratios are 1.232550 / 1.278365 / 1.288751 and the canonical
+child inputs match the previous hosted observation. On macOS, the current
+application passes Module 195/1240, Refinement 122/367 with the shared skip,
+and the original Method-copy control at 1.830389x. Preserve the distinct
+source and architecture provenance. Full corpus/gem controls and hosted
+released-compiler CI remain separate; older Method-copy failures are not waived.
+See gemtest/module_rss_released_compiler_r72.json and tools/module_rss_compare.md.
+
+### Review repair: native notification super owners (2026-11-21)
+
+Module's own private notification visibility marks describe real native
+bodies, rather than visibility-only forwarding entries. The corrected
+`module_notification_method_after` keeps that body before looking for its
+super in Object. Corpus 724 now covers bound and unbound Methods for all
+seven notifications, including an earlier prepended wrapper.
+
+Before importing the newly merged C API, all 708 corpus programs matched
+with the hash index on and off (594.362 seconds, 1,048,560 KiB, unchanged
+900-second / 2-GiB bounds). The nine RSS workloads, root, depth (155) and
+dead-definition gates passed. After integrating main `e540007c`, the O2
+build and all 12 focused comparisons (corpus 720/723/724 in four cache
+configurations) passed again. The complete hosted reports and per-file
+comparison are still required for this integrated source before merge.
+
 ## 2026-11-20: rooted mixin arguments, scoped namespace autoload and the autoload loader
 
 Unchanged Rails loading reached three independent evaluator boundaries:
@@ -9705,6 +10008,34 @@ an undef. Keep unittest/range_kernel_method_owner_probe.rb and
 unittest/range_case_equality_undef_probe.rb as explicit failing diagnostics;
 these are not claimed repairs, exclusions or passing corpus cases. The older
 direct primitive/object comparison diagnostic also remains unresolved.
+
+
+### Class case equality: invoke Ruby hooks and retain native super positions
+
+A class's Ruby singleton === was used by the explicit operator but skipped by
+case/when. This prevented ActiveSupport's Time.=== from accepting TimeWithZone.
+Resolve the actual singleton ancestor chain, stop at the real native Module
+entry, and call a preceding Ruby body with its actual ancestor index. Super
+continues through the real Module/Kernel entries, including after Module's own
+Ruby replacement. Splat candidates also use case equality instead of ==.
+Native entries consume pending call state before invoking Ruby comparisons.
+The obsolete equality-only leaf helper is removed; no top-level value is added.
+
+Normal O2 runtime8812a585 passes **721/721 corpus** with the hash index ON/OFF,
+all16 comparisons for735/741-743 in four hash/MRO modes, nine existing RSS
+gates, dead/duplicate definitions, GC roots and depth155/1024. The original
+Case/Class/Module/Super/Method/Refinement/Settracefunc/PatternMatching comparison
+has665 cases: both main d9826ac9 and candidate657 MATCH/5 RED/3 BOTH, zero
+EXTRA or lost original PASS, and no per-file MATCH decrease. The original
+600-second/2-GiB/10-second child bounds, files, bootstrap and exclusions remain.
+
+The separate combined Rails diagnostic explicitly activates the real installed
+Bundler on both sides and retains every locked-package source check. Migration
+and boot pass. The original six app tests improve from five errors to three:
+all TimeWithZone cast errors are gone, while one unhandled retry and two unknown
+<=> errors remain. This warm diagnostic does not establish the direct-start
+Bundler path, a cold install, HTTP success or whole-Rails compatibility.
+
 ### Review repair: mixed Hash keys and Object autoloads (2026-11-21)
 
 Native Hash reads now use the internal hash for builtin search and stored
@@ -10320,3 +10651,269 @@ content-store reads still fail with input/output errors, so current-head
 hosted Linux validation remains required. Keep the candidate draft until
 hosted checks, latest-main per-file comparison, parent integration and review
 pass. The existing hosted Method-copy failures remain separate merge gates.
+
+## Native comparator review repairs: final validation
+
+PR #142 retains original native comparator owners through aliases and native
+Method installation. Module and class wrappers invoke saved native entries;
+Kernel#=== rebound as Module#=== retains equality semantics for super.
+Existing initializers record physical native entries without adding top-level
+state. Functions: invoke_val_c0, native_case_entry, native_case_alias_owner,
+run_super_target, set_builtin_alias. Corpus 743 covers the review regressions.
+
+O2: 721/721 corpus programs match in both hash modes, 480.426 seconds and
+1,284,944 KiB under unchanged 900-second/2-GiB bounds. Sixteen focused cache
+comparisons and nine RSS cases pass, as do roots, depth 155 and dead definitions.
+Original Module/Method/Super: 342 MATCH and one existing RED over 343 cases;
+no previously passing case is lost. Parent #141 documentation is integrated.
+The additional already-rebound comparator alias diagnostic remains explicit
+in unittest/module_kernel_comparator_alias_probe.rb and KNOWN_GAPS.md; it
+fails identically on prior main, parent #141 and candidate. The ineffective
+broader alias-copy change was reverted. Hosted checks and per-file comparison
+remain required before merge.
+
+### Preserve an already-selected native comparator under Module prepends
+
+run_super_target now reads native provenance through the new exact-entry
+native_case_alias_entry_owner helper. Ordinary alias dispatch continues to
+resolve ancestors through native_case_alias_owner; selected super targets
+must not restart at an earlier prepend. Corpus 743 adds a Module-level
+forwarding comparator and both matching/nonmatching cases.
+All 16 focused comparisons and the complete Module/Method/Super files retain
+342 MATCH and one existing RED over 343 cases. A fresh full sweep is running.
+The additional saved-native-Method diagnostic fails on the preceding main
+integration and #141 parent as well as the candidate and remains explicit
+in unittest/module_saved_comparator_method_probe.rb and KNOWN_GAPS.md.
+
+
+### Captured native comparator Methods keep their body after prepends
+
+A captured native comparator can reach bi_meth_call after a Ruby prepend
+shadows its name. Its recorded Module, Kernel or Range owner now selects the
+existing native_case_equal body directly. The selected-super repair from
+11d87d93 is preserved. This follow-up edits bi_meth_call and adds corpus 749;
+it adds no global state or placeholder native implementation.
+
+The final ordinary O2 source is 8e060d3f, using the exact CI compiler
+01f5ad73. Corpus 741, 743 and 749 match Ruby 4.0.9 in all four hash/MRO cache
+combinations (12 comparisons). The retained saved-comparator probe now prints
+true/false on both runtimes. Original Module passes 195/1240 and Super50/109;
+Method98/554 keeps the same single compaction skip, with its complete 98-case
+verdict dictionary identical to the retained baseline. The three files retain
+342 MATCH and one existing RED over343 cases. Original Method-copy passes at
+1.679902x, reference1.084765x. All original assertions and resource bounds stay
+in force. All 722 corpus programs match in both hash modes: 520.933 seconds and
+1,290,080 KiB peak family RSS, within the original 900-second / 2-GiB bound.
+This was measured at 8e060d3f before the documentation-only follow-up.
+
+## 2026-11-21: reduce clone cache residency without losing the Method-copy gate
+
+PR #109's Linux job 136752758452 fails the original Module clone leak check:
+71,696,384 to 144,699,392 resident bytes, **2.018224406x**, under compiler
+01f5ad73. The failed test-merge source 1533737c has the same tree as head
+5813b8d6. Both compilers are compared on that exact source, ordinary O2,
+with the original upstream input and ten-second child timeout.
+
+Published compiler 43f2994b clears discarded cached-region pages with Linux
+MADV_DONTNEED rather than writing zeros into every page. Restoring its clear
+helper and call makes the generated C byte-identical to 01f5ad73. Neither
+the native cache's default of 64 regions nor live or pinned storage changes.
+On Linux/aarch64, the predeclared parent/candidate/candidate/parent clone
+order gives **1.818147056 / 1.150605110 / 1.348688635 / 1.671946690x**.
+The old compiler also passes locally; this is evidence of reduced residency,
+not a reproduction of the x86-64 hosted failure on the same runner.
+
+The compiler-only candidate fails the independent Method-copy gate at
+**2.118446692x**, so that change alone is insufficient. Backport the existing
+compact_method_store correction from #114: if native compaction is deferred
+and the arena has not shrunk, preserve the previous measured baseline.
+The thresholds, dirty flag, initial baseline and unmeasurable fallback are
+unchanged. The combined source 6d8d563d passes two Linux clone trials at
+**1.264892127 / 1.301888908x** and two Method-copy trials at
+**1.705846868 / 1.704296585x**. Module **195/1240** and Refinement
+**122/370** match every reference case. macOS Method-copy is **1.385781495x**
+and Refinement **122/367, one reference-matching skip** is unchanged.
+
+Keep the failures: the compiler-only macOS Module runs fail complemented-entry
+at **2.051378446x** and **2.037586135x**. The first combined macOS Module run
+also fails that case at **2.018579686x** and times out in the original iclass
+child. The retained serialized comparison follows the corpus runs; no
+assertion, test or timeout is removed. In that comparison, the compiler-only
+baseline still fails complemented-entry at **2.030891254x**; the combined
+candidate passes **195/1240**, loses no passing cases, and the iclass timeout
+does not recur in either run. Both sources also pass **721/721 corpus** in
+both hash-index modes: 529.512 seconds / 1,104,752 KiB for compiler-only,
+524.786 seconds / 1,187,728 KiB for the combined candidate.
+The separate instrumented Linux clone
+observes deferred compaction with zero increases to an established baseline
+without movement.
+Its success is diagnostic evidence and cannot replace an ordinary gate.
+
+[The measurement receipt](bench/module_clone_cache_r82.json) preserves the
+hosted failure, all compiler controls, original case dictionaries, all 21
+Method-copy samples per trial, corpus results and the serialized macOS
+comparison. The identical retained Method-copy program can be rerun with
+`python3 tools/method_copy_memory_check.py --reference /path/to/ruby --output /path/to/results`.
+All per-file checks retain 600 seconds / 2 GiB; the complete corpus keeps its
+900-second / 2-GiB aggregate guard. Current hosted checks and comparison with
+the latest completed main remain required before merge. This follow-up
+changes only m_state.compact_method_store in the runtime; collector bodies,
+native pin policy, ISeq, AST/Prism and C API implementations are unchanged.
+
+### Class-subclasses integration with current main
+
+Integrate main a206da11 into PR #125, preserving both subclasses and extend
+branches of defined_super_str. Documentation retains both independent
+appendices; no other runtime conflict requires manual resolution. The O2
+runtime matches corpus717/718/720/729/730 in all four hash/MRO modes (20
+comparisons), and roots/depth155 pass. Current hosted full checks remain
+required. The prior Linux clone RSS failure remains recorded; this merge
+and the focused comparisons do not establish its repair or waive its gate.
+
+### Native notification repair after the updated class-dispatch parent
+
+Integrate the repaired #125 parent without manually changing a runtime
+function. The normal O2 runtime matches all 721 corpus programs in both hash
+modes; all 28 focused comparisons include the new Module-subclass notification
+and native-super cases. The original Module/Method/Super files retain
+342 MATCH and one existing RED across 343 cases (Module 195/195). Nine RSS
+workloads, roots, depth 155 and dead definitions pass. The earlier 708-program
+result remains tied to its preceding integration; current hosted checks and
+every-file comparison still gate this head.
+
+
+## Deliver Class registry and Module notification repairs directly to main
+
+PR #132 previously targeted the closed, unmerged Class branch. Deliver both
+reviewed repairs together against main, preserving the Ruby subclasses registry
+and real Class native entry alongside the Module notification owner protocol.
+Integrate main 2e2ab568 without manually resolving any runtime conflict; both
+independent documentation records are retained. The generic alias-origin and
+saved native metadata issues #124/#133 remain outside this repair.
+
+Normal O2 runtime 732c99ab, compiler 01f5ad73: all 723 corpus programs match with
+hash indexing ON/OFF (538.321 seconds / 1,113,104 KiB under unchanged 900-second /
+2-GiB bounds). All 36 focused hash/MRO comparisons, nine RSS cases, roots,
+depth 155 and dead definitions pass. Original Class/Module/Method/Super/Refinement
+cover 527 cases / 525 MATCH / 1 existing RED / 1 BOTH, with no file below completed
+main d9826ac9. Class uses its unchanged native fixture built separately against
+each runtime's own headers and passes all 62 cases. The earlier missing-fixture
+context remains diagnostic; the final Class comparison has a healthy reference.
+All 49 captured Mere-source/binary hashes stay fixed.
+
+The actual unchanged Rails RakeCommand registers and is found on both runtimes
+in a separate saved-own-gems diagnostic (reference 0.692 seconds, candidate 1.490).
+The original migration CLI on a fresh unchanged app then reaches the next Hash
+configuration setter issue #123, exit 1 in 2.538 seconds / 306,800 KiB; reference
+migration passes. This diagnostic reuses each runtime's independently built
+gems and is not a cold installation or an accepted six-stage application pass.
+The previous main Rails measurement and all NOT_RUN states remain unchanged.
+No source lock, original test, exclusion, API inventory or bound changes.
+Current-head hosted CI, full file comparisons and review still gate merge.
+
+
+## 2026-11-22: preserve Class visibility owners and their selected Method bodies
+
+PR 132's remaining review reproduction makes an inherited subclasses entry
+private. Its bound and unbound super_method wrongly selected Class again,
+and a prepend before the visibility entry skipped its observable owner.
+The Class paths now use native_owner_method_after, the existing notification
+Method traversal parameterized by its real native owner. Ordinary dispatch
+and defined?(super) retain their implementation-chain query.
+
+When that traversal selects a visibility-only Class entry, record the actual
+body below it using existing Method definition metadata and native provenance.
+Blockless and block-carrying Method calls share class_subclasses_method_call;
+UnboundMethod binding, copies and to_proc retain the same selection and block.
+No new top-level value, collector/pin/state, VM, AST or C API implementation
+is changed by this repair. Changed existing functions: invoke_val_c0,
+invoke_with_block0 and module_notification_method_after; the new and-helpers
+are native_owner_method_after, class_subclasses_method_note and
+class_subclasses_method_call. Main 49ad01e3 merges without a runtime conflict;
+both independent documentation records are preserved.
+
+Ordinary native macOS O2/compiler 408b03d9 source f3d22a1a versus
+parent 161b40d0: all 72 focused default/evaluator/strict-VM and hash/MRO
+comparisons match Ruby 4.0.9. Corpus 770 includes actual calls and yields,
+private/protected/public visibility, singleton and Class prepends, inherited
+Ruby bodies, bound/unbound methods, copies and to_proc. The original literal
+review returns [nil, nil], versus the parent's [Class, Class].
+
+Five complete original files retain 527 cases / 525 MATCH / 1 existing RED / 1 BOTH,
+without a passing parent case lost. Class 62 uses its original own-header
+fixture on both runtimes; parent/candidate 10,255 assertions versus reference 10,355
+is retained as an existing difference. Module 195/1240, Super 50/109 and the
+existing Method/Refinement skips remain unchanged. All nine existing loop RSS
+gates and dead/duplicate definitions, GC roots, method writes, record hygiene
+and bracket 155/1024 pass. Top-level let count remains 136.
+
+All 748 corpus programs match in both hash-index modes,
+488.748 seconds / 1,284,080 KiB under the original 900-second/2-GiB
+bound. The first pre-final candidate's block-carrying probe failed and its
+partial corpus was stopped; it is not counted as this final complete pass.
+The receipt unittest/class_subclasses_visibility_review_r102.json retains
+all actual identities, cases, mode comparisons, hashes and fixture context.
+No original tests, accepted baselines, locks, exclusions or limits change.
+Fresh hosted CI and latest-main per-file acceptance remain required.
+
+### PR review: retain selected native Class methods behind prepends
+
+Once the remaining-chain query selects Class's native subclasses entry,
+mark that exact owner directly instead of searching Class's prepends again.
+The new native_owner_method_mark helper is shared with Module's existing
+marker. Both bound and unbound super_method preserve the selected Class
+owner; method_unbind_fields carries an already-proven native owner into the
+UnboundMethod. Changed functions: invoke_val_c0, method_unbind_fields,
+module_notification_method_mark and new native_owner_method_mark.
+Corpus724 adds Class.prepend with bound/unbound super_method, dup, clone,
+unbind, bind and bind_call, including the native terminal super_method.
+The original review reproduction and extra unbind comparison failed before
+these repairs and now match Ruby4.0.9.
+
+Normal O2 compiler01f5ad73 validation: **723/723 corpus**, hash index ON/OFF,
+**488.378s / 1,070,864KiB** peak family RSS. All44 focused default/evaluator/
+strict-VM and hash/MRO comparisons, all nine RSS gates, roots, dead definitions
+and C depth155/1024 pass. Complete original Class/Module/Method/Super/
+Refinement discover527 cases: **525 MATCH / 1 existing RED / 1 BOTH**, with
+Class62, Module195, Method97, Super50 and Refinement121 MATCH retained.
+Class's unchanged fixture uses each interpreter's own headers. The existing
+Method compaction failure, Refinement skip and separate captured-native
+metadata issue133 remain explicit. No original tests, exclusions, limits,
+collector/state, VM/ISeq, AST/Prism, C API or gemtest code changed. Updated-head
+hosted checks and the latest-main per-file gate remain required before merge.
+
+### PR review: lexer context for continuations and class method heredocs
+
+Record a continued newline only when the lexer consumes a backslash in code.
+Comment and literal scanners never record it. Nested interpolation lexers use
+separate invocation numbers and restore their parent's context; consumed
+continuation entries are removed after lexing. The existing tc_st map holds
+this context, with no additional top-level state. after_class_kw also checks
+the preceding significant character across whitespace, so receiver `. class`
+and `:: class` calls keep their bare, indented and quoted heredoc arguments.
+Changed functions: lex_go, new lex_go_step/lex_cont_key/lex_cont_go,
+lex_go_b, after_class_kw and prev_nonspace. Corpus761/762 adds both review
+reproductions, tab/newline separators, comment-ending backslashes, quoted
+hash bytes, real continuations, nested interpolation and repeated eval.
+
+Normal O2 with the CI-pinned compiler01f5ad73: **721/721 corpus** matches
+Ruby4.0.9 with hash index ON/OFF, **483.813s / 1,089,488KiB** peak family
+RSS. All nine existing RSS gates, roots, dead definitions and C depth155/1024
+pass. Corpus761-763 matches all36 evaluator/default/strict-VM and hash/MRO
+comparisons. Three complete original Parse/Syntax/Literal files retain
+**300 MATCH / 1 RED / 2 BOTH** across303 cases, identical per-file counts
+to successful main d9826ac9. The existing Syntax invalid-symbol leak Timeout
+and both reference skips stay visible. An initial nonexistent test_heredoc.rb
+selection was rejected as incomplete; only the real test_literal.rb result
+is counted here. No original tests, exclusions, API or resource limits change.
+Hosted checks must still finish on the updated head before merging.
+
+The follow-up review found the receiver's separator lost again when a comment
+or a continuation stands between it and `class` (`p o. # note`, then
+` class <<-EOS`; also `o::`, and a comment-only line between). The lexer now
+records each comment it skips the way it records a continuation -- keyed by
+the newline that ends it, holding where it began, removed once the rest of
+the source is lexed (lex_comment_key) -- and after_class_kw's look back
+passes over both. corpus/761 holds the five forms, and a real
+`class <<self` after comment lines. 721/721, the VM's 761-763 the same, and
+the twelve gems the same on both sides.

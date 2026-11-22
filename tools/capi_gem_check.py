@@ -13,7 +13,16 @@ readiness of real descriptors), and nokogiri, built from source against the syst
 libxml2 and libxslt (`--use-system-libraries`; mini_portile2, which its
 extconf.rb requires, is installed with it): typed data wrapping the
 library's structs, callbacks from the library into Ruby (SAX), error
-objects. The .gem files are fetched once by the reference
+objects. And what Rails 8.1's own dependencies build, at the versions
+railstest/ locks: erb (its escape, which ERB::Util.html_escape is), rbs (a
+parser that builds Ruby AST objects), websocket-driver (the frame mask), puma
+(the HTTP request parser) and sqlite3, against the system's SQLite
+(`--enable-system-libraries`; callbacks into Ruby, BLOBs, transactions). Each
+of those prints whether the extension it loaded is the one in the gem home --
+a library the interpreter ships under the same name would pass otherwise.
+(json, date, bigdecimal, io-console and prism build as well, but mere-ruby
+loads its own library before an activated gem's extension -- issue #127.)
+The .gem files are fetched once by the reference
 ruby (or taken from --gems), and then each ruby installs them from those
 files into a gem directory of its own with RubyGems' ordinary `gem install`:
 extconf.rb, make, make install, all driven by that ruby.
@@ -39,7 +48,13 @@ ROOT = Path(__file__).resolve().parents[1]
 GEMS = [('fast_blank', '1.0.1', [], []), ('redcarpet', '3.6.1', [], []), ('msgpack', '1.8.7', [], []),
         ('racc', '1.8.1', [], []), ('bcrypt', '3.1.22', [], []), ('nio4r', '2.7.5', [], []),
         ('mini_portile2', '2.8.9', [], []),
-        ('nokogiri', '1.19.7', ['--platform', 'ruby'], ['--', '--use-system-libraries'])]
+        ('nokogiri', '1.19.7', ['--platform', 'ruby'], ['--', '--use-system-libraries']),
+        # (what Rails 8.1's own dependencies build, at railstest/'s locked
+        #  versions, and the gems they need)
+        ('erb', '6.0.7', [], []), ('logger', '1.7.0', [], []), ('tsort', '0.2.0', [], []),
+        ('rbs', '4.2.0', [], []), ('base64', '0.3.0', [], []), ('websocket-extensions', '0.2.0', [], []),
+        ('websocket-driver', '0.9.0', [], []), ('puma', '8.1.2', [], []),
+        ('sqlite3', '2.10.2', ['--platform', 'ruby'], ['--', '--enable-system-libraries'])]
 parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 parser.add_argument('--reference', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
@@ -127,4 +142,4 @@ if not refused:
     problems.append('mere-ruby used the gems the reference built')
 if problems:
     sys.exit('capi_gem_check: ' + '; '.join(problems))
-print('capi_gem_check: seven gems with C extensions install with `gem install` and behave the same on both sides')
+print('capi_gem_check: twelve gems with C extensions install with `gem install` and behave the same on both sides')
