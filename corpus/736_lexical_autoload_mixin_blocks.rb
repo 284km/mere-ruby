@@ -184,3 +184,63 @@ Dir.mktmpdir('object-mixin-autoload') do |directory|
     p [:object_mixin_autoload, kind, receiver.new.object_mixin_value, Object.autoload?(name)]
   end
 end
+
+# String eval keeps the method's lexical nesting when it opens a class.
+class StringEvalMixinScope140
+  module Sibling
+    def lexical_eval_value = :sibling
+  end
+
+  def self.include_scope
+    eval <<~'RUBY'
+      class IncludeReceiver
+      end
+      class IncludeReceiver
+        include Sibling
+        NESTING = Module.nesting
+      end
+      [IncludeReceiver.new.lexical_eval_value, IncludeReceiver::NESTING.map(&:name)]
+    RUBY
+  end
+
+  def prepend_scope
+    eval <<~'RUBY'
+      class PrependReceiver
+      end
+      class PrependReceiver
+        prepend Sibling
+        NESTING = Module.nesting
+      end
+      [PrependReceiver.new.lexical_eval_value, PrependReceiver::NESTING.map(&:name)]
+    RUBY
+  end
+end
+
+p [:string_eval_include, StringEvalMixinScope140.include_scope]
+p [:string_eval_prepend, StringEvalMixinScope140.new.prepend_scope]
+
+# A qualified class name does not add its prefixes to the lexical nesting.
+module NotLexicallyEnclosing140
+  Sibling = Module.new
+  class Receiver
+  end
+end
+
+class StringEvalQualifiedScope140
+  def self.check
+    eval <<~'RUBY'
+      class ::NotLexicallyEnclosing140::Receiver
+        p [:qualified_eval_nesting, Module.nesting.map(&:name)]
+        begin
+          include Sibling
+        rescue NameError
+          puts :qualified_prefix_is_not_lexical
+        else
+          raise 'qualified prefix leaked into lexical lookup'
+        end
+      end
+    RUBY
+  end
+end
+
+StringEvalQualifiedScope140.check
