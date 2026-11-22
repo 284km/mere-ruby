@@ -37838,6 +37838,10 @@ and eval_str_args = fn env -> fn world -> fn (args: Val list) ->
 // private one first and `K.include(M)` was "private method 'include' called".
 and cls_meth_own = fn world -> fn (c: str) -> fn (name: str) ->
   has_meth world ("(sng:" ++ c ++ ")") name
+  // A local alias of a builtin precedes an inherited Ruby class method,
+  // just as it does for instance methods. Rack::MockResponse aliases [] to
+  // Class#new above Rack::Response.[], whose argument order is different.
+  && not (map_len builtin_alias > 0 && alias_first world ("(sng:" ++ c ++ ")") name)
   && (if (map_has (name_set "modpub") name || map_has (name_set "modpriv") name)
          && str_list_has (ancestors_of world "Object") (lookup_anc world (ancestors_of world ("(sng:" ++ c ++ ")")) name)
       then false else true)
@@ -60987,13 +60991,11 @@ and resolve_feature = fn env -> fn world -> fn (f0: str) ->
             else if sfx9 ("." ++ dl9) then substring f0 0 (str_len f0 - str_len dl9 - 1)
             else if sfx9 ".so" then substring f0 0 (str_len f0 - 3) else f0) in
   let sdir9 = (if map_has load_ctx "stdlibdir" then (match map_get load_ctx "stdlibdir" with VStr d -> sget d | _ -> "") else "") in
-  if (if str_eq (shipped_lib_src p0) "" then false else true) then
-    (if cext_feature p0
-     then arr_new (Cons (VSym "so", Cons (mkstr (sdir9 ++ "/" ++ ruby_platform ++ "/" ++ p0 ++ "." ++ dl9), Nil)))
-     else arr_new (Cons (VSym "rb", Cons (mkstr (sdir9 ++ "/" ++ p0 ++ ".rb"), Nil))))
-  else
-    (let hit9 = load_path_find_conv env world (p0 ++ ".rb") in
-     if str_eq hit9 "" then VNil else arr_new (Cons (VSym "rb", Cons (mkstr hit9, Nil))))
+  let (hit9, virtual9) = load_path_pick_shipped env world (p0 ++ ".rb") (shipped_lib_src p0) sdir9 in
+  if str_eq hit9 "" then VNil
+  else if virtual9 && cext_feature p0 then
+    arr_new (Cons (VSym "so", Cons (mkstr (sdir9 ++ "/" ++ ruby_platform ++ "/" ++ p0 ++ "." ++ dl9), Nil)))
+  else arr_new (Cons (VSym "rb", Cons (mkstr hit9, Nil)))
 // the features ruby's build has as C extensions (a shipped one of these is
 // that extension, whatever it is written in here)
 and cext_feature = fn (n: str) ->
@@ -61052,6 +61054,48 @@ and load_path_find_conv = fn env -> fn world -> fn (p1: str) ->
          | Cons (v9, t9) -> Cons (mkstr (require_path_of env world v9), conv9 t9)) in
       load_path_go (conv9 (deref aid)) p1)
    | _ -> "")
+// A shipped implementation occupies its own stdlib directory in $LOAD_PATH.
+// A real Ruby file before that entry wins; later fallback directories do not
+// replace the selected shipped source. Reuse ordinary physical-path lookup
+// for the prefix, including its tilde expansion and directory bookkeeping.
+and load_path_pick_shipped = fn env -> fn world -> fn (p1: str) -> fn (shipped: str) -> fn (sdir: str) ->
+  // A harness declares reference directories as fallbacks. A RubyGems
+  // child can repeat one in -I; defer it without moving other user paths.
+  // Ruby wrappers such as psych also depend on their runtime's native core.
+  let fallback9 = (let dirs9 = rb_env_get "MERE_RUBY_STDLIB_FALLBACK" in
+                   if str_len dirs9 > 0 then str_split dirs9 ":" else Nil) in
+  let rec is_fallback9 = fn (ds9: str list) -> fn (dir9: str) -> (match ds9 with
+    | Nil -> false
+    | Cons (d9, t9) -> (str_len d9 > 0 && str_eq (path_norm d9) dir9) || is_fallback9 t9 dir9) in
+  (match (if map_has globals (gvar_slot "LOAD_PATH") then map_get globals (gvar_slot "LOAD_PATH") else VNil) with
+   | VArr aid ->
+     (let rec conv9 = fn (xs: Val list) ->
+        (match xs with
+         | Nil -> (Nil : Val list)
+         | Cons (VStr h9, t9) -> Cons (VStr h9, conv9 t9)
+         | Cons (v9, t9) -> Cons (mkstr (require_path_of env world v9), conv9 t9)) in
+      let rec prefix9 = fn (xs: Val list) ->
+        (match xs with
+         | Nil -> ((Nil : Val list), (Nil : Val list))
+         | Cons (v9, rest9) ->
+           (let d9 = (match v9 with VStr h9 -> sget h9 | _ -> "") in
+            let d9 = (if str_len d9 > 0 && str_eq (char_at d9 0) "~" && (str_len d9 == 1 || str_eq (char_at d9 1) "/")
+                      then rb_env_get "HOME" ++ substring d9 1 (str_len d9) else d9) in
+            let a9 = path_norm (if str_len d9 > 0 && str_eq (char_at d9 0) "/" then d9 else env_get "PWD" ++ "/" ++ d9) in
+            if str_len shipped > 0 && str_len sdir > 0 && str_eq a9 (path_norm sdir)
+            then ((Nil : Val list), (Nil : Val list))
+            else (let (tail9, deferred9) = prefix9 rest9 in
+                  if is_fallback9 fallback9 a9 then (tail9, Cons (v9, deferred9))
+                  else (Cons (v9, tail9), deferred9)))) in
+      let (before9, deferred9) = prefix9 (conv9 (deref aid)) in
+      let hit9 = load_path_go before9 p1 in
+      if str_len hit9 > 0 then (hit9, false)
+      // Bundled libraries also remain available in a standalone runtime
+      // after $LOAD_PATH.clear. Physical replacements still win above.
+      // This includes the Marshal builtin's private implementation import.
+      else if str_len shipped > 0 && str_len sdir > 0 then (sdir ++ "/" ++ p1, true)
+      else (load_path_go deferred9 p1, false))
+   | _ -> ("", false))
 // The loader behind `require` / `require_relative`: resolve the path, run the
 // file once, and record it. Reached through Kernel#require (see SRequire), so
 // a replaced `require` can still get here by calling the original.
@@ -61220,22 +61264,21 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
      //   library/digest 3) were that and nothing else.
      //
      //   `require` is not `require_relative`: the name resolves once, for the
-     //   whole process. So a shipped feature is named from the name ALONE --
-     //   including over a file of the same name on the $LOAD_PATH, which the
-     //   source already ignored. require_relative is left alone: it names a
-     //   file in the program's own tree and the requiring dir is the point.
-     let full = if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1
-                else if rel then dir ++ "/" ++ p1
+     //   whole process. When its stdlib directory wins the ordered search,
+     //   a shipped feature has that stable identity. Earlier real Ruby files
+     //   and require_relative keep their own physical identity and source.
+     let in_ship9 = fn (f9: str) -> str_len sdir > 0 && str_len shipped > 0
+                     && str_starts_with (path_norm f9) (path_norm sdir ++ "/") in
+     let (full, virtual9) = if str_len p1 > 0 && str_eq (char_at p1 0) "/" then (p1, in_ship9 p1)
+                else if rel then (dir ++ "/" ++ p1, in_ship9 (dir ++ "/" ++ p1))
                 else if str_len p1 >= 2 && (str_eq (substring p1 0 2) "./" || (str_len p1 >= 3 && str_eq (substring p1 0 3) "../")) then
-                  env_get "PWD" ++ "/" ++ p1
-                else if (if str_eq shipped "" then false else true) && (if str_eq sdir "" then false else true) then
-                  sdir ++ "/" ++ p1
+                  (env_get "PWD" ++ "/" ++ p1, false)
                 // ⚠ not found on the $LOAD_PATH is not found: it fell back to
                 //   the REQUIRING FILE's directory, so `require "x/t.rb"`
                 //   found a file beside the program with no "." on $:
                 //   (ruby raises LoadError -- test_require's test_relative)
-                else (let hit = load_path_find_conv env world p1 in
-                      if str_eq hit "" then "/.mere-ruby-not-found/" ++ p1 else hit) in
+                else (let (hit, virtual9) = load_path_pick_shipped env world p1 shipped sdir in
+                      if str_eq hit "" then ("/.mere-ruby-not-found/" ++ p1, false) else (hit, virtual9)) in
      // ...and then CANONICALISED, because this one string is the whole
      // identity of a feature: it keys loaded_files, it is the entry pushed
      // onto $LOADED_FEATURES, and it is what is opened and read. Built by
@@ -61255,6 +61298,7 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
      let full = (let n0 = path_norm full in
                  if str_len n0 > 0 && str_eq (char_at n0 0) "/" then n0
                  else path_norm (env_get "PWD" ++ "/" ++ n0)) in
+     let shipped = (if virtual9 then shipped else "") in
      let native_path = if str_eq shipped "" &&
                             (str_ends_with p0 ".bundle" || str_ends_with p0 ".so" || (if is_reg_file full then false else true))
                        then native_feature_path env world rel dir p0 else "" in
@@ -61393,9 +61437,8 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
        else
        let _ = (if str_eq shipped "" then () else map_set stdlib_ran srk9 VNil) in
        let _ = (if str_eq shipped "" then () else map_set shipped_files full "1") in
-       // A library mere-ruby SHIPS (see stdlib_src) is its implementation of
-       // that feature, so it wins over a file of the same name on the load
-       // path -- CRuby's monitor.rb would only `require "monitor.so"` here.
+       // Use the source selected by the ordered search: either the real Ruby
+       // file or this interpreter's implementation at its stdlib entry.
        // (a required file's __END__ ends it too, but DATA is the main script's)
        if (if str_eq native_path "" then false else true) then
          (let _ = try_or_msg (fn (u: unit) ->

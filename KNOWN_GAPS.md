@@ -4584,6 +4584,28 @@ there and the rest of the file is never reached; unittest/run.sh fixes the
 seed so the file stops at the same place every run.
 
 
+### PR90: Pathname core and physical library extensions
+
+Separating the unchanged shipped Pathname core from pathname.rb's extension
+body restores the two original Bundler binstub cases (13 to15 MATCH). Real
+pathname.rb files still win ordinary load-path lookup. The core is initialized
+when their class body needs it, and factory-first loading preserves the real
+core/library phases. Corpus746/747, the710-file corpus and five complete
+original test files retain the completed main's passing cases under unchanged
+bounds. The five-gem baseline remains48 MATCH/14 RED with both sides' actual
+library audits complete. The previous hosted30K-method Timeout remains an
+observation requiring a fresh hosted result; the same original file passes
+locally on both actual CI binaries and the candidate within60 seconds.
+
+
+The final Pathname core entry uses an internal identity anchored in the
+runtime's stdlib directory. A user's same-named ordinary Ruby file remains
+selectable, while the core body keeps its actual implementation(corpus748).
+The integrated714-file corpus and original bounded focused/gem measurements
+pass. The intermediate head's separate Linux Module clone RSS2.0991655787x
+failure remains evidence; fresh final-head hosted gates and every-file
+nonregression are still required, with original assertions and limits intact.
+
 ## Rails dependency checksums and the next command boundary (2026-11-19)
 
 SHA-2 can use the real internal OpenSSL provider when already loaded, as
@@ -4826,6 +4848,24 @@ privacy and autoload behavior. The712-file corpus and original nine-file784-case
 comparison pass without losing a main PASS. The separate module_eval lexical
 negative remains an explicit failing diagnostic; this change does not claim it.
 
+Native-check stdlib fallbacks are explicit: the C extension runners set
+MERE_RUBY_STDLIB_FALLBACK to the actual reference library directory. A
+RubyGems extension child can repeat it through -I; native-backed shipped
+features still use this runtime's implementation there. Other user paths
+and pure Ruby source retain ordinary ordering. Corpus525 covers a native
+wrapper, and unchanged mkmf contracts plus seven real native gem installs
+pass. The C API spec gate retains its existing unsupported cases and bounds;
+2277 candidate cases versus2584 reference is not a claim of complete C API.
+
+Declared reference fallback directories are now deferred for both shipped
+and unshipped feature lookup. This covers Psych/YAML wrappers whose native
+core names do not appear in the earlier native-feature filter. Ordinary
+user source paths retain precedence, and no inactive path is added to the
+search. The real YAML child reproduction and all 11 library controls pass.
+The earlier native-name-only behavior is superseded; native Method dispatch
+and other independent compatibility gaps are not claimed solved by this
+ordering repair.
+
 
 The Hash native-read review fixes repeated observable #hash calls using one
 real local search code. Corpus735 retains value/call-count controls for saved
@@ -4851,3 +4891,13 @@ Puma HTTP. Mere's next migration command fails at the separate registry issue
 #121 (perform on nil), exit 1 in 2.062 seconds / 199,616 KiB without a limit event.
 Boot, tests and HTTP remain NOT_RUN; the complete measurement is RED. No
 runtime function, lock, fixture, original test, exclusion or bound changes.
+
+
+## Native loading after the main compiler update
+
+The PR145 compiler408b03d9 setting is retained when integrating main; the
+native/shipped fallback ordering and child-launcher implementation are
+unchanged. All726 corpus programs, actual mkmf builds and seven native gems
+retain their passing controls. Full hosted per-file acceptance remains a
+merge requirement; this configuration integration does not establish a
+complete Rails pass or change any accepted snapshot or resource bound.
