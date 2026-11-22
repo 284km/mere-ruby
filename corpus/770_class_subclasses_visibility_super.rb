@@ -62,7 +62,7 @@ module BeforeClassVisibility
 end
 Class.prepend(BeforeClassVisibility)
 visibility_methods(:class_prepend, VisibilityParent)
-class PublishedVisibility
+class PublishedVisibility < VisibilityChild
   class << self
     public :subclasses
   end
