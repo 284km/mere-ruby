@@ -6569,6 +6569,79 @@ and addressed P1/P2 findings are still required before merge. No test, helper,
 limit, exclusion, collector, VM/ISeq, AST/Prism or C API change is used here.
 
 
+
+## 2026-11-19: SHA-2 checksums in real gem installation
+
+The locked Rails intake (#117) gets beyond mkmf on the unmerged C API
+candidate, then reaches the unchanged 600-second install bound before
+Nokogiri is extracted. Its 4,387,328-byte archive exposes the interpreted
+SHA-2 loop. The existing OpenSSL provider computes the same hash quickly.
+
+Digest::SHA256/384/512 now use that internal provider when RubyGems or
+another caller has already loaded it. Digest itself loads no extra library;
+without the provider the original portable algorithm remains. Named
+singleton methods and private portable aliases preserve Ractor use. The
+provider's binary Array/Hash packing uses explicit empty separators so $,
+cannot enter the request. Public OpenSSL::Digest overrides are not callbacks
+for these standard Digest operations. No public API, API inventory, native
+ABI, collector, VM/ISeq or dispatcher function changes, or new top-level
+Mere values. lib/openssl_backend.rb and its generated embedding agree.
+
+The original Digest files retain 80/80, 24/24 and 6/6 MATCH; OpenSSL Digest
+retains 14/14 against successful main 12ca1df2. The full corpus is 704/704
+with both hash modes. Witness 715 covers binary and block boundaries,
+files, incremental/cloned/reset state, SHA2 selection, OFS, Ractors and
+independence from public provider overrides; it was renamed byte-for-byte
+from provisional 714 after an origin collision and rechecked in both modes.
+All nine RSS cases and 15 existing provider lifetime/interruption checks
+pass. Bracket depth remains 933/1024. A freshly emitted/assembled/optimized
+Wasm module computes the twelve portable vector/clone results as the
+reference, with the provider unavailable. That smoke uses the actual host
+from the separate GC host-fix candidate (#112) for its already-declared
+file-time imports; this change adds no imports or browser host code.
+
+The final archive checksum plus RubyGems metadata probe matches reference
+(hash, Nokogiri version and 182 files), completing in 3.492 s / 381,984 KiB.
+A fresh own combination with #95 installs all 68 Rails dependencies in
+284.529 s / 874,928 KiB under the original 600 s / 2 GiB bounds. This is an
+unmerged candidate, not a main Rails pass: migration next stops when the
+command registry's Ruby subclasses method loses to Class's native entry.
+The standalone registry reproduction is separate from this library fix.
+
+
+### Rails SHA-2 provider input bounds (review follow-up, 2026-11-19)
+
+The first provider connection sent the complete SHA-2 input in one native
+request. Review #120 found that inputs at the provider's 64-MiB wire bound
+raise instead of hashing. Reproduced on the preceding O2 binary with a
+67,108,867-byte binary input, without a memory or wall-limit event.
+
+SHA256, SHA384 and SHA512 now update the same real native context with
+1-MiB byte slices before finalization. The provider's own wire bound and
+all test/resource limits are unchanged. Empty inputs and the existing
+portable algorithms retain their behavior. No new top-level Mere value,
+public API, dispatcher, collector, C API or provider ABI change.
+
+The same input now matches Ruby 4.0.9 for all nine combinations of the
+three algorithms and direct/incremental/file entry points, each in a
+separate supervised process under 600 seconds / 2 GiB. Mere completes each
+in 1.266–2.055 seconds; the largest observed family peak is 1,119,600 KiB.
+The reusable actual-input probe is unittest/digest_provider_large.rb;
+arguments are algorithm bits (256/384/512) and entry point
+(direct/incremental/file). Compare its complete output with the reference.
+Witness 716 covers binary bytes crossing the bounded update boundary.
+
+Original Digest/OpenSSL Digest retain all 124 MATCH. The full corpus is
+705/705 with indexing ON and OFF. All nine RSS cases, fifteen existing
+provider lifetime/interruption/worker controls and the actual bracket
+check (933/1024) pass again. The real Nokogiri checksum/metadata probe
+still matches both hash and 182 files (4.715 seconds / 352,544 KiB).
+
+The earlier 68-gem installation observation remains tied to experimental
+composition 153e64f5 before this review fix. No new full Rails workload
+pass is inferred. #121 still owns the independent command registry
+boundary, and migration/boot/tests/HTTP require their original CLI replay.
+
 ## 2026-11-19: Rails application intake, rounds 1–2
 
 Round 1 fixes Rails 8.1.4.1, sqlite3 2.10.2, Puma 8.1.2, Minitest 6.1.0
@@ -7125,6 +7198,76 @@ the installed method directly; this change does not claim that predicate
 repair or a full Rails pass. Hosted CI remains required on the corrected head.
 
 
+## 2026-11-20: Real Hash defaults, yielded entries and lexical mixin arguments
+
+ActiveSupport::OrderedOptions normalizes keys in Ruby Hash#[]; the missing-key
+shortcut ran before that override. Honor the real override, and share native
+Hash reads through super and saved aliases with the actual Hash#default.
+Hash subclass count/entries now consume the real Ruby each, including arguments,
+multiple yields and block/break, while ordinary Hash and Ruby overrides retain
+their existing paths. Count uses the existing Enumerator counting body on the
+actual Hash receiver; no proxy collection or invented size is used.
+
+Runtime include/prepend evaluates lexical constants, ivars/classvars, local
+variables and bare getters before validating the actual Module. Each scoped
+segment follows its real ancestor/autoload/const_missing result and privacy;
+explicit roots and custom include/prepend overrides are preserved. The first
+full corpus caught a missing intermediate const_missing regression in525.
+Fix it rather than removing the case. Keep the direct include-local hot path.
+
+Normal O2 eea2a983 on main d9826ac9 plus the reviewed loading/Module stack:
+**718/718 corpus**, hash index ON/OFF;525/735/736/737 in four hash/MRO modes
+match in all16 comparisons. Nine existing RSS gates, dead definitions and C
+bracket depth155/1024 pass. The complete original twelve-file paired set finds
+1,302 cases: main1,284 MATCH/3 RED/15 BOTH, candidate1,285/2/15, zero EXTRA.
+No original PASS or per-file MATCH is lost. Hash297, Enum89, Module195,
+Class61, Refinement121, Super50, Method97, Parse102, Forwardable27,
+Autoload27 and Require51 MATCH are maintained. Syntax167/168 is the known
+invalid-symbol memory observation, not claimed as a causal improvement.
+The final set was measured as eight files plus four additional files on the
+same unchanged binary. Original600-second/2-GiB and10-second child bounds,
+bootstrap, test files and exclusions remain unchanged.
+
+An own integration reaches real Rails migration and stops at Range#=== through
+ActiveSupport's prepended super, rejecting precision6 in0..6. Reference passes
+all four warm application stages; candidate boot/tests/HTTP remain NOT_RUN.
+This is reused-own-gem diagnostic evidence, not cold installation or a Rails
+pass. The separately measured four original ActiveSupport files still have
+537/541 MATCH at the earlier Hash-default boundary; these new Enumerable
+changes require a new original-framework measurement before claiming more.
+
+
+## 2026-11-20: Native Range case equality through super and saved aliases
+
+ActiveSupport prepends CompareWithRange#=== and calls super for scalar values.
+The native fallback reached Object#=== instead of Range#===, so precision6 was
+rejected by0..6 during actual Rails migration. Enter the real Range comparison
+from super and native aliases. Compare begin <=> value and value <=> end once
+in that order, matching range.c r_cover_p: nil means not covered; comparator
+exceptions propagate. Preserve exclusive/beginless/endless boundaries and the
+bounds of real Range subclass instances. No invented precision exception.
+
+Normal O2 at25415a32, on the reviewed loading/Module/Hash stack: **719/719
+corpus** match with the hash index ON and OFF. Corpus741 matches in all four
+hash/MRO settings, including native alias arity, scalar/string/object bounds,
+comparison side effects and exceptions. Nine existing RSS gates, dead definitions
+and generated C depth155/1024 pass. The original Range/Super/Method/Module
+pair discovers410 cases: both main d9826ac9 and candidate409 MATCH/1 RED,
+zero BOTH/EXTRA, no original PASS lost. Range67, Super50, Method97 and Module195
+MATCH are equal under the original600-second/2-GiB and10-second child limits.
+
+The own integration fd5a68a5 passes unchanged migration in6.812 seconds with
+804,208 KiB peak family RSS and no limit event. The next boot check refuses
+Bundler's full_gem_path because it points outside that interpreter's actual
+installed gem home; candidate application tests and HTTP remain NOT_RUN.
+Reference passes all four warm stages. This reused-own-gem run does not claim
+cold installation or application success. Remeasuring the same four original
+ActiveSupport files on both interpreters gives **539 MATCH/2 RED out of541**,
+zero BOTH/EXTRA/skips: OrderedOptions31/31, Concern17/17, Inflector471/473,
+class attribute20/20. Both remaining identities are Inflector titleize cases
+(String gsub! native super and Unicode negative lookbehind); the framework-wide
+suite has not been run.
+
 ### Scoped namespace review: every remaining segment is a real scope lookup
 
 Resolving the first constant lexically was necessary but did not make
@@ -7192,3 +7335,164 @@ its existing record. Existing digest-header, thread timeout and other
 unsupported spec results are retained, not counted as passing cases.
 The earlier runner-only attempt's six native-gem child failures remain
 separate raw evidence. Current hosted every-file validation still gates merge.
+
+### Reference directories remain fallbacks for wrapped native libraries
+
+The declared-reference marker must describe directory ordering, not a list
+of native feature names: the Psych/YAML Ruby wrappers also require their
+own runtime's native core. load_path_pick_shipped now defers declared
+reference entries, preserves other active user paths, selects the shipped
+source at its own position, and searches deferred paths for unshipped files.
+No directory absent from LOAD_PATH is added by the marker. Behavior without
+a declaration is unchanged. Corpus 525 exercises real YAML parsing in a
+child with the fallback repeated through -I, using a genuine native-wrapper
+prerequisite on the reference. All 11 ordinary/child library controls pass;
+Psych and YAML failed the preceding child control. A real user source still
+wins over a declared fallback in the separate priority control.
+
+Current main 2e2ab568 is integrated with Digest, the cached compiler action,
+XML dependency checks and released compiler 43f2994b retained. Normal O2:
+726/726 corpus programs match in both hash modes (530.253 seconds,
+1,058,272 KiB), all 24 focused comparisons, nine RSS workloads, roots,
+depth 155 and dead definitions pass. The unchanged mkmf gate agrees on all
+14 contracts for reference/candidate/stress and rejects both negative
+controls. All seven native gems install and their 84 output lines agree;
+wrong-runtime libraries remain rejected. The C API spec gate retains its
+existing record, reference 2584/candidate 2277, including existing unsupported
+and timeout cases. Reference-cache and embedding-build controls pass, and
+workflow YAML parses. Hosted full checks and every-file nonregression remain
+required for the new head. No original assertion, exclusion or bound changes.
+
+
+### Hash review: calculate a native read's search hash once (2026-11-20)
+
+The new native read helper discarded hash_touch's result, then recalculated
+#hash for each candidate through hash_lookup_w. Keep the real search hash in
+the call and reuse it with stored codes; share the post-bucket identity/eql?
+comparison without changing insertion's existing hash evaluation order.
+Identity reads skip the protocol. Ruby [] overrides run before probing keys;
+the native custom-key [] entry uses the same lookup, so super and saved aliases
+both calculate the actual hash once. Reentrant hash/eql? calls use local data.
+
+The first amendment passed the reported alias but its added super control
+found an earlier [] dispatcher bypass. Retain the16/20 failed witness run and
+stop its incomplete original-file comparison; fix that door too, then start
+a new O2 measurement. Runtime4d95d7b7 passes **719/719 corpus** ON/OFF,
+all20 comparisons for525/735-737/742 in four hash/MRO modes, nine existing RSS
+gates, dead definitions and depth155/1024. Complete original twelve-file
+comparison:1,302 cases, both main d9826ac9 and candidate **1,284 MATCH/3 RED/
+15 BOTH**, zero EXTRA, no original PASS or file MATCH lost. Original600-second/
+2-GiB/10-second child limits, bootstrap, exclusions and tests are unchanged.
+
+
+### Range review: resume native lookup from the actual ancestor position
+
+A receiver-only native fallback incorrectly reentered containment when Range
+itself replaced ===: that super belongs above Range and reaches equality.
+Include the real native Range entry while resolving super's remaining ancestor
+chain. Ruby definitions and undef before it keep their precedence; a native
+Range entry stops before a lower Ruby override. Both ordinary and refined
+super retain their actual lookup positions. Only Ruby targets consume the
+pending frame index; native comparator callbacks do not inherit that index.
+
+Normal O2 runtime0824a721 passes **720/720 corpus** ON/OFF, all12 comparisons
+for735/741/742 across four hash/MRO modes, nine existing RSS gates, dead
+definitions and C depth155/1024. The original Range/Super/Method/Module pair
+remains409 MATCH/1 RED out of410. Add the whole original Refinement file on
+the same unchanged binary:121 MATCH/1 BOTH out of122 on both sides. Combined
+five-file result:532 cases, both main d9826ac9 and candidate530 MATCH/1 RED/
+1 BOTH, zero EXTRA or lost original PASS. Original600-second/2-GiB/10-second
+child limits, files, bootstrap and exclusions remain unchanged. Subsequent
+parent merges change documentation only; full hosted checks are still required.
+
+Two exploratory controls expose separate preceding-parent gaps: native Kernel
+Method binding loses its owner on a Range receiver, and primitive === bypasses
+an undef. Keep unittest/range_kernel_method_owner_probe.rb and
+unittest/range_case_equality_undef_probe.rb as explicit failing diagnostics;
+these are not claimed repairs, exclusions or passing corpus cases. The older
+direct primitive/object comparison diagnostic also remains unresolved.
+### Review repair: mixed Hash keys and Object autoloads (2026-11-21)
+
+Native Hash reads now use the internal hash for builtin search and stored
+keys even when a mixed table contains Ruby-hashed keys. Ruby hash callbacks
+still run once for keys whose protocol requires them. Object-qualified
+mixin paths normalize the constant/autoload key before firing the loader.
+Functions changed: hash_read_native and mixin_argument_value. Corpus 735
+and 736 cover String/Symbol hash overrides, missing custom keys, and block,
+class-body include and runtime prepend through Object's pending autoload.
+
+With Mere 01f5ad73 and O2, all 719 corpus programs match in both hash-index
+modes (516.823 seconds, 1,192,432 KiB under the unchanged 900-second/2-GiB
+bounds); RSS, root, depth (155) and dead-definition gates pass. The three
+focused corpus programs match in all four hash/MRO cache configurations.
+The original test_hash.rb remains 297 MATCH, 1 RED, 8 BOTH out of 306,
+without any previously passing named case lost against the retained before
+and previous candidate results. The remaining RED is test_replace_memory_leak;
+it was already RED. Full hosted per-file comparison is required before merge.
+
+
+### Review repair: removed native Range entries (2026-11-21)
+
+Native Range and Kernel comparators have entries in the existing
+builtin-alias store. Ruby replacements displace them; deleting a replacement
+does not restore the native entry. Ordinary/refined super follow the actual
+remaining entries while saved native aliases retain containment.
+
+Pinned Mere 01f5ad73/O2 passes all 720 corpus programs in both hash modes
+(510.717 seconds, 1,285,680 KiB under unchanged 900-second/2-GiB limits),
+all nine RSS workloads and root/depth155/dead-definition gates. Corpus741
+matches in four hash/MRO configurations. Original test_range/test_method/
+test_super total 215 cases: 214 MATCH and one existing Method RED, with no
+previously passing named case lost against retained candidate results.
+Full hosted per-file comparison still gates merge. Functions changed by
+the review: run_super_target, range_super_lookup and super_next_refined;
+existing builtin_alias/blt_alias_names initializers retain the native entries.
+
+## Replay the original Rails native-build issue on integrated main
+
+Issue #116 was left open while the own build metadata (#95) and bounded SHA-2
+provider (#120) were unmerged. Both are now in main 2e2ab568. A fresh normal O2
+build with main's pinned compiler 01f5ad73 and the unchanged committed Rails
+runner installs Bundler and all 68 dependencies from the same 69 archives.
+Separate initially empty gem homes and independently built extensions remain;
+the same documented system SQLite 3.46.1 option is used on both interpreters.
+
+The dependency stage exits 0 in 253.379 seconds / 914,976 KiB, within the existing
+600-second/2-GiB family bounds. The original small mkmf probe matches and the
+actual bigdecimal Makefile/build uses this runtime's own headers. All 77 captured
+runtime/runner/lock input hashes stay fixed, all stored stdout/stderr hashes
+verify, and seven harness controls pass. The initial sandbox-denied ps check
+is separate setup evidence; the same harness passes with normal permissions.
+
+Reference passes all six stages, including six tests / 31 assertions and actual
+Puma HTTP. Mere's original migration then stops at the separately tracked #121
+registry error, perform on nil, exit 1 in 2.062 seconds / 199,616 KiB. Boot/tests/
+HTTP are NOT_RUN and the whole record remains RED. Keep all earlier source-
+specific records, add railstest/main_native_install.json, and correct the stale
+README statement about current main. This meets #116's first-extension-build
+acceptance condition without claiming Rails application/framework success.
+Runtime functions changed: none; no lock, test, exclusion or bound changes.
+
+
+### Merge main after the released Map-slot compiler adoption
+
+Integrate main05c3bda3 after PR145 and the documentation-only PR146. Resolve only the MERE_REF conflict by
+retaining released compiler408b03d9, which clears removed native Map backing
+references. Keep the existing native child launchers, declared-reference
+fallback ordering and user-source priority. No runtime function, library,
+original test, exclusion, accepted snapshot or resource bound is changed.
+
+New ordinary O2/compiler408b03d9 validation: **726/726 corpus**, hash
+index ON/OFF, **546.48s / 1,057,696KiB** peak family RSS.
+All24 focused hash/MRO comparisons, 11 ordinary/child library controls,
+all nine RSS gates, roots, dead definitions and C depth155/1024 pass.
+The original upstream mkmf checks retain all14 reference/candidate/stress
+contracts and both negative controls. All eight locked packages, including
+seven gems with C extensions, freshly install separately under both runtimes;
+all84 use-output lines match and reference-built libraries are rejected.
+Earlier compiler43 measurements stay associated with their original source.
+Fresh hosted checks and latest-main per-file acceptance remain required.
+
+The upstream gem workflow also selects compiler408b03d9, matching core CI
+and the new local O2 measurements. Its original locks, tests, accepted
+snapshots and bounds are unchanged; new hosted gem results remain required.
