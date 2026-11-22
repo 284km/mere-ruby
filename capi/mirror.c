@@ -111,7 +111,11 @@ static void refresh_head(struct mr_mirror *m, VALUE obj) {
     if (m->data) type = T_DATA;
     flags = keep | (VALUE)type;
     if (packed & 0x20) flags |= RUBY_FL_FREEZE;
-    flags |= ((packed >> 8) & 0x7f) << RUBY_ENCODING_SHIFT;
+    /* (the encoding index in the 7 bits CRuby keeps it in: one that does not
+     *  fit -- a dummy encoding defined from C, 127 and on -- is
+     *  ENCODING_INLINE_MAX there, and rb_enc_get_index asks for the rest) */
+    long enc_index = (long)((packed >> 8) & 0xffff);
+    flags |= (VALUE)(enc_index < RUBY_ENCODING_INLINE_MAX ? enc_index : RUBY_ENCODING_INLINE_MAX) << RUBY_ENCODING_SHIFT;
     if (type == T_STRING) {
         flags |= RSTRING_NOEMBED;
         /* (the coderange is the interpreter's to say, as far as it knows:
@@ -130,17 +134,18 @@ static void refresh_head(struct mr_mirror *m, VALUE obj) {
     m->head_epoch = mr_epoch;
 }
 /* ObjectSpace.memsize_of: a typed data object's own count of what it holds
- * (its type's dsize), by handle number. */
-int mr_capi_dsize(int number) {
+ * (its type's dsize), by handle number -- run inside a C call (MR_RUN_DSIZE).
+ * A NULL data pointer holds nothing, as gc.c's rb_objspace_data_type_memsize
+ * guards: a wrapper of NULL, or one an extension emptied when it closed. */
+long mr_capi_dsize(long number) {
     struct mr_mirror *m = mirror_at(number, 0);
     if (!m || m->data != 2) return 0;
     const rb_data_type_t *type = (const rb_data_type_t *)(m->as.typed.type & TYPED_DATA_PTR_MASK);
     if (!type || !type->function.dsize) return 0;
-    /* (the struct itself, as the free and mark paths find it -- no header
-     *  refresh: no C call is in progress here) */
     void *data = m->embedded ? (void *)&m->as.typed.data : m->as.typed.data;
+    if (!data) return 0;
     size_t n = type->function.dsize(data);
-    return n > (size_t)INT_MAX ? INT_MAX : (int)n;
+    return n > (size_t)LONG_MAX ? LONG_MAX : (long)n;
 }
 /* rb_obj_hide / rb_obj_reveal: to C, a hidden object has no class (CRuby
  * clears RBasic.klass; the interpreter's object keeps its own). */

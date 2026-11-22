@@ -122,30 +122,25 @@ VALUE rb_singleton_class(VALUE obj) { return mr_callk(obj, "singleton_class", 0)
 void rb_define_const(VALUE klass, const char *name, VALUE value) { mr_call(klass, "const_set", 2, ID2SYM(rb_intern(name)), value); }
 void rb_define_global_const(const char *name, VALUE value) { rb_define_const(rb_cObject, name, value); }
 /* A name that is no constant's ("_INVALID"): CRuby keeps it under an ID that
- * `constants` and Ruby's const_get do not see, and C finds it again. Kept in
- * a hidden instance variable of the module, by the same key define_class
- * uses for a class of such a name. */
-static int const_name_p(const char *name) {
-    return name && ((name[0] >= 'A' && name[0] <= 'Z') || (unsigned char)name[0] >= 0x80);
-}
-static ID hidden_const_key(const char *name) {
-    VALUE key = rb_str_new_cstr("@__capi_hidden_const_");
-    rb_str_cat_cstr(key, name);
-    return rb_intern_str(key);
-}
+ * `constants` and Ruby's const_get do not see, and C finds it again. Kept on
+ * the C side (capi/hidden.c, the table define_class uses for a class of
+ * such a name), out of Ruby's sight. */
+extern int mr_const_name_p(const char *name);
+extern VALUE mr_hidden_const_get(VALUE outer, const char *name, int *found);
+extern void mr_hidden_const_set(VALUE outer, const char *name, VALUE value);
 void rb_const_set(VALUE klass, ID id, VALUE value) {
     const char *name = rb_id2name(id);
-    if (!const_name_p(name)) { rb_ivar_set(klass, hidden_const_key(name), value); return; }
+    if (!mr_const_name_p(name)) { mr_hidden_const_set(klass, name, value); return; }
     mr_call(klass, "const_set", 2, ID2SYM(id), value);
 }
 VALUE rb_const_get(VALUE klass, ID id) {
     const char *name = rb_id2name(id);
-    if (!const_name_p(name)) {
-        ID key = hidden_const_key(name);
+    if (!mr_const_name_p(name)) {
         VALUE ancestors = mr_call(klass, "ancestors", 0);
         for (long i = 0; i < RARRAY_LEN(ancestors); i++) {
-            VALUE m = rb_ary_entry(ancestors, i);
-            if (RTEST(rb_ivar_defined(m, key))) return rb_ivar_get(m, key);
+            int found = 0;
+            VALUE v = mr_hidden_const_get(rb_ary_entry(ancestors, i), name, &found);
+            if (found) return v;
         }
         /* (not there: the lookup's own words, not Ruby's refusal of the name) */
         if (klass == rb_cObject) rb_raise(rb_eNameError, "uninitialized constant %s", name);

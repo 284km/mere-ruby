@@ -452,6 +452,12 @@ static VALUE run(const CapiReq *req, long argc, VALUE *argv) {
         libraries[number].init();
         return Qnil;
       }
+      case MR_RUN_DSIZE: {
+        /* (a typed data object's dsize, run as C runs: in a call of its own,
+         *  so a dsize that asks the C API can -- ObjectSpace.memsize_of) */
+        extern long mr_capi_dsize(long number);
+        return LONG2NUM(mr_capi_dsize((long)req->mu_a));
+      }
       case MR_RUN_BLOCK: {
         long number = (long)req->mu_a;
         if (number < 0 || number >= function_count) mr_fatal("no such C block");
@@ -596,6 +602,7 @@ const void *mr_capi_frame(void) { return cur; }
  * calls finds none; Ruby a C handler runs, and the C it calls, find the
  * exception. (A root: the collector reads it with the C API's own.) */
 VALUE mr_frame_errinfo(void) { return c_errinfo; }
+int mr_capi_clear_errinfo(void) { c_errinfo = Qnil; return 0; }
 void mr_frame_set_errinfo(VALUE v) {
     static int rooted;
     if (!rooted) { rooted = 1; rb_gc_register_address(&c_errinfo); }

@@ -11195,3 +11195,43 @@ reference (4, 41, 54, 112, 15, 1).
   read from the struct directly: no C call is in progress there).
 - Kernel#binding sent from C is "Can't create Binding from C level
   function".
+
+### PR #160 review (two rounds)
+
+First round:
+- **[Minor] An encoding index of 127 or more was cut to the 7 bits of the
+  flags** (dummy encodings defined from C reach it now). refresh_head
+  stores ENCODING_INLINE_MAX (127) when the index does not fit, and
+  rb_enc_get_index asks the object's encoding then, as CRuby does.
+- **[Minor] C's seven global variables were not roots**: a value without
+  identity (`$; = /,/`) assigned to one lost its number at the next
+  collection. Registered at boot, as rb_global_variable makes CRuby's.
+- **[Minor] `Array(H2[1, 2])` named Hash in its TypeError**: the receiver's
+  class (and the returned value's) now. And `Array([1, 2].each)` -- an
+  object's builtin #to_a, which conv_try does not find -- is asked too.
+- **[Suggestion] rb_funcallv_public went through the Ruby-visible
+  public_send.** Without a block it is __capi_public_send (public_send's
+  check and call, whatever the class made of `public_send`); with one,
+  public_send_guard and then an explicit-receiver call of the method.
+- capi/hidden.c (the table #157 keeps names that are no constant's in) holds
+  rb_const_set / rb_const_get's too: no instance variable of the module.
+
+Second round (on 2ad86883):
+- **[Major] Kernel#binding's refusal refused Proc#binding too.** Only a
+  receiver whose `binding` is Kernel's is refused now (not a Proc, a
+  Binding or a TracePoint, nor a class that defines its own), in 4.0's
+  words: "Cannot create Binding object for non-Ruby caller".
+- **[Major] dsize was called with a NULL pointer** (a typed data wrapping
+  NULL, or one an extension emptied): guarded, as gc.c does. And it ran
+  outside any C call, where a dsize that asks the C API would have failed:
+  it runs in a call of its own now (MR_RUN_DSIZE).
+- **[Minor] rb_errinfo kept an old exception after a C call returned
+  normally**, and a later Ruby rescue saw it. A Ruby rescue now clears it
+  (capi_errinfo_clear, where the evaluator's rescue matches), as entering
+  CRuby's rescue clears ec->errinfo. Not the VM's rescue yet; and it is one
+  value per process, where CRuby's is per thread and fiber.
+- capi/check: rb_funcallv_public on a class with its own public_send (and a
+  private method), rb_fs after `$; = /,/` and GC.start, the 30th dummy
+  encoding's index read back from C, Proc#binding vs Kernel#binding from C,
+  memsize_of a typed data wrapping NULL, rb_errinfo in a Ruby rescue after an
+  rb_protect -- each agreeing on both sides.

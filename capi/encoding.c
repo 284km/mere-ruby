@@ -438,8 +438,13 @@ int rb_enc_get_index(VALUE obj) {
         return index_of_object(mr_call(obj, "encoding", 0));
     }
     switch (rb_type(obj)) {
-      case T_STRING: case T_REGEXP:
-        return (int)((RBASIC(obj)->flags >> RUBY_ENCODING_SHIFT) & RUBY_ENCODING_INLINE_MAX);
+      case T_STRING: case T_REGEXP: {
+        int inline_index = (int)((RBASIC(obj)->flags >> RUBY_ENCODING_SHIFT) & RUBY_ENCODING_INLINE_MAX);
+        /* (127 means the index did not fit the flags: asked, as CRuby reads
+         *  it from the object's encoding then) */
+        if (inline_index < RUBY_ENCODING_INLINE_MAX) return inline_index;
+        return index_of_object(mr_call(obj, "encoding", 0));
+      }
       default: break;
     }
     if (RTEST(rb_obj_is_kind_of(obj, rb_cEncoding))) return index_of_object(obj);
