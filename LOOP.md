@@ -11064,3 +11064,25 @@ What is left is still spread:
 - the frame records (call_names_s, call_lines, call_files_s, fb_env_at).
 - vm_exec's VMR region.
 - arr_len's three tables.
+
+## 2026-11-22 (92): a method's :call after its prologue, and an alias's events (corpus 725 on the VM, corpus 790)
+
+**corpus 725.** A TracePoint can be enabled while a `(a, b)` parameter is being destructured, by the `#to_ary` it calls. Ruby then fires the method's :call at the instruction marked Ca, after the prologue. The VM fired :call only on the way in (run_meth), so it missed it. Now:
+- The loader reads RUBY_EVENT_CALL, which the native export already wrote. When it marks a method's instruction other than the first, that instruction gets a new events bit, 16.
+- When vm_events meets the bit and a TracePoint is on, vm_late_call fires :call. It fires only once a frame ("__tpcall"), and not when the call was already made on the way in (tp_meth_flow keeps the frame: "__tpkeep").
+- vm_late_call builds the event as run_meth does: the name the method was defined as and the one it was called by, its class, and the line and file it was written in.
+- Two readers took `events >= 4` to mean the rescue bit. They now test that bit itself.
+
+**Aliases, on both executions** (found while writing the witness):
+- **A top-level `alias`** copied the method and recorded nothing else. TracePoint's method_id, `__method__` and the :call line all came out as the alias's, and the :return line was the caller's. The top-level SAlias now records the source's name ("Object#" key in alias_srcname, through an alias of an alias) and its lines (copy_meth_src). call_method, the top-level call path, names the frame and the events as run_meth does.
+- **An alias in a class** fired :return on the caller's line: copy_meth_src copied the source's first line and file, but not its end. A destination with no end line of its own now gets the source's. #154's modfunc_promote also uses copy_meth_src; corpus 778 was checked on #154 with this change, on both executions.
+
+Results:
+- Under MERE_RUBY_VM=1: 801 programs, 791 on the VM, 10 fallen back, 0 different. This is the first round with no difference.
+- Corpus 790 covers:
+  - the call fired after the prologue;
+  - a call already made on the way in, not fired twice;
+  - a loop back to the first instruction after the prologue;
+  - an alias in a class and at the top level.
+- On main's build it differs.
+- test_settracefunc, test_alias, test_method, test_proc, test_super and test_iseq give the same counts as main's build on both executions.
