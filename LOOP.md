@@ -4848,6 +4848,85 @@ runs on the evaluator.
   it has to be native (note 552).
 - Next: whole files on the VM (the compiler made native first), then speed.
 
+## 2026-11-16: stage 9 GC remainder, round 1 -- measured profiling and explicit exclusions
+
+Baseline: main c64d0ae4, successful CI run 43807166928. The six target files
+have 159 RED: allocation 76, objspace 35, gc 23, gc_compact 22, string_memory 3.
+The GC policy follows CRuby's alternate MMTk collector: actual measurements,
+NotImplementedError for unavailable operations, and a reasoned ledger for
+tests of the default collector. No slot or page constants are invented.
+
+- GC.auto_compact now raises like the other unavailable compaction methods;
+  respond_to? remains false. INTERNAL_CONSTANTS and stat_heap are empty,
+  and OPTS does not advertise generational collection.
+- gc_collect_any records actual collection durations for GC::Profiler and
+  the inspected/retained weak references for latest_gc_info. The profiler
+  reports measured per-run times and supports clear. No per-slot sizes are
+  fabricated. gc_fixpoint, gc_mark_roots and gc_collect are untouched, to
+  avoid overlapping PR #87. The allocation counter uses issued Proc handles,
+  rather than the shrinking live Proc table.
+- each_object snapshots String, Array and Hash stores, using real String
+  survivors and post-sweep allocations. count_objects keeps its separate
+  Array/Hash accounting, avoiding double counting.
+- The upstream EXCLUDES mechanism applies the same reasoned ledger to both
+  interpreters. Actual removed methods are audited and counted separately
+  in local STATUS.md/EXCLUSIONS.tsv and CI summary.json/files.tsv/exclusions.tsv.
+  The GC implementation-name comparison is excluded: the reference keeps
+  its own default collector, and Mere truthfully reports mere-ruby.
+- Local round 1: objspace MATCH 28 -> 29; gc 29 -> 32; string_memory 0 -> 2;
+  55 exclusions, identical per side. Compaction's unsupported-API checks stay
+  enabled (five EXTRA, one BOTH). Missing local -test-/stack makes two GC
+  finalizer tests BOTH locally; they are RED in CI and belong to PR #87.
+- Left: WeakMap's freed-object test retains 66 objects against a bound of
+  10, despite real counts; conservative roots are shared with PR #87. One
+  string_memory test sees interpreter parameter-name Strings on the first
+  call into each_object (VM allocation provenance). Neither is excluded.
+- Witness 669 checks actual profiling, latest info, unsupported compaction,
+  empty slot information and each_object over real value stores.
+
+### Stage 9 GC remainder, rounds 2 and 3 -- real heap dumps and complete triage
+
+- dump_all snapshots real objects and value stores, emits actual handles,
+  class/reference edges and allocation generation filters, and returns the
+  requested stream/string/file. dump includes observed object_id in flags,
+  File's type and String encoding information. It omits the inherited guessed
+  memsize field. Witness 670 checks real membership, references and provenance.
+- A snapshot can otherwise retain many expired runtime temporaries. When GC
+  is enabled it collects before the public value-store snapshot; GC.disable
+  and count_objects allocation comparisons retain their existing behavior.
+- All 159 baseline RED are listed in unittest/gc_cases.tsv: 14 honest MATCH,
+  55 reasoned exclusions, 90 reasoned handoffs. All 76 allocation tests remain
+  enabled and RED locally. VM handoffs cover call-path allocation/provenance,
+  actual literal pools, Float identity and Symbol lifetime; native handoffs
+  cover -test-/stack, TypedData owners, allocator attribution and stack roots.
+- Raw standalone results: objspace MATCH 28 -> 38, GC 29 -> 32, string_memory
+  0 -> 2; objspace/ractor stays 3. The 15 raw gains include memsize_of_all,
+  which still sums pre-existing guessed sizes and remains a handoff, not an
+  accepted honest implementation match. The exclusion count remains 55 on
+  both interpreters. Missing local -test-/stack remains BOTH, not a pass.
+- The RSS gate caught a real regression: cause recording reused oncall and
+  suppressed native arena compaction during explicit off-stack GC. A separate
+  explicit cause flag restores the original collection behavior; the
+  discarded-class-ivar ratio returns from 2.25x to baseline 1.06x. No resource
+  limit was changed. The collector's gc_fixpoint/gc_mark_roots/gc_collect and
+  m_state.mere remain untouched.
+- Main advanced through PR #88 to 535ad955 during this work. It was merged
+  into this branch; only the appended LOOP.md sections conflicted, and both
+  were retained. Final verification uses that main plus the GC changes.
+- Validation: runner 20, CI collector 47 (five existing optional real-reference
+  fixtures skipped locally), exclusion accounting's identical/asymmetric
+  fixtures, transcript 17; new witnesses agree with Ruby. Full corpus, final
+  source gates, RSS and whole-suite CI are recorded in the PR as they finish.
+
+Final review corrected that raw classification: test_start_full_mark and
+test_latest_gc_info_need_major_by return before assertions without USE_RGENGC.
+They are default-generational-GC tests, not honest implementation matches;
+both are now explicitly excluded on both interpreters. The final inventory
+is 12 honest MATCH, 57 reasoned exclusions, 90 handoffs (159 total). Raw MATCH
+gain is 13, including the unaccepted inherited memsize_of_all estimate.
+The GC file's expected local counts are MATCH 30 and exclusions 19; other
+target files are unchanged. Of MMTk's 38 exclusions, 22 now apply here.
+
 ## 2026-11-15 (58): Ruby's C API on CRuby's own headers -- `test/-ext-` runs against ruby's unchanged test extensions
 
 Stage 7′ / 8, second unit (note 550 §3, note 553). The prototype taken in at
@@ -5210,6 +5289,245 @@ different.
   is Ruby running on mere-ruby, about 3 ms a line; and the VM's loop is
   1.7 - 2.6 times the evaluator's time (note 552). Next: the smaller
   fallbacks, then the compiler made native, then speed.
+
+## 2026-11-16: stage 9, round 4 -- count the actual live String store
+
+While PR #91 waits for CI, an independent probe found that count_objects
+omitted T_STRING although each_object(String) now visits the actual store.
+The store count is the last sweep's survivor count plus handles issued since
+its sweep boundary. Empty strings count, reclaimed slots do not, and TOTAL
+includes the same live Strings. No collector function or m_state.mere changed.
+
+Witness 674 checks empty/live/reclaimed Strings, hash reuse, zeroed old keys
+and the total's arithmetic. It fails on PR #91's old binary (missing T_STRING)
+and agrees with Ruby after this fix. Core test_objectspace remains 37/37;
+objspace stays MATCH 38 and string_memory stays MATCH 2. The original 159-case
+classification is unchanged; this is an additional real API correction.
+### PR #91 review: GC::Profiler keeps the runtime CPU epoch
+
+P2 found that GC_INVOKE_TIME began at Profiler.enable instead of runtime
+startup. The existing gc_state initializer now captures the process CPU clock
+once, before Ruby execution; enable/disable/clear preserve it. GC_TIME uses
+that same process CPU clock, so sleeps and scheduling waits are not charged
+as collection CPU. tools/process_glue.c adds mr_gc_process_cpu_time using
+CLOCK_PROCESS_CPUTIME_ID with the standard C clock fallback; it is a new
+function, separate from the stat/utime functions in the concurrent C API work.
+No top-level value or collector-body change is introduced.
+
+Witness 673 spends CPU before enabling, checks clear and re-enable, and checks
+that sleep does not advance the CPU timeline as wall time would. Ruby passes;
+the old build fails at the delayed-enable assertion; the corrected build
+passes. The C clock glue also passes strict compiler warnings.
+
+### PR #91 platform review: the browser CPU clock ABI and Linux witness
+
+The browser host now supplies mr_gc_process_cpu_time as a pointer to a boxed
+negative Float, matching the Wasm backend's custom-extern ABI. Returning a raw
+negative number would instantiate but trap during collector initialization.
+The host import check validates the box; the browser build also executes the
+full interpreter and checks that Profiler.enable raises NotImplementedError.
+A fresh emitted module starts normally and reports the unavailable CPU clock.
+
+Witness 673 now reads Process.clock_gettime(CLOCK_PROCESS_CPUTIME_ID), using
+the same native process clock as the profiler. It no longer depends on the
+platform-specific ps output behind the existing Process.times implementation.
+The unchanged witness and measurement witness 669 pass on Darwin and Linux.
+The native process-clock unit selection preserves the existing conversion
+checks; all 19 upstream clock tests pass locally.
+
+dump_all hoists its main-ractor check and reuses the shareability result
+already needed by non-main ractors. This removes repeated interpreter calls
+without changing its object selection or the subprocess timeout. The ractor
+dump witness passes in 6.76 seconds under the unchanged ten-second bound.
+
+### PR #91 CI follow-up: enumeration preserves the current retained set
+
+The OpenSSL lifetime gate exposed an extra collection in the new iterator:
+it changed the native retained set after the caller had measured it following
+GC.start. each_object now snapshots the current stores without forcing GC.
+Witness 669 reproduces the extra collection on the previous build and agrees
+with Ruby after the correction. The existing OpenSSL memory gate passes,
+including 20/200 owner counts, interrupted allocation and worker lifetimes.
+All six affected GC/ObjectSpace files preserve their local counts: MATCH 110,
+RED 11, BOTH 5, EXTRA 5, plus 57 separately audited exclusions. Allocation
+comparisons remain enabled; no collector body, timeout or memory limit changed.
+
+The latest successful main run is now 43869939788 at 535ad955. Its target
+RED counts are unchanged: 76 allocation, 35 objspace including ractor, 23 GC,
+22 compaction and 3 string-memory. The 159-case inventory remains applicable.
+
+Dump string escaping now scans bytes into a Mere buffer, copying plain runs
+and using the existing JSON byte-escape helper for control characters. It
+preserves quotes, backslashes, all controls and DEL without a Ruby call for
+every character. Witness 670 round-trips a long ASCII string and those bytes;
+the unchanged ractor dump test still passes its ten-second limit. No new
+top-level value or JSON engine changes are introduced.
+
+## 2026-11-17: stage 9, round 5 -- enumerate Proc and Binding stores
+
+each_object now snapshots actual Proc and Binding handles from proc_store
+and bind_store, applying the existing class filter and preserving identity.
+count_objects includes those live store lengths in T_DATA and TOTAL. This
+does not invent native TypedData owner counts or allocator byte sizes.
+Witness 680 checks held values, unique identities, Enumerator behavior,
+returned counts and survival after collection. Witness 674 covers String
+counts, including empty and reclaimed values. The 159-case classification
+remains 12 accepted matches, 57 reasoned exclusions and 90 handoffs.
+
+The inherited Ruby memsize_of_all loop now visits Proc/Binding too, producing
+temporary Strings that enter the next String-only measurement. Its a > b
+assertion fails (1081807 versus 1844111 in the isolated reproduction). This
+is the already-recorded native allocator handoff; its guessed byte counts
+are not adjusted to retain a raw pass. It remains enabled and visible.
+
+The latest main baseline is successful CI 43869939788, main 535ad955. Its
+target 159 RED are unchanged from the original inventory. Both hash modes
+pass 696/696 corpus comparisons before the final dump escaping optimization;
+all nine RSS cases pass, with discarded-class-ivar at 1.07x. The final
+ObjectSpace file and dump witnesses are rechecked after that optimization.
+No collector body, m_state, VM, AST, C API or gemtest change is introduced.
+
+The pre-publication origin check found witness 675 newly used by the VM
+branch. This branch's Proc/Binding witness moved to the first free number,
+680, leaving the concurrent branch unchanged.
+
+Final ObjectSpace remeasurement: 46 tests, MATCH 37, RED 9, with 16 audited
+exclusions. The ractor dump passes again; the remaining raw loss from #91 is
+the unaccepted memsize_of_all estimate described above. Combining that final
+file with the unchanged six-file measurement gives 207 tests: MATCH 109,
+RED 88, BOTH 5, EXTRA 5, plus 57 separately reported exclusions. Against the
+latest main the target raw gain is now 12, all accepted implementation
+matches. Both final store witnesses and the extended dump witness pass.
+
+## 2026-11-17: stage 9, round 6 -- inverse identities and integer conversion
+
+While #91 and #94 wait for CI, a separate worktree reproduces two ObjectSpace
+gaps: _id2ref rejects to_int arguments and cannot recover retained Proc or
+Binding handles. It now converts once, including private and conventional
+respond_to_missing? conversions, rejects non-Integer results with TypeError,
+and reads the actual Proc/Binding tables for those identity tags. The
+collector and the shared conversion helpers remain unchanged.
+
+Witness 681 round-trips held objects and stores, checks conversion calls,
+private/dynamic conversion, one-argument respond_to? overrides, invalid
+return types, Float conversion and preservation after collection. Ruby
+passes; the previous interpreter fails at the first to_int argument.
+
+## 2026-11-17: stage 9, round 7 -- reject swept String identities
+
+_id2ref's String path used the issued-handle boundary alone, so an old ID
+could recover a swept slot as an empty String. __str_of_id now checks the
+existing gc_str_present predicate. This reads actual survivors and fresh
+handles without changing the collector, its roots or its sweep behavior.
+
+Witness 682 releases dynamic Strings, collects and requires rejection of
+collected IDs, while retained empty/nonempty Strings and a fresh empty String
+still round-trip. The reference rejects collected IDs; the old interpreter
+rejects none. No default-collector exclusion or allocation comparison changes.
+
+### PR #91 CI comparison: snapshot iteration without temporary Ruby Arrays
+
+The full 758-file report at 47c833e7 has three lower MATCH counts than main
+535ad955, all at the unchanged ten-second bound. Paired local runs of the
+actual CI binaries pass the Class and Zlib leak tests on both builds. The
+Enumerable reverse_each case reproduces the regression: main 2.58 seconds,
+PR 10.10 seconds and Timeout. It must not be dismissed as timing noise.
+
+The ObjectSpace snapshot now filters class candidates internally and avoids
+walking unrelated stores for exact builtin value-class filters. each_object
+yields from the native snapshot without creating Ruby snapshot Arrays that
+would enter later iterations. Actual candidate values are temporarily rooted
+in the existing Ruby method frame, with cleanup on normal and exceptional
+exits. Snapshot storage and each callback turn have scoped Mere lifetimes.
+The existing builtin-frame wrapper gives callbacks a native iterator boundary
+so statement watermarks do not retain every earlier callback's temporaries.
+No collector/root-table definition, shared block helper or limit is changed.
+
+Witness 683 covers class/module/subclass filtering, held objects across GC,
+nested enumeration, exceptions, break/nonlocal return, lambda/orphan break
+and Fiber suspension across collection. It agrees with Ruby. The scoped
+native-yield candidate passes the original Enumerable case in 7.07 seconds
+and the existing RSS harness's 3000-iteration probe at 1.07x. The complete
+corpus and the integration with newly merged main are checked separately.
+
+### Latest main integration and public native iteration
+
+Main 96075af9, successful CI 43933582689, supersedes the earlier baseline.
+Its native extension integration passes the two finalizer stack-overflow
+cases, leaving 157 target RED: 12 accepted implementation matches, 57
+reasoned exclusions and 88 named handoffs. The original 159-row inventory
+retains those two main fixes without claiming them as stage 9 gains.
+WeakMap still retains 50 keys against a bound of 10; moving the statistics
+sampler did not improve that count, so that experiment was discarded.
+
+The public each_object native arm accepts the original block directly,
+avoiding conversion through an extra Ruby Proc wrapper. It preserves
+blockless enumeration, argument validation, user overrides and Proc break
+semantics. The unchanged Enumerable test passes in 6.38 seconds. On the
+actual latest-main CI binary, the million-finalizer test takes 25.84 seconds;
+this candidate takes 26.97 seconds, both within its unchanged sixty seconds.
+The complete seven-file comparison is MATCH 198, RED 12, BOTH 6, EXTRA 5,
+with 57 exclusions reported separately: objspace 37, ractor 3, Enumerable
+89, GC 30, compaction 0, core ObjectSpace 37, string memory 2 MATCH.
+The local missing native stack extension remains BOTH. The native iteration
+RSS probe is 1.07x; roots/dead/duplicate checks pass and bracket depth is
+892/1024. Full CI against the new main is still required before merge.
+
+The integrated candidate passes 695/695 corpus programs with hash indexing
+ON and OFF, the original nine RSS cases (class ivar 1.05x), and the complete
+OpenSSL owner/lifetime gate. Linux CI then failed the unchanged Float#step
+bit comparison: the baseline used Ubuntu 24.04, while ubuntu-latest had
+moved to 26.04 with Clang 21. The native build job is pinned to Ubuntu 24.04
+to preserve that baseline environment; its 90-minute limit and all test
+time/memory bounds remain unchanged. The platform explanation is checked by
+the next CI run, rather than changing Float arithmetic during GC work.
+
+The final identity branch also integrates this main and the native iterator
+correction. All 699 corpus programs agree in both hash-index modes. Its
+seven-file comparison completes with MATCH 198, RED 12, BOTH 6, EXTRA 5 and
+57 symmetric exclusions; Enumerable is 89 MATCH and core ObjectSpace 37/37.
+All nine RSS cases (class ivar 1.05x), the complete OpenSSL lifetime gate,
+root/dead/duplicate-definition checks and bracket depth 892/1024 pass.
+Rounds 6 and 7 are PR #98, stacked on #94; none of the three PRs is merged
+while the latest-main full CI and per-file comparison are pending.
+
+### PR #98 review: conversion does not require argument reflection
+
+The review found that asking the argument for method(:respond_to?) rejects
+a valid to_int object that undefines or overrides Kernel#method. The native
+ObjectSpace __id_integer arm now reads existing method metadata and calls
+through the existing dispatcher. It preserves private and dynamic conversion,
+one-argument respond_to? overrides, refusal, errors and result type checks;
+it does not call the argument's method, class, is_a? or __send__ methods.
+
+The BasicObject control exposed another dependency: scanning snapshot
+candidates through their object_id failed just because a BasicObject was
+present. Ordinary object IDs now resolve from the real obj_cls store, and
+the fallback compares existing native identity metadata. Witness 681 adds
+the review's missing-method case, reflection traps, BasicObject and held
+Class identity. It passes on Ruby and the O2 candidate; the prior binary
+fails the new missing-method case. Sixteen conversion controls have identical
+reference/candidate output. Witnesses 682/683 and root/dead/duplicate gates
+also pass; bracket depth remains 892/1024. The full comparison is rerun.
+
+### PR #98 follow-up: checked method_missing conversion
+
+A further review found that a custom method_missing can supply to_int
+without advertising it through respond_to_missing?. The ObjectSpace native
+conversion arm now distinguishes an explicit query refusal from the absence
+of an advertised method. It tries custom missing-method dispatch, preserves
+explicit refusals and promised-method exceptions, and treats an unadvertised
+NoMethodError as a declined conversion. A tagged result distinguishes a
+successful nil return from a missing method. The caller's exception context
+is restored before reporting refusal. Query arity errors match Ruby's
+checked-call entry. No shared conversion helper or VM function is changed.
+
+Witness 681 covers Object/BasicObject proxies without an advertisement,
+refusal, nil results, query arity and collection inside conversion. It agrees
+with Ruby and fails on the prior binary. Existing witnesses 682/683 and 30
+comparison outputs (16 prior conversions, 12 new conversions and two exception
+context checks) agree too. Roots/dead/duplicate checks and depth 892/1024 pass.
+The complete upstream comparison and both corpus modes are rerun.
 
 ## 2026-11-16 (65): five real pure Ruby gems run their own upstream test files
 
@@ -5778,6 +6096,26 @@ assertion and every Proc pays. corpus 680.
   MERE_RUBY_ATTR_IC_CHECK and MERE_RUBY_IVAR_INDEX_CHECK on; test_ast's
   individual tests 114 as the reference; the gates.
 
+### Integrate the AST main and keep corpus numbers unique
+
+Main 392bf810 integrates #86. Its main CI 44030304378 is still pending;
+successful PR CI 43985122856 tested source 0031da3a, whose tree is identical
+to this main, and retains the same 157 target RED. This supplements the last
+successful main baseline 96075af9 rather than claiming a completed main run.
+The AST and VM changes are imported unchanged; there are no independent
+edits to m_state or the AST/Prism implementation. Corpus namespace auditing
+found overlapping publication numbers. This branch moves its native
+ObjectSpace snapshot witness from 683 to 685, retaining the upstream cases.
+
+The follow-up store witness moves from its original publication number 680
+to 686. The upstream AST/Proc witness at 680 is retained unchanged. Earlier
+progress entries use their publication numbers; this records the mapping.
+
+The identity witnesses similarly move from 681/682 to 687/688 after the
+remote namespace audit. The earlier conversion-review entries retain their
+publication numbers. Only this session's witnesses are renamed; main's and
+the concurrent branches' cases are retained. This integrated branch has
+703 corpus programs, including the four cases newly imported from main.
 ## 2026-11-16 (61): round 39 -- what test_iseq and test_optimization still asked
 
 **The point.** `ruby/test_iseq.rb` goes from 42 of 70 to 62 of 68 (the two
@@ -6360,6 +6698,74 @@ test_regexp, test_enumerator, test_fiber, test_hash the same counts;
 test_array MATCH 473 on both (one test that fails on the reference too
 moves between RED and BOTH from run to run, on either build).
 
+## 2026-11-18: stage 9, complete CI comparison and remaining bounds
+
+Main CI 44030304378 completed at 392bf810: 33,277 MATCH, 1,137 RED,
+134 BOTH, 21 EXTRA, 49 incomplete files. Its GC intake remains 157 RED:
+12 honest implementation matches, 57 audited exclusions and 88 named
+handoffs. The original 159-row inventory separately identifies main's two
+finalizer fixes. Main later advanced through #89 and #101 to 3eb24fef;
+those changes are imported unchanged into this branch and its follow-ups.
+
+All three main-392 PR workflows completed green, but the per-file gate is
+not met. #91 (44043415539) has ObjectSpace memory stops and Enumerable
+89 -> 88 MATCH; #94 (44043433986) has Enumerable and several timing
+differences; #98 (44043456672) also has a core ObjectSpace memory stop.
+Duplicate summary artifacts in #91's rerun include a partial seven-shard
+report; the final eight-shard artifact is the comparison source.
+
+Native ObjectSpace snapshots now use scoped vectors instead of indexed
+maps, reuse their pin keys, and skip class metadata for exact builtin value
+filters. The ordinary-object scan, actual candidates, temporary frame roots,
+GC/Fiber behavior and callback helper are preserved. These small changes
+do not fix the unchanged ten-second Enumerable subprocess: about 6,800
+Arrays in its runner environment mean millions of real callbacks. A
+100-turn diagnostic takes 0.73 CPU seconds with an empty callback and 1.89
+with the original body. No arrays are hidden or additional GC forced.
+The VM callback-throughput handoff and this merge blocker remain explicit.
+
+On the #89 integration, seven of eight bounded files complete: 225 MATCH,
+15 RED, 6 BOTH, 5 EXTRA, with 57 identical exclusions reported separately.
+Core ObjectSpace reaches 2,123,504 KiB during its million-finalizer child.
+Paired isolated runs of the actual main e40 CI binary and this candidate
+both pass, with peaks of 1,900,768 and 2,009,040 KiB. Those isolated passes
+do not clear the whole-file memory stop. The nine RSS cases and OpenSSL
+lifetimes pass on this integration; no resource bounds are changed.
+
+The main-392 candidate previously passed all 703 corpus programs in both
+hash-index modes. The #101 integration passes all 710 corpus programs in
+both hash-index modes, nine RSS cases and the OpenSSL lifetime gate.
+Root/dead/duplicate checks pass; bracket depth is 932/1024. The seven
+completed bounded files retain 225 MATCH, 15 RED, 6 BOTH, 5 EXTRA and 57
+symmetric exclusions. Core ObjectSpace still reaches the unchanged bound
+at 2,102,256 KiB.
+Both _id2ref review findings are fixed and resolved on #98. All three PRs
+remain unmerged until current CI and the per-file comparison satisfy the
+stated gate. The next independent work outside stage 9 is VM callback cost,
+conservative frame lifetime and native allocator attribution, with concrete
+test names retained in gc_cases.tsv and KNOWN_GAPS.md.
+
+### Follow-up review: receiver-side undef in checked ID conversion
+
+The next #98 review found that owner metadata alone could see an inherited
+to_int, respond_to_missing? or method_missing past a child's undef marker.
+ObjectSpace.__id_integer now checks undef_blocked from the receiver's full
+lookup start (super_base) before using owner metadata. The same check guards
+the real-method probe and custom respond_to? arity; shared lookup/dispatch
+helpers are unchanged. Corpus 687 covers inherited conversion/hook/query
+undefs, a definition restored below an undef, and class singleton lookup.
+
+Ruby passes the expanded witness; the previous candidate fails its inherited
+undef assertion. The fixed O2 candidate passes witnesses 685–688, all 30
+earlier conversion/exception-context outputs, and the upstream id2ref group
+(25 tests, 54 assertions, no failures, errors or skips). Root/dead/duplicate
+checks pass and bracket depth remains 932/1024. The independent Enumerable
+P2 and whole-file finalizer memory bound remain open; no new exclusion or
+resource-limit change is made.
+
+The final review-fix build also passes 710/710 corpus programs in both
+hash-index modes, all nine RSS cases and the OpenSSL lifetime gate.
+
 ## 2026-11-18: gem source provenance is checked before accepting MATCH
 
 The initial gem harness exposed a provenance gap during the next candidates'
@@ -6458,6 +6864,294 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+## 2026-11-18: stage 9 follow-up, collectible snapshots and native dump facts
+
+Main 12ca1df2 (#102) is imported unchanged. The complete main CI for
+3eb24fef (44196635193) measures 33,313 MATCH, 1,101 RED, 132 BOTH, 21 EXTRA,
+49 incomplete/zero-test files and the same 157 target RED. The 12/57/88
+inventory is unchanged. The older #94 CI now has all eight shards: 33,322
+MATCH, 1,034 RED, 131 BOTH, 23 EXTRA, 49 incomplete files and 57 exclusions.
+Its Ractor dump failure is a real Module wrapper error, not timing noise.
+
+ObjectSpace's public snapshot kept every candidate rooted through callbacks,
+unlike MMTk's each_object, which rechecks actual presence. It now roots only
+the current value in the existing frame and skips candidates collected by
+an earlier callback. A control creates 1,001 instances and collects inside
+the first callback: the old build keeps all 1,001, Ruby keeps three, and the
+new conservative collector keeps about 120. Held values and callback counts
+remain correct. No additional collection, root definition or threshold is
+introduced. Corpus 685 adds this differential regression.
+
+Exact builtin filters avoid dispatch-class/ancestry lookup for a value whose
+store already proves its base type. Other filters read the full hng_store
+singleton tag. dispatch_cls_of deliberately strips singleton tags, so using
+it had omitted extended Array/Hash values from module and subclass filters.
+The expanded 685 reproduces this omission on the old build and covers named
+subclasses and singleton-tagged ancestry as well as the existing GC/Fiber
+and block-control cases.
+
+ObjectSpace.__dump_one also called singleton_class? on Module-subclass
+wrappers and superclass on uninitialized Classes. Native __dump_class_info
+reads the actual superclass table and singleton representation. Corpus 670
+now covers both forms, with no guessed fields. The upstream Ractor dump
+and singleton dump pass: two tests, nine assertions, no skips; the Ractor
+case takes 7.33 seconds under its unchanged bound.
+
+The ten-second Enumerable test still times out. A diagnostic of its exact
+child program, with the runner's loaded libraries and without adding code
+to that program, takes 17.67 seconds on the current-value-root candidate.
+That diagnostic is not an upstream pass. Sampling shows shared block frames,
+local lookup, hashing and primitive dispatch on the path; those helpers are
+unchanged. Full validation of the final combined candidate follows before
+publication. No ISeq/AST/m_state/collector-body or gemtest edits are added.
+
+The first combined full validation caught a class-presence regression:
+an implicit superclass row had been mistaken for a collected class.
+Class candidates now capture their collectible identity owner before the
+callbacks and consult that registry after collection. Named classes remain
+valid without explicit superclass rows. Existing corpus 226, expanded 685
+and test_each_object_singleton_class pass. Dump metadata follows the native
+implicit superclass rules too, including Object/BasicObject and Enumerator's
+builtin subclasses; expanded 670 compares their actual address edges.
+
+The intermediate bounded run completed all eight files, with core
+ObjectSpace at 1,886,512 KiB, below the unchanged 2-GiB bound. It still had
+the class-presence assertion above, so it is not the final pass. ObjectSpace
+itself completed at 533,136 KiB with 38 MATCH and eight RED; memsize_of_all's
+raw pass still uses inherited estimates and is not an honest implementation
+gain. Allocation-path tests now reach their actual frozen-literal provenance
+failures instead of the Module reflection error and remain named handoffs.
+
+Final validation on the combined #102 candidate completes all eight files:
+288 tests, 263 MATCH, 14 RED, six BOTH and five EXTRA, with 57 identical
+exclusions separately audited (16 + 19 + 22). Core ObjectSpace is 37/37 at
+1,876,592 KiB and objspace is 38 MATCH/eight RED at 571,136 KiB. No file in
+this bounded local subset reaches the 2-GiB limit. Nine RSS cases and the
+OpenSSL interruption/stress/native-owner/thread lifetime gates pass; source
+checks pass and bracket depth is 933/1024. The remaining Enumerable test
+still reaches its ten-second limit and is not excluded.
+
+Local corpus commands in earlier progress entries omitted --both; their
+ordinary-mode results were incorrectly described as local checks of both
+hash modes. Those local mode claims are corrected here. CI's explicit
+--both jobs are separate evidence. The final candidate has now completed
+the explicit command `sh run_corpus.sh --both`: 711/711 programs agree with
+Ruby with indexing ON and OFF. Corpus 670 compares direct class edges;
+Object's inserted Kernel ICLASS is not a portable superclass-address test.
+
+A VM handoff can reproduce the callback cost without ObjectSpace at all:
+keep 6,800 empty Arrays, and repeat 1,000 times an Array#each block containing
+`array.clear if array.length == 1000`. The actual main 3eb24fef CI interpreter
+takes 14.22 wall seconds (12.88 user + 0.21 system CPU seconds). This is
+independent shared-call workload evidence, not a replacement for the failing
+upstream test. Shared block/frame/lookup/dispatch functions remain untouched.
+
+The final remote namespace audit found a concurrent gem witness at 685.
+This session's snapshot witness moves from 685 to the verified free 710;
+earlier entries retain their publication numbers. Its contents are unchanged
+and its renamed path is checked against Ruby with indexing ON and OFF.
+
+
+The primitive singleton-undef correction reviewed in #109 is also applied
+to this stacked ID branch. Only ObjectSpace.__id_integer changes: it reads
+the actual hng_store tag for availability and native error class names,
+re-reading after callbacks. Corpus 687 retains six String/Array/Hash controls
+for preexisting and query-created undefs. Shared lookup/VM helpers are
+unchanged. The independent extraction and this port are the same fix, not
+two additional matches in the original intake.
+
+
+## 2026-11-18: stage 9, ship checked ID lookup independently
+
+The GC/ObjectSpace stack has an open Enumerable timeout finding. Its checked
+ID lookup can be reviewed independently against main 12ca1df2: this change
+ports ObjectSpace.__id_integer, live __val_of_id/__str_of_id lookup and the
+_id2ref prelude only. A small __id_value arm reads native identity for the
+fallback search, avoiding a dependency on the stack's heap dump metadata.
+Corpora 687/688 are copied unchanged from the reviewed stack, including all
+four conversion review controls. No additional corpus number is consumed.
+
+The base __objects/each_object and count_objects implementations are kept.
+There are no new exclusions, top-level values, collector-body changes or
+independent edits to shared VM/dispatch helpers, m_state, Prism, C API or
+gemtest. The full 157-test intake remains 12 honest implementation matches,
+57 reasoned exclusions and 88 named handoffs in the parent inventory. This
+port does not count the same fixes a second time.
+
+O2 verification of the independent port retains core ObjectSpace 37 MATCH,
+Enumerable 89 MATCH and Object 65 MATCH under the unchanged CI supervisor.
+The 10-second Enumerable subprocess remains enabled. All nine RSS cases pass;
+actual bracket depth is 933/1024, so the stale 923 search seed is corrected
+to that measured value. No top-level definition is added.
+
+
+The second independent round ports ObjectSpace.__store_counts and the
+count_objects prelude from #94. Actual String survivors/new handles and
+Proc/Binding store lengths contribute to T_STRING, T_DATA and TOTAL. Corpus
+674 retains 1,000 ordinary Strings, 1,000 empty Strings and 200 Procs plus
+200 Bindings, checking real count deltas, totals and held identities. The
+base enumeration implementation is unchanged; no exclusion or limit changes.
+
+
+The third independent round addresses the primitive singleton-undef review.
+ObjectSpace.__id_integer now reads a primitive's full hng_store lookup tag
+for availability and native error class names, re-reading after callbacks.
+The shared super_base/dispatch helpers are unchanged. Corpus 687 adds named
+String/Array/Hash subclasses with preexisting singleton undefs and undefs
+created by respond_to? callbacks. All six controls require the reference's
+TypeError and concrete subclass name. The previous build raises NoMethodError
+or accepts conversion instead.
+
+
+## 2026-11-18: stage 9, ship GC measurements independently
+
+Extract the GC-specific part of #91 against main 12ca1df2, preserving the
+base ObjectSpace enumeration and VM/AST/C API code. gc_collect_any wraps
+actual collections with CPU profiling and weak-map observations; its
+ObjectSpace observation cleanup is left with #91. No collector marking or
+sweeping function is independently changed. Startup CPU epoch and portable
+CPU-clock/browser bindings retain the three addressed review corrections.
+
+GC APIs expose real observations and unsupported compaction consistently.
+The upstream exclusion mechanism and symmetric audit/reporting cover only
+19 GC and 22 compaction cases in this branch; ObjectSpace's 16 exclusions
+stay with #91. Corpus 711 tests GC measurements/capabilities; existing 673
+checks delayed enablement, clear/re-enable and CPU-versus-sleep accounting.
+No new top-level value or resource-limit changes.
+
+Fresh Wasm emission also exposed an existing missing mr_utimens/mr_stat_times host imports.
+The HTML host now returns its guest wrapper's declared -2/empty-string unavailable
+sentinels, preserving startup without claiming timestamp support. The native
+File/C API implementation is unchanged.
+
+
+## 2026-11-18: consolidate the deferred GC/ObjectSpace stack
+
+Integrate the count/ID stack and the independently validated #109/#112
+changes into this remaining branch. Keep the full ObjectSpace snapshot and
+its collectible-owner checks, all ID protocol controls, real store counts,
+the ObjectSpace observation cleanup at collection, and both browser host
+fixes. The integrated ledger remains 57 (41 GC plus 16 ObjectSpace). The
+independent main-targeted PRs stay open; this is branch integration, not a
+main merge. The Enumerable P2 is still open and is not claimed as fixed.
+
+The integrated O2 candidate passes explicit corpus --both 712/712, all nine
+RSS cases and bracket depth 933/1024. All eight bounded files complete:
+263 MATCH, 14 RED, 6 BOTH, 5 EXTRA, plus 57 symmetric exclusions. Core
+ObjectSpace is 37/37 at 1,830,016 KiB; Enumerable remains 88 rather than
+main's 89. Issue #113 records the shared callback handoff: even the native
+1,000-turn diagnostic takes 13.710 CPU seconds without the Ruby wrapper.
+That diagnostic is not a passing upstream test or a changed time limit.
+The earlier stacked count/ID work is consolidated here, while #109/#112
+remain independent main-targeted deliveries. No main merge is implied.
+
+
+## Stage 9 merge audit after the complete CI run (2026-11-19)
+
+PR #91's prior complete CI 44316999605 attempt 2 is green, but comparison
+with complete main CI 44239745755 attempt 3 covers all 758 files and finds
+three lower MATCH rows: Enumerable 89 to 88, Optimization 88 to 87, zlib
+96 to 95. None is an exclusion; the 57 actual symmetric exclusions remain
+separately reported. A green measurement job does not waive these rows.
+
+Merge current main 3b05689f, keeping its compiler 01f5ad73 and bracket seed
+155. The only conflict was that seed; the actual 1024 limit and verification
+remain unchanged. Fresh independent O2 builds of main and the integrated
+GC source f6ed1792 reproduce the original cases sequentially after builds:
+
+- Enumerable: reference 0.22 s, main 1.73 s, both PASS/three assertions;
+  GC candidate reaches the original ten-second Timeout, two assertions.
+  The outer measurement is 12.357 s / 239,840 KiB without a resource event.
+  Issue #113 and its P2 remain open; do not hide real Arrays or change bounds.
+- Optimization: the unused named block parameter produces a real extra Proc
+  (T_DATA delta 1 versus reference 0). No-call/unused/used controls give
+  reference 0/0/1, main 0/0/0, candidate 0/1/1. Main's used control reveals
+  its incomplete counter. The true counts stay; issue #130 hands actual
+  lazy block-parameter materialization to the VM/evaluator work. The same
+  count path is relevant to #109. This test stays enabled, without a new
+  exclusion or fabricated zero. unittest/block_parameter_probe.rb preserves
+  the three controls in fresh processes.
+- The original zlib gunzip memory-leak case passes on all three current
+  builds: reference 1.125 s, main 6.515 s, candidate 6.551 s outer execution.
+  This selected result does not replace the required complete file/CI row.
+
+The original three files were also rerun under their normal supervisor;
+their exact current totals are recorded below. The two genuine blockers
+above are outside the original 159-row intake: that inventory remains
+two main fixes, 12 honest implementation matches, 57 exclusions and 88
+named handoffs. No collector, VM/ISeq, m_state, AST, C API, test or limit is
+changed by this audit beyond importing the already merged compiler update.
+The PR is not mergeable until these blockers and current hosted gates pass.
+
+```text
+ruby/test_enum.rb                                  90 tests  MATCH   88  RED    1  BOTH   1  EXTRA   0
+ruby/test_optimization.rb                          89 tests  MATCH   87  RED    2  BOTH   0  EXTRA   0
+zlib/test_zlib.rb                                  96 tests  MATCH   96  RED    0  BOTH   0  EXTRA   0
+total: 275 tests, MATCH 271, RED 3, BOTH 1, EXTRA 0
+```
+
+
+## 2026-11-19: restore the strict GC merge-gate cases
+
+The unchanged Optimization allocation case now passes with four assertions.
+An empty method whose sole formal is its named block parameter, with no
+defaults or observer/scheduler, avoids creating an unread Proc. Positional
+formals retain the full binder: destructuring can execute to_ary and enable
+TracePoint during binding, exposing the block through call/return Bindings. TracePoint, set_trace_func, defaults, threads/fibers, signals and
+finalizers retain the full binder. Local-declaration markers are metadata,
+not reads of the block. Real none/unused/used T_DATA deltas remain 0/0/1;
+the used Proc is still present in ObjectSpace.
+
+The unchanged Enumerable case now completes in 7.919 seconds with all three
+assertions under its original ten-second child bound. Native Array length,
+size and empty? reads avoid general dispatch only after proving the actual
+plain Array entry, its visibility and absence of observers, overrides,
+aliases, undef, prepends and refinements. A block with one ordinary positional
+formal and one value binds that same value directly, after consuming the
+source-Proc state; the surrounding frame, GC roots and flow handling stay.
+No objects are filtered out of enumeration and no collection is forced.
+
+The complete Enumerable file improves from 88 MATCH / 1 RED / 1 BOTH to
+89 MATCH / 0 RED / 1 BOTH across 90 cases, without losing any previously
+passing case. The original Module contract completes all 195 tests / 1,240
+assertions with zero failures/errors/skips (22.935 seconds / 359,296 KiB
+outer peak, unchanged 600-second / 2-GiB bounds). This local pass does not
+erase the earlier Linux clone RSS failure; the new hosted job must pass it.
+
+Corpus 725/726/727 cover actual Proc counts and binding observation, native
+Array read dispatch, and one-value block identity/arity/defaults/closures/
+bindings/keywords/flow. All three match Ruby with the hash index enabled or
+disabled and with MRO caching disabled. Existing native Array singleton-undef
+and private-call gaps produce identical failures on the preceding binary;
+their separate diagnostics are retained, no new exclusion is added, and the
+corresponding existing tests remain enabled. The native-undef gem work owns
+that independent behavior; it is not claimed fixed by this read path.
+
+Touched runtime functions: call_method, run_meth_result and bind_block_params,
+plus emethod_args; new and-helpers bind_params_body, empty_block_binding_body
+and native_array_query. The concurrently changed bind_params implementation
+is left alone. No m_state, VM/ISeq, AST/Prism, C API, API inventory, collector
+mark/sweep body or resource limit changes. The original 159-row intake and
+its 12 honest matches, 57 symmetric exclusions and 88 handoffs (plus two main
+fixes) retain their denominator. These extra merge-gate repairs are separate.
+
+The paired comparison covers 12 complete files / 1,390 cases on checkpoint
+b54452d8: MATCH 1,297 to 1,299, RED 90 to 88, BOTH 3 unchanged, no previously
+passing case lost in any file. This includes Array, Proc, Iterator, Method,
+Super, Refinement, Eval, Settracefunc and all 76 allocation comparisons;
+those allocation cases remain enabled and retain their 76 existing REDs.
+
+The final observer guard narrows the optimization to a sole named block
+formal. Its O2 binary passes the actual original allocation test (four
+assertions) and enumeration test (7.768 seconds, three assertions), the
+to_ary-activated observer control, all 715 corpus programs in both hash-index
+modes, all nine RSS controls and bracket depth 155/1024. The complete Module
+contract is repeated on this final runtime: 195 tests / 1,240 assertions,
+zero failures/errors/skips, outer 23.441 seconds / 365,632 KiB. The
+12-file checkpoint observations are not relabeled as a final-runtime rerun.
+The updated hosted CI, Linux Module memory gate and all-file comparison
+against complete main remain required before merge. No bound is changed.
 
 
 ## PR 90 merge gate: preserve the Pathname core before physical extensions
@@ -6941,6 +7635,26 @@ moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
 
+### Stage 9 consolidation after main's VM update (2026-11-20)
+
+Merge main d9826ac9 into the existing consolidation branch. Only concurrent
+LOOP.md appendices conflict; retain both. The runtime/driver merge is automatic,
+with no manual VM, collector or state edits. Normal O2 with the pinned Mere
+01f5ad73 passes **718/718 corpus files**, hash index ON and OFF, the 12 observer
+witness/cache combinations, all nine original RSS checks, dead definitions and
+C nesting **155/1024**. No resource bound or original test was changed.
+
+The paired 10-file checkpoint against this main discovers **559 cases**:
+main446 MATCH/102 RED/7 BOTH/4 EXTRA, candidate459/89/6/5. No original PASS
+identity or file MATCH is lost. Module remains195 MATCH with all1,240 assertions;
+Enum89 and ObjectSpace37 are unchanged; GC29->30, string-memory0->2 and
+objspace28->38. All76 allocation comparisons remain enabled and RED for the
+existing VM handoff. The same57 excluded identities apply to both sides
+(GC19, compact22, objspace16); the per-file exclusion sidecars retain each
+reason. These local observations do not replace full hosted CI or its
+per-file comparison against a completed main run. Previous hosted RSS failures
+remain historical evidence, not waived gates for this new head.
+
 
 ### Pathname follow-up: retain an internal core identity and ordinary user files
 
@@ -7227,6 +7941,38 @@ limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
 
+### Stage 9: preserve native launchers and finish current-main integration
+
+Integrate main a206da11 after the native-extension runner change. The manual
+runner resolution retains the current mr_run child launcher and Perl entry,
+and UNITTEST_EXCLUSIONS still writes the separate per-file exclusion sidecar.
+Only appended documentation requires manual resolution in the final merge;
+no collector, state, VM or C API function is manually changed.
+
+Final O2 validation: 728/728 corpus programs match in both hash modes,
+514.759 seconds / 1,113,136 KiB under the unchanged 900-second / 2-GiB bound.
+All 88 focused comparisons on the default runtime, nine RSS workloads,
+roots, depth155 and dead definitions pass. An additional forced evaluator
+comparison differs on the existing unused-block and two lexical-namespace
+witnesses; it is retained separately and is not reported as passing.
+
+On the preceding native-main integration, the actual pinned CI reference
+runtime, source and test extensions give GC 32 MATCH / 1 RED / 2 BOTH over
+35 cases with the same19 exclusions on both sides. The original two mkmf
+cases give1 MATCH / 1 RED: ruby_init remains an unsupported link symbol.
+The first local reference setup lacked its Makefile and test stack extension;
+that incomplete setup is not accepted as a passing comparison. The complete
+context is measured separately. Existing57 exclusions remain explicit and
+unchanged (GC19, compact22, objspace16), and all76 allocation cases remain
+enabled for the VM handoff. Hosted every-file comparison still gates merge.
+
+Final current-main integration checkpoint: all 730 corpus programs match in
+both hash modes after the Digest/CI changes. All 56 focused comparisons,
+including the two new Digest witnesses, pass; nine RSS workloads, roots,
+depth 155 and dead definitions also pass. GC runtime functions, the 159-row
+classification ledger, 57 symmetric exclusions and all original bounds are
+unchanged. Current hosted checks and every-file nonregression still gate merge.
+
 ### Native extension child processes retain declared stdlib fallbacks
 
 The runtime-first native runners fixed parent mkmf loading, but RubyGems'
@@ -7395,6 +8141,31 @@ acceptance condition without claiming Rails application/framework success.
 Runtime functions changed: none; no lock, test, exclusion or bound changes.
 
 
+### Merge main while retaining the actual GC observations and exclusions
+
+Integrate main05c3bda3 and its released compiler408b03d9 after PR145,
+including the documentation-only Rails-install receipt from PR146.
+Preserve the already-published07d88806 unused-block correction unchanged;
+no VM function is manually edited. The sole implementation-related merge
+change is CI's MERE_REF. No GC API value, collector/state function, ledger,
+original test, accepted snapshot or resource bound is changed.
+
+New ordinary O2/compiler408b03d9 validation: **730/730 corpus**, hash
+index ON/OFF, **586.824s / 1,045,968KiB** peak family RSS.
+All56 focused comparisons, nine RSS gates, roots, dead definitions and C
+depth155/1024 pass. Five complete original files retain **166 enabled cases:
+71 MATCH / 87 RED / 3 BOTH / 5 EXTRA**, plus **57 separately recorded
+exclusions**. Both sides exclude the exact same identities/reasons: GC19,
+compact22, objspace16. All76 allocation comparisons stay enabled and RED.
+GC retains32 MATCH/1 existing RED/2 BOTH; ObjSpace37 MATCH/9 RED and string
+memory2 MATCH/1 RED. The compact API controls retain the reference's skips.
+The initial GC run lacked Mere's native stack fixture and is not accepted
+as the corrected context; rebuilding the unchanged fixture against Mere's
+own headers restores the two finalizer matches. The reference is the pinned
+CI Ruby4.0.9 with its matching original extensions. The159-row intake remains
+14 MATCH/57 EXCLUDED/88 HANDOFF. New hosted checks and the every-file gate
+remain required; no exclusion is credited as a passing test.
+
 ### Merge main after the released Map-slot compiler adoption
 
 Integrate main05c3bda3 after PR145 and the documentation-only PR146. Resolve only the MERE_REF conflict by
@@ -7418,6 +8189,32 @@ The upstream gem workflow also selects compiler408b03d9, matching core CI
 and the new local O2 measurements. Its original locks, tests, accepted
 snapshots and bounds are unchanged; new hosted gem results remain required.
 
+
+### Integrate the merged native-loading repair into stage9
+
+Merge main9b7f16a7 after PR90. Preserve actual GC observations, all57
+reasoned exclusions and the original native child launchers. The only
+manual code resolution is HarnessCheck.setUp: its fake interpreter writes
+both the exclusion sidecar and the actual RUBYLIB capture. The documentation
+resolution retains both branches' records. Runtime changes from PR90 merge
+automatically; gc_fixpoint/gc_mark_roots/gc_collect and m_state.mere remain
+unchanged from this branch. No new GC API value or top-level state is added.
+The original percent-literal witness667 keeps its meaningful closing spaces.
+
+Normal O2/compiler408b03d9: **738/738 corpus**, hash index ON/OFF,
+**549.227s / 1,168,512KiB** peak family RSS. All72
+focused GC/loading comparisons, 11 ordinary/child library controls,
+20 harness checks, nine RSS gates, roots, dead definitions and C depth155/1024
+pass. Actual mkmf builds retain14 reference/candidate/stress contracts and
+both negative controls; eight locked packages including seven native gems
+install separately under both runtimes and produce the same84 output lines.
+Foreign libraries are rejected. Five complete original files retain166
+enabled cases:71 MATCH/87 RED/3 BOTH/5 EXTRA, plus57 separately reported
+exclusions with identical identities and reasons on both sides. Allocation76
+stays enabled. The159-row intake remains14 MATCH/57 EXCLUDED/88 HANDOFF.
+Original tests, locks, accepted snapshots and all bounds are unchanged.
+Fresh hosted checks and the latest-main per-file comparison remain required.
+
 ## 2026-11-22: stop cancelled workflows from starting new suite summaries
 
 Cancelled runs 44921266629 and 44922636658 still started their Unit,
@@ -7440,3 +8237,7 @@ files in partial artifacts remain visible; weighted plans still reject a
 missing shard; and a monitor failure preserves reference cases while failing
 collection. This does not mark previously cancelled or failed runs successful.
 
+Latest-main integration retains the merged stage9 documentation verbatim.
+The only conflict was the append position in this log; runtime and collector
+changes come unchanged from main. The same four collector controls and
+actionlint pass again on the integrated base.
