@@ -4824,6 +4824,23 @@ prints true on Ruby and false on both main and this candidate; it remains
 unresolved and is not a passing corpus case.
 
 
+## Rails Hash options and lexical mixins: measured boundary (2026-11-20)
+
+Corpus735-737 verifies real Hash default reads through Ruby overrides/native
+super/aliases, real Hash subclass each for count/entries, and lexical/runtime
+mixin arguments with autoload, inherited constants, privacy and const_missing.
+The full718-file corpus and complete original twelve-file1,302-case comparison
+retain every main PASS under unchanged resource bounds. A full-corpus regression
+in525 was fixed, not excluded. The captured constructor default-block behavior
+is a separate existing prerequisite; the isolated default-read witness uses
+Hash#default_proc= to set the real Proc.
+
+An own Rails composition reaches actual migration, where a prepended Range#===
+calling super compares the Range object for equality and rejects precision6.
+Boot, application tests and HTTP remain NOT_RUN. Earlier selected original
+ActiveSupport measurements remain537 MATCH/4 RED out of541; no framework-wide
+or cold application pass is claimed from these runtime fixes.
+
 The follow-up scoped-namespace review fixes Object::Branch::Child, inherited
 namespace constants and intermediate const_missing results as real scope
 lookups (corpus742). Both definition paths retain the lexical first constant,
@@ -4849,6 +4866,14 @@ The earlier native-name-only behavior is superseded; native Method dispatch
 and other independent compatibility gaps are not claimed solved by this
 ordering repair.
 
+
+The Hash native-read review fixes repeated observable #hash calls using one
+real local search code. Corpus735 retains value/call-count controls for saved
+aliases, super, collisions, changed codes, reentrant reads, empty and identity
+hashes. Both the native custom-key entry and Ruby override precedence are
+covered. The719-file corpus and original twelve-file1,302-case comparison
+retain every main PASS under unchanged limits. This does not claim to fix all
+other Hash operations' hash-call ordering or the remaining Rails boundaries.
 
 ## The original Rails native-install blocker is resolved on integrated main
 

@@ -7119,6 +7119,44 @@ the installed method directly; this change does not claim that predicate
 repair or a full Rails pass. Hosted CI remains required on the corrected head.
 
 
+## 2026-11-20: Real Hash defaults, yielded entries and lexical mixin arguments
+
+ActiveSupport::OrderedOptions normalizes keys in Ruby Hash#[]; the missing-key
+shortcut ran before that override. Honor the real override, and share native
+Hash reads through super and saved aliases with the actual Hash#default.
+Hash subclass count/entries now consume the real Ruby each, including arguments,
+multiple yields and block/break, while ordinary Hash and Ruby overrides retain
+their existing paths. Count uses the existing Enumerator counting body on the
+actual Hash receiver; no proxy collection or invented size is used.
+
+Runtime include/prepend evaluates lexical constants, ivars/classvars, local
+variables and bare getters before validating the actual Module. Each scoped
+segment follows its real ancestor/autoload/const_missing result and privacy;
+explicit roots and custom include/prepend overrides are preserved. The first
+full corpus caught a missing intermediate const_missing regression in525.
+Fix it rather than removing the case. Keep the direct include-local hot path.
+
+Normal O2 eea2a983 on main d9826ac9 plus the reviewed loading/Module stack:
+**718/718 corpus**, hash index ON/OFF;525/735/736/737 in four hash/MRO modes
+match in all16 comparisons. Nine existing RSS gates, dead definitions and C
+bracket depth155/1024 pass. The complete original twelve-file paired set finds
+1,302 cases: main1,284 MATCH/3 RED/15 BOTH, candidate1,285/2/15, zero EXTRA.
+No original PASS or per-file MATCH is lost. Hash297, Enum89, Module195,
+Class61, Refinement121, Super50, Method97, Parse102, Forwardable27,
+Autoload27 and Require51 MATCH are maintained. Syntax167/168 is the known
+invalid-symbol memory observation, not claimed as a causal improvement.
+The final set was measured as eight files plus four additional files on the
+same unchanged binary. Original600-second/2-GiB and10-second child bounds,
+bootstrap, test files and exclusions remain unchanged.
+
+An own integration reaches real Rails migration and stops at Range#=== through
+ActiveSupport's prepended super, rejecting precision6 in0..6. Reference passes
+all four warm application stages; candidate boot/tests/HTTP remain NOT_RUN.
+This is reused-own-gem diagnostic evidence, not cold installation or a Rails
+pass. The separately measured four original ActiveSupport files still have
+537/541 MATCH at the earlier Hash-default boundary; these new Enumerable
+changes require a new original-framework measurement before claiming more.
+
 ### Scoped namespace review: every remaining segment is a real scope lookup
 
 Resolving the first constant lexically was necessary but did not make
@@ -7214,6 +7252,46 @@ and timeout cases. Reference-cache and embedding-build controls pass, and
 workflow YAML parses. Hosted full checks and every-file nonregression remain
 required for the new head. No original assertion, exclusion or bound changes.
 
+
+### Hash review: calculate a native read's search hash once (2026-11-20)
+
+The new native read helper discarded hash_touch's result, then recalculated
+#hash for each candidate through hash_lookup_w. Keep the real search hash in
+the call and reuse it with stored codes; share the post-bucket identity/eql?
+comparison without changing insertion's existing hash evaluation order.
+Identity reads skip the protocol. Ruby [] overrides run before probing keys;
+the native custom-key [] entry uses the same lookup, so super and saved aliases
+both calculate the actual hash once. Reentrant hash/eql? calls use local data.
+
+The first amendment passed the reported alias but its added super control
+found an earlier [] dispatcher bypass. Retain the16/20 failed witness run and
+stop its incomplete original-file comparison; fix that door too, then start
+a new O2 measurement. Runtime4d95d7b7 passes **719/719 corpus** ON/OFF,
+all20 comparisons for525/735-737/742 in four hash/MRO modes, nine existing RSS
+gates, dead definitions and depth155/1024. Complete original twelve-file
+comparison:1,302 cases, both main d9826ac9 and candidate **1,284 MATCH/3 RED/
+15 BOTH**, zero EXTRA, no original PASS or file MATCH lost. Original600-second/
+2-GiB/10-second child limits, bootstrap, exclusions and tests are unchanged.
+
+
+### Review repair: mixed Hash keys and Object autoloads (2026-11-21)
+
+Native Hash reads now use the internal hash for builtin search and stored
+keys even when a mixed table contains Ruby-hashed keys. Ruby hash callbacks
+still run once for keys whose protocol requires them. Object-qualified
+mixin paths normalize the constant/autoload key before firing the loader.
+Functions changed: hash_read_native and mixin_argument_value. Corpus 735
+and 736 cover String/Symbol hash overrides, missing custom keys, and block,
+class-body include and runtime prepend through Object's pending autoload.
+
+With Mere 01f5ad73 and O2, all 719 corpus programs match in both hash-index
+modes (516.823 seconds, 1,192,432 KiB under the unchanged 900-second/2-GiB
+bounds); RSS, root, depth (155) and dead-definition gates pass. The three
+focused corpus programs match in all four hash/MRO cache configurations.
+The original test_hash.rb remains 297 MATCH, 1 RED, 8 BOTH out of 306,
+without any previously passing named case lost against the retained before
+and previous candidate results. The remaining RED is test_replace_memory_leak;
+it was already RED. Full hosted per-file comparison is required before merge.
 
 ## Replay the original Rails native-build issue on integrated main
 
