@@ -1370,7 +1370,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
                        else fl0)
                  else fl0) in
       let fl = rx_one_enc_flag fl0 in
-      let _ = rx_escapes_check lit fl in
+      let _ = rx_escapes_check lit fl (rx_line_at s i) in
       let _ = rx_raw_check lit fl in
       let _ = rx_static_frags lit 0 in
       if rx_has_interp lit 0 || rx_has_dvar lit 0 then
@@ -1432,7 +1432,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
          let fj0 = skip_regex_flags s rj in
          let fl = rx_one_enc_flag (substring s rj fj0) in
          let fj = rx_unknown_opts s (rj - 1) fj0 in
-         let _ = rx_escapes_check rlit fl in
+         let _ = rx_escapes_check rlit fl (rx_line_at s b) in
          let _ = rx_raw_check rlit fl in
          let _ = rx_static_frags rlit 0 in
          if rx_has_interp rlit 0 || rx_has_dvar rlit 0 then
@@ -4436,6 +4436,38 @@ and rx_static_frags = fn (lit: str) -> fn (i: int) ->
               else ()) in
      rx_static_frags lit j)
   else rx_static_frags lit (i + 1)
+// ...and the same for a pattern given to Regexp.new (or made for a literal
+// of AbstractSyntaxTree): each run of bytes written as escapes -- \xHH,
+// a three-digit octal, \c / \C- / \M- -- must be whole characters of the
+// pattern's encoding `enc`. A plain character, a raw non-ASCII byte or any
+// other escape ends the run. The reason, or "" when every run is whole.
+and rx_esc_runs_why = fn (lit: str) -> fn (enc: str) ->
+  let n = str_len lit in
+  let whole = fn (run: str) ->
+    (if str_len run == 0 || enc_valid run enc then ""
+     else (let w = rx_mb_why run enc in if str_eq w "" then "too short escaped multibyte character" else w)) in
+  let rec go = fn (i: int) -> fn (run: str) ->
+    if i >= n then whole run
+    else if str_eq (char_at lit i) "\\" && i + 1 < n then
+      (let c = char_at lit (i + 1) in
+       let numeric = str_eq c "x" || str_eq c "c" || str_eq c "C" || str_eq c "M"
+                     || (let o = ord c in o >= 48 && o <= 55) in
+       if numeric then
+         (match rx_esc_byte lit (i + 1) false false with
+          | (w, b, k) ->
+            // (a control escape with no \M- in it is no byte of a character
+            //  to Regexp.new -- `'a\c\xff'` compiles, its 0x9F alone -- as
+            //  onigmo reads it; a meta one is)
+            let meta = str_contains (substring lit i k) "M-" in
+            let numeric = meta || (if str_eq c "x" then true else (let o = ord c in o >= 48 && o <= 55)) in
+            // (...and once a run has begun, an escaped byte below 0x80 joins
+            //  it too: Shift_JIS and Windows-31J have trail bytes from 0x40,
+            //  so `\x81\x40` is one whole character, not a lead byte cut short)
+            if str_eq w "" && numeric && (b >= 128 || str_len run > 0) then go k (run ++ chr b)
+            else (let why = whole run in if str_eq why "" then go (if str_eq w "" then k else i + 2) "" else why))
+       else (let why = whole run in if str_eq why "" then go (i + 2) "" else why))
+    else (let why = whole run in if str_eq why "" then go (i + 1) "" else why) in
+  go 0 ""
 // what onigmo's unescape_escaped_nonascii says of a run of \xHH bytes in
 // a multibyte encoding, character by character: a lead byte the encoding
 // has no use for is "invalid multibyte escape", a character the run ends
@@ -4544,7 +4576,14 @@ and rx_interp_bytes_check = fn toks ->
        syn_refuse ("invalid multibyte character: /" ++ rx_raw_show v 0 ++ "/"))
   | Cons (_, r) -> rx_interp_bytes_check r
   | Nil -> ()
-and rx_escapes_check = fn (lit: str) -> fn (fl: str) ->
+// (the line, as the refusal reports it, of offset `i` in the text `s`)
+and rx_line_at = fn (s: str) -> fn (i: int) ->
+  let rec nl = fn (j: int) -> fn (k: int) ->
+    (if j >= i || j >= str_len s then k else nl (j + 1) (if str_eq (char_at s j) "\n" then k + 1 else k)) in
+  nl 0 0 + 1 + lshift_lex ()
+// (`ln`: the literal's line. The refusal shows the whole pattern as the
+//  lexer left it -- `\M-b` written \xE2 -- as ruby's does)
+and rx_escapes_check = fn (lit: str) -> fn (fl: str) -> fn (ln: int) ->
   // (a literal with no flag takes the SOURCE's encoding -- the magic
   //  comment's; a one-byte one, `# encoding: binary` included, takes any byte)
   let cd = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr h -> sget h | _ -> "") else "") in
@@ -4559,21 +4598,34 @@ and rx_escapes_check = fn (lit: str) -> fn (fl: str) ->
              else "") in
   let n = str_len lit in
   let hx = fn (k: int) -> k < n && (let o = ord (char_at lit k) in (o >= 48 && o <= 57) || (o >= 65 && o <= 70) || (o >= 97 && o <= 102)) in
-  let flush = fn (run: str) ->
+  // (the refusal shows the literal's text the run is in: the whole pattern,
+  //  or with interpolation the fragment between two -- `/\x81#{ }/` says
+  //  /\x81/ -- from `fs` to the next `#{`)
+  let rec frag_end = fn (k: int) ->
+    (if k >= n then n
+     else if str_eq (char_at lit k) "\\" then frag_end (k + 2)
+     else if str_eq (char_at lit k) "#" && k + 1 < n && str_eq (char_at lit (k + 1)) "\{" then k
+     else frag_end (k + 1)) in
+  let flush = fn (run: str) -> fn (fs: int) -> fn (at: int) ->
     (if str_len run == 0 || str_eq enc "" then ()
      else if enc_valid run enc then ()
      else (let why = rx_mb_why run enc in
-           syn_refuse ((if str_eq why "" then "too short escaped multibyte character" else why) ++ ": /" ++ rx_esc_show run ++ "/"))) in
-  let rec go = fn (i: int) -> fn (run: str) ->
-    if i >= n then flush run
+           // (in ruby's shape, with no frame: it is the regexp compiler's
+           //  refusal, not the grammar's -- rx_cur "why" -- on its line)
+           let text = substring lit fs (frag_end at) in
+           let msg = (if str_eq why "" then "too short escaped multibyte character" else why) ++ ": /" ++ rx_esc_slashes text 0 "" ++ "/" in
+           let _ = map_set rx_cur "why" (mkstr msg) in
+           syn_refuse_at ln msg)) in
+  let rec go = fn (i: int) -> fn (run: str) -> fn (fs: int) ->
+    if i >= n then flush run fs i
     else if str_eq (char_at lit i) "\\" && i + 3 < n + 0 && i + 1 < n && str_eq (char_at lit (i + 1)) "x" && hx (i + 2) && hx (i + 3) then
-      go (i + 4) (run ++ chr (hexv (char_at lit (i + 2)) * 16 + hexv (char_at lit (i + 3))))
-    else if str_eq (char_at lit i) "\\" && i + 1 < n then (let _ = flush run in go (i + 2) "")
+      go (i + 4) (run ++ chr (hexv (char_at lit (i + 2)) * 16 + hexv (char_at lit (i + 3)))) fs
+    else if str_eq (char_at lit i) "\\" && i + 1 < n then (let _ = flush run fs i in go (i + 2) "" fs)
     // (an interpolation is code, not the pattern's escapes: `/#{"\xcd"}/`
     //  is rx_interp_bytes_check's)
     else if str_eq (char_at lit i) "#" && i + 1 < n && str_eq (char_at lit (i + 1)) "\{" then
-      (let _ = flush run in go (interp_close lit (i + 2) 1) "")
-    else (let _ = flush run in go (i + 1) "") in
+      (let _ = flush run fs i in let k = interp_close lit (i + 2) 1 in go k "" k)
+    else (let _ = flush run fs i in go (i + 1) "" fs) in
   // `\u` takes four hex digits or a `{` list, inside a class too, in a
   // source of any encoding (`/[\users]/x` is ruby's SyntaxError, which the
   // class parser let by)
@@ -4602,14 +4654,7 @@ and rx_escapes_check = fn (lit: str) -> fn (fl: str) ->
               && (if rx_has_interp lit 0 then false else true)
               && rx_u_nonascii lit 0
            then syn_refuse ("incompatible character encoding: /" ++ lit ++ "/") else ()) in
-  if str_eq enc "" then () else go 0 ""
-and rx_esc_show = fn (run: str) ->
-  let rec go = fn (i: int) -> fn (acc: str) ->
-    if i >= str_len run then acc
-    else (let o = ord (char_at run i) in
-          let hd = "0123456789abcdef" in
-          go (i + 1) (acc ++ "\\x" ++ char_at hd (o / 16) ++ char_at hd (o - (o / 16) * 16))) in
-  go 0 ""
+  if str_eq enc "" then () else go 0 "" 0
 and skip_regex_flags = fn (s: str) -> fn (i: int) ->
   if i < str_len s && is_alpha (char_at s i) then
     (let c = char_at s i in
