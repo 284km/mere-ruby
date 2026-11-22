@@ -527,6 +527,15 @@ difference between two runs as a regression, check it against this list, and
 run the file on both builds with `unittest/try.sh` (a regression reproduces
 there; these do not). Each entry was seen on main as well as on a branch.
 
+**Cancelled workflows.** Unit and bootstrap summary jobs collect successful
+or failed shard jobs while the workflow remains active. They do not start
+after cancellation or for a cancelled/skipped shard group, and their collect
+steps stop if the workflow is cancelled after the job starts. Partial shard
+artifacts remain available through their existing upload steps. A cancelled
+attempt does not establish a complete suite score; rerun it for merge evidence.
+An active workflow with failed shards still runs collection, and missing or
+partial artifacts still fail the unchanged collectors.
+
 **Order-dependent tests.** They lean on a library an earlier test happened to
 load, so the seed decides them; run alone they fail on main too.
 

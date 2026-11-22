@@ -6860,6 +6860,79 @@ Corpus 675 and 676 carry the witnesses (return values and an overridden
 Encoding.find, multiword names, binding / eval / local_variables / a
 refinement with the optimization on and off).
 
+## 2026-11-17 (74): Prism's fixtures -- where parse.y's lexer, not its grammar, decides the tree
+
+PR #86 (main `392bf810`) left 20 of Prism's 976 fixtures whose tree is not
+parse.y's. 5 of them CRuby cannot answer itself (`#children` raises
+NoMethodError on `::A ||= 1` and the like). The other 15 now agree: 971 of
+976, measured with tools/ast_on_cruby.rb against tools/ast_dump. The 850
+files test_ast reads still all agree. Each is a place where parse.y's lexer
+cuts or places a token differently from Prism:
+
+- **A percent literal closed by a line end** (`%\nfoo\n`, `%r\nfoo\n`) ends
+  on that line, in the column past the newline -- and so does every node
+  ending with it. The offset is the next line's start, where every other
+  node that ends there ends; tr notes these literals and ao_nl_end places
+  them.
+- **A program's end** reads past a `\` continuation and past the heredoc
+  bodies a line opened; after a comment, a program that ends after those
+  bodies ends at the comment, and a last line of blanks with no newline is
+  the term's place (hd_skip, nl_after_comment, skip_terms).
+- **A regexp's text splits at a `#@` / `#$` that names no variable**
+  (`/a#@~b/`): parse.y's tokadd_string stops there to look for a variable
+  name, finds none, and the text from `#` is the next token -- a DREGX,
+  and in a condition a MATCH2. Prism keeps one RegularExpressionNode.
+- **Text a heredoc body interrupts is one token** (`<<-A.gsub(/b\` / body /
+  `b/)`, a `%w` / `%i` word): a REGX, and a word placed from the line it
+  ends on. Prism splits it into parts, and places such a `%i` word where
+  its first line is.
+- **A `<<~` heredoc with an unindented line** reads as a plain heredoc
+  (heredoc_dedent has nothing to remove); when the indentation falls to
+  none at a later line, the lines before it stay tokens of their own,
+  because literal_concat does not join while heredoc_indent is above 0. A
+  `<<~` DSTR whose pieces all joined its head is a STR.
+- **`Foo::Bar { }`** (ruby bug #18878): the call takes the block's place.
+- **A command's `do` block inside bracketed arguments** (`foo(bar baz do
+  end)`, `[bar baz do end]`, `foo[...]`, a splat, a keyword value) is a
+  SyntaxError, as in parse.y -- checked against 16 forms.
+- **An empty file's tree is at line 0** with no script lines
+  (`parse_file`); an empty String's stays at line 1.
+- A regexp in a condition: an interpolated one warns only under -w, in
+  Prism as in parse.y (it always warned); under AST.parse, one parse.y
+  splits warns so too.
+
+Review of #99 (two P2s, both fixed): a `<<~` heredoc with interpolation
+whose indentation falls to none later also keeps its pieces before that
+line apart and placed as `<<~` pieces (`  #{1}` / `b`: the text after the
+interpolation is 2:6-2:7, not the opener's end) -- tr_contents runs
+literal_concat with `squiggly` until that line; and a regexp split at `#@`
+takes its pieces' text as tokadd_string leaves it: an escaped delimiter is
+the delimiter unless simple_re_meta, a `\` and its line end go, a `\`
+before a non-ASCII byte goes, `\cX` / `\C-X` / `\M-X` are written `\xHH`.
+Checked against 11 heredoc forms and 20 regexp forms. The follow-up review
+(one P2 left): a control or meta escape's operand is a whole escape again,
+as in read_escape -- `\c\n` is `\x0A`, `\M-\n` is `\x8A`, `\c\x41` is
+`\x01`, an unknown `\q` is `q`; a bare `?` is DEL only right after `\c` /
+`\C-`. rx_read_escape does this over Prism's bytes. Checked against 20 more
+forms on ruby 4.0.9, among them a condition and ones ruby refuses. The
+third (one P2): looking for a split, a control or meta escape is read whole
+-- `\c#@~` is `\x03` and `@~`, no split -- in regx_splits and in
+rx_text_splits, which classifies the condition's warning. Checked against 12
+forms. Not done, and so on main too: AST.parse lets a regexp through that is
+not valid in its encoding (`/a\M-b/`, `/a\xff/` in UTF-8), where ruby
+raises SyntaxError.
+
+Not done: `/(?<y>a)#@~/ =~ x`, where parse.y's DREGX assigns no `y` (the
+scope's table comes from Prism's locals).
+
+Speed: tr reads a node's first byte once. 300 files of test_ast's walk,
+205.05e9 -> 205.34e9 instructions (+0.14%). Bracket depth 923 -> 924 (one
+table, ao_lx, holds both kinds of note). Witness corpus/684.
+
+- Checked: corpus 696 of 696, and with MERE_RUBY_BLK_ID_CHECK,
+  MERE_RUBY_ATTR_IC_CHECK and MERE_RUBY_IVAR_INDEX_CHECK on; test_ast's
+  individual tests 114 as the reference; the gates; loop memory.
+
 ## 2026-11-17 (72): what still differed on the VM in 40 whole test files -- freed memory, a loop with no safepoint, collections that marked too much
 
 **The point.** The 40 files of (68) run again on both, same build: the VM
@@ -7201,6 +7274,100 @@ complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
 
+## 2026-11-18 (75): AbstractSyntaxTree where Prism and parse.y part ways -- captures parse.y does not assign, and two kinds of error_tolerant recovery
+
+**The point.** Two of the gaps note 551 left in stage 5, against ruby 4.0.9:
+- **Named captures in a regexp parse.y splits.** For `/(?<y>a)#@~/ =~ x`,
+  parse.y splits the text at the `#@`, so the regexp is a DREGX, and
+  reg_named_capture_assign does not run. MATCH2 has no assignments, `y` is
+  not in the table, and a later `y` is a VCALL until something else assigns
+  it. Prism does not split the regexp and assigns `y`.
+- **Two kinds of error_tolerant recovery:**
+  - in a body, what cannot follow a statement (`1q`, `a = 1 2`);
+  - an `end` after `.` that closes by its indent (`bar.` / `end`) in
+    constructs other than a class or module.
+
+**Captures.** tr_match_write sees the DREGX and records each name as a
+"ghost" of its scope (as_gh). Scopes now carry a serial (as_sc keeps kind +
+2 x serial). A program with a ghost is translated a second time; nothing
+else pays for it. The second pass records where each variable is really
+assigned: a write, a target (multiple assignment, for, rescue =>, pattern
+captures), an operator write, a parameter (nm_push), or a capture of an
+unsplit regexp. Then:
+- a read of a ghost name with no real assignment before it, in that scope
+  or one inside it, is a VCALL;
+- a ghost name that nothing assigns is left out of the table;
+- a ghost name first assigned later moves to where that assignment puts it
+  in the table;
+- in a block, an assignment to an outer scope's ghost that nothing has
+  assigned yet makes a new variable of the block (kind 4), as parse.y does.
+
+`y = y` assigns before its value is read, as assignable does. Checked
+against 33 forms.
+
+**Garbage after a statement.** parse.y pops back to the start of the
+body's `stmts`, makes everything from there to the last token it throws
+away one ERROR (`stmt: error`), and reads on after the next term. That holds
+in the body of a def, class, module, `class <<`, begin, while, until and
+lambda, and of an if or unless without else (rv_mark, as_px 11).
+tr_stmt_list replaces those statements:
+- the ERROR runs from the body's start through the statements written
+  without a term between them;
+- where the body has a leading term (class, module), the ERROR starts there
+  and takes the place of that BEGIN;
+- a second error in the same body starts from the body's start again.
+
+Other places recover differently, and those were left alone:
+- a do or brace block makes the whole outer statement an ERROR, and the
+  program ends;
+- an if with an else takes the then-branch too;
+- under when there is no tree at all (NIL);
+- a modifier after the garbage (`1q if y`) wraps the ERROR.
+
+Checked against 26 forms.
+
+**An `end` closed by its indent.** The class and module code is now two
+helpers, de_open and de_close. def, do blocks, if and unless without else,
+while and until use them as well:
+- the statements before `bar.` stay;
+- an ERROR runs from `bar` through that `end`;
+- the construct ends there;
+- the statements after it go up a level.
+
+de_open saves as_px 7 and 8, and de_close puts them back, so a sibling does
+not lose a value that is still pending. A do block's indent is the one of
+the line it opens on. Checked against 11 forms.
+
+Speed: 300 files of test_ast's walk, 203.95e9 -> 204.13e9 instructions
+(+0.09%). Bracket depth 934 -> 935 (as_gh). Witness corpus/700.
+
+- Checked: fixtures 971 of 976; the 850 files 850 of 850; corpus 705 of
+  705; test_ast's individual tests 114 as the reference; the gates.
+
+
+### AST review repairs: real bindings and recovery body starts (2026-11-21)
+
+Ghost capture assignments now keep later writes in the nearest real or
+relocated block binding, including writes in nested blocks. Destructured
+parameters and explicit block locals register real bindings before the
+body is translated. For-loop local targets register before the collection
+without changing AST node construction order. Recovery ERROR locations
+start at the original statement-list syntax, including a removed begin
+and leading empty statements.
+
+Corpus 700 adds 13 review cases. All 13 match the reference's standalone
+AST including locations, and the normal O2 runtime matches the whole corpus
+700 output in all four hash/MRO configurations. All 869 current Ruby test
+files match, including 1,002,971 textual AST lines. Prism fixtures retain
+971/976: only the same five reference children walks raise NoMethodError.
+The new two Prism readers were regenerated from the pinned config. Root,
+depth, dead-definition and duplicate-definition gates pass. Full hosted
+corpus and per-file comparison remain required for merging.
+
+Functions changed: gh_put, gh_targets, gh_parameter, gh_block_locals,
+tr_stmt_list, tr_compstmt, tr_block_scope, tr_mlhs, tr_lambda, tr_for;
+generated readers pm_block_parameters_locals and pm_block_local_variable_name.
+
 ## Gem-suite OS baselines and the multipart resource gate
 
 Hosted Linux before and after the source audit (runs 43989409595 and
@@ -7427,6 +7594,12 @@ Fresh Wasm emission also exposed an existing missing mr_utimens/mr_stat_times ho
 The HTML host now returns its guest wrapper's declared -2/empty-string unavailable
 sentinels, preserving startup without claiming timestamp support. The native
 File/C API implementation is unchanged.
+
+Merging main on 2026-11-22 (after #91, #99, #103, #144 and #149): #91 carried
+this same GC work, so the code, glue, exclusion files, corpus 673/711 and this
+record are already on main byte for byte. Main's wording of the ledger (41 GC
+and compaction plus 16 ObjectSpace, 57 in all) and its run.sh are kept; #112
+adds only this note.
 
 
 ## 2026-11-18: consolidate the deferred GC/ObjectSpace stack
@@ -8038,6 +8211,179 @@ moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
 
+## 2026-11-19 (85): an exception no clause can see, a constructor of stores, and super with values
+
+**The point.** After (84) the slowest of ruby's benchmarks on the VM were
+app_raise (1.72x the evaluator), so_object (1.49x) and so_exception (1.18x).
+Each was a shortcut the evaluator takes and the VM did not.
+
+- **A rescue that only matches.** run_rescues makes the exception an object
+  with its own frames (exc_pin_bt) only when the clause binds it to a name;
+  the VM made one -- an object id and three ivars -- for every exception any
+  clause took. A rescue sequence made of nothing but its local read,
+  constants and literals pushed, checkmatch, branches, nil, a pop, a leave
+  or a throw (vm_rescue_only_matches) cannot keep or show the exception, and
+  leaves it the pair, `$!` included, as the evaluator does.
+- **`$!` after a retry** (both executions, found writing the witness): a
+  retry ran the construct again by calling run_begin_f again, which took
+  the exception in `$!` as "what $! was before" and restored that once the
+  construct was done. `begin; raise if t < 2; rescue; retry; end; p $!` was
+  the exception; ruby's nil. The construct is run again from the $! it
+  started with.
+- **A method of stores.** The evaluator runs a method whose body is only
+  `@x = param` statements without a frame (triv_store_body); a VM method's
+  body is its program, which that never matched. A program of `getlocal p,
+  (dup,) setinstancevariable @x` for each parameter and a leave is run the
+  same way (vm_triv_store_ok / _run), under the same conditions (a plain
+  object, no block, no TracePoint, Coverage or Ractor, the arguments plain).
+- **super with values.** `super(a, b)` was an ESuper over hidden locals in a
+  scope, evaluated. ESuper's arm is now two halves: the arguments, and what
+  is done with them (super_vals) -- the method after the definer along the
+  receiver's ancestors, a singleton's extended modules, Class#new, a hook's
+  no-op, "no superclass method". The VM calls the second with its values
+  when there is no block written or passed, no splat or keywords, and no
+  hook (vm_super_direct, with the arm's refusals).
+
+Corpus 696 (a rescue that only matches, a bound one and `$!`, a bare raise,
+retry, `$!` in an ensure, a class's own ===), 697 (stores of one and three
+parameters, arity errors, `_`, a class variable, a literal, a frozen
+receiver, keywords and a splat) and 698 (super with values, a bare super
+after a parameter changed, a module's, `def self.new`, a hook, nothing
+above, another object's instance_eval, define_method's bare super, a
+singleton's extended module): the same on ruby 4.0.9, the evaluator and the
+VM.
+
+Measured, ruby's app_* / so_* (27; least of 3 runs, local): the whole 0.940x
+-> 0.927x the evaluator; app_raise 1.72x -> 1.06x, so_exception 1.18x ->
+1.07x, so_object 1.49x -> 1.10x. Still behind: so_nsieve_bits 1.25x,
+app_mandelbrot 1.15x (Complex), so_object 1.10x, so_pidigits 1.09x
+(Bignums), so_lists 1.07x.
+
+Checked (local): corpus 709 / 709; under MERE_RUBY_VM=1 699 on the VM, 10
+fallen back, 0 different; vm_check 245 / 245; gates; the Module check
+COMPLETE; under both executions, the previous build against this one:
+test_exception, test_rubyoptions, test_flip, test_super, test_method,
+test_object, test_class the same counts.
+
+## 2026-11-19 (86): test_complemented_method_entry_memory_leak -- what a collection costs, and why the floor stays
+
+**The point.** The test has timed out at 10.03-10.04 s on slow runners
+(main's CI, PR #95's, the VM-default measuring branch's). Measured here, on
+its own program (the test's block, 100,000 turns after 1,000):
+
+- It is linear: 50,000 / 100,000 / 200,000 turns take 0.97 / 1.82 / 3.52 s,
+  about 18 µs a turn (ruby 5.7). Nothing grows per collection.
+- Of the time, collecting is 36%; the rest is making the classes and the
+  refinement, spread over the native declaration paths with no function
+  above a few percent. A collection is about 9 ms: the class tables' sweep
+  is near half (68 tables walked, each key's owner read from its text; a
+  turn leaves 21 rows -- methods 3 x 4 tables, modules 2, supers 2, the
+  refinement's 3, privates, mro_external), the stack's native candidates
+  about a third, the fixpoint the rest.
+- The native candidates were 42,000 a collection, most of them the same
+  `Class#name` key from meths_g, meth_src, meth_cref and meth_cvcls; they
+  are taken once now (30,000). The time did not move outside the noise.
+- The class-time floor (knob 14, 4,000 entries) is load-bearing for this
+  very test: at 8,000 its RSS ratio was 2.18 and at 16,000 2.50, against
+  the bound of 2.0, and the time did not fall (1.74-1.98 s against 1.75-1.82
+  for 100,000 turns). It stays.
+
+What is left would be structure: rows a class keeps a record of, so the
+sweep need not read every key's text, or fewer rows a refinement. Until
+then the test stays in Known noise (rerun the job).
+
+## 2026-11-19 (87): the VM as the default, measured over the whole suite
+
+**The point.** The measuring branch vm-default-r44 (#104's stage10-r44 with
+the VM as the default execution, MERE_RUBY_VM=0 the evaluator; not for
+merging) ran the whole CI: run 44295654770. Every job but build-linux
+passed, and the CRuby tests' MATCH is 33,312 against main's 33,313 over the
+same 758 files. Four files are a test lower, three a test higher:
+
+- ruby/test_keyword.rb's test_kwrest_overwritten: a bare super after `**h`
+  was reassigned is "wrong argument type Array (expected Hash)" -- fixed in
+  this branch (core#hash_merge_ptr's Check_Type, corpus 699).
+- ruby/test_ractor.rb: test_move_nested_hash_during_gc_with_yjit's
+  timeout, Known noise.
+- ruby/test_iseq.rb's test_parent_iseq_mark and ruby/test_thread.rb's
+  test_thread_join_during_finalizers: timeouts, and the VM is slower at
+  both. Locally, with the compiler #108 pinned (01f5ad73): 9.65 s on the
+  evaluator and 13.12 s on the VM (bound 20 s), and 23.2 s and 44.9 s (bound
+  60 s); with the compiler before it, 9.76 / 13.16 and 30.2 / 57.7. The
+  second's program alone, outside the test, is faster on the VM (23.6 s
+  against 29.4 s, 5,627 collections against 8,768): what the test adds runs
+  under GC.stress with 20 popen3 wait threads parked, and the child spends
+  nearly all its time collecting -- three quarters of that in gc_mark_roots,
+  where the suspended stacks are read (coro_scan_ints, and the pin gather
+  the recycles at its start ask for). Why the VM's parked stacks cost twice
+  the evaluator's is the next question: the C frames a Ruby call stacks are
+  of the same size on both (vm_step 960 bytes, eval_e 2,080).
+- build-linux: the Module check's test_complemented_method_entry_memory_leak
+  at 10.03 s, Known noise (LOOP (86)).
+
+So the VM as the default passes what the evaluator passes, in the whole
+suite, but for those two timeouts under GC.stress with threads parked.
+
+### Preserve exceptions exposed by a custom rescue matcher
+
+PR #144 review: checkmatch can invoke Ruby === even when the rescue body
+binds no variable. Pin such an exception before exposing it, update the
+handler's hidden exception local and $!, and propagate the same object when
+all clauses reject it. Builtin-only matching retains the allocation-free
+path. run_rescues needs the same protection in evaluator mode. TracePoint
+observers conservatively receive a pinned exception too. Functions changed:
+vm_checkmatch, vm_region, run_rescues; no new top-level state or collector edit.
+Corpus 696 covers retained backtraces across a subsequent raise, $! identity,
+multiple matcher clauses, splat matchers and outer propagation. Corpus
+696-699 matches in all four cache modes on both evaluator and strict VM
+(32 comparisons). Full integrated validation is still pending.
+
+The final parent-integrated AST runtime b4bbb8d9 also passes all 708 corpus
+programs in both hash modes (468.071 seconds, 1,174,736 KiB, unchanged
+900-second/2-GiB bounds), the nine RSS workloads and root/depth/dead gates.
+Corpus 700 still matches in four independent cache configurations after
+this integration. No exclusion, budget or expected output was changed.
+
+
+### AST parameter default source order (2026-11-21)
+
+A follow-up control found that registering explicit block locals before
+parameter defaults changed a ghost-capture name from VCALL to DVAR in
+`foo { |z=y; y| y }` and its keyword-default form. Registration now happens
+after translating parameters and before translating the body, in both
+blocks and lambdas. Corpus 700 adds the two regressions and a destructured
+post-parameter control. Standalone O2 comparisons pass all three; all 869
+Ruby test ASTs and the same 971/976 Prism fixtures remain unchanged.
+The earlier complete 708-program validation applies before this follow-up;
+its updated public-API witness and hosted full suite are validated separately.
+Functions changed in this follow-up: tr_block_scope and tr_lambda.
+
+### AST parameter defaults before block-local declarations
+
+Register explicit block-local declarations after parameter default expressions
+and before the body in tr_block_scope and tr_lambda. Three additional corpus
+700 sources cover optional and keyword defaults and a destructured parameter.
+All three location comparisons pass; the full current source sweep remains
+869/869 Ruby files and 971/976 Prism fixtures with the same five reference
+NoMethodError cases. All 13 original review reproductions and the full public
+corpus 700 in four hash/MRO modes pass on the rebuilt O2 runtime. The earlier
+708-program corpus result predates this follow-up; hosted full checks remain
+required for the final revision.
+
+### AST for-target registration is idempotent at its source position
+
+The early for-target registration is replayed during AST construction. gh_add
+now deduplicates kind-2 and kind-4 records with the same scope serial, name
+and source offset. Reads still use their original strict-before ordering,
+and targets remain registered before the collection is translated.
+Corpus 700 adds four block/lambda/destructuring and collection-read cases.
+All four fail before the repair and match Ruby 4.0.9, including locations,
+after it. All 869 Ruby test files and 971/976 Prism fixtures remain unchanged
+(the same five reference children errors); all 13 earlier review reproductions
+and the rebuilt public corpus 700 API in four cache modes pass. Roots and
+bracket depth 155 pass. The earlier full-corpus observation predates this
+follow-up; full hosted checks and every-file comparison still gate merge.
+
 ### Stage 9 consolidation after main's VM update (2026-11-20)
 
 Merge main d9826ac9 into the existing consolidation branch. Only concurrent
@@ -8344,6 +8690,56 @@ limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
 
+Final current-main validation of the retained matcher repair: all720 corpus
+programs match in both hash modes (490.781 seconds, 1,194,640 KiB under the
+unchanged900-second/2-GiB bound). The final integrated runtime retains all32
+focused comparisons across evaluator/strict VM and four hash/MRO modes.
+Nine RSS workloads, GC roots, bracket depth155 and dead definitions pass.
+The handler and $! keep the same pinned exception across rejecting matchers
+and outer propagation. No builtin-only VM matcher pins an exception.
+
+### Preserve exception frames before resolving a rescue constant
+
+A getconstant can run autoload or const_missing before checkmatch. Such
+handlers now leave vm_rescue_only_matches' optimization and pin the original
+exception before the lookup; lookup-free builtin operands, including bare
+rescue, keep their fast path. run_rescues likewise pins before expanding
+explicit class expressions. This deliberately avoids guessing whether a
+constant lookup can execute Ruby. No top-level state or collector change.
+Corpus 696 adds an autoload that raises/rescues internally and a const_missing
+variant, checking the original frame and identity with $!. The original
+head fails the new evaluator reproduction in all four cache modes. The repair
+matches corpus 696-699 in all 32 evaluator/strict-VM/cache combinations; the
+original Exception and Backtrace files pass all 129 cases. The previous
+720-program sweep predates this follow-up; a fresh complete sweep is running.
+
+
+### PR review: resolve constant path heads through actual lexical scopes
+
+Use lex_const_key_nested for the EConst qualified-path shortcut and both
+const_walk_head lookups. An absent namespace prefix is not a lexical scope.
+If that first hit is rejected, the helper continues through the actual
+nesting instead of discarding a later real outer scope. It preserves the
+existing singleton-owner mapping. Changed functions: eval_e,
+const_walk_head and lex_const_key_nested; the parent's vm_define correction
+is unchanged. Corpus760 adds qualified reopening, method reads, scoped class
+definition and the case with both an absent prefix and a real outer scope.
+Both reported and additional comparisons failed before these corrections.
+
+Final normal O2/compiler01f5ad73 validation: **721/721 corpus**, hash index
+ON/OFF, **481.274s / 1,188,480KiB** peak family RSS. All36 default/evaluator/
+strict-VM and hash/MRO comparisons of731/738/760, all nine RSS gates, roots,
+dead definitions and C depth155/1024 pass. Complete original Exception/
+Backtrace/Module/Autoload/Require discover404 cases: **402 MATCH / 0 RED /
+2 BOTH**, with both reference skips explicit and all per-file MATCH retained.
+The old invalid-symbol Syntax leak failure is not affected or reclassified.
+An initial original-file selection started before the replacement build
+finished and is explicitly ineligible; the accepted fresh run checks the O2
+build's freshness and unchanged binary hash. No collector/state, C API,
+VM/ISeq, AST/Prism, gemtest implementation, original tests, exclusions or
+limits were changed for this repair. New hosted CI and latest-main per-file
+acceptance remain required before merging.
+
 ### Stage 9: preserve native launchers and finish current-main integration
 
 Integrate main a206da11 after the native-extension runner change. The manual
@@ -8617,6 +9013,33 @@ exclusions with identical identities and reasons on both sides. Allocation76
 stays enabled. The159-row intake remains14 MATCH/57 EXCLUDED/88 HANDOFF.
 Original tests, locks, accepted snapshots and all bounds are unchanged.
 Fresh hosted checks and the latest-main per-file comparison remain required.
+
+## 2026-11-22: stop cancelled workflows from starting new suite summaries
+
+Cancelled runs 44921266629 and 44922636658 still started their Unit,
+Bootstrap and Tool summary jobs. The jobs had no completed shard group to
+collect, so cancellation produced additional failing summary checks. Main's
+Tool summary already checks cancellation and the shard result; apply the same
+boundary to Unit and Bootstrap.
+
+Both jobs require a successful plan and an active workflow with a successful
+or failed shard group. Their collect steps also check cancellation, covering
+a workflow cancelled after the job starts. Genuine shard failures still run
+the existing collectors; missing and partial results still fail, and the
+existing artifact uploads continue to retain diagnostics. Test inventories,
+resource bounds, runners, measurement code and runtime implementation are
+unchanged. See the [GitHub status-check documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions).
+
+Validation: actionlint 1.7.12 accepts the workflow. Four existing collection
+controls pass: missing shards retain all planned rows and fail; unattempted
+files in partial artifacts remain visible; weighted plans still reject a
+missing shard; and a monitor failure preserves reference cases while failing
+collection. This does not mark previously cancelled or failed runs successful.
+
+Latest-main integration retains the merged stage9 documentation verbatim.
+The only conflict was the append position in this log; runtime and collector
+changes come unchanged from main. The same four collector controls and
+actionlint pass again on the integrated base.
 
 
 ## 2026-11-22: keep TracePoint events on their suspended callback

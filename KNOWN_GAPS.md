@@ -5092,6 +5092,18 @@ privacy and autoload behavior. The712-file corpus and original nine-file784-case
 comparison pass without losing a main PASS. The separate module_eval lexical
 negative remains an explicit failing diagnostic; this change does not claim it.
 
+
+## Constant path heads in qualified reopening
+
+`module A::B` searches the scopes actually present in Module.nesting.
+An A namespace prefix absent from that nesting no longer shadows the top
+level or a real enclosing lexical scope. Qualified reads, method reads and
+class definitions use the same constrained lookup; corpus760 includes both
+review reproductions and true nested shadowing controls731/738. Final full
+corpus721 and original402 MATCH across404 cases are retained. The separate
+module_eval lexical-nesting diagnostic remains unresolved; this repair does
+not claim a full Rails pass or change any original test, exclusion or bound.
+
 Native-check stdlib fallbacks are explicit: the C extension runners set
 MERE_RUBY_STDLIB_FALLBACK to the actual reference library directory. A
 RubyGems extension child can repeat it through -I; native-backed shipped
