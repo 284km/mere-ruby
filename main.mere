@@ -1549,8 +1549,8 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
                 (if k >= n9 then ()
                  else (let t9 = (if 3 * k + 1 < vec_len vm_own then vec_get vm_own (3 * k + 1) else 0 - 1) in
                        let _ = (if t9 >= 0 && map_has vm_keep t9 then
-                                  (let (_, _, _, _, _, ov9, _, _) = vec_get vm_code k in
-                                   let rec each = fn (i: int) -> (if i >= vec_len ov9 then () else (let _ = gc_mark_val live (vec_get ov9 i) in each (i + 1))) in
+                                  (let (_, _, ov9, vcb, vcn) = vm_prog k in
+                                   let rec each = fn (i: int) -> (if i >= vcn then () else (let _ = gc_mark_val live (vec_get ov9 (vcb + i)) in each (i + 1))) in
                                    each 0)
                                 else ()) in
                        progs (k + 1))) in
@@ -2075,10 +2075,13 @@ let gc_sweep_classes = fn (nc: bool) ->
     then (let _ = map_set tags key 1 in vec_push dead_tags key) else () in
   let _ = map_iter hng_store note in
   let _ = map_iter hng_sng_base note in
-  let _ = gc_drop_sh hng_store dead_tags "" in
+  // (through hng_drop: an Array's note goes with its entry)
+  let _ = (let rec drop_tag = fn (i: int) ->
+             if i >= vec_len dead_tags then () else (let _ = hng_drop (vec_get dead_tags i) in drop_tag (i + 1)) in
+           drop_tag 0) in
   let _ = gc_drop_sh hng_sng_base dead_tags "" in
   let _ = (if compact && vec_len dead_tags > 0 then
-    (let _ = map_compact hng_store in map_compact hng_sng_base) else ()) in
+    (let _ = map_compact hng_store in let _ = map_compact hng_arr_ids in map_compact hng_sng_base) else ()) in
   let dead_refs = vec_new () in
   let _ = map_iter ref_snaps (fn (key: int) -> fn (_entries: (str * str) list) ->
     if map_has gc_ref_live key then () else vec_push dead_refs key) in
@@ -8808,6 +8811,15 @@ and run_block1 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   let _ = (if map_len bi_skip > 0 then map_clear bi_skip else ()) in
   if map_has hook_flags "tp" && tp_blk_user world theblk then run_block_tp world encl theblk argvals
   else run_block0 world encl theblk argvals
+// run_block from inside a region a builtin iterator opened for the turn
+// (run_block_turn and its kin): the invocation needs no BLK of its own. While
+// allocations or a TracePoint are traced, the ordinary way.
+and run_block_t = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
+  if vec_get atr_on 0 > 0 || map_has hook_flags "tp" then run_block world encl theblk argvals
+  else
+    (let _ = (if vec_get attr_ic_st 3 == 1 then vec_set attr_ic_st 3 0 else ()) in
+     let _ = (if map_len bi_skip > 0 then map_clear bi_skip else ()) in
+     run_block0x world encl theblk argvals false)
 // (while allocations are traced: what the block makes is its own method's,
 //  as ruby's allocation_method_id answers -- not the method that yields)
 and run_block_atr = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
@@ -9152,6 +9164,12 @@ and core_metadata_run = fn world -> fn captured -> fn (local: str) -> fn (body: 
   let _ = box_take depth in
   result
 and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
+  run_block0x world encl theblk argvals true
+// (own9: whether the invocation opens a region of its own, BLK. A builtin
+//  iterator's turn is one already -- run_block_turn and its kin -- and a
+//  second, entered and left at every call, was 4% of a block called from
+//  an each: issue #113)
+and run_block0x = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) -> fn (own9: bool) ->
   // consume any pending forwarded-block home: a `&proc` passed to a BUILTIN
   // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
   // clear it here to keep it from leaking into a later method's frame.
@@ -9272,8 +9290,51 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // into the env on store, the Flow value is copied out. A raise inside
   // unwinds through the region and is caught by the try_or, as a raise in the
   // body always was.
-  let f = region BLK {
-   try_or_msg (fn (u: unit) ->
+  let f = (if own9 then
+             region BLK {
+               try_or_msg (fn (u: unit) -> run_block0_in world encl encl_call params00 argvals kwp9 body cenv benv)
+                 (fn (m: str) -> let _ = note_extern_refused m in FRaise VNil) }
+           else try_or_msg (fn (u: unit) -> run_block0_in world encl encl_call params00 argvals kwp9 body cenv benv)
+                  (fn (m: str) -> let _ = note_extern_refused m in FRaise VNil)) in
+  let ok = (if map_has blk_ok "n" then map_get blk_ok "n" else 0) == 1 in
+  let _ = map_set blk_ok "n" prev_ok in
+  let _ = (if rfprev9 >= 0 then ref_install rfprev9 else ()) in
+  // the block frame comes back off here, on every exit path (try_or has already
+  // turned a raise into FRaise above).
+  let _ = cd_set bcd9 in
+  let _ = vec_set cur_fm 0 fm9 in
+  let _ = box_take bcd9 in
+  let _ = rx_blk_leave rxs9 rxb9 rxh9 in
+  // the env dies here unless a closure captured it (see blk_env_put). On every
+  // exit path: try_or has already turned a raise into FRaise, so this runs
+  // before the re-raise below. The Flow value `f` does not point into the
+  // env's arena -- run_stmts copies each statement's value out of its own
+  // region STMT block, into the region current here.
+  let _ = if pooled then blk_env_put benv else () in
+  let _ = (if lfid9 > 0 then map_delete live_frames lfid9 else ()) in
+  if ok then (if map_len brk_wraps > 0 then brk_home_flow cenv f else f)
+  // the lambda's own return, consumed here (see lfid9)
+  else if lfid9 > 0 && map_has flow_sig "k" && map_has flow_sig "fid"
+          && (match map_get flow_sig "k" with VStr kk -> str_eq (sget kk) "returnret" | _ -> false)
+          && (match map_get flow_sig "fid" with VInt t9 -> t9 == lfid9 | _ -> false) then
+    (let v9 = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+     let _ = map_delete flow_sig "k" in
+     let _ = map_delete flow_sig "fid" in
+     let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+     let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
+     let _ = if map_has prim_missing "rl" then map_delete prim_missing "rl" else () in
+     let _ = if map_has prim_missing "rd" then map_delete prim_missing "rd" else () in
+     let _ = bi_rescued () in
+     let _ = if map_has prim_missing "rbt" then map_delete prim_missing "rbt" else () in
+     let _ = if map_has prim_missing "rm" then map_delete prim_missing "rm" else () in
+     let _ = if map_has prim_missing "rf" then map_delete prim_missing "rf" else () in
+     FNext v9)
+  else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
+
+// The invocation's work from parameter stripping through the body, in the
+// region its caller chose (run_block0x): BLK, or a builtin iterator's own
+// turn, which is a region of its own already (run_block_t, issue #113)
+and run_block0_in = fn world -> fn encl -> fn encl_call -> fn (params00: str list) -> fn (argvals: Val list) -> fn (kwp9: bool) -> fn (body: Stmt list) -> fn cenv -> fn benv ->
   let (encl, params0) = strip_yblk_markers encl params00 in
   // a lambda installed as a block carries a marker: strip it and enforce
   // strict arity (a plain block stays lenient).
@@ -9303,7 +9364,13 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   //  block was written in -- its body's first SFile and SLine -- as ruby
   //  reports `unknown keyword` for `proc {|a:| a}`; the caller's line was
   //  still the current one)
-  let _ = (match params with Nil -> (if is_lam then blk_head_pos body else ()) | _ -> blk_head_pos body) in
+  // (...which a block whose binding is one store cannot have: the body's own
+  //  first statements set the file and the line again, and the walk and the
+  //  file's name looked up were 4% of a block called from an each -- #113)
+  let bdef9 = block_defaults body in
+  let _ = (match params with
+           | Nil -> (if is_lam then blk_head_pos body else ())
+           | _ -> (if blk_simple1 bdef9 params argvals is_lam kwp9 then () else blk_head_pos body)) in
   // ...and a lambda's own arity refusal is the lambda's: the builtin that
   // called it (Proc#call, an each) is not put on top of it
   let _ = (if is_lam && map_has struct_ctr "bd" && map_get struct_ctr "bd" >= cd_get ()
@@ -9353,7 +9420,7 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
                          (if ip9 == 10 then (if lv_has cenv "it" then 0 else 1) else ip9)
                        else 9)
            | _ -> ()) in
-  let _ = bind_block_params benv world encl_call (block_defaults body) params argvals is_lam kwp9 in
+  let _ = bind_block_params benv world encl_call bdef9 params argvals is_lam kwp9 in
   // ⚠ WHICH implicit parameters this frame HAS is a property of the body, not
   //   of the env: the slots alone do not distinguish `it` from `_1`, and ruby 4.0's
   //   Binding#implicit_parameters answers only the ones the body declares
@@ -9387,42 +9454,7 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // normal return so the exception is re-raised (details live in ivars "$exc").
   let r = block_body_flow benv world encl body in
    let _ = map_set blk_ok "n" 1 in
-   r)
-   (fn (m: str) -> let _ = note_extern_refused m in FRaise VNil) } in
-  let ok = (if map_has blk_ok "n" then map_get blk_ok "n" else 0) == 1 in
-  let _ = map_set blk_ok "n" prev_ok in
-  let _ = (if rfprev9 >= 0 then ref_install rfprev9 else ()) in
-  // the block frame comes back off here, on every exit path (try_or has already
-  // turned a raise into FRaise above).
-  let _ = cd_set bcd9 in
-  let _ = vec_set cur_fm 0 fm9 in
-  let _ = box_take bcd9 in
-  let _ = rx_blk_leave rxs9 rxb9 rxh9 in
-  // the env dies here unless a closure captured it (see blk_env_put). On every
-  // exit path: try_or has already turned a raise into FRaise, so this runs
-  // before the re-raise below. The Flow value `f` does not point into the
-  // env's arena -- run_stmts copies each statement's value out of its own
-  // region STMT block, into the region current here.
-  let _ = if pooled then blk_env_put benv else () in
-  let _ = (if lfid9 > 0 then map_delete live_frames lfid9 else ()) in
-  if ok then (if map_len brk_wraps > 0 then brk_home_flow cenv f else f)
-  // the lambda's own return, consumed here (see lfid9)
-  else if lfid9 > 0 && map_has flow_sig "k" && map_has flow_sig "fid"
-          && (match map_get flow_sig "k" with VStr kk -> str_eq (sget kk) "returnret" | _ -> false)
-          && (match map_get flow_sig "fid" with VInt t9 -> t9 == lfid9 | _ -> false) then
-    (let v9 = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
-     let _ = map_delete flow_sig "k" in
-     let _ = map_delete flow_sig "fid" in
-     let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
-     let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
-     let _ = if map_has prim_missing "rl" then map_delete prim_missing "rl" else () in
-     let _ = if map_has prim_missing "rd" then map_delete prim_missing "rd" else () in
-     let _ = bi_rescued () in
-     let _ = if map_has prim_missing "rbt" then map_delete prim_missing "rbt" else () in
-     let _ = if map_has prim_missing "rm" then map_delete prim_missing "rm" else () in
-     let _ = if map_has prim_missing "rf" then map_delete prim_missing "rf" else () in
-     FNext v9)
-  else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
+   r
 
 // `for` desugars to `each` with a hidden "__for" / "__forv" / "__f<n>" param
 // and an assignment from it; Ruby's `for` shares the enclosing scope, so that
@@ -9659,6 +9691,18 @@ and rescues_targets = fn rescues ->
 
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
+// One ordinary positional parameter, one value, no default, no keywords, not
+// a lambda: binding it is one store, which cannot raise (bind_block_params)
+and blk_simple1 = fn (bdefaults: (str * Expr) list) -> fn (params0: str list) -> fn (argvals0: Val list) -> fn (is_lam: bool) -> fn (kwp: bool) ->
+  not is_lam && not kwp && (match bdefaults with Nil -> true | _ -> false)
+  && (match argvals0 with Cons (_, Nil) -> true | _ -> false)
+  && (match params0 with
+      | Cons (p9, Nil) -> str_len p9 > 0 && not (is_for_params params0)
+                         && not (str_starts_with p9 "*" || str_starts_with p9 "&"
+                                 || str_starts_with p9 ";" || str_starts_with p9 "("
+                                 || str_starts_with p9 "~")
+                         && not (str_ends_with p9 ":")
+      | _ -> false)
 and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * Expr) list) -> fn (params0: str list) -> fn (argvals0: Val list) -> fn (is_lam: bool) -> fn (kwp: bool) ->
   // A block's own `&b` parameter binds the block given at the CALL SITE, the
   // same way a method's does -- the comment here used to claim blocks are not
@@ -9671,15 +9715,7 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
   // One ordinary positional local and one value require no destructuring,
   // keyword/default/rest walks or temporary parameter lists. Keep the same
   // surrounding block frame, roots, observers and flow handling.
-  if not is_lam && not kwp && (match bdefaults with Nil -> true | _ -> false)
-     && (match argvals0 with Cons (_, Nil) -> true | _ -> false)
-     && (match params0 with
-         | Cons (p9, Nil) -> str_len p9 > 0 && not (is_for_params params0)
-                            && not (str_eq (char_at p9 0) "*" || str_eq (char_at p9 0) "&"
-                                    || str_eq (char_at p9 0) ";" || str_eq (char_at p9 0) "("
-                                    || str_eq (char_at p9 0) "~")
-                            && not (str_eq (char_at p9 (str_len p9 - 1)) ":")
-         | _ -> false)
+  if blk_simple1 bdefaults params0 argvals0 is_lam kwp
   then (match (params0, argvals0) with
         | (Cons (p9, Nil), Cons (v9, Nil)) -> map_set cenv p9 v9
         | _ -> ())
@@ -12012,7 +12048,7 @@ and arr_each_idx = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (
 and run_block_turn = fn world -> fn encl -> fn theblk -> fn (args: Val list) ->
   let _ = gc_point_finalizers world in
   region TURN {
-    match run_block world encl theblk args with
+    match run_block_t world encl theblk args with
     | FNext _ -> flow_next_nil
     | f -> f
   }
@@ -12026,21 +12062,21 @@ and run_block_turn = fn world -> fn encl -> fn theblk -> fn (args: Val list) ->
 and run_block_turn1 = fn world -> fn encl -> fn theblk -> fn (x: Val) ->
   let _ = gc_point_finalizers world in
   region TURN {
-    match run_block world encl theblk (Cons (x, Nil)) with
+    match run_block_t world encl theblk (Cons (x, Nil)) with
     | FNext _ -> flow_next_nil
     | f -> f
   }
 and run_block_turn_i = fn world -> fn encl -> fn theblk -> fn (i: int) ->
   let _ = gc_point_finalizers world in
   region TURN {
-    match run_block world encl theblk (Cons (VInt i, Nil)) with
+    match run_block_t world encl theblk (Cons (VInt i, Nil)) with
     | FNext _ -> flow_next_nil
     | f -> f
   }
 and run_block_turn_vi = fn world -> fn encl -> fn theblk -> fn (x: Val) -> fn (i: int) ->
   let _ = gc_point_finalizers world in
   region TURN {
-    match run_block world encl theblk (Cons (x, Cons (VInt i, Nil))) with
+    match run_block_t world encl theblk (Cons (x, Cons (VInt i, Nil))) with
     | FNext _ -> flow_next_nil
     | f -> f
   }
@@ -12048,14 +12084,14 @@ and run_block_turn_vi = fn world -> fn encl -> fn theblk -> fn (x: Val) -> fn (i
 and run_block_turn_kv = fn world -> fn encl -> fn theblk -> fn (k: Val) -> fn (v: Val) ->
   let _ = gc_point_finalizers world in
   region TURN {
-    match run_block world encl theblk (Cons (arr_new (Cons (k, Cons (v, Nil))), Nil)) with
+    match run_block_t world encl theblk (Cons (arr_new (Cons (k, Cons (v, Nil))), Nil)) with
     | FNext _ -> flow_next_nil
     | f -> f
   }
 and run_block_turn_s = fn world -> fn encl -> fn theblk -> fn (cur: str) ->
   let _ = gc_point_finalizers world in
   region TURN {
-    match run_block world encl theblk (Cons (mkstr cur, Nil)) with
+    match run_block_t world encl theblk (Cons (mkstr cur, Nil)) with
     | FNext _ -> flow_next_nil
     | f -> f
   }
@@ -15341,7 +15377,7 @@ and invoke_val_c2 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                         && map_has hng_store ("prc:" ++ str_of_int p9)
                                         && (if is_sng_cls (map_get hng_store ("prc:" ++ str_of_int p9)) then false else true) ->
              (let c9 = map_get hng_store ("prc:" ++ str_of_int p9) in
-              let _ = (if map_has hng_store ("prc:" ++ str_of_int np9) then () else map_set hng_store ("prc:" ++ str_of_int np9) c9) in
+              let _ = (if map_has hng_store ("prc:" ++ str_of_int np9) then () else hng_put ("prc:" ++ str_of_int np9) c9) in
               let hook9 = (if str_len name0 == 5 then "initialize_clone" else "initialize_dup") in
               if has_meth world c9 hook9
               then (let _ = invoke world (false, (Nil : str list), (Nil : Stmt list), env) v c9 hook9 (Cons (recv0, Nil)) in ())
@@ -18278,8 +18314,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            then map_set tc9 (nsng9 ++ "::" ++ substring k (str_len cpre9) (str_len k)) v
                            else ()) in
                  let _ = map_iter tc9 (fn (k: str) -> fn (v: Val) -> consts_put k v) in
-                 map_set hng_store (hng_key cp) nsng9)
-              else if tagged9 then map_set hng_store (hng_key cp) tag9 else ()) in
+                 hng_put (hng_key cp) nsng9)
+              else if tagged9 then hng_put (hng_key cp) tag9 else ()) in
      // ...and so does a CHILLED literal's state: #clone of one is chilled
      // too (it warns when mutated), #dup is an ordinary string
      let _ = (match (recv, cp) with
@@ -18970,11 +19006,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      // singleton has to become that tag or the mixed-in methods are invisible
      // (its superclass is the class the value had, so nothing else moves).
      let _ = (match recv with
-              | VStr _ -> map_set hng_store (hng_key recv) sc
-              | VArr _ -> map_set hng_store (hng_key recv) sc
-              | VHsh _ -> map_set hng_store (hng_key recv) sc
-              | VProc _ -> map_set hng_store (hng_key recv) sc
-              | VBind _ -> map_set hng_store (hng_key recv) sc
+              | VStr _ -> hng_put (hng_key recv) sc
+              | VArr _ -> hng_put (hng_key recv) sc
+              | VHsh _ -> hng_put (hng_key recv) sc
+              | VProc _ -> hng_put (hng_key recv) sc
+              | VBind _ -> hng_put (hng_key recv) sc
               | _ -> ()) in
      // `M.extended(base)` fires after the mixin, the mirror of `included`.
      // ActiveSupport::LazyLoadHooks initialises its hook tables there, so
@@ -19225,7 +19261,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 let _ = vec_set moved_on 0 1 in
                 let _ = (match v9 with
                          | VObj id9 -> (let (_, _, ocls9, _) = world in map_set ocls9 id9 "Ractor::MovedObject")
-                         | _ -> map_set hng_store k9 "Ractor::MovedObject") in
+                         | _ -> hng_put k9 "Ractor::MovedObject") in
                 VNil))
        | Nil -> VNil)
     else if str_eq c "Ractor" && (str_len name == 13 && str_eq name "__nonmain_off") then
@@ -19418,25 +19454,25 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       // against it, so a `self << x` in there appends to this array.
       (if has_meth world c "initialize" then
          (let v = arr_new Nil in
-          let _ = map_set hng_store (hng_key v) c in
+          let _ = hng_put (hng_key v) c in
           let _ = invoke world noblk v c "initialize" args in
           v)
        else
          (let v = array_new_args args in
-          let _ = (match v with VArr _ -> map_set hng_store (hng_key v) c | _ -> ()) in v))
+          let _ = (match v with VArr _ -> hng_put (hng_key v) c | _ -> ()) in v))
     // a subclass of Hash is backed by real hash storage and tagged with the
     // subclass, the same way an Array subclass is — otherwise h[:k] = v on an
     // instance has nowhere to write.
     else if (str_len name == 3 && str_eq name "new") && (if str_eq c "Hash" then false else obj_is_a world c "Hash") then
       (if has_meth world c "initialize" then
          (let v = mkhash Nil in
-          let _ = map_set hng_store (hng_key v) c in
+          let _ = hng_put (hng_key v) c in
           let _ = invoke world noblk v c "initialize" args in
           v)
        else
          (let v = mkhash Nil in
           let _ = (match args with Cons (d, _) -> (match v with VHsh hid -> hdflt_set hid d | _ -> ()) | _ -> ()) in
-          let _ = map_set hng_store (hng_key v) c in v))
+          let _ = hng_put (hng_key v) c in v))
     // a subclass of String is backed by real string storage and tagged so its
     // own methods dispatch (super reaches String). With its own #initialize the
     // storage starts EMPTY and initialize runs against it, the same way an
@@ -19448,14 +19484,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let bin9 = fn (v: Val) -> (match v with VStr h9 -> (let _ = senc_set h9 "ASCII-8BIT" in v) | _ -> v) in
        if has_meth world c "initialize" then
          (let v = bin9 (mkstr "") in
-          let _ = map_set hng_store (hng_key v) c in
+          let _ = hng_put (hng_key v) c in
           let _ = invoke world noblk v c "initialize" args in
           v)
        // (without one, String.new's own rules -- `encoding:`, the TypeError
        //  for a non-String source -- and the subclass's tag)
        else
          (let v = new_obj world "String" args in
-          let _ = (match v with VStr _ -> map_set hng_store (hng_key v) c | _ -> ()) in v))
+          let _ = (match v with VStr _ -> hng_put (hng_key v) c | _ -> ()) in v))
     // Hash[k => v, ...] / Hash[{...}] and Array[...] constructor syntax.
     // Hash[...] takes three shapes: one Hash, one array of [k, v] pairs, or a
     // flat even-length argument list. Only the first was built; the other two
@@ -19481,7 +19517,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // (which is the whole point of the spec fixtures that use it).
     else if (str_len name == 2 && str_eq name "[]") && obj_is_a world c "Array" then
       (let v = arr_new args in
-       let _ = map_set hng_store (hng_key v) c in v)
+       let _ = hng_put (hng_key v) c in v)
     // ...and a SUBCLASS's: the same conversions (an object with #to_hash or
     // #to_ary), and the result is an instance of the subclass -- it was a
     // plain Hash, and `SubHash[o]` with a #to_hash was "odd number"
@@ -19498,7 +19534,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                     | _ -> args)
                  | _ -> args) in
        let v9 = hash_bracket world a9 in
-       let _ = (match v9 with VHsh _ -> map_set hng_store (hng_key v9) c | _ -> ()) in
+       let _ = (match v9 with VHsh _ -> hng_put (hng_key v9) c | _ -> ()) in
        v9)
     // Hash.ruby2_keywords_hash?(h) / Hash.ruby2_keywords_hash(h): the "keywords
     // hash" mark is the one a `key:` argument already carries here (a
@@ -19530,7 +19566,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                then map_set hash_dproc (str_of_int d9) (map_get hash_dproc (str_of_int h9)) else ()) in
                       // the subclass tag and the instance variables ride along
                       let _ = (let hk9 = hng_key (VHsh h9) in
-                               if map_has hng_store hk9 then map_set hng_store (hng_key cp9) (map_get hng_store hk9) else ()) in
+                               if map_has hng_store hk9 then hng_put (hng_key cp9) (map_get hng_store hk9) else ()) in
                       let oldp9 = hng_key (VHsh h9) ++ "@" in
                       let newp9 = hng_key cp9 ++ "@" in
                       let tmp9 = map_new () in
@@ -24364,7 +24400,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (match args with
        | Cons (v9, Cons (VClass k9, _)) ->
          (let hk9 = hng_key v9 in
-          let _ = (if str_len hk9 > 0 then map_set hng_store hk9 k9 else ()) in v9)
+          let _ = (if str_len hk9 > 0 then hng_put hk9 k9 else ()) in v9)
        | Cons (v9, _) -> v9
        | _ -> VNil)
     // rb_ary_push and OBJ_FREEZE for the loader: the builtin act, never a
@@ -30398,7 +30434,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // ...and #clone keeps the singleton class (an attr_accessor put there
        // answers on the copy), #dup does not
        let _ = (if str_len name == 5 && map_has hng_store ("bnd:" ++ str_of_int bid)
-                then map_set hng_store ("bnd:" ++ str_of_int nb9) (map_get hng_store ("bnd:" ++ str_of_int bid)) else ()) in
+                then hng_put ("bnd:" ++ str_of_int nb9) (map_get hng_store ("bnd:" ++ str_of_int bid)) else ()) in
        VBind nb9)
     // Binding#local_variables: the names the binding can see, as symbols.
     // ⚠ NOT the interpreter's own entries -- `self` and the `__`-prefixed
@@ -31764,7 +31800,7 @@ and hsh_class_like = fn (src: Val) -> fn (dst: Val) ->
   let hk9 = hng_key src in
   let c9 = (if map_has hng_store hk9 then map_get hng_store hk9 else "") in
   let c9 = (if is_sng_cls c9 then (if map_has hng_sng_base hk9 then map_get hng_sng_base hk9 else "") else c9) in
-  if str_eq c9 "" || str_eq c9 "Hash" then () else map_set hng_store (hng_key dst) c9
+  if str_eq c9 "" || str_eq c9 "Hash" then () else hng_put (hng_key dst) c9
 // What nl_langinfo(CODESET) answers after setlocale(LC_CTYPE, ""), read the
 // way setlocale reads it: LC_ALL, else LC_CTYPE, else LANG; the codeset after
 // the dot (up to an @modifier), "UTF-8" however a UTF-8 one is spelled; and
@@ -33466,9 +33502,9 @@ and alloc_empty = fn world -> fn (c9: str) ->
       (let (_, _, oc9, _) = world in
        let id9 = alloc_oid oc9 in let _ = map_set oc9 id9 c9 in VObj id9) in
   let _ = (match v9 with
-    | VStr _ -> if str_eq c9 "String" then () else map_set hng_store (hng_key v9) c9
-    | VArr _ -> if str_eq c9 "Array" then () else map_set hng_store (hng_key v9) c9
-    | VHsh _ -> if str_eq c9 "Hash" then () else map_set hng_store (hng_key v9) c9
+    | VStr _ -> if str_eq c9 "String" then () else hng_put (hng_key v9) c9
+    | VArr _ -> if str_eq c9 "Array" then () else hng_put (hng_key v9) c9
+    | VHsh _ -> if str_eq c9 "Hash" then () else hng_put (hng_key v9) c9
     | _ -> ()) in
   v9
 and bi_priv_over = fn world -> fn (recv: Val) -> fn (name: str) ->
@@ -34335,7 +34371,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           let id = (proc_next ()) in
           let _ = store_proc (str_of_int id) newblk in
           let _ = if (let (h, _, _, _) = blk in h) then store_yblk (str_of_int id) blk else () in
-          let _ = map_set hng_store ("prc:" ++ str_of_int id) c in
+          let _ = hng_put ("prc:" ++ str_of_int id) c in
           let _ = (if has_meth world c "initialize" then (let _ = invoke world newblk (VProc id) c "initialize" args in ()) else ()) in
           VProc id)
        else if str_eq c "Proc" && (str_len name == 3 && str_eq name "new") then
@@ -34665,7 +34701,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // the first `[]=` inside initialize was a NoMethodError.
        else if (str_len name == 3 && str_eq name "new") && (if str_eq c "Hash" then false else obj_is_a world c "Hash") then
          (let v9 = mkhash Nil in
-          let _ = map_set hng_store (hng_key v9) c in
+          let _ = hng_put (hng_key v9) c in
           let _ = (if has_meth world c "initialize"
                    then (let _ = invoke world newblk v9 c "initialize" args in ())
                    else (match v9 with
@@ -35549,7 +35585,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
     // (the primitive's dup copies the table, the default and the identity
     //  mode, and no instance variables; the subclass's tag is taken off)
     (let v9 = prim_method recv "dup" Nil in
-     let _ = (if map_has hng_store (hng_key v9) then map_delete hng_store (hng_key v9) else ()) in
+     let _ = hng_drop (hng_key v9) in
      let _ = (match (recv, v9) with
               | (VHsh o9, VHsh n9) ->
                 (let _ = (match hdflt_get o9 with VNil -> () | d9 -> hdflt_set n9 d9) in
@@ -40620,7 +40656,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                | VProc pid9 ->
                  (let np9 = proc_copy pid9 in
                   let _ = (if (str_len name == 5 && str_eq name "clone") && map_has hng_store ("prc:" ++ str_of_int pid9)
-                           then map_set hng_store ("prc:" ++ str_of_int np9) (map_get hng_store ("prc:" ++ str_of_int pid9)) else ()) in
+                           then hng_put ("prc:" ++ str_of_int np9) (map_get hng_store ("prc:" ++ str_of_int pid9)) else ()) in
                   VProc np9)
                | VArr id -> arr_new (deref id)
                | VStr h -> (let c2 = mkstr (sget h) in (match c2 with VStr nid -> (let _ = senc_set nid (senc_get h) in c2) | _ -> c2))
@@ -47947,15 +47983,29 @@ and main_sng_has = fn world -> fn (name: str) ->
 and native_array_query = fn world -> fn (recv: Val) -> fn (name: str) -> fn (vis: bool) ->
   // With no prepend, subclass, singleton or Ruby override, Array itself is
   // the native owner. Lower ancestors cannot change this entry's visibility.
-  let key9 = "Array#" ++ name in
+  // (the key is one of three literals, not a String made at each call: an
+  //  `array.length` in a block run 6,800 times a turn made it every time --
+  //  issue #113)
+  let key9 = (if str_eq name "length" then "Array#length" else if str_eq name "size" then "Array#size" else "Array#empty?") in
   vec_get moved_on 0 == 0 && vec_get core_only 0 == 0 && map_len ractor_thr == 0
   && map_len trace_fn == 0 && not (map_has hook_flags "tp" || map_has hook_flags "stf")
   && map_len ref_active == 0 && map_len bi_skip == 0 && map_len bm_bypass == 0
   && not (map_has undef_names name || map_has builtin_alias key9)
-  && not (map_has prepends "Array")
-  && not (map_len hng_store > 0 && map_has hng_store (hng_key recv))
-  && not (has_meth world "Array" name)
+  && naq_meth_free world name
+  && not (map_len hng_store > 0 && (match recv with VArr i9 -> map_has hng_arr_ids i9 | _ -> true) && map_has hng_store (hng_key recv))
   && (not vis || not (map_has privates key9 || map_has protecteds key9))
+// ...no prepend on Array and no method of the name on it or above it: what
+// mro_bump's generation covers -- every write to meths, prepends and undefs
+// moves it, and Array is no local owner -- so answered once a generation for
+// each of the three names, as int_ops_plain is for Integer's operators
+and naq_meth_free = fn world -> fn (name: str) ->
+  let i = (if str_eq name "length" then 0 else if str_eq name "size" then 2 else 4) in
+  let g = mro_now () in
+  if mro_cache_on () && vec_get naq_st i == g then vec_get naq_st (i + 1) == 1
+  else
+    (let ok = not (map_has prepends "Array") && not (has_meth world "Array" name) in
+     let _ = (if mro_cache_on () then (let _ = vec_set naq_st i g in vec_set naq_st (i + 1) (if ok then 1 else 0)) else ()) in
+     ok)
 and emethod_args = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vis: bool) ->
   // These native reads cannot invoke Ruby or observe a builtin frame.
   // Arguments were evaluated already; all observed or altered entries keep
@@ -49425,17 +49475,17 @@ and vm_triv_store_ok = fn (params: str list) -> fn (body: Stmt list) ->
     (let (_, _, kind, g, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
      if g != gen || kind != 2 then false
      else
-       (let (op, na, _, _, _, _, _, _) = vec_get vm_code id in
-        let n = vec_len op in
+       (let (code, na, _, vcb, vcn) = vm_prog id in
+        let n = vcn in
         let rec go = fn (i: int) -> fn (seen: bool) ->
           (if i >= n then false
-           else if vec_get op i == 50 then seen && i == n - 1
-           else if vec_get op i == 20 && i + 1 < n then
-             (let p9 = vec_get na i in
-              let j = (if vec_get op (i + 1) == 14 then i + 2 else i + 1) in
+           else if vc code (vcb + i) 0 == 50 then seen && i == n - 1
+           else if vc code (vcb + i) 0 == 20 && i + 1 < n then
+             (let p9 = vec_get na (vcb + i) in
+              let j = (if vc code (vcb + (i + 1)) 0 == 14 then i + 2 else i + 1) in
               str_list_has params p9 && (if str_eq p9 "_" then false else true)
-              && j < n && vec_get op j == 23
-              && (let iv9 = vec_get na j in str_len iv9 > 1 && (if str_eq (char_at iv9 1) "@" then false else true))
+              && j < n && vc code (vcb + j) 0 == 23
+              && (let iv9 = vec_get na (vcb + j) in str_len iv9 > 1 && (if str_eq (char_at iv9 1) "@" then false else true))
               && go (j + 1) true)
            else false) in
         go 0 false))
@@ -49446,14 +49496,14 @@ and vm_triv_store_run = fn world -> fn (recv: Val) -> fn (params: str list) -> f
   match body with
   | Cons (SLineQ _, Cons (SFile _, Cons (SVm (id, _), Nil))) ->
     (let (_, _, _, ivars9) = world in
-     let (op, na, _, _, _, _, _, _) = vec_get vm_code id in
-     let n = vec_len op in
+     let (code, na, _, vcb, vcn) = vm_prog id in
+     let n = vcn in
      let rec go = fn (i: int) -> fn (last: Val) ->
-       (if i >= n || vec_get op i == 50 then last
+       (if i >= n || vc code (vcb + i) 0 == 50 then last
         else
-          (let p9 = vec_get na i in
-           let j = (if vec_get op (i + 1) == 14 then i + 2 else i + 1) in
-           let iv9 = vec_get na j in
+          (let p9 = vec_get na (vcb + i) in
+           let j = (if vc code (vcb + (i + 1)) 0 == 14 then i + 2 else i + 1) in
+           let iv9 = vec_get na (vcb + j) in
            let v9 = triv_store_arg params args p9 in
            let _ = iv_put ivars9 (ivar_self_key recv (substring iv9 1 (str_len iv9))) v9 in
            go (j + 1) v9)) in
@@ -58747,8 +58797,8 @@ and vm_empty_block_binding_body = fn (id: int) -> fn (gen: int) ->
      && (match kids9 with Nil -> true | _ -> false)
      && (match defaults9 with Nil -> true | _ -> false)
      && (match catches9 with Nil -> true | _ -> false)
-     && (let (ops9, _, _, _, _, _, _, _) = vec_get vm_code id in
-         vec_len ops9 == 2 && vec_get ops9 0 == 1 && vec_get ops9 1 == 50))
+     && (let (code, _, _, vcb, vcn) = vm_prog id in
+         vcn == 2 && vc code (vcb + 0) 0 == 1 && vc code (vcb + 1) 0 == 50))
 and empty_block_binding_body = fn (body: Stmt list) ->
   match body with
   // Loaded method bodies carry negative source markers and an SVm. Check
@@ -66210,7 +66260,8 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   if (if str_eq why0 "" then false else true) then (why0, 0 - 1, 0, (Nil : int list), (Nil : (str * int) list))
   else
   let id = vm_slot () in
-  let (op, na, ia, ib, ic, ov, ln, ev) = vec_get vm_code id in
+  let _ = (if depth == 0 then vec_set vm_tree_cur 0 (vm_tree_new ()) else ()) in
+  let (code, na, ov) = vm_scratch depth in
   let labels = map_new () in
   let rec scan = fn (xs: Val list) -> fn (i: int) ->
     (match xs with
@@ -66259,14 +66310,14 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
            //  flag's bit 1048576 says the answer is used: vm_call_in.)
            let x = (if o == 29 && cid < 0 && vm_setter n && (if vm_next_pops t then false else true) then x + 1048576 else x) in
            if str_eq cw "" then
-             (let _ = vec_push op o in
+             (let _ = vec_push code o in
               let _ = vec_push na n in
-              let _ = vec_push ia x in
-              let _ = vec_push ib y in
-              let _ = vec_push ic cid in
+              let _ = vec_push code x in
+              let _ = vec_push code y in
+              let _ = vec_push code cid in
               let _ = vec_push ov v in
-              let _ = vec_push ln line in
-              let _ = vec_push ev evt in
+              let _ = vec_push code line in
+              let _ = vec_push code evt in
               go t line 0 (if o == 27 then 27 + 100 * x else o)
                  (vm_bor (vm_bor yld cy)
                     // (a yield, or `defined?(yield)`, asks for the method's block)
@@ -66282,7 +66333,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
         else (w, yld, ids, outs))
      | Cons (_, t) -> go t line evt prev yld ids outs) in
   let (why1, yld1, kids1, outs1) = go body line0 0 (0 - 1) 0 (Nil : int list) (Nil : (str * int) list) in
-  let _ = (if str_eq why1 "" then vm_fuse_mark labels id else ()) in
+  let _ = (if str_eq why1 "" then vm_fuse_mark labels (code, na, ov) else ()) in
   // the catch table: each rescue / ensure entry's sequence a program of its
   // own, the labels instruction indices; and where a protected region
   // starts, marked in the events (2: vm_loop asks vm_region there)
@@ -66308,8 +66359,8 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
         //  ensure's region is cut in pieces around the copies of the ensure
         //  the compiler put in it, and a branch past a copy lands inside
         //  the next piece)
-        let _ = (if str_eq w2 "" && (k == 1 || k == 2) && e9 > s9 && e9 <= vec_len ev then
-                   (let mark = fn (i: int) -> (let e0 = vec_get ev i in if (e0 / 2) % 2 == 1 then () else vec_set ev i (e0 + 2)) in
+        let _ = (if str_eq w2 "" && (k == 1 || k == 2) && e9 > s9 && e9 <= vc_n code then
+                   (let mark = fn (i: int) -> (let e0 = vc code i 5 in if (e0 / 2) % 2 == 1 then () else vec_set code (i * 6 + 5) (e0 + 2)) in
                     let _ = mark s9 in
                     map_iter labels (fn (ln9: str) -> fn (li: int) -> if li > s9 && li < e9 then mark li else ()))
                  else ()) in
@@ -66398,30 +66449,34 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   // (a block's implicit parameters, plus 1, where a tree's top keeps its
   //  state: a block is never a top -- vm_enter writes the frame's "__ip")
   let _ = (if kind == 1 && ipn >= 0 then vec_set vm_own (3 * id + 2) (ipn + 1) else ()) in
+  // (its instructions put in the tree, after those of the sequences inside
+  //  it; a tree none of whose sequences got there is given back at once)
+  let _ = (if str_eq why "" then vm_tree_put id depth else ()) in
+  let _ = (if depth == 0 && vec_get vm_tree_rc (vec_get vm_tree_cur 0) == 0 then vm_tree_give (vec_get vm_tree_cur 0) else ()) in
   (why, id, yld, Cons (id, kids), outs)
 // A getlocal, then a getlocal or an Integer putobject, then a plain Integer
 // operator -- `n < 2`, `n - 1`, `i < n`, `s + x` -- is marked at the getlocal
 // (its ib, which a getlocal does not use) for vm_step to answer the three in
 // one step when both values are Integers: vm_fused2. Not when a jump can land
 // on the second or the third, or an event is on them.
-and vm_fuse_mark = fn labels -> fn (id: int) ->
-  let (op, na, ia, ib, ic, ov, _, ev) = vec_get vm_code id in
-  let n = vec_len op in
+and vm_fuse_mark = fn labels -> fn sc ->
+  let (code, na, ov) = sc in
+  let n = vc_n code in
   let tgt = vec_new () in
   let rec zero = fn (i: int) -> (if i > n then () else (let _ = vec_push tgt 0 in zero (i + 1))) in
   let _ = zero 0 in
   let _ = map_iter labels (fn (l: str) -> fn (i: int) -> if i >= 0 && i <= n then vec_set tgt i 1 else ()) in
   let opnd = fn (i: int) ->
-    (let o = vec_get op i in
-     o == 20 || (o == 3 && vec_get ia i != 1 && (match vec_get ov i with VInt _ -> true | _ -> false))) in
+    (let o = vc code i 0 in
+     o == 20 || (o == 3 && vc code i 1 != 1 && (match vec_get ov i with VInt _ -> true | _ -> false))) in
   let rec go = fn (i: int) ->
     (if i + 2 >= n then ()
      else
-       (let f = vec_get ia (i + 2) in
-        let _ = (if vec_get op i == 20 && opnd (i + 1) && vec_get op (i + 2) == 29
+       (let f = vc code (i + 2) 1 in
+        let _ = (if vc code i 0 == 20 && opnd (i + 1) && vc code (i + 2) 0 == 29
                     && vec_get tgt (i + 1) == 0 && vec_get tgt (i + 2) == 0
-                    && vec_get ev (i + 1) == 0 && vec_get ev (i + 2) == 0
-                    && vec_get ib (i + 2) == 1 && vec_get ic (i + 2) < 0
+                    && vc code (i + 1) 5 == 0 && vc code (i + 2) 5 == 0
+                    && vc code (i + 2) 2 == 1 && vc code (i + 2) 3 < 0
                     && vm_bit f 16 && (if vm_bit f 4 then false else true)
                     && vm_fuse_op (vec_get na (i + 2))
                  then
@@ -66429,10 +66484,10 @@ and vm_fuse_mark = fn labels -> fn (id: int) ->
                    //  jumps to: the answer is tested there and not pushed;
                    //  3 when a dup and a setlocal do -- `s += x` as a value --
                    //  and 4 a setlocal alone: the answer is stored there)
-                   (let quiet = fn (j: int) -> j < n && vec_get tgt j == 0 && vec_get ev j == 0 in
-                    let o3 = (if i + 3 < n then vec_get op (i + 3) else 0 - 1) in
-                    vec_set ib i (if quiet (i + 3) && (o3 == 47 || o3 == 48) then 2
-                                  else if quiet (i + 3) && quiet (i + 4) && o3 == 14 && vec_get op (i + 4) == 21 then 3
+                   (let quiet = fn (j: int) -> j < n && vec_get tgt j == 0 && vc code j 5 == 0 in
+                    let o3 = (if i + 3 < n then vc code (i + 3) 0 else 0 - 1) in
+                    vec_set code (i * 6 + 2) (if quiet (i + 3) && (o3 == 47 || o3 == 48) then 2
+                                  else if quiet (i + 3) && quiet (i + 4) && o3 == 14 && vc code (i + 4) 0 == 21 then 3
                                   else if quiet (i + 3) && o3 == 21 then 4
                                   else 1))
                  else ()) in
@@ -66441,9 +66496,9 @@ and vm_fuse_mark = fn labels -> fn (id: int) ->
 // ...an operand of them: the putobject's Integer, or the local as getlocal
 // reads it (a closure made for this at every step was a tenth of the step)
 and vm_fz_rd = fn env -> fn cd -> fn (i: int) ->
-  let (op, na, _, _, _, ov, _, _) = cd in
-  if vec_get op i == 3 then vec_get ov i
-  else (let n = vec_get na i in
+  let (code, na, ov, vcb, vcn) = cd in
+  if vc code (vcb + i) 0 == 3 then vec_get ov (vcb + i)
+  else (let n = vec_get na (vcb + i) in
         match lv_get env n with
         | VExc (c9, _) when str_eq c9 "~vmarg~" -> VNil
         | v9 -> v9)
@@ -66456,7 +66511,7 @@ and vm_fuse_op = fn (m: str) ->
 // as itself. As vm_step's own Integer path: not while a TracePoint wants the
 // call or an Integer operator is redefined.
 and vm_fused2 = fn env -> fn world -> fn st -> fn cd -> fn (pc: int) -> fn (kind: int) ->
-  let (op, na, ia, _, _, _, _, _) = cd in
+  let (code, na, _, vcb, vcn) = cd in
   if map_len hook_flags > 0 && map_has hook_flags "tp" then 0 - 1
   else
     (match vm_fz_rd env cd pc with
@@ -66464,18 +66519,18 @@ and vm_fused2 = fn env -> fn world -> fn st -> fn cd -> fn (pc: int) -> fn (kind
        (match vm_fz_rd env cd (pc + 1) with
         | VInt y ->
           if int_ops_plain world then
-            (let (ok, v) = int_fast_op (vec_get na (pc + 2)) x y in
+            (let (ok, v) = int_fast_op (vec_get na (vcb + (pc + 2))) x y in
              if (if ok then false else true) then 0 - 1
              else if kind == 1 then (let _ = vm_push st v in pc + 3)
              // (the setlocal's store, as vm_var_op makes it)
              else if kind == 3 || kind == 4 then
                (let j = (if kind == 3 then pc + 4 else pc + 3) in
-                let n9 = vec_get na j in
-                let l9 = vec_get ia j in
+                let n9 = vec_get na (vcb + j) in
+                let l9 = vc code (vcb + j) 1 in
                 let _ = (if l9 == 0 then map_set env n9 v else vm_setup env n9 l9 v) in
                 if kind == 3 then (let _ = vm_push st v in pc + 5) else pc + 4)
              // (branchif jumps on a truthy answer, branchunless on a falsy one)
-             else if (if vec_get op (pc + 3) == 47 then truthy v else (if truthy v then false else true)) then vec_get ia (pc + 3)
+             else if (if vc code (vcb + (pc + 3)) 0 == 47 then truthy v else (if truthy v then false else true)) then vc code (vcb + (pc + 3)) 1
              else pc + 4)
           else 0 - 1
         | _ -> 0 - 1)
@@ -66554,11 +66609,11 @@ and vm_cov_note = fn (top: Val list) -> fn (ids: int list) ->
     (match xs with
      | Nil -> ()
      | Cons (id, t) ->
-       (let (_, _, _, _, _, _, ln, ev) = vec_get vm_code id in
+       (let (code, _, _, vcb, vcn) = vm_prog id in
         let rec lines = fn (i: int) ->
-          (if i >= vec_len ev then ()
-           else (let _ = (if vec_get ev i % 2 == 1 && vec_get ln i > 0 then
-                            (let k = "L:" ++ pth ++ chr 1 ++ str_of_int (vec_get ln i) in
+          (if i >= vcn then ()
+           else (let _ = (if vc code (vcb + i) 5 % 2 == 1 && vc code (vcb + i) 4 > 0 then
+                            (let k = "L:" ++ pth ++ chr 1 ++ str_of_int (vc code (vcb + i) 4) in
                              if map_has cov_tab k then () else map_set cov_tab k 0)
                           else ()) in
                  lines (i + 1))) in
@@ -66788,9 +66843,9 @@ and vm_yields = fn (id: int) ->
 // the last line a program's instructions are on (Proc#__tp_lines: the lines
 // a targeted TracePoint hooks)
 and vm_max_line = fn (id: int) ->
-  let (_, _, _, _, _, _, lns, _) = vec_get vm_code id in
+  let (code, _, _, vcb, vcn) = vm_prog id in
   let rec go = fn (i: int) -> fn (acc: int) ->
-    (if i >= vec_len lns then acc else go (i + 1) (let l = vec_get lns i in if l > acc then l else acc)) in
+    (if i >= vcn then acc else go (i + 1) (let l = vc code (vcb + i) 4 in if l > acc then l else acc)) in
   go 0 0
 // every local a program's own table names (a frame's locals to a
 // TracePoint's binding, assigned yet or not: tp_env_meth)
@@ -67478,10 +67533,10 @@ and vm_expand = fn env -> fn world -> fn blk -> fn st -> fn (num: int) -> fn (fl
 // ---- running ----
 // One instruction; answers the next pc, or -1 at `leave` (the value on top).
 and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
-  let (op, na, ia, ib, ic, ov, ln, ev) = cd in
+  let (code, na, ov, vcb, vcn) = cd in
   let (stk, regs) = st in
-  let o = vec_get op pc in
-  let _ = cur_line_set (vec_get ln pc) in
+  let o = vc code (vcb + pc) 0 in
+  let _ = cur_line_set (vc code (vcb + pc) 4) in
   // a statement begins with nothing on the stack: its interval starts here
   // and a collection may run, as between two statements of a body
   // (run_stmts). The stack's Vec is wound back then too -- nothing in it is
@@ -67494,7 +67549,7 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
   //  turn and a signal are given -- but those were given where the frame
   //  was entered (vm_body_run, the statement around a `once`), and nothing
   //  of Ruby's is made between: a frame's first statement marks none again)
-  let _ = (if vec_get ev pc % 2 == 1 && vec_get regs 0 == 0 then
+  let _ = (if vc code (vcb + pc) 5 % 2 == 1 && vec_get regs 0 == 0 then
              (let _ = vm_stack_wind st in
               if vec_get regs 14 == 1 then ()
               else
@@ -67505,21 +67560,21 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
   // the events ruby put on the instruction: a line is Coverage's count and
   // a TracePoint's :line, and a rescue clause's first instruction its
   // :rescue. A hook runs Ruby: what the stack holds is rooted first.
-  let _ = (if vec_get ev pc == 0 then ()
+  let _ = (if vc code (vcb + pc) 5 == 0 then ()
            else if vec_get cov_st 0 != 2 && (if map_len hook_flags > 0 && map_has hook_flags "tp" then false else true) then ()
-           else vm_events env world (vec_get ev pc) (vec_get ln pc)) in
-  let n = vec_get na pc in
-  let a = vec_get ia pc in
+           else vm_events env world (vc code (vcb + pc) 5) (vc code (vcb + pc) 4)) in
+  let n = vec_get na (vcb + pc) in
+  let a = vc code (vcb + pc) 1 in
   // (a getlocal marked by vm_fuse_mark: it, the operand after it and the
   //  operator in one step -- and the branch after them, marked 2)
-  let fz = (if o == 20 then (let k = vec_get ib pc in if k > 0 then vm_fused2 env world st cd pc k else 0 - 1) else 0 - 1) in
+  let fz = (if o == 20 then (let k = vc code (vcb + pc) 2 in if k > 0 then vm_fused2 env world st cd pc k else 0 - 1) else 0 - 1) in
   if fz >= 0 then fz
   else
   // (two Integers and a plain operator -- `i < n`, `s += i` -- answered here,
   //  as the evaluator's EBin answers them: when no Integer operator is
   //  redefined and no TracePoint wants the call. ARGS_SIMPLE, no FCALL, one
   //  argument, no block.)
-  if o == 29 && vec_get ib pc == 1 && vec_get ic pc < 0 && vm_bit a 16 && (if vm_bit a 4 then false else true)
+  if o == 29 && vc code (vcb + pc) 2 == 1 && vc code (vcb + pc) 3 < 0 && vm_bit a 16 && (if vm_bit a 4 then false else true)
      && vm_int_fast world st n then pc + 1
   else
   // throw: the sequence is left with the value on top, and regs' slot 2 says
@@ -67540,16 +67595,16 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
      //  `new` its operand jumps to)
      else a)
   else
-    (let _ = (if o <= 19 || o == 53 then vm_stack_op env world blk st o n a (vec_get ov pc)
+    (let _ = (if o <= 19 || o == 53 then vm_stack_op env world blk st o n a (vec_get ov (vcb + pc))
               else if o <= 28 then vm_var_op env world blk st o n a
-              else if o == 29 then vm_send env world blk st n a (vec_get ib pc) (vec_get ov pc) (vec_get ic pc)
-              else if o == 55 then vm_yield env world blk st a (vec_get ib pc) (vec_get ov pc)
+              else if o == 29 then vm_send env world blk st n a (vc code (vcb + pc) 2) (vec_get ov (vcb + pc)) (vc code (vcb + pc) 3)
+              else if o == 55 then vm_yield env world blk st a (vc code (vcb + pc) 2) (vec_get ov (vcb + pc))
               // (checkkeyword: the evaluator bound a keyword that was not
               //  given to EVmArg's value, and its default is the sequence's
               //  to compute)
               else if o == 57 then vm_push st (VBool (if vm_unset (if map_has env n then map_get env n else VNil) then false else true))
-              else if o >= 59 && o <= 61 then vm_define env world blk st o n a (vec_get ic pc)
-              else if o == 62 then vm_super env world blk st a (vec_get ib pc) (vec_get ov pc) (vec_get ic pc)
+              else if o >= 59 && o <= 61 then vm_define env world blk st o n a (vc code (vcb + pc) 3)
+              else if o == 62 then vm_super env world blk st a (vc code (vcb + pc) 2) (vec_get ov (vcb + pc)) (vc code (vcb + pc) 3)
               else if o == 64 then vm_checkmatch env world blk st a
               // (pushtoarraykwsplat: `[1, **h]`, `return 1, **h` -- the Hash
               //  is the Array's last element unless it is empty)
@@ -67567,14 +67622,14 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
                                     | VArr _ -> a == 7
                                     | VHsh _ -> a == 8
                                     | _ -> false)))
-              else if o == 65 || o == 66 then vm_defined env world blk st o n a (vec_get ib pc) (vec_get ov pc)
+              else if o == 65 || o == 66 then vm_defined env world blk st o n a (vc code (vcb + pc) 2) (vec_get ov (vcb + pc))
               // (toregexp: the pieces joined as an interpolation's are, and
               //  the Regexp of that source with the literal's options)
               // (...as the evaluator makes a pattern with interpolation:
               //  rx_dregexp over the pieces, each its own text or computed,
               //  then the pattern of the joined source under the flags)
               else if o == 67 then
-                (let ps = vm_popn st (vec_get ib pc) in
+                (let ps = vm_popn st (vc code (vcb + pc) 2) in
                  let bar = str_index_of n "|" in
                  if bar < 0 then
                    (let rec spine = fn (xs: Expr list) -> fn (acc: Expr) ->
@@ -67622,7 +67677,7 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
               //  and the evaluator's rx_once_eval)
               else if o == 77 then
                 (let k9 = vm_once_key st a in
-                 let cid9 = vec_get ic pc in
+                 let cid9 = vc code (vcb + pc) 3 in
                  let run9 = fn (u: unit) -> (let (v9, _) = vm_exec env world blk cid9 0 in v9) in
                  let rec wait9 = fn (u: unit) ->
                    (if map_has ff_state k9 then ()
@@ -67639,7 +67694,7 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
                     let _ = map_set ff_state k9 v9 in
                     vm_push st v9))
               else if o == 68 then vm_push st (vm_ev env world blk (EVar n))
-              else if o == 72 || o == 73 then vm_forward env world blk st o n a (vec_get ib pc) (vec_get ov pc)
+              else if o == 72 || o == 73 then vm_forward env world blk st o n a (vc code (vcb + pc) 2) (vec_get ov (vcb + pc))
               // (getconstant: the constant under the class the value below
               //  is -- `expr::X` -- or, for nil with the flag above it true,
               //  the frame's own lookup)
@@ -67654,9 +67709,9 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
               //  object, which the send was written to, comes off the stack)
               else if o == 58 then
                 (let _ = vm_pop st in
-                 let (_, _, _, _, _, _, _, _, bp, bb, _, _, _, _) = vec_get vm_meta (vec_get ic pc) in
+                 let (_, _, _, _, _, _, _, _, bp, bb, _, _, _, _) = vec_get vm_meta (vc code (vcb + pc) 3) in
                  vm_push st (vm_ev env world blk (ELambda (bp, bb))))
-              else vm_value_op env world blk st o n a (vec_get ib pc) (vec_get ov pc)) in
+              else vm_value_op env world blk st o n a (vc code (vcb + pc) 2) (vec_get ov (vcb + pc))) in
      // (a tail call made by the caller: the frame is left -- vm_send)
      if vec_get regs 2 == 7 then 0 - 1 else pc + 1)
 // (the method an event names, as the evaluator's :line names it: the frame's
@@ -67742,11 +67797,11 @@ and vm_str_append = fn world -> fn (va0: Val) -> fn (h: int) -> fn (y: int) ->
 // handlers need the original exception pinned before resolving the class.
 // Lookup-free builtin operands (including bare rescue) keep the fast path.
 and vm_rescue_only_matches = fn (cid: int) ->
-  let (op, _, _, _, _, _, _, _) = vec_get vm_code cid in
-  let n = vec_len op in
+  let (code, _, _, vcb, vcn) = vm_prog cid in
+  let n = vcn in
   let rec go = fn (i: int) ->
     (if i >= n then true
-     else (let o = vec_get op i in
+     else (let o = vc code (vcb + i) 0 in
            if o == 0 || o == 1 || o == 3 || o == 13 || o == 20 || o == 64
               || (o >= 46 && o <= 50) || o == 56
            then go (i + 1) else false)) in
@@ -68143,8 +68198,8 @@ and vm_region = fn env -> fn world -> fn blk -> fn cd -> fn (ct: (int * int * in
   //  instruction before where the frame goes on, as ruby leaves the frame's
   //  pc there. That is the `begin`'s, or the def's.)
   let _ = (if ty == 1 then
-             (let (_, _, _, _, _, _, ln, _) = cd in
-              if cont >= 1 && cont - 1 < vec_len ln then cur_line_set (vec_get ln (cont - 1)) else ())
+             (let (code, _, _, vcb, vcn) = cd in
+              if cont >= 1 && cont - 1 < vcn then cur_line_set (vc code (vcb + (cont - 1)) 4) else ())
            else ()) in
   let _ =
     (if ty == 1 then
@@ -68219,8 +68274,8 @@ and vm_loop = fn env -> fn world -> fn blk -> fn cd -> fn (ct: (int * int * int 
                 let _ = vm_jump ct st tpc v how in pc))
      else pc)
   else
-    (let (_, _, _, _, _, _, _, ev) = cd in
-     let k = (if (vec_get ev pc / 2) % 2 == 1 then vm_region_at ct pc act else 0 - 1) in
+    (let (code, _, _, vcb, vcn) = cd in
+     let k = (if (vc code (vcb + pc) 5 / 2) % 2 == 1 then vm_region_at ct pc act else 0 - 1) in
      if k >= 0 then vm_loop env world blk cd ct st (vm_region env world blk cd ct st k pc act) lo hi act
      // (one region a statement, as the evaluator's run_stmts has: the
      //  instructions up to the next statement's start or protected region
@@ -68262,8 +68317,8 @@ and vm_run_stmt = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int)
            else ()) in
   if nx < lo || nx >= hi || ends then nx
   else
-    (let (_, _, _, _, _, _, _, ev) = cd in
-     if vec_get ev nx % 4 != 0 then nx else vm_run_stmt env world blk cd st nx lo hi)
+    (let (code, _, _, vcb, vcn) = cd in
+     if vc code (vcb + nx) 5 % 4 != 0 then nx else vm_run_stmt env world blk cd st nx lo hi)
 // A program run in the frame `env`: the value it leaves and how it left
 // (0 leave, 1 return, 2 break, 3 next, 4 retry, 5 redo, 6 the exception
 // again). The stack and its registers are this run's own and go with its
@@ -68292,10 +68347,10 @@ and vm_stack_wind = fn st ->
      if vec_bytes stk > 65536 then vec_recycle stk else ())
   else vec_set regs 1 (n + 1)
 and vm_exec = fn env -> fn world -> fn blk -> fn (id: int) -> fn (pc0: int) ->
-  let cd = vec_get vm_code id in
+  let cd = vm_prog id in
   let (_, _, kind, _, _, _, _, _, _, _, _, _, _, ct) = vec_get vm_meta id in
-  let (op, _, _, _, _, _, _, _) = cd in
-  let n = vec_len op in
+  let (code, _, _, vcb, vcn) = cd in
+  let n = vcn in
   // (a stack and registers from the pool, made outside the frame's region:
   //  they outlive it. Given back however the frame is left.)
   let nf = vec_get vm_pool_free 0 in
@@ -68359,13 +68414,13 @@ and vm_exec_run = fn env -> fn world -> fn blk -> fn cd -> fn ct -> fn st -> fn 
 // region's start, which is run as a region again. -1 when values would be
 // on the stack there.
 and vm_pc_of_line = fn (id: int) -> fn (ln: int) ->
-  let (_, _, _, _, _, _, lns, ev) = vec_get vm_code id in
+  let (code, _, _, vcb, vcn) = vm_prog id in
   let (_, _, _, _, _, _, _, _, _, _, _, _, _, ct) = vec_get vm_meta id in
-  let n = vec_len lns in
+  let n = vcn in
   let rec at = fn (i: int) -> fn (before: int) ->
     (if i >= n then before
-     else if vec_get ev i % 2 == 1 && vec_get lns i == ln then i
-     else at (i + 1) (if vec_get ev i % 2 == 1 && vec_get lns i < ln then i else before)) in
+     else if vc code (vcb + i) 5 % 2 == 1 && vc code (vcb + i) 4 == ln then i
+     else at (i + 1) (if vc code (vcb + i) 5 % 2 == 1 && vc code (vcb + i) 4 < ln then i else before)) in
   let p = at 0 0 in
   let rec out = fn (es: (int * int * int * int * int * int) list) -> fn (best: int) -> fn (bsp: int) ->
     (match es with
@@ -68382,18 +68437,18 @@ and vm_pc_of_line = fn (id: int) -> fn (ln: int) ->
 // a program of two instructions, the second a leave and the first one that
 // puts a value no Ruby code runs for: nil, self, a literal, an ivar
 and vm_trivial = fn (id: int) ->
-  let (op, _, _, _, _, _, _, _) = vec_get vm_code id in
-  vec_len op == 2 && vec_get op 1 == 50
-  && (let o = vec_get op 0 in o == 1 || o == 2 || o == 3 || o == 22)
+  let (code, _, _, vcb, vcn) = vm_prog id in
+  vcn == 2 && vc code (vcb + 1) 0 == 50
+  && (let o = vc code (vcb + 0) 0 in o == 1 || o == 2 || o == 3 || o == 22)
 // ...and that value, as vm_stack_op puts it
 and vm_trivial_value = fn env -> fn world -> fn blk -> fn (id: int) ->
-  let (op, na, ia, _, _, ov, ln, _) = vec_get vm_code id in
-  let _ = cur_line_set (vec_get ln 0) in
-  let o = vec_get op 0 in
+  let (code, na, ov, vcb, vcn) = vm_prog id in
+  let _ = cur_line_set (vc code (vcb + 0) 4) in
+  let o = vc code (vcb + 0) 0 in
   if o == 1 then VNil
   else if o == 2 then lv_get env "self"
-  else if o == 3 then (if vec_get ia 0 == 1 then str_fstring_text (vec_get na 0) else vec_get ov 0)
-  else (let n = vec_get na 0 in vm_ev env world blk (EIVar (substring n 1 (str_len n))))
+  else if o == 3 then (if vc code (vcb + 0) 1 == 1 then str_fstring_text (vec_get na (vcb + 0)) else vec_get ov (vcb + 0))
+  else (let n = vec_get na (vcb + 0) in vm_ev env world blk (EIVar (substring n 1 (str_len n))))
 and vm_enter = fn env -> fn world -> fn blk -> fn (id: int) -> fn (gen: int) ->
   let (_, _, kind, g, optn, optp, shadow, kids, _, _, _, _, _, _) = vec_get vm_meta id in
   if g != gen || kind < 0 then
@@ -68675,7 +68730,7 @@ and run_loop_builtin = fn env -> fn world -> fn blk -> fn theblk ->
   // and the turn's flow went to the region of the statement around the loop,
   // 180 bytes a turn (`loop` over 3M turns held 546 MB, note 403)
   let f = region TURN {
-    match try_or (fn (u: unit) -> run_block world blk theblk Nil) flow_raise_nil with
+    match try_or (fn (u: unit) -> run_block_t world blk theblk Nil) flow_raise_nil with
     | FNext _ -> flow_next_nil
     | f9 -> f9
   } in
