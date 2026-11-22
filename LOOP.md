@@ -11021,6 +11021,12 @@ maxRSS moved with the order test/unit picks. With `--seed=42` on the subset: mai
   - test_settracefunc (the same tests fail as on main), test_module, test_exception, test_string, test_array, test_frozen, test_lambda, test_hash, test_proc, test_object, test_class, test_method and test_iterator give the same results as main;
   - gates pass.
 - Found on the way (main too, not this round's): `nil.upcase` says "undefined method 'upcase'" where ruby adds "for nil"; `nil.foo` has it.
+- Review of #162: mro_local_name built a substring per `(sng:` wrapper, once per mro_now_class on a singleton class. It now reads the name inside the wrappers in place (mro_local_in, mro_pre_at with str_index_from). A name with no wrapper is still asked with str_starts_with: comparing every name byte by byte in Mere was tried first and cost 2.6% of the subset's instructions. corpus/805 gained the singleton classes of an anonymous class, a Struct and a module, and a singleton's singleton.
+- The reviews of #159 and #162 ran probes that found four differences from ruby. Main gives the same answers, so none is this round's:
+  - `binding.define_singleton_method` raises `TypeError: can't define singleton`.
+  - `def fz.x` on a frozen String succeeds; ruby raises FrozenError.
+  - `s.clone(freeze: true)` is not frozen.
+  - `o.singleton_method_added`, once defined, does not fire for its own name (ruby reports `[:singleton_method_added, :y]`; mere-ruby `[:y]`).
 
 ## 2026-11-22 (93): test_ast's time, round two -- a key made per call, and one stack walked twice per collection
 

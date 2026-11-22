@@ -66,3 +66,29 @@ p d.new([1]).length
 # operator and binary names
 p 1.respond_to?(:+), [1].respond_to?(:<<), 1.method(:<=>).arity
 p [[1, 2], [3]].sum([]), (1 <=> 2), (2 ** 10)
+
+# the singleton classes of anonymous classes, Structs and modules, and a
+# singleton's singleton: their names are read inside the `(sng:` wrappers
+c2 = Class.new
+def c2.k = 1
+p c2.k
+c2.singleton_class.class_eval { def k = 2 }
+p c2.k
+c2.singleton_class.singleton_class.class_eval { def kk = 3 }
+p c2.singleton_class.kk
+c2.singleton_class.singleton_class.class_eval { def kk = 4 }
+p c2.singleton_class.kk
+st = Struct.new(:a)
+def st.z = :z
+p st.z
+st.singleton_class.class_eval { def z = :z2 }
+p st.z, st.new(1).a
+m2 = Module.new
+def m2.q = 1
+p m2.q
+m2.singleton_class.send(:define_method, :q) { 2 }
+p m2.q
+sub = Class.new(c2)
+p sub.k
+c2.singleton_class.class_eval { remove_method :k }
+p((sub.k rescue $!.class))
