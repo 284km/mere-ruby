@@ -10970,3 +10970,31 @@ public instance methods only: tools/gen_arity_table.rb now reads the eleven
 private hooks the same way (nothing called), and only those rows were added
 to the table (regenerating the whole table would drop rows added since).
 corpus/777.
+
+## 2026-11-22 (91): test_ast's time, round one -- two costs paid per object and per builtin call
+
+**The point.** On a slow runner test_ast takes 590-635 s of its 600 (note 551 §13). A sample of test_all_tokens showed no single hot spot:
+- GC: about 14% of the run in this subset;
+- building assert messages: 9%;
+- a tail of 1-3% items.
+
+This round takes two of those that are per-object and per-call costs, and leaves the GC fixed cost (Mere's scan of suspended stacks) and the ivar store's string keys for later.
+
+1. **Marking asked every live String, Array, Hash, Proc and Binding for a singleton class by string key.** gc_handle_class built "kind:id" and probed hng_store and hng_sng_base for each one: 12% of a collection. Those two tables hold a handful of rows. gc_collect now builds an integer set of their handles (gc_hng_ids_build) before marking and turns it off after gc_fixpoint. Marking skips a handle not in the set. Outside a collection, and in fb_reclaim, the string path still answers.
+2. **The builtin arity check probed its table and walked the ancestors on every call.** For a class without a row of its own, that was up to three obj_is_a walks (Enumerable, Comparable, Kernel), 2% of the token test. The row a class and name resolve to -- the packed bounds, or -1 for none or for the program's own method -- changes only with attr_ic's token: a method defined, removed or made private, or a module included. arity_memo keeps it under that token, split out as arity_row. A singleton's method is the receiver's own and is still asked per call.
+
+Tried and dropped: taking gc_churn_bytes (seventy arenas summed) one check in sixteen. Each collection recomputes it for the next baseline, and collections come often enough here that the saving was within noise.
+
+Measured on test_ast's tokens, ranges and not_cared for test/ruby/test_[a-c]* (78 tests, 233,297 assertions):
+
+| build | instructions | change |
+|---|---|---|
+| main | 342.2e9 | |
+| step 1 | 336.0e9 | -1.8% |
+| step 2 | 332.6e9 | -2.8% in all |
+
+- Checked:
+  - corpus 799/800 (394, thread interrupts, passes alone three times on both builds; it lost to the load of a concurrent sample);
+  - test_array, test_string, test_hash, test_integer, test_enum, test_comparable, test_object, test_module, test_refinement, test_method, test_struct and test_range give the same results as main;
+  - test_ast's individual tests 114;
+  - gates pass, bracket depth 155.
