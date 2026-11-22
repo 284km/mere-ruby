@@ -6,11 +6,12 @@ root="$(cd "$here/.." && pwd)"
 . "$here/ref_ruby.sh"
 mr="${MR_BIN:-$root/mere-ruby}"
 stdlib="$("$REF_RUBY_BIN" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
+mere_stdlib="$(sh "$here/runtime_load_path.sh" "$mr")"
 task_tmp="$(mktemp -d "${TMPDIR:-/tmp}/psych_scalar_check.XXXXXX")"
 trap 'rm -rf "$task_tmp"' EXIT HUP INT TERM
 for mode in --autoload --direct; do
   "$REF_RUBY_BIN" "$root/unittest/repro/psych_scalar_protocols.rb" "$mode" > "$task_tmp/reference"
-  RUBYLIB="$stdlib" "$mr" "$root/unittest/repro/psych_scalar_protocols.rb" "$mode" > "$task_tmp/candidate"
+  RUBYLIB="$mere_stdlib:$stdlib" "$mr" "$root/unittest/repro/psych_scalar_protocols.rb" "$mode" > "$task_tmp/candidate"
   diff -u "$task_tmp/reference" "$task_tmp/candidate"
 done
 cat "$task_tmp/candidate"
