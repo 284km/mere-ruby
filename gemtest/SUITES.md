@@ -60,7 +60,9 @@ native-boundary warning controls are in corpus 701/702.
 `method_copy_lifetime_latest.json` retains the subsequent strict Linux failure
 and paired measurements of publishing each copied metadata row once. The
 check, workload and limits are unchanged; local Linux/aarch64 is identified
-separately from hosted x86-64. Final hosted validation of that change is pending.
+separately from hosted x86-64. Both hosted additional jobs pass this correction
+in run 44313194961; hosted Linux's post-GC ratio is 1.909. Full CI remains a
+separate merge requirement.
 
 `suites.lock.json` records each release tag's full commit, repository URL,
 source tree SHA256, every test file, load paths and command. Development
@@ -150,15 +152,23 @@ the wrong source tree and a process that bypasses the audit with `exit!`.
 The eighth rejects wrong-platform and wrong-lock baselines and verifies that
 a previously matching file reaching the RSS cap is still a regression.
 
-The Linux baseline comes from hosted run 44248949546, with 52 MATCH /
+The earlier Linux baseline comes from hosted run 44248949546, with 52 MATCH /
 9 RED / 1 MEMORY. Its ordinary per-file comparison with this PR's earlier
 Linux run 43989409595 has no regressions. Both runs exceed 2 GiB in Rack's
 multipart file. `suites_linux_before_source_audit.json` preserves the earlier
 result; `suites_linux_transition.json` records the unchanged source/dependency
 inventory, command-only audit transition and exact comparison. The original
 gate error against macOS's 53-MATCH snapshot is preserved in the new Linux
-record. No file verdict, test count or limit is changed. The macOS baseline
-retains all 53 MATCH files, including multipart; a later macOS loss must fail.
+record. No file verdict, test count or limit is changed by that transition.
+
+Round 28 strengthens Linux to the actual 53 MATCH / 7 RED / 2 MEMORY from
+hosted run 44338965455 on parent PR #114. Its merge source 548582c7 has exactly
+the tree of head 89dbac2e. Every reference file is healthy; the ordinary
+same-OS comparison loses no previous MATCH and now requires Lint too.
+`suites_linux_before_r28.json` preserves the preceding 52-MATCH baseline,
+including its cross-platform gate history. Both Linux MEMORY outcomes remain
+visible; RED to MEMORY is not an improvement. The current macOS gate retains
+all 54 actual MATCH files, including multipart and Lint, independently.
 
 Kramdown 2.5.1 was measured before choosing this set. Its large conversion
 file needs an external tidy executable plus optional Rouge and stringex; the
@@ -255,3 +265,20 @@ under GC.stress. Corpus is 726/726. `suites_runtime_r25.json` records current
 core controls; `suites_before_review_r25.json` preserves the preceding complete
 54-MATCH macOS observation. The lifetime record distinguishes earlier runs
 separated by compilation from the new consecutive saved-binary comparisons.
+
+Rounds 26-27 restore Hash's native fetch/fetch_values/dig behavior when a Ruby
+override calls super. The native entries preserve arity errors, KeyError's
+key/receiver, blocks and early exit, and nested dig dispatch/defaults without
+calling the receiver's fetch or [] override again. Witnesses 710/711 detect
+the saved parent and match normally and with GC.stress. The original Rack
+Headers file improves from 6 failures / 268 assertions to 3 failures /
+282 assertions, with the same 51 tests and no errors. It remains RED against
+the reference's 302 assertions. Its remaining failures and separate shared
+dispatcher/binding gaps stay in `SUITES_GAPS.md`; upstream tests are unchanged.
+
+Round 28 reruns all 115 files on O2 source 72adb4d3: original 54 MATCH /
+7 RED / 1 MEMORY, additional 6 MATCH / 1 RED, Rake 46 MATCH; all strict
+comparisons are empty. Preceding complete snapshots remain separate.
+Corpus is 728/728; Class/Hash/Array/Super/Method retain every preceding
+passing case. Exact core outcomes, the separate unresolved controls and
+the unchanged lifetime control (1.686x) are in `suites_runtime_r28.json`.
