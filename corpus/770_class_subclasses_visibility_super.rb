@@ -15,7 +15,15 @@ def visibility_chain(method, receiver)
   result = []
   while method
     value = method.is_a?(UnboundMethod) ? method.bind_call(receiver) : method.call
-    result << [method.owner.to_s, visibility_value(value)]
+    with_block = if method.is_a?(UnboundMethod)
+      method.bind_call(receiver) { |entry| [:yielded, entry] }
+    else
+      method.call { |entry| [:yielded, entry] }
+    end
+    bound = method.is_a?(UnboundMethod) ? method.bind(receiver) : method
+    from_proc = bound.to_proc.call { |entry| [:yielded, entry] }
+    result << [method.owner.to_s, visibility_value(value),
+               visibility_value(with_block), visibility_value(from_proc)]
     method = method.super_method
     raise 'super_method repeated a body' if result.length > 8
   end
@@ -72,7 +80,7 @@ visibility_methods(:public, PublishedVisibility)
 # Preserve ordinary Ruby bodies represented by an inherited visibility entry.
 class RubyVisibilityParent
   def self.subclasses
-    [:ruby]
+    [:ruby, block_given? ? yield(:token) : :no_block]
   end
 end
 class RubyVisibilityChild < RubyVisibilityParent
