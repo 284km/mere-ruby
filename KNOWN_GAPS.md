@@ -4848,3 +4848,31 @@ search. The real YAML child reproduction and all 11 library controls pass.
 The earlier native-name-only behavior is superseded; native Method dispatch
 and other independent compatibility gaps are not claimed solved by this
 ordering repair.
+
+
+## The original Rails native-install blocker is resolved on integrated main
+
+The fresh cold replay in railstest/main_native_install.json uses main 2e2ab568,
+normal O2 and its pinned compiler 01f5ad73. The merged #95 build/header metadata
+and #120 SHA-2 provider are sufficient for Bundler and all 68 frozen dependencies
+to install, including bigdecimal 4.1.3, in 253.379 seconds / 914,976 KiB. The same 69
+source archives, empty per-interpreter gem homes, independently built native
+extensions and 600-second/2-GiB bounds remain. The mkmf probe also succeeds
+using this runtime's own actual headers. Issue #116's first-build boundary
+is resolved; the old main 12ca failure remains a historical measurement.
+
+Reference passes all six stages, six application tests / 31 assertions and
+Puma HTTP. Mere's next migration command fails at the separate registry issue
+#121 (perform on nil), exit 1 in 2.062 seconds / 199,616 KiB without a limit event.
+Boot, tests and HTTP remain NOT_RUN; the complete measurement is RED. No
+runtime function, lock, fixture, original test, exclusion or bound changes.
+
+
+## Native loading after the main compiler update
+
+The PR145 compiler408b03d9 setting is retained when integrating main; the
+native/shipped fallback ordering and child-launcher implementation are
+unchanged. All726 corpus programs, actual mkmf builds and seven native gems
+retain their passing controls. Full hosted per-file acceptance remains a
+merge requirement; this configuration integration does not establish a
+complete Rails pass or change any accepted snapshot or resource bound.

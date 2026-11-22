@@ -7213,3 +7213,49 @@ existing record, reference 2584/candidate 2277, including existing unsupported
 and timeout cases. Reference-cache and embedding-build controls pass, and
 workflow YAML parses. Hosted full checks and every-file nonregression remain
 required for the new head. No original assertion, exclusion or bound changes.
+
+
+## Replay the original Rails native-build issue on integrated main
+
+Issue #116 was left open while the own build metadata (#95) and bounded SHA-2
+provider (#120) were unmerged. Both are now in main 2e2ab568. A fresh normal O2
+build with main's pinned compiler 01f5ad73 and the unchanged committed Rails
+runner installs Bundler and all 68 dependencies from the same 69 archives.
+Separate initially empty gem homes and independently built extensions remain;
+the same documented system SQLite 3.46.1 option is used on both interpreters.
+
+The dependency stage exits 0 in 253.379 seconds / 914,976 KiB, within the existing
+600-second/2-GiB family bounds. The original small mkmf probe matches and the
+actual bigdecimal Makefile/build uses this runtime's own headers. All 77 captured
+runtime/runner/lock input hashes stay fixed, all stored stdout/stderr hashes
+verify, and seven harness controls pass. The initial sandbox-denied ps check
+is separate setup evidence; the same harness passes with normal permissions.
+
+Reference passes all six stages, including six tests / 31 assertions and actual
+Puma HTTP. Mere's original migration then stops at the separately tracked #121
+registry error, perform on nil, exit 1 in 2.062 seconds / 199,616 KiB. Boot/tests/
+HTTP are NOT_RUN and the whole record remains RED. Keep all earlier source-
+specific records, add railstest/main_native_install.json, and correct the stale
+README statement about current main. This meets #116's first-extension-build
+acceptance condition without claiming Rails application/framework success.
+Runtime functions changed: none; no lock, test, exclusion or bound changes.
+
+
+### Merge main after the released Map-slot compiler adoption
+
+Integrate main05c3bda3 after PR145 and the documentation-only PR146. Resolve only the MERE_REF conflict by
+retaining released compiler408b03d9, which clears removed native Map backing
+references. Keep the existing native child launchers, declared-reference
+fallback ordering and user-source priority. No runtime function, library,
+original test, exclusion, accepted snapshot or resource bound is changed.
+
+New ordinary O2/compiler408b03d9 validation: **726/726 corpus**, hash
+index ON/OFF, **546.48s / 1,057,696KiB** peak family RSS.
+All24 focused hash/MRO comparisons, 11 ordinary/child library controls,
+all nine RSS gates, roots, dead definitions and C depth155/1024 pass.
+The original upstream mkmf checks retain all14 reference/candidate/stress
+contracts and both negative controls. All eight locked packages, including
+seven gems with C extensions, freshly install separately under both runtimes;
+all84 use-output lines match and reference-built libraries are rejected.
+Earlier compiler43 measurements stay associated with their original source.
+Fresh hosted checks and latest-main per-file acceptance remain required.
