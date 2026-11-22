@@ -7914,6 +7914,51 @@ gem observations and unresolved native-undef/private-alias diagnostics;
 this change does not claim their repair. A fresh combined original Rails
 workload and full hosted CI remain required before merge.
 
+
+## Compatible native features before shipped implementations
+
+An activated gem's existing native extension can precede the shipped stdlib
+without being selected: the ordered search handled real Ruby files, then
+chose the shipped source before asking the native resolver. This mixed the
+actual JSON 3.1 facade with an older shipped generator during Rails loading
+(#127). Select a compatible native feature in the same load-path prefix when
+no physical Ruby file wins. Preserve explicit .rb searches, the native ABI
+probe and the shipped fallback after that prefix. resolve_feature_path and
+actual require report/use the same native file and its loaded identity.
+
+Only main.mere's resolve_feature, load_path_pick_shipped and do_require0
+change, with new mutually recursive shipped_native_path. No additional
+top-level Mere values, C API implementation/header, collector, VM/ISeq, AST,
+gemtest, API inventory, original test or resource-limit changes.
+
+Corpus 722 (originally 721) independently compiles the same tiny C fixture for each runtime
+using that runtime's headers. It covers a real Ruby file before the native
+choice, explicit .rb lookup, native feature resolution/loading, its actual
+constant, canonical feature identity and one-time execution. The parent
+fails at the missing native constant; normal O2 head matches Ruby 4.0.9 with
+indexing ON/OFF. Original require/autoload/Marshal retain the exact paired
+parent result: 311 cases, 308 MATCH / 0 RED / 3 BOTH. All nine RSS checks
+pass; bracket depth remains 933/1024 with the parent's pinned compiler.
+
+The full corpus is 733/733 in both modes. The unchanged C API contract
+groups agree normally and under collection stress (loader: reference 48,
+Mere 49); all six fault controls fail as required. The ordinary unchanged
+JSON 3.1 probe now matches on validation-only composition 61d01f6d.
+
+A new cold original-CLI replay on that composition installs all 68 gems
+(232.699 s / 954,624 KiB), then passes the JSON boundary and stops in the
+next ActiveModel Module#included native-super call (#129), migration exit 1
+in 4.097 s / 318,224 KiB. Reference passes all six stages; candidate boot,
+tests and HTTP remain NOT_RUN, without a resource event. The separate
+native_candidate.json in #117 preserves the exact run. No JSON attributes,
+Rails/gem sources or original inputs/limits are patched. This own branch
+is stacked on the Hash candidate; production integration must wait for the
+parent series and required hosted gates.
+
+The native feature witness was renumbered from 721 to 722 after the
+concurrent parent published its distinct IO witness 721. Its Ruby/C source
+is byte-identical; no observation or historical source record is rewritten.
+
 ## 2026-11-20: apply the verified method floor repair to the earlier small-suite branch
 
 PR 119 still fails its original Method-copy assertion at 2.051319x on native
@@ -9659,3 +9704,37 @@ per-file classifications to a freshly built unmodified7c0fe03d baseline.
 The existing logger logdevice failure is not hidden or reclassified as a
 success. gemtest/method_floor_backport_r81.json retains the hosted failure,
 all Method samples and the two platform results. Baselines are unchanged.
+
+## Native selection after the current Hash parent synchronization
+
+Integrate the current Hash parent without dropping compatible native feature
+selection. The load_path_pick_shipped conflict also carries forward PR90's
+published true reference-directory fallback policy: ordinary user files and
+compatible native files stay ahead of shipped source, and only explicitly
+declared reference directories are deferred. An unshipped feature can still
+come from its real reference directory. Corpus525 now covers YAML/Psych
+native prerequisites in a real child as well as monitor; corpus722 remains
+the independently built native-selection fixture.
+
+The published mkmf launcher correction from PR90 is retained too: its child
+keeps the declared reference fallback and the caller's explicit helper paths.
+The added context/child controls use an actual path containing an apostrophe.
+No runtime function other than the existing load_path_pick_shipped is manually
+changed in this integration; all other runtime changes come from the reviewed
+parent. No top-level value, original test, exclusion, baseline or bound changes.
+Fresh O2, complete corpus and original-file checks follow this synchronization;
+the older734-program receipt remains tied to its original source.
+
+The synchronized normal O2 source b9c06a08, released compiler43f2994b,
+now completes751/751 corpus programs in both hash modes (487.638 seconds,
+1,187,808 KiB under the unchanged900-second/2-GiB aggregate bound).
+All8 focused native/fallback comparisons, nine RSS cases, roots, depth155
+and dead-definition checks pass. Original require/autoload/Marshal remain
+311 cases /308 MATCH /0 RED /3 BOTH, the same as the parent receipt.
+The original mkmf14 contracts pass on both runtimes and under GC stress;
+the real upstream context/child controls pass, and broken-source/foreign
+runtime controls fail correctly. Source/binary/check hashes stayed fixed.
+The earlier partial focused invocation named absent Digest witnesses;
+its successful525/722 rows are retained but only the corrected8-row run
+is accepted as a complete focused receipt. No case is silently omitted.
+Hosted current-head CI, per-file comparison and review gates remain required.
