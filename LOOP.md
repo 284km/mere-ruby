@@ -11167,3 +11167,10 @@ the C names can point there and bignum.c leaves.
   every test/-ext-/bignum file stopped at its first raw Bignum. Freed first,
   removed after.) Toom-3 on 3**60000 x 7**50000 and big2str_generic of the
   product (70,883 digits): 2.3 s.
+- (re-review) **[Minor] a raw Bignum a registered address held was kept
+  forever**, even after the slot was overwritten (82 MB over 20,000 calls).
+  Those go to a list of their own now (held), checked at the end of every C
+  call: freed once no registered address holds them. The reviewer's pattern
+  (`last = rb_big_new(1000, 1)` on a registered `last`, 20,000 times) grows
+  RSS by -3 MB, and `last` still reads 0. One kept by rb_gc_mark from a
+  dmark is still kept for good (the rarer case; the header says so).

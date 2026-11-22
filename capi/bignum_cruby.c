@@ -17,11 +17,13 @@
  *     the Integer its digits say (mr_vbig_out);
  *   - it is freed when the C call that made it ends, unless it is kept for
  *     good: bignum.c's power cache (rb_vm_register_global_object), or what C
- *     keeps the public ways -- rb_gc_register_mark_object, rb_gc_mark from a
- *     dmark, or a registered address (rb_gc_register_address,
- *     rb_global_variable) that holds it when its call ends. One C only
- *     stores in a struct, which no collection marks before the call ends,
- *     is freed with the call: register it.
+ *     keeps the public ways -- rb_gc_register_mark_object, or rb_gc_mark
+ *     from a dmark (kept for good from then on, even after its data object
+ *     is gone: a leak, the rarer case) -- or for as long as a registered
+ *     address (rb_gc_register_address, rb_global_variable) holds it: checked
+ *     at the end of every C call, so an overwritten static slot lets the old
+ *     one go. One C only stores in a struct, which no collection marks
+ *     before the call ends, is freed with the call: register it.
  *
  * The other way, an Integer the interpreter has is a handle (or a Fixnum),
  * which bignum.c cannot read: the entry points below hand it a raw Bignum
@@ -138,6 +140,10 @@ struct vlist { struct vbig *at; long count, cap; };
 /* (temporaries, freed when their C call ends; and the ones kept for good,
  *  apart, so that the end of every C call does not walk them) */
 static struct vlist temps, kept;
+/* (...and those a registered address held when their call ended: kept only
+ *  while one still does -- an overwritten static slot lets go of the old
+ *  one at the end of the next C call, as CRuby's collection would) */
+static struct vlist held;
 long mr_vbig_live;   /* how many there are: 0 is the fast path everywhere */
 
 /* ...and every one's address in an open-addressing set, so the question
@@ -190,6 +196,7 @@ static struct vbig *find_in(struct vlist *l, VALUE v) {
 static struct vbig *find(VALUE v) {
     if (!set_has(v)) return NULL;
     struct vbig *b = find_in(&temps, v);
+    if (!b) b = find_in(&held, v);
     return b ? b : find_in(&kept, v);
 }
 static void push(struct vlist *l, struct vbig b) {
@@ -199,7 +206,7 @@ static void push(struct vlist *l, struct vbig b) {
         if (!l->at) mr_fatal("out of memory");
     }
     l->at[l->count++] = b;
-    mr_vbig_live = temps.count + kept.count;
+    mr_vbig_live = temps.count + held.count + kept.count;
 }
 int mr_vbig_raw_p(VALUE v) { return mr_vbig_live && set_has(v); }
 
@@ -226,10 +233,12 @@ size_t rb_gc_obj_slot_size(VALUE obj) {
  * Anything else is no raw Bignum, and nothing to do here. */
 void mr_vbig_keep(VALUE obj) {
     if (!mr_vbig_live || RB_SPECIAL_CONST_P(obj) || MR_HANDLE_P(obj) || !set_has(obj)) return;
+    struct vlist *from = &temps;
     struct vbig *b = find_in(&temps, obj);
+    if (!b) { from = &held; b = find_in(&held, obj); }
     if (!b) return;   /* (kept already) */
     struct vbig copy = *b;
-    *b = temps.at[--temps.count];
+    *b = from->at[--from->count];
     push(&kept, copy);
 }
 void rb_vm_register_global_object(VALUE obj) {
@@ -244,27 +253,27 @@ static void raw_free(VALUE obj) {
  * them reached the interpreter is an Integer there by now). */
 extern int mr_gc_address_holds(VALUE v);
 void mr_vbig_leave(const void *frame) {
-    if (!temps.count) return;
+    if (!temps.count && !held.count) return;
+    /* the call's own temporaries: freed, or held while an address holds them */
     long left = 0, n = temps.count;
-    struct vbig *keep_now = NULL;
-    long keep_count = 0;
     for (long i = 0; i < n; i++) {
         struct vbig b = temps.at[i];
         if (b.owner != frame) { temps.at[left++] = b; continue; }
-        /* (a static variable C registered still holds it: kept, not freed) */
-        if (mr_gc_address_holds(b.obj)) {
-            keep_now = realloc(keep_now, sizeof(*keep_now) * (size_t)(keep_count + 1));
-            if (!keep_now) mr_fatal("out of memory");
-            keep_now[keep_count++] = b;
-            continue;
-        }
+        if (mr_gc_address_holds(b.obj)) { push(&held, b); continue; }
         raw_free(b.obj);   /* (reads its flags through RBASIC: still a member) */
         set_del(b.obj);
     }
     temps.count = left;
-    for (long i = 0; i < keep_count; i++) push(&kept, keep_now[i]);
-    free(keep_now);
-    mr_vbig_live = temps.count + kept.count;
+    /* ...and the held ones no registered address holds any more */
+    long kept_held = 0;
+    for (long i = 0; i < held.count; i++) {
+        struct vbig b = held.at[i];
+        if (mr_gc_address_holds(b.obj)) { held.at[kept_held++] = b; continue; }
+        raw_free(b.obj);
+        set_del(b.obj);
+    }
+    held.count = kept_held;
+    mr_vbig_live = temps.count + held.count + kept.count;
 }
 
 /* A raw Bignum as the Integer its digits say; anything else as it is. */
