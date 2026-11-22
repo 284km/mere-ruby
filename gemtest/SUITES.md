@@ -20,6 +20,25 @@ strict macOS baseline. Hosted Linux run 44269323039 also reports 6 MATCH /
 `suites_additional_linux.json` is the strict Linux baseline. The separate
 additional CI jobs now enforce their own OS's baseline under the same caps.
 
+`suites_rake.lock.json` adds Rake 13.2.1 at release commit
+`d84f6ef7f3540a1d0e95fabe451ea3a16157791b`: all 46 original test files,
+597 reference tests and 1,459 assertions. Its four pure Ruby dependencies
+are the three Test::Unit packages above and Minitest 5.25.5, which Rake's
+functional tests require in generated child tests. Use a third external cache
+with the same commands and `--lock gemtest/suites_rake.lock.json`.
+The first complete macOS observation is `suites_rake_initial.json` (verbose);
+`suites_rake_latest.json` is a strict repeat with normal output. Both report
+46 MATCH with both sides' physical source audits complete. Preparatory 40/6
+and 45/1 measurements had incomplete child environments and are explicitly
+not baselines; their reasons remain in `suites_rake_preparation.json`.
+Hosted Linux run 44288206768 also gives 46 MATCH with all 92 source audits
+complete. `suites_rake_linux_initial.json` preserves that first observation;
+`suites_rake_linux.json` is the strict Linux baseline. The independent Rake
+workflow requires the matching OS baseline on every PR/main/dispatch run.
+The same first hosted run completes macOS at 46 MATCH too; the latest macOS
+snapshot retains this normal-output observation and its zero-regression
+comparison with the preceding complete local baseline.
+
 These gems use their unmodified helper and actual Test::Unit framework,
 with alphabetical order instead of a Minitest seed. Preserve tests,
 assertions, failures, errors, pendings, omissions and notifications; pending
@@ -27,7 +46,9 @@ plus omitted tests count as skips when rejecting an all-skipped summary.
 Every summary field must match. Each side routes bare `ruby` children through
 the existing child-bin selector to the selected interpreter and propagates
 the locked libraries. A real child-process control rejects a shadow Ruby
-on PATH or a missing locked child library. Ten harness controls pass.
+on PATH, a missing locked child library or a missing child stdlib fallback.
+Child RUBYLIB retains each selected runtime's actual own paths before the
+pinned Ruby-source fallback, after the locked gem libraries. Ten controls pass.
 
 The additional jobs also run `tools/method_copy_memory_check.py`: actual
 UnboundMethod definitions on 21,000 transient classes, with three collections

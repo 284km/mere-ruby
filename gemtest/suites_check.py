@@ -121,9 +121,12 @@ class SuiteChecks(unittest.TestCase):
             source = root / 'cache/probe'
             (source / 'lib').mkdir(parents=True)
             (source / 'lib/probe.rb').write_text('CHILD_LIBRARY = "locked"\n')
+            fallback = root / 'fallback/lib'
+            fallback.mkdir(parents=True)
+            (fallback / 'fallback_probe.rb').write_text('CHILD_FALLBACK = "fallback"\n')
             (source / 'test.rb').write_text('''require "probe"
-child = IO.popen(["ruby", "--disable-gems", "-e", 'require "probe"; print CHILD_LIBRARY'], &:read)
-abort "wrong child or library" unless child == "locked" && $?.success?
+child = IO.popen(["ruby", "--disable-gems", "-e", 'require "probe"; require "fallback_probe"; print CHILD_LIBRARY + CHILD_FALLBACK'], &:read)
+abort "wrong child or library" unless child == "lockedfallback" && $?.success?
 puts "3 runs, 4 assertions, 0 failures, 0 errors, 0 skips"
 ''')
             shadow = root / 'shadow'
@@ -133,7 +136,8 @@ puts "3 runs, 4 assertions, 0 failures, 0 errors, 0 skips"
             output = root / 'output'
             output.mkdir()
             args = SimpleNamespace(cache=root / 'cache', ruby_src=root / 'fallback',
-                                   binary=Path(ruby), reference=shadow / 'ruby', verbose=False)
+                                   binary=Path(ruby), reference=shadow / 'ruby', verbose=False,
+                                   runtime_paths={'mere': suites.call(['sh', str(suites.ROOT / 'tools/runtime_load_path.sh'), ruby]).split(os.pathsep)})
             suite = dict(name='probe', load_sources=['probe'], load_paths=['lib'])
             env = dict(os.environ, PATH=str(shadow) + os.pathsep + os.defpath, LANG='en_US.UTF-8')
 
