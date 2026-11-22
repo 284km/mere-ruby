@@ -129,6 +129,31 @@ begin
 ensure
   previous_disabled ? GC.disable : GC.enable
 end
+# Non-main enumeration must preserve Ractor isolation even through the
+# public Ruby wrapper, its Enumerator and typed value-store filters.
+Warning[:experimental] = false
+main_only = Object.new
+raise 'main object omitted before Ractor' unless ObjectSpace.each_object(Object).any? { |o| o.equal?(main_only) }
+shared_text = 'snapshot shared text'.freeze
+shared_array = [shared_text].freeze
+shared_hash = { token: shared_text }.freeze
+result = Ractor.new(shared_text, shared_array, shared_hash) do |text, array, hash|
+  [Object, String, Array, Hash].each do |filter|
+    visible_count = 0
+    visible_returned = ObjectSpace.each_object(filter) do |object|
+      raise 'unshareable object crossed Ractor enumeration' unless Ractor.shareable?(object)
+      visible_count += 1
+    end
+    raise 'Ractor enumeration count disagrees' unless visible_returned == visible_count
+  end
+  raise 'Enumerator crossed Ractor isolation' if ObjectSpace.each_object.any? { |o| !Ractor.shareable?(o) }
+  [[String, text], [Array, array], [Hash, hash]].each do |filter, held|
+    raise 'shared value omitted inside Ractor' unless ObjectSpace.each_object(filter).any? { |o| o.equal?(held) }
+  end
+  :isolated_snapshot
+end.value
+raise 'Ractor enumeration did not complete' unless result == :isolated_snapshot
+raise 'Ractor context leaked to main' unless Ractor.main?
 def ObjectSpace.each_object(*) = :overridden
 raise 'user override ignored' unless ObjectSpace.each_object == :overridden
 puts 'ObjectSpace filters real classes and value stores before yielding'
