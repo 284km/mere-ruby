@@ -10981,7 +10981,7 @@ corpus/777.
 This round takes two of those that are per-object and per-call costs, and leaves the GC fixed cost (Mere's scan of suspended stacks) and the ivar store's string keys for later.
 
 1. **Marking asked every live String, Array, Hash, Proc and Binding for a singleton class by string key.** gc_handle_class built "kind:id" and probed hng_store and hng_sng_base for each one: 12% of a collection. Those two tables hold a handful of rows. gc_collect now builds an integer set of their handles (gc_hng_ids_build) before marking and turns it off after gc_fixpoint. Marking skips a handle not in the set. Outside a collection, and in fb_reclaim, the string path still answers.
-2. **The builtin arity check probed its table and walked the ancestors on every call.** For a class without a row of its own, that was up to three obj_is_a walks (Enumerable, Comparable, Kernel), 2% of the token test. The row a class and name resolve to -- the packed bounds, or -1 for none or for the program's own method -- changes only with attr_ic's token: a method defined, removed or made private, or a module included. arity_memo keeps it under that token, split out as arity_row. A singleton's method is the receiver's own and is still asked per call.
+2. **The builtin arity check probed its table and walked the ancestors on every call.** For a class without a row of its own, that was up to three obj_is_a walks (Enumerable, Comparable, Kernel), 2% of the token test. The row a class and name resolve to -- the packed bounds, or -1 for none or for the program's own method -- changes only when a method is defined, removed or made private, or a module included. arity_memo keeps it, split out as arity_row, per entry under the class's own lookup generation (mro_now_class) and the private/protected count. The first version used attr_ic's global token, which a definition in an anonymous class does not move: `Class.new(Array)` then `def length(a)` kept Array#length's 0 and refused `o.length(5)` (review of #156, witness corpus/751). The memo is emptied past 4,096 rows. A singleton's method is the receiver's own and is still asked per call.
 
 Tried and dropped: taking gc_churn_bytes (seventy arenas summed) one check in sixteen. Each collection recomputes it for the next baseline, and collections come often enough here that the saving was within noise.
 
@@ -10991,7 +10991,7 @@ Measured on test_ast's tokens, ranges and not_cared for test/ruby/test_[a-c]* (7
 |---|---|---|
 | main | 342.2e9 | |
 | step 1 | 336.0e9 | -1.8% |
-| step 2 | 332.6e9 | -2.8% in all |
+| step 2 | 333.7e9 | -2.5% in all |
 
 - Checked:
   - corpus 799/800 (394, thread interrupts, passes alone three times on both builds; it lost to the load of a concurrent sample);
