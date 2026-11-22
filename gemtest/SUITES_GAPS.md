@@ -18,10 +18,9 @@ module_rss_pr92_r55.json; no existing source lock or baseline is replaced.
 
 | Suite / file | Observed difference | Ownership and next step |
 |---|---|---|
-| minitest / `test_minitest_mock.rb` | Now executes all 94 tests; 2 failures, 13 errors and 10 skips. Stubbing `File.open` still reaches the real file operation, and a dynamic method's super lookup fails. | Ruby semantics. Inspect builtin aliases and super lookup. Shared dispatch functions are being edited by PRs #86–#88; do not edit those functions concurrently. |
-| minitest / `test_minitest_reporter.rb` | 1 error while compressing a SystemStackError backtrace. `[0].chain([1,1,2].each_slice(1)).chunk_while { ... }.to_a` raises ArgumentError about a missing block; the same operation without Chain succeeds. | Ruby semantics. The Chain block dispatcher is in `invoke_with_block0`, also edited by the VM session in #88; recorded for coordination, not attributed to an ISeq failure. |
+| minitest / `test_minitest_mock.rb` | Executes all 94 tests; 1 failure, 8 errors and 10 skips. File.open stubs now work with and without blocks. Remaining failures include private stubs and a dynamic method's super lookup. | Ruby semantics. Reduce the remaining alias/super witnesses; avoid dispatch functions currently edited by other sessions. |
 | minitest / `test_minitest_spec.rb` | `Minitest::Spec::DSL#name` calls super and cannot find the inherited Class/Module implementation. | Ruby semantics. Coordinate with #86, which edits `super_next_plain`; no AST tree failure is established. |
-| minitest / `test_minitest_test.rb` | Backtrace compression errors as above, exception Marshal/equality failures, and a missing yield under the backtrace filter helper. | Ruby semantics. Separate the Marshal and block-forwarding witnesses before changing implementations. |
+| minitest / `test_minitest_test.rb` | Backtrace compression now works; 8 exception Marshal/equality failures and 1 missing-yield error remain. | Ruby semantics. Separate the Marshal and block-forwarding witnesses before changing implementations. |
 | rack / `spec_headers.rb` | Class naming through `Minitest::Spec::DSL#name` fails before a summary. | Same super lookup issue as minitest spec; coordinate with #86. |
 | rack / `spec_lint.rb` | `notice environment errors` expects Rack::Lint::LintError, but nothing is raised. | Ruby semantics; root cause not yet isolated. |
 | rack / `spec_request.rb` | The result reporter cannot resolve super from `RackRequestTest::TestProxyRequest.name`; no final summary. | Same super lookup issue as minitest spec; coordinate with #86. |
@@ -63,6 +62,20 @@ Resolved in follow-up rounds 4-5:
   object. A caller's `@st` and `@label` remain visible and round-trip, while
   the stream still reads its own buffer. The original file becomes MATCH
   and all 103 CRuby StringIO tests pass. Witness 672.
+
+Resolved in follow-up rounds 6-7:
+
+- Block calls to File.open/new now respect Ruby overrides. The native File
+  path remains available when a saved prelude IO alias is restored; its
+  actual source metadata distinguishes that alias from a Ruby replacement.
+  Only the File condition in `invoke_with_block0` changes. Witness 676.
+- Chain receives Enumerable's existing implementation module, and
+  `chunk_while` / `slice_when` defer the source and predicate until iteration.
+  Early `take` stops infinite inputs, multiple yields retain their values,
+  and reflected owner/ancestry remain consistent with the reference.
+  Only `core_prelude_b` changes. Witness 677. The original minitest reporter
+  now passes all 22 tests / 52 assertions and becomes MATCH. Enum and
+  Enumerator report 159 MATCH / 0 RED / 1 BOTH; corpus reports 697/697.
 The source-audit correction also makes explicit physical gem libraries win
 before the bundled stdlib at its actual load-path position. do_require0 and
 resolve_feature share load_path_pick_shipped; witness 685 covers converted
@@ -90,6 +103,13 @@ The preserved pre-audit snapshot and transition now refer to this branch's
 own previous result; its two additional Rack MATCH files remain MATCH.
 Reference audits cover 62 files and Mere audits 61. No inventory, dependency
 or bound changes and no per-file comparison regressions.
+
+On the rounds 6-7 branch, normal audited O2 source d403f444 including main
+3eb24fef retains 51 MATCH / 10 RED / 0 BOTH / 1 MEMORY and 709/709 corpus
+matches. Reference and Mere audits cover 62 and 61 files. Its own pre-audit
+51-MATCH snapshot is preserved, and the explicit transition reports no lost
+MATCH or reference coverage. Subsequent hosted-driver and standalone-loader
+corrections are checked separately before claiming combined-head results.
 Hosted validation exposed reference-fallback ordering in other existing
 drivers and a fake interpreter that did not answer the new path query.
 runtime_load_path.sh now supplies the actual selected runtime's paths before
@@ -116,6 +136,8 @@ is still required. Class.new blocks that change cref incorrectly and bare
 class declarations in such a scope remain separate existing lexical gaps;
 they are not claimed as fixed by the bare-write guard.
 
+Final combined rounds 6-7, normal O2 source 7a79b8db: 51 MATCH /
+11 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
 Final combined rounds 4-5, normal O2 source 9730ae28: 50 MATCH /
 12 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
 Final combined first gem-suite PR, normal O2 source 4ff6b54f: 48 MATCH /
@@ -124,6 +146,7 @@ All 62 files on both sides finish the locked-library source audit. Multipart
 finishes below the RSS cap with one custom-params-hash error (test_0034),
 85 tests / 238 assertions versus the reference's 239. Its prior MEMORY/RED
 variation is not a new MATCH or an inferred VM/GC cause.
+File override, Chain, provenance and constant witnesses 676/677/685/693 match the reference. The earlier full corpus was 709/709 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
 The earlier full corpus was 707/707 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
 Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
 
