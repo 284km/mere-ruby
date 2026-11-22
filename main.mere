@@ -7873,6 +7873,13 @@ and capi_type = fn world -> fn (v: Val) ->
          if str_eq c "Struct" then 9
          else if str_eq c "IO" then 11
          else if str_eq c "MatchData" then 13
+         // (the core classes CRuby builds as typed data: T_DATA to C, which
+         //  reads no struct of them -- only their type)
+         else if str_eq c "Time" || str_eq c "Thread" || str_eq c "Thread::Mutex" || str_eq c "Thread::Queue"
+                 || str_eq c "Thread::ConditionVariable" || str_eq c "Method" || str_eq c "UnboundMethod"
+                 || str_eq c "Encoding" || str_eq c "Random" || str_eq c "Enumerator" || str_eq c "Fiber"
+                 || str_eq c "ObjectSpace::WeakMap" || str_eq c "ObjectSpace::WeakKeyMap" || str_eq c "Ractor"
+                 || str_eq c "Dir" then 12
          else if str_eq c "Object" || str_eq c "Exception" then 1
          else kind rest in
      kind (ancestors_of world (obj_cls_name oid)))
@@ -7886,8 +7893,13 @@ and capi_describe = fn env -> fn world -> fn (v: Val) ->
   //   CLASS_OF of a `class Blob < String` instance was String, so sqlite3,
   //   which binds a value whose class is SQLite3::Blob as a BLOB, stored it as
   //   text and read it back in UTF-8 instead of binary.
+  // (...and an object's RBasic.klass is its singleton class once it has one,
+  //  as CRuby's is -- CLASS_OF / rb_class_of read it; rb_obj_class asks the
+  //  interpreter for the real one)
   let cls = (match v with
-             | VObj oid -> obj_cls_name oid
+             | VObj oid -> (let (_, _, ocls9, _) = world in
+                            let c9 = (if map_has ocls9 oid then map_get ocls9 oid else "") in
+                            if is_sng_cls c9 then c9 else obj_cls_name oid)
              | VClass c -> (if map_has modules c then "Module" else "Class")
              | _ -> dispatch_cls_of world v) in
   let frozen = (match v with
@@ -7961,7 +7973,11 @@ and capi_send = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
         else super_missing world noblk recv name args)
      else if str_eq a9 "" then super_missing world noblk recv name args
      else run_meth world noblk recv a9 name (map_get meths9 k9) args)
-  | VNil -> invoke_val_c env world noblk recv name args public
+  // (rb_funcallv_public is Kernel#public_send: a protected method is refused
+  //  too -- an explicit-receiver call from here would pass the protected
+  //  check whenever main happened to be of the receiver's kind)
+  | VNil -> (if public then invoke_val_c env world noblk recv "public_send" (Cons (VSym name, args)) false
+            else invoke_val_c env world noblk recv name args public)
   | _ ->
     // a block goes the way `recv.name(*args, &block)` sends one
     (let e = map_new () in
@@ -7976,7 +7992,7 @@ and capi_send = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
      let bp = Cons (block_pass_marker, (Nil : str list)) in
      let be = Cons (SExpr (EVar "__capi_b"), (Nil : Stmt list)) in
      eval_e e world (false, (Nil : str list), (Nil : Stmt list), e)
-       (if public then EMethodB (EVar "__capi_r", name, pass, bp, be)
+       (if public then EMethodB (EVar "__capi_r", "public_send", Cons (ESym name, pass), bp, be)
         else EMethodB (EVar "__capi_r", "__send__", Cons (ESym name, pass), bp, be)))
 // One request from C.
 and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
@@ -8237,6 +8253,9 @@ and capi_proc = fn world -> fn (number: int) -> fn (data: Val) -> fn (kind: int)
     if i >= arity then Cons ("&__b", (Nil : str list)) else Cons ("__a" ++ str_of_int i, fixed (i + 1)) in
   let params = (if kind == 2 && arity >= 0 then fixed 0 else Cons ("*__a", Cons ("**__k", Cons ("&__b", Nil)))) in
   let _ = store_proc (str_of_int pid) (true, params, body, benv) in
+  // (written nowhere in Ruby: no source location, and #inspect names none,
+  //  as a Proc of rb_proc_new is in CRuby)
+  let _ = map_set proc_src ("f" ++ str_of_int pid) (mkstr "") in
   let _ = (if kind != 0 then map_set lambda_ids (str_of_int pid) VNil else ()) in
   let _ = (if kind == 2 then map_set proc_arity (str_of_int pid) (VInt (if arity == 0 - 2 then 0 - 1 else arity)) else ()) in
   VProc pid
@@ -30333,6 +30352,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // (...or one made from a block the parser wrote as a lambda: `&:sym`
     //  where a refinement is active is such a block, and Symbol#to_proc's
     //  procs are lambdas)
+    // (rb_block_lambda: the block as a NEW Proc that is a lambda, as CRuby
+    //  makes one from the block handler; the block itself is unchanged)
+    else if (str_len name == 11 && str_eq name "__as_lambda") then
+      (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VProc pid) "dup" Nil false with
+       | VProc np9 -> (let _ = map_set lambda_ids (str_of_int np9) VNil in VProc np9)
+       | other9 -> other9)
     else if (str_len name == 7 && str_eq name "lambda?") then
       VBool (map_has lambda_ids (str_of_int pid)
              || (match proc_get (str_of_int pid) with (_, Cons (m9, _), _, _) -> str_eq m9 lambda_blk_marker | _ -> false))
@@ -45535,7 +45560,14 @@ and kernel_conv_fn0 = fn env -> fn world -> fn (name: str) -> fn (args: Val list
           // a conversion that answers a NON-array (and not nil, which declines)
           // is the object lying about its type.
           | VNil ->
-            (let r8 = conv_try env world v "to_a" in
+            // (a builtin value -- a Hash, a Range -- is asked too: conv_try
+            //  answers only for an object, and `Array({a: 1})` was [{a: 1}]
+            //  where ruby's is [[:a, 1]])
+            (let r8 = (match v with
+                       | VObj _ -> conv_try env world v "to_a"
+                       | _ -> (if responds world v "to_a"
+                               then invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) v "to_a" Nil false
+                               else VNil)) in
              match r8 with
              | VArr a9 -> VArr a9
              | VNil -> arr_new (Cons (v, Nil))

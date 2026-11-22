@@ -121,8 +121,38 @@ VALUE rb_singleton_class(VALUE obj) { return mr_callk(obj, "singleton_class", 0)
 /* ---- constants and variables --------------------------------------------- */
 void rb_define_const(VALUE klass, const char *name, VALUE value) { mr_call(klass, "const_set", 2, ID2SYM(rb_intern(name)), value); }
 void rb_define_global_const(const char *name, VALUE value) { rb_define_const(rb_cObject, name, value); }
-void rb_const_set(VALUE klass, ID id, VALUE value) { mr_call(klass, "const_set", 2, ID2SYM(id), value); }
-VALUE rb_const_get(VALUE klass, ID id) { return mr_call(klass, "const_get", 1, ID2SYM(id)); }
+/* A name that is no constant's ("_INVALID"): CRuby keeps it under an ID that
+ * `constants` and Ruby's const_get do not see, and C finds it again. Kept in
+ * a hidden instance variable of the module, by the same key define_class
+ * uses for a class of such a name. */
+static int const_name_p(const char *name) {
+    return name && ((name[0] >= 'A' && name[0] <= 'Z') || (unsigned char)name[0] >= 0x80);
+}
+static ID hidden_const_key(const char *name) {
+    VALUE key = rb_str_new_cstr("@__capi_hidden_const_");
+    rb_str_cat_cstr(key, name);
+    return rb_intern_str(key);
+}
+void rb_const_set(VALUE klass, ID id, VALUE value) {
+    const char *name = rb_id2name(id);
+    if (!const_name_p(name)) { rb_ivar_set(klass, hidden_const_key(name), value); return; }
+    mr_call(klass, "const_set", 2, ID2SYM(id), value);
+}
+VALUE rb_const_get(VALUE klass, ID id) {
+    const char *name = rb_id2name(id);
+    if (!const_name_p(name)) {
+        ID key = hidden_const_key(name);
+        VALUE ancestors = mr_call(klass, "ancestors", 0);
+        for (long i = 0; i < RARRAY_LEN(ancestors); i++) {
+            VALUE m = rb_ary_entry(ancestors, i);
+            if (RTEST(rb_ivar_defined(m, key))) return rb_ivar_get(m, key);
+        }
+        /* (not there: the lookup's own words, not Ruby's refusal of the name) */
+        if (klass == rb_cObject) rb_raise(rb_eNameError, "uninitialized constant %s", name);
+        rb_raise(rb_eNameError, "uninitialized constant %"PRIsVALUE"::%s", rb_class_path(klass), name);
+    }
+    return mr_call(klass, "const_get", 1, ID2SYM(id));
+}
 VALUE rb_const_get_at(VALUE klass, ID id) { return mr_call(klass, "const_get", 2, ID2SYM(id), Qfalse); }
 VALUE rb_const_get_from(VALUE klass, ID id) { return mr_call(klass, "const_get", 1, ID2SYM(id)); }
 int rb_const_defined(VALUE klass, ID id) { return RTEST(mr_call(klass, "const_defined?", 1, ID2SYM(id))); }
@@ -233,7 +263,10 @@ VALUE rb_class_get_superclass(VALUE klass) {
     return NIL_P(s) ? Qfalse : s;
 }
 VALUE rb_mod_ancestors(VALUE module) { return mr_call(module, "ancestors", 0); }
-VALUE rb_class_inherited_p(VALUE module, VALUE other) { return mr_call(module, "<=", 1, other); }
+VALUE rb_class_inherited_p(VALUE module, VALUE other) {
+    if (!RB_TYPE_P(module, T_CLASS) && !RB_TYPE_P(module, T_MODULE)) rb_raise(rb_eTypeError, "compared with non class/module");
+    return mr_call(module, "<=", 1, other);
+}
 VALUE rb_obj_is_kind_of(VALUE obj, VALUE klass) { return mr_callk(obj, "is_a?", 1, klass); }
 VALUE rb_obj_is_instance_of(VALUE obj, VALUE klass) { return mr_callk(obj, "instance_of?", 1, klass); }
 int rb_respond_to(VALUE obj, ID id) { return RTEST(mr_call(obj, "respond_to?", 2, ID2SYM(id), Qtrue)); }

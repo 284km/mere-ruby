@@ -102,7 +102,11 @@ void rb_mem_clear(VALUE *mem, long n) { while (n-- > 0) *mem++ = Qnil; }
 
 /* ---- Hash --------------------------------------------------------------------- */
 VALUE rb_hash_new(void) { return mr_call(rb_cHash, "new", 0); }
-VALUE rb_hash_new_capa(long capa) { (void)capa; return rb_hash_new(); }
+/* (a capacity is a size: a negative one is st.c's "st_table too big") */
+VALUE rb_hash_new_capa(long capa) {
+    if (capa < 0) rb_raise(rb_eRuntimeError, "st_table too big");
+    return rb_hash_new();
+}
 VALUE rb_ident_hash_new(void) { return mr_call(rb_hash_new(), "compare_by_identity", 0); }
 VALUE rb_check_hash_type(VALUE obj) {
     if (RB_TYPE_P(obj, T_HASH)) return obj;
@@ -138,7 +142,20 @@ VALUE rb_hash_update_by(VALUE hash, VALUE other, rb_hash_update_func *func) {
 void rb_hash_bulk_insert(long argc, const VALUE *argv, VALUE hash) {
     for (long i = 0; i + 1 < argc; i += 2) rb_hash_aset(hash, argv[i], argv[i + 1]);
 }
-VALUE rb_hash(VALUE obj) { return mr_call(obj, "hash", 0); }
+/* hash.c's: #hash, made a Fixnum -- a Bignum by its low word (with the sign
+ * kept in the top bit), anything else through #to_int */
+VALUE rb_hash(VALUE obj) {
+    VALUE hval = mr_call(obj, "hash", 0);
+    while (!FIXNUM_P(hval)) {
+        if (RB_TYPE_P(hval, T_BIGNUM)) {
+            unsigned long ul;
+            int sign = rb_integer_pack(hval, &ul, 1, sizeof(ul), 0, INTEGER_PACK_LSWORD_FIRST | INTEGER_PACK_NATIVE_BYTE_ORDER);
+            hval = sign < 0 ? LONG2FIX((long)(ul | (unsigned long)FIXNUM_MIN)) : LONG2FIX((long)(ul & (unsigned long)FIXNUM_MAX));
+        }
+        else hval = rb_to_int(hval);
+    }
+    return hval;
+}
 void rb_hash_foreach(VALUE hash, int (*func)(VALUE, VALUE, VALUE), VALUE arg) {
     VALUE pairs = mr_callh(hash, "to_a", 0);
     long n = RARRAY_LEN(pairs);

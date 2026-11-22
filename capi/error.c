@@ -166,8 +166,24 @@ static void warn_formatted(const char *fmt, va_list ap, int verbose_only) {
 void rb_warn(const char *fmt, ...) { va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 0); va_end(ap); }
 void rb_warning(const char *fmt, ...) { va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 1); va_end(ap); }
 void rb_compile_warn(const char *file, int line, const char *fmt, ...) { (void)file; (void)line; va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 0); va_end(ap); }
-void rb_category_warn(rb_warning_category_t category, const char *fmt, ...) { (void)category; va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 0); va_end(ap); }
-void rb_category_warning(rb_warning_category_t category, const char *fmt, ...) { (void)category; va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 1); va_end(ap); }
+/* (a category the program turned off -- Warning[:deprecated] = false -- is
+ *  not said at all, as error.c's rb_warning_category_enabled_p decides) */
+static int category_on(rb_warning_category_t category) {
+    const char *name = category == RB_WARN_CATEGORY_DEPRECATED ? "deprecated"
+                     : category == RB_WARN_CATEGORY_EXPERIMENTAL ? "experimental"
+                     : category == RB_WARN_CATEGORY_PERFORMANCE ? "performance"
+                     : category == RB_WARN_CATEGORY_STRICT_UNUSED_BLOCK ? "strict_unused_block" : NULL;
+    if (!name) return 1;
+    return RTEST(mr_call(mr_ruby("->(c) { (Warning[c] rescue true) }"), "call", 1, ID2SYM(rb_intern(name))));
+}
+void rb_category_warn(rb_warning_category_t category, const char *fmt, ...) {
+    if (!category_on(category)) return;
+    va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 0); va_end(ap);
+}
+void rb_category_warning(rb_warning_category_t category, const char *fmt, ...) {
+    if (!category_on(category)) return;
+    va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 1); va_end(ap);
+}
 void rb_sys_warning(const char *fmt, ...) { va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 1); va_end(ap); }
 
 /* ---- $! --------------------------------------------------------------------- */

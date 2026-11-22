@@ -204,7 +204,15 @@ ID mr_frame_method(void) { return cur ? cur->method : 0; }
 int mr_frame_keywords(void) { return cur ? cur->keywords : 0; }
 int mr_kw(int kw) { return kw ? MR_SEND_KW : 0; }
 
+/* (rb_iterate's block, waiting for the first method its function calls) */
+VALUE mr_iterate_block;
 VALUE mr_callv(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int flags) {
+    if (mr_iterate_block && NIL_P(block)) { block = mr_iterate_block; mr_iterate_block = 0; }
+    /* (keywords passed are a Hash, or one by #to_hash -- every *_kw function
+     *  of the C API refuses anything else: "no implicit conversion of
+     *  Integer into Hash") */
+    if ((flags & MR_SEND_KW) && argc > 0 && !RB_TYPE_P(argv[argc - 1], T_HASH))
+        rb_convert_type(argv[argc - 1], T_HASH, "Hash", "to_hash");
     mr_put_words(argc, argv);
     return mr_up(MR_SEND, recv, (VALUE)mid, (VALUE)argc, block, (VALUE)flags);
 }

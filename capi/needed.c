@@ -64,6 +64,15 @@ void rb_must_asciicompat(VALUE str) {
 /* ---- instance variables -------------------------------------------------------- */
 void rb_ivar_foreach(VALUE obj, int (*func)(ID name, VALUE val, st_data_t arg), st_data_t arg) {
     if (RB_SPECIAL_CONST_P(obj)) return;
+    /* (a class or module keeps its class variables in the same table, ahead
+     *  of its instance variables here, and CRuby walks them all) */
+    if (RB_TYPE_P(obj, T_CLASS) || RB_TYPE_P(obj, T_MODULE)) {
+        VALUE cvars = mr_call(obj, "class_variables", 1, Qfalse);
+        for (long i = 0; i < RARRAY_LEN(cvars); i++) {
+            ID id = SYM2ID(rb_ary_entry(cvars, i));
+            if (func(id, rb_cvar_get(obj, id), arg) == ST_STOP) return;
+        }
+    }
     VALUE names = rb_obj_instance_variables(obj);
     for (long i = 0; i < RARRAY_LEN(names); i++) {
         ID id = SYM2ID(rb_ary_entry(names, i));
@@ -188,14 +197,31 @@ unsigned long ruby_strtoul(const char *str, char **endptr, int base) {
 /* ---- blocks ---------------------------------------------------------------------- */
 extern VALUE mr_frame_set_block(VALUE block);
 extern VALUE mr_block_function(rb_block_call_func_t func, VALUE data);
-/* rb_iterate: func1(data1), with the C function `proc` as its block. */
-struct iterate { VALUE (*func)(VALUE); VALUE data; };
-static VALUE iterate_body(VALUE p) { struct iterate *it = (struct iterate *)p; return it->func(it->data); }
-static VALUE iterate_restore(VALUE old) { mr_frame_set_block(old); return Qnil; }
+/* rb_iterate: func1(data1), with the C function `proc` as its block -- the
+ * C frame's, and the block of the first method func1 calls (CRuby's passed
+ * block: `rb_funcall(obj, "each_pair", 0)` in func1 iterates with it). */
+extern VALUE mr_iterate_block;
+struct iterate { VALUE (*func)(VALUE); VALUE data; VALUE block; VALUE pending; };
+static VALUE iterate_body(VALUE p) {
+    struct iterate *it = (struct iterate *)p;
+    it->pending = mr_iterate_block;
+    mr_iterate_block = it->block;
+    return it->func(it->data);
+}
+
+struct iterate_frame { struct iterate it; VALUE old; };
+static VALUE iterate_frame_restore(VALUE p) {
+    struct iterate_frame *f = (struct iterate_frame *)p;
+    mr_iterate_block = f->it.pending;
+    mr_frame_set_block(f->old);
+    return Qnil;
+}
 VALUE rb_iterate(VALUE (*func1)(VALUE), VALUE data1, rb_block_call_func_t proc, VALUE data2) {
-    struct iterate it = { func1, data1 };
-    VALUE old = mr_frame_set_block(mr_block_function(proc, data2));
-    return rb_ensure(iterate_body, (VALUE)&it, iterate_restore, old);
+    struct iterate_frame f;
+    f.it.func = func1; f.it.data = data1; f.it.pending = 0;
+    f.it.block = mr_block_function(proc, data2);
+    f.old = mr_frame_set_block(f.it.block);
+    return rb_ensure(iterate_body, (VALUE)&f.it, iterate_frame_restore, (VALUE)&f);
 }
 
 /* ---- classes ----------------------------------------------------------------------- */
@@ -233,11 +259,11 @@ VALUE rb_make_exception(int argc, const VALUE *argv) {
 }
 VALUE rb_make_backtrace(void) { return rb_eval_string("caller(0)"); }
 const char *rb_sourcefile(void) {
-    VALUE path = rb_eval_string("caller_locations(0, 1).first&.path");
+    VALUE path = rb_eval_string("caller_locations(1, 1).first&.path");
     return NIL_P(path) ? NULL : StringValueCStr(path);
 }
 int rb_sourceline(void) {
-    VALUE line = rb_eval_string("caller_locations(0, 1).first&.lineno");
+    VALUE line = rb_eval_string("caller_locations(1, 1).first&.lineno");
     return NIL_P(line) ? 0 : NUM2INT(line);
 }
 VALUE rb_lastline_get(void) { return rb_gv_get("$_"); }
