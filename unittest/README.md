@@ -127,13 +127,36 @@ The workflow pins the Mere compiler and Ruby source to full commit SHAs.
 measure a newer compiler without changing the default pin. The macOS jobs use
 `macos-26` consistently. Linux still has its separate compilation smoke test.
 
-The corpus job builds mere-ruby once with `tools/build.sh` at O2 and uploads the
-binary before running the corpus. A separate job builds Ruby 4.0.9 and its native
-test extensions and both JITs (with Rust 1.85.0), installs a relocatable
-reference, and verifies the four test
-extensions previously replaced by shims. The reference load path excludes
+The `build-macos` job builds mere-ruby once with `tools/build.sh` at O2 and uploads
+the binary and its provenance. Corpus and native lifecycle checks run in the
+separate `corpus` job, which restores that exact binary and verifies its SHA-256.
+Its generated C, Prism archive and C API header are transferred in
+`native-build-macos` rather than rebuilt. CRuby, bootstrap, basic and tool
+measurements depend on the two builds and the plan, so they can start while
+corpus verification is still running. Corpus failures still fail CI.
+
+The shared `setup-mere` action caches only the native compiler executable,
+keyed by the full Mere SHA, runner OS/architecture, image and Clang identity,
+and the action definition. A hit skips OCaml/opam setup and compilation;
+the compiler checkout and executable check still run. A miss retains the
+existing OCaml setup retry. Both native platforms use the same action.
+
+A separate job builds Ruby 4.0.9, its native test extensions and both JITs
+(with Rust 1.85.0), installs a relocatable reference, and verifies the four
+test extensions previously replaced by shims. The reference load path excludes
 those shims entirely: Ruby can select a later .rb before an earlier native
 extension. mere-ruby keeps its own Ruby implementations.
+
+The reference runtime archive is cached by the Ruby source SHA, Ruby/Rust
+versions, build/data/archive definitions, runner OS/architecture, image,
+Clang/SDK identity and native dependency versions and prefixes. The definition
+set lives in `reference_cache_key.py`; changes to shard scheduling or unrelated
+workflow steps keep the cache. `package_reference.sh` defines the relocatable
+archive layout and is included in its key. Cache hits still
+check the Ruby version, both JITs, native test extensions, pinned test data,
+the environment smoke tests and actual mkmf compilation. Provenance is
+regenerated and the runtime is uploaded for the current run. The mere-ruby
+binary is rebuilt for each run; test outcomes are always measured again.
 
 Workers launch absolute test paths from each file's directory, preserving
 the source assumptions about `__FILE__` and absolute backtrace locations.
@@ -246,7 +269,7 @@ weights. None of these cases skips a file or reuses a test verdict. Invalid
 negative, zero or non-finite estimates fail planning. The plan records the timing
 file hash, coverage and estimated shard durations.
 
-At most four macOS measurement jobs run at once. Each file runs sequentially:
+The CRuby matrix runs at most four macOS jobs at once. Each file runs sequentially:
 each interpreter has a 600-second wall limit, and the tracked process family
 has an aggregate RSS cap of 2 GiB, polled every 0.1 seconds. A worker also has
 an outer wall limit of twice the per-side limit plus 60 seconds. Polling can
@@ -276,19 +299,20 @@ openssl/test_ossl.rb, resolv/test_dns.rb, ruby/test_io_timeout.rb,
 socket/test_tcp.rb and zlib/test_zlib.rb), totaling about 60 minutes. Their
 600-second limits and incomplete-result reporting are retained. Runtime fixes
 are needed to remove that work without changing the measurement budget.
-Reference and compiler builds take only a few minutes; this change targets the
-larger repeated-job overhead without introducing native-runtime cache validity
-or ABI dependencies.
+That earlier reduction targeted repeated-job overhead; the subsequent build
+caches described above also remove fixed compiler/reference build work.
 
-The checked-in estimates now come from the [post-merge run on 2026-11-07](https://github.com/284km/mere-ruby/actions/runs/42361097257)
-at `278a46c`, after the runtime fixes. All 758 files were collected from eight
-shards. The observed execution totals ranged from 708.0 to 1,383.5 seconds per
-shard with the previous weights. Replaying the same observations with refreshed
-weights gives 959.8–960.6 seconds per shard. A four-worker replay falls from
-2,298.3 to 1,920.4 seconds (16.4%); this excludes setup, queueing and future
-runtime variation and is not an observed end-to-end speedup. The report has no
-WALL_LIMIT files, but 22 MEMORY_LIMIT files and 166 incomplete or zero-test files
-remain. Successful collection is not Ruby conformance.
+The checked-in estimates now come from the [full run on 2026-11-18](https://github.com/284km/mere-ruby/actions/runs/44205107484)
+at measurement source `3e95d2844498aac009ba76b3a9025f5bc21feb0f`, with Mere
+`2e3cc433d470842a07c79cc50bd217441c889dc0`. All 758 files were collected from
+eight shards. The observed supervised execution totals ranged from 727.4 to
+1,582.4 seconds per shard with the previous weights. Replaying the same
+observations with refreshed weights gives 1,132.2–1,133.3 seconds per shard.
+This excludes setup, queueing and future runtime variation and is not an
+observed end-to-end speedup. The run took about 313 minutes overall, with the
+last CRuby shard starting about 290 minutes after dispatch; build separation
+does not itself remove contention with other workflows. The report retains
+49 incomplete or zero-test files. Successful collection is not Ruby conformance.
 
 Successful collection writes `timings.json` into `unittest-report`, using the
 observed per-file supervisor durations and exact source/compiler/Ruby refs.
@@ -352,6 +376,7 @@ Artifacts are retained for seven days:
 |---|---|
 | `unittest-plan` | Exact candidate list, pinned revisions, partitions and scheduling estimates |
 | `mere-ruby-macos` | O2 binary, build mode and compiler/source provenance |
+| `native-build-macos` | Generated C, Prism archive and generated C API header for corpus/native verification |
 | `ruby-reference-macos` | Installed reference, native test extensions and provenance |
 | `unittest-shard-N` | Per-file results, bounds, peak family RSS and sanitized diagnostic logs |
 | `unittest-report` | `SUMMARY.md`, `summary.json`, every planned file in `files.tsv`, and successful-run `timings.json` |
@@ -522,6 +547,11 @@ runner crosses them.
   after 60,000 named Structs and wants less than twice. Locally the ratio is
   1.25-1.37 on main and on a branch alike; one CI run gave 2.29 for one of
   the two while the other passed in the same file.
+- `assert_no_memory_leak` gives a child 10 s: `-ext-/string/test_nofree.rb`
+  (`test_no_memory_leak`) takes 7.1-7.3 s on this machine, on main's build
+  and on a branch alike, and one CI run of a branch whose runners were
+  crowded took 10.10 s. `ruby/test_object.rb`'s `test_copied_ivar_memory_leak`
+  is the same kind of test, and the same run timed it out.
 - `ruby/test_ractor.rb`'s `test_move_nested_hash_during_gc_with_yjit` runs a
   child with a 10 s bound and takes 9.3-10.1 s on the runners, on main as
   well: one run in a few is a Timeout and the file is one test lower.
