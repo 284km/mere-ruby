@@ -48,6 +48,14 @@ const host = mod.makeInstance();
 const { instance } = await WebAssembly.instantiate(readFileSync(wasm), { env: host.env });
 host.bind(instance);
 if (process.argv[2] === '--check-imports') {
+  // Custom Float externs return a pointer to a boxed f64 in this backend.
+  // A raw -1 would satisfy instantiation but trap on the startup f64.load.
+  const ptr = host.env.mr_gc_process_cpu_time();
+  const memory = instance.exports.memory.buffer;
+  if (!Number.isInteger(ptr) || ptr < 0 || ptr + 8 > memory.byteLength ||
+      new DataView(memory).getFloat64(ptr, true) !== -1) {
+    throw new Error('smoke: CPU clock host must return a boxed unavailable Float');
+  }
   console.log('every import instantiates with index.html\'s actual host');
   process.exit(0);
 }
