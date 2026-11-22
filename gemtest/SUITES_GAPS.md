@@ -5,6 +5,30 @@ stderr in CI's `gem-suites-*` artifacts identify individual failed tests.
 Symptoms below are observed; an unconfirmed cause is explicitly marked.
 None is excluded from the measurement to improve its score.
 
+Additional pinned suites: Matrix has 2 MATCH files; Logger has 4 MATCH and
+1 RED. Primitive super now stops at Hash/Array/String/Proc's actual native
+ancestor before a Ruby method farther up the chain. The actual Test::Unit
+Fixture observer registration therefore works in separated children. The
+common method-copy path records real alias/Method-copy sharing as a private
+flag in the existing owned method-source row. Replacing such a copy suppresses
+its first redefinition warning; the next ordinary replacement warns. Clone
+and refinement-import copies retain ordinary warnings. Anonymous owners carry
+no new global warning-map entries; their flag has their method row's lifetime.
+Witnesses 701 and 702; no new top-level let or collector change.
+
+Logger's remaining test_logdevice failure compares a rotated open File with
+its old pathname. File predicates currently discard its retained descriptor.
+A /dev/fd path conversion trial did not match the reference and was reverted;
+the real fstat primitive exists, but routing this predicate through it needs
+the shared invoke_val_c0 branch. Defer that Ruby semantics edit while the
+C API session owns the function; this is not a C extension dependency.
+
+A separate pre-existing Hash subclass undef under a prepended [] wrapper
+still reaches the primitive on both the paired parent and this candidate.
+It is not repaired by the native-super ordering change or omitted from an
+upstream file. The focused new witness tests native-super ordering and an
+undef farther behind the already selected native entry.
+
 PR #92 Module RSS follow-up (2026-11-20): its original complemented-entry
 case still has a preserved hosted 2.026060x failure. A single-refinery live
 snapshot no longer duplicates the fixed entry it already restores. The
@@ -265,6 +289,16 @@ total MATCH counts from a different gained file. Route the producer/reader
 resource investigation to the VM/performance session; no specific VM or GC
 cause is established. Keep the 600-second/2-GiB bounds and parent baseline.
 
+The subsequent strict rounds 19-21 macOS run 44292334030 again loses multipart
+to MEMORY. Keep that failure alongside #107's preceding successful hosted
+observation. The cause of this variation remains open. Separately, strict
+Linux run 44292334299 fails the new Method-copy lifetime check at 2.086x.
+copy_meth_src now publishes each destination's location/flags once and avoids
+rewriting an already-shared source. Paired unmodified controls lower peak RSS
+on macOS and Linux/aarch64; their raw series and the failed hosted x86-64
+observation are retained in method_copy_lifetime_latest.json. The unchanged
+2x check and final hosted result remain merge gates.
+
 The remaining stdlib-caller P2 also affected `mspec/scoreboard.sh` and
 `run_corpus.sh` when reference library directories were supplied through
 RUBYLIB. Mere now receives its own load paths before those fallback paths;
@@ -290,3 +324,18 @@ bundled-gem directories stops at corpus 178: `$_` before the first read is
 observed additional environment-dependent Ruby semantic difference; its cause
 is not isolated, and it is not assigned to VM, AST, C API or GC internals.
 It is retained as an open difference, not counted as a successful full sweep.
+
+
+PR 107 Method-copy follow-up (2026-11-22): restore the previously authorized
+`compact_method_store` floor correction omitted from public `263c2dd6`.
+Ordinary macOS O2 parent/candidate/candidate/parent gives
+1.682880 / 1.380188 / 1.382723 / 1.679791 under the unchanged original 2x assertion
+and all 21 prefixes. Preserve the hosted 2.151589x failure and require new hosted
+evidence. Complete core Module, Refinement and Method lose no passing case.
+The original 69 gem files retain 60 MATCH / 7 RED / 0 BOTH / 2 MEMORY with no
+lost accepted MATCH. Logger is now MEMORY in the full sweep; a first separate
+parent is RED, then all four predetermined whole-file comparisons are MEMORY,
+including both parents. Neither Logger's root RSS growth nor its File identity
+error is fixed. Rack Request remains MEMORY. Full corpus 738/738 matches in
+both modes. See `method_floor_pr107_r101.json` for all observations and identities;
+no snapshot or bound is changed, and this is not Linux or latest-main merge proof.
