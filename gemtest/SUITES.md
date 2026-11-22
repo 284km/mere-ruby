@@ -159,3 +159,13 @@ a3ad911a keeps **53 MATCH / 7 RED / 2 MEMORY**, zero regressions and corpus
 **701/701**. Method, Module, TracePoint, Proc, Super and Yield retain their
 paired baseline MATCH counts. The initial snapshot and resource bounds stay
 unchanged; hosted per-file merge checks remain pending.
+
+Rounds 12-13 dispatch genuinely missing primitive names to their singleton's
+Ruby method_missing and leave do...end on the outer command when its argument
+is another dotted command. Minitest spec's errors fall from four to zero and
+Minitest test's from one to zero; both files retain their other failures.
+Fresh O2 source 61d57736 keeps the full-file totals at **53 MATCH / 7 RED /
+2 MEMORY**, zero BOTH/TIMEOUT/regressions. Corpus is **703/703**. Witnesses
+683/684 match normally and under GC.stress, and related Method/Super/Yield/
+Parse/Syntax controls retain their baseline counts. Original files, sources,
+dependencies, the initial snapshot and all resource bounds stay unchanged.

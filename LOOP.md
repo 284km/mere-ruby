@@ -5821,6 +5821,80 @@ reflected Method calls with and without blocks.
 - Existing hosted per-file checks against both CI baselines remain pending;
   no lower count or incomplete coverage is waived and no PR is merged.
 
+## 2026-11-17 (72): gem rounds 12-13 -- singleton missing hooks and command blocks
+
+The unchanged five-suite inventory still gives 53 MATCH / 7 RED / 2 MEMORY,
+with zero BOTH/TIMEOUT/regressions across 62 original files / 1,969 reference
+tests. Within the RED files, Minitest spec improves from 2 failures / 4 errors /
+443 assertions to 2 failures / 0 errors / 451 assertions. Minitest test improves
+from 8 failures / 1 error to 8 failures / 0 errors, retaining its one skip.
+No entire-file MATCH gain is claimed.
+
+- `invoke_val_c2` / `invoke_with_block2` use the new `hng_missing_hook` to
+  reach a primitive singleton's Ruby method_missing for a genuinely missing
+  name. Existing Ruby methods, native aliases and the existing native owner
+  table win first; response hooks do not decide existence. The existing
+  missing-call path retains arguments, keywords, blocks and error attributes.
+- `super_missing` now reaches the extracted `missing_native_super` before
+  the generic primitive fallback. A hook's super reports the originally
+  requested name, receiver and arguments instead of method_missing itself.
+  Witness 683 includes Hash/Array/String/Proc, direct/send/public_send calls,
+  query claims, existing methods, private refusal, hook super and removal.
+- `safe_nav_bare` / `attach_block_method` respect an enclosing command's
+  existing nodo flag after parsing their own bare arguments. The outer
+  do...end no longer attaches to a nested dotted command. Witness 684 covers
+  normal/safe/nil calls, nesting, direct calls, parentheses, braces and the
+  exact regex/new/Mutex/yield shape isolated from Minitest. This is a language
+  parsing difference; AST/Ripper/Prism tree APIs are untouched.
+- Fresh O2 source 61d57736: corpus 703/703. Both added witnesses match normally
+  and under GC.stress. Method retains 97 MATCH / 1 RED, Super 50/50, Yield
+  13/13; paired latest-successful-main controls for Parse are 102/102 on both
+  and Syntax 167 MATCH / 1 RED / 2 BOTH on both. Six harness controls and the
+  structural gates pass; bracket depth remains 892/1024.
+- The remaining spec-name failures reduce to Array#join ignoring a class's
+  Ruby to_s while the direct call works. Its invoke_val_c0 branch, like the
+  exception Marshal branch in stdlib_src, is still shared with another
+  session. Keep those coordination constraints and original RED files.
+- AST #86 has merged to main 392bf810; its ordinary CI is still queued, so
+  43933582689 remains the latest successful main baseline alongside handoff
+  43548292351. Before publication, the current #99 AST, VM, C API and GC
+  branches were compared at all changed function bodies; none overlaps.
+  No top-level let, collector, shared dispatcher or resource bound changes.
+
+## 2026-11-17 (73): preserve active refinements before singleton missing hooks
+
+#100's P2 found that hng_missing_hook's real-definition probes omitted lexical
+refinements. The existing refinement dispatcher could handle the call, but the
+new earlier guard sent it to method_missing. Source 77e39520 also consults the
+existing refined_impl_for before declaring the name missing, preserving that
+dispatcher's priority without editing it.
+
+Expanded witness 683 covers Hash/Array/String/Proc refinement methods, keyword
+arguments, send/public_send and ordinary unhandled names with singleton hooks.
+It matches Ruby normally and under GC.stress. A separate block-bearing refined
+Hash control fails on the pre-round base too; that existing block-dispatch gap
+is recorded, rather than claimed as fixed or removed from an upstream file.
+
+- Fresh O2 full run: 62 files / 1,969 reference tests, 53 MATCH / 7 RED /
+  2 MEMORY, zero BOTH/TIMEOUT/regressions. Corpus 703/703. Method retains
+  97 MATCH / 1 RED, and paired #97-base/candidate Refinement both give
+  121 MATCH / 1 BOTH. Six harness controls pass; bounds are unchanged.
+- #90's newly available hosted raw artifacts cover 663/758 existing files.
+  ObjectSpace 37, Object 65, transcode 98 and zlib 96 MATCH recover their
+  earlier lower counts. TracePoint gives 96 versus handoff's 97; its extra
+  recorded error is test_thread_add_trace_func's access-from-outside error,
+  while the local paired controls give 97; its cause remains unconfirmed.
+  Bootstrap eval is still
+  48 versus handoff's 49: case 19 incorrectly allows Integer.instance_eval
+  to define a constant. Neither shortfall is waived; remaining shard coverage
+  and the two file gates still prevent merging.
+- Candidate-only measurements outside the public lock give Matrix 2 MATCH.
+  Rake has 20 BOTH because CRuby's core Test::Unit adapter refuses the tag's
+  assert_raises alias; Logger's child cannot find its locked library on the
+  reference side. These are setup defects, not interpreter verdicts accepted
+  into the baseline. The candidates need their actual pinned Test::Unit
+  dependencies and inherited locked child load paths before inclusion.
+
 ## 2026-11-16 (60): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and published gems -- nokogiri among them -- install with `gem install`
 
 Stage 7′ / 8, third unit (note 553), on the C API of (58). Until now
@@ -7317,9 +7391,17 @@ log is archived; retry that job when GitHub allows it.
 Audited rounds 10-11 on main 12ca1df2, O2 source 20cc0eac: 53 MATCH /
 7 RED / 0 BOTH / 0 TIMEOUT / 2 MEMORY, all 62 reference files audited.
 The parent's macOS multipart MATCH becomes MEMORY in both the full run
-and a focused repeat. Keep the nonempty regression in suites_candidate.json;
-this observation is not an adopted baseline. Preserve the parent's macOS
+and a focused repeat. Keep this inherited observation byte-for-byte in
+gemtest/suites_candidate_r5_inherited.json; it is not an adopted baseline.
+Preserve the parent's macOS
 and Linux gates, and leave merge blocked pending the resource investigation.
+
+Audited rounds 12-13 on main 12ca1df2, O2 source e32d84fd: 53 MATCH /
+7 RED / 0 BOTH / 0 TIMEOUT / 2 MEMORY. All 62 reference files and 60 Mere
+files finish their source audits; two Mere processes reach the RSS cap.
+Keep the nonempty multipart MATCH-to-MEMORY regression in the unadopted
+suites_candidate.json. The parent's macOS 53-MATCH baseline remains the
+merge gate. The source/dependency inventory and resource bounds are unchanged.
 
 ## 2026-11-20: a live refinement snapshot need not duplicate its first target
 
