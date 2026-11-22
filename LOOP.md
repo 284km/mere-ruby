@@ -8445,3 +8445,26 @@ exclusions with identical identities and reasons on both sides. Allocation76
 stays enabled. The159-row intake remains14 MATCH/57 EXCLUDED/88 HANDOFF.
 Original tests, locks, accepted snapshots and all bounds are unchanged.
 Fresh hosted checks and the latest-main per-file comparison remain required.
+
+
+## 2026-11-22: keep TracePoint events on their suspended callback
+
+The PR96 integration at 6fc219e6 loses the original
+`TestSetTraceFunc#test_thread_add_trace_func` with `access from outside` in two
+complete runs, while paired main a9ca552d passes that case. A short program
+that explicitly yields inside a shared TracePoint reproduces overwritten
+event metadata on both binaries, so the underlying bug predates this PR;
+only the original case's triggering schedule differs. The initial failures
+and all existing suite failures remain recorded.
+
+TracePoint's Ruby prelude now keeps each active event in its own Fiber's
+entry on the TracePoint object, rather than shared event/inside ivars. An
+ensure restores the enclosing event for allow_reentry or removes the entry
+when the callback ends, including exceptions. No Mere global map, pin, GC
+rule, compiler/dependency pin, upstream test or resource bound is changed.
+
+Witness 749 checks shared callbacks across Thread.pass, outside access while
+another thread's callback is suspended, allow_reentry restoration, explicit
+Fiber.yield/resume and exception cleanup. A fresh ordinary O2 build matches
+Ruby 4.0.9 exactly. Complete original TracePoint and other regression results
+are recorded separately on the PR with their actual source revision.
