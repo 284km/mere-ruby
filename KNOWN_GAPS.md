@@ -5034,3 +5034,32 @@ lookups (corpus742). Both definition paths retain the lexical first constant,
 privacy and autoload behavior. The712-file corpus and original nine-file784-case
 comparison pass without losing a main PASS. The separate module_eval lexical
 negative remains an explicit failing diagnostic; this change does not claim it.
+
+
+## The original Rails native-install blocker is resolved on integrated main
+
+The fresh cold replay in railstest/main_native_install.json uses main 2e2ab568,
+normal O2 and its pinned compiler 01f5ad73. The merged #95 build/header metadata
+and #120 SHA-2 provider are sufficient for Bundler and all 68 frozen dependencies
+to install, including bigdecimal 4.1.3, in 253.379 seconds / 914,976 KiB. The same 69
+source archives, empty per-interpreter gem homes, independently built native
+extensions and 600-second/2-GiB bounds remain. The mkmf probe also succeeds
+using this runtime's own actual headers. Issue #116's first-build boundary
+is resolved; the old main 12ca failure remains a historical measurement.
+
+Reference passes all six stages, six application tests / 31 assertions and
+Puma HTTP. Mere's next migration command fails at the separate registry issue
+#121 (perform on nil), exit 1 in 2.062 seconds / 199,616 KiB without a limit event.
+Boot, tests and HTTP remain NOT_RUN; the complete measurement is RED. No
+runtime function, lock, fixture, original test, exclusion or bound changes.
+
+
+## GC compiler integration after PR145
+
+Compiler408b03d9 is now selected with main while retaining the published
+VM correction and all truthful GC/ObjectSpace behavior. The159-row intake
+stays14 MATCH/57 reasoned exclusions/88 handoffs. A fresh comparison keeps
+all76 allocation cases enabled; its57 exclusion identities and reasons match
+on reference and Mere. The existing weak-reference count, VM allocation
+and native attribution gaps remain explicit. No collector value, exclusion,
+original test or limit was changed to obtain the new730-file corpus result.

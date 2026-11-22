@@ -7725,3 +7725,55 @@ including the two new Digest witnesses, pass; nine RSS workloads, roots,
 depth 155 and dead definitions also pass. GC runtime functions, the 159-row
 classification ledger, 57 symmetric exclusions and all original bounds are
 unchanged. Current hosted checks and every-file nonregression still gate merge.
+
+
+## Replay the original Rails native-build issue on integrated main
+
+Issue #116 was left open while the own build metadata (#95) and bounded SHA-2
+provider (#120) were unmerged. Both are now in main 2e2ab568. A fresh normal O2
+build with main's pinned compiler 01f5ad73 and the unchanged committed Rails
+runner installs Bundler and all 68 dependencies from the same 69 archives.
+Separate initially empty gem homes and independently built extensions remain;
+the same documented system SQLite 3.46.1 option is used on both interpreters.
+
+The dependency stage exits 0 in 253.379 seconds / 914,976 KiB, within the existing
+600-second/2-GiB family bounds. The original small mkmf probe matches and the
+actual bigdecimal Makefile/build uses this runtime's own headers. All 77 captured
+runtime/runner/lock input hashes stay fixed, all stored stdout/stderr hashes
+verify, and seven harness controls pass. The initial sandbox-denied ps check
+is separate setup evidence; the same harness passes with normal permissions.
+
+Reference passes all six stages, including six tests / 31 assertions and actual
+Puma HTTP. Mere's original migration then stops at the separately tracked #121
+registry error, perform on nil, exit 1 in 2.062 seconds / 199,616 KiB. Boot/tests/
+HTTP are NOT_RUN and the whole record remains RED. Keep all earlier source-
+specific records, add railstest/main_native_install.json, and correct the stale
+README statement about current main. This meets #116's first-extension-build
+acceptance condition without claiming Rails application/framework success.
+Runtime functions changed: none; no lock, test, exclusion or bound changes.
+
+
+### Merge main while retaining the actual GC observations and exclusions
+
+Integrate main05c3bda3 and its released compiler408b03d9 after PR145,
+including the documentation-only Rails-install receipt from PR146.
+Preserve the already-published07d88806 unused-block correction unchanged;
+no VM function is manually edited. The sole implementation-related merge
+change is CI's MERE_REF. No GC API value, collector/state function, ledger,
+original test, accepted snapshot or resource bound is changed.
+
+New ordinary O2/compiler408b03d9 validation: **730/730 corpus**, hash
+index ON/OFF, **586.824s / 1,045,968KiB** peak family RSS.
+All56 focused comparisons, nine RSS gates, roots, dead definitions and C
+depth155/1024 pass. Five complete original files retain **166 enabled cases:
+71 MATCH / 87 RED / 3 BOTH / 5 EXTRA**, plus **57 separately recorded
+exclusions**. Both sides exclude the exact same identities/reasons: GC19,
+compact22, objspace16. All76 allocation comparisons stay enabled and RED.
+GC retains32 MATCH/1 existing RED/2 BOTH; ObjSpace37 MATCH/9 RED and string
+memory2 MATCH/1 RED. The compact API controls retain the reference's skips.
+The initial GC run lacked Mere's native stack fixture and is not accepted
+as the corrected context; rebuilding the unchanged fixture against Mere's
+own headers restores the two finalizer matches. The reference is the pinned
+CI Ruby4.0.9 with its matching original extensions. The159-row intake remains
+14 MATCH/57 EXCLUDED/88 HANDOFF. New hosted checks and the every-file gate
+remain required; no exclusion is credited as a passing test.
