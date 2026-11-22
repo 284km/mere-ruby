@@ -11004,3 +11004,31 @@ extra is a fixed cost per thread. The collections' time is mostly
 coro_scan_strings (the stacks read for class names) on both; the VM's
 collections see more live classes and more native candidates (22 and 423
 against 6 and 112 in the test's child), which is the next thing to follow.
+
+## 2026-11-22 (89): the VM's cost with threads parked under GC.stress was the programs' arenas
+
+What (88) left open was not the parked frames. test_thread_join_during_
+finalizers' child kept 11,909 region blocks live on the VM and 1,219 on the
+evaluator; both rebuilt the sorted list of live blocks the same number of
+times (about 9,200, __lang_scan_spans: the change log of 64 overflows
+between two scans of a stopped fiber), and each rebuild sorts every block.
+`require "test/unit"` alone made the difference: 13,607 blocks against 744.
+Counted by who made each arena (the region's creator recorded at
+__lang_region_init and symbolized at exit), all but a few hundred were
+vm_load_seq's: a program had eight Vecs (operation, name, operands a, b, c,
+value, line, events), each with an arena of its own so that vm_free could
+give it back, and an arena that grew past 256 bytes kept its first block
+and a 4 KB one.
+
+Now a program's instructions are a stretch of its tree's:
+- vm_trees holds three Vecs a tree (its ints, six to an instruction; its names; its values),
+- vm_code holds the tree, the stretch's start and its length a program (vm_prog),
+- a sequence is put together in Vecs kept one a depth (vm_scratch) and appended to the tree when it is done -- the sequences inside it first, as they are loaded before it is done (vm_tree_put),
+- a tree's Vecs are emptied when its last program is given back (vm_tree_rc); trees are given back whole (vm_unload, a failed load).
+
+Every reader adds the stretch's start (vcb) to the pc it indexes with.
+
+- `require "test/unit"` on the VM: 13,607 blocks -> 1,110 (the evaluator 747).
+- Measured with nothing else running, the evaluator, then the VM before and after:
+  - test_thread_join_during_finalizers: 24.4-24.9 s; VM 36.5 s -> 27.3 s, which is 1.47x -> 1.11x.
+  - test_parent_iseq_mark: 11.3 s; VM 12.5 s -> 12.2 s, which is 1.08x.
