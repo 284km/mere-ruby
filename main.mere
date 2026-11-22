@@ -15208,6 +15208,41 @@ and invoke_val_c2 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              hng_undef_call env world recv0 name0 args0
                (false, (Nil : str list), (Nil : Stmt list), env) (if vischeck then 0 else 1)
            else if cls_sng_undef world recv0 name0 then cls_sng_undef_raise world recv0 name0 args0
+           // The core override check must consume its own native bypass.
+           // Subclasses (or a core without that check) enter the constructor
+           // directly and clear the bypass before it can reach a coercion.
+           else if str_eq name0 "[]" && map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name0
+                   && (match recv0 with
+                       | VClass c9 when obj_is_a world c9 "Hash" || obj_is_a world c9 "Array" ->
+                         (let (meths9, _, _, _) = world in
+                          if str_eq c9 "Hash" || str_eq c9 "Array" then
+                            (if (map_has meths9 ("(sng:" ++ c9 ++ ")#[]") || map_has prepends ("(sng:" ++ c9 ++ ")"))
+                                && (if str_eq (sng_user_owner world c9 name0) "" then false else true)
+                             then false else true)
+                          else true)
+                       | _ -> false) then
+             (let _ = map_clear bi_skip in invoke_val_c0 env world blk recv0 name0 args0 vischeck)
+           // A container subclass's Ruby [] precedes its inherited native
+           // constructor, including an inherited/prepended singleton method.
+           // A saved native alias or super consumes only its existing bypass.
+           else if str_eq name0 "[]"
+                   && (match recv0 with VClass c9 ->
+                         (obj_is_a world c9 "Hash" || obj_is_a world c9 "Array")
+                         && cls_meth_own world c9 name0 && container_bracket_ruby_first world c9 | _ -> false)
+                   && (if map_len ref_active > 0 then str_eq (refined_impl_for world recv0 name0) "" else true)
+                   && (if map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name0 then false else true) then
+             (match recv0 with
+              | VClass c9 ->
+                (let sc9 = "(sng:" ++ c9 ++ ")" in
+                 let refused9 = (if vischeck && meth_private world sc9 name0 then "private"
+                                  else if vischeck && meth_protected world sc9 name0 && (if protected_ok_m env world sc9 name0 then false else true) then "protected"
+                                  else "") in
+                 if str_eq refused9 "" then invoke world blk recv0 sc9 name0 args0
+                 else if has_meth world sc9 "method_missing" then invoke world blk recv0 sc9 "method_missing" (Cons (VSym name0, args0))
+                 else raise_exc_iv world "NoMethodError"
+                        (refused9 ++ " method '" ++ name0 ++ "' called for class " ++ display_cls world c9)
+                        (Cons (("__name", VSym name0), Cons (("__args", arr_new args0), Cons (("__recv", recv0), Nil)))))
+              | _ -> VNil)
            // (an Enumerator's to_a / entries walk it under 'Enumerable#to_a'
            //  and 'Enumerator#each', as with a block: what the source sees
            //  of the stack -- Thread.each_caller_location through
@@ -47416,7 +47451,8 @@ and try_self_call1 = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> 
        // a `def self.new` outranks the built-in allocation here exactly as it
        // does for an explicit receiver -- a bare `new` inside another class
        // method must reach it (Date.parse builds its result that way).
-       if (str_len name == 3 && str_eq name "new") && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then new_obj world c args
+       if (str_len name == 3 && str_eq name "new") && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+         invoke_val_c env world noblk (VClass c) name args false
        else if has_meth world ("(sng:" ++ c ++ ")") name then invoke world noblk (VClass c) ("(sng:" ++ c ++ ")") name args
        // ...and Kernel's bare specials, as in try_self_call_x's VClass arm
        else if kernel_bare_special name && (if has_meth world "Module" name then false else true) then
@@ -48881,7 +48917,11 @@ and super_next_plain = fn world -> fn env -> fn (recv: Val) -> fn (defcls: str) 
   // A primitive's native entry precedes Ruby methods farther up its chain.
   // Returning no Ruby entry asks super_missing to run that actual builtin.
   let base9 = (match recv with VStr _ -> "String" | VArr _ -> "Array"
-                             | VHsh _ -> "Hash" | VProc _ -> "Proc" | _ -> "") in
+                             | VHsh _ -> "Hash" | VProc _ -> "Proc"
+                             | VClass c9 when str_eq meth "[]" ->
+                               (if obj_is_a world c9 "Hash" then "(sng:Hash)"
+                                else if obj_is_a world c9 "Array" then "(sng:Array)" else "")
+                             | _ -> "") in
   if str_eq base9 "" then
     (if map_len undefs > 0 && undef_blocked_anc world rest9 meth then ("", 0 - 1, true)
      else (let a2 = lookup_anc world rest9 meth in
@@ -48897,6 +48937,7 @@ and super_next_plain = fn world -> fn env -> fn (recv: Val) -> fn (defcls: str) 
        if map_len undefs > 0 && map_has undefs key9 then ("", 0 - 1, true)
        else if map_has methods9 key9 then (owner9, at9, false)
        else if map_has bi_owner_set key9
+               || (match recv with VClass _ -> str_eq meth "[]" && str_eq owner9 base9 | _ -> false)
        then ("", 0 - 1, false)
        else walk9 tail9 (at9 + 1)) in
   walk9 rest9 (i0 + 1)
@@ -50426,6 +50467,34 @@ and missing_native_super = fn world -> fn (recv: Val) -> fn (args: Val list) ->
         (Cons (("__name", nmv9), Cons (("__recv", recv), Cons (("__args", arr_new rest9),
            Cons (("__priv", VBool (pv9 >= 1)), Nil))))))
    | Nil -> raise_exc world "NoMethodError" ("undefined method for " ++ for_recv_cls world dcls))
+and container_bracket_ruby_first = fn world -> fn (c: str) ->
+  let (meths9, _, _, _) = world in
+  let rec first9 = fn (anc9: str list) -> match anc9 with
+    | Nil -> false
+    | Cons (own9, tail9) ->
+      if map_has undefs (own9 ++ "#[]") then false
+      else if map_has meths9 (own9 ++ "#[]") then true
+      else if str_eq own9 "(sng:Hash)" || str_eq own9 "(sng:Array)" then false
+      else first9 tail9 in
+  first9 (ancestors_of world ("(sng:" ++ c ++ ")"))
+and container_bracket_super_ahead = fn world -> fn (recv: Val) ->
+  let depth9 = caller_depth () - 1 in
+  if (if map_has fb_env_at depth9 then false else true) then false else
+  (let frame9 = map_get fb_env_at depth9 in
+   let dc9 = (match lv_get frame9 "__defcls" with VClass c9 -> c9 | _ -> "") in
+   let anc9 = ancestors_of world (super_base world recv) in
+   let at9 = (if lv_has frame9 "__defidx" then
+                (match lv_get frame9 "__defidx" with VInt i9 when i9 >= 0 -> i9 | _ -> idx_in9 anc9 dc9)
+              else idx_in9 anc9 dc9) in
+   let (meths9, _, _, _) = world in
+   let rec ahead9 = fn (rest9: str list) -> fn (index9: int) -> match rest9 with
+     | Nil -> false
+     | Cons (own9, tail9) ->
+       if index9 <= at9 then ahead9 tail9 (index9 + 1)
+       else if map_has undefs (own9 ++ "#[]") || map_has meths9 (own9 ++ "#[]") then false
+       else if str_eq own9 "(sng:Hash)" || str_eq own9 "(sng:Array)" then true
+       else ahead9 tail9 (index9 + 1) in
+   at9 >= 0 && ahead9 anc9 0)
 and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) -> fn (args: Val list) ->
   // super from a method of a primitive subclass (Array/String/Hash) into the
   // builtin base: use the builtin implementation.
@@ -50550,6 +50619,16 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   //   method_missing -- Tempfile's is Delegator's, so every Tempfile.create
   //   under test/unit was "undefined method '__getobj__' for class Tempfile".
   match recv with
+  | VClass c9 when str_eq meth "[]" && (obj_is_a world c9 "Hash" || obj_is_a world c9 "Array")
+                   && container_bracket_super_ahead world recv ->
+    // Dispatch the real native constructor without entering the override.
+    // Only core receivers need its one-call bypass; subclasses reach the
+    // inherited constructor directly, with no bypass leaking to coercions.
+    (let core9 = str_eq c9 "Hash" || str_eq c9 "Array" in
+     let _ = (if core9 then map_set bi_skip "n" meth else ()) in
+     let answer9 = try_or_msg (fn (u: unit) -> invoke_val_c0 gc_cenv0 world superblk recv meth args false)
+                              (fn (message: str) -> (let _ = (if core9 then map_clear bi_skip else ()) in fail message)) in
+     let _ = (if core9 then map_clear bi_skip else ()) in answer9)
   // A class/module's override of Module#name reaches the same builtin name
   // value as a direct call; re-dispatch would enter the override again.
   | VClass c9 when str_eq meth "name" && module_name_super_ahead world recv ->

@@ -57,7 +57,7 @@ module_rss_pr92_r55.json; no existing source lock or baseline is replaced.
 | minitest / `test_minitest_mock.rb` | Executes all 94 tests; 1 failure, 8 errors and 10 skips. File.open stubs now work with and without blocks. Remaining failures include private stubs and a dynamic method's super lookup. | Ruby semantics. Reduce the remaining alias/super witnesses; avoid dispatch functions currently edited by other sessions. |
 | minitest / `test_minitest_spec.rb` | All 76 tests run: 2 failures, 0 errors, 451 versus 458 assertions. Hash expectation names now reach singleton method_missing and the nested yield reaches its outer command block. Nested spec names still retain an anonymous parent description. | Ruby semantics. A reduced class overrides to_s correctly in a direct call, but Array#join still uses its native class display. The join branch is in invoke_val_c0, shared with the other sessions, so leave it untouched until available. |
 | minitest / `test_minitest_test.rb` | Backtrace compression works and the missing-yield error is resolved; 8 exception Marshal/equality failures, 0 errors and 1 skip remain. A small exception wrapper with an overridden backtrace compares unequal after a Marshal round trip. The dump stores its delegated trace as its native trace; the reference keeps the native trace nil. | Ruby semantics. The Marshal branch is in `stdlib_src`, also edited by the GC session in #91/#94, so avoid that function until available. This is a coordination constraint, not a GC cause. |
-| rack / `spec_headers.rb` | All 51 tests now run: 37 failures, 2 errors, 151 versus 302 assertions. A Hash subclass's own class `[]` is bypassed by the inherited native constructor, so header keys remain uppercase. | Ruby semantics. A small subclass returning a sentinel from self.[] reproduces the bypass with both bracket and ordinary call syntax. An unaccepted priority-fix trial then exposed bare zero-argument new allocating a VObj without Hash storage, producing 51 errors. That route uses try_self_call and new_obj/new_obj_wb, edited by the AST/VM and C API sessions. The trial was reverted; this is a coordination constraint, not evidence of an AST-tree or C API cause. |
+| rack / `spec_headers.rb` | All 51 tests run: 6 failures, 0 errors, 268 versus 302 assertions. Ruby class `[]` and bare native construction now work; the earlier observation was 37 failures / 2 errors. | Remaining Ruby semantics include default-plus-block and fetch arity, fetch_values missing-key errors, dig intermediate TypeError, copied class tags and default-Proc key normalization. Some reach super_missing's leaf fallback; native validation/copy paths also reach the shared invoke_val_c0. Keep all cases and exact assertion comparisons. The earlier rejected constructor trial is superseded by the measured fixes in invoke_val_c2 / try_self_call1 and native-super chain checks; the shared dispatcher and allocator functions remain untouched. |
 | rack / `spec_request.rb` | After the reporter's name super becomes available, execution reaches 2 GiB in TestProxyRequest's `handles ASCII NUL input of 16777216 bytes`. The reference completes 404 tests / 1,754 assertions with 2 skips. | Resource investigation, without a proven VM or GC cause; keep the cap. It changes from RED to MEMORY, with no MATCH gain. |
 | rack / `spec_rewindable_input.rb` | Exits without a summary. A reduced Tempfile writes successfully, but rewind fails after chmod(0); the underlying File fails too. The same write/rewind without chmod succeeds. | Ruby File/IO semantics. file_flush_obj reads the path outside its guarded descriptor fallback. Completing the read path also reaches invoke_val_c0, shared with the other sessions; avoid editing that shared function. |
 | rack / `spec_sendfile.rb` | Two tests opening a File subclass reach IO's descriptor conversion and reject a path string. | Ruby constructor inheritance; reduce a File subclass witness. |
@@ -316,6 +316,34 @@ rewriting an already-shared source. Paired unmodified controls lower peak RSS
 on macOS and Linux/aarch64; their raw series and the failed hosted x86-64
 observation are retained in method_copy_lifetime_latest.json. The unchanged
 2x check and final hosted result remain merge gates.
+
+
+Rounds 23-24 also retain a separate existing coordination gap: undef_method
+on a Hash subclass's singleton rejects inherited native [] before a Ruby
+entry is defined. A standalone control raises NameError on both the paired
+parent and candidate, while the reference removes it. That native availability
+path reaches the shared Module dispatcher. Witness 706 instead exercises a
+real Ruby parent definition followed by undef, and proves that the resulting
+tombstone blocks the native constructor. No upstream case is omitted.
+
+The full candidate at 170fb4b8 passes the preceding macOS file gate with
+54 MATCH / 7 RED / 1 MEMORY. Preserve both the preceding 53-MATCH baseline
+and failed candidate independently; adopt the actual stronger 54-MATCH
+snapshot without changing sources, reference counts or bounds. Multipart's
+2,006,464-KiB success is an observation, not a proven resource fix. Linux keeps
+its own measured baseline. The additional and Rake strict comparisons retain
+6 MATCH / 1 RED and 46 MATCH respectively.
+
+
+Review of the first constructor head found two regressions: consuming a
+native alias bypass in the early guard let the final core check enter the
+Ruby override, and a singleton walk could choose an included method after
+Hash/Array's native owner. Source 1d0cbe6b preserves the bypass until the
+correct native entry, stops ordinary lookup and super at that owner, and
+retains earlier Ruby definitions/tombstones. New 708/709 detect the previous
+head; all 706-709 match normally and with GC.stress. The corrected full run
+retains the strict 54-MATCH macOS baseline, additional 6 MATCH / 1 RED and
+Rake 46 MATCH. No failed observation or stronger gate is removed.
 
 The remaining stdlib-caller P2 also affected `mspec/scoreboard.sh` and
 `run_corpus.sh` when reference library directories were supplied through
