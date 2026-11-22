@@ -971,6 +971,9 @@ let str_bytes = fn (u: unit) ->
 // one: same bytes, same encoding, same snapshot. A mutation makes different
 // bytes, so the check fails and a new snapshot is taken -- which is exactly the
 // semantics a per-match copy had.
+// Keep only encoding metadata here. The already-rooted snapshot handle below
+// supplies its bytes too: storing them in this default-arena map copied every
+// alternating subject again, retaining all those copies until process exit.
 let rx_src_last = map_new ();
 let rx_src_hnd = map_new ();
 let str_slot_prepare = fn (u: unit) ->
@@ -2147,11 +2150,15 @@ let alias_srcname = map_new ();
 // alias_method whose SOURCE is a builtin (e.g. `alias_method :plus, :+` on a
 // String subclass): keyed "Cls#newname" -> builtin op name. Dispatched by
 // delegating to prim_method on the receiver, since the source has no AST body.
-let builtin_alias = map_new ();
+// The native comparator entries participate in ordinary replacement and
+// removal: set_meth deletes this entry when Ruby installs another body.
+let builtin_alias = (let entries = map_new () in
+  let _ = map_set entries "Range#===" "===" in
+  let _ = map_set entries "Kernel#===" "===" in entries);
 // ...and every name an entry was ever made under, never removed: the lookup
 // walks the ancestors with a key built per ancestor, and almost every call's
 // name was never aliased at all (a fifth of a call to Array#size)
-let blt_alias_names = map_new ();
+let blt_alias_names = (let names = map_new () in let _ = map_set names "===" 1 in names);
 // a call made through send / __send__ / public_send: ruby says nothing of the
 // block it passes (unused_blk_warn), consumed by the method it reaches
 let ub_skip = map_new ();
@@ -3095,24 +3102,32 @@ let copy_method_core = fn (src: int) -> fn (dst: int) ->
   if map_has method_cores src then map_set method_cores dst (map_get method_cores src) else ();
 
 let meth_params = map_new ();   // "cls#name" -> the Array of parameter names
-// One owned row per definition: line, source path, end line, endless flag.
+// One owned row per definition: line, source path, end line, private flags.
+// Bit 0 is endless; bit 1 records sharing. The accessor preserves endless
+// as field 3 and exposes sharing internally as field 4. Both bits have the
+// existing method row's lifetime; no separate owner table is populated.
 // Missing fields are VNil; writers only publish VInt or String handles.
 // Keeping the fields together avoids hashing and copying three prefixed owner
 // keys for every anonymous method, and lets the collector scan its owner once.
 let meth_src = map_new ();
 let meth_source_get = fn (key: str) -> fn (field: int) ->
   if map_has meth_src key then
-    (let (line, file, last, endless) = map_get meth_src key in
-     if field == 0 then line else if field == 1 then file else if field == 2 then last else endless)
+    (let (line, file, last, flags) = map_get meth_src key in
+     if field == 0 then line else if field == 1 then file else if field == 2 then last
+     else (let bits = (match flags with VInt n -> n | _ -> 0) in
+           if (if field == 4 then bit_and bits 2 != 0 else bit_and bits 1 != 0) then VInt 1 else VNil))
   else VNil;
 let meth_source_has = fn (key: str) -> fn (field: int) ->
   match meth_source_get key field with VNil -> false | _ -> true;
 let meth_source_set = fn (key: str) -> fn (field: int) -> fn (value: Val) ->
-  let (line, file, last, endless) = (if map_has meth_src key then map_get meth_src key else (VNil, VNil, VNil, VNil)) in
-  map_set meth_src key (if field == 0 then (value, file, last, endless)
-                       else if field == 1 then (line, value, last, endless)
-                       else if field == 2 then (line, file, value, endless)
-                       else (line, file, last, value));
+  let (line, file, last, flags) = (if map_has meth_src key then map_get meth_src key else (VNil, VNil, VNil, VNil)) in
+  map_set meth_src key (if field == 0 then (value, file, last, flags)
+                       else if field == 1 then (line, value, last, flags)
+                       else if field == 2 then (line, file, value, flags)
+                       else (let bits = (match flags with VInt n -> n | _ -> 0) in
+                             let keep = bit_and bits (if field == 4 then 1 else 2) in
+                             let next = keep + (if truthy value then (if field == 4 then 2 else 1) else 0) in
+                             (line, file, last, if next == 0 then VNil else VInt next)));
 let meth_source_delete = fn (key: str) -> fn (field: int) ->
   if map_has meth_src key then meth_source_set key field VNil else ();
 // "cls#name" -> 1 for a method the prelude wrote: ruby's C method, which has
@@ -3146,23 +3161,12 @@ let stamp_meth_src = fn (key: str) -> stamp_named_meth_src key (def_bare_name ke
 let copy_dm_tbl = fn t -> fn (dst: str) -> fn (src: str) ->
   if map_has t src then map_set t dst (map_get t src)
   else if map_has t dst then map_delete t dst else ();
-let copy_meth_src = fn (dst: str) -> fn (src: str) ->
-  let _ = copy_dm_tbl r2k_methods dst src in
-  let _ = copy_dm_tbl dm_closenv dst src in
-  let _ = copy_dm_tbl dm_methods dst src in
-  let _ = copy_dm_tbl dm_captured dst src in
-  let _ = copy_dm_tbl dm_had_blk dst src in
-  let _ = (if map_has meth_cfn src then map_set meth_cfn dst 1
-           else if map_has meth_cfn dst then map_delete meth_cfn dst else ()) in
-  if meth_source_has src 0 && meth_source_has (src) 1
-  then (let _ = meth_source_set dst 0 (meth_source_get src 0) in
-        meth_source_set (dst) 1 (meth_source_get (src) 1))
-  else ();
 // a BLOCK's definition site is the call that takes it, so `stamp_meth_src` is
 // right for `define_method(:m) { }`. A PROC handed to define_method was
 // written somewhere else entirely and carries its own site -- the call that
 // installs it is not where it was defined.
 let stamp_meth_src_proc = fn (key: str) -> fn (pk: str) ->
+  let _ = meth_source_delete key 4 in
   let _ = (if map_has meth_cfn key then map_delete meth_cfn key else ()) in
   if proc_source_has pk && proc_source_has ("f" ++ pk)
   then (let _ = meth_source_set key 0 (proc_source_get pk) in
@@ -3390,7 +3394,25 @@ let ref_snapshot = fn (u: unit) ->
         vec_push entries (key, (match value with VClass cls -> cls | _ -> ""))) in
     let id = vec_get ref_snap_counter 0 + 1 in
     let _ = vec_set ref_snap_counter 0 id in
-    let _ = map_set ref_snaps id (vec_to_list entries) in
+    // A refinery with one target already restores this exact fixed entry
+    // through its live marker. Keep the marker live so later refinements
+    // remain visible; mixed tables retain their complete ordered snapshot.
+    let snapshot =
+      if vec_len entries == 2 then
+        let (k0, v0) = vec_get entries 0 in
+        let (k1, v1) = vec_get entries 1 in
+        let (marker, marker_value, target, implementation) =
+          if str_starts_with k0 "@" then (k0, v0, k1, v1) else (k1, v1, k0, v0) in
+        let owner = (if str_len marker > 1 && str_starts_with marker "@"
+                     then substring marker 1 (str_len marker) else "") in
+        let key = owner ++ "#0" in
+        if str_len owner > 0 && str_eq marker_value ""
+           && map_has refine_cnt owner && map_get refine_cnt owner == 1
+           && map_has refine_tgt key && str_eq (map_get refine_tgt key) target
+           && map_has refine_cls key && str_eq (map_get refine_cls key) implementation
+        then Cons ((marker, marker_value), Nil) else vec_to_list entries
+      else vec_to_list entries in
+    let _ = map_set ref_snaps id snapshot in
     let _ = map_set ref_active "~rid" (VInt id) in
     id
   };
@@ -4613,8 +4635,7 @@ let stdlib_ran = map_new ();
 // mere-ruby's own library code (ruby's C, or files it rewrites) from a
 // program's: "method redefined" is not said about it (warn_redef)
 let shipped_files = map_new ();
-// methods an alias was made from or to ("cls#name" -> "1"): ruby does not say
-// "method redefined" over one of them (its alias_count is not zero)
+// Legacy alias state; new sharing flags live in their owned method rows.
 let meth_aliased = map_new ();
 // __ENCODING__ is a parse-time constant: the source encoding of the file (or
 // eval string) being parsed. The parser captures the current script encoding
@@ -6036,6 +6057,31 @@ let bi_reg_get = fn (u: unit) ->
   (if map_has bi_reg_n 0 then (let n9 = vec_get bi_names (map_get bi_reg_n 0) in substring n9 0 (str_len n9)) else "",
    bi_reg_recv (),
    if map_has struct_ctr "bd" then map_get struct_ctr "bd" else (0 - 1));
+// Sharing belongs only to alias/Method-copy definitions in the current
+// native call. Clone/import copies keep ordinary redefinition warnings.
+let copy_meth_src = fn (dst: str) -> fn (src: str) ->
+  let (operation, _, _) = bi_reg_get () in
+  let sharing = str_eq operation "alias_method" || str_eq operation "define_method" || str_eq operation "define_singleton_method" in
+  let _ = copy_dm_tbl r2k_methods dst src in
+  let _ = copy_dm_tbl dm_closenv dst src in
+  let _ = copy_dm_tbl dm_methods dst src in
+  let _ = copy_dm_tbl dm_captured dst src in
+  let _ = copy_dm_tbl dm_had_blk dst src in
+  let _ = (if map_has meth_cfn src then map_set meth_cfn dst 1
+           else if map_has meth_cfn dst then map_delete meth_cfn dst else ()) in
+  let _ = (if meth_source_has src 0 && meth_source_has src 1
+           // Publish the copied location and sharing flag once. Preserve the
+           // destination's end position/endless bit, as the separate writes did.
+           then (let last = meth_source_get dst 2 in
+                 let flags = (if meth_source_has dst 3 then 1 else 0) + (if sharing then 2 else 0) in
+                 map_set meth_src dst (meth_source_get src 0, meth_source_get src 1, last,
+                                       if flags == 0 then VNil else VInt flags))
+           else (let _ = (if meth_source_has dst 4 then meth_source_delete dst 4 else ()) in
+                 if sharing && meth_source_has dst 0 then meth_source_set dst 4 (VInt 1) else ())) in
+  // A shared source needs marking only once; repeated Method copies must not
+  // rewrite the same live owner's row for every anonymous destination.
+  if sharing && meth_source_has src 0 && (if meth_source_has src 4 then false else true)
+  then meth_source_set src 4 (VInt 1) else ();
 // the receiver as (kind, handle or int, name index) -- what its class needs:
 // a stand-in of the same class for anything that carries more (an
 // exception's message, a big Integer's digits, a Range's bounds)
