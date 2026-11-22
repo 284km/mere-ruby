@@ -10971,6 +10971,45 @@ private hooks the same way (nothing called), and only those rows were added
 to the table (regenerating the whole table would drop rows added since).
 corpus/777.
 
+## 2026-11-22 (93): test_ast's time, round two -- a key made per call, and one stack walked twice per collection
+
+**The point.** Round one (91) took 2.5% off. This round sampled the whole of test_ast instead of a subset. The self time was spread out:
+- the string hash and memcmp of map lookups: about 19%;
+- region allocation: 8%;
+- GC: about 14%.
+
+Two items were costs nothing needed.
+
+1. **Every method call on a String, Array, Hash, Proc or Binding made its hng_store key.** dispatch_cls_of, hng_sng_has, hng_missing_hook, hng_lookup_cls and invoke_val_c0 each built "str:" plus the id in decimal, then hashed and compared it, to learn that the value has no class of its own. That was 2-3% of the run (hng_key and show_int). An Array's id was already noted beside its entry (hng_arr_ids, issue #113). Now a String's, Hash's, Proc's and Binding's are noted too, as id * 8 + kind in hng_prim_ids. hng_put and hng_drop keep the note with the entry, and the class sweep compacts it with them. hng_key_q answers "" for an id never noted, without making the key. Writes still make the key with hng_key, and so does a direct read of hng_store, which stays correct.
+2. **A collection walked the interrupted body's stack twice.** gc_mark_roots began by recycling its own tables (gc_live_cls, gc_cls_pend, gc_ref_live, gc_ref_pend, gc_obj_pend). A recycle asks each suspended stack whether it points into the arena. The first ask after a stack stops walks everything it reaches (__lang_pin_gather, 2.6% of the run). The scan of that same stack for handles, later in the mark (coro_scan_ints), walks it again, and that walk gathers the pins and keeps them. The tables are now emptied at the end of gc_collect (gc_pend_release), after that scan, so they cost no walk of their own. A mark that finds them empty skips the recycle. A collection on the stack (nc) and the fiber reclaim pass leave them filled, and the next mark recycles them as before.
+
+Tried and dropped:
+- **A larger entries headroom after a collection** (live + max(scan, 32,000) instead of scan / 2). It cut the subset by 2.6%, but the whole file ran in the same time (409 s) and the same instructions. That is a GC policy question anyway.
+- **gc_churn_bytes measured one check in eight**, with an exact measure at each baseline. It moved where collections fell: 80 became 94 on the subset, and +0.7% instructions.
+
+Measured on test_ast's tokens, ranges and not_cared for test/ruby/test_[a-c]* (78 tests, 233,297 assertions):
+
+| build | instructions | change |
+|---|---|---|
+| main | 331.1e9 | |
+| step 1 | 315.7e9 | -4.6% |
+| step 2 | 314.3e9 | -5.1% in all |
+
+The whole of test_ast (2,664 tests, both builds run side by side):
+
+| build | instructions | time | maxRSS |
+|---|---|---|---|
+| main | 3,642.3e9 | 388 s | 960 MB |
+| this round | 3,457.6e9 (-5.1%) | 372 s | 992 MB |
+
+maxRSS varies by run: main measured 918 MB in an earlier run.
+
+- Checked:
+  - corpus 802/802. Once, under three gates at a time, 394 lost ruby's own `[:outer, false]` line (as in the earlier note); alone it passes 8 of 8 on both builds, and under load 6 of 6;
+  - corpus/800 is new: singletons and extends on each kind, a clone, a subclass, a singleton's method_missing, and the ids of dropped values after GC.start;
+  - test_module, test_string, test_array, test_hash, test_proc, test_object, test_class, test_gc, test_method and test_marshal give the same results as main;
+  - gates pass, bracket depth ok.
+
 ## 2026-11-22 (91): test_ast's time, round one -- two costs paid per object and per builtin call
 
 **The point.** On a slow runner test_ast takes 590-635 s of its 600 (note 551 §13). A sample of test_all_tokens showed no single hot spot:
