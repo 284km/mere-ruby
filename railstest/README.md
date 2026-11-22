@@ -1,11 +1,14 @@
 # Rails application measurement
 
 This is a real Rails **8.1.4.1 application**, measured against Ruby 4.0.9.
-It is not Rails' own framework test suite. Current main does not yet install
-its complete dependency set: bigdecimal's native extension stops while
-loading mkmf. Boot, migration, application tests and serving HTTP on mere-ruby
-therefore remain **NOT_RUN**, not passing zero-test cases. See
-[issue #116](https://github.com/284km/mere-ruby/issues/116).
+It is not Rails' own framework test suite. Main `2e2ab568` now installs all
+68 frozen dependencies, including bigdecimal's native extension, within the
+existing bounds. The next migration command fails at the separate command
+registry boundary in [issue #121](https://github.com/284km/mere-ruby/issues/121).
+Boot, application tests and HTTP on mere-ruby remain **NOT_RUN**. The first
+main snapshot's mkmf failure in [issue #116](https://github.com/284km/mere-ruby/issues/116)
+is retained as history; the fresh integrated-main replay is
+[`main_native_install.json`](main_native_install.json).
 
 The app uses the published Rails gem and its unchanged dependencies. It checks
 SQLite migration, model autoloading, fixtures, validation/callbacks, CRUD,
@@ -307,3 +310,32 @@ is a full-corpus claim for this combined b9056808 composition. A separate
 pre-existing saved native Method metadata gap is tracked in issue #133; its
 Array#length control fails on the parent and is not an actual Rails blocker.
 Rails application and framework-suite success remain unestablished.
+
+
+## Integrated main gets beyond the original native-build blocker
+
+`main_native_install.json` records a new cold run on main `2e2ab568`, after
+the build metadata/C API integration in #95 and SHA-2 provider integration
+in #120 were merged. The normal O2 build uses main's pinned Mere `01f5ad73`.
+The unchanged 69 archive locks, fixture, runner, bootstrap and per-stage
+600-second/2-GiB family bounds are retained. Both interpreters start with
+empty gem homes and build their own extensions. SQLite again uses its
+documented system-library option with the same 3.46.1 library on both sides.
+
+Reference Ruby 4.0.9 passes all six stages, including six application tests /
+31 assertions and actual Puma HTTP. Its dependency installation takes
+163.412 seconds / 1,733,168 KiB. Mere installs Bundler and all 68 dependencies;
+dependency installation exits 0 in 253.379 seconds / 914,976 KiB without a
+resource event. The actual bigdecimal 4.1.3 Makefile uses this interpreter's
+own headers and completes its native build/install. The existing small
+`probes/mkmf.rb` also prints `rubyhdrdir_present=true` and `mkmf-loaded` on
+both interpreters; a separate check verifies the real `capi/include/ruby.h`.
+
+The next original migration command exits 1 in 2.062 seconds / 199,616 KiB:
+Rails::Command.invoke_rake calls perform on nil, the independently reduced
+singleton subclasses/command-registry issue #121. Boot/tests/HTTP remain
+NOT_RUN and the complete record remains RED. This meets #116's acceptance
+condition of getting beyond the first extension build; it does not establish
+a Rails application or framework-suite pass. The first main and every
+unmerged-composition record above remain unchanged. Runtime functions changed
+for this replay: none. All seven measurement harness controls pass.
