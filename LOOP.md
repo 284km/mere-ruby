@@ -5587,6 +5587,240 @@ reference tests. Counts below are FILE verdicts, not case counts:
   and runs on macOS and Linux, without changing existing job durations or
   any per-file limits. Full existing-suite regression checks still gate merge.
 
+## 2026-11-16 (66): gem rounds 4-5 -- gzip callbacks and StringIO reflection
+
+While #90's full CI runs, two independent Ruby-library fixes make two more
+original Rack files pass. The same locked 62 files / 1,969 reference tests
+now report 50 MATCH / 11 RED / 1 MEMORY (was 48 / 13 / 1 after rounds 1-3),
+with no lost MATCH or reference coverage change. Rack alone moves from
+30 MATCH / 8 RED / 1 MEMORY to 32 / 6 / 1; the other four gems are unchanged.
+
+- `Zlib::GzipWriter#__write_output` takes the pending bytes out of its
+  buffer BEFORE calling the destination. Rack's consumer accepts a chunk
+  and then raises FakeDisconnect. The old buffer still held that chunk,
+  so ensure's `finish` sent the gzip prefix again and replaced the caller's
+  exception with Zlib::DataError. A two-write sink that inflates bytes and
+  then raises reproduces it without Rack; now it retains the reference's
+  Disconnect and decoded `foo`. Original `spec_deflater.rb` becomes MATCH,
+  and CRuby's zlib file stays 96/96 MATCH. Witness 671.
+- StringIO's eight backing ivars use the interpreter's existing internal
+  namespace. CRuby keeps that state outside Ruby ivars; exposing `@st`,
+  `@enc` and the flags made Psych serialize the private State object and
+  fail restoring the environment dump. User-added `@st` and `@label` remain
+  visible and round-trip; assigning `@st` no longer replaces the stream's
+  real buffer state. This is a mechanical backing-name change in
+  `lib/stringio_ext.rb`, with its embedded copy regenerated. The original
+  `spec_mock_request.rb` becomes MATCH; both CRuby StringIO files give
+  103/103 MATCH. Witness 672.
+- Corpus 695/695 matches the reference, dead definitions and GC-root gates
+  pass, bracket depth stays 895/1024. No main interpreter function, VM,
+  AST tree, native API, collector, global let or resource bound is changed.
+- `suites.py --verbose` only asks the upstream runner to name each test.
+  It identifies the multipart memory file's active case as
+  `test_0018_rejects insanely long boundaries`. Both interpreters pass a
+  small control allocating 10 MiB and doing one nonblocking pipe write
+  (65,536 bytes on each); this does not establish the combined workload's
+  cause. The MEMORY verdict and 2 GiB cap remain.
+- The previous batch's Gem suites CI 43874223005 passes on Linux and macOS
+  with identical reference counts and the recorded 48 / 13 / 1 verdicts;
+  an independent review of #90 repeated all 62 files with no regression or
+  actionable finding. Full existing-suite CI remains a merge gate.
+
+## 2026-11-17 (67): gem rounds 6-7 -- File overrides and deferred Chain groups
+
+The same 62 locked upstream files now give 51 MATCH / 10 RED / 1 MEMORY,
+with zero BOTH or timeout, no lost MATCH and no reference coverage change.
+Minitest improves from 3 MATCH / 4 RED to 4 / 3; Rack remains 32 / 6 / 1,
+rack-test 7 / 1, public_suffix 7 / 0 and base64 1 / 0.
+
+- `invoke_with_block0` previously handled File.open/new before Ruby method
+  dispatch, so a stub worked without a block but opened a real path with
+  one. Ruby overrides now receive the block. A restored prelude IO alias
+  still uses File's native path handling; the method's native flag and
+  actual prelude source metadata identify that case. Witness 676 covers
+  keyword/block forwarding and restoring the original alias. The original
+  mock file improves from 2 failures / 13 errors to 1 / 8 across 94 tests,
+  while remaining RED.
+- `core_prelude_b` attaches the existing Enumerable implementation to
+  Chain, whose advertised ancestry alone did not provide its private
+  helpers. `chunk_while` and `slice_when` construct deferred enumerators
+  over the source rather than eagerly gathering it. Witness 677 covers
+  deferred predicates, infinite inputs stopped by take, multiple yielded
+  values, empty inputs, argument errors and reflected owner/ancestors.
+  Minitest's original reporter file becomes MATCH (22 tests / 52 assertions).
+  Its test file loses the backtrace-compression errors but retains 8 Marshal
+  failures and 1 yield error.
+- Corpus 697/697; Enum/Enumerator 159 MATCH / 0 RED / 1 BOTH, with no
+  decrease from either required CI baseline. GC roots pass and bracket
+  depth remains 895/1024. No new top-level let or resource bound change.
+  After #88 merged, the current open branches no longer changed either
+  function; their diffs were checked again before publishing this batch.
+- #90's completed existing-suite shard 3 has one lower file count:
+  test_transcode.rb is 97 rather than 98 MATCH because its ractor encoding
+  test reaches its existing 10-second timeout. The isolated test passes
+  locally on both the PR binary (5.35 s) and a CI artifact whose relevant
+  runtime sources equal main (5.79 s). This does not yet establish a cause;
+  rerun CI without changing the limit before accepting the merge gate.
+
+## 2026-11-17 (68): gem rounds 8-9 -- ordered rescue and Hash initialize's block
+
+The original 62 files / 1,969 reference tests now give 52 MATCH / 9 RED /
+1 MEMORY, with zero BOTH, TIMEOUT or baseline regressions. Rack improves
+from 32 MATCH / 6 RED / 1 MEMORY to 33 / 5 / 1; minitest stays 4 / 3,
+rack-test 7 / 1, public_suffix 7 / 0 and base64 1 / 0. The initial 47 / 14 /
+1 MEMORY snapshot remains unchanged.
+
+- Rescue checks one candidate before evaluating the next expression or
+  validating the next splatted value. An earlier ArgumentError match now
+  prevents an unreachable regexp from raising TypeError; a reached invalid
+  value still raises. Empty/nil splats remain different from bare rescue.
+  `rescue_clause_matches` / `rescue_values_match` reuse the existing lexical
+  constant, splat conversion, Module#=== and TracePoint machinery.
+  `run_rescues` calls the ordered matcher. The obsolete eager expansion and
+  its unused class-name filter are removed. Witness 678.
+- `super_missing` retains the actual default Proc passed to Hash#initialize
+  from a subclass. The iterator fallback previously lost the block, so
+  Rack's symbol-key fallback returned nil. Existing entries remain, lambda
+  arity is validated from Proc metadata, and invalid arguments/frozen hashes
+  keep their errors. Witness 679 includes to_h, Proc identity and variadic
+  as well as strict lambdas. The original Rack utils file passes all
+  63 tests / 285 assertions (previously 1 failure / 1 error).
+- Corpus 699/699, all six suite-harness controls and the structural gates
+  pass. Generated bracket depth stays 895/1024; no top-level let, collector,
+  VM instruction or resource bound is added or changed. The open branches'
+  corresponding function bodies were compared with main before publication;
+  none overlaps. Marshal's separately isolated exception-wrapper difference
+  remains recorded because `stdlib_src` is being edited by the GC session.
+  Final CRuby Hash gives 297 MATCH / 1 RED / 8 BOTH across 306 tests, equal
+  to both baselines; Exception gives 98/98 MATCH. The earlier local exception
+  timeout does not recur in this final measurement at the unchanged limit.
+- #93's review found that the new grouping callbacks returned true to their
+  source. Both now explicitly return nil; witness 677 includes a source that
+  stops on truthy yield results. The old O2 runtime truncates both methods to
+  [[1]], and the fixed runtime matches the reference's [[1], [2], [3]]. Its
+  latest Linux gem CI also gives 51 / 10 / 1 with zero regressions. The P2
+  thread is answered in English and resolved; hosted merge checks remain.
+- Existing-suite comparisons use latest successful main CI 43869939788 and
+  handoff CI 43548292351. #90's final report covers all 758 files. The three
+  lower counts from ObjectSpace finalizer, Object copied-ivar and transcode
+  ractor timeouts remain, and zlib is 95 rather than 96 MATCH (its case still
+  needs confirmation). Bootstrap has 9 missing files after a cancelled shard;
+  test_eval is 48 MATCH, equal to main but below handoff's 49. Basic stays
+  894/894 MATCH. The whole ordinary workflow is rerun at its existing bounds
+  to recover missing coverage and verify the lower counts. Local transcode gives 98/98 on
+  both main and #90, and copied-ivar passes on both. Finalizer controls cross
+  2 GiB on the PR binary while main controls finish; its cause is unconfirmed.
+  No lower count is waived, no limit is increased, and no GC-internal
+  exclusion decision is made.
+
+## 2026-11-17 (69): retain implicit super's Proc without replacing yield wrappers
+
+The review's implicit-super witness exposed a lost default Proc identity and
+lambda arity in #96. `bind_params` now retains the incoming VProc in the method
+frame; `method_body_flow_result` carries its identity through the existing block
+metadata path, and `super_missing` recovers it for Hash#initialize. The new
+`block_source_proc` recognizes a repeated marker, distinct from the single
+marker naming a literal wrapper's enclosing yield context. No new root table,
+global pin, top-level let or collector change is needed.
+
+The first candidate confused those two meanings. The original Minitest
+assertions file and corpus 226 caught that regression, so it was corrected
+before accepting the review response or updating the snapshot. Witness 679 now
+covers implicit super/super(), an unrelated nested call, a two-level relay,
+literal captures, replacement/nil blocks and yield-containing wrappers. The
+extended witness matches the reference both normally and with GC.stress.
+
+- Fresh O2 source 5fbd80c1: all 62 original gem files remain 52 MATCH / 9 RED /
+  1 MEMORY, zero BOTH/TIMEOUT/regressions; the initial snapshot is unchanged.
+- Corpus 699/699; CRuby Proc 117 MATCH / 1 RED, Super 50/50 and Yield 13/13,
+  identical to the paired latest-main controls (96075af9). All six harness
+  controls pass; bracket depth is 892/1024 after the incoming main C API merge.
+- The separate merge gate remains open. #90's Linux build job now fails the
+  Float#step bit comparison. This is not waived as known noise. Latest successful
+  main CI is 43933582689; compare it and handoff 43548292351 before any merge.
+
+## 2026-11-17 (70): gem rounds 10-11 -- singleton undef and Module name super
+
+With the unchanged lock and 62 files / 1,969 reference tests, round 10 gives
+53 MATCH / 8 RED / 1 MEMORY; round 11 gives 53 MATCH / 7 RED / 2 MEMORY.
+There are no BOTH, TIMEOUT, reference changes or lost MATCH. Rack Lint becomes
+MATCH (37 tests / 763 assertions). The second memory verdict is a newly reached
+request case, not another passing file. The initial snapshot remains unchanged.
+
+- `invoke_val_c2` / `invoke_with_block2` consult a primitive singleton's undef
+  before the native path; `respond_to_answer` / `responds_x` ask the same fact.
+  `hng_lookup_cls`, `hng_undef_blocked` and `hng_undef_call` keep the actual
+  lookup class, method_missing block, query hook and NoMethodError attributes.
+  Ordinary class identity stays separate. Witness 681 includes send/public_send
+  with and without blocks, redefinition, other instances and saved aliases.
+- `super_missing` sends a class/module override's name super directly to the
+  existing `mod_name_val`, with native arity. Witness 682 checks named,
+  anonymous, late-named and singleton classes, frozen cached names and a
+  superclass undef. The shared super lookup and main dispatcher are untouched.
+  Minitest spec now executes 76 tests (2 failures / 4 errors), and Rack headers
+  51 (37 failures / 2 errors). Both stay RED. Request now reaches TestProxyRequest's
+  16 MiB ASCII NUL test and crosses 2 GiB; no VM/GC cause is established.
+- Fresh O2 source 861c74d1: corpus 701/701 and both witnesses under GC.stress
+  match Ruby. CRuby Method is 97 MATCH / 1 RED and Module 195/195, equal to the
+  same-environment latest-main controls. Six harness controls pass; bracket
+  depth stays 892/1024. No top-level let, root table or limit change.
+- Additional controls reduce RewindableInput to File rewind after chmod(0),
+  and the uploaded-file assertion count to reflected File/IO helpers.
+  A separate prepended name/undef lookup gap also predates these rounds.
+  Their shared-function constraints and remaining symptoms stay in the ledger.
+- Linux's ubuntu-latest rollout changed the reference from Ubuntu 24.04 to
+  26.04 and exposed fused versus separate Float#step rounding. Strict diagnostic
+  output confirms the differing bits. #90 pins only the runtime build and gem
+  Linux jobs to the measured Ubuntu 24.04 target; all bounds/assertions remain.
+  The newer-target numeric gap stays documented. Updated Linux jobs pass.
+  #92's separate Module leak test hit its documented 10-second known noise;
+  its raw record is retained for an unchanged-bound job rerun after completion.
+
+## 2026-11-17 (71): retain native definitions through singleton undef
+
+#97's review exposed two distinct native-definition regressions and a saved
+alias path missed by the original Hash-only alias witness. A Method captured
+before undef must keep its definition, and replacing Module#name must not
+make super revive that definition beyond Module. Saved String/Array/Proc
+aliases retain their definitions too, including direct, send/public_send and
+reflected Method calls with and without blocks.
+
+- `method_unbind_fields` retains the existing native metadata;
+  `bi_meth_shadowed` / `bi_meth_call` preserve the native definition through
+  the existing one-dispatch bypass. Retained String conversion keeps the
+  correct receiver identity, and Hash#to_hash ignores its block.
+- `run_block1`, `bind_params`, `method_body_flow_result`, `run_stmts` and
+  `eval_run` clear that bypass before Ruby code. The witness includes a
+  second receiver's override, coercion defaults and string instance_eval.
+  `en_can_buffer` / `gen1_src` keep a returned Enumerator's later source lookup
+  ordinary, including NoMethodError after each has been undefined.
+- `hng_retained_alias` / `hng_retained_alias_call`, consulted by
+  `invoke_val_c2` / `invoke_with_block2`, preserve the native alias's source
+  only during redispatch. The block alias path uses the actual singleton.
+  `module_name_super_ahead` reads the current method frame and ancestry;
+  `super_missing` returns the native name only when Module remains ahead.
+- Fresh O2 source a3ad911a: all 62 original files / 1,969 reference tests give
+  53 MATCH / 7 RED / 2 MEMORY, zero BOTH/TIMEOUT/regressions. Corpus is 701/701;
+  expanded 681/682 also match under GC.stress. CRuby Method is 97 MATCH / 1 RED,
+  Module 195/195, TracePoint 97 MATCH / 4 RED / 1 BOTH, Proc 117 MATCH / 1 RED,
+  Super 50/50 and Yield 13/13, retaining the paired baseline counts. All six
+  harness controls pass; bracket depth remains 892/1024. The initial snapshot,
+  collector, shared dispatch bodies and resource limits are unchanged.
+- A preliminary corpus invocation stopped at the stale-generated-C gate;
+  regenerating and comparing C proved identical contents. A later run mixed
+  a changing alias witness/binary and was rejected. Only the final fixed-tree
+  701/701 run is accepted. A verbose ShowExceptions time control passes on
+  both pre-review and final binaries (81.73s / 82.86s inside the test runner);
+  this does not establish a review-induced slowdown.
+- An unaccepted Headers class-[] trial exposed bare new without native Hash
+  storage and worsened the file to 51 errors. It was reverted, with no trial
+  snapshot or public implementation. Its try_self_call/new_obj coordination
+  constraint, and additional pre-existing primitive lookup gaps, remain in
+  the ledger. Current remote AST/VM/C API/GC function bodies were compared
+  before publication; none overlaps the functions changed in this follow-up.
+- Existing hosted per-file checks against both CI baselines remain pending;
+  no lower count or incomplete coverage is waived and no PR is merged.
+
 ## 2026-11-16 (60): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and published gems -- nokogiri among them -- install with `gem install`
 
 Stage 7′ / 8, third unit (note 553), on the C API of (58). Until now
@@ -6552,6 +6786,79 @@ Corpus 675 and 676 carry the witnesses (return values and an overridden
 Encoding.find, multiword names, binding / eval / local_variables / a
 refinement with the optimization on and off).
 
+## 2026-11-17 (74): Prism's fixtures -- where parse.y's lexer, not its grammar, decides the tree
+
+PR #86 (main `392bf810`) left 20 of Prism's 976 fixtures whose tree is not
+parse.y's. 5 of them CRuby cannot answer itself (`#children` raises
+NoMethodError on `::A ||= 1` and the like). The other 15 now agree: 971 of
+976, measured with tools/ast_on_cruby.rb against tools/ast_dump. The 850
+files test_ast reads still all agree. Each is a place where parse.y's lexer
+cuts or places a token differently from Prism:
+
+- **A percent literal closed by a line end** (`%\nfoo\n`, `%r\nfoo\n`) ends
+  on that line, in the column past the newline -- and so does every node
+  ending with it. The offset is the next line's start, where every other
+  node that ends there ends; tr notes these literals and ao_nl_end places
+  them.
+- **A program's end** reads past a `\` continuation and past the heredoc
+  bodies a line opened; after a comment, a program that ends after those
+  bodies ends at the comment, and a last line of blanks with no newline is
+  the term's place (hd_skip, nl_after_comment, skip_terms).
+- **A regexp's text splits at a `#@` / `#$` that names no variable**
+  (`/a#@~b/`): parse.y's tokadd_string stops there to look for a variable
+  name, finds none, and the text from `#` is the next token -- a DREGX,
+  and in a condition a MATCH2. Prism keeps one RegularExpressionNode.
+- **Text a heredoc body interrupts is one token** (`<<-A.gsub(/b\` / body /
+  `b/)`, a `%w` / `%i` word): a REGX, and a word placed from the line it
+  ends on. Prism splits it into parts, and places such a `%i` word where
+  its first line is.
+- **A `<<~` heredoc with an unindented line** reads as a plain heredoc
+  (heredoc_dedent has nothing to remove); when the indentation falls to
+  none at a later line, the lines before it stay tokens of their own,
+  because literal_concat does not join while heredoc_indent is above 0. A
+  `<<~` DSTR whose pieces all joined its head is a STR.
+- **`Foo::Bar { }`** (ruby bug #18878): the call takes the block's place.
+- **A command's `do` block inside bracketed arguments** (`foo(bar baz do
+  end)`, `[bar baz do end]`, `foo[...]`, a splat, a keyword value) is a
+  SyntaxError, as in parse.y -- checked against 16 forms.
+- **An empty file's tree is at line 0** with no script lines
+  (`parse_file`); an empty String's stays at line 1.
+- A regexp in a condition: an interpolated one warns only under -w, in
+  Prism as in parse.y (it always warned); under AST.parse, one parse.y
+  splits warns so too.
+
+Review of #99 (two P2s, both fixed): a `<<~` heredoc with interpolation
+whose indentation falls to none later also keeps its pieces before that
+line apart and placed as `<<~` pieces (`  #{1}` / `b`: the text after the
+interpolation is 2:6-2:7, not the opener's end) -- tr_contents runs
+literal_concat with `squiggly` until that line; and a regexp split at `#@`
+takes its pieces' text as tokadd_string leaves it: an escaped delimiter is
+the delimiter unless simple_re_meta, a `\` and its line end go, a `\`
+before a non-ASCII byte goes, `\cX` / `\C-X` / `\M-X` are written `\xHH`.
+Checked against 11 heredoc forms and 20 regexp forms. The follow-up review
+(one P2 left): a control or meta escape's operand is a whole escape again,
+as in read_escape -- `\c\n` is `\x0A`, `\M-\n` is `\x8A`, `\c\x41` is
+`\x01`, an unknown `\q` is `q`; a bare `?` is DEL only right after `\c` /
+`\C-`. rx_read_escape does this over Prism's bytes. Checked against 20 more
+forms on ruby 4.0.9, among them a condition and ones ruby refuses. The
+third (one P2): looking for a split, a control or meta escape is read whole
+-- `\c#@~` is `\x03` and `@~`, no split -- in regx_splits and in
+rx_text_splits, which classifies the condition's warning. Checked against 12
+forms. Not done, and so on main too: AST.parse lets a regexp through that is
+not valid in its encoding (`/a\M-b/`, `/a\xff/` in UTF-8), where ruby
+raises SyntaxError.
+
+Not done: `/(?<y>a)#@~/ =~ x`, where parse.y's DREGX assigns no `y` (the
+scope's table comes from Prism's locals).
+
+Speed: tr reads a node's first byte once. 300 files of test_ast's walk,
+205.05e9 -> 205.34e9 instructions (+0.14%). Bracket depth 923 -> 924 (one
+table, ao_lx, holds both kinds of note). Witness corpus/684.
+
+- Checked: corpus 696 of 696, and with MERE_RUBY_BLK_ID_CHECK,
+  MERE_RUBY_ATTR_IC_CHECK and MERE_RUBY_IVAR_INDEX_CHECK on; test_ast's
+  individual tests 114 as the reference; the gates; loop memory.
+
 ## 2026-11-17 (72): what still differed on the VM in 40 whole test files -- freed memory, a loop with no safepoint, collections that marked too much
 
 **The point.** The 40 files of (68) run again on both, same build: the VM
@@ -6803,6 +7110,17 @@ two-compile search. The existing build limit remains 1024. Before publishing,
 retain the already published main-merge history as well; its runtime sources
 are identical to the fully measured 799c55d7 build.
 
+The same audit on rounds 4-5, normal O2 source f2f57fa7 including main
+3eb24fef, retains 50 MATCH / 11 RED / 0 BOTH / 1 MEMORY. The branch's own
+pre-audit result is preserved; all 62 reference and 61 non-resource Mere
+files audit the locked gem lib. The ordinary per-file comparison reports
+zero regressions. Gzip/MockRequest retain their two additional MATCH files.
+
+Normal audited O2 source d403f444 on rounds 6-7 retains 51 MATCH / 10 RED /
+1 MEMORY, zero regressions and 709/709 corpus matches. Preserve that branch's
+own old snapshot and audit transition (reference 62, Mere 61 library audits).
+The later hosted-driver and standalone-loader fixes still need their combined
+validation; this result does not claim that unmeasured combination.
 Hosted validation found old reference-first paths in Unicode/NKF and other
 drivers, plus a fake interpreter unable to answer the new path query. Share
 the clean runtime query in tools/runtime_load_path.sh, put reference fallbacks
@@ -6819,13 +7137,30 @@ is now applied for a combined build; its original bootstrap eval control is
 49/49 MATCH, with isolated corpus 705/705 and unchanged core Eval/Module/Const
 counts. No combined-head or hosted result is inferred from those controls.
 
+Final combined rounds 6-7, normal O2 source 7a79b8db: 51 MATCH /
+11 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
+Final combined rounds 4-5, normal O2 source 9730ae28: 50 MATCH /
+12 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
 Final combined first gem-suite PR, normal O2 source 4ff6b54f: 48 MATCH /
 14 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY, zero strict-baseline regressions.
 All 62 files on both sides finish the locked-library source audit. Multipart
 finishes below the RSS cap with one custom-params-hash error (test_0034),
 85 tests / 238 assertions versus the reference's 239. Its prior MEMORY/RED
 variation is not a new MATCH or an inferred VM/GC cause.
+File override, Chain, provenance and constant witnesses 676/677/685/693 match the reference. The earlier full corpus was 709/709 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
+The earlier full corpus was 707/707 before the final shared corrections. The final hosted corpus and every existing-file comparison remain merge gates.
 Integrated corpus: 706/706. The provenance-checked bootstrap harness gives eval 49/49 MATCH, both COMPLETE. Hosted gem jobs pass on Linux and macOS. The Linux runtime job reaches the documented complemented-method-entry leak timeout. Its artifacts are preserved; GitHub rejects reruns while the enclosing workflow is active, so that retry remains pending.
+
+Audited rounds 8-9, O2 source 72effb05 on main 3eb24fef: two consecutive
+normal full runs give 53 MATCH / 9 RED / 0 BOTH / 0 TIMEOUT / 0 MEMORY.
+All 62 files on each side audit the locked library. Ordinary comparison
+against this branch's preserved pre-audit 52 MATCH / 9 RED / 1 MEMORY gives
+zero regressions, with identical source/dependency pins and reference tallies.
+Multipart gives 85 tests / 239 assertions in both runs, with peaks about
+1.69 and 1.36 GiB. Its earlier MEMORY/RED variation remains recorded; neither
+its cause nor attribution to a specific change is established by these runs.
+The latest snapshot uses the second full run. Cross-platform hosted checks
+must retain this new MATCH under the same bounds before merge.
 ## 2026-11-18 (82): build-linux's Module check at its 10 s, and Module#clone walking every constant
 
 Main e40bb486's CI run failed the Module check:
@@ -6864,6 +7199,159 @@ Making a class costs a few microseconds spread over a dozen tables. In the
 complemented program, collections are 27% and the rest is spread with no
 function above 6%. Halving it means fewer rows per class: work of its own,
 not this round's.
+
+## 2026-11-18 (75): AbstractSyntaxTree where Prism and parse.y part ways -- captures parse.y does not assign, and two kinds of error_tolerant recovery
+
+**The point.** Two of the gaps note 551 left in stage 5, against ruby 4.0.9:
+- **Named captures in a regexp parse.y splits.** For `/(?<y>a)#@~/ =~ x`,
+  parse.y splits the text at the `#@`, so the regexp is a DREGX, and
+  reg_named_capture_assign does not run. MATCH2 has no assignments, `y` is
+  not in the table, and a later `y` is a VCALL until something else assigns
+  it. Prism does not split the regexp and assigns `y`.
+- **Two kinds of error_tolerant recovery:**
+  - in a body, what cannot follow a statement (`1q`, `a = 1 2`);
+  - an `end` after `.` that closes by its indent (`bar.` / `end`) in
+    constructs other than a class or module.
+
+**Captures.** tr_match_write sees the DREGX and records each name as a
+"ghost" of its scope (as_gh). Scopes now carry a serial (as_sc keeps kind +
+2 x serial). A program with a ghost is translated a second time; nothing
+else pays for it. The second pass records where each variable is really
+assigned: a write, a target (multiple assignment, for, rescue =>, pattern
+captures), an operator write, a parameter (nm_push), or a capture of an
+unsplit regexp. Then:
+- a read of a ghost name with no real assignment before it, in that scope
+  or one inside it, is a VCALL;
+- a ghost name that nothing assigns is left out of the table;
+- a ghost name first assigned later moves to where that assignment puts it
+  in the table;
+- in a block, an assignment to an outer scope's ghost that nothing has
+  assigned yet makes a new variable of the block (kind 4), as parse.y does.
+
+`y = y` assigns before its value is read, as assignable does. Checked
+against 33 forms.
+
+**Garbage after a statement.** parse.y pops back to the start of the
+body's `stmts`, makes everything from there to the last token it throws
+away one ERROR (`stmt: error`), and reads on after the next term. That holds
+in the body of a def, class, module, `class <<`, begin, while, until and
+lambda, and of an if or unless without else (rv_mark, as_px 11).
+tr_stmt_list replaces those statements:
+- the ERROR runs from the body's start through the statements written
+  without a term between them;
+- where the body has a leading term (class, module), the ERROR starts there
+  and takes the place of that BEGIN;
+- a second error in the same body starts from the body's start again.
+
+Other places recover differently, and those were left alone:
+- a do or brace block makes the whole outer statement an ERROR, and the
+  program ends;
+- an if with an else takes the then-branch too;
+- under when there is no tree at all (NIL);
+- a modifier after the garbage (`1q if y`) wraps the ERROR.
+
+Checked against 26 forms.
+
+**An `end` closed by its indent.** The class and module code is now two
+helpers, de_open and de_close. def, do blocks, if and unless without else,
+while and until use them as well:
+- the statements before `bar.` stay;
+- an ERROR runs from `bar` through that `end`;
+- the construct ends there;
+- the statements after it go up a level.
+
+de_open saves as_px 7 and 8, and de_close puts them back, so a sibling does
+not lose a value that is still pending. A do block's indent is the one of
+the line it opens on. Checked against 11 forms.
+
+Speed: 300 files of test_ast's walk, 203.95e9 -> 204.13e9 instructions
+(+0.09%). Bracket depth 934 -> 935 (as_gh). Witness corpus/700.
+
+- Checked: fixtures 971 of 976; the 850 files 850 of 850; corpus 705 of
+  705; test_ast's individual tests 114 as the reference; the gates.
+
+
+### AST review repairs: real bindings and recovery body starts (2026-11-21)
+
+Ghost capture assignments now keep later writes in the nearest real or
+relocated block binding, including writes in nested blocks. Destructured
+parameters and explicit block locals register real bindings before the
+body is translated. For-loop local targets register before the collection
+without changing AST node construction order. Recovery ERROR locations
+start at the original statement-list syntax, including a removed begin
+and leading empty statements.
+
+Corpus 700 adds 13 review cases. All 13 match the reference's standalone
+AST including locations, and the normal O2 runtime matches the whole corpus
+700 output in all four hash/MRO configurations. All 869 current Ruby test
+files match, including 1,002,971 textual AST lines. Prism fixtures retain
+971/976: only the same five reference children walks raise NoMethodError.
+The new two Prism readers were regenerated from the pinned config. Root,
+depth, dead-definition and duplicate-definition gates pass. Full hosted
+corpus and per-file comparison remain required for merging.
+
+Functions changed: gh_put, gh_targets, gh_parameter, gh_block_locals,
+tr_stmt_list, tr_compstmt, tr_block_scope, tr_mlhs, tr_lambda, tr_for;
+generated readers pm_block_parameters_locals and pm_block_local_variable_name.
+
+## Gem-suite OS baselines and the multipart resource gate
+
+Hosted Linux before and after the source audit (runs 43989409595 and
+44248949546) has the same 52 MATCH / 9 RED / 1 MEMORY and no per-file loss.
+Its multipart MEMORY was incorrectly compared with macOS's new MATCH.
+Keep the complete actual Linux snapshots and explicit protocol-transition
+proof, select the matching OS in CI, and reject a wrong-OS baseline in the
+CLI. Preserve the original cross-platform error in the Linux record. Eight
+harness controls pass; source pins, inventory and 600-second/2-GiB bounds
+are unchanged. macOS keeps all 53 MATCH files.
+
+The rounds 10-11 candidate really loses multipart on macOS against its
+parent, on main 12ca1df2; a focused parent run still matches. Equal total
+MATCH counts cannot waive that file loss. Keep the parent gate and route
+resource investigation to VM/performance without assuming a GC cause.
+The separate rounds 8-9 Linux runtime failure is the documented
+complemented-method-entry leak test timing out at 10.05 seconds. Its full
+log is archived; retry that job when GitHub allows it.
+
+
+Audited rounds 10-11 on main 12ca1df2, O2 source 20cc0eac: 53 MATCH /
+7 RED / 0 BOTH / 0 TIMEOUT / 2 MEMORY, all 62 reference files audited.
+The parent's macOS multipart MATCH becomes MEMORY in both the full run
+and a focused repeat. Keep the nonempty regression in suites_candidate.json;
+this observation is not an adopted baseline. Preserve the parent's macOS
+and Linux gates, and leave merge blocked pending the resource investigation.
+
+## 2026-11-20: a live refinement snapshot need not duplicate its first target
+
+PR #92's repeated original Module check failed its RSS assertion at
+77,643,776 -> 157,310,976 bytes, 2.026060x. Keep that failed measurement.
+A refinement scope with one live refinery and its sole matching fixed
+target stored both entries, although installing the live refinery restores
+that same target and implementation. Store its live marker once in this
+exact case. Mixed tables retain their complete snapshots, and later targets
+still expand when the live scope is installed. This changes ref_snapshot
+only; no collector, native pinning, allocator, cache size or workload changes.
+
+Separate ordinary O2 builds use the same CI compiler 01f5ad73. On local
+Linux/aarch64, the unchanged selected upstream case fails before at
+2.168020x and passes after at 1.722404x. Initial RSS is comparable,
+80,203,776 / 80,076,800 bytes; final RSS is 173,883,392 / 137,924,608.
+Outer times are 6.133 / 6.098 seconds. Both complete original Module files
+pass all 195 tests / 1,240 assertions. The corresponding macOS observation
+gives 1.219891x before / 0.809315x after; its complete files also pass.
+These local observations do not substitute for fresh hosted x86-64 CI.
+
+All 122 original Refinement tests retain the reference's per-case result:
+370 assertions with no skips on Linux, 367 assertions and the same one skip
+on macOS. All eighteen logs reparse, identities match, and the six captured
+selected-case child inputs differ only in the original two nonce tokens.
+Witness 728 checks live targets added after capture, a fixed using scope,
+reopening, enumeration and collection in four hash/MRO configurations.
+Actual bracket depth is 155/1024 and no top-level binding is added.
+The source locks, stronger suite baselines, 600-second / 2-GiB file bounds,
+original 1,000 / 300,000 iterations, ten-second child timeout and strict
+ratio below 2.0 are unchanged. Measurements and hashes are preserved in
+gemtest/module_rss_pr92_r55.json.
 
 ## 2026-11-18: stage 9 follow-up, collectible snapshots and native dump facts
 
@@ -7635,6 +8123,179 @@ moves 3 programs to the VM and makes 462 wrong, a `/#{...}/` the compilers
 fold into a Regexp fixed to UTF-8 in a US-ASCII source -- 3 sources in other
 encodings and 1 the compiler's refusal.
 
+## 2026-11-19 (85): an exception no clause can see, a constructor of stores, and super with values
+
+**The point.** After (84) the slowest of ruby's benchmarks on the VM were
+app_raise (1.72x the evaluator), so_object (1.49x) and so_exception (1.18x).
+Each was a shortcut the evaluator takes and the VM did not.
+
+- **A rescue that only matches.** run_rescues makes the exception an object
+  with its own frames (exc_pin_bt) only when the clause binds it to a name;
+  the VM made one -- an object id and three ivars -- for every exception any
+  clause took. A rescue sequence made of nothing but its local read,
+  constants and literals pushed, checkmatch, branches, nil, a pop, a leave
+  or a throw (vm_rescue_only_matches) cannot keep or show the exception, and
+  leaves it the pair, `$!` included, as the evaluator does.
+- **`$!` after a retry** (both executions, found writing the witness): a
+  retry ran the construct again by calling run_begin_f again, which took
+  the exception in `$!` as "what $! was before" and restored that once the
+  construct was done. `begin; raise if t < 2; rescue; retry; end; p $!` was
+  the exception; ruby's nil. The construct is run again from the $! it
+  started with.
+- **A method of stores.** The evaluator runs a method whose body is only
+  `@x = param` statements without a frame (triv_store_body); a VM method's
+  body is its program, which that never matched. A program of `getlocal p,
+  (dup,) setinstancevariable @x` for each parameter and a leave is run the
+  same way (vm_triv_store_ok / _run), under the same conditions (a plain
+  object, no block, no TracePoint, Coverage or Ractor, the arguments plain).
+- **super with values.** `super(a, b)` was an ESuper over hidden locals in a
+  scope, evaluated. ESuper's arm is now two halves: the arguments, and what
+  is done with them (super_vals) -- the method after the definer along the
+  receiver's ancestors, a singleton's extended modules, Class#new, a hook's
+  no-op, "no superclass method". The VM calls the second with its values
+  when there is no block written or passed, no splat or keywords, and no
+  hook (vm_super_direct, with the arm's refusals).
+
+Corpus 696 (a rescue that only matches, a bound one and `$!`, a bare raise,
+retry, `$!` in an ensure, a class's own ===), 697 (stores of one and three
+parameters, arity errors, `_`, a class variable, a literal, a frozen
+receiver, keywords and a splat) and 698 (super with values, a bare super
+after a parameter changed, a module's, `def self.new`, a hook, nothing
+above, another object's instance_eval, define_method's bare super, a
+singleton's extended module): the same on ruby 4.0.9, the evaluator and the
+VM.
+
+Measured, ruby's app_* / so_* (27; least of 3 runs, local): the whole 0.940x
+-> 0.927x the evaluator; app_raise 1.72x -> 1.06x, so_exception 1.18x ->
+1.07x, so_object 1.49x -> 1.10x. Still behind: so_nsieve_bits 1.25x,
+app_mandelbrot 1.15x (Complex), so_object 1.10x, so_pidigits 1.09x
+(Bignums), so_lists 1.07x.
+
+Checked (local): corpus 709 / 709; under MERE_RUBY_VM=1 699 on the VM, 10
+fallen back, 0 different; vm_check 245 / 245; gates; the Module check
+COMPLETE; under both executions, the previous build against this one:
+test_exception, test_rubyoptions, test_flip, test_super, test_method,
+test_object, test_class the same counts.
+
+## 2026-11-19 (86): test_complemented_method_entry_memory_leak -- what a collection costs, and why the floor stays
+
+**The point.** The test has timed out at 10.03-10.04 s on slow runners
+(main's CI, PR #95's, the VM-default measuring branch's). Measured here, on
+its own program (the test's block, 100,000 turns after 1,000):
+
+- It is linear: 50,000 / 100,000 / 200,000 turns take 0.97 / 1.82 / 3.52 s,
+  about 18 µs a turn (ruby 5.7). Nothing grows per collection.
+- Of the time, collecting is 36%; the rest is making the classes and the
+  refinement, spread over the native declaration paths with no function
+  above a few percent. A collection is about 9 ms: the class tables' sweep
+  is near half (68 tables walked, each key's owner read from its text; a
+  turn leaves 21 rows -- methods 3 x 4 tables, modules 2, supers 2, the
+  refinement's 3, privates, mro_external), the stack's native candidates
+  about a third, the fixpoint the rest.
+- The native candidates were 42,000 a collection, most of them the same
+  `Class#name` key from meths_g, meth_src, meth_cref and meth_cvcls; they
+  are taken once now (30,000). The time did not move outside the noise.
+- The class-time floor (knob 14, 4,000 entries) is load-bearing for this
+  very test: at 8,000 its RSS ratio was 2.18 and at 16,000 2.50, against
+  the bound of 2.0, and the time did not fall (1.74-1.98 s against 1.75-1.82
+  for 100,000 turns). It stays.
+
+What is left would be structure: rows a class keeps a record of, so the
+sweep need not read every key's text, or fewer rows a refinement. Until
+then the test stays in Known noise (rerun the job).
+
+## 2026-11-19 (87): the VM as the default, measured over the whole suite
+
+**The point.** The measuring branch vm-default-r44 (#104's stage10-r44 with
+the VM as the default execution, MERE_RUBY_VM=0 the evaluator; not for
+merging) ran the whole CI: run 44295654770. Every job but build-linux
+passed, and the CRuby tests' MATCH is 33,312 against main's 33,313 over the
+same 758 files. Four files are a test lower, three a test higher:
+
+- ruby/test_keyword.rb's test_kwrest_overwritten: a bare super after `**h`
+  was reassigned is "wrong argument type Array (expected Hash)" -- fixed in
+  this branch (core#hash_merge_ptr's Check_Type, corpus 699).
+- ruby/test_ractor.rb: test_move_nested_hash_during_gc_with_yjit's
+  timeout, Known noise.
+- ruby/test_iseq.rb's test_parent_iseq_mark and ruby/test_thread.rb's
+  test_thread_join_during_finalizers: timeouts, and the VM is slower at
+  both. Locally, with the compiler #108 pinned (01f5ad73): 9.65 s on the
+  evaluator and 13.12 s on the VM (bound 20 s), and 23.2 s and 44.9 s (bound
+  60 s); with the compiler before it, 9.76 / 13.16 and 30.2 / 57.7. The
+  second's program alone, outside the test, is faster on the VM (23.6 s
+  against 29.4 s, 5,627 collections against 8,768): what the test adds runs
+  under GC.stress with 20 popen3 wait threads parked, and the child spends
+  nearly all its time collecting -- three quarters of that in gc_mark_roots,
+  where the suspended stacks are read (coro_scan_ints, and the pin gather
+  the recycles at its start ask for). Why the VM's parked stacks cost twice
+  the evaluator's is the next question: the C frames a Ruby call stacks are
+  of the same size on both (vm_step 960 bytes, eval_e 2,080).
+- build-linux: the Module check's test_complemented_method_entry_memory_leak
+  at 10.03 s, Known noise (LOOP (86)).
+
+So the VM as the default passes what the evaluator passes, in the whole
+suite, but for those two timeouts under GC.stress with threads parked.
+
+### Preserve exceptions exposed by a custom rescue matcher
+
+PR #144 review: checkmatch can invoke Ruby === even when the rescue body
+binds no variable. Pin such an exception before exposing it, update the
+handler's hidden exception local and $!, and propagate the same object when
+all clauses reject it. Builtin-only matching retains the allocation-free
+path. run_rescues needs the same protection in evaluator mode. TracePoint
+observers conservatively receive a pinned exception too. Functions changed:
+vm_checkmatch, vm_region, run_rescues; no new top-level state or collector edit.
+Corpus 696 covers retained backtraces across a subsequent raise, $! identity,
+multiple matcher clauses, splat matchers and outer propagation. Corpus
+696-699 matches in all four cache modes on both evaluator and strict VM
+(32 comparisons). Full integrated validation is still pending.
+
+The final parent-integrated AST runtime b4bbb8d9 also passes all 708 corpus
+programs in both hash modes (468.071 seconds, 1,174,736 KiB, unchanged
+900-second/2-GiB bounds), the nine RSS workloads and root/depth/dead gates.
+Corpus 700 still matches in four independent cache configurations after
+this integration. No exclusion, budget or expected output was changed.
+
+
+### AST parameter default source order (2026-11-21)
+
+A follow-up control found that registering explicit block locals before
+parameter defaults changed a ghost-capture name from VCALL to DVAR in
+`foo { |z=y; y| y }` and its keyword-default form. Registration now happens
+after translating parameters and before translating the body, in both
+blocks and lambdas. Corpus 700 adds the two regressions and a destructured
+post-parameter control. Standalone O2 comparisons pass all three; all 869
+Ruby test ASTs and the same 971/976 Prism fixtures remain unchanged.
+The earlier complete 708-program validation applies before this follow-up;
+its updated public-API witness and hosted full suite are validated separately.
+Functions changed in this follow-up: tr_block_scope and tr_lambda.
+
+### AST parameter defaults before block-local declarations
+
+Register explicit block-local declarations after parameter default expressions
+and before the body in tr_block_scope and tr_lambda. Three additional corpus
+700 sources cover optional and keyword defaults and a destructured parameter.
+All three location comparisons pass; the full current source sweep remains
+869/869 Ruby files and 971/976 Prism fixtures with the same five reference
+NoMethodError cases. All 13 original review reproductions and the full public
+corpus 700 in four hash/MRO modes pass on the rebuilt O2 runtime. The earlier
+708-program corpus result predates this follow-up; hosted full checks remain
+required for the final revision.
+
+### AST for-target registration is idempotent at its source position
+
+The early for-target registration is replayed during AST construction. gh_add
+now deduplicates kind-2 and kind-4 records with the same scope serial, name
+and source offset. Reads still use their original strict-before ordering,
+and targets remain registered before the collection is translated.
+Corpus 700 adds four block/lambda/destructuring and collection-read cases.
+All four fail before the repair and match Ruby 4.0.9, including locations,
+after it. All 869 Ruby test files and 971/976 Prism fixtures remain unchanged
+(the same five reference children errors); all 13 earlier review reproductions
+and the rebuilt public corpus 700 API in four cache modes pass. Roots and
+bracket depth 155 pass. The earlier full-corpus observation predates this
+follow-up; full hosted checks and every-file comparison still gate merge.
+
 ### Stage 9 consolidation after main's VM update (2026-11-20)
 
 Merge main d9826ac9 into the existing consolidation branch. Only concurrent
@@ -7941,6 +8602,56 @@ limits, tests, bootstrap and exclusions are unchanged. Parent documentation
 was merged after measurement; it changes no runtime source. Hosted checks
 must complete on the updated head before merge.
 
+Final current-main validation of the retained matcher repair: all720 corpus
+programs match in both hash modes (490.781 seconds, 1,194,640 KiB under the
+unchanged900-second/2-GiB bound). The final integrated runtime retains all32
+focused comparisons across evaluator/strict VM and four hash/MRO modes.
+Nine RSS workloads, GC roots, bracket depth155 and dead definitions pass.
+The handler and $! keep the same pinned exception across rejecting matchers
+and outer propagation. No builtin-only VM matcher pins an exception.
+
+### Preserve exception frames before resolving a rescue constant
+
+A getconstant can run autoload or const_missing before checkmatch. Such
+handlers now leave vm_rescue_only_matches' optimization and pin the original
+exception before the lookup; lookup-free builtin operands, including bare
+rescue, keep their fast path. run_rescues likewise pins before expanding
+explicit class expressions. This deliberately avoids guessing whether a
+constant lookup can execute Ruby. No top-level state or collector change.
+Corpus 696 adds an autoload that raises/rescues internally and a const_missing
+variant, checking the original frame and identity with $!. The original
+head fails the new evaluator reproduction in all four cache modes. The repair
+matches corpus 696-699 in all 32 evaluator/strict-VM/cache combinations; the
+original Exception and Backtrace files pass all 129 cases. The previous
+720-program sweep predates this follow-up; a fresh complete sweep is running.
+
+
+### PR review: resolve constant path heads through actual lexical scopes
+
+Use lex_const_key_nested for the EConst qualified-path shortcut and both
+const_walk_head lookups. An absent namespace prefix is not a lexical scope.
+If that first hit is rejected, the helper continues through the actual
+nesting instead of discarding a later real outer scope. It preserves the
+existing singleton-owner mapping. Changed functions: eval_e,
+const_walk_head and lex_const_key_nested; the parent's vm_define correction
+is unchanged. Corpus760 adds qualified reopening, method reads, scoped class
+definition and the case with both an absent prefix and a real outer scope.
+Both reported and additional comparisons failed before these corrections.
+
+Final normal O2/compiler01f5ad73 validation: **721/721 corpus**, hash index
+ON/OFF, **481.274s / 1,188,480KiB** peak family RSS. All36 default/evaluator/
+strict-VM and hash/MRO comparisons of731/738/760, all nine RSS gates, roots,
+dead definitions and C depth155/1024 pass. Complete original Exception/
+Backtrace/Module/Autoload/Require discover404 cases: **402 MATCH / 0 RED /
+2 BOTH**, with both reference skips explicit and all per-file MATCH retained.
+The old invalid-symbol Syntax leak failure is not affected or reclassified.
+An initial original-file selection started before the replacement build
+finished and is explicitly ineligible; the accepted fresh run checks the O2
+build's freshness and unchanged binary hash. No collector/state, C API,
+VM/ISeq, AST/Prism, gemtest implementation, original tests, exclusions or
+limits were changed for this repair. New hosted CI and latest-main per-file
+acceptance remain required before merging.
+
 ### Stage 9: preserve native launchers and finish current-main integration
 
 Integrate main a206da11 after the native-extension runner change. The manual
@@ -8241,3 +8952,26 @@ Latest-main integration retains the merged stage9 documentation verbatim.
 The only conflict was the append position in this log; runtime and collector
 changes come unchanged from main. The same four collector controls and
 actionlint pass again on the integrated base.
+
+
+## 2026-11-22: keep TracePoint events on their suspended callback
+
+The PR96 integration at 6fc219e6 loses the original
+`TestSetTraceFunc#test_thread_add_trace_func` with `access from outside` in two
+complete runs, while paired main a9ca552d passes that case. A short program
+that explicitly yields inside a shared TracePoint reproduces overwritten
+event metadata on both binaries, so the underlying bug predates this PR;
+only the original case's triggering schedule differs. The initial failures
+and all existing suite failures remain recorded.
+
+TracePoint's Ruby prelude now keeps each active event in its own Fiber's
+entry on the TracePoint object, rather than shared event/inside ivars. An
+ensure restores the enclosing event for allow_reentry or removes the entry
+when the callback ends, including exceptions. No Mere global map, pin, GC
+rule, compiler/dependency pin, upstream test or resource bound is changed.
+
+Witness 749 checks shared callbacks across Thread.pass, outside access while
+another thread's callback is suspended, allow_reentry restoration, explicit
+Fiber.yield/resume and exception cleanup. A fresh ordinary O2 build matches
+Ruby 4.0.9 exactly. Complete original TracePoint and other regression results
+are recorded separately on the PR with their actual source revision.
