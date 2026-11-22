@@ -232,7 +232,12 @@ VALUE rb_obj_freeze(VALUE obj) {
     if (!RB_SPECIAL_CONST_P(obj)) { mr_callk(obj, "freeze", 0); mr_mirror_forget(obj); }
     return obj;
 }
-void rb_obj_freeze_inline(VALUE obj) { rb_obj_freeze(obj); }
+extern int mr_vbig_raw_p(VALUE v);
+void rb_obj_freeze_inline(VALUE obj) {
+    /* (a raw Bignum is frozen as bignum.c freezes it, in its own flags) */
+    if (!RB_SPECIAL_CONST_P(obj) && !MR_HANDLE_P(obj) && mr_vbig_raw_p(obj)) { RBASIC(obj)->flags |= RUBY_FL_FREEZE; return; }
+    rb_obj_freeze(obj);
+}
 VALUE rb_obj_frozen_p(VALUE obj) { return mr_callk(obj, "frozen?", 0); }
 VALUE rb_equal(VALUE a, VALUE b) { return a == b ? Qtrue : (RTEST(mr_call(a, "==", 1, b)) ? Qtrue : Qfalse); }
 int rb_eql(VALUE a, VALUE b) { return a == b || RTEST(mr_call(a, "eql?", 1, b)); }

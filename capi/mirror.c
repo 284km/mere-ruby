@@ -129,7 +129,13 @@ struct mr_mirror *mr_mirror_of(VALUE obj) {
     refresh_head(m, obj);
     return m;
 }
-void *rb_mere_basic(VALUE obj) { return &mr_mirror_of(obj)->as.basic; }
+/* (...or a raw Bignum bignum.c made, which is its own struct:
+ *  capi/bignum_cruby.c) */
+extern int mr_vbig_raw_p(VALUE v);
+void *rb_mere_basic(VALUE obj) {
+    if (!MR_HANDLE_P(obj) && !RB_SPECIAL_CONST_P(obj) && mr_vbig_raw_p(obj)) return (void *)obj;
+    return &mr_mirror_of(obj)->as.basic;
+}
 
 /* (every C call that may hold a pointer into the struct watches it: two
  *  Fibers stopped in C calls that took the same String's bytes each write

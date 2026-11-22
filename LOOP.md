@@ -11004,3 +11004,59 @@ extra is a fixed cost per thread. The collections' time is mostly
 coro_scan_strings (the stacks read for class names) on both; the VM's
 collections see more live classes and more native candidates (22 and 423
 against 6 and 112 in the test's child), which is the next thing to follow.
+
+## 2026-11-22: CRuby's bignum.c, compiled as it is -- the algorithms an extension names
+
+Note 553 §4 decided (b): the 27 RED of test/-ext-/bignum (test_mul 19,
+test_big2str 2, test_str2big 3, test_bigzero 2, test_div 1) call CRuby's
+internal algorithms by name -- rb_big_mul_karatsuba, rb_big_mul_toom3,
+rb_big2str_generic, rb_str2big_karatsuba, rb_big_divrem_normal, ... -- and
+answering them with this interpreter's one multiplication would be a claim.
+So CRuby's bignum.c is now in capi/vendor, unchanged, and those algorithms
+run as CRuby runs them. Locally all 31 tests of those five files pass (and
+test_pack's 28 still do); CI compares both sides.
+
+**What it took.** bignum.c compiles against this C API's headers with seven
+more of CRuby's internal headers, copied unchanged, and two stand-ins:
+`id.h` (seven method IDs, interned by name) and `internal/gc.h` (NEWOBJ_OF
+and two slot-size questions; the real one includes vm_core.h).
+capi/tools/headers_check.py holds the copies to the ruby tree. Every function
+bignum.c defines is renamed (mr_vbig_*) before any header is read, inside
+capi/bignum_cruby.c only, so it calls its own and the C API's own Integer
+functions (numeric.c, bignum.c of capi/) stay as they are; the twelve
+algorithms by name leave capi/unsupported.c and are given under ruby's names.
+What bignum.c asks of the rest of CRuby (rb_int_plus and friends, a ulong
+isqrt) is written in the public API's terms; the one Complex corner
+(rb_dbl_complex_new_polar_pi, a negative Bignum to a fractional power) is a
+named NotImplementedError, and unreachable from the exported names.
+
+**A Bignum it makes is a C struct.** bignum.c makes one with NEWOBJ_OF, turns
+the pointer into its VALUE (`bigv = (VALUE)big`) and reads it through a cast;
+and an extension that includes internal/bignum.h does the same
+(ext/-test-/bignum/bigzero.c writes BIGNUM_DIGITS of what rb_big_new gave
+it). A handle is no address, so such a Bignum is a RAW one: the struct's
+address is its VALUE. RBASIC() answers the struct itself (rb_mere_basic),
+so its type, sign, length and frozen bit are read and written as bignum.c
+does. Where one reaches the interpreter -- an up-call's arguments, the
+transit words, what the C call returns (core.c) -- it becomes the Integer its
+digits say (mr_vbig_out; mr_put_words converts BEFORE it sets the words,
+because making the Integer is an up-call that keeps and puts back what is
+in transit). It is freed when the C call that made it ends, unless bignum.c
+keeps it for good (its radix power cache, rb_vm_register_global_object),
+and those are listed apart so the end of a C call does not walk them. The
+other way, an Integer the interpreter has is a handle or a Fixnum: the entry
+points give bignum.c a raw Bignum with the same digits. Nothing changes for
+a program that never calls these: every hook starts with "are there any raw
+Bignums at all".
+
+**GMP.** The reference links GMP 6.3.0; this build does not. The four *_gmp
+tests rescue NotImplementedError, which is what a ruby built without GMP
+answers, so they pass on both sides without a new build dependency.
+
+Unchanged: ruby/test_bignum.rb 65/74, ruby/spec optional/capi bignum_spec
+105 = reference, integer_spec 60 = reference, numeric_spec 90 (reference 93,
+as recorded), capi_check, corpus.
+
+The future form (note 553 §6.1-5, a separate arc): this interpreter's
+Integer in binary limbs, with Karatsuba and Toom-3 written in Mere; then
+the C names can point there and bignum.c leaves.
