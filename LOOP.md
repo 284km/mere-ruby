@@ -5739,6 +5739,88 @@ extended witness matches the reference both normally and with GC.stress.
   Float#step bit comparison. This is not waived as known noise. Latest successful
   main CI is 43933582689; compare it and handoff 43548292351 before any merge.
 
+## 2026-11-17 (70): gem rounds 10-11 -- singleton undef and Module name super
+
+With the unchanged lock and 62 files / 1,969 reference tests, round 10 gives
+53 MATCH / 8 RED / 1 MEMORY; round 11 gives 53 MATCH / 7 RED / 2 MEMORY.
+There are no BOTH, TIMEOUT, reference changes or lost MATCH. Rack Lint becomes
+MATCH (37 tests / 763 assertions). The second memory verdict is a newly reached
+request case, not another passing file. The initial snapshot remains unchanged.
+
+- `invoke_val_c2` / `invoke_with_block2` consult a primitive singleton's undef
+  before the native path; `respond_to_answer` / `responds_x` ask the same fact.
+  `hng_lookup_cls`, `hng_undef_blocked` and `hng_undef_call` keep the actual
+  lookup class, method_missing block, query hook and NoMethodError attributes.
+  Ordinary class identity stays separate. Witness 681 includes send/public_send
+  with and without blocks, redefinition, other instances and saved aliases.
+- `super_missing` sends a class/module override's name super directly to the
+  existing `mod_name_val`, with native arity. Witness 682 checks named,
+  anonymous, late-named and singleton classes, frozen cached names and a
+  superclass undef. The shared super lookup and main dispatcher are untouched.
+  Minitest spec now executes 76 tests (2 failures / 4 errors), and Rack headers
+  51 (37 failures / 2 errors). Both stay RED. Request now reaches TestProxyRequest's
+  16 MiB ASCII NUL test and crosses 2 GiB; no VM/GC cause is established.
+- Fresh O2 source 861c74d1: corpus 701/701 and both witnesses under GC.stress
+  match Ruby. CRuby Method is 97 MATCH / 1 RED and Module 195/195, equal to the
+  same-environment latest-main controls. Six harness controls pass; bracket
+  depth stays 892/1024. No top-level let, root table or limit change.
+- Additional controls reduce RewindableInput to File rewind after chmod(0),
+  and the uploaded-file assertion count to reflected File/IO helpers.
+  A separate prepended name/undef lookup gap also predates these rounds.
+  Their shared-function constraints and remaining symptoms stay in the ledger.
+- Linux's ubuntu-latest rollout changed the reference from Ubuntu 24.04 to
+  26.04 and exposed fused versus separate Float#step rounding. Strict diagnostic
+  output confirms the differing bits. #90 pins only the runtime build and gem
+  Linux jobs to the measured Ubuntu 24.04 target; all bounds/assertions remain.
+  The newer-target numeric gap stays documented. Updated Linux jobs pass.
+  #92's separate Module leak test hit its documented 10-second known noise;
+  its raw record is retained for an unchanged-bound job rerun after completion.
+
+## 2026-11-17 (71): retain native definitions through singleton undef
+
+#97's review exposed two distinct native-definition regressions and a saved
+alias path missed by the original Hash-only alias witness. A Method captured
+before undef must keep its definition, and replacing Module#name must not
+make super revive that definition beyond Module. Saved String/Array/Proc
+aliases retain their definitions too, including direct, send/public_send and
+reflected Method calls with and without blocks.
+
+- `method_unbind_fields` retains the existing native metadata;
+  `bi_meth_shadowed` / `bi_meth_call` preserve the native definition through
+  the existing one-dispatch bypass. Retained String conversion keeps the
+  correct receiver identity, and Hash#to_hash ignores its block.
+- `run_block1`, `bind_params`, `method_body_flow_result`, `run_stmts` and
+  `eval_run` clear that bypass before Ruby code. The witness includes a
+  second receiver's override, coercion defaults and string instance_eval.
+  `en_can_buffer` / `gen1_src` keep a returned Enumerator's later source lookup
+  ordinary, including NoMethodError after each has been undefined.
+- `hng_retained_alias` / `hng_retained_alias_call`, consulted by
+  `invoke_val_c2` / `invoke_with_block2`, preserve the native alias's source
+  only during redispatch. The block alias path uses the actual singleton.
+  `module_name_super_ahead` reads the current method frame and ancestry;
+  `super_missing` returns the native name only when Module remains ahead.
+- Fresh O2 source a3ad911a: all 62 original files / 1,969 reference tests give
+  53 MATCH / 7 RED / 2 MEMORY, zero BOTH/TIMEOUT/regressions. Corpus is 701/701;
+  expanded 681/682 also match under GC.stress. CRuby Method is 97 MATCH / 1 RED,
+  Module 195/195, TracePoint 97 MATCH / 4 RED / 1 BOTH, Proc 117 MATCH / 1 RED,
+  Super 50/50 and Yield 13/13, retaining the paired baseline counts. All six
+  harness controls pass; bracket depth remains 892/1024. The initial snapshot,
+  collector, shared dispatch bodies and resource limits are unchanged.
+- A preliminary corpus invocation stopped at the stale-generated-C gate;
+  regenerating and comparing C proved identical contents. A later run mixed
+  a changing alias witness/binary and was rejected. Only the final fixed-tree
+  701/701 run is accepted. A verbose ShowExceptions time control passes on
+  both pre-review and final binaries (81.73s / 82.86s inside the test runner);
+  this does not establish a review-induced slowdown.
+- An unaccepted Headers class-[] trial exposed bare new without native Hash
+  storage and worsened the file to 51 errors. It was reverted, with no trial
+  snapshot or public implementation. Its try_self_call/new_obj coordination
+  constraint, and additional pre-existing primitive lookup gaps, remain in
+  the ledger. Current remote AST/VM/C API/GC function bodies were compared
+  before publication; none overlaps the functions changed in this follow-up.
+- Existing hosted per-file checks against both CI baselines remain pending;
+  no lower count or incomplete coverage is waived and no PR is merged.
+
 ## 2026-11-16 (60): ruby's mkmf builds extensions from mere-ruby's own RbConfig, and published gems -- nokogiri among them -- install with `gem install`
 
 Stage 7′ / 8, third unit (note 553), on the C API of (58). Until now
@@ -7063,6 +7145,14 @@ resource investigation to VM/performance without assuming a GC cause.
 The separate rounds 8-9 Linux runtime failure is the documented
 complemented-method-entry leak test timing out at 10.05 seconds. Its full
 log is archived; retry that job when GitHub allows it.
+
+
+Audited rounds 10-11 on main 12ca1df2, O2 source 20cc0eac: 53 MATCH /
+7 RED / 0 BOTH / 0 TIMEOUT / 2 MEMORY, all 62 reference files audited.
+The parent's macOS multipart MATCH becomes MEMORY in both the full run
+and a focused repeat. Keep the nonempty regression in suites_candidate.json;
+this observation is not an adopted baseline. Preserve the parent's macOS
+and Linux gates, and leave merge blocked pending the resource investigation.
 
 ## 2026-11-20: a live refinement snapshot need not duplicate its first target
 
