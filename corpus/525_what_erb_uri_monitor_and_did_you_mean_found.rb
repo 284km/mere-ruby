@@ -112,3 +112,26 @@ Dir.mktmpdir('monitor-fallback') do |dir|
     $LOADED_FEATURES.replace(loaded)
   end
 end
+
+# Reference wrappers may depend on a differently named native core (Psych).
+# Use real YAML parsing in an isolated child, with the reference directory
+# deliberately repeated as -I just as RubyGems' extension builder does.
+require 'rbconfig'
+Dir.mktmpdir('psych-fallback') do |directory|
+  File.write(File.join(directory, 'psych.rb'), <<~RUBY)
+    require 'rbconfig'
+    require 'psych.so'
+    raise NameError, 'native Psych parser unavailable' unless defined?(Psych::Parser)
+    require File.join(RbConfig::CONFIG.fetch('rubylibdir'), 'psych.rb')
+  RUBY
+  File.write(File.join(directory, 'yaml.rb'), "require 'psych'\nYAML = Psych unless defined?(YAML)\n")
+  previous = ENV['MERE_RUBY_STDLIB_FALLBACK']
+  ENV['MERE_RUBY_STDLIB_FALLBACK'] = directory
+  begin
+    code = 'require "yaml"; p [:yaml_fallback, YAML.load("answer: 42\n")]'
+    print IO.popen([RbConfig.ruby, '--disable-gems', '-I' + directory, '-e', code], &:read)
+    p [:yaml_fallback_status, $?.success?]
+  ensure
+    previous ? ENV['MERE_RUBY_STDLIB_FALLBACK'] = previous : ENV.delete('MERE_RUBY_STDLIB_FALLBACK')
+  end
+end
