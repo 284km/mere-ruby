@@ -7628,3 +7628,44 @@ its existing record. Existing digest-header, thread timeout and other
 unsupported spec results are retained, not counted as passing cases.
 The earlier runner-only attempt's six native-gem child failures remain
 separate raw evidence. Current hosted every-file validation still gates merge.
+
+
+## 2026-11-22: restore the earlier Method arena floor repair to PR 107
+
+PR 107 still fails the unchanged hosted macOS Method-copy assertion at
+2.151589x in run 44896678187. Its public source `263c2dd6` omitted the previously
+authorized `compact_method_store` correction carried by the later stack.
+Restore that exact change: native compaction can decline while an arena is
+pinned, and unchanged capacity must not become the enlarged next floor.
+Only initialization or actual capacity reduction publishes a measurable floor.
+Dirty clearing, the return value, unmeasurable behavior, numeric thresholds
+and native pin/collector policy are preserved. No new top-level binding.
+
+Build the exact public parent and candidate `1e977ae4` with released compiler
+`408b03d9`, ordinary native macOS O2. Predetermined parent/candidate/candidate/parent
+ratios are 1.682880 / 1.380188 / 1.382723 / 1.679791. All 21 original post-collection
+prefixes, the complete program bytes and the 2x assertion are unchanged; healthy
+references accompany every trial. These local parents pass as well. Preserve
+the original failed hosted series instead of claiming a local reproduction.
+
+Complete Module 195/1240 and Refinement 122/367 retain identical reference cases
+(the same refinement skip). Method retains 98 tests / 554 assertions and its
+existing skip versus reference 558 assertions. No passing parent case is lost.
+Both original gem groups complete offline: primary 54 MATCH / 7 RED / 1 MEMORY
+and additional 6 MATCH / 1 MEMORY, with zero accepted per-file MATCH losses.
+Logger's known RED is MEMORY in this sweep. A separate parent run reaches RED,
+followed by a predetermined parent/candidate/candidate/parent whole-file comparison
+that exceeds the original cap in all four runs. Keep all five observations;
+no Logger RSS or File-identity repair is claimed. Rack Request remains MEMORY.
+
+All 738 corpus programs match in both hash-index modes (466.667 seconds, peak
+family RSS 1,039,664 KiB within 900 seconds / 2 GiB). New witness 769 retains copied
+Ruby method bodies, aliases and lexical constants across collections. All nine
+existing loop RSS checks and dead/duplicate definitions, GC roots, method
+writes and record hygiene pass; generated-C depth remains 155/1024.
+
+The receipt `gemtest/method_floor_pr107_r101.json` retains every paired RSS prefix,
+the original hosted failure, source/compiler/binary/C identities, complete core
+case dictionaries, all 69 gem rows and raw-log hashes. Baselines, locks, tests
+and 600-second / 2-GiB file limits are unchanged. This is macOS evidence; fresh
+hosted CI and latest-main per-file acceptance still gate merging.
