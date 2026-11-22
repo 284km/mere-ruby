@@ -82,14 +82,27 @@ current x86-64 implementation evaluates them separately. That numeric
 portability gap remains open, rather than weakening the bit-parity check.
 `actions/cache` stores the exact locked sources and dependencies, which are
 verified even on cache hits. A baseline rejects missing files, lost MATCH
-files and a newly unhealthy reference. On the same OS it also rejects changed
-reference counts. Across operating systems platform guards may differ, while
-the two interpreters must still agree within that run. CI artifacts preserve
+files, changed reference counts and a newly unhealthy reference. The CLI
+rejects a baseline from another OS. Linux uses `suites_linux.json`; macOS
+uses `suites_latest.json`. The two interpreters must agree within each run.
+CI artifacts preserve
 the complete measurements and logs. `suites_check.py` includes negative
 controls for zero tests, early exits, missing files, reference failures,
 resource classification, and source mutation or shadow files.
 The seventh control runs real Ruby to reject a healthy-looking summary from
 the wrong source tree and a process that bypasses the audit with `exit!`.
+The eighth rejects wrong-platform and wrong-lock baselines and verifies that
+a previously matching file reaching the RSS cap is still a regression.
+
+The Linux baseline comes from hosted run 44248949546, with 52 MATCH /
+9 RED / 1 MEMORY. Its ordinary per-file comparison with this PR's earlier
+Linux run 43989409595 has no regressions. Both runs exceed 2 GiB in Rack's
+multipart file. `suites_linux_before_source_audit.json` preserves the earlier
+result; `suites_linux_transition.json` records the unchanged source/dependency
+inventory, command-only audit transition and exact comparison. The original
+gate error against macOS's 53-MATCH snapshot is preserved in the new Linux
+record. No file verdict, test count or limit is changed. The macOS baseline
+retains all 53 MATCH files, including multipart; a later macOS loss must fail.
 
 Kramdown 2.5.1 was measured before choosing this set. Its large conversion
 file needs an external tidy executable plus optional Rouge and stringex; the
@@ -117,3 +130,11 @@ minitest's original reporter becomes MATCH (22 tests / 52 assertions).
 Witnesses 676 and 677 cover restoring native File aliases, keyword/block
 forwarding, deferred predicates and early termination of infinite inputs.
 Only `invoke_with_block0` and `core_prelude_b` change in these rounds.
+
+Rounds 8-9 match rescue candidates in order and retain a Hash subclass's
+default block passed to super. Rack's original utils file becomes MATCH
+(63 tests / 285 assertions). The unchanged 62-file inventory now gives
+52 MATCH / 9 RED / 1 MEMORY, with no BOTH, TIMEOUT or baseline regression.
+Witnesses 678 and 679 cover candidate evaluation/conversion, Module#===,
+Proc identity, lambda arity, preserved entries, argument errors and freezing.
+Corpus reports 699/699 MATCH; bracket depth remains 895/1024.

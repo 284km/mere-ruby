@@ -213,6 +213,14 @@ def compare(rows, baseline, same_platform=True):
     return errors
 
 
+def baseline_errors(result, baseline):
+    if baseline['lock_sha256'] != result['lock_sha256']:
+        raise ValueError('baseline lock differs')
+    if baseline['platform'] != result['platform']:
+        raise ValueError('baseline platform differs; select the matching platform snapshot')
+    return compare(result['rows'], baseline)
+
+
 def measure(args, lock):
     verify(args.cache, lock)
     if call([str(args.reference), '--disable-gems', '-e', 'print RUBY_VERSION']) != lock['ruby_version']:
@@ -255,9 +263,7 @@ def measure(args, lock):
         raise ValueError('binary or lock changed during measurement; discard this run')
     if args.baseline:
         baseline = json.loads(args.baseline.read_text())
-        if baseline['lock_sha256'] != result['lock_sha256']:
-            raise ValueError('baseline lock differs')
-        errors = compare(rows, baseline, baseline.get('platform') == result['platform'])
+        errors = baseline_errors(result, baseline)
         result['regressions'] = errors
         save(args.output / 'results.json', result)
         if errors:
