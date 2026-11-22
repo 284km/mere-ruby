@@ -10970,3 +10970,37 @@ public instance methods only: tools/gen_arity_table.rb now reads the eleven
 private hooks the same way (nothing called), and only those rows were added
 to the table (regenerating the whole table would drop rows added since).
 corpus/777.
+
+## 2026-11-22 (88): two corpus programs main added that differed on the VM, and the VM's cost with threads parked under GC.stress
+
+- **corpus 736** (`include Feature::Item` inside `module Inner` whose
+  `Feature` is only an autoload of Inner, with an R::Feature further out):
+  const_walk_head looked for the head in the constant table alone, so the
+  outer constant won over the nearer autoload. An autoload registered in a
+  scope nearer than the constant found is read first now, as ruby asks each
+  scope for a constant or an autoload innermost first. The evaluator's
+  `include` statement had its own path; the VM reads the argument as a
+  constant path, through here. The evaluator's result is unchanged.
+- **corpus 725** (a TracePoint enabled inside `to_ary` while a `(a, b)`
+  parameter is destructured, then the method's :call): ruby fires :call at
+  the instruction marked Ca, after the destructuring prologue
+  (`getlocal ?; expandarray; setlocal a; setlocal b`, then Ca). The VM's
+  :call is fired by run_meth before the program runs, so a TracePoint
+  enabled by the prologue misses it. Moving it means the VM knowing the Ca
+  instruction and firing there; left as it is.
+- With `-W`, `($g ||= []) << x` inside a method warns that $g is not
+  initialized (ruby does not), and a read after `$g &&= x` does not warn
+  (ruby does). Not this round's.
+
+**The VM-default timeouts** (test_parent_iseq_mark, test_thread_join_during_
+finalizers, LOOP (87)): assert_separately puts a BEGIN in the child's
+source, so the test's own code runs on the evaluator; what runs on the VM is
+what it requires -- test/unit, open3 -- and the popen3 wait threads are
+parked in VM frames. Reproduced outside the test: 20 threads parked in a
+VM-required file's method, then 200 objects under GC.stress -- 3.9 s on the
+evaluator, 5.4 s on the VM; parked 10 frames deeper 4.9 / 7.8, 40 deeper
+7.8 / 10.4. Past the first frames the depth costs both the same: the VM's
+extra is a fixed cost per thread. The collections' time is mostly
+coro_scan_strings (the stacks read for class names) on both; the VM's
+collections see more live classes and more native candidates (22 and 423
+against 6 and 112 in the test's child), which is the next thing to follow.
