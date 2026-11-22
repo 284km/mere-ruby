@@ -7719,6 +7719,65 @@ The unchanged Method-copy lifetime control passes at post-GC peak/start
 1.686, with real RSS samples retained. No speedup or resource-cause claim
 follows from these observations.
 
+
+## Gem suites, rounds 29–31: preserve native reflection and sender protocols
+
+The actual parent #115 Linux Method-copy lifetime failure remains a merge
+blocker: 2.056x in hosted run 44414103412, with the original 2x assertion and
+600-second / 2-GiB outer bounds. Consecutive saved-binary Linux/aarch64
+comparisons reproduce both pass and fail for each identical binary (parent
+1.894/2.035x, candidate 2.053/1.889x). This is evidence of variation, not an
+established resource cause or a substitute for the hosted x86_64 gate.
+A metadata-row lookup prototype also fails at 2.119x and is rejected; its
+source and extra control are restored. All failed and successful series
+remain in method_copy_lifetime_latest.json. No collector edits or bound,
+warm-up, workload or native-copy metadata changes are adopted in this round.
+
+The parent's original macOS run 44414103487 also regresses multipart from
+MATCH to MEMORY. suites_hosted_r115_macos_failure.json preserves that actual
+53-MATCH failure; it does not replace the stronger 54-MATCH macOS baseline.
+No retry is presented as a repair or a successful same-head observation.
+
+Minitest Mock exposes a separate Ruby semantics gap: a saved native
+respond_to? alias must answer using its own protocol even when respond_to?
+is overridden. send, __send__ and public_send must honor actual Ruby
+overrides, while their native aliases, retained native Methods and native
+super keep the captured implementation. native_sender_call consumes the
+one-call bypass at the actual native entry before coercion callbacks,
+preserves blocks, keywords and refinements, and keeps public visibility
+errors' real name/receiver/args. sender_super_ahead checks the remaining
+actual ancestor chain rather than reviving a nonexistent native definition.
+Class aliases keep their block and native owners precede later Ruby mixins.
+
+Only user_defines_send, blt_alias_call, invoke_val_c2, invoke_with_block2,
+invoke_with_block0, super_next_plain and super_missing change, plus the two
+new and-helpers above. An adjacent named_class_of_al comment is updated.
+The shared invoke_val_c0, VM, AST tree, C API and GC functions are untouched.
+All other active session branches have disjoint changed functions at the
+pre-publication check. Top-level let counts remain main 136 / state 1167;
+the generated C still needs bracket depth 933, below the existing 1024.
+
+Witnesses 712/713 fail the saved parent binary and match normally and with
+GC.stress on O2 source c0b06cc7. The unchanged upstream Minitest Mock file
+runs all 94 tests: 8 errors become 2, assertions rise 136 to 144, and its
+1 failure / 10 skips remain. Reference assertions are 147, so the file stays
+RED. Dynamic missing-method super and bare private Kernel stub calls remain
+separate gaps; the shared dispatcher/VM-default functions are not edited.
+
+All 115 files across the unchanged three locks retain their strict gates:
+original 54 MATCH / 7 RED / 1 MEMORY, additional 6 MATCH / 1 RED, Rake 46 MATCH;
+all reference files are healthy (2735 tests). The preceding complete
+observations are saved independently before updating the latest snapshots.
+Corpus matches 730/730 with both hash modes under its unchanged wrapper.
+These local results do not replace the pending complete hosted merge gates.
+
+Core Class/Hash/Array/Super/Method retain all preceding passing cases, with
+MATCH counts 61/297/473/50/97. Array is actually 473 MATCH / 3 RED / 1 BOTH
+in this observation; reference shared-marking variation is not hidden.
+The unchanged local lifetime control passes at 1.769x. That observation does
+not resolve the parent hosted Linux failure. suites_runtime_r31.json stores
+the exact core executions/nonpassing cases, corpus bounds and lifetime series.
+
 ## 2026-11-20: a live refinement snapshot need not duplicate its first target
 
 PR #92's repeated original Module check failed its RSS assertion at
