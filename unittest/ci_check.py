@@ -85,6 +85,24 @@ class CICheck(unittest.TestCase):
         self.assertEqual(summary["totals"]["match"], 3)
         self.assertEqual(summary["missing_files"], 0)
 
+    def test_exclusions_remain_separate_from_named_test_totals(self):
+        audit = 'Example\ttest_slots\tRequires default GC slot heaps\n'
+        for side in ('reference', 'mere-ruby'):
+            (self.root / (side + '.exclusions')).write_text(audit)
+        self.assertEqual(self.run_shard(0), 0)
+        self.assertEqual(self.run_shard(1), 0)
+        self.assertEqual(self.merge(), 0)
+        summary = ci.load(self.root / 'report/summary.json')
+        self.assertEqual(summary['excluded_tests'], 3)
+        self.assertEqual(summary['totals']['match'], 3)
+        self.assertIn('Example#test_slots', (self.root / 'report/exclusions.tsv').read_text())
+        self.assertIn('Excluded tests (identical on both interpreters): 3',
+                      (self.root / 'report/SUMMARY.md').read_text())
+
+    def test_asymmetric_exclusions_are_an_infrastructure_error(self):
+        (self.root / 'reference.exclusions').write_text('Example\ttest_slots\tRequires default GC slot heaps\n')
+        self.assertEqual(self.run_shard(0), 1)
+
     def weighted_plan(self, seconds, ruby_ref='c' * 40, shards=2):
         path = self.root / 'timings.json'
         ci.save(path, dict(schema=1, ruby_ref=ruby_ref, seconds=seconds))
