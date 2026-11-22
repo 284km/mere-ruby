@@ -413,6 +413,31 @@ Integer conversion on both the saved parent and rejected prototype when the
 receiver subclasses File. File itself works. Keep this shared constructor/
 allocator investigation separate; no native gem is required by the reduction.
 
+
+Rounds 35–37 add twelve MATCH files from Forwardable 1.4.0, Delegate 0.7.0
+and URI 1.1.2 on macOS and network-disabled Linux/aarch64. All 158 tests /
+3229 assertions run without skips; no runtime change is adopted.
+
+Retain the earlier preflight versions and their actual 9 MATCH / 1 RED /
+2 BOTH verdicts. Forwardable 1.3.3 expects backtick message quoting and URI
+1.0.3 calls the removed Ractor#take API, both failing on reference Ruby 4.0.9.
+Delegate 0.4.0's Proc#ruby2_keywords/define_method forwarding passes its final
+hash positionally on Mere. The underlying implementation site is not yet
+confirmed or repaired; record it as Ruby keyword semantics. Delegate 0.7.0
+uses generated `...` forwarding methods instead. Its passing result does not
+claim that the old path is repaired. I18n's helper/Gemfile pre-audit still
+needs a validated isolated Bundler development closure; it is not measured
+or classified as an unavoidable native-extension dependency in this round.
+
+Actual #119 small-suite hosted jobs are green on both OSes. Its Linux
+lifetime check passes at 1.996285x using the identical fbbd0199 executable
+that failed at 2.269969x on #118; preserve both separate-hosted-run series.
+No resource cause is established. Its full build fails the known-noise
+Module complemented-entry memory-leak case at 2.371912x. A requested job
+rerun is rejected with HTTP 403 while the containing workflow remains active;
+record the retry as pending, not accepted or successful. The stronger original
+baseline, failed multipart observations, and all existing-file gates remain.
+
 The remaining stdlib-caller P2 also affected `mspec/scoreboard.sh` and
 `run_corpus.sh` when reference library directories were supplied through
 RUBYLIB. Mere now receives its own load paths before those fallback paths;

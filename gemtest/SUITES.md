@@ -324,3 +324,29 @@ missing-super prototype and all three of its measured batches remain explicit
 trial records; its apparent Mock improvement is not an adopted runtime fix.
 Final runtime source files and the existing workflows are unchanged. The
 Linux lifetime failure and complete hosted comparisons remain merge blockers.
+
+
+The separate delegation/URI batch pins Forwardable 1.4.0, Delegate 0.7.0
+and URI 1.1.2 in suites_delegation_uri.lock.json. Their twelve complete
+original files MATCH on macOS and network-disabled Linux/aarch64, with
+158 tests / 3229 assertions and zero skips. Use the existing restore/measure
+commands with that lock and suites_delegation_uri_latest.json (macOS) or
+suites_delegation_uri_linux.json (Linux). Initial and actual per-OS records
+are separate; all development packages reuse the pinned Test::Unit closure.
+The independent workflow has its own source cache and unchanged file bounds.
+
+The older-version preflight remains explicit: 9 MATCH / 1 RED / 2 BOTH.
+Forwardable's old quote expectation and URI's removed Ractor#take call also
+fail on Ruby 4.0.9. Delegate 0.4.0's keyword-forwarding error remains an
+unrepaired Ruby semantics gap; its newer release emits different forwarding
+code. No tests are edited, skipped or dropped within a selected release.
+The inventory is now 13 gems / 129 files; this round's twelve-file measurement
+is kept separate from the preceding 117-file observation. Runtime and all
+731 corpus files are unchanged, and full corpus validation passes again.
+
+Hosted #119 small-suite observations now supply the latest actual OS records,
+with preceding local snapshots preserved. Its successful Linux lifetime
+observation uses the exact same executable as the earlier failed #118 run;
+all samples remain, with no resource-fix claim. Full hosted CI and existing
+file comparisons remain merge gates, including the stronger original macOS
+baseline and the pending known-noise Module-job retry.
