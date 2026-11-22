@@ -8981,3 +8981,19 @@ another thread's callback is suspended, allow_reentry restoration, explicit
 Fiber.yield/resume and exception cleanup. A fresh ordinary O2 build matches
 Ruby 4.0.9 exactly. Complete original TracePoint and other regression results
 are recorded separately on the PR with their actual source revision.
+
+## 2026-11-22 (77): a regexp's escapes must be whole characters of its encoding -- Regexp.new, AST.parse, and the parser's refusal
+
+**The point.** `Regexp.new('a\xff')` compiled, and `RubyVM::AbstractSyntaxTree.parse('/a\xff/')` returned a tree. In ruby 4.0.9 the first is a RegexpError and the second a SyntaxError: "invalid multibyte escape: /a\xff/". Note 551 recorded the AST case as a gap.
+
+**Regexp.new.** `__rx_new` now checks each run of escaped bytes, unless the pattern has NOENCODING. A run is made of `\xHH`, a three-digit octal, and `\M-` (alone or around a control escape). The run must make whole characters of the source's encoding: UTF-8, EUC-JP, Shift_JIS or Windows-31J. A plain character, a raw byte or any other escape ends the run. The reason comes from the parser's own rx_mb_why, through rx_esc_runs_why in m_parse.mere. A control escape with no `\M-` in it is no byte of a character to Regexp.new: `'a\c\xff'` compiles, as in ruby.
+
+**AST.parse.** It compiles a plain literal (REGX) with Regexp.new, so it now refuses one as parse.y does, in Regexp.new's words. A split or interpolated literal (DREGX) is not compiled, and parse.y does not refuse it either. This interpreter's own parser runs first and refuses such a literal in its own form. AST.parse now leaves that refusal to the tree's error.
+
+**The parser's refusal**, for eval and load:
+- it names the pattern as the lexer left it (`\M-b` written `\xE2`), or with interpolation the fragment the run is in (`/\x81#{ }/` says `/\x81/`), where it named only the run's bytes;
+- it names the line the literal is on, unframed, as ruby does: rx_cur "why" with syn_why_ln "l". Eval used the eval's own line for an unframed reason, and a literal on line 2 said line 1.
+
+Not done (on main too): `Regexp.new('\xc3\M-)')`, whose `\M-)` the pattern parser takes as an unmatched `)`.
+
+- Checked: the same results before and after on test_regexp, test_m17n, test_m17n_comb, test_syntax, test_ast, test_iseq, test_parse, enc/test_utf16, enc/test_euc_jp and enc/test_shift_jis. Witness corpus/750.
