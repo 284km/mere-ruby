@@ -4810,6 +4810,68 @@ zero failures/errors/skips, outer 23.441 seconds / 365,632 KiB. The
 The updated hosted CI, Linux Module memory gate and all-file comparison
 against complete main remain required before merge. No bound is changed.
 
+## Hash subclass missing hooks used by Rails options
+
+Unknown calls on Hash subclass instances now reach their real inherited
+Ruby method_missing, using the existing primitive hook path. Real Ruby
+methods, native entries/aliases and refinements retain their precedence.
+The unchanged ActiveSupport OrderedOptions setter/getter and stored value
+match the reference in a saved-gem diagnostic. This does not establish a
+Rails application pass; the original cold six-stage workload still needs
+the Class/C API/SHA-2 composition and this change together.
+
+This correction changes only hng_missing_hook. Native undef/private-alias
+dispatch gaps already present on the parent remain unresolved; their
+diagnostic failures are not converted into exclusions or passing tests.
+Original Hash/Method/Super retain 444 MATCH / 2 RED / 8 BOTH (454 cases).
+The complete 13-gem original suites have not been rerun on this head; the
+parent observations and all resource/comparison gates remain in force.
+
+
+## Compatible native features before shipped implementations
+
+An activated gem's existing native extension can precede the shipped stdlib
+without being selected: the ordered search handled real Ruby files, then
+chose the shipped source before asking the native resolver. This mixed the
+actual JSON 3.1 facade with an older shipped generator during Rails loading
+(#127). Select a compatible native feature in the same load-path prefix when
+no physical Ruby file wins. Preserve explicit .rb searches, the native ABI
+probe and the shipped fallback after that prefix. resolve_feature_path and
+actual require report/use the same native file and its loaded identity.
+
+Only main.mere's resolve_feature, load_path_pick_shipped and do_require0
+change, with new mutually recursive shipped_native_path. No additional
+top-level Mere values, C API implementation/header, collector, VM/ISeq, AST,
+gemtest, API inventory, original test or resource-limit changes.
+
+Corpus 722 (originally 721) independently compiles the same tiny C fixture for each runtime
+using that runtime's headers. It covers a real Ruby file before the native
+choice, explicit .rb lookup, native feature resolution/loading, its actual
+constant, canonical feature identity and one-time execution. The parent
+fails at the missing native constant; normal O2 head matches Ruby 4.0.9 with
+indexing ON/OFF. Original require/autoload/Marshal retain the exact paired
+parent result: 311 cases, 308 MATCH / 0 RED / 3 BOTH. All nine RSS checks
+pass; bracket depth remains 933/1024 with the parent's pinned compiler.
+
+The full corpus is 733/733 in both modes. The unchanged C API contract
+groups agree normally and under collection stress (loader: reference 48,
+Mere 49); all six fault controls fail as required. The ordinary unchanged
+JSON 3.1 probe now matches on validation-only composition 61d01f6d.
+
+A new cold original-CLI replay on that composition installs all 68 gems
+(232.699 s / 954,624 KiB), then passes the JSON boundary and stops in the
+next ActiveModel Module#included native-super call (#129), migration exit 1
+in 4.097 s / 318,224 KiB. Reference passes all six stages; candidate boot,
+tests and HTTP remain NOT_RUN, without a resource event. The separate
+native_candidate.json in #117 preserves the exact run. No JSON attributes,
+Rails/gem sources or original inputs/limits are patched. This own branch
+is stacked on the Hash candidate; production integration must wait for the
+parent series and required hosted gates.
+
+The native feature witness was renumbered from 721 to 722 after the
+concurrent parent published its distinct IO witness 721. Its Ruby/C source
+is byte-identical; no observation or historical source record is rewritten.
+
 ### PR90: Pathname core and physical library extensions
 
 Separating the unchanged shipped Pathname core from pathname.rb's extension
@@ -5187,6 +5249,15 @@ original166-case comparison retain their measured results; all57 exclusions
 remain explicit and identical across runtimes. The existing87 RED in that
 comparison, including all76 allocation cases, stay visible. This integration
 does not claim a complete Rails pass or a fix for native memory attribution.
+
+The synchronized native-selection branch retains declared reference stdlib
+fallbacks through repeated child -I arguments, including actual YAML/Psych
+native prerequisites, and preserves unrelated user paths. Its new normal O2
+receipt is751/751 corpus programs in both hash modes; original require,
+autoload and Marshal retain308 MATCH/0 RED/3 BOTH across311 cases.
+The real mkmf context/child,14 contracts, stress and negative controls pass.
+These checks do not establish a Rails application/framework-suite pass or
+complete C API compatibility; earlier original Rails failures remain recorded.
 
 ## Lexer review: comments and receiver class calls
 
