@@ -23,19 +23,125 @@ let nott = fn (b: bool) -> if b then false else true;
 // What kind of scope each enclosing one is, innermost last: 1 a block's or a
 // lambda's (its variables are DVAR / DASGN), 0 a method's, a class's or the
 // program's (LVAR / LASGN). as_sc[0] is how many there are.
+// Each entry is the kind plus twice the scope's serial (as_gh[1] counts them).
 let as_sc = vec_new ();
+// A regexp's named captures assign variables only when parse.y reads the
+// regexp as one literal (reg_named_capture_assign skips a DREGX). Prism does
+// not split `/(?<y>a)#@~/` and assigns `y`; parse.y splits it at the `#@`, so
+// there `y` is no variable: no assignment under MATCH2, no `y` in the table,
+// and a later `y` is a VCALL until something else assigns it. Such a name
+// (a "ghost") is found while translating, and then the program is
+// translated again, recording where each variable is really assigned.
+//   as_gh[0]  0 no ghost, 1 one found (translate again), 2 translating again
+//   as_gh[1]  the next scope's serial
+//   then four ints an entry: kind (1 a ghost, 2 a real assignment, 3 a
+//   parameter), the scope's serial, the name (a Prism constant; for 3 the
+//   table's child), the offset of the assignment
+let as_gh = vec_new ();
 let sc_reset = fn (u: unit) ->
   let _ = vec_recycle as_sc in
   vec_push as_sc 0;
 let sc_push = fn (kind: int) ->
   let d = vec_get as_sc 0 + 1 in
-  let _ = (if d < vec_len as_sc then vec_set as_sc d kind else vec_push as_sc kind) in
+  let s = vec_get as_gh 1 in
+  let _ = vec_set as_gh 1 (s + 1) in
+  let v = kind + 2 * s in
+  let _ = (if d < vec_len as_sc then vec_set as_sc d v else vec_push as_sc v) in
   vec_set as_sc 0 d;
 let sc_pop = fn (u: unit) -> vec_set as_sc 0 (vec_get as_sc 0 - 1);
 // (the scope `depth` levels out from the innermost)
 let sc_is_block = fn (depth: int) ->
   let i = vec_get as_sc 0 - depth in
-  i >= 1 && vec_get as_sc i == 1;
+  i >= 1 && vec_get as_sc i % 2 == 1;
+let gh_serial = fn (depth: int) -> vec_get as_sc (vec_get as_sc 0 - depth) / 2;
+let gh_add = fn (kind: int) -> fn (s: int) -> fn (v: int) -> fn (off: int) ->
+  // A for target is registered before its collection and visited again
+  // while building its AST. One source position is one binding record.
+  let rec exists = fn (i: int) ->
+    if i + 3 >= vec_len as_gh then false
+    else if vec_get as_gh i == kind && vec_get as_gh (i + 1) == s
+            && vec_get as_gh (i + 2) == v && vec_get as_gh (i + 3) == off then true
+    else exists (i + 4) in
+  if (kind == 2 || kind == 4) && exists 2 then ()
+  else (let _ = vec_push as_gh kind in
+        let _ = vec_push as_gh s in
+        let _ = vec_push as_gh v in
+        vec_push as_gh off);
+// (an entry of `kind` for name `c` in scope `s` placed before `before`)
+let gh_has = fn (kind: int) -> fn (s: int) -> fn (c: int) -> fn (before: int) ->
+  let n = vec_len as_gh in
+  let nm = (if kind == 3 then cname c else "") in
+  let rec go = fn (i: int) ->
+    if i + 3 >= n then false
+    else if vec_get as_gh i == kind && vec_get as_gh (i + 1) == s
+            && (if kind == 3 then (let k = vec_get as_gh (i + 2) in k_tag k == 2 && str_eq (vec_get ao_s (k_val k)) nm)
+                else vec_get as_gh (i + 2) == c && vec_get as_gh (i + 3) < before)
+    then true
+    else go (i + 4) in
+  go 2;
+// (the offset of the first entry of `kind` for `c` in scope `s`, or -1)
+let gh_first = fn (kind: int) -> fn (s: int) -> fn (c: int) ->
+  let n = vec_len as_gh in
+  let rec go = fn (i: int) -> fn (best: int) ->
+    if i + 3 >= n then best
+    else if vec_get as_gh i == kind && vec_get as_gh (i + 1) == s && vec_get as_gh (i + 2) == c
+            && (best < 0 || vec_get as_gh (i + 3) < best)
+    then go (i + 4) (vec_get as_gh (i + 3))
+    else go (i + 4) best in
+  go 2 (0 - 1);
+// (no scope from the innermost out to `depth` assigns `c` before `p`)
+let rec gh_unassigned = fn (depth: int) -> fn (c: int) -> fn (p: int) ->
+  if depth < 0 then true
+  else if gh_real (gh_serial depth) c p then false
+  else gh_unassigned (depth - 1) c p;
+// (in the second translation: `c`, `depth` scopes out, is assigned at `p`.
+//  A ghost of an outer scope that nothing assigned yet is, to parse.y, a
+//  new variable of the innermost scope -- kind 4 puts it in that table)
+let gh_put = fn (depth: int) -> fn (c: int) -> fn (p: int) ->
+  if vec_get as_gh 0 != 2 then ()
+  else if depth > 0 && gh_has 1 (gh_serial depth) c 1000000000000000 then
+    // A prior write may have relocated the binding into this block or an
+    // intermediate enclosing block. Subsequent writes stay at that binding.
+    (let rec binding = fn (d: int) ->
+       if d > depth then 0 - 1
+       else if gh_real (gh_serial d) c p then d else binding (d + 1) in
+     let d = binding 0 in
+     if d >= 0 then gh_add 2 (gh_serial d) c p
+     else (let _ = gh_add 2 (gh_serial 0) c p in gh_add 4 (gh_serial 0) c p))
+  else gh_add 2 (gh_serial depth) c p;
+let gh_target = fn (t: int) -> gh_put (pm_local_variable_target_depth t) (pm_local_variable_target_name t) (pm_start t);
+
+// Register for-loop locals before translating the collection, without
+// creating AST nodes early or traversing receiver expressions as targets.
+let rec gh_targets = fn (t: int) ->
+  if t == 0 || vec_get as_gh 0 != 2 then ()
+  else if pm_is t (pm_t_local_variable_target ()) then gh_target t
+  else if pm_is t (pm_t_multi_target ()) then
+    (let rec each = fn (l: int) -> fn (i: int) ->
+       if i >= pm_ls_len l then ()
+       else (let _ = gh_targets (pm_ls_at l i) in each l (i + 1)) in
+     let _ = each (pm_multi_target_lefts t) 0 in
+     let _ = gh_targets (pm_multi_target_rest t) in
+     each (pm_multi_target_rights t) 0)
+  else if pm_is t (pm_t_splat ()) then gh_targets (pm_splat_expression t)
+  else ();
+let gh_parameter = fn (c: int) ->
+  if vec_get as_gh 0 == 2 then gh_add 3 (gh_serial 0) (k_id (id_c c)) 0 else ();
+let gh_block_locals = fn (pn: int) ->
+  if vec_get as_gh 0 != 2 || nott (pm_is pn (pm_t_block_parameters ())) then ()
+  else (let locals = pm_block_parameters_locals pn in
+        let rec each = fn (i: int) ->
+          if i >= pm_ls_len locals then ()
+          else (let _ = gh_parameter (pm_block_local_variable_name (pm_ls_at locals i)) in each (i + 1)) in
+        each 0);
+
+// (the name is assigned for real in scope `s` before `p`: a parameter, or an
+//  assignment that starts before it)
+let gh_real = fn (s: int) -> fn (c: int) -> fn (p: int) -> gh_has 2 s c p || gh_has 3 s c 0;
+// (a read of `c` at `p`, `depth` scopes out, that parse.y makes a VCALL)
+let gh_vcall = fn (depth: int) -> fn (c: int) -> fn (p: int) ->
+  gh_has 1 (gh_serial depth) c 1000000000000000 && gh_unassigned depth c p;
+let gh_assign = fn (depth: int) -> fn (c: int) -> fn (p: int) -> gh_put depth c p;
 // The argument part of the table of the scope being built (children, in
 // table order), as a stack: a parameter's default value can hold a block
 // with parameters of its own. as_nm[0] is how many are in use.
@@ -45,6 +151,7 @@ let nm_reset = fn (u: unit) ->
   vec_push as_nm 0;
 let nm_len = fn (u: unit) -> vec_get as_nm 0;
 let nm_push = fn (k: int) ->
+  let _ = (if vec_get as_gh 0 == 2 then gh_add 3 (gh_serial 0) k 0 else ()) in
   let d = vec_get as_nm 0 + 1 in
   let _ = (if d < vec_len as_nm then vec_set as_nm d k else vec_push as_nm k) in
   vec_set as_nm 0 d;
@@ -87,7 +194,23 @@ let as_er = vec_new ();
 //      such a construct go up to the list it is in itself
 //  10  for the caller that makes the tree's literals: 1 once the Regexp of a
 //      literal was made, 0 when making it raised
+//  11  error_tolerant, the statement list whose owner is about to translate
+//      it, when parse.y recovers inside it by `stmt: error` (rv_mark); -1
+//      otherwise. 12 the ERROR that recovery made last, -1 when none
 let as_px = vec_new ();
+// (a body that is a def's, a class's, a module's, `class <<`'s, a begin's,
+//  a while's or until's, a lambda's, or an if's or unless's without an
+//  else: when parse.y meets what cannot follow a statement there, it pops
+//  back to the start of the body's `stmts` and makes everything from there
+//  to the last token it throws away one ERROR (stmt: error), and reads on
+//  after the next term. Other bodies recover otherwise -- a block's pops
+//  the whole outer statement, an if's with an else takes the then-branch
+//  too, a when's leaves no tree -- and are not marked)
+let rv_mark = fn (bodyn: int) ->
+  let sn = (if bodyn != 0 && pm_is bodyn (pm_t_begin ()) then pm_begin_statements bodyn else bodyn) in
+  vec_set as_px 11
+    (if vec_get pm_hd 6 >= 0 && vec_len pm_er > 0 && sn != 0 && pm_is sn (pm_t_statements ())
+     then pm_statements_body sn else 0 - 1);
 // (those from `base` on, in order; they are dropped)
 let nm_take = fn (base: int) ->
   let cnt = vec_get as_nm 0 in
@@ -242,7 +365,97 @@ let rec skip_blank = fn (i: int) ->
   if c == 32 || c == 9 then skip_blank (i + 1) else i;
 
 // ---- the walk ------------------------------------------------------------------
-let tr = fn (n: int) -> if n == 0 then 0 else ast_tr_node n;
+// What parse.y refuses among arguments written in parentheses or brackets
+// (`foo(...)`, `foo[...]`, `[...]`): a command -- a call with arguments and
+// no parentheses -- given a `do` block, `foo(bar baz do end)`. The lexer
+// reads that `do` as a block's of a command (keyword_do_block), which
+// nothing inside the brackets takes. Also inside a splat and as a keyword
+// argument's value; not inside a `( )` of its own, not a `{ }` block, not a
+// call with no arguments. Prism gives `bar` the block. (as_er)
+let rec cmd_do_check = fn (l: int) ->
+  let rec bad = fn (x: int) ->
+    if pm_is x (pm_t_call ()) then
+      (let b = pm_call_block x in
+       pm_is b (pm_t_block ()) && pm_byte (pm_block_opening_loc_s b) == 100
+       && pm_call_arguments x != 0 && pm_call_opening_loc_s x < 0)
+    else false in
+  let rec go = fn (i: int) ->
+    if i >= pm_ls_len l then ()
+    else
+      (let x = pm_ls_at l i in
+       let _ = (if bad x then
+                  (let b = pm_call_block x in
+                   if vec_len as_er == 0 then vec_push as_er (ast_err_at "syntax error, unexpected 'do' for block" (pm_block_opening_loc_s b) (pm_block_opening_loc_e b)) else ())
+                else if pm_is x (pm_t_splat ()) && pm_splat_expression x != 0 && bad (pm_splat_expression x) then
+                  (let b = pm_call_block (pm_splat_expression x) in
+                   if vec_len as_er == 0 then vec_push as_er (ast_err_at "syntax error, unexpected 'do' for block" (pm_block_opening_loc_s b) (pm_block_opening_loc_e b)) else ())
+                else if pm_is x (pm_t_keyword_hash ()) then
+                  (let es = pm_keyword_hash_elements x in
+                   let rec kv = fn (j: int) ->
+                     if j >= pm_ls_len es then ()
+                     else (let a = pm_ls_at es j in
+                           let _ = (if pm_is a (pm_t_assoc ()) && bad (pm_assoc_value a) then
+                                      (let b = pm_call_block (pm_assoc_value a) in
+                                       if vec_len as_er == 0 then vec_push as_er (ast_err_at "syntax error, unexpected 'do' for block" (pm_block_opening_loc_s b) (pm_block_opening_loc_e b)) else ())
+                                    else ()) in
+                           kv (j + 1)) in
+                   kv 0)
+                else ()) in
+       go (i + 1)) in
+  go 0;
+// (the offset of the newline that ends the line `i` is on; the program's
+//  length when there is none)
+let rec ast_line_end_from = fn (i: int) ->
+  let c = pm_byte i in
+  if c < 0 || c == 10 then i else ast_line_end_from (i + 1);
+// A heredoc's body and its terminator line, as the lexer reads them when it
+// meets the line end after the opener (ao_lx): where the body starts -- its
+// first text, or the terminator when there is none -- and where the
+// terminator line ends.
+let hd_note = fn (n: int) ->
+  let pair = (if pm_is n (pm_t_string ()) then (pm_string_content_loc_s n, pm_string_closing_loc_e n)
+              else if pm_is n (pm_t_xstring ()) then (pm_xstring_content_loc_s n, pm_xstring_closing_loc_e n)
+              else if pm_is n (pm_t_interpolated_string ()) then
+                (let ps = pm_interpolated_string_parts n in
+                 ((if pm_ls_len ps > 0 then pm_start (pm_ls_at ps 0) else pm_interpolated_string_closing_loc_s n),
+                  pm_interpolated_string_closing_loc_e n))
+              else if pm_is n (pm_t_interpolated_xstring ()) then
+                (let ps = pm_interpolated_xstring_parts n in
+                 ((if pm_ls_len ps > 0 then pm_start (pm_ls_at ps 0) else pm_interpolated_xstring_closing_loc_s n),
+                  pm_interpolated_xstring_closing_loc_e n))
+              else (0 - 1, 0 - 1)) in
+  let (bs, ce) = pair in
+  if bs >= 0 && ce >= 0 then (let _ = vec_push ao_lx bs in let _ = vec_push ao_lx ce in ()) else ();
+// (from the start of a line, `k`: past the bodies of the heredocs that start
+//  there, one after another -- what the lexer reads before it looks at the
+//  line again)
+let rec hd_skip = fn (k: int) ->
+  let rec find = fn (i: int) ->
+    if i + 1 >= vec_len ao_lx then 0 - 1
+    else if vec_get ao_lx i == k then vec_get ao_lx (i + 1)
+    else find (i + 2) in
+  if vec_len ao_lx == 0 then k
+  else (let ce = find 0 in if ce > k then hd_skip ce else k);
+let tr = fn (n: int) ->
+  if n == 0 then 0
+  else
+    (let c0 = pm_byte (pm_start n) in
+     // (a percent literal closed by a line end: ao_nl_end)
+     let _ = (if c0 == 37 then
+                (let e = pm_end n in
+                 if e > 0 && pm_byte (e - 1) == 10 then (let _ = vec_push ao_lx (0 - 1) in vec_push ao_lx e) else ())
+              // (a heredoc: hd_skip)
+              else if c0 == 60 && pm_byte (pm_start n + 1) == 60 then hd_note n
+              else ()) in
+     // (arguments in parentheses or brackets: cmd_do_check)
+     let t = vec_get pm_nd n in
+     let _ = (if t == pm_t_call () then
+                (if pm_call_opening_loc_s n >= 0 then
+                   (let a = pm_call_arguments n in if a != 0 then cmd_do_check (pm_arguments_arguments a) else ())
+                 else ())
+              else if t == pm_t_array () && c0 == 91 then cmd_do_check (pm_array_elements n)
+              else ()) in
+     ast_tr_node n);
 let tr_unknown = fn (n: int) -> n0 (nt_error ()) (pm_start n) (pm_end n);
 
 // stmts: stmt_or_begin | stmts terms stmt_or_begin, each through
@@ -255,10 +468,40 @@ let tr_stmt_list = fn (l: int) ->
   let eb = vec_get as_px 5 in
   let ee = vec_get as_px 6 in
   let _ = (if cut then vec_set as_px 3 (0 - 1) else ()) in
+  let rv = lim >= 0 && vec_get as_px 11 == l in
+  let _ = (if rv then vec_set as_px 11 (0 - 1) else ()) in
+  // (error_tolerant, a marked body (rv_mark): Prism found no term between
+  //  statement i-1 and i -- `1q`, `a = 1 2`. parse.y's ERROR runs from the
+  //  body's start through the statements written without a term between
+  //  them; the index of the last of those, or -1 when this is not that case
+  //  or a modifier takes the ERROR, which is not done)
+  let garbage = fn (ll: int) -> fn (i: int) -> fn (n: int) ->
+    (if nott rv || i == 0 then 0 - 1
+     else
+       (let a = pm_end (pm_ls_at ll (i - 1)) in
+        let b = pm_start (pm_ls_at ll i) in
+        let ne = vec_len pm_er in
+        let rec err = fn (k: int) ->
+          k + 4 < ne && ((vec_get pm_er k == pm_e_expect_eol_after_statement () && vec_get pm_er (k + 2) >= a
+                          && vec_get pm_er (k + 2) <= b) || err (k + 5)) in
+        let modif = fn (x: int) ->
+          pm_is x (pm_t_if ()) || pm_is x (pm_t_unless ()) || pm_is x (pm_t_while ()) || pm_is x (pm_t_until ())
+          || pm_is x (pm_t_rescue_modifier ()) in
+        let rec last = fn (j: int) ->
+          if modif (pm_ls_at ll j) then 0 - 1
+          else if j + 1 < n && nott (term_ahead (pm_end (pm_ls_at ll j))) then last (j + 1)
+          else j in
+        if nott (err 0) then 0 - 1 else last i)) in
   let rec go = fn (ll: int) -> fn (i: int) -> fn (n: int) -> fn (acc: int) ->
     if i >= n then acc
     else
       (let x = pm_ls_at ll i in
+       let gj = garbage ll i n in
+       if gj >= 0 then
+         (let er = n0 (nt_error ()) (pm_start (pm_ls_at ll 0)) (pm_end (pm_ls_at ll gj)) in
+          let _ = vec_set as_px 12 er in
+          go ll (gj + 1) n er)
+       else
        // (error_tolerant: what Prism puts after the last token, where an
        //  `end` never came, is no statement)
        if lim >= 0 && pm_is x (pm_t_missing ()) && (pm_start x >= lim || (i == n - 1 && pm_end x >= lim)) then go ll (i + 1) n acc
@@ -297,14 +540,28 @@ let tr_compstmt = fn (sn: int) -> fn (empty_at: int) ->
   // (a `;` first: the empty `stmts` is reduced before it, and the
   //  statements follow that BEGIN)
   if body == 0 then p_begin_at empty_at
-  else if empty_at < 1099511627776 && pm_byte (skip_space_nl empty_at) == 59 then p_block_append (p_begin_at empty_at) body
+  else if empty_at < 1099511627776 && pm_byte (skip_space_nl empty_at) == 59 then
+    (let er = vec_get as_px 12 in
+     let head = (if er >= 0 && a_is body (nt_block ()) then a_f body 0 else body) in
+     if er >= 0 && head == er then
+       (let _ = a_set_beg er empty_at in
+        let _ = (if head != body then a_set_beg body empty_at else ()) in body)
+     else p_block_append (p_begin_at empty_at) body)
   else body;
 // ...and where a `term` can come first (`class A; ...`, `begin; ...`): the
 // empty `stmts` is reduced before the term, so the statements follow a
 // BEGIN at `lead_at`. `lead` says whether a term does come first.
 let tr_compstmt_lead = fn (sn: int) -> fn (lead: bool) -> fn (lead_at: int) ->
   let body = tr_stmts_of sn in
-  if lead then p_block_append (p_begin_at lead_at) body
+  let er = vec_get as_px 12 in
+  // (...an ERROR of parse.y's recovery (tr_stmt_list) that starts the
+  //  statements starts where that empty `stmts` is: it took the term too)
+  let head = (if er >= 0 && body != 0 && a_is body (nt_block ()) then a_f body 0 else body) in
+  if lead && er >= 0 && head == er then
+    (let _ = a_set_beg er lead_at in
+     let _ = (if head != body then a_set_beg body lead_at else ()) in
+     body)
+  else if lead then p_block_append (p_begin_at lead_at) body
   else if body == 0 then p_begin_at lead_at else body;
 // is there a `;` or a line end between offset `i` and the next token?
 // (a comment runs to the line end, which is that term)
@@ -318,17 +575,47 @@ let rec term_ahead = fn (i: int) ->
 // which are Prism's locals that are no argument.
 let scope_tbl = fn (locals: int) -> fn (args: int list) ->
   let cnt = pm_ls_len locals in
+  // (a ghost nothing else assigns is no variable of parse.y's)
+  let ghost = fn (c: int) ->
+    (vec_get as_gh 0 == 2
+     && (let s = gh_serial 0 in gh_has 1 s c 1000000000000000 && nott (gh_real s c 1000000000000000))) in
   let rec is_arg = fn (xs: int list) -> fn (nm: str) ->
     (match xs with
      | Nil -> false
      | Cons (k, t) -> (if k_tag k == 2 && str_eq (vec_get ao_s (k_val k)) nm then true else is_arg t nm)) in
+  // (...and one first assigned for real after its capture is in the table
+  //  where that assignment puts it: before the first variable assigned
+  //  later. Prism's order is by first appearance, the capture included)
+  let late = fn (c: int) ->
+    (vec_get as_gh 0 == 2
+     && (let s = gh_serial 0 in
+         let g = gh_first 1 s c in
+         g >= 0 && nott (gh_has 3 s c 0) && gh_first 2 s c > g)) in
   let rec vars = fn (i: int) ->
     if i >= cnt then (Nil : int list)
     else (let c = pm_ls_at locals i in
-          if is_arg args (cname c) then vars (i + 1) else Cons (k_id (id_c c), vars (i + 1))) in
+          if is_arg args (cname c) || ghost c || late c then vars (i + 1) else Cons (c, vars (i + 1))) in
+  let rec ins = fn (xs: int list) -> fn (c: int) -> fn (at: int) ->
+    (match xs with
+     | Nil -> Cons (c, Nil)
+     | Cons (h, t) -> (if gh_first 2 (gh_serial 0) h > at then Cons (c, xs) else Cons (h, ins t c at))) in
+  let rec lates = fn (i: int) -> fn (xs: int list) ->
+    if i >= cnt then xs
+    else (let c = pm_ls_at locals i in
+          lates (i + 1) (if late c then ins xs c (gh_first 2 (gh_serial 0) c) else xs)) in
+  // (the new variables of kind 4, each once)
+  let rec news = fn (i: int) -> fn (xs: int list) ->
+    if i + 3 >= vec_len as_gh then xs
+    else if vec_get as_gh i == 4 && vec_get as_gh (i + 1) == gh_serial 0
+            && gh_first 4 (gh_serial 0) (vec_get as_gh (i + 2)) == vec_get as_gh (i + 3)
+    then news (i + 4) (ins xs (vec_get as_gh (i + 2)) (vec_get as_gh (i + 3)))
+    else news (i + 4) xs in
+  let rec ks = fn (xs: int list) ->
+    (match xs with Nil -> (Nil : int list) | Cons (c, t) -> Cons (k_id (id_c c), ks t)) in
   let rec app = fn (xs: int list) -> fn (ys: int list) ->
     (match xs with Nil -> ys | Cons (h, t) -> Cons (h, app t ys)) in
-  mk_arr (app args (vars 0));
+  let vs = vars 0 in
+  mk_arr (app args (ks (if vec_get as_gh 0 == 2 then news 2 (lates 0 vs) else vs)));
 
 // program: compstmt(top_stmts) -> NEW_SCOPE(0, block_append(eval_tree, $2))
 // error_tolerant, a program with something after a whole statement where a
@@ -370,7 +657,9 @@ let tr_program = fn (n: int) ->
     if i >= vec_len as_pre then acc else pre (i + 1) (p_block_append acc (vec_get as_pre i)) in
   let body = (if vec_len as_pre == 0 then body0 else p_block_append (pre 0 0) body0) in
   let tbl = scope_tbl (pm_program_locals n) Nil in
-  let r = n3 (nt_scope ()) 0 (if a_is body (nt_error ()) then a_end body else stmts_end_of sn (a_end body)) tbl 0 body in
+  // (...an ERROR from the recovery in a body (tr_stmt_list) is not that)
+  let r = n3 (nt_scope ()) 0 (if a_is body (nt_error ()) && body != vec_get as_px 12 then a_end body
+                              else stmts_end_of sn (a_end body)) tbl 0 body in
   let _ = sc_pop () in
   r;
 
@@ -505,15 +794,41 @@ let tr_embedded_variable = fn (x: int) ->
 // opener (it has no width, at the opener's end); one that stops at an
 // interpolation starts on the line it stops on; in a `<<~` heredoc every
 // line is a token of its own, and a run of them keeps the first one's place.
-let tr_contents = fn (parts: int) -> fn (hd: int) -> fn (hend: int) ->
+//
+// hd 3 is a `<<~` whose indentation falls to none at a later line (`d`, the
+// first piece that starts a line with no indentation -- text, or the `#{` of
+// an interpolation). parse.y's heredoc_indent shrinks as the lexer reads,
+// and literal_concat does not join pieces while it is above 0: the pieces
+// before `d` stay apart, each text one placed as in a `<<~` heredoc (from
+// where it starts to past its line's newline). From `d` on, literal_concat
+// joins as usual -- a text to the text before it -- and a text after an
+// interpolation is placed as in a plain heredoc; heredoc_dedent, with
+// nothing to remove, leaves it all so.
+let tr_contents = fn (parts: int) -> fn (hd0: int) -> fn (hend: int) ->
   let cnt = pm_ls_len parts in
   let first_b = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0) in
+  let d = (if hd0 != 3 then 0 - 1
+           else
+             (let flush = fn (l: int) -> (let c = pm_byte l in c != 32 && c != 9 && c != 10 && c != 13) in
+              let rec drop_at = fn (i: int) ->
+                if i >= cnt then 0 - 1
+                else (let x = pm_ls_at parts i in
+                      let ps = pm_start x in
+                      if i > 0 && ast_line_start ps == ps && flush ps then ps else drop_at (i + 1)) in
+              drop_at 0)) in
+  // (before `d`: apart, as `<<~`; from `d` on: as a plain heredoc)
+  let pre = fn (x: int) -> hd0 == 3 && (d < 0 || pm_start x < d) in
+  let hd_of = fn (x: int) -> if hd0 != 3 then hd0 else if pre x then 2 else 1 in
   let rec run_end = fn (i: int) ->
     if i + 1 < cnt && pm_is (pm_ls_at parts (i + 1)) (pm_t_string ()) then run_end (i + 1) else i in
   let rec go = fn (i: int) -> fn (acc: int) -> fn (prev_str: bool) ->
     if i >= cnt then acc
     else
       (let x = pm_ls_at parts i in
+       let hd = hd_of x in
+       // (literal_concat as parse.y's runs it here: apart while there is
+       //  indentation to remove)
+       let apart = pre x in
        if pm_is x (pm_t_string ()) then
          (let ps = pm_start x in
           // (in a plain heredoc the text up to the next interpolation is one
@@ -534,30 +849,64 @@ let tr_contents = fn (parts: int) -> fn (hd: int) -> fn (hend: int) ->
           let st = n1 (nt_str ()) b e (lit_str (vec_get pm_st (pm_string_unescaped x)) (ast_str_enc x)) in
           // (a `<<~` run of lines is one STR after heredoc_dedent: the
           //  first's place, the text of all)
-          if hd == 2 && prev_str && acc != 0 then
+          if hd0 == 2 && prev_str && acc != 0 then
             (let lit = (if a_is acc (nt_str ()) then a_f acc 0 else p_literal_head acc) in
              let _ = (if lit != 0 then p_lit_append lit (a_f st 0) else ()) in
              go (i + 1) (if lit != 0 then acc else p_literal_concat acc st first_b pe false) true)
-          else go (i + 1) (p_literal_concat acc st first_b pe false) true)
+          else go (i + 1) (p_literal_concat acc st first_b pe apart) true)
        else if pm_is x (pm_t_embedded_statements ()) then
          (let ev = tr_embedded_statements x in
-          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) false) false)
+          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) apart) false)
        else if pm_is x (pm_t_embedded_variable ()) then
          (let ev = tr_embedded_variable x in
-          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) false) false)
+          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) apart) false)
        else
          (let v = tr x in
-          go (i + 1) (p_literal_concat acc v first_b (pm_end x) false) false)) in
-  go 0 0 false;
-// (is this opener a heredoc's, and is it a `<<~`? 0, 1 or 2. `first`: where
-//  its text starts -- a `<<~` whose first line has no indentation has none
-//  to remove, and the lexer then reads it as it reads a plain one)
-let heredoc_kind = fn (os: int) -> fn (first: int) ->
+          go (i + 1) (p_literal_concat acc v first_b (pm_end x) apart) false)) in
+  let r = go 0 0 false in
+  // (heredoc_dedent: a `<<~` DSTR whose pieces all joined its head -- a
+  //  literal interpolated, `#{"y"}` -- is a STR)
+  if hd0 == 2 && r != 0 && a_is r (nt_dstr ()) && a_f r 1 == 0 then n1 (nt_str ()) (a_beg r) (a_end r) (a_f r 0)
+  else r;
+// (is this opener a heredoc's, and is it a `<<~`? 0, 1 or 2. `parts`: its
+//  text -- a `<<~` with a line that has no indentation (the first one, or
+//  any other outside an interpolation, one that starts with `#{` too) has
+//  none to remove, and the lexer then reads it as it reads a plain one)
+let heredoc_kind = fn (os: int) -> fn (parts: int) ->
+  let cnt = pm_ls_len parts in
+  let first = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0 - 1) in
+  let flush = fn (l: int) -> (let c = pm_byte l in c != 32 && c != 9 && c != 10 && c != 13) in
+  // (is offset `l` inside an interpolation -- past its start?)
+  let rec inside = fn (i: int) -> fn (l: int) ->
+    i < cnt && ((let x = pm_ls_at parts i in nott (pm_is x (pm_t_string ())) && pm_start x < l && l < pm_end x) || inside (i + 1) l) in
+  let last = (if cnt > 0 then pm_end (pm_ls_at parts (cnt - 1)) else 0) in
+  let rec any_flush = fn (ln: int) ->
+    if ln >= vec_len pm_lo then false
+    else (let l = vec_get pm_lo ln in
+          if l >= last then false
+          else if flush l && nott (inside 0 l) then true
+          else any_flush (ln + 1)) in
   if os < 0 || pm_byte os != 60 || pm_byte (os + 1) != 60 then 0
   else if pm_byte (os + 2) == 126 then
-    (let c = pm_byte (ast_line_start first) in
-     if first >= 0 && c != 32 && c != 9 && c != 10 then 1 else 2)
+    (if first >= 0 && flush (ast_line_start first) then 1
+     // (3: the first line is indented and a later one is not -- the pieces
+     //  before that one stay apart: tr_contents)
+     else if first >= 0 && any_flush (ao_line_of first + 1) then 3
+     else 2)
   else 1;
+// (Prism's parts are all text: what parse.y's lexer read as ONE token,
+//  which a heredoc body after a `\`-continued line splits in Prism only)
+let parts_all_text = fn (ps: int) ->
+  let rec go = fn (i: int) -> i >= pm_ls_len ps || (pm_is (pm_ls_at ps i) (pm_t_string ()) && go (i + 1)) in
+  pm_ls_len ps > 1 && go 0;
+// (a word of %w[] / %i[] that is such a token: placed as a word token is,
+//  from the start of the line it ends on)
+let word_token_place = fn (d: int) -> fn (n: int) -> fn (ps: int) ->
+  let e = pm_end n in
+  let ls = ast_line_start e in
+  if parts_all_text ps && ls > pm_start n && (a_is d (nt_str ()) || a_is d (nt_sym ())) then
+    (let _ = a_set_beg d ls in let _ = a_set_end d e in d)
+  else d;
 // string1: tSTRING_BEG string_contents tSTRING_END, then `strings`'
 // evstr2dstr -- one literal, located at the whole of it
 let tr_string1 = fn (n: int) ->
@@ -572,7 +921,7 @@ let tr_string1 = fn (n: int) ->
   else
     (let os = pm_interpolated_string_opening_loc_s n in
      let parts = pm_interpolated_string_parts n in
-     let c = tr_contents parts (heredoc_kind os (if pm_ls_len parts > 0 then pm_start (pm_ls_at parts 0) else 0 - 1)) e in
+     let c = tr_contents parts (heredoc_kind os parts) e in
      if c == 0 then n1 (nt_str ()) b e (lit_str "" (src_enc ()))
      else (let _ = a_set_beg c b in
            let _ = a_set_end c e in
@@ -603,7 +952,7 @@ let tr_interpolated_string = fn (n: int) ->
     // a word of %W[...]: its contents, with no delimiters of its own
     (let c = tr_contents parts 0 0 in
      if c == 0 then n1 (nt_str ()) (pm_start n) (pm_end n) (lit_str "" (src_enc ()))
-     else p_evstr2dstr c)
+     else word_token_place (p_evstr2dstr c) n parts)
   else p_evstr2dstr (tr_string1 n);
 // xstring: new_xstring
 let tr_xstring = fn (n: int) ->
@@ -612,7 +961,7 @@ let tr_interpolated_xstring = fn (n: int) ->
   let b = pm_start n in
   let e = pm_end n in
   let xparts = pm_interpolated_xstring_parts n in
-  let c = tr_contents xparts (heredoc_kind (pm_interpolated_xstring_opening_loc_s n) (if pm_ls_len xparts > 0 then pm_start (pm_ls_at xparts 0) else 0 - 1)) e in
+  let c = tr_contents xparts (heredoc_kind (pm_interpolated_xstring_opening_loc_s n) xparts) e in
   if c == 0 then n1 (nt_xstr ()) b e (lit_str "" (src_enc ()))
   else if a_is c (nt_str ()) then (let _ = a_set_ty c (nt_xstr ()) in let _ = a_set_beg c b in let _ = a_set_end c e in c)
   else if a_is c (nt_dstr ()) then (let _ = a_set_ty c (nt_dxstr ()) in let _ = a_set_beg c b in let _ = a_set_end c e in c)
@@ -640,7 +989,20 @@ let tr_interpolated_symbol = fn (n: int) ->
     // a word of %I[...]: symbol_append(evstr2dstr(word))
     (let d = p_evstr2dstr c in
      if a_is d (nt_dstr ()) then (let _ = a_set_ty d (nt_dsym ()) in d)
-     else if a_is d (nt_str ()) then n1 (nt_sym ()) (a_beg d) (a_end d) (id_of_lit (a_f d 0))
+     else if a_is d (nt_str ()) then
+       (let ps = pm_interpolated_symbol_parts n in
+        let sy = n1 (nt_sym ()) (a_beg d) (a_end d) (id_of_lit (a_f d 0)) in
+        // (Prism places such a word -- and each of its parts -- where its
+        //  first line is: the token goes on past the heredoc bodies, to the
+        //  length of its last line)
+        if parts_all_text ps && pm_start (pm_ls_at ps (pm_ls_len ps - 1)) == pm_start (pm_ls_at ps 0) then
+          (let tx = lit_text (a_f d 0) in
+           let rec last_nl = fn (i: int) -> if i < 0 then 0 - 1 else if ord (char_at tx i) == 10 then i else last_nl (i - 1) in
+           let k1 = hd_skip (ast_line_end_from (pm_end n) + 1) in
+           let _ = a_set_beg sy k1 in
+           let _ = a_set_end sy (k1 + str_len tx - last_nl (str_len tx - 1) - 1) in
+           sy)
+        else word_token_place sy n ps)
      else d);
 // cond0 on a range in a condition: FLIP2 / FLIP3; an Integer end is
 // compared with the line number (range_op)
@@ -713,22 +1075,24 @@ let rec regx_has_property = fn (src: str) -> fn (i: int) ->
 let tr_regx = fn (ty: int) -> fn (n: int) -> fn (src: str) -> fn (os: int) -> fn (oe: int) -> fn (cs: int) -> fn (ce: int) ->
   let r = n1 ty (pm_start n) (pm_end n) (regx_lit n src) in
   // (a MATCH -- the REGX of a condition -- answers only its own location)
-  if ty == nt_match () then r else a_xloc r [os, oe, oe, tok_end cs, cs, ce];
+  // (`%r\nfoo\n`: the opening and the closing each end on their line end's line)
+  // (no text, only a heredoc's body between the opening and the closing:
+  //  the text ends where it starts)
+  let te = (if cs > oe && hd_skip oe == cs then tok_end oe else tok_end cs) in
+  if ty == nt_match () then r else a_xloc r [os, tok_end oe, tok_end oe, te, cs, tok_end ce];
 // (where a text token that ends at offset `e` ends: one whose last byte is a
 //  newline ends on that newline's line, in the column past it)
 let tok_end = fn (e: int) ->
   if e > 0 && pm_byte (e - 1) == 10 then pos_lc (ao_line_of (e - 1)) (e - vec_get pm_lo (ao_line_of (e - 1))) else e;
-let tr_regular_expression = fn (n: int) ->
-  tr_regx (nt_regx ()) n (vec_get pm_st (pm_regular_expression_unescaped n))
-    (pm_regular_expression_opening_loc_s n) (pm_regular_expression_opening_loc_e n)
-    (pm_regular_expression_closing_loc_s n) (pm_regular_expression_closing_loc_e n);
-// (a regexp literal that is a condition: cond0 makes the REGX a MATCH)
-let tr_match_last_line = fn (n: int) ->
-  tr_regx (nt_match ()) n (vec_get pm_st (pm_match_last_line_unescaped n))
-    (pm_match_last_line_opening_loc_s n) (pm_match_last_line_opening_loc_e n)
-    (pm_match_last_line_closing_loc_s n) (pm_match_last_line_closing_loc_e n);
 // regexp_contents: its own fold -- the first part becomes a DSTR (one with
 // no string when it is not text), the rest are appended
+let regx_fold = fn (acc: int) -> fn (v: int) -> fn (first_b: int) ->
+  if acc == 0 then v
+  else
+    (let head = (if a_is acc (nt_str ()) then p_str2dstr acc
+                 else if a_is acc (nt_dstr ()) then acc
+                 else p_list_append (n3 (nt_dstr ()) first_b (a_end v) 0 0 1) acc) in
+     p_list_append head v);
 let tr_regexp_contents = fn (parts: int) ->
   let cnt = pm_ls_len parts in
   let first_b = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0) in
@@ -751,10 +1115,9 @@ let tr_regexp_contents = fn (parts: int) ->
                       else p_list_append (n3 (nt_dstr ()) first_b (pm_end x) 0 0 1) acc) in
           go (i + 1) (p_list_append head v))) in
   go 0 0;
-let tr_dregx = fn (n: int) -> fn (parts: int) ->
+let tr_dregx_of = fn (n: int) -> fn (c: int) ->
   let b = pm_start n in
   let e = pm_end n in
-  let c = tr_regexp_contents parts in
   let d = (if a_is c (nt_dstr ()) then c
            else if a_is c (nt_str ()) then p_str2dstr c
            else n3 (nt_dstr ()) b e (lit_str "" (src_enc ())) (p_new_list c b e) 1) in
@@ -782,8 +1145,152 @@ let tr_dregx = fn (n: int) -> fn (parts: int) ->
           each (a_f cell 1)) in
   let _ = each (a_f d 1) in
   if pm_has n (pm_f_regular_expression_once ()) then n1 (nt_once ()) b e d else d;
+let tr_dregx = fn (n: int) -> fn (parts: int) -> tr_dregx_of n (tr_regexp_contents parts);
+// (where parse.y's lexer ends a regexp's text token although nothing is
+//  interpolated: before a `#` that a `@` or `$` follows -- tokadd_string
+//  stops there for parser_peek_variable_name, which finds no variable name
+//  (Prism would have made one an interpolation), and the text from that `#`
+//  is the next token. Not at the text's start, where no token has begun;
+//  not after a `\`. The offsets of those `#`s, in order.)
+let regx_splits = fn (cs: int) -> fn (ce: int) ->
+  let rec go = fn (i: int) ->
+    if i + 1 >= ce then (Nil : int list)
+    else (let c = pm_byte i in
+          // (a control or meta escape is read whole, its operand -- a `#`
+          //  too -- with it: read_escape)
+          if c == 92 then
+            (let d = pm_byte (i + 1) in
+             if d == 99 || d == 67 || d == 77 then
+               (let (v, n) = rx_read_escape (i + 1) ce false false in if v < 0 then go (i + 2) else go n)
+             else go (i + 2))
+          else if c == 35 && i > cs && (pm_byte (i + 1) == 64 || pm_byte (i + 1) == 36) then Cons (i, go (i + 1))
+          else go (i + 1)) in
+  go cs;
+// (a regexp text token's bytes as parse.y's tokadd_string leaves them: a
+//  `\` and the line end after it go; an escaped closing delimiter is the
+//  delimiter, unless it means something to the regexp (simple_re_meta); a
+//  `\` before a non-ASCII byte goes; `\cX`, `\C-X`, `\M-X` are written
+//  as the byte they mean, `\xHH`; every other escape stays as written)
+// (parse.y's read_escape, from the byte after the `\` at `i`, below the
+//  `\M-` (`meta`) and `\C-` / `\c` (`ctl`) already read: the byte and
+//  where the escape ends, or -1 when ruby refuses it. A control or meta
+//  escape's operand is a whole escape again -- `\c\n`, `\M-\x41` -- or a
+//  byte; `\c?` alone is DEL)
+let rec rx_read_escape = fn (i: int) -> fn (e: int) -> fn (meta: bool) -> fn (ctl: bool) ->
+  let oct = fn (k: int) -> k < e && pm_byte k >= 48 && pm_byte k <= 55 in
+  let hex = fn (k: int) ->
+    (let c = pm_byte k in
+     if k >= e then 0 - 1 else if c >= 48 && c <= 57 then c - 48
+     else if c >= 97 && c <= 102 then c - 87 else if c >= 65 && c <= 70 then c - 55 else 0 - 1) in
+  let operand = fn (j: int) -> fn (m: bool) -> fn (k: bool) -> fn (q: bool) ->
+    // (what a control or meta escape works on, before its mask, under the
+    //  prefixes `m` and `k` now read; with `q`, a control escape's, a bare
+    //  `?` is -2)
+    (if j >= e then (0 - 1, j)
+     else if pm_byte j == 92 then
+       (if j + 1 < e && pm_byte (j + 1) == 117 then (0 - 1, j) else rx_read_escape (j + 1) e m k)
+     else if pm_byte j >= 128 then (0 - 1, j)
+     else if q && pm_byte j == 63 then (0 - 2, j + 1)
+     else (pm_byte j, j + 1)) in
+  let ctl_of = fn (v: int) -> fn (n: int) ->
+    (if v == 0 - 2 then (127, n) else if v < 0 then (0 - 1, i) else (bit_and v 159, n)) in
+  if i >= e then (0 - 1, i)
+  else
+    (let c = pm_byte i in
+     if c == 77 then
+       (if meta || pm_byte (i + 1) != 45 then (0 - 1, i)
+        else (let (v, n) = operand (i + 2) true ctl false in
+              if v < 0 then (0 - 1, i) else (bit_or (bit_and v 255) 128, n)))
+     else if c == 67 then
+       (if ctl || pm_byte (i + 1) != 45 then (0 - 1, i)
+        else (let (v, n) = operand (i + 2) meta true true in ctl_of v n))
+     else if c == 99 then
+       (if ctl then (0 - 1, i) else (let (v, n) = operand (i + 1) meta true true in ctl_of v n))
+     else if c == 110 then (10, i + 1) else if c == 116 then (9, i + 1)
+     else if c == 114 then (13, i + 1) else if c == 102 then (12, i + 1)
+     else if c == 118 then (11, i + 1) else if c == 97 then (7, i + 1)
+     else if c == 101 then (27, i + 1) else if c == 98 then (8, i + 1)
+     else if c == 115 then (32, i + 1)
+     else if oct i then
+       (let k2 = (if oct (i + 1) then (if oct (i + 2) then i + 3 else i + 2) else i + 1) in
+        let rec ov = fn (k: int) -> fn (acc: int) -> (if k >= k2 then acc else ov (k + 1) (acc * 8 + pm_byte k - 48)) in
+        (bit_and (ov i 0) 255, k2))
+     else if c == 120 then
+       (let h1 = hex (i + 1) in
+        if h1 < 0 then (0 - 1, i)
+        else (let h2 = hex (i + 2) in if h2 < 0 then (h1, i + 2) else (h1 * 16 + h2, i + 3)))
+     else if c >= 128 then (0 - 1, i)
+     else (c, i + 1));
+let rx_ctl_escape = fn (i: int) -> fn (e: int) -> rx_read_escape i e false false;
+let rx_token_text = fn (b: int) -> fn (e: int) -> fn (term: int) ->
+  let meta = fn (c: int) -> c == 36 || c == 42 || c == 43 || c == 46 || c == 63 || c == 94 || c == 124
+                            || c == 41 || c == 93 || c == 125 || c == 62 in
+  let rec go = fn (i: int) -> fn (from: int) -> fn (acc: str) ->
+    if i >= e then acc ++ pm_text from e
+    else if pm_byte i == 92 && i + 1 < e then
+      (let c = pm_byte (i + 1) in
+       if c == 10 then go (i + 2) (i + 2) (acc ++ pm_text from i)
+       else if c == 13 && i + 2 < e && pm_byte (i + 2) == 10 then go (i + 3) (i + 3) (acc ++ pm_text from i)
+       else if (c == term && nott (meta c)) || c >= 128 then go (i + 2) (i + 1) (acc ++ pm_text from i)
+       else if c == 99 || c == 67 || c == 77 then
+         (let (v, n) = rx_ctl_escape (i + 1) e in
+          if v < 0 then go (i + 2) from acc
+          else
+            (let hx = "0123456789ABCDEF" in
+             go n n (acc ++ pm_text from i ++ "\\x" ++ char_at hx (v / 16) ++ char_at hx (v % 16))))
+       else go (i + 2) from acc)
+    else go (i + 1) from acc in
+  go b b "";
+// (those tokens are regexp_contents' pieces, folded as with interpolation;
+//  `term`, the closing delimiter)
+let regx_split_contents = fn (cs: int) -> fn (ce: int) -> fn (sp: int list) -> fn (term: int) ->
+  let piece = fn (b: int) -> fn (e: int) ->
+    (let ls = ast_line_start e in
+     n1 (nt_str ()) (if ls > b then ls else b) e (lit_str (rx_token_text b e term) (src_enc ()))) in
+  let rec go = fn (b: int) -> fn (xs: int list) -> fn (acc: int) ->
+    (match xs with
+     | Nil -> regx_fold acc (piece b ce) cs
+     | Cons (k, t) -> go k t (regx_fold acc (piece b k) cs)) in
+  go cs sp 0;
+let tr_regular_expression = fn (n: int) ->
+  let cs = pm_regular_expression_content_loc_s n in
+  let ce = pm_regular_expression_content_loc_e n in
+  let sp = (if cs >= 0 then regx_splits cs ce else Nil) in
+  match sp with
+  | Nil ->
+    tr_regx (nt_regx ()) n (vec_get pm_st (pm_regular_expression_unescaped n))
+      (pm_regular_expression_opening_loc_s n) (pm_regular_expression_opening_loc_e n)
+      (pm_regular_expression_closing_loc_s n) (pm_regular_expression_closing_loc_e n)
+  | _ -> tr_dregx_of n (regx_split_contents cs ce sp (pm_byte (pm_regular_expression_closing_loc_s n)));
+// (a regexp literal that is a condition: cond0 makes the REGX a MATCH --
+//  and a DREGX, the text split as tr_regular_expression says, a MATCH2 with $_)
+let tr_match_last_line = fn (n: int) ->
+  let cs = pm_match_last_line_content_loc_s n in
+  let ce = pm_match_last_line_content_loc_e n in
+  let sp = (if cs >= 0 then regx_splits cs ce else Nil) in
+  match sp with
+  | Nil ->
+    tr_regx (nt_match ()) n (vec_get pm_st (pm_match_last_line_unescaped n))
+      (pm_match_last_line_opening_loc_s n) (pm_match_last_line_opening_loc_e n)
+      (pm_match_last_line_closing_loc_s n) (pm_match_last_line_closing_loc_e n)
+  | _ ->
+    (let d = tr_dregx_of n (regx_split_contents cs ce sp (pm_byte (pm_match_last_line_closing_loc_s n))) in
+     let b = cl_b (pm_start n) in
+     let e = cl_e (pm_end n) in
+     let g = n1 (nt_gvar ()) b e (id_of "$_") in
+     n3 (nt_match2 ()) b e d g 0);
+
+// (the parts all text: one token to parse.y -- see parts_all_text -- and a REGX)
+let text_of_parts = fn (ps: int) ->
+  let rec go = fn (i: int) -> if i >= pm_ls_len ps then "" else vec_get pm_st (pm_string_unescaped (pm_ls_at ps i)) ++ go (i + 1) in
+  go 0;
 let tr_interpolated_regular_expression = fn (n: int) ->
-  tr_dregx n (pm_interpolated_regular_expression_parts n);
+  let ps = pm_interpolated_regular_expression_parts n in
+  if parts_all_text ps then
+    tr_regx (nt_regx ()) n (text_of_parts ps)
+      (pm_interpolated_regular_expression_opening_loc_s n) (pm_interpolated_regular_expression_opening_loc_e n)
+      (pm_interpolated_regular_expression_closing_loc_s n) (pm_interpolated_regular_expression_closing_loc_e n)
+  else tr_dregx n ps;
 // (an interpolated regexp that is a condition: cond0's NEW_MATCH2(node, $_))
 let tr_interpolated_match_last_line = fn (n: int) ->
   let d = tr_dregx n (pm_interpolated_match_last_line_parts n) in
@@ -796,11 +1303,14 @@ let tr_interpolated_match_last_line = fn (n: int) ->
 // gettable: inside a block every local variable is a DVAR (dvar_defined
 // walks out to the method's own table), outside one an LVAR
 let tr_local_variable_read = fn (n: int) ->
-  n1 (if sc_is_block 0 then nt_dvar () else nt_lvar ())
-     (pm_start n) (pm_end n) (id_c (pm_local_variable_read_name n));
+  let c = pm_local_variable_read_name n in
+  if vec_get as_gh 0 == 2 && gh_vcall (pm_local_variable_read_depth n) c (pm_start n)
+  then n1 (nt_vcall ()) (pm_start n) (pm_end n) (id_c c)
+  else n1 (if sc_is_block 0 then nt_dvar () else nt_lvar ()) (pm_start n) (pm_end n) (id_c c);
 // (`it`: the block's one implicit parameter, whose name in the table is "<it>")
 let tr_it_local_variable_read = fn (n: int) -> n1 (nt_dvar ()) (pm_start n) (pm_end n) (id_of "<it>");
 let tr_local_variable_target = fn (n: int) ->
+  let _ = gh_target n in
   n2 (asgn_type 0) (pm_start n) (pm_end n) (id_c (pm_local_variable_target_name n)) 0;
 let tr_instance_variable_read = fn (n: int) ->
   n1 (nt_ivar ()) (pm_start n) (pm_end n) (id_c (pm_instance_variable_read_name n));
@@ -825,6 +1335,8 @@ let tr_constant_path = fn (n: int) ->
 // assignable: DASGN inside a block, LASGN outside one
 let asgn_type = fn (depth: int) -> if sc_is_block 0 then nt_dasgn () else nt_lasgn ();
 let tr_local_variable_write = fn (n: int) ->
+  // (assignable comes before the value: in `y = y` the value is the variable)
+  let _ = gh_assign (pm_local_variable_write_depth n) (pm_local_variable_write_name n) (pm_start n) in
   let v = tr (pm_local_variable_write_value n) in
   n2 (asgn_type (pm_local_variable_write_depth n)) (pm_start n) (pm_end n) (id_c (pm_local_variable_write_name n)) v;
 let tr_instance_variable_write = fn (n: int) ->
@@ -1108,18 +1620,23 @@ let tr_block_scope = fn (blk: int) ->
              let _ = nm 1 in
              a)
           else (let _ = a_set a 0 1 in let _ = nm_push (k_sym "<it>") in a))) in
+    let _ = gh_block_locals pn in
     // (where an empty body's BEGIN is: after `|...|`, else after the opener)
     let empty_at = (if pm_is pn (pm_t_block_parameters ()) then pm_end pn else oe) in
     let bodyn = pm_block_body blk in
+    // (an `end` closes a do block by its indent against the line it opens on)
+    let dE = (if pm_byte os == 100 then de_open bodyn (skip_blank (ast_line_start os)) else (0 - 1, 0 - 2, 0 - 1, 0 - 1)) in
     let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt bodyn empty_at
                 else tr_compstmt bodyn empty_at) in
+    let (ce, _, _) = de_close bodyn dE (pm_block_closing_loc_s blk) ce ce in
     let tbl = scope_tbl (pm_block_locals blk) (nm_take nbase) in
     let _ = sc_pop () in
     n3 (nt_scope ()) os ce tbl args body);
 // method_add_block: the ITER of a call and its block. ITER: iter, body
 let tr_iter = fn (call: int) -> fn (blk: int) -> fn (b: int) -> fn (e: int) ->
   let scope = tr_block_scope blk in
-  n2 (nt_iter ()) b e call scope;
+  // (...and the call with it ends there too)
+  n2 (nt_iter ()) b (if a_end scope != pm_block_closing_loc_e blk then a_end scope else e) call scope;
 
 // ---- calls ---------------------------------------------------------------------
 let is_binop = fn (s: str) ->
@@ -1236,7 +1753,13 @@ let tr_call = fn (n: int) ->
                          && pm_call_arguments recv != 0 && pm_call_opening_loc_s recv < 0 in
      // (primary_value call_op operation2 command_args cmd_brace_block: the same)
      let cmd_brace = recv != 0 && argsn != 0 && ce < 0 && pm_byte (pm_block_opening_loc_s blk) == 123 in
-     let core = tr_call_core n (if on_block_call || cmd_brace then pm_end n else en) in
+     // (primary_value tCOLON2 tCONSTANT brace_block -- `Foo::Bar { }`,
+     //  ruby bug #18878 -- the same)
+     let ms = pm_call_message_loc_s n in
+     let cop = pm_call_call_operator_loc_s n in
+     let colon_const = recv != 0 && argsn == 0 && ce < 0 && cop >= 0 && pm_byte cop == 58 && pm_byte (cop + 1) == 58
+                       && ms >= 0 && pm_byte ms >= 65 && pm_byte ms <= 90 && pm_byte (pm_block_opening_loc_s blk) == 123 in
+     let core = tr_call_core n (if on_block_call || cmd_brace || colon_const then pm_end n else en) in
      tr_iter core blk (pm_start n) (pm_end n))
   else tr_call_core n (pm_end n);
 
@@ -1253,6 +1776,7 @@ let tr_def = fn (n: int) ->
                 else if pm_is rn (pm_t_parentheses ()) then tr_stmts_of (pm_parentheses_body rn)
                 else tr rn) in
     let _ = sc_push 0 in
+    let dE = de_open (pm_def_body n) (pm_def_def_keyword_loc_s n) in
     let pn = pm_def_parameters n in
     let lp = pm_def_lparen_loc_s n in
     let ne = pm_def_name_loc_e n in
@@ -1275,11 +1799,13 @@ let tr_def = fn (n: int) ->
                 else semi_after_term (if pn != 0 then pm_end pn else ne)) in
     // (where an empty body is: after `)`, or after the term f_arglist takes)
     let body_at = (if re >= 0 then re else skip_term (if pn != 0 then pm_end pn else ne)) in
+    let _ = rv_mark bodyn in
     let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt_lead bodyn lead body_at
                 else if lead then tr_compstmt_lead bodyn true body_at
                 else if bodyn == 0 then 0
                 else tr_stmt_list (pm_statements_body bodyn)) in
     let body = p_scope_body body in
+    let (e, _, _) = de_close (pm_def_body n) dE (pm_def_end_keyword_loc_s n) (pm_def_end_keyword_loc_e n) e in
     let tbl = scope_tbl (pm_def_locals n) (nm_take nbase) in
     let _ = sc_pop () in
     let scope = n3 (nt_scope ()) b e tbl args body in
@@ -1336,6 +1862,38 @@ let dummy_end_cut = fn (bodyn: int) -> fn (ks: int) ->
 let dummy_end_rest = fn (bodyn: int) -> fn (de: int) ->
   if de < 0 then ()
   else (let _ = vec_set as_px 1 (pm_statements_body bodyn) in vec_set as_px 2 (de + 1));
+// (the same for a def, a block, an if or unless without else, a while or
+//  until -- whose `end` closes them by its indent as a class's does: before
+//  the body, the cut and as_px 9 (answers the cut's index, and as_px 9, 7
+//  and 8 to put back; -2 for 9 when the program parsed and nothing was
+//  touched)...)
+let de_open = fn (bodyn: int) -> fn (ks: int) ->
+  if vec_get pm_hd 6 < 0 || vec_len pm_er == 0 then (0 - 1, 0 - 2, 0 - 1, 0 - 1)
+  else
+    (let de = dummy_end_cut bodyn ks in
+     let o7 = vec_get as_px 7 in
+     let o8 = vec_get as_px 8 in
+     let _ = vec_set as_px 7 (0 - 1) in
+     let own9 = vec_get as_px 9 in
+     let _ = vec_set as_px 9 (if bodyn != 0 && pm_is bodyn (pm_t_statements ()) then pm_statements_body bodyn else 0 - 1) in
+     (de, own9, o7, o8));
+// (...and after it: where the construct ends and its `end` keyword is,
+//  given its own `end` (s, e) and end `ne`)
+let de_close = fn (bodyn: int) -> fn (o: int * int * int * int) -> fn (eks: int) -> fn (eke: int) -> fn (ne: int) ->
+  let (de, own9, o7, o8) = o in
+  if own9 == 0 - 2 then (ne, eks, eke)
+  else
+  let _ = vec_set as_px 9 own9 in
+  let _ = dummy_end_rest bodyn de in
+  let hs = vec_get as_px 7 in
+  let he = vec_get as_px 8 in
+  let dx = (if de < 0 then 0 else pm_ls_at (pm_statements_body bodyn) de) in
+  let e = (if de >= 0 then pm_call_message_loc_e dx else if hs >= 0 then he else ne) in
+  let ends = (if de >= 0 then pm_call_message_loc_s dx else if hs >= 0 then hs else eks) in
+  let ende = (if de >= 0 then pm_call_message_loc_e dx else if hs >= 0 then he else eke) in
+  let _ = (if de >= 0 || hs >= 0 then (let _ = vec_set as_px 7 eks in vec_set as_px 8 eke)
+           else (let _ = vec_set as_px 7 o7 in vec_set as_px 8 o8)) in
+  (e, ends, ende);
 // cpath: cname -> NEW_COLON2(0, cname); the scoped forms as they are
 let tr_cpath = fn (c: int) ->
   if pm_is c (pm_t_constant_read ()) then
@@ -1361,6 +1919,7 @@ let tr_class = fn (n: int) ->
   //  (...and with one, a `;` after the term `superclass` took is)
   let lead = (if sup == 0 then term_ahead (pm_end cp) else semi_after_term (pm_end (pm_class_superclass n))) in
   let lead_at = (if sup == 0 then pm_end cp else skip_term (pm_end (pm_class_superclass n))) in
+  let _ = rv_mark bodyn in
   let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt_lead bodyn lead lead_at
               else tr_compstmt_lead bodyn lead lead_at) in
   let _ = vec_set as_px 9 own9 in
@@ -1388,19 +1947,26 @@ let tr_class = fn (n: int) ->
 // newline included, and looks at the next line; comment lines after it are
 // read the same way, so the token is the column past the newline on the
 // LAST of those lines. When the program ends there, no newline token is
-// placed and the last comment's own start is what the grammar sees.
+// placed and the last comment's own start is what the grammar sees -- but
+// when the line after it holds only blanks and the program ends on it with
+// no newline, the token is that line's start.
+//   When the lines after it are the bodies of heredocs the line opened, the
+// lexer reads them first: the program ending after them is the program
+// ending there, and otherwise the token is on the last of their lines, in
+// the column past the comment line's newline.
 let rec nl_after_comment = fn (i: int) ->
   let k = ast_line_end_from i in
-  if pm_byte k < 0 || pm_byte (k + 1) < 0 then i
+  let k1 = (if pm_byte k < 0 then k + 1 else hd_skip (k + 1)) in
+  if pm_byte k < 0 || pm_byte k1 < 0 then i
+  else if k1 != k + 1 then
+    (let j = skip_blank k1 in
+     if pm_byte j == 35 then nl_after_comment j
+     else pos_lc (ao_line_of (k1 - 1)) (k - vec_get pm_lo (ao_line_of k) + 1))
   else
     (let j = skip_blank (k + 1) in
      if pm_byte j == 35 then nl_after_comment j
+     else if pm_byte j < 0 then k + 1
      else pos_lc (ao_line_of k) (k - vec_get pm_lo (ao_line_of k) + 1));
-// (the offset of the newline that ends the line `i` is on; the program's
-//  length when there is none)
-let rec ast_line_end_from = fn (i: int) ->
-  let c = pm_byte i in
-  if c < 0 || c == 10 then i else ast_line_end_from (i + 1);
 // (the end of the `term` that starts at or after `i`: past a `;`, or at the
 //  line end a newline token is)
 let rec skip_term = fn (i: int) ->
@@ -1431,6 +1997,7 @@ let tr_module = fn (n: int) ->
   let own9 = vec_get as_px 9 in
   let _ = vec_set as_px 9 (if vec_get pm_hd 6 >= 0 && vec_len pm_er > 0 && bodyn != 0 && pm_is bodyn (pm_t_statements ())
                            then pm_statements_body bodyn else 0 - 1) in
+  let _ = rv_mark bodyn in
   let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt_lead bodyn (term_ahead (pm_end cp)) (pm_end cp)
               else tr_compstmt_lead bodyn (term_ahead (pm_end cp)) (pm_end cp)) in
   let _ = vec_set as_px 9 own9 in
@@ -1461,6 +2028,7 @@ let tr_singleton_class = fn (n: int) ->
   let _ = sc_push 0 in
   let bodyn = pm_singleton_class_body n in
   let at = skip_term (pm_end ex) in
+  let _ = rv_mark bodyn in
   let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt bodyn at else tr_compstmt bodyn at) in
   let tbl = scope_tbl (pm_singleton_class_locals n) Nil in
   let _ = sc_pop () in
@@ -1488,6 +2056,7 @@ let then_end = fn (after: int) -> fn (kw_e: int) ->
 let tr_target = fn (t: int) -> fn (value: int) -> fn (b: int) -> fn (e: int) ->
   let ty = pm_type t in
   if ty == pm_t_local_variable_target () then
+    let _ = gh_target t in
     n2 (asgn_type 0) b e (id_c (pm_local_variable_target_name t)) value
   else if ty == pm_t_instance_variable_target () then
     n2 (nt_iasgn ()) b e (id_c (pm_instance_variable_target_name t)) value
@@ -1566,11 +2135,18 @@ let stmts_end = fn (sn: int) -> fn (dflt: int) ->
   else if dflt < 1099511627776 then skip_semis dflt
   else dflt;
 let stmts_end_of = fn (sn: int) -> fn (dflt: int) ->
-  if sn == 0 || pm_ls_len (pm_statements_body sn) == 0 then dflt else skip_terms (pm_end sn);
+  if sn == 0 || pm_ls_len (pm_statements_body sn) == 0 then dflt
+  else
+    (let t = skip_terms (pm_end sn) in
+     // (the last statement a percent literal closed by a line end, and a
+     //  line end after it: the term is read, and the end is past it -- the
+     //  next line's start, which ao_nl_end would put back on the literal's)
+     if t == pm_end sn && pm_byte t == 10 && ao_nl_end t != t then pos_lc (ao_line_of t) (t - vec_get pm_lo (ao_line_of t))
+     else t);
 // (past the terms after offset `i`, where a statement ends: a `;` or the
 //  line end, then every `;` after it -- once a term is read the lexer is at
 //  the start of an expression, where line ends and comments are skipped)
-let skip_terms = fn (i: int) ->
+let rec skip_terms = fn (i: int) ->
   let j = skip_blank i in
   let c = pm_byte j in
   if c == 59 then skip_semis (j + 1)
@@ -1579,6 +2155,16 @@ let skip_terms = fn (i: int) ->
                         let k = ast_line_end_from j in
                         let t = skip_semis k in
                         if t == k then p0 else t)
+  // (a `\` before the line end continues the line: the lexer reads past it,
+  //  and past the bodies of heredocs the line opened, and the term is what
+  //  comes after them -- none when the program ends there)
+  else if c == 92 && (pm_byte (j + 1) == 10 || (pm_byte (j + 1) == 13 && pm_byte (j + 2) == 10)) then
+    (let k1 = hd_skip (if pm_byte (j + 1) == 10 then j + 2 else j + 3) in
+     let j2 = skip_blank k1 in
+     let c2 = pm_byte j2 in
+     if c2 == 13 && pm_byte (j2 + 1) == 10 then j2
+     else if c2 == 10 || c2 == 59 || c2 == 35 || c2 == 92 then skip_terms k1
+     else i)
   else i;
 // (past every `;` from offset `i` on, with blanks, line ends and comments
 //  between; `i` itself when there is none)
@@ -1615,6 +2201,7 @@ let tr_bodystmt = fn (bn: int) -> fn (empty_at: int) -> tr_bodystmt_lead bn fals
 // k_begin bodystmt k_end -> NEW_BEGIN($3)
 let tr_begin = fn (n: int) ->
   let ke = pm_begin_begin_keyword_loc_e n in
+  let _ = rv_mark n in
   let body = tr_bodystmt_lead n (pm_byte (skip_blank ke) == 59) ke in
   n1 (nt_begin ()) (pm_start n) (pm_end n) body;
 // stmt modifier_rescue stmt / arg modifier_rescue arg (rescued_expr)
@@ -1675,7 +2262,10 @@ let rec tr_if_node = fn (n: int) -> fn (b: int) -> fn (e: int) -> fn (elsif: boo
      let c = tr_cond_after pred ke in
      let ts = then_start (cond_end pred c) ths in
      let te = then_end (cond_end pred c) the in
+     let dE = (if sub == 0 && nott elsif then de_open (pm_if_statements n) ks else (0 - 1, 0 - 2, 0 - 1, 0 - 1)) in
+     let _ = (if sub == 0 then rv_mark (pm_if_statements n) else ()) in
      let l = tr_compstmt (pm_if_statements n) te in
+     let (e, es, ee) = de_close (pm_if_statements n) dE es ee e in
      let r = (if sub == 0 then 0
               else if pm_is sub (pm_t_else ()) then tr_else_body sub
               // (an elsif runs to where the whole `if` ends its clauses)
@@ -1717,10 +2307,13 @@ let tr_unless = fn (n: int) ->
      let c = tr_cond_after pred ke in
      let ts = then_start (cond_end pred c) (pm_unless_then_keyword_loc_s n) in
      let te = then_end (cond_end pred c) (pm_unless_then_keyword_loc_e n) in
+     let noelse = pm_unless_else_clause n == 0 in
+     let dE = (if noelse then de_open (pm_unless_statements n) ks else (0 - 1, 0 - 2, 0 - 1, 0 - 1)) in
+     let _ = (if noelse then rv_mark (pm_unless_statements n) else ()) in
      let l = tr_compstmt (pm_unless_statements n) te in
      let r = tr_else_body (pm_unless_else_clause n) in
-     a_xloc (n3 (nt_unless ()) b e c l r)
-       [ks, ke, ts, te, pm_unless_end_keyword_loc_s n, pm_unless_end_keyword_loc_e n]);
+     let (e, es, ee) = de_close (pm_unless_statements n) dE (pm_unless_end_keyword_loc_s n) (pm_unless_end_keyword_loc_e n) e in
+     a_xloc (n3 (nt_unless ()) b e c l r) [ks, ke, ts, te, es, ee]);
 // k_while expr_value_do compstmt k_end | stmt modifier_while expr_value
 // WHILE, UNTIL: cond, body, state
 let tr_loop = fn (ty: int) -> fn (n: int) -> fn (ks: int) -> fn (ke: int) -> fn (cs: int) -> fn (ce: int) ->
@@ -1740,7 +2333,10 @@ let tr_loop = fn (ty: int) -> fn (n: int) -> fn (ks: int) -> fn (ke: int) -> fn 
      let c = tr_cond_after pred ke in
      // do: term | keyword_do_cond
      let de = (if dke >= 0 then dke else skip_term (cond_end pred c)) in
+     let dE = de_open sn ks in
+     let _ = rv_mark sn in
      let body = tr_compstmt sn de in
+     let (e, cs, ce) = de_close sn dE cs ce e in
      a_xloc (n3 ty b e c body 1) [ks, ke, cs, ce]);
 let tr_while = fn (n: int) ->
   tr_loop (nt_while ()) n (pm_while_keyword_loc_s n) (pm_while_keyword_loc_e n) (pm_while_closing_loc_s n)
@@ -1899,7 +2495,7 @@ let tr_mlhs = fn (lefts: int) -> fn (rest: int) -> fn (rights: int) -> fn (b: in
   let item = fn (x: int) ->
     (if pm_is x (pm_t_multi_target ()) then tr_mlhs_of x param
      else if pm_is x (pm_t_required_parameter ()) then
-       (let _ = () in n2 (asgn_type 0) (pm_start x) (pm_end x) (id_c (pm_required_parameter_name x)) 0)
+       (let _ = gh_parameter (pm_required_parameter_name x) in n2 (asgn_type 0) (pm_start x) (pm_end x) (id_c (pm_required_parameter_name x)) 0)
      else tr_target x 0 (pm_start x) (pm_end x)) in
   let rec items = fn (l: int) -> fn (i: int) -> fn (acc: int) ->
     if i >= pm_ls_len l then acc
@@ -1917,7 +2513,8 @@ let tr_mlhs = fn (lefts: int) -> fn (rest: int) -> fn (rights: int) -> fn (b: in
         if x == 0 then 0 - 1
         else if pm_is x (pm_t_required_parameter ()) then
           // f_rest_marg: tSTAR f_norm_arg, located with its star
-          n2 (asgn_type 0) (pm_start rest) (pm_end rest) (id_c (pm_required_parameter_name x)) 0
+          (let _ = gh_parameter (pm_required_parameter_name x) in
+           n2 (asgn_type 0) (pm_start rest) (pm_end rest) (id_c (pm_required_parameter_name x)) 0)
         else item x)) in
   let args = (if pm_ls_len rights == 0 then restn
               else n2 (nt_postarg ()) b e restn (items rights 0 0)) in
@@ -1979,13 +2576,16 @@ let tr_var_op = fn (n: int) -> fn (aty: int) -> fn (rty: int) -> fn (name: int) 
   p_op_assign lhs read op v (pm_start n) (pm_end n);
 let lvar_type = fn (u: unit) -> if sc_is_block 0 then nt_dvar () else nt_lvar ();
 let tr_local_variable_operator_write = fn (n: int) ->
+  let _ = gh_assign (pm_local_variable_operator_write_depth n) (pm_local_variable_operator_write_name n) (pm_start n) in
   tr_var_op n (asgn_type 0) (lvar_type ()) (pm_local_variable_operator_write_name n)
     (pm_local_variable_operator_write_name_loc_s n) (pm_local_variable_operator_write_name_loc_e n)
     (cname (pm_local_variable_operator_write_binary_operator n)) (pm_local_variable_operator_write_value n);
 let tr_local_variable_or_write = fn (n: int) ->
+  let _ = gh_assign (pm_local_variable_or_write_depth n) (pm_local_variable_or_write_name n) (pm_start n) in
   tr_var_op n (asgn_type 0) (lvar_type ()) (pm_local_variable_or_write_name n)
     (pm_local_variable_or_write_name_loc_s n) (pm_local_variable_or_write_name_loc_e n) "||" (pm_local_variable_or_write_value n);
 let tr_local_variable_and_write = fn (n: int) ->
+  let _ = gh_assign (pm_local_variable_and_write_depth n) (pm_local_variable_and_write_name n) (pm_start n) in
   tr_var_op n (asgn_type 0) (lvar_type ()) (pm_local_variable_and_write_name n)
     (pm_local_variable_and_write_name_loc_s n) (pm_local_variable_and_write_name_loc_e n) "&&" (pm_local_variable_and_write_value n);
 let tr_instance_variable_operator_write = fn (n: int) ->
@@ -2131,7 +2731,9 @@ let tr_lambda = fn (n: int) ->
            let _ = nm 1 in
            a)
         else (let _ = a_set a 0 1 in let _ = nm_push (k_sym "<it>") in a))) in
+  let _ = gh_block_locals pn in
   let bodyn = pm_lambda_body n in
+  let _ = rv_mark bodyn in
   let body = (if pm_is bodyn (pm_t_begin ()) then tr_bodystmt bodyn ope else tr_compstmt bodyn ope) in
   let tbl = scope_tbl (pm_lambda_locals n) (nm_take nbase) in
   let _ = sc_pop () in
@@ -2189,6 +2791,7 @@ let tr_for = fn (n: int) ->
   let ix = pm_for_index n in
   let vs = pm_start ix in
   let ve = pm_end ix in
+  let _ = gh_targets ix in
   let iter = tr (pm_for_collection n) in
   let internal = n1 (nt_dvar ()) vs ve (id_internal ()) in
   let multi = pm_is ix (pm_t_multi_target ()) in
@@ -2242,7 +2845,7 @@ let tr_pat_list = fn (l: int) ->
 // p_rest: tSTAR tIDENTIFIER -> assignable (with its star) | tSTAR -> none
 let tr_pat_rest = fn (x: int) ->
   let t = pm_splat_expression x in
-  if t == 0 then 0 else n2 (asgn_type 0) (pm_start x) (pm_end x) (id_c (pm_local_variable_target_name t)) 0;
+  if t == 0 then 0 else (let _ = gh_target t in n2 (asgn_type 0) (pm_start x) (pm_end x) (id_c (pm_local_variable_target_name t)) 0);
 // (a pattern's constant, and where the pattern then starts)
 let tr_pat_const = fn (c: int) -> if c == 0 then 0 else tr c;
 // ARYPTN: pconst, pre_args, rest (-1: unnamed), post_args
@@ -2310,7 +2913,8 @@ let tr_hash_pattern = fn (n: int) ->
        let key = (if implicit then n1 (nt_sym ()) (pm_start a) (pm_end a) (id_of (vec_get pm_st (pm_symbol_unescaped kn)))
                   else tr kn) in
        let v = (if implicit then
-                  n2 (asgn_type 0) (pm_start a) (pm_end a) (id_c (pm_local_variable_target_name (pm_implicit_value vn))) 0
+                  (let _ = gh_target (pm_implicit_value vn) in
+                   n2 (asgn_type 0) (pm_start a) (pm_end a) (id_c (pm_local_variable_target_name (pm_implicit_value vn))) 0)
                 else tr_pat vn) in
        let pair = p_list_append (p_new_list key (pm_start a) (pm_end a)) v in
        pairs (i + 1) (if acc == 0 then pair else p_list_concat acc pair)) in
@@ -2319,7 +2923,7 @@ let tr_hash_pattern = fn (n: int) ->
   let restn = (if rest == 0 then 0
                else if pm_is rest (pm_t_no_keywords_parameter ()) then 0 - 1
                else (let t = pm_assoc_splat_value rest in
-                     if t == 0 then 0 else n2 (asgn_type 0) ib ie (id_c (pm_local_variable_target_name t)) 0)) in
+                     if t == 0 then 0 else (let _ = gh_target t in n2 (asgn_type 0) ib ie (id_c (pm_local_variable_target_name t)) 0))) in
   n3 (nt_hshptn ()) b e pconst hash restn;
 // p_alt: NEW_OR
 let tr_alternation_pattern = fn (n: int) ->
@@ -2402,12 +3006,26 @@ let tr_match_predicate = fn (n: int) ->
               [pm_match_predicate_operator_loc_s n, pm_match_predicate_operator_loc_e n, 0 - 1, 0 - 1, 0 - 1, 0 - 1] in
   a_xloc (n2 (nt_case3 ()) (pm_start n) (pm_end n) v inn) [0 - 1, 0 - 1, 0 - 1, 0 - 1];
 // match_op's named captures (reg_named_capture_assign): each name assigned
-// its own Symbol, the assignments a chain of BLOCKs under MATCH2's args
+// its own Symbol, the assignments a chain of BLOCKs under MATCH2's args --
+// unless parse.y split the regexp (a DREGX), when they are ghosts (as_gh)
 let tr_match_write = fn (n: int) ->
   let m = tr (pm_match_write_call n) in
   let b = pm_start n in
   let e = pm_end n in
   let l = pm_match_write_targets n in
+  let split = a_is m (nt_match2 ()) && a_is (a_f m 0) (nt_dregx ()) in
+  let rec each = fn (i: int) -> fn (kind: int) ->
+    if i >= pm_ls_len l then ()
+    else
+      (let t = pm_ls_at l i in
+       let d = pm_local_variable_target_depth t in
+       let c = pm_local_variable_target_name t in
+       let _ = (if kind == 1 then gh_add 1 (gh_serial d) c b else gh_assign d c b) in
+       each (i + 1) kind) in
+  if split then
+    (let _ = (if vec_get as_gh 0 < 2 then (let _ = vec_set as_gh 0 1 in each 0 1) else ()) in m)
+  else
+  let _ = each 0 2 in
   let rec go = fn (i: int) -> fn (first: int) -> fn (lastc: int) ->
     if i >= pm_ls_len l then first
     else
@@ -2544,7 +3162,8 @@ let tr_splat = fn (n: int) ->
 let tr_shareable_constant = fn (n: int) -> tr (pm_shareable_constant_write n);
 
 // The tree of the program pm_decode last decoded: its SCOPE.
-let ast_translate = fn (u: unit) ->
+let ast_translate_once = fn (u: unit) ->
+  let _ = vec_set as_gh 1 0 in
   let _ = ao_reset () in
   let _ = sc_reset () in
   let _ = nm_reset () in
@@ -2562,6 +3181,18 @@ let ast_translate = fn (u: unit) ->
   let _ = vec_push as_px 0 in
   let _ = vec_push as_px (0 - 1) in
   let _ = vec_push as_px 0 in
+  let _ = vec_push as_px (0 - 1) in
+  let _ = vec_push as_px (0 - 1) in
   let _ = lpa_set (0 - 1) in
   let _ = cl_set (0 - 1) (0 - 1) in
   tr (pm_root ());
+let ast_translate = fn (u: unit) ->
+  let _ = vec_recycle as_gh in
+  let _ = vec_push as_gh 0 in
+  let _ = vec_push as_gh 0 in
+  let h6 = vec_get pm_hd 6 in
+  let r = ast_translate_once () in
+  if vec_get as_gh 0 != 1 then r
+  else (let _ = vec_set as_gh 0 2 in
+        let _ = vec_set pm_hd 6 h6 in
+        ast_translate_once ());
