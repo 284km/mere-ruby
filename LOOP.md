@@ -7513,6 +7513,12 @@ The HTML host now returns its guest wrapper's declared -2/empty-string unavailab
 sentinels, preserving startup without claiming timestamp support. The native
 File/C API implementation is unchanged.
 
+Merging main on 2026-11-22 (after #91, #99, #103, #144 and #149): #91 carried
+this same GC work, so the code, glue, exclusion files, corpus 673/711 and this
+record are already on main byte for byte. Main's wording of the ledger (41 GC
+and compaction plus 16 ObjectSpace, 57 in all) and its run.sh are kept; #112
+adds only this note.
+
 
 ## 2026-11-18: consolidate the deferred GC/ObjectSpace stack
 
@@ -8925,6 +8931,33 @@ exclusions with identical identities and reasons on both sides. Allocation76
 stays enabled. The159-row intake remains14 MATCH/57 EXCLUDED/88 HANDOFF.
 Original tests, locks, accepted snapshots and all bounds are unchanged.
 Fresh hosted checks and the latest-main per-file comparison remain required.
+
+## 2026-11-22: stop cancelled workflows from starting new suite summaries
+
+Cancelled runs 44921266629 and 44922636658 still started their Unit,
+Bootstrap and Tool summary jobs. The jobs had no completed shard group to
+collect, so cancellation produced additional failing summary checks. Main's
+Tool summary already checks cancellation and the shard result; apply the same
+boundary to Unit and Bootstrap.
+
+Both jobs require a successful plan and an active workflow with a successful
+or failed shard group. Their collect steps also check cancellation, covering
+a workflow cancelled after the job starts. Genuine shard failures still run
+the existing collectors; missing and partial results still fail, and the
+existing artifact uploads continue to retain diagnostics. Test inventories,
+resource bounds, runners, measurement code and runtime implementation are
+unchanged. See the [GitHub status-check documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions).
+
+Validation: actionlint 1.7.12 accepts the workflow. Four existing collection
+controls pass: missing shards retain all planned rows and fail; unattempted
+files in partial artifacts remain visible; weighted plans still reject a
+missing shard; and a monitor failure preserves reference cases while failing
+collection. This does not mark previously cancelled or failed runs successful.
+
+Latest-main integration retains the merged stage9 documentation verbatim.
+The only conflict was the append position in this log; runtime and collector
+changes come unchanged from main. The same four collector controls and
+actionlint pass again on the integrated base.
 
 
 ## 2026-11-22: keep TracePoint events on their suspended callback
