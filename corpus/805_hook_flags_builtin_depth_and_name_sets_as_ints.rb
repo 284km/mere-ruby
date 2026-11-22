@@ -92,3 +92,17 @@ sub = Class.new(c2)
 p sub.k
 c2.singleton_class.class_eval { remove_method :k }
 p((sub.k rescue $!.class))
+
+# `def C.m` on a constant that holds an anonymous class or Struct: the method
+# goes to the singleton of the class the constant holds (review of #162)
+AnonK = Class.new
+def AnonK.g = 1
+p AnonK.g, AnonK.singleton_methods
+AnonS = Struct.new(:a)
+def AnonS.h = 2
+p AnonS.h, AnonS.singleton_methods.include?(:h)
+StrAlias = String
+def StrAlias.zz = :zz
+p String.zz
+SubK = Class.new(AnonK)
+p SubK.g

@@ -11027,6 +11027,8 @@ maxRSS moved with the order test/unit picks. With `--seed=42` on the subset: mai
   - `def fz.x` on a frozen String succeeds; ruby raises FrozenError.
   - `s.clone(freeze: true)` is not frozen.
   - `o.singleton_method_added`, once defined, does not fire for its own name (ruby reports `[:singleton_method_added, :y]`; mere-ruby `[:y]`).
+- The re-review of #162 found one more: `A = Class.new; def A.g = 1; A.g` was a NoMethodError in the evaluator, and so was the same for a Struct. `def C.m` on a constant holding a class keyed the method under the constant's spelling, "(sng:A)", while A's class is AnonClass_N. Named classes never showed it, because their name is their constant's. This was a one-line fix, so it is fixed here: the key now uses the name of the class the constant holds, so `StrAlias = String; def StrAlias.zz` lands on String too. corpus/805 covers it; main fails those lines. test_class, test_struct, test_module, test_object and test_method give the same results as main.
+- Seen while writing that: a Struct class's singleton_methods lacks :inspect, which ruby lists (main too).
 
 ## 2026-11-22 (93): test_ast's time, round two -- a key made per call, and one stack walked twice per collection
 
