@@ -35,6 +35,13 @@ echo "built $here/mere-ruby.wasm ($(wc -c < "$here/mere-ruby.wasm" | tr -d ' ') 
 # from the value, because the host answers NaN for both "nan" and "not a float".)
 node "$here/smoke.mjs" --check-imports
 
+# Browsers have no process CPU clock. Its startup import must be callable,
+# ABI-correct, and leave the interpreter able to reject profiling explicitly.
+cpu_probe='begin; GC::Profiler.enable; puts :unexpected_cpu_clock; rescue NotImplementedError; puts :cpu_unavailable; end'
+if [ "$(node --stack-size=8000 "$here/smoke.mjs" "$cpu_probe")" != "cpu_unavailable" ]; then
+  echo 'the playground did not reject the unavailable CPU clock'; exit 1
+fi
+
 # ... and the page has to AGREE with the native build, not merely run. smoke.mjs
 # drives this .wasm with index.html's own host code; a bigger JS stack than
 # node's default is the browser-side equivalent of -Wl,-stack_size (PAIN.md §M9).
