@@ -191,10 +191,28 @@ static int is_newline(const OnigUChar *p, const OnigUChar *e, OnigEncoding enc) 
     if (p >= e) return 0;
     return to_code(p, e, enc) == 0x0a;
 }
-/* (the ASCII range only: what a character past it is, is the interpreter's to say) */
+/* A character past ASCII is the interpreter's to say: the character, in
+ * Unicode, against the POSIX class -- the tables CRuby's encodings carry for
+ * their upper halves are Unicode's for the characters they map to. One that
+ * has no Unicode form is in no class. */
+static int is_ctype_beyond_ascii(OnigCodePoint c, OnigCtype ctype, OnigEncoding enc) {
+    const char *cls = NULL;
+    switch (ctype) {
+      case ONIGENC_CTYPE_ALPHA: cls = "alpha"; break;   case ONIGENC_CTYPE_BLANK: cls = "blank"; break;
+      case ONIGENC_CTYPE_CNTRL: cls = "cntrl"; break;   case ONIGENC_CTYPE_DIGIT: cls = "digit"; break;
+      case ONIGENC_CTYPE_GRAPH: cls = "graph"; break;   case ONIGENC_CTYPE_LOWER: cls = "lower"; break;
+      case ONIGENC_CTYPE_PRINT: cls = "print"; break;   case ONIGENC_CTYPE_PUNCT: cls = "punct"; break;
+      case ONIGENC_CTYPE_SPACE: cls = "space"; break;   case ONIGENC_CTYPE_UPPER: cls = "upper"; break;
+      case ONIGENC_CTYPE_XDIGIT: cls = "xdigit"; break; case ONIGENC_CTYPE_WORD: cls = "word"; break;
+      case ONIGENC_CTYPE_ALNUM: cls = "alnum"; break;
+      default: return 0;   /* NEWLINE, ASCII */
+    }
+    VALUE ask = mr_ruby("->(c, e, k) { s = (c.chr(Encoding.find(e)).encode(Encoding::UTF_8) rescue nil); "
+                        "!!(s && s.match?(Regexp.new('\\A[[:' + k + ':]]\\z'))) }");
+    return RTEST(mr_call(ask, "call", 3, UINT2NUM(c), rb_str_new_cstr((const char *)enc->name), rb_str_new_cstr(cls)));
+}
 static int is_ctype(OnigCodePoint c, OnigCtype ctype, OnigEncoding enc) {
-    (void)enc;
-    if (c >= 0x80) return 0;
+    if (c >= 0x80) return is_ctype_beyond_ascii(c, ctype, enc);
     switch (ctype) {
       case ONIGENC_CTYPE_NEWLINE: return c == '\n';
       case ONIGENC_CTYPE_ALPHA: return (c | 0x20) >= 'a' && (c | 0x20) <= 'z';
@@ -245,7 +263,32 @@ static OnigUChar *char_head(const OnigUChar *start, const OnigUChar *p, const On
       }
     }
 }
-static int unsupported_fold(OnigCaseFoldType f, const OnigUChar **pp, const OnigUChar *e, OnigUChar *to, OnigEncoding enc) { (void)f; (void)pp; (void)e; (void)to; no_rules(enc); }
+/* ONIGENC_MBC_CASE_FOLD: one character folded, *pp past it, the folded
+ * bytes' length. ASCII in an ASCII-compatible encoding is its lower case;
+ * anything else is the interpreter's String#downcase(:fold) -- Unicode's
+ * case folding -- in the character's own encoding. */
+static int fold_one(OnigCaseFoldType f, const OnigUChar **pp, const OnigUChar *e, OnigUChar *to, OnigEncoding enc) {
+    (void)f;
+    const OnigUChar *p = *pp;
+    if (p >= e) return 0;
+    enum family fam = family_of(enc);
+    int ascii_compat = fam != F_UTF16BE && fam != F_UTF16LE && fam != F_UTF32BE && fam != F_UTF32LE;
+    if (ascii_compat && *p < 0x80) {
+        *to = (OnigUChar)((*p >= 'A' && *p <= 'Z') ? *p + 32 : *p);
+        *pp = p + 1;
+        return 1;
+    }
+    int r = precise_len(p, e, enc);
+    int n = r > 0 ? r : 1;
+    if (p + n > e) n = (int)(e - p);
+    VALUE ch = rb_enc_str_new((const char *)p, n, (rb_encoding *)enc);
+    VALUE folded = mr_call(mr_ruby("->(s) { (s.downcase(:fold) rescue s) }"), "call", 1, ch);
+    long len = RSTRING_LEN(folded);
+    if (len > ONIGENC_GET_CASE_FOLD_CODES_MAX_NUM) len = ONIGENC_GET_CASE_FOLD_CODES_MAX_NUM;
+    memcpy(to, RSTRING_PTR(folded), (size_t)len);
+    *pp = p + n;
+    return (int)len;
+}
 static int unsupported_all_fold(OnigCaseFoldType f, OnigApplyAllCaseFoldFunc fn, void *arg, OnigEncoding enc) { (void)f; (void)fn; (void)arg; no_rules(enc); }
 static int unsupported_fold_codes(OnigCaseFoldType f, const OnigUChar *p, const OnigUChar *e, OnigCaseFoldCodeItem acs[], OnigEncoding enc) { (void)f; (void)p; (void)e; (void)acs; no_rules(enc); }
 static int unsupported_property(OnigEncoding enc, const OnigUChar *p, const OnigUChar *e) { (void)p; (void)e; no_rules(enc); }
@@ -271,7 +314,7 @@ static int add(const char *name, int min, int max, enum family family, int dummy
     e->type.mbc_to_code = to_code;
     e->type.code_to_mbclen = code_len;
     e->type.code_to_mbc = code_to_bytes;
-    e->type.mbc_case_fold = unsupported_fold;
+    e->type.mbc_case_fold = fold_one;
     e->type.apply_all_case_fold = unsupported_all_fold;
     e->type.get_case_fold_codes_by_str = unsupported_fold_codes;
     e->type.property_name_to_ctype = unsupported_property;
@@ -285,9 +328,32 @@ static int add(const char *name, int min, int max, enum family family, int dummy
     entries[entry_count] = e;
     return entry_count++;
 }
+/* Every encoding ruby 4.0.9 has, in the order it registers them, so that an
+ * index here is the encoding's place in Encoding.list (the interpreter lists
+ * them in this same order: enc_list_order). The widths are the multi-byte
+ * list's above; any other is single-byte. One made later
+ * (rb_define_dummy_encoding, Encoding#replicate) comes after these. */
+static const char ruby_order[] =
+    "ASCII-8BIT|UTF-8|US-ASCII|UTF-16BE|UTF-16LE|UTF-32BE|UTF-32LE|UTF-16|UTF-32|UTF8-MAC|EUC-JP|Windows-31J|Big5|Big5-HKSCS|Big5-UAO|CESU-8|CP949|Emacs-Mule|EUC-KR|EUC-TW|GB18030|GBK|ISO-8859-1|ISO-8859-2|ISO-8859-3|ISO-8859-4|ISO-8859-5|ISO-8859-6|ISO-8859-7|ISO-8859-8|ISO-8859-9|ISO-8859-10|ISO-8859-11|ISO-8859-13|ISO-8859-14|ISO-8859-15|ISO-8859-16|KOI8-R|KOI8-U|Shift_JIS|Windows-1250|Windows-1251|Windows-1252|Windows-1253|Windows-1254|Windows-1257|IBM437|IBM720|IBM737|IBM775|CP850|IBM852|CP852|IBM855|CP855|IBM857|IBM860|IBM861|IBM862|IBM863|IBM864|IBM865|IBM866|IBM869|Windows-1258|GB1988|macCentEuro|macCroatian|macCyrillic|macGreek|macIceland|macRoman|macRomania|macThai|macTurkish|macUkraine|CP950|CP951|IBM037|stateless-ISO-2022-JP|eucJP-ms|CP51932|EUC-JIS-2004|GB2312|GB12345|ISO-2022-JP|ISO-2022-JP-2|CP50220|CP50221|Windows-1256|Windows-1255|TIS-620|Windows-874|MacJapanese|UTF-7|UTF8-DoCoMo|SJIS-DoCoMo|UTF8-KDDI|SJIS-KDDI|ISO-2022-JP-KDDI|stateless-ISO-2022-JP-KDDI|UTF8-SoftBank|SJIS-SoftBank";
 static void fill(void) {
     if (entry_count) return;
-    for (size_t i = 0; i < 12; i++) add(known[i].name, known[i].min, known[i].max, known[i].family, known[i].dummy);
+    const char *p = ruby_order;
+    char name[64];
+    while (*p) {
+        size_t n = strcspn(p, "|");
+        if (n >= sizeof(name)) n = sizeof(name) - 1;
+        memcpy(name, p, n);
+        name[n] = 0;
+        p += n + (p[n] == '|');
+        int found = 0;
+        for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++)
+            if (!strcmp(known[i].name, name)) {
+                add(known[i].name, known[i].min, known[i].max, known[i].family, known[i].dummy);
+                found = 1;
+                break;
+            }
+        if (!found) add(name, 1, 1, F_SINGLE, 0);
+    }
 }
 static int same_name(const char *a, const char *b) {
     for (; *a && *b; a++, b++) {
@@ -391,6 +457,15 @@ static VALUE encoding_object(int index) {
     return mr_call(rb_cEncoding, "find", 1, rb_str_new_cstr(name));
 }
 VALUE rb_enc_associate_index(VALUE obj, int index) {
+    /* (encoding.c's enc_capable: a String, a Regexp, an IO, a Symbol, a
+     *  data object -- anything else is refused, in its words) */
+    int type = rb_type(obj);
+    if (type != T_STRING && type != T_REGEXP && type != T_FILE && type != T_SYMBOL && type != T_DATA)
+        rb_raise(rb_eArgError, "cannot set encoding on non-encoding capable object");
+    /* A Regexp here is a value without an identity (its pattern, options and
+     * encoding): one changed in place is not what every other reference to
+     * it would see, so it is not changed at all. */
+    if (type == T_REGEXP) mr_unsupported("setting the encoding of a Regexp in place (rb_enc_associate on a Regexp)");
     rb_check_frozen(obj);
     mr_call(obj, "force_encoding", 1, encoding_object(index));
     mr_mirror_forget(obj);
@@ -423,7 +498,16 @@ int rb_define_dummy_encoding(const char *name) {
     fill();
     for (int i = 0; i < entry_count; i++)
         if (same_name(entries[i]->type.name, name)) rb_raise(rb_eArgError, "encoding %s is already registered", name);
-    mr_unsupported("rb_define_dummy_encoding (a new Encoding made from C)");
+    /* (the interpreter makes it, and refuses past ruby's 256 encodings; it
+     *  is the last of Encoding.list, and here the last index) */
+    mr_call(rb_cEncoding, "__define_dummy", 1, rb_str_new_cstr(name));
+    return add(name, 1, 1, F_SINGLE, 1);
+}
+/* An alias of an existing encoding: its index, or -1 when there is none of
+ * that name. */
+int rb_enc_alias(const char *alias, const char *orig) {
+    VALUE e = mr_call(rb_cEncoding, "__alias", 2, rb_str_new_cstr(alias), rb_str_new_cstr(orig));
+    return NIL_P(e) ? -1 : index_of_object(e);
 }
 
 /* ---- characters ------------------------------------------------------------------- */

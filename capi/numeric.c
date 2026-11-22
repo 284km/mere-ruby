@@ -305,8 +305,10 @@ VALUE rb_str_to_inum(VALUE str, int base, int badcheck) {
     if (badcheck) return mr_call(mr_main(), "Integer", 2, str, INT2FIX(base));
     return mr_call(str, "to_i", 1, INT2FIX(base < 0 ? -base : base));
 }
-VALUE rb_cstr2inum(const char *str, int base) { return rb_cstr_to_inum(str, base, base == 2); }
-VALUE rb_str2inum(VALUE str, int base) { return rb_str_to_inum(str, base, base == 2); }
+/* (strict when the base is to be read from the text, base 0, as bignum.c's
+ *  rb_cstr2inum and rb_str2inum are) */
+VALUE rb_cstr2inum(const char *str, int base) { return rb_cstr_to_inum(str, base, base == 0); }
+VALUE rb_str2inum(VALUE str, int base) { return rb_str_to_inum(str, base, base == 0); }
 double rb_cstr_to_dbl(const char *str, int badcheck) {
     VALUE s = rb_str_new_cstr(str);
     return rb_str_to_dbl(s, badcheck);

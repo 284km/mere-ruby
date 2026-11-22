@@ -7896,8 +7896,12 @@ and capi_describe = fn env -> fn world -> fn (v: Val) ->
                                 (fn (m: str) -> let _ = capi_clear world in VBool false) with
                         | VBool true -> 32 | _ -> 0)) in
   let enc = (match v with VStr h -> mr_capi_enc_index (senc_get h) * 256 | _ -> 0) in
+  // (...and whether a String's bytes are ASCII alone, 1 << 24: the coderange
+  //  C reads from its flags, ENC_CODERANGE_7BIT. Asked once per contents:
+  //  str_is_ascii keeps its answer.)
+  let ascii9 = (match v with VStr h -> (if str_is_ascii h then 16777216 else 0) | _ -> 0) in
   let _ = mr_capi_set 0 (CapiWord { w = capi_out (VClass cls) }) in
-  capi_type world v + frozen + enc
+  capi_type world v + frozen + enc + ascii9
 // The values C put in transit.
 and capi_args = fn (n: int) ->
   let rec take = fn (i: int) -> fn (acc: Val list) ->
@@ -16593,6 +16597,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // nothing -- `frozen.transform_keys!` is an Enumerator; with a mapping Hash
   // they write at once and refuse here)
   // (the prelude's IO reads lock and unlock the buffer they fill)
+  // (...and whether one is: rb_str_locktmp / rb_str_unlocktmp refuse a
+  //  second lock and an unlock of an unlocked string)
+  if (str_len name == 12 && str_eq name "__tmplocked?") then
+    (match recv with VStr h9 -> VBool (map_has str_locks (str_of_int h9)) | _ -> VBool false)
+  else
   if (str_len name == 9 && str_eq name "__locktmp") || (str_len name == 11 && str_eq name "__unlocktmp") then
     (match recv with
      | VStr h9 -> (let _ = (if str_eq name "__locktmp" then map_set str_locks (str_of_int h9) 1
@@ -19688,13 +19697,57 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if struct_generator_cls world c && (str_len name == 3 && str_eq name "new") then struct_build world c args
     // Encoding class methods: the known encodings, and the locale charmap
     // (always UTF-8 in this interpreter — no locale probing).
+    // The C API's two ways of making a name: rb_define_dummy_encoding's new
+    // (dummy) Encoding -- a constant too when the name can be one, as
+    // encoding.c's set_encoding_const does -- refused past ruby's 256; and
+    // rb_enc_alias's alias of an existing one.
+    else if str_eq c "Encoding" && (str_len name == 14 && str_eq name "__define_dummy") then
+      (match args with
+       | Cons (VStr nh, _) ->
+         (let nm9 = sget nh in
+          if map_has enc_objs nm9 then raise_exc world "ArgumentError" ("encoding " ++ nm9 ++ " is already registered")
+          else if map_len enc_objs >= 256 then raise_exc world "EncodingError" "too many encoding (> 256)"
+          else
+            (let (_, _, ocls9, ivars9) = world in
+             let id9 = alloc_oid ocls9 in
+             let _ = map_set ocls9 id9 "Encoding" in
+             let _ = iv_put ivars9 (str_of_int id9 ++ "@name") (mkstr nm9) in
+             let o9 = VObj id9 in
+             let _ = map_set enc_objs nm9 o9 in
+             let _ = map_set enc_alias_canon (enc_norm_name nm9) nm9 in
+             let _ = map_set enc_name (str_of_int id9) nm9 in
+             let _ = map_set enc_dummy_made nm9 1 in
+             let f9 = ord (char_at nm9 0) in
+             let _ = (if f9 >= 65 && f9 <= 90 then
+                        (let rec cn9 = fn (i: int) -> fn (acc: str) ->
+                           (if i >= str_len nm9 then acc
+                            else (let ch9 = char_at nm9 i in
+                                  let o2 = ord ch9 in
+                                  cn9 (i + 1) (acc ++ (if (o2 >= 48 && o2 <= 57) || (o2 >= 65 && o2 <= 90) || (o2 >= 97 && o2 <= 122) then ch9 else "_")))) in
+                         consts_put ("Encoding::" ++ cn9 0 "") o9)
+                      else ()) in
+             o9))
+       | _ -> raise_exc world "TypeError" "no implicit conversion into String")
+    else if str_eq c "Encoding" && (str_len name == 7 && str_eq name "__alias") then
+      (match args with
+       | Cons (VStr ah, Cons (VStr oh, _)) ->
+         (let canon9 = enc_find_canon (sget oh) in
+          if map_has enc_objs canon9 then
+            (let _ = map_set enc_alias_canon (enc_norm_name (sget ah)) canon9 in map_get enc_objs canon9)
+          else VNil)
+       | _ -> VNil)
     else if str_eq c "Encoding" && (str_len name == 4 && str_eq name "list") then
       (let out = map_new () in
-       // Ruby registers BINARY first. Kconv uses list[0] to distinguish
-       // unlabelled bytes from an input encoding it must pass to NKF.
-       let _ = map_set out "0" (map_get enc_objs "ASCII-8BIT") in
+       // In ruby's order of registration -- BINARY first (Kconv reads
+       // list[0] to tell unlabelled bytes from an input encoding), and the
+       // index of each is the one the C API gives it (rb_to_encoding_index,
+       // rb_enc_find_index: ENCODING_GET of a String) -- then any encoding
+       // made since (Encoding#replicate's, rb_define_dummy_encoding's).
+       let seen = map_new () in
+       let _ = list_iter (str_split enc_list_order "|") (fn (k: str) ->
+         if map_has enc_objs k then (let _ = map_set seen k 1 in map_set out (str_of_int (map_len out)) (map_get enc_objs k)) else ()) in
        let _ = map_iter enc_objs (fn (k: str) -> fn (v: Val) ->
-         if str_eq k "ASCII-8BIT" then () else let i = map_len out in map_set out (str_of_int i) v) in
+         if map_has seen k then () else let i = map_len out in map_set out (str_of_int i) v) in
        arr_new (idx_to_list out 0 (map_len out)))
     else if str_eq c "Encoding" && (str_len name == 14 && str_eq name "locale_charmap") then mkstr (locale_codeset ())
     // Encoding.compatible?(a, b): the encoding a combination of the two would
@@ -45424,6 +45477,12 @@ and kernel_conv_fn0 = fn env -> fn world -> fn (name: str) -> fn (args: Val list
        | Cons (v, _) ->
          (match conv_try env world v "to_str" with
           | VStr r9 -> VStr r9
+          // (#to_str answering anything but a String or nil is refused,
+          //  not passed over for #to_s: rb_convert_type's words. Only an
+          //  object can have one that answers that.)
+          | g9 when (match v with VObj _ -> (match g9 with VNil -> false | _ -> true) | _ -> false) ->
+            raise_exc world "TypeError"
+              ("can't convert " ++ class_name v ++ " to String (" ++ class_name v ++ "#to_str gives " ++ class_name g9 ++ ")")
           | _ ->
             (let r8 = conv_try env world v "to_s" in
              match r8 with

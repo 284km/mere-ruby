@@ -248,8 +248,9 @@ VALUE rb_obj_dup(VALUE obj) { return mr_callk(obj, "dup", 0); }
 VALUE rb_obj_clone(VALUE obj) { return mr_callk(obj, "clone", 0); }
 VALUE rb_obj_init_copy(VALUE obj, VALUE orig) { (void)orig; return obj; }
 VALUE rb_obj_id(VALUE obj) { return mr_callk(obj, "object_id", 0); }
-VALUE rb_obj_hide(VALUE obj) { return obj; }
-VALUE rb_obj_reveal(VALUE obj, VALUE klass) { (void)klass; return obj; }
+extern void mr_mirror_hide(VALUE obj, int hidden);
+VALUE rb_obj_hide(VALUE obj) { mr_mirror_hide(obj, 1); return obj; }
+VALUE rb_obj_reveal(VALUE obj, VALUE klass) { (void)klass; mr_mirror_hide(obj, 0); return obj; }
 VALUE rb_obj_alloc(VALUE klass) { return mr_call(klass, "allocate", 0); }
 VALUE rb_class_new_instance(int argc, const VALUE *argv, VALUE klass) { return mr_callv(klass, rb_intern("new"), argc, argv, Qnil, 0); }
 VALUE rb_class_new_instance_kw(int argc, const VALUE *argv, VALUE klass, int kw) {

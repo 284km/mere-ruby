@@ -34,6 +34,7 @@ struct mr_mirror {
     int body;                   /* 0 none yet, T_STRING, T_ARRAY */
     int data;                   /* 0, 1 RData, 2 RTypedData */
     int listed;                 /* how many C calls in progress watch it (entries of `touched`) */
+    int hidden;                 /* rb_obj_hide: its class reads as 0 to C until rb_obj_reveal */
     size_t embedded;            /* a typed struct's own bytes, after it */
     struct rb_io *io;           /* an IO's, made when RFILE first asks for it */
     union {
@@ -111,12 +112,30 @@ static void refresh_head(struct mr_mirror *m, VALUE obj) {
     flags = keep | (VALUE)type;
     if (packed & 0x20) flags |= RUBY_FL_FREEZE;
     flags |= ((packed >> 8) & 0x7f) << RUBY_ENCODING_SHIFT;
-    if (type == T_STRING) flags |= RSTRING_NOEMBED;
+    if (type == T_STRING) {
+        flags |= RSTRING_NOEMBED;
+        /* (the coderange is the interpreter's to say, as far as it knows:
+         *  7BIT when the bytes are ASCII alone in an ASCII-compatible
+         *  encoding, else unknown -- what C cached may be stale) */
+        flags &= ~(VALUE)RUBY_ENC_CODERANGE_MASK;
+        if (packed & 0x1000000) {
+            rb_encoding *e = rb_enc_from_index((int)((packed >> 8) & 0xffff));
+            if (e && rb_enc_asciicompat(e)) flags |= RUBY_ENC_CODERANGE_7BIT;
+        }
+    }
     if (type == T_ARRAY) flags &= ~(VALUE)RARRAY_EMBED_FLAG;
     if ((type == T_CLASS || type == T_MODULE) && (packed & 0x40)) flags |= RUBY_FL_SINGLETON;
     m->as.basic.flags = flags;
-    *(VALUE *)&m->as.basic.klass = mr_word(0);
+    *(VALUE *)&m->as.basic.klass = m->hidden ? 0 : mr_word(0);
     m->head_epoch = mr_epoch;
+}
+/* rb_obj_hide / rb_obj_reveal: to C, a hidden object has no class (CRuby
+ * clears RBasic.klass; the interpreter's object keeps its own). */
+void mr_mirror_hide(VALUE obj, int hidden) {
+    if (!MR_HANDLE_P(obj)) return;
+    struct mr_mirror *m = mirror_at(MR_NUMBER(obj), 1);
+    m->hidden = hidden;
+    m->head_epoch = 0;
 }
 
 struct mr_mirror *mr_mirror_of(VALUE obj) {
