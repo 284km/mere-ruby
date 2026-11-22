@@ -11,8 +11,7 @@
 # reference ($REF_RUBY_BIN, else ruby -- tools/ref_ruby.sh). The environment
 # is run.sh's for that side, and it is NOT optional detail -- a hand-made
 # command line reads differently:
-#   - rubygems/* need the source tree's lib/ FIRST on RUBYLIB: its rubygems
-#     is the one under test (Gem.prefix, the default gem specs).
+#   - rubygems/* add the source tree's lib/ to each side's fallback paths.
 #   - mere-ruby gets the reference's standard library and bundled gem libs
 #     on RUBYLIB, and unittest/shim.
 #   - the binary is reached by an absolute path, and should be NAMED
@@ -24,6 +23,7 @@
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
+EXCLUDES="$here/excludes-gc${EXCLUDES:+:$EXCLUDES}"; export EXCLUDES
 src="${1:?usage: unittest/try.sh <ruby-src> [--ref] <path under test/> [runner args ...]}"
 shift
 src="$(cd "$src" && pwd)"
@@ -46,6 +46,7 @@ case "$ref" in /*) ;; *) ref="$(cd "$(dirname "$ref")" && pwd)/$(basename "$ref"
 [ -x "$mr" ] || [ "$side" = ref ] || { echo "unittest: no $mr" >&2; exit 2; }
 shim="$here/shim"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
+mere_stdlib="$(sh "$root/tools/runtime_load_path.sh" "$mr")"
 rake_source="$("$ref" -e 'begin; print Gem.bin_path("rake", "rake"); rescue Gem::Exception; end')"
 # (run.sh's select_rake, for the file in hand)
 if [ "$rel" != "rubygems/test_gem_ext_rake_builder.rb" ] && [ -n "$rake_source" ]; then
@@ -59,7 +60,9 @@ ref_lib="$src/tool/lib:$src/test"
 if [ -n "${UNITTEST_REF_EXT_PATH:-}" ]; then
   ref_lib="$UNITTEST_REF_EXT_PATH:$ref_lib"
 fi
-mere_lib="$src/tool/lib:$src/test:$shim:$stdlib"
+mere_fallback="$stdlib"
+case "$rel" in rubygems/*) mere_fallback="$src/lib:$mere_fallback" ;; esac
+mere_lib="$src/tool/lib:$src/test:$shim:$mere_stdlib:$mere_fallback"
 # (the test extensions built against mere-ruby's ruby.h: tools/capi_ext_build.py)
 if [ -n "${UNITTEST_MERE_EXT_PATH:-}" ]; then
   mere_lib="$UNITTEST_MERE_EXT_PATH:$mere_lib"
@@ -71,10 +74,20 @@ case "$rel" in
     if [ -f "$src/.unittest-reference/rbconfig.rb" ]; then
       extra="-I $src/.unittest-reference -I $src/lib"
       ref_lib="$src/.unittest-reference:$src/lib:$ref_lib"
+    fi
+    # (mere-ruby's side: the build tree test/mkmf expects, staged of links to
+    #  its own headers -- mkmf_context.sh; without a C API it stays as it was)
+    if [ "$side" != ref ]; then
+      ctx="${TMPDIR:-/tmp}/unittest-mkmf-context.$$"
+      if launcher="$(sh "$here/mkmf_context.sh" "$mr" "$src" "$ctx" "${stdlib%%:*}")"; then
+        mr="$launcher"
+        mere_lib="$ctx/source/lib:$mere_lib"
+      else
+        ctx=""
+      fi
     fi ;;
   rubygems/*)
-    ref_lib="$src/lib:$ref_lib"
-    mere_lib="$src/lib:$mere_lib" ;;
+    ref_lib="$src/lib:$ref_lib" ;;
 esac
 seed="--seed=${UNITTEST_SEED:-1}"
 for a in "$@"; do case "$a" in --seed*) seed="" ;; esac; done
@@ -83,6 +96,14 @@ if [ "$side" = ref ]; then
   # shellcheck disable=SC2086
   PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$ref" RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" \
     exec "$ref" $extra -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" "$file" -v --show-skip $seed "$@"
+elif [ -n "${ctx:-}" ]; then
+  # (the staged tree is this run's: removed when the run is over)
+  # shellcheck disable=SC2086
+  PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr" RUBY="$mr" RUBYLIB="$mere_lib" UNITTEST_TEST_FILE="$rel" \
+    "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" "$file" -v --show-skip $seed "$@"
+  code=$?
+  rm -rf "$ctx"
+  exit "$code"
 else
   # shellcheck disable=SC2086
   PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr" RUBY="$mr" RUBYLIB="$mere_lib" UNITTEST_TEST_FILE="$rel" \

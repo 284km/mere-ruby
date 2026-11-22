@@ -10,6 +10,10 @@ on:
         description: Full published Mere commit SHA (default is the pinned compiler)
         type: string
         required: false
+      timing_baseline_run_id:
+        description: Optional baseline CI run ID for the integration timing report
+        type: string
+        required: false
   schedule:
     - cron: "0 3 * * 1"
 
@@ -29,7 +33,7 @@ env:
   #  on 2026-11-16, and its toolchain moved Float#step's rounding against the
   #  reference -- unittest/math_glue_check.py failed on every branch at once.
   #  The jobs name ubuntu-24.04; a move to 26.04 is a change of its own.)
-  MERE_REF: ${{ inputs.mere_ref || '01f5ad738748cc570cc04e3000f50b8c6965543f' }}
+  MERE_REF: ${{ inputs.mere_ref || '408b03d9cfc9f56331490a8912f3ea1254d488dd' }}
   RUBY_SOURCE_REF: 3e93b23afcec3433f6aecc34b5d832799d754238
   REF_RUBY_VERSION: "4.0.9"
   RUST_VERSION: "1.85.0"
@@ -60,6 +64,9 @@ jobs:
       - run: python3 unittest/transcript_check.py -v
       - run: python3 unittest/test_data_check.py -v
       - run: python3 unittest/process_family_check.py -v
+      - run: python3 unittest/reference_cache_check.py -v
+      - run: python3 tools/native_probe/embedding_build_check.py -v
+      - run: python3 tools/ci_timing_check.py -v
       - name: Test CI collection and real Test::Unit diagnostics
         run: |
           export UNITTEST_REAL_RUBY="$(ruby -rrbconfig -e 'print RbConfig.ruby')"
@@ -98,7 +105,7 @@ jobs:
             --source-ref "$GITHUB_SHA" --mere-ref "$MERE_REF" \
             --ruby-ref "$RUBY_SOURCE_REF" --ruby-version "$REF_RUBY_VERSION"
           python3 bootstraptest/measure.py plan --ruby-src .ruby-tests \
-            --output measurement-plan/bootstrap.json --shards 4 \
+            --output measurement-plan/bootstrap.json --shards 4 --timings bootstraptest/timings.json \
             --source-ref "$GITHUB_SHA" --mere-ref "$MERE_REF" --ruby-ref "$RUBY_SOURCE_REF"
           python3 unittest/suite_inventory.py --ruby-src .ruby-tests --output measurement-plan/suites.json
       - uses: actions/upload-artifact@v4
@@ -107,7 +114,7 @@ jobs:
           path: measurement-plan
           retention-days: 7
 
-  corpus:
+  build-macos:
     runs-on: macos-26
     timeout-minutes: 90
     outputs:
@@ -117,32 +124,12 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
-      - uses: actions/checkout@v5
-        with:
-          repository: merelang/mere
-          ref: ${{ env.MERE_REF }}
-          path: .mere-compiler
-          persist-credentials: false
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ env.REF_RUBY_VERSION }}
-      # Release downloads can return HTTP 504 before compilation. Retry setup
-      # once; a second failure still fails the job and prevents the build.
-      - uses: ocaml/setup-ocaml@v3
-        id: setup-ocaml
-        continue-on-error: true
+      - uses: ./.github/actions/setup-mere
         with:
-          ocaml-compiler: "5.1"
-      - name: Retry OCaml setup after a failed attempt
-        if: steps.setup-ocaml.outcome == 'failure'
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: "5.1"
-      - name: Build the pinned Mere compiler
-        working-directory: .mere-compiler
-        run: |
-          opam install . --deps-only
-          opam exec -- dune build bin/mere.exe
+          ref: ${{ env.MERE_REF }}
       - name: Install native OpenSSL build dependencies
         run: brew install openssl@3 pkgconf
       - name: Build the measurement binary at O2
@@ -151,13 +138,74 @@ jobs:
         run: python3 unittest/prism_query_boundary_check.py
       - name: Record binary provenance
         run: python3 unittest/ci.py build-info --compiler .mere-compiler --output build-info.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mere-ruby-macos
+          # (with what tools/build.sh writes beside the executable after the
+          #  link: the C API's import library and this arch's header directory,
+          #  which RbConfig names where they are there)
+          path: |
+            mere-ruby
+            .build_mode
+            build-info.json
+            capi/lib
+            capi/arch
+          include-hidden-files: true
+          retention-days: 7
+      - id: ready
+        run: echo "binary_sha=$(shasum -a 256 mere-ruby | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Package native inputs for verification
+        run: |
+          tar -czf native-build.tar.gz mr.c vendor/prism/obj/libprism.a capi/mere_capi.h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-build-macos
+          path: native-build.tar.gz
+          retention-days: 7
+
+  corpus:
+    needs: [build-macos]
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.REF_RUBY_VERSION }}
+      - uses: ./.github/actions/setup-mere
+        with:
+          ref: ${{ env.MERE_REF }}
+      - name: Install native OpenSSL build dependencies
+        run: brew install openssl@3 pkgconf
+      - uses: actions/download-artifact@v4
+        with:
+          name: mere-ruby-macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-build-macos
+      - name: Restore the exact O2 build and native inputs
+        env:
+          EXPECTED_SHA: ${{ needs.build-macos.outputs.binary_sha }}
+        run: |
+          chmod +x mere-ruby
+          test "$(shasum -a 256 mere-ruby | cut -d ' ' -f 1)" = "$EXPECTED_SHA"
+          tar -xzf native-build.tar.gz
+      # A fresh checkout has newer source mtimes than the transferred C.
+      # Emit again with the same pinned compiler so source freshness checks
+      # keep testing actual generated code, including after job handoff.
+      - name: Regenerate C for the checked-out source tree
+        run: |
+          .mere-compiler/_build/default/bin/mere.exe -c main.mere > mr.c.new
+          mv mr.c.new mr.c
       - name: Check deferred string-page compaction
         run: python3 unittest/string_page_compact_check.py
       - name: Check protected embedding lifecycle and archive
         run: |
           python3 tools/native_probe/embedding_check.py --compiler .mere-compiler/_build/default/bin/mere.exe --output "$RUNNER_TEMP/embedding"
-          python3 tools/native_probe/embedding_check.py --compiler .mere-compiler/_build/default/bin/mere.exe --output "$RUNNER_TEMP/embedding-setup-failure" --setup-failure
-          python3 tools/native_probe/embedding_check.py --compiler .mere-compiler/_build/default/bin/mere.exe --output "$RUNNER_TEMP/embedding-cleanup-failure" --cleanup-failure
+          python3 tools/native_probe/embedding_check.py --compiler .mere-compiler/_build/default/bin/mere.exe --output "$RUNNER_TEMP/embedding-failures" --failure-checks --reuse-header-from "$RUNNER_TEMP/embedding"
           python3 tools/native_probe/embedding_stress_check.py --library-dir "$RUNNER_TEMP/embedding" --prism-lib vendor/prism/obj/libprism.a --output "$RUNNER_TEMP/embedding-stress"
           python3 tools/native_probe/embedding_bundle.py --library-dir "$RUNNER_TEMP/embedding" --prism-lib vendor/prism/obj/libprism.a --output "$RUNNER_TEMP/embedding-bundle"
       - name: Check sparse string-page lifetime under sanitizers
@@ -166,17 +214,6 @@ jobs:
         run: python3 unittest/gc_marks_check.py
       - name: Check character-device writes under backpressure
         run: python3 unittest/file_device_check.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mere-ruby-macos
-          path: |
-            mere-ruby
-            .build_mode
-            build-info.json
-          include-hidden-files: true
-          retention-days: 7
-      - id: ready
-        run: echo "binary_sha=$(shasum -a 256 mere-ruby | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
       - name: Check bounded argument-marker allocations
         run: python3 unittest/argument_marker_check.py
       - name: Check bounded Fiber scheduler handoffs and shutdown
@@ -267,12 +304,21 @@ jobs:
       # Ruby's own C sources (ext/-test-/exception, typeddata, float, iter) and the
       # fixtures of capi/check, built unchanged against the reference's headers
       # and against mere-ruby's: the same contracts on both sides, under
-      # collection stress, and with each guarantee switched off in turn.
+      # collection stress, and with each guarantee switched off in turn. Then
+      # ruby's own mkmf builds an extension on both sides (extconf.rb, make,
+      # make install) from the RbConfig each ruby says of its build, and
+      # published gems with C extensions (nokogiri among them, on the system's
+      # libxml2) are installed with `gem install` and used, on both sides.
+      # And ruby/spec's own C API specs (optional/capi) run on both: the
+      # reference passes what is recorded, mere-ruby no less than is recorded.
       - name: Check Ruby's C API against the reference with shared C sources
         run: |
           python3 capi/tools/headers_check.py .ruby-network
           python3 capi/tools/config_probe.py --cc clang --check capi/include/ruby/config.h
           python3 tools/capi_check.py --ruby-source .ruby-network --reference "$(ruby -rrbconfig -e 'print RbConfig.ruby')" --output "$RUNNER_TEMP/capi-check"
+          python3 tools/capi_mkmf_check.py --ruby-source .ruby-network --reference "$(ruby -rrbconfig -e 'print RbConfig.ruby')" --output "$RUNNER_TEMP/capi-mkmf-check"
+          python3 tools/capi_gem_check.py --reference "$(ruby -rrbconfig -e 'print RbConfig.ruby')" --output "$RUNNER_TEMP/capi-gem-check"
+          python3 tools/capi_spec_check.py --ruby-source .ruby-network --reference "$(ruby -rrbconfig -e 'print RbConfig.ruby')" --output "$RUNNER_TEMP/capi-spec-check"
       - name: Compare every corpus program
         run: sh run_corpus.sh --both
       - name: Check temporary scope reuse on success and exceptions
@@ -312,19 +358,40 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rust_bin=$(dirname "$(rustup which --toolchain "$RUST_VERSION" rustc)")
           echo "UNITTEST_RUST_BIN=$rust_bin" >> "$GITHUB_ENV"
+      - name: Identify the reference build cache
+        id: reference-key
+        run: |
+          key=$(python3 unittest/reference_cache_key.py)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: reference-cache
+        with:
+          path: reference-runtime.tar.gz
+          key: ${{ steps.reference-key.outputs.key }}
+      - name: Restore the cached reference runtime
+        if: steps.reference-cache.outputs.cache-hit == 'true'
+        run: tar -xzf reference-runtime.tar.gz
       - name: Build reference Ruby including test-only C extensions
+        if: steps.reference-cache.outputs.cache-hit != 'true'
         env:
           RUSTUP_TOOLCHAIN: ${{ env.RUST_VERSION }}
         run: sh unittest/build_reference.sh .ruby-tests "$GITHUB_WORKSPACE/.reference-ruby"
+      - name: Verify the reference runtime including both JITs and test extensions
+        run: |
+          .reference-ruby/bin/ruby --yjit -e 'abort "YJIT is unavailable" unless RubyVM::YJIT.enabled?'
+          .reference-ruby/bin/ruby --zjit -e 'abort "ZJIT is unavailable" unless RubyVM::ZJIT.enabled?'
+          arch=$(.reference-ruby/bin/ruby -rrbconfig -e 'print RbConfig::CONFIG.fetch("arch")')
+          .reference-ruby/bin/ruby -I "$GITHUB_WORKSPACE/.ruby-tests/.ext/$arch" -e '
+            abort "unexpected reference version" unless RUBY_VERSION == ENV.fetch("REF_RUBY_VERSION")
+            %w[-test-/integer -test-/file -test-/iter -test-/rb_call_super_kw].each { |name| require name }
+          '
       - name: Prepare checksum-pinned Unicode data and RubyGems fixtures
         run: python3 unittest/test_data.py .ruby-tests
       - name: Record reference provenance and package its runtime
         run: |
           python3 unittest/ci.py reference-info --ruby-src .ruby-tests \
             --binary .reference-ruby/bin/ruby --output reference-build.json
-          archive=$(.reference-ruby/bin/ruby -rrbconfig -e 'print RbConfig::CONFIG.fetch("LIBRUBY_A")')
-          tar -czf reference-runtime.tar.gz .reference-ruby .ruby-tests/.ext \
-            .ruby-tests/Makefile ".ruby-tests/$archive" .ruby-tests/enc/unicode/data .ruby-tests/exe/gem
+          sh unittest/package_reference.sh
       - name: Check actual Unicode assertions and Rust gem builds
         run: |
           python3 unittest/environment_smoke.py --ruby-src .ruby-tests \
@@ -346,6 +413,11 @@ jobs:
             "$reference" -I "$source/.unittest-reference" -I "$source/lib" \
               -I "$source/tool/lib" -I "$source/test" -r test/unit "$test" -v --seed=1
           done
+      - uses: actions/cache/save@v4
+        if: steps.reference-cache.outputs.cache-hit != 'true'
+        with:
+          path: reference-runtime.tar.gz
+          key: ${{ steps.reference-cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v4
         with:
           name: ruby-reference-macos
@@ -356,10 +428,10 @@ jobs:
 
   unittest-shards:
     name: CRuby tests / shard ${{ matrix.shard }}
-    needs: [unittest-plan, corpus, unittest-reference]
-    # Corpus differences do not suppress the measurement after a successful
-    # upload. A failed build still cannot supply an unrelated binary.
-    if: ${{ !cancelled() && needs.corpus.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
+    needs: [unittest-plan, build-macos, unittest-reference]
+    # Start as soon as both builds are ready; corpus verification runs separately.
+    # A failed build still cannot supply an unrelated binary.
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-macos.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
     runs-on: macos-26
     timeout-minutes: 330
     strategy:
@@ -428,7 +500,7 @@ jobs:
 
   unittest-summary:
     needs: [unittest-plan, unittest-shards]
-    if: ${{ always() && needs.unittest-plan.result == 'success' }}
+    if: ${{ !cancelled() && needs.unittest-plan.result == 'success' && (needs['unittest-shards'].result == 'success' || needs['unittest-shards'].result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -444,7 +516,7 @@ jobs:
           pattern: unittest-shard-*
           path: shard-results
       - name: Collect every planned file including interrupted shards
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           python3 unittest/ci.py merge --plan measurement-plan/manifest.json \
             --input shard-results --output measurement-report
@@ -458,8 +530,8 @@ jobs:
 
   bootstrap-shards:
     name: Bootstrap tests / shard ${{ matrix.shard }}
-    needs: [unittest-plan, corpus, unittest-reference]
-    if: ${{ !cancelled() && needs.corpus.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
+    needs: [unittest-plan, build-macos, unittest-reference]
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-macos.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
     runs-on: macos-26
     # Nine files per shard, two 600-second sides each, plus setup/upload.
     timeout-minutes: 210
@@ -515,7 +587,7 @@ jobs:
 
   bootstrap-summary:
     needs: [unittest-plan, bootstrap-shards]
-    if: ${{ always() && needs.unittest-plan.result == 'success' }}
+    if: ${{ !cancelled() && needs.unittest-plan.result == 'success' && (needs['bootstrap-shards'].result == 'success' || needs['bootstrap-shards'].result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -531,7 +603,7 @@ jobs:
           pattern: bootstrap-shard-*
           path: bootstrap-results
       - name: Collect all planned bootstrap source files
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           python3 bootstraptest/measure.py merge --plan measurement-plan/bootstrap.json \
             --input bootstrap-results --output bootstrap-report
@@ -545,8 +617,8 @@ jobs:
           retention-days: 7
 
   basic-measurement:
-    needs: [unittest-plan, corpus, unittest-reference]
-    if: ${{ !cancelled() && needs.corpus.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
+    needs: [unittest-plan, build-macos, unittest-reference]
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-macos.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -593,8 +665,8 @@ jobs:
 
   tool-shards:
     name: Tool tests / shard ${{ matrix.shard }}
-    needs: [unittest-plan, corpus, unittest-reference]
-    if: ${{ !cancelled() && needs.corpus.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
+    needs: [unittest-plan, build-macos, unittest-reference]
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' && needs.build-macos.outputs.binary_sha != '' && needs.unittest-reference.result == 'success' && needs.unittest-plan.result == 'success' }}
     runs-on: macos-26
     # Twelve files, two 600-second sides each, plus setup/upload.
     timeout-minutes: 270
@@ -651,7 +723,7 @@ jobs:
 
   tool-summary:
     needs: [tool-shards]
-    if: ${{ always() }}
+    if: ${{ !cancelled() && (needs['tool-shards'].result == 'success' || needs['tool-shards'].result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -663,7 +735,7 @@ jobs:
           pattern: tool-shard-*
           path: tool-results
       - name: Collect every planned tool file, retaining interrupted sides
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           python3 tooltest/measure.py collect --input tool-results --output tool-report
           cat tool-report/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
@@ -675,7 +747,44 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  ci-timing:
+    name: CI timing report
+    if: always()
+    needs: [unittest-harness, unittest-plan, build-macos, corpus, unittest-reference,
+            unittest-shards, unittest-summary, bootstrap-shards, bootstrap-summary,
+            basic-measurement, tool-shards, tool-summary, build-linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Snapshot job delays and execution without mixing attempts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This validation branch compares with the existing main run at
+          # 12ca1df2. Preserve incomplete/failed baseline states in the report.
+          BASELINE_RUN_ID: ${{ inputs.timing_baseline_run_id || '44239745755' }}
+        run: |
+          python3 tools/ci_timing.py --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --baseline-run-id "$BASELINE_RUN_ID" \
+            --checkout-sha "$GITHUB_SHA" --mere-ref "$MERE_REF" --output ci-timing
+      - name: Preserve timing snapshots including failed comparisons
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-timing-${{ github.run_attempt }}
+          path: ci-timing
+          if-no-files-found: error
+          retention-days: 7
+
   build-linux:
+    # Keep the measured reference target: Ubuntu 26.04's GCC-built Ruby fuses
+    # Float#step operations that the 24.04 x86-64 baseline evaluates separately.
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -683,33 +792,22 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
-      - uses: actions/checkout@v5
-        with:
-          repository: merelang/mere
-          ref: ${{ env.MERE_REF }}
-          path: .mere-compiler
-          persist-credentials: false
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ env.REF_RUBY_VERSION }}
       - name: Install native OpenSSL build dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config
-      # Keep the same bounded setup retry as the macOS build above.
-      - uses: ocaml/setup-ocaml@v3
-        id: setup-ocaml
-        continue-on-error: true
-        with:
-          ocaml-compiler: "5.1"
-      - name: Retry OCaml setup after a failed attempt
-        if: steps.setup-ocaml.outcome == 'failure'
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: "5.1"
-      - name: Build the pinned Mere compiler
-        working-directory: .mere-compiler
+        run: sh tools/linux_build_deps.sh
+      # Native gem checks build nokogiri against these system libraries.
+      - name: Ensure libxml2 and libxslt build dependencies
         run: |
-          opam install . --deps-only
-          opam exec -- dune build bin/mere.exe
+          if ! pkg-config --exists libxml-2.0 libxslt; then
+            sudo apt-get update
+            sudo apt-get install -y libxml2-dev libxslt1-dev
+          fi
+          pkg-config --exists libxml-2.0 libxslt
+      - uses: ./.github/actions/setup-mere
+        with:
+          ref: ${{ env.MERE_REF }}
       - name: Build mere-ruby on Linux
         run: sh tools/build.sh
       - name: Check Prism StringQuery byte boundaries
@@ -732,6 +830,8 @@ jobs:
           python3 capi/tools/headers_check.py .ruby-network
           python3 capi/tools/config_probe.py --cc clang --check capi/include/ruby/config.h
           python3 tools/capi_check.py --ruby-source .ruby-network --reference "$(ruby -rrbconfig -e 'print RbConfig.ruby')" --output "$RUNNER_TEMP/capi-check"
+          python3 tools/capi_mkmf_check.py --ruby-source .ruby-network --reference "$(ruby -rrbconfig -e 'print RbConfig.ruby')" --output "$RUNNER_TEMP/capi-mkmf-check"
+          python3 tools/capi_gem_check.py --reference "$(ruby -rrbconfig -e 'print RbConfig.ruby')" --output "$RUNNER_TEMP/capi-gem-check"
       - name: Check pinned NKF engine, original contracts and resource ownership
         run: |
           gem install nkf --version 0.2.0 --no-document
@@ -798,8 +898,7 @@ jobs:
       - name: Check protected embedding lifecycle and archive
         run: |
           python3 tools/native_probe/embedding_check.py --compiler .mere-compiler/_build/default/bin/mere.exe --output "$RUNNER_TEMP/embedding"
-          python3 tools/native_probe/embedding_check.py --compiler .mere-compiler/_build/default/bin/mere.exe --output "$RUNNER_TEMP/embedding-setup-failure" --setup-failure
-          python3 tools/native_probe/embedding_check.py --compiler .mere-compiler/_build/default/bin/mere.exe --output "$RUNNER_TEMP/embedding-cleanup-failure" --cleanup-failure
+          python3 tools/native_probe/embedding_check.py --compiler .mere-compiler/_build/default/bin/mere.exe --output "$RUNNER_TEMP/embedding-failures" --failure-checks --reuse-header-from "$RUNNER_TEMP/embedding"
           python3 tools/native_probe/embedding_stress_check.py --library-dir "$RUNNER_TEMP/embedding" --prism-lib vendor/prism/obj/libprism.a --output "$RUNNER_TEMP/embedding-stress"
           python3 tools/native_probe/embedding_bundle.py --library-dir "$RUNNER_TEMP/embedding" --prism-lib vendor/prism/obj/libprism.a --output "$RUNNER_TEMP/embedding-bundle"
       - name: Check packed GC mark membership

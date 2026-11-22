@@ -52,6 +52,8 @@ set -u
 LC_ALL=C; export LC_ALL
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
+# Absolute paths survive the runner's per-file working directory and children.
+EXCLUDES="$here/excludes-gc${EXCLUDES:+:$EXCLUDES}"; export EXCLUDES
 src="${1:?usage: unittest/run.sh <ruby-src> [path under test/ ...]}"
 shift
 src="$(cd "$src" && pwd)"
@@ -104,6 +106,9 @@ wall="${UNITTEST_WALL:-600}"
 #   (42.upto(Float::INFINITY).size) came first the second time.
 seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
+# The reference libraries supplement mere-ruby's stdlib. Keep the runtime's
+# own entries first when require honors the actual load-path order.
+mere_stdlib="$(sh "$root/tools/runtime_load_path.sh" "$mr")" || exit 1
 rake_source="$("$ref" -e 'begin; print Gem.bin_path("rake", "rake"); rescue Gem::Exception; end')"
 select_rake() {
   # This file installs its own rake gem and checks RubyGems' executable
@@ -154,6 +159,8 @@ if [ "${1:-}" = "--one" ]; then
   #   whole sweep stopped behind one file, whose verdicts then came out empty
   #   (MATCH 57 -> 0). An orphan holding a file holds nothing up.
   out1="$work/$n.ref.stdout"; err1="$work/$n.ref.stderr"
+  : > "$work/$n.ref.excluded"
+  : > "$work/$n.mere.excluded"
   printf 'ref\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
   # mkmf's own tests require Ruby's build Makefile and source headers. The
@@ -167,25 +174,36 @@ if [ "${1:-}" = "--one" ]; then
   if [ -n "${UNITTEST_REF_EXT_PATH:-}" ]; then
     ref_lib="$UNITTEST_REF_EXT_PATH:$ref_lib"
   fi
-  mere_lib="$src/tool/lib:$src/test:$shim:$stdlib"
+  mere_fallback="$stdlib"
+  case "$rel" in
+    rubygems/*) mere_fallback="$src/lib:$mere_fallback" ;;
+  esac
+  mere_lib="$src/tool/lib:$src/test:$shim:$mere_stdlib:$mere_fallback"
   # (the test extensions built against mere-ruby's ruby.h: tools/capi_ext_build.py)
   if [ -n "${UNITTEST_MERE_EXT_PATH:-}" ]; then
     mere_lib="$UNITTEST_MERE_EXT_PATH:$mere_lib"
   fi
+  mr_run="$mr"
   case "$rel" in
     mkmf/*)
       if [ -f "$src/.unittest-reference/rbconfig.rb" ]; then
         set -- -I "$src/.unittest-reference" -I "$src/lib"
         ref_lib="$src/.unittest-reference:$src/lib:$ref_lib"
+      fi
+      # mere-ruby's side: the build tree test/mkmf expects, staged of links
+      # to its own headers (mkmf_context.sh), and a launcher that runs the
+      # test and its children inside it. Without a C API it stays as it was.
+      if launcher="$(sh "$here/mkmf_context.sh" "$mr" "$src" "$work/$n.mkmf-context" "${stdlib%%:*}")"; then
+        mr_run="$launcher"
+        mere_lib="$work/$n.mkmf-context/source/lib:$mere_lib"
       fi ;;
     rubygems/*)
-      ref_lib="$src/lib:$ref_lib"
-      mere_lib="$src/lib:$mere_lib" ;;
+      ref_lib="$src/lib:$ref_lib" ;;
   esac
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.
   # Parse stdout, then append stderr to the saved diagnostic log.
-  (cd "$dir" && select_rake "$ref" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$ref" RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$ref" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$ref" RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.ref.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   ref_code=$?
   printf '%s\n' "$ref_code" > "$work/$n.ref.exit.new"
   mv "$work/$n.ref.exit.new" "$work/$n.ref.exit"
@@ -196,7 +214,7 @@ if [ "${1:-}" = "--one" ]; then
   out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
   printf 'mere\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
-  (cd "$dir" && select_rake "$mr" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr" RUBY="$mr" UNITTEST_TEST_FILE="$rel" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$mr" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr_run" RUBY="$mr_run" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.mere.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr_run" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
   mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"
@@ -206,6 +224,7 @@ if [ "${1:-}" = "--one" ]; then
   tag="$records/tags/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').txt"
   python3 "$here/transcript.py" compare "$work/$n.ref.json" "$work/$n.mere.json" \
     --file="$rel" "$work/$n" "$tag" || exit 1
+  python3 "$here/exclusions.py" "$work/$n" "$rel" || exit 1
   [ -s "$tag" ] || rm -f "$tag"
   [ -f "$tag" ] && { strip_noise < "$tag" > "$tag.m" && mv "$tag.m" "$tag"; }
   exit 0
@@ -235,6 +254,8 @@ coverage_file="$records/COVERAGE.tsv.$$"
 printf 'file\tref_state\tref_exit\tref_summary_tests\tref_discovered_tests\tmere_state\tmere_exit\tmere_summary_tests\tmere_discovered_tests\n' > "$coverage_file"
 incomplete=0
 tm=0; tr=0; tb=0; tx=0; tt=0
+excluded=0
+printf 'file\ttest\treason\n' > "$records/EXCLUSIONS.tsv"
 {
   echo "# mere-ruby — CRuby's own tests"
   echo
@@ -264,12 +285,21 @@ while read -r rel; do
     incomplete=$((incomplete + 1))
   fi
   set -- $(cat "$work/$i.row")
+  if [ -f "$work/$i.exclusions" ]; then
+    cat "$work/$i.exclusions" >> "$records/EXCLUSIONS.tsv"
+    excluded=$((excluded + $(wc -l < "$work/$i.exclusions")))
+  else
+    echo "unittest: missing exclusion audit for $rel" >&2
+    incomplete=$((incomplete + 1))
+  fi
   printf '| %s | %s | %s | %s | %s | %s |\n' "$rel" "$1" "$2" "$3" "$4" "$5" >> "$status"
   printf '%-48s %4s tests  MATCH %4s  RED %4s  BOTH %3s  EXTRA %3s\n' "$rel" "$1" "$2" "$3" "$4" "$5"
   tt=$((tt + $1)); tm=$((tm + $2)); tr=$((tr + $3)); tb=$((tb + $4)); tx=$((tx + $5))
 done < "$list"
 {
   printf '| **total** | %s | %s | %s | %s | %s |\n' "$tt" "$tm" "$tr" "$tb" "$tx"
+  echo
+  printf 'Excluded tests (identical on both interpreters): %s. See `EXCLUSIONS.tsv`.\n' "$excluded"
   echo
   printf 'File coverage: %s incomplete or zero-test files. See `COVERAGE.tsv`.\n' "$incomplete"
   echo

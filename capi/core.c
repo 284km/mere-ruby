@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <unistd.h>
 
 /* ---- calls in progress --------------------------------------------------- */
 struct mr_guard { jmp_buf jump; struct mr_guard *prev; };
@@ -191,6 +193,13 @@ VALUE mr_guarded(VALUE (*body)(VALUE), VALUE arg, VALUE *outcome) {
     return result;
 }
 VALUE mr_frame_block(void) { return cur ? cur->block : Qnil; }
+/* (rb_iterate: the block of the call in progress, for as long as one function runs) */
+VALUE mr_frame_set_block(VALUE block) {
+    if (!cur) mr_fatal("no call in progress to give a block to");
+    VALUE old = cur->block;
+    cur->block = block;
+    return old;
+}
 ID mr_frame_method(void) { return cur ? cur->method : 0; }
 int mr_frame_keywords(void) { return cur ? cur->keywords : 0; }
 int mr_kw(int kw) { return kw ? MR_SEND_KW : 0; }
@@ -250,6 +259,9 @@ void mr_unsupported(const char *what) {
 struct mr_function { void *fn; int arity; };
 static struct mr_function *functions;
 static long function_count, function_cap;
+void *mr_registered_function(long number) {
+    return number >= 0 && number < function_count ? functions[number].fn : NULL;
+}
 long mr_register_function(void *fn, int arity) {
     for (long i = 0; i < function_count; i++)
         if (functions[i].fn == fn && functions[i].arity == arity) return i;
@@ -530,6 +542,38 @@ void *rb_ext_resolve_symbol(const char *feature, const char *symbol) {
     return RTEST(loaded) ? dlsym(RTLD_DEFAULT, symbol) : NULL;
 }
 
+/* The file this process is running: where the interpreter was built, which
+ * is where its headers are (RbConfig's rubyhdrdir, bindir, topdir). "" when
+ * the OS does not say. */
+#ifdef __APPLE__
+# include <mach-o/dyld.h>
+#endif
+char *mr_capi_exe(void) {
+    static char resolved[PATH_MAX];
+    if (resolved[0]) return resolved;
+    char raw[PATH_MAX];
+#ifdef __APPLE__
+    uint32_t size = sizeof(raw);
+    if (_NSGetExecutablePath(raw, &size) != 0) return "";
+#else
+    ssize_t n = readlink("/proc/self/exe", raw, sizeof(raw) - 1);
+    if (n <= 0) return "";
+    raw[n] = 0;
+#endif
+    if (!realpath(raw, resolved)) { resolved[0] = 0; return ""; }
+    return resolved;
+}
+
+/* The C library this interpreter was compiled against, as a configure
+ * triplet names it after the OS ("gnu" in x86_64-pc-linux-gnu): "" where the
+ * triplet has no such part (macOS) or the library does not say. */
+char *mr_capi_libc(void) {
+#ifdef __GLIBC__
+    return "gnu";
+#else
+    return "";
+#endif
+}
 int mr_capi_depth(void) { return depth; }
 const void *mr_capi_frame(void) { return cur; }
 int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which] : -1; }
