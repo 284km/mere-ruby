@@ -3,6 +3,24 @@
 Every harness here is meant to be run against CRuby as well, because a number
 without the reference number is not a measurement.
 
+## `scanner_search_lengths.rb`
+
+This fixed workload searches an 8-MiB subject 24 times through `exist?`,
+`skip_until` and `search_full` with an integer result. Each turn resets the
+scanner and contributes to the checksum `[8388608, 201326592, 0, "z"]`.
+There is no collection, warmup or delay.
+
+`scanner_search_copies_r100.json` retains a fixed reference/before/candidate/
+candidate/before comparison with the same released compiler. A wait4 wrapper
+records the child's kernel peak separately from CI's sampled process-family
+peak; both use the existing 600-second / 2-GiB family envelope. Child peaks
+are 35,312 / 255,760 / 122,976 / 122,960 / 255,680 KiB. All checksums match.
+The original sampled-only run is retained too: it missed the short reference
+process's actual peak, so its 32-KiB observation is not used as that peak.
+
+The original Rack Request file still exceeds its cap. This benchmark does
+not replace it or demonstrate a repair of its remaining memory failure.
+
 ## `request_subject_copy.rb`
 
 This fixed workload alternates a mutable 2-MiB regexp subject and a small
