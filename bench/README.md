@@ -3,6 +3,41 @@
 Every harness here is meant to be run against CRuby as well, because a number
 without the reference number is not a measurement.
 
+## Embedding verification builds
+
+After building Prism and the native C API header with `tools/build.sh`, run:
+
+```sh
+python3 tools/native_probe/embedding_check.py --compiler /path/to/mere.exe --output /tmp/embedding-normal
+python3 tools/native_probe/embedding_check.py --compiler /path/to/mere.exe --output /tmp/embedding-failures \
+  --failure-checks --reuse-header-from /tmp/embedding-normal
+```
+
+CI builds the normal library and a separate fault-only library. The latter
+runs setup failure and scheduler-cleanup failure in separate host processes,
+selecting the injection through a test-only environment variable. It also runs
+the normal lifecycle with injection disabled. The three native ownership cycles,
+outside-provider sentinel and NKF cleanup checks remain in the cleanup-failure
+case. The standalone `--setup-failure` and `--cleanup-failure` options still work.
+
+The shared header is accepted only from a normal build with matching compiler,
+export definitions and source-input hashes, including imported `ic/` and mgz
+sources. Its checksum must match its provenance. Normal and fault-only builds
+record their identities separately, and the consumer bundler refuses injected
+builds. The normal library uses the original API source without injection hooks.
+
+This changes CI's large interpreter builds from three to two per platform and
+header emissions from three to one. It retains O2, process-family supervision,
+the 3-GiB/300-second compilation budget and the 2-GiB runtime limits. Actual
+runner elapsed time still depends on native toolchain and queue availability.
+
+Local validation with the pinned Mere `2e3cc433d470842a07c79cc50bd217441c889dc0`
+completed all normal lifecycle, retained-state/allocation stress and packaged
+consumer checks at O2. Both combined failure cases passed. Independently emitting
+the fault fixture's header produced exactly the normal header's bytes. The
+test-only selector was absent from both the normal generated C and consumer
+archive, and the bundler rejected the actual injected build.
+
 ## `scanner_search_lengths.rb`
 
 This fixed workload searches an 8-MiB subject 24 times through `exist?`,

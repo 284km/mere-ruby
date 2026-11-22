@@ -524,3 +524,18 @@ bundled-gem directories stops at corpus 178: `$_` before the first read is
 observed additional environment-dependent Ruby semantic difference; its cause
 is not isolated, and it is not assigned to VM, AST, C API or GC internals.
 It is retained as an open difference, not counted as a successful full sweep.
+
+
+PR 107 Method-copy follow-up (2026-11-22): restore the previously authorized
+`compact_method_store` floor correction omitted from public `263c2dd6`.
+Ordinary macOS O2 parent/candidate/candidate/parent gives
+1.682880 / 1.380188 / 1.382723 / 1.679791 under the unchanged original 2x assertion
+and all 21 prefixes. Preserve the hosted 2.151589x failure and require new hosted
+evidence. Complete core Module, Refinement and Method lose no passing case.
+The original 69 gem files retain 60 MATCH / 7 RED / 0 BOTH / 2 MEMORY with no
+lost accepted MATCH. Logger is now MEMORY in the full sweep; a first separate
+parent is RED, then all four predetermined whole-file comparisons are MEMORY,
+including both parents. Neither Logger's root RSS growth nor its File identity
+error is fixed. Rack Request remains MEMORY. Full corpus 738/738 matches in
+both modes. See `method_floor_pr107_r101.json` for all observations and identities;
+no snapshot or bound is changed, and this is not Linux or latest-main merge proof.
