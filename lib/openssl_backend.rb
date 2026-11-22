@@ -66,8 +66,8 @@ module OpenSSL
         text = value.to_s
         'i' + [text.bytesize].pack('N') + text
       when String then 's' + [value.bytesize].pack('N') + value.b
-      when Array then 'a' + [value.length].pack('N') + value.map { |v| pack(v) }.join
-      when Hash then 'm' + [value.length].pack('N') + value.map { |k, v| pack(k) + pack(v) }.join
+      when Array then 'a' + [value.length].pack('N') + value.map { |v| pack(v) }.join('')
+      when Hash then 'm' + [value.length].pack('N') + value.map { |k, v| pack(k) + pack(v) }.join('')
       when NativeObject then pack(value.__native_id)
       else raise TypeError, 'unsupported provider argument'
       end.b
