@@ -10492,3 +10492,22 @@ verdict dictionary identical to the retained baseline. The three files retain
 in force. All 722 corpus programs match in both hash modes: 520.933 seconds and
 1,290,080 KiB peak family RSS, within the original 900-second / 2-GiB bound.
 This was measured at 8e060d3f before the documentation-only follow-up.
+
+## 2026-11-22 (78): what an explicit GC.start gives back -- test_module's complemented-method-entry leak test on macOS
+
+**The point.** `TestModule#test_complemented_method_entry_memory_leak` fails on main's macOS unittest shard every run: RSS 2.22-2.30 times its start, against ruby's limit of 2.0. The shard keeps the run green, so it went unnoticed. It is no leak. Retained memory after the final GC.start is 55-62 MB whether the loop runs 60,000 or 600,000 times. A loop that makes and drops classes grows two things that an explicit GC.start did not hand back:
+- **The method store (meths_g).** Its arena swings between 8.4 MB and 33.6 MB under that churn, while it holds about 1,270 live rows. compact_method_store copies it only once it doubles.
+- **Mere's region cache.** mem_trim emptied it only down to eight regions, and those eight held grown blocks: the collector's own scratch (GCC 7.3 MB, GFX 6.3 MB, CSD/CSC 4 MB), 28 MB in all. Only the cache cap that mem_trim enforced was below what they held.
+
+**What changed.**
+- `compact_method_store force` copies the store whenever it grew at all since the last copy, when the collection is an explicit GC.start (gc_state "explicit"). The automatic collector keeps its doubling rule.
+- Mere 90d05895 (merelang/mere#87): a trim after real work releases every cached region. Real work means at least 4,096 region acquisitions since the last trim. A trim right after another, as in a loop of GC.starts, keeps them as before. MERE_REF moves to it.
+
+The same Mere commit also fixes eq_<tag> for values holding a float: a tuple, record or variant with a float never equalled even itself in the C backend.
+
+**Measured** (locally, under the test's own harness; it fails on CI's macOS, which kept the loop's peak after GC.start):
+- the leak test's ratio, 1.51 -> 1.32;
+- 2,000 GC.starts with 20,000 live Strings, the same instructions as before (55.8e9);
+- test_module 195/195.
+
+Neither the collection floor nor the class-time floor is touched. LOOP (86) showed that raising them only makes the ratio worse.
