@@ -304,3 +304,23 @@ change or GC cause is claimed by the sender correction.
 The exact original core results and unchanged local lifetime observation
 (1.769x) are retained in suites_runtime_r31.json. All preceding core MATCH
 cases are retained; complete hosted CI remains pending.
+
+
+The separate small-stdlib batch pins Abbrev 0.1.2 and Singleton 0.3.0 by
+release SHA in suites_small_stdlib.lock.json. Their complete original files
+are MATCH on macOS and network-disabled Linux/aarch64 (15 tests / 23
+assertions total); native extensions and runtime dependencies are absent.
+Use the same restore/measure commands with that lock, selecting
+suites_small_stdlib_latest.json on macOS or suites_small_stdlib_linux.json
+on Linux. The initial observation is immutable. Sources remain in an
+external cache, and the new gem-small-stdlib-suites workflow has independent
+Linux/macOS jobs with its own actions/cache key and the same per-file bounds.
+
+Round 34 measures all 117 files on the unchanged parent runtime: 107 MATCH /
+8 RED / 0 BOTH / 2 MEMORY, with 2750 healthy reference tests. Multipart's
+MATCH-to-MEMORY regression stays in the candidate; the stronger preceding
+54-MATCH original baseline is not lowered. Corpus is 731/731. The rejected
+missing-super prototype and all three of its measured batches remain explicit
+trial records; its apparent Mock improvement is not an adopted runtime fix.
+Final runtime source files and the existing workflows are unchanged. The
+Linux lifetime failure and complete hosted comparisons remain merge blockers.
