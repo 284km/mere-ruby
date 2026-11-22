@@ -947,8 +947,33 @@ let gc_class_text = fn (text: str) ->
         let _ = (if stop > start + width then gc_class_mark (substring text start stop) else ()) in
         scan (if stop > start then stop else start + 1) in
   let _ = scan 0 in gc_ref_mark (pack_rf text);
+// The handles that have a singleton class or a recorded base, as integers
+// (id * 8 + kind: 1 str, 2 arr, 3 hsh, 4 prc, 5 bnd), built once at the start
+// of a collection (gc_hng_ids_build) from hng_store and hng_sng_base, which
+// hold a handful of rows. Marking asked every live String, Array, Hash, Proc
+// and Binding for its "kind:id" key in both -- a string made and hashed twice
+// per object, 12% of a collection in test_ast. Slot 0 of gc_hng_ids_on says
+// the set is current: outside a collection the string path answers.
+let gc_hng_ids = (let t = map_new () in let _ = map_compact t in t);
+let gc_hng_ids_on = (let v = vec_new () in let _ = vec_push v 0 in v);
+let gc_hng_kind = fn (prefix: str) ->
+  if str_eq prefix "str:" then 1 else if str_eq prefix "arr:" then 2 else if str_eq prefix "hsh:" then 3
+  else if str_eq prefix "prc:" then 4 else if str_eq prefix "bnd:" then 5 else 0;
+let gc_hng_ids_note = fn (k: str) ->
+  if str_len k > 4 then
+    (let kind = gc_hng_kind (substring k 0 4) in
+     let rest = substring k 4 (str_len k) in
+     let rec digits = fn (i: int) -> (if i >= str_len rest then true else (let o = ord (char_at rest i) in o >= 48 && o <= 57 && digits (i + 1))) in
+     if kind > 0 && str_len rest > 0 && digits 0 then map_set gc_hng_ids (int_of_str rest * 8 + kind) 1 else ())
+  else ();
+let gc_hng_ids_build = fn (u: unit) ->
+  let _ = map_clear gc_hng_ids in
+  let _ = map_iter hng_store (fn (k: str) -> fn _v -> gc_hng_ids_note k) in
+  let _ = map_iter hng_sng_base (fn (k: str) -> fn _v -> gc_hng_ids_note k) in
+  vec_set gc_hng_ids_on 0 1;
 let gc_handle_class = fn (prefix: str) -> fn (id: int) ->
   if map_len hng_store == 0 && map_len hng_sng_base == 0 then ()
+  else if vec_get gc_hng_ids_on 0 == 1 && (let kind = gc_hng_kind prefix in kind > 0 && (if map_has gc_hng_ids (id * 8 + kind) then false else true)) then ()
   else let key = prefix ++ str_of_int id in
     let _ = (if map_has hng_store key then gc_class_mark (map_get hng_store key) else ()) in
     if map_has hng_sng_base key then gc_class_mark (map_get hng_sng_base key) else ();
@@ -2191,12 +2216,15 @@ let gc_collect = fn env -> fn world ->
                                  ++ " stub=" ++ str_of_int (vec_get gc_knob 12)) else ()) in
     let live = gc_live_new () in
     let metadata = gc_metadata_new () in
+    let _ = gc_hng_ids_build () in
     let _ = gc_mark_roots metadata env live in
     let stack_ids = vec_new () in
     let _ = vec_push stack_ids (fb_cur ()) in
     let _ = map_iter fb_state (fn (id: int) -> fn (st: int) -> if (st == 1 || st == 2) && id != fb_cur () then vec_push stack_ids id else ()) in
     let stacks = vec_to_list stack_ids in
     let _ = gc_fixpoint metadata ivars live stacks in
+    // (the singleton handles' set is this marking's only: off again now)
+    let _ = vec_set gc_hng_ids_on 0 0 in
     let _ = (if map_len capi_tab > 0 then capi_gc_sweep live else ()) in
     // (a MatchData still a record holds its subject and its pattern key by
     //  handle: what its ivars would have kept, for the ones that are live --
@@ -14928,6 +14956,50 @@ and builtin_arity_msg_b = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
   else
     let cls = dispatch_cls_of world recv in
     let key0 = cls ++ "#" ++ name in
+    // (what the class's row is -- the table's bounds, or -1 when it has none
+    //  or the program defined the name -- is the same for every call until a
+    //  method is defined, removed or made private, or a module included:
+    //  arity_memo keeps it under the class's token. The arm below took several
+    //  table probes and up to three walks of the ancestors per builtin call,
+    //  2% of test_ast's token test. A singleton's method is the receiver's
+    //  own and is asked each time.)
+    //  The token is the class's own lookup generation (mro_now_class: a
+    //  definition in an anonymous class moves only its local epoch, which a
+    //  global token missed -- `Class.new(Array)` then `def length(a)` kept
+    //  Array#length's 0) with the private/protected count, kept per entry;
+    //  the memo is emptied when it grows past 4,096 rows, as classes made in
+    //  a loop would otherwise leave theirs behind.
+    let tok9 = mro_now_class cls * 1048576 + vec_get attr_ic_st 0 % 1048576 in
+    let _ = (if map_len arity_memo > 4096 then (let _ = map_clear arity_memo in map_clear arity_memo_tk) else ()) in
+    let mk9 = (if with_blk then "b" else "n") ++ key0 in
+    let packed0 = (if map_has arity_memo_tk mk9 && map_get arity_memo_tk mk9 == tok9 then map_get arity_memo mk9
+                   else (let p9 = arity_row world recv cls name key0 with_blk in
+                         let _ = map_set arity_memo mk9 p9 in
+                         let _ = map_set arity_memo_tk mk9 tok9 in p9)) in
+    if packed0 < 0 || hng_sng_has world recv name then ""
+    else
+      let packed = packed0 in
+      let lo = packed / 1024 in
+      let hi = (packed - lo * 1024) - 1 in
+      let n0 = vlen args in
+      // A trailing `k: v` hash is a keyword argument to a method that takes
+      // keywords and a positional Hash to one that does not -- and this table
+      // records only positional bounds. Counting it wrongly refuses one of the
+      // two (`1.23.round(2, half: :up)` or `"l".sub("l", "l" => "L")`), so a
+      // call with one is accepted if EITHER count fits: the check exists to
+      // catch a wrong number, not to decide what a hash means.
+      let kw = (if n0 > 0 then is_kw_hash (vlast args) else false) in
+      let fits = fn (k: int) -> k >= lo && (if hi < 0 then true else k <= hi) in
+      let n = n0 in
+      if fits n0 || (if kw then fits (n0 - 1) else false) then ""
+      else "wrong number of arguments (given " ++ str_of_int n ++ ", expected "
+           ++ (if hi < 0 then str_of_int lo ++ "+"
+               else if lo == hi then str_of_int lo
+               else str_of_int lo ++ ".." ++ str_of_int hi) ++ ")"
+// (...the row itself: the packed bounds a call of `name` on an instance of
+//  `cls` is checked against, or -1 when there is none or the program owns
+//  the name)
+and arity_row = fn world -> fn (recv: Val) -> fn (cls: str) -> fn (name: str) -> fn (key0: str) -> fn (with_blk: bool) ->
     // a class that INCLUDES Enumerable (or Comparable) gets that module's
     // bounds: `Enumerable#all?` takes 0..1 whatever the includer is called,
     // and ten spec files ask exactly that, through a class of their own.
@@ -14946,32 +15018,14 @@ and builtin_arity_msg_b = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
                else if map_has tbl ("Kernel#" ++ name) && obj_is_a world cls "Kernel"
                then "Kernel#" ++ name
                else key0) in
-    if (if map_has tbl key then false else true) then ""
+    if (if map_has tbl key then false else true) then 0 - 1
     // a method the PROGRAM defined owns its own arity -- including one defined
     // on this object's singleton, which dispatch_cls_of does not name
     // (`class << (ary = []); def []; 0; end; end` then read Array#[]'s bounds).
     // (prim_user_has would find the class and ask has_meth again: what is
     //  left of it once has_meth said no is the singleton's question)
-    else if has_meth world cls name || hng_sng_has world recv name then ""
-    else
-      let packed = map_get tbl key in
-      let lo = packed / 1024 in
-      let hi = (packed - lo * 1024) - 1 in
-      let n0 = vlen args in
-      // A trailing `k: v` hash is a keyword argument to a method that takes
-      // keywords and a positional Hash to one that does not -- and this table
-      // records only positional bounds. Counting it wrongly refuses one of the
-      // two (`1.23.round(2, half: :up)` or `"l".sub("l", "l" => "L")`), so a
-      // call with one is accepted if EITHER count fits: the check exists to
-      // catch a wrong number, not to decide what a hash means.
-      let kw = (if n0 > 0 then is_kw_hash (vlast args) else false) in
-      let fits = fn (k: int) -> k >= lo && (if hi < 0 then true else k <= hi) in
-      let n = n0 in
-      if fits n0 || (if kw then fits (n0 - 1) else false) then ""
-      else "wrong number of arguments (given " ++ str_of_int n ++ ", expected "
-           ++ (if hi < 0 then str_of_int lo ++ "+"
-               else if lo == hi then str_of_int lo
-               else str_of_int lo ++ ".." ++ str_of_int hi) ++ ")"
+    else if has_meth world cls name then 0 - 1
+    else map_get tbl key
 // A builtin's call while continuations are loaded (cont_on; through
 // dispatch_prim, builtin_iter, and for flatten and sort with a block the two
 // doors ahead of those): an Array method whose C refuses re-entry is a guard for as long as it runs (cont_gpush), and the
