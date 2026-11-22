@@ -37,10 +37,12 @@ def main():
         parser.error('a reference Ruby executable is required for subprocess context')
     os.environ['REF_RUBY_BIN'] = str(Path(reference).resolve())
     env = ci.test_environment(output / 'environment', binary, '4.0.9')
+    runtime = subprocess.check_output(['sh', str(ROOT / 'tools/runtime_load_path.sh'), str(binary)],
+                                      text=True, timeout=20).split(os.pathsep)
     env.update(RUBY=str(binary), UNITTEST_CHILD_RUBY=str(binary),
                UNITTEST_TEST_FILE='ruby/test_module.rb',
                RUBYLIB=os.pathsep.join(map(str, [source / 'tool/lib', source / 'test',
-                                                ROOT / 'unittest/shim', source / 'lib'])))
+                                                ROOT / 'unittest/shim', *runtime, source / 'lib'])))
     env['PATH'] = str(ROOT / 'unittest/child-bin') + os.pathsep + env['PATH']
     test = source / 'test/ruby/test_module.rb'
     command = [str(binary), '-r', 'test/unit', '-r', str(ROOT / 'unittest/bootstrap.rb'),

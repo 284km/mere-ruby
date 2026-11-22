@@ -242,7 +242,97 @@ let rec skip_blank = fn (i: int) ->
   if c == 32 || c == 9 then skip_blank (i + 1) else i;
 
 // ---- the walk ------------------------------------------------------------------
-let tr = fn (n: int) -> if n == 0 then 0 else ast_tr_node n;
+// What parse.y refuses among arguments written in parentheses or brackets
+// (`foo(...)`, `foo[...]`, `[...]`): a command -- a call with arguments and
+// no parentheses -- given a `do` block, `foo(bar baz do end)`. The lexer
+// reads that `do` as a block's of a command (keyword_do_block), which
+// nothing inside the brackets takes. Also inside a splat and as a keyword
+// argument's value; not inside a `( )` of its own, not a `{ }` block, not a
+// call with no arguments. Prism gives `bar` the block. (as_er)
+let rec cmd_do_check = fn (l: int) ->
+  let rec bad = fn (x: int) ->
+    if pm_is x (pm_t_call ()) then
+      (let b = pm_call_block x in
+       pm_is b (pm_t_block ()) && pm_byte (pm_block_opening_loc_s b) == 100
+       && pm_call_arguments x != 0 && pm_call_opening_loc_s x < 0)
+    else false in
+  let rec go = fn (i: int) ->
+    if i >= pm_ls_len l then ()
+    else
+      (let x = pm_ls_at l i in
+       let _ = (if bad x then
+                  (let b = pm_call_block x in
+                   if vec_len as_er == 0 then vec_push as_er (ast_err_at "syntax error, unexpected 'do' for block" (pm_block_opening_loc_s b) (pm_block_opening_loc_e b)) else ())
+                else if pm_is x (pm_t_splat ()) && pm_splat_expression x != 0 && bad (pm_splat_expression x) then
+                  (let b = pm_call_block (pm_splat_expression x) in
+                   if vec_len as_er == 0 then vec_push as_er (ast_err_at "syntax error, unexpected 'do' for block" (pm_block_opening_loc_s b) (pm_block_opening_loc_e b)) else ())
+                else if pm_is x (pm_t_keyword_hash ()) then
+                  (let es = pm_keyword_hash_elements x in
+                   let rec kv = fn (j: int) ->
+                     if j >= pm_ls_len es then ()
+                     else (let a = pm_ls_at es j in
+                           let _ = (if pm_is a (pm_t_assoc ()) && bad (pm_assoc_value a) then
+                                      (let b = pm_call_block (pm_assoc_value a) in
+                                       if vec_len as_er == 0 then vec_push as_er (ast_err_at "syntax error, unexpected 'do' for block" (pm_block_opening_loc_s b) (pm_block_opening_loc_e b)) else ())
+                                    else ()) in
+                           kv (j + 1)) in
+                   kv 0)
+                else ()) in
+       go (i + 1)) in
+  go 0;
+// (the offset of the newline that ends the line `i` is on; the program's
+//  length when there is none)
+let rec ast_line_end_from = fn (i: int) ->
+  let c = pm_byte i in
+  if c < 0 || c == 10 then i else ast_line_end_from (i + 1);
+// A heredoc's body and its terminator line, as the lexer reads them when it
+// meets the line end after the opener (ao_lx): where the body starts -- its
+// first text, or the terminator when there is none -- and where the
+// terminator line ends.
+let hd_note = fn (n: int) ->
+  let pair = (if pm_is n (pm_t_string ()) then (pm_string_content_loc_s n, pm_string_closing_loc_e n)
+              else if pm_is n (pm_t_xstring ()) then (pm_xstring_content_loc_s n, pm_xstring_closing_loc_e n)
+              else if pm_is n (pm_t_interpolated_string ()) then
+                (let ps = pm_interpolated_string_parts n in
+                 ((if pm_ls_len ps > 0 then pm_start (pm_ls_at ps 0) else pm_interpolated_string_closing_loc_s n),
+                  pm_interpolated_string_closing_loc_e n))
+              else if pm_is n (pm_t_interpolated_xstring ()) then
+                (let ps = pm_interpolated_xstring_parts n in
+                 ((if pm_ls_len ps > 0 then pm_start (pm_ls_at ps 0) else pm_interpolated_xstring_closing_loc_s n),
+                  pm_interpolated_xstring_closing_loc_e n))
+              else (0 - 1, 0 - 1)) in
+  let (bs, ce) = pair in
+  if bs >= 0 && ce >= 0 then (let _ = vec_push ao_lx bs in let _ = vec_push ao_lx ce in ()) else ();
+// (from the start of a line, `k`: past the bodies of the heredocs that start
+//  there, one after another -- what the lexer reads before it looks at the
+//  line again)
+let rec hd_skip = fn (k: int) ->
+  let rec find = fn (i: int) ->
+    if i + 1 >= vec_len ao_lx then 0 - 1
+    else if vec_get ao_lx i == k then vec_get ao_lx (i + 1)
+    else find (i + 2) in
+  if vec_len ao_lx == 0 then k
+  else (let ce = find 0 in if ce > k then hd_skip ce else k);
+let tr = fn (n: int) ->
+  if n == 0 then 0
+  else
+    (let c0 = pm_byte (pm_start n) in
+     // (a percent literal closed by a line end: ao_nl_end)
+     let _ = (if c0 == 37 then
+                (let e = pm_end n in
+                 if e > 0 && pm_byte (e - 1) == 10 then (let _ = vec_push ao_lx (0 - 1) in vec_push ao_lx e) else ())
+              // (a heredoc: hd_skip)
+              else if c0 == 60 && pm_byte (pm_start n + 1) == 60 then hd_note n
+              else ()) in
+     // (arguments in parentheses or brackets: cmd_do_check)
+     let t = vec_get pm_nd n in
+     let _ = (if t == pm_t_call () then
+                (if pm_call_opening_loc_s n >= 0 then
+                   (let a = pm_call_arguments n in if a != 0 then cmd_do_check (pm_arguments_arguments a) else ())
+                 else ())
+              else if t == pm_t_array () && c0 == 91 then cmd_do_check (pm_array_elements n)
+              else ()) in
+     ast_tr_node n);
 let tr_unknown = fn (n: int) -> n0 (nt_error ()) (pm_start n) (pm_end n);
 
 // stmts: stmt_or_begin | stmts terms stmt_or_begin, each through
@@ -505,15 +595,41 @@ let tr_embedded_variable = fn (x: int) ->
 // opener (it has no width, at the opener's end); one that stops at an
 // interpolation starts on the line it stops on; in a `<<~` heredoc every
 // line is a token of its own, and a run of them keeps the first one's place.
-let tr_contents = fn (parts: int) -> fn (hd: int) -> fn (hend: int) ->
+//
+// hd 3 is a `<<~` whose indentation falls to none at a later line (`d`, the
+// first piece that starts a line with no indentation -- text, or the `#{` of
+// an interpolation). parse.y's heredoc_indent shrinks as the lexer reads,
+// and literal_concat does not join pieces while it is above 0: the pieces
+// before `d` stay apart, each text one placed as in a `<<~` heredoc (from
+// where it starts to past its line's newline). From `d` on, literal_concat
+// joins as usual -- a text to the text before it -- and a text after an
+// interpolation is placed as in a plain heredoc; heredoc_dedent, with
+// nothing to remove, leaves it all so.
+let tr_contents = fn (parts: int) -> fn (hd0: int) -> fn (hend: int) ->
   let cnt = pm_ls_len parts in
   let first_b = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0) in
+  let d = (if hd0 != 3 then 0 - 1
+           else
+             (let flush = fn (l: int) -> (let c = pm_byte l in c != 32 && c != 9 && c != 10 && c != 13) in
+              let rec drop_at = fn (i: int) ->
+                if i >= cnt then 0 - 1
+                else (let x = pm_ls_at parts i in
+                      let ps = pm_start x in
+                      if i > 0 && ast_line_start ps == ps && flush ps then ps else drop_at (i + 1)) in
+              drop_at 0)) in
+  // (before `d`: apart, as `<<~`; from `d` on: as a plain heredoc)
+  let pre = fn (x: int) -> hd0 == 3 && (d < 0 || pm_start x < d) in
+  let hd_of = fn (x: int) -> if hd0 != 3 then hd0 else if pre x then 2 else 1 in
   let rec run_end = fn (i: int) ->
     if i + 1 < cnt && pm_is (pm_ls_at parts (i + 1)) (pm_t_string ()) then run_end (i + 1) else i in
   let rec go = fn (i: int) -> fn (acc: int) -> fn (prev_str: bool) ->
     if i >= cnt then acc
     else
       (let x = pm_ls_at parts i in
+       let hd = hd_of x in
+       // (literal_concat as parse.y's runs it here: apart while there is
+       //  indentation to remove)
+       let apart = pre x in
        if pm_is x (pm_t_string ()) then
          (let ps = pm_start x in
           // (in a plain heredoc the text up to the next interpolation is one
@@ -534,30 +650,64 @@ let tr_contents = fn (parts: int) -> fn (hd: int) -> fn (hend: int) ->
           let st = n1 (nt_str ()) b e (lit_str (vec_get pm_st (pm_string_unescaped x)) (ast_str_enc x)) in
           // (a `<<~` run of lines is one STR after heredoc_dedent: the
           //  first's place, the text of all)
-          if hd == 2 && prev_str && acc != 0 then
+          if hd0 == 2 && prev_str && acc != 0 then
             (let lit = (if a_is acc (nt_str ()) then a_f acc 0 else p_literal_head acc) in
              let _ = (if lit != 0 then p_lit_append lit (a_f st 0) else ()) in
              go (i + 1) (if lit != 0 then acc else p_literal_concat acc st first_b pe false) true)
-          else go (i + 1) (p_literal_concat acc st first_b pe false) true)
+          else go (i + 1) (p_literal_concat acc st first_b pe apart) true)
        else if pm_is x (pm_t_embedded_statements ()) then
          (let ev = tr_embedded_statements x in
-          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) false) false)
+          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) apart) false)
        else if pm_is x (pm_t_embedded_variable ()) then
          (let ev = tr_embedded_variable x in
-          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) false) false)
+          go (i + 1) (p_literal_concat acc ev first_b (pm_end x) apart) false)
        else
          (let v = tr x in
-          go (i + 1) (p_literal_concat acc v first_b (pm_end x) false) false)) in
-  go 0 0 false;
-// (is this opener a heredoc's, and is it a `<<~`? 0, 1 or 2. `first`: where
-//  its text starts -- a `<<~` whose first line has no indentation has none
-//  to remove, and the lexer then reads it as it reads a plain one)
-let heredoc_kind = fn (os: int) -> fn (first: int) ->
+          go (i + 1) (p_literal_concat acc v first_b (pm_end x) apart) false)) in
+  let r = go 0 0 false in
+  // (heredoc_dedent: a `<<~` DSTR whose pieces all joined its head -- a
+  //  literal interpolated, `#{"y"}` -- is a STR)
+  if hd0 == 2 && r != 0 && a_is r (nt_dstr ()) && a_f r 1 == 0 then n1 (nt_str ()) (a_beg r) (a_end r) (a_f r 0)
+  else r;
+// (is this opener a heredoc's, and is it a `<<~`? 0, 1 or 2. `parts`: its
+//  text -- a `<<~` with a line that has no indentation (the first one, or
+//  any other outside an interpolation, one that starts with `#{` too) has
+//  none to remove, and the lexer then reads it as it reads a plain one)
+let heredoc_kind = fn (os: int) -> fn (parts: int) ->
+  let cnt = pm_ls_len parts in
+  let first = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0 - 1) in
+  let flush = fn (l: int) -> (let c = pm_byte l in c != 32 && c != 9 && c != 10 && c != 13) in
+  // (is offset `l` inside an interpolation -- past its start?)
+  let rec inside = fn (i: int) -> fn (l: int) ->
+    i < cnt && ((let x = pm_ls_at parts i in nott (pm_is x (pm_t_string ())) && pm_start x < l && l < pm_end x) || inside (i + 1) l) in
+  let last = (if cnt > 0 then pm_end (pm_ls_at parts (cnt - 1)) else 0) in
+  let rec any_flush = fn (ln: int) ->
+    if ln >= vec_len pm_lo then false
+    else (let l = vec_get pm_lo ln in
+          if l >= last then false
+          else if flush l && nott (inside 0 l) then true
+          else any_flush (ln + 1)) in
   if os < 0 || pm_byte os != 60 || pm_byte (os + 1) != 60 then 0
   else if pm_byte (os + 2) == 126 then
-    (let c = pm_byte (ast_line_start first) in
-     if first >= 0 && c != 32 && c != 9 && c != 10 then 1 else 2)
+    (if first >= 0 && flush (ast_line_start first) then 1
+     // (3: the first line is indented and a later one is not -- the pieces
+     //  before that one stay apart: tr_contents)
+     else if first >= 0 && any_flush (ao_line_of first + 1) then 3
+     else 2)
   else 1;
+// (Prism's parts are all text: what parse.y's lexer read as ONE token,
+//  which a heredoc body after a `\`-continued line splits in Prism only)
+let parts_all_text = fn (ps: int) ->
+  let rec go = fn (i: int) -> i >= pm_ls_len ps || (pm_is (pm_ls_at ps i) (pm_t_string ()) && go (i + 1)) in
+  pm_ls_len ps > 1 && go 0;
+// (a word of %w[] / %i[] that is such a token: placed as a word token is,
+//  from the start of the line it ends on)
+let word_token_place = fn (d: int) -> fn (n: int) -> fn (ps: int) ->
+  let e = pm_end n in
+  let ls = ast_line_start e in
+  if parts_all_text ps && ls > pm_start n && (a_is d (nt_str ()) || a_is d (nt_sym ())) then
+    (let _ = a_set_beg d ls in let _ = a_set_end d e in d)
+  else d;
 // string1: tSTRING_BEG string_contents tSTRING_END, then `strings`'
 // evstr2dstr -- one literal, located at the whole of it
 let tr_string1 = fn (n: int) ->
@@ -572,7 +722,7 @@ let tr_string1 = fn (n: int) ->
   else
     (let os = pm_interpolated_string_opening_loc_s n in
      let parts = pm_interpolated_string_parts n in
-     let c = tr_contents parts (heredoc_kind os (if pm_ls_len parts > 0 then pm_start (pm_ls_at parts 0) else 0 - 1)) e in
+     let c = tr_contents parts (heredoc_kind os parts) e in
      if c == 0 then n1 (nt_str ()) b e (lit_str "" (src_enc ()))
      else (let _ = a_set_beg c b in
            let _ = a_set_end c e in
@@ -603,7 +753,7 @@ let tr_interpolated_string = fn (n: int) ->
     // a word of %W[...]: its contents, with no delimiters of its own
     (let c = tr_contents parts 0 0 in
      if c == 0 then n1 (nt_str ()) (pm_start n) (pm_end n) (lit_str "" (src_enc ()))
-     else p_evstr2dstr c)
+     else word_token_place (p_evstr2dstr c) n parts)
   else p_evstr2dstr (tr_string1 n);
 // xstring: new_xstring
 let tr_xstring = fn (n: int) ->
@@ -612,7 +762,7 @@ let tr_interpolated_xstring = fn (n: int) ->
   let b = pm_start n in
   let e = pm_end n in
   let xparts = pm_interpolated_xstring_parts n in
-  let c = tr_contents xparts (heredoc_kind (pm_interpolated_xstring_opening_loc_s n) (if pm_ls_len xparts > 0 then pm_start (pm_ls_at xparts 0) else 0 - 1)) e in
+  let c = tr_contents xparts (heredoc_kind (pm_interpolated_xstring_opening_loc_s n) xparts) e in
   if c == 0 then n1 (nt_xstr ()) b e (lit_str "" (src_enc ()))
   else if a_is c (nt_str ()) then (let _ = a_set_ty c (nt_xstr ()) in let _ = a_set_beg c b in let _ = a_set_end c e in c)
   else if a_is c (nt_dstr ()) then (let _ = a_set_ty c (nt_dxstr ()) in let _ = a_set_beg c b in let _ = a_set_end c e in c)
@@ -640,7 +790,20 @@ let tr_interpolated_symbol = fn (n: int) ->
     // a word of %I[...]: symbol_append(evstr2dstr(word))
     (let d = p_evstr2dstr c in
      if a_is d (nt_dstr ()) then (let _ = a_set_ty d (nt_dsym ()) in d)
-     else if a_is d (nt_str ()) then n1 (nt_sym ()) (a_beg d) (a_end d) (id_of_lit (a_f d 0))
+     else if a_is d (nt_str ()) then
+       (let ps = pm_interpolated_symbol_parts n in
+        let sy = n1 (nt_sym ()) (a_beg d) (a_end d) (id_of_lit (a_f d 0)) in
+        // (Prism places such a word -- and each of its parts -- where its
+        //  first line is: the token goes on past the heredoc bodies, to the
+        //  length of its last line)
+        if parts_all_text ps && pm_start (pm_ls_at ps (pm_ls_len ps - 1)) == pm_start (pm_ls_at ps 0) then
+          (let tx = lit_text (a_f d 0) in
+           let rec last_nl = fn (i: int) -> if i < 0 then 0 - 1 else if ord (char_at tx i) == 10 then i else last_nl (i - 1) in
+           let k1 = hd_skip (ast_line_end_from (pm_end n) + 1) in
+           let _ = a_set_beg sy k1 in
+           let _ = a_set_end sy (k1 + str_len tx - last_nl (str_len tx - 1) - 1) in
+           sy)
+        else word_token_place sy n ps)
      else d);
 // cond0 on a range in a condition: FLIP2 / FLIP3; an Integer end is
 // compared with the line number (range_op)
@@ -713,22 +876,24 @@ let rec regx_has_property = fn (src: str) -> fn (i: int) ->
 let tr_regx = fn (ty: int) -> fn (n: int) -> fn (src: str) -> fn (os: int) -> fn (oe: int) -> fn (cs: int) -> fn (ce: int) ->
   let r = n1 ty (pm_start n) (pm_end n) (regx_lit n src) in
   // (a MATCH -- the REGX of a condition -- answers only its own location)
-  if ty == nt_match () then r else a_xloc r [os, oe, oe, tok_end cs, cs, ce];
+  // (`%r\nfoo\n`: the opening and the closing each end on their line end's line)
+  // (no text, only a heredoc's body between the opening and the closing:
+  //  the text ends where it starts)
+  let te = (if cs > oe && hd_skip oe == cs then tok_end oe else tok_end cs) in
+  if ty == nt_match () then r else a_xloc r [os, tok_end oe, tok_end oe, te, cs, tok_end ce];
 // (where a text token that ends at offset `e` ends: one whose last byte is a
 //  newline ends on that newline's line, in the column past it)
 let tok_end = fn (e: int) ->
   if e > 0 && pm_byte (e - 1) == 10 then pos_lc (ao_line_of (e - 1)) (e - vec_get pm_lo (ao_line_of (e - 1))) else e;
-let tr_regular_expression = fn (n: int) ->
-  tr_regx (nt_regx ()) n (vec_get pm_st (pm_regular_expression_unescaped n))
-    (pm_regular_expression_opening_loc_s n) (pm_regular_expression_opening_loc_e n)
-    (pm_regular_expression_closing_loc_s n) (pm_regular_expression_closing_loc_e n);
-// (a regexp literal that is a condition: cond0 makes the REGX a MATCH)
-let tr_match_last_line = fn (n: int) ->
-  tr_regx (nt_match ()) n (vec_get pm_st (pm_match_last_line_unescaped n))
-    (pm_match_last_line_opening_loc_s n) (pm_match_last_line_opening_loc_e n)
-    (pm_match_last_line_closing_loc_s n) (pm_match_last_line_closing_loc_e n);
 // regexp_contents: its own fold -- the first part becomes a DSTR (one with
 // no string when it is not text), the rest are appended
+let regx_fold = fn (acc: int) -> fn (v: int) -> fn (first_b: int) ->
+  if acc == 0 then v
+  else
+    (let head = (if a_is acc (nt_str ()) then p_str2dstr acc
+                 else if a_is acc (nt_dstr ()) then acc
+                 else p_list_append (n3 (nt_dstr ()) first_b (a_end v) 0 0 1) acc) in
+     p_list_append head v);
 let tr_regexp_contents = fn (parts: int) ->
   let cnt = pm_ls_len parts in
   let first_b = (if cnt > 0 then pm_start (pm_ls_at parts 0) else 0) in
@@ -751,10 +916,9 @@ let tr_regexp_contents = fn (parts: int) ->
                       else p_list_append (n3 (nt_dstr ()) first_b (pm_end x) 0 0 1) acc) in
           go (i + 1) (p_list_append head v))) in
   go 0 0;
-let tr_dregx = fn (n: int) -> fn (parts: int) ->
+let tr_dregx_of = fn (n: int) -> fn (c: int) ->
   let b = pm_start n in
   let e = pm_end n in
-  let c = tr_regexp_contents parts in
   let d = (if a_is c (nt_dstr ()) then c
            else if a_is c (nt_str ()) then p_str2dstr c
            else n3 (nt_dstr ()) b e (lit_str "" (src_enc ())) (p_new_list c b e) 1) in
@@ -782,8 +946,152 @@ let tr_dregx = fn (n: int) -> fn (parts: int) ->
           each (a_f cell 1)) in
   let _ = each (a_f d 1) in
   if pm_has n (pm_f_regular_expression_once ()) then n1 (nt_once ()) b e d else d;
+let tr_dregx = fn (n: int) -> fn (parts: int) -> tr_dregx_of n (tr_regexp_contents parts);
+// (where parse.y's lexer ends a regexp's text token although nothing is
+//  interpolated: before a `#` that a `@` or `$` follows -- tokadd_string
+//  stops there for parser_peek_variable_name, which finds no variable name
+//  (Prism would have made one an interpolation), and the text from that `#`
+//  is the next token. Not at the text's start, where no token has begun;
+//  not after a `\`. The offsets of those `#`s, in order.)
+let regx_splits = fn (cs: int) -> fn (ce: int) ->
+  let rec go = fn (i: int) ->
+    if i + 1 >= ce then (Nil : int list)
+    else (let c = pm_byte i in
+          // (a control or meta escape is read whole, its operand -- a `#`
+          //  too -- with it: read_escape)
+          if c == 92 then
+            (let d = pm_byte (i + 1) in
+             if d == 99 || d == 67 || d == 77 then
+               (let (v, n) = rx_read_escape (i + 1) ce false false in if v < 0 then go (i + 2) else go n)
+             else go (i + 2))
+          else if c == 35 && i > cs && (pm_byte (i + 1) == 64 || pm_byte (i + 1) == 36) then Cons (i, go (i + 1))
+          else go (i + 1)) in
+  go cs;
+// (a regexp text token's bytes as parse.y's tokadd_string leaves them: a
+//  `\` and the line end after it go; an escaped closing delimiter is the
+//  delimiter, unless it means something to the regexp (simple_re_meta); a
+//  `\` before a non-ASCII byte goes; `\cX`, `\C-X`, `\M-X` are written
+//  as the byte they mean, `\xHH`; every other escape stays as written)
+// (parse.y's read_escape, from the byte after the `\` at `i`, below the
+//  `\M-` (`meta`) and `\C-` / `\c` (`ctl`) already read: the byte and
+//  where the escape ends, or -1 when ruby refuses it. A control or meta
+//  escape's operand is a whole escape again -- `\c\n`, `\M-\x41` -- or a
+//  byte; `\c?` alone is DEL)
+let rec rx_read_escape = fn (i: int) -> fn (e: int) -> fn (meta: bool) -> fn (ctl: bool) ->
+  let oct = fn (k: int) -> k < e && pm_byte k >= 48 && pm_byte k <= 55 in
+  let hex = fn (k: int) ->
+    (let c = pm_byte k in
+     if k >= e then 0 - 1 else if c >= 48 && c <= 57 then c - 48
+     else if c >= 97 && c <= 102 then c - 87 else if c >= 65 && c <= 70 then c - 55 else 0 - 1) in
+  let operand = fn (j: int) -> fn (m: bool) -> fn (k: bool) -> fn (q: bool) ->
+    // (what a control or meta escape works on, before its mask, under the
+    //  prefixes `m` and `k` now read; with `q`, a control escape's, a bare
+    //  `?` is -2)
+    (if j >= e then (0 - 1, j)
+     else if pm_byte j == 92 then
+       (if j + 1 < e && pm_byte (j + 1) == 117 then (0 - 1, j) else rx_read_escape (j + 1) e m k)
+     else if pm_byte j >= 128 then (0 - 1, j)
+     else if q && pm_byte j == 63 then (0 - 2, j + 1)
+     else (pm_byte j, j + 1)) in
+  let ctl_of = fn (v: int) -> fn (n: int) ->
+    (if v == 0 - 2 then (127, n) else if v < 0 then (0 - 1, i) else (bit_and v 159, n)) in
+  if i >= e then (0 - 1, i)
+  else
+    (let c = pm_byte i in
+     if c == 77 then
+       (if meta || pm_byte (i + 1) != 45 then (0 - 1, i)
+        else (let (v, n) = operand (i + 2) true ctl false in
+              if v < 0 then (0 - 1, i) else (bit_or (bit_and v 255) 128, n)))
+     else if c == 67 then
+       (if ctl || pm_byte (i + 1) != 45 then (0 - 1, i)
+        else (let (v, n) = operand (i + 2) meta true true in ctl_of v n))
+     else if c == 99 then
+       (if ctl then (0 - 1, i) else (let (v, n) = operand (i + 1) meta true true in ctl_of v n))
+     else if c == 110 then (10, i + 1) else if c == 116 then (9, i + 1)
+     else if c == 114 then (13, i + 1) else if c == 102 then (12, i + 1)
+     else if c == 118 then (11, i + 1) else if c == 97 then (7, i + 1)
+     else if c == 101 then (27, i + 1) else if c == 98 then (8, i + 1)
+     else if c == 115 then (32, i + 1)
+     else if oct i then
+       (let k2 = (if oct (i + 1) then (if oct (i + 2) then i + 3 else i + 2) else i + 1) in
+        let rec ov = fn (k: int) -> fn (acc: int) -> (if k >= k2 then acc else ov (k + 1) (acc * 8 + pm_byte k - 48)) in
+        (bit_and (ov i 0) 255, k2))
+     else if c == 120 then
+       (let h1 = hex (i + 1) in
+        if h1 < 0 then (0 - 1, i)
+        else (let h2 = hex (i + 2) in if h2 < 0 then (h1, i + 2) else (h1 * 16 + h2, i + 3)))
+     else if c >= 128 then (0 - 1, i)
+     else (c, i + 1));
+let rx_ctl_escape = fn (i: int) -> fn (e: int) -> rx_read_escape i e false false;
+let rx_token_text = fn (b: int) -> fn (e: int) -> fn (term: int) ->
+  let meta = fn (c: int) -> c == 36 || c == 42 || c == 43 || c == 46 || c == 63 || c == 94 || c == 124
+                            || c == 41 || c == 93 || c == 125 || c == 62 in
+  let rec go = fn (i: int) -> fn (from: int) -> fn (acc: str) ->
+    if i >= e then acc ++ pm_text from e
+    else if pm_byte i == 92 && i + 1 < e then
+      (let c = pm_byte (i + 1) in
+       if c == 10 then go (i + 2) (i + 2) (acc ++ pm_text from i)
+       else if c == 13 && i + 2 < e && pm_byte (i + 2) == 10 then go (i + 3) (i + 3) (acc ++ pm_text from i)
+       else if (c == term && nott (meta c)) || c >= 128 then go (i + 2) (i + 1) (acc ++ pm_text from i)
+       else if c == 99 || c == 67 || c == 77 then
+         (let (v, n) = rx_ctl_escape (i + 1) e in
+          if v < 0 then go (i + 2) from acc
+          else
+            (let hx = "0123456789ABCDEF" in
+             go n n (acc ++ pm_text from i ++ "\\x" ++ char_at hx (v / 16) ++ char_at hx (v % 16))))
+       else go (i + 2) from acc)
+    else go (i + 1) from acc in
+  go b b "";
+// (those tokens are regexp_contents' pieces, folded as with interpolation;
+//  `term`, the closing delimiter)
+let regx_split_contents = fn (cs: int) -> fn (ce: int) -> fn (sp: int list) -> fn (term: int) ->
+  let piece = fn (b: int) -> fn (e: int) ->
+    (let ls = ast_line_start e in
+     n1 (nt_str ()) (if ls > b then ls else b) e (lit_str (rx_token_text b e term) (src_enc ()))) in
+  let rec go = fn (b: int) -> fn (xs: int list) -> fn (acc: int) ->
+    (match xs with
+     | Nil -> regx_fold acc (piece b ce) cs
+     | Cons (k, t) -> go k t (regx_fold acc (piece b k) cs)) in
+  go cs sp 0;
+let tr_regular_expression = fn (n: int) ->
+  let cs = pm_regular_expression_content_loc_s n in
+  let ce = pm_regular_expression_content_loc_e n in
+  let sp = (if cs >= 0 then regx_splits cs ce else Nil) in
+  match sp with
+  | Nil ->
+    tr_regx (nt_regx ()) n (vec_get pm_st (pm_regular_expression_unescaped n))
+      (pm_regular_expression_opening_loc_s n) (pm_regular_expression_opening_loc_e n)
+      (pm_regular_expression_closing_loc_s n) (pm_regular_expression_closing_loc_e n)
+  | _ -> tr_dregx_of n (regx_split_contents cs ce sp (pm_byte (pm_regular_expression_closing_loc_s n)));
+// (a regexp literal that is a condition: cond0 makes the REGX a MATCH --
+//  and a DREGX, the text split as tr_regular_expression says, a MATCH2 with $_)
+let tr_match_last_line = fn (n: int) ->
+  let cs = pm_match_last_line_content_loc_s n in
+  let ce = pm_match_last_line_content_loc_e n in
+  let sp = (if cs >= 0 then regx_splits cs ce else Nil) in
+  match sp with
+  | Nil ->
+    tr_regx (nt_match ()) n (vec_get pm_st (pm_match_last_line_unescaped n))
+      (pm_match_last_line_opening_loc_s n) (pm_match_last_line_opening_loc_e n)
+      (pm_match_last_line_closing_loc_s n) (pm_match_last_line_closing_loc_e n)
+  | _ ->
+    (let d = tr_dregx_of n (regx_split_contents cs ce sp (pm_byte (pm_match_last_line_closing_loc_s n))) in
+     let b = cl_b (pm_start n) in
+     let e = cl_e (pm_end n) in
+     let g = n1 (nt_gvar ()) b e (id_of "$_") in
+     n3 (nt_match2 ()) b e d g 0);
+
+// (the parts all text: one token to parse.y -- see parts_all_text -- and a REGX)
+let text_of_parts = fn (ps: int) ->
+  let rec go = fn (i: int) -> if i >= pm_ls_len ps then "" else vec_get pm_st (pm_string_unescaped (pm_ls_at ps i)) ++ go (i + 1) in
+  go 0;
 let tr_interpolated_regular_expression = fn (n: int) ->
-  tr_dregx n (pm_interpolated_regular_expression_parts n);
+  let ps = pm_interpolated_regular_expression_parts n in
+  if parts_all_text ps then
+    tr_regx (nt_regx ()) n (text_of_parts ps)
+      (pm_interpolated_regular_expression_opening_loc_s n) (pm_interpolated_regular_expression_opening_loc_e n)
+      (pm_interpolated_regular_expression_closing_loc_s n) (pm_interpolated_regular_expression_closing_loc_e n)
+  else tr_dregx n ps;
 // (an interpolated regexp that is a condition: cond0's NEW_MATCH2(node, $_))
 let tr_interpolated_match_last_line = fn (n: int) ->
   let d = tr_dregx n (pm_interpolated_match_last_line_parts n) in
@@ -1236,7 +1544,13 @@ let tr_call = fn (n: int) ->
                          && pm_call_arguments recv != 0 && pm_call_opening_loc_s recv < 0 in
      // (primary_value call_op operation2 command_args cmd_brace_block: the same)
      let cmd_brace = recv != 0 && argsn != 0 && ce < 0 && pm_byte (pm_block_opening_loc_s blk) == 123 in
-     let core = tr_call_core n (if on_block_call || cmd_brace then pm_end n else en) in
+     // (primary_value tCOLON2 tCONSTANT brace_block -- `Foo::Bar { }`,
+     //  ruby bug #18878 -- the same)
+     let ms = pm_call_message_loc_s n in
+     let cop = pm_call_call_operator_loc_s n in
+     let colon_const = recv != 0 && argsn == 0 && ce < 0 && cop >= 0 && pm_byte cop == 58 && pm_byte (cop + 1) == 58
+                       && ms >= 0 && pm_byte ms >= 65 && pm_byte ms <= 90 && pm_byte (pm_block_opening_loc_s blk) == 123 in
+     let core = tr_call_core n (if on_block_call || cmd_brace || colon_const then pm_end n else en) in
      tr_iter core blk (pm_start n) (pm_end n))
   else tr_call_core n (pm_end n);
 
@@ -1388,19 +1702,26 @@ let tr_class = fn (n: int) ->
 // newline included, and looks at the next line; comment lines after it are
 // read the same way, so the token is the column past the newline on the
 // LAST of those lines. When the program ends there, no newline token is
-// placed and the last comment's own start is what the grammar sees.
+// placed and the last comment's own start is what the grammar sees -- but
+// when the line after it holds only blanks and the program ends on it with
+// no newline, the token is that line's start.
+//   When the lines after it are the bodies of heredocs the line opened, the
+// lexer reads them first: the program ending after them is the program
+// ending there, and otherwise the token is on the last of their lines, in
+// the column past the comment line's newline.
 let rec nl_after_comment = fn (i: int) ->
   let k = ast_line_end_from i in
-  if pm_byte k < 0 || pm_byte (k + 1) < 0 then i
+  let k1 = (if pm_byte k < 0 then k + 1 else hd_skip (k + 1)) in
+  if pm_byte k < 0 || pm_byte k1 < 0 then i
+  else if k1 != k + 1 then
+    (let j = skip_blank k1 in
+     if pm_byte j == 35 then nl_after_comment j
+     else pos_lc (ao_line_of (k1 - 1)) (k - vec_get pm_lo (ao_line_of k) + 1))
   else
     (let j = skip_blank (k + 1) in
      if pm_byte j == 35 then nl_after_comment j
+     else if pm_byte j < 0 then k + 1
      else pos_lc (ao_line_of k) (k - vec_get pm_lo (ao_line_of k) + 1));
-// (the offset of the newline that ends the line `i` is on; the program's
-//  length when there is none)
-let rec ast_line_end_from = fn (i: int) ->
-  let c = pm_byte i in
-  if c < 0 || c == 10 then i else ast_line_end_from (i + 1);
 // (the end of the `term` that starts at or after `i`: past a `;`, or at the
 //  line end a newline token is)
 let rec skip_term = fn (i: int) ->
@@ -1566,11 +1887,18 @@ let stmts_end = fn (sn: int) -> fn (dflt: int) ->
   else if dflt < 1099511627776 then skip_semis dflt
   else dflt;
 let stmts_end_of = fn (sn: int) -> fn (dflt: int) ->
-  if sn == 0 || pm_ls_len (pm_statements_body sn) == 0 then dflt else skip_terms (pm_end sn);
+  if sn == 0 || pm_ls_len (pm_statements_body sn) == 0 then dflt
+  else
+    (let t = skip_terms (pm_end sn) in
+     // (the last statement a percent literal closed by a line end, and a
+     //  line end after it: the term is read, and the end is past it -- the
+     //  next line's start, which ao_nl_end would put back on the literal's)
+     if t == pm_end sn && pm_byte t == 10 && ao_nl_end t != t then pos_lc (ao_line_of t) (t - vec_get pm_lo (ao_line_of t))
+     else t);
 // (past the terms after offset `i`, where a statement ends: a `;` or the
 //  line end, then every `;` after it -- once a term is read the lexer is at
 //  the start of an expression, where line ends and comments are skipped)
-let skip_terms = fn (i: int) ->
+let rec skip_terms = fn (i: int) ->
   let j = skip_blank i in
   let c = pm_byte j in
   if c == 59 then skip_semis (j + 1)
@@ -1579,6 +1907,16 @@ let skip_terms = fn (i: int) ->
                         let k = ast_line_end_from j in
                         let t = skip_semis k in
                         if t == k then p0 else t)
+  // (a `\` before the line end continues the line: the lexer reads past it,
+  //  and past the bodies of heredocs the line opened, and the term is what
+  //  comes after them -- none when the program ends there)
+  else if c == 92 && (pm_byte (j + 1) == 10 || (pm_byte (j + 1) == 13 && pm_byte (j + 2) == 10)) then
+    (let k1 = hd_skip (if pm_byte (j + 1) == 10 then j + 2 else j + 3) in
+     let j2 = skip_blank k1 in
+     let c2 = pm_byte j2 in
+     if c2 == 13 && pm_byte (j2 + 1) == 10 then j2
+     else if c2 == 10 || c2 == 59 || c2 == 35 || c2 == 92 then skip_terms k1
+     else i)
   else i;
 // (past every `;` from offset `i` on, with blanks, line ends and comments
 //  between; `i` itself when there is none)
