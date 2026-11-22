@@ -755,8 +755,32 @@ let tc_skipped = fn (s: str) -> fn (i: int) ->
 let tc_mark = fn (s: str) -> fn (j: int) ->
   if (if map_has tc_st "on" then map_get tc_st "on" == 1 else false) && str_len s == map_get tc_st "len" then map_set tc_st "prev" j else ();
 let rec lex_go = fn (s: str) -> fn (i: int) ->
+  // Interpolations lex their own source. Continuation offsets belong to that
+  // invocation, even when its source has the same length as its parent's.
+  if i == 0 then
+    (let parent9 = (if map_has tc_st "lc_scope" then map_get tc_st "lc_scope" else 0) in
+     let scope9 = (if map_has tc_st "lc_next" then map_get tc_st "lc_next" + 1 else 1) in
+     let _ = map_set tc_st "lc_next" scope9 in
+     let _ = map_set tc_st "lc_scope" scope9 in
+     let toks9 = lex_go_step s i in
+     let _ = map_set tc_st "lc_scope" parent9 in toks9)
+  else lex_go_step s i
+and lex_go_step = fn (s: str) -> fn (i: int) ->
   let k = tc_skipped s i in
   if k > 0 then Cons (TCont k, lex_go_b s i) else lex_go_b s i
+// Only the lexer can prove that a backslash is code rather than comment or
+// literal text. Keep that proof while lexing the rest of this source, then
+// remove it; tc_st gains no source text or persistent offset entries.
+and lex_cont_key = fn (i: int) ->
+  "lc:" ++ str_of_int (if map_has tc_st "lc_scope" then map_get tc_st "lc_scope" else 0) ++ ":" ++ str_of_int i
+and lex_comment_key = fn (e: int) ->
+  "lm:" ++ str_of_int (if map_has tc_st "lc_scope" then map_get tc_st "lc_scope" else 0) ++ ":" ++ str_of_int e
+and lex_cont_go = fn (s: str) -> fn (i: int) ->
+  let key9 = lex_cont_key (i + 1) in
+  let _ = map_set tc_st key9 1 in
+  let j = hd_jump s (i + 1) in
+  let toks9 = lex_go s (if j >= 0 then j else i + 2) in
+  let _ = map_delete tc_st key9 in toks9
 and lex_go_b = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
   else
@@ -787,17 +811,23 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
        Cons (TNL i, lex_go s (if j >= 0 then j else i + 1)))
     else if str_eq c "#" then
       (let e = skip_comment s i in
+       // (where the comment ending at this newline began, while the rest of
+       //  this source lexes: a look back from a later token passes over it --
+       //  after_class_kw -- as only the lexer knows a `#` starts a comment)
+       let ckey9 = lex_comment_key e in
+       let _ = map_set tc_st ckey9 i in
        let _ = ind_directive (substring s i e) in
        let v = scv_value s i e in
        // (a frozen_string_literal comment after the first token is no magic
        //  comment: -w says so, once the line is a comment alone)
        let _ = (if parse_verbose () && fsl_comment_text (substring s i e) && scv_comment_only s i && code_before s i
                 then lex_warn_at s i "'frozen_string_literal' is ignored after any tokens" else ()) in
-       if str_eq v "" then lex_go s e
-       else if (if scv_comment_only s i then false else true) then
-         (let _ = (if parse_verbose () then lex_warn_at s i "'shareable_constant_value' is ignored unless in comment-only line" else ()) in lex_go s e)
-       else if scv_known (scv_norm v 0 "") then Cons (TId ("__scv~" ++ scv_norm v 0 ""), lex_go s e)
-       else (let _ = (if parse_verbose () then lex_warn_at s i ("invalid value for shareable_constant_value: " ++ v) else ()) in lex_go s e))
+       let toks9 = (if str_eq v "" then lex_go s e
+                    else if (if scv_comment_only s i then false else true) then
+                      (let _ = (if parse_verbose () then lex_warn_at s i "'shareable_constant_value' is ignored unless in comment-only line" else ()) in lex_go s e)
+                    else if scv_known (scv_norm v 0 "") then Cons (TId ("__scv~" ++ scv_norm v 0 ""), lex_go s e)
+                    else (let _ = (if parse_verbose () then lex_warn_at s i ("invalid value for shareable_constant_value: " ++ v) else ()) in lex_go s e)) in
+       let _ = map_delete tc_st ckey9 in toks9)
     // `=begin` ... `=end` block comment: both markers sit at column 0.
     else if str_eq c "=" && (i == 0 || str_eq (char_at s (i - 1)) "\n")
             && i + 6 <= str_len s && str_eq (substring s i (i + 6)) "=begin" then
@@ -1266,6 +1296,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
               (Cons (TP (if u8 then ")u8" else ")"), Cons (TP ".", Cons (TId "to_sym", lex_go s j)))))
     else if str_eq c "<" && i + 3 < str_len s && str_eq (char_at s (i + 1)) "<"
             && (str_eq (char_at s (i + 2)) "~" || str_eq (char_at s (i + 2)) "-")
+            && (if after_class_kw s i then false else true)
             && (is_alpha (char_at s (i + 3)) || str_eq (char_at s (i + 3)) "\"" || str_eq (char_at s (i + 3)) "'" || str_eq (char_at s (i + 3)) "`"
                 // (an id may start with a digit, `<<~0`, where a value starts:
                 //  `x <<~1` is a shift of ~1)
@@ -1285,6 +1316,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
       else hd_lex s idend hid squiggly (quoted && str_eq q0 "'")
     else if str_eq c "<" && i + 3 < str_len s && str_eq (char_at s (i + 1)) "<"
             && (str_eq (char_at s (i + 2)) "\"" || str_eq (char_at s (i + 2)) "'" || str_eq (char_at s (i + 2)) "`")
+            && (if after_class_kw s i then false else true)
             && (regex_position s i || lvt_cmd_arg s i) then
       // <<"ID" (interpolating) / <<'ID' (raw) quoted heredocs.
       let q = char_at s (i + 2) in
@@ -1305,7 +1337,8 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
       if str_eq q "`" then hd_lex_cmd s (idend0 + 1) hid false
       else hd_lex s (idend0 + 1) hid false (str_eq q "'")
     else if str_eq c "<" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "<"
-            && (is_alpha (char_at s (i + 2)) || is_digit (char_at s (i + 2))) && (regex_position s i || lvt_cmd_arg s i) then
+            && (is_alpha (char_at s (i + 2)) || is_digit (char_at s (i + 2)))
+            && (if after_class_kw s i then false else true) && (regex_position s i || lvt_cmd_arg s i) then
       // bare <<HERE heredoc (`<<0` too: an id may start with a digit) (an id in value position; `a << B` shift stays an
       // operator because of the position check). The id may be lowercase:
       // ruby's own test library writes `src = <<eom`, and `x <<eom` with x a
@@ -1315,7 +1348,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
       hd_lex s idend hid false false
     else if str_eq c "\\" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\n" then
       // a backslash at end of line continues the logical line.
-      (let j = hd_jump s (i + 1) in lex_go s (if j >= 0 then j else i + 2))
+      lex_cont_go s i
     else if str_eq c "/" && regex_position s i then
       // a minimal regex literal. With #{...} interpolation it desugars to
       // (string-concat).__regex("flags"); otherwise a plain TRegex token.
@@ -1593,7 +1626,7 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
            Cons (TP c, reasg_tok par9 (lvt_born_tok f9 rest9)))
         // backslash-newline continues the statement on the next line.
         else if str_eq c "\\" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\n" then
-          (let j = hd_jump s (i + 1) in lex_go s (if j >= 0 then j else i + 2))
+          lex_cont_go s i
         // (ruby's words for what cannot start a token: a stray backslash, an
         //  escaped blank, a control character)
         else
@@ -3832,6 +3865,32 @@ and undef_line_at = fn (s: str) -> fn (i: int) ->
   let rec bol = fn (k: int) -> (if k <= 0 then 0 else if str_eq (char_at s (k - 1)) "\n" then k else bol (k - 1)) in
   let b9 = lvt_skip_ws s (bol i) in
   b9 + 6 <= i && str_eq (substring s b9 (b9 + 6)) "undef "
+// is the `<<` at i right after the keyword `class` -- `class <<self`, a
+// singleton class? parse.y opens no here document there (EXPR_CLASS), so
+// `class <<self` with no space was read as a heredoc whose terminator is
+// "self", and the rest of the file was its body: rbs.rb writes it so, and
+// `require "rbs"` was a SyntaxError. (`obj.class <<X` and `A::class`: the
+// word is a method name there, not the keyword.)
+and after_class_kw = fn (s: str) -> fn (i: int) ->
+  let p = prev_nonspace s (i - 1) in
+  if p < 4 then false
+  else if str_eq (substring s (p - 4) (p + 1)) "class" then
+    (if p - 5 < 0 then true
+     else (let b = char_at s (p - 5) in
+           if is_alnum b || str_eq b "_" || str_eq b "." || str_eq b ":" || str_eq b "@" || str_eq b "$" || ord b >= 128 then false
+           // (what came before, past blanks, line continuations and comments
+           //  -- a comment-only line too: `o. # note` then `class <<X` on the
+           //  next line is still the method -- as the lexer recorded them)
+           else (let rec significant9 = fn (k9: int) ->
+                   if k9 < 0 then k9
+                   else if str_eq (char_at s k9) "\n" && map_has tc_st (lex_cont_key k9) then significant9 (k9 - 2)
+                   else if str_eq (char_at s k9) "\n" && map_has tc_st (lex_comment_key k9) then
+                     significant9 (map_get tc_st (lex_comment_key k9) - 1)
+                   else if str_contains " \t\r\n" (char_at s k9) then significant9 (k9 - 1)
+                   else k9 in
+                 let before9 = significant9 (p - 5) in
+                 before9 < 0 || (if str_eq (char_at s before9) "." || str_eq (char_at s before9) ":" then false else true))))
+  else false
 // is the / at i in a value position (a regex) rather than a division?
 and regex_position = fn (s: str) -> fn (i: int) ->
   let p = prev_nonspace s (i - 1) in
@@ -3942,9 +4001,14 @@ and bc_line_end = fn (s: str) -> fn (i: int) ->
   else if str_eq (char_at s i) "\n" then i + 1
   else bc_line_end s (i + 1)
 
+// ...and a backslash that ends a line continues it: the line after it is the
+// same logical line, so what stands before is what precedes the backslash.
+// (`x.nil? \` with `? a : b` on the next line was a `?` at a statement's
+// start -- "unexpected '?'" -- rbs's value_object_generator.rb writes it so)
 and prev_nonspace = fn (s: str) -> fn (i: int) ->
   if i < 0 then 0 - 1
   else if str_eq (char_at s i) " " then prev_nonspace s (i - 1)
+  else if str_eq (char_at s i) "\n" && i >= 1 && map_has tc_st (lex_cont_key i) then prev_nonspace s (i - 2)
   else i
 // -w: the operator was read as an argument's prefix, not as binary
 and amb_prefix_warn = fn (s: str) -> fn (i: int) -> fn (op: str) ->

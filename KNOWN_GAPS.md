@@ -5423,3 +5423,14 @@ native owner; corpus724 checks copies and rebinding too. All723 corpus
 programs and original525 MATCH counts are retained at unchanged bounds.
 The separate issue133 about captured native metadata after later lookup
 mutations remains unresolved; this repair claims invocation and owner only.
+
+## Lexer review: comments and receiver class calls
+
+A backslash at the end of a comment no longer changes the following regexp
+or character literal into continuation syntax. Only actual code continuations
+are recorded, separately for nested lexer invocations. Whitespace before a
+method named class, after `.` or `::`, keeps heredoc arguments rather than
+opening a singleton class. Corpus761/762 covers these review regressions.
+The full721-file corpus and original Parse102/Syntax167/Literal31 MATCH
+counts are retained. The pre-existing invalid-symbol Syntax leak Timeout
+and reference skips remain; these repairs do not establish a full Rails pass.

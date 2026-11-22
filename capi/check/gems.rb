@@ -104,3 +104,110 @@ handler = Class.new(Nokogiri::XML::SAX::Document) do
 end.new
 Nokogiri::XML::SAX::Parser.new(handler).parse('<r><x/><y><z/></y></r>')
 p handler.seen
+
+# What Rails' own dependencies build: each from the gem home, not from a
+# library the interpreter ships (the line says which file the extension is)
+native = lambda do |feature|
+  hit = $LOADED_FEATURES.grep(/\/#{Regexp.escape(feature)}\.(bundle|so)\z/)
+  hit.size == 1 && hit[0].start_with?(ENV.fetch('GEM_HOME'))
+end
+
+# erb: its escape is C (erb/escape), and ERB::Util.html_escape is that one
+gem 'erb'
+require 'erb'
+p native.('erb/escape')
+p ERB::Util.html_escape(%q{<a href="x">&'"</a>}), ERB::Util.html_escape(nil), ERB::Util.html_escape(12)
+s = +'plain'
+p ERB::Util.html_escape(s).equal?(s), ERB::Util.html_escape('日本<語>').encoding
+p ERB.new("<%= 1 + 2 %> <%= ERB::Util.h('<b>') %>\n<% [1, 2].each do |i| %>[<%= i %>]<% end %>\n", trim_mode: '-').result(binding)
+
+# rbs: its parser is C (rbs_extension) and builds Ruby AST objects
+gem 'rbs'
+require 'rbs'
+p native.('rbs_extension')
+_, _, decls = RBS::Parser.parse_signature(<<~RBS)
+  module M
+    def m: (Integer, ?String) -> Array[Symbol]
+  end
+  class C < Object
+    attr_reader name: String
+    def initialize: (name: String) -> void
+    def each: () { (Integer) -> void } -> self
+  end
+RBS
+p decls.map { |d| [d.class.name, d.name.to_s, d.members.map { |m| m.class.name.split('::').last }] }
+p RBS::Parser.parse_type('Hash[Symbol, Integer | nil]').to_s, RBS::Parser.parse_method_type('(untyped) -> bool').to_s
+begin
+  RBS::Parser.parse_type('Array[')
+rescue => e
+  p e.class
+end
+
+# websocket-driver: the frame mask is C (websocket_mask)
+gem 'websocket-driver'
+require 'websocket/driver'
+p native.('websocket_mask')
+masked = WebSocket::Mask.mask("Hello, \x00\xff".b, [1, 2, 3, 4].pack('C*'))
+p masked.bytes, WebSocket::Mask.mask(masked, [1, 2, 3, 4].pack('C*'))
+p WebSocket::Mask.mask('abc', nil)
+
+# puma: the HTTP request parser is C (puma_http11)
+gem 'puma'
+require 'puma'
+require 'puma/puma_http11'
+p native.('puma/puma_http11')
+parser = Puma::HttpParser.new
+env = {}
+request = "GET /path/x?q=1&r=%20 HTTP/1.1\r\nHost: example.com\r\nX-Custom: a b\r\nContent-Length: 3\r\n\r\nabc"
+done = parser.execute(env, request, 0)
+p done, parser.finished?, parser.nread, parser.error?
+p env.slice('REQUEST_METHOD', 'REQUEST_PATH', 'QUERY_STRING', 'SERVER_PROTOCOL', 'HTTP_HOST', 'HTTP_X_CUSTOM', 'CONTENT_LENGTH').sort
+p parser.body, parser.body.encoding
+bad = Puma::HttpParser.new
+begin
+  bad.execute({}, "GET / HTTP/1.1\r\nBad Header\r\n\r\n", 0)
+rescue => e
+  p e.class
+end
+
+# sqlite3: the database is C (sqlite3_native) on the system's SQLite, with
+# callbacks into Ruby
+gem 'sqlite3'
+require 'sqlite3'
+p native.('sqlite3/sqlite3_native')
+db = SQLite3::Database.new(':memory:')
+db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, data BLOB)')
+db.execute('INSERT INTO t (name, score, data) VALUES (?, ?, ?)', ['ann', 1.5, SQLite3::Blob.new("\x00\x01\xff")])
+stmt = db.prepare('INSERT INTO t (name, score) VALUES (:name, :score)')
+%w[bob cid].each_with_index { |n, i| stmt.execute(name: n, score: i * 10) }
+stmt.close
+p db.last_insert_row_id, db.changes, db.total_changes
+p db.execute('SELECT id, name, score FROM t ORDER BY id')
+row = db.get_first_row('SELECT data FROM t WHERE id = 1')
+p row[0].bytes, row[0].encoding
+db.results_as_hash = true
+p db.execute('SELECT name FROM t WHERE score > ?', 5).map { |h| h['name'] }
+db.results_as_hash = false
+db.create_function('twice', 1) { |f, x| f.result = x.to_i * 2 }
+p db.get_first_value('SELECT twice(21)')
+db.transaction do
+  db.execute("UPDATE t SET name = 'zed' WHERE id = 2")
+  raise SQLite3::Exception, 'roll back' rescue nil
+end
+p db.get_first_value('SELECT name FROM t WHERE id = 2')
+begin
+  db.transaction do
+    db.execute("UPDATE t SET name = 'gone' WHERE id = 3")
+    raise ArgumentError, 'abort'
+  end
+rescue ArgumentError
+end
+p db.get_first_value('SELECT name FROM t WHERE id = 3')
+begin
+  db.execute('SELECT * FROM missing')
+rescue SQLite3::SQLException => e
+  p e.class, e.message
+end
+p db.prepare('SELECT ?1 + ?2').execute(1, 2).to_a
+db.close
+p db.closed?

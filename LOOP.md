@@ -6348,6 +6348,49 @@ last item.
 - Gates: dead_defs, dup_defs, gc_roots pass; bracket depth 923 of 1024 (was
   892 on main: the translation and the caches keep top-level tables).
 
+## 2026-11-21 (76): what Rails' own dependencies build, on the C API
+
+Rails 8.1 installs on main now (issue #116: #95 and #120), and the next
+stages -- boot, the application's tests, Puma serving HTTP -- run the C
+extensions of its dependencies. Thirteen of its 68 locked gems have one.
+`tools/capi_gem_check.py` builds five more of them at railstest/'s versions,
+on both rubies, and uses them the same way: erb (its escape, which
+ERB::Util.html_escape is), rbs (a C parser building Ruby AST objects),
+websocket-driver (the frame mask), puma (the HTTP request parser) and sqlite3
+on the system's SQLite (BLOBs, a Ruby function SQL calls, transactions,
+errors). Each prints whether the extension it loaded is the gem home's.
+json, date, bigdecimal, io-console and prism build too, but mere-ruby
+loads its own library of the same name before an activated gem's extension
+(issue #127, PR #128): what they would compare is not the C API.
+
+**What it found** (each reproduced against ruby first):
+
+- `class <<self` with no space was a here document whose terminator is
+  "self": the rest of the file was its body, and `require "rbs"` a
+  SyntaxError. parse.y opens none after the keyword `class` (EXPR_CLASS);
+  after_class_kw says so (and `obj.class <<X`, a method named class, keeps
+  its argument). corpus/761.
+- A backslash that ends a line continues it, and a `?` that starts the next
+  line was taken for a character literal at a statement's start ("unexpected
+  '?'"): prev_nonspace now looks past `\` + newline. rbs's
+  value_object_generator.rb writes `x.nil? \` and then `? a : b`.
+  corpus/762.
+- `module_function` copied a define_method body WITHOUT its closure: the copy
+  of `define_method(:x) { v }` read `v` as a method call. A C method is such
+  a body, holding the function it calls, so erb's
+  `include ERB::Escape; module_function :html_escape` -- how every Rails
+  template escapes -- raised NoMethodError for `__capi_m`. modfunc_promote
+  copies as alias does (copy_meth_src). corpus/763.
+- CLASS_OF of an instance of a builtin's subclass was the builtin: a String
+  of `class Blob < String` is a primitive tagged with its class, and
+  capi_describe answered class_name. sqlite3 binds a SQLite3::Blob as a BLOB
+  by its class, so it stored text and read it back in UTF-8. It answers
+  dispatch_cls_of now. Four contracts (`class_of` in the fixture).
+
+**Found, not fixed here**: `module_function :m` of an INHERITED m leaves no
+private `m` in the module itself (`private_instance_methods(false)` is `[]`
+where ruby lists it).
+
 ## 2026-11-17 (73): test_ast's margin -- what every assertion runs, and a block's number
 
 test_ast fits CI's 600 s since LOOP (57), with 47 s to spare on the slower of
@@ -10647,6 +10690,25 @@ in force. All 722 corpus programs match in both hash modes: 520.933 seconds and
 1,290,080 KiB peak family RSS, within the original 900-second / 2-GiB bound.
 This was measured at 8e060d3f before the documentation-only follow-up.
 
+## 2026-11-22 (78): what an explicit GC.start gives back -- test_module's complemented-method-entry leak test on macOS
+
+**The point.** `TestModule#test_complemented_method_entry_memory_leak` fails on main's macOS unittest shard every run: RSS 2.22-2.30 times its start, against ruby's limit of 2.0. The shard keeps the run green, so it went unnoticed. It is no leak. Retained memory after the final GC.start is 55-62 MB whether the loop runs 60,000 or 600,000 times. A loop that makes and drops classes grows two things that an explicit GC.start did not hand back:
+- **The method store (meths_g).** Its arena swings between 8.4 MB and 33.6 MB under that churn, while it holds about 1,270 live rows. compact_method_store copies it only once it doubles.
+- **Mere's region cache.** mem_trim emptied it only down to eight regions, and those eight held grown blocks: the collector's own scratch (GCC 7.3 MB, GFX 6.3 MB, CSD/CSC 4 MB), 28 MB in all. Only the cache cap that mem_trim enforced was below what they held.
+
+**What changed.**
+- `compact_method_store force` copies the store whenever it grew at all since the last copy, when the collection is an explicit GC.start (gc_state "explicit"). The automatic collector keeps its doubling rule.
+- Mere 90d05895 (merelang/mere#87): a trim after real work releases every cached region. Real work means at least 4,096 region acquisitions since the last trim. A trim right after another, as in a loop of GC.starts, keeps them as before. MERE_REF moves to it.
+
+The same Mere commit also fixes eq_<tag> for values holding a float: a tuple, record or variant with a float never equalled even itself in the C backend.
+
+**Measured** (locally, under the test's own harness; it fails on CI's macOS, which kept the loop's peak after GC.start):
+- the leak test's ratio, 1.51 -> 1.32;
+- 2,000 GC.starts with 20,000 live Strings, the same instructions as before (55.8e9);
+- test_module 195/195.
+
+Neither the collection floor nor the class-time floor is touched. LOOP (86) showed that raising them only makes the ratio worse.
+
 ## 2026-11-21: reduce clone cache residency without losing the Method-copy gate
 
 PR #109's Linux job 136752758452 fails the original Module clone leak check:
@@ -10822,6 +10884,42 @@ Method compaction failure, Refinement skip and separate captured-native
 metadata issue133 remain explicit. No original tests, exclusions, limits,
 collector/state, VM/ISeq, AST/Prism, C API or gemtest code changed. Updated-head
 hosted checks and the latest-main per-file gate remain required before merge.
+
+### PR review: lexer context for continuations and class method heredocs
+
+Record a continued newline only when the lexer consumes a backslash in code.
+Comment and literal scanners never record it. Nested interpolation lexers use
+separate invocation numbers and restore their parent's context; consumed
+continuation entries are removed after lexing. The existing tc_st map holds
+this context, with no additional top-level state. after_class_kw also checks
+the preceding significant character across whitespace, so receiver `. class`
+and `:: class` calls keep their bare, indented and quoted heredoc arguments.
+Changed functions: lex_go, new lex_go_step/lex_cont_key/lex_cont_go,
+lex_go_b, after_class_kw and prev_nonspace. Corpus761/762 adds both review
+reproductions, tab/newline separators, comment-ending backslashes, quoted
+hash bytes, real continuations, nested interpolation and repeated eval.
+
+Normal O2 with the CI-pinned compiler01f5ad73: **721/721 corpus** matches
+Ruby4.0.9 with hash index ON/OFF, **483.813s / 1,089,488KiB** peak family
+RSS. All nine existing RSS gates, roots, dead definitions and C depth155/1024
+pass. Corpus761-763 matches all36 evaluator/default/strict-VM and hash/MRO
+comparisons. Three complete original Parse/Syntax/Literal files retain
+**300 MATCH / 1 RED / 2 BOTH** across303 cases, identical per-file counts
+to successful main d9826ac9. The existing Syntax invalid-symbol leak Timeout
+and both reference skips stay visible. An initial nonexistent test_heredoc.rb
+selection was rejected as incomplete; only the real test_literal.rb result
+is counted here. No original tests, exclusions, API or resource limits change.
+Hosted checks must still finish on the updated head before merging.
+
+The follow-up review found the receiver's separator lost again when a comment
+or a continuation stands between it and `class` (`p o. # note`, then
+` class <<-EOS`; also `o::`, and a comment-only line between). The lexer now
+records each comment it skips the way it records a continuation -- keyed by
+the newline that ends it, holding where it began, removed once the rest of
+the source is lexed (lex_comment_key) -- and after_class_kw's look back
+passes over both. corpus/761 holds the five forms, and a real
+`class <<self` after comment lines. 721/721, the VM's 761-763 the same, and
+the twelve gems the same on both sides.
 
 ## 2026-11-22 (79): an alias round trip, and a Method made of a builtin (issues #124, #133)
 
