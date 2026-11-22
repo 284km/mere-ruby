@@ -206,8 +206,20 @@ static VALUE set_parse_depth(VALUE self, VALUE depth) {
 
 static VALUE ospath(VALUE self, VALUE path) { (void)self; return rb_str_encode_ospath(path); }
 
+/* (Bignums C keeps past the call that made them -- public API both ways:
+ *  rb_gc_register_mark_object, and a static variable registered first) */
+static VALUE kept_marked, kept_static;
+static VALUE kept_bignums(VALUE self) {
+    (void)self;
+    return rb_ary_new_from_args(2, kept_marked, kept_static);
+}
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
+    kept_marked = rb_big_new(3, 1);
+    rb_gc_register_mark_object(kept_marked);
+    rb_gc_register_address(&kept_static);
+    kept_static = rb_big_new(4, 0);
+    rb_define_singleton_method(mod, "kept_bignums", kept_bignums, 0);
     rb_define_singleton_method(mod, "ptr_after_yield", ptr_after_yield, 1);
     rb_define_singleton_method(mod, "ary_ptr_after_yield", ary_ptr_after_yield, 1);
     rb_define_singleton_method(mod, "byte_after_yield", byte_after_yield, 2);

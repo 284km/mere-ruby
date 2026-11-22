@@ -11148,3 +11148,22 @@ as recorded), capi_check, corpus.
 The future form (note 553 §6.1-5, a separate arc): this interpreter's
 Integer in binary limbs, with Karatsuba and Toom-3 written in Mere; then
 the C names can point there and bignum.c leaves.
+
+### PR #158 review
+
+- **[Minor] A raw Bignum C keeps past its call was freed anyway.** rb_big_new
+  is public API and returns one. Now kept for good when C keeps it the
+  public ways: rb_gc_register_mark_object and rb_gc_mark / _movable / _maybe
+  (capi/gc.c hand a raw one to mr_vbig_keep), or a registered address
+  (rb_gc_register_address, rb_global_variable) that holds it when its call
+  ends (mr_vbig_leave asks mr_gc_address_holds). One only stored in a struct
+  and marked by a later collection is still freed with its call; the header
+  comment says so. capi/check: a Bignum made in Init_ and kept each way is
+  still 0 after GC.start, two calls later, on both sides.
+- **[Suggestion] Membership was a linear scan on every RBASIC().** An
+  open-addressing set of addresses answers it in O(1); the two lists stay
+  for the walk at the end of a call. (First version removed an address from
+  the set before freeing it -- raw_free reads the flags through RBASIC, and
+  every test/-ext-/bignum file stopped at its first raw Bignum. Freed first,
+  removed after.) Toom-3 on 3**60000 x 7**50000 and big2str_generic of the
+  product (70,883 digits): 2.3 s.

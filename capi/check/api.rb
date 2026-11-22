@@ -417,4 +417,9 @@ check(A.ospath(euc).bytes == (mac ? "\u3042".bytes : euc.bytes))
 check(A.ospath(euc.b).equal?(euc.b) == false && A.ospath(euc.b).encoding == Encoding::BINARY)
 utf = "\u3042"
 check(A.ospath(utf).equal?(utf))
+# (Bignums C made in Init_ and kept the public ways are still there later,
+#  and still zero -- rb_big_new gives digits of zero)
+GC.start
+check(A.kept_bignums == [0, 0])
+check(A.kept_bignums == [0, 0])
 puts "api contracts: #{$count} passed"

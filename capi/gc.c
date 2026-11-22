@@ -24,8 +24,11 @@ void rb_gc_unregister_address(VALUE *address) {
     for (long i = 0; i < address_count; i++)
         if (addresses[i] == address) { addresses[i] = addresses[--address_count]; return; }
 }
+/* (a raw Bignum CRuby's bignum.c made -- capi/bignum_cruby.c -- kept past
+ *  the C call that made it: registered or marked, it is not freed then) */
+extern void mr_vbig_keep(VALUE v);
 void rb_gc_register_mark_object(VALUE obj) {
-    if (!MR_HANDLE_P(obj)) return;
+    if (!MR_HANDLE_P(obj)) { mr_vbig_keep(obj); return; }
     if (object_count == object_cap) {
         object_cap = object_cap ? object_cap * 2 : 64;
         objects = realloc(objects, sizeof(*objects) * (size_t)object_cap);
@@ -41,9 +44,15 @@ int mr_capi_roots(closure_int_int visit) {
     for (long i = 0; i < object_count; i++) visit.fn(visit.env, (long long)objects[i]);
     return 0;
 }
-void rb_gc_mark(VALUE v) { mr_mark_value(v); }
-void rb_gc_mark_movable(VALUE v) { mr_mark_value(v); }
-void rb_gc_mark_maybe(VALUE v) { mr_mark_value(v); }
+void rb_gc_mark(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
+void rb_gc_mark_movable(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
+void rb_gc_mark_maybe(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
+/* Does a registered address (rb_gc_register_address, rb_global_variable)
+ * hold this VALUE now? */
+int mr_gc_address_holds(VALUE v) {
+    for (long i = 0; i < address_count; i++) if (*addresses[i] == v) return 1;
+    return 0;
+}
 void rb_gc_mark_locations(const VALUE *start, const VALUE *end) {
     for (; start < end; start++) mr_mark_value(*start);
 }

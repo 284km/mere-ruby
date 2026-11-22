@@ -15,8 +15,13 @@
  *   - where it reaches the interpreter -- an argument of an up-call, a word
  *     of the transit buffer, what the C call returns (core.c) -- it becomes
  *     the Integer its digits say (mr_vbig_out);
- *   - it is freed when the C call that made it ends, unless bignum.c keeps it
- *     for good (its power cache: rb_vm_register_global_object).
+ *   - it is freed when the C call that made it ends, unless it is kept for
+ *     good: bignum.c's power cache (rb_vm_register_global_object), or what C
+ *     keeps the public ways -- rb_gc_register_mark_object, rb_gc_mark from a
+ *     dmark, or a registered address (rb_gc_register_address,
+ *     rb_global_variable) that holds it when its call ends. One C only
+ *     stores in a struct, which no collection marks before the call ends,
+ *     is freed with the call: register it.
  *
  * The other way, an Integer the interpreter has is a handle (or a Fixnum),
  * which bignum.c cannot read: the entry points below hand it a raw Bignum
@@ -135,11 +140,55 @@ struct vlist { struct vbig *at; long count, cap; };
 static struct vlist temps, kept;
 long mr_vbig_live;   /* how many there are: 0 is the fast path everywhere */
 
+/* ...and every one's address in an open-addressing set, so the question
+ * every RBASIC() of one asks -- is this a raw Bignum? -- is O(1): bignum.c
+ * reads flags through RBASIC constantly, and one large multiplication makes
+ * many temporaries before its C call ends. (0 is empty, 1 a removed slot.) */
+static VALUE *set_slots;
+static long set_cap, set_used;
+static unsigned long set_hash(VALUE v) { return (unsigned long)((v >> 4) * 0x9E3779B97F4A7C15ULL); }
+static void set_put(VALUE v);
+static void set_grow(void) {
+    VALUE *old = set_slots;
+    long old_cap = set_cap;
+    set_cap = set_cap ? set_cap * 2 : 256;
+    set_slots = calloc((size_t)set_cap, sizeof(VALUE));
+    if (!set_slots) mr_fatal("out of memory");
+    set_used = 0;
+    for (long i = 0; i < old_cap; i++) if (old[i] > 1) set_put(old[i]);
+    free(old);
+}
+static void set_put(VALUE v) {
+    if ((set_used + 1) * 2 > set_cap) set_grow();
+    unsigned long i = set_hash(v) & (unsigned long)(set_cap - 1);
+    while (set_slots[i] > 1) i = (i + 1) & (unsigned long)(set_cap - 1);
+    if (set_slots[i] == 0) set_used++;
+    set_slots[i] = v;
+}
+static int set_has(VALUE v) {
+    if (!set_cap) return 0;
+    unsigned long i = set_hash(v) & (unsigned long)(set_cap - 1);
+    while (set_slots[i] != 0) {
+        if (set_slots[i] == v) return 1;
+        i = (i + 1) & (unsigned long)(set_cap - 1);
+    }
+    return 0;
+}
+static void set_del(VALUE v) {
+    if (!set_cap) return;
+    unsigned long i = set_hash(v) & (unsigned long)(set_cap - 1);
+    while (set_slots[i] != 0) {
+        if (set_slots[i] == v) { set_slots[i] = 1; return; }
+        i = (i + 1) & (unsigned long)(set_cap - 1);
+    }
+}
+
 static struct vbig *find_in(struct vlist *l, VALUE v) {
     for (long i = l->count - 1; i >= 0; i--) if (l->at[i].obj == v) return &l->at[i];
     return NULL;
 }
 static struct vbig *find(VALUE v) {
+    if (!set_has(v)) return NULL;
     struct vbig *b = find_in(&temps, v);
     return b ? b : find_in(&kept, v);
 }
@@ -152,7 +201,7 @@ static void push(struct vlist *l, struct vbig b) {
     l->at[l->count++] = b;
     mr_vbig_live = temps.count + kept.count;
 }
-int mr_vbig_raw_p(VALUE v) { return mr_vbig_live && find(v) != NULL; }
+int mr_vbig_raw_p(VALUE v) { return mr_vbig_live && set_has(v); }
 
 VALUE mr_vbig_newobj(VALUE klass, VALUE flags, size_t size) {
     if (size < sizeof(struct RBignum)) size = sizeof(struct RBignum);
@@ -162,6 +211,7 @@ VALUE mr_vbig_newobj(VALUE klass, VALUE flags, size_t size) {
     memcpy((void *)&big->basic.klass, &klass, sizeof(VALUE));
     struct vbig b = { (VALUE)big, size, mr_capi_frame() };
     push(&temps, b);
+    set_put((VALUE)big);
     return (VALUE)big;
 }
 bool rb_gc_size_allocatable_p(size_t size) { return size <= 640; }
@@ -169,13 +219,22 @@ size_t rb_gc_obj_slot_size(VALUE obj) {
     struct vbig *b = find(obj);
     return b ? b->size : sizeof(struct RBignum);
 }
-/* (kept for the life of the process: the power cache of radix conversion) */
-void rb_vm_register_global_object(VALUE obj) {
+/* A raw Bignum kept for the life of the process: bignum.c's power cache
+ * (rb_vm_register_global_object), and one C keeps the public ways --
+ * rb_gc_register_mark_object, rb_gc_mark from a dmark (capi/gc.c), or a
+ * registered address holding it when its C call ends (mr_vbig_leave).
+ * Anything else is no raw Bignum, and nothing to do here. */
+void mr_vbig_keep(VALUE obj) {
+    if (!mr_vbig_live || RB_SPECIAL_CONST_P(obj) || MR_HANDLE_P(obj) || !set_has(obj)) return;
     struct vbig *b = find_in(&temps, obj);
-    if (!b) { if (!find_in(&kept, obj)) rb_gc_register_mark_object(obj); return; }
+    if (!b) return;   /* (kept already) */
     struct vbig copy = *b;
     *b = temps.at[--temps.count];
     push(&kept, copy);
+}
+void rb_vm_register_global_object(VALUE obj) {
+    if (!RB_SPECIAL_CONST_P(obj) && !MR_HANDLE_P(obj) && set_has(obj)) mr_vbig_keep(obj);
+    else rb_gc_register_mark_object(obj);
 }
 static void raw_free(VALUE obj) {
     if (!BIGNUM_EMBED_P(obj)) ruby_xfree(RBIGNUM(obj)->as.heap.digits);
@@ -183,14 +242,28 @@ static void raw_free(VALUE obj) {
 }
 /* The C call `frame` ends: the raw Bignums it made are gone (whatever of
  * them reached the interpreter is an Integer there by now). */
+extern int mr_gc_address_holds(VALUE v);
 void mr_vbig_leave(const void *frame) {
     if (!temps.count) return;
-    long left = 0;
-    for (long i = 0; i < temps.count; i++) {
-        if (temps.at[i].owner == frame) raw_free(temps.at[i].obj);
-        else temps.at[left++] = temps.at[i];
+    long left = 0, n = temps.count;
+    struct vbig *keep_now = NULL;
+    long keep_count = 0;
+    for (long i = 0; i < n; i++) {
+        struct vbig b = temps.at[i];
+        if (b.owner != frame) { temps.at[left++] = b; continue; }
+        /* (a static variable C registered still holds it: kept, not freed) */
+        if (mr_gc_address_holds(b.obj)) {
+            keep_now = realloc(keep_now, sizeof(*keep_now) * (size_t)(keep_count + 1));
+            if (!keep_now) mr_fatal("out of memory");
+            keep_now[keep_count++] = b;
+            continue;
+        }
+        raw_free(b.obj);   /* (reads its flags through RBASIC: still a member) */
+        set_del(b.obj);
     }
     temps.count = left;
+    for (long i = 0; i < keep_count; i++) push(&kept, keep_now[i]);
+    free(keep_now);
     mr_vbig_live = temps.count + kept.count;
 }
 
