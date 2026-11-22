@@ -5,6 +5,7 @@
 # has no ready?; and a child started with SIGINT ignored keeps it ignored
 require 'rbconfig'
 require 'io/wait'
+require 'tmpdir'
 
 module E
   def y = :ey
@@ -57,3 +58,21 @@ c = Class.new
 def c.q = super
 p((m.q rescue $!.message.sub(/0x\h+/, "X")))
 p((c.q rescue $!.message.sub(/0x\h+/, "X")))
+
+# (review: the inherited module_function entry has no body -- a later
+#  redefinition in the source module is what the includer runs; a
+#  singleton-classed subclass instance encodes into its class; a read-only
+#  mode whose encoding name has an "a" is still read-only)
+module E2; def y = :old; end
+module U2; include E2; module_function :y; end
+module E2; def y = :new; end
+class X2; include U2; def t = y; end
+p [X2.new.t, U2.y, U2.private_instance_methods(false)]
+t2 = S.new("c")
+def t2.hi = 1
+p [t2.encode("UTF-16LE").class, t2.encode("UTF-16LE").respond_to?(:hi)]
+path = File.join(Dir.tmpdir, "corpus778_#{$$}")
+File.write(path, "x")
+File.open(path, "r:binary") { |f| p((f.wait_writable(0) rescue [$!.class, $!.message])) }
+File.open(path, "r:windows-1252") { |f| p((f.wait_writable(0) rescue [$!.class, $!.message])) }
+File.delete(path)

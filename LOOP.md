@@ -11141,3 +11141,22 @@ does not inherit the ignore, where ruby's does. That is Mere's runtime
 (codegen_c's spawn), recorded in KNOWN_GAPS.md.
 
 corpus/778.
+
+### PR #154 review
+
+- **[Major] module_function on an inherited method copied its body.** Ruby's
+  rb_export_method writes a ZSUPER entry -- private, no body, forwarding up
+  the chain when called -- so `module E; def y = :new; end` after
+  `include E; module_function :y` is what an includer of U runs. The entry is
+  now the visibility mark `private :y` on an inherited method writes
+  (vis_marks + set_private): `U.private_instance_methods(false)` lists y,
+  X.new.t answers :new, U.y (the singleton copy) keeps :old. corpus/778 has
+  the redefinition.
+- **[Minor] A singleton-classed String subclass instance encoded into a
+  String.** str_keep_sub walks from the singleton class to its first real
+  class, and carries it unless that is String.
+- **[Minor] `"r:binary"` counted as writable**: the mode test read the
+  encoding after ":" too. IO.__mode_writes? / __mode_creates? test the
+  access part only; six places used the whole string (wait_writable,
+  File#truncate, File#chmod, the mmap refusal, the open-with-create check,
+  and one more truncate).
