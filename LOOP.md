@@ -9811,6 +9811,34 @@ an undef. Keep unittest/range_kernel_method_owner_probe.rb and
 unittest/range_case_equality_undef_probe.rb as explicit failing diagnostics;
 these are not claimed repairs, exclusions or passing corpus cases. The older
 direct primitive/object comparison diagnostic also remains unresolved.
+
+
+### Class case equality: invoke Ruby hooks and retain native super positions
+
+A class's Ruby singleton === was used by the explicit operator but skipped by
+case/when. This prevented ActiveSupport's Time.=== from accepting TimeWithZone.
+Resolve the actual singleton ancestor chain, stop at the real native Module
+entry, and call a preceding Ruby body with its actual ancestor index. Super
+continues through the real Module/Kernel entries, including after Module's own
+Ruby replacement. Splat candidates also use case equality instead of ==.
+Native entries consume pending call state before invoking Ruby comparisons.
+The obsolete equality-only leaf helper is removed; no top-level value is added.
+
+Normal O2 runtime8812a585 passes **721/721 corpus** with the hash index ON/OFF,
+all16 comparisons for735/741-743 in four hash/MRO modes, nine existing RSS
+gates, dead/duplicate definitions, GC roots and depth155/1024. The original
+Case/Class/Module/Super/Method/Refinement/Settracefunc/PatternMatching comparison
+has665 cases: both main d9826ac9 and candidate657 MATCH/5 RED/3 BOTH, zero
+EXTRA or lost original PASS, and no per-file MATCH decrease. The original
+600-second/2-GiB/10-second child bounds, files, bootstrap and exclusions remain.
+
+The separate combined Rails diagnostic explicitly activates the real installed
+Bundler on both sides and retains every locked-package source check. Migration
+and boot pass. The original six app tests improve from five errors to three:
+all TimeWithZone cast errors are gone, while one unhandled retry and two unknown
+<=> errors remain. This warm diagnostic does not establish the direct-start
+Bundler path, a cold install, HTTP success or whole-Rails compatibility.
+
 ### Review repair: mixed Hash keys and Object autoloads (2026-11-21)
 
 Native Hash reads now use the internal hash for builtin search and stored
@@ -10410,3 +10438,57 @@ content-store reads still fail with input/output errors, so current-head
 hosted Linux validation remains required. Keep the candidate draft until
 hosted checks, latest-main per-file comparison, parent integration and review
 pass. The existing hosted Method-copy failures remain separate merge gates.
+
+## Native comparator review repairs: final validation
+
+PR #142 retains original native comparator owners through aliases and native
+Method installation. Module and class wrappers invoke saved native entries;
+Kernel#=== rebound as Module#=== retains equality semantics for super.
+Existing initializers record physical native entries without adding top-level
+state. Functions: invoke_val_c0, native_case_entry, native_case_alias_owner,
+run_super_target, set_builtin_alias. Corpus 743 covers the review regressions.
+
+O2: 721/721 corpus programs match in both hash modes, 480.426 seconds and
+1,284,944 KiB under unchanged 900-second/2-GiB bounds. Sixteen focused cache
+comparisons and nine RSS cases pass, as do roots, depth 155 and dead definitions.
+Original Module/Method/Super: 342 MATCH and one existing RED over 343 cases;
+no previously passing case is lost. Parent #141 documentation is integrated.
+The additional already-rebound comparator alias diagnostic remains explicit
+in unittest/module_kernel_comparator_alias_probe.rb and KNOWN_GAPS.md; it
+fails identically on prior main, parent #141 and candidate. The ineffective
+broader alias-copy change was reverted. Hosted checks and per-file comparison
+remain required before merge.
+
+### Preserve an already-selected native comparator under Module prepends
+
+run_super_target now reads native provenance through the new exact-entry
+native_case_alias_entry_owner helper. Ordinary alias dispatch continues to
+resolve ancestors through native_case_alias_owner; selected super targets
+must not restart at an earlier prepend. Corpus 743 adds a Module-level
+forwarding comparator and both matching/nonmatching cases.
+All 16 focused comparisons and the complete Module/Method/Super files retain
+342 MATCH and one existing RED over 343 cases. A fresh full sweep is running.
+The additional saved-native-Method diagnostic fails on the preceding main
+integration and #141 parent as well as the candidate and remains explicit
+in unittest/module_saved_comparator_method_probe.rb and KNOWN_GAPS.md.
+
+
+### Captured native comparator Methods keep their body after prepends
+
+A captured native comparator can reach bi_meth_call after a Ruby prepend
+shadows its name. Its recorded Module, Kernel or Range owner now selects the
+existing native_case_equal body directly. The selected-super repair from
+11d87d93 is preserved. This follow-up edits bi_meth_call and adds corpus 749;
+it adds no global state or placeholder native implementation.
+
+The final ordinary O2 source is 8e060d3f, using the exact CI compiler
+01f5ad73. Corpus 741, 743 and 749 match Ruby 4.0.9 in all four hash/MRO cache
+combinations (12 comparisons). The retained saved-comparator probe now prints
+true/false on both runtimes. Original Module passes 195/1240 and Super50/109;
+Method98/554 keeps the same single compaction skip, with its complete 98-case
+verdict dictionary identical to the retained baseline. The three files retain
+342 MATCH and one existing RED over343 cases. Original Method-copy passes at
+1.679902x, reference1.084765x. All original assertions and resource bounds stay
+in force. All 722 corpus programs match in both hash modes: 520.933 seconds and
+1,290,080 KiB peak family RSS, within the original 900-second / 2-GiB bound.
+This was measured at 8e060d3f before the documentation-only follow-up.

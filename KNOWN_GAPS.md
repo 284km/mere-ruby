@@ -5258,3 +5258,33 @@ autoload and Marshal retain308 MATCH/0 RED/3 BOTH across311 cases.
 The real mkmf context/child,14 contracts, stress and negative controls pass.
 These checks do not establish a Rails application/framework-suite pass or
 complete C API compatibility; earlier original Rails failures remain recorded.
+
+Class/Module case equality now honors a real Ruby singleton === before the
+native Module entry, including inherited/private hooks and when splats. Actual
+Module/Kernel ancestor positions preserve native super semantics. Corpus743,
+the721-file corpus and eight original CRuby files retain main's passing cases.
+This resolves the observed ActiveSupport TimeWithZone cast errors in the warm
+app diagnostic; three original app errors remain (retry and unknown <=>), and
+the original direct-start Bundler selection, cold installation, HTTP and the
+whole Rails suite remain unverified. Existing native Method owner/undef probes
+above are separate gaps and are not claimed by this dispatch repair.
+
+
+Native comparator alias metadata: after rebinding Kernel#=== as Module's
+entry, saving that rebound entry under another name still reaches an
+unsupported primitive comparator. The previous main and the #141 parent
+already fail this way; the class-case review fix does not claim it solved.
+`unittest/module_kernel_comparator_alias_probe.rb` preserves the original
+comparison against Ruby 4.0.9. This dispatch diagnostic is separate from the related native
+Method metadata work in [#133](https://github.com/284km/mere-ruby/issues/133).
+No upstream assertion or existing corpus program is skipped or excluded.
+
+Saved native Module comparator calls after a prepend now retain their real
+native owner. Corpus 749 and unittest/module_saved_comparator_method_probe.rb
+cover the matching and nonmatching calls; both agree with Ruby 4.0.9.
+
+A separate Method#super_method reflection gap remains when a class receiver's
+=== comes from prepends on Module. With two forwarding comparators, Ruby
+walks SecondComparator, FirstComparator, Module and Kernel. The #141 baseline
+71e95b9a and the current implementation return SecondComparator and then nil.
+This receiver-chain lookup predates the native comparator call repairs.
