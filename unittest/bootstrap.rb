@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'exclusions'
+
 # These files rely on libraries loaded earlier by the upstream whole-suite
 # runner. Keep the standalone prerequisites explicit and identical per side.
 module MereRubyTestBootstrap

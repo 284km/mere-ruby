@@ -54,17 +54,23 @@ from ci import supervise  # noqa: E402
 # (mere-ruby reads the standard library -- mkmf.rb among it -- from the
 #  reference's directory, as everywhere else in the checks)
 stdlib = subprocess.check_output([str(REF), '-rrbconfig', '-e', 'print RbConfig::CONFIG["rubylibdir"]'], text=True)
+# Prefer this runtime's libraries before using the reference Ruby as a fallback.
+# In particular, the reference monitor.rb requires an incompatible monitor.so.
+runtime = subprocess.check_output(["sh", str(ROOT / "tools/runtime_load_path.sh"), str(MERE)],
+                                  text=True, timeout=20).split(os.pathsep)
 results = {}
 problems = []
 
 
 def run(key, side, command, cwd, extra=None, lib=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith('MERE_RUBY_') and k not in ('RUBYOPT', 'RUBYLIB', 'MAKEFLAGS')}
-    path = ([str(lib)] if lib else []) + ([stdlib] if side == 'mere' else [])
+    path = ([str(lib)] if lib else []) + ([*runtime, stdlib] if side == 'mere' else [])
     if path:
         env['RUBYLIB'] = os.pathsep.join(path)
     env['LANG'] = 'en_US.UTF-8'
     env['CAPI_CHECK_SIDE'] = side
+    if side == 'mere':
+        env['MERE_RUBY_STDLIB_FALLBACK'] = stdlib
     env.update(extra or {})
     log = OUT / f'{key}.{side}.out'
     old = Path.cwd()
@@ -133,6 +139,32 @@ def passed(result):
     lines = [l for l in result['output'].splitlines() if l.endswith(' passed')]
     return lines[-1] if result['ok'] and lines else None
 
+
+# The upstream test launcher is a separate caller of mkmf. Exercise it with
+# reference-first startup and no inherited fallback declaration, then launch
+# a child which repeats that reference path through -I. Keep the caller's
+# explicit helper library visible through the generated launcher.
+context = OUT / "mkmf context's tree"
+started = run('upstream-context', 'mere',
+              ['sh', ROOT / 'unittest' / 'mkmf_context.sh', MERE, SRC, context, stdlib],
+              OUT, {'RUBYLIB': stdlib, 'MERE_RUBY_STDLIB_FALLBACK': ''})
+launcher = context / 'ruby'
+if not started['ok'] or not launcher.is_file() or not (context / 'build' / 'Makefile').is_file():
+    problems.append('mere: the upstream mkmf context could not be constructed')
+else:
+    explicit = OUT / 'explicit-context-lib'
+    explicit.mkdir()
+    (explicit / 'context_priority.rb').write_text('$mkmf_context_priority = true\n')
+    checked = run('upstream-context-child', 'mere',
+                  [launcher, '-I', stdlib, '-rcontext_priority', '-e',
+                   'abort "explicit library lost" unless $mkmf_context_priority; '
+                   'abort "context lost" unless RbConfig::CONFIG["topdir"] == ENV["UNITTEST_MKMF_BUILD"]; '
+                   'require "mkmf"; require "monitor"; Monitor.new.synchronize { puts "upstream mkmf context passed" }'],
+                  OUT, {'RUBYLIB': os.pathsep.join([str(explicit), str(context / 'source' / 'lib'), stdlib]),
+                        'MERE_RUBY_STDLIB_FALLBACK': ''})
+    if not checked['ok'] or 'upstream mkmf context passed' not in checked['output']:
+        problems.append('mere: the upstream mkmf child lost its context or explicit library')
+    print(f"upstream   context and child: {'passed' if checked['ok'] else 'FAILED'}", flush=True)
 
 script = CHECK / 'mkmf.rb'
 answers = {side: passed(run('contracts', side, [REF if side == 'reference' else MERE, script], OUT, lib=libs[side]))
