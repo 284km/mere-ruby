@@ -5281,6 +5281,24 @@ native fixture is built separately against each interpreter's real headers.
 No original test, exclusion, resource bound or API inventory changes.
 
 
+## Class visibility entries in Method traversal (2026-11-22)
+
+The PR 132 Class visibility review is corrected in f3d22a1a. Both
+Method and UnboundMethod resume above the body represented by a visibility
+entry; prepends retain the intervening singleton owner. Selected Ruby/native
+bodies remain callable with and without blocks, including binding, copies,
+yields and to_proc. All 72 focused comparisons, the original 527-case core
+comparison and all 748 corpus programs retain their passing cases. No
+original test, snapshot, exclusion, API policy or resource bound is changed.
+
+Separate reflection controls already differ on integrated parent 161b40d0:
+unbinding a private inherited native subclasses Method reports the singleton
+owner rather than Class; a redundant public declaration creates a singleton
+owner rather than retaining a Class prepend's owner. These controls and the
+independent saved-metadata/alias issues 124/133 remain outside this traversal
+and selected-body correction. The receipt preserves their reference/parent
+outputs. Fresh hosted CI and latest-main per-file acceptance remain required.
+
 ## Selected native Class Method behind a prepend
 
 Class.prepend no longer makes a native subclasses super_method call the

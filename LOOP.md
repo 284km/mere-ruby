@@ -8421,6 +8421,50 @@ No source lock, original test, exclusion, API inventory or bound changes.
 Current-head hosted CI, full file comparisons and review still gate merge.
 
 
+## 2026-11-22: preserve Class visibility owners and their selected Method bodies
+
+PR 132's remaining review reproduction makes an inherited subclasses entry
+private. Its bound and unbound super_method wrongly selected Class again,
+and a prepend before the visibility entry skipped its observable owner.
+The Class paths now use native_owner_method_after, the existing notification
+Method traversal parameterized by its real native owner. Ordinary dispatch
+and defined?(super) retain their implementation-chain query.
+
+When that traversal selects a visibility-only Class entry, record the actual
+body below it using existing Method definition metadata and native provenance.
+Blockless and block-carrying Method calls share class_subclasses_method_call;
+UnboundMethod binding, copies and to_proc retain the same selection and block.
+No new top-level value, collector/pin/state, VM, AST or C API implementation
+is changed by this repair. Changed existing functions: invoke_val_c0,
+invoke_with_block0 and module_notification_method_after; the new and-helpers
+are native_owner_method_after, class_subclasses_method_note and
+class_subclasses_method_call. Main 49ad01e3 merges without a runtime conflict;
+both independent documentation records are preserved.
+
+Ordinary native macOS O2/compiler 408b03d9 source f3d22a1a versus
+parent 161b40d0: all 72 focused default/evaluator/strict-VM and hash/MRO
+comparisons match Ruby 4.0.9. Corpus 770 includes actual calls and yields,
+private/protected/public visibility, singleton and Class prepends, inherited
+Ruby bodies, bound/unbound methods, copies and to_proc. The original literal
+review returns [nil, nil], versus the parent's [Class, Class].
+
+Five complete original files retain 527 cases / 525 MATCH / 1 existing RED / 1 BOTH,
+without a passing parent case lost. Class 62 uses its original own-header
+fixture on both runtimes; parent/candidate 10,255 assertions versus reference 10,355
+is retained as an existing difference. Module 195/1240, Super 50/109 and the
+existing Method/Refinement skips remain unchanged. All nine existing loop RSS
+gates and dead/duplicate definitions, GC roots, method writes, record hygiene
+and bracket 155/1024 pass. Top-level let count remains 136.
+
+All 748 corpus programs match in both hash-index modes,
+488.748 seconds / 1,284,080 KiB under the original 900-second/2-GiB
+bound. The first pre-final candidate's block-carrying probe failed and its
+partial corpus was stopped; it is not counted as this final complete pass.
+The receipt unittest/class_subclasses_visibility_review_r102.json retains
+all actual identities, cases, mode comparisons, hashes and fixture context.
+No original tests, accepted baselines, locks, exclusions or limits change.
+Fresh hosted CI and latest-main per-file acceptance remain required.
+
 ### PR review: retain selected native Class methods behind prepends
 
 Once the remaining-chain query selects Class's native subclasses entry,
