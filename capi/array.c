@@ -229,7 +229,23 @@ VALUE rb_struct_new(VALUE klass, ...) {
     return mr_callv(klass, rb_intern("new"), (int)n, argv, Qnil, 0);
 }
 VALUE rb_struct_alloc(VALUE klass, VALUE values) { return mr_callv(klass, rb_intern("new"), RARRAY_LENINT(values), RARRAY_CONST_PTR(values), Qnil, 0); }
-VALUE rb_struct_initialize(VALUE self, VALUE values) { mr_callv(self, rb_intern("initialize"), RARRAY_LENINT(values), RARRAY_CONST_PTR(values), Qnil, 0); return Qnil; }
+/* struct.c's: the values by position -- for a Data instance too, whose own
+ * #initialize takes keywords: the members named, a missing one nil, one too
+ * many "struct size differs" -- and a Data instance frozen after. */
+VALUE rb_struct_initialize(VALUE self, VALUE values) {
+    if (!RTEST(rb_obj_is_kind_of(self, mr_const("Data")))) {
+        mr_callv(self, rb_intern("initialize"), RARRAY_LENINT(values), RARRAY_CONST_PTR(values), Qnil, 0);
+        return Qnil;
+    }
+    VALUE members = mr_call(rb_obj_class(self), "members", 0);
+    long n = RARRAY_LEN(members), given = RARRAY_LEN(values);
+    if (given > n) rb_raise(rb_eArgError, "struct size differs");
+    VALUE kw = rb_hash_new();
+    for (long i = 0; i < n; i++) rb_hash_aset(kw, RARRAY_AREF(members, i), i < given ? RARRAY_AREF(values, i) : Qnil);
+    mr_callv(self, rb_intern("initialize"), 1, &kw, Qnil, MR_SEND_KW);
+    rb_obj_freeze(self);
+    return Qnil;
+}
 VALUE rb_struct_aref(VALUE s, VALUE index) { return mr_call(s, "[]", 1, index); }
 VALUE rb_struct_aset(VALUE s, VALUE index, VALUE value) { return mr_call(s, "[]=", 2, index, value); }
 VALUE rb_struct_getmember(VALUE s, ID id) {
@@ -257,6 +273,7 @@ VALUE rb_data_define(VALUE super, ...) {
     while ((member = va_arg(ap, const char *)) != NULL) rb_ary_push(members, ID2SYM(rb_intern(member)));
     va_end(ap);
     VALUE base = (super == 0 || NIL_P(super)) ? mr_const("Data") : super;
+    if (!RB_TYPE_P(base, T_CLASS)) rb_raise(rb_eTypeError, "wrong argument type %s (expected Class)", rb_obj_classname(base));
     return mr_callv(base, rb_intern("define"), RARRAY_LENINT(members), RARRAY_CONST_PTR(members), Qnil, 0);
 }
 

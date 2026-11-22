@@ -241,7 +241,7 @@ int rb_sourceline(void) {
     return NIL_P(line) ? 0 : NUM2INT(line);
 }
 VALUE rb_lastline_get(void) { return rb_gv_get("$_"); }
-VALUE rb_f_global_variables(void) { return rb_funcall(mr_main(), rb_intern("global_variables"), 0); }
+VALUE rb_f_global_variables(void) { return mr_call(mr_ruby("-> { Kernel.global_variables }"), "call", 0); }
 VALUE rb_gc_latest_gc_info(VALUE key) { return rb_funcall(mr_const("GC"), rb_intern("latest_gc_info"), 1, key); }
 VALUE rb_marshal_dump(VALUE obj, VALUE port) {
     if (NIL_P(port)) return rb_funcall(mr_const("Marshal"), rb_intern("dump"), 1, obj);

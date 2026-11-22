@@ -429,6 +429,8 @@ int mr_capi_open(const char *path) {
 /* ---- running C -------------------------------------------------------------- */
 extern void mr_capi_boot(void);
 static int booted;
+/* (has any extension run yet: before that, the C globals are not filled) */
+int mr_capi_booted(void) { return booted; }
 
 static VALUE run(const CapiReq *req, long argc, VALUE *argv) {
     switch ((int)req->mu_op) {

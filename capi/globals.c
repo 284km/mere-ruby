@@ -66,6 +66,18 @@ static VALUE boot_body(VALUE unused) {
     Init_MemoryView();
     return Qnil;
 }
+/* The interpreter assigned one of the globals C keeps as a variable ($stdin,
+ * $stdout, $stderr, $;, $,, $/, $\\): the variable is that value now, as
+ * CRuby's are (its setters write them). */
+int mr_capi_set_global(int slot, CapiWord word) {
+    VALUE v = (VALUE)word.mu_w;
+    switch (slot) {
+      case 0: rb_stdin = v; break;   case 1: rb_stdout = v; break;  case 2: rb_stderr = v; break;
+      case 3: rb_fs = v; break;      case 4: rb_output_fs = v; break;
+      case 5: rb_rs = v; break;      case 6: rb_output_rs = v; break;
+    }
+    return 0;
+}
 void mr_capi_boot(void) {
     VALUE outcome;
     mr_guarded(boot_body, Qnil, &outcome);
