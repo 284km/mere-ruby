@@ -7417,3 +7417,26 @@ Fresh hosted checks and latest-main per-file acceptance remain required.
 The upstream gem workflow also selects compiler408b03d9, matching core CI
 and the new local O2 measurements. Its original locks, tests, accepted
 snapshots and bounds are unchanged; new hosted gem results remain required.
+
+## 2026-11-22: stop cancelled workflows from starting new suite summaries
+
+Cancelled runs 44921266629 and 44922636658 still started their Unit,
+Bootstrap and Tool summary jobs. The jobs had no completed shard group to
+collect, so cancellation produced additional failing summary checks. Main's
+Tool summary already checks cancellation and the shard result; apply the same
+boundary to Unit and Bootstrap.
+
+Both jobs require a successful plan and an active workflow with a successful
+or failed shard group. Their collect steps also check cancellation, covering
+a workflow cancelled after the job starts. Genuine shard failures still run
+the existing collectors; missing and partial results still fail, and the
+existing artifact uploads continue to retain diagnostics. Test inventories,
+resource bounds, runners, measurement code and runtime implementation are
+unchanged. See the [GitHub status-check documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions).
+
+Validation: actionlint 1.7.12 accepts the workflow. Four existing collection
+controls pass: missing shards retain all planned rows and fail; unattempted
+files in partial artifacts remain visible; weighted plans still reject a
+missing shard; and a monitor failure preserves reference cases while failing
+collection. This does not mark previously cancelled or failed runs successful.
+
