@@ -21,6 +21,8 @@ from ci import supervise
 WALL = 600
 RSS_KB = 2097152
 TALLY = re.compile(r'(\d+) (?:runs|tests), (\d+) assertions, (\d+) failures, (\d+) errors, (\d+) skips')
+TEST_UNIT_TALLY = re.compile(r'(\d+) tests, (\d+) assertions, (\d+) failures, (\d+) errors,\s*'
+                             r'(\d+) pendings, (\d+) omissions, (\d+) notifications')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
 
@@ -125,8 +127,17 @@ end
     print('Verified all locked sources and pure Ruby dependencies.')
 
 
-def tally(stdout, stderr):
-    found = TALLY.findall(ANSI.sub('', stdout + '\n' + stderr))
+def tally(stdout, stderr, framework=None):
+    text = ANSI.sub('', stdout + '\n' + stderr)
+    if framework == 'test-unit-gem':
+        found = TEST_UNIT_TALLY.findall(text)
+        if not found:
+            return None
+        counts = dict(zip(('tests', 'assertions', 'failures', 'errors', 'pendings', 'omissions', 'notifications'),
+                          map(int, found[-1])))
+        counts['skips'] = counts['pendings'] + counts['omissions']
+        return counts
+    found = TALLY.findall(text)
     return dict(zip(('tests', 'assertions', 'failures', 'errors', 'skips'), map(int, found[-1]))) if found else None
 
 
@@ -170,20 +181,31 @@ def run_side(args, suite, file, side, env, output, lock):
         libraries += [scratch / name / 'lib' for name in suite['load_sources'] if name != suite['name']]
         if suite.get('framework') == 'cruby-test-unit':
             libraries += [args.ruby_src / 'tool/lib']
+        if suite.get('framework') == 'test-unit-gem':
+            libraries += [args.cache / 'home/gems' / f"{p['name']}-{p['version']}" / 'lib' for p in lock['packages']]
         binary = args.reference if side == 'reference' else args.binary
         command = [str(binary), '--disable-gems', '-I', os.pathsep.join(map(str, libraries)),
-                   '-r', str(ROOT / 'gemtest/suite_bootstrap.rb'), '-r', 'rubygems', file, '--seed', '1']
+                   '-r', str(ROOT / 'gemtest/suite_bootstrap.rb'), '-r', 'rubygems']
+        for preload in suite.get('preload', []):
+            command += ['-r', str(source / preload)]
+        command += [file]
+        command += ['--order=alphabetic'] if suite.get('framework') == 'test-unit-gem' else ['--seed', '1']
+        if args.verbose:
+            command += ['--verbose']
         stdout = output / (side + '.stdout')
         stderr = output / (side + '.stderr')
         source_record = output / (side + '.source.txt')
         side_env = dict(env, MERE_SUITE_RUBY_LIB=str(args.ruby_src / 'lib'),
-                        MERE_SUITE_SOURCE_ROOT=str(source), MERE_SUITE_SOURCE_RECORD=str(source_record))
+                        MERE_SUITE_SOURCE_ROOT=str(source), MERE_SUITE_SOURCE_RECORD=str(source_record),
+                        RUBY=str(binary), UNITTEST_CHILD_RUBY=str(binary),
+                        RUBYLIB=os.pathsep.join(map(str, libraries + args.runtime_paths[side] + [args.ruby_src / 'lib'])),
+                        PATH=str(ROOT / 'unittest/child-bin') + os.pathsep + env.get('PATH', os.defpath))
         result = supervise([sys.executable, '-c', EXEC, str(source), str(stdout), str(stderr)] + command,
                            side_env, output / (side + '.monitor'), RSS_KB, WALL)
         result['source_files'] = [line for line in source_record.read_text().splitlines() if line] if source_record.exists() else []
         result['source_verified'] = bool(result['source_files'])
         result['source_record'] = source_record.name
-        result['tally'] = tally(stdout.read_text(errors='replace'), stderr.read_text(errors='replace'))
+        result['tally'] = tally(stdout.read_text(errors='replace'), stderr.read_text(errors='replace'), suite.get('framework'))
         result['stdout'] = stdout.name
         result['stderr'] = stderr.name
         # Raw logs stay in the run directory; portable records contain no paths.
@@ -211,6 +233,14 @@ def compare(rows, baseline, same_platform=True):
     return errors
 
 
+def baseline_errors(result, baseline):
+    if baseline['lock_sha256'] != result['lock_sha256']:
+        raise ValueError('baseline lock differs')
+    if baseline['platform'] != result['platform']:
+        raise ValueError('baseline platform differs; select the matching platform snapshot')
+    return compare(result['rows'], baseline)
+
+
 def measure(args, lock):
     verify(args.cache, lock)
     if call([str(args.reference), '--disable-gems', '-e', 'print RUBY_VERSION']) != lock['ruby_version']:
@@ -220,6 +250,10 @@ def measure(args, lock):
     subprocess.run(['git', '-C', str(args.ruby_src), 'diff', '--exit-code', 'HEAD', '--', 'lib'], check=True, stdout=subprocess.DEVNULL)
     if (ROOT / '.build_mode').read_text().strip() != 'O2':
         raise ValueError('measurement requires an O2 build')
+    args.runtime_paths = {
+        side: call(['sh', str(ROOT / 'tools/runtime_load_path.sh'), str(binary)], timeout=20).split(os.pathsep)
+        for side, binary in [('reference', args.reference), ('mere', args.binary)]
+    }
     args.output.mkdir(parents=True, exist_ok=False)
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(('RUBY', 'GEM_', 'BUNDLE_', 'MERE_', 'MT_')) and key not in ('COVERAGE', 'SEPARATE')}
@@ -253,9 +287,7 @@ def measure(args, lock):
         raise ValueError('binary or lock changed during measurement; discard this run')
     if args.baseline:
         baseline = json.loads(args.baseline.read_text())
-        if baseline['lock_sha256'] != result['lock_sha256']:
-            raise ValueError('baseline lock differs')
-        errors = compare(rows, baseline, baseline.get('platform') == result['platform'])
+        errors = baseline_errors(result, baseline)
         result['regressions'] = errors
         save(args.output / 'results.json', result)
         if errors:
@@ -275,6 +307,7 @@ def main():
     parser.add_argument('--gem', action='append')
     parser.add_argument('--file', action='append')
     parser.add_argument('--baseline', type=Path)
+    parser.add_argument('--verbose', action='store_true', help='ask the upstream runner to name each test')
     args = parser.parse_args()
     for key in ('lock', 'cache', 'reference', 'binary', 'ruby_src', 'output', 'baseline'):
         value = getattr(args, key)
