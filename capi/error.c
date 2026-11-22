@@ -87,8 +87,21 @@ void rb_frozen_error_raise(VALUE obj, const char *fmt, ...) {
     VALUE argv[2] = { message, options };
     rb_exc_raise(mr_callv(rb_eFrozenError, rb_intern("new"), 2, argv, Qnil, MR_SEND_KW));
 }
+/* error.c's: the object inspected once -- an #inspect that itself reports
+ * the object frozen gets " ..." for it (rb_exec_recursive), not a loop */
+static VALUE frozen_inspecting[16];
+static int frozen_depth;
 void rb_error_frozen_object(VALUE obj) {
-    rb_frozen_error_raise(obj, "can't modify frozen %" PRIsVALUE ": %" PRIsVALUE, rb_obj_class(obj), rb_inspect(obj));
+    for (int i = 0; i < frozen_depth; i++)
+        if (frozen_inspecting[i] == obj)
+            rb_frozen_error_raise(obj, "can't modify frozen %" PRIsVALUE ":  ...", rb_obj_class(obj));
+    if (frozen_depth >= 16) rb_frozen_error_raise(obj, "can't modify frozen %" PRIsVALUE ":  ...", rb_obj_class(obj));
+    frozen_inspecting[frozen_depth++] = obj;
+    int state = 0;
+    VALUE text = rb_protect(rb_inspect, obj, &state);
+    frozen_depth--;
+    if (state) rb_jump_tag(state);
+    rb_frozen_error_raise(obj, "can't modify frozen %" PRIsVALUE ": %" PRIsVALUE, rb_obj_class(obj), text);
 }
 void rb_error_frozen(const char *what) { rb_raise(rb_eFrozenError, "can't modify frozen %s", what); }
 #undef rb_check_frozen
@@ -187,10 +200,17 @@ void rb_category_warning(rb_warning_category_t category, const char *fmt, ...) {
 void rb_sys_warning(const char *fmt, ...) { va_list ap; va_start(ap, fmt); warn_formatted(fmt, ap, 1); va_end(ap); }
 
 /* ---- $! --------------------------------------------------------------------- */
-VALUE rb_errinfo(void) { return mr_up2(MR_ERRINFO, 0, Qnil); }
+extern VALUE mr_frame_errinfo(void);
+extern void mr_frame_set_errinfo(VALUE v);
+/* the C call's own: nil when it starts, what rb_protect / rb_rescue caught */
+VALUE rb_errinfo(void) { return mr_frame_errinfo(); }
+/* ($! of the Ruby frame that called C: what rb_ensure and rb_rescue put
+ *  back as they found it) */
+static VALUE ruby_errinfo(void) { return mr_up2(MR_ERRINFO, 0, Qnil); }
 void rb_set_errinfo(VALUE exc) {
     if (!NIL_P(exc) && !RTEST(rb_obj_is_kind_of(exc, rb_eException))) rb_raise(rb_eTypeError, "assigning non-exception to $!");
     mr_up2(MR_ERRINFO, 1, exc);
+    mr_frame_set_errinfo(exc);
 }
 
 /* ---- the guards ----------------------------------------------------------- */
@@ -206,6 +226,7 @@ VALUE rb_protect(VALUE (*func)(VALUE), VALUE arg, int *state) {
     protected_outcome = outcome;
     /* ($! is the exception from here on, until the caller clears it) */
     mr_up2(MR_OUTCOME, outcome, MR_O_ENTER);
+    mr_frame_set_errinfo(ruby_errinfo());
     if (state) *state = tag;
     return Qnil;
 }
@@ -220,14 +241,16 @@ void rb_jump_tag(int state) {
     rb_raise(rb_eRuntimeError, "rb_jump_tag: no jump of state %d is pending", state);
 }
 VALUE rb_ensure(VALUE (*body)(VALUE), VALUE data1, VALUE (*cleanup)(VALUE), VALUE data2) {
-    VALUE before = rb_errinfo();
+    VALUE before = ruby_errinfo(), before_c = mr_frame_errinfo();
     VALUE leaving, cleanup_leaving;
     volatile VALUE result = mr_guarded(body, data1, &leaving);
-    if (leaving != Qundef) mr_up2(MR_OUTCOME, leaving, MR_O_ENTER);
+    /* (the cleanup runs with the exception on its way out as $! and errinfo) */
+    if (leaving != Qundef) { mr_up2(MR_OUTCOME, leaving, MR_O_ENTER); mr_frame_set_errinfo(ruby_errinfo()); }
     volatile VALUE kept = leaving;      /* (on this stack: a collection in the cleanup finds it) */
     if (mr_without("ensure")) cleanup_leaving = Qundef;
     else mr_guarded(cleanup, data2, &cleanup_leaving);
     mr_up2(MR_ERRINFO, 1, before);
+    mr_frame_set_errinfo(before_c);
     if (cleanup_leaving != Qundef) mr_throw(cleanup_leaving);
     if (kept != Qundef) mr_throw(kept);
     return result;
@@ -235,7 +258,7 @@ VALUE rb_ensure(VALUE (*body)(VALUE), VALUE data1, VALUE (*cleanup)(VALUE), VALU
 static VALUE rescue_classes(VALUE (*body)(VALUE), VALUE data1, VALUE (*handler)(VALUE, VALUE), VALUE data2,
                             int count, const VALUE *classes) {
     VALUE leaving;
-    VALUE before = rb_errinfo();
+    VALUE before = ruby_errinfo(), before_c = mr_frame_errinfo();
     VALUE result = mr_guarded(body, data1, &leaving);
     if (leaving == Qundef) return result;
     volatile VALUE kept = leaving;
@@ -245,8 +268,10 @@ static VALUE rescue_classes(VALUE (*body)(VALUE), VALUE data1, VALUE (*handler)(
     for (int i = 0; i < count && !handled; i++) handled = RTEST(rb_obj_is_kind_of(exc, classes[i]));
     if (!handled) mr_throw(kept);
     mr_up2(MR_OUTCOME, kept, MR_O_ENTER);
+    mr_frame_set_errinfo(exc);
     result = handler ? handler(data2, exc) : Qnil;
     mr_up2(MR_ERRINFO, 1, before);
+    mr_frame_set_errinfo(before_c);
     return result;
 }
 VALUE rb_vrescue2(VALUE (*body)(VALUE), VALUE data1, VALUE (*handler)(VALUE, VALUE), VALUE data2, va_list ap) {

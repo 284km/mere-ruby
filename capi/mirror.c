@@ -129,6 +129,19 @@ static void refresh_head(struct mr_mirror *m, VALUE obj) {
     *(VALUE *)&m->as.basic.klass = m->hidden ? 0 : mr_word(0);
     m->head_epoch = mr_epoch;
 }
+/* ObjectSpace.memsize_of: a typed data object's own count of what it holds
+ * (its type's dsize), by handle number. */
+int mr_capi_dsize(int number) {
+    struct mr_mirror *m = mirror_at(number, 0);
+    if (!m || m->data != 2) return 0;
+    const rb_data_type_t *type = (const rb_data_type_t *)(m->as.typed.type & TYPED_DATA_PTR_MASK);
+    if (!type || !type->function.dsize) return 0;
+    /* (the struct itself, as the free and mark paths find it -- no header
+     *  refresh: no C call is in progress here) */
+    void *data = m->embedded ? (void *)&m->as.typed.data : m->as.typed.data;
+    size_t n = type->function.dsize(data);
+    return n > (size_t)INT_MAX ? INT_MAX : (int)n;
+}
 /* rb_obj_hide / rb_obj_reveal: to C, a hidden object has no class (CRuby
  * clears RBasic.klass; the interpreter's object keeps its own). */
 void mr_mirror_hide(VALUE obj, int hidden) {

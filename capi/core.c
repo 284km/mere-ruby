@@ -24,6 +24,7 @@ struct mr_frame {
     int raised;
 };
 static struct mr_frame *cur;
+static VALUE c_errinfo = Qnil;   /* rb_errinfo's (mr_frame_errinfo, below) */
 static int depth;
 unsigned long mr_epoch = 1;
 static long stats[8];
@@ -520,6 +521,9 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
         raised = 1;
         result = frame.pending;
     }
+    /* (an exception leaving C is Ruby's to rescue now, and a Ruby rescue
+     *  clears ec->errinfo: one a C handler re-raised is not left behind) */
+    if (raised) c_errinfo = Qnil;
     mr_mirrors_leave(&frame, frame.prev == NULL);
     cur = frame.prev;
     depth--;
@@ -586,6 +590,17 @@ char *mr_capi_libc(void) {
 }
 int mr_capi_depth(void) { return depth; }
 const void *mr_capi_frame(void) { return cur; }
+/* CRuby's ec->errinfo, which rb_errinfo answers: ONE value, set by C's own
+ * rescues -- rb_protect, rb_rescue's handler, rb_ensure's cleanup,
+ * rb_set_errinfo -- and not by a Ruby `rescue`, so a C method a Ruby rescue
+ * calls finds none; Ruby a C handler runs, and the C it calls, find the
+ * exception. (A root: the collector reads it with the C API's own.) */
+VALUE mr_frame_errinfo(void) { return c_errinfo; }
+void mr_frame_set_errinfo(VALUE v) {
+    static int rooted;
+    if (!rooted) { rooted = 1; rb_gc_register_address(&c_errinfo); }
+    c_errinfo = v;
+}
 int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which] : -1; }
 
 /* A coroutine switch. The calls in progress are a chain through C stack

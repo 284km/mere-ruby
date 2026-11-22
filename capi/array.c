@@ -300,20 +300,33 @@ VALUE rb_enumeratorize(VALUE obj, VALUE meth, int argc, const VALUE *argv) {
     rb_ary_unshift(args, meth);
     return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, 0);
 }
-/* (the size function is C's and takes the receiver, the arguments and the
- *  enumerator: the Enumerator made here answers size as nil -- "not known" --
- *  rather than ask a function this side cannot hand to it) */
+/* The size function is C's, and takes the receiver, the arguments and the
+ * enumerator: it is the size block enum_for takes, a block function that
+ * calls it with those three -- the enumerator filled in once enum_for has
+ * made it. */
 #undef rb_enumeratorize_with_size
 #undef rb_enumeratorize_with_size_kw
-VALUE rb_enumeratorize_with_size(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size) {
-    (void)size;
-    return rb_enumeratorize(obj, meth, argc, argv);
+extern VALUE mr_block_function(rb_block_call_func_t func, VALUE data);
+static VALUE enum_size_call(VALUE yielded, VALUE data, int argc, const VALUE *argv, VALUE blockarg) {
+    (void)yielded; (void)argc; (void)argv; (void)blockarg;
+    rb_enumerator_size_func *size = (rb_enumerator_size_func *)(uintptr_t)NUM2ULONG(rb_ary_entry(data, 0));
+    return size(rb_ary_entry(data, 1), rb_ary_entry(data, 2), rb_ary_entry(data, 3));
 }
-VALUE rb_enumeratorize_with_size_kw(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size, int kw) {
-    (void)size;
+static VALUE enumeratorize_sized(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size, int flags) {
     VALUE args = rb_ary_new_from_values(argc, argv);
     rb_ary_unshift(args, meth);
-    return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, mr_kw(kw));
+    if (!size) return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, flags);
+    VALUE data = rb_ary_new_from_args(4, ULONG2NUM((uintptr_t)size), obj, rb_ary_new_from_values(argc, argv), Qnil);
+    VALUE e = mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args),
+                       mr_block_function(enum_size_call, data), flags);
+    rb_ary_store(data, 3, e);
+    return e;
+}
+VALUE rb_enumeratorize_with_size(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size) {
+    return enumeratorize_sized(obj, meth, argc, argv, size, 0);
+}
+VALUE rb_enumeratorize_with_size_kw(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size, int kw) {
+    return enumeratorize_sized(obj, meth, argc, argv, size, mr_kw(kw));
 }
 int rb_arithmetic_sequence_extract(VALUE obj, rb_arithmetic_sequence_components_t *component) {
     if (RTEST(rb_obj_is_kind_of(obj, mr_const("Enumerator::ArithmeticSequence")))) {
@@ -323,7 +336,10 @@ int rb_arithmetic_sequence_extract(VALUE obj, rb_arithmetic_sequence_components_
         component->exclude_end = RTEST(mr_call(obj, "exclude_end?", 0));
         return 1;
     }
-    if (RTEST(rb_obj_is_kind_of(obj, rb_cRange))) {
+    /* (a Range, or anything with a Range's three readers: rb_range_values) */
+    if (RTEST(rb_obj_is_kind_of(obj, rb_cRange))
+        || (rb_respond_to(obj, rb_intern("begin")) && rb_respond_to(obj, rb_intern("end"))
+            && rb_respond_to(obj, rb_intern("exclude_end?")))) {
         component->begin = mr_call(obj, "begin", 0);
         component->end = mr_call(obj, "end", 0);
         component->step = INT2FIX(1);

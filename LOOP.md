@@ -11165,3 +11165,33 @@ unchanged, and rb_set_end_proc's output at shutdown (2); class_spec's three
 names that are no constant's, which #157's define_class answers; digest_spec
 (needs Fiddle, which this interpreter does not have -- the spec returns
 early); debug_spec and tracepoint_spec (the VM's own structures).
+
+## 2026-11-22: ruby/spec optional/capi -- the six small files, 2,394 to 2,402
+
+enumerator, exception, range, time, typed_data and binding now equal the
+reference (4, 41, 54, 112, 15, 1).
+
+- rb_enumeratorize_with_size: the C size function is enum_for's size block
+  (it is called with the receiver, the arguments and the enumerator, which
+  is filled in once enum_for has made it).
+- **rb_errinfo is CRuby's ec->errinfo: one value**, set by C's own rescues
+  (rb_protect, rb_rescue's handler, rb_ensure's cleanup, rb_set_errinfo),
+  not by a Ruby `rescue` -- a C method a Ruby rescue calls finds nil -- and
+  gone when an exception leaves C for the interpreter (a Ruby rescue clears
+  it in CRuby). It read the interpreter's $! before. Tried first per C call:
+  rb_protect's exception was then gone at the next C call, which
+  kernel_spec reads (288 -> 280); and as one value with no clearing, a
+  handler that re-raised left it behind for every later example (-> 222).
+  rb_ensure and rb_rescue save and restore the Ruby caller's $! apart from
+  it.
+- rb_error_frozen_object inspects the object once: an #inspect that itself
+  reports the object frozen gets " ..." (rb_exec_recursive), not a loop.
+  rb_make_exception(nil) is TypeError.
+- rb_arithmetic_sequence_extract takes anything with a Range's three readers
+  (rb_range_values).
+- rb_time_new / rb_time_nano_new reach Time.at's builtin (Time.__capi_at),
+  not what the program made of Time.at.
+- ObjectSpace.memsize_of adds a typed data object's dsize (mr_capi_dsize,
+  read from the struct directly: no C call is in progress there).
+- Kernel#binding sent from C is "Can't create Binding from C level
+  function".
