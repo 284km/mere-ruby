@@ -82,3 +82,62 @@ k = Class.new { include IM.new(:password, 5) }
 o = k.new
 o.password = 3
 p o.password
+
+# Module's other methods, private ones included, reach the module from the
+# instance's module_eval: Rails' undefine_attribute_methods runs
+# `module_eval { undef_method(*instance_methods) }` on one.
+class GM < Module
+  def initialize = super
+end
+g = GM.new
+g.module_eval { def a = 1; def b = 2; def c = 3; def d = 4 }
+g.module_eval { undef_method(:a); alias_method :e, :b; remove_method :c }
+p g.instance_methods.sort
+class GA < Module
+  def initialize
+    module_eval { def q = 1 }
+    module_eval { undef_method(*instance_methods) }
+  end
+end
+p GA.new.instance_methods
+gen = GM.new
+gen.module_eval { def title = 1; def body = 2 }
+gen.module_eval { undef_method(*instance_methods) }
+p Class.new { include gen }.new.respond_to?(:title), gen.instance_methods
+
+# the subclass's own attr_reader wins over Module's; attr_accessor still defines
+class OA < Module
+  def attr_reader(*a) = (@seen ||= []).concat(a)
+  def initialize
+    attr_reader :z
+    attr_accessor :w
+  end
+  def seen = @seen
+end
+o = OA.new
+p o.seen, o.instance_methods.sort, o == o, o.frozen?
+
+# a def in the instance's module_eval goes to the instance, not the subclass
+m2 = GM.new
+p m2.module_eval { [self.equal?(m2), (def made2 = :made)] }, m2.instance_methods, GM.instance_methods(false)
+
+# a frozen instance refuses every change that would land in its module, by
+# a call or from its module_eval, and names the instance as ruby does
+class FM < Module; end
+fm = FM.new
+fm.module_eval { def a = 1; def b = 2 }
+fm.freeze
+[[:attr_reader, :x], [:attr_writer, :x], [:attr_accessor, :x], [:attr, :x], [:alias_method, :c, :a],
+ [:remove_method, :a], [:undef_method, :b], [:define_method, :d, -> {}], [:public, :a], [:private, :a]].each do |n, *a|
+  begin
+    fm.send(n, *a); p [n, :ok]
+  rescue => e
+    p [n, e.class, e.message.sub(/0x\h+/, "X")]
+  end
+end
+begin; fm.module_eval { def e = 1 }; p :def_ok; rescue => e; p [:def, e.class, e.message.sub(/0x\h+/, "X")]; end
+begin; fm.module_eval { attr_reader :y }; p :blk_ok; rescue => e; p [:blk, e.class, e.message.sub(/0x\h+/, "X")]; end
+p fm.instance_methods(false).sort
+# ...and one frozen before its module was ever made
+fz = FM.new.freeze
+begin; fz.module_eval { def f = 1 }; rescue => e; p [e.class, e.message.sub(/0x\h+/, "X")]; end
