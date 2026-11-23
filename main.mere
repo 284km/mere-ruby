@@ -5193,8 +5193,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        && (match va0 with VHsh _ -> true | VArr _ -> true | _ -> false)
        && (let bv8 = eval_e env world blk b in
            (match (va0, bv8) with
-            | (VHsh h8, VHsh g8) -> (if rb_eq va0 bv8 then false else hash_has_obj world (hderef h8) || hash_has_obj world (hderef g8))
-            | (VArr a8, VArr b8) -> (if rb_eq va0 bv8 then false else arr_has_obj world (deref a8) || arr_has_obj world (deref b8))
+            // (...asked before the structural answer: an element's own #==
+            //  -- an object's, a singleton's -- can say no to a twin)
+            | (VHsh h8, VHsh g8) -> hash_has_obj world (hderef h8) || hash_has_obj world (hderef g8)
+            | (VArr a8, VArr b8) -> arr_has_obj world (deref a8) || arr_has_obj world (deref b8)
             | (_, _) -> false)) then
       // ...compared HERE rather than through the dispatcher: a binary operator
       // on a primitive routes back to this path, and the two would call each
@@ -38563,7 +38565,9 @@ and arr_has_obj_d = fn world -> fn (xs: Val list) -> fn (d: int) ->
   | Cons (VExc (c9, m9), t) -> (if exc_cmp_val world (VExc (c9, m9)) then true else arr_has_obj_d world t d)
   | Cons (VArr a9, t) -> (if d > 0 && arr_has_obj_d world (deref a9) (d - 1) then true else arr_has_obj_d world t d)
   | Cons (VHsh h9, t) -> (if d > 0 && arr_has_obj_d world (hderef h9) (d - 1) then true else arr_has_obj_d world t d)
-  | Cons (_, t) -> arr_has_obj_d world t d
+  // (...or is a builtin value whose singleton or subclass answers #==:
+  //  `x = +"k"; def x.==(o) = true` in `[x] == ["zzz"]` -- prim_eq_override)
+  | Cons (v9, t) -> (if prim_eq_override world v9 then true else arr_has_obj_d world t d)
 
 // can the dispatcher answer #== for this object? A user method, or a builtin
 // arm (a Time compares by its instant, a Method by its definition). Asking one
@@ -38571,8 +38575,23 @@ and arr_has_obj_d = fn world -> fn (xs: Val list) -> fn (d: int) ->
 // a member that is itself a container is compared the same way, all the way
 // down: `[[Version.new(1)]] == [[Version.new(1)]]` is one nesting deeper than
 // the structural answer can see
+// a String, Array, Hash ... with a singleton class or a subclass tag whose
+// method table has #== (hng_store, as EBin's arm finds an operator there)
+and prim_eq_override = fn world -> fn (v: Val) ->
+  (match v with
+   | VObj _ -> false | VInt _ -> false | VNil -> false | VBool _ -> false
+   | _ -> (let hk9 = hng_key v in
+           (if str_eq hk9 "" then false else true) && map_has hng_store hk9 && has_meth world (map_get hng_store hk9) "=="))
 and cmp_member_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
-  if rb_eq x y then true
+  // (an element whose own #== is a singleton's or a subclass's is asked, as
+  //  rb_equal asks it -- unless the two are the same object)
+  if prim_eq_override world x then
+    (match (x, y) with
+     | (VStr h1, VStr h2) when h1 == h2 -> true
+     | (VArr h1, VArr h2) when h1 == h2 -> true
+     | (VHsh h1, VHsh h2) when h1 == h2 -> true
+     | _ -> truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) x "==" (Cons (y, Nil)) false))
+  else if rb_eq x y then true
   else
     (match (x, y) with
      // ⚠ under rb_eq's cycle guard: a pair met again inside itself is equal
@@ -68180,6 +68199,15 @@ and vm_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) ->
   then (match (recv, args) with
         | (VInt x9, Cons (VInt y9, Nil)) -> (match int_fast_op mid x9 y9 with (_, v9) -> v9)
         | _ -> VNil)
+  // (`!x` -- `not`, `while !q.empty?` -- as EUn's arm answers it: the
+  //  receiver's own #! when its class has one, else the truth turned over;
+  //  without the scope and the EUn made in it)
+  else if argc == 0 && bid < 0 && str_eq mid "!" && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 64 || vm_bit fl 1048576 then false else true)
+          && (match kws with Nil -> true | _ -> false) && (match args with Nil -> true | _ -> false)
+          && (if map_len hook_flags > 0 && hook_tp_on () then false else true)
+          && (let c9 = (match recv with VObj id9 -> (let (_, _, oc9, _) = world in map_get oc9 id9) | v9 -> dispatch_cls_of world v9) in
+              if has_meth world c9 "!" then false else true)
+  then VBool (if truthy recv then false else true)
   // (`==` / `!=` of a builtin value with nothing in the way: the answer
   //  EBin's arm reaches at its end, without the scope and the EBin made in
   //  it -- vm_bin_eq says when that is so)
@@ -68216,8 +68244,9 @@ and vm_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) ->
 // or Hash of its own class (no subclass tag, no singleton class) whose class
 // and ancestors -- a prepended module too -- define no `==`; an argument that
 // is no object (no #to_str / #to_ary / #to_hash to ask) and no Complex; and
-// for two Arrays or two Hashes, none with an object in it (EBin's arm compares
-// those itself, by their elements' #==). A number stays EBin's: coercion.
+// for two Arrays or two Hashes, none with an object or an element whose own
+// #== is a singleton's in it (EBin's arm compares those itself, by their
+// elements' #==). A number stays EBin's: coercion.
 and vm_bin_eq_ok = fn world -> fn (op: str) -> fn (recv: Val) -> fn (arg: Val) ->
   (if map_len hook_flags > 0 && hook_tp_on () then false else true)
   && map_len ref_active == 0
@@ -68232,8 +68261,8 @@ and vm_bin_eq_ok = fn world -> fn (op: str) -> fn (recv: Val) -> fn (arg: Val) -
   && (let c9 = class_name recv in
       (if has_meth world c9 op then false else true) && (if has_meth world c9 "==" then false else true))
   && (match (recv, arg) with
-      | (VHsh h8, VHsh g8) -> (if rb_eq recv arg then true else (if hash_has_obj world (hderef h8) || hash_has_obj world (hderef g8) then false else true))
-      | (VArr a8, VArr b8) -> (if rb_eq recv arg then true else (if arr_has_obj world (deref a8) || arr_has_obj world (deref b8) then false else true))
+      | (VHsh h8, VHsh g8) -> (if hash_has_obj world (hderef h8) || hash_has_obj world (hderef g8) then false else true)
+      | (VArr a8, VArr b8) -> (if arr_has_obj world (deref a8) || arr_has_obj world (deref b8) then false else true)
       | _ -> true)
 // A call on a receiver with a literal block and positional values -- `a.each
 // { |x| s += x }` -- as EMethodB's arm makes it past its written receiver and
