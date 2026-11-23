@@ -6765,6 +6765,8 @@ and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
            // (a global whose value C keeps: its C setter takes the value)
            else if map_len capi_gvar > 0 && map_has capi_gvar slot then (let _ = capi_gvar_call world slot true v in ())
            else (let _ = bx_note_gvar slot in map_set globals slot v)) in
+  // (...and C's own variable for it, rb_rs and the rest: capi_global_note)
+  let _ = capi_global_note slot v in
   // (the warning comes AFTER the store: a Warning.warn that prints sees the
   //  new $\ already, as ruby's does -- its line ends with it)
   // (and $\, the output record separator: rb_output_rs_setter warns too)
@@ -7924,6 +7926,13 @@ and capi_type = fn world -> fn (v: Val) ->
          if str_eq c "Struct" then 9
          else if str_eq c "IO" then 11
          else if str_eq c "MatchData" then 13
+         // (the core classes CRuby builds as typed data: T_DATA to C, which
+         //  reads no struct of them -- only their type)
+         else if str_eq c "Time" || str_eq c "Thread" || str_eq c "Thread::Mutex" || str_eq c "Thread::Queue"
+                 || str_eq c "Thread::ConditionVariable" || str_eq c "Method" || str_eq c "UnboundMethod"
+                 || str_eq c "Encoding" || str_eq c "Random" || str_eq c "Enumerator" || str_eq c "Fiber"
+                 || str_eq c "ObjectSpace::WeakMap" || str_eq c "ObjectSpace::WeakKeyMap" || str_eq c "Ractor"
+                 || str_eq c "Dir" then 12
          else if str_eq c "Object" || str_eq c "Exception" then 1
          else kind rest in
      kind (ancestors_of world (obj_cls_name oid)))
@@ -7937,8 +7946,13 @@ and capi_describe = fn env -> fn world -> fn (v: Val) ->
   //   CLASS_OF of a `class Blob < String` instance was String, so sqlite3,
   //   which binds a value whose class is SQLite3::Blob as a BLOB, stored it as
   //   text and read it back in UTF-8 instead of binary.
+  // (...and an object's RBasic.klass is its singleton class once it has one,
+  //  as CRuby's is -- CLASS_OF / rb_class_of read it; rb_obj_class asks the
+  //  interpreter for the real one)
   let cls = (match v with
-             | VObj oid -> obj_cls_name oid
+             | VObj oid -> (let (_, _, ocls9, _) = world in
+                            let c9 = (if map_has ocls9 oid then map_get ocls9 oid else "") in
+                            if is_sng_cls c9 then c9 else obj_cls_name oid)
              | VClass c -> (if map_has modules c then "Module" else "Class")
              | _ -> dispatch_cls_of world v) in
   let frozen = (match v with
@@ -7949,8 +7963,12 @@ and capi_describe = fn env -> fn world -> fn (v: Val) ->
                                 (fn (m: str) -> let _ = capi_clear world in VBool false) with
                         | VBool true -> 32 | _ -> 0)) in
   let enc = (match v with VStr h -> mr_capi_enc_index (senc_get h) * 256 | _ -> 0) in
+  // (...and whether a String's bytes are ASCII alone, 1 << 24: the coderange
+  //  C reads from its flags, ENC_CODERANGE_7BIT. Asked once per contents:
+  //  str_is_ascii keeps its answer.)
+  let ascii9 = (match v with VStr h -> (if str_is_ascii h then 16777216 else 0) | _ -> 0) in
   let _ = mr_capi_set 0 (CapiWord { w = capi_out (VClass cls) }) in
-  capi_type world v + frozen + enc
+  capi_type world v + frozen + enc + ascii9
 // The values C put in transit.
 and capi_args = fn (n: int) ->
   let rec take = fn (i: int) -> fn (acc: Val list) ->
@@ -7980,6 +7998,17 @@ and capi_overridden = fn world -> fn (recv: Val) -> fn (owner: str) -> fn (name:
 and capi_send = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (block: Val) -> fn (flags: int) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let public = (if bit_and flags 1 != 0 then true else false) in
+  // (Kernel#binding sent from C has no Ruby frame to bind -- CRuby's
+  //  rb_f_binding refuses it in these words -- unless the receiver's class
+  //  made something else of the name)
+  //  ...Kernel's only: a Proc's #binding (and a TracePoint's) answers from C
+  //  as from Ruby. A Binding has none of its own -- Kernel's answers it, so
+  //  it is refused too. In 4.0's words.)
+  let _ = (if str_len name == 7 && str_eq name "binding"
+              && (match recv with VProc _ -> false | _ -> true)
+              && (if has_meth world (dispatch_cls_of world recv) "binding" then false else true)
+              && (if obj_is_a world (dispatch_cls_of world recv) "TracePoint" then false else true)
+           then (let _ = raise_exc world "RuntimeError" "Cannot create Binding object for non-Ruby caller" in ()) else ()) in
   // (the last argument is the keywords of the call)
   let _ = (if bit_and flags 2 != 0 then
              (let rec last = fn (xs: Val list) -> match xs with
@@ -8008,7 +8037,23 @@ and capi_send = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
         else super_missing world noblk recv name args)
      else if str_eq a9 "" then super_missing world noblk recv name args
      else run_meth world noblk recv a9 name (map_get meths9 k9) args)
-  | VNil -> invoke_val_c env world noblk recv name args public
+  // (rb_funcallv_public is public_send's check and call -- a protected method
+  //  is refused too; an explicit-receiver call from here would pass the
+  //  protected check whenever main happened to be of the receiver's kind --
+  //  reached as __capi_public_send, so a class's own `public_send` is not
+  //  what C calls)
+  //  An object's private method is refused in ruby's words, as public_send
+  //  refuses it -- unless its class has a method_missing, which is asked.)
+  | VNil -> (if public then
+               (let c9 = dispatch_cls_of world recv in
+                let _ = (match recv with
+                         | VObj _ when meth_private world c9 name && (if has_meth world c9 "method_missing" then false else true) ->
+                           raise_exc_iv world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world c9)
+                             (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
+                         | _ -> VNil) in
+                let _ = vec_set capi_pub_entry 0 1 in
+                invoke_val_c env world noblk recv "__capi_public_send" (Cons (VSym name, args)) false)
+            else invoke_val_c env world noblk recv name args public)
   | _ ->
     // a block goes the way `recv.name(*args, &block)` sends one
     (let e = map_new () in
@@ -8022,6 +8067,10 @@ and capi_send = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
      let pass = Cons (ESplat (EVar "__capi_a"), Nil) in
      let bp = Cons (block_pass_marker, (Nil : str list)) in
      let be = Cons (SExpr (EVar "__capi_b"), (Nil : Stmt list)) in
+     // (public, with a block: public_send's protected refusal first, then an
+     //  explicit-receiver call of the method itself -- which refuses a
+     //  private one -- so no `public_send` of the receiver's is looked up)
+     let _ = (if public then public_send_guard world recv name else ()) in
      eval_e e world (false, (Nil : str list), (Nil : Stmt list), e)
        (if public then EMethodB (EVar "__capi_r", name, pass, bp, be)
         else EMethodB (EVar "__capi_r", "__send__", Cons (ESym name, pass), bp, be)))
@@ -8297,6 +8346,9 @@ and capi_proc = fn world -> fn (number: int) -> fn (data: Val) -> fn (kind: int)
     if i >= arity then Cons ("&__b", (Nil : str list)) else Cons ("__a" ++ str_of_int i, fixed (i + 1)) in
   let params = (if kind == 2 && arity >= 0 then fixed 0 else Cons ("*__a", Cons ("**__k", Cons ("&__b", Nil)))) in
   let _ = store_proc (str_of_int pid) (true, params, body, benv) in
+  // (written nowhere in Ruby: no source location, and #inspect names none,
+  //  as a Proc of rb_proc_new is in CRuby)
+  let _ = map_set proc_src ("f" ++ str_of_int pid) (mkstr "") in
   let _ = (if kind != 0 then map_set lambda_ids (str_of_int pid) VNil else ()) in
   let _ = (if kind == 2 then map_set proc_arity (str_of_int pid) (VInt (if arity == 0 - 2 then 0 - 1 else arity)) else ()) in
   VProc pid
@@ -8784,6 +8836,10 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
       // $! holds the exception being handled (so a bare `raise` re-raises it);
       // run_begin restores $! to its pre-begin value when the construct ends.
       let _ = map_set globals "!" exc in
+      // (...and a Ruby rescue clears what C's rb_errinfo answers, as entering
+      //  CRuby's rescue clears ec->errinfo: a C method this rescue calls finds
+      //  nil, whatever an earlier rb_protect left there)
+      let _ = capi_errinfo_clear () in
       // ...and a :rescue tracepoint sees the exception it handles
       // (on the first line of the clause's body, the `rescue`'s own when it
       //  has none)
@@ -15707,10 +15763,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   //   unwrap to came here and found no method, so every shared ruby/spec
   //   group that runs `obj.send(@method, ...)` with @method = :send read
   //   "undefined method 'send'". Unwrap it again, with the same rules.
-  else if (str_eq name0 "send" || str_eq name0 "__send__" || str_eq name0 "public_send")
-          && (if user_defines_send world recv0 name0 then false else true)
-          && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
-    (let pub9 = str_eq name0 "public_send" in
+  // (...and __capi_public_send, rb_funcallv_public's own way in: public_send's
+  //  check and call whatever the receiver's class made of `public_send`,
+  //  as CRuby's rb_call(..., CALL_PUBLIC) never looks that name up)
+  else if ((str_eq name0 "send" || str_eq name0 "__send__" || str_eq name0 "public_send")
+           && (if user_defines_send world recv0 name0 then false else true)
+           && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true))
+          || (str_eq name0 "__capi_public_send" && vec_get capi_pub_entry 0 == 1) then
+    (let _ = vec_set capi_pub_entry 0 0 in
+     let pub9 = str_eq name0 "public_send" || str_eq name0 "__capi_public_send" in
      let m9 = send_name_arg env world args0 in
      let rest9 = (match args0 with Cons (_, r9) -> r9 | Nil -> Nil) in
      let _ = (if pub9 then public_send_guard world recv0 m9 else ()) in
@@ -16717,6 +16778,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // nothing -- `frozen.transform_keys!` is an Enumerator; with a mapping Hash
   // they write at once and refuse here)
   // (the prelude's IO reads lock and unlock the buffer they fill)
+  // (...and whether one is: rb_str_locktmp / rb_str_unlocktmp refuse a
+  //  second lock and an unlock of an unlocked string)
+  if (str_len name == 12 && str_eq name "__tmplocked?") then
+    (match recv with VStr h9 -> VBool (map_has str_locks (str_of_int h9)) | _ -> VBool false)
+  else
   if (str_len name == 9 && str_eq name "__locktmp") || (str_len name == 11 && str_eq name "__unlocktmp") then
     (match recv with
      | VStr h9 -> (let _ = (if str_eq name "__locktmp" then map_set str_locks (str_of_int h9) 1
@@ -19525,7 +19591,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let _ = (if str_eq cyc9 "0" then () else (let _ = time_x_mark () in iv_put iv9 (str_of_int id ++ "@__tyc") (norm_big cyc9))) in
        let _ = (if (str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm") then iv_put iv9 (str_of_int id ++ "@__utc") (VBool true) else ()) in
        VObj id)
-    else if time_cls world c && ((str_len name == 3 && str_eq name "now") || (str_len name == 2 && str_eq name "at")) then
+    // (Time.__capi_at is Time.at's own builtin, whatever the program made of
+    //  Time.at: rb_time_nano_new and friends do not call Time.at, a stub of
+    //  it included -- time_spec's "doesn't call Time.at directly")
+    else if time_cls world c && ((str_len name == 3 && str_eq name "now") || (str_len name == 2 && str_eq name "at")
+                                 || (str_len name == 9 && str_eq name "__capi_at")) then
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
        let _ = map_set ocls9 id c in
@@ -19841,13 +19911,66 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if struct_generator_cls world c && (str_len name == 3 && str_eq name "new") then struct_build world c args
     // Encoding class methods: the known encodings, and the locale charmap
     // (always UTF-8 in this interpreter — no locale probing).
+    // The C API's two ways of making a name: rb_define_dummy_encoding's new
+    // (dummy) Encoding -- a constant too when the name can be one, as
+    // encoding.c's set_encoding_const does -- refused past ruby's 256; and
+    // rb_enc_alias's alias of an existing one.
+    // rb_class_new: a subclass made as Class.new makes it, but without the
+    // superclass's `inherited` (CRuby's rb_class_boot calls no hook). The C
+    // side has refused what Class.new would refuse before it asks.
+    else if str_eq c "Class" && (str_len name == 11 && str_eq name "__new_quiet") then
+      (let _ = map_set inherited_quiet "on" 1 in
+       let r9 = try_or_msg (fn (u: unit) -> invoke_val_c env world blk (VClass "Class") "new" args false)
+                           (fn (m: str) -> let _ = map_delete inherited_quiet "on" in fail m) in
+       let _ = map_delete inherited_quiet "on" in
+       r9)
+    else if str_eq c "Encoding" && (str_len name == 14 && str_eq name "__define_dummy") then
+      (match args with
+       | Cons (VStr nh, _) ->
+         (let nm9 = sget nh in
+          if map_has enc_objs nm9 then raise_exc world "ArgumentError" ("encoding " ++ nm9 ++ " is already registered")
+          else if map_len enc_objs >= 256 then raise_exc world "EncodingError" "too many encoding (> 256)"
+          else
+            (let (_, _, ocls9, ivars9) = world in
+             let id9 = alloc_oid ocls9 in
+             let _ = map_set ocls9 id9 "Encoding" in
+             let _ = iv_put ivars9 (str_of_int id9 ++ "@name") (mkstr nm9) in
+             let o9 = VObj id9 in
+             let _ = map_set enc_objs nm9 o9 in
+             let _ = map_set enc_alias_canon (enc_norm_name nm9) nm9 in
+             let _ = map_set enc_name (str_of_int id9) nm9 in
+             let _ = map_set enc_dummy_made nm9 1 in
+             let f9 = ord (char_at nm9 0) in
+             let _ = (if f9 >= 65 && f9 <= 90 then
+                        (let rec cn9 = fn (i: int) -> fn (acc: str) ->
+                           (if i >= str_len nm9 then acc
+                            else (let ch9 = char_at nm9 i in
+                                  let o2 = ord ch9 in
+                                  cn9 (i + 1) (acc ++ (if (o2 >= 48 && o2 <= 57) || (o2 >= 65 && o2 <= 90) || (o2 >= 97 && o2 <= 122) then ch9 else "_")))) in
+                         consts_put ("Encoding::" ++ cn9 0 "") o9)
+                      else ()) in
+             o9))
+       | _ -> raise_exc world "TypeError" "no implicit conversion into String")
+    else if str_eq c "Encoding" && (str_len name == 7 && str_eq name "__alias") then
+      (match args with
+       | Cons (VStr ah, Cons (VStr oh, _)) ->
+         (let canon9 = enc_find_canon (sget oh) in
+          if map_has enc_objs canon9 then
+            (let _ = map_set enc_alias_canon (enc_norm_name (sget ah)) canon9 in map_get enc_objs canon9)
+          else VNil)
+       | _ -> VNil)
     else if str_eq c "Encoding" && (str_len name == 4 && str_eq name "list") then
       (let out = map_new () in
-       // Ruby registers BINARY first. Kconv uses list[0] to distinguish
-       // unlabelled bytes from an input encoding it must pass to NKF.
-       let _ = map_set out "0" (map_get enc_objs "ASCII-8BIT") in
+       // In ruby's order of registration -- BINARY first (Kconv reads
+       // list[0] to tell unlabelled bytes from an input encoding), and the
+       // index of each is the one the C API gives it (rb_to_encoding_index,
+       // rb_enc_find_index: ENCODING_GET of a String) -- then any encoding
+       // made since (Encoding#replicate's, rb_define_dummy_encoding's).
+       let seen = map_new () in
+       let _ = list_iter (str_split enc_list_order "|") (fn (k: str) ->
+         if map_has enc_objs k then (let _ = map_set seen k 1 in map_set out (str_of_int (map_len out)) (map_get enc_objs k)) else ()) in
        let _ = map_iter enc_objs (fn (k: str) -> fn (v: Val) ->
-         if str_eq k "ASCII-8BIT" then () else let i = map_len out in map_set out (str_of_int i) v) in
+         if map_has seen k then () else let i = map_len out in map_set out (str_of_int i) v) in
        arr_new (idx_to_list out 0 (map_len out)))
     else if str_eq c "Encoding" && (str_len name == 14 && str_eq name "locale_charmap") then mkstr (locale_codeset ())
     // Encoding.compatible?(a, b): the encoding a combination of the two would
@@ -24803,6 +24926,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              arr_new (walk (if map_has weak_seq "n" then map_get weak_seq "n" else 0) Nil))
           else VNil)
        | _ -> VNil)
+    // (what a C extension's typed data says it holds: its type's dsize, for
+    //  ObjectSpace.memsize_of -- 0 for anything C did not wrap)
+    else if str_eq c "ObjectSpace" && (str_len name == 12 && str_eq name "__capi_dsize") then
+      (match args with
+       | Cons (VObj oid9, _) ->
+         (if map_has capi_ids (oid9 * 8)
+          then capi_enter env world (CapiReq { op = 4, a = map_get capi_ids (oid9 * 8), b = 4, c = 0, d = 4, e = 0 }) Nil
+          else VInt 0)
+       | _ -> VInt 0)
     else if str_eq c "ObjectSpace" && (str_len name == 19 && str_eq name "__internal_class_of") then
       (match args with Cons (value, _) -> objectspace_class_of world value | _ -> VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 10 && str_eq name "__fin_flag") then
@@ -30463,6 +30595,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // (...or one made from a block the parser wrote as a lambda: `&:sym`
     //  where a refinement is active is such a block, and Symbol#to_proc's
     //  procs are lambdas)
+    // (rb_block_lambda: the block as a NEW Proc that is a lambda, as CRuby
+    //  makes one from the block handler; the block itself is unchanged)
+    else if (str_len name == 11 && str_eq name "__as_lambda") then
+      (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VProc pid) "dup" Nil false with
+       | VProc np9 -> (let _ = map_set lambda_ids (str_of_int np9) VNil in VProc np9)
+       | other9 -> other9)
     else if (str_len name == 7 && str_eq name "lambda?") then
       VBool (map_has lambda_ids (str_of_int pid)
              || (match proc_get (str_of_int pid) with (_, Cons (m9, _), _, _) -> str_eq m9 lambda_blk_marker | _ -> false))
@@ -45687,6 +45825,12 @@ and kernel_conv_fn0 = fn env -> fn world -> fn (name: str) -> fn (args: Val list
        | Cons (v, _) ->
          (match conv_try env world v "to_str" with
           | VStr r9 -> VStr r9
+          // (#to_str answering anything but a String or nil is refused,
+          //  not passed over for #to_s: rb_convert_type's words. Only an
+          //  object can have one that answers that.)
+          | g9 when (match v with VObj _ -> (match g9 with VNil -> false | _ -> true) | _ -> false) ->
+            raise_exc world "TypeError"
+              ("can't convert " ++ class_name v ++ " to String (" ++ class_name v ++ "#to_str gives " ++ class_name g9 ++ ")")
           | _ ->
             (let r8 = conv_try env world v "to_s" in
              match r8 with
@@ -45728,16 +45872,33 @@ and kernel_conv_fn0 = fn env -> fn world -> fn (name: str) -> fn (args: Val list
           // a conversion that answers a NON-array (and not nil, which declines)
           // is the object lying about its type.
           | VNil ->
-            (let r8 = conv_try env world v "to_a" in
+            // (a builtin value -- a Hash, a Range -- is asked too: conv_try
+            //  answers only for an object, and `Array({a: 1})` was [{a: 1}]
+            //  where ruby's is [[:a, 1]])
+            //  ...and so is an object's builtin #to_a -- an Enumerator's,
+            //  `Array([1, 2].each)` -- when no Ruby method of that name
+            //  answered: conv_try finds Ruby-defined ones only)
+            (let builtin_to_a9 = fn (u: unit) ->
+                   (if responds world v "to_a"
+                    then invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) v "to_a" Nil false
+                    else VNil) in
+             let r8 = (match v with
+                       | VObj _ -> (match conv_try env world v "to_a" with
+                                    | VNil -> (if has_meth world (dispatch_cls_of world v) "to_a" then VNil else builtin_to_a9 ())
+                                    | got9 -> got9)
+                       | _ -> builtin_to_a9 ()) in
+             // (named by the receiver's class: a Hash subclass is H2, not Hash)
+             let vn9 = display_cls_msg world (dispatch_cls_of world v) in
              match r8 with
              | VArr a9 -> VArr a9
              | VNil -> arr_new (Cons (v, Nil))
              | other -> raise_exc world "TypeError"
-                          ("can't convert " ++ class_name v ++ " to Array ("
-                           ++ class_name v ++ "#to_a gives " ++ class_name other ++ ")"))
-          | other -> raise_exc world "TypeError"
-                       ("can't convert " ++ class_name v ++ " to Array ("
-                        ++ class_name v ++ "#to_ary gives " ++ class_name other ++ ")")))
+                          ("can't convert " ++ vn9 ++ " to Array ("
+                           ++ vn9 ++ "#to_a gives " ++ display_cls_msg world (dispatch_cls_of world other) ++ ")"))
+          | other -> (let vn9 = display_cls_msg world (dispatch_cls_of world v) in
+                      raise_exc world "TypeError"
+                        ("can't convert " ++ vn9 ++ " to Array ("
+                         ++ vn9 ++ "#to_ary gives " ++ display_cls_msg world (dispatch_cls_of world other) ++ ")"))))
     // Kernel#Hash(obj): #to_hash; nil and [] are the empty hash; anything else
     // is a TypeError (it answered {} for everything).
     else if (str_len name == 4 && str_eq name "Hash") then
@@ -60432,9 +60593,11 @@ and register_class_lex = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
 // Ruby's `inherited` hook: when a new subclass is created, call
 // superclass.inherited(subclass) if a (class-level) `inherited` is defined.
 and call_inherited = fn world -> fn env -> fn (super_name: str) -> fn (sub_name: str) ->
+  // (rb_class_new makes a class without the hook: Class.__new_quiet)
+  if map_has inherited_quiet "on" then ()
   // (a class with no superclass written is Object's: Class#inherited runs,
   //  a C method a TracePoint sees, note 448)
-  if str_eq super_name "" then (if hook_tp_on () && (if map_has modules sub_name then false else true) then tp_c_hook world "inherited" "Object" else ())
+  else if str_eq super_name "" then (if hook_tp_on () && (if map_has modules sub_name then false else true) then tp_c_hook world "inherited" "Object" else ())
   else
     let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
     // `inherited` is a class method: it lives in the superclass's singleton

@@ -24,8 +24,11 @@ void rb_gc_unregister_address(VALUE *address) {
     for (long i = 0; i < address_count; i++)
         if (addresses[i] == address) { addresses[i] = addresses[--address_count]; return; }
 }
+/* (a raw Bignum CRuby's bignum.c made -- capi/bignum_cruby.c -- kept past
+ *  the C call that made it: registered or marked, it is not freed then) */
+extern void mr_vbig_keep(VALUE v);
 void rb_gc_register_mark_object(VALUE obj) {
-    if (!MR_HANDLE_P(obj)) return;
+    if (!MR_HANDLE_P(obj)) { mr_vbig_keep(obj); return; }
     if (object_count == object_cap) {
         object_cap = object_cap ? object_cap * 2 : 64;
         objects = realloc(objects, sizeof(*objects) * (size_t)object_cap);
@@ -33,17 +36,29 @@ void rb_gc_register_mark_object(VALUE obj) {
     }
     objects[object_count++] = obj;
 }
+extern VALUE mr_errinfo_parked_at(long i);
 int mr_capi_roots(closure_int_int visit) {
     for (long i = 0; i < address_count; i++) {
         VALUE v = *addresses[i];
         if (MR_HANDLE_P(v)) visit.fn(visit.env, (long long)v);
     }
     for (long i = 0; i < object_count; i++) visit.fn(visit.env, (long long)objects[i]);
+    /* (rb_errinfo of each stack not running: capi/core.c) */
+    VALUE e;
+    for (long i = 0; (e = mr_errinfo_parked_at(i)) != Qundef; i++)
+        if (MR_HANDLE_P(e)) visit.fn(visit.env, (long long)e);
     return 0;
 }
-void rb_gc_mark(VALUE v) { mr_mark_value(v); }
-void rb_gc_mark_movable(VALUE v) { mr_mark_value(v); }
-void rb_gc_mark_maybe(VALUE v) { mr_mark_value(v); }
+void rb_gc_mark(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
+void rb_gc_mark_movable(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
+void rb_gc_mark_maybe(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
+/* What every registered address (rb_gc_register_address,
+ * rb_global_variable) holds now, each handed to `visit` -- read once, for a
+ * caller with many values to ask about. */
+void mr_gc_each_address_value(void (*visit)(VALUE)) {
+    for (long i = 0; i < address_count; i++) visit(*addresses[i]);
+}
+long mr_gc_address_count(void) { return address_count; }
 void rb_gc_mark_locations(const VALUE *start, const VALUE *end) {
     for (; start < end; start++) mr_mark_value(*start);
 }

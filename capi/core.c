@@ -3,6 +3,7 @@
  * loaded extensions. See mr_capi.h for the shape of the whole. */
 #include "mr_capi.h"
 #include <dlfcn.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,7 @@ struct mr_frame {
     int raised;
 };
 static struct mr_frame *cur;
+static VALUE c_errinfo = Qnil;   /* rb_errinfo's (mr_frame_errinfo, below) */
 static int depth;
 unsigned long mr_epoch = 1;
 static long stats[8];
@@ -54,10 +56,32 @@ static void words_need(long n) {
     memset(words + words_cap, 0, sizeof(VALUE) * (size_t)(cap - words_cap));
     words_cap = cap;
 }
+extern long mr_vbig_live;
+extern VALUE mr_vbig_out(VALUE v);
+extern void mr_vbig_leave(const void *frame, int outermost);
+extern void mr_vbig_park(int stack, const VALUE *lo, const VALUE *hi);
+extern void mr_vbig_unpark(int stack);
 void mr_put_words(long n, const VALUE *v) {
+    /* (a raw Bignum bignum.c made is the Integer it says, past this point:
+     *  capi/bignum_cruby.c. Converted BEFORE the words are set: making the
+     *  Integer is an up-call, which keeps and puts back what is in transit
+     *  -- through here.) */
+    VALUE *converted = NULL;
+    if (mr_vbig_live)
+        for (long i = 0; i < n; i++) {
+            VALUE w = mr_vbig_out(v[i]);
+            if (w != v[i] && !converted) {
+                converted = malloc(sizeof(VALUE) * (size_t)n);
+                if (!converted) mr_fatal("out of memory");
+                memcpy(converted, v, sizeof(VALUE) * (size_t)n);
+            }
+            if (converted) converted[i] = w;
+        }
+    if (converted) v = converted;
     words_need(n);
     if (n > 0) memcpy(words, v, sizeof(VALUE) * (size_t)n);
     words_put = n;
+    free(converted);
 }
 VALUE mr_word(long i) { return i >= 0 && i < words_cap ? words[i] : Qnil; }
 CapiWord mr_capi_get(int i) {
@@ -160,6 +184,9 @@ static int reads_only(int op) {
 VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
     struct mr_frame *frame = cur;
     if (!frame) mr_fatal("called with no call from the interpreter in progress (a C thread of its own?)");
+    if (mr_vbig_live) {
+        a = mr_vbig_out(a); b = mr_vbig_out(b); c = mr_vbig_out(c); d = mr_vbig_out(d); e = mr_vbig_out(e);
+    }
     if (!reads_only(op) && op != MR_STR_SET && op != MR_ARY_SET) mr_mirrors_flush();
     CapiReq request = { op, (long long)a, (long long)b, (long long)c, (long long)d, (long long)e };
     stats[ST_UP]++;
@@ -204,7 +231,15 @@ ID mr_frame_method(void) { return cur ? cur->method : 0; }
 int mr_frame_keywords(void) { return cur ? cur->keywords : 0; }
 int mr_kw(int kw) { return kw ? MR_SEND_KW : 0; }
 
+/* (rb_iterate's block, waiting for the first method its function calls) */
+VALUE mr_iterate_block;
 VALUE mr_callv(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int flags) {
+    if (mr_iterate_block && NIL_P(block)) { block = mr_iterate_block; mr_iterate_block = 0; }
+    /* (keywords passed are a Hash, or one by #to_hash -- every *_kw function
+     *  of the C API refuses anything else: "no implicit conversion of
+     *  Integer into Hash") */
+    if ((flags & MR_SEND_KW) && argc > 0 && !RB_TYPE_P(argv[argc - 1], T_HASH))
+        rb_convert_type(argv[argc - 1], T_HASH, "Hash", "to_hash");
     mr_put_words(argc, argv);
     return mr_up(MR_SEND, recv, (VALUE)mid, (VALUE)argc, block, (VALUE)flags);
 }
@@ -429,6 +464,8 @@ int mr_capi_open(const char *path) {
 /* ---- running C -------------------------------------------------------------- */
 extern void mr_capi_boot(void);
 static int booted;
+/* (has any extension run yet: before that, the C globals are not filled) */
+int mr_capi_booted(void) { return booted; }
 
 static VALUE run(const CapiReq *req, long argc, VALUE *argv) {
     switch ((int)req->mu_op) {
@@ -440,6 +477,12 @@ static VALUE run(const CapiReq *req, long argc, VALUE *argv) {
         if (!booted) { booted = 1; mr_capi_boot(); }
         libraries[number].init();
         return Qnil;
+      }
+      case MR_RUN_DSIZE: {
+        /* (a typed data object's dsize, run as C runs: in a call of its own,
+         *  so a dsize that asks the C API can -- ObjectSpace.memsize_of) */
+        extern long mr_capi_dsize(long number);
+        return LONG2NUM(mr_capi_dsize((long)req->mu_a));
       }
       case MR_RUN_BLOCK: {
         long number = (long)req->mu_a;
@@ -504,13 +547,20 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
     last.prev = NULL;
     frame.guard = &last;
     if (RUBY_SETJMP(last.jump) == 0) {
+        if (!raised) result = mr_vbig_out(result);
         mr_mirrors_flush();
     }
     else if (!raised) {
         raised = 1;
         result = frame.pending;
     }
+    /* (an exception leaving C is Ruby's to rescue now, and a Ruby rescue
+     *  clears ec->errinfo: one a C handler re-raised is not left behind) */
+    if (raised) c_errinfo = Qnil;
     mr_mirrors_leave(&frame, frame.prev == NULL);
+    /* (no C call left on this stack; what a Fiber's parked one has was read
+     *  off it when it paused: mr_vbig_park) */
+    mr_vbig_leave(&frame, frame.prev == NULL);
     cur = frame.prev;
     depth--;
     mr_epoch++;
@@ -576,7 +626,51 @@ char *mr_capi_libc(void) {
 }
 int mr_capi_depth(void) { return depth; }
 const void *mr_capi_frame(void) { return cur; }
+/* CRuby's ec->errinfo, which rb_errinfo answers: the running stack's (the
+ * others' are put aside: errinfo_switch, below). Set by C's own rescues --
+ * rb_protect, rb_rescue's handler, rb_ensure's cleanup, rb_set_errinfo --
+ * and not by a Ruby `rescue`, so a C method a Ruby rescue calls finds none;
+ * Ruby a C handler runs, and the C it calls, find the exception. (A root:
+ * the collector reads it with the C API's own.) */
+VALUE mr_frame_errinfo(void) { return c_errinfo; }
+int mr_capi_clear_errinfo(void) { c_errinfo = Qnil; return 0; }
+void mr_frame_set_errinfo(VALUE v) {
+    static int rooted;
+    if (!rooted) { rooted = 1; rb_gc_register_address(&c_errinfo); }
+    c_errinfo = v;
+}
 int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which] : -1; }
+
+/* rb_errinfo is the running stack's: every Fiber (and every Thread's root
+ * fiber) has its own, as CRuby's execution context does -- an rb_protect on
+ * one Fiber is not what another reads. The one of the stack being left is
+ * put aside by its number (a Fiber's number is never handed out again), the
+ * target's taken up, and a stack's dropped when its Fiber ends
+ * (mr_capi_stack_end). Each put aside is a root (mr_errinfo_parked_at). */
+struct mr_errpark { int stack; VALUE err; };
+static struct mr_errpark *errparked;
+static long errparked_count, errparked_cap;
+static void errinfo_drop(int stack) {
+    for (long i = 0; i < errparked_count; i++)
+        if (errparked[i].stack == stack) { errparked[i] = errparked[--errparked_count]; return; }
+}
+static void errinfo_switch(int from, int to) {
+    if (!NIL_P(c_errinfo)) {
+        if (errparked_count == errparked_cap) {
+            errparked_cap = errparked_cap ? errparked_cap * 2 : 8;
+            errparked = realloc(errparked, sizeof(*errparked) * (size_t)errparked_cap);
+            if (!errparked) mr_fatal("out of memory");
+        }
+        errparked[errparked_count].stack = from;
+        errparked[errparked_count].err = c_errinfo;
+        errparked_count++;
+    }
+    c_errinfo = Qnil;
+    for (long i = 0; i < errparked_count; i++)
+        if (errparked[i].stack == to) { c_errinfo = errparked[i].err; errinfo_drop(to); return; }
+}
+VALUE mr_errinfo_parked_at(long i) { return i < errparked_count ? errparked[i].err : Qundef; }
+int mr_capi_stack_end(int stack) { errinfo_drop(stack); return 0; }
 
 /* A coroutine switch. The calls in progress are a chain through C stack
  * frames, so each stack has its own; the interpreter says when it changes
@@ -584,8 +678,17 @@ int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which]
 struct mr_parked { int stack; struct mr_frame *frame; int depth; };
 static struct mr_parked *parked;
 static long parked_count, parked_cap;
+/* (the raw Bignums the C frames of the stack being left still have, from
+ *  here -- below this function's caller, whose saved registers are on the
+ *  stack by now -- up to its outermost C call) */
+static __attribute__((noinline)) void park_bignums(int stack, const void *hi) {
+    volatile VALUE here = 0;
+    mr_vbig_park(stack, (const VALUE *)(const void *)&here, (const VALUE *)hi);
+    (void)here;
+}
 int mr_capi_switch(int from, int to) {
     if (mr_without("switch")) return 0;
+    errinfo_switch(from, to);
     if (cur) {
         if (parked_count == parked_cap) {
             parked_cap = parked_cap ? parked_cap * 2 : 8;
@@ -596,6 +699,16 @@ int mr_capi_switch(int from, int to) {
         parked[parked_count].frame = cur;
         parked[parked_count].depth = depth;
         parked_count++;
+        /* (registers too: a C local may live in a callee-saved one --
+         *  spilled here, as setjmp alone may store some mangled: glibc's
+         *  x86_64 keeps rbp so) */
+        __builtin_unwind_init();
+        jmp_buf regs;
+        if (setjmp(regs) == 0) {
+            struct mr_frame *outer = cur;
+            while (outer->prev) outer = outer->prev;
+            park_bignums(from, outer + 1);
+        }
         cur = NULL;
         depth = 0;
     }
@@ -604,6 +717,7 @@ int mr_capi_switch(int from, int to) {
             cur = parked[i].frame;
             depth = parked[i].depth;
             parked[i] = parked[--parked_count];
+            mr_vbig_unpark(to);
             break;
         }
     }

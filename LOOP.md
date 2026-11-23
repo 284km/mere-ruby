@@ -4,6 +4,10 @@ The other documents describe the SUBJECT. This one describes the LOOP: how
 long it takes to get from an edit to a landed commit, where that time actually
 goes, and what each attempt to shorten it was worth.
 
+> **Since 2026-11-23, new records go in [`loop/`](loop/README.md), one file per
+> change.** This file is the history up to then; do not append to it. The
+> per-stream corpus number ranges are in `loop/README.md`.
+
 It exists because the first honest measurement of this loop was a surprise.
 The sweep is 95% of a cycle, and more than half of the sweep was the harness
 copying a directory tree that never changes. Nobody would have guessed that;
@@ -11407,51 +11411,297 @@ this Mac; CI is where the four run.)
   (MEMORY_LIMIT on the reference side, not mere-ruby's). Run alone it
   passes. The limit stays.
 
-## 2026-11-23: a name is not made a Symbol to fail with it (-ext-/symbol/test_inadvertent_creation)
+## 2026-11-22: ruby/spec optional/capi -- 2,282 to 2,394 (reference 2,592)
 
-The file was 32 failures and a timeout of 49; it passes now, 1181
-assertions as the reference's. Bug::Symbol.find is rb_check_symbol and
-.pinneddown? is rb_check_id.
+Note 553 §6.1-6: what was left of ruby/spec's C API specs, file by file.
+tools/capi_spec_check.py, recorded in capi/check/spec_expect.tsv:
 
-**Dynamic Symbols.** Most of the 32 were `name.to_sym` and then "not pinned
-down": ruby's String#to_sym makes a dynamic Symbol, which rb_check_id does
-not count until something uses it as an ID. sym_all's value now says which:
-VNil a name source wrote (the lexer's sym_note, and the Prism loader's
-literals), false one only #to_sym / #intern made. set_meth / set_fresh_meth
-and const_store pin a dynamic name a method or constant is given, as
-define_method, attr, alias_method and const_set pin it in ruby.
-capi/symbol.c asks the interpreter (request 29, MR_SYM_STATE: 0 none, 1
-dynamic, 2 pinned) instead of `Symbol.all_symbols.any?`, which built the
-whole list per question -- test_gc_attrset's 1000 noninterned names were
-the timeout. A C table entry knows whether C pinned it (rb_intern*,
-rb_sym2id); one the interpreter's Symbol only crossed into C with
-(mr_capi_intern) does not. rb_check_id of a dynamic Symbol is 0 and *namep
-its name; rb_check_symbol finds either kind and answers a Symbol as itself.
-A Symbol the interpreter has but never noted (an identifier, a method's
-name) still counts as pinned. rb_iv_get is rb_check_id_cstr first, as
-ruby's is, and then the variable by its own name when the object has it
-(identifiers are not noted here, so `@a = 1` makes no Symbol).
+| file | before | now | reference |
+|---|---|---|---|
+| string | 291 | 312 | 314 |
+| encoding | 160 | 177 | 180 |
+| struct | 60 | 75 | 75 |
+| class | 97 | 103 | 109 |
+| globals | 33 | 44 | 44 |
+| object | 209 | 221 | 223 |
+| util | 76 | 83 | 83 |
+| kernel | 284 | 288 | 290 |
+| hash | 61 | 65 | 65 |
+| proc | 40 | 44 | 44 |
+| module | 76 | 79 | 79 |
+| numeric | 90 | 93 | 93 |
+| gc | 20 | 25 | 25 |
+| array, fixnum, rbasic, basic_object | one each short | equal | |
 
-**The name as given.** send / __send__ / public_send by a String that is no
-Symbol: the NoMethodError for that receiver and name is given the String as
-#name (send_str_named, around each send arm's call) -- unless the receiver
-has a #method_missing of its own, which ruby hands a Symbol (corpus/555).
-const_get by such a String skips Module's own const_missing and names the
-String. Both stop at a name some method or constant already has: ruby has
-that ID (corpus/248's `const_get("Outer::TOP_CONST")` names :TOP_CONST).
+(The reference moved too: the spec shim gained mspec's have_constant and
+the other variable matchers, which struct_spec and object_spec use. The
+twelve ruby/spec files outside optional/capi that use them MATCH before and
+after.)
 
-**Interning on the way to failing.** Struct#[], #[]= and #dig compared a
-String key by `k.to_sym`; they compare names now, and the NameError's #name
-is the key.
+What was wrong, by kind:
 
-**Met on the way.** `def self.alias_method` on a class was never called: the
-builtin arm came first; it yields to the class's own (cls_meth_own) and
-`super` comes back through bi_skip, as include's does. untrace_var of a name
-that is no global variable raises NameError. Kernel#method / #public_method
-on a CLASS ask its singleton's respond_to_missing?, and the Method's call
-goes to BasicObject#method_missing; #singleton_method asks it for a name
-that is no pinned Symbol (Bug #10985).
+- **Answers the C API made up.** rb_str_locktmp/unlocktmp did nothing (now
+  the interpreter's temporary lock, refusing a second lock and a frozen
+  string); rb_obj_hide did nothing (a hidden object's class reads as 0 to
+  C); rb_str_encode dropped its ECONV flags; rb_cstr2inum was strict for
+  base 2 where bignum.c is strict for base 0; rb_external_str_new_with_enc
+  and rb_str_export ignored the encodings string.c weighs; rb_hash did not
+  fold a Bignum #hash; rb_class_name answered nil for an anonymous class;
+  rb_class_get_superclass answered nil for "none"; rb_scan_args counted the
+  keyword Hash; rb_sourcefile named an eval; rb_ivar_foreach left out a
+  class's class variables; rb_class_new ran the superclass's `inherited`;
+  rb_block_call with no function dropped the C method's block, and
+  rb_iterate's block did not reach the first method its function calls.
+- **What C reads off an object's header.** RBasic.klass is the singleton
+  class once there is one (CLASS_OF); the core classes CRuby builds as
+  typed data are T_DATA; the coderange is 7BIT when the interpreter knows
+  the bytes are ASCII alone; C's global variables (rb_rs, rb_fs, rb_stdin,
+  ...) follow the program's assignments instead of keeping their values
+  from the first C call.
+- **Encodings.** Encoding.list is in ruby's order of registration, and C's
+  table is filled in that order, so an encoding's index is its place in the
+  list (rb_to_encoding_index); a character past ASCII is in a POSIX class
+  as Unicode says (the tables CRuby's encodings carry for their upper
+  halves); rb_define_dummy_encoding and rb_enc_alias make what they say
+  (with ruby's "too many encoding (> 256)"); ONIGENC_MBC_CASE_FOLD folds
+  through downcase(:fold).
+- **Names.** A Symbol whose name has a NUL crosses whole (new FFI calls
+  carrying its bytes); rb_const_set / rb_const_get take a name that is no
+  constant's, kept hidden by the key define_class uses.
+- **The interpreter itself**, found through the specs (corpus/801):
+  `Array({a: 1})` was `[{a: 1}]` (a builtin value was never asked for
+  #to_a); `String(x)` passed over a #to_str that answered a non-String to
+  #to_s instead of refusing it; `Kernel.global_variables` was no module
+  function; Encoding.list's order.
 
-Not done: identifiers are still not noted as Symbols (`def foo` leaves
-rb_check_id("foo") 0, as before), and instance/class variable writes do
-not pin a dynamic name.
+Left, and why (KNOWN_GAPS.md): a pointer C keeps across a call seeing what
+Ruby wrote meanwhile (2 string examples; it would mean re-reading every
+watched String after every up-call); a Regexp's encoding changed in place
+(3; a Regexp here is a value without identity); respond_to? of a method
+defined as rb_f_notimplement (2); rb_block_lambda passing a `&proc` through
+unchanged, and rb_set_end_proc's output at shutdown (2); class_spec's three
+names that are no constant's, which #157's define_class answers; digest_spec
+(needs Fiddle, which this interpreter does not have -- the spec returns
+early); debug_spec and tracepoint_spec (the VM's own structures).
+
+## 2026-11-22: ruby/spec optional/capi -- the six small files, 2,394 to 2,402
+
+enumerator, exception, range, time, typed_data and binding now equal the
+reference (4, 41, 54, 112, 15, 1).
+
+- rb_enumeratorize_with_size: the C size function is enum_for's size block
+  (it is called with the receiver, the arguments and the enumerator, which
+  is filled in once enum_for has made it).
+- **rb_errinfo is CRuby's ec->errinfo: one value**, set by C's own rescues
+  (rb_protect, rb_rescue's handler, rb_ensure's cleanup, rb_set_errinfo),
+  not by a Ruby `rescue` -- a C method a Ruby rescue calls finds nil -- and
+  gone when an exception leaves C for the interpreter (a Ruby rescue clears
+  it in CRuby). It read the interpreter's $! before. Tried first per C call:
+  rb_protect's exception was then gone at the next C call, which
+  kernel_spec reads (288 -> 280); and as one value with no clearing, a
+  handler that re-raised left it behind for every later example (-> 222).
+  rb_ensure and rb_rescue save and restore the Ruby caller's $! apart from
+  it.
+- rb_error_frozen_object inspects the object once: an #inspect that itself
+  reports the object frozen gets " ..." (rb_exec_recursive), not a loop.
+  rb_make_exception(nil) is TypeError.
+- rb_arithmetic_sequence_extract takes anything with a Range's three readers
+  (rb_range_values).
+- rb_time_new / rb_time_nano_new reach Time.at's builtin (Time.__capi_at),
+  not what the program made of Time.at.
+- ObjectSpace.memsize_of adds a typed data object's dsize (mr_capi_dsize,
+  read from the struct directly: no C call is in progress there).
+- Kernel#binding sent from C is "Can't create Binding from C level
+  function".
+
+### PR #160 review (two rounds)
+
+First round:
+- **[Minor] An encoding index of 127 or more was cut to the 7 bits of the
+  flags** (dummy encodings defined from C reach it now). refresh_head
+  stores ENCODING_INLINE_MAX (127) when the index does not fit, and
+  rb_enc_get_index asks the object's encoding then, as CRuby does.
+- **[Minor] C's seven global variables were not roots**: a value without
+  identity (`$; = /,/`) assigned to one lost its number at the next
+  collection. Registered at boot, as rb_global_variable makes CRuby's.
+- **[Minor] `Array(H2[1, 2])` named Hash in its TypeError**: the receiver's
+  class (and the returned value's) now. And `Array([1, 2].each)` -- an
+  object's builtin #to_a, which conv_try does not find -- is asked too.
+- **[Suggestion] rb_funcallv_public went through the Ruby-visible
+  public_send.** Without a block it is __capi_public_send (public_send's
+  check and call, whatever the class made of `public_send`); with one,
+  public_send_guard and then an explicit-receiver call of the method.
+- capi/hidden.c (the table #157 keeps names that are no constant's in) holds
+  rb_const_set / rb_const_get's too: no instance variable of the module.
+
+Second round (on 2ad86883):
+- **[Major] Kernel#binding's refusal refused Proc#binding too.** Only a
+  receiver whose `binding` is Kernel's is refused now (not a Proc, a
+  Binding or a TracePoint, nor a class that defines its own), in 4.0's
+  words: "Cannot create Binding object for non-Ruby caller".
+- **[Major] dsize was called with a NULL pointer** (a typed data wrapping
+  NULL, or one an extension emptied): guarded, as gc.c does. And it ran
+  outside any C call, where a dsize that asks the C API would have failed:
+  it runs in a call of its own now (MR_RUN_DSIZE).
+- **[Minor] rb_errinfo kept an old exception after a C call returned
+  normally**, and a later Ruby rescue saw it. A Ruby rescue now clears it
+  (capi_errinfo_clear, where the evaluator's rescue matches), as entering
+  CRuby's rescue clears ec->errinfo. Not the VM's rescue yet; and it is one
+  value per process, where CRuby's is per thread and fiber.
+- capi/check: rb_funcallv_public on a class with its own public_send (and a
+  private method), rb_fs after `$; = /,/` and GC.start, the 30th dummy
+  encoding's index read back from C, Proc#binding vs Kernel#binding from C,
+  memsize_of a typed data wrapping NULL, rb_errinfo in a Ruby rescue after an
+  rb_protect -- each agreeing on both sides.
+
+Third round (on 7871475d, nits):
+- `rb_funcall(a_binding, "binding")` is refused too: a Binding has no
+  #binding of its own in 4.0, Kernel's answers it.
+- rb_funcallv_public on an object's private method says ruby's "private
+  method 'm' called for ..." (it said "undefined method"), unless the class
+  has a method_missing, which is asked.
+- `__capi_public_send` answers only the call capi_send makes just before
+  (capi_pub_entry); Ruby code that writes it gets NoMethodError, as in ruby.
+- **[Minor] rb_errinfo per fiber** (asked to be fixed after all): it is the
+  running stack's now. mr_capi_switch puts the one of the stack being left
+  aside by its number and takes up the target's (nil for a new one). A
+  Fiber's number is never handed out again (fb_new_index), and a new hook,
+  mr_capi_stack_end, called where a Fiber's body ends (fb_run_body), drops
+  what was put aside for it. Each one put aside is a root (mr_capi_roots).
+  (The round before said stack numbers come back: they do not.) Threads too,
+  each root fiber being a stack: an rb_protect on a Thread or a Fiber is not
+  what main reads. capi/check: errinfo on a paused Fiber is not main's, nor
+  a new Fiber's, and is still its own after GC.start and a resume.
+  Left: ruby makes a Thread whose body ends with errinfo set raise it from
+  #value / #join; here #value is the body's value.
+
+## 2026-11-22: CRuby's bignum.c, compiled as it is -- the algorithms an extension names
+
+Note 553 §4 decided (b): the 27 RED of test/-ext-/bignum (test_mul 19,
+test_big2str 2, test_str2big 3, test_bigzero 2, test_div 1) call CRuby's
+internal algorithms by name -- rb_big_mul_karatsuba, rb_big_mul_toom3,
+rb_big2str_generic, rb_str2big_karatsuba, rb_big_divrem_normal, ... -- and
+answering them with this interpreter's one multiplication would be a claim.
+So CRuby's bignum.c is now in capi/vendor, unchanged, and those algorithms
+run as CRuby runs them. Locally all 31 tests of those five files pass (and
+test_pack's 28 still do); CI compares both sides.
+
+**What it took.** bignum.c compiles against this C API's headers with seven
+more of CRuby's internal headers, copied unchanged, and two stand-ins:
+`id.h` (seven method IDs, interned by name) and `internal/gc.h` (NEWOBJ_OF
+and two slot-size questions; the real one includes vm_core.h).
+capi/tools/headers_check.py holds the copies to the ruby tree. Every function
+bignum.c defines is renamed (mr_vbig_*) before any header is read, inside
+capi/bignum_cruby.c only, so it calls its own and the C API's own Integer
+functions (numeric.c, bignum.c of capi/) stay as they are; the twelve
+algorithms by name leave capi/unsupported.c and are given under ruby's names.
+What bignum.c asks of the rest of CRuby (rb_int_plus and friends, a ulong
+isqrt) is written in the public API's terms; the one Complex corner
+(rb_dbl_complex_new_polar_pi, a negative Bignum to a fractional power) is a
+named NotImplementedError, and unreachable from the exported names.
+
+**A Bignum it makes is a C struct.** bignum.c makes one with NEWOBJ_OF, turns
+the pointer into its VALUE (`bigv = (VALUE)big`) and reads it through a cast;
+and an extension that includes internal/bignum.h does the same
+(ext/-test-/bignum/bigzero.c writes BIGNUM_DIGITS of what rb_big_new gave
+it). A handle is no address, so such a Bignum is a RAW one: the struct's
+address is its VALUE. RBASIC() answers the struct itself (rb_mere_basic),
+so its type, sign, length and frozen bit are read and written as bignum.c
+does. Where one reaches the interpreter -- an up-call's arguments, the
+transit words, what the C call returns (core.c) -- it becomes the Integer its
+digits say (mr_vbig_out; mr_put_words converts BEFORE it sets the words,
+because making the Integer is an up-call that keeps and puts back what is
+in transit). It is freed when the C call that made it ends, unless bignum.c
+keeps it for good (its radix power cache, rb_vm_register_global_object),
+and those are listed apart so the end of a C call does not walk them. The
+other way, an Integer the interpreter has is a handle or a Fixnum: the entry
+points give bignum.c a raw Bignum with the same digits. Nothing changes for
+a program that never calls these: every hook starts with "are there any raw
+Bignums at all".
+
+**GMP.** The reference links GMP 6.3.0; this build does not. The four *_gmp
+tests rescue NotImplementedError, which is what a ruby built without GMP
+answers, so they pass on both sides without a new build dependency.
+
+Unchanged: ruby/test_bignum.rb 65/74, ruby/spec optional/capi bignum_spec
+105 = reference, integer_spec 60 = reference, numeric_spec 90 (reference 93,
+as recorded), capi_check, corpus.
+
+The future form (note 553 §6.1-5, a separate arc): this interpreter's
+Integer in binary limbs, with Karatsuba and Toom-3 written in Mere; then
+the C names can point there and bignum.c leaves.
+
+### PR #158 review
+
+- **[Minor] A raw Bignum C keeps past its call was freed anyway.** rb_big_new
+  is public API and returns one. Now kept for good when C keeps it the
+  public ways: rb_gc_register_mark_object and rb_gc_mark / _movable / _maybe
+  (capi/gc.c hand a raw one to mr_vbig_keep), or a registered address
+  (rb_gc_register_address, rb_global_variable) that holds it when its call
+  ends (mr_vbig_leave asks mr_gc_address_holds). One only stored in a struct
+  and marked by a later collection is still freed with its call; the header
+  comment says so. capi/check: a Bignum made in Init_ and kept each way is
+  still 0 after GC.start, two calls later, on both sides.
+- **[Suggestion] Membership was a linear scan on every RBASIC().** An
+  open-addressing set of addresses answers it in O(1); the two lists stay
+  for the walk at the end of a call. (First version removed an address from
+  the set before freeing it -- raw_free reads the flags through RBASIC, and
+  every test/-ext-/bignum file stopped at its first raw Bignum. Freed first,
+  removed after.) Toom-3 on 3**60000 x 7**50000 and big2str_generic of the
+  product (70,883 digits): 2.3 s.
+- (re-review) **[Minor] a raw Bignum a registered address held was kept
+  forever**, even after the slot was overwritten (82 MB over 20,000 calls).
+  Those go to a list of their own now (held), checked at the end of every C
+  call: freed once no registered address holds them. The reviewer's pattern
+  (`last = rb_big_new(1000, 1)` on a registered `last`, 20,000 times) grows
+  RSS by -3 MB, and `last` still reads 0. One kept by rb_gc_mark from a
+  dmark is still kept for good (the rarer case; the header says so).
+- (re-review 2) **[Major] that sweep freed one a C local still had.** It ran
+  at the end of every C call, a nested one too: `old = slot; slot = Qnil;`,
+  then rb_funcall / rb_block_call into C, then `old` -- [BUG] "not an
+  object", where CRuby's collection sees `old` on the C stack. The held ones
+  are looked at again only when no C call is in progress on any stack
+  (frame.prev is NULL, and no Fiber has a chain of C calls parked). A
+  call's own temporaries still go at its end, as before. capi/check: the
+  pattern, both ways in, reads 0 after GC.start on both sides.
+- (re-review 2) **[Suggestion] the sweep cost (held x registered addresses)
+  per call.** The addresses are read once per sweep into a set of the raw
+  Bignums they hold (mr_gc_each_address_value), so it is O(addresses +
+  held), and nothing is read at the end of a call that made no raw Bignum
+  while the outer one is still running.
+- (re-review 3) **[Minor] one Fiber paused inside C stopped the sweep for
+  good** (no parked chain at all was the condition): a Fiber dropped inside
+  a C call, or an external Enumerator over a C #each left after one #next,
+  and every overwritten slot stayed (+84 MB per 20,000). A parked chain's C
+  locals do not run while it is parked, so they can have only what was made
+  before it was: every raw Bignum has a birth number (mr_vbig_seq), each
+  park notes it, and the sweep keeps only the held ones born before the
+  newest park. The reviewer's pattern: +2 MB, then +2 MB (ruby: +13, +0).
+  capi/check: a C local on a Fiber paused inside rb_yield still reads its
+  value after the slot is overwritten from outside, GC.start and a call.
+- (re-review 3) **[Suggestion] the holder set was sized from mr_vbig_live
+  at its largest**, and cleared whole on every sweep. It is sized from the
+  registered addresses (all it can hold), grown or shrunk to that. An empty
+  C call after one that made 100,000 temporaries: 3.6 us (3.6 before it).
+- (re-review 4) **[Minor] a Fiber that pauses again and again inside one C
+  call kept one held raw Bignum per pause** (the newest park's birth number
+  moved on each time, and what was held at each pause stayed). The birth
+  numbers are gone: when a stack pauses inside C, the words of its C frames
+  -- from the switch (registers spilled by setjmp, read from a callee below
+  it) up to its outermost C call -- are read once, and the raw Bignums
+  among them stay until it resumes (mr_vbig_park / mr_vbig_unpark), as
+  CRuby's collection marks a suspended Fiber's stack. With a C #each that
+  yields for ever, driven by Enumerator#next with a churn of the slot
+  between: 1 held, nothing pinned, every 5,000 calls. The RSS that still
+  grows there is Enumerator#next's own: `[1].cycle.next` alone grows the
+  same, on main too, with no C at all.
+- (re-review 5) **[Minor] asking whether a value was pinned walked every
+  pinned word**, so the end of a C call cost (held + temporaries) x (words
+  pinned): 1,000 Fibers each paused with a raw Bignum in a C local made an
+  empty C call 423 us. Each pinned word is counted in a set of its own
+  (value -> words), so the question is O(1): 9.9 us with 1,000 paused (5.1
+  with none), the paused locals still read 0. **[Suggestion]** a pause reads
+  its stack only when there are temporaries or held ones (what is kept for
+  good never goes), and the registers are spilled with
+  __builtin_unwind_init() before setjmp (glibc's x86_64 setjmp stores rbp
+  mangled).

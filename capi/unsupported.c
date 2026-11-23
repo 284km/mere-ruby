@@ -9,23 +9,20 @@
  * the one shape every stub has).
  *
  * The groups, and why each is not there:
- *   - bignum algorithms by name (rb_big_mul_toom3, ...): CRuby's internal
- *     routines, exported for its own tests. This interpreter's Integer has
- *     one multiplication; calling it by another's name would be a claim.
+ *   - rb_gcd_normal: rational.c's internal routine, exported for its own
+ *     tests. (The bignum algorithms by name are CRuby's bignum.c itself,
+ *     compiled as it is: capi/bignum_cruby.c.)
  *   - TracePoint from C, the debug inspector, profile frames, postponed
  *     jobs, internal thread event hooks, the bug reporter, ISeq loading:
  *     the VM's own structures.
- *   - the Random interface, encoding converters, an encoding's alias: not
+ *   - the Random interface, encoding converters: not
  *     written yet.
  */
 extern void mr_unsupported_symbol(const char *name) __attribute__((__noreturn__));
 #define UNSUPPORTED(name) void name(void) { mr_unsupported_symbol(#name); }
 
-/* CRuby's internal bignum routines */
-UNSUPPORTED(rb_big_divrem_normal) UNSUPPORTED(rb_big_mul_balance) UNSUPPORTED(rb_big_mul_karatsuba)
-UNSUPPORTED(rb_big_mul_normal) UNSUPPORTED(rb_big_mul_toom3) UNSUPPORTED(rb_big_new)
-UNSUPPORTED(rb_big_sq_fast) UNSUPPORTED(rb_big2str_generic) UNSUPPORTED(rb_big2str_poweroftwo)
-UNSUPPORTED(rb_str2big_karatsuba) UNSUPPORTED(rb_str2big_normal) UNSUPPORTED(rb_str2big_poweroftwo)
+/* CRuby's internal rational routine (the bignum ones by name are CRuby's own
+ * bignum.c now: capi/bignum_cruby.c) */
 UNSUPPORTED(rb_gcd_normal)
 /* the VM's own structures */
 UNSUPPORTED(rb_tracepoint_new) UNSUPPORTED(rb_tracepoint_enable) UNSUPPORTED(rb_tracepoint_disable)
@@ -44,7 +41,7 @@ UNSUPPORTED(rb_postponed_job_register_one) UNSUPPORTED(rb_postponed_job_trigger)
 UNSUPPORTED(rb_internal_thread_add_event_hook) UNSUPPORTED(rb_internal_thread_remove_event_hook)
 UNSUPPORTED(rb_thread_lock_native_thread) UNSUPPORTED(rb_thread_prevent_fork)
 UNSUPPORTED(rb_bug_reporter_add) UNSUPPORTED(rb_iseq_load)
-UNSUPPORTED(rb_tracepoint_enabled_p) UNSUPPORTED(rb_enc_alias)
+UNSUPPORTED(rb_tracepoint_enabled_p)
 /* the Random interface */
 UNSUPPORTED(rb_random_base_init) UNSUPPORTED(rb_random_mark)
 /* encoding converters, and the rest */

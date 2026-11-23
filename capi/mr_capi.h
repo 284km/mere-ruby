@@ -75,7 +75,7 @@ enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, 
 enum mr_method_kind { MR_M_INSTANCE = 0, MR_M_SINGLETON, MR_M_MODULE_FUNCTION, MR_M_PRIVATE, MR_M_PROTECTED, MR_M_GLOBAL };
 enum mr_outcome_ask { MR_O_TAG = 0, MR_O_EXCEPTION, MR_O_ENTER, MR_O_VALUE };
 /* What the interpreter asks C to run (mr_capi_enter's req.op). */
-enum mr_run { MR_RUN_METHOD = 1, MR_RUN_INIT, MR_RUN_BLOCK };
+enum mr_run { MR_RUN_METHOD = 1, MR_RUN_INIT, MR_RUN_BLOCK, MR_RUN_DSIZE };
 /* CRuby's jump tags (rb_protect's *state, rb_jump_tag's argument). */
 enum mr_tag { MR_TAG_NONE = 0, MR_TAG_RETURN = 1, MR_TAG_BREAK = 2, MR_TAG_NEXT = 3, MR_TAG_RETRY = 4,
               MR_TAG_REDO = 5, MR_TAG_RAISE = 6, MR_TAG_THROW = 7, MR_TAG_FATAL = 8 };

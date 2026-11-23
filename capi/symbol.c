@@ -101,6 +101,28 @@ char *mr_capi_id_name(int id) {
     const char *s = mr_id_name((ID)id, NULL);
     return s ? (char *)s : (char *)"";
 }
+/* (a name with a NUL in it: its bytes, which a C string stops short of) */
+int mr_capi_intern_bytes(mere_bytes *b) { return (int)intern((const char *)b->data, (long)b->len); }
+int mr_capi_id_len(int id) {
+    long n = 0;
+    return mr_id_name((ID)id, &n) ? (int)n : 0;
+}
+mere_bytes *mr_capi_id_bytes(int id) {
+    static mere_bytes *buffer;
+    static long cap;
+    long n = 0;
+    const char *s = mr_id_name((ID)id, &n);
+    if (!s) n = 0;
+    if (!buffer || n > cap) {
+        cap = n > 64 ? n : 64;
+        buffer = realloc(buffer, sizeof(mere_bytes) + (size_t)cap + 1);
+        if (!buffer) mr_fatal("out of memory");
+    }
+    buffer->len = n;
+    if (n > 0) memcpy(buffer->data, s, (size_t)n);
+    buffer->data[n] = 0;
+    return buffer;
+}
 
 #undef rb_intern
 #undef rb_intern2
