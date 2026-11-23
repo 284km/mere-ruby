@@ -163,3 +163,16 @@ end
 be = BangEdges.new("hello")
 p try { be.gsub!("l", "l") }, try { be.sub!("l", "l") }, try { be.gsub!("z", "y") }
 p try { be.gsub!(/l/).class }, try { be.sub!(/l/) }, try { be.gsub! }, try { be.gsub!(1, 2) }, try { be.sub!(1, "a") }
+
+# ...with a Hash replacement, for a String pattern as for a Regexp
+hs = BangEdges.new("aa")
+p try { hs.gsub!("a", { "a" => "b" }) }, hs
+hs2 = BangEdges.new("aa")
+p try { hs2.sub!("a", { "a" => "b" }) }, hs2
+hs3 = BangEdges.new("aa")
+p try { hs3.gsub!(/a/, { "a" => "c" }) }, hs3, try { hs3.gsub!("z", { "z" => "y" }) }
+class PlainHashSub < String
+  def gsub(*a, &b) = super
+  def sub(*a, &b) = super
+end
+p PlainHashSub.new("aa").gsub("a", { "a" => "x" }), PlainHashSub.new("aa").sub("a", { "a" => "x" })
