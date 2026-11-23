@@ -35486,7 +35486,10 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
      | _ ->
        // the in-place mutators below are reached with a block, ahead of
        // builtin_iter's guard, so the frozen check has to happen here too.
-       if is_mutating_method name && val_frozen_mut recv then
+       // (the same check as builtin_iter's: a Ruby method of the name is not a
+       //  builtin mutator -- ActiveSupport's Object#try! with a block on a
+       //  frozen String was "can't modify frozen String")
+       if builtin_mut_on_frozen world recv name then
          raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect env world recv) (Cons (("__recv", recv), Nil))
        // a singleton method defined on this exact String/Array/Hash --
        // `def ary.m`, or a module it was extended with -- wins, as it does
@@ -39151,6 +39154,19 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
         | _ -> ()))) in
   let _ = (if mro_local_name c && (if map_has meth_owner_seen c then false else true)
            then () else rec_pfx (c ++ "#") (nc ++ "#")) in
+  // a Struct class's copy is a Struct class too: its members, in order, and
+  // the marks on the methods Struct.new wrote. `OtherWrapper = Wrapper.dup`
+  // (ActiveSupport's deep_mergeable_test) made plain objects, and its
+  // `new(hash)` was read as Struct.new's class name.
+  let _ = (if map_has struct_mem c then map_set struct_mem nc (map_get struct_mem c) else ()) in
+  let _ = (if map_len struct_gen > 0 then
+             (let pfx9 = c ++ "#" in
+              let gk9 = map_new () in
+              let _ = map_iter struct_gen (fn (k: str) -> fn (v: int) ->
+                        if str_starts_with k pfx9 && (if str_contains (substring k (str_len pfx9) (str_len k)) "#" then false else true)
+                        then map_set gk9 (nc ++ "#" ++ substring k (str_len pfx9) (str_len k)) v else ()) in
+              map_iter gk9 (fn (k: str) -> fn (v: int) -> map_set struct_gen k v))
+           else ()) in
   let sc = "(sng:" ++ c ++ ")" in
   let _ = (if mro_local_name sc && (if map_has meth_owner_seen sc then false else true)
            then () else rec_pfx (sc ++ "#") ("(sng:" ++ nc ++ ")#")) in
@@ -40022,6 +40038,14 @@ and hash_transform_keys_map = fn (recv: Val) -> fn (name: str) -> fn (args: Val 
 and prim_native_wanted = fn world -> fn (recv: Val) -> fn (name: str) ->
   if prim_user_has world recv name then (if bi_skip_pass name then false else true)
   else (let _ = bi_skip_pass name in true)
+and range_super_enum_name = fn (n: str) ->
+  str_eq n "sum" || str_eq n "min" || str_eq n "max" || str_eq n "minmax" || str_eq n "min_by"
+  || str_eq n "max_by" || str_eq n "count" || str_eq n "inject" || str_eq n "reduce" || str_eq n "tally"
+  || str_eq n "sort" || str_eq n "sort_by" || str_eq n "map" || str_eq n "collect" || str_eq n "flat_map"
+  || str_eq n "select" || str_eq n "filter" || str_eq n "reject" || str_eq n "filter_map"
+  || str_eq n "group_by" || str_eq n "partition" || str_eq n "to_a" || str_eq n "entries"
+  || str_eq n "take" || str_eq n "take_while" || str_eq n "drop" || str_eq n "drop_while" || str_eq n "uniq"
+  || str_eq n "zip" || str_eq n "first"
 and range_native_wanted = fn world -> fn (recv: Val) -> fn (name: str) ->
   if prim_user_has world recv name then false else true
 and prim_user_has = fn world -> fn (recv: Val) -> fn (name: str) ->
@@ -47431,6 +47455,11 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
   | (VStr _, _) when (if has_meth world (dispatch_cls_of world recv) src then false else true)
                      && str_eq (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) src) "" ->
     invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
+  // (...and a Symbol's: prim_method's #end_with? reads its first argument
+  //  only, and ActiveSupport's `alias ends_with? end_with?` took the rest)
+  | (VSym _, _) when (if has_meth world (dispatch_cls_of world recv) src then false else true)
+                     && str_eq (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) src) "" ->
+    invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
   // (...nor an ITERATOR's blockless form on any value: `alias old_times
   //  times; 3.old_times` was "undefined method 'times'", and so was a Method
   //  of it. Once the class redefines the name it is an Enumerator over that
@@ -52250,6 +52279,17 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
      | Cons (v9, _) when str_eq meth "cover?" -> VBool (rng_covers_w world lo9 hi9 ex9 v9)
      | Cons (v9, _) -> rng_include gc_cenv0 world lo9 hi9 ex9 v9
      | Nil -> VNil)
+  // ...and Enumerable's answers from a Range method that replaces one
+  // (ActiveSupport's Range#sum calls super with a block or a non-Integer
+  // range): over the range's elements, as Enumerable's walk gives them --
+  // `to_a` refuses what cannot be walked (a Float begin) in ruby's words.
+  // Only the methods whose answer is a value, not the receiver.
+  | VRange (_, _, _) when range_super_enum_name meth ->
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     let arr9 = invoke_val_c gc_cenv0 world nb9 recv "to_a" Nil false in
+     match superblk with
+     | (true, _, _, _) -> invoke_with_block gc_cenv0 world superblk arr9 meth args superblk
+     | _ -> invoke_val_c gc_cenv0 world nb9 arr9 meth args false)
   // `super` from a module prepended to a number's class (`class Integer;
   // prepend M` and M#+ calling super) is the builtin operation
   | VInt _ -> prim_method recv meth args
@@ -52722,7 +52762,8 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
   let _ = (if parent_inits9 then () else set_meth meths (anon ++ "#initialize") member_init9) in
   let toa = Cons (SReturn (EArr (struct_ivar_reads members)), Nil) in
   let _ = set_meth meths (anon ++ "#to_a") (Meth (Nil, Nil, toa)) in
-  let _ = set_meth meths (anon ++ "#to_ary") (Meth (Nil, Nil, toa)) in
+  // (no #to_ary: ruby's Struct has none, so a struct is not destructured or
+  //  flattened, and ActiveSupport's Array.wrap(struct) is [struct])
   let _ = set_meth meths (anon ++ "#values") (Meth (Nil, Nil, toa)) in
   let _ = set_meth meths (anon ++ "#deconstruct") (Meth (Nil, Nil, toa)) in
   let _ = set_meth meths (anon ++ "#members") (Meth (Nil, Nil, Cons (SReturn (EArr (struct_sym_lits members)), Nil))) in
