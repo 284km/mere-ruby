@@ -43,11 +43,17 @@ unless defined?(::Ripper)
     def initialize(source, filename = "(ripper)", lineno = 1)
       # (the C core reads any object that answers #gets, line by line, when
       #  the parse runs -- a line that is no String is its TypeError then)
+      # (...and anything else is StringValue'd: its #to_str, or the TypeError
+      #  that conversion raises -- rspec's failure snippets hand Ripper.sexp
+      #  an RSpec::Support::EncodedString)
       @__input = nil
       unless source.is_a?(String)
-        raise TypeError, "wrong argument type #{source.class} (expected String)" unless source.respond_to?(:gets)
-        @__input = source
-        source = ""
+        if source.respond_to?(:gets)
+          @__input = source
+          source = ""
+        else
+          source = String.new(source)
+        end
       end
       __translation_initialize(source, filename.is_a?(String) ? filename.dup.freeze : filename, lineno)
       @__parsing = false
@@ -272,7 +278,9 @@ unless defined?(::Ripper)
       end
 
       def initialize(src, filename = "-", lineno = 1)
-        @source = src.respond_to?(:read) ? src.read : (src.respond_to?(:gets) ? src.gets(nil) : src)
+        # (a source that is neither a String nor a stream is StringValue'd,
+        #  as Ripper#initialize does: it was lexed as its #to_s)
+        @source = src.respond_to?(:read) ? src.read : (src.respond_to?(:gets) ? src.gets(nil) : (src.is_a?(String) ? src : String.new(src)))
         @filename = filename
         @lineno = lineno
         @errors = []
