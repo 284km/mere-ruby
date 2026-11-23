@@ -538,6 +538,32 @@ paused.resume
 GC.start
 A.noop
 check(paused.resume == 0)
+
+# rb_check_id answers the ID of a name ruby has as one -- a builtin's name,
+# a method the program defined -- also after #to_sym of it; a name only
+# #to_sym made is a dynamic Symbol, which rb_check_symbol finds and
+# rb_check_id does not, until a definition pins it. (The names are built so
+# that this source does not write them.)
+builtin = 'lj' + 'ust'
+check(builtin.to_sym.is_a?(Symbol))
+check(A.check_id(builtin))
+check(A.check_id(builtin.to_sym))
+defined = 'api_dm_' + 'q9'
+Class.new.define_method(defined) {}
+check(defined.to_sym.is_a?(Symbol))
+check(A.check_id(defined))
+fresh = 'api_fresh_' + 'q9'
+check(!A.check_id(fresh))
+check(A.check_symbol(fresh).nil?)
+sym = fresh.to_sym
+check(!A.check_id(fresh))
+check(!A.check_id(sym))
+check(A.check_symbol(fresh) == sym)
+check(A.check_symbol(sym) == sym)
+Class.new.define_method(sym) {}
+check(A.check_id(fresh))
+check(A.check_id(sym))
+
 # (without the GVL: another thread runs while the function naps; the
 #  function can call back into Ruby; a kill ends a blocking read)
 ticks = 0
