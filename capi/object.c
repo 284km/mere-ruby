@@ -193,7 +193,18 @@ VALUE rb_ivar_get(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_ge
 VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_callk(obj, "instance_variable_set", 2, ivar_name(id), value); return value; }
 VALUE rb_ivar_defined(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_defined?", 1, ivar_name(id)); }
 VALUE rb_attr_get(VALUE obj, ID id) { return rb_ivar_get(obj, id); }
-VALUE rb_iv_get(VALUE obj, const char *name) { return rb_ivar_get(obj, rb_intern(name)); }
+/* A name that is no Symbol is no variable, and asking does not make it one
+ * (ruby's rb_check_id_cstr). ⚠ BUT a variable the program assigned is one:
+ * ruby's parser made `@a` an ID, and this interpreter notes no identifier as
+ * a Symbol -- so a variable that is there is asked for by its own name. */
+VALUE rb_iv_get(VALUE obj, const char *name) {
+    long len = (long)strlen(name);
+    ID id = rb_check_id_cstr(name, len, rb_usascii_encoding());
+    if (id) return rb_ivar_get(obj, id);
+    if (len > 1 && name[0] == '@' && RTEST(mr_callk(obj, "instance_variable_defined?", 1, rb_str_new(name, len))))
+        return mr_callk(obj, "instance_variable_get", 1, rb_str_new(name, len));
+    return Qnil;
+}
 VALUE rb_iv_set(VALUE obj, const char *name, VALUE value) { return rb_ivar_set(obj, rb_intern(name), value); }
 VALUE rb_obj_instance_variables(VALUE obj) { return mr_callk(obj, "instance_variables", 0); }
 VALUE rb_obj_remove_instance_variable(VALUE obj, VALUE name) { return mr_call(obj, "remove_instance_variable", 1, name); }
