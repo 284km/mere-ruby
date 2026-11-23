@@ -1730,6 +1730,7 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter rx_prog_names mk in
   let _ = map_iter gc_cenv0 mk in
   let _ = map_iter gc_hold (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
+  let _ = map_iter gc_iter_hold (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
   // the Fiber objects, the value crossing a switch, and the saved contexts of
   // suspended stacks
   let fbx = map_has gc_state "fbx" in
@@ -12133,13 +12134,14 @@ and flt_step_go = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (st: f
 // nodes a C variable points at, not a list's later cells: a result built
 // before the first yield and walked from a list was rooted by nothing once
 // the block's first statements had run, and a collection there swept it.
-// gc_hold is a root; the key is this depth and the value's id, so a nested
-// walk of another value never drops this one.
+// gc_iter_hold is a root; each walk draws a number of its own for its key,
+// so a nested walk never drops another's value.
 and iter_held = fn (v: Val) -> fn (body: unit -> Flow) ->
-  let k = "iterheld:" ++ str_of_int (cd_get ()) ++ ":" ++ (match v with VArr a9 -> str_of_int a9 | _ -> "v") in
-  let _ = map_set gc_hold k v in
-  let r = try_or_msg body (fn (m: str) -> (let _ = map_delete gc_hold k in fail m)) in
-  let _ = map_delete gc_hold k in
+  let k = vec_get gc_iter_hold_n 0 in
+  let _ = vec_set gc_iter_hold_n 0 (k + 1) in
+  let _ = map_set gc_iter_hold k v in
+  let r = try_or_msg body (fn (m: str) -> (let _ = map_delete gc_iter_hold k in fail m)) in
+  let _ = map_delete gc_iter_hold k in
   r
 and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
@@ -27166,7 +27168,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else if str_eq mown "Struct" && is_struct_gen_method mnm && (match args with Nil -> true | _ -> false)
                   && (match mrecv with VObj o9 -> (let (_, _, oc9, _) = world in is_struct_obj_cls world (map_get oc9 o9)) | _ -> false)
                   && (str_eq mnm "members" || str_eq mnm "size" || str_eq mnm "length" || str_eq mnm "to_a"
-                      || str_eq mnm "to_ary" || str_eq mnm "values" || str_eq mnm "deconstruct") then
+                      || str_eq mnm "values" || str_eq mnm "deconstruct") then
             (match mrecv with
              | VObj o9 ->
                (let (_, _, oc9, iv9) = world in
@@ -53218,7 +53220,7 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
   let _ = set_meth meths (anon ++ "#length")
             (Meth (Nil, Nil, Cons (SReturn (EMethod (self_m "to_a", "size", Nil)), Nil))) in
   // (these are Struct's in ruby, not the class's own: struct_gen)
-  let _ = list_iter (Cons ("to_a", Cons ("to_ary", Cons ("values", Cons ("deconstruct", Cons ("members", Cons ("each", Cons ("size", Cons ("length", Nil)))))))))
+  let _ = list_iter (Cons ("to_a", Cons ("values", Cons ("deconstruct", Cons ("members", Cons ("each", Cons ("size", Cons ("length", Nil))))))))
             // (...unless a MEMBER has the name: its accessor replaced it, and
             //  is the class's own -- `Struct.new(:members, :class)`)
             (fn (n9: str) -> if str_list_has members n9 then () else map_set struct_gen (anon ++ "#" ++ n9) 1) in
@@ -62839,6 +62841,20 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
          //  the reopening here too, as at the top level)
          let _ = (if map_has consts full && (match map_get consts full with VClass _ -> false | _ -> true)
                   then (let _ = reopen_kind_err world full is_mod in ()) else ()) in
+         // ...and a constant that names ANOTHER class or module by its own name
+         // (`HTML = Nokogiri::HTML4; module HTML`) reopens that one, refusing
+         // the other kind as for any constant. This path registered a second
+         // module under the alias (N::HTML::Document beside N::HTML4); the top
+         // level path refused it as "not a module". Nokogiri's html.rb.
+         let ali9 = (if map_has consts full then
+                       (match map_get consts full with
+                        | VClass rc9 -> if is_anon_cls rc9 || str_eq rc9 full then "" else rc9
+                        | _ -> "")
+                     else "") in
+         let _ = (if str_eq ali9 "" then ()
+                  else if (if is_mod then (if map_has modules ali9 then false else true) else map_has modules ali9)
+                  then (let _ = reopen_kind_err world full is_mod in ()) else ()) in
+         let full = (if str_eq ali9 "" then full else ali9) in
          let anon9 = (if map_has consts full then
                         (match map_get consts full with
                          | VClass rc9 -> if is_anon_cls rc9 then rc9 else ""
@@ -65449,9 +65465,20 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // internal name, and that is where its methods and its module-ness live,
     // so the body has to be registered against that name -- while `already`
     // still answers for the constant that was written.
+    // (...and so does a constant that names another class or module by its
+    //  own name, `HTML = Nokogiri::HTML4; module HTML` -- the other kind is
+    //  refused as for any constant, with where the constant was set)
+    let alias_target = (if map_has consts name then
+                          (match map_get consts name with
+                           | VClass rc -> if is_anon_cls rc || str_eq rc name then "" else rc
+                           | _ -> "")
+                        else "") in
+    let _ = (if str_eq alias_target "" then ()
+             else if (if is_module then (if map_has modules alias_target then false else true) else map_has modules alias_target)
+             then (let _ = reopen_kind_err world name is_module in ()) else ()) in
     let anon_target = (if map_has consts name then
                          (match map_get consts name with
-                          | VClass rc -> if is_anon_cls rc then rc else ""
+                          | VClass rc -> if is_anon_cls rc || (if str_eq alias_target "" then false else true) then rc else ""
                           | _ -> "")
                        else "") in
     // reopening: `module C` on an existing class (or `class C` on a module)
