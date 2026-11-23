@@ -141,3 +141,35 @@ p fm.instance_methods(false).sort
 # ...and one frozen before its module was ever made
 fz = FM.new.freeze
 begin; fz.module_eval { def f = 1 }; rescue => e; p [e.class, e.message.sub(/0x\h+/, "X")]; end
+
+# refine and using in the instance's module_eval; Module's private methods
+# refuse an explicit receiver and name the instance; send reaches them
+class PM < Module; end
+pm = PM.new
+pm.module_eval { def a = 1 }
+p pm.module_eval { refine(String) { def zz_960 = 1 } }.class
+p pm.module_eval { using Module.new }.equal?(pm)
+pm = PM.new
+pm.module_eval { def a = 1 }
+[[:module_function], [:private, :a], [:public], [:remove_const, :Q]].each do |n, *a|
+  begin
+    p [n, pm.public_send(n, *a)]
+  rescue => e
+    p [n, e.class, e.message.sub(/0x\h+/, "X")]
+  end
+  p [n, :inside, (pm.instance_eval { send(n, *a) } rescue $!.class)]
+end
+
+# dup and clone have a module of their own, a copy of the original's
+cm = PM.new
+cm.module_eval { def a = 1 }
+cd = cm.dup
+cd.module_eval { def dd = 1 }
+cc = cm.clone
+cc.module_eval { def cc = 1 }
+p cm.instance_methods.sort, cd.instance_methods.sort, cc.instance_methods.sort
+cm.freeze
+p (cm.dup.module_eval { def x1 = 1 }), (cm.clone(freeze: false).module_eval { def x2 = 1 })
+begin; cm.clone.module_eval { def x3 = 1 }; rescue => e; p [e.class, e.message.sub(/0x\h+/, "X")]; end
+p cm.instance_methods.sort, cm.clone.frozen?, cm.dup.frozen?
+p Class.new { include cd }.new.dd, Class.new { include cm }.new.respond_to?(:dd)
