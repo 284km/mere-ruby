@@ -10940,7 +10940,13 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
                  | FBreak v -> FBreak v | FReturn v -> FReturn v
                  | _ -> (if str_eq (sget h) sv then go9 t9
                          else (match raise_exc world "RuntimeError" "string modified" with _ -> FNext VNil)))) in
-           iter_each_result (go9 (deref aid)) recv)
+           // (the pieces are held while the block runs: this builtin's frame
+           //  starts its interval again at every yield, and the pieces after
+           //  the one in hand sit deeper in the list than the stack scan
+           //  reads, so a collection in the block gave the rest back and
+           //  they were yielded as "" -- Bundler's lockfile parser then read
+           //  no PLATFORMS)
+           iter_each_result (iter_held (VArr aid) (fn (u: unit) -> go9 (deref aid))) recv)
         | other -> other)
      // scrub with a block: each invalid span is yielded and the block's
      // answer replaces it. scrub! writes the result back (frozen refuses
@@ -11122,10 +11128,14 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
     // argument zipped as nils (`[1, 2].zip("a".."b") { }` saw [1, nil])
     else if (str_len name == 3 && str_eq name "zip") then
       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
-       let tup9 = (match invoke_val_c gc_cenv0 world nb9 recv "zip" args false with
+       // (the tuples are held while the block runs, as split's pieces are:
+       //  `a.zip(a.dup) { |x| }` lost them to a collection in the block and
+       //  stopped with map_get on a swept tuple -- iter_held)
+       let z9 = invoke_val_c gc_cenv0 world nb9 recv "zip" args false in
+       let tup9 = (match z9 with
                    | VArr t9 -> deref t9
                    | _ -> val_zip xs args 0 (val_list_len xs)) in
-       match arr_each world encl theblk tup9 with
+       match iter_held z9 (fn (u: unit) -> arr_each world encl theblk tup9) with
        | FBreak v -> v
        | _ -> VNil)
     else if (str_len name == 6 && str_eq name "reduce") || (str_len name == 6 && str_eq name "inject") then
@@ -12117,6 +12127,20 @@ and flt_step_go = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (st: f
      | FRaise v -> FRaise v
      | _ -> flt_step_go world encl theblk b st lim (i + 1) n)
 
+// WHAT A BUILTIN BUILT WHOLE AND THEN YIELDS, held for as long as it yields.
+// A builtin frame's watermark interval starts again at each yield (see
+// run_block0x's "when the caller is a BUILTIN"), and the stack scan reads the
+// nodes a C variable points at, not a list's later cells: a result built
+// before the first yield and walked from a list was rooted by nothing once
+// the block's first statements had run, and a collection there swept it.
+// gc_hold is a root; the key is this depth and the value's id, so a nested
+// walk of another value never drops this one.
+and iter_held = fn (v: Val) -> fn (body: unit -> Flow) ->
+  let k = "iterheld:" ++ str_of_int (cd_get ()) ++ ":" ++ (match v with VArr a9 -> str_of_int a9 | _ -> "v") in
+  let _ = map_set gc_hold k v in
+  let r = try_or_msg body (fn (m: str) -> (let _ = map_delete gc_hold k in fail m)) in
+  let _ = map_delete gc_hold k in
+  r
 and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> FNext VNil
