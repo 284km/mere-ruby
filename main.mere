@@ -4658,45 +4658,55 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   // write the attribute through the normal method dispatch.
   | EAttrOp (recv_e, name, op, rhs_e) ->
     let r = eval_e env world blk recv_e in
-    // (a pooled scratch env -- see with_scratch_env -- so the value returned is
-    //  the one computed here, never one read back out of it: Ruby's value of
-    //  `recv.attr op= v` is the value assigned, not what the setter returns)
-    with_scratch_env env (fn e2 ->
-    let _ = map_set e2 "__opr" r in
-    // self-receiver keeps ESelf so private accessors stay reachable (self is
-    // side-effect-free, so evaluating it twice is harmless).
+    // The reader and the writer each run in a pooled scope of their own
+    // (vm_scoped: the answer copied out of its region before the scope goes
+    // back), and the right side runs in env itself, with no scope alive:
+    // a Fiber or a Thread that stops inside the value (`o.y += y.yield(1)`)
+    // left the scope's lv_up link behind, and fb_reclaim's roots reached the
+    // stopped block through it, so the Fiber was never given back.
+    // Ruby's value of `recv.attr op= v` is the value assigned, not what the
+    // setter returns.
+    // (self-receiver keeps ESelf so private accessors stay reachable -- self
+    //  is side-effect-free, so evaluating it twice is harmless)
     let rx = (match recv_e with ESelf -> ESelf | _ -> EVar "__opr") in
-    let cur = eval_e e2 world blk (EMethod (rx, name, Nil)) in
-    let set9 = fn (v: Val) -> (let _ = map_set e2 "__opv" v in let _ = eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil))) in v) in
-    let res9 =
-      (if str_eq op "||" then
-         (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
-       else if str_eq op "&&" then
-         (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
-       else
-         (let v = eval_e env world blk rhs_e in
-          set9 (apply_bin_vals world blk op cur v))) in
-    res9)
+    let cur = vm_scoped env (fn e2 -> (let _ = map_set e2 "__opr" r in eval_e e2 world blk (EMethod (rx, name, Nil)))) in
+    let set9 = fn (v: Val) ->
+      (let _ = vm_scoped env (fn e2 ->
+                 (let _ = map_set e2 "__opr" r in
+                  let _ = map_set e2 "__opv" v in
+                  eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil))))) in
+       v) in
+    if str_eq op "||" then
+      (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
+    else if str_eq op "&&" then
+      (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
+    else
+      (let v = eval_e env world blk rhs_e in
+       set9 (apply_bin_vals world blk op cur v))
   // recv[idx..] op= rhs — evaluate recv and the indices once (bound to temps).
+  // (each call in a scope of its own, the value outside them, as EAttrOp)
   | EIdxOp (recv_e, idx_es, op, rhs_e) ->
     let r = eval_e env world blk recv_e in
     let idxs = eval_args env world blk idx_es in
-    // (a pooled scratch env, as for EAttrOp above)
-    with_scratch_env env (fn e2 ->
-    let _ = map_set e2 "__opr" r in
     let rx = (match recv_e with ESelf -> ESelf | _ -> EVar "__opr") in
-    let ies = idx_temp_exprs e2 idxs 0 in
-    let cur = eval_e e2 world blk (EMethod (rx, "[]", ies)) in
-    let set9 = fn (v: Val) -> (let _ = map_set e2 "__opv" v in let _ = eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil)))) in v) in
-    let res9 =
-      (if str_eq op "||" then
-         (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
-       else if str_eq op "&&" then
-         (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
-       else
-         (let v = eval_e env world blk rhs_e in
-          set9 (apply_bin_vals world blk op cur v))) in
-    res9)
+    let cur = vm_scoped env (fn e2 ->
+                (let _ = map_set e2 "__opr" r in
+                 let ies = idx_temp_exprs e2 idxs 0 in
+                 eval_e e2 world blk (EMethod (rx, "[]", ies)))) in
+    let set9 = fn (v: Val) ->
+      (let _ = vm_scoped env (fn e2 ->
+                 (let _ = map_set e2 "__opr" r in
+                  let ies = idx_temp_exprs e2 idxs 0 in
+                  let _ = map_set e2 "__opv" v in
+                  eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil)))))) in
+       v) in
+    if str_eq op "||" then
+      (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
+    else if str_eq op "&&" then
+      (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
+    else
+      (let v = eval_e env world blk rhs_e in
+       set9 (apply_bin_vals world blk op cur v))
   // `self.using M` is `using M`: a private method called through `self.`
   // (only the literal `self`: `recv = self; recv.using M` is refused, as
   // ruby refuses a private call with any other receiver)
