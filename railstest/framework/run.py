@@ -131,6 +131,42 @@ def environment(side_dir, stdlib, mere=False):
     return env
 
 
+# --env: a setting both sides get alike (activerecord's ARCONN=sqlite3), and
+# the record keeps it. The record is published, so neither a secret nor a
+# path of this machine may be one; and the settings the runner itself makes
+# for each side (the gem home, the bootstrap, the tmp directory) are not
+# overridable, nor is mere-ruby's own --mere-env.
+RESERVED = ('GEM_HOME', 'GEM_PATH', 'GEMRC', 'RUBYOPT', 'RUBYLIB', 'RAILS_SMOKE_RUBY_LIB', 'TMPDIR',
+            'LANG', 'PATH', 'HOME', 'MAKEFLAGS', 'RUBYGEMS_GEMDEPS')
+SECRET = re.compile(r'TOKEN|SECRET|PASSW|CREDENTIAL|PRIVATE|API_?KEY|AUTH|COOKIE|SESSION')
+LOCAL_PATH = re.compile(r'(?:^|[\s=:,;])[/~]|/Users/|/home/|/private/|/var/folders/')
+
+
+def shared_settings(items):
+    settings = {}
+    for item in items:
+        key, sep, value = item.partition('=')
+        if not sep or not re.fullmatch(r'[A-Z][A-Z0-9_]*', key):
+            raise ValueError('--env takes NAME=value with an upper-case NAME: ' + item)
+        if key in RESERVED or key.startswith(('BUNDLE_', 'MERE_RUBY_')):
+            raise ValueError(f'--env cannot set {key}: the runner makes it for each side'
+                             + (' (use --mere-env)' if key.startswith('MERE_RUBY_') else ''))
+        if SECRET.search(key):
+            raise ValueError(f'--env {key}: a secret is not recorded; the results are published')
+        if LOCAL_PATH.search(value):
+            raise ValueError(f'--env {key}: a path of this machine is not recorded; the results are published')
+        settings[key] = value
+    return dict(sorted(settings.items()))
+
+
+def side_environment(side_dir, stdlib, mere, shared):
+    """A side's environment: the runner's own, then --env's settings, which
+    are the same for both sides"""
+    env = environment(side_dir, stdlib, mere=mere)
+    env.update(shared)
+    return env
+
+
 def supervisor():
     sys.path.insert(0, str(REPO / 'unittest'))
     from ci import supervise
@@ -331,6 +367,7 @@ def mere_settings(items):
 
 def run(args, data):
     mere_env = mere_settings(args.mere_env)
+    shared = shared_settings(args.env)
     source_head = check_source(args.source, data)
     files = select_files(args.source, args.paths)
     version, stdlib, _gem = reference_facts(args.reference)
@@ -364,7 +401,7 @@ def run(args, data):
                   source_ref=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
                   runner_sha256=sha(Path(__file__)), archive_lock_sha256=sha(ROOT / 'archives.lock.json'),
                   binary_sha256=sha(args.binary) if args.binary else None, reference_sha256=sha(args.reference),
-                  seed=SEED, wall_seconds=WALL, family_rss_kib=RSS_KB, jobs=args.jobs,
+                  seed=SEED, wall_seconds=WALL, family_rss_kib=RSS_KB, jobs=args.jobs, env=shared,
                   install_binary_sha256={side: install_record['sides'][side].get('binary_sha256') for side, _b in sides},
                   files={})
     lock_ = threading.Lock()
@@ -373,7 +410,7 @@ def run(args, data):
     def one(side, binary, name):
         component, relative = name.split('/', 1)
         side_dir = args.gems / side
-        env = environment(side_dir, stdlib, mere=side == 'mere')
+        env = side_environment(side_dir, stdlib, side == 'mere', shared)
         if side == 'mere':
             env.update(mere_env)
         stem = args.output / side / 'logs' / name.replace('/', '__')
@@ -504,6 +541,8 @@ def main():
     parser.add_argument('--side', choices=('both', 'reference', 'mere'), default='both')
     parser.add_argument('--sqlite-prefix', type=Path)
     parser.add_argument('--jobs', type=int, default=MAX_JOBS)
+    parser.add_argument('--env', action='append', default=[], metavar='NAME=VALUE',
+                        help='run: a setting both sides get alike (repeatable; recorded in the results)')
     parser.add_argument('--mere-env', action='append', default=[], metavar='MERE_RUBY_X=V',
                         help='run: a setting for mere-ruby only (repeatable; recorded in the results)')
     parser.add_argument('--other-install-binary', action='store_true',

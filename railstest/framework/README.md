@@ -67,6 +67,16 @@ errors on either side. Inherited `MERE_RUBY_*` settings are removed too.
 to mere-ruby's side, so that the VM can be measured instead of the evaluator.
 The results record it as `mere_env`.
 
+A component may need a setting of its own, such as activerecord's `ARCONN=sqlite3`.
+`run --env NAME=VALUE` (repeatable) gives it to both sides alike, and
+`results.json` records it under `env`. Because the record is published, the
+runner refuses:
+- a NAME it makes itself for each side (the gem home, `RUBYOPT`, `RUBYLIB`,
+  `TMPDIR`, `BUNDLE_*`, ...);
+- `MERE_RUBY_*`, which is mere-ruby's alone;
+- a NAME that looks like a secret (`TOKEN`, `SECRET`, `PASSWORD`, ...);
+- a VALUE that holds a path of this machine.
+
 ## Verdicts
 
 Each test name the reference reports gets one verdict:
@@ -114,6 +124,8 @@ python3 railstest/framework/run.py run --jobs 2 \
   --reference /path/to/ruby-4.0.9/bin/ruby --binary ./mere-ruby \
   --source /path/to/rails-v8.1.4.1 --gems /path/to/fw-gems --output /path/to/new-run \
   activesupport/test
+# (a component's own settings, the same on both sides and recorded:
+#  `--env ARCONN=sqlite3 activerecord/test/cases`)
 
 # 4. what changed between two runs, file by file (exit 1 when a MATCH is lost,
 #    including a file or a mere-ruby side that is gone from the new record)
@@ -124,8 +136,9 @@ python3 railstest/framework/run.py compare --base old/results.json --new new/res
 missing, failed, duplicated or unconfirmed test never becomes MATCH, that a
 resource stop wins over a summary, that a crash after the summary is visible,
 that an unhealthy reference compares nothing, that one side never runs two
-files at once, that a vanished file fails `compare`, and that foreign settings
-are dropped.
+files at once, that a vanished file fails `compare`, that foreign settings
+are dropped, and that `--env` reaches both sides and refuses a runner
+setting, a secret or a local path.
 
 ## Records
 

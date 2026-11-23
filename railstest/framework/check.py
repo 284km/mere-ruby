@@ -98,6 +98,22 @@ class FrameworkCheck(unittest.TestCase):
             env = run.environment(Path('/run/mere'), '/stdlib', mere=True)
         self.assertEqual('/stdlib', env['RUBYLIB'])
 
+    def test_shared_settings_reach_both_sides_and_stay_publishable(self):
+        # --env: the same setting on both sides, recorded; never a setting the
+        # runner makes, mere-ruby's own, a secret, or a path of this machine
+        shared = run.shared_settings(['ARCONN=sqlite3', 'AR_TEST_FLAG=1'])
+        self.assertEqual({'AR_TEST_FLAG': '1', 'ARCONN': 'sqlite3'}, shared)
+        for side, mere in (('reference', False), ('mere', True)):
+            env = run.side_environment(Path('/run') / side, '/stdlib', mere, shared)
+            self.assertEqual('sqlite3', env['ARCONN'])
+            self.assertEqual(f'/run/{side}/gems', env['GEM_HOME'])
+        for bad in ('ARCONN', 'arconn=sqlite3', 'GEM_HOME=/x', 'RUBYOPT=-rx', 'TMPDIR=t', 'PATH=x',
+                    'BUNDLE_GEMFILE=x', 'MERE_RUBY_VM=1', 'GITHUB_TOKEN=abc', 'DB_PASSWORD=pw', 'AWS_SECRET=s',
+                    'AR_DB=/Users/someone/db', 'AR_DB=~/db', 'AR_DB=x:/tmp/db', 'AR_DB=/home/u/db'):
+            with self.subTest(item=bad):
+                with self.assertRaises(ValueError):
+                    run.shared_settings([bad])
+
     def test_selection_stays_inside_component_tests(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)

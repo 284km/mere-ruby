@@ -226,7 +226,29 @@ static VALUE ivar_name(ID id) {
     memcpy(buffer + 8, s, (size_t)len);
     return ID2SYM(rb_intern2(buffer, len + 8));
 }
-VALUE rb_ivar_get(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_get", 1, ivar_name(id)); }
+/* (a dmark run between C calls reads the ivar from the table, through the
+ *  collector's reader -- no dispatch, no Ruby -- for an object; anything
+ *  else is refused) */
+static VALUE ivar_read_unasked(VALUE obj, ID id) {
+    int type = rb_type(obj);
+    if (type != T_OBJECT && type != T_DATA)
+        mr_fatal("a dmark read an instance variable of something that is not an object, with no C call in progress");
+    long len = 0;
+    const char *s = mr_id_name(id, &len);
+    if (!s) mr_fatal("a dmark read an instance variable by an invalid ID");
+    char *buffer = alloca((size_t)len + 16);
+    if (len > 0 && s[0] == '@') { memcpy(buffer, s, (size_t)len); buffer[len] = 0; }
+    else { memcpy(buffer, "@__capi_", 8); memcpy(buffer + 8, s, (size_t)len); buffer[len + 8] = 0; }
+    mr_put_text(buffer);
+    VALUE value = mr_up1(MR_IVAR_READ, obj);
+    if (value == Qundef)
+        mr_fatal("a dmark read an instance variable of a T_DATA the interpreter keeps no ivar table for (a Proc, a Binding), with no C call in progress");
+    return value;
+}
+VALUE rb_ivar_get(VALUE obj, ID id) {
+    if (mr_capi_mark_unasked()) return ivar_read_unasked(obj, id);
+    return mr_callk(obj, "instance_variable_get", 1, ivar_name(id));
+}
 VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_callk(obj, "instance_variable_set", 2, ivar_name(id), value); return value; }
 VALUE rb_ivar_defined(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_defined?", 1, ivar_name(id)); }
 VALUE rb_attr_get(VALUE obj, ID id) { return rb_ivar_get(obj, id); }

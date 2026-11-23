@@ -27,7 +27,8 @@ announce a number before using it.
 | 806–849 | VM and JIT |
 | 850–889 | AST, Prism and parser speed |
 | 890–929 | C API and native extensions |
-| 930–979 | Rails |
+| 930–959 | Rails: activesupport, activemodel, actionview, actionpack, activejob, actionmailer (Rails-1) |
+| 960–979 | Rails: activerecord (Rails-2) |
 | 980–999 | process, CI and anything else |
 
 When a range runs out, add the next free block of 50 for that stream to this

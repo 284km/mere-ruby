@@ -122,3 +122,20 @@ The next RED, each reproduced without Rails:
   path makes. It refuses first now. The plain form still answers from a frozen
   receiver. The other bang entries this PR adds (`gsub!` / `sub!`) check
   first. A String's block call goes through the dispatcher, which checks.
+
+## The review's third round
+
+- The new `gsub!` / `sub!` path through super answered nil where ruby does
+  not. It now returns self when a match wrote the same text, an Enumerator
+  for `gsub!(pattern)`, ArgumentError for `sub!(pattern)` and for no
+  arguments, and TypeError for a pattern that is neither a String nor a
+  Regexp, in ruby's words for each.
+- Merged with #188 (`run --env`): `--env`, `--mere-env` and the install-binary
+  check all stay, and check.py passes 21 controls.
+
+Follow-up (the same on main): many other bang methods called through super
+from a frozen subclass write instead of raising FrozenError. Examples are
+Hash's compact! / clear / store / delete / shift, Array's compact! / flatten!
+/ reverse! / concat / pop, and String's reverse! / replace / concat / << /
+insert / slice! / succ! / clear. The entries this PR adds (gsub!, sub!,
+transform_keys!) refuse.
