@@ -28,8 +28,13 @@ same names on both sides. The differences, one by one:
   to C as a data object (none, an RData, or a typed data's
   wrap_struct_name). `ObjectSpace.__data_struct` carries it into the
   objspace prelude, whose `__type_of` now says :T_DATA (count_objects too)
-  and whose dump adds `"struct"`. capi/check typeddata covers it: 113
-  contracts on both sides.
+  and whose dump adds `"struct"`. Deciding the type makes nothing
+  (`ObjectSpace.__data_p`, a yes or no); only the dump's `"struct"` makes the
+  name's String. (A first version had `__type_of` ask for the name: one
+  `count_objects` with 100 sqlite3 Statements alive allocated 119 objects,
+  15 without them -- #190 review.) capi/check typeddata covers both: the
+  dump, and that one count_objects allocates no more with 100 more typed
+  data objects alive; 115 contracts on both sides.
 - **test_step_does_not_allocate_when_done: fixed.**
   `GC.stat(:total_allocated_objects)`, read twice around a
   `Statement#step` that allocates nothing, differed by 2. The interpreter
@@ -42,13 +47,18 @@ same names on both sides. The differences, one by one:
     `__params`). It is now built only for that body (`SReturn EStructInit`).
   - Each `return` / `break` / `next` / `throw` out of a block made two
     Strings: the flow signal's kind (`flow_sig "k"`) and its "unhandled"
-    message (`prim_missing "i"`). Now there is one frozen String per text,
-    made once and held in gc_hold as "flow:" ++ text (flow_str), which
-    is rooted like the rest of gc_hold.
+    message (`prim_missing "i"`). Both are Symbols now (VSym), and their
+    readers -- capi_capture / capi_resume, which carry the kind through C,
+    among them -- read the Symbol's name. No String is made for a flow at
+    all.
   So nothing is subtracted from the count: the objects are no longer made.
-  A first version of this fix did subtract them (mkstr_internal /
-  arr_new_internal); I dropped it, because that made the count disagree
-  with the objects that exist.
+  Two earlier versions did something else and were dropped:
+  - the first subtracted them from the count (mkstr_internal /
+    arr_new_internal), which made the count disagree with the objects;
+  - the second kept one frozen String per text in gc_hold (flow_str), which
+    each_object(String) still found ("returnret", "mere-ruby: (unhandled
+    return out of a block)", ...): objects the program never made (#190
+    review).
   - corpus 906 shows the count and each_object agreeing around the same
     code. It runs String-, Array-making and calling code 1 and 10 times;
     the delta of GC.stat and of each_object(String) / each_object(Array)
@@ -56,7 +66,9 @@ same names on both sides. The differences, one by one:
     call with an argument added an Array.
   - corpus 907: 10 and 100 `return` / `break` / `throw` out of a block add
     no String, as on ruby. On main, 10 such calls added 31 Strings on the
-    evaluator and 21 on the VM (work2026-fd's measurement).
+    evaluator and 21 on the VM (work2026-fd's measurement). It also walks
+    every String for the flows' own words, written as bytes so that the
+    check makes no such String: 0, as on ruby.
   - Not changed, found on the way: counting with
     `ObjectSpace.each_object(Array).count` (an Enumerator) makes Arrays in
     proportion to the objects it walks; counting with a block does not.
@@ -113,6 +125,12 @@ same names on both sides. The differences, one by one:
   - No corpus program for the top-level fix: under MERE_RUBY_VM=1 the VM
     runs the file and its frames keep the values (1, 1, 3, 4 where ruby says
     0), so a corpus program would fail the VM corpus. Recorded for the VM.
+  - **Owner:** the follow-up for this retention is d4's, in aidocs note
+    553 §7.4, item 1 ("C 拡張と GC の境目で残っている物").
+  - work2026-fd's repro: open a Database, register 20 collations, close it,
+    351 times. The Databases left: 52-67 on #190's binary, 48-49 on main.
+    RSS grows about 33-40 MB on both. With no collations, nothing grows.
+    This is a problem from before this PR; the PR does not make it worse.
 - **The 2 GiB tests (`/longer_than_int_max/`, 7): excluded on both sides,
   not runnable here.** They build `"\0" * 2**31`. CRuby gets that from
   calloc, so its pages are never touched. Here the String is 2 GiB in the
@@ -126,14 +144,59 @@ same names on both sides. The differences, one by one:
   compaction. A GC.compact that did nothing would make these tests check
   nothing.
 
+## What else allocates differently from ruby (measured, #190 review)
+
+Each case run 10 times after 3 warm-ups, GC disabled. The figures are the
+`GC.stat(:total_allocated_objects)` delta for the 10 calls, with
+each_object(String / Array / Hash) agreeing.
+
+| case | ruby 4.0.9 | mere-ruby before | mere-ruby now |
+|---|---|---|---|
+| `P.new(1, 2)` | 10 | 10 | 10 |
+| `K.new(a: 1)` (keyword `initialize`) | 10 | 20 (+10 Hashes) | 20 |
+| `S.new(1, 2)` (Struct) | 10 | 20 (+10 Arrays) | 20 |
+| `KS.new(a: 1, b: 2)` (keyword_init Struct) | 20 | 210 (120 Strings, 60 Arrays, 20 Hashes) | 90 (0 Strings) |
+| `kw(a: 1)` (explicit keywords) | 0 | 10 (Hashes) | 10 |
+| `kwr(a: 1)` (`**o`) | 10 | 20 | 20 |
+| `pos(1, 2)` | 0 | 0 | 0 |
+| `raise E` + rescue | 20 | 100 (80 Strings) | 100 |
+| `raise E, "m"` + rescue | 30 | 110 | 110 |
+
+- Fixed: a keyword_init Struct's `#new`, `#[]`, `#[]=` and `#to_h` spelled
+  each member's slot name in Ruby (`"@" + s + 1.chr`), 3 Strings a member.
+  `::Struct.__mslot_get` / `__mslot_set` read and write the slot by name
+  (struct_slot) with nothing made; the prelude's `__mslot` is gone.
+- Follow-up, with these numbers:
+  - A keyword call passes its keywords as a Hash: one Hash per call to a
+    method with explicit keywords (ruby makes none) and a second for `**o`.
+  - A Struct's `#initialize` takes `*__sa`, an Array per `new`.
+  - keyword_init's `__struct_kw_init` is Ruby (`members`, `keys`,
+    `reject`): 6 Arrays and 1 Hash more than ruby per `new`.
+  - `raise` builds its backtrace eagerly: 4 Strings (one per frame here)
+    and an Array per raise, where ruby builds them when they are read.
+  These are real objects the program can find, made where ruby makes none;
+  each is a change to how arguments or backtraces are carried, not one
+  arm.
+
 ## The dmark refusal names its request
 
 work2026-fd's review of #178: the refusal of a dmark's request between C
 calls said "(a method call, a write)" even for RHASH_SIZE, which is a read.
-It now names the method a call names, for example: "a dmark called Hash#size
-with no C call in progress (RHASH_SIZE and rb_hash_foreach are such
-calls)". For any other request it names the operation. Checked with a
-throwaway extension whose dmark reads RHASH_SIZE.
+It now names the method a call names, and the C function only where it is
+that one: "a dmark called Hash#size (RHASH_SIZE) with no C call in
+progress", "Hash#to_a (rb_hash_foreach)", and plain "String#upcase" for
+another call. For any other request it names the operation, from a table
+with designated initializers (`[MR_STR_GET] = "a String read"`, ...), so
+it stays right when the enum changes. Checked with a throwaway extension
+whose dmark reads RHASH_SIZE.
+
+## GC.stat's keys are one list
+
+The key form answered from a `case`, and the Hash form from a Hash literal
+with the same keys (and an old Symbol branch that no longer ran). Both now
+read gc_stat_entries (main.mere), one list of keys with how each value is
+read: `GC.__stat_value(key)` makes nothing, `GC.__stat_keys` lists them for
+the Hash form.
 
 ## Checks
 
