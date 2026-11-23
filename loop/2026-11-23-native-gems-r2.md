@@ -166,6 +166,7 @@ each_object(String / Array / Hash) agreeing.
   each member's slot name in Ruby (`"@" + s + 1.chr`), 3 Strings a member.
   `::Struct.__mslot_get` / `__mslot_set` read and write the slot by name
   (struct_slot) with nothing made; the prelude's `__mslot` is gone.
+  corpus 908.
 - Follow-up, with these numbers:
   - A keyword call passes its keywords as a Hash: one Hash per call to a
     method with explicit keywords (ruby makes none) and a second for `**o`.
@@ -200,16 +201,27 @@ the Hash form.
 
 ## Checks
 
-With the final binary (O2):
+After the #190 review fixes, with an O2 build, one after another (the gem
+check alone, last):
 
-- run_corpus.sh: 838/838 corpus programs match ruby.
-- tools/iseq/vm_corpus.sh: 838 programs, 834 on the VM and 4 on the
-  evaluator (fell back), 0 FAIL.
-- capi_check: every contract agrees on both sides and holds under stress
-  (ensure 58, typeddata 113, loader 48 on ruby / 49 on mere-ruby, numeric 13,
-  fiber 16, api 245), and every negative control fails as it must.
-- corpus 906 and 907 also match with MERE_RUBY_NO_HASH_INDEX=1.
-- sqlite3's suite: 410 runs, 13 failures, 2 errors, 23 skips; the failures
-  beyond the reference's are the four release counts above.
-- `--eval-print` still prints the last value. The gates and record_hygiene
-  pass.
+- gates (dead_defs, dup_defs, gc_roots, meth_writes, name_len, ns_names,
+  bracket depth) and record_hygiene: pass.
+- capi_check (ruby-4.0.9's source, as CI pins it): ensure 58, typeddata
+  115, loader 48 on ruby / 49 on mere-ruby, numeric 13, fiber 16, api 245,
+  on both sides and under stress; every negative control fails as it must.
+- capi_spec_check: ruby 2,592, mere-ruby 2,410 -- "the reference passes
+  what is recorded, and mere-ruby no less than is recorded" (io_spec and
+  thread_spec hit WALL_LIMIT on mere-ruby, as recorded).
+- capi_mkmf_check: mkmf contracts 14 on both sides and under stress;
+  every control fails as it must.
+- run_corpus.sh: 841/841 match ruby.
+- tools/iseq/vm_corpus.sh: 841 programs, 837 on the VM and 4 on the
+  evaluator, 0 FAIL.
+- capi_gem_check (--gems as fetched): seventeen gems install and behave the
+  same on both sides (173 lines).
+- sqlite3's suite: ruby 410 runs, 807 assertions, 9 failures, 2 errors,
+  17 skips; mere-ruby 410 runs, 799 assertions, 12 failures, 2 errors, 23
+  skips. Beyond the reference's are three of the four release counts
+  (which of the aggregate two fails depends on the order).
+- corpus 906, 907 and 908 also match under MERE_RUBY_VM=1 and with
+  MERE_RUBY_NO_HASH_INDEX=1.
