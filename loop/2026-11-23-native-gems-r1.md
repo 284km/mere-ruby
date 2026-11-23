@@ -207,6 +207,13 @@ Fixed in this round (main merged first):
   `M === pr` sees the singleton, `singleton_methods` lists the extended
   modules' methods. corpus 904.
 
+The full check of that round found one regression: corpus 717's
+`EnumeratedParent.native_children { }` -- an alias of the builtin
+`subclasses`, called with a block, under a Ruby `subclasses` -- reached the
+override, through the with-block alias arm added for `Array.on(2) { }`.
+That arm now takes only an alias of `new` (whose with-block arm reads the
+skip); 717 matches again on the evaluator and the VM.
+
 Follow-ups, not done:
 
 - The parser's `name [array] op rest` (corpus 899) still keeps the old
