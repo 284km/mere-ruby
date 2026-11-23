@@ -317,7 +317,20 @@ def classify(reference, mere):
     return verdicts
 
 
+def mere_settings(items):
+    """--mere-env: settings for mere-ruby's side only (MERE_RUBY_VM=1 measures
+    the VM instead of the evaluator), checked before anything is made"""
+    settings = {}
+    for item in items:
+        key, sep, value = item.partition('=')
+        if not sep or not key.startswith('MERE_RUBY_'):
+            raise ValueError('--mere-env takes MERE_RUBY_*=value only: ' + item)
+        settings[key] = value
+    return settings
+
+
 def run(args, data):
+    mere_env = mere_settings(args.mere_env)
     source_head = check_source(args.source, data)
     files = select_files(args.source, args.paths)
     version, stdlib, _gem = reference_facts(args.reference)
@@ -355,12 +368,6 @@ def run(args, data):
                   install_binary_sha256={side: install_record['sides'][side].get('binary_sha256') for side, _b in sides},
                   files={})
     lock_ = threading.Lock()
-    # settings given to mere-ruby's side only, e.g. MERE_RUBY_VM=1 to measure
-    # the VM instead of the evaluator; recorded with the results
-    mere_env = dict(item.split('=', 1) for item in args.mere_env)
-    for key in mere_env:
-        if not key.startswith('MERE_RUBY_'):
-            raise ValueError('--mere-env takes MERE_RUBY_* settings only: ' + key)
     record['mere_env'] = mere_env
 
     def one(side, binary, name):

@@ -216,6 +216,12 @@ class FrameworkCheck(unittest.TestCase):
             run.check_install_binary(record, 'mere', 'b' * 64, False)
         self.assertFalse(run.check_install_binary(record, 'mere', 'b' * 64, True))
 
+    def test_mere_settings_are_checked_first(self):
+        self.assertEqual({'MERE_RUBY_VM': '1'}, run.mere_settings(['MERE_RUBY_VM=1']))
+        for bad in (['RUBYOPT=-rx'], ['MERE_RUBY_VM']):
+            with self.assertRaisesRegex(ValueError, 'MERE_RUBY_'):
+                run.mere_settings(bad)
+
     def test_install_requires_every_component(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

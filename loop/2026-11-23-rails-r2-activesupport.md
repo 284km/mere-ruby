@@ -48,3 +48,50 @@ change here. Every fault below was reproduced without Rails first. Witness:
 - Time.new saved by `Time.singleton_class.alias_method` and then replaced
   (TimeHelpers' stub_object): 5 RED in time_travel_test. This is the path #178
   changes. The owner decided it is fixed there.
+
+## The review's round, and the next ActiveSupport shapes
+
+The review of `8bf5563b` found three regressions in the first round, all in
+shapes ActiveSupport's tests do not take. Witness: `corpus/934_review_shapes_of_r2.rb`.
+- **A module prepended to String, whose `#gsub` / `#sub` call super, looped.**
+  `dispatch_prim` asks String's own Ruby definitions and came back to the
+  module. The gsub family goes there now only for a subclass's value (a
+  tagged value without a singleton class). A plain String keeps prim_method,
+  as on main.
+- **A module prepended to Range, whose `#cover?` calls super, looped.**
+  `range_native_wanted` spent the one-call bypass in an arm that checked its
+  argument afterwards and did not take the call. The `super` now calls Range's
+  own answers directly: `rng_include` for `include?` / `member?`,
+  `__cover_range` for a Range argument, and `rng_covers_w` otherwise. No
+  bypass is set.
+- **A Hash subclass with its own `#each` answered `select` / `reject`
+  through super as an Array.** The block path through the dispatcher is now
+  for a String's value only. A Hash or an Array keeps the iterator path.
+
+Minor findings, also fixed here:
+- A frozen String subclass refused nothing in `gsub!` / `sub!` through super.
+  It now raises FrozenError, naming the subclass.
+- Kernel#=== by name now requires Kernel among the ancestors and no undef.
+- `Object#respond_to_missing?` through a value's super takes exactly two
+  arguments, as ruby's does.
+- `--mere-env` is checked before the output directory is made.
+
+Left as a follow-up: an endless range whose answer lies past int64's
+maximum. `range_seek` stops there with the RangeError the array form gave,
+because the bignum walk is not here. ruby goes on and answers.
+
+The next RED, each reproduced without Rails:
+- **A protected method called on a value of the class** from another of its
+  methods (SafeBuffer#* calls `mark_unsafe!` on the buffer it made) was
+  refused for every value `self`. `protected_ok` now asks the value's class,
+  its singleton class first.
+- **`super` into String#initialize** copied the bytes and not the encoding,
+  and ignored `encoding:`. `SafeBuffer.new` (`def initialize(_str = "") =
+  super`) was BINARY, and its `#unicode_normalize` refused it.
+- **`method_missing` on a String or an Array subclass** was never asked. Only
+  a Hash subclass's was. ActiveSupport::StringInquirer answers
+  `env.production?` from it.
+- **`HashWithIndifferentAccess#transform_keys(mapping)` calls super**, which
+  had no answer for a mapping. The arm's body is now
+  `hash_transform_keys_map`, shared with the dispatcher. With a block, the
+  call keeps the iterator path.
