@@ -291,10 +291,9 @@ VALUE rb_data_define(VALUE super, ...) {
     va_end(ap);
     VALUE data = mr_const("Data");
     /* (0 is Data; anything else is the superclass, as struct.c's
-     *  anonymous_struct takes it -- nil included, which rb_class_new refuses) */
+     *  anonymous_struct takes it -- nil included, which Check_Type refuses) */
     VALUE base = super == 0 ? data : super;
-    if (!RB_TYPE_P(base, T_CLASS))
-        rb_raise(rb_eTypeError, "superclass must be an instance of Class (given an instance of %s)", rb_obj_classname(base));
+    Check_Type(base, T_CLASS);   /* (rb_class_new's own check, and its words) */
     /* (a class outside Data: ruby sets up a Data-shaped class under it
      *  -- members, new, [] -- without Data's own methods; not offered) */
     if (base != data && !RTEST(mr_call(base, "<", 1, data)))

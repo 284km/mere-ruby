@@ -24,21 +24,39 @@
 
 extern const void *mr_capi_frame(void);
 
-static int view_cmp(st_data_t a, st_data_t b) { return rb_eql((VALUE)a, (VALUE)b) ? 0 : 1; }
+/* (set while a sync runs, and while st.c is inside one of the callbacks
+ *  below: the requests they make are not synced -- a sync there would
+ *  rebuild the very table st.c is walking) */
+static int syncing;
+
+static int view_cmp(st_data_t a, st_data_t b) {
+    syncing++;
+    int r = rb_eql((VALUE)a, (VALUE)b) ? 0 : 1;
+    syncing--;
+    return r;
+}
 static st_index_t view_hash(st_data_t key) {
+    syncing++;
     VALUE h = rb_hash((VALUE)key);
     if (!FIXNUM_P(h)) h = rb_hash(h);   /* (an Integer's own #hash is a Fixnum) */
+    syncing--;
     return (st_index_t)FIX2LONG(h);
 }
 static const struct st_hash_type view_type = { view_cmp, view_hash };
 /* (compare_by_identity: the same OBJECT, as equal? says -- two handles can
  *  name one Bignum, so the handle's bits are not the identity) */
 static int ident_cmp(st_data_t a, st_data_t b) {
-    return (VALUE)a == (VALUE)b || RTEST(mr_call((VALUE)a, "equal?", 1, (VALUE)b)) ? 0 : 1;
+    if ((VALUE)a == (VALUE)b) return 0;
+    syncing++;
+    int r = RTEST(mr_call((VALUE)a, "equal?", 1, (VALUE)b)) ? 0 : 1;
+    syncing--;
+    return r;
 }
 static st_index_t ident_hash(st_data_t key) {
+    syncing++;
     VALUE id = mr_call((VALUE)key, "object_id", 0);
     if (!FIXNUM_P(id)) id = rb_hash(id);
+    syncing--;
     return (st_index_t)FIX2LONG(id);
 }
 static const struct st_hash_type ident_type = { ident_cmp, ident_hash };
@@ -113,7 +131,6 @@ static int put_i(st_data_t key, st_data_t value, st_data_t arg) {
 }
 /* (one table's changes into its Hash, if it has any; the caller holds the
  *  syncing guard, so the requests this makes are not synced again) */
-static int syncing;
 static void sync_out_view(struct view *v) {
     struct same s = { v->before, v->count, 0, 1 };
     st_foreach(v->tbl, same_i, (st_data_t)&s);

@@ -81,3 +81,11 @@ scheduler's interrupt (an unblock function run by a signal), Bug 14834
 - The count: 17 of the 28 target tests fail on main without this PR and
   pass with it (the body said 19, counting test_have_library's 2, which were
   reverted). The base is main c521aa58.
+- (while checking the above) Two faults of the first version of the sync,
+  found by the new contracts: the sync's own requests overwrote what the
+  request being made had put in transit (its arguments -- a block got :x
+  for the Hash), so mr_up keeps the transit aside around each sync; and a
+  request made from inside the table's own hash or compare function (an
+  identity table asks #object_id) synced, rebuilding the table st.c was
+  walking -- those callbacks hold the sync off. rb_data_define checks with
+  Check_Type, as rb_class_new does (struct_spec expects its words).
