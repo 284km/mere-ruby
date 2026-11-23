@@ -4,6 +4,10 @@ The other documents describe the SUBJECT. This one describes the LOOP: how
 long it takes to get from an edit to a landed commit, where that time actually
 goes, and what each attempt to shorten it was worth.
 
+> **Since 2026-11-23, new records go in [`loop/`](loop/README.md), one file per
+> change.** This file is the history up to then; do not append to it. The
+> per-stream corpus number ranges are in `loop/README.md`.
+
 It exists because the first honest measurement of this loop was a surprise.
 The sweep is 95% of a cycle, and more than half of the sweep was the harness
 copying a directory tree that never changes. Nobody would have guessed that;
@@ -11571,51 +11575,133 @@ Third round (on 7871475d, nits):
   Left: ruby makes a Thread whose body ends with errinfo set raise it from
   #value / #join; here #value is the body's value.
 
-## 2026-11-23: the test extensions' C API, first part (note 553 §7, PR-1)
+## 2026-11-22: CRuby's bignum.c, compiled as it is -- the algorithms an extension names
 
-main's last green CI (`2e2ab568`) has 881 RED; about 230 of them in the C
-extension tests (`-ext-`, mkmf, rubygems' ext, `ruby/test_bignum`). This is
-the first of the PRs that take them down (the plan is note 553 §7).
+Note 553 §4 decided (b): the 27 RED of test/-ext-/bignum (test_mul 19,
+test_big2str 2, test_str2big 3, test_bigzero 2, test_div 1) call CRuby's
+internal algorithms by name -- rb_big_mul_karatsuba, rb_big_mul_toom3,
+rb_big2str_generic, rb_str2big_karatsuba, rb_big_divrem_normal, ... -- and
+answering them with this interpreter's one multiplication would be a claim.
+So CRuby's bignum.c is now in capi/vendor, unchanged, and those algorithms
+run as CRuby runs them. Locally all 31 tests of those five files pass (and
+test_pack's 28 still do); CI compares both sides.
 
-- **rb_rational_raw** keeps the pair as it is (42/2 stays 42/2): a request of
-  its own (MR_RAT_RAW) makes the VRat without mk_rat_s's reduction. It
-  refused such a pair before. **rb_gcd_normal** is rational.c's Euclid by
-  remainders (it was in unsupported.c). test_rat: 4/4.
-- **rb_str_normalize_ospath** (Apple only, as in file.c, capi/ospath.c):
-  NFC by segments, the HFS+ ranges copied as they are, a bad byte U+FFFD;
-  the composition is String#unicode_normalize(:nfc). test_normalize: 4/4.
-- **rb_data_define(super, ...)** under a class Data.define made: Data's own
-  ::define, bound to that class (the class has none: it is undefined there,
-  as in ruby). test_data: 2/2.
-- **rb_f_notimplement** methods: C's define_method notes them (MR_NOTIMPL),
-  and the interpreter keeps them in capi_notimpl -- listed by methods(false),
-  calling one raises NotImplementedError, and respond_to? (which then asks
-  respond_to_missing?), method_defined? and its three kin say false;
-  Method#inspect says "(not-implemented)". test_notimplement: 6/6.
-- **mkmf**: MAKEFILE_CONFIG has libdir `$(exec_prefix)/lib` and exec_prefix
-  `$(prefix)` as configure writes them (dir_config takes the lib basename
-  from libdir). **ruby_init / ruby_setup** answer as they do in a running
-  interpreter (return at once), so the import library has them and
-  `have_func("ruby_init")` links. test_have_func 2/2, test_config 5/5.
-  Not test_have_library (2): its archive takes a "lib" prefix from
-  LIBRUBY_A, which is "" here -- and must stay equal to LIBRUBY, or mkmf
-  links every extension against LIBRUBYARG (mkmf.rb's `LIBRUBY !=
-  LIBRUBY_A`; tried, and the import library's stubs then answered C).
+**What it took.** bignum.c compiles against this C API's headers with seven
+more of CRuby's internal headers, copied unchanged, and two stand-ins:
+`id.h` (seven method IDs, interned by name) and `internal/gc.h` (NEWOBJ_OF
+and two slot-size questions; the real one includes vm_core.h).
+capi/tools/headers_check.py holds the copies to the ruby tree. Every function
+bignum.c defines is renamed (mr_vbig_*) before any header is read, inside
+capi/bignum_cruby.c only, so it calls its own and the C API's own Integer
+functions (numeric.c, bignum.c of capi/) stay as they are; the twelve
+algorithms by name leave capi/unsupported.c and are given under ruby's names.
+What bignum.c asks of the rest of CRuby (rb_int_plus and friends, a ulong
+isqrt) is written in the public API's terms; the one Complex corner
+(rb_dbl_complex_new_polar_pi, a negative Bignum to a fractional power) is a
+named NotImplementedError, and unreachable from the exported names.
 
-- **RHASH_TBL / rb_hash_tbl** (capi/hashtbl.c): C gets an st_table of its
-  own, filled from the Hash (the same objects, the Hash's order, compared by
-  #hash / #eql?, or by identity for compare_by_identity), which st.c's
-  functions read and change. What C changed goes back to the Hash when the
-  C call that asked ends (the Hash then has the table's pairs in its order);
-  asked again in the call, the same table. Ruby code C runs in between sees
-  the Hash as it was: the write-back is at the end of the call. test_update
-  (st_update: insert, keep, delete, replace, the same key and value
-  objects): 5/5.
+**A Bignum it makes is a C struct.** bignum.c makes one with NEWOBJ_OF, turns
+the pointer into its VALUE (`bigv = (VALUE)big`) and reads it through a cast;
+and an extension that includes internal/bignum.h does the same
+(ext/-test-/bignum/bigzero.c writes BIGNUM_DIGITS of what rb_big_new gave
+it). A handle is no address, so such a Bignum is a RAW one: the struct's
+address is its VALUE. RBASIC() answers the struct itself (rb_mere_basic),
+so its type, sign, length and frozen bit are read and written as bignum.c
+does. Where one reaches the interpreter -- an up-call's arguments, the
+transit words, what the C call returns (core.c) -- it becomes the Integer its
+digits say (mr_vbig_out; mr_put_words converts BEFORE it sets the words,
+because making the Integer is an up-call that keeps and puts back what is
+in transit). It is freed when the C call that made it ends, unless bignum.c
+keeps it for good (its radix power cache, rb_vm_register_global_object),
+and those are listed apart so the end of a C call does not walk them. The
+other way, an Integer the interpreter has is a handle or a Fixnum: the entry
+points give bignum.c a raw Bignum with the same digits. Nothing changes for
+a program that never calls these: every hook starts with "are there any raw
+Bignums at all".
 
-Looked at and left for the later PRs (note 553 §7): rb_econv_str_append
-(needs the rb_econv_t of an Encoding::Converter, which is no C data here --
-the whole rb_econv_* family together), Bug 3571 (a C method has no frame in
-the backtrace, and a C block is labelled `block in`), MyInteger (Integer's
-to_f / <=> on a C subclass of Integer should raise NotImplementedError), the
-scheduler's interrupt (an unblock function run by a signal), Bug 14834
-(rb_tracepoint_new).
+**GMP.** The reference links GMP 6.3.0; this build does not. The four *_gmp
+tests rescue NotImplementedError, which is what a ruby built without GMP
+answers, so they pass on both sides without a new build dependency.
+
+Unchanged: ruby/test_bignum.rb 65/74, ruby/spec optional/capi bignum_spec
+105 = reference, integer_spec 60 = reference, numeric_spec 90 (reference 93,
+as recorded), capi_check, corpus.
+
+The future form (note 553 §6.1-5, a separate arc): this interpreter's
+Integer in binary limbs, with Karatsuba and Toom-3 written in Mere; then
+the C names can point there and bignum.c leaves.
+
+### PR #158 review
+
+- **[Minor] A raw Bignum C keeps past its call was freed anyway.** rb_big_new
+  is public API and returns one. Now kept for good when C keeps it the
+  public ways: rb_gc_register_mark_object and rb_gc_mark / _movable / _maybe
+  (capi/gc.c hand a raw one to mr_vbig_keep), or a registered address
+  (rb_gc_register_address, rb_global_variable) that holds it when its call
+  ends (mr_vbig_leave asks mr_gc_address_holds). One only stored in a struct
+  and marked by a later collection is still freed with its call; the header
+  comment says so. capi/check: a Bignum made in Init_ and kept each way is
+  still 0 after GC.start, two calls later, on both sides.
+- **[Suggestion] Membership was a linear scan on every RBASIC().** An
+  open-addressing set of addresses answers it in O(1); the two lists stay
+  for the walk at the end of a call. (First version removed an address from
+  the set before freeing it -- raw_free reads the flags through RBASIC, and
+  every test/-ext-/bignum file stopped at its first raw Bignum. Freed first,
+  removed after.) Toom-3 on 3**60000 x 7**50000 and big2str_generic of the
+  product (70,883 digits): 2.3 s.
+- (re-review) **[Minor] a raw Bignum a registered address held was kept
+  forever**, even after the slot was overwritten (82 MB over 20,000 calls).
+  Those go to a list of their own now (held), checked at the end of every C
+  call: freed once no registered address holds them. The reviewer's pattern
+  (`last = rb_big_new(1000, 1)` on a registered `last`, 20,000 times) grows
+  RSS by -3 MB, and `last` still reads 0. One kept by rb_gc_mark from a
+  dmark is still kept for good (the rarer case; the header says so).
+- (re-review 2) **[Major] that sweep freed one a C local still had.** It ran
+  at the end of every C call, a nested one too: `old = slot; slot = Qnil;`,
+  then rb_funcall / rb_block_call into C, then `old` -- [BUG] "not an
+  object", where CRuby's collection sees `old` on the C stack. The held ones
+  are looked at again only when no C call is in progress on any stack
+  (frame.prev is NULL, and no Fiber has a chain of C calls parked). A
+  call's own temporaries still go at its end, as before. capi/check: the
+  pattern, both ways in, reads 0 after GC.start on both sides.
+- (re-review 2) **[Suggestion] the sweep cost (held x registered addresses)
+  per call.** The addresses are read once per sweep into a set of the raw
+  Bignums they hold (mr_gc_each_address_value), so it is O(addresses +
+  held), and nothing is read at the end of a call that made no raw Bignum
+  while the outer one is still running.
+- (re-review 3) **[Minor] one Fiber paused inside C stopped the sweep for
+  good** (no parked chain at all was the condition): a Fiber dropped inside
+  a C call, or an external Enumerator over a C #each left after one #next,
+  and every overwritten slot stayed (+84 MB per 20,000). A parked chain's C
+  locals do not run while it is parked, so they can have only what was made
+  before it was: every raw Bignum has a birth number (mr_vbig_seq), each
+  park notes it, and the sweep keeps only the held ones born before the
+  newest park. The reviewer's pattern: +2 MB, then +2 MB (ruby: +13, +0).
+  capi/check: a C local on a Fiber paused inside rb_yield still reads its
+  value after the slot is overwritten from outside, GC.start and a call.
+- (re-review 3) **[Suggestion] the holder set was sized from mr_vbig_live
+  at its largest**, and cleared whole on every sweep. It is sized from the
+  registered addresses (all it can hold), grown or shrunk to that. An empty
+  C call after one that made 100,000 temporaries: 3.6 us (3.6 before it).
+- (re-review 4) **[Minor] a Fiber that pauses again and again inside one C
+  call kept one held raw Bignum per pause** (the newest park's birth number
+  moved on each time, and what was held at each pause stayed). The birth
+  numbers are gone: when a stack pauses inside C, the words of its C frames
+  -- from the switch (registers spilled by setjmp, read from a callee below
+  it) up to its outermost C call -- are read once, and the raw Bignums
+  among them stay until it resumes (mr_vbig_park / mr_vbig_unpark), as
+  CRuby's collection marks a suspended Fiber's stack. With a C #each that
+  yields for ever, driven by Enumerator#next with a churn of the slot
+  between: 1 held, nothing pinned, every 5,000 calls. The RSS that still
+  grows there is Enumerator#next's own: `[1].cycle.next` alone grows the
+  same, on main too, with no C at all.
+- (re-review 5) **[Minor] asking whether a value was pinned walked every
+  pinned word**, so the end of a C call cost (held + temporaries) x (words
+  pinned): 1,000 Fibers each paused with a raw Bignum in a C local made an
+  empty C call 423 us. Each pinned word is counted in a set of its own
+  (value -> words), so the question is O(1): 9.9 us with 1,000 paused (5.1
+  with none), the paused locals still read 0. **[Suggestion]** a pause reads
+  its stack only when there are temporaries or held ones (what is kept for
+  good never goes), and the registers are spilled with
+  __builtin_unwind_init() before setjmp (glibc's x86_64 setjmp stores rbp
+  mangled).
