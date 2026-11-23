@@ -538,4 +538,14 @@ paused.resume
 GC.start
 A.noop
 check(paused.resume == 0)
+# (RHASH_TBL: what C put in the table reaches the Hash before Ruby runs,
+#  survives a collection, and what Ruby and rb_hash_aset changed comes back)
+h = {a: 1}
+r = A.tbl_insert_yield(h) { |hh| GC.start; hh[:z] = 3; hh[:x] }
+check(r == ["ababab", 3, 4])
+check(h == {a: 1, x: "ababab", z: 3, y: 2})
+big = 2**80
+ih = {}.compare_by_identity
+ih[big] = :b
+check(A.tbl_lookup(ih, big) == :b)
 puts "api contracts: #{$count} passed"

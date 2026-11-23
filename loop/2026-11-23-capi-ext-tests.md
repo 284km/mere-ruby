@@ -46,3 +46,38 @@ the backtrace, and a C block is labelled `block in`), MyInteger (Integer's
 to_f / <=> on a C subclass of Integer should raise NotImplementedError), the
 scheduler's interrupt (an unblock function run by a signal), Bug 14834
 (rb_tracepoint_new).
+
+## Review of #170 (work2026-fd)
+
+- **[Critical] the RHASH_TBL table was no root**: a value C made by a call
+  and put only in the table lost its number to a collection before the
+  write-back. Every key and value of a live table is a root now
+  (mr_hash_tables_root_at, from capi/gc.c's mr_capi_roots).
+- **[Major] the Hash and the table drifted apart during the call** (one
+  write-back at the end, by clear and refill): the two are kept in step at
+  every request C makes (core.c's mr_up). What C changed in the table goes
+  to the Hash before the request (sync_out); after a request that can write,
+  what the interpreter changed in the Hash comes back into the table
+  (sync_in, only when it differs, so st_update's own callback finds its
+  table as it left it). A guard keeps the syncs' own requests from syncing.
+  capi/check: a value put only in the table survives GC.start in a block,
+  the block's `h[:z] = 3` and a later rb_hash_aset both stay, and C finds
+  :z in the table after the block -- on both sides.
+- **[Minor] compare_by_identity compared handle bits**: the table compares
+  with #equal? and hashes by #object_id; capi/check finds a Bignum key by
+  the same object.
+- **[Minor] rb_f_notimplement notes**: a later definition of the name clears
+  the note (set_meth / set_fresh_meth), and C notes its own after defining;
+  a class method looks up the superclass chain (Sub.respond_to? is false
+  for Parent's); Method#inspect says "(not-implemented)" after the name and
+  before the parameters, as proc.c does.
+- **[Minor] RbConfig::CONFIG["exec_prefix"]** is the prefix, so the
+  MAKEFILE_CONFIG libdir expands.
+- **[Minor] rb_data_define**: 0 is Data; nil or any non-class is
+  rb_class_new's TypeError; a class outside Data is refused by name
+  (ruby builds a Data-shaped class under it -- not offered).
+- **[Suggestion] op 29's comment** sits on op 29. Left: `Rational.raw(42, 2)
+  + 1` is (22/1) here and (44/2) in ruby -- the arithmetic reduces.
+- The count: 17 of the 28 target tests fail on main without this PR and
+  pass with it (the body said 19, counting test_have_library's 2, which were
+  reverted). The base is main c521aa58.

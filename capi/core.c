@@ -25,6 +25,10 @@ struct mr_frame {
     int raised;
 };
 static struct mr_frame *cur;
+/* (a Hash C has as an st_table: capi/hashtbl.c) */
+extern int mr_hash_tables_live(void);
+extern void mr_hash_tables_sync_out(void);
+extern void mr_hash_tables_sync_in(void);
 static VALUE c_errinfo = Qnil;   /* rb_errinfo's (mr_frame_errinfo, below) */
 static int depth;
 unsigned long mr_epoch = 1;
@@ -188,12 +192,17 @@ VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
         a = mr_vbig_out(a); b = mr_vbig_out(b); c = mr_vbig_out(c); d = mr_vbig_out(d); e = mr_vbig_out(e);
     }
     if (!reads_only(op) && op != MR_STR_SET && op != MR_ARY_SET) mr_mirrors_flush();
+    /* (a Hash C has as an st_table gets what C changed in it first, and the
+     *  table what the request changed in the Hash after: capi/hashtbl.c) */
+    int hash_views = mr_hash_tables_live();
+    if (hash_views) mr_hash_tables_sync_out();
     CapiReq request = { op, (long long)a, (long long)b, (long long)c, (long long)d, (long long)e };
     stats[ST_UP]++;
     frame->raised = 0;
     long long answer = frame->up.fn(frame->up.env, request);
     if (cur != frame) mr_fatal("the calls in progress are out of step");
     if (!reads_only(op)) mr_epoch++;
+    if (hash_views && !reads_only(op)) mr_hash_tables_sync_in();
     if (frame->raised) {
         frame->raised = 0;
         mr_throw(frame->outcome);

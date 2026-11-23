@@ -259,8 +259,30 @@ static VALUE slot_swap_yield(VALUE self) {
     rb_yield(Qnil);
     return old;
 }
+/* (a Hash as C's st_table: a value made by a call and put only in the
+ *  table, then a block -- which collects and changes the Hash -- then
+ *  rb_hash_aset; and a lookup in a compare_by_identity Hash) */
+#include <ruby/st.h>
+static VALUE tbl_insert_yield(VALUE self, VALUE hash) {
+    (void)self;
+    st_table *tbl = RHASH_TBL(hash);
+    VALUE made = rb_funcall(rb_str_new_cstr("ab"), rb_intern("*"), 1, INT2FIX(3));
+    st_insert(tbl, (st_data_t)ID2SYM(rb_intern("x")), (st_data_t)made);
+    VALUE seen = rb_yield(hash);
+    rb_hash_aset(hash, ID2SYM(rb_intern("y")), INT2FIX(2));
+    st_data_t z = 0;
+    int found = st_lookup(RHASH_TBL(hash), (st_data_t)ID2SYM(rb_intern("z")), &z);
+    return rb_ary_new_from_args(3, seen, found ? (VALUE)z : Qnil, LONG2NUM((long)RHASH_TBL(hash)->num_entries));
+}
+static VALUE tbl_lookup(VALUE self, VALUE hash, VALUE key) {
+    (void)self;
+    st_data_t v = 0;
+    return st_lookup(RHASH_TBL(hash), (st_data_t)key, &v) ? (VALUE)v : ID2SYM(rb_intern("missing"));
+}
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
+    rb_define_singleton_method(mod, "tbl_insert_yield", tbl_insert_yield, 1);
+    rb_define_singleton_method(mod, "tbl_lookup", tbl_lookup, 2);
     rb_define_singleton_method(mod, "funcall_public", funcall_public, 2);
     rb_define_singleton_method(mod, "enc_index_of", enc_index_of, 1);
     rb_define_singleton_method(mod, "define_dummy", define_dummy, 1);

@@ -290,8 +290,15 @@ VALUE rb_data_define(VALUE super, ...) {
     while ((member = va_arg(ap, const char *)) != NULL) rb_ary_push(members, ID2SYM(rb_intern(member)));
     va_end(ap);
     VALUE data = mr_const("Data");
-    VALUE base = (super == 0 || NIL_P(super)) ? data : super;
-    if (!RB_TYPE_P(base, T_CLASS)) rb_raise(rb_eTypeError, "wrong argument type %s (expected Class)", rb_obj_classname(base));
+    /* (0 is Data; anything else is the superclass, as struct.c's
+     *  anonymous_struct takes it -- nil included, which rb_class_new refuses) */
+    VALUE base = super == 0 ? data : super;
+    if (!RB_TYPE_P(base, T_CLASS))
+        rb_raise(rb_eTypeError, "superclass must be an instance of Class (given an instance of %s)", rb_obj_classname(base));
+    /* (a class outside Data: ruby sets up a Data-shaped class under it
+     *  -- members, new, [] -- without Data's own methods; not offered) */
+    if (base != data && !RTEST(mr_call(base, "<", 1, data)))
+        mr_unsupported("rb_data_define with a superclass outside Data");
     if (base == data)
         return mr_callv(data, rb_intern("define"), RARRAY_LENINT(members), RARRAY_CONST_PTR(members), Qnil, 0);
     /* (a class Data.define made has no ::define of its own -- it is undefined

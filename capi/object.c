@@ -89,21 +89,21 @@ static void define_method(VALUE klass, const char *name, VALUE (*fn)(ANYARGS), i
     long number = mr_register_function((void *)fn, arity);
     VALUE body = mr_up(MR_PROC_NEW, (VALUE)number, (VALUE)(long)arity, 2, (VALUE)rb_intern(name), 0);
     VALUE sym = ID2SYM(rb_intern(name));
-    /* (rb_f_notimplement: an entry that is no method -- see capi_notimpl) */
+    if (kind == MR_M_SINGLETON) mr_callv(klass, rb_intern("define_singleton_method"), 1, &sym, body, 0);
+    else {
+        mr_callv(klass, rb_intern("define_method"), 1, &sym, body, 0);
+        if (kind == MR_M_PRIVATE) mr_call(klass, "private", 1, sym);
+        else if (kind == MR_M_PROTECTED) mr_call(klass, "protected", 1, sym);
+        else if (kind == MR_M_MODULE_FUNCTION) {
+            mr_call(klass, "private", 1, sym);
+            mr_callv(klass, rb_intern("define_singleton_method"), 1, &sym, body, 0);
+        }
+    }
+    /* (rb_f_notimplement: an entry that is no method -- see capi_notimpl.
+     *  Noted after the definition, which clears any note of the name.) */
     if (fn == (VALUE (*)(ANYARGS))rb_f_notimplement) {
         mr_put_text(name);
         mr_up2(MR_NOTIMPL, klass, kind == MR_M_SINGLETON ? 1 : kind == MR_M_MODULE_FUNCTION ? 2 : 0);
-    }
-    if (kind == MR_M_SINGLETON) {
-        mr_callv(klass, rb_intern("define_singleton_method"), 1, &sym, body, 0);
-        return;
-    }
-    mr_callv(klass, rb_intern("define_method"), 1, &sym, body, 0);
-    if (kind == MR_M_PRIVATE) mr_call(klass, "private", 1, sym);
-    else if (kind == MR_M_PROTECTED) mr_call(klass, "protected", 1, sym);
-    else if (kind == MR_M_MODULE_FUNCTION) {
-        mr_call(klass, "private", 1, sym);
-        mr_callv(klass, rb_intern("define_singleton_method"), 1, &sym, body, 0);
     }
 }
 #undef rb_define_method
