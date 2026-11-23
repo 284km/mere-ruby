@@ -34,6 +34,9 @@ static VALUE ary_ptr_after_yield(VALUE self, VALUE ary) {
     return ary;
 }
 static VALUE noop(VALUE self) { (void)self; return Qnil; }
+/* rb_check_id: is the name an ID already (true), without making it one */
+static VALUE check_id(VALUE self, VALUE name) { (void)self; return rb_check_id(&name) ? Qtrue : Qfalse; }
+static VALUE check_symbol(VALUE self, VALUE name) { (void)self; return rb_check_symbol(&name); }
 
 /* The primitives are ruby's own operations, whatever a subclass defines
  * under the same name. */
@@ -282,6 +285,8 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "ary_ptr_after_yield", ary_ptr_after_yield, 1);
     rb_define_singleton_method(mod, "byte_after_yield", byte_after_yield, 2);
     rb_define_singleton_method(mod, "noop", noop, 0);
+    rb_define_singleton_method(mod, "check_id", check_id, 1);
+    rb_define_singleton_method(mod, "check_symbol", check_symbol, 1);
     rb_define_singleton_method(mod, "push", push, 2);
     rb_define_singleton_method(mod, "append", append, 2);
     rb_define_singleton_method(mod, "length", length, 1);

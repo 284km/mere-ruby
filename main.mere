@@ -7046,6 +7046,10 @@ and const_seg_last = fn (key: str) ->
   let i9 = dcolon_at key 0 in
   if i9 + 2 >= str_len key then key else const_seg_last (substring key (i9 + 2) (str_len key))
 and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
+  // (a constant's name is a Symbol, pinned down -- a dynamic one too, as
+  //  ruby's const_set pins it)
+  let _ = (let b9 = const_seg_last key in
+           if str_len b9 == 0 then () else map_set sym_all b9 VNil) in
   // (a constant a SHIPPED library defines is the interpreter's: where ruby
   //  has a C extension -- cgi/escape's escapeHTML -- this one runs the Ruby
   //  fallback, and its tables are C data to ruby. A non-main ractor reads
@@ -8261,6 +8265,20 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
   else if r.op == 28 then
     (if r.a == 0 then (if map_has rx_depth "limit" then map_get rx_depth "limit" else 4096)
      else (let _ = (if r.b <= 0 then map_delete rx_depth "limit" else map_set rx_depth "limit" r.b) in 0))
+  // rb_check_id / rb_check_symbol: is the name (a String, or a Symbol's) a
+  // Symbol already -- 0 no, 1 a dynamic one (#to_sym made it), 2 pinned down
+  // (source wrote it). Asking makes nothing; the key is #to_sym's.
+  else if r.op == 31 then
+    (let nm9 = (match capi_in r.a with
+                | VStr h9 ->
+                  (let s9 = sget h9 in
+                   let e9 = enc_canon_name (senc_get h9) in
+                   if (enc_all7 s9 && enc_ascii_compat e9) || str_eq e9 "UTF-8" then s9 else name_u8 s9 e9)
+                | VSym s9 -> s9
+                | _ -> "") in
+     let _ = sym_builtins_ensure () in
+     if str_len nm9 == 0 || (if map_has sym_all nm9 then false else true) then 0
+     else (match map_get sym_all nm9 with VBool _ -> 1 | _ -> 2))
   else (let _ = raise_exc world "NotImplementedError" ("C API: request " ++ str_of_int r.op ++ " is not answered") in 0)
 // Run C and come back with its value, or with what left it raised again.
 and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) ->
@@ -15771,7 +15789,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      else if (str_len m9 == 5 && str_eq m9 "using") && (if pub9 then false else true)
              && main_like world recv0 then
        do_using_main env world rest9
-     else invoke_val_c env world blk recv0 m9 rest9 pub9)
+     else send_str_named world args0 recv0 m9 (fn (u: unit) -> invoke_val_c env world blk recv0 m9 rest9 pub9))
   // `Class.allocate` is a class that was never initialized: it has no
   // superclass to name, and cannot be made a subclass of Class
   else if (str_eq name0 "superclass" || (str_eq name0 "initialize" && (match args0 with Cons (VClass cc9, _) -> str_eq cc9 "Class" | _ -> false)))
@@ -18917,7 +18935,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                    // the file loads)
                                    || ((match recv with VClass _ -> true | _ -> false)
                                        && (if str_eq (builtin_frame_label world recv nm) "" then false else true))
-                              else responds world recv nm)
+                              else responds world recv nm
+                                   // (...and a CLASS's #respond_to_missing? is its
+                                   //  singleton's, which `responds` does not ask:
+                                   //  #public_method asks it, private false)
+                                   || (match recv with
+                                       | VClass c9 ->
+                                         has_meth world ("(sng:" ++ c9 ++ ")") "respond_to_missing?"
+                                         && truthy (invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
+                                                      recv "respond_to_missing?" (Cons (VSym nm, Cons (VBool false, Nil))) false)
+                                       | _ -> false))
                              || is_binary_op_name nm
                              // ⚠ ...and #public_method does NOT: it asks the
                              //   same question #respond_to? asks, which is
@@ -18932,7 +18959,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                              //   statement) is still a Method. `responds` asks
                              //   with false, which is right for respond_to?
                              //   and wrong here.
-                                 (let cls9 = dispatch_cls_of world recv in
+                                 // (a CLASS receiver's hook is its singleton's:
+                                 //  `def self.respond_to_missing?`)
+                                 (let cls9 = (match recv with VClass c9 -> "(sng:" ++ c9 ++ ")" | _ -> dispatch_cls_of world recv) in
                                  has_meth world cls9 "respond_to_missing?"
                                  && truthy (invoke_val_c gc_cenv0 world
                                               (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
@@ -19000,8 +19029,26 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            else if has_own_meth world a9 nm then a9
                            else walk9 t9)) in
                      walk9 (ancestors_of world sng))) in
+     // ⚠ a name that is no pinned Symbol (a String no Symbol has, a dynamic
+     //   Symbol) is no singleton method's: ruby asks the singleton's
+     //   #respond_to_missing? for it (private false), and a yes is a Method
+     //   that goes to #method_missing -- rb_obj_singleton_method's `!id`
+     //   branch, Bug #10985. (A pinned name is refused, as there.)
+     let rtm9 = (if str_eq home9 "" && (if str_eq sng "" then false else true)
+                    && (if map_has sym_all nm then (match map_get sym_all nm with VBool _ -> true | _ -> false)
+                        else (match args with Cons (VStr _, _) -> true | _ -> false))
+                    && has_meth world sng "respond_to_missing?"
+                 then truthy (invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
+                                recv "respond_to_missing?" (Cons (VSym nm, Cons (VBool false, Nil))) false)
+                 else false) in
      if (if str_eq home9 "" then false else true)
      then mk_bound_method world recv home9 nm
+     else if rtm9 then
+       (let mv9 = mk_bound_method world recv (value_meth_owner world recv "" nm) nm in
+        let _ = (match mv9 with
+                 | VObj mid9 -> (let (_, _, _, ivars9) = world in iv_put ivars9 (str_of_int mid9 ++ "@~m_mm") (VBool true))
+                 | _ -> ()) in
+        mv9)
      else raise_exc world "NameError"
             // ruby QUOTES the receiver here: "for 'false'", not "for false".
             ("undefined singleton method '" ++ nm ++ "' for '" ++ inspect recv ++ "'"))
@@ -23616,7 +23663,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     // alias_method(new, old): the method form of `alias` — copy the method.
-    else if (str_len name == 12 && str_eq name "alias_method") then
+    // (...unless the class has an alias_method of its own: that one is called,
+    //  and its `super` comes back here through bi_skip, as include's does)
+    else if (str_len name == 12 && str_eq name "alias_method")
+            && (if cls_meth_own world c name && bi_skip_pass name then false else true) then
       (let (methsA, _, _, _) = world in
        match args with
        | Cons (a, Cons (b, _)) ->
@@ -24041,7 +24091,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let plain9 = enc_ascii_compat enc9 in
           let symof9 = fn (s9: str) ->
             if plain9 && enc_all7 s9 && (if map_has sym_enc s9 then false else true) then VSym (sym_note s9)
-            else prim_method (mkstr_e s9 enc9) "to_sym" Nil in
+            // (...pinned down: source wrote it, which is no dynamic Symbol)
+            else (match prim_method (mkstr_e s9 enc9) "to_sym" Nil with
+                  | VSym p9 -> VSym (sym_note p9)
+                  | o9 -> o9) in
           let (nd9, end9) = prism_load_node (bytes_of_str (sget ser9)) pos9 srcv9 (sget inp9) cbase9 enc9 symof9 in
           if end9 < 0 then raise_exc world "RuntimeError" "Prism.__prism_load_node: a node type this build's table does not have"
           else arr_new (Cons (nd9, Cons (VInt end9, Nil))))
@@ -24143,7 +24196,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              //  it is not the program's -- id_of_enc)
              let symof9 = fn (nm9: str) -> fn (enc9: str) ->
                if plain9 && enc_all7 nm9 && (if map_has sym_enc nm9 then false else true) then VSym (sym_note nm9)
-               else prim_method (mkstr_e nm9 (if str_eq enc9 "" then penc9 else enc9)) "to_sym" Nil in
+               // (...pinned down: source wrote it, which is no dynamic Symbol)
+               else (match prim_method (mkstr_e nm9 (if str_eq enc9 "" then penc9 else enc9)) "to_sym" Nil with
+                     | VSym p9 -> VSym (sym_note p9)
+                     | o9 -> o9) in
              let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
              // The literals' values. None of them calls a method a program
              // can redefine: parse.y makes them itself, and a nested parse
@@ -25915,14 +25971,33 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              let withtop9 = first && (str_eq cx "Object" || (inherit9 && (map_has modules cx || str_list_has (ancestors_of world cx) "Object"))) in
              let k9 = seg9 cx sn (if first then inherit9 else true) withtop9 true in
              if str_eq k9 "" then
-               (if has_meth world ("(sng:" ++ cx ++ ")") "const_missing" || has_meth world cx "const_missing" then
+               // (a String that is no Symbol goes to a const_missing only a
+               //  program defined -- made a Symbol to be its argument. Module's
+               //  own refuses it as it is, rb_mod_const_missing given the part.
+               //  A name ruby has as an ID is pinned in sym_all: an identifier
+               //  the source wrote, a constant stored, a builtin's name)
+               (let strnm9 = (match v with
+                              | VStr _ ->
+                                (if map_has sym_all sn then (match map_get sym_all sn with VBool _ -> true | _ -> false)
+                                 else (let _ = sym_builtins_ensure () in (if map_has sym_all sn then false else true)))
+                              | _ -> false) in
+                let basic9 = strnm9
+                             && (let ow9 = owner_anc world (ancestors_of world ("(sng:" ++ cx ++ ")")) "const_missing" in
+                                 str_eq ow9 "" || str_eq ow9 "Module")
+                             && (if has_own_meth world cx "const_missing" then false else true) in
+                if (if basic9 then false else true)
+                   && (has_meth world ("(sng:" ++ cx ++ ")") "const_missing" || has_meth world cx "const_missing") then
                   (let r9 = invoke_val_c env world blk (VClass cx) "const_missing" (Cons (VSym sn, Nil)) false in
                    if str_eq rest8 "" then r9
                    else (match r9 with VClass nc9 -> walk9 nc9 rest8 false | _ -> r9))
                 else raise_exc_iv world "NameError"
                        ("uninitialized constant " ++ (if str_eq cx "Object" then sn else cls_display world cx ++ "::" ++ sn))
                        // (in the name's encoding when it has one: note 444)
-                       (const_name_ivs v sn (Cons (("__name", VSym sn), Cons (("__recv", VClass cx), Nil)))))
+                       // (...and a String that is no Symbol is not made one to
+                       //  be refused: #name is the String, rb_mod_const_missing
+                       //  given the part)
+                       (const_name_ivs v sn (Cons (("__name", (if strnm9 then mkstr sn else VSym sn)),
+                                                   Cons (("__recv", VClass cx), Nil)))))
              else
                (let v9 = map_get consts k9 in
                 let _ = const_read_note world k9 in
@@ -26512,7 +26587,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let mrecv = (if map_has method_cores id then method_core_field id 2 else VMain) in
        if (str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "===") then
          (if map_has ivars (str_of_int id ++ "@~m_mm")
-          then invoke_val_c env world blk mrecv "method_missing" (Cons (VSym mnm, args)) false
+          then (match mrecv with
+                // (a CLASS with no #method_missing of its own reaches
+                //  BasicObject's, which refuses the name -- its own NoMethodError)
+                | VClass c9 when (if has_meth world ("(sng:" ++ c9 ++ ")") "method_missing" then false else true) ->
+                  missing_native_super world mrecv (Cons (VSym mnm, args))
+                | _ -> invoke_val_c env world blk mrecv "method_missing" (Cons (VSym mnm, args)) false)
           // (Struct's own #members, #size, #to_a ... bound to a struct answer
           //  from its member table, whatever a member of that name made of
           //  the method: pp binds Struct#members to every struct it prints,
@@ -33869,7 +33949,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
               let m2 = send_name_arg env world args in
               let rest2 = (match args with Cons (_, r) -> r | Nil -> Nil) in
               let _ = (if vis2 then public_send_guard world recv m2 else ()) in
-              invoke_val_c env world blk recv m2 rest2 vis2))
+              send_str_named world args recv m2 (fn (u: unit) -> invoke_val_c env world blk recv m2 rest2 vis2)))
         // vischeck TRUE: this path is reached with an explicit receiver (a
         // bare call's own methods were dispatched by the caller), and a
         // forwarded private call must refuse -- `def foo(...) = @o.foo(...)`
@@ -33922,7 +34002,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // ...and so is the builtin (private) Enumerator#initialize
        else if (if vis3 then false else true) && (if str_eq (enum_init_cls world recv m3) "" then false else true)
        then enum_init env world recv (enum_init_cls world recv m3) rest3 newblk
-       else invoke_with_block env world blk recv m3 rest3 newblk))
+       else send_str_named world args recv m3 (fn (u: unit) -> invoke_with_block env world blk recv m3 rest3 newblk)))
     else
     // the block path skips invoke_val_c's argument conversion, so the string
     // methods that duck-type their arguments convert here too.
@@ -34024,7 +34104,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
       (let m3 = send_name_arg env world args in
        let rest3 = (match args with Cons (_, r) -> r | Nil -> Nil) in
        let _ = (if (str_len name == 11 && str_eq name "public_send") then public_send_guard world recv m3 else ()) in
-       ub_skip_run (fn (u: unit) -> invoke_with_block env world blk recv m3 rest3 newblk)))
+       ub_skip_run (fn (u: unit) -> send_str_named world args recv m3 (fn (u2: unit) -> invoke_with_block env world blk recv m3 rest3 newblk))))
     // `UnboundMethod#bind_call(obj, ...) { }`: bind, then the Method's #call
     // below with the block. The plain dispatcher's bind_call has no block to
     // hand on, so a method that yields raised "no block given".
@@ -39044,6 +39124,45 @@ and send_name_arg = fn env -> fn world -> fn (args: Val list) ->
      | _ -> (let _ = raise_exc world "TypeError"
                (inspect_w env world other ++ " is not a symbol nor a string") in ""))
   | Nil -> (let _ = raise_exc world "ArgumentError" "no method name given" in "")
+// send / __send__ / public_send by a name that is no pinned Symbol (a String
+// no Symbol has, or a dynamic Symbol's name): ruby does not make it one to
+// fail with it, and the NoMethodError's #name is the String (vm_call_opt_send:
+// rb_check_id answered 0 and gave the name back as a String). The call goes
+// ahead by name here, and the NoMethodError for THIS receiver and name that
+// comes out of it is given the String. (A name ruby has as an ID -- an
+// identifier, a defined method, a builtin -- is pinned in sym_all.)
+and send_str_named = fn world -> fn (args: Val list) -> fn (recv: Val) -> fn (m: str) -> fn (k: unit -> Val) ->
+  let unpinned9 = (if map_has sym_all m then (match map_get sym_all m with VBool _ -> true | _ -> false)
+                   else (let _ = sym_builtins_ensure () in (if map_has sym_all m then false else true))) in
+  let str9 = (match args with
+              | Cons (VStr h9, _) when unpinned9 -> mkstr_e (sget h9) (senc_get h9)
+              | Cons (VSym _, _) when unpinned9 && map_has sym_all m -> mkstr m
+              | _ -> VNil) in
+  match str9 with
+  | VNil -> k ()
+  | _ ->
+    try_or_msg k (fn (msg9: str) ->
+      (let (_, _, _, ivars9) = world in
+       let _ = (match (if map_has ivars9 "$exc" then map_get ivars9 "$exc" else VNil) with
+                | VObj x9 ->
+                  (let kn9 = str_of_int x9 ++ "@__name" in
+                   let kr9 = str_of_int x9 ++ "@__recv" in
+                   if map_has ivars9 kn9 && map_has ivars9 kr9
+                      && (match map_get ivars9 kn9 with VSym s9 -> str_eq s9 m | _ -> false)
+                      && (match (map_get ivars9 kr9, recv) with
+                          | (VObj a9, VObj b9) -> a9 == b9
+                          | (VObj _, _) -> false
+                          | (_, VObj _) -> false
+                          | (a9, b9) -> rb_eq a9 b9)
+                      // (a receiver with a #method_missing of its own was
+                      //  given the name as a Symbol: ruby interns it for that
+                      //  call, and its super's NoMethodError names the Symbol)
+                      && (if has_meth world (match recv with VClass c9 -> "(sng:" ++ c9 ++ ")" | _ -> hng_lookup_cls world recv) "method_missing"
+                          then false else true)
+                   then iv_put ivars9 kn9 str9
+                   else ())
+                | _ -> ()) in
+       fail msg9))
 
 and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val list) ->
   let all = (match args with
@@ -41578,13 +41697,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // with it, because that is what core/exception/full_message compares.
   else if (str_len name == 7 && str_eq name "to_tty?") && (match recv with VClass c8 -> str_eq c8 "Exception" | _ -> false) then VBool false
   else if (str_len name == 11 && str_eq name "all_symbols") && (match recv with VClass c9 -> str_eq c9 "Symbol" | _ -> false) then
-    (let acc9 = map_new () in
-     let _ = map_set acc9 "v" (arr_new (Nil : Val list)) in
+    // (...and every builtin's name, and one pass: the list was appended to
+    //  once per name, quadratic in a table the lexer now fills with every
+    //  identifier)
+    (let _ = sym_builtins_ensure () in
+     let acc9 = map_new () in
      let _ = map_iter sym_all (fn (k9: str) -> fn (_v9: Val) ->
-       (match map_get acc9 "v" with
-        | VArr id9 -> (let _ = arr_set id9 (list_append (deref id9) (Cons (VSym k9, Nil))) in ())
-        | _ -> ())) in
-     map_get acc9 "v")
+       map_set acc9 (str_of_int (map_len acc9)) (VSym k9)) in
+     arr_new (idx_to_list acc9 0 (map_len acc9)))
   else if (str_len name == 6 && str_eq name "to_sym") || (str_len name == 6 && str_eq name "intern") then
     // the symbol KEEPS the string's encoding (recorded aside -- VSym is just
     // the name): ascii-only content is US-ASCII, invalid content refuses.
@@ -41602,7 +41722,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                    else if str_eq e "UTF-8" then (let _ = (if map_has sym_enc s then map_delete sym_enc s else ()) in s)
                    else (let u9 = name_u8 s e in
                          let _ = (if str_eq u9 s then map_set sym_enc s e else ()) in u9)) in
-          let _ = sym_note s in
+          // (a name first made here is a DYNAMIC Symbol: it exists -- all_symbols
+          //  lists it, rb_check_symbol finds it -- but it is not pinned down
+          //  until source names it, so rb_check_id still answers 0 for it, as
+          //  ruby's does for a String#to_sym that nothing has used as an ID.
+          //  sym_all: VNil pinned, false dynamic. capi_up request 31 reads it.
+          //  A name ruby already has as an ID is none of that: an identifier
+          //  the source wrote (the lexer notes those), a method or constant
+          //  defined (set_meth, const_store), a builtin's name
+          //  (sym_builtins_ensure) -- those are in sym_all, pinned.)
+          let _ = (if map_has sym_all s then ()
+                   else (let _ = sym_builtins_ensure () in
+                         if map_has sym_all s then () else map_set sym_all s (VBool false))) in
           VSym s)
      | VSym s -> VSym s
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_sym") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'to_sym'")) in fail "mere-ruby: undefined method 'to_sym'")))
@@ -47039,6 +47170,27 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
      | Cons (gv, _) ->
        // answers the tracers it took off
        (let gn = gvar_trace_name (to_s gv) in
+        // ...and a name that is no global variable is refused, with the name
+        // as it was given: "undefined global variable zq" (rb_f_untrace_var;
+        // a String is not made a Symbol for it)
+        // ruby's global table has every special variable ($_ $< $& ...,
+        // $-w; not $1, a capture is no entry), its named ones, every global
+        // the source names -- read
+        // only or assigned (the lexer notes those, pinned) -- and every one
+        // assigned since (global_vars_of)
+        let nm9 = to_s gv in
+        let c19 = (if str_len nm9 > 1 then char_at nm9 1 else "") in
+        let _ = (if map_has gvar_traces gn then ()
+                 else if str_len nm9 > 1 && str_eq (char_at nm9 0) "$"
+                         && ((str_len nm9 == 2 && (if is_alnum c19 then false else true))
+                             || (str_len nm9 == 3 && str_eq c19 "-")
+                             || str_contains "|$FILENAME|$PROGRAM_NAME|$DEBUG|$VERBOSE|$LOAD_PATH|$LOADED_FEATURES|$stdin|$stdout|$stderr|" ("|" ++ nm9 ++ "|")
+                             || (map_has sym_all nm9 && (match map_get sym_all nm9 with VBool _ -> false | _ -> true))
+                             || (match global_vars_of () with
+                                 | VArr a9 -> list_any_val (deref a9) (fn (x9: Val) -> (match x9 with VSym s9 -> str_eq s9 nm9 | _ -> false))
+                                 | _ -> true)) then ()
+                 else (let _ = raise_exc_iv world "NameError" ("undefined global variable " ++ nm9)
+                                 (Cons (("__name", gv), Nil)) in ())) in
         let had9 = (if map_has gvar_traces gn then Cons (map_get gvar_traces gn, Nil) else Nil) in
         let _ = (if map_has gvar_traces gn then map_delete gvar_traces gn else ()) in
         let _ = (if map_len gvar_traces == 0 && map_has hook_flags "gvt"
@@ -48306,7 +48458,7 @@ and emethod_args = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
           // (main.using, private, reached by send: see do_using_main)
           else if (str_len m == 5 && str_eq m "using") && (if vis then false else true)
                   && main_like world recv then do_using_main env world rest
-          else invoke_val_c env world blk recv m rest vis))
+          else send_str_named world args recv m (fn (u: unit) -> invoke_val_c env world blk recv m rest vis)))
        // ⚠ a class that DEFINES #respond_to? answers with it, and with whatever
        // it returns: this arm used to answer for every receiver, so an override
        // was reached only through the internal probe (which reads it for
@@ -48831,7 +48983,7 @@ and ecall_args = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val
        // (main.using, private, reached by send: see do_using_main)
        else if (str_len m == 5 && str_eq m "using") && (if vis then false else true)
                && main_like world recv then do_using_main env world rest
-       else invoke_val_c env world blk recv m rest vis))
+       else send_str_named world args recv m (fn (u: unit) -> invoke_val_c env world blk recv m rest vis)))
     // enum_for(:m) / to_enum(:m): an Enumerator that drives self.m on #each.
     else if ((str_len name == 8 && str_eq name "enum_for") || (str_len name == 7 && str_eq name "to_enum")) && (if map_has meths name then false else true) then
       // `to_enum(:m, a, b)` records a and b: they are the arguments the
@@ -51660,7 +51812,7 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // Module's mixin entry points remain native ancestors of a Class/Module
   // override. Re-enter with the existing one-call builtin bypass so arity,
   // coercion and frozen checks stay shared with ordinary dispatch.
-  else if (str_eq meth "include" || str_eq meth "prepend")
+  else if (str_eq meth "include" || str_eq meth "prepend" || str_eq meth "alias_method")
           && (match recv with VClass _ -> true | _ -> false) then
     (let _ = map_set bi_skip "n" meth in
      let answer = try_or_msg (fn (u: unit) -> invoke_val_c gc_cenv0 world superblk recv meth args false)
@@ -60514,6 +60666,19 @@ and bo_ensure = fn (u: unit) ->
   if map_has struct_ctr "bo" then ()
   else (let _ = map_set struct_ctr "bo" 1 in
         bo_rows builtin_owner_rows 0 (str_len builtin_owner_rows))
+// Every builtin method's name is a Symbol, pinned down: ruby registers them
+// as IDs at boot, so `"ljust".to_sym` is no dynamic Symbol and rb_check_id
+// finds it. Put into sym_all once, the first time a question needs it
+// (#to_sym of a new name, MR_SYM_STATE, Symbol.all_symbols).
+and sym_builtins_ensure = fn (u: unit) ->
+  if map_has struct_ctr "bos" then ()
+  else
+    (let _ = map_set struct_ctr "bos" 1 in
+     let _ = bo_ensure () in
+     map_iter bi_owner_set (fn (k: str) -> fn (_v: int) ->
+       (let i9 = str_index_of k "#" in
+        let j9 = (if i9 >= 0 then i9 else str_rindex_go k "." (str_len k - 1)) in
+        if j9 >= 0 && j9 + 1 < str_len k then (let _ = sym_note (substring k (j9 + 1) (str_len k)) in ()) else ())))
 and bo_walk = fn (anc: str list) -> fn (name: str) ->
   match anc with
   | Nil -> ""
