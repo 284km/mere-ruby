@@ -89,6 +89,8 @@ static VALUE set_match(VALUE self, VALUE match) { (void)self; rb_backref_set(mat
 static VALUE class_of(VALUE self, VALUE obj) { (void)self; return CLASS_OF(obj); }
 static VALUE version_text(VALUE self) { (void)self; return rb_str_new_cstr(ruby_version); }
 static VALUE write_io_of(VALUE self, VALUE io) { (void)self; return rb_io_get_write_io(io); }
+/* (the descriptor C writes on -- io-console's way to it) */
+static VALUE write_descriptor(VALUE self, VALUE io) { (void)self; return INT2FIX(rb_io_descriptor(rb_io_get_write_io(io))); }
 static VALUE read_pending(VALUE self, VALUE io) { (void)self; rb_io_t *fptr; GetOpenFile(io, fptr); return INT2NUM(rb_io_read_pending(fptr)); }
 static VALUE strtoul_of(VALUE self, VALUE str, VALUE base) {
     char *end;
@@ -233,6 +235,7 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "class_of", class_of, 1);
     rb_define_singleton_method(mod, "version_text", version_text, 0);
     rb_define_singleton_method(mod, "write_io_of", write_io_of, 1);
+    rb_define_singleton_method(mod, "write_descriptor", write_descriptor, 1);
     rb_define_singleton_method(mod, "read_pending", read_pending, 1);
     rb_define_singleton_method(mod, "strtoul", strtoul_of, 2);
     rb_define_singleton_method(mod, "io_facts", io_facts, 1);

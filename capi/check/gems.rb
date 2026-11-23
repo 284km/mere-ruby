@@ -260,6 +260,12 @@ p native.('io/console'), IO.respond_to?(:console)
 # (oflush reaches rb_io_get_write_io: on a duplex pipe, which is no terminal)
 duplex = IO.popen(['cat'], 'r+')
 p((duplex.oflush rescue $!.class))
+# (...and after close_read, on the write descriptor: still no terminal, and
+#  beep writes nowhere else -- not on a file that got the read one's number)
+duplex.close_read
+victim = File.open(File::NULL)
+p((duplex.oflush rescue $!.class), (duplex.beep.equal?(duplex) rescue $!.class))
+victim.close
 duplex.close
 r, w = IO.pipe
 begin

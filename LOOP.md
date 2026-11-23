@@ -11162,6 +11162,19 @@ this Mac; CI is where the four run.)
   the write side into io). capi/check covers both. Left, and said in the
   comment: the writer does not own the descriptor, so C closing it leaves
   io writable, where CRuby's says "closed stream".
+- (re-review 2) **[Minor] after close_read, C wrote on the closed read
+  descriptor.** rb_io_get_write_io answered io, and io.fileno was still the
+  read descriptor close_read had closed: io-console's beep wrote "\a" into
+  whatever file got that number next. IO#fileno (and so rb_io_descriptor)
+  answers the write descriptor once the read half is closed, as CRuby's
+  close_read moves the writer in -- from Ruby too, which differed before
+  this PR. capi/check: the number after close_read is the writer's, both
+  from Ruby and from C. The gem check runs oflush and beep after close_read
+  with a file opened in between (Errno::ENOTTY and the IO, on both sides).
+  Also seen by the reviewer, older than this PR and pure Ruby: a popen'd
+  duplex IO with both halves closed was not closed?, and its child was not
+  waited for. close_read / close_write of the last half open closes the IO
+  now, as ruby's does (capi/check: both orders, closed? and $?.pid).
 - (note) The reference ruby's `gem install prism` peaks at 1.93 GB of the
   check's 2 GiB; run beside another heavy check it hit the limit once
   (MEMORY_LIMIT on the reference side, not mere-ruby's). Run alone it

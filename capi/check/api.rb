@@ -288,9 +288,21 @@ check(A.write_io_of(dio).equal?(dio))
 dio.close
 dio = IO.popen(['cat'], 'r+')
 dw = A.write_io_of(dio)
+wfd = A.write_descriptor(dio)
 dio.close_read
 check(dw.closed? && A.write_io_of(dio).equal?(dio))
+# (...and from then on the IO is its write half: its number, and the one C
+#  writes on, is the writer's -- not the read descriptor close_read closed)
+check(dio.fileno == wfd && A.write_descriptor(dio) == wfd)
 dio.close
+# (both halves closed, in either order: the IO is closed, its child waited for)
+[%i[close_read close_write], %i[close_write close_read]].each do |first, second|
+  dio = IO.popen(['cat'], 'r+')
+  pid = dio.pid
+  dio.send(first)
+  dio.send(second)
+  check(dio.closed? && $?.pid == pid)
+end
 pr.close
 check(A.strtoul('  0x1fz', 0) == [31, 6])
 check(A.strtoul('-12', 10) == [2**64 - 12, 3])
