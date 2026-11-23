@@ -47014,7 +47014,10 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        (match to_path_str noblk world a9 with
         | VStr ph -> (let _ = map_set req_penc "v" (senc_get ph) in
                       let pc9 = (match os_path_conv world (VStr ph) with VStr c9 -> sget c9 | _ -> sget ph) in
-                      rb_load env world pc9 (match rest9 with Cons (w9, _) -> w9 | Nil -> VNil))
+                      // (under its own 'Kernel#load' frame, as ruby's C
+                      //  method has one, below the file's '<top (required)>')
+                      with_builtin_frame world (if lv_has env "self" then lv_get env "self" else VMain) "load"
+                        (fn (u: unit) -> rb_load env world pc9 (match rest9 with Cons (w9, _) -> w9 | Nil -> VNil)))
         | _ -> raise_exc world "TypeError"
                  ("no implicit conversion of " ++ conv_gives_name a9 ++ " into String"))
      | Nil -> VNil)
@@ -52505,9 +52508,11 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
         | Cons (SPreexe _, t) -> nopre9 t
         | Cons (s9, t) -> Cons (s9, nopre9 t)) in
      // (a proc's `return` at the file's top level ends the file: top_return_taken)
+     // (in a '<top (required)>' frame, as require's file is)
      let f = (if preret9 then FNext VNil
-              else try_or_msg (fn (u: unit) -> run_stmts fenv world noblk2 (nopre9 prog2))
-                              (fn (m: str) -> (if top_return_taken () then FNext VNil else fail m))) in
+              else in_scope_frame_pass "<top (required)>" fenv (fn (u0: unit) ->
+                     try_or_msg (fn (u: unit) -> run_stmts fenv world noblk2 (nopre9 prog2))
+                                (fn (m: str) -> (if top_return_taken () then FNext VNil else fail m)))) in
      let _ = rx_call_leave fid9 rx0 (map_has fenv "__captured") in
      let _ = cur_file_set savedcf9 in
      let _ = box_back savedbx9 in
@@ -60698,6 +60703,19 @@ and bi_raise_frame = fn world -> fn (exc_cls: str) ->
      else builtin_frame_label world (if map_has prim_missing "rbr" then map_get prim_missing "rbr" else VNil) n)
   else ""
 and in_scope_frame = fn (label: str) -> fn senv -> fn (body: unit -> Flow) ->
+  let cd = scope_frame_push label senv in
+  let r = try_or body (FRaise VNil) in
+  let _ = scope_frame_pop cd in
+  r
+// ...and the same frame for a body whose failure goes on up as it was (a
+// `throw`, a raise): `load`'s file, which was no frame at all, so its top
+// level read '<main>' where ruby says '<top (required)>'
+and in_scope_frame_pass = fn (label: str) -> fn senv -> fn (body: unit -> Flow) ->
+  let cd = scope_frame_push label senv in
+  let r = try_or_msg body (fn (m: str) -> (let _ = scope_frame_pop cd in fail m)) in
+  let _ = scope_frame_pop cd in
+  r
+and scope_frame_push = fn (label: str) -> fn senv ->
   let cd = (cd_get ()) in
   let _ = fb_wm_call (cd - 1) in
   let _ = cd_set (cd + 1) in
@@ -60708,12 +60726,25 @@ and in_scope_frame = fn (label: str) -> fn senv -> fn (body: unit -> Flow) ->
   let _ = cur_meth_set label in
   let _ = map_set fb_env_at cd senv in
   let _ = map_set senv "__scope" (mkstr label) in
-  let r = try_or body (FRaise VNil) in
+  cd
+// ...a block's frame, for a block body that runs as statements (class_exec,
+// Class.new): the label is block_label's, from the env, which counts it
+and blk_frame_push = fn senv ->
+  let cd = (cd_get ()) in
+  let _ = fb_wm_call (cd - 1) in
+  let _ = cd_set (cd + 1) in
+  let _ = map_set_si call_names_s cd blk_frame_mark in
+  let _ = map_set call_lines cd (cur_line ()) in
+  let _ = (let _ = box_put cd in map_set_si call_files_s cd (cur_file ())) in
+  let _ = map_set_si call_meths_s cd (cur_meth ()) in
+  let _ = map_set fb_env_at cd senv in
+  let _ = map_set senv "__bki" VNil in
+  cd
+and scope_frame_pop = fn (cd: int) ->
   let _ = cd_set cd in
   let _ = cur_line_set (if map_has call_lines cd then map_get call_lines cd else 0) in
   let _ = (let _ = box_take cd in cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "")) in
-  let _ = cur_meth_set (if map_has call_meths_s cd then map_get call_meths_s cd else "") in
-  r
+  cur_meth_set (if map_has call_meths_s cd then map_get call_meths_s cd else "")
 // `<class:Name>` / `<module:Name>`: the last segment of the name
 and scope_label_of = fn (cls: str) ->
   let rec last = fn (i: int) -> fn (from: int) ->
@@ -61113,7 +61144,13 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   //   arena among it, and a pooled env's arena is the NEXT call's frame.
   //   `show(c.module_eval("self"))` answered show's own receiver (and at the
   //   top level, the String "show"): test_eval's module_eval basics.
+  // (...and it is a BLOCK's frame, as ruby runs it: `block in <main>` for the
+  //  body, and one level more for a block written inside it -- rspec's
+  //  example blocks, written in a describe block that class_exec runs, are
+  //  `block (2 levels) in <top (required)>`; they read one level short)
+  let bcd9 = blk_frame_push cenv in
   let r = region RCB { try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) } in
+  let _ = scope_frame_pop bcd9 in
   let _ = blk_env_put cenv in
   let _ = set_lex saved_lex in
   let _ = restore_ref_active saved in
