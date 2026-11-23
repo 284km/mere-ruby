@@ -70,7 +70,14 @@ VALUE rb_define_class(const char *name, VALUE super) { return define_class(Qnil,
 VALUE rb_define_class_under(VALUE outer, const char *name, VALUE super) { return define_class(outer, name, super, 0); }
 VALUE rb_define_class_id(ID id, VALUE super) { return define_class(Qnil, rb_id2name(id), super, 0); }
 VALUE rb_define_class_id_under(VALUE outer, ID id, VALUE super) { return define_class(outer, rb_id2name(id), super, 0); }
-VALUE rb_class_new(VALUE super) { return mr_call(rb_cClass, "new", 1, super); }
+/* class.c's: a subclass, with no `inherited` called -- rb_check_inheritable's
+ * refusals first, in its words */
+VALUE rb_class_new(VALUE super) {
+    if (!RB_TYPE_P(super, T_CLASS)) rb_raise(rb_eTypeError, "superclass must be an instance of Class (given an instance of %"PRIsVALUE")", rb_obj_class(super));
+    if (RB_FL_TEST(super, RUBY_FL_SINGLETON)) rb_raise(rb_eTypeError, "can't make subclass of singleton class");
+    if (super == rb_cClass) rb_raise(rb_eTypeError, "can't make subclass of Class");
+    return mr_call(rb_cClass, "__new_quiet", 1, super);
+}
 VALUE rb_module_new(void) { return mr_call(rb_cModule, "new", 0); }
 VALUE rb_refinement_new(void) { mr_unsupported("rb_refinement_new"); }
 
@@ -150,8 +157,33 @@ VALUE rb_singleton_class(VALUE obj) { return mr_callk(obj, "singleton_class", 0)
 /* ---- constants and variables --------------------------------------------- */
 void rb_define_const(VALUE klass, const char *name, VALUE value) { mr_call(klass, "const_set", 2, ID2SYM(rb_intern(name)), value); }
 void rb_define_global_const(const char *name, VALUE value) { rb_define_const(rb_cObject, name, value); }
-void rb_const_set(VALUE klass, ID id, VALUE value) { mr_call(klass, "const_set", 2, ID2SYM(id), value); }
-VALUE rb_const_get(VALUE klass, ID id) { return mr_call(klass, "const_get", 1, ID2SYM(id)); }
+/* A name that is no constant's ("_INVALID"): CRuby keeps it under an ID that
+ * `constants` and Ruby's const_get do not see, and C finds it again. Kept on
+ * the C side (capi/hidden.c, the table define_class uses for a class of
+ * such a name), out of Ruby's sight. */
+extern int mr_const_name_p(const char *name);
+extern VALUE mr_hidden_const_get(VALUE outer, const char *name, int *found);
+extern void mr_hidden_const_set(VALUE outer, const char *name, VALUE value);
+void rb_const_set(VALUE klass, ID id, VALUE value) {
+    const char *name = rb_id2name(id);
+    if (!mr_const_name_p(name)) { mr_hidden_const_set(klass, name, value); return; }
+    mr_call(klass, "const_set", 2, ID2SYM(id), value);
+}
+VALUE rb_const_get(VALUE klass, ID id) {
+    const char *name = rb_id2name(id);
+    if (!mr_const_name_p(name)) {
+        VALUE ancestors = mr_call(klass, "ancestors", 0);
+        for (long i = 0; i < RARRAY_LEN(ancestors); i++) {
+            int found = 0;
+            VALUE v = mr_hidden_const_get(rb_ary_entry(ancestors, i), name, &found);
+            if (found) return v;
+        }
+        /* (not there: the lookup's own words, not Ruby's refusal of the name) */
+        if (klass == rb_cObject) rb_raise(rb_eNameError, "uninitialized constant %s", name);
+        rb_raise(rb_eNameError, "uninitialized constant %"PRIsVALUE"::%s", rb_class_path(klass), name);
+    }
+    return mr_call(klass, "const_get", 1, ID2SYM(id));
+}
 VALUE rb_const_get_at(VALUE klass, ID id) { return mr_call(klass, "const_get", 2, ID2SYM(id), Qfalse); }
 VALUE rb_const_get_from(VALUE klass, ID id) { return mr_call(klass, "const_get", 1, ID2SYM(id)); }
 int rb_const_defined(VALUE klass, ID id) { return RTEST(mr_call(klass, "const_defined?", 1, ID2SYM(id))); }
@@ -205,7 +237,14 @@ VALUE rb_obj_remove_instance_variable(VALUE obj, VALUE name) { return mr_call(ob
 st_index_t rb_ivar_count(VALUE obj) { return (st_index_t)NUM2LONG(mr_call(rb_obj_instance_variables(obj), "size", 0)); }
 VALUE rb_cvar_get(VALUE klass, ID id) { return mr_call(klass, "class_variable_get", 1, ID2SYM(id)); }
 void rb_cvar_set(VALUE klass, ID id, VALUE value) { mr_call(klass, "class_variable_set", 2, ID2SYM(id), value); }
-VALUE rb_cvar_defined(VALUE klass, ID id) { return mr_call(klass, "class_variable_defined?", 1, ID2SYM(id)); }
+/* (CRuby's lookup reads the class's own table, where its instance variables
+ *  are too: "@x" of the class or an ancestor answers as well as "@@x") */
+VALUE rb_cvar_defined(VALUE klass, ID id) {
+    const char *name = rb_id2name(id);
+    if (name && name[0] == '@' && name[1] != '@')
+        return mr_call(mr_ruby("->(k, n) { k.ancestors.any? { |m| m.instance_variable_defined?(n) } }"), "call", 2, klass, ID2SYM(id));
+    return mr_call(klass, "class_variable_defined?", 1, ID2SYM(id));
+}
 VALUE rb_cv_get(VALUE klass, const char *name) { return rb_cvar_get(klass, rb_intern(name)); }
 void rb_cv_set(VALUE klass, const char *name, VALUE value) { rb_cvar_set(klass, rb_intern(name), value); }
 void rb_define_class_variable(VALUE klass, const char *name, VALUE value) { rb_cvar_set(klass, rb_intern(name), value); }
@@ -217,6 +256,10 @@ static VALUE global_name(const char *name) {
 }
 /* (the value travels as a block's argument, never through source text) */
 VALUE rb_gv_get(const char *name) {
+    /* ($~ is the Ruby frame's that called C -- rb_backref_get -- not the
+     *  frame an eval here would have) */
+    const char *bare = name[0] == '$' ? name + 1 : name;
+    if (!strcmp(bare, "~")) return rb_backref_get();
     return mr_call(mr_ruby("->(n) { eval(n) }"), "call", 1, global_name(name));
 }
 VALUE rb_gv_set(const char *name, VALUE value) {
@@ -239,13 +282,22 @@ const char *rb_class2name(VALUE klass) {
     return StringValueCStr(name);
 }
 const char *rb_obj_classname(VALUE obj) { return rb_class2name(rb_obj_class(obj)); }
-VALUE rb_class_name(VALUE klass) { return mr_call(klass, "name", 0); }
+/* (class.c's: the path of the real class -- "#<Class:0x...>" for one with no name) */
+VALUE rb_class_name(VALUE klass) { return rb_class_path(rb_class_real(klass)); }
 VALUE rb_class_path(VALUE klass) { return mr_call(klass, "to_s", 0); }
 VALUE rb_mod_name(VALUE module) { return mr_call(module, "name", 0); }
 VALUE rb_class_superclass(VALUE klass) { return mr_call(klass, "superclass", 0); }
-VALUE rb_class_get_superclass(VALUE klass) { return mr_call(klass, "superclass", 0); }
+/* (RCLASS_SUPER: false where there is none -- BasicObject's, and a module's) */
+VALUE rb_class_get_superclass(VALUE klass) {
+    if (!RB_TYPE_P(klass, T_CLASS)) return Qfalse;
+    VALUE s = mr_call(klass, "superclass", 0);
+    return NIL_P(s) ? Qfalse : s;
+}
 VALUE rb_mod_ancestors(VALUE module) { return mr_call(module, "ancestors", 0); }
-VALUE rb_class_inherited_p(VALUE module, VALUE other) { return mr_call(module, "<=", 1, other); }
+VALUE rb_class_inherited_p(VALUE module, VALUE other) {
+    if (!RB_TYPE_P(module, T_CLASS) && !RB_TYPE_P(module, T_MODULE)) rb_raise(rb_eTypeError, "compared with non class/module");
+    return mr_call(module, "<=", 1, other);
+}
 VALUE rb_obj_is_kind_of(VALUE obj, VALUE klass) { return mr_callk(obj, "is_a?", 1, klass); }
 VALUE rb_obj_is_instance_of(VALUE obj, VALUE klass) { return mr_callk(obj, "instance_of?", 1, klass); }
 int rb_respond_to(VALUE obj, ID id) { return RTEST(mr_call(obj, "respond_to?", 2, ID2SYM(id), Qtrue)); }
@@ -284,11 +336,16 @@ VALUE rb_obj_dup(VALUE obj) { return mr_callk(obj, "dup", 0); }
 VALUE rb_obj_clone(VALUE obj) { return mr_callk(obj, "clone", 0); }
 VALUE rb_obj_init_copy(VALUE obj, VALUE orig) { (void)orig; return obj; }
 VALUE rb_obj_id(VALUE obj) { return mr_callk(obj, "object_id", 0); }
-VALUE rb_obj_hide(VALUE obj) { return obj; }
-VALUE rb_obj_reveal(VALUE obj, VALUE klass) { (void)klass; return obj; }
+extern void mr_mirror_hide(VALUE obj, int hidden);
+VALUE rb_obj_hide(VALUE obj) { mr_mirror_hide(obj, 1); return obj; }
+VALUE rb_obj_reveal(VALUE obj, VALUE klass) { (void)klass; mr_mirror_hide(obj, 0); return obj; }
 VALUE rb_obj_alloc(VALUE klass) { return mr_call(klass, "allocate", 0); }
 VALUE rb_class_new_instance(int argc, const VALUE *argv, VALUE klass) { return mr_callv(klass, rb_intern("new"), argc, argv, Qnil, 0); }
 VALUE rb_class_new_instance_kw(int argc, const VALUE *argv, VALUE klass, int kw) {
+    /* (keywords passed are a Hash, or one by #to_hash: "no implicit
+     *  conversion of Integer into Hash") */
+    if (kw == RB_PASS_KEYWORDS && argc > 0 && !RB_TYPE_P(argv[argc - 1], T_HASH))
+        rb_convert_type(argv[argc - 1], T_HASH, "Hash", "to_hash");
     return mr_callv(klass, rb_intern("new"), argc, argv, Qnil, mr_kw(kw));
 }
 VALUE rb_class_new_instance_pass_kw(int argc, const VALUE *argv, VALUE klass) { return rb_class_new_instance(argc, argv, klass); }

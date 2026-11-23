@@ -102,7 +102,11 @@ void rb_mem_clear(VALUE *mem, long n) { while (n-- > 0) *mem++ = Qnil; }
 
 /* ---- Hash --------------------------------------------------------------------- */
 VALUE rb_hash_new(void) { return mr_call(rb_cHash, "new", 0); }
-VALUE rb_hash_new_capa(long capa) { (void)capa; return rb_hash_new(); }
+/* (a capacity is a size: a negative one is st.c's "st_table too big") */
+VALUE rb_hash_new_capa(long capa) {
+    if (capa < 0) rb_raise(rb_eRuntimeError, "st_table too big");
+    return rb_hash_new();
+}
 VALUE rb_ident_hash_new(void) { return mr_call(rb_hash_new(), "compare_by_identity", 0); }
 VALUE rb_check_hash_type(VALUE obj) {
     if (RB_TYPE_P(obj, T_HASH)) return obj;
@@ -138,7 +142,20 @@ VALUE rb_hash_update_by(VALUE hash, VALUE other, rb_hash_update_func *func) {
 void rb_hash_bulk_insert(long argc, const VALUE *argv, VALUE hash) {
     for (long i = 0; i + 1 < argc; i += 2) rb_hash_aset(hash, argv[i], argv[i + 1]);
 }
-VALUE rb_hash(VALUE obj) { return mr_call(obj, "hash", 0); }
+/* hash.c's: #hash, made a Fixnum -- a Bignum by its low word (with the sign
+ * kept in the top bit), anything else through #to_int */
+VALUE rb_hash(VALUE obj) {
+    VALUE hval = mr_call(obj, "hash", 0);
+    while (!FIXNUM_P(hval)) {
+        if (RB_TYPE_P(hval, T_BIGNUM)) {
+            unsigned long ul;
+            int sign = rb_integer_pack(hval, &ul, 1, sizeof(ul), 0, INTEGER_PACK_LSWORD_FIRST | INTEGER_PACK_NATIVE_BYTE_ORDER);
+            hval = sign < 0 ? LONG2FIX((long)(ul | (unsigned long)FIXNUM_MIN)) : LONG2FIX((long)(ul & (unsigned long)FIXNUM_MAX));
+        }
+        else hval = rb_to_int(hval);
+    }
+    return hval;
+}
 void rb_hash_foreach(VALUE hash, int (*func)(VALUE, VALUE, VALUE), VALUE arg) {
     VALUE pairs = mr_callh(hash, "to_a", 0);
     long n = RARRAY_LEN(pairs);
@@ -229,7 +246,23 @@ VALUE rb_struct_new(VALUE klass, ...) {
     return mr_callv(klass, rb_intern("new"), (int)n, argv, Qnil, 0);
 }
 VALUE rb_struct_alloc(VALUE klass, VALUE values) { return mr_callv(klass, rb_intern("new"), RARRAY_LENINT(values), RARRAY_CONST_PTR(values), Qnil, 0); }
-VALUE rb_struct_initialize(VALUE self, VALUE values) { mr_callv(self, rb_intern("initialize"), RARRAY_LENINT(values), RARRAY_CONST_PTR(values), Qnil, 0); return Qnil; }
+/* struct.c's: the values by position -- for a Data instance too, whose own
+ * #initialize takes keywords: the members named, a missing one nil, one too
+ * many "struct size differs" -- and a Data instance frozen after. */
+VALUE rb_struct_initialize(VALUE self, VALUE values) {
+    if (!RTEST(rb_obj_is_kind_of(self, mr_const("Data")))) {
+        mr_callv(self, rb_intern("initialize"), RARRAY_LENINT(values), RARRAY_CONST_PTR(values), Qnil, 0);
+        return Qnil;
+    }
+    VALUE members = mr_call(rb_obj_class(self), "members", 0);
+    long n = RARRAY_LEN(members), given = RARRAY_LEN(values);
+    if (given > n) rb_raise(rb_eArgError, "struct size differs");
+    VALUE kw = rb_hash_new();
+    for (long i = 0; i < n; i++) rb_hash_aset(kw, RARRAY_AREF(members, i), i < given ? RARRAY_AREF(values, i) : Qnil);
+    mr_callv(self, rb_intern("initialize"), 1, &kw, Qnil, MR_SEND_KW);
+    rb_obj_freeze(self);
+    return Qnil;
+}
 VALUE rb_struct_aref(VALUE s, VALUE index) { return mr_call(s, "[]", 1, index); }
 VALUE rb_struct_aset(VALUE s, VALUE index, VALUE value) { return mr_call(s, "[]=", 2, index, value); }
 VALUE rb_struct_getmember(VALUE s, ID id) {
@@ -257,13 +290,15 @@ VALUE rb_data_define(VALUE super, ...) {
     while ((member = va_arg(ap, const char *)) != NULL) rb_ary_push(members, ID2SYM(rb_intern(member)));
     va_end(ap);
     VALUE data = mr_const("Data");
-    if (super == 0 || NIL_P(super) || super == data)
+    VALUE base = (super == 0 || NIL_P(super)) ? data : super;
+    if (!RB_TYPE_P(base, T_CLASS)) rb_raise(rb_eTypeError, "wrong argument type %s (expected Class)", rb_obj_classname(base));
+    if (base == data)
         return mr_callv(data, rb_intern("define"), RARRAY_LENINT(members), RARRAY_CONST_PTR(members), Qnil, 0);
     /* (a class Data.define made has no ::define of its own -- it is undefined
      *  there, as in ruby -- so Data's runs with that class as its self, and
      *  makes the new one under it: rb_data_define(super, ...)) */
     VALUE define = mr_call(mr_call(data, "singleton_class", 0), "instance_method", 1, ID2SYM(rb_intern("define")));
-    rb_ary_unshift(members, super);
+    rb_ary_unshift(members, base);
     return mr_callv(define, rb_intern("bind_call"), RARRAY_LENINT(members), RARRAY_CONST_PTR(members), Qnil, 0);
 }
 
@@ -273,20 +308,33 @@ VALUE rb_enumeratorize(VALUE obj, VALUE meth, int argc, const VALUE *argv) {
     rb_ary_unshift(args, meth);
     return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, 0);
 }
-/* (the size function is C's and takes the receiver, the arguments and the
- *  enumerator: the Enumerator made here answers size as nil -- "not known" --
- *  rather than ask a function this side cannot hand to it) */
+/* The size function is C's, and takes the receiver, the arguments and the
+ * enumerator: it is the size block enum_for takes, a block function that
+ * calls it with those three -- the enumerator filled in once enum_for has
+ * made it. */
 #undef rb_enumeratorize_with_size
 #undef rb_enumeratorize_with_size_kw
-VALUE rb_enumeratorize_with_size(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size) {
-    (void)size;
-    return rb_enumeratorize(obj, meth, argc, argv);
+extern VALUE mr_block_function(rb_block_call_func_t func, VALUE data);
+static VALUE enum_size_call(VALUE yielded, VALUE data, int argc, const VALUE *argv, VALUE blockarg) {
+    (void)yielded; (void)argc; (void)argv; (void)blockarg;
+    rb_enumerator_size_func *size = (rb_enumerator_size_func *)(uintptr_t)NUM2ULONG(rb_ary_entry(data, 0));
+    return size(rb_ary_entry(data, 1), rb_ary_entry(data, 2), rb_ary_entry(data, 3));
 }
-VALUE rb_enumeratorize_with_size_kw(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size, int kw) {
-    (void)size;
+static VALUE enumeratorize_sized(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size, int flags) {
     VALUE args = rb_ary_new_from_values(argc, argv);
     rb_ary_unshift(args, meth);
-    return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, mr_kw(kw));
+    if (!size) return mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args), Qnil, flags);
+    VALUE data = rb_ary_new_from_args(4, ULONG2NUM((uintptr_t)size), obj, rb_ary_new_from_values(argc, argv), Qnil);
+    VALUE e = mr_callv(obj, rb_intern("enum_for"), RARRAY_LENINT(args), RARRAY_CONST_PTR(args),
+                       mr_block_function(enum_size_call, data), flags);
+    rb_ary_store(data, 3, e);
+    return e;
+}
+VALUE rb_enumeratorize_with_size(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size) {
+    return enumeratorize_sized(obj, meth, argc, argv, size, 0);
+}
+VALUE rb_enumeratorize_with_size_kw(VALUE obj, VALUE meth, int argc, const VALUE *argv, rb_enumerator_size_func *size, int kw) {
+    return enumeratorize_sized(obj, meth, argc, argv, size, mr_kw(kw));
 }
 int rb_arithmetic_sequence_extract(VALUE obj, rb_arithmetic_sequence_components_t *component) {
     if (RTEST(rb_obj_is_kind_of(obj, mr_const("Enumerator::ArithmeticSequence")))) {
@@ -296,7 +344,10 @@ int rb_arithmetic_sequence_extract(VALUE obj, rb_arithmetic_sequence_components_
         component->exclude_end = RTEST(mr_call(obj, "exclude_end?", 0));
         return 1;
     }
-    if (RTEST(rb_obj_is_kind_of(obj, rb_cRange))) {
+    /* (a Range, or anything with a Range's three readers: rb_range_values) */
+    if (RTEST(rb_obj_is_kind_of(obj, rb_cRange))
+        || (rb_respond_to(obj, rb_intern("begin")) && rb_respond_to(obj, rb_intern("end"))
+            && rb_respond_to(obj, rb_intern("exclude_end?")))) {
         component->begin = mr_call(obj, "begin", 0);
         component->end = mr_call(obj, "end", 0);
         component->step = INT2FIX(1);

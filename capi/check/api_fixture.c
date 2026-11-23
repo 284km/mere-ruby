@@ -212,8 +212,34 @@ static VALUE set_parse_depth(VALUE self, VALUE depth) {
 
 static VALUE ospath(VALUE self, VALUE path) { (void)self; return rb_str_encode_ospath(path); }
 
+/* (rb_funcallv_public by name; an encoding's index as C reads it; a dummy
+ *  encoding defined here; what C's rb_fs holds) */
+static VALUE funcall_public(VALUE self, VALUE obj, VALUE name) {
+    (void)self;
+    return rb_funcallv_public(obj, rb_sym2id(name), 0, NULL);
+}
+static VALUE enc_index_of(VALUE self, VALUE str) { (void)self; return INT2FIX(rb_enc_get_index(str)); }
+static VALUE define_dummy(VALUE self, VALUE name) { (void)self; return INT2FIX(rb_define_dummy_encoding(StringValueCStr(name))); }
+static VALUE fs_value(VALUE self) { (void)self; return rb_fs; }
+/* (#binding sent from C; a typed data wrapping NULL whose dsize reads its
+ *  pointer; rb_errinfo after an rb_protect that returned normally) */
+static VALUE binding_of(VALUE self, VALUE obj) { (void)self; return rb_funcall(obj, rb_intern("binding"), 0); }
+static size_t reading_dsize(const void *p) { return *(const size_t *)p; }
+static const rb_data_type_t reading_type = { "ApiFixture::Reading", { NULL, RUBY_TYPED_DEFAULT_FREE, reading_dsize }, 0, 0, 0 };
+static VALUE null_typed(VALUE self) { (void)self; return TypedData_Wrap_Struct(rb_cObject, &reading_type, NULL); }
+static VALUE raise_arg(VALUE arg) { (void)arg; rb_raise(rb_eArgError, "caught by rb_protect"); return Qnil; }
+static VALUE protect_and_return(VALUE self) { (void)self; int state = 0; rb_protect(raise_arg, Qnil, &state); return INT2FIX(state); }
+static VALUE errinfo_now(VALUE self) { (void)self; return rb_errinfo(); }
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
+    rb_define_singleton_method(mod, "funcall_public", funcall_public, 2);
+    rb_define_singleton_method(mod, "enc_index_of", enc_index_of, 1);
+    rb_define_singleton_method(mod, "define_dummy", define_dummy, 1);
+    rb_define_singleton_method(mod, "fs_value", fs_value, 0);
+    rb_define_singleton_method(mod, "binding_of", binding_of, 1);
+    rb_define_singleton_method(mod, "null_typed", null_typed, 0);
+    rb_define_singleton_method(mod, "protect_and_return", protect_and_return, 0);
+    rb_define_singleton_method(mod, "errinfo_now", errinfo_now, 0);
     rb_define_singleton_method(mod, "ptr_after_yield", ptr_after_yield, 1);
     rb_define_singleton_method(mod, "ary_ptr_after_yield", ary_ptr_after_yield, 1);
     rb_define_singleton_method(mod, "byte_after_yield", byte_after_yield, 2);

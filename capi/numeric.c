@@ -188,6 +188,7 @@ static int negative_p(VALUE v) {
 /* (a negative number given for an unsigned type is taken as its two's
  *  complement, as CRuby takes it, when it fits the signed type) */
 unsigned long rb_num2uint(VALUE v) {
+    if (NIL_P(v)) rb_raise(rb_eTypeError, "no implicit conversion from nil to integer");
     int negative = negative_p(v);
     unsigned long n = rb_num2ulong(v);
     if (negative) {
@@ -305,8 +306,10 @@ VALUE rb_str_to_inum(VALUE str, int base, int badcheck) {
     if (badcheck) return mr_call(mr_main(), "Integer", 2, str, INT2FIX(base));
     return mr_call(str, "to_i", 1, INT2FIX(base < 0 ? -base : base));
 }
-VALUE rb_cstr2inum(const char *str, int base) { return rb_cstr_to_inum(str, base, base == 2); }
-VALUE rb_str2inum(VALUE str, int base) { return rb_str_to_inum(str, base, base == 2); }
+/* (strict when the base is to be read from the text, base 0, as bignum.c's
+ *  rb_cstr2inum and rb_str2inum are) */
+VALUE rb_cstr2inum(const char *str, int base) { return rb_cstr_to_inum(str, base, base == 0); }
+VALUE rb_str2inum(VALUE str, int base) { return rb_str_to_inum(str, base, base == 0); }
 double rb_cstr_to_dbl(const char *str, int badcheck) {
     VALUE s = rb_str_new_cstr(str);
     return rb_str_to_dbl(s, badcheck);
@@ -331,21 +334,28 @@ int rb_cmpint(VALUE val, VALUE a, VALUE b) {
     return 0;
 }
 void rb_num_zerodiv(void) { rb_raise(rb_eZeroDivError, "divided by 0"); }
-static VALUE coerced(VALUE x, VALUE y, ID op) {
+/* numeric.c's do_coerce: y.coerce(x) must be a pair; when it is not, the
+ * binary operators raise (err) and the comparisons decline (Qundef) */
+static VALUE coerced_or(VALUE x, VALUE y, ID op, int err) {
     VALUE pair = mr_call(y, "coerce", 1, x);
-    if (!RB_TYPE_P(pair, T_ARRAY) || RARRAY_LEN(pair) != 2) rb_raise(rb_eTypeError, "coerce must return [x, y]");
+    if (!RB_TYPE_P(pair, T_ARRAY) || RARRAY_LEN(pair) != 2) {
+        if (err) rb_raise(rb_eTypeError, "coerce must return [x, y]");
+        return Qundef;
+    }
     VALUE a = rb_ary_entry(pair, 0), b = rb_ary_entry(pair, 1);
     return mr_callv(a, op, 1, &b, Qnil, 0);
 }
+static VALUE coerced(VALUE x, VALUE y, ID op) { return coerced_or(x, y, op, 1); }
 VALUE rb_num_coerce_bin(VALUE x, VALUE y, ID op) { return coerced(x, y, op); }
 VALUE rb_num_coerce_cmp(VALUE x, VALUE y, ID op) {
     if (!rb_respond_to(y, rb_intern("coerce"))) return Qnil;
-    return coerced(x, y, op);
+    VALUE r = coerced_or(x, y, op, 0);
+    return r == Qundef ? Qnil : r;
 }
 VALUE rb_num_coerce_relop(VALUE x, VALUE y, ID op) {
     if (!rb_respond_to(y, rb_intern("coerce"))) rb_cmperr(x, y);
-    VALUE r = coerced(x, y, op);
-    if (NIL_P(r)) rb_cmperr(x, y);
+    VALUE r = coerced_or(x, y, op, 0);
+    if (r == Qundef || NIL_P(r)) rb_cmperr(x, y);
     return r;
 }
 VALUE rb_num_coerce_bit(VALUE x, VALUE y, ID op) { return coerced(x, y, op); }

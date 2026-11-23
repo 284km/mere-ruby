@@ -54,9 +54,27 @@ VALUE rb_utf8_str_new_static(const char *ptr, long len) { return make(ptr, len, 
 VALUE rb_enc_str_new(const char *ptr, long len, rb_encoding *enc) { return make(ptr, len, enc ? rb_enc_to_index(enc) : rb_ascii8bit_encindex()); }
 VALUE rb_enc_str_new_cstr(const char *ptr, rb_encoding *enc) { return rb_enc_str_new(ptr, (long)strlen(ptr), enc); }
 VALUE rb_enc_str_new_static(const char *ptr, long len, rb_encoding *enc) { return rb_enc_str_new(ptr, len, enc); }
-VALUE rb_external_str_new(const char *ptr, long len) { return rb_enc_str_new(ptr, len, rb_default_external_encoding()); }
+VALUE rb_external_str_new(const char *ptr, long len) { return rb_external_str_new_with_enc(ptr, len, rb_default_external_encoding()); }
 VALUE rb_external_str_new_cstr(const char *ptr) { return rb_external_str_new(ptr, (long)strlen(ptr)); }
-VALUE rb_external_str_new_with_enc(const char *ptr, long len, rb_encoding *enc) { return rb_enc_str_new(ptr, len, enc); }
+/* string.c's: bytes from outside in their encoding -- binary when they are
+ * said to be US-ASCII and are not, and transcoded to default_internal when
+ * one is set (as they are, when that fails). */
+static int any_nonascii(const char *p, long n) {
+    for (long i = 0; i < n; i++) if ((unsigned char)p[i] >= 0x80) return 1;
+    return 0;
+}
+VALUE rb_external_str_new_with_enc(const char *ptr, long len, rb_encoding *eenc) {
+    if (!ptr) return rb_enc_str_new(ptr, len, eenc);
+    int eidx = rb_enc_to_index(eenc);
+    if (eidx == rb_ascii8bit_encindex() || (eidx == rb_usascii_encindex() && any_nonascii(ptr, len)))
+        return rb_str_new(ptr, len);
+    rb_encoding *ienc = rb_default_internal_encoding();
+    if (!ienc || eenc == ienc) return rb_enc_str_new(ptr, len, eenc);
+    if (eidx == rb_usascii_encindex() || (rb_enc_asciicompat(eenc) && !any_nonascii(ptr, len)))
+        return rb_enc_str_new(ptr, len, ienc);
+    VALUE str = rb_enc_str_new(ptr, len, eenc);
+    return rb_str_conv_enc(str, eenc, ienc);
+}
 VALUE rb_locale_str_new(const char *ptr, long len) { return rb_enc_str_new(ptr, len, rb_locale_encoding()); }
 VALUE rb_locale_str_new_cstr(const char *ptr) { return rb_locale_str_new(ptr, (long)strlen(ptr)); }
 VALUE rb_filesystem_str_new(const char *ptr, long len) { return rb_enc_str_new(ptr, len, rb_filesystem_encoding()); }
@@ -67,7 +85,8 @@ VALUE rb_str_buf_new(long capa) {
     return str;
 }
 VALUE rb_str_buf_new_cstr(const char *ptr) { return rb_str_new_cstr(ptr); }
-VALUE rb_str_tmp_new(long len) { return rb_str_new(NULL, len); }
+/* (hidden, as CRuby makes it: its class reads as 0 to C) */
+VALUE rb_str_tmp_new(long len) { return rb_obj_hide(rb_str_new(NULL, len)); }
 VALUE rb_str_new_with_class(VALUE obj, const char *ptr, long len) {
     VALUE str = rb_enc_str_new(ptr, len, rb_enc_get(obj));
     VALUE klass = rb_obj_class(obj);
@@ -179,14 +198,39 @@ VALUE rb_str_ellipsize(VALUE str, long len) {
     return mr_call(mr_ruby("->(s, n) { d = '...'.encode(s.encoding); s.length <= n ? s : n <= 3 ? d[0, n] : s[0, n - 3] + d }"), "call", 2, str, LONG2NUM(len));
 }
 VALUE rb_str_drop_bytes(VALUE str, long len) { mr_calls(str, "replace", 1, mr_calls(str, "byteslice", 2, LONG2NUM(len), LONG2NUM(RSTRING_LEN(str)))); return changed(str); }
-VALUE rb_str_locktmp(VALUE str) { return str; }
-VALUE rb_str_unlocktmp(VALUE str) { return str; }
-VALUE rb_str_export(VALUE str) { return str; }
-VALUE rb_str_export_locale(VALUE str) { return str; }
+/* The interpreter's temporary lock (what a waiting read holds on its buffer):
+ * a change to a locked String is "can't modify string; temporarily locked".
+ * A frozen String is refused first, as ruby 4.0 does. */
+VALUE rb_str_locktmp(VALUE str) {
+    rb_check_frozen(str);
+    if (RTEST(mr_call(str, "__tmplocked?", 0))) rb_raise(rb_eRuntimeError, "temporal locking already locked string");
+    mr_call(str, "__locktmp", 0);
+    return str;
+}
+VALUE rb_str_unlocktmp(VALUE str) {
+    rb_check_frozen(str);
+    if (!RTEST(mr_call(str, "__tmplocked?", 0))) rb_raise(rb_eRuntimeError, "temporal unlocking already unlocked string");
+    mr_call(str, "__unlocktmp", 0);
+    return str;
+}
+VALUE rb_str_export(VALUE str) { return rb_str_conv_enc(str, rb_enc_get(str), rb_default_external_encoding()); }
+VALUE rb_str_export_locale(VALUE str) { return rb_str_conv_enc(str, rb_enc_get(str), rb_locale_encoding()); }
+/* rb_str_encode: String#encode, with the converter flags said as the options
+ * they are (ECONV_INVALID_REPLACE is `invalid: :replace`, ...) beside what
+ * ecopts holds (a replacement String). */
 VALUE rb_str_encode(VALUE str, VALUE to, int ecflags, VALUE ecopts) {
-    (void)ecflags;
-    if (NIL_P(ecopts)) return mr_calls(str, "encode", 1, to);
-    VALUE argv[2] = { to, ecopts };
+    VALUE opts = NIL_P(ecopts) ? rb_hash_new() : rb_hash_dup(ecopts);
+    VALUE replace = ID2SYM(rb_intern("replace"));
+    if (ecflags & ECONV_INVALID_REPLACE) rb_hash_aset(opts, ID2SYM(rb_intern("invalid")), replace);
+    if (ecflags & ECONV_UNDEF_REPLACE) rb_hash_aset(opts, ID2SYM(rb_intern("undef")), replace);
+    if (ecflags & ECONV_UNIVERSAL_NEWLINE_DECORATOR) rb_hash_aset(opts, ID2SYM(rb_intern("universal_newline")), Qtrue);
+    if (ecflags & ECONV_CRLF_NEWLINE_DECORATOR) rb_hash_aset(opts, ID2SYM(rb_intern("crlf_newline")), Qtrue);
+    if (ecflags & ECONV_CR_NEWLINE_DECORATOR) rb_hash_aset(opts, ID2SYM(rb_intern("cr_newline")), Qtrue);
+    if (ecflags & ECONV_LF_NEWLINE_DECORATOR) rb_hash_aset(opts, ID2SYM(rb_intern("lf_newline")), Qtrue);
+    if (ecflags & ECONV_XML_TEXT_DECORATOR) rb_hash_aset(opts, ID2SYM(rb_intern("xml")), ID2SYM(rb_intern("text")));
+    if (ecflags & ECONV_XML_ATTR_CONTENT_DECORATOR) rb_hash_aset(opts, ID2SYM(rb_intern("xml")), ID2SYM(rb_intern("attr")));
+    if (RHASH_SIZE(opts) == 0) return mr_calls(str, "encode", 1, to);
+    VALUE argv[2] = { to, opts };
     return mr_callv(str, rb_intern("encode"), 2, argv, Qnil, MR_SEND_KW);
 }
 /* string.c's rb_str_conv_enc: the same object when there is nothing to

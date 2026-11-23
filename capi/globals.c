@@ -61,10 +61,30 @@ static VALUE boot_body(VALUE unused) {
     rb_default_rs = rb_rs;
     rb_output_rs = rb_gv_get("$\\");
     rb_argv0 = rb_gv_get("$0");
+    /* (roots, as CRuby's rb_global_variable makes them: a value without an
+     *  identity assigned to one -- `$; = /,/`, a Regexp -- has a number C
+     *  holds only while C reaches it, and these variables are how it does;
+     *  capi_global_note writes later assignments into them) */
+    rb_gc_register_address(&rb_stdin); rb_gc_register_address(&rb_stdout); rb_gc_register_address(&rb_stderr);
+    rb_gc_register_address(&rb_fs); rb_gc_register_address(&rb_output_fs);
+    rb_gc_register_address(&rb_rs); rb_gc_register_address(&rb_default_rs); rb_gc_register_address(&rb_output_rs);
+    rb_gc_register_address(&rb_argv0);
     /* (the memory view registry: capi/memory_view.c) */
     extern void Init_MemoryView(void);
     Init_MemoryView();
     return Qnil;
+}
+/* The interpreter assigned one of the globals C keeps as a variable ($stdin,
+ * $stdout, $stderr, $;, $,, $/, $\\): the variable is that value now, as
+ * CRuby's are (its setters write them). */
+int mr_capi_set_global(int slot, CapiWord word) {
+    VALUE v = (VALUE)word.mu_w;
+    switch (slot) {
+      case 0: rb_stdin = v; break;   case 1: rb_stdout = v; break;  case 2: rb_stderr = v; break;
+      case 3: rb_fs = v; break;      case 4: rb_output_fs = v; break;
+      case 5: rb_rs = v; break;      case 6: rb_output_rs = v; break;
+    }
+    return 0;
 }
 void mr_capi_boot(void) {
     VALUE outcome;

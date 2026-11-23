@@ -1958,10 +1958,14 @@ let tz_db = map_new ();
 // "ASCII-8BIT"; only the inspect shows both.
 let enc_display_name = fn (nm: str) ->
   if str_eq nm "ASCII-8BIT" then "BINARY (ASCII-8BIT)" else nm;
+// (and the ones a C extension defined: rb_define_dummy_encoding)
+let enc_dummy_made = map_new ();
+// "on" while rb_class_new makes a class: no `inherited` hook runs (call_inherited)
+let inherited_quiet = map_new ();
 let enc_is_dummy = fn (nm: str) ->
   str_eq nm "UTF-16" || str_eq nm "UTF-32" || str_eq nm "IBM037" ||
   str_eq nm "ISO-2022-JP" || str_eq nm "ISO-2022-JP-2" || str_eq nm "ISO-2022-JP-KDDI" ||
-  str_eq nm "CP50220" || str_eq nm "CP50221" || str_eq nm "UTF-7";
+  str_eq nm "CP50220" || str_eq nm "CP50221" || str_eq nm "UTF-7" || map_has enc_dummy_made nm;
 // the canonical frozen string for this content + encoding: the FIRST frozen
 // holder registers itself (a dynamic string that interns becomes canonical),
 // later callers get that same object back.
@@ -2088,6 +2092,13 @@ let anon_name = map_new ();
 // check is a single map lookup in the overwhelmingly common case (nobody
 // defines one) rather than an ancestor walk.
 let hook_flags = map_new ();
+// ...and the two keys asked on the hot path, as ints beside it (slot 0 "tp",
+// slot 1 "mm"), written where the key is: a program that installs any hook --
+// test/unit defines method_added -- made `map_has hook_flags "tp"` a string
+// hashed at every evaluation (tp_hook_on), 56 million in a sample of test_ast.
+let hook_bits = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v 0 in v);
+let hook_tp_on = fn (u: unit) -> vec_get hook_bits 0 == 1;
+let hook_mm_on = fn (u: unit) -> vec_get hook_bits 1 == 1;
 // 0 -> 1 while the method call that just returned ended because its BLOCK
 // broke out of it (`m { break v }`). The value is the call's value either way;
 // `new` is the one caller that throws its callee's value away, and
@@ -2353,8 +2364,21 @@ let mro_lookup_root = map_new ();
 let _ = map_compact mro_local_epoch;
 let _ = map_compact mro_external;
 let _ = map_compact mro_lookup_root;
-let rec mro_local_name = fn (c: str) ->
-  if str_len c > 6 && str_starts_with c "(sng:" then mro_local_name (substring c 5 (str_len c - 1))
+// (does `pre` stand in c at `off`, wholly before `stop`? Asked in place --
+//  str_index_from finds it there or further on -- with no substring)
+let mro_pre_at = fn (c: str) -> fn (off: int) -> fn (stop: int) -> fn (pre: str) ->
+  off + str_len pre <= stop && str_index_from c pre off == off;
+// (the name inside c's `(sng:` wrappers is c[off, stop). This built a
+//  substring per wrapper -- once per mro_now_class on a singleton class,
+//  which class-method lookups ask often; review of #162. A name with no
+//  wrapper is still asked with str_starts_with: comparing it byte by byte
+//  in Mere cost 2.6% of test_ast's instructions.)
+let rec mro_local_in = fn (c: str) -> fn (off: int) -> fn (stop: int) ->
+  if stop - off > 6 && mro_pre_at c off stop "(sng:" then mro_local_in c (off + 5) (stop - 1)
+  else mro_pre_at c off stop "AnonClass_" || mro_pre_at c off stop "AnonModule_"
+       || mro_pre_at c off stop "Struct_" || mro_pre_at c off stop "Refine_";
+let mro_local_name = fn (c: str) ->
+  if str_len c > 6 && str_starts_with c "(sng:" then mro_local_in c 5 (str_len c - 1)
   else str_starts_with c "AnonClass_" || str_starts_with c "AnonModule_"
        || str_starts_with c "Struct_" || str_starts_with c "Refine_";
 let mro_next_epoch = fn () ->
@@ -2362,10 +2386,16 @@ let mro_next_epoch = fn () ->
   let _ = vec_set mro_gen 2 n in n;
 let mro_bump = fn () -> vec_set mro_gen 0 (mro_next_epoch ());
 let mro_now = fn () -> vec_get mro_gen 0;
+// (only a name mro_local_name accepts ever gets a local epoch -- see
+//  mro_lookup_enter and mro_bump_class -- so any other name is the global
+//  one without hashing it twice: 27 million lookups in a sample of test_ast,
+//  from ancestors_of and has_meth)
 let mro_now_class = fn (c: str) ->
   let all = mro_now () in
-  let own = (if map_has mro_local_epoch c then map_get mro_local_epoch c else 0) in
-  if own > all then own else all;
+  if mro_local_name c then
+    (let own = (if map_has mro_local_epoch c then map_get mro_local_epoch c else 0) in
+     if own > all then own else all)
+  else all;
 let mro_observe = fn (c: str) ->
   if mro_local_name c &&
      (if map_has mro_lookup_root 0 then (if str_eq (map_get mro_lookup_root 0) c then false else true) else true)
@@ -2831,7 +2861,7 @@ let name_spec = fn (tag: str) ->
     )
   else if str_eq tag "is_kernel_modfunc" then ("puts|p|pp|print|printf|format|sprintf|warn|rand|srand|sleep|gets|"
     ++ "binding|caller|caller_locations|Integer|Float|String|Array|Hash|"
-    ++ "Rational|Complex"
+    ++ "Rational|Complex|global_variables"
     )
   else if str_eq tag "is_numeric_own_method" then ("%|+@|-@|<=>|abs|abs2|angle|arg|ceil|clone|coerce|conj|conjugate|"
     ++ "denominator|div|divmod|dup|eql?|fdiv|finite?|floor|i|imag|imaginary|"
@@ -3011,6 +3041,14 @@ let name_set = fn (tag: str) ->
      let _ = list_iter (str_split (name_spec tag) "|") (fn (n: str) -> map_set tbl n true) in
      let _ = map_set name_sets tag tbl in
      tbl);
+// the sets asked per call, made once here: name_set hashes its tag twice to
+// find the set before the name is asked (is_mutating_method's "mut" alone was
+// 26 million lookups in a sample of test_ast)
+let ns_mut = name_set "mut";
+let ns_opmeth = name_set "opmeth";
+let ns_enum_needs_block = name_set "enum_needs_block";
+let ns_is_binary_op_name = name_set "is_binary_op_name";
+let ns_modmeth = name_set "modmeth";
 let map_set_s = fn tbl -> fn (k: str) -> fn (v: str) ->
   if map_has tbl k && str_eq (map_get tbl k) v then () else map_set tbl k v;
 // the same, for a table keyed by an INT. The call-stack tables (call_names_s,
@@ -4224,6 +4262,8 @@ let req_penc = map_new ();
 // strings a blocking read is filling (IO#read(n, buf) and kin waiting in a
 // thread): changing one is "can't modify string; temporarily locked"
 let str_locks = map_new ();
+// the encodings in the order ruby 4.0.9 registers them (Encoding.list)
+let enc_list_order = "ASCII-8BIT|UTF-8|US-ASCII|UTF-16BE|UTF-16LE|UTF-32BE|UTF-32LE|UTF-16|UTF-32|UTF8-MAC|EUC-JP|Windows-31J|Big5|Big5-HKSCS|Big5-UAO|CESU-8|CP949|Emacs-Mule|EUC-KR|EUC-TW|GB18030|GBK|ISO-8859-1|ISO-8859-2|ISO-8859-3|ISO-8859-4|ISO-8859-5|ISO-8859-6|ISO-8859-7|ISO-8859-8|ISO-8859-9|ISO-8859-10|ISO-8859-11|ISO-8859-13|ISO-8859-14|ISO-8859-15|ISO-8859-16|KOI8-R|KOI8-U|Shift_JIS|Windows-1250|Windows-1251|Windows-1252|Windows-1253|Windows-1254|Windows-1257|IBM437|IBM720|IBM737|IBM775|CP850|IBM852|CP852|IBM855|CP855|IBM857|IBM860|IBM861|IBM862|IBM863|IBM864|IBM865|IBM866|IBM869|Windows-1258|GB1988|macCentEuro|macCroatian|macCyrillic|macGreek|macIceland|macRoman|macRomania|macThai|macTurkish|macUkraine|CP950|CP951|IBM037|stateless-ISO-2022-JP|eucJP-ms|CP51932|EUC-JIS-2004|GB2312|GB12345|ISO-2022-JP|ISO-2022-JP-2|CP50220|CP50221|Windows-1256|Windows-1255|TIS-620|Windows-874|MacJapanese|UTF-7|UTF8-DoCoMo|SJIS-DoCoMo|UTF8-KDDI|SJIS-KDDI|ISO-2022-JP-KDDI|stateless-ISO-2022-JP-KDDI|UTF8-SoftBank|SJIS-SoftBank";
 let rxp_warn = fn (m: str) ->
   let cur = (if map_has rx_wq "q" then map_get rx_wq "q" else "") in
   if str_contains cur (m ++ "\n") then () else map_set rx_wq "q" (cur ++ m ++ "\n");
@@ -5681,6 +5721,11 @@ let store_meth = fn tbl -> fn (key: str) -> fn (value: Meth) ->
 let capi_boot_defs = map_new ();
 let capi_redefs = map_new ();
 let capi_booted = (let v = vec_new () in let _ = vec_push v 0 in v);
+// capi_pub_entry: 1 from capi_send's rb_funcallv_public until the dispatcher
+// takes its __capi_public_send -- the name answers nothing else, so Ruby
+// code that writes it gets the NoMethodError ruby gives.
+let capi_pub_entry = (let v = vec_new () in let _ = vec_push v 0 in v);
+
 // capi_notimpl: "Owner#name" of each method C defined as rb_f_notimplement --
 // in the table (methods lists it, calling it raises NotImplementedError) and
 // no method to respond_to? / method_defined? / Method#inspect, as ruby's
@@ -5718,7 +5763,7 @@ let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
                    && (let i9 = str_index_of k "#" in
                        i9 > 0 && str_contains "|Object|Kernel|BasicObject|Comparable|Enumerable|Integer|Numeric|Float|String|Symbol|Array|Hash|NilClass|TrueClass|FalseClass|Range|"
                                               ("|" ++ substring k 0 i9 ++ "|"))
-           then map_set hook_flags "mm" VNil
+           then (let _ = vec_set hook_bits 1 1 in map_set hook_flags "mm" VNil)
            else ()) in
   let _ = (if map_len struct_gen > 0 && map_has struct_gen k then map_delete struct_gen k else ()) in
   let _ = map_delete meth_params k in store_meth tbl k v;
@@ -5960,17 +6005,34 @@ let bi_owner_memo = map_new ();
 //   which is what its class needs (bi_reg_recv rebuilds a stand-in).
 let bi_names = vec_new ();
 let bi_name_ix = map_new ();
+// (a name's index is asked at every builtin call, and the same few names come
+//  back: a slot of 64 by the name's length and end bytes remembers the index,
+//  plus one, of the last name that fell there -- checked against bi_names, so
+//  a collision only costs the lookup it saves; nothing new is stored)
+let bi_nix_memo = (let v = vec_new () in
+                   let rec fill = fn (i: int) -> if i >= 64 then () else (let _ = vec_push v 0 in fill (i + 1)) in
+                   let _ = fill 0 in v);
 let bi_nix = fn (n: str) ->
-  if map_has bi_name_ix n then map_get bi_name_ix n
-  else (let i = vec_len bi_names in
-        let _ = vec_push bi_names n in
-        let _ = map_set bi_name_ix n i in i);
+  let l = str_len n in
+  let h = (if l == 0 then 0 else (l * 31 + ord (char_at n 0) * 7 + ord (char_at n (l - 1))) % 64) in
+  let c = vec_get bi_nix_memo h in
+  if c > 0 && str_eq (vec_get bi_names (c - 1)) n then c - 1
+  else
+    (let i = (if map_has bi_name_ix n then map_get bi_name_ix n
+              else (let i0 = vec_len bi_names in
+                    let _ = vec_push bi_names n in
+                    let _ = map_set bi_name_ix n i0 in i0)) in
+     let _ = vec_set bi_nix_memo h (i + 1) in i);
 // A receiver class name is temporary context, not an interned method name.
 // bi_reg_get copies the stand-in before nested calls and restores it through
 // bi_reg_set, so one compactable slot suffices without permanent class names.
 let bi_class_name = (let t = map_new () in let _ = map_compact t in t);
 let bi_reg_n = (let t = map_new () in let _ = map_compact t in t);  // (its own arena: gc_churn_bytes, note 270)
 let bi_reg_r = map_new ();
+// ...and the depth of the builtin running now, -1 for none. It was
+// struct_ctr's "bd", a string key hashed at every builtin call (bi_reg_set)
+// and at every rescue -- 40 million in a sample of test_ast.
+let bi_reg_d = (let v = vec_new () in let _ = vec_push v (0 - 1) in v);
 let _ = map_compact bi_reg_r;  // (its own arena: gc_churn_bytes, note 270)
 // THE TABLES REWRITTEN AS THE PROGRAM RUNS (note 270). A write into a map
 // copies the value into the map's arena, and the copy it replaces stays there:
@@ -6212,7 +6274,7 @@ let bi_reg_recv = fn (u: unit) ->
 let bi_reg_get = fn (u: unit) ->
   (if map_has bi_reg_n 0 then (let n9 = vec_get bi_names (map_get bi_reg_n 0) in substring n9 0 (str_len n9)) else "",
    bi_reg_recv (),
-   if map_has struct_ctr "bd" then map_get struct_ctr "bd" else (0 - 1));
+   vec_get bi_reg_d 0);
 // Sharing belongs only to alias/Method-copy definitions in the current
 // native call. Clone/import copies keep ordinary redefinition warnings.
 let copy_meth_src = fn (dst: str) -> fn (src: str) ->
@@ -6263,7 +6325,7 @@ let bi_reg_set = fn (n: str) -> fn (r: Val) -> fn (d: int) ->
   let _ = map_set bi_reg_r 0 k in
   let _ = map_set bi_reg_r 1 p in
   let _ = (if ni >= 0 then map_set bi_reg_r 2 ni else (if map_has bi_reg_r 2 then map_delete bi_reg_r 2 else ())) in
-  map_set struct_ctr "bd" d;
+  vec_set bi_reg_d 0 d;
 // a rescue ends whatever builtin raised at or above its own depth; a later
 // raise at this depth is the program's, not that builtin's
 let bi_raiser_drop = fn (u: unit) ->
@@ -6272,7 +6334,7 @@ let bi_raiser_drop = fn (u: unit) ->
 let bi_rescued = fn (u: unit) ->
   let _ = bi_raiser_drop () in
   let cd = (cd_get ()) in
-  if map_has struct_ctr "bd" && map_get struct_ctr "bd" >= cd then bi_reg_set "" VNil (0 - 1) else ();
+  if vec_get bi_reg_d 0 >= cd then bi_reg_set "" VNil (0 - 1) else ();
 // A builtin that has no method by this name records the name and fails; the
 // NoMethodError is built only when something rescues it (pending_exc). Where
 // it failed is kept beside the name -- the last one wins, as the name does, so

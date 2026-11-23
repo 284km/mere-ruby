@@ -34,6 +34,7 @@ struct mr_mirror {
     int body;                   /* 0 none yet, T_STRING, T_ARRAY */
     int data;                   /* 0, 1 RData, 2 RTypedData */
     int listed;                 /* how many C calls in progress watch it (entries of `touched`) */
+    int hidden;                 /* rb_obj_hide: its class reads as 0 to C until rb_obj_reveal */
     size_t embedded;            /* a typed struct's own bytes, after it */
     struct rb_io *io;           /* an IO's, made when RFILE first asks for it */
     union {
@@ -110,13 +111,49 @@ static void refresh_head(struct mr_mirror *m, VALUE obj) {
     if (m->data) type = T_DATA;
     flags = keep | (VALUE)type;
     if (packed & 0x20) flags |= RUBY_FL_FREEZE;
-    flags |= ((packed >> 8) & 0x7f) << RUBY_ENCODING_SHIFT;
-    if (type == T_STRING) flags |= RSTRING_NOEMBED;
+    /* (the encoding index in the 7 bits CRuby keeps it in: one that does not
+     *  fit -- a dummy encoding defined from C, 127 and on -- is
+     *  ENCODING_INLINE_MAX there, and rb_enc_get_index asks for the rest) */
+    long enc_index = (long)((packed >> 8) & 0xffff);
+    flags |= (VALUE)(enc_index < RUBY_ENCODING_INLINE_MAX ? enc_index : RUBY_ENCODING_INLINE_MAX) << RUBY_ENCODING_SHIFT;
+    if (type == T_STRING) {
+        flags |= RSTRING_NOEMBED;
+        /* (the coderange is the interpreter's to say, as far as it knows:
+         *  7BIT when the bytes are ASCII alone in an ASCII-compatible
+         *  encoding, else unknown -- what C cached may be stale) */
+        flags &= ~(VALUE)RUBY_ENC_CODERANGE_MASK;
+        if (packed & 0x1000000) {
+            rb_encoding *e = rb_enc_from_index((int)((packed >> 8) & 0xffff));
+            if (e && rb_enc_asciicompat(e)) flags |= RUBY_ENC_CODERANGE_7BIT;
+        }
+    }
     if (type == T_ARRAY) flags &= ~(VALUE)RARRAY_EMBED_FLAG;
     if ((type == T_CLASS || type == T_MODULE) && (packed & 0x40)) flags |= RUBY_FL_SINGLETON;
     m->as.basic.flags = flags;
-    *(VALUE *)&m->as.basic.klass = mr_word(0);
+    *(VALUE *)&m->as.basic.klass = m->hidden ? 0 : mr_word(0);
     m->head_epoch = mr_epoch;
+}
+/* ObjectSpace.memsize_of: a typed data object's own count of what it holds
+ * (its type's dsize), by handle number -- run inside a C call (MR_RUN_DSIZE).
+ * A NULL data pointer holds nothing, as gc.c's rb_objspace_data_type_memsize
+ * guards: a wrapper of NULL, or one an extension emptied when it closed. */
+long mr_capi_dsize(long number) {
+    struct mr_mirror *m = mirror_at(number, 0);
+    if (!m || m->data != 2) return 0;
+    const rb_data_type_t *type = (const rb_data_type_t *)(m->as.typed.type & TYPED_DATA_PTR_MASK);
+    if (!type || !type->function.dsize) return 0;
+    void *data = m->embedded ? (void *)&m->as.typed.data : m->as.typed.data;
+    if (!data) return 0;
+    size_t n = type->function.dsize(data);
+    return n > (size_t)LONG_MAX ? LONG_MAX : (long)n;
+}
+/* rb_obj_hide / rb_obj_reveal: to C, a hidden object has no class (CRuby
+ * clears RBasic.klass; the interpreter's object keeps its own). */
+void mr_mirror_hide(VALUE obj, int hidden) {
+    if (!MR_HANDLE_P(obj)) return;
+    struct mr_mirror *m = mirror_at(MR_NUMBER(obj), 1);
+    m->hidden = hidden;
+    m->head_epoch = 0;
 }
 
 struct mr_mirror *mr_mirror_of(VALUE obj) {

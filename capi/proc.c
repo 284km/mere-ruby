@@ -17,7 +17,7 @@ VALUE rb_block_proc(void) {
     if (NIL_P(block)) rb_raise(rb_eArgError, "tried to create Proc object without a block");
     return block;
 }
-VALUE rb_block_lambda(void) { return rb_block_proc(); }
+VALUE rb_block_lambda(void) { return mr_call(rb_block_proc(), "__as_lambda", 0); }
 static VALUE yield_values(int argc, const VALUE *argv, int flags) {
     rb_need_block();
     return mr_callv(mr_frame_block(), rb_intern("yield"), argc, argv, Qnil, flags);
@@ -79,12 +79,14 @@ static VALUE block_proc(rb_block_call_func_t func, VALUE data, int lambda) {
                  (VALUE)mr_frame_method(), mr_frame_block());
 }
 VALUE mr_block_function(rb_block_call_func_t func, VALUE data) { return block_proc(func, data, 0); }
+/* (no function: the block the C method itself was given goes on, as
+ *  vm_eval.c's rb_block_call passes the current block handler) */
 VALUE rb_block_call(VALUE obj, ID mid, int argc, const VALUE *argv, rb_block_call_func_t func, VALUE data) {
-    VALUE block = func ? block_proc(func, data, 0) : Qnil;
+    VALUE block = func ? block_proc(func, data, 0) : mr_frame_block();
     return mr_callv(obj, mid, argc, argv, block, 0);
 }
 VALUE rb_block_call_kw(VALUE obj, ID mid, int argc, const VALUE *argv, rb_block_call_func_t func, VALUE data, int kw) {
-    VALUE block = func ? block_proc(func, data, 0) : Qnil;
+    VALUE block = func ? block_proc(func, data, 0) : mr_frame_block();
     return mr_callv(obj, mid, argc, argv, block, mr_kw(kw));
 }
 VALUE rb_each(VALUE obj) { return mr_callv(obj, rb_intern("each"), 0, NULL, mr_frame_block(), 0); }
@@ -174,7 +176,7 @@ static int scan(int kw_flag, int argc, const VALUE *argv, const char *fmt, va_li
     for (int k = 0; k < trail; k++, i++) { VALUE *var = va_arg(ap, VALUE *); if (var) *var = argv[i]; }
     if (hash) { VALUE *var = va_arg(ap, VALUE *); if (var) *var = options; }
     if (block) { VALUE *var = va_arg(ap, VALUE *); if (var) *var = rb_block_given_p() ? rb_block_proc() : Qnil; }
-    return given;
+    return argc;   /* (after the keyword Hash is taken off, as CRuby counts) */
 }
 #undef rb_scan_args
 #undef rb_scan_args_kw
