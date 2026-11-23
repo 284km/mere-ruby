@@ -445,6 +445,15 @@ void mr_mark_value(VALUE v) {
     if (marking && MR_HANDLE_P(v)) marker.fn(marker.env, (long long)v);
 }
 /* What a live data object keeps alive: its dmark says. */
+/* What a handle is to C as a data object (ObjectSpace.dump's "struct"):
+ * "\001" none, "" an RData, the typed data's wrap_struct_name. */
+char *mr_capi_data_name(int number) {
+    struct mr_mirror *m = mirror_at(number, 0);
+    if (!m || !m->data) return "\001";
+    if (m->data != 2) return "";
+    const rb_data_type_t *type = (const rb_data_type_t *)(m->as.typed.type & TYPED_DATA_PTR_MASK);
+    return (char *)(type && type->wrap_struct_name ? type->wrap_struct_name : "");
+}
 int mr_capi_mark(closure_int_int visit, int number) {
     struct mr_mirror *m = mirror_at(number, 0);
     if (!m) return 0;

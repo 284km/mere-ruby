@@ -107,4 +107,11 @@ readers.each do |reader|
   check('a reading dmark reads the ivar truly', reader.child == 'native-child')
   check('a reading dmark reads an Array as it is now', reader.gated_child == 'gated-child')
 end
+# A typed data object is DATA to ObjectSpace, and its struct is its type's
+# wrap_struct_name (sqlite3's test_typed_data_struct_name reads this)
+require 'objspace'
+dumped = ObjectSpace.dump(Bug::NativeBox.new)
+check('a typed data object dumps as DATA', dumped.include?('"type":"DATA"'))
+check('a typed data object dumps its struct name', dumped.include?('"struct":"native_box"'))
+check('a plain object is no DATA', ObjectSpace.dump(Object.new).include?('"type":"OBJECT"'))
 puts "typeddata contracts: #{$checks} passed"
