@@ -115,9 +115,31 @@ p try { kh.transform_keys(&:upcase) }, try { kh.transform_keys({ "a" => "x" }) }
 p try { kh.transform_keys({ "a" => "x" }) { |k| k * 2 } }
 
 # gsub with a Hash replacement looks each match up as a string of the
-# receiver's encoding (ActiveSupport's JSON escaping maps "\u2028".b this way)
-sep = "\xE2\x80\xA8".b
-escapes = { sep => '\u2028'.b, ">".b => '\u003e'.b }
-json = ['{', '"\u2028":"x>"', '}'].join.b
-p json.gsub(Regexp.union(*escapes.keys), escapes), json.gsub(/\xE2\x80\xA8/n, escapes).encoding
-p "a>b".gsub(/>/, ">" => "G"), "a\u2028b".gsub(/\u2028/, "\u2028" => "S")
+# receiver's encoding (ActiveSupport's JSON escaping maps U+2028's bytes,
+# BINARY, to a six-character escape). The bytes are packed, so that nothing
+# between the source and the interpreter can change them.
+sep = [0xE2, 0x80, 0xA8].pack("C*")
+escaped = ["5c", "75", "32", "30", "32", "38"].map { |x| x.to_i(16) }.pack("C*")
+escapes = { sep => escaped, ">".b => "&gt;".b }
+json = ("[" + '"' + sep + '",' + '"x>"' + "]").b
+p json.gsub(Regexp.union(*escapes.keys), escapes), json.gsub(/\xE2\x80\xA8/n, escapes).bytes.size
+bin = ("a" + sep + "b").b
+p bin.gsub(/\xE2\x80\xA8/n, sep => "S"), bin.gsub(Regexp.union(sep), sep => "S"), bin.sub(/\xE2\x80\xA8/n, sep => "T")
+p "a>b".gsub(/>/, ">" => "G")
+
+# a String subclass's value, with a module prepended to String calling super
+module AroundGsub
+  def gsub(*a, &b) = "<" + super + ">"
+  def sub(*a, &b) = "<" + super + ">"
+end
+String.prepend AroundGsub
+class PlainSub < String; end
+p try { PlainSub.new("aa").gsub("a", "b") }, try { PlainSub.new("aa").sub("a", "b") }
+class BangSub < String
+  def gsub(*a) = super
+  def gsub!(*a) = super
+  def sub!(*a) = super
+end
+p try { BangSub.new("aa").gsub("a", "b") }
+bs = BangSub.new("aa")
+p try { bs.gsub!("a", "b") }, bs, try { bs.gsub!("z", "y") }, try { bs.sub!("b", "c") }, bs
