@@ -112,3 +112,32 @@ n = Time::CALLS.size
 p t1 < t2, t2 > t1, t1 <= t1, t1 >= t2, t1.send(:<, t2), t1.public_send(:>=, t1)
 p Time::CALLS.size - n
 p t1.between?(Time.at(0), t2), t2.clamp(t1, t1).to_i
+
+# 8. an Object-level operator saved on a user class, then redefined
+class Plainish
+  alias_method :saved_eq, :==
+  alias_method :saved_ne, :!=
+  alias_method :saved_case, :===
+  def ==(other) = :mine
+end
+pl = Plainish.new
+p try { pl.saved_eq(pl) }, try { pl.saved_eq(Plainish.new) }, try { pl.saved_ne(pl) }
+p try { pl.saved_case(pl) }, try { pl.saved_case(1) }
+
+# 9. ActiveSupport also saves Time#eql? and puts its own in front
+class Time
+  alias_method :eql_without_coercion, :eql?
+  def eql_with_coercion(other) = eql_without_coercion(other)
+  alias_method :eql?, :eql_with_coercion
+end
+p try { Time.at(1).eql?(Time.at(1)) }, try { Time.at(1).eql?(Time.at(2)) }
+p try { [Time.at(1), Time.at(1), Time.at(2)].uniq.size }, try { { Time.at(1) => :one }[Time.at(1)] }
+
+# 10. a refinement of the saved name does not answer for the saved builtin
+module RefineCmp
+  refine Time do
+    def <=>(other) = 7
+  end
+end
+using RefineCmp
+p try { Time.at(5).saved_cmp(Time.at(9)) }, try { Time.at(5) <=> Time.at(9) }

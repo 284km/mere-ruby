@@ -52,3 +52,22 @@ begin
 rescue NoMethodError => e
   puts e.message
 end
+
+# a block rides super into a builtin alias
+class Listish < Array
+  alias_method :old_map, :map
+  alias_method :old_each, :each
+end
+class Mapper < Listish
+  def old_map(&b) = super(&b)
+  def old_each(&b) = super(&b)
+end
+p Mapper.new([1, 2]).old_map { |x| x * 3 }
+seen = []
+Mapper.new([1, 2]).old_each { |x| seen << x }
+p seen
+class Tapper; alias_method :my_tap, :tap; end
+class Tapped < Tapper
+  def my_tap = super { |x| $tapped = x.class }
+end
+p Tapped.new.my_tap.class, $tapped

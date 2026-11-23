@@ -70,6 +70,36 @@ faults. Each one was reproduced without Rails as well.
    the receiver's chain (`alias_first`). Witness for 5 and 6:
    `corpus/932_super_into_a_builtin_alias.rb`.
 
+## The review's round (first review of 4928505)
+
+- `super(&b)` into an alias of `map` / `each` / `tap` dropped the block. It
+  is passed on now (`blt_alias_block_call`), past a Ruby body of the source
+  name once.
+- `blt_alias_redispatch` answers an operator that no builtin object class
+  has as BasicObject's or Kernel's (`==` identity, `!=` and `===` through the
+  object's own `==`). A user class that saved `==` and then defined its own
+  `==` used to get NoMethodError. It also suspends active refinements while
+  the saved builtin runs (`ref_suspended`), because ruby's C body sees none,
+  and a refinement of `Time#<=>` used to answer for `cmp0`.
+- The `super_missing` arm for an object's builtin now comes before
+  BasicObject's and Kernel's arms. `super` from a module prepended to Time
+  into `to_s`, `<=>` or `==` is Time's own (it was `#<object>`, nil and
+  identity). Descriptor streams (fdio_route) and objects with a singleton
+  class still take the old arms. The native arms do not answer through a
+  singleton class, and `def $stdout.puts(*a) = super` printed only through
+  Kernel's arm.
+- A saved builtin of an object class that is not an operator goes the same
+  object path once its name is redefined (ActiveSupport's
+  `eql_without_coercion`). Equal Times were not `eql?`: `uniq` kept both and
+  a Hash lookup missed.
+
+Follow-up (the same on main):
+- `super` from a module extended into `$stderr` / `$stdout`, or a singleton
+  method on one, into `#write`: "super: no superclass method 'write'". The
+  native arms do not answer through a singleton class.
+- `Method#original_name` of an alias of an alias, `Time.at(1).method(:<).owner`
+  (Time here, Comparable in ruby), and a saved `String#%` (TypeError).
+
 Left, not fixed here (not on the app's path):
 - `instance_method(:m).super_method` is nil when the method above is an alias
   of a builtin.

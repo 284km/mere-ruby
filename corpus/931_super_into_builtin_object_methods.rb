@@ -58,3 +58,18 @@ class Stamp < Time
   def hour = super * 10
 end
 p try { Stamp.at(3600).utc.hour }
+
+# names Kernel and BasicObject also have are Time's own here
+module TimeShow
+  def to_s = "<" + super + ">"
+  def <=>(other) = super
+  def ==(other) = super
+end
+Time.prepend TimeShow
+z = Time.at(0).utc
+p try { z.to_s }, try { z <=> Time.at(1) }, try { Time.at(1) < Time.at(2) }
+p try { [Time.at(3), Time.at(1)].sort.map(&:to_i) }, try { Time.at(1) == Time.at(1) }
+
+# a singleton's super still reaches Kernel#puts as before
+$stdout.singleton_class.class_eval { def puts(*a) = super }
+$stdout.puts("through the singleton")
