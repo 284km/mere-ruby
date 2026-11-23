@@ -13,10 +13,13 @@
  *   - When no other Ruby thread is alive (Thread.list has only the caller),
  *     there is nothing to run meanwhile: the function runs right there, on
  *     the interpreter's native thread, as before -- and a signal the
- *     program traps still reaches the unblocking function, or (for
- *     RUBY_UBF_IO / RUBY_UBF_PROCESS) interrupts its blocking call
- *     (inline_call). Note that Timeout leaves its own thread alive once it
- *     has been used, so every later call takes the worker below.
+ *     program traps still reaches a custom unblocking function
+ *     (inline_call). Not yet: RUBY_UBF_IO / RUBY_UBF_PROCESS do not
+ *     interrupt the call here, as on main -- a signal from outside goes to
+ *     the process's first thread, not to the interpreter's (a later PR:
+ *     forward it with pthread_kill). Note that Timeout leaves its own
+ *     thread alive once it has been used, so every later call takes the
+ *     worker below.
  *   - When other Ruby threads are alive, or the caller said
  *     RB_NOGVL_OFFLOAD_SAFE (rb_nogvl), it runs on a worker native thread,
  *     and the Ruby thread that called it waits for it the way Ruby waits for
@@ -215,16 +218,17 @@ static void inline_handler(int sig, siginfo_t *info, void *context) {
     else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) old->sa_handler(sig);
     if (inline_ubf && inline_ubf != RUBY_UBF_IO && inline_ubf != RUBY_UBF_PROCESS) inline_ubf(inline_ubf_data);
 }
+struct inline_job { void *(*func)(void *); void *data, *result; };
+static VALUE inline_run(VALUE arg) {
+    struct inline_job *job = (struct inline_job *)arg;
+    job->result = job->func(job->data);
+    return Qnil;
+}
 static void *inline_call(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2) {
     rb_unblock_function_t *outer = inline_ubf;
     void *outer_data = inline_ubf_data;
     int wrapped[NSIG] = { 0 };
-    /* (RUBY_UBF_IO / RUBY_UBF_PROCESS ask for the blocking call to be
-     *  interrupted -- CRuby sends the thread a signal for it. Here the
-     *  trapped signals themselves do it: SA_RESTART is taken off while the
-     *  function runs, so its blocking call returns EINTR when one comes,
-     *  as nio4r's select under Ctrl-C needs) */
-    if (ubf && !outer) {
+    if (ubf && ubf != RUBY_UBF_IO && ubf != RUBY_UBF_PROCESS && !outer) {
         for (int sig = 1; sig < NSIG; sig++) {
             struct sigaction current;
             if (sig == SIGKILL || sig == SIGSTOP || sigaction(sig, NULL, &current) != 0) continue;
@@ -233,19 +237,22 @@ static void *inline_call(void *(*func)(void *), void *data1, rb_unblock_function
             struct sigaction ours = current;
             ours.sa_sigaction = inline_handler;
             ours.sa_flags |= SA_SIGINFO;
-            ours.sa_flags &= ~SA_RESTART;
             if (sigaction(sig, &ours, NULL) == 0) wrapped[sig] = 1;
         }
     }
     inline_ubf = ubf;
     inline_ubf_data = data2;
     inline_running++;
-    void *result = func(data1);
+    /* (a with_gvl call inside may raise: the handlers go back first) */
+    struct inline_job job = { func, data1, NULL };
+    int state = 0;
+    rb_protect(inline_run, (VALUE)&job, &state);
     inline_running--;
     inline_ubf = outer;
     inline_ubf_data = outer_data;
     for (int sig = 1; sig < NSIG; sig++) if (wrapped[sig]) sigaction(sig, &inline_previous[sig], NULL);
-    return result;
+    if (state) rb_jump_tag(state);
+    return job.result;
 }
 /* (is any other Ruby thread alive, to run while the function does?) */
 static int others_alive(void) {

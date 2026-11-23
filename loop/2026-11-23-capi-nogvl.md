@@ -79,11 +79,18 @@ calls back with the GVL, and a kill ends a blocking read -- on both sides.
   the function left it and the caller gets it back. capi/check: a read on
   a bad descriptor gives -1 and EBADF to C, alone and with another thread
   alive.
-- (re-review 3) **[Minor] alone, a trap did not end a RUBY_UBF_IO call**
-  (USR1 to Interrupt: 2.5 s, ruby 0.7 s; main the same): while the function
-  runs right there, the trapped signals' handlers lose SA_RESTART, so the
-  blocking call returns EINTR when one comes -- what CRuby's signal to the
-  thread does. **[Minor]** stated: once Timeout has been used its thread
+- (re-review 3) **[Minor] alone, a trap does not end a RUBY_UBF_IO call**
+  (USR1 to Interrupt: ruby 0.7 s; here, as on main, the read goes on). Taking
+  SA_RESTART off the trapped handlers did not help and is gone again: the
+  interpreter runs on a second pthread, and a signal from outside goes to
+  the first (waiting in pthread_join), so the interpreter's blocking call
+  never sees it. Follow-up: forward it to the interpreter's thread with
+  pthread_kill (SIGVTALRM, as the worker path does).
+- (re-review 4) **[Minor] a raise in a with_gvl call inside a function run
+  right there left the trapped handlers replaced** (and a custom unblocking
+  function called later on a dead stack -- older than this PR): the call
+  runs under rb_protect, and the handlers go back before the exception goes
+  on. **[Minor]** stated: once Timeout has been used its thread
   stays alive, and later calls take the worker (and its TLS caveat).
   **[Suggestion]** ruby_thread_has_gvl_p is 0 inside a function run right
   there (1 again inside its with_gvl call).
