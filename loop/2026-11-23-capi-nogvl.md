@@ -36,8 +36,9 @@ calls back with the GVL, and a kill ends a blocking read -- on both sides.
   now too -- IO#wait_readable(0.1) under rb_protect, the unblocking function
   again before each turn -- so the other threads run and a trap still
   reaches Ruby. capi/check: a function that ignores its unblocking function
-  naps 400 ms; another thread raises into its caller; a ticker has ticked
-  at least 20 of its 30 times by the time the raise arrives (ruby too).
+  naps 400 ms; another thread raises into its caller; a ticker goes on
+  ticking between the raise and the function's end (ruby too; a count, not
+  a rate, so it holds under GC.stress).
 - **[Major] a raise in rb_thread_call_with_gvl's call leaked the worker and
   its pipe**: the call runs under rb_protect; the worker gets NULL, the
   function runs to its end, and the exception goes on from

@@ -555,15 +555,16 @@ rd.close; wr.close
 # (...a raise that a function cannot be woken for: the other threads still
 #  run until it ends, and then it is raised)
 ticks = 0
-ticker = Thread.new { 30.times { ticks += 1; sleep 0.01 } }
+ticker = Thread.new { loop { ticks += 1; sleep 0.01 } }
 napper = Thread.new { A.nogvl_stubborn(400) }
 sleep 0.05
 napper.raise(ArgumentError, "stop")
+at_raise = ticks
 ended = (napper.value rescue $!.class)
 seen = ticks
+ticker.kill
 check(ended == ArgumentError)
-check(seen >= 20)
-ticker.join
+check(seen > at_raise)
 # (...and a call back into Ruby that raises: the function ends, the
 #  exception reaches the caller, and the next call works)
 3.times { check((A.nogvl_call_raise rescue $!.message) == "from with_gvl") }
