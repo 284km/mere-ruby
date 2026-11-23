@@ -16,3 +16,5 @@ end
 r = /#{"\\p{Alpha}"}/
 p [r.source, r.encoding, r.fixed_encoding?]
 p [/\x80/n.encoding, /a/e.encoding, /a/s.encoding, /a/u.encoding, /#{"a"}/n.encoding]
+# (...but NOENCODING still makes it BINARY)
+p [Regexp.new(us('\x80'), Regexp::NOENCODING).encoding, Regexp.new(us('a'), Regexp::NOENCODING).encoding]
