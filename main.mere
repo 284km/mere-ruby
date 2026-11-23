@@ -4379,8 +4379,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if (str_len name == 7 && str_eq name "at_exit") && (if map_has meths "at_exit" then false else true) then
       at_exit_with_block (true, bp, bb, env)
     // Kernel#fork { }: Process.fork, with the block (note 436)
+    // (...which captures the enclosing method's block, as every block written
+    //  at a call site does: ActiveSupport's run_in_isolation yields to its
+    //  test from `fork do ... yield ... end`, and it was "no block given")
     else if (str_len name == 4 && str_eq name "fork") && (if map_has meths "fork" then false else true) then
-      invoke world (true, bp, bb, env) (VClass "Process") "(sng:Process)" "fork" Nil
+      invoke world (blk_capture blk (true, bp, bb, env) bb) (VClass "Process") "(sng:Process)" "fork" Nil
     // proc { } / lambda { } capture the block as a first-class VProc.
     // (...unless self's class defines its own: then `lambda { return 1 }` is a
     // call to it with a block, which stays a proc)
@@ -11523,6 +11526,13 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
            | _ -> VNil)
         else if (str_len name == 3 && str_eq name "map") || (str_len name == 7 && str_eq name "collect") then
           iter_result (range_map world encl theblk a int_max Nil) recv
+        // ...and the questions that stop at their answer: they walk, rather
+        // than make the endless array first. ActiveSupport's #many? is
+        // `any? { (cnt += 1) > 1 }`, and `(0..Float::INFINITY).many?` never
+        // came back (test_many_iterates_only_on_what_is_needed, 2 GiB).
+        else if range_seek_name name && (match args with Nil -> true | _ -> false)
+                && (match theblk with (true, _, _, _) -> true | _ -> false) then
+          iter_result (range_seek world encl theblk name a a int_max) recv
         else via_arr_iter world encl theblk recv (arr_new (range_vals world lo hi excl)) name args)
      // ...and an end past int64 (a positive bignum) walks as far as int64
      // does: `(1..2**70).each { }` walked NOTHING (no arm took it), and so did
@@ -12479,6 +12489,26 @@ and range_step_big = fn world -> fn encl -> fn theblk -> fn (v: Val) -> fn (by: 
    | FBreak r -> FBreak r | FReturn r -> FReturn r
    | _ -> range_step_big world encl theblk (arith_bin "+" v by) by)
 
+and range_seek_name = fn (name: str) ->
+  str_eq name "any?" || str_eq name "all?" || str_eq name "none?" || str_eq name "find"
+  || str_eq name "detect" || str_eq name "find_index"
+// an integer walk that stops at its answer (any? / all? / none? / find /
+// detect / find_index with a block); past `last` it gives the empty answer
+and range_seek = fn world -> fn encl -> fn theblk -> fn (mode: str) -> fn (start: int) -> fn (i: int) -> fn (last: int) ->
+  let done9 = FNext (if str_eq mode "all?" || str_eq mode "none?" then VBool true
+                     else if str_eq mode "any?" then VBool false else VNil) in
+  if i > last then done9
+  else (match run_block world encl theblk (Cons (VInt i, Nil)) with
+        | FBreak v -> FBreak v | FReturn v -> FReturn v
+        | f ->
+          (let t9 = truthy (flow_value f) in
+           if str_eq mode "any?" && t9 then FNext (VBool true)
+           else if str_eq mode "none?" && t9 then FNext (VBool false)
+           else if str_eq mode "all?" && (if t9 then false else true) then FNext (VBool false)
+           else if (str_eq mode "find" || str_eq mode "detect") && t9 then FNext (VInt i)
+           else if str_eq mode "find_index" && t9 then FNext (VInt (i - start))
+           else if i == last then done9
+           else range_seek world encl theblk mode start (i + 1) last))
 and range_map = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) -> fn (acc: Val list) ->
   if i > last then FNext (arr_new (val_rev acc Nil))
   else (match run_block world encl theblk (Cons (VInt i, Nil)) with
@@ -16443,6 +16473,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // cover? with a RANGE argument asks whether the whole range is inside
   else if str_eq name0 "cover?"
           && (match recv0 with VRange (_, _, _) -> true | _ -> false)
+          && range_native_wanted world recv0 name0
           && (match args0 with
               | Cons (VRange (_, _, _), Nil) -> true
               | Cons (VObj o9, Nil) -> (let (_, _, oc9, _) = world in exc_is_a world (map_get oc9 o9) "Range")
@@ -16450,7 +16481,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     invoke_val_c env world blk recv0 "__cover_range" args0 false
   else if (str_eq name0 "include?" || str_eq name0 "member?")
           && (match args0 with Cons (_, Nil) -> true | _ -> false)
-          && (match recv0 with VRange (_, _, _) -> true | _ -> false) then
+          && (match recv0 with VRange (_, _, _) -> true | _ -> false)
+          && range_native_wanted world recv0 name0 then
     (match recv0 with
      | VRange (lo9, hi9, ex9) ->
        (match args0 with
@@ -16464,6 +16496,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // ArgumentError instead of false.
   else if (str_eq name0 "cover?" || str_eq name0 "include?" || str_eq name0 "member?" || str_eq name0 "===")
           && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          && (str_eq name0 "===" || range_native_wanted world recv0 name0)
           // (an object BEGIN is handled by the arm above -- this one is for a
           // primitive range asked about an object, and the reverse)
           && (match recv0 with
@@ -16547,6 +16580,19 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           && (if str_eq name0 "!" then false else true)
           && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
     (match args0 with Cons (b0, _) -> apply_bin_vals world blk name0 recv0 b0 | _ -> VNil)
+  // Kernel#=== asked BY NAME of an object whose class writes none: the same
+  // object, or the object's own #== (rb_equal). `case` and the operator had
+  // it; `obj.__send__(:===, x)` -- minitest's assert_operator -- was
+  // "undefined method '==='" (ActiveSupport's deprecation tests).
+  else if str_eq name0 "===" && (match recv0 with VObj _ -> true | _ -> false)
+          && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true)
+          && (if builtin_obj_anc_has world (ancestors_of world (display_cls world (dispatch_cls_of world recv0))) name0 then false else true) then
+    (match args0 with
+     | Cons (b0, _) ->
+       VBool (rb_identical recv0 b0
+              || truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv0 "==" args0 false))
+     | Nil -> VNil)
   // the unary pair, same rule. `~x` is `-1 - x` in every integer width this
   // has, so it needs no arm of its own.
   else if (str_eq name0 "~" || str_eq name0 "!")
@@ -39723,6 +39769,13 @@ and recv_defines = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VClass c -> has_meth world ("(sng:" ++ c ++ ")") name
   | _ -> has_meth world (dispatch_cls_of world recv) name
+// Range's own include? / member? / cover? answer a range unless the program
+// wrote the name -- ActiveSupport prepends CompareWithRange to Range, whose
+// #include?(range) is cover? -- or the one call that skips the program's body
+// asked for it (a `super` from that body), which consumes the bypass here.
+and range_native_wanted = fn world -> fn (recv: Val) -> fn (name: str) ->
+  if prim_user_has world recv name then (if bi_skip_pass name then false else true)
+  else (let _ = bi_skip_pass name in true)
 and prim_user_has = fn world -> fn (recv: Val) -> fn (name: str) ->
   let c = dispatch_cls_of world recv in
   ((if str_eq c "" then false else has_meth world c name)
@@ -51588,6 +51641,10 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
     (if module_notification_super_ahead world recv meth then module_notification_native world args
      else super_undefined world superblk recv meth args)
   else if str_eq meth "method_missing" then missing_native_super world recv args
+  // Object#respond_to_missing? answers false for every receiver, a value too:
+  // ActiveSupport's tests redefine Array#respond_to_missing? and String's as
+  // `super`, and a value's branch below has no such method
+  else if str_eq meth "respond_to_missing?" && (match recv with VClass _ -> false | VObj _ -> false | _ -> true) then VBool false
   else if (str_eq meth "send" || str_eq meth "__send__" || str_eq meth "public_send")
           && sender_super_ahead world recv meth then
     native_sender_call gc_cenv0 world (blk_noblk superblk) recv meth args superblk
@@ -51715,6 +51772,36 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
      | VStr h9 when (str_len meth == 6 && str_eq meth "unpack") -> arr_new (unpack_call gc_cenv0 world h9 0 args)
      | VStr h9 when (str_len meth == 7 && str_eq meth "unpack1") ->
        (match unpack_call gc_cenv0 world h9 2 args with Cons (v, _) -> v | Nil -> VNil)
+     // ...and a String subclass's own sub! / gsub! / * / ... calling super:
+     // the leaf builtin that a plain String runs (dispatch_prim, which asks no
+     // Ruby definition), or with a block the dispatcher's arm past this body
+     // once (bi_skip). ActiveSupport::SafeBuffer wraps every unsafe String
+     // method that way, and each said "undefined method 'gsub!' for an
+     // instance of String" -- prim_method has no gsub!.
+     // (a Hash or an Array subclass the same: HashWithIndifferentAccess's
+     //  #default(key) and #transform_keys call super)
+     | _ when (match recv with VStr _ -> true | VHsh _ -> true | VArr _ -> true | _ -> false)
+              && (match superblk with (true, _, _, _) -> true | _ -> false) ->
+       (let _ = map_set bi_skip "n" meth in
+        let r9 = try_or_msg (fn (u: unit) -> invoke_with_block gc_cenv0 world superblk recv meth args superblk)
+                   (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
+        let _ = map_clear bi_skip in r9)
+     // (an operator is the value's operator: `def *(n) = self.class.new(super)`)
+     | _ when (match recv with VStr _ -> true | VHsh _ -> true | VArr _ -> true | _ -> false)
+              && is_binary_op_name meth && (match args with Cons (_, Nil) -> true | _ -> false) ->
+       (match args with Cons (a9, _) -> eval_bin_prim gc_cenv0 world superblk meth recv a9 | Nil -> VNil)
+     // (Hash#default(key) runs the default proc with the hash and the key:
+     //  HashWithIndifferentAccess#default converts the key and calls super)
+     | VHsh _ when str_eq meth "default" && (match args with Cons (_, Nil) -> true | _ -> false) ->
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        match invoke_val_c gc_cenv0 world nb9 recv "default_proc" Nil false with
+        | VProc pr9 -> invoke_val_c gc_cenv0 world nb9 (VProc pr9) "call" (Cons (recv, args)) false
+        | _ -> dispatch_prim gc_cenv0 world superblk recv "default" Nil false)
+     // (only the names prim_method has no answer for: dispatch_prim asks
+     //  String's own Ruby definitions, so `String.prepend M` with M#upcase
+     //  calling super came back to M#upcase when every name went there)
+     | VStr _ when str_eq meth "gsub" || str_eq meth "sub" || str_eq meth "gsub!" || str_eq meth "sub!" ->
+       dispatch_prim gc_cenv0 world superblk recv meth args false
      | _ ->
        (match superblk with
         | (true, _, _, _) -> builtin_iter world superblk superblk recv meth args
@@ -51782,6 +51869,14 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   | VClass ac9 when (str_len meth == 8 && str_eq meth "allocate") && (if map_has modules ac9 then false else true)
                     && (if str_eq ac9 "String" || str_eq ac9 "Array" || str_eq ac9 "Hash" then false else true) ->
     alloc_empty world ac9
+  // ...and from a module prepended to Range (ActiveSupport's
+  // CompareWithRange#include? / #cover?): Range's own arm, past the Ruby body
+  // once (range_native_wanted consumes the bypass)
+  | VRange (_, _, _) when str_eq meth "include?" || str_eq meth "member?" || str_eq meth "cover?" ->
+    (let _ = map_set bi_skip "n" meth in
+     let r9 = try_or_msg (fn (u: unit) -> invoke_val_c gc_cenv0 world superblk recv meth args false)
+                (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
+     let _ = map_clear bi_skip in r9)
   // `super` from a module prepended to a number's class (`class Integer;
   // prepend M` and M#+ calling super) is the builtin operation
   | VInt _ -> prim_method recv meth args
