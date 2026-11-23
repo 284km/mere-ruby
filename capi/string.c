@@ -107,24 +107,20 @@ void rb_str_modify_expand(VALUE str, long expand) {
     rb_str_modify(str);
     long len = RSTRING_LEN(str);
     if (expand >= LONG_MAX - len) rb_raise(rb_eArgError, "string size too big");
-    mr_string_reserve(str, len + expand);
+    if (expand > 0) mr_string_reserve(str, len + expand);
 }
 size_t rb_str_capacity(VALUE str) { return (size_t)mr_string_capacity(str); }
 void rb_str_set_len(VALUE str, long len) {
     rb_str_modify(str);
     long capa = mr_string_capacity(str);
     if (len > capa || len < 0) rb_bug("probable buffer overflow: %ld for %ld", len, capa);
-    struct RString *s = RSTRING(str);
-    s->len = len;
-    memset(s->as.heap.ptr + len, 0, (size_t)mr_string_terminator(str));
+    RSTRING(str)->len = len;
+    memset(RSTRING_PTR(str) + len, 0, (size_t)mr_string_terminator(str));
 }
 VALUE rb_str_resize(VALUE str, long len) {
     if (len < 0) rb_raise(rb_eArgError, "negative string size (or size too big)");
     rb_str_modify(str);
-    if (len > mr_string_capacity(str)) mr_string_reserve(str, len);
-    struct RString *s = RSTRING(str);
-    s->len = len;
-    memset(s->as.heap.ptr + len, 0, (size_t)mr_string_terminator(str));
+    mr_string_resize(str, len);
     return str;
 }
 VALUE rb_str_cat(VALUE str, const char *ptr, long len) {
@@ -132,15 +128,16 @@ VALUE rb_str_cat(VALUE str, const char *ptr, long len) {
     if (len == 0) { rb_str_modify(str); return str; }
     rb_str_modify(str);
     long old = RSTRING_LEN(str);
-    /* (ptr may point into this very buffer, which the reserve can move) */
+    if (old > LONG_MAX - len) rb_raise(rb_eArgError, "string sizes too big");
+    /* (ptr may point into this very buffer, which the growing can move) */
     const char *base = RSTRING_PTR(str);
     long inside = (ptr >= base && ptr <= base + old) ? (long)(ptr - base) : -1;
-    mr_string_reserve(str, old + len);
-    struct RString *s = RSTRING(str);
-    if (inside >= 0) ptr = s->as.heap.ptr + inside;
-    memmove(s->as.heap.ptr + old, ptr, (size_t)len);
-    s->len = old + len;
-    memset(s->as.heap.ptr + s->len, 0, (size_t)mr_string_terminator(str));
+    mr_string_grow(str, old + len);
+    char *p = RSTRING_PTR(str);
+    if (inside >= 0) ptr = p + inside;
+    memmove(p + old, ptr, (size_t)len);
+    RSTRING(str)->len = old + len;
+    memset(p + old + len, 0, (size_t)mr_string_terminator(str));
     return str;
 }
 VALUE rb_str_cat_cstr(VALUE str, const char *ptr) { return rb_str_cat(str, ptr, (long)strlen(ptr)); }
@@ -184,7 +181,12 @@ int rb_str_hash_cmp(VALUE a, VALUE b) { return !RTEST(mr_calls(a, "eql?", 1, b))
 VALUE rb_str_inspect(VALUE str) { return mr_calls(str, "inspect", 0); }
 VALUE rb_str_dump(VALUE str) { return mr_calls(str, "dump", 0); }
 VALUE rb_str_split(VALUE str, const char *sep) { return mr_calls(str, "split", 1, rb_str_new_cstr(sep)); }
-VALUE rb_str_freeze(VALUE str) { return rb_obj_freeze(str); }
+/* (string.c: String#freeze resizes to the length, then freezes) */
+VALUE rb_str_freeze(VALUE str) {
+    if (RB_OBJ_FROZEN(str)) return str;
+    rb_str_resize(str, RSTRING_LEN(str));
+    return rb_obj_freeze(str);
+}
 VALUE rb_str_new_frozen(VALUE str) {
     if (RB_OBJ_FROZEN(str)) return str;
     return rb_obj_freeze(rb_str_dup(str));

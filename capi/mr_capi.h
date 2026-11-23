@@ -34,7 +34,7 @@
 
 /* What C asks of the interpreter (capi_up in main.mere answers each). */
 enum mr_op {
-    MR_DESCRIBE = 1,    /* a: handle -> type | frozen<<5 | enc<<8; word 0: its class */
+    MR_DESCRIBE = 1,    /* a: handle -> type | frozen<<5 | singleton<<6 | enc<<8 | a String's bytesize<<32; word 0: its class */
     MR_STR_GET,         /* a: String -> its bytes (given) */
     MR_STR_SET,         /* a: String, bytes: its new contents */
     MR_ARY_GET,         /* a: Array, b: version held + 1 -> length (words: elements, then version), or -1: unchanged */
@@ -153,10 +153,13 @@ extern unsigned long mr_epoch;
 /* The String's bytes changed on the interpreter's side by this C's own
  * request: nothing to write back, and the struct is stale. */
 void mr_mirror_forget(VALUE obj);
+void mr_mirror_frozen_by_c(VALUE obj);
 
 long mr_string_capacity(VALUE str);
 int mr_string_terminator(VALUE str);
 void mr_string_reserve(VALUE str, long capa);
+void mr_string_grow(VALUE str, long total);
+void mr_string_resize(VALUE str, long len);
 
 /* ---- symbol.c ----------------------------------------------------------- */
 const char *mr_id_name(ID id, long *len);
