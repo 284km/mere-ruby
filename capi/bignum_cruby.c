@@ -21,9 +21,12 @@
  *     from a dmark (kept for good from then on, even after its data object
  *     is gone: a leak, the rarer case) -- or for as long as a registered
  *     address (rb_gc_register_address, rb_global_variable) holds it: checked
- *     when a C call ends and no other is in progress (a C local of an outer
- *     call may have taken it out of the slot), so an overwritten static slot
- *     lets the old one go. One C only stores in a struct, which no
+ *     when a C call ends and no other is in progress on its stack (a C
+ *     local of an outer call may have taken it out of the slot), so an
+ *     overwritten static slot lets the old one go. One made before a Fiber
+ *     paused inside C stays until that Fiber resumes (its locals may have
+ *     it) -- for good if it never does, a leak of what was made before the
+ *     pause, not after (mr_vbig_leave). One C only stores in a struct, which no
  *     collection marks before the call ends, is freed with the call:
  *     register it.
  *
@@ -137,7 +140,8 @@ extern void mr_transit_restore(struct mr_transit *);
 extern const void *mr_capi_frame(void);
 
 /* ---- raw Bignums ------------------------------------------------------- */
-struct vbig { VALUE obj; size_t size; const void *owner; };
+struct vbig { VALUE obj; size_t size; const void *owner; unsigned long long born; };
+extern unsigned long long mr_vbig_seq;   /* (one more per raw Bignum made: see mr_vbig_leave) */
 struct vlist { struct vbig *at; long count, cap; };
 /* (temporaries, freed when their C call ends; and the ones kept for good,
  *  apart, so that the end of every C call does not walk them) */
@@ -218,7 +222,7 @@ VALUE mr_vbig_newobj(VALUE klass, VALUE flags, size_t size) {
     if (!big) rb_memerror();
     big->basic.flags = flags;
     memcpy((void *)&big->basic.klass, &klass, sizeof(VALUE));
-    struct vbig b = { (VALUE)big, size, mr_capi_frame() };
+    struct vbig b = { (VALUE)big, size, mr_capi_frame(), ++mr_vbig_seq };
     push(&temps, b);
     set_put((VALUE)big);
     return (VALUE)big;
@@ -253,9 +257,12 @@ static void raw_free(VALUE obj) {
 }
 /* The raw Bignums the registered addresses hold right now: read once per
  * end of a call, into a set of their own, so that asking about each one is
- * O(1) -- not a walk of every address per raw Bignum. (Only raw Bignums go
- * in, so it is no bigger than mr_vbig_live; 0 is empty.) */
+ * O(1) -- not a walk of every address per raw Bignum. (Sized from how many
+ * addresses are registered, which is all it can hold -- not from how many
+ * raw Bignums one call once made -- and grown or shrunk to that; 0 is
+ * empty.) */
 extern void mr_gc_each_address_value(void (*visit)(VALUE));
+extern long mr_gc_address_count(void);
 static VALUE *holder_slots;
 static long holder_cap;
 static void holder_put(VALUE v) {
@@ -265,9 +272,9 @@ static void holder_put(VALUE v) {
     holder_slots[i] = v;
 }
 static void holders_read(void) {
-    long want = 16;
-    while (want < mr_vbig_live * 2) want *= 2;
-    if (want > holder_cap) {
+    long want = 16, addresses = mr_gc_address_count();
+    while (want < addresses * 2) want *= 2;
+    if (want > holder_cap || want * 4 < holder_cap) {
         free(holder_slots);
         holder_slots = calloc((size_t)want, sizeof(VALUE));
         if (!holder_slots) mr_fatal("out of memory");
@@ -287,13 +294,21 @@ static int held_by_address(VALUE v) {
 /* The C call `frame` ends: the raw Bignums it made are gone (whatever of
  * them reached the interpreter is an Integer there by now), but for the
  * ones a registered address holds. Those are looked at again only when
- * `no_c_frame`: no C call is in progress on any stack, so no C local can
+ * `outermost` -- no C call left on this stack -- so no C local here can
  * still have one. (A nested call's end must not free what its caller took
- * out of a slot into a local: CRuby's collection sees the C stack.) */
-void mr_vbig_leave(const void *frame, int no_c_frame) {
+ * out of a slot into a local: CRuby's collection sees the C stack.)
+ *
+ * A Fiber's stack paused inside C (a parked chain, core.c) has C locals
+ * too, but they do not run while it is parked: they can only have what was
+ * made before it was. `parked_seq` is the newest park's mr_vbig_seq (0:
+ * none), and a held one made before it stays -- until that chain resumes,
+ * or for good if it never does (a Fiber dropped inside C: what was made
+ * before its park, not what came after). */
+unsigned long long mr_vbig_seq;
+void mr_vbig_leave(const void *frame, int outermost, unsigned long long parked_seq) {
     int own = 0;
     for (long i = 0; i < temps.count && !own; i++) own = temps.at[i].owner == frame;
-    if (!own && !(no_c_frame && held.count)) return;
+    if (!own && !(outermost && held.count)) return;
     holders_read();
     /* the call's own temporaries: freed, or held while an address holds them */
     long left = 0, n = temps.count;
@@ -306,11 +321,11 @@ void mr_vbig_leave(const void *frame, int no_c_frame) {
     }
     temps.count = left;
     /* ...and the held ones no registered address holds any more */
-    if (no_c_frame) {
+    if (outermost) {
         long kept_held = 0;
         for (long i = 0; i < held.count; i++) {
             struct vbig b = held.at[i];
-            if (held_by_address(b.obj)) { held.at[kept_held++] = b; continue; }
+            if (b.born < parked_seq || held_by_address(b.obj)) { held.at[kept_held++] = b; continue; }
             raw_free(b.obj);
             set_del(b.obj);
         }

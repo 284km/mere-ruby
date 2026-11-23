@@ -53,6 +53,7 @@ void rb_gc_mark_maybe(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
 void mr_gc_each_address_value(void (*visit)(VALUE)) {
     for (long i = 0; i < address_count; i++) visit(*addresses[i]);
 }
+long mr_gc_address_count(void) { return address_count; }
 void rb_gc_mark_locations(const VALUE *start, const VALUE *end) {
     for (; start < end; start++) mr_mark_value(*start);
 }

@@ -429,4 +429,13 @@ check(A.kept_bignums == [0, 0])
   GC.start
   check(A.slot_swap(by_block) == 0)
 end
+# (...and while a Fiber is paused inside that C call, the slot is filled
+#  and overwritten from outside it: the paused local still has its own)
+A.slot_fill
+paused = Fiber.new { A.slot_swap_yield { Fiber.yield } }
+paused.resume
+3.times { A.slot_fill }
+GC.start
+A.noop
+check(paused.resume == 0)
 puts "api contracts: #{$count} passed"

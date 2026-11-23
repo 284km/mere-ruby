@@ -11187,3 +11187,17 @@ the C names can point there and bignum.c leaves.
   Bignums they hold (mr_gc_each_address_value), so it is O(addresses +
   held), and nothing is read at the end of a call that made no raw Bignum
   while the outer one is still running.
+- (re-review 3) **[Minor] one Fiber paused inside C stopped the sweep for
+  good** (no parked chain at all was the condition): a Fiber dropped inside
+  a C call, or an external Enumerator over a C #each left after one #next,
+  and every overwritten slot stayed (+84 MB per 20,000). A parked chain's C
+  locals do not run while it is parked, so they can have only what was made
+  before it was: every raw Bignum has a birth number (mr_vbig_seq), each
+  park notes it, and the sweep keeps only the held ones born before the
+  newest park. The reviewer's pattern: +2 MB, then +2 MB (ruby: +13, +0).
+  capi/check: a C local on a Fiber paused inside rb_yield still reads its
+  value after the slot is overwritten from outside, GC.start and a call.
+- (re-review 3) **[Suggestion] the holder set was sized from mr_vbig_live
+  at its largest**, and cleared whole on every sweep. It is sized from the
+  registered addresses (all it can hold), grown or shrunk to that. An empty
+  C call after one that made 100,000 temporaries: 3.6 us (3.6 before it).

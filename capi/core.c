@@ -56,8 +56,8 @@ static void words_need(long n) {
 }
 extern long mr_vbig_live;
 extern VALUE mr_vbig_out(VALUE v);
-extern void mr_vbig_leave(const void *frame, int no_c_frame);
-static long parked_chains(void);
+extern void mr_vbig_leave(const void *frame, int outermost, unsigned long long parked_seq);
+static unsigned long long parked_newest(void);
 void mr_put_words(long n, const VALUE *v) {
     /* (a raw Bignum bignum.c made is the Integer it says, past this point:
      *  capi/bignum_cruby.c. Converted BEFORE the words are set: making the
@@ -536,8 +536,9 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
         result = frame.pending;
     }
     mr_mirrors_leave(&frame, frame.prev == NULL);
-    /* (no C call left on this stack, nor on a Fiber's parked one) */
-    mr_vbig_leave(&frame, frame.prev == NULL && parked_chains() == 0);
+    /* (no C call left on this stack; and what a Fiber's parked one may
+     *  still have: see mr_vbig_leave) */
+    mr_vbig_leave(&frame, frame.prev == NULL, parked_newest());
     cur = frame.prev;
     depth--;
     mr_epoch++;
@@ -608,10 +609,17 @@ int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which]
 /* A coroutine switch. The calls in progress are a chain through C stack
  * frames, so each stack has its own; the interpreter says when it changes
  * stacks, and the chain of the stack being left is put aside by its number. */
-struct mr_parked { int stack; struct mr_frame *frame; int depth; };
+/* (`seq`: mr_vbig_seq when it was parked -- its C locals can have no raw
+ *  Bignum made after that, since they do not run until it resumes) */
+struct mr_parked { int stack; struct mr_frame *frame; int depth; unsigned long long seq; };
+extern unsigned long long mr_vbig_seq;
 static struct mr_parked *parked;
 static long parked_count, parked_cap;
-static long parked_chains(void) { return parked_count; }
+static unsigned long long parked_newest(void) {
+    unsigned long long newest = 0;
+    for (long i = 0; i < parked_count; i++) if (parked[i].seq > newest) newest = parked[i].seq;
+    return newest;
+}
 int mr_capi_switch(int from, int to) {
     if (mr_without("switch")) return 0;
     if (cur) {
@@ -623,6 +631,7 @@ int mr_capi_switch(int from, int to) {
         parked[parked_count].stack = from;
         parked[parked_count].frame = cur;
         parked[parked_count].depth = depth;
+        parked[parked_count].seq = mr_vbig_seq + 1;
         parked_count++;
         cur = NULL;
         depth = 0;

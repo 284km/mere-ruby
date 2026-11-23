@@ -227,6 +227,14 @@ static VALUE slot_swap(VALUE self, VALUE by_block) {
     else rb_funcall(self, rb_intern("noop"), 0);
     return old;
 }
+/* (...and one whose nested call is a yield, which a Fiber may pause in) */
+static VALUE slot_swap_yield(VALUE self) {
+    (void)self;
+    volatile VALUE old = swap_slot;
+    swap_slot = Qnil;
+    rb_yield(Qnil);
+    return old;
+}
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
     kept_marked = rb_big_new(3, 1);
@@ -237,6 +245,7 @@ void Init_api_fixture(void) {
     rb_gc_register_address(&swap_slot);
     rb_define_singleton_method(mod, "slot_fill", slot_fill, 0);
     rb_define_singleton_method(mod, "slot_swap", slot_swap, 1);
+    rb_define_singleton_method(mod, "slot_swap_yield", slot_swap_yield, 0);
     rb_define_singleton_method(mod, "ptr_after_yield", ptr_after_yield, 1);
     rb_define_singleton_method(mod, "ary_ptr_after_yield", ary_ptr_after_yield, 1);
     rb_define_singleton_method(mod, "byte_after_yield", byte_after_yield, 2);
