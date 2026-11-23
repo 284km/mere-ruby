@@ -109,3 +109,90 @@ TIMED, and fail on time, not on an answer:
   is the reference's line for line once it is all there. What it would take:
   booting rackup + puma ten times faster -- the interpreter's general speed,
   not something of puma's.
+
+## puma integration tests: per-side source trees, and three more fixes
+
+`test/runner --integration` starts `bin/puma` from the source tree with the
+tree's `lib/`, which has no compiled extension: on both sides every server
+died of `cannot load such file -- puma/puma_http11`. So each side gets its
+own copy of the tree with that side's built `puma_http11.bundle` in
+`lib/puma/`, and its Gemfile names the tree (`gem "puma", path: ...`), so
+unit and integration tests load the same puma. What that run showed:
+
+- **A long C call that calls back only through the C API held everything
+  it asked for until it returned.** The first mere run was killed at 14 GB
+  in Http11ParserTest#test_horrible_queries (80 x 1024 identical headers).
+  puma's http_field joins a repeated header with rb_str_cat2 + rb_str_cat
+  on the String it got from rb_hash_aref; each append fetches the whole
+  growing String into the mirror and writes it all back (the interpreter ran
+  in between, so the struct is stale). Two things kept every copy:
+  - no collection: nothing in those requests is a Ruby statement, so there
+    was no safepoint (GC.count advanced by 1 in the call). capi/core.c
+    mr_up now sends MR_SAFEPOINT (33) before the requests that make
+    something -- a String's bytes fetched, a call, a new String -- with what
+    the request has put in transit set aside around it, and not while a
+    collection is marking (a dmark's own request) nor for the write-back
+    itself (MR_STR_SET / MR_ARY_SET, in the middle of a flush). capi_up
+    answers it with gc_point_capi: a collection when one is due, which is
+    one in the middle of a statement, rooted as an off-stack collection
+    roots any (note 270) -- the interrupted stack is read for VALUEs, C's
+    frames and the outer calls' with it, an Array's fetched elements and a
+    dmark's are asked, and C's own writes were flushed just before. Under
+    MERE_RUBY_GC_STRESS=N it collects at every 16*N-th of these, not every
+    N-th: at every one, capi_check's api contracts ran past their 120 s
+    bound (a collection every 25 ms of C API calls).
+  - the statement's region: what a request makes on the way -- the copy of
+    a String's bytes handed to C, the bytes C wrote back before they are a
+    String -- went to the region of the statement that called C, which
+    stays open for the whole call and which no collection gives back. Each
+    request now runs in a region of its own (capi_enter's `up`, region CUP).
+
+  Measured with the same binary otherwise (the "before" is native-gems-r2's
+  9aa9a0ce build, what #190 merged), puma's parser on N x 1024 identical
+  headers, RSS sampled every 0.25 s from outside:
+
+  | headers | before: peak RSS, collections in the call | after |
+  |---|---|---|
+  | 12 x 1024 | 5,406 MB, 1 | 276 MB, 33 |
+  | 16 x 1024 | 6,759 MB, 1 | 443 MB, 56 |
+
+  (The safepoint alone took 12 x 1024 to 3,157 MB with 32 collections; the
+  regions are the rest.) capi/check/api.rb: join_in_c does the parser's join
+  400 times with a 64 KB String made and dropped each turn, and the
+  collector runs during it, on both sides; hold_locals keeps a String and an
+  Array only in C locals across 120 Strings made and 120 calls, and again
+  with the call paused halfway in a Fiber while the program makes garbage and
+  runs GC.start -- both intact afterwards, on both sides and under
+  MERE_RUBY_GC_STRESS=1. capi_check's api file under stress: 33.7 s, the
+  same as main's contracts on main's binary (33.5 s).
+  The note 553 §7.4 retention (Databases kept by the conservative scan) is
+  the same: a Database opened, 20 collations registered, closed, 351 times,
+  then GC.start -- 15 Databases left and +25-26 MB on the before binary, 13
+  and +25-26 MB after (two runs each; my reconstruction of work2026-fd's
+  repro, which counted more: its comparator may differ).
+  ⚠ test_horrible_queries itself is NOT run (`--exclude`): its memory is now
+  bounded, but its time is not. Every crossing writes back each String C
+  touched in the call, which means hashing all of it to see whether C wrote
+  -- the 1.1 MB request, 3 crossings per header, 80 x 1024 headers -- and
+  the joined header is fetched and written back whole at each append. On
+  ruby the test takes milliseconds; here it is hours. What it would take:
+  knowing that C wrote into a buffer without reading it all (page
+  protection on the mirror's buffer, say), and appending through the
+  interpreter when the struct is stale. (Appending by `<<` alone, tried
+  this round, was slower: the force_encoding round trip copies.)
+- **C's write into a FROZEN String's buffer raised FrozenError** (5 tests
+  of Http11ParserTest). puma's parser upcases each header name in place in
+  the request it is given -- `X-Strip-Me` becomes `X_STRIP_ME` in the
+  caller's String, a frozen literal in these tests, and in ruby the frozen
+  String's bytes simply change. Frozen is what rb_str_modify refuses, and
+  every function of the C API that changes a String asks it first; the
+  write-back (MR_STR_SET, used by nothing else) refused it too. It writes
+  the bytes now. capi/check/api.rb: write_frozen.
+- **Process.kill with a negative pid** (a process group) answered ESRCH
+  for a group that was there. Signals to another process go to kill(1), and
+  `kill -s KILL -123` reads `-123` as a second signal ("invalid signal
+  specification"); `--` goes before the pid now. The integration helper
+  stops an unresponsive server with `Process.kill(:KILL, -pgid)`, so the
+  server ran on, its test waited out its 395 s, and the tests after it met
+  its leftovers (900-second waits in pumactl and SSL tests that pass alone).
+  corpus 911.
