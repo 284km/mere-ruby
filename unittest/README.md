@@ -161,7 +161,8 @@ that audit. Bootstrap, basic and RubySpec remain separate measurements.
 The workflow pins the Mere compiler and Ruby source to full commit SHAs.
 `workflow_dispatch` accepts `mere_ref`, a full published Mere commit SHA, to
 measure a newer compiler without changing the default pin. The macOS jobs use
-`macos-26` consistently. Linux still has its separate compilation smoke test.
+`macos-15` consistently: `macos-26` runners were too scarce, and its jobs
+sat queued for hours. Linux still has its separate compilation smoke test.
 
 The `build-macos` job builds mere-ruby once with `tools/build.sh` at O2 and uploads
 the binary and its provenance. Corpus and native lifecycle checks run in the
@@ -613,7 +614,7 @@ runner crosses them.
   1,081,6xx KB in five runs each, and the shard's rerun gave 42 / 42.
   Rerun its shard.
 
-**Jobs that never ran.** A `macos-26` job can wait without a runner and be
+**Jobs that never ran.** A macOS job can wait without a runner and be
 cancelled after 15-30 min (the job has no `runner_name`). A shard that reaches
 its job timeout is cancelled the same way, and every file it held comes back
 MISSING_SHARD: the totals drop by thousands and the comparison is meaningless.
