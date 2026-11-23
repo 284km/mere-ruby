@@ -1487,12 +1487,25 @@ let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
 // (Monitor#synchronize then raised ThreadError). The type checker keeps this
 // list honest in one direction: a non-Val map here is a build error. A MISSING
 // map is the direction to fear when adding a new global store.
-let gc_mark_roots = fn metadata -> fn env -> fn live ->
+// The marking's own tables, emptied and their arenas handed back. A recycle
+// asks every suspended stack whether it points into the arena, and the first
+// ask after a stack stopped walks all it reaches (__lang_pin_gather) -- the
+// same walk the scan of that stack below makes, which keeps the answer. Asked
+// here, at the start of a mark, it was the interrupted body's stack walked
+// twice per collection: 2.6% of test_ast. So a collection empties them at its
+// end (gc_collect), once its scan has gathered the pins, and a mark that
+// finds them empty does nothing here; one that does not (a collection on the
+// stack, or the fiber reclaim pass) empties them here as before.
+let gc_pend_release = fn (u: unit) ->
   let _ = map_recycle gc_live_cls in
   let _ = vec_recycle gc_cls_pend in
   let _ = map_recycle gc_ref_live in
   let _ = vec_recycle gc_ref_pend in
-  let _ = vec_recycle gc_obj_pend in
+  vec_recycle gc_obj_pend;
+let gc_mark_roots = fn metadata -> fn env -> fn live ->
+  let _ = (if map_len gc_live_cls > 0 || vec_len gc_cls_pend > 0 || map_len gc_ref_live > 0
+              || vec_len gc_ref_pend > 0 || vec_len gc_obj_pend > 0
+           then gc_pend_release () else ()) in
   // (Ruby's C API: the VALUEs C registered, and -- while a call into C is in
   //  progress -- the ones on this stack, which is C's local variables. A
   //  stopped stack's are read with its handles, below.)
@@ -2106,7 +2119,7 @@ let gc_sweep_classes = fn (nc: bool) ->
            drop_tag 0) in
   let _ = gc_drop_sh hng_sng_base dead_tags "" in
   let _ = (if compact && vec_len dead_tags > 0 then
-    (let _ = map_compact hng_store in let _ = map_compact hng_arr_ids in map_compact hng_sng_base) else ()) in
+    (let _ = map_compact hng_store in let _ = map_compact hng_arr_ids in let _ = map_compact hng_prim_ids in map_compact hng_sng_base) else ()) in
   let dead_refs = vec_new () in
   let _ = map_iter ref_snaps (fn (key: int) -> fn (_entries: (str * str) list) ->
     if map_has gc_ref_live key then () else vec_push dead_refs key) in
@@ -2559,6 +2572,8 @@ let gc_collect = fn env -> fn world ->
     // pools, now that every stack is suspended (note 303)
     let _ = (if nc then () else qv_drain ()) in
     let _ = (if nc then () else hidx_drain ()) in
+    // (the marking's tables, for the next mark: gc_pend_release)
+    let _ = (if nc then () else gc_pend_release ()) in
     let _ = vec_set qv_ctr 3 0 in
     let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (gc_live_count live) ++ " ivars2=" ++ str_of_int (map_len ivars)
                                      ++ " str_store=" ++ str_of_int (str_bytes ()) ++ " str_pch=" ++ str_of_int (map_bytes str_pch)
@@ -18636,7 +18651,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      | _ -> VNil)
   else
   // a singleton method defined on this exact String/Array/Hash wins.
-  let hk = hng_key recv in
+  let hk = hng_key_q recv in
   if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) name then
     // (with an explicit receiver its visibility holds, as for any object's:
     //  main's -- `singleton_class.class_eval { private def m; end }` -- was
@@ -32072,9 +32087,22 @@ and signal_ruby_handled = fn (nm: str) ->
   str_eq nm "INT" || str_eq nm "HUP" || str_eq nm "QUIT" || str_eq nm "TERM"
   || str_eq nm "ALRM" || str_eq nm "USR1" || str_eq nm "USR2"
 and signal_initial = fn (nm: str) ->
-  if signal_ruby_handled nm then mkstr "DEFAULT"
+  if signal_ruby_handled nm then mkstr (if signal_inherited_ign nm then "IGNORE" else "DEFAULT")
   else if str_eq nm "PIPE" || str_eq nm "SYS" || str_eq nm "EXIT" then VNil
   else mkstr "SYSTEM_DEFAULT"
+// (the question is put by installing the marking handler with ruby's keep
+//  rule -- an inherited SIG_IGN is put back and reported -- and, when it was
+//  not ignored, giving the default back at once: no trap has been set for
+//  this name yet, so the default is what was there)
+and signal_inherited_ign = fn (nm: str) ->
+  if map_has sig_inherited nm then map_get sig_inherited nm == 1
+  else if map_has signal_traps nm || map_has sig_armed nm then false
+  else
+    (let n9 = sig_host_num nm in
+     let r9 = (if n9 <= 0 then 0 - 2 else try_or (fn (u: unit) -> proc_sig_catch n9 1) (0 - 2)) in
+     let _ = (if r9 == 0 then (let _ = try_or (fn (u: unit) -> proc_sig_default n9) 0 in ()) else ()) in
+     let _ = map_set sig_inherited nm (if r9 == 1 then 1 else 0) in
+     r9 == 1)
 and signal_arg_name = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VInt n9 ->
@@ -32377,7 +32405,9 @@ and signal_trap_callable = fn (sg: str) ->
   map_has signal_traps nm && (match map_get signal_traps nm with VNil -> false | VStr _ -> false | _ -> true)
 and signal_deliver_self = fn env -> fn world -> fn (sg: str) ->
   let nm = signal_short sg in
-  if (if map_has signal_traps nm then false else true) then false
+  if (if map_has signal_traps nm then false else true) then
+    // (ignored since the process started: the kernel drops it)
+    signal_ruby_handled nm && signal_inherited_ign nm
   else
     (match map_get signal_traps nm with
      | VNil -> true
@@ -36075,7 +36105,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
     // encoding) with :invalid handling per broken SEQUENCE, apply the
     // newline options, then encode per codepoint with :undef handling
     // (:replace or a :fallback proc/hash). encode! writes back.
-    (match recv with
+    (let enc_out9 = (match recv with
      | VStr h ->
        (let encname_of = fn (v: Val) ->
           (match v with
@@ -36459,7 +36489,11 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         } in
         if (str_len name == 7 && str_eq name "encode!") then (let _ = sset h bytes in let _ = senc_set h to in recv)
         else (let c = mkstr bytes in (match c with VStr id -> let _ = senc_set id to in c | _ -> c)))
-     | _ -> VNil)
+     | _ -> VNil) in
+     // (a String subclass's instance encodes into one of its class, as
+     //  ruby's str_encode duplicates the receiver: S.new("a").encode("UTF-16LE")
+     //  is an S; encode! answers the receiver itself)
+     if (str_len name == 7 && str_eq name "encode!") then enc_out9 else str_keep_sub world recv enc_out9)
   // instance_eval/instance_exec with a String arg: parse and run the code
   // with self rebound to the receiver (a fresh scope, like Ruby).
   else if ((str_len name == 13 && str_eq name "instance_eval") || (str_len name == 13 && str_eq name "instance_exec")) && (match args with Cons (VStr _, _) -> true | _ -> false) then
@@ -39350,7 +39384,7 @@ and alias_owner = fn world -> fn (cls: str) -> fn (name: str) ->
 // does this value's singleton class (from `def value.method`) define `name`?
 and hng_sng_has = fn world -> fn (recv: Val) -> fn (name: str) ->
   if map_len hng_store == 0 then false else
-  let hk = hng_key recv in
+  let hk = hng_key_q recv in
   (if str_eq hk "" then false else map_has hng_store hk)
   && (let c9 = map_get hng_store hk in
       is_sng_cls c9 && (has_meth world c9 name
@@ -48269,7 +48303,14 @@ and ecall_args = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val
          let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
          (if autoload_pending world key then map_get autoloads key else VNil)
        | _ -> VNil)
-    else if is_kernel_conv name then kernel_conv_fn env world name args
+    // (...unless the program defined one: `module Kernel; def Float(n)`, or
+    //  Object's, or self's own -- a bare call is a call of it, as `send` is;
+    //  test_iseq's test_mandatory_only_redef. Not in the prelude, which
+    //  stands where ruby's C does and converts with the builtin: its
+    //  `Integer(line)` in ISeq.compile met the program's Integer.)
+    else if is_kernel_conv name
+            && (if str_starts_with (cur_file ()) "<internal:" then true
+                else if kernel_overridden env world name then false else true) then kernel_conv_fn env world name args
     // using refinery — activate the refinery's refinements into ref_active.
     // The scope is bounded by the enclosing module/class body (register_class
     // save/restores ref_active), matching Ruby's lexical activation.
@@ -48681,7 +48722,12 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
                   else frame_pool_get ()) in
      let _ = map_set frame "__fid" (VInt (next_fid ())) in
      let _ = (if map_has r2k_methods ("Object#" ++ name) then map_set frame "__r2k" VNil else ()) in
-     let _ = map_set frame "__meth" (frame_text name) in
+     // (the name it was defined as, an alias's source -- as run_meth's mnm:
+     //  __method__ and a TracePoint's method_id -- and the one it was called
+     //  by, __callee__)
+     let mnm9 = (let k9 = "Object#" ++ name in if map_has alias_srcname k9 then map_get alias_srcname k9 else name) in
+     let _ = map_set frame "__meth" (frame_text mnm9) in
+     let _ = (if str_eq mnm9 name then () else map_set frame "__callee" (frame_text name)) in
      // Whether THIS call was given a block. `block_given?` asks about the
      // enclosing METHOD frame, and Ruby's rule reaches it through any number
      // of blocks -- `m { }` with `def m; [1].each { block_given? }; end` is
@@ -48711,10 +48757,12 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let slf9 = (if lv_has frame "self" then lv_get frame "self" else VNil) in
      // (on the line it was defined on, note 435)
      let _ = (if map_has hook_flags "tp" then tp_env_meth frame body else ()) in
-     let _ = fire_tp_vl world "call" name "Object" VNil slf9
-               (match (meth_source_get name 0) with VInt l9 -> l9 | _ -> cur_line ()) "" in
+     let _ = (if map_len hook_flags > 0 && map_has hook_flags "tp" && vm_body_late body then ()
+              else (let _ = fire_tp_vlc world "call" mnm9 "Object" VNil slf9
+                              (match (meth_source_get name 0) with VInt l9 -> l9 | _ -> cur_line ()) "" name in
+                    if map_len hook_flags > 0 && map_has hook_flags "tp" then map_set frame "__tpcall" VNil else ())) in
      // (as run_meth: tp_meth_flow while a TracePoint is armed)
-     let flow9 = (if map_has hook_flags "tp" then tp_meth_flow world frame blk body name name "Object" slf9
+     let flow9 = (if map_has hook_flags "tp" then tp_meth_flow world frame blk body mnm9 name "Object" slf9
                   else method_body_flow frame world blk body) in
      let out = (match flow9 with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
     let _ = (if rfprev9 >= 0 then ref_install rfprev9 else ()) in
@@ -48728,8 +48776,8 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
     let _ = (if tpf9 then () else frame_done frame) in
      let _ = fire_trace world "return" name "Object" in
      let _ = (if tpf9 then tp_env_set frame else ()) in
-     let _ = fire_tp_vl world "return" name "Object" (match flow9 with FBreak _ -> VNil | _ -> out) slf9
-               (match (meth_source_get (name) 2) with VInt l9 -> l9 | _ -> cur_line ()) "" in
+     let _ = fire_tp_vlc world "return" mnm9 "Object" (match flow9 with FBreak _ -> VNil | _ -> out) slf9
+               (match (meth_source_get (name) 2) with VInt l9 -> l9 | _ -> cur_line ()) "" name in
      let _ = (if tpf9 then frame_done frame else ()) in
      out)
 
@@ -48869,7 +48917,7 @@ and module_name_super_ahead = fn world -> fn (recv: Val) ->
 // A primitive's singleton participates in lookup without becoming its reported
 // ordinary class. dispatch_cls_of intentionally looks past this tag for super.
 and hng_lookup_cls = fn world -> fn (recv: Val) ->
-  let hk9 = hng_key recv in
+  let hk9 = hng_key_q recv in
   if str_len hk9 > 0 && map_has hng_store hk9 && is_sng_cls (map_get hng_store hk9)
   then map_get hng_store hk9 else dispatch_cls_of world recv
 and hng_undef_blocked = fn world -> fn (recv: Val) -> fn (name: str) ->
@@ -48905,7 +48953,7 @@ and hng_retained_alias_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> 
 and hng_missing_hook = fn world -> fn (recv: Val) -> fn (name: str) ->
   if map_len hng_store == 0 || (match recv with VObj _ -> true | VClass _ -> true | VMain -> true | _ -> false) then false
   else
-    (let hk9 = hng_key recv in
+    (let hk9 = hng_key_q recv in
      if (if map_has hng_store hk9 then false else true) then false
      else
        (let c9 = map_get hng_store hk9 in
@@ -49815,7 +49863,12 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                                      else VNil) with VInt l9 -> l9 | _ -> cur_line ()) in
                    // (...in the file it was written in, not the caller's)
                    let cp9 = (if map_has hook_flags "tp" then tp_meth_path dk defcls name else "") in
-                   let _ = fire_tp_vlc world "call" mnm defcls VNil slf9 cl9 cp9 name in
+                   // (...not for a body whose :call comes after its prologue:
+                   //  the VM fires that one there -- vm_late_call. One fired
+                   //  here marks the frame, so the VM does not fire it again.)
+                   let _ = (if map_len hook_flags > 0 && map_has hook_flags "tp" && vm_body_late body then ()
+                            else (let _ = fire_tp_vlc world "call" mnm defcls VNil slf9 cl9 cp9 name in
+                                  if map_len hook_flags > 0 && map_has hook_flags "tp" then map_set frame "__tpcall" VNil else ())) in
                    // (a define_method body is a block too: its :b_call, and
                    //  the frame marked for a :b_return a raise makes)
                    if tpbm9 then (let _ = map_set frame "__tpbm" VNil in tp_blk_fire_at_c world "b_call" mnm defcls VNil slf9 cl9 cp9 name) else ())) in
@@ -63981,7 +64034,18 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      | _ ->
        // (a builtin -- `alias aliased_eval eval` -- is aliased on Object, as
        //  a class body's alias of one is)
-       let _ = if map_has meths n2 then set_meth meths n1 (map_get meths n2)
+       // (...and a top-level method's alias carries what alias_method's
+       //  does: where the method was written, and the name it was defined
+       //  as -- a TracePoint's method_id and lineno, #original_name, and the
+       //  name a `super` in it looks for. It reported the alias's own name
+       //  and the caller's line.)
+       let _ = if map_has meths n2 then
+                 (let _ = set_meth meths n1 (map_get meths n2) in
+                  let _ = copy_meth_src n1 n2 in
+                  let sk9 = "Object#" ++ n2 in
+                  let src9 = (if map_has alias_srcname sk9 then map_get alias_srcname sk9 else n2) in
+                  if str_eq n1 src9 then (if map_has alias_srcname ("Object#" ++ n1) then map_delete alias_srcname ("Object#" ++ n1) else ())
+                  else map_set alias_srcname ("Object#" ++ n1) src9)
                else (let _ = do_class_alias world "Object" n1 n2 in ()) in
        FNext VNil)
     else (let _ = do_class_alias world dcls n1 n2 in FNext VNil)
@@ -66327,6 +66391,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   let id = vm_slot () in
   let _ = (if depth == 0 then vec_set vm_tree_cur 0 (vm_tree_new ()) else ()) in
   let (code, na, ov) = vm_scratch depth in
+  let _ = (if map_has vm_late_ids id then map_delete vm_late_ids id else ()) in
   let labels = map_new () in
   let rec scan = fn (xs: Val list) -> fn (i: int) ->
     (match xs with
@@ -66351,7 +66416,14 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
      | Cons (VInt n, t) -> go t n evt prev yld ids outs
      | Cons (VSym s, t) ->
        if str_eq s "RUBY_EVENT_LINE" then go t line (if evt % 2 == 1 then evt else evt + 1) prev yld ids outs
-       else if str_eq s "RUBY_EVENT_RESCUE" then go t line (if evt >= 4 then evt else evt + 4) prev yld ids outs
+       else if str_eq s "RUBY_EVENT_RESCUE" then go t line (if (evt / 4) % 2 == 1 then evt else evt + 4) prev yld ids outs
+       // (a method's :call where ruby fires it, after a prologue -- the
+       //  destructuring of a `(a, b)` parameter: 16, vm_late_call. At the
+       //  first instruction the call made on the way in is the same one.)
+       else if str_eq s "RUBY_EVENT_CALL" then
+         (let late9 = kind == 2 && vec_len code > 0 in
+          let _ = (if late9 then map_set vm_late_ids id 1 else ()) in
+          go t line (if late9 && (evt / 16) % 2 == 0 then evt + 16 else evt) prev yld ids outs)
        else if str_len s > 6 && str_eq (substring s 0 6) "label_" then go t line evt (0 - 1) yld ids outs
        else go t line evt prev yld ids outs
      | Cons (VArr iid, t) ->
@@ -66900,6 +66972,16 @@ and vm_body_pos = fn (body: Stmt list) ->
      | Cons (SFile f, t) -> go t line f
      | Cons (_, t) -> go t line path) in
   go body 0 ""
+// whether a method's body is a program whose :call comes after its
+// prologue (vm_late_ids): run_meth and call_method leave that :call to it
+and vm_body_late = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (SVm (id, _), _) -> map_has vm_late_ids id
+  | Cons (SLine _, t) -> vm_body_late t
+  | Cons (SLineQ _, t) -> vm_body_late t
+  | Cons (SFile _, t) -> vm_body_late t
+  | _ -> false
 // whether the program, or a block in it, yields (bare_yield_stmt: the
 // method's block is kept for a block that does)
 and vm_yields = fn (id: int) ->
@@ -67785,6 +67867,7 @@ and vm_events = fn env -> fn world -> fn (e: int) -> fn (line: int) ->
   let tp = map_len hook_flags > 0 && map_has hook_flags "tp"
            && (let f9 = cur_file () in if str_len f9 > 10 && str_eq (substring f9 0 10) "<internal:" then false else true) in
   let self9 = fn (u: unit) -> (if lv_has env "self" then lv_get env "self" else VMain) in
+  let _ = (if (e / 16) % 2 == 1 && tp then vm_late_call env world else ()) in
   let _ = (if e % 2 == 1 then
              (let _ = cov_line line in
               if tp then
@@ -67796,10 +67879,34 @@ and vm_events = fn env -> fn world -> fn (e: int) -> fn (line: int) ->
                  let _ = fire_tp_v world "line" (if str_eq c9 "" then "" else m9) c9 VNil (self9 ()) in ())
               else ())
            else ()) in
-  if e >= 4 && tp then
+  if (e / 4) % 2 == 1 && tp then
     (let _ = tp_env_set env in
      let _ = fire_tp_v world "rescue" "" "" (if map_has globals "!" then map_get globals "!" else VNil) (self9 ()) in ())
   else ()
+// A method's :call, at the instruction ruby fires it on when a prologue came
+// first: a TracePoint enabled while the prologue ran -- by a `#to_ary` that
+// destructuring `(a, b)` called -- sees the call, as ruby's does (corpus
+// 725) -- and with one on from the start, in the same place: run_meth and
+// call_method leave such a method's :call to this (vm_body_late). Once a
+// frame: one fired on the way in marks the frame "__tpcall". As run_meth
+// makes it:
+// the name it was defined as and called by, its class, the line and the file
+// it was written in.
+and vm_late_call = fn env -> fn world ->
+  if map_has env "__tpcall" || (if lv_has env "__meth" then false else true) then ()
+  else
+    (let _ = map_set env "__tpcall" VNil in
+     let mnm = (match lv_get env "__meth" with VStr h9 -> sget h9 | _ -> "") in
+     let defcls = (if lv_has env "__defcls" then (match lv_get env "__defcls" with VClass c9 -> c9 | _ -> "Object") else "Object") in
+     let name = (if map_has env "__callee" then (match map_get env "__callee" with VStr h9 -> sget h9 | _ -> mnm) else mnm) in
+     let slf9 = (if lv_has env "self" then lv_get env "self" else VNil) in
+     let dk = defcls ++ "#" ++ mnm in
+     let cl9 = (match (if meth_source_has dk 0 then meth_source_get dk 0
+                       else if str_eq defcls "Object" && meth_source_has mnm 0 then meth_source_get mnm 0
+                       else VNil) with VInt l9 -> l9 | _ -> cur_line ()) in
+     let cp9 = tp_meth_path dk defcls mnm in
+     let _ = tp_env_set env in
+     fire_tp_vlc world "call" mnm defcls VNil slf9 cl9 cp9 name)
 and vm_stack_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: str) -> fn (a: int) -> fn (v: Val) ->
   if o == 0 then (if a > 0 then cov_branch (a - 1) else ())
   else if o == 1 then vm_push st VNil
