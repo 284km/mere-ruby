@@ -26,3 +26,22 @@ The small benchmark overstated it: test_ast's own asserts spend little of their 
 Locals live in the frame's string-keyed table too, so that one representation is over 40% of the hashing. Making locals and the frame's own facts slots is what the VM does. `MERE_RUBY_VM=1` runs the same number of instructions on this test, so test-unit's methods are not yet in its reach. Where test_ast's 450 seconds come from next is being decided with work2026-fd and the VM session.
 
 **Checked.** `singleton_class` constant scopes (`class << self; X = 1`, nested modules, a singleton of a singleton, an object's singleton, and a read after `remove_const`) match ruby and main.
+
+## Review of #185: a Box switch, other writers, and a bound
+
+**A Ruby::Box switch left the memo stale.** `bx_switch` moves a box's constants out of and into `consts` directly (`bx_out` / `bx_in`), past `const_tbl_put` and `consts_del`. A remembered key could therefore name a constant the live box did not have. The caller's `map_get` then raised a bare StandardError where ruby raises NameError, and `defined?` said "constant". `bx_switch` now forgets the memo. The two other direct writers forget it too: Module#dup/clone's `copy_kv consts`, and the GC class sweep. No stale read was found through those, but the rule "every writer forgets" now holds as written.
+
+**A bound.** Entries went only when a constant was written, so a program that makes classes without end grew the memo without end. 160,000 anonymous classes each reading four constants peaked at 375 MB, against 303 MB on main. The memo now lives in an arena of its own, given back whole (`map_recycle`) when it is forgotten big. It is forgotten at every class sweep and whenever it holds 8,192 answers.
+
+| `Class.new` + `class_eval` reading 4 constants | main | first version | now |
+|---|---|---|---|
+| 80,000 classes | 238 MB | 278 MB | 237 MB |
+| 160,000 classes | 303 MB | 375 MB | 313 MB |
+
+**Witness.** corpus 853 runs the review's three box shapes in a `RUBY_BOX=1` child, as corpus 647 does:
+
+- a read inside a box, then outside, then inside;
+- a method defined in main, read again after a box defined the constant;
+- two boxes.
+
+It also covers reads around a constant's definition and `remove_const`, and a singleton class's constant through `dup`. The first version stops at the second box line.
