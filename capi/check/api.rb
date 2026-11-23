@@ -463,4 +463,14 @@ begin
 rescue
   check(A.errinfo_now.nil?)
 end
+# (...and it is each Fiber's own: one an rb_protect left on a Fiber is not
+#  main's, nor a new Fiber's, and is still that Fiber's when it resumes)
+check(A.errinfo_now.nil?)
+f = Fiber.new { A.protect_and_return; Fiber.yield A.errinfo_now.class; A.errinfo_now.class }
+check(f.resume == ArgumentError)
+check(A.errinfo_now.nil?)
+check(Fiber.new { A.errinfo_now }.resume.nil?)
+GC.start
+check(f.resume == ArgumentError)
+check(A.errinfo_now.nil?)
 puts "api contracts: #{$count} passed"

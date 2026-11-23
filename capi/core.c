@@ -596,11 +596,12 @@ char *mr_capi_libc(void) {
 }
 int mr_capi_depth(void) { return depth; }
 const void *mr_capi_frame(void) { return cur; }
-/* CRuby's ec->errinfo, which rb_errinfo answers: ONE value, set by C's own
- * rescues -- rb_protect, rb_rescue's handler, rb_ensure's cleanup,
- * rb_set_errinfo -- and not by a Ruby `rescue`, so a C method a Ruby rescue
- * calls finds none; Ruby a C handler runs, and the C it calls, find the
- * exception. (A root: the collector reads it with the C API's own.) */
+/* CRuby's ec->errinfo, which rb_errinfo answers: the running stack's (the
+ * others' are put aside: errinfo_switch, below). Set by C's own rescues --
+ * rb_protect, rb_rescue's handler, rb_ensure's cleanup, rb_set_errinfo --
+ * and not by a Ruby `rescue`, so a C method a Ruby rescue calls finds none;
+ * Ruby a C handler runs, and the C it calls, find the exception. (A root:
+ * the collector reads it with the C API's own.) */
 VALUE mr_frame_errinfo(void) { return c_errinfo; }
 int mr_capi_clear_errinfo(void) { c_errinfo = Qnil; return 0; }
 void mr_frame_set_errinfo(VALUE v) {
@@ -610,6 +611,37 @@ void mr_frame_set_errinfo(VALUE v) {
 }
 int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which] : -1; }
 
+/* rb_errinfo is the running stack's: every Fiber (and every Thread's root
+ * fiber) has its own, as CRuby's execution context does -- an rb_protect on
+ * one Fiber is not what another reads. The one of the stack being left is
+ * put aside by its number (a Fiber's number is never handed out again), the
+ * target's taken up, and a stack's dropped when its Fiber ends
+ * (mr_capi_stack_end). Each put aside is a root (mr_errinfo_parked_at). */
+struct mr_errpark { int stack; VALUE err; };
+static struct mr_errpark *errparked;
+static long errparked_count, errparked_cap;
+static void errinfo_drop(int stack) {
+    for (long i = 0; i < errparked_count; i++)
+        if (errparked[i].stack == stack) { errparked[i] = errparked[--errparked_count]; return; }
+}
+static void errinfo_switch(int from, int to) {
+    if (!NIL_P(c_errinfo)) {
+        if (errparked_count == errparked_cap) {
+            errparked_cap = errparked_cap ? errparked_cap * 2 : 8;
+            errparked = realloc(errparked, sizeof(*errparked) * (size_t)errparked_cap);
+            if (!errparked) mr_fatal("out of memory");
+        }
+        errparked[errparked_count].stack = from;
+        errparked[errparked_count].err = c_errinfo;
+        errparked_count++;
+    }
+    c_errinfo = Qnil;
+    for (long i = 0; i < errparked_count; i++)
+        if (errparked[i].stack == to) { c_errinfo = errparked[i].err; errinfo_drop(to); return; }
+}
+VALUE mr_errinfo_parked_at(long i) { return i < errparked_count ? errparked[i].err : Qundef; }
+int mr_capi_stack_end(int stack) { errinfo_drop(stack); return 0; }
+
 /* A coroutine switch. The calls in progress are a chain through C stack
  * frames, so each stack has its own; the interpreter says when it changes
  * stacks, and the chain of the stack being left is put aside by its number. */
@@ -618,6 +650,7 @@ static struct mr_parked *parked;
 static long parked_count, parked_cap;
 int mr_capi_switch(int from, int to) {
     if (mr_without("switch")) return 0;
+    errinfo_switch(from, to);
     if (cur) {
         if (parked_count == parked_cap) {
             parked_cap = parked_cap ? parked_cap * 2 : 8;

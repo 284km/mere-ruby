@@ -11244,7 +11244,15 @@ Third round (on 7871475d, nits):
   has a method_missing, which is asked.
 - `__capi_public_send` answers only the call capi_send makes just before
   (capi_pub_entry); Ruby code that writes it gets NoMethodError, as in ruby.
-- Still open: rb_errinfo per fiber. The switch hook (mr_capi_switch) could
-  keep one per stack, but it cannot tell a Fiber that ended from one that
-  paused, and stack numbers come back -- a new Fiber would start with an
-  old exception. That needs a hook for a stack's end first.
+- **[Minor] rb_errinfo per fiber** (asked to be fixed after all): it is the
+  running stack's now. mr_capi_switch puts the one of the stack being left
+  aside by its number and takes up the target's (nil for a new one). A
+  Fiber's number is never handed out again (fb_new_index), and a new hook,
+  mr_capi_stack_end, called where a Fiber's body ends (fb_run_body), drops
+  what was put aside for it. Each one put aside is a root (mr_capi_roots).
+  (The round before said stack numbers come back: they do not.) Threads too,
+  each root fiber being a stack: an rb_protect on a Thread or a Fiber is not
+  what main reads. capi/check: errinfo on a paused Fiber is not main's, nor
+  a new Fiber's, and is still its own after GC.start and a resume.
+  Left: ruby makes a Thread whose body ends with errinfo set raise it from
+  #value / #join; here #value is the body's value.
