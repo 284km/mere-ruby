@@ -634,7 +634,10 @@ int mr_capi_switch(int from, int to) {
         parked[parked_count].frame = cur;
         parked[parked_count].depth = depth;
         parked_count++;
-        /* (registers too: a C local may live in a callee-saved one) */
+        /* (registers too: a C local may live in a callee-saved one --
+         *  spilled here, as setjmp alone may store some mangled: glibc's
+         *  x86_64 keeps rbp so) */
+        __builtin_unwind_init();
         jmp_buf regs;
         if (setjmp(regs) == 0) {
             struct mr_frame *outer = cur;

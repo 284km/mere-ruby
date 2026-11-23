@@ -340,8 +340,50 @@ void mr_vbig_leave(const void *frame, int outermost) {
  * let go when it resumes (mr_vbig_unpark). A word that only looks like
  * one keeps it too, as a conservative scan does. A stack dropped while
  * paused keeps what it had, and nothing made after. */
+/* (every pinned word is also counted in a set of its own -- value -> how
+ *  many words of paused stacks have it -- so asking is O(1) however many
+ *  stacks are paused; 0 is empty, 1 a removed slot) */
+static VALUE *pin_keys;
+static long *pin_counts;
+static long pin_cap, pin_used;
+static long *pin_slot(VALUE v, int make) {
+    if (make && (pin_used + 1) * 2 > pin_cap) {
+        VALUE *old_keys = pin_keys;
+        long *old_counts = pin_counts;
+        long old_cap = pin_cap;
+        pin_cap = pin_cap ? pin_cap * 2 : 64;
+        pin_keys = calloc((size_t)pin_cap, sizeof(VALUE));
+        pin_counts = calloc((size_t)pin_cap, sizeof(long));
+        if (!pin_keys || !pin_counts) mr_fatal("out of memory");
+        pin_used = 0;
+        for (long i = 0; i < old_cap; i++)
+            if (old_keys[i] > 1) *pin_slot(old_keys[i], 1) = old_counts[i];
+        free(old_keys);
+        free(old_counts);
+    }
+    if (!pin_cap) return NULL;
+    unsigned long i = set_hash(v) & (unsigned long)(pin_cap - 1);
+    long tomb = -1;
+    while (pin_keys[i] != 0) {
+        if (pin_keys[i] == v) return &pin_counts[i];
+        if (pin_keys[i] == 1 && tomb < 0) tomb = (long)i;
+        i = (i + 1) & (unsigned long)(pin_cap - 1);
+    }
+    if (!make) return NULL;
+    if (tomb >= 0) i = (unsigned long)tomb;
+    else pin_used++;
+    pin_keys[i] = v;
+    pin_counts[i] = 0;
+    return &pin_counts[i];
+}
+static void pin_drop(VALUE v) {
+    long *c = pin_slot(v, 0);
+    if (c && --*c <= 0) { pin_keys[c - pin_counts] = 1; *c = 0; }
+}
 void mr_vbig_park(int stack, const VALUE *lo, const VALUE *hi) {
-    if (!mr_vbig_live || lo >= hi) return;
+    /* (what is kept for good needs no reading: only temporaries and held
+     *  ones can go) */
+    if ((!temps.count && !held.count) || lo >= hi) return;
     VALUE *at = NULL;
     long n = 0, cap = 0;
     for (const VALUE *p = lo; p < hi; p++) {
@@ -353,6 +395,7 @@ void mr_vbig_park(int stack, const VALUE *lo, const VALUE *hi) {
             if (!at) mr_fatal("out of memory");
         }
         at[n++] = v;
+        ++*pin_slot(v, 1);
     }
     if (!n) return;
     if (pinned_count == pinned_cap) {
@@ -367,12 +410,17 @@ void mr_vbig_park(int stack, const VALUE *lo, const VALUE *hi) {
 }
 void mr_vbig_unpark(int stack) {
     for (long i = 0; i < pinned_count; i++)
-        if (pinned[i].stack == stack) { free(pinned[i].at); pinned[i] = pinned[--pinned_count]; return; }
+        if (pinned[i].stack == stack) {
+            for (long j = 0; j < pinned[i].count; j++) pin_drop(pinned[i].at[j]);
+            free(pinned[i].at);
+            pinned[i] = pinned[--pinned_count];
+            return;
+        }
 }
 static int pinned_p(VALUE v) {
-    for (long i = 0; i < pinned_count; i++)
-        for (long j = 0; j < pinned[i].count; j++) if (pinned[i].at[j] == v) return 1;
-    return 0;
+    if (!pinned_count) return 0;
+    long *c = pin_slot(v, 0);
+    return c && *c > 0;
 }
 
 /* A raw Bignum as the Integer its digits say; anything else as it is. */

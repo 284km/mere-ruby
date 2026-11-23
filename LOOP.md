@@ -11468,3 +11468,13 @@ the C names can point there and bignum.c leaves.
   between: 1 held, nothing pinned, every 5,000 calls. The RSS that still
   grows there is Enumerator#next's own: `[1].cycle.next` alone grows the
   same, on main too, with no C at all.
+- (re-review 5) **[Minor] asking whether a value was pinned walked every
+  pinned word**, so the end of a C call cost (held + temporaries) x (words
+  pinned): 1,000 Fibers each paused with a raw Bignum in a C local made an
+  empty C call 423 us. Each pinned word is counted in a set of its own
+  (value -> words), so the question is O(1): 9.9 us with 1,000 paused (5.1
+  with none), the paused locals still read 0. **[Suggestion]** a pause reads
+  its stack only when there are temporaries or held ones (what is kept for
+  good never goes), and the registers are spilled with
+  __builtin_unwind_init() before setjmp (glibc's x86_64 setjmp stores rbp
+  mangled).
