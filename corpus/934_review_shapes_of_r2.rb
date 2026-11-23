@@ -152,3 +152,14 @@ class FrozenKeys < Hash
 end
 fk = FrozenKeys[a: 1].freeze
 p try { fk.transform_keys!({ a: :b }) }, fk, try { fk.transform_keys({ a: :b }) }, fk
+
+# gsub! / sub! through super answer as String's own: self when a match wrote
+# the same text, nil without a match, an Enumerator for gsub!(pattern), and
+# ruby's errors for missing or wrong arguments
+class BangEdges < String
+  def gsub!(*a, &b) = super
+  def sub!(*a, &b) = super
+end
+be = BangEdges.new("hello")
+p try { be.gsub!("l", "l") }, try { be.sub!("l", "l") }, try { be.gsub!("z", "y") }
+p try { be.gsub!(/l/).class }, try { be.sub!(/l/) }, try { be.gsub! }, try { be.gsub!(1, 2) }, try { be.sub!(1, "a") }
