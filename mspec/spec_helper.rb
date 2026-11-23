@@ -1089,6 +1089,16 @@ def have_method(name, inc = true); HaveMethodMatcher.new(:methods, name, inc); e
 def have_public_method(name, inc = true); HaveMethodMatcher.new(:public_methods, name, inc); end
 def have_private_method(name, inc = true); HaveMethodMatcher.new(:private_methods, name, inc); end
 def have_singleton_method(name, inc = true); HaveMethodMatcher.new(:singleton_methods, name, inc); end
+# mspec's VariableMatcher: the name among what the lister gives
+# (have_constant, have_instance_variable, have_class_variable, ...)
+class HaveVariableMatcher
+  def initialize(lister, name); @lister = lister; @name = name.to_sym; end
+  def match?(subject); subject.send(@lister).include?(@name); end
+end
+def have_constant(name); HaveVariableMatcher.new(:constants, name); end
+def have_instance_variable(name); HaveVariableMatcher.new(:instance_variables, name); end
+def have_class_variable(name); HaveVariableMatcher.new(:class_variables, name); end
+def have_global_variable(name); HaveVariableMatcher.new(:global_variables, name); end
 
 # obj.should be_ancestor_of(mod): self appears in mod.ancestors.
 class AncestorOfMatcher
