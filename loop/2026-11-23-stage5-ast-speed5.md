@@ -36,3 +36,18 @@ That is the frame-as-a-string-keyed-map design, and it is the next thing to take
 
 - **An 8-entry key cache in Mere's String-keyed maps.** This widened #88's one remembered entry to eight, picked by the key's address. The test_ast subset went from 292.24e9 to 292.03e9 instructions (−0.07%). A frame's table is new for each call, and each key is read once or twice right after it is written, so the address cache does not hit. What would help is fewer keys, not cheaper ones.
 - **Building `String#bytes` with a loop instead of a recursion.** test_all_tokens takes the bytes of every file twice, but the four heaviest of those tests ran the same 168.7e9 instructions either way.
+
+## Review of #169: a long line made the newline counts quadratic
+
+`str_index_from` does not stop at the range a count asks about. It runs on to the next newline. `tc_nls` is asked for every token (`tc_skipped`), and `nl_count_to` for every `;`, so on a source with few newlines each call went to the end of the line.
+
+| case | main | first version | now |
+|---|---|---|---|
+| one 100,000-element array literal on one line, through `eval` | 2.6e9 | 28.8e9 | 2.5e9 |
+| `"a=1;" * 200_000`, through `eval` | 10.5e9 | 150.6e9 | 10.4e9 |
+
+(instructions; the reviewer measured 3.4e9 → 29.6e9 and 4.7 s → 24.9 s.)
+
+**The change.** `nl_next` remembers the stretch it last searched: no newline in `[from, j)`, and `j` is the next one, for the source of that length. A query inside the stretch is answered without searching, so each newline of a pass is searched for once. Each counter has its own memory (`tc_nlm`, `nl_cm`), reset where its pass starts (`lex_src`, `number_nls_at`). The length is the same test `tc_skipped` already uses to know it is looking at `lex_src`'s source. `eval("")` keeps its gain (77.4e9 → 54.0e9).
+
+`number_nls_go` writes `tc_number` out, so that the key is made only when `tc_off` holds something. It now says that a change to one is a change to both.
