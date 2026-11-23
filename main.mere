@@ -3759,7 +3759,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // run initialize, exactly as the built-in path would have.
        else if str_eq meth "new" then (match recv with VClass c9 -> (if obj_is_a world c9 "Thread" then thread_new world (sbh, sbp, sbb, sbe) c9 meth args (sbh, sbp, sbb, sbe) else new_obj_wb world c9 args (sbh, sbp, sbb, sbe)) | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
        // Match block-less super: singleton overrides can reach builtins too.
-       else super_missing world (sbh, sbp, sbb, sbe) recv meth args)
+       else super_native_or_missing env world (sbh, sbp, sbb, sbe) recv defcls meth args)
     else
       (let (a2, j2, blocked9) = super_next world env recv defcls meth in
        if blocked9 then super_undefined world (sbh, sbp, sbb, sbe) recv meth args
@@ -5625,7 +5625,7 @@ and super_vals = fn env -> fn world -> fn superblk -> fn (defcls: str) -> fn (me
        // autoload, method_missing, ...) are ancestors of a singleton too, so
        // `super` from a `def self.` override of one lands there rather than
        // running out of chain.
-       else super_missing world superblk recv meth args)
+       else super_native_or_missing env world superblk recv defcls meth args)
     else
       (let (a2, j2, blocked9) = super_next world env recv defcls meth in
        if blocked9 then super_undefined world superblk recv meth args
@@ -5639,7 +5639,7 @@ and super_vals = fn env -> fn world -> fn superblk -> fn (defcls: str) -> fn (me
 // under its source name, as a call of the alias does.
 and super_blt_alias_or_missing = fn env -> fn world -> fn superblk -> fn (recv: Val) -> fn (defcls: str) -> fn (meth: str) -> fn (args: Val list) ->
   let src9 = (if map_has blt_alias_names meth then super_blt_alias_src world env recv defcls meth else "") in
-  if str_len src9 == 0 then super_missing world superblk recv meth args
+  if str_len src9 == 0 then super_native_or_missing env world superblk recv defcls meth args
   else if str_eq src9 "send" || str_eq src9 "__send__" || str_eq src9 "public_send" then
     native_sender_call env world superblk recv src9 args superblk
   // (with a block -- `super(&b)` into an alias of map / each / tap -- the
@@ -5648,6 +5648,52 @@ and super_blt_alias_or_missing = fn env -> fn world -> fn superblk -> fn (recv: 
   else if (match superblk with (true, _, _, _) -> true | _ -> false) then
     blt_alias_block_call env world superblk recv src9 args
   else blt_alias_call env world recv src9 args
+// `super` that finds no Ruby method above, from a module prepended to a builtin
+// object class, a subclass's or a singleton's override, or a refinement of
+// one: that class's native method, when the class comes AFTER defcls in the
+// chain. io-console 0.9.5 prepends IO::platform_tty, whose #tty? calls
+// rb_call_super, and every $stdout.tty? -- Rails' test reporter asks it --
+// was "super: no superclass method 'tty?'". Time's #to_s, #== and #<=> are
+// Time's own, so this comes before super_missing's BasicObject and Kernel
+// arms. A body that REPLACES the native in the class itself
+// (`class Time; def eql?(o) = super; end`) has the native behind it, not
+// above it, and goes on to those arms as ruby's does.
+// The call skips the Ruby bodies of that name once (bi_skip). From inside a
+// refinement of the name it runs with no refinement active: the dispatcher
+// would come back to the refinement. A singleton class on an IO is left to
+// the old arms: the IO arms do not answer through one (`def $stdout.puts(*a)
+// = super` prints through Kernel's), and neither are descriptor streams'
+// stream methods (fdio_route).
+and super_native_or_missing = fn env -> fn world -> fn superblk -> fn (recv: Val) -> fn (defcls: str) -> fn (meth: str) -> fn (args: Val list) ->
+  let owner9 = (match recv with VObj _ -> super_native_owner world recv defcls meth | _ -> "") in
+  if str_len owner9 == 0 then super_missing world superblk recv meth args
+  else
+    (let call9 = fn (u0: unit) ->
+       (let _ = map_set bi_skip "n" meth in
+        let answer9 = try_or_msg (fn (u: unit) -> invoke_val_c env world superblk recv meth args false)
+                        (fn (message: str) -> (let _ = map_clear bi_skip in fail message)) in
+        let _ = map_clear bi_skip in answer9) in
+     // (only a super from INSIDE a refinement leaves refinements behind)
+     if is_refine_impl defcls then ref_suspended call9 else call9 ())
+// the builtin object class after defcls in recv's chain that answers meth
+// natively ("" when none, or when the old arms must answer: see above)
+and super_native_owner = fn world -> fn (recv: Val) -> fn (defcls: str) -> fn (meth: str) ->
+  match recv with
+  | VObj oid9 ->
+    (let (_, _, oc9, _) = world in
+     let c9 = map_get oc9 oid9 in
+     let anc9 = ancestors_of world (super_base world recv) in
+     let i0 = idx_in9 anc9 defcls in
+     let rec drop9 = fn (xs: str list) -> fn (k: int) -> (if k <= 0 then xs else (match xs with Nil -> Nil | Cons (_, t9) -> drop9 t9 (k - 1))) in
+     let rec first9 = fn (xs: str list) -> (match xs with
+                                            | Nil -> ""
+                                            | Cons (a9, t9) -> (if builtin_obj_has a9 meth then a9 else first9 t9)) in
+     let own9 = first9 (if i0 < 0 then anc9 else drop9 anc9 (i0 + 1)) in
+     if str_len own9 == 0 then ""
+     else if fdio_route world oid9 (if is_sng_cls c9 then sng_supername world c9 else c9) meth then ""
+     else if is_sng_cls c9 && (str_eq own9 "IO" || str_eq own9 "File") then ""
+     else own9)
+  | _ -> ""
 // the builtin under its source name, with the caller's block, past a Ruby
 // body of that name once (bi_skip) when there is one
 and blt_alias_block_call = fn env -> fn world -> fn superblk -> fn (recv: Val) -> fn (src: str) -> fn (args: Val list) ->
@@ -51581,36 +51627,13 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   | VFlt _ -> prim_method recv meth args
   | _ ->
   let dcls = dispatch_cls_of world recv in
-  // `super` from a module prepended to a builtin object class, or from a
-  // subclass's or a singleton's override, into that class's native method:
-  // io-console 0.9.5 prepends IO::platform_tty, whose #tty? calls
-  // rb_call_super, and every $stdout.tty? -- Rails' test reporter asks it --
-  // was "super: no superclass method 'tty?'". The dispatcher's native arm
-  // answers it, past the Ruby bodies of that name once (bi_skip, as a saved
-  // native alias does). Ahead of BasicObject's and Kernel's arms below: Time's
-  // #to_s, #== and #<=> and IO's #write are its own, not theirs.
-  // (not a descriptor stream's stream methods: those are the prelude layer's,
-  //  fdio_route, below. Nor an object with a singleton class: the native arms
-  //  do not answer through one -- `def $stdout.puts(*a) = super` reached
-  //  nothing there, where Kernel's arm below prints)
-  if (match recv with
-      | VObj oid9 -> (let (_, _, oc9, _) = world in
-                      let c9 = map_get oc9 oid9 in
-                      (if is_sng_cls c9 then false else true)
-                      && (if fdio_route world oid9 c9 meth then false else true)
-                      && builtin_obj_anc_has world (ancestors_of world (display_cls world dcls)) meth)
-      | _ -> false) then
-    (let _ = map_set bi_skip "n" meth in
-     let answer9 = try_or_msg (fn (u: unit) -> invoke_val_c gc_cenv0 world superblk recv meth args false)
-                     (fn (message: str) -> (let _ = map_clear bi_skip in fail message)) in
-     let _ = map_clear bi_skip in answer9)
   // BasicObject's own `==` (identity), `!` (the truth of self), `!=` (the
   // negation of `==`, whichever `==` the object has) and Object#=== (`==`):
   // `super` from an override of one -- Prism's Lexer::State has
   // `def ==(i) super or to_int == i end` -- ran out of chain into "undefined
   // method '=='". (Object#=~ is gone since 3.2: that one is no superclass
   // method, as ruby says.)
-  else if (str_len meth == 2 && str_eq meth "==") then prim_method recv "equal?" args
+  if (str_len meth == 2 && str_eq meth "==") then prim_method recv "equal?" args
   else if (str_len meth == 3 && str_eq meth "===") then invoke_val_c gc_cenv0 world superblk recv "==" args false
   else if (str_len meth == 2 && str_eq meth "!=") then
     VBool (if truthy (invoke_val_c gc_cenv0 world superblk recv "==" args false) then false else true)
@@ -51851,12 +51874,6 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
         let fl = (if map_has i9x (str_of_int oid ++ "@__rx_flags") then to_s (map_get i9x (str_of_int oid ++ "@__rx_flags")) else "") in
         invoke_val_c (map_new ()) world superblk (VRegex (src, fl, "")) meth args false)
      | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
-  // `super` from a module prepended to a builtin object class, or from a
-  // subclass's override, into that class's native method: io-console 0.9.5
-  // prepends IO::platform_tty, whose #tty? calls rb_call_super, and every
-  // $stdout.tty? -- Rails' test reporter asks it -- was "super: no superclass
-  // method 'tty?'". The dispatcher's native arm answers it, past the Ruby
-  // bodies of that name once (bi_skip, as a saved native alias does).
   // All real native ancestors have been tried. A class/module receiver's
   // missing hook belongs to its singleton chain, not its instance methods.
   else if has_meth world (super_base world recv) "method_missing" then

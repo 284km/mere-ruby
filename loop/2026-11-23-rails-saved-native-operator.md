@@ -93,7 +93,26 @@ faults. Each one was reproduced without Rails as well.
   `eql_without_coercion`). Equal Times were not `eql?`: `uniq` kept both and
   a Hash lookup missed.
 
+## The review's second round (60250ac5)
+
+Moving that arm ahead of BasicObject's and Kernel's had three costs, so the
+decision now lives where `super` knows its `defcls`. It is
+`super_native_or_missing`, called from `super_blt_alias_or_missing` and from
+both singleton `super` paths:
+- The native is reached only when its builtin object class comes **after
+  defcls** in the chain. `class Time; def eql?(o) = super; end` replaces
+  Time's own, so it goes on to Kernel's, as in ruby (`false`), and not back
+  to Time's native (it said `true`).
+- A `super` from inside a refinement of the name runs with no refinement
+  active. `refine(Time) { def hour = super + 100 }` overflowed the stack.
+- Only an IO or File with a singleton class keeps the old arms. A Time with
+  a singleton method or an extended module reaches Time's native again.
+
 Follow-up (the same on main):
+- `super` from a singleton method defined in a file where a refinement of
+  that name is active does not reach the refinement (ruby: the refinement,
+  then the native).
+
 - `super` from a module extended into `$stderr` / `$stdout`, or a singleton
   method on one, into `#write`: "super: no superclass method 'write'". The
   native arms do not answer through a singleton class.

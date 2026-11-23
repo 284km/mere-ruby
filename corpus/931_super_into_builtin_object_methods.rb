@@ -73,3 +73,24 @@ p try { [Time.at(3), Time.at(1)].sort.map(&:to_i) }, try { Time.at(1) == Time.at
 # a singleton's super still reaches Kernel#puts as before
 $stdout.singleton_class.class_eval { def puts(*a) = super }
 $stdout.puts("through the singleton")
+
+# a singleton method or an extended module on a Time reaches Time's own
+tz = Time.at(7200).utc
+def tz.hour = super * 2
+p try { tz.hour }
+tz2 = Time.at(0).utc
+tz2.extend(Module.new { def year = super + 1 })
+p try { tz2.year }
+
+# a body that replaces Time's own in Time itself goes on to Kernel's
+class Time
+  def eql?(other) = super
+end
+p try { Time.at(1).eql?(Time.at(1)) }, try { Time.at(1).eql?(Time.at(1).dup) }
+
+# super from inside a refinement reaches the native, not the refinement again
+module HourPlus
+  refine(Time) { def hour = super + 100 }
+end
+using HourPlus
+p try { Time.at(3600).utc.hour }
