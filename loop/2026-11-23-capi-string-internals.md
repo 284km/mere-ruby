@@ -50,9 +50,13 @@ slot_size, and stopped at nil before any C ran: the next section.
 
 ## 2026-11-23: GC::INTERNAL_CONSTANTS describes the slots the String structs C sees are allocated in
 
-**The decision changed** (the user's, 2026-11-23). On 11-16 it was "empty:
-there is no RVALUE slot heap" (note 545 §2), checked by corpus 669 / 711. Now
-INTERNAL_CONSTANTS describes how the objects C sees are actually allocated,
+**Applying the 11-16 decision (real values only), as the user confirmed on
+11-23 and 11-24.** On 11-16 INTERNAL_CONSTANTS was empty because there was no
+slot heap (note 545 §2), checked by corpus 669 / 711. The values are real now
+because the C side really allocates slots: INTERNAL_CONSTANTS reports the
+slots the String mirrors C has seen are allocated in, and no slot is
+predicted for an object C has not seen (11-24, #189's review). It describes
+how the objects C sees are actually allocated,
 as CRuby's MMTk build reports its own collector's values (gc/mmtk/mmtk.c) --
 and for that to be true, not invented, the String mirror allocates that way:
 
