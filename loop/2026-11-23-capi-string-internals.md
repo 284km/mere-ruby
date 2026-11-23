@@ -98,19 +98,31 @@ test_dump_to_default and test_dump_to_io pass on both sides and leave the
 exclusion ledger (unittest/excludes-gc/TestObjSpace.rb, gc_cases.tsv now
 MATCH). test_gc, test_gc_compact, test_time, test_objectspace unchanged.
 
-**test_memsize_of_all is RED in the file's run, and why it is not this
-change.** It compares `memsize_of_all` with `memsize_of_all(String)`,
-counted one after the other. Here `memsize_of` of an Encoding, an Array, a
-Proc ... makes Strings (206 for the Encodings alone, GC disabled), so the
-first count makes ~6,000 Strings that the second then counts: 3.4 M vs 4.5 M
-in the file's run, 0.96 M when the Strings are counted again right after.
-Whether the first count wins depends on what the tests before it left and
-when the collector runs: main's binary fails it run alone
-(`-n test_memsize_of_all`) and passes it in the file; this branch passes it
-alone and, with the three tests above now running (the order changes), fails
-it in the file. The fix is a memsize_of that allocates nothing, not part of
-this change. memsize_of a String itself asks for one Integer
-(`__str_layout(s, :memsize)`), no Array.
+**test_memsize_of_all: memsize_of makes no Strings.** The test compares
+`memsize_of_all` with `memsize_of_all(String)`, counted one after the
+other, so Strings the first count makes are counted by the second. Here
+`memsize_of` of an Encoding, an Array, a Proc ... made 2 Strings each (~6,000
+in the file's run: 3.4 M vs 4.5 M), and whether the first count won
+depended on the order and on when the collector ran -- main's binary fails
+it alone (`-n test_memsize_of_all`) and passes it in the file; this branch,
+before the fix, the other way round. The Strings came from `__slot`'s
+`return` out of an `each` block: **a return out of a block makes 2--3
+Strings** on the evaluator and the VM (`def m(n) = ([40, 80].each { |s|
+return s if n <= s }; 0)`, 10 calls: 31 / 21 Strings; the same without the
+`return`: none). `__slot` is now a chain of comparisons, and memsize_of of
+none of 14 kinds (Encoding, Array, Proc, Object, Hash, String, Range,
+Method, exception, Time, Symbol, Class, Regexp, Bignum) makes a String.
+test_memsize_of_all passes alone and in 10 runs of the file. The file fails
+the same 8 tests in each run, all of which main's binary fails too (main: 9,
+the ninth test_dump_to_io, above). One of the first three runs had 1 error
+more; it did not come back in the next 7, and its log was not kept, so which
+test it was is not known.
+**Follow-up (interpreter): a `return` from a block should make no
+Strings** -- it is on every early return out of `each` / `map` / `find`
+with a block.
+
+memsize_of a String itself asks for one Integer (`__str_layout(s,
+:memsize)`), no Array.
 
 capi/check/spec_expect.tsv re-recorded: class_spec 103 -> 109 on the
 mere-ruby side, which main's binary already passes (#157/#158, not this
