@@ -11235,3 +11235,16 @@ Second round (on 2ad86883):
   encoding's index read back from C, Proc#binding vs Kernel#binding from C,
   memsize_of a typed data wrapping NULL, rb_errinfo in a Ruby rescue after an
   rb_protect -- each agreeing on both sides.
+
+Third round (on 7871475d, nits):
+- `rb_funcall(a_binding, "binding")` is refused too: a Binding has no
+  #binding of its own in 4.0, Kernel's answers it.
+- rb_funcallv_public on an object's private method says ruby's "private
+  method 'm' called for ..." (it said "undefined method"), unless the class
+  has a method_missing, which is asked.
+- `__capi_public_send` answers only the call capi_send makes just before
+  (capi_pub_entry); Ruby code that writes it gets NoMethodError, as in ruby.
+- Still open: rb_errinfo per fiber. The switch hook (mr_capi_switch) could
+  keep one per stack, but it cannot tell a Fiber that ended from one that
+  paused, and stack numbers come back -- a new Fiber would start with an
+  old exception. That needs a hook for a stack's end first.

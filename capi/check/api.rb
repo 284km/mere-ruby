@@ -426,6 +426,10 @@ class PublicSendOverride
 end
 check(A.funcall_public(PublicSendOverride.new, :m) == :real)
 check((A.funcall_public(PublicSendOverride.new, :hidden) rescue $!.class) == NoMethodError)
+check((A.funcall_public(PublicSendOverride.new, :hidden) rescue $!.message) ==
+      "private method 'hidden' called for an instance of PublicSendOverride")
+# (...and the way in it takes is no name Ruby code can call)
+check((1.__capi_public_send(:to_s) rescue $!.class) == NoMethodError)
 # (C's rb_fs holds a value without identity across a collection)
 old_fs = $;
 begin
@@ -447,6 +451,7 @@ check(Encoding.list.index(dummy) >= 127)
 # (Kernel#binding from C is refused; a Proc's #binding is not)
 check(A.binding_of(proc { 1 }).is_a?(Binding))
 check((A.binding_of(Object.new) rescue $!.class) == RuntimeError)
+check((A.binding_of(binding) rescue $!.class) == RuntimeError)
 # (memsize_of a typed data wrapping NULL: its dsize is not asked)
 require 'objspace'
 check(ObjectSpace.memsize_of(A.null_typed).is_a?(Integer))
