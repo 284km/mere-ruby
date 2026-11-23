@@ -4,6 +4,10 @@ The other documents describe the SUBJECT. This one describes the LOOP: how
 long it takes to get from an edit to a landed commit, where that time actually
 goes, and what each attempt to shorten it was worth.
 
+> **Since 2026-11-23, new records go in [`loop/`](loop/README.md), one file per
+> change.** This file is the history up to then; do not append to it. The
+> per-stream corpus number ranges are in `loop/README.md`.
+
 It exists because the first honest measurement of this loop was a surprise.
 The sweep is 95% of a cycle, and more than half of the sweep was the harness
 copying a directory tree that never changes. Nobody would have guessed that;
