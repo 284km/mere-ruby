@@ -85,7 +85,12 @@ The collector is the interpreter's own. For the C API it adds:
   (scanned conservatively for numbers in the table's range) -- and the same
   for the stack of a Fiber or Thread that is stopped inside a C call;
 - what a live data object's `dmark` marks (`rb_gc_mark`), run to a fixpoint
-  with the rest of the marking;
+  with the rest of the marking. A `dmark` that runs with no call into C in
+  progress has nobody to ask: what it reads of an object (`RARRAY_LEN`, an
+  Array's elements, the header) is the struct as last fetched, and a method
+  it calls (`rb_ivar_get`) answers nil. What it reaches that way is reachable
+  from the object it already marked, which the interpreter marks itself
+  (sqlite3's `database_mark` walks its arrays so);
 - the elements a live Array's or String's mirror holds.
 
 An entry nothing reaches is dropped at the sweep; a data object's `dfree`

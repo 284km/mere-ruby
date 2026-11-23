@@ -141,6 +141,7 @@ void mr_transit_restore(struct mr_transit *t) {
 }
 
 /* ---- asking the interpreter ---------------------------------------------- */
+int mr_capi_calling(void) { return cur != NULL; }
 int mr_capi_raise(CapiWord outcome) {
     if (!cur) mr_fatal("an outcome with no call in progress");
     cur->raised = 1;
@@ -208,6 +209,10 @@ int mr_kw(int kw) { return kw ? MR_SEND_KW : 0; }
 /* (rb_iterate's block, waiting for the first method its function calls) */
 VALUE mr_iterate_block;
 VALUE mr_callv(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int flags) {
+    /* (a method a dmark calls with no C call in progress -- sqlite3's
+     *  aggregator pin reads an ivar with rb_ivar_get, under GC.stress --
+     *  answers nil: what the object it asks holds, the interpreter marks) */
+    if (!cur && mr_capi_mark_unasked()) return Qnil;
     if (mr_iterate_block && NIL_P(block)) { block = mr_iterate_block; mr_iterate_block = 0; }
     /* (keywords passed are a Hash, or one by #to_hash -- every *_kw function
      *  of the C API refuses anything else: "no implicit conversion of

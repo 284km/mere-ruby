@@ -37,6 +37,42 @@ static VALUE box_get_after_gc(VALUE self) {
 static VALUE box_freed(VALUE self) { (void)self; return INT2NUM(freed); }
 static VALUE error_payload(VALUE self) { return (VALUE)(uintptr_t)RTYPEDDATA_DATA(self); }
 static VALUE box_duplicates(VALUE self) { (void)self; return INT2NUM(duplicate_frees); }
+/* A dmark that READS what it marks, as sqlite3's database_mark does: an
+ * Array's length and elements (RARRAY_LEN / RARRAY_AREF) and an object's
+ * ivar (rb_ivar_get), from a collection that runs with no C call in progress. */
+typedef struct { VALUE list; VALUE holder; } reading_box;
+static void reading_mark(void *ptr) {
+    reading_box *box = ptr;
+    if (!NIL_P(box->list)) {
+        rb_gc_mark(box->list);
+        for (long i = 0; i < RARRAY_LEN(box->list); i++) rb_gc_mark(RARRAY_AREF(box->list, i));
+    }
+    if (!NIL_P(box->holder)) {
+        rb_gc_mark(box->holder);
+        rb_gc_mark(rb_ivar_get(box->holder, rb_intern("@items")));
+    }
+}
+static size_t reading_size(const void *ptr) { (void)ptr; return sizeof(reading_box); }
+static const rb_data_type_t reading_type = {
+    "reading_box", {reading_mark, RUBY_TYPED_DEFAULT_FREE, reading_size}, 0, 0, RUBY_TYPED_FREE_IMMEDIATELY
+};
+static VALUE reading_alloc(VALUE klass) {
+    reading_box *box;
+    VALUE object = TypedData_Make_Struct(klass, reading_box, &reading_type, box);
+    box->list = rb_ary_new();
+    for (int i = 0; i < 4; i++) rb_ary_push(box->list, rb_sprintf("item-%d", i));
+    box->holder = rb_obj_alloc(rb_cObject);
+    rb_ivar_set(box->holder, rb_intern("@items"), rb_ary_new_from_args(1, rb_str_new_cstr("held")));
+    return object;
+}
+static VALUE reading_list(VALUE self) {
+    reading_box *box; TypedData_Get_Struct(self, reading_box, &reading_type, box);
+    return box->list;
+}
+static VALUE reading_held(VALUE self) {
+    reading_box *box; TypedData_Get_Struct(self, reading_box, &reading_type, box);
+    return rb_ivar_get(box->holder, rb_intern("@items"));
+}
 extern void Init_typeddata(void);
 extern void Init_dataerror(VALUE);
 void Init_typed_probe(void) {
@@ -52,4 +88,8 @@ void Init_typed_probe(void) {
     rb_define_method(klass, "value_after_gc", box_get_after_gc, 0);
     rb_define_singleton_method(klass, "freed", box_freed, 0);
     rb_define_singleton_method(klass, "duplicate_frees", box_duplicates, 0);
+    VALUE reading = rb_define_class_under(bug, "ReadingBox", rb_cObject);
+    rb_define_alloc_func(reading, reading_alloc);
+    rb_define_method(reading, "list", reading_list, 0);
+    rb_define_method(reading, "held", reading_held, 0);
 }

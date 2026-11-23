@@ -100,8 +100,15 @@ static uint64_t body_hash(const struct mr_mirror *m) {
     return hash_bytes(m->as.array.as.heap.ptr, sizeof(VALUE) * (size_t)m->as.array.as.heap.len, 2);
 }
 
+/* (a dmark the collector runs between C calls has nobody to ask: it reads
+ *  the struct as last fetched -- sqlite3's database_mark walks its arrays
+ *  with RARRAY_LEN after rb_gc_mark on them, at the first GC.start. What the
+ *  marked object holds the interpreter marks itself.) */
+static int marking;
+int mr_capi_mark_unasked(void) { return marking && !mr_capi_calling(); }
 static void refresh_head(struct mr_mirror *m, VALUE obj) {
     if (m->head_epoch == mr_epoch) return;
+    if (mr_capi_mark_unasked()) return;
     VALUE packed = mr_up1(MR_DESCRIBE, obj);
     VALUE flags = m->as.basic.flags;
     /* The type, frozen and the encoding are the interpreter's to say; the
@@ -298,6 +305,7 @@ static void array_room(struct mr_mirror *m, long capa) {
 
 void *rb_mere_array(VALUE obj) {
     struct mr_mirror *m = mr_mirror_of(obj);
+    if (mr_capi_mark_unasked()) return &m->as.array;
     if ((m->as.basic.flags & 0x1f) != T_ARRAY)
         rb_raise(rb_eTypeError, "wrong argument type %s (expected Array)", rb_obj_classname(obj));
     if (m->body == T_ARRAY && m->body_epoch == mr_epoch) return &m->as.array;
@@ -427,7 +435,6 @@ void mr_mirror_data(VALUE obj, int typed, const rb_data_type_t *type, void *data
 
 /* ---- the collector --------------------------------------------------------- */
 static closure_int_int marker;
-static int marking;
 void mr_mark_value(VALUE v) {
     if (marking && MR_HANDLE_P(v)) marker.fn(marker.env, (long long)v);
 }

@@ -128,6 +128,10 @@ RBIMPL_ATTR_NORETURN() void mr_fatal(const char *message);
 /* MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch|fileprobe|builtin: one guarantee switched off, for
  * the negative controls of tools/capi_check.py. UNSOUND; a diagnostic. */
 int mr_without(const char *what);
+/* Whether a C call from the interpreter is in progress (one it can be asked through). */
+int mr_capi_calling(void);
+/* Whether a dmark is running with no C call in progress: nobody to ask (mirror.c). */
+int mr_capi_mark_unasked(void);
 /* An API this C side does not provide: NotImplementedError, never a guess. */
 RBIMPL_ATTR_NORETURN() void mr_unsupported(const char *what);
 
