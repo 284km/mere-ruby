@@ -256,8 +256,15 @@ VALUE rb_data_define(VALUE super, ...) {
     const char *member;
     while ((member = va_arg(ap, const char *)) != NULL) rb_ary_push(members, ID2SYM(rb_intern(member)));
     va_end(ap);
-    VALUE base = (super == 0 || NIL_P(super)) ? mr_const("Data") : super;
-    return mr_callv(base, rb_intern("define"), RARRAY_LENINT(members), RARRAY_CONST_PTR(members), Qnil, 0);
+    VALUE data = mr_const("Data");
+    if (super == 0 || NIL_P(super) || super == data)
+        return mr_callv(data, rb_intern("define"), RARRAY_LENINT(members), RARRAY_CONST_PTR(members), Qnil, 0);
+    /* (a class Data.define made has no ::define of its own -- it is undefined
+     *  there, as in ruby -- so Data's runs with that class as its self, and
+     *  makes the new one under it: rb_data_define(super, ...)) */
+    VALUE define = mr_call(mr_call(data, "singleton_class", 0), "instance_method", 1, ID2SYM(rb_intern("define")));
+    rb_ary_unshift(members, super);
+    return mr_callv(define, rb_intern("bind_call"), RARRAY_LENINT(members), RARRAY_CONST_PTR(members), Qnil, 0);
 }
 
 /* ---- Enumerator ------------------------------------------------------------------ */

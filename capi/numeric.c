@@ -354,8 +354,7 @@ VALUE rb_num_coerce_bit(VALUE x, VALUE y, ID op) { return coerced(x, y, op); }
 VALUE rb_Rational(VALUE num, VALUE den) { return mr_call(mr_main(), "Rational", 2, num, den); }
 VALUE rb_rational_new(VALUE num, VALUE den) { return mr_call(mr_main(), "Rational", 2, num, den); }
 /* rational.c's rb_rational_raw: Integers (or what to_int gives), the sign on
- * the numerator, and no reduction. A Rational here is always in lowest terms,
- * so the pair that is not is refused instead of being answered reduced. */
+ * the numerator, and no reduction -- 42/2 stays 42/2. */
 VALUE rb_rational_raw(VALUE num, VALUE den) {
     if (!RB_INTEGER_TYPE_P(num)) num = rb_to_int(num);
     if (!RB_INTEGER_TYPE_P(den)) den = rb_to_int(den);
@@ -363,9 +362,32 @@ VALUE rb_rational_raw(VALUE num, VALUE den) {
         num = mr_call(num, "-@", 0);
         den = mr_call(den, "-@", 0);
     }
-    if (!RTEST(mr_call(mr_call(num, "gcd", 1, den), "==", 1, INT2FIX(1))) && !RTEST(mr_call(den, "==", 1, INT2FIX(0))))
-        mr_unsupported("rb_rational_raw (a Rational that is not in lowest terms)");
-    return mr_call(mr_main(), "Rational", 2, num, den);
+    return mr_up2(MR_RAT_RAW, num, den);
+}
+/* rational.c's f_gcd_normal: Euclid's algorithm on Integers, by remainders
+ * (CRuby exports it for its tests, beside the GMP one) */
+static long gcd_long(long x, long y) {
+    if (x < 0) x = -x;
+    if (y < 0) y = -y;
+    while (y) { long t = x % y; x = y; y = t; }
+    return x;
+}
+VALUE rb_gcd_normal(VALUE x, VALUE y) {
+    if (FIXNUM_P(x) && FIXNUM_P(y) && FIX2LONG(x) != LONG_MIN && FIX2LONG(y) != LONG_MIN)
+        return LONG2NUM(gcd_long(FIX2LONG(x), FIX2LONG(y)));
+    if (RTEST(mr_call(x, "<", 1, INT2FIX(0)))) x = mr_call(x, "-@", 0);
+    if (RTEST(mr_call(y, "<", 1, INT2FIX(0)))) y = mr_call(y, "-@", 0);
+    if (RTEST(mr_call(x, "==", 1, INT2FIX(0)))) return y;
+    if (RTEST(mr_call(y, "==", 1, INT2FIX(0)))) return x;
+    for (;;) {
+        if (FIXNUM_P(x)) {
+            if (FIX2LONG(x) == 0) return y;
+            if (FIXNUM_P(y)) return LONG2NUM(gcd_long(FIX2LONG(x), FIX2LONG(y)));
+        }
+        VALUE z = x;
+        x = mr_call(y, "%", 1, x);
+        y = z;
+    }
 }
 VALUE rb_rational_num(VALUE r) { return mr_call(r, "numerator", 0); }
 VALUE rb_rational_den(VALUE r) { return mr_call(r, "denominator", 0); }

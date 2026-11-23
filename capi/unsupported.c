@@ -26,7 +26,6 @@ UNSUPPORTED(rb_big_divrem_normal) UNSUPPORTED(rb_big_mul_balance) UNSUPPORTED(rb
 UNSUPPORTED(rb_big_mul_normal) UNSUPPORTED(rb_big_mul_toom3) UNSUPPORTED(rb_big_new)
 UNSUPPORTED(rb_big_sq_fast) UNSUPPORTED(rb_big2str_generic) UNSUPPORTED(rb_big2str_poweroftwo)
 UNSUPPORTED(rb_str2big_karatsuba) UNSUPPORTED(rb_str2big_normal) UNSUPPORTED(rb_str2big_poweroftwo)
-UNSUPPORTED(rb_gcd_normal)
 /* the VM's own structures */
 UNSUPPORTED(rb_tracepoint_new) UNSUPPORTED(rb_tracepoint_enable) UNSUPPORTED(rb_tracepoint_disable)
 UNSUPPORTED(rb_tracearg_from_tracepoint) UNSUPPORTED(rb_tracearg_event_flag) UNSUPPORTED(rb_tracearg_object)
@@ -49,7 +48,11 @@ UNSUPPORTED(rb_tracepoint_enabled_p) UNSUPPORTED(rb_enc_alias)
 UNSUPPORTED(rb_random_base_init) UNSUPPORTED(rb_random_mark)
 /* encoding converters, and the rest */
 UNSUPPORTED(rb_econv_str_append) UNSUPPORTED(rb_marshal_define_compat)
-UNSUPPORTED(rb_setup_fake_str) UNSUPPORTED(rb_str_normalize_ospath)
+UNSUPPORTED(rb_setup_fake_str)
+/* (file.c has it on Apple's platforms only: capi/ospath.c) */
+#ifndef __APPLE__
+UNSUPPORTED(rb_str_normalize_ospath)
+#endif
 
 /* Declared as data: an extension that names one links, and finds it empty. */
 const char rb_random_data_type_1_0[128];
