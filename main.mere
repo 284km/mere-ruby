@@ -23043,6 +23043,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else
          (let names = map_new () in
           let _ = collect_cls_methods world c names in
+          // (a class's or a module's singleton class answers Module's own
+          //  singleton methods too -- its singleton's ancestors reach
+          //  #<Class:Module>, and a class's #<Class:Class> -- where an
+          //  object's singleton class reaches neither: ruby 4.0's
+          //  `String.singleton_class.singleton_methods`)
+          let _ = (if is_sng_cls c then
+                     (let in9 = sng_inner c in
+                      if str_len in9 == 0 || is_digit (char_at in9 0) || is_sng_cls in9 then ()
+                      else (let mod9 = Cons ("constants", Cons ("nesting", Cons ("used_modules", Cons ("used_refinements", Nil)))) in
+                            let ns9 = (if map_has modules in9 then mod9 else Cons ("allocate", mod9)) in
+                            list_iter ns9 (fn (n9: str) -> if map_has names n9 then () else map_set names n9 (VSym n9))))
+                   else ()) in
           let out = map_new () in
           let _ = map_iter names (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
           let own9 = idx_to_list out 0 (map_len out) in
@@ -30098,7 +30110,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       | VMain -> "(main)"
                       | _ -> "") in
        let nm9 = (match args with Cons (VSym s9, _) -> s9 | Cons (VStr s9, _) -> sget s9 | _ -> "") in
-       let _ = frz_recv_check env world recv in
+       let _ = sng_def_check env world recv in
        if str_eq target9 "" then raise_exc world "TypeError" "can't define singleton"
        else (match args with
              | Cons (_, Cons (VProc pid9, _)) ->
@@ -34120,9 +34132,14 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                      | VArr _ -> hng_cls_of world recv "Array"
                      | VStr _ -> hng_cls_of world recv "String"
                      | VHsh _ -> hng_cls_of world recv "Hash"
+                     // (a Proc and a Binding keep theirs aside the same way,
+                     //  where `def pr.m` puts one: `binding.define_singleton_method`
+                     //  was "can't define singleton")
+                     | VProc _ -> hng_cls_of world recv "Proc"
+                     | VBind _ -> hng_cls_of world recv "Binding"
                      | _ -> "") in
        let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr s2, _) -> sget s2 | _ -> "") in
-       let _ = frz_recv_check env world recv in
+       let _ = sng_def_check env world recv in
        if str_eq target "" then raise_exc world "TypeError" "can't define singleton"
        else
          (let (h2, ps2, bb2, e2) = newblk in
@@ -36218,12 +36235,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
      //   compiler interns that one) are ruby's "can't define singleton", while
      //   a string frozen at run time (`"y".dup.freeze`) still gets a class.
      //   The intern table is the same one the `-str` operator writes.
-     | VStr h9 when (let k9 = senc_get h9 ++ chr 1 ++ sget h9 in
-                     if map_has str_intern_tbl k9
-                     then (match map_get str_intern_tbl k9 with
-                           | VStr hid9 -> hid9 == h9
-                           | _ -> false)
-                     else false) ->
+     | VStr h9 when str_is_interned h9 ->
        raise_exc world "TypeError" "can't define singleton"
      | VStr _ -> VClass (prim_sng_cls world recv "String")
      | VArr _ -> VClass (prim_sng_cls world recv "Array")
@@ -40907,10 +40919,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                | _ -> recv) in
      // #clone carries the frozen state over, #dup drops it. `clone(freeze: false)` opts out.
      let was_frozen = (match recv with VStr id -> sfrozen_get id | VArr id -> cfrozen_get 0 id | VHsh id -> cfrozen_get 1 id | VProc id -> cfrozen_get 2 id | VRegex (_, _, _) -> val_is_frozen recv | _ -> false) in
-     let keep = (str_len name == 5 && str_eq name "clone") && was_frozen &&
-       (match args with
-        | Cons (VHsh h, Nil) -> (match hash_get (hderef h) (VSym "freeze") with VBool b -> b | _ -> true)
-        | _ -> true) in
+     // (`freeze: true` freezes the copy whatever the receiver was, `false`
+     //  leaves it unfrozen, nil or no keyword carries the receiver's state:
+     //  `"x".clone(freeze: true).frozen?` was false)
+     let fz9 = (match args with
+                | Cons (VHsh h, Nil) -> (match hash_get (hderef h) (VSym "freeze") with VBool true -> 1 | VBool false -> 0 | _ -> 0 - 1)
+                | _ -> 0 - 1) in
+     let keep = (str_len name == 5 && str_eq name "clone") && (if fz9 == 1 then true else if fz9 == 0 then false else was_frozen) in
      let _ = if keep then (match cp with VStr id -> let _ = sfrozen_set id in () | VArr id -> let _ = cfrozen_set 0 id in () | VHsh id -> let _ = cfrozen_set 1 id in () | VProc id -> let _ = cfrozen_set 2 id in () | VRegex (_, _, e9) -> map_set rx_frz (rx_ev_id e9) 1 | _ -> ()) else () in
      cp))
   // string interpolation: a String is used as it is (Ruby does not call to_s on
@@ -50530,6 +50545,12 @@ and ma_blt_go = fn world -> fn (l: str list) ->
 // A CLASS's hook is one of its class methods, so for a VClass it is looked up
 // in the class's singleton (dispatch_cls_of answers the class itself, whose
 // table holds the INSTANCE methods -- the hook of `def self.x` was never found).
+// An object's singleton fires its hook before the write (the def sites);
+// the hook defining itself is the exception: ruby calls it after the def,
+// so the NEW hook hears its own name (run after the write, at the end of
+// SDef). Before, the first `def o.singleton_method_added` heard nothing.
+and run_sma_before = fn world -> fn (recv: Val) -> fn (nm: str) ->
+  if str_eq nm "singleton_method_added" then () else run_singleton_method_added world recv nm
 and run_singleton_method_added = fn world -> fn (recv: Val) -> fn (nm: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let c9 = (match recv with VClass c8 -> "(sng:" ++ c8 ++ ")" | _ -> dispatch_cls_of world recv) in
@@ -51981,9 +52002,11 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
               let _ = register_class_v world "Struct" sprog "public" cenv9 in ())) in
   // a keyword_init struct class says so in its inspect (rb_struct_s_inspect:
   // `S(keyword_init: true)`); #to_s and #name do not
-  let _ = (if kw then set_meth meths ("(sng:" ++ anon ++ ")#inspect")
-                        (Meth (Nil, Nil, Cons (SReturn (EBin ("+", EMethod (ESelf, "to_s", Nil), EStrL "(keyword_init: true)")), Nil)))
-           else ()) in
+  // (every struct class has that singleton inspect, a keyword_init one or
+  //  not: `S.singleton_methods` lists :inspect, and it is to_s otherwise)
+  let _ = set_meth meths ("(sng:" ++ anon ++ ")#inspect")
+            (Meth (Nil, Nil, Cons (SReturn (if kw then EBin ("+", EMethod (ESelf, "to_s", Nil), EStrL "(keyword_init: true)")
+                                            else EMethod (ESelf, "to_s", Nil)), Nil))) in
   // Struct[] is a synonym for new, and #keyword_init? answers what the class
   // was built with (nil when it was not mentioned at all, as ruby reports).
   let _ = set_meth meths ("(sng:" ++ anon ++ ")#[]")
@@ -59590,13 +59613,34 @@ and display_cls_msg = fn world -> fn (c: str) ->
 and frz_recv_check = fn env -> fn world -> fn (recv: Val) ->
   match recv with
   | VClass c -> frz_cls_check world c
-  | VObj id ->
-    (if ofrozen_get id
-     then (let _ = raise_exc_iv world "FrozenError"
-             ("can't modify frozen " ++ display_cls_msg world (dispatch_cls_of world recv)
-              ++ ": " ++ inspect_w env world recv) (Cons (("__recv", recv), Nil)) in ())
-     else ())
+  // (and a frozen String, Array or Hash: `s.freeze; def s.x` and
+  //  `s.define_singleton_method` are ruby's FrozenError, as for an object)
+  | VObj _ -> frz_recv_raise env world recv (val_is_frozen recv)
+  | VStr _ -> frz_recv_raise env world recv (val_frozen_mut recv)
+  | VArr _ -> frz_recv_raise env world recv (val_frozen_mut recv)
+  | VHsh _ -> frz_recv_raise env world recv (val_frozen_mut recv)
   | _ -> ()
+and frz_recv_raise = fn env -> fn world -> fn (recv: Val) -> fn (frozen: bool) ->
+  if frozen
+  then (let _ = raise_exc_iv world "FrozenError"
+          ("can't modify frozen " ++ display_cls_msg world (dispatch_cls_of world recv)
+           ++ ": " ++ inspect_w env world recv) (Cons (("__recv", recv), Nil)) in ())
+  else ()
+// ...and before a singleton method is defined on a value: a deduplicated
+// string -- a frozen literal, `-"s"` -- is shared, so it has no singleton
+// class to hold one (ruby's TypeError, as singleton_class says), whatever
+// else is true of it
+and sng_def_check = fn env -> fn world -> fn (recv: Val) ->
+  match recv with
+  | VStr h9 when str_is_interned h9 -> (let _ = raise_exc world "TypeError" "can't define singleton" in ())
+  | _ -> frz_recv_check env world recv
+// is this string the one the intern table holds for its text (the `-str`
+// operator's table, which frozen literals go through)?
+and str_is_interned = fn (h9: int) ->
+  let k9 = senc_get h9 ++ chr 1 ++ sget h9 in
+  if map_has str_intern_tbl k9
+  then (match map_get str_intern_tbl k9 with VStr hid9 -> hid9 == h9 | _ -> false)
+  else false
 
 
 
@@ -63547,7 +63591,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          let m = substring name 5 (str_len name) in
          (if lv_has env "self" then
             (match lv_get env "self" with
-             | VObj id -> (let _ = run_singleton_method_added world (VObj id) m in
+             | VObj id -> (let _ = run_sma_before world (VObj id) m in
                            singleton_cls_of world id ++ "#" ++ m)
              | VClass c -> (let _ = frz_cls_check world c in "(sng:" ++ c ++ ")#" ++ m)
              // (main's own singleton class: `singleton_methods` lists it and
@@ -63598,12 +63642,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                                  ++ ": " ++ inspect_w env world rv9)
                                 (Cons (("__recv", rv9), Nil)) in ())
                         else ()) in
-               let _ = run_singleton_method_added world rv9 m in
+               let _ = run_sma_before world rv9 m in
                singleton_cls_of world id ++ "#" ++ m)
             | VClass c -> (let _ = frz_cls_check world c in let _ = sng_frz_check world c in "(sng:" ++ c ++ ")#" ++ m)
-            | VStr h -> hng_cls_of world (VStr h) "String" ++ "#" ++ m
-            | VArr h -> hng_cls_of world (VArr h) "Array" ++ "#" ++ m
-            | VHsh h -> hng_cls_of world (VHsh h) "Hash" ++ "#" ++ m
+            // (a deduplicated string has none; a frozen one refuses the
+            //  write: sng_def_check)
+            | VStr h -> (let _ = sng_def_check env world rv9 in hng_cls_of world (VStr h) "String" ++ "#" ++ m)
+            | VArr h -> (let _ = sng_def_check env world rv9 in hng_cls_of world (VArr h) "Array" ++ "#" ++ m)
+            | VHsh h -> (let _ = sng_def_check env world rv9 in hng_cls_of world (VHsh h) "Hash" ++ "#" ++ m)
             | VProc ph -> hng_cls_of world (VProc ph) "Proc" ++ "#" ++ m
             | VBind bph -> hng_cls_of world (VBind bph) "Binding" ++ "#" ++ m
             // (a Regexp keyed by its value: see hng_key)
@@ -63629,11 +63675,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          else if is_upper_first recv && map_has consts recv
                  && (match map_get consts recv with VClass _ -> false | _ -> true) then
            (match map_get consts recv with
-            | VObj id -> (let _ = run_singleton_method_added world (VObj id) m in
+            | VObj id -> (let _ = run_sma_before world (VObj id) m in
                           singleton_cls_of world id ++ "#" ++ m)
-            | VStr h -> hng_cls_of world (VStr h) "String" ++ "#" ++ m
-            | VArr h -> hng_cls_of world (VArr h) "Array" ++ "#" ++ m
-            | VHsh h -> hng_cls_of world (VHsh h) "Hash" ++ "#" ++ m
+            | VStr h -> (let _ = sng_def_check env world (VStr h) in hng_cls_of world (VStr h) "String" ++ "#" ++ m)
+            | VArr h -> (let _ = sng_def_check env world (VArr h) in hng_cls_of world (VArr h) "Array" ++ "#" ++ m)
+            | VHsh h -> (let _ = sng_def_check env world (VHsh h) in hng_cls_of world (VHsh h) "Hash" ++ "#" ++ m)
             | VProc ph -> hng_cls_of world (VProc ph) "Proc" ++ "#" ++ m
             | VBind bph -> hng_cls_of world (VBind bph) "Binding" ++ "#" ++ m
             | VInt _ -> no_singleton_here world (map_get consts recv) name
@@ -63669,9 +63715,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           | _ -> name)
        else if lv_has env "__definee_recv"
                && (match lv_get env "__definee_recv" with VNil -> false | _ -> true) then
-         (let _ = frz_recv_check env world (lv_get env "__definee_recv") in
+         (let _ = sng_def_check env world (lv_get env "__definee_recv") in
           match lv_get env "__definee_recv" with
-          | VObj id -> (let _ = run_singleton_method_added world (VObj id) name in
+          | VObj id -> (let _ = run_sma_before world (VObj id) name in
                         let k9 = singleton_cls_of world id ++ "#" ++ name in
                         let _ = map_set_s ie_def_meths k9 "1" in
                         k9)
@@ -63854,6 +63900,16 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              else if (if str_contains key "#" then false else true) && hook_tp_on () then
                (if map_has hook_flags "ma" && has_meth world "(sng:Object)" "method_added" then run_method_added world "Object" (meth_base name)
                 else tp_c_hook world "method_added" "Object")
+             else ()) in
+    // (an object's own singleton_method_added hears its own definition, now
+    //  that it is in place: run_sma_before)
+    let _ = (if str_eq (meth_base name) "singleton_method_added" && str_contains key "#" then
+               (let kc9 = substring key 0 (str_index_of key "#") in
+                if is_sng_cls kc9 then
+                  (let in9 = sng_inner kc9 in
+                   if str_len in9 > 0 && is_digit (char_at in9 0)
+                   then run_singleton_method_added world (VObj (int_of_str in9)) "singleton_method_added" else ())
+                else ())
              else ()) in
     // a (re)definition is not ruby2_keywords until explicitly marked; clear any
     // stale mark so a later plain `def m` does not inherit an earlier one.
@@ -64626,7 +64682,10 @@ and pending_exc = fn world ->
                                        " for " ++ (if map_has modules c9 then "module " else "class ") ++ cls_display world c9)
                                  else if map_has prim_missing "rv"
                                  then (match map_get prim_missing "rv" with VStr h -> sget h | _ -> "")
-                                 else ""))) in
+                                 // (a leaf that recorded the receiver and not
+                                 //  how to name it -- `nil.upcase`, `1.push(2)`
+                                 //  -- is named from the receiver, as ruby names it)
+                                 else prim_blame (map_get prim_missing "rvv")))) in
            let _ = note_prim_bt_at world (VObj id9) "nd" "nl" "nf" in
            let _ = iv_put ivars (str_of_int id9 ++ "@__bt") (map_get raise_bt "v") in
            VObj id9)
