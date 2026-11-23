@@ -34,6 +34,13 @@ the Rails plan. The application in `railstest/app` is measured separately by
   tree copy, gem home and TMPDIR (activerecord's sqlite3 tests share one
   fixture database). `--jobs 1` runs everything in sequence.
 
+The native extensions in a gem home were built by the interpreter that
+installed them (for mere-ruby, against its C API). `run` therefore refuses a
+binary other than the one recorded by `install`. With
+`--other-install-binary` it runs anyway and records both hashes
+(`install_binary_sha256` beside `binary_sha256`). A new mere-ruby build is
+measured after it has installed its own gem home.
+
 ## Environment
 
 Both sides use the application measurement's bootstrap (`../bootstrap.rb`),
@@ -55,7 +62,10 @@ and they set `RAILS_MINITEST_PLUGIN=true`. Here, on purpose:
 - one file per process, so a crash or a bound stops one file only.
 
 `RAILS_STRICT_WARNINGS`, `BUILDKITE` and `CI` are removed, so warnings are not
-errors on either side.
+errors on either side. Inherited `MERE_RUBY_*` settings are removed too.
+`--mere-env MERE_RUBY_VM=1` (repeatable, `MERE_RUBY_*` only) gives a setting
+to mere-ruby's side, so that the VM can be measured instead of the evaluator.
+The results record it as `mere_env`.
 
 A component may need a setting of its own, such as activerecord's `ARCONN=sqlite3`.
 `run --env NAME=VALUE` (repeatable) gives it to both sides alike, and
@@ -91,9 +101,12 @@ the verdicts it did report.
 `same_order` says whether the two sides ran their common tests in the same
 order. The same `--seed` is not enough: anything that draws random numbers
 between the shuffle's draws changes it. A file where it is false may have
-results that depend on order. A name printed after a test's own stdout on the
-same line is still found. Output ending in a capital letter would make a
-wrong name, which then shows as MISSING on one side and EXTRA on the other.
+results that depend on order. A result line is read from the start of the
+line, so a class name with spaces (a `describe` block) is kept whole. A test
+that prints to stdout without a newline puts that output in front of its own
+result line. The name read then carries the output, and the test shows as
+MISSING on one side and EXTRA on the other (unless both sides print it the
+same way). It is never counted as a MATCH that did not happen.
 
 ## Use
 

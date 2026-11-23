@@ -4450,8 +4450,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if (str_len name == 7 && str_eq name "at_exit") && (if map_has meths "at_exit" then false else true) then
       at_exit_with_block (true, bp, bb, env)
     // Kernel#fork { }: Process.fork, with the block (note 436)
+    // (...which captures the enclosing method's block, as every block written
+    //  at a call site does: ActiveSupport's run_in_isolation yields to its
+    //  test from `fork do ... yield ... end`, and it was "no block given")
     else if (str_len name == 4 && str_eq name "fork") && (if map_has meths "fork" then false else true) then
-      invoke world (true, bp, bb, env) (VClass "Process") "(sng:Process)" "fork" Nil
+      invoke world (blk_capture blk (true, bp, bb, env) bb) (VClass "Process") "(sng:Process)" "fork" Nil
     // proc { } / lambda { } capture the block as a first-class VProc.
     // (...unless self's class defines its own: then `lambda { return 1 }` is a
     // call to it with a block, which stays a proc)
@@ -11750,6 +11753,13 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
            | _ -> VNil)
         else if (str_len name == 3 && str_eq name "map") || (str_len name == 7 && str_eq name "collect") then
           iter_result (range_map world encl theblk a int_max Nil) recv
+        // ...and the questions that stop at their answer: they walk, rather
+        // than make the endless array first. ActiveSupport's #many? is
+        // `any? { (cnt += 1) > 1 }`, and `(0..Float::INFINITY).many?` never
+        // came back (test_many_iterates_only_on_what_is_needed, 2 GiB).
+        else if range_seek_name name && (match args with Nil -> true | _ -> false)
+                && (match theblk with (true, _, _, _) -> true | _ -> false) then
+          iter_result (range_seek world encl theblk name a a int_max) recv
         else via_arr_iter world encl theblk recv (arr_new (range_vals world lo hi excl)) name args)
      // ...and an end past int64 (a positive bignum) walks as far as int64
      // does: `(1..2**70).each { }` walked NOTHING (no arm took it), and so did
@@ -12706,6 +12716,30 @@ and range_step_big = fn world -> fn encl -> fn theblk -> fn (v: Val) -> fn (by: 
    | FBreak r -> FBreak r | FReturn r -> FReturn r
    | _ -> range_step_big world encl theblk (arith_bin "+" v by) by)
 
+and range_seek_name = fn (name: str) ->
+  str_eq name "any?" || str_eq name "all?" || str_eq name "none?" || str_eq name "find"
+  || str_eq name "detect" || str_eq name "find_index"
+// an integer walk that stops at its answer (any? / all? / none? / find /
+// detect / find_index with a block); past `last` it gives the empty answer
+and range_seek = fn world -> fn encl -> fn theblk -> fn (mode: str) -> fn (start: int) -> fn (i: int) -> fn (last: int) ->
+  // (an OPEN range that reaches int64's end without an answer would go on in
+  //  bignums; that walk is not here, so it stops as the array form did)
+  let done9 = fn (u: unit) ->
+    (if last == int_max then (match raise_exc world "RangeError" "cannot convert endless range to an array" with _ -> FNext VNil)
+     else FNext (if str_eq mode "all?" || str_eq mode "none?" then VBool true
+                 else if str_eq mode "any?" then VBool false else VNil)) in
+  if i > last then done9 ()
+  else (match run_block world encl theblk (Cons (VInt i, Nil)) with
+        | FBreak v -> FBreak v | FReturn v -> FReturn v
+        | f ->
+          (let t9 = truthy (flow_value f) in
+           if str_eq mode "any?" && t9 then FNext (VBool true)
+           else if str_eq mode "none?" && t9 then FNext (VBool false)
+           else if str_eq mode "all?" && (if t9 then false else true) then FNext (VBool false)
+           else if (str_eq mode "find" || str_eq mode "detect") && t9 then FNext (VInt i)
+           else if str_eq mode "find_index" && t9 then FNext (VInt (i - start))
+           else if i == last then done9 ()
+           else range_seek world encl theblk mode start (i + 1) last))
 and range_map = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) -> fn (acc: Val list) ->
   if i > last then FNext (arr_new (val_rev acc Nil))
   else (match run_block world encl theblk (Cons (VInt i, Nil)) with
@@ -16670,6 +16704,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // cover? with a RANGE argument asks whether the whole range is inside
   else if str_eq name0 "cover?"
           && (match recv0 with VRange (_, _, _) -> true | _ -> false)
+          && range_native_wanted world recv0 name0
           && (match args0 with
               | Cons (VRange (_, _, _), Nil) -> true
               | Cons (VObj o9, Nil) -> (let (_, _, oc9, _) = world in exc_is_a world (map_get oc9 o9) "Range")
@@ -16677,7 +16712,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     invoke_val_c env world blk recv0 "__cover_range" args0 false
   else if (str_eq name0 "include?" || str_eq name0 "member?")
           && (match args0 with Cons (_, Nil) -> true | _ -> false)
-          && (match recv0 with VRange (_, _, _) -> true | _ -> false) then
+          && (match recv0 with VRange (_, _, _) -> true | _ -> false)
+          && range_native_wanted world recv0 name0 then
     (match recv0 with
      | VRange (lo9, hi9, ex9) ->
        (match args0 with
@@ -16691,6 +16727,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // ArgumentError instead of false.
   else if (str_eq name0 "cover?" || str_eq name0 "include?" || str_eq name0 "member?" || str_eq name0 "===")
           && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          && (str_eq name0 "===" || range_native_wanted world recv0 name0)
           // (an object BEGIN is handled by the arm above -- this one is for a
           // primitive range asked about an object, and the reverse)
           && (match recv0 with
@@ -16774,6 +16811,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           && (if str_eq name0 "!" then false else true)
           && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
     (match args0 with Cons (b0, _) -> apply_bin_vals world blk name0 recv0 b0 | _ -> VNil)
+  // Kernel#=== asked BY NAME of an object whose class writes none: the same
+  // object, or the object's own #== (rb_equal). `case` and the operator had
+  // it; `obj.__send__(:===, x)` -- minitest's assert_operator -- was
+  // "undefined method '==='" (ActiveSupport's deprecation tests).
+  else if str_eq name0 "===" && (match recv0 with VObj _ -> true | _ -> false)
+          && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true)
+          && (if builtin_obj_anc_has world (ancestors_of world (display_cls world (dispatch_cls_of world recv0))) name0 then false else true)
+          // (Kernel's: not for a BasicObject subclass, nor after undef)
+          && str_list_has (ancestors_of world (dispatch_cls_of world recv0)) "Kernel"
+          && (if map_len undefs > 0 && undef_blocked world (dispatch_cls_of world recv0) name0 then false else true) then
+    (match args0 with
+     | Cons (b0, _) ->
+       VBool (rb_identical recv0 b0
+              || truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv0 "==" args0 false))
+     | Nil -> VNil)
   // the unary pair, same rule. `~x` is `-1 - x` in every integer width this
   // has, so it needs no arm of its own.
   else if (str_eq name0 "~" || str_eq name0 "!")
@@ -17831,24 +17884,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   else if ((str_len name == 14 && str_eq name "transform_keys") || (str_len name == 16 && str_eq name "transform_values")
            || (str_len name == 15 && str_eq name "transform_keys!") || (str_len name == 17 && str_eq name "transform_values!"))
           && (match recv with VHsh _ -> true | _ -> false)
-          && (if prim_user_has world recv name then false else true)
+          && prim_native_wanted world recv name
           && (match args with Nil -> true | _ -> false) then
     make_enum_a world recv name args
   else if ((str_len name == 14 && str_eq name "transform_keys") || (str_len name == 15 && str_eq name "transform_keys!"))
           && (match recv with VHsh _ -> true | _ -> false)
-          && (if prim_user_has world recv name then false else true)
+          && prim_native_wanted world recv name
           && (match args with Cons (VHsh _, _) -> true | _ -> false) then
-    (match (recv, args) with
-     | (VHsh hid, Cons (VHsh mid, _)) ->
-       (let mp = hderef mid in
-        let rec go = fn (ys: Val list) ->
-          (match ys with
-           | Cons (k, Cons (v, t)) ->
-             Cons ((if hash_haskey mp k then hash_get mp k else k), Cons (v, go t))
-           | _ -> (Nil : Val list)) in
-        let out = hash_merge Nil (go (hderef hid)) in
-        if (str_len name == 15 && str_eq name "transform_keys!") then (let _ = hset hid out in recv) else mkhash out)
-     | _ -> recv)
+    hash_transform_keys_map recv name args
   // `h[key] = v` through DISPATCH (send / a subclass) resolves the stored key
   // the same way the fast path does.
   // ⚠ ...and the READ doors, through the same rule (see hkey_eql_w).
@@ -37668,9 +37711,13 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                                //  rb_reg_regsub builds in the string's encoding)
                                | VStr rh -> (rx_expand_rep (rx_ref_names pat (sget rh)) s0 st en 0 "",
                                              (if enc_all7 (sget rh) then e0 else enc_canon_name (senc_get rh)))
+                               // (the match is a string of the receiver's
+                               //  encoding: a BINARY receiver's is a BINARY
+                               //  key, as ActiveSupport's JSON escaping maps
+                               //  U+2028 -- a UTF-8 one missed it)
                                | VHsh _ ->
                                  (let m = substring s0 st en in
-                                  match invoke_val_c env world nb repv "[]" (Cons (mkstr m, Nil)) false with
+                                  match invoke_val_c env world nb repv "[]" (Cons (mkstr_e m (senc_get h), Nil)) false with
                                   | VStr rh2 -> (sget rh2, enc_canon_name (senc_get rh2))
                                   | VNil -> ("", "US-ASCII")
                                   | ov -> (w_to_s world ov, "UTF-8"))
@@ -40143,6 +40190,38 @@ and recv_defines = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VClass c -> has_meth world ("(sng:" ++ c ++ ")") name
   | _ -> has_meth world (dispatch_cls_of world recv) name
+// Range's own include? / member? / cover? answer a range unless the program
+// wrote the name -- ActiveSupport prepends CompareWithRange to Range, whose
+// #include?(range) is cover? -- or the one call that skips the program's body
+// asked for it (a `super` from that body), which consumes the bypass here.
+// A value's builtin arm answers unless the program wrote the name -- or the
+// one call that skips the program's body asked for it (a `super` from that
+// body: HashWithIndifferentAccess#transform_keys), consumed here.
+// transform_keys(mapping) / transform_keys!(mapping): the keys the mapping
+// names are replaced, the others kept
+and hash_transform_keys_map = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  match (recv, args) with
+  | (VHsh hid, Cons (VHsh mid, _)) ->
+    (let mp = hderef mid in
+     let rec go = fn (ys: Val list) ->
+       (match ys with
+        | Cons (k, Cons (v, t)) ->
+          Cons ((if hash_haskey mp k then hash_get mp k else k), Cons (v, go t))
+        | _ -> (Nil : Val list)) in
+     let out = hash_merge Nil (go (hderef hid)) in
+     if (str_len name == 15 && str_eq name "transform_keys!") then (let _ = hset hid out in recv) else mkhash out)
+  | _ -> recv
+// gsub / sub arguments for prim_method: a String pattern with a Hash
+// replacement becomes the Regexp that matches that string
+and str_hash_rep_args = fn (args: Val list) ->
+  match args with
+  | Cons (VStr p9, Cons (VHsh r9, Nil)) -> Cons (VRegex (rx_escape (sget p9), "", ""), Cons (VHsh r9, Nil))
+  | _ -> args
+and prim_native_wanted = fn world -> fn (recv: Val) -> fn (name: str) ->
+  if prim_user_has world recv name then (if bi_skip_pass name then false else true)
+  else (let _ = bi_skip_pass name in true)
+and range_native_wanted = fn world -> fn (recv: Val) -> fn (name: str) ->
+  if prim_user_has world recv name then false else true
 and prim_user_has = fn world -> fn (recv: Val) -> fn (name: str) ->
   let c = dispatch_cls_of world recv in
   ((if str_eq c "" then false else has_meth world c name)
@@ -44115,7 +44194,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "undump") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'undump'")) in fail "mere-ruby: undefined method 'undump'")))
   else if (str_len name == 3 && str_eq name "sub") || (str_len name == 4 && str_eq name "gsub") then
     (match recv with
-     | VStr s -> let s = sget s in
+     | VStr sh0 -> let enc0 = senc_get sh0 in let s = sget sh0 in
        (match args with
         | Cons (VStr pat, Cons (VStr rep, _)) ->
           let pat = sget pat in let rep = sget rep in
@@ -44124,7 +44203,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let rep = sget rep in
           mkstr (rx_gsub_go2 pat pf s rep 0 ((str_len name == 4 && str_eq name "gsub")) "")
         | Cons (VRegex (pat, pf, _), Cons (VHsh h, _)) ->
-          mkstr (rx_gsub_hash (hderef h) pat pf s ((str_len name == 4 && str_eq name "gsub")) 0 "")
+          mkstr_e (rx_gsub_hash (hderef h) pat pf s ((str_len name == 4 && str_eq name "gsub")) 0 "" enc0) enc0
         | _ -> mkstr s)
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "sub") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'sub'")) in fail "mere-ruby: undefined method 'sub'")))
   else if (str_len name == 5 && str_eq name "chars") then (match recv with VStr s -> arr_new (utf8_chars_enc (sget s) (enc_canon_name (senc_get s)) 0) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "chars") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'chars'")) in fail "mere-ruby: undefined method 'chars'")))
@@ -49938,7 +50017,10 @@ and hng_missing_hook = fn world -> fn (recv: Val) -> fn (name: str) ->
      if (if map_has hng_store hk9 then false else true) then false
      else
        (let c9 = map_get hng_store hk9 in
-        (is_sng_cls c9 || obj_is_a world c9 "Hash") && has_meth world c9 "method_missing"
+        // (a String or an Array subclass too: ActiveSupport::StringInquirer
+        //  answers `env.production?` from its #method_missing)
+        (is_sng_cls c9 || obj_is_a world c9 "Hash" || obj_is_a world c9 "String" || obj_is_a world c9 "Array")
+        && has_meth world c9 "method_missing"
         && (if has_meth world c9 name then false else true)
         && str_eq (blt_alias_lookup world (ancestors_of world c9) name) ""
         && str_eq (refined_impl_for world recv name) ""
@@ -52104,6 +52186,13 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
     (if module_notification_super_ahead world recv meth then module_notification_native world args
      else super_undefined world superblk recv meth args)
   else if str_eq meth "method_missing" then missing_native_super world recv args
+  // Object#respond_to_missing? answers false for every receiver, a value too:
+  // ActiveSupport's tests redefine Array#respond_to_missing? and String's as
+  // `super`, and a value's branch below has no such method
+  else if str_eq meth "respond_to_missing?" && (match recv with VClass _ -> false | VObj _ -> false | _ -> true) then
+    (match args with
+     | Cons (_, Cons (_, Nil)) -> VBool false
+     | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 2)"))
   else if (str_eq meth "send" || str_eq meth "__send__" || str_eq meth "public_send")
           && sender_super_ahead world recv meth then
     native_sender_call gc_cenv0 world (blk_noblk superblk) recv meth args superblk
@@ -52138,6 +52227,27 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
         else if (str_len meth == 6 && str_eq meth "slice!") then str_mut_do h9 meth (coerce_slice_args gc_cenv0 world args)
         else if (str_len meth == 15 && str_eq meth "append_as_bytes") then str_mut_do h9 meth args
         else str_mut_do h9 meth (coerce_dyck_args gc_cenv0 world recv args))
+     // String#initialize from a String subclass's own #initialize: the
+     // content AND the encoding of the string given, then an `encoding:`.
+     // prim_method copied the bytes only, so ActiveSupport::SafeBuffer.new
+     // (`def initialize(_str = "") = super`) was BINARY, and its
+     // #unicode_normalize refused it.
+     | VStr h9 when (str_len meth == 10 && str_eq meth "initialize") ->
+       (let r9 = prim_method recv meth args in
+        let rec pos9 = fn (xs: Val list) -> (match xs with
+                                             | Cons (VStr a9, _) -> senc_set h9 (senc_get a9)
+                                             | _ -> ()) in
+        let _ = pos9 args in
+        let rec kw9 = fn (xs: Val list) -> (match xs with
+                                            | Nil -> VNil
+                                            | Cons (VHsh kh9, Nil) ->
+                                              (if hash_haskey (hderef kh9) (VSym "encoding") then hash_get (hderef kh9) (VSym "encoding") else VNil)
+                                            | Cons (_, t9) -> kw9 t9) in
+        let enc9 = kw9 args in
+        let _ = (match enc9 with
+                 | VNil -> VNil
+                 | e9 -> invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) recv "force_encoding" (Cons (e9, Nil)) false) in
+        r9)
      | VHsh _ when (str_eq meth "count" || str_eq meth "entries") && (if str_eq (hash_ruby_each_class world recv) "" then false else true) ->
        hash_enumeration_native world recv meth args superblk
      | VHsh _ when str_eq meth "[]" -> hash_read_native gc_cenv0 world superblk recv args
@@ -52231,6 +52341,85 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
      | VStr h9 when (str_len meth == 6 && str_eq meth "unpack") -> arr_new (unpack_call gc_cenv0 world h9 0 args)
      | VStr h9 when (str_len meth == 7 && str_eq meth "unpack1") ->
        (match unpack_call gc_cenv0 world h9 2 args with Cons (v, _) -> v | Nil -> VNil)
+     // ...and a String subclass's own sub! / gsub! / * / ... calling super:
+     // the leaf builtin that a plain String runs (dispatch_prim, which asks no
+     // Ruby definition), or with a block the dispatcher's arm past this body
+     // once (bi_skip). ActiveSupport::SafeBuffer wraps every unsafe String
+     // method that way, and each said "undefined method 'gsub!' for an
+     // instance of String" -- prim_method has no gsub!.
+     // (a Hash or an Array subclass the same: HashWithIndifferentAccess's
+     //  #default(key) and #transform_keys call super)
+     // (a String's: a Hash or an Array subclass with a block keeps the iterator
+     //  path below -- through the dispatcher, a Hash subclass with its own
+     //  #each answered select / reject as Enumerable's Array)
+     | VStr _ when (match superblk with (true, _, _, _) -> true | _ -> false) ->
+       (let _ = map_set bi_skip "n" meth in
+        let r9 = try_or_msg (fn (u: unit) -> invoke_with_block gc_cenv0 world superblk recv meth args superblk)
+                   (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
+        let _ = map_clear bi_skip in r9)
+     // (an operator is the value's operator: `def *(n) = self.class.new(super)`)
+     | _ when (match recv with VStr _ -> true | VHsh _ -> true | VArr _ -> true | _ -> false)
+              && is_binary_op_name meth && (match args with Cons (_, Nil) -> true | _ -> false) ->
+       (match args with Cons (a9, _) -> eval_bin_prim gc_cenv0 world superblk meth recv a9 | Nil -> VNil)
+     // (Hash#default(key) runs the default proc with the hash and the key:
+     //  HashWithIndifferentAccess#default converts the key and calls super)
+     | VHsh _ when str_eq meth "default" && (match args with Cons (_, Nil) -> true | _ -> false) ->
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        match invoke_val_c gc_cenv0 world nb9 recv "default_proc" Nil false with
+        | VProc pr9 -> invoke_val_c gc_cenv0 world nb9 (VProc pr9) "call" (Cons (recv, args)) false
+        | _ -> dispatch_prim gc_cenv0 world superblk recv "default" Nil false)
+     // (only the names prim_method has no answer for: dispatch_prim asks
+     //  String's own Ruby definitions, so `String.prepend M` with M#upcase
+     //  calling super came back to M#upcase when every name went there)
+     // (gsub! / sub! from a String subclass's own method: prim_method has
+     //  only the plain forms, so the bang is that answer written back -- nil
+     //  when nothing changed. Not through dispatch_prim, which asks String's
+     //  own Ruby definitions and came back to a module prepended to String.
+     //  A frozen receiver refuses first, naming its class.)
+     // (gsub / sub with a String pattern and a Hash: prim_method takes a
+     //  Hash only with a Regexp, so the pattern goes as the Regexp it means)
+     | VStr _ when (str_eq meth "gsub" || str_eq meth "sub")
+                   && (match args with Cons (VStr _, Cons (VHsh _, Nil)) -> true | _ -> false) ->
+       prim_method recv meth (str_hash_rep_args args)
+     | VStr h9 when (str_eq meth "gsub!" || str_eq meth "sub!") ->
+       (if sfrozen_get h9 then
+          raise_exc_iv world "FrozenError" ("can't modify frozen " ++ (if map_has hng_store hk then display_cls_msg world (map_get hng_store hk) else "String") ++ ": " ++ frz_inspect gc_cenv0 world recv)
+            (Cons (("__recv", recv), Nil))
+        else
+          (let gs9 = str_eq meth "gsub!" in
+           match args with
+           | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..2)"
+           // (a pattern alone: gsub! is an Enumerator over the matches, sub!
+           //  needs its replacement)
+           | Cons (_, Nil) ->
+             (if gs9 then make_enum_a world recv meth args
+              else raise_exc world "ArgumentError" "wrong number of arguments (given 1, expected 2)")
+           | Cons (pat9, Cons (_, Nil)) ->
+             (let before9 = sget h9 in
+              let hit9 = (match pat9 with
+                          | VStr p9 -> str_contains before9 (sget p9)
+                          | VRegex (rp9, rf9, _) -> (match rxv_search rp9 rf9 before9 0 with RHit (_, _, _) -> true | _ -> false)
+                          | _ -> (if gs9 then (match raise_exc world "TypeError" ("no implicit conversion of " ++ conv_name pat9 ++ " into String") with _ -> false)
+                                  else (match raise_exc world "TypeError" ("wrong argument type " ++ conv_name pat9 ++ " (expected Regexp)") with _ -> false))) in
+              // (nil only when nothing matched: a match that wrote the same
+              //  text is still the receiver)
+              if (if hit9 then false else true) then VNil
+              else
+                (match prim_method recv (substring meth 0 (str_len meth - 1)) (str_hash_rep_args args) with
+                 | VStr r9 -> (let _ = (if str_eq (sget r9) before9 then VNil else str_mut_do h9 "replace" (Cons (VStr r9, Nil))) in recv)
+                 | _ -> recv))
+           | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")))
+     // (HashWithIndifferentAccess#transform_keys(mapping) calls super)
+     | VHsh _ when (str_eq meth "transform_keys" || str_eq meth "transform_keys!")
+                   && (match args with Cons (VHsh _, _) -> true | _ -> false)
+                   && (match superblk with (true, _, _, _) -> false | _ -> true) ->
+       // (the bang refuses a frozen receiver before it writes, as Hash's own
+       //  does; the plain form answers a new hash from a frozen one too)
+       (if str_eq meth "transform_keys!" && val_frozen_mut recv then
+          raise_exc_iv world "FrozenError"
+            ("can't modify frozen " ++ (if map_has hng_store hk then display_cls_msg world (map_get hng_store hk) else "Hash") ++ ": " ++ inspect_w gc_cenv0 world recv)
+            (Cons (("__recv", recv), Nil))
+        else hash_transform_keys_map recv meth args)
      | _ ->
        (match superblk with
         | (true, _, _, _) -> builtin_iter world superblk superblk recv meth args
@@ -52298,6 +52487,19 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   | VClass ac9 when (str_len meth == 8 && str_eq meth "allocate") && (if map_has modules ac9 then false else true)
                     && (if str_eq ac9 "String" || str_eq ac9 "Array" || str_eq ac9 "Hash" then false else true) ->
     alloc_empty world ac9
+  // ...and from a module prepended to Range (ActiveSupport's
+  // CompareWithRange#include? / #cover?): Range's own arm, past the Ruby body
+  // once (range_native_wanted consumes the bypass)
+  // (Range's own answers, called directly: a bypass re-dispatched by name
+  //  was spent by an arm that then did not take the call -- cover? with a
+  //  non-Range argument -- and came back to the override)
+  | VRange (lo9, hi9, ex9) when (str_eq meth "include?" || str_eq meth "member?" || str_eq meth "cover?")
+                                && (match args with Cons (_, Nil) -> true | _ -> false) ->
+    (match args with
+     | Cons (VRange (_, _, _), _) when str_eq meth "cover?" -> invoke_val_c gc_cenv0 world superblk recv "__cover_range" args false
+     | Cons (v9, _) when str_eq meth "cover?" -> VBool (rng_covers_w world lo9 hi9 ex9 v9)
+     | Cons (v9, _) -> rng_include gc_cenv0 world lo9 hi9 ex9 v9
+     | Nil -> VNil)
   // `super` from a module prepended to a number's class (`class Integer;
   // prepend M` and M#+ calling super) is the builtin operation
   | VInt _ -> prim_method recv meth args
@@ -63198,7 +63400,10 @@ and protected_ok = fn env -> fn world -> fn (cls: str) ->
      | VClass sc -> str_list_has (ancestors_of world ("(sng:" ++ sc ++ ")")) cls
      // (main is a kind of its own singleton class, when it has one)
      | VMain -> str_list_has (ancestors_of world (if map_has hng_store "main:0" then map_get hng_store "main:0" else "Object")) cls
-     | _ -> false)
+     // ...and a VALUE self: a String or a Hash subclass's method calling a
+     // protected method of another one (ActiveSupport::SafeBuffer#* calls
+     // mark_unsafe! on the buffer it made). It was refused for every value.
+     | v9 -> str_list_has (ancestors_of world (hng_lookup_cls world v9)) cls)
   else false
 
 
@@ -74331,7 +74536,10 @@ and rx_scan_blk = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn (
 
 // gsub/sub with a Hash replacement: each match is looked up in the hash and
 // replaced by the (to_s of the) value, or by "" when the key is absent.
-and rx_gsub_hash = fn (pairs: Val list) -> fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (all: bool) -> fn (i: int) -> fn (acc: str) ->
+// (each match is looked up as a string of the RECEIVER's encoding: a BINARY
+//  receiver's match is a BINARY key -- ActiveSupport's JSON escaping maps
+//  `"\u2028".b` that way -- and a UTF-8 one with the same bytes is another key)
+and rx_gsub_hash = fn (pairs: Val list) -> fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (all: bool) -> fn (i: int) -> fn (acc: str) -> fn (enc: str) ->
   let n = str_len s in
   match rxv_search pat fl s i with
   | RBadPat -> acc ++ substring s i n
@@ -74340,14 +74548,14 @@ and rx_gsub_hash = fn (pairs: Val list) -> fn (pat: str) -> fn (fl: str) -> fn (
   | RNoHit -> if i == 0 && str_eq acc "" then s else acc ++ substring s i n
   | RHit (st, en, saves) ->
     let m = substring s st en in
-    let rep = (match hash_lookup pairs (mkstr m) with (true, v) -> to_s v | _ -> "") in
+    let rep = (match hash_lookup pairs (mkstr_e m enc) with (true, v) -> to_s v | _ -> "") in
     if en <= st then
       (let acc2 = acc ++ substring s i st ++ rep in
-       if all then (if st >= n then acc2 else rx_gsub_hash pairs pat fl s all (st + 1) (acc2 ++ substring s st (st + 1)))
+       if all then (if st >= n then acc2 else rx_gsub_hash pairs pat fl s all (st + 1) (acc2 ++ substring s st (st + 1)) enc)
        else acc2 ++ substring s st n)
     else
       (let acc2 = acc ++ substring s i st ++ rep in
-       if all then rx_gsub_hash pairs pat fl s all en acc2
+       if all then rx_gsub_hash pairs pat fl s all en acc2 enc
        else acc2 ++ substring s en n)
 
 // ruby's `limit`: 0 (the default) splits everywhere and drops trailing empty
