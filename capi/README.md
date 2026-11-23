@@ -85,7 +85,17 @@ The collector is the interpreter's own. For the C API it adds:
   (scanned conservatively for numbers in the table's range) -- and the same
   for the stack of a Fiber or Thread that is stopped inside a C call;
 - what a live data object's `dmark` marks (`rb_gc_mark`), run to a fixpoint
-  with the rest of the marking;
+  with the rest of the marking. A `dmark` that runs with no call into C in
+  progress reads through the collector's reader (`mr_capi_gc_reader`),
+  which answers what changes nothing -- an object's header, a String's
+  bytes, an Array's elements (`RARRAY_LEN`, `RARRAY_AREF`), an object's
+  instance variable (`rb_ivar_get`, of an object or a C data wrapper; a
+  Proc's or a Binding's is refused) -- from the objects as they are now,
+  running no Ruby: every struct it reads is fetched again for it, since the
+  interpreter has run since the last call ended. Anything else it asks --
+  a method call, a write, `rb_hash_foreach` -- is refused with `mr_fatal`,
+  never answered with a guess (sqlite3's `database_mark` and its aggregator
+  pin read Arrays and an ivar so);
 - the elements a live Array's or String's mirror holds.
 
 An entry nothing reaches is dropped at the sweep; a data object's `dfree`
