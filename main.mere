@@ -1974,6 +1974,9 @@ let gc_drop_sh = fn tbl -> fn (dead: Vec['d, str]) -> fn (pre: str) ->
 // the block a :b_call / :b_return is about, while its hook runs: what
 // TracePoint#parameters describes (made a Proc only when asked)
 let tp_cur_blk = map_new ();
+// 1 while a block's :b_call waits for its parameters to be bound: set by
+// run_block_tp, taken by the run_block0_in it calls (tp_blk_fire_late)
+let tp_bpend = (let v = vec_new () in let _ = vec_push v 0 in v);
 // Anonymous class metadata is owned by the traced class group, including
 // singleton and nested namespace rows. Parse owners before deleting entries;
 // compact only while suspended stacks can pin their borrowed arenas.
@@ -4170,7 +4173,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if map_len hng_store > 0 && (match (if lv_has env "self" then lv_get env "self" else VMain) with VMain -> true | _ -> false)
             && main_sng_has world name then
       invoke_val_c env world noblk VMain name Nil false
-    else if map_has meths name then call_method env world noblk name Nil
+    // (...unless self's class has its own: self_shadows_top)
+    else if map_has meths name && (if self_shadows_top env world name then false else true) then call_method env world noblk name Nil
     // Kernel#local_variables: the locals visible in the current scope.
     else if (str_len name == 15 && str_eq name "local_variables") then local_vars_of env
     // Kernel#instance_variables_to_inspect (ruby 4.0): nil means "all of them";
@@ -4509,7 +4513,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | Cons (other9, _) ->
          raise_exc world "TypeError" ("wrong argument type " ++ class_name other9 ++ " (expected Class or Module)")
        | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
-    else if map_has meths name then call_method env world newblk name args
+    else if map_has meths name && (if self_shadows_top env world name then false else true) then call_method env world newblk name args
     // bare method(:name) — Kernel#method on the implicit self.
     else if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
       invoke_val_c env world newblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
@@ -8937,33 +8941,30 @@ and run_block_atr = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) -
   let _ = vec_set atr_home 1 a0 in
   r9
 and run_block_tp = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
-    (let (_, _, _, cenv9) = theblk in
-     let mid9 = (if lv_has cenv9 "__meth" then (match lv_get cenv9 "__meth" with VStr h9 -> sget h9 | _ -> "") else "") in
-     let cls9 = (if lv_has cenv9 "__defcls" then (match lv_get cenv9 "__defcls" with VClass c9 -> c9 | _ -> "") else "") in
-     let slf9 = (if lv_has cenv9 "self" then lv_get cenv9 "self" else VNil) in
-     // (a :b_call is on the line of the block's `{` / `do` -- the negative
-     //  SLine parse_block_inner puts in front -- and both events are in the
-     //  file the block is written in: its method's, else the program's)
-     let (_, _, body9, _) = theblk in
-     // (a block the ISeq VM runs knows both: its sequence's)
-     let (vp9, vl9) = vm_body_pos body9 in
-     let l9 = (if vl9 > 0 then vl9 else (match body9 with Cons (SLine n9, _) -> (if n9 < 0 then blk_line_of n9 else n9) | _ -> cur_line ())) in
-     let path9 = (if str_eq vp9 "" then tp_blk_path cls9 mid9 else vp9) in
-     // (callee_id: the name the method it is written in was called by -- an
-     //  alias's, which that frame keeps in __callee)
-     let ce9 = (if lv_has cenv9 "__callee" then (match lv_get cenv9 "__callee" with VStr ch9 -> sget ch9 | _ -> mid9) else mid9) in
+    (let (_, _, body9, cenv9) = theblk in
+     let (mid9, cls9, slf9, l9, path9, ce9) = tp_blk_info cenv9 body9 in
      // (the block a hook asks about is put back as it was after, not
      //  removed: the HOOK's own block runs through here too, and removing
      //  the traced one left `tp.parameters` in the hook with nothing -- [])
      let had9 = map_has tp_cur_blk 0 in
      let prevb9 = (if had9 then map_get tp_cur_blk 0 else theblk) in
      let put_back9 = fn (u: unit) -> (if had9 then map_set tp_cur_blk 0 prevb9 else map_delete tp_cur_blk 0) in
+     // ruby fires :b_call once the parameters are bound: after the defaults'
+     // own calls, after the #to_ary a destructured `(a, b)` makes. A block
+     // the VM runs, whose sequence puts the event past its first
+     // instruction, fires it there (vm_late_bcall: the hook's block is this
+     // one from here on, and every block run in between puts it back); one
+     // the evaluator runs, in run_block0_in once the parameters and the
+     // keywords' defaults are bound (tp_bpend, tp_blk_fire_late).
+     let vm9 = vm_body_svm body9 in
+     let late9 = (if vm9 then vm_body_late body9 else true) in
      let f9 = try_or_msg (fn (u: unit) ->
-                (let _ = map_set trace_fn "tpblk" VNil in
-                 let _ = map_set tp_cur_blk 0 theblk in
-                 let _ = fire_tp_vlc world "b_call" mid9 cls9 VNil slf9 l9 path9 ce9 in
-                 let _ = put_back9 () in
-                 let _ = map_delete trace_fn "tpblk" in
+                (let _ = (if late9 then (if vm9 then map_set tp_cur_blk 0 theblk else vec_set tp_bpend 0 1)
+                          else (let _ = map_set tp_cur_blk 0 theblk in
+                                let _ = map_set trace_fn "tpblk" VNil in
+                                let _ = fire_tp_vlc world "b_call" mid9 cls9 VNil slf9 l9 path9 ce9 in
+                                let _ = put_back9 () in
+                                map_delete trace_fn "tpblk")) in
                  run_block0 world encl theblk argvals))
                 (fn (m: str) -> (let ex9 = tp_exc_save world in
                                  let _ = map_set tp_cur_blk 0 theblk in
@@ -8975,6 +8976,50 @@ and run_block_tp = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
      let _ = tp_blk_fire_at_c world "b_return" mid9 cls9 rv9 slf9 (cur_line ()) path9 ce9 in
      let _ = put_back9 () in
      f9)
+// what a block's :b_call names: the method it is written in (and the name
+// that method was called by -- an alias's, which that frame keeps in
+// __callee), its class and self, and where the block is written: the line
+// of its `{` / `do` -- the negative SLine parse_block_inner puts in front,
+// after the defaults' prologue when there is one -- in its method's file,
+// else the program's. (A block the ISeq VM runs knows both: its sequence's.)
+and tp_blk_info = fn cenv9 -> fn (body9: Stmt list) ->
+  let mid9 = (if lv_has cenv9 "__meth" then (match lv_get cenv9 "__meth" with VStr h9 -> sget h9 | _ -> "") else "") in
+  let cls9 = (if lv_has cenv9 "__defcls" then (match lv_get cenv9 "__defcls" with VClass c9 -> c9 | _ -> "") else "") in
+  let slf9 = (if lv_has cenv9 "self" then lv_get cenv9 "self" else VNil) in
+  let (vp9, vl9) = vm_body_pos body9 in
+  let rec open9 = fn (ss: Stmt list) ->
+    (match ss with
+     | Cons (SLine n9, _) -> (if n9 < 0 then blk_line_of n9 else n9)
+     | Cons (SIf (_, Nil), t) -> open9 t
+     | _ -> cur_line ()) in
+  let l9 = (if vl9 > 0 then vl9 else open9 body9) in
+  let path9 = (if str_eq vp9 "" then tp_blk_path cls9 mid9 else vp9) in
+  let ce9 = (if lv_has cenv9 "__callee" then (match lv_get cenv9 "__callee" with VStr ch9 -> sget ch9 | _ -> mid9) else mid9) in
+  (mid9, cls9, slf9, l9, path9, ce9)
+// (...fired once the parameters are bound, for a block the evaluator runs:
+//  run_block_tp left it to run_block0_in -- tp_bpend. The positional
+//  defaults were bound with the parameters; the keywords' are the body's
+//  prologue (defaults_prologue), so that runs first, and the body goes on
+//  without it. While the hook runs, its block is this one: tp_cur_blk.)
+and tp_blk_fire_late = fn world -> fn benv -> fn encl -> fn cenv -> fn (params: str list) -> fn (body: Stmt list) ->
+  let rest9 = drop_defaults_prologue body in
+  let rec len9 = fn (ss: Stmt list) -> (match ss with Nil -> 0 | Cons (_, t9) -> 1 + len9 t9) in
+  let rec pro9 = fn (ss: Stmt list) -> fn (n: int) ->
+    (if n <= 0 then ()
+     else (match ss with
+           | Nil -> ()
+           | Cons (s9, t9) -> (let _ = exec_stmt benv world encl s9 in pro9 t9 (n - 1)))) in
+  let _ = pro9 body (len9 body - len9 rest9) in
+  let (mid9, cls9, slf9, l9, path9, ce9) = tp_blk_info cenv body in
+  let had9 = map_has tp_cur_blk 0 in
+  let theblk = (true, params, body, cenv) in
+  let prevb9 = (if had9 then map_get tp_cur_blk 0 else theblk) in
+  let _ = map_set tp_cur_blk 0 theblk in
+  let _ = map_set trace_fn "tpblk" VNil in
+  let _ = fire_tp_vlc world "b_call" mid9 cls9 VNil slf9 l9 path9 ce9 in
+  let _ = map_delete trace_fn "tpblk" in
+  let _ = (if had9 then map_set tp_cur_blk 0 prevb9 else map_delete tp_cur_blk 0) in
+  rest9
 // (...at a given line, as the program's: callee is the name the method was
 //  called by -- a block written in a method called through an alias, and a
 //  define_method body called so, are :b_call / :b_return with that alias as
@@ -9433,6 +9478,11 @@ and run_block0x = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) -> 
 // region its caller chose (run_block0x): BLK, or a builtin iterator's own
 // turn, which is a region of its own already (run_block_t, issue #113)
 and run_block0_in = fn world -> fn encl -> fn encl_call -> fn (params00: str list) -> fn (argvals: Val list) -> fn (kwp9: bool) -> fn (body: Stmt list) -> fn cenv -> fn benv ->
+  // (this block's :b_call, which run_block_tp left to be fired once the
+  //  parameters are bound -- taken now, before a default runs a block of
+  //  its own: tp_bpend)
+  let bpend9 = vec_get tp_bpend 0 == 1 in
+  let _ = (if bpend9 then vec_set tp_bpend 0 0 else ()) in
   let (encl, params0) = strip_yblk_markers encl params00 in
   // a lambda installed as a block carries a marker: strip it and enforce
   // strict arity (a plain block stays lenient).
@@ -9550,7 +9600,9 @@ and run_block0_in = fn world -> fn encl -> fn encl_call -> fn (params00: str lis
   // and were visible to later sibling blocks; with a per-invocation frame the
   // raise path cannot leak. The flag still distinguishes a raise from a
   // normal return so the exception is re-raised (details live in ivars "$exc").
-  let r = block_body_flow benv world encl body in
+  // (this block's :b_call, past the binding: tp_blk_fire_late)
+  let body9 = (if bpend9 then tp_blk_fire_late world benv encl cenv params00 body else body) in
+  let r = block_body_flow benv world encl body9 in
    let _ = map_set blk_ok "n" 1 in
    r
 
@@ -39011,13 +39063,15 @@ and public_send_guard = fn world -> fn (recv: Val) -> fn (m: str) ->
   // (a builtin the program made private -- `Integer.class_eval { private :+ }`
   //  -- is refused too; an object's own methods are refused by the dispatcher,
   //  which also asks its method_missing. Bug #13592)
+  // (...and main is "main", as ruby names it: a top-level def is private)
+  let who9 = (match recv with VMain -> "main" | _ -> for_recv_cls world c9) in
   if (match recv with VObj _ -> false | VClass _ -> false | _ -> map_len privates > 0 && meth_private world c9 m)
   then (let _ = raise_exc_iv world "NoMethodError"
-          ("private method '" ++ m ++ "' called for " ++ for_recv_cls world c9)
+          ("private method '" ++ m ++ "' called for " ++ who9)
           (Cons (("__name", VSym m), Cons (("__recv", recv), Nil))) in ())
   else if meth_protected world c9 m
   then (let _ = raise_exc world "NoMethodError"
-          ("protected method '" ++ m ++ "' called for " ++ for_recv_cls world c9) in ())
+          ("protected method '" ++ m ++ "' called for " ++ who9) in ())
   else ()
 
 // the method-name argument of send / __send__ / public_send, read the way
@@ -47983,6 +48037,24 @@ and self_defines = fn env -> fn world -> fn (name: str) ->
      | _ -> false)
   else false
 
+// A bare call of a name the program also defined at the top level: the
+// top-level def is a private method of Object, so it is self's only when
+// nothing before Object in self's ancestors defines the name. The callers
+// tried the top-level table first; with an object as self that called
+// Object's `foo` where self's own class has one (`def foo = 7` at the top,
+// `class C; def foo = 9; def m = foo; end` -- C.new.m was 7).
+and self_shadows_top = fn env -> fn world -> fn (name: str) ->
+  if lv_has env "__ksuper" then false
+  else if lv_has env "self" then
+    (let c9 = (match lv_get env "self" with
+               | VObj id -> (let (_, _, ocls0, _) = world in map_get ocls0 id)
+               | VClass c -> "(sng:" ++ c ++ ")"
+               | _ -> "") in
+     if str_eq c9 "" then false
+     else (let a9 = lookup_anc world (ancestors_of world c9) name in
+           if str_eq a9 "" || str_eq a9 "Object" || str_eq a9 "Kernel" || str_eq a9 "BasicObject" then false else true))
+  else false
+
 // (a call written with no receiver and no argument, of an object: the
 //  attribute reader cache is asked first -- attr_ic, "!" keys)
 and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) ->
@@ -48577,7 +48649,7 @@ and ecall_args = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val
             && (match args with Nil -> false | _ -> true) then
       (let _ = (if (str_len name == 7 && str_eq name "include") then incl_each world "Object" args
                 else prep_each world "Object" args) in VClass "Object")
-    else if map_has meths name then call_method env world noblk name args
+    else if map_has meths name && (if self_shadows_top env world name then false else true) then call_method env world noblk name args
     // `catch :tag` with no block: the block IS the method, so there is nothing
     // to run and nothing to catch. ruby reports a LocalJumpError; this reached
     // the unknown-method path instead.
@@ -48918,10 +48990,18 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let slf9 = (if lv_has frame "self" then lv_get frame "self" else VNil) in
      // (on the line it was defined on, note 435)
      let _ = (if hook_tp_on () then tp_env_meth frame body else ()) in
+     // (a define_method body is a block, as in run_meth: its :b_call after
+     //  the :call, and its :b_return before the :return -- or, where the VM
+     //  fires them after the defaults, there: vm_late_bcall, which knows the
+     //  frame by "__tpdm" -- run_meth's by "__in_dm")
+     let tpbm9 = hook_tp_on ()
+                 && (map_has dm_methods name || map_has dm_methods ("Object#" ++ name)) in
+     let _ = (if tpbm9 then map_set frame "__tpdm" VNil else ()) in
+     let cl9 = (match (meth_source_get name 0) with VInt l9 -> l9 | _ -> cur_line ()) in
      let _ = (if hook_tp_on () && vm_body_late body then ()
-              else (let _ = fire_tp_vlc world "call" mnm9 "Object" VNil slf9
-                              (match (meth_source_get name 0) with VInt l9 -> l9 | _ -> cur_line ()) "" name in
-                    if hook_tp_on () then map_set frame "__tpcall" VNil else ())) in
+              else (let _ = fire_tp_vlc world "call" mnm9 "Object" VNil slf9 cl9 "" name in
+                    let _ = (if hook_tp_on () then map_set frame "__tpcall" VNil else ()) in
+                    if tpbm9 then (let _ = map_set frame "__tpbm" VNil in tp_blk_fire_at_c world "b_call" mnm9 "Object" VNil slf9 cl9 "" name) else ())) in
      // (as run_meth: tp_meth_flow while a TracePoint is armed)
      let flow9 = (if hook_tp_on () then tp_meth_flow world frame blk body mnm9 name "Object" slf9
                   else method_body_flow frame world blk body) in
@@ -48936,8 +49016,16 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
     let tpf9 = hook_tp_on () in
     let _ = (if tpf9 then () else frame_done frame) in
      let _ = (if tpf9 then tp_env_set frame else ()) in
-     let _ = fire_tp_vlc world "return" mnm9 "Object" (match flow9 with FBreak _ -> VNil | _ -> out) slf9
-               (match (meth_source_get (name) 2) with VInt l9 -> l9 | _ -> cur_line ()) "" name in
+     let rl9 = (match (meth_source_get (name) 2) with
+                VInt l9 -> l9
+                // (a define_method body: as run_meth's -- the VM's last line,
+                //  else the block's first)
+                | _ -> (if tpbm9 && vm_body_svm body then vm_max_line (vm_body_id body 64)
+                        else if tpbm9 then (match meth_source_get name 0 with VInt l9 -> l9 | _ -> cur_line ())
+                        else cur_line ())) in
+     let rv9 = (match flow9 with FBreak _ -> (if tpbm9 then out else VNil) | _ -> out) in
+     let _ = (if tpbm9 && map_has frame "__tpbm" then (let _ = map_delete frame "__tpbm" in tp_blk_fire_at_c world "b_return" mnm9 "Object" rv9 slf9 rl9 "" name) else ()) in
+     let _ = fire_tp_vlc world "return" mnm9 "Object" rv9 slf9 rl9 "" name in
      let _ = (if tpf9 then frame_done frame else ()) in
      out)
 
@@ -50029,8 +50117,10 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                             else (let _ = fire_tp_vlc world "call" mnm defcls VNil slf9 cl9 cp9 name in
                                   if hook_tp_on () then map_set frame "__tpcall" VNil else ())) in
                    // (a define_method body is a block too: its :b_call, and
-                   //  the frame marked for a :b_return a raise makes)
-                   if tpbm9 then (let _ = map_set frame "__tpbm" VNil in tp_blk_fire_at_c world "b_call" mnm defcls VNil slf9 cl9 cp9 name) else ())) in
+                   //  the frame marked for a :b_return a raise makes --
+                   //  ...where the VM fires it after the defaults, there:
+                   //  vm_late_bcall)
+                   if tpbm9 && (if vm_body_late body then false else true) then (let _ = map_set frame "__tpbm" VNil in tp_blk_fire_at_c world "b_call" mnm defcls VNil slf9 cl9 cp9 name) else ())) in
     // (while a TracePoint is armed: tp_meth_flow, which keeps the method on
     //  tp_mstack for a :raise inside it and makes a raise that leaves it a
     //  :return too, with no value -- ruby's, Bug #9759 / #13369. Kept out of
@@ -50067,8 +50157,10 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                            | FNext _ -> (match (if meth_source_has (dk) 2 then meth_source_get (dk) 2
                                                 else if str_eq defcls "Object" && meth_source_has (name) 2 then meth_source_get (name) 2
                                                 // (a define_method body has no `end` of its own on record:
-                                                //  the block's line, which an empty `{}` returns on)
-                                                else if map_has dm_methods dk && meth_source_has dk 0 then meth_source_get dk 0
+                                                //  the block's line, which an empty `{}` returns on --
+                                                //  ...where the VM ran it, the last line its
+                                                //  instructions are on: the block's `}` / `end`)
+                                                else if map_has dm_methods dk && meth_source_has dk 0 then (if vm_body_svm body then VInt (vm_max_line (vm_body_id body 64)) else meth_source_get dk 0)
                                                 else VNil) with VInt l9 -> (if attr9 then cur_line () else l9) | _ -> cur_line ())
                            | FReturn _ when map_has tp_mstack "rl" ->
                              (let l9 = int_of_str (map_get tp_mstack "rl") in let _ = map_delete tp_mstack "rl" in l9)
@@ -66570,6 +66662,12 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
          (let late9 = kind == 2 && vec_len code > 0 in
           let _ = (if late9 then map_set vm_late_ids id 1 else ()) in
           go t line (if late9 && (evt / 16) % 2 == 0 then evt + 16 else evt) prev yld ids outs)
+       // (...and a block's :b_call, after the defaults' calls and the
+       //  #to_ary of a destructured `(a, b)`: 32, vm_late_bcall)
+       else if str_eq s "RUBY_EVENT_B_CALL" then
+         (let late9 = kind == 1 && vec_len code > 0 in
+          let _ = (if late9 then map_set vm_late_ids id 1 else ()) in
+          go t line (if late9 && (evt / 32) % 2 == 0 then evt + 32 else evt) prev yld ids outs)
        else if str_len s > 6 && str_eq (substring s 0 6) "label_" then go t line evt (0 - 1) yld ids outs
        else go t line evt prev yld ids outs
      | Cons (VArr iid, t) ->
@@ -67127,6 +67225,19 @@ and vm_body_late = fn (body: Stmt list) ->
   | Cons (SLine _, t) -> vm_body_late t
   | Cons (SLineQ _, t) -> vm_body_late t
   | Cons (SFile _, t) -> vm_body_late t
+  // (a block's defaults' prologue: block_defaults)
+  | Cons (SIf (_, Nil), t) -> vm_body_late t
+  | _ -> false
+// (...and whether the VM runs it at all)
+and vm_body_svm = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (SVm (_, _), _) -> true
+  | Cons (SLine _, t) -> vm_body_svm t
+  | Cons (SLineQ _, t) -> vm_body_svm t
+  | Cons (SFile _, t) -> vm_body_svm t
+  // (a block's defaults' prologue: block_defaults)
+  | Cons (SIf (_, Nil), t) -> vm_body_svm t
   | _ -> false
 // whether the program, or a block in it, yields (bare_yield_stmt: the
 // method's block is kept for a block that does)
@@ -68014,6 +68125,7 @@ and vm_events = fn env -> fn world -> fn (e: int) -> fn (line: int) ->
            && (let f9 = cur_file () in if str_len f9 > 10 && str_eq (substring f9 0 10) "<internal:" then false else true) in
   let self9 = fn (u: unit) -> (if lv_has env "self" then lv_get env "self" else VMain) in
   let _ = (if (e / 16) % 2 == 1 && tp then vm_late_call env world else ()) in
+  let _ = (if (e / 32) % 2 == 1 && tp then vm_late_bcall env world line else ()) in
   let _ = (if e % 2 == 1 then
              (let _ = cov_line line in
               if tp then
@@ -68042,17 +68154,44 @@ and vm_late_call = fn env -> fn world ->
   if map_has env "__tpcall" || (if lv_has env "__meth" then false else true) then ()
   else
     (let _ = map_set env "__tpcall" VNil in
-     let mnm = (match lv_get env "__meth" with VStr h9 -> sget h9 | _ -> "") in
-     let defcls = (if lv_has env "__defcls" then (match lv_get env "__defcls" with VClass c9 -> c9 | _ -> "Object") else "Object") in
-     let name = (if map_has env "__callee" then (match map_get env "__callee" with VStr h9 -> sget h9 | _ -> mnm) else mnm) in
-     let slf9 = (if lv_has env "self" then lv_get env "self" else VNil) in
-     let dk = defcls ++ "#" ++ mnm in
-     let cl9 = (match (if meth_source_has dk 0 then meth_source_get dk 0
-                       else if str_eq defcls "Object" && meth_source_has mnm 0 then meth_source_get mnm 0
-                       else VNil) with VInt l9 -> l9 | _ -> cur_line ()) in
-     let cp9 = tp_meth_path dk defcls mnm in
+     let (mnm, defcls, name, slf9, cl9, cp9) = vm_frame_meth env in
      let _ = tp_env_set env in
      fire_tp_vlc world "call" mnm defcls VNil slf9 cl9 cp9 name)
+// the method a frame is running, as its events name it: the name it was
+// defined as and called by, its class and self, the line and the file it
+// was written in
+and vm_frame_meth = fn env ->
+  let mnm = (match lv_get env "__meth" with VStr h9 -> sget h9 | _ -> "") in
+  let defcls = (if lv_has env "__defcls" then (match lv_get env "__defcls" with VClass c9 -> c9 | _ -> "Object") else "Object") in
+  let name = (if map_has env "__callee" then (match map_get env "__callee" with VStr h9 -> sget h9 | _ -> mnm) else mnm) in
+  let slf9 = (if lv_has env "self" then lv_get env "self" else VNil) in
+  let dk = defcls ++ "#" ++ mnm in
+  let cl9 = (match (if meth_source_has dk 0 then meth_source_get dk 0
+                    else if str_eq defcls "Object" && meth_source_has mnm 0 then meth_source_get mnm 0
+                    else VNil) with VInt l9 -> l9 | _ -> cur_line ()) in
+  (mnm, defcls, name, slf9, cl9, tp_meth_path dk defcls mnm)
+// A block's :b_call, at the instruction ruby fires it on when the binding of
+// its parameters came first (a default's own call, a destructured `(a, b)`'s
+// #to_ary): run_block_tp leaves such a block's to this. On the line that
+// instruction is on -- the block's `{` / `do`, as ruby marks it.
+// A define_method body is a block too, and its method's :call comes at the
+// same place, before it (run_meth leaves both: vm_body_late).
+and vm_late_bcall = fn env -> fn world -> fn (line: int) ->
+  let _ = tp_env_set env in
+  if map_has env "__in_dm" || map_has env "__tpdm" then
+    (if map_has env "__tpbm" || (if lv_has env "__meth" then false else true) then ()
+     else (let _ = vm_late_call env world in
+           let _ = map_set env "__tpbm" VNil in
+           let (mnm, defcls, name, slf9, cl9, cp9) = vm_frame_meth env in
+           tp_blk_fire_at_c world "b_call" mnm defcls VNil slf9 cl9 cp9 name))
+  else
+    (let mid9 = (if lv_has env "__meth" then (match lv_get env "__meth" with VStr h9 -> sget h9 | _ -> "") else "") in
+     let cls9 = (if lv_has env "__defcls" then (match lv_get env "__defcls" with VClass c9 -> c9 | _ -> "") else "") in
+     let slf9 = (if lv_has env "self" then lv_get env "self" else VNil) in
+     let ce9 = (if lv_has env "__callee" then (match lv_get env "__callee" with VStr ch9 -> sget ch9 | _ -> mid9) else mid9) in
+     let _ = map_set trace_fn "tpblk" VNil in
+     let _ = fire_tp_vlc world "b_call" mid9 cls9 VNil slf9 line "" ce9 in
+     map_delete trace_fn "tpblk")
 and vm_stack_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: str) -> fn (a: int) -> fn (v: Val) ->
   if o == 0 then (if a > 0 then cov_branch (a - 1) else ())
   else if o == 1 then vm_push st VNil

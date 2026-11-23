@@ -85,3 +85,35 @@ pro_m1(0)
 pro_m2(ProPair.new, 3)
 late_tp.disable
 p $late
+
+# A block's :b_call comes after its parameters are bound, too: after a
+# default's own call (a lambda's, a keyword's), after the #to_ary of a
+# destructured `|(a, b)|`, on the line of the block's `{` / `do`. A
+# define_method body is a block: its method's :call and its :b_call come
+# after the default -- at the top level as in a class.
+$bev = []
+btp = TracePoint.new(:call, :return, :b_call, :b_return) do |t|
+  if t.method_id.to_s.start_with?("bd_") || (t.method_id.nil? && %i[b_call b_return].include?(t.event))
+    $bev << [t.event, t.method_id, t.lineno]
+  end
+end
+def bd_dflt = 1
+define_method(:bd_top) { |a, b = bd_dflt| a + b }
+class BdHost
+  define_method(:bd_in) { |a, b = 2| a + b }
+end
+class BdPair; def to_ary = [1, 2]; end
+# (the body ends on the `end` line: the evaluator's :b_return is on the
+#  last line it ran, not on the `end` -- loop/2026-11-23-stage10-r50.md (96))
+lam = lambda do |x,
+                 y = bd_dflt|
+  x + y; end
+kw = proc { |k: bd_dflt| k }
+btp.enable
+bd_top(1)
+BdHost.new.bd_in(1)
+lam.(1)
+kw.call
+[BdPair.new].each { |(a, b)| a }
+btp.disable
+$bev.each { |e| p e }
