@@ -37,6 +37,11 @@ struct mr_mirror {
     int hidden;                 /* rb_obj_hide: its class reads as 0 to C until rb_obj_reveal */
     size_t embedded;            /* a typed struct's own bytes, after it */
     struct rb_io *io;           /* an IO's, made when RFILE first asks for it */
+    /* the internal ivars (no `@`: only C sees them) C wrote or read, as it
+     * last did: what a dmark with no call in progress reads (object.c) */
+    ID *hidden_ids;
+    VALUE *hidden_values;
+    int hidden_count, hidden_cap;
     union {
         struct RBasic basic;
         struct RFile file;
@@ -180,6 +185,29 @@ void *rb_mere_basic(VALUE obj) {
     if (!MR_HANDLE_P(obj) && !RB_SPECIAL_CONST_P(obj) && mr_vbig_raw_p(obj)) return (void *)obj;
     return &mr_mirror_of(obj)->as.basic;
 }
+void mr_mirror_hidden_put(VALUE obj, ID id, VALUE value) {
+    if (!MR_HANDLE_P(obj)) return;
+    struct mr_mirror *m = mirror_at(MR_NUMBER(obj), 1);
+    for (int i = 0; i < m->hidden_count; i++)
+        if (m->hidden_ids[i] == id) { m->hidden_values[i] = value; return; }
+    if (m->hidden_count == m->hidden_cap) {
+        int cap = m->hidden_cap ? m->hidden_cap * 2 : 4;
+        m->hidden_ids = realloc(m->hidden_ids, sizeof(ID) * (size_t)cap);
+        m->hidden_values = realloc(m->hidden_values, sizeof(VALUE) * (size_t)cap);
+        if (!m->hidden_ids || !m->hidden_values) mr_fatal("out of memory");
+        m->hidden_cap = cap;
+    }
+    m->hidden_ids[m->hidden_count] = id;
+    m->hidden_values[m->hidden_count++] = value;
+}
+int mr_mirror_hidden_get(VALUE obj, ID id, VALUE *value) {
+    if (!MR_HANDLE_P(obj)) return 0;
+    struct mr_mirror *m = mirror_at(MR_NUMBER(obj), 0);
+    if (!m) return 0;
+    for (int i = 0; i < m->hidden_count; i++)
+        if (m->hidden_ids[i] == id) { *value = m->hidden_values[i]; return 1; }
+    return 0;
+}
 
 /* (every C call that may hold a pointer into the struct watches it: two
  *  Fibers stopped in C calls that took the same String's bytes each write
@@ -311,7 +339,12 @@ static void array_room(struct mr_mirror *m, long capa) {
 
 void *rb_mere_array(VALUE obj) {
     struct mr_mirror *m = mr_mirror_of(obj);
-    if (mr_capi_mark_unasked()) return &m->as.array;
+    /* (as last fetched, and only of what was last known to be an Array) */
+    if (mr_capi_mark_unasked()) {
+        if (m->head_epoch && (m->as.basic.flags & 0x1f) != T_ARRAY)
+            mr_fatal("a dmark read something that is not an Array as one");
+        return &m->as.array;
+    }
     if ((m->as.basic.flags & 0x1f) != T_ARRAY)
         rb_raise(rb_eTypeError, "wrong argument type %s (expected Array)", rb_obj_classname(obj));
     if (m->body == T_ARRAY && m->body_epoch == mr_epoch) return &m->as.array;
@@ -472,6 +505,8 @@ int mr_capi_mark(closure_int_int visit, int number) {
     /* An Array's fetched elements are VALUEs C may be holding by address. */
     if (m->body == T_ARRAY)
         for (long i = 0; i < m->as.array.as.heap.len; i++) mr_mark_value(m->as.array.as.heap.ptr[i]);
+    /* ...and so are the internal ivars' values it keeps for a dmark */
+    for (int i = 0; i < m->hidden_count; i++) mr_mark_value(m->hidden_values[i]);
     marker = before;
     marking = was;
     return 0;
@@ -490,6 +525,8 @@ int mr_capi_release(int number) {
             }
     }
     free(m->io);
+    free(m->hidden_ids);
+    free(m->hidden_values);
     if (m->body == T_STRING) free(m->as.string.as.heap.ptr);
     if (m->body == T_ARRAY) free((void *)m->as.array.as.heap.ptr);
     int ran = 0;

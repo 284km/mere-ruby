@@ -184,6 +184,11 @@ static int reads_only(int op) {
 }
 VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
     struct mr_frame *frame = cur;
+    /* (a dmark run by a collection between C calls has nobody to ask: what it
+     *  may read then is mirror.c's -- the struct as last fetched, an internal
+     *  ivar C wrote -- and anything else is refused, not answered) */
+    if (!frame && mr_capi_mark_unasked())
+        mr_fatal("a dmark asked the interpreter with no C call in progress (only fetched structs and internal ivars C wrote can be read then)");
     if (!frame) mr_fatal("called with no call from the interpreter in progress (a C thread of its own?)");
     if (mr_vbig_live) {
         a = mr_vbig_out(a); b = mr_vbig_out(b); c = mr_vbig_out(c); d = mr_vbig_out(d); e = mr_vbig_out(e);
@@ -235,10 +240,6 @@ int mr_kw(int kw) { return kw ? MR_SEND_KW : 0; }
 /* (rb_iterate's block, waiting for the first method its function calls) */
 VALUE mr_iterate_block;
 VALUE mr_callv(VALUE recv, ID mid, int argc, const VALUE *argv, VALUE block, int flags) {
-    /* (a method a dmark calls with no C call in progress -- sqlite3's
-     *  aggregator pin reads an ivar with rb_ivar_get, under GC.stress --
-     *  answers nil: what the object it asks holds, the interpreter marks) */
-    if (!cur && mr_capi_mark_unasked()) return Qnil;
     if (mr_iterate_block && NIL_P(block)) { block = mr_iterate_block; mr_iterate_block = 0; }
     /* (keywords passed are a Hash, or one by #to_hash -- every *_kw function
      *  of the C API refuses anything else: "no implicit conversion of

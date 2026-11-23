@@ -91,13 +91,15 @@ collect
 check('dynamic descriptor cleanup returned', true)
 check('live owners remain usable', boxes.last.value == 'native-only-box-payload')
 
-# A dmark that reads RARRAY_LEN / RARRAY_AREF and rb_ivar_get, run by a
+# A dmark that reads RARRAY_LEN / RARRAY_AREF and an internal ivar, run by a
 # collection between C calls: it was "called with no call from the
 # interpreter in progress" (sqlite3's database_mark, its aggregator pin).
+# The child is held by C alone and marked when the ivar read says so.
 readers = Array.new(8) { Bug::ReadingBox.new }
-collect
+10.times { collect }
 readers.each do |reader|
   check('a reading dmark keeps its array', reader.list == %w[item-0 item-1 item-2 item-3])
   check('a reading dmark keeps the ivar it reads', reader.held == ['held'])
+  check('a reading dmark reads the ivar truly', reader.child == 'native-child')
 end
 puts "typeddata contracts: #{$checks} passed"

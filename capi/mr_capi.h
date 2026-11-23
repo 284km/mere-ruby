@@ -135,6 +135,9 @@ int mr_without(const char *what);
 int mr_capi_calling(void);
 /* Whether a dmark is running with no C call in progress: nobody to ask (mirror.c). */
 int mr_capi_mark_unasked(void);
+/* An internal ivar's value as C last wrote or read it (mirror.c). */
+void mr_mirror_hidden_put(VALUE obj, ID id, VALUE value);
+int mr_mirror_hidden_get(VALUE obj, ID id, VALUE *value);
 /* An API this C side does not provide: NotImplementedError, never a guess. */
 RBIMPL_ATTR_NORETURN() void mr_unsupported(const char *what);
 
