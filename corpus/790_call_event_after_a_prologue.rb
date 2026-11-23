@@ -132,3 +132,17 @@ lambda { |a = bd_dflt| n += a }.call
 begin; lambda { |a, k:| }.call(1); rescue ArgumentError; end
 once_tp.disable
 p $once, n
+
+# ...but a default that raises has its frame pushed: its :b_return comes,
+# with no :b_call -- a positional default, a lambda's, a keyword's
+def bd_boom = raise("boom")
+$raised = []
+raised_tp = TracePoint.new(:b_call, :b_return) { |t| $raised << [t.event, t.lineno] }
+raised_tp.enable
+begin; proc { |a = bd_boom| }.call; rescue; end
+begin; lambda { |a = bd_boom| }.call; rescue; end
+begin; proc { |k: bd_boom| }.call; rescue; end
+begin; lambda { |a| }.call; rescue ArgumentError; end
+begin; [1].each { |a, b = bd_boom| }; rescue; end
+raised_tp.disable
+p $raised
