@@ -26,3 +26,19 @@ The frame of the method holding it said the line of `->`, where ruby says the li
 **Left as it was.** `self⏎.send(:m)` still reports the line of `self`. Marking a `self` receiver would hide it from the private-call check, and the request does not need it.
 
 **Witness.** corpus 852 covers the two requested shapes and the class-shaped `-> do … end.call` from activesupport. It also covers arguments, keyword values, array elements, a splat of a multi-line array, a chain, a raise with its message on the next line, a block argument before a later one, and `defined?` across lines. On main, 7 of its lines differ.
+
+## Review of #180: defined? and the marks inside arguments
+
+`ln_strip` took the marks off the outer expression and its receivers only. `defined?` walks arguments, keyword values and elements as calls of their own, so a `__lnb~` left there was asked about as a method. It called the receiver to find it: `defined?(take(⏎ value⏎))` ran `value` and answered nil. The same happened with a keyword value, a local-variable argument, an array element in an argument, `x, k: 1`, `value.then(⏎ value⏎)` and `*[⏎ value⏎]`. `ln_strip` now goes through call arguments, keyword hashes (`EKwHash`), array and hash literals, splats, block passes and binary operands. corpus 852 has each of those under `defined?`, with a counter showing that nothing ran.
+
+The marks also carry their line as an `EInt` argument now (`EMethod (x, "__lnb~", [EInt n])`) instead of in the name. Reading it took a `substring` and an `int_of_str` per evaluation. 300,000 calls of `f(⏎ x,⏎ y,⏎ z⏎)`, against main 94aa899b:
+
+| | single-line call | multi-line call |
+|---|---|---|
+| main | 10.169e9 | 10.154e9 |
+| first version | 10.244e9 | 10.445e9 (+2.9%) |
+| now | 10.192e9 (+0.2%) | 10.249e9 (+0.9%) |
+
+The remaining cost is the mark itself (a line set and one more match arm per marked argument). A local variable is still marked: the lexer's table of locals describes the end of the source by the time the parser runs, so it cannot say what a name is at that point.
+
+**Not changed** (older than this PR, listed by the review): a later line inside a hash value, string interpolation, the right side of `+` / `&&` / `?:`, `**{⏎…}`, `raise("x")` as an argument, arguments of a call without parentheses, and the line of `foo(⏎…⏎) + nil`.

@@ -111,3 +111,42 @@ class Bc
 end
 b = Bc.new
 p [b.invoke, b.line]
+
+# (review of #180) defined? looks through the line marks on arguments, keyword
+# values and elements: none of them is called, and the answer is ruby's
+$seen = 0
+def value; $seen += 1; 123; end
+def take(*args, **kw); end
+x = 1
+r = []
+r << defined?(take(
+  value
+))
+r << defined?(take(
+  k: value
+))
+r << defined?(take(
+  x
+))
+r << defined?(take([
+  value
+]))
+r << defined?(take(x,
+  k: 1
+))
+r << defined?(value.then(
+  value
+))
+r << defined?(take(*[
+  value
+]))
+r << defined?([
+  x
+])
+r << defined?(take(
+  nope
+))
+r << defined?([1][
+  value
+])
+p r, $seen
