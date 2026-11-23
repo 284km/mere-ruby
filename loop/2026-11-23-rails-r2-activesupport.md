@@ -95,3 +95,10 @@ The next RED, each reproduced without Rails:
   had no answer for a mapping. The arm's body is now
   `hash_transform_keys_map`, shared with the dispatcher. With a block, the
   call keeps the iterator path.
+- **`gsub` / `sub` with a Hash replacement** looked each match up as a new
+  UTF-8 string. A BINARY receiver's match is a BINARY key, and ActiveSupport's
+  JSON escaping maps `"\u2028".b` that way: the separators came out empty.
+  The match and the result now carry the receiver's encoding
+  (`rx_gsub_hash`'s new `enc`). Left: `Regexp.union` of a BINARY non-ASCII
+  string prints its pattern as characters with `/n`, where ruby keeps the
+  `\x` escapes. The match itself is right.

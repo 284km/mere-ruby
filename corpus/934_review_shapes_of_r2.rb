@@ -113,3 +113,11 @@ end
 kh = KeyHash[{"a" => 1, "b" => 2}]
 p try { kh.transform_keys(&:upcase) }, try { kh.transform_keys({"a" => "x"}) }
 p try { kh.transform_keys({"a" => "x"}) { |k| k * 2 } }
+
+# gsub with a Hash replacement looks each match up as a string of the
+# receiver's encoding (ActiveSupport's JSON escaping maps "\u2028".b this way)
+sep = "\xE2\x80\xA8".b
+escapes = { sep => '\u2028'.b, ">".b => '\u003e'.b }
+json = %({"\u2028":"x>"}).b
+p json.gsub(Regexp.union(*escapes.keys), escapes), json.gsub(/\xE2\x80\xA8/n, escapes).encoding
+p "a>b".gsub(/>/, ">" => "G"), "a\u2028b".gsub(/\u2028/, "\u2028" => "S")
