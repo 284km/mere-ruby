@@ -114,4 +114,20 @@ dumped = ObjectSpace.dump(Bug::NativeBox.new)
 check('a typed data object dumps as DATA', dumped.include?('"type":"DATA"'))
 check('a typed data object dumps its struct name', dumped.include?('"struct":"native_box"'))
 check('a plain object is no DATA', ObjectSpace.dump(Object.new).include?('"type":"OBJECT"'))
+# ...and count_objects makes nothing per C data object: what one call
+# allocates is the same with 100 more of them alive
+def count_objects_cost
+  GC.disable
+  ObjectSpace.count_objects
+  before = GC.stat(:total_allocated_objects)
+  ObjectSpace.count_objects
+  GC.stat(:total_allocated_objects) - before
+ensure
+  GC.enable
+end
+few = count_objects_cost
+held = Array.new(100) { Bug::NativeBox.new }
+many = count_objects_cost
+check('count_objects allocates nothing per C data object', many <= few)
+check('the data objects are still there', held.size == 100)
 puts "typeddata contracts: #{$checks} passed"
