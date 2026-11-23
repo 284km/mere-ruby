@@ -175,10 +175,13 @@ class FrameworkCheck(unittest.TestCase):
         self.assertEqual({'A#test_a': 'MATCH'}, run.classify(parsed(text), crashed))
 
     def test_output_in_front_of_a_result_line(self):
-        out = parsed('Run options: --seed 1\nhello, A::B#test_x y = 0.01 s = .\n...A#test_b = 0.01 s = .\n'
-                     '2 runs, 2 assertions, 0 failures, 0 errors, 0 skips\n')
-        self.assertEqual(['A::B#test_x y', 'A#test_b'], list(out['cases']))
-        self.assertEqual('COMPLETE', out['state'])
+        # a class name with spaces (a describe block) is read whole
+        spaced = parsed('a thing#test_0001_works = 0.01 s = .\n1 runs, 1 assertions, 0 failures, 0 errors, 0 skips\n')
+        self.assertEqual(['a thing#test_0001_works'], list(spaced['cases']))
+        # output in front of a result line makes another name: never a MATCH
+        reference = parsed(transcript({'A#test_a': '.'}))
+        noisy = parsed('hello A#test_a = 0.01 s = .\n1 runs, 1 assertions, 0 failures, 0 errors, 0 skips\n')
+        self.assertEqual({'A#test_a': 'MISSING', 'hello A#test_a': 'EXTRA'}, run.classify(reference, noisy))
 
     def test_order_is_compared(self):
         cases = {'A#test_a': '.', 'A#test_b': '.'}
@@ -205,6 +208,13 @@ class FrameworkCheck(unittest.TestCase):
                 for gone in (dict(files={}), no_mere):
                     new.write_text(json.dumps(gone))
                     self.assertEqual(1, run.compare(args))
+
+    def test_a_run_uses_the_binary_that_installed(self):
+        record = dict(sides=dict(mere=dict(binary_sha256='a' * 64)))
+        self.assertTrue(run.check_install_binary(record, 'mere', 'a' * 64, False))
+        with self.assertRaisesRegex(ValueError, 'not the one that installed'):
+            run.check_install_binary(record, 'mere', 'b' * 64, False)
+        self.assertFalse(run.check_install_binary(record, 'mere', 'b' * 64, True))
 
     def test_install_requires_every_component(self):
         with tempfile.TemporaryDirectory() as directory:
