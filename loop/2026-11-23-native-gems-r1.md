@@ -170,3 +170,55 @@ Left as found (not needed by bcrypt, noted for later):
 - a captured builtin class method other than `new` called WITH a block on a
   class that overrides it (invoke_with_block0's generic singleton arm) still
   reaches the override.
+
+## Review of #178
+
+Fixed in this round (main merged first):
+
+- **Major: a saved class `==` / `!=` overflowed the stack** -- the
+  `(VClass _, _) -> skip9 ()` arm sent every class receiver back by name,
+  and the class arms for `==` / `!=` never read bi_skip. bi_meth_call now
+  answers a class's `==` (identity) and `!=` (the negation of the class's
+  own `==`) itself, and its `===` as Module#=== (the Method had recorded
+  Kernel's). corpus 900 covers `==`, `!=`, `<=>`, `===`, `<`, `to_s`,
+  `hash`, `inspect`.
+- **Major (from Rails-1): Time's saved `new` under a singleton
+  replacement** -- `alias_method :__orig_new, :new` then
+  `define_singleton_method(:new)` recursed (main: "already initialized
+  Time"). The builtin-class override arm consumed bi_skip as it declined,
+  and the `self.new` arm after it took the override. invoke_val_c0's VClass
+  arm takes the skip once where it starts (bi_skip_take) and its arms read
+  that. An alias of a builtin class method called with a block now keeps
+  the block (invoke_with_block0). corpus 902 (Time, String, Array). None of
+  #172's four arms is touched.
+- **Major: `super` from an instance_exec / instance_eval override** --
+  super_missing runs the builtin arm once, with the block, past the
+  override (bi_skip). corpus 901.
+- **Major: the dmark nil** -- a dmark run between C calls no longer gets a
+  made-up nil. An internal ivar (no `@`: only C writes it) is read as C last
+  wrote or read it, kept on the mirror and marked with it; any other ask of
+  the interpreter there is mr_fatal, named as a dmark's. The fixture marks a
+  C-only child conditionally on that read; typeddata contracts 102 on both
+  sides and under MERE_RUBY_GC_STRESS=1.
+- **Minor: `defined?(Fmt::H)` / `Fmt::Nope`** in the reopened class:
+  defined? asks the nesting as the read does, and the head's const_missing
+  is called. corpus 903.
+- **Minor: Proc#extend's neighbours** -- a frozen proc refuses it,
+  `M === pr` sees the singleton, `singleton_methods` lists the extended
+  modules' methods. corpus 904.
+
+Follow-ups, not done:
+
+- The parser's `name [array] op rest` (corpus 899) still keeps the old
+  reading for `p(foo [1] == [1] ? :yes : :no)` (leftmost_arr_swap answers
+  false for a ternary) and `z = foo [1] + [2] do |q| q end` (a SyntaxError
+  here). corpus 899 passing under MERE_RUBY_VM=1 is no evidence for this
+  arm: the VM compiles the file itself, and a binary without it passes 899
+  there too.
+- A dmark with no C call in progress still cannot read a String
+  (RSTRING_PTR), a Hash (rb_hash_foreach), an `@` ivar or call a method:
+  those are refused (mr_fatal), not answered. An Array is read as last
+  fetched, and one never fetched reads as empty.
+- `K.method(:===).owner` says Kernel for a class (ruby: Module).
+- An `M#call` on an extended proc that calls `super` overflows the stack
+  (older: `def pr.call(*a) = super` does too).
