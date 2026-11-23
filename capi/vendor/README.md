@@ -14,6 +14,21 @@ internal headers that this C API has no equivalent of
 `capi/standin/`, which are this repository's own files and hold only what
 the vendored sources use.
 
+`bignum.c` is CRuby's multiple-precision Integer code, also unchanged,
+compiled by `capi/bignum_cruby.c`, so that the algorithms an extension can
+call by name (`rb_big_mul_karatsuba`, `rb_big_mul_toom3`,
+`rb_big2str_generic`, `rb_str2big_karatsuba`, `rb_big_divrem_normal`, ...)
+run as CRuby runs them. It brings seven more internal headers, copied
+unchanged (`internal/{bignum,complex,fixnum,numeric,object,serial,vm}.h`),
+and two stand-ins in `capi/standin/`: `id.h` (the seven method IDs it names,
+interned by name; the real one is generated) and `internal/gc.h` (NEWOBJ_OF
+and two questions about slot sizes; the real one includes `vm_core.h`).
+Every function it defines is renamed (`mr_vbig_*`) inside that one file, so
+the C API's own Integer functions are not replaced; only the algorithms by
+name are given under ruby's names. How a Bignum it makes -- a C struct, whose
+VALUE is its address -- becomes an Integer when it reaches the interpreter
+is written at the top of `capi/bignum_cruby.c`.
+
 They are under Ruby's licence (`capi/include/COPYING`, `capi/include/BSDL`).
 Nothing in this directory is edited; `capi/tools/headers_check.py` compares
 it, and `capi/include`, with a ruby source tree.
