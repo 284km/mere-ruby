@@ -90,3 +90,28 @@ fstring, encode_bang now), test_set_len 5 of 6. Left: the shared Strings --
 test_capacity_shared, test_set_len#test_shared, test_rb_str_dup x2: a
 String that shares another's buffer (STR_SHARED, as.heap.aux.shared) is not
 made here, rb_str_dup copies.
+
+Elsewhere: ruby/test_string 2 errors -> 0 and test_struct 2 -> 0 (they size
+Strings from BASE_SLOT_SIZE / RVARGC_MAX_ALLOCATE_SIZE), test_file_exhaustive's
+test_expand_path_memsize passes. objspace: test_dump_includes_slot_size,
+test_dump_to_default and test_dump_to_io pass on both sides and leave the
+exclusion ledger (unittest/excludes-gc/TestObjSpace.rb, gc_cases.tsv now
+MATCH). test_gc, test_gc_compact, test_time, test_objectspace unchanged.
+
+**test_memsize_of_all is RED in the file's run, and why it is not this
+change.** It compares `memsize_of_all` with `memsize_of_all(String)`,
+counted one after the other. Here `memsize_of` of an Encoding, an Array, a
+Proc ... makes Strings (206 for the Encodings alone, GC disabled), so the
+first count makes ~6,000 Strings that the second then counts: 3.4 M vs 4.5 M
+in the file's run, 0.96 M when the Strings are counted again right after.
+Whether the first count wins depends on what the tests before it left and
+when the collector runs: main's binary fails it run alone
+(`-n test_memsize_of_all`) and passes it in the file; this branch passes it
+alone and, with the three tests above now running (the order changes), fails
+it in the file. The fix is a memsize_of that allocates nothing, not part of
+this change. memsize_of a String itself asks for one Integer
+(`__str_layout(s, :memsize)`), no Array.
+
+capi/check/spec_expect.tsv re-recorded: class_spec 103 -> 109 on the
+mere-ruby side, which main's binary already passes (#157/#158, not this
+change).
