@@ -102,3 +102,23 @@ The next RED, each reproduced without Rails:
   (`rx_gsub_hash`'s new `enc`). Left: `Regexp.union` of a BINARY non-ASCII
   string prints its pattern as characters with `/n`, where ruby keeps the
   `\x` escapes. The match itself is right.
+
+## The review's second round
+
+- **Major 1 was half fixed.** A String *subclass's* value still went to
+  `dispatch_prim`, and a module prepended to String came back from there.
+  Now no `super` from a value's String method goes through `dispatch_prim`.
+  `gsub` / `sub` are prim_method's answer, as on main. `gsub!` / `sub!` are
+  prim_method's plain `gsub` / `sub` written back with `replace` (nil when
+  nothing changed), after the frozen check.
+- **The U+2028 fix did not reach the dispatcher's gsub.** `rx_gsub_hash` is
+  prim_method's path. The dispatcher's gsub (a String or a Regexp pattern with
+  a Hash) built each match as UTF-8 too. Both use the receiver's encoding now.
+  The witness had checked only `>`, because the U+2028 in it had become six
+  characters of text on the way into the file. corpus 934 now packs the bytes.
+- **`transform_keys!(mapping)` through super wrote to a frozen Hash
+  subclass** (the review bot's P2). The new entry called the mapping helper
+  directly, and its bang branch wrote without the frozen check that Hash's own
+  path makes. It refuses first now. The plain form still answers from a frozen
+  receiver. The other bang entries this PR adds (`gsub!` / `sub!`) check
+  first. A String's block call goes through the dispatcher, which checks.

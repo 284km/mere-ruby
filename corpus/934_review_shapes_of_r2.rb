@@ -143,3 +143,12 @@ end
 p try { BangSub.new("aa").gsub("a", "b") }
 bs = BangSub.new("aa")
 p try { bs.gsub!("a", "b") }, bs, try { bs.gsub!("z", "y") }, try { bs.sub!("b", "c") }, bs
+
+# transform_keys! through super refuses a frozen Hash subclass, and the plain
+# form still answers from it
+class FrozenKeys < Hash
+  def transform_keys!(*a, &b) = super
+  def transform_keys(*a, &b) = super
+end
+fk = FrozenKeys[a: 1].freeze
+p try { fk.transform_keys!({ a: :b }) }, fk, try { fk.transform_keys({ a: :b }) }, fk
