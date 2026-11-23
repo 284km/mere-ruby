@@ -156,3 +156,31 @@ local paths. Raw logs stay outside the repository.
   side's application gem home. `inflector_test.rb` is `same_order: false`:
   the same 473 names run in a different order from the second test on. The
   other three files run in the same order.
+- `activesupport-8bf5563b.json`: all of `activesupport/test` (170 files) at
+  `8bf5563b`, the first round of the ActiveSupport work (#181).
+  **4,675 MATCH / 63 RED / 1 MISSING / 29 BOTH**. 8 files are not compared,
+  because the reference does not complete them here. Three cache files
+  require `dalli` or `redis`, which are not in the lock. Four `xml_mini`
+  engines run no test (JDOM is JRuby's, and LibXML needs `libxml-ruby`), and
+  the reference's `event_reporter_assertions_test.rb` prints no summary.
+- `install-68588737.json`: the gem home the two `68588737` records ran in.
+  mere-ruby's side was installed again by that build (320.8 s, peak 1.74 GB).
+  The twelve components' `lib/` match the tag. The reference's side is the one
+  in `install-c521aa58.json`, kept as it was.
+- `activesupport-68588737.json`: all 170 files at `68588737`, which is
+  main `03c2869a`'s runtime. **4,546 MATCH / 34 RED / 159 MISSING / 29
+  BOTH**. 158 of the MISSING are `json/encoding_test.rb`, which stopped
+  before its first test at `require "bundler/setup"` ("Your bundle only
+  supports platforms []"). String#split with a block lost its pieces to a
+  collection, and Bundler's lockfile parser read no PLATFORMS. #195 fixes
+  that, and the file then runs 158 MATCH. Against `8bf5563b`, that file is the only
+  one that lost a MATCH. Eight files gained: `backtrace_cleaner` (+8),
+  `time_travel` (+5), `safe_buffer` (+4), the two MessagePack serializers
+  (+2 each), `string_inquirer` (+2), `array_inquirer` and `string_ext` (+1
+  each).
+- `activesupport-68588737-vm.json`: the same build and files with
+  `--mere-env MERE_RUBY_VM=1`. **4,667 MATCH / 31 RED / 41 MISSING / 29
+  BOTH**. The 31 RED are the evaluator's 34 without `error_reporter` (1) and
+  `deep_mergeable` (2). 40 of the MISSING are `xml_mini/nokogiri_engine_test.rb`
+  and `nokogirisax_engine_test.rb`: requiring nokogiri stops on the VM with
+  `Nokogiri::HTML is not a module`. The evaluator runs both files.
