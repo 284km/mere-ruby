@@ -63292,41 +63292,57 @@ and top_ret_args = fn (ss: Stmt list) ->
 and top_ret_cls = fn (cl: (Expr * Stmt list) list) ->
   match cl with Nil -> false | Cons ((_, b), r) -> top_ret_args b || top_ret_cls r
 and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (lastv: Val) ->
+  run_until_gc_n env world blk rem lastv 0
+// ⚠ ONE FRAME FOR THE WHOLE CHUNK, and no statement's value carried on.
+//   This recursed after each statement (`let (c, f, lv) = run_until_gc ...
+//   in (c + 1, f, lv)`), so every top-level statement left a frame holding
+//   its value, and a collection's conservative scan of the stack (the
+//   interrupted body's, GC.start) found them all: `Plain.new` written N
+//   times at the top level kept N objects through any number of GC.start
+//   (sqlite3's tests count released comparators). The count rides along
+//   (n) so the call is a tail call, and a statement's value is passed on
+//   only when the program's last value is printed (gc_state "keeplast").
+and run_until_gc_n = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (lastv: Val) -> fn (n: int) ->
   // The chunk runner behind the collector's driver (run_src): top-level
   // statements, each under its own region STMT exactly as run_stmts does,
   // until the object stores grow past `limit`. Returns (consumed, flag, last):
   // flag 0 = limit hit (collect, then continue), 1 = list exhausted, 2 = a
   // non-FNext flow ended the program. A raise never returns at all -- it
   // unwinds to the driver's try_or, whose default is flag 3.
+  let keep9 = map_has gc_state "keeplast" in
   match rem with
-  | Nil -> (0, 1, lastv)
+  | Nil -> (n, 1, lastv)
   // A top-level while is the one statement whose INSIDE the collector can
   // see (run_while_top). 0 consumed on pressure = the driver re-enters this
   // same statement after collecting.
   | Cons (SWhile (c, b), rest) ->
     (match run_while_top env world blk c b 100000 with
-     | 0 -> (0, 0, lastv)
+     | 0 -> (n, 0, lastv)
      | 1 ->
        // the body's targets exist after the loop, run or not (see SWhile)
        let _ = declare_nils env (deep_targets b) in
-       (if gc_pressure world then (1, 0, VNil)
-        else let (cn, f, lv) = run_until_gc env world blk rest VNil in (cn + 1, f, lv))
-     | _ -> (0, 2, lastv))
+       (if gc_pressure world then (n + 1, 0, VNil)
+        else run_until_gc_n env world blk rest VNil (n + 1))
+     | _ -> (n, 2, lastv))
   | Cons (s, rest) ->
     let _ = fb_wm_stmt () in
     // (the top level's statements, which run_stmts does not see)
     let _ = (if map_len sig_armed > 0 then sig_poll env world else ()) in
-    (match exec_stmt_region env world blk s true with
+    // (...and the statement's value is let go inside its own region STMT
+    //  unless it is printed: copied out, it sat in the chunk's region DRV,
+    //  which a collection's scan of the interrupted stack reads -- one
+    //  object kept per top-level statement)
+    (match exec_stmt_region env world blk s keep9 with
      | FNext v ->
-       (if gc_pressure world then (1, 0, v)
-        else let (c, f, lv) = run_until_gc env world blk rest v in (c + 1, f, lv))
+       (if gc_pressure world then (n + 1, 0, (if keep9 then v else VNil))
+        else run_until_gc_n env world blk rest (if keep9 then v else VNil) (n + 1))
      // (the top level's own `return 10`: ruby says the value goes nowhere,
      //  naming the file and no line)
      | FReturn _ ->
        (let _ = (if top_ret_arg s && (if rb_verbose_nil () then false else true)
                  then warning_emit world (cur_file () ++ ": warning: argument of top-level return is ignored\n") VNil else ()) in
-        (0, 2, lastv))
-     | _ -> (0, 2, lastv))
+        (n, 2, lastv))
+     | _ -> (n, 2, lastv))
 
 // a program's statements without its top-level BEGIN blocks (run_pre_f ran them)
 and req_nopre = fn (ss: Stmt list) ->
