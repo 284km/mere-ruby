@@ -1,7 +1,21 @@
 # Rails application measurement
 
 This is a real Rails **8.1.4.1 application**, measured against Ruby 4.0.9.
-It is not Rails' own framework test suite. Main `2e2ab568` now installs all
+It is not Rails' own framework test suite; that one is measured by
+[`framework/`](framework/README.md).
+
+**Current baseline: [`main_cold_c521aa58.json`](main_cold_c521aa58.json)**, a
+cold run of main `c521aa58` (its `source_ref` is a work-in-progress commit
+that adds only `railstest/` files on top of it). It used the harness before
+`RUBYLIB` was given to mere-ruby. The reference passes all six stages.
+mere-ruby passes Bundler, the dependencies (591.4 s of the 600-second bound,
+at a load average of about 35 when the run started) and the migration. Boot
+fails: the direct `bin/rails` did not activate Bundler as a gem (see below).
+Tests and HTTP are NOT_RUN. An earlier cold run of `87ae563d` reached the
+600-second bound in the dependency stage while the load average was 100 to
+230. It is not kept as a baseline.
+
+The history below is kept as it was. Main `2e2ab568` installed all
 68 frozen dependencies, including bigdecimal's native extension, within the
 existing bounds. The next migration command fails at the separate command
 registry boundary in [issue #121](https://github.com/284km/mere-ruby/issues/121).
@@ -26,6 +40,16 @@ into its own initially empty gem home, and builds its own extensions. The
 reference's standard library is appended as a fallback on both load paths;
 it does not precede Bundler's selected gem libraries. No reference
 extension directories or installed gem homes are passed to mere-ruby.
+mere-ruby is also given that library on `RUBYLIB`, which is how it takes its
+standard library: a `lib/ruby/4.0.0` with `gems/4.0.0/specifications/default`
+beside it makes those default gem specs visible to RubyGems (only
+`rubylibprefix` follows it; `prefix`, `rubylibdir`, `archdir`, `rubyhdrdir`
+and the compiler settings do not change). Without them `require
+"bundler/setup"` from a direct `bin/rails` did not activate Bundler as a gem:
+it read `bundler.rb` from the fallback library, and the boot audit found a
+Bundler outside mere-ruby's gem home. The reference is not given `RUBYLIB`;
+there it would put its library ahead of the gem home and select its default
+Bundler.
 
 ## Restore and measure
 
