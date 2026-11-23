@@ -12,7 +12,10 @@ def inventory(source):
     source = source.resolve()
     ruby_ref = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
     unit = subprocess.check_output(['sh', str(Path(__file__).with_name('list.sh')), str(source), '--all'], text=True).splitlines()
-    inputs = {'test': ['test/' + name for name in unit]}
+    # (a file split into units -- unittest/splits.tsv, `<file>@<part>` -- is
+    #  one input file here: the inventory is of files, not of runs)
+    files = list(dict.fromkeys(re.sub(r'@[0-9]+$', '', name) for name in unit))
+    inputs = {'test': ['test/' + name for name in files]}
     inputs['bootstraptest'] = sorted(str(p.relative_to(source)) for p in (source / 'bootstraptest').glob('test_*.rb'))
     inputs['basictest'] = ['basictest/test.rb']
     inputs['tool/test'] = sorted(str(p.relative_to(source)) for p in (source / 'tool/test').rglob('*.rb') if p.name.startswith('test_') or p.name.endswith('_test.rb'))
