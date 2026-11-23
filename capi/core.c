@@ -643,6 +643,21 @@ char *mr_capi_libc(void) {
     return "";
 #endif
 }
+
+/* The OpenSSL installation this interpreter was linked against, where the
+ * build named one (tools/build.sh: OPENSSL_PREFIX, or Homebrew's openssl@3):
+ * "" when the compiler found OpenSSL on its own paths or through pkg-config.
+ * RbConfig says it as ruby's configure would have been told it,
+ * --with-openssl-dir, which is what mkmf's dir_config("openssl") reads -- an
+ * extension that brings its own TLS (puma's MiniSSL) then builds against the
+ * OpenSSL the interpreter's own openssl library uses. */
+char *mr_capi_openssl_dir(void) {
+#ifdef MR_OPENSSL_DIR
+    return MR_OPENSSL_DIR;
+#else
+    return "";
+#endif
+}
 int mr_capi_depth(void) { return depth; }
 const void *mr_capi_frame(void) { return cur; }
 /* CRuby's ec->errinfo, which rb_errinfo answers: the running stack's (the
