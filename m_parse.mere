@@ -3256,6 +3256,11 @@ and rx_kinds = fn (p: str) -> fn (i: int) -> fn (hu: bool) -> fn (ho: bool) ->
     (let c9 = char_at p (i + 1) in
      if str_eq c9 "u" then rx_kinds p (i + 2) true ho
      else if str_eq c9 "x" then rx_kinds p (i + 2) hu (ho || rx_hex_run_ge80 p (i + 2) 0 false)
+     // (...and so does a \M- one, nested with a control escape or not:
+     //  `'\M-C\M-)'` is UTF-8 and fixed, as `'\xc3\xa9'` is)
+     else if str_eq c9 "M" || str_eq c9 "c" || str_eq c9 "C" then
+       (match rx_str_esc_byte p (i + 1) with
+        | (w9, b9, k9) -> if str_eq w9 "" then rx_kinds p k9 hu (ho || b9 >= 128) else rx_kinds p (i + 2) hu ho)
      else rx_kinds p (i + 2) hu ho)
   else rx_kinds p (i + 1) hu ho
 // A regexp LITERAL in a source that is not UTF-8 is in the source's
@@ -3308,6 +3313,11 @@ and rx_src_nonascii = fn (p: str) -> fn (i: int) ->
        (if rx_u_esc_ge80 p (i + 2) then true else rx_src_nonascii p (i + 2))
      else if str_eq c9 "x" then
        (if rx_hex_run_ge80 p (i + 2) 0 false then true else rx_src_nonascii p (i + 2))
+     // (a \M- escape -- with a control escape in it or around it -- makes a
+     //  byte past ASCII too: `'\M-C\M-)'` is UTF-8, as `'\xc3\xa9'` is)
+     else if str_eq c9 "M" || str_eq c9 "c" || str_eq c9 "C" then
+       (match rx_str_esc_byte p (i + 1) with
+        | (w9, b9, k9) -> if str_eq w9 "" && b9 >= 128 then true else rx_src_nonascii p (if str_eq w9 "" then k9 else i + 2))
      // any other escape covers exactly one character; step over both
      else rx_src_nonascii p (i + 2))
   else rx_src_nonascii p (i + 1)
@@ -4323,6 +4333,57 @@ and rx_frag_why = fn (v: str) ->
              else go (i + 2)))
     else go (i + 1) in
   go 0
+// The same for a pattern given as a STRING (Regexp.new): re.c's
+// read_escaped_byte, from p (just past a backslash). It is not the parser's
+// rule (rx_esc_byte): a control prefix only masks with 0x1F (`\c?` is 0x1F,
+// where a literal's `/\c?/` is 0x7F), and \c, \C- and \M- each take any
+// escape after them -- `\c\M-)` is 0x89, `\c\x41` 0x01, `\M-\C-?` 0x9F --
+// while a non-ASCII byte after one is "too short". (refusal or "", the
+// byte, next index)
+and rx_str_esc_byte = fn (v: str) -> fn (p: int) ->
+  rx_str_esc_go v p false false
+and rx_str_esc_go = fn (v: str) -> fn (p: int) -> fn (meta: bool) -> fn (ctl: bool) ->
+  let n = str_len v in
+  let fin = fn (b: int) -> fn (k: int) ->
+    (if b < 0 || b > 255 then ("invalid escape code", 0, k)
+     else (let b2 = (if ctl then b % 32 else b) in ("", (if meta then b2 + (if b2 >= 128 then 0 else 128) else b2), k))) in
+  // what follows a \M- or a \c / \C-: another escape, or one ASCII byte
+  let after = fn (k: int) -> fn (m2: bool) -> fn (c2: bool) -> fn (short: str) ->
+    (if k < n && ord (char_at v k) < 128 then
+       (if str_eq (char_at v k) "\\" then rx_str_esc_go v (k + 1) m2 c2
+        else (let b = ord (char_at v k) in
+              let b2 = (if c2 then b % 32 else b) in
+              ("", (if m2 then b2 + (if b2 >= 128 then 0 else 128) else b2), k + 1)))
+     else (short, 0, k)) in
+  let isoct = fn (k: int) -> k < n && (let o = ord (char_at v k) in o >= 48 && o <= 55) in
+  if p >= n then ("too short escape sequence", 0, p)
+  else
+    (let c = char_at v p in
+     if str_eq c "M" then
+       (if meta then ("duplicate meta escape", 0, p)
+        else if p + 1 < n && str_eq (char_at v (p + 1)) "-" then after (p + 2) true ctl "too short meta escape"
+        else ("too short meta escape", 0, p))
+     else if str_eq c "C" then
+       (if p + 1 < n && str_eq (char_at v (p + 1)) "-" then
+          (if ctl then ("duplicate control escape", 0, p) else after (p + 2) meta true "too short control escape")
+        else ("too short control escape", 0, p))
+     else if str_eq c "c" then
+       (if ctl then ("duplicate control escape", 0, p) else after (p + 1) meta true "too short control escape")
+     else if str_eq c "n" then fin 10 (p + 1) else if str_eq c "t" then fin 9 (p + 1)
+     else if str_eq c "r" then fin 13 (p + 1) else if str_eq c "f" then fin 12 (p + 1)
+     else if str_eq c "v" then fin 11 (p + 1) else if str_eq c "a" then fin 7 (p + 1)
+     else if str_eq c "e" then fin 27 (p + 1) else if str_eq c "\\" then fin 92 (p + 1)
+     else if isoct p then
+       (let k2 = (if isoct (p + 1) then (if isoct (p + 2) then p + 3 else p + 2) else p + 1) in
+        let rec ov = fn (k: int) -> fn (acc: int) -> (if k >= k2 then acc else ov (k + 1) (acc * 8 + ord (char_at v k) - 48)) in
+        fin (ov p 0) k2)
+     else if str_eq c "x" then
+       (if p + 1 < n && is_hex_digit (char_at v (p + 1)) then
+          (if p + 2 < n && is_hex_digit (char_at v (p + 2))
+           then fin (hex_val (char_at v (p + 1)) * 16 + hex_val (char_at v (p + 2))) (p + 3)
+           else fin (hex_val (char_at v (p + 1))) (p + 2))
+        else ("invalid hex escape", 0, p))
+     else ("unexpected escape sequence", 0, p))
 // ruby's read_escaped_byte from p (just past a backslash) under the \M-
 // and \C- prefixes already read: (refusal or "", the byte, next index)
 and rx_esc_byte = fn (v: str) -> fn (p: int) -> fn (meta: bool) -> fn (ctl: bool) ->
@@ -4485,17 +4546,20 @@ and rx_esc_runs_why = fn (lit: str) -> fn (enc: str) ->
        let numeric = str_eq c "x" || str_eq c "c" || str_eq c "C" || str_eq c "M"
                      || (let o = ord c in o >= 48 && o <= 55) in
        if numeric then
-         (match rx_esc_byte lit (i + 1) false false with
+         (match rx_str_esc_byte lit (i + 1) with
           | (w, b, k) ->
             // (a control escape with no \M- in it is no byte of a character
-            //  to Regexp.new -- `'a\c\xff'` compiles, its 0x9F alone -- as
+            //  to Regexp.new -- `'a\c\xff'` compiles, its 0x1F alone -- as
             //  onigmo reads it; a meta one is)
             let meta = str_contains (substring lit i k) "M-" in
             let numeric = meta || (if str_eq c "x" then true else (let o = ord c in o >= 48 && o <= 55)) in
             // (...and once a run has begun, an escaped byte below 0x80 joins
             //  it too: Shift_JIS and Windows-31J have trail bytes from 0x40,
             //  so `\x81\x40` is one whole character, not a lead byte cut short)
-            if str_eq w "" && numeric && (b >= 128 || str_len run > 0) then go k (run ++ chr b)
+            // (an escape that cannot be read says why, as re.c does:
+            //  `\M-\M-x` is "duplicate meta escape")
+            if (if str_eq w "" then false else true) && (str_eq c "M" || str_eq c "c" || str_eq c "C") then w
+            else if str_eq w "" && numeric && (b >= 128 || str_len run > 0) then go k (run ++ chr b)
             else (let why = whole run in if str_eq why "" then go (if str_eq w "" then k else i + 2) "" else why))
        else (let why = whole run in if str_eq why "" then go (i + 2) "" else why))
     else (let why = whole run in if str_eq why "" then go (i + 1) "" else why) in
