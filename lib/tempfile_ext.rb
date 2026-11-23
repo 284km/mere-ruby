@@ -673,19 +673,23 @@ module MereAnonymousTempfile # :nodoc:
   end
 end
 
-private def create_anonymous(basename="", tmpdir=nil, mode: 0, **options, &block)
-  tmpdir = Dir.tmpdir() if tmpdir.nil?
-  tmpfile = create_with_filename(basename, tmpdir, mode: mode, **options)
-  hidden = tmpfile.path
-  tmpfile.extend(MereAnonymousTempfile).__mere_anonymous(hidden, File.join(tmpdir, ''))
-  at_exit { (File.unlink(hidden) if File.exist?(hidden)) rescue nil }
-  if block
-    begin
-      yield tmpfile
-    ensure
-      tmpfile.close
+# (Tempfile's own, replacing ruby's above: a top-level def is Object's, and
+#  the bare call in Tempfile.create finds the singleton class's method first)
+class << Tempfile
+  private def create_anonymous(basename="", tmpdir=nil, mode: 0, **options, &block)
+    tmpdir = Dir.tmpdir() if tmpdir.nil?
+    tmpfile = create_with_filename(basename, tmpdir, mode: mode, **options)
+    hidden = tmpfile.path
+    tmpfile.extend(MereAnonymousTempfile).__mere_anonymous(hidden, File.join(tmpdir, ''))
+    at_exit { (File.unlink(hidden) if File.exist?(hidden)) rescue nil }
+    if block
+      begin
+        yield tmpfile
+      ensure
+        tmpfile.close
+      end
+    else
+      tmpfile
     end
-  else
-    tmpfile
   end
 end
