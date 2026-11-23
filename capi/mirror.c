@@ -30,7 +30,10 @@ struct mr_mirror {
     unsigned long body_epoch;   /* when the bytes / elements were last fetched */
     uint64_t hash;              /* of the body as fetched or last written back */
     long version;               /* an Array's version at the last fetch */
-    long capa;                  /* bytes or elements the buffer holds */
+    long capa;                  /* elements an Array's buffer holds */
+    char *own;                  /* a String's buffer when its bytes are not in the struct */
+    long own_size;              /* ...and how many bytes it is */
+    long reserve;               /* room the interpreter asked for (mr_capi_reserve), not yet made */
     int body;                   /* 0 none yet, T_STRING, T_ARRAY */
     int data;                   /* 0, 1 RData, 2 RTypedData */
     int listed;                 /* how many C calls in progress watch it (entries of `touched`) */
@@ -93,9 +96,93 @@ static uint64_t hash_bytes(const void *p, size_t n, uint64_t seed) {
     while (n--) h = (h ^ *s++) * 0x100000001B3ULL;
     return h ^ (h >> 29);
 }
-static uint64_t body_hash(const struct mr_mirror *m) {
+/* ---- where a String's bytes are -------------------------------------------- */
+/* As CRuby keeps them: in the struct itself, after `len` (RSTRING_NOEMBED
+ * clear), when they and the terminator fit in its 16 bytes -- what CRuby's
+ * smallest slot holds -- and otherwise in a buffer of their own, as.heap.ptr,
+ * of as.heap.aux.capa bytes and room for the terminator. A String that has
+ * left the struct stays out until rb_str_resize brings it back, as in CRuby.
+ * C may put a buffer of its own in as.heap.ptr (ruby's own test extensions
+ * do); it is taken over, and freed with the struct. */
+#define EMBED_ROOM ((long)(sizeof(struct RString) - offsetof(struct RString, as.embed.ary)))
+enum { ROOM_GROW, ROOM_EXACT };
+static int str_embedded(const struct mr_mirror *m) { return !(m->as.basic.flags & RSTRING_NOEMBED); }
+static char *embed_ary(struct mr_mirror *m) { return (char *)&m->as.string + offsetof(struct RString, as.embed.ary); }
+static char *str_ptr(struct mr_mirror *m) { return str_embedded(m) ? embed_ary(m) : m->as.string.as.heap.ptr; }
+/* (the terminator of an encoding index, from the flags alone: the head is
+ *  being refreshed and cannot be asked) */
+static int term_of_index(int index) {
+    rb_encoding *enc = rb_enc_from_index(index);
+    int n = enc ? rb_enc_mbminlen(enc) : 1;
+    return n > 1 && n <= 4 ? n : 1;
+}
+static int str_term(const struct mr_mirror *m) {
+    return term_of_index((int)((m->as.basic.flags >> RUBY_ENCODING_SHIFT) & RUBY_ENCODING_INLINE_MAX));
+}
+/* What C did to the struct's buffer since the mirror last looked. */
+static void str_adopt(struct mr_mirror *m) {
+    if (str_embedded(m)) {
+        /* (C moved the bytes back into the struct) */
+        if (m->own) { free(m->own); m->own = NULL; m->own_size = 0; }
+        return;
+    }
+    char *p = m->as.string.as.heap.ptr;
+    if (p == m->own) return;
+    /* (a pointer into its own buffer -- a substring C made by moving it -- keeps the buffer) */
+    if (m->own && p > m->own && p < m->own + m->own_size) return;
+    free(m->own);
+    m->own = p;
+    m->own_size = p ? m->as.string.as.heap.aux.capa + 1 : 0;
+}
+static long str_capacity(struct mr_mirror *m, int term) {
+    return str_embedded(m) ? EMBED_ROOM - term : (m->as.string.as.heap.ptr ? m->as.string.as.heap.aux.capa : 0);
+}
+/* Room for `need` bytes and the terminator. ROOM_EXACT makes it exactly that
+ * (rb_str_modify_expand, rb_str_buf_new, String.new(capacity:), a read into
+ * a buffer); ROOM_GROW doubles as str_buf_cat does, 2 * capa + termlen. New
+ * room is not cleared -- as in CRuby, what is past the length is C's to
+ * write -- only the terminator's place at the end of it. */
+static void string_room(struct mr_mirror *m, long need, int term, int mode) {
+    if (need < 0) need = 0;
+    long capa = str_capacity(m, term);
+    if (str_embedded(m) ? need + term <= EMBED_ROOM : (m->as.string.as.heap.ptr && need <= capa)) return;
+    long want = need;
+    if (mode == ROOM_GROW && need < LONG_MAX / 2) {
+        want = capa > 0 ? capa : 0;
+        while (want < need) want = 2 * want + term;
+    }
+    if (want > LONG_MAX - 8) rb_raise(rb_eArgError, "string size too big");
+    /* (four more bytes: the terminator of the widest encoding) */
+    size_t size = (size_t)want + 4;
+    long len = m->body == T_STRING ? m->as.string.len : 0;
+    char *p;
+    if (str_embedded(m)) {
+        p = malloc(size);
+        if (!p) rb_memerror();
+        memcpy(p, embed_ary(m), (size_t)EMBED_ROOM);
+        m->as.basic.flags |= RSTRING_NOEMBED;
+    }
+    else if (m->own && m->as.string.as.heap.ptr == m->own) {
+        p = realloc(m->own, size);
+        if (!p) rb_memerror();
+    }
+    else {
+        /* (the bytes start inside the buffer: they move to the front of a new one) */
+        p = malloc(size);
+        if (!p) rb_memerror();
+        if (m->as.string.as.heap.ptr && len > 0) memcpy(p, m->as.string.as.heap.ptr, (size_t)(len < want ? len : want));
+        free(m->own);
+    }
+    memset(p + want, 0, 4);
+    m->own = p;
+    m->own_size = (long)size;
+    m->as.string.as.heap.ptr = p;
+    m->as.string.as.heap.aux.capa = want;
+}
+
+static uint64_t body_hash(struct mr_mirror *m) {
     if (m->body == T_STRING)
-        return hash_bytes(m->as.string.as.heap.ptr, (size_t)m->as.string.len, 1);
+        return hash_bytes(str_ptr(m), (size_t)m->as.string.len, 1);
     return hash_bytes(m->as.array.as.heap.ptr, sizeof(VALUE) * (size_t)m->as.array.as.heap.len, 2);
 }
 
@@ -111,12 +198,30 @@ static void refresh_head(struct mr_mirror *m, VALUE obj) {
     flags = keep | (VALUE)type;
     if (packed & 0x20) flags |= RUBY_FL_FREEZE;
     flags |= ((packed >> 8) & 0x7f) << RUBY_ENCODING_SHIFT;
-    if (type == T_STRING) flags |= RSTRING_NOEMBED;
     if (type == T_ARRAY) flags &= ~(VALUE)RARRAY_EMBED_FLAG;
     if ((type == T_CLASS || type == T_MODULE) && (packed & 0x40)) flags |= RUBY_FL_SINGLETON;
     m->as.basic.flags = flags;
     *(VALUE *)&m->as.basic.klass = mr_word(0);
     m->head_epoch = mr_epoch;
+    if (type == T_STRING) {
+        /* Where the bytes are is in the flags, which C reads before it asks
+         * for the bytes (RSTRING_PTR tests RSTRING_NOEMBED first), so it is
+         * settled here, from the length the interpreter has now: a String
+         * whose bytes the struct does not hold yet is in it when they fit,
+         * and one in the struct leaves it when they no longer do. */
+        long len = (long)(packed >> 16);
+        int term = term_of_index((int)((packed >> 8) & 0x7f));
+        long need = len > m->reserve ? len : m->reserve;
+        if (m->body != T_STRING) {
+            if (need + term <= EMBED_ROOM) m->as.basic.flags &= ~(VALUE)RSTRING_NOEMBED;
+            else m->as.basic.flags |= RSTRING_NOEMBED;
+        }
+        else {
+            str_adopt(m);
+            string_room(m, need, term, ROOM_EXACT);
+            m->reserve = 0;
+        }
+    }
 }
 
 struct mr_mirror *mr_mirror_of(VALUE obj) {
@@ -161,8 +266,10 @@ static int write_back(struct mr_mirror *m, VALUE obj) {
     mr_transit_save(&saved, -1);
     m->hash = now;
     if (m->body == T_STRING) {
-        if (m->as.string.len < 0 || m->as.string.len > m->capa) mr_fatal("a String's length was set past its capacity");
-        mr_put_bytes(m->as.string.as.heap.ptr, m->as.string.len);
+        str_adopt(m);
+        if (m->as.string.len < 0 || m->as.string.len > str_capacity(m, str_term(m)))
+            mr_fatal("a String's length was set past its capacity");
+        mr_put_bytes(str_ptr(m), m->as.string.len);
         mr_up1(MR_STR_SET, obj);
     }
     else {
@@ -197,26 +304,11 @@ void mr_mirror_forget(VALUE obj) {
     m->body_epoch = 0;
 }
 
-static void string_room(struct mr_mirror *m, long capa) {
-    if (m->as.string.as.heap.ptr && capa <= m->capa) return;
-    long want = m->capa > 0 ? m->capa : 15;
-    while (want < capa) {
-        if (want > LONG_MAX / 2 - 1) { want = capa; break; }
-        want = want * 2 + 1;
-    }
-    /* (four more bytes: the terminator of the widest encoding) */
-    char *p = realloc(m->as.string.as.heap.ptr, (size_t)want + 4);
-    if (!p) rb_memerror();
-    memset(p + m->capa, 0, (size_t)(want - m->capa) + 4);
-    m->as.string.as.heap.ptr = p;
-    m->as.string.as.heap.aux.capa = want;
-    m->capa = want;
-}
-
 void *rb_mere_string(VALUE obj) {
     struct mr_mirror *m = mr_mirror_of(obj);
     if ((m->as.basic.flags & 0x1f) != T_STRING) goto wrong;
     if (m->body == T_STRING && m->body_epoch == mr_epoch) return &m->as.string;
+    if (m->body == T_STRING) str_adopt(m);
     /* What C wrote through a pointer it kept across a call is not lost to
      * the fetch: it goes back first, and is then what the interpreter has. */
     if (m->body == T_STRING && write_back(m, obj)) {
@@ -226,18 +318,25 @@ void *rb_mere_string(VALUE obj) {
     }
     mr_up1(MR_STR_GET, obj);
     const mere_bytes *b = mr_got_bytes();
+    long len = (long)b->len;
+    int term = str_term(m);
     /* The buffer is the String as far as C can tell, also past its length:
      * what C wrote there (to reveal with rb_str_set_len later) stays, and
      * so does everything when the interpreter has the very bytes the
      * buffer holds. Only a String that changed is copied in, and ends in
-     * its encoding's terminator. */
-    if (!(m->body == T_STRING && m->as.string.as.heap.ptr && m->as.string.len == (long)b->len
-          && !memcmp(m->as.string.as.heap.ptr, b->data, (size_t)b->len))) {
-        string_room(m, (long)b->len);
-        memcpy(m->as.string.as.heap.ptr, b->data, (size_t)b->len);
-        memset(m->as.string.as.heap.ptr + b->len, 0, (size_t)mr_string_terminator(obj));
+     * its encoding's terminator. A new buffer is as long as the String, or
+     * as the room the interpreter asked for (String.new(capacity:)). */
+    if (m->body != T_STRING && !str_embedded(m)) {
+        m->as.string.as.heap.ptr = NULL;
+        m->as.string.as.heap.aux.capa = 0;
     }
-    m->as.string.len = (long)b->len;
+    string_room(m, len > m->reserve ? len : m->reserve, term, ROOM_EXACT);
+    m->reserve = 0;
+    if (!(m->body == T_STRING && m->as.string.len == len && !memcmp(str_ptr(m), b->data, (size_t)len))) {
+        memcpy(str_ptr(m), b->data, (size_t)len);
+        memset(str_ptr(m) + len, 0, (size_t)term);
+    }
+    m->as.string.len = len;
     m->body = T_STRING;
     m->hash = body_hash(m);
     m->body_epoch = mr_epoch;
@@ -352,13 +451,94 @@ int mr_string_terminator(VALUE str) {
     int n = mr_encoding_unit(str);
     return n > 1 && n <= 4 ? n : 1;
 }
-long mr_string_capacity(VALUE str) {
+static struct mr_mirror *string_body(VALUE str) {
     rb_mere_string(str);
-    return mirror_at(MR_NUMBER(str), 1)->capa;
+    struct mr_mirror *m = mirror_at(MR_NUMBER(str), 1);
+    str_adopt(m);
+    return m;
 }
+/* rb_str_capacity: what the buffer holds before the terminator -- the
+ * struct's own room when the bytes are in it. */
+long mr_string_capacity(VALUE str) {
+    struct mr_mirror *m = string_body(str);
+    return str_capacity(m, str_term(m));
+}
+/* string.c's RESIZE_CAPA_TERM (rb_str_modify_expand, rb_str_buf_new): a
+ * buffer of exactly `capa` bytes -- also a shorter one than there was -- and
+ * the struct's own room while they fit in it. */
 void mr_string_reserve(VALUE str, long capa) {
-    rb_mere_string(str);
-    string_room(mirror_at(MR_NUMBER(str), 1), capa);
+    struct mr_mirror *m = string_body(str);
+    int term = str_term(m);
+    if (!str_embedded(m) && m->own && m->as.string.as.heap.ptr == m->own
+        && capa >= m->as.string.len && capa != m->as.string.as.heap.aux.capa) {
+        char *p = realloc(m->own, (size_t)capa + 4);
+        if (!p) rb_memerror();
+        memset(p + capa, 0, 4);
+        m->own = p;
+        m->own_size = capa + 4;
+        m->as.string.as.heap.ptr = p;
+        m->as.string.as.heap.aux.capa = capa;
+        return;
+    }
+    string_room(m, capa, term, ROOM_EXACT);
+}
+/* Room for `total` bytes, grown as str_buf_cat grows it (rb_str_cat). */
+void mr_string_grow(VALUE str, long total) {
+    struct mr_mirror *m = string_body(str);
+    string_room(m, total, str_term(m), ROOM_GROW);
+}
+/* rb_str_resize: the length, and the buffer string.c would leave -- the
+ * bytes back in the struct when they fit there again, the buffer cut down
+ * to the length when it is longer than the length by more than the length
+ * (or 1 KB). */
+void mr_string_resize(VALUE str, long len) {
+    struct mr_mirror *m = string_body(str);
+    int term = str_term(m);
+    long slen = m->as.string.len;
+    if (str_embedded(m)) {
+        if (len == slen) return;
+        string_room(m, len, term, ROOM_EXACT);
+    }
+    else if (len + term <= EMBED_ROOM) {
+        char *p = m->as.string.as.heap.ptr;
+        long keep = slen < len ? slen : len;
+        char *ary = embed_ary(m);
+        if (keep > 0 && p) memmove(ary, p, (size_t)keep);
+        free(m->own);
+        m->own = NULL;
+        m->own_size = 0;
+        m->as.basic.flags &= ~(VALUE)RSTRING_NOEMBED;
+    }
+    else {
+        long capa = m->as.string.as.heap.aux.capa;
+        if (capa < len || capa - len > (len < 1024 ? len : 1024)) {
+            if (m->as.string.as.heap.ptr == m->own) {
+                char *p = realloc(m->own, (size_t)len + 4);
+                if (!p) rb_memerror();
+                m->own = p;
+                m->own_size = len + 4;
+                m->as.string.as.heap.ptr = p;
+                m->as.string.as.heap.aux.capa = len;
+            }
+            else string_room(m, len, term, ROOM_EXACT);
+        }
+        else if (len == slen) return;
+    }
+    m->as.string.len = len;
+    memset(str_ptr(m) + len, 0, (size_t)term);
+}
+
+/* From the interpreter: the String whose handle has this number is to have
+ * room for `capa` bytes -- String.new(capacity:), a read into a buffer
+ * (io.c's io_setstrbuf). The buffer is made exactly that long the next time
+ * C looks at the String, when its length is known; the interpreter's own
+ * String has no buffer to make longer. */
+int mr_capi_reserve(int number, CapiWord capa) {
+    struct mr_mirror *m = mirror_at(number, 1);
+    long n = (long)capa.mu_w;
+    if (n > m->reserve) m->reserve = n;
+    m->head_epoch = 0;
+    return 0;
 }
 
 /* ---- data objects ---------------------------------------------------------- */
@@ -440,7 +620,7 @@ int mr_capi_release(int number) {
             }
     }
     free(m->io);
-    if (m->body == T_STRING) free(m->as.string.as.heap.ptr);
+    if (m->body == T_STRING) { str_adopt(m); free(m->own); }
     if (m->body == T_ARRAY) free((void *)m->as.array.as.heap.ptr);
     int ran = 0;
     if (m->data && mr_without("dfree")) { free(m); return 0; }

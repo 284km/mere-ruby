@@ -46,7 +46,11 @@ entry: what C got once it gets again while the entry lives.
 The number is not an address. When C asks for a struct (`RSTRING(str)`,
 `RBASIC(obj)->flags`), it gets a **mirror**: a C struct made the first time
 it is asked for, filled from the Ruby value, and kept with the entry. A
-String's mirror has its bytes, a NUL after them, and its capacity; an
+String's mirror has its bytes, a NUL after them, and its capacity -- the
+bytes in the struct itself (`RSTRING_NOEMBED` clear) while they and the
+terminator fit in its 16 bytes, CRuby's smallest slot, and in a buffer as
+long as the String otherwise, or as the room asked for
+(`rb_str_modify_expand`, `String.new(capacity:)`, a read into a buffer); an
 Array's has its elements as VALUEs. Mirrors are refreshed when control
 comes back to C from the interpreter and the value has changed, and what C
 wrote into one (`RSTRING_PTR(str)[0] = 'x'`, `rb_str_set_len`,
@@ -194,8 +198,10 @@ asked of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
   behind `RFILE` is there, filled from the IO; its buffers are not), the
   fiber scheduler hooks, `rb_econv_*`, `rb_reg_*` and Ractor.
 - Internals a test may read and this has no equivalent of: a String's
-  embedded / shared state and capacity classes, coderange caching, a Hash's
-  `st_table` (`rb_hash_tbl`), a Rational that is not in lowest terms.
+  shared state, the larger slots CRuby embeds a String in (the mirror has
+  one, 16 bytes; `GC::INTERNAL_CONSTANTS` describes no slot heap here, so
+  the tests that compute sizes from it stop at nil), coderange caching, a
+  Hash's `st_table` (`rb_hash_tbl`), a Rational that is not in lowest terms.
 
 ## How it is checked
 

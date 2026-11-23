@@ -211,6 +211,48 @@ static VALUE set_parse_depth(VALUE self, VALUE depth) {
 }
 
 static VALUE ospath(VALUE self, VALUE path) { (void)self; return rb_str_encode_ospath(path); }
+/* Where a String's bytes are -- in the struct while they fit there, in a
+ * buffer of their own after -- is CRuby's business, and nothing C does
+ * through the API may see it change under it. */
+static VALUE capacity(VALUE self, VALUE str) { (void)self; return LONG2NUM((long)rb_str_capacity(str)); }
+/* the String grows in Ruby between two looks from C */
+static VALUE grown_by_ruby(VALUE self, VALUE str, VALUE more) {
+    char first = RSTRING_PTR(str)[0];
+    (void)self;
+    rb_funcall(str, rb_intern("<<"), 1, more);
+    return rb_ary_new3(2, INT2FIX(first), rb_str_new(RSTRING_PTR(str), RSTRING_LEN(str)));
+}
+/* rb_str_cat of the String's own bytes, out of the struct into a buffer */
+static VALUE cat_self(VALUE self, VALUE str, VALUE times) {
+    (void)self;
+    for (int i = 0; i < NUM2INT(times); i++) rb_str_cat(str, RSTRING_PTR(str), RSTRING_LEN(str));
+    return str;
+}
+/* a buffer from rb_str_buf_new, filled through the pointer */
+static VALUE buf_fill(VALUE self, VALUE n) {
+    long len = NUM2LONG(n);
+    VALUE s = rb_str_buf_new(len);
+    (void)self;
+    long capa = (long)rb_str_capacity(s);
+    memset(RSTRING_PTR(s), 'z', (size_t)len);
+    rb_str_set_len(s, len);
+    return rb_ary_new3(2, capa >= len ? Qtrue : Qfalse, s);
+}
+/* rb_str_modify_expand: room for exactly that much more */
+static VALUE expand_room(VALUE self, VALUE str, VALUE n) {
+    (void)self;
+    rb_str_modify_expand(str, NUM2LONG(n));
+    return LONG2NUM((long)rb_str_capacity(str) - RSTRING_LEN(str));
+}
+/* rb_str_resize out to a buffer and back into the struct */
+static VALUE resize_out_and_back(VALUE self, VALUE str) {
+    (void)self;
+    rb_str_resize(str, 200);
+    RSTRING_PTR(str)[199] = 'q';
+    VALUE far = rb_str_new(RSTRING_PTR(str) + 199, 1);
+    rb_str_resize(str, 2);
+    return rb_ary_new3(2, far, str);
+}
 
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
@@ -256,6 +298,12 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "parse_depth", parse_depth, 0);
     rb_define_singleton_method(mod, "set_parse_depth", set_parse_depth, 1);
     rb_define_singleton_method(mod, "ospath", ospath, 1);
+    rb_define_singleton_method(mod, "capacity", capacity, 1);
+    rb_define_singleton_method(mod, "grown_by_ruby", grown_by_ruby, 2);
+    rb_define_singleton_method(mod, "cat_self", cat_self, 2);
+    rb_define_singleton_method(mod, "buf_fill", buf_fill, 1);
+    rb_define_singleton_method(mod, "expand_room", expand_room, 2);
+    rb_define_singleton_method(mod, "resize_out_and_back", resize_out_and_back, 1);
     /* classes under a module under a module, all of them made here: a class
      * C defines is a class by that name like any other */
     VALUE mid = rb_define_module_under(mod, "Mid");

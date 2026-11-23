@@ -11347,3 +11347,57 @@ this Mac; CI is where the four run.)
   check's 2 GiB; run beside another heavy check it hit the limit once
   (MEMORY_LIMIT on the reference side, not mere-ruby's). Run alone it
   passes. The limit stays.
+
+## 2026-11-23: a String's bytes in the struct C sees, and the room in its buffer
+
+Note 553 §7.2's PR-2 (String internals for test/-ext-/string). The mirror
+(capi/mirror.c) now keeps a String the way CRuby does, instead of always in
+a buffer twice as long as needed:
+
+- **In the struct while it fits.** RSTRING_NOEMBED is clear and the bytes
+  are in as.embed.ary when they and the terminator fit in the struct's own
+  16 bytes (sizeof(struct RString) - offsetof(as.embed.ary): CRuby's
+  smallest slot); otherwise as.heap.ptr. C reads the flag before it asks
+  for the bytes (RSTRING_PTR tests it first), so where they are is settled
+  when the head is refreshed: MR_DESCRIBE now carries a String's bytesize
+  (<<16). A String with no bytes fetched yet goes where it fits; one in the
+  struct that Ruby grew past it moves out then; one in a buffer stays there
+  until rb_str_resize brings it back (string.c's rule).
+- **Buffers as long as asked.** A fetched String's buffer is its length
+  (was: 15, 31, 63 ... and zero-filled). rb_str_modify_expand and
+  rb_str_buf_new make exactly the room (RESIZE_CAPA_TERM), rb_str_cat grows
+  2 * capa + termlen (str_buf_cat4), rb_str_resize follows string.c (back
+  into the struct when it fits, cut down when longer than the length by more
+  than min(length, 1 KB)). New room is not cleared, only the terminator's
+  place at its end: test_modify_expand_memory_leak asks for the process's
+  VSZ (416 GiB on macOS) ten times, and the old memset touched every page --
+  the 10 s timeout. Now 0.24 s, VSZ 1.99x (limit 2.5).
+- **The room the interpreter asks for.** `String.new(capacity: n)` and a
+  read into a buffer (File#read / #sysread with a buffer: io.c's
+  io_setstrbuf) call mr_capi_reserve (m_capi.mere's capi_reserve; a new
+  extern, stubbed in m_capi_none.mere): the String's buffer is made that
+  long the next time C looks at it. The interpreter's own String has no
+  buffer to make longer, so nothing is asked while no C has run.
+- **A buffer C puts in as.heap.ptr** (ext/-test-/string's cstr_noembed) is
+  taken over and freed with the struct (the mirror's own was leaked); a
+  pointer moved inside the mirror's buffer (unterminated_substring) keeps it.
+  The length check at write-back reads as.heap.aux.capa, which C may set.
+
+test/-ext-/string: test_s_new_capacity, test_io_read, test_modify_expand
+(both) and test_cstr's test_rb_str_new_frozen_embed pass; no file lost a
+test (all 94 test/-ext- files, against main's binary). capi/check/api.rb:
+10 contracts (a String Ruby grows between two looks from C, rb_str_cat of
+its own bytes out of the struct, rb_str_buf_new, rb_str_modify_expand's
+exact room, rb_str_resize out and back, String.new(capacity:), a read into a
+buffer), the same on both sides. capi/check/spec_expect.tsv re-recorded:
+class_spec 97 -> 103 and gc_spec 20 -> 25 on the mere-ruby side, which
+main's binary already passes (not this change; string_spec stays 291).
+
+Not done, on purpose: the other 15 of the 17 target tests (test_capacity's
+embedded / normal / shared / literal / frozen / fstring / encode_bang,
+test_set_len's 6, test_rb_str_dup's 2) compute their sizes from
+GC::INTERNAL_CONSTANTS (BASE_SLOT_SIZE, RBASIC_SIZE,
+RVARGC_MAX_ALLOCATE_SIZE) or ObjectSpace.dump's slot_size, and stop at nil
+before any C runs. Those describe a slot heap this collector does not have;
+the 2026-11-16 decision (note 545 §2) keeps them empty, and corpus 669 / 711
+check that. Waiting for the owner, as before.
