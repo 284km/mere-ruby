@@ -89,3 +89,22 @@ scheduler's interrupt (an unblock function run by a signal), Bug 14834
   identity table asks #object_id) synced, rebuilding the table st.c was
   walking -- those callbacks hold the sync off. rb_data_define checks with
   Check_Type, as rb_class_new does (struct_spec expects its words).
+
+## Re-review of #170: RHASH_TBL taken out again
+
+The re-review (on e76f3fb7) found the sync itself wrong in two ways: an
+exception C rescues inside a table's hash/compare function or a sync left
+the guard up, so the rest of the call stopped syncing and C's later writes
+were lost; and the cost -- while any table lived, every request walked every
+table, and every request that can write read the Hash back (500 entries:
+1,000 rb_str_new_cstr took 4.3 s; a Bignum or heap Float value made a new
+handle each time, so "unchanged" tables were rebuilt every request). Plus a
+frozen Hash's table made the next unrelated request raise FrozenError.
+
+A copy kept in step at every request is the wrong shape. RHASH_TBL goes
+back to a NotImplementedError naming it (rb_hash_tbl in capi/array.c,
+rb_hash_tbl_raw in capi/st.c, as on main), and capi/hashtbl.c, its roots,
+the mr_up hooks and its contracts are removed from this PR. The next try is
+its own PR: a table whose writes go to the Hash as they happen (an st type
+of its own, or st.c's entry points answered for such a table), not a copy.
+test/-ext-/st/test_update (5) waits for that. This PR now fixes 12 tests.

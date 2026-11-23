@@ -37,7 +37,6 @@ void rb_gc_register_mark_object(VALUE obj) {
     objects[object_count++] = obj;
 }
 extern VALUE mr_errinfo_parked_at(long i);
-extern VALUE mr_hash_tables_root_at(long i);
 int mr_capi_roots(closure_int_int visit) {
     for (long i = 0; i < address_count; i++) {
         VALUE v = *addresses[i];
@@ -47,9 +46,6 @@ int mr_capi_roots(closure_int_int visit) {
     /* (rb_errinfo of each stack not running: capi/core.c) */
     VALUE e;
     for (long i = 0; (e = mr_errinfo_parked_at(i)) != Qundef; i++)
-        if (MR_HANDLE_P(e)) visit.fn(visit.env, (long long)e);
-    /* (what C put in a Hash's st_table: capi/hashtbl.c) */
-    for (long i = 0; (e = mr_hash_tables_root_at(i)) != Qundef; i++)
         if (MR_HANDLE_P(e)) visit.fn(visit.env, (long long)e);
     return 0;
 }
