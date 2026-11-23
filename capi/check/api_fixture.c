@@ -259,8 +259,43 @@ static VALUE slot_swap_yield(VALUE self) {
     rb_yield(Qnil);
     return old;
 }
+/* (a function without the GVL: other Ruby threads run meanwhile; it may
+ *  come back with rb_thread_call_with_gvl; a kill ends a blocking read
+ *  through RUBY_UBF_IO) */
+#include <ruby/thread.h>
+#include <time.h>
+#include <unistd.h>
+static void *nap(void *ms) {
+    struct timespec t = { 0, (long)(*(long *)ms) * 1000000L };
+    nanosleep(&t, NULL);
+    return NULL;
+}
+static VALUE nogvl_nap(VALUE self, VALUE ms) {
+    (void)self;
+    long n = NUM2LONG(ms);
+    rb_thread_call_without_gvl(nap, &n, RUBY_UBF_IO, NULL);
+    return Qtrue;
+}
+static void *push_one(void *ary) { rb_ary_push((VALUE)ary, INT2FIX(1)); return ary; }
+static void *call_back(void *ary) { return rb_thread_call_with_gvl(push_one, ary); }
+static VALUE nogvl_call_back(VALUE self, VALUE ary) {
+    (void)self;
+    return (VALUE)rb_thread_call_without_gvl(call_back, (void *)ary, RUBY_UBF_IO, NULL);
+}
+static void *read_one(void *fd) {
+    char c;
+    return (void *)(long)read(*(int *)fd, &c, 1);
+}
+static VALUE nogvl_read(VALUE self, VALUE fd) {
+    (void)self;
+    int f = NUM2INT(fd);
+    return LONG2NUM((long)rb_thread_call_without_gvl(read_one, &f, RUBY_UBF_IO, NULL));
+}
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
+    rb_define_singleton_method(mod, "nogvl_nap", nogvl_nap, 1);
+    rb_define_singleton_method(mod, "nogvl_call_back", nogvl_call_back, 1);
+    rb_define_singleton_method(mod, "nogvl_read", nogvl_read, 1);
     rb_define_singleton_method(mod, "funcall_public", funcall_public, 2);
     rb_define_singleton_method(mod, "enc_index_of", enc_index_of, 1);
     rb_define_singleton_method(mod, "define_dummy", define_dummy, 1);

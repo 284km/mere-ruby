@@ -538,4 +538,18 @@ paused.resume
 GC.start
 A.noop
 check(paused.resume == 0)
+# (without the GVL: another thread runs while the function naps; the
+#  function can call back into Ruby; a kill ends a blocking read)
+ticks = 0
+ticker = Thread.new { 20.times { ticks += 1; sleep 0.01 } }
+check(A.nogvl_nap(400) == true)
+ticker.join
+check(ticks == 20)
+check(A.nogvl_call_back([]) == [1])
+rd, wr = IO.pipe
+reader = Thread.new { A.nogvl_read(rd.fileno) }
+sleep 0.1
+reader.kill
+check(reader.join(5).equal?(reader))
+rd.close; wr.close
 puts "api contracts: #{$count} passed"
