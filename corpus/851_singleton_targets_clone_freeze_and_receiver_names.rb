@@ -75,3 +75,23 @@ t(:g3) { SC1.singleton_methods(false).sort }
 t(:g4) { Mo.singleton_class.singleton_methods.sort }
 t(:g5) { Object.new.singleton_class.singleton_methods.sort }
 t(:g6) { [Mm.singleton_class.singleton_methods.sort, Mm.singleton_class.singleton_methods(false)] }
+
+# (review of #175) a value's singleton class answers no Module methods; a
+# struct class's inspect is not its to_s; a frozen Proc or Binding refuses a
+# singleton method; clone(freeze:) takes true, false or nil only
+t(:str_sc) { (+"a").singleton_class.singleton_methods.sort }
+t(:arr_sc) { [1].singleton_class.singleton_methods.sort }
+t(:hsh_sc) { {}.singleton_class.singleton_methods.sort }
+t(:prc_sc) { proc {}.singleton_class.singleton_methods.sort }
+t(:bnd_sc) { binding.singleton_class.singleton_methods.sort }
+t(:main_sc) { TOPLEVEL_BINDING.receiver.singleton_class.singleton_methods.sort }
+Sc = Struct.new(:a); def Sc.to_s = "custom"
+t(:sc_ins) { [Sc.inspect, Sc.singleton_methods(false).sort] }
+class Nm < Struct.new(:b); end
+t(:nm) { [Nm.singleton_methods.sort, Nm.singleton_methods(false)] }
+t(:frz_proc) { pr = proc {}.freeze; begin; pr.define_singleton_method(:x) { 1 }; rescue FrozenError => e; [e.class, e.message[/\A[^:]*/]]; end }
+t(:frz_bind) { b = binding.freeze; begin; b.define_singleton_method(:x) { 1 }; rescue FrozenError => e; [e.class, e.message[/\A[^:]*/]]; end }
+t(:cl_s) { "x".clone(freeze: 1) }
+t(:cl_a) { [1].clone(freeze: "y") }
+t(:cl_h) { {}.clone(freeze: :z) }
+t(:cl_nil) { "x".freeze.clone(freeze: nil).frozen? }

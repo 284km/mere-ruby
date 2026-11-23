@@ -15,3 +15,20 @@ Round three of test_ast's speed (#162, now #164) found these while its corpus pr
 7. **A singleton class answered no `singleton_methods`.** In ruby, the singleton class of a class answers `allocate constants nesting used_modules used_refinements`, because its own singleton's ancestors reach `#<Class:Module>` and `#<Class:Class>`. The singleton class of a module answers the four without `allocate`, and an object's answers none. These are added to the full list, not to `singleton_methods(false)`.
 
 **Witness.** corpus 851 covers each, with the neighbouring cases that must not change: an unfrozen `+"w"`, `nil.foo`, a frozen Object, `singleton_methods(false)`, and the hook redefined. On main, 25 of its lines differ from ruby.
+
+## Review of #175: value singleton classes, the struct inspect, frozen Procs, freeze values
+
+The review found one regression and three smaller problems.
+
+- **(7) was a regression for values.** The extra names were added to any singleton class whose inside did not start with a digit. That included the singleton classes of a String, Array, Hash, Proc, Regexp, Binding and main: `(+"a").singleton_class.singleton_methods` gained five names, where ruby says `[:new, :try_convert]`. A value's singleton class is named by its `hng_key` (`str:12`, `prc:3`, `main:0` ...). A single colon is in no constant's name, so `sng_inner_is_value` tells them apart, and only a class's or a module's singleton class gets the names.
+- **(6) changed dispatch.** Defining the singleton `inspect` as a call of `to_s` made `def S.to_s = "custom"` change `S.inspect`. ruby's `rb_struct_s_inspect` reads the class name and calls no method. The method is back to keyword_init structs only. The other struct classes list `:inspect` (and `:new`, which `singleton_methods(false)` was also missing) without a method-table entry. The full list uses `is_struct_obj_cls`, so a subclass of a struct class lists them too.
+- **(2) frozen Procs and Bindings.** A frozen Proc or Binding accepted `define_singleton_method`; ruby says FrozenError. `frz_recv_check` covers them now.
+- **(4) the value of `freeze:`.** `clone(freeze: 1)` on a String, Array or Hash is "unexpected value for freeze: Integer", as ruby's `rb_obj_clone2` says. Proc#clone takes no keyword at all in 4.0, so it is left as it was.
+
+**Noted, not changed** (older than this PR, listed by the review):
+
+- `extend` of a deduplicated string is TypeError in ruby. Here it is FrozenError, and the PR text said FrozenError.
+- `class << s` on a frozen String opens it.
+- `def a.x` on a non-literal string after `-a` is TypeError here, where ruby says FrozenError.
+- The singleton class of a singleton class does not list the five names.
+- For any name but the hook's own, an object's singleton hook still fires before the write.
