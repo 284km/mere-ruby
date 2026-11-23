@@ -3,6 +3,7 @@
  * loaded extensions. See mr_capi.h for the shape of the whole. */
 #include "mr_capi.h"
 #include <dlfcn.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,10 +56,32 @@ static void words_need(long n) {
     memset(words + words_cap, 0, sizeof(VALUE) * (size_t)(cap - words_cap));
     words_cap = cap;
 }
+extern long mr_vbig_live;
+extern VALUE mr_vbig_out(VALUE v);
+extern void mr_vbig_leave(const void *frame, int outermost);
+extern void mr_vbig_park(int stack, const VALUE *lo, const VALUE *hi);
+extern void mr_vbig_unpark(int stack);
 void mr_put_words(long n, const VALUE *v) {
+    /* (a raw Bignum bignum.c made is the Integer it says, past this point:
+     *  capi/bignum_cruby.c. Converted BEFORE the words are set: making the
+     *  Integer is an up-call, which keeps and puts back what is in transit
+     *  -- through here.) */
+    VALUE *converted = NULL;
+    if (mr_vbig_live)
+        for (long i = 0; i < n; i++) {
+            VALUE w = mr_vbig_out(v[i]);
+            if (w != v[i] && !converted) {
+                converted = malloc(sizeof(VALUE) * (size_t)n);
+                if (!converted) mr_fatal("out of memory");
+                memcpy(converted, v, sizeof(VALUE) * (size_t)n);
+            }
+            if (converted) converted[i] = w;
+        }
+    if (converted) v = converted;
     words_need(n);
     if (n > 0) memcpy(words, v, sizeof(VALUE) * (size_t)n);
     words_put = n;
+    free(converted);
 }
 VALUE mr_word(long i) { return i >= 0 && i < words_cap ? words[i] : Qnil; }
 CapiWord mr_capi_get(int i) {
@@ -162,6 +185,9 @@ static int reads_only(int op) {
 VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
     struct mr_frame *frame = cur;
     if (!frame) mr_fatal("called with no call from the interpreter in progress (a C thread of its own?)");
+    if (mr_vbig_live) {
+        a = mr_vbig_out(a); b = mr_vbig_out(b); c = mr_vbig_out(c); d = mr_vbig_out(d); e = mr_vbig_out(e);
+    }
     if (!reads_only(op) && op != MR_STR_SET && op != MR_ARY_SET) mr_mirrors_flush();
     CapiReq request = { op, (long long)a, (long long)b, (long long)c, (long long)d, (long long)e };
     stats[ST_UP]++;
@@ -526,6 +552,7 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
     last.prev = NULL;
     frame.guard = &last;
     if (RUBY_SETJMP(last.jump) == 0) {
+        if (!raised) result = mr_vbig_out(result);
         mr_mirrors_flush();
     }
     else if (!raised) {
@@ -536,6 +563,9 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
      *  clears ec->errinfo: one a C handler re-raised is not left behind) */
     if (raised) c_errinfo = Qnil;
     mr_mirrors_leave(&frame, frame.prev == NULL);
+    /* (no C call left on this stack; what a Fiber's parked one has was read
+     *  off it when it paused: mr_vbig_park) */
+    mr_vbig_leave(&frame, frame.prev == NULL);
     cur = frame.prev;
     depth--;
     mr_epoch++;
@@ -653,6 +683,14 @@ int mr_capi_stack_end(int stack) { errinfo_drop(stack); return 0; }
 struct mr_parked { int stack; struct mr_frame *frame; int depth; };
 static struct mr_parked *parked;
 static long parked_count, parked_cap;
+/* (the raw Bignums the C frames of the stack being left still have, from
+ *  here -- below this function's caller, whose saved registers are on the
+ *  stack by now -- up to its outermost C call) */
+static __attribute__((noinline)) void park_bignums(int stack, const void *hi) {
+    volatile VALUE here = 0;
+    mr_vbig_park(stack, (const VALUE *)(const void *)&here, (const VALUE *)hi);
+    (void)here;
+}
 int mr_capi_switch(int from, int to) {
     if (mr_without("switch")) return 0;
     errinfo_switch(from, to);
@@ -666,6 +704,16 @@ int mr_capi_switch(int from, int to) {
         parked[parked_count].frame = cur;
         parked[parked_count].depth = depth;
         parked_count++;
+        /* (registers too: a C local may live in a callee-saved one --
+         *  spilled here, as setjmp alone may store some mangled: glibc's
+         *  x86_64 keeps rbp so) */
+        __builtin_unwind_init();
+        jmp_buf regs;
+        if (setjmp(regs) == 0) {
+            struct mr_frame *outer = cur;
+            while (outer->prev) outer = outer->prev;
+            park_bignums(from, outer + 1);
+        }
         cur = NULL;
         depth = 0;
     }
@@ -674,6 +722,7 @@ int mr_capi_switch(int from, int to) {
             cur = parked[i].frame;
             depth = parked[i].depth;
             parked[i] = parked[--parked_count];
+            mr_vbig_unpark(to);
             break;
         }
     }

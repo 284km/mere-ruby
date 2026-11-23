@@ -1,0 +1,518 @@
+/* CRuby's own bignum.c (capi/vendor), compiled as it is: the multiplication,
+ * division and radix conversion algorithms an extension can name
+ * (rb_big_mul_karatsuba, rb_big_mul_toom3, rb_big2str_generic, ...) run as
+ * CRuby runs them.
+ *
+ * bignum.c works on struct RBignum: it makes one with NEWOBJ_OF and turns
+ * the pointer into its VALUE (`bigv = (VALUE)big`), and reads one through a
+ * cast (RBIGNUM). A handle is no address, so a Bignum it makes is a C struct
+ * of its own -- a RAW Bignum, whose VALUE is the struct's address:
+ *
+ *   - made by NEWOBJ_OF (capi/standin/internal/gc.h) and listed here, with
+ *     the C call that made it;
+ *   - RBASIC() answers the struct itself (rb_mere_basic, mirror.c), so its
+ *     type, sign and length are read as bignum.c writes them;
+ *   - where it reaches the interpreter -- an argument of an up-call, a word
+ *     of the transit buffer, what the C call returns (core.c) -- it becomes
+ *     the Integer its digits say (mr_vbig_out);
+ *   - it is freed when the C call that made it ends, unless it is kept for
+ *     good: bignum.c's power cache (rb_vm_register_global_object), or what C
+ *     keeps the public ways -- rb_gc_register_mark_object, or rb_gc_mark
+ *     from a dmark (kept for good from then on, even after its data object
+ *     is gone: a leak, the rarer case) -- or for as long as a registered
+ *     address (rb_gc_register_address, rb_global_variable) holds it: checked
+ *     when a C call ends and no other is in progress on its stack (a C
+ *     local of an outer call may have taken it out of the slot), so an
+ *     overwritten static slot lets the old one go. One the C frames of a
+ *     Fiber paused inside C have (its stack is read when it pauses) stays
+ *     until that Fiber resumes (mr_vbig_park). One C only stores in a struct, which no
+ *     collection marks before the call ends, is freed with the call:
+ *     register it.
+ *
+ * The other way, an Integer the interpreter has is a handle (or a Fixnum),
+ * which bignum.c cannot read: the entry points below hand it a raw Bignum
+ * with the same digits (mr_vbig_in).
+ *
+ * Every function bignum.c defines is renamed (mr_vbig_*), before any header,
+ * so that it calls its own and nothing else in this C API is replaced. Only
+ * the algorithms by name are given under ruby's names, below; the C API's
+ * own Integer functions (capi/numeric.c, capi/bignum.c) are unchanged. */
+#define RUBY_EXPORT 1
+#define Init_Bignum mr_vbig_Init_Bignum
+#define rb_absint_numwords mr_vbig_rb_absint_numwords
+#define rb_absint_singlebit_p mr_vbig_rb_absint_singlebit_p
+#define rb_absint_size mr_vbig_rb_absint_size
+#define rb_big_2comp mr_vbig_rb_big_2comp
+#define rb_big_abs mr_vbig_rb_big_abs
+#define rb_big_and mr_vbig_rb_big_and
+#define rb_big_aref mr_vbig_rb_big_aref
+#define rb_big_aref2 mr_vbig_rb_big_aref2
+#define rb_big_bit_length mr_vbig_rb_big_bit_length
+#define rb_big_clone mr_vbig_rb_big_clone
+#define rb_big_cmp mr_vbig_rb_big_cmp
+#define rb_big_comp mr_vbig_rb_big_comp
+#define rb_big_div mr_vbig_rb_big_div
+#define rb_big_divmod mr_vbig_rb_big_divmod
+#define rb_big_divrem_normal mr_vbig_rb_big_divrem_normal
+#define rb_big_eq mr_vbig_rb_big_eq
+#define rb_big_eql mr_vbig_rb_big_eql
+#define rb_big_even_p mr_vbig_rb_big_even_p
+#define rb_big_fdiv mr_vbig_rb_big_fdiv
+#define rb_big_fdiv_double mr_vbig_rb_big_fdiv_double
+#define rb_big_ge mr_vbig_rb_big_ge
+#define rb_big_gt mr_vbig_rb_big_gt
+#define rb_big_hash mr_vbig_rb_big_hash
+#define rb_big_idiv mr_vbig_rb_big_idiv
+#define rb_big_isqrt mr_vbig_rb_big_isqrt
+#define rb_big_le mr_vbig_rb_big_le
+#define rb_big_lshift mr_vbig_rb_big_lshift
+#define rb_big_lt mr_vbig_rb_big_lt
+#define rb_big_minus mr_vbig_rb_big_minus
+#define rb_big_modulo mr_vbig_rb_big_modulo
+#define rb_big_mul mr_vbig_rb_big_mul
+#define rb_big_mul_balance mr_vbig_rb_big_mul_balance
+#define rb_big_mul_karatsuba mr_vbig_rb_big_mul_karatsuba
+#define rb_big_mul_normal mr_vbig_rb_big_mul_normal
+#define rb_big_mul_toom3 mr_vbig_rb_big_mul_toom3
+#define rb_big_new mr_vbig_rb_big_new
+#define rb_big_norm mr_vbig_rb_big_norm
+#define rb_big_odd_p mr_vbig_rb_big_odd_p
+#define rb_big_or mr_vbig_rb_big_or
+#define rb_big_pack mr_vbig_rb_big_pack
+#define rb_big_plus mr_vbig_rb_big_plus
+#define rb_big_pow mr_vbig_rb_big_pow
+#define rb_big_remainder mr_vbig_rb_big_remainder
+#define rb_big_resize mr_vbig_rb_big_resize
+#define rb_big_rshift mr_vbig_rb_big_rshift
+#define rb_big_sign mr_vbig_rb_big_sign
+#define rb_big_size mr_vbig_rb_big_size
+#define rb_big_size_m mr_vbig_rb_big_size_m
+#define rb_big_sq_fast mr_vbig_rb_big_sq_fast
+#define rb_big_uminus mr_vbig_rb_big_uminus
+#define rb_big_unpack mr_vbig_rb_big_unpack
+#define rb_big_xor mr_vbig_rb_big_xor
+#define rb_big2dbl mr_vbig_rb_big2dbl
+#define rb_big2ll mr_vbig_rb_big2ll
+#define rb_big2long mr_vbig_rb_big2long
+#define rb_big2str mr_vbig_rb_big2str
+#define rb_big2str_generic mr_vbig_rb_big2str_generic
+#define rb_big2str_poweroftwo mr_vbig_rb_big2str_poweroftwo
+#define rb_big2ull mr_vbig_rb_big2ull
+#define rb_big2ulong mr_vbig_rb_big2ulong
+#define rb_bigzero_p mr_vbig_rb_bigzero_p
+#define rb_cmpint mr_vbig_rb_cmpint
+#define rb_cstr_to_inum mr_vbig_rb_cstr_to_inum
+#define rb_cstr2inum mr_vbig_rb_cstr2inum
+#define rb_dbl2big mr_vbig_rb_dbl2big
+#define rb_int_parse_cstr mr_vbig_rb_int_parse_cstr
+#define rb_int_powm mr_vbig_rb_int_powm
+#define rb_int128t2big mr_vbig_rb_int128t2big
+#define rb_int2big mr_vbig_rb_int2big
+#define rb_int2inum mr_vbig_rb_int2inum
+#define rb_integer_float_cmp mr_vbig_rb_integer_float_cmp
+#define rb_integer_float_eq mr_vbig_rb_integer_float_eq
+#define rb_integer_pack mr_vbig_rb_integer_pack
+#define rb_integer_unpack mr_vbig_rb_integer_unpack
+#define rb_ll2big mr_vbig_rb_ll2big
+#define rb_ll2inum mr_vbig_rb_ll2inum
+#define rb_str_convert_to_inum mr_vbig_rb_str_convert_to_inum
+#define rb_str_to_inum mr_vbig_rb_str_to_inum
+#define rb_str2big_karatsuba mr_vbig_rb_str2big_karatsuba
+#define rb_str2big_normal mr_vbig_rb_str2big_normal
+#define rb_str2big_poweroftwo mr_vbig_rb_str2big_poweroftwo
+#define rb_str2inum mr_vbig_rb_str2inum
+#define rb_uint128t2big mr_vbig_rb_uint128t2big
+#define rb_uint2big mr_vbig_rb_uint2big
+#define rb_uint2inum mr_vbig_rb_uint2inum
+#define rb_ull2big mr_vbig_rb_ull2big
+#define rb_ull2inum mr_vbig_rb_ull2inum
+#define ruby_digitmap mr_vbig_ruby_digitmap
+#include "mr_capi.h"
+#include <float.h>
+#include <math.h>
+#include "internal/bits.h"
+#include "internal/bignum.h"
+
+struct mr_transit { VALUE *words; long nwords; mere_bytes *bytes; char *text; double dbl; };
+extern void mr_transit_save(struct mr_transit *, long);
+extern void mr_transit_restore(struct mr_transit *);
+extern const void *mr_capi_frame(void);
+
+/* ---- raw Bignums ------------------------------------------------------- */
+struct vbig { VALUE obj; size_t size; const void *owner; };
+struct vlist { struct vbig *at; long count, cap; };
+/* (temporaries, freed when their C call ends; and the ones kept for good,
+ *  apart, so that the end of every C call does not walk them) */
+static struct vlist temps, kept;
+/* (...and those a registered address held when their call ended: kept only
+ *  while one still does -- an overwritten static slot lets go of the old
+ *  one at the end of the next C call, as CRuby's collection would) */
+static struct vlist held;
+long mr_vbig_live;   /* how many there are: 0 is the fast path everywhere */
+
+/* ...and every one's address in an open-addressing set, so the question
+ * every RBASIC() of one asks -- is this a raw Bignum? -- is O(1): bignum.c
+ * reads flags through RBASIC constantly, and one large multiplication makes
+ * many temporaries before its C call ends. (0 is empty, 1 a removed slot.) */
+static VALUE *set_slots;
+static long set_cap, set_used;
+static unsigned long set_hash(VALUE v) { return (unsigned long)((v >> 4) * 0x9E3779B97F4A7C15ULL); }
+static void set_put(VALUE v);
+static void set_grow(void) {
+    VALUE *old = set_slots;
+    long old_cap = set_cap;
+    set_cap = set_cap ? set_cap * 2 : 256;
+    set_slots = calloc((size_t)set_cap, sizeof(VALUE));
+    if (!set_slots) mr_fatal("out of memory");
+    set_used = 0;
+    for (long i = 0; i < old_cap; i++) if (old[i] > 1) set_put(old[i]);
+    free(old);
+}
+static void set_put(VALUE v) {
+    if ((set_used + 1) * 2 > set_cap) set_grow();
+    unsigned long i = set_hash(v) & (unsigned long)(set_cap - 1);
+    while (set_slots[i] > 1) i = (i + 1) & (unsigned long)(set_cap - 1);
+    if (set_slots[i] == 0) set_used++;
+    set_slots[i] = v;
+}
+static int set_has(VALUE v) {
+    if (!set_cap) return 0;
+    unsigned long i = set_hash(v) & (unsigned long)(set_cap - 1);
+    while (set_slots[i] != 0) {
+        if (set_slots[i] == v) return 1;
+        i = (i + 1) & (unsigned long)(set_cap - 1);
+    }
+    return 0;
+}
+static void set_del(VALUE v) {
+    if (!set_cap) return;
+    unsigned long i = set_hash(v) & (unsigned long)(set_cap - 1);
+    while (set_slots[i] != 0) {
+        if (set_slots[i] == v) { set_slots[i] = 1; return; }
+        i = (i + 1) & (unsigned long)(set_cap - 1);
+    }
+}
+
+static struct vbig *find_in(struct vlist *l, VALUE v) {
+    for (long i = l->count - 1; i >= 0; i--) if (l->at[i].obj == v) return &l->at[i];
+    return NULL;
+}
+static struct vbig *find(VALUE v) {
+    if (!set_has(v)) return NULL;
+    struct vbig *b = find_in(&temps, v);
+    if (!b) b = find_in(&held, v);
+    return b ? b : find_in(&kept, v);
+}
+static void push(struct vlist *l, struct vbig b) {
+    if (l->count == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 64;
+        l->at = realloc(l->at, sizeof(*l->at) * (size_t)l->cap);
+        if (!l->at) mr_fatal("out of memory");
+    }
+    l->at[l->count++] = b;
+    mr_vbig_live = temps.count + held.count + kept.count;
+}
+int mr_vbig_raw_p(VALUE v) { return mr_vbig_live && set_has(v); }
+
+VALUE mr_vbig_newobj(VALUE klass, VALUE flags, size_t size) {
+    if (size < sizeof(struct RBignum)) size = sizeof(struct RBignum);
+    struct RBignum *big = calloc(1, size);
+    if (!big) rb_memerror();
+    big->basic.flags = flags;
+    memcpy((void *)&big->basic.klass, &klass, sizeof(VALUE));
+    struct vbig b = { (VALUE)big, size, mr_capi_frame() };
+    push(&temps, b);
+    set_put((VALUE)big);
+    return (VALUE)big;
+}
+bool rb_gc_size_allocatable_p(size_t size) { return size <= 640; }
+size_t rb_gc_obj_slot_size(VALUE obj) {
+    struct vbig *b = find(obj);
+    return b ? b->size : sizeof(struct RBignum);
+}
+/* A raw Bignum kept for the life of the process: bignum.c's power cache
+ * (rb_vm_register_global_object), and one C keeps the public ways --
+ * rb_gc_register_mark_object, rb_gc_mark from a dmark (capi/gc.c), or a
+ * registered address holding it when its C call ends (mr_vbig_leave).
+ * Anything else is no raw Bignum, and nothing to do here. */
+void mr_vbig_keep(VALUE obj) {
+    if (!mr_vbig_live || RB_SPECIAL_CONST_P(obj) || MR_HANDLE_P(obj) || !set_has(obj)) return;
+    struct vlist *from = &temps;
+    struct vbig *b = find_in(&temps, obj);
+    if (!b) { from = &held; b = find_in(&held, obj); }
+    if (!b) return;   /* (kept already) */
+    struct vbig copy = *b;
+    *b = from->at[--from->count];
+    push(&kept, copy);
+}
+void rb_vm_register_global_object(VALUE obj) {
+    if (!RB_SPECIAL_CONST_P(obj) && !MR_HANDLE_P(obj) && set_has(obj)) mr_vbig_keep(obj);
+    else rb_gc_register_mark_object(obj);
+}
+static void raw_free(VALUE obj) {
+    if (!BIGNUM_EMBED_P(obj)) ruby_xfree(RBIGNUM(obj)->as.heap.digits);
+    free((void *)obj);
+}
+/* The raw Bignums the registered addresses hold right now: read once per
+ * end of a call, into a set of their own, so that asking about each one is
+ * O(1) -- not a walk of every address per raw Bignum. (Sized from how many
+ * addresses are registered, which is all it can hold -- not from how many
+ * raw Bignums one call once made -- and grown or shrunk to that; 0 is
+ * empty.) */
+extern void mr_gc_each_address_value(void (*visit)(VALUE));
+extern long mr_gc_address_count(void);
+static VALUE *holder_slots;
+static long holder_cap;
+static void holder_put(VALUE v) {
+    if (RB_SPECIAL_CONST_P(v) || MR_HANDLE_P(v) || !set_has(v)) return;
+    unsigned long i = set_hash(v) & (unsigned long)(holder_cap - 1);
+    while (holder_slots[i] != 0 && holder_slots[i] != v) i = (i + 1) & (unsigned long)(holder_cap - 1);
+    holder_slots[i] = v;
+}
+static void holders_read(void) {
+    long want = 16, addresses = mr_gc_address_count();
+    while (want < addresses * 2) want *= 2;
+    if (want > holder_cap || want * 4 < holder_cap) {
+        free(holder_slots);
+        holder_slots = calloc((size_t)want, sizeof(VALUE));
+        if (!holder_slots) mr_fatal("out of memory");
+        holder_cap = want;
+    }
+    else memset(holder_slots, 0, sizeof(VALUE) * (size_t)holder_cap);
+    mr_gc_each_address_value(holder_put);
+}
+static int held_by_address(VALUE v) {
+    unsigned long i = set_hash(v) & (unsigned long)(holder_cap - 1);
+    while (holder_slots[i] != 0) {
+        if (holder_slots[i] == v) return 1;
+        i = (i + 1) & (unsigned long)(holder_cap - 1);
+    }
+    return 0;
+}
+/* The C call `frame` ends: the raw Bignums it made are gone (whatever of
+ * them reached the interpreter is an Integer there by now), but for the
+ * ones a registered address holds. Those are looked at again only when
+ * `outermost` -- no C call left on this stack -- so no C local here can
+ * still have one. (A nested call's end must not free what its caller took
+ * out of a slot into a local: CRuby's collection sees the C stack.)
+ *
+ * A Fiber's stack paused inside C (a parked chain, core.c) has C locals
+ * too: what they have is read off that stack when it pauses (mr_vbig_park)
+ * and stays, held or not, until it resumes -- as CRuby's collection marks a
+ * suspended Fiber's stack. */
+static int pinned_p(VALUE v);
+struct pinned_stack { int stack; VALUE *at; long count; };
+static struct pinned_stack *pinned;
+static long pinned_count, pinned_cap;
+void mr_vbig_leave(const void *frame, int outermost) {
+    int own = 0;
+    for (long i = 0; i < temps.count && !own; i++) own = temps.at[i].owner == frame;
+    if (!own && !(outermost && held.count)) return;
+    holders_read();
+    /* the call's own temporaries: freed, or held while an address holds them */
+    long left = 0, n = temps.count;
+    for (long i = 0; i < n; i++) {
+        struct vbig b = temps.at[i];
+        if (b.owner != frame) { temps.at[left++] = b; continue; }
+        if (held_by_address(b.obj) || pinned_p(b.obj)) { push(&held, b); continue; }
+        raw_free(b.obj);   /* (reads its flags through RBASIC: still a member) */
+        set_del(b.obj);
+    }
+    temps.count = left;
+    /* ...and the held ones no registered address holds any more */
+    if (outermost) {
+        long kept_held = 0;
+        for (long i = 0; i < held.count; i++) {
+            struct vbig b = held.at[i];
+            if (held_by_address(b.obj) || pinned_p(b.obj)) { held.at[kept_held++] = b; continue; }
+            raw_free(b.obj);
+            set_del(b.obj);
+        }
+        held.count = kept_held;
+    }
+    mr_vbig_live = temps.count + held.count + kept.count;
+}
+
+/* What a stack that pauses inside C (core.c parks its chain of C calls)
+ * still has: the raw Bignums among the words of its C frames, from where
+ * it stops [lo] up to its outermost C call [hi]. Read once, when it pauses
+ * -- nothing on it runs until it resumes -- and kept apart by its number;
+ * let go when it resumes (mr_vbig_unpark). A word that only looks like
+ * one keeps it too, as a conservative scan does. A stack dropped while
+ * paused keeps what it had, and nothing made after. */
+/* (every pinned word is also counted in a set of its own -- value -> how
+ *  many words of paused stacks have it -- so asking is O(1) however many
+ *  stacks are paused; 0 is empty, 1 a removed slot) */
+static VALUE *pin_keys;
+static long *pin_counts;
+static long pin_cap, pin_used;
+static long *pin_slot(VALUE v, int make) {
+    if (make && (pin_used + 1) * 2 > pin_cap) {
+        VALUE *old_keys = pin_keys;
+        long *old_counts = pin_counts;
+        long old_cap = pin_cap;
+        pin_cap = pin_cap ? pin_cap * 2 : 64;
+        pin_keys = calloc((size_t)pin_cap, sizeof(VALUE));
+        pin_counts = calloc((size_t)pin_cap, sizeof(long));
+        if (!pin_keys || !pin_counts) mr_fatal("out of memory");
+        pin_used = 0;
+        for (long i = 0; i < old_cap; i++)
+            if (old_keys[i] > 1) *pin_slot(old_keys[i], 1) = old_counts[i];
+        free(old_keys);
+        free(old_counts);
+    }
+    if (!pin_cap) return NULL;
+    unsigned long i = set_hash(v) & (unsigned long)(pin_cap - 1);
+    long tomb = -1;
+    while (pin_keys[i] != 0) {
+        if (pin_keys[i] == v) return &pin_counts[i];
+        if (pin_keys[i] == 1 && tomb < 0) tomb = (long)i;
+        i = (i + 1) & (unsigned long)(pin_cap - 1);
+    }
+    if (!make) return NULL;
+    if (tomb >= 0) i = (unsigned long)tomb;
+    else pin_used++;
+    pin_keys[i] = v;
+    pin_counts[i] = 0;
+    return &pin_counts[i];
+}
+static void pin_drop(VALUE v) {
+    long *c = pin_slot(v, 0);
+    if (c && --*c <= 0) { pin_keys[c - pin_counts] = 1; *c = 0; }
+}
+void mr_vbig_park(int stack, const VALUE *lo, const VALUE *hi) {
+    /* (what is kept for good needs no reading: only temporaries and held
+     *  ones can go) */
+    if ((!temps.count && !held.count) || lo >= hi) return;
+    VALUE *at = NULL;
+    long n = 0, cap = 0;
+    for (const VALUE *p = lo; p < hi; p++) {
+        VALUE v = *p;
+        if (RB_SPECIAL_CONST_P(v) || MR_HANDLE_P(v) || !set_has(v)) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 8;
+            at = realloc(at, sizeof(*at) * (size_t)cap);
+            if (!at) mr_fatal("out of memory");
+        }
+        at[n++] = v;
+        ++*pin_slot(v, 1);
+    }
+    if (!n) return;
+    if (pinned_count == pinned_cap) {
+        pinned_cap = pinned_cap ? pinned_cap * 2 : 8;
+        pinned = realloc(pinned, sizeof(*pinned) * (size_t)pinned_cap);
+        if (!pinned) mr_fatal("out of memory");
+    }
+    pinned[pinned_count].stack = stack;
+    pinned[pinned_count].at = at;
+    pinned[pinned_count].count = n;
+    pinned_count++;
+}
+void mr_vbig_unpark(int stack) {
+    for (long i = 0; i < pinned_count; i++)
+        if (pinned[i].stack == stack) {
+            for (long j = 0; j < pinned[i].count; j++) pin_drop(pinned[i].at[j]);
+            free(pinned[i].at);
+            pinned[i] = pinned[--pinned_count];
+            return;
+        }
+}
+static int pinned_p(VALUE v) {
+    if (!pinned_count) return 0;
+    long *c = pin_slot(v, 0);
+    return c && *c > 0;
+}
+
+/* A raw Bignum as the Integer its digits say; anything else as it is. */
+VALUE mr_vbig_out(VALUE v) {
+    if (!mr_vbig_live || RB_SPECIAL_CONST_P(v) || MR_HANDLE_P(v) || !find(v)) return v;
+    size_t len = BIGNUM_LEN(v);
+    const BDIGIT *ds = BIGNUM_DIGITS(v);
+    while (len > 0 && ds[len - 1] == 0) len--;
+    char *text = ruby_xmalloc2(len * SIZEOF_BDIGIT * 2 + 3, 1);
+    char *p = text;
+    if (len == 0) { *p++ = '0'; }
+    else {
+        if (BIGNUM_NEGATIVE_P(v)) *p++ = '-';
+        p += sprintf(p, "%llx", (unsigned long long)ds[len - 1]);
+        for (size_t i = len - 1; i > 0; i--)
+            p += sprintf(p, "%0*llx", SIZEOF_BDIGIT * 2, (unsigned long long)ds[i - 1]);
+    }
+    *p = '\0';
+    /* (what the caller has in transit stays: this runs inside its up-call) */
+    struct mr_transit saved;
+    mr_transit_save(&saved, -1);
+    mr_put_text(text);
+    ruby_xfree(text);
+    VALUE made = mr_up1(MR_INT_NEW, (VALUE)16);
+    mr_transit_restore(&saved);
+    return made;
+}
+/* An Integer as a raw Bignum bignum.c can read (a raw one as it is). */
+static VALUE vbig_in(VALUE v) {
+    if (FIXNUM_P(v)) return rb_int2big(FIX2LONG(v));
+    if (!RB_SPECIAL_CONST_P(v) && !MR_HANDLE_P(v)) return v;
+    if (!RB_INTEGER_TYPE_P(v)) rb_raise(rb_eTypeError, "can't convert %"PRIsVALUE" into Bignum", rb_obj_class(v));
+    VALUE hex = rb_funcall(v, rb_intern("to_s"), 1, INT2FIX(16));
+    VALUE big = rb_str_to_inum(hex, 16, TRUE);
+    return FIXNUM_P(big) ? rb_int2big(FIX2LONG(big)) : big;
+}
+
+/* ---- what bignum.c asks of the rest of CRuby, in the public API's terms -- */
+static VALUE int_result(VALUE v) { return RB_INTEGER_TYPE_P(v) && !FIXNUM_P(v) ? vbig_in(v) : v; }
+#define INT_OP2(name, op) VALUE name(VALUE x, VALUE y) { return int_result(rb_funcall(x, rb_intern(op), 1, y)); }
+INT_OP2(rb_int_plus, "+") INT_OP2(rb_int_minus, "-") INT_OP2(rb_int_mul, "*") INT_OP2(rb_int_idiv, "div")
+INT_OP2(rb_int_modulo, "%") INT_OP2(rb_int_pow, "**") INT_OP2(rb_int_and, "&") INT_OP2(rb_int_xor, "^")
+INT_OP2(rb_int_lshift, "<<") INT_OP2(rb_int_rshift, ">>") INT_OP2(rb_int_gt, ">")
+VALUE rb_int_uminus(VALUE x) { return int_result(rb_funcall(x, rb_intern("-@"), 0)); }
+VALUE rb_int_zero_p(VALUE x) { return rb_funcall(x, rb_intern("zero?"), 0); }
+VALUE rb_int_odd_p(VALUE x) { return rb_funcall(x, rb_intern("odd?"), 0); }
+int rb_int_positive_p(VALUE x) { return RTEST(rb_funcall(x, rb_intern(">"), 1, INT2FIX(0))); }
+int rb_int_negative_p(VALUE x) { return RTEST(rb_funcall(x, rb_intern("<"), 1, INT2FIX(0))); }
+VALUE rb_flo_div_flo(VALUE x, VALUE y) { return rb_funcall(x, rb_intern("/"), 1, y); }
+VALUE rb_dbl_complex_new_polar_pi(double abs, double ang) {
+    (void)abs; (void)ang;
+    mr_unsupported("rb_dbl_complex_new_polar_pi (a negative Bignum to a fractional power)");
+}
+/* numeric.c's DEFINE_INT_SQRT for unsigned long, as it is there */
+unsigned long rb_ulong_isqrt(unsigned long n) {
+    if (!(n < (1UL << DBL_MANT_DIG))) {
+        unsigned int b = bit_length(n);
+        unsigned long t;
+        unsigned long x = (unsigned long)(n >> (b/2+1));
+        x |= ((unsigned long)1LU << (b-1)/2);
+        while ((t = n/x) < (unsigned long)x) x = (unsigned long)((x + t) >> 1);
+        return x;
+    }
+    unsigned long x = (unsigned long)sqrt((double)n);
+    if (x * x > n) x--;
+    return x;
+}
+
+#include "vendor/bignum.c"
+
+/* ---- the algorithms by name ---------------------------------------------- */
+#undef rb_big_mul_normal
+VALUE rb_big_mul_normal(VALUE x, VALUE y) { return mr_vbig_rb_big_mul_normal(vbig_in(x), vbig_in(y)); }
+#undef rb_big_mul_balance
+VALUE rb_big_mul_balance(VALUE x, VALUE y) { return mr_vbig_rb_big_mul_balance(vbig_in(x), vbig_in(y)); }
+#undef rb_big_mul_karatsuba
+VALUE rb_big_mul_karatsuba(VALUE x, VALUE y) { return mr_vbig_rb_big_mul_karatsuba(vbig_in(x), vbig_in(y)); }
+#undef rb_big_mul_toom3
+VALUE rb_big_mul_toom3(VALUE x, VALUE y) { return mr_vbig_rb_big_mul_toom3(vbig_in(x), vbig_in(y)); }
+#undef rb_big_divrem_normal
+VALUE rb_big_divrem_normal(VALUE x, VALUE y) { return mr_vbig_rb_big_divrem_normal(vbig_in(x), vbig_in(y)); }
+#undef rb_big_sq_fast
+VALUE rb_big_sq_fast(VALUE x) { return mr_vbig_rb_big_sq_fast(vbig_in(x)); }
+#undef rb_big2str_poweroftwo
+VALUE rb_big2str_poweroftwo(VALUE x, int base) { return mr_vbig_rb_big2str_poweroftwo(vbig_in(x), base); }
+#undef rb_big2str_generic
+VALUE rb_big2str_generic(VALUE x, int base) { return mr_vbig_rb_big2str_generic(vbig_in(x), base); }
+#undef rb_str2big_poweroftwo
+VALUE rb_str2big_poweroftwo(VALUE arg, int base, int badcheck) { return mr_vbig_rb_str2big_poweroftwo(arg, base, badcheck); }
+#undef rb_str2big_normal
+VALUE rb_str2big_normal(VALUE arg, int base, int badcheck) { return mr_vbig_rb_str2big_normal(arg, base, badcheck); }
+#undef rb_str2big_karatsuba
+VALUE rb_str2big_karatsuba(VALUE arg, int base, int badcheck) { return mr_vbig_rb_str2big_karatsuba(arg, base, badcheck); }
+#undef rb_big_new
+VALUE rb_big_new(size_t len, int sign) { return mr_vbig_rb_big_new(len, sign); }
