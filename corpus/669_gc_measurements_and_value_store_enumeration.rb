@@ -44,7 +44,10 @@ unless GC.respond_to?(:compact)
     rescue NotImplementedError
     end
   end
-  raise 'invented slot constants' unless GC::INTERNAL_CONSTANTS.empty?
+  # the slots the String structs C sees are allocated in (capi/mirror.c), as
+  # CRuby's MMTk build reports its own; none in a build with no C side
+  slots = { BASE_SLOT_SIZE: 40, RBASIC_SIZE: 16, RVALUE_OVERHEAD: 0, RVARGC_MAX_ALLOCATE_SIZE: 640, SIZE_POOL_COUNT: 5 }
+  raise 'invented slot constants' unless GC::INTERNAL_CONSTANTS.frozen? && (GC::INTERNAL_CONSTANTS.empty? || GC::INTERNAL_CONSTANTS == slots)
   raise 'invented slot heaps' unless GC.stat_heap.empty?
 end
 
