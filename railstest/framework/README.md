@@ -122,10 +122,11 @@ local paths. Raw logs stay outside the repository.
 - `install-c521aa58.json`: both sides' installation from the archives.
   Reference: 505.6 s, peak 1.86 GB. mere-ruby: 405.3 s, peak 716 MB.
   Both passed, and the twelve components' `lib/` match the tag.
-- `activesupport-4files-c521aa58.json`: OrderedOptions, Concern, Inflector
-  and ClassAttribute, on main `c521aa58` (the run's `source_ref` is this
-  branch's work-in-progress commit, which adds only `railstest/` files on top
-  of it). **539 MATCH / 2 RED / 0 MISSING / 0 BOTH** of 541. The two RED
-  tests are `InflectorTest#test_titleize_mixture_to_title_case_15` and `_21`.
-  This is the same result as the earlier one-off comparison with each side's
-  application gem home.
+- `activesupport-4files-d8f45207.json`: OrderedOptions, Concern, Inflector
+  and ClassAttribute, at this branch's `d8f45207` (main `ab350da1`'s runtime).
+  **539 MATCH / 2 RED / 0 MISSING / 0 UNCONFIRMED / 0 BOTH** of 541. The two
+  RED tests are `InflectorTest#test_titleize_mixture_to_title_case_15` and
+  `_21`. This is the same result as the earlier one-off comparison with each
+  side's application gem home. `inflector_test.rb` is `same_order: false`:
+  the same 473 names run in a different order from the second test on. The
+  other three files run in the same order.
