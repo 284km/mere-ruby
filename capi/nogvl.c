@@ -13,7 +13,10 @@
  *   - When no other Ruby thread is alive (Thread.list has only the caller),
  *     there is nothing to run meanwhile: the function runs right there, on
  *     the interpreter's native thread, as before -- and a signal the
- *     program traps still reaches the unblocking function (inline_call).
+ *     program traps still reaches the unblocking function, or (for
+ *     RUBY_UBF_IO / RUBY_UBF_PROCESS) interrupts its blocking call
+ *     (inline_call). Note that Timeout leaves its own thread alive once it
+ *     has been used, so every later call takes the worker below.
  *   - When other Ruby threads are alive, or the caller said
  *     RB_NOGVL_OFFLOAD_SAFE (rb_nogvl), it runs on a worker native thread,
  *     and the Ruby thread that called it waits for it the way Ruby waits for
@@ -203,6 +206,7 @@ static int drain(struct worker *w, int *call_state) {
  *  runs: the interpreter's handler, which notes it, then the unblocking
  *  function; the trap itself runs when the function has returned) */
 static rb_unblock_function_t *inline_ubf;
+static int inline_running;   /* (a function without the GVL runs right here) */
 static void *inline_ubf_data;
 static struct sigaction inline_previous[NSIG];
 static void inline_handler(int sig, siginfo_t *info, void *context) {
@@ -215,7 +219,12 @@ static void *inline_call(void *(*func)(void *), void *data1, rb_unblock_function
     rb_unblock_function_t *outer = inline_ubf;
     void *outer_data = inline_ubf_data;
     int wrapped[NSIG] = { 0 };
-    if (ubf && ubf != RUBY_UBF_IO && ubf != RUBY_UBF_PROCESS && !outer) {
+    /* (RUBY_UBF_IO / RUBY_UBF_PROCESS ask for the blocking call to be
+     *  interrupted -- CRuby sends the thread a signal for it. Here the
+     *  trapped signals themselves do it: SA_RESTART is taken off while the
+     *  function runs, so its blocking call returns EINTR when one comes,
+     *  as nio4r's select under Ctrl-C needs) */
+    if (ubf && !outer) {
         for (int sig = 1; sig < NSIG; sig++) {
             struct sigaction current;
             if (sig == SIGKILL || sig == SIGSTOP || sigaction(sig, NULL, &current) != 0) continue;
@@ -224,12 +233,15 @@ static void *inline_call(void *(*func)(void *), void *data1, rb_unblock_function
             struct sigaction ours = current;
             ours.sa_sigaction = inline_handler;
             ours.sa_flags |= SA_SIGINFO;
+            ours.sa_flags &= ~SA_RESTART;
             if (sigaction(sig, &ours, NULL) == 0) wrapped[sig] = 1;
         }
     }
     inline_ubf = ubf;
     inline_ubf_data = data2;
+    inline_running++;
     void *result = func(data1);
+    inline_running--;
     inline_ubf = outer;
     inline_ubf_data = outer_data;
     for (int sig = 1; sig < NSIG; sig++) if (wrapped[sig]) sigaction(sig, &inline_previous[sig], NULL);
@@ -245,7 +257,6 @@ static void *without_gvl(void *(*func)(void *), void *data1, rb_unblock_function
     if (running_worker) return func(data1);   /* (from a worker: right there) */
     if (!interp_known) { interp_thread = pthread_self(); interp_known = 1; }
     if (!(flags & RB_NOGVL_OFFLOAD_SAFE) && !others_alive()) return inline_call(func, data1, ubf, data2);
-    if (!interp_known) { interp_thread = pthread_self(); interp_known = 1; }
     install_wake_handler();
     struct worker *w = take_worker();
     pthread_mutex_lock(&w->lock);
@@ -300,7 +311,12 @@ void *rb_thread_call_with_gvl(void *(*func)(void *), void *data1) {
     if (!w) {
         if (interp_known && !pthread_equal(pthread_self(), interp_thread))
             rb_bug("rb_thread_call_with_gvl: called by a native thread that is not Ruby's");
-        return func(data1);
+        /* (from a function run right here: it has the GVL again meanwhile) */
+        int was = inline_running;
+        inline_running = 0;
+        void *result = func(data1);
+        inline_running = was;
+        return result;
     }
     pthread_mutex_lock(&w->lock);
     w->call = func;
@@ -315,4 +331,4 @@ void *rb_thread_call_with_gvl(void *(*func)(void *), void *data1) {
     pthread_mutex_unlock(&w->lock);
     return result;
 }
-int ruby_thread_has_gvl_p(void) { return running_worker == NULL; }
+int ruby_thread_has_gvl_p(void) { return running_worker == NULL && inline_running == 0; }
