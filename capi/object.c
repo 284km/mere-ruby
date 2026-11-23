@@ -226,9 +226,9 @@ VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_callk(obj, "instance_varia
 VALUE rb_ivar_defined(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_defined?", 1, ivar_name(id)); }
 VALUE rb_attr_get(VALUE obj, ID id) { return rb_ivar_get(obj, id); }
 /* A name that is no Symbol is no variable, and asking does not make it one
- * (ruby's rb_check_id_cstr). ⚠ BUT a variable the program assigned is one:
- * ruby's parser made `@a` an ID, and this interpreter notes no identifier as
- * a Symbol -- so a variable that is there is asked for by its own name. */
+ * (ruby's rb_check_id_cstr). (A variable that is there -- set by a name the
+ * lexer never read, instance_variable_set of a dynamic Symbol -- is still
+ * asked for by its own name.) */
 VALUE rb_iv_get(VALUE obj, const char *name) {
     long len = (long)strlen(name);
     ID id = rb_check_id_cstr(name, len, rb_usascii_encoding());

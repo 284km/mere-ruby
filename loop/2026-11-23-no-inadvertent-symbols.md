@@ -11,7 +11,7 @@ VNil a name source wrote (the lexer's sym_note, and the Prism loader's
 literals), false one only #to_sym / #intern made. set_meth / set_fresh_meth
 and const_store pin a dynamic name a method or constant is given, as
 define_method, attr, alias_method and const_set pin it in ruby.
-capi/symbol.c asks the interpreter (request 29, MR_SYM_STATE: 0 none, 1
+capi/symbol.c asks the interpreter (request 31, MR_SYM_STATE: 0 none, 1
 dynamic, 2 pinned) instead of `Symbol.all_symbols.any?`, which built the
 whole list per question -- test_gc_attrset's 1000 noninterned names were
 the timeout. A C table entry knows whether C pinned it (rb_intern*,
@@ -45,4 +45,42 @@ that is no pinned Symbol (Bug #10985).
 
 Not done: identifiers are still not noted as Symbols (`def foo` leaves
 rb_check_id("foo") 0, as before), and instance/class variable writes do
-not pin a dynamic name.
+not pin a dynamic name. (The first is done in the review round below.)
+
+## PR #171 review (work2026-fd)
+
+- **[Major] `"ljust".to_sym` and `"foo".to_sym` after `def foo` made a
+  dynamic Symbol**, so rb_check_id answered 0 where main and ruby answer the
+  ID. A name ruby has as an ID is pinned in sym_all now, from every source
+  ruby's comes from:
+  - the lexer notes every identifier it reads -- method, local, constant,
+    `@ivar`, `@@cvar`, `$global` -- as it notes Symbol literals (ruby's
+    parser makes each an ID, and all_symbols lists them);
+  - set_meth / set_fresh_meth pin every method's name, and const_store
+    every constant's (a `define_method("x")` with a String too);
+  - sym_builtins_ensure puts every builtin method's name (the owner rows,
+    bi_owner_set) into sym_all once, the first time #to_sym meets a new
+    name, MR_SYM_STATE is asked, or all_symbols lists them.
+  Symbol.all_symbols was appended to once per name (quadratic); one pass
+  now, since the table is much larger. capi/check/api.rb: rb_check_id after
+  #to_sym of a builtin's name and of a define_method'd one; a fresh name's
+  #to_sym is found by rb_check_symbol and not rb_check_id, as a String and
+  as the Symbol, until define_method pins it.
+- **[Minor] untrace_var refused globals ruby has.** It answers [] for the
+  special variables (`$_`, `$<`, `$&` ..., `$-w`; `$1` raises, as in
+  ruby), the named ones
+  (`$FILENAME` ...), a global the source only reads (the lexer pins it), and
+  one assigned; it raises for a name that is none of these. Still different:
+  a `:$g` Symbol literal counts as naming the global, where ruby's table
+  does not have it.
+- **[Minor] send by a dynamic Symbol's name** named the Symbol. Only a
+  pinned name keeps the Symbol now: a String or a dynamic Symbol that is not
+  pinned names the String, as rb_check_id gives it back. The method-table
+  and constant-table walks that stood in for "source wrote this identifier"
+  are gone; the lexer's notes answer that.
+- **[Suggestion]** the request number is 31 in the comments and above;
+  `respond_to_answer = fn` spacing.
+
+Known gaps, kept: instance and class variable writes (instance_variable_set
+and the rest) do not pin a dynamic name; dynamic Symbols are never collected
+(sym_all keeps every name #to_sym ever made, as it kept every name before).
