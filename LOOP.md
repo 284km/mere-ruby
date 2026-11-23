@@ -11319,3 +11319,90 @@ corpus/778.
   access part only; six places used the whole string (wait_writable,
   File#truncate, File#chmod, the mmap refusal, the open-with-create check,
   and one more truncate).
+
+## 2026-11-22: json, date, bigdecimal, io-console and prism from their gems, C API and all
+
+Rails' lock pins five default gems newer than the interpreter ships; since
+#128 an activated gem's own extension is the one loaded, so they join
+tools/capi_gem_check.py (now 22 gems, 17 of them with C extensions): each
+prints whether the extension it loaded
+is the gem home's, its VERSION, and a use. Four things stood between them
+and ruby's output.
+
+- **The C API.** io-console asks for `rb_io_get_write_io` (an IO's write
+  half: the duplex one's, else itself), and prism for `ruby_version` and
+  `rb_io_read_pending` (what the stream has buffered: @__io_rbuf). Contracts
+  in capi/check/api.rb: `ruby_version == RUBY_VERSION`, the write IO of a
+  pipe end is itself, nothing pending before a read and five bytes after
+  `getc` from six.
+- **A class or module whose name is no constant's.** io-console does
+  `rb_define_module_under(rb_cIO, "platform_tty")` and prepends it to IO.
+  define_class asked `const_defined?(:platform_tty)`, which raises NameError.
+  ruby keeps it under an ID `constants` and `const_get` do not see, and the
+  module's name is "IO::platform_tty"; here it is kept in a hidden instance
+  variable of the outer one and named with set_temporary_name (which accepts
+  that name because it is not a constant path).
+- **`require 'bigdecimal.so'`**, which the gem's bigdecimal.rb writes. The
+  shipped-native lookup looked for "bigdecimal.so.bundle", and cext_feature
+  did not know "bigdecimal.so" at all, so the gem's extension was never
+  looked for and the shipped 4.0.1 answered. Both now read the name without
+  ".so".
+- **prism.** "prism/prism" was not in cext_feature, so the gem's prism.rb
+  got the shipped feature (libprism 1.8.2) and the gem's serializer refused
+  its output ("Invalid serialization"). With it there, the gem's own
+  extension (2.1.0) loads; without the gem the shipped one still answers.
+
+json and date matched once the gem check reached them.
+
+And the test/mkmf difference note 553 left open (144 of 148 here, 140 on
+CI): the four are mkmf/test_pkg_config.rb, which reads
+`RbConfig::CONFIG["PKG_CONFIG"]`. CI's macOS reference was configured with
+pkg-config and ran them; this RbConfig had no such key, so they were skipped
+(RED). This Mac's reference has "" and skips them too, so here they matched.
+The key is now configure's AC_CHECK_TOOLS answer, asked when RbConfig loads:
+"pkg-config" when one is on PATH, else "". (Not run here -- no pkg-config on
+this Mac; CI is where the four run.)
+
+### PR #157 review
+
+- **[Minor] The hidden module was in `IO.instance_variables`**
+  (`@__capi_hidden_const_platform_tty`, and io-console's generic_readable).
+  A name that is no constant's is now kept on the C side -- capi/hidden.c,
+  a table outer (by identity) -> name -> value, a root of the collector --
+  and nothing Ruby-visible holds it: `IO.instance_variables` is `[]` as in
+  ruby. An anonymous outer names the module by its inspect. (#160's
+  rb_const_set / rb_const_get keep such names in the same table.)
+- **[Minor] PKG_CONFIG follows the running PATH, on purpose**, and the
+  comment now says so: this interpreter builds extensions with the machine's
+  tools, so it can say "pkg-config" where a reference configured before
+  pkg-config was installed says "". File::PATH_SEPARATOR, and a file (not a
+  directory) of that name.
+- **[Suggestion] rb_io_get_write_io's duplex branch.** The write IO is
+  synchronous now, and IO#close / #close_write close it (flushed) before the
+  descriptor goes, as CRuby closes the tied writer. capi/check: on
+  `IO.popen(["cat"], "r+")` the same writer each time, a write reaches the
+  child, closed after `close`. The gem check calls io-console's oflush on
+  such an IO (Errno::ENOTTY on both sides).
+- (re-review) **[Suggestion] the writer after a half-close.** Closing either
+  half unties it, as CRuby does: rb_io_get_write_io answers io itself after
+  close_write or close_read, and close_read closes the writer (CRuby moves
+  the write side into io). capi/check covers both. Left, and said in the
+  comment: the writer does not own the descriptor, so C closing it leaves
+  io writable, where CRuby's says "closed stream".
+- (re-review 2) **[Minor] after close_read, C wrote on the closed read
+  descriptor.** rb_io_get_write_io answered io, and io.fileno was still the
+  read descriptor close_read had closed: io-console's beep wrote "\a" into
+  whatever file got that number next. IO#fileno (and so rb_io_descriptor)
+  answers the write descriptor once the read half is closed, as CRuby's
+  close_read moves the writer in -- from Ruby too, which differed before
+  this PR. capi/check: the number after close_read is the writer's, both
+  from Ruby and from C. The gem check runs oflush and beep after close_read
+  with a file opened in between (Errno::ENOTTY and the IO, on both sides).
+  Also seen by the reviewer, older than this PR and pure Ruby: a popen'd
+  duplex IO with both halves closed was not closed?, and its child was not
+  waited for. close_read / close_write of the last half open closes the IO
+  now, as ruby's does (capi/check: both orders, closed? and $?.pid).
+- (note) The reference ruby's `gem install prism` peaks at 1.93 GB of the
+  check's 2 GiB; run beside another heavy check it hit the limit once
+  (MEMORY_LIMIT on the reference side, not mere-ruby's). Run alone it
+  passes. The limit stays.

@@ -261,6 +261,49 @@ check(A.class_of(SubString.new('x')) == SubString)
 check(A.class_of(SubArray.new([1])) == SubArray)
 check(A.class_of(SubHash.new) == SubHash)
 check(A.class_of('plain') == String && A.class_of([]) == Array && A.class_of({}) == Hash)
+# (what io-console and prism asked for: ruby_version is RUBY_VERSION; the
+#  write IO of a plain IO is itself; nothing is pending before a read, and
+#  what a partial read left buffered is)
+check(A.version_text == RUBY_VERSION)
+pr, pw = IO.pipe
+check(A.write_io_of(pr).equal?(pr) && A.write_io_of(pw).equal?(pw))
+check(A.read_pending(pr) == 0)
+pw.write("abcdef"); pw.close
+check(pr.getc == "a")
+check(A.read_pending(pr) == 5)
+# (a duplex IO's write half: the same one each time, writes reach the child,
+#  and it is closed with the IO -- CRuby's tied writer)
+dio = IO.popen(['cat'], 'r+')
+dw = A.write_io_of(dio)
+check(A.write_io_of(dio).equal?(dw))
+dw.write("duplex\n")
+check(dio.gets == "duplex\n")
+dio.close
+check(dw.closed?)
+# (closing either half unties it: io itself answers, and close_read takes
+#  the writer with it)
+dio = IO.popen(['cat'], 'r+')
+dio.close_write
+check(A.write_io_of(dio).equal?(dio))
+dio.close
+dio = IO.popen(['cat'], 'r+')
+dw = A.write_io_of(dio)
+wfd = A.write_descriptor(dio)
+dio.close_read
+check(dw.closed? && A.write_io_of(dio).equal?(dio))
+# (...and from then on the IO is its write half: its number, and the one C
+#  writes on, is the writer's -- not the read descriptor close_read closed)
+check(dio.fileno == wfd && A.write_descriptor(dio) == wfd)
+dio.close
+# (both halves closed, in either order: the IO is closed, its child waited for)
+[%i[close_read close_write], %i[close_write close_read]].each do |first, second|
+  dio = IO.popen(['cat'], 'r+')
+  pid = dio.pid
+  dio.send(first)
+  dio.send(second)
+  check(dio.closed? && $?.pid == pid)
+end
+pr.close
 check(A.strtoul('  0x1fz', 0) == [31, 6])
 check(A.strtoul('-12', 10) == [2**64 - 12, 3])
 check(A.strtoul('777', 8) == [511, 3])
