@@ -11131,3 +11131,64 @@ What is left is still spread:
 - the frame records (call_names_s, call_lines, call_files_s, fb_env_at).
 - vm_exec's VMR region.
 - arr_len's three tables.
+
+## 2026-11-22 (92): a method's :call after its prologue, and an alias's events (corpus 725 on the VM, corpus 790)
+
+**corpus 725.** A TracePoint can be enabled while a `(a, b)` parameter is being destructured, by the `#to_ary` it calls. Ruby then fires the method's :call at the instruction marked Ca, after the prologue. The VM fired :call only on the way in (run_meth), so it missed it. Now:
+- The loader reads RUBY_EVENT_CALL, which the native export already wrote. When it marks a method's instruction other than the first, that instruction gets a new events bit, 16.
+- When vm_events meets the bit and a TracePoint is on, vm_late_call fires :call. It fires only once a frame ("__tpcall"), and not when the call was already made on the way in (tp_meth_flow keeps the frame: "__tpkeep").
+- vm_late_call builds the event as run_meth does: the name the method was defined as and the one it was called by, its class, and the line and file it was written in.
+- Two readers took `events >= 4` to mean the rescue bit. They now test that bit itself.
+
+**Aliases, on both executions** (found while writing the witness):
+- **A top-level `alias`** copied the method and recorded nothing else. TracePoint's method_id, `__method__` and the :call line all came out as the alias's, and the :return line was the caller's. The top-level SAlias now records the source's name ("Object#" key in alias_srcname, through an alias of an alias) and its lines (copy_meth_src). call_method, the top-level call path, names the frame and the events as run_meth does.
+- **An alias in a class** fired :return on the caller's line: copy_meth_src copied the source's first line and file, but not its end. A destination with no end line of its own now gets the source's. #154's modfunc_promote also uses copy_meth_src; corpus 778 was checked on #154 with this change, on both executions.
+
+Results:
+- Under MERE_RUBY_VM=1: 801 programs, 791 on the VM, 10 fallen back, 0 different. This is the first round with no difference.
+- Corpus 790 covers:
+  - the call fired after the prologue;
+  - a call already made on the way in, not fired twice;
+  - a loop back to the first instruction after the prologue;
+  - an alias in a class and at the top level.
+- On main's build it differs.
+- test_settracefunc, test_alias, test_method, test_proc, test_super and test_iseq give the same counts as main's build on both executions.
+
+## 2026-11-22 (94): the stage-10 REDs recounted, two of test_iseq's fixed (corpus 795)
+
+The REDs the stage-10 close names, on main dc0eeb62 + rounds 92 and 94, the same on both executions:
+
+| file | RED | which |
+|---|---|---|
+| prism/newline_test | 0 | |
+| coverage/test_coverage | 0 | |
+| test_iseq | 3 (5 before this round) | builtin_to_a; invalid_source_no_memory_leak and loading_kwargs_memory_leak (timeouts) |
+| test_optimization | 1 | string_freeze_saves_memory |
+
+**Fixed.**
+- **test_mandatory_only_redef.** `module Kernel; def Float(n)` was a definition a bare `Float(30)` never met. `send(:Float, …)` found it, but ecall_args answered every conversion function with the builtin. A bare call now asks kernel_overridden (Kernel, Object, self's own, main's singleton), as the other Kernel names do. In the prelude it still converts with the builtin: the prelude stands where ruby's C does. Its `Integer(line)` in ISeq.compile met a program's `Object#Integer` on the first try.
+- **test_iseq_builtin_load.** Ruby refuses to load the binary of a sequence that calls a builtin function ("builtin function table is not provided"). ISeq#to_binary now marks such a sequence, one whose ruby disassembly (@__dis) has an invokebuiltin. load_from_binary refuses the mark with that ArgumentError.
+
+Corpus 795 is the witness for both. It differs on main's build.
+
+**Left, and why.**
+- **test_iseq_builtin_to_a** wants the instruction's operand as ruby's C has it: a function pointer and an index into ruby's own table of builtin functions. There is no such table here, and inventing the numbers would be passing the test, not doing what it asks.
+- **The two leak tests** run their body 1,000,000 times inside the 10-second leak child. Here one `ISeq.new(nil)` (a TypeError) takes 23 µs and one `load_from_binary` 36 µs (ruby: about 1 µs). The time is the prelude's Ruby method calls: optional and keyword parameters bound, is_a? / respond_to?, an interpolated message. That is the general cost of a call, 2-4x over what these need, not something to special-case for two tests.
+- **test_string_freeze_saves_memory** asks ObjectSpace.memsize_of for a String's capacity: what readpartial(n, buf) reserved, and the shrink on freeze. memsize_of here is a model of ruby's object layout from the length alone; a capacity would have to be recorded by every read path that fills a buffer (pipe, file, socket).
+
+Results:
+- corpus 802/802; under MERE_RUBY_VM=1, 792 on the VM, 10 fallen back, 0 different.
+- test_integer, test_float, test_rational, test_complex, test_array and test_string give the same counts as main's build.
+
+**Review of #161 (to (92)).** The same mismatch could be reached with a TracePoint that was already on at entry. The VM fired :call on the way in, before the prologue:
+- before a default's own :call / :return;
+- before the destructuring `#to_ary`'s;
+- even for a default that raised, where ruby fires no :call.
+
+Now:
+- The loader notes each method whose RUBY_EVENT_CALL is past its first instruction (vm_late_ids; vm_free and a reload clear the note).
+- run_meth and call_method leave such a method's :call to the VM (vm_body_late).
+- vm_late_call fires it at the marked instruction whether or not the TracePoint was on at entry.
+- A :call fired on the way in marks the frame "__tpcall", so vm_late_call never fires a second one.
+
+All three cases now match ruby on the VM, and corpus 790 covers the first two. The evaluator still fires no :return for the raising default; that was so before #161.
