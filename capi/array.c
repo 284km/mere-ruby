@@ -150,7 +150,7 @@ void rb_hash_foreach(VALUE hash, int (*func)(VALUE, VALUE, VALUE), VALUE arg) {
         else if (r == ST_STOP) break;
     }
 }
-struct st_table *rb_hash_tbl(VALUE hash, const char *file, int line) { (void)hash; (void)file; (void)line; mr_unsupported("rb_hash_tbl (a Hash's st_table)"); }
+/* (rb_hash_tbl: capi/hashtbl.c) */
 VALUE rb_env_clear(void) { return mr_call(mr_const("ENV"), "clear", 0); }
 
 /* ---- Range -------------------------------------------------------------------- */

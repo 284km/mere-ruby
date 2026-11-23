@@ -452,6 +452,8 @@ static VALUE run(const CapiReq *req, long argc, VALUE *argv) {
 }
 
 extern void mr_mirrors_leave(const void *frame, int outermost);
+extern void mr_hash_tables_flush(const void *frame);
+extern void mr_hash_tables_leave(const void *frame);
 
 CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
     struct mr_frame frame;
@@ -505,12 +507,14 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
     frame.guard = &last;
     if (RUBY_SETJMP(last.jump) == 0) {
         mr_mirrors_flush();
+        mr_hash_tables_flush(&frame);
     }
     else if (!raised) {
         raised = 1;
         result = frame.pending;
     }
     mr_mirrors_leave(&frame, frame.prev == NULL);
+    mr_hash_tables_leave(&frame);
     cur = frame.prev;
     depth--;
     mr_epoch++;

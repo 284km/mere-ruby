@@ -11379,6 +11379,16 @@ the first of the PRs that take them down (the plan is note 553 §7).
   links every extension against LIBRUBYARG (mkmf.rb's `LIBRUBY !=
   LIBRUBY_A`; tried, and the import library's stubs then answered C).
 
+- **RHASH_TBL / rb_hash_tbl** (capi/hashtbl.c): C gets an st_table of its
+  own, filled from the Hash (the same objects, the Hash's order, compared by
+  #hash / #eql?, or by identity for compare_by_identity), which st.c's
+  functions read and change. What C changed goes back to the Hash when the
+  C call that asked ends (the Hash then has the table's pairs in its order);
+  asked again in the call, the same table. Ruby code C runs in between sees
+  the Hash as it was: the write-back is at the end of the call. test_update
+  (st_update: insert, keep, delete, replace, the same key and value
+  objects): 5/5.
+
 Looked at and left for the later PRs (note 553 §7): rb_econv_str_append
 (needs the rb_econv_t of an Encoding::Converter, which is no C data here --
 the whole rb_econv_* family together), Bug 3571 (a C method has no frame in

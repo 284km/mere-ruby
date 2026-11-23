@@ -2,16 +2,12 @@
 #define RUBY_EXPORT 1
 #include "vendor/st.c"
 
-/* The two things it asks of a Hash, which only CRuby's Hash (an st_table
- * itself) could answer. */
+/* What it asks of a Hash: a String key frozen as a Hash keeps it (a Hash's
+ * own st_table is capi/hashtbl.c). */
 #include "mr_capi.h"
 VALUE rb_hash_key_str(VALUE key) {
     if (RB_OBJ_FROZEN(key)) return key;
     return rb_str_new_frozen(key);
-}
-st_table *rb_hash_tbl_raw(VALUE hash, const char *file, int line) {
-    (void)hash; (void)file; (void)line;
-    mr_unsupported("a Hash's st_table");
 }
 void ruby_malloc_size_overflow(size_t count, size_t size) {
     rb_raise(rb_eArgError, "malloc: possible integer overflow (%zu*%zu)", count, size);
