@@ -240,7 +240,10 @@ static VALUE ivar_read_unasked(VALUE obj, ID id) {
     if (len > 0 && s[0] == '@') { memcpy(buffer, s, (size_t)len); buffer[len] = 0; }
     else { memcpy(buffer, "@__capi_", 8); memcpy(buffer + 8, s, (size_t)len); buffer[len + 8] = 0; }
     mr_put_text(buffer);
-    return mr_up1(MR_IVAR_READ, obj);
+    VALUE value = mr_up1(MR_IVAR_READ, obj);
+    if (value == Qundef)
+        mr_fatal("a dmark read an instance variable of a T_DATA the interpreter keeps no ivar table for (a Proc, a Binding), with no C call in progress");
+    return value;
 }
 VALUE rb_ivar_get(VALUE obj, ID id) {
     if (mr_capi_mark_unasked()) return ivar_read_unasked(obj, id);
