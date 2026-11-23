@@ -32,12 +32,16 @@
  *     nor the interpreter's is CRuby's [BUG].
  *   - Known: an exception raised while waiting has the wait's own frames
  *     (IO#wait_readable) at the top of its backtrace, where CRuby has the C
- *     method's. */
+ *     method's. The interpreter's native thread is learnt at the first
+ *     without-GVL call: before it, rb_thread_call_with_gvl from a foreign
+ *     native thread is not caught. A call costs IO#wait_readable's own
+ *     turn (about 0.4 ms here, 3.5 us in ruby): that is the scheduler's. */
 #include "mr_capi.h"
 #include "ruby/thread.h"
 #include <pthread.h>
 #include <signal.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
@@ -118,6 +122,10 @@ static struct worker *take_worker(void) {
     struct worker *w = calloc(1, sizeof(*w));
     if (!w) rb_memerror();
     if (pipe(w->fds) != 0) { free(w); rb_sys_fail("pipe"); }
+    /* (a worker lives as long as the process: its pipe is not a child's --
+     *  system / spawn / exec do not inherit it) */
+    fcntl(w->fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(w->fds[1], F_SETFD, FD_CLOEXEC);
     pthread_mutex_init(&w->lock, NULL);
     pthread_cond_init(&w->wake, NULL);
     pthread_attr_t attr;

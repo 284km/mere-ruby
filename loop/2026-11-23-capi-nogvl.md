@@ -46,8 +46,17 @@ calls back with the GVL, and a kill ends a blocking read -- on both sides.
   callback's error, and the next call works.
 - **[Minor] each call made a thread, a pipe and an IO** (0.6 ms): workers
   are kept on an idle list with their pipe and IO (rooted in one Array) and
-  used again; a forked child forgets them (pthread_atfork).
+  used again; a forked child forgets them (pthread_atfork). That removed the
+  thread per call, not the cost: 2,000 empty calls still take about 960 ms
+  (ruby 1 ms), nearly all of it the interpreter's IO#wait_readable on a pipe
+  that is already readable (2,000 of those: 820 ms, ruby 7 ms). That is the
+  scheduler's own cost, for a PR of its own.
 - **[Minor] rb_thread_call_with_gvl from an extension's own native thread**
   ran right there, beside the interpreter: it is CRuby's [BUG] now.
 - Left, and said in capi/nogvl.c: an exception raised while waiting has the
   wait's frames (IO#wait_readable) at the top of its backtrace.
+- (re-review) **[Minor] the workers' pipes had no close-on-exec**: a child
+  of system / spawn inherited 2 descriptors (ruby 0). Both ends are
+  FD_CLOEXEC now. **[Suggestion]** recorded in capi/nogvl.c: before the
+  first without-GVL call, with_gvl from a foreign native thread is not
+  caught.
