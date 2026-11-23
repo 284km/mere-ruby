@@ -552,4 +552,20 @@ sleep 0.1
 reader.kill
 check(reader.join(5).equal?(reader))
 rd.close; wr.close
+# (...a raise that a function cannot be woken for: the other threads still
+#  run until it ends, and then it is raised)
+ticks = 0
+ticker = Thread.new { 30.times { ticks += 1; sleep 0.01 } }
+napper = Thread.new { A.nogvl_stubborn(400) }
+sleep 0.05
+napper.raise(ArgumentError, "stop")
+ended = (napper.value rescue $!.class)
+seen = ticks
+check(ended == ArgumentError)
+check(seen >= 20)
+ticker.join
+# (...and a call back into Ruby that raises: the function ends, the
+#  exception reaches the caller, and the next call works)
+3.times { check((A.nogvl_call_raise rescue $!.message) == "from with_gvl") }
+check(A.nogvl_call_back([]) == [1])
 puts "api contracts: #{$count} passed"

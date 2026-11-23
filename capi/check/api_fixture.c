@@ -265,6 +265,7 @@ static VALUE slot_swap_yield(VALUE self) {
 #include <ruby/thread.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 static void *nap(void *ms) {
     struct timespec t = { 0, (long)(*(long *)ms) * 1000000L };
     nanosleep(&t, NULL);
@@ -282,6 +283,26 @@ static VALUE nogvl_call_back(VALUE self, VALUE ary) {
     (void)self;
     return (VALUE)rb_thread_call_without_gvl(call_back, (void *)ary, RUBY_UBF_IO, NULL);
 }
+/* (a function that does not end for its unblocking function: it naps to the
+ *  end whatever comes) */
+static void *stubborn_nap(void *ms) {
+    struct timespec t = { 0, (long)(*(long *)ms) * 1000000L }, left;
+    while (nanosleep(&t, &left) != 0 && errno == EINTR) t = left;
+    return NULL;
+}
+static VALUE nogvl_stubborn(VALUE self, VALUE ms) {
+    (void)self;
+    long n = NUM2LONG(ms);
+    rb_thread_call_without_gvl(stubborn_nap, &n, NULL, NULL);
+    return Qtrue;
+}
+static void *raise_in_ruby(void *arg) { (void)arg; rb_raise(rb_eRuntimeError, "from with_gvl"); return NULL; }
+static void *call_raising(void *arg) { return rb_thread_call_with_gvl(raise_in_ruby, arg); }
+static VALUE nogvl_call_raise(VALUE self) {
+    (void)self;
+    rb_thread_call_without_gvl(call_raising, NULL, RUBY_UBF_IO, NULL);
+    return Qfalse;
+}
 static void *read_one(void *fd) {
     char c;
     return (void *)(long)read(*(int *)fd, &c, 1);
@@ -296,6 +317,8 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "nogvl_nap", nogvl_nap, 1);
     rb_define_singleton_method(mod, "nogvl_call_back", nogvl_call_back, 1);
     rb_define_singleton_method(mod, "nogvl_read", nogvl_read, 1);
+    rb_define_singleton_method(mod, "nogvl_stubborn", nogvl_stubborn, 1);
+    rb_define_singleton_method(mod, "nogvl_call_raise", nogvl_call_raise, 0);
     rb_define_singleton_method(mod, "funcall_public", funcall_public, 2);
     rb_define_singleton_method(mod, "enc_index_of", enc_index_of, 1);
     rb_define_singleton_method(mod, "define_dummy", define_dummy, 1);

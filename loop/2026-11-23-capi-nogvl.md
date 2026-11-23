@@ -28,3 +28,25 @@ Rails-1's two repros on this build: nio1.rb prints 1; http3.rb (a bare
 Puma::Server and Net::HTTP) prints ["200", "ok"] and stops. capi/check:
 another thread ticks 20 times while the function naps 400 ms, the function
 calls back with the GVL, and a kill ends a blocking read -- on both sides.
+
+## Review of #177 (work2026-fd)
+
+- **[Major] after an exception the wait stopped every thread**: it polled the
+  pipe itself until the function was done. It waits through the scheduler
+  now too -- IO#wait_readable(0.1) under rb_protect, the unblocking function
+  again before each turn -- so the other threads run and a trap still
+  reaches Ruby. capi/check: a function that ignores its unblocking function
+  naps 400 ms; another thread raises into its caller; a ticker has ticked
+  at least 20 of its 30 times by the time the raise arrives (ruby too).
+- **[Major] a raise in rb_thread_call_with_gvl's call leaked the worker and
+  its pipe**: the call runs under rb_protect; the worker gets NULL, the
+  function runs to its end, and the exception goes on from
+  rb_thread_call_without_gvl. capi/check: three such calls raise the
+  callback's error, and the next call works.
+- **[Minor] each call made a thread, a pipe and an IO** (0.6 ms): workers
+  are kept on an idle list with their pipe and IO (rooted in one Array) and
+  used again; a forked child forgets them (pthread_atfork).
+- **[Minor] rb_thread_call_with_gvl from an extension's own native thread**
+  ran right there, beside the interpreter: it is CRuby's [BUG] now.
+- Left, and said in capi/nogvl.c: an exception raised while waiting has the
+  wait's frames (IO#wait_readable) at the top of its backtrace.
