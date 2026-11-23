@@ -11192,3 +11192,71 @@ Now:
 - A :call fired on the way in marks the frame "__tpcall", so vm_late_call never fires a second one.
 
 All three cases now match ruby on the VM, and corpus 790 covers the first two. The evaluator still fires no :return for the raising default; that was so before #161.
+
+## 2026-11-22: module_function on an inherited method, String#encode on a subclass, IO#wait on a dead descriptor, and an inherited SIG_IGN
+
+Four small differences listed in note 553 §6 as the interpreter's own (not
+the C API's), and two met on the way.
+
+**module_function.** `include E; module_function :y` left
+`U.private_instance_methods(false)` empty: the entry was only made private
+where the module already had one. ruby's rb_export_method writes a private
+copy into the module for an inherited one, so modfunc_promote now copies the
+entry (copy_meth_src, and alias_origin set to the module it came from, as
+alias_method records, so the copy's `super` resumes above that module). A
+module's copy that runs out of `super` said "for class U"; ruby says "for
+module U", and an anonymous one by its inspect (`#<Module:0x...>`), where
+this said `AnonModule_1` (super_missing_msg).
+
+**String#encode** on a String subclass's instance answered a String; ruby's
+str_encode duplicates the receiver, so the result is of the subclass. The
+encode arm's result is tagged with the receiver's class (str_keep_sub, the
+hng_store tag dispatch_cls_of reads); encode! answers the receiver itself.
+
+**IO#wait on a descriptor closed behind the stream's back**
+(`IO.for_fd(r.fileno).close`) answered the stream as ready: poll(2) reports
+POLLNVAL, which the bits read as ready. ruby raises Errno::EBADF from wait,
+wait_readable and IO.select. IO.__sel_wait now asks IO.__fd_ok of a
+descriptor that came back ready and raises EBADF for a dead one -- only when
+something came back, so a wait that blocks pays nothing. On the way:
+wait_writable on a read end answered nil where ruby raises "not opened for
+writing", and io/wait still defined `IO#ready?`, which io-wait 0.4 (ruby
+4.0's) removed (ruby: NoMethodError; it answered nil here). The shipped
+io/wait is now a comment, not empty: an empty source is "not shipped" and the
+search would go on to the reference's file.
+
+**A process started with SIGINT ignored** (`cmd &` in a non-interactive
+shell, or `trap '' INT; exec ...`): ruby's install_sighandler keeps an
+inherited SIG_IGN for the signals it handles, so `trap("INT", "DEFAULT")`
+answers "IGNORE" and `Process.kill(:INT, $$)` is dropped. Here it answered
+"DEFAULT" and raised Interrupt -- corpus/394 printed one line more when the
+corpus ran under `&`. signal_inherited_ign asks once per name, the first time
+it matters, with Mere's proc_sig_catch keep rule (an inherited SIG_IGN is put
+back and reported; otherwise the default is given back at once), and
+signal_initial / signal_deliver_self read it.
+
+Not done here: Mere's spawn sets SIGINT/QUIT/TERM/HUP/PIPE to the default in
+the child (POSIX_SPAWN_SETSIGDEF), so after `trap("INT", "IGNORE")` a child
+does not inherit the ignore, where ruby's does. That is Mere's runtime
+(codegen_c's spawn), recorded in KNOWN_GAPS.md.
+
+corpus/778.
+
+### PR #154 review
+
+- **[Major] module_function on an inherited method copied its body.** Ruby's
+  rb_export_method writes a ZSUPER entry -- private, no body, forwarding up
+  the chain when called -- so `module E; def y = :new; end` after
+  `include E; module_function :y` is what an includer of U runs. The entry is
+  now the visibility mark `private :y` on an inherited method writes
+  (vis_marks + set_private): `U.private_instance_methods(false)` lists y,
+  X.new.t answers :new, U.y (the singleton copy) keeps :old. corpus/778 has
+  the redefinition.
+- **[Minor] A singleton-classed String subclass instance encoded into a
+  String.** str_keep_sub walks from the singleton class to its first real
+  class, and carries it unless that is String.
+- **[Minor] `"r:binary"` counted as writable**: the mode test read the
+  encoding after ":" too. IO.__mode_writes? / __mode_creates? test the
+  access part only; six places used the whole string (wait_writable,
+  File#truncate, File#chmod, the mmap refusal, the open-with-create check,
+  and one more truncate).
