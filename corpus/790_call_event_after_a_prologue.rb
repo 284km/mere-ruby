@@ -146,3 +146,23 @@ begin; lambda { |a| }.call; rescue ArgumentError; end
 begin; [1].each { |a, b = bd_boom| }; rescue; end
 raised_tp.disable
 p $raised
+
+# A positional default runs once, and only for an argument not given: a
+# default that gives nil is not run again, and an explicit nil is kept. So a
+# default that yields a Fiber is resumed past, and the block's events follow.
+$dn = 0
+def bd_nil = ($dn += 1; nil)
+[1].each { |a, b = bd_nil| }
+proc { |a, b = bd_nil| }.call(1, nil)
+lambda { |a = bd_nil| }.call
+p $dn
+def bd_fy = Fiber.yield(:paused)
+$fev = []
+fiber_tp = TracePoint.new(:b_call, :b_return) { |t| $fev << [t.event, t.lineno] }
+fb = Fiber.new do
+  [1].each { |a, b = bd_fy| a }; :done end
+fiber_tp.enable
+p fb.resume, fb.resume
+fiber_tp.disable
+p $fev
+
