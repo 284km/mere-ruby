@@ -30,12 +30,13 @@ MAX_JOBS = 2
 SEED = '12345'
 COMPONENTS = ('activesupport', 'activemodel', 'actionview', 'actionpack', 'activejob', 'actionmailer',
               'activerecord', 'railties', 'actioncable', 'activestorage', 'actiontext', 'actionmailbox')
-# A result line is `Class#test_name = 0.01 s = .`. A test that prints to
-# stdout without a newline puts its output in front of it on the same line, so
-# the name starts at the first capital of the line rather than at its start.
-# (Output that itself ends in a capital makes a wrong name: it is then MISSING
-# on one side and EXTRA on the other, never a MATCH.)
-CASE = re.compile(r'([A-Z][\w:]*#\S.*?) = ([0-9.]+) s = ([.FES])$', re.M)
+# A result line is `Class#test_name = 0.01 s = .`, read from the start of the
+# line: a class name may hold spaces (a `describe "..."` block). A test that
+# prints to stdout without a newline puts that output in front of its own
+# result line; the name read then carries the output, so it is MISSING on one
+# side and EXTRA on the other (or both sides print it alike) -- never a MATCH
+# that did not happen.
+CASE = re.compile(r'^(.+?#.+?) = ([0-9.]+) s = ([.FES])$', re.M)
 # The worse of two verdicts for one name, when a transcript reports it twice
 SEVERITY = {'.': 0, 'S': 1, 'F': 2, 'E': 3}
 VERDICTS = ('MATCH', 'RED', 'MISSING', 'UNCONFIRMED', 'BOTH', 'EXTRA')
@@ -255,6 +256,17 @@ def selected_sides(args):
     return sides
 
 
+def check_install_binary(install_record, side, binary_sha, allowed):
+    """The native extensions in a gem home were built by the interpreter that
+    installed them (for mere-ruby, against its C API). A run with another
+    binary would measure that binary on someone else's extensions."""
+    installed_by = install_record['sides'][side].get('binary_sha256')
+    if installed_by != binary_sha and not allowed:
+        raise ValueError(f'{side}: the binary is not the one that installed this gem home ({installed_by}); '
+                         'install again, or pass --other-install-binary to record the difference')
+    return installed_by == binary_sha
+
+
 def check_source(source, data):
     head = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
     if head != data['rails_source_commit']:
@@ -341,7 +353,20 @@ def classify(reference, mere):
     return verdicts
 
 
+def mere_settings(items):
+    """--mere-env: settings for mere-ruby's side only (MERE_RUBY_VM=1 measures
+    the VM instead of the evaluator), checked before anything is made"""
+    settings = {}
+    for item in items:
+        key, sep, value = item.partition('=')
+        if not sep or not key.startswith('MERE_RUBY_'):
+            raise ValueError('--mere-env takes MERE_RUBY_*=value only: ' + item)
+        settings[key] = value
+    return settings
+
+
 def run(args, data):
+    mere_env = mere_settings(args.mere_env)
     shared = shared_settings(args.env)
     source_head = check_source(args.source, data)
     files = select_files(args.source, args.paths)
@@ -349,9 +374,13 @@ def run(args, data):
     supervise = supervisor()
     sides = selected_sides(args)
     install_record = json.loads((args.gems / 'install.json').read_text())
-    for side, _binary in sides:
+    for side, binary in sides:
         if install_record['sides'].get(side, {}).get('dependencies', {}).get('state') != 'PASS':
             raise ValueError(f'{side} has no successful installation in {args.gems}')
+        # The native extensions in a gem home were built by the interpreter
+        # that installed them (for mere-ruby, against its C API). A run with
+        # another binary measures that binary on someone else's extensions.
+        check_install_binary(install_record, side, sha(binary), args.other_install_binary)
     if args.output.exists():
         raise ValueError('--output must not exist; use a fresh directory')
     args.output.mkdir(parents=True)
@@ -372,13 +401,18 @@ def run(args, data):
                   source_ref=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
                   runner_sha256=sha(Path(__file__)), archive_lock_sha256=sha(ROOT / 'archives.lock.json'),
                   binary_sha256=sha(args.binary) if args.binary else None, reference_sha256=sha(args.reference),
-                  seed=SEED, wall_seconds=WALL, family_rss_kib=RSS_KB, jobs=args.jobs, env=shared, files={})
+                  seed=SEED, wall_seconds=WALL, family_rss_kib=RSS_KB, jobs=args.jobs, env=shared,
+                  install_binary_sha256={side: install_record['sides'][side].get('binary_sha256') for side, _b in sides},
+                  files={})
     lock_ = threading.Lock()
+    record['mere_env'] = mere_env
 
     def one(side, binary, name):
         component, relative = name.split('/', 1)
         side_dir = args.gems / side
         env = side_environment(side_dir, stdlib, side == 'mere', shared)
+        if side == 'mere':
+            env.update(mere_env)
         stem = args.output / side / 'logs' / name.replace('/', '__')
         command = [binary, '-w', '-Itest', relative, '-v', '--seed', SEED]
         outcome, stdout, _stderr = capture(command, env, trees[side] / component, stem, supervise)
@@ -509,6 +543,10 @@ def main():
     parser.add_argument('--jobs', type=int, default=MAX_JOBS)
     parser.add_argument('--env', action='append', default=[], metavar='NAME=VALUE',
                         help='run: a setting both sides get alike (repeatable; recorded in the results)')
+    parser.add_argument('--mere-env', action='append', default=[], metavar='MERE_RUBY_X=V',
+                        help='run: a setting for mere-ruby only (repeatable; recorded in the results)')
+    parser.add_argument('--other-install-binary', action='store_true',
+                        help='run: allow a binary other than the one that installed --gems (recorded in the results)')
     parser.add_argument('--base', type=Path)
     parser.add_argument('--new', type=Path)
     args = parser.parse_intermixed_args()
