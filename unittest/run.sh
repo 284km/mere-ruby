@@ -144,6 +144,21 @@ runner='
 # the rows in list order, so how many files ran at once does not show in it.
 if [ "${1:-}" = "--one" ]; then
   work="$2"; n="$3"; rel="$4"
+  # A unit of a split file (splits.tsv) is `<file>@<part>`: the file runs on
+  # both sides with that part's name filter, and the logs and the tag keep
+  # the part in their names. Everything that is about the FILE -- where it
+  # is, its load path, its preloads -- reads the file's own path.
+  unit="$rel"
+  case "$rel" in
+    *@*)
+      part="${rel##*@}"; rel="${rel%@*}"
+      filter="$(awk -F '\t' -v f="$rel" -v p="$part" '$0 !~ /^#/ && $1 == f && $2 == p {print $3}' "$here/splits.tsv")"
+      [ -n "$filter" ] || { echo "unittest: no part $part of $rel in splits.tsv" >&2; exit 1; }
+      set -- -n "$filter" ;;
+    *) set -- ;;
+  esac
+  nf1=""; nf2=""
+  [ "$#" -eq 0 ] || { nf1="$1"; nf2="$2"; }
   # -ext-/... is a real part of CRuby's test tree. Passing it directly to
   # dirname/basename treats the leading hyphen as an option on macOS.
   file="$src/test/$rel"
@@ -203,28 +218,28 @@ if [ "${1:-}" = "--one" ]; then
   # Verbose names are printed before a test runs, without a newline. A warning
   # on stderr can otherwise join the name and create a different test identity.
   # Parse stdout, then append stderr to the saved diagnostic log.
-  (cd "$dir" && select_rake "$ref" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$ref" RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.ref.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$ref" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$ref" RUBY="$ref" RUBYLIB="$ref_lib" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.ref.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.ref.encodings" perl -e "$runner" "$wall" "$ref" "$@" -I "$src/tool/lib" -I "$src/test" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" ${nf1:+"$nf1"} ${nf2:+"$nf2"} -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   ref_code=$?
   printf '%s\n' "$ref_code" > "$work/$n.ref.exit.new"
   mv "$work/$n.ref.exit.new" "$work/$n.ref.exit"
   python3 "$here/transcript.py" parse "$out1" "$ref_code" "$work/$n.ref.json" --encodings "$work/$n.ref.encodings" || exit 1
-  [ -z "${UNITTEST_KEEP:-}" ] || cat "$out1" "$err1" > "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').reference.out"
+  [ -z "${UNITTEST_KEEP:-}" ] || cat "$out1" "$err1" > "$UNITTEST_KEEP/$(printf '%s' "$unit" | sed 's|/|_|g; s|\.rb@|@|; s|\.rb$||').reference.out"
   # Separate files prevent a kill between the phase switch and redirection
   # from reinterpreting reference stdout as mere-ruby stdout.
   out1="$work/$n.mere.stdout"; err1="$work/$n.mere.stderr"
   printf 'mere\n' > "$work/$n.phase.new"
   mv "$work/$n.phase.new" "$work/$n.phase"
-  (cd "$dir" && select_rake "$mr" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr_run" RUBY="$mr_run" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.mere.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr_run" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
+  (cd "$dir" && select_rake "$mr" && PATH="$here/child-bin:$PATH" UNITTEST_CHILD_RUBY="$mr_run" RUBY="$mr_run" UNITTEST_TEST_FILE="$rel" UNITTEST_EXCLUSIONS="$work/$n.mere.excluded" UNITTEST_CASE_ENCODINGS="$work/$n.mere.encodings" RUBYLIB="$mere_lib" perl -e "$runner" "$wall" "$mr_run" -I "$src/tool/lib" -I "$src/test" -I "$shim" -r test/unit -r "$here/bootstrap.rb" -r "$here/case_encodings.rb" "$file" ${nf1:+"$nf1"} ${nf2:+"$nf2"} -v --show-skip --seed="$seed" < /dev/null > "$out1" 2> "$err1")
   mr_code=$?
   printf '%s\n' "$mr_code" > "$work/$n.mere.exit.new"
   mv "$work/$n.mere.exit.new" "$work/$n.mere.exit"
   python3 "$here/transcript.py" parse "$out1" "$mr_code" "$work/$n.mere.json" --encodings "$work/$n.mere.encodings" || exit 1
   # Preserve the old mere-ruby log name and add the reference side beside it.
-  [ -n "${UNITTEST_KEEP:-}" ] && cat "$out1" "$err1" > "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').out"
-  tag="$records/tags/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').txt"
+  [ -n "${UNITTEST_KEEP:-}" ] && cat "$out1" "$err1" > "$UNITTEST_KEEP/$(printf '%s' "$unit" | sed 's|/|_|g; s|\.rb@|@|; s|\.rb$||').out"
+  tag="$records/tags/$(printf '%s' "$unit" | sed 's|/|_|g; s|\.rb@|@|; s|\.rb$||').txt"
   python3 "$here/transcript.py" compare "$work/$n.ref.json" "$work/$n.mere.json" \
-    --file="$rel" "$work/$n" "$tag" || exit 1
-  python3 "$here/exclusions.py" "$work/$n" "$rel" || exit 1
+    --file="$unit" "$work/$n" "$tag" || exit 1
+  python3 "$here/exclusions.py" "$work/$n" "$unit" || exit 1
   [ -s "$tag" ] || rm -f "$tag"
   [ -f "$tag" ] && { strip_noise < "$tag" > "$tag.m" && mv "$tag.m" "$tag"; }
   exit 0

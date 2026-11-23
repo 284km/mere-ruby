@@ -35,6 +35,13 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def log_key(file):
+    """A unit's name in logs and tags: its path with "/" as "_" and without
+    ".rb". A unit of a split file (unittest/splits.tsv) is "<file>@<part>";
+    it keeps the part, so the parts of one file do not overwrite each other."""
+    return re.sub(r'\.rb(@[0-9]+)?$', r'\1', file).replace('/', '_')
+
+
 def save(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,7 +270,7 @@ def recover_cases(work, index, file, phase, limit, records):
         values[side + '_parse_issues'] = parsed['issues']
     counts, tags = transcript.compare(reference, mere)
     values.update(counts)
-    key = file[:-3].replace('/', '_')
+    key = log_key(file)
     transcript.atomic(records / 'tags' / (key + '.txt'), tags)
     return values
 
@@ -422,7 +429,7 @@ def run_shard(args):
                     except Exception as recovery_error:
                         row['recovery_error'] = type(recovery_error).__name__
             finally:
-                key = file[:-3].replace("/", "_")
+                key = log_key(file)
                 try:
                     for side, name in (('ref', key + '.reference.out'), ('mere', key + '.out')):
                         stdout = work / f'{index}.{side}.stdout'

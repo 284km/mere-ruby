@@ -69,7 +69,16 @@ sed 's|^\./||' "$work/files" | sort -u > "$work/sorted"
 if [ "$default" -eq 1 ]; then
   awk '/^-/ {print substr($0,2)}' "$here/files.txt" > "$work/excluded"
   # grep's exit 1 means an empty selection, not an I/O error.
-  awk 'FILENAME==ARGV[1] {excluded[$0]=1; next} !($0 in excluded)' "$work/excluded" "$work/sorted"
+  awk 'FILENAME==ARGV[1] {excluded[$0]=1; next} !($0 in excluded)' "$work/excluded" "$work/sorted" > "$work/selected"
 else
-  cat "$work/sorted"
+  cat "$work/sorted" > "$work/selected"
+fi
+# A file split into units (splits.tsv) is listed as `<file>@<part>`, one line
+# per part in part order, in its place.
+if [ -f "$here/splits.tsv" ]; then
+  awk -F '\t' 'FILENAME==ARGV[1] {if ($0 !~ /^#/ && NF == 3) {n[$1]++; part[$1, n[$1]] = $2}; next}
+       ($0 in n) {for (i = 1; i <= n[$0]; i++) print $0 "@" part[$0, i]; next}
+       {print}' "$here/splits.tsv" "$work/selected"
+else
+  cat "$work/selected"
 fi

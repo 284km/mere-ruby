@@ -20,7 +20,7 @@ class HarnessCheck(unittest.TestCase):
         self.root = Path(self.temp.name)
         for folder in ["unittest", "tools", "mspec", "src/test/ruby/enc", "src/tool/lib", "bin"]:
             (self.root / folder).mkdir(parents=True)
-        for script in ["run.sh", "list.sh", "transcript.py", "case_encodings.rb", "bootstrap.rb", "exclusions.py", "exclusions.rb"]:
+        for script in ["run.sh", "list.sh", "splits.tsv", "transcript.py", "case_encodings.rb", "bootstrap.rb", "exclusions.py", "exclusions.rb"]:
             shutil.copyfile(ROOT / "unittest" / script, self.root / "unittest" / script)
         shutil.copytree(ROOT / 'unittest/child-bin', self.root / 'unittest/child-bin')
         shutil.copyfile(ROOT / "mspec/mask.sh", self.root / "mspec/mask.sh")
@@ -38,6 +38,7 @@ class HarnessCheck(unittest.TestCase):
 case "$*" in *rubylibdir*) printf '/fixture/reference-stdlib'; exit 0 ;; esac
 case "$*" in *'$LOAD_PATH.join'*) printf '/fixture/runtime-stdlib'; exit 0 ;; esac
 case "$*" in *Gem.bin_path*) printf '\\n'; exit 0 ;; esac
+printf '%s\n' "$@" > "$(cd "$(dirname "$0")" && pwd)/$(basename "$0").args"
 preload=0
 script=
 while [ "$#" -gt 0 ]; do
@@ -103,6 +104,36 @@ exit "$(cat "$fixture_root/$side.code")"
         # Listing must work even when no interpreter is installed or built.
         (self.root / "mere-ruby").unlink()
         self.assertEqual(self.run_harness("--list", "--all").returncode, 0)
+
+    def test_split_units_are_listed_and_run_with_their_filter(self):
+        # A file split by unittest/splits.tsv is listed as one unit per part,
+        # and each unit runs the file with its part's name filter on both
+        # sides; logs, tags and the coverage row keep the part.
+        (self.root / 'unittest/splits.tsv').write_text(
+            '# fixture\nruby/test_vm.rb\t1\t/#test_a/\nruby/test_vm.rb\t2\t!/#test_a/\n')
+        listed = self.run_harness('--list', '--all')
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout.splitlines(),
+                         ['ruby/enc/test_encoding.rb', 'ruby/test_ok.rb', 'ruby/test_vm.rb@1', 'ruby/test_vm.rb@2'])
+        work = self.root / 'work'
+        work.mkdir()
+        one = subprocess.run(['sh', str(self.root / 'unittest/run.sh'), str(self.root / 'src'), '--one',
+                              str(work), '1', 'ruby/test_vm.rb@2'],
+                             env=self.env, text=True, capture_output=True, timeout=15)
+        self.assertEqual(one.returncode, 0, one.stderr)
+        for side in ('reference', 'mere-ruby'):
+            args = (self.root / (side + '.args')).read_text().splitlines()
+            self.assertIn(str(self.root / 'src/test/ruby/test_vm.rb'), args)
+            at = args.index('-n')
+            self.assertEqual(args[at + 1], '!/#test_a/')
+        self.assertEqual((work / '1.coverage').read_text().split('\t')[0], 'ruby/test_vm.rb@2')
+        self.assertTrue((self.root / 'raw/ruby_test_vm@2.out').exists())
+        self.assertTrue((self.root / 'raw/ruby_test_vm@2.reference.out').exists())
+        # an unlisted part is refused rather than run unfiltered
+        bad = subprocess.run(['sh', str(self.root / 'unittest/run.sh'), str(self.root / 'src'), '--one',
+                              str(work), '2', 'ruby/test_vm.rb@9'],
+                             env=self.env, text=True, capture_output=True, timeout=15)
+        self.assertNotEqual(bad.returncode, 0)
 
     def test_manifest_without_exclusions(self):
         (self.root / "unittest/files.txt").write_text("ruby\n")
