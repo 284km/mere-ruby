@@ -20,8 +20,11 @@ class HarnessCheck(unittest.TestCase):
         self.root = Path(self.temp.name)
         for folder in ["unittest", "tools", "mspec", "src/test/ruby/enc", "src/tool/lib", "bin"]:
             (self.root / folder).mkdir(parents=True)
-        for script in ["run.sh", "list.sh", "splits.tsv", "transcript.py", "case_encodings.rb", "bootstrap.rb", "exclusions.py", "exclusions.rb"]:
+        for script in ["run.sh", "list.sh", "transcript.py", "case_encodings.rb", "bootstrap.rb", "exclusions.py", "exclusions.rb"]:
             shutil.copyfile(ROOT / "unittest" / script, self.root / "unittest" / script)
+        # (the real table names files this fixture tree does not have; a test
+        #  that splits writes its own)
+        (self.root / "unittest/splits.tsv").write_text("# fixture: no file is split\n")
         shutil.copytree(ROOT / 'unittest/child-bin', self.root / 'unittest/child-bin')
         shutil.copyfile(ROOT / "mspec/mask.sh", self.root / "mspec/mask.sh")
         shutil.copyfile(ROOT / 'tools/runtime_load_path.sh', self.root / 'tools/runtime_load_path.sh')
@@ -129,6 +132,18 @@ exit "$(cat "$fixture_root/$side.code")"
         self.assertEqual((work / '1.coverage').read_text().split('\t')[0], 'ruby/test_vm.rb@2')
         self.assertTrue((self.root / 'raw/ruby_test_vm@2.out').exists())
         self.assertTrue((self.root / 'raw/ruby_test_vm@2.reference.out').exists())
+        # a malformed table is refused, not skipped
+        for table in ('ruby/test_vm.rb\t1\t/#test_a/\n',
+                      'ruby/test_vm.rb\t1\t/#test_a/\nruby/test_vm.rb\t2\t/#test_b/\n',
+                      'ruby/test_vm.rb\t1\t!/#test_a/\nruby/test_vm.rb\t2\t!/#test_b/\n',
+                      'ruby/test_vm.rb\t1\t/#test_a/\nruby/test_vm.rb\t3\t!/#test_a/\n',
+                      'ruby/test_vm.rb\t1\n',
+                      'ruby/test_gone.rb\t1\t/#test_a/\nruby/test_gone.rb\t2\t!/#test_a/\n'):
+            with self.subTest(table=table):
+                (self.root / 'unittest/splits.tsv').write_text(table)
+                self.assertNotEqual(self.run_harness('--list', '--all').returncode, 0)
+        (self.root / 'unittest/splits.tsv').write_text(
+            'ruby/test_vm.rb\t1\t/#test_a/\nruby/test_vm.rb\t2\t!/#test_a/\n')
         # an unlisted part is refused rather than run unfiltered
         bad = subprocess.run(['sh', str(self.root / 'unittest/run.sh'), str(self.root / 'src'), '--one',
                               str(work), '2', 'ruby/test_vm.rb@9'],
