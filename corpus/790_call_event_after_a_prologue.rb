@@ -117,3 +117,18 @@ kw.call
 [BdPair.new].each { |(a, b)| a }
 btp.disable
 $bev.each { |e| p e }
+
+# ...once a call, on both executions: a `for` loop's body (which writes its
+# variable first), a block that writes a local outside it, a lambda with a
+# default doing the same. A binding that raises -- a missing keyword --
+# fires neither :b_call nor :b_return.
+$once = []
+once_tp = TracePoint.new(:b_call, :b_return) { |t| $once << [t.event, t.lineno] }
+n = 0
+once_tp.enable
+for i in [1, 2] do i end
+[1].each { |x, y = bd_dflt| n += 1 }
+lambda { |a = bd_dflt| n += a }.call
+begin; lambda { |a, k:| }.call(1); rescue ArgumentError; end
+once_tp.disable
+p $once, n

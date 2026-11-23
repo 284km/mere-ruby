@@ -52,3 +52,13 @@ def priv_top = 1
 rescue NoMethodError => e
   p e.message
 end
+
+# ...and with any self: a core class opened again, a subclass of one, and a
+# value's instance_eval
+class String; def foo = :str; def m806 = foo; end
+class Integer; def foo = :int; def m806 = foo; end
+class Array; def foo = :ary; def m806 = foo; end
+class NilClass; def foo = :nil; def m806 = foo; end
+class Sub806 < Array; def foo = :sub; end
+class Float; def m806 = foo; end
+p "x".m806, 1.m806, [].m806, nil.m806, Sub806.new.m806, "y".instance_eval { foo }, 1.5.m806
