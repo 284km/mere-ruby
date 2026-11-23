@@ -10971,6 +10971,45 @@ private hooks the same way (nothing called), and only those rows were added
 to the table (regenerating the whole table would drop rows added since).
 corpus/777.
 
+## 2026-11-22 (93): test_ast's time, round two -- a key made per call, and one stack walked twice per collection
+
+**The point.** Round one (91) took 2.5% off. This round sampled the whole of test_ast instead of a subset. The self time was spread out:
+- the string hash and memcmp of map lookups: about 19%;
+- region allocation: 8%;
+- GC: about 14%.
+
+Two items were costs nothing needed.
+
+1. **Every method call on a String, Array, Hash, Proc or Binding made its hng_store key.** dispatch_cls_of, hng_sng_has, hng_missing_hook, hng_lookup_cls and invoke_val_c0 each built "str:" plus the id in decimal, then hashed and compared it, to learn that the value has no class of its own. That was 2-3% of the run (hng_key and show_int). An Array's id was already noted beside its entry (hng_arr_ids, issue #113). Now a String's, Hash's, Proc's and Binding's are noted too, as id * 8 + kind in hng_prim_ids. hng_put and hng_drop keep the note with the entry, and the class sweep compacts it with them. hng_key_q answers "" for an id never noted, without making the key. Writes still make the key with hng_key, and so does a direct read of hng_store, which stays correct.
+2. **A collection walked the interrupted body's stack twice.** gc_mark_roots began by recycling its own tables (gc_live_cls, gc_cls_pend, gc_ref_live, gc_ref_pend, gc_obj_pend). A recycle asks each suspended stack whether it points into the arena. The first ask after a stack stops walks everything it reaches (__lang_pin_gather, 2.6% of the run). The scan of that same stack for handles, later in the mark (coro_scan_ints), walks it again, and that walk gathers the pins and keeps them. The tables are now emptied at the end of gc_collect (gc_pend_release), after that scan, so they cost no walk of their own. A mark that finds them empty skips the recycle. A collection on the stack (nc) and the fiber reclaim pass leave them filled, and the next mark recycles them as before.
+
+Tried and dropped:
+- **A larger entries headroom after a collection** (live + max(scan, 32,000) instead of scan / 2). It cut the subset by 2.6%, but the whole file ran in the same time (409 s) and the same instructions. That is a GC policy question anyway.
+- **gc_churn_bytes measured one check in eight**, with an exact measure at each baseline. It moved where collections fell: 80 became 94 on the subset, and +0.7% instructions.
+
+Measured on test_ast's tokens, ranges and not_cared for test/ruby/test_[a-c]* (78 tests, 233,297 assertions):
+
+| build | instructions | change |
+|---|---|---|
+| main | 331.1e9 | |
+| step 1 | 315.7e9 | -4.6% |
+| step 2 | 314.3e9 | -5.1% in all |
+
+The whole of test_ast (2,664 tests, both builds run side by side):
+
+| build | instructions | time | maxRSS |
+|---|---|---|---|
+| main | 3,642.3e9 | 388 s | 960 MB |
+| this round | 3,457.6e9 (-5.1%) | 372 s | 992 MB |
+
+maxRSS varies by run: main measured 918 MB in an earlier run.
+
+- Checked:
+  - corpus 802/802. Once, under three gates at a time, 394 lost ruby's own `[:outer, false]` line (as in the earlier note); alone it passes 8 of 8 on both builds, and under load 6 of 6;
+  - corpus/800 is new: singletons and extends on each kind, a clone, a subclass, a singleton's method_missing, and the ids of dropped values after GC.start;
+  - test_module, test_string, test_array, test_hash, test_proc, test_object, test_class, test_gc, test_method and test_marshal give the same results as main;
+  - gates pass, bracket depth ok.
+
 ## 2026-11-22 (91): test_ast's time, round one -- two costs paid per object and per builtin call
 
 **The point.** On a slow runner test_ast takes 590-635 s of its 600 (note 551 §13). A sample of test_all_tokens showed no single hot spot:
@@ -11092,6 +11131,222 @@ What is left is still spread:
 - the frame records (call_names_s, call_lines, call_files_s, fb_env_at).
 - vm_exec's VMR region.
 - arr_len's three tables.
+
+## 2026-11-22 (92): a method's :call after its prologue, and an alias's events (corpus 725 on the VM, corpus 790)
+
+**corpus 725.** A TracePoint can be enabled while a `(a, b)` parameter is being destructured, by the `#to_ary` it calls. Ruby then fires the method's :call at the instruction marked Ca, after the prologue. The VM fired :call only on the way in (run_meth), so it missed it. Now:
+- The loader reads RUBY_EVENT_CALL, which the native export already wrote. When it marks a method's instruction other than the first, that instruction gets a new events bit, 16.
+- When vm_events meets the bit and a TracePoint is on, vm_late_call fires :call. It fires only once a frame ("__tpcall"), and not when the call was already made on the way in (tp_meth_flow keeps the frame: "__tpkeep").
+- vm_late_call builds the event as run_meth does: the name the method was defined as and the one it was called by, its class, and the line and file it was written in.
+- Two readers took `events >= 4` to mean the rescue bit. They now test that bit itself.
+
+**Aliases, on both executions** (found while writing the witness):
+- **A top-level `alias`** copied the method and recorded nothing else. TracePoint's method_id, `__method__` and the :call line all came out as the alias's, and the :return line was the caller's. The top-level SAlias now records the source's name ("Object#" key in alias_srcname, through an alias of an alias) and its lines (copy_meth_src). call_method, the top-level call path, names the frame and the events as run_meth does.
+- **An alias in a class** fired :return on the caller's line: copy_meth_src copied the source's first line and file, but not its end. A destination with no end line of its own now gets the source's. #154's modfunc_promote also uses copy_meth_src; corpus 778 was checked on #154 with this change, on both executions.
+
+Results:
+- Under MERE_RUBY_VM=1: 801 programs, 791 on the VM, 10 fallen back, 0 different. This is the first round with no difference.
+- Corpus 790 covers:
+  - the call fired after the prologue;
+  - a call already made on the way in, not fired twice;
+  - a loop back to the first instruction after the prologue;
+  - an alias in a class and at the top level.
+- On main's build it differs.
+- test_settracefunc, test_alias, test_method, test_proc, test_super and test_iseq give the same counts as main's build on both executions.
+
+## 2026-11-22 (94): the stage-10 REDs recounted, two of test_iseq's fixed (corpus 795)
+
+The REDs the stage-10 close names, on main dc0eeb62 + rounds 92 and 94, the same on both executions:
+
+| file | RED | which |
+|---|---|---|
+| prism/newline_test | 0 | |
+| coverage/test_coverage | 0 | |
+| test_iseq | 3 (5 before this round) | builtin_to_a; invalid_source_no_memory_leak and loading_kwargs_memory_leak (timeouts) |
+| test_optimization | 1 | string_freeze_saves_memory |
+
+**Fixed.**
+- **test_mandatory_only_redef.** `module Kernel; def Float(n)` was a definition a bare `Float(30)` never met. `send(:Float, …)` found it, but ecall_args answered every conversion function with the builtin. A bare call now asks kernel_overridden (Kernel, Object, self's own, main's singleton), as the other Kernel names do. In the prelude it still converts with the builtin: the prelude stands where ruby's C does. Its `Integer(line)` in ISeq.compile met a program's `Object#Integer` on the first try.
+- **test_iseq_builtin_load.** Ruby refuses to load the binary of a sequence that calls a builtin function ("builtin function table is not provided"). ISeq#to_binary now marks such a sequence, one whose ruby disassembly (@__dis) has an invokebuiltin. load_from_binary refuses the mark with that ArgumentError.
+
+Corpus 795 is the witness for both. It differs on main's build.
+
+**Left, and why.**
+- **test_iseq_builtin_to_a** wants the instruction's operand as ruby's C has it: a function pointer and an index into ruby's own table of builtin functions. There is no such table here, and inventing the numbers would be passing the test, not doing what it asks.
+- **The two leak tests** run their body 1,000,000 times inside the 10-second leak child. Here one `ISeq.new(nil)` (a TypeError) takes 23 µs and one `load_from_binary` 36 µs (ruby: about 1 µs). The time is the prelude's Ruby method calls: optional and keyword parameters bound, is_a? / respond_to?, an interpolated message. That is the general cost of a call, 2-4x over what these need, not something to special-case for two tests.
+- **test_string_freeze_saves_memory** asks ObjectSpace.memsize_of for a String's capacity: what readpartial(n, buf) reserved, and the shrink on freeze. memsize_of here is a model of ruby's object layout from the length alone; a capacity would have to be recorded by every read path that fills a buffer (pipe, file, socket).
+
+Results:
+- corpus 802/802; under MERE_RUBY_VM=1, 792 on the VM, 10 fallen back, 0 different.
+- test_integer, test_float, test_rational, test_complex, test_array and test_string give the same counts as main's build.
+
+**Review of #161 (to (92)).** The same mismatch could be reached with a TracePoint that was already on at entry. The VM fired :call on the way in, before the prologue:
+- before a default's own :call / :return;
+- before the destructuring `#to_ary`'s;
+- even for a default that raised, where ruby fires no :call.
+
+Now:
+- The loader notes each method whose RUBY_EVENT_CALL is past its first instruction (vm_late_ids; vm_free and a reload clear the note).
+- run_meth and call_method leave such a method's :call to the VM (vm_body_late).
+- vm_late_call fires it at the marked instruction whether or not the TracePoint was on at entry.
+- A :call fired on the way in marks the frame "__tpcall", so vm_late_call never fires a second one.
+
+All three cases now match ruby on the VM, and corpus 790 covers the first two. The evaluator still fires no :return for the raising default; that was so before #161.
+
+## 2026-11-22: module_function on an inherited method, String#encode on a subclass, IO#wait on a dead descriptor, and an inherited SIG_IGN
+
+Four small differences listed in note 553 §6 as the interpreter's own (not
+the C API's), and two met on the way.
+
+**module_function.** `include E; module_function :y` left
+`U.private_instance_methods(false)` empty: the entry was only made private
+where the module already had one. ruby's rb_export_method writes a private
+copy into the module for an inherited one, so modfunc_promote now copies the
+entry (copy_meth_src, and alias_origin set to the module it came from, as
+alias_method records, so the copy's `super` resumes above that module). A
+module's copy that runs out of `super` said "for class U"; ruby says "for
+module U", and an anonymous one by its inspect (`#<Module:0x...>`), where
+this said `AnonModule_1` (super_missing_msg).
+
+**String#encode** on a String subclass's instance answered a String; ruby's
+str_encode duplicates the receiver, so the result is of the subclass. The
+encode arm's result is tagged with the receiver's class (str_keep_sub, the
+hng_store tag dispatch_cls_of reads); encode! answers the receiver itself.
+
+**IO#wait on a descriptor closed behind the stream's back**
+(`IO.for_fd(r.fileno).close`) answered the stream as ready: poll(2) reports
+POLLNVAL, which the bits read as ready. ruby raises Errno::EBADF from wait,
+wait_readable and IO.select. IO.__sel_wait now asks IO.__fd_ok of a
+descriptor that came back ready and raises EBADF for a dead one -- only when
+something came back, so a wait that blocks pays nothing. On the way:
+wait_writable on a read end answered nil where ruby raises "not opened for
+writing", and io/wait still defined `IO#ready?`, which io-wait 0.4 (ruby
+4.0's) removed (ruby: NoMethodError; it answered nil here). The shipped
+io/wait is now a comment, not empty: an empty source is "not shipped" and the
+search would go on to the reference's file.
+
+**A process started with SIGINT ignored** (`cmd &` in a non-interactive
+shell, or `trap '' INT; exec ...`): ruby's install_sighandler keeps an
+inherited SIG_IGN for the signals it handles, so `trap("INT", "DEFAULT")`
+answers "IGNORE" and `Process.kill(:INT, $$)` is dropped. Here it answered
+"DEFAULT" and raised Interrupt -- corpus/394 printed one line more when the
+corpus ran under `&`. signal_inherited_ign asks once per name, the first time
+it matters, with Mere's proc_sig_catch keep rule (an inherited SIG_IGN is put
+back and reported; otherwise the default is given back at once), and
+signal_initial / signal_deliver_self read it.
+
+Not done here: Mere's spawn sets SIGINT/QUIT/TERM/HUP/PIPE to the default in
+the child (POSIX_SPAWN_SETSIGDEF), so after `trap("INT", "IGNORE")` a child
+does not inherit the ignore, where ruby's does. That is Mere's runtime
+(codegen_c's spawn), recorded in KNOWN_GAPS.md.
+
+corpus/778.
+
+### PR #154 review
+
+- **[Major] module_function on an inherited method copied its body.** Ruby's
+  rb_export_method writes a ZSUPER entry -- private, no body, forwarding up
+  the chain when called -- so `module E; def y = :new; end` after
+  `include E; module_function :y` is what an includer of U runs. The entry is
+  now the visibility mark `private :y` on an inherited method writes
+  (vis_marks + set_private): `U.private_instance_methods(false)` lists y,
+  X.new.t answers :new, U.y (the singleton copy) keeps :old. corpus/778 has
+  the redefinition.
+- **[Minor] A singleton-classed String subclass instance encoded into a
+  String.** str_keep_sub walks from the singleton class to its first real
+  class, and carries it unless that is String.
+- **[Minor] `"r:binary"` counted as writable**: the mode test read the
+  encoding after ":" too. IO.__mode_writes? / __mode_creates? test the
+  access part only; six places used the whole string (wait_writable,
+  File#truncate, File#chmod, the mmap refusal, the open-with-create check,
+  and one more truncate).
+
+## 2026-11-22: json, date, bigdecimal, io-console and prism from their gems, C API and all
+
+Rails' lock pins five default gems newer than the interpreter ships; since
+#128 an activated gem's own extension is the one loaded, so they join
+tools/capi_gem_check.py (now 22 gems, 17 of them with C extensions): each
+prints whether the extension it loaded
+is the gem home's, its VERSION, and a use. Four things stood between them
+and ruby's output.
+
+- **The C API.** io-console asks for `rb_io_get_write_io` (an IO's write
+  half: the duplex one's, else itself), and prism for `ruby_version` and
+  `rb_io_read_pending` (what the stream has buffered: @__io_rbuf). Contracts
+  in capi/check/api.rb: `ruby_version == RUBY_VERSION`, the write IO of a
+  pipe end is itself, nothing pending before a read and five bytes after
+  `getc` from six.
+- **A class or module whose name is no constant's.** io-console does
+  `rb_define_module_under(rb_cIO, "platform_tty")` and prepends it to IO.
+  define_class asked `const_defined?(:platform_tty)`, which raises NameError.
+  ruby keeps it under an ID `constants` and `const_get` do not see, and the
+  module's name is "IO::platform_tty"; here it is kept in a hidden instance
+  variable of the outer one and named with set_temporary_name (which accepts
+  that name because it is not a constant path).
+- **`require 'bigdecimal.so'`**, which the gem's bigdecimal.rb writes. The
+  shipped-native lookup looked for "bigdecimal.so.bundle", and cext_feature
+  did not know "bigdecimal.so" at all, so the gem's extension was never
+  looked for and the shipped 4.0.1 answered. Both now read the name without
+  ".so".
+- **prism.** "prism/prism" was not in cext_feature, so the gem's prism.rb
+  got the shipped feature (libprism 1.8.2) and the gem's serializer refused
+  its output ("Invalid serialization"). With it there, the gem's own
+  extension (2.1.0) loads; without the gem the shipped one still answers.
+
+json and date matched once the gem check reached them.
+
+And the test/mkmf difference note 553 left open (144 of 148 here, 140 on
+CI): the four are mkmf/test_pkg_config.rb, which reads
+`RbConfig::CONFIG["PKG_CONFIG"]`. CI's macOS reference was configured with
+pkg-config and ran them; this RbConfig had no such key, so they were skipped
+(RED). This Mac's reference has "" and skips them too, so here they matched.
+The key is now configure's AC_CHECK_TOOLS answer, asked when RbConfig loads:
+"pkg-config" when one is on PATH, else "". (Not run here -- no pkg-config on
+this Mac; CI is where the four run.)
+
+### PR #157 review
+
+- **[Minor] The hidden module was in `IO.instance_variables`**
+  (`@__capi_hidden_const_platform_tty`, and io-console's generic_readable).
+  A name that is no constant's is now kept on the C side -- capi/hidden.c,
+  a table outer (by identity) -> name -> value, a root of the collector --
+  and nothing Ruby-visible holds it: `IO.instance_variables` is `[]` as in
+  ruby. An anonymous outer names the module by its inspect. (#160's
+  rb_const_set / rb_const_get keep such names in the same table.)
+- **[Minor] PKG_CONFIG follows the running PATH, on purpose**, and the
+  comment now says so: this interpreter builds extensions with the machine's
+  tools, so it can say "pkg-config" where a reference configured before
+  pkg-config was installed says "". File::PATH_SEPARATOR, and a file (not a
+  directory) of that name.
+- **[Suggestion] rb_io_get_write_io's duplex branch.** The write IO is
+  synchronous now, and IO#close / #close_write close it (flushed) before the
+  descriptor goes, as CRuby closes the tied writer. capi/check: on
+  `IO.popen(["cat"], "r+")` the same writer each time, a write reaches the
+  child, closed after `close`. The gem check calls io-console's oflush on
+  such an IO (Errno::ENOTTY on both sides).
+- (re-review) **[Suggestion] the writer after a half-close.** Closing either
+  half unties it, as CRuby does: rb_io_get_write_io answers io itself after
+  close_write or close_read, and close_read closes the writer (CRuby moves
+  the write side into io). capi/check covers both. Left, and said in the
+  comment: the writer does not own the descriptor, so C closing it leaves
+  io writable, where CRuby's says "closed stream".
+- (re-review 2) **[Minor] after close_read, C wrote on the closed read
+  descriptor.** rb_io_get_write_io answered io, and io.fileno was still the
+  read descriptor close_read had closed: io-console's beep wrote "\a" into
+  whatever file got that number next. IO#fileno (and so rb_io_descriptor)
+  answers the write descriptor once the read half is closed, as CRuby's
+  close_read moves the writer in -- from Ruby too, which differed before
+  this PR. capi/check: the number after close_read is the writer's, both
+  from Ruby and from C. The gem check runs oflush and beep after close_read
+  with a file opened in between (Errno::ENOTTY and the IO, on both sides).
+  Also seen by the reviewer, older than this PR and pure Ruby: a popen'd
+  duplex IO with both halves closed was not closed?, and its child was not
+  waited for. close_read / close_write of the last half open closes the IO
+  now, as ruby's does (capi/check: both orders, closed? and $?.pid).
+- (note) The reference ruby's `gem install prism` peaks at 1.93 GB of the
+  check's 2 GiB; run beside another heavy check it hit the limit once
+  (MEMORY_LIMIT on the reference side, not mere-ruby's). Run alone it
+  passes. The limit stays.
 
 ## 2026-11-22: ruby/spec optional/capi -- 2,282 to 2,394 (reference 2,592)
 

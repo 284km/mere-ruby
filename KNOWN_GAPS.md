@@ -5435,6 +5435,18 @@ The full721-file corpus and original Parse102/Syntax167/Literal31 MATCH
 counts are retained. The pre-existing invalid-symbol Syntax leak Timeout
 and reference skips remain; these repairs do not establish a full Rails pass.
 
+## A child does not inherit a trapped SIG_IGN (Mere's spawn)
+
+After `Signal.trap("INT", "IGNORE")`, a child started with spawn, system,
+IO.popen or exec answers `trap("INT", "DEFAULT")` with "DEFAULT"; ruby's
+child answers "IGNORE" (an ignored disposition survives exec(2)). Mere's
+posix_spawn path (codegen_c) sets SIGPIPE, SIGINT, SIGQUIT, SIGTERM and SIGHUP
+to the default in every child (POSIX_SPAWN_SETSIGDEF), which undoes the
+user's ignore along with the runtime's own handlers (a handler is reset at
+exec anyway). The fix is Mere's: default only what the runtime itself set to
+SIG_IGN, or take the set from the caller. A process STARTED with the signal
+ignored keeps it (signal_inherited_ign, corpus/778).
+
 ## ruby/spec optional/capi: what is left (2026-11-22, 2,394 of 2,592)
 
 - **A pointer C keeps across a call** (string_spec, 2): `ptr =
