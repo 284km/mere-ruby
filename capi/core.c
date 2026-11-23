@@ -187,6 +187,35 @@ static int reads_only(int op) {
     return op == MR_DESCRIBE || op == MR_STR_GET || op == MR_ARY_GET || op == MR_FLOAT_GET
         || op == MR_INT_GET || op == MR_OUTCOME;
 }
+/* The refusal a dmark run between C calls gets for a request that is no read
+ * the collector's reader answers, naming the request: the method a call
+ * names (RHASH_SIZE is Hash#size, rb_hash_foreach Hash#each_pair), or the
+ * operation. */
+static const char *dmark_refusal(int op, VALUE b, VALUE flags) {
+    static char message[256];
+    static const char *names[] = { "?", "a header read", "a String read", "a String write", "an Array read",
+        "an Array write", "a method call", "a String allocation", "a Float allocation", "a Float read",
+        "an Integer allocation", "an Integer read", "a constant lookup", "a class definition",
+        "a method definition", "an allocator definition", "an object allocation", "a raise",
+        "an outcome", "$!", "an eval", "a Proc allocation", "a Symbol", "a GC request",
+        "an Array allocation", "a break", "$~", "a global variable definition", "the Regexp depth",
+        "a Rational allocation", "rb_f_notimplement", "a Symbol's state", "an ivar read" };
+    if (op == MR_SEND) {
+        long len = 0;
+        const char *name = mr_id_name((ID)b, &len);
+        const char *owner = (flags & MR_SEND_HASH) ? "Hash#" : (flags & MR_SEND_ARRAY) ? "Array#"
+                          : (flags & MR_SEND_STRING) ? "String#" : (flags & MR_SEND_KERNEL) ? "Kernel#" : "#";
+        snprintf(message, sizeof message,
+                 "a dmark called %s%.*s with no C call in progress (RHASH_SIZE and rb_hash_foreach are such calls): "
+                 "only a header, a String, an Array and an ivar can be read then", owner, (int)(name ? len : 1), name ? name : "?");
+    } else {
+        snprintf(message, sizeof message,
+                 "a dmark asked the interpreter for %s with no C call in progress: "
+                 "only a header, a String, an Array and an ivar can be read then",
+                 op > 0 && op < (int)(sizeof names / sizeof *names) ? names[op] : "a request");
+    }
+    return message;
+}
 VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
     struct mr_frame *frame = cur;
     /* (a dmark run by a collection between C calls asks the collector's
@@ -200,7 +229,7 @@ VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
             stats[ST_UP]++;
             return (VALUE)gc_reader.fn(gc_reader.env, request);
         }
-        mr_fatal("a dmark asked the interpreter for more than a read with no C call in progress (a method call, a write)");
+        mr_fatal(dmark_refusal(op, b, e));
     }
     if (!frame) mr_fatal("called with no call from the interpreter in progress (a C thread of its own?)");
     if (mr_vbig_live) {
