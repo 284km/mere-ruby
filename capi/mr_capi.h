@@ -34,7 +34,7 @@
 
 /* What C asks of the interpreter (capi_up in main.mere answers each). */
 enum mr_op {
-    MR_DESCRIBE = 1,    /* a: handle -> type | frozen<<5 | singleton<<6 | enc<<8 | a String's bytesize<<16; word 0: its class */
+    MR_DESCRIBE = 1,    /* a: handle -> type | frozen<<5 | singleton<<6 | enc<<8 | a String's bytesize<<32; word 0: its class */
     MR_STR_GET,         /* a: String -> its bytes (given) */
     MR_STR_SET,         /* a: String, bytes: its new contents */
     MR_ARY_GET,         /* a: Array, b: version held + 1 -> length (words: elements, then version), or -1: unchanged */

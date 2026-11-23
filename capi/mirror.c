@@ -209,7 +209,7 @@ static void refresh_head(struct mr_mirror *m, VALUE obj) {
          * settled here, from the length the interpreter has now: a String
          * whose bytes the struct does not hold yet is in it when they fit,
          * and one in the struct leaves it when they no longer do. */
-        long len = (long)(packed >> 16);
+        long len = (long)(packed >> 32);
         int term = term_of_index((int)((packed >> 8) & 0x7f));
         long need = len > m->reserve ? len : m->reserve;
         if (m->body != T_STRING) {
