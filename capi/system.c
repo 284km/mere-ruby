@@ -133,9 +133,9 @@ void ruby_vm_at_exit(void (*fn)(ruby_vm_t *)) {
 }
 
 /* ---- time ----------------------------------------------------------------------- */
-VALUE rb_time_new(time_t sec, long usec) { return mr_call(rb_cTime, "at", 2, LONG2NUM((long)sec), LONG2NUM(usec)); }
+VALUE rb_time_new(time_t sec, long usec) { return mr_call(rb_cTime, "__capi_at", 2, LONG2NUM((long)sec), LONG2NUM(usec)); }
 VALUE rb_time_nano_new(time_t sec, long nsec) {
-    return mr_call(rb_cTime, "at", 3, LONG2NUM((long)sec), LONG2NUM(nsec), ID2SYM(rb_intern("nsec")));
+    return mr_call(rb_cTime, "__capi_at", 3, LONG2NUM((long)sec), LONG2NUM(nsec), ID2SYM(rb_intern("nsec")));
 }
 VALUE rb_time_timespec_new(const struct timespec *ts, int offset) {
     VALUE t = rb_time_nano_new(ts->tv_sec, ts->tv_nsec);

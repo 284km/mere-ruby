@@ -15,7 +15,7 @@
  *   - TracePoint from C, the debug inspector, profile frames, postponed
  *     jobs, internal thread event hooks, the bug reporter, ISeq loading:
  *     the VM's own structures.
- *   - the Random interface, encoding converters, an encoding's alias: not
+ *   - the Random interface, encoding converters: not
  *     written yet.
  */
 extern void mr_unsupported_symbol(const char *name) __attribute__((__noreturn__));
@@ -41,7 +41,7 @@ UNSUPPORTED(rb_postponed_job_register_one) UNSUPPORTED(rb_postponed_job_trigger)
 UNSUPPORTED(rb_internal_thread_add_event_hook) UNSUPPORTED(rb_internal_thread_remove_event_hook)
 UNSUPPORTED(rb_thread_lock_native_thread) UNSUPPORTED(rb_thread_prevent_fork)
 UNSUPPORTED(rb_bug_reporter_add) UNSUPPORTED(rb_iseq_load)
-UNSUPPORTED(rb_tracepoint_enabled_p) UNSUPPORTED(rb_enc_alias)
+UNSUPPORTED(rb_tracepoint_enabled_p)
 /* the Random interface */
 UNSUPPORTED(rb_random_base_init) UNSUPPORTED(rb_random_mark)
 /* encoding converters, and the rest */

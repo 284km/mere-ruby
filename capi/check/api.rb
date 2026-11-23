@@ -460,6 +460,63 @@ check(A.ospath(euc).bytes == (mac ? "\u3042".bytes : euc.bytes))
 check(A.ospath(euc.b).equal?(euc.b) == false && A.ospath(euc.b).encoding == Encoding::BINARY)
 utf = "\u3042"
 check(A.ospath(utf).equal?(utf))
+# (rb_funcallv_public calls the method, not what the class made of
+#  `public_send`, and still refuses a private one)
+class PublicSendOverride
+  def public_send(*) = :overridden
+  def m = :real
+  private def hidden = :no
+end
+check(A.funcall_public(PublicSendOverride.new, :m) == :real)
+check((A.funcall_public(PublicSendOverride.new, :hidden) rescue $!.class) == NoMethodError)
+check((A.funcall_public(PublicSendOverride.new, :hidden) rescue $!.message) ==
+      "private method 'hidden' called for an instance of PublicSendOverride")
+# (...and the way in it takes is no name Ruby code can call)
+check((1.__capi_public_send(:to_s) rescue $!.class) == NoMethodError)
+# (C's rb_fs holds a value without identity across a collection)
+old_fs = $;
+begin
+  $VERBOSE, verbose = nil, $VERBOSE
+  $; = /,/
+  GC.start
+  check(A.fs_value == /,/)
+ensure
+  $; = old_fs
+  $VERBOSE = verbose
+end
+# (an encoding index past the 7 bits of the flags: the 30th dummy defined
+#  from C, read back from a String in it)
+last = nil
+30.times { |i| last = "CapiDummy#{i}"; A.define_dummy(last) }
+dummy = Encoding.find(last)
+check(A.enc_index_of("x".dup.force_encoding(dummy)) == Encoding.list.index(dummy))
+check(Encoding.list.index(dummy) >= 127)
+# (Kernel#binding from C is refused; a Proc's #binding is not)
+check(A.binding_of(proc { 1 }).is_a?(Binding))
+check((A.binding_of(Object.new) rescue $!.class) == RuntimeError)
+check((A.binding_of(binding) rescue $!.class) == RuntimeError)
+# (memsize_of a typed data wrapping NULL: its dsize is not asked)
+require 'objspace'
+check(ObjectSpace.memsize_of(A.null_typed).is_a?(Integer))
+# (a Ruby rescue clears what an earlier rb_protect left in errinfo)
+check(A.protect_and_return != 0)
+check(A.errinfo_now.is_a?(ArgumentError))
+begin
+  raise "E2"
+rescue
+  check(A.errinfo_now.nil?)
+end
+# (...and it is each Fiber's own: one an rb_protect left on a Fiber is not
+#  main's, nor a new Fiber's, and is still that Fiber's when it resumes)
+check(A.errinfo_now.nil?)
+f = Fiber.new { A.protect_and_return; Fiber.yield A.errinfo_now.class; A.errinfo_now.class }
+check(f.resume == ArgumentError)
+check(A.errinfo_now.nil?)
+check(Fiber.new { A.errinfo_now }.resume.nil?)
+GC.start
+check(f.resume == ArgumentError)
+check(A.errinfo_now.nil?)
+
 # (Bignums C made in Init_ and kept the public ways are still there later,
 #  and still zero -- rb_big_new gives digits of zero)
 GC.start
