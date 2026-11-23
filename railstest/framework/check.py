@@ -3,6 +3,8 @@
 import importlib.util
 import json
 import os
+import threading
+import time
 from pathlib import Path
 import sys
 import tempfile
@@ -14,10 +16,12 @@ spec = importlib.util.spec_from_file_location('rails_framework', Path(__file__).
 run = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run)
 
-OK = dict(exit=0, limit=None)
-
-
-def parsed(text, outcome=OK):
+def parsed(text, outcome=None):
+    if outcome is None:
+        # the exit minitest gives for this summary
+        found = run.SUMMARY.findall(text)
+        failing = bool(found) and (int(found[-1][2]) + int(found[-1][3])) > 0
+        outcome = dict(exit=1 if failing else 0, limit=None)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / 'out.stdout'
         path.write_text(text)
@@ -47,6 +51,9 @@ class FrameworkCheck(unittest.TestCase):
         reference = parsed(transcript({'A#test_a': '.', 'A#test_b': '.', 'A#test_c': '.', 'A#test_d': 'F', 'A#test_e': 'S'}))
         mere = parsed(transcript({'A#test_a': '.', 'A#test_b': 'E', 'A#test_d': 'F', 'A#test_e': 'S', 'A#test_x': '.'}))
         self.assertEqual('COMPLETE', reference['state'])
+        mere = parsed(transcript({'A#test_a': '.', 'A#test_b': 'E', 'A#test_d': 'F', 'A#test_e': 'S', 'A#test_x': '.'}),
+                      dict(exit=1, limit=None))
+        self.assertEqual('COMPLETE', mere['state'])
         self.assertEqual({'A#test_a': 'MATCH', 'A#test_b': 'RED', 'A#test_c': 'MISSING', 'A#test_d': 'BOTH',
                           'A#test_e': 'BOTH', 'A#test_x': 'EXTRA'}, run.classify(reference, mere))
 
@@ -126,6 +133,86 @@ class FrameworkCheck(unittest.TestCase):
 
     def test_jobs_are_bounded(self):
         self.assertEqual(2, run.MAX_JOBS)
+
+    def test_one_side_never_runs_two_files_at_once(self):
+        # mere-ruby is the slow side: with a shared pool its second file used
+        # to start while its first still ran
+        running, overlaps, lock = {}, [], threading.Lock()
+
+        def one(side, _binary, name):
+            with lock:
+                if running.get(side):
+                    overlaps.append((side, running[side], name))
+                running[side] = name
+            time.sleep(0.02 if side == 'mere' else 0.002)
+            with lock:
+                running[side] = None
+        files = [f'activesupport/test/f{i}_test.rb' for i in range(6)]
+        run.schedule([('reference', 'r'), ('mere', 'm')], files, 2, one)
+        self.assertEqual([], overlaps)
+
+    def test_a_duplicated_name_keeps_its_worse_verdict(self):
+        twice = parsed('A#test_a = 0.01 s = F\nA#test_a = 0.01 s = .\n1 runs, 1 assertions, 1 failures, 0 errors, 0 skips\n')
+        self.assertEqual('F', twice['cases']['A#test_a'])
+        self.assertEqual('COUNT_MISMATCH', twice['state'])
+        reference = parsed(transcript({'A#test_a': '.'}))
+        self.assertEqual({'A#test_a': 'RED'}, run.classify(reference, twice))
+
+    def test_a_pass_in_an_inconsistent_transcript_is_not_a_match(self):
+        reference = parsed(transcript({'A#test_a': '.', 'A#test_b': '.'}))
+        lying = parsed('A#test_a = 0.01 s = .\nA#test_b = 0.01 s = .\n2 runs, 2 assertions, 1 failures, 0 errors, 0 skips\n',
+                       dict(exit=1, limit=None))
+        self.assertEqual('REPORT_MISMATCH', lying['state'])
+        self.assertEqual({'A#test_a': 'UNCONFIRMED', 'A#test_b': 'UNCONFIRMED'}, run.classify(reference, lying))
+
+    def test_a_crash_after_the_summary_is_visible(self):
+        text = transcript({'A#test_a': '.'})
+        self.assertEqual('EXIT_ERROR', parsed(text, dict(exit=-11, limit=None))['state'])
+        self.assertEqual('EXIT_ERROR', parsed(text, dict(exit=1, limit=None))['state'])
+        self.assertEqual('COMPLETE', parsed(transcript({'A#test_a': 'F'}), dict(exit=1, limit=None))['state'])
+        # the verdicts it did report are still compared
+        crashed = parsed(text, dict(exit=-11, limit=None))
+        self.assertEqual({'A#test_a': 'MATCH'}, run.classify(parsed(text), crashed))
+
+    def test_output_in_front_of_a_result_line(self):
+        out = parsed('Run options: --seed 1\nhello, A::B#test_x y = 0.01 s = .\n...A#test_b = 0.01 s = .\n'
+                     '2 runs, 2 assertions, 0 failures, 0 errors, 0 skips\n')
+        self.assertEqual(['A::B#test_x y', 'A#test_b'], list(out['cases']))
+        self.assertEqual('COMPLETE', out['state'])
+
+    def test_order_is_compared(self):
+        cases = {'A#test_a': '.', 'A#test_b': '.'}
+        record = dict(files={'activesupport/test/x_test.rb': dict(sides=dict(
+            reference=parsed(transcript(cases)), mere=parsed(transcript(dict(reversed(list(cases.items()))))))),
+            'activesupport/test/y_test.rb': dict(sides=dict(reference=parsed(transcript(cases)), mere=parsed(transcript(cases))))})
+        run.summarize(record)
+        self.assertFalse(record['files']['activesupport/test/x_test.rb']['same_order'])
+        self.assertTrue(record['files']['activesupport/test/y_test.rb']['same_order'])
+        self.assertEqual(1, record['components']['activesupport']['order_differs'])
+
+    def test_compare_counts_a_vanished_file_or_side(self):
+        cases = {'A#test_a': '.'}
+        full = dict(files={'activesupport/test/x_test.rb': dict(sides=dict(
+            reference=parsed(transcript(cases)), mere=parsed(transcript(cases))))})
+        run.summarize(full)
+        no_mere = dict(files={'activesupport/test/x_test.rb': dict(sides=dict(reference=parsed(transcript(cases))))})
+        run.summarize(no_mere)
+        with tempfile.TemporaryDirectory() as directory:
+            base, new = Path(directory) / 'base.json', Path(directory) / 'new.json'
+            base.write_text(json.dumps(full))
+            args = type('Args', (), dict(base=base, new=new))
+            with open(os.devnull, 'w') as sink, patch('sys.stdout', sink):
+                for gone in (dict(files={}), no_mere):
+                    new.write_text(json.dumps(gone))
+                    self.assertEqual(1, run.compare(args))
+
+    def test_install_requires_every_component(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'source/activesupport/lib').mkdir(parents=True)
+            (root / 'home/gems').mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError, 'not installed'):
+                run.component_lib_parity(root / 'source', root / 'home')
 
 
 if __name__ == '__main__':

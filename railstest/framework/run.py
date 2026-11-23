@@ -30,7 +30,15 @@ MAX_JOBS = 2
 SEED = '12345'
 COMPONENTS = ('activesupport', 'activemodel', 'actionview', 'actionpack', 'activejob', 'actionmailer',
               'activerecord', 'railties', 'actioncable', 'activestorage', 'actiontext', 'actionmailbox')
-CASE = re.compile(r'^(.+?#.+) = ([0-9.]+) s = ([.FES])$', re.M)
+# A result line is `Class#test_name = 0.01 s = .`. A test that prints to
+# stdout without a newline puts its output in front of it on the same line, so
+# the name starts at the first capital of the line rather than at its start.
+# (Output that itself ends in a capital makes a wrong name: it is then MISSING
+# on one side and EXTRA on the other, never a MATCH.)
+CASE = re.compile(r'([A-Z][\w:]*#\S.*?) = ([0-9.]+) s = ([.FES])$', re.M)
+# The worse of two verdicts for one name, when a transcript reports it twice
+SEVERITY = {'.': 0, 'S': 1, 'F': 2, 'E': 3}
+VERDICTS = ('MATCH', 'RED', 'MISSING', 'UNCONFIRMED', 'BOTH', 'EXTRA')
 SUMMARY = re.compile(r'^(\d+) runs, (\d+) assertions, (\d+) failures, (\d+) errors, (\d+) skips$', re.M)
 
 
@@ -137,6 +145,7 @@ def capture(command, env, cwd, stem, supervise):
 
 
 def install(args, data):
+    check_source(args.source, data)
     verify(args.archives, data)
     version, stdlib, gem = reference_facts(args.reference)
     if version != data['ruby_version']:
@@ -187,7 +196,7 @@ def component_lib_parity(source, home):
     for component in COMPONENTS:
         installed = home / 'gems' / f'{component}-8.1.4.1' / 'lib'
         if not installed.is_dir():
-            continue
+            raise ValueError(f'{component}-8.1.4.1 is not installed in {home}')
         tagged = source / component / 'lib'
         names = sorted(str(p.relative_to(tagged)) for p in tagged.rglob('*') if p.is_file())
         mine = sorted(str(p.relative_to(installed)) for p in installed.rglob('*') if p.is_file())
@@ -246,6 +255,9 @@ def parse(stdout, outcome):
     for identity, _seconds, verdict in CASE.findall(text):
         if identity in cases:
             duplicates.append(identity)
+            # the worse verdict stands: a name reported F then . is not a pass
+            if SEVERITY[verdict] < SEVERITY[cases[identity]]:
+                verdict = cases[identity]
         cases[identity] = verdict
     summaries = SUMMARY.findall(text)
     summary = dict(zip(('runs', 'assertions', 'failures', 'errors', 'skips'), map(int, summaries[-1]))) if summaries else None
@@ -260,21 +272,31 @@ def parse(stdout, outcome):
         state = 'REPORT_MISMATCH'
     elif summary['runs'] == 0:
         state = 'ZERO'
+    elif outcome['exit'] != (1 if summary['failures'] + summary['errors'] else 0):
+        # minitest exits 0 or 1 by its own summary; a signal after the summary
+        # (exit -11) or any other code is a crash at exit, kept visible
+        state = 'EXIT_ERROR'
     else:
         state = 'COMPLETE'
     return dict(state=state, summary=summary, cases=cases, duplicates=duplicates)
 
 
+# mere-ruby transcripts whose own lines and summary disagree: a `.` line there
+# is not evidence of a pass
+UNTRUSTED = ('COUNT_MISMATCH', 'REPORT_MISMATCH')
+
+
 def classify(reference, mere):
     """Every reference test name gets one verdict; mere-only names are EXTRA."""
     verdicts = {}
+    untrusted = mere.get('state') in UNTRUSTED
     for name, verdict in reference['cases'].items():
         if verdict != '.':
             verdicts[name] = 'BOTH'
         elif name not in mere['cases']:
             verdicts[name] = 'MISSING'
         elif mere['cases'][name] == '.':
-            verdicts[name] = 'MATCH'
+            verdicts[name] = 'UNCONFIRMED' if untrusted else 'MATCH'
         else:
             verdicts[name] = 'RED'
     for name in mere['cases']:
@@ -331,16 +353,31 @@ def run(args, data):
             print(f"{side:9} {parsed['state']:15} {outcome['seconds']:8.1f}s {outcome['peak_rss_kb']:8} KiB  {name}", flush=True)
             write_json(args.output / 'results.json', record)
 
-    jobs = [(side, binary, name) for name in files for side, binary in sides]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        for future in [pool.submit(one, *job) for job in jobs]:
-            future.result()
+    schedule(sides, files, args.jobs, one)
     if args.binary and sha(args.binary) != record['binary_sha256']:
         raise ValueError('binary changed during the run')
     summarize(record)
     write_json(args.output / 'results.json', record)
     report(record)
     return 0
+
+
+def schedule(sides, files, jobs, one):
+    """Each side runs its files one after another: the files of one side share
+    its tree copy, gem home and TMPDIR (activerecord's sqlite3 tests share a
+    fixture database), so two of them must never overlap. jobs 2 runs the two
+    SIDES at once; jobs 1 runs everything in sequence."""
+    def side_queue(side, binary):
+        for name in files:
+            one(side, binary, name)
+
+    if jobs == 1:
+        for side, binary in sides:
+            side_queue(side, binary)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(sides)) as pool:
+            for future in [pool.submit(side_queue, side, binary) for side, binary in sides]:
+                future.result()
 
 
 def summarize(record):
@@ -357,26 +394,35 @@ def summarize(record):
         else:
             verdicts = classify(reference, mere)
             entry['verdict'] = 'COMPARED'
-        counts = {k: sum(v == k for v in verdicts.values()) for k in ('MATCH', 'RED', 'MISSING', 'BOTH', 'EXTRA')}
+        # Did both sides run the common tests in the same order? (the same
+        # --seed is not enough: a library that draws random numbers between
+        # the shuffle's draws changes it). A result that may depend on order
+        # is then visible.
+        common = set(reference['cases']) & set(mere['cases'])
+        entry['same_order'] = ([n for n in reference['cases'] if n in common]
+                               == [n for n in mere['cases'] if n in common])
+        counts = {k: sum(v == k for v in verdicts.values()) for k in VERDICTS}
         entry.update(counts=counts, red=sorted(n for n, v in verdicts.items() if v == 'RED'),
                      missing=sorted(n for n, v in verdicts.items() if v == 'MISSING'),
+                     unconfirmed=sorted(n for n, v in verdicts.items() if v == 'UNCONFIRMED'),
                      extra=sorted(n for n, v in verdicts.items() if v == 'EXTRA'))
         component = name.split('/', 1)[0]
-        row = totals.setdefault(component, dict(files=0, reference_unusable=0, mere_incomplete=0,
-                                                MATCH=0, RED=0, MISSING=0, BOTH=0, EXTRA=0))
+        row = totals.setdefault(component, dict(files=0, reference_unusable=0, mere_incomplete=0, order_differs=0,
+                                                **{k: 0 for k in VERDICTS}))
         row['files'] += 1
         row['reference_unusable'] += entry['verdict'] != 'COMPARED'
         row['mere_incomplete'] += entry['verdict'] == 'COMPARED' and mere['state'] != 'COMPLETE'
+        row['order_differs'] += entry['verdict'] == 'COMPARED' and not entry['same_order']
         for key, value in counts.items():
             row[key] += value
     record['components'] = totals
 
 
 def report(record):
-    print(f"{'component':14} {'files':>5} {'refbad':>6} {'mere!':>5} {'MATCH':>6} {'RED':>5} {'MISS':>5} {'BOTH':>5} {'EXTRA':>5}")
+    print(f"{'component':14} {'files':>5} {'refbad':>6} {'mere!':>5} {'order':>5} {'MATCH':>6} {'RED':>5} {'MISS':>5} {'UNCF':>5} {'BOTH':>5} {'EXTRA':>5}")
     for component, row in record.get('components', {}).items():
-        print(f"{component:14} {row['files']:5} {row['reference_unusable']:6} {row['mere_incomplete']:5} "
-              f"{row['MATCH']:6} {row['RED']:5} {row['MISSING']:5} {row['BOTH']:5} {row['EXTRA']:5}")
+        print(f"{component:14} {row['files']:5} {row['reference_unusable']:6} {row['mere_incomplete']:5} {row['order_differs']:5} "
+              f"{row['MATCH']:6} {row['RED']:5} {row['MISSING']:5} {row['UNCONFIRMED']:5} {row['BOTH']:5} {row['EXTRA']:5}")
 
 
 def compare(args):
@@ -385,12 +431,15 @@ def compare(args):
     worse = 0
     for name in sorted(set(old['files']) | set(new['files'])):
         a, b = old['files'].get(name), new['files'].get(name)
-        if not a or not b or 'counts' not in a or 'counts' not in b:
-            print('only in one record:', name)
-            continue
-        lost = sorted(n for n, v in classify_entry(a).items() if v == 'MATCH' and classify_entry(b).get(n) != 'MATCH')
-        gained = sorted(n for n, v in classify_entry(b).items() if v == 'MATCH' and classify_entry(a).get(n) != 'MATCH')
-        if lost or gained or a['counts'] != b['counts']:
+        before, after = (classify_entry(a) if a else {}), (classify_entry(b) if b else {})
+        lost = sorted(n for n, v in before.items() if v == 'MATCH' and after.get(n) != 'MATCH')
+        gained = sorted(n for n, v in after.items() if v == 'MATCH' and before.get(n) != 'MATCH')
+        if not (a and b and 'counts' in a and 'counts' in b):
+            # a file (or its mere-ruby side) gone from the new record loses
+            # every MATCH it had; one that is new gains its own
+            print(f"{name}: only in the {'base' if a else 'new'} record, or not compared in one of them"
+                  + (f" ({len(lost)} MATCH lost)" if lost else ""))
+        elif lost or gained or a['counts'] != b['counts']:
             print(f"{name}: MATCH {a['counts']['MATCH']} -> {b['counts']['MATCH']}, RED {a['counts']['RED']} -> {b['counts']['RED']}, "
                   f"MISSING {a['counts']['MISSING']} -> {b['counts']['MISSING']}")
             for n in lost:
@@ -403,7 +452,7 @@ def compare(args):
 
 def classify_entry(entry):
     sides = entry['sides']
-    if entry.get('verdict') != 'COMPARED':
+    if entry.get('verdict') != 'COMPARED' or 'mere' not in sides or 'reference' not in sides:
         return {}
     return classify(sides['reference'], sides['mere'])
 
