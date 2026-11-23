@@ -615,6 +615,8 @@ let gc_tick =
   (let v = vec_new () in
    let _ = vec_push v 0 in
    let _ = vec_push v 0 in
+   // (2: the C API's safepoints under stress, gc_point_capi)
+   let _ = vec_push v 0 in
    v);
 let gc_body_tick = fn (u: unit) ->
   let n = vec_get gc_tick 0 in
@@ -2751,6 +2753,25 @@ let gc_collect_off_stack = fn world ->
 // sizes.
 let gc_point = fn world ->
   if fb_off_stack && not (gc_auto_off ()) && gc_stress_due () then (let _ = gc_collect_off_stack world in ())
+  else if fb_off_stack && gc_body_tick () && gc_pressure world
+  then (if gc_collect_off_stack world then ()
+        else (let bn = (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
+              let _ = map_set gc_state "blocked" (bn + 1) in ()))
+  else ();
+
+// The C API's safepoint (capi_up, MR_SAFEPOINT: mr_up asks it before a
+// String is fetched, a call, a new String), so that a long C call that calls
+// back through the C API alone is collected in -- under pressure, as any
+// safepoint. Under MERE_RUBY_GC_STRESS=N it collects at every 16*N-th of
+// them, not every N-th: a C call asks for those many times per statement,
+// and at every one capi_check's api contracts ran past their 120 s bound
+// under stress (a collection every 25 ms of C API calls).
+let gc_point_capi = fn world ->
+  let every = vec_get gc_knob 6 in
+  if fb_off_stack && not (gc_auto_off ()) && every > 0 then
+    (let n = vec_get gc_tick 2 in
+     if n + 1 >= every * 16 then (let _ = vec_set gc_tick 2 0 in let _ = gc_collect_off_stack world in ())
+     else (let _ = vec_set gc_tick 2 (n + 1) in ()))
   else if fb_off_stack && gc_body_tick () && gc_pressure world
   then (if gc_collect_off_stack world then ()
         else (let bn = (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
@@ -8312,16 +8333,27 @@ and capi_send = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
 and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let (_, _, ocls, _) = world in
-  if r.op == 1 then capi_describe env world (capi_in r.a)
+  // MR_SAFEPOINT (capi/core.c mr_up, before a String is fetched, a call or a
+  // new String; gc_point_capi): the collector's chance in a C call that calls back through
+  // the C API only. A collection here is one in the middle of a statement,
+  // which an off-stack collection roots (note 270) -- the stack it
+  // interrupted is read for VALUEs, C's frames and the outer calls' with it.
+  if r.op == 33 then (let _ = gc_point_capi world in 0)
+  else if r.op == 1 then capi_describe env world (capi_in r.a)
   else if r.op == 2 then
     (match capi_in r.a with
      | VStr h -> let _ = mr_capi_give (bytes_of_str (sget h)) in 0
      | _ -> let _ = raise_exc world "TypeError" "C API: not a String" in 0)
   else if r.op == 3 then
     (match capi_in r.a with
-     | VStr h ->
-       if sfrozen_get h then (let _ = raise_exc world "FrozenError" ("can't modify frozen String: " ++ inspect_w env world (VStr h)) in 0)
-       else (let _ = sset h (str_of_bytes (mr_capi_bytes ())) in 0)
+     // (what C wrote through RSTRING_PTR, written back: a FROZEN String's
+     //  too. Frozen is the Ruby methods' refusal -- rb_str_modify's, which
+     //  every function of the C API that changes a String asks first -- and
+     //  a write into the buffer is not one: in ruby the bytes simply change.
+     //  puma's HTTP parser upcases each header name in the request it is
+     //  given, a frozen literal in its tests, and the write-back raised
+     //  FrozenError out of the parse.)
+     | VStr h -> let _ = sset h (str_of_bytes (mr_capi_bytes ())) in 0
      | _ -> let _ = raise_exc world "TypeError" "C API: not a String" in 0)
   else if r.op == 4 then
     (match capi_in r.a with
@@ -8555,7 +8587,14 @@ and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) 
   let rec below = fn (d: int) -> if own d then below (d - 1) else d in
   let c9 = (if at >= 0 then below at else 0 - 2) in
   let cenv = (if c9 >= 0 - 1 && map_has fb_env_at c9 then map_get fb_env_at c9 else env) in
-  let up = fn (r: CapiReq) ->
+  // (each request in a region of its own: what it makes along the way --
+  //  the copy of a String's bytes handed to C, the bytes C wrote back
+  //  before they are a String -- went to the region of the statement that
+  //  called C, open for the whole call. puma's HTTP parser, which joins a
+  //  repeated header with rb_str_cat at every callback, held 5.4 GB at
+  //  12 x 1024 headers in one call; the collections at mr_up's safepoint
+  //  cannot give back a region's bytes.)
+  let up = fn (r: CapiReq) -> region CUP {
     try_or_msg (fn (u: unit) -> capi_up env cenv world r)
       (fn (message: str) ->
         let out = try_or_msg (fn (u: unit) -> capi_capture world)
@@ -8563,7 +8602,7 @@ and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) 
                       let _ = capi_clear world in
                       arr_new (Cons (VExc ("fatal", "C API: what a request raised could not be kept: " ++ message),
                                      Cons (VNil, Cons (VNil, Cons (VNil, Cons (VNil, Nil))))))) in
-        let _ = mr_capi_raise (CapiWord { w = capi_out out }) in 0) in
+        let _ = mr_capi_raise (CapiWord { w = capi_out out }) in 0) } in
   let ret = mr_capi_enter up req in
   if ret.raised == 0 then capi_in ret.w
   else capi_resume world (capi_in ret.w)

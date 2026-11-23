@@ -65,8 +65,9 @@ enum mr_op {
     MR_RAT_RAW = 29,    /* a: numerator, b: denominator (Integers) -> that Rational, not reduced */
     MR_NOTIMPL = 30,    /* a: class, b: 0 its method, 1 its singleton's, 2 both; text: name -- rb_f_notimplement */
     MR_SYM_STATE = 31,  /* a: String or Symbol -> 0 not a Symbol, 1 a dynamic one, 2 pinned down */
-    MR_IVAR_READ = 32   /* a: an object; text: an ivar's name -> its value, read from the table with no
+    MR_IVAR_READ = 32,  /* a: an object; text: an ivar's name -> its value, read from the table with no
                          * dispatch -- the collector's reader only (a dmark between C calls) */
+    MR_SAFEPOINT = 33   /* (nothing) -- a collection may run here, when one is due (mr_up) */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
     /* (16: the receiver is the current one)
@@ -137,6 +138,7 @@ int mr_without(const char *what);
 int mr_capi_calling(void);
 /* Whether a dmark is running with no C call in progress: nobody to ask (mirror.c). */
 int mr_capi_mark_unasked(void);
+int mr_capi_marking(void);
 /* An API this C side does not provide: NotImplementedError, never a guess. */
 RBIMPL_ATTR_NORETURN() void mr_unsupported(const char *what);
 

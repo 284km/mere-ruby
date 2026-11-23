@@ -6,6 +6,7 @@
 #include <ruby/io.h>
 #include <ruby/version.h>
 #include <sys/stat.h>
+#include <stdio.h>
 
 /* A pointer C took before the block it yields to gave up the Fiber: the
  * write through it, after the Fiber is resumed, is a write to the String. */
@@ -274,6 +275,67 @@ static VALUE resize_out_and_back(VALUE self, VALUE str) {
     return rb_ary_new3(2, far, str);
 }
 
+/* VALUEs held ONLY in C locals across many requests that allocate: a String
+ * C made and an Array C filled, then Strings made and dropped and calls
+ * that make their answers, and the two read back at the end. A collection
+ * can run at any of those requests (mr_up's safepoint); the stack is all
+ * that roots the two. With a block, it is yielded to halfway -- a Fiber's
+ * body can pause there, in the middle of this call, while the program
+ * collects -- and the loop goes on when it comes back. */
+static VALUE hold_locals(VALUE self, VALUE times) {
+    (void)self;
+    static char junk[4096];
+    long n = NUM2LONG(times);
+    VALUE held = rb_str_new_cstr("held-string");
+    VALUE ary = rb_ary_new();
+    for (int i = 0; i < 8; i++) {
+        char name[8];
+        snprintf(name, sizeof name, "e%d", i);
+        rb_ary_push(ary, rb_str_new_cstr(name));
+    }
+    long sum = 0;
+    for (long i = 0; i < n; i++) {
+        rb_str_new(junk, (long)sizeof(junk));
+        VALUE text = rb_funcall(LONG2NUM(i), rb_intern("to_s"), 0);
+        sum += RSTRING_LEN(text);
+        if (i == n / 2 && rb_block_given_p()) rb_yield(LONG2NUM(i));
+    }
+    return rb_ary_new3(3, held, ary, LONG2NUM(sum));
+}
+
+/* C writes into a FROZEN String's buffer -- frozen is what rb_str_modify
+ * refuses, not the bytes -- and then calls the interpreter, which sees them
+ * (puma's parser upcases the header names of a frozen request in place). */
+static VALUE write_frozen(VALUE self, VALUE str) {
+    (void)self;
+    char *p = RSTRING_PTR(str);
+    p[0] = 'Z';
+    VALUE seen = rb_funcall(str, rb_intern("dup"), 0);
+    return rb_ary_new3(2, seen, str);
+}
+
+/* A long C call that only calls back through the C API -- no Ruby method in
+ * between -- and makes garbage as it goes: puma's HTTP parser joining a
+ * repeated header (rb_hash_aref, then rb_str_cat2 and rb_str_cat on the
+ * String it found), with a 64 KB String made and dropped each turn. Answers the
+ * joined String and how many collections ran while it went on. */
+static VALUE join_in_c(VALUE self, VALUE times) {
+    (void)self;
+    static char junk[65536];
+    long n = NUM2LONG(times);
+    VALUE hash = rb_hash_new();
+    VALUE key = rb_str_new_cstr("HTTP_X_TEST");
+    rb_hash_aset(hash, key, rb_str_new_cstr("test"));
+    size_t before = rb_gc_count();
+    for (long i = 1; i < n; i++) {
+        VALUE v = rb_hash_aref(hash, key);
+        rb_str_cat2(v, ", ");
+        rb_str_cat(v, "test", 4);
+        rb_str_new(junk, (long)sizeof(junk));
+    }
+    return rb_ary_new3(2, rb_hash_aref(hash, key), SIZET2NUM(rb_gc_count() - before));
+}
+
 /* (rb_funcallv_public by name; an encoding's index as C reads it; a dummy
  *  encoding defined here; what C's rb_fs holds) */
 static VALUE funcall_public(VALUE self, VALUE obj, VALUE name) {
@@ -489,6 +551,9 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "expand_room", expand_room, 2);
     rb_define_singleton_method(mod, "freeze_keeps_room", freeze_keeps_room, 0);
     rb_define_singleton_method(mod, "resize_out_and_back", resize_out_and_back, 1);
+    rb_define_singleton_method(mod, "join_in_c", join_in_c, 1);
+    rb_define_singleton_method(mod, "write_frozen", write_frozen, 1);
+    rb_define_singleton_method(mod, "hold_locals", hold_locals, 1);
     /* classes under a module under a module, all of them made here: a class
      * C defines is a class by that name like any other */
     VALUE mid = rb_define_module_under(mod, "Mid");
