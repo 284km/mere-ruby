@@ -167,9 +167,12 @@ Left as found (not needed by bcrypt, noted for later):
   ("not initialized"). The captured-Method route goes through the
   dispatcher and is right.
 - `Ripper.new(src).class` is Prism::Translation::Ripper (ruby: Ripper).
-- a captured builtin class method other than `new` called WITH a block on a
-  class that overrides it (invoke_with_block0's generic singleton arm) still
-  reaches the override.
+- a captured builtin class method called WITH a block on a class that
+  overrides it reached the override in round 1 -- `new` included, for
+  Class.new and Module.new (Class#new on an ordinary class was served). The
+  review rounds below serve `new` (Class/Module too) and the eval family;
+  any other name still reaches the override through invoke_with_block0's
+  generic singleton arm.
 
 ## Review of #178
 
@@ -214,6 +217,15 @@ override, through the with-block alias arm added for `Array.on(2) { }`.
 That arm now takes only an alias of `new` (whose with-block arm reads the
 skip); 717 matches again on the evaluator and the VM.
 
+Second review: a CLASS's own instance_exec / instance_eval whose `super`
+reaches the builtin overflowed the stack (main: NoMethodError) -- the
+with-block class arm for the eval family took the override again; it now
+takes bi_skip, the string form asks the class's override first, and
+super_missing serves class_exec / module_exec / class_eval / module_eval
+on a module as well. A saved Class.new / Module.new called with a block
+recursed too (as on main): both of the `new` arms for Class and Module
+now read the skip. corpus 905.
+
 Follow-ups, not done:
 
 - The parser's `name [array] op rest` (corpus 899) still keeps the old
@@ -229,3 +241,14 @@ Follow-ups, not done:
 - `K.method(:===).owner` says Kernel for a class (ruby: Module).
 - An `M#call` on an extended proc that calls `super` overflows the stack
   (older: `def pr.call(*a) = super` does too).
+- A holder Ruby copied (`dup` / `clone`) has the internal ivars in the
+  interpreter but not on its mirror: a dmark that reads one before C has
+  touched the copy reaches mr_fatal. Copying the entries in
+  initialize_copy would cover it.
+- Saved builtin class methods called through an alias WITH A BLOCK: only
+  an alias of `new` is served (Class.new and Module.new included, corpus
+  902, 905); another builtin's alias called with a block takes the path
+  it took on main.
+- Unrelated, found on the way: `Class.new { include m[1] }` with `m` a
+  local includes `m` (TypeError "wrong argument type Array"); `x = m[1];
+  include x` works.
