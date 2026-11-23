@@ -59,6 +59,10 @@ and GC::Profiler tests remain enabled. Passing MMTk exclusions are not copied.
 CI 43807166928 (c64d0ae4). The last complete successful main CI 44239745755
 (12ca1df2) passes two of those finalizer cases after #87, leaving 157 target RED: 12 honest
 implementation matches, 57 reasoned exclusions and 88 named handoffs.
+(2026-11-23: three of the exclusions -- test_dump_includes_slot_size,
+test_dump_to_default, test_dump_to_io -- are matches now: a String's dump has
+the slot of the struct C sees, which GC::INTERNAL_CONSTANTS describes. 15
+matches, 54 exclusions.)
 The two main fixes are identified separately in the inventory. This is a dated triage inventory, not a
 replacement for measured results. In particular, `memsize_of_all` now passes
 the raw comparison but still sums the inherited guessed `memsize_of` values;

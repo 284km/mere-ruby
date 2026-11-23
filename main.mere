@@ -16776,7 +16776,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   //  room in the buffer C sees -- capi_reserve)
   else if (str_len name == 13 && str_eq name "__capa_expand") then
     (match (recv, args) with
-     | (VStr _, Cons (VInt n9, _)) -> (let _ = capi_reserve recv n9 in recv)
+     | (VStr _, Cons (VInt n9, _)) -> (let _ = capi_reserve recv n9 false in recv)
      | _ -> recv)
   // (is it still a chilled literal -- unfrozen, warned about at its first
   //  change? ObjectSpace.dump says so, and StringIO leaves its encoding be)
@@ -19637,9 +19637,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           v)
        // (without one, String.new's own rules -- `encoding:`, the TypeError
        //  for a non-String source -- and the subclass's tag)
+       // (...and its `capacity:` is rb_str_init's, not String.new's: never
+       //  under STR_BUF_MIN_SIZE (63), and a buffer even when the slot would
+       //  hold it -- the room in the buffer C sees, capi_reserve)
        else
          (let v = new_obj world "String" args in
-          let _ = (match v with VStr _ -> hng_put (hng_key v) c | _ -> ()) in v))
+          let _ = (match v with VStr _ -> hng_put (hng_key v) c | _ -> ()) in
+          let capn9 = str_capacity_kw args in
+          let _ = (if capn9 < 0 then () else capi_reserve v (if capn9 < 63 then 63 else capn9) true) in
+          v))
     // Hash[k => v, ...] / Hash[{...}] and Array[...] constructor syntax.
     // Hash[...] takes three shapes: one Hash, one array of [k, v] pairs, or a
     // flat even-length argument list. Only the first was built; the other two
@@ -23814,6 +23820,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             + str_count () + vec_get hash_ctr 0 + (proc_next () - handle_base) + map_len bind_store)
     else if str_eq c "GC" && (str_len name == 10 && str_eq name "total_time") then
       VInt (if map_has gc_state "ns" then map_get gc_state "ns" else 0)
+    // (GC::INTERNAL_CONSTANTS: the sizes the String structs C sees are
+    //  allocated in -- capi/mirror.c's slots; 0 where there is no C side)
+    else if str_eq c "GC" && (str_len name == 13 && str_eq name "__capi_layout") then
+      (match args with Cons (VInt i9, _) -> VInt (mr_capi_layout i9) | _ -> VInt 0)
     else if str_eq c "GC" && str_eq name "__latest" then
       (let get9 = fn (k9: str) -> VInt (if map_has gc_state k9 then map_get gc_state k9 else 0) in
        let by9 = (if map_has gc_state "latest_by" then get9 "latest_by" else VNil) in
@@ -24887,6 +24897,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           then capi_enter env world (CapiReq { op = 4, a = map_get capi_ids (oid9 * 8), b = 4, c = 0, d = 4, e = 0 }) Nil
           else VInt 0)
        | _ -> VInt 0)
+    // (a String's struct as C sees it, or would when it first looks: its
+    //  slot, whether its bytes are in it, its buffer -- ObjectSpace.dump's
+    //  slot_size and embedded, memsize_of; nil where there is no C side)
+    else if str_eq c "ObjectSpace" && (str_len name == 12 && str_eq name "__str_layout") then
+      (match args with
+       | Cons (VStr h9, _) ->
+         (let num9 = (if map_has capi_ids (h9 * 8 + 1) then map_get capi_ids (h9 * 8 + 1) else 0 - 1) in
+          let bl9 = CapiWord { w = str_len (sget h9) } in
+          let ei9 = mr_capi_enc_index (senc_get h9) in
+          let slot9 = (mr_capi_str_layout num9 0 bl9 ei9).w in
+          if slot9 == 0 then VNil
+          else arr_new (Cons (VInt slot9, Cons (VBool ((mr_capi_str_layout num9 1 bl9 ei9).w == 1),
+                                                Cons (VInt (mr_capi_str_layout num9 2 bl9 ei9).w, Nil)))))
+       | _ -> VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 19 && str_eq name "__internal_class_of") then
       (match args with Cons (value, _) -> objectspace_class_of world value | _ -> VNil)
     else if str_eq c "ObjectSpace" && (str_len name == 10 && str_eq name "__fin_flag") then
@@ -58570,6 +58594,13 @@ and new_plain_object = fn world -> fn (cls: str) -> fn (args: Val list) ->
     let block = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
     let _ = invoke_result world block object cls "initialize" args true in object
   else tp_init_around world object (fn (u: unit) -> init_arity_refuse world cls args object)
+// The `capacity:` keyword of a String constructor's arguments, -1 when none.
+and str_capacity_kw = fn (args: Val list) ->
+  let rec last9 = fn (xs: Val list) -> fn (acc: Val) ->
+    (match xs with Nil -> acc | Cons (VHsh oh, t9) -> last9 t9 (VHsh oh) | Cons (_, t9) -> last9 t9 acc) in
+  match last9 args VNil with
+  | VHsh oh -> (match hash_lookup (hderef oh) (VSym "capacity") with (true, VInt n9) -> n9 | _ -> 0 - 1)
+  | _ -> 0 - 1
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
   if map_len capi_alloc > 0 && capi_allocator world cls >= 0 then
     capi_construct world cls args (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
@@ -58650,7 +58681,7 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
         (match c with
          | VStr id -> (let _ = senc_set id (if str_eq ename "" then "ASCII-8BIT" else ename) in c)
          | _ -> c))) in
-     let _ = capi_reserve made capn in
+     let _ = capi_reserve made capn false in
      made)
   // Time.new(y[,m,d,h,mi,s]) — a minimal, comparable Time object: a Time-class
   // VObj carrying a monotonic ordinal ivar (enough for <=> and range membership).

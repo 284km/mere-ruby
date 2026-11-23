@@ -11583,7 +11583,8 @@ a buffer twice as long as needed:
   smallest slot); otherwise as.heap.ptr. C reads the flag before it asks
   for the bytes (RSTRING_PTR tests it first), so where they are is settled
   when the head is refreshed: MR_DESCRIBE now carries a String's bytesize
-  (<<16). A String with no bytes fetched yet goes where it fits; one in the
+  (from bit 32: below it #160's encoding index and coderange bit). A
+  String with no bytes fetched yet goes where it fits; one in the
   struct that Ruby grew past it moves out then; one in a buffer stays there
   until rb_str_resize brings it back (string.c's rule).
 - **Buffers as long as asked.** A fetched String's buffer is its length
@@ -11612,15 +11613,51 @@ test (all 94 test/-ext- files, against main's binary). capi/check/api.rb:
 10 contracts (a String Ruby grows between two looks from C, rb_str_cat of
 its own bytes out of the struct, rb_str_buf_new, rb_str_modify_expand's
 exact room, rb_str_resize out and back, String.new(capacity:), a read into a
-buffer), the same on both sides. capi/check/spec_expect.tsv re-recorded:
-class_spec 97 -> 103 and gc_spec 20 -> 25 on the mere-ruby side, which
-main's binary already passes (not this change; string_spec stays 291).
+buffer), the same on both sides.
 
-Not done, on purpose: the other 15 of the 17 target tests (test_capacity's
-embedded / normal / shared / literal / frozen / fstring / encode_bang,
-test_set_len's 6, test_rb_str_dup's 2) compute their sizes from
-GC::INTERNAL_CONSTANTS (BASE_SLOT_SIZE, RBASIC_SIZE,
-RVARGC_MAX_ALLOCATE_SIZE) or ObjectSpace.dump's slot_size, and stop at nil
-before any C runs. Those describe a slot heap this collector does not have;
-the 2026-11-16 decision (note 545 §2) keeps them empty, and corpus 669 / 711
-check that. Waiting for the owner, as before.
+The other 15 of the 17 tests compute their sizes from GC::INTERNAL_CONSTANTS
+(BASE_SLOT_SIZE, RBASIC_SIZE, RVARGC_MAX_ALLOCATE_SIZE) or ObjectSpace.dump's
+slot_size, and stopped at nil before any C ran: the next section.
+
+## 2026-11-23: GC::INTERNAL_CONSTANTS describes the slots the String structs C sees are allocated in
+
+**The decision changed** (the user's, 2026-11-23). On 11-16 it was "empty:
+there is no RVALUE slot heap" (note 545 §2), checked by corpus 669 / 711. Now
+INTERNAL_CONSTANTS describes how the objects C sees are actually allocated,
+as CRuby's MMTk build reports its own collector's values (gc/mmtk/mmtk.c) --
+and for that to be true, not invented, the String mirror allocates that way:
+
+- **Five slot sizes, 40 / 80 / 160 / 320 / 640 bytes** (five words and its
+  doublings, CRuby's variable-width allocation). A String's struct is the
+  first `slot` bytes of the mirror's `as`, and the block is allocated that
+  long (str_take_slot). The slot is the smallest that holds the header
+  (offsetof(struct RString, as.embed.ary), 24), the bytes and the
+  terminator, chosen once -- the first time C sees the String, from its
+  length or the room asked for -- and never changed, as an object's slot is
+  not in CRuby; past 640, or for rb_str_init's capacity ("make noembed
+  always"), the smallest slot and a buffer. Embedded capacity is slot - 24 -
+  termlen; the largest embedded String is 640 - 24 - 1 = 615 bytes.
+- **INTERNAL_CONSTANTS** = {BASE_SLOT_SIZE: 40, RBASIC_SIZE: 16,
+  RVALUE_OVERHEAD: 0, RVARGC_MAX_ALLOCATE_SIZE: 640, SIZE_POOL_COUNT: 5},
+  asked of the C side (mr_capi_layout: slot_sizes[], sizeof(struct
+  RBasic)); MMTk's keys, MMTk's SIZE_POOL_COUNT name. Not HEAP_COUNT, page
+  sizes or OLD_AGE: the interpreter's own values have no slot heap and the
+  collector is not generational, so stat_heap stays empty. The Wasm / RV
+  tree (no C side, m_capi_none.mere) answers 0 and the Hash is empty.
+- **ObjectSpace.dump** of a String has "slot_size" and "embedded" (CRuby's
+  places: after "type", after "frozen"), and **memsize_of** a String is its
+  slot plus its buffer -- what its struct is, or will be made as when C
+  first looks (mr_capi_str_layout). Other objects have no slot and say none.
+- **Freezing resizes** (rb_str_freeze calls rb_str_resize to the length): a
+  frozen String's room asked for is dropped, and a buffer longer than its
+  length by more than min(length, 1 KB) is cut down, or the bytes go back
+  into the slot. `-s` is a new frozen String here, sized to its length.
+- corpus 669 / 711 now check the constants are frozen and either these
+  values or empty (the build without C); the reference takes the other
+  branch (its GC compacts), so the programs print what they printed.
+
+test/-ext-/string: test_capacity 9 of 10 (embedded, normal, literal, frozen,
+fstring, encode_bang now), test_set_len 5 of 6. Left: the shared Strings --
+test_capacity_shared, test_set_len#test_shared, test_rb_str_dup x2: a
+String that shares another's buffer (STR_SHARED, as.heap.aux.shared) is not
+made here, rb_str_dup copies.

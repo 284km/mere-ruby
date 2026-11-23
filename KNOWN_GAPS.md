@@ -15,8 +15,10 @@ with reasons. The upstream EXCLUDES mechanism removes the same methods
 from both interpreters, audits actual removals and reports exclusions apart
 from MATCH/RED. It does not exclude allocation comparisons.
 
-`GC::INTERNAL_CONSTANTS` and `GC.stat_heap` describe no RVALUE slot heap;
-they are empty. `GC::OPTS` advertises no generational GC. Unavailable
+`GC::INTERNAL_CONSTANTS` describes the slots the String structs C sees are
+allocated in (capi/mirror.c: 40 to 640 bytes, five sizes, MMTk's keys; empty
+in a build with no C side); the interpreter's own values have no slot heap,
+so `GC.stat_heap` is empty and there is no HEAP_COUNT. `GC::OPTS` advertises no generational GC. Unavailable
 compaction operations raise NotImplementedError and respond_to? is false.
 `GC.config[:implementation]` is `mere-ruby`; the CRuby GC-library-name test
 is excluded instead of changing the reference's collector identity.
@@ -4701,7 +4703,8 @@ come from the same native tag and preserve the primitive subclass name.
 The independent stage 9 GC work records actual collection causes, weak-map
 observations and process CPU profiling records. Unsupported compaction APIs
 raise NotImplementedError and report respond_to? false. INTERNAL_CONSTANTS
-contains no invented slot/heap values; stat_heap exposes no nonexistent pools.
+reports only the String structs' real slot sizes (2026-11-23); stat_heap
+exposes no nonexistent pools.
 The GC-only subset in #112 has 41 explicit exclusions. This integrated
 stack also includes 16 ObjectSpace exclusions, for 57 audited exclusions
 on both interpreters, reported separately. The Enumerable P2 remains open.
