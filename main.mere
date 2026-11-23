@@ -19393,6 +19393,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               | Nil -> (let _ = raise_exc world "ArgumentError"
                           "wrong number of arguments (given 0, expected 1+)" in ())
               | _ -> ()) in
+     // (an instance of a Module subclass is the module it backs, as it is to
+     //  include: `o.extend(EnumMethods.new(k))` was "expected Module")
+     let rec smv9 = fn (xs: Val list) ->
+       (match xs with Nil -> (Nil : Val list) | Cons (h9, t9) -> Cons (scope_mod_val world h9, smv9 t9)) in
+     let args = smv9 args in
      let _ = extend_arg_check world args in
      // a refinement is not a module an object can be extended with
      let _ = (let rec anyref9 = fn (xs: Val list) ->
@@ -19524,6 +19529,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (str_len name == 9 && str_eq name "exception") && exc_is_a world c "Exception"
             && (if has_meth world ("(sng:" ++ c ++ ")") "exception" then false else true) then
       invoke_val_c env world blk recv "new" args false
+    // (an instance of a Module subclass is asked about as the module it
+    //  backs, as include took it: `klass.include?(EnumMethods.new(k))`)
+    else if (str_len name == 8 && str_eq name "include?")
+            && (if cls_meth_own world c name then false else true)
+            && (match args with
+                | Cons (VObj o9, Nil) -> (match scope_mod_val world (VObj o9) with VClass _ -> true | _ -> false)
+                | _ -> false) then
+      invoke_val_c env world blk recv name (Cons (scope_mod_val world (match args with Cons (a9, _) -> a9 | Nil -> VNil), Nil)) false
     // Module#include?(M) takes a MODULE: a class or any other value is the
     // TypeError (a class that answers include? itself -- Enumerable on its
     // singleton -- keeps its own meaning, membership)
@@ -35231,7 +35244,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                && (match args with Nil -> false | _ -> true) then
          (let (h3, ps3, bb3, e3) = newblk in
           let e3c = lv_flat e3 in
-          let _ = map_set e3c "self" (VClass c) in
+          let _ = map_set e3c "self" (mod_inst_self c) in
           let _ = map_set e3c "__definee_cls" (mkstr (if (str_len name == 13 && str_eq name "instance_exec") then "(sng:" ++ c ++ ")" else c)) in
           flow_value (run_block world blk (h3, ps3, bb3, e3c) args))
        else if ((str_len name == 10 && str_eq name "class_eval") || (str_len name == 11 && str_eq name "module_eval") || (str_len name == 13 && str_eq name "instance_eval"))
@@ -35261,8 +35274,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                      | Cons (p3, _) ->
                        (let ch3 = lv_child e3 in let _ = brk_carry e3 ch3 in
                         let a3 = (if (str_len name == 10 && str_eq name "class_exec") || (str_len name == 11 && str_eq name "module_exec")
-                                  then (match args with Cons (a9, _) -> a9 | Nil -> VClass c)
-                                  else VClass c) in
+                                  then (match args with Cons (a9, _) -> a9 | Nil -> mod_inst_self c)
+                                  else mod_inst_self c) in
                         // (a splat `|*args|` takes them as one Array)
                         let _ = (if str_len p3 > 1 && str_eq (char_at p3 0) "*" && (if str_eq (char_at p3 1) "*" then false else true)
                                  then lv_set ch3 (substring p3 1 (str_len p3)) (arr_new (Cons (a3, Nil)))
@@ -38937,7 +38950,12 @@ and mod_inst_delegates = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VObj id ->
     (is_module_method name || str_eq name "define_method"
-     || str_eq name "private" || str_eq name "public" || str_eq name "protected")
+     || str_eq name "private" || str_eq name "public" || str_eq name "protected"
+     // (and the attribute definers, which modmeth leaves out on purpose: an
+     //  instance of a Module subclass defines its own readers in #initialize,
+     //  as ActiveModel's InstanceMethodsOnActivation does)
+     || str_eq name "attr_reader" || str_eq name "attr_writer" || str_eq name "attr_accessor"
+     || str_eq name "attr")
     && (if str_eq name "singleton_class" || str_eq name "singleton_class?" || str_eq name "instance_variable_get"
            || str_eq name "allocate" || str_eq name "attached_object" || str_eq name "superclass"
            || str_eq name "subclasses" then false else true)
@@ -39052,6 +39070,10 @@ and mixin_module_name = fn world -> fn (value9: Val) ->
   match scope_mod_val world value9 with
   | VClass name9 when map_has modules name9 -> name9
   | _ -> (let _ = raise_exc world "TypeError" ("wrong argument type " ++ class_name value9 ++ " (expected Module)") in "")
+// the Module-subclass instance an anonymous backing module stands for
+// (mod_inst_backing), or the module itself
+and mod_inst_self = fn (c: str) ->
+  if is_anon_cls c && map_has gc_hold ("modbk:" ++ c) then map_get gc_hold ("modbk:" ++ c) else VClass c
 and mod_inst_backing = fn world -> fn (recv: Val) ->
   let (_, _, _, iv9) = world in
   match recv with
@@ -61750,7 +61772,11 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   //   `using` that was inside `Class.new do ... end` is not refined, and a
   //   `Module.new do` written inside one is (ref_enter_env)
   let _ = (if ref_on () then ref_install (ref_env_id denv) else ()) in
-  let _ = map_set cenv "self" (VClass cls) in
+  // (self is the module the body was asked of: for an instance of a Module
+  //  subclass that is the instance, not the anonymous module holding its
+  //  methods (mod_inst_backing) -- `EnumMethods.new(k).module_eval { helper }`
+  //  calls the subclass's own private helper, as activerecord's enum does)
+  let _ = map_set cenv "self" (mod_inst_self cls) in
   // A CLASS BODY establishes its own definee (the class), and this env is a
   // CHILD of the block's -- so an enclosing instance_eval's definee reached
   // into it and every `def` the body could not handle itself went to the wrong
@@ -64858,6 +64884,15 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     (let self9 = (if lv_has env "self" then lv_get env "self" else VNil) in
      match self9 with
      | VClass _ ->
+       (let m0 = (if str_len mode > 1 && str_eq (char_at mode (str_len mode - 1)) "!" then substring mode 0 (str_len mode - 1) else mode) in
+        let flag9 = (if str_len mode > 1 && str_eq (char_at mode (str_len mode - 1)) "!" then true else false) in
+        let rec sy9 = fn (ns: str list) -> (match ns with Nil -> (Nil : Val list) | Cons (n9, t9) -> Cons (VSym n9, sy9 t9)) in
+        let args9 = (if flag9 then list_append (sy9 syms) (Cons (VBool (str_eq m0 "rw"), Nil)) else sy9 syms) in
+        let nm9 = (if flag9 then "attr" else if str_eq m0 "r" then "attr_reader" else if str_eq m0 "w" then "attr_writer" else "attr_accessor") in
+        FNext (invoke_val_c env world blk self9 nm9 args9 false))
+     // (...and in a method of a Module subclass, whose self is the module
+     //  instance: `attr_reader :x` in its #initialize defines on it)
+     | VObj _ when mod_inst_delegates world self9 "attr_reader" ->
        (let m0 = (if str_len mode > 1 && str_eq (char_at mode (str_len mode - 1)) "!" then substring mode 0 (str_len mode - 1) else mode) in
         let flag9 = (if str_len mode > 1 && str_eq (char_at mode (str_len mode - 1)) "!" then true else false) in
         let rec sy9 = fn (ns: str list) -> (match ns with Nil -> (Nil : Val list) | Cons (n9, t9) -> Cons (VSym n9, sy9 t9)) in
