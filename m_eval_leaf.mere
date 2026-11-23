@@ -878,6 +878,16 @@ and hng_key = fn (recv: Val) ->
   // re.match` went nowhere at all before -- test_string's test_match_method.
   | VRegex (p9, f9, e9) -> "rx:" ++ f9 ++ chr 1 ++ e9 ++ chr 1 ++ p9
   | _ -> ""
+// hng_key for a READ of hng_store: "" when the value's id was never noted
+// (hng_put), without making the key. Every write still makes it with hng_key.
+and hng_key_q = fn (recv: Val) ->
+  match recv with
+  | VStr h -> if map_has hng_prim_ids (h * 8 + 1) then hng_key recv else ""
+  | VArr h -> if map_has hng_arr_ids h then hng_key recv else ""
+  | VHsh h -> if map_has hng_prim_ids (h * 8 + 3) then hng_key recv else ""
+  | VProc p -> if map_has hng_prim_ids (p * 8 + 4) then hng_key recv else ""
+  | VBind b -> if map_has hng_prim_ids (b * 8 + 5) then hng_key recv else ""
+  | _ -> hng_key recv
 and moved_key = fn (v: Val) -> match v with VObj id -> "obj:" ++ str_of_int id | VStr _ -> hng_key v | VArr _ -> hng_key v | VHsh _ -> hng_key v | _ -> ""
 and is_moved = fn (v: Val) ->
   if vec_get moved_on 0 == 1 then (let k = moved_key v in if str_eq k "" then false else map_has moved_set k) else false
@@ -4218,9 +4228,28 @@ and dispatch_cls_of = fn world -> fn (recv: Val) ->
   | VClass c -> c
   // a primitive tagged as a subclass instance reports the subclass (so super
   // resumes above it, reaching the builtin base).
-  | _ -> let hk = hng_key recv in
+  | _ -> let hk = hng_key_q recv in
          if (if str_eq hk "" then false else true) && map_has hng_store hk && (if is_sng_cls (map_get hng_store hk) then false else true)
          then map_get hng_store hk else class_name recv
+// a new String made from a subclass instance's, of that subclass. A
+// singleton class's tag is not carried (the copy has no singleton methods),
+// but the class it was made from is: `def t.hi` on an S still encodes to an
+// S (its first superclass that is no singleton class).
+and str_keep_sub = fn world -> fn (recv: Val) -> fn (out: Val) ->
+  let (_, sup9, _, _) = world in
+  let hk = hng_key recv in
+  let tag0 = (if str_eq hk "" then "" else if map_has hng_store hk then map_get hng_store hk else "") in
+  let rec real9 = fn (c: str) -> fn (n: int) ->
+    (if str_eq c "" || n > 64 then ""
+     else if is_sng_cls c then real9 (if map_has sup9 c then map_get sup9 c else "") (n + 1)
+     else c) in
+  let tag9 = real9 tag0 0 in
+  if str_eq tag9 "" || str_eq tag9 "String" then out
+  else
+    (match out with
+     | VStr _ -> (let ok9 = hng_key out in
+                  let _ = (if str_eq ok9 "" then () else hng_put ok9 tag9) in out)
+     | _ -> out)
 and no_singleton_here = fn world -> fn (recv: Val) -> fn (fallback: str) ->
   let _ = (match recv with
            | VRat (_, _) -> raise_exc_iv world "FrozenError"
@@ -6045,17 +6074,15 @@ and stdlib_src = fn (name: str) ->
   // wait_readable / wait_writable are in the prelude, over poll(2) -- ruby 4
   // has them without this require -- and a socket is an IO, so they are its
   // too (they were the identity on a BasicSocket of its own, which answered
-  // "ready" for a socket with nothing in it). `ready?` answers "unknown"
-  // rather than a guess.
+  // "ready" for a socket with nothing in it). ⚠ `ready?` is not there:
+  //   io-wait 0.4 (ruby 4.0's) removed it, and ruby answers NoMethodError.
+  //   It answered nil here. (The file is not empty: an empty source is "not
+  //   shipped", and the search would go on to the reference's io/wait.)
   // ⚠ Nothing here may open `class BasicSocket`: without a superclass that
   //   would make it an Object subclass, and the `socket` library's
   //   `class BasicSocket < IO` after it a superclass mismatch.
   if str_eq n "io/wait" then
-    "class IO\n" ++
-    "  def ready?\n" ++
-    "    nil\n" ++
-    "  end\n" ++
-    "end\n"
+    "# io/wait: IO#wait, #wait_readable and #wait_writable are the core's\n"
   // io/nonblock: O_NONBLOCK, as far as the descriptor bookkeeping can say it.
   // Setting it is real (io_set_nonblocking). CLEARING it is not something
   // this interpreter can ask of the kernel -- it takes fcntl(2), which no
@@ -12138,7 +12165,9 @@ and for_recv_name = fn (v: Val) -> for_recv_msg (class_name v)
 and super_missing_msg = fn (meth: str) -> fn (recv: Val) ->
   "super: no superclass method '" ++ meth ++ "' for "
   ++ (match recv with
-      | VClass c9 -> "class " ++ c9
+      // (a module's `module_function` copy runs out as "for module U")
+      //  ...and an anonymous one by its inspect, #<Module:0x...>)
+      | VClass c9 -> (if map_has modules c9 then "module " else "class ") ++ to_s recv
       | VMain -> "main"
       | _ -> for_recv_name recv)
 and meth_base = fn (nm: str) ->
@@ -12274,6 +12303,19 @@ and modfunc_promote = fn world -> fn (cls: str) -> fn (names: str list) ->
     // that something includes must not give the includer a public `m` --
     // that is the whole point of the pair (Kernel#puts is reachable as
     // Kernel.puts and as a private method of every object, not a public one).
+    // ⚠ ...and an INHERITED one gets a private entry of its own in the module,
+    //   as ruby's rb_export_method writes: `include E; module_function :y`
+    //   listed y in U.private_instance_methods(false) there and nothing here.
+    //   That entry has no body (ruby's is a ZSUPER entry): it forwards to the
+    //   next method up the chain when called, so a later redefinition of E#y
+    //   is what an includer of U runs. It is the mark `private :y` on an
+    //   inherited method writes (mark_vis_mode). A copy of the body froze
+    //   the old one there.
+    let _ = (if map_has meths own9 then ()
+             else if map_has meths src && (if str_eq src own9 then false else true) then
+               (let _ = map_set vis_marks own9 VNil in
+                set_private own9 VNil)
+             else ()) in
     let _ = if map_has meths own9 then set_private own9 VNil else () in
     modfunc_promote world cls rest
 and vis_arg_names = fn (args: Val list) ->
