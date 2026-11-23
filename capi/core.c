@@ -192,27 +192,37 @@ static int reads_only(int op) {
  * names (RHASH_SIZE is Hash#size, rb_hash_foreach Hash#each_pair), or the
  * operation. */
 static const char *dmark_refusal(int op, VALUE b, VALUE flags) {
-    static char message[256];
-    static const char *names[] = { "?", "a header read", "a String read", "a String write", "an Array read",
-        "an Array write", "a method call", "a String allocation", "a Float allocation", "a Float read",
-        "an Integer allocation", "an Integer read", "a constant lookup", "a class definition",
-        "a method definition", "an allocator definition", "an object allocation", "a raise",
-        "an outcome", "$!", "an eval", "a Proc allocation", "a Symbol", "a GC request",
-        "an Array allocation", "a break", "$~", "a global variable definition", "the Regexp depth",
-        "a Rational allocation", "rb_f_notimplement", "a Symbol's state", "an ivar read" };
+    static char message[320];
+    static const char *const names[] = {
+        [MR_DESCRIBE] = "a header read", [MR_STR_GET] = "a String read", [MR_STR_SET] = "a String write",
+        [MR_ARY_GET] = "an Array read", [MR_ARY_SET] = "an Array write", [MR_SEND] = "a method call",
+        [MR_STR_NEW] = "a String allocation", [MR_FLOAT_NEW] = "a Float allocation",
+        [MR_FLOAT_GET] = "a Float read", [MR_INT_NEW] = "an Integer allocation",
+        [MR_INT_GET] = "an Integer read", [MR_CONST] = "a constant lookup",
+        [MR_DEFINE_CLASS] = "a class definition", [MR_DEFINE_METHOD] = "a method definition",
+        [MR_DEFINE_ALLOC] = "an allocator definition", [MR_OBJECT_NEW] = "an object allocation",
+        [MR_RAISE] = "a raise", [MR_OUTCOME] = "an outcome", [MR_ERRINFO] = "$!", [MR_EVAL] = "an eval",
+        [MR_PROC_NEW] = "a Proc allocation", [MR_SYMBOL] = "a Symbol", [MR_GC] = "a GC request",
+        [MR_ARY_NEW] = "an Array allocation", [MR_BREAK] = "a break", [MR_BACKREF] = "$~",
+        [MR_DEFINE_GVAR] = "a global variable definition", [MR_RX_DEPTH] = "the Regexp depth",
+        [MR_RAT_RAW] = "a Rational allocation", [MR_NOTIMPL] = "rb_f_notimplement",
+        [MR_SYM_STATE] = "a Symbol's state", [MR_IVAR_READ] = "an ivar read" };
+    const char *tail = "only a header, a String, an Array and an ivar can be read then";
     if (op == MR_SEND) {
         long len = 0;
         const char *name = mr_id_name((ID)b, &len);
-        const char *owner = (flags & MR_SEND_HASH) ? "Hash#" : (flags & MR_SEND_ARRAY) ? "Array#"
+        int hash = (flags & MR_SEND_HASH) != 0;
+        const char *owner = hash ? "Hash#" : (flags & MR_SEND_ARRAY) ? "Array#"
                           : (flags & MR_SEND_STRING) ? "String#" : (flags & MR_SEND_KERNEL) ? "Kernel#" : "#";
-        snprintf(message, sizeof message,
-                 "a dmark called %s%.*s with no C call in progress (RHASH_SIZE and rb_hash_foreach are such calls): "
-                 "only a header, a String, an Array and an ivar can be read then", owner, (int)(name ? len : 1), name ? name : "?");
+        /* (the C function, for the two Hash reads ruby.h makes method calls of here) */
+        const char *what = !hash || !name ? ""
+                         : (len == 4 && !memcmp(name, "size", 4)) ? " (RHASH_SIZE)"
+                         : (len == 4 && !memcmp(name, "to_a", 4)) ? " (rb_hash_foreach)" : "";
+        snprintf(message, sizeof message, "a dmark called %s%.*s%s with no C call in progress: %s",
+                 owner, (int)(name ? len : 1), name ? name : "?", what, tail);
     } else {
-        snprintf(message, sizeof message,
-                 "a dmark asked the interpreter for %s with no C call in progress: "
-                 "only a header, a String, an Array and an ivar can be read then",
-                 op > 0 && op < (int)(sizeof names / sizeof *names) ? names[op] : "a request");
+        const char *n = op > 0 && op < (int)(sizeof names / sizeof *names) && names[op] ? names[op] : "a request";
+        snprintf(message, sizeof message, "a dmark asked the interpreter for %s with no C call in progress: %s", n, tail);
     }
     return message;
 }
