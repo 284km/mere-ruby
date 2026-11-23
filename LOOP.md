@@ -10971,6 +10971,65 @@ private hooks the same way (nothing called), and only those rows were added
 to the table (regenerating the whole table would drop rows added since).
 corpus/777.
 
+## 2026-11-22 (95): test_ast's time, round three -- flags and sets asked as ints
+
+**The point.** Round two (93) left the string keys of the interpreter's own tables as the largest cost. To see which keys, a copy of mr.c counted every string hashed, by its shape (digits folded) and by its two callers: 964 million in the subset below. Many of them were flags and fixed sets asked by name on every call:
+
+| key | hashed | asked by |
+|---|---|---|
+| "tp" | 56 M | tp_hook_on and 72 more, `map_has hook_flags "tp"` |
+| "bd" | 41 M | bi_reg_set / bi_reg_get / bi_rescued (struct_ctr) |
+| "mut", "opmeth", ... | 26 M, 12 M, ... | name_set: the tag hashed twice to find the set |
+| builtin names | 40 M | bi_nix, at every builtin call |
+| class names | 27 M | mro_now_class, from ancestors_of and has_meth |
+| "stf" | 9 M | 16 checks of a flag nothing sets |
+
+Hook flags are never empty in a test file, because test/unit defines method_added.
+
+1. **hook_bits:** "tp" and "mm" are ints beside hook_flags, written where the key is written. hook_tp_on () replaces the 73 reads. "stf" has had no writer since set_trace_func became a TracePoint (189b8356), and neither has trace_fn's "p". The 15 `|| map_has hook_flags "stf"` and fire_trace, which never ran, are taken out.
+2. **bi_reg_d:** the builtin's depth is an int slot. -1 stands for none, as the absent key did.
+3. **bi_nix:** a 64-slot memo of name indexes. The slot is picked by the name's length and end bytes, and the hit is checked against bi_names, so nothing new is stored.
+4. **mro_now_class:** a local epoch is only ever written for a name mro_local_name accepts (mro_lookup_enter, mro_bump_class). Any other name is the global generation without a lookup.
+5. **ns_mut and four more:** the name sets asked per call are made once at the top level.
+6. **builtin_mut_on_frozen** asks frozen first (an int key) and the mutating-name set second.
+
+After this, the subset hashed 724 million strings, and 40% of them were the same pointer as the hash just before: `if map_has m k then map_get m k`. That is Mere's to answer (merelang/mere, a String-keyed Map remembers its last entry). It is not in this PR, but it is measured below as "+ Mere".
+
+On the subset (test_ast's tokens, ranges and not_cared for test/ruby/test_[a-c]*, 78 tests):
+
+| build | instructions | change |
+|---|---|---|
+| main | 331.1e9 | |
+| round two (#159) | 314.4e9 | -5.1% |
+| steps 1-5 | 296.1e9 | -10.6% |
+| step 6 | 294.4e9 | -11.1% |
+| + Mere | 289.9e9 | -12.4% |
+
+The whole of test_ast (2,664 tests; two builds run side by side each time):
+
+| build | instructions | time |
+|---|---|---|
+| main | 3,642.3e9 | 388 s |
+| round two | 3,457.6e9 | 372 s |
+| round three | 3,269.7e9 (-10.2%) | 337 s |
+| + Mere | 3,123.7e9 (-14.2%) | 329 s |
+
+maxRSS moved with the order test/unit picks. With `--seed=42` on the subset: main 1,049-1,084 MB, this round 924-1,030 MB, + Mere 989 MB. Without a seed, one run reads 1,050 MB and another 1,368 MB for the same build.
+
+- Checked:
+  - corpus 803/803. corpus/805 is new: a TracePoint on, off and on, a builtin class's method_missing, frozen receivers, a lambda's arity inside a builtin, the memo's collisions, an anonymous class's generation;
+  - test_settracefunc (the same tests fail as on main), test_module, test_exception, test_string, test_array, test_frozen, test_lambda, test_hash, test_proc, test_object, test_class, test_method and test_iterator give the same results as main;
+  - gates pass.
+- Found on the way (main too, not this round's): `nil.upcase` says "undefined method 'upcase'" where ruby adds "for nil"; `nil.foo` has it.
+- Review of #162: mro_local_name built a substring per `(sng:` wrapper, once per mro_now_class on a singleton class. It now reads the name inside the wrappers in place (mro_local_in, mro_pre_at with str_index_from). A name with no wrapper is still asked with str_starts_with: comparing every name byte by byte in Mere was tried first and cost 2.6% of the subset's instructions. corpus/805 gained the singleton classes of an anonymous class, a Struct and a module, and a singleton's singleton.
+- The reviews of #159 and #162 ran probes that found four differences from ruby. Main gives the same answers, so none is this round's:
+  - `binding.define_singleton_method` raises `TypeError: can't define singleton`.
+  - `def fz.x` on a frozen String succeeds; ruby raises FrozenError.
+  - `s.clone(freeze: true)` is not frozen.
+  - `o.singleton_method_added`, once defined, does not fire for its own name (ruby reports `[:singleton_method_added, :y]`; mere-ruby `[:y]`).
+- The re-review of #162 found one more: `A = Class.new; def A.g = 1; A.g` was a NoMethodError in the evaluator, and so was the same for a Struct. `def C.m` on a constant holding a class keyed the method under the constant's spelling, "(sng:A)", while A's class is AnonClass_N. Named classes never showed it, because their name is their constant's. This was a one-line fix, so it is fixed here: the key now uses the name of the class the constant holds, so `StrAlias = String; def StrAlias.zz` lands on String too. corpus/805 covers it; main fails those lines. test_class, test_struct, test_module, test_object and test_method give the same results as main.
+- Seen while writing that: a Struct class's singleton_methods lacks :inspect, which ruby lists (main too).
+
 ## 2026-11-22 (93): test_ast's time, round two -- a key made per call, and one stack walked twice per collection
 
 **The point.** Round one (91) took 2.5% off. This round sampled the whole of test_ast instead of a subset. The self time was spread out:
