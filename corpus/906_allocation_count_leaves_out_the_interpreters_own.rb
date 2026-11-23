@@ -1,34 +1,36 @@
-# GC.stat(:total_allocated_objects) counts what the program allocates: not a
-# method frame's argument Array (kept for a bare `super`), not the String a
-# `return` through the interpreter's flow made for itself, and not a Hash
-# GC.stat built to answer one key (sqlite3's
+# GC.stat(:total_allocated_objects) and ObjectSpace.each_object agree: an
+# object counted is an object each_object finds, and the interpreter makes
+# none the program does not see -- GC.stat built its whole Hash to answer one
+# key, every method frame made an Array of its arguments that only Struct's
+# initializer reads, and a flow signal made Strings (sqlite3's
 # test_step_does_not_allocate_when_done measures a C method that allocates
 # nothing)
+GC.disable
+def strings = (n = 0; ObjectSpace.each_object(String) { n += 1 }; n)
+def arrays = (n = 0; ObjectSpace.each_object(Array) { n += 1 }; n)
+def measure(n)
+  s0 = strings; a0 = arrays; t0 = GC.stat(:total_allocated_objects)
+  n.times { yield }
+  t1 = GC.stat(:total_allocated_objects); a1 = arrays; s1 = strings
+  [t1 - t0, s1 - s0, a1 - a0]
+end
 class C
   def i(a) = a
-  def self.c(a) = a
-  def r(a)
-    return a
-  end
+  def self.c(a, b) = b
 end
-module G; def self.s(a, b) = b; end
 o = C.new
 def m1(a) = a
-def window
-  2.times { yield }
-  b = GC.stat(:total_allocated_objects)
-  yield
-  GC.stat(:total_allocated_objects) - b
+cases = [[:strings, proc { "a" + "b" }], [:arrays, proc { [1, 2] }], [:instance_call, proc { o.i(1) }],
+         [:class_call, proc { C.c(1, 2) }], [:main_call, proc { m1(1) }], [:stat, proc { GC.stat(:count) }]]
+# (each case once first: a first call may fill a cache, in either runtime)
+2.times { cases.each { |_, pr| measure(1, &pr) } }
+base = measure(0) { }
+cases.each do |name, pr|
+  [1, 10].each do |n|
+    t, s, a = measure(n, &pr)
+    p [name, n, t - base[0], s - base[1], a - base[2]]
+  end
 end
-window { o.i(1) }
-p window { o.i(1) }
-p window { C.c(1) }
-p window { G.s(1, 2) }
-p window { m1(1) }
-p window { o.r(1) }
-p window { nil }
-p window { [1, 2] } >= 1
-p window { "x" + "y" } >= 1
 p GC.stat(:count).is_a?(Integer), GC.stat[:total_allocated_objects].is_a?(Integer)
 begin
   GC.stat(:no_such_key)

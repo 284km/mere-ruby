@@ -31,16 +31,36 @@ same names on both sides. The differences, one by one:
   and whose dump adds `"struct"`. capi/check typeddata covers it: 113
   contracts on both sides.
 - **test_step_does_not_allocate_when_done: fixed.**
-  `GC.stat(:total_allocated_objects)` taken twice around a `Statement#step`
-  that allocates nothing read 2. That was three kinds of allocation the
-  interpreter made for itself:
-  - GC.stat built its whole Hash to answer one key;
-  - each method frame's `__args` Array, kept for a bare `super`;
-  - the Strings a flow signal makes, two per `return` through the
-    interpreter's flow.
-  GC.stat now answers a key without the Hash. The other two are made by
-  arr_new_internal / mkstr_internal, which count themselves in str_n's
-  second slot, and GC.__allocated_so_far leaves that slot out. corpus 906.
+  `GC.stat(:total_allocated_objects)`, read twice around a
+  `Statement#step` that allocates nothing, differed by 2. The interpreter
+  was making objects for itself, and they are real objects:
+  `ObjectSpace.each_object(String)` and `(Array)` found them too.
+  - GC.stat built its whole Hash to answer one key. It now answers the key
+    without the Hash.
+  - Each method frame got an Array of its arguments, `__args`, which only
+    Struct's generated initializer reads (a bare `super` reads
+    `__params`). It is now built only for that body (`SReturn EStructInit`).
+  - Each `return` / `break` / `next` / `throw` out of a block made two
+    Strings: the flow signal's kind (`flow_sig "k"`) and its "unhandled"
+    message (`prim_missing "i"`). Now there is one frozen String per text,
+    made once and held in gc_hold as "flow:" ++ text (flow_str), which
+    is rooted like the rest of gc_hold.
+  So nothing is subtracted from the count: the objects are no longer made.
+  A first version of this fix did subtract them (mkstr_internal /
+  arr_new_internal); I dropped it, because that made the count disagree
+  with the objects that exist.
+  - corpus 906 shows the count and each_object agreeing around the same
+    code. It runs String-, Array-making and calling code 1 and 10 times;
+    the delta of GC.stat and of each_object(String) / each_object(Array)
+    match each other and match ruby. Before, an instance or class method
+    call with an argument added an Array.
+  - corpus 907: 10 and 100 `return` / `break` / `throw` out of a block add
+    no String, as on ruby. On main, 10 such calls added 31 Strings on the
+    evaluator and 21 on the VM (work2026-fd's measurement).
+  - Not changed, found on the way: counting with
+    `ObjectSpace.each_object(Array).count` (an Enumerator) makes Arrays in
+    proportion to the objects it walks; counting with a block does not.
+    The corpus programs count with a block.
 - **One GC.start leaving released objects (4 tests): partly found, not
   fixed.** test_replacing_a_collation_(by_another_case_)releases_the_previous_comparator
   and test_aggregate_instance(s)_are_released_* count with
@@ -57,14 +77,39 @@ same names on both sides. The differences, one by one:
     run_until_gc_n is a tail call now, and a statement's value is dropped
     inside its own region STMT unless --eval-print prints it. Three
     statements that kept 3 keep 0; 20 that kept 20 keep 0.
-  - What is left: sqlite3's comparators and aggregators are held the same
-    way, by the conservative scan of the interrupted method's stack and open
-    regions. With MERE_RUBY_GC_DBG=4 (that scan left out) all four pass.
-    That is not a precise hold to drop: it is what the scan reads (Mere's
-    coro_scan_ints reads the open region blocks as well as the stack). It
-    would need the scan, or what the C call path leaves in open regions, to
-    change. A top-level `x = Plain.new; x = nil` and `Plain.new.tap {}`
-    still keep 1 the same way.
+  - What is left: sqlite3's comparators and aggregators. The
+    conservative scan of the interrupted stack, and of the regions open on
+    it, holds them. With that scan left out (MERE_RUBY_GC_DBG=4), all four
+    tests pass. Mere's coro_scan_ints reads the open region blocks as well
+    as the stack, and some region still open while the test method runs
+    keeps the object ids of the comparators and aggregators that went
+    through C (`Database#collation`, `#define_aggregator`). I have not
+    found which allocation, in which region, it is. A top-level
+    `x = Plain.new; x = nil` and `Plain.new.tap {}` still keep 1 the same
+    way.
+  - **This hold is not bounded, and is a leak in practice.**
+    - In a method, `SQLite3::Database.new` with 50 `define_aggregator`s,
+      then `close`, done 5 times: after 2 and then 7 more `GC.start`s, all
+      5 Databases and their 250 aggregators are still there. Ruby has 0.
+    - Without the scan (MERE_RUBY_GC_DBG=4), 1 Database and 50 aggregators
+      remain after the first GC.start, and 0 of each by the later ones.
+    - With 3,000 `define_aggregator`s on one Database, closed and dropped:
+      3,007 aggregators remain on mere-ruby, 1 on ruby.
+    - So the objects are not released by a later collection. It is the
+      scan, and it grows with what was made.
+  - **Whether this affects activerecord:** activerecord's own sqlite3
+    adapter (8.1.4.1, activerecord/lib/active_record/connection_adapters/
+    sqlite3_adapter.rb and sqlite3/) registers none of what is held here.
+    It never calls `collation`, `create_function` / `define_function`,
+    `create_aggregate` / `define_aggregator`, `trace` or `authorizer`. The
+    raw connection methods it calls are `prepare`, `execute_batch`,
+    `changes`, `total_changes`, `encoding`, `busy_handler_timeout=`,
+    `rollback`, `closed?`, and the pragma writers through `public_send`.
+    Its tests use no comparator or aggregator either (`collation` there is
+    `DatabaseTasks.collation`, another thing). So no activerecord test
+    waits for one to be freed. But the scan holds closed Databases
+    themselves (the first item above), so a process that opens and closes
+    many connections keeps them: memory, not results.
   - No corpus program for the top-level fix: under MERE_RUBY_VM=1 the VM
     runs the file and its frames keep the values (1, 1, 3, 4 where ruby says
     0), so a corpus program would fail the VM corpus. Recorded for the VM.
@@ -92,12 +137,16 @@ throwaway extension whose dmark reads RHASH_SIZE.
 
 ## Checks
 
+With the final binary (O2):
+
+- run_corpus.sh: 838/838 corpus programs match ruby.
+- tools/iseq/vm_corpus.sh: 838 programs, 834 on the VM and 4 on the
+  evaluator (fell back), 0 FAIL.
 - capi_check: every contract agrees on both sides and holds under stress
   (ensure 58, typeddata 113, loader 48 on ruby / 49 on mere-ruby, numeric 13,
-  fiber 16, api 245),
-  and every negative control fails as it must.
-- corpus 906 matches on the evaluator, under MERE_RUBY_VM=1 and with
-  MERE_RUBY_NO_HASH_INDEX=1.
-- 157 corpus programs that use GC / ObjectSpace / top-level return /
-  at_exit / BEGIN, run one at a time: all match.
-- `--eval-print` still prints the last value.
+  fiber 16, api 245), and every negative control fails as it must.
+- corpus 906 and 907 also match with MERE_RUBY_NO_HASH_INDEX=1.
+- sqlite3's suite: 410 runs, 13 failures, 2 errors, 23 skips; the failures
+  beyond the reference's are the four release counts above.
+- `--eval-print` still prints the last value. The gates and record_hygiene
+  pass.
