@@ -95,3 +95,10 @@ t(:cl_s) { "x".clone(freeze: 1) }
 t(:cl_a) { [1].clone(freeze: "y") }
 t(:cl_h) { {}.clone(freeze: :z) }
 t(:cl_nil) { "x".freeze.clone(freeze: nil).frozen? }
+# (second review of #175) singleton_methods(false) leaves out a struct
+# class's new or inspect made private or undefined
+Sa = Struct.new(:a); class << Sa; undef_method :new; end
+Sb = Struct.new(:a); Sb.private_class_method :new
+Sd = Struct.new(:a); class << Sd; undef_method :inspect; end
+Sp = Struct.new(:a); Sp.private_class_method :inspect
+t(:own) { [Sa, Sb, Sd, Sp].map { |k| k.singleton_methods(false).sort } }

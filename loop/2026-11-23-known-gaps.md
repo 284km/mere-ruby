@@ -32,3 +32,12 @@ The review found one regression and three smaller problems.
 - `def a.x` on a non-literal string after `-a` is TypeError here, where ruby says FrozenError.
 - The singleton class of a singleton class does not list the five names.
 - For any name but the hook's own, an object's singleton hook still fires before the write.
+
+## Second review of #175: a struct class's new or inspect made private or undefined
+
+`singleton_methods(false)` listed `:new` and `:inspect` for a struct class even after `private_class_method :new` or `class << S; undef_method :new; end`, where ruby leaves them out. main had (false) right, so this was the PR's own regression. The added names now skip a name that is private there or undefined there (`privates`, `undef_blocked`), and so does the full list's `:inspect`.
+
+**Follow-ups** (older than this PR):
+
+- `clone` with an unknown keyword (`foo:`, `"freeze" =>`) is accepted, and so is `freeze: 1` on a Regexp or a Range; ruby refuses both.
+- The full `singleton_methods` list of such a struct class still shows `:new`; main does too.
