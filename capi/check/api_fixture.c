@@ -306,6 +306,28 @@ static VALUE nogvl_call_raise(VALUE self) {
     rb_thread_call_without_gvl(call_raising, NULL, RUBY_UBF_IO, NULL);
     return Qfalse;
 }
+/* (a function that reads a __thread variable C set before the call: with no
+ *  other Ruby thread alive it runs on the caller's native thread) */
+static __thread int tls_slot;
+static void *read_tls(void *arg) { (void)arg; return (void *)(long)tls_slot; }
+static VALUE nogvl_tls(VALUE self) {
+    (void)self;
+    tls_slot = 42;
+    return LONG2NUM((long)rb_thread_call_without_gvl(read_tls, NULL, RUBY_UBF_IO, NULL));
+}
+/* (errno as the function left it, read by C after the call) */
+static void *read_closed(void *arg) {
+    char c;
+    (void)arg;
+    errno = 0;
+    return (void *)(long)read(-1, &c, 1);
+}
+static VALUE nogvl_errno(VALUE self) {
+    (void)self;
+    errno = 0;
+    long n = (long)rb_thread_call_without_gvl(read_closed, NULL, RUBY_UBF_IO, NULL);
+    return rb_ary_new_from_args(2, LONG2NUM(n), INT2FIX(errno == EBADF));
+}
 static void *read_one(void *fd) {
     char c;
     return (void *)(long)read(*(int *)fd, &c, 1);
@@ -320,6 +342,8 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "nogvl_nap", nogvl_nap, 1);
     rb_define_singleton_method(mod, "nogvl_call_back", nogvl_call_back, 1);
     rb_define_singleton_method(mod, "nogvl_read", nogvl_read, 1);
+    rb_define_singleton_method(mod, "nogvl_tls", nogvl_tls, 0);
+    rb_define_singleton_method(mod, "nogvl_errno", nogvl_errno, 0);
     rb_define_singleton_method(mod, "nogvl_stubborn", nogvl_stubborn, 1);
     rb_define_singleton_method(mod, "nogvl_call_raise", nogvl_call_raise, 0);
     rb_define_singleton_method(mod, "funcall_public", funcall_public, 2);

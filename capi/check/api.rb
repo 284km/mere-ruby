@@ -564,6 +564,15 @@ Class.new.define_method(sym) {}
 check(A.check_id(fresh))
 check(A.check_id(sym))
 
+# (without the GVL, with no other Ruby thread alive: the function runs on
+#  the caller's native thread, and sees the __thread value C set)
+check(Thread.list.size == 1 && A.nogvl_tls == 42)
+# (...and errno is what the function left, whichever native thread it ran
+#  on: alone, and with another thread alive)
+check(A.nogvl_errno == [-1, 1])
+other = Thread.new { sleep 5 }
+check(A.nogvl_errno == [-1, 1])
+other.kill
 # (without the GVL: another thread runs while the function naps; the
 #  function can call back into Ruby; a kill ends a blocking read)
 ticks = 0

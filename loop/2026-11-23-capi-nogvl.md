@@ -60,3 +60,22 @@ calls back with the GVL, and a kill ends a blocking read -- on both sides.
   FD_CLOEXEC now. **[Suggestion]** recorded in capi/nogvl.c: before the
   first without-GVL call, with_gvl from a foreign native thread is not
   caught.
+- (automated review, mere-pr-review-watch) **[Major] native-thread affinity**:
+  every call ran on a worker, so a function that reads a __thread variable
+  its caller set (or unlocks a mutex the caller's thread owns) saw another
+  thread's (probe: 42 in ruby and on main, 0 here). Now the worker is used
+  only when it buys something: when another Ruby thread is alive to run
+  meanwhile, or when rb_nogvl is given RB_NOGVL_OFFLOAD_SAFE. With no other
+  Ruby thread alive the function runs right there, on the interpreter's
+  native thread, as on main, and a trapped signal still reaches its
+  unblocking function (main's signal step, kept as inline_call). With other
+  threads alive the function's native thread is not the caller's: that is
+  the price of running them meanwhile on a one-native-thread interpreter,
+  and capi/nogvl.c says so. capi/check: with Thread.list of one, the
+  function sees the caller's __thread value (42, as in ruby).
+- (re-review) **errno** is thread-local too: on a worker the function's
+  errno was not the caller's, and `n = rb_thread_call_without_gvl(...);
+  if (n < 0) rb_sys_fail(...)` read the wrong one. The worker keeps errno as
+  the function left it and the caller gets it back. capi/check: a read on
+  a bad descriptor gives -1 and EBADF to C, alone and with another thread
+  alive.

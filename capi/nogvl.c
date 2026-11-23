@@ -5,10 +5,22 @@
  * (m_sched.mere). A C function "without the GVL" -- a select, a socket
  * accept, a long computation -- used to run right there, and every Ruby
  * thread waited for it (nio4r's Selector#select in a thread stopped Puma).
- * Now it runs on a worker native thread, and the Ruby thread that called it
- * waits for it the way Ruby waits for an IO: on the read end of the worker's
- * pipe, through IO#wait_readable, which the scheduler turns into turns for
- * the other threads.
+ *
+ * Which native thread it runs on is a choice CRuby never has to make (each
+ * Ruby thread is a native thread of its own), and a function may depend on
+ * it -- a __thread variable C set before the call, a mutex the thread owns:
+ *
+ *   - When no other Ruby thread is alive (Thread.list has only the caller),
+ *     there is nothing to run meanwhile: the function runs right there, on
+ *     the interpreter's native thread, as before -- and a signal the
+ *     program traps still reaches the unblocking function (inline_call).
+ *   - When other Ruby threads are alive, or the caller said
+ *     RB_NOGVL_OFFLOAD_SAFE (rb_nogvl), it runs on a worker native thread,
+ *     and the Ruby thread that called it waits for it the way Ruby waits for
+ *     an IO: on the read end of the worker's pipe, through IO#wait_readable,
+ *     which the scheduler turns into turns for the other threads. There,
+ *     its native thread is not the caller's: thread-local data C set before
+ *     the call is not what the function sees.
  *
  *   - Workers are kept and used again (an idle list), each with its pipe and
  *     the IO on its read end: a call costs a hand-over, not a thread.
@@ -55,6 +67,7 @@ struct worker {
     /* the job */
     void *(*func)(void *);
     void *data, *result;
+    int err;                    /* errno as the function left it */
     int has_job;
     /* rb_thread_call_with_gvl's call, while asked */
     void *(*call)(void *);
@@ -86,7 +99,9 @@ static void *worker_main(void *arg) {
         pthread_mutex_lock(&w->lock);
         while (!w->has_job) pthread_cond_wait(&w->wake, &w->lock);
         pthread_mutex_unlock(&w->lock);
+        errno = 0;
         w->result = w->func(w->data);
+        w->err = errno;   /* (errno is the worker's own: the caller gets it back) */
         pthread_mutex_lock(&w->lock);
         w->has_job = 0;
         pthread_mutex_unlock(&w->lock);
@@ -183,8 +198,53 @@ static int drain(struct worker *w, int *call_state) {
     return 0;
 }
 
-static void *without_gvl(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2) {
+/* ---- right there, on the interpreter's thread ---------------------------- */
+/* (a signal the program traps is given one more step while the function
+ *  runs: the interpreter's handler, which notes it, then the unblocking
+ *  function; the trap itself runs when the function has returned) */
+static rb_unblock_function_t *inline_ubf;
+static void *inline_ubf_data;
+static struct sigaction inline_previous[NSIG];
+static void inline_handler(int sig, siginfo_t *info, void *context) {
+    struct sigaction *old = &inline_previous[sig];
+    if (old->sa_flags & SA_SIGINFO) { if (old->sa_sigaction) old->sa_sigaction(sig, info, context); }
+    else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) old->sa_handler(sig);
+    if (inline_ubf && inline_ubf != RUBY_UBF_IO && inline_ubf != RUBY_UBF_PROCESS) inline_ubf(inline_ubf_data);
+}
+static void *inline_call(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2) {
+    rb_unblock_function_t *outer = inline_ubf;
+    void *outer_data = inline_ubf_data;
+    int wrapped[NSIG] = { 0 };
+    if (ubf && ubf != RUBY_UBF_IO && ubf != RUBY_UBF_PROCESS && !outer) {
+        for (int sig = 1; sig < NSIG; sig++) {
+            struct sigaction current;
+            if (sig == SIGKILL || sig == SIGSTOP || sigaction(sig, NULL, &current) != 0) continue;
+            if (!(current.sa_flags & SA_SIGINFO) && (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN)) continue;
+            inline_previous[sig] = current;
+            struct sigaction ours = current;
+            ours.sa_sigaction = inline_handler;
+            ours.sa_flags |= SA_SIGINFO;
+            if (sigaction(sig, &ours, NULL) == 0) wrapped[sig] = 1;
+        }
+    }
+    inline_ubf = ubf;
+    inline_ubf_data = data2;
+    void *result = func(data1);
+    inline_ubf = outer;
+    inline_ubf_data = outer_data;
+    for (int sig = 1; sig < NSIG; sig++) if (wrapped[sig]) sigaction(sig, &inline_previous[sig], NULL);
+    return result;
+}
+/* (is any other Ruby thread alive, to run while the function does?) */
+static int others_alive(void) {
+    VALUE list = mr_call(rb_cThread, "list", 0);
+    return RB_TYPE_P(list, T_ARRAY) && RARRAY_LEN(list) > 1;
+}
+
+static void *without_gvl(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2, int flags) {
     if (running_worker) return func(data1);   /* (from a worker: right there) */
+    if (!interp_known) { interp_thread = pthread_self(); interp_known = 1; }
+    if (!(flags & RB_NOGVL_OFFLOAD_SAFE) && !others_alive()) return inline_call(func, data1, ubf, data2);
     if (!interp_known) { interp_thread = pthread_self(); interp_known = 1; }
     install_wake_handler();
     struct worker *w = take_worker();
@@ -211,22 +271,25 @@ static void *without_gvl(void *(*func)(void *), void *data1, rb_unblock_function
         if (!again && RTEST(ready)) done = drain(w, &call_state);
     }
     void *result = w->result;
+    int err = w->err;
     w->next_idle = idle;
     idle = w;
     if (state) rb_jump_tag(state);
     if (call_state) rb_jump_tag(call_state);
+    /* (C reads errno after the call -- `if (n < 0) rb_sys_fail(...)` -- as
+     *  the function left it, on whichever thread it ran) */
+    errno = err;
     return result;
 }
 
 void *rb_thread_call_without_gvl(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2) {
-    return without_gvl(func, data1, ubf, data2);
+    return without_gvl(func, data1, ubf, data2, 0);
 }
 void *rb_thread_call_without_gvl2(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2) {
-    return without_gvl(func, data1, ubf, data2);
+    return without_gvl(func, data1, ubf, data2, 0);
 }
 void *rb_nogvl(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2, int flags) {
-    (void)flags;
-    return without_gvl(func, data1, ubf, data2);
+    return without_gvl(func, data1, ubf, data2, flags);
 }
 /* From a worker: the Ruby thread waiting for it runs the call, and the
  * worker waits for the answer. From the interpreter's own thread: right
