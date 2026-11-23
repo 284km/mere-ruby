@@ -10971,6 +10971,65 @@ private hooks the same way (nothing called), and only those rows were added
 to the table (regenerating the whole table would drop rows added since).
 corpus/777.
 
+## 2026-11-22 (95): test_ast's time, round three -- flags and sets asked as ints
+
+**The point.** Round two (93) left the string keys of the interpreter's own tables as the largest cost. To see which keys, a copy of mr.c counted every string hashed, by its shape (digits folded) and by its two callers: 964 million in the subset below. Many of them were flags and fixed sets asked by name on every call:
+
+| key | hashed | asked by |
+|---|---|---|
+| "tp" | 56 M | tp_hook_on and 72 more, `map_has hook_flags "tp"` |
+| "bd" | 41 M | bi_reg_set / bi_reg_get / bi_rescued (struct_ctr) |
+| "mut", "opmeth", ... | 26 M, 12 M, ... | name_set: the tag hashed twice to find the set |
+| builtin names | 40 M | bi_nix, at every builtin call |
+| class names | 27 M | mro_now_class, from ancestors_of and has_meth |
+| "stf" | 9 M | 16 checks of a flag nothing sets |
+
+Hook flags are never empty in a test file, because test/unit defines method_added.
+
+1. **hook_bits:** "tp" and "mm" are ints beside hook_flags, written where the key is written. hook_tp_on () replaces the 73 reads. "stf" has had no writer since set_trace_func became a TracePoint (189b8356), and neither has trace_fn's "p". The 15 `|| map_has hook_flags "stf"` and fire_trace, which never ran, are taken out.
+2. **bi_reg_d:** the builtin's depth is an int slot. -1 stands for none, as the absent key did.
+3. **bi_nix:** a 64-slot memo of name indexes. The slot is picked by the name's length and end bytes, and the hit is checked against bi_names, so nothing new is stored.
+4. **mro_now_class:** a local epoch is only ever written for a name mro_local_name accepts (mro_lookup_enter, mro_bump_class). Any other name is the global generation without a lookup.
+5. **ns_mut and four more:** the name sets asked per call are made once at the top level.
+6. **builtin_mut_on_frozen** asks frozen first (an int key) and the mutating-name set second.
+
+After this, the subset hashed 724 million strings, and 40% of them were the same pointer as the hash just before: `if map_has m k then map_get m k`. That is Mere's to answer (merelang/mere, a String-keyed Map remembers its last entry). It is not in this PR, but it is measured below as "+ Mere".
+
+On the subset (test_ast's tokens, ranges and not_cared for test/ruby/test_[a-c]*, 78 tests):
+
+| build | instructions | change |
+|---|---|---|
+| main | 331.1e9 | |
+| round two (#159) | 314.4e9 | -5.1% |
+| steps 1-5 | 296.1e9 | -10.6% |
+| step 6 | 294.4e9 | -11.1% |
+| + Mere | 289.9e9 | -12.4% |
+
+The whole of test_ast (2,664 tests; two builds run side by side each time):
+
+| build | instructions | time |
+|---|---|---|
+| main | 3,642.3e9 | 388 s |
+| round two | 3,457.6e9 | 372 s |
+| round three | 3,269.7e9 (-10.2%) | 337 s |
+| + Mere | 3,123.7e9 (-14.2%) | 329 s |
+
+maxRSS moved with the order test/unit picks. With `--seed=42` on the subset: main 1,049-1,084 MB, this round 924-1,030 MB, + Mere 989 MB. Without a seed, one run reads 1,050 MB and another 1,368 MB for the same build.
+
+- Checked:
+  - corpus 803/803. corpus/805 is new: a TracePoint on, off and on, a builtin class's method_missing, frozen receivers, a lambda's arity inside a builtin, the memo's collisions, an anonymous class's generation;
+  - test_settracefunc (the same tests fail as on main), test_module, test_exception, test_string, test_array, test_frozen, test_lambda, test_hash, test_proc, test_object, test_class, test_method and test_iterator give the same results as main;
+  - gates pass.
+- Found on the way (main too, not this round's): `nil.upcase` says "undefined method 'upcase'" where ruby adds "for nil"; `nil.foo` has it.
+- Review of #162: mro_local_name built a substring per `(sng:` wrapper, once per mro_now_class on a singleton class. It now reads the name inside the wrappers in place (mro_local_in, mro_pre_at with str_index_from). A name with no wrapper is still asked with str_starts_with: comparing every name byte by byte in Mere was tried first and cost 2.6% of the subset's instructions. corpus/805 gained the singleton classes of an anonymous class, a Struct and a module, and a singleton's singleton.
+- The reviews of #159 and #162 ran probes that found four differences from ruby. Main gives the same answers, so none is this round's:
+  - `binding.define_singleton_method` raises `TypeError: can't define singleton`.
+  - `def fz.x` on a frozen String succeeds; ruby raises FrozenError.
+  - `s.clone(freeze: true)` is not frozen.
+  - `o.singleton_method_added`, once defined, does not fire for its own name (ruby reports `[:singleton_method_added, :y]`; mere-ruby `[:y]`).
+- The re-review of #162 found one more: `A = Class.new; def A.g = 1; A.g` was a NoMethodError in the evaluator, and so was the same for a Struct. `def C.m` on a constant holding a class keyed the method under the constant's spelling, "(sng:A)", while A's class is AnonClass_N. Named classes never showed it, because their name is their constant's. This was a one-line fix, so it is fixed here: the key now uses the name of the class the constant holds, so `StrAlias = String; def StrAlias.zz` lands on String too. corpus/805 covers it; main fails those lines. test_class, test_struct, test_module, test_object and test_method give the same results as main.
+- Seen while writing that: a Struct class's singleton_methods lacks :inspect, which ruby lists (main too).
+
 ## 2026-11-22 (93): test_ast's time, round two -- a key made per call, and one stack walked twice per collection
 
 **The point.** Round one (91) took 2.5% off. This round sampled the whole of test_ast instead of a subset. The self time was spread out:
@@ -11347,6 +11406,170 @@ this Mac; CI is where the four run.)
   check's 2 GiB; run beside another heavy check it hit the limit once
   (MEMORY_LIMIT on the reference side, not mere-ruby's). Run alone it
   passes. The limit stays.
+
+## 2026-11-22: ruby/spec optional/capi -- 2,282 to 2,394 (reference 2,592)
+
+Note 553 §6.1-6: what was left of ruby/spec's C API specs, file by file.
+tools/capi_spec_check.py, recorded in capi/check/spec_expect.tsv:
+
+| file | before | now | reference |
+|---|---|---|---|
+| string | 291 | 312 | 314 |
+| encoding | 160 | 177 | 180 |
+| struct | 60 | 75 | 75 |
+| class | 97 | 103 | 109 |
+| globals | 33 | 44 | 44 |
+| object | 209 | 221 | 223 |
+| util | 76 | 83 | 83 |
+| kernel | 284 | 288 | 290 |
+| hash | 61 | 65 | 65 |
+| proc | 40 | 44 | 44 |
+| module | 76 | 79 | 79 |
+| numeric | 90 | 93 | 93 |
+| gc | 20 | 25 | 25 |
+| array, fixnum, rbasic, basic_object | one each short | equal | |
+
+(The reference moved too: the spec shim gained mspec's have_constant and
+the other variable matchers, which struct_spec and object_spec use. The
+twelve ruby/spec files outside optional/capi that use them MATCH before and
+after.)
+
+What was wrong, by kind:
+
+- **Answers the C API made up.** rb_str_locktmp/unlocktmp did nothing (now
+  the interpreter's temporary lock, refusing a second lock and a frozen
+  string); rb_obj_hide did nothing (a hidden object's class reads as 0 to
+  C); rb_str_encode dropped its ECONV flags; rb_cstr2inum was strict for
+  base 2 where bignum.c is strict for base 0; rb_external_str_new_with_enc
+  and rb_str_export ignored the encodings string.c weighs; rb_hash did not
+  fold a Bignum #hash; rb_class_name answered nil for an anonymous class;
+  rb_class_get_superclass answered nil for "none"; rb_scan_args counted the
+  keyword Hash; rb_sourcefile named an eval; rb_ivar_foreach left out a
+  class's class variables; rb_class_new ran the superclass's `inherited`;
+  rb_block_call with no function dropped the C method's block, and
+  rb_iterate's block did not reach the first method its function calls.
+- **What C reads off an object's header.** RBasic.klass is the singleton
+  class once there is one (CLASS_OF); the core classes CRuby builds as
+  typed data are T_DATA; the coderange is 7BIT when the interpreter knows
+  the bytes are ASCII alone; C's global variables (rb_rs, rb_fs, rb_stdin,
+  ...) follow the program's assignments instead of keeping their values
+  from the first C call.
+- **Encodings.** Encoding.list is in ruby's order of registration, and C's
+  table is filled in that order, so an encoding's index is its place in the
+  list (rb_to_encoding_index); a character past ASCII is in a POSIX class
+  as Unicode says (the tables CRuby's encodings carry for their upper
+  halves); rb_define_dummy_encoding and rb_enc_alias make what they say
+  (with ruby's "too many encoding (> 256)"); ONIGENC_MBC_CASE_FOLD folds
+  through downcase(:fold).
+- **Names.** A Symbol whose name has a NUL crosses whole (new FFI calls
+  carrying its bytes); rb_const_set / rb_const_get take a name that is no
+  constant's, kept hidden by the key define_class uses.
+- **The interpreter itself**, found through the specs (corpus/801):
+  `Array({a: 1})` was `[{a: 1}]` (a builtin value was never asked for
+  #to_a); `String(x)` passed over a #to_str that answered a non-String to
+  #to_s instead of refusing it; `Kernel.global_variables` was no module
+  function; Encoding.list's order.
+
+Left, and why (KNOWN_GAPS.md): a pointer C keeps across a call seeing what
+Ruby wrote meanwhile (2 string examples; it would mean re-reading every
+watched String after every up-call); a Regexp's encoding changed in place
+(3; a Regexp here is a value without identity); respond_to? of a method
+defined as rb_f_notimplement (2); rb_block_lambda passing a `&proc` through
+unchanged, and rb_set_end_proc's output at shutdown (2); class_spec's three
+names that are no constant's, which #157's define_class answers; digest_spec
+(needs Fiddle, which this interpreter does not have -- the spec returns
+early); debug_spec and tracepoint_spec (the VM's own structures).
+
+## 2026-11-22: ruby/spec optional/capi -- the six small files, 2,394 to 2,402
+
+enumerator, exception, range, time, typed_data and binding now equal the
+reference (4, 41, 54, 112, 15, 1).
+
+- rb_enumeratorize_with_size: the C size function is enum_for's size block
+  (it is called with the receiver, the arguments and the enumerator, which
+  is filled in once enum_for has made it).
+- **rb_errinfo is CRuby's ec->errinfo: one value**, set by C's own rescues
+  (rb_protect, rb_rescue's handler, rb_ensure's cleanup, rb_set_errinfo),
+  not by a Ruby `rescue` -- a C method a Ruby rescue calls finds nil -- and
+  gone when an exception leaves C for the interpreter (a Ruby rescue clears
+  it in CRuby). It read the interpreter's $! before. Tried first per C call:
+  rb_protect's exception was then gone at the next C call, which
+  kernel_spec reads (288 -> 280); and as one value with no clearing, a
+  handler that re-raised left it behind for every later example (-> 222).
+  rb_ensure and rb_rescue save and restore the Ruby caller's $! apart from
+  it.
+- rb_error_frozen_object inspects the object once: an #inspect that itself
+  reports the object frozen gets " ..." (rb_exec_recursive), not a loop.
+  rb_make_exception(nil) is TypeError.
+- rb_arithmetic_sequence_extract takes anything with a Range's three readers
+  (rb_range_values).
+- rb_time_new / rb_time_nano_new reach Time.at's builtin (Time.__capi_at),
+  not what the program made of Time.at.
+- ObjectSpace.memsize_of adds a typed data object's dsize (mr_capi_dsize,
+  read from the struct directly: no C call is in progress there).
+- Kernel#binding sent from C is "Can't create Binding from C level
+  function".
+
+### PR #160 review (two rounds)
+
+First round:
+- **[Minor] An encoding index of 127 or more was cut to the 7 bits of the
+  flags** (dummy encodings defined from C reach it now). refresh_head
+  stores ENCODING_INLINE_MAX (127) when the index does not fit, and
+  rb_enc_get_index asks the object's encoding then, as CRuby does.
+- **[Minor] C's seven global variables were not roots**: a value without
+  identity (`$; = /,/`) assigned to one lost its number at the next
+  collection. Registered at boot, as rb_global_variable makes CRuby's.
+- **[Minor] `Array(H2[1, 2])` named Hash in its TypeError**: the receiver's
+  class (and the returned value's) now. And `Array([1, 2].each)` -- an
+  object's builtin #to_a, which conv_try does not find -- is asked too.
+- **[Suggestion] rb_funcallv_public went through the Ruby-visible
+  public_send.** Without a block it is __capi_public_send (public_send's
+  check and call, whatever the class made of `public_send`); with one,
+  public_send_guard and then an explicit-receiver call of the method.
+- capi/hidden.c (the table #157 keeps names that are no constant's in) holds
+  rb_const_set / rb_const_get's too: no instance variable of the module.
+
+Second round (on 2ad86883):
+- **[Major] Kernel#binding's refusal refused Proc#binding too.** Only a
+  receiver whose `binding` is Kernel's is refused now (not a Proc, a
+  Binding or a TracePoint, nor a class that defines its own), in 4.0's
+  words: "Cannot create Binding object for non-Ruby caller".
+- **[Major] dsize was called with a NULL pointer** (a typed data wrapping
+  NULL, or one an extension emptied): guarded, as gc.c does. And it ran
+  outside any C call, where a dsize that asks the C API would have failed:
+  it runs in a call of its own now (MR_RUN_DSIZE).
+- **[Minor] rb_errinfo kept an old exception after a C call returned
+  normally**, and a later Ruby rescue saw it. A Ruby rescue now clears it
+  (capi_errinfo_clear, where the evaluator's rescue matches), as entering
+  CRuby's rescue clears ec->errinfo. Not the VM's rescue yet; and it is one
+  value per process, where CRuby's is per thread and fiber.
+- capi/check: rb_funcallv_public on a class with its own public_send (and a
+  private method), rb_fs after `$; = /,/` and GC.start, the 30th dummy
+  encoding's index read back from C, Proc#binding vs Kernel#binding from C,
+  memsize_of a typed data wrapping NULL, rb_errinfo in a Ruby rescue after an
+  rb_protect -- each agreeing on both sides.
+
+Third round (on 7871475d, nits):
+- `rb_funcall(a_binding, "binding")` is refused too: a Binding has no
+  #binding of its own in 4.0, Kernel's answers it.
+- rb_funcallv_public on an object's private method says ruby's "private
+  method 'm' called for ..." (it said "undefined method"), unless the class
+  has a method_missing, which is asked.
+- `__capi_public_send` answers only the call capi_send makes just before
+  (capi_pub_entry); Ruby code that writes it gets NoMethodError, as in ruby.
+- **[Minor] rb_errinfo per fiber** (asked to be fixed after all): it is the
+  running stack's now. mr_capi_switch puts the one of the stack being left
+  aside by its number and takes up the target's (nil for a new one). A
+  Fiber's number is never handed out again (fb_new_index), and a new hook,
+  mr_capi_stack_end, called where a Fiber's body ends (fb_run_body), drops
+  what was put aside for it. Each one put aside is a root (mr_capi_roots).
+  (The round before said stack numbers come back: they do not.) Threads too,
+  each root fiber being a stack: an rb_protect on a Thread or a Fiber is not
+  what main reads. capi/check: errinfo on a paused Fiber is not main's, nor
+  a new Fiber's, and is still its own after GC.start and a resume.
+  Left: ruby makes a Thread whose body ends with errinfo set raise it from
+  #value / #join; here #value is the body's value.
 
 ## 2026-11-23: a String's bytes in the struct C sees, and the room in its buffer
 

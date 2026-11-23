@@ -33,12 +33,17 @@ void rb_gc_register_mark_object(VALUE obj) {
     }
     objects[object_count++] = obj;
 }
+extern VALUE mr_errinfo_parked_at(long i);
 int mr_capi_roots(closure_int_int visit) {
     for (long i = 0; i < address_count; i++) {
         VALUE v = *addresses[i];
         if (MR_HANDLE_P(v)) visit.fn(visit.env, (long long)v);
     }
     for (long i = 0; i < object_count; i++) visit.fn(visit.env, (long long)objects[i]);
+    /* (rb_errinfo of each stack not running: capi/core.c) */
+    VALUE e;
+    for (long i = 0; (e = mr_errinfo_parked_at(i)) != Qundef; i++)
+        if (MR_HANDLE_P(e)) visit.fn(visit.env, (long long)e);
     return 0;
 }
 void rb_gc_mark(VALUE v) { mr_mark_value(v); }
