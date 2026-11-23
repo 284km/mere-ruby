@@ -51,6 +51,12 @@ class MeasurementCheck(unittest.TestCase):
         self.assertEqual('test', env['RAILS_ENV'])
         self.assertNotIn('BUNDLE_PATH', env)
         self.assertNotIn('BUNDLE_WITHOUT', env)
+        # mere-ruby is given the same library on RUBYLIB (its default gem
+        # specs), never the inherited foreign one
+        with patch.dict(os.environ, dict(RUBYLIB='/foreign')):
+            env = measure.environment(Path('/run/gems'), Path('/run/app'), '/stdlib', Path('/run/user'), None, mere=True)
+        self.assertEqual('/stdlib', env['RUBYLIB'])
+        self.assertEqual('/stdlib', env['RAILS_SMOKE_RUBY_LIB'])
 
     def test_zero_summary_or_missing_case_is_not_success(self):
         ok = dict(exit=0, limit=None)
