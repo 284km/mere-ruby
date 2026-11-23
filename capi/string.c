@@ -181,7 +181,12 @@ int rb_str_hash_cmp(VALUE a, VALUE b) { return !RTEST(mr_calls(a, "eql?", 1, b))
 VALUE rb_str_inspect(VALUE str) { return mr_calls(str, "inspect", 0); }
 VALUE rb_str_dump(VALUE str) { return mr_calls(str, "dump", 0); }
 VALUE rb_str_split(VALUE str, const char *sep) { return mr_calls(str, "split", 1, rb_str_new_cstr(sep)); }
-VALUE rb_str_freeze(VALUE str) { return rb_obj_freeze(str); }
+/* (string.c: String#freeze resizes to the length, then freezes) */
+VALUE rb_str_freeze(VALUE str) {
+    if (RB_OBJ_FROZEN(str)) return str;
+    rb_str_resize(str, RSTRING_LEN(str));
+    return rb_obj_freeze(str);
+}
 VALUE rb_str_new_frozen(VALUE str) {
     if (RB_OBJ_FROZEN(str)) return str;
     return rb_obj_freeze(rb_str_dup(str));

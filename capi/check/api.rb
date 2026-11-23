@@ -619,6 +619,12 @@ ok, filled = A.buf_fill(3000)
 check(ok && filled == 'z' * 3000)
 check(A.expand_room(+'abc', 1000) == 1000)
 check(A.expand_room(+('abc' * 100), 5000) == 5000)
+# OBJ_FREEZE keeps a String's buffer, so a pointer C holds still reads its
+# bytes; rb_str_freeze (String#freeze) resizes to the length, which puts
+# 3 bytes back into the smallest slot (its room: the slot less the 24-byte
+# header and the terminator)
+seen, kept, resized, frozen = A.freeze_keeps_room
+check(seen == 'abc' && kept == 1024 && resized == GC::INTERNAL_CONSTANTS[:BASE_SLOT_SIZE] - 25 && frozen)
 far, back = A.resize_out_and_back(+'hello')
 check(far == 'q' && back == 'he')
 # String.new(capacity:) and a read into a buffer give the room they ask for

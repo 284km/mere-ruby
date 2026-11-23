@@ -36,6 +36,7 @@ struct mr_mirror {
     long reserve;               /* room the interpreter asked for (mr_capi_reserve), not yet made */
     long slot;                  /* a String's: the bytes its struct is allocated in (0 until chosen) */
     int heap_only;              /* ...and the room asked for is to be a buffer, whatever it fits (rb_str_init) */
+    int frozen_by_c;            /* a String OBJ_FREEZE / rb_obj_freeze froze: its room stays (only String#freeze, rb_str_freeze, resizes) */
     int body;                   /* 0 none yet, T_STRING, T_ARRAY */
     int data;                   /* 0, 1 RData, 2 RTypedData */
     int listed;                 /* how many C calls in progress watch it (entries of `touched`) */
@@ -311,13 +312,15 @@ static struct mr_mirror *refresh_head(struct mr_mirror *m, VALUE obj) {
          * for the bytes (RSTRING_PTR tests RSTRING_NOEMBED first), so it is
          * settled here, from the length the interpreter has now: a String
          * whose bytes the struct does not hold yet is in it when they fit,
-         * and one in the struct leaves it when they no longer do. A frozen
-         * String has no use for room: rb_str_freeze resizes it to its
-         * length (string.c), which is what it is given here. */
+         * and one in the struct leaves it when they no longer do. A String
+         * String#freeze froze has no use for room: rb_str_freeze resizes it
+         * to its length (string.c), which is what it is given here. One C
+         * froze with OBJ_FREEZE / rb_obj_freeze keeps its buffer, as in
+         * CRuby: C may still hold RSTRING_PTR. */
         long len = (long)(packed >> 32);
         int term = term_of_index((int)((packed >> 8) & 0xffff));
         if (!m->slot) m = str_take_slot(MR_NUMBER(obj), m, slot_for(len > m->reserve ? len : m->reserve, term, m->heap_only));
-        int frozen = (packed & 0x20) != 0;
+        int frozen = (packed & 0x20) != 0 && !m->frozen_by_c;
         if (frozen) { m->reserve = 0; m->heap_only = 0; }
         long need = len > m->reserve ? len : m->reserve;
         if (m->body != T_STRING) {
@@ -441,6 +444,13 @@ void mr_mirror_forget(VALUE obj) {
     if (!m) return;
     m->head_epoch = 0;
     m->body_epoch = 0;
+}
+/* OBJ_FREEZE / rb_obj_freeze is about to freeze this String: it keeps its
+ * buffer (only rb_str_freeze, String#freeze, resizes -- string.c) */
+void mr_mirror_frozen_by_c(VALUE obj) {
+    if (!MR_HANDLE_P(obj)) return;
+    struct mr_mirror *m = mirror_at(MR_NUMBER(obj), 0);
+    if (m) m->frozen_by_c = 1;
 }
 
 void *rb_mere_string(VALUE obj) {
@@ -669,8 +679,8 @@ int mr_capi_layout(int what) {
 /* ObjectSpace.dump and memsize_of of a String (`number` its handle's, or -1):
  * 0 its slot, 1 whether its bytes are in it, 2 the bytes of its buffer with
  * the terminator (0 when in the slot). A String C has seen answers from its
- * struct, with the length the interpreter has now; one C has not seen, what
- * the struct would be made as when C first looks. */
+ * struct, with the length the interpreter has now; one C has not seen has no
+ * struct and answers 0 (no slot). */
 CapiWord mr_capi_str_layout(int number, int what, CapiWord bytesize, int enc_index) {
     long len = (long)bytesize.mu_w;
     int term = term_of_index(enc_index);
@@ -692,12 +702,10 @@ CapiWord mr_capi_str_layout(int number, int what, CapiWord bytesize, int enc_ind
         }
     }
     else {
-        long want = m && len < m->reserve ? m->reserve : len;
-        int heap = m ? m->heap_only : 0;
-        slot = slot_for(want, term, heap);
-        room = slot - EMBED_HEADER;
-        in_slot = !heap && want + term <= room;
-        buffer = in_slot ? 0 : want + term;
+        /* (C has not seen it: there is no struct and no slot, and none is
+         *  predicted -- 0, and ObjectSpace says nothing of a slot) */
+        CapiWord none = { 0 };
+        return none;
     }
     CapiWord w = { what == 0 ? slot : what == 1 ? in_slot : buffer };
     return w;

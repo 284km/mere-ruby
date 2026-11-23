@@ -73,30 +73,50 @@ and for that to be true, not invented, the String mirror allocates that way:
   sizes or OLD_AGE: the interpreter's own values have no slot heap and the
   collector is not generational, so stat_heap stays empty. The Wasm / RV
   tree (no C side, m_capi_none.mere) answers 0 and the Hash is empty.
-- **ObjectSpace.dump** of a String has "slot_size" and "embedded" (CRuby's
-  places: after "type", after "frozen"), and **memsize_of** a String is its
-  slot plus its buffer -- what its struct is, or will be made as when C
-  first looks (mr_capi_str_layout). Other objects have no slot and say none.
-- **Freezing resizes** (rb_str_freeze calls rb_str_resize to the length): a
-  frozen String's room asked for is dropped, and a buffer longer than its
-  length by more than min(length, 1 KB) is cut down, or the bytes go back
-  into the slot. `-s` is a new frozen String here, sized to its length.
+- **ObjectSpace.dump** of a String C has seen has "slot_size" and
+  "embedded" (CRuby's places: after "type", after "frozen"), and
+  **memsize_of** it is its slot plus its buffer (mr_capi_str_layout). A
+  String C has not seen has no struct and no slot: the dump says nothing of
+  one, and memsize_of is main's estimate (`__slot(24 + bytesize + 1)`), as
+  for every other object. (The first version predicted the slot C would make
+  when it first looked -- a value of a struct that does not exist; #189's
+  review. Removed 11-24.)
+- **String#freeze resizes** (rb_str_freeze calls rb_str_resize to the
+  length): a frozen String's room asked for is dropped, and a buffer longer
+  than its length by more than min(length, 1 KB) is cut down, or the bytes go
+  back into the slot. `-s` is a new frozen String here, sized to its length.
+  **OBJ_FREEZE / rb_obj_freeze do not** (CRuby sets the flag alone, and C may
+  hold RSTRING_PTR across it): rb_obj_freeze marks the mirror
+  (frozen_by_c) before the interpreter freezes the String, and the head
+  refresh then leaves its buffer as it is; rb_str_freeze resizes first and
+  then calls rb_obj_freeze, as string.c does. capi/check/api.rb: a pointer
+  taken before OBJ_FREEZE still reads the bytes, the 1,024 bytes of room
+  stay, and rb_str_freeze puts 3 bytes back in the smallest slot (room 15 on
+  both sides). (#189's review, 11-24.)
 - corpus 669 / 711 now check the constants are frozen and either these
   values or empty (the build without C); the reference takes the other
   branch (its GC compacts), so the programs print what they printed.
 
-test/-ext-/string: test_capacity 9 of 10 (embedded, normal, literal, frozen,
-fstring, encode_bang now), test_set_len 5 of 6. Left: the shared Strings --
+test/-ext-/string (11-24, after the review): test_capacity 8 of 10 (main
+1), test_set_len 5 of 6 (main 0). Left: the shared Strings --
 test_capacity_shared, test_set_len#test_shared, test_rb_str_dup x2: a
 String that shares another's buffer (STR_SHARED, as.heap.aux.shared) is not
-made here, rb_str_dup copies.
+made here, rb_str_dup copies -- and test_encode_bang_capacity_with_
+multibyte_terminator, which takes the smallest slot from
+`ObjectSpace.dump("")`, a String C has not seen (it passed on the predicted
+slot). test_ellipsize, test_enc_str_buf_cat and test_fstring fail as on
+main.
 
-Elsewhere: ruby/test_string 2 errors -> 0 and test_struct 2 -> 0 (they size
-Strings from BASE_SLOT_SIZE / RVARGC_MAX_ALLOCATE_SIZE), test_file_exhaustive's
-test_expand_path_memsize passes. objspace: test_dump_includes_slot_size,
-test_dump_to_default and test_dump_to_io pass on both sides and leave the
-exclusion ledger (unittest/excludes-gc/TestObjSpace.rb, gc_cases.tsv now
-MATCH). test_gc, test_gc_compact, test_time, test_objectspace unchanged.
+Elsewhere: test_struct 2 errors -> 0 (it sizes Strings from
+RVARGC_MAX_ALLOCATE_SIZE), test_file_exhaustive's test_expand_path_memsize
+passes. ruby/test_string keeps main's 2 errors: test_string_interpolations_
+across_heaps_get_embedded (both classes) reads slot_size from the dump of
+Strings C has not seen (it passed on the predicted slot). objspace:
+test_dump_includes_slot_size, test_dump_to_default and test_dump_to_io stay
+in the exclusion ledger, with the reason now "asserts the default GC's slot
+for a String C has not seen" (BASE_SLOT_SIZE exists now; the old reason no
+longer held). test_gc, test_gc_compact, test_time, test_objectspace
+unchanged.
 
 **test_memsize_of_all: memsize_of makes no Strings.** The test compares
 `memsize_of_all` with `memsize_of_all(String)`, counted one after the
@@ -114,7 +134,9 @@ none of 14 kinds (Encoding, Array, Proc, Object, Hash, String, Range,
 Method, exception, Time, Symbol, Class, Regexp, Bignum) makes a String.
 test_memsize_of_all passes alone and in 10 runs of the file. The file fails
 the same 8 tests in each run, all of which main's binary fails too (main: 9,
-the ninth test_dump_to_io, above). One of the first three runs had 1 error
+the ninth test_dump_to_io, which main runs unexcluded in this tool; after the
+review the three dump tests are excluded again and the file is 46 tests, 8
+failures). One of the first three runs had 1 error
 more; it did not come back in the next 7, and its log was not kept, so which
 test it was is not known.
 **Follow-up (interpreter): a `return` from a block should make no

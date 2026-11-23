@@ -349,8 +349,16 @@ int rb_method_basic_definition_p(VALUE klass, ID id) {
         || !strcmp(s, "Array") || !strcmp(s, "Hash") || !strcmp(s, "Integer") || !strcmp(s, "Float")
         || !strcmp(s, "Symbol") || !strcmp(s, "NilClass") || !strcmp(s, "Numeric");
 }
+/* (a String C freezes keeps its buffer: CRuby's OBJ_FREEZE sets the flag
+ *  alone, and C may hold RSTRING_PTR across it. Freezing goes through the
+ *  interpreter's String#freeze, which the mirror would take as
+ *  rb_str_freeze's resize, so the mirror is told first.) */
 VALUE rb_obj_freeze(VALUE obj) {
-    if (!RB_SPECIAL_CONST_P(obj)) { mr_callk(obj, "freeze", 0); mr_mirror_forget(obj); }
+    if (!RB_SPECIAL_CONST_P(obj)) {
+        if (MR_HANDLE_P(obj) && rb_type(obj) == T_STRING && !RB_OBJ_FROZEN_RAW(obj)) mr_mirror_frozen_by_c(obj);
+        mr_callk(obj, "freeze", 0);
+        mr_mirror_forget(obj);
+    }
     return obj;
 }
 extern int mr_vbig_raw_p(VALUE v);

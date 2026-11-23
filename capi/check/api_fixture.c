@@ -247,6 +247,23 @@ static VALUE expand_room(VALUE self, VALUE str, VALUE n) {
     rb_str_modify_expand(str, NUM2LONG(n));
     return LONG2NUM((long)rb_str_capacity(str) - RSTRING_LEN(str));
 }
+/* OBJ_FREEZE keeps the buffer (string.c resizes only in rb_str_freeze): a
+ * pointer C took before still reads the bytes, and the room is still there.
+ * rb_str_freeze resizes to the length. */
+static VALUE freeze_keeps_room(VALUE self) {
+    (void)self;
+    VALUE s = rb_str_buf_new(1024);
+    rb_str_cat(s, "abc", 3);
+    const char *p = RSTRING_PTR(s);
+    OBJ_FREEZE(s);
+    long len = RSTRING_LEN(s);
+    VALUE seen = rb_str_new(p, len);
+    long room = (long)rb_str_capacity(s);
+    VALUE t = rb_str_buf_new(1024);
+    rb_str_cat(t, "abc", 3);
+    rb_str_freeze(t);
+    return rb_ary_new3(4, seen, LONG2NUM(room), LONG2NUM((long)rb_str_capacity(t)), RB_OBJ_FROZEN(t) ? Qtrue : Qfalse);
+}
 /* rb_str_resize out to a buffer and back into the struct */
 static VALUE resize_out_and_back(VALUE self, VALUE str) {
     (void)self;
@@ -454,6 +471,7 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "cat_self", cat_self, 2);
     rb_define_singleton_method(mod, "buf_fill", buf_fill, 1);
     rb_define_singleton_method(mod, "expand_room", expand_room, 2);
+    rb_define_singleton_method(mod, "freeze_keeps_room", freeze_keeps_room, 0);
     rb_define_singleton_method(mod, "resize_out_and_back", resize_out_and_back, 1);
     /* classes under a module under a module, all of them made here: a class
      * C defines is a class by that name like any other */
