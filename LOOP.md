@@ -4,6 +4,10 @@ The other documents describe the SUBJECT. This one describes the LOOP: how
 long it takes to get from an edit to a landed commit, where that time actually
 goes, and what each attempt to shorten it was worth.
 
+> **Since 2026-11-23, new records go in [`loop/`](loop/README.md), one file per
+> change.** This file is the history up to then; do not append to it. The
+> per-stream corpus number ranges are in `loop/README.md`.
+
 It exists because the first honest measurement of this loop was a surprise.
 The sweep is 95% of a cycle, and more than half of the sweep was the harness
 copying a directory tree that never changes. Nobody would have guessed that;
@@ -11571,93 +11575,133 @@ Third round (on 7871475d, nits):
   Left: ruby makes a Thread whose body ends with errinfo set raise it from
   #value / #join; here #value is the body's value.
 
-## 2026-11-23: a String's bytes in the struct C sees, and the room in its buffer
+## 2026-11-22: CRuby's bignum.c, compiled as it is -- the algorithms an extension names
 
-Note 553 §7.2's PR-2 (String internals for test/-ext-/string). The mirror
-(capi/mirror.c) now keeps a String the way CRuby does, instead of always in
-a buffer twice as long as needed:
+Note 553 §4 decided (b): the 27 RED of test/-ext-/bignum (test_mul 19,
+test_big2str 2, test_str2big 3, test_bigzero 2, test_div 1) call CRuby's
+internal algorithms by name -- rb_big_mul_karatsuba, rb_big_mul_toom3,
+rb_big2str_generic, rb_str2big_karatsuba, rb_big_divrem_normal, ... -- and
+answering them with this interpreter's one multiplication would be a claim.
+So CRuby's bignum.c is now in capi/vendor, unchanged, and those algorithms
+run as CRuby runs them. Locally all 31 tests of those five files pass (and
+test_pack's 28 still do); CI compares both sides.
 
-- **In the struct while it fits.** RSTRING_NOEMBED is clear and the bytes
-  are in as.embed.ary when they and the terminator fit in the struct's own
-  16 bytes (sizeof(struct RString) - offsetof(as.embed.ary): CRuby's
-  smallest slot); otherwise as.heap.ptr. C reads the flag before it asks
-  for the bytes (RSTRING_PTR tests it first), so where they are is settled
-  when the head is refreshed: MR_DESCRIBE now carries a String's bytesize
-  (from bit 32: below it #160's encoding index and coderange bit). A
-  String with no bytes fetched yet goes where it fits; one in the
-  struct that Ruby grew past it moves out then; one in a buffer stays there
-  until rb_str_resize brings it back (string.c's rule).
-- **Buffers as long as asked.** A fetched String's buffer is its length
-  (was: 15, 31, 63 ... and zero-filled). rb_str_modify_expand and
-  rb_str_buf_new make exactly the room (RESIZE_CAPA_TERM), rb_str_cat grows
-  2 * capa + termlen (str_buf_cat4), rb_str_resize follows string.c (back
-  into the struct when it fits, cut down when longer than the length by more
-  than min(length, 1 KB)). New room is not cleared, only the terminator's
-  place at its end: test_modify_expand_memory_leak asks for the process's
-  VSZ (416 GiB on macOS) ten times, and the old memset touched every page --
-  the 10 s timeout. Now 0.24 s, VSZ 1.99x (limit 2.5).
-- **The room the interpreter asks for.** `String.new(capacity: n)` and a
-  read into a buffer (File#read / #sysread with a buffer: io.c's
-  io_setstrbuf) call mr_capi_reserve (m_capi.mere's capi_reserve; a new
-  extern, stubbed in m_capi_none.mere): the String's buffer is made that
-  long the next time C looks at it. The interpreter's own String has no
-  buffer to make longer, so nothing is asked while no C has run.
-- **A buffer C puts in as.heap.ptr** (ext/-test-/string's cstr_noembed) is
-  taken over and freed with the struct (the mirror's own was leaked); a
-  pointer moved inside the mirror's buffer (unterminated_substring) keeps it.
-  The length check at write-back reads as.heap.aux.capa, which C may set.
+**What it took.** bignum.c compiles against this C API's headers with seven
+more of CRuby's internal headers, copied unchanged, and two stand-ins:
+`id.h` (seven method IDs, interned by name) and `internal/gc.h` (NEWOBJ_OF
+and two slot-size questions; the real one includes vm_core.h).
+capi/tools/headers_check.py holds the copies to the ruby tree. Every function
+bignum.c defines is renamed (mr_vbig_*) before any header is read, inside
+capi/bignum_cruby.c only, so it calls its own and the C API's own Integer
+functions (numeric.c, bignum.c of capi/) stay as they are; the twelve
+algorithms by name leave capi/unsupported.c and are given under ruby's names.
+What bignum.c asks of the rest of CRuby (rb_int_plus and friends, a ulong
+isqrt) is written in the public API's terms; the one Complex corner
+(rb_dbl_complex_new_polar_pi, a negative Bignum to a fractional power) is a
+named NotImplementedError, and unreachable from the exported names.
 
-test/-ext-/string: test_s_new_capacity, test_io_read, test_modify_expand
-(both) and test_cstr's test_rb_str_new_frozen_embed pass; no file lost a
-test (all 94 test/-ext- files, against main's binary). capi/check/api.rb:
-10 contracts (a String Ruby grows between two looks from C, rb_str_cat of
-its own bytes out of the struct, rb_str_buf_new, rb_str_modify_expand's
-exact room, rb_str_resize out and back, String.new(capacity:), a read into a
-buffer), the same on both sides.
+**A Bignum it makes is a C struct.** bignum.c makes one with NEWOBJ_OF, turns
+the pointer into its VALUE (`bigv = (VALUE)big`) and reads it through a cast;
+and an extension that includes internal/bignum.h does the same
+(ext/-test-/bignum/bigzero.c writes BIGNUM_DIGITS of what rb_big_new gave
+it). A handle is no address, so such a Bignum is a RAW one: the struct's
+address is its VALUE. RBASIC() answers the struct itself (rb_mere_basic),
+so its type, sign, length and frozen bit are read and written as bignum.c
+does. Where one reaches the interpreter -- an up-call's arguments, the
+transit words, what the C call returns (core.c) -- it becomes the Integer its
+digits say (mr_vbig_out; mr_put_words converts BEFORE it sets the words,
+because making the Integer is an up-call that keeps and puts back what is
+in transit). It is freed when the C call that made it ends, unless bignum.c
+keeps it for good (its radix power cache, rb_vm_register_global_object),
+and those are listed apart so the end of a C call does not walk them. The
+other way, an Integer the interpreter has is a handle or a Fixnum: the entry
+points give bignum.c a raw Bignum with the same digits. Nothing changes for
+a program that never calls these: every hook starts with "are there any raw
+Bignums at all".
 
-The other 15 of the 17 tests compute their sizes from GC::INTERNAL_CONSTANTS
-(BASE_SLOT_SIZE, RBASIC_SIZE, RVARGC_MAX_ALLOCATE_SIZE) or ObjectSpace.dump's
-slot_size, and stopped at nil before any C ran: the next section.
+**GMP.** The reference links GMP 6.3.0; this build does not. The four *_gmp
+tests rescue NotImplementedError, which is what a ruby built without GMP
+answers, so they pass on both sides without a new build dependency.
 
-## 2026-11-23: GC::INTERNAL_CONSTANTS describes the slots the String structs C sees are allocated in
+Unchanged: ruby/test_bignum.rb 65/74, ruby/spec optional/capi bignum_spec
+105 = reference, integer_spec 60 = reference, numeric_spec 90 (reference 93,
+as recorded), capi_check, corpus.
 
-**The decision changed** (the user's, 2026-11-23). On 11-16 it was "empty:
-there is no RVALUE slot heap" (note 545 §2), checked by corpus 669 / 711. Now
-INTERNAL_CONSTANTS describes how the objects C sees are actually allocated,
-as CRuby's MMTk build reports its own collector's values (gc/mmtk/mmtk.c) --
-and for that to be true, not invented, the String mirror allocates that way:
+The future form (note 553 §6.1-5, a separate arc): this interpreter's
+Integer in binary limbs, with Karatsuba and Toom-3 written in Mere; then
+the C names can point there and bignum.c leaves.
 
-- **Five slot sizes, 40 / 80 / 160 / 320 / 640 bytes** (five words and its
-  doublings, CRuby's variable-width allocation). A String's struct is the
-  first `slot` bytes of the mirror's `as`, and the block is allocated that
-  long (str_take_slot). The slot is the smallest that holds the header
-  (offsetof(struct RString, as.embed.ary), 24), the bytes and the
-  terminator, chosen once -- the first time C sees the String, from its
-  length or the room asked for -- and never changed, as an object's slot is
-  not in CRuby; past 640, or for rb_str_init's capacity ("make noembed
-  always"), the smallest slot and a buffer. Embedded capacity is slot - 24 -
-  termlen; the largest embedded String is 640 - 24 - 1 = 615 bytes.
-- **INTERNAL_CONSTANTS** = {BASE_SLOT_SIZE: 40, RBASIC_SIZE: 16,
-  RVALUE_OVERHEAD: 0, RVARGC_MAX_ALLOCATE_SIZE: 640, SIZE_POOL_COUNT: 5},
-  asked of the C side (mr_capi_layout: slot_sizes[], sizeof(struct
-  RBasic)); MMTk's keys, MMTk's SIZE_POOL_COUNT name. Not HEAP_COUNT, page
-  sizes or OLD_AGE: the interpreter's own values have no slot heap and the
-  collector is not generational, so stat_heap stays empty. The Wasm / RV
-  tree (no C side, m_capi_none.mere) answers 0 and the Hash is empty.
-- **ObjectSpace.dump** of a String has "slot_size" and "embedded" (CRuby's
-  places: after "type", after "frozen"), and **memsize_of** a String is its
-  slot plus its buffer -- what its struct is, or will be made as when C
-  first looks (mr_capi_str_layout). Other objects have no slot and say none.
-- **Freezing resizes** (rb_str_freeze calls rb_str_resize to the length): a
-  frozen String's room asked for is dropped, and a buffer longer than its
-  length by more than min(length, 1 KB) is cut down, or the bytes go back
-  into the slot. `-s` is a new frozen String here, sized to its length.
-- corpus 669 / 711 now check the constants are frozen and either these
-  values or empty (the build without C); the reference takes the other
-  branch (its GC compacts), so the programs print what they printed.
+### PR #158 review
 
-test/-ext-/string: test_capacity 9 of 10 (embedded, normal, literal, frozen,
-fstring, encode_bang now), test_set_len 5 of 6. Left: the shared Strings --
-test_capacity_shared, test_set_len#test_shared, test_rb_str_dup x2: a
-String that shares another's buffer (STR_SHARED, as.heap.aux.shared) is not
-made here, rb_str_dup copies.
+- **[Minor] A raw Bignum C keeps past its call was freed anyway.** rb_big_new
+  is public API and returns one. Now kept for good when C keeps it the
+  public ways: rb_gc_register_mark_object and rb_gc_mark / _movable / _maybe
+  (capi/gc.c hand a raw one to mr_vbig_keep), or a registered address
+  (rb_gc_register_address, rb_global_variable) that holds it when its call
+  ends (mr_vbig_leave asks mr_gc_address_holds). One only stored in a struct
+  and marked by a later collection is still freed with its call; the header
+  comment says so. capi/check: a Bignum made in Init_ and kept each way is
+  still 0 after GC.start, two calls later, on both sides.
+- **[Suggestion] Membership was a linear scan on every RBASIC().** An
+  open-addressing set of addresses answers it in O(1); the two lists stay
+  for the walk at the end of a call. (First version removed an address from
+  the set before freeing it -- raw_free reads the flags through RBASIC, and
+  every test/-ext-/bignum file stopped at its first raw Bignum. Freed first,
+  removed after.) Toom-3 on 3**60000 x 7**50000 and big2str_generic of the
+  product (70,883 digits): 2.3 s.
+- (re-review) **[Minor] a raw Bignum a registered address held was kept
+  forever**, even after the slot was overwritten (82 MB over 20,000 calls).
+  Those go to a list of their own now (held), checked at the end of every C
+  call: freed once no registered address holds them. The reviewer's pattern
+  (`last = rb_big_new(1000, 1)` on a registered `last`, 20,000 times) grows
+  RSS by -3 MB, and `last` still reads 0. One kept by rb_gc_mark from a
+  dmark is still kept for good (the rarer case; the header says so).
+- (re-review 2) **[Major] that sweep freed one a C local still had.** It ran
+  at the end of every C call, a nested one too: `old = slot; slot = Qnil;`,
+  then rb_funcall / rb_block_call into C, then `old` -- [BUG] "not an
+  object", where CRuby's collection sees `old` on the C stack. The held ones
+  are looked at again only when no C call is in progress on any stack
+  (frame.prev is NULL, and no Fiber has a chain of C calls parked). A
+  call's own temporaries still go at its end, as before. capi/check: the
+  pattern, both ways in, reads 0 after GC.start on both sides.
+- (re-review 2) **[Suggestion] the sweep cost (held x registered addresses)
+  per call.** The addresses are read once per sweep into a set of the raw
+  Bignums they hold (mr_gc_each_address_value), so it is O(addresses +
+  held), and nothing is read at the end of a call that made no raw Bignum
+  while the outer one is still running.
+- (re-review 3) **[Minor] one Fiber paused inside C stopped the sweep for
+  good** (no parked chain at all was the condition): a Fiber dropped inside
+  a C call, or an external Enumerator over a C #each left after one #next,
+  and every overwritten slot stayed (+84 MB per 20,000). A parked chain's C
+  locals do not run while it is parked, so they can have only what was made
+  before it was: every raw Bignum has a birth number (mr_vbig_seq), each
+  park notes it, and the sweep keeps only the held ones born before the
+  newest park. The reviewer's pattern: +2 MB, then +2 MB (ruby: +13, +0).
+  capi/check: a C local on a Fiber paused inside rb_yield still reads its
+  value after the slot is overwritten from outside, GC.start and a call.
+- (re-review 3) **[Suggestion] the holder set was sized from mr_vbig_live
+  at its largest**, and cleared whole on every sweep. It is sized from the
+  registered addresses (all it can hold), grown or shrunk to that. An empty
+  C call after one that made 100,000 temporaries: 3.6 us (3.6 before it).
+- (re-review 4) **[Minor] a Fiber that pauses again and again inside one C
+  call kept one held raw Bignum per pause** (the newest park's birth number
+  moved on each time, and what was held at each pause stayed). The birth
+  numbers are gone: when a stack pauses inside C, the words of its C frames
+  -- from the switch (registers spilled by setjmp, read from a callee below
+  it) up to its outermost C call -- are read once, and the raw Bignums
+  among them stay until it resumes (mr_vbig_park / mr_vbig_unpark), as
+  CRuby's collection marks a suspended Fiber's stack. With a C #each that
+  yields for ever, driven by Enumerator#next with a churn of the slot
+  between: 1 held, nothing pinned, every 5,000 calls. The RSS that still
+  grows there is Enumerator#next's own: `[1].cycle.next` alone grows the
+  same, on main too, with no C at all.
+- (re-review 5) **[Minor] asking whether a value was pinned walked every
+  pinned word**, so the end of a C call cost (held + temporaries) x (words
+  pinned): 1,000 Fibers each paused with a raw Bignum in a C local made an
+  empty C call 423 us. Each pinned word is counted in a set of its own
+  (value -> words), so the question is O(1): 9.9 us with 1,000 paused (5.1
+  with none), the paused locals still read 0. **[Suggestion]** a pause reads
+  its stack only when there are temporaries or held ones (what is kept for
+  good never goes), and the registers are spilled with
+  __builtin_unwind_init() before setjmp (glibc's x86_64 setjmp stores rbp
+  mangled).

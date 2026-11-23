@@ -517,6 +517,28 @@ GC.start
 check(f.resume == ArgumentError)
 check(A.errinfo_now.nil?)
 
+# (Bignums C made in Init_ and kept the public ways are still there later,
+#  and still zero -- rb_big_new gives digits of zero)
+GC.start
+check(A.kept_bignums == [0, 0])
+check(A.kept_bignums == [0, 0])
+# (...and one a slot held, taken out into a C local and used after a
+#  nested C call: still there)
+[false, true].each do |by_block|
+  A.slot_fill
+  GC.start
+  check(A.slot_swap(by_block) == 0)
+end
+# (...and while a Fiber is paused inside that C call, the slot is filled
+#  and overwritten from outside it: the paused local still has its own)
+A.slot_fill
+paused = Fiber.new { A.slot_swap_yield { Fiber.yield } }
+paused.resume
+3.times { A.slot_fill }
+GC.start
+A.noop
+check(paused.resume == 0)
+
 # A String's bytes in the struct or in a buffer of their own: C reads the
 # same String either way, also when Ruby grew it between two looks, and the
 # room the API promises is there.
