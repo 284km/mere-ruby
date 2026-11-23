@@ -150,3 +150,43 @@ r << defined?([1][
   value
 ])
 p r, $seen
+
+# (second review of #180) the marks at any depth: a statement-shaped call's
+# arguments (puts, print, p), a unary operand, a ternary, a range, a hash
+# value, an interpolation, an && operand
+$seen = 0
+x = 1
+r = []
+r << defined?(puts(
+  value
+))
+r << defined?(take(![
+  x
+]))
+r << defined?(take(!(
+  value
+)))
+r << defined?(take(x ? (
+  value
+) : 2))
+r << defined?(take((1..
+  value
+)))
+r << defined?(take({ a:
+  value
+}))
+r << defined?(take("#{
+  value
+}"))
+r << defined?(take(-(
+  value
+)))
+r << defined?(take(x &&
+  value))
+r << defined?(print(
+  value, nope
+))
+r << defined?(p(
+  value
+))
+p r, $seen

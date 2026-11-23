@@ -42,3 +42,9 @@ The marks also carry their line as an `EInt` argument now (`EMethod (x, "__lnb~"
 The remaining cost is the mark itself (a line set and one more match arm per marked argument). A local variable is still marked: the lexer's table of locals describes the end of the source by the time the parser runs, so it cannot say what a name is at that point.
 
 **Not changed** (older than this PR, listed by the review): a later line inside a hash value, string interpolation, the right side of `+` / `&&` / `?:`, `**{⏎…}`, `raise("x")` as an argument, arguments of a call without parentheses, and the line of `foo(⏎…⏎) + nil`.
+
+## Second review of #180: a mark at any depth
+
+`ln_strip` reaches only the node kinds it names. A statement-shaped call such as `puts(⏎ value⏎)`, which is `EStmt (SPuts …)`, and a unary operand (`!`, `EUn`) kept their marks, and other kinds would have followed. `defined?` asks about every operand, argument and element by coming back through `eval_e`'s `EDefined` arm, so that arm now takes the marks off first (`ln_unmark`). A mark at any depth is seen through there, whatever node holds it. `ln_strip` stays for the outer expression, as before.
+
+corpus 852 gained `puts`, `print` and `p` arguments, a unary operand, a ternary, a range, a hash value, an interpolation and an `&&` operand, all on later lines and all under `defined?` with the counter. They match ruby, as main does.
