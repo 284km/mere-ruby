@@ -301,6 +301,9 @@ static int held_by_address(VALUE v) {
  * and stays, held or not, until it resumes -- as CRuby's collection marks a
  * suspended Fiber's stack. */
 static int pinned_p(VALUE v);
+struct pinned_stack { int stack; VALUE *at; long count; };
+static struct pinned_stack *pinned;
+static long pinned_count, pinned_cap;
 void mr_vbig_leave(const void *frame, int outermost) {
     int own = 0;
     for (long i = 0; i < temps.count && !own; i++) own = temps.at[i].owner == frame;
@@ -337,9 +340,6 @@ void mr_vbig_leave(const void *frame, int outermost) {
  * let go when it resumes (mr_vbig_unpark). A word that only looks like
  * one keeps it too, as a conservative scan does. A stack dropped while
  * paused keeps what it had, and nothing made after. */
-struct pinned_stack { int stack; VALUE *at; long count; };
-static struct pinned_stack *pinned;
-static long pinned_count, pinned_cap;
 void mr_vbig_park(int stack, const VALUE *lo, const VALUE *hi) {
     if (!mr_vbig_live || lo >= hi) return;
     VALUE *at = NULL;

@@ -11456,3 +11456,15 @@ the C names can point there and bignum.c leaves.
   at its largest**, and cleared whole on every sweep. It is sized from the
   registered addresses (all it can hold), grown or shrunk to that. An empty
   C call after one that made 100,000 temporaries: 3.6 us (3.6 before it).
+- (re-review 4) **[Minor] a Fiber that pauses again and again inside one C
+  call kept one held raw Bignum per pause** (the newest park's birth number
+  moved on each time, and what was held at each pause stayed). The birth
+  numbers are gone: when a stack pauses inside C, the words of its C frames
+  -- from the switch (registers spilled by setjmp, read from a callee below
+  it) up to its outermost C call -- are read once, and the raw Bignums
+  among them stay until it resumes (mr_vbig_park / mr_vbig_unpark), as
+  CRuby's collection marks a suspended Fiber's stack. With a C #each that
+  yields for ever, driven by Enumerator#next with a churn of the slot
+  between: 1 held, nothing pinned, every 5,000 calls. The RSS that still
+  grows there is Enumerator#next's own: `[1].cycle.next` alone grows the
+  same, on main too, with no C at all.
