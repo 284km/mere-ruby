@@ -82,6 +82,11 @@ static void define_method(VALUE klass, const char *name, VALUE (*fn)(ANYARGS), i
     long number = mr_register_function((void *)fn, arity);
     VALUE body = mr_up(MR_PROC_NEW, (VALUE)number, (VALUE)(long)arity, 2, (VALUE)rb_intern(name), 0);
     VALUE sym = ID2SYM(rb_intern(name));
+    /* (rb_f_notimplement: an entry that is no method -- see capi_notimpl) */
+    if (fn == (VALUE (*)(ANYARGS))rb_f_notimplement) {
+        mr_put_text(name);
+        mr_up2(MR_NOTIMPL, klass, kind == MR_M_SINGLETON ? 1 : kind == MR_M_MODULE_FUNCTION ? 2 : 0);
+    }
     if (kind == MR_M_SINGLETON) {
         mr_callv(klass, rb_intern("define_singleton_method"), 1, &sym, body, 0);
         return;
