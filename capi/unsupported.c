@@ -9,9 +9,9 @@
  * the one shape every stub has).
  *
  * The groups, and why each is not there:
- *   - rb_gcd_normal: rational.c's internal routine, exported for its own
- *     tests. (The bignum algorithms by name are CRuby's bignum.c itself,
- *     compiled as it is: capi/bignum_cruby.c.)
+ *   (The bignum algorithms by name are CRuby's bignum.c itself, compiled as
+ *   it is: capi/bignum_cruby.c; rb_gcd_normal is rational.c's Euclid,
+ *   capi/numeric.c.)
  *   - TracePoint from C, the debug inspector, profile frames, postponed
  *     jobs, internal thread event hooks, the bug reporter, ISeq loading:
  *     the VM's own structures.
@@ -21,9 +21,6 @@
 extern void mr_unsupported_symbol(const char *name) __attribute__((__noreturn__));
 #define UNSUPPORTED(name) void name(void) { mr_unsupported_symbol(#name); }
 
-/* CRuby's internal rational routine (the bignum ones by name are CRuby's own
- * bignum.c now: capi/bignum_cruby.c) */
-UNSUPPORTED(rb_gcd_normal)
 /* the VM's own structures */
 UNSUPPORTED(rb_tracepoint_new) UNSUPPORTED(rb_tracepoint_enable) UNSUPPORTED(rb_tracepoint_disable)
 UNSUPPORTED(rb_tracearg_from_tracepoint) UNSUPPORTED(rb_tracearg_event_flag) UNSUPPORTED(rb_tracearg_object)
@@ -46,7 +43,11 @@ UNSUPPORTED(rb_tracepoint_enabled_p)
 UNSUPPORTED(rb_random_base_init) UNSUPPORTED(rb_random_mark)
 /* encoding converters, and the rest */
 UNSUPPORTED(rb_econv_str_append) UNSUPPORTED(rb_marshal_define_compat)
-UNSUPPORTED(rb_setup_fake_str) UNSUPPORTED(rb_str_normalize_ospath)
+UNSUPPORTED(rb_setup_fake_str)
+/* (file.c has it on Apple's platforms only: capi/ospath.c) */
+#ifndef __APPLE__
+UNSUPPORTED(rb_str_normalize_ospath)
+#endif
 
 /* Declared as data: an extension that names one links, and finds it empty. */
 const char rb_random_data_type_1_0[128];

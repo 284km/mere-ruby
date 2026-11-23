@@ -273,7 +273,7 @@ VALUE rb_marshal_dump(VALUE obj, VALUE port) {
     return rb_funcall(mr_const("Marshal"), rb_intern("dump"), 2, obj, port);
 }
 int ruby_native_thread_p(void) { return 1; }
-int ruby_thread_has_gvl_p(void) { return 1; }
+/* (ruby_thread_has_gvl_p: capi/nogvl.c) */
 
 /* ---- hashing ------------------------------------------------------------------------- */
 st_index_t rb_hash_start(st_index_t h) {
