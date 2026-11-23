@@ -19,3 +19,23 @@ Looking at the class case showed an older gap under it. In a class, escaped byte
 - the literal `/\c?/` next to `Regexp.new('\c?')`.
 
 On main, the first seven lines differ from ruby.
+
+## Review of #168: re.c's reader, and only a UTF-8 pattern joins
+
+The review found two problems in the first version.
+
+- **Joining was a regression for BINARY patterns.** The class join stopped only for the `n` flag, and a Regexp made from a BINARY string has no `n`. `Regexp.new('[\xc3\xa9]'.b) =~ "\xA9".b` is 0 on ruby and on main, and the first version gave nil. The join now happens only when the pattern is cut as UTF-8 (`cut_k`).
+- **The new `\M-` arm used the parser's rule.** That is `rx_esc_byte`, under which `?` behind a control prefix is 0x7F. re.c reads a pattern given as a string with its own `read_escaped_byte`, which differs in three ways:
+  - a control prefix only masks with 0x1F, so `\M-\C-?` is 0x9F;
+  - `\c`, `\C-` and `\M-` each take any escape after them, so `\c\M-)` is 0x89, `\c\x41` is 0x01 and `\c\\` is 0x1C;
+  - a second prefix of the same kind, or a non-ASCII byte after one, is refused.
+
+**The change.** `rx_str_esc_byte` is that reader. These now use it:
+
+- the check of the escaped runs (it returns the reader's refusal, so `\M-\M-x` says "duplicate meta escape");
+- `rxp_escape`, for `\c`, `\C-` and `\M-` in one arm;
+- the class members, where `\c` and `\C-` were themselves before;
+- the continuation bytes of a joined class character;
+- `rx_kinds` and `rx_src_nonascii`, so a `\M-` escape past ASCII makes the Regexp UTF-8 and fixed, as `\x` already did (`'\M-C\M-)'` was US-ASCII).
+
+corpus 850 gained every case the review named.

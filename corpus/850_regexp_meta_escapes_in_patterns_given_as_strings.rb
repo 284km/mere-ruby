@@ -34,3 +34,27 @@ t('\C-')
 t('\Ca')
 p((Regexp.new('\c?') =~ "\x7f"), (/\c?/ =~ "\x7f"))
 p Regexp.new('x\xc3\M-)y').match("axéyb")[0]
+# (review of #168) only a UTF-8 pattern joins escaped bytes in a class: one
+# made from a BINARY string keeps them, as /n does
+def tb(src, subj)
+  r = Regexp.new(src.b)
+  p [r.encoding, r =~ subj]
+end
+tb('[\xc3\xa9]', "\xA9".b)
+tb('[^\xc3\xa9]', "\xC3".b)
+# a control or meta escape takes any escape after it, masks with 0x1F (no
+# special `?`), and refuses a second of its kind or a non-ASCII byte
+t('\c\x41', "\x01")
+t('\c\\\\', "\x1c")
+t('\c\e', "\e")
+t('\xc3\c\M-)', "É")
+t('[\xc3\c\M-)]', "É")
+t('\xc3\M-\C-?', "ß")
+t('\xc3\M-\c?', "ß")
+t('\cé')
+t('\C-\C-x')
+t('\M-\M-x')
+# \M- alone can name a non-ASCII character, and the Regexp is UTF-8, fixed
+t('\M-C\M-)', "é")
+t('[\M-C\M-)]', "é")
+p Regexp.new('\M-C\M-)').fixed_encoding?
