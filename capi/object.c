@@ -226,31 +226,27 @@ static VALUE ivar_name(ID id) {
     memcpy(buffer + 8, s, (size_t)len);
     return ID2SYM(rb_intern2(buffer, len + 8));
 }
-static int internal_ivar(ID id) {
+/* (a dmark run between C calls reads the ivar from the table, through the
+ *  collector's reader -- no dispatch, no Ruby -- for an object; anything
+ *  else is refused) */
+static VALUE ivar_read_unasked(VALUE obj, ID id) {
+    int type = rb_type(obj);
+    if (type != T_OBJECT && type != T_DATA)
+        mr_fatal("a dmark read an instance variable of something that is not an object, with no C call in progress");
     long len = 0;
     const char *s = mr_id_name(id, &len);
-    return s && !(len > 0 && s[0] == '@');
+    if (!s) mr_fatal("a dmark read an instance variable by an invalid ID");
+    char *buffer = alloca((size_t)len + 16);
+    if (len > 0 && s[0] == '@') { memcpy(buffer, s, (size_t)len); buffer[len] = 0; }
+    else { memcpy(buffer, "@__capi_", 8); memcpy(buffer + 8, s, (size_t)len); buffer[len + 8] = 0; }
+    mr_put_text(buffer);
+    return mr_up1(MR_IVAR_READ, obj);
 }
-/* (an internal ivar is C's alone, so what C last wrote or read is its value:
- *  a dmark run with no C call in progress reads it from there -- sqlite3's
- *  aggregator pin. An ordinary one is the interpreter's to say, and there
- *  is nobody to ask then: mr_up refuses.) */
 VALUE rb_ivar_get(VALUE obj, ID id) {
-    int internal = internal_ivar(id);
-    if (internal && mr_capi_mark_unasked()) {
-        VALUE known;
-        if (mr_mirror_hidden_get(obj, id, &known)) return known;
-        mr_fatal("a dmark read an internal instance variable C never wrote or read, with no C call in progress");
-    }
-    VALUE value = mr_callk(obj, "instance_variable_get", 1, ivar_name(id));
-    if (internal) mr_mirror_hidden_put(obj, id, value);
-    return value;
+    if (mr_capi_mark_unasked()) return ivar_read_unasked(obj, id);
+    return mr_callk(obj, "instance_variable_get", 1, ivar_name(id));
 }
-VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) {
-    mr_callk(obj, "instance_variable_set", 2, ivar_name(id), value);
-    if (internal_ivar(id)) mr_mirror_hidden_put(obj, id, value);
-    return value;
-}
+VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_callk(obj, "instance_variable_set", 2, ivar_name(id), value); return value; }
 VALUE rb_ivar_defined(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_defined?", 1, ivar_name(id)); }
 VALUE rb_attr_get(VALUE obj, ID id) { return rb_ivar_get(obj, id); }
 /* A name that is no Symbol is no variable, and asking does not make it one

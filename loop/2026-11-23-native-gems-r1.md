@@ -234,17 +234,15 @@ Follow-ups, not done:
   here). corpus 899 passing under MERE_RUBY_VM=1 is no evidence for this
   arm: the VM compiles the file itself, and a binary without it passes 899
   there too.
-- A dmark with no C call in progress still cannot read a String
-  (RSTRING_PTR), a Hash (rb_hash_foreach), an `@` ivar or call a method:
-  those are refused (mr_fatal), not answered. An Array is read as last
-  fetched, and one never fetched reads as empty.
+- A dmark with no C call in progress cannot read a Hash (RHASH_SIZE and
+  rb_hash_foreach are method calls) or call a method: those are refused
+  (mr_fatal), not answered. (Superseded below: Strings, Arrays and ivars
+  are read current through the collector's reader.)
 - `K.method(:===).owner` says Kernel for a class (ruby: Module).
 - An `M#call` on an extended proc that calls `super` overflows the stack
   (older: `def pr.call(*a) = super` does too).
-- A holder Ruby copied (`dup` / `clone`) has the internal ivars in the
-  interpreter but not on its mirror: a dmark that reads one before C has
-  touched the copy reaches mr_fatal. Copying the entries in
-  initialize_copy would cover it.
+- (A holder Ruby copied with `dup` / `clone` had no internal-ivar entries
+  on its mirror -- moot below: ivars are read from the table now.)
 - Saved builtin class methods called through an alias WITH A BLOCK: only
   an alias of `new` is served (Class.new and Module.new included, corpus
   902, 905); another builtin's alias called with a block takes the path
@@ -252,3 +250,51 @@ Follow-ups, not done:
 - Unrelated, found on the way: `Class.new { include m[1] }` with `m` a
   local includes `m` (TypeError "wrong argument type Array"); `x = m[1];
   include x` works.
+
+## Review of #178: a dmark's reads are current
+
+mere-pr-review-watch (capi/mirror.c): a dmark between C calls read an
+Array as C last fetched it. C took an empty Array, handed it to Ruby, Ruby
+appended, and at the next GC.start `if (RARRAY_LEN(gate) > 0)
+rb_gc_mark(child)` read 0 and lost a C-only child of a live holder (8
+wrappers: ruby 4.0.9 frees none, this head freed 6-8). Main aborted there
+instead. Nothing stale or made up may decide liveness.
+
+Chosen: the reads are made current (option 1), not refused. The collector
+runs the dmark (mr_capi_mark, from capi_gc_visit) with no C call in
+progress, so there is no frame to ask -- but a read asks nothing of Ruby:
+capi_up's DESCRIBE, STR_GET and ARY_GET only read the object store (the
+interpreter's collector does not move objects), and what they write is the
+C-side transit buffer and, for an element with no handle yet, a new handle
+(capi_tab during capi_gc_visit is walked from a snapshot vec, and a handle
+made then is swept by the same rules). So:
+
+- m_capi_api.mere: `mr_capi_gc_reader`, given once when an extension
+  opens (capi_require_file): `capi_gc_read`, which answers DESCRIBE
+  (capi_describe_x with frozen read from the flag, not dispatched), STR_GET,
+  ARY_GET, and the new MR_IVAR_READ (an object's ivar from the table, no
+  dispatch). mr_up sends exactly those ops there when a dmark runs with no
+  call in progress, and mr_fatal's everything else (a method call, a write
+  -- RHASH_SIZE and rb_hash_foreach among them).
+- mr_capi_mark bumps mr_epoch when no call is in progress, so every header
+  and body the dmark reads is fetched again: the interpreter has run since
+  the last call ended and nothing said so. That covers RARRAY_LEN /
+  RARRAY_AREF / RARRAY_CONST_PTR and RSTRING_LEN / RSTRING_PTR alike.
+- rb_ivar_get in such a dmark reads the table (MR_IVAR_READ), for an
+  object (T_OBJECT / T_DATA); the internal-ivar snapshot of the previous
+  round is gone, and with it the dup / clone hole.
+
+sqlite3's database_mark (RARRAY over its functions / collations arrays)
+and its aggregator pin (an internal ivar) read through the reader: the
+collation repros run, and the suite is as before (410 runs, 15 failures,
+2 errors, 23 skips -- the same names).
+
+capi/check: Bug::ReadingBox's gate -- an Array C read empty, that Ruby
+fills between C calls, after which C makes a child it alone holds, marked
+only when the dmark reads the gate's current length. The dmark guards a
+still-zeroed struct and its IDs are interned at Init (CRuby's GC.stress
+otherwise aborts: allocation during GC). typeddata contracts 110 on the
+reference (also under GC.stress) and on mere-ruby (default, under
+MERE_RUBY_GC_STRESS=1, with MERE_RUBY_NO_HASH_INDEX=1, under
+MERE_RUBY_VM=1); api contracts 245 (also under stress).
+

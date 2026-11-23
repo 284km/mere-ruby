@@ -25,6 +25,11 @@ struct mr_frame {
     int raised;
 };
 static struct mr_frame *cur;
+/* the collector's reader (mr_capi_gc_reader): what a dmark run between C
+ * calls asks for a read */
+static closure_CapiReq_int gc_reader;
+static int gc_reader_set;
+int mr_capi_gc_reader(closure_CapiReq_int reader) { gc_reader = reader; gc_reader_set = 1; return 0; }
 static VALUE c_errinfo = Qnil;   /* rb_errinfo's (mr_frame_errinfo, below) */
 static int depth;
 unsigned long mr_epoch = 1;
@@ -184,11 +189,19 @@ static int reads_only(int op) {
 }
 VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
     struct mr_frame *frame = cur;
-    /* (a dmark run by a collection between C calls has nobody to ask: what it
-     *  may read then is mirror.c's -- the struct as last fetched, an internal
-     *  ivar C wrote -- and anything else is refused, not answered) */
-    if (!frame && mr_capi_mark_unasked())
-        mr_fatal("a dmark asked the interpreter with no C call in progress (only fetched structs and internal ivars C wrote can be read then)");
+    /* (a dmark run by a collection between C calls asks the collector's
+     *  reader, which answers the reads that change nothing -- a header, a
+     *  String's bytes, an Array's elements, an object's ivar -- from the
+     *  objects as they are now, running no Ruby. Anything else is refused,
+     *  not answered.) */
+    if (!frame && mr_capi_mark_unasked()) {
+        if (gc_reader_set && (op == MR_DESCRIBE || op == MR_STR_GET || op == MR_ARY_GET || op == MR_IVAR_READ)) {
+            CapiReq request = { op, (long long)a, (long long)b, (long long)c, (long long)d, (long long)e };
+            stats[ST_UP]++;
+            return (VALUE)gc_reader.fn(gc_reader.env, request);
+        }
+        mr_fatal("a dmark asked the interpreter for more than a read with no C call in progress (a method call, a write)");
+    }
     if (!frame) mr_fatal("called with no call from the interpreter in progress (a C thread of its own?)");
     if (mr_vbig_live) {
         a = mr_vbig_out(a); b = mr_vbig_out(b); c = mr_vbig_out(c); d = mr_vbig_out(d); e = mr_vbig_out(e);
