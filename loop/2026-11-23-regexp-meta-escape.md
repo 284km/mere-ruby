@@ -54,3 +54,13 @@ I found the second one by tracing: with only the key changed, the BINARY search 
 The comment in `rx_esc_runs_why` now says that `'a\c\xff'` is a 0x1F, under re.c's reader.
 
 corpus 850 has each order, for a UTF-8 and a BINARY pattern and for a named group.
+
+## Third review of #168: the /i program
+
+A `/i` pattern with `s`, `S`, `k` or `K` in it is keyed by the `U8` program before the `J8` branch is reached, and the copy to the plain key was stopped only for `J8`. So `Regexp.new('[\xc3\xa9]s'.b, Regexp::IGNORECASE)` met `"as"` first and then gave nil for `"\xA9s".b`; ruby gives 0. The copy is now stopped for any program compiled under a cut key, cut as UTF-8, from a pattern with a class and an escape, whatever the suffix. corpus 850 has both orders, and an `/i` UTF-8 pattern against `"éK"`.
+
+The review also listed some older differences, noted here without a change:
+
+- a pattern written only with octal escapes (`\303\251`) is US-ASCII here;
+- BINARY `split`;
+- the wording of the overlong and surrogate refusals.

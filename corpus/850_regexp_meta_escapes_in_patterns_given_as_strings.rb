@@ -67,3 +67,8 @@ rb = Regexp.new('[\xc3\xa9]'.b); p [rb =~ "a", rb =~ "\xA9".b]
 rb2 = Regexp.new('[^\xc3\xa9]'.b); p [rb2 =~ "z", rb2 =~ "\xC3".b]
 rb3 = Regexp.new('[^\xc3\xa9]'.b); p [rb3 =~ "\xC3".b, rb3 =~ "z"]
 rn = Regexp.new('(?<c>[\xc3\xa9])'); p [rn =~ "zé", $~ && $~[:c], rn.names]
+# (third review of #168) the same under /i, where a pattern with s or k is
+# keyed by the U8 program first
+ri = Regexp.new('[\xc3\xa9]s'.b, Regexp::IGNORECASE); p [ri =~ "as", ri =~ "\xA9s".b]
+ri2 = Regexp.new('[\xc3\xa9]s'.b, Regexp::IGNORECASE); p [ri2 =~ "\xA9S".b, ri2 =~ "as"]
+ui = Regexp.new('[\xc3\xa9]k', Regexp::IGNORECASE); p [ui =~ "a".b, ui =~ "éK", ui =~ "zéK"]
