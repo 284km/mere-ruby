@@ -31,6 +31,37 @@ tests, basic tests, RubySpec and tests outside this naming convention need
 their own runners and inventories. `--all` adds CRuby implementation tests;
 their dependencies and runtime behavior may require substantial work.
 
+### Split files (`splits.tsv`)
+
+A file too long for one unit's bounds (600 s, 2 GiB) runs as several units,
+listed in `splits.tsv` as `<file> TAB <part> TAB <filter>`. Each filter is a
+test/unit `-n` name filter, and the bounds are held per unit, as they are per
+file. `list.sh` lists `<file>@<part>` in place of the file, in every mode, and
+`run.sh --one` runs the file with that part's filter on both sides. Logs, tags
+and the coverage row keep the part (`ruby_test_ast@3.out`).
+
+`list.sh` refuses a table that does not keep the promise that the parts cover
+the file exactly once:
+- a row that is not three columns;
+- parts out of order;
+- a negation anywhere but in the last part;
+- a file with fewer than two parts, or whose last part is not a negation (`!/.../`);
+- a file the tree does not have.
+
+The last part, the negation of the others, is what catches a test the other
+filters do not name.
+
+Two consequences for reading results:
+- A file's result is the sum of its parts. Compare a split file with a round
+  from before its split by adding the parts. The summary's `expected_files`
+  counts units, so it grows by the number of parts less one.
+- An upstream exclusion (`EXCLUDES`) applies before the name filter, so each
+  part records it, and `excluded_tests` would count it once per part. No
+  split file has one today.
+
+`test_ast.rb` is split in four: `test_all_tokens` over `test/ruby`, every other
+`test_all_tokens`, `test_ranges`, and the rest.
+
 ## Records and diagnostics
 
 `unittest/excludes-gc/` is the reasoned ledger for tests of the default

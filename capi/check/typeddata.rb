@@ -90,4 +90,21 @@ dynamic_garbage
 collect
 check('dynamic descriptor cleanup returned', true)
 check('live owners remain usable', boxes.last.value == 'native-only-box-payload')
+
+# A dmark that reads RARRAY_LEN / RARRAY_AREF and an internal ivar, run by a
+# collection between C calls: it was "called with no call from the
+# interpreter in progress" (sqlite3's database_mark, its aggregator pin).
+# The child is held by C alone and marked when the ivar read says so.
+# ...and an Array C handed to Ruby (empty when C read it), which Ruby
+# fills between C calls; C then makes a child it holds alone, marked only
+# when the dmark reads the gate's current length, not the copy C fetched.
+readers = Array.new(8) { Bug::ReadingBox.new }
+readers.each { |reader| reader.gate << true; reader.arm }
+10.times { collect }
+readers.each do |reader|
+  check('a reading dmark keeps its array', reader.list == %w[item-0 item-1 item-2 item-3])
+  check('a reading dmark keeps the ivar it reads', reader.held == ['held'])
+  check('a reading dmark reads the ivar truly', reader.child == 'native-child')
+  check('a reading dmark reads an Array as it is now', reader.gated_child == 'gated-child')
+end
 puts "typeddata contracts: #{$checks} passed"

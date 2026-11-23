@@ -1899,6 +1899,9 @@ let sym_enc = map_new ();
 // Symbol.all_symbols includes one written in source that execution has not
 // reached, because the parser has already made it -- so the LEXER registers
 // them, alongside the ones #to_sym makes at run time.
+// The value says which kind: VNil a name source wrote (pinned down, as
+// ruby's static Symbols are), VBool false one only #to_sym / #intern made (a
+// dynamic Symbol, which rb_check_id does not count). sym_note pins.
 let sym_all = map_new ();
 let sym_note = fn (sy: str) -> let _ = map_set sym_all sy VNil in sy;
 // the interned (deduplicated) frozen strings, keyed by encoding + content:
@@ -5314,7 +5317,21 @@ let const_owners = map_new ();
 let const_owner_note = fn (k: str) ->
   let at = str_last_index_of k "::" in
   if at > 0 then map_set const_owners (substring k 0 at) 1 else ();
+// lex_const_key's answers by "<cref>\x01<name>": a lexical constant read
+// rebuilt "<cref>::<name>" for every scope out to the top and hashed each,
+// at every read (`when String, Proc` in test-unit's assert: twenty keys a
+// call). They depend on nothing but what `consts` holds, so any write or
+// delete there forgets them all.
+// (in an arena of its own, given back whole when it is forgotten big; and
+// never more than LCK_CAP answers -- a program that makes classes without end
+// asks about scopes without end)
+let lck_memo = (let t = map_new () in let _ = map_compact t in t);
+let lck_cap = 8192;
+let lck_forget = fn (u: unit) ->
+  let n = map_len lck_memo in
+  if n == 0 then () else if n > 64 then map_recycle lck_memo else map_clear lck_memo;
 let const_tbl_put = fn (k: str) -> fn (v: Val) ->
+  let _ = lck_forget () in
   let _ = const_owner_note k in map_set consts k v;
 // `private_constant :NAME` — the fully qualified names that may not be read
 // through the scope operator. The constant itself stays in `consts`: it is
@@ -5529,7 +5546,9 @@ and bx_meth_memo = fn (b: int) -> bx_walk "m" b (fn (k: str) -> map_delete meth_
 and bx_switch = fn (b: int) ->
   let l = vec_get box_st 2 in
   if l == b then () else
-  (let _ = (if l == 1 then () else
+  // (another box's constants: what lex_const_key remembered was this one's)
+  (let _ = lck_forget () in
+   let _ = (if l == 1 then () else
              (let _ = bx_out consts bx_val "c" l in
               let _ = bx_out globals bx_val "g" l in
               let _ = bx_out meths_g bx_meth "m" l in
@@ -5557,7 +5576,7 @@ and box_take = fn (d: int) -> if vec_get box_st 0 == 1 && map_has call_box d the
 and box_back = fn (b: int) -> if vec_get box_st 0 == 1 then box_set b else ()
 // (the constant table's doors for a program's own writes)
 and consts_put = fn (k: str) -> fn (v: Val) -> let _ = bx_note_const k in const_tbl_put k v
-and consts_del = fn (k: str) -> let _ = bx_note_const k in map_delete consts k
+and consts_del = fn (k: str) -> let _ = lck_forget () in let _ = bx_note_const k in map_delete consts k
 // (a marked file name enters its box; the name is the rest)
 and cur_file_set = fn (s: str) ->
   if str_len s > 2 && str_starts_with s chr1_s then
@@ -5725,6 +5744,12 @@ let capi_booted = (let v = vec_new () in let _ = vec_push v 0 in v);
 // takes its __capi_public_send -- the name answers nothing else, so Ruby
 // code that writes it gets the NoMethodError ruby gives.
 let capi_pub_entry = (let v = vec_new () in let _ = vec_push v 0 in v);
+
+// capi_notimpl: "Owner#name" of each method C defined as rb_f_notimplement --
+// in the table (methods lists it, calling it raises NotImplementedError) and
+// no method to respond_to? / method_defined? / Method#inspect, as ruby's
+// NOTIMPLEMENTED entries
+let capi_notimpl = map_new ();
 let capi_note_redef = fn tbl -> fn (k: str) ->
   if vec_get capi_booted 0 == 0 || map_has capi_redefs k then ()
   else if str_starts_with k "Array#" || str_starts_with k "String#" || str_starts_with k "Hash#"
@@ -5735,6 +5760,9 @@ let capi_note_redef = fn tbl -> fn (k: str) ->
 let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
   let _ = class_sng_method_note k in
   let _ = capi_note_redef tbl k in
+  // (a new definition is a method again, whatever rb_f_notimplement made of
+  //  the name: C notes its own after defining, object.c)
+  let _ = (if map_len capi_notimpl > 0 then map_delete capi_notimpl k else ()) in
   let _ = msnap_save tbl k in
   let sep = str_index_of k "#" in
   let _ = (if sep > 0 then mro_bump_class (substring k 0 sep) else mro_bump ()) in
@@ -5760,13 +5788,26 @@ let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
            then (let _ = vec_set hook_bits 1 1 in map_set hook_flags "mm" VNil)
            else ()) in
   let _ = (if map_len struct_gen > 0 && map_has struct_gen k then map_delete struct_gen k else ()) in
+  // (a method's name is a Symbol, pinned down -- a dynamic one too, as
+  //  ruby's define_method / attr / alias pin it: rb_check_id finds it from
+  //  here on, and a later `"name".to_sym` is no dynamic Symbol)
+  let _ = (let b = meth_key_base k in
+           if str_len b == 0 then ()
+           else if map_has sym_all b then (match map_get sym_all b with VBool _ -> map_set sym_all b VNil | _ -> ())
+           else map_set sym_all b VNil) in
   let _ = map_delete meth_params k in store_meth tbl k v;
 // native_definition_body proves an unobserved anonymous owner, an absent
 // method row and no alias/undef/generated-method or notification-hook state.
 // Retain cache invalidation, owner presence and parameter-cache invalidation.
 let set_fresh_meth = fn tbl -> fn (owner: str) -> fn (key: str) -> fn (value: Meth) ->
+  let _ = (if map_len capi_notimpl > 0 then map_delete capi_notimpl key else ()) in
   let _ = mro_bump_class owner in
   let _ = map_set meth_owner_seen owner 1 in
+  // (the name pinned down, as set_meth does)
+  let _ = (let b = meth_key_base key in
+           if str_len b == 0 then ()
+           else if map_has sym_all b then (match map_get sym_all b with VBool _ -> map_set sym_all b VNil | _ -> ())
+           else map_set sym_all b VNil) in
   let _ = map_delete meth_params key in store_meth tbl key value;
 let del_meth = fn tbl -> fn (k: str) ->
   let _ = capi_note_redef tbl k in

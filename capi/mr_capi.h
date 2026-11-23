@@ -61,7 +61,12 @@ enum mr_op {
     MR_BREAK,           /* a: value -- `break value` from the block this C was called in */
     MR_BACKREF,         /* a: 0 read, 1 write (b: the MatchData or nil) -- `$~` of the Ruby frame that called C */
     MR_DEFINE_GVAR,     /* a: the function that reads and writes it; text: the name without `$` */
-    MR_RX_DEPTH = 28    /* a: 0 read, 1 write (b: the limit) -- how deep a pattern may nest */
+    MR_RX_DEPTH = 28,   /* a: 0 read, 1 write (b: the limit) -- how deep a pattern may nest */
+    MR_RAT_RAW = 29,    /* a: numerator, b: denominator (Integers) -> that Rational, not reduced */
+    MR_NOTIMPL = 30,    /* a: class, b: 0 its method, 1 its singleton's, 2 both; text: name -- rb_f_notimplement */
+    MR_SYM_STATE = 31,  /* a: String or Symbol -> 0 not a Symbol, 1 a dynamic one, 2 pinned down */
+    MR_IVAR_READ = 32   /* a: an object; text: an ivar's name -> its value, read from the table with no
+                         * dispatch -- the collector's reader only (a dmark between C calls) */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
     /* (16: the receiver is the current one)
@@ -128,6 +133,10 @@ RBIMPL_ATTR_NORETURN() void mr_fatal(const char *message);
 /* MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch|fileprobe|builtin: one guarantee switched off, for
  * the negative controls of tools/capi_check.py. UNSOUND; a diagnostic. */
 int mr_without(const char *what);
+/* Whether a C call from the interpreter is in progress (one it can be asked through). */
+int mr_capi_calling(void);
+/* Whether a dmark is running with no C call in progress: nobody to ask (mirror.c). */
+int mr_capi_mark_unasked(void);
 /* An API this C side does not provide: NotImplementedError, never a guess. */
 RBIMPL_ATTR_NORETURN() void mr_unsupported(const char *what);
 

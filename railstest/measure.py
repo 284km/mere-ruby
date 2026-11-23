@@ -95,8 +95,18 @@ def clean_environment():
     return env
 
 
-def environment(home, app, stdlib, user, sqlite_prefix):
+def environment(home, app, stdlib, user, sqlite_prefix, mere=False):
     env = clean_environment()
+    if mere:
+        # mere-ruby takes the standard library it is given on RUBYLIB, and a
+        # `<x>/lib/ruby/4.0.0` there with gems/4.0.0/specifications/default
+        # beside it names the tree whose DEFAULT gem specs RubyGems sees (its
+        # rubylibprefix; no other RbConfig path changes). Without them Bundler
+        # was not activated as a gem: a direct `bin/rails` read bundler.rb from
+        # the fallback library and the boot audit found no installed Bundler.
+        # The reference has its own library and specs; RUBYLIB there would put
+        # its library first and select its default Bundler instead.
+        env['RUBYLIB'] = stdlib
     env.update(LANG='en_US.UTF-8', GEM_HOME=str(home), GEM_PATH=str(home),
                GEMRC=os.devnull, RAILS_SMOKE_RUBY_LIB=stdlib, RAILS_ENV='test',
                RUBYOPT='--disable-gems -r' + str(ROOT / 'bootstrap.rb'),
@@ -153,7 +163,7 @@ def measure(args, data):
             (app / directory).mkdir(exist_ok=True)
         shutil.copytree(args.archives, app / 'vendor/cache')
         home.mkdir()
-        env = environment(home, app, stdlib, work / 'bundler-user', args.sqlite_prefix)
+        env = environment(home, app, stdlib, work / 'bundler-user', args.sqlite_prefix, mere=side == 'mere')
         commands = [
             [binary, gem, 'install', app / 'vendor/cache/bundler-4.0.20.gem', '--local', '--no-document'],
             [binary, home / 'gems/bundler-4.0.20/exe/bundle', 'install', '--local', '--jobs', '1'],

@@ -268,6 +268,12 @@ static uint64_t body_hash(struct mr_mirror *m) {
     return hash_bytes(m->as.array.as.heap.ptr, sizeof(VALUE) * (size_t)m->as.array.as.heap.len, 2);
 }
 
+/* (a dmark the collector runs between C calls has nobody to ask: it reads
+ *  the struct as last fetched -- sqlite3's database_mark walks its arrays
+ *  with RARRAY_LEN after rb_gc_mark on them, at the first GC.start. What the
+ *  marked object holds the interpreter marks itself.) */
+static int marking;
+int mr_capi_mark_unasked(void) { return marking && !mr_capi_calling(); }
 static struct mr_mirror *refresh_head(struct mr_mirror *m, VALUE obj) {
     if (m->head_epoch == mr_epoch) return m;
     VALUE packed = mr_up1(MR_DESCRIBE, obj);
@@ -372,6 +378,8 @@ void *rb_mere_basic(VALUE obj) {
  *  through their own pointer when resumed, and the watch lasts until the
  *  last of them has ended) */
 static void touch(struct mr_mirror *m, VALUE obj) {
+    /* (a dmark's read between C calls has no call to watch it for) */
+    if (mr_capi_mark_unasked()) return;
     const void *frame = mr_capi_frame();
     if (m->listed)
         for (long i = touched_count - 1; i >= 0; i--)
@@ -724,7 +732,6 @@ void mr_mirror_data(VALUE obj, int typed, const rb_data_type_t *type, void *data
 
 /* ---- the collector --------------------------------------------------------- */
 static closure_int_int marker;
-static int marking;
 void mr_mark_value(VALUE v) {
     if (marking && MR_HANDLE_P(v)) marker.fn(marker.env, (long long)v);
 }
@@ -733,6 +740,10 @@ int mr_capi_mark(closure_int_int visit, int number) {
     struct mr_mirror *m = mirror_at(number, 0);
     if (!m) return 0;
     if (m->data && mr_without("dmark")) return 0;
+    /* (a dmark run between C calls reads what is current: the interpreter
+     *  has run since the last call ended, and nothing said so -- every
+     *  struct it reads is asked again, of the collector's reader, mr_up) */
+    if (!mr_capi_calling()) mr_epoch++;
     closure_int_int before = marker;
     int was = marking;
     marker = visit;

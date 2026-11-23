@@ -89,16 +89,21 @@ static void define_method(VALUE klass, const char *name, VALUE (*fn)(ANYARGS), i
     long number = mr_register_function((void *)fn, arity);
     VALUE body = mr_up(MR_PROC_NEW, (VALUE)number, (VALUE)(long)arity, 2, (VALUE)rb_intern(name), 0);
     VALUE sym = ID2SYM(rb_intern(name));
-    if (kind == MR_M_SINGLETON) {
-        mr_callv(klass, rb_intern("define_singleton_method"), 1, &sym, body, 0);
-        return;
+    if (kind == MR_M_SINGLETON) mr_callv(klass, rb_intern("define_singleton_method"), 1, &sym, body, 0);
+    else {
+        mr_callv(klass, rb_intern("define_method"), 1, &sym, body, 0);
+        if (kind == MR_M_PRIVATE) mr_call(klass, "private", 1, sym);
+        else if (kind == MR_M_PROTECTED) mr_call(klass, "protected", 1, sym);
+        else if (kind == MR_M_MODULE_FUNCTION) {
+            mr_call(klass, "private", 1, sym);
+            mr_callv(klass, rb_intern("define_singleton_method"), 1, &sym, body, 0);
+        }
     }
-    mr_callv(klass, rb_intern("define_method"), 1, &sym, body, 0);
-    if (kind == MR_M_PRIVATE) mr_call(klass, "private", 1, sym);
-    else if (kind == MR_M_PROTECTED) mr_call(klass, "protected", 1, sym);
-    else if (kind == MR_M_MODULE_FUNCTION) {
-        mr_call(klass, "private", 1, sym);
-        mr_callv(klass, rb_intern("define_singleton_method"), 1, &sym, body, 0);
+    /* (rb_f_notimplement: an entry that is no method -- see capi_notimpl.
+     *  Noted after the definition, which clears any note of the name.) */
+    if (fn == (VALUE (*)(ANYARGS))rb_f_notimplement) {
+        mr_put_text(name);
+        mr_up2(MR_NOTIMPL, klass, kind == MR_M_SINGLETON ? 1 : kind == MR_M_MODULE_FUNCTION ? 2 : 0);
     }
 }
 #undef rb_define_method
@@ -221,11 +226,44 @@ static VALUE ivar_name(ID id) {
     memcpy(buffer + 8, s, (size_t)len);
     return ID2SYM(rb_intern2(buffer, len + 8));
 }
-VALUE rb_ivar_get(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_get", 1, ivar_name(id)); }
+/* (a dmark run between C calls reads the ivar from the table, through the
+ *  collector's reader -- no dispatch, no Ruby -- for an object; anything
+ *  else is refused) */
+static VALUE ivar_read_unasked(VALUE obj, ID id) {
+    int type = rb_type(obj);
+    if (type != T_OBJECT && type != T_DATA)
+        mr_fatal("a dmark read an instance variable of something that is not an object, with no C call in progress");
+    long len = 0;
+    const char *s = mr_id_name(id, &len);
+    if (!s) mr_fatal("a dmark read an instance variable by an invalid ID");
+    char *buffer = alloca((size_t)len + 16);
+    if (len > 0 && s[0] == '@') { memcpy(buffer, s, (size_t)len); buffer[len] = 0; }
+    else { memcpy(buffer, "@__capi_", 8); memcpy(buffer + 8, s, (size_t)len); buffer[len + 8] = 0; }
+    mr_put_text(buffer);
+    VALUE value = mr_up1(MR_IVAR_READ, obj);
+    if (value == Qundef)
+        mr_fatal("a dmark read an instance variable of a T_DATA the interpreter keeps no ivar table for (a Proc, a Binding), with no C call in progress");
+    return value;
+}
+VALUE rb_ivar_get(VALUE obj, ID id) {
+    if (mr_capi_mark_unasked()) return ivar_read_unasked(obj, id);
+    return mr_callk(obj, "instance_variable_get", 1, ivar_name(id));
+}
 VALUE rb_ivar_set(VALUE obj, ID id, VALUE value) { mr_callk(obj, "instance_variable_set", 2, ivar_name(id), value); return value; }
 VALUE rb_ivar_defined(VALUE obj, ID id) { return mr_callk(obj, "instance_variable_defined?", 1, ivar_name(id)); }
 VALUE rb_attr_get(VALUE obj, ID id) { return rb_ivar_get(obj, id); }
-VALUE rb_iv_get(VALUE obj, const char *name) { return rb_ivar_get(obj, rb_intern(name)); }
+/* A name that is no Symbol is no variable, and asking does not make it one
+ * (ruby's rb_check_id_cstr). (A variable that is there -- set by a name the
+ * lexer never read, instance_variable_set of a dynamic Symbol -- is still
+ * asked for by its own name.) */
+VALUE rb_iv_get(VALUE obj, const char *name) {
+    long len = (long)strlen(name);
+    ID id = rb_check_id_cstr(name, len, rb_usascii_encoding());
+    if (id) return rb_ivar_get(obj, id);
+    if (len > 1 && name[0] == '@' && RTEST(mr_callk(obj, "instance_variable_defined?", 1, rb_str_new(name, len))))
+        return mr_callk(obj, "instance_variable_get", 1, rb_str_new(name, len));
+    return Qnil;
+}
 VALUE rb_iv_set(VALUE obj, const char *name, VALUE value) { return rb_ivar_set(obj, rb_intern(name), value); }
 VALUE rb_obj_instance_variables(VALUE obj) { return mr_callk(obj, "instance_variables", 0); }
 VALUE rb_obj_remove_instance_variable(VALUE obj, VALUE name) { return mr_call(obj, "remove_instance_variable", 1, name); }
