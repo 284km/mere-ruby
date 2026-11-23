@@ -8,7 +8,11 @@
 #include <string.h>
 
 #define ID_FIRST 1024
-struct name { char *text; long len; uint64_t hash; };
+/* `pinned`: C has used the name as an ID (rb_intern, rb_sym2id ...), which
+ * pins it down. A name that only came over as a Symbol of the interpreter's
+ * is not: that Symbol may be a dynamic one (String#to_sym), and whether it is
+ * pinned is the interpreter's to say (MR_SYM_STATE). */
+struct name { char *text; long len; uint64_t hash; int pinned; };
 static struct name *names;
 static long name_count, name_cap;
 static long *buckets;       /* open addressing: index + 1, 0 empty */
@@ -48,9 +52,12 @@ static ID find(const char *s, long n) {
     }
     return 0;
 }
-static ID intern(const char *s, long n) {
+static ID intern_as(const char *s, long n, int pin) {
     ID found = find(s, n);
-    if (found) return found;
+    if (found) {
+        if (pin && found >= ID_FIRST) names[found - ID_FIRST].pinned = 1;
+        return found;
+    }
     uint64_t h = hash_name(s, n);
     if (name_count == name_cap) {
         name_cap = name_cap ? name_cap * 2 : 512;
@@ -64,6 +71,7 @@ static ID intern(const char *s, long n) {
     names[name_count].text = copy;
     names[name_count].len = n;
     names[name_count].hash = h;
+    names[name_count].pinned = pin;
     name_count++;
     if (name_count * 2 > bucket_cap) rehash();
     else {
@@ -73,6 +81,8 @@ static ID intern(const char *s, long n) {
     }
     return (ID)(ID_FIRST + name_count - 1);
 }
+static ID intern(const char *s, long n) { return intern_as(s, n, 1); }
+static int pinned(ID id) { return id < ID_FIRST || names[id - ID_FIRST].pinned; }
 const char *mr_id_name(ID id, long *len) {
     static char op[2];
     if (id < ID_FIRST) {
@@ -84,7 +94,9 @@ const char *mr_id_name(ID id, long *len) {
     if (len) *len = names[i].len;
     return names[i].text;
 }
-int mr_capi_intern(const char *name) { return (int)intern(name, (long)strlen(name)); }
+/* (a Symbol of the interpreter's on its way to C: having a number here pins
+ *  nothing down) */
+int mr_capi_intern(const char *name) { return (int)intern_as(name, (long)strlen(name), 0); }
 char *mr_capi_id_name(int id) {
     const char *s = mr_id_name((ID)id, NULL);
     return s ? (char *)s : (char *)"";
@@ -121,9 +133,13 @@ ID rb_intern3(const char *name, long len, rb_encoding *enc) { (void)enc; return 
 ID rb_intern_str(VALUE str) { return intern(RSTRING_PTR(str), RSTRING_LEN(str)); }
 const char *rb_id2name(ID id) { return mr_id_name(id, NULL); }
 VALUE rb_id2sym(ID id) { return ((VALUE)id << RUBY_SPECIAL_SHIFT) | RUBY_SYMBOL_FLAG; }
+/* (C taking a Symbol's ID pins it down, as ruby's rb_sym2id does a dynamic
+ *  Symbol's) */
 ID rb_sym2id(VALUE sym) {
     if (!RB_STATIC_SYM_P(sym)) rb_raise(rb_eTypeError, "wrong argument type %s (expected Symbol)", rb_obj_classname(sym));
-    return (ID)(sym >> RUBY_SPECIAL_SHIFT);
+    ID id = (ID)(sym >> RUBY_SPECIAL_SHIFT);
+    if (!pinned(id) && mr_id_name(id, NULL)) names[id - ID_FIRST].pinned = 1;
+    return id;
 }
 /* The String a Symbol is the name of: the interpreter's own, one object per
  * Symbol (Symbol#name). */
@@ -131,7 +147,10 @@ VALUE rb_id2str(ID id) {
     if (!mr_id_name(id, NULL)) return Qfalse;
     return mr_call(rb_id2sym(id), "name", 0);
 }
-VALUE rb_sym2str(VALUE sym) { return rb_id2str(rb_sym2id(sym)); }
+VALUE rb_sym2str(VALUE sym) {
+    if (!RB_STATIC_SYM_P(sym)) rb_raise(rb_eTypeError, "wrong argument type %s (expected Symbol)", rb_obj_classname(sym));
+    return rb_id2str((ID)(sym >> RUBY_SPECIAL_SHIFT));
+}
 VALUE rb_to_symbol(VALUE name) {
     if (RB_SYMBOL_P(name)) return name;
     VALUE str = rb_check_string_type(name);
@@ -143,34 +162,58 @@ VALUE rb_str_intern(VALUE str) { return rb_id2sym(rb_intern_str(str)); }
 VALUE rb_sym_to_s(VALUE sym) { return mr_call(sym, "to_s", 0); }
 VALUE rb_sym_proc(VALUE sym) { return mr_call(sym, "to_proc", 0); }
 /* The ID a name has when it is a Symbol already, and 0 when it is not: the
- * asking must not make it one. A name C has interned is one; any other is
- * asked of the interpreter, which knows the Symbols a program has made. */
-static int symbol_exists(VALUE str) {
-    return RTEST(mr_call(mr_ruby("->(s) { Symbol.all_symbols.any? { |x| x.name == s } }"), "call", 1, str));
+ * asking must not make it one. A name C has used as an ID is one. Any other
+ * is asked of the interpreter, which knows the Symbols a program has made and
+ * which of them are pinned down (MR_SYM_STATE: 0 none, 1 dynamic, 2 pinned).
+ * rb_check_id counts a pinned one only, as ruby's does: a dynamic Symbol (a
+ * String#to_sym that nothing has used as an ID since) answers 0, and *namep
+ * becomes its name. rb_check_symbol finds either kind.
+ * (A Symbol the interpreter has without having noted it -- a method's name
+ *  it made from an identifier -- is one ruby's parser would have pinned.) */
+static int sym_state(VALUE name) { return (int)(long)mr_up(MR_SYM_STATE, name, 0, 0, 0, 0); }
+static VALUE check_string(volatile VALUE *namep) {
+    VALUE str = rb_check_string_type(*namep);
+    if (NIL_P(str)) rb_raise(rb_eTypeError, "%" PRIsVALUE " is not a symbol nor a string", rb_inspect(*namep));
+    *namep = str;
+    return str;
 }
 ID rb_check_id(volatile VALUE *namep) {
     VALUE name = *namep;
-    if (RB_SYMBOL_P(name)) return rb_sym2id(name);
-    VALUE str = rb_check_string_type(name);
-    if (NIL_P(str)) rb_raise(rb_eTypeError, "%" PRIsVALUE " is not a symbol nor a string", rb_inspect(name));
-    *namep = str;
+    if (RB_STATIC_SYM_P(name)) {
+        ID id = (ID)(name >> RUBY_SPECIAL_SHIFT);
+        if (pinned(id) || !mr_id_name(id, NULL)) return id;
+        if (sym_state(name) != 1) { names[id - ID_FIRST].pinned = 1; return id; }
+        *namep = rb_id2str(id);
+        return 0;
+    }
+    VALUE str = check_string(namep);
     ID id = find(RSTRING_PTR(str), RSTRING_LEN(str));
-    if (id) return id;
-    return symbol_exists(str) ? rb_intern_str(str) : 0;
+    if (id && pinned(id)) return id;
+    int state = sym_state(str);
+    if (state == 2 || (id && state == 0)) return rb_intern_str(str);
+    return 0;
 }
 VALUE rb_check_symbol(volatile VALUE *namep) {
-    ID id = rb_check_id(namep);
-    return id ? rb_id2sym(id) : Qnil;
+    VALUE name = *namep;
+    if (RB_STATIC_SYM_P(name)) return name;
+    VALUE str = check_string(namep);
+    ID id = find(RSTRING_PTR(str), RSTRING_LEN(str));
+    if (id) return rb_id2sym(id);
+    if (!sym_state(str)) return Qnil;
+    return rb_id2sym(intern_as(RSTRING_PTR(str), RSTRING_LEN(str), 0));
 }
 ID rb_check_id_cstr(const char *ptr, long len, rb_encoding *enc) {
     ID id = find(ptr, len);
-    if (id) return id;
-    VALUE str = rb_enc_str_new(ptr, len, enc);
-    return symbol_exists(str) ? intern(ptr, len) : 0;
+    if (id && pinned(id)) return id;
+    int state = sym_state(rb_enc_str_new(ptr, len, enc));
+    if (state == 2 || (id && state == 0)) return intern(ptr, len);
+    return 0;
 }
 VALUE rb_check_symbol_cstr(const char *ptr, long len, rb_encoding *enc) {
-    ID id = rb_check_id_cstr(ptr, len, enc);
-    return id ? rb_id2sym(id) : Qnil;
+    ID id = find(ptr, len);
+    if (id) return rb_id2sym(id);
+    if (!sym_state(rb_enc_str_new(ptr, len, enc))) return Qnil;
+    return rb_id2sym(intern_as(ptr, len, 0));
 }
 /* What kind of name an ID is, as the parser would read it. */
 enum kind { K_NONE, K_LOCAL, K_CONST, K_GLOBAL, K_INSTANCE, K_CLASS, K_ATTRSET, K_JUNK };
