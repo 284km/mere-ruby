@@ -58,3 +58,12 @@ t('\M-\M-x')
 t('\M-C\M-)', "é")
 t('[\M-C\M-)]', "é")
 p Regexp.new('\M-C\M-)').fixed_encoding?
+# (second review of #168) the compiled program is shared by every Regexp
+# with the same source and options: a UTF-8 subject met first must not
+# decide what a BINARY one meets, nor the other way round
+r = Regexp.new('[\xc3\xa9]'); p [r =~ "a".b, r =~ "é"]
+r2 = Regexp.new('[\xc3\xa9]'); p [r2 =~ "é", r2 =~ "a".b]
+rb = Regexp.new('[\xc3\xa9]'.b); p [rb =~ "a", rb =~ "\xA9".b]
+rb2 = Regexp.new('[^\xc3\xa9]'.b); p [rb2 =~ "z", rb2 =~ "\xC3".b]
+rb3 = Regexp.new('[^\xc3\xa9]'.b); p [rb3 =~ "\xC3".b, rb3 =~ "z"]
+rn = Regexp.new('(?<c>[\xc3\xa9])'); p [rn =~ "zé", $~ && $~[:c], rn.names]

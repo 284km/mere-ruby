@@ -39,3 +39,18 @@ The review found two problems in the first version.
 - `rx_kinds` and `rx_src_nonascii`, so a `\M-` escape past ASCII makes the Regexp UTF-8 and fixed, as `\x` already did (`'\M-C\M-)'` was US-ASCII).
 
 corpus 850 gained every case the review named.
+
+## Second review of #168: the program cache decided by the first subject
+
+Joining was decided by `cut_k`, which is set by the encoding of the subject being matched. The compiled program is cached under the pattern and its options, and that key did not say how it was cut. So whichever subject came first decided the program for every Regexp with that source: `r =~ "a".b; r =~ "é"` was nil, nil, and the other way round for a BINARY pattern.
+
+Two changes make the cut part of the key.
+
+- **The key says how the program was cut.** A UTF-8-cut program for a pattern with a class and an escape gets its own key (`rx_cut_key`, a `J8` suffix kept apart from the `/i` program's `U8`).
+- **The plain key no longer gets a copy of a joined program.** `rxc_get` copies every program it compiles under a cut key to the plain key, for the readers that look up names and the group count by that key. A joined program is not the byte-cut one, and its start bytes differ too. So for it, the plain key gets only the names and an alias that `rx_ng_of` follows, and a byte-cut search compiles its own program.
+
+I found the second one by tracing: with only the key changed, the BINARY search still found the joined program under the plain key.
+
+The comment in `rx_esc_runs_why` now says that `'a\c\xff'` is a 0x1F, under re.c's reader.
+
+corpus 850 has each order, for a UTF-8 and a BINARY pattern and for a named group.
