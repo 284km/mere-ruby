@@ -62,7 +62,7 @@ enum mr_op {
     MR_BACKREF,         /* a: 0 read, 1 write (b: the MatchData or nil) -- `$~` of the Ruby frame that called C */
     MR_DEFINE_GVAR,     /* a: the function that reads and writes it; text: the name without `$` */
     MR_RX_DEPTH = 28,   /* a: 0 read, 1 write (b: the limit) -- how deep a pattern may nest */
-    MR_SYM_STATE = 29   /* a: String or Symbol -> 0 not a Symbol, 1 a dynamic one, 2 pinned down */
+    MR_SYM_STATE = 31   /* a: String or Symbol -> 0 not a Symbol, 1 a dynamic one, 2 pinned down */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
     /* (16: the receiver is the current one)
