@@ -1487,12 +1487,25 @@ let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
 // (Monitor#synchronize then raised ThreadError). The type checker keeps this
 // list honest in one direction: a non-Val map here is a build error. A MISSING
 // map is the direction to fear when adding a new global store.
-let gc_mark_roots = fn metadata -> fn env -> fn live ->
+// The marking's own tables, emptied and their arenas handed back. A recycle
+// asks every suspended stack whether it points into the arena, and the first
+// ask after a stack stopped walks all it reaches (__lang_pin_gather) -- the
+// same walk the scan of that stack below makes, which keeps the answer. Asked
+// here, at the start of a mark, it was the interrupted body's stack walked
+// twice per collection: 2.6% of test_ast. So a collection empties them at its
+// end (gc_collect), once its scan has gathered the pins, and a mark that
+// finds them empty does nothing here; one that does not (a collection on the
+// stack, or the fiber reclaim pass) empties them here as before.
+let gc_pend_release = fn (u: unit) ->
   let _ = map_recycle gc_live_cls in
   let _ = vec_recycle gc_cls_pend in
   let _ = map_recycle gc_ref_live in
   let _ = vec_recycle gc_ref_pend in
-  let _ = vec_recycle gc_obj_pend in
+  vec_recycle gc_obj_pend;
+let gc_mark_roots = fn metadata -> fn env -> fn live ->
+  let _ = (if map_len gc_live_cls > 0 || vec_len gc_cls_pend > 0 || map_len gc_ref_live > 0
+              || vec_len gc_ref_pend > 0 || vec_len gc_obj_pend > 0
+           then gc_pend_release () else ()) in
   // (Ruby's C API: the VALUEs C registered, and -- while a call into C is in
   //  progress -- the ones on this stack, which is C's local variables. A
   //  stopped stack's are read with its handles, below.)
@@ -2106,7 +2119,7 @@ let gc_sweep_classes = fn (nc: bool) ->
            drop_tag 0) in
   let _ = gc_drop_sh hng_sng_base dead_tags "" in
   let _ = (if compact && vec_len dead_tags > 0 then
-    (let _ = map_compact hng_store in let _ = map_compact hng_arr_ids in map_compact hng_sng_base) else ()) in
+    (let _ = map_compact hng_store in let _ = map_compact hng_arr_ids in let _ = map_compact hng_prim_ids in map_compact hng_sng_base) else ()) in
   let dead_refs = vec_new () in
   let _ = map_iter ref_snaps (fn (key: int) -> fn (_entries: (str * str) list) ->
     if map_has gc_ref_live key then () else vec_push dead_refs key) in
@@ -2559,6 +2572,8 @@ let gc_collect = fn env -> fn world ->
     // pools, now that every stack is suspended (note 303)
     let _ = (if nc then () else qv_drain ()) in
     let _ = (if nc then () else hidx_drain ()) in
+    // (the marking's tables, for the next mark: gc_pend_release)
+    let _ = (if nc then () else gc_pend_release ()) in
     let _ = vec_set qv_ctr 3 0 in
     let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (gc_live_count live) ++ " ivars2=" ++ str_of_int (map_len ivars)
                                      ++ " str_store=" ++ str_of_int (str_bytes ()) ++ " str_pch=" ++ str_of_int (map_bytes str_pch)
@@ -18636,7 +18651,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      | _ -> VNil)
   else
   // a singleton method defined on this exact String/Array/Hash wins.
-  let hk = hng_key recv in
+  let hk = hng_key_q recv in
   if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) name then
     // (with an explicit receiver its visibility holds, as for any object's:
     //  main's -- `singleton_class.class_eval { private def m; end }` -- was
@@ -39350,7 +39365,7 @@ and alias_owner = fn world -> fn (cls: str) -> fn (name: str) ->
 // does this value's singleton class (from `def value.method`) define `name`?
 and hng_sng_has = fn world -> fn (recv: Val) -> fn (name: str) ->
   if map_len hng_store == 0 then false else
-  let hk = hng_key recv in
+  let hk = hng_key_q recv in
   (if str_eq hk "" then false else map_has hng_store hk)
   && (let c9 = map_get hng_store hk in
       is_sng_cls c9 && (has_meth world c9 name
@@ -48869,7 +48884,7 @@ and module_name_super_ahead = fn world -> fn (recv: Val) ->
 // A primitive's singleton participates in lookup without becoming its reported
 // ordinary class. dispatch_cls_of intentionally looks past this tag for super.
 and hng_lookup_cls = fn world -> fn (recv: Val) ->
-  let hk9 = hng_key recv in
+  let hk9 = hng_key_q recv in
   if str_len hk9 > 0 && map_has hng_store hk9 && is_sng_cls (map_get hng_store hk9)
   then map_get hng_store hk9 else dispatch_cls_of world recv
 and hng_undef_blocked = fn world -> fn (recv: Val) -> fn (name: str) ->
@@ -48905,7 +48920,7 @@ and hng_retained_alias_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> 
 and hng_missing_hook = fn world -> fn (recv: Val) -> fn (name: str) ->
   if map_len hng_store == 0 || (match recv with VObj _ -> true | VClass _ -> true | VMain -> true | _ -> false) then false
   else
-    (let hk9 = hng_key recv in
+    (let hk9 = hng_key_q recv in
      if (if map_has hng_store hk9 then false else true) then false
      else
        (let c9 = map_get hng_store hk9 in
