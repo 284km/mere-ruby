@@ -14,60 +14,7 @@
 #include <unistd.h>
 
 /* ---- threads -------------------------------------------------------------- */
-/* This interpreter's threads take turns on one native thread: there is no
- * lock to give up, and a function "without the GVL" simply runs. Nothing
- * else runs meanwhile.
- *
- * What the unblocking function is for still holds: a signal the program
- * traps must be able to end the wait. While the function runs, every signal
- * the interpreter has a handler for is given one more step -- the
- * interpreter's handler (which notes the signal), then the unblocking
- * function. The trap itself runs when the C function has returned. */
-#include <signal.h>
-static rb_unblock_function_t *unblock;
-static void *unblock_data;
-static struct sigaction previous[NSIG];
-static void unblocking_handler(int sig, siginfo_t *info, void *context) {
-    struct sigaction *old = &previous[sig];
-    if (old->sa_flags & SA_SIGINFO) { if (old->sa_sigaction) old->sa_sigaction(sig, info, context); }
-    else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) old->sa_handler(sig);
-    if (unblock && unblock != RUBY_UBF_IO && unblock != RUBY_UBF_PROCESS) unblock(unblock_data);
-}
-static void *without_gvl(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2) {
-    rb_unblock_function_t *outer = unblock;
-    void *outer_data = unblock_data;
-    int wrapped[NSIG] = { 0 };
-    if (ubf && ubf != RUBY_UBF_IO && ubf != RUBY_UBF_PROCESS && !outer) {
-        for (int sig = 1; sig < NSIG; sig++) {
-            struct sigaction current;
-            if (sig == SIGKILL || sig == SIGSTOP || sigaction(sig, NULL, &current) != 0) continue;
-            if (!(current.sa_flags & SA_SIGINFO) && (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN)) continue;
-            previous[sig] = current;
-            struct sigaction ours = current;
-            ours.sa_sigaction = unblocking_handler;
-            ours.sa_flags |= SA_SIGINFO;
-            if (sigaction(sig, &ours, NULL) == 0) wrapped[sig] = 1;
-        }
-    }
-    unblock = ubf;
-    unblock_data = data2;
-    void *result = func(data1);
-    unblock = outer;
-    unblock_data = outer_data;
-    for (int sig = 1; sig < NSIG; sig++) if (wrapped[sig]) sigaction(sig, &previous[sig], NULL);
-    return result;
-}
-void *rb_thread_call_without_gvl(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2) {
-    return without_gvl(func, data1, ubf, data2);
-}
-void *rb_thread_call_without_gvl2(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2) {
-    return without_gvl(func, data1, ubf, data2);
-}
-void *rb_nogvl(void *(*func)(void *), void *data1, rb_unblock_function_t *ubf, void *data2, int flags) {
-    (void)flags;
-    return without_gvl(func, data1, ubf, data2);
-}
-void *rb_thread_call_with_gvl(void *(*func)(void *), void *data1) { return func(data1); }
+/* (the functions without the GVL, and rb_thread_call_with_gvl: capi/nogvl.c) */
 VALUE rb_thread_current(void) { return mr_call(rb_cThread, "current", 0); }
 VALUE rb_thread_main(void) { return mr_call(rb_cThread, "main", 0); }
 void rb_thread_schedule(void) { mr_call(rb_cThread, "pass", 0); }

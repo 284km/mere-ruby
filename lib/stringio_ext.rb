@@ -182,6 +182,9 @@ class StringIO
     @__sio_st.string.replace((+"").force_encoding(@__sio_st.string.encoding)) if trunc
     binmode if opts[:binmode]
     set_encoding(enc_name.split(":")[0]) if enc_name && !enc_name.empty?
+    # (strio_initialize returns the stream: Puma's `class IOBuffer <
+    #  StringIO; def initialize = super.binmode` uses that)
+    self
   end
 
   def close

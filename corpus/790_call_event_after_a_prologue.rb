@@ -166,3 +166,4 @@ p fb.resume, fb.resume
 fiber_tp.disable
 p $fev
 
+p [proc { |a = 1| a }.call(nil), proc { |a, b = 2| b }.call(1, nil), lambda { |a = 3| a }.call(nil), [[1, nil]].map { |a, b = 4| b }]

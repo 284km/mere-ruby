@@ -563,4 +563,45 @@ check(A.check_symbol(sym) == sym)
 Class.new.define_method(sym) {}
 check(A.check_id(fresh))
 check(A.check_id(sym))
+
+# (without the GVL, with no other Ruby thread alive: the function runs on
+#  the caller's native thread, and sees the __thread value C set)
+check(Thread.list.size == 1 && A.nogvl_tls == 42)
+# (...and errno is what the function left, whichever native thread it ran
+#  on: alone, and with another thread alive)
+check(A.nogvl_errno == [-1, 1])
+other = Thread.new { sleep 5 }
+check(A.nogvl_errno == [-1, 1])
+other.kill
+# (without the GVL: another thread runs while the function naps; the
+#  function can call back into Ruby; a kill ends a blocking read)
+ticks = 0
+ticker = Thread.new { 20.times { ticks += 1; sleep 0.01 } }
+check(A.nogvl_nap(400) == true)
+ticker.join
+check(ticks == 20)
+check(A.nogvl_call_back([]) == [1])
+rd, wr = IO.pipe
+reader = Thread.new { A.nogvl_read(rd.fileno) }
+sleep 0.1
+reader.kill
+check(reader.join(5).equal?(reader))
+rd.close; wr.close
+# (...a raise that a function cannot be woken for: the other threads still
+#  run until it ends, and then it is raised)
+ticks = 0
+ticker = Thread.new { loop { ticks += 1; sleep 0.01 } }
+napper = Thread.new { A.nogvl_stubborn(400) }
+sleep 0.05
+napper.raise(ArgumentError, "stop")
+at_raise = ticks
+ended = (napper.value rescue $!.class)
+seen = ticks
+ticker.kill
+check(ended == ArgumentError)
+check(seen > at_raise)
+# (...and a call back into Ruby that raises: the function ends, the
+#  exception reaches the caller, and the next call works)
+3.times { check((A.nogvl_call_raise rescue $!.message) == "from with_gvl") }
+check(A.nogvl_call_back([]) == [1])
 puts "api contracts: #{$count} passed"

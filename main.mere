@@ -5574,7 +5574,8 @@ and int_ops_plain = fn world ->
           (match ops with
            | Nil -> true
            | Cons (o, t) -> (if has_meth world "Integer" o || map_has builtin_alias ("Integer#" ++ o) then false else none t)) in
-        let ok = none (Cons ("+", Cons ("-", Cons ("*", Cons ("<", Cons ("<=", Cons (">", Cons (">=", Cons ("==", Cons ("!=", Nil)))))))))) in
+        let ok = none (Cons ("+", Cons ("-", Cons ("*", Cons ("<", Cons ("<=", Cons (">", Cons (">=", Cons ("==", Cons ("!=",
+                       Cons (">>", Cons ("<<", Cons ("&", Cons ("|", Cons ("^", Cons ("%", Cons ("/", Nil))))))))))))))))) in
         let _ = vec_set int_fast_st 0 g in
         let _ = vec_set int_fast_st 1 (if ok then 1 else 0) in
         let _ = vec_set int_fast_st 2 1 in
@@ -5634,7 +5635,8 @@ and flt_fast_op = fn world -> fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
 // (the overflow into a Bignum is add_int_ov's, as the general path's is)
 and int_fast_op = fn (op: str) -> fn (a: int) -> fn (b: int) ->
   let n = str_len op in
-  // (told apart by their bytes: < 60, > 62, + 43, - 45, * 42, = 61, ! 33)
+  // (told apart by their bytes: < 60, > 62, + 43, - 45, * 42, = 61, ! 33,
+  //  & 38, | 124, ^ 94, % 37, / 47)
   if n == 1 then
     (let c = ord (char_at op 0) in
      if c == 60 then (true, VBool (a < b))
@@ -5642,6 +5644,25 @@ and int_fast_op = fn (op: str) -> fn (a: int) -> fn (b: int) ->
      else if c == 43 then (true, add_int_ov a b)
      else if c == 45 then (true, sub_int_ov a b)
      else if c == 42 then (true, mul_int_ov a b)
+     else if c == 38 then (true, VInt (bit_and a b))
+     else if c == 124 then (true, VInt (bit_or a b))
+     else if c == 94 then (true, VInt (bit_xor a b))
+     // (only where floor and truncation agree, and nothing is refused: a
+     //  negative operand, or a zero divisor, goes the general way)
+     else if c == 37 && a >= 0 && b > 0 then (true, VInt (a % b))
+     else if c == 47 && a >= 0 && b > 0 then (true, VInt (a / b))
+     else (false, VNil))
+  // `>>` -- arithmetic, so floor division by 2^b; a shift past the width is
+  // the sign -- and `<<` while the answer stays an Integer of this width (a
+  // negative count, or one that overflows, goes the general way)
+  else if n == 2 && ord (char_at op 0) == 62 && ord (char_at op 1) == 62 then
+    (if b < 0 then (false, VNil)
+     else if b >= int_bits then (true, VInt (if a < 0 then 0 - 1 else 0))
+     else (true, VInt (bit_shr a b)))
+  else if n == 2 && ord (char_at op 0) == 60 && ord (char_at op 1) == 60 then
+    (if b < 0 || b >= int_bits then (if a == 0 && b >= 0 then (true, VInt 0) else (false, VNil))
+     else if a >= 0 && a <= bit_shr int_max b then (true, VInt (bit_shl a b))
+     else if a < 0 && a >= bit_shr int_min b then (true, VInt (bit_shl a b))
      else (false, VNil))
   else if n == 2 && ord (char_at op 1) == 61 then
     (let c = ord (char_at op 0) in
@@ -21899,6 +21920,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 && enc_ascii_compat se9
                 && (match rx_kinds body 0 false false with (_, ho9) -> ho9 || str_contains body "\\p\{" || str_contains body "\\P\{")
              then (se9, (if str_contains fl "u" then fl else fl ++ "u"))
+             // ...and a UTF-8 source that names a character property
+             // (`'\p{Alpha}'`, `'\P{Alpha}'`) is fixed to UTF-8, as ruby's
+             // rb_reg_preprocess makes it (a folded `/#{"\\p{Alpha}"}/` is this)
+             else if str_eq renc9 "" && str_eq se9 "UTF-8" && (if str_contains fl "n" then false else true)
+                     && (str_contains body "\\p\{" || str_contains body "\\P\{")
+             then ("UTF-8", (if str_contains fl "u" then fl else fl ++ "u"))
+             // ...and in a US-ASCII source, escapes of bytes past 0x7F
+             // (`'\x80'`, `'[\x80-\xff]'`) leave it US-ASCII and not fixed,
+             // as ruby does: they only read as UTF-8 elsewhere. (A folded
+             // `/#{%q"\x80"}/` in a US-ASCII file is this.)
+             else if (str_eq renc9 "UTF-8" || (str_eq renc9 "" && rx_src_nonascii body 0))
+                     && str_eq se9 "US-ASCII" && (if str_contains fl "u" || str_contains fl "n" then false else true)
+                     && str_all_ascii_go body 0 (str_len body) && (if str_contains body "\\u" then false else true)
+             then ("US-ASCII", fl)
              else (renc9, fl)) in
           // ...and a pattern that does not parse is refused with the reason,
           // "premature end of char-class: /^[$/" as ruby words it
@@ -67159,16 +67194,12 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
      match v with
      // (a String in another encoding is the operand itself -- the one
      //  frozen object, in the encoding the compiler gave it, which is
-     //  ruby's: tools/iseq/compare_files.rb compares it. A Regexp literal
-     //  in an encoding other than UTF-8 or US-ASCII is not run here yet:
-     //  corpus 462's, in a US-ASCII source, came out unfrozen and in
-     //  another encoding than the evaluator's lexer gives them.)
-     // (the value's third field is its encoding and, after it, its identity)
+     //  ruby's: tools/iseq/compare_files.rb compares it. So is a Regexp
+     //  literal in any encoding: a BINARY `/\x80/n`, an EUC-JP `/../e`.
+     //  corpus 462's folded `/#{%q"\x80"}/` in a US-ASCII source came out
+     //  UTF-8 here once -- Regexp.new read the escape as UTF-8, which ruby
+     //  does only in a UTF-8 string.)
      | VStr h -> if utf8 v then (o, sget h, 1, 0, v, "") else (o, "", 0, 0, v, "")
-     // (the value's third field is its encoding and, after it, its identity)
-     | VRegex (_, _, e9) -> (let e8 = rx_ev_enc e9 in
-                             if str_eq e8 "" || str_eq e8 "UTF-8" || str_eq e8 "US-ASCII" then (o, "", 0, 0, v, "")
-                             else bad " (a Regexp in another encoding)")
      | _ -> (o, "", 0, 0, v, ""))
   else if o == 6 || o == 7 || o == 31 || o == 32 then
     (match o1 with
@@ -67270,8 +67301,6 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
     (let fk = (match vm_nth ins 3 with VStr h -> sget h | _ -> "") in
      let fl = (let b9 = str_index_of fk "|" in if b9 < 0 then "" else substring fk 0 b9) in
      if vm_int o1 < 0 || vm_int o2 < 0 then bad ""
-     // (a pattern whose flags name an encoding: as a literal in one, above)
-     else if str_contains fl "n" || str_contains fl "u" || str_contains fl "e" || str_contains fl "s" then bad " (a Regexp in another encoding)"
      else (o, fk, vm_int o1, vm_int o2, VNil, ""))
   // getspecial: a match reference (key 1) -- the number doubled, or the
   // character doubled plus 1 -- as the global it is; `$_` (key 0)
@@ -68108,6 +68137,20 @@ and vm_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) ->
           && (match kws with Nil -> true | _ -> false) && (if str_eq mid "new" then false else true)
           && (if map_len hook_flags > 0 && hook_tp_on () then false else true)
   then vm_blk_send env world blk recv mid args bid
+  // (two Integers and an operator int_fast_op answers -- `p >> 3`, a send
+  //  in the sequence -- answered here, as vm_step answers its opt_ forms:
+  //  vm_call_in made the parser's EBin of it in a scope)
+  else if argc == 1 && bid < 0 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 8 || vm_bit fl 64 || vm_bit fl 1048576 then false else true)
+          && (match (recv, args) with (VInt _, Cons (VInt _, Nil)) -> true | _ -> false)
+          && (match kws with Nil -> true | _ -> false)
+          && (if map_len hook_flags > 0 && hook_tp_on () then false else true)
+          && int_ops_plain world
+          && (match (recv, args) with
+              | (VInt x9, Cons (VInt y9, Nil)) -> (match int_fast_op mid x9 y9 with (ok9, _) -> ok9)
+              | _ -> false)
+  then (match (recv, args) with
+        | (VInt x9, Cons (VInt y9, Nil)) -> (match int_fast_op mid x9 y9 with (_, v9) -> v9)
+        | _ -> VNil)
   // (a call of positional values on a receiver that vm_call_in would hand
   //  to emethod_args -- not an operator or a setter it writes as the
   //  parser's form, not on Kernel, not a `__` name, nothing watching --
