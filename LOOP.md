@@ -11174,3 +11174,16 @@ the C names can point there and bignum.c leaves.
   (`last = rb_big_new(1000, 1)` on a registered `last`, 20,000 times) grows
   RSS by -3 MB, and `last` still reads 0. One kept by rb_gc_mark from a
   dmark is still kept for good (the rarer case; the header says so).
+- (re-review 2) **[Major] that sweep freed one a C local still had.** It ran
+  at the end of every C call, a nested one too: `old = slot; slot = Qnil;`,
+  then rb_funcall / rb_block_call into C, then `old` -- [BUG] "not an
+  object", where CRuby's collection sees `old` on the C stack. The held ones
+  are looked at again only when no C call is in progress on any stack
+  (frame.prev is NULL, and no Fiber has a chain of C calls parked). A
+  call's own temporaries still go at its end, as before. capi/check: the
+  pattern, both ways in, reads 0 after GC.start on both sides.
+- (re-review 2) **[Suggestion] the sweep cost (held x registered addresses)
+  per call.** The addresses are read once per sweep into a set of the raw
+  Bignums they hold (mr_gc_each_address_value), so it is O(addresses +
+  held), and nothing is read at the end of a call that made no raw Bignum
+  while the outer one is still running.

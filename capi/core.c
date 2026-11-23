@@ -56,7 +56,8 @@ static void words_need(long n) {
 }
 extern long mr_vbig_live;
 extern VALUE mr_vbig_out(VALUE v);
-extern void mr_vbig_leave(const void *frame);
+extern void mr_vbig_leave(const void *frame, int no_c_frame);
+static long parked_chains(void);
 void mr_put_words(long n, const VALUE *v) {
     /* (a raw Bignum bignum.c made is the Integer it says, past this point:
      *  capi/bignum_cruby.c. Converted BEFORE the words are set: making the
@@ -535,7 +536,8 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
         result = frame.pending;
     }
     mr_mirrors_leave(&frame, frame.prev == NULL);
-    mr_vbig_leave(&frame);
+    /* (no C call left on this stack, nor on a Fiber's parked one) */
+    mr_vbig_leave(&frame, frame.prev == NULL && parked_chains() == 0);
     cur = frame.prev;
     depth--;
     mr_epoch++;
@@ -609,6 +611,7 @@ int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which]
 struct mr_parked { int stack; struct mr_frame *frame; int depth; };
 static struct mr_parked *parked;
 static long parked_count, parked_cap;
+static long parked_chains(void) { return parked_count; }
 int mr_capi_switch(int from, int to) {
     if (mr_without("switch")) return 0;
     if (cur) {

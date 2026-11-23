@@ -422,4 +422,11 @@ check(A.ospath(utf).equal?(utf))
 GC.start
 check(A.kept_bignums == [0, 0])
 check(A.kept_bignums == [0, 0])
+# (...and one a slot held, taken out into a C local and used after a
+#  nested C call: still there)
+[false, true].each do |by_block|
+  A.slot_fill
+  GC.start
+  check(A.slot_swap(by_block) == 0)
+end
 puts "api contracts: #{$count} passed"

@@ -213,6 +213,20 @@ static VALUE kept_bignums(VALUE self) {
     (void)self;
     return rb_ary_new_from_args(2, kept_marked, kept_static);
 }
+/* (...and one a registered slot held when its call ended, which a later
+ *  call takes out into a local, empties the slot, and uses after a nested
+ *  C call -- a method, or a C block: the local still has it, as CRuby's
+ *  collection sees the C stack) */
+static VALUE swap_slot;
+static VALUE slot_fill(VALUE self) { (void)self; swap_slot = rb_big_new(5, 1); return Qnil; }
+static VALUE slot_block(RB_BLOCK_CALL_FUNC_ARGLIST(x, data)) { (void)data; return x; }
+static VALUE slot_swap(VALUE self, VALUE by_block) {
+    volatile VALUE old = swap_slot;
+    swap_slot = Qnil;
+    if (RTEST(by_block)) rb_block_call(rb_ary_new_from_args(1, INT2FIX(1)), rb_intern("each"), 0, 0, slot_block, Qnil);
+    else rb_funcall(self, rb_intern("noop"), 0);
+    return old;
+}
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
     kept_marked = rb_big_new(3, 1);
@@ -220,6 +234,9 @@ void Init_api_fixture(void) {
     rb_gc_register_address(&kept_static);
     kept_static = rb_big_new(4, 0);
     rb_define_singleton_method(mod, "kept_bignums", kept_bignums, 0);
+    rb_gc_register_address(&swap_slot);
+    rb_define_singleton_method(mod, "slot_fill", slot_fill, 0);
+    rb_define_singleton_method(mod, "slot_swap", slot_swap, 1);
     rb_define_singleton_method(mod, "ptr_after_yield", ptr_after_yield, 1);
     rb_define_singleton_method(mod, "ary_ptr_after_yield", ary_ptr_after_yield, 1);
     rb_define_singleton_method(mod, "byte_after_yield", byte_after_yield, 2);

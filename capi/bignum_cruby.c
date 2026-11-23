@@ -21,9 +21,11 @@
  *     from a dmark (kept for good from then on, even after its data object
  *     is gone: a leak, the rarer case) -- or for as long as a registered
  *     address (rb_gc_register_address, rb_global_variable) holds it: checked
- *     at the end of every C call, so an overwritten static slot lets the old
- *     one go. One C only stores in a struct, which no collection marks
- *     before the call ends, is freed with the call: register it.
+ *     when a C call ends and no other is in progress (a C local of an outer
+ *     call may have taken it out of the slot), so an overwritten static slot
+ *     lets the old one go. One C only stores in a struct, which no
+ *     collection marks before the call ends, is freed with the call:
+ *     register it.
  *
  * The other way, an Integer the interpreter has is a handle (or a Fixnum),
  * which bignum.c cannot read: the entry points below hand it a raw Bignum
@@ -249,30 +251,71 @@ static void raw_free(VALUE obj) {
     if (!BIGNUM_EMBED_P(obj)) ruby_xfree(RBIGNUM(obj)->as.heap.digits);
     free((void *)obj);
 }
+/* The raw Bignums the registered addresses hold right now: read once per
+ * end of a call, into a set of their own, so that asking about each one is
+ * O(1) -- not a walk of every address per raw Bignum. (Only raw Bignums go
+ * in, so it is no bigger than mr_vbig_live; 0 is empty.) */
+extern void mr_gc_each_address_value(void (*visit)(VALUE));
+static VALUE *holder_slots;
+static long holder_cap;
+static void holder_put(VALUE v) {
+    if (RB_SPECIAL_CONST_P(v) || MR_HANDLE_P(v) || !set_has(v)) return;
+    unsigned long i = set_hash(v) & (unsigned long)(holder_cap - 1);
+    while (holder_slots[i] != 0 && holder_slots[i] != v) i = (i + 1) & (unsigned long)(holder_cap - 1);
+    holder_slots[i] = v;
+}
+static void holders_read(void) {
+    long want = 16;
+    while (want < mr_vbig_live * 2) want *= 2;
+    if (want > holder_cap) {
+        free(holder_slots);
+        holder_slots = calloc((size_t)want, sizeof(VALUE));
+        if (!holder_slots) mr_fatal("out of memory");
+        holder_cap = want;
+    }
+    else memset(holder_slots, 0, sizeof(VALUE) * (size_t)holder_cap);
+    mr_gc_each_address_value(holder_put);
+}
+static int held_by_address(VALUE v) {
+    unsigned long i = set_hash(v) & (unsigned long)(holder_cap - 1);
+    while (holder_slots[i] != 0) {
+        if (holder_slots[i] == v) return 1;
+        i = (i + 1) & (unsigned long)(holder_cap - 1);
+    }
+    return 0;
+}
 /* The C call `frame` ends: the raw Bignums it made are gone (whatever of
- * them reached the interpreter is an Integer there by now). */
-extern int mr_gc_address_holds(VALUE v);
-void mr_vbig_leave(const void *frame) {
-    if (!temps.count && !held.count) return;
+ * them reached the interpreter is an Integer there by now), but for the
+ * ones a registered address holds. Those are looked at again only when
+ * `no_c_frame`: no C call is in progress on any stack, so no C local can
+ * still have one. (A nested call's end must not free what its caller took
+ * out of a slot into a local: CRuby's collection sees the C stack.) */
+void mr_vbig_leave(const void *frame, int no_c_frame) {
+    int own = 0;
+    for (long i = 0; i < temps.count && !own; i++) own = temps.at[i].owner == frame;
+    if (!own && !(no_c_frame && held.count)) return;
+    holders_read();
     /* the call's own temporaries: freed, or held while an address holds them */
     long left = 0, n = temps.count;
     for (long i = 0; i < n; i++) {
         struct vbig b = temps.at[i];
         if (b.owner != frame) { temps.at[left++] = b; continue; }
-        if (mr_gc_address_holds(b.obj)) { push(&held, b); continue; }
+        if (held_by_address(b.obj)) { push(&held, b); continue; }
         raw_free(b.obj);   /* (reads its flags through RBASIC: still a member) */
         set_del(b.obj);
     }
     temps.count = left;
     /* ...and the held ones no registered address holds any more */
-    long kept_held = 0;
-    for (long i = 0; i < held.count; i++) {
-        struct vbig b = held.at[i];
-        if (mr_gc_address_holds(b.obj)) { held.at[kept_held++] = b; continue; }
-        raw_free(b.obj);
-        set_del(b.obj);
+    if (no_c_frame) {
+        long kept_held = 0;
+        for (long i = 0; i < held.count; i++) {
+            struct vbig b = held.at[i];
+            if (held_by_address(b.obj)) { held.at[kept_held++] = b; continue; }
+            raw_free(b.obj);
+            set_del(b.obj);
+        }
+        held.count = kept_held;
     }
-    held.count = kept_held;
     mr_vbig_live = temps.count + held.count + kept.count;
 }
 

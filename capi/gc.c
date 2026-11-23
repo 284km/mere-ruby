@@ -47,11 +47,11 @@ int mr_capi_roots(closure_int_int visit) {
 void rb_gc_mark(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
 void rb_gc_mark_movable(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
 void rb_gc_mark_maybe(VALUE v) { mr_vbig_keep(v); mr_mark_value(v); }
-/* Does a registered address (rb_gc_register_address, rb_global_variable)
- * hold this VALUE now? */
-int mr_gc_address_holds(VALUE v) {
-    for (long i = 0; i < address_count; i++) if (*addresses[i] == v) return 1;
-    return 0;
+/* What every registered address (rb_gc_register_address,
+ * rb_global_variable) holds now, each handed to `visit` -- read once, for a
+ * caller with many values to ask about. */
+void mr_gc_each_address_value(void (*visit)(VALUE)) {
+    for (long i = 0; i < address_count; i++) visit(*addresses[i]);
 }
 void rb_gc_mark_locations(const VALUE *start, const VALUE *end) {
     for (; start < end; start++) mr_mark_value(*start);
