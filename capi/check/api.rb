@@ -498,6 +498,15 @@ check((A.binding_of(binding) rescue $!.class) == RuntimeError)
 # (memsize_of a typed data wrapping NULL: its dsize is not asked)
 require 'objspace'
 check(ObjectSpace.memsize_of(A.null_typed).is_a?(Integer))
+# rb_protect's state for each way out of a block, as C sees it (CRuby's
+# TAG_*: return 1, break 2, raise 6, throw 7, and 0 for a value -- a `next`
+# is the block's value), and rb_jump_tag carries the flow on
+check(A.protect_state { break :b } == :b && A.last_state == 2)
+def api_protect_return = (A.protect_state { return :r }; :not_returned)
+check(api_protect_return == :r && A.last_state == 1)
+check(A.protect_state { next :n } == :n && A.last_state == 0)
+check(catch(:api_t) { A.protect_state { throw :api_t, 5 }; :no } == 5 && A.last_state == 7)
+check((A.protect_state { raise 'x' } rescue $!.message) == 'x' && A.last_state == 6)
 # (a Ruby rescue clears what an earlier rb_protect left in errinfo)
 check(A.protect_and_return != 0)
 check(A.errinfo_now.is_a?(ArgumentError))

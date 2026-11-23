@@ -291,6 +291,20 @@ static const rb_data_type_t reading_type = { "ApiFixture::Reading", { NULL, RUBY
 static VALUE null_typed(VALUE self) { (void)self; return TypedData_Wrap_Struct(rb_cObject, &reading_type, NULL); }
 static VALUE raise_arg(VALUE arg) { (void)arg; rb_raise(rb_eArgError, "caught by rb_protect"); return Qnil; }
 static VALUE protect_and_return(VALUE self) { (void)self; int state = 0; rb_protect(raise_arg, Qnil, &state); return INT2FIX(state); }
+/* rb_protect around the block: the state it gives for each way out of it
+ * (TAG_RETURN 1, TAG_BREAK 2, TAG_RAISE 6, TAG_THROW 7; 0 for a value),
+ * kept for last_protect_state, and the flow then goes on with rb_jump_tag */
+static int last_protect_state;
+static VALUE yield_nil(VALUE arg) { (void)arg; return rb_yield(Qnil); }
+static VALUE protect_state(VALUE self) {
+    (void)self;
+    int state = 0;
+    VALUE result = rb_protect(yield_nil, Qnil, &state);
+    last_protect_state = state;
+    if (state) rb_jump_tag(state);
+    return result;
+}
+static VALUE last_state(VALUE self) { (void)self; return INT2FIX(last_protect_state); }
 static VALUE errinfo_now(VALUE self) { (void)self; return rb_errinfo(); }
 /* (Bignums C keeps past the call that made them -- public API both ways:
  *  rb_gc_register_mark_object, and a static variable registered first) */
@@ -412,6 +426,8 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "binding_of", binding_of, 1);
     rb_define_singleton_method(mod, "null_typed", null_typed, 0);
     rb_define_singleton_method(mod, "protect_and_return", protect_and_return, 0);
+    rb_define_singleton_method(mod, "protect_state", protect_state, 0);
+    rb_define_singleton_method(mod, "last_state", last_state, 0);
     rb_define_singleton_method(mod, "errinfo_now", errinfo_now, 0);
     kept_marked = rb_big_new(3, 1);
     rb_gc_register_mark_object(kept_marked);
