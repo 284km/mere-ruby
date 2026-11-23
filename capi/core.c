@@ -3,6 +3,7 @@
  * loaded extensions. See mr_capi.h for the shape of the whole. */
 #include "mr_capi.h"
 #include <dlfcn.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,8 +57,9 @@ static void words_need(long n) {
 }
 extern long mr_vbig_live;
 extern VALUE mr_vbig_out(VALUE v);
-extern void mr_vbig_leave(const void *frame, int outermost, unsigned long long parked_seq);
-static unsigned long long parked_newest(void);
+extern void mr_vbig_leave(const void *frame, int outermost);
+extern void mr_vbig_park(int stack, const VALUE *lo, const VALUE *hi);
+extern void mr_vbig_unpark(int stack);
 void mr_put_words(long n, const VALUE *v) {
     /* (a raw Bignum bignum.c made is the Integer it says, past this point:
      *  capi/bignum_cruby.c. Converted BEFORE the words are set: making the
@@ -536,9 +538,9 @@ CapiRet mr_capi_enter(closure_CapiReq_int up, CapiReq req) {
         result = frame.pending;
     }
     mr_mirrors_leave(&frame, frame.prev == NULL);
-    /* (no C call left on this stack; and what a Fiber's parked one may
-     *  still have: see mr_vbig_leave) */
-    mr_vbig_leave(&frame, frame.prev == NULL, parked_newest());
+    /* (no C call left on this stack; what a Fiber's parked one has was read
+     *  off it when it paused: mr_vbig_park) */
+    mr_vbig_leave(&frame, frame.prev == NULL);
     cur = frame.prev;
     depth--;
     mr_epoch++;
@@ -609,16 +611,16 @@ int mr_capi_stat(int which) { return which >= 0 && which < 8 ? (int)stats[which]
 /* A coroutine switch. The calls in progress are a chain through C stack
  * frames, so each stack has its own; the interpreter says when it changes
  * stacks, and the chain of the stack being left is put aside by its number. */
-/* (`seq`: mr_vbig_seq when it was parked -- its C locals can have no raw
- *  Bignum made after that, since they do not run until it resumes) */
-struct mr_parked { int stack; struct mr_frame *frame; int depth; unsigned long long seq; };
-extern unsigned long long mr_vbig_seq;
+struct mr_parked { int stack; struct mr_frame *frame; int depth; };
 static struct mr_parked *parked;
 static long parked_count, parked_cap;
-static unsigned long long parked_newest(void) {
-    unsigned long long newest = 0;
-    for (long i = 0; i < parked_count; i++) if (parked[i].seq > newest) newest = parked[i].seq;
-    return newest;
+/* (the raw Bignums the C frames of the stack being left still have, from
+ *  here -- below this function's caller, whose saved registers are on the
+ *  stack by now -- up to its outermost C call) */
+static __attribute__((noinline)) void park_bignums(int stack, const void *hi) {
+    volatile VALUE here = 0;
+    mr_vbig_park(stack, (const VALUE *)(const void *)&here, (const VALUE *)hi);
+    (void)here;
 }
 int mr_capi_switch(int from, int to) {
     if (mr_without("switch")) return 0;
@@ -631,8 +633,14 @@ int mr_capi_switch(int from, int to) {
         parked[parked_count].stack = from;
         parked[parked_count].frame = cur;
         parked[parked_count].depth = depth;
-        parked[parked_count].seq = mr_vbig_seq + 1;
         parked_count++;
+        /* (registers too: a C local may live in a callee-saved one) */
+        jmp_buf regs;
+        if (setjmp(regs) == 0) {
+            struct mr_frame *outer = cur;
+            while (outer->prev) outer = outer->prev;
+            park_bignums(from, outer + 1);
+        }
         cur = NULL;
         depth = 0;
     }
@@ -641,6 +649,7 @@ int mr_capi_switch(int from, int to) {
             cur = parked[i].frame;
             depth = parked[i].depth;
             parked[i] = parked[--parked_count];
+            mr_vbig_unpark(to);
             break;
         }
     }

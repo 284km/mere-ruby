@@ -23,10 +23,9 @@
  *     address (rb_gc_register_address, rb_global_variable) holds it: checked
  *     when a C call ends and no other is in progress on its stack (a C
  *     local of an outer call may have taken it out of the slot), so an
- *     overwritten static slot lets the old one go. One made before a Fiber
- *     paused inside C stays until that Fiber resumes (its locals may have
- *     it) -- for good if it never does, a leak of what was made before the
- *     pause, not after (mr_vbig_leave). One C only stores in a struct, which no
+ *     overwritten static slot lets the old one go. One the C frames of a
+ *     Fiber paused inside C have (its stack is read when it pauses) stays
+ *     until that Fiber resumes (mr_vbig_park). One C only stores in a struct, which no
  *     collection marks before the call ends, is freed with the call:
  *     register it.
  *
@@ -140,8 +139,7 @@ extern void mr_transit_restore(struct mr_transit *);
 extern const void *mr_capi_frame(void);
 
 /* ---- raw Bignums ------------------------------------------------------- */
-struct vbig { VALUE obj; size_t size; const void *owner; unsigned long long born; };
-extern unsigned long long mr_vbig_seq;   /* (one more per raw Bignum made: see mr_vbig_leave) */
+struct vbig { VALUE obj; size_t size; const void *owner; };
 struct vlist { struct vbig *at; long count, cap; };
 /* (temporaries, freed when their C call ends; and the ones kept for good,
  *  apart, so that the end of every C call does not walk them) */
@@ -222,7 +220,7 @@ VALUE mr_vbig_newobj(VALUE klass, VALUE flags, size_t size) {
     if (!big) rb_memerror();
     big->basic.flags = flags;
     memcpy((void *)&big->basic.klass, &klass, sizeof(VALUE));
-    struct vbig b = { (VALUE)big, size, mr_capi_frame(), ++mr_vbig_seq };
+    struct vbig b = { (VALUE)big, size, mr_capi_frame() };
     push(&temps, b);
     set_put((VALUE)big);
     return (VALUE)big;
@@ -299,13 +297,11 @@ static int held_by_address(VALUE v) {
  * out of a slot into a local: CRuby's collection sees the C stack.)
  *
  * A Fiber's stack paused inside C (a parked chain, core.c) has C locals
- * too, but they do not run while it is parked: they can only have what was
- * made before it was. `parked_seq` is the newest park's mr_vbig_seq (0:
- * none), and a held one made before it stays -- until that chain resumes,
- * or for good if it never does (a Fiber dropped inside C: what was made
- * before its park, not what came after). */
-unsigned long long mr_vbig_seq;
-void mr_vbig_leave(const void *frame, int outermost, unsigned long long parked_seq) {
+ * too: what they have is read off that stack when it pauses (mr_vbig_park)
+ * and stays, held or not, until it resumes -- as CRuby's collection marks a
+ * suspended Fiber's stack. */
+static int pinned_p(VALUE v);
+void mr_vbig_leave(const void *frame, int outermost) {
     int own = 0;
     for (long i = 0; i < temps.count && !own; i++) own = temps.at[i].owner == frame;
     if (!own && !(outermost && held.count)) return;
@@ -315,7 +311,7 @@ void mr_vbig_leave(const void *frame, int outermost, unsigned long long parked_s
     for (long i = 0; i < n; i++) {
         struct vbig b = temps.at[i];
         if (b.owner != frame) { temps.at[left++] = b; continue; }
-        if (held_by_address(b.obj)) { push(&held, b); continue; }
+        if (held_by_address(b.obj) || pinned_p(b.obj)) { push(&held, b); continue; }
         raw_free(b.obj);   /* (reads its flags through RBASIC: still a member) */
         set_del(b.obj);
     }
@@ -325,13 +321,58 @@ void mr_vbig_leave(const void *frame, int outermost, unsigned long long parked_s
         long kept_held = 0;
         for (long i = 0; i < held.count; i++) {
             struct vbig b = held.at[i];
-            if (b.born < parked_seq || held_by_address(b.obj)) { held.at[kept_held++] = b; continue; }
+            if (held_by_address(b.obj) || pinned_p(b.obj)) { held.at[kept_held++] = b; continue; }
             raw_free(b.obj);
             set_del(b.obj);
         }
         held.count = kept_held;
     }
     mr_vbig_live = temps.count + held.count + kept.count;
+}
+
+/* What a stack that pauses inside C (core.c parks its chain of C calls)
+ * still has: the raw Bignums among the words of its C frames, from where
+ * it stops [lo] up to its outermost C call [hi]. Read once, when it pauses
+ * -- nothing on it runs until it resumes -- and kept apart by its number;
+ * let go when it resumes (mr_vbig_unpark). A word that only looks like
+ * one keeps it too, as a conservative scan does. A stack dropped while
+ * paused keeps what it had, and nothing made after. */
+struct pinned_stack { int stack; VALUE *at; long count; };
+static struct pinned_stack *pinned;
+static long pinned_count, pinned_cap;
+void mr_vbig_park(int stack, const VALUE *lo, const VALUE *hi) {
+    if (!mr_vbig_live || lo >= hi) return;
+    VALUE *at = NULL;
+    long n = 0, cap = 0;
+    for (const VALUE *p = lo; p < hi; p++) {
+        VALUE v = *p;
+        if (RB_SPECIAL_CONST_P(v) || MR_HANDLE_P(v) || !set_has(v)) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 8;
+            at = realloc(at, sizeof(*at) * (size_t)cap);
+            if (!at) mr_fatal("out of memory");
+        }
+        at[n++] = v;
+    }
+    if (!n) return;
+    if (pinned_count == pinned_cap) {
+        pinned_cap = pinned_cap ? pinned_cap * 2 : 8;
+        pinned = realloc(pinned, sizeof(*pinned) * (size_t)pinned_cap);
+        if (!pinned) mr_fatal("out of memory");
+    }
+    pinned[pinned_count].stack = stack;
+    pinned[pinned_count].at = at;
+    pinned[pinned_count].count = n;
+    pinned_count++;
+}
+void mr_vbig_unpark(int stack) {
+    for (long i = 0; i < pinned_count; i++)
+        if (pinned[i].stack == stack) { free(pinned[i].at); pinned[i] = pinned[--pinned_count]; return; }
+}
+static int pinned_p(VALUE v) {
+    for (long i = 0; i < pinned_count; i++)
+        for (long j = 0; j < pinned[i].count; j++) if (pinned[i].at[j] == v) return 1;
+    return 0;
 }
 
 /* A raw Bignum as the Integer its digits say; anything else as it is. */
