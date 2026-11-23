@@ -604,4 +604,36 @@ check(seen > at_raise)
 #  exception reaches the caller, and the next call works)
 3.times { check((A.nogvl_call_raise rescue $!.message) == "from with_gvl") }
 check(A.nogvl_call_back([]) == [1])
+
+# A String's bytes in the struct or in a buffer of their own: C reads the
+# same String either way, also when Ruby grew it between two looks, and the
+# room the API promises is there.
+s = +'ab'
+first, copy = A.grown_by_ruby(s, 'c' * 100)
+check(first == 'a'.ord && copy == 'ab' + 'c' * 100 && s == copy)
+s = +'xyz'
+check(A.cat_self(s, 4).equal?(s) && s == 'xyz' * 16)
+ok, filled = A.buf_fill(5)
+check(ok && filled == 'zzzzz')
+ok, filled = A.buf_fill(3000)
+check(ok && filled == 'z' * 3000)
+check(A.expand_room(+'abc', 1000) == 1000)
+check(A.expand_room(+('abc' * 100), 5000) == 5000)
+# OBJ_FREEZE keeps a String's buffer, so a pointer C holds still reads its
+# bytes; rb_str_freeze (String#freeze) resizes to the length, which puts
+# 3 bytes back into the smallest slot (its room: the slot less the 24-byte
+# header and the terminator)
+seen, kept, resized, frozen = A.freeze_keeps_room
+check(seen == 'abc' && kept == 1024 && resized == GC::INTERNAL_CONSTANTS[:BASE_SLOT_SIZE] - 25 && frozen)
+far, back = A.resize_out_and_back(+'hello')
+check(far == 'q' && back == 'he')
+# String.new(capacity:) and a read into a buffer give the room they ask for
+# (string.c's rb_str_s_new, io.c's io_setstrbuf), and the String keeps it
+s = String.new(capacity: 5000)
+check(A.capacity(s) == 5000)
+s << 'abc'
+check(A.capacity(s) == 5000 && s == 'abc')
+buf = String.new
+File.open(__FILE__) { |f| f.read(70000, buf) }
+check(A.capacity(buf) == 70000 && buf == File.binread(__FILE__))
 puts "api contracts: #{$count} passed"
