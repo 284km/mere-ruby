@@ -89,7 +89,8 @@ The collector is the interpreter's own. For the C API it adds:
   progress reads through the collector's reader (`mr_capi_gc_reader`),
   which answers what changes nothing -- an object's header, a String's
   bytes, an Array's elements (`RARRAY_LEN`, `RARRAY_AREF`), an object's
-  instance variable (`rb_ivar_get`) -- from the objects as they are now,
+  instance variable (`rb_ivar_get`, of an object or a C data wrapper; a
+  Proc's or a Binding's is refused) -- from the objects as they are now,
   running no Ruby: every struct it reads is fetched again for it, since the
   interpreter has run since the last call ended. Anything else it asks --
   a method call, a write, `rb_hash_foreach` -- is refused with `mr_fatal`,
