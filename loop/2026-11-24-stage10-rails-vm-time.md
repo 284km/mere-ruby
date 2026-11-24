@@ -66,6 +66,14 @@ Corpus 814 has every form: the class body, a block there, `each`, `send`, `self.
 
 **Left, on the evaluator only:** a class body's statement `attr :x` calls the program's `attr_reader`, not its `attr`. The parser reads `attr :x` as the reader's statement and does not keep which name was written. The VM calls `attr`.
 
+**Left, on both executions (from the review of #209):** a program that redefines `Module#attr_reader` or `Module#attr` itself replaces the builtin in ruby, and a `super` in it is a NoMethodError. Here that `super` still reaches the builtin.
+
+## A first look at the VM's boot
+
+The measured application, booted again in the gem home the cold run left (`bin/rails runner script/boot.rb`), by instructions: 54.4 G on the evaluator and 85.4 G on the VM, 57% more; peak RSS 642 MB and 896 MB.
+
+A sample of the VM's boot puts the compile of a file to an instruction sequence and its load at about a tenth of the run (`ic_vm_native` 7.5% with `ic_to_val` 3% inside it, `vm_load` 2%). So most of the 57% is not the compile. It is in running code that runs once: a class body's definitions (`vm_define` is under about 14% of the samples) and the calls of a file's top level. The next round takes this apart against a sample of the evaluator's boot.
+
 ## Checked
 
 Against ruby 4.0.9 (tools/ref_ruby.sh), built with Mere 9dec2ff6, on main cfcc861a:
@@ -77,4 +85,5 @@ Against ruby 4.0.9 (tools/ref_ruby.sh), built with Mere 9dec2ff6, on main cfcc86
 - The CI corpus job's OpenSSL checks: asn1, provider, formats, reinitialize, memory, wasm.
 - `railstest/check.py`: 7 controls pass.
 - These give the same counts as main cfcc861a's build, on both executions: test_module, test_class, test_object, test_method, test_super, test_refinement, test_eval and test_alias.
-- The Rails application, cold, on main 17a5db5f with this change: all six stages PASS on the evaluator and on the VM (the table above). On that tree corpus 812, 813 and 814 match on both executions, and vm_check and the gates pass; the full corpus sweep was made on cfcc861a.
+- The Rails application, cold, on main 17a5db5f with this change: all six stages PASS on the evaluator and on the VM (the table above).
+- On main 17a5db5f with this change, the tree that was pushed: corpus 854/854; under MERE_RUBY_VM=1, 850 on the VM, 4 fell back, 0 different; vm_check 245/245; the gates.
