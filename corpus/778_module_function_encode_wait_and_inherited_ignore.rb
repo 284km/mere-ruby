@@ -45,12 +45,21 @@ w.close
 
 # (the shell ignores it and execs the interpreter, as `cmd &` in a
 #  non-interactive shell does; a signal sent to itself is then dropped)
-src = 'p Signal.trap("INT", "DEFAULT"); p Signal.trap("INT", "DEFAULT"); p Signal.trap("HUP", "DEFAULT")'
-src2 = 'Process.kill(:INT, $$); sleep 0.05; puts :alive'
-[src, src2].each do |code|
-  IO.popen(["sh", "-c", "trap '' INT; exec \"$0\" -e \"$1\"", RbConfig.ruby, code]) { |io| print io.read }
+old_int = Signal.trap("INT", "DEFAULT")
+old_hup = Signal.trap("HUP", "DEFAULT")
+begin
+  # Control the parent's disposition too: a background/nohup launcher can
+  # otherwise make the uncontrolled child inherit an unrelated SIG_IGN.
+  src = 'p Signal.trap("INT", "DEFAULT"); p Signal.trap("INT", "DEFAULT"); p Signal.trap("HUP", "DEFAULT")'
+  src2 = 'Process.kill(:INT, $$); sleep 0.05; puts :alive'
+  [src, src2].each do |code|
+    IO.popen(["sh", "-c", "trap '' INT; exec \"$0\" -e \"$1\"", RbConfig.ruby, code]) { |io| print io.read }
+  end
+  IO.popen([RbConfig.ruby, "-e", src]) { |io| print io.read }
+ensure
+  Signal.trap("INT", old_int)
+  Signal.trap("HUP", old_hup)
 end
-IO.popen([RbConfig.ruby, "-e", src]) { |io| print io.read }
 
 m = Module.new
 def m.q = super
