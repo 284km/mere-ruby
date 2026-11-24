@@ -105,6 +105,17 @@ sums, constant cache), `descendants_tracker` 2, and one each in
   end of corpus/935 section 7. The arm cannot tell where the super came from,
   so a super from a method defined in Range itself answers the same way. Ruby
   walks forever there (Enumerable's), so this stops where ruby does not.
+- **Second re-review.** (1) The arm covered BEGINLESS ranges too, and so
+  changed an answer that had matched ruby. `class Range; def count = [:p,
+  super]; end; (..3).count` is ruby's TypeError (Enumerable's walk cannot
+  start from nil), not `[:p, Infinity]`. The arm now takes only endless
+  ranges. A beginless range is left to the walk, whose first step refuses it.
+  The cost is a beginless range reached from a module PREPENDED to Range:
+  ruby's Range answers there (`(..3).count` is Infinity), and this answers
+  the TypeError. That belongs to the recorded prepend follow-up below.
+  (2) With a block, `min`, `max`, `to_a` and `entries` on an endless range
+  still walked without end, where main raised NoMethodError. They now raise
+  ruby's RangeError. `minmax` with a block walks in ruby too, and is left.
 - Left, as on main (the review allows recording these):
   - `super` from a module PREPENDED to Range should reach Range's own method
     (`(1.5..3.5).min` is 1.5 there). It reaches Enumerable's, as from a
