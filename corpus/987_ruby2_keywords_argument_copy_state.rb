@@ -128,3 +128,13 @@ trace.enable do
   value = marked_proc.call(*[original]) {}
   p [:trace_proc_block, value.last.equal?(original), Hash.ruby2_keywords_hash?(value.last)]
 end
+
+# The native Method block path has the same conversion boundary.
+bound_marked = method(:marked_method)
+converted_marked = bound_marked.to_proc
+[bound_marked, converted_marked].each_with_index do |callable, index|
+  value = callable.call(*[original], &call_block).last
+  p [:bound_with_proc, index, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = callable.call(*[original]) {}.last
+  p [:bound_with_literal, index, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+end
