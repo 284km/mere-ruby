@@ -101,6 +101,18 @@ TIMED, and fail on time, not on an answer:
   multibyte variant of the same test (6 MiB of euro signs) passes. What it would
   take: a String whose tail shares its source's bytes, or a mirror that lends
   C the interpreter's bytes instead of a copy.
+  Looked at again before the push, for a fix that copies less: per 8 MiB,
+  the byteslice is 3.1 ms and one C call that reads the new String is
+  another 6.7 ms (ruby: both under 0.01 ms). The 6.7 ms is the String's
+  bytes made (bytes_of_str), copied into the transit buffer
+  (mr_capi_give), copied into the mirror's buffer and hashed, and hashed
+  again when the call ends. Two of those could go -- the transit copy, by
+  handing C the interpreter's bytes, which since this round live only in
+  the request's region (region CUP), so C would read them after they are
+  freed; and the separate hash, by hashing while copying -- for perhaps
+  half of the 6.7 ms. The loop stays quadratic, and the 16 MiB run would
+  still sit at the 10 s bound under load, so it is left as it is: the
+  honest fix is the sharing above, not a smaller constant.
 - **TestRackUp::RackUp#test_bin**: `IO.popen "rackup -p 0"`, then
   `wait_readable 2`, `sleep 0.7` and one sysread of whatever is there. The
   child is the same interpreter, and from exec to "Use Ctrl-C to stop" it
@@ -281,3 +293,75 @@ nio4r, which this harness does not fetch. What is left on mere-ruby:
   write to the File, reopen $stdout onto it, puts, system("echo"), write
   again -- ruby "A B C D", here "B-via-stD-log\n-child". What it takes:
   a File whose position is the descriptor's.
+
+## Integration on the final binary (a0501bcc's build)
+
+Each file on its own, `--exclude=/test_horrible_queries/`. ruby 4.0.9 first,
+then mere-ruby, one at a time. The machine's load average was 10 to 23
+(other sessions). The first mere-ruby pass of test_integration_cluster
+also ran beside a puma cluster left over from an earlier killed run of
+mine: its master had renamed itself, so the runner's pkill missed it, and
+a worker had used a core for two hours. The cluster row below is the rerun
+after that cluster was killed, with ruby rerun at the same time.
+
+| file | ruby 4.0.9 runs/F/E/S | mere-ruby runs/F/E/S |
+|---|---|---|
+| test_http11 | 18/0/0/1 | 18/0/0/1 |
+| test_integration_cluster (rerun) | 77/0/0/0 | 77/19/1/0 |
+| test_integration_helpers | 14/0/0/0 | 14/0/0/0 |
+| test_integration_pumactl | 13/0/0/0 | 13/1/0/0 |
+| test_integration_single | 21/0/0/0 | 21/1/0/0 |
+| test_integration_ssl | 8/0/0/0 | 8/0/0/0 |
+| test_integration_ssl_session | 8/0/0/0 | 8/0/0/0 |
+| test_plugin | 1/0/0/0 | 1/0/0/0 |
+| test_plugin_systemd | 7/0/0/7 | 7/0/0/7 |
+| test_plugin_systemd_jruby | 1/0/0/1 | 1/0/0/1 |
+| test_preserve_bundler_env | 3/0/0/0 | 3/3/0/0 |
+| test_redirect_io | 2/0/0/0 | 2/0/0/0 |
+| test_skip_sigusr2 | 1/0/0/0 | 1/0/0/0 |
+| test_skip_systemd | 1/0/0/1 | 1/0/0/1 |
+| test_url_map | 1/0/0/0 | 1/0/0/0 |
+| test_web_concurrency_auto | 2/0/0/0 | 2/0/0/0 |
+| test_worker_gem_independence | 6/6/0/0 | 6/6/0/0 |
+
+Mere-only, with a one-line cause:
+
+- prune_bundler, 12: cluster's nio4r/json-not-required (3), prune_bundler_*
+  (2) and load_path_* (2), pumactl's prune_bundler_with_multiple_workers, and
+  preserve_bundler_env's 3 -- puma-wild cannot `require 'rubygems'` once
+  Bundler.with_unbundled_env takes the reference stdlib (this harness's
+  RUBYLIB) away. Harness; needs an installed rubylibdir.
+- cluster, phase-N boot not logged in time (mold_worker_phased_restart_retires_mold,
+  mold_worker_reforks_at_each_threshold, mold_worker_refork_completes_after_mold_dies_during_promotion,
+  phased_restart_does_not_drop_connections_threads{,_fork_worker,_mold_worker},
+  stuck_external_term_spawn, fork_worker_refork_waits_for_all_workers_after_worker_dies)
+  and the fork_worker checks (refork_phased_restart_with_fork_worker_and_high_worker_count,
+  fork_worker_after_refork): not understood. The pass before the trap fix had
+  fewer of these (12 failures and 1 error in the whole file, against 19 and
+  1 now), so the trap fix may have changed how the master reacts to
+  URG/USR1/TERM/CHLD; to be measured.
+- cluster test_thread_log (INFO, "Thread: TID-" not logged): not understood.
+  By hand, INFO to a `-w 1` master under mere-ruby logs the threads.
+- cluster test_mold_worker_refork_does_not_leak_file_descriptors (19 against
+  17 descriptors in a reforked worker): not understood.
+- hot_restart_does_not_drop_connections_threads (single and cluster): the
+  restarted server had not logged its PID when the helper stopped waiting.
+  Not understood; the variant without threads passes.
+
+## Paused (2026-11-24)
+
+The user paused all sessions.
+
+- Done and committed: everything up to the per-file integration table above
+  (puma fixes 8e73b184, 761f7d85, a0a5cb43, 8f75e0cc, the merge of main
+  cd2fdb4b, and the records). The test_write_nonblock look is in the timed
+  tests section above: no fix taken, recorded.
+- The integration run had completed: every file on both sides, and the
+  cluster file once more on both sides, with the numbers in the table
+  above. Nothing was running when the pause came, and no process of this
+  work is left.
+- Next on resume: rerun puma's full integration suite on both sides, one at
+  a time (use the scratch runner that kills renamed masters); look into the
+  cluster reforks and signals that the trap fix may have changed; then the
+  test_write_nonblock look again if wanted; then nokogiri at corpus 915,
+  after asking the coordinator for numbers.
