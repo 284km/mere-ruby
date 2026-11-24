@@ -2603,7 +2603,6 @@ let gc_collect = fn env -> fn world ->
     let _ = (if nc then () else map_compact_big rx_gnodes) in
     let _ = (if nc then () else map_compact_big tc_off) in
     let _ = (if nc then () else map_compact_big tc_ln) in
-    let _ = (if nc then () else map_compact_big tc_lnc) in
     // ...and the queues and indexes dropped since the last one go back to their
     // pools, now that every stack is suspended (note 303)
     let _ = (if nc then () else qv_drain ()) in
@@ -4704,7 +4703,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             // (with the block it was called with: Enumerable#find's `each`
             //  on a String subclass that aliased each to each_char)
             match newblk with
-            | (true, _, _, _) when (if has_meth world tagcls src then false else true) -> invoke_with_block env world blk other src args newblk
+            | (true, _, _, _) -> blt_alias_block_call env world newblk other src args
             | _ -> blt_alias_call env world other src args)
          else
            let pcls = class_name other in
@@ -7320,6 +7319,17 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
 //   hundred others, and every class name -- and warning there would put a page
 //   of noise in front of any program run with -w. Of the 159 writes to the
 //   table, seven are a program assigning a constant; these are those.
+and ivar_opassign_read = fn env -> fn world -> fn blk -> fn (name: str) -> fn (op: str) ->
+  // Only ||= treats an uninitialized class variable as nil. An ordinary
+  // read, &&= and arithmetic assignment must still raise NameError. Keep
+  // the lexical scope, Ractor isolation and overtaken-variable checks.
+  if str_eq op "||" && str_len name > 0 && str_eq (char_at name 0) "@" then
+    (let cls9 = cvar_cls env world in
+     let nm9 = substring name 1 (str_len name) in
+     if str_len cls9 > 0 && (if cvar_defined_from world cls9 nm9 then false else true) then
+       (let _ = ractor_cvar_check world cls9 nm9 in VNil)
+     else eval_e env world blk (EIVar name))
+  else eval_e env world blk (EIVar name)
 // `C ||= v` / `C &&= v`: read-then-MAYBE-write. When the short circuit already
 // decides the answer there is no write at all -- the same rule SIVarAssign has
 // for `@x ||= v`. It matters now that a replacement WARNS: desugared to
@@ -7350,7 +7360,7 @@ and const_opassign = fn env -> fn world -> fn blk -> fn (name: str) -> fn (e: Ex
    // (SIVarAssign) -- which is what lets a frozen object answer its memo.
    // It wrote the value back, and a frozen object raised FrozenError.
    | EBin (o9, EStmt (SExpr (EIVar n9)), rhs9) when (str_eq o9 "||" || str_eq o9 "&&") && str_eq name ("@" ++ n9) ->
-     (let cur9 = eval_e env world blk (EIVar n9) in
+     (let cur9 = ivar_opassign_read env world blk n9 o9 in
       if str_eq o9 "||"
       then (if truthy cur9 then (true, cur9) else (false, eval_e env world blk rhs9))
       else (if truthy cur9 then (false, eval_e env world blk rhs9) else (true, cur9)))
@@ -14679,6 +14689,15 @@ and hash_read_native = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (arg
 and hash_get_w = fn env -> fn world -> fn (hid: int) -> fn (xs: Val list) -> fn (k: Val) ->
   let (_, value) = hash_lookup_w env world hid xs k in value
 
+and hash_values_at_native = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (keys: Val list) ->
+  let rec values9 = fn (keys9: Val list) ->
+    (match keys9 with
+     | Nil -> (Nil : Val list)
+     | Cons (key9, tail9) ->
+       (let value9 = hash_read_native env world blk recv (Cons (key9, Nil)) in
+        Cons (value9, values9 tail9))) in
+  arr_new (values9 keys)
+
 and hash_haskey_w = fn env -> fn world -> fn (hid: int) -> fn (xs: Val list) -> fn (k: Val) ->
   match xs with
   | Cons (k2, Cons (_, t)) -> hkey_eql_w env world hid k2 k || hash_haskey_w env world hid t k
@@ -18083,11 +18102,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                                 let r9 = sub aid e0 in
                                 let _ = map_delete seen ("o" ++ str_of_int oid) in r9))
                        | _ ->
-                         (let (m2, s2, ocls2, iv2) = world in
-                          let cls = map_get ocls2 oid in
-                          if has_meth world cls "to_s"
-                          then str_of (invoke world noblk h cls "to_s" Nil) e0
-                          else app e0 (to_s h) "US-ASCII")))
+                         str_of (invoke_val_c env world noblk h "to_s" Nil false) e0))
                  | _ -> app e0 (to_s h) "US-ASCII") in
               ljoin t e1 false)) in
         // ⚠ the TOP level is walked as ruby walks it, by index on the array as
@@ -18433,21 +18448,13 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
            | _ -> VNil)
         | _ -> VNil)
      | _ -> VNil)
-  // values_at of a hash with a default: a missing key answers it, as `[]`
-  // does (the proc called with the hash and the key)
+  // Hash's native values_at performs native lookups and calls #default for
+  // missing keys. A subclass's override still gets first choice, including
+  // on a hash whose default has explicitly been set to nil.
   else if (str_len name == 9 && str_eq name "values_at")
-          && (match recv with VHsh hid -> map_has hash_dproc (str_of_int hid) || map_has hash_dflt (str_of_int hid) | _ -> false) then
-    (match recv with
-     | VHsh hid ->
-       (let one9 = fn (k: Val) ->
-          (let xs9 = hderef hid in
-           if hash_haskey xs9 k then hash_get xs9 k
-           else (match hdproc_get hid with
-                 | VProc pid -> flow_value (run_block world noblk (proc_as_block pid) (Cons (recv, Cons (k, Nil))))
-                 | _ -> hdflt_get hid)) in
-        let rec all9 = fn (ks: Val list) -> (match ks with Nil -> (Nil : Val list) | Cons (k, t) -> (let v = one9 k in Cons (v, all9 t))) in
-        arr_new (all9 args))
-     | _ -> VNil)
+          && (match recv with VHsh _ -> true | _ -> false)
+          && prim_native_wanted world recv name then
+    hash_values_at_native env world blk recv args
   // Time instance methods. The object carries a single ordinal, so the zone
   // conversions are identity and #to_i hands the ordinal back.
   // ...and it stays a Time after `def t.succ`: that gives the object a
@@ -19514,10 +19521,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
   // in the name list with nothing behind it: every call was a NoMethodError.
   else if ((str_len name == 6 && str_eq name "method") || (str_len name == 13 && str_eq name "public_method"))
           && (match args with Cons (_, _) -> true | _ -> false)
-          && (match recv with
-              | VObj oid2 -> (let (m9, s9, o9, i9) = world in
-                              if has_meth world (map_get o9 oid2) name then false else true)
-              | _ -> true) then
+          && (let c9 = (match recv with VClass c9 -> "(sng:" ++ c9 ++ ")" | _ -> dispatch_cls_of world recv) in
+              if (has_meth world c9 name || hng_sng_has world recv name) && bi_skip_pass name then false else true) then
     // the name argument reads the way every other name argument does: a Symbol
     // or a String as written, anything else through #to_str, and a TypeError
     // for what is neither. It used to be a pattern-match that simply did not
@@ -30132,7 +30137,24 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     else if (str_len name == 5 && str_eq name "cause") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       (match recv with
        | VObj eid -> (let (_, _, _, iv9) = world in
-                      if map_has iv9 (str_of_int eid ++ "@__cause") then map_get iv9 (str_of_int eid ++ "@__cause") else VNil)
+                      let key9 = str_of_int eid in
+                      if map_has iv9 (key9 ++ "@__cause") then
+                        (match map_get iv9 (key9 ++ "@__cause") with
+                         | VExc (c9, m9) when map_has iv9 (key9 ++ "@__cause_bt") ->
+                           // A lightweight cause's saved frames belong to that
+                           // exception, even after later raises replaced raise_bt.
+                           // Materialize it once so #cause's own backtrace and
+                           // backtrace_locations remain available and stable.
+                           (let (_, _, o9, _) = world in
+                            let id9 = alloc_oid o9 in
+                            let _ = map_set o9 id9 c9 in
+                            let _ = iv_put iv9 (str_of_int id9 ++ "@__exception_message") (mkstr m9) in
+                            let _ = iv_put iv9 (str_of_int id9 ++ "@__bt") (map_get iv9 (key9 ++ "@__cause_bt")) in
+                            let _ = (if map_has le_path m9 then iv_put iv9 (str_of_int id9 ++ "@__path") (map_get le_path m9) else ()) in
+                            let cause9 = VObj id9 in
+                            let _ = iv_put iv9 (key9 ++ "@__cause") cause9 in cause9)
+                         | cause9 -> cause9)
+                      else VNil)
        | _ -> VNil)
     // Exception#detailed_message / #full_message: the report ruby prints for an
     // uncaught exception, and the first line of it on its own. Both honour
@@ -34665,6 +34687,8 @@ and bi_meth_call = fn env -> fn world -> fn blk -> fn (id: int) -> fn (mnm: str)
         if str_eq c9 "String" then mrecv else mkstr_e (sget h9) (senc_get h9))
      | _ -> raise_exc world "ArgumentError"
               ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)"))
+  | (VHsh _, _) when str_eq mnm "values_at" && str_eq (bi_meth_own world id) "Hash" ->
+    hash_values_at_native env world blk mrecv args
   // Hash#to_hash ignores a block. Keep the retained native definition on
   // the plain path; the block iterator fallback walks an Array of pairs.
   | (VHsh _, (true, _, _, _)) when str_eq mnm "to_hash" ->
@@ -39241,6 +39265,8 @@ and cmp_member_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
      // a NUMBER against an object asks the object (num_equal: rb_equal(y,
      // x)) -- `[pid, 0] == Process.wait2` is a Status's own ==
      // (an exception against one held as a pair: Exception#==, rb_eq_w0)
+     // String-like values use the same equality protocol in containers.
+     | (VStr _, VObj _) -> rb_eq_w env world x y
      | (VObj _, VExc (_, _)) -> rb_eq_w0 env world x y
      | (VExc (_, _), VObj _) -> rb_eq_w0 env world x y
      | (VInt _, VObj _) -> cmp_num_obj_w env world x y
@@ -40330,6 +40356,10 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
   else if all && is_kernel_builtin nm
           && (if map_len undefs > 0 && undef_blocked world c9 nm then false else true)
           && str_list_has (ancestors_of world c9) "Kernel" then VBool true
+  else if all && (str_eq nm "method_missing"
+                  || (is_private_object_method nm && (if str_eq nm "respond_to_missing?" then false else true)))
+          && (if map_has undef_names nm && undef_blocked world c9 nm then false else true)
+          && str_list_has (ancestors_of world c9) "BasicObject" then VBool true
   else rtm9 ()
 
 // ruby's coerce protocol does NOT go through respond_to?: it looks the method
@@ -48150,6 +48180,8 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
        raise_exc world "ArgumentError"
          ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")
      else respond_to_answer env world recv args)
+  | (VHsh _, _) when str_eq src "values_at" ->
+    hash_values_at_native env world (false, (Nil : str list), (Nil : Stmt list), env) recv args
   | _ when str_eq src "__send__" || str_eq src "send" || str_eq src "public_send" ->
     native_sender_call env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args
       (false, (Nil : str list), (Nil : Stmt list), env)
@@ -48611,15 +48643,6 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
         let _ = map_delete gvar_quiet gn in
         v)
      | _ -> VNil)
-  else if (str_len name == 13 && str_eq name "__cvar_or_nil") && (match args with Cons (VStr _, _) -> true | _ -> false) then
-    (match args with
-     | Cons (VStr nh, _) ->
-       (let cn = sget nh in
-        let cls0 = cvar_cls env world in
-        if str_eq cls0 "" then VNil
-        else if cvar_defined_from world cls0 cn then cvar_get_from world cls0 cn
-        else VNil)
-     | _ -> VNil)
   // the loader itself, reachable only through the default Kernel#require (and
   // through any alias of it — which is how RubyGems keeps the original around
   // while replacing `require`).
@@ -48823,6 +48846,15 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   else if (str_len name == 17 && str_eq name "__builtin_relpath") && (match args with Cons (VStr _, Cons (_, _)) -> true | _ -> false) then
     (match args with
      | Cons (VStr fh, Cons (pv, _)) ->
+       // A replacement require_relative receives the original argument,
+       // before the native loader's path coercion and source anchoring.
+       (let self9 = (if lv_has env "self" then lv_get env "self" else VMain) in
+        let dc9 = (match self9 with VClass _ -> "Object" | _ -> dispatch_cls_of world self9) in
+        let custom9 = has_meth world dc9 "require_relative"
+          && (match lookup_meth world dc9 "require_relative" with
+              | Meth (_, _, Cons (SExpr (ECall ("__builtin_require_relative", _)), Nil)) -> false
+              | _ -> true) in
+        if custom9 then pv else
        // ⚠ the fourth door. `to_s` on a non-String turned `require_relative(42)`
        //   into the path "42" and a LoadError; ruby refuses with TypeError
        //   before it ever looks at the filesystem.
@@ -48842,7 +48874,7 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
               // ([ruby-dev:40040]; ruby's rb_current_realfilepath)
               let fa = path_norm (d ++ "/" ++ basename_of (sget fh)) in
               let d = (if is_reg_file fa then dirname_of (feat_realpath fa) else d) in
-              mkstr (d ++ "/" ++ p)))
+              mkstr (d ++ "/" ++ p))))
      | _ -> VNil)
   else if ((str_len name == 17 && str_eq name "__builtin_require") || (str_len name == 26 && str_eq name "__builtin_require_relative")) &&
           (match args with Cons (_, _) -> true | _ -> false) then
@@ -48863,20 +48895,13 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
      //  arrived as UTF-8, and where the OS takes the bytes as they are --
      //  Linux -- a LoadError for a Windows-31J name said its path in UTF-8,
      //  which the name's own end_with? then refused)
-     | Cons (VStr h8, _) ->
+     | Cons (a8, _) ->
        with_scratch_env env (fn e2 ->
-         (let _ = map_set e2 "__reqp" (VStr h8) in
+         (let _ = map_set e2 "__reqp" a8 in
           match exec_stmt e2 world noblk (SRequire ((str_len name == 16 && str_eq name "require_relative"), EVar "__reqp")) with
           | FNext v -> v
           | FRaise _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
           | _ -> VNil))
-     | Cons (a8, _) ->
-       (let ph = require_path_of env world a8 in
-        if str_eq ph "" then VNil else
-        match exec_stmt env world noblk (SRequire ((str_len name == 16 && str_eq name "require_relative"), EStrL ph)) with
-        | FNext v -> v
-        | FRaise _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
-        | _ -> VNil)
      | _ -> VNil)
   else
   if lv_has env "self" then
@@ -52751,6 +52776,26 @@ and hash_super_fetch = fn world -> fn superblk -> fn (hid: int) -> fn (args: Val
                        ("key not found: " ++ key_err_desc (inspect_w gc_cenv0 world key9))
                        (Cons (("__key", key9), Cons (("__recv", VHsh hid), Nil))))))
      | Nil -> FNext VNil)
+and hash_super_delete = fn world -> fn superblk -> fn (hid: int) -> fn (args: Val list) ->
+  match args with
+  | Cons (key9, Nil) ->
+    (let _ = (if cfrozen_get 1 hid then
+                (let _ = raise_exc_iv world "FrozenError" ("can't modify frozen Hash: " ++ inspect (VHsh hid))
+                           (Cons (("__recv", VHsh hid), Nil)) in ())
+              else ()) in
+     let user9 = (if hcbi_on hid then false else key_has_user_hash world key9) in
+     let _ = (if user9 then hash_touch gc_cenv0 world key9 else ()) in
+     match hash_super_lookup world hid key9 with
+     | (true, value9) ->
+       (let pairs9 = hderef hid in
+        let rest9 = (if user9 then hash_del_w gc_cenv0 world hid pairs9 key9 else hash_del pairs9 key9) in
+        let _ = hdel_indexed hid key9 rest9 in FNext value9)
+     | _ ->
+       (match superblk with
+        | (true, _, _, _) -> run_block world (blk_noblk superblk) superblk (Cons (key9, Nil))
+        | _ -> FNext VNil))
+  | _ -> FNext (raise_exc world "ArgumentError"
+                  ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
 and sender_super_ahead = fn world -> fn (recv: Val) -> fn (meth: str) ->
   let depth9 = caller_depth () - 1 in
   if not (map_has fb_env_at depth9) then false else
@@ -52817,6 +52862,24 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   else if (str_eq meth "send" || str_eq meth "__send__" || str_eq meth "public_send")
           && sender_super_ahead world recv meth then
     native_sender_call gc_cenv0 world (blk_noblk superblk) recv meth args superblk
+  else if (str_eq meth "method" || str_eq meth "public_method") && sender_super_ahead world recv meth then
+    (let _ = (if val_list_len args != 1 then
+                (let _ = raise_exc world "ArgumentError"
+                           ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)") in ())
+              else ()) in
+     let _ = map_set bi_skip "n" meth in
+     let answer9 = try_or_msg (fn (u: unit) -> invoke_val_c gc_cenv0 world superblk recv meth args false)
+                     (fn (message: str) -> (let _ = map_clear bi_skip in fail message)) in
+     let _ = map_clear bi_skip in answer9)
+  // Kernel's respond_to? is also the super of an Array, Hash or String
+  // subclass's override. Handle it before the primitive-method branch,
+  // which does not implement Kernel's methods. The builtin answer honours
+  // visibility and respond_to_missing? without calling this override again.
+  else if str_eq meth "respond_to?" then
+    (if val_list_len args > 2 then
+       raise_exc world "ArgumentError"
+         ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")
+     else respond_to_answer gc_cenv0 world recv args)
   // (the copy hooks are Kernel's, and a subclass's super reaches them too)
   else if (str_len meth == 15 && str_eq meth "initialize_copy") || (str_len meth == 14 && str_eq meth "initialize_dup")
      || (str_len meth == 16 && str_eq meth "initialize_clone") then
@@ -52895,8 +52958,12 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
           (let k9 = hash_store_key gc_cenv0 world h9 k in
            hput_or_queue_w gc_cenv0 world h9 (hcbi_on h9) k9 v (fn (u: unit) -> hash_put_wx gc_cenv0 world h9 (hcbi_on h9) (hderef h9) k9 v))
         | _ -> VNil)
+     | VHsh h9 when str_eq meth "delete" ->
+       flow_value (hash_super_delete world superblk h9 args)
      | VHsh h9 when str_eq meth "fetch" ->
        flow_value (hash_super_fetch world superblk h9 args)
+     | VHsh _ when str_eq meth "values_at" ->
+       hash_values_at_native gc_cenv0 world superblk recv args
      | VHsh h9 when str_eq meth "fetch_values" ->
        (let rec go9 = fn (keys9: Val list) -> fn (values9: Val list) ->
           (match keys9 with
@@ -53271,20 +53338,6 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
     (match recv with
      | VObj id9 -> prim_q_init world id9 (prim_base_name dcls) args
      | _ -> VNil)
-  else if str_eq meth "respond_to?" then
-    // the BUILTIN answer, not `responds` -- that would dispatch back into the
-    // override we are the `super` of. It is respond_to_answer, the table
-    // form, which does not ask the override: a private method answers only
-    // with include_all, and respond_to_missing? is asked. (This asked "is
-    // there such a method at all", so an override that calls super said
-    // true for a private one. ActiveRecord::Core's private #to_ary is how
-    // Array.wrap(record) keeps a record whole, and every record has
-    // ActiveModel's respond_to? override: `[record].flatten`-style code got
-    // NoMethodError 'to_ary'.)
-    (if val_list_len args > 2 then
-       raise_exc world "ArgumentError"
-         ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")
-     else respond_to_answer gc_cenv0 world recv args)
   // `super` from respond_to_missing? is Object#respond_to_missing?, which
   // answers false. `m == :ok || super` is how the method is written, so it is
   // on the same path as method_missing below and failed the same way.
@@ -65483,7 +65536,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
       (match e with
        | EBin (o2, EStmt (SExpr (EIVar n2)), rhs) ->
          (if (str_eq o2 "||" || str_eq o2 "&&") && str_eq n2 name then
-            (let cur = eval_e env world blk (EIVar name) in
+            (let cur = ivar_opassign_read env world blk name o2 in
              if str_eq o2 "||"
              then (if truthy cur then (true, cur) else (false, eval_e env world blk rhs))
              else (if truthy cur then (false, eval_e env world blk rhs) else (true, cur)))
@@ -66392,8 +66445,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SDeclare names ->
     let _ = declare_nils env names in FNext VNil
   | SRequire (rel, e) ->
-    (match eval_e env world blk e with
-     | VStr p0 ->
+    (let arg9 = eval_e env world blk e in
        // `require` is a real Kernel method, so a library that replaces it is
        // honoured — RubyGems does exactly that, to activate a gem when the
        // file asked for is not on the load path. The statement form is a call
@@ -66408,17 +66460,21 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
         // superclass is BasicObject (builder's XmlBase), where the instance
         // chain has no Kernel at all.
         let dc = (match self0 with VClass _ -> "Object" | _ -> dispatch_cls_of world self0) in
-        if has_meth world dc mname then FNext (invoke world blk self0 dc mname (Cons (VStr p0, Nil)))
-        else if map_has meths0 ("Object#" ++ mname) then FNext (invoke world blk self0 "Object" mname (Cons (VStr p0, Nil)))
-        else if map_has meths0 ("Kernel#" ++ mname) then FNext (invoke world blk self0 "Kernel" mname (Cons (VStr p0, Nil)))
-        else do_require env world blk rel (sget p0))
+        // Lookup precedes path coercion: Parameters#require accepts symbols
+        // and arrays. Its recursive bare require(key) is the same method,
+        // rather than Kernel's loader trying to turn the key into a path.
+        if has_meth world dc mname then FNext (invoke world blk self0 dc mname (Cons (arg9, Nil)))
+        else if map_has meths0 ("Object#" ++ mname) then FNext (invoke world blk self0 "Object" mname (Cons (arg9, Nil)))
+        else if map_has meths0 ("Kernel#" ++ mname) then FNext (invoke world blk self0 "Kernel" mname (Cons (arg9, Nil)))
+        else match arg9 with
+     | VStr p0 -> do_require env world blk rel (sget p0)
      // ...and a non-String argument is NOT nothing: require_path_of asks it
      // for #to_path / #to_str and refuses with TypeError. Answering nil here
      // in silence was the quietest of the three doors.
      | other9 ->
        (let ph9 = require_path_of env world other9 in
         if str_eq ph9 "" then FNext VNil
-        else do_require env world blk rel ph9))
+        else do_require env world blk rel ph9)))
   | SReturn e ->
     let v = eval_e env world blk e in
     // a bare `return` directly inside a Thread.new block cannot return across
@@ -67695,7 +67751,16 @@ and do_eval0 = fn env -> fn world -> fn blk -> fn (args: Val list) ->
                                  let k9 = nlc 0 0 in
                                  let _ = map_set syn_why_ln "c" (e9 - b9) in
                                  let _ = map_set syn_why_ln "w" 1 in
-                                 str_of_int (k9 + eline9) ++ ": " ++ syn_frame code k9 (k9 + eline9) "unexpected end-of-input, assuming it is closing the parent top level context"))
+                                 let eof9 = "unexpected end-of-input, assuming it is closing the parent top level context" in
+                                 // An unfinished assignment has two diagnostics: the missing
+                                 // expression at `=`, followed by end-of-input.
+                                 let why9 = (if e9 > b9 && str_eq (char_at code (e9 - 1)) "=" then
+                                               (let _ = map_set syn_why_ln "c" (e9 - b9 - 1) in
+                                                let _ = map_set syn_why_ln "c2" (e9 - b9) in
+                                                let _ = map_set syn_extra "w" eof9 in
+                                                "expected an expression after `=`")
+                                             else eof9) in
+                                 str_of_int (k9 + eline9) ++ ": " ++ syn_frame code k9 (k9 + eline9) why9))
                      else msg) in
           // (a source that ENDS in a call's dot -- `1.` -- is prism's
           //  end-of-input with nothing to send: framed after the dot, note 445)
@@ -67744,7 +67809,9 @@ and do_eval0 = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        // (a yield at the eval's own top level is the method's when the code
        //  runs in one -- `binding.eval("yield")` of a method's binding)
        else if class_yield_stmts prog2 || (bare_yield_stmts prog2 && (if lv_has eenv "__meth" then false else true)) then
-         raise_exc world "SyntaxError" "Invalid yield"
+         raise_exc_iv world "SyntaxError" (efile9 ++ ":" ++ str_of_int eline9 ++ ": Invalid yield")
+           (Cons (("__path", mkstr efile9), Cons (("__bt", arr_new (Cons (mkstr efile9, Nil))),
+             Cons (("__bt_user", VBool true), Nil))))
        else if (let _ = (if map_has num_misuse_note "why" then (let _ = map_delete num_misuse_note "why" in ()) else ()) in
                 numbered_misuse_stmts prog2) then
          raise_exc world "SyntaxError"
