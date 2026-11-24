@@ -251,11 +251,17 @@ nio4r, which this harness does not fetch. What is left on mere-ruby:
   rubylibdir, not in RUBYLIB. What it takes: a mere-ruby installed with
   its stdlib at its rubylibdir (MERE_RUBY_STDLIB_FALLBACK only reorders
   directories already on the load path).
-- **TERM does not stop a single-mode server (5 tests, and the cluster
-  hot restart).** With the trap fix the trap runs on the main thread and
-  reaches Puma::Server#stop; in most runs (5 of 6 by hand) it then stalls
-  before the stop command is written to the server's notify pipe, with the
-  server thread still in IO.select. Not understood yet; next.
+- **TERM did not stop a single-mode server (5 tests).** This was the trap
+  on the wrong thread (above). After that fix test_integration_single is
+  21 runs, 1 failure here against 0 on ruby 4.0.9: the failure is
+  test_hot_restart_does_not_drop_connections_threads, whose restarted
+  server had not logged its PID when the helper stopped waiting (a slow
+  boot, as RackUp#test_bin). By hand -- a mere-ruby puma started from a
+  ruby script that does not read its output until the server has had 5 s
+  to stop -- TERM still left the server running in 5 of 6 runs, stalled
+  in the trap between Server#stop's start and its notify write, with the
+  server thread in IO.select; the suite's own helper, which drains the
+  output, does not see that. Not understood yet.
 - **fork_worker / mold_worker (4 tests)** -- "Worker N failed to check in
   within 2 seconds" and a phase-2 boot not logged in time: a forked
   worker here takes longer than puma's 2 s check-in to start.
