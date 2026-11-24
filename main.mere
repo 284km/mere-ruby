@@ -2780,6 +2780,14 @@ let gc_point = fn world ->
 // suspended fiber's frames count only once its Fiber object has been reached,
 // which may reach another's, to a fixed point. What is still unreached can
 // never be resumed, and is abandoned (fb_abandon). Nothing is swept here.
+
+// The native compiler asked before the parser (vm_file_first), two slots.
+// Slot 0: how many warnings Prism had of the source the native compiler last
+// read (ic_vm_native writes it: vm_file_first asks). Slot 1: 1 while
+// vm_file_first compiles -- a regexp literal is then checked as the
+// evaluator's parser checks one (ic_to_val), since that parser will not
+// read the file.
+let ic_warns_v = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v 0 in v);
 // a scope vm_scoped or with_scratch_env made on a fiber, by its env id: the
 // fiber (fb_reclaim)
 let lv_fbscope = map_new ();
@@ -65021,6 +65029,29 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
        //  parsed, copied out, and runs on the evaluator as before.)
        let vmreq9 = (str_eq shipped "" && map_has cli_opt "vm" && (if map_has cli_opt "vmbusy" then false else true)
                      && vec_get cov_st 0 == 0) in
+       // (a regexp literal that does not parse is the file's SyntaxError, as
+       //  eval's is. The check's `fail` was left as it was -- a StandardError
+       //  "mere-ruby: regexp: invalid regular expression" no `rescue
+       //  SyntaxError` took, with no path. Asked right after the parse and
+       //  before the compile: the Ruby compiler's own evals spend the queue,
+       //  and took the error for a refusal of theirs -- the file then ran.)
+       let rxchk9 = fn (u: unit) ->
+         (let _ = try_or_msg (fn (u1: unit) -> (let _ = rx_check_pending () in VNil))
+                    (fn (m9: str) ->
+                       (let _ = unmark9 () in
+                        let strip9 = fn (pfx: str) -> fn (t: str) ->
+                          (if str_len t >= str_len pfx && str_eq (substring t 0 (str_len pfx)) pfx then substring t (str_len pfx) (str_len t) else t) in
+                        // (the reason the check kept for eval's SyntaxError --
+                        //  rx_cur "why", ruby's "end pattern with unmatched
+                        //  parenthesis: /(/" -- when it has one)
+                        let why0 = (if map_has rx_cur "why" then (match map_get rx_cur "why" with VStr h -> sget h | _ -> "") else "") in
+                        let _ = (if map_has rx_cur "why" then map_delete rx_cur "why" else ()) in
+                        let why9 = (if str_len why0 > 0 then why0
+                                    else if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> m9) else m9) in
+                        let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+                        let m0 = strip9 "mere-ruby: regexp: " (strip9 "mere-ruby: regexp parse: " why9) in
+                        raise_exc_iv world "SyntaxError" (req_syntax_framed env world full src m0)
+                          (Cons (("__path", mkstr full), Nil)))) in ()) in
        let parse9 = fn (u: unit) ->
                    (let tk = number_nls src (lex_src src) in
                     let _ = parse_line_reset (count_nls tk) in
@@ -65028,12 +65059,21 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
                     let _ = (match r with (pg9, _) -> if cb_ret_prog pg9 then syn_refuse "Invalid return in class/module body" else ()) in
                     let _ = (match r with (pg9, _) -> yield_refuse_file pg9) in
                     let _ = map_set pok "y" 1 in r) in
+       // (...and first, without the parse at all: vm_file_first. A file
+       //  Coverage reads, and MERE_RUBY_VM=strict / =why, go the long way.)
+       let first9 = (if vmreq9 && (str_eq (map_get cli_opt "vm") "1" || str_eq (map_get cli_opt "vm") "report")
+                     then vm_file_first env world (false, (Nil : str list), (Nil : Stmt list), env) src full
+                     else (Nil : Stmt list)) in
          let (prog2, rest2) =
-           (if vmreq9 then
+           (match first9 with
+            | Cons (_, _) -> (let _ = map_set pok "y" 1 in (first9, Cons (TEOF, Nil)))
+            | Nil ->
+            if vmreq9 then
               region REQP {
                 (let (pg9, rs9) = try_or parse9 (Nil, Nil) in
                  if map_has pok "y" && (match rs9 with Cons (TEOF, _) -> true | _ -> false) then
-                   (let st9 = vm_file_stmts env world (false, (Nil : str list), (Nil : Stmt list), env) src full "<top (required)>" (req_nopre pg9) in
+                   (let _ = rxchk9 () in
+                    let st9 = vm_file_stmts env world (false, (Nil : str list), (Nil : Stmt list), env) src full "<top (required)>" (req_nopre pg9) in
                     match st9 with
                     | Cons (SFile _, Cons (SVm (_, _), Nil)) -> (st9, rs9)
                     | _ -> (pg9, rs9))
@@ -65053,7 +65093,7 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
                   let m0 = (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "syntax error") else "syntax error") in
                   let _ = raise_exc_iv world "SyntaxError" (req_syntax_framed env world full src m0)
                             (Cons (("__path", mkstr full), Nil)) in ()) in
-       let _ = rx_check_pending () in
+       let _ = rxchk9 () in
      let _ = warn_flush world in
        let _ = (match rest2 with
                 | Cons (TEOF, _) -> ()
@@ -68924,6 +68964,38 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
            else refused why)
         | VStr h -> refused (sget h)
         | _ -> refused "the compiler answered nothing"))
+// A required file the native compiler takes whole, asked BEFORE the
+// evaluator's lexer and parser read it: the two statements that run its
+// program, or Nil -- and then the file is parsed and asked again the long
+// way (vm_file_stmts), which is where every refusal, error and warning is
+// said. Nil when Prism has an error or a warning of the source (the
+// evaluator's parser says its own of them), when the native compiler
+// declines anything in it, or when the loader does. The parser's statements
+// of such a file were made, kept for the compile and thrown away: its lexer
+// and parser were a twelfth of a Rails boot on the VM.
+and vm_file_first = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: str) ->
+  if map_has cli_opt "vmbusy" || (if str_eq (env_get "MERE_RUBY_IC") "ruby" then true else false) then (Nil : Stmt list)
+  else
+    (let _ = map_set cli_opt "vmbusy" "1" in
+     let line9 = cur_line () in
+     let file9 = cur_file () in
+     let _ = vec_set ic_warns_v 0 0 in
+     let _ = vec_set ic_warns_v 1 1 in
+     let nat = ic_vm_native env world blk src path "<top (required)>" in
+     let _ = vec_set ic_warns_v 1 0 in
+     let _ = map_delete cli_opt "vmbusy" in
+     let _ = cur_line_set line9 in
+     let _ = cur_file_set file9 in
+     match nat with
+     | VArr _ ->
+       (if vec_get ic_warns_v 0 > 0 then (Nil : Stmt list)
+        else
+          (let (why, id) = vm_load nat in
+           if str_eq why "" then
+             (let (_, _, _, gen, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
+              Cons (SFile (bx_tag path), Cons (SVm (id, gen), (Nil : Stmt list))))
+           else (Nil : Stmt list)))
+     | _ -> (Nil : Stmt list))
 // The native compiler's sequences for a file run on the VM -- the Array
 // RubyVM::InstructionSequence.__vm_file answers, built in Mere from libprism's
 // serialized tree (ic/, note 552) -- or VNil when it does not take the file:
@@ -68977,6 +69049,7 @@ and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: st
                 vec_new (), vec_new (), vec_new (), vec_new ()) in
       let cx = (tr, es, us) in
       let why = ic_tree_load tr in
+      let _ = vec_set ic_warns_v 0 (vec_get meta 6) in
       if (if str_eq why "" then false else true) || vec_get meta 3 > 0 then VNil
       else
         (let enc = ic_enc cx in
@@ -69026,7 +69099,19 @@ and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
         | Cons ((k, x), t) -> Cons (ic_to_val env world blk k, Cons (ic_to_val env world blk x, flat t))) in
      frozen (mkhash (flat ps)))
   | IvRx (s, o, e) ->
-    frozen (invoke_val_c env world blk (VClass "Regexp") "__rx_new" (Cons (mkstr_e s e, Cons (VInt o, Nil))) false)
+    // (asked before the parser: the literal is validated here as the
+    //  parser's queue validates it -- rx_check_go -- and one that does not
+    //  parse, or that the check has a warning of, stops the compile: the
+    //  file then goes the long way, where the parser says so)
+    (let _ = (if vec_get ic_warns_v 1 == 1 then
+                (let _ = rx_wq_take () in
+                 let fl9 = (if o % 2 == 1 then "i" else "") ++ (if (o / 2) % 2 == 1 then "x" else "") ++ (if (o / 4) % 2 == 1 then "m" else "") in
+                 let ok9 = rx_validate s fl9 in
+                 let w9 = rx_wq_take () in
+                 let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+                 if ok9 && str_eq w9 "" then () else fail "a regexp literal the parser has something to say of")
+              else ()) in
+     frozen (invoke_val_c env world blk (VClass "Regexp") "__rx_new" (Cons (mkstr_e s e, Cons (VInt o, Nil))) false))
   | IvRng (a, b, excl) -> VRange (ic_to_val env world blk a, ic_to_val env world blk b, excl)
   | IvRat (a, b) ->
     (let sv = fn (x: Iv) -> (match x with IvInt k -> str_of_int k | IvBig t -> t | _ -> "0") in VRat (sv a, sv b))
