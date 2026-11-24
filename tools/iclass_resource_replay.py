@@ -45,8 +45,8 @@ def main():
     git = lambda path, *opts: subprocess.check_output(['git', '-C', str(path), *opts], text=True).strip()
     if git(source, 'rev-parse', 'HEAD') != RUBY or ci.digest(source / 'test/ruby/test_module.rb') != TEST_SHA:
         parser.error('the exact pinned Ruby source is required')
-    if not subprocess.check_output([str(reference), '-v'], text=True).startswith('ruby 4.0.10 '):
-        parser.error('reference Ruby 4.0.10 is required')
+    if not subprocess.check_output([str(reference), '-v'], text=True).startswith('ruby 4.0.9 '):
+        parser.error('reference Ruby 4.0.9 is required')
     for (label, root) in roots.items():
         if git(root, 'rev-parse', 'HEAD') != SOURCE or (root / '.build_mode').read_text().strip() != 'O2':
             parser.error('both ordinary O2 binaries must use the failed source SHA')
@@ -72,7 +72,7 @@ def main():
 
     def environment(root, binary, folder):
         ci.ROOT = root
-        env = ci.test_environment(folder / 'environment', binary, '4.0.10')
+        env = ci.test_environment(folder / 'environment', binary, '4.0.9')
         runtime = subprocess.check_output(['sh', str(root / 'tools/runtime_load_path.sh'), str(binary)], text=True, timeout=20).split(os.pathsep)
         env.update(RUBY=str(binary), UNITTEST_CHILD_RUBY=str(binary), UNITTEST_TEST_FILE='ruby/test_module.rb', RUBYLIB=os.pathsep.join(map(str, [source / 'tool/lib', source / 'test', root / 'unittest/shim', *runtime, source / 'lib'])))
         env['PATH'] = str(root / 'unittest/child-bin') + os.pathsep + env['PATH']
