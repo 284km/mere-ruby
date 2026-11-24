@@ -13120,11 +13120,39 @@ and arr_partition = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i: i
 // group_by: hash of block-value -> array of elements (first-seen order).
 and arr_group_by = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) ->
   match xs with
-  | Nil -> mkhash acc
+  | Nil -> hstored_seed gc_cenv0 world (mkhash acc)
   | Cons (h, t) ->
     let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
+    // a key with its own #hash / #eql? is grouped by them, as `h[k] <<= x`
+    // would: ActiveRecord's preloader runs `loaders.group_by(&:loader_query)`
+    // and each query was a group of its own -- one SELECT per association
+    // where ruby sends one for all of them
+    if elems_user_hash world (Cons (k, Nil)) then
+      (let (found9, cur9) = hash_lookup_w gc_cenv0 world (0 - 1) acc k in
+       let lst = (match cur9 with
+                  | VArr id -> (if found9 then list_append (deref id) (Cons (h, Nil)) else Cons (h, Nil))
+                  | _ -> Cons (h, Nil)) in
+       arr_group_by world encl theblk t (hash_put_w gc_cenv0 world (0 - 1) acc k (arr_new lst)))
+    else
     let lst = (match hash_get acc k with VArr id -> list_append (deref id) (Cons (h, Nil)) | _ -> Cons (h, Nil)) in
     arr_group_by world encl theblk t (hash_put acc k (arr_new lst))
+// A table built from pairs, entered again through `[]=` when a key carries
+// its own #hash / #eql? -- what a hash LITERAL does (EHsh). The structural
+// merge keeps two keys that say they are equal as two entries.
+and hash_rekey_w = fn env -> fn world -> fn (h0: Val) ->
+  match h0 with
+  | VHsh hid0 ->
+    (let kv9 = hderef hid0 in
+     if elems_user_hash world kv9 then
+       (let h9 = mkhash Nil in
+        let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        let rec put9 = fn (xs: Val list) ->
+          (match xs with
+           | Cons (k9, Cons (v9, t9)) -> (let _ = invoke_val_c env world nb9 h9 "[]=" (Cons (k9, Cons (v9, Nil))) false in put9 t9)
+           | _ -> ()) in
+        let _ = put9 kv9 in h9)
+     else h0)
+  | _ -> h0
 
 // each_with_object(o): run block with (elem, o) for each; return o.
 and arr_each_with_object = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (o: Val) ->
@@ -13139,7 +13167,7 @@ and arr_each_with_object = fn world -> fn encl -> fn theblk -> fn (xs: Val list)
 and arr_to_h_blk = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i: int) -> fn (xs0: Val list) -> fn (ver0: int) -> fn (acc: Val list) ->
   let ver = arr_ver id in
   match arr_lv id i xs0 ver0 with
-  | Nil -> FNext (mkhash (hash_merge Nil (val_rev acc Nil)))
+  | Nil -> FNext (hash_rekey_w gc_cenv0 world (mkhash (hash_merge Nil (val_rev acc Nil))))
   | Cons (h, t) ->
     (match run_block world encl theblk (Cons (h, Nil)) with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
@@ -14280,6 +14308,11 @@ and arr_hash_rec = fn env -> fn world -> fn (id: int) ->
                           (match invoke_val_c env world nb9 r9 "to_int" Nil false with
                            | VInt n -> n | _ -> 0)
                         | other -> val_hash other)
+                     // (a Hash element holding a key or value with its own
+                     //  #hash answers as Hash#hash does: `[name, scope.values]
+                     //  .hash` is how ActiveRecord's preloader keys a query,
+                     //  and two equal ones hashed apart)
+                     | VHsh hh9 when elems_user_hash world (hderef hh9) -> hash_pairs_code env world (hderef hh9) 7193
                      | _ -> val_hash h) in
            go t (floor_mod (acc * 31 + hv) 1000000007))) in
      let r = go (deref id) 17 in
@@ -14325,13 +14358,37 @@ and val_intersect_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val lis
      then Cons (h9, val_intersect_w env world t9 ys)
      else val_intersect_w env world t9 ys)
 
+// Array#- asks no #hash when EITHER array is small (16 elements or fewer,
+// rb_ary_diff's SMALL_ARRAY_LEN): each element is looked for with rb_eql
+// alone -- the same object, or its own #eql?. A #hash that raises is then
+// never reached: ActiveRecord's `predicates - other.predicates` holds a bind
+// whose #hash refuses an out-of-range Integer, and the #eql? before it
+// answers false from the plain values.
 and val_subtract_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
+  let rec short = fn (l: Val list) -> fn (n: int) ->
+    (match l with
+     | Nil -> true
+     | Cons (_, t) -> if n == 0 then false else short t (n - 1)) in
+  val_subtract_wx env world xs ys (short xs 16 || short ys 16)
+and val_subtract_wx = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) -> fn (small: bool) ->
   match xs with
   | Nil -> (Nil : Val list)
   | Cons (h9, t9) ->
-    (if val_member_eqlw env world ys h9
-     then val_subtract_w env world t9 ys
-     else Cons (h9, val_subtract_w env world t9 ys))
+    (if (if small then val_member_eql_small env world ys h9 else val_member_eqlw env world ys h9)
+     then val_subtract_wx env world t9 ys small
+     else Cons (h9, val_subtract_wx env world t9 ys small))
+and val_member_eql_small = fn env -> fn world -> fn (ys: Val list) -> fn (x: Val) ->
+  match ys with
+  | Nil -> false
+  | Cons (h9, t9) ->
+    (if (match (x, h9) with
+         | (VObj ia, VObj ib) ->
+           (if ia == ib then true
+            else if has_meth world (dispatch_cls_of world x) "eql?"
+            then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) x "eql?" (Cons (h9, Nil)) false)
+            else rb_eql_w env world x h9)
+         | _ -> rb_eql_w env world x h9)
+     then true else val_member_eql_small env world t9 x)
 
 and val_any_in_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
@@ -18323,7 +18380,13 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           && (match args with Cons (VArr _, _) -> true | _ -> false)
           && (match recv with
               | VArr a1 -> (match args with
-                            | Cons (VArr a2, _) -> (if rb_eq recv (VArr a2) then false else arr_has_obj world (deref a1))
+                            // (...and for #eql?, an element with its own #eql? or
+                            //  #hash and no #==: `[q].eql?([q2])` answered the
+                            //  structural false without asking q, so an Array
+                            //  of such keys was never found as a Hash key)
+                            | Cons (VArr a2, _) -> (if rb_eq recv (VArr a2) then false
+                                                    else arr_has_obj world (deref a1)
+                                                         || (str_len name == 4 && elems_user_hash world (deref a1)))
                             | _ -> false)
               | _ -> false) then
     (match recv with
@@ -18970,7 +19033,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
          ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)")
      | Nil ->
        (match recv with
-        | VArr id -> mkhash (hkeys_frozen (hash_merge Nil (arr_to_h_pairs env world (deref id) 0)))
+        | VArr id -> hash_rekey_w env world (mkhash (hkeys_frozen (hash_merge Nil (arr_to_h_pairs env world (deref id) 0))))
         | _ -> VNil))
   // Array#delete compares the same way (element == obj) and additionally takes
   // a block to run when NOTHING matched -- it removed by structural equality
@@ -20428,7 +20491,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                                | _ -> args))
                     | _ -> args)
                  | _ -> args) in
-       hash_bracket world a9)
+       hash_rekey_w env world (hash_bracket world a9))
     else if str_eq c "Array" && (str_len name == 2 && str_eq name "[]") then arr_new args
     // A subclass inherits the [] constructor: MyArray[1, 2] builds an array
     // tagged with the subclass, WITHOUT calling the subclass's #initialize
@@ -36588,7 +36651,10 @@ and tally_into = fn env -> fn world -> fn (recv: Val) -> fn (h0: Val) ->
   | (VHsh hid, VArr aid) ->
     (let _ = (if val_frozen_mut h then (let _ = raise_exc world "FrozenError" ("can't modify frozen Hash: " ++ inspect_w env world h) in ()) else ()) in
      let _ = list_iter_vals (deref aid) (fn (e9: Val) ->
-               (let nv9 = (match hash_lookup (hderef hid) e9 with
+               // (a key with its own #hash is looked up by it, as it is stored)
+               (let nv9 = (match (if elems_user_hash world (Cons (e9, Nil))
+                                  then hash_lookup_w env world hid (hderef hid) e9
+                                  else hash_lookup (hderef hid) e9) with
                            | (true, VInt n9) -> VInt (n9 + 1)
                            | (true, other9) -> raise_exc world "TypeError" ("wrong argument type " ++ class_name other9 ++ " (expected Integer)")
                            | _ -> VInt 1) in
@@ -36934,6 +37000,12 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   else if (str_len name == 5 && str_eq name "tally") && (match recv with VArr _ -> true | _ -> false)
           && (match args with Cons (_, Nil) -> true | _ -> false)
   then tally_into env world recv (match args with Cons (h9, _) -> h9 | Nil -> VNil)
+  // (...and a plain #tally of elements with their own #hash counts into a
+  //  new Hash the same way, so two that are #eql? are one key)
+  else if (str_len name == 5 && str_eq name "tally") && (match args with Nil -> true | _ -> false)
+          && (match recv with VArr tid9 -> elems_user_hash world (deref tid9) | _ -> false)
+          && (if prim_user_has world recv "tally" then false else true)
+  then tally_into env world recv (mkhash Nil)
   else
   // ⚠ the PRECISION of the rounding family is an integer CONVERSION too, and
   // the leaf that applies it (prim_method_raw) has no world to ask an object
