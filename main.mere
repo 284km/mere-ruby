@@ -65576,15 +65576,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = declare_nils env (clause_body_targets clauses) in
     exec_stmt env world blk (SIf (clauses, els9))
   | SIf (clauses, els) ->
-    // after the if, declare (as nil) any assignment targets in branches
-    // that did not run — Ruby defines locals at parse time.
-    // The scan is deep: an assignment inside a `begin`, a loop or a nested
-    // `if` of the branch that did not run declares its name too (resolv.rb's
-    // `hosts = ... rescue LoadError` under an untaken `if` is exactly that).
-    let f = run_if env world blk clauses els in
-    let _ = declare_nils env (clauses_targets clauses) in
-    let _ = declare_nils env (deep_targets els) in
-    f
+    // the assignment targets of every branch are declared (as nil) whether or
+    // not the branch runs — Ruby defines locals at parse time: run_if
+    run_if env world blk clauses els
   | SWhile (cond, body) ->
     // (a Thread body's loops are counted: a `break` inside one is the loop's)
     let tb9 = map_has env "__thrbody" in
@@ -65596,12 +65590,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = declare_nils env (deep_targets body) in
     f
   | SCase (subj, whens, els) ->
-    let f = (match subj with
-             | ECaseNone -> run_case_truthy env world blk whens els
-             | _ -> run_case env world blk (eval_e env world blk subj) whens els) in
-    let _ = declare_nils env (whens_targets whens) in
-    let _ = declare_nils env (deep_targets els) in
-    f
+    // (each `when` declares its targets once, in the order of the text, as
+    //  an `if`'s branches do: run_if)
+    (match subj with
+     | ECaseNone -> run_case_truthy env world blk whens els
+     | _ -> run_case env world blk (eval_e env world blk subj) whens els)
   | SCaseIn (subj, clauses, has_else, els) ->
     // Ruby declares every pattern variable at parse time (they exist as nil
     // even when no clause matches). Pre-declare, then try each clause.
@@ -67008,12 +67001,37 @@ and run_begin_f = fn env -> fn world -> fn blk -> fn (body_f: unit -> Flow) -> f
 
 
 and run_if = fn env -> fn world -> fn blk -> fn clauses -> fn (els: Stmt list) ->
+  // ⚠ EVERY BRANCH DECLARES ITS TARGETS, ONCE, IN THE ORDER OF THE TEXT. A
+  //   local is a local from where its first assignment is written, whether or
+  //   not that line runs, so a branch that is passed over declares its names
+  //   BEFORE the next branch runs: a block there that assigns one writes the
+  //   method's variable, not a variable of its own (ActiveRecord's
+  //   compute_cache_version: `if loaded then size = ... else with_connection {
+  //   size, timestamp = ... } end`). The branch that runs declares its own
+  //   after it (it may have stopped before an assignment), and then the
+  //   branches after it. All of them used to be declared after the whole
+  //   `if`; declaring the passed-over ones a second time there cost a fifth
+  //   of a loop around an if/elsif/else.
+  // The scan is deep: an assignment inside a `begin`, a loop or a nested
+  // `if` of a branch that did not run declares its name too (resolv.rb's
+  // `hosts = ... rescue LoadError` under an untaken `if` is exactly that).
   match clauses with
-  | Nil -> run_stmts env world blk els
+  | Nil ->
+    (match els with
+     | Nil -> run_stmts env world blk els
+     | _ -> (let f = run_stmts env world blk els in
+             let _ = declare_nils env (deep_targets els) in f))
   | Cons (cl, rest) ->
     let (c, b) = cl in
-    if truthy (eval_e env world blk c) then run_stmts env world blk b
-    else run_if env world blk rest els
+    if truthy (eval_e env world blk c) then
+      (let f = run_stmts env world blk b in
+       let _ = declare_nils env (deep_targets b) in
+       let _ = (match rest with Nil -> () | _ -> declare_nils env (clauses_targets rest)) in
+       let _ = (match els with Nil -> () | _ -> declare_nils env (deep_targets els)) in
+       f)
+    else
+      (let _ = declare_nils env (deep_targets b) in
+       run_if env world blk rest els)
 
 and run_while = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body: Stmt list) ->
   // A REGION PER ITERATION -- the loop-shaped sibling of run_stmts' region per
@@ -71664,11 +71682,23 @@ and defined_eval_recv = fn env -> fn world -> fn blk -> fn (recv: Expr) ->
 // plain equality.
 and run_case = fn env -> fn world -> fn blk -> fn (v: Val) -> fn whens -> fn (els: Stmt list) ->
   match whens with
-  | Nil -> run_stmts env world blk els
+  | Nil ->
+    (match els with
+     | Nil -> run_stmts env world blk els
+     | _ -> (let f = run_stmts env world blk els in
+             let _ = declare_nils env (deep_targets els) in f))
   | Cons (w, rest) ->
     let (vs, b) = w in
-    if when_matches env world blk v vs then run_stmts env world blk b
-    else run_case env world blk v rest els
+    if when_matches env world blk v vs then
+      (let f = run_stmts env world blk b in
+       let _ = declare_nils env (list_append_str (exprs_pat_vars vs) (deep_targets b)) in
+       let _ = (match rest with Nil -> () | _ -> declare_nils env (whens_targets rest)) in
+       let _ = (match els with Nil -> () | _ -> declare_nils env (deep_targets els)) in
+       f)
+    else
+      // (a `when` passed over declares its targets before the next is tried)
+      (let _ = declare_nils env (list_append_str (exprs_pat_vars vs) (deep_targets b)) in
+       run_case env world blk v rest els)
 
 and case_any_eqq = fn world -> fn (value9: Val) -> fn (candidates9: Val list) ->
   match candidates9 with
@@ -75863,11 +75893,22 @@ and rx_split_go_l = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) 
 // subjectless case: the first when whose any condition is truthy wins.
 and run_case_truthy = fn env -> fn world -> fn blk -> fn whens -> fn (els: Stmt list) ->
   match whens with
-  | Nil -> run_stmts env world blk els
+  | Nil ->
+    (match els with
+     | Nil -> run_stmts env world blk els
+     | _ -> (let f = run_stmts env world blk els in
+             let _ = declare_nils env (deep_targets els) in f))
   | Cons (w, rest) ->
     let (vs, b) = w in
-    if any_truthy env world blk vs then run_stmts env world blk b
-    else run_case_truthy env world blk rest els
+    if any_truthy env world blk vs then
+      (let f = run_stmts env world blk b in
+       let _ = declare_nils env (list_append_str (exprs_pat_vars vs) (deep_targets b)) in
+       let _ = (match rest with Nil -> () | _ -> declare_nils env (whens_targets rest)) in
+       let _ = (match els with Nil -> () | _ -> declare_nils env (deep_targets els)) in
+       f)
+    else
+      (let _ = declare_nils env (list_append_str (exprs_pat_vars vs) (deep_targets b)) in
+       run_case_truthy env world blk rest els)
 
 and any_truthy = fn env -> fn world -> fn blk -> fn (vs: Expr list) ->
   match vs with
