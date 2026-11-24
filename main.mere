@@ -4830,6 +4830,18 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
         let why = (if str_eq why "" then rx_frag_mb_why (sget sp) (enc_canon_name (senc_get sp)) else why) in
         if str_eq why "" then v9 else raise_exc world "ArgumentError" why)
      | _ -> v9)
+  | EMethod (EArr es, name, Nil)
+    when str_eq name "max" || str_eq name "min" ->
+    // CRuby's opt_newarray_send compares the later element with the best;
+    // Array#min/max compare the best with the later element instead.
+    (match eval_e env world blk (EArr es) with
+     | VArr id ->
+       // Argument evaluation can itself replace Array#min/max.
+       (if map_len ref_active > 0 || has_meth world "Array" name
+           || undef_blocked world "Array" name || map_has builtin_alias ("Array#" ++ name)
+        then invoke_val_c env world blk (VArr id) name Nil true
+        else arr_extreme world (deref id) (str_eq name "max") true)
+     | _ -> VNil)
   | EMethod (recv_e, name, arges) ->
     // `"literal".freeze` is ruby's interning special form: every evaluation
     // of the same literal-freeze answers ONE object (CRuby compiles it to
@@ -22763,7 +22775,10 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     // answering. A negative is a DomainError and a non-number a TypeError --
     // both of which came out as an answer or as an internal failure.
     else if str_eq c "Integer" && (str_len name == 4 && str_eq name "sqrt") then
-      (match args with
+      (let n9 = vals_len args 0 in
+       if n9 != 1 then raise_exc world "ArgumentError"
+         ("wrong number of arguments (given " ++ str_of_int n9 ++ ", expected 1)")
+       else match args with
        | Cons (VInt n9, _) ->
          (if n9 < 0 then raise_exc world "Math::DomainError"
                            "Numerical argument is out of domain - \"isqrt\""
@@ -37948,7 +37963,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
     (match recv with
      | VArr id ->
        (let xs9 = deref id in
-        arr_new (Cons (arr_opt_extreme world xs9 false, Cons (arr_opt_extreme world xs9 true, Nil))))
+        arr_new (Cons (arr_extreme world xs9 false false, Cons (arr_extreme world xs9 true false, Nil))))
      | _ -> VNil)
   else if (str_len name == 10 && str_eq name "each_entry") && (match recv with VArr _ -> true | _ -> false) then
     make_enum world recv "each"
@@ -38628,8 +38643,8 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
     (match recv with
      | VArr id ->
        (let xs9 = deref id in
-        if str_eq name "minmax" then arr_new (Cons (arr_opt_extreme world xs9 false, Cons (arr_opt_extreme world xs9 true, Nil)))
-        else arr_opt_extreme world xs9 (str_eq name "max"))
+        if str_eq name "minmax" then arr_new (Cons (arr_extreme world xs9 false false, Cons (arr_extreme world xs9 true false, Nil)))
+        else arr_extreme world xs9 (str_eq name "max") false)
      | _ -> VNil)
   // a NaN among numbers does not sort: the first pair it is in is compared the
   // way the sort would, and that is ruby's ArgumentError
@@ -38660,7 +38675,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   // sort/min/max of an array of user objects use their <=> (pure cmp_vals can't).
   // (...and an array of rows that hold such objects: Gem::Requirement#hash
   //  sorts [op, Gem::Version] pairs, and the world-free sort refused them)
-  else if (str_len name == 4 && str_eq name "sort") && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | xs9 -> rows_hold_obj xs9) | _ -> false) then
+  else if (str_len name == 4 && str_eq name "sort") && (match recv with VArr id -> numeric_cmp_changed world || (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | xs9 -> rows_hold_obj xs9) | _ -> false) then
     (match recv with VArr id -> arr_new (sort_w world (deref id)) | _ -> recv)
   else if (str_len name == 3 && str_eq name "min") && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
     (match recv with VArr id -> (match sort_w world (deref id) with Nil -> VNil | Cons (h, _) -> h) | _ -> VNil)
@@ -38679,7 +38694,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                   | Cons (VArr y, _) -> arr_spaceship_w env world (deref x) (deref y)
                   | _ -> VNil)
      | _ -> VNil)
-  else if (str_len name == 5 && str_eq name "sort!") && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
+  else if (str_len name == 5 && str_eq name "sort!") && (match recv with VArr id -> numeric_cmp_changed world || (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
     (match recv with VArr id -> (let st9 = sort_w world (deref id) in let _ = arr_frz_sort_check world id in let _ = arr_set id st9 in recv) | _ -> recv)
   else if (str_len name == 4 && str_eq name "sort") && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with
@@ -46386,8 +46401,9 @@ and reduce_sym_go = fn env -> fn world -> fn blk -> fn (xs: Val list) -> fn (acc
 // world-aware compare: a VObj with a user <=> uses it; everything else
 // falls back to the pure cmp_vals. Lets sort/min/max/clamp work on
 // Comparable user objects.
-// ruby's OPTIMIZED_CMP, which Array#max / #min / #minmax ask with the LATER
-// element as the receiver (`e <=> v`, v the best so far): two numbers compare
+// ruby's OPTIMIZED_CMP, used by the literal min/max instructions with the
+// later element as receiver. Ordinary Array#min/max use the best so far as
+// receiver instead. Two numbers with an unchanged comparator compare
 // directly, and a NaN does not compare (ArgumentError, "comparison of Float
 // with 1 failed"); anything else is asked through #<=> -- Integer#<=> coerces
 // and a nil answer is the same ArgumentError. max and min folded through a
@@ -46395,6 +46411,9 @@ and reduce_sym_go = fn env -> fn world -> fn blk -> fn (xs: Val list) -> fn (acc
 // equal to 1) answered 1 where ruby keeps the first (test_array, note 275).
 and val_is_num = fn (v: Val) ->
   match v with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat (_, _) -> true | _ -> false
+and numeric_cmp_changed = fn world ->
+  numeric_user_method world "Rational" "<=>" || numeric_user_method world "Integer" "<=>"
+  || numeric_user_method world "Float" "<=>"
 and val_is_nan = fn (v: Val) -> match v with VFlt f -> (if f == f then false else true) | _ -> false
 // rb_cmperr shows a Float by its inspect ("NaN", "1.5"), like the special constants
 and cmp_other_name_f = fn (v: Val) -> match v with VFlt f -> rb_float_str f | _ -> cmp_other_name v
@@ -46417,7 +46436,8 @@ and basic_obj_cmp_check = fn world -> fn (x: Val) ->
    else ())
 and opt_cmp = fn world -> fn (a: Val) -> fn (b: Val) ->
   let _ = basic_obj_cmp_check world a in
-  if val_is_num a && val_is_num b then
+  if val_is_num a && val_is_num b
+     && (if numeric_user_method world (class_name a) "<=>" then false else true) then
     (if val_is_nan a || val_is_nan b then
        (let _ = raise_exc world "ArgumentError" ("comparison of " ++ class_name a ++ " with " ++ cmp_other_name_f b ++ " failed") in 0)
      else cmp_vals a b)
@@ -46440,7 +46460,7 @@ and cmpint_obj = fn world -> fn (v: Val) ->
      else if truthy (invoke_val_c gc_cenv0 world nb9 v "<" (Cons (VInt 0, Nil)) false) then 0 - 1
      else 0)
   | _ -> cmp_vals_w world v (VInt 0)
-and arr_opt_extreme = fn world -> fn (xs: Val list) -> fn (want_max: bool) ->
+and arr_extreme = fn world -> fn (xs: Val list) -> fn (want_max: bool) -> fn (literal: bool) ->
   match xs with
   | Nil -> VNil
   | Cons (h0, t0) ->
@@ -46448,11 +46468,12 @@ and arr_opt_extreme = fn world -> fn (xs: Val list) -> fn (want_max: bool) ->
        (match ys with
         | Nil -> v
         | Cons (e, t) ->
-          (let c = opt_cmp world e v in
+          (let c = (if literal then opt_cmp world e v else 0 - opt_cmp world v e) in
            go t (if want_max then (if c > 0 then e else v) else (if c < 0 then e else v)))) in
      go t0 h0)
 and cmp_vals_w = fn world -> fn (a: Val) -> fn (b: Val) ->
-  match a with
+  if val_is_num a && numeric_user_method world (class_name a) "<=>" then opt_cmp world a b
+  else match a with
   | VObj oid ->
     let (meths, sup, ocls, ivars) = world in
     let ocl = map_get ocls oid in
@@ -70738,7 +70759,12 @@ and vm_value_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n:
   else if o == 34 then vm_push st (vm_send0 env world blk (match v with VHsh id -> vm_hash env world blk (hderef id) | _ -> v) "freeze" Nil)
   else if o == 35 then
     (let xs = vm_popn st a in
-     if b == 1 || b == 2 || b == 3 then
+     if (b == 1 || b == 2) && map_len ref_active == 0
+        && (let nm9 = (if b == 1 then "max" else "min") in
+            if has_meth world "Array" nm9 || undef_blocked world "Array" nm9
+               || map_has builtin_alias ("Array#" ++ nm9) then false else true) then
+       vm_push st (arr_extreme world xs (b == 1) true)
+     else if b == 1 || b == 2 || b == 3 then
        vm_push st (vm_send0 env world blk (arr_new xs) (if b == 1 then "max" else if b == 2 then "min" else "hash") Nil)
      else
        (let rec split = fn (ys: Val list) -> (match ys with
