@@ -5705,8 +5705,8 @@ and flt_fast_op = fn world -> fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
        else (false, VNil))
     else (false, VNil)
   | (VFlt x, VInt y) -> if arith && flt_ops_plain world then (true, fop x (float_of_int y)) else (false, VNil)
-  // (not Integer#/: int_ops_plain does not ask after it)
-  | (VInt x, VFlt y) -> if arith && c != 47 && int_ops_plain world && flt_ops_plain world then (true, fop (float_of_int x) y) else (false, VNil)
+  // (Integer#/ too: int_ops_plain asks after it)
+  | (VInt x, VFlt y) -> if arith && int_ops_plain world && flt_ops_plain world then (true, fop (float_of_int x) y) else (false, VNil)
   | _ -> (false, VNil)
 // the answer for two machine integers, or (false, _) for any other operator
 // (the overflow into a Bignum is add_int_ov's, as the general path's is)
@@ -6223,6 +6223,14 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        if (match va0 with VCpx (_, _) -> true | _ -> false) then
          raise_exc world "NoMethodError"
            ("undefined method '" ++ op ++ "' for an instance of Complex")
+       // (...and an Integer or a Float against a Complex coerces to a pair of
+       //  Complexes and asks the first for the operator: the same
+       //  NoMethodError. A Rational's is Comparable's, the failed
+       //  comparison below.)
+       else if (match va0 with VInt _ -> true | VBig _ -> true | VFlt _ -> true | _ -> false)
+               && (match vb with VCpx (_, _) -> true | _ -> false) then
+         raise_exc world "NoMethodError"
+           ("undefined method '" ++ op ++ "' for an instance of Complex")
        // ...and a NUMBER against an object that coerces asks it first, exactly
        // as `<=>` does. Only `<=>` had this, so `1 > obj` refused with
        // "comparison of Integer with Object failed" for an object whose whole
@@ -6253,7 +6261,13 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
          raise_exc_iv world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ for_recv_cls world (dispatch_cls_of world va0))
            (Cons (("__name", VSym op), Cons (("__args", arr_new (Cons (vb, Nil))), Cons (("__recv", va0), Nil))))
        else if cmp_incompatible va0 vb then
-         raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with " ++ (if is_num vb then to_s vb else cmperr_cls env world vb) ++ " failed")
+         raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with "
+                                          // (a Fixnum and a Float as themselves; a Bignum, a Rational
+                                          //  and a Complex by their class, as rb_cmperr has them)
+                                          ++ (match vb with
+                                              | VInt _ -> to_s vb
+                                              | VFlt _ -> to_s vb
+                                              | _ -> cmperr_cls env world vb) ++ " failed")
        else
          let c = cmp_vals va0 vb in
          VBool (if str_eq op "<" then c < 0 else if str_eq op "<=" then c <= 0 else if str_eq op ">" then c > 0 else c >= 0))
@@ -59118,6 +59132,11 @@ and cmperr_cls = fn env -> fn world -> fn (v: Val) ->
                        (VClass (display_cls world (dispatch_cls_of world v))) "to_s" Nil false with
                | VStr h9 -> sget h9
                | _ -> display_cls_msg world (dispatch_cls_of world v))
+  // (rb_cmperr writes a special constant as itself: `1 < nil` is "comparison
+  //  of Integer with nil failed", not "with NilClass")
+  | VNil -> "nil"
+  | VBool b9 -> (if b9 then "true" else "false")
+  | VSym _ -> inspect v
   | _ -> class_name v
 // Kernel#global_variables: the numbered ones are the groups of the last
 // match that took part ($1 and $12 of twelve, not a $2 that matched nothing),
@@ -68849,6 +68868,21 @@ and vm_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) ->
   then (match (recv, args) with
         | (VInt x9, Cons (VInt y9, Nil)) -> (match int_fast_op mid x9 y9 with (_, v9) -> v9)
         | _ -> VNil)
+  // (arithmetic and ordering of two builtin numbers with nothing in the
+  //  way -- `z * z` of two Complexes, `x.abs > 2`, a Rational's, a Bignum's
+  //  -- the answer EBin's arm reaches at its end, without the scope and the
+  //  EBin made in it: vm_num_bin_ok says when that is so)
+  else if argc == 1 && bid < 0 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 8 || vm_bit fl 64 || vm_bit fl 1048576 then false else true)
+          && (match kws with Nil -> true | _ -> false)
+          && (match args with Cons (a9, Nil) -> vm_num_bin_ok world mid recv a9 | _ -> false)
+  then (match args with
+        | Cons (a9, Nil) ->
+          (let (pn, pr, pd) = bi_reg_get () in
+           let _ = bi_reg_set mid recv (caller_depth ()) in
+           let v9 = eval_bin_prim env world blk mid recv a9 in
+           let _ = bi_reg_set pn pr pd in
+           v9)
+        | _ -> VNil)
   // (`!x` -- `not`, `while !q.empty?` -- as EUn's arm answers it: the
   //  receiver's own #! when its class has one, else the truth turned over;
   //  without the scope and the EUn made in it)
@@ -68897,6 +68931,30 @@ and vm_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) ->
 // for two Arrays or two Hashes, none with an object or an element whose own
 // #== is a singleton's in it (EBin's arm compares those itself, by their
 // elements' #==). A number stays EBin's: coercion.
+// Whether `recv op arg` is answered by eval_bin_prim at the end of EBin's
+// arm, for + - * / < <= > >= of two builtin numbers: an Integer, a Bignum, a
+// Float, a Rational or a Complex with no object in it, of its own class (no
+// subclass tag), whose class defines no such operator; no TracePoint,
+// refinement, undef or alias of the operator. A Complex with an object in
+// it, a user's Numeric and an object that coerces are EBin's.
+and vm_num_plain = fn (v: Val) ->
+  match v with
+  | VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat (_, _) -> true
+  | VCpx (a9, b9) -> (match a9 with VObj _ -> false | _ -> (match b9 with VObj _ -> false | _ -> true))
+  | _ -> false
+and vm_num_bin_ok = fn world -> fn (op: str) -> fn (recv: Val) -> fn (arg: Val) ->
+  let n = str_len op in
+  let c = (if n >= 1 then ord (char_at op 0) else 0) in
+  ((n == 1 && (c == 43 || c == 45 || c == 42 || c == 47 || c == 60 || c == 62))
+   || (n == 2 && (c == 60 || c == 62) && ord (char_at op 1) == 61))
+  && vm_num_plain recv && vm_num_plain arg
+  && (if map_len hook_flags > 0 && hook_tp_on () then false else true)
+  && map_len ref_active == 0
+  && (if map_len undefs > 0 && map_has undef_names op then false else true)
+  && (if map_len blt_alias_ops > 0 && map_has blt_alias_ops op then false else true)
+  && (if vec_get moved_on 0 == 1 then false else true)
+  && (let hk9 = hng_key recv in if str_eq hk9 "" then true else (if map_has hng_store hk9 then false else true))
+  && (if has_meth world (class_name recv) op then false else true)
 and vm_bin_eq_ok = fn world -> fn (op: str) -> fn (recv: Val) -> fn (arg: Val) ->
   (if map_len hook_flags > 0 && hook_tp_on () then false else true)
   && map_len ref_active == 0
