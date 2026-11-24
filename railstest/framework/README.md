@@ -182,6 +182,13 @@ setting, a secret or a local path.
 `records/` keeps the result JSON of each recorded run. These files hold no
 local paths. Raw logs stay outside the repository.
 
+- `actionpack-integrated-summary.json`: 26 focused Action Pack files, 1091 MATCH,
+  two C API-owned RED and two verified EMPTY files. It links all six native
+  batch records. The matching runtime's complete corpus has 887/887 matches
+  with both hash modes; its VM corpus has 883 VM / 4 fallback / zero differences.
+  `actionpack-integrated-rss.json` compares two large files against main 976bb95d.
+  Full 173-file validation and fresh final native-gem installation remain pending;
+  see `actionpack-plan.json` and the dated Action Pack loop record.
 - `install-c521aa58.json`: both sides' installation from the archives.
   Reference: 505.6 s, peak 1.86 GB. mere-ruby: 405.3 s, peak 716 MB.
   Both passed, and the twelve components' `lib/` match the tag.
