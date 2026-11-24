@@ -114,3 +114,17 @@ end
     end
   end
 end
+
+# A later singleton hook must take its own explicit-call reason after a
+# receiverless native failure; the previous private_call? must not leak.
+receiver = Object.new
+begin
+  receiver.instance_eval { missing_before_hook(1, 2) }
+rescue NoMethodError
+end
+def receiver.method_missing(*) = super
+begin
+  receiver.missing_after_hook(3)
+rescue NoMethodError => error
+  p [:after_native_failure, error.args, error.private_call?]
+end

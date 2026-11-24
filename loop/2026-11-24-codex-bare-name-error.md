@@ -38,3 +38,9 @@ their own call forms too. Corpus 983 adds module/class probes for object,
 primitive, class, main and private native failures rescued inside method_missing.
 Successful nested calls and explicit Ruby raises are controls that preserve the
 outer bare-call reason. Corpus 714 remains an independent nested-hook control.
+
+The full replay exposed an unrecorded singleton method_missing door in corpus
+384: a prior receiverless native failure leaked its private_call? flag into
+a later explicit call. That singleton door now takes its own call reason,
+like the ordinary instance door. Corpus 983 adds the same sequence as a
+focused control; the failed earlier replay is retained in local evidence.
