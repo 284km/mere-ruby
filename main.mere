@@ -6824,7 +6824,7 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
           let _ = cur_line_set ln9 in vs9)
 and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   match items with
-  | Nil -> (let _ = (if map_has blk_kwp "e" then map_delete blk_kwp "e" else ()) in Nil)
+  | Nil -> (let _ = arg_notes_reset () in Nil)
   // splat argument: expand an array's elements into the argument list.
   | Cons (ESplat e, t) ->
     let spread = (match eval_e env world blk e with
@@ -6865,22 +6865,16 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
                        | other -> (let _ = raise_exc world "TypeError" ("can't convert " ++ class_name (VObj oid) ++ " to Array (" ++ class_name (VObj oid) ++ "#to_a gives " ++ class_name other ++ ")") in Cons (VObj oid, Nil)))
                     else Cons (VObj oid, Nil)
                   | v -> Cons (v, Nil)) in
-    // a ruby2_keywords-flagged hash at the END of a splat is keywords to the
-    // callee (r2k_unflag_tail reads the note)
-    // -- only when the splat IS the end: `yield(*v, **kw)` (pp's seplist)
-    //    passes the hash positionally, whatever follows it
-    let _ = (match vlast spread with
-             | VHsh lh9 -> (if map_has r2k_marks (str_of_int lh9) && only_block_pass t then map_set r2k_splat lh9 1 else ())
-             | _ -> ()) in
-    // ...and an EMPTY one there is no keywords at all, as `**{}` is: it is
-    // dropped for every callee -- a builtin's too (`[].push(*a, h)` with h
-    // flagged and empty pushed the {}, Bug #4040's test)
-    (match vlast spread with
-     | VHsh lh9 when map_has r2k_marks (str_of_int lh9) && only_block_pass t && (match hderef lh9 with Nil -> true | _ -> false) ->
-       (let r9 = eval_args env world blk t in
-        let _ = map_set blk_kwp "e" "1" in
-        list_append (vinit spread) r9)
-     | _ -> list_append spread (eval_args env world blk t))
+    // The final splat's note belongs to this call. Publish it after the
+    // tail (including &obj conversion) finishes evaluating nested calls.
+    let flagged9 = (match vlast spread with
+                     | VHsh id9 when map_has r2k_marks (str_of_int id9) && only_block_pass t -> id9
+                     | _ -> 0) in
+    let empty9 = flagged9 > 0 && (match hderef flagged9 with Nil -> true | _ -> false) in
+    let tail9 = eval_args env world blk t in
+    if empty9 then (let _ = arg_empty_set () in list_append (vinit spread) tail9)
+    else (let _ = (if flagged9 > 0 then (let _ = arg_splat_note flagged9 in mark_kw flagged9) else ()) in
+          list_append spread tail9)
   // **h passes the hash's pairs as keyword args: a fresh, kwarg-marked copy
   // (so the original hash variable is unaffected and it binds as kwargs).
   | Cons (EKwSplat e, t) ->
@@ -6889,7 +6883,7 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
      // (Ruby 3.0): omit it rather than leaking an empty positional hash.
      | VHsh id ->
        (match hderef id with
-        | Nil -> (let r9 = eval_args env world blk t in let _ = map_set blk_kwp "e" "1" in r9)
+        | Nil -> (let r9 = eval_args env world blk t in let _ = arg_empty_set () in r9)
         | pairs -> (match mkhash pairs with
                     | VHsh nid -> let _ = mark_kw nid in Cons (VHsh nid, eval_args env world blk t)
                     | v -> Cons (v, eval_args env world blk t)))
@@ -6901,7 +6895,7 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   | Cons (EKwHash items9, t) ->
     (let pairs9 = hash_merge Nil (hsh_eval_items env world blk items9) in
      match pairs9 with
-     | Nil -> (let r9 = eval_args env world blk t in let _ = map_set blk_kwp "e" "1" in r9)
+     | Nil -> (let r9 = eval_args env world blk t in let _ = arg_empty_set () in r9)
      | _ -> (match hstored_seed env world (mkhash pairs9) with
              | VHsh id9 -> (let _ = mark_kw id9 in Cons (VHsh id9, eval_args env world blk t))
              | v9 -> Cons (v9, eval_args env world blk t)))
@@ -9740,14 +9734,36 @@ and run_block0x = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) -> 
   // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
   // clear it here to keep it from leaking into a later method's frame.
   let _ = if map_has pending_home "v" then map_delete pending_home "v" else () in
-  // (keywords given that came to nothing: see blk_kwp. An empty hash flagged
+  // (keywords given that came to nothing: see arg_notes. An empty hash flagged
   //  by ruby2_keywords, splatted last, is one too, and passes nothing.)
-  let kwp9 = map_has blk_kwp "e" in
-  let _ = (if kwp9 then map_delete blk_kwp "e" else ()) in
+  let kwp9 = arg_empty_take () in
   let (argvals, kwp9) =
     (match vlast argvals with
-     | VHsh lh9 when map_has r2k_splat lh9 && map_has r2k_marks (str_of_int lh9) && (match hderef lh9 with Nil -> true | _ -> false) ->
-       (rev_vals (match rev_vals argvals with Cons (_, t9) -> t9 | Nil -> (Nil : Val list)), true)
+     | VHsh lh9 when arg_splat_has lh9 && map_has r2k_marks (str_of_int lh9) ->
+       (match hderef lh9 with
+        | Nil -> (let _ = arg_splat_forget () in
+                  (rev_vals (match rev_vals argvals with Cons (_, t9) -> t9 | Nil -> (Nil : Val list)), true))
+        | _ ->
+          (let (_, ps9, body9, ce9) = theblk in
+           let source9 = block_source_proc theblk in
+           // Method/Symbol procs forward to another callee, which must bind
+           // the original keyword flag itself. Do not consume its splat note.
+           let symbol9 = (match body9 with
+             | Cons (SExpr (EMethod (EVar recv9, _, Cons (ESplat (EVar args9), Cons (EBlockPass (EVar blk9), Nil)))), Nil) ->
+               str_eq recv9 "__bp" && str_eq args9 "__ba" && str_eq blk9 "__bb"
+             | _ -> false) in
+           if lv_has ce9 "__m_meth" || symbol9
+              || (source9 >= 0 && map_has proc_symsrc (str_of_int source9)) then (argvals, kwp9)
+           else
+           let keep9 = arg_splat_keep ()
+                       || (source9 >= 0 && map_has r2k_procs (r2k_root (str_of_int source9))) in
+           let params9 = strip_marker_params ps9 in
+           let kws9 = kw_params params9 in
+           let wants9 = (match kws9 with Nil -> not (str_eq (dsplat_name params9) "") | _ -> true) in
+           let _ = arg_splat_forget () in
+           if wants9 then (let _ = mark_kw lh9 in (argvals, kwp9))
+           else if keep9 then (argvals, kwp9)
+           else (r2k_replace_tail argvals (r2k_hash_copy world lh9 false), kwp9)))
      | _ -> (argvals, kwp9)) in
   // ...and the pending SOURCE PROC with it: it is only valid between
   // `m(&pr)`'s conversion and the method reading it. Once any block body
@@ -9862,6 +9878,7 @@ and run_block0x = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) -> 
                  (fn (m: str) -> let _ = note_extern_refused m in FRaise VNil) }
            else try_or_msg (fn (u: unit) -> run_block0_in world encl encl_call params00 argvals kwp9 body cenv benv)
                   (fn (m: str) -> let _ = note_extern_refused m in FRaise VNil)) in
+  let _ = arg_notes_reset () in
   let ok = (if map_has blk_ok "n" then map_get blk_ok "n" else 0) == 1 in
   let _ = map_set blk_ok "n" prev_ok in
   let _ = (if rfprev9 >= 0 then ref_install rfprev9 else ()) in
@@ -10332,7 +10349,10 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
                  || (if str_eq (block_param_name params0) "" then false else true)
                  || ps_any_default bdefaults params in
   let want_kw = (match kws with Nil -> (if str_eq dsname "" then false else true) | _ -> true) in
-  let (argvals0, kwhash) = if want_kw then peel_kw_hash argvals0 else (argvals0, (Nil : Val list)) in
+  let (argvals0, kwhash) = if want_kw then
+    (let peeled9 = peel_kw_hash argvals0 in
+     let _ = unmark_kwargs argvals0 in peeled9)
+    else (argvals0, (Nil : Val list)) in
   // ...and a BLOCK declares it the same way: `proc { |**nil| }` refuses too.
   let _ = (if str_eq dsname "nil" && (match kwhash with Nil -> false | _ -> true)
            then (let _ = raise_exc world "ArgumentError" "no keywords accepted" in ())
@@ -12046,7 +12066,7 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
           && core_metadata_allowed world captured
        then
          (let _ = (if map_has pending_home "v" then map_delete pending_home "v" else ()) in
-          let _ = (if map_has blk_kwp "e" then map_delete blk_kwp "e" else ()) in
+          let _ = (let _ = arg_empty_take () in ()) in
           let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
           let _ = (if map_len ub_amp > 0 then map_clear ub_amp else ()) in
           iter_each_result (range_metadata_each world captured local body inner 0 (n - 1)) recv)
@@ -20436,9 +20456,9 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        let _ = (match v9 with VHsh _ -> hng_put (hng_key v9) c | _ -> ()) in
        v9)
     // Hash.ruby2_keywords_hash?(h) / Hash.ruby2_keywords_hash(h): the "keywords
-    // hash" mark is the one a `key:` argument already carries here (a
-    // ruby2_keywords method keeps it instead of demoting it), so the predicate
-    // reads that table and the constructor copies the hash and marks the copy.
+    // hash" flag belongs to the Hash, independently of a call site's `key:`
+    // origin. The constructor marks only the copy's persistent flag; a later
+    // splat establishes keyword origin for that invocation.
     else if str_eq c "Hash" && (str_len name == 20 && str_eq name "ruby2_keywords_hash?") then
       (match args with
        | Cons (VHsh h9, _) -> VBool (map_has r2k_marks (str_of_int h9))
@@ -20475,8 +20495,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                                 then map_set tmp9 (newp9 ++ substring k9 (str_len oldp9) (str_len k9)) v9
                                 else ())) in
                       let _ = map_iter tmp9 (fn (k9: str) -> fn (v9: Val) -> iv_put iv9k k9 v9) in
-                      let _ = map_set r2k_marks (str_of_int d9) VNil in
-                      mark_kw d9)
+                      map_set r2k_marks (str_of_int d9) VNil)
                    | _ -> ()) in
           cp9)
        | Cons (other9, _) ->
@@ -25477,7 +25496,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     // table already holds it
     else if str_eq c "Marshal" && (str_len name == 5 && str_eq name "__r2k") then
       (match args with
-       | Cons (VHsh h9, _) -> (let _ = map_set r2k_marks (str_of_int h9) VNil in let _ = mark_kw h9 in VHsh h9)
+       | Cons (VHsh h9, _) -> (let _ = map_set r2k_marks (str_of_int h9) VNil in VHsh h9)
        | _ -> VNil)
     // Marshal.__rng_uninit(r): an allocated Range never given its bounds,
     // which range_dumper writes with excl nil and range_loader leaves alone
@@ -40123,24 +40142,64 @@ and mod_ruby2_keywords = fn env -> fn world -> fn (cls: str) -> fn (args: Val li
   VNil
 // the argument list with a ruby2_keywords-flagged LAST hash replaced by an
 // unflagged copy (see bind_params)
-// -- only a hash that arrived through a SPLAT (r2k_splat, noted by eval_args):
+// -- only a hash that arrived through a SPLAT (arg_notes, set by eval_args):
 // passed directly, `bar(h)`, it is an ordinary positional argument and is the
 // same object in the callee.
 // (the last argument is found by a loop and the list rebuilt only when it
 // changes: this rebuilt every list on the way down, one C frame per argument,
 // and test_method's `rest(*(1..10_000_000))` ran out of stack here)
-and r2k_unflag_tail = fn (args: Val list) ->
+// Native argument copies preserve Hash state without invoking user dup or
+// initialize_copy hooks. Frozen/singleton state is not copied by rb_hash_dup.
+and r2k_hash_copy = fn world -> fn (id9: int) -> fn (keep9: bool) ->
+  let copy9 = prim_method (VHsh id9) "dup" Nil in
+  let (_, supers9, _, ivars9) = world in
+  let oldkey9 = hng_key (VHsh id9) in
+  let newkey9 = hng_key copy9 in
+  let _ = (if map_has hng_store oldkey9 then
+             (let tag9 = map_get hng_store oldkey9 in
+              let base9 = if is_sng_cls tag9 then
+                            (if map_has supers9 tag9 then map_get supers9 tag9 else "Hash")
+                          else tag9 in
+              hng_put newkey9 base9)
+           else ()) in
+  let oldprefix9 = oldkey9 ++ "@" in
+  let newprefix9 = newkey9 ++ "@" in
+  let copied9 = map_new () in
+  let _ = (if vec_get hiv_made 0 == 0 then () else
+             map_iter ivars9 (fn (key9: str) -> fn (value9: Val) ->
+               if str_len key9 > str_len oldprefix9
+                  && str_eq (substring key9 0 (str_len oldprefix9)) oldprefix9
+               then map_set copied9 (newprefix9 ++ substring key9 (str_len oldprefix9) (str_len key9)) value9
+               else ())) in
+  let _ = map_iter copied9 (fn (key9: str) -> fn (value9: Val) -> iv_put ivars9 key9 value9) in
+  let _ = (if map_has kwarg_marks (str_of_int id9) then map_delete kwarg_marks (str_of_int id9) else ()) in
+  let _ = (if keep9 then (match copy9 with
+                          | VHsh new9 -> map_set r2k_marks (str_of_int new9) VNil
+                          | _ -> ()) else ()) in
+  copy9
+and r2k_replace_tail = fn (args9: Val list) -> fn (tail9: Val) ->
+  match rev_vals args9 with
+  | Cons (_, rest9) -> rev_vals (Cons (tail9, rest9))
+  | Nil -> args9
+and r2k_flag_tail = fn world -> fn (args9: Val list) ->
+  match vlast args9 with
+  | VHsh id9 when arg_splat_has id9 && map_has r2k_marks (str_of_int id9) ->
+    (match hderef id9 with
+     | Nil -> args9
+     | _ -> r2k_replace_tail args9 (r2k_hash_copy world id9 true))
+  | _ -> args9
+and r2k_unflag_tail = fn world -> fn (args: Val list) ->
   let rec last9 = fn (xs: Val list) -> (match xs with Nil -> VNil | Cons (h9, Nil) -> h9 | Cons (_, t9) -> last9 t9) in
   match last9 args with
   | VHsh id ->
-    (if map_has r2k_marks (str_of_int id) && map_has r2k_splat id
+    (if map_has r2k_marks (str_of_int id) && arg_splat_has id
      then
        (let rest9 = (match rev_vals args with Cons (_, t9) -> t9 | Nil -> (Nil : Val list)) in
         // ...and an EMPTY one is no keywords at all, which pass nothing
         // (`args.last.clear; opt(*args)` reaches opt's default)
         match hderef id with
         | Nil -> rev_vals rest9
-        | prs9 -> rev_vals (Cons (mkhash prs9, rest9)))
+        | _ -> rev_vals (Cons (r2k_hash_copy world id false, rest9)))
      else args)
   | _ -> args
 // A module nested in an anonymous one is named through it (`#<Module:0x..>::N`,
@@ -53890,6 +53949,9 @@ and method_body_flow_result = fn frame -> fn world -> fn blk -> fn (body: Stmt l
             (fn (m: str) -> let _ = note_extern_refused m in FRaise VNil) in
   // (a continuation re-entered into this frame: cont_rerun)
   let f = (if vec_get cont_on 0 == 1 then cont_rerun frame world blk body fidk f else f) in
+  // Native calls in an evaluator body can return without binding arguments.
+  // Its caller may resume on the VM's direct path, so no note escapes a body.
+  let _ = arg_notes_reset () in
   let _ = (if rxc9 then () else rx_call_leave rxf9 rx0 (map_has frame "__captured")) in
   // restore depth: runs whether the body returned normally, re-raised, or
   // emitted a flow signal (try_or has already caught any fail by this point).
@@ -60870,7 +60932,7 @@ and bind_params_m = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (para
   if (match params with Nil -> true | _ -> false)
      && (match defaults with Nil -> true | _ -> false)
      && (match args with Nil -> true | _ -> false)
-     && map_len r2k_splat == 0
+     && not (arg_splat_any ())
      && not (map_has pending_home "v" || map_has pending_srcproc "v") then ()
   else
   let pd9 = vec_get bind_mark_v 0 in
@@ -60900,25 +60962,29 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
   //   keywords arrives as a plain positional COPY: ruby converts the keywords
   //   back into a new, unflagged hash, and the flagged one stays as it was.
   //   It arrived as the flagged hash itself.
-  let args0 = (let ps8 = strip_block_params params0 in
+  let args0 = (if not (arg_splat_any ()) then args00 else
+               let ps8 = strip_block_params params0 in
                if (match kw_params ps8 with Nil -> str_eq (dsplat_name ps8) "" | _ -> false)
-                  && (if map_has frame "__r2k" || str_list_has ps8 "*__fwd" then false else true)
-               then r2k_unflag_tail args00 else args00) in
+               then (if map_has frame "__r2k" then
+                       (if arg_splat_any () then r2k_flag_tail world args00 else args00)
+                     else if str_list_has ps8 "*__fwd" then args00
+                     else r2k_unflag_tail world args00)
+               else args00) in
   // ...and into one that DOES take keywords, the flagged hash splatted at the
   // end is keywords, whatever has been done with it since it was flagged:
   // passing it as a positional argument in between (an assert_same) took
   // its keywords mark away, and `kwargs(*args)` then saw one positional Hash
-  let _ = (if map_len r2k_splat > 0 then
+  let _ = (if arg_splat_any () then
              (let ps8 = strip_block_params params0 in
               let wants8 = (match kw_params ps8 with Nil -> (if str_eq (dsplat_name ps8) "" then false else true) | _ -> true) in
               if wants8 then
                 (match vlast args0 with
-                 | VHsh id8 -> (if map_has r2k_marks (str_of_int id8) && map_has r2k_splat id8 then mark_kw id8 else ())
+                 | VHsh id8 -> (if map_has r2k_marks (str_of_int id8) && arg_splat_has id8 then mark_kw id8 else ())
                  | _ -> ())
               else ())
            else ()) in
   // (the splat notes are this call's; none may outlive it)
-  let _ = (if map_len r2k_splat > 0 then map_clear r2k_splat else ()) in
+  let _ = (if arg_splat_any () then arg_splat_forget () else ()) in
   // a block forwarded as `&proc` carries its home frame in pending_home;
   // record it on this frame so a `break` in that block unwinds to the home.
   let _ = if map_has pending_home "v" then
@@ -60980,7 +61046,9 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
   // the two apart needs the call site to say which arguments came from a splat;
   // the mark alone cannot, and using it for both made the direct call raise.
   // One bootstraptest pair pins the splat case.)
-  let (args, kwhash) = if want_kw then peel_kw_hash args0 else (args0, (Nil : Val list)) in
+  let (args, kwhash) = if want_kw then
+    (let peeled9 = peel_kw_hash args0 in let _ = unmark_kwargs args0 in peeled9)
+    else (args0, (Nil : Val list)) in
   // (`**nil` binds nothing: it is not a local named nil)
   let _ = if str_eq dsname "" || str_eq dsname "nil" then ()
           else map_set frame dsname (mkhash (kwhash_drop kwhash (kw_names_of kws))) in
@@ -69392,6 +69460,10 @@ and vm_scoped = fn env -> fn f ->
   let eid9 = (if fb9 > 0 then (match map_get ce "__eid" with VInt n9 -> n9 | _ -> 0 - 1) else 0 - 1) in
   let _ = (if eid9 >= 0 then map_set lv_fbscope eid9 fb9 else ()) in
   let (r, m) = region VSC { try_or_msg (fn (u: unit) -> (f ce, "")) (fn (m: str) -> (VNil, (if str_eq m "" then " " else m))) } in
+  // General VM calls prepare splats through evaluator expressions. Native
+  // callees need not bind parameters, so consume their notes at scope exit,
+  // including exceptions. Ordinary direct VM sends keep their existing path.
+  let _ = arg_notes_reset () in
   let _ = (if eid9 >= 0 then map_delete lv_fbscope eid9 else ()) in
   let _ = blk_env_put ce in
   if str_eq m "" then r else fail m
