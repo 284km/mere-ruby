@@ -95,9 +95,24 @@ def clean_environment():
     return env
 
 
-def environment(home, app, stdlib, user, sqlite_prefix, mere=False):
+def mere_settings(pairs):
+    """--mere-env NAME=VALUE: a setting of mere-ruby's own for its side only
+    (MERE_RUBY_VM=1 runs each file on the ISeq VM). clean_environment drops
+    every inherited MERE_RUBY_ name; these are the ones the run asks for,
+    and the result records them."""
+    out = {}
+    for pair in pairs or []:
+        name, sep, value = pair.partition('=')
+        if not sep or not name.startswith('MERE_RUBY_') or not value:
+            raise ValueError('--mere-env takes MERE_RUBY_<NAME>=<value>: ' + pair)
+        out[name] = value
+    return out
+
+
+def environment(home, app, stdlib, user, sqlite_prefix, mere=False, settings=None):
     env = clean_environment()
     if mere:
+        env.update(settings or {})
         # mere-ruby takes the standard library it is given on RUBYLIB, and a
         # `<x>/lib/ruby/4.0.0` there with gems/4.0.0/specifications/default
         # beside it names the tree whose DEFAULT gem specs RubyGems sees (its
@@ -145,6 +160,7 @@ def measure(args, data):
         raise ValueError('reference Ruby version differs from lock')
     if not args.binary.is_file() or args.binary.with_name('.build_mode').read_text().strip() != 'O2':
         raise ValueError('--binary must name a normal O2 build with its .build_mode')
+    settings = mere_settings(args.mere_env)
     sys.path.insert(0, str(REPO / 'unittest'))
     from ci import supervise
     args.output.mkdir(parents=True)
@@ -154,7 +170,8 @@ def measure(args, data):
                   archive_lock_sha256=sha(ROOT / 'archives.lock.json'), fixture_sha256=fixture_hash(),
                   runner_sha256=sha(ROOT / 'measure.py'), bootstrap_sha256=sha(ROOT / 'bootstrap.rb'),
                   wall_seconds=WALL, family_rss_kib=RSS_KB,
-                  sqlite_build='system-prefix' if args.sqlite_prefix else 'packaged', sides={})
+                  sqlite_build='system-prefix' if args.sqlite_prefix else 'packaged',
+                  mere_env=settings, sides={})
     for side, binary in [('reference', args.reference), ('mere', args.binary)]:
         work = args.output / side
         app, home = work / 'app', work / 'gems'
@@ -163,7 +180,8 @@ def measure(args, data):
             (app / directory).mkdir(exist_ok=True)
         shutil.copytree(args.archives, app / 'vendor/cache')
         home.mkdir()
-        env = environment(home, app, stdlib, work / 'bundler-user', args.sqlite_prefix, mere=side == 'mere')
+        env = environment(home, app, stdlib, work / 'bundler-user', args.sqlite_prefix, mere=side == 'mere',
+                          settings=settings)
         commands = [
             [binary, gem, 'install', app / 'vendor/cache/bundler-4.0.20.gem', '--local', '--no-document'],
             [binary, home / 'gems/bundler-4.0.20/exe/bundle', 'install', '--local', '--jobs', '1'],
@@ -218,6 +236,7 @@ def main():
     parser.add_argument('--binary', type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--sqlite-prefix', type=Path)
+    parser.add_argument('--mere-env', action='append', metavar='MERE_RUBY_NAME=VALUE')
     args = parser.parse_args()
     for key in ('archives', 'reference', 'binary', 'output', 'sqlite_prefix'):
         if getattr(args, key) is not None:
