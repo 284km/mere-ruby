@@ -29,3 +29,9 @@ head: full corpus in both hash-index modes, the full VM corpus, source gates,
 record hygiene and targeted upstream numeric files against the starting main.
 Exact counts are reported in the PR description. No Rails cold measurement or
 full upstream unit-test suite is run.
+
+The follow-up review identified a comparator answer that implements the sign
+protocol without being numeric. Rational's ordering now uses cmpint_obj for
+these answers, while nil still raises the comparison ArgumentError. Corpus
+984 adds negative, zero and positive result objects on operator/named sends
+and all four nil-result diagnostics.

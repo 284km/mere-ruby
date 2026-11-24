@@ -26,6 +26,30 @@ probes = {
     def target.coerce(other) = raise('the overridden comparator wins')
     p [r < target, r > target]
   RUBY
+  comparison_object: <<~'RUBY',
+    class ComparisonAnswer
+      def initialize(sign) = @sign = sign
+      def >(zero) = @sign > zero
+      def <(zero) = @sign < zero
+    end
+    class Rational
+      def <=>(other) = $comparison_answer
+    end
+    r = Rational(1, 2)
+    [-1, 0, 1].each do |sign|
+      $comparison_answer = ComparisonAnswer.new(sign)
+      p [r < 1, r <= 1, r > 1, r >= 1]
+      p [:<, :<=, :>, :>=].map { |operator| r.public_send(operator, 1) }
+    end
+    $comparison_answer = nil
+    [:<, :<=, :>, :>=].each do |operator|
+      begin
+        r.public_send(operator, 1)
+      rescue ArgumentError => error
+        p [operator, error.class, error.message]
+      end
+    end
+  RUBY
   coercion: <<~'RUBY',
     class Rational
       def *(other) = [:rational, self, other]
