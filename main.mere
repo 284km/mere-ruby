@@ -2771,6 +2771,32 @@ let gc_point = fn world ->
 // suspended fiber's frames count only once its Fiber object has been reached,
 // which may reach another's, to a fixed point. What is still unreached can
 // never be resumed, and is abandoned (fb_abandon). Nothing is swept here.
+// a scope vm_scoped or with_scratch_env made on a fiber, by its env id: the
+// fiber (fb_reclaim)
+let lv_fbscope = map_new ();
+// Accessors and comparison methods may raise before the expression returns.
+// Release the temporary on that path too, preserving the original failure.
+// The scratch env is a pooled CHILD of env (blk_env_get, as vm_scoped's
+// scope is), not a flattened copy of the chain: its callers bind a few
+// temporaries in it and read self and the rest through the chain. The copy
+// wrote every name of every frame up to the top level into a pooled map at
+// each `self.assertions += 1` -- with the frame's own entries a tenth of
+// test_ast's string-key work (note 552 §17.6).
+// (...and, as vm_scoped's, a scope made on a fiber is noted with it: a
+//  Fiber stopped in a program's `==` that an effectful right side's
+//  comparison runs here, then dropped, kept its stopped block through the
+//  scope's parent link)
+let with_scratch_env = fn env -> fn f ->
+  let d = blk_env_get env in
+  let fb9 = fb_cur () in
+  let eid9 = (if fb9 > 0 then (match map_get d "__eid" with VInt n9 -> n9 | _ -> 0 - 1) else 0 - 1) in
+  let _ = (if eid9 >= 0 then map_set lv_fbscope eid9 fb9 else ()) in
+  let done9 = fn (u: unit) ->
+    (let _ = (if eid9 >= 0 then map_delete lv_fbscope eid9 else ()) in scratch_env_done d) in
+  let out = try_or_msg (fn (u: unit) -> f d)
+                      (fn (msg: str) -> let _ = done9 () in fail msg) in
+  let _ = done9 () in
+  out;
 let fb_reclaim = fn env -> fn world ->
   region FBR {
     let (_, _, _, ivars) = world in
@@ -2794,6 +2820,15 @@ let fb_reclaim = fn env -> fn world ->
            match (if map_has e "__eid" then map_get e "__eid" else VNil) with
            | VInt n -> map_set fb_rc_eid n 1
            | _ -> ())) in
+       // ...and the scopes made on a candidate (vm_scoped notes them): one
+       // alive where the fiber stopped is on its stack as surely as a block
+       // (a note whose scope is gone from lv_up -- an abandoned fiber's -- is
+       //  dropped here)
+       let gone9 = vec_new () in
+       let _ = map_iter lv_fbscope (fn (k: int) -> fn (f: int) ->
+         if map_has lv_up k then (if map_has cand f then map_set fb_rc_eid k 1 else ())
+         else vec_push gone9 k) in
+       let _ = vec_iter gone9 (fn (k: int) -> map_delete lv_fbscope k) in
        let _ = map_set gc_state "fbx" 1 in
        let metadata = gc_metadata_new () in
     let _ = gc_mark_roots metadata env live in
@@ -4659,45 +4694,55 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   // write the attribute through the normal method dispatch.
   | EAttrOp (recv_e, name, op, rhs_e) ->
     let r = eval_e env world blk recv_e in
-    // (a pooled scratch env -- see lv_flat_pooled -- so the value returned is
-    //  the one computed here, never one read back out of it: Ruby's value of
-    //  `recv.attr op= v` is the value assigned, not what the setter returns)
-    with_scratch_env env (fn e2 ->
-    let _ = map_set e2 "__opr" r in
-    // self-receiver keeps ESelf so private accessors stay reachable (self is
-    // side-effect-free, so evaluating it twice is harmless).
+    // The reader and the writer each run in a pooled scope of their own
+    // (vm_scoped: the answer copied out of its region before the scope goes
+    // back), and the right side runs in env itself, with no scope alive:
+    // a Fiber or a Thread that stops inside the value (`o.y += y.yield(1)`)
+    // left the scope's lv_up link behind, and fb_reclaim's roots reached the
+    // stopped block through it, so the Fiber was never given back.
+    // Ruby's value of `recv.attr op= v` is the value assigned, not what the
+    // setter returns.
+    // (self-receiver keeps ESelf so private accessors stay reachable -- self
+    //  is side-effect-free, so evaluating it twice is harmless)
     let rx = (match recv_e with ESelf -> ESelf | _ -> EVar "__opr") in
-    let cur = eval_e e2 world blk (EMethod (rx, name, Nil)) in
-    let set9 = fn (v: Val) -> (let _ = map_set e2 "__opv" v in let _ = eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil))) in v) in
-    let res9 =
-      (if str_eq op "||" then
-         (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
-       else if str_eq op "&&" then
-         (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
-       else
-         (let v = eval_e env world blk rhs_e in
-          set9 (apply_bin_vals world blk op cur v))) in
-    res9)
+    let cur = vm_scoped env (fn e2 -> (let _ = map_set e2 "__opr" r in eval_e e2 world blk (EMethod (rx, name, Nil)))) in
+    let set9 = fn (v: Val) ->
+      (let _ = vm_scoped env (fn e2 ->
+                 (let _ = map_set e2 "__opr" r in
+                  let _ = map_set e2 "__opv" v in
+                  eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil))))) in
+       v) in
+    if str_eq op "||" then
+      (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
+    else if str_eq op "&&" then
+      (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
+    else
+      (let v = eval_e env world blk rhs_e in
+       set9 (apply_bin_vals world blk op cur v))
   // recv[idx..] op= rhs — evaluate recv and the indices once (bound to temps).
+  // (each call in a scope of its own, the value outside them, as EAttrOp)
   | EIdxOp (recv_e, idx_es, op, rhs_e) ->
     let r = eval_e env world blk recv_e in
     let idxs = eval_args env world blk idx_es in
-    // (a pooled scratch env, as for EAttrOp above)
-    with_scratch_env env (fn e2 ->
-    let _ = map_set e2 "__opr" r in
     let rx = (match recv_e with ESelf -> ESelf | _ -> EVar "__opr") in
-    let ies = idx_temp_exprs e2 idxs 0 in
-    let cur = eval_e e2 world blk (EMethod (rx, "[]", ies)) in
-    let set9 = fn (v: Val) -> (let _ = map_set e2 "__opv" v in let _ = eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil)))) in v) in
-    let res9 =
-      (if str_eq op "||" then
-         (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
-       else if str_eq op "&&" then
-         (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
-       else
-         (let v = eval_e env world blk rhs_e in
-          set9 (apply_bin_vals world blk op cur v))) in
-    res9)
+    let cur = vm_scoped env (fn e2 ->
+                (let _ = map_set e2 "__opr" r in
+                 let ies = idx_temp_exprs e2 idxs 0 in
+                 eval_e e2 world blk (EMethod (rx, "[]", ies)))) in
+    let set9 = fn (v: Val) ->
+      (let _ = vm_scoped env (fn e2 ->
+                 (let _ = map_set e2 "__opr" r in
+                  let ies = idx_temp_exprs e2 idxs 0 in
+                  let _ = map_set e2 "__opv" v in
+                  eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil)))))) in
+       v) in
+    if str_eq op "||" then
+      (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
+    else if str_eq op "&&" then
+      (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
+    else
+      (let v = eval_e env world blk rhs_e in
+       set9 (apply_bin_vals world blk op cur v))
   // `self.using M` is `using M`: a private method called through `self.`
   // (only the literal `self`: `recv = self; recv.using M` is refused, as
   // ruby refuses a private call with any other receiver)
@@ -68717,9 +68762,19 @@ and vm_ev = fn env -> fn world -> fn blk -> fn (e: Expr) -> eval_e env world blk
 //   depended on what the allocator had put there since: test_sprintf's
 //   test_rational failed after one set of tests and not another (found with
 //   tools/asan_build.sh), as run_block0's result is copied out of run_stmts'.
+// (...and a scope made on a fiber is noted with the fiber, lv_fbscope: when
+//  the fiber stops inside it -- `o.y += y.yield(1)`'s reader -- and is then
+//  dropped, fb_reclaim leaves the scope's parent link out of the roots, as
+//  it does for the blocks on that fiber's stack. The link otherwise reached
+//  the stopped block, and through its yielder the fiber, which was never
+//  given back.)
 and vm_scoped = fn env -> fn f ->
   let ce = blk_env_get env in
+  let fb9 = fb_cur () in
+  let eid9 = (if fb9 > 0 then (match map_get ce "__eid" with VInt n9 -> n9 | _ -> 0 - 1) else 0 - 1) in
+  let _ = (if eid9 >= 0 then map_set lv_fbscope eid9 fb9 else ()) in
   let (r, m) = region VSC { try_or_msg (fn (u: unit) -> (f ce, "")) (fn (m: str) -> (VNil, (if str_eq m "" then " " else m))) } in
+  let _ = (if eid9 >= 0 then map_delete lv_fbscope eid9 else ()) in
   let _ = blk_env_put ce in
   if str_eq m "" then r else fail m
 // the expression mk makes of these values, evaluated (vm_scoped)
