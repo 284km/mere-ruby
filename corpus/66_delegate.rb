@@ -32,14 +32,14 @@ p a.respond_to?(:known), a.respond_to?(:virtual), a.respond_to?(:missing)
 # respond_to? knows about the classes whose methods are primitives, so a
 # delegator can forward to one
 require "tempfile"
-f = File.open("/tmp/mrb_corpus_delegate.txt", "w")
+f = File.open("/tmp/mrb_corpus_delegate_#{$$}.txt", "w")
 p f.respond_to?(:write), f.respond_to?(:nope)
 d = SimpleDelegator.new(f)
 p d.respond_to?(:write)
 d.write("through the delegator")
 f.close
-p File.read("/tmp/mrb_corpus_delegate.txt")
-File.delete("/tmp/mrb_corpus_delegate.txt")
+p File.read("/tmp/mrb_corpus_delegate_#{$$}.txt")
+File.delete("/tmp/mrb_corpus_delegate_#{$$}.txt")
 
 t = Time.now
 p t.respond_to?(:year), t.respond_to?(:nope)
@@ -48,11 +48,11 @@ p t.respond_to?(:year), t.respond_to?(:nope)
 def forward(target, m, *a, &b)
   target.__send__(m, *a, &b)
 end
-g = File.open("/tmp/mrb_corpus_delegate2.txt", "w")
+g = File.open("/tmp/mrb_corpus_delegate2_#{$$}.txt", "w")
 forward(g, :write, "forwarded")
 g.close
-p File.read("/tmp/mrb_corpus_delegate2.txt")
-File.delete("/tmp/mrb_corpus_delegate2.txt")
+p File.read("/tmp/mrb_corpus_delegate2_#{$$}.txt")
+File.delete("/tmp/mrb_corpus_delegate2_#{$$}.txt")
 
 # Tempfile, which is a DelegateClass(File)
 tmp = Tempfile.new("demo")

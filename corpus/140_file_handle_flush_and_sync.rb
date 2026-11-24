@@ -3,7 +3,7 @@
 # implemented: respond_to?(:flush) said yes and calling it raised NoMethodError,
 # which is worse than either answer on its own, because a library that checks
 # first breaks anyway.
-path = "/tmp/mrb_corpus_io_handle.txt"
+path = "/tmp/mrb_corpus_io_handle_#{$$}.txt"
 
 # a `w` open truncates at once, a write is buffered, and flush puts it out
 f = File.open(path, "w")

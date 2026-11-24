@@ -53,13 +53,13 @@ p M.singleton_class.constants.include?(:X)
 
 # ...and the autoload twin: a bare `autoload` in a `class << self` body
 # registers under the singleton too.
-path = "/tmp/mere_ruby_corpus_205_al.rb"
+path = "/tmp/mere_ruby_corpus_205_al_#{$$}.rb"
 File.open(path, "w") { |f| f.write("module M; class << self; AL = 42; end; end\n") }
 $LOAD_PATH.unshift("/tmp")
 
 module M
   class << self
-    autoload :AL, "mere_ruby_corpus_205_al"
+    autoload :AL, "mere_ruby_corpus_205_al_#{$$}"
     def later = AL
   end
 end

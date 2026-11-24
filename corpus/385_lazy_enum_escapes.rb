@@ -11,13 +11,13 @@ p (1..3).lazy.with_index.inspect, (1..3).lazy.uniq.inspect, (1..3).lazy.compact.
 p (1..).lazy.find { |x| x > 3 }, (1..).lazy.map { _1 * 2 }.find { |x| x > 3 }
 p (1..9).lazy.map { _1 * 2 }.each_slice(2).to_a
 p (1..4).lazy.select(&:even?).sort_by { -_1 }
-File.write("/tmp/mere_corpus_385.txt", "a\nb\n\nclass X\n\nc\n\nd\n")
-File.open("/tmp/mere_corpus_385.txt") do |f|
+File.write("/tmp/mere_corpus_385_#{$$}.txt", "a\nb\n\nclass X\n\nc\n\nd\n")
+File.open("/tmp/mere_corpus_385_#{$$}.txt") do |f|
   ln = nil
   r = f.lazy.each("").map { |pa| pa[/\A\s*(.*)/, 1] }.find { |s| if s[/^class/]; ln = f.lineno; true; end }
   p r, ln
 end
-File.delete("/tmp/mere_corpus_385.txt")
+File.delete("/tmp/mere_corpus_385_#{$$}.txt")
 
 # to_enum on a lazy names the eager method; with_index hands two values
 a = [1, 2, 3].to_enum

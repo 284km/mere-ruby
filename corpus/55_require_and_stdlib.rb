@@ -66,11 +66,12 @@ p Outer.class, Outer::Inner.class, Outer::Klass.class
 p Outer.const_get(:Inner).class
 
 # const_get fires a pending autoload
-File.write("/tmp/mrb_corpus_autoloaded.rb", "module Holder; Loaded = :yes; end\n")
+File.write("/tmp/mrb_corpus_autoloaded_#{$$}.rb", "module Holder; Loaded = :yes; end\n")
 module Holder
 end
-Object.autoload :Holder2, "/tmp/mrb_corpus_autoloaded.rb"
+Object.autoload :Holder2, "/tmp/mrb_corpus_autoloaded_#{$$}.rb"
 p Object.const_get(:Holder).name
+File.delete("/tmp/mrb_corpus_autoloaded_#{$$}.rb")
 
 # a constant assigned inside a class/module body belongs to that namespace
 # even when the assignment is nested in a conditional or a block

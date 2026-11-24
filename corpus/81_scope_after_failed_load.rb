@@ -1,13 +1,13 @@
 # A raise inside a class or module body must still restore the lexical scope.
 # Without that, every top-level constant assigned afterwards is silently keyed
 # under that class -- `TOP = 1` becomes Cls::TOP, and `defined?(TOP)` is nil.
-File.write("/tmp/mrb_boom1.rb", "module Outer\n  class Inner\n    raise 'boom'\n  end\nend\n")
-File.write("/tmp/mrb_boom2.rb", "class Alone\n  raise ArgumentError, 'nope'\nend\n")
-File.write("/tmp/mrb_boom3.rb", "module Solo\n  raise 'in a module'\nend\n")
+File.write("/tmp/mrb_boom1_#{$$}.rb", "module Outer\n  class Inner\n    raise 'boom'\n  end\nend\n")
+File.write("/tmp/mrb_boom2_#{$$}.rb", "class Alone\n  raise ArgumentError, 'nope'\nend\n")
+File.write("/tmp/mrb_boom3_#{$$}.rb", "module Solo\n  raise 'in a module'\nend\n")
 $LOAD_PATH.unshift("/tmp")
 
 begin
-  require "mrb_boom1"
+  require "mrb_boom1_#{$$}"
 rescue RuntimeError => e
   puts e.message
 end
@@ -16,7 +16,7 @@ p defined?(TOP_ONE)
 p Object.const_defined?(:TOP_ONE)
 
 begin
-  require "mrb_boom2"
+  require "mrb_boom2_#{$$}"
 rescue ArgumentError => e
   puts e.message
 end
@@ -24,7 +24,7 @@ TOP_TWO = 2
 p Object.const_defined?(:TOP_TWO)
 
 begin
-  require "mrb_boom3"
+  require "mrb_boom3_#{$$}"
 rescue RuntimeError => e
   puts e.message
 end
@@ -50,4 +50,4 @@ end
 p Fine::INSIDE
 p Object.const_defined?(:INSIDE)
 
-%w[mrb_boom1 mrb_boom2 mrb_boom3].each { |f| File.delete("/tmp/#{f}.rb") }
+%w[mrb_boom1 mrb_boom2 mrb_boom3].each { |f| File.delete("/tmp/#{f}_#{$$}.rb") }

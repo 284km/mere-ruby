@@ -10,7 +10,7 @@ p ((-8) ** (1.0 / 3)).imaginary
 p [(-8) ** 2, (-8) ** 3, (-8.0) ** 3, (-8) ** -1, 4 ** 0.5, 8 ** (1.0 / 3), 2 ** 10]
 
 # File.binwrite writes the bytes it is given, zero bytes included.
-path = "/tmp/mere_ruby_corpus_105.bin"
+path = "/tmp/mere_ruby_corpus_105_#{$$}.bin"
 data = "a\0b\xff\0c"
 File.binwrite(path, data)
 back = File.binread(path)
