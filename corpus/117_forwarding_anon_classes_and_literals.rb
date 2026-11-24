@@ -138,9 +138,11 @@ $g_watched = 3
 p watched
 
 # Dir.open answers a Dir object
-Dir.mkdir("/tmp/mrb_corpus_dir") unless Dir.exist?("/tmp/mrb_corpus_dir")
-d = Dir.open("/tmp/mrb_corpus_dir")
-p [d.path, d.class, d.children.sort, d.close]
+dir117 = "/tmp/mrb_corpus_dir_#{$$}"
+Dir.mkdir(dir117)
+d = Dir.open(dir117)
+p [d.path == dir117, d.class, d.children.sort, d.close]
+Dir.rmdir(dir117)
 
 # `/#{x}/o` interpolates ONCE per source site
 def once_rx(expr)

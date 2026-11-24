@@ -1,5 +1,7 @@
 """Negative controls for coverage, classification, and locked source integrity."""
 import copy
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -77,6 +79,31 @@ class SuiteChecks(unittest.TestCase):
         broken = copy.deepcopy(result)
         broken['rows'][0]['classification'] = 'MEMORY'
         self.assertTrue(suites.baseline_errors(broken, result))
+
+    def test_reference_upgrade_preserves_locked_inputs_and_regression_checks(self):
+        old_lock = dict(schema=1, ruby_version='4.0.9',
+                        ruby_source_sha='3e93b23afcec3433f6aecc34b5d832799d754238',
+                        sources=[dict(name='fixture', sha='original')])
+        new_lock = dict(old_lock, ruby_version='4.0.10',
+                        ruby_source_sha='a704b7cd95a42cc0cf5f307137bf3aac0285b915')
+        digest = lambda lock: hashlib.sha256((json.dumps(lock, indent=2) + '\n').encode()).hexdigest()
+        row = dict(gem='fixture', file='test.rb', classification='MATCH',
+                   reference=self.side(), mere=self.side())
+        old = dict(rows=[row], lock_sha256=digest(old_lock), platform='Darwin', reference_version='4.0.9')
+        new = dict(old, lock_sha256=digest(new_lock), reference_version='4.0.10')
+        self.assertEqual(suites.baseline_errors(new, old, new_lock), [])
+        changed = copy.deepcopy(new_lock)
+        changed['sources'][0]['sha'] = 'different source'
+        with self.assertRaisesRegex(ValueError, 'lock differs'):
+            suites.baseline_errors(new, old, changed)
+        with self.assertRaisesRegex(ValueError, 'lock differs'):
+            suites.baseline_errors(new, old, dict(new_lock, ruby_source_sha='wrong revision'))
+        broken = copy.deepcopy(new)
+        broken['rows'][0]['classification'] = 'RED'
+        self.assertTrue(suites.baseline_errors(broken, old, new_lock))
+        self.assertTrue(suites.baseline_errors(dict(new, rows=[]), old, new_lock))
+        with self.assertRaisesRegex(ValueError, 'lock differs'):
+            suites.baseline_errors(dict(new, reference_version='4.0.11'), old, new_lock)
 
     def test_untracked_shadow_and_source_mutation_change_digest(self):
         with tempfile.TemporaryDirectory() as directory:

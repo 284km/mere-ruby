@@ -95,7 +95,7 @@ def main():
     args=parser.parse_args()
     assert bool(args.gem_home)==bool(args.rubygems),'provide both --gem-home and --rubygems'
     args.output.mkdir(parents=True,exist_ok=False)
-    assert subprocess.check_output([args.reference,'-e','print RUBY_VERSION'],text=True)=='4.0.9'
+    assert subprocess.check_output([args.reference,'-e','print RUBY_VERSION'],text=True)=='4.0.10'
     fixture=args.output/'server.pem'
     subprocess.run([args.reference,'-ropenssl','-e',PREPARE,str(fixture)],check=True,capture_output=True,timeout=30)
     if args.gem_home:

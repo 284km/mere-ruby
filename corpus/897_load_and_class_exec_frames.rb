@@ -5,7 +5,7 @@
 # rspec loads spec files and runs describe blocks with module_exec, so its
 # "Called from ...:in 'block (2 levels) in <top (required)>'" read 'block in
 # <main>'.
-dir = "/tmp/mere_ruby_corpus_897"
+dir = "/tmp/mere_ruby_corpus_897_#{$$}"
 Dir.mkdir(dir) unless File.directory?(dir)
 loaded = File.join(dir, "loaded.rb")
 File.write(loaded, <<~RUBY)

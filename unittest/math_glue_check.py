@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix='mere-math-glue-') as folder:
     source = folder / 'values.bin'
     source.write_bytes(b''.join(struct.pack('!d', value) for value in values))
     result = subprocess.run([args.reference, '-e',
-        "raise 'reference version drift' unless RUBY_VERSION=='4.0.9'; STDOUT.binmode; STDOUT.write(File.binread(ARGV.fetch(0)).unpack('G*').map { |x| Math.cbrt(x) }.pack('G*'))",
+        "raise 'reference version drift' unless RUBY_VERSION=='4.0.10'; STDOUT.binmode; STDOUT.write(File.binread(ARGV.fetch(0)).unpack('G*').map { |x| Math.cbrt(x) }.pack('G*'))",
         str(source)], capture_output=True, check=True, timeout=30)
     expected = result.stdout
     actual = b''.join(struct.pack('!d', lib.mr_math_cbrt(value)) for value in values)

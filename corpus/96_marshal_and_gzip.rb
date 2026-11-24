@@ -36,7 +36,7 @@ p gz.bytesize > 0
 p Zlib.gunzip(gz) == payload
 p gz.bytes.first(3)                                      # 1f 8b 08
 
-path = "/tmp/mere_ruby_corpus_96.gz"
+path = "/tmp/mere_ruby_corpus_96_#{$$}.gz"
 File.open(path, "wb") { |f| f.write(gz) }
 File.open(path, "rb") do |io|
   p Zlib::GzipReader.new(io).read == payload

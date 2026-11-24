@@ -3,22 +3,22 @@
 # the innermost scope (M::B::A) and the bare top-level name used to be tried,
 # so a library reading its own autoloaded sibling from inside one of its own
 # classes raised NameError. Bundler::Dsl reaches Bundler::SourceList this way.
-File.write("/tmp/mrb_al_thing.rb",
+File.write("/tmp/mrb_al_thing_#{$$}.rb",
            "module Outer\n  class Thing\n    def hi; 'hi from Thing'; end\n  end\nend\n")
-File.write("/tmp/mrb_al_source.rb",
+File.write("/tmp/mrb_al_source_#{$$}.rb",
            "module Outer\n  module Source\n" \
-           "    autoload :Rubygems, '/tmp/mrb_al_source_rubygems'\n  end\nend\n")
-File.write("/tmp/mrb_al_source_rubygems.rb",
+           "    autoload :Rubygems, '/tmp/mrb_al_source_rubygems_#{$$}'\n  end\nend\n")
+File.write("/tmp/mrb_al_source_rubygems_#{$$}.rb",
            "module Outer\n  module Source\n    class Rubygems\n" \
            "      def name; 'rubygems source'; end\n    end\n  end\nend\n")
-File.write("/tmp/mrb_al_holder.rb",
+File.write("/tmp/mrb_al_holder_#{$$}.rb",
            "module Outer\n  class Holder\n    def make; Thing.new.hi; end\n" \
            "    def deep; Source::Rubygems.new.name; end\n  end\nend\n")
 
 module Outer
-  autoload :Thing,  "/tmp/mrb_al_thing"
-  autoload :Source, "/tmp/mrb_al_source"
-  autoload :Holder, "/tmp/mrb_al_holder"
+  autoload :Thing,  "/tmp/mrb_al_thing_#{$$}"
+  autoload :Source, "/tmp/mrb_al_source_#{$$}"
+  autoload :Holder, "/tmp/mrb_al_holder_#{$$}"
 
   # written in the same file as the autoload declarations ...
   class Sibling
@@ -46,10 +46,10 @@ p Outer::Thing.new.hi
 
 # File.readable? / writable? / executable?, and a path that is not there is
 # none of the three.
-File.write("/tmp/mrb_al_plain.txt", "x")
-p [File.readable?("/tmp/mrb_al_plain.txt"),
-   File.writable?("/tmp/mrb_al_plain.txt"),
-   File.executable?("/tmp/mrb_al_plain.txt")]
+File.write("/tmp/mrb_al_plain_#{$$}.txt", "x")
+p [File.readable?("/tmp/mrb_al_plain_#{$$}.txt"),
+   File.writable?("/tmp/mrb_al_plain_#{$$}.txt"),
+   File.executable?("/tmp/mrb_al_plain_#{$$}.txt")]
 p [File.readable?("/tmp/mrb_al_nope"),
    File.writable?("/tmp/mrb_al_nope"),
    File.executable?("/tmp/mrb_al_nope")]
@@ -57,4 +57,4 @@ p [File.readable?("/bin/sh"), File.executable?("/bin/sh")]
 p File.writable?("/tmp")
 
 %w[mrb_al_thing.rb mrb_al_source.rb mrb_al_source_rubygems.rb mrb_al_holder.rb
-   mrb_al_plain.txt].each { |f| File.delete("/tmp/#{f}") }
+   mrb_al_plain.txt].each { |f| File.delete("/tmp/#{f.sub(".", "_#{$$}.")}") }

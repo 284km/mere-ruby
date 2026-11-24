@@ -552,6 +552,10 @@ let arr_store =
 // `arr_new` makes -- once per Array the program builds.
 //   0 n   1 flushes   2 hfast   3 hslow
 let arr_ctr = map_new ();
+// Cached parameter-name arrays belong to the interpreter, not Ruby's Array
+// heap. The existing method/frame roots retain their contents; these integer
+// flags only classify them for ObjectSpace and are pruned after Array sweep.
+let arr_metadata = map_new ();
 // count_objects' own Arrays and Hashes, as id ranges lo -> hi (see the
 // ObjectSpace.__store_counts arm), and where the call in progress began
 // the scheduler threads that run a non-main Ractor's body (thread id -> 1):
@@ -581,6 +585,12 @@ let arr_new = fn (xs: Val list) ->
   let _ = map_set arr_store id xs in
   let _ = (if vec_get atr_on 0 > 0 then atr_note ("arr:" ++ str_of_int id) else ()) in
   VArr id;
+// Only the method-metadata cache calls this, once on a cache miss. Ordinary
+// method/block calls keep their existing cached handle and do no extra work.
+let arr_new_metadata = fn (xs: Val list) ->
+  match arr_new xs with
+  | VArr id -> (let _ = map_set arr_metadata id 1 in VArr id)
+  | other -> other;
 // ⚠ APPENDS GO INTO A Vec, NOT A LIST, AND THAT IS THE WHOLE POINT.
 // An Array here is a `Val list`, and `push` was `arr_set id (list_append
 // (deref id) args)` -- a copy of the entire array per element, so building one
@@ -2295,6 +2305,11 @@ let gc_cenv0 = map_new ();
 // other in-flight value is either in `env` or below a safepoint that refuses
 // to collect; this one is above them all.
 let gc_hold = map_new ();
+// iter_held's values (main.mere), by a number drawn for each walk: a root
+// like gc_hold, with an Int key, so a walk builds no key string
+let gc_iter_hold = map_new ();
+let gc_iter_hold_n = vec_new ();
+let _ = vec_push gc_iter_hold_n 0;
 let bind_store = map_new ();
 // ---- lexical scope chain ------------------------------------------------
 // A locals env is a Map, but Ruby blocks nest scopes: a block's params and
@@ -3151,6 +3166,17 @@ let method_text = fn (value: Val) -> method_text_or "" value;
 // Method and UnboundMethod payloads are native object metadata. Each row
 // is reached only through its live Method and swept with that object's id.
 let method_cores = (let t = map_new () in let _ = map_compact t in t);
+// RubyVM::AbstractSyntaxTree::Node's values, by the node's object id
+// (m_ast_obj.mere's ast_obj_build writes them; the readers are builtins,
+// ast_node_get). ruby's Node is a C object with no instance variables, and
+// as ivars they were most of what a collection marked in test_ast: 235,000
+// of 274,000 in one file (note 552 §17.8).
+//   ast_node_pos   (type, first_lineno, first_column, last_lineno, last_column, node_id)
+//   ast_node_vals  (children, the other locations or nil, [script_lines, all_tokens])
+// gc_mark_val follows ast_node_vals from a live node, and gc_collect drops
+// the rows of dead ones, as it does method_cores'.
+let ast_node_pos = (let t = map_new () in let _ = map_compact t in t);
+let ast_node_vals = (let t = map_new () in let _ = map_compact t in t);
 let store_bound_method_core = fn (id: int) -> fn (name: Val) -> fn (owner: Val) -> fn (receiver: Val) ->
   map_set method_cores id (name, owner, receiver, VNil);
 let method_core_field = fn (id: int) -> fn (slot: int) ->
@@ -4049,6 +4075,12 @@ let rx_prog_names = map_new ();
 // the cache key of the pattern currently being matched, so the MatchData it
 // publishes can name its groups.
 let rx_cur = map_new ();
+// The line of the literal the last check of queued regexp literals refused
+// (rx_check_go), 0 when it refused none: the line a required file's, or an
+// eval's, SyntaxError says for a literal only the regexp engine refuses. A
+// Vec and not an entry of rx_cur: it is written at every such refusal, and
+// an entry written in a loop of evals grows the map's arena.
+let rx_bad_line = (let v = vec_new () in let _ = vec_push v 0 in v);
 // the String handle for a pattern's key, made once per key rather than per
 // search: rxv_search wrote a new one into rx_cur "k" every time it ran, so a
 // gsub made a String per match (note 308). Kept as an int (a handle no table
@@ -4660,8 +4692,9 @@ let tmp_ctr = map_new ();
 // classes answer with their builtins, whatever the program redefined -- the
 // reference's marshal.c is C, which a redefined String#+ never reaches.
 let core_only = (let v = vec_new () in let _ = vec_push v 0 in v);
-// 1 while a method_missing called for a receiverless call runs: the
-// NoMethodError its `super` raises is a private call (#private_call?)
+// Most recent missing-call reason: 0 explicit, 1 receiverless, 2 bare name,
+// 3 private visibility refusal, 4 protected refusal. Native failures replace
+// the reason too, so a rescued nested call determines a later native super.
 let mm_priv = (let v = vec_new () in let _ = vec_push v 0 in v);
 // 1 while a bare name (a vcall: it could have been a local) goes to its
 // receiver's method_missing, until the door into it takes the mark
@@ -5164,7 +5197,7 @@ let ruby_platform = (let os = sys_os () in
                      let a = sys_arch () in
                      (if str_eq os "linux" && str_eq a "arm64" then "aarch64" else a)
                      ++ "-" ++ (if str_eq os "darwin" then "darwin25" else os));
-let ruby_desc = "ruby 4.0.9 (2026-10-23 revision 3e93b23afc) +PRISM [" ++ ruby_platform ++ "]";
+let ruby_desc = "ruby 4.0.10 (2026-11-19 revision a704b7cd95) +PRISM [" ++ ruby_platform ++ "]";
 // ONE place for the usage line: -h prints it and so does a bare invocation.
 // The invalid-option message points at -h, so -h has to exist -- a diagnostic
 // that names a flag the binary does not have is worse than no diagnostic.
@@ -5461,6 +5494,9 @@ let chr1_s = chr 1;
 let box_st = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v 1 in let _ = vec_push v 1 in
               let _ = vec_push v 4 in let _ = vec_push v 0 in v);
 let bx_int = map_new ();
+// (the autoload table is here, before the box journal, which keeps it per
+//  box as it keeps the constants: see bx_note_al and autoload_tbl_put below)
+let autoloads = map_new ();
 let bx_str = map_new ();
 let bx_val = map_new ();
 let bx_meth = map_new ();
@@ -5527,6 +5563,16 @@ and bx_note_const = fn (k: str) ->
     (let i = str_last_index_of k "::" in
      if i < 0 || bx_master_cls (substring k 0 i) then bx_note consts bx_val "c" k else ())
   else ()
+// ...and an autoload, which is a constant not yet loaded: a box that loads
+// it (the entry goes) or registers one leaves the other boxes' as they were.
+// The main box loading Pathname's core took the root box's autoload with it,
+// and `require "pathname"` in the root box -- whose file names Pathname to
+// load the core -- was "uninitialized constant Pathname".
+and bx_note_al = fn (k: str) ->
+  if bx_writing () then
+    (let i = str_last_index_of k "::" in
+     if i < 0 || bx_master_cls (substring k 0 i) then bx_note autoloads bx_val "a" k else ())
+  else ()
 and bx_note_gvar = fn (slot: str) -> if bx_writing () then bx_note globals bx_val "g" slot else ()
 and bx_note_meth = fn (k: str) ->
   if bx_writing () && bx_master_cls (bx_key_cls k) then bx_note meths_g bx_meth "m" k else ()
@@ -5541,6 +5587,7 @@ and bx_switch = fn (b: int) ->
   (let _ = lck_forget () in
    let _ = (if l == 1 then () else
              (let _ = bx_out consts bx_val "c" l in
+              let _ = bx_out autoloads bx_val "a" l in
               let _ = bx_out globals bx_val "g" l in
               let _ = bx_out meths_g bx_meth "m" l in
               let _ = bx_out includes bx_str "i" l in
@@ -5548,6 +5595,7 @@ and bx_switch = fn (b: int) ->
               bx_meth_memo l)) in
    let _ = (if b == 1 then () else
              (let _ = bx_in consts bx_val "c" b in
+              let _ = bx_in autoloads bx_val "a" b in
               let _ = bx_in globals bx_val "g" b in
               let _ = bx_in meths_g bx_meth "m" b in
               let _ = bx_in includes bx_str "i" b in
@@ -5748,7 +5796,38 @@ let capi_note_redef = fn tbl -> fn (k: str) ->
     (let _ = (if map_has tbl k then map_set capi_boot_defs k (map_get tbl k) else ()) in
      map_set capi_redefs k 1)
   else ();
+// Node's readers that are still the prelude's own (`def type =
+// self.__nd_type`): name -> the method key, and the names found not to be.
+// Asked of the method table at a reader's first call (ast_reader_fast in
+// main.mere: the prelude's rows are not written through set_meth), and
+// forgotten when a def, an alias or a removal writes the row (set_meth,
+// del_meth). While a reader is, a call on a plain Node is answered from
+// ast_node_pos / ast_node_vals with no frame; a private, a prepend, a
+// singleton class and a refinement are asked where it is used.
+let ast_reader_ok = map_new ();
+let ast_reader_no = map_new ();
+let ast_reader_canon = fn (b: str) -> fn (v: Meth) ->
+  match v with
+  | Meth (Nil, Nil, body) ->
+    (let rec one = fn (ss: Stmt list) -> fn (seen: bool) ->
+       match ss with
+       | Nil -> seen
+       | Cons (SLine _, t) -> one t seen
+       | Cons (SLineQ _, t) -> one t seen
+       | Cons (SFile _, t) -> one t seen
+       | Cons (SExpr (EMethod (ESelf, n, Nil)), t) -> (if seen then false else (if str_eq n ("__nd_" ++ b) then one t true else false))
+       | Cons (SReturn (EMethod (ESelf, n, Nil)), t) -> (if seen then false else (if str_eq n ("__nd_" ++ b) then one t true else false))
+       | _ -> false in
+     one body false)
+  | _ -> false;
+let ast_reader_forget = fn (k: str) ->
+  if str_len k > 33 && str_starts_with k "RubyVM::AbstractSyntaxTree::Node#" then
+    (let b = substring k 33 (str_len k) in
+     let _ = (if map_has ast_reader_ok b then map_delete ast_reader_ok b else ()) in
+     if map_has ast_reader_no b then map_delete ast_reader_no b else ())
+  else ();
 let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
+  let _ = ast_reader_forget k in
   let _ = class_sng_method_note k in
   let _ = capi_note_redef tbl k in
   // (a new definition is a method again, whatever rb_f_notimplement made of
@@ -5801,6 +5880,7 @@ let set_fresh_meth = fn tbl -> fn (owner: str) -> fn (key: str) -> fn (value: Me
            else map_set sym_all b VNil) in
   let _ = map_delete meth_params key in store_meth tbl key value;
 let del_meth = fn tbl -> fn (k: str) ->
+  let _ = ast_reader_forget k in
   let _ = capi_note_redef tbl k in
   let _ = bx_note_meth k in
   let _ = vec_set method_store_dirty 0 1 in
@@ -5897,9 +5977,11 @@ let num_names_memo = map_new ();  // numeric kind -> its method-name set
 // constant is in the table, `constants` lists it, const_source_location
 // answers the autoload's line -- and goes when the require returns; a require
 // that RAISES leaves it registered, so the next read tries again.
-let autoloads = map_new ();
 let autoload_tbl_put = fn (k: str) -> fn (v: Val) ->
+  let _ = bx_note_al k in
   let _ = const_owner_note k in map_set autoloads k v;
+// (...and an entry going: its file loaded, or the constant defined)
+let autoloads_del = fn (k: str) -> let _ = bx_note_al k in map_delete autoloads k;
 // ...and while its file runs, the thread running it (its id): to THAT thread
 // the constant is undefined (defined? nil, const_defined? false, autoload?
 // nil) -- which is also what keeps a file that reads its own constant from
@@ -6200,7 +6282,7 @@ let gvar_wname = (let t = map_new () in let _ = map_compact t in t);
 let gc_churn_bytes = fn (u: unit) ->
   capi_bytes () + vec_bytes metadata_methods_cache + vec_bytes method_store_floor + vec_bytes method_store_dirty + vec_bytes include_defaults_cache + vec_bytes core_new_cache + vec_bytes private_new_seen + vec_bytes protected_new_seen + map_bytes gvar_wname +
   map_bytes meth_name_ids + map_bytes meth_names + vec_bytes meth_name_next +
-  map_bytes anonymous_classes + map_bytes cls_copy_of + map_bytes method_cores + vec_bytes refinement_method_bits + vec_bytes reflection_protocol_changed +
+  map_bytes anonymous_classes + map_bytes cls_copy_of + map_bytes method_cores + map_bytes ast_node_pos + map_bytes ast_node_vals + vec_bytes refinement_method_bits + vec_bytes reflection_protocol_changed +
   map_bytes bi_class_name +
   map_bytes bi_owner_memo + map_bytes meth_cfn + map_bytes builtin_alias + map_bytes ie_def_meths + map_bytes hng_store + map_bytes hng_arr_ids + map_bytes hng_prim_ids + map_bytes hng_sng_base
   +   map_bytes meth_owner_seen +
@@ -6347,7 +6429,9 @@ let bi_reg_set = fn (n: str) -> fn (r: Val) -> fn (d: int) ->
                     | VExc (c, _) -> (let _ = bi_class_set c in (10, 0, 0 - 1))
                     | VBig _ -> (11, 0, 0 - 1) | VRat (_, _) -> (12, 0, 0 - 1) | VFlt _ -> (13, 0, 0 - 1)
                     | VCpx (_, _) -> (14, 0, 0 - 1) | VRange (_, _, _) -> (15, 0, 0 - 1) | VProc h -> (16, h, 0 - 1)
-                    | VBind h -> (17, h, 0 - 1) | VRegex (_, _, _) -> (18, 0, 0 - 1) | VMain -> (19, 0, 0 - 1)) in
+                    | VBind h -> (17, h, 0 - 1) | VRegex (_, _, _) -> (18, 0, 0 - 1) | VMain -> (19, 0, 0 - 1)
+                    // (the loader's list, VIcl, is no value: it is never here)
+                    | VIcl (_, _) -> fail "a compiler's list where a value is read") in
   let _ = map_set bi_reg_r 0 k in
   let _ = map_set bi_reg_r 1 p in
   let _ = (if ni >= 0 then map_set bi_reg_r 2 ni else (if map_has bi_reg_r 2 then map_delete bi_reg_r 2 else ())) in
@@ -6368,6 +6452,9 @@ let bi_rescued = fn (u: unit) ->
 // stale site for a later one. Without it that exception had no backtrace at
 // all: `begin; 1.nope; rescue => e; e.backtrace; end` was nil.
 let prim_nm_set = fn (v: Val) ->
+  // A native missing call replaces an outer method_missing's bare-call
+  // reason, just as dispatch to another Ruby method_missing does.
+  let _ = vec_set mm_priv 0 0 in
   // (a failure that cannot say what it was called on leaves no receiver of
   //  an earlier one behind for pending_exc to pair with this name)
   let _ = (if map_has prim_missing "rvv" then map_delete prim_missing "rvv" else ()) in

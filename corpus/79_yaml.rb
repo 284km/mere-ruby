@@ -29,7 +29,7 @@ p YAML.safe_load("x: 1")
 p YAML.load("k: v", symbolize_names: true)
 
 # a round trip through a real file
-path = "/tmp/mrb_corpus.yml"
+path = "/tmp/mrb_corpus_#{$$}.yml"
 File.write(path, "---\nname: mere\nlist:\n  - 1\n  - 2\nnested:\n  a: true\n")
 p YAML.load_file(path)
 File.delete(path)

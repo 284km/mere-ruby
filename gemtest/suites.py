@@ -233,9 +233,22 @@ def compare(rows, baseline, same_platform=True):
     return errors
 
 
-def baseline_errors(result, baseline):
+def baseline_errors(result, baseline, lock=None):
     if baseline['lock_sha256'] != result['lock_sha256']:
-        raise ValueError('baseline lock differs')
+        # A reference upgrade keeps every gem source, package digest, test file
+        # and command unchanged. Reconstruct the old lock and verify its exact
+        # digest before comparing the historical results; never relabel them.
+        previous = dict(lock or {})
+        previous.update(ruby_version='4.0.9',
+                        ruby_source_sha='3e93b23afcec3433f6aecc34b5d832799d754238')
+        previous_digest = hashlib.sha256((json.dumps(previous, indent=2) + '\n').encode()).hexdigest()
+        if (previous.get('schema') != 1
+                or not lock or lock.get('ruby_version') != '4.0.10'
+                or lock.get('ruby_source_sha') != 'a704b7cd95a42cc0cf5f307137bf3aac0285b915'
+                or result.get('reference_version') != '4.0.10'
+                or baseline.get('reference_version') != '4.0.9'
+                or previous_digest != baseline['lock_sha256']):
+            raise ValueError('baseline lock differs')
     if baseline['platform'] != result['platform']:
         raise ValueError('baseline platform differs; select the matching platform snapshot')
     return compare(result['rows'], baseline)
@@ -287,7 +300,7 @@ def measure(args, lock):
         raise ValueError('binary or lock changed during measurement; discard this run')
     if args.baseline:
         baseline = json.loads(args.baseline.read_text())
-        errors = baseline_errors(result, baseline)
+        errors = baseline_errors(result, baseline, lock)
         result['regressions'] = errors
         save(args.output / 'results.json', result)
         if errors:

@@ -6,7 +6,7 @@ macOS/Linux CI live in `suites.lock.json`, `suites_latest.json` and the
 `Gem suites` workflow.
 
 `measure.py` runs the existing 29-gem list in separate processes under a pinned
-Ruby 4.0.9 reference and mere-ruby, with and without an external stdlib. Both
+Ruby 4.0.10 reference and mere-ruby, with and without an external stdlib. Both
 interpreters use the same isolated gem home and RubyGems source checkout.
 Each process family is limited to 120 seconds and 2 GiB; stdout, stderr, exit,
 resource limits and reference availability are recorded. Use a fresh output
@@ -14,14 +14,14 @@ directory for every run.
 
 ```sh
 python3 gemtest/measure.py --binary ./mere-ruby \
-  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --reference /path/to/ruby-4.0.10/bin/ruby \
   --gem-home /path/to/snapshot \
-  --rubygems /path/to/ruby-source-3e93b23 \
+  --rubygems /path/to/ruby-source-a704b7c \
   --snapshot-lock gemtest/snapshot.lock.json \
   --output /tmp/gem-measure-new
 ```
 
-The Ruby source checkout must be `3e93b23afcec3433f6aecc34b5d832799d754238`.
+The Ruby source checkout must be `a704b7cd95a42cc0cf5f307137bf3aac0285b915`.
 The external stdlib comes from the reference installation's `rubylibdir` and
 installed bundled/default gem `lib` directories. Installed gem libraries are
 available in both native modes; “bundled” means no additional stdlib `-I`,
@@ -32,10 +32,14 @@ The source environment is independent of the user's Ruby installation. Restore
 it from the committed lock into a fresh directory with the pinned reference:
 
 ```sh
-/path/to/ruby-4.0.9/bin/ruby gemtest/restore_snapshot.rb \
+/path/to/ruby-4.0.10/bin/ruby gemtest/restore_snapshot.rb \
   --lock gemtest/snapshot.lock.json --output /path/to/snapshot \
   --cache /path/to/package-cache
 ```
+
+The package snapshot retains its original Ruby 4.0.9 provenance; replay runs
+under the current 4.0.10 reference without replacing package sources. Saved
+`latest.json` and `https_latest.json` results retain their measured version.
 
 The lock records 278 package archives, versions, runtime dependencies and source
 tree SHA256 digests. Public archives come from RubyGems; a replay refuses changed
@@ -66,9 +70,9 @@ distinct results.
 
 ```sh
 python3 gemtest/https_measure.py --binary ./mere-ruby \
-  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --reference /path/to/ruby-4.0.10/bin/ruby \
   --gem-home /path/to/snapshot \
-  --rubygems /path/to/ruby-source-3e93b23 \
+  --rubygems /path/to/ruby-source-a704b7c \
   --output /tmp/https-measure-new
 ```
 

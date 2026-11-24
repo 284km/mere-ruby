@@ -4,7 +4,7 @@
 #
 #   . ./tools/ref_ruby.sh && ruby tools/gen_json_lib.rb > m_json_lib.mere
 #
-# The files are json 2.18.0's lib/ (json.rb, json/common.rb, json/ext.rb,
+# The files are json 2.18.3's lib/ (json.rb, json/common.rb, json/ext.rb,
 # json/ext/generator/state.rb, json/generic_object.rb, json/version.rb and
 # json/add/*.rb), byte for byte: comments included, so a line number in a
 # backtrace names the line CRuby's copy has there. They are distributed under
