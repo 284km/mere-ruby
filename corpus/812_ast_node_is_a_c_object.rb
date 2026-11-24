@@ -41,6 +41,13 @@ class RubyVM::AbstractSyntaxTree::Node
   def inner812 = (__locations rescue :none)
 end
 p n.span812, n.children[2].span812, n.inner812
+# (...nor with self a Node: in a method a program adds, in instance_exec)
+class RubyVM::AbstractSyntaxTree::Node
+  def self812 = (self.__nd_type rescue $!.class)
+end
+p n.self812, (n.instance_exec { self.__nd_type } rescue $!.class), (n.instance_eval { __nd_type } rescue $!.class)
+# (Kernel's own dup and clone, bound to a Node, refuse it too)
+[:dup, :clone].each { |m| p((Kernel.instance_method(m).bind_call(n) rescue $!.class)) }
 
 def walk(x) = x.is_a?(RubyVM::AbstractSyntaxTree::Node) ? [x.type, *x.children.map { walk(_1) }] : x
 before = walk(n)
