@@ -22,6 +22,9 @@ files = {
   "second" => with.(3, 2 => "X = /(unclosed/\n"),
   "last" => with.(12, 12 => "v12 = /(un/\n"),
   "last_no_newline" => with.(12, 12 => "v12 = /(un/"),
+  "no_newline_after" => "1\n/(x/\n3\n4",
+  "no_newline_one_after" => "1\n/(x/\n3",
+  "no_newline_three_after" => "1\n/(x/\n3\n4\n5",
   "wide_numbers" => with.(120, 105 => "v105 = /(un/\n"),
   # ...two errors, and what is shown between them
   "adjacent" => with.(12, 3 => "v3 = /(a/\n", 4 => "v4 = /(b/\n"),
