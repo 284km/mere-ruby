@@ -1047,6 +1047,12 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                       let _ = gc_mark_val live name in
                       let _ = gc_mark_val live owner in
                       let _ = gc_mark_val live receiver in gc_mark_val live extra) else ()) in
+                   // (an AST node's children, its other locations and its tree's
+                   //  lines and tokens: ast_node_vals)
+                   let _ = (if map_len ast_node_vals > 0 && map_has ast_node_vals id then
+                     (let (kids9, xl9, tree9) = map_get ast_node_vals id in
+                      let _ = gc_mark_val live kids9 in
+                      let _ = gc_mark_val live xl9 in gc_mark_val live tree9) else ()) in
                    vec_push gc_obj_pend id) else ())
   | VStr id -> let k = id * 8 + 1 in
                (if gc_live_mark live k then gc_handle_class "str:" id else ())
@@ -2398,6 +2404,9 @@ let gc_collect = fn env -> fn world ->
     let _ = gc_drop_i ocls dOC in
     let _ = gc_drop_i method_cores dOC in
     let _ = (if nc then () else map_compact method_cores) in
+    let _ = gc_drop_i ast_node_pos dOC in
+    let _ = gc_drop_i ast_node_vals dOC in
+    let _ = (if nc then () else (let _ = map_compact ast_node_pos in map_compact ast_node_vals)) in
     let _ = gc_purge_sng world dOC in
     let _ = (if nc then () else map_compact ocls) in
     // ⚠ md_whole had NO sweep. It is one entry per successful match -- the
@@ -3659,7 +3668,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                     && (if map_has private_consts k9 then false else true)
                                  then mkstr "constant" else VNil)
                  | _ -> VNil)
-              else if (if str_contains pfx9 "::" then false else true) then
+              // (...asked only when the bare head is there, by defined? of it:
+              //  evaluating a head that is not raised a NameError with a
+              //  backtrace inside defined? -- Ractor.make_shareable's
+              //  `defined?(Psych::Parser)` without Psych, once per constant
+              //  of a `shareable_constant_value: literal` body, made
+              //  test_gc's test_ast_node_buffer 4-5x slower)
+              else if (if str_contains pfx9 "::" then false else true)
+                      && (match eval_e env world blk (EDefined (EConst pfx9)) with VNil -> false | _ -> true) then
                 (match defined_eval_recv env world blk (EConst pfx9) with
                  | VClass c9 -> (let k9 = c9 ++ "::" ++ const_of_scoped name in
                                  if (map_has consts k9 || autoload_pending world k9
@@ -5690,8 +5706,8 @@ and flt_fast_op = fn world -> fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
        else (false, VNil))
     else (false, VNil)
   | (VFlt x, VInt y) -> if arith && flt_ops_plain world then (true, fop x (float_of_int y)) else (false, VNil)
-  // (not Integer#/: int_ops_plain does not ask after it)
-  | (VInt x, VFlt y) -> if arith && c != 47 && int_ops_plain world && flt_ops_plain world then (true, fop (float_of_int x) y) else (false, VNil)
+  // (Integer#/ too: int_ops_plain asks after it)
+  | (VInt x, VFlt y) -> if arith && int_ops_plain world && flt_ops_plain world then (true, fop (float_of_int x) y) else (false, VNil)
   | _ -> (false, VNil)
 // the answer for two machine integers, or (false, _) for any other operator
 // (the overflow into a Bignum is add_int_ov's, as the general path's is)
@@ -6208,6 +6224,14 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        if (match va0 with VCpx (_, _) -> true | _ -> false) then
          raise_exc world "NoMethodError"
            ("undefined method '" ++ op ++ "' for an instance of Complex")
+       // (...and an Integer or a Float against a Complex coerces to a pair of
+       //  Complexes and asks the first for the operator: the same
+       //  NoMethodError. A Rational's is Comparable's, the failed
+       //  comparison below.)
+       else if (match va0 with VInt _ -> true | VBig _ -> true | VFlt _ -> true | _ -> false)
+               && (match vb with VCpx (_, _) -> true | _ -> false) then
+         raise_exc world "NoMethodError"
+           ("undefined method '" ++ op ++ "' for an instance of Complex")
        // ...and a NUMBER against an object that coerces asks it first, exactly
        // as `<=>` does. Only `<=>` had this, so `1 > obj` refused with
        // "comparison of Integer with Object failed" for an object whose whole
@@ -6238,7 +6262,13 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
          raise_exc_iv world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ for_recv_cls world (dispatch_cls_of world va0))
            (Cons (("__name", VSym op), Cons (("__args", arr_new (Cons (vb, Nil))), Cons (("__recv", va0), Nil))))
        else if cmp_incompatible va0 vb then
-         raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with " ++ (if is_num vb then to_s vb else cmperr_cls env world vb) ++ " failed")
+         raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with "
+                                          // (a Fixnum and a Float as themselves; a Bignum, a Rational
+                                          //  and a Complex by their class, as rb_cmperr has them)
+                                          ++ (match vb with
+                                              | VInt _ -> to_s vb
+                                              | VFlt _ -> to_s vb
+                                              | _ -> cmperr_cls env world vb) ++ " failed")
        else
          let c = cmp_vals va0 vb in
          VBool (if str_eq op "<" then c < 0 else if str_eq op "<=" then c <= 0 else if str_eq op ">" then c > 0 else c >= 0))
@@ -7357,7 +7387,7 @@ and const_added_hook = fn world -> fn (key: str) ->
   // that load is still in flight, and autoload_settle retires it.)
   let _ = (if map_len autoloads > 0 && map_has autoloads key && map_has consts key
               && (if map_has autoload_busy key then false else true)
-           then map_delete autoloads key else ()) in
+           then autoloads_del key else ()) in
   let f9 = cur_file () in
   let _ = (if str_len f9 > 10 && str_eq (substring f9 0 10) "<internal:" then ()
            else if map_has autoload_busy key && map_has autoloads key
@@ -14963,7 +14993,7 @@ and autoload_fire0 = fn env -> fn world -> fn blk -> fn (key: str) ->
                     let disp9 = (if i9 < 0 then key else cls_display world (substring key 0 i9) ++ substring key i9 (str_len key)) in
                     rb_warning world ("Expected " ++ path ++ " to define " ++ disp9 ++ " but it didn't"))
                  else ()) in
-        if ok9 then (let _ = map_delete autoloads key in true)
+        if ok9 then (let _ = autoloads_del key in true)
         // a require that RAISED (LoadError, or the file's own exception)
         // leaves the autoload registered, and the exception goes on
         else fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "exception") else "exception")))
@@ -14981,7 +15011,7 @@ and autoload_settle = fn world -> fn (key: str) ->
   // (the threads -- and fibers -- parked on this load: const_read_note)
   let _ = (if busy9 then fsw_wake_all world 9 ld9 else ()) in
   // (a registration whose file defined the constant is spent for good)
-  let _ = (if map_has consts key && map_has autoloads key then map_delete autoloads key else ()) in
+  let _ = (if map_has consts key && map_has autoloads key then autoloads_del key else ()) in
   if map_has const_src_pend key then
     (let _ = map_set const_src key (map_get const_src_pend key) in map_delete const_src_pend key)
   else ()
@@ -16050,6 +16080,81 @@ and str_arg_enc_check = fn world -> fn (h: int) -> fn (args: Val list) ->
                   ("incompatible character encodings: " ++ enc_msg_name (senc_get h) ++ " and " ++ enc_msg_name (senc_get y)) in ())
      else str_arg_enc_check world h t)
   | Cons (_, t) -> str_arg_enc_check world h t
+// the names a Node answers from its row, the builtins of the prelude's
+// `class Node` (m_driver.mere): its location and number, its children, and
+// what its tree shares (script lines, tokens) and its other locations
+and ast_node_reader = fn (n: str) ->
+  str_eq n "type" || str_eq n "children" || str_eq n "first_lineno" || str_eq n "first_column"
+  || str_eq n "last_lineno" || str_eq n "last_column" || str_eq n "node_id"
+  || str_eq n "script_lines" || str_eq n "all_tokens" || str_eq n "__locations"
+// ...whether a Node answers the name from the table: the prelude's own names
+// for the readers, `__nd_type` and so on, and `__locations`. The readers
+// themselves are methods of Node in the prelude (`def type = self.__nd_type`),
+// so they are rows of the method table as ruby's are: they come before what
+// Object, Kernel and BasicObject define, and instance_method, alias, private,
+// super from a prepended module and remove_method all see them.
+and ast_node_answers = fn (n: str) ->
+  if str_len n > 5 && str_starts_with n "__nd_" then ast_node_reader (substring n 5 (str_len n))
+  else str_eq n "__locations"
+// ...and a reader called on a plain Node while it is still the prelude's own
+// (ast_reader_ok): answered here, with no frame, as ruby's Primitive answers.
+// A singleton class, a prepend to Node, a refinement, a private or protected
+// reader, a TracePoint (its :call / :return) or an argument goes the way of
+// any method.
+and ast_reader_fast = fn world -> fn (id: int) -> fn (n: str) -> fn (args: Val list) ->
+  map_len ast_node_pos > 0
+  && (match args with Nil -> true | _ -> false)
+  && map_has ast_node_pos id
+  && ast_reader_named world n
+  && (let c9 = map_get obj_cls id in str_len c9 == 32 && str_eq c9 "RubyVM::AbstractSyntaxTree::Node")
+  && vec_get hook_bits 0 == 0
+  && map_len refine_tgt == 0
+  && (if map_len prepends > 0 && map_has prepends "RubyVM::AbstractSyntaxTree::Node" then false else true)
+  && (let k9 = map_get ast_reader_ok n in
+      (if map_has privates k9 then false else true) && (if map_has protecteds k9 then false else true))
+// (whether the reader n is still the prelude's own row: asked of the table
+//  once, and remembered until a write to the row forgets it)
+and ast_reader_named = fn world -> fn (n: str) ->
+  if map_has ast_reader_ok n then true
+  else if map_has ast_reader_no n then false
+  else if (if ast_node_reader n then false else true) || str_eq n "__locations" then false
+  else
+    (let (meths9, _, _, _) = world in
+     let k9 = "RubyVM::AbstractSyntaxTree::Node#" ++ n in
+     // (the prelude's own, not a program's def of the same shape: meth_cfn)
+     if map_has meths9 k9 && map_has meth_cfn k9 && ast_reader_canon n (map_get meths9 k9)
+     then (let _ = map_set ast_reader_ok n k9 in true)
+     else (let _ = map_set ast_reader_no n 1 in false))
+// ...and only a method of Node the prelude wrote asks for them (meth_cfn; an
+// alias of one is one too): a method a program adds to Node, or a block
+// instance_exec runs on a Node, is not answered -- ruby has no such methods
+and ast_nd_caller = fn env ->
+  lv_has env "__meth" && lv_has env "__defcls"
+  && (match lv_get env "__defcls" with
+      | VClass c9 -> str_len c9 == 32 && str_eq c9 "RubyVM::AbstractSyntaxTree::Node"
+      | _ -> false)
+  // (by the name it was called by: an alias made of the prelude's reader
+  //  stays one when the program then writes its own under the old name)
+  && (match (if lv_has env "__callee" then lv_get env "__callee" else lv_get env "__meth") with
+      | VStr h9 -> map_has meth_cfn ("RubyVM::AbstractSyntaxTree::Node#" ++ sget h9)
+      | _ -> false)
+and ast_node_get = fn world -> fn (id: int) -> fn (n0: str) -> fn (args: Val list) ->
+  let n = (if str_len n0 > 5 && str_starts_with n0 "__nd_" then substring n0 5 (str_len n0) else n0) in
+  match args with
+  | Cons (_, _) -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (list_len_v args 0) ++ ", expected 0)")
+  | Nil ->
+    (let (ty, fl, fc, ll, lc, nid) = map_get ast_node_pos id in
+     let (kids, xl, tree) = map_get ast_node_vals id in
+     if str_eq n "type" then VSym (vec_get ao_names ty)
+     else if str_eq n "children" then kids
+     else if str_eq n "first_lineno" then VInt fl
+     else if str_eq n "first_column" then VInt fc
+     else if str_eq n "last_lineno" then VInt ll
+     else if str_eq n "last_column" then VInt lc
+     else if str_eq n "node_id" then VInt nid
+     else if str_eq n "script_lines" then (match tree with VArr a9 -> arr_at a9 0 | _ -> VNil)
+     else if str_eq n "all_tokens" then (match tree with VArr a9 -> arr_at a9 1 | _ -> VNil)
+     else xl)
 and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
   // the count comes first: ruby refuses a wrong number of arguments before it
   // looks at what they are.
@@ -26334,7 +26439,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          let _ = const_read_note world n in
          let _ = if map_has deprecated_consts n then map_delete deprecated_consts n else () in
          let _ = if map_has consts n then consts_del n else () in
-         let _ = if auto9 then map_delete autoloads al9 else () in
+         let _ = if auto9 then autoloads_del al9 else () in
          // (a class removed under its own name: the next `class` of that name
          //  is a NEW class, and must not find this one's constants -- see
          //  the SClass arm)
@@ -26978,9 +27083,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                          && (if str_eq (blt_alias_lookup world (ancestors_of world c0) name) "" then false else true)
                       then false else true)
                then sng_supername world c0 else c0) in
+    // (a Node's reader, while it is the prelude's own: ast_reader_fast)
+    if ast_reader_fast world id name args then ast_node_get world id name Nil
     // a descriptor stream's stream methods are the prelude's IO layer (see
     // fdio_route), ahead of IO's own -- which are the File model's
-    if fdio_route_call world id cls name then invoke world noblk recv "IO" (fdio_mname name) args
+    else if fdio_route_call world id cls name then invoke world noblk recv "IO" (fdio_mname name) args
     // `Class.allocate` is a class that was never initialized: it cannot make
     // instances or name a superclass (they were "undefined method")
     else if str_eq cls "Class" && (if has_meth world cls name then false else true)
@@ -27014,6 +27121,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if has_meth world cls "method_missing" then (let _ = vec_set mm_priv 0 (mm_reason_take ()) in invoke world noblk recv cls "method_missing" (Cons (VSym name, args)))
        else raise_exc_iv world "NoMethodError" (refused9 ++ " method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
               (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
+    // RubyVM::AbstractSyntaxTree::Node's values, from ast_node_pos /
+    // ast_node_vals (ast_node_get): the prelude's own names, asked only by
+    // the Node itself in a method of Node the prelude wrote (ast_nd_caller)
+    // -- its readers, #inspect and #locations. Ruby has no such methods:
+    // `n.__nd_type` from outside, `self.__nd_type` in a method a program
+    // adds to Node and `n.instance_eval { __nd_type }` are NoMethodErrors.
+    else if map_len ast_node_pos > 0 && map_has ast_node_pos id && ast_node_answers name
+            && lv_has env "self" && (match lv_get env "self" with VObj i9 -> i9 == id | _ -> false)
+            && ast_nd_caller env then
+      ast_node_get world id name args
     // A visibility-only entry has no Ruby method row. Native Method#unbind
     // must still refuse the call and give method_missing its usual chance.
     else if vischeck && str_eq cls "Method" && str_eq name "unbind"
@@ -30330,6 +30447,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             && is_enum_cls cls
             && (map_has ivars (str_of_int id ++ "@__x_fb") || map_has ivars (str_of_int id ++ "@__e_pos")) then
       raise_exc world "TypeError" "can't copy execution context"
+    // RubyVM::AbstractSyntaxTree::Node is a C object with no allocator: ruby's
+    // Kernel#dup / #clone refuse it. Its values are in ast_node_pos /
+    // ast_node_vals by its id, so a copy would be a Node with none. Refused
+    // here, at the copy itself: a program's own dup / clone was found before
+    // this arm, and a bind_call of Kernel's or a `super` arrives here.
+    else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
+            && map_len ast_node_pos > 0 && map_has ast_node_pos id then
+      raise_exc world "TypeError" "allocator undefined for RubyVM::AbstractSyntaxTree::Node"
     else if (str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone") then
       (let nid = alloc_oid ocls in
        // `cls` above is the DISPATCH class, which strips the singleton off when
@@ -48593,7 +48718,10 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        // IPSocket#inspect, `write` inside a socket's own method -- is the
        // layer's, as it is with a receiver (the dispatcher asks fdio_route_call
        // first too). has_meth alone found IO's File-model #write, or nothing.
-       if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
+       // (a Node's reader called bare -- test_ast's Helper, pp -- while it is
+       //  the prelude's own: ast_reader_fast)
+       if ast_reader_fast world id name args then ast_node_get world id name Nil
+       else if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
        then invoke world noblk (VObj id) "IO" (fdio_mname name) args
        else if has_meth world cls name then invoke world noblk (VObj id) cls name args
        // the string form of instance_eval/instance_exec on an object self
@@ -49201,7 +49329,10 @@ and try_self_call1 = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> 
      | VObj id ->
        let cls = map_get ocls id in
        // (a descriptor stream's stream method: see try_self_call_x)
-       if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
+       // (a Node's reader called bare -- test_ast's Helper, pp -- while it is
+       //  the prelude's own: ast_reader_fast)
+       if ast_reader_fast world id name args then ast_node_get world id name Nil
+       else if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
        then invoke world noblk (VObj id) "IO" (fdio_mname name) args
        else if has_meth world cls name then invoke world noblk (VObj id) cls name args
        // an Enumerable-mixin method (map/count/inject/...) or a name the
@@ -52905,12 +53036,18 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
      | _ -> VNil)
   else if str_eq meth "respond_to?" then
     // the BUILTIN answer, not `responds` -- that would dispatch back into the
-    // override we are the `super` of.
-    (match args with
-     | Cons (v, _) ->
-       (let nm = ivar_arg_name (to_s v) in
-        VBool (has_meth world (dispatch_cls_of world recv) nm || is_prim_method nm || is_enum_method nm))
-     | _ -> VBool false)
+    // override we are the `super` of. It is respond_to_answer, the table
+    // form, which does not ask the override: a private method answers only
+    // with include_all, and respond_to_missing? is asked. (This asked "is
+    // there such a method at all", so an override that calls super said
+    // true for a private one. ActiveRecord::Core's private #to_ary is how
+    // Array.wrap(record) keeps a record whole, and every record has
+    // ActiveModel's respond_to? override: `[record].flatten`-style code got
+    // NoMethodError 'to_ary'.)
+    (if val_list_len args > 2 then
+       raise_exc world "ArgumentError"
+         ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")
+     else respond_to_answer gc_cenv0 world recv args)
   // `super` from respond_to_missing? is Object#respond_to_missing?, which
   // answers false. `m == :ok || super` is how the method is written, so it is
   // on the same path as method_missing below and failed the same way.
@@ -59083,6 +59220,11 @@ and cmperr_cls = fn env -> fn world -> fn (v: Val) ->
                        (VClass (display_cls world (dispatch_cls_of world v))) "to_s" Nil false with
                | VStr h9 -> sget h9
                | _ -> display_cls_msg world (dispatch_cls_of world v))
+  // (rb_cmperr writes a special constant as itself: `1 < nil` is "comparison
+  //  of Integer with nil failed", not "with NilClass")
+  | VNil -> "nil"
+  | VBool b9 -> (if b9 then "true" else "false")
+  | VSym _ -> inspect v
   | _ -> class_name v
 // Kernel#global_variables: the numbered ones are the groups of the last
 // match that took part ($1 and $12 of twelve, not a $2 that matched nothing),
@@ -62419,9 +62561,16 @@ and native_definition_apply = fn world -> fn (cls: str) -> fn (body: Stmt list) 
   let saved_lex = cur_lex () in
   let _ = (if ref_on () then ref_install (ref_env_id denv) else ()) in
   let _ = set_lex cscope in
+  // (the nesting of a block written in a method is the method's: see
+  //  register_class_blk. `Class.new { def b; end }` comes straight here,
+  //  from native_constructor_declaration.)
+  let saved_nest = cur_nest () in
+  let _ = (if lv_has denv "__meth" && lv_has denv "__nest"
+           then set_nest (match lv_get denv "__nest" with VStr h9 -> sget h9 | _ -> "") else ()) in
   let result = try_or_msg (fn (u: unit) -> native_definition_commit world cls body stmt)
-    (fn (message: str) -> let _ = set_lex saved_lex in let _ = restore_ref_active saved in fail message) in
+    (fn (message: str) -> let _ = set_lex saved_lex in let _ = set_nest saved_nest in let _ = restore_ref_active saved in fail message) in
   let _ = set_lex saved_lex in
+  let _ = set_nest saved_nest in
   let _ = restore_ref_active saved in result
 // Only existing lexical locals and ordinary global slots can be read here.
 // Missing names, special globals, aliases and constant lookup retain eval_e.
@@ -62497,7 +62646,24 @@ and native_refinement_declaration_body = fn world -> fn (cls: str) -> fn (body: 
          (true, (match tail with Nil -> value | _ -> VNil))
      | _ -> (false, VNil))
   | _ -> (false, VNil)
+// The methods a class body's block defines capture the block's lexical
+// scope: its cref (cscope) and its NESTING. For a block written in a METHOD
+// the nesting is the method's own (its frame's __nest), which the live
+// nesting does not hold while a method runs. A `def` in `Class.new { }`
+// called from a method of a class opened as `class A::B::C` captured an
+// empty nesting, so its constants were looked up through A::B as well:
+// activerecord's FixtureSet::RenderContext reads `File` there and got
+// ActiveRecord::FixtureSet::File ("undefined method 'binread'").
 and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
+  if lv_has denv "__meth" && lv_has denv "__nest" then
+    (let saved_nest = cur_nest () in
+     let _ = set_nest (match lv_get denv "__nest" with VStr h9 -> sget h9 | _ -> "") in
+     let r9 = try_or_msg (fn (u: unit) -> register_class_blk0 world cls body cscope denv)
+                         (fn (m: str) -> (let _ = set_nest saved_nest in fail m)) in
+     let _ = set_nest saved_nest in
+     r9)
+  else register_class_blk0 world cls body cscope denv
+and register_class_blk0 = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
   // ⚠ a block body is starting, so the pending `&pr` source is spent -- as
   //   run_block says for the same reason. A class body never reached it, so
   //   `c.class_eval(&blk)` left blk pending and the NEXT method taking a
@@ -68796,13 +68962,23 @@ and vm_hash = fn env -> fn world -> fn blk -> fn (xs: Val list) -> vm_eval env w
 // ---- sends ----
 // an operator the parser writes as EBin / EUn: the same send, by the path
 // the same source takes through the evaluator
+// (an operator's name is one to three bytes and starts with no letter:
+//  asked first, as vm_call asks this of every call with one argument, and
+//  the list below was twenty-one comparisons for `a.at(0)`)
+and vm_op_shaped = fn (m: str) -> fn (most: int) ->
+  let n = str_len m in
+  if n == 0 || n > most then false
+  else (let c = ord (char_at m 0) in
+        if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 128 then false else true)
 and vm_binop = fn (m: str) ->
-  str_eq m "+" || str_eq m "-" || str_eq m "*" || str_eq m "/" || str_eq m "%" || str_eq m "**"
-  || str_eq m "==" || str_eq m "!=" || str_eq m "<" || str_eq m "<=" || str_eq m ">" || str_eq m ">="
-  || str_eq m "<<" || str_eq m ">>" || str_eq m "&" || str_eq m "|" || str_eq m "^"
-  || str_eq m "<=>" || str_eq m "===" || str_eq m "=~" || str_eq m "!~"
+  vm_op_shaped m 3
+  && (str_eq m "+" || str_eq m "-" || str_eq m "*" || str_eq m "/" || str_eq m "%" || str_eq m "**"
+      || str_eq m "==" || str_eq m "!=" || str_eq m "<" || str_eq m "<=" || str_eq m ">" || str_eq m ">="
+      || str_eq m "<<" || str_eq m ">>" || str_eq m "&" || str_eq m "|" || str_eq m "^"
+      || str_eq m "<=>" || str_eq m "===" || str_eq m "=~" || str_eq m "!~")
 and vm_unop = fn (m: str) ->
-  if str_eq m "!" then "!" else if str_eq m "-@" then "-" else if str_eq m "+@" then "+" else if str_eq m "~" then "~" else ""
+  if (if vm_op_shaped m 2 then false else true) then ""
+  else if str_eq m "!" then "!" else if str_eq m "-@" then "-" else if str_eq m "+@" then "+" else if str_eq m "~" then "~" else ""
 // a name a receiverless call can be written with: `foo(1)`, `ok?`, `go!`
 and vm_ident = fn (m: str) ->
   let n = str_len m in
@@ -68846,6 +69022,21 @@ and vm_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) ->
               | _ -> false)
   then (match (recv, args) with
         | (VInt x9, Cons (VInt y9, Nil)) -> (match int_fast_op mid x9 y9 with (_, v9) -> v9)
+        | _ -> VNil)
+  // (arithmetic and ordering of two builtin numbers with nothing in the
+  //  way -- `z * z` of two Complexes, `x.abs > 2`, a Rational's, a Bignum's
+  //  -- the answer EBin's arm reaches at its end, without the scope and the
+  //  EBin made in it: vm_num_bin_ok says when that is so)
+  else if argc == 1 && bid < 0 && (if vm_bit fl 1 || vm_bit fl 2 || vm_bit fl 8 || vm_bit fl 64 || vm_bit fl 1048576 then false else true)
+          && (match kws with Nil -> true | _ -> false)
+          && (match args with Cons (a9, Nil) -> vm_num_bin_ok world mid recv a9 | _ -> false)
+  then (match args with
+        | Cons (a9, Nil) ->
+          (let (pn, pr, pd) = bi_reg_get () in
+           let _ = bi_reg_set mid recv (caller_depth ()) in
+           let v9 = eval_bin_prim env world blk mid recv a9 in
+           let _ = bi_reg_set pn pr pd in
+           v9)
         | _ -> VNil)
   // (`!x` -- `not`, `while !q.empty?` -- as EUn's arm answers it: the
   //  receiver's own #! when its class has one, else the truth turned over;
@@ -68895,6 +69086,30 @@ and vm_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) ->
 // for two Arrays or two Hashes, none with an object or an element whose own
 // #== is a singleton's in it (EBin's arm compares those itself, by their
 // elements' #==). A number stays EBin's: coercion.
+// Whether `recv op arg` is answered by eval_bin_prim at the end of EBin's
+// arm, for + - * / < <= > >= of two builtin numbers: an Integer, a Bignum, a
+// Float, a Rational or a Complex with no object in it, of its own class (no
+// subclass tag), whose class defines no such operator; no TracePoint,
+// refinement, undef or alias of the operator. A Complex with an object in
+// it, a user's Numeric and an object that coerces are EBin's.
+and vm_num_plain = fn (v: Val) ->
+  match v with
+  | VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat (_, _) -> true
+  | VCpx (a9, b9) -> (match a9 with VObj _ -> false | _ -> (match b9 with VObj _ -> false | _ -> true))
+  | _ -> false
+and vm_num_bin_ok = fn world -> fn (op: str) -> fn (recv: Val) -> fn (arg: Val) ->
+  let n = str_len op in
+  let c = (if n >= 1 then ord (char_at op 0) else 0) in
+  ((n == 1 && (c == 43 || c == 45 || c == 42 || c == 47 || c == 60 || c == 62))
+   || (n == 2 && (c == 60 || c == 62) && ord (char_at op 1) == 61))
+  && vm_num_plain recv && vm_num_plain arg
+  && (if map_len hook_flags > 0 && hook_tp_on () then false else true)
+  && map_len ref_active == 0
+  && (if map_len undefs > 0 && map_has undef_names op then false else true)
+  && (if map_len blt_alias_ops > 0 && map_has blt_alias_ops op then false else true)
+  && (if vec_get moved_on 0 == 1 then false else true)
+  && (let hk9 = hng_key recv in if str_eq hk9 "" then true else (if map_has hng_store hk9 then false else true))
+  && (if has_meth world (class_name recv) op then false else true)
 and vm_bin_eq_ok = fn world -> fn (op: str) -> fn (recv: Val) -> fn (arg: Val) ->
   (if map_len hook_flags > 0 && hook_tp_on () then false else true)
   && map_len ref_active == 0
