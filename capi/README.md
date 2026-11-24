@@ -243,7 +243,7 @@ asked of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
   spec file and a C extension for each part of the C API, 46 files -- with
   each extension built for both rubies. The count of passing examples per
   file is recorded in `capi/check/spec_expect.tsv`: the reference's must be
-  the recorded one, mere-ruby's must not be lower. 2,269 of 2,584 pass.
+  the recorded one, mere-ruby's must not be lower. 2,420 of 2,602 pass against Ruby 4.0.10 (2026-11-24).
 - `test/mkmf` runs in a build tree staged for mere-ruby
   (`unittest/mkmf_context.sh`: links to `capi/include` in the places mkmf's
   build-tree mode looks, and a Makefile mere-ruby's own mkmf wrote).

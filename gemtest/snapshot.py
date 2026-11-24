@@ -29,7 +29,9 @@ def verify_snapshot(home,lockfile,requested=None):
     lockfile=Path(lockfile)
     raw=lockfile.read_bytes()
     lock=json.loads(raw)
-    assert lock['format']==1 and lock['reference_ruby']=='4.0.9','snapshot format/reference drift'
+    # A lock records the package snapshot's original reference, independently
+    # of the current interpreter used to replay those exact sources.
+    assert lock['format']==1 and lock['reference_ruby'] in ('4.0.9','4.0.10'),'snapshot format/reference drift'
     if requested is not None:assert lock['requested']==requested,'snapshot requested gem list drift'
     expected=set()
     for package in lock['packages']:

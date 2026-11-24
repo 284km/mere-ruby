@@ -3,6 +3,8 @@
 A Ruby implementation written in [Mere](https://merelang.org/), in pure
 Mere, targeting ruby 4.0.10. The saved measurements below were taken
 against ruby 4.0.9; they remain historical until replaced by a 4.0.10 run.
+The [reference upgrade notes](loop/2026-11-24-ruby-4.0.10.md) record the new
+inputs, validation and newly exposed gaps.
 It is measured by CRuby's own test suites
 and by [ruby/spec](https://github.com/ruby/spec): of the 34,559 tests in
 CRuby's `test/`, **32,462 pass here as they pass under ruby**; all of
@@ -662,7 +664,7 @@ other 873, counted so that they add up:
 | files | not measured | why |
 |---|---|---|
 | 781 | `library/` outside the groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before -- and which those are is now MEASURED rather than remembered: every `require` the 118 unrecorded groups make was asked of this interpreter, and the 49 groups whose libraries all loaded were swept |
-| 46 | `optional/capi` | measured by `tools/capi_spec_check.py`, not by this sweep: each spec file needs its C extension built for both rubies. Its record is `capi/check/spec_expect.tsv` -- 2,269 of the reference's 2,584 examples pass (2026-11-16) |
+| 46 | `optional/capi` | measured by `tools/capi_spec_check.py`, not by this sweep: each spec file needs its C extension built for both rubies. Its record is `capi/check/spec_expect.tsv` -- 2,420 of the reference's 2,602 examples pass (2026-11-24, Ruby 4.0.10) |
 | 32 | `command_line` | the executable's flag handling, which `clitest/` measures directly instead |
 | 13 | `security` | CVE regressions; four of them need rubygems or optparse |
 | 1 | `optional/thread_safety` | one file; it needs the scheduling `core/thread` is still thin on |

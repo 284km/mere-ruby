@@ -71,7 +71,7 @@ end
 # reference_ruby identifies the immutable package snapshot, not the Ruby
 # executing this replay. Keep the original package sources across oracle upgrades.
 if lock
-  abort 'snapshot format/reference changed' unless lock.fetch('format') == 1 && lock.fetch('reference_ruby') == '4.0.9'
+  abort 'snapshot format/reference changed' unless lock.fetch('format') == 1 && ['4.0.9', '4.0.10'].include?(lock.fetch('reference_ruby'))
   abort 'requested gem list changed' unless lock.fetch('requested') == requested
   queue = lock.fetch('packages').dup
   unavailable = lock.fetch('unavailable').dup
