@@ -8146,10 +8146,22 @@ and scv_stmt_go = fn (m: str) -> fn (s: Stmt) -> scv_stmt_t m "" "" s
 //  name the error gives is recv's constant path tp)
 and scv_stmt_t = fn (m: str) -> fn (tv: str) -> fn (tp: str) -> fn (s: Stmt) ->
   match s with
+  // (`C op= v`: ruby compiles the operation as it is and the right side as
+  //  the shareable value. So `C += [x]` is not made shareable as a whole,
+  //  `C ||= v` writes nothing when C is set, and under `literal` what is
+  //  checked is v.)
+  | SAssign (n, EBin (op, rd, v)) when scv_const_name n && scv_opasgn_read rd n -> SAssign (n, EBin (op, rd, scv_wrap m n v))
   | SAssign (n, e) when scv_const_name n -> SAssign (n, scv_wrap m n e)
   | SExpr (EScopedAssign (rc, cn, e)) ->
     (let p9 = (match rc with EVar v9 when str_len tv > 0 && str_eq v9 tv -> tp | _ -> scv_path rc) in
-     SExpr (EScopedAssign (rc, cn, scv_wrap m (p9 ++ "::" ++ cn) e)))
+     // (`recv::C op= v`: the operation on the constant read through the
+     //  temporary, of which only v is the shareable value)
+     let opasgn = (match (rc, e) with
+                   | (EVar v9, EBin (_, EScopedRead (EVar w9, c9), _)) -> str_len tv > 0 && str_eq v9 tv && str_eq w9 tv && str_eq c9 cn
+                   | _ -> false) in
+     SExpr (EScopedAssign (rc, cn, (match e with
+                                    | EBin (op, rd, v) when opasgn -> EBin (op, rd, scv_wrap m (p9 ++ "::" ++ cn) v)
+                                    | _ -> scv_wrap m (p9 ++ "::" ++ cn) e))))
   | SExpr (EStmt (SBegin (Cons (SAssign (t9, rv9), rest), Nil, Nil, Nil))) when (if scv_const_name t9 then false else true) ->
     SExpr (EStmt (SBegin (Cons (SAssign (t9, rv9), scv_stmts_t m t9 (scv_path rv9) rest), Nil, Nil, Nil)))
   // (`C ||= v` and `expr::C ||= v` are an if around the assignment)
@@ -8168,6 +8180,13 @@ and scv_path = fn (e: Expr) ->
   | EConst c9 -> c9
   | EScopedRead (r9, n9) -> (let p9 = scv_path r9 in if str_eq p9 "..." then "..." else p9 ++ "::" ++ n9)
   | _ -> "..."
+// the read of the constant an op-assignment writes: `||=`'s, and the
+// wrapped one the parser makes of the others under a setting
+and scv_opasgn_read = fn (rd: Expr) -> fn (n: str) ->
+  match rd with
+  | EConstOrNil c -> str_eq c n
+  | EStmt (SExpr (EConst c)) -> str_eq c n
+  | _ -> false
 and scv_const_name = fn (n: str) ->
   str_len n > 0 && (let c = char_at n 0 in (ord c >= 65 && ord c <= 90) || str_eq c ":")
   && (let rec last9 = fn (i: int) ->
@@ -9269,7 +9288,9 @@ and const_opasgn = fn (target: str) -> fn (rd: str) -> fn (op: str) -> fn (e: Ex
   let read9 = opasgn_const_read op rd in
   if str_eq op "||" then SIf (Cons ((read9, Cons (SExpr read9, Nil)), Nil), Cons (SAssign (target, e), Nil))
   else if str_eq op "&&" then SIf (Cons ((read9, Cons (SAssign (target, e), Nil)), Nil), Cons (SExpr read9, Nil))
-  else SAssign (target, EBin (op, read9, e))
+  // (under a shareable_constant_value setting the read is wrapped, as a
+  //  bare constant's is: scv_stmt_t tells the op-assignment by it)
+  else SAssign (target, EBin (op, (if map_has scv_mode "m" then EStmt (SExpr read9) else read9), e))
 // a `return` among the statements (not inside a def, a class or a block)
 and stmts_have_return = fn (b: Stmt list) ->
   match b with
@@ -9738,7 +9759,14 @@ and parse_stmt_ident = fn toks -> fn (id: str) -> fn r ->
            // `Const op= expr` — a bare constant op-assign: `||=` reads nil for an
            // undefined one, every other op reads it as a constant (NameError)
            let (e, r3) = parse_expr (skip_nls r2) in
-           (SAssign (id, EBin (opassign_base p, opasgn_const_read (opassign_base p) id, e)), r3)
+           // (under a shareable_constant_value setting the read is wrapped --
+           //  it evaluates the same -- so that the op-assignment can be told
+           //  from `C = C + v`: ruby makes only its right side shareable, and
+           //  the whole value of the other. `||=` reads through EConstOrNil,
+           //  which only an op-assignment has: scv_stmt_t)
+           let rd0 = opasgn_const_read (opassign_base p) id in
+           let rd = (if map_has scv_mode "m" && (if str_eq (opassign_base p) "||" then false else true) then EStmt (SExpr rd0) else rd0) in
+           (SAssign (id, EBin (opassign_base p, rd, e)), r3)
          else
            let (e, r4) = parse_expr toks in (SExpr e, r4)
        | _ -> let (e, r5) = parse_expr toks in (SExpr e, r5))
