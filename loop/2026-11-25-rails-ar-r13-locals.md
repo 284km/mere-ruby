@@ -1,6 +1,7 @@
 # Rails-2 round 3, part 1: a branch's locals, and whose block a `do` is
 
-**Where this comes from.** Rails-2 round 3 measured activerecord (sqlite3 adapter, 427 files) on main 30de57d4 with #225, against ruby 4.0.10: MATCH 8,943, RED 133, MISSING 84. Round 2 (main 8c39dd51, against ruby 4.0.9) was 7,717 / 1,008 / 399. The RED by cause are in the third part of this series. This part has two of the causes, 31 RED.
+**Where this comes from.** Rails-2 round 3 measured activerecord (sqlite3 adapter, 427 files) on main 30de57d4 with #225, against ruby 4.0.10: MATCH 8,943, RED 133, MISSING 84. Round 2 (main 8c39dd51, against ruby 4.0.9) was 7,717 / 1,008 / 399. The RED by cause are in the third part of this series.
+This part has two of the causes, 31 RED.
 
 ## A branch that is passed over declares its locals before the next one runs (23)
 
@@ -15,9 +16,11 @@ end
 "#{size}-#{timestamp}"
 ```
 
-the block writes the method's `size`: the `if` branch comes first in the text. That is ActiveRecord's `compute_cache_version`. The names of a branch that did not run were declared only after the whole `if`, so the block made variables of its own, the method read nil, and every collection cache key ended in "-" with nothing after it.
+the block writes the method's `size`: the `if` branch comes first in the text. That is ActiveRecord's `compute_cache_version`.
+The names of a branch that did not run were declared only after the whole `if`, so the block made variables of its own, the method read nil, and every collection cache key ended in "-" with nothing after it.
 
-`run_if`, `run_case` and `run_case_truthy` now declare each branch's targets once, in the order of the text: a branch that is passed over before the next one is tried, the branch that runs after it has run, and then the ones after it. The statement arms no longer declare them all a second time after the statement.
+`run_if`, `run_case` and `run_case_truthy` now declare each branch's targets once, in the order of the text: a branch that is passed over before the next one is tried, the branch that runs after it has run, and then the ones after it.
+The statement arms no longer declare them all a second time after the statement.
 
 Corpus 974: `if` / `elsif` / `else`, `unless`, `case` with and without a subject, a multiple assignment, a nested `if` in the skipped branch, and the two forms that must stay as they were (a name first written in a later branch is the block's own; the last branch passed over).
 
@@ -37,7 +40,8 @@ tmp_yaml ["curious", "yml"], yaml do |t| ... end
 assert_changes -> { topic.updated_at }, to: new_updated_at do ... end
 ```
 
-A `do` after a paren-less argument list belongs to the command. When the first argument was an array literal or a `->` lambda, the rest of the list was read without the flag that keeps the `do` for the command, and the last argument took the block: `yaml do |t| ... end` was a call of a method named yaml (NoMethodError for a local), and `{...}.to_yaml do ... end` left `tmp_yaml` with no block (LocalJumpError).
+A `do` after a paren-less argument list belongs to the command. When the first argument was an array literal or a `->` lambda, the rest of the list was read without the flag that keeps the `do` for the command, and the last argument took the block:
+`yaml do |t| ... end` was a call of a method named yaml (NoMethodError for a local), and `{...}.to_yaml do ... end` left `tmp_yaml` with no block (LocalJumpError).
 
 `puts_args_cmd` reads the rest of the list with the flag set, in the four places: a comma after the bracket, a binary operator after the bracket, a comma after a chain on the bracket, and a `->` first argument.
 
