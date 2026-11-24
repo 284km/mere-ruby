@@ -1736,6 +1736,7 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter rx_prog_names mk in
   let _ = map_iter gc_cenv0 mk in
   let _ = map_iter gc_hold (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
+  let _ = map_iter gc_iter_hold (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
   // the Fiber objects, the value crossing a switch, and the saved contexts of
   // suspended stacks
   let fbx = map_has gc_state "fbx" in
@@ -12215,13 +12216,14 @@ and flt_step_go = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (st: f
 // nodes a C variable points at, not a list's later cells: a result built
 // before the first yield and walked from a list was rooted by nothing once
 // the block's first statements had run, and a collection there swept it.
-// gc_hold is a root; the key is this depth and the value's id, so a nested
-// walk of another value never drops this one.
+// gc_iter_hold is a root; each walk draws a number of its own for its key,
+// so a nested walk never drops another's value.
 and iter_held = fn (v: Val) -> fn (body: unit -> Flow) ->
-  let k = "iterheld:" ++ str_of_int (cd_get ()) ++ ":" ++ (match v with VArr a9 -> str_of_int a9 | _ -> "v") in
-  let _ = map_set gc_hold k v in
-  let r = try_or_msg body (fn (m: str) -> (let _ = map_delete gc_hold k in fail m)) in
-  let _ = map_delete gc_hold k in
+  let k = vec_get gc_iter_hold_n 0 in
+  let _ = vec_set gc_iter_hold_n 0 (k + 1) in
+  let _ = map_set gc_iter_hold k v in
+  let r = try_or_msg body (fn (m: str) -> (let _ = map_delete gc_iter_hold k in fail m)) in
+  let _ = map_delete gc_iter_hold k in
   r
 and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
@@ -27335,7 +27337,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else if str_eq mown "Struct" && is_struct_gen_method mnm && (match args with Nil -> true | _ -> false)
                   && (match mrecv with VObj o9 -> (let (_, _, oc9, _) = world in is_struct_obj_cls world (map_get oc9 o9)) | _ -> false)
                   && (str_eq mnm "members" || str_eq mnm "size" || str_eq mnm "length" || str_eq mnm "to_a"
-                      || str_eq mnm "to_ary" || str_eq mnm "values" || str_eq mnm "deconstruct") then
+                      || str_eq mnm "values" || str_eq mnm "deconstruct") then
             (match mrecv with
              | VObj o9 ->
                (let (_, _, oc9, iv9) = world in
@@ -35986,7 +35988,10 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
      | _ ->
        // the in-place mutators below are reached with a block, ahead of
        // builtin_iter's guard, so the frozen check has to happen here too.
-       if is_mutating_method name && val_frozen_mut recv then
+       // (the same check as builtin_iter's: a Ruby method of the name is not a
+       //  builtin mutator -- ActiveSupport's Object#try! with a block on a
+       //  frozen String was "can't modify frozen String")
+       if builtin_mut_on_frozen world recv name then
          raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect env world recv) (Cons (("__recv", recv), Nil))
        // a singleton method defined on this exact String/Array/Hash --
        // `def ary.m`, or a module it was extended with -- wins, as it does
@@ -39717,6 +39722,23 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
         | _ -> ()))) in
   let _ = (if mro_local_name c && (if map_has meth_owner_seen c then false else true)
            then () else rec_pfx (c ++ "#") (nc ++ "#")) in
+  // a Struct class's copy is a Struct class too: its members, in order, and
+  // the marks on the methods Struct.new wrote. `OtherWrapper = Wrapper.dup`
+  // (ActiveSupport's deep_mergeable_test) made plain objects, and its
+  // `new(hash)` was read as Struct.new's class name.
+  let _ = (if map_has struct_mem c then map_set struct_mem nc (map_get struct_mem c) else ()) in
+  // ...and the members' own initializer: an #initialize that calls super
+  // reaches it through struct_members_cls, which picks the copy, so without
+  // this `K.dup.new(1)` stopped when K (or the copy) had its own #initialize
+  let _ = (if map_has struct_initializers c then map_set struct_initializers nc (map_get struct_initializers c) else ()) in
+  let _ = (if map_len struct_gen > 0 then
+             (let pfx9 = c ++ "#" in
+              let gk9 = map_new () in
+              let _ = map_iter struct_gen (fn (k: str) -> fn (v: int) ->
+                        if str_starts_with k pfx9 && (if str_contains (substring k (str_len pfx9) (str_len k)) "#" then false else true)
+                        then map_set gk9 (nc ++ "#" ++ substring k (str_len pfx9) (str_len k)) v else ()) in
+              map_iter gk9 (fn (k: str) -> fn (v: int) -> map_set struct_gen k v))
+           else ()) in
   let sc = "(sng:" ++ c ++ ")" in
   let _ = (if mro_local_name sc && (if map_has meth_owner_seen sc then false else true)
            then () else rec_pfx (sc ++ "#") ("(sng:" ++ nc ++ ")#")) in
@@ -40594,6 +40616,19 @@ and str_hash_rep_args = fn (args: Val list) ->
 and prim_native_wanted = fn world -> fn (recv: Val) -> fn (name: str) ->
   if prim_user_has world recv name then (if bi_skip_pass name then false else true)
   else (let _ = bi_skip_pass name in true)
+and range_super_enum_name = fn (n: str) ->
+  str_eq n "sum" || str_eq n "min" || str_eq n "max" || str_eq n "minmax" || str_eq n "min_by"
+  || str_eq n "max_by" || str_eq n "count" || str_eq n "inject" || str_eq n "reduce" || str_eq n "tally"
+  || str_eq n "sort" || str_eq n "sort_by" || str_eq n "map" || str_eq n "collect" || str_eq n "flat_map"
+  || str_eq n "select" || str_eq n "filter" || str_eq n "reject" || str_eq n "filter_map"
+  || str_eq n "group_by" || str_eq n "partition" || str_eq n "to_a" || str_eq n "entries"
+  || str_eq n "take" || str_eq n "take_while" || str_eq n "drop" || str_eq n "drop_while" || str_eq n "uniq"
+  || str_eq n "zip" || str_eq n "first"
+// ...of which these answer an Enumerator when they are given no block
+and range_super_enum_lazy = fn (n: str) ->
+  str_eq n "map" || str_eq n "collect" || str_eq n "flat_map" || str_eq n "select" || str_eq n "filter"
+  || str_eq n "reject" || str_eq n "filter_map" || str_eq n "group_by" || str_eq n "partition"
+  || str_eq n "sort_by" || str_eq n "min_by" || str_eq n "max_by" || str_eq n "take_while" || str_eq n "drop_while"
 and range_native_wanted = fn world -> fn (recv: Val) -> fn (name: str) ->
   if prim_user_has world recv name then false else true
 and prim_user_has = fn world -> fn (recv: Val) -> fn (name: str) ->
@@ -48007,6 +48042,11 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
   | (VStr _, _) when (if has_meth world (dispatch_cls_of world recv) src then false else true)
                      && str_eq (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) src) "" ->
     invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
+  // (...and a Symbol's: prim_method's #end_with? reads its first argument
+  //  only, and ActiveSupport's `alias ends_with? end_with?` took the rest)
+  | (VSym _, _) when (if has_meth world (dispatch_cls_of world recv) src then false else true)
+                     && str_eq (blt_alias_lookup world (ancestors_of world (dispatch_cls_of world recv)) src) "" ->
+    invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
   // (...nor an ITERATOR's blockless form on any value: `alias old_times
   //  times; 3.old_times` was "undefined method 'times'", and so was a Method
   //  of it. Once the class redefines the name it is an Enumerator over that
@@ -52907,6 +52947,47 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
      | Cons (v9, _) when str_eq meth "cover?" -> VBool (rng_covers_w world lo9 hi9 ex9 v9)
      | Cons (v9, _) -> rng_include gc_cenv0 world lo9 hi9 ex9 v9
      | Nil -> VNil)
+  // ...and Enumerable's answers from a Range method that replaces one
+  // (ActiveSupport's Range#sum calls super with a block or a non-Integer
+  // range): over the range's elements, as Enumerable's walk gives them --
+  // `to_a` refuses what cannot be walked (a Float begin) in ruby's words.
+  // Only the methods whose answer is a value, not the receiver.
+  // ⚠ Enumerable's walk is `each`, one element at a time, not `to_a`: a
+  //   `to_a` called by name came back to a Range#to_a that calls super
+  //   (SystemStackError), and built an endless range whole (`(1..).first(2)`
+  //   was a RangeError). The answer comes from an Enumerator over the range's
+  //   #each. Without a block, the methods that answer an Enumerator answer one
+  //   on the range itself (`#<Enumerator: 1..3:map>`).
+  // ...except Range's OWN methods of those names on an ENDLESS range: walking
+  // it never stops (`(1..).count` from a module prepended to Range ran
+  // forever), and Range's own answer is at hand -- Infinity, the value, or
+  // its RangeError; with a block, min / max / to_a / entries refuse as
+  // Range's do (minmax with a block walks in ruby too). A beginless range is
+  // left to the walk, whose first step refuses it: ruby's answer for a super
+  // from Range's own reopened method (`can't iterate from NilClass`).
+  | VRange (_, VNil, _) when range_super_enum_name meth
+                             && (match superblk with (true, _, _, _) -> false | _ -> true)
+                             && (str_eq meth "count" || str_eq meth "min" || str_eq meth "max" || str_eq meth "minmax"
+                                 || str_eq meth "to_a" || str_eq meth "entries") ->
+    prim_method recv meth args
+  | VRange (_, VNil, _) when range_super_enum_name meth
+                             && (match superblk with (true, _, _, _) -> true | _ -> false)
+                             && (str_eq meth "min" || str_eq meth "max" || str_eq meth "to_a" || str_eq meth "entries") ->
+    raise_exc world "RangeError"
+      (if str_eq meth "min" then "cannot get the minimum of endless range with custom comparison method"
+       else if str_eq meth "max" then "cannot get the maximum of endless range"
+       else "cannot convert endless range to an array")
+  | VRange (_, _, _) when range_super_enum_name meth ->
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     match superblk with
+     | (true, _, _, _) ->
+       (let en9 = invoke_val_c gc_cenv0 world nb9 recv "to_enum" (Cons (VSym "each", Nil)) false in
+        invoke_with_block gc_cenv0 world superblk en9 meth args superblk)
+     | _ ->
+       if range_super_enum_lazy meth && (match args with Nil -> true | _ -> false)
+       then invoke_val_c gc_cenv0 world nb9 recv "enum_for" (Cons (VSym meth, Nil)) false
+       else (let en9 = invoke_val_c gc_cenv0 world nb9 recv "to_enum" (Cons (VSym "each", Nil)) false in
+             invoke_val_c gc_cenv0 world nb9 en9 meth args false))
   // `super` from a module prepended to a number's class (`class Integer;
   // prepend M` and M#+ calling super) is the builtin operation
   | VInt _ -> prim_method recv meth args
@@ -53385,7 +53466,8 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
   let _ = (if parent_inits9 then () else set_meth meths (anon ++ "#initialize") member_init9) in
   let toa = Cons (SReturn (EArr (struct_ivar_reads members)), Nil) in
   let _ = set_meth meths (anon ++ "#to_a") (Meth (Nil, Nil, toa)) in
-  let _ = set_meth meths (anon ++ "#to_ary") (Meth (Nil, Nil, toa)) in
+  // (no #to_ary: ruby's Struct has none, so a struct is not destructured or
+  //  flattened, and ActiveSupport's Array.wrap(struct) is [struct])
   let _ = set_meth meths (anon ++ "#values") (Meth (Nil, Nil, toa)) in
   let _ = set_meth meths (anon ++ "#deconstruct") (Meth (Nil, Nil, toa)) in
   let _ = set_meth meths (anon ++ "#members") (Meth (Nil, Nil, Cons (SReturn (EArr (struct_sym_lits members)), Nil))) in
@@ -53405,7 +53487,7 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
   let _ = set_meth meths (anon ++ "#length")
             (Meth (Nil, Nil, Cons (SReturn (EMethod (self_m "to_a", "size", Nil)), Nil))) in
   // (these are Struct's in ruby, not the class's own: struct_gen)
-  let _ = list_iter (Cons ("to_a", Cons ("to_ary", Cons ("values", Cons ("deconstruct", Cons ("members", Cons ("each", Cons ("size", Cons ("length", Nil)))))))))
+  let _ = list_iter (Cons ("to_a", Cons ("values", Cons ("deconstruct", Cons ("members", Cons ("each", Cons ("size", Cons ("length", Nil))))))))
             // (...unless a MEMBER has the name: its accessor replaced it, and
             //  is the class's own -- `Struct.new(:members, :class)`)
             (fn (n9: str) -> if str_list_has members n9 then () else map_set struct_gen (anon ++ "#" ++ n9) 1) in
@@ -59418,7 +59500,9 @@ and gen1_src = fn world -> fn (id: int) ->
       (match r with
        | VInt _ -> str_eq m "times"
        | VArr _ -> str_eq m "each"
-       | VRange (VInt _, _, _) -> str_eq m "each"
+       // (both ends Integers: gen1_take makes no other range's elements, and
+       //  `(1..).each.first(2)` / `(1..Float::INFINITY).each.first(2)` were [])
+       | VRange (VInt _, VInt _, _) -> str_eq m "each"
        | VStr _ -> (str_eq m "each_line" || str_eq m "each_char" || str_eq m "each_byte")
                    // (gen1_take reads them through lines / chars / bytes)
                    && (if prim_user_has world r (if str_eq m "each_line" then "lines" else if str_eq m "each_char" then "chars" else "bytes")
@@ -63055,6 +63139,23 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
          //  the reopening here too, as at the top level)
          let _ = (if map_has consts full && (match map_get consts full with VClass _ -> false | _ -> true)
                   then (let _ = reopen_kind_err world full is_mod in ()) else ()) in
+         // ...and a constant that names ANOTHER class or module by its own name
+         // (`HTML = Nokogiri::HTML4; module HTML`) reopens that one, refusing
+         // the other kind as for any constant. This path registered a second
+         // module under the alias (N::HTML::Document beside N::HTML4); the top
+         // level path refused it as "not a module". Nokogiri's html.rb.
+         let ali9 = (if map_has consts full then
+                       (match map_get consts full with
+                        | VClass rc9 -> if is_anon_cls rc9 || str_eq rc9 full then "" else rc9
+                        | _ -> "")
+                     else "") in
+         let _ = (if str_eq ali9 "" then ()
+                  else if (if is_mod then (if map_has modules ali9 then false else true) else map_has modules ali9)
+                  then (let _ = reopen_kind_err world full is_mod in ()) else ()) in
+         // (the superclass mismatch still names the class as WRITTEN, without
+         //  its scope: "superclass mismatch for class Cl3")
+         let written9 = (let i9 = str_rindex_go full "::" (str_len full - 2) in if i9 < 0 then full else substring full (i9 + 2) (str_len full)) in
+         let full = (if str_eq ali9 "" then full else ali9) in
          let anon9 = (if map_has consts full then
                         (match map_get consts full with
                          | VClass rc9 -> if is_anon_cls rc9 then rc9 else ""
@@ -63087,7 +63188,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
          // a TypeError (the superclass stays unchanged).
          let _ = if (if was_new then false else true) && (if str_eq qsuper "" then false else true)
                     && (let existing = (if map_has sup full then map_get sup full else if str_eq full "Object" then "BasicObject" else "Object") in if str_eq existing qsuper then false else true)
-                 then let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ full) in ()
+                 then let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ written9) in ()
                  else () in
          let _ = if str_eq qsuper "" then () else set_sup sup full qsuper in
          let _ = if map_has consts full then () else consts_put full (VClass full) in
@@ -65669,14 +65770,28 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // internal name, and that is where its methods and its module-ness live,
     // so the body has to be registered against that name -- while `already`
     // still answers for the constant that was written.
+    // (...and so does a constant that names another class or module by its
+    //  own name, `HTML = Nokogiri::HTML4; module HTML` -- the other kind is
+    //  refused as for any constant, with where the constant was set)
+    let alias_target = (if map_has consts name then
+                          (match map_get consts name with
+                           | VClass rc -> if is_anon_cls rc || str_eq rc name then "" else rc
+                           | _ -> "")
+                        else "") in
+    let _ = (if str_eq alias_target "" then ()
+             else if (if is_module then (if map_has modules alias_target then false else true) else map_has modules alias_target)
+             then (let _ = reopen_kind_err world name is_module in ()) else ()) in
     let anon_target = (if map_has consts name then
                          (match map_get consts name with
-                          | VClass rc -> if is_anon_cls rc then rc else ""
+                          | VClass rc -> if is_anon_cls rc || (if str_eq alias_target "" then false else true) then rc else ""
                           | _ -> "")
                        else "") in
     // reopening: `module C` on an existing class (or `class C` on a module)
     // is a TypeError; so is `class C < D` with a different superclass.
     let already = map_has consts name in
+    // (the superclass mismatch names the class as WRITTEN, not the class an
+    //  alias or an anonymous class resolves to: "class D", not "class C")
+    let written9 = (let i9 = str_rindex_go name "::" (str_len name - 2) in if i9 < 0 then name else substring name (i9 + 2) (str_len name)) in
     let name = (if str_eq anon_target "" then name else anon_target) in
     let was_module = map_has modules name in
     // (`already` answers for the constant as WRITTEN; after a retarget the
@@ -65699,7 +65814,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                                       else if (str_len name == 6 && str_eq name "Object") then "BasicObject"
                                       else "Object") in
                       if str_eq existing super0 then false else true) then
-               let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ name) in ()
+               let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ written9) in ()
              else ()) in
     // ⚠ ...and IN A BOX a name another box's class already has is a NEW
     //   class (Ruby::Box): the box does not see that one (bx_note_const kept
