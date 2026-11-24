@@ -12,23 +12,31 @@ Note 558's second item for the VM stream: the real Rails application of `railste
 
 `railstest/check.py` passes (7 controls). The six stages, their bounds (600 s and 2 GiB a stage) and what a PASS requires are unchanged.
 
-**The evaluator**, main cfcc861a's source built with Mere 9dec2ff6, 2026-11-24 15:02 to 15:08. The load average was 6 to 7; another session ran one corpus sweep at the time. All six stages PASS on both sides.
+**Both executions pass all six stages**, cold, against ruby 4.0.9: [`railstest/cold_2c167cfd_evaluator.json`](../railstest/cold_2c167cfd_evaluator.json) and [`railstest/cold_2c167cfd_vm.json`](../railstest/cold_2c167cfd_vm.json). The source is this change's first commit, 2c167cfd, on main 17a5db5f, built with Mere 9dec2ff6. The runs were made one after the other on 2026-11-24, 16:22 to 16:29 and 16:29 to 16:36, at a load average of 7 to 9; another session ran two corpus sweeps at the time.
 
-| stage | ruby 4.0.9 | mere-ruby, evaluator | times ruby |
+Seconds and peak RSS of each stage's process family:
+
+| stage | ruby 4.0.9 | mere-ruby, evaluator | mere-ruby, VM |
 |---|---|---|---|
-| Bundler | 0.6 s, 33 MB | 4.1 s, 343 MB | 6.5 |
-| the 68 dependencies (native ones built) | 134.9 s, 1,684 MB | 209.1 s, 1,382 MB | 1.5 |
-| migration | 5.1 s, 105 MB | 10.8 s, 773 MB | 2.1 |
-| boot (the direct `bin/rails`) | 1.5 s, 98 MB | 6.4 s, 771 MB | 4.2 |
-| the six tests (31 assertions) | 1.8 s, 114 MB | 10.9 s, 861 MB | 6.2 |
-| Puma's HTTP | 2.2 s, 107 MB | 8.9 s, 989 MB | 4.0 |
+| Bundler | 0.9 s, 41 MB | 4.6 s, 387 MB | 6.8 s, 380 MB |
+| the 68 dependencies (native ones built) | 147.9 s, 1,601 MB | 232.6 s, 1,141 MB | 231.7 s, 1,271 MB |
+| migration | 4.8 s, 107 MB | 10.7 s, 751 MB | 13.8 s, 1,122 MB |
+| boot (the direct `bin/rails`) | 1.6 s, 100 MB | 6.6 s, 785 MB | 10.3 s, 1,280 MB |
+| the six tests (31 assertions) | 1.8 s, 115 MB | 11.6 s, 844 MB | 14.6 s, 1,273 MB |
+| Puma's HTTP | 2.3 s, 106 MB | 9.9 s, 927 MB | 12.6 s, 1,514 MB |
 
-Against the last recorded cold run (d434c81e, load about 12): boot 7.4 s → 6.4 s, tests 11.8 s → 10.9 s, HTTP 11.0 s → 8.9 s, the dependencies 232.1 s → 209.1 s. The two runs' loads differ, so this is no measure of a change.
+(The reference column is the evaluator run's; the VM run's reference side was within 0.3 s of it at each stage.)
 
-**The VM** (`--mere-env MERE_RUBY_VM=1`) does not pass yet. Bundler and the dependencies PASS; migration FAILS, so boot, tests and HTTP are NOT_RUN. Two defects, in the order they were met:
+**What the table says.**
+- The evaluator takes 4 to 6 times ruby's time to boot, test and serve, and about 8 times its memory.
+- **The VM is slower than the evaluator on this application**: 1.3 to 1.6 times its time in the four stages that load Rails, and 1.5 times its memory. Boot is 10.3 s against 6.6 s.
+- The benchmark programs of rounds 57 and 58 run code many times. Booting Rails runs most code once: about three thousand files are read, and on the VM each is first compiled to an instruction sequence. That is the cost this table shows, and it is what stands between the VM and being the default. Measuring it by its parts (the compile, the load of the sequence, the run) is the next round.
 
+**How the VM got here.** Its first cold run failed in migration, and so did its second:
 1. thor's own `attr_reader`. This is the section below, fixed here.
-2. `Nokogiri::HTML is not a module`: `HTML = HTML4` and then `module HTML`, a module reopened through a constant that names it. #197 has the fix. The VM's cold run is to be taken again once it is on main.
+2. `Nokogiri::HTML is not a module`: `HTML = HTML4` and then `module HTML`, a module reopened through a constant that names it. #197 fixed it.
+
+An earlier pair of runs on main cfcc861a (before #197) had the evaluator passing all six stages, with boot at 6.4 s, tests at 10.9 s and HTTP at 8.9 s at a load average of 6 to 7.
 
 ## A class's own attr_reader is called
 
@@ -69,4 +77,4 @@ Against ruby 4.0.9 (tools/ref_ruby.sh), built with Mere 9dec2ff6, on main cfcc86
 - The CI corpus job's OpenSSL checks: asn1, provider, formats, reinitialize, memory, wasm.
 - `railstest/check.py`: 7 controls pass.
 - These give the same counts as main cfcc861a's build, on both executions: test_module, test_class, test_object, test_method, test_super, test_refinement, test_eval and test_alias.
-- The Rails application, cold, on the evaluator: all six stages PASS on both sides (the table above).
+- The Rails application, cold, on main 17a5db5f with this change: all six stages PASS on the evaluator and on the VM (the table above). On that tree corpus 812, 813 and 814 match on both executions, and vm_check and the gates pass; the full corpus sweep was made on cfcc861a.
