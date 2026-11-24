@@ -257,11 +257,12 @@ type Val = VInt of int | VFlt of float | VStr of int | VBool of bool
          // the SAME source and flags whatever s was encoded in, so a side table
          // keyed by the two answered whichever was built last.
          | VRegex of str * str * str
-         // Not a Ruby value: a list the native ISeq compiler hands the VM's
-         // loader in place of an Array of a sequence's structure (false) or
-         // of a Hash's keys and values in turn (true). It lives from
-         // ic_to_val to vm_load, inside ic_vm_native's region, and is never
-         // an operand the VM keeps -- vm_lst, vm_rec.
+         // Not a Ruby value: an immutable native list. The ISeq loader uses
+         // false for sequence structure, true for interleaved Hash fields;
+         // these lists live inside ic_vm_native's region -- vm_lst, vm_rec.
+         // Method frames also own a false list for private ... arguments.
+         // Frame storage owns the payload and GC follows its Ruby values;
+         // forwarding itself does not construct an observable Ruby Array.
          | VIcl of bool * Val list
          | VMain;               // the top-level `self` (main), class Object
 
@@ -1119,6 +1120,7 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                       (if map_has bind_store (str_of_int id)
                        then gc_mark_env live (map_get bind_store (str_of_int id))
                        else ()))
+  | VIcl (_, values) -> gc_mark_vals live values
   | VRange (a, b, _) -> let _ = gc_mark_val live a in gc_mark_val live b
   | VCpx (a, b) -> let _ = gc_mark_val live a in gc_mark_val live b
   | VExc (c, _) -> gc_class_mark c
@@ -6836,6 +6838,7 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   // splat argument: expand an array's elements into the argument list.
   | Cons (ESplat e, t) ->
     let spread = (match eval_e env world blk e with
+                  | VIcl (false, values) -> values
                   | VArr id -> deref id
                   // *hash spreads as [k, v] pairs -- through #to_a when the
                   // hash (or its class) defines one of its own
@@ -10138,7 +10141,7 @@ and redo_from = fn (body: Stmt list) ->
   | Nil -> body
 and for_hidden = fn (e: Expr) ->
   match e with
-  | EVar h -> str_len h >= 3 && str_eq (substring h 0 3) "__f" && (if str_eq h "__fwd" then false else true)
+  | EVar h -> str_len h >= 3 && str_eq (substring h 0 3) "__f" && (if str_eq h "__fwd~args" then false else true)
   | ESplat x -> for_hidden x
   | _ -> false
 and for_prologue_stmt = fn (st: Stmt) ->
@@ -51484,7 +51487,7 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     let share_rest_args = from_pool &&
       (match params with
        | Cons (p, Nil) -> str_len p > 1 && str_eq (char_at p 0) "*"
-                          && not (str_eq (char_at p 1) "*") && not (str_eq p "*__fwd")
+                          && not (str_eq (char_at p 1) "*") && not (str_eq p "*__fwd~args")
        | _ -> false) && (match vlast args with VHsh _ -> false | _ -> true) in
     // Empty argument and parameter lists carry no heap references. Keep an
     // explicit empty parameter sentinel so zsuper does not fall back to an
@@ -60922,7 +60925,7 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
   //   It arrived as the flagged hash itself.
   let args0 = (let ps8 = strip_block_params params0 in
                if (match kw_params ps8 with Nil -> str_eq (dsplat_name ps8) "" | _ -> false)
-                  && (if map_has frame "__r2k" || str_list_has ps8 "*__fwd" then false else true)
+                  && (if map_has frame "__r2k" || str_list_has ps8 "*__fwd~args" then false else true)
                then r2k_unflag_tail args00 else args00) in
   // ...and into one that DOES take keywords, the flagged hash splatted at the
   // end is keywords, whatever has been done with it since it was flagged:
@@ -60989,7 +60992,7 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
   // kwarg mark (Ruby demotes it; a later *args re-splat stays positional).
   // `...` forwarding (*__fwd) and ruby2_keywords methods are exempt — both
   // forward a `key:` hash's keyword-ness faithfully.
-  let _ = if want_kw || str_list_has params1 "*__fwd" || map_has frame "__r2k" then () else unmark_kwargs args0 in
+  let _ = if want_kw || str_list_has params1 "*__fwd~args" || map_has frame "__r2k" then () else unmark_kwargs args0 in
   // a ruby2_keywords METHOD that keeps a `key:` hash gives it the permanent
   // mark too: that hash IS ruby's "keywords hash", and Hash.ruby2_keywords_hash?
   // has to say so for the rest of its life.
@@ -61085,11 +61088,12 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
     // Its list is immutable; arr_new gives the rest parameter its own Array.
     let rest_args = vdrop args (npre + kopt) in
     let rest_values = if na == 0 then rest_args else vtake rest_args sc in
-    let rest_array = (if sc < 4096 then arr_new rest_values
+    let rest_binding = (if str_eq sname "__fwd~args" then VIcl (false, rest_values)
+                      else if sc < 4096 then arr_new rest_values
                       else (match arr_new Nil with
                             | VArr id -> let _ = arr_push_many id rest_values in VArr id
                             | v -> v)) in
-    let _ = map_set frame sname rest_array in
+    let _ = map_set frame sname rest_binding in
     let _ = bind_seq frame world after (vdrop args (npre + kopt + sc)) in
     let _ = bind_kw_params frame world blk kws defaults kwhash in
     ()
@@ -68246,7 +68250,7 @@ and vm_lname = fn (locs: Val list) -> fn (i: int) -> fn (depth: int) ->
   | VSym s -> if str_eq s "*" then "__anonrest" else if str_eq s "**" then "__anonkw" else if str_eq s "&" then "__anonblk"
               else if str_eq s "$!" then "__vm~e" ++ str_of_int depth
               // (`...`: the evaluator's name for what a forwarding method was given)
-              else if str_eq s "..." then "__fwd" else s
+              else if str_eq s "..." then "__fwd~args" else s
   | VInt k -> "__vh~" ++ str_of_int depth ++ "_" ++ str_of_int k
   | _ -> ""
 // the local table `lvl` sequences out: (names, how many, its depth), a depth
@@ -68384,7 +68388,7 @@ and vm_params = fn (kind: int) -> fn (locs: Val list) -> fn (depth: int) -> fn (
               else if kind == 1 && lead == 1 && nopt == 0 && num "post_num" <= 0 && nokw && num "kwrest" < 0
                       && num "block_start" < 0 && (if amb then false else true) then Cons ("*,", Nil)
               else (Nil : str list)) in
-  let rest = (if vm_has_sym locs "..." && num "rest_start" < 0 then Cons ("*__fwd", (Nil : str list)) else rest) in
+  let rest = (if vm_has_sym locs "..." && num "rest_start" < 0 then Cons ("*__fwd~args", (Nil : str list)) else rest) in
   let post = (let n = num "post_num" in if n <= 0 then (Nil : str list) else vm_names locs depth (num "post_start") n) in
   let kwrest = (let r = num "kwrest" in if r < 0 then (Nil : str list) else Cons ("**" ++ vm_lname locs r depth, Nil)) in
   let bparam = (let r = num "block_start" in if r < 0 then (Nil : str list) else Cons ("&" ++ vm_lname locs r depth, Nil)) in
@@ -70234,7 +70238,7 @@ and vm_forward = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (mid
   vm_push st (vm_scoped env (fn ce ->
     (let _ = map_set ce "__vm~r" recv in
      let all = eapp (vm_argl ce fl argc kws args)
-                 (Cons (ESplat (EVar "__fwd"), Cons (EBlockPass (EVar "__anonblk"), Nil))) in
+                 (Cons (ESplat (EVar "__fwd~args"), Cons (EBlockPass (EVar "__anonblk"), Nil))) in
      if o == 73 then vm_ev ce world blk (ESuper (vm_bit fl 512, (if vm_bit fl 512 then (Nil : Expr list) else all)))
      else if vm_bit fl 4 && vm_ident mid then vm_ev ce world blk (ECall (mid, all))
      else vm_ev ce world blk (EMethod ((if vm_bit fl 4 then ESelf else EVar "__vm~r"), mid, all)))))
