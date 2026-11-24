@@ -46,7 +46,7 @@ Harness controls: 25 passed.
 - `yield ::C` passes a top-level constant, while `yield::C` resolves C from
   the yielded receiver, allowing RubyZip to load unchanged.
 
-Corpus 1000-1015 contains focused regressions. Before the first four-digit
+Corpus 1000-1017 contains focused regressions. Before the first four-digit
 file, selection was checked: run_corpus.sh uses corpus/*.rb and
  tools/iseq/vm_corpus.sh uses the same unrestricted glob. record_hygiene
 checks tracked records rather than selecting corpus programs; its explicit
@@ -103,3 +103,30 @@ intentional and unrelated to the editor's extra Prism 1.9.0.
 
 The full-suite slot is explicitly after the Rails cold measurement and
 Rails-2's multi-hour activerecord round 3. Do not start it without the owner.
+
+## Hash pattern protocol and remaining owner dependency
+
+TestResponse's two JSON pattern failures were raw-pair lookups bypassing
+HashWithIndifferentAccess#key? and #[]. Hash patterns now keep the returned
+Hash, check all keys before matching values, and use #dup/#delete for a named
+rest or **nil. Native primitive #dup/#clone also respect subclass overrides
+and resume the native copying operation through super. Corpus 1016/1017
+cover the protocol, ordering, actual error matchee, visibility, rest class,
+copy overrides and copied instance variables on Hash, Array and String.
+
+All eighteen new regressions match the independent reference under evaluator
+and VM with GC stress period 50: 36 runs, zero differences. Ruby's own hash
+pattern/deconstruct_keys tests pass on all three: 3 tests, 80 assertions.
+TestResponse now has 5 MATCH, zero RED (its two pattern failures are gone).
+
+Routing Inspector still has two errors without the other stream's C API
+change: test_not_routes_when_expanded and
+test_no_routes_matched_filter_when_expanded. Both reach IO.console_size and
+raise NameError, "wrong constant name console". The reference returns nil
+from IO.console outside a TTY. The owner has the reproduction and candidate
+hidden-constant API patch. This branch intentionally contains no capi/ diff.
+
+An intermediate build also passed 882/882 corpus programs in both hash modes
+in 725.672 seconds, peak family RSS 1193824 KiB, with no resource event. That
+precedes the hash-pattern/copy changes; the final 884-program sweep and full
+VM/fallback accounting remain required.
