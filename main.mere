@@ -68453,15 +68453,20 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
      //  corpus 462's folded `/#{%q"\x80"}/` in a US-ASCII source came out
      //  UTF-8 here once -- Regexp.new read the escape as UTF-8, which ruby
      //  does only in a UTF-8 string.)
-     | VStr h -> if utf8 v then (o, sget h, 1, 0, v, "") else (o, "", 0, 0, v, "")
+     // (...and it is ruby's fstring, as a UTF-8 one is: one object for
+     //  every literal of that text in that encoding -- `"a".equal?("a")`
+     //  under frozen_string_literal in a Big5 source. The evaluator interns
+     //  it under the same key: str_fstring.)
+     | VStr h -> if utf8 v then (o, sget h, 1, 0, v, "") else (o, "", 0, 0, (if sfrozen_get h then str_fstring v else v), "")
      | _ -> (o, "", 0, 0, v, ""))
   else if o == 6 || o == 7 || o == 31 || o == 32 then
     (match o1 with
      // (...and a literal in another encoding: a copy of the operand each
      //  time, in its encoding -- a = 1)
+     // (...`"lit".freeze` and `-"lit"` too: the evaluator's literal of that
+     //  encoding, as its parser marks one -- a = 1)
      | VStr h -> if utf8 o1 then (o, sget h, 0, 0, VNil, "")
-                 else if o == 6 || o == 7 then (o, sget h, 1, 0, o1, "")
-                 else bad " (a String in another encoding)"
+                 else (o, sget h, 1, 0, o1, "")
      | _ -> bad "")
   else if o == 8 || o == 33 then (match o1 with VArr _ -> (o, "", 0, 0, o1, "") | _ -> bad "")
   else if o == 9 || o == 34 then (match o1 with VHsh _ -> (o, "", 0, 0, o1, "") | _ -> bad "")
@@ -69090,8 +69095,6 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
                  //  (88). What else it declines the Ruby one may take: a
                  //  top-level `return false`, corpus 675.)
                  | VStr h9 when native9 && (str_contains (sget h9) "PreExecutionNode" || str_contains (sget h9) "pre_execution_node") -> mkstr "a BEGIN block"
-                 // (...nor a source in an encoding neither compiler takes)
-                 | VStr h9 when native9 && str_starts_with (sget h9) "a source in " -> nat
                  | _ ->
                 // (the Ruby compiler makes a literal's Regexp with Regexp.new:
                 //  quiet, as the native compiler's is -- ic_first_v)
@@ -69163,9 +69166,10 @@ and vm_file_first = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
 // Rails boot on the VM.
 // The answer is (what, why, id):
 //   2  the program `id` is loaded
-//   3  the loader refused what was compiled, and why
-//   1  the compiler declined, and why: a source in an encoding the VM does
-//      not take, a node it refuses, a failure of its own
+//   3  refused for good, and why: the loader refused what was compiled, or
+//      the compiler declined something in a source that is not UTF-8 or
+//      US-ASCII (which the Ruby compiler does not take at all)
+//   1  the compiler declined, and why: a node it refuses, a failure of its own
 //   0  nothing: a syntax error -- or, when `quiet` (asked before the parser,
 //      vm_file_first), a source Prism has a warning of
 // On 1 and 0 the caller may ask the Ruby compiler.
@@ -69332,19 +69336,18 @@ and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: st
       else if quiet && vec_get meta 6 > 0 then (0, "", 0 - 1)
       else
         (let enc = ic_enc cx in
-         // (a source in another encoding is the evaluator's, and the Ruby
-         //  compiler says the same of it: answered here as that refusal, so
-         //  the Ruby compiler -- and Prism's Ruby library with it -- is not
-         //  loaded to say it again. One such file in a Rails boot, a BINARY
-         //  one, cost a fifth of the boot that way.)
-         if (if str_eq enc "UTF-8" || str_eq enc "US-ASCII" then false else true) then (1, "a source in " ++ enc, 0 - 1)
-         else
+         // (a source in another encoding is compiled as any is: its literals
+         //  carry the encoding. What is declined in one is declined for good
+         //  -- the Ruby compiler takes no such source, and asking it loads
+         //  it, and Prism's Ruby library with it, to say so: one such file
+         //  in a Rails boot, a BINARY one, cost a fifth of the boot.)
+         let other = (if str_eq enc "UTF-8" || str_eq enc "US-ASCII" then false else true) in
            (let msg = vec_new () in
             // (a construct it does not compile yet declines by failing, with
             //  the message)
             let v = try_or_msg (fn (x: unit) -> ic_to_val env world blk (ic_to_a cx (ic_compile cx path label)))
                                (fn (m: str) -> (let _ = vec_push msg m in VNil)) in
-            if vec_len msg > 0 then (1, vec_get msg 0, 0 - 1)
+            if vec_len msg > 0 then ((if other then 3 else 1), (if other then "in a source in " ++ enc ++ ", " else "") ++ vec_get msg 0, 0 - 1)
             else
               (let (lw, id) = vm_load v in
                if str_eq lw "" then (2, "", id) else (3, lw, 0 - 1))))
@@ -69357,6 +69360,14 @@ and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: st
 //   freeze is the primitive's and an Encoding the interpreter's own object.
 and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
   let frozen = fn (x: Val) -> prim_method_raw x "freeze" Nil in
+  // (a String inside a literal Array or Hash is ruby's fstring, as every
+  //  String an instruction carries is: one object for that text in that
+  //  encoding. `{"ABC" => 1}` is a duphash whose key is one, so two such
+  //  literals have the same key object, and it is `"ABC".freeze` -- on the
+  //  VM each literal's key was an object of its own: test_hash's
+  //  test_NEWHASH_fstring_key, which no run on the VM had reached while its
+  //  file, a US-ASCII source, fell back for another reason.)
+  let inner = fn (y: Iv) -> (match ic_to_val env world blk y with VStr h -> (if sfrozen_get h then str_fstring (VStr h) else VStr h) | x -> x) in
   match v with
   | IvNil -> VNil
   | IvTrue -> VBool true
@@ -69370,12 +69381,12 @@ and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
     (let x = mkstr_e s (if str_len e == 0 then "UTF-8" else e) in
      let _ = (match x with VStr h -> sfrozen_set h | _ -> ()) in
      x)
-  | IvArr xs -> arr_new (ic_map (fn (y: Iv) -> ic_to_val env world blk y) xs)
+  | IvArr xs -> arr_new (ic_map inner xs)
   | IvHsh ps ->
     (let rec flat = fn (xs: (Iv * Iv) list) ->
        (match xs with
         | Nil -> (Nil : Val list)
-        | Cons ((k, x), t) -> Cons (ic_to_val env world blk k, Cons (ic_to_val env world blk x, flat t))) in
+        | Cons ((k, x), t) -> Cons (inner k, Cons (inner x, flat t))) in
      frozen (mkhash (flat ps)))
   | IvRx (s, o, e) ->
     // (asked before the parser: the literal is validated here as the
@@ -70679,8 +70690,9 @@ and vm_value_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n:
                          | VNil -> h9
                          | _ -> vm_eval env world blk (Cons (h9, Nil)) (fn (es: Expr list) -> EHsh (Cons (EKwSplat (vm_nth_e es 0), Cons (EKwSplat (vm_nth_e es 0), Nil))))) in
      vm_push st b9)
-  else if o == 31 then vm_push st (vm_ev env world blk (EMethod (EStrL n, "freeze", Nil)))
-  else if o == 32 then vm_push st (vm_ev env world blk (EUn ("-", EStrL n)))
+  else if o == 31 || o == 32 then
+    (let lit = (if a == 1 then (match v with VStr h0 -> EMethod (EStrL n, "__lit_enc~" ++ senc_get h0, Nil) | _ -> EStrL n) else EStrL n) in
+     vm_push st (vm_ev env world blk (if o == 31 then EMethod (lit, "freeze", Nil) else EUn ("-", lit))))
   else if o == 33 then vm_push st (vm_send0 env world blk (match v with VArr id -> arr_new (deref id) | _ -> v) "freeze" Nil)
   else if o == 34 then vm_push st (vm_send0 env world blk (match v with VHsh id -> vm_hash env world blk (hderef id) | _ -> v) "freeze" Nil)
   else if o == 35 then
