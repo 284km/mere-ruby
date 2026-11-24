@@ -8,6 +8,8 @@
  * value. The table is a root of the collector, so what it holds lives as long
  * as CRuby's constant would. (Used by capi/object.c.) */
 #include "mr_capi.h"
+/* Class proxy flags omit freezing; use the exported state check here. */
+#undef rb_check_frozen
 
 static VALUE table = Qnil;
 
@@ -42,4 +44,11 @@ VALUE mr_hidden_const_get(VALUE outer, const char *name, int *found) {
 
 void mr_hidden_const_set(VALUE outer, const char *name, VALUE value) {
     rb_hash_aset(bucket(outer, 1), rb_str_new_cstr(name), value);
+}
+
+VALUE mr_hidden_const_remove(VALUE outer, const char *name, int *found) {
+    rb_check_frozen(outer);
+    VALUE value = mr_hidden_const_get(outer, name, found);
+    if (*found) rb_hash_delete(bucket(outer, 0), rb_str_new_cstr(name));
+    return value;
 }
