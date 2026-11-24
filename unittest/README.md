@@ -186,7 +186,7 @@ turn a case into MATCH.
 ## Full measurement in GitHub Actions
 
 Pull requests, pushes to `main`, the weekly schedule and manual dispatch run
-the full `test/` candidate inventory. For Ruby 4.0.9 this is 758 files: 757
+the full `test/` candidate inventory. For the pinned Ruby 4.0.10 this is 758 files: 757
 matching the naming rules and the audited standalone body
 `rubygems/bundler_test_gem.rb` in `extra_files.txt`. This includes the 16 files
 excluded from the historical default and the encoding subdirectory. Recursive
@@ -215,7 +215,7 @@ and the action definition. A hit skips OCaml/opam setup and compilation;
 the compiler checkout and executable check still run. A miss retains the
 existing OCaml setup retry. Both native platforms use the same action.
 
-A separate job builds Ruby 4.0.9, its native test extensions and both JITs
+A separate job builds Ruby 4.0.10, its native test extensions and both JITs
 (with Rust 1.85.0), installs a relocatable reference, and verifies the four
 test extensions previously replaced by shims. The reference load path excludes
 those shims entirely: Ruby can select a later .rb before an earlier native

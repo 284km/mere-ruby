@@ -2369,7 +2369,7 @@ and builtin_pub_meth = fn (cls: str) -> fn (name: str) ->
 and is_exception_method = fn (name: str) ->
   map_has (name_set "is_exception_method") name
 and is_struct_gen_method = fn (name: str) ->
-  (str_len name == 4 && str_eq name "to_a") || (str_len name == 6 && str_eq name "to_ary") || (str_len name == 6 && str_eq name "values") ||
+  (str_len name == 4 && str_eq name "to_a") || (str_len name == 6 && str_eq name "values") ||
   (str_len name == 11 && str_eq name "deconstruct") || (str_len name == 7 && str_eq name "members") || (str_len name == 4 && str_eq name "size") ||
   (str_len name == 6 && str_eq name "length") || (str_len name == 4 && str_eq name "each") || (str_len name == 9 && str_eq name "each_pair") ||
   (str_len name == 4 && str_eq name "to_h") || (str_len name == 2 && str_eq name "==")
@@ -2748,6 +2748,7 @@ and class_name = fn (recv: Val) ->
   // makes o's recorded class `#<Class:...>` and ruby still says M3.
   | VObj oid -> obj_cls_name oid
   | VExc (c, _) -> c | VProc _ -> "Proc" | VBind _ -> "Binding" | VRegex _ -> "Regexp" | VMain -> "Object"
+  | VIcl (_, _) -> fail "a compiler's list where a value is read"
 and rng_int = fn (v: Val) -> match v with VInt n -> n | VFlt f -> int_of_float f | _ -> 0
 and rng_is_int = fn (v: Val) -> match v with VInt _ -> true | _ -> false
 // the pairs with every unfrozen String KEY replaced by a frozen copy, as
@@ -4389,9 +4390,26 @@ and anc_const_go = fn (withtop: bool) -> fn (ancs: str list) -> fn (name: str) -
     else anc_const_go withtop t name
 and super_base = fn world -> fn (recv: Val) ->
   match recv with
+  // (the singleton class of an OBJECT, as a receiver, is a Class: its own
+  //  chain is its metaclass's, which reaches Class and Module. Taken as
+  //  written, its chain was the object's -- no Module in it -- so a `super`
+  //  from a method prepended to Module had nowhere to go. Zeitwerk prepends
+  //  #const_added to Module and calls super: `class << obj; X = 1; end`
+  //  raised "super: no superclass method 'const_added'", which stopped
+  //  every file that loads tmpdir after Zeitwerk.)
+  | VClass c when is_sng_cls c && sng_of_value c -> "(sng:" ++ c ++ ")"
   | VClass c -> if is_sng_cls c then c else "(sng:" ++ c ++ ")"
   | VMain when map_has hng_store "main:0" -> map_get hng_store "main:0"
   | _ -> dispatch_cls_of world recv
+// whether a singleton class's name is an object's or a value's ("(sng:<id>)",
+// "(sng:str:12)") and not a class's or a module's ("(sng:Foo)")
+and sng_of_value = fn (c: str) ->
+  let in9 = sng_inner c in
+  str_len in9 > 0
+  && (is_digit (char_at in9 0)
+      || str_starts_with in9 "str:" || str_starts_with in9 "arr:" || str_starts_with in9 "hsh:"
+      || str_starts_with in9 "prc:" || str_starts_with in9 "bnd:" || str_starts_with in9 "main:"
+      || str_starts_with in9 "rx:")
 and is_definition_hook = fn (name: str) ->
   (str_len name == 9 && str_eq name "inherited") || (str_len name == 8 && str_eq name "included") || (str_len name == 8 && str_eq name "extended") ||
   (str_len name == 9 && str_eq name "prepended") || (str_len name == 12 && str_eq name "method_added") ||
@@ -7970,6 +7988,7 @@ and stdlib_src = fn (name: str) ->
     "                    Enumerator::Lazy Enumerator::Yielder Enumerator::Generator Enumerator::Chain\n" ++
     "                    Enumerator::ArithmeticSequence ObjectSpace::WeakMap ObjectSpace::WeakKeyMap\n" ++
     "                    Thread::Backtrace::Location TracePoint Fiber Ractor Continuation\n" ++
+    "                    RubyVM::AbstractSyntaxTree::Node\n" ++
     "                    StringIO StringScanner]\n" ++
     "\n" ++
     "    def data_class_name(obj)\n" ++
@@ -9976,9 +9995,25 @@ and file_flush_obj = fn world -> fn (id: int) ->
      else if (let m9 = fs_mode path true in
               let kind9 = bit_and m9 61440 in
               m9 >= 0 && (kind9 == 4096 || kind9 == 8192)) then through_fd ()
+     // ⚠ AN APPEND WRITES ONLY WHAT IS NEW, through a descriptor opened for
+     //   appending and closed again. It used to read the whole file and write
+     //   it back with the buffer on the end -- every flush cost the size of
+     //   the file, and for the moment between the truncate and the write the
+     //   file on disk was empty. A logger flushes per line: ActiveRecord's
+     //   test log is 45 MB by the end of its suite, so each SQL statement
+     //   logged read and wrote 45 MB (migration_test: 18 s a test, rising).
+     //   A write the kernel took part of leaves the rest in the buffer.
      else if str_contains mode "a" then
-       (if try_or (fn (u: unit) -> let _ = write_file path ((if file_exists path then read_file path else "") ++ buf) in true) false
-        then true else by_fd_at (0 - 1))
+       (let fd8 = fd_open path "a" 438 in
+        if fd8 < 0 then by_fd_at (0 - 1)
+        else
+          (let n8 = fd_put_all fd8 buf 0 0 in
+           let _ = fd_close fd8 in
+           if n8 == str_len buf then true
+           else if n8 > 0 then
+             (let _ = iv_put ivars (k ++ "@__f_wpos") (VInt (wpos + n8)) in
+              let _ = iv_put ivars (k ++ "@__f_buf") (mkstr (substring buf n8 (str_len buf))) in false)
+           else by_fd_at (0 - 1)))
      else if str_contains mode "w" || str_contains mode "+" then
        (let old9 = (if file_exists path then read_file path else "") in
         let head9 = (if str_len old9 >= wpos then substring old9 0 wpos
@@ -12878,7 +12913,7 @@ and rxp_name_check = fn (nm: str) ->
   if str_len nm == 0 then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp parse: group name is empty")) in fail "mere-ruby: regexp parse: group name is empty")
   else
     let c = char_at nm 0 in
-    if (c >= "0" && c <= "9") || str_eq c "-" then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp parse: bad group name")) in fail "mere-ruby: regexp parse: bad group name")
+    if (c >= "0" && c <= "9") || str_eq c "-" then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h ("mere-ruby: regexp parse: invalid group name <" ++ nm ++ ">"))) in fail ("mere-ruby: regexp parse: invalid group name <" ++ nm ++ ">"))
     else ()
 and lex_innermost = fn (lx: str) ->
   let i = str_rindex_go lx "::" (str_len lx - 2) in
@@ -13655,7 +13690,12 @@ and set_named_caps = fn env -> fn (pat: str) -> fn (p: int) -> fn (gidx: int) ->
          let _ = (if rx_cap_local_ok name || lv_has env name then lv_set env name (rx_named_val g) else ()) in
          set_named_caps env pat (nend + 1) g
        else if str_eq (char_at pat (p + 1)) "?" then set_named_caps env pat (p + 1) gidx
-       else set_named_caps env pat (p + 1) (gidx + 1))
+       // (a plain paren has no number here: beside a named group it does
+       //  not capture at all, and only a pattern with a named group binds
+       //  anything. It was counted, so `/(\w+) (?<a>.)(?<b>.)/ =~ s` gave a
+       //  the capture of b and b nil -- the sqlite3 adapter reads an index's
+       //  expressions and its WHERE that way.)
+       else set_named_caps env pat (p + 1) gidx)
     else set_named_caps env pat (p + 1) gidx
 and rx_capture_names = fn (pat: str) -> fn (p: int) ->
   if p >= str_len pat then Nil
@@ -13688,7 +13728,8 @@ and rx_ref_names = fn (pat: str) -> fn (rep: str) ->
               (let nend = rx_name_end pat (p + 3) in
                gnum nm (nend + 1) (gidx + 1) (if str_eq (substring pat (p + 3) nend) nm then gidx + 1 else best))
             else if p + 1 < str_len pat && str_eq (char_at pat (p + 1)) "?" then gnum nm (p + 1) gidx best
-            else gnum nm (p + 1) (gidx + 1) best)
+            // (a plain paren beside a named group has no number: set_named_caps)
+            else gnum nm (p + 1) gidx best)
          else gnum nm (p + 1) gidx best in
      let n = str_len rep in
      let rec go = fn (i: int) -> fn (acc: str) ->

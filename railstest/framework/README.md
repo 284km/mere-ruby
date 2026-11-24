@@ -1,7 +1,7 @@
 # Rails' own component tests, file by file
 
 This runs the test files of Rails 8.1.4.1 itself (`activesupport/test`,
-`activemodel/test`, ...) on the reference Ruby 4.0.9 and on mere-ruby, and
+`activemodel/test`, ...) on the reference Ruby 4.0.10 and on mere-ruby, and
 compares them test by test. It is the measurement for the framework half of
 the Rails plan. The application in `railstest/app` is measured separately by
 `railstest/measure.py`.
@@ -116,12 +116,12 @@ python3 railstest/framework/run.py restore --archives /path/to/fw-archives
 
 # 2. each side installs into its own empty gem home (either side may be redone alone)
 python3 railstest/framework/run.py install --archives /path/to/fw-archives \
-  --reference /path/to/ruby-4.0.9/bin/ruby --binary ./mere-ruby \
+  --reference /path/to/ruby-4.0.10/bin/ruby --binary ./mere-ruby \
   --source /path/to/rails-v8.1.4.1 --sqlite-prefix /path/to/sqlite --output /path/to/fw-gems
 
 # 3. run files or directories, relative to the Rails checkout
 python3 railstest/framework/run.py run --jobs 2 \
-  --reference /path/to/ruby-4.0.9/bin/ruby --binary ./mere-ruby \
+  --reference /path/to/ruby-4.0.10/bin/ruby --binary ./mere-ruby \
   --source /path/to/rails-v8.1.4.1 --gems /path/to/fw-gems --output /path/to/new-run \
   activesupport/test
 # (a component's own settings, the same on both sides and recorded:

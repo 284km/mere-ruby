@@ -1,7 +1,11 @@
 # mere-ruby
 
 A Ruby implementation written in [Mere](https://merelang.org/), in pure
-Mere, measured against ruby 4.0.9. It is measured by CRuby's own test suites
+Mere, targeting ruby 4.0.10. The saved measurements below were taken
+against ruby 4.0.9; they remain historical until replaced by a 4.0.10 run.
+The [reference upgrade notes](loop/2026-11-24-ruby-4.0.10.md) record the new
+inputs, validation and newly exposed gaps.
+It is measured by CRuby's own test suites
 and by [ruby/spec](https://github.com/ruby/spec): of the 34,559 tests in
 CRuby's `test/`, **32,462 pass here as they pass under ruby**; all of
 `basictest` passes; and **2,673 of 2,994 ruby/spec files** are byte-identical
@@ -83,12 +87,12 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ru
 # real and is not a defect: two platforms' constants, correctly reported by
 # each. Comparing like with like means running where the identity it claims is
 # true -- and, for the same reason, beside the ruby VERSION it claims to be.
-# main.mere reports `ruby 4.0.9` (tools/ref_ruby.sh names the same version,
+# mere-ruby reports `ruby 4.0.10` (tools/ref_ruby.sh names the same version,
 # and every gate sources it). The oracle has to be that release: 3.4 changed
 # Hash#inspect to put spaces around `=>`, 4.0 prints a Set as `Set[1, 2]`, and
 # 3.2.11 stopped warning on a `$=` read where 3.2.2 still warned -- a
 # difference inside one minor version. Every axis of the string this reports
-# has to match, so CI pins the oracle to exactly 4.0.9 on darwin. None of those
+# has to match, so CI pins the oracle to exactly 4.0.10 on darwin. None of those
 # differences was a defect on either side.
 ./mere-ruby script.rb
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
@@ -660,7 +664,7 @@ other 873, counted so that they add up:
 | files | not measured | why |
 |---|---|---|
 | 781 | `library/` outside the groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before -- and which those are is now MEASURED rather than remembered: every `require` the 118 unrecorded groups make was asked of this interpreter, and the 49 groups whose libraries all loaded were swept |
-| 46 | `optional/capi` | measured by `tools/capi_spec_check.py`, not by this sweep: each spec file needs its C extension built for both rubies. Its record is `capi/check/spec_expect.tsv` -- 2,269 of the reference's 2,584 examples pass (2026-11-16) |
+| 46 | `optional/capi` | measured by `tools/capi_spec_check.py`, not by this sweep: each spec file needs its C extension built for both rubies. Its record is `capi/check/spec_expect.tsv` -- 2,420 of the reference's 2,602 examples pass (2026-11-24, Ruby 4.0.10) |
 | 32 | `command_line` | the executable's flag handling, which `clitest/` measures directly instead |
 | 13 | `security` | CVE regressions; four of them need rubygems or optparse |
 | 1 | `optional/thread_safety` | one file; it needs the scheduling `core/thread` is still thin on |

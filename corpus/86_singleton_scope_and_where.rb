@@ -40,11 +40,11 @@ p Z::Inner.singleton_methods.sort
 p Z::Klass.singleton_methods.sort
 
 # an error raised while loading is still an ordinary rescuable error
-File.write("/tmp/mrb_where.rb", "module W\n  X = Integer(nil)\nend\n")
+File.write("/tmp/mrb_where_#{$$}.rb", "module W\n  X = Integer(nil)\nend\n")
 $LOAD_PATH.unshift("/tmp")
 begin
-  require "mrb_where"
+  require "mrb_where_#{$$}"
 rescue TypeError => e
   puts e.class
 end
-File.delete("/tmp/mrb_where.rb")
+File.delete("/tmp/mrb_where_#{$$}.rb")
