@@ -44,6 +44,13 @@ SEVERITY = {'.': 0, 'S': 1, 'F': 2, 'E': 3}
 VERDICTS = ('MATCH', 'RED', 'MISSING', 'UNCONFIRMED', 'BOTH', 'EXTRA')
 SUMMARY = re.compile(r'^(\d+) runs, (\d+) assertions, (\d+) failures, (\d+) errors, (\d+) skips$', re.M)
 
+# Only these unchanged tagged files legitimately contain no runnable tests.
+# A missing service can also make a nonempty test file report zero runs.
+EMPTY_TEST_SOURCES = {
+    'actionpack/test/controller/new_base/render_xml_test.rb': (290, '6aca88be3c0886bd9fc5ae974042053d16a1148f5dbe9484f2e41d7faa0345fb'),
+    'actionpack/test/journey/nodes/symbol_test.rb': (0, 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'),
+}
+
 
 def sha(path):
     digest = hashlib.sha256()
@@ -469,8 +476,8 @@ def all_pass(record, selected_files):
     """
     if not selected_files or set(record['files']) != set(selected_files):
         return False
-    for entry in record['files'].values():
-        if empty_entry(entry):
+    for name, entry in record['files'].items():
+        if empty_entry(name, entry):
             continue
         sides = entry['sides']
         if set(sides) != {'reference', 'mere'}:
@@ -485,7 +492,10 @@ def all_pass(record, selected_files):
     return True
 
 
-def empty_entry(entry):
+def empty_entry(name, entry):
+    source = (entry.get('source_bytes'), entry.get('source_sha256'))
+    if source != EMPTY_TEST_SOURCES.get(name):
+        return False
     sides = entry['sides']
     if set(sides) != {'reference', 'mere'}:
         return False
@@ -525,7 +535,7 @@ def summarize(record):
         if 'reference' not in sides or 'mere' not in sides:
             continue
         reference, mere = sides['reference'], sides['mere']
-        if empty_entry(entry):
+        if empty_entry(name, entry):
             entry['verdict'] = 'EMPTY'
             verdicts = {}
         elif reference['state'] != 'COMPLETE':

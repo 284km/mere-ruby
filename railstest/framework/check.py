@@ -101,21 +101,44 @@ class FrameworkCheck(unittest.TestCase):
 
     def test_empty_upstream_files_are_accounted_for_without_inventing_tests(self):
         zero = dict(parsed('0 runs, 0 assertions, 0 failures, 0 errors, 0 skips\n'), exit=0, limit=None)
-        entry = dict(sides=dict(reference=zero, mere=zero))
-        record = dict(files={'actionpack/test/fixture_test.rb': entry})
-        self.assertTrue(run.all_pass(record, list(record['files'])))
+        name = 'actionpack/test/controller/new_base/render_xml_test.rb'
+        size, digest = run.EMPTY_TEST_SOURCES[name]
+        entry = dict(source_bytes=size, source_sha256=digest, sides=dict(reference=zero, mere=zero))
+        record = dict(files={name: entry})
+        self.assertTrue(run.all_pass(record, [name]))
         run.summarize(record)
         self.assertEqual('EMPTY', entry['verdict'])
         self.assertEqual(0, entry['counts']['MATCH'])
         self.assertEqual(1, record['components']['actionpack']['empty_files'])
         self.assertEqual(0, record['components']['actionpack']['reference_unusable'])
+        name = 'actionpack/test/journey/nodes/symbol_test.rb'
+        size, digest = run.EMPTY_TEST_SOURCES[name]
         no_output = dict(parsed(''), exit=0, limit=None)
-        entry.update(source_bytes=0, sides=dict(reference=no_output, mere=no_output))
-        self.assertTrue(run.all_pass(record, list(record['files'])))
+        entry = dict(source_bytes=size, source_sha256=digest,
+                     sides=dict(reference=no_output, mere=no_output))
+        record = dict(files={name: entry})
+        self.assertTrue(run.all_pass(record, [name]))
         entry['source_bytes'] = 100
-        self.assertFalse(run.all_pass(record, list(record['files'])))
-        entry.update(source_bytes=0, sides=dict(reference=no_output, mere=dict(no_output, exit=1)))
-        self.assertFalse(run.all_pass(record, list(record['files'])))
+        self.assertFalse(run.all_pass(record, [name]))
+        entry['source_bytes'] = size
+        entry['source_sha256'] = 'changed'
+        self.assertFalse(run.all_pass(record, [name]))
+        entry.update(source_sha256=digest, sides=dict(reference=no_output, mere=dict(no_output, exit=1)))
+        self.assertFalse(run.all_pass(record, [name]))
+
+    def test_missing_service_zero_runs_cannot_pass_as_an_empty_file(self):
+        zero = dict(parsed('0 runs, 0 assertions, 0 failures, 0 errors, 0 skips\n'), exit=0, limit=None)
+        name = 'actionpack/test/dispatch/session/mem_cache_store_test.rb'
+        size, digest = run.EMPTY_TEST_SOURCES['actionpack/test/controller/new_base/render_xml_test.rb']
+        entry = dict(source_bytes=size, source_sha256=digest, sides=dict(reference=zero, mere=zero))
+        record = dict(files={name: entry})
+        self.assertFalse(run.all_pass(record, [name]))
+        run.summarize(record)
+        self.assertEqual('REFERENCE_ZERO', entry['verdict'])
+        self.assertEqual(0, entry['counts']['MATCH'])
+        self.assertEqual(0, record['components']['actionpack']['empty_files'])
+        self.assertEqual(1, record['components']['actionpack']['reference_unusable'])
+
     def test_resource_limit_wins_over_a_summary(self):
         text = transcript({'A#test_a': '.'})
         self.assertEqual('WALL_LIMIT', parsed(text, dict(exit=-9, limit='WALL_LIMIT'))['state'])

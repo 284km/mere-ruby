@@ -158,8 +158,11 @@ python3 railstest/framework/run.py run --jobs 2 --require-all-pass \
 runner still runs the two interpreters concurrently. `--require-all-pass`
 is a strict gate: every selected file must complete on both interpreters,
 with the same test inventory and no failures, errors or skips.
-Files containing no runnable tests are recorded as EMPTY with zero MATCH,
-including the upstream zero-byte symbol_test.rb. Missing files, tests,
+Only the two known upstream files without runnable tests are recorded as EMPTY
+with zero MATCH: controller/new_base/render_xml_test.rb and the zero-byte
+journey/nodes/symbol_test.rb. Their source sizes and SHA-256 digests must match
+the locked tag. Other zero-run files fail the gate, including a MemCacheStore
+file that omits its methods because memcached is unavailable. Missing files, tests,
 unusable references and resource stops exit 1. Without
 this option the runner retains its original measurement-only exit behavior.
 The selected file inventory and gate setting are recorded in `results.json`.
