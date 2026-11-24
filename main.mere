@@ -64948,15 +64948,36 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
        let _ = map_set load_ctx "parsing" (mkstr full) in
        // (a library this interpreter ships has no file to cover)
        let _ = (if str_eq shipped "" then cov_begin full src else ()) in
+       // (MERE_RUBY_VM: a file the ISeq VM takes is compiled here, inside a
+       //  region with the parse, and what leaves the region is the two
+       //  statements that run it -- vm_file_stmts' answer. The parser's
+       //  statements go with the region. Kept until the file had run, they
+       //  were reachable from the stack for every collection in between:
+       //  mail's address_lists_parser.rb, a generated parser of tables, was
+       //  2.4 million nodes a collection walked, and a Rails boot's largest
+       //  stretch of memory. A file the VM declines leaves the region as
+       //  parsed, copied out, and runs on the evaluator as before.)
+       let vmreq9 = (str_eq shipped "" && map_has cli_opt "vm" && (if map_has cli_opt "vmbusy" then false else true)
+                     && vec_get cov_st 0 == 0) in
+       let parse9 = fn (u: unit) ->
+                   (let tk = number_nls src (lex_src src) in
+                    let _ = parse_line_reset (count_nls tk) in
+                    let r = parse_stmts tk Nil in
+                    let _ = (match r with (pg9, _) -> if cb_ret_prog pg9 then syn_refuse "Invalid return in class/module body" else ()) in
+                    let _ = (match r with (pg9, _) -> yield_refuse_file pg9) in
+                    let _ = map_set pok "y" 1 in r) in
          let (prog2, rest2) =
-         try_or (fn (u: unit) ->
-                   let tk = number_nls src (lex_src src) in
-                   let _ = parse_line_reset (count_nls tk) in
-                   let r = parse_stmts tk Nil in
-                   let _ = (match r with (pg9, _) -> if cb_ret_prog pg9 then syn_refuse "Invalid return in class/module body" else ()) in
-                   let _ = (match r with (pg9, _) -> yield_refuse_file pg9) in
-                   let _ = map_set pok "y" 1 in r)
-                (Nil, Nil) in
+           (if vmreq9 then
+              region REQP {
+                (let (pg9, rs9) = try_or parse9 (Nil, Nil) in
+                 if map_has pok "y" && (match rs9 with Cons (TEOF, _) -> true | _ -> false) then
+                   (let st9 = vm_file_stmts env world (false, (Nil : str list), (Nil : Stmt list), env) src full "<top (required)>" (req_nopre pg9) in
+                    match st9 with
+                    | Cons (SFile _, Cons (SVm (_, _), Nil)) -> (st9, rs9)
+                    | _ -> (pg9, rs9))
+                 else (pg9, rs9))
+              }
+            else try_or parse9 (Nil, Nil)) in
        let _ = cov_end () in
        let _ = map_set load_ctx "parsing" (mkstr "") in
        // ⚠ ...and that failure is a RUBY exception. It was a bare `fail`, an
@@ -65029,8 +65050,9 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
                   | FReturn _ -> FNext VNil
                   // (MERE_RUBY_VM: the file's statements as the one the ISeq
                   //  VM runs of it, when it takes the whole file: vm_file_stmts)
+                  // (...asked above, with the parse, when vmreq9)
                   | _ -> run_stmts fenv world noblk2
-                           (if str_eq shipped "" then vm_file_stmts fenv world noblk2 src full "<top (required)>" (req_nopre prog2)
+                           (if str_eq shipped "" && (if vmreq9 then false else true) then vm_file_stmts fenv world noblk2 src full "<top (required)>" (req_nopre prog2)
                             else req_nopre prog2))) in
        // (a proc written at the file's top level may still match into it)
        let _ = rx_call_leave fid9 rx0 (map_has fenv "__captured") in
@@ -68779,6 +68801,14 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
         let native9 = (vec_get cov_st 0 == 0 || (vec_get cov_st 1 / 2) % 2 == 0)
                       && (if str_eq (env_get "MERE_RUBY_IC") "ruby" then false else true) in
         let nat = (if native9 then ic_vm_native env world blk src path label else VNil) in
+        // (=report also says which files the native compiler declined, and
+        //  why: the Ruby compiler then compiles them, at many times the cost)
+        let _ = (if str_eq mode "report" && native9 then
+                   (match nat with
+                    | VArr _ -> ()
+                    | VStr h9 -> print_err ("mere-ruby: vm: " ++ path ++ ": the native compiler declined: " ++ sget h9)
+                    | _ -> print_err ("mere-ruby: vm: " ++ path ++ ": the native compiler declined"))
+                 else ()) in
         let r = (match nat with
                  | VArr _ -> nat
                  // (...but a BEGIN the native compiler declined is not handed
@@ -68791,6 +68821,8 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
                  //  (88). What else it declines the Ruby one may take: a
                  //  top-level `return false`, corpus 675.)
                  | VStr h9 when native9 && (str_contains (sget h9) "PreExecutionNode" || str_contains (sget h9) "pre_execution_node") -> mkstr "a BEGIN block"
+                 // (...nor a source in an encoding neither compiler takes)
+                 | VStr h9 when native9 && str_starts_with (sget h9) "a source in " -> nat
                  | _ ->
                 try_or_msg (fn (u: unit) ->
                   invoke_val_c env world blk (VClass "RubyVM::InstructionSequence") "__vm_file"
@@ -68875,7 +68907,12 @@ and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: st
       if (if str_eq why "" then false else true) || vec_get meta 3 > 0 then VNil
       else
         (let enc = ic_enc cx in
-         if (if str_eq enc "UTF-8" || str_eq enc "US-ASCII" then false else true) then VNil
+         // (a source in another encoding is the evaluator's, and the Ruby
+         //  compiler says the same of it: answered here as that refusal, so
+         //  the Ruby compiler -- and Prism's Ruby library with it -- is not
+         //  loaded to say it again. One such file in a Rails boot, a BINARY
+         //  one, cost a fifth of the boot that way.)
+         if (if str_eq enc "UTF-8" || str_eq enc "US-ASCII" then false else true) then mkstr ("a source in " ++ enc)
          else
            try_or_msg (fn (x: unit) ->
                          (let iv = ic_to_a cx (ic_compile cx path label) in
@@ -68926,6 +68963,20 @@ and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
     (let c = (if map_has enc_objs e then e else enc_find_canon e) in
      if map_has enc_objs c then map_get enc_objs c
      else invoke_val_c env world blk (VClass "Encoding") "find" (Cons (mkstr e, Nil)) false)
+  // (a shareable literal: an Array and a Hash frozen, and what they hold
+  //  the same way. An Array was left as an instruction's operand is -- not
+  //  frozen -- and `# shareable_constant_value: literal` then `X = [1, [2]]`
+  //  left X unfrozen on the VM.)
+  | IvShr x ->
+    (match x with
+     | IvArr xs -> frozen (arr_new (ic_map (fn (y: Iv) -> ic_to_val env world blk (IvShr y)) xs))
+     | IvHsh ps ->
+       (let rec flat = fn (xs: (Iv * Iv) list) ->
+          (match xs with
+           | Nil -> (Nil : Val list)
+           | Cons ((k, y), t) -> Cons (ic_to_val env world blk (IvShr k), Cons (ic_to_val env world blk (IvShr y), flat t))) in
+        frozen (mkhash (flat ps)))
+     | _ -> ic_to_val env world blk x)
 // where a body the VM runs was written -- (path, line) -- and ("", 0) for a
 // body that is not one
 and vm_body_pos = fn (body: Stmt list) ->
