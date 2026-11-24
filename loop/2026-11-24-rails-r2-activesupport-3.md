@@ -131,5 +131,10 @@ sums, constant cache), `descendants_tracker` 2, and one each in
     `each_with_index` raise RangeError too; on the evaluator only, a nested
     anonymous class gets no superclass mismatch; with Range#first
     overridden, `zip` does not read a Range argument right.
+  - From main: when the process starts with a signal already ignored
+    (SIGINT for a corpus run started with `&` from a non-interactive shell,
+    SIGHUP under `nohup`), ruby reports the inherited `IGNORE` and mere-ruby
+    reports `DEFAULT`, so corpus 778 differs. Main's build does the same. A
+    run started with both at default matches.
   - From main: a Struct's error messages show the internal name
     (`Struct_1`), and `puts` does not use a user-defined `#to_ary`.
