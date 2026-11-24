@@ -52,3 +52,26 @@ module P1; def self.extended(b) = ($log << :p1); end
 module P2; def self.extended(b) = ($log << :p2); end
 Object.new.extend(P1, P2)
 p $log
+
+# ONE AT A TIME, the hook included: a module's #extended runs as soon as
+# that module is in, before the modules written before it. What the hook
+# sees when it calls the receiver is that module's method, not the nearer
+# one's that is mixed in next. The order of the hooks alone does not show it.
+module HA; def who = :a; end
+module HB; def who = :b; def self.extended(o) = ($saw << [o.class, o.who]); end
+module HC; def who = :c; def self.extended(o) = ($saw << [:c, o.who, o.singleton_class.ancestors.include?(HA)]); end
+[Object.new, [1], { a: 1 }, +"s", proc { }, Module.new, Class.new, [1].each].each do |recv|
+  $saw = []
+  recv.extend(HA, HB, HC)
+  p [$saw, recv.who]
+end
+$saw = []
+one = Object.new
+one.extend(HB); one.extend(HA)
+p [$saw, one.who]
+# a hook that extends again, and reads what its module brought
+module HD; def d = :d; def self.extended(o) = (o.extend(HE); ($saw << [:d, o.d, o.respond_to?(:e)])); end
+module HE; def e = :e; def self.extended(o) = ($saw << [:e, o.respond_to?(:d)]); end
+$saw = []
+x = Object.new.extend(HA, HD)
+p $saw, x.singleton_class.ancestors[1, 3]
