@@ -92,3 +92,37 @@ X = Comparable
 p try { module X; def cmpx = 1; end }, Comparable.instance_method(:cmpx).owner
 S = String
 p try { class S; def ss = 3; end }, "a".ss
+
+# 7. review of round 3
+#    a Struct copy keeps the members' initializer, for an #initialize that
+#    calls super, whether written before or after the dup
+KS = Struct.new(:x) do
+  def initialize(x) = super(x + 1)
+end
+CS = KS.dup
+p CS.new(1).to_a, KS.new(1).to_a
+LS = Struct.new(:a, :b)
+DS = LS.dup
+class DS
+  def initialize(a, b = 5) = super(a * 2, b)
+end
+p DS.new(1).to_a, LS.new(1, 2).to_a
+#    a superclass mismatch names the class as written
+class CM; end
+DM = CM
+p try { class DM < String; end }
+module NM
+  class AM; end
+  p try { class AM < String; end }
+end
+XM = Class.new
+p try { class XM < String; end }
+#    Enumerable's methods reached by super from Range walk #each: a Range#to_a
+#    that calls super, an endless range, and map without a block
+class Range
+  def to_a = super
+  def first(n = nil) = n ? super : super()
+  def map(&b) = super
+end
+p (1..3).to_a, (1..).first(2), (1..4).first, (1..3).map { |x| x * 2 }, (1..3).map.inspect
+p (1..).each.first(2), (1..Float::INFINITY).each.first(2)

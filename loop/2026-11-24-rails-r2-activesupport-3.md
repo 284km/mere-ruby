@@ -2,8 +2,8 @@
 
 The REDs left in the `68588737` records that come from this flow's own
 shapes, plus the VM's nokogiri stop. Witness:
-`corpus/935_activesupport_round_two_shapes.rb`, which matches ruby on the
-evaluator and on the VM.
+`corpus/935_activesupport_round_two_shapes.rb` (section 7 holds the review's
+cases), which matches ruby on the evaluator and on the VM.
 
 ## What changed
 
@@ -68,3 +68,44 @@ sums, constant cache), `descendants_tracker` 2, and one each in
 `numeric_ext`, `string_ext` and `inflector` (titleize), `time_with_zone`,
 `gzip`, `logger`, `error_reporter` and `time_travel` (Time subclass).
 `duplicable` has 1 MISSING.
+
+## Review (no Critical or Major; Minor 1 and 2 fixed here)
+
+- **P2 (review bot): a Struct copy lost the members' initializer.** `dup`
+  copied `struct_mem` and `struct_gen` but not `struct_initializers`, and
+  `struct_initialize_members` looks the initializer up on the class that
+  `struct_members_cls` picks, which is the copy. An `#initialize` that calls
+  super stopped, whether it was written in the original (`K = Struct.new(:x)
+  { def initialize(x) = super(x + 1) }; K.dup.new(1)`) or in the copy after
+  the dup. The copy now gets the entry too. A Struct with the generated
+  initializer only worked because its body is copied directly.
+
+- **Minor 1: the superclass mismatch named the class the alias resolves to**
+  (`D = C; class D < String` said "class C"). Both registration paths now
+  name the class as written, without its scope. This also fixes two older
+  differences from ruby: a nested class said "class N::A" (ruby: "class A"),
+  and an anonymous class held by a constant said "class AnonClass_1"
+  (ruby: "class X").
+- **Minor 2: Range's super into Enumerable built the range with `to_a`,
+  called by name.** A Range#to_a that calls super recursed into
+  SystemStackError, and `(1..).first(2)` through super was a RangeError.
+  The super now walks an Enumerator over the range's `#each`. Without a
+  block, the methods that answer an Enumerator answer one on the range
+  itself (`#<Enumerator: 1..3:map>`).
+  The walk met an older bug (main has it): an Enumerator over a range that
+  starts with an Integer took the fast path for Integer ranges (`gen1_src`),
+  whose `gen1_take` makes elements only when both ends are Integers.
+  `(1..).each.first(2)` and `(1..Float::INFINITY).each.first(2)` were `[]`.
+  The fast path now takes only Integer..Integer, and the others walk.
+- Left, as on main (the review allows recording these):
+  - `super` from a module PREPENDED to Range should reach Range's own method
+    (`(1.5..3.5).min` is 1.5 there). It reaches Enumerable's, as from a
+    method in Range itself. Range's arms take no one-call bypass (#181
+    removed it: a bypass was spent by an arm that did not take the call), so
+    this needs its own design.
+  - After a Symbol builtin is redefined, an alias of it reads only its first
+    argument (outside the new branch's condition).
+  - From main: `(1..).each_slice(2).first(1)` and `(1..).each_entry.first(2)`
+    raise "cannot convert endless range to an array" (ruby answers).
+  - From main: a Struct's error messages show the internal name
+    (`Struct_1`), and `puts` does not use a user-defined `#to_ary`.
