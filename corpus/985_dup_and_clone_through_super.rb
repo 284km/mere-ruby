@@ -82,3 +82,11 @@ def callable.marker = :proc_singleton
 end
 callable.freeze
 p [callable.dup.frozen?, callable.clone.frozen?]
+
+# Immutable native values retain their original native copy route too.
+[Integer, Float, Rational, Complex, Symbol, NilClass, TrueClass, FalseClass].each do |klass|
+  klass.prepend(ForwardProcCopy)
+end
+[1, 1.5, Rational(1, 2), Complex(1, 1), :symbol, nil, true, false].each do |value|
+  p [value.class, value.dup.equal?(value), value.clone.equal?(value)]
+end

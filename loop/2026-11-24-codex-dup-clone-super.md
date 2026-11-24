@@ -33,3 +33,9 @@ world-aware redispatch re-entered the same Ruby method. Proc's native super
 path now calls its existing primitive copy operation directly and copies its
 ivars without redispatch. Corpus 985 covers an extended Proc, copied ivars,
 invocation, singleton retention and frozen-state preservation.
+
+The same review follow-up was checked against immutable native receivers:
+a Rational forwarding dup through super also re-entered its Ruby method.
+World-aware redispatch is now limited to object, class and container receivers;
+other primitive values retain their existing native super path. Corpus 985
+adds forwarded dup/clone on eight immutable native value classes.
