@@ -87,3 +87,44 @@ rescue ArgumentError => error
 end
 keyword_lambda = ->(a:) { a }
 p [:lambda_keywords, keyword_lambda.call(*[original])]
+
+# Supplying a block must not bypass the called Proc's flag or lambda marker.
+marked_lambda = ->(*a) { a.last }.ruby2_keywords
+flagged_proc = proc { |*a| a.last }.ruby2_keywords
+call_block = proc {}
+[flagged_proc, marked_lambda].each_with_index do |callable, index|
+  value = callable.call(*[original], &call_block)
+  p [:marked_with_block, index, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = callable.call(*[original]) {}
+  p [:marked_with_literal, index, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+end
+begin
+  ->(x) { x }.call(1, 2) {}
+rescue ArgumentError => error
+  p [:lambda_block_arity, error.class, error.message]
+end
+def capture_keyword_yield
+  proc { |*_| yield :captured }
+end
+captured = capture_keyword_yield { |value| [:home, value] }
+p [:captured_yield, captured.call(1) { :call_site }]
+
+# Direct marked calls keep the input; Method#call converts it at its boundary.
+p [:direct_marked, marked_method(*[original]).last.equal?(original)]
+p [:direct_marked_block, marked_method(*[original]) {}.last.equal?(original)]
+p [:marked_method_proc, method(:marked_method).to_proc.call(*[original]).last.equal?(original)]
+# Observer callbacks must not steal or leak the call's transient argument state.
+def self.keyword_observer_work
+  [1].each { |value| value.to_s }
+end
+trace = TracePoint.new(:call, :b_call, :c_call) { keyword_observer_work }
+trace.enable do
+  value = plain_method(*[original]).last
+  p [:trace_plain, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = marked_method(*[original]).last
+  p [:trace_marked, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = method(:marked_method).call(*[original]).last
+  p [:trace_bound, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = marked_proc.call(*[original]) {}
+  p [:trace_proc_block, value.last.equal?(original), Hash.ruby2_keywords_hash?(value.last)]
+end
