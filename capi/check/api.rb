@@ -22,6 +22,35 @@ end
 A = ApiFixture
 check(said == '')
 
+# C's constant APIs also accept hidden cache names, as io-console's
+# IO.console does. Ruby's own constant lookup must continue to reject them.
+class HiddenConstParent; end
+class HiddenConstChild < HiddenConstParent; end
+[:console, :_cache].each do |name|
+  check(!A.hidden_const_api(HiddenConstParent, name, 4, nil))
+  check(A.hidden_const_api(HiddenConstParent, name, 0, false) == false)
+  [1, 2, 3].each { |operation| check(A.hidden_const_api(HiddenConstParent, name, operation, nil) == false) }
+  [4, 5, 6].each { |operation| check(A.hidden_const_api(HiddenConstParent, name, operation, nil)) }
+  check(!HiddenConstParent.constants(false).include?(name))
+  raises(NameError) { HiddenConstParent.const_get(name) }
+  [1, 3].each { |operation| check(A.hidden_const_api(HiddenConstChild, name, operation, nil) == false) }
+  [4, 6].each { |operation| check(A.hidden_const_api(HiddenConstChild, name, operation, nil)) }
+  check(!A.hidden_const_api(HiddenConstChild, name, 5, nil))
+  raises(NameError) { A.hidden_const_api(HiddenConstChild, name, 2, nil) }
+  raises(NameError) { A.hidden_const_api(HiddenConstChild, name, 7, nil) }
+  check(A.hidden_const_api(HiddenConstChild, name, 0, nil).nil?)
+  check(A.hidden_const_api(HiddenConstChild, name, 5, nil))
+  check(A.hidden_const_api(HiddenConstChild, name, 7, nil).nil?)
+  check(!A.hidden_const_api(HiddenConstChild, name, 5, nil))
+  check(A.hidden_const_api(HiddenConstParent, name, 7, nil) == false)
+  check(!A.hidden_const_api(HiddenConstParent, name, 4, nil))
+  frozen_owner = Class.new
+  A.hidden_const_api(frozen_owner, name, 0, false)
+  frozen_owner.freeze
+  raises(FrozenError) { A.hidden_const_api(frozen_owner, name, 7, nil) }
+  check(A.hidden_const_api(frozen_owner, name, 5, nil))
+end
+
 # What C writes through a pointer it took before its Fiber was stopped goes
 # back to the object -- also when another stack ran a C call of its own
 # meanwhile.
