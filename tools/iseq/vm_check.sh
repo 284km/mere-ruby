@@ -25,7 +25,7 @@
 #   sh tools/iseq/vm_check.sh [snippets]       (RUBY=, MR_BIN= to override)
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-RUBY="${RUBY:-$HOME/.rbenv/versions/4.0.9/bin/ruby}"
+RUBY="${RUBY:-$HOME/.rbenv/versions/4.0.10/bin/ruby}"
 MR="${MR_BIN:-$ROOT/mere-ruby}"
 case "$MR" in /*) ;; *) MR="$(pwd)/$MR" ;; esac
 SNIPS="${1:-$ROOT/tools/iseq/vm_snippets.txt}"

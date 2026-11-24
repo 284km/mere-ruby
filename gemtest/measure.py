@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Measure the same installed gems with pinned reference, bundled and external stdlib."""
 import argparse
+from datetime import date
 import hashlib
 import json
 import os
@@ -26,7 +27,7 @@ def main():
     assert (args.gem_home/'specifications').is_dir()
     assert (args.rubygems/'lib/rubygems.rb').is_file()
     version=subprocess.check_output([args.reference,'-e','print RUBY_VERSION'],text=True)
-    assert version=='4.0.9',version
+    assert version=='4.0.10',version
     stdlib=subprocess.check_output([args.reference,'-rrbconfig','-rrubygems','-e',
         'print ([RbConfig::CONFIG["rubylibdir"]]+Dir[File.join(Gem.default_dir,"gems","*","lib")].sort).join(":")'],text=True)
     runtime=subprocess.check_output(['sh',str(ROOT/'tools/runtime_load_path.sh'),str(Path(args.binary).resolve())],text=True)
@@ -59,7 +60,7 @@ def main():
         (args.output/'results.json').write_text(json.dumps({'reference_version':version,'gemspec_sha256':specs,'snapshot':snapshot,'rows':rows},indent=2)+'\n')
     if args.snapshot_lock:assert verify_snapshot(args.gem_home,args.snapshot_lock,gems)==snapshot,'snapshot changed during measurement'
     eligible=[r for r in rows if r['classification']=='eligible']
-    summary={'date':'2026-11-10','reference_version':version,'listed':len(rows),'reference_loads':len(eligible),
+    summary={'date':date.today().isoformat(),'reference_version':version,'listed':len(rows),'reference_loads':len(eligible),
              'reference_unavailable':len(rows)-len(eligible),
              'bundled_loads':sum(r['bundled']['loaded'] for r in eligible),
              'external_loads':sum(r['external']['loaded'] for r in eligible)}

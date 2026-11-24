@@ -1,6 +1,11 @@
 # Original upstream gem tests
 
-`suites.py` runs each locked upstream test file under Ruby 4.0.9 and an O2
+Saved results retain their original reference version. For the 4.0.9 to
+4.0.10 transition, baseline comparison verifies that only the reference
+version and source revision changed in the lock; source/package digests,
+test files, commands and regression checks remain enforced.
+
+`suites.py` runs each locked upstream test file under Ruby 4.0.10 and an O2
 mere-ruby build. It does not modify the original tests or helpers. The first
 five suites are minitest 5.25.5, rack 3.2.0, rack-test 2.2.0, public_suffix
 6.0.2 and base64 0.2.0 (62 files). These are independent of the load-only
@@ -73,10 +78,10 @@ this repository. Nothing is resolved against the user's installed gems.
 
 ```sh
 python3 gemtest/suites.py restore --cache /path/to/suite-cache \
-  --reference /path/to/ruby-4.0.9/bin/ruby
+  --reference /path/to/ruby-4.0.10/bin/ruby
 python3 gemtest/suites.py measure --cache /path/to/suite-cache \
-  --reference /path/to/ruby-4.0.9/bin/ruby --binary ./mere-ruby \
-  --ruby-src /path/to/ruby-source-3e93b23 --output /tmp/gem-suites-new \
+  --reference /path/to/ruby-4.0.10/bin/ruby --binary ./mere-ruby \
+  --ruby-src /path/to/ruby-source-a704b7c --output /tmp/gem-suites-new \
   --baseline gemtest/suites_latest.json
 ```
 

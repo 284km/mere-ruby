@@ -29,12 +29,14 @@ class RubyVM::InstructionSequence
     CALL_KW_SPLAT_MUT = 2048
     CALL_ARGS_SPLAT_MUT = 4096
     CALL_FORWARDING = 8192
+    CALL_IGNORE_REFINEMENTS = 16384
     # (iseq.c's order, not the bits')
     CALL_FLAG_NAMES = [[CALL_ARGS_SPLAT, "ARGS_SPLAT"], [CALL_ARGS_SPLAT_MUT, "ARGS_SPLAT_MUT"],
                        [CALL_ARGS_BLOCKARG, "ARGS_BLOCKARG"], [CALL_FCALL, "FCALL"], [CALL_VCALL, "VCALL"],
                        [CALL_ARGS_SIMPLE, "ARGS_SIMPLE"], [CALL_TAILCALL, "TAILCALL"], [CALL_SUPER, "SUPER"],
                        [CALL_ZSUPER, "ZSUPER"], [CALL_KWARG, "KWARG"], [CALL_KW_SPLAT, "KW_SPLAT"],
-                       [CALL_KW_SPLAT_MUT, "KW_SPLAT_MUT"], [CALL_FORWARDING, "FORWARDING"]].freeze
+                       [CALL_KW_SPLAT_MUT, "KW_SPLAT_MUT"], [CALL_FORWARDING, "FORWARDING"],
+                       [CALL_IGNORE_REFINEMENTS, "IGNORE_REFINEMENTS"]].freeze
 
     EVENT_BITS = { line: 0x01, class: 0x02, end: 0x04, call: 0x08, return: 0x10,
                    c_call: 0x20, c_return: 0x40, b_call: 0x100, b_return: 0x200, rescue: 0x4000 }.freeze
@@ -1001,7 +1003,7 @@ class RubyVM::InstructionSequence
         done = u.new_label
         fwd = flag & CALL_FORWARDING != 0 ? 1 : 0
         u.insn(:opt_new, ci(:new, argc + fwd, flag, kws), not_basic)
-        sendish(u, :initialize, argc, flag | CALL_FCALL, kws, nil)
+        sendish(u, :initialize, argc, flag | CALL_FCALL | CALL_IGNORE_REFINEMENTS, kws, nil)
         u.insn(:jump, done)
         u.emit_label(not_basic)
         sendish(u, :new, argc, flag, kws, nil)

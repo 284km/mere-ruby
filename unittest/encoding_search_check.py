@@ -11,7 +11,7 @@ parser.add_argument('--binary', type=Path, default=ROOT / 'mere-ruby')
 parser.add_argument('--reference', default=os.environ.get('REF_RUBY_BIN', 'ruby'))
 args = parser.parse_args()
 version = subprocess.check_output([args.reference, '-e', 'print RUBY_VERSION'], text=True, timeout=10)
-assert version == '4.0.9', 'reference version drift: ' + version
+assert version == '4.0.10', 'reference version drift: ' + version
 
 for name in ['546_encoding_name_folding.rb', '563_byte_search_offsets.rb']:
     source = ROOT / 'corpus' / name

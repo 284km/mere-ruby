@@ -616,7 +616,7 @@ void rb_define_virtual_variable(const char *name, rb_gvar_getter_t *getter, rb_g
 
 /* the version this interpreter reports as RUBY_VERSION -- a contract in
  * capi/check/api.rb compares the two, so they cannot drift apart */
-const char ruby_version[] = "4.0.9";
+const char ruby_version[] = "4.0.10";
 
 /* the IO that writes for io: io itself, unless it is a duplex stream whose
  * writing goes to a descriptor of its own (a popen "r+": @__io_wfd), which

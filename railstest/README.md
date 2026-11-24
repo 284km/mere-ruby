@@ -1,6 +1,7 @@
 # Rails application measurement
 
-This is a real Rails **8.1.4.1 application**, measured against Ruby 4.0.9.
+This is a real Rails **8.1.4.1 application**. The harness targets Ruby 4.0.10;
+the historical measurements below retain their recorded reference versions.
 It is not Rails' own framework test suite; that one is measured by
 [`framework/`](framework/README.md).
 
@@ -84,7 +85,7 @@ LANG=en_US.UTF-8 python3 railstest/measure.py restore \
 
 LANG=en_US.UTF-8 python3 railstest/measure.py measure \
   --archives /path/to/rails-archives \
-  --reference /path/to/ruby-4.0.9/bin/ruby \
+  --reference /path/to/ruby-4.0.10/bin/ruby \
   --binary ./mere-ruby \
   --sqlite-prefix /path/to/sqlite-prefix \
   --output /path/to/new-rails-run
