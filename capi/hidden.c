@@ -8,6 +8,8 @@
  * value. The table is a root of the collector, so what it holds lives as long
  * as CRuby's constant would. (Used by capi/object.c.) */
 #include "mr_capi.h"
+/* Class proxy flags omit freezing; use the exported state check here. */
+#undef rb_check_frozen
 
 static VALUE table = Qnil;
 

@@ -50,4 +50,12 @@ Dir.mktmpdir('hidden-constant-1018-') do |dir|
   p [api.cache(child, 5, nil), api.cache(child, 7, nil), api.cache(child, 5, nil)]
   p api.cache(parent, 7, nil)
   p api.cache(parent, 4, nil)
+  api.cache(parent, 0, 1)
+  parent.freeze
+  begin
+    api.cache(parent, 7, nil)
+  rescue FrozenError
+    p :kept_on_frozen_owner
+  end
+  p api.cache(parent, 1, nil)
 end
