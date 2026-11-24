@@ -21,9 +21,20 @@
 # and the script exits non-zero when there is a FAIL. The fallbacks are the
 # list of what the compiler and the VM do not take yet, most common first.
 #
+# A fallback is also held to a list kept in the repository,
+# tools/iseq/vm_fallbacks.txt: one corpus program a line, the reason after a
+# tab. The script exits non-zero when a program falls back that is not
+# listed (a change made the VM decline it), and when a listed program now
+# runs on the VM (the line is to be removed). A fallback passes the
+# comparison with ruby -- the evaluator ran it -- so without the list a
+# program that stopped running on the VM was a number nobody was asked to
+# read, and what the VM got wrong in it went unseen: round 62's test_hash.
+# Only the programs of this run are held to the list.
+#
 #   sh tools/iseq/vm_corpus.sh [-j N] [corpus/NNN_*.rb ...]
 #       (RUBY=, MR_BIN= to override -- RUBY defaults to tools/ref_ruby.sh's;
-#        VM_CORPUS_OUT=<dir> keeps the outputs)
+#        VM_CORPUS_OUT=<dir> keeps the outputs; VM_FALLBACKS=<file> is
+#        another list, VM_FALLBACKS=none none at all)
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 2
@@ -77,5 +88,28 @@ grep "^FAIL	" "$OUT/verdicts.tsv" | sort | while IFS='	' read -r v f why; do
 done
 echo "-- why a main script fell back, most common first"
 grep "^fallback	" "$OUT/verdicts.tsv" | cut -f3 | sed -E 's/[0-9]+/N/g' | sort | uniq -c | sort -rn | head -40
-echo "vm_corpus: $total programs -- $nvm on the VM, $nfb on the evaluator (fell back), $nfail FAIL"
-[ "$nfail" = 0 ]
+
+# the list of fallbacks: a program not on it that fell back, and one on it
+# that ran on the VM
+LIST="${VM_FALLBACKS:-$ROOT/tools/iseq/vm_fallbacks.txt}"
+nlist=0
+if [ "$LIST" != none ]; then
+  [ -f "$LIST" ] || { echo "vm_corpus: no list of fallbacks at $LIST" >&2; exit 2; }
+  grep -v '^#' "$LIST" | grep -v '^[[:space:]]*$' | cut -f1 | sort -u > "$OUT/listed.txt"
+  grep "^fallback	" "$OUT/verdicts.tsv" | sort -t '	' -k2,2 > "$OUT/fell.tsv"
+  while IFS='	' read -r v f why; do
+    if ! grep -qxF "$f" "$OUT/listed.txt"; then
+      echo "UNLISTED fallback $f ($why): the VM declines a program it is not listed to decline -- make it run on the VM, or add a line to $(basename "$LIST") saying why"
+      nlist=$((nlist + 1))
+    fi
+  done < "$OUT/fell.tsv"
+  grep "^vm	" "$OUT/verdicts.tsv" | cut -f2 | sort -u > "$OUT/ran.txt"
+  while read -r f; do
+    if grep -qxF "$f" "$OUT/ran.txt"; then
+      echo "LISTED but on the VM: $f runs on the VM now -- remove its line from $(basename "$LIST")"
+      nlist=$((nlist + 1))
+    fi
+  done < "$OUT/listed.txt"
+fi
+echo "vm_corpus: $total programs -- $nvm on the VM, $nfb on the evaluator (fell back), $nfail FAIL${nlist:+, $nlist against the list of fallbacks}"
+[ "$nfail" = 0 ] && [ "$nlist" = 0 ]
