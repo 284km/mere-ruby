@@ -55,14 +55,14 @@ p [m[0], m[1], m[2]]
 
 # a require that raises is NOT loaded: ruby takes the feature back out of
 # $LOADED_FEATURES so the next require retries
-File.write("/tmp/mrb_corpus_bad.rb", 'raise "boom"')
+File.write("/tmp/mrb_corpus_bad_#{$$}.rb", 'raise "boom"')
 $LOAD_PATH.unshift("/tmp")
 2.times do
   begin
-    require "mrb_corpus_bad"
+    require "mrb_corpus_bad_#{$$}"
   rescue RuntimeError => e
     puts "raised #{e.message}"
   end
 end
 p $LOADED_FEATURES.grep(/mrb_corpus_bad/).size
-File.delete("/tmp/mrb_corpus_bad.rb")
+File.delete("/tmp/mrb_corpus_bad_#{$$}.rb")
