@@ -14,6 +14,14 @@ started. This took the saved native operators and super into builtins (#172),
 default gem specs on `RUBYLIB` (#173), and a C function without the GVL
 running while other threads run (#177).
 
+**On both executions: [`cold_2c167cfd_evaluator.json`](cold_2c167cfd_evaluator.json)
+and [`cold_2c167cfd_vm.json`](cold_2c167cfd_vm.json).** Cold runs of `2c167cfd`
+(on main `17a5db5f`) pass all six stages on the evaluator and, with
+`--mere-env MERE_RUBY_VM=1`, on the ISeq VM. mere-ruby boots in 6.6 s on the
+evaluator and 10.3 s on the VM (the reference: 1.6 s); the six tests take
+11.6 s and 14.6 s (1.8 s), Puma's HTTP 9.9 s and 12.6 s (2.3 s). The load
+average was 7 to 9. `loop/2026-11-24-stage10-rails-vm-time.md` has the table.
+
 The earlier baseline: [`main_cold_c521aa58.json`](main_cold_c521aa58.json), a
 cold run of main `c521aa58` (its `source_ref` is a work-in-progress commit
 that adds only `railstest/` files on top of it). It used the harness before
@@ -81,6 +89,11 @@ LANG=en_US.UTF-8 python3 railstest/measure.py measure \
   --sqlite-prefix /path/to/sqlite-prefix \
   --output /path/to/new-rails-run
 ```
+
+`--mere-env MERE_RUBY_NAME=VALUE` (repeatable) sets a variable of mere-ruby's
+own on its side only, and the result records it as `mere_env`:
+`--mere-env MERE_RUBY_VM=1` measures the ISeq VM. Every inherited `MERE_RUBY_`
+name is still dropped.
 
 Omit `--sqlite-prefix` to use sqlite3's packaged SQLite build; that path also
 requires pkg-config. The measured system SQLite was 3.46.1. It is an explicit
