@@ -64,3 +64,21 @@ end
 CopyPlain.prepend(CopyBeforePlain)
 object = CopyPlain.new
 p [object.dup.class, object.dup.equal?(object)]
+
+# Proc uses its native copy operation after an extended Ruby forwarder.
+module ForwardProcCopy
+  def dup = super
+  def clone(...) = super
+end
+callable = proc { :ok }
+callable.extend(ForwardProcCopy)
+callable.instance_variable_set(:@data, [:shared])
+def callable.marker = :proc_singleton
+[:dup, :clone].each do |method|
+  copy = callable.public_send(method)
+  p [method, copy.equal?(callable), copy.call,
+     copy.instance_variable_get(:@data).equal?(callable.instance_variable_get(:@data)),
+     copy.respond_to?(:marker)]
+end
+callable.freeze
+p [callable.dup.frozen?, callable.clone.frozen?]

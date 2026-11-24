@@ -27,3 +27,9 @@ on and off, the full VM corpus, source gates, record hygiene and focused
 upstream copy tests against the starting main. Exact final-head results are
 posted in the PR description. No Rails cold measurement or full upstream
 unit-test suite is run.
+
+The follow-up review found that forwarding Proc dup/clone through the new
+world-aware redispatch re-entered the same Ruby method. Proc's native super
+path now calls its existing primitive copy operation directly and copies its
+ivars without redispatch. Corpus 985 covers an extended Proc, copied ivars,
+invocation, singleton retention and frozen-state preservation.
