@@ -97,6 +97,14 @@ sums, constant cache), `descendants_tracker` 2, and one each in
   whose `gen1_take` makes elements only when both ends are Integers.
   `(1..).each.first(2)` and `(1..Float::INFINITY).each.first(2)` were `[]`.
   The fast path now takes only Integer..Integer, and the others walk.
+- **Re-review Minor: from a module prepended to Range, super on a range
+  without an end never stopped** (`(1..).count`, and min, max, minmax,
+  to_a, entries). Main raised NoMethodError and the first head RangeError. Given no
+  block, on an endless or beginless range, these answer with Range's own
+  method (Infinity, the value, or its RangeError), as ruby does. Witness: the
+  end of corpus/935 section 7. The arm cannot tell where the super came from,
+  so a super from a method defined in Range itself answers the same way. Ruby
+  walks forever there (Enumerable's), so this stops where ruby does not.
 - Left, as on main (the review allows recording these):
   - `super` from a module PREPENDED to Range should reach Range's own method
     (`(1.5..3.5).min` is 1.5 there). It reaches Enumerable's, as from a
@@ -107,5 +115,10 @@ sums, constant cache), `descendants_tracker` 2, and one each in
     argument (outside the new branch's condition).
   - From main: `(1..).each_slice(2).first(1)` and `(1..).each_entry.first(2)`
     raise "cannot convert endless range to an array" (ruby answers).
+  - From main (re-review): `(1.0..).each.first(2)` and `(..3).each.first(2)`
+    raise RangeError where ruby raises TypeError; endless `each_cons` and
+    `each_with_index` raise RangeError too; on the evaluator only, a nested
+    anonymous class gets no superclass mismatch; with Range#first
+    overridden, `zip` does not read a Range argument right.
   - From main: a Struct's error messages show the internal name
     (`Struct_1`), and `puts` does not use a user-defined `#to_ary`.

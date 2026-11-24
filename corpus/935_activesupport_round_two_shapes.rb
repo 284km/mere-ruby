@@ -126,3 +126,14 @@ class Range
 end
 p (1..3).to_a, (1..).first(2), (1..4).first, (1..3).map { |x| x * 2 }, (1..3).map.inspect
 p (1..).each.first(2), (1..Float::INFINITY).each.first(2)
+#    ...and from a module prepended to Range, an endless or beginless range
+#    gets Range's own answer at once instead of a walk without end (not
+#    #to_a here: the Range#to_a above calls super into Enumerable's walk, which
+#    ruby runs forever too)
+module RangeSuperPrepended
+  %i[count min max minmax entries].each { |m| define_method(m) { |*a, &b| super(*a, &b) } }
+end
+Range.prepend RangeSuperPrepended
+p try { (1..).count }, try { (1..).min }, try { (1..).max }, try { (1..).minmax }, try { (1..).entries }
+p try { (..3).count }, try { (..3).max }, try { (..3).min }
+p try { (1..4).count }, try { (1..4).max }, try { (1..4).minmax }, try { (1..4).count(&:even?) }
