@@ -23,3 +23,5 @@ A newer version of a default gem counts too (erb 6.0.7 beside the default erb): 
 | `REF_RUBY_VERSION=4.0.9` | one line: no list for 4.0.9, not checked; goes on |
 | `REF_RUBY_BIN` of a 4.0.9 with the pin at 4.0.10 | stops on the version, as before |
 | the thirteen named as wanted (stands in for a clean directory) | goes on |
+
+After the thirteen were removed: the check goes on with nothing printed, `Prism::VERSION` on the reference is 1.8.2 again, and `gem list` shows erb at its default 6.0.7, irb 1.16.0 and rbs 3.10.0, the versions ruby 4.0.10 ships.
