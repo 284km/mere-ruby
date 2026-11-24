@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""A dropped Fiber that stopped inside an op-assign must be given back.
+"""A dropped Fiber that stopped inside an op-assign, a program's `==` or an
+expression-position `require` must be given back.
 
 Each form runs bench/fiber_scope_reclaim.rb at two counts. A fiber that is
 never reclaimed keeps its stack, so the peak RSS grows with the count: 2.8
 times from 1,000 to 3,000 turns when the scope rooted the stopped block
-(review of #191), 1.25 times when it is reclaimed. The bound is between."""
+(review of #191), 1.25 times when it is reclaimed. The `==` and `require`
+forms go through with_scratch_env on the evaluator (second review of #191). The bound is between."""
 import os
 from pathlib import Path
 import resource
@@ -36,7 +38,7 @@ def main():
         rss = peak_rss(sys.argv[2], int(sys.argv[3]))
         print(rss)
         return
-    for mode in ('value', 'getter', 'setter', 'aref', 'aset'):
+    for mode in ('value', 'getter', 'setter', 'aref', 'aset', 'eq', 'require'):
         low = measure(mode, LOW)
         high = measure(mode, HIGH)
         ratio = high / low
