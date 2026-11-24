@@ -21,13 +21,17 @@ module RubyVM::AbstractSyntaxTree
       path = loc.absolute_path
       return -1 unless path && File.file?(path)
       stat = File.stat(path)
-      key = [path, stat.mtime, stat.size]
-      @__nid_tree = [key, Prism.parse_file(path).value] unless @__nid_tree && @__nid_tree[0] == key
       line = loc.lineno
-      cands = []
-      __nid_walk(@__nid_tree[1], line, cands)
       want = loc.instance_variable_get(:@__callee)
       own = loc.base_label.to_s.to_sym
+      key = [path, stat.mtime, stat.size, line, want, own]
+      ids = (@__nid_ids ||= {})
+      return ids[key] if ids.key?(key)
+
+      # Cache only the answer. Keeping a complete native Prism tree here
+      # duplicates the tree error_highlight builds immediately afterwards.
+      cands = []
+      __nid_walk(Prism.parse_file(path).value, line, cands)
       tiers =
         if want == :"(entry)"
           # (the frame an ArgumentError of the arguments was raised entering:
@@ -54,7 +58,9 @@ module RubyVM::AbstractSyntaxTree
         targets = found.filter_map { |n| n.target.node_id if n.respond_to?(:target) }
         found = found.reject { |n| targets.include?(n.node_id) }
       end
-      found && found.size == 1 ? found[0].node_id : -1
+      id = found && found.size == 1 ? found[0].node_id : -1
+      ids.shift if ids.size >= 128
+      ids[key] = id
     end
 
     private
