@@ -60,3 +60,57 @@ module BareNamesHandled
   def self.method_missing(name, *args) = [name, args]
 end
 p BareNamesHandled.bare
+
+# The latest missing call replaces the reason even when its native default
+# raises and is rescued. Successful calls and an explicit Ruby raise do not.
+class NestedPrivateReceiver
+  private
+  def inner_missing = nil
+  protected
+  def protected_missing = nil
+end
+module NestedNativeMissing
+  def bare = missing_name
+  def primitive_name = chr
+  def method_missing(name, *args)
+    begin
+      case @nested_probe
+      when :object
+        Object.new.inner_missing
+      when :object_block
+        Object.new.inner_missing { :unused }
+      when :primitive
+        ''.inner_missing
+      when :class
+        Object.inner_missing
+      when :main
+        TOPLEVEL_BINDING.receiver.inner_missing
+      when :private
+        NestedPrivateReceiver.new.inner_missing
+      when :protected
+        NestedPrivateReceiver.new.protected_missing
+      when :successful
+        Object.new.to_s
+      when :ruby_raise
+        raise NoMethodError, 'explicit Ruby raise'
+      end
+    rescue NoMethodError
+    end
+    super
+  end
+end
+module NestedBareModule
+  extend NestedNativeMissing
+end
+class NestedBareClass
+  extend NestedNativeMissing
+end
+[NestedBareModule, NestedBareClass].each_with_index do |receiver, index|
+  [:object, :object_block, :primitive, :class, :main, :private, :protected,
+   :successful, :ruby_raise].each do |kind|
+    receiver.instance_variable_set(:@nested_probe, kind)
+    [:bare, :primitive_name].each do |method|
+      report_missing([index, kind], receiver, method)
+    end
+  end
+end

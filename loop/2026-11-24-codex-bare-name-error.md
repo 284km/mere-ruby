@@ -29,3 +29,12 @@ MERE_RUBY_VM=1, source gates and record hygiene. Focused unchanged upstream
 exception/defined tests are compared with the independently built starting
 main. Exact final-head results are recorded in the PR description. Rails cold
 measurements and the full upstream unit-test suite are outside this change.
+
+The follow-up review found that nested native missing calls did not replace
+the new class/module bare-call reason. The native primitive and ordinary-object
+failure paths now record the latest missing call, including calls with a block
+and visibility refusals. The bare-name and undefined-primitive helpers record
+their own call forms too. Corpus 983 adds module/class probes for object,
+primitive, class, main and private native failures rescued inside method_missing.
+Successful nested calls and explicit Ruby raises are controls that preserve the
+outer bare-call reason. Corpus 714 remains an independent nested-hook control.
