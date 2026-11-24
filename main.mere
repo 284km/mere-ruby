@@ -1047,6 +1047,12 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                       let _ = gc_mark_val live name in
                       let _ = gc_mark_val live owner in
                       let _ = gc_mark_val live receiver in gc_mark_val live extra) else ()) in
+                   // (an AST node's children, its other locations and its tree's
+                   //  lines and tokens: ast_node_vals)
+                   let _ = (if map_len ast_node_vals > 0 && map_has ast_node_vals id then
+                     (let (kids9, xl9, tree9) = map_get ast_node_vals id in
+                      let _ = gc_mark_val live kids9 in
+                      let _ = gc_mark_val live xl9 in gc_mark_val live tree9) else ()) in
                    vec_push gc_obj_pend id) else ())
   | VStr id -> let k = id * 8 + 1 in
                (if gc_live_mark live k then gc_handle_class "str:" id else ())
@@ -2397,6 +2403,9 @@ let gc_collect = fn env -> fn world ->
     let _ = gc_drop_i ocls dOC in
     let _ = gc_drop_i method_cores dOC in
     let _ = (if nc then () else map_compact method_cores) in
+    let _ = gc_drop_i ast_node_pos dOC in
+    let _ = gc_drop_i ast_node_vals dOC in
+    let _ = (if nc then () else (let _ = map_compact ast_node_pos in map_compact ast_node_vals)) in
     let _ = gc_purge_sng world dOC in
     let _ = (if nc then () else map_compact ocls) in
     // ⚠ md_whole had NO sweep. It is one entry per successful match -- the
@@ -16003,6 +16012,42 @@ and str_arg_enc_check = fn world -> fn (h: int) -> fn (args: Val list) ->
                   ("incompatible character encodings: " ++ enc_msg_name (senc_get h) ++ " and " ++ enc_msg_name (senc_get y)) in ())
      else str_arg_enc_check world h t)
   | Cons (_, t) -> str_arg_enc_check world h t
+// the names a Node answers from its row, the builtins of the prelude's
+// `class Node` (m_driver.mere): its location and number, its children, and
+// what its tree shares (script lines, tokens) and its other locations
+and ast_node_reader = fn (n: str) ->
+  str_eq n "type" || str_eq n "children" || str_eq n "first_lineno" || str_eq n "first_column"
+  || str_eq n "last_lineno" || str_eq n "last_column" || str_eq n "node_id"
+  || str_eq n "script_lines" || str_eq n "all_tokens" || str_eq n "__locations"
+// ...whether a Node answers the name from the table: a reader ruby defines
+// on Node, unless the program took it away (remove_method / undef_method
+// leave a tombstone, set_undef, and the call then misses as ruby's does), or
+// the same reader under `__nd_`, which the prelude's #inspect and #locations
+// read -- ruby's are Primitives, which a program's own `def type` does not
+// change
+and ast_node_answers = fn (n: str) ->
+  if str_len n > 5 && str_starts_with n "__nd_" then ast_node_reader (substring n 5 (str_len n))
+  else ast_node_reader n
+       && (if map_len undef_names > 0 && map_has undef_names n
+           then (if map_has undefs ("RubyVM::AbstractSyntaxTree::Node#" ++ n) then false else true)
+           else true)
+and ast_node_get = fn world -> fn (id: int) -> fn (n0: str) -> fn (args: Val list) ->
+  let n = (if str_len n0 > 5 && str_starts_with n0 "__nd_" then substring n0 5 (str_len n0) else n0) in
+  match args with
+  | Cons (_, _) -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (list_len_v args 0) ++ ", expected 0)")
+  | Nil ->
+    (let (ty, fl, fc, ll, lc, nid) = map_get ast_node_pos id in
+     let (kids, xl, tree) = map_get ast_node_vals id in
+     if str_eq n "type" then VSym (vec_get ao_names ty)
+     else if str_eq n "children" then kids
+     else if str_eq n "first_lineno" then VInt fl
+     else if str_eq n "first_column" then VInt fc
+     else if str_eq n "last_lineno" then VInt ll
+     else if str_eq n "last_column" then VInt lc
+     else if str_eq n "node_id" then VInt nid
+     else if str_eq n "script_lines" then (match tree with VArr a9 -> arr_at a9 0 | _ -> VNil)
+     else if str_eq n "all_tokens" then (match tree with VArr a9 -> arr_at a9 1 | _ -> VNil)
+     else xl)
 and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
   // the count comes first: ruby refuses a wrong number of arguments before it
   // looks at what they are.
@@ -18831,6 +18876,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // them from -- so the copy came back without them: `s.dup` lost an @ivar that
   // `s.instance_variable_set` had just put there. The object path already
   // copied its ivars; this is the same thing for the handle-keyed ones.
+  // RubyVM::AbstractSyntaxTree::Node is a C object with no allocator: ruby's
+  // #dup / #clone refuse it. Its values are in ast_node_pos / ast_node_vals
+  // by its id, so a copy would be a Node with none.
+  else if map_len ast_node_pos > 0 && ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
+          && (match recv with VObj i9 -> map_has ast_node_pos i9 | _ -> false) then
+    raise_exc world "TypeError" "allocator undefined for RubyVM::AbstractSyntaxTree::Node"
   else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
           && (match recv with VStr _ -> true | VArr _ -> true | VHsh _ -> true | _ -> false)
           && not (has_meth world (class_name recv) name) then
@@ -23305,7 +23356,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             else ()) in
           // a core class's own public methods (m_builtin_lists), which no
           // table row names: `String.instance_methods(false)` was []
-          let _ = (let l9 = builtin_own_names c in
+          let _ = (let l9 = own_builtin_names c in
                    if str_eq l9 "" then ()
                    else (let had9 = map_new () in
                          let _ = map_iter tmp (fn (k9: str) -> fn (v9: Val) -> (match v9 with VSym y9 -> map_set had9 y9 1 | _ -> ())) in
@@ -23744,7 +23795,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // .public_instance_methods(false)` was [], and DelegateClass(Array)
           // delegated nothing of Array's
           let _ = (if (if want_prot || want_priv then false else true) then
-                     (let l9 = builtin_own_names cx in
+                     (let l9 = own_builtin_names cx in
                       if str_eq l9 "" then ()
                       else list_iter (str_split l9 " ")
                              (fn (nb9: str) -> (if map_has meths0 (pfx ++ nb9) then () else push9 nb9)))
@@ -26434,6 +26485,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                        //  and a missing method still raises after it)
                        (if map_has meths0 key || builtin_owns_here c n9 || map_has vis_marks key
                            || map_has builtin_alias key
+                           // (a reader of Node's, not yet taken away)
+                           || (str_len c == 32 && str_eq c "RubyVM::AbstractSyntaxTree::Node" && ast_node_reader n9
+                               && (if map_has undefs key then false else true))
                            || (str_eq c "BasicObject" && bo_defines "BasicObject" n9)
                            || ((str_eq c "Module" || str_eq c "Class") && is_definition_hook n9) then
                           (if (if tomb then false else true) && map_has builtin_alias key then map_delete builtin_alias key else ())
@@ -26450,7 +26504,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             let bi9 = (if map_has meths0 key then false else builtin_owns_here c n9) in
             let _ = if map_has meths0 key then del_meth meths0 key else () in
             let _ = if map_has builtin_alias key then map_delete builtin_alias key else () in
-            let _ = if tomb || bi9 then set_undef key else () in
+            // (...and so is a reader of RubyVM::AbstractSyntaxTree::Node's,
+            //  which a program's own def had replaced: ruby's own is gone
+            //  with it, and the call misses -- ast_node_answers)
+            let nd9 = (str_len c == 32 && str_eq c "RubyVM::AbstractSyntaxTree::Node" && ast_node_reader n9) in
+            let _ = if tomb || bi9 || nd9 then set_undef key else () in
             let _ = run_cls_hook world c (if tomb then "method_undefined" else "method_removed") n9 in
             let _ = run_sng_hook world c (if tomb then "singleton_method_undefined" else "singleton_method_removed") n9 in
             go9 rest9) in
@@ -26967,6 +27025,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if has_meth world cls "method_missing" then (let _ = vec_set mm_priv 0 (mm_reason_take ()) in invoke world noblk recv cls "method_missing" (Cons (VSym name, args)))
        else raise_exc_iv world "NoMethodError" (refused9 ++ " method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
               (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
+    // RubyVM::AbstractSyntaxTree::Node's readers, from ast_node_pos /
+    // ast_node_vals: after the method table, so a program's own `def type`
+    // in Node still answers (ast_node_get)
+    else if map_len ast_node_pos > 0 && map_has ast_node_pos id && ast_node_answers name then
+      ast_node_get world id name args
     // A visibility-only entry has no Ruby method row. Native Method#unbind
     // must still refuse the call and give method_missing its usual chance.
     else if vischeck && str_eq cls "Method" && str_eq name "unbind"
@@ -34285,6 +34348,13 @@ and native_owner_method_mark = fn world -> fn (id9: int) -> fn (owner9: str) ->
 and module_notification_method_mark = fn world -> fn (id9: int) ->
   native_owner_method_mark world id9 "Module"
 
+// the public methods a class answers with no table row: a core class's
+// (m_builtin_lists, generated) and RubyVM::AbstractSyntaxTree::Node's readers
+// (ast_node_get), which ruby defines on Node itself
+and own_builtin_names = fn (cls: str) ->
+  if str_len cls == 32 && str_eq cls "RubyVM::AbstractSyntaxTree::Node" then
+    "all_tokens children first_column first_lineno last_column last_lineno node_id script_lines type"
+  else builtin_own_names cls
 and bi_skip_pass = fn (name: str) ->
   if map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name then (let _ = map_clear bi_skip in false)
   else true
@@ -48511,6 +48581,11 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
        then invoke world noblk (VObj id) "IO" (fdio_mname name) args
        else if has_meth world cls name then invoke world noblk (VObj id) cls name args
+       // RubyVM::AbstractSyntaxTree::Node's readers called bare -- in a method
+       // a program (test_ast's Helper, pp) adds to Node: `first_lineno` --
+       // as `self.first_lineno` reaches them (ast_node_get)
+       else if map_len ast_node_pos > 0 && map_has ast_node_pos id && ast_node_answers name then
+         ast_node_get world id name args
        // the string form of instance_eval/instance_exec on an object self
        // (e.g. inside an instance_exec block) routes to the prim dispatcher,
        // exactly like the VMain special case below.
@@ -49119,6 +49194,11 @@ and try_self_call1 = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> 
        if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
        then invoke world noblk (VObj id) "IO" (fdio_mname name) args
        else if has_meth world cls name then invoke world noblk (VObj id) cls name args
+       // RubyVM::AbstractSyntaxTree::Node's readers called bare -- in a method
+       // a program (test_ast's Helper, pp) adds to Node: `first_lineno` --
+       // as `self.first_lineno` reaches them (ast_node_get)
+       else if map_len ast_node_pos > 0 && map_has ast_node_pos id && ast_node_answers name then
+         ast_node_get world id name args
        // an Enumerable-mixin method (map/count/inject/...) or a name the
        // object responds to (method_missing) with implicit self routes through
        // the receiver dispatcher, exactly as `self.name` would; a genuinely
@@ -60699,7 +60779,7 @@ and collect_vis = fn world -> fn (cls: str) -> fn names -> fn blocked -> fn (wan
      //  Comparable: ruby's `1i.respond_to?(:<)` is false)
      let _ = (if str_list_has anc9 "Complex" then list_iter (complex_undef_names ()) (fn (nu9: str) -> if map_has names nu9 then () else map_set blocked nu9 VNil) else ()) in
      let _ = list_iter anc9 (fn (a9: str) ->
-               (let l9 = builtin_own_names a9 in
+               (let l9 = own_builtin_names a9 in
                 if str_eq l9 "" then () else list_iter (str_split l9 " ") add9)) in
      let _ = (if str_list_has anc9 "Kernel" then list_iter (kernel_instance_list ()) add9 else ()) in
      let _ = (if str_list_has anc9 "Comparable" then list_iter (str_split "< <= == > >= between? clamp" " ") add9 else ()) in
@@ -60721,7 +60801,7 @@ and listed_builtin_root = fn world -> fn (cls: str) -> fn (nm: str) ->
   || (let rec own9 = fn (xs: str list) ->
         (match xs with
          | Nil -> false
-         | Cons (a9, t9) -> (let l9 = builtin_own_names a9 in
+         | Cons (a9, t9) -> (let l9 = own_builtin_names a9 in
                              (if str_eq l9 "" then false else has9 l9) || own9 t9)) in
       own9 anc9)
   || (str_list_has anc9 "Comparable" && has9 "< <= == > >= between? clamp")
