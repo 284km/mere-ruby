@@ -1,6 +1,7 @@
 # Action Pack: runtime contracts and complete suite accounting
 
-Work in progress, based on current main 30de57d4. Rails is the unchanged
+Work in progress, originally measured against main 30de57d4 and rebased onto
+976bb95d after the other runtime fixes merged. Rails is the unchanged
 8.1.4.1 tag; the reference is Ruby 4.0.10 from tools/ref_ruby.sh.
 The final complete run waits for the owner's schedule, to avoid overlapping
 Rails-2's full measurement. All checked-in results must distinguish evaluator
@@ -130,3 +131,18 @@ An intermediate build also passed 882/882 corpus programs in both hash modes
 in 725.672 seconds, peak family RSS 1193824 KiB, with no resource event. That
 precedes the hash-pattern/copy changes; the final 884-program sweep and full
 VM/fallback accounting remain required.
+
+## Main integration on November 25
+
+Rebased onto 976bb95d after the bare-name, numeric lookup, native-copy and
+extend-hook changes merged. The primitive copy guard now also sees singleton
+and private overrides. The one-call native bypass is consumed before copy
+hooks, using the upstream copy implementation; there is no second primitive
+super-copy path. Corpus 985 and 1017 cover the overlap. Final results must
+come from this combined build, not the earlier isolated runtime binary.
+
+The four parameters/browser controls move from 108 MATCH / 12 RED on
+30de57d4 to 120 MATCH / zero RED on the pre-integration runtime. The four
+permit/required/TestResponse controls move from 72 MATCH / 12 RED to
+84 MATCH / zero RED. Full corpus, VM accounting and the two large-file RSS
+measurements are being repeated after integration.
