@@ -165,7 +165,15 @@ $ref_ruby_wanted" "$REF_RUBY_BIN" -e '
         puts "  #{gem} uninstall #{name} --version #{version} --executables --ignore-dependencies"
       end
       puts "(a language server of an editor installs itself this way. REF_RUBY_EXTRA_GEMS_OK=1 skips this check.)"
-    ' 2>/dev/null)"
+    ')"
+    # (a check that could not run is not a clean directory: the script's own
+    #  failure stops here too, with what it said on stderr, rather than
+    #  answering nothing and passing)
+    ref_extra_rc=$?
+    if [ "$ref_extra_rc" -ne 0 ]; then
+      echo "reference ruby $REF_RUBY_VERSION: the check of its gem directory did not run (exit $ref_extra_rc); REF_RUBY_EXTRA_GEMS_OK=1 skips it" >&2
+      exit 2
+    fi
     if [ -n "$ref_extra" ]; then
       echo "$ref_extra" >&2
       exit 2
