@@ -22,7 +22,7 @@ os.environ['REF_RUBY_BIN'] = str(a.ruby.resolve())
 results = {}
 for side, binary in [('reference', a.ruby), ('native', a.binary)]:
     result, stdout, stderr = run_side(a.source.resolve(), a.ruby.resolve(), binary.resolve(),
-        a.output / side, {'file': 'tool/test/test_commit_email.rb'}, '4.0.9', 60, 2097152)
+        a.output / side, {'file': 'tool/test/test_commit_email.rb'}, '4.0.10', 60, 2097152)
     results[side] = result
     ci.sanitize_parts([stdout, stderr], a.output / (side + '.out'))
     print(side, result['state'], result['summary'], flush=True)

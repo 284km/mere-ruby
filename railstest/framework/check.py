@@ -38,7 +38,7 @@ class FrameworkCheck(unittest.TestCase):
     def test_lock_matches_gemfile_and_rails_tag(self):
         data = run.lock()
         self.assertEqual('8.1.4.1', data['rails_version'])
-        self.assertEqual('4.0.9', data['ruby_version'])
+        self.assertEqual('4.0.10', data['ruby_version'])
         self.assertEqual('3f290b759c8e2ffe7c257951b1255740751355e4', data['rails_source_commit'])
         lock = (run.ROOT / 'Gemfile.lock').read_text()
         names = {p['file'] for p in data['packages']}

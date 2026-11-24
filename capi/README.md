@@ -12,7 +12,7 @@ not written are listed under "What is missing".
 
 ## The headers
 
-`capi/include` is ruby 4.0.9's `include/` directory. Ten files differ from
+`capi/include` is ruby 4.0.10's `include/` directory. Ten files differ from
 the original, by `capi/tools/headers.patch` and nothing else
 (`capi/tools/headers_check.py <ruby source tree>` checks that):
 

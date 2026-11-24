@@ -7,7 +7,7 @@ require 'fileutils'
 require 'net/http'
 require 'optparse'
 
-abort 'reference Ruby4.0.9 is required' unless RUBY_VERSION == '4.0.9'
+abort 'reference Ruby4.0.10 is required' unless RUBY_VERSION == '4.0.10'
 options = {}
 OptionParser.new do |parser|
   parser.on('--inventory PATH') { |value| options[:inventory] = value }
@@ -63,11 +63,13 @@ candidates = lambda do |name, requirement|
   end
   if result.empty?
     spec = Gem::Specification.find_all_by_name(name,requirement).select { |spec| spec.default_gem? || spec.full_gem_path.start_with?(File.join(Gem.default_dir,'gems')+'/') }.max_by(&:version)
-    result << {'name'=>name,'version'=>spec.version.to_s,'file'=>spec.file_name,'origin'=>'pinned Ruby4.0.9 default gem'} if spec
+    result << {'name'=>name,'version'=>spec.version.to_s,'file'=>spec.file_name,'origin'=>"pinned Ruby#{RUBY_VERSION} default gem"} if spec
   end
   result.sort_by { |item| [Gem::Version.new(item.fetch('version')),item.fetch('file')] }.reverse
 end
 
+# reference_ruby identifies the immutable package snapshot, not the Ruby
+# executing this replay. Keep the original package sources across oracle upgrades.
 if lock
   abort 'snapshot format/reference changed' unless lock.fetch('format') == 1 && lock.fetch('reference_ruby') == '4.0.9'
   abort 'requested gem list changed' unless lock.fetch('requested') == requested
@@ -142,7 +144,7 @@ until queue.empty?
     end
   end
 end
-report = {'format'=>1,'reference_ruby'=>'4.0.9','requested'=>requested,'packages'=>packages.sort_by { |item| item.fetch('file') },
+report = {'format'=>1,'reference_ruby'=>(lock ? lock.fetch('reference_ruby') : RUBY_VERSION),'requested'=>requested,'packages'=>packages.sort_by { |item| item.fetch('file') },
           'supplemental_stdlib_roots'=>(lock ? lock.fetch('supplemental_stdlib_roots',[]) : supplemental),'unavailable'=>unavailable.uniq,'missing_dependencies'=>missing_dependencies.uniq,
           'native_extension_policy'=>'Source packages are restored without rebuilding native extensions, matching the previous load-only measurement boundary. This does not claim native extension functionality.'}
 File.write(File.join(output,'snapshot.lock.json'),JSON.pretty_generate(report)+"\n")

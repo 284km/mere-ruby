@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / 'unittest'))
 import ci
 import transcript
 
-RUBY_REF = '3e93b23afcec3433f6aecc34b5d832799d754238'
+RUBY_REF = 'a704b7cd95a42cc0cf5f307137bf3aac0285b915'
 
 
 def main():
@@ -36,7 +36,7 @@ def main():
     if not reference:
         parser.error('a reference Ruby executable is required for subprocess context')
     os.environ['REF_RUBY_BIN'] = str(Path(reference).resolve())
-    env = ci.test_environment(output / 'environment', binary, '4.0.9')
+    env = ci.test_environment(output / 'environment', binary, '4.0.10')
     runtime = subprocess.check_output(['sh', str(ROOT / 'tools/runtime_load_path.sh'), str(binary)],
                                       text=True, timeout=20).split(os.pathsep)
     env.update(RUBY=str(binary), UNITTEST_CHILD_RUBY=str(binary),

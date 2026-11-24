@@ -18,7 +18,7 @@ import transcript
 from method_copy_memory_check import PROGRAM
 
 SUBJECT = '90c83c6e525fbac7c7b9cdf670bd5e6db1ca79a5'
-RUBY = '3e93b23afcec3433f6aecc34b5d832799d754238'
+RUBY = 'a704b7cd95a42cc0cf5f307137bf3aac0285b915'
 TEST_SHA = '6b9b0fe714d15e2d08ac9ac6954b5f429754b2507eec2960b9544bc54eb8cdbc'
 PROGRAM_SHA = '9bb9dd80ebc082cdb1c356e415f688598228cf8e075ddfb4ae509f5581ca38a3'
 CLONE_SHA = '8789649ad88008ef963cd64e00fdee7ed92ef22b84aeb76362d3b1862b2f4fc9'
@@ -178,7 +178,7 @@ def policy_observed(samples):
 
 def environment(binary, directory, reference, source):
     os.environ['REF_RUBY_BIN'] = str(reference)
-    env = ci.test_environment(directory / 'environment', binary, '4.0.9')
+    env = ci.test_environment(directory / 'environment', binary, '4.0.10')
     runtime = subprocess.check_output(
         ['sh', str(ROOT / 'tools/runtime_load_path.sh'), str(binary)], text=True).split(os.pathsep)
     env.update(RUBY=str(binary), UNITTEST_CHILD_RUBY=str(binary),
@@ -245,8 +245,8 @@ def collect(args):
             or (subject / '.build_mode').read_text().strip() != 'O2'
             or (probe / '.build_mode').read_text().strip() != MODE):
         raise ValueError('locked inputs and separate ordinary / diagnostic binaries are required')
-    if not subprocess.check_output([str(reference), '-v'], text=True).startswith('ruby 4.0.9 '):
-        raise ValueError('reference Ruby 4.0.9 is required')
+    if not subprocess.check_output([str(reference), '-v'], text=True).startswith('ruby 4.0.10 '):
+        raise ValueError('reference Ruby 4.0.10 is required')
     receipt = json.loads((probe / 'probe-build.json').read_text())
     if (receipt['subject_ref'] != args.subject_ref or receipt['mode'] != MODE
             or receipt['ordinary_binary_sha256'] != ci.digest(subject / 'mere-ruby')

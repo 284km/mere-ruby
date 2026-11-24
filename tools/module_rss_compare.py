@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / 'unittest'))
 import ci
 import transcript
 
-RUBY_REF = '3e93b23afcec3433f6aecc34b5d832799d754238'
+RUBY_REF = 'a704b7cd95a42cc0cf5f307137bf3aac0285b915'
 COMPILER_REF = '43f2994b7d2bc664e47afa1c9555f2dcf26214f2'
 BASE_REF = '3b05689f57dbc0321c249523eacf4863eaa7c8bf'
 CANDIDATE_REF = '949e46384c1c4190be443450c3bdef0f4d822112'
@@ -95,7 +95,7 @@ def main():
             key = mode + '-' + label
             directory = args.output / key
             directory.mkdir()
-            env = ci.test_environment(directory / 'environment', binary, '4.0.9')
+            env = ci.test_environment(directory / 'environment', binary, '4.0.10')
             runtime = subprocess.check_output(
                 ['sh', str(ROOT / 'tools/runtime_load_path.sh'), str(binary)],
                 text=True, timeout=20).split(os.pathsep)

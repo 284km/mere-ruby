@@ -14,7 +14,7 @@ files. This says exactly how they differ from the tree they were copied from:
     the tree's
   - every .c and .h of capi/vendor is the tree's file of the same path
 
-The tree must be the version the headers were copied from (ruby 4.0.9, the
+The tree must be the version the headers were copied from (ruby 4.0.10, the
 commit CI names RUBY_SOURCE_REF).
 """
 from pathlib import Path

@@ -5,7 +5,7 @@
 #   ./unittest/run.sh <ruby-src> [--list] [--all | path under test/ ...]
 #
 # <ruby-src> is a CRuby source tree AT THE REFERENCE'S RELEASE -- the ruby_4_0
-# branch for 4.0.9 (tools/ref_ruby.sh). Only two of its directories are read:
+# branch for 4.0.10 (tools/ref_ruby.sh). Only two of its directories are read:
 # tool/lib, which holds the framework the tests are written against (its own
 # test/unit, core_assertions, envutil -- NOT the test-unit gem), and test/.
 # ⚠ A tree from another release is a different subject: master's test/json is

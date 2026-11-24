@@ -38,10 +38,13 @@
 # arity, gets on a character boundary, strftime's zone abbreviation. ruby/spec
 # did not move (2487 on both): its tree is pinned separately.
 #
+# 2026-11-24: the reference is Ruby 4.0.10, tag a704b7cd95. Saved
+# 4.0.9 measurements keep their original provenance; new runs use this pin.
+#
 # So: name the version, select it if rbenv has it, and refuse to run otherwise.
 # Refusing is the point. A gate that runs against whatever ruby is on PATH
 # reports a regression that did not happen, and the reader cannot tell.
-REF_RUBY_VERSION="${REF_RUBY_VERSION:-4.0.9}"
+REF_RUBY_VERSION="${REF_RUBY_VERSION:-4.0.10}"
 if [ -n "${REF_RUBY_BIN:-}" ]; then
   # CI builds a reference with test-only C extensions. Verify that exact
   # binary rather than replacing it with an installed rbenv interpreter.
