@@ -1,10 +1,11 @@
 # RubyVM::AbstractSyntaxTree::Node is a C object: it has no instance
-# variables, it cannot be copied or dumped, and its readers are methods of
-# Node itself -- answered with a receiver, called bare in a method a program
-# adds to Node, and named by reflection. A program's own reader wins, but
-# not in #inspect or #locations; a reader removed or undefined is gone. A
-# Node held across collections keeps its values; the trees dropped beside it
-# are reclaimed.
+# variables, and it cannot be copied or dumped. Its readers are methods of
+# Node itself, with a receiver or bare, in reflection, aliased, made private,
+# and reached by super from a prepended module. They come before what
+# Object and Kernel define. A program's own reader wins, but not in
+# #inspect or #locations; a reader removed or undefined is gone. A Node held
+# across collections keeps its values; the trees dropped beside it are
+# reclaimed.
 src = "x = 1 + 2\nfoo(x) { |y| y }\nclass K; def m = 1; end\n"
 n = RubyVM::AbstractSyntaxTree.parse(src, keep_script_lines: true, keep_tokens: true)
 p n.instance_variables, n.instance_variable_get(:@type)
@@ -28,12 +29,18 @@ rescue TypeError => e
 end
 
 p n.respond_to?(:first_lineno), n.method(:type).owner, n.frozen?
+N812 = RubyVM::AbstractSyntaxTree::Node
+p N812.instance_method(:type).owner, N812.method_defined?(:children), n.method(:type).arity
+p n.public_methods(false).include?(:last_lineno)
+# (no other methods: what the readers are made of is not reachable)
+p((n.__locations rescue $!.class), n.respond_to?(:__locations), n.methods.grep(/\A__(nd|loc)/))
 p RubyVM::AbstractSyntaxTree::Node.instance_methods(false).sort
 
 class RubyVM::AbstractSyntaxTree::Node
   def span812 = [type, first_lineno, last_lineno, children.size]
+  def inner812 = (__locations rescue :none)
 end
-p n.span812, n.children[2].span812
+p n.span812, n.children[2].span812, n.inner812
 
 def walk(x) = x.is_a?(RubyVM::AbstractSyntaxTree::Node) ? [x.type, *x.children.map { walk(_1) }] : x
 before = walk(n)
@@ -52,3 +59,14 @@ class RubyVM::AbstractSyntaxTree::Node
 end
 p n.type, n.mine812, n.last_column, n.respond_to?(:type), n.inspect
 p RubyVM::AbstractSyntaxTree::Node.instance_methods(false).sort
+
+class RubyVM::AbstractSyntaxTree::Node
+  alias_method :orig812, :first_lineno
+  private :node_id
+end
+p n.orig812, (n.node_id rescue $!.class)
+module Pre812; def first_lineno = [:pre, super]; end
+RubyVM::AbstractSyntaxTree::Node.prepend(Pre812)
+class Object; def children = :obj; def first_column = :obj; end
+module Kernel; def all_tokens = :ker; end
+p n.first_lineno, n.children.size, n.first_column, n.all_tokens.class, n.inspect
