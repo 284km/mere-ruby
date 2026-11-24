@@ -1047,6 +1047,12 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                       let _ = gc_mark_val live name in
                       let _ = gc_mark_val live owner in
                       let _ = gc_mark_val live receiver in gc_mark_val live extra) else ()) in
+                   // (an AST node's children, its other locations and its tree's
+                   //  lines and tokens: ast_node_vals)
+                   let _ = (if map_len ast_node_vals > 0 && map_has ast_node_vals id then
+                     (let (kids9, xl9, tree9) = map_get ast_node_vals id in
+                      let _ = gc_mark_val live kids9 in
+                      let _ = gc_mark_val live xl9 in gc_mark_val live tree9) else ()) in
                    vec_push gc_obj_pend id) else ())
   | VStr id -> let k = id * 8 + 1 in
                (if gc_live_mark live k then gc_handle_class "str:" id else ())
@@ -2397,6 +2403,9 @@ let gc_collect = fn env -> fn world ->
     let _ = gc_drop_i ocls dOC in
     let _ = gc_drop_i method_cores dOC in
     let _ = (if nc then () else map_compact method_cores) in
+    let _ = gc_drop_i ast_node_pos dOC in
+    let _ = gc_drop_i ast_node_vals dOC in
+    let _ = (if nc then () else (let _ = map_compact ast_node_pos in map_compact ast_node_vals)) in
     let _ = gc_purge_sng world dOC in
     let _ = (if nc then () else map_compact ocls) in
     // ⚠ md_whole had NO sweep. It is one entry per successful match -- the
@@ -16055,6 +16064,81 @@ and str_arg_enc_check = fn world -> fn (h: int) -> fn (args: Val list) ->
                   ("incompatible character encodings: " ++ enc_msg_name (senc_get h) ++ " and " ++ enc_msg_name (senc_get y)) in ())
      else str_arg_enc_check world h t)
   | Cons (_, t) -> str_arg_enc_check world h t
+// the names a Node answers from its row, the builtins of the prelude's
+// `class Node` (m_driver.mere): its location and number, its children, and
+// what its tree shares (script lines, tokens) and its other locations
+and ast_node_reader = fn (n: str) ->
+  str_eq n "type" || str_eq n "children" || str_eq n "first_lineno" || str_eq n "first_column"
+  || str_eq n "last_lineno" || str_eq n "last_column" || str_eq n "node_id"
+  || str_eq n "script_lines" || str_eq n "all_tokens" || str_eq n "__locations"
+// ...whether a Node answers the name from the table: the prelude's own names
+// for the readers, `__nd_type` and so on, and `__locations`. The readers
+// themselves are methods of Node in the prelude (`def type = self.__nd_type`),
+// so they are rows of the method table as ruby's are: they come before what
+// Object, Kernel and BasicObject define, and instance_method, alias, private,
+// super from a prepended module and remove_method all see them.
+and ast_node_answers = fn (n: str) ->
+  if str_len n > 5 && str_starts_with n "__nd_" then ast_node_reader (substring n 5 (str_len n))
+  else str_eq n "__locations"
+// ...and a reader called on a plain Node while it is still the prelude's own
+// (ast_reader_ok): answered here, with no frame, as ruby's Primitive answers.
+// A singleton class, a prepend to Node, a refinement, a private or protected
+// reader, a TracePoint (its :call / :return) or an argument goes the way of
+// any method.
+and ast_reader_fast = fn world -> fn (id: int) -> fn (n: str) -> fn (args: Val list) ->
+  map_len ast_node_pos > 0
+  && (match args with Nil -> true | _ -> false)
+  && map_has ast_node_pos id
+  && ast_reader_named world n
+  && (let c9 = map_get obj_cls id in str_len c9 == 32 && str_eq c9 "RubyVM::AbstractSyntaxTree::Node")
+  && vec_get hook_bits 0 == 0
+  && map_len refine_tgt == 0
+  && (if map_len prepends > 0 && map_has prepends "RubyVM::AbstractSyntaxTree::Node" then false else true)
+  && (let k9 = map_get ast_reader_ok n in
+      (if map_has privates k9 then false else true) && (if map_has protecteds k9 then false else true))
+// (whether the reader n is still the prelude's own row: asked of the table
+//  once, and remembered until a write to the row forgets it)
+and ast_reader_named = fn world -> fn (n: str) ->
+  if map_has ast_reader_ok n then true
+  else if map_has ast_reader_no n then false
+  else if (if ast_node_reader n then false else true) || str_eq n "__locations" then false
+  else
+    (let (meths9, _, _, _) = world in
+     let k9 = "RubyVM::AbstractSyntaxTree::Node#" ++ n in
+     // (the prelude's own, not a program's def of the same shape: meth_cfn)
+     if map_has meths9 k9 && map_has meth_cfn k9 && ast_reader_canon n (map_get meths9 k9)
+     then (let _ = map_set ast_reader_ok n k9 in true)
+     else (let _ = map_set ast_reader_no n 1 in false))
+// ...and only a method of Node the prelude wrote asks for them (meth_cfn; an
+// alias of one is one too): a method a program adds to Node, or a block
+// instance_exec runs on a Node, is not answered -- ruby has no such methods
+and ast_nd_caller = fn env ->
+  lv_has env "__meth" && lv_has env "__defcls"
+  && (match lv_get env "__defcls" with
+      | VClass c9 -> str_len c9 == 32 && str_eq c9 "RubyVM::AbstractSyntaxTree::Node"
+      | _ -> false)
+  // (by the name it was called by: an alias made of the prelude's reader
+  //  stays one when the program then writes its own under the old name)
+  && (match (if lv_has env "__callee" then lv_get env "__callee" else lv_get env "__meth") with
+      | VStr h9 -> map_has meth_cfn ("RubyVM::AbstractSyntaxTree::Node#" ++ sget h9)
+      | _ -> false)
+and ast_node_get = fn world -> fn (id: int) -> fn (n0: str) -> fn (args: Val list) ->
+  let n = (if str_len n0 > 5 && str_starts_with n0 "__nd_" then substring n0 5 (str_len n0) else n0) in
+  match args with
+  | Cons (_, _) -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (list_len_v args 0) ++ ", expected 0)")
+  | Nil ->
+    (let (ty, fl, fc, ll, lc, nid) = map_get ast_node_pos id in
+     let (kids, xl, tree) = map_get ast_node_vals id in
+     if str_eq n "type" then VSym (vec_get ao_names ty)
+     else if str_eq n "children" then kids
+     else if str_eq n "first_lineno" then VInt fl
+     else if str_eq n "first_column" then VInt fc
+     else if str_eq n "last_lineno" then VInt ll
+     else if str_eq n "last_column" then VInt lc
+     else if str_eq n "node_id" then VInt nid
+     else if str_eq n "script_lines" then (match tree with VArr a9 -> arr_at a9 0 | _ -> VNil)
+     else if str_eq n "all_tokens" then (match tree with VArr a9 -> arr_at a9 1 | _ -> VNil)
+     else xl)
 and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
   // the count comes first: ruby refuses a wrong number of arguments before it
   // looks at what they are.
@@ -26983,9 +27067,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                          && (if str_eq (blt_alias_lookup world (ancestors_of world c0) name) "" then false else true)
                       then false else true)
                then sng_supername world c0 else c0) in
+    // (a Node's reader, while it is the prelude's own: ast_reader_fast)
+    if ast_reader_fast world id name args then ast_node_get world id name Nil
     // a descriptor stream's stream methods are the prelude's IO layer (see
     // fdio_route), ahead of IO's own -- which are the File model's
-    if fdio_route_call world id cls name then invoke world noblk recv "IO" (fdio_mname name) args
+    else if fdio_route_call world id cls name then invoke world noblk recv "IO" (fdio_mname name) args
     // `Class.allocate` is a class that was never initialized: it cannot make
     // instances or name a superclass (they were "undefined method")
     else if str_eq cls "Class" && (if has_meth world cls name then false else true)
@@ -27019,6 +27105,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if has_meth world cls "method_missing" then (let _ = vec_set mm_priv 0 (mm_reason_take ()) in invoke world noblk recv cls "method_missing" (Cons (VSym name, args)))
        else raise_exc_iv world "NoMethodError" (refused9 ++ " method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
               (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
+    // RubyVM::AbstractSyntaxTree::Node's values, from ast_node_pos /
+    // ast_node_vals (ast_node_get): the prelude's own names, asked only by
+    // the Node itself in a method of Node the prelude wrote (ast_nd_caller)
+    // -- its readers, #inspect and #locations. Ruby has no such methods:
+    // `n.__nd_type` from outside, `self.__nd_type` in a method a program
+    // adds to Node and `n.instance_eval { __nd_type }` are NoMethodErrors.
+    else if map_len ast_node_pos > 0 && map_has ast_node_pos id && ast_node_answers name
+            && lv_has env "self" && (match lv_get env "self" with VObj i9 -> i9 == id | _ -> false)
+            && ast_nd_caller env then
+      ast_node_get world id name args
     // A visibility-only entry has no Ruby method row. Native Method#unbind
     // must still refuse the call and give method_missing its usual chance.
     else if vischeck && str_eq cls "Method" && str_eq name "unbind"
@@ -30335,6 +30431,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             && is_enum_cls cls
             && (map_has ivars (str_of_int id ++ "@__x_fb") || map_has ivars (str_of_int id ++ "@__e_pos")) then
       raise_exc world "TypeError" "can't copy execution context"
+    // RubyVM::AbstractSyntaxTree::Node is a C object with no allocator: ruby's
+    // Kernel#dup / #clone refuse it. Its values are in ast_node_pos /
+    // ast_node_vals by its id, so a copy would be a Node with none. Refused
+    // here, at the copy itself: a program's own dup / clone was found before
+    // this arm, and a bind_call of Kernel's or a `super` arrives here.
+    else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
+            && map_len ast_node_pos > 0 && map_has ast_node_pos id then
+      raise_exc world "TypeError" "allocator undefined for RubyVM::AbstractSyntaxTree::Node"
     else if (str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone") then
       (let nid = alloc_oid ocls in
        // `cls` above is the DISPATCH class, which strips the singleton off when
@@ -48560,7 +48664,10 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        // IPSocket#inspect, `write` inside a socket's own method -- is the
        // layer's, as it is with a receiver (the dispatcher asks fdio_route_call
        // first too). has_meth alone found IO's File-model #write, or nothing.
-       if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
+       // (a Node's reader called bare -- test_ast's Helper, pp -- while it is
+       //  the prelude's own: ast_reader_fast)
+       if ast_reader_fast world id name args then ast_node_get world id name Nil
+       else if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
        then invoke world noblk (VObj id) "IO" (fdio_mname name) args
        else if has_meth world cls name then invoke world noblk (VObj id) cls name args
        // the string form of instance_eval/instance_exec on an object self
@@ -49168,7 +49275,10 @@ and try_self_call1 = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> 
      | VObj id ->
        let cls = map_get ocls id in
        // (a descriptor stream's stream method: see try_self_call_x)
-       if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
+       // (a Node's reader called bare -- test_ast's Helper, pp -- while it is
+       //  the prelude's own: ast_reader_fast)
+       if ast_reader_fast world id name args then ast_node_get world id name Nil
+       else if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
        then invoke world noblk (VObj id) "IO" (fdio_mname name) args
        else if has_meth world cls name then invoke world noblk (VObj id) cls name args
        // an Enumerable-mixin method (map/count/inject/...) or a name the
