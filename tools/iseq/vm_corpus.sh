@@ -22,11 +22,25 @@
 # list of what the compiler and the VM do not take yet, most common first.
 #
 #   sh tools/iseq/vm_corpus.sh [-j N] [corpus/NNN_*.rb ...]
-#       (RUBY=, MR_BIN= to override; VM_CORPUS_OUT=<dir> keeps the outputs)
+#       (RUBY=, MR_BIN= to override -- RUBY defaults to tools/ref_ruby.sh's;
+#        VM_CORPUS_OUT=<dir> keeps the outputs)
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 2
-RUBY="${RUBY:-$HOME/.rbenv/versions/4.0.9/bin/ruby}"
+# the reference is run_corpus.sh's: tools/ref_ruby.sh checks its version and
+# names it (REF_RUBY_BIN -- on CI the one built with the test extensions). A
+# path of this machine's own here made every program a FAIL on CI's runners:
+# "ruby exited 127", read as 841 VM failures (main's run 45240819455).
+if [ -z "${RUBY:-}" ]; then
+  . "$ROOT/tools/ref_ruby.sh"
+  RUBY="$REF_RUBY_BIN"
+fi
+# ...and a reference that does not run stops the sweep, before any verdict:
+# a FAIL is a difference of the VM's, not a missing ruby
+if ! "$RUBY" -e 'exit 0' > /dev/null 2>&1; then
+  echo "vm_corpus: the reference ruby does not run: $RUBY" >&2
+  exit 2
+fi
 MR="${MR_BIN:-$ROOT/mere-ruby}"
 JOBS=4
 if [ "${1:-}" = "-j" ]; then JOBS="$2"; shift 2; fi
