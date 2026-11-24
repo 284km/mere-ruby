@@ -196,3 +196,82 @@ unit and integration tests load the same puma. What that run showed:
   server ran on, its test waited out its 395 s, and the tests after it met
   its leftovers (900-second waits in pumactl and SSL tests that pass alone).
   corpus 911.
+- **A trap ran on whichever thread was inside a method, and never while the
+  main thread joined.** Signals are delivered at a safepoint "on the main
+  thread", and the test for it was `in_thread ()` -- a flag that says a
+  Thread body's own statements are running, which every method call clears
+  for the method's body (it is the `return` boundary's). puma's TERM trap
+  ran on its reactor thread; its stop joined the server thread, which was
+  joining the reactor. And a main thread waiting in Thread#join (kind 8)
+  was not woken for a signal at all, so a trap whose main thread joins
+  never ran. Now delivery asks sig_off_main (in_thread, or under the
+  scheduler a thread that is not sch_main), a join is one of the waits a
+  signal wakes (sch_trap_wakes) and sch_join runs the waiting trap -- also
+  for numbers the scheduler took ("n") -- before it joins on; a thread's
+  self-kill from inside a method queues for the main thread too. corpus 912.
+
+## puma 8.1.2 after this round
+
+All reference numbers are ruby 4.0.9 (`~/.rbenv/versions/4.0.9/bin/ruby`,
+side.sh's reference side, and the shebang of the binstubs in its GEM_HOME);
+mere-ruby is this branch. Each side runs its own copy of the source tree,
+with its own built extension in `lib/puma/` and a Gemfile that names it.
+
+Unit (`test/runner -v --unit --seed=1`):
+
+| | runs | assertions | failures | errors | skips |
+|---|---|---|---|---|---|
+| ruby 4.0.9 | 863 | 2515 | 1 | 1 | 7 |
+| mere-ruby | 863 | 2548 | 1 | 1 | 7 |
+
+The reference's two are timing under this machine's load
+(test_back_to_back_chunked, test_zero_first_data_timeout_reads_complete_body_without_queue);
+both pass here. mere-ruby's two are the timed tests above
+(test_write_nonblock_retry_delivers_data_once, RackUp#test_bin). With the
+tree's own lib, TestBundlePruner and TestCLI#test_plugins pass on both sides.
+
+Integration (each file on its own, `--exclude=/test_horrible_queries/`,
+before the trap fix):
+
+| | runs | failures | errors | skips |
+|---|---|---|---|---|
+| ruby 4.0.9 | 184 | 6 | 0 | 10 |
+| mere-ruby | 184 | 26 | 3 | 10 |
+
+The reference's six are TestWorkerGemIndependence, the same six here: each
+runs `bundle install` in a fixture app for other versions of json and
+nio4r, which this harness does not fetch. What is left on mere-ruby:
+
+- **prune_bundler (11 tests: 7 cluster, 1 pumactl, 3 preserve_bundler_env).**
+  The pruned server re-execs `bin/puma-wild` under
+  `Bundler.with_unbundled_env`, which takes bundler's own directory out of
+  RUBYLIB; that directory is the reference's stdlib, which is how this
+  harness gives mere-ruby its standard library, and puma-wild's
+  `require 'rubygems'` then fails. ruby has its stdlib in its own
+  rubylibdir, not in RUBYLIB. What it takes: a mere-ruby installed with
+  its stdlib at its rubylibdir (MERE_RUBY_STDLIB_FALLBACK only reorders
+  directories already on the load path).
+- **TERM does not stop a single-mode server (5 tests, and the cluster
+  hot restart).** With the trap fix the trap runs on the main thread and
+  reaches Puma::Server#stop; in most runs (5 of 6 by hand) it then stalls
+  before the stop command is written to the server's notify pipe, with the
+  server thread still in IO.select. Not understood yet; next.
+- **fork_worker / mold_worker (4 tests)** -- "Worker N failed to check in
+  within 2 seconds" and a phase-2 boot not logged in time: a forked
+  worker here takes longer than puma's 2 s check-in to start.
+- **test_mold_worker_refork_does_not_leak_file_descriptors**: a reforked
+  worker has 19 descriptors open where the first had 17 (ruby: equal).
+  Observable, not investigated yet.
+- **test_horrible_queries** (excluded above), and the two timed unit tests.
+
+## Seen on the way, not fixed
+
+- **`$stdout.reopen(file)` does not share the File's position.** mkmf's
+  Logging reopens $stdout onto mkmf.log, and the log came out overwritten
+  ("etect_leaks=0 ..." in the middle of a later check). A File here keeps
+  its own position and writes through its own buffer (file_write_at,
+  `@__f_pos`), so writes to fd 1 after dup2 and the File's own writes land
+  at different offsets. ruby's are one open file description. Repro:
+  write to the File, reopen $stdout onto it, puts, system("echo"), write
+  again -- ruby "A B C D", here "B-via-stD-log\n-child". What it takes:
+  a File whose position is the descriptor's.
