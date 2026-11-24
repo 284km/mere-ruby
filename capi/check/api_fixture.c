@@ -472,8 +472,24 @@ static VALUE nogvl_read(VALUE self, VALUE fd) {
     int f = NUM2INT(fd);
     return LONG2NUM((long)rb_thread_call_without_gvl(read_one, &f, RUBY_UBF_IO, NULL));
 }
+static VALUE hidden_const_api(VALUE self, VALUE klass, VALUE name, VALUE operation, VALUE value) {
+    (void)self;
+    ID id = rb_to_id(name);
+    switch (NUM2INT(operation)) {
+      case 0: rb_const_set(klass, id, value); return value;
+      case 1: return rb_const_get(klass, id);
+      case 2: return rb_const_get_at(klass, id);
+      case 3: return rb_const_get_from(klass, id);
+      case 4: return rb_const_defined(klass, id) ? Qtrue : Qfalse;
+      case 5: return rb_const_defined_at(klass, id) ? Qtrue : Qfalse;
+      case 6: return rb_const_defined_from(klass, id) ? Qtrue : Qfalse;
+      case 7: return rb_const_remove(klass, id);
+      default: rb_raise(rb_eArgError, "unknown constant operation");
+    }
+}
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
+    rb_define_singleton_method(mod, "hidden_const_api", hidden_const_api, 4);
     rb_define_singleton_method(mod, "nogvl_nap", nogvl_nap, 1);
     rb_define_singleton_method(mod, "nogvl_call_back", nogvl_call_back, 1);
     rb_define_singleton_method(mod, "nogvl_read", nogvl_read, 1);
