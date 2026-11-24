@@ -123,6 +123,10 @@ class RubyVM::InstructionSequence
       #  -- catch_except_p)
       attr_reader :catch
       attr_accessor :catch_except, :block_labels, :block_nop, :in_rescue
+      # (the value of the shareable constant write being compiled, with its
+      #  ShareableConstantNode and the constant's path: `node` compiles that
+      #  one node as pm_compile_shareable_constant_value does)
+      attr_accessor :shareable
 
       def add_catch(type, ls, le, iseq, lc)
         ls.unremovable = true
@@ -197,7 +201,13 @@ class RubyVM::InstructionSequence
       def ise_size = (@ise_n || -1) + 1
       def cvc(name) = CVC.new((@cvcs ||= {})[name] ||= @cvcs.size, nil)
       def cvc_size = (@cvcs ||= {}).size
-      def at(line, node_id) = (@line, @node = line, node_id)
+      # (...under a ShareableConstantNode the write is compiled at that
+      #  node's place: its id stands for the write's -- id_alias)
+      def at(line, node_id)
+        node_id = @id_alias[1] if @id_alias && @id_alias[0] == node_id
+        @line, @node = line, node_id
+      end
+      attr_accessor :id_alias
       def line = @line
 
       def insn(name, *ops)
@@ -332,6 +342,10 @@ class RubyVM::InstructionSequence
       if n.newline? && u.last_line != n.location.start_line
         u.last_line = n.location.start_line
         u.event(:line)
+      end
+      if (sh = u.shareable) && sh[0].equal?(n)
+        u.shareable = nil
+        return shareable_value(u, n, sh[1], sh[2], true)
       end
       case n
       when Prism::StatementsNode
@@ -641,19 +655,15 @@ class RubyVM::InstructionSequence
       when Prism::IndexOperatorWriteNode, Prism::IndexAndWriteNode, Prism::IndexOrWriteNode
         index_write(u, n, popped)
       when Prism::ShareableConstantNode
-        # (a `shareable_constant_value` constant: compiled only when it is
-        #  X = a literal, which is pushed already made shareable)
+        # (a `shareable_constant_value` constant: the write is compiled as
+        #  any is, and its value as pm_compile_shareable_constant_value
+        #  compiles one -- shareable_value, entered from `node`)
         w = n.write
-        lit = w.is_a?(Prism::ConstantWriteNode) && shareable_literal(w.value)
-        unless lit
-          raise NotImplementedError, "RubyVM::InstructionSequence: a shareable_constant_value write of this is not compiled yet"
-        end
-        here(u, w.value)
-        u.insn(:putobject, lit[0])
-        here(u, n)
-        u.insn(:dup) unless popped
-        u.insn(:putspecialobject, 3)
-        u.insn(:setconstant, w.name)
+        u.shareable = [w.value, n, shareable_path(w)]
+        was = u.id_alias
+        u.id_alias = [w.node_id, n.node_id]
+        node(u, w, popped)
+        u.id_alias = was
       when Prism::AliasMethodNode
         # (pm_compile_alias_method_node: core#set_method_alias on the cbase)
         u.insn(:putspecialobject, 1)
@@ -3597,6 +3607,72 @@ class RubyVM::InstructionSequence
 
     # pm_compile_shareable_constant_literal: [the value] when n is a
     # literal ruby makes shareable as it compiles, nil otherwise
+    # the constant's path as an unshareable value's error names it: "X",
+    # "A::B", "::X", and "..." for an owner that is not a constant
+    def shareable_path(w)
+      return w.name.to_s unless w.respond_to?(:target)
+      path = lambda do |c|
+        case c
+        when Prism::ConstantReadNode then c.name.to_s
+        when Prism::ConstantPathNode
+          c.parent ? "#{path.(c.parent)}::#{c.name}" : "::#{c.name}"
+        else "..."
+        end
+      end
+      path.(w.target)
+    end
+
+    # pm_compile_shareable_constant_value: a literal is pushed already made
+    # shareable; an Array or a Hash is built of its elements' values and made
+    # shareable when it is the constant's own (`top`); anything else is
+    # compiled as it is and, under `literal`, checked (ensure_shareable, with
+    # the constant's path for the error) or, at the top, made shareable.
+    def shareable_value(u, n, sn, path, top)
+      if (lit = shareable_literal(n))
+        here(u, n)
+        u.insn(:putobject, lit[0])
+        return
+      end
+      make = sn.experimental_copy? ? :make_shareable_copy : :make_shareable
+      core = ->(mid, argc) { u.insn(:send, CallData.new(mid, CALL_ARGS_SIMPLE, argc, nil), nil).vmx = :core }
+      case n
+      when Prism::ArrayNode
+        here(u, n)
+        u.insn(:putspecialobject, 1) if top
+        n.elements.each { |e| shareable_value(u, e, sn, path, false) }
+        here(u, n)
+        u.insn(:newarray, n.elements.size)
+        core.(make, 1) if top
+      when Prism::HashNode
+        here(u, n)
+        u.insn(:putspecialobject, 1) if top
+        n.elements.each do |e|
+          raise NotImplementedError, "RubyVM::InstructionSequence: a shareable_constant_value Hash with ** is not compiled" unless e.is_a?(Prism::AssocNode)
+          shareable_value(u, e.key, sn, path, false)
+          shareable_value(u, e.value, sn, path, false)
+        end
+        here(u, n)
+        u.insn(:newhash, n.elements.size * 2)
+        core.(make, 1) if top
+      else
+        literal = sn.literal?
+        here(u, n)
+        u.insn(:putspecialobject, 1) if literal || top
+        node(u, n, false)
+        here(u, n)
+        u.insn(:send, CallData.new(:-@, CALL_ARGS_SIMPLE, 0, nil), nil) if n.is_a?(Prism::InterpolatedStringNode)
+        if literal
+          # (the path is a String of the names: US-ASCII when they are, and
+          #  BINARY when an owner that is no constant is written "...")
+          enc = path.start_with?("...") ? Encoding::BINARY : path.ascii_only? ? Encoding::US_ASCII : (u.opts[:source_encoding] || Encoding::UTF_8)
+          u.insn(:putobject, path.dup.force_encoding(enc).freeze)
+          core.(:ensure_shareable, 2)
+        elsif top
+          core.(make, 1)
+        end
+      end
+    end
+
     def shareable_literal(n)
       case n
       when Prism::TrueNode, Prism::FalseNode, Prism::NilNode, Prism::SymbolNode, Prism::RegularExpressionNode,
