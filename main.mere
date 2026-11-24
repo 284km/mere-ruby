@@ -257,6 +257,12 @@ type Val = VInt of int | VFlt of float | VStr of int | VBool of bool
          // the SAME source and flags whatever s was encoded in, so a side table
          // keyed by the two answered whichever was built last.
          | VRegex of str * str * str
+         // Not a Ruby value: a list the native ISeq compiler hands the VM's
+         // loader in place of an Array of a sequence's structure (false) or
+         // of a Hash's keys and values in turn (true). It lives from
+         // ic_to_val to vm_load, inside ic_vm_native's region, and is never
+         // an operand the VM keeps -- vm_lst, vm_rec.
+         | VIcl of bool * Val list
          | VMain;               // the top-level `self` (main), class Object
 
 // A user method: parameter names, defaults ((name, default-expr) for
@@ -2439,6 +2445,14 @@ let gc_collect = fn env -> fn world ->
     let rec dropPK = fn (i: int) -> (if i >= vec_len dPK then () else (let _ = arr_drop_q (vec_get dPK i) in dropPK (i + 1))) in
     let _ = dropPK 0 in
     let _ = gc_drop_i arr_store dAK in
+    // Classification flags must not retain dead method metadata. Walk this
+    // small metadata set once per collection, not every discarded Array.
+    let _ = (if map_len arr_metadata == 0 then () else
+      (let dead9 = vec_new () in
+       let _ = map_iter arr_metadata (fn (id9: int) -> fn (_v9: int) ->
+         if map_has arr_store id9 then () else vec_push dead9 id9) in
+       let _ = gc_drop_i arr_metadata dead9 in
+       if not nc && vec_len dead9 > 0 then map_compact arr_metadata else ())) in
     // ...and what was kept beside a dead array: its shifted-off count, its
     // stored length, its queue's length
     let _ = gc_drop_ih arr_off dAK in
@@ -2780,13 +2794,18 @@ let gc_point = fn world ->
 // which may reach another's, to a fixed point. What is still unreached can
 // never be resumed, and is abandoned (fb_abandon). Nothing is swept here.
 
-// The native compiler asked before the parser (vm_file_first), two slots.
-// Slot 0: how many warnings Prism had of the source the native compiler last
-// read (ic_vm_native writes it: vm_file_first asks). Slot 1: 1 while
-// vm_file_first compiles -- a regexp literal is then checked as the
-// evaluator's parser checks one (ic_to_val), since that parser will not
-// read the file.
-let ic_warns_v = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v 0 in v);
+// ic_prism_opts' bytes while it packs them: kept and emptied at each call
+// (a Vec made at a call is not given back).
+let ic_opts_v = (let v = vec_new () in let _ = vec_push v 0 in v);
+// Slot 0: 1 while the native compiler is asked before the parser
+// (vm_file_first): a regexp literal is then checked as the evaluator's
+// parser checks one (ic_to_val), since that parser will not read the file.
+// Slot 1: 1 while a compiler makes a literal's Regexp. The regexp parser's
+// warnings of a literal are the parse's to say, with the literal's place;
+// the Regexp the compiler makes of it for the VM said them again, at
+// whatever line was current -- "<internal:prelude>:2660: warning: character
+// class has '-' without escape" after the right one (Regexp's __rx_new).
+let ic_first_v = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v 0 in v);
 // a scope vm_scoped or with_scratch_env made on a fiber, by its env id: the
 // fiber (fb_reclaim)
 let lv_fbscope = map_new ();
@@ -6887,13 +6906,12 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   //   where handing the callee an empty hash makes it "wrong number of
   //   arguments (given 1, expected 0)" and aborted a whole spec file.
   | Cons (EKwHash items9, t) ->
-    (match eval_e env world blk (EKwHash items9) with
-     | VHsh id9 ->
-       (match hderef id9 with
-        // (...but keywords were given, which a block's binding asks: blk_kwp)
-        | Nil -> (let r9 = eval_args env world blk t in let _ = map_set blk_kwp "e" "1" in r9)
-        | _ -> Cons (VHsh id9, eval_args env world blk t))
-     | v9 -> Cons (v9, eval_args env world blk t))
+    (let pairs9 = hash_merge Nil (hsh_eval_items env world blk items9) in
+     match pairs9 with
+     | Nil -> (let r9 = eval_args env world blk t in let _ = map_set blk_kwp "e" "1" in r9)
+     | _ -> (match hstored_seed env world (mkhash pairs9) with
+             | VHsh id9 -> (let _ = mark_kw id9 in Cons (VHsh id9, eval_args env world blk t))
+             | v9 -> Cons (v9, eval_args env world blk t)))
   | Cons (h, t) -> Cons (eval_e env world blk h, eval_args env world blk t)
 
 // ---- multiple assignment ------------------------------------------------
@@ -8944,12 +8962,23 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
     else
       // (`raise Cls, 3`: a message that is no String is the object's own
       //  #to_s -- "3", "sym", "[1, :a]" -- where the pair took the class's
-      //  name for it. A Hash is left to the keywords it may be.)
+      //  name for it.)
+      // (...a Hash too: `raise Cls, {a: 1}` and `raise Cls, h` say
+      //  "{a: 1}", and so do keywords that are not `cause:`, which ruby
+      //  hands to .exception as that Hash. It was left "to the keywords it
+      //  may be", and the message was the class's name -- what a `case / in`
+      //  over a Hash raises on the VM when no branch matches, the value
+      //  being the message. Only keywords that are none, `**{}`, are no
+      //  message.)
       (let args = (match args with
-                   | Cons (VClass c2, Cons (m2, rest2)) when (match m2 with VStr _ -> false | VNil -> false | VHsh _ -> false | _ -> true) ->
+                   | Cons (VClass c2, Cons (m2, rest2)) when (match m2 with
+                                                              | VStr _ -> false | VNil -> false
+                                                              | VHsh h2 -> (if is_kw_hash m2 && (match hderef h2 with Nil -> true | _ -> false) then false else true)
+                                                              | _ -> true) ->
                      (let noblk2 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
                       let t2 = (match m2 with
                                 | VObj _ -> invoke_val_c gc_cenv0 world noblk2 m2 "to_s" Nil false
+                                | VHsh _ -> invoke_val_c gc_cenv0 world noblk2 m2 "to_s" Nil false
                                 | _ -> mkstr (to_s m2)) in
                       Cons (VClass c2, Cons (t2, rest2)))
                    | _ -> args) in
@@ -9577,27 +9606,30 @@ and core_metadata_vm = fn (body: Stmt list) ->
 and vm_metadata_shape = fn (top: Val list) ->
   let rec ins = fn (xs: Val list) -> (match xs with
     | Nil -> (Nil : Val list)
-    | Cons (VArr a, t) -> Cons (VArr a, ins t)
+    | Cons (a, t) when vm_is_lst a -> Cons (a, ins t)
     | Cons (_, t) -> ins t) in
   let rec first_line = fn (xs: Val list) -> (match xs with Nil -> 0 | Cons (VInt n, _) -> n | Cons (_, t) -> first_line t) in
   // (the line in force at the instruction that reads the constant `Class`)
   let rec class_line = fn (xs: Val list) -> fn (l: int) -> (match xs with
     | Nil -> 0
     | Cons (VInt n, t) -> class_line t n
-    | Cons (VArr a, t) -> (match deref a with
-                           | Cons (VSym o, Cons (VArr c, _)) when str_eq o "opt_getconstant_path" && (match deref c with Cons (VSym k, Nil) -> str_eq k "Class" | _ -> false) -> l
+    | Cons (a, t) when vm_is_lst a -> (match vm_lst a with
+                           | Cons (VSym o, Cons (c, _)) when str_eq o "opt_getconstant_path" && (match vm_lst c with Cons (VSym k, Nil) -> str_eq k "Class" | _ -> false) -> l
                            | _ -> class_line t l)
     | Cons (_, t) -> class_line t l) in
-  let op = fn (v: Val) -> (match v with VArr a -> (match deref a with Cons (VSym o, _) -> o | _ -> "") | _ -> "") in
-  let arg = fn (v: Val) -> fn (i: int) -> (match v with VArr a -> vm_nth (deref a) i | _ -> VNil) in
-  let cd = fn (v: Val) -> fn (k: str) -> (match arg v 1 with VHsh h -> vm_hget (hderef h) k | _ -> VNil) in
+  let op = fn (v: Val) -> (match vm_lst v with Cons (VSym o, _) -> o | _ -> "") in
+  let arg = fn (v: Val) -> fn (i: int) -> vm_nth (vm_lst v) i in
+  let cd = fn (v: Val) -> fn (k: str) -> vm_hget (vm_rec (arg v 1)) k in
   let is_mid = fn (v: Val) -> fn (m: str) -> fn (argc: int) ->
     (match (cd v "mid", cd v "orig_argc") with (VSym x, VInt n) -> str_eq x m && n == argc | _ -> false) in
   let cpath = fn (v: Val) -> fn (k: str) ->
-    str_eq (op v) "opt_getconstant_path" && (match arg v 1 with VArr c -> (match deref c with Cons (VSym x, Nil) -> str_eq x k | _ -> false) | _ -> false) in
-  let no_params = fn (t: Val list) -> (match vm_nth t 11 with VHsh h -> (match hderef h with Nil -> true | _ -> false) | _ -> false) in
-  let locals = fn (t: Val list) -> (match vm_nth t 10 with VArr l -> deref l | _ -> (Nil : Val list)) in
-  let body = (match vm_nth top 13 with VArr b -> deref b | _ -> (Nil : Val list)) in
+    str_eq (op v) "opt_getconstant_path" && (match vm_lst (arg v 1) with Cons (VSym x, Nil) -> str_eq x k | _ -> false) in
+  let no_params = fn (t: Val list) -> (match vm_nth t 11 with
+                                       | VHsh h -> (match hderef h with Nil -> true | _ -> false)
+                                       | VIcl (h, ps) -> h && (match ps with Nil -> true | _ -> false)
+                                       | _ -> false) in
+  let locals = fn (t: Val list) -> vm_lst (vm_nth t 10) in
+  let body = vm_lst (vm_nth top 13) in
   match (locals top, ins body) with
   | (Cons (VSym local, Nil),
      Cons (m1, Cons (m2, Cons (m3, Cons (m4, Cons (m5, Cons (m6, Cons (m7, Cons (m8, Cons (m9, Cons (m10,
@@ -9613,9 +9645,9 @@ and vm_metadata_shape = fn (top: Val list) ->
          && (match cd c2 "flag" with VInt f -> f == 0 | _ -> false)
          && str_eq (op c3) "leave" ->
     (match arg c2 2 with
-     | VArr kid ->
-       (let kt = deref kid in
-        let kb = (match vm_nth kt 13 with VArr b -> deref b | _ -> (Nil : Val list)) in
+     | kid when vm_is_lst kid ->
+       (let kt = vm_lst kid in
+        let kb = vm_lst (vm_nth kt 13) in
         match (locals kt, ins kb) with
         | (Nil, Cons (k1, Cons (k2, Cons (k3, Cons (k4, Nil)))))
           when no_params kt && str_eq (op k1) "putself"
@@ -22362,7 +22394,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                      else if str_eq se9 "UTF-8" || str_eq se9 "EUC-JP" || str_eq se9 "Shift_JIS" || str_eq se9 "Windows-31J"
                      then rx_esc_runs_why body se9 else "") in
           let why9 = (if str_eq mix9 "" then (if str_eq mb9 "" then rx_invalid_msg body fl else mb9) else mix9) in
-          let _ = rx_emit_warns world (rx_wq_take ()) body in
+          // (a compiler's literal: its warnings are said already -- ic_first_v)
+          let _ = (if vec_get ic_first_v 1 == 1 then (let _ = rx_wq_take () in ()) else rx_emit_warns world (rx_wq_take ()) body) in
           if str_eq why9 "" then rx_with_tmo env world (rx_build_once body fl renc9 args) args
           else raise_exc world "RegexpError" (why9 ++ ": /" ++ rx_esc_slashes body 0 "" ++ "/"))
        // a Regexp is copied as it is; options beside it are ignored, which
@@ -26167,7 +26200,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           if s9 < 0 then VNil
           else if k9 == 2 && map_has obj_cls (handle_base + s9)
                   && not (str_starts_with (map_get obj_cls (handle_base + s9)) "__") then VObj (handle_base + s9)
-          else if k9 == 6 && map_has arr_store (handle_base + s9) then VArr (handle_base + s9)
+          else if k9 == 6 && map_has arr_store (handle_base + s9) && not (map_has arr_metadata (handle_base + s9)) then VArr (handle_base + s9)
           else if k9 == 10 && map_has hash_store (handle_base + s9) then VHsh (handle_base + s9)
           else if k9 == 12 && map_has proc_store (str_of_int (handle_base + s9)) then VProc (handle_base + s9)
           else if k9 == 14 && map_has bind_store (str_of_int (handle_base + s9)) then VBind (handle_base + s9)
@@ -26221,18 +26254,18 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        let h0 = hash_next () in
        let _ = vec_set cobj_entry 0 a0 in
        let _ = vec_set cobj_entry 1 h0 in
-       let own = fn st -> fn rg ->
+       let own = fn st -> fn rg -> fn (metadata9: bool) ->
          (let dead = map_new () in
           let acc = map_new () in
           let _ = map_iter rg (fn (lo: int) -> fn (hi: int) ->
-                    (let rec live = fn (k: int) -> fn (n: int) -> (if k >= hi then n else live (k + 1) (if map_has st k then n + 1 else n)) in
+                    (let rec live = fn (k: int) -> fn (n: int) -> (if k >= hi then n else live (k + 1) (if map_has st k && (not metadata9 || not (map_has arr_metadata k)) then n + 1 else n)) in
                      let n9 = live lo 0 in
                      if n9 == 0 then map_set dead lo 1
                      else map_set acc 0 ((if map_has acc 0 then map_get acc 0 else 0) + n9))) in
           let _ = map_iter dead (fn (lo: int) -> fn (_u: int) -> map_delete rg lo) in
           (if map_has acc 0 then map_get acc 0 else 0)) in
-       let oa = own arr_store cobj_arr in
-       let oh = own hash_store cobj_hsh in
+       let oa = own arr_store cobj_arr true + map_len arr_metadata in
+       let oh = own hash_store cobj_hsh false in
        // String handles are never reused. The last sweep's actual survivors
        // plus handles issued since its boundary are exactly the live store;
        // empty live strings count too, and reclaimed slots do not.
@@ -26279,7 +26312,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                      let class9 = (if str_len tagged9 > 0 && map_has hng_store tagged9 then map_get hng_store tagged9 else base9) in
                      obj_is_a world class9 want9)
               then vec_push objs9 v9 else () in
-            let _ = (if visit9 "Array" then map_iter arr_store (fn (id9: int) -> fn _values9 -> addv9 (VArr id9) "Array") else ()) in
+            let _ = (if visit9 "Array" then map_iter arr_store (fn (id9: int) -> fn _values9 ->
+              if map_has arr_metadata id9 then () else addv9 (VArr id9) "Array") else ()) in
             let _ = (if visit9 "Hash" then map_iter hash_store (fn (id9: int) -> fn _values9 -> addv9 (VHsh id9) "Hash") else ()) in
             let _ = (if visit9 "Proc" then map_iter proc_store (fn (key9: str) -> fn _entry9 ->
               let v9 = VProc (int_of_str key9) in addv9 v9 "Proc") else ()) in
@@ -51500,7 +51534,7 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
               (match params with
                | Nil -> VNil
                | _ -> if map_has meth_params dk then map_get meth_params dk
-                      else (let pv = arr_new (param_names_vals params) in
+                      else (let pv = arr_new_metadata (param_names_vals params) in
                             let _ = map_set meth_params dk pv in pv)) in
     let vs9 = map_has super_call_pend "v" in
     let _ = (if vs9 then map_delete super_call_pend "v" else ()) in
@@ -65214,7 +65248,22 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
                                     else if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> m9) else m9) in
                         let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
                         let m0 = strip9 "mere-ruby: regexp: " (strip9 "mere-ruby: regexp parse: " why9) in
-                        raise_exc_iv world "SyntaxError" (req_syntax_framed env world full src m0)
+                        // (the message as ruby has it. A literal Prism's own
+                        //  regexp parser refuses -- an unmatched parenthesis, a
+                        //  repeat of nothing -- is one of Prism's errors: its
+                        //  report, with every other error it has of the file.
+                        //  One only the regexp engine refuses -- a class that
+                        //  does not end, an unknown property -- is found when
+                        //  the literal is compiled: "<path>:<line>: " and the
+                        //  reason, of the first such literal alone.)
+                        let ln9 = vec_get rx_bad_line 0 in
+                        let _ = vec_set rx_bad_line 0 0 in
+                        let ln0 = (if ln9 > 0 then str_of_int ln9 else "") in
+                        let pr9 = try_or (fn (u2: unit) -> prism_report src full 1) "" in
+                        let msg9 = (if str_len pr9 > 0 then pr9
+                                    else if str_len ln0 > 0 then full ++ ":" ++ ln0 ++ ": " ++ m0
+                                    else req_syntax_framed env world full src m0) in
+                        raise_exc_iv world "SyntaxError" msg9
                           (Cons (("__path", mkstr full), Nil)))) in ()) in
        let parse9 = fn (u: unit) ->
                    (let tk = number_nls src (lex_src src) in
@@ -67691,7 +67740,19 @@ and do_eval0 = fn env -> fn world -> fn blk -> fn (args: Val list) ->
           let el9 = (if str_contains code "BEGIN\{throw :__isq_ok, :ok}" then eline9 + 1 else eline9) in
           // (...and a reason that rides unframed -- rx_cur "why" -- names its
           //  own line when it knows one: rx_escapes_check's literal)
-          let msg = (if str_len why9 > 0 then efile9 ++ ":" ++ str_of_int (if sl9 > 0 then sl9 else el9) ++ ": " ++ why9 else try_or (fn (u: unit) ->
+          // (a regexp literal's refusal -- why0 -- as ruby has it. A literal
+          //  Prism's own regexp parser refuses is one of Prism's errors: its
+          //  report, the frame and all, with every other error it has of the
+          //  source. One only the regexp engine refuses is found when the
+          //  literal is compiled: the reason, at the literal's own line --
+          //  rx_bad_line, where it was lexed. Not for ISeq.compile's check,
+          //  whose source has a line of the check's in front.)
+          let rxl9 = vec_get rx_bad_line 0 in
+          let _ = vec_set rx_bad_line 0 0 in
+          let pr9 = (if str_len why0 > 0 && (if str_contains code "BEGIN\{throw :__isq_ok, :ok}" then false else true)
+                     then try_or (fn (u: unit) -> prism_report code efile9 eline9) "" else "") in
+          let msg = (if str_len pr9 > 0 then pr9
+                     else if str_len why9 > 0 then efile9 ++ ":" ++ str_of_int (if sl9 > 0 then sl9 else if str_len why0 > 0 && rxl9 > 0 then rxl9 else el9) ++ ": " ++ why9 else try_or (fn (u: unit) ->
             let toks2 = number_nls code (lex_src code) in
             // (ending in a newline, as every prism message does: a message
             //  piped on is a complete line)
@@ -68173,6 +68234,12 @@ and vm_nth = fn (xs: Val list) -> fn (i: int) ->
   match xs with
   | Nil -> VNil
   | Cons (x, t) -> if i <= 0 then x else vm_nth t (i - 1)
+// An Array of a sequence's own structure, as its elements: the Array #to_a
+// made (the Ruby compiler's answer), or the list the native compiler hands
+// over in its place (VIcl). And a Hash of it, as its keys and values in turn.
+and vm_lst = fn (v: Val) -> match v with VArr id -> deref id | VIcl (h, xs) -> (if h then (Nil : Val list) else xs) | _ -> (Nil : Val list)
+and vm_is_lst = fn (v: Val) -> match v with VArr _ -> true | VIcl (h, _) -> (if h then false else true) | _ -> false
+and vm_rec = fn (v: Val) -> match v with VHsh h -> hderef h | VIcl (h, ps) -> (if h then ps else (Nil : Val list)) | _ -> (Nil : Val list)
 and vm_sym = fn (v: Val) -> match v with VSym s -> s | _ -> ""
 and vm_int = fn (v: Val) -> match v with VInt n -> n | _ -> 0 - 1
 // one of the VM_CALL_* bits of a call's flag (vm_callinfo.h)
@@ -68190,7 +68257,7 @@ and vm_cd = fn (v: Val) ->
        else go t mid fl ac kw
      | Cons (_, Cons (_, t)) -> go t mid fl ac kw
      | _ -> (mid, fl, ac, kw)) in
-  let (mid, fl, ac, kw) = go (match v with VHsh h -> hderef h | _ -> Nil) "" (0 - 1) (0 - 1) VNil in
+  let (mid, fl, ac, kw) = go (vm_rec v) "" (0 - 1) (0 - 1) VNil in
   // (a send marked for a tail call is loaded: vm_tail_call readies its calls)
   let _ = (if fl >= 0 && vm_bit fl 128 then vec_set vm_tail_ready 1 1 else ()) in
   (mid, fl, ac, kw)
@@ -68211,7 +68278,8 @@ and vm_send_why = fn (mid: str) -> fn (fl: int) ->
   //  evaluator's statements of those names stand for: vm_send)
   else if str_eq mid "core#set_method_alias" || str_eq mid "core#undef_method" || str_eq mid "core#set_variable_alias"
           || str_eq mid "core#sprintf" || str_eq mid "core#raise" || str_eq mid "core#set_postexe"
-          || str_eq mid "core#hash_merge_ptr" || str_eq mid "core#hash_merge_kwd" then ""
+          || str_eq mid "core#hash_merge_ptr" || str_eq mid "core#hash_merge_kwd"
+          || str_eq mid "core#make_shareable" || str_eq mid "core#make_shareable_copy" || str_eq mid "core#ensure_shareable" then ""
   else if str_len mid > 5 && str_eq (substring mid 0 5) "core#" then "a call on the VM's own object: " ++ mid
 
   else ""
@@ -68327,7 +68395,7 @@ and vm_reasg_note = fn (kids: int list) -> fn (rs: str list) ->
 and vm_kw_first = fn (ps: Val list) ->
   let num = fn (k: str) -> (match vm_hget ps k with VInt n -> n | _ -> 0 - 1) in
   let lead = (let n = num "lead_num" in if n < 0 then 0 else n) in
-  let nopt = (match vm_hget ps "opt" with VArr o -> (let n = list_len_v (deref o) 0 in if n > 0 then n - 1 else 0) | _ -> 0) in
+  let nopt = (let n = list_len_v (vm_lst (vm_hget ps "opt")) 0 in if n > 0 then n - 1 else 0) in
   lead + nopt + (if num "rest_start" >= 0 then 1 else 0) + (let n = num "post_num" in if n < 0 then 0 else n)
 and vm_uniq_locs = fn (locs: Val list) -> fn (ph: Val) ->
   let rec cnt = fn (xs: Val list) ->
@@ -68337,9 +68405,9 @@ and vm_uniq_locs = fn (locs: Val list) -> fn (ph: Val) ->
      | Cons (_, t) -> cnt t) in
   if cnt locs < 2 then locs
   else
-    (let ps = (match ph with VHsh h -> hderef h | _ -> Nil) in
+    (let ps = vm_rec ph in
      let kw0 = vm_kw_first ps in
-     let nkw = (match vm_hget ps "keyword" with VArr k -> list_len_v (deref k) 0 | _ -> 0) in
+     let nkw = list_len_v (vm_lst (vm_hget ps "keyword")) 0 in
      let rec go = fn (xs: Val list) -> fn (i: int) -> fn (seen: int) -> fn (kseen: int) ->
        (match xs with
         | Nil -> (Nil : Val list)
@@ -68350,14 +68418,14 @@ and vm_uniq_locs = fn (locs: Val list) -> fn (ph: Val) ->
         | Cons (x, t) -> Cons (x, go t (i + 1) seen kseen)) in
      go locs 0 0 0)
 and vm_params = fn (kind: int) -> fn (locs: Val list) -> fn (depth: int) -> fn (ph: Val) ->
-  let ps = (match ph with VHsh h -> hderef h | _ -> Nil) in
+  let ps = vm_rec ph in
   let num = fn (k: str) -> (match vm_hget ps k with VInt n -> n | _ -> 0 - 1) in
   let lead = (let n = num "lead_num" in if n < 0 then 0 else n) in
-  let optl = (match vm_hget ps "opt" with VArr o -> deref o | _ -> Nil) in
+  let optl = vm_lst (vm_hget ps "opt") in
   let nopt = (let n = list_len_v optl 0 in if n > 0 then n - 1 else 0) in
   let optn = vm_names locs depth lead nopt in
   let amb = (match vm_hget ps "ambiguous_param0" with VBool true -> true | _ -> false) in
-  let nokw = (match vm_hget ps "keyword" with VArr _ -> false | _ -> true) in
+  let nokw = (if vm_is_lst (vm_hget ps "keyword") then false else true) in
   // (`|a,|`: one required parameter that is not ambiguous_param0 and has
   //  nothing after it had a trailing comma -- the evaluator's `*,`, which
   //  takes an Array's first element and keeps the arity 1)
@@ -68390,8 +68458,8 @@ and vm_params = fn (kind: int) -> fn (locs: Val list) -> fn (depth: int) -> fn (
        (let (w, names, opts, ds) = kws t (i + 1) in
         match x with
         | VSym k0 -> (let k = slotn k0 i in (w, Cons (k ++ ":", names), opts, ds))
-        | VArr e ->
-          (match deref e with
+        | e9 when vm_is_lst e9 ->
+          (match vm_lst e9 with
            | Cons (VSym k0, Nil) -> (let k = slotn k0 i in (w, Cons (k ++ ":", names), Cons (k, opts), Cons ((k ++ ":", EVmArg), ds)))
            | Cons (VSym k0, Cons (d, Nil)) ->
              (let k = slotn k0 i in
@@ -68407,7 +68475,7 @@ and vm_params = fn (kind: int) -> fn (locs: Val list) -> fn (depth: int) -> fn (
                Cons (k ++ ":", names), Cons (k, opts), Cons ((k ++ ":", de), ds)))
            | _ -> ("a keyword parameter it cannot read", names, opts, ds))
         | _ -> ("a keyword parameter it cannot read", names, opts, ds))) in
-  let (kwhy, kwnames, kwopts, kwds) = kws (match vm_hget ps "keyword" with VArr k -> deref k | _ -> Nil) 0 in
+  let (kwhy, kwnames, kwopts, kwds) = kws (vm_lst (vm_hget ps "keyword")) 0 in
   let rec optds = fn (ns: str list) -> (match ns with Nil -> kwds | Cons (n, t) -> Cons ((n, EVmArg), optds t)) in
   let rec app = fn (a: str list) -> fn (b: str list) -> (match a with Nil -> b | Cons (h, t) -> Cons (h, app t b)) in
   // (`**nil`, which ruby's to_a does not show and the compiler's export for
@@ -68423,16 +68491,16 @@ and vm_catch = fn (ct: Val) ->
   let rec go = fn (xs: Val list) ->
     (match xs with
      | Nil -> ("", (Nil : (int * Val * Val * Val * Val * int) list))
-     | Cons (VArr e, t) ->
+     | Cons (e9, t) when vm_is_lst e9 ->
        (let (w, rest) = go t in
-        match deref e with
+        match vm_lst e9 with
         | Cons (VSym ty, Cons (sq, Cons (st, Cons (ed, Cons (ct9, Cons (VInt sp, Nil)))))) ->
           (let k = (if str_eq ty "rescue" then 1 else if str_eq ty "ensure" then 2 else if str_eq ty "retry" then 3
                     else if str_eq ty "break" then 4 else if str_eq ty "redo" then 5 else if str_eq ty "next" then 6 else 0) in
            if k == 0 then ("a catch table (" ++ ty ++ ")", rest) else (w, Cons ((k, sq, st, ed, ct9, sp), rest)))
         | _ -> ("a catch table it cannot read", rest))
      | Cons (_, _) -> ("a catch table it cannot read", (Nil : (int * Val * Val * Val * Val * int) list))) in
-  match ct with VArr c -> go (deref c) | _ -> ("a catch table it cannot read", (Nil : (int * Val * Val * Val * Val * int) list))
+  if vm_is_lst ct then go (vm_lst ct) else ("a catch table it cannot read", (Nil : (int * Val * Val * Val * Val * int) list))
 // One instruction decoded: (opcode, name, int a, int b, operand, why). The
 // name is what the instruction names (a local, an ivar, a global, a
 // constant path, a method, a literal's text); `why` is "" when it runs.
@@ -68465,15 +68533,20 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
      //  corpus 462's folded `/#{%q"\x80"}/` in a US-ASCII source came out
      //  UTF-8 here once -- Regexp.new read the escape as UTF-8, which ruby
      //  does only in a UTF-8 string.)
-     | VStr h -> if utf8 v then (o, sget h, 1, 0, v, "") else (o, "", 0, 0, v, "")
+     // (...and it is ruby's fstring, as a UTF-8 one is: one object for
+     //  every literal of that text in that encoding -- `"a".equal?("a")`
+     //  under frozen_string_literal in a Big5 source. The evaluator interns
+     //  it under the same key: str_fstring.)
+     | VStr h -> if utf8 v then (o, sget h, 1, 0, v, "") else (o, "", 0, 0, (if sfrozen_get h then str_fstring v else v), "")
      | _ -> (o, "", 0, 0, v, ""))
   else if o == 6 || o == 7 || o == 31 || o == 32 then
     (match o1 with
      // (...and a literal in another encoding: a copy of the operand each
      //  time, in its encoding -- a = 1)
+     // (...`"lit".freeze` and `-"lit"` too: the evaluator's literal of that
+     //  encoding, as its parser marks one -- a = 1)
      | VStr h -> if utf8 o1 then (o, sget h, 0, 0, VNil, "")
-                 else if o == 6 || o == 7 then (o, sget h, 1, 0, o1, "")
-                 else bad " (a String in another encoding)"
+                 else (o, sget h, 1, 0, o1, "")
      | _ -> bad "")
   else if o == 8 || o == 33 then (match o1 with VArr _ -> (o, "", 0, 0, o1, "") | _ -> bad "")
   else if o == 9 || o == 34 then (match o1 with VHsh _ -> (o, "", 0, 0, o1, "") | _ -> bad "")
@@ -68497,15 +68570,19 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
   else if o == 28 then (o, vm_sym o1, (if prev == 327 then 0 else 1), 0, VNil, "")
   else if o == 71 then (if str_eq (vm_sym o1) "" then bad "" else (o, vm_sym o1, 0, 0, VNil, ""))
   else if o == 26 then
-    (match o1 with
-     | VArr pid -> (let p = vm_cpath (deref pid) in if str_eq p "" then bad "" else (o, p, 0, 0, VNil, ""))
-     | _ -> bad "")
+    (if vm_is_lst o1 then (let p = vm_cpath (vm_lst o1) in if str_eq p "" then bad "" else (o, p, 0, 0, VNil, ""))
+     else bad "")
   else if o == 27 then
     (if vm_int o1 >= 1 && vm_int o1 <= 3 then (o, "", vm_int o1, 0, VNil, "") else bad (" " ++ str_of_int (vm_int o1)))
   else if o == 29 || o == 30 then
-    (let (mid, fl, ac, kw) = vm_cd (if o == 30 then o2 else o1) in
+    (let (mid0, fl, ac, kw) = vm_cd (if o == 30 then o2 else o1) in
+     // (a send the compiler wrote to the VM's own object under a name a
+     //  program can spell too -- make_shareable, for a
+     //  shareable_constant_value constant -- is marked in the VM's export,
+     //  and is `core#<name>` here as the others are by their own names)
+     let mid = (if str_eq (vm_sym o2) "core" || str_eq (vm_sym (vm_nth ins 3)) "core" then "core#" ++ mid0 else mid0) in
      let w = vm_send_why mid fl in
-     let blk = str_eq nm "send" && (match o2 with VArr _ -> true | _ -> false) in
+     let blk = str_eq nm "send" && vm_is_lst o2 in
      if (if str_eq w "" then false else true) || ac < 0 then bad (" (" ++ w ++ ")")
      // (`-> { }`: the VM's own object asked for a lambda of the block)
      else if prev == 127 then
@@ -68582,9 +68659,7 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
   // once: a sequence run the first time the instruction is reached, and the
   // number its value is kept under after that (`/#{x}/o`, `END { }`)
   else if o == 77 then
-    (match o1 with
-     | VArr _ -> (o, "", vm_int o2, 0, VNil, "")
-     | _ -> bad "")
+    (if vm_is_lst o1 then (o, "", vm_int o2, 0, VNil, "") else bad "")
   // checkmatch: the kind in the low two bits (1 when, 2 case, 3 rescue),
   // 4 the pattern is an Array of them
   else if o == 64 then
@@ -68592,16 +68667,14 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
   // definemethod / definesmethod: the method's name (a singleton method
   // written `def self.m` has self under it: a = 1)
   else if o == 59 || o == 60 then
-    (match o2 with
-     | VArr _ -> if str_eq (vm_sym o1) "" then bad "" else (o, vm_sym o1, (if prev == 2 then 1 else 0), 0, VNil, "")
-     | _ -> bad "")
+    (if vm_is_lst o2 then (if str_eq (vm_sym o1) "" then bad "" else (o, vm_sym o1, (if prev == 2 then 1 else 0), 0, VNil, ""))
+     else bad "")
   // defineclass: the name and the flags (the type in the low three bits,
   // 8 a scoped name, 16 a superclass)
   else if o == 61 then
-    (match o2 with
-     | VArr _ -> (let f = vm_int (vm_nth ins 3) in
-                  if f < 0 || f % 8 > 2 || str_eq (vm_sym o1) "" then bad "" else (o, vm_sym o1, f, 0, VNil, ""))
-     | _ -> bad "")
+    (if vm_is_lst o2 then (let f = vm_int (vm_nth ins 3) in
+                           if f < 0 || f % 8 > 2 || str_eq (vm_sym o1) "" then bad "" else (o, vm_sym o1, f, 0, VNil, ""))
+     else bad "")
   // sendforward / invokesuperforward: a call that passes `...` on
   else if o == 72 || o == 73 then
     (let (mid, fl, ac, kw) = vm_cd o1 in
@@ -68612,7 +68685,7 @@ and vm_dec = fn labels -> fn (scopes: (Val list * int * int * bool) list) -> fn 
   else if o == 62 then
     (let (_, fl, ac, kw) = vm_cd o1 in
      if fl < 0 || ac < 0 || vm_bit fl 8192 then bad " (argument forwarding)"
-     else if (match o2 with VNil -> false | VArr _ -> false | _ -> true) then bad " (a block it cannot read)"
+     else if (match o2 with VNil -> false | _ -> if vm_is_lst o2 then false else true) then bad " (a block it cannot read)"
      else (o, "", fl, ac, kw, ""))
   // checkkeyword: was this optional keyword given
   else if o == 57 then
@@ -68641,16 +68714,16 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   let lbl = (match vm_nth top 5 with VStr h -> sget h | _ -> "<compiled>") in
   let pth = (match vm_nth top 6 with VStr h -> sget h | _ -> "<compiled>") in
   let line0 = (match vm_nth top 8 with VInt n -> n | _ -> 1) in
-  let locs0 = (match vm_nth top 10 with VArr id -> deref id | _ -> Nil) in
+  let locs0 = vm_lst (vm_nth top 10) in
   // (implicit parameters, which the compiler's export for the VM names: N
   //  for _1 .. _N, 0 for `it` -- whose hidden slot, the first, is the
   //  evaluator's `_1`, where a Binding looks for it)
-  let ipn = (match (match vm_nth top 11 with VHsh ph -> vm_hget (hderef ph) "implicit" | _ -> VNil) with VInt k -> k | _ -> 0 - 1) in
+  let ipn = (match vm_hget (vm_rec (vm_nth top 11)) "implicit" with VInt k -> k | _ -> 0 - 1) in
   let locs = (if ipn == 0 then (match locs0 with Cons (VInt _, t) -> Cons (VSym "_1", t) | _ -> locs0) else locs0) in
   let locs = vm_uniq_locs locs (vm_nth top 11) in
   let nloc = list_len_v locs 0 in
   let scopes = Cons ((locs, nloc, depth, kind == 4 || kind == 5 || kind == 6), outer) in
-  let body = (match vm_nth top 13 with VArr id -> deref id | _ -> Nil) in
+  let body = vm_lst (vm_nth top 13) in
   let (pwhy, bp, optn, optl, kwn, defs) = vm_params kind locs depth (vm_nth top 11) in
   let (cwhy, centries) = vm_catch (vm_nth top 12) in
   let why0 =
@@ -68670,6 +68743,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
      | Nil -> i
      | Cons (VSym s, t) -> (let _ = (if str_len s > 6 && str_eq (substring s 0 6) "label_" then map_set labels s i else ()) in scan t i)
      | Cons (VArr _, t) -> scan t (i + 1)
+     | Cons (VIcl (_, _), t) -> scan t (i + 1)
      | Cons (_, t) -> scan t i) in
   let _ = scan body 0 in
   // (outs: a local of a sequence further out, with how far)
@@ -68704,8 +68778,8 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
           go t line (if late9 && (evt / 32) % 2 == 0 then evt + 32 else evt) prev yld ids outs)
        else if str_len s > 6 && str_eq (substring s 0 6) "label_" then go t line evt (0 - 1) yld ids outs
        else go t line evt prev yld ids outs
-     | Cons (VArr iid, t) ->
-       (let ins = deref iid in
+     | Cons (i9, t) when vm_is_lst i9 ->
+       (let ins = vm_lst i9 in
         let (o, n, x, y, v, w) = vm_dec labels scopes kwn prev ins in
         if str_eq w "" then
           // (a block's sequence: the send's second operand; a method's or a
@@ -68714,7 +68788,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
           (let isdef = o >= 59 && o <= 61 in
            let (cw, cid, cy0, cids, couts0) =
              (match (if o == 29 || o == 58 || o == 62 || isdef then vm_nth ins 2 else if o == 77 then vm_nth ins 1 else VNil) with
-              | VArr c -> vm_load_seq (deref c) (if isdef then (Nil : (Val list * int * int * bool) list) else scopes) (depth + 1)
+              | c9 when vm_is_lst c9 -> vm_load_seq (vm_lst c9) (if isdef then (Nil : (Val list * int * int * bool) list) else scopes) (depth + 1)
               | _ -> ("", 0 - 1, 0, (Nil : int list), (Nil : (str * int) list))) in
            let cy = (if isdef then 0 else cy0) in
            let couts = (if isdef then (Nil : (str * int) list) else couts0) in
@@ -68759,7 +68833,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
      | Cons ((k, sq, st, ed, ct9, sp), t) ->
        (let (cw, cid, cy, cids, couts) =
           (match (if (k == 1 || k == 2) && str_eq w "" then sq else VNil) with
-           | VArr c -> vm_load_seq (deref c) scopes (depth + 1)
+           | c9 when vm_is_lst c9 -> vm_load_seq (vm_lst c9) scopes (depth + 1)
            | _ -> ("", 0 - 1, 0, (Nil : int list), (Nil : (str * int) list))) in
         let s9 = lab st in
         let e9 = lab ed in
@@ -68825,11 +68899,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
         Cons (SIf (Cons ((EMethod (EVar n, "nil?", Nil), Cons (SAssign (n, d), Nil)), Nil), Nil), pro t))) in
   // (...led by the line its `end` is on, as a parsed class body is -- a
   //  TracePoint's :end and :return are there: class_end_line, vm_define)
-  let endl = (match vm_nth top 4 with
-              | VHsh m -> (match vm_hget (hderef m) "code_location" with
-                           | VArr c -> (match vm_nth (deref c) 2 with VInt n -> n | _ -> line0)
-                           | _ -> line0)
-              | _ -> line0) in
+  let endl = (match vm_nth (vm_lst (vm_hget (vm_rec (vm_nth top 4)) "code_location")) 2 with VInt n -> n | _ -> line0) in
   let bb = (if kind == 1 then pro defs else Cons (SLineQ (0 - endl), Cons (SFile (bx_tag pth), Cons (SVm (id, gen), Nil)))) in
   // (a rescue or an ensure sequence's one local is its `$!`: the name the
   //  frame holds it under goes where a sequence's optional names go)
@@ -68854,7 +68924,7 @@ and vm_load_seq = fn (top: Val list) -> fn (outer: (Val list * int * int * bool)
   let _ = vec_set vm_meta id (lbl, pth, kind, gen, optn, optp optl, decl, kids, bp, bb,
                               // (1: a yield, a `defined?(yield)` or a super is in it; 2: the
                               //  method takes a block as ruby's compiler decides it -- use_block)
-                              yld % 2 + (match (match vm_nth top 11 with VHsh ph -> vm_hget (hderef ph) "use_block" | _ -> VNil) with VBool true -> 2 | _ -> 0),
+                              yld % 2 + (match vm_hget (vm_rec (vm_nth top 11)) "use_block" with VBool true -> 2 | _ -> 0),
                               onames outs, defs, ctab) in
   // (the locals of this sequence that are assigned more than once: noted on
   //  the blocks inside it that reach them, for a shareable Proc's refusal)
@@ -68962,7 +69032,7 @@ and vm_setter = fn (m: str) ->
 and vm_next_pops = fn (xs: Val list) ->
   match xs with
   | Nil -> false
-  | Cons (VArr i, _) -> (match deref i with Cons (VSym s, Nil) -> str_eq s "pop" | _ -> false)
+  | Cons (i9, _) when vm_is_lst i9 -> (match vm_lst i9 with Cons (VSym s, Nil) -> str_eq s "pop" | _ -> false)
   | Cons (_, t) -> vm_next_pops t
 and vm_iapp = fn (a: int list) -> fn (b: int list) ->
   match a with Nil -> b | Cons (h, t) -> Cons (h, vm_iapp t b)
@@ -68974,7 +69044,7 @@ and vm_has_sym = fn (ls: Val list) -> fn (n: str) ->
 // A whole to_a tree loaded: (why, the top sequence's id). What the VM
 // refuses is refused whole, and what was decoded of it given back.
 and vm_load = fn (a: Val) ->
-  let top = (match a with VArr id -> deref id | _ -> Nil) in
+  let top = vm_lst a in
   let why0 =
     // (--debug=frozen-string-literal records where each literal was made,
     //  and the command line's frozen-string-literal flags are not among the
@@ -69005,11 +69075,7 @@ and vm_load = fn (a: Val) ->
      else (let _ = vm_free_all ids in (why, 0 - 1)))
 and vm_cov_note = fn (top: Val list) -> fn (ids: int list) ->
   let pth = (match vm_nth top 6 with VStr h -> sget h | _ -> "") in
-  let last = (match vm_nth top 4 with
-              | VHsh m -> (match vm_hget (hderef m) "code_location" with
-                           | VArr c -> (match vm_nth (deref c) 2 with VInt n -> n | _ -> 0)
-                           | _ -> 0)
-              | _ -> 0) in
+  let last = (match vm_nth (vm_lst (vm_hget (vm_rec (vm_nth top 4)) "code_location")) 2 with VInt n -> n | _ -> 0) in
   let _ = (if map_has cov_tab ("F:" ++ pth) then () else map_set cov_tab ("F:" ++ pth) last) in
   // (the lines the evaluator's parser noted for the file, and that have not
   //  run, are not its lines any more: the VM runs it, and a line is counted
@@ -69091,17 +69157,19 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
         //  Ruby compiler, test_coverage's test_big_code)
         let native9 = (vec_get cov_st 0 == 0 || (vec_get cov_st 1 / 2) % 2 == 0)
                       && (if str_eq (env_get "MERE_RUBY_IC") "ruby" then false else true) in
-        let nat = (if native9 then ic_vm_native env world blk src path label else VNil) in
+        // (nk: 2 its program is loaded, nid; 3 the loader refused what it
+        //  compiled, and nwhy; 1 it declined, and nwhy; 0 it answered nothing)
+        let (nk, nwhy, nid) = (if native9 then ic_vm_native env world blk src path label false else (0, "", 0 - 1)) in
         // (=report also says which files the native compiler declined, and
         //  why: the Ruby compiler then compiles them, at many times the cost)
         let _ = (if str_eq mode "report" && native9 then
-                   (match nat with
-                    | VArr _ -> ()
-                    | VStr h9 -> print_err ("mere-ruby: vm: " ++ path ++ ": the native compiler declined: " ++ sget h9)
-                    | _ -> print_err ("mere-ruby: vm: " ++ path ++ ": the native compiler declined"))
+                   (if nk >= 2 then ()
+                    else if nk == 1 then print_err ("mere-ruby: vm: " ++ path ++ ": the native compiler declined: " ++ nwhy)
+                    else print_err ("mere-ruby: vm: " ++ path ++ ": the native compiler declined"))
                  else ()) in
+        let nat = (if nk == 1 then mkstr nwhy else VNil) in
         let r = (match nat with
-                 | VArr _ -> nat
+                 | _ when nk >= 2 -> VNil
                  // (...but a BEGIN the native compiler declined is not handed
                  //  to the Ruby one, which declines it too: loading it --
                  //  Prism's Ruby library with it -- cost every
@@ -69112,13 +69180,17 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
                  //  (88). What else it declines the Ruby one may take: a
                  //  top-level `return false`, corpus 675.)
                  | VStr h9 when native9 && (str_contains (sget h9) "PreExecutionNode" || str_contains (sget h9) "pre_execution_node") -> mkstr "a BEGIN block"
-                 // (...nor a source in an encoding neither compiler takes)
-                 | VStr h9 when native9 && str_starts_with (sget h9) "a source in " -> nat
                  | _ ->
+                // (the Ruby compiler makes a literal's Regexp with Regexp.new:
+                //  quiet, as the native compiler's is -- ic_first_v)
                 try_or_msg (fn (u: unit) ->
-                  invoke_val_c env world blk (VClass "RubyVM::InstructionSequence") "__vm_file"
-                    (Cons (mkstr src, Cons (mkstr path, Cons (mkstr label, Nil)))) false)
+                  (let _ = vec_set ic_first_v 1 1 in
+                   let r9 = invoke_val_c env world blk (VClass "RubyVM::InstructionSequence") "__vm_file"
+                              (Cons (mkstr src, Cons (mkstr path, Cons (mkstr label, Nil)))) false in
+                   let _ = vec_set ic_first_v 1 0 in
+                   r9))
                   (fn (m: str) ->
+                     let _ = vec_set ic_first_v 1 0 in
                      // (the compiler rescues what it raises; what still got
                      //  here is put away, and the file runs as before)
                      (let (_, _, _, ivars9) = world in
@@ -69129,17 +69201,20 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
         let _ = map_delete cli_opt "vmbusy" in
         let _ = cur_line_set line9 in
         let _ = cur_file_set file9 in
+        let on_vm = fn (id: int) ->
+          (let (_, _, _, gen, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
+           let _ = (if asked then (let _ = print_err ("mere-ruby: vm: " ++ path ++ ": on the VM") in exit 0) else ()) in
+           // (led by the file, as the parsed statements are: the head's SFile)
+           match prog with
+           | Cons (SFile f, _) -> Cons (SFile f, Cons (SVm (id, gen), (Nil : Stmt list)))
+           | _ -> Cons (SFile (bx_tag path), Cons (SVm (id, gen), (Nil : Stmt list)))) in
+        if nk == 2 then on_vm nid
+        else if nk == 3 then refused nwhy
+        else
         match r with
         | VArr _ ->
           (let (why, id) = vm_load r in
-           if str_eq why "" then
-             (let (_, _, _, gen, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
-              let _ = (if asked then (let _ = print_err ("mere-ruby: vm: " ++ path ++ ": on the VM") in exit 0) else ()) in
-              // (led by the file, as the parsed statements are: the head's SFile)
-              match prog with
-              | Cons (SFile f, _) -> Cons (SFile f, Cons (SVm (id, gen), (Nil : Stmt list)))
-              | _ -> Cons (SFile (bx_tag path), Cons (SVm (id, gen), (Nil : Stmt list))))
-           else refused why)
+           if str_eq why "" then on_vm id else refused why)
         | VStr h -> refused (sget h)
         | _ -> refused "the compiler answered nothing"))
 // A required file the native compiler takes whole, asked BEFORE the
@@ -69157,28 +69232,32 @@ and vm_file_first = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
     (let _ = map_set cli_opt "vmbusy" "1" in
      let line9 = cur_line () in
      let file9 = cur_file () in
-     let _ = vec_set ic_warns_v 0 0 in
-     let _ = vec_set ic_warns_v 1 1 in
-     let nat = ic_vm_native env world blk src path "<top (required)>" in
-     let _ = vec_set ic_warns_v 1 0 in
+     let _ = vec_set ic_first_v 0 1 in
+     let (nk, _, id) = ic_vm_native env world blk src path "<top (required)>" true in
+     let _ = vec_set ic_first_v 0 0 in
      let _ = map_delete cli_opt "vmbusy" in
      let _ = cur_line_set line9 in
      let _ = cur_file_set file9 in
-     match nat with
-     | VArr _ ->
-       (if vec_get ic_warns_v 0 > 0 then (Nil : Stmt list)
-        else
-          (let (why, id) = vm_load nat in
-           if str_eq why "" then
-             (let (_, _, _, gen, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
-              Cons (SFile (bx_tag path), Cons (SVm (id, gen), (Nil : Stmt list))))
-           else (Nil : Stmt list)))
-     | _ -> (Nil : Stmt list))
-// The native compiler's sequences for a file run on the VM -- the Array
-// RubyVM::InstructionSequence.__vm_file answers, built in Mere from libprism's
-// serialized tree (ic/, note 552) -- or VNil when it does not take the file:
-// a syntax error, a source in an encoding the VM does not take, a node it
-// refuses, or any failure of its own. The caller then asks the Ruby compiler.
+     if nk == 2 then
+       (let (_, _, _, gen, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
+        Cons (SFile (bx_tag path), Cons (SVm (id, gen), (Nil : Stmt list))))
+     else (Nil : Stmt list))
+// A file compiled by the native compiler -- ic/, from libprism's serialized
+// tree (note 552) -- and its sequences loaded into the VM's tables, in one
+// region: what RubyVM::InstructionSequence.__vm_file answers as an Array is
+// here a list the loader reads (VIcl) and the region then drops. Before
+// this, each instruction was made an Array and each calldata a Hash, the
+// loader read them back, and a collection later swept them: a tenth of a
+// Rails boot on the VM.
+// The answer is (what, why, id):
+//   2  the program `id` is loaded
+//   3  refused for good, and why: the loader refused what was compiled, or
+//      the compiler declined something in a source that is not UTF-8 or
+//      US-ASCII (which the Ruby compiler does not take at all)
+//   1  the compiler declined, and why: a node it refuses, a failure of its own
+//   0  nothing: a syntax error -- or, when `quiet` (asked before the parser,
+//      vm_file_first), a source Prism has a warning of
+// On 1 and 0 the caller may ask the Ruby compiler.
 // libprism's parse of src (no file, line 1, no options) finds no error:
 // pm_parse_success_p, with the options packed as Prism's FFI side packs them
 and ic_parse_ok = fn (src: str) ->
@@ -69195,59 +69274,169 @@ and ic_parse_ok = fn (src: str) ->
     let _ = u32 0 in
     prism_ok (bytes_of_str src) (bytes_of_vec ob) == 1
   }
-and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: str) -> fn (label: str) ->
-  let ok = vec_new () in
-  let _ = vec_push ok 0 in
-  let res =
+// Prism's options as its FFI backend packs them: the file path, the first
+// line, no encoding, the flags all 0, no scopes.
+and ic_prism_opts = fn (path: str) -> fn (line: int) ->
+  let ob = ic_opts_v in
+  let _ = vec_recycle ob in
+  let u32 = fn (n0: int) ->
+    (let n = (if n0 < 0 then n0 + 4294967296 else n0) in
+     let _ = vec_push ob (n % 256) in let _ = vec_push ob ((n / 256) % 256) in
+     let _ = vec_push ob ((n / 65536) % 256) in vec_push ob ((n / 16777216) % 256)) in
+  let pb = bytes_of_str path in
+  let _ = u32 (bytes_len pb) in
+  let rec pbytes = fn (i: int) -> if i >= bytes_len pb then () else (let _ = vec_push ob (bytes_get pb i) in pbytes (i + 1)) in
+  let _ = pbytes 0 in
+  let _ = u32 line in
+  let _ = u32 0 in
+  let rec zeros = fn (k: int) -> if k <= 0 then () else (let _ = vec_push ob 0 in zeros (k - 1)) in
+  let _ = zeros 7 in
+  let _ = u32 0 in
+  bytes_of_vec ob
+// Prism's own report of a source's syntax errors, as ruby raises it for a
+// file or an eval: "<path>:<line>: syntax error found" and the frame
+// pm_parse_errors_format writes --
+//
+//     4 | v4 = 4
+//     5 | v5 = 5
+//   > 6 | v6 = /(un/
+//       |        ^~ end pattern with unmatched parenthesis
+//     7 | v7 = 7
+//
+// -- "" when Prism has no error of the source, or one that is not a syntax
+// error's (an argument's, a load's: those are other exceptions).
+// The frame's rules, each read off ruby 4.0.10's output:
+//   - the errors in the order of their place; "errors" when there are two;
+//   - two lines before the first error's line and two after the last one's,
+//     and between two errors every line when there are four or fewer, else
+//     two after, a row of `~`, and two before;
+//   - a line number as wide as the LAST error's line number;
+//   - `^~~` under the error's characters (one column a character, a tab
+//     too), cut at the end of its line, with the message;
+//   - a line whose error starts 30 bytes in or more starts there, after
+//     "... ", and one that goes on 30 bytes past the error stops there,
+//     with " ...".
+and prism_report = fn (src: str) -> fn (path: str) -> fn (line: int) ->
+  region PRP {
+    let sb = bytes_of_str src in
+    let slen = bytes_len sb in
+    let (ok, first, offs, es0) = ic_tree_errors (prism_ser 0 sb (ic_prism_opts path line)) in
+    let nl = vec_len offs in
+    let rec all_syntax = fn (es: (int * str * int * int) list) ->
+      (match es with Nil -> true | Cons ((lv, _, _, _), t) -> lv == 0 && all_syntax t) in
+    // (by where they start: an insertion sort, the errors being few)
+    let rec ins = fn (e: int * str * int * int) -> fn (xs: (int * str * int * int) list) ->
+      (match xs with
+       | Nil -> Cons (e, Nil)
+       | Cons (h, t) -> (let (_, _, a, _) = e in let (_, _, b, _) = h in if a < b then Cons (e, xs) else Cons (h, ins e t))) in
+    let rec sort = fn (xs: (int * str * int * int) list) -> fn (acc: (int * str * int * int) list) ->
+      (match xs with Nil -> acc | Cons (h, t) -> sort t (ins h acc)) in
+    let es = sort es0 Nil in
+    if (if ok then false else true) || nl == 0 || (match es with Nil -> true | _ -> false) || (if all_syntax es then false else true) then ""
+    else
+      (let li_of = fn (off: int) ->
+         (let rec go = fn (lo: int) -> fn (hi: int) ->
+            (if hi - lo <= 1 then lo
+             else (let mid = (lo + hi) / 2 in if vec_get offs mid <= off then go mid hi else go lo mid)) in
+          go 0 nl) in
+       let lstart = fn (li: int) -> vec_get offs li in
+       let lend = fn (li: int) -> (if li + 1 < nl then vec_get offs (li + 1) else slen) in
+       let rec last_start = fn (xs: (int * str * int * int) list) -> fn (acc: int) ->
+         (match xs with Nil -> acc | Cons ((_, _, st, _), t) -> last_start t st) in
+       let rec count = fn (xs: (int * str * int * int) list) -> (match xs with Nil -> 0 | Cons (_, t) -> 1 + count t) in
+       let width = str_len (str_of_int (first + li_of (last_start es 0))) in
+       let rec rep = fn (c: str) -> fn (n: int) -> (if n <= 0 then "" else c ++ rep c (n - 1)) in
+       let num = fn (li: int) -> (let s = str_of_int (first + li) in rep " " (width - str_len s) ++ s ++ " | ") in
+       let slice = fn (a: int) -> fn (b: int) -> (if b <= a then "" else str_of_bytes (bytes_slice sb a (b - a))) in
+       // (a line as the frame shows it: cs, ce the error's columns, ce < 0
+       //  for a line shown whole)
+       let fmt_line = fn (li: int) -> fn (cs: int) -> fn (ce: int) ->
+         (let a = lstart li in
+          let b = lend li in
+          let cut_end = ce > 0 && b - (a + ce) >= 30 in
+          let cut_start = cs >= 30 in
+          num li ++ (if cut_start then "... " else "")
+          ++ slice (if cut_start then a + cs else a) (if cut_end then a + ce + 30 else b)
+          ++ (if cut_end then " ...\n"
+              else if b >= slen && (slen == 0 || bytes_get sb (slen - 1) != 10) then "\n" else "")) in
+       // (a character's bytes: UTF-8's lead byte says)
+       let cw = fn (p: int) ->
+         (if p >= slen then 1
+          else (let c = bytes_get sb p in if c >= 240 then 4 else if c >= 224 then 3 else if c >= 192 then 2 else 1)) in
+       let marker = fn (li: int) -> fn (shown_cs: int) -> fn (cs: int) -> fn (ce: int) -> fn (msg: str) ->
+         (let a = lstart li in
+          let rec pad = fn (col: int) -> (if col >= cs then "" else " " ++ pad (col + cw (a + col))) in
+          let rec tail = fn (col: int) -> (if col >= ce then "" else "~" ++ tail (col + cw (a + col))) in
+          "  " ++ rep " " (width + 1) ++ "| " ++ (if shown_cs >= 30 then "    " ++ pad shown_cs else pad 0)
+          ++ "^" ++ tail (cs + cw (a + cs)) ++ " " ++ msg ++ "\n") in
+       let divider = "  " ++ rep "~" (width + 4) ++ "\n" in
+       let rec go = fn (xs: (int * str * int * int) list) -> fn (idx: int) -> fn (lastli: int) -> fn (shown: int) -> fn (acc: str list) ->
+         (match xs with
+          | Nil -> acc
+          | Cons ((_, msg, st, ln), t) ->
+            (let li = li_of st in
+             let cs = st - lstart li in
+             // (an error that runs on to another line is marked to the end of
+             //  this one; one of no width is marked one column)
+             let ce0 = (if li_of (st + ln) == li then st + ln - lstart li
+                        else (let e = lend li - lstart li in if e > 0 && bytes_get sb (lend li - 1) == 10 then e - 1 else e)) in
+             let ce = (if ce0 <= cs then cs + 1 else ce0) in
+             let fresh = idx == 0 || li != lastli in
+             let d = li - lastli in
+             let a1 = (if fresh && d > 2
+                       then Cons ("  " ++ fmt_line (li - 2) 0 (0 - 1), (if idx != 0 && d > 3 then Cons (divider, acc) else acc))
+                       else acc) in
+             let a2 = (if fresh && d > 1 then Cons ("  " ++ fmt_line (li - 1) 0 (0 - 1), a1) else a1) in
+             let a3 = (if fresh then Cons ("> " ++ fmt_line li cs ce, a2) else a2) in
+             let shown2 = (if fresh then cs else shown) in
+             let a4 = Cons (marker li shown2 cs ce msg, a3) in
+             // (after the last error, up to the source's last line: the
+             //  line after a final newline is not one)
+             let nextli = (match t with
+                           | Nil -> (if slen > 0 && bytes_get sb (slen - 1) == 10 then nl - 1 else nl)
+                           | Cons ((_, _, st2, _), _) -> li_of st2) in
+             let (a5, l5) = (if nextli - li > 1 then (Cons ("  " ++ fmt_line (li + 1) 0 (0 - 1), a4), li + 1) else (a4, li)) in
+             let (a6, l6) = (if nextli - l5 > 1 then (Cons ("  " ++ fmt_line (l5 + 1) 0 (0 - 1), a5), l5 + 1) else (a5, l5)) in
+             go t (idx + 1) l6 shown2 a6)) in
+       let body = go es 0 (0 - 1) 0 (Nil : str list) in
+       let rec cat = fn (xs: str list) -> fn (acc: str) -> (match xs with Nil -> acc | Cons (h, t) -> cat t (h ++ acc)) in
+       let first_li = (match es with Cons ((_, _, st, _), _) -> li_of st | _ -> 0) in
+       path ++ ":" ++ str_of_int (first + first_li) ++ ": syntax error" ++ (if count es > 1 then "s" else "") ++ " found\n" ++ cat body "")
+  }
+and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: str) -> fn (label: str) -> fn (quiet: bool) ->
     region ICV {
-      // (Prism's options as its FFI backend packs them: the file path, the
-      //  first line, no encoding, the flags all 0, no scopes)
-      let ob = vec_new () in
-      let u32 = fn (n: int) ->
-        (let _ = vec_push ob (n % 256) in let _ = vec_push ob ((n / 256) % 256) in
-         let _ = vec_push ob ((n / 65536) % 256) in vec_push ob ((n / 16777216) % 256)) in
-      let pb = bytes_of_str path in
-      let _ = u32 (bytes_len pb) in
-      let rec pbytes = fn (i: int) -> if i >= bytes_len pb then () else (let _ = vec_push ob (bytes_get pb i) in pbytes (i + 1)) in
-      let _ = pbytes 0 in
-      let _ = u32 1 in
-      let _ = u32 0 in
-      let rec zeros = fn (k: int) -> if k <= 0 then () else (let _ = vec_push ob 0 in zeros (k - 1)) in
-      let _ = zeros 7 in
-      let _ = u32 0 in
       let sb = bytes_of_str src in
-      let ser = prism_ser 0 sb (bytes_of_vec ob) in
+      let ser = prism_ser 0 sb (ic_prism_opts path 1) in
       let meta = vec_new () in
-      let _ = zeros 0 in
       let rec fill = fn (i: int) -> if i <= 0 then () else (let _ = vec_push meta 0 in fill (i - 1)) in
-      let _ = fill 8 in
+      let _ = fill 11 in
       let tr = (ser, sb, vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), meta) in
       let es = (vec_new (), vec_new (), vec_new (), vec_new (), vec_new ()) in
       let us = (vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (),
                 vec_new (), vec_new (), vec_new (), vec_new ()) in
       let cx = (tr, es, us) in
       let why = ic_tree_load tr in
-      let _ = vec_set ic_warns_v 0 (vec_get meta 6) in
-      if (if str_eq why "" then false else true) || vec_get meta 3 > 0 then VNil
+      if (if str_eq why "" then false else true) || vec_get meta 3 > 0 then (0, "", 0 - 1)
+      // (slot 6: Prism's warnings of the source)
+      else if quiet && vec_get meta 6 > 0 then (0, "", 0 - 1)
       else
         (let enc = ic_enc cx in
-         // (a source in another encoding is the evaluator's, and the Ruby
-         //  compiler says the same of it: answered here as that refusal, so
-         //  the Ruby compiler -- and Prism's Ruby library with it -- is not
-         //  loaded to say it again. One such file in a Rails boot, a BINARY
-         //  one, cost a fifth of the boot that way.)
-         if (if str_eq enc "UTF-8" || str_eq enc "US-ASCII" then false else true) then mkstr ("a source in " ++ enc)
-         else
-           try_or_msg (fn (x: unit) ->
-                         (let iv = ic_to_a cx (ic_compile cx path label) in
-                          let v = ic_to_val env world blk iv in
-                          let _ = vec_set ok 0 1 in
-                          v))
-                      (fn (m: str) -> mkstr m))
-    } in
-  // (the program, or why it was declined -- a construct it does not compile
-  //  yet, as its message -- or nil)
-  if vec_get ok 0 == 1 then res else (match res with VStr _ -> res | _ -> VNil)
+         // (a source in another encoding is compiled as any is: its literals
+         //  carry the encoding. What is declined in one is declined for good
+         //  -- the Ruby compiler takes no such source, and asking it loads
+         //  it, and Prism's Ruby library with it, to say so: one such file
+         //  in a Rails boot, a BINARY one, cost a fifth of the boot.)
+         let other = (if str_eq enc "UTF-8" || str_eq enc "US-ASCII" then false else true) in
+           (let msg = vec_new () in
+            // (a construct it does not compile yet declines by failing, with
+            //  the message)
+            let v = try_or_msg (fn (x: unit) -> ic_to_val env world blk (ic_to_a cx (ic_compile cx path label)))
+                               (fn (m: str) -> (let _ = vec_push msg m in VNil)) in
+            if vec_len msg > 0 then ((if other then 3 else 1), (if other then "in a source in " ++ enc ++ ", " else "") ++ vec_get msg 0, 0 - 1)
+            else
+              (let (lw, id) = vm_load v in
+               if str_eq lw "" then (2, "", id) else (3, lw, 0 - 1))))
+    }
 // (the native compiler's values as the interpreter's: a literal frozen, as
 //  the Ruby compiler freezes what it puts in an instruction)
 // ⚠ The compiler's data, not the program's calls: this runs while a file is
@@ -69256,6 +69445,14 @@ and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: st
 //   freeze is the primitive's and an Encoding the interpreter's own object.
 and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
   let frozen = fn (x: Val) -> prim_method_raw x "freeze" Nil in
+  // (a String inside a literal Array or Hash is ruby's fstring, as every
+  //  String an instruction carries is: one object for that text in that
+  //  encoding. `{"ABC" => 1}` is a duphash whose key is one, so two such
+  //  literals have the same key object, and it is `"ABC".freeze` -- on the
+  //  VM each literal's key was an object of its own: test_hash's
+  //  test_NEWHASH_fstring_key, which no run on the VM had reached while its
+  //  file, a US-ASCII source, fell back for another reason.)
+  let inner = fn (y: Iv) -> (match ic_to_val env world blk y with VStr h -> (if sfrozen_get h then str_fstring (VStr h) else VStr h) | x -> x) in
   match v with
   | IvNil -> VNil
   | IvTrue -> VBool true
@@ -69269,19 +69466,19 @@ and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
     (let x = mkstr_e s (if str_len e == 0 then "UTF-8" else e) in
      let _ = (match x with VStr h -> sfrozen_set h | _ -> ()) in
      x)
-  | IvArr xs -> arr_new (ic_map (fn (y: Iv) -> ic_to_val env world blk y) xs)
+  | IvArr xs -> arr_new (ic_map inner xs)
   | IvHsh ps ->
     (let rec flat = fn (xs: (Iv * Iv) list) ->
        (match xs with
         | Nil -> (Nil : Val list)
-        | Cons ((k, x), t) -> Cons (ic_to_val env world blk k, Cons (ic_to_val env world blk x, flat t))) in
+        | Cons ((k, x), t) -> Cons (inner k, Cons (inner x, flat t))) in
      frozen (mkhash (flat ps)))
   | IvRx (s, o, e) ->
     // (asked before the parser: the literal is validated here as the
     //  parser's queue validates it -- rx_check_go -- and one that does not
     //  parse, or that the check has a warning of, stops the compile: the
     //  file then goes the long way, where the parser says so)
-    (let _ = (if vec_get ic_warns_v 1 == 1 then
+    (let _ = (if vec_get ic_first_v 0 == 1 then
                 (let _ = rx_wq_take () in
                  let fl9 = (if o % 2 == 1 then "i" else "") ++ (if (o / 2) % 2 == 1 then "x" else "") ++ (if (o / 4) % 2 == 1 then "m" else "") in
                  let ok9 = rx_validate s fl9 in
@@ -69289,7 +69486,21 @@ and ic_to_val = fn env -> fn world -> fn blk -> fn (v: Iv) ->
                  let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
                  if ok9 && str_eq w9 "" then () else fail "a regexp literal the parser has something to say of")
               else ()) in
-     frozen (invoke_val_c env world blk (VClass "Regexp") "__rx_new" (Cons (mkstr_e s e, Cons (VInt o, Nil))) false))
+     let q9 = vec_get ic_first_v 1 in
+     let _ = vec_set ic_first_v 1 1 in
+     let rx9 = try_or_msg (fn (u: unit) -> invoke_val_c env world blk (VClass "Regexp") "__rx_new" (Cons (mkstr_e s e, Cons (VInt o, Nil))) false)
+                          (fn (m: str) -> (let _ = vec_set ic_first_v 1 q9 in fail m)) in
+     let _ = vec_set ic_first_v 1 q9 in
+     frozen rx9)
+  // (a sequence's structure: read by the loader and dropped, so no Array
+  //  and no Hash is made of it -- two in three of the objects this made)
+  | IvLst xs -> VIcl (false, ic_map (fn (y: Iv) -> ic_to_val env world blk y) xs)
+  | IvRec ps ->
+    (let rec flat = fn (xs: (Iv * Iv) list) ->
+       (match xs with
+        | Nil -> (Nil : Val list)
+        | Cons ((k, x), t) -> Cons (ic_to_val env world blk k, Cons (ic_to_val env world blk x, flat t))) in
+     VIcl (true, flat ps))
   | IvRng (a, b, excl) -> VRange (ic_to_val env world blk a, ic_to_val env world blk b, excl)
   | IvRat (a, b) ->
     (let sv = fn (x: Iv) -> (match x with IvInt k -> str_of_int k | IvBig t -> t | _ -> "0") in VRat (sv a, sv b))
@@ -69851,6 +70062,12 @@ and vm_send = fn env -> fn world -> fn blk -> fn st -> fn (mid: str) -> fn (fl: 
   //  and raises -- Kernel's format and raise, whatever the program made of
   //  the names it can spell)
   else if str_eq mid "core#sprintf" then vm_push st (vm_eval env world blk args (fn (es: Expr list) -> ECall ("format", es)))
+  // (a shareable_constant_value constant's value: what the evaluator's
+  //  parser wraps the same value in -- scv_wrap. make_shareable(v),
+  //  make_shareable_copy(v) and ensure_shareable(v, the constant's path).)
+  else if str_eq mid "core#make_shareable" then vm_push st (vm_eval env world blk args (fn (es: Expr list) -> scv_call "make_shareable" es))
+  else if str_eq mid "core#make_shareable_copy" then vm_push st (vm_eval env world blk args (fn (es: Expr list) -> scv_call "__scv_copy" es))
+  else if str_eq mid "core#ensure_shareable" then vm_push st (vm_eval env world blk args (fn (es: Expr list) -> scv_call "__scv_check" es))
   else if str_eq mid "core#raise" then vm_push st (vm_eval env world blk args (fn (es: Expr list) -> ERaise es))
   // (core#set_postexe: `END { }` -- the block is the evaluator's at-exit
   //  statement's body, under a site no parsed one has. The `once` around it
@@ -70564,8 +70781,9 @@ and vm_value_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n:
                          | VNil -> h9
                          | _ -> vm_eval env world blk (Cons (h9, Nil)) (fn (es: Expr list) -> EHsh (Cons (EKwSplat (vm_nth_e es 0), Cons (EKwSplat (vm_nth_e es 0), Nil))))) in
      vm_push st b9)
-  else if o == 31 then vm_push st (vm_ev env world blk (EMethod (EStrL n, "freeze", Nil)))
-  else if o == 32 then vm_push st (vm_ev env world blk (EUn ("-", EStrL n)))
+  else if o == 31 || o == 32 then
+    (let lit = (if a == 1 then (match v with VStr h0 -> EMethod (EStrL n, "__lit_enc~" ++ senc_get h0, Nil) | _ -> EStrL n) else EStrL n) in
+     vm_push st (vm_ev env world blk (if o == 31 then EMethod (lit, "freeze", Nil) else EUn ("-", lit))))
   else if o == 33 then vm_push st (vm_send0 env world blk (match v with VArr id -> arr_new (deref id) | _ -> v) "freeze" Nil)
   else if o == 34 then vm_push st (vm_send0 env world blk (match v with VHsh id -> vm_hash env world blk (hderef id) | _ -> v) "freeze" Nil)
   else if o == 35 then
@@ -71831,7 +72049,19 @@ and pm_raise = fn env -> fn world -> fn (v: Val) -> fn (single: bool) ->
         let _ = pm_reset () in
         raise_exc_iv world "NoMatchingPatternKeyError" msg (Cons (("__matchee", m9), Cons (("__key", k9), Nil))))
      else (let _ = pm_reset () in raise_exc world "NoMatchingPatternError" msg))
-  else raise_exc world "NoMatchingPatternError" head
+  // (with more than one pattern ruby raises the error with the value as its
+  //  message -- `raise NoMatchingPatternError, v` -- so the text is the
+  //  value's #to_s, not its inspect: "abc" for a String, the class's name
+  //  for nil, as any raise with that argument says)
+  else raise_exc world "NoMatchingPatternError"
+         (match v with
+          | VNil -> "NoMatchingPatternError"
+          | VStr h9 -> sget h9
+          | VObj _ -> (match try_or (fn (u: unit) -> invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) v "to_s" Nil false) VNil with
+                       | VStr h9 -> sget h9
+                       | _ -> head)
+          | VSym _ -> to_s v
+          | _ -> head)
 and pm_eqq_fail = fn env -> fn world -> fn (pv: Val) -> fn (v: Val) ->
   pm_fail (inspect_w env world pv ++ " === " ++ inspect_w env world v ++ " does not return true")
 
@@ -72193,7 +72423,7 @@ and rxp_parse = fn (pat: str) -> fn (fl: str) ->
   let _ = map_set rx_depth "d" 0 in
   let _ = rxp_enter () in
   let (n, p, g) = rxp_alt pat 0 fl 1 in
-  if p < str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp parse: unmatched )")) in fail "mere-ruby: regexp parse: unmatched )")
+  if p < str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp parse: unmatched close parenthesis")) in fail "mere-ruby: regexp parse: unmatched close parenthesis")
   // ⚠ a reference past the last group is refused once the groups are all
   //   counted (a FORWARD one, `/\1()/`, is fine): `/(a)\2/` matched nothing
   //   where ruby says "invalid backref number/name".
@@ -73064,6 +73294,8 @@ and rx_check_pending = fn (u: unit) ->
   // `eval('/(/')` in a spec file turned every subsequent eval in the process
   // into a SyntaxError. A literal is validated once, whatever the verdict.
   let _ = map_set rx_pending "done" (VInt n) in
+  // (the place of a literal an earlier check refused is not this one's)
+  let _ = vec_set rx_bad_line 0 0 in
   rx_check_go d n
 and rx_check_go = fn (i: int) -> fn (n: int) ->
   if i >= n then ()
@@ -73105,6 +73337,11 @@ and rx_check_go = fn (i: int) -> fn (n: int) ->
           let r9 = strip9 "mere-ruby: regexp: " (strip9 "mere-ruby: regexp parse: " why) in
           let _ = (if str_eq r9 "" || str_eq r9 why then ()
                    else map_set rx_cur "why" (mkstr (r9 ++ ": /" ++ rx_esc_slashes body 0 "" ++ "/"))) in
+          // (...and the line the literal was lexed on, the end of its place
+          //  "<file>:<line>": the line its SyntaxError says -- rx_bad_line)
+          let _ = (let rec lcol = fn (i: int) -> (if i < 0 then 0 - 1 else if str_eq (char_at loc9 i) ":" then i else lcol (i - 1)) in
+                   let c9 = lcol (str_len loc9 - 1) in
+                   vec_set rx_bad_line 0 (if c9 >= 0 && c9 + 1 < str_len loc9 then try_or (fn (u: unit) -> int_of_str (substring loc9 (c9 + 1) (str_len loc9))) 0 else 0)) in
           let _ = map_set prim_missing "i" (cstr_h "mere-ruby: regexp: invalid regular expression") in fail "mere-ruby: regexp: invalid regular expression"))
 
 
