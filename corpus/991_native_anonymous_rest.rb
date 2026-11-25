@@ -218,3 +218,12 @@ p [:scoped_symbol_block, symbol_args, symbol_block.call(9), symbol_block.equal?(
 symbol_source = [10]
 snapshot_args, snapshot_block = anonymous_block_identity(*symbol_source, &(symbol_source << 11; :itself))
 p [:snapshot_symbol_block, snapshot_args, symbol_source, snapshot_block.call(12)]
+
+# Converting a flagged trailing Hash changes the positional spread.
+flagged_input = Hash.ruby2_keywords_hash({a: 1})
+flagged_source = [3, flagged_input]
+flagged_capture = isolation.capture(*flagged_source)
+flagged_input[:a] = 9
+flagged_result = flagged_capture.call
+p [:flagged_copy_snapshot, flagged_result, flagged_result.last.equal?(flagged_input), Hash.ruby2_keywords_hash?(flagged_result.last), Hash.ruby2_keywords_hash?(flagged_input)]
+p [:flagged_keyword_peeling, anonymous_keywords(*flagged_source)]

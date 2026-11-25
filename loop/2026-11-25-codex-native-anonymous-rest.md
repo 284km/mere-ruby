@@ -41,7 +41,7 @@ can run defaults or destructuring callbacks retain the source in a private
 frame slot. A sole anonymous formal has no callback or GC safepoint before
 rest installation: a third fixed integer slot transfers provenance only over
 that atomic interval, and is reset before installation. This avoids generic
-per-call local tuples and temporary frame-map traffic. Native leaf, block,
+per-call local tuples, temporary VArr wrappers and frame-map traffic. Native leaf, block,
 iterator, sender and Method boundaries consume Array provenance. Idempotent
 native deletion already handles an empty table, so cleanup needs no separate
 presence probe.
@@ -53,7 +53,10 @@ Binding recognizes that refusal before reading the unused source lengths.
 Array provenance is not a flagged Hash. Parse keyword formals in this branch
 only when the actual trailing Hash has a ruby2_keywords splat note. Borrow
 only at the matching positional-prefix boundary, without optional/post or
-ruby2_keywords copying; do not compare every Array element.
+ruby2_keywords copying; do not compare every Array element. When a flagged trailing Hash is copied
+or peeled as keywords, the original Array is no longer the positional rest:
+retain the converted snapshot instead. Regressions cover subsequent source
+Hash mutation and preventing peeled keywords from appearing positionally.
 
 ## Block conversion and ownership
 
@@ -66,13 +69,11 @@ it in GC churn accounting and compaction. Its only reader finishes during
 marking; no borrowed entry survives into compaction. The regression first
 accumulates deleted roots with automatic GC disabled, then collects while
 an ephemeral conversion source is held, exercising compaction with a live
-root as well as marking. The callback scope also owns its native
-closure and temporary root value in a region; copies cannot accumulate in the
-caller's long-lived region after the scope returns. Only the converted
-Proc/value and its origin kind cross that region; assemble the block
-environment outside. Preserve Symbol conversion and direct-versus-converted
-Proc origin exactly. This reclaims real bookkeeping storage without changing
-Ruby allocation counts.
+root as well as marking. Reuse the actual native source value when installing
+an eligible borrowed rest, instead of constructing a second VArr wrapper
+with the same handle on every call. No temporary caller-owned wrapper needs
+to survive after the frame stores its value. This reclaims real bookkeeping
+storage without changing Ruby allocation counts.
 
 CRuby compile.c setup_args_dup_rest_p distinguishes a simple block variable
 from a complex expression that can modify its splat. Preserve the source
@@ -87,16 +88,16 @@ call receives counting-only work.
 
 ## Regression and measurement
 
-Corpus 991 has 61 output lines covering the exact review reproduction,
+Corpus 991 has 63 output lines covering the exact review reproduction,
 direct/explicit/frozen/nil/converted splats, deep shareability, source aliasing
 across GC, leading/optional/post parameters, repeated splats, local/Binding
 collisions, reflection, large arguments, native boundaries, empty super,
 keyword append, block conversion mutation, exceptions and ephemeral roots.
-The final 61-line candidate also checks converted Proc identity, lambda
+The final 63-line candidate also checks converted Proc identity, lambda
 behavior, fresh captured locals after GC, and scoped/snapshot Symbol blocks.
-All 61 match clean Ruby 4.0.10 on both engines, normally and under GC stress
-50, with empty stderr. GC-root, duplicate-definition and dead-definition
-gates pass. Final-head corpus 664, hardware profiles, isolated allocation
+All 63 lines match clean Ruby 4.0.10 on evaluator and VM, normally and with
+GC stress 50, with empty stderr. GC-root, duplicate-definition and
+dead-definition gates pass on this candidate. Final-head corpus 664, hardware profiles, isolated allocation
 file and full corpus/gate results are required before the batched push.
 
 Measure all 76 ruby/test_allocation.rb cases alone on each engine, without
