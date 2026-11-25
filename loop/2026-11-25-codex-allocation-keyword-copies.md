@@ -237,3 +237,21 @@ the only missing dispatch change. Keep corpus 1062 unchanged as the control
 and repeat both engines, normal/stress, before continuing acceptance.
 The old integrated binary remains pinned for the main/head diagnostic while
 this source correction is prepared; rebuild before any final-head result.
+
+## Full-corpus follow-up: empty value-list keyword merges
+
+The f2c40d61 full index ON/OFF sweep finds corpus 117: [**{}] must be [],
+where an ordinary splat of a flagged empty Hash retains that Hash. The value
+walker now evaluates keyword-merge fields once, omits an empty merge without
+publishing empty-keyword or splat origin, and builds a nonempty value using
+the existing keyword-merge construction. Ordinary Hash-literal evaluation and
+call-argument binding are unchanged. Extend 987 with empty merge positions,
+the flagged ordinary-splat control and side-effectful to_hash conversions.
+
+Keep the completed f2c40d61 unit/instruction/RSS evidence identified by that
+source. Its controlled 20-run allocation plan retains all samples: median
+KiB 675,520 to 617,120 on evaluator, 679,840 to 644,544 on VM. All 76 cases
+are COMPLETE on every sample, main 8 MATCH/68 RED and head 14/62. The full
+corpus finding prevents accepting that head; final source needs a fresh
+focused replay, relevant whole files, controlled allocation/RSS, source gates
+and complete corpus/VM acceptance before the batched push.

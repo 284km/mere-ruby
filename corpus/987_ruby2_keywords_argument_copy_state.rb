@@ -430,3 +430,13 @@ p [:module_exec_origin, Module.new.module_exec(*[callback_hash]) { |a: 0| a }]
 yielded_keywords = []
 Enumerator.new { |y| y.yield(*[callback_hash]) }.each { |a: 0| yielded_keywords << a }
 p [:yielder_origin, yielded_keywords]
+
+# Empty value-list keyword merges omit the element; an ordinary splat keeps it.
+empty_value_987 = Hash.ruby2_keywords_hash({})
+p [:empty_value_merges, [**{}], [1, **{}], [**{}, 9], [**empty_value_987], [*[empty_value_987]]]
+merge_calls_987 = []
+empty_merge_987 = Object.new
+empty_merge_987.define_singleton_method(:to_hash) { merge_calls_987 << :empty; {} }
+full_merge_987 = Object.new
+full_merge_987.define_singleton_method(:to_hash) { merge_calls_987 << :full; {a: 2} }
+p [:value_merge_evaluation, [**empty_merge_987], [1, **full_merge_987], merge_calls_987]
