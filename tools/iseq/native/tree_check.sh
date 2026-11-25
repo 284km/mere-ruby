@@ -5,6 +5,12 @@
 here="$(cd "$(dirname "$0")" && pwd)"
 tmp="${TMPDIR:-/tmp}/ic_tree.$$"
 mkdir -p "$tmp"
+# (MERE may be relative to where this was started: made absolute before the
+#  compile, which runs from this directory)
+case "${MERE:?MERE names the Mere compiler}" in
+  /*) ;;
+  */*) MERE="$(cd "$(dirname "$MERE")" && pwd)/$(basename "$MERE")" ;;
+esac
 (cd "$here" && "$MERE" -c tree_dump.mere > "$tmp/tree_dump.c") && clang -O1 -w "$tmp/tree_dump.c" -o "$tmp/tree_dump" || { echo "tree_check: build failed"; exit 2; }
 ok=0; bad=0
 for f in "$@"; do
