@@ -359,3 +359,74 @@ class NativeSplatInitializer
   end
 end
 p [:native_constructor_forwarding, NativeSplatInitializer.new(*[native_hash]).value]
+
+# A splat that builds values does not prepare a keyword call.
+value_preparers = [
+  ->(h) { x = [*[h]]; nil },
+  ->(h) { x = [1, *[h]]; nil },
+  ->(h) { x, y = 1, *[h]; nil },
+  ->(h) { x = {nested: [*[h]]}; nil },
+  ->(h) { x = [[*[h]]]; nil },
+  ->(h) { x = "#{[*[h]]}"; nil },
+  ->(h) { x = '%p' % [*[h]]; nil }
+]
+value_preparers.each_with_index do |prepare, index|
+  h = Hash.ruby2_keywords_hash(a: 2)
+  prepare.call(h)
+  native_splat_noop
+  method_answer = begin
+    native_splat_keyword(h)
+  rescue ArgumentError => error
+    error.class
+  end
+  prepare.call(h)
+  native_splat_noop
+  proc_answer = proc { |a: 0| a }.call(h)
+  prepare.call(h)
+  native_splat_noop
+  lambda_answer = ->(value, a: 0) { a }.call(h)
+  p [:value_splat_origin, index, method_answer, proc_answer, lambda_answer]
+end
+empty_value_hash = Hash.ruby2_keywords_hash({})
+empty_values = [*[empty_value_hash]]
+p [:empty_value_splat, empty_values.size, empty_values.last.equal?(empty_value_hash),
+   Hash.ruby2_keywords_hash?(empty_values.last)]
+first_value, second_value = 1, *[empty_value_hash]
+p [:empty_assignment_splat, first_value, second_value.equal?(empty_value_hash)]
+
+# Native callbacks receive positional values even when another native argument
+# is the same flagged Hash. These callbacks enter Ruby without an AST send.
+class KeywordOriginCallback
+  def initialize(h) = @h = h
+  def kwm(a: 0) = a
+  def inspect = ((kwm(@h) rescue $!.class).to_s)
+  alias to_s inspect
+end
+callback_hash = Hash.ruby2_keywords_hash(a: 2)
+callback_object = KeywordOriginCallback.new(callback_hash)
+p [:native_inspect_callback]
+p(*[callback_object, callback_hash])
+print(*[callback_object, callback_hash])
+puts
+p [:native_format_callback, format('%p/%p', *[callback_object, callback_hash])]
+p [:native_fetch_callback, {}.fetch(*[callback_hash]) {
+  (native_splat_keyword(callback_hash) rescue $!.class)
+}]
+saved_verbosity = $VERBOSE
+$VERBOSE = nil
+p [:native_array_callback, Array.new(1, *[callback_hash]) {
+  (native_splat_keyword(callback_hash) rescue $!.class)
+}]
+$VERBOSE = saved_verbosity
+
+# Actual forwarding protocols still deliver the call's keywords to its block.
+def keyword_origin_yield(h)
+  yield(*[h])
+end
+p [:explicit_yield_origin, keyword_origin_yield(callback_hash) { |a: 0| a }]
+p [:instance_exec_origin, Object.new.instance_exec(*[callback_hash]) { |a: 0| a }]
+p [:class_exec_origin, Class.new.class_exec(*[callback_hash]) { |a: 0| a }]
+p [:module_exec_origin, Module.new.module_exec(*[callback_hash]) { |a: 0| a }]
+yielded_keywords = []
+Enumerator.new { |y| y.yield(*[callback_hash]) }.each { |a: 0| yielded_keywords << a }
+p [:yielder_origin, yielded_keywords]

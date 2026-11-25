@@ -181,3 +181,28 @@ keyword-mark value when they return. This lets send's method-name conversion
 and Class#new resume the original keyword call, while callback bodies see
 ordinary positional arguments. Add sender-conversion and Ruby-initializer
 controls before the queued build is admitted.
+
+## Re-review: value splats and native callbacks
+
+The 876ffec8 re-review finds two regressions: value-list splats publish call
+origin, and a native callback can bypass the four earlier invocation scopes.
+Array literals and multiple assignments now use a value walker that shares
+ordinary splat conversion without publishing call notes or removing a flagged
+empty Hash. Direct Ruby method entry joins the shared invocation scopes.
+Native block callbacks consume the caller's temporary origin at their common
+entry; explicit yield and actual argument-forwarding protocols enter the
+existing argument-binding path. No list of reported consumer names is added.
+Extend corpus 987 with all literal/assignment/interpolation/format shapes,
+empty Hash identity, native inspect/to_s/default-block callbacks and explicit
+yield, exec and Enumerator::Yielder forwarding controls.
+
+The reviewer also requires finding and fixing any allocation-file RSS
+regression, rather than merely disclosing a higher peak. Diagnose the exact
+876ffec8 O2 binary in a clean snapshot using external per-case process-family
+sampling, GC_TIGHT and fixed seed 1; keep diagnostics separate from official
+acceptance. The first paired VM trace changes the relative peaks, so a single
+earlier sample does not identify the cause. Attribute the peak to the active
+test and its parent/child contributions before deciding on a runtime change.
+Do not change upstream cases, exclusions, allocation counters or budgets.
+Repeat final-head correctness, dispatch instructions, controlled RSS and all
+local corpus/source gates before the next single batched push.
