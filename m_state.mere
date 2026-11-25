@@ -38,6 +38,8 @@ extern fn tcp_set_timeout: int -> int -> int;
 // datagram socket (resolve, socket, connect), and send/recv move one datagram
 // through the arena; they are what UDPSocket#connect / #send / #recv are.
 extern fn mr_recvmsg_flags: int -> int;
+// accept(2): the descriptor or -errno (tools/socket_glue.c)
+extern fn mr_sock_accept: int -> int;
 extern fn mr_udp_connect: int -> str -> int -> int;
 extern fn udp_open: str -> int -> int;
 extern fn udp_send: int -> int -> int -> int;
@@ -202,6 +204,9 @@ extern fn mr_process_id: int -> str;
 // tools/process_glue.c: a file's times to the nanosecond (File::Stat).
 extern fn mr_stat_times: str -> int -> int -> str;
 extern fn mr_utimens: str -> int -> str -> int;
+// ...and O_NONBLOCK cleared, as a child's standard three are before exec
+// (1 cleared, 0 was clear, -errno).
+extern fn mr_fd_clear_nonblock: int -> int;
 extern fn getpid: unit -> int;
 // The process-identity questions <unistd.h> answers with an int, which is
 // the whole of what an extern can carry: the parent, a process group, a
@@ -496,7 +501,9 @@ let iv_put_new = fn tbl -> fn (k: str) -> fn (v: Val) -> map_set tbl k v;
 // the two other askers, so the prefix test is written out here once.)
 let obj_cls_name = fn (oid: int) ->
   let c = (if map_has obj_cls oid then map_get obj_cls oid else "Object") in
-  if str_len c >= 5 && str_eq (substring c 0 5) "(sng:"
+  // (a WHOLE singleton name only: a class defined inside one, "(sng:159)::M",
+  //  is the object's class itself -- `.class` answered Object for it)
+  if str_len c >= 5 && str_eq (substring c 0 5) "(sng:" && str_eq (char_at c (str_len c - 1)) ")"
   then (if map_has cls_sup c then map_get cls_sup c else "Object") else c;
 // (the current line, and the current file's and method's numbers -- see
 //  pos_names below; here so that an allocation can note them)
@@ -2446,6 +2453,12 @@ let mro_bump_class = fn (c: str) ->
 // the generation at which Integer's operators were last found to be the
 // builtins (slot 0), the answer (slot 1), and whether there is one (slot 2):
 // see int_ops_plain
+// Numeric comparison overrides, invalidated with method-table generation.
+// Only integer counters are cached; no Ruby receiver or closure is retained.
+let numeric_cmp_st =
+  (let v = vec_new () in
+   let _ = vec_push v (0 - 1) in
+   let _ = vec_push v 0 in v);
 let int_fast_st =
   (let v = vec_new () in
    let _ = vec_push v 0 in
@@ -3914,13 +3927,12 @@ let mode_writable = fn (m: str) ->
 //   shape. ruby prints "..." on re-entry, which is what the spec's regexp
 //   matches. The flag is cleared by raise_exc / raise_exc_iv, because a raise
 //   is the one thing that unwinds out of an inspect without returning.
-// The encoding of the format String that sprintf / String#% is running
-// (slot "v"); %c needs it to turn a codepoint into bytes. Saved and restored
-// around each format, since a #to_s run by one format may format another.
-let fmt_enc_cur = map_new ();
-// "k": the name a `%<name>` directive being read has already taken (a second
-// one in the same directive is "named<k2> after <k>")
-let fmt_named_cur = map_new ();
+// Formatting scratch storage is reused after every normal or exceptional
+// return. Busy slots remain separate across nested and interleaved calls.
+// Each slot holds result encoding, prefix, format encoding, named key and
+// its presence flag. Free slots retain no output or format text.
+let fmt_state_pool = vec_new ();
+let fmt_state_busy = vec_new ();
 // an object whose #inspect is being asked by `super` from the program's own:
 // inspect_w answers the builtin text for it (keyed by the object's id)
 let insp_super = map_new ();
@@ -7019,7 +7031,7 @@ let enc_valid = fn (s: str) -> fn (e: str) ->
           || str_eq e "SJIS-DoCoMo" || str_eq e "SJIS-KDDI" || str_eq e "SJIS-SoftBank" then
     enc_valid_sjis s
   else if str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
-          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" then enc_valid_db s 129 254 64 126 161 254 false
+          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" then enc_valid_db s 161 254 64 126 161 254 false
   else if str_eq e "CP949" then enc_valid_db s 129 254 65 90 97 254 true
   else if str_eq e "GBK" || str_eq e "CP936" then enc_valid_db s 129 254 64 126 128 254 true
   else if str_eq e "GB18030" then enc_valid_gb18030 s 0
@@ -7060,14 +7072,14 @@ let enc_sjis_family = fn (e: str) ->
   || str_eq e "SJIS-DoCoMo" || str_eq e "SJIS-KDDI" || str_eq e "SJIS-SoftBank";
 // the double-byte families the validator above models, as (lead, trail, trail2)
 // ranges -- the same numbers enc_valid_db is called with, read back here.
-// ⚠ ONLY the ranges that were checked against ruby for EVERY number in the
-// one- and two-byte space. The validator above also models Big5, CP949 and
-// GBK with (129, 254, ...), and ruby disagrees with all three -- it refuses
-// 0x8140 in Big5 and ACCEPTS a bare 0x80 in CP949 and GBK -- so chr leaves
-// them to the refusal below instead of answering from ranges that are wrong
-// in the permissive direction.
+// Checked against Ruby 4.0.10 over all one- and two-byte codepoints.
+// GBK also accepts the single byte 0x80 (handled by enc_clen1 below).
+// CP949 is still outside this model.
 let enc_db_ranges = fn (e: str) ->
   if str_eq e "EUC-KR" || str_eq e "GB2312" || str_eq e "GB12345" then (161, 254, 161, 254, 0 - 1, 0 - 1)
+  else if str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
+          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" then (161, 254, 64, 126, 161, 254)
+  else if str_eq e "GBK" || str_eq e "CP936" then (129, 254, 64, 126, 128, 254)
   else (0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
 let enc_max_clen = fn (e: str) ->
   if str_eq e "US-ASCII" then 1
@@ -7075,15 +7087,13 @@ let enc_max_clen = fn (e: str) ->
   else if enc_eucjp_family e then 3
   else if enc_sjis_family e then 2
   else if (match enc_db_ranges e with (l, _, _, _, _, _) -> l) > 0 then 2
-  // ⚠ modelled by the validator above but NOT verified for chr: Big5 and its
-  // variants, CP949, GBK/CP936, and the stateless ISO-2022-JP pair, which
+  // ⚠ modelled by the validator above but NOT verified for chr:
+  // CP949 and the stateless ISO-2022-JP pair, which
   // accepts ASCII and the EUC-JP katakana shift but not the trail pairs.
   else if str_eq e "EUC-TW" || str_eq e "GB18030"
           || str_eq e "Emacs-Mule" || str_eq e "UTF-16BE" || str_eq e "UTF-16LE"
           || str_eq e "UTF-32BE" || str_eq e "UTF-32LE"
-          || str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
-          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" || str_eq e "CP949"
-          || str_eq e "GBK" || str_eq e "CP936"
+          || str_eq e "CP949"
           || str_eq e "stateless-ISO-2022-JP" || str_eq e "stateless-ISO-2022-JP-KDDI" then 0 - 1
   // ⚠ NOT a dummy check. A dummy encoding is never DECODED, but Integer#chr
   // does not decode: ruby hands back the single byte for 0..255 in every one
@@ -7119,7 +7129,7 @@ let enc_clen1 = fn (e: str) -> fn (s: str) ->
     (match enc_db_ranges e with
      | (l_lo, l_hi, t1_lo, t1_hi, t2_lo, t2_hi) ->
        if l_lo > 0 then
-         (if b0 < 128 then 1
+         (if b0 < 128 || (b0 == 128 && (str_eq e "GBK" || str_eq e "CP936")) then 1
           else if b0 >= l_lo && b0 <= l_hi then
             (let v = bv 1 in
              if (v >= t1_lo && v <= t1_hi) || (t2_lo > 0 && v >= t2_lo && v <= t2_hi) then 2 else 0)
@@ -7318,3 +7328,6 @@ let rxv_imf = (let v = vec_new () in let _ = vec_push v 0 in v);
 // per program key: 1 when the cache may be used for it, 0 when not
 let rx_mc_ok = map_new ();
 
+
+// Only a method-generation stamp and a boolean; no Ruby handles are retained.
+let pattern_hash_cache = (let v = vec_new () in let _ = vec_push v (0 - 1) in let _ = vec_push v 0 in v);

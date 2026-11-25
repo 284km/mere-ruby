@@ -163,9 +163,18 @@ void rb_attr(VALUE klass, ID id, int read, int write, int ex) {
     if (read) mr_call(klass, "attr_reader", 1, ID2SYM(id));
     if (write) mr_call(klass, "attr_writer", 1, ID2SYM(id));
 }
-void rb_include_module(VALUE klass, VALUE module) { mr_call(klass, "include", 1, module); }
-void rb_prepend_module(VALUE klass, VALUE module) { mr_call(klass, "prepend", 1, module); }
-void rb_extend_object(VALUE obj, VALUE module) { mr_callk(obj, "extend", 1, module); }
+void rb_include_module(VALUE klass, VALUE module) {
+    if (mr_without("builtin")) mr_call(klass, "include", 1, module);
+    else mr_up(MR_MIXIN, klass, module, 0, 0, 0);
+}
+void rb_prepend_module(VALUE klass, VALUE module) {
+    if (mr_without("builtin")) mr_call(klass, "prepend", 1, module);
+    else mr_up(MR_MIXIN, klass, module, 1, 0, 0);
+}
+void rb_extend_object(VALUE obj, VALUE module) {
+    if (mr_without("builtin")) mr_callk(obj, "extend", 1, module);
+    else mr_up(MR_MIXIN, obj, module, 2, 0, 0);
+}
 VALUE rb_singleton_class(VALUE obj) { return mr_callk(obj, "singleton_class", 0); }
 
 /* ---- constants and variables --------------------------------------------- */
@@ -401,8 +410,14 @@ int rb_method_basic_definition_p(VALUE klass, ID id) {
  *  rb_str_freeze's resize, so the mirror is told first.) */
 VALUE rb_obj_freeze(VALUE obj) {
     if (!RB_SPECIAL_CONST_P(obj)) {
-        if (MR_HANDLE_P(obj) && rb_type(obj) == T_STRING && !RB_OBJ_FROZEN_RAW(obj)) mr_mirror_frozen_by_c(obj);
-        mr_callk(obj, "freeze", 0);
+        /* (a String, an Array, a Hash: the flag, as RB_OBJ_FREEZE sets it --
+         *  MR_FREEZE; anything else is sent #freeze, Kernel's) */
+        VALUE done = MR_HANDLE_P(obj) && !mr_without("builtin") ? mr_up1(MR_FREEZE, obj) : 0;
+        if (done == 2) mr_mirror_frozen_by_c(obj);
+        if (!done) {
+            if (MR_HANDLE_P(obj) && rb_type(obj) == T_STRING && !RB_OBJ_FROZEN_RAW(obj)) mr_mirror_frozen_by_c(obj);
+            mr_callk(obj, "freeze", 0);
+        }
         mr_mirror_forget(obj);
     }
     return obj;
@@ -413,7 +428,7 @@ void rb_obj_freeze_inline(VALUE obj) {
     if (!RB_SPECIAL_CONST_P(obj) && !MR_HANDLE_P(obj) && mr_vbig_raw_p(obj)) { RBASIC(obj)->flags |= RUBY_FL_FREEZE; return; }
     rb_obj_freeze(obj);
 }
-VALUE rb_obj_frozen_p(VALUE obj) { return mr_callk(obj, "frozen?", 0); }
+VALUE rb_obj_frozen_p(VALUE obj) { return RB_OBJ_FROZEN(obj) ? Qtrue : Qfalse; }
 VALUE rb_equal(VALUE a, VALUE b) { return a == b ? Qtrue : (RTEST(mr_call(a, "==", 1, b)) ? Qtrue : Qfalse); }
 int rb_eql(VALUE a, VALUE b) { return a == b || RTEST(mr_call(a, "eql?", 1, b)); }
 VALUE rb_obj_equal(VALUE a, VALUE b) { return mr_call(a, "equal?", 1, b); }

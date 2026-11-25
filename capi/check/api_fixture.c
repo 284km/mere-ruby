@@ -6,6 +6,8 @@
 #include <ruby/io.h>
 #include <ruby/version.h>
 #include <sys/stat.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* A pointer C took before the block it yields to gave up the Fiber: the
  * write through it, after the Fiber is resumed, is a write to the String. */
@@ -45,6 +47,36 @@ static VALUE aref(VALUE self, VALUE ary, VALUE index) { (void)self; return rb_ar
 static VALUE append(VALUE self, VALUE str, VALUE other) { (void)self; rb_str_append(str, other); return Qnil; }
 static VALUE length(VALUE self, VALUE str) { (void)self; return LONG2NUM(rb_str_strlen(str)); }
 static VALUE freeze(VALUE self, VALUE obj) { (void)self; rb_obj_freeze(obj); return Qnil; }
+static VALUE store(VALUE self, VALUE ary, VALUE index, VALUE value) { (void)self; rb_ary_store(ary, NUM2LONG(index), value); return ary; }
+/* A row as sqlite3's step makes one: an Array of the capacity, its elements
+ * stored in order, a String frozen with rb_obj_freeze, the row frozen; and
+ * what C reads of it after (its length, its last element, its flags). */
+static VALUE row(VALUE self, VALUE n) {
+    (void)self;
+    long len = NUM2LONG(n);
+    VALUE list = rb_ary_new2(len);
+    for (long i = 0; i < len; i++) {
+        VALUE v = (i % 2) ? rb_str_new_cstr("text") : LONG2NUM(i);
+        if (i % 2) rb_obj_freeze(v);
+        rb_ary_store(list, i, v);
+    }
+    rb_obj_freeze(list);
+    return rb_ary_new_from_args(4, list, LONG2NUM(RARRAY_LEN(list)), len ? RARRAY_AREF(list, len - 1) : Qnil,
+                                OBJ_FROZEN(list) ? Qtrue : Qfalse);
+}
+/* What rb_default_internal_encoding answers now (nil: none). */
+static VALUE default_internal(VALUE self) {
+    (void)self;
+    rb_encoding *e = rb_default_internal_encoding();
+    return e ? rb_enc_from_encoding(e) : Qnil;
+}
+/* Read the proxy flag directly, including after C/Ruby changes the owner. */
+static VALUE frozen_flags(VALUE self, VALUE obj, VALUE operation) {
+    (void)self;
+    if (NUM2INT(operation) == 1) rb_obj_freeze(obj);
+    if (NUM2INT(operation) == 2) rb_yield(obj);
+    return RB_OBJ_FROZEN(obj) ? Qtrue : Qfalse;
+}
 static VALUE aset(VALUE self, VALUE hash, VALUE key, VALUE value) { (void)self; rb_hash_aset(hash, key, value); return Qnil; }
 static VALUE kind_of(VALUE self, VALUE obj, VALUE klass) { (void)self; return rb_obj_is_kind_of(obj, klass); }
 
@@ -90,6 +122,8 @@ static VALUE ivars(VALUE self, VALUE obj) {
 static VALUE last_match(VALUE self, VALUE nth) { (void)self; return rb_reg_nth_match(NUM2INT(nth), rb_backref_get()); }
 static VALUE set_match(VALUE self, VALUE match) { (void)self; rb_backref_set(match); return Qnil; }
 static VALUE class_of(VALUE self, VALUE obj) { (void)self; return CLASS_OF(obj); }
+/* A class variable read through CLASS_OF, as cgi/escape reads @@accept_charset. */
+static VALUE cvar_of_class_of(VALUE self, VALUE obj, VALUE name) { (void)self; return rb_cvar_get(CLASS_OF(obj), rb_intern_str(name)); }
 static VALUE version_text(VALUE self) { (void)self; return rb_str_new_cstr(ruby_version); }
 static VALUE write_io_of(VALUE self, VALUE io) { (void)self; return rb_io_get_write_io(io); }
 /* (the descriptor C writes on -- io-console's way to it) */
@@ -274,6 +308,108 @@ static VALUE resize_out_and_back(VALUE self, VALUE str) {
     return rb_ary_new3(2, far, str);
 }
 
+/* VALUEs held ONLY in C locals across many requests that allocate: a String
+ * C made and an Array C filled, then Strings made and dropped and calls
+ * that make their answers, and the two read back at the end. A collection
+ * can run at any of those requests (mr_up's safepoint); the stack is all
+ * that roots the two. With a block, it is yielded to halfway -- a Fiber's
+ * body can pause there, in the middle of this call, while the program
+ * collects -- and the loop goes on when it comes back. */
+static VALUE hold_locals(VALUE self, VALUE times) {
+    (void)self;
+    static char junk[4096];
+    long n = NUM2LONG(times);
+    VALUE held = rb_str_new_cstr("held-string");
+    VALUE ary = rb_ary_new();
+    for (int i = 0; i < 8; i++) {
+        char name[8];
+        snprintf(name, sizeof name, "e%d", i);
+        rb_ary_push(ary, rb_str_new_cstr(name));
+    }
+    long sum = 0;
+    for (long i = 0; i < n; i++) {
+        rb_str_new(junk, (long)sizeof(junk));
+        VALUE text = rb_funcall(LONG2NUM(i), rb_intern("to_s"), 0);
+        sum += RSTRING_LEN(text);
+        if (i == n / 2 && rb_block_given_p()) rb_yield(LONG2NUM(i));
+    }
+    return rb_ary_new3(3, held, ary, LONG2NUM(sum));
+}
+
+/* C writes into a FROZEN String's buffer -- frozen is what rb_str_modify
+ * refuses, not the bytes -- and then calls the interpreter, which sees them
+ * (puma's parser upcases the header names of a frozen request in place). */
+static VALUE write_frozen(VALUE self, VALUE str) {
+    (void)self;
+    char *p = RSTRING_PTR(str);
+    p[0] = 'Z';
+    VALUE seen = rb_funcall(str, rb_intern("dup"), 0);
+    return rb_ary_new3(2, seen, str);
+}
+
+/* A long C call that only calls back through the C API -- no Ruby method in
+ * between -- and makes garbage as it goes: puma's HTTP parser joining a
+ * repeated header (rb_hash_aref, then rb_str_cat2 and rb_str_cat on the
+ * String it found), with a 64 KB String made and dropped each turn. Answers the
+ * joined String and how many collections ran while it went on. */
+static VALUE join_in_c(VALUE self, VALUE times) {
+    (void)self;
+    static char junk[65536];
+    long n = NUM2LONG(times);
+    VALUE hash = rb_hash_new();
+    VALUE key = rb_str_new_cstr("HTTP_X_TEST");
+    rb_hash_aset(hash, key, rb_str_new_cstr("test"));
+    size_t before = rb_gc_count();
+    for (long i = 1; i < n; i++) {
+        VALUE v = rb_hash_aref(hash, key);
+        rb_str_cat2(v, ", ");
+        rb_str_cat(v, "test", 4);
+        rb_str_new(junk, (long)sizeof(junk));
+    }
+    return rb_ary_new3(2, rb_hash_aref(hash, key), SIZET2NUM(rb_gc_count() - before));
+}
+
+/* What C was lent and what it holds only in its locals, across collections
+ * in the middle of the one C call: RSTRING_PTR's pointer is taken first,
+ * then the call makes 64 KB Strings and calls a method, over and over (a
+ * collection can run at any of those requests -- mr_up's safepoint; under
+ * MERE_RUBY_GC_STRESS=1 one runs every 16th of them -- and rb_gc runs one
+ * every 100 turns). After them the pointer
+ * is the one RSTRING_PTR answers again, the bytes under it are the String's
+ * (no collection moved, freed or rewrote what C was lent), a byte C writes
+ * through it reaches the interpreter, and the String and the Array C made
+ * and held only in locals are still those values. Answers [the same pointer,
+ * the bytes intact, the String, the Array, the String as the interpreter
+ * sees it, how many collections ran]. */
+static VALUE lent_across_collections(VALUE self, VALUE str, VALUE times) {
+    (void)self;
+    static char junk[65536];
+    long n = NUM2LONG(times);
+    char *p = RSTRING_PTR(str);
+    long len = RSTRING_LEN(str);
+    char *copy = malloc(len > 0 ? (size_t)len : 1);
+    if (!copy) rb_memerror();
+    memcpy(copy, p, (size_t)len);
+    VALUE held = rb_str_new_cstr("held-only-in-c");
+    VALUE ary = rb_ary_new_from_args(2, rb_str_new_cstr("a"), rb_str_new_cstr("b"));
+    size_t before = rb_gc_count();
+    for (long i = 0; i < n; i++) {
+        rb_str_new(junk, (long)sizeof(junk));
+        rb_funcall(LONG2NUM(i), rb_intern("to_s"), 0);
+        /* (and a collection for certain every 100th turn, on both sides:
+         *  whether the garbage alone brings one about depends on the
+         *  collector's limits and on the load) */
+        if (i % 100 == 50) rb_gc();
+    }
+    size_t collections = rb_gc_count() - before;
+    int same = RSTRING_PTR(str) == p;
+    int intact = memcmp(p, copy, (size_t)len) == 0;
+    free(copy);
+    if (len > 0) p[0] = 'W';
+    VALUE seen = rb_funcall(str, rb_intern("dup"), 0);
+    return rb_ary_new_from_args(6, same ? Qtrue : Qfalse, intact ? Qtrue : Qfalse, held, ary, seen, SIZET2NUM(collections));
+}
+
 /* (rb_funcallv_public by name; an encoding's index as C reads it; a dummy
  *  encoding defined here; what C's rb_fs holds) */
 static VALUE funcall_public(VALUE self, VALUE obj, VALUE name) {
@@ -425,8 +561,20 @@ static VALUE hidden_const_api(VALUE self, VALUE klass, VALUE name, VALUE operati
       default: rb_raise(rb_eArgError, "unknown constant operation");
     }
 }
+static VALUE native_mixin(VALUE self, VALUE target, VALUE module, VALUE operation) {
+    (void)self;
+    switch (NUM2INT(operation)) {
+      case 0: rb_include_module(target, module); break;
+      case 1: rb_prepend_module(target, module); break;
+      case 2: rb_extend_object(target, module); break;
+      default: rb_raise(rb_eArgError, "unknown mixin operation");
+    }
+    return target;
+}
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
+    rb_define_singleton_method(mod, "native_mixin", native_mixin, 3);
+    rb_define_singleton_method(mod, "frozen_flags", frozen_flags, 2);
     rb_define_singleton_method(mod, "hidden_const_api", hidden_const_api, 4);
     rb_define_singleton_method(mod, "nogvl_nap", nogvl_nap, 1);
     rb_define_singleton_method(mod, "nogvl_call_back", nogvl_call_back, 1);
@@ -465,6 +613,9 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "length", length, 1);
     rb_define_singleton_method(mod, "aref", aref, 2);
     rb_define_singleton_method(mod, "freeze", freeze, 1);
+    rb_define_singleton_method(mod, "store", store, 3);
+    rb_define_singleton_method(mod, "row", row, 1);
+    rb_define_singleton_method(mod, "default_internal", default_internal, 0);
     rb_define_singleton_method(mod, "aset", aset, 3);
     rb_define_singleton_method(mod, "kind_of", kind_of, 2);
     rb_define_singleton_method(mod, "kwargs", kwargs, 4);
@@ -475,6 +626,7 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "last_match", last_match, 1);
     rb_define_singleton_method(mod, "set_match", set_match, 1);
     rb_define_singleton_method(mod, "class_of", class_of, 1);
+    rb_define_singleton_method(mod, "cvar_of_class_of", cvar_of_class_of, 2);
     rb_define_singleton_method(mod, "version_text", version_text, 0);
     rb_define_singleton_method(mod, "write_io_of", write_io_of, 1);
     rb_define_singleton_method(mod, "write_descriptor", write_descriptor, 1);
@@ -505,6 +657,10 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "expand_room", expand_room, 2);
     rb_define_singleton_method(mod, "freeze_keeps_room", freeze_keeps_room, 0);
     rb_define_singleton_method(mod, "resize_out_and_back", resize_out_and_back, 1);
+    rb_define_singleton_method(mod, "join_in_c", join_in_c, 1);
+    rb_define_singleton_method(mod, "write_frozen", write_frozen, 1);
+    rb_define_singleton_method(mod, "hold_locals", hold_locals, 1);
+    rb_define_singleton_method(mod, "lent_across_collections", lent_across_collections, 2);
     /* classes under a module under a module, all of them made here: a class
      * C defines is a class by that name like any other */
     VALUE mid = rb_define_module_under(mod, "Mid");

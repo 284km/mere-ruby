@@ -67,12 +67,32 @@ files above run one file at a time, against main and both candidate engines,
 with `--seed=1` and `MERE_RUBY_GC_TIGHT=1`. RSS is max resident bytes from
 `/usr/bin/time -l`. No gems are installed into the reference.
 
-The O2 binary uses compiler 9dec2ff6 and mgz 661a01d8. Full acceptance is
-running sequentially: `sh run_corpus.sh --both`, followed by
-`MERE_RUBY_VM=1 sh run_corpus.sh --both`. Each includes gc_roots,
-dup_defs, dead_defs, meth_writes, name_spec, rx_caps, ns_names, name_len
-and full record_hygiene. Generated C is checked with
-`MR_C=mr.c sh tools/bracket_depth_check.sh`; this loop record is also
-checked explicitly with record_hygiene. Focused passing cases are not a
-substitute for those pending sweeps. No full unit suite or Rails component
-suite was run; no workflow is changed.
+The ordinary O2 binary uses compiler 9dec2ff6 and mgz 661a01d8, SHA-256
+29b1e5bd472f051cecd1b8831682c928ba4a4cdfb467b5a27a6cb90021265592.
+Both sh run_corpus.sh --both and MERE_RUBY_VM=1 sh run_corpus.sh --both
+complete 893/893 with hash indexing ON and OFF. All eight source gates
+and the full record_hygiene pass in each sweep. Generated-C bracket
+depth passes 155 required / 1024 supplied; explicit completed-note
+hygiene is checked before publishing these results. Current-main merge
+preflight at fd5f54b0 is clean, not a tested integration build.
+No full unit suite or Rails component suite was run; no workflow changes.
+
+
+## Review correction: repeated-line annotation cost and current main
+
+Review 6058821085 identifies the old operator-literal RSS/instruction
+increase and asks for current-main integration. Main 03160dc9 is merged
+locally before the correction. The array's existing line cache now avoids
+both the line-lookup helper call and the annotation node when an earlier
+call-capable element already established the same observed logical line.
+Literal elements do not advance the cached call line. Nested parsing that
+observes another line invalidates it; continued physical lines retain the
+exact tc_phys lookup. This retains real source positions without scanning
+the token tail for every element.
+
+Corpus 992 adds same-line successful/raising calls, preceding literals,
+nested/newline expressions and a heredoc whose body precedes the next
+source-order operation. Fresh focused/reference comparisons, fixed-seed
+GC_TIGHT instruction/RSS measurements and both full corpus sweeps on this
+merged tree are pending. Earlier 893/893 sweeps describe the earlier head.
+The completed new record will be committed with the code, in one push.

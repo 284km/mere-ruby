@@ -70,3 +70,25 @@ end
 # This also exercises the new call-capable shapes on a later physical line.
 large = eval("[\n" + '1 + 1,' * 100_000 + "\n]", binding, 'large-operators.rb', 1)
 p [large.length, large.first, large.last]
+
+# Eliding a repeated annotation must preserve later calls on the same line,
+# including after literals and after nested expressions on different lines.
+steady = Object.new
+steady.define_singleton_method(:+) { |number| raise('later binary') if number == 1; 0 }
+steady.define_singleton_method(:call) { 0 }
+steady.define_singleton_method(:to_s) { 'steady' }
+[
+  "steady + 0, steady + 1",
+  "1, steady + 0, steady + 1",
+  "steady + 0,\n 1, steady + 1",
+  "steady + 0,\n [1,\n 2], steady + 1",
+  "steady.call, steady + 1",
+  "Array.new(\n 1), steady + 1",
+  "<<HERE, steady + 1\n\#{steady}\nHERE"
+].each do |elements|
+  begin
+    eval("[\n" + elements + "\n]", binding, 'array-element-location.rb', 200)
+  rescue => error
+    p [error.message, error.backtrace_locations.find { |frame| frame.path == 'array-element-location.rb' }.lineno]
+  end
+end
