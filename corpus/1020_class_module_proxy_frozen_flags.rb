@@ -1,22 +1,35 @@
 require 'rbconfig'
 require 'tmpdir'
-Dir.mktmpdir('frozen-class-1020-') do |dir|
-  source=File.join(dir,'frozen_probe.c'); library=File.join(dir,'frozen_probe.'+RbConfig::CONFIG.fetch('DLEXT'))
+
+Dir.mktmpdir('proxy-frozen-1020-') do |dir|
+  source = File.join(dir, 'proxy_frozen_1020.c')
+  library = File.join(dir, "proxy_frozen_1020.#{RbConfig::CONFIG.fetch('DLEXT')}")
   File.write(source, <<~C)
     #include "ruby.h"
-    static VALUE status(VALUE self, VALUE owner) {
-      return rb_ary_new_from_args(3, rb_obj_frozen_p(owner), rb_funcall(owner, rb_intern("frozen?"), 0), RB_OBJ_FROZEN(owner) ? Qtrue : Qfalse);
+    static VALUE flags(VALUE self, VALUE owner) {
+      (void)self;
+      return rb_ary_new_from_args(2, rb_obj_frozen_p(owner), RB_OBJ_FROZEN(owner) ? Qtrue : Qfalse);
     }
-    void Init_frozen_probe(void) { rb_define_global_function("frozen_probe", status, 1); }
+    void Init_proxy_frozen_1020(void) {
+      rb_define_global_function("proxy_frozen_flags_1020", flags, 1);
+    }
   C
-  flags=RUBY_PLATFORM.include?('darwin') ? ['-bundle','-undefined','dynamic_lookup'] : ['-shared']
-  hdr=RbConfig::CONFIG.values_at('rubyhdrdir','rubyarchhdrdir').compact.flat_map{|v| ['-I',v]}
-  raise 'native fixture build failed' unless system(RbConfig::CONFIG.fetch('CC'),'-fPIC',*flags,*hdr,source,'-o',library)
+  link = RUBY_PLATFORM.include?('darwin') ? ['-bundle', '-undefined', 'dynamic_lookup'] : ['-shared']
+  headers = RbConfig::CONFIG.values_at('rubyhdrdir', 'rubyarchhdrdir').compact
+  command = [RbConfig::CONFIG.fetch('CC'), '-fPIC', *link, *headers.flat_map { |path| ['-I', path] }, source, '-o', library]
+  raise 'native fixture build failed' unless system(*command, out: File::NULL, err: File::NULL)
   require library
-  [Class, Module].each do |factory|
-    owner = factory.new
-    p [:before, frozen_probe(owner)]
+
+  [Class.new, Module.new, Object.new, +'', [], {}, proc {}, binding].each do |owner|
+    $frozen_flag_queries = 0
+    owner.define_singleton_method(:frozen?) { $frozen_flag_queries += 1; false }
+    p [owner.class.name, :before, proxy_frozen_flags_1020(owner), $frozen_flag_queries]
     owner.freeze
-    p [:after, frozen_probe(owner)]
+    p [owner.class.name, :after, proxy_frozen_flags_1020(owner), $frozen_flag_queries]
   end
+  # Regexp singleton methods are a separate interpreter limitation.
+  regexp = Regexp.new('a')
+  p [:regexp, proxy_frozen_flags_1020(regexp)]
+  regexp.freeze
+  p [:regexp_frozen, proxy_frozen_flags_1020(regexp)]
 end

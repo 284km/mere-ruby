@@ -413,7 +413,7 @@ void rb_obj_freeze_inline(VALUE obj) {
     if (!RB_SPECIAL_CONST_P(obj) && !MR_HANDLE_P(obj) && mr_vbig_raw_p(obj)) { RBASIC(obj)->flags |= RUBY_FL_FREEZE; return; }
     rb_obj_freeze(obj);
 }
-VALUE rb_obj_frozen_p(VALUE obj) { return mr_callk(obj, "frozen?", 0); }
+VALUE rb_obj_frozen_p(VALUE obj) { return RB_OBJ_FROZEN(obj) ? Qtrue : Qfalse; }
 VALUE rb_equal(VALUE a, VALUE b) { return a == b ? Qtrue : (RTEST(mr_call(a, "==", 1, b)) ? Qtrue : Qfalse); }
 int rb_eql(VALUE a, VALUE b) { return a == b || RTEST(mr_call(a, "eql?", 1, b)); }
 VALUE rb_obj_equal(VALUE a, VALUE b) { return mr_call(a, "equal?", 1, b); }

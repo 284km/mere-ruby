@@ -22,15 +22,18 @@ end
 A = ApiFixture
 check(said == '')
 
-# Class/Module flags must agree without invoking an overridden Ruby predicate.
-[Class, Module].each do |factory|
-  owner = factory.new
-  def owner.frozen? = raise('frozen? must not be called')
+# Native flags never call a Ruby predicate, including during mirror refresh.
+[-> { Class.new }, -> { Module.new }, -> { Object.new }, -> { +'' },
+ -> { [] }, -> { {} }, -> { proc {} }, -> { binding }].each do |factory|
+  owner = factory.call
+  $frozen_flag_queries = 0
+  owner.define_singleton_method(:frozen?) { $frozen_flag_queries += 1; false }
   check(!A.frozen_flags(owner, 0))
   owner.freeze
   check(A.frozen_flags(owner, 0))
-  check(A.frozen_flags(factory.new, 1))
-  check(A.frozen_flags(factory.new, 2) { |value| value.freeze })
+  check(A.frozen_flags(factory.call, 1))
+  check(A.frozen_flags(factory.call, 2) { |value| value.freeze })
+  check($frozen_flag_queries == 0)
 end
 
 # C's constant APIs also accept hidden cache names, as io-console's
