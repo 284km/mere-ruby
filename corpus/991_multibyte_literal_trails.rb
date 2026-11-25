@@ -31,3 +31,29 @@ Dir.mktmpdir('corpus-987-') do |dir|
     require path
   end
 end
+
+# Review controls: classes and a backslash before an entire encoded character.
+review_source = <<~'RUBY'
+  p [/[CHAR]/ =~ "CHAR", /[aCHAR]+/ =~ "bCHAR", /[CHAR-CHAR]/ =~ "CHAR"]
+  p Regexp.new("[CHAR]") =~ "aCHAR"
+  p "aCHARb".scan(/[CHAR]/).size
+  p ["\CHAR", "a\CHARb", :"\CHAR".to_s, /\CHAR/.source, %r[\CHAR].source].map(&:bytes)
+  p %w[\CHAR x].map(&:bytes)
+  p %W[\CHAR x].map(&:bytes)
+  x = <<TEXT
+  \CHAR
+  TEXT
+  p x.bytes
+RUBY
+Dir.mktmpdir('corpus-991-review-') do |dir|
+  [['Windows-31J', '表'], ['Big5', '許'], ['GBK', '乗']].each_with_index do |(encoding, char), index|
+    path = File.join(dir, "class_#{index}.rb")
+    source = ("# coding: #{encoding}\n" + review_source.gsub('CHAR', char)).encode(encoding)
+    File.binwrite(path, source)
+    IO.popen([RbConfig.ruby, path]) { |io| print io.read }
+    raise 'main class/escape failed' unless $?.success?
+    require path
+    eval(source, binding, path)
+    Object.new.instance_eval(source, path)
+  end
+end
