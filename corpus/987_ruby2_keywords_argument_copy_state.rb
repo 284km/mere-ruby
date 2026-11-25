@@ -234,3 +234,25 @@ p [:proxy_break, method(:proxy_yield_target).to_proc.call { break :done }]
 def proxy_block_identity(&block) = block
 identity_block = -> { :identity }
 p [:proxy_block_identity, method(:proxy_block_identity).to_proc.call(&identity_block).equal?(identity_block)]
+
+# A native consumer must not turn a later iterator's ordinary yield into **kw.
+StaleSplatHash = Hash.ruby2_keywords_hash({a: 2})
+def stale_splat_pos(*args) = args
+stale_splat_pos(StaleSplatHash)
+[].push(*[StaleSplatHash])
+p [:iterator_after_splat, [StaleSplatHash].map { |a: 0| a }]
+
+# Removing and re-adding ivars must keep copy metadata accurate across GC.
+removed_hash = Hash.ruby2_keywords_hash({a: 2})
+removed_hash.instance_variable_set(:@deleted, :old)
+removed_hash.instance_variable_set(:@kept, :first)
+removed_hash.remove_instance_variable(:@deleted)
+removed_hash.instance_variable_set(:@kept, :updated)
+def copied_ivar_target(*args) = args.last
+ruby2_keywords def copied_ivar_forward(*args) = copied_ivar_target(*args)
+copy = copied_ivar_forward(*[removed_hash])
+p [:copied_ivars, copy.instance_variable_get(:@kept), copy.instance_variable_defined?(:@deleted)]
+removed_hash.instance_variable_set(:@deleted, :new)
+GC.start
+copy = copied_ivar_forward(*[removed_hash])
+p [:readded_ivar, copy.instance_variable_get(:@deleted), copy.equal?(removed_hash)]

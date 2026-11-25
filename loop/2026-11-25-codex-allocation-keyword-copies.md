@@ -98,3 +98,19 @@ builds, the allocation file alone on both engines, the complete corpus with
 hash indexing on/off, one subsequent VM corpus, all nine source gates,
 record_hygiene, instruction counts and max RSS. Automated inline review
 comments are checked after opening the English PR and after every push.
+
+## Review: copy memory, unrelated ivars and native argument consumption
+
+Replace the per-copy temporary map and whole-world ivar walk with an owner
+index containing only native ivar names. iv_put maintains the index inside
+its existing primitive-ivar branch; removal removes the name, and GC drops
+dead Hash owners and compacts the native table. A copy with no ivars never
+allocates a scratch map or traverses unrelated objects. The native copy
+visits only its source Hash's names and preserves write order.
+
+Leaf native consumers and builtin iterators consume transient splat origin
+and its temporary keyword mark before subsequent user code can observe it.
+Actual method and Proc forwarding keep their existing argument boundary.
+Corpus 987 adds the stale push-to-map case and removed/re-added ivars across
+GC. Final-head focused, memory, instruction and full replays are required
+before this draft is ready again.
