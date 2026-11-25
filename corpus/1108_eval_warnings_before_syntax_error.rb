@@ -11,6 +11,15 @@ Dir.mktmpdir do |dir|
       end
     end
     p eval("1\n2\n", nil, 'valid-eval.rb', 3)
+    [1, 7].each do |first|
+      ["end", "# leading comment\nend", "1\n2\nend", "# BEGIN{throw :__isq_ok, :ok}\nend"].each do |source|
+        begin
+          RubyVM::InstructionSequence.compile(source, 'compile-warning.rb', 'compile-warning.rb', first)
+        rescue SyntaxError => error
+          print error.message
+        end
+      end
+    end
   CODE
   out = IO.popen([RbConfig.ruby, '-W', '-e', child, err: error_path], &:read)
   print out
