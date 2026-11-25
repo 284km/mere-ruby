@@ -90,9 +90,46 @@ ask the override only at the Array sorting and element-comparison sites.
 Corpus 930, 1100 and 1101 now match Ruby on both engines. The RSS table above
 was remeasured for this corrected O2 binary.
 
-Final acceptance on the corrected O2 binary: `run_corpus.sh --both` passes
+Pre-review acceptance on the R3 O2 binary: `run_corpus.sh --both` passes
 883/883 corpus programs with the hash index ON and OFF. The subsequent
 `MERE_RUBY_VM=1 run_corpus.sh --both` also passes 883/883 with the index ON
 and OFF. Both invocations run all source gates and full record_hygiene.
 The bracket-depth check passes (155 required, 1024 supplied). No corpus
 exclusion, assertion, resource budget or workflow was changed.
+
+## Review correction: numeric hot-path cost
+
+The requested 2,000-element / 200-iteration min/max/sort probe prints
+983200.0 on clean Ruby 4.0.10, main 323706a7, and both candidate modes.
+The pre-review R3 candidate costs 34,563,634,177 instructions on the
+evaluator versus 33,647,753,858 on main, and 34,451,062,068 versus
+33,554,890,230 on the VM (about 2.7% more).
+
+R4 caches the absence of numeric comparator overrides behind mro_now's
+method-table generation. opt_cmp uses that cached answer before the
+class-specific lookup. Comparator replacement still invalidates the cache;
+corpus 1100 now primes the plain cache before redefining Rational#<=>.
+The cache retains two integer counters and no Ruby values.
+
+The same probe after caching, with `MERE_RUBY_GC_TIGHT=1 --seed=1`:
+
+| Engine | Main instructions | Candidate instructions | Main max RSS bytes | Candidate max RSS bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Evaluator | 33,777,153,198 | 33,800,438,393 | 110575616 | 110837760 |
+| VM | 33,635,367,980 | 33,675,326,648 | 112377856 | 111869952 |
+
+The measured difference is 0.07% / 0.12%. The main baseline here is the
+unchanged 323706a7 O2 build with the same compiler and mgz pins.
+
+Selected unchanged upstream files were repeated on R4, one file at a time,
+with tight GC and seed 1. All main and candidate runs pass:
+
+| File | Result | Main evaluator RSS | Candidate evaluator RSS | Main VM RSS | Candidate VM RSS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ruby/test_array.rb | 22 tests, 344 assertions, 0 failures, 0 errors, 0 skips | 180961280 | 181551104 | 219987968 | 222527488 |
+| ruby/test_integer.rb | 1 tests, 168 assertions, 0 failures, 0 errors, 0 skips | 166412288 | 165822464 | 167264256 | 169017344 |
+| ruby/test_rational.rb | 1 tests, 26 assertions, 0 failures, 0 errors, 0 skips | 166445056 | 165838848 | 170000384 | 169836544 |
+| ruby/test_optimization.rb | 2 tests, 24 assertions, 0 failures, 0 errors, 0 skips | 168378368 | 171507712 | 171622400 | 170819584 |
+
+The R4 full evaluator and VM corpus sweeps are running. The R3 full
+acceptance above is historical and does not stand in for those runs.

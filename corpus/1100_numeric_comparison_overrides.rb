@@ -1,5 +1,7 @@
 # Ruby's literal min/max instructions and Array methods compare in opposite
 # directions. A redefined Rational#<=> must run in both paths and in sorting.
+# Prime the plain-comparator cache before a method-table change.
+p [Rational(1, 2), Rational(1, 3)].max
 class Rational
   alias original_compare_1100 <=>
   def <=>(other)
