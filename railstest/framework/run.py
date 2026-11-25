@@ -168,11 +168,12 @@ def shared_settings(items):
     return dict(sorted(settings.items()))
 
 
-def side_environment(side_dir, stdlib, mere, shared):
+def side_environment(side_dir, stdlib, mere, shared, framework_bootstrap=False):
     """A side's environment: the runner's own, then --env's settings, which
     are the same for both sides"""
     env = environment(side_dir, stdlib, mere=mere)
-    env['RUBYOPT'] = '--disable-gems -r' + str(ROOT / 'bootstrap.rb')
+    if framework_bootstrap:
+        env['RUBYOPT'] = '--disable-gems -r' + str(ROOT / 'bootstrap.rb')
     env.update(shared)
     return env
 
@@ -433,7 +434,8 @@ def run(args, data):
                   rails_source_commit=source_head,
                   source_ref=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
                   runner_sha256=sha(Path(__file__)), archive_lock_sha256=sha(ROOT / 'archives.lock.json'),
-                  bootstrap_sha256=sha(ROOT / 'bootstrap.rb'),
+                  framework_bootstrap=args.framework_bootstrap,
+                  bootstrap_sha256=sha((ROOT if args.framework_bootstrap else RAILSTEST) / 'bootstrap.rb'),
                   binary_sha256=sha(args.binary) if args.binary else None, reference_sha256=sha(args.reference),
                   seed=SEED, wall_seconds=WALL, family_rss_kib=RSS_KB, jobs=args.jobs, env=shared,
                   install_binary_sha256={side: install_record['sides'][side].get('binary_sha256') for side, _b in sides},
@@ -444,7 +446,7 @@ def run(args, data):
     def one(side, binary, name):
         component, relative = name.split('/', 1)
         side_dir = args.gems / side
-        env = side_environment(side_dir, stdlib, side == 'mere', shared)
+        env = side_environment(side_dir, stdlib, side == 'mere', shared, args.framework_bootstrap)
         if side == 'mere':
             env.update(mere_env)
         stem = args.output / side / 'logs' / name.replace('/', '__')
@@ -628,6 +630,8 @@ def main():
                         help='run: a setting for mere-ruby only (repeatable; recorded in the results)')
     parser.add_argument('--other-install-binary', action='store_true',
                         help='run: allow a binary other than the one that installed --gems (recorded in the results)')
+    parser.add_argument('--framework-bootstrap', action='store_true',
+                        help='run: restore bundled_gems, did_you_mean and error_highlight startup (recorded)')
     parser.add_argument('--require-all-pass', action='store_true',
                         help='run: exit 1 unless every selected file completes on both sides with all tests passing')
     parser.add_argument('--base', type=Path)
@@ -638,6 +642,8 @@ def main():
             setattr(args, key, getattr(args, key).resolve())
     if not 1 <= args.jobs <= MAX_JOBS:
         parser.error(f'--jobs must be 1..{MAX_JOBS}: the machine is shared')
+    if args.framework_bootstrap and args.command != 'run':
+        parser.error('--framework-bootstrap requires run')
     if args.require_all_pass and (args.command != 'run' or args.side != 'both'):
         parser.error('--require-all-pass requires run --side both')
     if args.command == 'compare':

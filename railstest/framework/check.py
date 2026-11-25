@@ -175,8 +175,13 @@ class FrameworkCheck(unittest.TestCase):
 
     def test_framework_startup_libraries_are_shared_by_both_interpreters(self):
         for mere in (False, True):
-            env = run.side_environment(Path('/run/side'), '/stdlib', mere, {})
+            env = run.side_environment(Path('/run/side'), '/stdlib', mere, {}, framework_bootstrap=True)
             self.assertEqual('--disable-gems -r' + str(run.ROOT / 'bootstrap.rb'), env['RUBYOPT'])
+
+    def test_default_component_startup_keeps_application_bootstrap(self):
+        for mere in (False, True):
+            env = run.side_environment(Path('/run/side'), '/stdlib', mere, {})
+            self.assertEqual('--disable-gems -r' + str(run.RAILSTEST / 'bootstrap.rb'), env['RUBYOPT'])
 
     def test_shared_settings_reach_both_sides_and_stay_publishable(self):
         # --env: the same setting on both sides, recorded; never a setting the
