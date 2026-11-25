@@ -42,6 +42,10 @@ that atomic interval, and is reset before installation. This avoids generic
 per-call local tuples and temporary frame-map traffic. Native leaf, block,
 iterator, sender and Method boundaries consume Array provenance.
 
+A synthetic native rest needs only its refusal note: skip source-length
+walks and fixed-slot writes that only an actual Array or nil can use.
+Binding recognizes that refusal before reading the unused source lengths.
+
 Array provenance is not a flagged Hash. Parse keyword formals in this branch
 only when the actual trailing Hash has a ruby2_keywords splat note. Borrow
 only at the matching positional-prefix boundary, without optional/post or
