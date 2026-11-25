@@ -178,3 +178,6 @@ gc_conversion.define_singleton_method(:to_proc) { GC.start; proc {} }
 gc_capture = isolation.capture(*[AnonymousConversionValue.new], &gc_conversion)
 GC.start
 p [:conversion_source_survives_gc, gc_capture.call.map(&:value)]
+
+def anonymous_short_slot_user(__ar, *) = [__ar, anonymous_collect(*)]
+p [:short_slot_local_collision, anonymous_short_slot_user(:user, 1, 2)]

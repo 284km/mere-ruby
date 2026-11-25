@@ -1,161 +1,97 @@
-# Store anonymous rest arguments as a native frame payload
+# Store anonymous rest arguments in the owning frame
 
 ## Cause and representation
 
-Anonymous method rest parameters always constructed an Array, including an
-empty call and an existing input splat that Ruby can borrow. Nested anonymous
-forwarding created another Array at each frame. Use an immutable native list
-in the existing VIcl representation, held by its owning method frame. A
-captured closure retains that frame and GC follows the payload's Ruby values.
-Eligible borrowed splats retain their original Array and frozen state;
-a synthesized rest uses native storage until observed. A named rest remains
-an ordinary independent Ruby Array.
+Anonymous method rest parameters created an Array on every call, including
+empty calls and nested forwarding for which Ruby does not need an Array.
+Store synthesized arguments as an immutable native list in the existing
+VIcl representation. Its owning frame, including a captured closure, retains
+the Ruby values through GC. Named rest parameters remain independent Arrays.
+No allocation counter, counting exclusion or dummy Ruby object is added.
 
-The parameter and slot use an internal name containing a tilde. Ruby locals,
-named rest parameters and Binding writes with the old implementation spelling
-cannot collide with or expose the private native value. Normalize parenthesized
-and bare method parameter forms to that same internal name; reflection still
-reports an anonymous rest. Anonymous block parameters retain their existing
-binding behavior.
+The private parameter is `__ar~`; Ruby identifiers and Binding writes cannot
+collide with it. Parameter normalization, VM locals, bare super, reflection
+and the Proc outer-variable walk preserve its private identity. In particular,
+pbase must preserve the tilde instead of aliasing the legal local `__ar`.
+Anonymous block parameters retain their existing binding behavior.
 
-## Readers and execution
+Explicit splats and bare super expand native storage. VM Array concatenation
+and keyword append materialize ordinary Arrays. Eligible borrowed splats
+retain the actual source Array, including frozen state and later mutation.
+Direct empty calls and eligible nil splats privately represent Ruby's shared
+frozen empty Array as nil. Optional/post signatures that require a new rest
+retain synthesized native storage until it is observed.
 
-Explicit argument splats and bare super expand the native list. VM splatarray
-can retain it for a borrowed splat and represent a borrowed *nil as an
-empty native list; an explicit Array expression still makes
-an actual Array. VM array concatenation and keyword-array append materialize
-ordinary Arrays instead of inserting the payload as an element or returning
-it to Ruby. The existing sole-rest Array sharing optimization does not treat
-an anonymous native slot as an Array. No Val tag, registry, counter or counting
-exclusion is added. Ordinary method/block calls gain no counting-only work.
+## Review: shareable Proc isolation
 
-Corpus 991 compares forwarding, optional/post parameters, array literals,
-keywords, repeated captured forwarding across GC, super with/without a block,
-local and named-rest collisions, Binding writes, reflection, ten thousand
-arguments, and the Array-free calls Ruby also performs without an Array.
-Before claiming success, compare every result with clean Ruby 4.0.10 on both
-evaluator and VM in O2 builds.
+The review reproduction captures anonymous rest through bare super in
+Ractor.shareable_proc. The exact private parameter name must contribute to
+the outer-variable set. Isolation materializes synthesized rest only when
+observed, so rejection reports the ordinary Array and variable '*', rather
+than accepting it or exposing a generic internal exception. Existing actual
+Arrays retain deep shareability and frozen-state checks. A no-splat empty
+call has different reference behavior from an explicit unfrozen empty Array.
 
-## Measurement and remaining differences
+The reserved key zero of the existing splat-note map retains source identity;
+fixed native slots retain the suffix and original spread lengths. GC follows
+a pending positive source handle. Binding consumes the note. Signatures that
+can run defaults or destructuring callbacks retain the source in a private
+frame slot. A sole anonymous formal has no callback or GC safepoint before
+rest installation: a third fixed integer slot transfers provenance only over
+that atomic interval, and is reset before installation. This avoids generic
+per-call local tuples and temporary frame-map traffic. Native leaf, block,
+iterator, sender and Method boundaries consume Array provenance.
 
-Post the allocation file measured alone on evaluator and VM before/after,
-all 76 cases retained, with cause groups and process-family max RSS. Report
-retired instructions for ordinary method/block loops, unchanged Ruby matrix
-and anonymous forwarding. Run full corpus --both, one VM corpus with
-VM/fallback/difference counts, all nine source gates and record_hygiene.
-Run one corpus sweep at a time. Do not run the full unit suite or Rails cold
-measurement. Read automated review inline comments after opening and after
-every push, and answer or fix Major/P1/P2 before leaving draft.
+Array provenance is not a flagged Hash. Parse keyword formals in this branch
+only when the actual trailing Hash has a ruby2_keywords splat note. Borrow
+only at the matching positional-prefix boundary, without optional/post or
+ruby2_keywords copying; do not compare every Array element.
 
-CRuby sometimes creates an internal rest/concatenation Array that is not
-needed by this representation. Record those missing counts as not matched;
-do not allocate a dummy Array just to match them. Keyword packets and
-keyword-rest copies are separate causes. Generic forwarding uses the same
-lifetime principle in its independent change; integrate the shared native
-readers without weakening either regression corpus.
+## Block conversion and ownership
 
-## Review: captured rest isolation and borrowed Array provenance
+Scope pending Array provenance across block conversion. The existing
+temporary iterator root keeps an ephemeral source alive while to_proc or a
+block expression can call Ruby and GC. Exceptions remove the scoped state.
+CRuby compile.c setup_args_dup_rest_p distinguishes a simple block variable
+from a complex expression that can modify its splat. Preserve the source
+through simple-variable to_proc, but snapshot native argument storage before
+a complex block expression. VM splatarray retains its own copy flag.
 
-The private anonymous name contains a tilde, which pbase normally strips
-from renamed locals. Preserve that exact private name when bare super
-contributes a method's parameters to a Proc's outer-variable set. Otherwise
-isolation never sees the captured rest at all. Materialize a synthesized
-native rest only when isolation observes it, so its error names an ordinary
-Array instead of leaking an internal value or a generic StandardError.
+Common Array, native-list and nil splats keep their existing Val without a
+conversion-helper call or reboxing. A live plain block local holding Proc or
+nil needs no callback scope; custom to_proc still does. Pseudo variables and
+implicit numbered parameters retain the full evaluation path. No ordinary
+call receives counting-only work.
 
-Retain the source Array of an eligible anonymous splat, including its frozen
-state and later mutations. A reserved non-handle slot in the existing splat
-note table carries source identity; fixed native integer slots hold the
-suffix and original spread lengths. The existing nonempty-note binder branch snapshots the actual
-source value in a private frame slot before defaults may call Ruby.
-The collector follows a pending source handle. Binding consumes the note and
-removes the frame metadata when the anonymous rest is installed. Native leaf,
-block, iterator, sender and Method boundaries consume Array provenance.
-Ordinary fixed-arity Ruby calls do not gain a counting-only branch.
+## Regression and measurement
 
-An empty direct rest, and an eligible borrowed nil splat, represent Ruby's
-frozen shared empty Array privately as nil. An explicit empty Array splat
-retains that actual Array; an unfrozen one must refuse isolation. Optional or
-post-rest binding that synthesizes an Array keeps an unshareable native list
-until observed. VM borrowed to_a conversion uses the same source conversion
-helper as the evaluator, preserving a frozen converted Array rather than
-copying it. Array-producing operations still materialize normal Arrays.
+Corpus 991 has 56 output lines covering the exact review reproduction,
+direct/explicit/frozen/nil/converted splats, deep shareability, source aliasing
+across GC, leading/optional/post parameters, repeated splats, local/Binding
+collisions, reflection, large arguments, native boundaries, empty super,
+keyword append, block conversion mutation, exceptions and ephemeral roots.
+All 56 match clean Ruby 4.0.10 on evaluator and VM with GC stress 50. The GC
+root, duplicate-definition and dead-definition gates pass on this candidate.
+Final-head normal replay, corpus 664, hardware profiles, isolated allocation
+file and full corpus/gate results are required before the batched push.
 
-Corpus 991 now has 47 output lines, including the exact singleton-method
-review reproduction, direct/explicit/frozen/nil and converted splats, deep
-shareability, leading/post parameters, repeated splats, native Method/send
-boundaries, retained source aliasing across GC, empty super and keyword Array
-append. All lines match clean Ruby 4.0.10 on evaluator and VM under GC stress
-50. Existing corpus 664's 27 lines match both engines as well. GC-root,
-duplicate-definition and dead-definition gates pass. Final-head hardware,
-whole allocation-file and complete corpus replays follow before readiness.
+Measure all 76 ruby/test_allocation.rb cases alone on each engine, without
+other runtime probes. The main control is 8 MATCH / 68 RED in both modes.
+Its atomic differences group into excess rest Arrays (218), excess keyword
+Hashes (504), missing CRuby temporary Arrays (198), missing temporary Hashes
+(8), and ruby2_keywords copying (28). These are assertion counts, not disjoint
+test counts. Generic forwarding and keyword ownership are separate changes.
+Record remaining model-specific temporaries as not matched, with the reason;
+never allocate unused objects to imitate CRuby's counts.
 
-A wider probe also found an existing main difference for captured optional
-parameters: a defaulted parameter can be falsely reported as reassigned by
-Ractor isolation. The same refusal reproduces on the pre-change main control;
-that separate reassignment cause is not hidden by changing expected output
-in this regression corpus. No unused Ruby Array is allocated to imitate an
-allocation count.
+Post ordinary method/block loops, unchanged so_matrix, anonymous forwarding,
+other affected forwarding/proxy profiles, and large-file max RSS before/after.
+An instruction regression on every call is not an acceptable allocation fix.
+Run corpus --both and the VM corpus (VM/fallback/difference counts), all nine
+source gates and record_hygiene. Run one corpus sweep at a time; do not run
+the full unit suite or Rails cold measurement. Batch code and records into a
+single push after local checks, then read all inline review comments again.
 
-The first review fix passed semantic checks but added instructions to the
-borrowed-rest loop, especially on the VM. Replace three map entries and a
-boxed metadata list per splat with one existing-table slot and one fixed
-native integer slot. Store the actual source value in the frame, rather than
-boxing its id and lengths in another list. All 47 regression output lines
-still match both engines with GC stress 50; the three source gates pass.
-Repeat the hardware measurement before claiming that the performance issue
-is resolved. No allocation counter or unused Ruby object changes.
-
-## Preserve callback order without adding generic keyword work
-
-Array provenance alone is not a flagged Hash: parse keyword formals only
-when the actual trailing Hash has a ruby2_keywords splat note. For an
-anonymous source, record the original spread span and derive its positional
-prefix. A sole anonymous rest with no prefix keeps the source directly;
-mixed signatures store native prefix metadata and borrow only for the same
-leading-argument boundary, without optional/post or ruby2_keywords copying.
-This replaces an element-by-element guard and preserves later source
-mutation during to_proc.
-
-Scope pending Array provenance across block conversion and root the source
-with the existing temporary-iterator root while callbacks can run GC. A
-conversion exception removes that scoped state. CRuby's compile.c
-setup_args_dup_rest_p distinguishes a simple block-variable read from a
-block expression that may modify the splat: the former retains the source
-through to_proc, while the latter snapshots before evaluating the expression.
-Mirror that distinction without creating an unused Ruby snapshot Array.
-The VM retains its own splatarray copy flag.
-
-The extended regression checks simple to_proc append/replacement, complex
-block-expression snapshots, positional-prefix independence, conversion
-errors and subsequent calls, and an ephemeral source Array across explicit
-GC in conversion. Performance and all final-head replay results must pass
-before this draft is pushed again.
-
-All 55 corpus 991 output lines match clean Ruby 4.0.10 on evaluator and VM
-with GC stress 50, including the ephemeral conversion-source lifetime case.
-The separate four-case conversion probe also matches both engines. GC-root,
-duplicate-definition and dead-definition gates pass. The final hardware,
-whole-file allocation and complete corpus results are still required. Batch
-these follow-ups locally and push once those local checks pass.
-
-The VM still showed a small instruction increase after removing the boxed
-metadata. Common Array/native-list/nil splats now retain their existing Val
-directly, avoiding a conversion-helper call and a native rebox. A live plain
-block local can be read without Ruby callbacks; passing an existing Proc or
-nil through it does not need a callback scope or temporary source root.
-Pseudo and implicit-numbered variables retain the full evaluation path, and
-custom to_proc conversions still use the scoped provenance/root behavior.
-The private source-frame key is also short, reducing repeated string work.
-All 55 corpus lines still match both engines under GC stress 50, and the
-three source gates pass. Recheck hardware on this candidate before readiness;
-do not claim that the earlier VM instruction increase is acceptable.
-
-A sole anonymous formal cannot evaluate defaults or destructuring callbacks
-between reading provenance and installing its rest slot. Keep that source
-in a native local pair until installation, instead of storing, reading and
-deleting temporary frame metadata. Signatures that can evaluate Ruby during
-binding retain the private frame root. This removes hot temporary-map traffic;
-it does not create a Ruby object or change an allocation counter. All 55
-regression lines still match both engines with GC stress 50 and the three
-source gates pass. Hardware comparison remains required before readiness.
+A wider probe found captured optional parameters falsely reported as
+reassigned on the main control too. Keep that separate existing Ractor cause
+visible rather than changing expected output to hide it.
