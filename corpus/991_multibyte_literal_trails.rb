@@ -40,6 +40,9 @@ review_source = <<~'RUBY'
   p ["\CHAR", "a\CHARb", :"\CHAR".to_s, /\CHAR/.source, %r[\CHAR].source].map(&:bytes)
   p %w[\CHAR x].map(&:bytes)
   p %W[\CHAR x].map(&:bytes)
+  p "#{"\CHAR"}".bytes
+  p "#{/\CHAR/.source}".bytes
+  p "#{%Q[\CHAR]}".bytes
   x = <<TEXT
   \CHAR
   TEXT
