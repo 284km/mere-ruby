@@ -70,3 +70,15 @@ int mr_utimens(const char *path, int follow, const char *spec) {
     }
     return utimensat(AT_FDCWD, path, ts, follow ? 0 : AT_SYMLINK_NOFOLLOW) == 0 ? 0 : errno;
 }
+
+/* O_NONBLOCK off on a descriptor: what ruby's child does to its standard
+ * three just before exec (process.c, stdfd_clear_nonblock), since many
+ * programs cannot deal with a non-blocking stdin, stdout or stderr. The flag
+ * is the open file description's, shared with every copy of it. 1 when it
+ * was set and is now clear, 0 when it was not set, -errno on a refusal. */
+int mr_fd_clear_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL);
+    if (fl == -1) return -errno;
+    if (!(fl & O_NONBLOCK)) return 0;
+    return fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) == -1 ? -errno : 1;
+}

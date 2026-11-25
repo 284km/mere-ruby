@@ -1,38 +1,33 @@
-# Keep CI integrity checks aligned with vendored sources and VM jobs
+# Compare the renamed vendored ERB source with its actual upstream path
 
 ## Cause and change
 
-Linux build CI stops in headers_check before any runtime gate: the vendored
+Linux build CI stops in headers_check before runtime gates: the vendored
 ERB source is named erb_escape.c, but Ruby keeps it at
 ext/erb/escape/escape.c. The checker assumed every vendor-relative path was
-also the source-tree-relative path. The same failure reproduces on main.
+also the upstream-relative path. This failure also reproduces on main.
 
-List that rename explicitly and continue comparing every byte. All ordinary
+List that rename explicitly and continue comparing every byte. Ordinary
 vendor paths retain their existing rule; a missing or modified renamed
-source still fails. No runtime source, vendored bytes or CI workflow changes.
+source still fails. Vendored bytes and runtime source are unchanged.
 
-## Validation
+## Validation and review integration
 
-The original checker fails against the pinned clean Ruby 4.0.10 source;
-the corrected checker passes: 194 headers, ten explicitly patched headers,
-and 21 unchanged vendored sources. Scratch copies reject a modified
-vendored ERB file and a missing upstream ERB file, even when an old-location
-same-basename decoy exists. Restoring the explicit upstream file passes.
-Run record_hygiene. Build the unchanged runtime in O2 and post source gates,
-full corpus with both hash-index settings and VM/fallback/difference counts
-before readiness. No unit-test file is changed and no full unit suite or
-Rails cold measurement is run.
+The original checker fails against clean Ruby 4.0.10 source. The corrected
+checker passes: 194 headers, ten explicitly patched headers and 21 unchanged
+vendored sources. Scratch copies reject modified ERB bytes and a missing
+upstream file, even with an old-location same-basename decoy. Restoring the
+explicit upstream file passes.
 
-## Include the VM unit job in the integration report
+The reviewer independently reproduced that result. Main has since added
+unittest-vm to the CI timing report in PR 275. Merge main 0cd831f0 and keep
+its workflow byte for byte, resolving the overlapping needs-list edits. The
+final diff against that main contains only the checker and this record;
+there is no workflow or runtime change. Run the timing self-tests, all source
+gates and record_hygiene before the batched follow-up push, then read inline
+comments again. Historical full-corpus and RSS results belong to head
+81b3001d and are identified separately in the PR description; do not label
+them final-head measurements. The reviewer requests checker/gate validation
+for this source-check-only integration, without another full corpus sweep.
 
-The same main snapshot added unittest-vm without adding it to ci-timing's
-needs list. The existing integrity self-test correctly fails: the report
-must wait for every work job. Add that existing job to needs; preserve
-always(), read-only actions/contents permissions, the Ubuntu runner and
-artifact handling. This does not add a job or a workflow run.
-
-The timing-check file reports 16 passes and one failure before the change;
-rerun all 17 checks after the workflow dependency correction. Runtime source
-and binary inputs remain unchanged. This workflow edit is for the repository
-owner to merge, after final local validation. Batch this code and its record
-in one follow-up push, only when local checks pass.
+No upstream unit file changes, full unit suite or Rails cold measurement.

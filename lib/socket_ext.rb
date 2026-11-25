@@ -370,6 +370,32 @@ class BasicSocket < IO
   def __wait_readable
     __fd_read_wait(@__io_fd)
   end
+  # accept(2) itself, once readiness has said a connection waits, as
+  # ext/socket/init.c answers it. Another process may take the connection
+  # first -- a forked server's workers all accept on the one listener -- and
+  # accept(2) then says EAGAIN; or the client went before it was taken,
+  # ECONNABORTED (EPROTO). A nonblocking accept raises them as
+  # IO::WaitReadable (or answers :wait_readable), and a blocking one waits
+  # again on EAGAIN. Anything else is its Errno. They were all SocketError
+  # "accept failed", which puma's accept loop logs as a "Listen loop" error
+  # -- dozens a second while a cluster's workers race for connections.
+  def __accept_now(nonblock, exception = true)
+    loop do
+      fd = Socket.__accept_e(@__io_fd)
+      return fd if fd >= 0
+      e = -fd
+      again = e == Errno::EAGAIN::Errno || e == Errno::EWOULDBLOCK::Errno
+      if nonblock && (again || e == Errno::ECONNABORTED::Errno || e == Errno::EPROTO::Errno)
+        return :wait_readable unless exception
+        raise IO::EAGAINWaitReadable, "accept(2) would block" if again
+        ex = SystemCallError.new("accept(2) would block", e)
+        ex.extend(IO::WaitReadable)
+        raise ex
+      end
+      raise SystemCallError.new("accept(2)", e) unless again
+      __wait_readable
+    end
+  end
   # recv(2) on a stream: what has arrived, up to maxlen, and nil at end of
   # stream. MSG_PEEK leaves it in the buffer for the next read.
   # A DATAGRAM is one recv(2) and one send(2), never the stream buffer: an
@@ -728,9 +754,7 @@ class TCPServer < TCPSocket
   def accept
     __check_open
     __wait_readable
-    fd = Socket.__accept(@__io_fd)
-    raise SocketError, "accept failed" if fd < 0
-    TCPSocket.for_fd(fd)
+    TCPSocket.for_fd(__accept_now(false))
   end
   def accept_nonblock(exception: true)
     __check_open
@@ -738,14 +762,13 @@ class TCPServer < TCPSocket
       return :wait_readable unless exception
       raise IO::EAGAINWaitReadable, "accept(2) would block"
     end
-    accept
+    fd = __accept_now(true, exception)
+    fd.is_a?(Integer) ? TCPSocket.for_fd(fd) : fd
   end
   def sysaccept
     __check_open
     __wait_readable
-    fd = Socket.__accept(@__io_fd)
-    raise SocketError, "accept failed" if fd < 0
-    fd
+    __accept_now(false)
   end
   # listen(2) again on a listening socket changes its backlog; the backlog
   # is converted as NUM2INT converts it
@@ -998,12 +1021,10 @@ class UNIXServer < UNIXSocket
     __new_block_warn if block_given?
     __unix_init(path, true)
   end
-  def __accept_fd
+  def __accept_fd(nonblock = false, exception = true)
     __check_open
-    __wait_readable
-    fd = Socket.__accept(@__io_fd)
-    IO.__fd_raise(-Errno::EINVAL::Errno, "accept(2)") if fd < 0
-    fd
+    __wait_readable unless nonblock
+    __accept_now(nonblock, exception)
   end
   def __unix_client(fd)
     s = UNIXSocket.allocate
@@ -1019,7 +1040,8 @@ class UNIXServer < UNIXSocket
       return :wait_readable unless exception
       raise IO::EAGAINWaitReadable, "accept(2) would block"
     end
-    accept
+    fd = __accept_fd(true, exception)
+    fd.is_a?(Integer) ? __unix_client(fd) : fd
   end
   def sysaccept
     __accept_fd
@@ -1275,8 +1297,9 @@ class Socket < BasicSocket
     __check_open
     raise Errno::EINVAL, "accept(2)" unless @listening
     __wait_readable
-    fd = Socket.__accept(@__io_fd)
-    raise SocketError, "accept failed" if fd < 0
+    __socket_client(__accept_now(false))
+  end
+  def __socket_client(fd)
     s = Socket.allocate
     s.__setup(fd, @socktype)
     s.instance_variable_set(:@family, @family)
@@ -1290,7 +1313,8 @@ class Socket < BasicSocket
       return :wait_readable unless exception
       raise IO::EAGAINWaitReadable, "accept(2) would block"
     end
-    accept
+    fd = __accept_now(true, exception)
+    fd.is_a?(Integer) ? __socket_client(fd) : fd
   end
   def sysaccept
     s, a = accept
