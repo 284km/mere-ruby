@@ -28698,7 +28698,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        else if (str_len name == 6 && str_eq name "printf") then
          (match args with
           | Cons (VStr h9, rest9) ->
-            (let s9 = rb_format env world (sget h9) rest9 VNil in
+            (let s9 = rb_format env world (VStr h9) rest9 VNil in
              let _ = (if fd == 2 then err_raw s9 else out_print_checked world s9) in
              VNil)
           | Nil -> VNil
@@ -46749,12 +46749,33 @@ and rb_fmt_array_arg = fn (args: Val list) -> fn (source9: Val) -> fn (index9: i
   | VArr id9 -> rb_fmt_posarg (deref id9) (index9 + 1)
   | _ -> rb_fmt_posarg args (index9 + 1)
 
-and rb_format = fn env -> fn world -> fn (fmt: str) -> fn (args: Val list) -> fn (source9: Val) ->
-  rb_format_core env world (rb_fmt_state "UTF-8") fmt args source9
+and rb_format = fn env -> fn world -> fn (format9: Val) -> fn (args: Val list) -> fn (source9: Val) ->
+  let value9 = (match format9 with VStr _ -> format9 | _ -> pack_cv env world 0 "str" format9) in
+  match value9 with
+  | VStr handle9 ->
+    (let _ = fmt_ascii_guard world (senc_get handle9) in
+     let (out9, _) = rb_format_in env world (senc_get handle9) (sget handle9) args source9 in out9)
+  | _ -> ""
 and rb_fmt_state = fn (encoding9: str) ->
-  let state9 = vec_new () in
-  let _ = vec_push state9 (enc_canon_name encoding9) in
-  let _ = vec_push state9 "" in state9
+  let rec free9 = fn (index9: int) ->
+    (if index9 >= vec_len fmt_state_busy || vec_get fmt_state_busy index9 == 0 then index9
+     else free9 (index9 + 1)) in
+  let index9 = free9 0 in
+  let state9 = (if index9 < vec_len fmt_state_pool then vec_get fmt_state_pool index9
+                else (let added9 = vec_new () in
+                      let _ = vec_compact added9 in
+                      let _ = vec_push fmt_state_pool added9 in
+                      let _ = vec_push fmt_state_busy 0 in added9)) in
+  let _ = vec_set fmt_state_busy index9 1 in
+  let encoding9 = enc_canon_name encoding9 in
+  let _ = vec_push state9 encoding9 in let _ = vec_push state9 "" in
+  let _ = vec_push state9 encoding9 in let _ = vec_push state9 "" in
+  let _ = vec_push state9 "" in index9
+and rb_fmt_release = fn (index9: int) ->
+  let state9 = vec_get fmt_state_pool index9 in
+  // Vec stores copy strings into its arena. Clearing slots alone leaves
+  // those copies allocated; recycling the arena releases them as well.
+  let _ = vec_recycle state9 in vec_set fmt_state_busy index9 0
 // Negotiate at conversion time, against the output prefix. The state belongs
 // to this invocation, including when a callback recursively formats strings.
 and rb_fmt_take = fn state9 -> fn (text9: str) -> fn (encoding9: str) ->
@@ -46783,14 +46804,16 @@ and rb_format_core = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (arg
      out)
 
 and rb_format_in = fn env -> fn world -> fn (enc: str) -> fn (fmt: str) -> fn (args: Val list) -> fn (source9: Val) ->
-  let had = map_has fmt_enc_cur "v" in
-  let prev = (if had then map_get fmt_enc_cur "v" else "") in
-  let _ = map_set fmt_enc_cur "v" (enc_canon_name enc) in
-  let _ = (if map_has fmt_named_cur "k" then map_delete fmt_named_cur "k" else ()) in
-  let state9 = rb_fmt_state enc in
-  let out = rb_format_core env world state9 fmt args source9 in
-  let _ = (if had then map_set fmt_enc_cur "v" prev else map_delete fmt_enc_cur "v") in
-  (out, vec_get state9 0)
+  let index9 = rb_fmt_state enc in
+  let state9 = vec_get fmt_state_pool index9 in
+  let result9 = try_or_msg
+    (fn (u9: unit) ->
+      let out9 = rb_format_core env world state9 fmt args source9 in
+      let encoding9 = vec_get state9 0 in
+      // The caller owns the returned encoding after the scratch is recycled.
+      (out9, substring encoding9 0 (str_len encoding9)))
+    (fn (message9: str) -> let _ = rb_fmt_release index9 in fail message9) in
+  let _ = rb_fmt_release index9 in result9
 
 and rb_format_go = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (source9: Val) -> fn (nextarg: int) -> fn (mode: int) -> fn (acc: str) ->
   let n = str_len fmt in
@@ -46806,20 +46829,20 @@ and rb_format_go = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (i: in
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "\{" then
          let _ = vec_set state9 1 acc in
          let (key, j) = rb_fmt_name fmt (i + 2) "" "}" in
-         let m2 = rb_fmt_to_named_k mode "\{" key "}" nextarg in
-         rb_format_go env world state9 fmt j args source9 nextarg m2 (acc ++ rb_fmt_one env world state9 "" (0 - 1) (0 - 1) false "s" (rb_fmt_named_w env world args key "\{" "}"))
+         let m2 = rb_fmt_to_named_k state9 mode "\{" key "}" nextarg in
+         rb_format_go env world state9 fmt j args source9 nextarg m2 (acc ++ rb_fmt_one env world state9 "" (0 - 1) (0 - 1) false "s" (rb_fmt_named_w env world state9 args key "\{" "}"))
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "<" then
          let _ = vec_set state9 1 acc in
          let (key, j0) = rb_fmt_name fmt (i + 2) "" ">" in
-         let m2 = rb_fmt_to_named_k mode "<" key ">" nextarg in
-         let av = rb_fmt_named_w env world args key "<" ">" in
+         let m2 = rb_fmt_to_named_k state9 mode "<" key ">" nextarg in
+         let av = rb_fmt_named_w env world state9 args key "<" ">" in
          // the spec after the name formats exactly this one value: run the
          // directive parser over a one-element argument list in numbered mode
          // with the position preset, so a stray %s inside cannot consume the
          // real argument list.
-         let _ = map_set fmt_named_cur "k" key in
+         let _ = vec_set state9 3 key in let _ = vec_set state9 4 "on" in
          let (piece, j, na9, m9) = rb_fmt_dir env world state9 fmt j0 (Cons (av, Nil)) VNil 0 2 "" (0 - 1) false (0 - 1) false 1 in
-         let _ = map_delete fmt_named_cur "k" in
+         let _ = vec_set state9 4 "" in
          let _ = na9 in
          let _ = m9 in
          rb_format_go env world state9 fmt j args source9 nextarg m2 (acc ++ piece)
@@ -46901,63 +46924,63 @@ and rb_fmt_dir = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (i: int)
     // `%<name>` may stand anywhere in the spec (`%+15<foo>.5f`): the named
     // value is this directive's argument, and the format is named from here
     // ...and `%-20.5{foo}`: the named value as %s, with what came before it
-    else if str_eq c "\{" && map_has fmt_named_cur "k" then
+    else if str_eq c "\{" && (str_len (vec_get state9 4) > 0) then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" "}" in
-       let _ = prim_raise_enc "ArgumentError" ("named\{" ++ key ++ "} after <" ++ map_get fmt_named_cur "k" ++ ">") (fmt_enc_now ()) in
+       let _ = prim_raise_enc "ArgumentError" ("named\{" ++ key ++ "} after <" ++ vec_get state9 3 ++ ">") (fmt_enc_now state9) in
        ("", j, nextarg, mode))
-    else if str_eq c "<" && map_has fmt_named_cur "k" then
+    else if str_eq c "<" && (str_len (vec_get state9 4) > 0) then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" ">" in
-       let _ = prim_raise_enc "ArgumentError" ("named<" ++ key ++ "> after <" ++ map_get fmt_named_cur "k" ++ ">") (fmt_enc_now ()) in
+       let _ = prim_raise_enc "ArgumentError" ("named<" ++ key ++ "> after <" ++ vec_get state9 3 ++ ">") (fmt_enc_now state9) in
        ("", j, nextarg, mode))
     else if str_eq c "\{" then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" "}" in
-       let m2 = rb_fmt_to_named_k mode "\{" key "}" nextarg in
-       let av = rb_fmt_named_w env world args key "\{" "}" in
+       let m2 = rb_fmt_to_named_k state9 mode "\{" key "}" nextarg in
+       let av = rb_fmt_named_w env world state9 args key "\{" "}" in
        (rb_fmt_one env world state9 flags width prec pset "s" av, j, nextarg, m2))
     else if str_eq c "<" then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" ">" in
-       let m2 = rb_fmt_to_named_k mode "<" key ">" nextarg in
-       let av = rb_fmt_named_w env world args key "<" ">" in
-       let _ = map_set fmt_named_cur "k" key in
+       let m2 = rb_fmt_to_named_k state9 mode "<" key ">" nextarg in
+       let av = rb_fmt_named_w env world state9 args key "<" ">" in
+       let _ = vec_set state9 3 key in let _ = vec_set state9 4 "on" in
        let (piece, j2, _, _) = rb_fmt_dir env world state9 fmt j (Cons (av, Nil)) VNil 0 2 flags width wset prec pset 1 in
-       let _ = map_delete fmt_named_cur "k" in
+       let _ = vec_set state9 4 "" in
        (piece, j2, nextarg, m2))
     // a character that is not a directive is named when it is printable
     else (let o9 = ord c in
           let _ = prim_raise "ArgumentError"
                     (if o9 > 32 && o9 < 127 then "malformed format string - %" ++ c else "malformed format string") in
           ("", i + 1, nextarg, mode))
-and rb_fmt_named = fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
+and rb_fmt_named = fn state9 -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
   (match args with
    | Cons (VHsh h, _) ->
      let xs = hderef h in
      // symbol keys only: ruby does not accept a string key here, and the
      // message quotes the brackets the format used.
      // (the key is a name in the format's encoding: name_u8, note 484)
-     let key9 = VSym (name_u8 key (fmt_enc_now ())) in
+     let key9 = VSym (name_u8 key (fmt_enc_now state9)) in
      if hash_haskey xs key9 then hash_get xs key9
-     else prim_raise_enc "KeyError" ("key" ++ op ++ key ++ cl ++ " not found") (fmt_enc_now ())
+     else prim_raise_enc "KeyError" ("key" ++ op ++ key ++ cl ++ " not found") (fmt_enc_now state9)
    | _ -> prim_raise "ArgumentError" "one hash required")
 
 // A named reference reads the one Hash argument through Hash#[] -- so its
 // default (a value or a block) answers a missing key -- and only a nil
 // answer is the KeyError, which carries the Hash and the key as ruby's does.
-and rb_fmt_named_w = fn env -> fn world -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
+and rb_fmt_named_w = fn env -> fn world -> fn state9 -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
   match args with
   | Cons (VHsh h, _) ->
     (let xs = hderef h in
-     let key9 = VSym (name_u8 key (fmt_enc_now ())) in
+     let key9 = VSym (name_u8 key (fmt_enc_now state9)) in
      if hash_haskey xs key9 then hash_get xs key9
      else
        (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
         match invoke_val_c env world nb (VHsh h) "[]" (Cons (key9, Nil)) false with
         | VNil -> raise_exc_iv world "KeyError" ("key" ++ op ++ key ++ cl ++ " not found")
-                    (Cons (("__key", key9), Cons (("__recv", VHsh h), Cons (("__menc", mkstr (fmt_enc_now ())), Nil))))
+                    (Cons (("__key", key9), Cons (("__recv", VHsh h), Cons (("__menc", mkstr (fmt_enc_now state9)), Nil))))
         | v -> v))
-  | _ -> rb_fmt_named args key op cl
+  | _ -> rb_fmt_named state9 args key op cl
 
 
-// A format argument that is not a String: #to_str, as StringValue asks it.
+// StringValue conversion shared by Kernel's message and command readers.
 and fmt_str_arg = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VStr h -> sget h
@@ -50382,11 +50405,10 @@ and ecall_args = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val
     // String form existed, so `printf(io, "%d", 1)` printed nothing anywhere.
     else if (str_len name == 6 && str_eq name "printf") && (if kernel_overridden env world "printf" then false else true) then
       (let _ = (match args with
-                | Cons (VStr h, rest) -> out_emit world (rb_format env world (sget h) rest VNil)
+                | Cons (VStr h, rest) -> out_emit world (rb_format env world (VStr h) rest VNil)
                 | Cons (io9, Cons (f9, rest9)) ->
-                  (let fs9 = fmt_str_arg env world f9 in
-                   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                   let _ = invoke_val_c env world nb9 io9 "write" (Cons (mkstr (rb_format env world fs9 rest9 VNil), Nil)) false in ())
+                  (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                   let _ = invoke_val_c env world nb9 io9 "write" (Cons (mkstr (rb_format env world f9 rest9 VNil), Nil)) false in ())
                 | Cons (_, Nil) -> (let _ = raise_exc world "ArgumentError" "too few arguments" in ())
                 | Nil -> ()) in VNil)
     // Kernel#format / #sprintf: sprintf-style formatting. A format that is not

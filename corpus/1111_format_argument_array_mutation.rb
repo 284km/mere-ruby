@@ -54,6 +54,82 @@ begin
 rescue => error
   p [error.class, error.message]
 end
+
+# printf must retain the format String's own encoding on every IO path.
+Dir.mktmpdir do |dir|
+  child = <<~'CODE'
+    encoding = ARGV.fetch(0)
+    prefix = encoding == 'ASCII-8BIT' ? "\xFF".b : 'あ'.encode(encoding)
+    argument = encoding == 'ASCII-8BIT' ? "\xFE".b : 'い'.encode(encoding)
+    ['s', 'c'].each do |type|
+      template = prefix + '%' + type + "\n"
+      printf(template, argument)
+      $stdout.printf(template, argument)
+      STDOUT.printf(template, argument)
+      $stderr.printf(template, argument)
+      printf($stdout, template, argument)
+      File.open(ARGV.fetch(1), 'w+') do |io|
+        printf(io, template, argument)
+        io.printf(template, argument)
+        io.rewind
+        print io.read
+      end
+    end
+    begin
+      printf("\xFF%s".b, 'é')
+    rescue Encoding::CompatibilityError
+      puts :incompatible
+    end
+  CODE
+  ['EUC-JP', 'Windows-31J', 'ASCII-8BIT'].each do |encoding|
+    errors = File.join(dir, 'errors')
+    output = IO.popen([RbConfig.ruby, '-e', child, encoding, File.join(dir, 'output'), err: errors], &:read)
+    status = $?.exitstatus
+    p [encoding, output.bytes, File.binread(errors).bytes, status]
+  end
+end
+
+# Nested named directives and repeated exceptions release their invocation
+# state while preserving the outer formatter's context.
+value = Object.new
+value.define_singleton_method(:to_s) do
+  begin
+    format('%<inner><bad>s', inner: 'x')
+  rescue ArgumentError
+  end
+  format('%<inner>s', inner: 'inside')
+end
+p format('%<outer>s:%<tail>s', outer: value, tail: 'after')
+raising = Object.new
+raising.define_singleton_method(:to_s) { '%s' % value; raise 'conversion' }
+1000.times do
+  begin
+    '%s' % raising
+  rescue RuntimeError
+  end
+end
+p format('%<after>s', after: 'exceptions')
+escaping = Object.new
+escaping.define_singleton_method(:to_s) { throw :format_escape, :escaped }
+p catch(:format_escape) { '%s' % escaping }
+p '%s' % 'after throw'
+first = Fiber.new do
+  value = Object.new
+  value.define_singleton_method(:to_s) { Fiber.yield :first; 'é' }
+  format('%<x>s:%<y>s', x: value, y: 'one')
+end
+second = Fiber.new do
+  value = Object.new
+  value.define_singleton_method(:to_s) { Fiber.yield :second; 'い'.encode('EUC-JP') }
+  format('%<x>s:%<y>s'.encode('EUC-JP'), x: value, y: 'two')
+end
+p first.resume
+p second.resume
+text = first.resume
+p [text.bytes, text.encoding.name]
+p format('%<middle>s', middle: 'between resumes')
+text = second.resume
+p [text.bytes, text.encoding.name]
 # Kernel#sprintf receives its own argument vector; mutating an unrelated
 # source array after splatting does not invalidate that call.
 array.replace([object, 'y'])
