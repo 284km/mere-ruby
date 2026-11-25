@@ -25,7 +25,13 @@
 #   sh tools/iseq/vm_check.sh [snippets]       (RUBY=, MR_BIN= to override)
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-RUBY="${RUBY:-$HOME/.rbenv/versions/4.0.10/bin/ruby}"
+# (the reference ruby: this machine's rbenv build when there is one, else
+#  the ruby on PATH -- CI's, which setup-ruby puts there at the reference's
+#  version. CI's step failed at once on the rbenv path it does not have.)
+REF_RBENV="$HOME/.rbenv/versions/4.0.10/bin/ruby"
+if [ -z "${RUBY:-}" ]; then
+  if [ -x "$REF_RBENV" ]; then RUBY="$REF_RBENV"; else RUBY="$(command -v ruby)"; fi
+fi
 MR="${MR_BIN:-$ROOT/mere-ruby}"
 case "$MR" in /*) ;; *) MR="$(pwd)/$MR" ;; esac
 SNIPS="${1:-$ROOT/tools/iseq/vm_snippets.txt}"
