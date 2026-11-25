@@ -25,12 +25,13 @@
 #   sh tools/iseq/vm_check.sh [snippets]       (RUBY=, MR_BIN= to override)
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-# (the reference ruby: this machine's rbenv build when there is one, else
-#  the ruby on PATH -- CI's, which setup-ruby puts there at the reference's
-#  version. CI's step failed at once on the rbenv path it does not have.)
-REF_RBENV="$HOME/.rbenv/versions/4.0.10/bin/ruby"
+# (the reference ruby as every gate takes it, tools/ref_ruby.sh: rbenv's
+#  build of the pinned version when PATH's ruby is another, CI's setup-ruby
+#  one there, and a refusal when neither is that version -- not whatever
+#  ruby PATH has. RUBY= still names one outright.)
 if [ -z "${RUBY:-}" ]; then
-  if [ -x "$REF_RBENV" ]; then RUBY="$REF_RBENV"; else RUBY="$(command -v ruby)"; fi
+  . "$ROOT/tools/ref_ruby.sh"
+  RUBY="$(command -v ruby)"
 fi
 MR="${MR_BIN:-$ROOT/mere-ruby}"
 case "$MR" in /*) ;; *) MR="$(pwd)/$MR" ;; esac
