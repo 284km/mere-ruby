@@ -29,9 +29,12 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 #  build of the pinned version when PATH's ruby is another, CI's setup-ruby
 #  one there, and a refusal when neither is that version -- not whatever
 #  ruby PATH has. RUBY= still names one outright.)
+# (...and the binary itself, REF_RUBY_BIN, not rbenv's shim: the shim adds
+#  RBENV_* and RUBYLIB to the ENV of what it runs, which a snippet that
+#  compares ENV would see on the reference side only)
 if [ -z "${RUBY:-}" ]; then
   . "$ROOT/tools/ref_ruby.sh"
-  RUBY="$(command -v ruby)"
+  RUBY="$REF_RUBY_BIN"
 fi
 MR="${MR_BIN:-$ROOT/mere-ruby}"
 case "$MR" in /*) ;; *) MR="$(pwd)/$MR" ;; esac
