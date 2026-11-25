@@ -3867,7 +3867,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                   else (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
     let superblk = (match bpl9 with
-                    | Cons (be9, _) -> coerce_to_block env world blk (eval_e env world blk be9)
+                    | Cons (be9, _) -> coerce_block_arg env world blk be9
                     | Nil -> blk) in
     super_vals env world superblk defcls meth recv args
   | ESuperB (zsuper, arges, bp0, bb) ->
@@ -3979,7 +3979,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        (match bp with
         | Cons (c, Nil) when str_eq c block_pass_marker ->
           invoke_with_block env world blk recv name args
-            (coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil))
+            (coerce_block_arg env world blk (match bb with Cons (SExpr be, _) -> be | _ -> ENil))
         // (...and a literal block carries the method's own block for its
         //  yield, as EMethodB's does: `a&.map { |x| yield x }` was "no block
         //  given (yield)")
@@ -4506,7 +4506,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let newblk = (match bp with
                   | Cons (c, Nil) ->
                     (if str_eq c block_pass_marker
-                     then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil)
+                     then coerce_block_arg env world blk (match bb with Cons (SExpr be, _) -> be | _ -> ENil)
                      else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
                            blk_capture blk (true, bp, bb, env) bb))
                   | _ -> (let s9 = bp_sym world bp bb in
@@ -5037,7 +5037,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     //  left unread is not this one -- `Proc.new { }` answered that pr, as
     //  ECallB's arm already knew)
     let newblk = (match bp with
-                  | Cons (c, Nil) -> if str_eq c block_pass_marker then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil)
+                  | Cons (c, Nil) -> if str_eq c block_pass_marker then coerce_block_arg env world blk (match bb with Cons (SExpr be, _) -> be | _ -> ENil)
                                      else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
                                            blk_capture blk (true, bp, bb, env) bb)
                   | _ -> (let s9 = bp_sym world bp bb in
@@ -6913,6 +6913,7 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
                   (match source9 with VArr id9 -> id9 | VNil -> 0 - 1 | _ -> 0 - 2) in
     let _ = map_set r2k_splat 0 srcid9 in
     let _ = vec_set anon_splat_tail 0 (vlen tail9) in
+    let _ = vec_set anon_splat_tail 1 (vlen spread) in
     (match vlast spread with
      | VHsh lh9 when map_has r2k_marks (str_of_int lh9) && only_block_pass t && (match hderef lh9 with Nil -> true | _ -> false) ->
        (let _ = map_set blk_kwp "e" "1" in list_append (vinit spread) tail9)
@@ -34074,7 +34075,53 @@ and brk_home_flow = fn cenv -> fn (f: Flow) ->
      | VInt h9 -> (if h9 > 0 && fb_frame_live h9 then (let _ = flow_throw_breakret h9 v in FNext VNil) else f)
      | _ -> f)
   | _ -> f
+// A block expression/to_proc can call Ruby after splat evaluation. Keep this
+// call's Array provenance scoped across that callback, not on its callee.
+and anon_splat_block_scope = fn body9 ->
+  let source9 = map_get r2k_splat 0 in
+  let tail9 = vec_get anon_splat_tail 0 in
+  let span9 = vec_get anon_splat_tail 1 in
+  let hold9 = vec_get gc_iter_hold_n 0 in
+  let _ = vec_set gc_iter_hold_n 0 (hold9 + 1) in
+  let _ = (if source9 > 0 then map_set gc_iter_hold hold9 (VArr source9) else ()) in
+  let _ = anon_splat_forget () in
+  let result9 = try_or_msg body9 (fn (message9: str) ->
+    (let _ = (if source9 > 0 then map_delete gc_iter_hold hold9 else ()) in
+     let _ = anon_splat_forget () in fail message9)) in
+  let _ = (if source9 > 0 then map_delete gc_iter_hold hold9 else ()) in
+  let _ = map_set r2k_splat 0 source9 in
+  let _ = vec_set anon_splat_tail 0 tail9 in
+  let _ = vec_set anon_splat_tail 1 span9 in
+  result9
+// CRuby compile.c setup_args_dup_rest_p snapshots a splat before a block
+// expression which can modify it. Variable/literal reads keep the source.
+and anon_block_dup_rest = fn env -> fn (expression9: Expr) ->
+  match expression9 with
+  | EVar name9 -> not (lv_has env name9 || str_starts_with name9 "$" || str_starts_with name9 "@@")
+  | EIVar _ -> false | EConst _ -> false | EConstOrNil _ -> false
+  | EInt _ -> false | EBig _ -> false | ERat _ -> false
+  | EImag _ -> false | EImagF _ -> false | EImagRat _ -> false | EFlt _ -> false
+  | EStrL _ -> false | ESym _ -> false | ERegex _ -> false
+  | ESelf -> false | ENil -> false | EBool _ -> false | ELambda _ -> false
+  | EScopedRead (inner9, _) -> anon_block_dup_rest env inner9
+  | EArr expressions9 ->
+    (let rec any9 = fn (xs9: Expr list) -> match xs9 with
+       | Nil -> false
+       | Cons (h9, t9) -> anon_block_dup_rest env h9 || any9 t9 in any9 expressions9)
+  | EMethod (EStrL _, name9, Nil) when str_starts_with name9 "__lit_" -> false
+  | _ -> true
+and coerce_block_arg = fn env -> fn world -> fn blk -> fn (expression9: Expr) ->
+  if map_has r2k_splat 0 then
+    (let _ = (if anon_block_dup_rest env expression9 then map_set r2k_splat 0 (0 - 2) else ()) in
+     anon_splat_block_scope (fn (u: unit) -> coerce_to_block_value env world blk (eval_e env world blk expression9)))
+  else coerce_to_block_value env world blk (eval_e env world blk expression9)
 and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
+  match bv with
+  | VProc _ -> coerce_to_block_value env world blk bv
+  | VNil -> coerce_to_block_value env world blk bv
+  | _ -> if map_has r2k_splat 0 then anon_splat_block_scope (fn (u: unit) -> coerce_to_block_value env world blk bv)
+         else coerce_to_block_value env world blk bv
+and coerce_to_block_value = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   match bv with
   | VProc pid ->
     // forward the proc's home frame so the callee's `break` targets it.
@@ -61152,21 +61199,31 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
   // passing it as a positional argument in between (an assert_same) took
   // its keywords mark away, and `kwargs(*args)` then saw one positional Hash
   let _ = (if map_len r2k_splat > 0 then
-             (let ps8 = strip_block_params params0 in
-              let wants8 = (match kw_params ps8 with Nil -> (if str_eq (dsplat_name ps8) "" then false else true) | _ -> true) in
-              let _ = (if map_has r2k_splat 0 && str_list_has ps8 "*__anon~rest" then
+             (let _ = (if map_has r2k_splat 0 && str_list_has params0 "*__anon~rest" then
                          (let src9 = map_get r2k_splat 0 in
                           let tail9 = vec_get anon_splat_tail 0 in
+                          let kwtail9 = tail9 == 1 && is_kw_hash (vlast args0)
+                            && (let ps8 = strip_block_params params0 in
+                                match kw_params ps8 with Nil -> not (str_eq (dsplat_name ps8) "") | _ -> true) in
                           map_set frame "__anon~source"
-                            (if tail9 == 0 || (tail9 == 1 && wants8 && is_kw_hash (vlast args0)) then
-                               (if src9 > 0 then VArr src9 else if src9 == 0 - 1 then VNil else VBool false)
+                            (if tail9 == 0 || kwtail9 then
+                               (if src9 > 0 then
+                                  (let prefix9 = vlen args0 - tail9 - vec_get anon_splat_tail 1 in
+                                   match params0 with
+                                   | Cons (p9, Nil) when str_eq p9 "*__anon~rest" ->
+                                     if prefix9 == 0 then VArr src9 else VBool false
+                                   | _ -> VIcl (false, Cons (VArr src9, Cons (VInt prefix9, Nil))))
+                                else if src9 == 0 - 1 then VNil else VBool false)
                              else VBool false))
                        else ()) in
-              if wants8 then
-                (match vlast args0 with
-                 | VHsh id8 -> (if map_has r2k_marks (str_of_int id8) && map_has r2k_splat id8 then mark_kw id8 else ())
-                 | _ -> ())
-              else ())
+              // Array provenance alone is not a flagged Hash. Do not parse
+              // keyword formals for every ordinary anonymous splat.
+              match vlast args0 with
+              | VHsh id8 when map_has r2k_marks (str_of_int id8) && map_has r2k_splat id8 ->
+                (let ps8 = strip_block_params params0 in
+                 let wants8 = (match kw_params ps8 with Nil -> not (str_eq (dsplat_name ps8) "") | _ -> true) in
+                 if wants8 then mark_kw id8 else ())
+              | _ -> ())
            else ()) in
   // (the splat notes are this call's; none may outlive it)
   let _ = (if map_len r2k_splat > 0 then map_clear r2k_splat else ()) in
@@ -61321,12 +61378,9 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
                          let source9 = if noted9 then map_get frame "__anon~source" else VNil in
                          let _ = (if noted9 then map_delete frame "__anon~source" else ()) in
                          match source9 with
-                         | VArr id9 when nopt == 0 && na == 0 && not (map_has frame "__r2k") ->
-                           (let rec same9 = fn (xs9: Val list) -> fn (ys9: Val list) -> match (xs9, ys9) with
-                              | (Nil, Nil) -> true
-                              | (Cons (x9, xt9), Cons (y9, yt9)) -> rb_identical x9 y9 && same9 xt9 yt9
-                              | _ -> false in
-                            if same9 rest_values (deref id9) then VArr id9 else VIcl (false, rest_values))
+                         | VArr id9 when nopt == 0 && na == 0 && not (map_has frame "__r2k") -> VArr id9
+                         | VIcl (false, Cons (VArr id9, Cons (VInt prefix9, Nil)))
+                           when prefix9 == npre && nopt == 0 && na == 0 && not (map_has frame "__r2k") -> VArr id9
                          | VNil when nv == npre && na == 0 && (not noted9 || nopt == 0) -> VNil
                          | _ -> VIcl (false, rest_values))
                       else if sc < 4096 then arr_new rest_values
@@ -70044,7 +70098,7 @@ and vm_blk_send = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str
   let (_, _, _, _, _, _, _, _, bp0, bb, _, _, _, _) = vec_get vm_meta bid in
   let bp = blk_own_locals env bp0 in
   let newblk = (match bp with
-                | Cons (c, Nil) -> if str_eq c block_pass_marker then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil)
+                | Cons (c, Nil) -> if str_eq c block_pass_marker then coerce_block_arg env world blk (match bb with Cons (SExpr be, _) -> be | _ -> ENil)
                                    else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
                                          blk_capture blk (true, bp, bb, env) bb)
                 | _ -> (let s9 = bp_sym world bp bb in

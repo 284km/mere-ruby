@@ -1,4 +1,4 @@
-# Anonymous rest has no Ruby Array identity; explicit arrays remain observable.
+# Borrowed source Arrays stay observable; synthesized anonymous rest can be native.
 def anonymous_collect(*values) = values
 def anonymous_forward(*) = anonymous_collect(*)
 def anonymous_array(*) = [*]
@@ -131,3 +131,50 @@ converted = Object.new
 def converted.to_a = [].freeze
 check_anonymous_isolation(:converted_frozen) { isolation.through(*converted) }
 check_anonymous_isolation(:frozen_unshareable_value) { isolation.through(*['unfrozen'].freeze) }
+
+# Block conversion can change a borrowed source before the method binds.
+conversion_source = [1]
+conversion = Object.new
+conversion.define_singleton_method(:to_proc) { conversion_source << 2; proc {} }
+converted_capture = isolation.capture(*conversion_source, &conversion)
+p [:conversion_appends_source, converted_capture.call, conversion_source]
+replacement_source = [1]
+replacement = Object.new
+replacement.define_singleton_method(:to_proc) { replacement_source[0] = 9; proc {} }
+replaced_capture = isolation.capture(*replacement_source, &replacement)
+p [:conversion_replaces_source, replaced_capture.call, replacement_source]
+prefix_source = [1]
+prefix_capture = isolation.capture(0, *prefix_source)
+prefix_source << 2
+p [:prefix_is_independent, prefix_capture.call]
+
+expression_source = [1]
+expression_capture = isolation.capture(*expression_source, &(expression_source << 2; proc {}))
+p [:block_expression_source, expression_capture.call]
+refusal_source = [1]
+refusal = Object.new
+def refusal.to_proc = raise('conversion refused')
+begin
+  isolation.capture(*refusal_source, &refusal)
+rescue => error
+  p [:conversion_refusal, error.class, error.message]
+end
+check_anonymous_isolation(:after_conversion_refusal) { isolation.through }
+
+def anonymous_mutating_block(source)
+  source << 2
+  proc {}
+end
+called_source = [1]
+called_capture = isolation.capture(*called_source, &anonymous_mutating_block(called_source))
+p [:called_block_snapshot, called_capture.call, called_source]
+
+class AnonymousConversionValue
+  def initialize = @value = :retained
+  attr_reader :value
+end
+gc_conversion = Object.new
+gc_conversion.define_singleton_method(:to_proc) { GC.start; proc {} }
+gc_capture = isolation.capture(*[AnonymousConversionValue.new], &gc_conversion)
+GC.start
+p [:conversion_source_survives_gc, gc_capture.call.map(&:value)]

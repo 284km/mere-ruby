@@ -7,7 +7,9 @@ empty call and an existing input splat that Ruby can borrow. Nested anonymous
 forwarding created another Array at each frame. Use an immutable native list
 in the existing VIcl representation, held by its owning method frame. A
 captured closure retains that frame and GC follows the payload's Ruby values.
-A named rest remains an ordinary independent Ruby Array.
+Eligible borrowed splats retain their original Array and frozen state;
+a synthesized rest uses native storage until observed. A named rest remains
+an ordinary independent Ruby Array.
 
 The parameter and slot use an internal name containing a tilde. Ruby locals,
 named rest parameters and Binding writes with the old implementation spelling
@@ -63,8 +65,8 @@ Array instead of leaking an internal value or a generic StandardError.
 
 Retain the source Array of an eligible anonymous splat, including its frozen
 state and later mutations. A reserved non-handle slot in the existing splat
-note table carries source identity; one fixed native integer slot holds the
-suffix length. The existing nonempty-note binder branch snapshots the actual
+note table carries source identity; fixed native integer slots hold the
+suffix and original spread lengths. The existing nonempty-note binder branch snapshots the actual
 source value in a private frame slot before defaults may call Ruby.
 The collector follows a pending source handle. Binding consumes the note and
 removes the frame metadata when the anonymous rest is installed. Native leaf,
@@ -103,3 +105,36 @@ boxing its id and lengths in another list. All 47 regression output lines
 still match both engines with GC stress 50; the three source gates pass.
 Repeat the hardware measurement before claiming that the performance issue
 is resolved. No allocation counter or unused Ruby object changes.
+
+## Preserve callback order without adding generic keyword work
+
+Array provenance alone is not a flagged Hash: parse keyword formals only
+when the actual trailing Hash has a ruby2_keywords splat note. For an
+anonymous source, record the original spread span and derive its positional
+prefix. A sole anonymous rest with no prefix keeps the source directly;
+mixed signatures store native prefix metadata and borrow only for the same
+leading-argument boundary, without optional/post or ruby2_keywords copying.
+This replaces an element-by-element guard and preserves later source
+mutation during to_proc.
+
+Scope pending Array provenance across block conversion and root the source
+with the existing temporary-iterator root while callbacks can run GC. A
+conversion exception removes that scoped state. CRuby's compile.c
+setup_args_dup_rest_p distinguishes a simple block-variable read from a
+block expression that may modify the splat: the former retains the source
+through to_proc, while the latter snapshots before evaluating the expression.
+Mirror that distinction without creating an unused Ruby snapshot Array.
+The VM retains its own splatarray copy flag.
+
+The extended regression checks simple to_proc append/replacement, complex
+block-expression snapshots, positional-prefix independence, conversion
+errors and subsequent calls, and an ephemeral source Array across explicit
+GC in conversion. Performance and all final-head replay results must pass
+before this draft is pushed again.
+
+All 55 corpus 991 output lines match clean Ruby 4.0.10 on evaluator and VM
+with GC stress 50, including the ephemeral conversion-source lifetime case.
+The separate four-case conversion probe also matches both engines. GC-root,
+duplicate-definition and dead-definition gates pass. The final hardware,
+whole-file allocation and complete corpus results are still required. Batch
+these follow-ups locally and push once those local checks pass.
