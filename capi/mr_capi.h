@@ -69,7 +69,8 @@ enum mr_op {
                          * dispatch -- the collector's reader only (a dmark between C calls) */
     MR_SAFEPOINT = 33,  /* (nothing) -- a collection may run here, when one is due (mr_up); -> how many to pass over */
     MR_FREEZE = 34,     /* a: object -> 1 frozen, 2 a String frozen now, 0 not a String/Array/Hash (send #freeze) */
-    MR_ARY_APPEND = 35  /* a: Array, b: index, c: value -> 1 stored at the end, 0 (send #[]=) */
+    MR_ARY_APPEND = 35, /* a: Array, b: index, c: value -> 1 stored at the end, 0 (send #[]=) */
+    MR_MIXIN = 36      /* a: target, b: module, c: 0 include, 1 prepend, 2 extend; no Ruby hooks */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
     /* (16: the receiver is the current one)
