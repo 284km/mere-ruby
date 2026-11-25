@@ -52,3 +52,28 @@ the portable record includes the filename mapping and full source hashes,
 and the renamed programs plus 331 were replayed on both modes.
 
 Detailed portable validation: unittest/records/parse-multibyte-source.json.
+
+
+## Review follow-up
+
+Regexp classes and group skippers now consume a whole character in the pattern encoding; class
+ranges use encoded character values. A backslash before a non-ASCII character also consumes the
+complete source character in strings, regexps, symbols, words and heredocs. Corpus 991 covers
+Windows-31J, Big5 and GBK through main scripts, require, eval and instance_eval, including
+Regexp.new and scan. GB18030 and Regexp.escape/union remain separate pre-existing follow-ups.
+
+Runtime f73f8c90, ordinary O2. Full corpus --both: 881/881 ON/OFF (1192.326 s, 1,195,488 KiB). VM:
+881 / 0 fallback / 0 differences (526.547 s, 1,149,856 KiB). Eight prefix source gates and default
+hygiene pass; generated C needs 155 of the unchanged 1024 bracket limit.
+
+All 7 related CRuby files are COMPLETE on both engines and lose no previously passing case. Existing
+nonpasses are retained in the portable record. Parse-heavy mapper instruction medians: 169,609,105
+to 169,985,626 (+0.22%), with all three alternating samples preserved. Fixed-seed m17n_comb RSS
+after the review change is 789,792 KiB evaluator / 936,704 KiB VM; the earlier repeated
+main/candidate range above remains the context for its substantial variation.
+
+test_regexp remains 176 tests / 62,595 assertions / 4 failures / 3 errors on both main and
+candidate, with identical passing identities; the reference itself reports one failure and one error in this
+local cohort. These are not described as an all-pass file.
+
+Portable review validation: unittest/records/parse-multibyte-review.json.
