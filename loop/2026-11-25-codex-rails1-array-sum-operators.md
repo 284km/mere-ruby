@@ -16,7 +16,7 @@ tools/ref_ruby.sh: Ruby 4.0.10, revision
 a704b7cd95a42cc0cf5f307137bf3aac0285b915, no extra gems and Prism 1.8.2.
 No reference gem-directory installation was performed.
 
-Final corpus --both: 942/942 with hash index ON and OFF, 1273.029 seconds,
+Earlier fd7f5acb corpus --both: 942/942 with hash index ON and OFF, 1273.029 seconds,
 maximum family RSS 1,193,648 KiB. VM corpus: 942 VM, zero fallback and zero
 differences, 346.774 seconds, maximum family RSS 1,323,728 KiB. All eight
 source gates and default record hygiene pass. The fresh run replaces an
@@ -49,3 +49,25 @@ and engines. These retained baseline failures are not called all-pass.
 
 Portable evidence:
 railstest/framework/records/activesupport-array-sum-operators.json.
+
+Review follow-up, runtime 8a18fffc: a general accumulator may return an Integer
+or Float. The block route now retains general Ruby + dispatch after that
+transition, while numeric-only sums retain the native path. Corpus 945
+adds Integer/Float return and addend transition controls. Focused corpus
+945/426/593 matches reference on both engines.
+
+The fresh exact-runtime full corpus passes 942/942 in both hash modes; VM
+reports 942 VM / 0 fallback / 0 differences. Selected CRuby sum cases pass
+2 tests / 156 assertions in all five executions. The whole Array/Enum
+results above belong to fd7f5acb and are retained as earlier coverage, not
+claimed as whole-file results on this final runtime.
+
+Three fresh alternating Rails pairs again change Enumerable 33/1 to 34/0
+and keep TimeWithZone 174/0, all COMPLETE. Peak family RSS in KiB:
+
+| File | main | candidate |
+| --- | --- | --- |
+| enumerable_test.rb | 288448 / 368208 / 321488 | 289232 / 288272 / 361456 |
+| time_with_zone_test.rb | 456544 / 454896 / 456528 | 490992 / 459456 / 458960 |
+
+The samples vary; no stable memory improvement is claimed.
