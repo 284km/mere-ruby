@@ -42,10 +42,33 @@ Plain-object controls at 100000 iterations measured main evaluator/VM
 3.5x ratio is workload-dependent; this record reports the observed growth
 and reduction, without claiming to reproduce that exact ratio.
 
-## Acceptance still running
+## Completed acceptance
 
-Full `run_corpus.sh --both` and `MERE_RUBY_VM=1 run_corpus.sh --both`
-sweeps, their source gates, bracket-depth checks and record_hygiene are
-queued. Results will be recorded after completion. The checks above are
-not a full-corpus claim. No full unit suite or Rails component suite was
-run and no workflow is changed.
+sh run_corpus.sh --both: 884/884 pass, hash indexing ON and OFF.
+MERE_RUBY_VM=1 sh run_corpus.sh --both: 884/884 pass, indexing ON/OFF.
+Both complete commands pass all source gates and full record_hygiene.
+The generated-C bracket gate passes, 155 required / 1024 supplied.
+No full unit suite or Rails component suite was run; no workflow changed.
+
+## Review correction: production helpers in the packed-mark gate
+
+The human review reproduced a real PR-specific CI failure: the owner-parser
+slice calls sng_key_id without including its definition. Running the same
+gate locally reproduced unbound variable: sng_key_id before the correction.
+The checker now extracts the production sng_key_id and its is_digit helper
+from the source files and includes them before the owner parser. Four new
+checks cover an object-singleton method, a bare object singleton, a nested
+singleton and an object-singleton constant owner. The real compiler runs
+both ordinary O2 and ASan/UBSan probes successfully.
+
+This follow-up changes only the Python gate and this completed note. All
+runtime Mere files, corpus programs and the measured ordinary O2 binary
+are unchanged from 215d866e; the completed corpus, upstream and RSS results
+above therefore apply without claiming a fresh runtime compilation.
+The gate correction, its regression expectations and this note are pushed
+together. Source gates and record hygiene are repeated before pushing.
+
+The optional anonymous-parent mark suggestion remains a follow-up. The
+review could not expose it in Ruby behavior and classified it nonblocking;
+other roots currently preserve those parents on both main and the PR.
+This gate-only correction does not change the collector's mark policy.
