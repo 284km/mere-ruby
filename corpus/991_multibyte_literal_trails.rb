@@ -60,3 +60,19 @@ Dir.mktmpdir('corpus-991-review-') do |dir|
     Object.new.instance_eval(source, path)
   end
 end
+
+# The same bytes compile independently in binary and multibyte encodings.
+p Regexp.new("[\xE3\x81\x82]".b) =~ "\x81".b
+p(/[あ]/ =~ "あ")
+p Regexp.new("[\xE3\x81\x82\xE3\x81\x84]".b) =~ "\x84".b
+p "かい".sub(/[あい]/, "!")
+p(/[え]/ =~ "え")
+p Regexp.new("[\xE3\x81\x88]".b) =~ "\x88".b
+p Regexp.new("\xE3\x81\x86+".b).match("\x86\x86".b).to_s.bytes
+p(/う+/.match("うう").to_s)
+sj = "[あ]".encode("Windows-31J")
+p Regexp.new(sj.b) =~ "\xA0".b
+p Regexp.new(sj) =~ "あ".encode("Windows-31J")
+sj = "[い]".encode("Windows-31J")
+p Regexp.new(sj) =~ "い".encode("Windows-31J")
+p Regexp.new(sj.b) =~ "\xA2".b
