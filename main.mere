@@ -6586,7 +6586,14 @@ and defined_self_has = fn env -> fn world -> fn (name: str) ->
 and defined_self_rtm = fn env -> fn world -> fn (name: str) ->
   lv_has env "self"
   && (let sv9 = lv_get env "self" in
-      let c9 = dispatch_cls_of world sv9 in
+      // (a class asks its OWN #respond_to_missing?, a singleton method: the
+      //  one its instances have is not the class's. `defined?(file_fixture_
+      //  path)` in a class method of a class that includes a module with
+      //  #respond_to_missing? called the instances' on the class, and its
+      //  `super` was a NoMethodError -- ActiveRecord::TestFixtures.fixtures)
+      let c9 = (match sv9 with
+                | VClass cc9 -> "(sng:" ++ cc9 ++ ")"
+                | _ -> dispatch_cls_of world sv9) in
       (if str_eq c9 "" then false else has_meth world c9 "respond_to_missing?")
       && truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) sv9
                    "respond_to_missing?" (Cons (VSym name, Cons (VBool true, Nil))) false))
@@ -7419,7 +7426,14 @@ and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
   //   `M.const_set(:Z, Class.new)` and `m::X = Class.new` left the class
   //   nameless -- `#name` answered nil for something that has a constant
   //   pointing at it. This is the one door every constant comes through.
-  let _ = name_anon key v in
+  // (...and an instance of a Module SUBCLASS is named through the module it
+  //  backs: `Topic.const_set(:GeneratedAttributeMethods, GAM.new)` -- its
+  //  #name and #inspect read "Topic::GeneratedAttributeMethods")
+  let _ = name_anon key (match v with
+                         | VObj _ -> (if mod_inst_is world v
+                                      then (let _ = map_set modinst_named "y" 1 in mod_inst_backing world v)
+                                      else v)
+                         | _ -> v) in
   // `const_added(:NAME)` on the module the constant landed in -- Object for a
   // bare one. This is the only door constants come through, so the hook cannot
   // be missed; the flag keeps a program that never defines it from paying a
@@ -8792,6 +8806,15 @@ and capi_construct = fn world -> fn (cls: str) -> fn (args: Val list) -> fn blk 
 and capi_require_file = fn env -> fn world -> fn (path: str) ->
   let n = mr_capi_open (feat_realpath path) in
   // (the collector's reader, for a dmark that runs between C calls)
+  let _ = (if n < 0 then 0 else mr_capi_gc_reader capi_gc_read) in
+  if n < 0 then false
+  else (let _ = capi_enter env world (CapiReq { op = 2, a = n, b = 4, c = 0, d = 4, e = 0 }) Nil in true)
+// ...and of one of ruby's extensions linked into this executable
+// (capi/static_ext.c): run its Init_. Answers false where there is none -- a
+// build with no C side -- and `require` raises LoadError, as ruby's miniruby
+// does for erb/escape.
+and capi_require_static = fn env -> fn world -> fn (feature: str) ->
+  let n = mr_capi_static_open feature in
   let _ = (if n < 0 then 0 else mr_capi_gc_reader capi_gc_read) in
   if n < 0 then false
   else (let _ = capi_enter env world (CapiReq { op = 2, a = n, b = 4, c = 0, d = 4, e = 0 }) Nil in true)
@@ -15223,6 +15246,8 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     //   while the method said the environment. Ask once, here.
     // (through a singleton too: pp.rb's `class << ENV` retags it)
     if str_eq cls "EnvHash" || (is_sng_cls cls && str_eq (sng_supername world cls) "EnvHash") then inspect_w env world (mkhash (env_hash_list ()))
+    // (an instance of a Module subclass that a constant names: mod_inst_name_s)
+    else if (if usr9 then false else true) && (if str_eq (mod_inst_name_s world v) "" then false else true) then mod_inst_name_s world v
     // a BasicObject has no #inspect (Kernel's is Object's): `p b` and
     // `[b].inspect` are ruby's NoMethodError, unless it defined one
     // (...unless it has a #method_missing, which an undefined name reaches
@@ -16508,6 +16533,11 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           && (map_has (name_set "modpriv") name0 || str_eq name0 "refine" || str_eq name0 "using") then
     raise_exc_iv world "NoMethodError" ("private method '" ++ name0 ++ "' called for module " ++ inspect_w env world recv0)
       (Cons (("__name", VSym name0), Cons (("__recv", recv0), Nil)))
+  // (...and it prints as the constant that names it, once one does)
+  else if (str_eq name0 "inspect" || str_eq name0 "to_s") && (match args0 with Nil -> true | _ -> false)
+          && (if str_eq (mod_inst_name_s world recv0) "" then false else true)
+          && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
+    mkstr (mod_inst_name_s world recv0)
   else if mod_inst_delegates world recv0 name0 then
     (let _ = (if str_eq name0 "define_method" || ((str_eq name0 "private" || str_eq name0 "public" || str_eq name0 "protected") && (match args0 with Nil -> false | _ -> true)) then frz_recv_check env world recv0 else ()) in
      invoke_val_c env world blk (mod_inst_backing world recv0) name0 args0 vischeck)
@@ -18177,6 +18207,14 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                           if has_meth world cls "to_s"
                           then str_of (invoke world noblk h cls "to_s" Nil) e0
                           else app e0 (to_s h) "US-ASCII")))
+                 // a class or module is asked its #to_s too: one a program
+                 // gave the class (minitest's spec classes answer the name
+                 // they were described with, from a module they extend) is
+                 // what a join of `[cls, "desc"]` has to show
+                 | VClass _ ->
+                   (match invoke_val_c env world noblk h "to_s" Nil false with
+                    | VStr sh -> app e0 (sget sh) (enc_canon_name (senc_get sh))
+                    | _ -> app e0 (to_s h) "US-ASCII")
                  | _ -> app e0 (to_s h) "US-ASCII") in
               ljoin t e1 false)) in
         // ⚠ the TOP level is walked as ruby walks it, by index on the array as
@@ -25410,6 +25448,13 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        //  fresh one would be the old one again)
        | Cons (v9, _) -> v9
        | _ -> VNil)
+    // (`require "erb/escape"`: the extension linked into this executable)
+    else if str_eq c "Kernel" && (str_len name == 21 && str_eq name "__capi_static_require") then
+      (match args with
+       | Cons (VStr h9, _) ->
+         (if capi_require_static env world (sget h9) then VBool true
+          else raise_exc world "LoadError" ("cannot load such file -- " ++ sget h9))
+       | _ -> VNil)
     else if str_eq c "Kernel" && (str_len name == 17 && str_eq name "__resolve_feature") then
       (match args with
        | Cons (VStr h9, _) -> resolve_feature env world (sget h9)
@@ -27685,7 +27730,9 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           then (let l9 = builtin_frame_label world mrecv mnm in
                 if str_len l9 > 0 then VClass (substring l9 0 (str_index_of l9 "#"))
                 else VClass (display_cls world (dispatch_cls_of world mrecv)))
-          else VClass (impl_public mown))
+          // (a method of the module an instance of a Module subclass backs is
+          //  owned by that INSTANCE: mod_inst_self)
+          else mod_inst_self (impl_public mown))
        // The same four as UnboundMethod (see there): the defined-as name, the
        // definition further up, a copy, and a hash. A bound Method's owner may
        // be empty (a method reached on a primitive receiver), in which case the
@@ -29784,8 +29831,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                    | _ -> VNil))
           else raise_exc world "TypeError" ("bind argument must be an instance of " ++ cls_display world (if str_eq rt9 "" then ucls else rt9)))
        else if (str_len name == 4 && str_eq name "name") then VSym unm
+       // (...the INSTANCE of a Module subclass when the method lives in the
+       //  module it backs: ActiveRecord's method_missing walks
+       //  `method.super_method while !method.owner.is_a?(GeneratedAttribute
+       //  Methods)`, and the owner was a plain anonymous Module)
        else if (str_len name == 5 && str_eq name "owner") then
-         VClass (impl_public (if method_core_has_field id 2
+         mod_inst_self (impl_public (if method_core_has_field id 2
                  then method_text_or ucls (method_core_field id 2)
                  // (a builtin's: where ruby defines it, as for Method#owner)
                  // ⚠ the ANCESTOR that defines it, not the class asked: has_meth
@@ -34348,8 +34399,15 @@ and warning_emit = fn world -> fn (s: str) -> fn (cat: Val) ->
 // prelude's Enumerable is a module IN the method table (Enumerable__Impl), so
 // asking whether the class "has" the name calls every Enumerable receiver
 // user-defined. The owner is the question.
+// (a class is asked through its SINGLETON class: a class method of the
+//  program's own -- ActiveRecord's `Account.count(:firm_id) { true }`, which
+//  `delegate` defines -- is not the builtin Enumerable#count, and its block
+//  was dropped with "given block not used")
 and builtin_answers = fn world -> fn (recv: Val) -> fn (name: str) ->
-  (let own9 = owner_anc world (ancestors_of world (dispatch_cls_of world recv)) name in
+  (let c9 = (match recv with
+             | VClass cc9 -> "(sng:" ++ cc9 ++ ")"
+             | _ -> dispatch_cls_of world recv) in
+   let own9 = owner_anc world (ancestors_of world c9) name in
    str_eq own9 "" || str_eq own9 "Enumerable__Impl")
 
 // `h.fetch(k, default) { }` / `[].fetch(i, default) { }` / `ENV.fetch(k, d) { }`
@@ -34936,6 +34994,15 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                 && (match newblk with (false, _, _, _) -> false | _ -> true)
                 && builtin_answers world recv name
              then rb_warn world "block supersedes default value argument" else ()) in
+    // Enumerator#first / #take take no block, and a block given to one is
+    // not called: the walk still stops at the count. `enum.first(4) do
+    // |batch| ... end` (activerecord's find_in_batches test) went to the
+    // iterator path and ran the whole enumerator -- 12 queries for 4 batches.
+    if ((str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "take"))
+       && (match newblk with (false, _, _, _) -> false | _ -> true)
+       && (match recv with VObj _ -> str_eq (dispatch_cls_of world recv) "Enumerator" | _ -> false) then
+      invoke_val_c env world blk recv name args false
+    else
     if (arg_beats_block name
         // Array#index is find_index under another name (String#index takes no block)
         || (str_len name == 5 && str_eq name "index" && (match recv with VArr _ -> true | _ -> false)))
@@ -39720,6 +39787,23 @@ and sng_mixin_syms = fn world -> fn (sng: str) -> fn (skip: Val list) ->
 //   and evaluation names go to it -- unless the subclass defines the name.
 //   The names that describe the OBJECT (singleton_class, ivars, allocate,
 //   superclass) stay with the object.
+// the name an instance of a Module subclass prints as: the constant it was
+// assigned to (through the module it backs), or "" while it has none --
+// Module#inspect and #to_s, which are the object's own until then
+and mod_inst_name_s = fn world -> fn (recv: Val) ->
+  if map_len modinst_named == 0 then "" else
+  match recv with
+  | VObj id ->
+    (let (_, _, _, iv9) = world in
+     let k9 = str_of_int id ++ "@__modbk" in
+     if map_has iv9 k9 then
+       (match map_get iv9 k9 with
+        | VClass c9 ->
+          (let n9 = (if map_has anon_name c9 then (match map_get anon_name c9 with VStr h9 -> sget h9 | _ -> "") else "") in
+           if str_len n9 >= 2 && str_eq (substring n9 0 2) "#<" then "" else n9)
+        | _ -> "")
+     else "")
+  | _ -> ""
 and mod_inst_delegates = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VObj id ->
@@ -40557,6 +40641,11 @@ and responds_x0 = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: 
     // ...and a subclass of a thread primitive inherits the builtin's
     // (prim_sub): `MyQ.new.respond_to?(:push)` was false
     || (map_len prim_sub > 0 && map_has prim_sub cls && builtin_pub_meth (map_get prim_sub cls) name)
+    // ...and a SUBCLASS of Fiber inherits Fiber's (the row above is asked by
+    // the object's own class name): `class F < Fiber; def join; resume while
+    // alive?; end; end` -- the bare `alive?` was a NameError
+    || (fb_inst_name name && (if str_eq cls "Fiber" then false else true) && obj_is_a world cls "Fiber"
+        && (if map_len undefs > 0 && undef_blocked world cls name then false else true))
     // ...and what `instance_methods` lists for the class (Kernel's,
     // BasicObject's, Comparable's): `o.respond_to?(:instance_eval)` was false
     // for a name the list named and the object answered
@@ -48192,6 +48281,21 @@ and range_case_equal_native = fn world -> fn (recv: Val) -> fn (args: Val list) 
            ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)")
 
 and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn (args: Val list) ->
+  // An alias of a builtin that changes its receiver refuses a frozen one, as
+  // the builtin does under its own name. The frozen check is asked with the
+  // name that was CALLED, and the alias's name is not a mutator's:
+  // HashWithIndifferentAccess writes through `alias_method :regular_writer,
+  // :[]=`, and `Book.statuses["bad"] = 40` changed a frozen enum mapping.
+  let _ = (if val_frozen_mut recv && is_mutating_method src
+              && (match recv with
+                  | VStr _ -> (if str_len src == 6 && str_eq src "delete" then false else true)
+                  | VArr _ -> true
+                  | VHsh _ -> true
+                  | _ -> false)
+           then (let _ = raise_exc_iv world "FrozenError"
+                           ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect env world recv)
+                           (Cons (("__recv", recv), Nil)) in ())
+           else ()) in
   match (recv, args) with
   // (an alias of a builtin definition hook is that no-op hook, not the name
   //  asked again: `alias_method :included_orig, :included` and then a new
@@ -52882,6 +52986,37 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // super from a method of a primitive subclass (Array/String/Hash) into the
   // builtin base: use the builtin implementation.
   let hk = hng_key recv in
+  // ⚠ ...which refuses a FROZEN receiver, as the builtin does when it is
+  //   called by its own name. The frozen check lives at the doors a call
+  //   comes through by name, and it is skipped there for a name the class
+  //   defines itself -- so `def delete(k) = super(convert_key(k))`
+  //   (HashWithIndifferentAccess) deleted from a frozen Hash, and
+  //   `Book.statuses.delete("published")` changed a frozen enum mapping.
+  //   (Array#delete of an element that is not there changes nothing and is
+  //   no error, delete_is_noop; String#delete answers a new string. A bang
+  //   method that answers an Enumerator without a block, and an arity error,
+  //   come first, as at the direct door.)
+  let frz_skip9 = enum_needs_block meth
+                  || (transform_bang_bare meth args && (let (hb9, _, _, _) = superblk in if hb9 then false else true))
+                  || arr_mut_arity_wrong recv meth args in
+  let _ = (if frz_skip9 then () else match recv with
+           | VStr _ -> (if val_frozen_mut recv && is_mutating_method meth && (if str_eq meth "delete" then false else true)
+                        then (let _ = raise_exc_iv world "FrozenError"
+                                        ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect gc_cenv0 world recv)
+                                        (Cons (("__recv", recv), Nil)) in ())
+                        else ())
+           | VArr _ -> (if val_frozen_mut recv && is_mutating_method meth
+                           && (if delete_is_noop gc_cenv0 world recv meth args then false else true)
+                        then (let _ = raise_exc_iv world "FrozenError"
+                                        ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect gc_cenv0 world recv)
+                                        (Cons (("__recv", recv), Nil)) in ())
+                        else ())
+           | VHsh _ -> (if val_frozen_mut recv && is_mutating_method meth
+                        then (let _ = raise_exc_iv world "FrozenError"
+                                        ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect gc_cenv0 world recv)
+                                        (Cons (("__recv", recv), Nil)) in ())
+                        else ())
+           | _ -> ()) in
   // BasicObject#instance_exec / #instance_eval from an override's `super`
   // (an Array or Hash subclass's too): the builtin arm, once, with the
   // block -- bi_skip passes the override that called super
@@ -63874,7 +64009,14 @@ and math_conv_args = fn env -> fn world -> fn (xs: Val list) ->
 // The class a FrozenError names: rb_obj_class as ruby prints it, so an
 // anonymous class is #<Class:0x...> rather than the internal name (an object
 // with a singleton class still names its real class).
-and frz_cls = fn world -> fn (v: Val) -> cls_display world (class_name v)
+// (the class a frozen value is said to be: its own, a subclass's too --
+//  "can't modify frozen HashWithIndifferentAccess", not "frozen Hash")
+and frz_cls = fn world -> fn (v: Val) ->
+  match v with
+  | VStr _ -> cls_display world (dispatch_cls_of world v)
+  | VArr _ -> cls_display world (dispatch_cls_of world v)
+  | VHsh _ -> cls_display world (dispatch_cls_of world v)
+  | _ -> cls_display world (class_name v)
 
 and math_conv_redef = fn env -> fn world -> fn (h: Val) -> fn (cls: str) ->
   if has_meth world cls "to_f" then
