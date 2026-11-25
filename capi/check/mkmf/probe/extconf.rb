@@ -14,6 +14,13 @@ $defs << '-DMKMF_PROBE_STDC' if have_macro('__STDC__')
 $defs << '-DMKMF_PROBE_NO_MACRO' if have_macro('NO_SUCH_MACRO_ANYWHERE')
 check_sizeof('long')
 have_library('m', 'floor')
+# (OpenSSL, as an extension with TLS of its own looks for it -- puma's
+#  MiniSSL: dir_config reads configure's --with-openssl-dir back out of
+#  RbConfig where the ruby was built against a named installation, and the
+#  header and both libraries are found there; elsewhere on the compiler's own
+#  paths)
+dir_config('openssl')
+$defs << '-DMKMF_PROBE_OPENSSL' if have_header('openssl/ssl.h') && have_library('crypto', 'BIO_read') && have_library('ssl', 'SSL_CTX_new')
 $defs << '-DMKMF_PROBE_NOTE=7'
 create_header
 create_makefile('mkmf_probe')

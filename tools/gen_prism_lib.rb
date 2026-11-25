@@ -29,7 +29,8 @@
 require "rbconfig"
 dir = ARGV[0] || RbConfig::CONFIG["rubylibdir"]
 here = File.expand_path("..", __dir__)
-files = [["prism/prism", "#{here}/lib/prism_ext.rb"]]
+files = [["prism/prism", "#{here}/lib/prism_ext.rb"],
+         ["mere/backtrace_node_id", "#{here}/lib/backtrace_node_id.rb"]]
 names = ["prism"] + Dir.glob("#{dir}/prism/**/*.rb").sort.map { |f| f.delete_prefix("#{dir}/").delete_suffix(".rb") }
 names.delete("prism/ffi")
 names.each { |n| files << [n, "#{dir}/#{n}.rb"] }

@@ -36,9 +36,15 @@ snippets.each do |src|
     end
     if mine_a != ra
       require "pp"
-      File.write("/tmp/ma.txt", mine_a.pretty_inspect); File.write("/tmp/ra.txt", ra.pretty_inspect)
-      puts `diff /tmp/ma.txt /tmp/ra.txt | head -20`
+      # (in a directory of its own: CI runs this beside other jobs' files)
+      require "tmpdir"
+      Dir.mktmpdir("cwr") do |d|
+        File.write(File.join(d, "ma.txt"), mine_a.pretty_inspect); File.write(File.join(d, "ra.txt"), ra.pretty_inspect)
+        puts `diff #{File.join(d, "ma.txt")} #{File.join(d, "ra.txt")} | head -20`
+      end
     end
   end
 end
 puts "ok=#{ok} bad=#{bad}"
+# (non-zero when a snippet differs: a check CI runs)
+exit(bad == 0 ? 0 : 1)

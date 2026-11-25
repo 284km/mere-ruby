@@ -6449,6 +6449,30 @@ let core_prelude_f =
   "    end\n" ++
   "  end\n" ++
   "\n" ++
+  "  # The child's standard three are BLOCKING, as ruby makes them just before\n" ++
+  "  # exec (process.c, stdfd_clear_nonblock: \"many programs cannot deal with\n" ++
+  "  # non-blocking stdin/stdout/stderr\"). An IO.pipe's ends are non-blocking\n" ++
+  "  # here as in ruby, and a child handed one as its stdout stopped at the\n" ++
+  "  # first full pipe -- curl's \"Resource temporarily unavailable\" after 64 KB,\n" ++
+  "  # puma's test_form_data_encoding_windows. The flag is the open file\n" ++
+  "  # description's, which the parent's copy shares, so clearing it here before\n" ++
+  "  # the child starts is what ruby's child does to it after fork. Each of 0, 1\n" ++
+  "  # and 2 is the descriptor a redirect gives it (a [:child, fd] one: that\n" ++
+  "  # fd's), or this process's own when none does; a file a redirect opens is\n" ++
+  "  # opened blocking, and a closed one is nothing to clear.\n" ++
+  "  def self.__std_blocking(rdl, latel)\n" ++
+  "    src = ->(f) do\n" ++
+  "      r = rdl.find \{ |g, _| g == f }\n" ++
+  "      next f if r.nil?\n" ++
+  "      v = r[1]\n" ++
+  "      v = v.to_io if !v.is_a?(IO) && !v.is_a?(Integer) && v.respond_to?(:to_io)\n" ++
+  "      v.is_a?(Integer) ? v : v.is_a?(IO) ? v.fileno : v == :in ? 0 : v == :out ? 1 : v == :err ? 2 : nil\n" ++
+  "    end\n" ++
+  "    [0, 1, 2].map do |f|\n" ++
+  "      l = latel.find \{ |g, _| g == f }\n" ++
+  "      l ? (l[1].is_a?(Integer) ? src.(l[1]) : nil) : src.(f)\n" ++
+  "    end.compact.uniq.each \{ |fd| IO.__fdblock(fd) if fd >= 0 }\n" ++
+  "  end\n" ++
   "  # spawn's direct path: argv and the environment as proc_spawn takes them,\n" ++
   "  # the redirects as file actions. Every SOURCE is first copied to a high\n" ++
   "  # descriptor of its own and only then put in place, so a rotation\n" ++
@@ -6761,6 +6785,7 @@ let core_prelude_f =
   "    #   deadlocked). The shell path opens it in the child's own shell.\n" ++
   "    fifo = rdl.any? \{ |_, v| pth = v.is_a?(Array) ? v[0] : v; pth.is_a?(String) && File.pipe?(pth) }\n" ++
   "    raise NotImplementedError, \"a new session needs the direct spawn\" if pty_session && (shell_only || fifo)\n" ++
+  "    __std_blocking(rdl, latel)\n" ++
   "    unless shell_only || fifo\n" ++
   "      STDOUT.flush\n" ++
   "      STDERR.flush\n" ++
@@ -9843,11 +9868,12 @@ let core_prelude_j =
   "      raise RuntimeError, \"cannot get AST for ISEQ compiled by prism\"\n" ++
   "    end\n" ++
   "    # (the node of the file's Prism tree the frame was running: see\n" ++
-  "    #  Prism.__node_id_for_location in lib/prism_ext.rb)\n" ++
+  "    #  the helper in lib/backtrace_node_id.rb)\n" ++
   "    def self.node_id_for_backtrace_location(loc)\n" ++
   "      raise TypeError, \"Thread::Backtrace::Location object expected\" unless loc.class.name == \"Thread::Backtrace::Location\"\n" ++
   "      require \"prism\"\n" ++
-  "      Prism.__node_id_for_location(loc)\n" ++
+  "      require \"mere/backtrace_node_id\"\n" ++
+  "      __node_id_for_location(loc)\n" ++
   "    end\n" ++
   "    def self.parse_file(path, **kw)\n" ++
   "      src = File.read(path)\n" ++
@@ -13046,6 +13072,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = set_meth meths "(sng:Kernel)#require_relative"
     (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require_relative", Cons (EVar "path", Nil))), Nil))) in
   let _ = set_meth meths "Exception#initialize" (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil), Cons (SIVarAssign ("__exception_message", EVar "msg"), Nil))) in
+  let _ = set_private "Exception#initialize" VNil in
   // An Errno class's message is the SYSTEM's text, and `.new` has to say the
   // same thing `raise` does: `Errno::EINVAL.new.message` is "Invalid argument",
   // not the class name, and with an argument it reads "<text> - <arg>". raise
@@ -13138,6 +13165,9 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
            Cons (SIVarAssign ("__sigpair", ECall ("__signal_pair", Cons (ESym "INT", Nil))),
              Cons (SIVarAssign ("__exception_message",
                      EBin ("||", EVar "msg", EStrL "Interrupt")), Nil)))) in
+  let _ = set_private "SystemCallError#initialize" VNil in
+  let _ = set_private "SignalException#initialize" VNil in
+  let _ = set_private "Interrupt#initialize" VNil in
   let _ = set_meth meths "SignalException#signo"
     (Meth (Nil, Nil, Cons (SExpr (EMethod (EIVar "__sigpair", "[]", Cons (EInt 0, Nil))), Nil))) in
   // #signm is the MESSAGE, not the resolved name: `SignalException.new(2)`
@@ -13609,7 +13639,14 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
                      //  hands this to that library's configure.)
                      Cons (mkstr "host", Cons (mkstr (rcpu ++ "-" ++ rvend ++ "-" ++ ros ++ (if str_eq (mr_capi_libc ()) "" then "" else "-" ++ mr_capi_libc ())),
                      Cons (mkstr "host_alias", Cons (mkstr "",
-                     rbc_facts))))))))))))
+                     // (the OpenSSL the build linked, as ruby's configure is
+                     //  told it -- mkmf's dir_config("openssl") reads it from
+                     //  here, and an extension with TLS of its own, puma's
+                     //  MiniSSL, finds the same headers and library. No
+                     //  directory named, no argument: the prelude's '' stands.)
+                     (if str_eq (mr_capi_openssl_dir ()) "" then rbc_facts
+                      else Cons (mkstr "configure_args", Cons (mkstr ("'--with-openssl-dir=" ++ mr_capi_openssl_dir () ++ "'"),
+                      rbc_facts)))))))))))))))
                    else rbc_facts) in
   let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr ros, Cons (mkstr "arch", Cons (mkstr rarch, Cons (mkstr "ruby_version", Cons (mkstr rver, Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "EXECUTABLE_EXTS", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr (rlp ++ "/site_ruby/" ++ rver), Cons (mkstr "rubylibprefix", Cons (mkstr rlpgem, Cons (mkstr "rubylibdir", Cons (mkstr rld, Cons (mkstr "rubyarchdir", Cons (mkstr rad, Cons (mkstr "DLEXT", Cons (mkstr (if str_eq (sys_os ()) "darwin" then "bundle" else "so"), Cons (mkstr "UNICODE_VERSION", Cons (mkstr "17.0.0", Cons (mkstr "UNICODE_EMOJI_VERSION", Cons (mkstr "17.0", rbc_facts))))))))))))))))))))))))))))))) in
   // UNICODE_VERSION / UNICODE_EMOJI_VERSION are the REFERENCE ruby's, asked of
@@ -14139,6 +14176,8 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   //  of it, when it takes the whole file: main.mere's vm_file_stmts)
   let gc_mids = (if req_ok && pre_st == 0 && (if embedded then false else true) && map_has cli_opt "vm"
                  then vm_file_stmts env world noblk src name "<main>" gc_mids else gc_mids) in
+  // (ruby's warning of a top-level `return <value>`, before the script runs)
+  let _ = (if req_ok && pre_st == 0 && (if embedded then false else true) then top_ret_warn world name gc_mids else ()) in
   let gc_total = list_len gc_mids in
   let rec gc_drive = fn (cursor: int) -> fn (lastv: Val) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in

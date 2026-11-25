@@ -2034,6 +2034,16 @@ class RubyVM::InstructionSequence
     # (at the top level the scope itself is as a method; from a block ruby
     #  throws TAG_RETURN, which needs the catch table)
     def return_node(u, n, popped)
+      # (a file's own return answers nothing: rb_warn at compile, which a
+      #  file compiled for the VM to run says as ruby says it -- with the
+      #  file and no line. A rescue or an ensure clause's return is the
+      #  scope's around it.)
+      # (rb_warn: nothing at all under -W0, where $VERBOSE is nil)
+      scope = u
+      scope = scope.parent while (scope.type == :rescue || scope.type == :ensure) && scope.parent
+      if scope.type == :top && u.opts[:vm_file] && n.arguments && !$VERBOSE.nil?
+        Warning.warn("#{u.path}: warning: argument of top-level return is ignored\n")
+      end
       unless u.type == :method || u.type == :top
         raise NotImplementedError, "RubyVM::InstructionSequence: return from here is not compiled yet" unless THROUGH.include?(u.type)
         return_value(u, n)
@@ -2041,12 +2051,6 @@ class RubyVM::InstructionSequence
         u.insn(:throw, 1)
         u.insn(:pop) if popped
         return
-      end
-      # (a file's own return answers nothing: rb_warn at compile, which a
-      #  file compiled for the VM to run says as ruby says it)
-      # (rb_warn: nothing at all under -W0, where $VERBOSE is nil)
-      if u.type == :top && u.opts[:vm_file] && n.arguments && !$VERBOSE.nil?
-        Warning.warn("#{u.path}:#{n.location.start_line}: warning: argument of top-level return is ignored\n")
       end
       sp_l = u.new_label
       u.emit_label(sp_l)

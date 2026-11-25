@@ -555,7 +555,8 @@ and raise_exc_iv = fn world -> fn (cls: str) -> fn (msg00: str) -> fn (fields: (
               | prev -> iv_put ivars (str_of_int id ++ "@__cause") prev)
            else ()) in
   let _ = note_raise_site () in
-  let bt9 = arr_new (caller_frames 0) in
+  let bt9 = (if map_has ivars (str_of_int id ++ "@__bt") then map_get ivars (str_of_int id ++ "@__bt")
+             else arr_new (caller_frames 0)) in
   let _ = map_set raise_bt "v" bt9 in
   // ...on the OBJECT as well: #backtrace reads the exception's own @__bt, and
   // an object raised without one answered nil where the pair form answers the
@@ -4400,7 +4401,12 @@ and super_base = fn world -> fn (recv: Val) ->
   | VClass c when is_sng_cls c && sng_of_value c -> "(sng:" ++ c ++ ")"
   | VClass c -> if is_sng_cls c then c else "(sng:" ++ c ++ ")"
   | VMain when map_has hng_store "main:0" -> map_get hng_store "main:0"
-  | _ -> dispatch_cls_of world recv
+  | _ ->
+    // Primitive values keep their singleton class separately from the class
+    // used for builtin dispatch. Super must resume in that singleton's chain.
+    let key9 = hng_key_q recv in
+    if str_len key9 > 0 && map_has hng_store key9 then map_get hng_store key9
+    else dispatch_cls_of world recv
 // whether a singleton class's name is an object's or a value's ("(sng:<id>)",
 // "(sng:str:12)") and not a class's or a module's ("(sng:Foo)")
 and sng_of_value = fn (c: str) ->
@@ -10022,13 +10028,11 @@ and file_flush_obj = fn world -> fn (id: int) ->
               let _ = iv_put ivars (k ++ "@__f_buf") (mkstr (substring buf n8 (str_len buf))) in false)
            else by_fd_at (0 - 1)))
      else if str_contains mode "w" || str_contains mode "+" then
-       (let old9 = (if file_exists path then read_file path else "") in
-        let head9 = (if str_len old9 >= wpos then substring old9 0 wpos
-                     else old9 ++ str_repeat (chr 0) (wpos - str_len old9)) in
-        let after9 = wpos + str_len buf in
-        let tail9 = (if str_len old9 > after9 then substring old9 after9 (str_len old9) else "") in
-        if try_or (fn (u: unit) -> let _ = write_file path (head9 ++ buf ++ tail9) in true) false
-        then true else by_fd_at wpos)
+       // Write just this buffer, at its recorded offset. The kernel keeps
+       // bytes outside the write and fills a seek-created hole with zeros.
+       // through_fd publishes each consumed prefix before an error/wait, so
+       // retrying flush resumes with the remaining bytes at the right offset.
+       by_fd_at wpos
      else true) in
   if not flushed then ()
   else (let _ = iv_put ivars (k ++ "@__f_wpos") (VInt (wpos + str_len buf)) in
@@ -12738,19 +12742,6 @@ and hash_lookup = fn (pairs: Val list) -> fn (target: Val) ->
   | Nil -> (false, VNil)
   | Cons (k, Cons (v, rest)) -> if rb_eq k target then (true, v) else hash_lookup rest target
   | _ -> (false, VNil)
-and hash_only_keys = fn (pairs: Val list) -> fn (items: (str * Pat) list) ->
-  match pairs with
-  | Nil -> true
-  | Cons (k, Cons (_, rest)) -> if item_has_key items k then hash_only_keys rest items else false
-  | _ -> true
-and item_has_key = fn (items: (str * Pat) list) -> fn (k: Val) ->
-  match items with Nil -> false | Cons (kp, r) -> let (nm, _) = kp in (rb_eq (VSym nm) k) || item_has_key r k
-and hash_without = fn (pairs: Val list) -> fn (items: (str * Pat) list) ->
-  mkhash (hash_without_go pairs items)
-and hash_without_go = fn (pairs: Val list) -> fn (items: (str * Pat) list) ->
-  match pairs with
-  | Cons (k, Cons (v, rest)) -> if item_has_key items k then hash_without_go rest items else Cons (k, Cons (v, hash_without_go rest items))
-  | _ -> Nil
 and rxp_skip_x = fn (pat: str) -> fn (p: int) ->
   if p >= str_len pat then p
   else
@@ -12902,7 +12893,8 @@ and rxp_skip_group = fn (pat: str) -> fn (p: int) -> fn (depth: int) ->
   if p >= str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp: end pattern with unmatched parenthesis")) in fail "mere-ruby: regexp: end pattern with unmatched parenthesis")
   else
     let c = char_at pat p in
-    if str_eq c "\\" then rxp_skip_group pat (p + 2) depth
+    if ord c >= 128 then rxp_skip_group pat (p + rxp_clen pat p) depth
+    else if str_eq c "\\" then rxp_skip_group pat (p + 1 + rxp_clen pat (p + 1)) depth
     else if str_eq c "[" then rxp_skip_group pat (rxp_skip_class pat (p + 1)) depth
     else if str_eq c "(" then rxp_skip_group pat (p + 1) (depth + 1)
     else if str_eq c ")" then (if depth == 1 then p + 1 else rxp_skip_group pat (p + 1) (depth - 1))
@@ -12911,7 +12903,8 @@ and rxp_skip_class = fn (pat: str) -> fn (p: int) ->
   if p >= str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp: premature end of char-class")) in fail "mere-ruby: regexp: premature end of char-class")
   else
     let c = char_at pat p in
-    if str_eq c "\\" then rxp_skip_class pat (p + 2)
+    if ord c >= 128 then rxp_skip_class pat (p + rxp_clen pat p)
+    else if str_eq c "\\" then rxp_skip_class pat (p + 1 + rxp_clen pat (p + 1))
     else if str_eq c "]" then p + 1
     // a nested class (or a [:name:]) closes with its own `]`
     else if str_eq c "[" then rxp_skip_class pat (rxp_skip_class pat (p + 1))
@@ -12934,6 +12927,7 @@ and rx_pending_sync = fn (u: unit) ->
 // one queued literal, once it has been looked at (or never will be)
 and rx_pending_drop = fn (i: int) ->
   let _ = (if map_has rx_pending ("e" ++ str_of_int i) then map_delete rx_pending ("e" ++ str_of_int i) else ()) in
+  let _ = (if map_has rx_pending ("c" ++ str_of_int i) then map_delete rx_pending ("c" ++ str_of_int i) else ()) in
   if map_has rx_pending ("l" ++ str_of_int i) then map_delete rx_pending ("l" ++ str_of_int i) else ()
 and rx_key_nl = fn (k: str) -> fn (i: int) ->
   if i >= str_len k then i
@@ -13055,7 +13049,9 @@ and rxp_dup_check = fn (acc: RCls list) -> fn (lo: int) -> fn (hi: int) ->
      then rxp_warn "Vcharacter class has duplicated range" else rxp_dup_check t lo hi)
   | Cons (_, t) -> rxp_dup_check t lo hi
 // a class member's codepoint (its byte for a lone byte)
-and rxp_cp_of = fn (c: str) -> match utf8_cp_strict c 0 with (cp, _, _) -> cp
+and rxp_cp_of = fn (c: str) ->
+  if vec_get cut_k 0 == 2 then cut_code c 0
+  else match utf8_cp_strict c 0 with (cp, _, _) -> cp
 and rxp_no_range_from = fn (pat: str) -> fn (p: int) ->
   if p + 1 < str_len pat && str_eq (char_at pat p) "-" && (if str_eq (char_at pat (p + 1)) "]" then false else true)
   then rxp_refuse "unmatched range specifier in char-class" else ()
@@ -13134,7 +13130,7 @@ and rxp_class_atom1 = fn (pat: str) -> fn (p: int) -> fn (fl: str) ->
      else if str_eq e "M" || str_eq e "c" || str_eq e "C" then
        (match rx_str_esc_byte pat (p + 1) with
         | (w, b, k) -> if str_eq w "" then (CChr (chr b), k) else (let _ = rxp_refuse w in (CChr "", k)))
-     else (CChr e, p + 2))
+     else (let n = rxp_clen pat (p + 1) in (CChr (substring pat (p + 1) (p + 1 + n)), p + 1 + n)))
   // A literal in a class is one CHARACTER. As one byte, `[あ-ん]` became a range
   // between two bytes of two different characters, and matching it against a
   // byte of the subject produced "\xE3" -- half a character, and not a string
@@ -13188,6 +13184,8 @@ and rxp_prop = fn (pat: str) -> fn (p: int) ->
           else if str_eq t "b" then CUProp (4, str_to_int_base arg 16, neg)
           else CUProp (2, int_of_str arg, neg)), close + 1)))
 and rxp_clen = fn (pat: str) -> fn (p: int) ->
+  if vec_get cut_k 0 != 1 then cut_clen pat p
+  else
   let n = str_len pat in
   let bt = fn (k: int) -> if k < n then ord (char_at pat k) else 0 in
   let cont = fn (k: int) -> k < n && bt k >= 128 && bt k < 192 in
