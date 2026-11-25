@@ -82,7 +82,9 @@ a complex block expression. VM splatarray retains its own copy flag.
 
 Common Array, native-list and nil splats keep their existing Val without a
 conversion-helper call or reboxing. A live plain block local holding Proc or
-nil needs no callback scope; custom to_proc still does. Pseudo variables and
+nil needs no callback scope; custom to_proc still does. Include the existing
+anonymous block local used by `...` and `&`, so ordinary forwarding of an
+existing Proc or nil does not allocate a callback scope or temporary root. Pseudo variables and
 implicit numbered parameters retain the full evaluation path. No ordinary
 call receives counting-only work.
 
@@ -95,9 +97,9 @@ collisions, reflection, large arguments, native boundaries, empty super,
 keyword append, block conversion mutation, exceptions and ephemeral roots.
 The final 63-line candidate also checks converted Proc identity, lambda
 behavior, fresh captured locals after GC, and scoped/snapshot Symbol blocks.
-All 63 lines match clean Ruby 4.0.10 on evaluator and VM, normally and with
-GC stress 50, with empty stderr. GC-root, duplicate-definition and
-dead-definition gates pass on this candidate. Final-head corpus 664, hardware profiles, isolated allocation
+All 63 regression lines match clean Ruby 4.0.10 on both engines, normally
+and under GC stress 50, with empty stderr. GC-root, duplicate-definition
+and dead-definition gates pass on this candidate. Final-head corpus 664, hardware profiles, isolated allocation
 file and full corpus/gate results are required before the batched push.
 
 Measure all 76 ruby/test_allocation.rb cases alone on each engine, without
