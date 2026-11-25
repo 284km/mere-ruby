@@ -12,7 +12,8 @@ files. This says exactly how they differ from the tree they were copied from:
   - capi/include has three files of its own: ruby/config.h (written for this
     interpreter, checked by config_probe.py), and COPYING and BSDL, which are
     the tree's
-  - every .c and .h of capi/vendor is the tree's file of the same path
+  - every .c and .h of capi/vendor is the tree's file of the same path,
+    except renamed files whose upstream paths are explicitly listed below
 
 The tree must be the version the headers were copied from (ruby 4.0.10, the
 commit CI names RUBY_SOURCE_REF).
@@ -26,6 +27,9 @@ HERE = Path(__file__).resolve().parent
 CAPI = HERE.parent
 PATCH = HERE / 'headers.patch'
 OURS = {'ruby/config.h', 'COPYING', 'BSDL'}
+# The vendored basename avoids colliding with other extensions' escape.c.
+# A renamed source is still compared byte for byte with its upstream file.
+VENDOR_PATHS = {'erb_escape.c': 'ext/erb/escape/escape.c'}
 args = [a for a in sys.argv[1:] if a != '--write']
 if len(args) != 1:
     sys.exit(__doc__)
@@ -59,7 +63,8 @@ elif not PATCH.exists() or PATCH.read_text() != patch:
 vendored = [p for p in (CAPI / 'vendor').rglob('*') if p.suffix in ('.c', '.h')]
 for p in sorted(vendored):
     name = p.relative_to(CAPI / 'vendor')
-    if not (tree / name).is_file() or (tree / name).read_bytes() != p.read_bytes():
+    upstream = tree / VENDOR_PATHS.get(name.as_posix(), name.as_posix())
+    if not upstream.is_file() or upstream.read_bytes() != p.read_bytes():
         problems.append(f'capi/vendor/{name} is not the tree\'s file')
 if problems:
     sys.exit('headers_check:\n  ' + '\n  '.join(problems))

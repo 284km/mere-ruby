@@ -70,6 +70,13 @@ static VALUE default_internal(VALUE self) {
     rb_encoding *e = rb_default_internal_encoding();
     return e ? rb_enc_from_encoding(e) : Qnil;
 }
+/* Read the proxy flag directly, including after C/Ruby changes the owner. */
+static VALUE frozen_flags(VALUE self, VALUE obj, VALUE operation) {
+    (void)self;
+    if (NUM2INT(operation) == 1) rb_obj_freeze(obj);
+    if (NUM2INT(operation) == 2) rb_yield(obj);
+    return RB_OBJ_FROZEN(obj) ? Qtrue : Qfalse;
+}
 static VALUE aset(VALUE self, VALUE hash, VALUE key, VALUE value) { (void)self; rb_hash_aset(hash, key, value); return Qnil; }
 static VALUE kind_of(VALUE self, VALUE obj, VALUE klass) { (void)self; return rb_obj_is_kind_of(obj, klass); }
 
@@ -554,6 +561,7 @@ static VALUE hidden_const_api(VALUE self, VALUE klass, VALUE name, VALUE operati
 }
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
+    rb_define_singleton_method(mod, "frozen_flags", frozen_flags, 2);
     rb_define_singleton_method(mod, "hidden_const_api", hidden_const_api, 4);
     rb_define_singleton_method(mod, "nogvl_nap", nogvl_nap, 1);
     rb_define_singleton_method(mod, "nogvl_call_back", nogvl_call_back, 1);
