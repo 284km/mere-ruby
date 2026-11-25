@@ -30,3 +30,31 @@ sweeps, their source gates, bracket-depth checks and record_hygiene are
 queued. Results will be recorded after completion. The checks above are
 not a full-corpus claim. No full unit suite or Rails component suite was
 run and no workflow is changed.
+
+## Review correction: forwarded body Procs
+
+The initial change captured the registration helper's block for a Proc
+forwarded with &body. That overrides the Proc's actual lexical yield
+context. Both define_method and define_singleton_method are affected.
+
+The block-pass definition paths now recognize the supplied Proc and derive
+the enclosing yield block and home/lambda metadata from its defining
+environment and existing yield markers, as the positional-Proc paths do.
+Direct literal blocks retain their registration-site context. No new
+global source slot or permanent root is introduced.
+
+Corpus 1105 adds both registration forms through an unrelated helper,
+with the original definition block and a different caller block. All four
+calls now print :definition on clean Ruby and both candidate modes.
+The complete 1105 witness matches on both engines with tight GC.
+
+The unchanged upstream selections were repeated with seed 1 and tight GC;
+all reference, main and candidate runs pass. Max RSS is bytes:
+
+| File | Result | Main evaluator RSS | Candidate evaluator RSS | Main VM RSS | Candidate VM RSS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ruby/test_method.rb | 15 tests, 45 assertions, 0 failures, 0 errors, 0 skips | 167886848 | 169639936 | 185827328 | 184500224 |
+| ruby/test_defined.rb | 1 tests, 2 assertions, 0 failures, 0 errors, 0 skips | 164364288 | 165543936 | 164626432 | 163430400 |
+| ruby/test_proc.rb | 4 tests, 11 assertions, 0 failures, 0 errors, 0 skips | 174473216 | 173146112 | 203227136 | 203423744 |
+
+The corrected O2 binary is in the full evaluator/VM corpus queue.

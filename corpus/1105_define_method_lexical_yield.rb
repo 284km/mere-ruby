@@ -48,3 +48,25 @@ end
 
 lambda_object = factory_1105(&-> { break :lambda_value })
 p lambda_object.nested { :caller }
+
+# Forwarding a body Proc must preserve its lexical block, rather than the
+# registration helper's unrelated block or the eventual method caller's.
+def forwarded_body_1105
+  proc { yield }
+end
+def install_forwarded_1105(target, body, singleton)
+  if singleton
+    target.define_singleton_method(:forwarded, &body)
+  else
+    target.define_method(:forwarded, &body)
+  end
+end
+definition = -> { :definition }
+body = forwarded_body_1105(&definition)
+[false, true].each do |singleton|
+  target = singleton ? Object.new : Class.new
+  install_forwarded_1105(target, body, singleton) { :registrar }
+  receiver = singleton ? target : target.new
+  p receiver.forwarded(&definition)
+  p receiver.forwarded { :caller }
+end
