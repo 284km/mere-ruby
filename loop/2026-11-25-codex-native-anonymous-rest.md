@@ -62,9 +62,10 @@ native rest only when isolation observes it, so its error names an ordinary
 Array instead of leaking an internal value or a generic StandardError.
 
 Retain the source Array of an eligible anonymous splat, including its frozen
-state and later mutations. Reserved non-handle slots in the existing splat
-note table carry source identity and span; the existing nonempty-note binder
-branch snapshots them in a private frame slot before defaults may call Ruby.
+state and later mutations. A reserved non-handle slot in the existing splat
+note table carries source identity; one fixed native integer slot holds the
+suffix length. The existing nonempty-note binder branch snapshots the actual
+source value in a private frame slot before defaults may call Ruby.
 The collector follows a pending source handle. Binding consumes the note and
 removes the frame metadata when the anonymous rest is installed. Native leaf,
 block, iterator, sender and Method boundaries consume Array provenance.
@@ -93,3 +94,12 @@ Ractor isolation. The same refusal reproduces on the pre-change main control;
 that separate reassignment cause is not hidden by changing expected output
 in this regression corpus. No unused Ruby Array is allocated to imitate an
 allocation count.
+
+The first review fix passed semantic checks but added instructions to the
+borrowed-rest loop, especially on the VM. Replace three map entries and a
+boxed metadata list per splat with one existing-table slot and one fixed
+native integer slot. Store the actual source value in the frame, rather than
+boxing its id and lengths in another list. All 47 regression output lines
+still match both engines with GC stress 50; the three source gates pass.
+Repeat the hardware measurement before claiming that the performance issue
+is resolved. No allocation counter or unused Ruby object changes.
