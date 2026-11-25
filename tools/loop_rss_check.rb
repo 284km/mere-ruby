@@ -44,6 +44,15 @@ CASES = {
     ivn = "@" + "x" * 65536
     (1_200 / d).times { |i| k = Class.new; k.instance_variable_set(ivn, i); GC.start if i % 10 == 9 }
   },
+  # Kernel#loop ran its turns in the caller's frame, and what a frame's
+  # statement built is rooted until the statement ends: nothing a turn made
+  # was collected until the loop did (1 KB a turn, a YAML block mapping of
+  # 65,536 entries past 8 GB)
+  "Kernel#loop" => ->(d) {
+    i = 0
+    n = 200_000 / d
+    loop { break if i >= n; [:s, "x" * 8, [i, 1]]; i += 1 }
+  },
 }
 
 name, body = CASES.to_a.fetch(Integer(ARGV.fetch(0)))
