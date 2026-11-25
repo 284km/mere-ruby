@@ -621,8 +621,6 @@ let gc_tick =
   (let v = vec_new () in
    let _ = vec_push v 0 in
    let _ = vec_push v 0 in
-   // (2: the C API's safepoints under stress, gc_point_capi)
-   let _ = vec_push v 0 in
    v);
 let gc_body_tick = fn (u: unit) ->
   let n = vec_get gc_tick 0 in
@@ -2786,24 +2784,26 @@ let gc_point = fn world ->
               let _ = map_set gc_state "blocked" (bn + 1) in ()))
   else ();
 
-// The C API's safepoint (capi_up, MR_SAFEPOINT: mr_up asks it before a
+// The C API's safepoint (capi_up, MR_SAFEPOINT: mr_up reaches one before a
 // String is fetched, a call, a new String), so that a long C call that calls
 // back through the C API alone is collected in -- under pressure, as any
-// safepoint. Under MERE_RUBY_GC_STRESS=N it collects at every 16*N-th of
-// them, not every N-th: a C call asks for those many times per statement,
+// safepoint. C counts them and asks here only at every 32nd (a statement
+// boundary's one in 32, gc_body_tick), or under MERE_RUBY_GC_STRESS=N every
+// 16*N-th, not every N-th: a C call reaches those many times per statement,
 // and at every one capi_check's api contracts ran past their 120 s bound
-// under stress (a collection every 25 ms of C API calls).
+// under stress (a collection every 25 ms of C API calls). The answer is how
+// many to pass over before C asks again. (C asked at every one, and the
+// round trip was most of what a safepoint cost: with GC.disable,
+// join_in_c(3000) took twice main's time before the safepoint.)
 let gc_point_capi = fn world ->
   let every = vec_get gc_knob 6 in
   if fb_off_stack && not (gc_auto_off ()) && every > 0 then
-    (let n = vec_get gc_tick 2 in
-     if n + 1 >= every * 16 then (let _ = vec_set gc_tick 2 0 in let _ = gc_collect_off_stack world in ())
-     else (let _ = vec_set gc_tick 2 (n + 1) in ()))
-  else if fb_off_stack && gc_body_tick () && gc_pressure world
-  then (if gc_collect_off_stack world then ()
-        else (let bn = (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
-              let _ = map_set gc_state "blocked" (bn + 1) in ()))
-  else ();
+    (let _ = gc_collect_off_stack world in every * 16 - 1)
+  else if fb_off_stack && gc_pressure world
+  then (let _ = (if gc_collect_off_stack world then ()
+                 else (let bn = (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
+                       let _ = map_set gc_state "blocked" (bn + 1) in ())) in 31)
+  else 31;
 
 // ---- giving back the fibers nobody can reach ---------------------------------
 // While a fiber is suspended a collection roots its stack and does not compact
@@ -8542,11 +8542,14 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
   // the C API only. A collection here is one in the middle of a statement,
   // which an off-stack collection roots (note 270) -- the stack it
   // interrupted is read for VALUEs, C's frames and the outer calls' with it.
-  if r.op == 33 then (let _ = gc_point_capi world in 0)
+  if r.op == 33 then gc_point_capi world
   else if r.op == 1 then capi_describe env world (capi_in r.a)
   else if r.op == 2 then
     (match capi_in r.a with
-     | VStr h -> let _ = mr_capi_give (bytes_of_str (sget h)) in 0
+     // (the String's own bytes, for C to copy while this request lasts:
+     //  bytes_of_str copies them in a region, and the transit buffer copied
+     //  them again -- capi/core.c mr_capi_give_str)
+     | VStr h -> (let s9 = sget h in let _ = mr_capi_give_str s9 (CapiWord { w = str_len s9 }) in 0)
      | _ -> let _ = raise_exc world "TypeError" "C API: not a String" in 0)
   else if r.op == 3 then
     (match capi_in r.a with
@@ -8762,6 +8765,27 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
      let _ = sym_builtins_ensure () in
      if str_len nm9 == 0 || (if map_has sym_all nm9 then false else true) then 0
      else (match map_get sym_all nm9 with VBool _ -> 1 | _ -> 2))
+  // rb_obj_freeze of a String, an Array or a Hash: the flag set, as CRuby's
+  // RB_OBJ_FREEZE sets it, with no method looked up or called -- 2 when it
+  // was a String not frozen before (C keeps its room: mr_mirror_frozen_by_c),
+  // 1 otherwise; 0 for anything else, which C sends #freeze as before.
+  // (sqlite3 freezes every row and every TEXT value it makes, and the send
+  // was an eighth of a prepared statement's step.)
+  else if r.op == 34 then
+    (match capi_in r.a with
+     | VStr h9 -> if sfrozen_get h9 then 1 else (let _ = sfrozen_set h9 in 2)
+     | VArr a9 -> let _ = cfrozen_set 0 a9 in 1
+     | VHsh h9 -> let _ = cfrozen_set 1 h9 in 1
+     | _ -> 0)
+  // rb_ary_store at the end of an Array that is not frozen: appended, with no
+  // method looked up or called (CRuby's rb_ary_store calls none) -- 1; 0 for
+  // any other index or a frozen Array, which C sends #[]= as before, so its
+  // errors are ruby's own. (sqlite3's step fills each row so.)
+  else if r.op == 35 then
+    (match capi_in r.a with
+     | VArr a9 when r.b == arr_len a9 && (if cfrozen_get 0 a9 then false else true) ->
+       let _ = arr_push_many a9 (Cons (capi_in r.c, Nil)) in 1
+     | _ -> 0)
   else (let _ = raise_exc world "NotImplementedError" ("C API: request " ++ str_of_int r.op ++ " is not answered") in 0)
 // Run C and come back with its value, or with what left it raised again.
 and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) ->
@@ -20915,8 +20939,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
       (if map_has def_int_enc "v" then map_get def_int_enc "v" else VNil)
     else if str_eq c "Encoding" && (str_len name == 17 && str_eq name "default_internal=") then
       (match args with
-       | Cons (VNil, _) -> let _ = (if map_has def_int_enc "v" then map_delete def_int_enc "v" else ()) in VNil
-       | Cons (v, _) -> (let e9 = enc_arg_obj env world v in let _ = map_set def_int_enc "v" e9 in v)
+       // (...and C's variable for it, which rb_enc_default_internal reads:
+       //  capi_global_note)
+       | Cons (VNil, _) -> let _ = (if map_has def_int_enc "v" then map_delete def_int_enc "v" else ()) in
+                           let _ = capi_global_note "default_internal" VNil in VNil
+       | Cons (v, _) -> (let e9 = enc_arg_obj env world v in let _ = map_set def_int_enc "v" e9 in
+                         let _ = capi_global_note "default_internal" e9 in v)
        | _ -> VNil)
     // Enumerator.new requires a block (the legacy obj/method form is gone).
     // (enum_init refuses a missing block, after checking the count)
