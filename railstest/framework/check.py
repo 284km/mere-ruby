@@ -57,6 +57,87 @@ class FrameworkCheck(unittest.TestCase):
         self.assertEqual({'A#test_a': 'MATCH', 'A#test_b': 'RED', 'A#test_c': 'MISSING', 'A#test_d': 'BOTH',
                           'A#test_e': 'BOTH', 'A#test_x': 'EXTRA'}, run.classify(reference, mere))
 
+    @staticmethod
+    def anonymous_case(address, suffix='a', second=None):
+        second = address if second is None else second
+        return f"T#test_#<Class:0x{address}>_matches_#<Class:0x{second}>_{suffix}"
+
+    def test_opaque_class_addresses_require_explicit_policy_and_keep_raw_names(self):
+        rname, mname = self.anonymous_case('0011'), self.anonymous_case('abcd')
+        reference, mere = parsed(transcript({rname: '.'})), parsed(transcript({mname: '.'}))
+        self.assertEqual({rname: 'MISSING', mname: 'EXTRA'}, run.classify(reference, mere))
+        self.assertEqual({rname: 'MATCH'}, run.classify(reference, mere, 'opaque-class-addresses'))
+        self.assertEqual([mname], list(mere['cases']))
+        self.assertEqual({mname: rname}, run.case_identity_aliases(reference, mere, 'opaque-class-addresses'))
+        name = 'activesupport/test/example_test.rb'
+        record = dict(files={name: dict(sides=dict(reference=reference, mere=mere))})
+        self.assertFalse(run.all_pass(record, [name]))
+        record['case_identity_policy'] = 'opaque-class-addresses'
+        self.assertTrue(run.all_pass(record, [name]))
+        run.summarize(record)
+        self.assertEqual(1, record['components']['activesupport']['MATCH'])
+        self.assertEqual({mname: rname}, record['files'][name]['case_identity_aliases'])
+        self.assertTrue(record['files'][name]['same_order'])
+
+    def test_opaque_class_aliases_preserve_results_and_require_complete_inventories(self):
+        rname, mname = self.anonymous_case('11'), self.anonymous_case('22')
+        good = parsed(transcript({rname: '.'}))
+        for verdict in 'FES':
+            bad = parsed(transcript({mname: verdict}))
+            self.assertEqual({rname: 'RED'}, run.classify(good, bad, 'opaque-class-addresses'))
+        bad_reference = parsed(transcript({rname: 'F'}))
+        self.assertEqual({rname: 'BOTH'}, run.classify(bad_reference, parsed(transcript({mname: '.'})),
+                                                    'opaque-class-addresses'))
+        for state in ('ZERO', 'INCOMPLETE', 'COUNT_MISMATCH', 'REPORT_MISMATCH', 'WALL_LIMIT',
+                      'MEMORY_LIMIT', 'EXIT_ERROR'):
+            for side in ('reference', 'mere'):
+                reference, mere = good, parsed(transcript({mname: '.'}))
+                if side == 'reference':
+                    reference = dict(reference, state=state)
+                else:
+                    mere = dict(mere, state=state)
+                self.assertEqual({}, run.case_identity_aliases(reference, mere, 'opaque-class-addresses'))
+
+    def test_opaque_class_aliases_reject_collisions_and_repeated_address_mismatches(self):
+        rname, mname = self.anonymous_case('11'), self.anonymous_case('22')
+        for reference, mere in (
+            ({rname: '.', self.anonymous_case('33'): '.'}, {mname: '.'}),
+            ({rname: '.'}, {mname: '.', self.anonymous_case('33'): '.'}),
+            ({rname: '.', self.anonymous_case('33'): '.'}, {mname: '.', self.anonymous_case('44'): '.'}),
+            ({rname: '.'}, {self.anonymous_case('22', second='33'): '.'}),
+            ({'T#test_object_#<Object:0x11>': '.'}, {'T#test_object_#<Object:0x22>': '.'}),
+            ({'T#test_literal_0x11': '.'}, {'T#test_literal_0x22': '.'}),
+        ):
+            left, right = parsed(transcript(reference)), parsed(transcript(mere))
+            self.assertEqual({}, run.case_identity_aliases(left, right, 'opaque-class-addresses'))
+            self.assertNotIn('MATCH', run.classify(left, right, 'opaque-class-addresses').values())
+
+    def test_ambiguous_shapes_do_not_reassign_a_literal_match(self):
+        common = self.anonymous_case('11')
+        reference = parsed(transcript({common: '.', self.anonymous_case('22'): '.'}))
+        mere = parsed(transcript({common: '.', self.anonymous_case('33'): '.'}))
+        self.assertEqual(run.classify(reference, mere),
+                         run.classify(reference, mere, 'opaque-class-addresses'))
+        self.assertEqual({}, run.case_identity_aliases(reference, mere, 'opaque-class-addresses'))
+
+    def test_opaque_class_aliases_preserve_bijections_across_test_names(self):
+        left = {self.anonymous_case('11', 'a'): '.', self.anonymous_case('11', 'b'): '.'}
+        consistent = {self.anonymous_case('22', 'a'): '.', self.anonymous_case('22', 'b'): '.'}
+        reference = parsed(transcript(left))
+        self.assertEqual(set(left), set(run.classify(reference, parsed(transcript(consistent)),
+                                                   'opaque-class-addresses')))
+        for right in (
+            {self.anonymous_case('22', 'a'): '.', self.anonymous_case('33', 'b'): '.'},
+            {self.anonymous_case('11', 'a'): '.', self.anonymous_case('22', 'b'): '.'},
+        ):
+            aliases = run.case_identity_aliases(reference, parsed(transcript(right)), 'opaque-class-addresses')
+            self.assertEqual({}, aliases)
+        reference = parsed(transcript({self.anonymous_case('11', 'a'): '.', self.anonymous_case('33', 'b'): '.'}))
+        self.assertEqual({}, run.case_identity_aliases(reference, parsed(transcript(consistent)),
+                                                     'opaque-class-addresses'))
+        with self.assertRaises(ValueError):
+            run.classify(reference, parsed(transcript(consistent)), 'unknown-policy')
+
     def test_partial_transcript_is_not_complete_and_loses_nothing(self):
         cases = {'A#test_a': '.', 'A#test_b': '.'}
         crashed = parsed('A#test_a = 0.01 s = .\n')
