@@ -122,3 +122,19 @@ single push after local checks, then read all inline review comments again.
 A wider probe found captured optional parameters falsely reported as
 reassigned on the main control too. Keep that separate existing Ractor cause
 visible rather than changing expected output to hide it.
+
+## Integrate current main after the CI fixes
+
+The pre-integration head f6ef0bb8 completed all local acceptance: 63 focused
+lines normally and under GC stress 50 on both engines, corpus 664's 27 lines
+in both conditions, the full 76-case allocation file alone on both engines,
+24 hardware-instruction profiles, memory controls, 893 corpus programs with
+hash indexing ON/OFF and 893 on the VM with no fallback or difference, all
+nine source gates and record_hygiene. Those measurements are historical
+after this main integration, not acceptance of a different source tree.
+
+Merge main 779c7cc9 to include the CI integrity fixes and current Action Pack
+and C API frozen-state changes. Replay acceptance against the same main
+control before the next batched push. Record unchanged MATCH/RED totals and
+the newly missing CRuby temporary Arrays honestly; do not create dummy
+objects. Keep one corpus sweep at a time and run the allocation file alone.

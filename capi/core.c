@@ -206,7 +206,8 @@ static const char *dmark_refusal(int op, VALUE b, VALUE flags) {
         [MR_ARY_NEW] = "an Array allocation", [MR_BREAK] = "a break", [MR_BACKREF] = "$~",
         [MR_DEFINE_GVAR] = "a global variable definition", [MR_RX_DEPTH] = "the Regexp depth",
         [MR_RAT_RAW] = "a Rational allocation", [MR_NOTIMPL] = "rb_f_notimplement",
-        [MR_SYM_STATE] = "a Symbol's state", [MR_IVAR_READ] = "an ivar read" };
+        [MR_SYM_STATE] = "a Symbol's state", [MR_IVAR_READ] = "an ivar read",
+        [MR_SAFEPOINT] = "a safepoint" };
     const char *tail = "only a header, a String, an Array and an ivar can be read then";
     if (op == MR_SEND) {
         long len = 0;
@@ -246,6 +247,28 @@ VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
         a = mr_vbig_out(a); b = mr_vbig_out(b); c = mr_vbig_out(c); d = mr_vbig_out(d); e = mr_vbig_out(e);
     }
     if (!reads_only(op) && op != MR_STR_SET && op != MR_ARY_SET) mr_mirrors_flush();
+    /* A safepoint before the requests that make something -- a String's
+     * bytes fetched, a call, a new String -- so that a long C call that only
+     * calls back through the C API is collected in as it goes: puma's HTTP
+     * parser joins a repeated header with rb_str_cat at every callback, and
+     * with no Ruby statement in the call there was no safepoint at all; 16 x
+     * 1024 headers held 4.5 GB. What C holds is rooted as under any Ruby
+     * method C calls: this stack is read for VALUEs (its C frames, the outer
+     * calls'), an Array's fetched elements and a dmark's are asked, and
+     * C's own writes were put back just above. What this request has put in
+     * transit is set aside around it. (Not for MR_STR_SET / MR_ARY_SET: those
+     * are the write-back itself, in the middle of a flush; nor while a
+     * collection is marking, whose dmark asked this.) */
+    if ((op == MR_STR_GET || op == MR_SEND || op == MR_STR_NEW) && !mr_capi_marking()) {
+        struct mr_transit saved;
+        mr_transit_save(&saved, -1);
+        CapiReq point = { MR_SAFEPOINT, 0, 0, 0, 0, 0 };
+        frame->raised = 0;
+        (void)frame->up.fn(frame->up.env, point);
+        if (cur != frame) mr_fatal("the calls in progress are out of step");
+        frame->raised = 0;
+        mr_transit_restore(&saved);
+    }
     CapiReq request = { op, (long long)a, (long long)b, (long long)c, (long long)d, (long long)e };
     stats[ST_UP]++;
     frame->raised = 0;
@@ -519,6 +542,31 @@ int mr_capi_open(const char *path) {
     return (int)library_count++;
 }
 
+/* An extension linked into this executable (capi/static_ext.c), by the
+ * feature `require` names: its library number, as mr_capi_open answers, or -1
+ * when there is no such extension. Its path is the feature; it has no handle
+ * (its symbols are this executable's). */
+int mr_capi_static_open(const char *feature) {
+    const struct mr_static_ext *e = mr_static_exts;
+    while (e->feature && strcmp(e->feature, feature)) e++;
+    if (!e->feature) {
+        mr_put_text("no such extension is linked into mere-ruby");
+        return -1;
+    }
+    for (long i = 0; i < library_count; i++)
+        if (!libraries[i].handle && !strcmp(libraries[i].path, feature)) return (int)i;
+    if (library_count == library_cap) {
+        library_cap = library_cap ? library_cap * 2 : 16;
+        libraries = realloc(libraries, sizeof(*libraries) * (size_t)library_cap);
+        if (!libraries) mr_fatal("out of memory");
+    }
+    libraries[library_count].path = strdup(feature);
+    libraries[library_count].handle = NULL;
+    libraries[library_count].init = e->init;
+    stats[ST_LIBRARIES] = library_count + 1;
+    return (int)library_count++;
+}
+
 /* ---- running C -------------------------------------------------------------- */
 extern void mr_capi_boot(void);
 static int booted;
@@ -642,7 +690,7 @@ void *rb_ext_resolve_symbol(const char *feature, const char *symbol) {
         const char *dot = strrchr(path, '.');
         size_t stem = dot ? (size_t)(dot - path) : strlen(path);
         if (stem >= n && !strncmp(path + stem - n, feature, n) && (stem == n || path[stem - n - 1] == '/'))
-            return dlsym(libraries[i].handle, symbol);
+            return dlsym(libraries[i].handle ? libraries[i].handle : RTLD_DEFAULT, symbol);
     }
     VALUE name = rb_str_new(feature, (long)n);
     VALUE loaded = mr_call(mr_ruby("->(name) { $LOADED_FEATURES.any? { |f| f == name + '.so' || f == name + '.rb' || f.end_with?('/' + name + '.rb') } }"),
@@ -678,6 +726,21 @@ char *mr_capi_exe(void) {
 char *mr_capi_libc(void) {
 #ifdef __GLIBC__
     return "gnu";
+#else
+    return "";
+#endif
+}
+
+/* The OpenSSL installation this interpreter was linked against, where the
+ * build named one (tools/build.sh: OPENSSL_PREFIX, or Homebrew's openssl@3):
+ * "" when the compiler found OpenSSL on its own paths or through pkg-config.
+ * RbConfig says it as ruby's configure would have been told it,
+ * --with-openssl-dir, which is what mkmf's dir_config("openssl") reads -- an
+ * extension that brings its own TLS (puma's MiniSSL) then builds against the
+ * OpenSSL the interpreter's own openssl library uses. */
+char *mr_capi_openssl_dir(void) {
+#ifdef MR_OPENSSL_DIR
+    return MR_OPENSSL_DIR;
 #else
     return "";
 #endif

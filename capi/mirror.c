@@ -275,6 +275,8 @@ static uint64_t body_hash(struct mr_mirror *m) {
  *  marked object holds the interpreter marks itself.) */
 static int marking;
 int mr_capi_mark_unasked(void) { return marking && !mr_capi_calling(); }
+/* (a collection is marking: a dmark is running, inside a C call or not) */
+int mr_capi_marking(void) { return marking; }
 static struct mr_mirror *refresh_head(struct mr_mirror *m, VALUE obj) {
     if (m->head_epoch == mr_epoch) return m;
     VALUE packed = mr_up1(MR_DESCRIBE, obj);
