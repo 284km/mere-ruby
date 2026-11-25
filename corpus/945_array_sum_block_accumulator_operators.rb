@@ -31,3 +31,19 @@ Integer.prepend(IntegerPlus945)
 Float.prepend(FloatPlus945)
 p [1, 2, 3].sum { |v| v }
 p [0.5, 1.5].sum { |v| v }
+# Once a general accumulator has been used, numeric results keep Ruby dispatch.
+class IntegerInitial945
+  def +(other) = 10
+end
+class FloatInitial945
+  def +(other) = 10.0
+end
+p [1, 2, 3].sum(IntegerInitial945.new) { |v| v }
+p [1, 2, 3].sum(IntegerInitial945.new)
+p [1.0, 2.0, 3.0].sum(FloatInitial945.new) { |v| v }
+p [1.0, 2.0, 3.0].sum(FloatInitial945.new)
+# Entering the general path through an addend must be sticky as well.
+class ReturnsInteger945
+  def coerce(other) = [IntegerInitial945.new, self]
+end
+p [ReturnsInteger945.new, 2, 3].sum { |v| v }
