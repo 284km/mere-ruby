@@ -131,5 +131,64 @@ with tight GC and seed 1. All main and candidate runs pass:
 | ruby/test_rational.rb | 1 tests, 26 assertions, 0 failures, 0 errors, 0 skips | 166445056 | 165838848 | 170000384 | 169836544 |
 | ruby/test_optimization.rb | 2 tests, 24 assertions, 0 failures, 0 errors, 0 skips | 168378368 | 171507712 | 171622400 | 170819584 |
 
-The R4 full evaluator and VM corpus sweeps are running. The R3 full
-acceptance above is historical and does not stand in for those runs.
+The R4 full evaluator and subsequent VM corpus sweeps each pass 883/883
+programs with hash indexing ON and OFF, including all source gates and
+full record_hygiene. The R3 acceptance above remains historical evidence;
+these are separate completed sweeps of the corrected R4 O2 binary.
+
+## Review correction: static arrays and splats
+
+The evaluator's literal min/max branch also caught static literals and
+arrays with splats. CRuby compiles a static array with duparray and makes
+an ordinary Array call; a splat also uses ordinary dispatch. With
+Rational#<=> returning 1, both [0.5r, 0.25r].max and [0.5r, *tail].max
+must keep 1/2. The prior candidate evaluator returned 1/4; its VM was
+already correct.
+
+The special evaluator branch now requires no splat and at least one
+nonstatic element. The static-expression check preserves the parser's
+literal and frozen-string markers; it does not treat nested containers
+as static literals. Corpus 1100 adds Rational static/splat min/max with
+callback order and 1/-1/0/nil results, plus Float static/splat controls
+and a dynamic Float literal control. Corpus 1100, 1101 and 930 match
+clean Ruby on both engines. A separate String/frozen-String, Regexp,
+Symbol and Complex shape probe matches too.
+
+The final R5 O2 binary repeats the unchanged upstream selections with
+--seed=1 and MERE_RUBY_GC_TIGHT=1. Reference, main and candidate pass:
+
+| File | Tests / assertions | Main evaluator RSS | Candidate evaluator RSS | Main VM RSS | Candidate VM RSS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ruby/test_array.rb | 22 / 344 | 178765824 | 179912704 | 223510528 | 220364800 |
+| ruby/test_integer.rb | 1 / 168 | 164790272 | 163512320 | 167165952 | 167837696 |
+| ruby/test_rational.rb | 1 / 26 | 165347328 | 163954688 | 169476096 | 172539904 |
+| ruby/test_optimization.rb | 2 / 24 | 170016768 | 170672128 | 171753472 | 170196992 |
+
+RSS is /usr/bin/time -l bytes. The requested hot-path probe was also
+repeated as three alternating main/candidate runs per engine, with tight
+GC and --seed=1. Every result is 983200.0. Median instructions and the
+maximum RSS across the three runs:
+
+| Engine | Main instructions | R5 instructions | Change | Main max RSS | R5 max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Evaluator | 33667977953 | 33730502090 | +0.19% | 110559232 | 110723072 |
+| VM | 33636517143 | 33685184567 | +0.14% | 112345088 | 111820800 |
+
+The main baseline for this performance comparison is unchanged 323706a7,
+using the same compiler and mgz pins. The new classifier adds no global
+object retention or cache.
+
+The review also records existing follow-ups outside this correction:
+Integer/Rational coerce comparison dispatch, max(n), each.max, max_by,
+sort_by, Array#<=>, and Rational#coerce/#== overrides. They are not
+represented as fixed by this PR.
+
+
+Final R5 acceptance is complete: sh run_corpus.sh --both and
+MERE_RUBY_VM=1 sh run_corpus.sh --both each pass 883/883 programs with
+hash indexing ON and OFF. Both fresh sweeps pass all source gates and
+full record_hygiene. The bracket-depth gate passes (155 / 1024), and
+this updated loop note passes explicit record_hygiene. The related-test
+main comparison above is also repeated on the same known 323706a7 O2
+baseline used for performance. Code, regression cases and the completed
+R4/R5 record are committed together. No workflow is changed.
