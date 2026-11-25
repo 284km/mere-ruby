@@ -6585,7 +6585,14 @@ and defined_self_has = fn env -> fn world -> fn (name: str) ->
 and defined_self_rtm = fn env -> fn world -> fn (name: str) ->
   lv_has env "self"
   && (let sv9 = lv_get env "self" in
-      let c9 = dispatch_cls_of world sv9 in
+      // (a class asks its OWN #respond_to_missing?, a singleton method: the
+      //  one its instances have is not the class's. `defined?(file_fixture_
+      //  path)` in a class method of a class that includes a module with
+      //  #respond_to_missing? called the instances' on the class, and its
+      //  `super` was a NoMethodError -- ActiveRecord::TestFixtures.fixtures)
+      let c9 = (match sv9 with
+                | VClass cc9 -> "(sng:" ++ cc9 ++ ")"
+                | _ -> dispatch_cls_of world sv9) in
       (if str_eq c9 "" then false else has_meth world c9 "respond_to_missing?")
       && truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) sv9
                    "respond_to_missing?" (Cons (VSym name, Cons (VBool true, Nil))) false))
@@ -7429,7 +7436,14 @@ and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
   //   `M.const_set(:Z, Class.new)` and `m::X = Class.new` left the class
   //   nameless -- `#name` answered nil for something that has a constant
   //   pointing at it. This is the one door every constant comes through.
-  let _ = name_anon key v in
+  // (...and an instance of a Module SUBCLASS is named through the module it
+  //  backs: `Topic.const_set(:GeneratedAttributeMethods, GAM.new)` -- its
+  //  #name and #inspect read "Topic::GeneratedAttributeMethods")
+  let _ = name_anon key (match v with
+                         | VObj _ -> (if mod_inst_is world v
+                                      then (let _ = map_set modinst_named "y" 1 in mod_inst_backing world v)
+                                      else v)
+                         | _ -> v) in
   // `const_added(:NAME)` on the module the constant landed in -- Object for a
   // bare one. This is the only door constants come through, so the hook cannot
   // be missed; the flag keeps a program that never defines it from paying a
@@ -13130,11 +13144,39 @@ and arr_partition = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i: i
 // group_by: hash of block-value -> array of elements (first-seen order).
 and arr_group_by = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) ->
   match xs with
-  | Nil -> mkhash acc
+  | Nil -> hstored_seed gc_cenv0 world (mkhash acc)
   | Cons (h, t) ->
     let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
+    // a key with its own #hash / #eql? is grouped by them, as `h[k] <<= x`
+    // would: ActiveRecord's preloader runs `loaders.group_by(&:loader_query)`
+    // and each query was a group of its own -- one SELECT per association
+    // where ruby sends one for all of them
+    if elems_user_hash world (Cons (k, Nil)) then
+      (let (found9, cur9) = hash_lookup_w gc_cenv0 world (0 - 1) acc k in
+       let lst = (match cur9 with
+                  | VArr id -> (if found9 then list_append (deref id) (Cons (h, Nil)) else Cons (h, Nil))
+                  | _ -> Cons (h, Nil)) in
+       arr_group_by world encl theblk t (hash_put_w gc_cenv0 world (0 - 1) acc k (arr_new lst)))
+    else
     let lst = (match hash_get acc k with VArr id -> list_append (deref id) (Cons (h, Nil)) | _ -> Cons (h, Nil)) in
     arr_group_by world encl theblk t (hash_put acc k (arr_new lst))
+// A table built from pairs, entered again through `[]=` when a key carries
+// its own #hash / #eql? -- what a hash LITERAL does (EHsh). The structural
+// merge keeps two keys that say they are equal as two entries.
+and hash_rekey_w = fn env -> fn world -> fn (h0: Val) ->
+  match h0 with
+  | VHsh hid0 ->
+    (let kv9 = hderef hid0 in
+     if elems_user_hash world kv9 then
+       (let h9 = mkhash Nil in
+        let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        let rec put9 = fn (xs: Val list) ->
+          (match xs with
+           | Cons (k9, Cons (v9, t9)) -> (let _ = invoke_val_c env world nb9 h9 "[]=" (Cons (k9, Cons (v9, Nil))) false in put9 t9)
+           | _ -> ()) in
+        let _ = put9 kv9 in h9)
+     else h0)
+  | _ -> h0
 
 // each_with_object(o): run block with (elem, o) for each; return o.
 and arr_each_with_object = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (o: Val) ->
@@ -13149,7 +13191,7 @@ and arr_each_with_object = fn world -> fn encl -> fn theblk -> fn (xs: Val list)
 and arr_to_h_blk = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i: int) -> fn (xs0: Val list) -> fn (ver0: int) -> fn (acc: Val list) ->
   let ver = arr_ver id in
   match arr_lv id i xs0 ver0 with
-  | Nil -> FNext (mkhash (hash_merge Nil (val_rev acc Nil)))
+  | Nil -> FNext (hash_rekey_w gc_cenv0 world (mkhash (hash_merge Nil (val_rev acc Nil))))
   | Cons (h, t) ->
     (match run_block world encl theblk (Cons (h, Nil)) with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
@@ -14290,6 +14332,11 @@ and arr_hash_rec = fn env -> fn world -> fn (id: int) ->
                           (match invoke_val_c env world nb9 r9 "to_int" Nil false with
                            | VInt n -> n | _ -> 0)
                         | other -> val_hash other)
+                     // (a Hash element holding a key or value with its own
+                     //  #hash answers as Hash#hash does: `[name, scope.values]
+                     //  .hash` is how ActiveRecord's preloader keys a query,
+                     //  and two equal ones hashed apart)
+                     | VHsh hh9 when elems_user_hash world (hderef hh9) -> hash_pairs_code env world (hderef hh9) 7193
                      | _ -> val_hash h) in
            go t (floor_mod (acc * 31 + hv) 1000000007))) in
      let r = go (deref id) 17 in
@@ -14335,13 +14382,37 @@ and val_intersect_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val lis
      then Cons (h9, val_intersect_w env world t9 ys)
      else val_intersect_w env world t9 ys)
 
+// Array#- asks no #hash when EITHER array is small (16 elements or fewer,
+// rb_ary_diff's SMALL_ARRAY_LEN): each element is looked for with rb_eql
+// alone -- the same object, or its own #eql?. A #hash that raises is then
+// never reached: ActiveRecord's `predicates - other.predicates` holds a bind
+// whose #hash refuses an out-of-range Integer, and the #eql? before it
+// answers false from the plain values.
 and val_subtract_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
+  let rec short = fn (l: Val list) -> fn (n: int) ->
+    (match l with
+     | Nil -> true
+     | Cons (_, t) -> if n == 0 then false else short t (n - 1)) in
+  val_subtract_wx env world xs ys (short xs 16 || short ys 16)
+and val_subtract_wx = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) -> fn (small: bool) ->
   match xs with
   | Nil -> (Nil : Val list)
   | Cons (h9, t9) ->
-    (if val_member_eqlw env world ys h9
-     then val_subtract_w env world t9 ys
-     else Cons (h9, val_subtract_w env world t9 ys))
+    (if (if small then val_member_eql_small env world ys h9 else val_member_eqlw env world ys h9)
+     then val_subtract_wx env world t9 ys small
+     else Cons (h9, val_subtract_wx env world t9 ys small))
+and val_member_eql_small = fn env -> fn world -> fn (ys: Val list) -> fn (x: Val) ->
+  match ys with
+  | Nil -> false
+  | Cons (h9, t9) ->
+    (if (match (x, h9) with
+         | (VObj ia, VObj ib) ->
+           (if ia == ib then true
+            else if has_meth world (dispatch_cls_of world x) "eql?"
+            then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) x "eql?" (Cons (h9, Nil)) false)
+            else rb_eql_w env world x h9)
+         | _ -> rb_eql_w env world x h9)
+     then true else val_member_eql_small env world t9 x)
 
 and val_any_in_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
@@ -15185,6 +15256,8 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     //   while the method said the environment. Ask once, here.
     // (through a singleton too: pp.rb's `class << ENV` retags it)
     if str_eq cls "EnvHash" || (is_sng_cls cls && str_eq (sng_supername world cls) "EnvHash") then inspect_w env world (mkhash (env_hash_list ()))
+    // (an instance of a Module subclass that a constant names: mod_inst_name_s)
+    else if (if usr9 then false else true) && (if str_eq (mod_inst_name_s world v) "" then false else true) then mod_inst_name_s world v
     // a BasicObject has no #inspect (Kernel's is Object's): `p b` and
     // `[b].inspect` are ruby's NoMethodError, unless it defined one
     // (...unless it has a #method_missing, which an undefined name reaches
@@ -16470,6 +16543,11 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           && (map_has (name_set "modpriv") name0 || str_eq name0 "refine" || str_eq name0 "using") then
     raise_exc_iv world "NoMethodError" ("private method '" ++ name0 ++ "' called for module " ++ inspect_w env world recv0)
       (Cons (("__name", VSym name0), Cons (("__recv", recv0), Nil)))
+  // (...and it prints as the constant that names it, once one does)
+  else if (str_eq name0 "inspect" || str_eq name0 "to_s") && (match args0 with Nil -> true | _ -> false)
+          && (if str_eq (mod_inst_name_s world recv0) "" then false else true)
+          && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
+    mkstr (mod_inst_name_s world recv0)
   else if mod_inst_delegates world recv0 name0 then
     (let _ = (if str_eq name0 "define_method" || ((str_eq name0 "private" || str_eq name0 "public" || str_eq name0 "protected") && (match args0 with Nil -> false | _ -> true)) then frz_recv_check env world recv0 else ()) in
      invoke_val_c env world blk (mod_inst_backing world recv0) name0 args0 vischeck)
@@ -18135,6 +18213,14 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                                 let _ = map_delete seen ("o" ++ str_of_int oid) in r9))
                        | _ ->
                          str_of (invoke_val_c env world noblk h "to_s" Nil false) e0))
+                 // a class or module is asked its #to_s too: one a program
+                 // gave the class (minitest's spec classes answer the name
+                 // they were described with, from a module they extend) is
+                 // what a join of `[cls, "desc"]` has to show
+                 | VClass _ ->
+                   (match invoke_val_c env world noblk h "to_s" Nil false with
+                    | VStr sh -> app e0 (sget sh) (enc_canon_name (senc_get sh))
+                    | _ -> app e0 (to_s h) "US-ASCII")
                  | _ -> app e0 (to_s h) "US-ASCII") in
               ljoin t e1 false)) in
         // ⚠ the TOP level is walked as ruby walks it, by index on the array as
@@ -18338,7 +18424,13 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           && (match args with Cons (VArr _, _) -> true | _ -> false)
           && (match recv with
               | VArr a1 -> (match args with
-                            | Cons (VArr a2, _) -> (if rb_eq recv (VArr a2) then false else arr_has_obj world (deref a1))
+                            // (...and for #eql?, an element with its own #eql? or
+                            //  #hash and no #==: `[q].eql?([q2])` answered the
+                            //  structural false without asking q, so an Array
+                            //  of such keys was never found as a Hash key)
+                            | Cons (VArr a2, _) -> (if rb_eq recv (VArr a2) then false
+                                                    else arr_has_obj world (deref a1)
+                                                         || (str_len name == 4 && elems_user_hash world (deref a1)))
                             | _ -> false)
               | _ -> false) then
     (match recv with
@@ -18977,7 +19069,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
          ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)")
      | Nil ->
        (match recv with
-        | VArr id -> mkhash (hkeys_frozen (hash_merge Nil (arr_to_h_pairs env world (deref id) 0)))
+        | VArr id -> hash_rekey_w env world (mkhash (hkeys_frozen (hash_merge Nil (arr_to_h_pairs env world (deref id) 0))))
         | _ -> VNil))
   // Array#delete compares the same way (element == obj) and additionally takes
   // a block to run when NOTHING matched -- it removed by structural equality
@@ -20433,7 +20525,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                                | _ -> args))
                     | _ -> args)
                  | _ -> args) in
-       hash_bracket world a9)
+       hash_rekey_w env world (hash_bracket world a9))
     else if str_eq c "Array" && (str_len name == 2 && str_eq name "[]") then arr_new args
     // A subclass inherits the [] constructor: MyArray[1, 2] builds an array
     // tagged with the subclass, WITHOUT calling the subclass's #initialize
@@ -27627,7 +27719,9 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           then (let l9 = builtin_frame_label world mrecv mnm in
                 if str_len l9 > 0 then VClass (substring l9 0 (str_index_of l9 "#"))
                 else VClass (display_cls world (dispatch_cls_of world mrecv)))
-          else VClass (impl_public mown))
+          // (a method of the module an instance of a Module subclass backs is
+          //  owned by that INSTANCE: mod_inst_self)
+          else mod_inst_self (impl_public mown))
        // The same four as UnboundMethod (see there): the defined-as name, the
        // definition further up, a copy, and a hash. A bound Method's owner may
        // be empty (a method reached on a primitive receiver), in which case the
@@ -29726,8 +29820,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                    | _ -> VNil))
           else raise_exc world "TypeError" ("bind argument must be an instance of " ++ cls_display world (if str_eq rt9 "" then ucls else rt9)))
        else if (str_len name == 4 && str_eq name "name") then VSym unm
+       // (...the INSTANCE of a Module subclass when the method lives in the
+       //  module it backs: ActiveRecord's method_missing walks
+       //  `method.super_method while !method.owner.is_a?(GeneratedAttribute
+       //  Methods)`, and the owner was a plain anonymous Module)
        else if (str_len name == 5 && str_eq name "owner") then
-         VClass (impl_public (if method_core_has_field id 2
+         mod_inst_self (impl_public (if method_core_has_field id 2
                  then method_text_or ucls (method_core_field id 2)
                  // (a builtin's: where ruby defines it, as for Method#owner)
                  // ⚠ the ANCESTOR that defines it, not the class asked: has_meth
@@ -34307,8 +34405,15 @@ and warning_emit = fn world -> fn (s: str) -> fn (cat: Val) ->
 // prelude's Enumerable is a module IN the method table (Enumerable__Impl), so
 // asking whether the class "has" the name calls every Enumerable receiver
 // user-defined. The owner is the question.
+// (a class is asked through its SINGLETON class: a class method of the
+//  program's own -- ActiveRecord's `Account.count(:firm_id) { true }`, which
+//  `delegate` defines -- is not the builtin Enumerable#count, and its block
+//  was dropped with "given block not used")
 and builtin_answers = fn world -> fn (recv: Val) -> fn (name: str) ->
-  (let own9 = owner_anc world (ancestors_of world (dispatch_cls_of world recv)) name in
+  (let c9 = (match recv with
+             | VClass cc9 -> "(sng:" ++ cc9 ++ ")"
+             | _ -> dispatch_cls_of world recv) in
+   let own9 = owner_anc world (ancestors_of world c9) name in
    str_eq own9 "" || str_eq own9 "Enumerable__Impl")
 
 // `h.fetch(k, default) { }` / `[].fetch(i, default) { }` / `ENV.fetch(k, d) { }`
@@ -34897,6 +35002,15 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                 && (match newblk with (false, _, _, _) -> false | _ -> true)
                 && builtin_answers world recv name
              then rb_warn world "block supersedes default value argument" else ()) in
+    // Enumerator#first / #take take no block, and a block given to one is
+    // not called: the walk still stops at the count. `enum.first(4) do
+    // |batch| ... end` (activerecord's find_in_batches test) went to the
+    // iterator path and ran the whole enumerator -- 12 queries for 4 batches.
+    if ((str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "take"))
+       && (match newblk with (false, _, _, _) -> false | _ -> true)
+       && (match recv with VObj _ -> str_eq (dispatch_cls_of world recv) "Enumerator" | _ -> false) then
+      invoke_val_c env world blk recv name args false
+    else
     if (arg_beats_block name
         // Array#index is find_index under another name (String#index takes no block)
         || (str_len name == 5 && str_eq name "index" && (match recv with VArr _ -> true | _ -> false)))
@@ -36612,7 +36726,10 @@ and tally_into = fn env -> fn world -> fn (recv: Val) -> fn (h0: Val) ->
   | (VHsh hid, VArr aid) ->
     (let _ = (if val_frozen_mut h then (let _ = raise_exc world "FrozenError" ("can't modify frozen Hash: " ++ inspect_w env world h) in ()) else ()) in
      let _ = list_iter_vals (deref aid) (fn (e9: Val) ->
-               (let nv9 = (match hash_lookup (hderef hid) e9 with
+               // (a key with its own #hash is looked up by it, as it is stored)
+               (let nv9 = (match (if elems_user_hash world (Cons (e9, Nil))
+                                  then hash_lookup_w env world hid (hderef hid) e9
+                                  else hash_lookup (hderef hid) e9) with
                            | (true, VInt n9) -> VInt (n9 + 1)
                            | (true, other9) -> raise_exc world "TypeError" ("wrong argument type " ++ class_name other9 ++ " (expected Integer)")
                            | _ -> VInt 1) in
@@ -36958,6 +37075,12 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   else if (str_len name == 5 && str_eq name "tally") && (match recv with VArr _ -> true | _ -> false)
           && (match args with Cons (_, Nil) -> true | _ -> false)
   then tally_into env world recv (match args with Cons (h9, _) -> h9 | Nil -> VNil)
+  // (...and a plain #tally of elements with their own #hash counts into a
+  //  new Hash the same way, so two that are #eql? are one key)
+  else if (str_len name == 5 && str_eq name "tally") && (match args with Nil -> true | _ -> false)
+          && (match recv with VArr tid9 -> elems_user_hash world (deref tid9) | _ -> false)
+          && (if prim_user_has world recv "tally" then false else true)
+  then tally_into env world recv (mkhash Nil)
   else
   // ⚠ the PRECISION of the rounding family is an integer CONVERSION too, and
   // the leaf that applies it (prim_method_raw) has no world to ask an object
@@ -39674,6 +39797,23 @@ and sng_mixin_syms = fn world -> fn (sng: str) -> fn (skip: Val list) ->
 //   and evaluation names go to it -- unless the subclass defines the name.
 //   The names that describe the OBJECT (singleton_class, ivars, allocate,
 //   superclass) stay with the object.
+// the name an instance of a Module subclass prints as: the constant it was
+// assigned to (through the module it backs), or "" while it has none --
+// Module#inspect and #to_s, which are the object's own until then
+and mod_inst_name_s = fn world -> fn (recv: Val) ->
+  if map_len modinst_named == 0 then "" else
+  match recv with
+  | VObj id ->
+    (let (_, _, _, iv9) = world in
+     let k9 = str_of_int id ++ "@__modbk" in
+     if map_has iv9 k9 then
+       (match map_get iv9 k9 with
+        | VClass c9 ->
+          (let n9 = (if map_has anon_name c9 then (match map_get anon_name c9 with VStr h9 -> sget h9 | _ -> "") else "") in
+           if str_len n9 >= 2 && str_eq (substring n9 0 2) "#<" then "" else n9)
+        | _ -> "")
+     else "")
+  | _ -> ""
 and mod_inst_delegates = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VObj id ->
@@ -40515,6 +40655,11 @@ and responds_x0 = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: 
     // ...and a subclass of a thread primitive inherits the builtin's
     // (prim_sub): `MyQ.new.respond_to?(:push)` was false
     || (map_len prim_sub > 0 && map_has prim_sub cls && builtin_pub_meth (map_get prim_sub cls) name)
+    // ...and a SUBCLASS of Fiber inherits Fiber's (the row above is asked by
+    // the object's own class name): `class F < Fiber; def join; resume while
+    // alive?; end; end` -- the bare `alive?` was a NameError
+    || (fb_inst_name name && (if str_eq cls "Fiber" then false else true) && obj_is_a world cls "Fiber"
+        && (if map_len undefs > 0 && undef_blocked world cls name then false else true))
     // ...and what `instance_methods` lists for the class (Kernel's,
     // BasicObject's, Comparable's): `o.respond_to?(:instance_eval)` was false
     // for a name the list named and the object answered
@@ -48150,6 +48295,21 @@ and range_case_equal_native = fn world -> fn (recv: Val) -> fn (args: Val list) 
            ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)")
 
 and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn (args: Val list) ->
+  // An alias of a builtin that changes its receiver refuses a frozen one, as
+  // the builtin does under its own name. The frozen check is asked with the
+  // name that was CALLED, and the alias's name is not a mutator's:
+  // HashWithIndifferentAccess writes through `alias_method :regular_writer,
+  // :[]=`, and `Book.statuses["bad"] = 40` changed a frozen enum mapping.
+  let _ = (if val_frozen_mut recv && is_mutating_method src
+              && (match recv with
+                  | VStr _ -> (if str_len src == 6 && str_eq src "delete" then false else true)
+                  | VArr _ -> true
+                  | VHsh _ -> true
+                  | _ -> false)
+           then (let _ = raise_exc_iv world "FrozenError"
+                           ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect env world recv)
+                           (Cons (("__recv", recv), Nil)) in ())
+           else ()) in
   match (recv, args) with
   // (an alias of a builtin definition hook is that no-op hook, not the name
   //  asked again: `alias_method :included_orig, :included` and then a new
@@ -52855,6 +53015,37 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // super from a method of a primitive subclass (Array/String/Hash) into the
   // builtin base: use the builtin implementation.
   let hk = hng_key recv in
+  // ⚠ ...which refuses a FROZEN receiver, as the builtin does when it is
+  //   called by its own name. The frozen check lives at the doors a call
+  //   comes through by name, and it is skipped there for a name the class
+  //   defines itself -- so `def delete(k) = super(convert_key(k))`
+  //   (HashWithIndifferentAccess) deleted from a frozen Hash, and
+  //   `Book.statuses.delete("published")` changed a frozen enum mapping.
+  //   (Array#delete of an element that is not there changes nothing and is
+  //   no error, delete_is_noop; String#delete answers a new string. A bang
+  //   method that answers an Enumerator without a block, and an arity error,
+  //   come first, as at the direct door.)
+  let frz_skip9 = enum_needs_block meth
+                  || (transform_bang_bare meth args && (let (hb9, _, _, _) = superblk in if hb9 then false else true))
+                  || arr_mut_arity_wrong recv meth args in
+  let _ = (if frz_skip9 then () else match recv with
+           | VStr _ -> (if val_frozen_mut recv && is_mutating_method meth && (if str_eq meth "delete" then false else true)
+                        then (let _ = raise_exc_iv world "FrozenError"
+                                        ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect gc_cenv0 world recv)
+                                        (Cons (("__recv", recv), Nil)) in ())
+                        else ())
+           | VArr _ -> (if val_frozen_mut recv && is_mutating_method meth
+                           && (if delete_is_noop gc_cenv0 world recv meth args then false else true)
+                        then (let _ = raise_exc_iv world "FrozenError"
+                                        ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect gc_cenv0 world recv)
+                                        (Cons (("__recv", recv), Nil)) in ())
+                        else ())
+           | VHsh _ -> (if val_frozen_mut recv && is_mutating_method meth
+                        then (let _ = raise_exc_iv world "FrozenError"
+                                        ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect gc_cenv0 world recv)
+                                        (Cons (("__recv", recv), Nil)) in ())
+                        else ())
+           | _ -> ()) in
   // BasicObject#instance_exec / #instance_eval from an override's `super`
   // (an Array or Hash subclass's too): the builtin arm, once, with the
   // block -- bi_skip passes the override that called super
@@ -63856,7 +64047,14 @@ and math_conv_args = fn env -> fn world -> fn (xs: Val list) ->
 // The class a FrozenError names: rb_obj_class as ruby prints it, so an
 // anonymous class is #<Class:0x...> rather than the internal name (an object
 // with a singleton class still names its real class).
-and frz_cls = fn world -> fn (v: Val) -> cls_display world (class_name v)
+// (the class a frozen value is said to be: its own, a subclass's too --
+//  "can't modify frozen HashWithIndifferentAccess", not "frozen Hash")
+and frz_cls = fn world -> fn (v: Val) ->
+  match v with
+  | VStr _ -> cls_display world (dispatch_cls_of world v)
+  | VArr _ -> cls_display world (dispatch_cls_of world v)
+  | VHsh _ -> cls_display world (dispatch_cls_of world v)
+  | _ -> cls_display world (class_name v)
 
 and math_conv_redef = fn env -> fn world -> fn (h: Val) -> fn (cls: str) ->
   if has_meth world cls "to_f" then
@@ -65630,15 +65828,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = declare_nils env (clause_body_targets clauses) in
     exec_stmt env world blk (SIf (clauses, els9))
   | SIf (clauses, els) ->
-    // after the if, declare (as nil) any assignment targets in branches
-    // that did not run — Ruby defines locals at parse time.
-    // The scan is deep: an assignment inside a `begin`, a loop or a nested
-    // `if` of the branch that did not run declares its name too (resolv.rb's
-    // `hosts = ... rescue LoadError` under an untaken `if` is exactly that).
-    let f = run_if env world blk clauses els in
-    let _ = declare_nils env (clauses_targets clauses) in
-    let _ = declare_nils env (deep_targets els) in
-    f
+    // the assignment targets of every branch are declared (as nil) whether or
+    // not the branch runs — Ruby defines locals at parse time: run_if
+    run_if env world blk clauses els
   | SWhile (cond, body) ->
     // (a Thread body's loops are counted: a `break` inside one is the loop's)
     let tb9 = map_has env "__thrbody" in
@@ -65650,12 +65842,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = declare_nils env (deep_targets body) in
     f
   | SCase (subj, whens, els) ->
-    let f = (match subj with
-             | ECaseNone -> run_case_truthy env world blk whens els
-             | _ -> run_case env world blk (eval_e env world blk subj) whens els) in
-    let _ = declare_nils env (whens_targets whens) in
-    let _ = declare_nils env (deep_targets els) in
-    f
+    // (each `when` declares its targets once, in the order of the text, as
+    //  an `if`'s branches do: run_if)
+    (match subj with
+     | ECaseNone -> run_case_truthy env world blk whens els
+     | _ -> run_case env world blk (eval_e env world blk subj) whens els)
   | SCaseIn (subj, clauses, has_else, els) ->
     // Ruby declares every pattern variable at parse time (they exist as nil
     // even when no clause matches). Pre-declare, then try each clause.
@@ -67065,12 +67256,37 @@ and run_begin_f = fn env -> fn world -> fn blk -> fn (body_f: unit -> Flow) -> f
 
 
 and run_if = fn env -> fn world -> fn blk -> fn clauses -> fn (els: Stmt list) ->
+  // ⚠ EVERY BRANCH DECLARES ITS TARGETS, ONCE, IN THE ORDER OF THE TEXT. A
+  //   local is a local from where its first assignment is written, whether or
+  //   not that line runs, so a branch that is passed over declares its names
+  //   BEFORE the next branch runs: a block there that assigns one writes the
+  //   method's variable, not a variable of its own (ActiveRecord's
+  //   compute_cache_version: `if loaded then size = ... else with_connection {
+  //   size, timestamp = ... } end`). The branch that runs declares its own
+  //   after it (it may have stopped before an assignment), and then the
+  //   branches after it. All of them used to be declared after the whole
+  //   `if`; declaring the passed-over ones a second time there cost a fifth
+  //   of a loop around an if/elsif/else.
+  // The scan is deep: an assignment inside a `begin`, a loop or a nested
+  // `if` of a branch that did not run declares its name too (resolv.rb's
+  // `hosts = ... rescue LoadError` under an untaken `if` is exactly that).
   match clauses with
-  | Nil -> run_stmts env world blk els
+  | Nil ->
+    (match els with
+     | Nil -> run_stmts env world blk els
+     | _ -> (let f = run_stmts env world blk els in
+             let _ = declare_nils env (deep_targets els) in f))
   | Cons (cl, rest) ->
     let (c, b) = cl in
-    if truthy (eval_e env world blk c) then run_stmts env world blk b
-    else run_if env world blk rest els
+    if truthy (eval_e env world blk c) then
+      (let f = run_stmts env world blk b in
+       let _ = declare_nils env (deep_targets b) in
+       let _ = (match rest with Nil -> () | _ -> declare_nils env (clauses_targets rest)) in
+       let _ = (match els with Nil -> () | _ -> declare_nils env (deep_targets els)) in
+       f)
+    else
+      (let _ = declare_nils env (deep_targets b) in
+       run_if env world blk rest els)
 
 and run_while = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body: Stmt list) ->
   // A REGION PER ITERATION -- the loop-shaped sibling of run_stmts' region per
@@ -71732,11 +71948,23 @@ and defined_eval_recv = fn env -> fn world -> fn blk -> fn (recv: Expr) ->
 // plain equality.
 and run_case = fn env -> fn world -> fn blk -> fn (v: Val) -> fn whens -> fn (els: Stmt list) ->
   match whens with
-  | Nil -> run_stmts env world blk els
+  | Nil ->
+    (match els with
+     | Nil -> run_stmts env world blk els
+     | _ -> (let f = run_stmts env world blk els in
+             let _ = declare_nils env (deep_targets els) in f))
   | Cons (w, rest) ->
     let (vs, b) = w in
-    if when_matches env world blk v vs then run_stmts env world blk b
-    else run_case env world blk v rest els
+    if when_matches env world blk v vs then
+      (let f = run_stmts env world blk b in
+       let _ = declare_nils env (list_append_str (exprs_pat_vars vs) (deep_targets b)) in
+       let _ = (match rest with Nil -> () | _ -> declare_nils env (whens_targets rest)) in
+       let _ = (match els with Nil -> () | _ -> declare_nils env (deep_targets els)) in
+       f)
+    else
+      // (a `when` passed over declares its targets before the next is tried)
+      (let _ = declare_nils env (list_append_str (exprs_pat_vars vs) (deep_targets b)) in
+       run_case env world blk v rest els)
 
 and case_any_eqq = fn world -> fn (value9: Val) -> fn (candidates9: Val list) ->
   match candidates9 with
@@ -75927,11 +76155,22 @@ and rx_split_go_l = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) 
 // subjectless case: the first when whose any condition is truthy wins.
 and run_case_truthy = fn env -> fn world -> fn blk -> fn whens -> fn (els: Stmt list) ->
   match whens with
-  | Nil -> run_stmts env world blk els
+  | Nil ->
+    (match els with
+     | Nil -> run_stmts env world blk els
+     | _ -> (let f = run_stmts env world blk els in
+             let _ = declare_nils env (deep_targets els) in f))
   | Cons (w, rest) ->
     let (vs, b) = w in
-    if any_truthy env world blk vs then run_stmts env world blk b
-    else run_case_truthy env world blk rest els
+    if any_truthy env world blk vs then
+      (let f = run_stmts env world blk b in
+       let _ = declare_nils env (list_append_str (exprs_pat_vars vs) (deep_targets b)) in
+       let _ = (match rest with Nil -> () | _ -> declare_nils env (whens_targets rest)) in
+       let _ = (match els with Nil -> () | _ -> declare_nils env (deep_targets els)) in
+       f)
+    else
+      (let _ = declare_nils env (list_append_str (exprs_pat_vars vs) (deep_targets b)) in
+       run_case_truthy env world blk rest els)
 
 and any_truthy = fn env -> fn world -> fn blk -> fn (vs: Expr list) ->
   match vs with

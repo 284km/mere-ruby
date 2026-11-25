@@ -2357,12 +2357,15 @@ and colon_after_value = fn (s: str) -> fn (i: int) ->
     //  a Symbol)
     // (...and not on an alias / undef line, whose second name is a Symbol:
     //  `alias :"g_#{i}" :"f_#{i}"`)
-    if lvt_names_stmt s i then false
-    else if str_eq pc "\"" || str_eq pc "'" || str_eq pc "]" then true
-    else if str_eq pc ")" then (if paren_closes_def_params s p then false else true)
-    else if is_digit pc then is_digit (char_at s (word_start s p))
-    else if (is_alnum pc || str_eq pc "_") && p < i - 1 then lvt_prev_local s i
-    else false
+    // A label cannot follow a value. Decide that from its preceding token
+    // before scanning back for alias/undef: on a long hash-literal line,
+    // checking the statement head at every label was quadratic.
+    let value9 = (if str_eq pc "\"" || str_eq pc "'" || str_eq pc "]" then true
+                  else if str_eq pc ")" then (if paren_closes_def_params s p then false else true)
+                  else if is_digit pc then is_digit (char_at s (word_start s p))
+                  else if (is_alnum pc || str_eq pc "_") && p < i - 1 then lvt_prev_local s i
+                  else false) in
+    value9 && not (lvt_names_stmt s i)
 // `^name` where only a pattern can stand -- after `in`, `=>`, `,`, `[`, `(`,
 // `|`, `{`, `:` -- pins a LOCAL, and ruby refuses a name that is none there:
 // "a: no such local variable" (test_pattern_matching's test_var_pattern). A
@@ -6008,6 +6011,17 @@ and is_binop_tok = fn (p: str) ->
   str_eq p "<=" || str_eq p ">=" || str_eq p "<=>" || str_eq p "===" || str_eq p "=~" ||
   str_eq p "!~" || str_eq p "&&" || str_eq p "||"
 
+// The rest of a paren-less argument list, read so that a `do` after it is
+// the COMMAND's: `tmp_yaml ["a", "b"], yaml do |t| ... end` gives the block to
+// tmp_yaml, not to `yaml`. Answers whether an enclosing command already owned
+// the `do` (then this one does not take it either).
+and puts_args_cmd = fn toks -> fn (acc: Expr list) ->
+  let had = map_has parser_flags "nodo" in
+  let _ = map_set parser_flags "nodo" VNil in
+  let (es, r) = parse_puts_args toks acc in
+  let _ = if had then () else map_delete parser_flags "nodo" in
+  (es, r, had)
+
 and ambig_or_call = fn (id: str) -> fn (ae: Expr) -> fn toks ->
   if starts_do_block toks then
     (let (bp, bb, r) = parse_block toks in (ECallB (id, Cons (ae, Nil), bp, bb), r))
@@ -6049,8 +6063,8 @@ and ambig_or_call = fn (id: str) -> fn (ae: Expr) -> fn toks ->
           match r1 with
           | Cons (TP cm9, r1b) ->
             if str_eq cm9 "," then
-              (let (es9, r1c) = parse_puts_args (skip_nls r1b) (Cons (call_arg, Nil)) in
-               if starts_do_block r1c
+              (let (es9, r1c, had9) = puts_args_cmd (skip_nls r1b) (Cons (call_arg, Nil)) in
+               if (if had9 then false else starts_do_block r1c)
                then (let (bp9, bb9, r1d) = parse_block r1c in (ECallB (id, es9, bp9, bb9), r1d))
                else (ECall (id, es9), r1c))
             else
@@ -7060,8 +7074,8 @@ and parse_primary = fn toks ->
             match r2b with
             | Cons (TP cm, r2c) ->
               if str_eq cm "," then
-                (let (es, r2d) = parse_puts_args (skip_nls r2c) (Cons (ae, Nil)) in
-                 if starts_do_block r2d
+                (let (es, r2d, had9) = puts_args_cmd (skip_nls r2c) (Cons (ae, Nil)) in
+                 if (if had9 then false else starts_do_block r2d)
                  then (let (bp, bb, r2e) = parse_block r2d in (ECallB (id, es, bp, bb), r2e))
                  else (ECall (id, es), r2d))
               // ...and so does a comma after a BINARY operator's right side:
@@ -7071,10 +7085,10 @@ and parse_primary = fn toks ->
               // know (see lvt_prev_local), and an index of a local followed by
               // a comma is no statement ruby accepts either.
               else if is_binop_tok cm then
-                (let (es, r2d) = parse_puts_args r Nil in
+                (let (es, r2d, had9) = puts_args_cmd r Nil in
                  match es with
                  | Cons (_, Cons (_, _)) ->
-                   if starts_do_block r2d
+                   if (if had9 then false else starts_do_block r2d)
                    then (let (bp, bb, r2e) = parse_block r2d in (ECallB (id, es, bp, bb), r2e))
                    else (ECall (id, es), r2d)
                  // ...and with no comma the operator is still the ARGUMENT's:
@@ -7123,8 +7137,10 @@ and parse_primary = fn toks ->
             else (ECall (id, es), r2b))
          // `foo -> { ... }` — a paren-less lambda argument (the lambda owns its
          // own block; `.call`/chains after it stay part of the argument).
+         // (...and a `do` after the arguments is the command's, as after any
+         //  other argument: `assert_changes -> { x }, to: y do ... end`)
          else if str_eq p "->" then
-           let (es, r2b) = parse_puts_args r Nil in
+           let (es, r2b, _) = puts_args_cmd r Nil in
            (if starts_block r2b then
               let (bp, bb, r4) = parse_block r2b in (ECallB (id, es, bp, bb), r4)
             else (ECall (id, es), r2b))
@@ -7355,10 +7371,22 @@ and arr_items_sep = fn r -> fn (acc: Expr list) ->
 
 and parse_arr_expr = fn toks -> fn (acc: Expr list) ->
   let _ = cmd_clear () in
-  let eln9 = tok_line toks in
   let (e0, r0) = parse_expr toks in
-  // (an element on a later line calls on its own line: ln_before)
-  let e = ln_before e0 eln9 in
+  // Only expressions that can call need a line annotation. Literals do not
+  // use it; scanning to the line end once per element made long arrays
+  // quadratic. Keep the ordinary line calculation for observable calls.
+  let e = (match e0 with
+           | EMethod (_, m9, _) when str_len m9 > 2 && str_eq (substring m9 0 2) "__" -> e0
+           | ECall (m9, _) when str_len m9 > 2 && str_eq (substring m9 0 2) "__" -> e0
+           | EVar m9 when str_len m9 > 2 && str_eq (substring m9 0 2) "__" -> e0
+           | EMethod (_, _, _) -> ln_before e0 (tok_line toks)
+           | EMethodB (_, _, _, _, _) -> ln_before e0 (tok_line toks)
+           | ECall (_, _) -> ln_before e0 (tok_line toks)
+           | ECallB (_, _, _, _) -> ln_before e0 (tok_line toks)
+           | ESafe (_, _, _) -> ln_before e0 (tok_line toks)
+           | ESafeB (_, _, _, _, _) -> ln_before e0 (tok_line toks)
+           | EVar _ -> ln_before e0 (tok_line toks)
+           | _ -> e0) in
   let _ = cmd_refuse "unexpected local variable or method; expected a `,` separator for the array elements" in
   let r = skip_nls r0 in   // allow a newline before the , or ]
   let _ = comma_after_nl_check r0 r in
@@ -7541,7 +7569,7 @@ and parse_hash_items = fn toks -> fn (acc: Expr list) ->
 // They all go through here now.
 and hsh_done = fn (acc: Expr list) -> fn (ln: int) -> fn rest9 ->
   (let its = rev_app acc Nil in
-   let _ = hsh_note_dups its (Nil : (str * int) list) ln in
+   let _ = hsh_warn_dups its ln in
    (EHsh its, rest9))
 and hash_items_sep = fn r3 -> fn (acc: Expr list) ->
   let done9 = hsh_done acc (tok_line r3) in
@@ -7788,7 +7816,7 @@ and finish_call_args = fn (pos: Expr list) -> fn (hp: Expr list) ->
     let ps0 = rev_app pos Nil in
     let ps = drop_blockpass ps0 in
     // the keyword pairs are a hash literal too: `m(k: 1, k: 2)` warns
-    let _ = hsh_note_dups (rev_app hp Nil) (Nil : (str * int) list) (parse_line_now ()) in
+    let _ = hsh_warn_dups (rev_app hp Nil) (parse_line_now ()) in
     eapp (drop_kwsplats ps)
          (let _ = (if val_list_len_e hp > 131070 then syn_refuse "too many keyword arguments" else ()) in
           Cons (EKwHash (eapp (rev_app hp Nil) (kwsplats_doubled ps)), only_blockpass ps0))
@@ -8067,7 +8095,7 @@ and parse_bare_pair = fn toks -> fn (hp: Expr list) ->
 // a paren-less call's arguments end with its bare hash, and maybe a block-pass
 // after it (rbs writes `any_node? child, nodes: nodes, &block`)
 and bare_hash_done = fn (acc: Expr list) -> fn (hp: Expr list) -> fn r ->
-  let _ = hsh_note_dups hp (Nil : (str * int) list) (parse_line_now ()) in
+  let _ = hsh_warn_dups hp (parse_line_now ()) in
   match r with
   | Cons (TP amp9, r9) when str_eq amp9 "&" || str_eq amp9 " &" ->
     let (bpe, r10) = parse_expr r9 in (rev_app (Cons (EBlockPass bpe, Cons (EKwHash hp, acc))) Nil, r10)
@@ -9132,7 +9160,7 @@ and flow_rhs = fn toks ->
       let (hp, r5) = (match r3 with
                       | Cons (TP c3, r4) when str_eq c3 "," -> parse_bare_hash (skip_nls r4) hp0
                       | _ -> (rev_app hp0 Nil, r3)) in
-      let _ = hsh_note_dups hp (Nil : (str * int) list) (parse_line_now ()) in
+      let _ = hsh_warn_dups hp (parse_line_now ()) in
       (list_append_expr init9 (Cons (EKwHash hp, Nil)), r5))
    | _ -> (es, r))
 and parse_rhs_list = fn toks -> fn (acc: Expr list) ->
@@ -11219,27 +11247,27 @@ and lit_rat_disp = fn (n: str) -> fn (d: str) ->
 // wins is the LAST one, so the warning is about the earlier one being dropped.
 // ⚠ Only literal keys: `{x => 1, y => 1}` may or may not collide at run time,
 // and ruby says nothing about those either.
-and hsh_note_dups = fn (items: Expr list) -> fn (seen: (str * int) list) -> fn (ln: int) ->
+// The seen set is private parser work. A region bounds its lifetime even
+// for eval loops; no Ruby Array or Hash is created to track static keys.
+and hsh_warn_dups = fn (items: Expr list) -> fn (ln: int) ->
+  region HDUP { hsh_note_dups items (map_new ()) ln }
+and hsh_note_dups = fn (items: Expr list) -> fn seen -> fn (ln: int) ->
   (match items with
-   // ⚠ `**{a: 1}` contributes KEYS too, and they collide with the literal ones
-   // around them: `{**{a: 1}, a: 2}` warns. Only a literal hash can be read
-   // this way -- `**h` names a variable, and what is in it is a run-time
-   // question this walk cannot answer, so it contributes nothing.
    | Cons (EKwSplat inner9, Cons (_, t9)) ->
-     (match inner9 with
-      | EHsh its9 -> hsh_note_dups t9 (hsh_note_dups its9 seen ln) ln
-      | _ -> hsh_note_dups t9 seen ln)
-   // interleaved [k1, v1, k2, v2, ...]: step two at a time.
+     (let _ = (match inner9 with
+                | EHsh its9 -> hsh_note_dups its9 seen ln
+                | _ -> ()) in
+      hsh_note_dups t9 seen ln)
    | Cons (k9, Cons (_, t9)) ->
      (let key = when_lit_key k9 in
-      if str_eq key "" then hsh_note_dups t9 seen ln
-      else if when_seen_line seen key > 0 then
-        (let _ = warn_note (parse_time_file () ++ ":" ++ str_of_int ln
+      let _ = (if str_eq key "" then ()
+               else if map_has seen key && map_get seen key > 0 then
+                 warn_note (parse_time_file () ++ ":" ++ str_of_int ln
                             ++ ": warning: key " ++ hsh_key_disp k9
-                            ++ " is duplicated and overwritten on line " ++ str_of_int ln) in
-         hsh_note_dups t9 seen ln)
-      else hsh_note_dups t9 (Cons ((key, ln), seen)) ln)
-   | _ -> seen)
+                            ++ " is duplicated and overwritten on line " ++ str_of_int ln)
+               else map_set seen key ln) in
+      hsh_note_dups t9 seen ln)
+   | _ -> ())
 // the key as the warning prints it: ruby inspects it.
 and hsh_key_disp = fn (e: Expr) ->
   (match e with
