@@ -3530,7 +3530,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                || (str_len name >= 12 && str_eq (substring name 0 12) "__ENCODING__")
                || (str_len name == 5 && str_eq name "break") || (str_len name == 4 && str_eq name "next") || (str_len name == 4 && str_eq name "redo")
                || (str_len name == 5 && str_eq name "retry") || (str_len name == 6 && str_eq name "return") then mkstr "expression"
-       else if (str_len name == 5 && str_eq name "yield") then (let (has, _, _, _) = blk in if has then mkstr "yield" else VNil)
+       else if (str_len name == 5 && str_eq name "yield") then (let (has, _, _, _) = lexical_yield_block env blk in if has then mkstr "yield" else VNil)
        else if (str_len name == 5 && str_eq name "super") then defined_super_str env world
        // $globals and @/@@-prefixed names have their own categories.
        else if str_len name > 0 && str_eq (char_at name 0) "$" then
@@ -3806,7 +3806,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                   else (if map_has private_consts (anc_const_key_q world c cn) then false else true))
                            then mkstr "constant" else VNil
              | _ -> VNil)
-     | EYield _ -> let (has, _, _, _) = blk in if has then mkstr "yield" else VNil
+     | EYield _ -> let (has, _, _, _) = lexical_yield_block env blk in if has then mkstr "yield" else VNil
      // An array LITERAL is defined only if every element is: ruby answers nil
      // for `defined?([Object, Undefined])`. It was "expression" whatever it
      // held, because the literal fell into the catch-all.
@@ -3993,6 +3993,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ERegex (p9, f9) -> VRegex (p9, f9, "")
   | EYield arges ->
     let args = eval_args env world blk arges in
+    let blk = lexical_yield_block env blk in
     let (has, bparams, bbody, cenv) = blk in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     // `break` inside the yielded block terminates the method the block was
@@ -4002,9 +4003,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // boundary (running any intervening ensure blocks). If the home method has
     // already returned, that is a LocalJumpError.
     if has then (match run_block world noblk blk args with
-                 | FBreak v when lv_has env "__blk_lam" -> v
+                 | FBreak v when (if lv_has env "__dm_yield" then
+                                   (match lv_get env "__dm_yield" with VProc pid9 -> map_has lambda_ids (str_of_int pid9) | _ -> false)
+                                 else lv_has env "__blk_lam") -> v
                  | FBreak v ->
-                     let target = (if lv_has env "__blk_home" then lv_get env "__blk_home"
+                     let target = (if lv_has env "__dm_yield" then
+                                     (match lv_get env "__dm_yield" with
+                                      | VProc pid9 -> (if map_has proc_home (str_of_int pid9) then map_get proc_home (str_of_int pid9) else VInt (0 - 1))
+                                      | _ -> VInt (0 - 1))
+                                   else if lv_has env "__blk_home" then lv_get env "__blk_home"
                                    else yield_home_fid env) in
                      let tk = (match target with VInt t -> t | _ -> 0 - 1) in
                      if tk < 0 || (if fb_frame_live tk then false else true)
@@ -4604,11 +4611,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let _ = (if map_has pending_srcproc "v" then stamp_meth_src_proc key (str_of_int (map_get pending_srcproc "v")) else ()) in
          // capture the block active here so a `yield` in the defined method
          // reaches it (Ruby's define_method closure semantics).
-         let _ = (match blk with
-                  | (true, _, _, _) -> let pid = (proc_next ()) in
-                    let _ = store_proc (str_of_int pid) blk in
-                    map_set dm_captured key (VProc pid)
-                  | _ -> if map_has dm_captured key then map_delete dm_captured key else ()) in
+         let _ = dm_capture_blk env key blk bb2 in
           // `block_given?` inside the body asks about THIS frame -- the one the
           // block was written in -- so the answer is fixed here, at definition,
           // and does not depend on how the method is later called.
@@ -23471,6 +23474,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                        let _ = set_meth meths0 (target ++ "#" ++ nm)
                                  (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
                        let _ = map_set dm_methods (target ++ "#" ++ nm) VNil in
+                       let (encl9, _) = strip_yblk_markers (false, (Nil : str list), (Nil : Stmt list), e2) ps2 in
+                       let _ = dm_capture_blk e2 (target ++ "#" ++ nm) encl9 bb2 in
                        VSym nm)
         | other -> raise_exc world "TypeError" ("wrong argument type " ++ class_name other ++ " (expected Proc/Method/UnboundMethod)")))
     // define_method with a name and no body: the block was the body, and there
@@ -23570,10 +23575,15 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           (match proc_as_block pid with (h2, ps2, bb2, e2) ->
              let ps2 = (match ps2 with Cons (m, rest) -> if str_eq m lambda_blk_marker then rest else ps2 | _ -> ps2) in
              // (a block-local is no parameter of the method: dm_params)
-             let mps2 = drop_block_locals ps2 in
+             let mps2 = dm_params ps2 bb2 in
              let _ = set_meth meths0 (c ++ "#" ++ nm) (Meth (mps2, meth_block_defaults (mps2) bb2, drop_defaults_prologue bb2)) in
              let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
              let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
+             let (encl9, _) = strip_yblk_markers (false, (Nil : str list), (Nil : Stmt list), e2) ps2 in
+             let _ = dm_capture_blk e2 (c ++ "#" ++ nm) encl9 bb2 in
+             let _ = map_set dm_had_blk (c ++ "#" ++ nm)
+                       (if lv_has e2 "__has_blk" then lv_get e2 "__has_blk"
+                        else VBool (match encl9 with (true, _, _, _) -> true | _ -> false)) in
              let _ = stamp_meth_src_proc (c ++ "#" ++ nm) (str_of_int pid) in
              VSym nm)
         // (a Symbol, an Integer, ...: not a body either)
@@ -35246,7 +35256,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                     (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
           let _ = map_set dm_methods mk2 VNil in
           let _ = dm_store_closure mk2 (h2, ps2, bb2, e2) in
-          let _ = dm_capture_blk mk2 blk bb2 in
+          let _ = dm_capture_blk env mk2 blk bb2 in
           // (...and `block_given?` in the body asks the frame it was written
           //  in, as the bare form's does: a flag, kept for every body)
           let _ = map_set dm_had_blk mk2
@@ -35278,7 +35288,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                    (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
          let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
-         let _ = dm_capture_blk (c ++ "#" ++ nm) blk bb2 in
+         let _ = dm_capture_blk env (c ++ "#" ++ nm) blk bb2 in
          let _ = map_set dm_had_blk (c ++ "#" ++ nm)
                    (if lv_has env "__has_blk" then lv_get env "__has_blk"
                     else VBool (match blk with (true, _, _, _) -> true | _ -> false)) in
@@ -51465,13 +51475,6 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     //  calls are its original's, as ruby counts them)
     let _ = (if vec_get cov_st 0 == 2
              then cov_meth (if map_has alias_srcname dk then defcls ++ "#" ++ map_get alias_srcname dk else dk) else ()) in
-    // a method defined via define_method yields to the block captured at
-    // definition time when the call site itself passes no block.
-    let blk = (match blk with
-               | (true, _, _, _) -> blk
-               | _ -> if map_has dm_captured dk
-                      then (match map_get dm_captured dk with VProc pid -> proc_get (str_of_int pid) | _ -> blk)
-                      else blk) in
     // a define_method body is a closure: its frame is a CHILD of the scope the
     // block was written in, so the body reads those locals -- and writes reach
     // them, which copying the values in could not do (`define_method(:bump) {
@@ -51492,14 +51495,14 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     let _ = (if map_has r2k_methods dk then map_set frame "__r2k" VNil else ()) in
     // A body that came from define_method is a BLOCK, and a block's
     // `block_given?` asks about the frame it was written in -- never about the
-    // call that reached the method. `C.new.dm { }` answered true here where
-    // Ruby answers false; `yield` inside such a body is not even legal Ruby
-    // (it is a SyntaxError), and `|&b|` still receives the caller's block,
-    // which is the supported way to take one.
+    // call that reached the method. A lexical yield uses the captured
+    // definition-site block, while |&b| still receives this call's block.
     let _ = (if map_has dm_closenv dk
-             then map_set frame "__in_dm"
+             then (let _ = map_set frame "__dm_yield"
+                             (if map_has dm_captured dk then map_get dm_captured dk else VNil) in
+                   map_set frame "__in_dm"
                     (if map_has dm_had_blk dk
-                     then map_get dm_had_blk dk else VBool false)
+                     then map_get dm_had_blk dk else VBool false))
              else ()) in
     let _ = map_set frame "self" recv in
     // a method body has no instance_eval definee in force: its `def` goes to
@@ -62832,6 +62835,14 @@ and yblk_env = fn denv -> fn blk ->
      let _ = brk_carry denv ch9 in
      let ypid = proc_next () in
      let _ = store_proc (str_of_int ypid) blk in
+     let source9 = block_source_proc blk in
+     let home9 = (if source9 >= 0 && map_has proc_home (str_of_int source9)
+                  then map_get proc_home (str_of_int source9)
+                  else if lv_has denv "__blk_home" then lv_get denv "__blk_home"
+                  else yield_home_fid denv) in
+     let _ = map_set proc_home (str_of_int ypid) home9 in
+     let _ = (if blk_is_lambda blk || lv_has denv "__blk_lam"
+              then map_set lambda_ids (str_of_int ypid) VNil else ()) in
      let _ = map_set ch9 "__yblk" (VProc ypid) in
      ch9)
   | _ -> denv
@@ -62861,11 +62872,38 @@ and yblk_blk = fn newblk -> fn blk ->
 // the block in force where a define_method / define_singleton_method with a
 // RECEIVER was called, kept for the body's `yield` (dm_captured, as the bare
 // form keeps it) -- when the body has one
-and dm_capture_blk = fn (key: str) -> fn blk -> fn (body: Stmt list) ->
-  match blk with
+and lexical_yield_block = fn env -> fn blk ->
+  let chosen9 = (if lv_has env "__dm_yield" then
+                   (match lv_get env "__dm_yield" with
+                    | VProc pid9 -> proc_get (str_of_int pid9)
+                    | _ -> (false, (Nil : str list), (Nil : Stmt list), env))
+                 else blk) in
+  match chosen9 with
+  | (true, _, _, _) -> chosen9
+  | _ -> (if lv_has env "__yblk" then
+            (match lv_get env "__yblk" with VProc pid9 -> proc_get (str_of_int pid9) | _ -> chosen9)
+          else chosen9)
+and dm_capture_blk = fn env -> fn (key: str) -> fn blk -> fn (body: Stmt list) ->
+  match lexical_yield_block env blk with
   | (true, _, _, _) when body_yields body ->
-    (let pid = proc_next () in
-     let _ = store_proc (str_of_int pid) blk in
+    (let actual9 = lexical_yield_block env blk in
+     let pid = proc_next () in
+     let _ = store_proc (str_of_int pid) actual9 in
+     let source9 = (if lv_has env "__dm_yield" then
+                      (match lv_get env "__dm_yield" with VProc p9 -> p9 | _ -> 0 - 1)
+                    else match blk with
+                    | (true, _, _, _) -> block_source_proc actual9
+                    | _ -> (if lv_has env "__yblk" then
+                              (match lv_get env "__yblk" with VProc p9 -> p9 | _ -> 0 - 1)
+                            else block_source_proc actual9)) in
+     let home9 = (if source9 >= 0 && map_has proc_home (str_of_int source9)
+                  then map_get proc_home (str_of_int source9)
+                  else if lv_has env "__blk_home" then lv_get env "__blk_home"
+                  else yield_home_fid env) in
+     let _ = map_set proc_home (str_of_int pid) home9 in
+     let _ = (if blk_is_lambda actual9 || (source9 >= 0 && map_has lambda_ids (str_of_int source9))
+              || (source9 < 0 && lv_has env "__blk_lam")
+              then map_set lambda_ids (str_of_int pid) VNil else ()) in
      map_set dm_captured key (VProc pid))
   | _ -> if map_has dm_captured key then map_delete dm_captured key else ()
 // A fresh anonymous owner with one ordinary method definition cannot run
@@ -63702,6 +63740,8 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                        // gone by the time the method runs unless they are kept
                        // here. The call form of define_method already did this.
                        let _ = dm_store_closure (cls ++ "#" ++ nm) (false, bp, bb, cenv) in
+                       let _ = dm_capture_blk cenv (cls ++ "#" ++ nm)
+                                 (false, (Nil : str list), (Nil : Stmt list), cenv) bb in
                        // ...and whether the frame this block was WRITTEN in had
                        // a block of its own, which is what `block_given?` inside
                        // the defined method answers. This is the fifth place a
