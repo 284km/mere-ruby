@@ -334,7 +334,11 @@ static int str_resize(struct mr_mirror *m, long len, int term) {
     return 1;
 }
 
-static uint64_t body_hash(struct mr_mirror *m) {
+/* (inlined where it is used: write_back runs it for every touched struct at
+ *  every crossing, and a call there, with the length tested again inside,
+ *  cost about five instructions each time -- hold_locals(20000), PR #284's
+ *  review) */
+static inline __attribute__((always_inline)) uint64_t body_hash(struct mr_mirror *m) {
     if (m->body == T_STRING)
         return hash_bytes(str_ptr(m), (size_t)m->as.string.len, 1);
     return hash_bytes(m->as.array.as.heap.ptr, sizeof(VALUE) * (size_t)m->as.array.as.heap.len, 2);

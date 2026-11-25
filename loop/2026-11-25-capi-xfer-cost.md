@@ -22,8 +22,11 @@ each value and the row, `rb_ary_store` of each column, and
   Where the bytes go is set for that one request alone: a collection at the
   safepoint before it, whose dmark may read Strings too, does not see it.
 - **The hash takes four lanes past 32 bytes** (`hash_long`): one lane was a
-  chain of dependent multiplies. Under 32 bytes it is the one lane, inlined
-  where `write_back` uses it, as before.
+  chain of dependent multiplies. Under 32 bytes it is the one lane. (The
+  first push said it stayed inlined in `write_back`; it did not -- the
+  review of #284 found write_back calling an out-of-line `body_hash`, about
+  5.5 instructions more per check. `body_hash` is always_inline now, checked
+  in the binary: no call from write_back.)
 - **The safepoint is counted in C.** The interpreter answers MR_SAFEPOINT with
   how many to pass over before it is asked again -- 31, a statement
   boundary's one in 32, or `16 * N - 1` under `MERE_RUBY_GC_STRESS=N` -- and
@@ -84,12 +87,25 @@ each side's `gem install`; the scripts are in the PR description.
 | sqlite3 prepared `reset!; step` x 30000 | 9.42 G | 7.97 G | -15% |
 | sqlite3, require and open only | 3.64 G | 3.63 G | |
 | `join_in_c(3000)`, GC.disable | 2.18 G | 1.88 G | -14% (0.28 s -> 0.14 s) |
-| `hold_locals(20000)`, GC.disable | 28.38 G | 30.60 G | +8% (1.75 s -> 1.66 s) |
+| `hold_locals(20000)`, GC.disable | 28.38 G | 29.38 G | +3.4% (1.89 s -> 1.58 s), see below |
 | capi/check api.rb, GC_STRESS=1 | 242.1 G | 243.8 G | +0.7% |
 | typeddata.rb, GC_STRESS=1 | 33.30 G | 33.37 G | |
 | ensure.rb, GC_STRESS=1 | 34.33 G | 34.29 G | |
 | fiber.rb, GC_STRESS=1 | 5.48 G | 5.49 G | |
 | numeric.rb, GC_STRESS=1 | 2.52 G | 2.52 G | |
+
+hold_locals after the inlining (median of 3, main and this branch
+alternately; GC.disable):
+
+| N | main | this branch | |
+|---|---|---|---|
+| 5000 | 2.765 G | 2.771 G | +0.2% |
+| 10000 | 7.833 G | 8.011 G | +2.3% |
+| 20000 | 28.415 G | 29.379 G | +3.4% (time 1.89 s -> 1.58 s) |
+
+The difference still grows with N squared -- about 2.4 instructions per
+check of a touched String at a crossing (N^2 checks): the `n < 32` test
+that picks the one-lane hash. Before the inlining it was about 5.5.
 
 Per operation, subtracting the open-only run: execute 1.10 -> 1.02 M
 instructions, step 0.193 -> 0.145 M. Ruby 4.0.10 on the same scripts:
@@ -125,6 +141,14 @@ reference ruby 4.0.10:
   less (2420 of 2602); capi_mkmf_check passes.
 - capi_gem_check (with #281's `--build-jobs 1`): seventeen gems install and
   behave the same on both sides (173 lines); the other-ruby control fails.
+- ruby/test_encoding.rb and ruby/test_m17n.rb (`unittest/run.sh`), main's
+  build and this branch, each on the evaluator and with `MERE_RUBY_VM=1`:
+  all four the same -- 142 tests, MATCH 141, BOTH 1, RED 0 (test_encoding
+  15 MATCH; test_m17n 126 MATCH and 1 that fails on both sides).
+- capi_check runs the contracts on the evaluator. Run on the VM
+  (`MERE_RUBY_VM=1`), api.rb stops at line 596 (errinfo after a Ruby
+  rescue) on this build; the review of #284 found main stopping there too,
+  an existing gap of the VM's.
 - After #278: a freeze from Ruby is seen by C reading again -- MR_FREEZE is
   not a read-only request, so it advances the epoch, and rb_obj_freeze
   forgets the mirror's header after it either way.
@@ -138,14 +162,22 @@ reference ruby 4.0.10:
   source's bytes is the fix, in the interpreter's String.
 - **Every crossing hashes every String the C call has touched.** A C call
   that reads many Strings (hold_locals reads 20,000) checks each of them at
-  every later request, which is quadratic -- the same on main. hold_locals
-  takes 8% more instructions than main here and 5% less time. What it would
+  every later request, which is quadratic -- the same on main. Here each
+  check costs about 2.4 instructions more than main's (the length test that
+  picks the hash), so hold_locals(20000) takes 3.4% more instructions and
+  16% less time. What it would
   take: knowing which structs C can have written since the last crossing
   (a page protection, or a pointer handed out only once).
 - **sqlite3's execute is mostly Ruby**: the C API is about a quarter of
   `execute("select 1")` (sample, base: 24% of the samples under
   mr_capi_enter, 12% in C's calls back into Ruby methods); the rest is the
   gem's Ruby code in the interpreter.
+- **str_take can raise in the middle of a collection.** On the collector's
+  reader path (a dmark reading a String between C calls), `str_take` runs
+  while MR_STR_GET is answered during a mark; if `string_room` cannot get
+  memory it calls `rb_memerror`, whose longjmp would cross the
+  interpreter's frames. Only when memory is exhausted (review of #284,
+  a suggestion).
 - **A data object's header is asked again at every call** (`rb_mere_basic`,
   MR_DESCRIBE, 9% of a step): TypedData_Get_Struct reads its flags, and the
   interpreter has run since the last call. Its type cannot change; its
