@@ -173,6 +173,15 @@ class AnonymousConversionValue
   def initialize = @value = :retained
   attr_reader :value
 end
+# Accumulate deleted scoped roots, then collect with an ephemeral root live.
+# This exercises compaction of the native root table, not only Ruby marking.
+root_churn_block = proc {}
+root_churn_conversion = Object.new
+root_churn_conversion.define_singleton_method(:to_proc) { root_churn_block }
+GC.disable
+16_384.times { unused_anonymous_rest(*input, &root_churn_conversion) }
+GC.enable
+
 gc_conversion = Object.new
 gc_conversion.define_singleton_method(:to_proc) { GC.start; proc {} }
 gc_capture = isolation.capture(*[AnonymousConversionValue.new], &gc_conversion)

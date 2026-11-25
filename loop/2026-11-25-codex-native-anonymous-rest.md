@@ -42,7 +42,9 @@ frame slot. A sole anonymous formal has no callback or GC safepoint before
 rest installation: a third fixed integer slot transfers provenance only over
 that atomic interval, and is reset before installation. This avoids generic
 per-call local tuples and temporary frame-map traffic. Native leaf, block,
-iterator, sender and Method boundaries consume Array provenance.
+iterator, sender and Method boundaries consume Array provenance. Idempotent
+native deletion already handles an empty table, so cleanup needs no separate
+presence probe.
 
 A synthetic native rest needs only its refusal note: skip source-length
 walks and fixed-slot writes that only an actual Array or nil can use.
@@ -58,6 +60,14 @@ ruby2_keywords copying; do not compare every Array element.
 Scope pending Array provenance across block conversion. The existing
 temporary iterator root keeps an ephemeral source alive while to_proc or a
 block expression can call Ruby and GC. Exceptions remove the scoped state.
+A growing-call-count memory probe exposed deleted native root copies retained
+in the default arena. Give the existing root table owned storage and include
+it in GC churn accounting and compaction. Its only reader finishes during
+marking; no borrowed entry survives into compaction. The regression first
+accumulates deleted roots with automatic GC disabled, then collects while
+an ephemeral conversion source is held, exercising compaction with a live
+root as well as marking. This reclaims real
+bookkeeping storage without changing Ruby allocation counts.
 CRuby compile.c setup_args_dup_rest_p distinguishes a simple block variable
 from a complex expression that can modify its splat. Preserve the source
 through simple-variable to_proc, but snapshot native argument storage before
@@ -76,8 +86,9 @@ direct/explicit/frozen/nil/converted splats, deep shareability, source aliasing
 across GC, leading/optional/post parameters, repeated splats, local/Binding
 collisions, reflection, large arguments, native boundaries, empty super,
 keyword append, block conversion mutation, exceptions and ephemeral roots.
-All 56 match clean Ruby 4.0.10 on evaluator and VM with GC stress 50. The GC
-root, duplicate-definition and dead-definition gates pass on this candidate.
+All 56 match clean Ruby 4.0.10 on both engines with GC stress 50, including
+the live-root compaction regression, with empty stderr. The GC root,
+duplicate-definition and dead-definition gates pass on this candidate.
 Final-head normal replay, corpus 664, hardware profiles, isolated allocation
 file and full corpus/gate results are required before the batched push.
 
