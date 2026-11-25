@@ -433,7 +433,7 @@ p [:yielder_origin, yielded_keywords]
 
 # Empty value-list keyword merges omit the element; an ordinary splat keeps it.
 empty_value_987 = Hash.ruby2_keywords_hash({})
-p [:empty_value_merges, [**{}], [1, **{}], [**{}, 9], [**empty_value_987], [*[empty_value_987]]]
+p [:empty_value_merges, [**{}], [1, **{}], [**{}, **{}], [**empty_value_987], [*[empty_value_987]]]
 merge_calls_987 = []
 empty_merge_987 = Object.new
 empty_merge_987.define_singleton_method(:to_hash) { merge_calls_987 << :empty; {} }
