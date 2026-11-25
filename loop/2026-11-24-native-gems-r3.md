@@ -524,3 +524,23 @@ average 11.1 at the start, 6.6 at the end.
   against 0.27 s (see above).
 - The skips are the same seven on both sides: SSLv3, three JRuby-only,
   two abstract UNIX sockets, a Linux-only thread name.
+
+## Checks on 0238f6ef (main 8b1b9525 merged, reference ruby 4.0.10)
+
+Gates, bracket_depth and record_hygiene pass; `run_corpus.sh --both` 900/900
+with the hash index on and off; `tools/iseq/vm_corpus.sh` 900 on the VM, 0
+fell back, 0 FAIL; capi_check (both sides, under stress, controls fail),
+capi_spec_check and capi_mkmf_check pass.
+
+capi_gem_check failed twice in a row, on the reference side: ruby 4.0.10's
+own `gem install prism` was killed at the 2 GiB limit (2,118,784 KB after
+6.7 s at load 28.78 → 32.34; 2,109,760 KB after 5.2 s at load 20.27 →
+14.57). RubyGems adds `-j<nprocessors>` (10 here) to make when MAKEFLAGS has
+no `-j` (rubygems/ext/builder.rb:46-47); the check removes MAKEFLAGS and
+measures the whole process tree, so prism's C files compile ten at a time.
+The reference side does not run this branch's build: the same install
+peaked at 1,922,944 KB and passed in the morning's run for #253, at load 59,
+where the compiles overlapped less. So `use` differs only in prism's two
+lines (the reference falls back to its default prism 1.8.2; mere-ruby
+installed 2.1.0, 797,680 KB, 28 s); the other 171 lines are the same and
+every other gem installs on both sides. The check is not changed here.
