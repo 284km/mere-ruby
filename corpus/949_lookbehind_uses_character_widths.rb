@@ -30,3 +30,22 @@ end
 end
 binary = Regexp.new("(?<=\xFF)a".b, Regexp::NOENCODING)
 p binary.match("\xFFa".b)&.to_a&.map(&:bytes)
+
+# Ambiguous trail bytes and consecutive lead-byte runs, at known boundaries.
+{
+  "Windows-31J" => ["\x81\x81", "\x81\x40", "\xA1"],
+  "Big5" => ["\xA1\xA1", "\xA1\x40"],
+  "GBK" => ["\x81\x81", "\x81\x40", "\x80"],
+  "EUC-JP" => ["\xA1\xA1", "\x8F\xA2\xAF", "\x8E\xA1"]
+}.each do |encoding, pieces|
+  [1, 2, 5].each do |count|
+    pieces.each do |tail|
+      prefix = ((pieces.first * count) + tail).force_encoding(encoding)
+      expression = Regexp.new("(?<=(.))x".force_encoding(encoding))
+      match = expression.match(prefix + "x")
+      p [encoding, count, tail.bytes, match&.begin(0), match && match[1].bytes]
+    end
+  end
+  expression = Regexp.new("(?<!a)x".force_encoding(encoding))
+  p [encoding, ("x" * 256).force_encoding(encoding).scan(expression).size]
+end
