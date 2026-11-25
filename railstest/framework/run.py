@@ -642,10 +642,18 @@ def report(record):
 def compare(args):
     old = json.loads(args.base.read_text())
     new = json.loads(args.new.read_text())
+    policy = old.get('case_identity_policy', 'literal')
+    if policy not in CASE_IDENTITY_POLICIES or policy != new.get('case_identity_policy', 'literal'):
+        raise ValueError('compare requires the same supported case identity policy in both records')
     worse = 0
     for name in sorted(set(old['files']) | set(new['files'])):
         a, b = old['files'].get(name), new['files'].get(name)
-        before, after = (classify_entry(a) if a else {}), (classify_entry(b) if b else {})
+        before, after = (classify_entry(a, policy) if a else {}), (classify_entry(b, policy) if b else {})
+        if policy != 'literal' and a and b and 'reference' in a['sides'] and 'reference' in b['sides']:
+            aliases = case_identity_aliases(a['sides']['reference'], b['sides']['reference'], policy)
+            # An EXTRA with the old spelling must not collide with a mapped test.
+            aliases = {key: value for key, value in aliases.items() if value not in after}
+            after = {aliases.get(key, key): value for key, value in after.items()}
         lost = sorted(n for n, v in before.items() if v == 'MATCH' and after.get(n) != 'MATCH')
         gained = sorted(n for n, v in after.items() if v == 'MATCH' and before.get(n) != 'MATCH')
         if not (a and b and 'counts' in a and 'counts' in b):
@@ -664,11 +672,11 @@ def compare(args):
     return 1 if worse else 0
 
 
-def classify_entry(entry):
+def classify_entry(entry, identity_policy='literal'):
     sides = entry['sides']
     if entry.get('verdict') != 'COMPARED' or 'mere' not in sides or 'reference' not in sides:
         return {}
-    return classify(sides['reference'], sides['mere'])
+    return classify(sides['reference'], sides['mere'], identity_policy)
 
 
 def main():

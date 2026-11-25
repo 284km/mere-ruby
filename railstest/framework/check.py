@@ -313,6 +313,66 @@ class FrameworkCheck(unittest.TestCase):
                 args.base, args.new = new, base
                 self.assertEqual(0, run.compare(args))
 
+    def identity_record(self, reference_cases, mere_cases, mere_state=None):
+        reference, mere = parsed(transcript(reference_cases)), parsed(transcript(mere_cases))
+        if mere_state:
+            mere['state'] = mere_state
+        record = dict(case_identity_policy='opaque-class-addresses', files={
+            'activesupport/test/x_test.rb': dict(sides=dict(reference=reference, mere=mere))})
+        run.summarize(record)
+        return record
+
+    def compare_records(self, before, after):
+        with tempfile.TemporaryDirectory() as directory:
+            base, new = Path(directory) / 'base.json', Path(directory) / 'new.json'
+            base.write_text(json.dumps(before))
+            new.write_text(json.dumps(after))
+            args = type('Args', (), dict(base=base, new=new))
+            with open(os.devnull, 'w') as sink, patch('sys.stdout', sink):
+                return run.compare(args)
+
+    def test_compare_opaque_addresses_keeps_passes_and_detects_failures(self):
+        a, b, c, d = [self.anonymous_case(x) for x in ('11', '22', '33', '44')]
+        before = self.identity_record({a: '.'}, {b: '.'})
+        self.assertEqual(0, self.compare_records(before, self.identity_record({c: '.'}, {d: '.'})))
+        for verdict in 'FES':
+            self.assertEqual(1, self.compare_records(before, self.identity_record({c: '.'}, {d: verdict})))
+        self.assertEqual(1, self.compare_records(before, self.identity_record({c: 'F'}, {d: '.'})))
+
+    def test_compare_opaque_addresses_rejects_incomplete_or_missing_tests(self):
+        a, b, c, d = [self.anonymous_case(x) for x in ('11', '22', '33', '44')]
+        before = self.identity_record({a: '.'}, {b: '.'})
+        for state in ('INCOMPLETE', 'COUNT_MISMATCH', 'REPORT_MISMATCH', 'WALL_LIMIT', 'MEMORY_LIMIT'):
+            self.assertEqual(1, self.compare_records(before, self.identity_record({c: '.'}, {d: '.'}, state)))
+        self.assertEqual(1, self.compare_records(before, self.identity_record({c: '.'}, {})))
+        self.assertEqual(1, self.compare_records(before, dict(files={}, case_identity_policy='opaque-class-addresses')))
+
+    def test_compare_opaque_addresses_preserves_cross_case_relationships(self):
+        make = self.anonymous_case
+        old = {make('11', 'a'): '.', make('11', 'b'): '.'}
+        consistent = {make('22', 'a'): '.', make('22', 'b'): '.'}
+        inconsistent = {make('22', 'a'): '.', make('33', 'b'): '.'}
+        before = self.identity_record(old, old)
+        self.assertEqual(0, self.compare_records(before, self.identity_record(consistent, consistent)))
+        self.assertEqual(1, self.compare_records(before, self.identity_record(inconsistent, inconsistent)))
+        old = {make('11'): '.', make('22'): '.'}
+        new = {make('33'): '.', make('44'): '.'}
+        self.assertEqual(1, self.compare_records(self.identity_record(old, old), self.identity_record(new, new)))
+
+    def test_compare_opaque_addresses_does_not_hide_extra_name_collisions(self):
+        a, b, c = [self.anonymous_case(x) for x in ('11', '22', '33')]
+        before = self.identity_record({a: '.'}, {b: '.'})
+        after = self.identity_record({c: '.'}, {c: '.', a: '.'})
+        self.assertEqual(1, self.compare_records(before, after))
+
+    def test_compare_refuses_mixed_identity_policies(self):
+        a, b = self.anonymous_case('11'), self.anonymous_case('22')
+        before = self.identity_record({a: '.'}, {b: '.'})
+        after = self.identity_record({a: '.'}, {b: '.'})
+        after.pop('case_identity_policy')
+        with self.assertRaisesRegex(ValueError, 'same supported case identity policy'):
+            self.compare_records(before, after)
+
     def test_jobs_are_bounded(self):
         self.assertEqual(2, run.MAX_JOBS)
 
