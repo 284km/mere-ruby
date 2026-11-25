@@ -132,3 +132,13 @@ corpus, VM counts, all source gates and record_hygiene. Keep earlier-head
 results identified separately until the integrated head is measured. No
 record-only push or full upstream unit suite; serialize corpus sweeps and
 run the allocation file alone.
+
+## Resolve the later Hash-mapping iterator entry
+
+Main a9e68981 adds Hash transform_keys mapping conversion at builtin_iter's
+entry, the same place this PR consumes transient keyword/splat origin.
+Retain both operations: consume this native iterator's incoming origin first,
+then normalize mapping arguments. A user to_hash callback must not inherit
+an unrelated native consumer's origin. Validate both corpus 987 and main's
+941 mapping regression, then take acceptance on this integrated source.
+Keep the completed 1a85c934 results separate from the new head's results.
