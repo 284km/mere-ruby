@@ -78,3 +78,38 @@ value = Object.new
 value.define_singleton_method(:to_s) { '%s' % ["\xFF".b]; 'é' }
 result = '%s' % [value]
 p [result.bytes, result.encoding.name, result.valid_encoding?]
+
+# Inspect a value once, then stringify that returned value. Neither the
+# original inspect nor the returned value's to_s may be called twice.
+[123, nil, true, :symbol, [1, 2]].each do |returned|
+  value = Object.new
+  calls = 0
+  value.define_singleton_method(:inspect) do
+    calls += 1
+    raise 'inspect called twice' if calls > 1
+    returned
+  end
+  p ['%p' % [value], calls]
+end
+['é', "\xFF".b].each do |text|
+  converted = Object.new
+  conversions = 0
+  converted.define_singleton_method(:to_s) { conversions += 1; text }
+  converted.define_singleton_method(:to_str) { raise 'unexpected to_str' }
+  value = Object.new
+  calls = 0
+  value.define_singleton_method(:inspect) { calls += 1; converted }
+  result = '%p' % [value]
+  p [result.bytes, result.encoding.name, result.valid_encoding?, calls, conversions]
+end
+class FormatResult1111
+end
+converted = FormatResult1111.new
+conversions = 0
+converted.define_singleton_method(:to_s) { conversions += 1; 123 }
+converted.define_singleton_method(:to_str) { raise 'unexpected to_str' }
+value = Object.new
+calls = 0
+value.define_singleton_method(:inspect) { calls += 1; converted }
+result = '%p' % [value]
+p [result.match?(/\A#<FormatResult1111:0x[0-9a-f]+>\z/), calls, conversions]
