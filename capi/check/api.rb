@@ -22,6 +22,20 @@ end
 A = ApiFixture
 check(said == '')
 
+# Native flags never call a Ruby predicate, including during mirror refresh.
+[-> { Class.new }, -> { Module.new }, -> { Object.new }, -> { +'' },
+ -> { [] }, -> { {} }, -> { proc {} }, -> { binding }].each do |factory|
+  owner = factory.call
+  $frozen_flag_queries = 0
+  owner.define_singleton_method(:frozen?) { $frozen_flag_queries += 1; false }
+  check(!A.frozen_flags(owner, 0))
+  owner.freeze
+  check(A.frozen_flags(owner, 0))
+  check(A.frozen_flags(factory.call, 1))
+  check(A.frozen_flags(factory.call, 2) { |value| value.freeze })
+  check($frozen_flag_queries == 0)
+end
+
 # C's constant APIs also accept hidden cache names, as io-console's
 # IO.console does. Ruby's own constant lookup must continue to reject them.
 class HiddenConstParent; end
@@ -674,4 +688,30 @@ check(A.capacity(s) == 5000 && s == 'abc')
 buf = String.new
 File.open(__FILE__) { |f| f.read(70000, buf) }
 check(A.capacity(buf) == 70000 && buf == File.binread(__FILE__))
+# What C holds only in its locals survives every collection the requests it
+# makes can run (mr_up's safepoint): a String and an Array C made, across
+# 120 Strings made and dropped and 120 calls -- and the same with the call
+# paused halfway in a Fiber while the program makes garbage and collects.
+digits = (0...120).sum { |i| i.to_s.size }
+names = (0...8).map { |i| "e#{i}" }
+held, ary, sum = A.hold_locals(120)
+check(held == 'held-string' && ary == names && sum == digits)
+paused = Fiber.new { A.hold_locals(120) { |i| Fiber.yield(i) } }
+check(paused.resume == 60)
+junk = (0...200).map { |i| ('x' * 4096) + i.to_s }
+junk = nil
+GC.start
+held, ary, sum = paused.resume
+check(held == 'held-string' && ary == names && sum == digits && !paused.alive?)
+# What C writes into a frozen String's buffer is that String's bytes, as in
+# ruby: the write-back raised FrozenError out of the C call instead
+s = (+'abc').freeze
+seen, same = A.write_frozen(s)
+check(seen == 'Zbc' && same.equal?(s) && s == 'Zbc' && s.frozen?)
+# A long C call that makes its garbage through the C API alone is collected
+# in as it goes, as ruby's malloc limit collects in it: with no Ruby
+# statement in it there was no safepoint here, and puma's parser held
+# gigabytes until it returned (mr_up's safepoint)
+joined, collections = A.join_in_c(400)
+check(joined == (['test'] * 400).join(', ') && collections > 0)
 puts "api contracts: #{$count} passed"

@@ -13,14 +13,21 @@ the Rails plan. The application in `railstest/app` is measured separately by
   gets its own copy of the tagged tree (`git archive`), because tests write
   beside themselves and the two sides run at the same time.
 - **Gems**: `Gemfile` and `Gemfile.lock` hold the published Rails gems,
-  sqlite3, minitest, and five test-only gems. The test-only gems are
+  sqlite3, minitest, and test-only gems. The original test-only gems are
   minitest-mock, rexml, rack-cache, bcrypt and msgpack, at the versions in
   Rails' own lock. minitest (6.1.0) and sqlite3 (2.10.2) are the
   application's locked versions, not Rails' (6.0.6 and 2.9.4). One lock for
   both measurements keeps one set of native builds to trust, and Rails 8.1.4.1
   accepts both. The lock was made from the application's lock with
   `bundle lock --conservative`. That drops puma and adds the five gems.
-  `archives.lock.json` pins all 73 archives with their SHA-256.
+  Action Pack also needs Capybara 3.40.0, Dalli 4.3.3, Launchy 3.1.1 and
+  Selenium WebDriver 4.44.0. These direct versions, and the RubyZip 2.4.1
+  constraint, come from Rails' lock. Their transitive dependencies were
+  resolved conservatively, preserving every previously locked package.
+  `archives.lock.json` pins all 85 archives with their SHA-256.
+  When updating from the earlier 73-archive lock, run `restore` again before
+  `install`. Existing archive bytes are reused; the new locked inventory must
+  be complete and contain no extra archives.
   Rails' own Gemfile is not used: it pulls in external-service gems
   (mysql, redis, selenium, ...) and documentation tools.
 - **Component code**: the tests take `lib/` from the installed component gems.
@@ -43,10 +50,17 @@ measured after it has installed its own gem home.
 
 ## Environment
 
-Both sides use the application measurement's bootstrap (`../bootstrap.rb`),
+By default both sides use the application bootstrap (`../bootstrap.rb`),
 with their own gem home and Bundler, and a scrubbed environment. mere-ruby is
 also given the reference standard library on `RUBYLIB`, as in `../README.md`.
 That is how mere-ruby sees default gem specs. The reference is not.
+
+Action Pack needs `--framework-bootstrap`: this opt-in startup loads the
+reference standard library's unmodified `bundled_gems`, `did_you_mean` and
+`error_highlight`, restoring libraries suppressed by `--disable-gems`.
+Other components retain their existing startup unless the flag is supplied.
+The flag and the selected bootstrap's hash are recorded in `results.json`.
+Installation always keeps the application bootstrap.
 
 A file runs from the component directory as
 
@@ -106,7 +120,10 @@ line, so a class name with spaces (a `describe` block) is kept whole. A test
 that prints to stdout without a newline puts that output in front of its own
 result line. The name read then carries the output, and the test shows as
 MISSING on one side and EXTRA on the other (unless both sides print it the
-same way). It is never counted as a MATCH that did not happen.
+same way). It is never counted as a MATCH that did not happen. A test logger may put
+lines between minitest's name prefix and its duration/verdict; the parser
+keeps that explicit name pending until its result arrives. An orphan result
+or a missing verdict still fails the transcript count checks.
 
 ## Use
 
@@ -132,6 +149,32 @@ python3 railstest/framework/run.py run --jobs 2 \
 python3 railstest/framework/run.py compare --base old/results.json --new new/results.json
 ```
 
+For all 173 Action Pack files, start a local memcached server (the upstream
+MemCacheStore tests otherwise omit their test methods), then run:
+
+```sh
+python3 railstest/framework/run.py run --jobs 2 --require-all-pass --framework-bootstrap \
+  --reference /path/to/ruby-4.0.10/bin/ruby --binary ./mere-ruby \
+  --source /path/to/rails-v8.1.4.1 --gems /path/to/fw-gems --output /path/to/new-run \
+  --env MT_CPU=0 --env MEMCACHE_SERVERS=127.0.0.1:21347 actionpack/test
+```
+
+`MT_CPU=0` uses Rails' supported serial test execution on both sides; the
+runner still runs the two interpreters concurrently. `--require-all-pass`
+is a strict gate: every selected file must complete on both interpreters,
+with the same test inventory and no failures, errors or skips.
+Only the two known upstream files without runnable tests are recorded as EMPTY
+with zero MATCH: controller/new_base/render_xml_test.rb and the zero-byte
+journey/nodes/symbol_test.rb. Their source sizes and SHA-256 digests must match
+the locked tag. Other zero-run files fail the gate, including a MemCacheStore
+file that omits its methods because memcached is unavailable. Missing files, tests,
+unusable references and resource stops exit 1. Without
+this option the runner retains its original measurement-only exit behavior.
+The selected file inventory and gate setting are recorded in `results.json`.
+The frozen 8624fb60 evaluator measurement accounts for all 173 files with
+4,152 MATCH and no RED, recorded in
+`records/actionpack-full-8624fb60.json`. Later builds need their own validation.
+
 `check.py` holds the harness's own controls, which CI runs. They check that a
 missing, failed, duplicated or unconfirmed test never becomes MATCH, that a
 resource stop wins over a summary, that a crash after the summary is visible,
@@ -145,6 +188,14 @@ setting, a secret or a local path.
 `records/` keeps the result JSON of each recorded run. These files hold no
 local paths. Raw logs stay outside the repository.
 
+- `actionpack-integrated-summary.json`: 26 focused Action Pack files, 1091 MATCH,
+  two C API-owned RED and two verified EMPTY files. It links all six native
+  batch records. The matching runtime's complete corpus has 887/887 matches
+  with both hash modes; its VM corpus has 883 VM / 4 fallback / zero differences.
+  `actionpack-integrated-rss.json` compares two large files against main 976bb95d.
+  Full 173-file validation and fresh native installation passed on frozen
+  build 8624fb60 (4,152 MATCH); later builds need separate validation;
+  see `actionpack-plan.json` and the dated Action Pack loop record.
 - `install-c521aa58.json`: both sides' installation from the archives.
   Reference: 505.6 s, peak 1.86 GB. mere-ruby: 405.3 s, peak 716 MB.
   Both passed, and the twelve components' `lib/` match the tag.

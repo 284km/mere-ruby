@@ -120,3 +120,15 @@ and VM under GC stress 50. This also checks a Ruby Array#push override
 receiving real splatted keywords; only the terminal native consumer clears
 the origin. GC-root, duplicate-definition and dead-definition gates pass.
 Current main is merged before all remaining final-head measurements.
+
+## Integrate the CI corrections and current main
+
+Merge main 779c7cc9 after the ERB checker fix in PR 273 and the CI timing
+fix in PR 275. The automatic merge retains main's Action Pack and C API
+frozen-state changes. Before the next batched push, compare the regression
+with clean Ruby on both engines, rebuild in O2, repeat instruction/RSS and
+isolated allocation-file comparisons against this main, and replay the full
+corpus, VM counts, all source gates and record_hygiene. Keep earlier-head
+results identified separately until the integrated head is measured. No
+record-only push or full upstream unit suite; serialize corpus sweeps and
+run the allocation file alone.

@@ -37,10 +37,19 @@ COMPONENTS = ('activesupport', 'activemodel', 'actionview', 'actionpack', 'activ
 # side and EXTRA on the other (or both sides print it alike) -- never a MATCH
 # that did not happen.
 CASE = re.compile(r'^(.+?#.+?) = ([0-9.]+) s = ([.FES])$', re.M)
+CASE_START = re.compile(r'^(.+?#.+?) = ')
+CASE_END = re.compile(r'^([0-9.]+) s = ([.FES])$')
 # The worse of two verdicts for one name, when a transcript reports it twice
 SEVERITY = {'.': 0, 'S': 1, 'F': 2, 'E': 3}
 VERDICTS = ('MATCH', 'RED', 'MISSING', 'UNCONFIRMED', 'BOTH', 'EXTRA')
 SUMMARY = re.compile(r'^(\d+) runs, (\d+) assertions, (\d+) failures, (\d+) errors, (\d+) skips$', re.M)
+
+# Only these unchanged tagged files legitimately contain no runnable tests.
+# A missing service can also make a nonempty test file report zero runs.
+EMPTY_TEST_SOURCES = {
+    'actionpack/test/controller/new_base/render_xml_test.rb': (290, '6aca88be3c0886bd9fc5ae974042053d16a1148f5dbe9484f2e41d7faa0345fb'),
+    'actionpack/test/journey/nodes/symbol_test.rb': (0, 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'),
+}
 
 
 def sha(path):
@@ -159,10 +168,12 @@ def shared_settings(items):
     return dict(sorted(settings.items()))
 
 
-def side_environment(side_dir, stdlib, mere, shared):
+def side_environment(side_dir, stdlib, mere, shared, framework_bootstrap=False):
     """A side's environment: the runner's own, then --env's settings, which
     are the same for both sides"""
     env = environment(side_dir, stdlib, mere=mere)
+    if framework_bootstrap:
+        env['RUBYOPT'] = '--disable-gems -r' + str(ROOT / 'bootstrap.rb')
     env.update(shared)
     return env
 
@@ -297,10 +308,31 @@ def select_files(source, selections):
     return files
 
 
+def reported_cases(text):
+    """Verbose minitest prints a name before running a test, and its result
+    afterwards. A test's logger can insert whole lines between these parts.
+    Keep that explicit name pending; never assign a result without one.
+    """
+    pending = None
+    for line in text.splitlines():
+        complete = CASE.fullmatch(line)
+        if complete:
+            yield complete.groups()
+            pending = None
+        else:
+            start = CASE_START.match(line)
+            end = CASE_END.fullmatch(line)
+            if start:
+                pending = start.group(1)
+            elif end and pending is not None:
+                yield pending, *end.groups()
+                pending = None
+
+
 def parse(stdout, outcome):
     text = stdout.read_text(encoding='utf-8', errors='replace')
     cases, duplicates = {}, []
-    for identity, _seconds, verdict in CASE.findall(text):
+    for identity, _seconds, verdict in reported_cases(text):
         if identity in cases:
             duplicates.append(identity)
             # the worse verdict stands: a name reported F then . is not a pass
@@ -370,6 +402,8 @@ def run(args, data):
     shared = shared_settings(args.env)
     source_head = check_source(args.source, data)
     files = select_files(args.source, args.paths)
+    sources = {name: dict(source_bytes=(args.source / name).stat().st_size,
+                          source_sha256=sha(args.source / name)) for name in files}
     version, stdlib, _gem = reference_facts(args.reference)
     supervise = supervisor()
     sides = selected_sides(args)
@@ -400,17 +434,19 @@ def run(args, data):
                   rails_source_commit=source_head,
                   source_ref=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
                   runner_sha256=sha(Path(__file__)), archive_lock_sha256=sha(ROOT / 'archives.lock.json'),
+                  framework_bootstrap=args.framework_bootstrap,
+                  bootstrap_sha256=sha((ROOT if args.framework_bootstrap else RAILSTEST) / 'bootstrap.rb'),
                   binary_sha256=sha(args.binary) if args.binary else None, reference_sha256=sha(args.reference),
                   seed=SEED, wall_seconds=WALL, family_rss_kib=RSS_KB, jobs=args.jobs, env=shared,
                   install_binary_sha256={side: install_record['sides'][side].get('binary_sha256') for side, _b in sides},
-                  files={})
+                  selected_files=files, require_all_pass=args.require_all_pass, files={})
     lock_ = threading.Lock()
     record['mere_env'] = mere_env
 
     def one(side, binary, name):
         component, relative = name.split('/', 1)
         side_dir = args.gems / side
-        env = side_environment(side_dir, stdlib, side == 'mere', shared)
+        env = side_environment(side_dir, stdlib, side == 'mere', shared, args.framework_bootstrap)
         if side == 'mere':
             env.update(mere_env)
         stem = args.output / side / 'logs' / name.replace('/', '__')
@@ -418,7 +454,7 @@ def run(args, data):
         outcome, stdout, _stderr = capture(command, env, trees[side] / component, stem, supervise)
         parsed = parse(stdout, outcome)
         with lock_:
-            entry = record['files'].setdefault(name, dict(sides={}))
+            entry = record['files'].setdefault(name, dict(sides={}, **sources[name]))
             entry['sides'][side] = dict(outcome, state=parsed['state'], summary=parsed['summary'],
                                         duplicates=parsed['duplicates'], cases=parsed['cases'])
             print(f"{side:9} {parsed['state']:15} {outcome['seconds']:8.1f}s {outcome['peak_rss_kb']:8} KiB  {name}", flush=True)
@@ -430,7 +466,50 @@ def run(args, data):
     summarize(record)
     write_json(args.output / 'results.json', record)
     report(record)
-    return 0
+    return 1 if args.require_all_pass and not all_pass(record, files) else 0
+
+
+def all_pass(record, selected_files):
+    """A strict gate, separate from the runner's usual measurement-only exit.
+
+    Every selected file must finish on both sides, with the same test
+    inventory and no failure, error or skip on either interpreter. Account
+    separately for upstream files that define no runnable tests.
+    """
+    if not selected_files or set(record['files']) != set(selected_files):
+        return False
+    for name, entry in record['files'].items():
+        if empty_entry(name, entry):
+            continue
+        sides = entry['sides']
+        if set(sides) != {'reference', 'mere'}:
+            return False
+        if sides['reference']['cases'].keys() != sides['mere']['cases'].keys():
+            return False
+        for side in sides.values():
+            if side['state'] != 'COMPLETE' or not side['cases']:
+                return False
+            if any(verdict != '.' for verdict in side['cases'].values()):
+                return False
+    return True
+
+
+def empty_entry(name, entry):
+    source = (entry.get('source_bytes'), entry.get('source_sha256'))
+    if source != EMPTY_TEST_SOURCES.get(name):
+        return False
+    sides = entry['sides']
+    if set(sides) != {'reference', 'mere'}:
+        return False
+    for side in sides.values():
+        if side['cases'] or side.get('exit', 0) != 0 or side.get('limit'):
+            return False
+        if side['state'] == 'ZERO' and side['summary'] == dict(runs=0, assertions=0, failures=0, errors=0, skips=0):
+            continue
+        if entry.get('source_bytes') == 0 and side['state'] == 'INCOMPLETE' and side['summary'] is None:
+            continue
+        return False
+    return True
 
 
 def schedule(sides, files, jobs, one):
@@ -458,7 +537,10 @@ def summarize(record):
         if 'reference' not in sides or 'mere' not in sides:
             continue
         reference, mere = sides['reference'], sides['mere']
-        if reference['state'] != 'COMPLETE':
+        if empty_entry(name, entry):
+            entry['verdict'] = 'EMPTY'
+            verdicts = {}
+        elif reference['state'] != 'COMPLETE':
             # Without a healthy reference there is nothing to compare against.
             entry['verdict'] = 'REFERENCE_' + reference['state']
             verdicts = {}
@@ -478,10 +560,11 @@ def summarize(record):
                      unconfirmed=sorted(n for n, v in verdicts.items() if v == 'UNCONFIRMED'),
                      extra=sorted(n for n, v in verdicts.items() if v == 'EXTRA'))
         component = name.split('/', 1)[0]
-        row = totals.setdefault(component, dict(files=0, reference_unusable=0, mere_incomplete=0, order_differs=0,
+        row = totals.setdefault(component, dict(files=0, empty_files=0, reference_unusable=0, mere_incomplete=0, order_differs=0,
                                                 **{k: 0 for k in VERDICTS}))
         row['files'] += 1
-        row['reference_unusable'] += entry['verdict'] != 'COMPARED'
+        row['empty_files'] += entry['verdict'] == 'EMPTY'
+        row['reference_unusable'] += entry['verdict'] not in ('COMPARED', 'EMPTY')
         row['mere_incomplete'] += entry['verdict'] == 'COMPARED' and mere['state'] != 'COMPLETE'
         row['order_differs'] += entry['verdict'] == 'COMPARED' and not entry['same_order']
         for key, value in counts.items():
@@ -490,9 +573,9 @@ def summarize(record):
 
 
 def report(record):
-    print(f"{'component':14} {'files':>5} {'refbad':>6} {'mere!':>5} {'order':>5} {'MATCH':>6} {'RED':>5} {'MISS':>5} {'UNCF':>5} {'BOTH':>5} {'EXTRA':>5}")
+    print(f"{'component':14} {'files':>5} {'empty':>5} {'refbad':>6} {'mere!':>5} {'order':>5} {'MATCH':>6} {'RED':>5} {'MISS':>5} {'UNCF':>5} {'BOTH':>5} {'EXTRA':>5}")
     for component, row in record.get('components', {}).items():
-        print(f"{component:14} {row['files']:5} {row['reference_unusable']:6} {row['mere_incomplete']:5} {row['order_differs']:5} "
+        print(f"{component:14} {row['files']:5} {row.get('empty_files', 0):5} {row['reference_unusable']:6} {row['mere_incomplete']:5} {row['order_differs']:5} "
               f"{row['MATCH']:6} {row['RED']:5} {row['MISSING']:5} {row['UNCONFIRMED']:5} {row['BOTH']:5} {row['EXTRA']:5}")
 
 
@@ -547,6 +630,10 @@ def main():
                         help='run: a setting for mere-ruby only (repeatable; recorded in the results)')
     parser.add_argument('--other-install-binary', action='store_true',
                         help='run: allow a binary other than the one that installed --gems (recorded in the results)')
+    parser.add_argument('--framework-bootstrap', action='store_true',
+                        help='run: restore bundled_gems, did_you_mean and error_highlight startup (recorded)')
+    parser.add_argument('--require-all-pass', action='store_true',
+                        help='run: exit 1 unless every selected file completes on both sides with all tests passing')
     parser.add_argument('--base', type=Path)
     parser.add_argument('--new', type=Path)
     args = parser.parse_intermixed_args()
@@ -555,6 +642,10 @@ def main():
             setattr(args, key, getattr(args, key).resolve())
     if not 1 <= args.jobs <= MAX_JOBS:
         parser.error(f'--jobs must be 1..{MAX_JOBS}: the machine is shared')
+    if args.framework_bootstrap and args.command != 'run':
+        parser.error('--framework-bootstrap requires run')
+    if args.require_all_pass and (args.command != 'run' or args.side != 'both'):
+        parser.error('--require-all-pass requires run --side both')
     if args.command == 'compare':
         if not (args.base and args.new):
             parser.error('compare requires --base and --new')
