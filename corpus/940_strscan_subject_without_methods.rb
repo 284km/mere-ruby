@@ -29,3 +29,22 @@ scanner = StringScanner.allocate
     p [method, error.class, error.message]
   end
 end
+
+# Saved native readers keep their definition after Ruby replaces the name.
+readers = [:length, :bytesize, :byteslice, :[], :getbyte, :encoding].map { |name| String.instance_method(name) }
+subject = "éab"
+arguments = [[], [], [0, 2], [0, 1], [0], []]
+readers.zip(arguments).each do |reader, args|
+  value = reader.bind_call(subject, *args)
+  p(value.is_a?(String) ? value.bytes : value)
+end
+subject.define_singleton_method(:bytesize) { raise 'subject predicate' }
+p readers[1].bind_call(subject)
+class String
+  alias_method :original_byte_size940, :bytesize
+  def bytesize = raise('replaced predicate')
+end
+p readers[1].bind_call(subject)
+class String
+  alias_method :bytesize, :original_byte_size940
+end
