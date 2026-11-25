@@ -473,6 +473,22 @@ Failures that are not time limits:
   worker has 19 descriptors open, ruby's 17. Main: the same (19 against 17).
   Not investigated.
 
+From the review of a542e525 (work2026-44's agent), left for later:
+- **The C API safepoint costs every request something.** Before each
+  String fetch, call and new String, mr_up saves the transit buffers (a
+  malloc and a copy of the bytes in transit) and makes one more up-call,
+  even when no collection is due. With GC.disable, ApiFixture.join_in_c(3000)
+  (a 64 KB String each turn) took 0.29-0.37 s against main's 0.16-0.21 s
+  (the reviewer's 3 runs each, load about 28); hold_locals(20000) was about
+  the same. What it takes: a "is a collection due?" check on the C side
+  before the save.
+- **`super` from a `new` defined in a MODULE still makes a plain object**
+  (not a regression: main does the same). `module M; def new(*a) = super;
+  end; class A1 < Array; extend M; end; A1.new(2, :q)` is `[:q, :q]` on
+  ruby and a bare `#<A1>` here, and the same for a String subclass with a
+  prepended `new`. These go through super_native_or_missing, not
+  super_cls_new.
+
 Failures at a time limit (a log line not seen in time, TestTookTooLong, or
 puma's 2 s worker check-in):
 - mold_worker: refork_replaces_workers_forked_by_previous_mold (phase 2 not
@@ -544,3 +560,25 @@ where the compiles overlapped less. So `use` differs only in prism's two
 lines (the reference falls back to its default prism 1.8.2; mere-ruby
 installed 2.1.0, 797,680 KB, 28 s); the other 171 lines are the same and
 every other gem installs on both sides. The check is not changed here.
+
+## Review of a542e525: kill(1) under dash (Major, fixed)
+
+761f7d85 put `--` before the pid, and kept `kill -0` and `kill -<N>` for
+signal 0 and an unnamed number. Linux's /bin/sh is dash, whose kill reads
+`kill -0 -- PID` and `kill -34 -- PID` as "Illegal number: -" (exit 2),
+so on Linux `Process.kill(0, other_pid)` raised Errno::EPERM (ps -p found
+the process) and a negative pid Errno::ESRCH; ruby answers 1. The command
+is now always `kill -s <name or number> -- <pid>`: `-s` goes through
+dash's option parser, and `-s 0 --` and `-s 34 --` work in dash and bash.
+
+Measured in `ubuntu:24.04` (arm64, /bin/sh -> dash), mr.c emitted on macOS
+by Mere 9dec2ff6 and compiled there with `tools/build.sh --cc-only --fast`:
+- the shell alone: `kill -0 -- PID` and `kill -34 -- PID` exit 2 with
+  "Illegal number: -"; `kill -s 0 -- PID` exits 0.
+- a542e525 (before): corpus 911 raises Errno::ESRCH at line 8,
+  `Process.kill(0, -pid)`, where ruby prints 1.
+- this fix: corpus 909-917 match ruby 4.0.10's output (taken on macOS) on
+  the evaluator and with MERE_RUBY_VM=1.
+macOS with the fix: corpus 909-917 match ruby 4.0.10 on both modes; the
+gates, `run_corpus.sh --both` 902/902 and `tools/iseq/vm_corpus.sh` 902 on
+the VM, 0 fell back, 0 FAIL.
