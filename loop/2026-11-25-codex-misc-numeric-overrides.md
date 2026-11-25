@@ -90,6 +90,9 @@ ask the override only at the Array sorting and element-comparison sites.
 Corpus 930, 1100 and 1101 now match Ruby on both engines. The RSS table above
 was remeasured for this corrected O2 binary.
 
-A fresh full `run_corpus.sh --both` is running, followed sequentially by
-`MERE_RUBY_VM=1 run_corpus.sh --both`. Neither full result is claimed here
-until the run completes.
+Final acceptance on the corrected O2 binary: `run_corpus.sh --both` passes
+883/883 corpus programs with the hash index ON and OFF. The subsequent
+`MERE_RUBY_VM=1 run_corpus.sh --both` also passes 883/883 with the index ON
+and OFF. Both invocations run all source gates and full record_hygiene.
+The bracket-depth check passes (155 required, 1024 supplied). No corpus
+exclusion, assertion, resource budget or workflow was changed.
