@@ -1350,17 +1350,6 @@ let gc_cand_hi = fn (u: unit) ->
 // Reads the digits straight out rather than cutting a substring: this runs
 // once per ivars entry per fixpoint pass, and the substring was an allocation
 // each time whose only use was to be parsed back into a number.
-let rec gc_owner_go = fn (k: str) -> fn (i: int) -> fn (acc: int) ->
-  if i >= str_len k then 0 - 1
-  else
-    let c = char_at k i in
-    if str_eq c "@" then (if i > 0 then acc else 0 - 1)
-    else if is_digit c then gc_owner_go k (i + 1) (acc * 10 + (ord c - 48))
-    else 0 - 1;
-let gc_owner_of = fn (k: str) ->
-  if str_len k == 0 then 0 - 1
-  else if is_digit (char_at k 0) then gc_owner_go k 0 0
-  else 0 - 1;
 // Ruby's C API and the collector (m_capi.mere says what capi_tab is).
 // A VALUE found in C's hands: its number is marked (bit 0 of capi_marks: C
 // reaches it), and its value with it.
@@ -1433,8 +1422,12 @@ let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
   let vals = vec_new () in
   let keys = vec_new () in
   let prevs = vec_new () in
+  // (whose a key is, and where its name starts, the door says: iv_key_owner.
+  //  Not a walk through a callback of the door's -- a curried closure called
+  //  per variable made a collection two fifths dearer; step 2b of note 559
+  //  marks an object's variables where they are kept instead)
   let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
-    let owner = gc_owner_of k in
+    let owner = iv_key_owner k in
     if owner < 0 then gc_owned_meta_add metadata live k v
     else (let i = vec_len vals in
           let _ = vec_push vals v in
@@ -2364,26 +2357,32 @@ let gc_collect = fn env -> fn world ->
     // store by its live size at every collection a fiber was suspended for.
     // Deleting the dead keys allocates nothing; the compaction after it, when
     // it can happen, moves only the living.
-    let dIV = vec_new () in
+    // (a dead object's variables: the object, its key, where the name starts)
+    let dIVo = vec_new () in
+    let dIVn = vec_new () in
+    let dIVa = vec_new () in
     // (a File nothing reaches gives its descriptor back, as ruby's finalizer
     //  closes it -- unless #autoclose = false gave it to the program. Before,
     //  a File the program dropped held its descriptor until exit, and with
     //  RLIMIT_NOFILE lowered the next open was EMFILE however much was
     //  garbage: test_dir's glob_gc_for_fd)
     let dFD = vec_new () in
-    let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
-      let owner = gc_owner_of k in
+    let _ = map_iter ivars (fn (s: str) -> fn (v: Val) ->
+      let owner = iv_key_owner s in
       if owner < 0 then ()
       else if gc_live_has live (owner * 8) then ()
       else
-        (let _ = (if str_ends_with k "@__f_fd" then
+        (let at = iv_key_name_at s in
+         let _ = (if iv_name_eq s at "__f_fd" then
                     (match v with
                      | VInt fd9 ->
                        (if fd9 > 2 && (if iv_has ivars owner "__f_keep_fd" then (if truthy (iv_get ivars owner "__f_keep_fd") then false else true) else true)
                         then vec_push dFD fd9 else ())
                      | _ -> ())
                   else ()) in
-         vec_push dIV k)) in
+         let _ = vec_push dIVo owner in
+         let _ = vec_push dIVa at in
+         vec_push dIVn s)) in
     let rec close_fds = fn (i: int) ->
       if i >= vec_len dFD then ()
       else (let fd9 = vec_get dFD i in
@@ -2405,12 +2404,15 @@ let gc_collect = fn env -> fn world ->
     let _ = release_ssl 0 in
     let _ = (if nc then () else map_compact openssl_owned) in
     let _ = (if nc then () else map_compact openssl_owner) in
-    let _ = gc_drop_s ivars dIV in
+    let rec drop_iv = fn (i: int) ->
+      if i >= vec_len dIVo then () else (let _ = iv_del_at ivars (vec_get dIVo i) (vec_get dIVn i) (vec_get dIVa i) in drop_iv (i + 1)) in
+    let _ = drop_iv 0 in
     let _ = (if nc then () else map_compact ivars) in
+    // (...and a dead owner's names in ivar_names_of's index, iv_idx)
     // (...and a dead owner's names in ivar_names_of's index, iv_idx)
     let dIX = vec_new () in
     let _ = map_iter iv_idx (fn (k: str) -> fn (v: str) ->
-      let owner = gc_owner_of k in
+      let owner = iv_key_owner k in
       if owner < 0 then ()
       else if gc_live_has live (owner * 8) then ()
       else vec_push dIX k) in
@@ -31181,7 +31183,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
             (match args with
              | Cons (kv, _) ->
                (let kk = thread_key_of env world kv in
-                if map_has ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) then map_get ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) else VNil)
+                if iv_has ivars (fb_tl_owner world tid name) ("__tl_" ++ kk) then iv_get ivars (fb_tl_owner world tid name) ("__tl_" ++ kk) else VNil)
              | _ -> VNil)
           else if (str_len name == 3 && str_eq name "[]=") || (str_len name == 19 && str_eq name "thread_variable_set") then
             (match args with
@@ -31191,34 +31193,34 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
              // nil REMOVES the variable: it is no longer a key at all
              | Cons (kv, Cons (VNil, _)) ->
                (let kk = thread_key_of env world kv in
-                let _ = (if map_has ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) then map_delete ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) else ()) in
-                let cur9 = (match (if map_has ivars (fb_tl_base world tid name ++ "@__tlk") then map_get ivars (fb_tl_base world tid name ++ "@__tlk") else VNil) with
+                let _ = (if iv_has ivars (fb_tl_owner world tid name) ("__tl_" ++ kk) then iv_del ivars (fb_tl_owner world tid name) ("__tl_" ++ kk) else ()) in
+                let cur9 = (match (if iv_has ivars (fb_tl_owner world tid name) "__tlk" then iv_get ivars (fb_tl_owner world tid name) "__tlk" else VNil) with
                             | VStr h9 -> sget h9 | _ -> "") in
                 let at9 = str_index_of cur9 ("|" ++ kk ++ "|") in
                 let _ = (if at9 >= 0
-                         then iv_put ivars (fb_tl_base world tid name ++ "@__tlk")
+                         then iv_set ivars (fb_tl_owner world tid name) "__tlk"
                                 (mkstr (substring cur9 0 (at9 + 1) ++ substring cur9 (at9 + str_len kk + 2) (str_len cur9)))
                          else ()) in
                 VNil)
              | Cons (kv, Cons (v, _)) ->
                (let kk = thread_key_of env world kv in
                 let _ = (if str_len kk == 17 && str_eq kk "__recursive_key__" then map_set pp_rk_on "on" 1 else ()) in
-                let _ = tl_note_key ivars (fb_tl_base world tid name) kk in
-                let _ = iv_put ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) v in v)
+                let _ = tl_note_key ivars (fb_tl_owner world tid name) kk in
+                let _ = iv_set ivars (fb_tl_owner world tid name) ("__tl_" ++ kk) v in v)
              | _ -> VNil)
           // ruby's #keys are the FIBER-locals and #thread_variables are the
           //   THREAD-locals -- two tables, which is the whole point of
           //   core/thread/keys_spec's "is not shared across fibers". They are
-          //   two here too: fb_tl_base names whose table a name reads.
+          //   two here too: fb_tl_owner names whose table a name reads.
           else if (str_len name == 4 && str_eq name "keys") || (str_len name == 16 && str_eq name "thread_variables") then
-            (let cur = (match (if map_has ivars (fb_tl_base world tid name ++ "@__tlk") then map_get ivars (fb_tl_base world tid name ++ "@__tlk") else VNil) with
+            (let cur = (match (if iv_has ivars (fb_tl_owner world tid name) "__tlk" then iv_get ivars (fb_tl_owner world tid name) "__tlk" else VNil) with
                         | VStr h9 -> sget h9 | _ -> "") in
              arr_new (tl_keys_split cur 0 0 Nil))
           else if (str_len name == 4 && str_eq name "key?") || (str_len name == 16 && str_eq name "thread_variable?") then
             (match args with
              | Cons (kv, _) ->
                (let kk = thread_key_of env world kv in
-                VBool (map_has ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk)))
+                VBool (iv_has ivars (fb_tl_owner world tid name) ("__tl_" ++ kk)))
              | _ -> VBool false)
           else if (str_len name == 5 && str_eq name "fetch") then
             thread_fetch env world blk tid args (false, (Nil : str list), (Nil : Stmt list), env)
@@ -33882,10 +33884,11 @@ and run_at_exits_r = fn world -> fn report ->
 and flush_files_at_exit = fn world ->
   let (_, _, _, ivars) = world in
   let ids = map_new () in
-  let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
-            (if str_len k > 8 && str_eq (substring k (str_len k - 8) (str_len k)) "@__f_buf"
+  let _ = map_iter ivars (fn (s: str) -> fn (v: Val) ->
+            (let o = iv_key_owner s in
+             if o >= 0 && iv_name_eq s (iv_key_name_at s) "__f_buf"
              then (match v with
-                   | VStr h -> (if str_len (sget h) > 0 then map_set ids (substring k 0 (str_len k - 8)) VNil else ())
+                   | VStr h -> (if str_len (sget h) > 0 then map_set ids (str_of_int o) VNil else ())
                    | _ -> ())
              else ())) in
   map_iter ids (fn (k: str) -> fn (v: Val) ->
@@ -33896,19 +33899,19 @@ and flush_files_at_exit = fn world ->
 // make them run twice).
 // the `@__cause` slot (below the first) in an exception's cause chain whose
 // value is `target`, or "" -- three deep at most
+// (the exception whose @__cause is the link: its id, else -1)
 and exc_cause_link_to = fn world -> fn (exc: Val) -> fn (target: Val) -> fn (depth: int) ->
   let (_, _, _, iv9) = world in
   match (exc, target) with
-  | (_, VNil) -> ""
+  | (_, VNil) -> 0 - 1
   | (VObj eid9, _) ->
-    (let k9 = iv_key eid9 "__cause" in
-     let c9 = (iv_get_or iv9 eid9 "__cause" VNil) in
+    (let c9 = (iv_get_or iv9 eid9 "__cause" VNil) in
      match c9 with
-     | VNil -> ""
-     | _ -> (if depth > 0 && rb_eq c9 target then k9
-             else if depth >= 3 then ""
+     | VNil -> 0 - 1
+     | _ -> (if depth > 0 && rb_eq c9 target then eid9
+             else if depth >= 3 then 0 - 1
              else exc_cause_link_to world c9 target (depth + 1)))
-  | _ -> ""
+  | _ -> 0 - 1
 // a recorded backtrace without its bottom '<main>' frame (an exit handler's)
 and bt_drop_main = fn (bt: Val) ->
   match bt with
@@ -34054,15 +34057,15 @@ and run_at_exit_procs = fn world -> fn report -> fn st -> fn (xs: Val list) ->
                    //  rescued into raise "outer"} after an END{raise
                    //  "previous"} has previous as middle's cause, and the
                    //  report showed it a second time -- note 365)
-                   let deep9 = (if hide9 then "" else exc_cause_link_to world exc9 bang9 0) in
-                   let dv9 = (if str_eq deep9 "" then VNil else map_get ivars9 deep9) in
-                   let _ = (if str_eq deep9 "" then () else iv_put ivars9 deep9 VNil) in
+                   let deep9 = (if hide9 then 0 - 1 else exc_cause_link_to world exc9 bang9 0) in
+                   let dv9 = (if deep9 < 0 then VNil else iv_get ivars9 deep9 "__cause") in
+                   let _ = (if deep9 < 0 then () else iv_set ivars9 deep9 "__cause" VNil) in
                    // (SignalException itself is not reported: the process
                    //  ends of the signal, below; Interrupt is)
                    let _ = (if sg9 > 0 && (match exc9 with VObj eid9 -> str_eq (map_get ocls9 eid9) "SignalException" | _ -> false)
                             then () else report exc9) in
                    let _ = (if hide9 then (match exc9 with VObj eid9 -> iv_set ivars9 eid9 "__cause" cv9 | _ -> ()) else ()) in
-                   let _ = (if str_eq deep9 "" then () else iv_put ivars9 deep9 dv9) in
+                   let _ = (if deep9 < 0 then () else iv_set ivars9 deep9 "__cause" dv9) in
                    let _ = map_set globals "!" exc9 in
                    map_set st "v" 1))) in
     let _ = run_at_exit_batch world report st in
@@ -56160,11 +56163,11 @@ and file_truncate = fn world -> fn (path: str) -> fn (len: int) ->
 //   list the two methods can only answer []. The list is "|a|b|c|" -- the
 //   delimiters on BOTH sides of every name, so a containment test for
 //   "|a|" cannot be satisfied by a longer name that merely starts with it.
-and tl_note_key = fn ivars -> fn (k: str) -> fn (kk: str) ->
-  let cur = (match (if map_has ivars (k ++ "@__tlk") then map_get ivars (k ++ "@__tlk") else VNil) with
+and tl_note_key = fn ivars -> fn (o: int) -> fn (kk: str) ->
+  let cur = (match iv_get_or ivars o "__tlk" VNil with
              | VStr h9 -> sget h9 | _ -> "") in
   if str_index_of cur ("|" ++ kk ++ "|") >= 0 then ()
-  else iv_put ivars (k ++ "@__tlk")
+  else iv_set ivars o "__tlk"
          (mkstr (if str_eq cur "" then "|" ++ kk ++ "|" else cur ++ kk ++ "|"))
 
 and tl_keys_split = fn (s9: str) -> fn (i: int) -> fn (st: int) -> fn (acc: Val list) ->
@@ -56209,8 +56212,7 @@ and insp_pp_held = fn env -> fn world -> fn (v: Val) ->
      match (if map_has cur_thr "t" then map_get cur_thr "t"
             else if map_has cur_thr "v" then map_get cur_thr "v" else VNil) with
      | VObj tid9 ->
-       (let k9 = fb_tl_base world tid9 "[]" ++ "@__tl___recursive_key__" in
-        match (if map_has iv9 k9 then map_get iv9 k9 else VNil) with
+       (match iv_get_or iv9 (fb_tl_owner world tid9 "[]") "__tl___recursive_key__" VNil with
         | VHsh h9 ->
           (match hash_lookup (hderef h9) (VSym "inspect") with
            | (true, VHsh h8) ->
@@ -59691,8 +59693,8 @@ and thread_fetch = fn env -> fn world -> fn blk -> fn (tid: int) -> fn (args: Va
      | Cons (kv, rest) ->
        (let kk = thread_key_of env world kv in
         let _ = (if hasblk && n9 == 2 then rb_warn world "block supersedes default value argument" else ()) in
-        let slot = fb_tl_base world tid "fetch" ++ "@__tl_" ++ kk in
-        if map_has iv9 slot then map_get iv9 slot
+        let own9 = fb_tl_owner world tid "fetch" in
+        if iv_has iv9 own9 ("__tl_" ++ kk) then iv_get iv9 own9 ("__tl_" ++ kk)
         else if hasblk then flow_value (run_block world (blk_noblk blk) newblk (Cons (kv, Nil)))
         else (match rest with
               | Cons (d, _) -> d
@@ -60111,7 +60113,9 @@ and fb_inspect = fn world -> fn (recv: Val) ->
 // whose table Thread#[] and friends read. The fiber-locals ([] []= keys key?
 // fetch) of the RUNNING thread belong to the running fiber when that is not
 // the thread's root; the thread-variables always belong to the thread.
-and fb_tl_base = fn world -> fn (tid: int) -> fn (name: str) ->
+// (whose variables a thread-local or fiber-local lives in: an object's id,
+//  the Fiber's or the Thread's)
+and fb_tl_owner = fn world -> fn (tid: int) -> fn (name: str) ->
   let fiber_local = (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "[]=")
                     || (str_len name == 4 && str_eq name "keys") || (str_len name == 4 && str_eq name "key?")
                     || (str_len name == 5 && str_eq name "fetch") in
@@ -60122,8 +60126,8 @@ and fb_tl_base = fn world -> fn (tid: int) -> fn (name: str) ->
   let _ = fb_boot () in
   let i = fb_cur () in
   if fiber_local && running && (if fb_is_root i then false else true)
-  then (match fb_obj_for world i with VObj o -> str_of_int o | _ -> str_of_int tid)
-  else str_of_int tid
+  then (match fb_obj_for world i with VObj o -> o | _ -> tid)
+  else tid
 // A source that cannot run a program's code -- a builtin iteration of an
 // Array, Hash, String or finite Range that no subclass has redefined -- gives
 // the same answers whether it is driven ahead or one element at a time, so its
