@@ -153,6 +153,10 @@ extern unsigned long mr_epoch;
 /* The String's bytes changed on the interpreter's side by this C's own
  * request: nothing to write back, and the struct is stale. */
 void mr_mirror_forget(VALUE obj);
+/* extensions linked into this executable (static_ext.c) */
+struct mr_static_ext { const char *feature; void (*init)(void); };
+extern const struct mr_static_ext mr_static_exts[];
+int mr_capi_static_open(const char *feature);
 void mr_mirror_frozen_by_c(VALUE obj);
 
 long mr_string_capacity(VALUE str);

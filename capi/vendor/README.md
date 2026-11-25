@@ -32,3 +32,11 @@ is written at the top of `capi/bignum_cruby.c`.
 They are under Ruby's licence (`capi/include/COPYING`, `capi/include/BSDL`).
 Nothing in this directory is edited; `capi/tools/headers_check.py` compares
 it, and `capi/include`, with a ruby source tree.
+
+`erb_escape.c` is CRuby's `ext/erb/escape/escape.c` (`ERB::Escape.html_escape`),
+also unchanged, compiled by `capi/static_ext.c`, which links it into the
+executable as ruby links an extension statically: `require "erb/escape"` runs
+its `Init_escape` (renamed there to `mr_static_Init_erb_escape`, so that
+another extension's `Init_escape` cannot meet it), and its methods are C
+functions, so `Method#source_location` is nil as on ruby. `HAVE_RB_EXT_RACTOR_SAFE`
+is defined there, as its extconf.rb's `have_func` would.

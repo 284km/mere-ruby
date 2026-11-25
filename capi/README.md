@@ -182,10 +182,13 @@ which tools/build.sh writes after the link
 variable of the C API the executable exports. RbConfig names it as
 `LIBRUBYARG`, which mkmf puts on the link line of its test programs only.
 The functions of `capi/unsupported.c` are left out of it, so for them the
-answer is "no" and an extension takes its other path. `ENABLE_SHARED` is
-not said (see the comment where the keys are, in m_driver.mere). The installation directories (`prefix`, `libdir`,
-`sitearchdir`) are still the stand-ins they were: `make install` is given
-its directory, as RubyGems gives it.
+answer is "no" and an extension takes its other path. `libdir` names that
+actual API-library directory in both CONFIG and MAKEFILE_CONFIG. mkmf searches
+it before configured dependency directories; a placeholder `/usr/lib` there
+can select a system library against headers chosen from another prefix.
+`ENABLE_SHARED` is not said (see m_driver.mere). The installation directories
+`prefix` and `sitearchdir` remain stand-ins: `make install` is given its
+directory, as RubyGems gives it.
 
 `tools/capi_ext_build.py --ruby-source <tree> --output <dir>` builds every
 directory of ruby's `ext/-test-` without running its `extconf.rb` (those are

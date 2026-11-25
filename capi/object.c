@@ -8,6 +8,20 @@
 extern int mr_const_name_p(const char *name);
 extern VALUE mr_hidden_const_get(VALUE outer, const char *name, int *found);
 extern void mr_hidden_const_set(VALUE outer, const char *name, VALUE value);
+extern VALUE mr_hidden_const_remove(VALUE outer, const char *name, int *found);
+static int hidden_const_defined(VALUE klass, const char *name, int inherit) {
+    int found = 0;
+    if (!inherit) {
+        mr_hidden_const_get(klass, name, &found);
+        return found;
+    }
+    VALUE ancestors = mr_call(klass, "ancestors", 0);
+    for (long i = 0; i < RARRAY_LEN(ancestors); i++) {
+        mr_hidden_const_get(rb_ary_entry(ancestors, i), name, &found);
+        if (found) return 1;
+    }
+    return 0;
+}
 /* A class or module named under `outer`: the one that is there, or a new
  * one set as that constant (which is also what names it). */
 static VALUE define_class(VALUE outer, const char *name, VALUE super, int module) {
@@ -184,12 +198,44 @@ VALUE rb_const_get(VALUE klass, ID id) {
     }
     return mr_call(klass, "const_get", 1, ID2SYM(id));
 }
-VALUE rb_const_get_at(VALUE klass, ID id) { return mr_call(klass, "const_get", 2, ID2SYM(id), Qfalse); }
-VALUE rb_const_get_from(VALUE klass, ID id) { return mr_call(klass, "const_get", 1, ID2SYM(id)); }
-int rb_const_defined(VALUE klass, ID id) { return RTEST(mr_call(klass, "const_defined?", 1, ID2SYM(id))); }
-int rb_const_defined_at(VALUE klass, ID id) { return RTEST(mr_call(klass, "const_defined?", 2, ID2SYM(id), Qfalse)); }
-int rb_const_defined_from(VALUE klass, ID id) { return RTEST(mr_call(klass, "const_defined?", 1, ID2SYM(id))); }
-VALUE rb_const_remove(VALUE klass, ID id) { return mr_call(klass, "remove_const", 1, ID2SYM(id)); }
+VALUE rb_const_get_at(VALUE klass, ID id) {
+    const char *name = rb_id2name(id);
+    if (!mr_const_name_p(name)) {
+        int found = 0;
+        VALUE value = mr_hidden_const_get(klass, name, &found);
+        if (found) return value;
+        rb_raise(rb_eNameError, "uninitialized constant %"PRIsVALUE"::%s", rb_class_path(klass), name);
+    }
+    return mr_call(klass, "const_get", 2, ID2SYM(id), Qfalse);
+}
+VALUE rb_const_get_from(VALUE klass, ID id) {
+    if (!mr_const_name_p(rb_id2name(id))) return rb_const_get(klass, id);
+    return mr_call(klass, "const_get", 1, ID2SYM(id));
+}
+int rb_const_defined(VALUE klass, ID id) {
+    const char *name = rb_id2name(id);
+    if (!mr_const_name_p(name)) return hidden_const_defined(klass, name, 1);
+    return RTEST(mr_call(klass, "const_defined?", 1, ID2SYM(id)));
+}
+int rb_const_defined_at(VALUE klass, ID id) {
+    const char *name = rb_id2name(id);
+    if (!mr_const_name_p(name)) return hidden_const_defined(klass, name, 0);
+    return RTEST(mr_call(klass, "const_defined?", 2, ID2SYM(id), Qfalse));
+}
+int rb_const_defined_from(VALUE klass, ID id) {
+    if (!mr_const_name_p(rb_id2name(id))) return hidden_const_defined(klass, rb_id2name(id), 1);
+    return RTEST(mr_call(klass, "const_defined?", 1, ID2SYM(id)));
+}
+VALUE rb_const_remove(VALUE klass, ID id) {
+    const char *name = rb_id2name(id);
+    if (!mr_const_name_p(name)) {
+        int found = 0;
+        VALUE value = mr_hidden_const_remove(klass, name, &found);
+        if (found) return value;
+        rb_raise(rb_eNameError, "constant %"PRIsVALUE"::%s not defined", rb_class_path(klass), name);
+    }
+    return mr_call(klass, "remove_const", 1, ID2SYM(id));
+}
 /* "A::B::C" to the class it names: each part looked up in the one before it
  * and nowhere else (Object's constants are not every module's). */
 VALUE rb_path_to_class(VALUE path) {
