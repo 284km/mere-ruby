@@ -60,9 +60,11 @@ puts "-- a script of one line"
 w.("line.rb", "$log = []; p 1; return 2; p 3\n")
 puts run.(File.join(dir, "line.rb"))
 
-# A magic comment is read only as the comment's key: right after the `#`, or
-# after a `;` or the `-*-` of the emacs form. A comment that only mentions
-# the name is none, and says nothing. (Here such a comment in the ISeq
+# A magic comment is read in two forms only: the comment is one pair and
+# nothing else, `# key: value`; or the emacs form, `# -*- key: value; key:
+# value -*-`, whose pairs are separated by `;`. A comment that only mentions
+# the name is none and says nothing, and so is a second pair after a `;`
+# outside the emacs form. (Here such a comment in the ISeq
 # compiler's own source warned "invalid value for shareable_constant_value"
 # each time that compiler was loaded.)
 w.("magic.rb", <<~'RUBY')
@@ -80,7 +82,22 @@ w.("magic.rb", <<~'RUBY')
   F = [1]
   # shareable_constant_value: nonsense
   G = [1]
-  p [A, B, C, D, E, F, G].map(&:frozen?)
+  # shareable_constant_value: literal
+  # frozen_string_literal: false; shareable_constant_value: none
+  H = [1]
+  # shareable_constant_value: none; foo: bar
+  I = [1]
+  # shareable_constant_value: none x
+  J = [1]
+  # -*- foo shareable_constant_value: none -*-
+  K = [1]
+  p [A, B, C, D, E, F, G, H, I, J, K].map(&:frozen?)
+  # (frozen_string_literal after code is ignored, and said to be when it is
+  #  a magic comment: the emacs form is one, a second pair after a `;` none)
+  # frozen_string_literal: true; shareable_constant_value: none
+  # -*- frozen_string_literal: true -*-
+  # -*- coding: utf-8; Frozen-String-Literal: true -*-
+  p "lit".frozen?
 RUBY
 puts "-- magic comments"
 puts run.("-w", File.join(dir, "magic.rb"))
