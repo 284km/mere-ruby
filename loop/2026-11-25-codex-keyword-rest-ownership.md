@@ -89,3 +89,17 @@ argument ownership. For anonymous rest, consume incoming Array provenance
 before any mapping to_hash callback. Validate the integrated regression and
 main's mapping corpus before recording final-head acceptance; earlier
 779c7cc9 measurements retain their exact revision labels.
+
+## Current-main integration before final acceptance
+
+Integrate main ecd65075, retaining its lexical block/super behavior, singleton
+metadata collection, formatter changes, C API transfer work and monotonic
+clock. Rebuild in O2 and repeat the isolated allocation file on both engines
+against this same main, ownership/bare-super and mapping regressions,
+call/block/matrix and keyword-rest instructions, full corpus ON/OFF, VM
+counts, source gates, record_hygiene and large-file RSS. Earlier a9e68981
+measurements remain historical. Shared admission limits heavy jobs across
+Codex sessions to two; serialize this session's corpus sweeps and isolate
+allocation files. Batch integration, code and records in one validated push.
+The saved origin and private forwarding payload still need reconciliation
+when PR 242/245 meets this independently measured branch.

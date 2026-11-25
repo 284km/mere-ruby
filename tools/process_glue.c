@@ -21,6 +21,45 @@ double mr_gc_process_cpu_time(void) {
     return ticks == (clock_t)-1 ? -1.0 : (double)ticks / CLOCKS_PER_SEC;
 }
 
+/* Process.clock_gettime's clocks, by kind rather than by number: the
+ * CLOCK_ constants the prelude defines are darwin's numbers on every
+ * platform, so the number is not what this OS's clock_gettime takes.
+ *   0 realtime   1 monotonic   2 monotonic, raw   3 uptime, raw
+ *   4 this thread's CPU time   5 monotonic, raw approx   6 uptime, raw approx
+ * A kind this platform has no clock for falls back to the monotonic one --
+ * never to the wall clock, which goes back when the time is set. -1.0 is a
+ * failed read. */
+double mr_clock_read(int kind) {
+    clockid_t id = CLOCK_MONOTONIC;
+    switch (kind) {
+    case 0: id = CLOCK_REALTIME; break;
+#if defined(CLOCK_MONOTONIC_RAW)
+    case 2: id = CLOCK_MONOTONIC_RAW; break;
+#endif
+#if defined(CLOCK_UPTIME_RAW)
+    case 3: id = CLOCK_UPTIME_RAW; break;
+#endif
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    case 4: id = CLOCK_THREAD_CPUTIME_ID; break;
+#endif
+#if defined(CLOCK_MONOTONIC_RAW_APPROX)
+    case 5: id = CLOCK_MONOTONIC_RAW_APPROX; break;
+#elif defined(CLOCK_MONOTONIC_RAW)
+    case 5: id = CLOCK_MONOTONIC_RAW; break;
+#endif
+#if defined(CLOCK_UPTIME_RAW_APPROX)
+    case 6: id = CLOCK_UPTIME_RAW_APPROX; break;
+#elif defined(CLOCK_UPTIME_RAW)
+    case 6: id = CLOCK_UPTIME_RAW; break;
+#endif
+    default: break;
+    }
+    struct timespec value;
+    if (clock_gettime(id, &value) != 0)
+        return -1.0;
+    return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
 char *mr_process_id(int kind) {
     /* Mere's plain int extern uses C int. Decimal text preserves the full
      * unsigned uid_t/gid_t range; the extern adapter copies this C string. */
