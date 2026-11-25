@@ -196,9 +196,9 @@ heredoc calls work on both engines; second-argument heredoc calls work on VM
 again. The second-argument evaluator line-number gap also occurs on main
 44aa, as retained in the baseline probe, and is a separate follow-up.
 
-Eval diagnostics now use native Prism reports for all unfinished assignments
-and operators, including endless method bodies; no last-character heuristic
-is applied. Plain Hash patterns use a versioned native-protocol guard, with
+Eval diagnostics for the reviewed unfinished assignments and operators
+ending in =, including endless bodies, now use native Prism reports; the
+selection heuristic no longer supplies diagnostic text or marker columns. Plain Hash patterns use a versioned native-protocol guard, with
 callback dispatch retained for overrides, refinements and protocol changes.
 Corpus 1021-1024 covers these review regressions and invalidation controls.
 
@@ -245,3 +245,28 @@ binary digests are retained.
 Portable evidence: unittest/records/actionpack-review.json and framework
 records actionpack-review-framework.json / actionpack-review-helper.json.
 Historical full-run and integration records remain separate.
+
+## Integration with merged parser review
+
+Before publishing the batched review response, main merged #263. Its eval
+hash-pattern diagnostic condition conflicted with this branch's unfinished
+assignment selection. Merge 1b45f1e2 pins main 003a5892 and retains both
+conditions, using Prism to format both kinds of errors. No reviewed change
+is discarded. The build remains ordinary O2 with the same compiler.
+
+Full corpus: 922/922 ON/OFF, 1173.816 s, 1,184,720 KiB.
+VM: 922 VM / 0 fallback / 0 differences, 318.514 s,
+1,329,392 KiB. Eight prefix source gates, default hygiene and
+155-of-1024 bracket gate pass. All 16 focused executions pass, including
+1021-1024, merged 989/990 and both join controls, on evaluator and VM.
+
+Related core files remain COMPLETE with no passing case lost against the
+review baseline. The explicit-bootstrap helper / TestResponse / Inspector
+replay is 60 MATCH / 0 RED, all COMPLETE and other categories zero, under
+unchanged seed, bounds and jobs. Gems are explicitly reused from 8624fb60.
+Earlier 1f94e1fa performance samples and the frozen 173-file cohort retain
+their original binary identities; neither is labeled a new full framework
+measurement of this merge.
+
+Portable evidence: unittest/records/actionpack-review-main-integration.json
+and framework record actionpack-review-merged-focused.json.
