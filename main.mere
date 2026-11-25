@@ -7415,6 +7415,19 @@ and const_opassign = fn env -> fn world -> fn blk -> fn (name: str) -> fn (e: Ex
 and const_seg_last = fn (key: str) ->
   let i9 = dcolon_at key 0 in
   if i9 + 2 >= str_len key then key else const_seg_last (substring key (i9 + 2) (str_len key))
+// A name whose class `remove_const` removed is defined again as a NEW class
+// (under an internal name): the old class's constants are keyed `Name::X` in
+// the one table, and a `Name::X` written later looks that key up by its text.
+// They are dropped, as main dropped them before the new class was made, so
+// `class AutoloadTest; X = 2; end` after a removal is 2 and `Name::X` of a
+// class that did not set X is a NameError. (The old class, which ruby keeps
+// with its constants, loses them here: the table has no other key for them.)
+and cls_removed_forget = fn (name: str) ->
+  let pfx9 = name ++ "::" in
+  let ks9 = map_new () in
+  let _ = map_iter consts (fn (k9: str) -> fn (_v9: Val) ->
+            if str_len k9 > str_len pfx9 && str_eq (substring k9 0 (str_len pfx9)) pfx9 then map_set ks9 k9 1 else ()) in
+  map_iter ks9 (fn (k9: str) -> fn (_u9: int) -> consts_del k9)
 and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
   // (a constant's name is a Symbol, pinned down -- a dynamic one too, as
   //  ruby's const_set pins it)
@@ -20196,7 +20209,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     // gone for whatever includes the copy and nowhere else.
     else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
             && map_has modules c && builtin_cls_name c
-            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+            && (skip9 || (if has_meth world ("(sng:" ++ c ++ ")") name then false else true)) then
       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
        let m9 = invoke_val_c env world nb9 (VClass "Module") "new" Nil false in
        let _ = invoke_val_c env world nb9 m9 "include" (Cons (recv, Nil)) false in
@@ -20205,7 +20218,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
             && (if is_sng_cls c then false else true)
             // (a builtin class has nothing in these tables to copy; it keeps the old answer)
             && (if builtin_cls_name c && (if str_eq c "BasicObject" then false else true) then false else true)
-            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+            // (...also when the class has a #dup of its own and `super` from
+            //  it is asking for this one -- skip9: ActiveRecord's `def dup;
+            //  other = super; other.set_base_class; other; end` got the class
+            //  itself back, so a validation added to `NumericData.dup` was
+            //  added to NumericData)
+            && (skip9 || (if has_meth world ("(sng:" ++ c ++ ")") name then false else true)) then
       (if str_eq c "BasicObject" then raise_exc world "TypeError" "can't copy the root class"
        else
          (let cp9 = cls_copy world c ((str_len name == 5 && str_eq name "clone")
@@ -20216,10 +20234,19 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           //  -- before a program's own initialize_clone / initialize_dup runs
           //  on it, as rb_mod_init_copy does: Bug #21538)
           let hook9 = "initialize_" ++ name in
-          (match cp9 with
-           | VClass nc9 when has_meth world ("(sng:" ++ nc9 ++ ")") hook9 ->
-             (let _ = invoke world blk cp9 ("(sng:" ++ nc9 ++ ")") hook9 (Cons (VClass c, Nil)) in cp9)
-           | _ -> cp9)))
+          let r9 = (match cp9 with
+                    | VClass nc9 when has_meth world ("(sng:" ++ nc9 ++ ")") hook9 ->
+                      (let _ = invoke world blk cp9 ("(sng:" ++ nc9 ++ ")") hook9 (Cons (VClass c, Nil)) in cp9)
+                    | _ -> cp9) in
+          // (`clone(freeze: true)` freezes the copy whether the original is
+          //  frozen or not, after its initialize_clone, as Kernel#clone does)
+          let _ = (if (str_len name == 5 && str_eq name "clone")
+                      && (match args with
+                          | Cons (VHsh h9, _) -> (match hash_get (hderef h9) (VSym "freeze") with VBool true -> true | _ -> false)
+                          | _ -> false)
+                   then (match r9 with VClass nc9 -> clsfrozen_set nc9 | _ -> ())
+                   else ()) in
+          r9))
     // true / false / nil are the ONLY instances of their classes: ruby gives
     // those three classes no allocator (TypeError) and no `new` at all
     // (NoMethodError) -- two different refusals, which is what the specs
@@ -26747,7 +26774,10 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
          // (a class removed under its own name: the next `class` of that name
          //  is a NEW class, and must not find this one's constants -- see
          //  the SClass arm)
-         let _ = (match old with VClass oc9 when str_eq oc9 n -> map_set cls_removed n 1 | _ -> ()) in
+         // (...and so is one whose class was itself made under an internal
+         //  name -- a class defined again after an earlier removal, or `X =
+         //  Class.new` -- since the key `n` may still hold an older class)
+         let _ = (match old with VClass _ -> map_set cls_removed n 1 | _ -> ()) in
          old
        | _ -> VNil)
     // attr_accessor / attr_reader / attr_writer called with values (a name
@@ -63833,6 +63863,32 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
             let _ = set_nest saved_nest in
             r)
          else
+         // (a class of a name whose class was removed is a NEW class, under
+         //  an internal name of its own: see the top-level arm)
+         if map_has cls_removed full && (if map_has consts full then false else true) then
+           (let _ = map_delete cls_removed full in
+            let _ = cls_removed_forget full in
+            let _ = (if str_eq csuper "" || is_mod then false
+                     else near_autoload_fire cenv world (false, (Nil : str list), (Nil : Stmt list), cenv) cscope csuper) in
+            let qsuper9 = (if str_eq csuper "" || is_mod then ""
+                           else named_class_of_al cenv world (false, (Nil : str list), (Nil : Stmt list), cenv) cscope (resolve_scope_name cscope csuper)) in
+            let sup9 = (if str_eq qsuper9 "" then "Object" else qsuper9) in
+            let internal = fresh_anon (if is_mod then "AnonModule_" else "AnonClass_") in
+            let _ = (if is_mod then map_set modules internal VNil else set_sup sup internal sup9) in
+            let _ = consts_put full (VClass internal) in
+            let _ = name_anon full (VClass internal) in
+            let _ = const_added_hook world full in
+            let _ = (if is_mod then () else call_inherited world cenv sup9 internal) in
+            let saved_lex = cur_lex () in
+            let saved_nest = cur_nest () in
+            let _ = push_nest internal in
+            let _ = set_lex internal in
+            let _ = cls_home_note cenv in
+            let r = register_class world internal cbody in
+            let _ = set_lex saved_lex in
+            let _ = set_nest saved_nest in
+            r)
+         else
          let _ = if is_mod then (let _ = map_set modules full VNil in ()) else () in
          // (a nearer autoload of the superclass's name first: resolve_scope_name
          //  answers the nearest scope that already HOLDS it)
@@ -63883,13 +63939,16 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                 (let bare9 = (let i9 = str_rindex_go cname "::" (str_len cname - 2) in if i9 < 0 then cname else substring cname (i9 + 2) (str_len cname)) in
                  let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ bare9) in FNext VNil)
               else
-              if was_new && str_eq sc full then
+              if was_new && (str_eq sc full || map_has cls_removed full) then
                 // `class X < remove_const(:X)`: the superclass IS the removed
                 // old class, whose internal name equals the one being defined.
                 // Give the NEW class a fresh internal name; the constant and
                 // display name stay `full` (name_anon), so X.name == full and
                 // X.superclass is the old class object.
-                (let internal = fresh_anon "AnonClass_" in
+                // (...and so is any class of a name whose class was removed:
+                //  a new class, see the top-level arm)
+                (let _ = (if map_has cls_removed full then (let _ = map_delete cls_removed full in cls_removed_forget full) else ()) in
+                 let internal = fresh_anon "AnonClass_" in
                  let _ = set_sup sup internal sc in
                  let _ = consts_put full (VClass internal) in
                  let _ = name_anon full (VClass internal) in
@@ -66410,18 +66469,19 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     //  NameErrors, wherever they are written)
     let _ = (if toplevel || (if str_contains name "::" then false else true) then ()
              else priv_path_check world name 0) in
-    // (a class of a name whose class was removed starts empty: its old
-    //  constants are keyed `Name::X` in the one table, and a test that
-    //  autoloads `class AutoloadTest; X = 1; end` twice was told X was
-    //  "already initialized")
-    let _ = (if map_has cls_removed name && (if map_has consts name then false else true) then
-               (let _ = map_delete cls_removed name in
-                let pfx9 = name ++ "::" in
-                let ks9 = map_new () in
-                let _ = map_iter consts (fn (k9: str) -> fn (_v9: Val) ->
-                          if str_len k9 > str_len pfx9 && str_eq (substring k9 0 (str_len pfx9)) pfx9 then map_set ks9 k9 1 else ()) in
-                map_iter ks9 (fn (k9: str) -> fn (_u9: int) -> consts_del k9))
-             else ()) in
+    // ⚠ A CLASS OF A NAME WHOSE CLASS WAS REMOVED IS A NEW CLASS. After
+    //   `Object.send(:remove_const, :Name)` the old class is still there for
+    //   whoever holds it -- its instances, a variable -- and `class Name`
+    //   makes another one: none of the old methods, constants, mixins or
+    //   superclass. The tables key a class by its name, so the new class gets
+    //   an internal name of its own and `Name` to show, as `Name = Class.new`
+    //   would (the arm below, which a Ruby::Box uses for the same reason).
+    //   It used to reopen the old class with only its constants taken away:
+    //   Rails' migrator removes a migration's class and loads its file again,
+    //   and the test's own `ValidPeopleHaveLastNames#change` (`drop_table
+    //   :people`) was still a method of the class the file defined.
+    // (asked below, once the name is qualified by the lexical scope: the VM
+    //  defines a nested `class Inner` through this arm, as "Outer::Inner")
     // `class << target` at top level: open the target's singleton class.
     if (str_len name == 11 && str_eq name "<<singleton") then
       // (`class << self` at the top level opens main's singleton class --
@@ -66482,6 +66542,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let name = if str_contains name "::" then scoped_class_definition_name env world blk name0
                else if toplevel || str_eq lex "" then name
                else lex ++ "::" ++ name in
+    let removed9 = map_has cls_removed name && (if map_has consts name then false else true) in
+    let _ = (if removed9 then (let _ = map_delete cls_removed name in cls_removed_forget name) else ()) in
     let super0 = if str_eq super0 "" || str_eq super0 "(module)" || str_eq lex "" || str_contains super0 "::" then super0
                  else if map_has consts (lex ++ "::" ++ super0) then lex ++ "::" ++ super0 else super0 in
     let super0 =
@@ -66567,8 +66629,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     //   its constant out), and the table keys a class by its name. Made as
     //   `Foo = Class.new` would be -- an anonymous internal name, `Foo` to
     //   show -- so both stay what they are.
-    if vec_get box_st 0 == 1 && (if already then false else true)
-       && (map_has sup name || map_has modules name || map_has bx_int ("m:" ++ name) || map_has bx_int ("b:" ++ name)) then
+    if (if already then false else true)
+       && (removed9
+           || (vec_get box_st 0 == 1
+               && (map_has sup name || map_has modules name || map_has bx_int ("m:" ++ name) || map_has bx_int ("b:" ++ name)))) then
       (let internal = fresh_anon (if is_module then "AnonModule_" else "AnonClass_") in
        let _ = (if is_module then map_set modules internal VNil
                 else set_sup sup internal (if str_eq super0 "" then "Object" else super0)) in
