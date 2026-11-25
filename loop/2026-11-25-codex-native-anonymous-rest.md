@@ -170,3 +170,31 @@ coercion RSS, full corpus ON/OFF, VM counts, all source gates, record_hygiene
 and large-file RSS. Earlier a9e68981 results are historical. Use shared
 two-run admission, serialize corpus sweeps and isolate allocation files;
 batch code, merge resolution and records in one push after validation.
+
+## Integrate the keyword-copy review corrections
+
+Merge local PR 242 source f2c40d61 on current main ccb68952 before the next
+validation. Keep its call/value splat separation, shared native Method entry,
+world-aware Module#name and native callback argument-origin boundaries.
+
+Anonymous-rest Array provenance now uses a fourth fixed native integer slot
+beside its existing suffix/span/pending slots. It no longer occupies key zero
+in the removed ruby2_keywords map. A positive source handle keeps its explicit
+manual GC root; block-conversion scopes retain their scoped roots and restore
+source provenance. The common conversion helper retains the original Array
+for actual call splats; the value walker reads its values without publishing
+call provenance. Method and block binding retire both independent notes.
+
+A native Hash copy uses the raw Hash primitive so that copying/dropping a
+flagged tail does not erase the Array-provenance refusal before the anonymous
+binder reads it. This invokes no user dup or initialize_copy hook and creates
+no scratch map. Native Method, sender, iterator and primitive entry keep their
+source retirement; the Method proxy continues using PR 242's shared helpers.
+
+This source is local, unbuilt and unaccepted. Replay 987, 995 and the original
+664 isolation regression on both engines, normally and with GC stress, plus
+main's lexical-yield/singleton-name/declaration controls. Repeat the standalone
+allocation file, controlled RSS and coercion-source loops, retired instruction
+counts, all source gates/record hygiene, full corpus ON/OFF and VM counts.
+Treat PR 242 as a dependency until it is merged; earlier independent-head
+results do not establish this combined tree's correctness or resource use.

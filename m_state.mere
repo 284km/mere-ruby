@@ -445,6 +445,17 @@ let ivars_g = map_new ();
 // The collector drops a dead owner's entry. A prefix whose list would grow
 // past 4 KB, or a name holding chr 2, is marked chr 3 and listed by the walk.
 let iv_idx = map_new ();
+// Hash copy metadata, indexed by its owner rather than the world's ivars.
+// Names contain no Ruby references; dead owners are dropped by gc_collect.
+let hash_ivar_names = map_new ();
+let rec hash_ivar_remove = fn (owner: str) -> fn (name: str) ->
+  if not (map_has hash_ivar_names owner) then () else
+    (let rec keep = fn (xs: str list) -> match xs with
+       | Nil -> Nil
+       | Cons (h, t) -> if str_eq h name then keep t else Cons (h, keep t) in
+     match keep (map_get hash_ivar_names owner) with
+     | Nil -> map_delete hash_ivar_names owner
+     | names -> map_set hash_ivar_names owner names);
 // How many instance variables of a String, an Array or a Hash -- keys
 // "str:<id>@name", "arr:..", "hsh:.." -- were ever written (iv_put counts).
 // Their owners have no index like an object's, so finding one's variables
@@ -483,7 +494,15 @@ and iv_put = fn tbl -> fn (k: str) -> fn (v: Val) ->
            // (an instance variable of a String, an Array or a Hash: hiv_made)
            else if (c0 == 115 || c0 == 97 || c0 == 104) && str_len k > 4
                    && (str_starts_with k "str:" || str_starts_with k "arr:" || str_starts_with k "hsh:")
-           then vec_set hiv_made 0 (vec_get hiv_made 0 + 1)
+           then (let _ = vec_set hiv_made 0 (vec_get hiv_made 0 + 1) in
+                 if c0 == 104 && not (map_has tbl k) then
+                   (let p = str_index_of k "@" in
+                    if p < 4 then () else
+                      (let owner = substring k 0 p in
+                       let name = substring k (p + 1) (str_len k) in
+                       let names = if map_has hash_ivar_names owner then map_get hash_ivar_names owner else Nil in
+                       map_set hash_ivar_names owner (Cons (name, names))))
+                 else ())
            else ()) in
   map_set tbl k v;
 // A NEW object's index entry, filed whole, and its variables written under
@@ -2135,20 +2154,35 @@ let meth_broke = map_new ();
 let yscan_defined = map_new ();
 // class name -> the frozen String Module#name answers for it (one per class)
 let cls_name_str = map_new ();
-// hash ids that reached the current call as the LAST element of a splat (see
-// r2k_unflag_tail); cleared as each method binds its parameters
-let r2k_splat = map_new ();
-// Reserved key zero carries the current splat source Array (positive hash
-// keys keep their ruby2_keywords meaning). Fixed native slots record the
-// suffix and original spread lengths, without per-call maps, lists or boxed metadata. Only splat
-// production writes it; its lifetime is gated by key zero.
-// Slot 2 is zero outside callback-free sole-rest binding. It is consumed
-// before the rest is installed: no Ruby/GC safepoint runs in that interval.
-// Signatures that may run Ruby retain their source in the owning frame.
-let anon_splat_tail = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v 0 in let _ = vec_push v 0 in v);
-// Deletion is idempotent and already returns immediately on an empty map.
-let anon_splat_forget = fn (u: unit) -> map_delete r2k_splat 0;
-
+// Transient argument notes for the call being prepared: empty keywords,
+// the single final splatted ruby2_keywords Hash, and whether a marked Proc
+// keeps that Hash (slot 2 is valid only while slot 1 names a Hash).
+// Native integer slots replace two string/integer maps.
+// Reset at the argument-list boundary; splats publish after their tail has
+// evaluated, so nested calls cannot overwrite an outer call's note.
+let arg_notes = (let v = vec_new () in let _ = vec_push v 0 in
+                 let _ = vec_push v 0 in let _ = vec_push v 0 in v);
+let arg_notes_reset = fn (u: unit) ->
+  let _ = vec_set arg_notes 0 0 in vec_set arg_notes 1 0;
+let arg_empty_set = fn (u: unit) -> vec_set arg_notes 0 1;
+let arg_empty_take = fn (u: unit) ->
+  let set9 = vec_get arg_notes 0 == 1 in let _ = (if set9 then vec_set arg_notes 0 0 else ()) in set9;
+let arg_splat_has = fn (id: int) -> vec_get arg_notes 1 == id;
+let arg_splat_any = fn (u: unit) -> vec_get arg_notes 1 > 0;
+let arg_splat_note = fn (id: int) ->
+  let _ = vec_set arg_notes 1 id in vec_set arg_notes 2 0;
+let arg_splat_forget = fn (u: unit) -> vec_set arg_notes 1 0;
+let arg_splat_keep = fn (u: unit) -> vec_get arg_notes 2 == 1;
+let arg_splat_mark_keep = fn (u: unit) -> vec_set arg_notes 2 1;
+// Anonymous-rest source provenance is independent of keyword origin:
+// suffix length, spread length, binder-only pending source, current source.
+// Source 0 is inactive, a positive handle names an Array, -1 is *nil and
+// -2 refuses borrowing. The active source is manually marked by GC.
+let anon_splat_tail = (let v = vec_new () in let _ = vec_push v 0 in
+                       let _ = vec_push v 0 in let _ = vec_push v 0 in
+                       let _ = vec_push v 0 in v);
+let anon_splat_forget = fn (u: unit) ->
+  if vec_get anon_splat_tail 3 == 0 then () else vec_set anon_splat_tail 3 0;
 // The DEFAULT VISIBILITY for top-level `def`s. A bare `public` / `private` at
 // the top level is a MODE, not a call on names -- language/fixtures/def.rb
 // switches it with a bare `public` and the spec then asks Object for the
@@ -3708,10 +3742,8 @@ let next_fid = fn () ->
   n + 1;
 let proc_home = (let t = map_new () in let _ = map_compact t in t);  // str(proc id) -> VInt home-frame-id // (its own arena from birth, compacted by the sweep: note 300)
 let pending_home = map_new ();  // single slot: home fid of a &proc being passed as a block
-// "e": the argument list just evaluated passed keywords that came to nothing
-// (`**{}`, an empty ruby2_keywords hash), which ruby still counts as keywords
-// given; run_block takes it for the block it starts (bind_block_params)
-let blk_kwp = map_new ();
+// arg_notes slot 0 records keywords that came to nothing (`**{}` or an
+// empty ruby2_keywords Hash). run_block consumes it for auto-splat binding.
 let live_frames = map_new ();   // fid -> 1 while that method frame is on the stack
 // callcc's re-entry (note 541 round 14). Off until `require "continuation"`
 // (cont_on is a slot, read on every call: cont_invoke). While on, each call of
@@ -6350,6 +6382,7 @@ let gc_churn_compact = fn (already: int) ->
   let _ = map_compact_big meth_cfn in
   let _ = map_compact_big builtin_alias in
   let _ = map_compact_big ie_def_meths in
+  let _ = map_compact_big hash_ivar_names in
   let _ = map_compact_big hng_store in
   let _ = map_compact_big hng_arr_ids in
   let _ = map_compact_big hng_prim_ids in
