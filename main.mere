@@ -811,6 +811,16 @@ let sng_key_id = fn (k: str) ->
        else 0 - 1 in
      go 5 0)
   else 0 - 1;
+// ...and the object whose singleton class OWNS the key: as sng_key_id, but a
+// class defined inside the singleton ("(sng:123)::N", "(sng:123)::N#v") is
+// -1. It is an ordinary class: a subclass or a constant keeps it after the
+// object is gone, so the object's death must not take its methods,
+// superclass and ancestors with it.
+let sng_own_id = fn (k: str) ->
+  let i = sng_key_id k in
+  if i < 0 then i
+  else (let e = str_index_of k ")" in
+        if e + 2 < str_len k && str_eq (substring k (e + 1) (e + 3)) "::" then 0 - 1 else i);
 // ruby's ARY_MAX_SIZE (LONG_MAX / sizeof(VALUE)): an index a write cannot
 // reach, and how long a splice's replacement is (an Array's length, else 1)
 let ary_max_size = 1152921504606846975;
@@ -872,7 +882,8 @@ let gc_class_owner = fn (k0: str) ->
   // An object's singleton methods belong to that object. Treating these
   // keys as permanent/ownerless roots retains their closures and, through
   // captured locals, the otherwise unreachable receiver itself.
-  let object9 = (if first == 40 then sng_key_id k0 else 0 - 1) in
+  // (a class defined inside that singleton has no owner: sng_own_id)
+  let object9 = (if first == 40 then sng_own_id k0 else 0 - 1) in
   if object9 >= 0 then "(sng:" ++ str_of_int object9 ++ ")" else
   let direct = (if first == 65 || first == 83 || first == 82 then
     (let at = str_index_of k0 "#" in
@@ -1926,9 +1937,9 @@ let gc_sweep_captured = fn live ->
 let gc_purge_tbl = fn tbl -> fn dead ->
   let dk = vec_new () in
   let _ = map_iter tbl (fn (k: str) -> fn v ->
-    let i = sng_key_id k in
+    let i = sng_own_id k in
     let i = (if i < 0 && str_len k > 7 && str_eq (char_at k 0) "f" && str_eq (char_at k 1) "("
-             then sng_key_id (substring k 1 (str_len k)) else i) in
+             then sng_own_id (substring k 1 (str_len k)) else i) in
     if i >= 0 && map_has dead i then vec_push dk k else ()) in
   gc_drop_s tbl dk;
 let gc_purge_sng = fn world -> fn (dOC: Vec['d, int]) ->
@@ -5071,12 +5082,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // These literal declaration bodies cannot capture the surrounding
     // method's yield block. Keep receiver/argument evaluation, then use the
     // same constructor proof before block capture and generic routing.
-    let declaration_block = (true, bp0, bb, env) in
+    // (...and a block the ISeq VM compiled, whose program is one def: its
+    //  parsed form, vm_def_block_body)
+    let vm_decl = (if str_eq name "new" then vm_def_block_body bb else (Nil : Stmt list)) in
+    let declaration_block = (true, bp0, (match vm_decl with Nil -> bb | _ -> vm_decl), env) in
     if str_eq name "new" && (match args with Nil -> true | _ -> false)
        && (match bp0 with Nil -> true | _ -> false)
        && (match recv with VClass c -> native_constructor_declaration_allowed world c declaration_block | _ -> false)
     then
       (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+       let _ = vm_def_block_mark vm_decl 0 in
        match recv with VClass c -> native_constructor_declaration world c declaration_block | _ -> VNil)
     else
     // (after the receiver and the arguments: `(s << m = 58).lines { m += 1 }`
@@ -15690,7 +15705,10 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
      match invoke_val_c env world nb9 v "inspect" Nil false with
      | VStr h9 -> sget h9
      | o9 -> to_s o9)
-  | VClass c -> (if is_sng_cls c || is_refine_impl c then cls_display world c else to_s v)
+  // (str_starts_with, not is_sng_cls: a class defined inside a singleton,
+  //  "(sng:Foo)::K", is shown by cls_display too -- to_s cuts its key as if
+  //  it were the singleton's, "#<Class:Foo)::K>")
+  | VClass c -> (if str_starts_with c "(sng:" || is_refine_impl c then cls_display world c else to_s v)
   // a Range's bounds are inspected the way any other container's elements
   // are -- through the WORLD, so an object bound shows its own #inspect.
   // Falling through to the world-free printer rendered a range of Comparables
@@ -19671,7 +19689,9 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
   else if ((str_len name == 4 && str_eq name "to_s") || (str_len name == 7 && str_eq name "inspect"))
           // (...and a refinement, which is always #<refinement:C@M>, even
           // after a constant names it)
-          && (match recv with VClass c8 -> is_sng_cls c8 || is_refine_impl c8 | _ -> false) then
+          // (str_starts_with: a class defined inside a singleton, "(sng:F)::K",
+          //  is shown by cls_display too)
+          && (match recv with VClass c8 -> str_starts_with c8 "(sng:" || is_refine_impl c8 | _ -> false) then
     (match recv with VClass c8 -> mkstr (cls_display world c8) | _ -> VNil)
   // A backtrace Location prints as the frame it names: "path:line:in `label'"
   // for to_s, and that string's inspect for inspect, which is how
@@ -20130,7 +20150,9 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
          invoke world noblk recv ("(sng:" ++ c ++ ")") name args
        else make_anon_cls world c args)
     // a singleton class cannot be instantiated: new / allocate raise TypeError.
-    else if is_sng_cls c && ((str_len name == 3 && str_eq name "new") || (str_len name == 8 && str_eq name "allocate")) then
+    // (is_sng_whole: a class defined inside one, "(sng:159)::M", is an
+    //  ordinary class and makes instances)
+    else if is_sng_whole c && ((str_len name == 3 && str_eq name "new") || (str_len name == 8 && str_eq name "allocate")) then
       raise_exc world "TypeError" "can't create instance of singleton class"
     // Exception.exception(*args) is Exception.new(*args) -- the class half of
     // the protocol raise uses (a class that defines its own still decides)
@@ -20188,7 +20210,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     // ⚠ ...but a singleton class has ONE object it belongs to, and ruby will
     //   not copy it ("can't copy singleton class"); it answered itself
     else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
-            && is_sng_cls c && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+            && is_sng_whole c && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
       raise_exc world "TypeError" "can't copy singleton class"
     // a builtin MODULE's copy -- `::Kernel.dup`, which ruby's Delegator
     // takes and then undefines names in -- answered Kernel itself, so the
@@ -23092,7 +23114,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        let k9 = (if u9 < 0 then "" else substring rest9 0 u9 ++ "#" ++ substring rest9 (u9 + 1) (str_len rest9)) in
        if map_has refine_tgt k9 then VClass (map_get refine_tgt k9) else VNil)
     else if (str_len name == 4 && str_eq name "name") && (if has_meth world ("(sng:" ++ c ++ ")") name && (if skip9 then false else true) then false else true) then
-      mod_name_val c
+      // (mod_name_w: a class defined inside a singleton is named by its place)
+      mod_name_w world c
     // Class#superclass: the recorded superclass, else Object (BasicObject has
     // none; Object's is BasicObject).
     else if (str_len name == 10 && str_eq name "superclass") then
@@ -27765,7 +27788,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
             // this); re-dispatching by name found the override
             else if str_eq mown "Module" && str_eq mnm "name" && (match args with Nil -> true | _ -> false)
                     && (match mrecv with VClass _ -> true | _ -> false) then
-              (match mrecv with VClass c9 -> mod_name_val c9 | _ -> VNil)
+              (match mrecv with VClass c9 -> mod_name_w world c9 | _ -> VNil)
             // Kernel#inspect bound to a String, Array or Hash (a subclass's,
             // typically) is Kernel's: the class, an address and the ivars --
             // not the value's own inspect. So it is for a Struct (whose own
@@ -39708,6 +39731,20 @@ and cmp_num_obj_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
 // Module#name, as the class itself answers it: nil for a singleton or an
 // anonymous class, the assigned name, or the constant path
 and mod_name_val = fn (c: str) -> mod_text_enc (mod_name_val0 c)
+// ...and with the world, which names a class defined inside an object's
+// singleton ("(sng:159)::M") by its place, as one inside an anonymous class
+// is named: "#<Class:#<T:0x..>>::M". (It had no name, and ActiveRecord could
+// not find its model's table.) Printing the object's singleton needs the
+// world. The ordinary call, Module#name bound to a class, and `super` from a
+// `def self.name` all answer through here, and the String is the same frozen
+// one each time, as every other name is (cls_name_str).
+and mod_name_w = fn world -> fn (c: str) ->
+  if sng_nested_at c > 0 then
+    (if map_has cls_name_str c then map_get cls_name_str c
+     else (let s9 = mkstr (cls_display world c) in
+           let _ = (match s9 with VStr h9 -> sfrozen_set h9 | _ -> ()) in
+           let _ = map_set cls_name_str c s9 in s9))
+  else mod_name_val c
 // (a name given in another encoding -- `const_set("R\xE9sum\xE9", ...)`
 //  with an ISO-8859-1 String -- is a String in it, as its Symbol is:
 //  sym_enc, which const_name_u8 records. The module's #to_s and #inspect
@@ -52672,7 +52709,10 @@ and run_method_added = fn world -> fn (cls: str) -> fn (nm: str) ->
   // object receives notifications. The existing ancestry map retains it.
   if is_anon_cls cls && map_has gc_hold ("modbk:" ++ cls) then
     run_module_instance_method_added world (map_get gc_hold ("modbk:" ++ cls)) nm
-  else if is_sng_cls cls then
+  // (is_sng_whole: a class defined INSIDE a singleton, "(sng:159)::M", is an
+  //  ordinary class -- its method_added is its own, not the object's
+  //  singleton_method_added, and "159)::" is no object id)
+  else if is_sng_whole cls then
     (let inner9 = sng_inner cls in
      if str_len inner9 > 0 && is_digit (char_at inner9 0)
      then run_singleton_method_added world (VObj (int_of_str inner9)) nm
@@ -53929,7 +53969,7 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // value as a direct call; re-dispatch would enter the override again.
   | VClass c9 when str_eq meth "name" && module_name_super_ahead world recv ->
     (match args with
-     | Nil -> mod_name_val c9
+     | Nil -> mod_name_w world c9
      | _ -> raise_exc world "ArgumentError"
               ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)"))
   | VClass tc9 when ((str_len meth == 3 && str_eq meth "new") || (str_len meth == 5 && str_eq meth "start") || (str_len meth == 4 && str_eq meth "fork"))
@@ -55916,6 +55956,7 @@ and make_anon_cls_block = fn world -> fn (c: str) -> fn (args: Val list) -> fn n
           | VClass anon9 ->
             (let (h3, ps3, bb3, e3) = newblk in
              if (match ps3 with Nil -> true | _ -> false) && native_include_body world anon9 bb3 e3 then VClass anon9
+             else if (match ps3 with Nil -> true | _ -> false) && vm_class_def_block world anon9 bb3 e3 then VClass anon9
              else
              // a block is not a constant scope: classes/constants defined in
              // it go to the block's LEXICAL scope (its captured cref;
@@ -55937,6 +55978,111 @@ and make_anon_cls_block = fn world -> fn (c: str) -> fn (args: Val list) -> fn n
               | _ -> VClass anon9))
           | other9 -> other9)
 
+// `Class.new { def m ... end }` on the ISeq VM: the block's program is the
+// three instructions `definemethod :m; putobject :m; leave`. The evaluator
+// takes the parsed form of it (native_constructor_declaration) straight to
+// the fresh class's method table; the VM ran the block, and its definemethod
+// went through the class body's walker (vm_define, register_class_v) --
+// twice the evaluator's time for the def, a memory-leak test of
+// test_module's at its time limit. The same def is made here from the
+// program, as vm_define makes it (its name, its parameters and body, the
+// line of its `end`, the tree marked as one a method was defined from), and
+// handed to the same writer under the same proof (native_definition_body:
+// a fresh class, no hook, trace or thread); anything else runs the block.
+// Not while coverage runs: the VM counts the block's lines its own way.
+and vm_class_def_block = fn world -> fn (cls: str) -> fn (bb: Stmt list) -> fn denv ->
+  match vm_def_block_body bb with
+  | Nil -> false
+  | body ->
+    (let cscope = (if lv_has denv "__cref" then (match lv_get denv "__cref" with VStr h9 -> sget h9 | _ -> "") else "") in
+     // (the block's source and home, noted for a proc made of it, are
+     //  dropped as native_include_body and register_class_blk0 drop them)
+     let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+     let _ = (if map_has pending_home "v" then map_delete pending_home "v" else ()) in
+     let saved_file = cur_file () in
+     let saved_line = cur_line () in
+     let (done9, _) = native_definition_body world cls body cscope denv in
+     let _ = cur_file_set saved_file in
+     let _ = cur_line_set saved_line in
+     let _ = (if done9 then vm_def_block_mark body 0 else ()) in
+     done9)
+// ...the parsed form of such a block's program, or Nil. Three forms, the
+// ones the evaluator's proof takes (native_constructor_declaration_allowed):
+// one def; `using X` and one def; and, in a Module.new block, `refine X`
+// with a block of one def -- X a global or a local, as the parsed form names
+// it. Nothing is changed by reading: what vm_define does besides defining
+// (the def's `end` line, the tree's mark) is vm_def_block_mark's, once the
+// parsed form is used -- a block that is neither used so nor run (`Foo.new
+// { def x; end }` with a block Foo ignores) leaves its tree to be given back.
+and vm_def_block_body = fn (bb: Stmt list) ->
+  match bb with
+  | Cons (SLine _, Cons (SFile file, Cons (SVm (id, gen), Nil))) when vec_get cov_st 0 == 0 ->
+    (match vm_block_decl id gen with
+     | Nil -> (Nil : Stmt list)
+     | ss -> Cons (SFile file, ss))
+  | _ -> (Nil : Stmt list)
+and vm_block_decl = fn (id: int) -> fn (gen: int) ->
+  let (_, _, kind, g, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
+  if g != gen || kind < 0 then (Nil : Stmt list)
+  else
+    (let (code, na, ov, b, n) = vm_prog id in
+     let op = fn (i: int) -> vc code (b + i) 0 in
+     // (an argument: a global's or a local's read)
+     let arg_at = fn (i: int) ->
+       (if op i == 24 || op i == 20 then Cons (EVar (vec_get na (b + i)), (Nil : Expr list)) else (Nil : Expr list)) in
+     // (a send of `m` to self with that one argument and nothing else)
+     let send_at = fn (i: int) -> fn (m: str) ->
+       op i == 29 && str_eq (vec_get na (b + i)) m && vc code (b + i) 2 == 1
+       && (if vm_bit (vc code (b + i) 1) 1 || vm_bit (vc code (b + i) 1) 2 then false else true)
+       && (match vec_get ov (b + i) with VArr _ -> false | _ -> true) in
+     if n == 3 then vm_def_at code na ov b n 0
+     else if n == 7 && op 0 == 2 && op 3 == 13 && send_at 2 "using" && vc code (b + 2) 3 < 0 then
+       (match (arg_at 1, vm_def_at code na ov b n 4) with
+        | (Cons (x, Nil), Cons (d1, d2)) ->
+          Cons (SLine (vc code b 4), Cons (SExpr (ECall ("using", Cons (x, (Nil : Expr list)))), Cons (d1, d2)))
+        | _ -> (Nil : Stmt list))
+     else if n == 4 && op 0 == 2 && op 3 == 50 && send_at 2 "refine" && vc code (b + 2) 3 >= 0 then
+       (let inner_id = vc code (b + 2) 3 in
+        let (_, _, ik, _, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta inner_id in
+        let (icode, ina, iov, ib, inn) = vm_prog inner_id in
+        match (arg_at 1, (if ik < 0 || inn != 3 then (Nil : Stmt list) else vm_def_at icode ina iov ib inn 0)) with
+        | (Cons (x, Nil), Cons (d1, d2)) ->
+          Cons (SLine (vc code b 4), Cons (SExpr (ECallB ("refine", Cons (x, (Nil : Expr list)), (Nil : str list), Cons (d1, d2))), (Nil : Stmt list)))
+        | _ -> (Nil : Stmt list))
+     else (Nil : Stmt list))
+// ...the def at instruction i of a program of n, its last three
+// (definemethod :m, putobject :m, leave): its line and the def, or Nil
+and vm_def_at = fn code -> fn na -> fn ov -> fn (b: int) -> fn (n: int) -> fn (i: int) ->
+  if n != i + 3 || vc code (b + i) 0 != 59 || vc code (b + i + 1) 0 != 3 || vc code (b + i + 2) 0 != 50 then (Nil : Stmt list)
+  else
+    (let name = vec_get na (b + i) in
+     match vec_get ov (b + i + 1) with
+     | VSym s9 when str_eq s9 name ->
+       (let cid = vc code (b + i) 3 in
+        let line = vc code (b + i) 4 in
+        let (_, _, _, _, _, _, _, _, bp, mbody, _, _, defs, _) = vec_get vm_meta cid in
+        Cons (SLine line, Cons (SDef (name, bp, defs, mbody), (Nil : Stmt list))))
+     | _ -> (Nil : Stmt list))
+// ...what vm_define does for each def of a parsed form that was used: the
+// line of its `end` under its name and line (a :return event's), and its
+// tree marked as one a method was defined from (vm_state_set 2)
+and vm_def_block_mark = fn (body: Stmt list) -> fn (line: int) ->
+  match body with
+  | Nil -> ()
+  | Cons (SLine l, t) -> vm_def_block_mark t l
+  | Cons (SDef (name, _, _, mbody), t) ->
+    (let _ = (match mbody with
+              | Cons (SLineQ el, _) when el < 0 -> map_set def_end_lines (name ++ ":" ++ str_of_int line) (VInt (0 - el))
+              | _ -> ()) in
+     let rec ids = fn (ss: Stmt list) ->
+       (match ss with
+        | Nil -> ()
+        | Cons (SVm (cid, _), r) -> let _ = vm_state_set cid 2 in ids r
+        | Cons (_, r) -> ids r) in
+     let _ = ids mbody in
+     vm_def_block_mark t line)
+  | Cons (SExpr (ECallB (_, _, _, inner)), t) -> let _ = vm_def_block_mark inner line in vm_def_block_mark t line
+  | Cons (_, t) -> vm_def_block_mark t line
 and native_constructor_declaration_allowed = fn world -> fn (factory: str) -> fn block ->
   (str_eq factory "Class" || str_eq factory "Module")
   && mro_cache_on () && vec_get core_only 0 == 0 && not (map_has flow_sig "k")
@@ -62436,7 +62582,11 @@ and frz_const_name = fn (name: str) ->
   || (str_len name == 18 && str_eq name "class_variable_set") || (str_len name == 21 && str_eq name "remove_class_variable")
 
 and frz_const_check = fn world -> fn (c0: str) ->
-  if is_sng_cls c0 && (clsfrozen_get c0
+  // (is_sng_whole, not is_sng_cls: a class DEFINED in an object's singleton
+  //  -- `class << o; class M` -- is "(sng:159)::M", an ordinary class whose
+  //  inner part "159)::" is no object id; int_of_str failed on it, so every
+  //  def, define_method and const_set into that class died with "failed")
+  if is_sng_whole c0 && (clsfrozen_get c0
                        || (let in8 = sng_inner c0 in str_len in8 > 0 && is_digit (char_at in8 0) && ofrozen_get (int_of_str in8)))
   then (let _ = raise_exc_iv world "FrozenError" ("can't modify frozen Class: " ++ cls_display world c0)
                   (Cons (("__recv", VClass c0), Nil)) in ())
@@ -62454,7 +62604,7 @@ and frz_cls_check = fn world -> fn (c0: str) ->
   // ruby still calls it modifying K ("can't modify frozen Class: K"). An
   // object's singleton -- "(sng:<id>)" -- is not a class name and is answered
   // by the object check instead.
-  let c = if is_sng_cls c0 then sng_inner c0 else c0 in
+  let c = if is_sng_whole c0 then sng_inner c0 else c0 in
   // (the module behind an instance of a Module subclass (mod_inst_backing)
   //  is frozen when the instance is: a def, attr_reader, alias_method or
   //  undef_method that lands there modifies the instance, and ruby names it)
@@ -62469,7 +62619,7 @@ and frz_cls_check = fn world -> fn (c0: str) ->
   // (ruby names the singleton's OBJECT: "can't modify frozen Object: #<Object:0x...>")
   // ...or whose OBJECT is frozen: a def into a frozen object's singleton class
   //  (`o.freeze; o.singleton_class.class_eval { def x; end }`) modifies o
-  else if is_sng_cls c0 && (clsfrozen_get c0
+  else if is_sng_whole c0 && (clsfrozen_get c0
                             || (let in8 = sng_inner c0 in str_len in8 > 0 && is_digit (char_at in8 0) && ofrozen_get (int_of_str in8)))
   then (let in9 = sng_inner c0 in
         let msg9 = (if str_len in9 > 0 && is_digit (char_at in9 0)
@@ -62722,9 +62872,10 @@ and cls_display = fn world -> fn (c0: str) ->
   if (if str_eq (thread_pub_name c) c then false else true) then thread_pub_name c else
   // a class defined INSIDE a singleton class, "(sng:N)::K": the singleton as
   // ruby prints it, then the rest of the path (#<Class:#<Object:0x..>>::K)
-  if is_sng_cls c && (if str_eq (char_at c (str_len c - 1)) ")" then false else true)
-     && str_find_from c ")::" 0 > 0 then
-    (let i9 = str_find_from c ")::" 0 in
+  // (sng_nested_at: the ")" that closes the singleton's key, which may hold
+  //  another nested key)
+  if sng_nested_at c > 0 then
+    (let i9 = sng_nested_at c in
      cls_display world (substring c 0 (i9 + 1)) ++ substring c (i9 + 1) (str_len c))
   else if is_sng_cls c then
     (let inner = sng_inner c in
@@ -62737,6 +62888,9 @@ and cls_display = fn world -> fn (c0: str) ->
            // ...and an anonymous class prints as ruby prints it, not as its
            // bookkeeping name (`#<Class:#<#<Class:0x..>:0x..>>`)
            let ocn = (if is_anon_cls ocn then to_s (VClass ocn) else ocn) in
+           // ...and so does a class defined inside a singleton, not as its key
+           // (`#<Class:#<#<Class:#<Object:0x..>>::M:0x..>>`)
+           let ocn = (if str_starts_with ocn "(sng:" then cls_display world ocn else ocn) in
            "#<Class:#<" ++ ocn ++ ":0x" ++ hex_pad16 (oid - handle_base) ++ ">>")
      // (main's is an Object's, as ruby prints it: #<Class:#<Object:0x...>>)
      else if str_eq inner "main:0" then "#<Class:#<Object:0x" ++ hex_pad16 8 ++ ">>"
@@ -66822,7 +66976,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           // obj`, from a block -- tells the object, before the write, as the
           // other object-singleton doors do)
           | VClass c -> (let _ = frz_cls_check world c in
-                         let _ = (if is_sng_cls c && (let i9 = sng_inner c in str_len i9 > 0 && is_digit (char_at i9 0))
+                         let _ = (if is_sng_whole c && (let i9 = sng_inner c in str_len i9 > 0 && is_digit (char_at i9 0))
                                   then run_method_added world c name else ()) in
                          c ++ "#" ++ name)
           // nil/true/false are singletons: def in their instance_eval defines
@@ -74960,12 +75114,12 @@ and meth_inspect_str = fn world -> fn (kind: str) -> fn (owner: str) -> fn (nm0:
   //   its owner, the singleton class, with a hash (`#<Class:C>#foo`). And a
   //   bound one on an OBJECT'S singleton names the object, which the owner
   //   spells as a bare id -- it printed `111.foo`.
-  let sdisp = (if is_sng_cls owner then cls_display world owner else "") in
-  let base = (if is_sng_cls owner && str_eq kind "UnboundMethod" then sdisp ++ "#"
-              else if is_sng_cls owner && str_len (sng_inner owner) > 0 && is_digit (char_at (sng_inner owner) 0)
+  let sdisp = (if is_sng_whole owner then cls_display world owner else "") in
+  let base = (if is_sng_whole owner && str_eq kind "UnboundMethod" then sdisp ++ "#"
+              else if is_sng_whole owner && str_len (sng_inner owner) > 0 && is_digit (char_at (sng_inner owner) 0)
                       && str_len sdisp > 9
               then substring sdisp 8 (str_len sdisp - 1) ++ "."
-              else if is_sng_cls owner then cls_display world (sng_inner owner) ++ "."
+              else if is_sng_whole owner then cls_display world (sng_inner owner) ++ "."
               else cls_display world owner ++ "#") in
   "#<" ++ kind ++ ": " ++ base ++ nm
   // (a method C defined as rb_f_notimplement says so, after the name and
