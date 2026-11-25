@@ -114,3 +114,25 @@ def seed_keyword_target(**kwargs) = kwargs
 key = SeedEscapeKey.new
 result = seed_keyword_target(:keyword_escape_marker => $seed_marker, key => :value)
 p [:seed_alias, $seed_seen.any? { |hash| hash.equal?(result) }]
+
+# Bare super restores the enclosing ... frame's origin on every invocation.
+def consumed_keyword_packet(**kwargs) = kwargs
+class KeywordOriginParent
+  def call(**kwargs) = kwargs
+end
+class KeywordOriginAfterConsume < KeywordOriginParent
+  def call(...)
+    consumed_keyword_packet(...)
+    super
+  end
+end
+class KeywordOriginRepeatedSuper < KeywordOriginParent
+  def call(...)
+    first = super
+    second = super
+    p [:separate_super_rest, first == second, first.equal?(second)]
+    second
+  end
+end
+p [:super_after_consume, KeywordOriginAfterConsume.new.call(a: 1)]
+p [:repeated_super, KeywordOriginRepeatedSuper.new.call(a: 2)]

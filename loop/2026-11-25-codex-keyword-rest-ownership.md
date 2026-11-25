@@ -52,3 +52,19 @@ anonymous rest Arrays, and generic forwarding are distinct representation
 work. CRuby-only concatenation/splat temporaries, missing empty-merger Hashes
 and unused marked-call copies stay documented as not matched; never create
 an unused Ruby object solely to imitate a count.
+
+## Review: repeated implicit super
+
+A callee consumes transient keyword origin, including a packet borrowed from
+an enclosing generic forwarding frame. Restore that frame's saved origin
+when zsuper_args expands its private forwarding rest, at every bare-super
+boundary. Restored packets stay borrowed, so separate callee keyword rests
+retain independent Hash identities. This touches only the existing rest
+expansion path, with no extra work on ordinary fixed-arity calls.
+
+Corpus 990 adds consume-then-super and repeated bare super, including an
+identity check for the two returned Hashes. All 19 output lines match clean
+Ruby 4.0.10 on evaluator and VM, also with GC stress 50. GC-root, duplicate
+definition and dead-definition gates pass. Previous whole-file allocation
+results are historical until replayed on this review fix; final whole-file,
+corpus and hardware measurements will be posted in the PR description.
