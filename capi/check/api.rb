@@ -341,6 +341,13 @@ check(A.class_of(SubString.new('x')) == SubString)
 check(A.class_of(SubArray.new([1])) == SubArray)
 check(A.class_of(SubHash.new) == SubHash)
 check(A.class_of('plain') == String && A.class_of([]) == Array && A.class_of({}) == Hash)
+# CLASS_OF of a class is its metaclass, which CRuby makes with every class,
+# and a class variable of a module it includes is read through it
+# (cgi/escape's @@accept_charset)
+module CvarM; @@cv = :from_module; end
+class CvarC; include CvarM; end
+check(A.class_of(CvarC) == CvarC.singleton_class && A.class_of(CvarC).singleton_class?)
+check(A.cvar_of_class_of(CvarC, '@@cv') == :from_module)
 # (what io-console and prism asked for: ruby_version is RUBY_VERSION; the
 #  write IO of a plain IO is itself; nothing is pending before a read, and
 #  what a partial read left buffered is)
