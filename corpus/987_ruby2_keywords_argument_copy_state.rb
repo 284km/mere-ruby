@@ -256,3 +256,9 @@ removed_hash.instance_variable_set(:@deleted, :new)
 GC.start
 copy = copied_ivar_forward(*[removed_hash])
 p [:readded_ivar, copy.instance_variable_get(:@deleted), copy.equal?(removed_hash)]
+
+# A real Ruby override still receives its splatted keywords before any leaf.
+class FlaggedNativeOverride < Array
+  def push(*positional, **keywords) = [positional, keywords]
+end
+p [:native_override_keywords, FlaggedNativeOverride.new.push(*[StaleSplatHash])]

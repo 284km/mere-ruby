@@ -114,3 +114,9 @@ Actual method and Proc forwarding keep their existing argument boundary.
 Corpus 987 adds the stale push-to-map case and removed/re-added ivars across
 GC. Final-head focused, memory, instruction and full replays are required
 before this draft is ready again.
+
+The integrated review build matches all 71 corpus 987 lines on evaluator
+and VM under GC stress 50. This also checks a Ruby Array#push override
+receiving real splatted keywords; only the terminal native consumer clears
+the origin. GC-root, duplicate-definition and dead-definition gates pass.
+Current main is merged before all remaining final-head measurements.
