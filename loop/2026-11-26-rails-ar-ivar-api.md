@@ -13,7 +13,7 @@ In m_state, beside `iv_put`:
 
 In m_eval_leaf, beside `ivar_self_key`:
 
-- `ivs_get`, `ivs_has`, `ivs_set tbl self name`: self's variable, whatever self is. An object's goes through `iv_*`; a class's, a String's, an Array's, a Hash's, a Proc's, a Binding's and main's keep their keys (`"cls:..@"`, `"str:..@"` and the like).
+- `ivs_has`, `ivs_set tbl self name` and `ivs_get_or tbl self name d`: self's variable, whatever self is. An object's goes through `iv_*`; a class's, a String's, an Array's, a Hash's, a Proc's, a Binding's and main's keep their keys (`"cls:..@"`, `"str:..@"` and the like).
 - `ivs_owner self`: whether self can hold a variable at all.
 - `iv_copy world src dst`: every variable of one object to another (dup, clone, `Exception#exception(msg)`).
 
@@ -26,6 +26,28 @@ In m_eval_leaf, beside `ivar_self_key`:
   - The rest by hand: the File helpers `file_univ_code` and `file_unget_len` take the id, the thread bodies' `k`, `file_flush_obj`, the Struct slots, `instance_variable_get`, `instance_variables`, the exception's cause chain, `ofrozen_set`.
 - The VM: `vm_ivar_get` (getinstancevariable) and the `@x = v` assignment (setinstancevariable runs the evaluator's) go through `ivs_has` / `ivs_get` / `ivs_set`, as df asked (note 559 §6).
 - The four copies of "every variable of this object to that one" are now one, `iv_copy`.
+
+## Review: a read made its key twice
+
+`if iv_has ... then iv_get ... else d` builds `"<id>@<name>"` twice, where the code before built the key once and handed it to `map_has` and `map_get`.
+Reading `@x` took about 15% (evaluator) and 18% (VM) more instructions.
+`iv_get_or tbl oid name d` and `ivs_get_or tbl self name d` build the key once. Every such read takes them: 170 of `iv_*` and 4 of `ivs_*`, among them the evaluator's `@x`, the VM's `vm_ivar_get`, `instance_variable_get`, `attr_ic_ask` and the Struct slots.
+
+Instructions retired (`/usr/bin/time -l`), the median of 3 runs taken in turn, `MERE_RUBY_GC_TIGHT=1`, 300,000 turns.
+Both binaries are built with the Mere that CI uses (9dec2ff6): the base is main 03694405.
+
+| loop | engine | base | this branch | |
+|---|---|---|---|---|
+| `s += @x` | evaluator | 3,367,710,904 | 3,366,861,756 | -0.0% |
+| `s += @x` | VM | 2,367,243,092 | 2,364,980,811 | -0.1% |
+| `s += a.x` (attr_accessor) | evaluator | 3,887,996,548 | 3,890,636,424 | +0.1% |
+| `s += a.x` (attr_accessor) | VM | 2,866,389,347 | 2,871,028,429 | +0.2% |
+| `@x = i` | evaluator | 3,059,610,906 | 3,063,236,943 | +0.1% |
+| `@x = i` | VM | 2,180,256,391 | 2,173,803,347 | -0.3% |
+| control (no ivar) | evaluator | 2,987,292,187 | 2,980,363,193 | -0.2% |
+| control (no ivar) | VM | 1,737,713,065 | 1,738,300,126 | +0.0% |
+
+(Earlier measurements here were of a binary built with another Mere, 0c083af0, which takes about 10% more instructions even on the control loop. Only binaries built with the same Mere are compared.)
 
 ## What does not yet
 
