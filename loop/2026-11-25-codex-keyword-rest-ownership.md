@@ -33,7 +33,7 @@ GC and identity behavior; no counting exclusion hides a live object.
 
 ## Validation and remaining groups
 
-Corpus 990 covers method/Proc/Lambda copies, subclasses and copy hooks,
+Corpus 994 covers method/Proc/Lambda copies, subclasses and copy hooks,
 repeated forwarding with mutation, explicit-keyword fallback, positional
 reuse, captured values across GC, nested conversion, actual Hash counts,
 ObjectSpace exposure at conversion and default binding, and custom-key
@@ -62,9 +62,21 @@ boundary. Restored packets stay borrowed, so separate callee keyword rests
 retain independent Hash identities. This touches only the existing rest
 expansion path, with no extra work on ordinary fixed-arity calls.
 
-Corpus 990 adds consume-then-super and repeated bare super, including an
+Corpus 994 adds consume-then-super and repeated bare super, including an
 identity check for the two returned Hashes. All 19 output lines match clean
 Ruby 4.0.10 on evaluator and VM, also with GC stress 50. GC-root, duplicate
 definition and dead-definition gates pass. Previous whole-file allocation
 results are historical until replayed on this review fix; final whole-file,
 corpus and hardware measurements will be posted in the PR description.
+
+## Current-main integration and corpus number
+
+Merge main 779c7cc9 after the CI integrity fixes and the Action Pack/C API
+changes. Main now uses corpus 989 through 992 for other regressions; move
+this unmerged program from 990 to the free slot 994. Its descriptive
+filename and assertions are unchanged. Repeat focused comparisons on both
+engines, isolated allocation-file before/after totals, instruction/RSS
+controls, all corpus modes, source gates and record_hygiene against this
+main before the next batched code-and-record push. Earlier head results
+remain historical until the integrated head is measured. One corpus sweep
+at a time; no full unit suite or Rails cold measurement.
