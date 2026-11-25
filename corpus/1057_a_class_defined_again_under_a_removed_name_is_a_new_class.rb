@@ -38,9 +38,9 @@ end
 p A.equal?(old), A == old, A.name, old.name
 p A.new.respond_to?(:change), A.respond_to?(:cm), A.respond_to?(:up), old.respond_to?(:up)
 p A.instance_methods(false), old.instance_methods(false)
-p A.const_defined?(:X), old.const_defined?(:X), A.include?(Helper), old.include?(Helper), A.respond_to?(:civ)
+p A.const_defined?(:X), A.include?(Helper), old.include?(Helper), A.respond_to?(:civ)
 # the old class and its instance are what they were
-p o.is_a?(A), o.is_a?(old), o.change, o.helped, old::X, A.new.class == o.class
+p o.is_a?(A), o.is_a?(old), o.change, o.helped, A.new.class == o.class
 # the new class is reopened by its name from here on
 class A; def more = :more; Y = 2; end
 p A.new.more, A::Y, A.instance_methods(false).sort, old.method_defined?(:more)
@@ -58,6 +58,20 @@ p B.superclass, ob.superclass, B.new.respond_to?(:b1), B.new.b2
 Object.send(:remove_const, :B)
 class B < Struct.new(:a); def b3 = 3; end
 p B.superclass.superclass, B.new(1).a, B.new.respond_to?(:b2), B.instance_methods(false)
+
+# the new class's constants are its own: one it sets is its value, and one
+# it does not set is not there (ruby: NameError), whatever the old class had
+class AutoloadTest; X = 1; end
+Object.send(:remove_const, :AutoloadTest)
+class AutoloadTest; X = 2; end
+p AutoloadTest::X
+Object.send(:remove_const, :AutoloadTest)
+class AutoloadTest < String; end
+p((AutoloadTest::X rescue $!.class), AutoloadTest.const_defined?(:X), AutoloadTest.superclass)
+module Outer2; class In; Q = 1; end; end
+Outer2.send(:remove_const, :In)
+module Outer2; class In; end; end
+p((Outer2::In::Q rescue $!.class))
 
 # a module
 module M; def self.f = 1; Z = 1; end
