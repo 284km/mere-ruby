@@ -22,6 +22,17 @@ end
 A = ApiFixture
 check(said == '')
 
+# Class/Module flags must agree without invoking an overridden Ruby predicate.
+[Class, Module].each do |factory|
+  owner = factory.new
+  def owner.frozen? = raise('frozen? must not be called')
+  check(!A.frozen_flags(owner, 0))
+  owner.freeze
+  check(A.frozen_flags(owner, 0))
+  check(A.frozen_flags(factory.new, 1))
+  check(A.frozen_flags(factory.new, 2) { |value| value.freeze })
+end
+
 # C's constant APIs also accept hidden cache names, as io-console's
 # IO.console does. Ruby's own constant lookup must continue to reject them.
 class HiddenConstParent; end
