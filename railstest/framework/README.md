@@ -93,6 +93,16 @@ runner refuses:
 
 ## Verdicts
 
+Test names are compared literally by default. A parameterized test may put
+an anonymous class address in its name, which differs between processes.
+`run --case-identity-policy opaque-class-addresses` explicitly permits pairing
+unique `#<Class:0x...>` descriptions. Both inventories must be COMPLETE;
+ambiguous shapes and inconsistent address relationships remain unmatched.
+Raw case names stay in `sides`, accepted mappings are recorded as
+`case_identity_aliases`, and the selected policy is recorded at the top level.
+Failures, skips, extra tests and incomplete runs retain their original meaning.
+
+
 Each test name the reference reports gets one verdict:
 
 | verdict | meaning |

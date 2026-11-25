@@ -42,6 +42,8 @@ CASE_END = re.compile(r'^([0-9.]+) s = ([.FES])$')
 # The worse of two verdicts for one name, when a transcript reports it twice
 SEVERITY = {'.': 0, 'S': 1, 'F': 2, 'E': 3}
 VERDICTS = ('MATCH', 'RED', 'MISSING', 'UNCONFIRMED', 'BOTH', 'EXTRA')
+CASE_IDENTITY_POLICIES = ('literal', 'opaque-class-addresses')
+ANONYMOUS_CLASS = re.compile(r'#<Class:0x([0-9a-fA-F]+)>')
 SUMMARY = re.compile(r'^(\d+) runs, (\d+) assertions, (\d+) failures, (\d+) errors, (\d+) skips$', re.M)
 
 # Only these unchanged tagged files legitimately contain no runnable tests.
@@ -366,20 +368,69 @@ def parse(stdout, outcome):
 UNTRUSTED = ('COUNT_MISMATCH', 'REPORT_MISMATCH')
 
 
-def classify(reference, mere):
+def case_identity_aliases(reference, mere, policy='literal'):
+    """Pair unique opaque class descriptions, preserving address relationships.
+
+    Raw identities stay in the record. Incomplete inventories and ambiguous
+    shapes cannot establish a pairing, even when their surviving tests pass.
+    """
+    if policy not in CASE_IDENTITY_POLICIES:
+        raise ValueError('unknown case identity policy: ' + policy)
+    if policy == 'literal' or reference['state'] != 'COMPLETE' or mere['state'] != 'COMPLETE':
+        return {}
+
+    def shape(name):
+        pieces, addresses, slots, start = [], [], {}, 0
+        for match in ANONYMOUS_CLASS.finditer(name):
+            address = int(match.group(1), 16)
+            pieces.extend((name[start:match.start()], slots.setdefault(address, len(slots))))
+            addresses.append(address)
+            start = match.end()
+        pieces.append(name[start:])
+        return tuple(pieces), addresses
+
+    inventories = []
+    for side in (reference, mere):
+        groups = {}
+        for name in side['cases']:
+            key, addresses = shape(name)
+            if addresses:
+                groups.setdefault(key, []).append(name)
+        inventories.append(groups)
+    left, right = inventories
+    pairs = [(name, name) for name in reference['cases'] if name in mere['cases']]
+    for key, names in left.items():
+        others = right.get(key, [])
+        if len(names) == len(others) == 1:
+            rname, mname = names[0], others[0]
+            if rname not in mere['cases'] and mname not in reference['cases']:
+                pairs.append((rname, mname))
+    forward, backward = {}, {}
+    for rname, mname in pairs:
+        for raddr, maddr in zip(shape(rname)[1], shape(mname)[1]):
+            forward.setdefault(raddr, set()).add(maddr)
+            backward.setdefault(maddr, set()).add(raddr)
+    return {mname: rname for rname, mname in pairs if rname != mname
+            and all(len(forward[raddr]) == len(backward[maddr]) == 1
+                    for raddr, maddr in zip(shape(rname)[1], shape(mname)[1]))}
+
+
+def classify(reference, mere, identity_policy='literal'):
     """Every reference test name gets one verdict; mere-only names are EXTRA."""
+    aliases = case_identity_aliases(reference, mere, identity_policy)
+    mere_cases = {aliases.get(name, name): verdict for name, verdict in mere['cases'].items()} if aliases else mere['cases']
     verdicts = {}
     untrusted = mere.get('state') in UNTRUSTED
     for name, verdict in reference['cases'].items():
         if verdict != '.':
             verdicts[name] = 'BOTH'
-        elif name not in mere['cases']:
+        elif name not in mere_cases:
             verdicts[name] = 'MISSING'
-        elif mere['cases'][name] == '.':
+        elif mere_cases[name] == '.':
             verdicts[name] = 'UNCONFIRMED' if untrusted else 'MATCH'
         else:
             verdicts[name] = 'RED'
-    for name in mere['cases']:
+    for name in mere_cases:
         if name not in reference['cases']:
             verdicts[name] = 'EXTRA'
     return verdicts
@@ -442,6 +493,8 @@ def run(args, data):
                   selected_files=files, require_all_pass=args.require_all_pass, files={})
     lock_ = threading.Lock()
     record['mere_env'] = mere_env
+    if getattr(args, 'case_identity_policy', 'literal') != 'literal':
+        record['case_identity_policy'] = args.case_identity_policy
 
     def one(side, binary, name):
         component, relative = name.split('/', 1)
@@ -484,7 +537,9 @@ def all_pass(record, selected_files):
         sides = entry['sides']
         if set(sides) != {'reference', 'mere'}:
             return False
-        if sides['reference']['cases'].keys() != sides['mere']['cases'].keys():
+        aliases = case_identity_aliases(sides['reference'], sides['mere'], record.get('case_identity_policy', 'literal'))
+        mere_names = {aliases.get(name, name) for name in sides['mere']['cases']}
+        if sides['reference']['cases'].keys() != mere_names:
             return False
         for side in sides.values():
             if side['state'] != 'COMPLETE' or not side['cases']:
@@ -537,6 +592,10 @@ def summarize(record):
         if 'reference' not in sides or 'mere' not in sides:
             continue
         reference, mere = sides['reference'], sides['mere']
+        policy = record.get('case_identity_policy', 'literal')
+        aliases = case_identity_aliases(reference, mere, policy)
+        if policy != 'literal':
+            entry['case_identity_aliases'] = aliases
         if empty_entry(name, entry):
             entry['verdict'] = 'EMPTY'
             verdicts = {}
@@ -545,15 +604,16 @@ def summarize(record):
             entry['verdict'] = 'REFERENCE_' + reference['state']
             verdicts = {}
         else:
-            verdicts = classify(reference, mere)
+            verdicts = classify(reference, mere, policy)
             entry['verdict'] = 'COMPARED'
         # Did both sides run the common tests in the same order? (the same
         # --seed is not enough: a library that draws random numbers between
         # the shuffle's draws changes it). A result that may depend on order
         # is then visible.
-        common = set(reference['cases']) & set(mere['cases'])
+        mere_order = [aliases.get(name, name) for name in mere['cases']]
+        common = set(reference['cases']) & set(mere_order)
         entry['same_order'] = ([n for n in reference['cases'] if n in common]
-                               == [n for n in mere['cases'] if n in common])
+                               == [n for n in mere_order if n in common])
         counts = {k: sum(v == k for v in verdicts.values()) for k in VERDICTS}
         entry.update(counts=counts, red=sorted(n for n, v in verdicts.items() if v == 'RED'),
                      missing=sorted(n for n, v in verdicts.items() if v == 'MISSING'),
@@ -632,11 +692,15 @@ def main():
                         help='run: allow a binary other than the one that installed --gems (recorded in the results)')
     parser.add_argument('--framework-bootstrap', action='store_true',
                         help='run: restore bundled_gems, did_you_mean and error_highlight startup (recorded)')
+    parser.add_argument('--case-identity-policy', choices=CASE_IDENTITY_POLICIES, default='literal',
+                        help='run: explicitly pair unique anonymous-class addresses; raw names are retained')
     parser.add_argument('--require-all-pass', action='store_true',
                         help='run: exit 1 unless every selected file completes on both sides with all tests passing')
     parser.add_argument('--base', type=Path)
     parser.add_argument('--new', type=Path)
     args = parser.parse_intermixed_args()
+    if args.command != 'run' and args.case_identity_policy != 'literal':
+        parser.error('--case-identity-policy is only used by run')
     for key in ('archives', 'reference', 'binary', 'source', 'gems', 'output', 'sqlite_prefix', 'base', 'new'):
         if getattr(args, key) is not None:
             setattr(args, key, getattr(args, key).resolve())
