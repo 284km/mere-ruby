@@ -53,10 +53,16 @@ unchanged O2 binaries. Max RSS includes fixture setup and is in bytes.
 | r+ | 266321920 | 225673216 | 313065472 | 218791936 |
 | w | 313327616 | 274317312 | 407322624 | 291028992 |
 
-## Acceptance still running
+## Full acceptance
 
-The full `run_corpus.sh --both` and `MERE_RUBY_VM=1 run_corpus.sh --both`
-sweeps are queued sequentially. Their source gates and full record_hygiene
-results will be recorded after completion. The direct witnesses and upstream
-selections above do not constitute a full-corpus result. No full unit suite
-or Rails component suite was run, and no workflow is changed.
+The immutable O2 binary passes `sh run_corpus.sh --both`: 884/884 programs
+match Ruby with the hash index ON and OFF. The subsequent
+`MERE_RUBY_VM=1 sh run_corpus.sh --both` also passes 884/884 with both
+index settings. Both commands pass gc_roots, dup_defs, dead_defs,
+meth_writes, name_spec, rx_caps, ns_names and name_len gates, and full
+record_hygiene. The generated C passes the bracket-depth gate.
+
+The mere-pr-review-watch review of exact source head 6ce56d24 found no
+new actionable findings; its independent partial-write check and descriptor
+reclamation control pass. No full unit suite or Rails component suite was
+run, and no workflow is changed.
