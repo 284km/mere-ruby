@@ -262,3 +262,84 @@ class FlaggedNativeOverride < Array
   def push(*positional, **keywords) = [positional, keywords]
 end
 p [:native_override_keywords, FlaggedNativeOverride.new.push(*[StaleSplatHash])]
+
+# Every native call must retire its incoming origin, including calls that
+# bypass the primitive leaf and calls made inside another block.
+NativeSplatStruct = Struct.new(:a)
+NativeSplatKeywordStruct = Struct.new(:a, keyword_init: true)
+def native_splat_keyword(a: 0) = a
+def native_splat_noop = 1
+def native_splat_probe(label, before)
+  hash = Hash.ruby2_keywords_hash({a: 2})
+  before.call(hash)
+  native_splat_noop
+  direct = begin
+    native_splat_keyword(hash)
+  rescue ArgumentError => error
+    error.class
+  end
+  before.call(hash)
+  native_splat_noop
+  block = proc { |a: 0| a }.call(hash)
+  before.call(hash)
+  native_splat_noop
+  strict = begin
+    lambda { |value, a: 0| [value.equal?(hash), a] }.call(hash)
+  rescue ArgumentError => error
+    error.class
+  end
+  p [label, direct, block, strict]
+end
+native_splat_probe(:hash_brackets, ->(hash) { Hash[*[hash]] })
+native_splat_probe(:struct_new, ->(hash) { NativeSplatStruct.new(*[hash]) })
+native_splat_probe(:ivar_set, ->(hash) { Object.new.instance_variable_set(:@value, *[hash]) })
+native_splat_probe(:kernel_p, ->(hash) { p(*[hash]) })
+native_splat_probe(:string_format, ->(hash) { '%p'.%(*[hash]) })
+native_splat_probe(:native_raise, ->(hash) {
+  begin
+    Object.new.instance_variable_set(:invalid, *[hash])
+  rescue NameError
+  end
+})
+
+# An ordinary no-block call, an explicit block and native keyword parsing
+# retain their normal values while the invocation owns the keyword origin.
+native_hash = Hash.ruby2_keywords_hash({a: 2})
+p [:native_struct_keywords, NativeSplatKeywordStruct.new(*[native_hash]).a]
+Hash[*[native_hash]] { :unused }
+native_splat_noop
+p [:after_native_block, proc { |a: 0| a }.call(native_hash)]
+
+# Resolution must retain Ruby overrides before the native boundary.
+class NativeSplatHashOverride < Hash
+  def self.[](*positional, **keywords) = [positional, keywords]
+end
+p [:hash_override_keywords, NativeSplatHashOverride[*[native_hash]]]
+class NativeSplatStringOverride < String
+  def %(*positional, **keywords) = [positional, keywords]
+end
+p [:format_override_keywords, NativeSplatStringOverride.new('%p').%(*[native_hash])]
+native_ivar_override = Object.new
+def native_ivar_override.instance_variable_set(*positional, **keywords)
+  [positional, keywords]
+end
+p [:ivar_override_keywords, native_ivar_override.instance_variable_set(:@value, *[native_hash])]
+
+# Native inspection/name conversion can call Ruby before returning. A
+# zero-argument callback does not inherit its caller's splatted Hash.
+native_inspection = nil
+native_observer = Hash.ruby2_keywords_hash({a: 2})
+native_observer.define_singleton_method(:inspect) do
+  native_inspection = proc { |a: 0| a }.call(self)
+  'native-observer'
+end
+p(*[native_observer])
+p [:native_inspection_callback, native_inspection]
+native_conversion = nil
+native_ivar_name = Object.new
+native_ivar_name.define_singleton_method(:to_str) do
+  native_conversion = proc { |a: 0| a }.call(native_hash)
+  '@native_value'
+end
+Object.new.instance_variable_set(native_ivar_name, *[native_hash])
+p [:native_name_callback, native_conversion]

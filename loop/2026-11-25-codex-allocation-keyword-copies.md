@@ -142,3 +142,35 @@ then normalize mapping arguments. A user to_hash callback must not inherit
 an unrelated native consumer's origin. Validate both corpus 987 and main's
 941 mapping regression, then take acceptance on this integrated source.
 Keep the completed 1a85c934 results separate from the new head's results.
+
+## Re-review: retire origin across every invocation door
+
+The a15ffc1a re-review confirms the two memory findings and Method#to_proc
+dispatch fix, but finds native consumers outside prim_method/builtin_iter:
+Hash[], Struct.new, instance_variable_set, Kernel#p and evaluator String#%.
+Their transient origin must not affect a later positional method, Proc or
+lambda call of the same Hash.
+
+Scope incoming splat origin around the shared bare-call, receiver-call,
+native-dispatch and supplied-block invocation doors. Keep it until normal
+method resolution and argument binding have run, then consume both the
+scalar note and the original Hash's temporary keyword mark on return or
+exception. A conversion/inspection callback cannot inherit a splat Hash
+absent from its own arguments. Primitive leaves and builtin iterators use
+the same consumption helper; permanent ruby2_keywords flags are separate.
+
+Extend corpus 987 with every reported native consumer, normal/Proc/lambda
+calls after them, exceptions, supplied blocks, native Struct keywords, Ruby
+overrides and inspection/name-conversion callbacks. Final acceptance of this
+follow-up is pending. Repeat both-engine corpus and allocation comparisons,
+all source gates and record_hygiene, dispatch instruction/RSS measurements,
+and the requested test_keyword, test_call and test_hash files against the
+same main. Measure the allocation file with GC_TIGHT and explicit seed 1.
+Do not change upstream tests, exclusions or resource bounds.
+
+Heavy work is admitted through the shared machine queue: at most two heavy
+runs across Codex sessions, with existing runs allowed to finish. Queue waits
+do not consume test deadlines. This session keeps its corpus sweeps serial
+and runs each allocation file alone. Remove merged-PR build/review trees
+after preserving their validation records; retain open-PR work and the clean
+reference/compiler required by it.
