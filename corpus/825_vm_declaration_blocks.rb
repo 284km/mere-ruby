@@ -53,3 +53,9 @@ p Class.new { include mm }.new.mx, mm.instance_method(:mx).owner == mm
 # the class's own inherited hook still runs before the def
 base = Class.new { def self.inherited(s) = (puts "inherited #{s.instance_methods(false).inspect}") }
 p Class.new(base) { def y = 2 }.new.y
+# a class whose new ignores the block: the block's def is never made
+class Ign
+  def initialize; end
+end
+Ign.new { def never_made; end }
+p Ign.method_defined?(:never_made), Object.method_defined?(:never_made)
