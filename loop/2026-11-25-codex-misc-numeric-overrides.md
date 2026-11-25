@@ -65,10 +65,10 @@ resource claims.
 
 | File | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
 | --- | ---: | ---: | ---: | ---: |
-| test_array | 180387840 | 180060160 | 221790208 | 220626944 |
-| test_integer | 165232640 | 165969920 | 168591360 | 169558016 |
-| test_rational | 165658624 | 166117376 | 170311680 | 172572672 |
-| test_optimization | 169721856 | 170229760 | 170262528 | 170901504 |
+| test_array | 180764672 | 179716096 | 222953472 | 220692480 |
+| test_integer | 166674432 | 165806080 | 169246720 | 169754624 |
+| test_rational | 167641088 | 164741120 | 173604864 | 169394176 |
+| test_optimization | 171327488 | 173129728 | 171819008 | 168689664 |
 
 An exploratory full-file test_array run on main was stopped in the unrelated
 permutation-array-modified stress case. It supplies no complete-file result.
@@ -80,3 +80,16 @@ corpus results, source gates and record hygiene. Binaries kept outside the
 source directory initially lacked the adjacent C API headers required by
 corpus 1018; final corpus binaries live beside those headers. This is a test
 layout requirement, not an interpreter change.
+
+## Saved native comparator regression
+
+The first full development sweep exposed recursion at corpus 930: a saved
+native Float#<=> alias called the generic comparator, which had been changed
+to redispatch the Ruby override. Keep the native comparator as a leaf and
+ask the override only at the Array sorting and element-comparison sites.
+Corpus 930, 1100 and 1101 now match Ruby on both engines. The RSS table above
+was remeasured for this corrected O2 binary.
+
+A fresh full `run_corpus.sh --both` is running, followed sequentially by
+`MERE_RUBY_VM=1 run_corpus.sh --both`. Neither full result is claimed here
+until the run completes.
