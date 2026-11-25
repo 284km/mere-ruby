@@ -138,3 +138,15 @@ The separate four-case conversion probe also matches both engines. GC-root,
 duplicate-definition and dead-definition gates pass. The final hardware,
 whole-file allocation and complete corpus results are still required. Batch
 these follow-ups locally and push once those local checks pass.
+
+The VM still showed a small instruction increase after removing the boxed
+metadata. Common Array/native-list/nil splats now retain their existing Val
+directly, avoiding a conversion-helper call and a native rebox. A live plain
+block local can be read without Ruby callbacks; passing an existing Proc or
+nil through it does not need a callback scope or temporary source root.
+Pseudo and implicit-numbered variables retain the full evaluation path, and
+custom to_proc conversions still use the scoped provenance/root behavior.
+The private source-frame key is also short, reducing repeated string work.
+All 55 corpus lines still match both engines under GC stress 50, and the
+three source gates pass. Recheck hardware on this candidate before readiness;
+do not claim that the earlier VM instruction increase is acceptable.
