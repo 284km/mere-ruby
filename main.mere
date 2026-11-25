@@ -621,6 +621,8 @@ let gc_tick =
   (let v = vec_new () in
    let _ = vec_push v 0 in
    let _ = vec_push v 0 in
+   // (2: the C API's safepoints under stress, gc_point_capi)
+   let _ = vec_push v 0 in
    v);
 let gc_body_tick = fn (u: unit) ->
   let n = vec_get gc_tick 0 in
@@ -2781,6 +2783,25 @@ let gc_point = fn world ->
               let _ = map_set gc_state "blocked" (bn + 1) in ()))
   else ();
 
+// The C API's safepoint (capi_up, MR_SAFEPOINT: mr_up asks it before a
+// String is fetched, a call, a new String), so that a long C call that calls
+// back through the C API alone is collected in -- under pressure, as any
+// safepoint. Under MERE_RUBY_GC_STRESS=N it collects at every 16*N-th of
+// them, not every N-th: a C call asks for those many times per statement,
+// and at every one capi_check's api contracts ran past their 120 s bound
+// under stress (a collection every 25 ms of C API calls).
+let gc_point_capi = fn world ->
+  let every = vec_get gc_knob 6 in
+  if fb_off_stack && not (gc_auto_off ()) && every > 0 then
+    (let n = vec_get gc_tick 2 in
+     if n + 1 >= every * 16 then (let _ = vec_set gc_tick 2 0 in let _ = gc_collect_off_stack world in ())
+     else (let _ = vec_set gc_tick 2 (n + 1) in ()))
+  else if fb_off_stack && gc_body_tick () && gc_pressure world
+  then (if gc_collect_off_stack world then ()
+        else (let bn = (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
+              let _ = map_set gc_state "blocked" (bn + 1) in ()))
+  else ();
+
 // ---- giving back the fibers nobody can reach ---------------------------------
 // While a fiber is suspended a collection roots its stack and does not compact
 // (see gc_collect), so a fiber that is simply DROPPED -- an Enumerator stepped
@@ -3916,7 +3937,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if is_definition_hook meth then VNil
        // `super` from a `def self.new` override is Class#new: allocate and
        // run initialize, exactly as the built-in path would have.
-       else if str_eq meth "new" then (match recv with VClass c9 -> (if obj_is_a world c9 "Thread" then thread_new world (sbh, sbp, sbb, sbe) c9 meth args (sbh, sbp, sbb, sbe) else new_obj_wb world c9 args (sbh, sbp, sbb, sbe)) | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
+       else if str_eq meth "new" then (match recv with VClass c9 -> super_cls_new env world (sbh, sbp, sbb, sbe) c9 args | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
        // Match block-less super: singleton overrides can reach builtins too.
        else super_native_or_missing env world (sbh, sbp, sbb, sbe) recv defcls meth args)
     else
@@ -5839,7 +5860,7 @@ and super_vals = fn env -> fn world -> fn superblk -> fn (defcls: str) -> fn (me
        // `super` from a `def self.new` override is Class#new: allocate and
        // run initialize, exactly as the built-in path would have.
        // (a Thread subclass's `super` is Thread.new, which starts it: see super_missing)
-       else if str_eq meth "new" then (match recv with VClass c9 -> (if obj_is_a world c9 "Thread" then thread_new world superblk c9 meth args superblk else new_obj_wb world c9 args superblk) | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
+       else if str_eq meth "new" then (match recv with VClass c9 -> super_cls_new env world superblk c9 args | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
        // the methods Class/Module themselves provide (append_features,
        // autoload, method_missing, ...) are ancestors of a singleton too, so
        // `super` from a `def self.` override of one lands there rather than
@@ -8467,16 +8488,27 @@ and capi_send = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (ar
 and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let (_, _, ocls, _) = world in
-  if r.op == 1 then capi_describe env world (capi_in r.a)
+  // MR_SAFEPOINT (capi/core.c mr_up, before a String is fetched, a call or a
+  // new String; gc_point_capi): the collector's chance in a C call that calls back through
+  // the C API only. A collection here is one in the middle of a statement,
+  // which an off-stack collection roots (note 270) -- the stack it
+  // interrupted is read for VALUEs, C's frames and the outer calls' with it.
+  if r.op == 33 then (let _ = gc_point_capi world in 0)
+  else if r.op == 1 then capi_describe env world (capi_in r.a)
   else if r.op == 2 then
     (match capi_in r.a with
      | VStr h -> let _ = mr_capi_give (bytes_of_str (sget h)) in 0
      | _ -> let _ = raise_exc world "TypeError" "C API: not a String" in 0)
   else if r.op == 3 then
     (match capi_in r.a with
-     | VStr h ->
-       if sfrozen_get h then (let _ = raise_exc world "FrozenError" ("can't modify frozen String: " ++ inspect_w env world (VStr h)) in 0)
-       else (let _ = sset h (str_of_bytes (mr_capi_bytes ())) in 0)
+     // (what C wrote through RSTRING_PTR, written back: a FROZEN String's
+     //  too. Frozen is the Ruby methods' refusal -- rb_str_modify's, which
+     //  every function of the C API that changes a String asks first -- and
+     //  a write into the buffer is not one: in ruby the bytes simply change.
+     //  puma's HTTP parser upcases each header name in the request it is
+     //  given, a frozen literal in its tests, and the write-back raised
+     //  FrozenError out of the parse.)
+     | VStr h -> let _ = sset h (str_of_bytes (mr_capi_bytes ())) in 0
      | _ -> let _ = raise_exc world "TypeError" "C API: not a String" in 0)
   else if r.op == 4 then
     (match capi_in r.a with
@@ -8710,7 +8742,14 @@ and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) 
   let rec below = fn (d: int) -> if own d then below (d - 1) else d in
   let c9 = (if at >= 0 then below at else 0 - 2) in
   let cenv = (if c9 >= 0 - 1 && map_has fb_env_at c9 then map_get fb_env_at c9 else env) in
-  let up = fn (r: CapiReq) ->
+  // (each request in a region of its own: what it makes along the way --
+  //  the copy of a String's bytes handed to C, the bytes C wrote back
+  //  before they are a String -- went to the region of the statement that
+  //  called C, open for the whole call. puma's HTTP parser, which joins a
+  //  repeated header with rb_str_cat at every callback, held 5.4 GB at
+  //  12 x 1024 headers in one call; the collections at mr_up's safepoint
+  //  cannot give back a region's bytes.)
+  let up = fn (r: CapiReq) -> region CUP {
     try_or_msg (fn (u: unit) -> capi_up env cenv world r)
       (fn (message: str) ->
         let out = try_or_msg (fn (u: unit) -> capi_capture world)
@@ -8718,7 +8757,7 @@ and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) 
                       let _ = capi_clear world in
                       arr_new (Cons (VExc ("fatal", "C API: what a request raised could not be kept: " ++ message),
                                      Cons (VNil, Cons (VNil, Cons (VNil, Cons (VNil, Nil))))))) in
-        let _ = mr_capi_raise (CapiWord { w = capi_out out }) in 0) in
+        let _ = mr_capi_raise (CapiWord { w = capi_out out }) in 0) } in
   let ret = mr_capi_enter up req in
   if ret.raised == 0 then capi_in ret.w
   else capi_resume world (capi_in ret.w)
@@ -25291,6 +25330,9 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           | _ -> VInt (0 - 9))
        else if (str_len name == 8 && str_eq name "__accept") then
          (match args with Cons (VInt fd, _) -> VInt (tcp_accept fd) | _ -> VInt (0 - 1))
+       // ...and with its errno: the descriptor or -errno (BasicSocket#__accept_now)
+       else if (str_len name == 10 && str_eq name "__accept_e") then
+         (match args with Cons (VInt fd, _) -> VInt (mr_sock_accept fd) | _ -> VInt (0 - 9))
        else if (str_len name == 7 && str_eq name "__close") then
          (match args with Cons (VInt fd, _) -> (let _ = tcp_close fd in VNil) | _ -> VNil)
        else if (str_len name == 9 && str_eq name "__timeout") then
@@ -33219,7 +33261,7 @@ and proc_kill_one = fn env -> fn world -> fn (sig9: Val) -> fn (pid9: int) ->
           // the main thread, which ruby runs every handler on (a `t.join`
           // in the handler joined the thread it was running on: "Target
           // thread must not be current thread")
-          else if (pid9 == getpid () || pid9 == 0) && in_thread ()
+          else if (pid9 == getpid () || pid9 == 0) && sig_off_main ()
                   && signal_trap_callable (match sig9 with
                                            | VInt k9 -> signal_name_of k9
                                            | VStr h9 -> sget h9
@@ -33322,10 +33364,19 @@ and proc_kill_one = fn env -> fn world -> fn (sig9: Val) -> fn (pid9: int) ->
              // (by NAME: kill(1) is the host's, whose numbers need not be the
              //  ones this table holds -- under RISC-V the guest's are Linux's
              //  and the shell is macOS's, where 10 is SIGBUS, note 304)
-             else if run ("kill " ++ (if num9 == 0 then "-0"
-                                      else (let nm9 = signal_name_of num9 in
-                                            if str_len nm9 > 0 then "-s " ++ nm9 else "-" ++ str_of_int num9))
-                          ++ " " ++ str_of_int pid9 ++ " 2>/dev/null") == 0 then VInt 1
+             else if run ("kill -s " ++ (if num9 == 0 then "0"
+                                         else (let nm9 = signal_name_of num9 in
+                                               if str_len nm9 > 0 then nm9 else str_of_int num9))
+                          // (`--`: a NEGATIVE pid is a process group, and kill(1)
+                          //  read `kill -s KILL -123` as a second signal, "invalid
+                          //  signal specification" -- ESRCH for a group that was
+                          //  there; puma's tests stop a server by its group.
+                          //  Always `-s`: Linux's /bin/sh is dash, whose kill
+                          //  reads `kill -0 -- 123` and `kill -34 -- 123` as
+                          //  "Illegal number: -"; `-s` goes through its option
+                          //  parser, and `-s 0 --` / `-s 34 --` work in dash
+                          //  and bash alike)
+                          ++ " -- " ++ str_of_int pid9 ++ " 2>/dev/null") == 0 then VInt 1
              else if run ("ps -p " ++ str_of_int pid9 ++ " >/dev/null 2>&1") == 0
              then raise_exc world "Errno::EPERM" "Operation not permitted"
              else raise_exc world "Errno::ESRCH" "No such process"))
@@ -33589,8 +33640,18 @@ and sig_apply = fn (nm: str) -> fn (stored: Val) ->
 // delivered on the MAIN thread as ruby delivers them -- one taken on another
 // thread waits in sig_queue for the main thread's next statement.
 // everything waiting, delivered (after a sleep woken for it)
+// ⚠ OFF THE MAIN THREAD is not in_thread () alone: that flag says a Thread
+//   body's own statements are running, and every method call clears it for
+//   the method's body (it is the `return` boundary's), so a thread inside
+//   any method read as the main one. A trap then ran on whichever thread
+//   was in a method at the time: puma's TERM trap ran on its reactor
+//   thread, whose stop joined the server thread, which was joining the
+//   reactor -- the server never exited. Under the scheduler the main thread
+//   is the one sch_main names.
+and sig_off_main = fn (u: unit) ->
+  in_thread () || (sch_main () >= 0 && sch_me () != sch_main ())
 and sig_poll_all = fn env -> fn world ->
-  if in_thread () then () else
+  if sig_off_main () then () else
   (let _ = sig_poll env world in
    if (map_has sig_queue "q" && str_len (map_get sig_queue "q") > 0)
       || (map_has sig_queue "n" && str_len (map_get sig_queue "n") > 0)
@@ -33615,7 +33676,19 @@ and sig_poll = fn env -> fn world ->
                let q9 = (if map_has sig_queue "q" then map_get sig_queue "q" else "") in
                map_set sig_queue "q" (q9 ++ nm9 ++ " "))
             else ()) in
-   if in_thread () then ()
+   // (taken on another thread: the main thread runs it, and is woken for it
+   //  when it waits in a wait a trap may run in the middle of -- a sleep, a
+   //  join, a queue, as sch_sig_check wakes it. Only the scheduler's idle
+   //  wait did that, so a process whose threads never all waited -- a puma
+   //  worker serving requests -- left the trap queued while its main thread
+   //  joined the server thread: the mold promotion's URG never ran.)
+   if sig_off_main () then
+     (let m9 = sch_main () in
+      let k9 = (if m9 >= 0 then sch_wait_kind m9 else 0) in
+      if m9 >= 0 && map_has sig_queue "q" && str_len (map_get sig_queue "q") > 0
+         && (k9 == 1 || k9 == 2 || sch_trap_wakes k9)
+      then (let _ = map_set sig_queue "w" "1" in sch_unpark m9)
+      else ())
    else
      (match (if map_has sig_queue "q" then map_get sig_queue "q" else "") with
       | q9 ->
@@ -56335,6 +56408,9 @@ and io_fd_prim = fn world -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "__fdsync" then VInt (if ia 0 < 0 then 0 - 1 else fsync (ia 0))
   else if str_eq name "__fdnonblock" then
     (let r = io_set_nonblocking (ia 0) in let _ = (if r >= 0 then map_set fd_nb (ia 0) 1 else ()) in VInt r)
+  // ...and off again, for a child's standard three (Process.__std_blocking)
+  else if str_eq name "__fdblock" then
+    (let r = mr_fd_clear_nonblock (ia 0) in let _ = (if r >= 0 && map_has fd_nb (ia 0) then map_delete fd_nb (ia 0) else ()) in VInt r)
   // pipe(2): the two descriptors, read end first, as they come -- blocking.
   // The layer's IO.pipe makes its own ends non-blocking (see there); a pipe
   // handed to a CHILD must not be, since the child reads and writes it with
@@ -58931,7 +59007,12 @@ and sch_join = fn env -> fn world -> fn (t: int) -> fn (limit: Val) ->
   let rec go = fn (u: unit) ->
     if map_has sch_live t && (if map_has sch_ending t then false else true) then
       (if blk_wait world 8 t (VObj t) dl then true
-       else (let _ = (if in_thread () then () else if map_has sig_queue "q" && str_len (map_get sig_queue "q") > 0 then sig_poll_all env world else ()) in
+       // (a trap waiting -- "q", or numbers the scheduler took, "n" -- runs
+       //  on the main thread in the middle of its join, which then goes on)
+       else (let _ = (if sig_off_main () then ()
+                      else if (map_has sig_queue "q" && str_len (map_get sig_queue "q") > 0)
+                              || (map_has sig_queue "n" && str_len (map_get sig_queue "n") > 0)
+                      then sig_poll_all env world else ()) in
              go ()))
     else false in
   go ()
@@ -60816,6 +60897,25 @@ and tp_init_around = fn world -> fn (obj: Val) -> fn k ->
 
 // like new_obj but forwards a block to initialize, so `C.new { } ` /
 // `C.new(&pr)` reaches an `initialize(&b)`. Containers keep their own paths.
+// `super` from a `def self.new` with nothing above it is Class#new for the
+// class. A Thread's starts it; a subclass of Hash, Array or String is the
+// class dispatch's own construction, once, past the override (bi_skip, as a
+// saved Class#new Method's call is) -- its instance is that storage tagged
+// with the subclass. new_obj_wb made a plain object of it, which had no
+// Hash#[]= for its own `[]=`'s super to reach: puma's Util::HeaderHash,
+// whose `self.new` is `HeaderHash === hash ? hash : super(hash)`.
+and super_cls_new = fn env -> fn world -> fn blk -> fn (c9: str) -> fn (args: Val list) ->
+  if obj_is_a world c9 "Thread" then thread_new world blk c9 "new" args blk
+  else if (if str_eq c9 "Hash" || str_eq c9 "Array" || str_eq c9 "String" then false
+           else obj_is_a world c9 "Hash" || obj_is_a world c9 "Array" || obj_is_a world c9 "String") then
+    (let _ = map_set bi_skip "n" "new" in
+     let r9 = try_or_msg (fn (u: unit) ->
+                (match blk with
+                 | (true, _, _, _) -> invoke_with_block env world blk (VClass c9) "new" args blk
+                 | _ -> invoke_val_c env world blk (VClass c9) "new" args false))
+                (fn (m: str) -> (let _ = map_clear bi_skip in fail m)) in
+     let _ = map_clear bi_skip in r9)
+  else new_obj_wb world c9 args blk
 and new_obj_wb = fn world -> fn (cls: str) -> fn (args: Val list) -> fn theblk ->
   if map_len capi_alloc > 0 && capi_allocator world cls >= 0 then capi_construct world cls args theblk
   else if map_len capi_alloc > 0 && capi_allocator world cls == 0 - 2 then
