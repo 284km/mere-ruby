@@ -67,8 +67,10 @@ enum mr_op {
     MR_SYM_STATE = 31,  /* a: String or Symbol -> 0 not a Symbol, 1 a dynamic one, 2 pinned down */
     MR_IVAR_READ = 32,  /* a: an object; text: an ivar's name -> its value, read from the table with no
                          * dispatch -- the collector's reader only (a dmark between C calls) */
-    MR_SAFEPOINT = 33,  /* (nothing) -- a collection may run here, when one is due (mr_up) */
-    MR_MIXIN = 34      /* a: target, b: module, c: 0 include, 1 prepend, 2 extend; no Ruby hooks */
+    MR_SAFEPOINT = 33,  /* (nothing) -- a collection may run here, when one is due (mr_up); -> how many to pass over */
+    MR_FREEZE = 34,     /* a: object -> 1 frozen, 2 a String frozen now, 0 not a String/Array/Hash (send #freeze) */
+    MR_ARY_APPEND = 35, /* a: Array, b: index, c: value -> 1 stored at the end, 0 (send #[]=) */
+    MR_MIXIN = 36      /* a: target, b: module, c: 0 include, 1 prepend, 2 extend; no Ruby hooks */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
     /* (16: the receiver is the current one)
@@ -96,6 +98,11 @@ void mr_put_words(long n, const VALUE *words);
 VALUE mr_word(long i);
 void mr_put_bytes(const void *p, long n);
 const mere_bytes *mr_got_bytes(void);
+/* Where the next request's answer goes when it is a String's bytes
+ * (MR_STR_GET): `take` gets the interpreter's own bytes while the request
+ * runs, instead of a copy in transit; `taken` says it was called. */
+struct mr_give_to { void (*take)(struct mr_give_to *, const char *, long); long number; int taken; };
+void mr_give_next(struct mr_give_to *to);
 void mr_put_text(const char *text);
 const char *mr_got_text(void);
 void mr_put_dbl(double d);
