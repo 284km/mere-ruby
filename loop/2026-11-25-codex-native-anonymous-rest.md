@@ -153,3 +153,20 @@ argument ownership. For anonymous rest, consume incoming Array provenance
 before any mapping to_hash callback. Validate the integrated regression and
 main's mapping corpus before recording final-head acceptance; earlier
 779c7cc9 measurements retain their exact revision labels.
+
+## Current-main integration and lexical super blocks
+
+Integrate main ecd65075 before final acceptance. At the explicit super block
+conflict, retain this branch's coerce_block_arg snapshot/root policy for an
+explicit block expression and main's lexical_yield_block selection for an
+implicit block from define_method. Keep main's singleton metadata lifetime,
+formatter, C API and monotonic-clock changes. Replay main's corpus 1105 on
+both engines, normally and under GC stress, alongside 995/941/664; the two
+sides of that conflict must both hold.
+
+Rebuild in O2 and compare the isolated allocation file on both engines with
+this same main. Repeat ordinary/anonymous/forwarding/proxy instructions,
+coercion RSS, full corpus ON/OFF, VM counts, all source gates, record_hygiene
+and large-file RSS. Earlier a9e68981 results are historical. Use shared
+two-run admission, serialize corpus sweeps and isolate allocation files;
+batch code, merge resolution and records in one push after validation.
