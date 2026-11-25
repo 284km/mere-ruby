@@ -1,10 +1,12 @@
 # Action Pack runtime protocols and suite accounting
 
-The integrated runtime is based on main 976bb95d. Rails is the unchanged
+The earlier integrated runtime was based on main 976bb95d. Rails is the unchanged
 8.1.4.1 tag, commit 3f290b759c8e2ffe7c257951b1255740751355e4.
-No upstream tests or component libraries are patched. The current focused
+No upstream tests or component libraries are patched. That focused
 replay has 1091 MATCH and two C API-owned RED across 26 files, including two
-known files without runnable tests. This is not a complete-suite all-pass.
+known files without runnable tests. The post-#235 full run is recorded in
+`2026-11-25-codex-actionpack-full-20261125.md`: 4,152 MATCH and zero RED across
+all 173 files. Timing and RSS below predate #235 and are historical.
 
 ## Framework tooling
 
@@ -144,22 +146,16 @@ gem list and manifest audit are recorded. Default Prism is 1.8.2; the locked
 framework gem homes' intentional native Prism 2.1.0 is independently controlled.
 Framework gems never write to the reference's Gem.default_dir.
 
-## Remaining owner dependencies
+## Full measurement and CI follow-up
 
-Routing Inspector still has two errors:
-- ActionDispatch::Routing::RoutesInspectorTest#test_not_routes_when_expanded
-- ActionDispatch::Routing::RoutesInspectorTest#test_no_routes_matched_filter_when_expanded
+The independently submitted IO.console and SQLite fixes were merged as
+#238 and #237. Both are included in the frozen full-run build `8624fb60`,
+together with main #235 and this branch's runtime changes. Fresh native-gem
+installs and all 173 files passed the optional strict gate: 4,152 MATCH,
+zero RED / MISSING / BOTH / UNCONFIRMED / EXTRA, and two verified EMPTY files.
+The full record is `railstest/framework/records/actionpack-full-8624fb60.json`.
 
-Both reach IO.console_size and raise NameError, "wrong constant name console".
-The reference's IO.console answers nil outside a TTY. The C API owner has the
-minimal reproduction, candidate hidden-constant API patch and shared C/Ruby
-fixture; this branch contains none of those C API changes. Its candidate
-fixture adds 46 assertions (307 API checks versus unchanged main's 261) and
-was separately verified on reference/Mere/GC stress with the negative controls.
-Those diagnostic candidate results are not proof that this branch passes it.
-
-Fresh final native-gem installation and all 173 Action Pack files remain
-queued after the Rails cold measurement and activerecord round 3. The owner
-must authorize that heavy slot. No full-suite run has been started to bypass
-that order. The older initial 173-file measurement predates the framework
-startup correction and is not a comparable complete pass.
+The owner authorized the heavy slot; the run completed on 2026-11-24 at
+23:51:41 UTC and the slot was released for work2026-df's full unit-test run.
+No file hit WALL_LIMIT or MEMORY_LIMIT. The separate Linux Module CI gate
+still has two original 10-second child timeouts and remains under investigation.
