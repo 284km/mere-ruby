@@ -48,3 +48,24 @@ The six-file cohort has 562,176 KiB evaluator / 617,904 VM before, and
 improvement or stable increase is claimed.
 
 Portable validation: unittest/records/parenthesized-hash-patterns.json.
+
+
+## Review follow-up
+
+The in branch now shares sequence continuation with rightward matches. Parenthesized matches accept
+if/unless/while/until/rescue and and/or continuation through the existing statement modifier parser.
+Corpus 989 adds direct and eval controls. The string forms of instance_eval/class_eval/module_eval
+still use their pre-existing raw-error path; their diagnostic framing and other pre-existing parser
+suggestions are separate follow-ups.
+
+Runtime a5184219, ordinary O2. Full corpus --both: 885/885 ON/OFF (1188.432 s, 1,214,656 KiB). VM:
+885 / 0 fallback / 0 differences (528.306 s, 1,109,824 KiB). Eight prefix source gates and default
+hygiene pass; generated C needs 155 of the unchanged 1024 bracket limit.
+
+All 6 related CRuby files are COMPLETE on both engines and lose no previously passing case. Existing
+nonpasses are retained in the portable record. Parse-heavy mapper instruction medians: 171,522,878
+to 170,369,625 (-0.67%), with all three alternating samples preserved. Fixed-seed m17n_comb RSS
+after the review change is 977,216 KiB evaluator / 1,017,424 KiB VM; the earlier repeated
+main/candidate range above remains the context for its substantial variation.
+
+Portable review validation: unittest/records/parse-patterns-review.json.
