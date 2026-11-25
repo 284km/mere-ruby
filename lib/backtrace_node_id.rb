@@ -28,22 +28,28 @@ module RubyVM::AbstractSyntaxTree
       ids = (@__nid_ids ||= {})
       return ids[key] if ids.key?(key)
 
-      # Cache only the answer. Keeping a complete native Prism tree here
-      # duplicates the tree error_highlight builds immediately afterwards.
-      cands = []
-      __nid_walk(Prism.parse_file(path).value, line, cands)
+      # Index one file once, retaining only compact call metadata. No Prism
+      # node or source tree survives, and another file replaces this index.
+      index_key = key[0, 3]
+      unless @__nid_index_key == index_key
+        index = {}
+        __nid_index(Prism.parse_file(path).value, index)
+        @__nid_index_key = index_key
+        @__nid_index = index
+      end
+      cands = @__nid_index[line] || []
       tiers =
         if want == :"(entry)"
           # (the frame an ArgumentError of the arguments was raised entering:
           #  the def, or the lambda / block define_method was given)
-          [cands.select { |n| n.type == :def_node && n.name == own },
-           cands.select { |n| n.type == :lambda_node || n.type == :block_node }]
+          [cands.select { |n| n[0] == :def_node && n[2].include?(own) },
+           cands.select { |n| n[0] == :lambda_node || n[0] == :block_node }]
         else
-          [want ? cands.select { |n| __nid_call?(n) && __nid_names(n).include?(want) } : [],
+          [want ? cands.select { |n| __nid_call?(n) && n[2].include?(want) } : [],
            # (a method written in C has a frame of its own, on its caller's
            #  line, named for the method: Integer#+)
-           cands.select { |n| __nid_call?(n) && __nid_names(n).include?(own) },
-           cands.select { |n| n.type == :call_node },
+           cands.select { |n| __nid_call?(n) && n[2].include?(own) },
+           cands.select { |n| n[0] == :call_node },
            cands.select { |n| __nid_call?(n) }]
         end
       # (the first way of asking that finds anything decides, and it must
@@ -55,10 +61,10 @@ module RubyVM::AbstractSyntaxTree
       #  construct, not two calls: `::X += 1` answers the write, as ruby's id
       #  does)
       if found && found.size > 1
-        targets = found.filter_map { |n| n.target.node_id if n.respond_to?(:target) }
-        found = found.reject { |n| targets.include?(n.node_id) }
+        targets = found.filter_map { |n| n[3] }
+        found = found.reject { |n| targets.include?(n[1]) }
       end
-      id = found && found.size == 1 ? found[0].node_id : -1
+      id = found && found.size == 1 ? found[0][1] : -1
       ids.shift if ids.size >= 128
       ids[key] = id
     end
@@ -77,21 +83,26 @@ module RubyVM::AbstractSyntaxTree
     #  is on the line of its name, as ruby numbers it, or -- as this
     #  interpreter numbers a call whose receiver is on an earlier line --
     #  on the line it starts on)
-    def __nid_walk(node, line, out)
-      return unless node.location.start_line <= line && node.location.end_line >= line
-      node.compact_child_nodes.each { |child| __nid_walk(child, line, out) }
+    def __nid_index(node, index)
+      # Heredoc bodies can lie outside a parent call's location.
+      node.compact_child_nodes.each { |child| __nid_index(child, index) }
       return unless NID_TYPES.include?(node.type)
       loc = (node.respond_to?(:message_loc) && node.message_loc) || node.location
-      out << node if loc.start_line == line || node.location.start_line == line
+      target = node.target.node_id if node.respond_to?(:target)
+      entry = [node.type, node.node_id, __nid_names(node), target]
+      [loc.start_line, node.location.start_line].uniq.each do |line|
+        (index[line] ||= []) << entry
+      end
     end
 
-    def __nid_call?(node)
-      node.type != :def_node && node.type != :lambda_node && node.type != :block_node
+    def __nid_call?(entry)
+      entry[0] != :def_node && entry[0] != :lambda_node && entry[0] != :block_node
     end
 
     # The method names a node calls.
     def __nid_names(node)
       case node.type
+      when :lambda_node, :block_node then []
       when :call_node, :constant_read_node, :constant_path_node, :def_node then [node.name]
       when :call_operator_write_node then [node.read_name, node.write_name, node.binary_operator]
       when :call_and_write_node, :call_or_write_node then [node.read_name, node.write_name]
