@@ -3590,6 +3590,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let (meths, sup, ocls, ivars) = world in
        (let k = ivar_self_key (lv_get env "self") name in
         if (if str_eq k "" then false else true) && map_has ivars k then mkstr "instance-variable" else VNil)
+     | EConst name when str_contains
+         (if str_starts_with name "::" then substring name 2 (str_len name) else name) "::" ->
+       // Evaluate the qualifier through real scoped reads. A flat table hit
+       // bypasses private intermediate constants and namespace aliases.
+       eval_e env world blk (EDefined (defined_const_path name))
      | EConst name ->
        // a qualified name's head can be lexically scoped: inside `module M`,
        // `I::K` is `M::I::K` (the same walk EConst's evaluation does).
@@ -3792,14 +3797,18 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | EScopedRead (recv, cn) ->
        // defined?(recv::Const): the receiver may raise or be a non-class
        // (e.g. `a::B` where a() returns nil) — then the const is undefined.
-       let rv = defined_eval_recv env world blk recv in
+       let rv = (if defined_const_chain recv
+                    && (match eval_e env world blk (EDefined recv) with VNil -> true | _ -> false)
+                 then VSym "__mere_defined_fail__"
+                 else defined_eval_recv env world blk recv) in
        if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) then VNil
        else (match rv with
              // (along the receiver's ancestors, as the read does: `self::X`
              // in a subclass finds the superclass's X)
              // (...and an autoload registered there, which is a constant
              // before its file runs: `defined?(M::Dog::R)` loads nothing)
-             | VClass c -> if map_has consts (c ++ "::" ++ cn)
+             | VClass c when str_eq c "Object" -> eval_e env world blk (EDefined (EConst ("::" ++ cn)))
+             | VClass c -> if (map_has consts (c ++ "::" ++ cn) && (if map_has private_consts (c ++ "::" ++ cn) then false else true))
                               || (autoload_pending world (c ++ "::" ++ cn) && (if map_has private_consts (c ++ "::" ++ cn) then false else true))
                               || (if str_eq (anc_const_key_q world c cn) "" then false
                                   else (if map_has private_consts (anc_const_key_q world c cn) then false else true))
@@ -8826,6 +8835,15 @@ and capi_construct = fn world -> fn (cls: str) -> fn (args: Val list) -> fn blk 
 and capi_require_file = fn env -> fn world -> fn (path: str) ->
   let n = mr_capi_open (feat_realpath path) in
   // (the collector's reader, for a dmark that runs between C calls)
+  let _ = (if n < 0 then 0 else mr_capi_gc_reader capi_gc_read) in
+  if n < 0 then false
+  else (let _ = capi_enter env world (CapiReq { op = 2, a = n, b = 4, c = 0, d = 4, e = 0 }) Nil in true)
+// ...and of one of ruby's extensions linked into this executable
+// (capi/static_ext.c): run its Init_. Answers false where there is none -- a
+// build with no C side -- and `require` raises LoadError, as ruby's miniruby
+// does for erb/escape.
+and capi_require_static = fn env -> fn world -> fn (feature: str) ->
+  let n = mr_capi_static_open feature in
   let _ = (if n < 0 then 0 else mr_capi_gc_reader capi_gc_read) in
   if n < 0 then false
   else (let _ = capi_enter env world (CapiReq { op = 2, a = n, b = 4, c = 0, d = 4, e = 0 }) Nil in true)
@@ -15004,6 +15022,19 @@ and arr_assoc_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) -> fn (
 // Resolve `A::B::C` one segment at a time, firing an autoload whenever the
 // next segment is not there yet. VNil means "not found" (a constant whose
 // value really is nil falls through to the caller's NameError).
+and defined_const_chain = fn (expr: Expr) ->
+  match expr with
+  | EConst _ -> true
+  | EScopedRead (parent9, _) -> defined_const_chain parent9
+  | _ -> false
+and defined_const_path = fn (name: str) ->
+  let root9 = str_starts_with name "::" in
+  let raw9 = (if root9 then substring name 2 (str_len name) else name) in
+  let first9 = EConst ((if root9 then "::" else "") ++ const_head raw9) in
+  let rec go9 = fn (expr9: Expr) -> fn (rest9: str) ->
+    if str_eq rest9 "" then expr9
+    else go9 (EScopedRead (expr9, const_head rest9)) (const_tail rest9) in
+  go9 first9 (const_tail raw9)
 and const_walk = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (name: str) ->
   let hk = const_walk_head env world blk cref (const_head name) in
   if str_eq hk "" then VNil else const_walk_go env world blk hk (const_tail name)
@@ -25346,6 +25377,13 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        //  fresh one would be the old one again)
        | Cons (v9, _) -> v9
        | _ -> VNil)
+    // (`require "erb/escape"`: the extension linked into this executable)
+    else if str_eq c "Kernel" && (str_len name == 21 && str_eq name "__capi_static_require") then
+      (match args with
+       | Cons (VStr h9, _) ->
+         (if capi_require_static env world (sget h9) then VBool true
+          else raise_exc world "LoadError" ("cannot load such file -- " ++ sget h9))
+       | _ -> VNil)
     else if str_eq c "Kernel" && (str_len name == 17 && str_eq name "__resolve_feature") then
       (match args with
        | Cons (VStr h9, _) -> resolve_feature env world (sget h9)
@@ -27651,7 +27689,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           //   anywhere) has the object's class above it, and the owner's own
           //   ancestors -- the module alone -- have nothing, so the first
           //   super_method of `obj.extend(M).method(:m)` was nil.
-          let anc9 = (let rc9 = dispatch_cls_of world mrecv in
+          let anc9 = (let rc9 = super_base world mrecv in
                       let ra9 = ancestors_of world rc9 in
                       if str_list_has ra9 ocl then ra9 else ancestors_of world ocl) in
           let above0 = (if (if str_eq aorig9 "" then false else true) && str_list_has anc9 aorig9
@@ -51152,6 +51190,20 @@ and run_super_target = fn world -> fn blk -> fn (recv: Val) -> fn (owner9: str) 
   let key9 = owner9 ++ "#" ++ name9 in
   if map_has methods9 key9 then
     (let _ = vec_set super_idx_pend 0 index9 in run_meth world blk recv owner9 name9 (map_get methods9 key9) args9)
+  // A prepended method still has Range's native entry above it. A method
+  // replacing Range's own entry does not: its super reaches Enumerable.
+  else if str_eq owner9 "Range"
+          && (str_eq name9 "count" || str_eq name9 "min" || str_eq name9 "max")
+          && (match recv with VRange (VNil, _, _) -> true | _ -> false)
+          && (match args9 with Nil -> true | _ -> false) then
+    (if (match blk with (true, _, _, _) -> true | _ -> false)
+        && (str_eq name9 "min" || str_eq name9 "max") then
+       raise_exc world "RangeError"
+         (if str_eq name9 "min" then "cannot get the minimum of beginless range"
+          else "cannot get the maximum of beginless range with custom comparison method")
+     else if (match blk with (true, _, _, _) -> true | _ -> false) then
+       super_missing world blk recv name9 args9
+     else prim_method recv name9 args9)
   else if map_has builtin_alias key9 then
     (let native9 = native_case_alias_entry_owner owner9 name9 in
      if str_eq native9 "" then blt_alias_call gc_cenv0 world recv (map_get builtin_alias key9) args9
@@ -51221,7 +51273,7 @@ and super_next_plain = fn world -> fn env -> fn (recv: Val) -> fn (defcls: str) 
   // A primitive's native entry precedes Ruby methods farther up its chain.
   // Returning no Ruby entry asks super_missing to run that actual builtin.
   let base9 = (match recv with VStr _ -> "String" | VArr _ -> "Array"
-                             | VHsh _ -> "Hash" | VProc _ -> "Proc"
+                             | VHsh _ -> "Hash" | VProc _ -> "Proc" | VRange _ -> "Range"
                              | VClass c9 when str_eq meth "[]" ->
                                (if obj_is_a world c9 "Hash" then "(sng:Hash)"
                                 else if obj_is_a world c9 "Array" then "(sng:Array)" else "")
@@ -51243,7 +51295,7 @@ and super_next_plain = fn world -> fn env -> fn (recv: Val) -> fn (defcls: str) 
        else if map_has methods9 key9 then (owner9, at9, false)
        else if map_has bi_owner_set key9
                || (match recv with VClass _ -> str_eq meth "[]" && str_eq owner9 base9 | _ -> false)
-       then ("", 0 - 1, false)
+       then (if str_eq base9 "Range" then (owner9, at9, false) else ("", 0 - 1, false))
        else walk9 tail9 (at9 + 1)) in
   walk9 rest9 (i0 + 1)
 and idx_in9 = fn (xs: str list) -> fn (x: str) ->
@@ -54432,8 +54484,10 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
      let _ = (if map_has pok "y" then ()
               else (let _ = (if map_has prim_missing "f" then () else map_set prim_missing "f" (mkstr full)) in
                     let _ = map_set load_ctx "coding" savedc in
-                    let _ = raise_exc_iv world "SyntaxError"
-                              (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "syntax error") else "syntax error")
+                    let msg = (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "syntax error") else "syntax error") in
+                    let report = (if str_contains msg "expected a label as the key in the hash pattern"
+                                  then try_or (fn (u: unit) -> prism_report src full 1) "" else "") in
+                    let _ = raise_exc_iv world "SyntaxError" (if str_len report > 0 then report else msg)
                               (Cons (("__path", mkstr full), Nil)) in ())) in
      let _ = rx_check_pending () in
      let _ = warn_flush world in
@@ -54507,6 +54561,9 @@ and rb_load = fn env -> fn world -> fn (p0: str) -> fn (wrap: Val) ->
         | Cons (s9, t) -> Cons (s9, nopre9 t)) in
      // (a proc's `return` at the file's top level ends the file: top_return_taken)
      // (in a '<top (required)>' frame, as require's file is)
+     // (ruby's warning of a top-level `return <value>`, said as the file is
+     //  read: a loaded file runs on the evaluator)
+     let _ = top_ret_warn world full prog2 in
      let f = (if preret9 then FNext VNil
               else in_scope_frame_pass "<top (required)>" fenv (fn (u0: unit) ->
                      try_or_msg (fn (u: unit) -> run_stmts fenv world noblk2 (nopre9 prog2))
@@ -64607,18 +64664,39 @@ and run_while_top = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body:
 
 // a `return` with a value among a top-level statement's own (not in a
 // block or a def)
+// How many `return <value>` a file's top level has: not in a method, a
+// class or a block, which are other scopes.
 and top_ret_arg = fn (s: Stmt) ->
   match s with
-  | SReturn ENil -> false
-  | SReturn _ -> true
-  | SBegin (b, rs, el, en) -> top_ret_args b || top_ret_args el || top_ret_args en
-  | SIf (cl, els) -> top_ret_cls cl || top_ret_args els
+  | SReturn ENil -> 0
+  | SReturn _ -> 1
+  | SBegin (b, rs, el, en) -> top_ret_args b + top_ret_rescues rs + top_ret_args el + top_ret_args en
+  | SIf (cl, els) -> top_ret_cls cl + top_ret_args els
   | SWhile (_, b) -> top_ret_args b
-  | _ -> false
+  | SAndThen (a, b) -> top_ret_arg a + top_ret_arg b
+  | SOrElse (a, b) -> top_ret_arg a + top_ret_arg b
+  | SLocalFrom (_, s2) -> top_ret_arg s2
+  | SExpr (EStmt s2) -> top_ret_arg s2
+  | _ -> 0
 and top_ret_args = fn (ss: Stmt list) ->
-  match ss with Nil -> false | Cons (s, r) -> top_ret_arg s || top_ret_args r
+  match ss with Nil -> 0 | Cons (s, r) -> top_ret_arg s + top_ret_args r
 and top_ret_cls = fn (cl: (Expr * Stmt list) list) ->
-  match cl with Nil -> false | Cons ((_, b), r) -> top_ret_args b || top_ret_cls r
+  match cl with Nil -> 0 | Cons ((_, b), r) -> top_ret_args b + top_ret_cls r
+and top_ret_rescues = fn (rs: (str list * str * Stmt list) list) ->
+  match rs with Nil -> 0 | Cons ((_, _, b), r) -> top_ret_args b + top_ret_rescues r
+// ruby's "argument of top-level return is ignored": said when a file is
+// compiled, before any of it runs, once for each such return, with the file
+// and no line; nothing under -W0. top_ret_warn is for a file the evaluator
+// runs, of its statements; a file the VM runs is told of by its compiler
+// (ic_vm_native, and the Ruby compiler in its own words).
+and top_ret_say = fn world -> fn (path: str) -> fn (n: int) ->
+  if n <= 0 || rb_verbose_nil () then ()
+  else (let _ = warning_emit world (path ++ ": warning: argument of top-level return is ignored\n") VNil in
+        top_ret_say world path (n - 1))
+and top_ret_warn = fn world -> fn (path: str) -> fn (ss: Stmt list) ->
+  match ss with
+  | Cons (SFile _, Cons (SVm (_, _), Nil)) -> ()
+  | _ -> top_ret_say world path (top_ret_args ss)
 and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (lastv: Val) ->
   run_until_gc_n env world blk rem lastv 0
 // ⚠ ONE FRAME FOR THE WHOLE CHUNK, and no statement's value carried on.
@@ -64666,10 +64744,8 @@ and run_until_gc_n = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (
         else run_until_gc_n env world blk rest (if keep9 then v else VNil) (n + 1))
      // (the top level's own `return 10`: ruby says the value goes nowhere,
      //  naming the file and no line)
-     | FReturn _ ->
-       (let _ = (if top_ret_arg s && (if rb_verbose_nil () then false else true)
-                 then warning_emit world (cur_file () ++ ": warning: argument of top-level return is ignored\n") VNil else ()) in
-        (n, 2, lastv))
+     // (...when the file is read, not here: top_ret_warn)
+     | FReturn _ -> (n, 2, lastv)
      | _ -> (n, 2, lastv))
 
 // a program's statements without its top-level BEGIN blocks (run_pre_f ran them)
@@ -65576,9 +65652,11 @@ and do_require0 = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str)
                   // (MERE_RUBY_VM: the file's statements as the one the ISeq
                   //  VM runs of it, when it takes the whole file: vm_file_stmts)
                   // (...asked above, with the parse, when vmreq9)
-                  | _ -> run_stmts fenv world noblk2
-                           (if str_eq shipped "" && (if vmreq9 then false else true) then vm_file_stmts fenv world noblk2 src full "<top (required)>" (req_nopre prog2)
-                            else req_nopre prog2))) in
+                  | _ ->
+                    (let ss9 = (if str_eq shipped "" && (if vmreq9 then false else true) then vm_file_stmts fenv world noblk2 src full "<top (required)>" (req_nopre prog2)
+                                else req_nopre prog2) in
+                     let _ = (if str_eq shipped "" then top_ret_warn world full ss9 else ()) in
+                     run_stmts fenv world noblk2 ss9))) in
        // (a proc written at the file's top level may still match into it)
        let _ = rx_call_leave fid9 rx0 (map_has fenv "__captured") in
        let _ = ref_install rfprev9 in
@@ -67981,7 +68059,7 @@ and do_eval0 = fn env -> fn world -> fn blk -> fn (args: Val list) ->
                                 (if i > 0 && (str_eq (char_at code (i - 1)) " " || str_eq (char_at code (i - 1)) "\n" || str_eq (char_at code (i - 1)) "\t")
                                  then tail9 (i - 1) else i) in
                              let i9 = tail9 (str_len code) in i9 > 0 && str_eq (char_at code (i9 - 1)) "=") in
-          let pr9 = (if (str_len why0 > 0 || eof_assign9) && (if str_contains code "BEGIN\{throw :__isq_ok, :ok}" then false else true)
+          let pr9 = (if (str_len why0 > 0 || eof_assign9 || str_contains why9 "expected a label as the key in the hash pattern") && (if str_contains code "BEGIN\{throw :__isq_ok, :ok}" then false else true)
                      then try_or (fn (u: unit) -> prism_report code efile9 eline9) "" else "") in
           let msg = (if str_len pr9 > 0 then pr9
                      else if str_len why9 > 0 then efile9 ++ ":" ++ str_of_int (if sl9 > 0 then sl9 else if str_len why0 > 0 && rxl9 > 0 then rxl9 else el9) ++ ": " ++ why9 else try_or (fn (u: unit) ->
@@ -69384,6 +69462,10 @@ and vm_file_stmts = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: s
                       && (if str_eq (env_get "MERE_RUBY_IC") "ruby" then false else true) in
         // (nk: 2 its program is loaded, nid; 3 the loader refused what it
         //  compiled, and nwhy; 1 it declined, and nwhy; 0 it answered nothing)
+        // (the parse's warnings are said before the compile's, as ruby's
+        //  are: "statement not reached", then "argument of top-level return
+        //  is ignored")
+        let _ = warn_flush world in
         let (nk, nwhy, nid) = (if native9 then ic_vm_native env world blk src path label false else (0, "", 0 - 1)) in
         // (=report also says which files the native compiler declined, and
         //  why: the Ruby compiler then compiles them, at many times the cost)
@@ -69549,7 +69631,8 @@ and prism_report = fn (src: str) -> fn (path: str) -> fn (line: int) ->
     let nl = vec_len offs in
     let rec all_syntax = fn (es: (int * str * int * int) list) ->
       (match es with Nil -> true | Cons ((lv, _, _, _), t) -> lv == 0 && all_syntax t) in
-    // (by where they start: an insertion sort, the errors being few)
+    // pm_parse_errors_format_sort inserts before an equal position too: a
+    // later diagnostic is printed first when their locations coincide.
     let rec ins = fn (e: int * str * int * int) -> fn (xs: (int * str * int * int) list) ->
       (match xs with
        | Nil -> Cons (e, Nil)
@@ -69634,7 +69717,7 @@ and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: st
       let ser = prism_ser 0 sb (ic_prism_opts path 1) in
       let meta = vec_new () in
       let rec fill = fn (i: int) -> if i <= 0 then () else (let _ = vec_push meta 0 in fill (i - 1)) in
-      let _ = fill 11 in
+      let _ = fill 12 in
       let tr = (ser, sb, vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), meta) in
       let es = (vec_new (), vec_new (), vec_new (), vec_new (), vec_new ()) in
       let us = (vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (), vec_new (),
@@ -69660,6 +69743,10 @@ and ic_vm_native = fn env -> fn world -> fn blk -> fn (src: str) -> fn (path: st
             if vec_len msg > 0 then ((if other then 3 else 1), (if other then "in a source in " ++ enc ++ ", " else "") ++ vec_get msg 0, 0 - 1)
             else
               (let (lw, id) = vm_load v in
+               // (ruby's warning of a top-level `return <value>`, said as
+               //  the file is compiled and before it runs: the native
+               //  compiler counted them)
+               let _ = (if str_eq lw "" then top_ret_say world path (vec_get meta 11) else ()) in
                if str_eq lw "" then (2, "", id) else (3, lw, 0 - 1))))
     }
 // (the native compiler's values as the interpreter's: a literal frozen, as
@@ -71096,8 +71183,9 @@ and vm_defined = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n: 
         vm_ev env world blk (EDefined (EVar (if k % 2 == 1 then "$" ++ chr (k / 2) else "$" ++ str_of_int (k / 2)))))
      // (a constant under a class is the parser's path -- `Object::X` -- which
      //  answers for an autoload without loading it)
-     else if ty == 17 && (match under with VClass _ -> true | _ -> false) then
-       vm_ev env world blk (EDefined (EConst ((match under with VClass c9 -> c9 | _ -> "") ++ "::" ++ n)))
+     // The namespace is already a value. Reconstructing its qualified name
+     // would recheck private qualifiers that were read legally through a
+     // lexical constant (Hidden::X inside the module defining Hidden).
      else
        vm_scoped env (fn ce ->
          (let _ = map_set ce "__vm~0" under in
