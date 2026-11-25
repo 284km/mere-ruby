@@ -490,7 +490,8 @@ rb_encoding *rb_enc_check(VALUE a, VALUE b) {
 }
 static rb_encoding *encoding_or_null(VALUE e) { return NIL_P(e) ? NULL : rb_enc_from_index(index_of_object(e)); }
 VALUE rb_enc_default_external(void) { return mr_call(rb_cEncoding, "default_external", 0); }
-VALUE rb_enc_default_internal(void) { return mr_call(rb_cEncoding, "default_internal", 0); }
+extern VALUE mr_default_internal;
+VALUE rb_enc_default_internal(void) { return mr_default_internal; }
 rb_encoding *rb_default_external_encoding(void) { return encoding_or_null(rb_enc_default_external()); }
 rb_encoding *rb_default_internal_encoding(void) { return encoding_or_null(rb_enc_default_internal()); }
 void rb_enc_set_default_external(VALUE encoding) { mr_call(rb_cEncoding, "default_external=", 1, encoding); }

@@ -555,6 +555,7 @@ import "ic/m_ic_nodes.mere";
 // preserved by enable/disable/clear. An extern Float preserves the C double;
 // a plain extern int would truncate nanoseconds at the C ABI boundary.
 extern fn mr_gc_process_cpu_time: unit -> float;
+extern fn mr_clock_read: int -> float;
 let gc_state =
   (let t = map_new () in
    let _ = map_set t "prof_epoch" (int_of_float (mr_gc_process_cpu_time () * 1000000000.0)) in
@@ -620,8 +621,6 @@ let gc_safe_now = fn (u: unit) ->
 let gc_tick =
   (let v = vec_new () in
    let _ = vec_push v 0 in
-   let _ = vec_push v 0 in
-   // (2: the C API's safepoints under stress, gc_point_capi)
    let _ = vec_push v 0 in
    v);
 let gc_body_tick = fn (u: unit) ->
@@ -2786,24 +2785,26 @@ let gc_point = fn world ->
               let _ = map_set gc_state "blocked" (bn + 1) in ()))
   else ();
 
-// The C API's safepoint (capi_up, MR_SAFEPOINT: mr_up asks it before a
+// The C API's safepoint (capi_up, MR_SAFEPOINT: mr_up reaches one before a
 // String is fetched, a call, a new String), so that a long C call that calls
 // back through the C API alone is collected in -- under pressure, as any
-// safepoint. Under MERE_RUBY_GC_STRESS=N it collects at every 16*N-th of
-// them, not every N-th: a C call asks for those many times per statement,
+// safepoint. C counts them and asks here only at every 32nd (a statement
+// boundary's one in 32, gc_body_tick), or under MERE_RUBY_GC_STRESS=N every
+// 16*N-th, not every N-th: a C call reaches those many times per statement,
 // and at every one capi_check's api contracts ran past their 120 s bound
-// under stress (a collection every 25 ms of C API calls).
+// under stress (a collection every 25 ms of C API calls). The answer is how
+// many to pass over before C asks again. (C asked at every one, and the
+// round trip was most of what a safepoint cost: with GC.disable,
+// join_in_c(3000) took twice main's time before the safepoint.)
 let gc_point_capi = fn world ->
   let every = vec_get gc_knob 6 in
   if fb_off_stack && not (gc_auto_off ()) && every > 0 then
-    (let n = vec_get gc_tick 2 in
-     if n + 1 >= every * 16 then (let _ = vec_set gc_tick 2 0 in let _ = gc_collect_off_stack world in ())
-     else (let _ = vec_set gc_tick 2 (n + 1) in ()))
-  else if fb_off_stack && gc_body_tick () && gc_pressure world
-  then (if gc_collect_off_stack world then ()
-        else (let bn = (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
-              let _ = map_set gc_state "blocked" (bn + 1) in ()))
-  else ();
+    (let _ = gc_collect_off_stack world in every * 16 - 1)
+  else if fb_off_stack && gc_pressure world
+  then (let _ = (if gc_collect_off_stack world then ()
+                 else (let bn = (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
+                       let _ = map_set gc_state "blocked" (bn + 1) in ())) in 31)
+  else 31;
 
 // ---- giving back the fibers nobody can reach ---------------------------------
 // While a fiber is suspended a collection roots its stack and does not compact
@@ -3554,7 +3555,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                || (str_len name >= 12 && str_eq (substring name 0 12) "__ENCODING__")
                || (str_len name == 5 && str_eq name "break") || (str_len name == 4 && str_eq name "next") || (str_len name == 4 && str_eq name "redo")
                || (str_len name == 5 && str_eq name "retry") || (str_len name == 6 && str_eq name "return") then mkstr "expression"
-       else if (str_len name == 5 && str_eq name "yield") then (let (has, _, _, _) = blk in if has then mkstr "yield" else VNil)
+       else if (str_len name == 5 && str_eq name "yield") then (let (has, _, _, _) = lexical_yield_block env blk in if has then mkstr "yield" else VNil)
        else if (str_len name == 5 && str_eq name "super") then defined_super_str env world
        // $globals and @/@@-prefixed names have their own categories.
        else if str_len name > 0 && str_eq (char_at name 0) "$" then
@@ -3839,7 +3840,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                   else (if map_has private_consts (anc_const_key_q world c cn) then false else true))
                            then mkstr "constant" else VNil
              | _ -> VNil)
-     | EYield _ -> let (has, _, _, _) = blk in if has then mkstr "yield" else VNil
+     | EYield _ -> let (has, _, _, _) = lexical_yield_block env blk in if has then mkstr "yield" else VNil
      // An array LITERAL is defined only if every element is: ruby answers nil
      // for `defined?([Object, Undefined])`. It was "expression" whatever it
      // held, because the literal fell into the catch-all.
@@ -3897,7 +3898,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                else eval_args env world blk arges in
     let superblk = (match bpl9 with
                     | Cons (be9, _) -> coerce_to_block env world blk (eval_e env world blk be9)
-                    | Nil -> blk) in
+                    | Nil -> if lv_has env "__dm_yield" then lexical_yield_block env blk else blk) in
     super_vals env world superblk defcls meth recv args
   | ESuperB (zsuper, arges, bp0, bb) ->
     let (meths, sup, ocls, ivars) = world in
@@ -4026,6 +4027,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ERegex (p9, f9) -> VRegex (p9, f9, "")
   | EYield arges ->
     let args = eval_args env world blk arges in
+    let blk = lexical_yield_block env blk in
     let (has, bparams, bbody, cenv) = blk in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     // `break` inside the yielded block terminates the method the block was
@@ -4035,9 +4037,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // boundary (running any intervening ensure blocks). If the home method has
     // already returned, that is a LocalJumpError.
     if has then (match run_block world noblk blk args with
-                 | FBreak v when lv_has env "__blk_lam" -> v
+                 | FBreak v when (if lv_has env "__dm_yield" then
+                                   (match lv_get env "__dm_yield" with VProc pid9 -> map_has lambda_ids (str_of_int pid9) | _ -> false)
+                                 else lv_has env "__blk_lam") -> v
                  | FBreak v ->
-                     let target = (if lv_has env "__blk_home" then lv_get env "__blk_home"
+                     let target = (if lv_has env "__dm_yield" then
+                                     (match lv_get env "__dm_yield" with
+                                      | VProc pid9 -> (if map_has proc_home (str_of_int pid9) then map_get proc_home (str_of_int pid9) else VInt (0 - 1))
+                                      | _ -> VInt (0 - 1))
+                                   else if lv_has env "__blk_home" then lv_get env "__blk_home"
                                    else yield_home_fid env) in
                      let tk = (match target with VInt t -> t | _ -> 0 - 1) in
                      if tk < 0 || (if fb_frame_live tk then false else true)
@@ -4637,11 +4645,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let _ = (if map_has pending_srcproc "v" then stamp_meth_src_proc key (str_of_int (map_get pending_srcproc "v")) else ()) in
          // capture the block active here so a `yield` in the defined method
          // reaches it (Ruby's define_method closure semantics).
-         let _ = (match blk with
-                  | (true, _, _, _) -> let pid = (proc_next ()) in
-                    let _ = store_proc (str_of_int pid) blk in
-                    map_set dm_captured key (VProc pid)
-                  | _ -> if map_has dm_captured key then map_delete dm_captured key else ()) in
+         let _ = dm_capture_body env key blk newblk in
           // `block_given?` inside the body asks about THIS frame -- the one the
           // block was written in -- so the answer is fixed here, at definition,
           // and does not depend on how the method is later called.
@@ -6381,10 +6385,10 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       if str_eq op "%" && (match va0 with VStr _ -> true | _ -> false) then
         (match va0 with
          | VStr h ->
-           let args2 = rb_fmt_args env world vb in
+           let (source9, args2) = rb_fmt_args env world vb in
            let _ = fmt_ascii_guard world (senc_get h) in
-           let out = rb_format_in env world (senc_get h) (sget h) args2 in
-           let renc = (let r9 = rb_fmt_enc (senc_get h) (sget h) args2 in
+           let (out, converted9) = rb_format_in env world (senc_get h) (sget h) args2 source9 in
+           let renc = (let r9 = converted9 in
                        if str_eq r9 "US-ASCII" && (if str_ascii_only out 0 then false else true) then "ASCII-8BIT" else r9) in
            let r = mkstr out in
            (match r with VStr rid -> (let _ = senc_set rid renc in r) | _ -> r)
@@ -8539,11 +8543,14 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
   // the C API only. A collection here is one in the middle of a statement,
   // which an off-stack collection roots (note 270) -- the stack it
   // interrupted is read for VALUEs, C's frames and the outer calls' with it.
-  if r.op == 33 then (let _ = gc_point_capi world in 0)
+  if r.op == 33 then gc_point_capi world
   else if r.op == 1 then capi_describe env world (capi_in r.a)
   else if r.op == 2 then
     (match capi_in r.a with
-     | VStr h -> let _ = mr_capi_give (bytes_of_str (sget h)) in 0
+     // (the String's own bytes, for C to copy while this request lasts:
+     //  bytes_of_str copies them in a region, and the transit buffer copied
+     //  them again -- capi/core.c mr_capi_give_str)
+     | VStr h -> (let s9 = sget h in let _ = mr_capi_give_str s9 (CapiWord { w = str_len s9 }) in 0)
      | _ -> let _ = raise_exc world "TypeError" "C API: not a String" in 0)
   else if r.op == 3 then
     (match capi_in r.a with
@@ -8759,6 +8766,27 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
      let _ = sym_builtins_ensure () in
      if str_len nm9 == 0 || (if map_has sym_all nm9 then false else true) then 0
      else (match map_get sym_all nm9 with VBool _ -> 1 | _ -> 2))
+  // rb_obj_freeze of a String, an Array or a Hash: the flag set, as CRuby's
+  // RB_OBJ_FREEZE sets it, with no method looked up or called -- 2 when it
+  // was a String not frozen before (C keeps its room: mr_mirror_frozen_by_c),
+  // 1 otherwise; 0 for anything else, which C sends #freeze as before.
+  // (sqlite3 freezes every row and every TEXT value it makes, and the send
+  // was an eighth of a prepared statement's step.)
+  else if r.op == 34 then
+    (match capi_in r.a with
+     | VStr h9 -> if sfrozen_get h9 then 1 else (let _ = sfrozen_set h9 in 2)
+     | VArr a9 -> let _ = cfrozen_set 0 a9 in 1
+     | VHsh h9 -> let _ = cfrozen_set 1 h9 in 1
+     | _ -> 0)
+  // rb_ary_store at the end of an Array that is not frozen: appended, with no
+  // method looked up or called (CRuby's rb_ary_store calls none) -- 1; 0 for
+  // any other index or a frozen Array, which C sends #[]= as before, so its
+  // errors are ruby's own. (sqlite3's step fills each row so.)
+  else if r.op == 35 then
+    (match capi_in r.a with
+     | VArr a9 when r.b == arr_len a9 && (if cfrozen_get 0 a9 then false else true) ->
+       let _ = arr_push_many a9 (Cons (capi_in r.c, Nil)) in 1
+     | _ -> 0)
   else (let _ = raise_exc world "NotImplementedError" ("C API: request " ++ str_of_int r.op ++ " is not answered") in 0)
 // Run C and come back with its value, or with what left it raised again.
 and capi_enter = fn env -> fn world -> fn (req: CapiReq) -> fn (args: Val list) ->
@@ -20380,6 +20408,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     // own methods dispatch and `super` still reaches Time.
     else if time_cls world c && ((str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm")
                                 || (str_len name == 5 && str_eq name "local") || (str_len name == 6 && str_eq name "mktime")) then
+      if not (str_eq c "Time") && not skip9 && cls_meth_own world c name
+         && not (str_eq (sng_user_owner world c name) "") then
+        (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name
+         then private_constructor_error world c name args
+         else invoke world blk recv ("(sng:" ++ c ++ ")") name args)
+      else
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
        let _ = map_set ocls9 id c in
@@ -20429,6 +20463,14 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     //  it included -- time_spec's "doesn't call Time.at directly")
     else if time_cls world c && ((str_len name == 3 && str_eq name "now") || (str_len name == 2 && str_eq name "at")
                                  || (str_len name == 9 && str_eq name "__capi_at")) then
+      // Inherited Ruby overrides precede the native constructor on a subclass.
+      // A saved builtin and the C API entry retain their native dispatch.
+      if not (str_eq c "Time") && not skip9 && not (str_eq name "__capi_at")
+         && cls_meth_own world c name && not (str_eq (sng_user_owner world c name) "") then
+        (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name
+         then private_constructor_error world c name args
+         else invoke world blk recv ("(sng:" ++ c ++ ")") name args)
+      else
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
        let _ = map_set ocls9 id c in
@@ -20913,8 +20955,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
       (if map_has def_int_enc "v" then map_get def_int_enc "v" else VNil)
     else if str_eq c "Encoding" && (str_len name == 17 && str_eq name "default_internal=") then
       (match args with
-       | Cons (VNil, _) -> let _ = (if map_has def_int_enc "v" then map_delete def_int_enc "v" else ()) in VNil
-       | Cons (v, _) -> (let e9 = enc_arg_obj env world v in let _ = map_set def_int_enc "v" e9 in v)
+       // (...and C's variable for it, which rb_enc_default_internal reads:
+       //  capi_global_note)
+       | Cons (VNil, _) -> let _ = (if map_has def_int_enc "v" then map_delete def_int_enc "v" else ()) in
+                           let _ = capi_global_note "default_internal" VNil in VNil
+       | Cons (v, _) -> (let e9 = enc_arg_obj env world v in let _ = map_set def_int_enc "v" e9 in
+                         let _ = capi_global_note "default_internal" e9 in v)
        | _ -> VNil)
     // Enumerator.new requires a block (the legacy obj/method form is gone).
     // (enum_init refuses a missing block, after checking the count)
@@ -23519,6 +23565,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                        let _ = set_meth meths0 (target ++ "#" ++ nm)
                                  (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
                        let _ = map_set dm_methods (target ++ "#" ++ nm) VNil in
+                       let (encl9, _) = strip_yblk_markers (false, (Nil : str list), (Nil : Stmt list), e2) ps2 in
+                       let _ = dm_capture_blk e2 (target ++ "#" ++ nm) encl9 bb2 in
                        VSym nm)
         | other -> raise_exc world "TypeError" ("wrong argument type " ++ class_name other ++ " (expected Proc/Method/UnboundMethod)")))
     // define_method with a name and no body: the block was the body, and there
@@ -23618,10 +23666,15 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           (match proc_as_block pid with (h2, ps2, bb2, e2) ->
              let ps2 = (match ps2 with Cons (m, rest) -> if str_eq m lambda_blk_marker then rest else ps2 | _ -> ps2) in
              // (a block-local is no parameter of the method: dm_params)
-             let mps2 = drop_block_locals ps2 in
+             let mps2 = dm_params ps2 bb2 in
              let _ = set_meth meths0 (c ++ "#" ++ nm) (Meth (mps2, meth_block_defaults (mps2) bb2, drop_defaults_prologue bb2)) in
              let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
              let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
+             let (encl9, _) = strip_yblk_markers (false, (Nil : str list), (Nil : Stmt list), e2) ps2 in
+             let _ = dm_capture_blk e2 (c ++ "#" ++ nm) encl9 bb2 in
+             let _ = map_set dm_had_blk (c ++ "#" ++ nm)
+                       (if lv_has e2 "__has_blk" then lv_get e2 "__has_blk"
+                        else VBool (match encl9 with (true, _, _, _) -> true | _ -> false)) in
              let _ = stamp_meth_src_proc (c ++ "#" ++ nm) (str_of_int pid) in
              VSym nm)
         // (a Symbol, an Integer, ...: not a body either)
@@ -25769,7 +25822,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     //   for every unit including :nanosecond, where ruby gives an Integer.
     //   A dispatcher arm wins over a prelude `def self.`, so the name here had
     //   to change for the ruby one to be reachable at all.
-    else if str_eq c "Process" && (str_len name == 11 && str_eq name "__clock_raw") then VFlt (time ())
+    // ⚠ __clock_raw was time() for EVERY clock, CLOCK_MONOTONIC included: a
+    //   wall clock that goes back when the time is set, so minitest timed a
+    //   test at -3.35 s and the runner could not read that line. The prelude
+    //   now names the kind of clock (tools/process_glue.c lists them).
+    else if str_eq c "Process" && (str_len name == 12 && str_eq name "__clock_read") then
+      (match args with Cons (VInt k9, _) -> VFlt (mr_clock_read k9) | _ -> VFlt (mr_clock_read 1))
     else if str_eq c "Process" && str_eq name "__process_cpu" then VFlt (mr_gc_process_cpu_time ())
     // the two primitives the prelude's spawn / wait are written over: one
     // `sh -c` run to completion (its exit status back, and $? untouched --
@@ -28761,7 +28819,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        else if (str_len name == 6 && str_eq name "printf") then
          (match args with
           | Cons (VStr h9, rest9) ->
-            (let s9 = rb_format env world (sget h9) rest9 in
+            (let s9 = rb_format env world (VStr h9) rest9 VNil in
              let _ = (if fd == 2 then err_raw s9 else out_print_checked world s9) in
              VNil)
           | Nil -> VNil
@@ -35404,7 +35462,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                     (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
           let _ = map_set dm_methods mk2 VNil in
           let _ = dm_store_closure mk2 (h2, ps2, bb2, e2) in
-          let _ = dm_capture_blk mk2 blk bb2 in
+          let _ = dm_capture_body env mk2 blk newblk in
           // (...and `block_given?` in the body asks the frame it was written
           //  in, as the bare form's does: a flag, kept for every body)
           let _ = map_set dm_had_blk mk2
@@ -35436,7 +35494,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                    (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
          let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
-         let _ = dm_capture_blk (c ++ "#" ++ nm) blk bb2 in
+         let _ = dm_capture_body env (c ++ "#" ++ nm) blk newblk in
          let _ = map_set dm_had_blk (c ++ "#" ++ nm)
                    (if lv_has env "__has_blk" then lv_get env "__has_blk"
                     else VBool (match blk with (true, _, _, _) -> true | _ -> false)) in
@@ -47035,8 +47093,59 @@ and hash_merge_one_block = fn world -> fn nb -> fn (base: Val list) -> fn (other
 // property of the WHOLE format, so `mode` rides along the entire pass and
 // mixing two styles is an ArgumentError no matter how far apart they sit.
 // mode: 0 = undecided, 1 = sequential, 2 = numbered, 3 = named.
-and rb_format = fn env -> fn world -> fn (fmt: str) -> fn (args: Val list) ->
-  let (out, used, mode) = rb_format_go env world fmt 0 args 0 0 "" in
+// String#% reads the original array again after coercion callbacks. A
+// length change is rejected before fetching another argument and at exit;
+// replacing an element at the same length remains visible to the formatter.
+and rb_fmt_array_check = fn (args: Val list) -> fn (source9: Val) ->
+  match source9 with
+  | VArr id9 -> (if val_list_len (deref id9) == val_list_len args then ()
+                else (let _ = prim_raise "RuntimeError" "array modified during formatting" in ()))
+  | _ -> ()
+and rb_fmt_array_arg = fn (args: Val list) -> fn (source9: Val) -> fn (index9: int) ->
+  let _ = rb_fmt_array_check args source9 in
+  match source9 with
+  | VArr id9 -> rb_fmt_posarg (deref id9) (index9 + 1)
+  | _ -> rb_fmt_posarg args (index9 + 1)
+
+and rb_format = fn env -> fn world -> fn (format9: Val) -> fn (args: Val list) -> fn (source9: Val) ->
+  let value9 = (match format9 with VStr _ -> format9 | _ -> pack_cv env world 0 "str" format9) in
+  match value9 with
+  | VStr handle9 ->
+    (let _ = fmt_ascii_guard world (senc_get handle9) in
+     let (out9, _) = rb_format_in env world (senc_get handle9) (sget handle9) args source9 in out9)
+  | _ -> ""
+and rb_fmt_state = fn (encoding9: str) ->
+  let rec free9 = fn (index9: int) ->
+    (if index9 >= vec_len fmt_state_busy || vec_get fmt_state_busy index9 == 0 then index9
+     else free9 (index9 + 1)) in
+  let index9 = free9 0 in
+  let state9 = (if index9 < vec_len fmt_state_pool then vec_get fmt_state_pool index9
+                else (let added9 = vec_new () in
+                      let _ = vec_compact added9 in
+                      let _ = vec_push fmt_state_pool added9 in
+                      let _ = vec_push fmt_state_busy 0 in added9)) in
+  let _ = vec_set fmt_state_busy index9 1 in
+  let encoding9 = enc_canon_name encoding9 in
+  let _ = vec_push state9 encoding9 in let _ = vec_push state9 "" in
+  let _ = vec_push state9 encoding9 in let _ = vec_push state9 "" in
+  let _ = vec_push state9 "" in index9
+and rb_fmt_release = fn (index9: int) ->
+  let state9 = vec_get fmt_state_pool index9 in
+  // Vec stores copy strings into its arena. Clearing slots alone leaves
+  // those copies allocated; recycling the arena releases them as well.
+  let _ = vec_recycle state9 in vec_set fmt_state_busy index9 0
+// Negotiate at conversion time, against the output prefix. The state belongs
+// to this invocation, including when a callback recursively formats strings.
+and rb_fmt_take = fn state9 -> fn (text9: str) -> fn (encoding9: str) ->
+  let previous9 = vec_get state9 0 in
+  let result9 = enc_compat2 previous9 (vec_get state9 1) encoding9 text9 in
+  if str_eq result9 "" then
+    (let _ = prim_raise "Encoding::CompatibilityError"
+       ("incompatible character encodings: " ++ enc_msg_name previous9 ++ " and " ++ enc_msg_name encoding9) in ())
+  else vec_set state9 0 result9
+and rb_format_core = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (args: Val list) -> fn (source9: Val) ->
+  let (out, used, mode) = rb_format_go env world state9 fmt 0 args source9 0 0 "" in
+  let _ = rb_fmt_array_check args source9 in
   // leftover arguments are an error only under $DEBUG, and only for the
   // sequential style: numbered and named formats may leave arguments unread.
   let dbg = (if map_has globals "DEBUG" then (match map_get globals "DEBUG" with VNil -> false | VBool b -> b | _ -> true) else false) in
@@ -47052,48 +47161,56 @@ and rb_format = fn env -> fn world -> fn (fmt: str) -> fn (args: Val list) ->
               then rb_warn world "too many arguments for format string" else ()) in
      out)
 
-and rb_format_in = fn env -> fn world -> fn (enc: str) -> fn (fmt: str) -> fn (args: Val list) ->
-  let had = map_has fmt_enc_cur "v" in
-  let prev = (if had then map_get fmt_enc_cur "v" else "") in
-  let _ = map_set fmt_enc_cur "v" (enc_canon_name enc) in
-  let _ = (if map_has fmt_named_cur "k" then map_delete fmt_named_cur "k" else ()) in
-  let out = rb_format env world fmt args in
-  let _ = (if had then map_set fmt_enc_cur "v" prev else map_delete fmt_enc_cur "v") in
-  out
+and rb_format_in = fn env -> fn world -> fn (enc: str) -> fn (fmt: str) -> fn (args: Val list) -> fn (source9: Val) ->
+  let index9 = rb_fmt_state enc in
+  let state9 = vec_get fmt_state_pool index9 in
+  let result9 = try_or_msg
+    (fn (u9: unit) ->
+      let out9 = rb_format_core env world state9 fmt args source9 in
+      let encoding9 = vec_get state9 0 in
+      // The caller owns the returned encoding after the scratch is recycled.
+      (out9, substring encoding9 0 (str_len encoding9)))
+    (fn (message9: str) -> let _ = rb_fmt_release index9 in fail message9) in
+  let _ = rb_fmt_release index9 in result9
 
-and rb_format_go = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (nextarg: int) -> fn (mode: int) -> fn (acc: str) ->
+and rb_format_go = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (source9: Val) -> fn (nextarg: int) -> fn (mode: int) -> fn (acc: str) ->
   let n = str_len fmt in
   if i >= n then (acc, nextarg, mode)
   else
     let c = char_at fmt i in
     if str_eq c "%" then
-      (if i + 1 < n && str_eq (char_at fmt (i + 1)) "%" then rb_format_go env world fmt (i + 2) args nextarg mode (acc ++ "%")
+      (if i + 1 < n && str_eq (char_at fmt (i + 1)) "%" then rb_format_go env world state9 fmt (i + 2) args source9 nextarg mode (acc ++ "%")
        // `%{name}` substitutes the hash entry with no format spec at all, and
        // `%<name>05.2f` names the argument for one. rubocop-ast generates its
        // node matchers this way, so a format that does not substitute becomes a
        // syntax error somewhere else entirely.
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "\{" then
+         let _ = vec_set state9 1 acc in
          let (key, j) = rb_fmt_name fmt (i + 2) "" "}" in
-         let m2 = rb_fmt_to_named_k mode "\{" key "}" nextarg in
-         rb_format_go env world fmt j args nextarg m2 (acc ++ rb_fmt_one env world "" (0 - 1) (0 - 1) false "s" (rb_fmt_named_w env world args key "\{" "}"))
+         let m2 = rb_fmt_to_named_k state9 mode "\{" key "}" nextarg in
+         rb_format_go env world state9 fmt j args source9 nextarg m2 (acc ++ rb_fmt_one env world state9 "" (0 - 1) (0 - 1) false "s" (rb_fmt_named_w env world state9 args key "\{" "}"))
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "<" then
+         let _ = vec_set state9 1 acc in
          let (key, j0) = rb_fmt_name fmt (i + 2) "" ">" in
-         let m2 = rb_fmt_to_named_k mode "<" key ">" nextarg in
-         let av = rb_fmt_named_w env world args key "<" ">" in
+         let m2 = rb_fmt_to_named_k state9 mode "<" key ">" nextarg in
+         let av = rb_fmt_named_w env world state9 args key "<" ">" in
          // the spec after the name formats exactly this one value: run the
          // directive parser over a one-element argument list in numbered mode
          // with the position preset, so a stray %s inside cannot consume the
          // real argument list.
-         let _ = map_set fmt_named_cur "k" key in
-         let (piece, j, na9, m9) = rb_fmt_dir env world fmt j0 (Cons (av, Nil)) 0 2 "" (0 - 1) false (0 - 1) false 1 in
-         let _ = map_delete fmt_named_cur "k" in
+         let _ = vec_set state9 3 key in let _ = vec_set state9 4 "on" in
+         let (piece, j, na9, m9) = rb_fmt_dir env world state9 fmt j0 (Cons (av, Nil)) VNil 0 2 "" (0 - 1) false (0 - 1) false 1 in
+         let _ = vec_set state9 4 "" in
          let _ = na9 in
          let _ = m9 in
-         rb_format_go env world fmt j args nextarg m2 (acc ++ piece)
+         rb_format_go env world state9 fmt j args source9 nextarg m2 (acc ++ piece)
        else
-         let (piece, j, na2, m2) = rb_fmt_dir env world fmt (i + 1) args nextarg mode "" (0 - 1) false (0 - 1) false 0 in
-         rb_format_go env world fmt j args na2 m2 (acc ++ piece))
-    else rb_format_go env world fmt (i + 1) args nextarg mode (acc ++ c)
+         // Only argument conversion needs the prefix for encoding checks.
+         // Literal bytes are copied without negotiating their encoding.
+         let _ = vec_set state9 1 acc in
+         let (piece, j, na2, m2) = rb_fmt_dir env world state9 fmt (i + 1) args source9 nextarg mode "" (0 - 1) false (0 - 1) false 0 in
+         rb_format_go env world state9 fmt j args source9 na2 m2 (acc ++ piece))
+    else rb_format_go env world state9 fmt (i + 1) args source9 nextarg mode (acc ++ c)
 
 // a named reference may not mix with the sequential or numbered styles.
 
@@ -47101,7 +47218,7 @@ and rb_format_go = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (arg
 // the spec is read left to right; `pset` tells "no precision" apart from an
 // explicit one (a negative star precision means none was given). Returns the
 // formatted piece, the index past the type char, the argument cursor, and mode.
-and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) ->
+and rb_fmt_dir = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (source9: Val) ->
   fn (nextarg: int) -> fn (mode: int) -> fn (flags: str) -> fn (width: int) -> fn (wset: bool) ->
   fn (prec: int) -> fn (pset: bool) -> fn (pos: int) ->
   let n = str_len fmt in
@@ -47122,106 +47239,106 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
       //  CHECK_FOR_FLAGS)
       (if pset then (let _ = prim_raise "ArgumentError" "flag after precision" in ("", i, nextarg, mode))
        else if wset then (let _ = prim_raise "ArgumentError" "flag after width" in ("", i, nextarg, mode))
-       else rb_fmt_dir env world fmt (i + 1) args nextarg mode (flags ++ c) width wset prec pset pos)
+       else rb_fmt_dir env world state9 fmt (i + 1) args source9 nextarg mode (flags ++ c) width wset prec pset pos)
     else if is_digit c then
       let (k, j) = rb_fmt_digits fmt i 0 false in
       (if j < n && str_eq (char_at fmt j) "$" then
          (if pos > 0 then (let _ = prim_raise "ArgumentError" ("value given twice - " ++ int_to_base k 10 ++ "$") in ("", j, nextarg, mode))
           else if k <= 0 then (let _ = prim_raise "ArgumentError" "invalid index - 0$" in ("", j, nextarg, mode))
           else if mode == 1 || mode == 3 then (let _ = prim_raise "ArgumentError" ("numbered(" ++ int_to_base k 10 ++ "$) after unnumbered(%)") in ("", j, nextarg, mode))
-          else rb_fmt_dir env world fmt (j + 1) args nextarg 2 flags width wset prec pset k)
+          else rb_fmt_dir env world state9 fmt (j + 1) args source9 nextarg 2 flags width wset prec pset k)
        else if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", j, nextarg, mode))
-       else rb_fmt_dir env world fmt j args nextarg mode flags k true prec pset pos)
+       else rb_fmt_dir env world state9 fmt j args source9 nextarg mode flags k true prec pset pos)
     else if str_eq c "*" then
       (if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", i, nextarg, mode))
        // (`%.**d`: a width cannot follow the precision)
        else if pset then (let _ = prim_raise "ArgumentError" "width after precision" in ("", i, nextarg, mode))
        else
-         let (w, j, na2, m2) = rb_fmt_star env world fmt (i + 1) args nextarg mode "width" in
+         let (w, j, na2, m2) = rb_fmt_star env world fmt (i + 1) args source9 nextarg mode "width" in
          // (a negative width is a left-justified one, and negating INT_MIN
          // does not fit an int: ruby's "width too big", where this padded
          // 2^31 spaces and ran out of stack)
          (if w < 0 && 0 - w > 2147483647 then (let _ = prim_raise "ArgumentError" "width too big" in ("", j, na2, m2))
-          else if w < 0 then rb_fmt_dir env world fmt j args na2 m2 (flags ++ "-") (0 - w) true prec pset pos
-          else rb_fmt_dir env world fmt j args na2 m2 flags w true prec pset pos))
+          else if w < 0 then rb_fmt_dir env world state9 fmt j args source9 na2 m2 (flags ++ "-") (0 - w) true prec pset pos
+          else rb_fmt_dir env world state9 fmt j args source9 na2 m2 flags w true prec pset pos))
     else if str_eq c "." then
       (if pset then (let _ = prim_raise "ArgumentError" "precision given twice" in ("", i, nextarg, mode))
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "*" then
-         let (p, j, na2, m2) = rb_fmt_star env world fmt (i + 2) args nextarg mode "prec" in
-         rb_fmt_dir env world fmt j args na2 m2 flags width wset (if p < 0 then 0 - 1 else p) true pos
+         let (p, j, na2, m2) = rb_fmt_star env world fmt (i + 2) args source9 nextarg mode "prec" in
+         rb_fmt_dir env world state9 fmt j args source9 na2 m2 flags width wset (if p < 0 then 0 - 1 else p) true pos
        else
          let (p, j) = rb_fmt_digits fmt (i + 1) 0 false in
          // a precision that cannot fit an int is ruby's own refusal (the
          // accumulated value has already wrapped, so measure the DIGITS).
          let _ = (if j - (i + 1) > 9 then (let _ = prim_raise "ArgumentError" "prec too big" in ()) else ()) in
-         rb_fmt_dir env world fmt j args nextarg mode flags width wset (if p < 0 then 0 else p) true pos)
+         rb_fmt_dir env world state9 fmt j args source9 nextarg mode flags width wset (if p < 0 then 0 else p) true pos)
     else if rb_fmt_is_type c then
       let (av, na2, m2) =
-        (if pos > 0 then (rb_fmt_posarg args pos, nextarg, mode)
+        (if pos > 0 then (rb_fmt_array_arg args source9 (pos - 1), nextarg, mode)
          else if mode == 2 || mode == 3 then (let _ = prim_raise "ArgumentError" ("unnumbered(" ++ int_to_base (nextarg + 1) 10 ++ ") mixed with numbered") in (VNil, nextarg, mode))
          else if nextarg >= val_list_len args then (let _ = prim_raise "ArgumentError" "too few arguments" in (VNil, nextarg, mode))
-         else (val_nth args nextarg, nextarg + 1, 1)) in
-      (rb_fmt_one env world flags width prec pset c av, i + 1, na2, m2)
+         else (rb_fmt_array_arg args source9 nextarg, nextarg + 1, 1)) in
+      (rb_fmt_one env world state9 flags width prec pset c av, i + 1, na2, m2)
     // `%<name>` may stand anywhere in the spec (`%+15<foo>.5f`): the named
     // value is this directive's argument, and the format is named from here
     // ...and `%-20.5{foo}`: the named value as %s, with what came before it
-    else if str_eq c "\{" && map_has fmt_named_cur "k" then
+    else if str_eq c "\{" && (str_len (vec_get state9 4) > 0) then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" "}" in
-       let _ = prim_raise_enc "ArgumentError" ("named\{" ++ key ++ "} after <" ++ map_get fmt_named_cur "k" ++ ">") (fmt_enc_now ()) in
+       let _ = prim_raise_enc "ArgumentError" ("named\{" ++ key ++ "} after <" ++ vec_get state9 3 ++ ">") (fmt_enc_now state9) in
        ("", j, nextarg, mode))
-    else if str_eq c "<" && map_has fmt_named_cur "k" then
+    else if str_eq c "<" && (str_len (vec_get state9 4) > 0) then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" ">" in
-       let _ = prim_raise_enc "ArgumentError" ("named<" ++ key ++ "> after <" ++ map_get fmt_named_cur "k" ++ ">") (fmt_enc_now ()) in
+       let _ = prim_raise_enc "ArgumentError" ("named<" ++ key ++ "> after <" ++ vec_get state9 3 ++ ">") (fmt_enc_now state9) in
        ("", j, nextarg, mode))
     else if str_eq c "\{" then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" "}" in
-       let m2 = rb_fmt_to_named_k mode "\{" key "}" nextarg in
-       let av = rb_fmt_named_w env world args key "\{" "}" in
-       (rb_fmt_one env world flags width prec pset "s" av, j, nextarg, m2))
+       let m2 = rb_fmt_to_named_k state9 mode "\{" key "}" nextarg in
+       let av = rb_fmt_named_w env world state9 args key "\{" "}" in
+       (rb_fmt_one env world state9 flags width prec pset "s" av, j, nextarg, m2))
     else if str_eq c "<" then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" ">" in
-       let m2 = rb_fmt_to_named_k mode "<" key ">" nextarg in
-       let av = rb_fmt_named_w env world args key "<" ">" in
-       let _ = map_set fmt_named_cur "k" key in
-       let (piece, j2, _, _) = rb_fmt_dir env world fmt j (Cons (av, Nil)) 0 2 flags width wset prec pset 1 in
-       let _ = map_delete fmt_named_cur "k" in
+       let m2 = rb_fmt_to_named_k state9 mode "<" key ">" nextarg in
+       let av = rb_fmt_named_w env world state9 args key "<" ">" in
+       let _ = vec_set state9 3 key in let _ = vec_set state9 4 "on" in
+       let (piece, j2, _, _) = rb_fmt_dir env world state9 fmt j (Cons (av, Nil)) VNil 0 2 flags width wset prec pset 1 in
+       let _ = vec_set state9 4 "" in
        (piece, j2, nextarg, m2))
     // a character that is not a directive is named when it is printable
     else (let o9 = ord c in
           let _ = prim_raise "ArgumentError"
                     (if o9 > 32 && o9 < 127 then "malformed format string - %" ++ c else "malformed format string") in
           ("", i + 1, nextarg, mode))
-and rb_fmt_named = fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
+and rb_fmt_named = fn state9 -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
   (match args with
    | Cons (VHsh h, _) ->
      let xs = hderef h in
      // symbol keys only: ruby does not accept a string key here, and the
      // message quotes the brackets the format used.
      // (the key is a name in the format's encoding: name_u8, note 484)
-     let key9 = VSym (name_u8 key (fmt_enc_now ())) in
+     let key9 = VSym (name_u8 key (fmt_enc_now state9)) in
      if hash_haskey xs key9 then hash_get xs key9
-     else prim_raise_enc "KeyError" ("key" ++ op ++ key ++ cl ++ " not found") (fmt_enc_now ())
+     else prim_raise_enc "KeyError" ("key" ++ op ++ key ++ cl ++ " not found") (fmt_enc_now state9)
    | _ -> prim_raise "ArgumentError" "one hash required")
 
 // A named reference reads the one Hash argument through Hash#[] -- so its
 // default (a value or a block) answers a missing key -- and only a nil
 // answer is the KeyError, which carries the Hash and the key as ruby's does.
-and rb_fmt_named_w = fn env -> fn world -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
+and rb_fmt_named_w = fn env -> fn world -> fn state9 -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
   match args with
   | Cons (VHsh h, _) ->
     (let xs = hderef h in
-     let key9 = VSym (name_u8 key (fmt_enc_now ())) in
+     let key9 = VSym (name_u8 key (fmt_enc_now state9)) in
      if hash_haskey xs key9 then hash_get xs key9
      else
        (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
         match invoke_val_c env world nb (VHsh h) "[]" (Cons (key9, Nil)) false with
         | VNil -> raise_exc_iv world "KeyError" ("key" ++ op ++ key ++ cl ++ " not found")
-                    (Cons (("__key", key9), Cons (("__recv", VHsh h), Cons (("__menc", mkstr (fmt_enc_now ())), Nil))))
+                    (Cons (("__key", key9), Cons (("__recv", VHsh h), Cons (("__menc", mkstr (fmt_enc_now state9)), Nil))))
         | v -> v))
-  | _ -> rb_fmt_named args key op cl
+  | _ -> rb_fmt_named state9 args key op cl
 
 
-// A format argument that is not a String: #to_str, as StringValue asks it.
+// StringValue conversion shared by Kernel's message and command readers.
 and fmt_str_arg = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VStr h -> sget h
@@ -47236,7 +47353,7 @@ and fmt_str_arg = fn env -> fn world -> fn (v: Val) ->
 // sequential argument, `*3$` a numbered one. Digits NOT followed by '$' are
 // left unconsumed -- ruby re-reads them after the star, so `%*5s` is a
 // width-given-twice error, not width 5.
-and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (nextarg: int) -> fn (mode: int) -> fn (what: str) ->
+and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (source9: Val) -> fn (nextarg: int) -> fn (mode: int) -> fn (what: str) ->
   let n = str_len fmt in
   let (k, j) = rb_fmt_digits fmt i 0 false in
   // (an argument index that cannot fit an int is ruby's "width too big" /
@@ -47246,11 +47363,11 @@ and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args
   else if k >= 0 && j < n && str_eq (char_at fmt j) "$" then
     (if k <= 0 then (let _ = prim_raise "ArgumentError" "invalid index - 0$" in (0, j + 1, nextarg, mode))
      else if mode == 1 || mode == 3 then (let _ = prim_raise "ArgumentError" ("numbered(" ++ int_to_base k 10 ++ "$) after unnumbered(%)") in (0, j + 1, nextarg, mode))
-     else (rb_fmt_int env world (rb_fmt_posarg args k), j + 1, nextarg, 2))
+     else (rb_fmt_int env world (rb_fmt_array_arg args source9 (k - 1)), j + 1, nextarg, 2))
   else
     (if mode == 2 || mode == 3 then (let _ = prim_raise "ArgumentError" ("unnumbered(" ++ int_to_base (nextarg + 1) 10 ++ ") mixed with numbered") in (0, i, nextarg, mode))
      else if nextarg >= val_list_len args then (let _ = prim_raise "ArgumentError" "too few arguments" in (0, i, nextarg, mode))
-     else (rb_fmt_int env world (val_nth args nextarg), i, nextarg + 1, 1))
+     else (rb_fmt_int env world (rb_fmt_array_arg args source9 nextarg), i, nextarg + 1, 1))
 
 
 // the encoding of a format's result: the format string's, negotiated with
@@ -47260,16 +47377,16 @@ and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args
 // "no, wrap me") is the whole argument list; any other value is one argument.
 and rb_fmt_args = fn env -> fn world -> fn (vb: Val) ->
   match vb with
-  | VArr id -> deref id
+  | VArr id -> (VArr id, deref id)
   | VObj _ ->
     (if responds world vb "to_ary" then
        (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
         match invoke_val_c env world nb vb "to_ary" Nil false with
-        | VArr id -> deref id
-        | VNil -> Cons (vb, Nil)
-        | other -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name vb ++ " to Array (" ++ class_name vb ++ "#to_ary gives " ++ class_name other ++ ")") in Cons (vb, Nil)))
-     else Cons (vb, Nil))
-  | _ -> Cons (vb, Nil)
+        | VArr id -> (VArr id, deref id)
+        | VNil -> (VNil, Cons (vb, Nil))
+        | other -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name vb ++ " to Array (" ++ class_name vb ++ "#to_ary gives " ++ class_name other ++ ")") in (VNil, Cons (vb, Nil))))
+     else (VNil, Cons (vb, Nil)))
+  | _ -> (VNil, Cons (vb, Nil))
 
 // the name inside %{...} / %<...>, and the index just past its closing brace.
 
@@ -47992,7 +48109,7 @@ and rb_fmt_flt = fn env -> fn world -> fn (v: Val) ->
 // `alt` is the `#` flag: keep the trailing zeros and the decimal point that
 // %g otherwise strips (`format("%#g", 1.0)` is "1.00000").
 
-and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (pset: bool) -> fn (typ: str) -> fn (av: Val) ->
+and rb_fmt_one = fn env -> fn world -> fn state9 -> fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (pset: bool) -> fn (typ: str) -> fn (av: Val) ->
   if str_eq typ "d" || str_eq typ "i" || str_eq typ "u" then
     let (neg, ds) =
       (match rb_fmt_int_v env world av with
@@ -48042,6 +48159,7 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     // for BINARY (`"%10s" % "\xc2\xa1".b` is eight spaces), EUC-JP's
     // characters for EUC-JP; they were UTF-8's for every string
     let se = (if str_eq se0 "" then "UTF-8" else se0) in
+    let _ = rb_fmt_take state9 s0 se in
     if str_eq se "UTF-8" || (if enc_ascii_compat se then false else true) then
       (let s = (if pset && prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
        rb_pad_str s flags width)
@@ -48052,7 +48170,26 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
        else if str_contains flags "-" then s ++ str_repeat " " (width - len9)
        else str_repeat " " (width - len9) ++ s)
   else if str_eq typ "p" then
-    let s0 = inspect_w env world av in
+    let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+    let inspected9 = invoke_val_c env world nb9 av "inspect" Nil false in
+    let (text9, source_encoding9) = dstr_conv env world nb9 inspected9 in
+    let (s0, encoding9) =
+        (let enc9 = enc_canon_name source_encoding9 in
+         if (if str_eq enc9 (insp_resenc ()) then false else true)
+            && (if enc_ascii_compat enc9 && enc_all7 text9 then false else true)
+         then
+           (let escaped9 = (if str_eq enc9 "ASCII-8BIT" then
+              (let buffer9 = strbuf_new () in
+               let rec bytes9 = fn (index9: int) ->
+                 (if index9 >= str_len text9 then strbuf_to_str buffer9
+                  else (let byte9 = ord (char_at text9 index9) in
+                        let _ = strbuf_push buffer9
+                          (if byte9 < 128 then chr byte9 else chr 92 ++ "x" ++ hex2 byte9) in
+                        bytes9 (index9 + 1))) in bytes9 0)
+              else enc_escape_txt enc9 text9) in
+            (escaped9, "US-ASCII"))
+         else (text9, enc9)) in
+    let _ = rb_fmt_take state9 s0 encoding9 in
     let s = (if pset && prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
     rb_pad_str s flags width
   else if str_eq typ "c" then
@@ -48065,6 +48202,7 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     // (the first CHARACTER of the string's own encoding: "%c" % sjis("あい")
     //  is the two bytes of あ, not the one byte UTF-8 would read off)
     let first_ch = fn (s0: str) -> fn (e0: str) ->
+      let _ = rb_fmt_take state9 s0 e0 in
       (if str_len s0 == 0 then ""
        else (let e9 = enc_canon_name e0 in
              if str_eq e9 "" || enc_utf8_family e9 || (if enc_ascii_compat e9 then false else true) then utf8_substr s0 0 1
@@ -48074,7 +48212,7 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     // calls more "out of char range", the byte-oriented encodings take the
     // character's bytes (0xA4A2 in EUC-JP), and what is no character at all is
     // "invalid character". Every codepoint was written as UTF-8.
-    let fe9 = (if map_has fmt_enc_cur "v" then map_get fmt_enc_cur "v" else "UTF-8") in
+    let fe9 = vec_get state9 0 in
     let cp_ch = fn (cp: int) ->
       (if cp < 0 then (let _ = prim_raise "ArgumentError" "invalid character" in "")
        else if str_eq fe9 "US-ASCII" || str_eq fe9 "ASCII-8BIT" then
@@ -50639,11 +50777,10 @@ and ecall_args = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val
     // String form existed, so `printf(io, "%d", 1)` printed nothing anywhere.
     else if (str_len name == 6 && str_eq name "printf") && (if kernel_overridden env world "printf" then false else true) then
       (let _ = (match args with
-                | Cons (VStr h, rest) -> out_emit world (rb_format env world (sget h) rest)
+                | Cons (VStr h, rest) -> out_emit world (rb_format env world (VStr h) rest VNil)
                 | Cons (io9, Cons (f9, rest9)) ->
-                  (let fs9 = fmt_str_arg env world f9 in
-                   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                   let _ = invoke_val_c env world nb9 io9 "write" (Cons (mkstr (rb_format env world fs9 rest9), Nil)) false in ())
+                  (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                   let _ = invoke_val_c env world nb9 io9 "write" (Cons (mkstr (rb_format env world f9 rest9 VNil), Nil)) false in ())
                 | Cons (_, Nil) -> (let _ = raise_exc world "ArgumentError" "too few arguments" in ())
                 | Nil -> ()) in VNil)
     // Kernel#format / #sprintf: sprintf-style formatting. A format that is not
@@ -50656,10 +50793,10 @@ and ecall_args = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val
               | Nil -> Nil) with
        | Cons (VStr h, rest) ->
          let _ = fmt_ascii_guard world (senc_get h) in
-         let out = rb_format_in env world (senc_get h) (sget h) rest in
+         let (out, converted9) = rb_format_in env world (senc_get h) (sget h) rest VNil in
          // (a US-ASCII result that came out holding a byte past 127 -- `%c`
          //  of 0x80 -- is BINARY, as ruby makes it)
-         let renc = (let r9 = rb_fmt_enc (senc_get h) (sget h) rest in
+         let renc = (let r9 = converted9 in
                      if str_eq r9 "US-ASCII" && (if str_ascii_only out 0 then false else true) then "ASCII-8BIT" else r9) in
          let r = mkstr out in
          (match r with VStr rid -> (let _ = senc_set rid renc in r) | _ -> r)
@@ -51793,13 +51930,6 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     //  calls are its original's, as ruby counts them)
     let _ = (if vec_get cov_st 0 == 2
              then cov_meth (if map_has alias_srcname dk then defcls ++ "#" ++ map_get alias_srcname dk else dk) else ()) in
-    // a method defined via define_method yields to the block captured at
-    // definition time when the call site itself passes no block.
-    let blk = (match blk with
-               | (true, _, _, _) -> blk
-               | _ -> if map_has dm_captured dk
-                      then (match map_get dm_captured dk with VProc pid -> proc_get (str_of_int pid) | _ -> blk)
-                      else blk) in
     // a define_method body is a closure: its frame is a CHILD of the scope the
     // block was written in, so the body reads those locals -- and writes reach
     // them, which copying the values in could not do (`define_method(:bump) {
@@ -51820,14 +51950,14 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     let _ = (if map_has r2k_methods dk then map_set frame "__r2k" VNil else ()) in
     // A body that came from define_method is a BLOCK, and a block's
     // `block_given?` asks about the frame it was written in -- never about the
-    // call that reached the method. `C.new.dm { }` answered true here where
-    // Ruby answers false; `yield` inside such a body is not even legal Ruby
-    // (it is a SyntaxError), and `|&b|` still receives the caller's block,
-    // which is the supported way to take one.
+    // call that reached the method. A lexical yield uses the captured
+    // definition-site block, while |&b| still receives this call's block.
     let _ = (if map_has dm_closenv dk
-             then map_set frame "__in_dm"
+             then (let _ = map_set frame "__dm_yield"
+                             (if map_has dm_captured dk then map_get dm_captured dk else VNil) in
+                   map_set frame "__in_dm"
                     (if map_has dm_had_blk dk
-                     then map_get dm_had_blk dk else VBool false)
+                     then map_get dm_had_blk dk else VBool false))
              else ()) in
     let _ = map_set frame "self" recv in
     // a method body has no instance_eval definee in force: its `def` goes to
@@ -63363,6 +63493,14 @@ and yblk_env = fn denv -> fn blk ->
      let _ = brk_carry denv ch9 in
      let ypid = proc_next () in
      let _ = store_proc (str_of_int ypid) blk in
+     let source9 = block_source_proc blk in
+     let home9 = (if source9 >= 0 && map_has proc_home (str_of_int source9)
+                  then map_get proc_home (str_of_int source9)
+                  else if lv_has denv "__blk_home" then lv_get denv "__blk_home"
+                  else yield_home_fid denv) in
+     let _ = map_set proc_home (str_of_int ypid) home9 in
+     let _ = (if blk_is_lambda blk || lv_has denv "__blk_lam"
+              then map_set lambda_ids (str_of_int ypid) VNil else ()) in
      let _ = map_set ch9 "__yblk" (VProc ypid) in
      ch9)
   | _ -> denv
@@ -63392,11 +63530,47 @@ and yblk_blk = fn newblk -> fn blk ->
 // the block in force where a define_method / define_singleton_method with a
 // RECEIVER was called, kept for the body's `yield` (dm_captured, as the bare
 // form keeps it) -- when the body has one
-and dm_capture_blk = fn (key: str) -> fn blk -> fn (body: Stmt list) ->
-  match blk with
+and lexical_yield_block = fn env -> fn blk ->
+  let chosen9 = (if lv_has env "__dm_yield" then
+                   (match lv_get env "__dm_yield" with
+                    | VProc pid9 -> proc_get (str_of_int pid9)
+                    | _ -> (false, (Nil : str list), (Nil : Stmt list), env))
+                 else blk) in
+  match chosen9 with
+  | (true, _, _, _) -> chosen9
+  | _ -> (if lv_has env "__yblk" then
+            (match lv_get env "__yblk" with VProc pid9 -> proc_get (str_of_int pid9) | _ -> chosen9)
+          else chosen9)
+// A forwarded Proc keeps the yield context of its definition, even when
+// an unrelated registration helper was called with another block.
+and dm_capture_body = fn env -> fn (key: str) -> fn blk -> fn bodyblk ->
+  let (_, ps9, body9, denv9) = bodyblk in
+  if map_has pending_srcproc "v" || block_source_proc bodyblk >= 0 then
+    (let (enclosing9, _) = strip_yblk_markers
+       (false, (Nil : str list), (Nil : Stmt list), denv9) ps9 in
+     dm_capture_blk denv9 key enclosing9 body9)
+  else dm_capture_blk env key blk body9
+and dm_capture_blk = fn env -> fn (key: str) -> fn blk -> fn (body: Stmt list) ->
+  match lexical_yield_block env blk with
   | (true, _, _, _) when body_yields body ->
-    (let pid = proc_next () in
-     let _ = store_proc (str_of_int pid) blk in
+    (let actual9 = lexical_yield_block env blk in
+     let pid = proc_next () in
+     let _ = store_proc (str_of_int pid) actual9 in
+     let source9 = (if lv_has env "__dm_yield" then
+                      (match lv_get env "__dm_yield" with VProc p9 -> p9 | _ -> 0 - 1)
+                    else match blk with
+                    | (true, _, _, _) -> block_source_proc actual9
+                    | _ -> (if lv_has env "__yblk" then
+                              (match lv_get env "__yblk" with VProc p9 -> p9 | _ -> 0 - 1)
+                            else block_source_proc actual9)) in
+     let home9 = (if source9 >= 0 && map_has proc_home (str_of_int source9)
+                  then map_get proc_home (str_of_int source9)
+                  else if lv_has env "__blk_home" then lv_get env "__blk_home"
+                  else yield_home_fid env) in
+     let _ = map_set proc_home (str_of_int pid) home9 in
+     let _ = (if blk_is_lambda actual9 || (source9 >= 0 && map_has lambda_ids (str_of_int source9))
+              || (source9 < 0 && lv_has env "__blk_lam")
+              then map_set lambda_ids (str_of_int pid) VNil else ()) in
      map_set dm_captured key (VProc pid))
   | _ -> if map_has dm_captured key then map_delete dm_captured key else ()
 // A fresh anonymous owner with one ordinary method definition cannot run
@@ -64262,6 +64436,8 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                        // gone by the time the method runs unless they are kept
                        // here. The call form of define_method already did this.
                        let _ = dm_store_closure (cls ++ "#" ++ nm) (false, bp, bb, cenv) in
+                       let _ = dm_capture_blk cenv (cls ++ "#" ++ nm)
+                                 (false, (Nil : str list), (Nil : Stmt list), cenv) bb in
                        // ...and whether the frame this block was WRITTEN in had
                        // a block of its own, which is what `block_given?` inside
                        // the defined method answers. This is the fifth place a
@@ -70971,7 +71147,8 @@ and vm_super_direct = fn env -> fn world -> fn blk -> fn (zsuper: bool) -> fn (v
                        | _ -> (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                     else (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                  else vals) in
-     super_vals env world blk defcls meth recv args)
+     let superblk9 = (if lv_has env "__dm_yield" then lexical_yield_block env blk else blk) in
+     super_vals env world superblk9 defcls meth recv args)
 // one turn of a send without arguments or flags beyond ARGS_SIMPLE, on a
 // receiver of the VM's making (opt_newarray_send's Array, ...)
 and vm_send0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str) -> fn (args: Val list) ->
