@@ -34,6 +34,13 @@ installed into: it must fail there (those extensions were built for another
 ruby), so what passed was mere-ruby's own build.
 
 Each step is bounded: 600 seconds for an install, 120 for a run; 2 GiB.
+An install's make runs one compiler at a time on both sides (BUILD_JOBS,
+said to `gem install` as --build-jobs). RubyGems' own default is the
+machine's processors + 1 (installer.rb), and on a ten-processor machine the
+reference's prism reached 1.92 to 2.12 GB with eleven at once -- the bound,
+set by the machine and not by the gem. One compile of prism's api_node.c
+with the reference's flags (-O3 -ggdb3) is 1.5 GB by itself, so two at once
+are 2.09 GB; one at a time the install peaks at 1.74 GB.
 """
 from pathlib import Path
 import argparse
@@ -93,6 +100,10 @@ for name, version, fetch_options, _ in GEMS:
     if not (fetched / file).is_file():
         sys.exit(f'capi_gem_check: {file} was not fetched')
 results = {}
+# (how many compilers an install's make runs at once: the bound is 2 GiB for
+#  the install with its children, whatever the machine's processor count,
+#  and the reference's prism has one compile of 1.5 GB)
+BUILD_JOBS = 1
 
 
 def run(key, side, command, home, seconds):
@@ -125,6 +136,7 @@ for side, ruby in (('reference', REF), ('mere', MERE)):
     homes[side].mkdir(parents=True)
     for name, version, _, install_options in GEMS:
         installed = run(f'install-{name}', side, [ruby, gem_command, 'install', '--local', '--no-document',
+                                                   '--build-jobs', str(BUILD_JOBS),
                                                    f'{name}-{version}.gem', *install_options], homes[side], 600)
         print(f"{side:10s} gem install {name} {version}: {'installed' if installed['ok'] else 'FAILED'}", flush=True)
         if not installed['ok']:
