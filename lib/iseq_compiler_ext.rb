@@ -5357,6 +5357,10 @@ class RubyVM::InstructionSequence
       end
       params[:kwrest] = pr[:kwrest] if pr[:kwrest]
       params[:ambiguous_param0] = true if pr[:ambiguous_param0]
+      # (...and that the block is a for loop's: its one parameter has no
+      #  has_lead, so an Array given is not spread over it, as it is over
+      #  `|x,|`'s -- the VM binds it as `|x|`)
+      params[:for] = true if vm && pr[:for]
       params[:accepts_no_kwarg] = true if vm && pr[:no_kwarg]
       # (...and which implicit parameters a block has: N for _1 .. _N, 0 for `it`)
       params[:implicit] = pr[:implicit] if vm && pr[:implicit]
