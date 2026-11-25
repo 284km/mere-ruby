@@ -73,12 +73,30 @@ The other `(sng:` prefix tests that are written out by hand (m_state's `mro_loca
 main after this branch's base adds one more call, in `capi_describe_x`'s VClass arm (#284): a class's CLASS_OF is "Class" for a singleton class, else its metaclass `(sng:c)`.
 With the whole key, a class inside a singleton gets its own metaclass, as any class does in CRuby. It is in the last group below. The branch merges with main without a conflict.
 
+## Review of #288
+
+Things the first version left, found in review (44's and the inline review):
+
+- **The object's death took the class with it.** The collector reads the object id of a key with `sng_key_id`, and that read `(sng:123)::N` and `(sng:123)::N#v` as object 123's too.
+  When the object was collected, `gc_purge_sng` / `gc_purge_tbl` and `gc_sweep_classes` (through `gc_class_owner`) dropped N's rows: its methods, its superclass, its includes, its ancestors.
+  A subclass or a constant holding N does not keep the object, so `class Keep < N` then `GC.start` answered NoMethodError for N's methods and Object for `Keep.superclass.superclass`. On main this could not happen, because N could not be given a method or a subclass.
+  `sng_own_id` is `sng_key_id` but -1 for a key with `::` after the singleton's `)`. The purge and `gc_class_owner` use it, so a nested class has no owner and stays, like a named class.
+  A value holding N still keeps the object (the mark of a VClass reads `sng_key_id`), so the singleton's own constants that N's methods can see stay as well.
+- **The printed key was cut at the first `)::`.** For `(sng:(sng:X)::M)::N2`, N2 in M's singleton, the name was `#<Class:(sng:281474976710815>::M)::N2`.
+  `sng_nested_at` (m_strutil) finds the `)` that closes the first `(`. `cls_display`, `cls_display_nw` and m_strutil's `to_s` cut there.
+- **An instance's own singleton class printed its class's key**, `#<Class:#<(sng:..)::M:0x..>>`. `cls_display`'s object arm now prints a `(sng:` class through `cls_display`, as it already did an anonymous one.
+
+- **`Module#name` was right only in the ordinary call.** `Module.instance_method(:name).bind_call(k)` and `super` from a `def k.name` go through `mod_name_val`, which has no world and answered the raw key `(sng:..)::M`. The ordinary call's String was also a new, unfrozen one each time.
+  `mod_name_w world c` names a nested key with `cls_display`, freezes it and keeps it in `cls_name_str`, as `mod_name_val0` does every other name. All three paths call it.
+
+corpus/1062 (new) is the collector's case: 20 classes held by a constant, 10 named subclasses and 50 `Class.new` subclasses of N, then 3 collections. It also checks the printed shapes (no `(sng:`, balanced `#<..>`, the path at the end), the three paths to `Module#name`, and that the name is frozen and the same String each time.
+
 ## Checked
 
 - The two tests, alone in round 4's tree: 2 runs, 2 assertions, 0 failures (main: 2 errors).
 - corpus/1061 (new): def, `def self.`, define_method, method_added, constants (its own, the singleton's around it, a nested one), `new` / `allocate` / `dup`, `.class`, `is_a?`, `name`, `inspect`, a string class_eval on a singleton with `inherited`, a frozen object's singleton, and a class under a named class's singleton.
   It matches ruby on both engines. main dies at its first `def`.
-- `./run_corpus.sh --both`: 946/946, plain and with `MERE_RUBY_VM=1` (the base is before corpus/1060).
+- `./run_corpus.sh --both`: 947/947, plain and with `MERE_RUBY_VM=1`, after the review's changes (the base is before corpus/1060).
 - Gates: dead_defs, dup_defs, gc_roots, meth_writes, name_len, ns_names, bracket_depth, loop_rss.
 
 ## Left
@@ -86,3 +104,4 @@ With the whole key, a class inside a singleton gets its own metaclass, as any cl
 - A class inside `class << self` written INSIDE `class Foo` is keyed `Foo::(sng:Foo)::Inner` (the outer scope prefixed to the singleton's key). So `Foo.singleton_class.const_get(:Inner)` is a NameError. This was already so on main. Opened from outside (`class << Foo; class Out`), it is right.
 - Such a class prints `#<Class:#<Object:0x..>>::M`, where ruby prints the singleton by its own address: `#<Class:0x..>::M`.
 - A class's `dup` does not call `method_added` for each method it copies, as ruby does. This holds for any class.
+- `M1 = o.singleton_class::M` names the class `M1` in ruby. Here it keeps the name it had (main: nil).
