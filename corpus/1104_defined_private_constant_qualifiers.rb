@@ -48,3 +48,17 @@ end
 p defined?(PublicHolder1104::Inner::X)
 p defined?(::PublicHolder1104::Inner::X)
 p defined?(PublicHolder1104::Inner::Missing)
+
+# Object's top-level autoloads are keyed by the bare name. A scoped
+# defined? query reports the pending constant without running its file.
+require 'tmpdir'
+Dir.mktmpdir do |dir|
+  file = File.join(dir, 'pending.rb')
+  File.write(file, "$autoload_1104_ran = true; module AutoloadPending1104; X = 1; end")
+  Object.autoload(:AutoloadPending1104, file)
+  p defined?(Object::AutoloadPending1104)
+  p defined?(::AutoloadPending1104)
+  p $autoload_1104_ran
+  p defined?(Object::AutoloadPending1104::X)
+  p $autoload_1104_ran
+end
