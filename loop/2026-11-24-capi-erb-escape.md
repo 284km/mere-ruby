@@ -39,31 +39,40 @@ source_location, which is right; before it, the nil here was an accident.
   off. It requires erb/escape, not erb: the corpus runs without the reference
   stdlib.
 
-## Measured so far
+## Measured (2026-11-25, 8157f9e0 = main 2e402b94 merged, reference ruby 4.0.10)
 
-- erb/test_erb.rb: 80 tests, 0 failures, 0 errors, 0 skips on mere-ruby, on
-  `MERE_RUBY_VM=1` and on the reference.
-- Gates and record_hygiene pass at 55ff1456.
+`capi/vendor/erb_escape.c` is also byte-for-byte 4.0.10's
+`ext/erb/escape/escape.c` (`cmp`). Built with Mere 9dec2ff6 (CI's MERE_REF).
+
+- Gates, bracket_depth and record_hygiene pass.
+- `run_corpus.sh --both`: 882/882 with the hash index on and off.
+- `tools/iseq/vm_corpus.sh`: 882 on the VM, 0 fell back, 0 FAIL.
+- capi_check (both sides and under collection stress, controls fail),
+  capi_spec_check and capi_mkmf_check pass against 4.0.10.
+- On mere-ruby, `MERE_RUBY_VM=1` and the reference, all the same:
+  - erb/test_erb.rb: 80 tests, 217 assertions, 0 failures
+  - erb/test_erb_command.rb: 2 tests, 0 failures
+  - erb/test_erb_m17n.rb: 6 tests, 0 failures
+- cgi/test_cgi_escape.rb: 435 tests, 0 failures, 2 skips on both mere-ruby
+  and the VM; the reference has 0 skips. The two skips are the
+  "C extension not available" omits (`CGI::EscapeExt` is undefined:
+  cgi/escape is still Ruby here). main 2e402b94 skips the same two.
+- test_erb.rb under `/usr/bin/time -l`, main 2e402b94 against this branch:
+  1 failure (test_html_escape_extension) → 0; maximum resident set size
+  193,314,816 → 187,023,360 bytes; 7.57 s → 7.58 s real.
+- capi_gem_check (last, alone among this session's checks): seventeen gems
+  with C extensions install with `gem install` and behave the same on both
+  sides; the other-ruby control fails. The load average was 59.74 at the
+  start and 33.58 at the end: several of Codex's corpus runs were going
+  (work2026-44), and this session's native-gems-r3 puma cluster runs
+  overlapped part of it. No gem hit a time limit.
 - A difference not from this change: a shipped C-extension feature has two
   $LOADED_FEATURES entries here (`.../erb/escape.bundle` and
   `.../erb/escape.rb`), where ruby has the bundle alone. `etc` and
   `rbconfig/sizeof` are the same. corpus 914 counts the bundle entries only.
 
-## Paused (2026-11-24, all sessions paused by the user via work2026-44)
+## Left
 
-The full check run was stopped after the gates: they and record_hygiene had
-passed, and the corpus was running. Nothing is pushed.
-
-On resume:
-1. In `/Users/284km/src/github.com/284km/mere-ruby/.claude/worktrees/capi-erb-escape`,
-   fetch origin. Merge main, grep for markers, then rebuild.
-2. Run the full checks one at a time:
-   - `run_corpus.sh --both`
-   - `tools/iseq/vm_corpus.sh`
-   - capi_check, capi_spec_check, capi_mkmf_check
-   - erb/test_erb.rb, test_erb_command.rb, test_erb_m17n.rb and
-     cgi/test_cgi_escape.rb on both sides
-   - capi_gem_check last, alone
-3. Push and open the PR. The body says:
-   - escape.c is ruby 4.0.9's, unchanged (work2026-44 asked);
-   - the two-entry $LOADED_FEATURES difference, which predates this PR.
+- cgi/escape as ruby's C extension (`ext/cgi/escape`), which would take the
+  two omits above. The same static table would hold it.
+- The two $LOADED_FEATURES entries above.
