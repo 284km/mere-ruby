@@ -16,3 +16,6 @@ p count.('stringio')
 p count.('stringio.so')
 p $LOAD_PATH.resolve_feature_path('etc')&.first
 p $LOAD_PATH.resolve_feature_path('stringio.so')&.first
+# ...and its methods are C: no source location
+p StringIO.instance_method(:read).source_location
+p Etc.method(:getlogin).source_location
