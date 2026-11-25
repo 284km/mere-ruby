@@ -1,3 +1,25 @@
+require 'tmpdir'
+# Start with printf in a fresh process: a rescued earlier formatting error
+# can leave the format-encoding context set and hide this regression.
+Dir.mktmpdir do |dir|
+  child = <<~'CODE'
+    printf("日本語 Kernel\n")
+    $stdout.printf("日本語 stdout\n")
+    STDOUT.printf("日本語 STDOUT\n")
+    $stderr.printf("日本語 stderr\n")
+    File.open(ARGV.fetch(0), 'w+') do |io|
+      printf(io, "日本語 explicit IO\n")
+      io.printf("日本語 IO\n")
+      io.rewind
+      print io.read
+    end
+  CODE
+  errors = File.join(dir, 'stderr')
+  print IO.popen([RbConfig.ruby, '-e', child, File.join(dir, 'output'), err: errors], &:read)
+  p $?.exitstatus
+  print File.binread(errors)
+end
+
 def formatting_case_1111(label, format, initial, mutation, conversion = :to_s)
   array = []
   object = Object.new
@@ -113,3 +135,19 @@ calls = 0
 value.define_singleton_method(:inspect) { calls += 1; converted }
 result = '%p' % [value]
 p [result.match?(/\A#<FormatResult1111:0x[0-9a-f]+>\z/), calls, conversions]
+
+# Ruby copies literal text without negotiating it against converted values.
+value = Object.new
+value.define_singleton_method(:to_s) { "\xFF".b }
+[
+  '%sé' % ["\xFF".b],
+  '%{a}é' % {a: "\xFF".b},
+  '%<a>sé' % {a: "\xFF".b},
+  '%sé' % [value]
+].each { |text| p [text.bytes, text.encoding.name, text.valid_encoding?] }
+# Literal text before a conversion still participates through the prefix.
+begin
+  p 'é%s' % ["\xFF".b]
+rescue => error
+  p [error.class, error.message]
+end
