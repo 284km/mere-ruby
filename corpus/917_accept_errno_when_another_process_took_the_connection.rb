@@ -41,3 +41,37 @@ p u.accept_nonblock(exception: false)
 uc.close
 u.close
 File.unlink(path)
+
+# Three forked processes accepting on one listener, as a cluster's workers
+# do: readiness says a connection waits, another process takes it, and
+# accept_nonblock must answer WaitReadable rather than raise or wait. Each
+# of the 120 connections is taken exactly once, and nothing else is raised.
+l2 = TCPServer.new("127.0.0.1", 0)
+port2 = l2.addr[1]
+r, w = IO.pipe
+kids = 3.times.map do
+  fork do
+    r.close
+    taken = 0
+    others = []
+    stop = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < stop
+      next unless IO.select([l2], nil, nil, 0.1)
+      begin
+        l2.accept_nonblock.close
+        taken += 1
+      rescue IO::WaitReadable
+      rescue => e
+        others << e.class.name
+      end
+    end
+    w.puts "#{taken} #{others.uniq.sort.join(',')}"
+    exit!(0)
+  end
+end
+w.close
+120.times { TCPSocket.new("127.0.0.1", port2).close; sleep 0.002 }
+kids.each { |k| Process.wait(k) }
+answers = r.read.lines.map(&:split)
+p answers.sum { |a| a[0].to_i }
+p answers.flat_map { |a| a[1].to_s.split(",") }.uniq
