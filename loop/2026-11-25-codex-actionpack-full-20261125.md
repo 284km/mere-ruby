@@ -50,6 +50,44 @@ append-mode log predate #235 and are historical; this run supplies the valid
 post-correction cohort. Focused before/after measurements are separate.
 
 Completion and release of the shared heavy-run slot were posted to #228.
-The next heavy run is work2026-df's complete unit-test run. The separate Linux
-Module resource gate still has two 10-second child timeouts; the full Action
-Pack result does not settle that CI failure.
+The next heavy run is work2026-df's complete unit-test run. Earlier Linux CI attempts had two 10-second Module child timeouts. The
+latest replay now passes the complete 195-test / 1,240-assertion gate with
+zero errors or skips; no deadlines, loop counts or memory bounds changed.
+Its exact CI merge source and binary digests are recorded separately in
+unittest/records/actionpack-module-linux-882177ca.json. This observation
+does not identify the cause of the earlier timeouts.
+
+## Focused comparison after #235
+
+Three alternating fixed-seed replays compare main 2e402b94 (which includes
+#235, #237 and #238) with the exact full-run build 8624fb60. The first replay
+also includes helper_test and test_response_test: 70 MATCH / 20 RED becomes
+90 MATCH / 0 RED, all files COMPLETE, with no missing or unconfirmed cases.
+The two later replays keep all 63 routing_assertions tests passing on both.
+
+Maximum family RSS for routing_assertions, KiB:
+
+| Repeat | main 2e402b94 | full-run build |
+| --- | ---: | ---: |
+| 1 | 483,552 | 552,944 |
+| 2 | 483,200 | 481,824 |
+| 3 | 409,056 | 606,304 |
+
+The candidate is higher in two of the three pairs; its median is 552,944
+versus 483,200 KiB (+14.43%). These samples show substantial variation and
+do not support a memory improvement claim. No source, seed, limits or loop
+counts were changed. Before explicitly reuses the native install made by
+8624fb60; after uses that binary's own fresh install. Both binary and install
+digests are recorded in actionpack-post235-focused-rss.json, with the full
+per-file identities, results and summaries for all six replays.
+
+## Exact full-run binary regression checks
+
+The same 8624fb60 binary subsequently passes run_corpus.sh --both:
+897/897 programs with hash index ON and OFF, 2,739.591 s and maximum family
+RSS 1,178,864 KiB, no resource event. This also runs its eight source gates
+and default record_hygiene before executing any program. The complete VM
+corpus has 897 VM / 0 fallback / 0 differences, 1,832.387 s, maximum family
+RSS 810,736 KiB, no resource event. The generated-C bracket gate is recorded
+separately. These replace the earlier integrated cohort's 887-program counts
+as validation of this exact measured binary.

@@ -157,5 +157,8 @@ The full record is `railstest/framework/records/actionpack-full-8624fb60.json`.
 
 The owner authorized the heavy slot; the run completed on 2026-11-24 at
 23:51:41 UTC and the slot was released for work2026-df's full unit-test run.
-No file hit WALL_LIMIT or MEMORY_LIMIT. The separate Linux Module CI gate
-still has two original 10-second child timeouts and remains under investigation.
+No file hit WALL_LIMIT or MEMORY_LIMIT. The completed Linux CI replay at
+882177ca also passes the unchanged Module gate: 195 tests, 1,240 assertions,
+zero failures/errors/skips. Earlier attempts had two child timeouts; their
+cause is not established. The exact CI merge and binary digests are in
+unittest/records/actionpack-module-linux-882177ca.json.
