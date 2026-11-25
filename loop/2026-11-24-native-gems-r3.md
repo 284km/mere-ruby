@@ -502,3 +502,25 @@ Checks on this build (b95ccc97 + the two fixes, built with mere-wt-9dec):
 and off; `tools/iseq/vm_corpus.sh` -- 887 on the VM, 0 fell back, 0 FAIL.
 capi_check, capi_spec_check, capi_mkmf_check, puma's full integration run
 and the gem check are still to be run on it, after asking.
+
+### Unit at 4.0.10 (0238f6ef)
+
+This replaces the 4.0.9 unit table above. `test/runner -v --unit --seed=1`, ruby 4.0.10
+first, then mere-ruby built at 0238f6ef (puma's extension rebuilt with its
+mkmf first), each with its own tree and GEM_HOME, one at a time. Load
+average 11.1 at the start, 6.6 at the end.
+
+| | runs | assertions | failures | errors | skips |
+|---|---|---|---|---|---|
+| ruby 4.0.10 | 863 | 2526 | 0 | 0 | 7 |
+| mere-ruby 0238f6ef | 863 | 2527 | 1 | 1 | 7 |
+
+- Error, TestMiniSSLSocket#test_write_nonblock_retry_delivers_data_once:
+  Timeout::Error at the test's 10 s bound -- 16 MiB through MiniSSL, where
+  `byteslice(n..-1)` copies the tail and RSTRING_PTR fetches it again, so
+  the loop is quadratic here (see the timed tests above).
+- Failure, TestRackUp::RackUp#test_bin: the one read at 2.7 s finds only
+  "Puma starting in single mode..."; booting rackup + puma takes 2.7 s here
+  against 0.27 s (see above).
+- The skips are the same seven on both sides: SSLv3, three JRuby-only,
+  two abstract UNIX sockets, a Linux-only thread name.
