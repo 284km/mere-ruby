@@ -42,3 +42,39 @@ object = Object.new
 object.define_singleton_method(:to_s) { '%s' % ['inner'] }
 array.replace([object, 'outer'])
 p '%s %s' % array
+
+# Result encodings follow the values consumed at each directive, including
+# replacements made by earlier conversions and strings returned by callbacks.
+["\xFF".b, "あ".encode('EUC-JP'), "é"].each do |replacement|
+  arguments = []
+  first = Object.new
+  first.define_singleton_method(:to_s) { arguments[1] = replacement; 'a' }
+  arguments.replace([first, 'old'])
+  result = '%s%s' % arguments
+  p [result.bytes, result.encoding.name, result.valid_encoding?]
+end
+["\xFF".b, "あ".encode('EUC-JP')].each do |original|
+  arguments = []
+  first = Object.new
+  first.define_singleton_method(:to_s) { arguments[1] = 'é'; 'a' }
+  arguments.replace([first, original])
+  result = '%s%s' % arguments
+  p [result.bytes, result.encoding.name, result.valid_encoding?]
+end
+arguments = []
+last = Object.new
+last.define_singleton_method(:to_s) { arguments[0] = 'é'; 'z' }
+arguments.replace(["\xFF".b, last])
+result = '%s%s' % arguments
+p [result.bytes, result.encoding.name, result.valid_encoding?]
+[:to_s, :inspect].each do |conversion|
+  value = Object.new
+  value.define_singleton_method(conversion) { "\xFF".b }
+  result = (conversion == :to_s ? '%s' : '%p') % [value]
+  p [result.bytes, result.encoding.name, result.valid_encoding?]
+end
+# Each nested formatting invocation negotiates its own encoding.
+value = Object.new
+value.define_singleton_method(:to_s) { '%s' % ["\xFF".b]; 'é' }
+result = '%s' % [value]
+p [result.bytes, result.encoding.name, result.valid_encoding?]

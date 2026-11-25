@@ -28,3 +28,30 @@ sweeps, their source gates, bracket-depth checks and record_hygiene are
 queued. Results will be recorded after completion. The checks above are
 not a full-corpus claim. No full unit suite or Rails component suite was
 run and no workflow is changed.
+
+## Review correction: live values and result encoding
+
+The initial live argument reads still negotiated the final encoding from
+the original list. Equal-length replacement could therefore produce bytes
+from the new value labelled with the old value's encoding.
+
+Encoding is now negotiated when each directive actually converts its
+argument, including to_s/inspect callback results. Each formatting call
+owns its encoding state; nested formatting cannot overwrite it. Earlier
+consumed arguments retain their contribution even when a later callback
+replaces their source slots. The obsolete post-format scan is removed.
+
+Corpus 1111 adds replacement between UTF-8, EUC-JP and ASCII-8BIT,
+replacement of an already consumed argument, callback results, and nested
+formatting. The complete witness matches clean Ruby 4.0.10 on both engines
+with tight GC. The seven unchanged test_sprintf.rb selections were repeated
+with --seed=1 and MERE_RUBY_GC_TIGHT=1, one file at a time:
+
+| Engine | Main result | Candidate result | Main max RSS bytes | Candidate max RSS bytes |
+| --- | --- | --- | ---: | ---: |
+| Evaluator | 7 tests / 59 assertions / 1 failure | 7 / 60 / 0 failures | 166051840 | 163004416 |
+| VM | 7 tests / 59 assertions / 1 failure | 7 / 60 / 0 failures | 165609472 | 163708928 |
+
+The clean reference passes 7 tests / 60 assertions. The corrected O2 full
+`run_corpus.sh --both` and `MERE_RUBY_VM=1 run_corpus.sh --both` are running;
+source gates and full record_hygiene are part of those commands.
