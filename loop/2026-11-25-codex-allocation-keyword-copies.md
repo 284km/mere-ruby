@@ -227,3 +227,13 @@ five-pair main/head comparison on the integrated build, GC_TIGHT=1, seed 1,
 retaining every successful sample, and investigate any persistent increase.
 The initial diagnostic with a closed report descriptor is invalid and is
 excluded; the corrected observer preserves descriptors and unchanged counts.
+
+The first integrated focused replay catches main's new corpus 1062: the moved
+native Method helper still used world-free mod_name_val, losing the displayed
+name when Module#name is bound to a class inside an object's singleton. Port
+main's mod_name_w world call into that helper. Comparing the complete moved
+Method arm with current main, after indentation normalization, finds this as
+the only missing dispatch change. Keep corpus 1062 unchanged as the control
+and repeat both engines, normal/stress, before continuing acceptance.
+The old integrated binary remains pinned for the main/head diagnostic while
+this source correction is prepared; rebuild before any final-head result.
