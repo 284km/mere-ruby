@@ -55,3 +55,46 @@ at 140,144 KiB evaluator and 42,064 KiB VM; complete results and earlier
 comparison peaks are retained.
 
 Portable validation: unittest/records/strscan-subject-storage.json.
+
+## Review follow-up
+
+Runtime 064b34d4 addresses the hot-path finding. Captured native String reader
+UnboundMethod#bind_call skips temporary Method allocation for exact primitive
+argument shapes. Other definitions, coercions, TracePoint and receiver kinds
+keep the binding path. Original native readers still work when subject or
+String methods change after initialization; corpus 940 checks these cases.
+An initialization-time plainness cache could become stale after overrides.
+
+Three alternating scan-loop instruction samples per state and engine:
+
+| Engine | main | previous PR | revised PR | revised overhead vs main |
+| --- | ---: | ---: | ---: | ---: |
+| evaluator | 254,243,331,432 | 292,677,898,700 | 257,075,047,479 | +1.11% |
+| VM | 252,887,473,795 | 292,656,796,899 | 256,983,329,011 | +1.62% |
+
+The original 15.12% / 15.73% cost is reduced, with the residual reported.
+Every sample produces 80,000 tokens. The portable record retains all 18
+samples and binary digests.
+
+Latest full corpus: 882/882 ON/OFF, 1,216.034 s, 1,189,088 KiB peak family
+RSS. VM: 882 VM / 0 fallback / 0 differences, 420.983 s, 1,287,408 KiB.
+Eight corpus-prefix source gates, default record_hygiene and generated-C
+bracket gate pass (155 of 1024). Core strscan remains 149 tests / 1,050
+assertions passing in both engines. Related method bind_call controls are
+2 tests / 10 assertions and String-reader controls 14 / 134, all passing on
+main and candidate in both engines. An initial missing-extension attempt is
+retained as incomplete; the unchanged CRuby extension was built privately
+and the checks rerun completely.
+
+Three further alternating fixed-seed 12345 Rails duration / erb_util replays
+remain 93 MATCH / 0 RED on main and candidate, all files COMPLETE, with the
+same order diagnostic of 1 and no other categories. Bounds remain 600 s /
+2 GiB and jobs 2. Gems are an owned copy installed by 8624fb60, explicitly
+reused rather than freshly installed by the measured binaries.
+
+Duration maximum family RSS, KiB, main: 343,328 / 346,976 / 342,992; revised:
+344,576 / 340,816 / 341,152. erb_util ranges: 300,912-316,640 main and
+291,712-323,360 revised. These overlap; no stable memory improvement is
+claimed. Earlier wider variation above is preserved.
+
+Portable review evidence: unittest/records/strscan-review.json.
