@@ -70,3 +70,61 @@ body = forwarded_body_1105(&definition)
   p receiver.forwarded(&definition)
   p receiver.forwarded { :caller }
 end
+
+# Implicit super forwards the body's lexical block. An explicit block or
+# &nil still overrides it, and the method's |&caller| remains the call block.
+class LexicalSuperBase1105
+  def save(*) = block_given? ? yield : :no_block
+end
+
+def lexical_super_factory_1105
+  klass = Class.new(LexicalSuperBase1105)
+  klass.define_method(:save) { |*args| super(*args) }
+  klass
+end
+
+klass = lexical_super_factory_1105 { :definition_block }
+p klass.new.save
+p klass.new.save(1)
+p klass.new.save { :caller_block }
+without = lexical_super_factory_1105
+p without.new.save { :caller_block }
+
+class LexicalExplicitBase1105
+  def implicit(*) = block_given? ? yield : :no_block
+  alias explicit implicit
+  alias empty implicit
+  alias literal implicit
+  alias nested implicit
+end
+
+def lexical_explicit_factory_1105
+  klass = Class.new(LexicalExplicitBase1105)
+  klass.define_method(:implicit) { |&caller| [super(), caller && caller.call] }
+  klass.define_method(:explicit) { |&caller| super(&caller) }
+  klass.define_method(:empty) { super(&nil) }
+  klass.define_method(:literal) { super() { :literal_block } }
+  klass.define_method(:nested) { 1.times.map { super() } }
+  klass
+end
+object = lexical_explicit_factory_1105 { :definition_block }.new
+p object.implicit { :caller_block }
+p object.explicit { :caller_block }
+p object.empty { :caller_block }
+p object.literal { :caller_block }
+p object.nested { :caller_block }
+
+# A forwarded body Proc carries the block from its own defining method,
+# rather than the unrelated registration helper.
+def lexical_super_body_1105
+  proc { |*args| super(*args) }
+end
+def lexical_super_install_1105(klass, body)
+  klass.define_method(:save, &body)
+end
+klass = Class.new(LexicalSuperBase1105)
+body = lexical_super_body_1105 { :definition_block }
+lexical_super_install_1105(klass, body) { :registrar_block }
+p klass.new.save { :caller_block }
+GC.start
+p klass.new.save
