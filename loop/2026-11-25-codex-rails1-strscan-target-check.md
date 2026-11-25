@@ -98,3 +98,46 @@ Duration maximum family RSS, KiB, main: 343,328 / 346,976 / 342,992; revised:
 claimed. Earlier wider variation above is preserved.
 
 Portable review evidence: unittest/records/strscan-review.json.
+
+## Captured native append review
+
+Re-review 6051973823 independently confirmed the earlier hot-path Minor
+resolved. It found a new concat regression: retained String#<< on an
+overridden receiver returned a new String, silently dropping the append.
+Runtime a73aa6a9 fixes the native Method body itself, preserving the bound
+receiver and using the existing mutator/coercion implementation. Arity is
+checked before frozen state; frozen state is checked before conversion and
+again if conversion freezes the receiver. The StringScanner Ruby library
+keeps its captured original operation and requires no dispatch fallback.
+
+Corpus 940 now covers subclass and singleton overrides, an override that
+calls super and one that raises, scanner concat/<<, retained bind_call and
+bind.call receiver identity, ignored blocks, coercion, Integer append,
+frozen receivers, wrong arity and a converter freezing the receiver. It
+fails against the prior reviewed binary on both engines and matches Ruby
+on both after the fix. The failure evidence is retained, not counted as a
+passing before run.
+
+Full corpus: 882/882 ON/OFF, 1056.892 s, 1,185,184 KiB peak
+family RSS. VM: 882 VM / 0 fallback / 0 differences, 235.33 s,
+1,291,328 KiB. Eight prefix source gates, default hygiene and the
+155-of-1024 bracket gate pass. Core StringScanner remains 149 tests /
+1,050 assertions all passing on evaluator and VM. Related Method controls
+are 2 tests / 10 assertions and String append/concat controls 4 / 50, all
+passing on main and candidate in both modes. The unchanged CRuby String
+test extension is reused from the earlier owned build.
+
+Three further alternating fixed-seed Rails duration / erb_util pairs
+remain 93 MATCH / 0 RED, all COMPLETE, with the existing order diagnostic
+of 1 and no other categories. Seed 12345, jobs 2 and 600 s / 2 GiB bounds
+are unchanged. Gems are explicitly reused from the owned 8624fb60 install.
+
+Duration RSS, KiB, main: 337,760 / 338,512 / 308,464; revised:
+338,688 / 329,920 / 338,272. erb_util: main 299,472 / 289,504 / 321,632;
+revised 311,360 / 306,192 / 319,808. Ranges overlap; no stable memory
+improvement is claimed. The prior performance checkpoint remains labeled
+064b34d4 and is not relabeled as a new scan-loop measurement of this fix.
+
+Pre-existing replace/position differences, TypeError wording and TracePoint
+visibility are separate follow-ups, as identified in the re-review.
+Portable evidence: unittest/records/strscan-append-review.json.
