@@ -365,3 +365,44 @@ The user paused all sessions.
   cluster reforks and signals that the trap fix may have changed; then the
   test_write_nonblock look again if wanted; then nokogiri at corpus 915,
   after asking the coordinator for numbers.
+
+## Resumed (2026-11-25): the cluster file
+
+The reference is ruby 4.0.10 from here on (`~/.rbenv/versions/4.0.10/bin/ruby`,
+#208): side.sh's REF, a fresh GEM_HOME per side with the same puma gem set
+installed by `gem install --local`, the reference tree's extension built by
+4.0.10, and the binstubs' shebangs. main merged twice (91251a0b, b95ccc97:
+#237's libdir and #238's hidden IDs), built with the CI-pinned Mere
+(mere-wt-9dec, 9dec2ff6), and puma's and nio4r's extensions rebuilt on the
+mere side after #237.
+
+Taken one group at a time (the mold_worker tests, 13), the cluster failures
+were not the trap fix itself but two things it uncovered:
+
+- **A signal taken on a busy thread waited for the main thread for ever.**
+  8f75e0cc delivers a trap only on the main thread, and a thread that takes
+  the signal at a statement leaves it queued for it. Only the scheduler's
+  idle wait (sch_sig_check) woke the main thread for it, so in a process
+  whose threads never all wait -- a puma worker serving requests, its main
+  thread joining the server thread -- the trap never ran: the master logged
+  "Promoting worker N to mold" and the worker never became one. sig_poll
+  now wakes the main thread the same way when it waits in a wait a trap
+  may run in the middle of (a sleep, a join, a queue). Repro (corpus case
+  drafted, number to be asked): a thread busy in `n += 1 until $stop`, the
+  main thread joining it, USR2 from outside -- ruby 4.0.10 runs the trap
+  on the main thread; this hung.
+- **accept(2) on a listener another process accepts on.** A cluster's
+  workers all accept on one listener; readiness says a connection waits,
+  another worker takes it, and accept(2) says EAGAIN -- or ECONNABORTED for
+  a client gone before it was taken. The runtime's tcp_accept folds errno
+  into three codes, and every refusal was SocketError "accept failed":
+  puma logged it as a "Listen loop" error, 60 in one mold test group. Now
+  accept goes through tools/socket_glue.c `mr_sock_accept` (-errno), and
+  BasicSocket#__accept_now answers as ext/socket/init.c does: nonblocking,
+  EAGAIN/EWOULDBLOCK is IO::EAGAINWaitReadable and ECONNABORTED/EPROTO the
+  Errno with IO::WaitReadable (`exception: false`: :wait_readable);
+  blocking, EAGAIN waits again; anything else is its Errno. TCPServer,
+  UNIXServer and Socket. Repro (drafted, number to be asked): a connection
+  taken by a forked process, then accept_nonblock and a blocking accept;
+  and three forked processes accepting 200 connections on one listener,
+  which hung here.
