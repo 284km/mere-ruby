@@ -90,7 +90,7 @@ call receives counting-only work.
 
 ## Regression and measurement
 
-Corpus 991 has 63 output lines covering the exact review reproduction,
+Corpus 995 has 63 output lines covering the exact review reproduction,
 direct/explicit/frozen/nil/converted splats, deep shareability, source aliasing
 across GC, leading/optional/post parameters, repeated splats, local/Binding
 collisions, reflection, large arguments, native boundaries, empty super,
@@ -138,3 +138,9 @@ and C API frozen-state changes. Replay acceptance against the same main
 control before the next batched push. Record unchanged MATCH/RED totals and
 the newly missing CRuby temporary Arrays honestly; do not create dummy
 objects. Keep one corpus sweep at a time and run the allocation file alone.
+
+Main now contains other streams' corpus 989 through 992. Renumber this
+unmerged regression from 991 to the free number 995. Keep its descriptive
+filename and all 63 assertions unchanged. Generic forwarding and keyword
+rest use 993 and 994; the next keyword-packet regression uses 996. Update
+the PR's references with the integrated results in the same push.
