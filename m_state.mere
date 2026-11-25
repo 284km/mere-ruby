@@ -496,12 +496,56 @@ and iv_put = fn tbl -> fn (k: str) -> fn (v: Val) ->
 // of the loader). MERE_RUBY_IVAR_INDEX_CHECK=1 holds this to the table too.
 let iv_file_new = fn (pfx: str) -> fn (names: str) -> map_set iv_idx pfx names;
 let iv_put_new = fn tbl -> fn (k: str) -> fn (v: Val) -> map_set tbl k v;
+// AN OBJECT'S INSTANCE VARIABLE, by the object's id and the name without its
+// "@" (note 559). Every reader and writer of one object's variable goes
+// through these, so that where the variables are kept can change in one
+// place: today the table is the one Map of every object's variables, keyed
+// "<id>@<name>", and these build that key. A class's ("cls:..@"), a String's,
+// an Array's or a Hash's ("str:..@" and the like) and the table's other keys
+// ("$exc") are not an object's and keep their own spelling.
+let iv_key = fn (oid: int) -> fn (name: str) -> str_of_int oid ++ "@" ++ name;
+let iv_get = fn tbl -> fn (oid: int) -> fn (name: str) -> map_get tbl (iv_key oid name);
+let iv_has = fn tbl -> fn (oid: int) -> fn (name: str) -> map_has tbl (iv_key oid name);
+let iv_set = fn tbl -> fn (oid: int) -> fn (name: str) -> fn (v: Val) -> iv_put tbl (iv_key oid name) v;
+let iv_del = fn tbl -> fn (oid: int) -> fn (name: str) -> map_delete tbl (iv_key oid name);
+// ...and an object's variable, or `d` when it has none: the key is made ONCE
+// (iv_has then iv_get made it twice, and reading `@x` is the hot path)
+let iv_get_or = fn tbl -> fn (oid: int) -> fn (name: str) -> fn (d: Val) ->
+  (let k = iv_key oid name in if map_has tbl k then map_get tbl k else d);
+// A KEY OF THE WHOLE TABLE, for those that walk it -- the collector, the
+// copy of every variable, the listing's fallback, the files flushed at exit
+// (note 559 step 2a): whose it is, and where its name starts, is asked here,
+// not read off the key by each of them. (They walk with map_iter themselves:
+// a curried callback of the door's, called per variable, made a collection
+// two fifths dearer.)
+// (the id a key "<id>@<name>" belongs to, else -1)
+let rec iv_key_owner_go = fn (k: str) -> fn (i: int) -> fn (acc: int) ->
+  if i >= str_len k then 0 - 1
+  else
+    (let c = char_at k i in
+     if str_eq c "@" then (if i > 0 then acc else 0 - 1)
+     else if is_digit c then iv_key_owner_go k (i + 1) (acc * 10 + (ord c - 48))
+     else 0 - 1);
+let iv_key_owner = fn (k: str) ->
+  if str_len k == 0 then 0 - 1
+  else if is_digit (char_at k 0) then iv_key_owner_go k 0 0
+  else 0 - 1;
+// (the name is asked about in place -- iv_name_eq -- and cut
+//  out only when it is kept, iv_name: a String per variable at each
+//  collection was dear too. iv_del_at deletes the variable.)
+// (where a key's name starts)
+let iv_key_name_at = fn (k: str) -> str_index_of k "@" + 1;
+let iv_name_eq = fn (s: str) -> fn (at: int) -> fn (lit: str) -> str_len s - at == str_len lit && str_ends_with s lit;
+let iv_name = fn (s: str) -> fn (at: int) -> substring s at (str_len s);
+let iv_del_at = fn tbl -> fn (o: int) -> fn (s: str) -> fn (at: int) -> map_delete tbl s;
 // the class an object's REFUSAL MESSAGE names: its own, never the singleton
 // that `def o.x` hung on it. (is_sng_cls lives in the eval chain, far below
 // the two other askers, so the prefix test is written out here once.)
 let obj_cls_name = fn (oid: int) ->
   let c = (if map_has obj_cls oid then map_get obj_cls oid else "Object") in
-  if str_len c >= 5 && str_eq (substring c 0 5) "(sng:"
+  // (a WHOLE singleton name only: a class defined inside one, "(sng:159)::M",
+  //  is the object's class itself -- `.class` answered Object for it)
+  if str_len c >= 5 && str_eq (substring c 0 5) "(sng:" && str_eq (char_at c (str_len c - 1)) ")"
   then (if map_has cls_sup c then map_get cls_sup c else "Object") else c;
 // (the current line, and the current file's and method's numbers -- see
 //  pos_names below; here so that an allocation can note them)
@@ -1766,8 +1810,7 @@ let cls_frozen = map_new ();
 //  and undef_method that lands there is refused, whichever path reaches it)
 let ofrozen_set = fn (id: int) ->
   let _ = map_set obj_frozen id "1" in
-  let k = str_of_int id ++ "@__modbk" in
-  if map_has ivars_g k then (match map_get ivars_g k with VClass b -> map_set cls_frozen b "1" | _ -> ()) else ();
+  if iv_has ivars_g id "__modbk" then (match iv_get ivars_g id "__modbk" with VClass b -> map_set cls_frozen b "1" | _ -> ()) else ();
 let ofrozen_get = fn (id: int) -> map_has obj_frozen id;
 // the caller has the id as TEXT (a singleton class name carries it), so this
 // is the one door that still parses; a non-numeric name is simply not an id.
@@ -3925,13 +3968,12 @@ let mode_writable = fn (m: str) ->
 //   shape. ruby prints "..." on re-entry, which is what the spec's regexp
 //   matches. The flag is cleared by raise_exc / raise_exc_iv, because a raise
 //   is the one thing that unwinds out of an inspect without returning.
-// The encoding of the format String that sprintf / String#% is running
-// (slot "v"); %c needs it to turn a codepoint into bytes. Saved and restored
-// around each format, since a #to_s run by one format may format another.
-let fmt_enc_cur = map_new ();
-// "k": the name a `%<name>` directive being read has already taken (a second
-// one in the same directive is "named<k2> after <k>")
-let fmt_named_cur = map_new ();
+// Formatting scratch storage is reused after every normal or exceptional
+// return. Busy slots remain separate across nested and interleaved calls.
+// Each slot holds result encoding, prefix, format encoding, named key and
+// its presence flag. Free slots retain no output or format text.
+let fmt_state_pool = vec_new ();
+let fmt_state_busy = vec_new ();
 // an object whose #inspect is being asked by `super` from the program's own:
 // inspect_w answers the builtin text for it (keyed by the object's id)
 let insp_super = map_new ();

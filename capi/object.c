@@ -410,8 +410,14 @@ int rb_method_basic_definition_p(VALUE klass, ID id) {
  *  rb_str_freeze's resize, so the mirror is told first.) */
 VALUE rb_obj_freeze(VALUE obj) {
     if (!RB_SPECIAL_CONST_P(obj)) {
-        if (MR_HANDLE_P(obj) && rb_type(obj) == T_STRING && !RB_OBJ_FROZEN_RAW(obj)) mr_mirror_frozen_by_c(obj);
-        mr_callk(obj, "freeze", 0);
+        /* (a String, an Array, a Hash: the flag, as RB_OBJ_FREEZE sets it --
+         *  MR_FREEZE; anything else is sent #freeze, Kernel's) */
+        VALUE done = MR_HANDLE_P(obj) && !mr_without("builtin") ? mr_up1(MR_FREEZE, obj) : 0;
+        if (done == 2) mr_mirror_frozen_by_c(obj);
+        if (!done) {
+            if (MR_HANDLE_P(obj) && rb_type(obj) == T_STRING && !RB_OBJ_FROZEN_RAW(obj)) mr_mirror_frozen_by_c(obj);
+            mr_callk(obj, "freeze", 0);
+        }
         mr_mirror_forget(obj);
     }
     return obj;

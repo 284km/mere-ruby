@@ -31,7 +31,7 @@ SAMPLES = {   # factories: every probe gets a fresh receiver
   "Struct" => -> { Struct.new(:a).new(1) }, "Exception" => -> { StandardError.new("m") },
   "Enumerator" => -> { [1].each }, "Comparable" => -> { 1 }, "Enumerable" => -> { [1] }, "Kernel" => -> { Object.new },
   "Numeric" => -> { 1 }, "Object" => -> { Object.new }, "Module" => -> { Module.new }, "Class" => -> { Class.new },
-  "Encoding" => -> { Encoding::UTF_8 }, "Dir" => -> { Dir }, "File" => -> { File }, "IO" => -> { $stdout }, "Math" => -> { Math },
+  "Encoding" => -> { Encoding::UTF_8 }, "Dir" => -> { Dir }, "File" => -> { File.open(__FILE__) }, "IO" => -> { $stdout }, "Math" => -> { Math },
   "Process" => -> { Process }, "ObjectSpace" => -> { ObjectSpace }, "Marshal" => -> { Marshal }, "GC" => -> { GC },
   "Signal" => -> { Signal }, "Random" => -> { Random.new(1) }, "Thread" => -> { Thread.current },
 }
