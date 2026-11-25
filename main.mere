@@ -119,7 +119,10 @@ type Expr = EInt of int | EBig of str | ERat of str * str | EImag of int | EImag
           // the default of an optional parameter of a sequence the ISeq VM
           // runs (note 548): the parameter was not given. The sequence's own
           // code computes the default; this is how it knows to (vm_unset).
-          | EVmArg;
+          | EVmArg
+          // Native Method#to_proc body: Method object, argument Array, block
+          // Proc. It invokes the captured entry, bypassing public #call.
+          | EBoundCall of Expr * Expr * Expr;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -5619,6 +5622,22 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
              let _ = bi_reg_set pn pr pd in
              v))
 
+
+  | EBoundCall (method_e9, argv_e9, block_e9) ->
+    let method9 = eval_e env world blk method_e9 in
+    let args9 = (match eval_e env world blk argv_e9 with VArr id9 -> deref id9 | _ -> (Nil : Val list)) in
+    let block9 = eval_e env world blk block_e9 in
+    (match method9 with
+     | VObj id9 ->
+       (match block9 with
+        | VProc pid9 ->
+          (let (has9, ps9, body9, ce9) = proc_as_block pid9 in
+           let marker9 = yblk_marker ++ str_of_int pid9 in
+           let passed9 = (has9, Cons (marker9, Cons (marker9, ps9)), body9, ce9) in
+           method_block_native env world blk id9 args9 passed9)
+        | _ -> method_call_native env world (blk_noblk blk) id9 args9)
+     | _ -> fail "native bound call has no Method")
+
 // v0.1: takes the right operand as a VALUE, not as an expression. Ruby's
 // order is receiver, then arguments, then dispatch -- and evaluating the
 // argument can change what dispatch finds, because it can open the
@@ -7044,6 +7063,7 @@ and ovr_expr = fn acc -> fn own -> fn (e: Expr) ->
   | EBin (_, a, b) -> (let _ = ovr_expr acc own a in ovr_expr acc own b)
   | EUn (_, a) -> ovr_expr acc own a
   | EMethod (r, _, args) -> (let _ = ovr_expr acc own r in ovr_exprs acc own args)
+  | EBoundCall (m9, a9, b9) -> (let _ = ovr_expr acc own m9 in let _ = ovr_expr acc own a9 in ovr_expr acc own b9)
   | ESafe (r, _, args) -> (let _ = ovr_expr acc own r in ovr_exprs acc own args)
   | EMethodB (r, _, args, ps, b) -> (let _ = ovr_expr acc own r in let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
   | ESafeB (r, _, args, ps, b) -> (let _ = ovr_expr acc own r in let _ = ovr_exprs acc own args in ovr_blk acc own ps b)
@@ -9778,8 +9798,8 @@ and run_block0x = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) -> 
              | Cons (SExpr (EMethod (EVar recv9, _, Cons (ESplat (EVar args9), Cons (EBlockPass (EVar blk9), Nil)))), Nil) ->
                str_eq recv9 "__bp" && str_eq args9 "__ba" && str_eq blk9 "__bb"
              | _ -> false) in
-           if lv_has ce9 "__m_meth" || symbol9
-              || (source9 >= 0 && map_has proc_symsrc (str_of_int source9)) then (argvals, kwp9)
+           if lv_has ce9 "__m~meth" then (r2k_method_args world argvals, kwp9)
+           else if symbol9 || (source9 >= 0 && map_has proc_symsrc (str_of_int source9)) then (argvals, kwp9)
            else
            let keep9 = arg_splat_keep ()
                        || (source9 >= 0 && map_has r2k_procs (r2k_root (str_of_int source9))) in
@@ -27475,163 +27495,15 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
         (msnap_src world id "Method" (msnap_obj_cls world id "Method") (msnap_obj_name world id "Method"))
         (fn (u: unit) -> invoke_val_c env world blk recv name args vischeck)
     else if str_eq cls "Method" then
-      (let method_name_value = method_core_field id 0 in
+      (if (str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "===") then
+         method_call_native env world blk id args
+       else
+       let method_name_value = method_core_field id 0 in
        let method_owner_value = method_core_field id 1 in
-       let mnm = (method_text (method_name_value)) in
-       let mown = (method_text (method_owner_value)) in
+       let mnm = method_text method_name_value in
+       let mown = method_text method_owner_value in
        let mrecv = (if map_has method_cores id then method_core_field id 2 else VMain) in
-       if (str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "===") then
-         (let args = (if arg_splat_any () then r2k_method_args world args else args) in
-          if map_has ivars (str_of_int id ++ "@~m_mm")
-          then (match mrecv with
-                // (a CLASS with no #method_missing of its own reaches
-                //  BasicObject's, which refuses the name -- its own NoMethodError)
-                | VClass c9 when (if has_meth world ("(sng:" ++ c9 ++ ")") "method_missing" then false else true) ->
-                  missing_native_super world mrecv (Cons (VSym mnm, args))
-                | _ -> invoke_val_c env world blk mrecv "method_missing" (Cons (VSym mnm, args)) false)
-          // (Struct's own #members, #size, #to_a ... bound to a struct answer
-          //  from its member table, whatever a member of that name made of
-          //  the method: pp binds Struct#members to every struct it prints,
-          //  and `Struct.new(:members, :class)` is a test of exactly that)
-          else if str_eq mown "Struct" && is_struct_gen_method mnm && (match args with Nil -> true | _ -> false)
-                  && (match mrecv with VObj o9 -> (let (_, _, oc9, _) = world in is_struct_obj_cls world (map_get oc9 o9)) | _ -> false)
-                  && (str_eq mnm "members" || str_eq mnm "size" || str_eq mnm "length" || str_eq mnm "to_a"
-                      || str_eq mnm "values" || str_eq mnm "deconstruct") then
-            (match mrecv with
-             | VObj o9 ->
-               (let (_, _, oc9, iv9) = world in
-                let ms9 = (match map_get struct_mem (struct_members_cls world (ancestors_of world (map_get oc9 o9))) with
-                           | VArr aid -> deref aid | _ -> Nil) in
-                if str_eq mnm "members" then arr_new ms9
-                else if str_eq mnm "size" || str_eq mnm "length" then VInt (vals_len ms9 0)
-                else
-                  (let rec field9 = fn (xs: Val list) ->
-                     (match xs with
-                      | Nil -> (Nil : Val list)
-                      | Cons (m9, t9) ->
-                        (let k9 = str_of_int o9 ++ "@" ++ struct_slot (match m9 with VSym y9 -> y9 | _ -> "") in
-                         Cons ((if map_has iv9 k9 then map_get iv9 k9 else VNil), field9 t9))) in
-                   arr_new (field9 ms9)))
-             | _ -> VNil)
-          // (a Method made from a builtin runs the builtin, though the name
-          //  has a Ruby body now: bi_meth_mark)
-          else if bi_meth_shadowed world id mown mnm mrecv then
-            bi_meth_call env world blk id mnm mrecv args (false, (Nil : str list), (Nil : Stmt list), env)
-          // A Class visibility entry can expose a body below its owner's
-          // prepends. Keep the visible owner, but call the recorded body.
-          else if str_eq mnm "subclasses" && is_sng_cls mown
-                  && map_has vis_marks (mown ++ "#" ++ mnm)
-                  && (if map_has ivars (str_of_int id ++ "@~m_bi") then false else true)
-                  && (if str_eq (msnap_cls world id "Method" mown) mown then false else true) then
-            class_subclasses_method_call world blk mrecv id mown mnm args
-          // (Kernel#binding called as a Method has a C function for its
-          //  caller, not Ruby code: rb_f_binding's refusal)
-          else if str_eq mnm "binding" && (str_eq mown "Kernel" || str_eq mown "")
-                  && (if has_meth world (dispatch_cls_of world mrecv) "binding" then false else true) then
-            raise_exc world "RuntimeError" "Cannot create Binding object for non-Ruby caller"
-          // (Kernel#eval called as a Method reads the CALLER's frame, as
-          //  rb_f_eval does: `method(:eval).call("def m; end")` in a class body
-          //  defines m on that class. Taken on the caller's own self it is the
-          //  bare eval; on a class it was a NoMethodError, the class-method
-          //  dispatcher having no eval.)
-          else if str_eq mnm "eval" && (str_eq mown "Kernel" || str_eq mown "")
-                  && (if has_meth world (dispatch_cls_of world mrecv) "eval" then false else true)
-                  && rb_identical mrecv (if lv_has env "self" then lv_get env "self" else VMain) then
-            do_eval env world blk args
-          else
-         match mrecv with
-          | VMain -> (if (let (m8, _, _, _) = world in map_has m8 mnm) then call_method (env_as_main env) world blk mnm args else invoke_val_c env world blk VMain mnm args false)
-          // a binary operator on a primitive is not in the method table -- it
-          // is arith_bin -- so `1.method(:+)` has to route there, the same way
-          // an alias to a builtin operator does.
-          // ⚠ ...but not String#<<, which is a MUTATION: arith_bin answers a
-          //   new string, so `s.method(:<<).call("q")` left s unchanged. The
-          //   by-name path appends in place (str_append_val).
-          | _ ->
-            if is_binary_op_name mnm
-               && (if (str_len mnm == 2 && str_eq mnm "<<") && (match mrecv with VStr _ -> true | _ -> false) then false else true)
-               && (if has_meth world (dispatch_cls_of world mrecv) mnm then false else true)
-               // (an OBJECT's operators are its dispatcher's arms, not
-               //  eval_bin_prim's: `Time.at(1).method(:<=>).call(t)` was nil)
-               && (match mrecv with VObj _ -> false | _ -> true) then
-              // (through eval_bin_prim, as the operator itself is: arith_bin
-              //  is the arithmetic only, and `0.method(:<).call(5)` was its
-              //  "unknown operator")
-              (match args with
-               | Cons (a1, _) -> eval_bin_prim env world blk mnm mrecv a1
-               | Nil -> invoke_val_c env world blk mrecv mnm args false)
-            // A Method holds the definition it was taken FROM: calling it by
-            // name again re-dispatches, so `obj.method(:m).super_method.call`
-            // ran the subclass's m forever. Invoke the owner's directly when
-            // there is one (a builtin has no entry and keeps the old path).
-            else if (if str_eq mown "" then false else true) && (has_meth world mown mnm || msnap_held world id "Method" mown mnm)
-                    // (an alias of a builtin is reached by name: alias_owner)
-                    && (if map_len builtin_alias > 0 && alias_first world mown mnm then false else true) then
-              (if msnap_held world id "Method" mown mnm
-               then msnap_call world blk mrecv id "Method" mown mnm args
-               // (the owner's OWN definition, not a lookup from it: a class
-               //  with a module prepended answers the module's first, and
-               //  `alias m2 m1` there made super_method.call run the
-               //  prepended m2 again)
-               else if (let (m8, _, _, _) = world in map_has m8 (mown ++ "#" ++ mnm)) then
-                 (let (m8, _, _, _) = world in run_meth world blk mrecv mown mnm (map_get m8 (mown ++ "#" ++ mnm)) args)
-               else invoke world blk mrecv mown mnm args)
-            // ...and Module#name bound to a class answers the class's REAL
-            // name, whatever `def self.name` it has (Data#inspect asks exactly
-            // this); re-dispatching by name found the override
-            else if str_eq mown "Module" && str_eq mnm "name" && (match args with Nil -> true | _ -> false)
-                    && (match mrecv with VClass _ -> true | _ -> false) then
-              (match mrecv with VClass c9 -> mod_name_val c9 | _ -> VNil)
-            // Kernel#inspect bound to a String, Array or Hash (a subclass's,
-            // typically) is Kernel's: the class, an address and the ivars --
-            // not the value's own inspect. So it is for a Struct (whose own
-            // is "#<struct ...>") and an Integer, Float, Symbol, nil or bool
-            else if str_eq mown "Kernel" && str_eq mnm "inspect" && (match args with Nil -> true | _ -> false)
-                    && (match mrecv with VStr _ -> true | VArr _ -> true | VHsh _ -> true | VObj _ -> true
-                        | VInt _ -> true | VBig _ -> true | VFlt _ -> true | VSym _ -> true | VNil -> true | VBool _ -> true
-                        | _ -> false) then
-              (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-               let ivs9 = (match invoke_val_c env world nb9 mrecv "instance_variables" Nil false with
-                           | VArr a9 -> deref a9 | _ -> Nil) in
-               let rec parts = fn (xs: Val list) ->
-                 (match xs with
-                  | Nil -> (Nil : str list)
-                  | Cons (VSym n9, t9) ->
-                    Cons (n9 ++ "=" ++ inspect_w env world (invoke_val_c env world nb9 mrecv "instance_variable_get" (Cons (VSym n9, Nil)) false), parts t9)
-                  | Cons (_, t9) -> parts t9) in
-               let ps9 = parts ivs9 in
-               let rec join = fn (xs: str list) -> (match xs with Nil -> "" | Cons (x9, Nil) -> x9 | Cons (x9, t9) -> x9 ++ ", " ++ join t9) in
-               mkstr ("#<" ++ cls_display world (obj_print_cls world (dispatch_cls_of world mrecv)) ++ ":0x" ++ hex_pad16 (val_hash mrecv)
-                      ++ (match ps9 with Nil -> "" | _ -> " " ++ join ps9) ++ ">"))
-            // a KERNEL method bound to a BasicObject runs on it
-            // (`Kernel.instance_method(:inspect).bind(bo).call`): the object
-            // has no such method of its own, which is the refusal bo_refuses
-            // makes for an ordinary call
-            else if str_eq mown "Kernel" then
-              (let _ = map_set bm_bypass "k" VNil in
-               // (Kernel#warn reads its self: bound to the Warning module it
-               //  writes the text itself instead of calling Warning.warn)
-               let env9 = (if str_eq mnm "warn" then (let e9 = lv_flat env in let _ = map_set e9 "self" mrecv in e9) else env) in
-               let r9 = try_or (fn (u: unit) -> FNext (invoke_val_c env9 world blk mrecv mnm args false)) (FRaise VNil) in
-               let _ = map_delete bm_bypass "k" in
-               match r9 with
-               | FNext v9 -> v9
-               | _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "exception") else "exception"))
-            // ⚠ a BUILTIN taken before a `using` stays the builtin: the method
-            //   entry is what the object holds, and a refinement active where
-            //   it is CALLED is not asked (`meth = 2.method(:pow); using M;
-            //   meth.call(3)` is 8). One taken under a refinement records the
-            //   refinement as its owner and never reaches here.
-            else if str_eq mown "" && map_len ref_active > 0 then
-              (let rp9 = ref_cur_id () in
-               let _ = ref_install 0 in
-               let r9 = try_or (fn (u: unit) -> FNext (invoke_val_c env world blk mrecv mnm args false)) (FRaise VNil) in
-               let _ = ref_install rp9 in
-               match r9 with
-               | FNext v9 -> v9
-               | _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "exception") else "exception"))
-            else invoke_val_c env world blk mrecv mnm args false)
-       else if (str_len name == 4 && str_eq name "name") then VSym mnm
+       if (str_len name == 4 && str_eq name "name") then VSym mnm
        else if (str_len name == 8 && str_eq name "receiver") then mrecv
        // Method#box (ruby 4.0): the Ruby::Box a method was defined in; nil while
        // boxes are not enabled, which is the only state this interpreter has.
@@ -27875,13 +27747,13 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           let _ = (if map_has meth_cref mk9 then map_set benv "__cref" (mkstr (pack_cref (map_get meth_cref mk9))) else ()) in
           // the proc calls the Method OBJECT, so it inherits everything #call
           // already handles: a private method, and a builtin operator.
-          let _ = map_set benv "__m_meth" (VObj id) in
+          let _ = map_set benv "__m~meth" (VObj id) in
           // ... and the block the caller gives the PROC belongs to the method:
           // `method(:m).to_proc.call(5) { }` must reach m's yield, so the proc
           // takes a block parameter and passes it on.
           // (a builtin on main -- `method(:Integer)`, `method(:sleep)` -- is no
           //  function the call by name finds: it goes through #call too)
-          let body = Cons (SExpr (EMethod (EVar "__m_meth", "call", Cons (ESplat (EVar "__a"), Cons (EBlockPass (EVar "__b"), Nil)))), Nil) in
+          let body = Cons (SExpr (EBoundCall (EVar "__m~meth", EVar "__a", EVar "__b")), Nil) in
           let pid = (proc_next ()) in
           let _ = store_proc (str_of_int pid) (true, Cons ("*__a", Cons ("&__b", Nil)), body, benv) in
           // ruby's Method#to_proc answers the METHOD's arity and is a lambda;
@@ -31246,7 +31118,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        let ok9 = r2k_params_ok ps9 in
        // ...and for one Method#to_proc made, whose parameters are the
        // method's (its closure holds the Method object)
-       let fm9 = (match proc_get (str_of_int pid) with (_, _, _, ce9) -> lv_has ce9 "__m_meth") in
+       let fm9 = (match proc_get (str_of_int pid) with (_, _, _, ce9) -> lv_has ce9 "__m~meth") in
        // (a Symbol's proc is no block of ruby code: rb_proc_ruby2_keywords's
        // default arm)
        let _ = (if map_has proc_symsrc (str_of_int pid) then rb_warn world "Skipping set of ruby2_keywords flag for proc (proc not defined in Ruby)"
@@ -31376,7 +31248,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
       //  call, keywords and all, to a method)
       let _ = (if map_has lambda_ids (str_of_int pid) && (if map_has r2k_procs (r2k_root (str_of_int pid)) then false else true)
                   && (if map_has proc_symsrc (str_of_int pid) then false else true)
-                  && (match theblk with (_, _, _, ce9) -> (if lv_has ce9 "__m_meth" then false else true))
+                  && (match theblk with (_, _, _, ce9) -> (if lv_has ce9 "__m~meth" then false else true))
                   && (match theblk with (_, ps9, _, _) -> (match kw_params (strip_marker_params ps9) with Nil -> true | _ -> false))
                then unmark_kwargs args else ()) in
       // a lambda checks arity strictly (procs stay lenient).
@@ -35112,33 +34984,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                 | VObj mid -> (let (_, _, ocls9, _) = world in str_eq (map_get ocls9 mid) "Method")
                 | _ -> false) then
       (match recv with
-       | VObj mid ->
-         (let args = (if arg_splat_any () then r2k_method_args world args else args) in
-          let (_, _, _, ivars9) = world in
-          let mnm = (method_text (method_core_field mid 0)) in
-          let mrecv = (if map_has method_cores mid then method_core_field mid 2 else VMain) in
-          let mown = (method_text (method_core_field mid 1)) in
-          match mrecv with
-          | VMain -> (if (let (m8, _, _, _) = world in map_has m8 mnm) then call_method (env_as_main env) world newblk mnm args else invoke_with_block env world blk VMain mnm args newblk)
-          | _ ->
-            // A Method object may call a PRIVATE method -- it was obtained by
-            // name, so calling it is not an implicit-receiver call. tsort does
-            // exactly this: `tsort_each_node` is private in bundler's SpecSet.
-            // The ordinary route through the block dispatcher applies
-            // visibility, so invoke the method itself when it can be found.
-            (let dcls = dispatch_cls_of world mrecv in
-             let owner = (if str_eq mown "" then dcls else mown) in
-             if bi_meth_shadowed world mid mown mnm mrecv then bi_meth_call env world blk mid mnm mrecv args newblk
-             else if str_eq mnm "subclasses" && is_sng_cls mown
-                     && map_has vis_marks (mown ++ "#" ++ mnm)
-                     && (if map_has ivars9 (str_of_int mid ++ "@~m_bi") then false else true)
-                     && (if str_eq (msnap_cls world mid "Method" mown) mown then false else true) then
-               class_subclasses_method_call world newblk mrecv mid mown mnm args
-             else if msnap_held world mid "Method" owner mnm then msnap_call world newblk mrecv mid "Method" owner mnm args
-             else if map_len builtin_alias > 0 && alias_first world owner mnm then invoke_with_block env world blk mrecv mnm args newblk
-             else if has_meth world owner mnm then invoke world newblk mrecv owner mnm args
-             else if has_meth world dcls mnm then invoke world newblk mrecv dcls mnm args
-             else invoke_with_block env world blk mrecv mnm args newblk))
+       | VObj mid -> method_block_native env world blk mid args newblk
        | _ -> VNil)
     // `Signal.trap("INT") do ... end` -- the form every CLI actually writes, and
     // a block-carrying call never reaches the plain dispatcher where the rest of
@@ -35170,7 +35016,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                 let _ = (if map_has lambda_ids (str_of_int pid)
                             && not (map_has r2k_procs (r2k_root (str_of_int pid)))
                             && not (map_has proc_symsrc (str_of_int pid))
-                            && (match callable9 with (_, _, _, ce9) -> not (lv_has ce9 "__m_meth"))
+                            && (match callable9 with (_, _, _, ce9) -> not (lv_has ce9 "__m~meth"))
                             && (match callable9 with (_, ps9, _, _) ->
                                  match kw_params (strip_marker_params ps9) with Nil -> true | _ -> false)
                          then unmark_kwargs args else ()) in
@@ -40185,6 +40031,190 @@ and mod_ruby2_keywords = fn env -> fn world -> fn (cls: str) -> fn (args: Val li
 // (the last argument is found by a loop and the list rebuilt only when it
 // changes: this rebuilt every list on the way down, one C frame per argument,
 // and test_method's `rest(*(1..10_000_000))` ran out of stack here)
+// The native bound entry is shared by public Method#call and Method#to_proc.
+// A generated Proc never performs public lookup of its Method object's call.
+and method_call_native = fn env -> fn world -> fn blk -> fn (id: int) -> fn (args: Val list) ->
+  let (_, _, _, ivars) = world in
+  let mnm = method_text (method_core_field id 0) in
+  let mown = method_text (method_core_field id 1) in
+  let mrecv = if map_has method_cores id then method_core_field id 2 else VMain in
+  (let args = (if arg_splat_any () then r2k_method_args world args else args) in
+          if map_has ivars (str_of_int id ++ "@~m_mm")
+          then (match mrecv with
+                // (a CLASS with no #method_missing of its own reaches
+                //  BasicObject's, which refuses the name -- its own NoMethodError)
+                | VClass c9 when (if has_meth world ("(sng:" ++ c9 ++ ")") "method_missing" then false else true) ->
+                  missing_native_super world mrecv (Cons (VSym mnm, args))
+                | _ -> invoke_val_c env world blk mrecv "method_missing" (Cons (VSym mnm, args)) false)
+          // (Struct's own #members, #size, #to_a ... bound to a struct answer
+          //  from its member table, whatever a member of that name made of
+          //  the method: pp binds Struct#members to every struct it prints,
+          //  and `Struct.new(:members, :class)` is a test of exactly that)
+          else if str_eq mown "Struct" && is_struct_gen_method mnm && (match args with Nil -> true | _ -> false)
+                  && (match mrecv with VObj o9 -> (let (_, _, oc9, _) = world in is_struct_obj_cls world (map_get oc9 o9)) | _ -> false)
+                  && (str_eq mnm "members" || str_eq mnm "size" || str_eq mnm "length" || str_eq mnm "to_a"
+                      || str_eq mnm "values" || str_eq mnm "deconstruct") then
+            (match mrecv with
+             | VObj o9 ->
+               (let (_, _, oc9, iv9) = world in
+                let ms9 = (match map_get struct_mem (struct_members_cls world (ancestors_of world (map_get oc9 o9))) with
+                           | VArr aid -> deref aid | _ -> Nil) in
+                if str_eq mnm "members" then arr_new ms9
+                else if str_eq mnm "size" || str_eq mnm "length" then VInt (vals_len ms9 0)
+                else
+                  (let rec field9 = fn (xs: Val list) ->
+                     (match xs with
+                      | Nil -> (Nil : Val list)
+                      | Cons (m9, t9) ->
+                        (let k9 = str_of_int o9 ++ "@" ++ struct_slot (match m9 with VSym y9 -> y9 | _ -> "") in
+                         Cons ((if map_has iv9 k9 then map_get iv9 k9 else VNil), field9 t9))) in
+                   arr_new (field9 ms9)))
+             | _ -> VNil)
+          // (a Method made from a builtin runs the builtin, though the name
+          //  has a Ruby body now: bi_meth_mark)
+          else if bi_meth_shadowed world id mown mnm mrecv then
+            bi_meth_call env world blk id mnm mrecv args (false, (Nil : str list), (Nil : Stmt list), env)
+          // A Class visibility entry can expose a body below its owner's
+          // prepends. Keep the visible owner, but call the recorded body.
+          else if str_eq mnm "subclasses" && is_sng_cls mown
+                  && map_has vis_marks (mown ++ "#" ++ mnm)
+                  && (if map_has ivars (str_of_int id ++ "@~m_bi") then false else true)
+                  && (if str_eq (msnap_cls world id "Method" mown) mown then false else true) then
+            class_subclasses_method_call world blk mrecv id mown mnm args
+          // (Kernel#binding called as a Method has a C function for its
+          //  caller, not Ruby code: rb_f_binding's refusal)
+          else if str_eq mnm "binding" && (str_eq mown "Kernel" || str_eq mown "")
+                  && (if has_meth world (dispatch_cls_of world mrecv) "binding" then false else true) then
+            raise_exc world "RuntimeError" "Cannot create Binding object for non-Ruby caller"
+          // (Kernel#eval called as a Method reads the CALLER's frame, as
+          //  rb_f_eval does: `method(:eval).call("def m; end")` in a class body
+          //  defines m on that class. Taken on the caller's own self it is the
+          //  bare eval; on a class it was a NoMethodError, the class-method
+          //  dispatcher having no eval.)
+          else if str_eq mnm "eval" && (str_eq mown "Kernel" || str_eq mown "")
+                  && (if has_meth world (dispatch_cls_of world mrecv) "eval" then false else true)
+                  && rb_identical mrecv (if lv_has env "self" then lv_get env "self" else VMain) then
+            do_eval env world blk args
+          else
+         match mrecv with
+          | VMain -> (if (let (m8, _, _, _) = world in map_has m8 mnm) then call_method (env_as_main env) world blk mnm args else invoke_val_c env world blk VMain mnm args false)
+          // a binary operator on a primitive is not in the method table -- it
+          // is arith_bin -- so `1.method(:+)` has to route there, the same way
+          // an alias to a builtin operator does.
+          // ⚠ ...but not String#<<, which is a MUTATION: arith_bin answers a
+          //   new string, so `s.method(:<<).call("q")` left s unchanged. The
+          //   by-name path appends in place (str_append_val).
+          | _ ->
+            if is_binary_op_name mnm
+               && (if (str_len mnm == 2 && str_eq mnm "<<") && (match mrecv with VStr _ -> true | _ -> false) then false else true)
+               && (if has_meth world (dispatch_cls_of world mrecv) mnm then false else true)
+               // (an OBJECT's operators are its dispatcher's arms, not
+               //  eval_bin_prim's: `Time.at(1).method(:<=>).call(t)` was nil)
+               && (match mrecv with VObj _ -> false | _ -> true) then
+              // (through eval_bin_prim, as the operator itself is: arith_bin
+              //  is the arithmetic only, and `0.method(:<).call(5)` was its
+              //  "unknown operator")
+              (match args with
+               | Cons (a1, _) -> eval_bin_prim env world blk mnm mrecv a1
+               | Nil -> invoke_val_c env world blk mrecv mnm args false)
+            // A Method holds the definition it was taken FROM: calling it by
+            // name again re-dispatches, so `obj.method(:m).super_method.call`
+            // ran the subclass's m forever. Invoke the owner's directly when
+            // there is one (a builtin has no entry and keeps the old path).
+            else if (if str_eq mown "" then false else true) && (has_meth world mown mnm || msnap_held world id "Method" mown mnm)
+                    // (an alias of a builtin is reached by name: alias_owner)
+                    && (if map_len builtin_alias > 0 && alias_first world mown mnm then false else true) then
+              (if msnap_held world id "Method" mown mnm
+               then msnap_call world blk mrecv id "Method" mown mnm args
+               // (the owner's OWN definition, not a lookup from it: a class
+               //  with a module prepended answers the module's first, and
+               //  `alias m2 m1` there made super_method.call run the
+               //  prepended m2 again)
+               else if (let (m8, _, _, _) = world in map_has m8 (mown ++ "#" ++ mnm)) then
+                 (let (m8, _, _, _) = world in run_meth world blk mrecv mown mnm (map_get m8 (mown ++ "#" ++ mnm)) args)
+               else invoke world blk mrecv mown mnm args)
+            // ...and Module#name bound to a class answers the class's REAL
+            // name, whatever `def self.name` it has (Data#inspect asks exactly
+            // this); re-dispatching by name found the override
+            else if str_eq mown "Module" && str_eq mnm "name" && (match args with Nil -> true | _ -> false)
+                    && (match mrecv with VClass _ -> true | _ -> false) then
+              (match mrecv with VClass c9 -> mod_name_val c9 | _ -> VNil)
+            // Kernel#inspect bound to a String, Array or Hash (a subclass's,
+            // typically) is Kernel's: the class, an address and the ivars --
+            // not the value's own inspect. So it is for a Struct (whose own
+            // is "#<struct ...>") and an Integer, Float, Symbol, nil or bool
+            else if str_eq mown "Kernel" && str_eq mnm "inspect" && (match args with Nil -> true | _ -> false)
+                    && (match mrecv with VStr _ -> true | VArr _ -> true | VHsh _ -> true | VObj _ -> true
+                        | VInt _ -> true | VBig _ -> true | VFlt _ -> true | VSym _ -> true | VNil -> true | VBool _ -> true
+                        | _ -> false) then
+              (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+               let ivs9 = (match invoke_val_c env world nb9 mrecv "instance_variables" Nil false with
+                           | VArr a9 -> deref a9 | _ -> Nil) in
+               let rec parts = fn (xs: Val list) ->
+                 (match xs with
+                  | Nil -> (Nil : str list)
+                  | Cons (VSym n9, t9) ->
+                    Cons (n9 ++ "=" ++ inspect_w env world (invoke_val_c env world nb9 mrecv "instance_variable_get" (Cons (VSym n9, Nil)) false), parts t9)
+                  | Cons (_, t9) -> parts t9) in
+               let ps9 = parts ivs9 in
+               let rec join = fn (xs: str list) -> (match xs with Nil -> "" | Cons (x9, Nil) -> x9 | Cons (x9, t9) -> x9 ++ ", " ++ join t9) in
+               mkstr ("#<" ++ cls_display world (obj_print_cls world (dispatch_cls_of world mrecv)) ++ ":0x" ++ hex_pad16 (val_hash mrecv)
+                      ++ (match ps9 with Nil -> "" | _ -> " " ++ join ps9) ++ ">"))
+            // a KERNEL method bound to a BasicObject runs on it
+            // (`Kernel.instance_method(:inspect).bind(bo).call`): the object
+            // has no such method of its own, which is the refusal bo_refuses
+            // makes for an ordinary call
+            else if str_eq mown "Kernel" then
+              (let _ = map_set bm_bypass "k" VNil in
+               // (Kernel#warn reads its self: bound to the Warning module it
+               //  writes the text itself instead of calling Warning.warn)
+               let env9 = (if str_eq mnm "warn" then (let e9 = lv_flat env in let _ = map_set e9 "self" mrecv in e9) else env) in
+               let r9 = try_or (fn (u: unit) -> FNext (invoke_val_c env9 world blk mrecv mnm args false)) (FRaise VNil) in
+               let _ = map_delete bm_bypass "k" in
+               match r9 with
+               | FNext v9 -> v9
+               | _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "exception") else "exception"))
+            // ⚠ a BUILTIN taken before a `using` stays the builtin: the method
+            //   entry is what the object holds, and a refinement active where
+            //   it is CALLED is not asked (`meth = 2.method(:pow); using M;
+            //   meth.call(3)` is 8). One taken under a refinement records the
+            //   refinement as its owner and never reaches here.
+            else if str_eq mown "" && map_len ref_active > 0 then
+              (let rp9 = ref_cur_id () in
+               let _ = ref_install 0 in
+               let r9 = try_or (fn (u: unit) -> FNext (invoke_val_c env world blk mrecv mnm args false)) (FRaise VNil) in
+               let _ = ref_install rp9 in
+               match r9 with
+               | FNext v9 -> v9
+               | _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "exception") else "exception"))
+            else invoke_val_c env world blk mrecv mnm args false)
+and method_block_native = fn env -> fn world -> fn blk -> fn (mid: int) -> fn (args: Val list) -> fn newblk ->
+  (let args = (if arg_splat_any () then r2k_method_args world args else args) in
+          let (_, _, _, ivars9) = world in
+          let mnm = (method_text (method_core_field mid 0)) in
+          let mrecv = (if map_has method_cores mid then method_core_field mid 2 else VMain) in
+          let mown = (method_text (method_core_field mid 1)) in
+          match mrecv with
+          | VMain -> (if (let (m8, _, _, _) = world in map_has m8 mnm) then call_method (env_as_main env) world newblk mnm args else invoke_with_block env world blk VMain mnm args newblk)
+          | _ ->
+            // A Method object may call a PRIVATE method -- it was obtained by
+            // name, so calling it is not an implicit-receiver call. tsort does
+            // exactly this: `tsort_each_node` is private in bundler's SpecSet.
+            // The ordinary route through the block dispatcher applies
+            // visibility, so invoke the method itself when it can be found.
+            (let dcls = dispatch_cls_of world mrecv in
+             let owner = (if str_eq mown "" then dcls else mown) in
+             if bi_meth_shadowed world mid mown mnm mrecv then bi_meth_call env world blk mid mnm mrecv args newblk
+             else if str_eq mnm "subclasses" && is_sng_cls mown
+                     && map_has vis_marks (mown ++ "#" ++ mnm)
+                     && (if map_has ivars9 (str_of_int mid ++ "@~m_bi") then false else true)
+                     && (if str_eq (msnap_cls world mid "Method" mown) mown then false else true) then
+               class_subclasses_method_call world newblk mrecv mid mown mnm args
+             else if msnap_held world mid "Method" owner mnm then msnap_call world newblk mrecv mid "Method" owner mnm args
+             else if map_len builtin_alias > 0 && alias_first world owner mnm then invoke_with_block env world blk mrecv mnm args newblk
+             else if has_meth world owner mnm then invoke world newblk mrecv owner mnm args
+             else if has_meth world dcls mnm then invoke world newblk mrecv dcls mnm args
+             else invoke_with_block env world blk mrecv mnm args newblk))
 // Native argument copies preserve Hash state without invoking user dup or
 // initialize_copy hooks. Frozen/singleton state is not copied by rb_hash_dup.
 and r2k_hash_copy = fn world -> fn (id9: int) ->
@@ -57997,7 +58027,7 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
                  //  and a Thread subclass's `super` handed over the proc itself)
                  | VProc pid -> (let _ = rx_fiber_home r (proc_get (str_of_int pid)) in
                                  let enc9 = (match proc_get (str_of_int pid) with
-                                             | (_, _, _, penv9) -> (if map_has penv9 "__m_meth"
+                                             | (_, _, _, penv9) -> (if map_has penv9 "__m~meth"
                                                                     then (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) else blk)) in
                                  let _ = vec_set thr_body_v 0 1 in
                                  run_block world enc9 (proc_get (str_of_int pid)) args)

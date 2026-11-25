@@ -22,6 +22,15 @@ instead of copying it. Method#call also shared it. Block-supplied Proc
 calls bypassed the flag policy, lambda marker and captured yield context.
 They now prepare these through the same native helpers used without a block.
 
+Method#to_proc uses a private bound-call expression and shared native Method
+entry helpers and an internal slot that cannot be a Ruby local, so
+singleton or class overrides of public Method#call cannot
+replace the captured target. It passes its already-bound argument Array
+without a synthetic Ruby splat: a direct positional flagged Hash stays
+positional. Incoming flagged splats are converted at the proxy boundary,
+before callbacks, and passed blocks retain their original Proc identity.
+Captured Ruby definitions and builtin targets keep their existing paths.
+
 The persistent ruby2_keywords flag and a call's temporary keyword origin are
 separate properties. Hash.ruby2_keywords_hash and Marshal's flag restoration
 set only the persistent flag. A final splat establishes origin for its call.

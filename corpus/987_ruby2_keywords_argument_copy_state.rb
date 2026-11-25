@@ -183,3 +183,54 @@ value = super_receiver.take(original)
 p [:super_positional_identity, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
 value = super_receiver.take(*[original])
 p [:super_splat_identity, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+
+# Method#to_proc invokes the captured entry, independently of public #call.
+def proxy_keyword_original(a:)
+  block_given? ? [a, yield] : a
+end
+proxy_method = method(:proxy_keyword_original)
+proxy_before_override = proxy_method.to_proc
+def proxy_method.call(*) = :singleton_override
+p [:singleton_call_override, proxy_method.call]
+p [:singleton_proxy_before, proxy_before_override.call(a: 27)]
+p [:singleton_proxy_after, proxy_method.to_proc.call(a: 28) { :block }]
+class Method
+  alias saved_keyword_corpus_call call
+  def call(*) = :class_override
+end
+class_proxy_method = method(:proxy_keyword_original)
+p [:class_call_override, class_proxy_method.call]
+p [:class_proxy, class_proxy_method.to_proc.call(a: 29)]
+p [:class_proxy_block, class_proxy_method.to_proc.call(a: 30) { :class_block }]
+class Method
+  alias call saved_keyword_corpus_call
+  remove_method :saved_keyword_corpus_call
+end
+# Native targets and captured Ruby definitions retain their ordinary behavior.
+p [:builtin_proxy, [1, 2].method(:map).to_proc.call { |value| value * 2 }]
+p [:operator_proxy, 1.method(:+).to_proc.call(2)]
+class StoredProxyTarget
+  def value = :old
+end
+stored_proxy_method = StoredProxyTarget.new.method(:value)
+stored_proxy = stored_proxy_method.to_proc
+class StoredProxyTarget
+  def value = :new
+end
+p [:snapshot_proxy, stored_proxy.call]
+plain_method_proxy = method(:plain_method).to_proc
+value = plain_method_proxy.call(original).last
+p [:proxy_direct_hash, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+value = plain_method_proxy.call(*[original]).last
+p [:proxy_splat_hash, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+value = plain_method_proxy.call(original) {}.last
+p [:proxy_direct_block_hash, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+def proxy_yield_target
+  yield
+  :after
+end
+p [:proxy_break, method(:proxy_yield_target).to_proc.call { break :done }]
+
+def proxy_block_identity(&block) = block
+identity_block = -> { :identity }
+p [:proxy_block_identity, method(:proxy_block_identity).to_proc.call(&identity_block).equal?(identity_block)]
