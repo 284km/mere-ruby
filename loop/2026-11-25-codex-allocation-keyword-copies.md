@@ -26,7 +26,10 @@ The persistent ruby2_keywords flag and a call's temporary keyword origin are
 separate properties. Hash.ruby2_keywords_hash and Marshal's flag restoration
 set only the persistent flag. A final splat establishes origin for its call.
 Binding consumes origin, while nonmutating arity queries can inspect it more
-than once. Copies and marked rest arguments keep the appropriate persistent
+than once. A generic forwarding frame stores its own keyword-origin bit and
+restores origin at each forwarding call, including repeated or escaped calls.
+A flagged Hash originally passed positionally stays positional through ...;
+the permanent flag alone does not determine that frame's provenance. Copies and marked rest arguments keep the appropriate persistent
 flag without turning a later direct positional argument into keywords.
 
 ## Ownership and cost of call state

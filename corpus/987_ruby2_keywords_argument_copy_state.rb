@@ -138,3 +138,48 @@ converted_marked = bound_marked.to_proc
   value = callable.call(*[original]) {}.last
   p [:bound_with_literal, index, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
 end
+
+# Keyword origin belongs to a forwarding frame, not one shared Hash mark.
+def self.repeated_keyword_target(a:) = a
+def self.repeated_keyword_forward(...)
+  [repeated_keyword_target(...), repeated_keyword_target(...)]
+end
+p [:repeated_keywords, repeated_keyword_forward(a: 23)]
+def self.captured_keyword_forward(...)
+  -> { repeated_keyword_target(...) }
+end
+forwarded_keywords = captured_keyword_forward(a: 24)
+p [:captured_keywords, forwarded_keywords.call, forwarded_keywords.call]
+eval('def self.evaluator_repeated_forward(...); [repeated_keyword_target(...), repeated_keyword_target(...)]; end')
+p [:evaluator_repeated_keywords, evaluator_repeated_forward(a: 25)]
+
+# A flagged Hash passed positionally stays positional through ... .
+def self.forward_plain_identity(...) = plain_method(...).last
+value = forward_plain_identity(original)
+p [:forwarded_positional, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+value = forward_plain_identity(*[original])
+p [:forwarded_splat, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+begin
+  repeated_keyword_forward(original)
+rescue ArgumentError => error
+  p [:forwarded_direct_error, error.class, error.message]
+end
+
+class RepeatedKeywordSuperParent
+  def take(a:) = a
+end
+class RepeatedKeywordSuperChild < RepeatedKeywordSuperParent
+  def take(...) = [super, super]
+end
+p [:repeated_keyword_super, RepeatedKeywordSuperChild.new.take(a: 26)]
+class ForwardedIdentitySuperParent
+  def take(*args) = args.last
+end
+class ForwardedIdentitySuperChild < ForwardedIdentitySuperParent
+  def take(...) = super
+end
+super_receiver = ForwardedIdentitySuperChild.new
+value = super_receiver.take(original)
+p [:super_positional_identity, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+value = super_receiver.take(*[original])
+p [:super_splat_identity, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
