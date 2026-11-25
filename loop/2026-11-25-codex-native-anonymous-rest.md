@@ -13,6 +13,8 @@ The private parameter is `__ar~`; Ruby identifiers and Binding writes cannot
 collide with it. Parameter normalization, VM locals, bare super, reflection
 and the Proc outer-variable walk preserve its private identity. In particular,
 pbase must preserve the tilde instead of aliasing the legal local `__ar`.
+Check that private identity only when its marker is encountered; ordinary
+parameter names keep the original scan without a per-parameter guard.
 Anonymous block parameters retain their existing binding behavior.
 
 Explicit splats and bare super expand native storage. VM Array concatenation
