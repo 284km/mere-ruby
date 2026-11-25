@@ -406,3 +406,17 @@ were not the trap fix itself but two things it uncovered:
   taken by a forked process, then accept_nonblock and a blocking accept;
   and three forked processes accepting 200 connections on one listener,
   which hung here.
+
+With both, the mold_worker group (13 tests) went from 6 failures to 3 on
+mere-ruby, measured at a load average of 36 to 53 on this 10-core machine
+(other sessions' measurements); ruby 4.0.10 passes all 13 at the same load.
+Still open in the group:
+- test_mold_worker_refork_replaces_workers_forked_by_previous_mold and
+  test_mold_worker_reforks_at_each_threshold: a phase-2 (or phase-1) worker
+  not booted in time. In each log the master first says "Out-of-sync worker
+  list, no <pid> worker" twice for the worker it has just TERMed: it has
+  dropped that worker from its list before the worker's last pipe messages
+  came in. Neither Process.wait2 nor Process.kill(0, pid) on a grandchild
+  differs from ruby (checked by hand), so the cause is not found yet.
+- test_mold_worker_refork_does_not_leak_file_descriptors: 19 descriptors
+  in a reforked worker against 17. Not investigated yet.
