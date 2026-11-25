@@ -11150,6 +11150,7 @@ and nby_count = fn world -> fn (a0: Val) ->
   if n9 < 0 then (let _ = raise_exc world "ArgumentError" ("negative size (" ++ str_of_int n9 ++ ")") in 0)
   else n9
 and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let args = (if hash_keys_mapping recv name args then hash_keys_args world args else args) in
   match recv with
   | VHsh hid9 when hash_iterating_name name ->
     (let _ = hiter_inc hid9 in
@@ -17681,6 +17682,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
      | _ -> VBool false)
   else
   if builtin_mut_on_frozen world recv name
+     && (if hash_keys_mapping recv name args then false else true)
      && (if enum_needs_block name then false else true)
      && (if transform_bang_bare name args
             && (let (hb9, _, _, _) = blk in if hb9 then false else true)
@@ -18392,14 +18394,14 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
   else if ((str_len name == 14 && str_eq name "transform_keys") || (str_len name == 16 && str_eq name "transform_values")
            || (str_len name == 15 && str_eq name "transform_keys!") || (str_len name == 17 && str_eq name "transform_values!"))
           && (match recv with VHsh _ -> true | _ -> false)
-          && prim_native_wanted world recv name
-          && (match args with Nil -> true | _ -> false) then
+          && (match args with Nil -> true | _ -> false)
+          && prim_native_wanted world recv name then
     make_enum_a world recv name args
   else if ((str_len name == 14 && str_eq name "transform_keys") || (str_len name == 15 && str_eq name "transform_keys!"))
           && (match recv with VHsh _ -> true | _ -> false)
-          && prim_native_wanted world recv name
-          && (match args with Cons (VHsh _, _) -> true | _ -> false) then
-    hash_transform_keys_map recv name args
+          && (match args with Cons (_, _) -> true | _ -> false)
+          && prim_native_wanted world recv name then
+    hash_transform_keys_map world recv name args
   // `h[key] = v` through DISPATCH (send / a subclass) resolves the stored key
   // the same way the fast path does.
   // ⚠ ...and the READ doors, through the same rule (see hkey_eql_w).
@@ -36367,7 +36369,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // (the same check as builtin_iter's: a Ruby method of the name is not a
        //  builtin mutator -- ActiveSupport's Object#try! with a block on a
        //  frozen String was "can't modify frozen String")
-       if builtin_mut_on_frozen world recv name then
+       if builtin_mut_on_frozen world recv name
+          && (if hash_keys_mapping recv name args then false else true) then
          raise_exc_iv world "FrozenError" ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect env world recv) (Cons (("__recv", recv), Nil))
        // a singleton method defined on this exact String/Array/Hash --
        // `def ary.m`, or a module it was extended with -- wins, as it does
@@ -39258,9 +39261,13 @@ and ary_set_arg = fn env -> fn world -> fn (v: Val) ->
                ("can't convert " ++ class_name v ++ " to Array (" ++ class_name v ++ "#to_ary gives " ++ class_name r9 ++ ")"))
 and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
   match v with
-  | VObj id ->
-    (let (meths, sup, ocls, ivars) = world in
-     let cls = map_get ocls id in
+  | VObj _ -> (let (_, answer) = conv_try_result env world v mname in answer)
+  | _ -> VNil
+// Keep absence separate from a conversion that actually returned nil.
+// The checked Hash argument path also accepts singleton methods on primitives.
+and conv_try_result = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
+    (let (_, _, ocls, _) = world in
+     let cls = (match v with VClass c -> "(sng:" ++ c ++ ")" | _ -> hng_lookup_cls world v) in
      let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
      // an undef'd name is not there to be called, no matter that the builtin
      // (or a superclass) would have answered it -- fall through to the
@@ -39285,10 +39292,10 @@ and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
                           (if takes_include_all ps ds then Cons (VBool true, Nil) else Nil)) in
            truthy (invoke world nb v cls "respond_to?" (Cons (VSym mname, extra))))
         else true) in
-     if (if rt_ok then false else true) then VNil
-     else if live && has_meth world cls mname then invoke_val_c env world nb v mname Nil false
+     if (if rt_ok then false else true) then (false, VNil)
+     else if live && has_meth world cls mname then (true, invoke_val_c env world nb v mname Nil false)
      else if live && (is_prim_method mname || builtin_obj_has cls mname) then
-       invoke_val_c env world nb v mname Nil false
+       (true, invoke_val_c env world nb v mname Nil false)
      else
        // ...and respond_to_missing?(name, true) is asked TOO (ruby asks both --
        // the first is not a substitute for the second), and only then
@@ -39299,26 +39306,25 @@ and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
                 truthy (invoke world nb v cls "respond_to_missing?"
                           (Cons (VSym mname, Cons (VBool true, Nil))))
               else true) in
-           if (if rtm_ok then false else true) then VNil
+           if (if rtm_ok then false else true) then (false, VNil)
            // (a NoMethodError out of it is a decline too, when no
            //  respond_to_missing? said yes: ruby's check_funcall_failed --
            //  `def method_missing(m, *a) = super` leaves [obj].flatten alone)
            else if has_meth world cls "method_missing" then
-             (if has_meth world cls "respond_to_missing?" then invoke world nb v cls "method_missing" (Cons (VSym mname, Nil))
+             (if has_meth world cls "respond_to_missing?" then (true, invoke world nb v cls "method_missing" (Cons (VSym mname, Nil)))
               else
                 (let (_, _, _, iv9) = world in
                  let ok9 = map_new () in
                  let r9 = try_or (fn (u: unit) -> (let x9 = invoke world nb v cls "method_missing" (Cons (VSym mname, Nil)) in let _ = map_set ok9 "y" 1 in x9)) VNil in
-                 if map_has ok9 "y" then r9
+                 if map_has ok9 "y" then (true, r9)
                  else if (match (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil) with
                           | VObj e9 -> exc_is_a world (map_get ocls e9) "NoMethodError"
                           | VExc (c9, _) -> exc_is_a world c9 "NoMethodError"
                           | _ -> false) then
-                   (let _ = map_delete iv9 "$exc" in let _ = map_clear prim_missing in VNil)
+                   (let _ = map_delete iv9 "$exc" in let _ = map_clear prim_missing in (false, VNil))
                  else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: (passed on past a conversion)")) in
                        fail "mere-ruby: (passed on past a conversion)")))
-           else VNil)))
-  | _ -> VNil
+           else (false, VNil))))
 
 // The key a hash actually STORES for `h[k] = v`: an existing key that is eql?
 // to k stays in place (so a second, equal key object never replaces the first),
@@ -41044,8 +41050,36 @@ and recv_defines = fn world -> fn (recv: Val) -> fn (name: str) ->
 // body: HashWithIndifferentAccess#transform_keys), consumed here.
 // transform_keys(mapping) / transform_keys!(mapping): the keys the mapping
 // names are replaced, the others kept
-and hash_transform_keys_map = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+and hash_keys_mapping = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  (match args with Nil -> false | _ -> true)
+  && (match recv with VHsh _ -> true | _ -> false)
+  && (str_eq name "transform_keys" || str_eq name "transform_keys!")
+and hash_keys_args = fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> args
+  | Cons (VHsh _, Nil) -> args
+  | Cons (value, Nil) ->
+    (let (called, converted) = conv_try_result gc_cenv0 world value "to_hash" in
+     match converted with
+     | VHsh _ -> Cons (converted, Nil)
+     | _ ->
+       (let message = (match converted with
+         | _ when (if called then false else true) ->
+           "no implicit conversion of " ++ conv_gives_name value ++ " into Hash"
+         | _ -> "can't convert " ++ class_name value ++ " to Hash (" ++ class_name value
+                ++ "#to_hash gives " ++ class_name converted ++ ")") in
+        let _ = raise_exc world "TypeError" message in (Nil : Val list)))
+  | _ -> (let _ = raise_exc world "ArgumentError"
+                    ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)") in (Nil : Val list))
+and hash_transform_keys_map = fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let args = hash_keys_args world args in
+  let _ = (if str_eq name "transform_keys!" && (match args with Nil -> false | _ -> true)
+              && val_frozen_mut recv
+           then (let _ = raise_exc_iv world "FrozenError"
+                         ("can't modify frozen " ++ frz_cls world recv ++ ": " ++ frz_inspect gc_cenv0 world recv)
+                         (Cons (("__recv", recv), Nil)) in ()) else ()) in
   match (recv, args) with
+  | (VHsh _, Nil) -> make_enum_a world recv name args
   | (VHsh hid, Cons (VHsh mid, _)) ->
     (let mp = hderef mid in
      let rec go = fn (ys: Val list) ->
@@ -48477,6 +48511,7 @@ and range_case_equal_native = fn world -> fn (recv: Val) -> fn (args: Val list) 
            ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)")
 
 and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn (args: Val list) ->
+  let args = (if hash_keys_mapping recv src args then hash_keys_args world args else args) in
   // An alias of a builtin that changes its receiver refuses a frozen one, as
   // the builtin does under its own name. The frozen check is asked with the
   // name that was CALLED, and the alias's name is not a mutator's:
@@ -48508,6 +48543,8 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
     raise_exc_iv world "NameError" (inspect recv ++ "/" ++ inspect arg) (Cons (("__name", VSym "/"), Cons (("__recv", recv), Nil)))
   | (VHsh _, _) when (str_eq src "count" || str_eq src "entries") && (if str_eq (hash_ruby_each_class world recv) "" then false else true) ->
     hash_enumeration_native world recv src args (false, (Nil : str list), (Nil : Stmt list), env)
+  | (VHsh _, _) when str_eq src "transform_keys" || str_eq src "transform_keys!" ->
+    hash_transform_keys_map world recv src args
   | (VHsh _, _) when str_eq src "[]" ->
     hash_read_native env world (false, (Nil : str list), (Nil : Stmt list), env) recv args
   | _ when str_eq src "===" && (match recv with VRange _ -> true | _ -> rng_sub_held world recv) ->
@@ -50133,6 +50170,7 @@ and emethod_args = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        // hands back an Enumerator (the error waits for its #each).
        let _ = chill_touch world recv name in
        let _ = (if builtin_mut_on_frozen world recv name
+                   && (if hash_keys_mapping recv name args then false else true)
                    && (if enum_needs_block name || transform_bang_bare name args then false else true)
                    && (if delete_is_noop env world recv name args then false else true)
                    && (if arr_mut_arity_wrong recv name args then false else true)
@@ -53321,6 +53359,7 @@ and sender_super_ahead = fn world -> fn (recv: Val) -> fn (meth: str) ->
        else if str_eq owner9 native9 then true else walk9 tail9 (i9 + 1) in
    at9 >= 0 && walk9 ancestors9 0)
 and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) -> fn (args: Val list) ->
+  let args = (if hash_keys_mapping recv meth args then hash_keys_args world args else args) in
   // super from a method of a primitive subclass (Array/String/Hash) into the
   // builtin base: use the builtin implementation.
   let hk = hng_key recv in
@@ -53646,17 +53685,10 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
                  | VStr r9 -> (let _ = (if str_eq (sget r9) before9 then VNil else str_mut_do h9 "replace" (Cons (VStr r9, Nil))) in recv)
                  | _ -> recv))
            | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")))
-     // (HashWithIndifferentAccess#transform_keys(mapping) calls super)
+     // Mapping coercion and its frozen check belong to the native operation.
      | VHsh _ when (str_eq meth "transform_keys" || str_eq meth "transform_keys!")
-                   && (match args with Cons (VHsh _, _) -> true | _ -> false)
                    && (match superblk with (true, _, _, _) -> false | _ -> true) ->
-       // (the bang refuses a frozen receiver before it writes, as Hash's own
-       //  does; the plain form answers a new hash from a frozen one too)
-       (if str_eq meth "transform_keys!" && val_frozen_mut recv then
-          raise_exc_iv world "FrozenError"
-            ("can't modify frozen " ++ (if map_has hng_store hk then display_cls_msg world (map_get hng_store hk) else "Hash") ++ ": " ++ inspect_w gc_cenv0 world recv)
-            (Cons (("__recv", recv), Nil))
-        else hash_transform_keys_map recv meth args)
+       hash_transform_keys_map world recv meth args
      | _ ->
        (match superblk with
         | (true, _, _, _) -> builtin_iter world superblk superblk recv meth args

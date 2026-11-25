@@ -80,3 +80,12 @@ controls, all corpus modes, source gates and record_hygiene against this
 main before the next batched code-and-record push. Earlier head results
 remain historical until the integrated head is measured. One corpus sweep
 at a time; no full unit suite or Rails cold measurement.
+
+## Follow the iterator-mapping integration
+
+Merge main a9e68981 for the same acceptance baseline as PR 242. Preserve
+main's Hash mapping conversion before iteration and this change's native
+argument ownership. For anonymous rest, consume incoming Array provenance
+before any mapping to_hash callback. Validate the integrated regression and
+main's mapping corpus before recording final-head acceptance; earlier
+779c7cc9 measurements retain their exact revision labels.
