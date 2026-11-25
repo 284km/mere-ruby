@@ -6381,10 +6381,10 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       if str_eq op "%" && (match va0 with VStr _ -> true | _ -> false) then
         (match va0 with
          | VStr h ->
-           let args2 = rb_fmt_args env world vb in
+           let (source9, args2) = rb_fmt_args env world vb in
            let _ = fmt_ascii_guard world (senc_get h) in
-           let out = rb_format_in env world (senc_get h) (sget h) args2 in
-           let renc = (let r9 = rb_fmt_enc (senc_get h) (sget h) args2 in
+           let (out, converted9) = rb_format_in env world (senc_get h) (sget h) args2 source9 in
+           let renc = (let r9 = converted9 in
                        if str_eq r9 "US-ASCII" && (if str_ascii_only out 0 then false else true) then "ASCII-8BIT" else r9) in
            let r = mkstr out in
            (match r with VStr rid -> (let _ = senc_set rid renc in r) | _ -> r)
@@ -28760,7 +28760,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        else if (str_len name == 6 && str_eq name "printf") then
          (match args with
           | Cons (VStr h9, rest9) ->
-            (let s9 = rb_format env world (sget h9) rest9 in
+            (let s9 = rb_format env world (VStr h9) rest9 VNil in
              let _ = (if fd == 2 then err_raw s9 else out_print_checked world s9) in
              VNil)
           | Nil -> VNil
@@ -47034,8 +47034,59 @@ and hash_merge_one_block = fn world -> fn nb -> fn (base: Val list) -> fn (other
 // property of the WHOLE format, so `mode` rides along the entire pass and
 // mixing two styles is an ArgumentError no matter how far apart they sit.
 // mode: 0 = undecided, 1 = sequential, 2 = numbered, 3 = named.
-and rb_format = fn env -> fn world -> fn (fmt: str) -> fn (args: Val list) ->
-  let (out, used, mode) = rb_format_go env world fmt 0 args 0 0 "" in
+// String#% reads the original array again after coercion callbacks. A
+// length change is rejected before fetching another argument and at exit;
+// replacing an element at the same length remains visible to the formatter.
+and rb_fmt_array_check = fn (args: Val list) -> fn (source9: Val) ->
+  match source9 with
+  | VArr id9 -> (if val_list_len (deref id9) == val_list_len args then ()
+                else (let _ = prim_raise "RuntimeError" "array modified during formatting" in ()))
+  | _ -> ()
+and rb_fmt_array_arg = fn (args: Val list) -> fn (source9: Val) -> fn (index9: int) ->
+  let _ = rb_fmt_array_check args source9 in
+  match source9 with
+  | VArr id9 -> rb_fmt_posarg (deref id9) (index9 + 1)
+  | _ -> rb_fmt_posarg args (index9 + 1)
+
+and rb_format = fn env -> fn world -> fn (format9: Val) -> fn (args: Val list) -> fn (source9: Val) ->
+  let value9 = (match format9 with VStr _ -> format9 | _ -> pack_cv env world 0 "str" format9) in
+  match value9 with
+  | VStr handle9 ->
+    (let _ = fmt_ascii_guard world (senc_get handle9) in
+     let (out9, _) = rb_format_in env world (senc_get handle9) (sget handle9) args source9 in out9)
+  | _ -> ""
+and rb_fmt_state = fn (encoding9: str) ->
+  let rec free9 = fn (index9: int) ->
+    (if index9 >= vec_len fmt_state_busy || vec_get fmt_state_busy index9 == 0 then index9
+     else free9 (index9 + 1)) in
+  let index9 = free9 0 in
+  let state9 = (if index9 < vec_len fmt_state_pool then vec_get fmt_state_pool index9
+                else (let added9 = vec_new () in
+                      let _ = vec_compact added9 in
+                      let _ = vec_push fmt_state_pool added9 in
+                      let _ = vec_push fmt_state_busy 0 in added9)) in
+  let _ = vec_set fmt_state_busy index9 1 in
+  let encoding9 = enc_canon_name encoding9 in
+  let _ = vec_push state9 encoding9 in let _ = vec_push state9 "" in
+  let _ = vec_push state9 encoding9 in let _ = vec_push state9 "" in
+  let _ = vec_push state9 "" in index9
+and rb_fmt_release = fn (index9: int) ->
+  let state9 = vec_get fmt_state_pool index9 in
+  // Vec stores copy strings into its arena. Clearing slots alone leaves
+  // those copies allocated; recycling the arena releases them as well.
+  let _ = vec_recycle state9 in vec_set fmt_state_busy index9 0
+// Negotiate at conversion time, against the output prefix. The state belongs
+// to this invocation, including when a callback recursively formats strings.
+and rb_fmt_take = fn state9 -> fn (text9: str) -> fn (encoding9: str) ->
+  let previous9 = vec_get state9 0 in
+  let result9 = enc_compat2 previous9 (vec_get state9 1) encoding9 text9 in
+  if str_eq result9 "" then
+    (let _ = prim_raise "Encoding::CompatibilityError"
+       ("incompatible character encodings: " ++ enc_msg_name previous9 ++ " and " ++ enc_msg_name encoding9) in ())
+  else vec_set state9 0 result9
+and rb_format_core = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (args: Val list) -> fn (source9: Val) ->
+  let (out, used, mode) = rb_format_go env world state9 fmt 0 args source9 0 0 "" in
+  let _ = rb_fmt_array_check args source9 in
   // leftover arguments are an error only under $DEBUG, and only for the
   // sequential style: numbered and named formats may leave arguments unread.
   let dbg = (if map_has globals "DEBUG" then (match map_get globals "DEBUG" with VNil -> false | VBool b -> b | _ -> true) else false) in
@@ -47051,48 +47102,56 @@ and rb_format = fn env -> fn world -> fn (fmt: str) -> fn (args: Val list) ->
               then rb_warn world "too many arguments for format string" else ()) in
      out)
 
-and rb_format_in = fn env -> fn world -> fn (enc: str) -> fn (fmt: str) -> fn (args: Val list) ->
-  let had = map_has fmt_enc_cur "v" in
-  let prev = (if had then map_get fmt_enc_cur "v" else "") in
-  let _ = map_set fmt_enc_cur "v" (enc_canon_name enc) in
-  let _ = (if map_has fmt_named_cur "k" then map_delete fmt_named_cur "k" else ()) in
-  let out = rb_format env world fmt args in
-  let _ = (if had then map_set fmt_enc_cur "v" prev else map_delete fmt_enc_cur "v") in
-  out
+and rb_format_in = fn env -> fn world -> fn (enc: str) -> fn (fmt: str) -> fn (args: Val list) -> fn (source9: Val) ->
+  let index9 = rb_fmt_state enc in
+  let state9 = vec_get fmt_state_pool index9 in
+  let result9 = try_or_msg
+    (fn (u9: unit) ->
+      let out9 = rb_format_core env world state9 fmt args source9 in
+      let encoding9 = vec_get state9 0 in
+      // The caller owns the returned encoding after the scratch is recycled.
+      (out9, substring encoding9 0 (str_len encoding9)))
+    (fn (message9: str) -> let _ = rb_fmt_release index9 in fail message9) in
+  let _ = rb_fmt_release index9 in result9
 
-and rb_format_go = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (nextarg: int) -> fn (mode: int) -> fn (acc: str) ->
+and rb_format_go = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (source9: Val) -> fn (nextarg: int) -> fn (mode: int) -> fn (acc: str) ->
   let n = str_len fmt in
   if i >= n then (acc, nextarg, mode)
   else
     let c = char_at fmt i in
     if str_eq c "%" then
-      (if i + 1 < n && str_eq (char_at fmt (i + 1)) "%" then rb_format_go env world fmt (i + 2) args nextarg mode (acc ++ "%")
+      (if i + 1 < n && str_eq (char_at fmt (i + 1)) "%" then rb_format_go env world state9 fmt (i + 2) args source9 nextarg mode (acc ++ "%")
        // `%{name}` substitutes the hash entry with no format spec at all, and
        // `%<name>05.2f` names the argument for one. rubocop-ast generates its
        // node matchers this way, so a format that does not substitute becomes a
        // syntax error somewhere else entirely.
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "\{" then
+         let _ = vec_set state9 1 acc in
          let (key, j) = rb_fmt_name fmt (i + 2) "" "}" in
-         let m2 = rb_fmt_to_named_k mode "\{" key "}" nextarg in
-         rb_format_go env world fmt j args nextarg m2 (acc ++ rb_fmt_one env world "" (0 - 1) (0 - 1) false "s" (rb_fmt_named_w env world args key "\{" "}"))
+         let m2 = rb_fmt_to_named_k state9 mode "\{" key "}" nextarg in
+         rb_format_go env world state9 fmt j args source9 nextarg m2 (acc ++ rb_fmt_one env world state9 "" (0 - 1) (0 - 1) false "s" (rb_fmt_named_w env world state9 args key "\{" "}"))
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "<" then
+         let _ = vec_set state9 1 acc in
          let (key, j0) = rb_fmt_name fmt (i + 2) "" ">" in
-         let m2 = rb_fmt_to_named_k mode "<" key ">" nextarg in
-         let av = rb_fmt_named_w env world args key "<" ">" in
+         let m2 = rb_fmt_to_named_k state9 mode "<" key ">" nextarg in
+         let av = rb_fmt_named_w env world state9 args key "<" ">" in
          // the spec after the name formats exactly this one value: run the
          // directive parser over a one-element argument list in numbered mode
          // with the position preset, so a stray %s inside cannot consume the
          // real argument list.
-         let _ = map_set fmt_named_cur "k" key in
-         let (piece, j, na9, m9) = rb_fmt_dir env world fmt j0 (Cons (av, Nil)) 0 2 "" (0 - 1) false (0 - 1) false 1 in
-         let _ = map_delete fmt_named_cur "k" in
+         let _ = vec_set state9 3 key in let _ = vec_set state9 4 "on" in
+         let (piece, j, na9, m9) = rb_fmt_dir env world state9 fmt j0 (Cons (av, Nil)) VNil 0 2 "" (0 - 1) false (0 - 1) false 1 in
+         let _ = vec_set state9 4 "" in
          let _ = na9 in
          let _ = m9 in
-         rb_format_go env world fmt j args nextarg m2 (acc ++ piece)
+         rb_format_go env world state9 fmt j args source9 nextarg m2 (acc ++ piece)
        else
-         let (piece, j, na2, m2) = rb_fmt_dir env world fmt (i + 1) args nextarg mode "" (0 - 1) false (0 - 1) false 0 in
-         rb_format_go env world fmt j args na2 m2 (acc ++ piece))
-    else rb_format_go env world fmt (i + 1) args nextarg mode (acc ++ c)
+         // Only argument conversion needs the prefix for encoding checks.
+         // Literal bytes are copied without negotiating their encoding.
+         let _ = vec_set state9 1 acc in
+         let (piece, j, na2, m2) = rb_fmt_dir env world state9 fmt (i + 1) args source9 nextarg mode "" (0 - 1) false (0 - 1) false 0 in
+         rb_format_go env world state9 fmt j args source9 na2 m2 (acc ++ piece))
+    else rb_format_go env world state9 fmt (i + 1) args source9 nextarg mode (acc ++ c)
 
 // a named reference may not mix with the sequential or numbered styles.
 
@@ -47100,7 +47159,7 @@ and rb_format_go = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (arg
 // the spec is read left to right; `pset` tells "no precision" apart from an
 // explicit one (a negative star precision means none was given). Returns the
 // formatted piece, the index past the type char, the argument cursor, and mode.
-and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) ->
+and rb_fmt_dir = fn env -> fn world -> fn state9 -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (source9: Val) ->
   fn (nextarg: int) -> fn (mode: int) -> fn (flags: str) -> fn (width: int) -> fn (wset: bool) ->
   fn (prec: int) -> fn (pset: bool) -> fn (pos: int) ->
   let n = str_len fmt in
@@ -47121,106 +47180,106 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
       //  CHECK_FOR_FLAGS)
       (if pset then (let _ = prim_raise "ArgumentError" "flag after precision" in ("", i, nextarg, mode))
        else if wset then (let _ = prim_raise "ArgumentError" "flag after width" in ("", i, nextarg, mode))
-       else rb_fmt_dir env world fmt (i + 1) args nextarg mode (flags ++ c) width wset prec pset pos)
+       else rb_fmt_dir env world state9 fmt (i + 1) args source9 nextarg mode (flags ++ c) width wset prec pset pos)
     else if is_digit c then
       let (k, j) = rb_fmt_digits fmt i 0 false in
       (if j < n && str_eq (char_at fmt j) "$" then
          (if pos > 0 then (let _ = prim_raise "ArgumentError" ("value given twice - " ++ int_to_base k 10 ++ "$") in ("", j, nextarg, mode))
           else if k <= 0 then (let _ = prim_raise "ArgumentError" "invalid index - 0$" in ("", j, nextarg, mode))
           else if mode == 1 || mode == 3 then (let _ = prim_raise "ArgumentError" ("numbered(" ++ int_to_base k 10 ++ "$) after unnumbered(%)") in ("", j, nextarg, mode))
-          else rb_fmt_dir env world fmt (j + 1) args nextarg 2 flags width wset prec pset k)
+          else rb_fmt_dir env world state9 fmt (j + 1) args source9 nextarg 2 flags width wset prec pset k)
        else if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", j, nextarg, mode))
-       else rb_fmt_dir env world fmt j args nextarg mode flags k true prec pset pos)
+       else rb_fmt_dir env world state9 fmt j args source9 nextarg mode flags k true prec pset pos)
     else if str_eq c "*" then
       (if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", i, nextarg, mode))
        // (`%.**d`: a width cannot follow the precision)
        else if pset then (let _ = prim_raise "ArgumentError" "width after precision" in ("", i, nextarg, mode))
        else
-         let (w, j, na2, m2) = rb_fmt_star env world fmt (i + 1) args nextarg mode "width" in
+         let (w, j, na2, m2) = rb_fmt_star env world fmt (i + 1) args source9 nextarg mode "width" in
          // (a negative width is a left-justified one, and negating INT_MIN
          // does not fit an int: ruby's "width too big", where this padded
          // 2^31 spaces and ran out of stack)
          (if w < 0 && 0 - w > 2147483647 then (let _ = prim_raise "ArgumentError" "width too big" in ("", j, na2, m2))
-          else if w < 0 then rb_fmt_dir env world fmt j args na2 m2 (flags ++ "-") (0 - w) true prec pset pos
-          else rb_fmt_dir env world fmt j args na2 m2 flags w true prec pset pos))
+          else if w < 0 then rb_fmt_dir env world state9 fmt j args source9 na2 m2 (flags ++ "-") (0 - w) true prec pset pos
+          else rb_fmt_dir env world state9 fmt j args source9 na2 m2 flags w true prec pset pos))
     else if str_eq c "." then
       (if pset then (let _ = prim_raise "ArgumentError" "precision given twice" in ("", i, nextarg, mode))
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "*" then
-         let (p, j, na2, m2) = rb_fmt_star env world fmt (i + 2) args nextarg mode "prec" in
-         rb_fmt_dir env world fmt j args na2 m2 flags width wset (if p < 0 then 0 - 1 else p) true pos
+         let (p, j, na2, m2) = rb_fmt_star env world fmt (i + 2) args source9 nextarg mode "prec" in
+         rb_fmt_dir env world state9 fmt j args source9 na2 m2 flags width wset (if p < 0 then 0 - 1 else p) true pos
        else
          let (p, j) = rb_fmt_digits fmt (i + 1) 0 false in
          // a precision that cannot fit an int is ruby's own refusal (the
          // accumulated value has already wrapped, so measure the DIGITS).
          let _ = (if j - (i + 1) > 9 then (let _ = prim_raise "ArgumentError" "prec too big" in ()) else ()) in
-         rb_fmt_dir env world fmt j args nextarg mode flags width wset (if p < 0 then 0 else p) true pos)
+         rb_fmt_dir env world state9 fmt j args source9 nextarg mode flags width wset (if p < 0 then 0 else p) true pos)
     else if rb_fmt_is_type c then
       let (av, na2, m2) =
-        (if pos > 0 then (rb_fmt_posarg args pos, nextarg, mode)
+        (if pos > 0 then (rb_fmt_array_arg args source9 (pos - 1), nextarg, mode)
          else if mode == 2 || mode == 3 then (let _ = prim_raise "ArgumentError" ("unnumbered(" ++ int_to_base (nextarg + 1) 10 ++ ") mixed with numbered") in (VNil, nextarg, mode))
          else if nextarg >= val_list_len args then (let _ = prim_raise "ArgumentError" "too few arguments" in (VNil, nextarg, mode))
-         else (val_nth args nextarg, nextarg + 1, 1)) in
-      (rb_fmt_one env world flags width prec pset c av, i + 1, na2, m2)
+         else (rb_fmt_array_arg args source9 nextarg, nextarg + 1, 1)) in
+      (rb_fmt_one env world state9 flags width prec pset c av, i + 1, na2, m2)
     // `%<name>` may stand anywhere in the spec (`%+15<foo>.5f`): the named
     // value is this directive's argument, and the format is named from here
     // ...and `%-20.5{foo}`: the named value as %s, with what came before it
-    else if str_eq c "\{" && map_has fmt_named_cur "k" then
+    else if str_eq c "\{" && (str_len (vec_get state9 4) > 0) then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" "}" in
-       let _ = prim_raise_enc "ArgumentError" ("named\{" ++ key ++ "} after <" ++ map_get fmt_named_cur "k" ++ ">") (fmt_enc_now ()) in
+       let _ = prim_raise_enc "ArgumentError" ("named\{" ++ key ++ "} after <" ++ vec_get state9 3 ++ ">") (fmt_enc_now state9) in
        ("", j, nextarg, mode))
-    else if str_eq c "<" && map_has fmt_named_cur "k" then
+    else if str_eq c "<" && (str_len (vec_get state9 4) > 0) then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" ">" in
-       let _ = prim_raise_enc "ArgumentError" ("named<" ++ key ++ "> after <" ++ map_get fmt_named_cur "k" ++ ">") (fmt_enc_now ()) in
+       let _ = prim_raise_enc "ArgumentError" ("named<" ++ key ++ "> after <" ++ vec_get state9 3 ++ ">") (fmt_enc_now state9) in
        ("", j, nextarg, mode))
     else if str_eq c "\{" then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" "}" in
-       let m2 = rb_fmt_to_named_k mode "\{" key "}" nextarg in
-       let av = rb_fmt_named_w env world args key "\{" "}" in
-       (rb_fmt_one env world flags width prec pset "s" av, j, nextarg, m2))
+       let m2 = rb_fmt_to_named_k state9 mode "\{" key "}" nextarg in
+       let av = rb_fmt_named_w env world state9 args key "\{" "}" in
+       (rb_fmt_one env world state9 flags width prec pset "s" av, j, nextarg, m2))
     else if str_eq c "<" then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" ">" in
-       let m2 = rb_fmt_to_named_k mode "<" key ">" nextarg in
-       let av = rb_fmt_named_w env world args key "<" ">" in
-       let _ = map_set fmt_named_cur "k" key in
-       let (piece, j2, _, _) = rb_fmt_dir env world fmt j (Cons (av, Nil)) 0 2 flags width wset prec pset 1 in
-       let _ = map_delete fmt_named_cur "k" in
+       let m2 = rb_fmt_to_named_k state9 mode "<" key ">" nextarg in
+       let av = rb_fmt_named_w env world state9 args key "<" ">" in
+       let _ = vec_set state9 3 key in let _ = vec_set state9 4 "on" in
+       let (piece, j2, _, _) = rb_fmt_dir env world state9 fmt j (Cons (av, Nil)) VNil 0 2 flags width wset prec pset 1 in
+       let _ = vec_set state9 4 "" in
        (piece, j2, nextarg, m2))
     // a character that is not a directive is named when it is printable
     else (let o9 = ord c in
           let _ = prim_raise "ArgumentError"
                     (if o9 > 32 && o9 < 127 then "malformed format string - %" ++ c else "malformed format string") in
           ("", i + 1, nextarg, mode))
-and rb_fmt_named = fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
+and rb_fmt_named = fn state9 -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
   (match args with
    | Cons (VHsh h, _) ->
      let xs = hderef h in
      // symbol keys only: ruby does not accept a string key here, and the
      // message quotes the brackets the format used.
      // (the key is a name in the format's encoding: name_u8, note 484)
-     let key9 = VSym (name_u8 key (fmt_enc_now ())) in
+     let key9 = VSym (name_u8 key (fmt_enc_now state9)) in
      if hash_haskey xs key9 then hash_get xs key9
-     else prim_raise_enc "KeyError" ("key" ++ op ++ key ++ cl ++ " not found") (fmt_enc_now ())
+     else prim_raise_enc "KeyError" ("key" ++ op ++ key ++ cl ++ " not found") (fmt_enc_now state9)
    | _ -> prim_raise "ArgumentError" "one hash required")
 
 // A named reference reads the one Hash argument through Hash#[] -- so its
 // default (a value or a block) answers a missing key -- and only a nil
 // answer is the KeyError, which carries the Hash and the key as ruby's does.
-and rb_fmt_named_w = fn env -> fn world -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
+and rb_fmt_named_w = fn env -> fn world -> fn state9 -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
   match args with
   | Cons (VHsh h, _) ->
     (let xs = hderef h in
-     let key9 = VSym (name_u8 key (fmt_enc_now ())) in
+     let key9 = VSym (name_u8 key (fmt_enc_now state9)) in
      if hash_haskey xs key9 then hash_get xs key9
      else
        (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
         match invoke_val_c env world nb (VHsh h) "[]" (Cons (key9, Nil)) false with
         | VNil -> raise_exc_iv world "KeyError" ("key" ++ op ++ key ++ cl ++ " not found")
-                    (Cons (("__key", key9), Cons (("__recv", VHsh h), Cons (("__menc", mkstr (fmt_enc_now ())), Nil))))
+                    (Cons (("__key", key9), Cons (("__recv", VHsh h), Cons (("__menc", mkstr (fmt_enc_now state9)), Nil))))
         | v -> v))
-  | _ -> rb_fmt_named args key op cl
+  | _ -> rb_fmt_named state9 args key op cl
 
 
-// A format argument that is not a String: #to_str, as StringValue asks it.
+// StringValue conversion shared by Kernel's message and command readers.
 and fmt_str_arg = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VStr h -> sget h
@@ -47235,7 +47294,7 @@ and fmt_str_arg = fn env -> fn world -> fn (v: Val) ->
 // sequential argument, `*3$` a numbered one. Digits NOT followed by '$' are
 // left unconsumed -- ruby re-reads them after the star, so `%*5s` is a
 // width-given-twice error, not width 5.
-and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (nextarg: int) -> fn (mode: int) -> fn (what: str) ->
+and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (source9: Val) -> fn (nextarg: int) -> fn (mode: int) -> fn (what: str) ->
   let n = str_len fmt in
   let (k, j) = rb_fmt_digits fmt i 0 false in
   // (an argument index that cannot fit an int is ruby's "width too big" /
@@ -47245,11 +47304,11 @@ and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args
   else if k >= 0 && j < n && str_eq (char_at fmt j) "$" then
     (if k <= 0 then (let _ = prim_raise "ArgumentError" "invalid index - 0$" in (0, j + 1, nextarg, mode))
      else if mode == 1 || mode == 3 then (let _ = prim_raise "ArgumentError" ("numbered(" ++ int_to_base k 10 ++ "$) after unnumbered(%)") in (0, j + 1, nextarg, mode))
-     else (rb_fmt_int env world (rb_fmt_posarg args k), j + 1, nextarg, 2))
+     else (rb_fmt_int env world (rb_fmt_array_arg args source9 (k - 1)), j + 1, nextarg, 2))
   else
     (if mode == 2 || mode == 3 then (let _ = prim_raise "ArgumentError" ("unnumbered(" ++ int_to_base (nextarg + 1) 10 ++ ") mixed with numbered") in (0, i, nextarg, mode))
      else if nextarg >= val_list_len args then (let _ = prim_raise "ArgumentError" "too few arguments" in (0, i, nextarg, mode))
-     else (rb_fmt_int env world (val_nth args nextarg), i, nextarg + 1, 1))
+     else (rb_fmt_int env world (rb_fmt_array_arg args source9 nextarg), i, nextarg + 1, 1))
 
 
 // the encoding of a format's result: the format string's, negotiated with
@@ -47259,16 +47318,16 @@ and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args
 // "no, wrap me") is the whole argument list; any other value is one argument.
 and rb_fmt_args = fn env -> fn world -> fn (vb: Val) ->
   match vb with
-  | VArr id -> deref id
+  | VArr id -> (VArr id, deref id)
   | VObj _ ->
     (if responds world vb "to_ary" then
        (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
         match invoke_val_c env world nb vb "to_ary" Nil false with
-        | VArr id -> deref id
-        | VNil -> Cons (vb, Nil)
-        | other -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name vb ++ " to Array (" ++ class_name vb ++ "#to_ary gives " ++ class_name other ++ ")") in Cons (vb, Nil)))
-     else Cons (vb, Nil))
-  | _ -> Cons (vb, Nil)
+        | VArr id -> (VArr id, deref id)
+        | VNil -> (VNil, Cons (vb, Nil))
+        | other -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name vb ++ " to Array (" ++ class_name vb ++ "#to_ary gives " ++ class_name other ++ ")") in (VNil, Cons (vb, Nil))))
+     else (VNil, Cons (vb, Nil)))
+  | _ -> (VNil, Cons (vb, Nil))
 
 // the name inside %{...} / %<...>, and the index just past its closing brace.
 
@@ -47991,7 +48050,7 @@ and rb_fmt_flt = fn env -> fn world -> fn (v: Val) ->
 // `alt` is the `#` flag: keep the trailing zeros and the decimal point that
 // %g otherwise strips (`format("%#g", 1.0)` is "1.00000").
 
-and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (pset: bool) -> fn (typ: str) -> fn (av: Val) ->
+and rb_fmt_one = fn env -> fn world -> fn state9 -> fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (pset: bool) -> fn (typ: str) -> fn (av: Val) ->
   if str_eq typ "d" || str_eq typ "i" || str_eq typ "u" then
     let (neg, ds) =
       (match rb_fmt_int_v env world av with
@@ -48041,6 +48100,7 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     // for BINARY (`"%10s" % "\xc2\xa1".b` is eight spaces), EUC-JP's
     // characters for EUC-JP; they were UTF-8's for every string
     let se = (if str_eq se0 "" then "UTF-8" else se0) in
+    let _ = rb_fmt_take state9 s0 se in
     if str_eq se "UTF-8" || (if enc_ascii_compat se then false else true) then
       (let s = (if pset && prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
        rb_pad_str s flags width)
@@ -48051,7 +48111,26 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
        else if str_contains flags "-" then s ++ str_repeat " " (width - len9)
        else str_repeat " " (width - len9) ++ s)
   else if str_eq typ "p" then
-    let s0 = inspect_w env world av in
+    let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+    let inspected9 = invoke_val_c env world nb9 av "inspect" Nil false in
+    let (text9, source_encoding9) = dstr_conv env world nb9 inspected9 in
+    let (s0, encoding9) =
+        (let enc9 = enc_canon_name source_encoding9 in
+         if (if str_eq enc9 (insp_resenc ()) then false else true)
+            && (if enc_ascii_compat enc9 && enc_all7 text9 then false else true)
+         then
+           (let escaped9 = (if str_eq enc9 "ASCII-8BIT" then
+              (let buffer9 = strbuf_new () in
+               let rec bytes9 = fn (index9: int) ->
+                 (if index9 >= str_len text9 then strbuf_to_str buffer9
+                  else (let byte9 = ord (char_at text9 index9) in
+                        let _ = strbuf_push buffer9
+                          (if byte9 < 128 then chr byte9 else chr 92 ++ "x" ++ hex2 byte9) in
+                        bytes9 (index9 + 1))) in bytes9 0)
+              else enc_escape_txt enc9 text9) in
+            (escaped9, "US-ASCII"))
+         else (text9, enc9)) in
+    let _ = rb_fmt_take state9 s0 encoding9 in
     let s = (if pset && prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
     rb_pad_str s flags width
   else if str_eq typ "c" then
@@ -48064,6 +48143,7 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     // (the first CHARACTER of the string's own encoding: "%c" % sjis("あい")
     //  is the two bytes of あ, not the one byte UTF-8 would read off)
     let first_ch = fn (s0: str) -> fn (e0: str) ->
+      let _ = rb_fmt_take state9 s0 e0 in
       (if str_len s0 == 0 then ""
        else (let e9 = enc_canon_name e0 in
              if str_eq e9 "" || enc_utf8_family e9 || (if enc_ascii_compat e9 then false else true) then utf8_substr s0 0 1
@@ -48073,7 +48153,7 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     // calls more "out of char range", the byte-oriented encodings take the
     // character's bytes (0xA4A2 in EUC-JP), and what is no character at all is
     // "invalid character". Every codepoint was written as UTF-8.
-    let fe9 = (if map_has fmt_enc_cur "v" then map_get fmt_enc_cur "v" else "UTF-8") in
+    let fe9 = vec_get state9 0 in
     let cp_ch = fn (cp: int) ->
       (if cp < 0 then (let _ = prim_raise "ArgumentError" "invalid character" in "")
        else if str_eq fe9 "US-ASCII" || str_eq fe9 "ASCII-8BIT" then
@@ -50638,11 +50718,10 @@ and ecall_args = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val
     // String form existed, so `printf(io, "%d", 1)` printed nothing anywhere.
     else if (str_len name == 6 && str_eq name "printf") && (if kernel_overridden env world "printf" then false else true) then
       (let _ = (match args with
-                | Cons (VStr h, rest) -> out_emit world (rb_format env world (sget h) rest)
+                | Cons (VStr h, rest) -> out_emit world (rb_format env world (VStr h) rest VNil)
                 | Cons (io9, Cons (f9, rest9)) ->
-                  (let fs9 = fmt_str_arg env world f9 in
-                   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                   let _ = invoke_val_c env world nb9 io9 "write" (Cons (mkstr (rb_format env world fs9 rest9), Nil)) false in ())
+                  (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                   let _ = invoke_val_c env world nb9 io9 "write" (Cons (mkstr (rb_format env world f9 rest9 VNil), Nil)) false in ())
                 | Cons (_, Nil) -> (let _ = raise_exc world "ArgumentError" "too few arguments" in ())
                 | Nil -> ()) in VNil)
     // Kernel#format / #sprintf: sprintf-style formatting. A format that is not
@@ -50655,10 +50734,10 @@ and ecall_args = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val
               | Nil -> Nil) with
        | Cons (VStr h, rest) ->
          let _ = fmt_ascii_guard world (senc_get h) in
-         let out = rb_format_in env world (senc_get h) (sget h) rest in
+         let (out, converted9) = rb_format_in env world (senc_get h) (sget h) rest VNil in
          // (a US-ASCII result that came out holding a byte past 127 -- `%c`
          //  of 0x80 -- is BINARY, as ruby makes it)
-         let renc = (let r9 = rb_fmt_enc (senc_get h) (sget h) rest in
+         let renc = (let r9 = converted9 in
                      if str_eq r9 "US-ASCII" && (if str_ascii_only out 0 then false else true) then "ASCII-8BIT" else r9) in
          let r = mkstr out in
          (match r with VStr rid -> (let _ = senc_set rid renc in r) | _ -> r)
