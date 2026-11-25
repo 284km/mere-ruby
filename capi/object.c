@@ -163,9 +163,18 @@ void rb_attr(VALUE klass, ID id, int read, int write, int ex) {
     if (read) mr_call(klass, "attr_reader", 1, ID2SYM(id));
     if (write) mr_call(klass, "attr_writer", 1, ID2SYM(id));
 }
-void rb_include_module(VALUE klass, VALUE module) { mr_call(klass, "include", 1, module); }
-void rb_prepend_module(VALUE klass, VALUE module) { mr_call(klass, "prepend", 1, module); }
-void rb_extend_object(VALUE obj, VALUE module) { mr_callk(obj, "extend", 1, module); }
+void rb_include_module(VALUE klass, VALUE module) {
+    if (mr_without("builtin")) mr_call(klass, "include", 1, module);
+    else mr_up(MR_MIXIN, klass, module, 0, 0, 0);
+}
+void rb_prepend_module(VALUE klass, VALUE module) {
+    if (mr_without("builtin")) mr_call(klass, "prepend", 1, module);
+    else mr_up(MR_MIXIN, klass, module, 1, 0, 0);
+}
+void rb_extend_object(VALUE obj, VALUE module) {
+    if (mr_without("builtin")) mr_callk(obj, "extend", 1, module);
+    else mr_up(MR_MIXIN, obj, module, 2, 0, 0);
+}
 VALUE rb_singleton_class(VALUE obj) { return mr_callk(obj, "singleton_class", 0); }
 
 /* ---- constants and variables --------------------------------------------- */

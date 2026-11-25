@@ -207,7 +207,7 @@ static const char *dmark_refusal(int op, VALUE b, VALUE flags) {
         [MR_DEFINE_GVAR] = "a global variable definition", [MR_RX_DEPTH] = "the Regexp depth",
         [MR_RAT_RAW] = "a Rational allocation", [MR_NOTIMPL] = "rb_f_notimplement",
         [MR_SYM_STATE] = "a Symbol's state", [MR_IVAR_READ] = "an ivar read",
-        [MR_SAFEPOINT] = "a safepoint" };
+        [MR_SAFEPOINT] = "a safepoint", [MR_MIXIN] = "native module insertion" };
     const char *tail = "only a header, a String, an Array and an ivar can be read then";
     if (op == MR_SEND) {
         long len = 0;

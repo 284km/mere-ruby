@@ -67,7 +67,8 @@ enum mr_op {
     MR_SYM_STATE = 31,  /* a: String or Symbol -> 0 not a Symbol, 1 a dynamic one, 2 pinned down */
     MR_IVAR_READ = 32,  /* a: an object; text: an ivar's name -> its value, read from the table with no
                          * dispatch -- the collector's reader only (a dmark between C calls) */
-    MR_SAFEPOINT = 33   /* (nothing) -- a collection may run here, when one is due (mr_up) */
+    MR_SAFEPOINT = 33,  /* (nothing) -- a collection may run here, when one is due (mr_up) */
+    MR_MIXIN = 34      /* a: target, b: module, c: 0 include, 1 prepend, 2 extend; no Ruby hooks */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
     /* (16: the receiver is the current one)
