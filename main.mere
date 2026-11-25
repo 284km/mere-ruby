@@ -74572,11 +74572,24 @@ and rxc_null_any = fn (xs: RNode list) ->
 // differing fixed lengths (`(?<=\A|/)` is width 0 or 1). Compute the range
 // and let the matcher try each start; -1 still means unbounded, which no
 // engine can walk backwards.
+// Multibyte literal atoms are emitted as a sequence of byte nodes. Their
+// instruction count is not their character width in a lookbehind.
+and rxc_mb_atom = fn (xs: RNode list) ->
+  match xs with
+  | Cons (NChar c, _) when str_len c == 1 && ord c >= 128 ->
+    (let rec bytes = fn (ys: RNode list) -> fn (acc: str) ->
+       (match ys with
+        | Nil -> acc
+        | Cons (NChar b, t) when str_len b == 1 && str_len acc < 4 -> bytes t (acc ++ b)
+        | _ -> "") in
+     let s9 = bytes xs "" in
+     str_len s9 > 1 && (if vec_get rxp_u8 0 == 1 then utf8_clen s9 0 else cut_clen s9 0) == str_len s9)
+  | _ -> false
 and rxc_wmin = fn (n: RNode) ->
   match n with
   | NChar _ -> 1 | NCharCI _ -> 1 | NAny -> 1 | NAnyNL -> 1 | NClass (_, _, _) -> 1
   | NGrapheme -> 1
-  | NSeq xs -> rxc_wmin_sum xs
+  | NSeq xs -> (if rxc_mb_atom xs then 1 else rxc_wmin_sum xs)
   | NAlt xs -> rxc_wmin_alt xs
   | NRep (b, lo, _, _) -> (let w = rxc_wmin b in if w < 0 then 0 - 1 else w * lo)
   | NGroup (b, _, _) -> rxc_wmin b
@@ -74599,7 +74612,7 @@ and rxc_wmax = fn (n: RNode) ->
   | NChar _ -> 1 | NCharCI _ -> 1 | NAny -> 1 | NAnyNL -> 1 | NClass (_, _, _) -> 1
   // a cluster is any number of characters: unbounded, like a backreference
   | NGrapheme -> 0 - 1
-  | NSeq xs -> rxc_wmax_sum xs
+  | NSeq xs -> (if rxc_mb_atom xs then 1 else rxc_wmax_sum xs)
   | NAlt xs -> rxc_wmax_alt xs
   | NRep (b, _, hi, _) -> (let w = rxc_wmax b in if w < 0 || hi < 0 then 0 - 1 else w * hi)
   | NGroup (b, _, _) -> rxc_wmax b
@@ -74617,6 +74630,11 @@ and rxc_wmax_alt = fn (xs: RNode list) ->
   | Nil -> 0
   | Cons (h, Nil) -> rxc_wmax h
   | Cons (h, t) -> (let w = rxc_wmax h in let r = rxc_wmax_alt t in if w < 0 || r < 0 then 0 - 1 else (if w > r then w else r))
+
+// Keep top-level lookbehind alternatives in pattern order and let the
+// outer matcher backtrack between them, including their capture states.
+and rxc_lookb_alts = fn (xs: RNode list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> Cons (NLookB (h, false), rxc_lookb_alts t)
 
 and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
   match n with
@@ -74697,6 +74715,9 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
      let _ = map_set prog pc (IJmp (pc2 + 1)) in
      let _ = map_set prog (pc2 + 1) (ILook (subpc, negd)) in
      pc2 + 2)
+  // Keep the shared trial range when calls or capture state affect an arm.
+  | NLookB (NAlt xs, false) when rxq_plain (NAlt xs) ->
+    rxc_emit prog pc (NAlt (rxc_lookb_alts xs))
   | NLookB (b, negd) ->
     (let wlo = rxc_wmin b in
      let whi = rxc_wmax b in
@@ -75765,20 +75786,46 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (base:
        if negd then rxv_run prog s (pc + 1) i base else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
   | IMeta (_, _) -> (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
 
-// a lookbehind body that ends exactly at `i`, starting anywhere between
-// i-whi and i-wlo (longest first, as ruby prefers).
+// Widths are characters, while VM positions are bytes. Find the longest
+// available start once, then advance by whole characters for shorter trials.
 and rxv_lookb_try = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
                    fn (wlo: int) -> fn (whi: int) ->
   if whi < wlo then RFail
-  else if i - whi < 0 then rxv_lookb_try prog s sub i wlo (whi - 1)
+  else if whi == 0 then rxv_lookb_from prog s sub i wlo i 0
+  else
+    (let k9 = vec_get cut_k 0 in
+     let (p9, n9) = (if k9 == 0 then (let n9 = (if i < whi then i else whi) in (i - n9, n9))
+                     else if k9 == 1 then rxv_lb_utf8_start s i whi 0
+                     else rxv_lb_enc_start s i whi 0 0) in
+     rxv_lookb_from prog s sub i wlo p9 n9)
+and rxv_lb_utf8_head = fn (s: str) -> fn (p: int) ->
+  if p <= 0 then 0
+  else (let b9 = ord (char_at s p) in
+        if b9 >= 128 && b9 < 192 then rxv_lb_utf8_head s (p - 1) else p)
+and rxv_lb_utf8_start = fn (s: str) -> fn (p: int) -> fn (n: int) -> fn (taken: int) ->
+  if n <= 0 || p <= 0 then (p, taken)
+  else rxv_lb_utf8_start s (rxv_lb_utf8_head s (p - 1)) (n - 1) (taken + 1)
+// Legacy multibyte encodings can have ASCII trail bytes. Two cursors from
+// a known boundary avoid guessing a lead byte and allocate no prefix copy.
+and rxv_lb_enc_start = fn (s: str) -> fn (finish: int) -> fn (n: int) -> fn (lead: int) -> fn (taken: int) ->
+  if n <= 0 then rxv_lb_enc_slide s finish lead 0 taken
+  else if lead >= finish then (0, taken)
+  else rxv_lb_enc_start s finish (n - 1) (lead + cut_clen s lead) (taken + 1)
+and rxv_lb_enc_slide = fn (s: str) -> fn (finish: int) -> fn (lead: int) -> fn (lag: int) -> fn (taken: int) ->
+  if lead >= finish then (lag, taken)
+  else rxv_lb_enc_slide s finish (lead + cut_clen s lead) (lag + cut_clen s lag) taken
+and rxv_lookb_from = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
+                    fn (wlo: int) -> fn (p: int) -> fn (n: int) ->
+  if n < wlo then RFail
   else
     (let prev = (if map_has rxv_lb_end "e" then map_get rxv_lb_end "e" else 0 - 1) in
      let _ = map_set rxv_lb_end "e" i in
-     let r = rxv_inner prog s sub (i - whi) in
+     let r = rxv_inner prog s sub p in
      let _ = map_set rxv_lb_end "e" prev in
      match r with
      | RFound (e, sv2) -> RFound (e, sv2)
-     | RFail -> rxv_lookb_try prog s sub i wlo (whi - 1))
+     | RFail -> if n == 0 then RFail
+                else rxv_lookb_from prog s sub i wlo (p + cut_clen s p) (n - 1))
 
 
 // does [i, e) of s contain a match of the sub-program? (the subject cut at e,
