@@ -248,3 +248,16 @@ int mr_recvmsg_flags(int unused) {
     return 0;
 #endif
 }
+
+/* accept(2) with its errno, which the runtime's tcp_accept folds into three
+ * codes: the descriptor, or -errno. EINTR is asked again, as ruby does. A
+ * nonblocking accept must tell EAGAIN and ECONNABORTED (the connection went
+ * before it was taken: WaitReadable in ruby) from EMFILE or EBADF (an
+ * error), and a blocking one waits again only for the first. */
+int mr_sock_accept(int fd) {
+    for (;;) {
+        int c = accept(fd, NULL, NULL);
+        if (c >= 0) return c;
+        if (errno != EINTR) return -errno;
+    }
+}
