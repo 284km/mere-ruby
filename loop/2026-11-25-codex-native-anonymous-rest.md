@@ -66,8 +66,14 @@ it in GC churn accounting and compaction. Its only reader finishes during
 marking; no borrowed entry survives into compaction. The regression first
 accumulates deleted roots with automatic GC disabled, then collects while
 an ephemeral conversion source is held, exercising compaction with a live
-root as well as marking. This reclaims real
-bookkeeping storage without changing Ruby allocation counts.
+root as well as marking. The callback scope also owns its native
+closure and temporary root value in a region; copies cannot accumulate in the
+caller's long-lived region after the scope returns. Only the converted
+Proc/value and its origin kind cross that region; assemble the block
+environment outside. Preserve Symbol conversion and direct-versus-converted
+Proc origin exactly. This reclaims real bookkeeping storage without changing
+Ruby allocation counts.
+
 CRuby compile.c setup_args_dup_rest_p distinguishes a simple block variable
 from a complex expression that can modify its splat. Preserve the source
 through simple-variable to_proc, but snapshot native argument storage before
@@ -81,15 +87,16 @@ call receives counting-only work.
 
 ## Regression and measurement
 
-Corpus 991 has 56 output lines covering the exact review reproduction,
+Corpus 991 has 61 output lines covering the exact review reproduction,
 direct/explicit/frozen/nil/converted splats, deep shareability, source aliasing
 across GC, leading/optional/post parameters, repeated splats, local/Binding
 collisions, reflection, large arguments, native boundaries, empty super,
 keyword append, block conversion mutation, exceptions and ephemeral roots.
-All 56 match clean Ruby 4.0.10 on both engines with GC stress 50, including
-the live-root compaction regression, with empty stderr. The GC root,
-duplicate-definition and dead-definition gates pass on this candidate.
-Final-head normal replay, corpus 664, hardware profiles, isolated allocation
+The final 61-line candidate also checks converted Proc identity, lambda
+behavior, fresh captured locals after GC, and scoped/snapshot Symbol blocks.
+All 61 match clean Ruby 4.0.10 on both engines, normally and under GC stress
+50, with empty stderr. GC-root, duplicate-definition and dead-definition
+gates pass. Final-head corpus 664, hardware profiles, isolated allocation
 file and full corpus/gate results are required before the batched push.
 
 Measure all 76 ruby/test_allocation.rb cases alone on each engine, without

@@ -190,3 +190,31 @@ p [:conversion_source_survives_gc, gc_capture.call.map(&:value)]
 
 def anonymous_short_slot_user(__ar, *) = [__ar, anonymous_collect(*)]
 p [:short_slot_local_collision, anonymous_short_slot_user(:user, 1, 2)]
+
+# Coercion keeps the exact converted Proc when its temporary scope ends.
+def anonymous_block_identity(*, &block) = [anonymous_collect(*), block]
+identity_proc = ->(value) { value + 1 }
+identity_conversion = Object.new
+identity_conversion.define_singleton_method(:to_proc) { identity_proc }
+identity_args, identity_block = anonymous_block_identity(*input, &identity_conversion)
+GC.start
+p [:scoped_block_identity, identity_args, identity_block.equal?(identity_proc), identity_block.lambda?, identity_block.call(4)]
+plain_args, plain_block = anonymous_block_identity(3, &identity_conversion)
+p [:plain_block_identity, plain_args, plain_block.equal?(identity_proc), plain_block.lambda?, plain_block.call(5)]
+
+class AnonymousFreshBlock
+  def to_proc
+    retained = :fresh_value
+    -> { retained }
+  end
+end
+fresh_args, fresh_block = anonymous_block_identity(*[7], &AnonymousFreshBlock.new)
+GC.start
+p [:fresh_converted_block, fresh_args, fresh_block.lambda?, fresh_block.call]
+
+symbol_conversion = :itself
+symbol_args, symbol_block = anonymous_block_identity(*[8], &symbol_conversion)
+p [:scoped_symbol_block, symbol_args, symbol_block.call(9), symbol_block.equal?(:itself.to_proc)]
+symbol_source = [10]
+snapshot_args, snapshot_block = anonymous_block_identity(*symbol_source, &(symbol_source << 11; :itself))
+p [:snapshot_symbol_block, snapshot_args, symbol_source, snapshot_block.call(12)]
