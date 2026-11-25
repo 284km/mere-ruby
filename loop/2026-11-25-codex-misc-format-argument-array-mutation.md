@@ -21,13 +21,11 @@ with `--seed=1` and `MERE_RUBY_GC_TIGHT=1`. Max RSS below is in bytes from
 | --- | --- | --- | ---: | ---: | ---: | ---: |
 | ruby/test_sprintf.rb | 7 tests, 59 assertions, 1 failures, 0 errors, 0 skips | 7 tests, 60 assertions, 0 failures, 0 errors, 0 skips | 163889152 | 164921344 | 162840576 | 164888576 |
 
-## Acceptance still running
+## Initial acceptance history
 
-Full `run_corpus.sh --both` and `MERE_RUBY_VM=1 run_corpus.sh --both`
-sweeps, their source gates, bracket-depth checks and record_hygiene are
-queued. Results will be recorded after completion. The checks above are
-not a full-corpus claim. No full unit suite or Rails component suite was
-run and no workflow is changed.
+The initial focused selections passed but review exposed the stale-encoding
+regression described below. The final corrected O2 source was rebuilt and
+its focused and complete acceptance runs were repeated.
 
 ## Review correction: live values and result encoding
 
@@ -53,5 +51,15 @@ with --seed=1 and MERE_RUBY_GC_TIGHT=1, one file at a time:
 | VM | 7 tests / 59 assertions / 1 failure | 7 / 60 / 0 failures | 165609472 | 163708928 |
 
 The clean reference passes 7 tests / 60 assertions. The corrected O2 full
-`run_corpus.sh --both` and `MERE_RUBY_VM=1 run_corpus.sh --both` are running;
-source gates and full record_hygiene are part of those commands.
+`run_corpus.sh --both` and `MERE_RUBY_VM=1 run_corpus.sh --both` each pass
+884/884 programs with the hash index ON and OFF. Both commands pass all
+source gates and full record_hygiene.
+
+## Completed acceptance
+
+The final source correction is 3608af46. Both complete 884/884 sweeps
+include all new encoding/mutation regressions; no program is excluded.
+The generated C passes the bracket-depth gate, and this record is checked
+explicitly with record_hygiene. The English inline review reply records
+the correction and the new regression cases. No full unit suite or Rails
+component suite was run, and no workflow is changed.
