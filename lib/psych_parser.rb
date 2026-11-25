@@ -115,7 +115,14 @@ module Psych
           __node(-1)
         end
         token = __peek
-        __error("did not find expected <document start>") unless [:eof, :document, :end_document].include?(token[0])
+        unless [:eof, :document, :end_document].include?(token[0])
+          # libyaml ends the document (implicitly) before it looks for the
+          # start of the next one, so a handler has this document whole --
+          # Psych.parse returns from its block there -- and only then is what
+          # follows it an error.
+          __event(:end_document, [true], token[2], token[2])
+          __error("did not find expected <document start>")
+        end
         explicit_end = token[0] == :end_document
         end_start = token[2]
         end_finish = explicit_end ? __take[3] : end_start
