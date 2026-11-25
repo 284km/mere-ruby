@@ -496,3 +496,9 @@ puma's 2 s worker check-in):
   against 0.27 s). Main's build has no MiniSSL at all (no OpenSSL directory
   in its RbConfig), so the first is not run there.
 - test_horrible_queries (excluded): bounded memory now, quadratic time.
+
+Checks on this build (b95ccc97 + the two fixes, built with mere-wt-9dec):
+`run_corpus.sh --both` -- the gates, then 887/887 with the hash index on
+and off; `tools/iseq/vm_corpus.sh` -- 887 on the VM, 0 fell back, 0 FAIL.
+capi_check, capi_spec_check, capi_mkmf_check, puma's full integration run
+and the gem check are still to be run on it, after asking.
