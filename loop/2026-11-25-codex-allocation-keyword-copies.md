@@ -262,3 +262,12 @@ Use consecutive empty keyword merges instead; validate syntax with the clean
 reference before replay. No runtime comparison from that failed attempt is
 acceptance evidence. The successful O2 runtime build is reusable after
 verifying that this correction changes only the corpus and this record.
+
+The focused empty-merge cases identify the parser's distinct representation:
+arr_hash_items wraps an EHsh in EKwSplat, whereas call/index keyword fields
+use EKwHash. The first correction reached only the latter. Handle EKwSplat
+explicitly in the value walker: evaluate its value once, omit an empty Hash
+and retain a nonempty value without publishing call origin or copying it as
+a call packet. Restore ordinary EKwHash value evaluation through EHsh.
+The additional cases remain 113 reference lines and cover side-effectful
+conversion once. The prior focused failures are not acceptance results.
