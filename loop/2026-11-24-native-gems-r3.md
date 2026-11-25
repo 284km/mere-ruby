@@ -387,10 +387,9 @@ were not the trap fix itself but two things it uncovered:
   thread joining the server thread -- the trap never ran: the master logged
   "Promoting worker N to mold" and the worker never became one. sig_poll
   now wakes the main thread the same way when it waits in a wait a trap
-  may run in the middle of (a sleep, a join, a queue). Repro (corpus case
-  drafted, number to be asked): a thread busy in `n += 1 until $stop`, the
+  may run in the middle of (a sleep, a join, a queue). Repro: a thread busy in `n += 1 until $stop`, the
   main thread joining it, USR2 from outside -- ruby 4.0.10 runs the trap
-  on the main thread; this hung.
+  on the main thread; this hung. corpus 916.
 - **accept(2) on a listener another process accepts on.** A cluster's
   workers all accept on one listener; readiness says a connection waits,
   another worker takes it, and accept(2) says EAGAIN -- or ECONNABORTED for
@@ -402,10 +401,10 @@ were not the trap fix itself but two things it uncovered:
   EAGAIN/EWOULDBLOCK is IO::EAGAINWaitReadable and ECONNABORTED/EPROTO the
   Errno with IO::WaitReadable (`exception: false`: :wait_readable);
   blocking, EAGAIN waits again; anything else is its Errno. TCPServer,
-  UNIXServer and Socket. Repro (drafted, number to be asked): a connection
+  UNIXServer and Socket. Repro: a connection
   taken by a forked process, then accept_nonblock and a blocking accept;
-  and three forked processes accepting 200 connections on one listener,
-  which hung here.
+  and three forked processes accepting 120 connections on one listener,
+  which hung here. corpus 917.
 
 With both, the mold_worker group (13 tests) went from 6 failures to 3 on
 mere-ruby, measured at a load average of 36 to 53 on this 10-core machine
@@ -420,3 +419,80 @@ Still open in the group:
   differs from ruby (checked by hand), so the cause is not found yet.
 - test_mold_worker_refork_does_not_leak_file_descriptors: 19 descriptors
   in a reforked worker against 17. Not investigated yet.
+
+### Before and after, against main's build
+
+main 2e402b94 built in a spare worktree with the same compiler
+(mere-wt-9dec), and the two corpus cases run on ruby 4.0.10, main's build
+and this branch's, each bounded at 20 s (`perl -e 'alarm 20; exec @ARGV'`;
+exit 142 is that bound):
+
+| case | ruby 4.0.10 | main 2e402b94 | this branch |
+|---|---|---|---|
+| 916 busy-thread trap | `true`, `[true]` | no output, exit 142 | `true`, `[true]` |
+| 917 accept errno | 4 lines, `120`, `[]` | the first 4 lines, then exit 142 in the three-process race | the same 6 lines as ruby |
+
+On main, 917's single-process part already matched: there the listener is
+no longer ready when the other process has taken the connection, and the
+old readiness check answered EAGAIN. The race is what main gets wrong: a
+connection taken between readiness and accept(2) went to the blocking
+accept, which waited for the next connection, and the children never
+reported.
+
+### test_integration_cluster in groups, on three builds
+
+Each group alone, one build at a time: ruby 4.0.10, this branch, and main
+2e402b94 built with the same compiler, with a GEM_HOME and puma tree of
+its own (puma's extension built by main's own mkmf, so without MiniSSL:
+main's RbConfig says no OpenSSL directory). The load average was 25 to 45
+throughout (once 140), from other sessions; every failure below that hit a
+time limit is listed apart from the others.
+
+| group (tests) | ruby 4.0.10 | this branch | main 2e402b94 |
+|---|---|---|---|
+| mold_worker (13) | 0 | 3 F | 5 F |
+| fork_worker (14) | 0 | 4 F, 1 E | runner ends in test_fork_worker_coalesces_pending_reforks (twice); the other 13: 3 F, 1 E |
+| prune_bundler, load_path, not_required (7) | 0 | 7 F | 7 F |
+| the rest, half 1 (22) | 0 | 1 E | 2 E |
+| the rest, half 2 (21) | 0 | 0 | 1 F |
+
+"Listen loop: SocketError accept failed" lines: 50 in main's mold_worker
+group, 0 on this branch. test_thread_log passes on this branch.
+
+## Left
+
+Each with its cause and main's build on the same test (above).
+
+Failures that are not time limits:
+- **prune_bundler (cluster 7, pumactl 1, preserve_bundler_env 3).**
+  puma-wild cannot `require 'rubygems'` once Bundler.with_unbundled_env
+  removes the reference stdlib from RUBYLIB, which is how this harness
+  gives mere-ruby its stdlib. Main: the same 7 of 7 in the cluster group.
+  What it takes: a mere-ruby installed with its stdlib at its rubylibdir.
+- **test_mold_worker_refork_does_not_leak_file_descriptors**: a reforked
+  worker has 19 descriptors open, ruby's 17. Main: the same (19 against 17).
+  Not investigated.
+
+Failures at a time limit (a log line not seen in time, TestTookTooLong, or
+puma's 2 s worker check-in):
+- mold_worker: refork_replaces_workers_forked_by_previous_mold (phase 2 not
+  booted; main the same), reforks_at_each_threshold (phase 1; main the same).
+  Both logs show "Out-of-sync worker list" for the worker just TERMed; cause
+  not found.
+- fork_worker: phased_restart_with_fork_worker_worker_order and
+  refork_phased_restart_with_fork_worker_and_high_worker_count ("Worker N
+  failed to check in within 2 seconds"), fork_worker_refork_waits_for_all_workers_after_worker_dies
+  ("cluster ready" not logged): main fails all three the same way.
+  phased_restart_with_fork_worker_and_high_worker_count (TestTookTooLong
+  here; main failed it once and passed it once) and
+  fork_worker_phased_restart_does_not_wait_for_check_interval (failed once
+  and passed once here; main passed twice) are flaky at this load.
+- hot_restart_does_not_drop_connections (cluster): TestTookTooLong; main
+  errs on it and on its _threads variant.
+- test_integration_single's hot_restart_does_not_drop_connections_threads:
+  from the full run before the pause; not rerun on main's build yet.
+- Unit: test_write_nonblock_retry_delivers_data_once (16 MiB through
+  MiniSSL, quadratic here; see above) and RackUp#test_bin (boot takes 2.7 s
+  against 0.27 s). Main's build has no MiniSSL at all (no OpenSSL directory
+  in its RbConfig), so the first is not run there.
+- test_horrible_queries (excluded): bounded memory now, quadratic time.
