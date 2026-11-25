@@ -255,3 +255,10 @@ are COMPLETE on every sample, main 8 MATCH/68 RED and head 14/62. The full
 corpus finding prevents accepting that head; final source needs a fresh
 focused replay, relevant whole files, controlled allocation/RSS, source gates
 and complete corpus/VM acceptance before the batched push.
+
+The first empty-merge focused attempt stopped at reference parsing because
+the new test incorrectly placed a positional element after a keyword merge.
+Use consecutive empty keyword merges instead; validate syntax with the clean
+reference before replay. No runtime comparison from that failed attempt is
+acceptance evidence. The successful O2 runtime build is reusable after
+verifying that this correction changes only the corpus and this record.
