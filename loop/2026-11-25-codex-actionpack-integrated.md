@@ -270,3 +270,38 @@ measurement of this merge.
 
 Portable evidence: unittest/records/actionpack-review-main-integration.json
 and framework record actionpack-review-merged-focused.json.
+
+## Integration after accepted re-review
+
+Review 6052328586 of d444bcd6 independently confirmed all seven earlier
+findings resolved on evaluator and VM against Ruby 4.0.10. The remaining
+blocker was main's newly merged StringScanner native append arm conflicting
+with this branch's retained Hash values_at arm in bi_meth_call.
+
+Merge 3064b6d3 pins main 5276535f, including #255, #247 and #262. Both arms
+remain: String#<< mutates its retained bound receiver; Hash#values_at uses
+hash_values_at_native. They match different receiver types. The ordinary O2
+build uses the same pinned compiler, with no other manual runtime change.
+
+Full corpus: 934/934 ON/OFF, 847.131 s, 1,174,928 KiB peak
+family RSS. VM: 934 VM / 0 fallback / 0 differences, 216.872 s,
+1,202,048 KiB. Eight prefix source gates, default hygiene and the
+155-of-1024 bracket gate pass. All 27 framework harness controls pass.
+All 24 focused executions match, including 940 and 1007 for the two arms
+and imported main regressions, on evaluator and VM.
+
+The three requested Action Pack files (helper, TestResponse and Inspector)
+remain 60 MATCH / 0 RED, both sides COMPLETE, all other verdicts and order
+differences zero. The explicit framework-bootstrap strict gate passes.
+Seed 12345, jobs 2 and 600 s / 2 GiB bounds are unchanged. Native gems are
+explicitly reused from the fresh 8624fb60 install; both binary digests are
+recorded. Per-file RSS is retained in the new focused record. The earlier
+repeated performance samples retain their original runtime identities.
+
+As requested in the accepted re-review, no new 173-file run is needed; the
+original frozen 8624fb60 all-file cohort remains separate. Nonblocking
+follow-ups are frozen Array delete misses, a 2-4-file compact node-index
+cache and trailing-comment eval framing. None is folded into this merge.
+
+Portable evidence: unittest/records/actionpack-main255-integration.json and
+framework record actionpack-main255-focused.json.
