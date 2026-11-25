@@ -51,3 +51,45 @@ do not allocate a dummy Array just to match them. Keyword packets and
 keyword-rest copies are separate causes. Generic forwarding uses the same
 lifetime principle in its independent change; integrate the shared native
 readers without weakening either regression corpus.
+
+## Review: captured rest isolation and borrowed Array provenance
+
+The private anonymous name contains a tilde, which pbase normally strips
+from renamed locals. Preserve that exact private name when bare super
+contributes a method's parameters to a Proc's outer-variable set. Otherwise
+isolation never sees the captured rest at all. Materialize a synthesized
+native rest only when isolation observes it, so its error names an ordinary
+Array instead of leaking an internal value or a generic StandardError.
+
+Retain the source Array of an eligible anonymous splat, including its frozen
+state and later mutations. Reserved non-handle slots in the existing splat
+note table carry source identity and span; the existing nonempty-note binder
+branch snapshots them in a private frame slot before defaults may call Ruby.
+The collector follows a pending source handle. Binding consumes the note and
+removes the frame metadata when the anonymous rest is installed. Native leaf,
+block, iterator, sender and Method boundaries consume Array provenance.
+Ordinary fixed-arity Ruby calls do not gain a counting-only branch.
+
+An empty direct rest, and an eligible borrowed nil splat, represent Ruby's
+frozen shared empty Array privately as nil. An explicit empty Array splat
+retains that actual Array; an unfrozen one must refuse isolation. Optional or
+post-rest binding that synthesizes an Array keeps an unshareable native list
+until observed. VM borrowed to_a conversion uses the same source conversion
+helper as the evaluator, preserving a frozen converted Array rather than
+copying it. Array-producing operations still materialize normal Arrays.
+
+Corpus 991 now has 47 output lines, including the exact singleton-method
+review reproduction, direct/explicit/frozen/nil and converted splats, deep
+shareability, leading/post parameters, repeated splats, native Method/send
+boundaries, retained source aliasing across GC, empty super and keyword Array
+append. All lines match clean Ruby 4.0.10 on evaluator and VM under GC stress
+50. Existing corpus 664's 27 lines match both engines as well. GC-root,
+duplicate-definition and dead-definition gates pass. Final-head hardware,
+whole allocation-file and complete corpus replays follow before readiness.
+
+A wider probe also found an existing main difference for captured optional
+parameters: a defaulted parameter can be falsely reported as reassigned by
+Ractor isolation. The same refusal reproduces on the pre-change main control;
+that separate reassignment cause is not hidden by changing expected output
+in this regression corpus. No unused Ruby Array is allocated to imitate an
+allocation count.

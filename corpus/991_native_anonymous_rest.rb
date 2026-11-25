@@ -84,3 +84,50 @@ count_anonymous_arrays(:empty_arrays) { unused_anonymous_rest }
 count_anonymous_arrays(:spread_arrays) { unused_anonymous_rest(*input) }
 count_anonymous_arrays(:nil_arrays) { unused_anonymous_rest(*nil) }
 GC.enable
+
+# Captured anonymous rest retains Ruby's isolation and source-Array state.
+class AnonymousRestIsolation
+  def through(*) = Ractor.shareable_proc { super }
+  def leading(first, *) = Ractor.shareable_proc { super }
+  def post(*, last) = Ractor.shareable_proc { super }
+  def capture(*) = proc { [*] }
+end
+isolation = AnonymousRestIsolation.new
+def check_anonymous_isolation(label)
+  result = yield
+  p [label, result.class, Ractor.shareable?(result)]
+rescue => error
+  p [label, error.class, error.message]
+end
+check_anonymous_isolation(:direct_empty) { isolation.through }
+check_anonymous_isolation(:nil_splat) { isolation.through(*nil) }
+check_anonymous_isolation(:empty_splat) { isolation.through(*[]) }
+check_anonymous_isolation(:frozen_empty) { isolation.through(*[].freeze) }
+check_anonymous_isolation(:direct_one) { isolation.through(1) }
+check_anonymous_isolation(:frozen_one) { isolation.through(*[1].freeze) }
+check_anonymous_isolation(:empty_after_lead) { isolation.leading(1) }
+check_anonymous_isolation(:splat_after_lead) { isolation.leading(1, *[]) }
+check_anonymous_isolation(:spread_lead) { isolation.leading(*[1].freeze) }
+check_anonymous_isolation(:post) { isolation.post(1) }
+check_anonymous_isolation(:frozen_then_arg) { isolation.through(*[].freeze, 1) }
+check_anonymous_isolation(:two_splats) { isolation.through(*[].freeze, *[].freeze) }
+check_anonymous_isolation(:method_splat) { isolation.method(:through).call(*[]) }
+check_anonymous_isolation(:send_splat) { isolation.send(:through, *[].freeze) }
+source = [1]
+captured_source = isolation.capture(*source)
+source << 2
+GC.start
+p [:captured_source_array, captured_source.call]
+singleton = Object.new
+def singleton.through(*) = Ractor.shareable_proc { super }
+check_anonymous_isolation(:singleton_splat) { singleton.through(*[]) }
+check_anonymous_isolation(:singleton_direct) { singleton.through }
+
+p [:super_empty, AnonymousRestChild.new.relay]
+p [:super_nil, AnonymousRestChild.new.relay(*nil)]
+p [:empty_array_keywords, anonymous_array_keywords]
+p [:nil_array_keywords, anonymous_array_keywords(*nil, a: 1)]
+converted = Object.new
+def converted.to_a = [].freeze
+check_anonymous_isolation(:converted_frozen) { isolation.through(*converted) }
+check_anonymous_isolation(:frozen_unshareable_value) { isolation.through(*['unfrozen'].freeze) }
