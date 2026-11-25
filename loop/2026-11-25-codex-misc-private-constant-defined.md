@@ -10,7 +10,7 @@ effects. Both engines match Ruby. The evaluator checks each real qualifier
 without invoking const_missing; the VM uses the namespace value it already
 resolved.
 
-## Related upstream comparisons
+## Initial upstream comparisons (before the autoload correction)
 
 Unchanged Ruby 4.0.10 files run one at a time through unittest/try.sh.
 Every invocation uses `--seed=1` and `MERE_RUBY_GC_TIGHT=1`. Reference,
@@ -22,13 +22,11 @@ maximum resident set size in bytes from `/usr/bin/time -l`.
 | ruby/test_defined.rb | 2 tests, 4 assertions, 0 failures, 0 errors, 0 skips | 163102720 | 164331520 | 163168256 | 164282368 |
 | ruby/test_module.rb | 10 tests, 54 assertions, 0 failures, 0 errors, 0 skips | 176881664 | 176668672 | 204767232 | 206028800 |
 
-## Acceptance still running
+## Initial acceptance history
 
-The full `run_corpus.sh --both` and `MERE_RUBY_VM=1 run_corpus.sh --both`
-sweeps are queued sequentially. Their source gates and full record_hygiene
-results will be recorded after completion. The direct witnesses and upstream
-selections above do not constitute a full-corpus result. No full unit suite
-or Rails component suite was run, and no workflow is changed.
+The first full sweep failed on existing corpus 361, as detailed below.
+The initial focused selections did not reveal that regression. The failed
+sweep is preserved as development evidence and is not counted as a pass.
 
 ## Full-corpus autoload regression and correction
 
@@ -46,11 +44,23 @@ match the clean reference on both engines with tight GC.
 
 The corrected O2 evaluator sweep passes 884/884 programs with the hash
 index ON and OFF, including all source gates and full record_hygiene.
-The VM sweep is running; the failed historical sweep is not counted as a
-pass. Selected unchanged upstream cases were repeated with seed 1 and
-GC tight, all passing:
+The subsequent VM sweep also passes 884/884 with both index settings.
+The failed historical sweep is not counted as a pass. Selected unchanged
+upstream cases were repeated with seed 1 and tight GC, all passing:
 
 | File | Tests/assertions | Main evaluator RSS | Candidate evaluator RSS | Main VM RSS | Candidate VM RSS |
 | --- | --- | ---: | ---: | ---: | ---: |
 | ruby/test_defined.rb | 2 / 4 | 162332672 | 165036032 | 162463744 | 166248448 |
 | ruby/test_module.rb | 10 / 54 | 175570944 | 175685632 | 203112448 | 204242944 |
+
+## Completed acceptance on the corrected O2 source
+
+`sh run_corpus.sh --both` and the subsequent
+`MERE_RUBY_VM=1 sh run_corpus.sh --both` each pass 884/884 programs,
+with the hash index ON and OFF. Both pass all source gates and full
+record_hygiene. `MR_C=mr.c sh tools/bracket_depth_check.sh` passes on the
+final emitted C; the loop record is also checked explicitly.
+
+The mere-pr-review-watch Object-autoload finding is fixed in 9081c5f8,
+with an English inline reply and regression cases. No full unit suite or
+Rails component suite was run, and no workflow is changed.
