@@ -101,6 +101,9 @@ ambiguous shapes and inconsistent address relationships remain unmatched.
 Raw case names stay in `sides`, accepted mappings are recorded as
 `case_identity_aliases`, and the selected policy is recorded at the top level.
 Failures, skips, extra tests and incomplete runs retain their original meaning.
+`compare` requires the same identity policy in both records. With the opaque
+policy it also pairs their COMPLETE reference inventories, so changed process
+addresses cannot conceal a lost MATCH. Ambiguities still fail conservatively.
 
 
 Each test name the reference reports gets one verdict:
