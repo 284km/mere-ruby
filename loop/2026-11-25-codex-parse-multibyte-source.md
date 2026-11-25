@@ -77,3 +77,45 @@ candidate, with identical passing identities; the reference itself reports one f
 local cohort. These are not described as an all-pass file.
 
 Portable review validation: unittest/records/parse-multibyte-review.json.
+
+## Regexp cache and interpolation review
+
+Runtime 8e65f018 includes 3610e91b: auxiliary interpolation boundary scanners
+consume the whole escaped character in quoted strings, percent literals and
+regexps. Corpus 991 covers nested interpolation in all four loading paths.
+The re-review's cache Minor is also fixed: every non-ASCII regexp program
+key distinguishes binary, UTF-8 and each legacy encoding. Existing ASCII
+case-folding and escaped-class distinctions remain. Corpus 991 checks both
+compilation orders, binary/UTF-8 classes, substitution, quantifiers and
+Windows-31J versus binary. All eight focused executions match the reference.
+
+Latest full corpus: 881/881 ON/OFF, 1112.167 s,
+1,181,584 KiB peak family RSS. VM: 881 / 0 fallback / 0 differences,
+239.41 s, 1,207,296 KiB. Eight prefix source gates,
+default hygiene and 155-of-1024 bracket gate pass. All seven related CRuby
+files are COMPLETE on both engines with no previously passing case lost.
+The existing test_regexp 4 failures / 3 errors remain; its reference has
+1 failure / 1 error.
+
+ASCII mapper -c: median 171,160,548 to 169,938,753 instructions
+(-0.71%), three alternating samples.
+UTF-8 Japanese parse-heavy input: median 50,820,773,873 to 50,944,626,285 instructions
+(+0.24%), three alternating samples.
+The Japanese input recipe and digest are retained; exit is first so its
+large body is parsed without running it. No broad speedup is claimed.
+
+Fixed-seed m17n_comb after: 868,848 KiB evaluator and
+890,544 KiB VM. Earlier before/after ranges above retain
+their original cohorts; the shared-machine variation is not hidden.
+
+The historical m17n assertion reduction by eight is retained in the old
+record but is not reproduced. Auditing all 127 per-test counts on the exact
+main, f73 and 3610 binaries gives identical counts within each engine.
+Instrumented totals are separate from unmodified core replays; the cause
+of the earlier count difference is not established. No passing identity is
+lost in either comparison.
+
+GB18030, Regexp.escape/union and non-UTF-8 Regexp.inspect remain explicitly
+separate follow-ups; no claim that their output is unchanged is made.
+
+Portable evidence: unittest/records/parse-multibyte-cache-review.json.
