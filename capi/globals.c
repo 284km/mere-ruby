@@ -42,6 +42,10 @@ EACH_CONSTANT(DEFINE)
 VALUE rb_cIOBuffer = Qnil, rb_cBox = Qnil, rb_cNameErrorMesg = Qnil;
 VALUE rb_stdin, rb_stdout, rb_stderr;
 VALUE rb_fs, rb_output_fs, rb_rs, rb_default_rs, rb_output_rs, rb_argv0;
+/* (Encoding.default_internal, as encoding.c's variable is CRuby's: what
+ *  rb_enc_default_internal answers without a call -- sqlite3 asks it for
+ *  every row step makes) */
+VALUE mr_default_internal = Qnil;
 
 const char ruby_engine[] = "ruby";
 const char ruby_hexdigits[] = "0123456789abcdef0123456789ABCDEF";
@@ -61,6 +65,7 @@ static VALUE boot_body(VALUE unused) {
     rb_default_rs = rb_rs;
     rb_output_rs = rb_gv_get("$\\");
     rb_argv0 = rb_gv_get("$0");
+    mr_default_internal = mr_call(rb_cEncoding, "default_internal", 0);
     /* (roots, as CRuby's rb_global_variable makes them: a value without an
      *  identity assigned to one -- `$; = /,/`, a Regexp -- has a number C
      *  holds only while C reaches it, and these variables are how it does;
@@ -69,20 +74,22 @@ static VALUE boot_body(VALUE unused) {
     rb_gc_register_address(&rb_fs); rb_gc_register_address(&rb_output_fs);
     rb_gc_register_address(&rb_rs); rb_gc_register_address(&rb_default_rs); rb_gc_register_address(&rb_output_rs);
     rb_gc_register_address(&rb_argv0);
+    rb_gc_register_address(&mr_default_internal);
     /* (the memory view registry: capi/memory_view.c) */
     extern void Init_MemoryView(void);
     Init_MemoryView();
     return Qnil;
 }
 /* The interpreter assigned one of the globals C keeps as a variable ($stdin,
- * $stdout, $stderr, $;, $,, $/, $\\): the variable is that value now, as
- * CRuby's are (its setters write them). */
+ * $stdout, $stderr, $;, $,, $/, $\\, Encoding.default_internal): the variable
+ * is that value now, as CRuby's are (its setters write them). */
 int mr_capi_set_global(int slot, CapiWord word) {
     VALUE v = (VALUE)word.mu_w;
     switch (slot) {
       case 0: rb_stdin = v; break;   case 1: rb_stdout = v; break;  case 2: rb_stderr = v; break;
       case 3: rb_fs = v; break;      case 4: rb_output_fs = v; break;
       case 5: rb_rs = v; break;      case 6: rb_output_rs = v; break;
+      case 7: mr_default_internal = v; break;
     }
     return 0;
 }

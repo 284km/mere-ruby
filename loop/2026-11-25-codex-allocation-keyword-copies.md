@@ -206,3 +206,24 @@ test and its parent/child contributions before deciding on a runtime change.
 Do not change upstream cases, exclusions, allocation counters or budgets.
 Repeat final-head correctness, dispatch instructions, controlled RSS and all
 local corpus/source gates before the next single batched push.
+
+## Integrate current main after the second re-review
+
+Merge main ccb68952 before final acceptance. Resolve lexical yield by keeping
+main's define_method/lambda break handling and this branch's argument-forwarding
+block entry. Retain the shared native Method call helper and main's new Class
+visibility/subclasses handling inside that helper, including its block form.
+Main's VM declaration blocks, singleton-contained classes and CGI extension
+changes remain in the integrated tree. Replay their focused controls too.
+
+The old-base RSS plan was superseded at an idle phase boundary for this main
+integration. Preserve all ten completed samples as partial diagnostic history;
+do not label that interrupted plan a five-pair result. Exact child highwaters
+identify the 100,000-entry Hash literal as the largest child on both trees:
+316,833,792 bytes on main a9e68981 and 317,046,784 on 3a1cd4ac. The observed
+short-lived child explains why periodic process-family maxima vary, but does
+not establish final integrated resource acceptance. Use a fresh predeclared
+five-pair main/head comparison on the integrated build, GC_TIGHT=1, seed 1,
+retaining every successful sample, and investigate any persistent increase.
+The initial diagnostic with a closed report descriptor is invalid and is
+excluded; the corrected observer preserves descriptors and unchanged counts.

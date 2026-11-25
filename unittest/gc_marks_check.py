@@ -13,6 +13,10 @@ end = source.index("let rec gc_mark_val =", start)
 helpers = source[start:end]
 owner_helpers = source[source.index("let rec gc_class_base ="):source.index("let gc_source_owner =")]
 state = (ROOT / "m_state.mere").read_text()
+digit_start = state.index("let is_digit =")
+digit_helper = state[digit_start:state.index(";\n", digit_start) + 2]
+singleton_start = source.index("let sng_key_id =")
+singleton_helper = source[singleton_start:source.index("// ruby's ARY_MAX_SIZE", singleton_start)]
 identity_helper = state[state.index("let rec is_anon_cls ="):state.index("// name_anon (")]
 owner_header = """let anonymous_classes = map_new ();
 let _ = map_set anonymous_classes "AnonClass_1" 1;
@@ -94,6 +98,10 @@ let _ = check_owner "AnonClass_User#answer" "";
 let _ = check_owner "AnonModule_User::State" "";
 let _ = check_owner "Struct_User#answer" "";
 let _ = check_owner "Refine_User#answer" "";
+let _ = check_owner "(sng:123)#answer" "(sng:123)";
+let _ = check_owner "(sng:123)" "(sng:123)";
+let _ = check_owner "(sng:(sng:123))#answer" "";
+let _ = check_const "(sng:123)::State" "(sng:123)";
 let _ = check_const "AnonClass_1" "";
 let _ = check_const "AnonModule_2" "";
 let _ = check_const "Refine_M::R_0" "";
@@ -111,7 +119,8 @@ let _ = ensure (if is_anon_cls "Refine_User" then false else true);
 with tempfile.TemporaryDirectory(prefix="mere-gc-marks-") as folder:
     folder = Path(folder)
     main = folder / "marks.mere"
-    main.write_text(owner_header + identity_helper + owner_helpers + helpers + probe + owner_probe)
+    main.write_text(owner_header + digit_helper + singleton_helper + identity_helper
+                    + owner_helpers + helpers + probe + owner_probe)
     generated = subprocess.run([MERE, "-c", str(main)], capture_output=True)
     assert generated.returncode == 0, generated.stderr.decode()
     cfile = folder / "marks.c"
