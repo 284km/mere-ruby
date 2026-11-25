@@ -103,3 +103,24 @@ Codex sessions to two; serialize this session's corpus sweeps and isolate
 allocation files. Batch integration, code and records in one validated push.
 The saved origin and private forwarding payload still need reconciliation
 when PR 242/245 meets this independently measured branch.
+
+## Integrate the keyword-copy review corrections
+
+Merge local PR 242 source f2c40d61 on current main ccb68952 before the next
+validation. Keep its value-list/call-origin separation and native callback
+entries, its world-aware native Method helper, and this branch's fresh packet
+marks, borrowed forwarding state and keyword-rest ownership transfer. Bare
+super keeps restoring the saved forwarding-frame keyword provenance.
+
+A block binder acquires the actual callee keyword-rest value before a default
+can call Ruby, then consumes the incoming origin before that callback. It
+binds the already acquired rest at its original validation point. This keeps
+the ownership optimization and PR 242's positional-Hash rule together; no
+packet is exposed to Ruby with a stale keyword mark. Add Proc/lambda default
+callbacks with the incoming flagged Hash to corpus 994.
+
+This combined source is local, unbuilt and unaccepted. Replay corpus 987 and
+994 normally/under GC stress on both engines, the complete allocation file
+alone, all source gates/record hygiene, corpus index ON/OFF then VM, instructions
+and controlled large-file RSS. Treat PR 242 as a dependency until it is merged;
+do not relabel the earlier independent-head results as integrated acceptance.

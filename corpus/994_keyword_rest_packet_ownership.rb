@@ -136,3 +136,16 @@ class KeywordOriginRepeatedSuper < KeywordOriginParent
 end
 p [:super_after_consume, KeywordOriginAfterConsume.new.call(a: 1)]
 p [:repeated_super, KeywordOriginRepeatedSuper.new.call(a: 2)]
+
+# A keyword-default callback must see a flagged incoming Hash positionally.
+def ownership_default_target_994(a: 0) = a
+def ownership_default_error_994(h)
+  ownership_default_target_994(h)
+rescue ArgumentError => e
+  [e.class, e.message]
+end
+packet_994 = Hash.ruby2_keywords_hash(a: 2)
+[proc { |missing: ownership_default_error_994(packet_994), **kw| [missing, kw] },
+ ->(missing: ownership_default_error_994(packet_994), **kw) { [missing, kw] }].each do |callable|
+  p [:default_callback_origin, callable.call(*[packet_994])]
+end
