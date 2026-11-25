@@ -179,3 +179,69 @@ on reference, evaluator and VM. Corpus 976 and 1009 match on both modes.
 The portable evidence is railstest/framework/records/actionpack-main323-focused.json.
 The complete corpus checks for this merged build are running separately;
 the completed 897-program counts above apply to the frozen full-run build.
+
+## Reviewer follow-up
+
+Runtime 1f94e1fa follows the main323 integration f67fbe16. Both Array#join
+branches are retained. Frozen primitive alias-with-block calls and Hash
+super deletion now preserve the receiver subclass in their frozen checks.
+Native method/public_method reflection through super uses the native helper
+directly rather than redispatching into the override.
+
+Backtrace node lookup traverses heredoc children regardless of parent spans.
+It builds a compact metadata index once for one file (path, mtime, size),
+replacing that index when the file changes; no Prism nodes or source tree
+remain. The existing answer cache remains bounded at 128 entries. First
+heredoc calls work on both engines; second-argument heredoc calls work on VM
+again. The second-argument evaluator line-number gap also occurs on main
+44aa, as retained in the baseline probe, and is a separate follow-up.
+
+Eval diagnostics now use native Prism reports for all unfinished assignments
+and operators, including endless method bodies; no last-character heuristic
+is applied. Plain Hash patterns use a versioned native-protocol guard, with
+callback dispatch retained for overrides, refinements and protocol changes.
+Corpus 1021-1024 covers these review regressions and invalidation controls.
+
+Shared runner change d36f19ce: --framework-bootstrap is explicitly opt-in.
+Default startup and installation retain the application bootstrap for other
+streams. Results record the flag and selected bootstrap digest. The README
+explains restoring the earlier 73-archive inventory to the 85-archive lock
+and marks the full Action Pack run complete. All 27 harness controls pass.
+The explicit-bootstrap three-file replay has 60 MATCH / 0 RED on f67fbe16;
+the default AS startup replay has 116 MATCH / 4 existing RED, all COMPLETE.
+
+Latest full corpus: 914/914 ON/OFF, 1,219.077 s, 1,179,856 KiB peak family
+RSS. VM: 914 VM / 0 fallback / 0 differences, 438.365 s, 1,224,880 KiB.
+Eight corpus-prefix source gates, default hygiene and generated-C bracket
+gate pass (155 of 1024). All 16 focused regression executions pass.
+Related method, pattern_matching, parse, syntax and node-ID AST controls are
+COMPLETE before/after in both modes, with no previously passing case lost.
+Known singleton-method name failure, parse diagnostic failures, syntax
+memory-leak child timeout and platform skips remain explicit in the record.
+This is a review-baseline f67fbe16 comparison, not a fresh main baseline;
+the earlier main comparisons remain above and in their original records.
+
+Latest normal evaluator Rails checks: helper, controller test_case,
+TestResponse and Inspector total 193 MATCH / 0 RED, all COMPLETE, all other
+categories and order differences zero. The strict gate passes. These use
+explicit bootstrap and disclose native gems reused from the fresh 8624fb60
+full-run install. The full 173-file cohort remains the separate frozen
+8624fb60 run, not a claim of a new full run on 1f94e1fa.
+
+Three alternating fixed-seed 12345 routing_assertions replays under
+MERE_RUBY_GC_TIGHT=1 retain 63 MATCH / 0 RED before/after, all COMPLETE,
+600 s / 2 GiB bounds and jobs 2. Maximum family RSS, KiB, before f67fbe16:
+635,152 / 782,320 / 681,984; after: 610,160 / 731,872 / 700,960. Median
++2.78%, overlapping ranges; no stable memory improvement or increase is
+established from this shared-machine sample.
+
+The 40-site, 80-lookup node-ID probe under GC_TIGHT=1 uses 136-137 MB after,
+versus 160-173 MB before, across three samples per engine. All return 80.
+The evaluator mixed Hash-pattern instruction median drops from
+25,352,494,623 to 10,831,787,958; VM remains about 29.11 G. These are the
+specified probes, not a claim about every Rails workload. All samples and
+binary digests are retained.
+
+Portable evidence: unittest/records/actionpack-review.json and framework
+records actionpack-review-framework.json / actionpack-review-helper.json.
+Historical full-run and integration records remain separate.
