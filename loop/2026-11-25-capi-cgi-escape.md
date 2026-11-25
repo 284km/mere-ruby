@@ -99,5 +99,17 @@ On 81c42f56 (this branch with main ecd65075 merged, #284 among it), mere
   `require "io/wait.so"` (and other `.so` names with no shipped entry) is a
   LoadError where ruby answers false; `require "zlib.so"` after `require
   "zlib"` answers true where ruby answers false (zlib's special case).
+- From the review of #286 (all on main too, not this change's):
+  - A metaclass's internal name `(sng:CGI)` shows in error messages where
+    ruby says `#<Class:CGI>`.
+  - A metaclass has no FL_SINGLETON here, and freezing a class does not
+    freeze its metaclass.
+  - Only some C-only features (etc, stringio, pty, io/console) are listed
+    once when required as `name.so`. With `.so`, io/nonblock, date_core,
+    fcntl, digest/* and json/ext/* are a LoadError, having no shipped entry
+    of that name. `require "zlib"` after `require "zlib.so"` answers true
+    a second time, and `require "date"` does not list `date_core.bundle`.
+  - A backtrace through a C-only library's Ruby here starts with
+    `stringio.bundle:260`, a file and line ruby's C has no counterpart for.
 - strscan is left out of `cext_c_only`: ruby lists `strscan/strscan.rb`
   that its extension requires, which this interpreter does not have.

@@ -29,7 +29,7 @@ PATCH = HERE / 'headers.patch'
 OURS = {'ruby/config.h', 'COPYING', 'BSDL'}
 # The vendored basename avoids colliding with other extensions' escape.c.
 # A renamed source is still compared byte for byte with its upstream file.
-VENDOR_PATHS = {'erb_escape.c': 'ext/erb/escape/escape.c'}
+VENDOR_PATHS = {'erb_escape.c': 'ext/erb/escape/escape.c', 'cgi_escape.c': 'ext/cgi/escape/escape.c'}
 args = [a for a in sys.argv[1:] if a != '--write']
 if len(args) != 1:
     sys.exit(__doc__)
