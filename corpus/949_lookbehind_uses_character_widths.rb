@@ -49,3 +49,9 @@ p binary.match("\xFFa".b)&.to_a&.map(&:bytes)
   expression = Regexp.new("(?<!a)x".force_encoding(encoding))
   p [encoding, ("x" * 256).force_encoding(encoding).scan(expression).size]
 end
+
+# The remaining ASCII-compatible multibyte decoders must not rescan prefixes.
+["CP949", "GB18030", "EUC-TW", "CESU-8"].each do |encoding|
+  expression = Regexp.new("(?<!a)x".encode(encoding))
+  p [encoding, ("x" * 256).encode(encoding).scan(expression).size]
+end
