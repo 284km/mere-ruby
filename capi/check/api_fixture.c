@@ -494,8 +494,19 @@ static VALUE hidden_const_api(VALUE self, VALUE klass, VALUE name, VALUE operati
       default: rb_raise(rb_eArgError, "unknown constant operation");
     }
 }
+static VALUE native_mixin(VALUE self, VALUE target, VALUE module, VALUE operation) {
+    (void)self;
+    switch (NUM2INT(operation)) {
+      case 0: rb_include_module(target, module); break;
+      case 1: rb_prepend_module(target, module); break;
+      case 2: rb_extend_object(target, module); break;
+      default: rb_raise(rb_eArgError, "unknown mixin operation");
+    }
+    return target;
+}
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
+    rb_define_singleton_method(mod, "native_mixin", native_mixin, 3);
     rb_define_singleton_method(mod, "frozen_flags", frozen_flags, 2);
     rb_define_singleton_method(mod, "hidden_const_api", hidden_const_api, 4);
     rb_define_singleton_method(mod, "nogvl_nap", nogvl_nap, 1);
