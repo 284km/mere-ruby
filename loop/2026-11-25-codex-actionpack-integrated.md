@@ -162,3 +162,20 @@ No file hit WALL_LIMIT or MEMORY_LIMIT. The completed Linux CI replay at
 zero failures/errors/skips. Earlier attempts had two child timeouts; their
 cause is not established. The exact CI merge and binary digests are in
 unittest/records/actionpack-module-linux-882177ca.json.
+
+
+## Pinned main integration after the full measurement
+
+Merge f67fbe160403d2c769f7ccef84178e484f7e8f8e incorporates main
+323706a7. The Array#join conflict preserves the main stream's separate
+Class#to_s dispatch and this branch's conversion fallback for other objects.
+This is a new build, not the frozen 8624fb60 full-suite cohort above.
+The three focused Rails files remain 90 MATCH / zero other classifications,
+all COMPLETE on both sides. Their runner is from 8624fb60; the measured
+binary is f67fbe16, digest 06b6c5797a38a9e7e103567f68c3b11f54e95bd5cfc1eabeef7e722e5eaf74eb.
+Native gems are explicitly reused from the exact 8624fb60 install.
+CRuby Array join runs 8 tests / 88 assertions with no failures/errors/skips
+on reference, evaluator and VM. Corpus 976 and 1009 match on both modes.
+The portable evidence is railstest/framework/records/actionpack-main323-focused.json.
+The complete corpus checks for this merged build are running separately;
+the completed 897-program counts above apply to the frozen full-run build.
