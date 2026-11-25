@@ -1,7 +1,10 @@
 # Store generic forwarded arguments in the owning frame
 
-This branch starts from main
-`2e402b9422018f27ba5cc96a9a6ae797bcd22e8a`. The reference is clean Ruby
+This branch started from main
+`2e402b9422018f27ba5cc96a9a6ae797bcd22e8a`. Final measurement follows a merge
+of current main `d03cbb8371a10da6c974969606018eb91af60c84`, which includes
+the literal parser fix. Allocation-file RSS can therefore be compared with
+completed literal cases instead of timed-out child processes. The reference is clean Ruby
 4.0.10 at `a704b7cd95a42cc0cf5f307137bf3aac0285b915`: 46 default and 38
 bundled gems, zero extras, Prism 1.8.2. Compiler
 `9dec2ff687a08433247dbdb7729bc19c8522e538` and mgz
@@ -53,10 +56,10 @@ remain observable Ruby Arrays. Anonymous rest and keyword packets are
 separate representation work. Missing CRuby-only concatenation/splat
 Arrays, empty-merge Hashes and unobservable marked-method/Proc Hash copies
 stay documented as not matched; they are not synthesized for a count.
-The independent parser change handles the two large-literal timeouts.
+The parser change now on the comparison main handles the two large-literal timeouts.
 
 Measure ruby/test_allocation.rb alone on both evaluator and VM, before and
-after against the exact main above. Retain all 76 cases, budgets and
+after against the final comparison main above. Retain all 76 cases, budgets and
 exclusions unchanged and report MATCH/RED, atomic cause groups and max RSS
 in the English PR. Instruction comparisons include method/block loops,
 the unchanged Ruby matrix benchmark, and positional/keyword forwarding
@@ -65,3 +68,8 @@ record_hygiene, the full corpus with both hash-index modes and the VM
 corpus run in sequence, one corpus sweep at a time. No full unit suite or
 Rails cold measurement is run. Read automated inline comments after the
 PR is opened and after each push.
+
+The forwarding marker overlaps the origin-state change in PR 242. After
+one of those PRs merges, merge current main into the remaining branch and
+reconcile both the private native slot and the saved keyword-origin bit.
+Retain both corpora when validating that integrated tree.
