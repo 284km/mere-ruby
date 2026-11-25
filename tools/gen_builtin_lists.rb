@@ -19,7 +19,7 @@
 # from kernel_instance_list and its two short lists (note 431).
 CLASSES = %w[String Array Hash Integer Float Symbol Range NilClass TrueClass FalseClass
              Rational Complex Proc Method UnboundMethod Regexp MatchData Time Struct
-             Exception Enumerator Numeric Enumerable Encoding Random].freeze
+             Exception Enumerator Numeric Enumerable Encoding Random IO File].freeze
 
 mode = ARGV[0]
 case mode

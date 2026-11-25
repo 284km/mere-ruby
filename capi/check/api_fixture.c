@@ -122,6 +122,8 @@ static VALUE ivars(VALUE self, VALUE obj) {
 static VALUE last_match(VALUE self, VALUE nth) { (void)self; return rb_reg_nth_match(NUM2INT(nth), rb_backref_get()); }
 static VALUE set_match(VALUE self, VALUE match) { (void)self; rb_backref_set(match); return Qnil; }
 static VALUE class_of(VALUE self, VALUE obj) { (void)self; return CLASS_OF(obj); }
+/* A class variable read through CLASS_OF, as cgi/escape reads @@accept_charset. */
+static VALUE cvar_of_class_of(VALUE self, VALUE obj, VALUE name) { (void)self; return rb_cvar_get(CLASS_OF(obj), rb_intern_str(name)); }
 static VALUE version_text(VALUE self) { (void)self; return rb_str_new_cstr(ruby_version); }
 static VALUE write_io_of(VALUE self, VALUE io) { (void)self; return rb_io_get_write_io(io); }
 /* (the descriptor C writes on -- io-console's way to it) */
@@ -559,8 +561,19 @@ static VALUE hidden_const_api(VALUE self, VALUE klass, VALUE name, VALUE operati
       default: rb_raise(rb_eArgError, "unknown constant operation");
     }
 }
+static VALUE native_mixin(VALUE self, VALUE target, VALUE module, VALUE operation) {
+    (void)self;
+    switch (NUM2INT(operation)) {
+      case 0: rb_include_module(target, module); break;
+      case 1: rb_prepend_module(target, module); break;
+      case 2: rb_extend_object(target, module); break;
+      default: rb_raise(rb_eArgError, "unknown mixin operation");
+    }
+    return target;
+}
 void Init_api_fixture(void) {
     VALUE mod = rb_define_module("ApiFixture");
+    rb_define_singleton_method(mod, "native_mixin", native_mixin, 3);
     rb_define_singleton_method(mod, "frozen_flags", frozen_flags, 2);
     rb_define_singleton_method(mod, "hidden_const_api", hidden_const_api, 4);
     rb_define_singleton_method(mod, "nogvl_nap", nogvl_nap, 1);
@@ -613,6 +626,7 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "last_match", last_match, 1);
     rb_define_singleton_method(mod, "set_match", set_match, 1);
     rb_define_singleton_method(mod, "class_of", class_of, 1);
+    rb_define_singleton_method(mod, "cvar_of_class_of", cvar_of_class_of, 2);
     rb_define_singleton_method(mod, "version_text", version_text, 0);
     rb_define_singleton_method(mod, "write_io_of", write_io_of, 1);
     rb_define_singleton_method(mod, "write_descriptor", write_descriptor, 1);
