@@ -174,3 +174,10 @@ do not consume test deadlines. This session keeps its corpus sweeps serial
 and runs each allocation file alone. Remove merged-PR build/review trees
 after preserving their validation records; retain open-PR work and the clean
 reference/compiler required by it.
+
+Conversion and lookup callbacks temporarily hide an origin absent from their
+own arguments and restore the caller's pending note, keep/empty bits and
+keyword-mark value when they return. This lets send's method-name conversion
+and Class#new resume the original keyword call, while callback bodies see
+ordinary positional arguments. Add sender-conversion and Ruby-initializer
+controls before the queued build is admitted.

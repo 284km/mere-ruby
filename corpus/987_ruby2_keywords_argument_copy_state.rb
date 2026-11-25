@@ -343,3 +343,19 @@ native_ivar_name.define_singleton_method(:to_str) do
 end
 Object.new.instance_variable_set(native_ivar_name, *[native_hash])
 p [:native_name_callback, native_conversion]
+
+# Method-name conversion runs before the final target consumes its arguments.
+native_sender_observation = nil
+native_sender_name = Object.new
+native_sender_name.define_singleton_method(:to_str) do
+  native_sender_observation = proc { |a: 0| a }.call(native_hash)
+  'native_splat_keyword'
+end
+p [:native_sender_conversion, send(native_sender_name, *[native_hash]), native_sender_observation]
+class NativeSplatInitializer
+  attr_reader :value
+  def initialize(a:)
+    @value = a
+  end
+end
+p [:native_constructor_forwarding, NativeSplatInitializer.new(*[native_hash]).value]
