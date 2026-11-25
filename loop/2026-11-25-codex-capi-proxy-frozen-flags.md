@@ -2,8 +2,8 @@
 
 A frozen Class or Module crossed the C API boundary with its frozen bit
 clear. Other values could call a Ruby frozen? override while their native
-proxy header was refreshed. rb_obj_frozen_p also sent that Ruby method,
-although the C API declares its implementation as the native flag query.
+proxy header was refreshed. rb_obj_frozen_p used a Kernel predicate round
+trip; the C API declares its implementation as the native flag query.
 
 Runtime 6588c51a makes proxy refresh read val_is_frozen for every kind and
 implements rb_obj_frozen_p with RB_OBJ_FROZEN. No Ruby callback is entered
@@ -25,9 +25,11 @@ Validation:
 - VM corpus: 894 VM / 0 fallback / 0 differences, 301.340 s,
   peak 1,218,208 KiB. Eight prefix source gates and default hygiene pass;
   the generated-C bracket gate needs 155 of 1024.
-- capi_check on evaluator and explicitly on VM: all six contracts hold,
-  including GC stress at every safepoint; all six negative controls fail.
-  API contract count is 351 on reference, Mere and stress in each mode.
+- Historical capi_check cohorts: all six contracts hold, including GC
+  stress; all six negative controls fail, with 351 API checks. The historical
+  VM label did not retain an executable-level mode pin. Since capi_check
+  strips MERE_RUBY_* from child environments, that label does not establish
+  VM execution. See the integration audit below for executable-pinned proof.
 - C API spec replay: all 46 per-side normalized output digests match main.
   Both runs have 2,602 reference / 2,420 Mere passing examples. Existing
   failures and io/thread wall limits remain; this is not an all-pass replay.
@@ -60,3 +62,61 @@ focused component replay, not a full component run. Protected native-gem,
 ERB-vendoring and bignum implementation files are unchanged.
 
 Portable evidence: unittest/records/capi-proxy-frozen-flags.json.
+
+## Executable-pinned mode audit after integration
+
+The owner merged #278 as main 779c7cc9 during the follow-up checks. Local
+integration 282be638 has an identical tracked tree to that merge and is the
+fresh O2 build measured here. Pinned main 45b09326 is the comparison binary.
+Both binary digests are separate from the historical 6588c51a cohort above.
+The already merged #273 fixes the former Linux headers-check failure;
+headers_check now verifies 194 headers and 21 unchanged vendored sources.
+
+The historical VM-labeled contract run was not execution-level proof:
+capi_check removes MERE_RUBY_* variables from child environments. The new
+audit supplies an explicit --mere executable wrapper exporting
+MERE_RUBY_VM=1. The default evaluator full check passes all six contracts
+with 356 API checks, including GC stress and all negative controls.
+
+The explicit VM full API check fails after rb_protect leaves an
+ArgumentError in errinfo and Ruby rescues E2. Pinned main45 fails at
+capi/check/api.rb:545, the candidate at :559 (the same check shifted by
+14 added lines). Both normal execution and GC stress reproduce it. The
+other five VM contracts pass in both conditions. All negative controls
+fail; no-builtin fails at its native override check, before the existing
+errinfo failure. This VM difference is reported to the owner separately;
+the VM implementation is unchanged in this PR.
+
+All 40 added frozen checks plus loader silence pass independently on the
+reference, evaluator, VM, evaluator under GC stress and VM under GC stress:
+41 checks in each execution. These targeted successes do not replace the
+retained full-script API failures. The historical contract label is
+qualified in the original record, and the PR description is corrected.
+
+The C API spec replay completes 46 files before and after: all 92 per-side
+raw outputs are byte-identical, including existing failures, io/thread wall
+limits and the unavailable digest extension. Totals remain 2,602 reference /
+2,420 Mere passing examples; no all-pass spec claim is made.
+
+Three alternating fixed-seed 12345 duration/erb_util replay pairs retain
+93 MATCH / 0 RED, all COMPLETE, with the existing order diagnostic 1.
+Maximum family RSS in KiB:
+
+| File | main45, three repeats | candidate, three repeats |
+| --- | --- | --- |
+| duration | 311,216 /309,728 /321,040 | 310,064 /307,424 /315,216 |
+| erb_util | 289,008 /289,888 /288,768 | 285,984 /283,760 /285,264 |
+
+Bounds remain 600 seconds / 2 GiB per file family, jobs 2, MT_CPU=0. These
+focused checks reuse the owned fdda9150 native install explicitly; no full
+component run was started. No stable memory improvement is claimed.
+
+Integrated corpus --both: 939/939 ON/OFF, 1,283.820 seconds, maximum family
+RSS 1,216,592 KiB. VM corpus: 939 VM / 0 fallback / 0 differences,
+234.762 seconds, maximum family RSS 1,159,856 KiB.
+Source gates, default hygiene, headers and bracket 155/1024 pass. New and
+corrected records are checked explicitly before any local record commit.
+
+This supplemental record will be batched with a future code update; the
+merged PR branch receives no record-only push. Portable evidence:
+unittest/records/capi-proxy-frozen-main45.json.

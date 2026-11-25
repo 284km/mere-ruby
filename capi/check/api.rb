@@ -22,6 +22,23 @@ end
 A = ApiFixture
 check(said == '')
 
+# C ancestry operations bypass receiver overrides and module callbacks.
+[Module, Class.new(Module)].each do |kind|
+  3.times do |operation|
+    mod = kind.new
+    mod.module_eval { def native_mixin_marker = 42 }
+    [:append_features, :included, :prepend_features, :prepended, :extend_object, :extended].each do |hook|
+      mod.define_singleton_method(hook) { |*args| raise "native mixin called Ruby hook" }
+    end
+    target = operation == 2 ? Object.new : Class.new
+    [:include, :prepend, :extend, :singleton_class].each do |method|
+      target.define_singleton_method(method) { |*args| raise "native mixin dispatched Ruby override" }
+    end
+    check(A.native_mixin(target, mod, operation).equal?(target))
+    check((operation == 2 ? target : target.new).native_mixin_marker == 42)
+  end
+end
+
 # Native flags never call a Ruby predicate, including during mirror refresh.
 [-> { Class.new }, -> { Module.new }, -> { Object.new }, -> { +'' },
  -> { [] }, -> { {} }, -> { proc {} }, -> { binding }].each do |factory|
@@ -341,6 +358,13 @@ check(A.class_of(SubString.new('x')) == SubString)
 check(A.class_of(SubArray.new([1])) == SubArray)
 check(A.class_of(SubHash.new) == SubHash)
 check(A.class_of('plain') == String && A.class_of([]) == Array && A.class_of({}) == Hash)
+# CLASS_OF of a class is its metaclass, which CRuby makes with every class,
+# and a class variable of a module it includes is read through it
+# (cgi/escape's @@accept_charset)
+module CvarM; @@cv = :from_module; end
+class CvarC; include CvarM; end
+check(A.class_of(CvarC) == CvarC.singleton_class && A.class_of(CvarC).singleton_class?)
+check(A.cvar_of_class_of(CvarC, '@@cv') == :from_module)
 # (what io-console and prism asked for: ruby_version is RUBY_VERSION; the
 #  write IO of a plain IO is itself; nothing is pending before a read, and
 #  what a partial read left buffered is)
