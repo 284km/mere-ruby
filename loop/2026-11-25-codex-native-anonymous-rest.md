@@ -150,3 +150,12 @@ The private source-frame key is also short, reducing repeated string work.
 All 55 corpus lines still match both engines under GC stress 50, and the
 three source gates pass. Recheck hardware on this candidate before readiness;
 do not claim that the earlier VM instruction increase is acceptable.
+
+A sole anonymous formal cannot evaluate defaults or destructuring callbacks
+between reading provenance and installing its rest slot. Keep that source
+in a native local pair until installation, instead of storing, reading and
+deleting temporary frame metadata. Signatures that can evaluate Ruby during
+binding retain the private frame root. This removes hot temporary-map traffic;
+it does not create a Ruby object or change an allocation counter. All 55
+regression lines still match both engines with GC stress 50 and the three
+source gates pass. Hardware comparison remains required before readiness.
