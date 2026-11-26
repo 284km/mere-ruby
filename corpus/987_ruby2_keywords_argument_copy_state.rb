@@ -459,6 +459,23 @@ p [:thread_argument_copy, thread_copy_987.equal?(thread_hash_987),
 thread_keep_987 = proc { |*args| args.last }.ruby2_keywords
 thread_kept_987 = Thread.new(*[thread_hash_987], &thread_keep_987).value
 p [:thread_marked_block, thread_kept_987.equal?(thread_hash_987), Hash.ruby2_keywords_hash?(thread_kept_987)]
+thread_marked_literal_987 = Thread.new(a: 3, &thread_keep_987).value
+p [:thread_marked_literal, thread_marked_literal_987, Hash.ruby2_keywords_hash?(thread_marked_literal_987)]
+thread_later_proc_987 = proc { |*args| args.last }
+thread_release_987 = Queue.new
+thread_gate_trace_987 = TracePoint.new(:thread_begin) { thread_release_987.pop }
+thread_gate_trace_987.enable
+thread_later_987 = Thread.new(a: 4, &thread_later_proc_987)
+thread_later_proc_987.ruby2_keywords
+GC.start
+thread_release_987 << true
+thread_later_hash_987 = thread_later_987.value
+thread_gate_trace_987.disable
+p [:thread_later_policy, thread_later_hash_987, Hash.ruby2_keywords_hash?(thread_later_hash_987)]
+thread_snapshot_987 = Thread.new(*[thread_hash_987]) { |a: 0| a }
+thread_hash_987[:a] = 9
+p [:thread_argument_snapshot, thread_snapshot_987.value, thread_hash_987[:a]]
+thread_hash_987[:a] = 2
 thread_special_987 = Thread.new(*[special]) { |*args| args.last }.value
 p [:thread_copy_metadata, thread_special_987.class, thread_special_987.default,
    thread_special_987.compare_by_identity?, thread_special_987.instance_variable_get(:@value)]
@@ -466,7 +483,7 @@ thread_observations_987 = []
 thread_trace_987 = TracePoint.new(:thread_begin) do
   thread_observations_987 << (native_splat_keyword(thread_hash_987) rescue $!.class)
 end
-thread_trace_987.enable do
-  Thread.new(*[thread_hash_987]) { |a: 0| a }.value
-end
+thread_trace_987.enable
+Thread.new(*[thread_hash_987]) { |a: 0| a }.value
+thread_trace_987.disable
 p [:thread_begin_positional_callback, thread_observations_987]

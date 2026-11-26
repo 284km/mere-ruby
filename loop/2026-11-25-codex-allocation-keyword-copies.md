@@ -366,3 +366,19 @@ the four requested complete upstream files, controlled resource attribution,
 copy/ivar and method/block/matrix instruction controls, source gates,
 record_hygiene and serial complete corpus/VM sweeps before the next batched
 push. The PR remains draft; no new code push or merge readiness is claimed.
+
+The first new-source O2 replay restores ordinary Thread keyword delivery but
+finds the supplied marked Proc receives an unflagged Hash. The Thread's new
+startup Proc has lost the original Proc's policy. Capture that policy at the
+native entry and restore it only for its actual keyword packet. The Thread
+roots the supplied Proc until completion and reads its policy at binding,
+so marking it after creation but before startup also works across GC; no
+process-wide per-Thread map is introduced. Prepare the
+unflagged native copy at startup instead of delaying it until binding, so
+caller mutation cannot change the queued keyword snapshot. Add a marked
+literal-keyword control and mutation-before-join control. Enable the
+thread-begin TracePoint without a block so it observes the new thread,
+rather than defaulting to the enabling thread only. The failed first replay
+and its source/binary identity remain separate; reuse the newly built main
+d93 O2 binary only after verifying its exact hash. Rebuild the changed head
+before repeating the focused controls and all later acceptance.
