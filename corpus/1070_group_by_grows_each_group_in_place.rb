@@ -69,3 +69,40 @@ class Hash
   alias_method :[]=, :__aset_1070
 end
 p r1, r2, r3, r4
+
+# A key's own #hash is asked once a lookup (and once a store), not once per
+# key already stored: 200 elements, 100 keys, about 300 calls as ruby makes.
+
+class HK
+  attr_reader :v
+  @@calls = 0
+  def self.calls = @@calls
+  def initialize(v) = @v = v
+  def hash = (@@calls += 1; @v.hash)
+  def eql?(o) = o.is_a?(HK) && o.v == @v
+end
+g = (0...200).map { |i| HK.new(i % 100) }.group_by(&:itself)
+p g.size, g.values.map(&:size).uniq, HK.calls.between?(200, 320)
+# a program's Hash#default is asked on a miss
+class Hash
+  alias_method :__default_1070, :default
+  def default(k = nil) = raise("user Hash#default")
+end
+r = [[[1], [1]], [1, 1], [:a]].map do |xs|
+  xs.group_by(&:itself)
+rescue => e
+  e.message
+end
+class Hash
+  alias_method :default, :__default_1070
+end
+p r
+# ...and an Array it answers is pushed onto, not stored
+class Hash
+  def default(k = nil) = ($dflt_1070 ||= [])
+end
+h = [1, 2, 1].group_by(&:itself)
+class Hash
+  alias_method :default, :__default_1070
+end
+p h, $dflt_1070
