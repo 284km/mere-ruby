@@ -1,6 +1,7 @@
 #!/bin/sh
 # Run every corpus program under the reference ruby and under ./mere-ruby,
-# and diff the outputs. Exits non-zero on the first mismatch.
+# and diff stdout/status. Optional stderr comparisons use the same executions.
+# Stdout/status retain first-failure behavior; stderr is compared in one batch.
 set -e
 . "$(cd "$(dirname "$0")" && pwd)"/tools/ref_ruby.sh
 # The reference ruby's own output depends on its default external encoding:
@@ -16,6 +17,13 @@ export RUBYOPT
 # moved onto ./mere-ruby, because a sweep in flight owns that path -- writing
 # it mid-measurement tests a half-written binary and invents a regression.
 MR_BIN="${MR_BIN:-./mere-ruby}"
+# Stderr is opt-in while the measured baseline differences are corrected.
+# Both modes retain ordering and duplicates; "all" also checks non-warning text.
+sb_stderr="${CORPUS_STDERR:-off}"
+case "$sb_stderr" in
+  off|warnings|all) ;;
+  *) echo "CORPUS_STDERR must be off, warnings or all" >&2; exit 2 ;;
+esac
 # A caller may supply reference stdlib paths through RUBYLIB. They are fallbacks
 # for Mere, whose C-backed libraries (including monitor) are shipped internally.
 # Do not reorder the reference side or override paths a program adds with -I
@@ -112,6 +120,11 @@ done
 tmpd="$(mktemp -d "${TMPDIR:-/tmp}/mere_ruby_corpus.XXXXXX")"
 trap 'rm -rf "$tmpd"' EXIT
 exp="$tmpd/exp.txt"; got="$tmpd/got.txt"; dif="$tmpd/diff.txt"
+stderr_manifest="$tmpd/stderr.tsv"
+if [ "$sb_stderr" != off ]; then
+  mkdir "$tmpd/stderr"
+  : > "$stderr_manifest"
+fi
 
 # ⚠ `--both` RUNS THE REFERENCE ONCE, NOT TWICE. Every change is swept with the
 # hash index ON and again with it OFF, which used to be two whole invocations of
@@ -145,8 +158,19 @@ pass=0
 failed=0
 total=0
 for f in corpus/*.rb; do
-  rrc=0; "$REF_RUBY_BIN" "$f" > "$exp" 2>/dev/null || rrc=$?
-  mrc=0; env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" "$f" > "$got" || mrc=$?
+  rrc=0
+  mrc=0
+  if [ "$sb_stderr" = off ]; then
+    "$REF_RUBY_BIN" "$f" > "$exp" 2>/dev/null || rrc=$?
+    env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" "$f" > "$got" || mrc=$?
+  else
+    stderr_name="${f##*/}"
+    stderr_reference="$tmpd/stderr/$stderr_name.ref"
+    stderr_on="$tmpd/stderr/$stderr_name.on"
+    stderr_off="-"
+    "$REF_RUBY_BIN" "$f" > "$exp" 2> "$stderr_reference" || rrc=$?
+    env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" "$f" > "$got" 2> "$stderr_on" || mrc=$?
+  fi
   total=$((total + 1))
   bad=0
   if ! diff -u "$exp" "$got" > "$dif"; then
@@ -160,12 +184,21 @@ for f in corpus/*.rb; do
   fi
   if [ "$bad" = 1 ] && [ "$sb_keep" != 1 ]; then exit 1; fi
   if [ "$sb_both" = 1 ]; then
-    mrc=0; MERE_RUBY_NO_HASH_INDEX=1 env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" "$f" > "$got" || mrc=$?
+    mrc=0
+    if [ "$sb_stderr" = off ]; then
+      MERE_RUBY_NO_HASH_INDEX=1 env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" "$f" > "$got" || mrc=$?
+    else
+      stderr_off="$tmpd/stderr/$stderr_name.off"
+      MERE_RUBY_NO_HASH_INDEX=1 env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" "$f" > "$got" 2> "$stderr_off" || mrc=$?
+    fi
     if ! diff -u "$exp" "$got" > "$dif" || [ "$rrc" != "$mrc" ]; then
       echo "FAIL $f (with MERE_RUBY_NO_HASH_INDEX=1; ruby exited $rrc, mere-ruby $mrc)"
       cat "$dif"
       bad=1
     fi
+  fi
+  if [ "$sb_stderr" != off ]; then
+    printf '%s\t%s\t%s\t%s\n' "$f" "$stderr_reference" "$stderr_on" "$stderr_off" >> "$stderr_manifest"
   fi
   if [ "$bad" = 1 ]; then
     failed=$((failed + 1))
@@ -175,6 +208,11 @@ for f in corpus/*.rb; do
     echo "ok   $f"
   fi
 done
+stderr_status=0
+if [ "$sb_stderr" != off ]; then
+  "$REF_RUBY_BIN" tools/corpus_stderr_check.rb "$sb_stderr" "$stderr_manifest" \
+    "$REF_RUBY_BIN" "$MR_BIN" "$PWD" "$tmpd" "${CORPUS_STDERR_REPORT:-}" || stderr_status=$?
+fi
 if [ "$failed" != 0 ]; then
   echo "$failed/$total corpus programs differ from ruby ($pass match)"
   exit 1
@@ -183,4 +221,7 @@ if [ "$sb_both" = 1 ]; then
   echo "$pass/$pass corpus programs match ruby, with the hash index ON and OFF"
 else
   echo "$pass/$pass corpus programs match ruby"
+fi
+if [ "$stderr_status" != 0 ]; then
+  exit "$stderr_status"
 fi
