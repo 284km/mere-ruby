@@ -29,7 +29,7 @@ class LoadPathCheck(unittest.TestCase):
         # Source guards have separate controls; this fixture exercises execution
         # of both corpus passes and the pre-sweep interpreter self-check.
         for guard in ("gc_roots", "dup_defs", "dead_defs", "meth_writes",
-                      "name_spec", "rx_caps", "ns_names", "name_len"):
+                      "name_spec", "rx_caps", "ns_names", "name_len", "iv_door"):
             (self.root / "tools" / f"{guard}_check.sh").write_text("#!/bin/sh\nexit 0\n")
             (self.root / "tools" / f"{guard}_check.sh").chmod(0o755)
         (self.root / "mspec/record_hygiene.sh").write_text("#!/bin/sh\nexit 0\n")
@@ -45,7 +45,8 @@ query = "-e" in sys.argv
 record = dict(query=query, library=os.environ.get("RUBYLIB"),
               options=os.environ.get("RUBYOPT"),
               errno=os.environ.get("MERE_RUBY_ERRNO_CHECK"),
-              no_hash=os.environ.get("MERE_RUBY_NO_HASH_INDEX"))
+              no_hash=os.environ.get("MERE_RUBY_NO_HASH_INDEX"),
+              shape_stats=os.environ.get("MERE_RUBY_STORE_STATS"))
 with (root / (side + ".jsonl")).open("a") as log:
     log.write(json.dumps(record) + "\\n")
 if query:
@@ -54,6 +55,14 @@ if query:
 elif side == "mere-ruby" and (root / "require-own").exists() and not (record["library"] or "").startswith("OWN:"):
     print("cannot load such file -- monitor.so", file=sys.stderr)
     sys.exit(1)
+elif side == "mere-ruby" and record["shape_stats"] == "1":
+    missing = (root / "missing-shape-row")
+    oversized = (root / "oversized-shape-row")
+    for name in ("sh_cls_var", "sh_cls_cap"):
+        if missing.exists() and missing.read_text() == name:
+            continue
+        value = 301 if oversized.exists() and oversized.read_text() == name else 0
+        print(f"{name} {value}", file=sys.stderr)
 else:
     print("pass=2 fail=0 err=0")
 '''.replace("PYTHON", sys.executable).replace("OWN", OWN)
@@ -95,11 +104,31 @@ else:
         records = self.records("mere-ruby")
         self.assertEqual(sum(r["query"] for r in records), 1)
         runs = [r for r in records if not r["query"]]
-        self.assertEqual(len(runs), 5)
+        self.assertEqual(len(runs), 6)
         self.assertTrue(runs[0]["errno"])
+        self.assertEqual(runs[1]["shape_stats"], "1")
+        self.assertEqual(sum(r["shape_stats"] == "1" for r in runs), 1)
         self.assertEqual(sum(r["no_hash"] == "1" for r in runs), 2)
         self.assertTrue(all(r["library"] == OWN + ":" + FALLBACK for r in runs))
         self.assertTrue(all(r["library"] == FALLBACK for r in self.records("reference")))
+
+    def test_corpus_stops_if_a_shape_statistics_row_is_missing(self):
+        for row in ("sh_cls_var", "sh_cls_cap"):
+            with self.subTest(row=row):
+                (self.root / "missing-shape-row").write_text(row)
+                result = self.run_driver("run_corpus.sh", "--both")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"{row} holds no row keys", result.stdout)
+                self.assertFalse((self.root / "reference.jsonl").exists())
+
+    def test_corpus_stops_if_a_shape_statistics_row_exceeds_the_bound(self):
+        for row in ("sh_cls_var", "sh_cls_cap"):
+            with self.subTest(row=row):
+                (self.root / "oversized-shape-row").write_text(row)
+                result = self.run_driver("run_corpus.sh", "--both")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"{row} holds 301 keys", result.stdout)
+                self.assertFalse((self.root / "reference.jsonl").exists())
 
     def test_corpus_stops_if_own_path_query_fails(self):
         self.env["RUBYLIB"] = FALLBACK
