@@ -26,3 +26,7 @@ end
 target = Class.new
 target.module_eval('def value = 42', 'valid-probe', 1)
 p [:valid, target.new.value]
+
+target.instance_eval('def singleton_source951; [__FILE__, __LINE__]; end', 'valid-instance-probe', 11)
+p [:valid_instance_source, target.singleton_source951]
+p [:caller_restored, caller(0).first.include?('951_string_eval_syntax_error_reports.rb')]
