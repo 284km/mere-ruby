@@ -1,3 +1,16 @@
+def ordinary_mixin943(label)
+  mod = Module.new { def marker943 = :ordinary }
+  klass = Class.new do
+    include mod
+    prepend mod
+    extend mod
+  end
+  p [label, klass.new.marker943, klass.marker943,
+     klass.ancestors.count { |entry| entry.equal?(mod) }]
+end
+
+ordinary_mixin943(:before_backing)
+
 class HookModule943 < Module
   attr_accessor :events
   def append_features(base)
@@ -67,3 +80,7 @@ a.events = trace
 b.events = trace
 Class.new.include(a, b)
 p trace
+
+ordinary_mixin943(:after_backing)
+GC.start
+ordinary_mixin943(:after_collection)
