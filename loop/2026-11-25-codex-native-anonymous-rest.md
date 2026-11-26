@@ -1,3 +1,16 @@
+A targeted post-integration control found an additional observable native
+rest regression: ObjectSpace.each_object(Array) could not expose the rest
+Array retained by a closure, so mutating that Array changed Ruby's later
+closure result but not this runtime's. Publish native rests only when an
+Array-compatible ObjectSpace enumeration observes them, updating the actual
+frame slot. Include retained frames and live/suspended Fiber stack frames.
+No new global registry, normal-call check, accounting adjustment or forced GC
+is added. count_objects and Hash/Class-only enumeration keep the native path.
+Corpus 995 adds direct/keyword capture, active-frame, suspended-Fiber and
+frozen/shareable exposure cases. This correction is unbuilt; the prior
+source95 acceptance job was cancelled before admission, and running builds
+were left alone. Rebuild and replay the integrated head before publication.
+
 Current-main integration requested by the owner: merge 83bc5735. Resolve
 splat conversion by retaining native anonymous-rest/source handling and
 main's invoke_own boundary for Hash/Object to_a callbacks. Existing frame and

@@ -573,3 +573,64 @@ p [:keyword_splat_callback_snapshot, keyword_callback_capture.call, keyword_call
 keyword_value_source = [1]
 keyword_value_capture = matrix_named_kw_995(*keyword_value_source, option: keyword_source_mutation_995(keyword_value_source, 1))
 p [:keyword_value_callback_snapshot, keyword_value_capture.call, keyword_value_source]
+
+# Publishing live rest through ObjectSpace must expose the same Array the
+# retained closure or suspended frame reads, with no eager ordinary-call work.
+def exposed_rest_capture_995(*) = proc { [*] }
+def exposed_keyword_rest_capture_995(*, option: 0) = proc { [*] }
+def observe_kept_rest_995(label, marker, kept)
+  seen = 0
+  ObjectSpace.each_object(Array) do |array|
+    if array.length == 1 && array.first.equal?(marker)
+      array << :observed
+      seen += 1
+    end
+  end
+  GC.start
+  p [label, seen, kept.call.map { |value| value.equal?(marker) ? :marker : value }]
+end
+marker = Object.new
+observe_kept_rest_995(:direct, marker, exposed_rest_capture_995(marker))
+marker = Object.new
+observe_kept_rest_995(:keyword_declaration, marker, exposed_keyword_rest_capture_995(marker))
+
+def mutate_live_rest_995(marker)
+  GC.start
+  seen = 0
+  ObjectSpace.each_object(Array) do |array|
+    if array.length == 1 && array.first.equal?(marker)
+      array << :observed
+      seen += 1
+    end
+  end
+  seen
+end
+def active_exposed_rest_995(marker, *)
+  seen = mutate_live_rest_995(marker)
+  [seen, [*].map { |value| value.equal?(marker) ? :marker : value }]
+end
+marker = Object.new
+p [:active_rest_exposure, active_exposed_rest_995(marker, marker)]
+def suspended_exposed_rest_995(marker, *)
+  Fiber.yield :ready
+  [*].map { |value| value.equal?(marker) ? :marker : value }
+end
+marker = Object.new
+suspended = Fiber.new { suspended_exposed_rest_995(marker, marker) }
+suspended.resume
+seen = mutate_live_rest_995(marker)
+p [:suspended_rest_exposure, seen, suspended.resume]
+
+def frozen_exposed_rest_995(*) = proc { Ractor.shareable_proc { [*] } }
+marker = Object.new.freeze
+kept = frozen_exposed_rest_995(marker)
+seen = 0
+ObjectSpace.each_object(Array) do |array|
+  if array.length == 1 && array.first.equal?(marker)
+    array.freeze
+    seen += 1
+  end
+end
+GC.start
+isolated = kept.call
+p [:frozen_rest_exposure, seen, isolated.class, Ractor.shareable?(isolated)]
