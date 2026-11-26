@@ -303,7 +303,7 @@ exit "$(cat "$fixture_root/$side.code")"
         (self.root / "corpus").mkdir()
         (self.root / "corpus/01_arith.rb").write_text("# fixture\n")
         for name in ["gc_roots", "dup_defs", "dead_defs", "meth_writes",
-                     "name_spec", "rx_caps", "ns_names", "name_len"]:
+                     "name_spec", "rx_caps", "ns_names", "name_len", "iv_door"]:
             stub = self.root / "tools" / (name + "_check.sh")
             stub.write_text("#!/bin/sh\nexit 0\n")
             stub.chmod(0o755)
@@ -322,6 +322,10 @@ printf 'answer\\n'
 ''')
         reference.chmod(0o755)
         (self.root / "mere-ruby").write_text('''#!/bin/sh
+if [ "$MERE_RUBY_STORE_STATS" = 1 ]; then
+  printf 'sh_cls_var 0\\nsh_cls_cap 0\\n' >&2
+  exit 0
+fi
 [ "${MERE_RUBY_ERRNO_CHECK:-}" = 1 ] && exit 0
 printf 'candidate:%s\\n' "${MERE_RUBY_NO_HASH_INDEX-unset}" >> "$FIXTURE_ROOT/corpus.calls"
 printf 'answer\\n'

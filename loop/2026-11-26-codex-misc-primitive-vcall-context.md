@@ -104,3 +104,80 @@ Code, fixture, benchmark and completed record are pushed together after
 local acceptance. No full unit/Rails suite, workflow change or reference
 gem installation. These checks do not claim integration acceptance for
 later main runtime revisions.
+
+
+## R5 current-main integration
+
+PR343 exposed a prospective conflict with main
+ ee9cf5dc7044092e97f6e86aca0ec58fa5b1d741. Preserve main's real
+arg_splat_scoped entry wrapper and apply the primitive bare-call context
+handling inside invoke_val_c0_raw. Both corrections are needed; no argument
+scope or missing-call metadata is dropped. R4's completed 964 sweeps remain
+historical acceptance. Fresh R5 build, matching-main original selections,
+cost/RSS, full corpus and gates are required before the next code push.
+
+
+### Completed R5 focused and cost checks
+
+A missing bare call on primitive self now raises NameError with the actual receiver
+and vcall context; explicit and parenthesized calls retain NoMethodError. User
+method_missing/super dispatch remains effective, and a consumed missing-call reason
+cannot leak into a later conversion. Known callees must match a real Prism call/name
+node, fixing the spoofed-filename highlight without choosing an unrelated constant.
+
+The integration preserves main's arg_splat_scoped entry wrapper and applies the
+bare-call handling inside invoke_val_c0_raw. Corpus 1124 matches all 82 rows, stderr
+and exit status on both engines. Unchanged original error_highlight VCALL_2,
+spoofed_filename and FCALL_1/2 selections pass 4 tests / 26 assertions on reference
+and candidate; ruby/test_object.rb method_missing passes 1 / 5. Exact main ee9cf5dc
+has two ErrorHighlight failures and one Object failure, on both engines. One file at a
+time, fixed --seed=1.
+
+Maximum RSS bytes, original unchanged file selections, MERE_RUBY_GC_TIGHT=1 and --seed=1:
+
+| Selection | Reference | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ErrorHighlight | 34062336 | 350781440 | 322355200 | 341966848 | 393216000 |
+| Object | 22085632 | 165052416 | 165724160 | 167936000 | 169951232 |
+
+Three alternating matching-main/candidate ordinary O2 pairs, same benchmark source,
+MERE_RUBY_GC_TIGHT=1 and parsed --seed=1. Hardware instructions and seconds are
+medians; RSS is the maximum of three samples:
+
+| Workload | Engine | Main instructions | Candidate instructions | Change | Main seconds | Candidate seconds | Main RSS bytes | Candidate RSS bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| integer | evaluator | 8939077620 | 8930098197 | -0.100% | 0.662 | 0.668 | 108068864 | 107970560 |
+| integer | VM | 4998110961 | 4994668132 | -0.069% | 0.346 | 0.336 | 113115136 | 113000448 |
+| float | evaluator | 11089777175 | 11091823882 | +0.018% | 0.768 | 0.775 | 108068864 | 107954176 |
+| float | VM | 5959931092 | 5958957107 | -0.016% | 0.386 | 0.385 | 130121728 | 113246208 |
+| string | evaluator | 5167572451 | 5198807169 | +0.604% | 0.421 | 0.427 | 93208576 | 93224960 |
+| string | VM | 4281429462 | 4296426513 | +0.350% | 0.322 | 0.322 | 94175232 | 94191616 |
+| array | evaluator | 5240514380 | 5237270887 | -0.062% | 0.388 | 0.391 | 108019712 | 107905024 |
+| array | VM | 3803355226 | 3802854019 | -0.013% | 0.270 | 0.261 | 104693760 | 104710144 |
+| encoding | evaluator | 2630478465 | 2627717578 | -0.105% | 0.213 | 0.219 | 82378752 | 82264064 |
+| encoding | VM | 2335125857 | 2342224804 | +0.304% | 0.181 | 0.189 | 83263488 | 83263488 |
+
+All instruction medians are reported. In particular, String is +0.604% on the
+evaluator and +0.350% on the VM; these are measured overhead, without a claim of zero
+cost. Shared-machine wall times are observations.
+
+Candidate O2 SHA-256 a7b8ece15f818296b385f6c893f98209afdb1feb5ccf430652b2db2146147dcb;
+matching main SHA-256
+94dd4c3e662ca569d5c5c7d5b5320cdf81e1263f4ac626f73ab199fb09fbbe89. The candidate was
+freshly built after integration with exact main
+ee9cf5dc7044092e97f6e86aca0ec58fa5b1d741. The matching-main executable was reused only
+after verifying all 2706 tracked regular source files against that commit before and
+after its immutable snapshot, the mgz inputs, original successful O2 build record,
+compiler 9dec2ff6 and executable SHA. This is a verified build reuse, not a new main
+build. Both full sweeps use the same candidate binary.
+
+### Completed R5 publication acceptance
+
+- `sh run_corpus.sh --both`: 989/989 PASS, hash index ON/OFF, exit 0.
+- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: 989/989 PASS, ON/OFF, exit 0.
+- Both immutable binary proofs match the R5 SHA-256 recorded above.
+- Eight source gates, generated-C bracket depth, embedded Ruby regeneration,
+  full/explicit completed record_hygiene and whitespace checks pass.
+
+The integration code and completed record are pushed together. These results
+validate the pinned ee9cf5dc integration; R4 results remain historical.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check Ruby's C API against the reference ruby with shared C sources.
 
-    capi_check.py --ruby-source <ruby> --reference <ruby binary> --output <dir>
+    capi_check.py --ruby-source <ruby> --reference <ruby binary> --output <dir> [--vm]
 
 The same C -- Ruby's own ext/-test-/exception, typeddata, float and iter, and the
 fixtures in capi/check -- is built twice: against the reference's headers and
@@ -31,6 +31,13 @@ What each run is for:
                        by loading it: its constructors run twice, and the
                        loader contracts must FAIL
 
+--vm runs every mere-ruby side (the contracts, stress and the negative
+controls) on the ISeq VM. It has to be asked for here: the runs are started
+with no MERE_RUBY_* variable of the caller's, so `MERE_RUBY_VM=1 capi_check.py`
+ran the evaluator and said nothing about the VM. Each run is given
+MERE_RUBY_VM=report, and a contract script the VM did not take itself -- the
+evaluator ran it -- fails the check, so a pass under --vm is the VM's.
+
 A negative control that passes means the check was not looking at the thing
 it names. Each run is bounded: 120 seconds, 2 GiB (its children included).
 """
@@ -49,6 +56,7 @@ parser.add_argument('--ruby-source', type=Path, required=True)
 parser.add_argument('--reference', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--mere', type=Path, default=ROOT / 'mere-ruby')
+parser.add_argument('--vm', action='store_true', help="run mere-ruby's side on the ISeq VM")
 args = parser.parse_args()
 SRC, REF, OUT, MERE = (p.resolve() for p in (args.ruby_source, args.reference, args.output, args.mere))
 OUT.mkdir(parents=True, exist_ok=True)
@@ -117,17 +125,31 @@ def run(name, side, script, lib, extra=None):
     env['LOADER_EVENTS'] = str(events)
     if side == 'mere':
         env['MERE_LOADER_TEST'] = '1'
+        if args.vm:
+            env['MERE_RUBY_VM'] = 'report'
     env.update(extra or {})
     log = OUT / f'{name}.{script}.{side}.out'
     result = supervise([str(REF if side == 'reference' else MERE), str(CHECK / (script + '.rb'))],
                        env, log, 2 * 1024 * 1024, 120)
     result['output'] = log.read_text(errors='replace')
+    if side == 'mere' and args.vm:
+        # (=report names each file the VM did not take; the script itself
+        #  must not be one of them. "the native compiler declined" is not a
+        #  refusal: the Ruby compiler then compiles it, for the VM.)
+        refused = [l for l in result['output'].splitlines()
+                   if l.startswith('mere-ruby: vm: ') and ('/' + script + '.rb: ') in l
+                   and 'the native compiler declined' not in l]
+        if refused:
+            result['vm_refused'] = refused[0]
+            print(f'  ({name}: the VM did not take {script}.rb, the evaluator ran it -- {refused[0]})', flush=True)
     results[f'{name}.{script}.{side}'] = {k: v for k, v in result.items() if k != 'output'}
     (OUT / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
     return result
 
 
 def passed(result):
+    if 'vm_refused' in result:
+        return None
     lines = [l for l in result['output'].splitlines() if l.endswith(' passed')]
     return lines[-1] if result['exit'] == 0 and result['limit'] is None and lines else None
 
@@ -138,7 +160,7 @@ problems = []
 for script in scripts:
     answers = {side: passed(run('contracts', side, script, libs[side])) for side in ('reference', 'mere')}
     stress = passed(run('stress', 'mere', script, libs['mere'], {'MERE_RUBY_GC_STRESS': '1'}))
-    print(f"{script:10s} reference: {answers['reference']} | mere-ruby: {answers['mere']} | under stress: {stress}", flush=True)
+    print(f"{script:10s} reference: {answers['reference']} | mere-ruby{' (VM)' if args.vm else ''}: {answers['mere']} | under stress: {stress}", flush=True)
     if not answers['reference'] or not answers['mere'] or stress != answers['mere']:
         problems.append(f'{script}: a side did not finish its contracts')
         continue
@@ -151,10 +173,11 @@ for name, knob, script in [('no-dmark', 'dmark', 'typeddata'), ('no-dfree', 'dfr
                            ('no-ensure', 'ensure', 'ensure'), ('no-switch', 'switch', 'fiber'),
                            ('no-fileprobe', 'fileprobe', 'loader'), ('no-builtin', 'builtin', 'api')]:
     result = run(name, 'mere', script, libs['mere'], {'MERE_RUBY_CAPI_WITHOUT': knob})
-    failed_as_it_must = passed(result) is None and result['limit'] is None
+    failed_as_it_must = passed(result) is None and result['limit'] is None and 'vm_refused' not in result
     print(f"{name:10s} {script}: {'fails, as it must' if failed_as_it_must else 'PASSED -- the check does not see ' + knob}", flush=True)
     if not failed_as_it_must:
         problems.append(f'{name}: the {script} contracts pass without {knob}')
 if problems:
     sys.exit('capi_check: ' + '; '.join(problems))
-print('capi_check: the contracts agree on both sides, hold under collection stress, and each negative control fails')
+print('capi_check: the contracts agree on both sides' + (" (mere-ruby's on the ISeq VM)" if args.vm else '')
+      + ', hold under collection stress, and each negative control fails')
