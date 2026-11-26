@@ -440,3 +440,50 @@ empty_merge_987.define_singleton_method(:to_hash) { merge_calls_987 << :empty; {
 full_merge_987 = Object.new
 full_merge_987.define_singleton_method(:to_hash) { merge_calls_987 << :full; {a: 2} }
 p [:value_merge_evaluation, [**empty_merge_987], [1, **full_merge_987], merge_calls_987]
+
+# A scheduled Thread binds after its creator's native call has returned.
+# Retiring that call must not retire the Thread's own startup provenance.
+thread_hash_987 = Hash.ruby2_keywords_hash(a: 2)
+thread_987 = Thread.new(*[thread_hash_987]) { |a: 0| a }
+p [:thread_creator_positional, (native_splat_keyword(thread_hash_987) rescue $!.class)]
+GC.start
+p [:thread_deferred_keywords, thread_987.value]
+p [:thread_literal_keywords, Thread.new(a: 2) { |a: 0| a }.value]
+p [:thread_positional_hash, Thread.new(thread_hash_987) { |a: 0| a }.value]
+p [:thread_lambda_keywords, Thread.new(*[thread_hash_987], &->(a:) { a }).value]
+p [:thread_start_keywords, Thread.start(*[thread_hash_987]) { |a: 0| a }.value]
+p [:thread_fork_keywords, Thread.fork(*[thread_hash_987]) { |a: 0| a }.value]
+thread_copy_987 = Thread.new(*[thread_hash_987]) { |*args| args.last }.value
+p [:thread_argument_copy, thread_copy_987.equal?(thread_hash_987),
+   Hash.ruby2_keywords_hash?(thread_copy_987), Hash.ruby2_keywords_hash?(thread_hash_987)]
+thread_keep_987 = proc { |*args| args.last }.ruby2_keywords
+thread_kept_987 = Thread.new(*[thread_hash_987], &thread_keep_987).value
+p [:thread_marked_block, thread_kept_987.equal?(thread_hash_987), Hash.ruby2_keywords_hash?(thread_kept_987)]
+thread_marked_literal_987 = Thread.new(a: 3, &thread_keep_987).value
+p [:thread_marked_literal, thread_marked_literal_987, Hash.ruby2_keywords_hash?(thread_marked_literal_987)]
+thread_later_proc_987 = proc { |*args| args.last }
+thread_release_987 = Queue.new
+thread_gate_trace_987 = TracePoint.new(:thread_begin) { thread_release_987.pop }
+thread_gate_trace_987.enable
+thread_later_987 = Thread.new(a: 4, &thread_later_proc_987)
+thread_later_proc_987.ruby2_keywords
+GC.start
+thread_release_987 << true
+thread_later_hash_987 = thread_later_987.value
+thread_gate_trace_987.disable
+p [:thread_later_policy, thread_later_hash_987, Hash.ruby2_keywords_hash?(thread_later_hash_987)]
+thread_snapshot_987 = Thread.new(*[thread_hash_987]) { |a: 0| a }
+thread_hash_987[:a] = 9
+p [:thread_argument_snapshot, thread_snapshot_987.value, thread_hash_987[:a]]
+thread_hash_987[:a] = 2
+thread_special_987 = Thread.new(*[special]) { |*args| args.last }.value
+p [:thread_copy_metadata, thread_special_987.class, thread_special_987.default,
+   thread_special_987.compare_by_identity?, thread_special_987.instance_variable_get(:@value)]
+thread_observations_987 = []
+thread_trace_987 = TracePoint.new(:thread_begin) do
+  thread_observations_987 << (native_splat_keyword(thread_hash_987) rescue $!.class)
+end
+thread_trace_987.enable
+Thread.new(*[thread_hash_987]) { |a: 0| a }.value
+thread_trace_987.disable
+p [:thread_begin_positional_callback, thread_observations_987]

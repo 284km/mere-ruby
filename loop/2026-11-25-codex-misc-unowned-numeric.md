@@ -25,7 +25,7 @@ No deadline, budget, assertion or test size was changed.
 | test_float_fdiv | Finite 1e300 quotient becomes Infinity | Integer receiver is converted before Float division; fix in this PR. |
 | test_interrupt_during_to_s | Expected thread.raise is not delivered during conversion | Scheduler interrupt boundary; investigate separately. |
 | test_to_f | Missing out-of-Float-range warning | Same conversion-warning cause as test_divide. |
-| test_to_s2 | ECHILD instead of RangeError | Process wait flags lose C-int overflow check; investigate with integer argument conversion. |
+| test_to_s2 | ECHILD instead of RangeError | Process wait flags miss NUM2UINT: unsigned-int width, negative wrapping, and unsigned-long bounds; separate from signed radix conversion. |
 | test_pow | Existing per-test timeout after 6 assertions | Huge negative exponent work/interrupt path; investigate separately. |
 
 ## First cause: overflowing Integer receiver in fdiv
