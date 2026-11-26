@@ -95,3 +95,62 @@ this conversion correction. It retains exact failing test names and keeps
 resource timeouts separate from established leaks. Code, corpus, benchmark
 and completed records are committed together. No full unit or Rails
 component suite was run; no workflow changed.
+
+## Review correction: warning leaves, exact formatting and current acceptance
+
+This section supersedes the earlier candidate's implementation and cost
+figures. The two review findings are handled together. Ordinary Float and
+builtin dispatch keep their original direct primitive calls; the new
+overflow hook is reached only at actual Big-to-Float conversion leaves.
+The hook dispatches the real Warning.warn in the active runtime frame.
+Exact Integer/Rational %f formatting bypasses Float conversion entirely.
+The private accurate fdiv/comparison conversions remain private.
+
+Expanded corpus 1119 has 123 rows, including four arithmetic warning-hook
+exceptions, later conversion cleanup and exact-format controls. Stdout,
+stderr and status match clean Ruby on both engines. Original Bignum to_f
+and divide still pass 2 tests / 10 assertions on reference and candidate,
+versus main fd5f54b0's 2 / 6 with two failures.
+
+| Fixed-seed tight-GC RSS bytes | Reference | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original Bignum selection | 22396928 | 179191808 | 179568640 | 177455104 | 179142656 |
+
+Three alternating pairs, GC_TIGHT and --seed=1; hardware instruction
+medians and maximum RSS across all three runs:
+
+| Engine | Workload | Instruction change | Main max RSS bytes | Candidate max RSS bytes |
+| --- | --- | ---: | ---: | ---: |
+| eval | integer | +0.031% | 73613312 | 73613312 |
+| eval | float | +0.006% | 73629696 | 73613312 |
+| eval | rational | +0.113% | 71696384 | 71712768 |
+| eval | mixed | +0.035% | 71483392 | 71401472 |
+| eval | to_f | +0.267% | 73613312 | 73662464 |
+| eval | float_loop | -0.090% | 108756992 | 108756992 |
+| eval | builtin_calls | -0.017% | 108724224 | 108756992 |
+| vm | integer | +0.071% | 74776576 | 74678272 |
+| vm | float | -0.007% | 74809344 | 74711040 |
+| vm | rational | +0.028% | 72859648 | 72761344 |
+| vm | mixed | +0.090% | 72646656 | 72499200 |
+| vm | to_f | +0.144% | 74809344 | 74678272 |
+| vm | float_loop | +0.097% | 109772800 | 109658112 |
+| vm | builtin_calls | -0.020% | 109903872 | 109789184 |
+
+Every common-workload instruction range overlaps main. The finite Big
+to_f evaluator range does not: its measured +0.267% is the check on actual
+Big conversion, and is reported rather than called unchanged. VM to_f is
++0.144% with overlapping ranges. No new common dispatch wrapper remains.
+Current ordinary O2 SHA-256:
+080f039133c7176c5e0d0b09c850cf85a40366f67c1d9bec9e2ac076300ebdf2.
+Final review-corrected acceptance on this exact binary:
+
+- `sh run_corpus.sh --both`: 949/949, hash index ON/OFF, exit 0.
+- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: 949/949, ON/OFF, exit 0.
+- Eight source gates and generated-C bracket depth: PASS.
+- Full and explicit loop record_hygiene and whitespace checks: PASS.
+
+These are new completed sweeps of the review-corrected binary, independent
+of the earlier candidate's 949 totals. Suggestions about Kernel Float's
+internal Ruby frame and other public conversions are recorded follow-ups;
+they are not claimed fixed. Code, regression and this completed record
+are committed and pushed together.

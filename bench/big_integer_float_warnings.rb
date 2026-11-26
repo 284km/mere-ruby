@@ -29,6 +29,16 @@ when "to_f"
   sum = 0.0
   count.times { sum += big.to_f }
   sum
+when "float_loop"
+  sum = 0.0
+  count.times { |i| sum = sum + i * 0.5 * 1.5 }
+  sum
+when "builtin_calls"
+  s = "abc"
+  a = [1, 2, 3]
+  sum = 0
+  count.times { sum += s.size + a.first + a.size }
+  sum
 when "warnings"
   $VERBOSE = true
   warnings = []

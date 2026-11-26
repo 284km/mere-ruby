@@ -32,6 +32,11 @@ cases = {
   coerce: -> { big.coerce(1.0) },
   pack: -> { [big].pack('d').unpack('d') },
   sprintf: -> { format('%g', big) },
+  fixed: -> { format('%f', big) },
+  fixed_percent: -> { '%f' % big },
+  fixed_precision: -> { format('%10.2f', -big) },
+  exponential: -> { format('%e', big) },
+  hexadecimal: -> { format('%a', big) },
   rational: -> { Rational(big, big).to_f },
   pow_zero: -> { big ** 0.0 },
   mod_zero: -> { big % 0.0 },
@@ -57,7 +62,7 @@ cases = {
 end
 
 $VERBOSE = true
-[:to_f, :float_soft, :complex_soft, :sprintf, :pack].each do |name|
+[:to_f, :float_soft, :complex_soft, :sprintf, :pack, :add, :radd, :mod_zero, :divmod_zero].each do |name|
   warning_mode.replace([:raise])
   begin
     result = case name
@@ -66,6 +71,10 @@ $VERBOSE = true
              when :complex_soft then Float(Complex(big, 0), exception: false)
              when :sprintf then format('%g', big)
              when :pack then [big].pack('d')
+             when :add then big + 1.0
+             when :radd then 1.0 + big
+             when :mod_zero then big % 0.0
+             when :divmod_zero then big.divmod(0.0)
              end
     p [name, :returned, result]
   rescue RuntimeError => error
