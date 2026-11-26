@@ -124,3 +124,10 @@ This combined source is local, unbuilt and unaccepted. Replay corpus 987 and
 alone, all source gates/record hygiene, corpus index ON/OFF then VM, instructions
 and controlled large-file RSS. Treat PR 242 as a dependency until it is merged;
 do not relabel the earlier independent-head results as integrated acceptance.
+
+Integrate parent source 8f0bd866 and main 85da98fb without manual conflict
+resolution. Preserve the early block keyword-rest acquisition and incoming
+origin retirement, plus the complete Method ivar API port and new main
+runtime changes. The parent focused controls pass; this combined ownership
+source remains unbuilt and needs its own complete validation before a push.
+Only source and git work takes place during parent allocation measurements.
