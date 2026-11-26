@@ -1,77 +1,55 @@
-# B13: independent class namespaces in Ruby::Box
+# B13: independent class identities in Ruby boxes
 
-Branch codex-misc-box-isolation starts from main fdda9150. Clean Ruby
-4.0.10 gives each box its own Example1112 class and nested constants;
-main leaks the first box's class namespace into the second.
+Boxes that define the same displayed class name shared its internal
+identity. Every newly defined box-owned class/module now receives its own
+internal identity. Qualified lookups follow the box's constant binding,
+including aliases, reopening and the VM include path. Outside boxes, a
+removed constant starts a fresh identity; ordinary reopening remains the
+same class. Registering the new class's lexical scope through the common
+path also fixes Timeout::State::GET_TIME when a box requires Timeout.
 
-Every newly defined box-owned class or module now gets an independent
-internal identity, including the first one with a display name. Nested
-bodies enter their real lexical constant scope. Qualified class resolution
-follows the actual box-local constant bindings, including the VM's include
-path, instead of reconstructing a shared display-name key.
+## Review integration completed
 
-Corpus 1112 checks two boxes, same-named classes, aliases, absolute paths,
-nested modules/constants, reopening, class names and identity, and a
-three-level nested mixin. Both engines match the clean reference. The
-fixture enables the real feature with RUBY_BOX=1 in its child process.
-No constant-read wrappers or replacement test helper are used.
+The review of head cd8e47f8 required integration after #262, #285 and #288
+changed the class-definition/singleton paths. This revision merges main
+f4303e14 and validates the resulting tree with a fresh ordinary O2 build.
+Older r6 sweeps are superseded by the following actual r7 results:
 
-## Related unchanged upstream file
+- `sh run_corpus.sh --both`: 965/965, hash index ON and OFF, exit 0.
+- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: 965/965, ON and OFF, exit 0.
+- Eight source gates, generated-C bracket depth, full and explicit loop
+  record_hygiene and staged/unstaged whitespace checks: PASS.
 
-The four selected test_box.rb cases pass 53 assertions on reference and
-both candidate engines. Main runs only 8 assertions before the existing
-Timeout GET_TIME NameError; the corrected lexical scope also fixes that
-error. RSS comparisons therefore include more completed work in candidate.
+Binary SHA-256:
+`7a62b41a2efccd196b46f01c854eebff888ed73ac1e7ca260c110bf0670809a7`.
+Compiler 9dec2ff6; mgz 661a01d8. Reference is clean Ruby 4.0.10 selected by
+`tools/ref_ruby.sh`. Matching main control is a fresh f4303e14 O2 build.
 
-| File | Candidate result | Main evaluator RSS | Candidate evaluator RSS | Main VM RSS | Candidate VM RSS |
-| --- | --- | ---: | ---: | ---: | ---: |
-| ruby/test_box.rb | 4 tests, 53 assertions, 0 failures, 0 errors, 0 skips | 258359296 | 282214400 | 260243456 | 279232512 |
+Requested targeted corpus comparisons match stdout, stderr and status on
+both engines: 1112 (14 rows), 1057 (72), 1061 (44), and 1062 (22).
+Corpus 1112 also matches on both engines with RUBY_BOX=1; only the exact
+reference/candidate executable prefix in the experimental warning is
+canonicalized, leaving both warning lines and their text intact.
 
-## Validation policy
+The unchanged ruby/test_box.rb selections add_constants_in_box,
+eval_with_constants, eval_with_classes and
+very_basic_method_calls_and_constants pass 4 tests / 53 assertions on
+reference and both candidate engines, with RUBY_BOX=1. Main completes only
+8 assertions and errors at Timeout::State::GET_TIME on each engine. These
+are selected related cases, not a whole-file claim.
 
-The reference is the clean pinned Ruby 4.0.10. The unchanged upstream
-files above run one file at a time, against main and both candidate engines,
-with `--seed=1` and `MERE_RUBY_GC_TIGHT=1`. RSS is max resident bytes from
-`/usr/bin/time -l`. No gems are installed into the reference.
+Maximum RSS bytes, /usr/bin/time -l, MERE_RUBY_GC_TIGHT=1 and --seed=1:
 
-The O2 compiler/mgz pins are unchanged. The completed current-integration
-acceptance below supersedes the earlier queued sweeps. No full unit suite
-or Rails component suite was run; no new workflow changes.
-
-
-## Current-main integration
-
-The integration with main fd5f54b0 preserves fresh identities after removed
-constants outside boxes, while every newly defined box-owned class remains
-independent. Corpus 1112 and the expanded 1057 outside-box controls match
-stdout, stderr and status on both engines. Earlier 884/884 sweeps apply to
-the earlier head; fresh ordinary O2 r6 results are:
-
-- sh run_corpus.sh --both: 949/949, hash index ON/OFF, exit 0.
-- MERE_RUBY_VM=1 sh run_corpus.sh --both: 949/949, ON/OFF, exit 0.
-- All eight source gates and full/explicit record_hygiene: pass.
-- Generated-C bracket depth: 155 required / 1024 supplied, pass.
-- Staged/unstaged diff whitespace checks: pass.
-
-The exact binary SHA-256 is
-e97a2cc29797e4c19c2e0b022896cc621146cdfbb392bc760506d7881c8c739f.
-Clean Ruby 4.0.10 is selected through tools/ref_ruby.sh; compiler 9dec2ff6
-and mgz 661a01d8, matching the main fd5f54b0 control build.
-
-Unchanged ruby/test_box.rb selections add_constants_in_box,
-eval_with_constants, eval_with_classes and very_basic_method_calls_and_constants
-pass 4 tests / 53 assertions on reference and both candidate engines.
-Main completes only 8 assertions and errors at Timeout::State::GET_TIME
-in both engines; the corrected box lexical scope removes that error too.
-RSS therefore includes substantially more completed work in the candidate
-and is not a matched-workload heap-growth comparison. All invocations use
-MERE_RUBY_GC_TIGHT=1, fixed --seed=1, one file at a time. Max RSS bytes:
-
-| Engine | Main | Candidate |
+| Engine | Main f4303e14 | Candidate |
 | --- | ---: | ---: |
-| Evaluator | 251674624 | 284033024 |
-| VM | 255967232 | 279822336 |
+| Evaluator | 242008064 | 281395200 |
+| VM | 255541248 | 279986176 |
 
-The completed record is committed with the code integration in one push.
-No reference gems, full unit/Rails suite or new workflow behavior. Main
-commits newer than this pinned integration are not claimed runtime tested.
+The candidate completes 45 more assertions and more stdlib loading, so
+this table is not a matched-workload heap-growth comparison. No pass is
+claimed for main's error. A1's separate missing Box prelude loaded features
+remain outside this class-identity fix; no feature entry is fabricated.
+
+The integration and completed record are pushed together after the local
+checks. No full unit or Rails suite, reference gem installation or workflow
+change. Main commits after the pinned integration are not claimed tested.

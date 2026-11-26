@@ -22,6 +22,46 @@ end
 A = ApiFixture
 check(said == '')
 
+# C ancestry operations bypass receiver overrides and module callbacks.
+[Module, Class.new(Module)].each do |kind|
+  3.times do |operation|
+    mod = kind.new
+    mod.module_eval { def native_mixin_marker = 42 }
+    [:append_features, :included, :prepend_features, :prepended, :extend_object, :extended].each do |hook|
+      mod.define_singleton_method(hook) { |*args| raise "native mixin called Ruby hook" }
+    end
+    target = operation == 2 ? Object.new : Class.new
+    [:include, :prepend, :extend, :singleton_class].each do |method|
+      target.define_singleton_method(method) { |*args| raise "native mixin dispatched Ruby override" }
+    end
+    check(A.native_mixin(target, mod, operation).equal?(target))
+    check((operation == 2 ? target : target.new).native_mixin_marker == 42)
+  end
+end
+
+# Native insertion refuses refinement arguments without leaking their methods.
+native_refinery = Module.new do
+  refine(String) { def native_refinement_leak = 123 }
+end
+native_refinement = native_refinery.refinements.first
+3.times do |operation|
+  target = operation == 2 ? String.new : Class.new(String)
+  ancestry = operation == 2 ? target.singleton_class : target
+  original_ancestors = ancestry.ancestors
+  error = raises(ArgumentError) { A.native_mixin(target, native_refinement, operation) }
+  check(error.message == "refinement module is not allowed")
+  check(ancestry.ancestors == original_ancestors)
+  check(!(operation == 2 ? target : target.new).respond_to?(:native_refinement_leak))
+  frozen_target = (operation == 2 ? Object.new : Class.new).freeze
+  raises(FrozenError) { A.native_mixin(frozen_target, native_refinement, operation) }
+end
+# The C API still permits an ordinary module to be inserted into a refinement.
+2.times do |operation|
+  plain_module = Module.new
+  A.native_mixin(native_refinement, plain_module, operation)
+  check(native_refinement.ancestors.include?(plain_module))
+end
+
 # Native flags never call a Ruby predicate, including during mirror refresh.
 [-> { Class.new }, -> { Module.new }, -> { Object.new }, -> { +'' },
  -> { [] }, -> { {} }, -> { proc {} }, -> { binding }].each do |factory|
