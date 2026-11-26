@@ -232,7 +232,11 @@ asked of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
   print the same on both sides, and again on this side with a collection at
   every safepoint. Then six guarantees are switched off one at a time
   (`MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch|fileprobe|builtin`) and the
-  contracts that depend on each must fail.
+  contracts that depend on each must fail. CI runs it a second time with
+  `--vm`: all of that again with this side on the ISeq VM. The runs start
+  with none of the caller's `MERE_RUBY_*` settings, so `MERE_RUBY_VM=1` in
+  front of the command does nothing -- the flag is how the VM is asked for,
+  and a contract script the VM does not take itself fails the run.
 - The unit test run builds all of `ext/-test-` and runs `test/-ext-` against
   it, file by file, like every other directory of ruby's tests.
 - `tools/capi_mkmf_check.py` (CI, macOS and Linux): an extension whose
