@@ -16,7 +16,10 @@ p /(?<!\u{65E5 672C})x/.match("日本x")&.begin(0)
   [/(?<=\u{65E5 1F600})x/, "日😀x"],
   [/(?<=\A\xE6\x97\xA5)x/, "日x"],
   [/(?<!\A\xE6\x97\xA5)x/, "日x"],
-  [/(?<=[ab]\xE6\x97\xA5)x/, "a日x"]
+  [/(?<=[ab]\xE6\x97\xA5)x/, "a日x"],
+  [Regexp.new('(?<=\xE6\x97\xA5{1})x'), "日x"],
+  [Regexp.new('(?<!\xE6\x97\xA5{1})x'), "日x"],
+  [Regexp.new('(?<=[ab]\xE6\x97\xA5{1})x'), "a日x"]
 ].each { |regexp, string| p regexp.match(string)&.begin(0) }
 [
   [/(?<=表)a/, "表a"],
