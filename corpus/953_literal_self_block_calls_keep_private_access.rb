@@ -57,3 +57,47 @@ p forwarder.symbol
     p [method, error.class, error.name]
   end
 end
+
+class CatchForwarder953
+  def call(&block)
+    self.capture(&block)
+  end
+
+  def nonlocal_return
+    catch(:done, &proc { return :returned })
+    :unreached
+  end
+
+  private
+
+  def capture(&block)
+    catch(:done, &block)
+  end
+end
+
+catcher = CatchForwarder953.new
+p [:catch_value, catcher.call { :executed } == :executed]
+p [:catch_throw, catcher.call { |tag| throw tag, :caught } == :caught]
+p [:catch_return, catcher.nonlocal_return]
+p [:catch_implicit_tag, catch(&proc { |tag| tag.is_a?(Object) })]
+p [:catch_explicit_receiver, Kernel.catch(:done, &proc { |tag| tag })]
+
+class CatchConvertible953
+  attr_reader :calls
+  def initialize
+    @calls = 0
+  end
+  def to_proc
+    @calls += 1
+    proc { :converted }
+  end
+end
+converted = CatchConvertible953.new
+p [:catch_conversion, catch(:done, &converted) == :converted, converted.calls]
+[proc { catch(:done, &nil) }, proc { catch(:done, &lambda { :strict }) }].each do |invocation|
+  begin
+    invocation.call
+  rescue LocalJumpError, ArgumentError => error
+    p [:catch_error, error.class.name]
+  end
+end
