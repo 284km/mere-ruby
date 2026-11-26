@@ -21,6 +21,27 @@ class Forwarder953
   class_eval("def generated(...) = self.target(:generated, ...)")
 end
 
+class << Forwarder953
+  private def target(&block) = block ? block.call : :none
+  def forwarded(...) = self.target(...)
+end
+p [:class, Forwarder953.forwarded { :class_block }]
+
+module RefineForwarder953
+  refine Forwarder953 do
+    def target(*args, **keywords, &block)
+      [:refined, args, keywords, block ? block.call : :none]
+    end
+  end
+end
+using RefineForwarder953
+class Forwarder953
+  def refined
+    self.target(:argument, key: 3) { :refined_block }
+  end
+end
+p [:refinement, Forwarder953.new.refined]
+
 forwarder = Forwarder953.new
 [:forwarded, :explicit, :bare, :generated].each do |method|
   p [method, forwarder.public_send(method, 1, key: 2)]
