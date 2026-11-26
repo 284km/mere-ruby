@@ -1,0 +1,227 @@
+# Store anonymous rest arguments in the owning frame
+
+## Cause and representation
+
+Anonymous method rest parameters created an Array on every call, including
+empty calls and nested forwarding for which Ruby does not need an Array.
+Store synthesized arguments as an immutable native list in the existing
+VIcl representation. Its owning frame, including a captured closure, retains
+the Ruby values through GC. Named rest parameters remain independent Arrays.
+No allocation counter, counting exclusion or dummy Ruby object is added.
+
+The private parameter is `__ar~`; Ruby identifiers and Binding writes cannot
+collide with it. Parameter normalization, VM locals, bare super, reflection
+and the Proc outer-variable walk preserve its private identity. In particular,
+pbase must preserve the tilde instead of aliasing the legal local `__ar`.
+Check that private identity only when its marker is encountered; ordinary
+parameter names keep the original scan without a per-parameter guard.
+Anonymous block parameters retain their existing binding behavior.
+
+Explicit splats and bare super expand native storage. VM Array concatenation
+and keyword append materialize ordinary Arrays. Eligible borrowed splats
+retain the actual source Array, including frozen state and later mutation.
+Direct empty calls and eligible nil splats privately represent Ruby's shared
+frozen empty Array as nil. Optional/post signatures that require a new rest
+retain synthesized native storage until it is observed.
+
+## Review: shareable Proc isolation
+
+The review reproduction captures anonymous rest through bare super in
+Ractor.shareable_proc. The exact private parameter name must contribute to
+the outer-variable set. Isolation materializes synthesized rest only when
+observed, so rejection reports the ordinary Array and variable '*', rather
+than accepting it or exposing a generic internal exception. Existing actual
+Arrays retain deep shareability and frozen-state checks. A no-splat empty
+call has different reference behavior from an explicit unfrozen empty Array.
+
+The reserved key zero of the existing splat-note map retains source identity;
+fixed native slots retain the suffix and original spread lengths. GC follows
+a pending positive source handle. Binding consumes the note. Signatures that
+can run defaults or destructuring callbacks retain the source in a private
+frame slot. A sole anonymous formal has no callback or GC safepoint before
+rest installation: a third fixed integer slot transfers provenance only over
+that atomic interval, and is reset before installation. This avoids generic
+per-call local tuples, temporary VArr wrappers and frame-map traffic. Native leaf, block,
+iterator, sender and Method boundaries consume Array provenance. Idempotent
+native deletion already handles an empty table, so cleanup needs no separate
+presence probe.
+
+A synthetic native rest needs only its refusal note: skip source-length
+walks and fixed-slot writes that only an actual Array or nil can use.
+Binding recognizes that refusal before reading the unused source lengths.
+
+Array provenance is not a flagged Hash. Parse keyword formals in this branch
+only when the actual trailing Hash has a ruby2_keywords splat note. Borrow
+only at the matching positional-prefix boundary, without optional/post or
+ruby2_keywords copying; do not compare every Array element. When a flagged trailing Hash is copied
+or peeled as keywords, the original Array is no longer the positional rest:
+retain the converted snapshot instead. Regressions cover subsequent source
+Hash mutation and preventing peeled keywords from appearing positionally.
+
+## Block conversion and ownership
+
+Scope pending Array provenance across block conversion. The existing
+temporary iterator root keeps an ephemeral source alive while to_proc or a
+block expression can call Ruby and GC. Exceptions remove the scoped state.
+A growing-call-count memory probe exposed deleted native root copies retained
+in the default arena. Give the existing root table owned storage and include
+it in GC churn accounting and compaction. Its only reader finishes during
+marking; no borrowed entry survives into compaction. The regression first
+accumulates deleted roots with automatic GC disabled, then collects while
+an ephemeral conversion source is held, exercising compaction with a live
+root as well as marking. Reuse the actual native source value when installing
+an eligible borrowed rest, instead of constructing a second VArr wrapper
+with the same handle on every call. No temporary caller-owned wrapper needs
+to survive after the frame stores its value. This reclaims real bookkeeping
+storage without changing Ruby allocation counts.
+
+CRuby compile.c setup_args_dup_rest_p distinguishes a simple block variable
+from a complex expression that can modify its splat. Preserve the source
+through simple-variable to_proc, but snapshot native argument storage before
+a complex block expression. VM splatarray retains its own copy flag.
+
+Common Array, native-list and nil splats keep their existing Val without a
+conversion-helper call or reboxing. A live plain block local holding Proc or
+nil needs no callback scope; custom to_proc still does. Include the existing
+anonymous block local used by `...` and `&`, so ordinary forwarding of an
+existing Proc or nil does not allocate a callback scope or temporary root. Pseudo variables and
+implicit numbered parameters retain the full evaluation path. No ordinary
+call receives counting-only work.
+
+## Regression and measurement
+
+Corpus 995 has 63 output lines covering the exact review reproduction,
+direct/explicit/frozen/nil/converted splats, deep shareability, source aliasing
+across GC, leading/optional/post parameters, repeated splats, local/Binding
+collisions, reflection, large arguments, native boundaries, empty super,
+keyword append, block conversion mutation, exceptions and ephemeral roots.
+The final 63-line candidate also checks converted Proc identity, lambda
+behavior, fresh captured locals after GC, and scoped/snapshot Symbol blocks.
+All 63 regression lines match clean Ruby 4.0.10 on both engines, normally
+and under GC stress 50, with empty stderr. GC-root, duplicate-definition
+and dead-definition gates pass on this candidate. Final-head corpus 664, hardware profiles, isolated allocation
+file and full corpus/gate results are required before the batched push.
+
+Measure all 76 ruby/test_allocation.rb cases alone on each engine, without
+other runtime probes. The main control is 8 MATCH / 68 RED in both modes.
+Its atomic differences group into excess rest Arrays (218), excess keyword
+Hashes (504), missing CRuby temporary Arrays (198), missing temporary Hashes
+(8), and ruby2_keywords copying (28). These are assertion counts, not disjoint
+test counts. Generic forwarding and keyword ownership are separate changes.
+Record remaining model-specific temporaries as not matched, with the reason;
+never allocate unused objects to imitate CRuby's counts.
+
+Post ordinary method/block loops, unchanged so_matrix, anonymous forwarding,
+other affected forwarding/proxy profiles, and large-file max RSS before/after.
+An instruction regression on every call is not an acceptable allocation fix.
+Run corpus --both and the VM corpus (VM/fallback/difference counts), all nine
+source gates and record_hygiene. Run one corpus sweep at a time; do not run
+the full unit suite or Rails cold measurement. Batch code and records into a
+single push after local checks, then read all inline review comments again.
+
+A wider probe found captured optional parameters falsely reported as
+reassigned on the main control too. Keep that separate existing Ractor cause
+visible rather than changing expected output to hide it.
+
+## Integrate current main after the CI fixes
+
+The pre-integration head f6ef0bb8 completed all local acceptance: 63 focused
+lines normally and under GC stress 50 on both engines, corpus 664's 27 lines
+in both conditions, the full 76-case allocation file alone on both engines,
+24 hardware-instruction profiles, memory controls, 893 corpus programs with
+hash indexing ON/OFF and 893 on the VM with no fallback or difference, all
+nine source gates and record_hygiene. Those measurements are historical
+after this main integration, not acceptance of a different source tree.
+
+Merge main 779c7cc9 to include the CI integrity fixes and current Action Pack
+and C API frozen-state changes. Replay acceptance against the same main
+control before the next batched push. Record unchanged MATCH/RED totals and
+the newly missing CRuby temporary Arrays honestly; do not create dummy
+objects. Keep one corpus sweep at a time and run the allocation file alone.
+
+Main now contains other streams' corpus 989 through 992. Renumber this
+unmerged regression from 991 to the free number 995. Keep its descriptive
+filename and all 63 assertions unchanged. Generic forwarding and keyword
+rest use 993 and 994; the next keyword-packet regression uses 996. Update
+the PR's references with the integrated results in the same push.
+
+## Follow the iterator-mapping integration
+
+Merge main a9e68981 for the same acceptance baseline as PR 242. Preserve
+main's Hash mapping conversion before iteration and this change's native
+argument ownership. For anonymous rest, consume incoming Array provenance
+before any mapping to_hash callback. Validate the integrated regression and
+main's mapping corpus before recording final-head acceptance; earlier
+779c7cc9 measurements retain their exact revision labels.
+
+## Current-main integration and lexical super blocks
+
+Integrate main ecd65075 before final acceptance. At the explicit super block
+conflict, retain this branch's coerce_block_arg snapshot/root policy for an
+explicit block expression and main's lexical_yield_block selection for an
+implicit block from define_method. Keep main's singleton metadata lifetime,
+formatter, C API and monotonic-clock changes. Replay main's corpus 1105 on
+both engines, normally and under GC stress, alongside 995/941/664; the two
+sides of that conflict must both hold.
+
+Rebuild in O2 and compare the isolated allocation file on both engines with
+this same main. Repeat ordinary/anonymous/forwarding/proxy instructions,
+coercion RSS, full corpus ON/OFF, VM counts, all source gates, record_hygiene
+and large-file RSS. Earlier a9e68981 results are historical. Use shared
+two-run admission, serialize corpus sweeps and isolate allocation files;
+batch code, merge resolution and records in one push after validation.
+
+## Integrate the keyword-copy review corrections
+
+Merge local PR 242 source f2c40d61 on current main ccb68952 before the next
+validation. Keep its call/value splat separation, shared native Method entry,
+world-aware Module#name and native callback argument-origin boundaries.
+
+Anonymous-rest Array provenance now uses a fourth fixed native integer slot
+beside its existing suffix/span/pending slots. It no longer occupies key zero
+in the removed ruby2_keywords map. A positive source handle keeps its explicit
+manual GC root; block-conversion scopes retain their scoped roots and restore
+source provenance. The common conversion helper retains the original Array
+for actual call splats; the value walker reads its values without publishing
+call provenance. Method and block binding retire both independent notes.
+
+A native Hash copy uses the raw Hash primitive so that copying/dropping a
+flagged tail does not erase the Array-provenance refusal before the anonymous
+binder reads it. This invokes no user dup or initialize_copy hook and creates
+no scratch map. Native Method, sender, iterator and primitive entry keep their
+source retirement; the Method proxy continues using PR 242's shared helpers.
+
+This source is local, unbuilt and unaccepted. Replay 987, 995 and the original
+664 isolation regression on both engines, normally and with GC stress, plus
+main's lexical-yield/singleton-name/declaration controls. Repeat the standalone
+allocation file, controlled RSS and coercion-source loops, retired instruction
+counts, all source gates/record hygiene, full corpus ON/OFF and VM counts.
+Treat PR 242 as a dependency until it is merged; earlier independent-head
+results do not establish this combined tree's correctness or resource use.
+
+Integrate parent source 8f0bd866 and main 85da98fb without manual conflict
+resolution. Keep the independent Array-origin slots, refusal marker and raw
+native Hash-copy entry alongside the parent Method ivar API port and runtime
+updates. The parent passes its focused controls; this source is unbuilt.
+Its own Ractor/callback, allocation, RSS, instruction and full corpus checks
+remain required. No dependent runtime overlaps parent allocation measurements.
+
+## Keyword peeling after the frame-door integration
+
+Merge parent 4f4694ec and main d4414ac2. The fresh dc130ec6 O2 replay
+matches all 127 corpus 987 lines normally and under stress on both engines,
+but corpus 995 exposes a positional borrowing regression. For a flagged
+Hash h, anonymous_keywords(*[3, h]) returns [[3, h], {a: 9}] instead of
+Ruby's [[3], {a: 9}]. A separate minimal probe confirms the same difference
+on both engines; parent 44819352 and clean Ruby agree. Captured rest and
+Ractor isolation diagnostics also retain the Hash incorrectly.
+
+The source Array cannot be borrowed after its final Hash is peeled into
+keywords. Keep the already bound positional slice in native storage instead.
+Explicit keywords following the spread still permit the original borrowing
+path. This changes only anonymous-rest provenance handling, with no work on
+ordinary calls and no unused Ruby Array. Corpus 995 adds frozen and unfrozen
+sources, a keyword-only spread, captured snapshots across GC, isolation text
+and frozen explicit-keyword controls. The fixed source is unbuilt and needs
+fresh both-engine focus, file/resource/performance and full corpus acceptance
+before publication; the failing dc130ec6 binary and C remain preserved.
