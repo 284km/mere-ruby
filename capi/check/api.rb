@@ -22,6 +22,23 @@ end
 A = ApiFixture
 check(said == '')
 
+# C ancestry operations bypass receiver overrides and module callbacks.
+[Module, Class.new(Module)].each do |kind|
+  3.times do |operation|
+    mod = kind.new
+    mod.module_eval { def native_mixin_marker = 42 }
+    [:append_features, :included, :prepend_features, :prepended, :extend_object, :extended].each do |hook|
+      mod.define_singleton_method(hook) { |*args| raise "native mixin called Ruby hook" }
+    end
+    target = operation == 2 ? Object.new : Class.new
+    [:include, :prepend, :extend, :singleton_class].each do |method|
+      target.define_singleton_method(method) { |*args| raise "native mixin dispatched Ruby override" }
+    end
+    check(A.native_mixin(target, mod, operation).equal?(target))
+    check((operation == 2 ? target : target.new).native_mixin_marker == 42)
+  end
+end
+
 # Native flags never call a Ruby predicate, including during mirror refresh.
 [-> { Class.new }, -> { Module.new }, -> { Object.new }, -> { +'' },
  -> { [] }, -> { {} }, -> { proc {} }, -> { binding }].each do |factory|
