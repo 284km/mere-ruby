@@ -48,9 +48,15 @@ def job_timing(job, observed):
     # wholly earlier completed execution; other inverted timestamps still fail.
     copied_execution = bool(job.get('run_attempt', 1) > 1 and status == 'completed'
                             and created and start and end and start <= end < created)
+    # A workflow cancellation can be stamped before its unassigned dependent
+    # jobs are materialized. Their queue interval is unobservable; keep the
+    # raw times and cancellation, without accepting an inverted execution.
+    cancelled_record = bool(status == 'completed' and conclusion == 'cancelled'
+                            and not started and created and end and end < created)
     delay_reason = ('execution_precedes_rerun_record' if copied_execution else
+                    'cancellation_precedes_job_record' if cancelled_record else
                     'missing_creation_time' if created is None else None)
-    start_delay = (None if conclusion == 'skipped' or copied_execution
+    start_delay = (None if conclusion == 'skipped' or copied_execution or cancelled_record
                    else seconds(created, wait_end))
     steps = []
     for step in job.get('steps', []):
@@ -141,6 +147,8 @@ def markdown(report):
              'throttling and runner availability. Queued rows show elapsed waiting at observation. '
              'Carried-forward executions in reruns retain their original execution time, but their '
              'start delay is unknown when the new record was created after completion. '
+              'Unassigned cancelled jobs completed before their record was created also have '
+              'unknown start delay. Raw timestamps and cancellation conclusions are retained. '
              'Created-after-run time includes dependency/planning delay; it is not attributed '
              'solely to dependencies. Execution is runner wall time, including setup and cleanup.', '',
              f'Measured work span: **{duration(report["measured_work_span_seconds"])}** '
