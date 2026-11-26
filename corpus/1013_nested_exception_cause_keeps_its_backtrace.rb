@@ -35,3 +35,37 @@ rescue => first
     p second.cause.backtrace == first.backtrace
   end
 end
+
+class BareRescueWrapper1013 < StandardError
+  attr_reader :cause
+  def initialize
+    super($!.message)
+    @cause = $!
+  end
+  def backtrace
+    @cause.backtrace
+  end
+end
+
+wrapped = begin
+  raise
+rescue
+  raise BareRescueWrapper1013.new rescue $!
+end
+p [:bare_custom_cause, !wrapped.backtrace.nil?,
+   wrapped.backtrace == wrapped.cause.backtrace,
+   wrapped.cause.backtrace_locations.is_a?(Array)]
+
+outer = begin
+  raise 'outer1013'
+rescue
+  saved = $!
+  begin
+    raise 'inner1013'
+  rescue
+  end
+  p [:bare_current_identity, saved.equal?($!)]
+  saved
+end
+p [:bare_retained_trace, outer.message, !outer.backtrace.nil?,
+   outer.backtrace_locations.is_a?(Array)]
