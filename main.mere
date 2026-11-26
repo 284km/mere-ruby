@@ -71743,6 +71743,9 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
      else a)
   else
     (let _ = (if o <= 19 || o == 53 then vm_stack_op env world blk st o n a (vec_get ov (vcb + pc))
+              // (an instance variable's, by its inline cache: vm_ivar_read)
+              else if o == 22 then vm_ivar_read env world blk st cd pc n
+              else if o == 23 then vm_ivar_write env world blk st cd pc n
               else if o <= 28 then vm_var_op env world blk st o n a
               else if o == 29 then vm_send env world blk st n a (vc code (vcb + pc) 2) (vec_get ov (vcb + pc)) (vc code (vcb + pc) 3)
               else if o == 55 then vm_yield env world blk st a (vc code (vcb + pc) 2) (vec_get ov (vcb + pc))
@@ -72019,6 +72022,83 @@ and vm_ivar_get = fn env -> fn world -> fn blk -> fn (n: str) ->
      let v9 = (ivs_get_or ivars slf9 name VNil) in
      if map_len ractor_thr == 0 then v9 else ractor_ivar_check env world (lv_get env "self") name false v9)
   else VNil
+// AN INSTANCE VARIABLE'S INLINE CACHE (note 559, step 2c). An object's
+// variables are in its shape's slots in the slab (step 2b), and a shape's
+// number and a name's slot in it never change -- shapes are never given back.
+// So an ivar instruction keeps, in its operand b (unused by them otherwise),
+// what it found the last time:
+// - getinstancevariable: 1 + shape * 4096 + slot. Reading an object of that
+//   shape is its slot, through iv_slot_read (a removed variable reads nil).
+// - setinstancevariable: 1 + (shape before * 4096 + slot) * 2^24 + shape
+//   after. The same shape: the slot is written, unless it holds the removed
+//   mark (iv_readd's, through the door). The child that adds this name: the
+//   slot is written and the object moves to the child -- when its area holds
+//   the child's slots; a bigger area is the door's (iv_grow).
+// What the cache does not cover goes through the doors as before and fills
+// the cache: a class variable, a TracePoint, a Ractor, an object in the table
+// (MERE_RUBY_SHAPES=0, too complex), self not an object, a frozen one. A
+// shape's slot count is at most 4,096 (sh_child), so a slot fits in 12 bits;
+// a shape past 2^24 is not cached.
+and vm_ivar_ok = fn (n: str) ->
+  map_len hook_flags == 0 && map_len ractor_thr == 0
+  && (if str_len n > 1 && ord (char_at n 1) == 64 then false else true)
+and vm_ivar_read = fn env -> fn world -> fn blk -> fn st -> fn cd -> fn (pc: int) -> fn (n: str) ->
+  if vm_ivar_ok n && lv_has env "self" then
+    (match lv_get env "self" with
+     | VObj oid ->
+       (let r = iv_rec oid in
+        if r > 0 then
+          (let (code, _, _, vcb, _) = cd in
+           let c = vc code (vcb + pc) 2 in
+           let s = iv_rec_shape r in
+           if c > 0 && (c - 1) / 4096 == s then vm_push st (iv_slot_read (iv_rec_base r) ((c - 1) % 4096) VNil)
+           else
+             (let i = sh_find s (iv_nid_find (substring n 1 (str_len n))) in
+              if i < 0 then vm_push st VNil
+              else (let _ = (if s < 16777216 then vec_set code ((vcb + pc) * 6 + 2) (1 + s * 4096 + i) else ()) in
+                    vm_push st (iv_slot_read (iv_rec_base r) i VNil))))
+        else vm_push st (vm_ivar_get env world blk n))
+     | _ -> vm_push st (vm_ivar_get env world blk n))
+  else vm_push st (vm_ivar_get env world blk n)
+and vm_ivar_write = fn env -> fn world -> fn blk -> fn st -> fn cd -> fn (pc: int) -> fn (n: str) ->
+  let v = vm_pop st in
+  let slf = (if vm_ivar_ok n && lv_has env "self" then lv_get env "self" else VNil) in
+  match slf with
+  | VObj oid when (if val_is_frozen slf then false else true) ->
+    (let r = iv_rec oid in
+     let (code, _, _, vcb, _) = cd in
+     let c = vc code (vcb + pc) 2 in
+     let hit = (if r > 0 && c > 0 then
+                  (let s1 = (c - 1) % 16777216 in
+                   let t = (c - 1) / 16777216 in
+                   let i = t % 4096 in
+                   let s0 = t / 4096 in
+                   let b = iv_rec_base r in
+                   if iv_rec_shape r != s0 then false
+                   else if s1 == s0 then
+                     (if iv_is_absent (vec_get iv_slab (b + i)) then false
+                      else (let _ = vec_set iv_slab (b + i) v in true))
+                   else if sh_len s1 <= iv_rec_cap r then
+                     (let _ = iv_slots_add 1 in
+                      let _ = vec_set iv_slab (b + i) v in
+                      let _ = map_set obj_iv oid (r - s0 + s1) in true)
+                   else false)
+                else false) in
+     if hit then ()
+     else
+       (let s0 = (if r > 0 then iv_rec_shape r else 0 - 1) in
+        let _ = assign_one env world n v in
+        let r2 = iv_rec oid in
+        if s0 >= 0 && r2 > 0 && s0 < 16777216 then
+          (let s1 = iv_rec_shape r2 in
+           let i = sh_find s1 (iv_nid_find (substring n 1 (str_len n))) in
+           if i >= 0 && s1 < 16777216 && (s1 == s0 || (sh_parent s1 == s0 && i == sh_len s1 - 1))
+           then vec_set code ((vcb + pc) * 6 + 2) (1 + (s0 * 4096 + i) * 16777216 + s1)
+           else ())
+        else ()))
+  | _ ->
+    (let _ = (if str_len n > 1 && str_eq (substring n 0 2) "@@" then vm_refine_warn env world else ()) in
+     assign_one env world n v)
 and vm_nth_e = fn (xs: Expr list) -> fn (i: int) ->
   match xs with
   | Nil -> ENil
