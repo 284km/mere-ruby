@@ -731,7 +731,7 @@ let gc_pressure = fn world ->
   let tight = vec_get gc_knob 2 == 1 in
   if gc_auto_off () then false
   else vec_get gc_knob 5 == 1
-  || map_len ivars + map_len ocls > limit
+  || iv_entries ivars + map_len ocls > limit
   // ...with the floor it had before, 4,000 entries, once a class has been
   // made since the last collection. Dead classes are not small, and a loop
   // that makes them beside its objects held twice the memory under the
@@ -741,7 +741,7 @@ let gc_pressure = fn world ->
   // method of its own, which makes a singleton class, copies that method
   // out of the whole method table, so `a.clone.set` in a loop ran four
   // times the instructions. Those loops collect as they did.
-  || (vec_get cls_made 0 != vec_get gc_knob 13 && map_len ivars + map_len ocls > vec_get gc_knob 14)
+  || (vec_get cls_made 0 != vec_get gc_knob 13 && iv_entries ivars + map_len ocls > vec_get gc_knob 14)
   // ...and the captured frames waiting in lv_cap, each a frame's arena (4 KB
   // and up) that no store's byte count sees: a loop that makes a lambda per
   // turn and nothing else ran 80k turns without one collection (note 272)
@@ -1253,6 +1253,29 @@ let gc_internal_ivar = fn live -> fn (key: str) -> fn (v: Val) ->
   let _ = gc_mark_val live v in
   if str_index_of key "@~m_" >= 0 || str_index_of key "@~um_" >= 0
   then (match v with VStr h -> gc_class_text (sget h) | _ -> ()) else ();
+// A SHAPED object's variables, where they are kept (note 559 step 2b): the
+// slots of its area, walked with its shape's names beside them -- a ~m_ or
+// ~um_ name holds a class's name, as gc_internal_ivar reads off a key. A
+// removed variable's mark is no value. (An object in the table is marked
+// through the owner chains of gc_fixpoint.)
+let gc_mark_area = fn live -> fn (o: int) ->
+  if map_has obj_iv o then
+    (let r = map_get obj_iv o in
+     if r <= 0 then ()
+     else
+       (let b = iv_rec_base r in
+        let rec walk = fn (t: int) ->
+          if t <= 0 then ()
+          else
+            (let v = vec_get iv_slab (b + sh_len t - 1) in
+             let _ = (if iv_is_absent v then ()
+                      else (let _ = gc_mark_val live v in
+                            let nm = vec_get iv_nm (sh_name t) in
+                            if str_starts_with nm "~m_" || str_starts_with nm "~um_"
+                            then (match v with VStr h -> gc_class_text (sget h) | _ -> ()) else ())) in
+             walk (sh_parent t)) in
+        walk (iv_rec_shape r)))
+  else ();
 // an id a half-evaluated statement built (fb_stack_wm): kind 0 object, 1 array,
 // 2 string, 3 hash. An id no store holds any more is skipped, not dereferenced.
 // An object id is marked only if it is an object still: a stopped stack's
@@ -1452,6 +1475,7 @@ let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
          if i >= stop then ()
          else (let o = vec_get gc_obj_pend i in
                let _ = (if map_has head o then mark_chain (map_get head o) else ()) in
+               let _ = gc_mark_area live o in
                each (i + 1)) in
        let _ = each start in drain stop (rounds + 1)) in
   let names_vec = gc_native_names in
@@ -1690,6 +1714,19 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter proc_src mk in
   let _ = map_iter proc_symsrc mk in
   let _ = map_iter meth_params (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
+  // (a method's record: the texts and the parameters' Array it gives each
+  //  frame -- the same handles frame_str_ids and meth_params keep, until a
+  //  redefinition drops those rows and the record is read again: mrec_get)
+  let _ = map_iter mrec_tab (fn (k: str) -> fn r9 ->
+    let (_, _, mt9, cal9, _, _, cr9, cv9, ns9, pv9, _, _, s09, s29, _) = r9 in
+    let _ = gc_mark_val live mt9 in let _ = gc_mark_val live cal9 in let _ = gc_mark_val live cr9 in
+    let _ = gc_mark_val live cv9 in let _ = gc_mark_val live ns9 in let _ = gc_mark_val live pv9 in
+    let _ = gc_mark_val live s09 in gc_mark_val live s29) in
+  let _ = map_iter mrec_ttab (fn (k: str) -> fn r9 ->
+    let (_, _, mt9, cal9, _, _, cr9, cv9, ns9, pv9, _, _, s09, s29, _) = r9 in
+    let _ = gc_mark_val live mt9 in let _ = gc_mark_val live cal9 in let _ = gc_mark_val live cr9 in
+    let _ = gc_mark_val live cv9 in let _ = gc_mark_val live ns9 in let _ = gc_mark_val live pv9 in
+    let _ = gc_mark_val live s09 in gc_mark_val live s29) in
   let _ = map_iter meth_src (fn (k: str) -> fn row ->
     let (line, file, last, endless) = row in
     let mark = fn (v: Val) ->
@@ -2081,6 +2118,17 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = gc_sweep_class_table alias_origin 0 compact in
   let _ = gc_sweep_class_table alias_srcname 0 compact in
   let _ = gc_sweep_class_table meth_params 0 compact in
+  let _ = gc_sweep_class_table mrec_tab 0 compact in
+  let _ = gc_sweep_class_table mrec_gen 0 compact in
+  // (a method's record written again with other contents leaves the old one
+  //  in the table's arena: a named class's method redefined and called in a
+  //  loop grew by about 220 bytes a turn. Compacted here, where the stack
+  //  the collection interrupted keeps what it borrowed: #321's review)
+  let _ = (if compact && vec_get mrec_dirty 0 >= 256
+           then (let _ = map_compact mrec_tab in let _ = map_compact mrec_ttab in
+                 let _ = map_compact mrec_gen in let _ = map_compact mrec_tgen in
+                 vec_set mrec_dirty 0 0)
+           else ()) in
   let _ = gc_sweep_class_table meth_src 0 compact in
   let _ = gc_sweep_class_table dm_methods 0 compact in
   let _ = gc_sweep_class_table dm_captured 0 compact in
@@ -2103,6 +2151,11 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = gc_sweep_class_table autoload_busy 2 compact in
   let _ = gc_sweep_class_table cvars 0 compact in
   let _ = gc_sweep_class_table ivars_g 0 compact in
+  // (a shape's per-class counts: the variations a class has made, the area
+  //  size its objects have come to need. The shape bound does not bound
+  //  them -- a Class.new a turn adds a key and no shape)
+  let _ = gc_sweep_class_table sh_cls_var 0 compact in
+  let _ = gc_sweep_class_table sh_cls_cap 0 compact in
   let _ = gc_sweep_class_table refine_cnt 0 compact in
   let _ = gc_sweep_class_table refine_tgt 0 compact in
   let _ = gc_sweep_class_table refine_cls 0 compact in
@@ -2358,8 +2411,9 @@ let gc_collect = fn env -> fn world ->
     // under a pin (a suspended stack pointing into the arena, Mere v0.1.589)
     // now leaves the table where it is, so the refill would have grown every
     // store by its live size at every collection a fiber was suspended for.
-    // Deleting the dead keys allocates nothing; the compaction after it, when
-    // it can happen, moves only the living.
+    // Deleting the dead keys adds nothing to the tables (what is dead is
+    // gathered in Vecs first, then deleted); the compaction after it, when it
+    // can happen, moves only the living.
     // (a dead object's variables: the object, its key, where the name starts)
     let dIVo = vec_new () in
     let dIVn = vec_new () in
@@ -2386,6 +2440,28 @@ let gc_collect = fn env -> fn world ->
          let _ = vec_push dIVo owner in
          let _ = vec_push dIVa at in
          vec_push dIVn s)) in
+    // (...and a dead SHAPED object's: its File's descriptor, as above, and its
+    //  area back to the free list. A dead object in the table -- obj_iv's -1 --
+    //  had its keys found by the walk above; its record goes too)
+    let dOI = vec_new () in
+    let _ = map_iter obj_iv (fn (o: int) -> fn (r: int) ->
+      if gc_live_has live (o * 8) then () else vec_push dOI o) in
+    let rec drop_oi = fn (i: int) ->
+      if i >= vec_len dOI then ()
+      else
+        (let o = vec_get dOI i in
+         let r = map_get obj_iv o in
+         let _ = (if r > 0 then
+                    (let _ = (match iv_get_or ivars o "__f_fd" VNil with
+                              | VInt fd9 ->
+                                (if fd9 > 2 && (if truthy (iv_get_or ivars o "__f_keep_fd" VNil) then false else true)
+                                 then vec_push dFD fd9 else ())
+                              | _ -> ()) in
+                     iv_rec_free r)
+                  else ()) in
+         let _ = map_delete obj_iv o in
+         drop_oi (i + 1)) in
+    let _ = drop_oi 0 in
     let rec close_fds = fn (i: int) ->
       if i >= vec_len dFD then ()
       else (let fd9 = vec_get dFD i in
@@ -2411,7 +2487,9 @@ let gc_collect = fn env -> fn world ->
       if i >= vec_len dIVo then () else (let _ = iv_del_at ivars (vec_get dIVo i) (vec_get dIVn i) (vec_get dIVa i) in drop_iv (i + 1)) in
     let _ = drop_iv 0 in
     let _ = (if nc then () else map_compact ivars) in
-    // (...and a dead owner's names in ivar_names_of's index, iv_idx)
+    // (the shaped objects' records, and the slab: a value written over is a
+    //  copy left in the slab's arena, as in the table's -- Mere's vec_set)
+    let _ = (if nc then () else (let _ = map_compact obj_iv in vec_compact iv_slab)) in
     // (...and a dead owner's names in ivar_names_of's index, iv_idx)
     let dIX = vec_new () in
     let _ = map_iter iv_idx (fn (k: str) -> fn (v: str) ->
@@ -2681,9 +2759,9 @@ let gc_collect = fn env -> fn world ->
     //  gc_pressure. Note 551 §8.)
     let scan = map_len arr_store + map_len hash_store + map_len ocls + vec_get gc_knob 10 in
     let delta = (if scan / 2 > 32000 then scan / 2 else 32000) in
-    let _ = vec_set gc_knob 0 (map_len ivars + map_len ocls + delta) in
+    let _ = vec_set gc_knob 0 (iv_entries ivars + map_len ocls + delta) in
     let _ = vec_set gc_knob 13 (vec_get cls_made 0) in
-    let _ = vec_set gc_knob 14 (map_len ivars + map_len ocls + (if scan / 2 > 4000 then scan / 2 else 4000)) in
+    let _ = vec_set gc_knob 14 (iv_entries ivars + map_len ocls + (if scan / 2 > 4000 then scan / 2 else 4000)) in
     let _ = vec_set gc_knob 1 (gc_store_bytes ()) in
     // ⚠ the dead slots' share of that baseline. A string handle is never
     //   reused, so every String ever made leaves a stub in str_store that no
@@ -4656,7 +4734,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let key = (if str_eq c "" then nm else c ++ "#" ++ nm) in
          let (_, ps2, bb2, _) = newblk in
          let _ = set_meth meths key (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
-         let _ = map_set dm_methods key VNil in
+         let _ = mrec_set_sv dm_methods key VNil in
          let _ = dm_store_closure key newblk in
          let _ = stamp_meth_src key in
          // (...where the PROC was written, when the block is one: `&pr`)
@@ -4680,7 +4758,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           let _ = (if str_eq c "" then
                      (let ok9 = "Object#" ++ nm in
                       let _ = set_meth meths ok9 (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
-                      let _ = map_set dm_methods ok9 VNil in
+                      let _ = mrec_set_sv dm_methods ok9 VNil in
                       let _ = dm_store_closure ok9 newblk in
                       let _ = (if map_has dm_captured key then map_set dm_captured ok9 (map_get dm_captured key) else ()) in
                       let _ = map_set dm_had_blk ok9 (map_get dm_had_blk key) in
@@ -8531,7 +8609,7 @@ and capi_gc_read = fn (r: CapiReq) ->
   else if r.op == 32 then
     (let (_, _, _, iv9) = world in
      match capi_in r.a with
-     | VObj oid9 -> (let k9 = str_of_int oid9 ++ mr_capi_text () in capi_out (if map_has iv9 k9 then map_get iv9 k9 else VNil))
+     | VObj oid9 -> (let t9 = mr_capi_text () in capi_out (iv_get_or iv9 oid9 (substring t9 1 (str_len t9)) VNil))
      // (a Proc, a Binding: T_DATA with no table here -- Qundef, which C
      //  refuses by name, never a made-up nil)
      | _ -> 36)
@@ -11789,7 +11867,7 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        if broke then bv
        else (let _ = arr_set id (extract_vals (sort_by_key world pairs)) in
              iter_result (FNext recv) recv))
-    else if (str_len name == 3 && str_eq name "sum") then (match args with Cons (init, _) -> arr_sum_blk world encl theblk id 0 xs (arr_ver id) init | Nil -> arr_sum_blk world encl theblk id 0 xs (arr_ver id) (VInt 0))
+    else if (str_len name == 3 && str_eq name "sum") then (match args with Cons (init, _) -> arr_sum_blk world encl theblk id 0 xs (arr_ver id) init (sum_native_number init) | Nil -> arr_sum_blk world encl theblk id 0 xs (arr_ver id) (VInt 0) true)
     else if (str_len name == 9 && str_eq name "partition") then arr_partition world encl theblk id 0 xs (arr_ver id) Nil Nil
     else if (str_len name == 8 && str_eq name "group_by") then arr_group_by world encl theblk xs Nil
     else if (str_len name == 16 && str_eq name "each_with_object") then (match args with Cons (o, _) -> arr_each_with_object world encl theblk xs o | Nil -> VNil)
@@ -12674,11 +12752,10 @@ and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
 // unreachable start is nil. A negative step walks the span from its end.
 and arr_aseq_slice = fn env -> fn world -> fn (xs: Val list) -> fn (oid: int) ->
   let (_, _, _, ivars) = world in
-  let key = str_of_int oid in
-  let iv = fn (k: str) -> (if map_has ivars k then map_get ivars k else VNil) in
-  let b0 = iv (key ++ "@__as_begin") in let e0 = iv (key ++ "@__as_end") in
-  let excl0 = (match iv (key ++ "@__as_excl") with VBool x -> x | _ -> false) in
-  let step = (match iv (key ++ "@__as_step") with VInt k -> k | _ -> 1) in
+  let iv = fn (k: str) -> iv_get_or ivars oid k VNil in
+  let b0 = iv "__as_begin" in let e0 = iv "__as_end" in
+  let excl0 = (match iv "__as_excl" with VBool x -> x | _ -> false) in
+  let step = (match iv "__as_step" with VInt k -> k | _ -> 1) in
   let alen = val_list_len xs in
   let (b1, e1, excl1) =
     (if step < 0 then
@@ -13458,15 +13535,24 @@ and array_init_args = fn env -> fn world -> fn (args: Val list) ->
         | _ -> coerce_int_args env world args)
      | _ -> coerce_int_args env world args)
 
+// Native numeric sum ignores replacements of core +, while a general
+// accumulator must dispatch its Ruby operator.
+and sum_native_number = fn (v9: Val) ->
+  match v9 with VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat (_, _) -> true | VCpx (_, _) -> true | _ -> false
 // sum with a block: total of the block values (starting from init).
-and arr_sum_blk = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i: int) -> fn (xs0: Val list) -> fn (ver0: int) -> fn (acc: Val) ->
+and arr_sum_blk = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i: int) -> fn (xs0: Val list) -> fn (ver0: int) -> fn (acc: Val) -> fn (native9: bool) ->
   let ver = arr_ver id in
   match arr_lv id i xs0 ver0 with
   | Nil -> acc
   | Cons (h, t) ->
     (match run_block world encl theblk (Cons (h, Nil)) with
      | FBreak v -> v
-     | f -> arr_sum_blk world encl theblk id (i + 1) t ver (arith_bin "+" acc (flow_value f)))
+     | f ->
+       (let value9 = flow_value f in
+        let fast9 = native9 && sum_native_number value9 in
+        let total9 = (if fast9 then arith_bin "+" acc value9
+                      else apply_bin_vals world (blk_noblk theblk) "+" acc value9) in
+        arr_sum_blk world encl theblk id (i + 1) t ver total9 fast9))
 
 // partition: [elements where block is truthy, the rest].
 and arr_partition = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i: int) -> fn (xs0: Val list) -> fn (ver0: int) -> fn (yes: Val list) -> fn (no: Val list) ->
@@ -15774,7 +15860,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
          if str_eq k "@~m_name" then method_text (method_core_field oid 0)
          else if str_eq k "@~m_owner" || str_eq k "@~um_cls" then method_text (method_core_field oid 1)
          else if str_eq k "@~um_name" then method_text (method_core_field oid 0)
-         else if map_has iv2 (str_of_int oid ++ k) then method_text (map_get iv2 (str_of_int oid ++ k)) else "" in
+         else if iv_has_at iv2 oid k then method_text (iv_get_at iv2 oid k) else "" in
        let own9 = (if str_eq cls "Method" then gv9 "@~m_owner" else gv9 "@~um_cls") in
        let nm9 = (if str_eq cls "Method" then gv9 "@~m_name" else gv9 "@~um_name") in
        let rcv9 = (if str_eq cls "Method" && map_has method_cores oid then method_core_field oid 2 else VMain) in
@@ -18127,7 +18213,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     (match (recv, args) with
      | (VArr aid9, Cons (VObj oid9, Nil)) ->
        (let (_, _, _, iv9) = world in
-        let gv = fn (nm: str) -> (if map_has iv9 (str_of_int oid9 ++ nm) then map_get iv9 (str_of_int oid9 ++ nm) else VNil) in
+        let gv = fn (nm: str) -> (if iv_has_at iv9 oid9 nm then iv_get_at iv9 oid9 nm else VNil) in
         let xs9 = deref aid9 in
         let n9 = val_list_len xs9 in
         let st9 = (match gv "@__as_step" with VInt k -> k | _ -> 1) in
@@ -19216,7 +19302,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        // "UTC" for UTC, nothing for a fixed offset (it has no name), and the
        // local zone's abbreviation otherwise.
        else if (str_len name == 4 && str_eq name "zone") then
-         (if iv_has iv9 oid "__tzo" then iv_get iv9 oid "__tzo"
+         (if iv_has iv9 oid "__tzo" then
+            (let _ = time_off world recv in iv_get iv9 oid "__tzo")
           else if time_is_utc world recv then mkstr_ascii "UTC"
           else if time_is_fixed world recv then VNil
           else (match tz_local_in (time_tz_of oid) (time_tz_ep world recv (match prim_time_epoch world recv with VInt n -> n | _ -> 0)) with (_, nm9) -> mkstr_ascii nm9))
@@ -20629,6 +20716,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     // own methods dispatch and `super` still reaches Time.
     else if time_cls world c && ((str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm")
                                 || (str_len name == 5 && str_eq name "local") || (str_len name == 6 && str_eq name "mktime")) then
+      if not (str_eq c "Time") && not skip9 && cls_meth_own world c name
+         && not (str_eq (sng_user_owner world c name) "") then
+        (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name
+         then private_constructor_error world c name args
+         else invoke world blk recv ("(sng:" ++ c ++ ")") name args)
+      else
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
        let _ = map_set ocls9 id c in
@@ -20678,6 +20771,14 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     //  it included -- time_spec's "doesn't call Time.at directly")
     else if time_cls world c && ((str_len name == 3 && str_eq name "now") || (str_len name == 2 && str_eq name "at")
                                  || (str_len name == 9 && str_eq name "__capi_at")) then
+      // Inherited Ruby overrides precede the native constructor on a subclass.
+      // A saved builtin and the C API entry retain their native dispatch.
+      if not (str_eq c "Time") && not skip9 && not (str_eq name "__capi_at")
+         && cls_meth_own world c name && not (str_eq (sng_user_owner world c name) "") then
+        (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name
+         then private_constructor_error world c name args
+         else invoke world blk recv ("(sng:" ++ c ++ ")") name args)
+      else
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
        let _ = map_set ocls9 id c in
@@ -23765,13 +23866,13 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                             if str_eq nm snm then ()
                             else (let _ = map_set blt_alias_names nm 1 in map_set builtin_alias (target ++ "#" ++ nm) snm)) in
               let _ = copy_meth_src (target ++ "#" ++ nm) sk in
-              let _ = if map_has meth_cref sk then map_set meth_cref (target ++ "#" ++ nm) (map_get meth_cref sk) else () in
+              let _ = if map_has meth_cref sk then mrec_set_ss meth_cref (target ++ "#" ++ nm) (map_get meth_cref sk) else () in
               VSym nm))
         | VProc pid -> (let _ = dm_store_closure (target ++ "#" ++ nm) (proc_as_block pid) in
                        let (h2, ps2, bb2, e2) = proc_as_block pid in
                        let _ = set_meth meths0 (target ++ "#" ++ nm)
                                  (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
-                       let _ = map_set dm_methods (target ++ "#" ++ nm) VNil in
+                       let _ = mrec_set_sv dm_methods (target ++ "#" ++ nm) VNil in
                        let (encl9, _) = strip_yblk_markers (false, (Nil : str list), (Nil : Stmt list), e2) ps2 in
                        let _ = dm_capture_blk e2 (target ++ "#" ++ nm) encl9 bb2 in
                        VSym nm)
@@ -23842,7 +23943,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
            //  redefined or removed -- transplants THAT one: msnap_save's copy)
            else if (if str_eq (msnap_src world uid ocl9 scls snm) "" then false else true) then
              (let sn9 = msnap_src world uid ocl9 scls snm in
-              let _ = (if str_eq nm snm then () else map_set alias_srcname (c ++ "#" ++ nm) snm) in
+              let _ = (if str_eq nm snm then () else mrec_set_ss alias_srcname (c ++ "#" ++ nm) snm) in
               let _ = set_meth meths0 (c ++ "#" ++ nm) (map_get snap_meths sn9) in
               let _ = msnap_copy_tables (c ++ "#" ++ nm) sn9 in
               VSym nm)
@@ -23856,18 +23957,18 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
               let _ = (if map_has meths0 sk then () else
                          (let _ = set_builtin_alias world c nm snm in
                           let source9 = bi_meth_own world uid in
-                          if str_eq snm "===" then map_set alias_origin (c ++ "#" ++ nm) (if str_eq source9 "" then scls else source9)
+                          if str_eq snm "===" then mrec_set_ss alias_origin (c ++ "#" ++ nm) (if str_eq source9 "" then scls else source9)
                           else ())) in
               // ...and the name it came FROM, which is what #original_name
               // answers. alias_method records this pair already; the Method form
               // of define_method is the same fact arriving through another door.
-              let _ = (if str_eq nm snm then () else map_set alias_srcname (c ++ "#" ++ nm) snm) in
+              let _ = (if str_eq nm snm then () else mrec_set_ss alias_srcname (c ++ "#" ++ nm) snm) in
               let _ = if map_has meths0 sk then set_meth meths0 (c ++ "#" ++ nm) (map_get meths0 sk) else () in
               // the copy also carries WHERE the method was written and the
               // scope it was written in -- both are properties of the original
               // definition, not of the define_method call that re-installs it.
               let _ = copy_meth_src (c ++ "#" ++ nm) sk in
-              let _ = if map_has meth_cref sk then map_set meth_cref (c ++ "#" ++ nm) (map_get meth_cref sk) else () in
+              let _ = if map_has meth_cref sk then mrec_set_ss meth_cref (c ++ "#" ++ nm) (map_get meth_cref sk) else () in
               VSym nm))
         | VProc pid ->
           (match proc_as_block pid with (h2, ps2, bb2, e2) ->
@@ -23875,7 +23976,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
              // (a block-local is no parameter of the method: dm_params)
              let mps2 = dm_params ps2 bb2 in
              let _ = set_meth meths0 (c ++ "#" ++ nm) (Meth (mps2, meth_block_defaults (mps2) bb2, drop_defaults_prologue bb2)) in
-             let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
+             let _ = mrec_set_sv dm_methods (c ++ "#" ++ nm) VNil in
              let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
              let (encl9, _) = strip_yblk_markers (false, (Nil : str list), (Nil : Stmt list), e2) ps2 in
              let _ = dm_capture_blk e2 (c ++ "#" ++ nm) encl9 bb2 in
@@ -24846,7 +24947,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                     // (RubyGems aliases Kernel#require and its body reads
                     // Kernel::RUBYGEMS_ACTIVATION_MONITOR).
                     let _ = if map_has meth_cref (origin ++ "#" ++ n2)
-                            then map_set meth_cref (c ++ "#" ++ n1) (map_get meth_cref (origin ++ "#" ++ n2))
+                            then mrec_set_ss meth_cref (c ++ "#" ++ n1) (map_get meth_cref (origin ++ "#" ++ n2))
                             else () in
                     // ...and the original's DEFINITION SITE: #source_location
                     // answers where the method was written, which for an alias
@@ -24870,9 +24971,9 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                     let sk9 = origin ++ "#" ++ n2 in
                     let origin9 = (if map_has alias_origin sk9 then map_get alias_origin sk9 else origin) in
                     let src9 = (if map_has alias_srcname sk9 then map_get alias_srcname sk9 else n2) in
-                    let _ = if str_eq origin9 c then () else map_set alias_origin (c ++ "#" ++ n1) origin9 in
-                    if str_eq n1 src9 then (if map_has alias_srcname (c ++ "#" ++ n1) then map_delete alias_srcname (c ++ "#" ++ n1) else ())
-                    else map_set alias_srcname (c ++ "#" ++ n1) src9)
+                    let _ = if str_eq origin9 c then () else mrec_set_ss alias_origin (c ++ "#" ++ n1) origin9 in
+                    if str_eq n1 src9 then (if map_has alias_srcname (c ++ "#" ++ n1) then mrec_del_ss alias_srcname (c ++ "#" ++ n1) else ())
+                    else mrec_set_ss alias_srcname (c ++ "#" ++ n1) src9)
                  // A TOP-LEVEL method is stored under its bare name, with no
                  // class prefix -- `alias_method :hash, :ret1` where ret1 is a
                  // top-level def found nothing here and silently made no alias
@@ -24880,10 +24981,10 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                  // a private method on Object) and the alias is private too.
                  else if map_has methsA n2 then
                    (let _ = set_meth methsA (c ++ "#" ++ n1) (map_get methsA n2) in
-                    let _ = if map_has meth_cref n2 then map_set meth_cref (c ++ "#" ++ n1) (map_get meth_cref n2) else () in
+                    let _ = if map_has meth_cref n2 then mrec_set_ss meth_cref (c ++ "#" ++ n1) (map_get meth_cref n2) else () in
                     let _ = copy_meth_src (c ++ "#" ++ n1) n2 in
                     let _ = set_private (c ++ "#" ++ n1) VNil in
-                    if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
+                    if str_eq n1 n2 then () else mrec_set_ss alias_srcname (c ++ "#" ++ n1) n2)
                  // source is a builtin (no AST body) — remember it delegates to
                  // prim_method under the builtin name (e.g. String#+).
                  // ...and the source NAME, which #original_name answers. The two
@@ -24892,7 +24993,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                  // ...but only a builtin that EXISTS: a missing name is the
                  // same NameError the `alias` keyword raises (alias_builtin_exists)
                  else if (let _ = zsuper_dead_check world c n2 in alias_builtin_exists world c n2) then
-                   (let _ = (if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2) in
+                   (let _ = (if str_eq n1 n2 then () else mrec_set_ss alias_srcname (c ++ "#" ++ n1) n2) in
                     set_builtin_alias world c n1 n2)
                  else (let _ = raise_exc_iv world "NameError"
                                  ("undefined method '" ++ n2 ++ "' for class '" ++ cls_display world c ++ "'")
@@ -29481,10 +29582,10 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                 || (str_len name == 4 && str_eq name "hash") || (str_len name == 4 && str_eq name "size") || (str_len name == 4 && str_eq name "last")) then
       // (no closure over `id` here: a lifted inner fn capturing a name that is
       // also a prelude function -- `id` -- resolved to the function)
-      (let key = str_of_int id in
-       let iv = fn (k: str) -> (if map_has ivars k then map_get ivars k else VNil) in
-       let b = iv (key ++ "@__as_begin") in let e = iv (key ++ "@__as_end") in let st = iv (key ++ "@__as_step") in
-       let excl = (match iv (key ++ "@__as_excl") with VBool x -> x | _ -> false) in
+      (let src9 = id in
+       let iv = fn (o: int) -> fn (k: str) -> iv_get_or ivars o k VNil in
+       let b = iv src9 "__as_begin" in let e = iv src9 "__as_end" in let st = iv src9 "__as_step" in
+       let excl = (match iv src9 "__as_excl" with VBool x -> x | _ -> false) in
        if (str_len name == 5 && str_eq name "begin") then b
        else if (str_len name == 3 && str_eq name "end") then e
        else if (str_len name == 4 && str_eq name "step") then st
@@ -29494,9 +29595,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
          (match args with
           | Cons (VObj oid, _) ->
             (if str_eq (map_get ocls oid) "Enumerator::ArithmeticSequence" then
-               (let okey = str_of_int oid in
-                VBool (rb_eq b (iv (okey ++ "@__as_begin")) && rb_eq e (iv (okey ++ "@__as_end")) && rb_eq st (iv (okey ++ "@__as_step"))
-                       && (match iv (okey ++ "@__as_excl") with VBool x -> x == excl | _ -> false)))
+               (VBool (rb_eq b (iv oid "__as_begin") && rb_eq e (iv oid "__as_end") && rb_eq st (iv oid "__as_step")
+                       && (match iv oid "__as_excl" with VBool x -> x == excl | _ -> false)))
              else VBool false)
           | _ -> VBool false)
        else if (str_len name == 4 && str_eq name "hash") then
@@ -30074,7 +30174,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           // (and where it was asked, owned and defined: a copy's #super_method
           //  and #== are the original's)
           let _ = list_iter (Cons ("@~um_def", Nil)) (fn (k9: str) ->
-                    if map_has ivars (str_of_int id ++ k9) then iv_put ivars (str_of_int nid ++ k9) (map_get ivars (str_of_int id ++ k9)) else ()) in
+                    if iv_has_at ivars id k9 then iv_set_at ivars nid k9 (iv_get_at ivars id k9) else ()) in
           let _ = msnap_carry world id "UnboundMethod" nid "UnboundMethod" in
           let _ = iv_copy world id nid in
           let _ = (if (str_len name == 5 && str_eq name "clone") && ofrozen_get id then ofrozen_set nid else ()) in
@@ -30885,17 +30985,19 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        //  and not in the index: they are copied by the members' names.)
        // (a let, not the match's `id`: cp9 is a closure -- see the
        //  rails-ar-ivar-api loop record)
+       // (a SHAPED object -- note 559 step 2b -- is copied whole: its shape,
+       //  and its area into one of the copy's. One in the table, name by name)
        let src9 = id in
-       let tmp = map_new () in
+       let whole9 = iv_copy_shaped src9 nid in
        let rec cp9 = fn (ns9: str list) ->
          (match ns9 with
           | Nil -> ()
           | Cons (nm9, t9) ->
-            (let _ = (if iv_has ivars src9 nm9 then map_set tmp (iv_key nid nm9) (iv_get ivars src9 nm9) else ()) in
+            (let _ = (if iv_has ivars src9 nm9 then iv_set ivars nid nm9 (iv_get ivars src9 nm9) else ()) in
              cp9 t9)) in
        // (a Struct's members first, as they were first in the table: each
        //  in its slot, by the members its class names)
-       let _ = (if is_struct_obj_cls world realcls then
+       let _ = (if (if whole9 then false else true) && is_struct_obj_cls world realcls then
                   (let mc9 = struct_members_cls world (ancestors_of world realcls) in
                    let rec sl9 = fn (ms9: Val list) ->
                      (match ms9 with
@@ -30905,8 +31007,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                    cp9 (sl9 (if str_eq mc9 "" then Nil
                              else (match map_get struct_mem mc9 with VArr a9 -> deref a9 | _ -> Nil))))
                 else ()) in
-       let _ = cp9 (ivar_names_of ivars id) in
-       let _ = map_iter tmp (fn (k: str) -> fn (v: Val) -> iv_put ivars k v) in
+       let _ = (if whole9 then () else cp9 (ivar_names_of ivars id)) in
        // (an instance of a Module subclass: the copy gets a module of its own,
        //  a copy of the original's (mod_inst_backing), so a def into one does
        //  not land in the other -- and a frozen original's copy, a dup or a
@@ -31356,7 +31457,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                    let mk9 = (if str_eq target9 "(main)" then nm9 else target9 ++ "#" ++ nm9) in
                    let _ = set_meth meths9 mk9
                              (Meth (ps9, meth_block_defaults (ps9) bb9, drop_defaults_prologue bb9)) in
-                   let _ = map_set dm_methods mk9 VNil in
+                   let _ = mrec_set_sv dm_methods mk9 VNil in
                    let _ = dm_store_closure mk9 (h9, ps9, bb9, e9) in
                    let _ = stamp_meth_src_proc mk9 (str_of_int pid9) in
                    VSym nm9))
@@ -31395,7 +31496,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                         | Cons (m9, rest9) -> if str_eq m9 lambda_blk_marker then rest9 else ps9
                         | _ -> ps9) in
              let _ = set_meth meths nm9 (Meth (drop_block_locals ps9, meth_block_defaults (drop_block_locals ps9) bb9, drop_defaults_prologue bb9)) in
-             let _ = map_set dm_methods nm9 VNil in
+             let _ = mrec_set_sv dm_methods nm9 VNil in
              let _ = dm_store_closure nm9 (h9, ps9, bb9, e9) in
              let _ = stamp_meth_src_proc nm9 (str_of_int pid9) in
              VSym nm9))
@@ -33927,6 +34028,12 @@ and flush_files_at_exit = fn world ->
                    | VStr h -> (if str_len (sget h) > 0 then map_set ids (str_of_int o) VNil else ())
                    | _ -> ())
              else ())) in
+  // (and a shaped object's, by the name's slot)
+  let _ = map_iter obj_iv (fn (o: int) -> fn (r: int) ->
+            if r <= 0 then ()
+            else (match iv_get_or ivars o "__f_buf" VNil with
+                  | VStr h -> (if str_len (sget h) > 0 then map_set ids (str_of_int o) VNil else ())
+                  | _ -> ())) in
   map_iter ids (fn (k: str) -> fn (v: Val) ->
     (let _ = try_or (fn (u: unit) -> file_flush_obj world (int_of_str k)) () in ()))
 
@@ -34882,7 +34989,7 @@ and class_subclasses_method_note = fn world -> fn (chain9: str list) -> fn (owne
   else (let (body9, native9) = native_owner_entry_after world chain9 owner9 (0 - 1) "subclasses" "Class" in
         if str_eq body9 "" then () else
         (let _ = msnap_note world id9 kind9 body9 "subclasses" in
-         let _ = iv_put ivars9 (str_of_int id9 ++ (if str_eq kind9 "Method" then "@~m_dk" else "@~um_dk")) (VClass body9) in
+         let _ = iv_set ivars9 id9 (if str_eq kind9 "Method" then "~m_dk" else "~um_dk") (VClass body9) in
          if native9 then native_owner_method_mark world id9 "Class" else ()))
 and class_subclasses_method_call = fn world -> fn blk -> fn (recv9: Val) -> fn (id9: int) -> fn (owner9: str) -> fn (name9: str) -> fn (args9: Val list) ->
   let body9 = msnap_cls world id9 "Method" owner9 in
@@ -35500,7 +35607,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           let mk2 = (if str_eq target "(main)" then nm else target ++ "#" ++ nm) in
           let _ = set_meth meths mk2
                     (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
-          let _ = map_set dm_methods mk2 VNil in
+          let _ = mrec_set_sv dm_methods mk2 VNil in
           let _ = dm_store_closure mk2 (h2, ps2, bb2, e2) in
           let _ = dm_capture_body env mk2 blk newblk in
           // (...and `block_given?` in the body asks the frame it was written
@@ -35532,7 +35639,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          // `define_method(:m) { |a = 5| }` was an arity error).
          let _ = set_meth meths (c ++ "#" ++ nm)
                    (Meth (dm_params ps2 bb2, meth_block_defaults (dm_params ps2 bb2) bb2, drop_defaults_prologue bb2)) in
-         let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
+         let _ = mrec_set_sv dm_methods (c ++ "#" ++ nm) VNil in
          let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
          let _ = dm_capture_body env (c ++ "#" ++ nm) blk newblk in
          let _ = map_set dm_had_blk (c ++ "#" ++ nm)
@@ -40237,7 +40344,7 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
           (let k = sget kh in
            let nk = dst ++ substring k pl9 (str_len k) in
            let _ = set_meth m9 nk (map_get m9 k) in
-           let _ = (if map_has meth_cref k then map_set meth_cref nk (map_get meth_cref k) else ()) in
+           let _ = (if map_has meth_cref k then mrec_set_ss meth_cref nk (map_get meth_cref k) else ()) in
            // (a method whose class variables were the original's reads the
            //  COPY's: ruby rewrites a copied method's cref to the copy --
            //  `Zeus = Gods.clone; Zeus.class_variable_set(:@@rule, "Athena")`
@@ -40251,11 +40358,11 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
            //  copied cref to the copy without the eval mark that made its
            //  lookup skip the class (test_class_variable_in_dup_class))
            let _ = (if map_has meth_cref k && str_eq src (c ++ "#")
-                    then map_set meth_cvcls nk dst_cls9 else ()) in
+                    then mrec_set_ss meth_cvcls nk dst_cls9 else ()) in
            let _ = copy_meth_src nk k in
            let _ = (if map_has privates k then set_private nk VNil else ()) in
            let _ = (if map_has protecteds k then set_protected nk VNil else ()) in
-           if map_has alias_srcname k then map_set alias_srcname nk (map_get alias_srcname k) else ())
+           if map_has alias_srcname k then mrec_set_ss alias_srcname nk (map_get alias_srcname k) else ())
         | _ -> ()))) in
   let _ = (if mro_local_name c && (if map_has meth_owner_seen c then false else true)
            then () else rec_pfx (c ++ "#") (nc ++ "#")) in
@@ -40318,7 +40425,7 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
                  let key = vec_get keys i in
                  let destination = target ++ "#" ++ substring key (str_len prefix) (str_len key) in
                  let _ = map_set builtin_alias destination (map_get builtin_alias key) in
-                 let _ = (if map_has alias_srcname key then map_set alias_srcname destination (map_get alias_srcname key) else ()) in
+                 let _ = (if map_has alias_srcname key then mrec_set_ss alias_srcname destination (map_get alias_srcname key) else ()) in
                  let _ = (if map_has privates key then set_private destination VNil else ()) in
                  let _ = (if map_has protecteds key then set_protected destination VNil else ()) in
                  copy (i + 1) in copy 0 in
@@ -51219,13 +51326,15 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
                      | _ -> frame_pool_get ())
                   else frame_pool_get ()) in
      let _ = map_set frame "__fid" (VInt (next_fid ())) in
-     let _ = (if map_has r2k_methods ("Object#" ++ name) then map_set frame "__r2k" VNil else ()) in
+     // (what the call reads of the method's tables: its record, mrec_top_get)
+     let (_, rmnm9, rmtx9, rcal9, rcref9, _, rcreftx9, rcv9, rnest9, _, _, rdmm9, rsrc0, rsrc2, rlbl9) = mrec_top_get name in
+     let _ = (if map_len r2k_methods > 0 && map_has r2k_methods ("Object#" ++ name) then map_set frame "__r2k" VNil else ()) in
      // (the name it was defined as, an alias's source -- as run_meth's mnm:
      //  __method__ and a TracePoint's method_id -- and the one it was called
      //  by, __callee__)
-     let mnm9 = (let k9 = "Object#" ++ name in if map_has alias_srcname k9 then map_get alias_srcname k9 else name) in
-     let _ = map_set frame "__meth" (frame_text mnm9) in
-     let _ = (if str_eq mnm9 name then () else map_set frame "__callee" (frame_text name)) in
+     let mnm9 = rmnm9 in
+     let _ = map_set frame "__meth" rmtx9 in
+     let _ = (match rcal9 with VNil -> () | v9 -> map_set frame "__callee" v9) in
      // Whether THIS call was given a block. `block_given?` asks about the
      // enclosing METHOD frame, and Ruby's rule reaches it through any number
      // of blocks -- `m { }` with `def m; [1].each { block_given? }; end` is
@@ -51237,11 +51346,10 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      // ⚠ the stored value carries BOTH (see lex_pack): the frame gets the cref
     // in the slot its ten readers already know, and the nesting in one of its
     // own. Unpacked here, once, rather than at each reader.
-    let crefv9 = (if map_has meth_cref name then map_get meth_cref name else "") in
-    let _ = map_set frame "__cref" (frame_text (pack_cref crefv9)) in
-    let _ = (if map_has meth_cvcls name then map_set frame "__cvcls" (frame_text (map_get meth_cvcls name)) else ()) in
-    let _ = (let n9 = pack_nest crefv9 in
-             if str_eq n9 "" then () else map_set frame "__nest" (frame_text n9)) in
+    let crefv9 = rcref9 in
+    let _ = map_set frame "__cref" rcreftx9 in
+    let _ = (match rcv9 with VNil -> () | v9 -> map_set frame "__cvcls" v9) in
+    let _ = (match rnest9 with VNil -> () | v9 -> map_set frame "__nest" v9) in
     // the refinements the method was WRITTEN under (see ref_enter_meth)
     let rfprev9 = (if ref_on () then ref_enter_meth frame crefv9 else 0 - 1) in
      let vs9 = map_has super_call_pend "v" in
@@ -51259,9 +51367,9 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      //  fires them after the defaults, there: vm_late_bcall, which knows the
      //  frame by "__tpdm" -- run_meth's by "__in_dm")
      let tpbm9 = hook_tp_on ()
-                 && (map_has dm_methods name || map_has dm_methods ("Object#" ++ name)) in
+                 && rdmm9 in
      let _ = (if tpbm9 then map_set frame "__tpdm" VNil else ()) in
-     let cl9 = (match (meth_source_get name 0) with VInt l9 -> l9 | _ -> cur_line ()) in
+     let cl9 = (match rsrc0 with VInt l9 -> l9 | _ -> cur_line ()) in
      let _ = (if hook_tp_on () && vm_body_late body then ()
               else (let _ = fire_tp_vlc world "call" mnm9 "Object" VNil slf9 cl9 "" name in
                     let _ = (if hook_tp_on () then map_set frame "__tpcall" VNil else ()) in
@@ -51269,7 +51377,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let _ = (if tpbm9 && vm_body_late body then map_set frame "__tpbmp" VNil else ()) in
      // (as run_meth: tp_meth_flow while a TracePoint is armed)
      let flow9 = (if hook_tp_on () then tp_meth_flow world frame blk body mnm9 name "Object" slf9
-                  else method_body_flow frame world blk body) in
+                  else method_body_flow_lbl frame world blk body false rlbl9) in
      let out = (match flow9 with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
     let _ = (if rfprev9 >= 0 then ref_install rfprev9 else ()) in
     // the frame dies here unless something captured it (or its chain):
@@ -51281,12 +51389,12 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
     let tpf9 = hook_tp_on () in
     let _ = (if tpf9 then () else frame_done frame) in
      let _ = (if tpf9 then tp_env_set frame else ()) in
-     let rl9 = (match (meth_source_get (name) 2) with
+     let rl9 = (match rsrc2 with
                 VInt l9 -> l9
                 // (a define_method body: as run_meth's -- the VM's last line,
                 //  else the block's first)
                 | _ -> (if tpbm9 && (vm_body_id body 64 >= 0) then vm_max_line (vm_body_id body 64)
-                        else if tpbm9 then (match meth_source_get name 0 with VInt l9 -> l9 | _ -> cur_line ())
+                        else if tpbm9 then (match rsrc0 with VInt l9 -> l9 | _ -> cur_line ())
                         else cur_line ())) in
      let rv9 = (match flow9 with FBreak _ -> (if tpbm9 then out else VNil) | _ -> out) in
      let _ = (if tpbm9 && map_has frame "__tpbm" then (let _ = map_delete frame "__tpbm" in tp_blk_fire_at_c world "b_return" mnm9 "Object" rv9 slf9 rl9 "" name) else ()) in
@@ -51778,14 +51886,13 @@ and lookup_meth_cls = fn world -> fn (cls: str) -> fn (name: str) ->
 // unbind, a bind, a clone), the original's (slot "@~m_era" / "@~um_era")
 and msnap_era = fn world -> fn (id: int) -> fn (ocl: str) ->
   let (_, _, _, iv9) = world in
-  let k9 = str_of_int id ++ (if str_eq ocl "Method" then "@~m_era" else "@~um_era") in
-  if map_has iv9 k9 then (match map_get iv9 k9 with VInt e -> e | _ -> id) else id
+  (match iv_get_or iv9 id (if str_eq ocl "Method" then "~m_era" else "~um_era") VNil with VInt e -> e | _ -> id)
 // the class whose table has the body: cls, or the ancestor recorded when cls
 // only published the name (`public :z` over a superclass's z)
 and msnap_cls = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) ->
   let (_, _, _, iv9) = world in
-  let k9 = str_of_int id ++ (if str_eq ocl "Method" then "@~m_dk" else "@~um_dk") in
-  if map_has iv9 k9 then (method_text_or cls (map_get iv9 k9)) else cls
+  let n9 = (if str_eq ocl "Method" then "~m_dk" else "~um_dk") in
+  if iv_has iv9 id n9 then (method_text_or cls (iv_get iv9 id n9)) else cls
 // a Method or UnboundMethod is being made for cls#name: mark the key that has
 // the body (only a marked key is copied when it is written)
 and msnap_note = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) -> fn (name: str) ->
@@ -51795,19 +51902,19 @@ and msnap_note = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) -> f
   let k = dc ++ "#" ++ name in
   if (if str_eq dc "" then false else true) && map_has m9 k then
     (let _ = (if str_eq dc cls then ()
-              else iv_put iv9 (str_of_int id ++ (if str_eq ocl "Method" then "@~m_dk" else "@~um_dk")) (VClass dc)) in
+              else iv_set iv9 id (if str_eq ocl "Method" then "~m_dk" else "~um_dk") (VClass dc)) in
      if map_has meth_obj_seen k then () else map_set meth_obj_seen k 1)
   else ()
 // a made-from object (nid) is dated and placed as its source (id) is
 and msnap_carry = fn world -> fn (id: int) -> fn (ocl: str) -> fn (nid: int) -> fn (nocl: str) ->
   let (_, _, _, iv9) = world in
-  let _ = iv_put iv9 (str_of_int nid ++ (if str_eq nocl "Method" then "@~m_era" else "@~um_era")) (VInt (msnap_era world id ocl)) in
-  let dk9 = str_of_int id ++ (if str_eq ocl "Method" then "@~m_dk" else "@~um_dk") in
-  let nk9 = str_of_int nid ++ (if str_eq nocl "Method" then "@~m_dk" else "@~um_dk") in
+  let _ = iv_set iv9 nid (if str_eq nocl "Method" then "~m_era" else "~um_era") (VInt (msnap_era world id ocl)) in
+  let dk9 = (if str_eq ocl "Method" then "~m_dk" else "~um_dk") in
+  let nk9 = (if str_eq nocl "Method" then "~m_dk" else "~um_dk") in
   // (and nothing else: making nid looked the body up in the table as it is
   //  NOW, which after a remove_method is a superclass's)
-  if map_has iv9 dk9 then iv_put iv9 nk9 (map_get iv9 dk9)
-  else if map_has iv9 nk9 then map_delete iv9 nk9 else ()
+  if iv_has iv9 id dk9 then iv_set iv9 nid nk9 (iv_get iv9 id dk9)
+  else if iv_has iv9 nid nk9 then iv_del iv9 nid nk9 else ()
 // the first bound above era in "B1;B2;...", or -1
 and msnap_bound_above = fn (bs: str) -> fn (era: int) ->
   let rec go = fn (xs: str list) ->
@@ -52147,6 +52254,129 @@ and vm_triv_store_run = fn world -> fn (recv: Val) -> fn (params: str list) -> f
   | _ -> VNil
 and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (name: str) -> fn (m: Meth) -> fn (args: Val list) ->
   run_meth_result world blk recv defcls name m args false
+// The method's record (mrec_tab, note 560 A): (the class its body was
+// defined in, the name it was defined as, that name's frame text, the called
+// name's when it differs, the cref, whether one is kept, the packed cref's
+// text, the class-variable class's, the nesting's, the parameters' Array,
+// whether C runs it, whether define_method made it, its first line, its last
+// line, its label) -- as run_meth_result read each of them at every call.
+and mrec_build = fn (defcls: str) -> fn (name: str) -> fn (dk: str) -> fn (params: str list) ->
+  let dc = (if map_has alias_origin dk then map_get alias_origin dk else defcls) in
+  let mnm = (if map_has alias_srcname dk then map_get alias_srcname dk else name) in
+  let crefv = (if map_has meth_cref dk then map_get meth_cref dk else "") in
+  let n8 = pack_nest crefv in
+  let pv = (match params with
+            | Nil -> VNil
+            | _ -> if map_has meth_params dk then map_get meth_params dk
+                   else (let pv9 = arr_new_metadata (param_names_vals params) in
+                         // (a memo of these parameters, the Array this record keeps:
+                         //  it moves no epoch -- that would drop every record, this one too)
+                         let _ = map_set meth_params dk pv9 in pv9)) in
+  let src0 = (if meth_source_has dk 0 then meth_source_get dk 0
+              else if str_eq defcls "Object" && meth_source_has name 0 then meth_source_get name 0
+              else VNil) in
+  let src2 = (if meth_source_has dk 2 then meth_source_get dk 2
+              else if str_eq defcls "Object" && meth_source_has name 2 then meth_source_get name 2
+              else VNil) in
+  (dc, mnm, frame_text mnm, (if str_eq mnm name then VNil else frame_text name),
+   crefv, map_has meth_cref dk, frame_text (pack_cref crefv),
+   (if map_has meth_cvcls dk then frame_text (map_get meth_cvcls dk) else VNil),
+   (if str_eq n8 "" then VNil else frame_text n8),
+   pv, map_has meth_cfn dk, map_has dm_methods dk, src0, src2, dc ++ "#" ++ mnm)
+and mrec_val_same = fn (a: Val) -> fn (b: Val) ->
+  match (a, b) with
+  | (VNil, VNil) -> true
+  | (VStr x, VStr y) -> x == y
+  | (VArr x, VArr y) -> x == y
+  | (VInt x, VInt y) -> x == y
+  | _ -> false
+// whether two records say the same, field by field (the first that does not:
+// its number; -1 when all do)
+and mrec_diff = fn r1 -> fn r2 ->
+  let (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14) = r1 in
+  let (b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14) = r2 in
+  if (if str_eq a0 b0 then false else true) then 0
+  else if (if str_eq a1 b1 then false else true) then 1
+  else if (if mrec_val_same a2 b2 then false else true) then 2
+  else if (if mrec_val_same a3 b3 then false else true) then 3
+  else if (if str_eq a4 b4 then false else true) then 4
+  else if a5 != b5 then 5
+  else if (if mrec_val_same a6 b6 then false else true) then 6
+  else if (if mrec_val_same a7 b7 then false else true) then 7
+  else if (if mrec_val_same a8 b8 then false else true) then 8
+  else if (if mrec_val_same a9 b9 then false else true) then 9
+  else if a10 != b10 then 10
+  else if a11 != b11 then 11
+  else if (if mrec_val_same a12 b12 then false else true) then 12
+  else if (if mrec_val_same a13 b13 then false else true) then 13
+  else if (if str_eq a14 b14 then false else true) then 14
+  else 0 - 1
+and mrec_checking = fn (u: unit) ->
+  let c = vec_get mrec_check_on 0 in
+  if c >= 0 then c == 1
+  else (let on = (if str_eq (env_get "MERE_RUBY_MREC_CHECK") "1" then 1 else 0) in
+        let _ = vec_set mrec_check_on 0 on in on == 1)
+// The record of "Class#name" as it stands now: the kept one while no method
+// table has moved since it was read, else read again -- and kept again only
+// when it differs from the one kept.
+// (...but not for a class that comes and goes -- an anonymous class or
+//  module, a Struct's, a refinement's, a singleton class: the names
+//  mro_local_name knows. A record for each would never be let go: a loop
+//  of `Class.new { def foo; end }` grew to 3.7 times its memory,
+//  test_complemented_method_entry_memory_leak. Read at each call, as before.)
+and mrec_get = fn (defcls: str) -> fn (name: str) -> fn (dk: str) -> fn (params: str list) ->
+  let g = vec_get mro_gen 2 in
+  if mro_local_name defcls then mrec_build defcls name dk params
+  else if map_has mrec_gen dk && map_get mrec_gen dk == g then
+    (let r = map_get mrec_tab dk in
+     if mrec_checking () then
+       (let f = mrec_diff r (mrec_build defcls name dk params) in
+        if f >= 0 then
+          (let m9 = "mere-ruby: the record of " ++ dk ++ " is stale (field " ++ str_of_int f ++ "): a table it reads was written without a method table moving" in
+           let _ = print_err m9 in
+           fail m9)
+        else r)
+     else r)
+  else
+    (let r = mrec_build defcls name dk params in
+     let _ = (if map_has mrec_tab dk && mrec_diff (map_get mrec_tab dk) r < 0 then ()
+              else (let _ = (if map_has mrec_tab dk then vec_set mrec_dirty 0 (vec_get mrec_dirty 0 + 1) else ()) in
+                    map_set mrec_tab dk r)) in
+     let _ = map_set mrec_gen dk g in
+     r)
+// A top-level method's record, as call_method read each of its parts: its
+// rows are under the bare name, its alias's source under "Object#name", and
+// its label is the name it was defined as (its frame names no class).
+and mrec_top_build = fn (name: str) ->
+  let k9 = "Object#" ++ name in
+  let mnm = (if map_has alias_srcname k9 then map_get alias_srcname k9 else name) in
+  let crefv = (if map_has meth_cref name then map_get meth_cref name else "") in
+  let n9 = pack_nest crefv in
+  ("Object", mnm, frame_text mnm, (if str_eq mnm name then VNil else frame_text name),
+   crefv, map_has meth_cref name, frame_text (pack_cref crefv),
+   (if map_has meth_cvcls name then frame_text (map_get meth_cvcls name) else VNil),
+   (if str_eq n9 "" then VNil else frame_text n9),
+   VNil, false, map_has dm_methods name || map_has dm_methods k9,
+   meth_source_get name 0, meth_source_get name 2, mnm)
+and mrec_top_get = fn (name: str) ->
+  let g = vec_get mro_gen 2 in
+  if map_has mrec_tgen name && map_get mrec_tgen name == g then
+    (let r = map_get mrec_ttab name in
+     if mrec_checking () then
+       (let f = mrec_diff r (mrec_top_build name) in
+        if f >= 0 then
+          (let m9 = "mere-ruby: the record of the top-level " ++ name ++ " is stale (field " ++ str_of_int f ++ "): a table it reads was written without a method table moving" in
+           let _ = print_err m9 in
+           fail m9)
+        else r)
+     else r)
+  else
+    (let r = mrec_top_build name in
+     let _ = (if map_has mrec_ttab name && mrec_diff (map_get mrec_ttab name) r < 0 then ()
+              else (let _ = (if map_has mrec_ttab name then vec_set mrec_dirty 0 (vec_get mrec_dirty 0 + 1) else ()) in
+                    map_set mrec_ttab name r)) in
+     let _ = map_set mrec_tgen name g in
+     r)
 and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (name: str) -> fn (m: Meth) -> fn (args: Val list) -> fn (discard_result: bool) ->
   // (the ancestor position a `super` handed over, taken at once -- see
   //  super_idx_pend)
@@ -52263,6 +52493,9 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     // below unless captured); a define_method body's frame is a scope-chain
     // child and stays unpooled -- its parent chain is captured by definition.
     let from_pool = (if map_has dm_closenv dk then false else true) in
+    // (what the call reads of the method's tables: its record, mrec_get)
+    let (rdc9, rmnm9, rmtx9, rcal9, rcref9, rhcref9, rcreftx9, rcv9, rnest9, rpv9, rcfn9, rdmm9, rsrc0, rsrc2, rlbl9) =
+      mrec_get defcls name dk params in
     let _ = dm_ractor_check world dk in
     let frame = (if map_has dm_closenv dk then
                    (match map_get dm_closenv dk with
@@ -52270,7 +52503,7 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                     | _ -> frame_pool_get ())
                  else frame_pool_get ()) in
     let _ = map_set frame "__fid" (VInt (next_fid ())) in
-    let _ = (if map_has r2k_methods dk then map_set frame "__r2k" VNil else ()) in
+    let _ = (if map_len r2k_methods > 0 && map_has r2k_methods dk then map_set frame "__r2k" VNil else ()) in
     // A body that came from define_method is a BLOCK, and a block's
     // `block_given?` asks about the frame it was written in -- never about the
     // call that reached the method. A lexical yield uses the captured
@@ -52295,18 +52528,14 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                    map_set frame "__definee_cls" VNil)) in
     // hidden bindings so `super` can resume lookup above the defining class.
     // an aliased method resumes above its ORIGIN, not above the aliasing class.
-    let dc = if map_has alias_origin dk
-             then (match map_get alias_origin dk with s -> s)
-             else defcls in
-    let mnm = if map_has alias_srcname dk
-              then (match map_get alias_srcname dk with s -> s)
-              else name in
+    let dc = rdc9 in
+    let mnm = rmnm9 in
     let _ = map_set frame "__defcls" (VClass dc) in
     let _ = map_set frame "__defidx" (VInt (if str_eq dc defcls then defidx9 else 0 - 1)) in
-    let _ = map_set frame "__meth" (frame_text mnm) in
+    let _ = map_set frame "__meth" rmtx9 in
     // __callee__ answers the name the method was CALLED by; only an alias
     // makes it differ from __meth (the name it was defined under).
-    let _ = (if str_eq mnm name then () else map_set frame "__callee" (frame_text name)) in
+    let _ = (match rcal9 with VNil -> () | v9 -> map_set frame "__callee" v9) in
     // Whether THIS call was given a block. `block_given?` asks about the
     // enclosing METHOD frame, and Ruby's rule reaches it through any number
     // of blocks -- `m { }` with `def m; [1].each { block_given? }; end` is
@@ -52316,16 +52545,15 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     // lexical scope (cref) for bare-constant resolution in the body.
     // ...the same split as the top-level path: the cref in the slot its readers
     // know, the captured Module.nesting in one of its own (see lex_pack).
-    let crefv8 = (if map_has meth_cref dk then map_get meth_cref dk else "") in
+    let crefv8 = rcref9 in
     // ⚠ ...except a define_method body made from a proc that already EXISTED
     //   (`define_method(:m, &mk)`), which has no row: it reads the cref of the
     //   proc's own env through the parent link, and writing "" here hid it --
     //   `FLOAT_VALUES` inside test_sprintf_comb's procs was a NameError
-    let keep_proc_cref = (if from_pool then false else (if map_has meth_cref dk then false else true)) in
-    let _ = (if keep_proc_cref then () else map_set frame "__cref" (frame_text (pack_cref crefv8))) in
-    let _ = (if map_has meth_cvcls dk then map_set frame "__cvcls" (frame_text (map_get meth_cvcls dk)) else ()) in
-    let _ = (let n8 = pack_nest crefv8 in
-             if str_eq n8 "" then () else map_set frame "__nest" (frame_text n8)) in
+    let keep_proc_cref = (if from_pool then false else (if rhcref9 then false else true)) in
+    let _ = (if keep_proc_cref then () else map_set frame "__cref" rcreftx9) in
+    let _ = (match rcv9 with VNil -> () | v9 -> map_set frame "__cvcls" v9) in
+    let _ = (match rnest9 with VNil -> () | v9 -> map_set frame "__nest" v9) in
     // the refinements the method was WRITTEN under, not the caller's: a
     // refinement is lexical (see ref_enter_meth)
     let rfprev8 = (if ref_on () then ref_enter_meth frame crefv8 else 0 - 1) in
@@ -52358,18 +52586,13 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     // current value, and never writes to the Array. Building it per call was a
     // counter bump, an id, and a copy of the list into arr_store's region on
     // every method call in the program.
-    let _ = map_set frame "__params"
-              (match params with
-               | Nil -> VNil
-               | _ -> if map_has meth_params dk then map_get meth_params dk
-                      else (let pv = arr_new_metadata (param_names_vals params) in
-                            let _ = map_set meth_params dk pv in pv)) in
+    let _ = map_set frame "__params" rpv9 in
     let vs9 = map_has super_call_pend "v" in
     let _ = (if vs9 then map_delete super_call_pend "v" else ()) in
     let _ = bind_params_body frame world blk name params defaults args body in
     let _ = (if share_rest_args then map_set frame "__args" (map_get frame (splat_name params)) else ()) in
     let _ = (match blk with (true, _, _, _) -> (if vs9 then () else unused_blk_warn world dk defcls name params body) | _ -> ()) in
-    let _ = (if map_has meth_cfn dk || capi_dm_body dk then rx_cfunc_frame frame else ()) in
+    let _ = (if rcfn9 || capi_dm_body dk then rx_cfunc_frame frame else ()) in
     // `$~` (and with it $1..$9, $&, $`, $') belongs to the frame that matched:
     // ruby makes a method's match invisible to its caller, and the caller's
     // invisible to the method (method_body_flow parks and restores it). A
@@ -52383,16 +52606,14 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     // An attribute (attr_accessor's x / x=) is ruby's C method: :c_call on the
     // calling line. method_id is the name the method was defined as,
     // callee_id the one it was called by (an alias).
-    let cfn9 = map_has meth_cfn dk in
+    let cfn9 = rcfn9 in
     let attr9 = (map_len hook_flags > 0) && meth_is_attr params body in
-    let tpbm9 = map_len hook_flags > 0 && hook_tp_on () && (if attr9 || map_has meth_cfn dk then false else true) && map_has dm_methods dk in
+    let tpbm9 = map_len hook_flags > 0 && hook_tp_on () && (if attr9 || rcfn9 then false else true) && rdmm9 in
     let _ = (if cfn9 then tp_fire_owned world defcls name false VNil slf9
              else if attr9 then fire_tp_vlc world "c_call" mnm defcls VNil slf9 (cur_line ()) "" name
              else (let _ = (if hook_tp_on () then tp_env_meth frame body else ()) in
                    // (a top-level def is kept under its bare name)
-                   let cl9 = (match (if meth_source_has dk 0 then meth_source_get dk 0
-                                     else if str_eq defcls "Object" && meth_source_has name 0 then meth_source_get name 0
-                                     else VNil) with VInt l9 -> l9 | _ -> cur_line ()) in
+                   let cl9 = (match rsrc0 with VInt l9 -> l9 | _ -> cur_line ()) in
                    // (...in the file it was written in, not the caller's)
                    let cp9 = (if hook_tp_on () then tp_meth_path dk defcls name else "") in
                    // (...not for a body whose :call comes after its prologue:
@@ -52413,7 +52634,7 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     //  this frame: the ordinary call pays nothing for it.)
     let flow9 = (if hook_tp_on () && (if cfn9 || attr9 then false else true)
                  then tp_meth_flow world frame blk body mnm name defcls slf9
-                 else method_body_flow_result frame world blk body discard_result) in
+                 else method_body_flow_lbl frame world blk body discard_result rlbl9) in
     let _ = (if rfprev8 >= 0 then ref_install rfprev8 else ()) in
     let out = (match flow9 with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
     // whether THIS call ended because its block broke out of it (meth_broke):
@@ -52440,14 +52661,15 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                (let rv9 = (match flow9 with FBreak _ -> (if map_has dm_methods dk then out else VNil) | _ -> out) in
                 // (a body that ran to its end returns at the `end`)
                 let rl9 = (match flow9 with
-                           | FNext _ -> (match (if meth_source_has (dk) 2 then meth_source_get (dk) 2
-                                                else if str_eq defcls "Object" && meth_source_has (name) 2 then meth_source_get (name) 2
+                           | FNext _ -> (match (match rsrc2 with
+                                                | VNil ->
                                                 // (a define_method body has no `end` of its own on record:
                                                 //  the block's line, which an empty `{}` returns on --
                                                 //  ...where the VM ran it, the last line its
                                                 //  instructions are on: the block's `}` / `end`)
-                                                else if map_has dm_methods dk && meth_source_has dk 0 then (if (vm_body_id body 64 >= 0) then VInt (vm_max_line (vm_body_id body 64)) else meth_source_get dk 0)
-                                                else VNil) with VInt l9 -> (if attr9 then cur_line () else l9) | _ -> cur_line ())
+                                                (if rdmm9 && meth_source_has dk 0 then (if (vm_body_id body 64 >= 0) then VInt (vm_max_line (vm_body_id body 64)) else meth_source_get dk 0)
+                                                 else VNil)
+                                                | v9 -> v9) with VInt l9 -> (if attr9 then cur_line () else l9) | _ -> cur_line ())
                            | FReturn _ when map_has tp_mstack "rl" ->
                              (let l9 = int_of_str (map_get tp_mstack "rl") in let _ = map_delete tp_mstack "rl" in l9)
                            | _ -> cur_line ()) in
@@ -54787,14 +55009,14 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
   // ...and the same pairs on `Struct` itself, which is where reflection asks
   // when the program has no generated class in hand:
   // `Struct.instance_method(:deconstruct) == Struct.instance_method(:to_a)`.
-  let _ = map_set alias_srcname "Struct#deconstruct" "to_a" in
-  let _ = map_set alias_srcname "Struct#values" "to_a" in
-  let _ = map_set alias_srcname "Struct#to_ary" "to_a" in
-  let _ = map_set alias_srcname "Struct#length" "size" in
-  let _ = map_set alias_srcname (anon ++ "#deconstruct") "to_a" in
-  let _ = map_set alias_srcname (anon ++ "#values") "to_a" in
-  let _ = map_set alias_srcname (anon ++ "#to_ary") "to_a" in
-  let _ = map_set alias_srcname (anon ++ "#length") "size" in
+  let _ = mrec_set_ss alias_srcname "Struct#deconstruct" "to_a" in
+  let _ = mrec_set_ss alias_srcname "Struct#values" "to_a" in
+  let _ = mrec_set_ss alias_srcname "Struct#to_ary" "to_a" in
+  let _ = mrec_set_ss alias_srcname "Struct#length" "size" in
+  let _ = mrec_set_ss alias_srcname (anon ++ "#deconstruct") "to_a" in
+  let _ = mrec_set_ss alias_srcname (anon ++ "#values") "to_a" in
+  let _ = mrec_set_ss alias_srcname (anon ++ "#to_ary") "to_a" in
+  let _ = mrec_set_ss alias_srcname (anon ++ "#length") "size" in
   // Struct#initialize is private, as ruby's is (a spec asks the class for it)
   let _ = mark_vis_mode meths anon (Cons ("initialize", Nil)) "private" in
   let _ = set_meth meths ("(sng:" ++ anon ++ ")#keyword_init?")
@@ -54814,6 +55036,11 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
 and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   method_body_flow_result frame world blk body false
 and method_body_flow_result = fn frame -> fn world -> fn blk -> fn (body: Stmt list) -> fn (discard_result: bool) ->
+  method_body_flow_lbl frame world blk body discard_result ""
+// ...with the frame's label ("Class#name") when the caller has it: a
+// method's record (mrec_get) does, and the frame's two entries need not be
+// read and joined again. "" reads them.
+and method_body_flow_lbl = fn frame -> fn world -> fn blk -> fn (body: Stmt list) -> fn (discard_result: bool) -> fn (lbl: str) ->
   // A native definition was selected before entering Ruby code. Its bypass
   // cannot shadow a call made by this method body, including coercion hooks.
   let _ = (if map_len bi_skip > 0 then map_clear bi_skip else ()) in
@@ -54863,7 +55090,7 @@ and method_body_flow_result = fn frame -> fn world -> fn blk -> fn (body: Stmt l
   // `require "x"` under it).
   let gcbare = map_has gc_bare "y" in
   let _ = (if gcbare then map_delete gc_bare "y" else gc_unsafe_push ()) in
-  let mlabel9 = ((match (if map_has frame "__defcls" then map_get frame "__defcls" else VNil) with
+  let mlabel9 = (if str_len lbl > 0 then lbl else (match (if map_has frame "__defcls" then map_get frame "__defcls" else VNil) with
                   | VClass c -> c ++ "#"
                   | _ -> "")
                  ++ (if map_has frame "__meth"
@@ -56957,6 +57184,7 @@ and time_mil_pos = fn (c: str) -> fn (tab: str) -> fn (i: int) ->
 // Apply an offset argument to a Time object in place.
 and time_set_zone = fn world -> fn (oid: int) -> fn (args: Val list) ->
   let (_, _, _, iv9) = world in
+  let _ = (if iv_has iv9 oid "__tzo_refresh" then iv_del iv9 oid "__tzo_refresh" else ()) in
   let (kind9, secs9, ex9) = (match args with Cons (v9, _) -> time_parse_off3 world v9 | Nil -> (0, 0, VNil)) in
   let _ = (if iv_has iv9 oid "__utc" then iv_del iv9 oid "__utc" else ()) in
   let _ = (if iv_has iv9 oid "__off" then iv_del iv9 oid "__off" else ()) in
@@ -56975,7 +57203,8 @@ and time_set_zone = fn world -> fn (oid: int) -> fn (args: Val list) ->
      match ex9 with VRat (_, _) -> iv_set iv9 oid "__offx" ex9 | _ -> ())
   else ()
 
-// A derived Time (t + n, t.round, ...) shows what its source showed.
+// A derived Time keeps its source's zone. A timezone object's offset is
+// recomputed lazily at the new instant, as time.c's TZMODE_COPY does.
 and time_copy_zone = fn world -> fn (src: Val) -> fn (dst: Val) ->
   let (_, _, _, iv9) = world in
   match (src, dst) with
@@ -56984,7 +57213,11 @@ and time_copy_zone = fn world -> fn (src: Val) -> fn (dst: Val) ->
      let _ = (if iv_has iv9 o1 "__offx" then iv_set iv9 o2 "__offx" (iv_get iv9 o1 "__offx") else ()) in
      let _ = (if iv_has iv9 o1 "__tzo" then iv_set iv9 o2 "__tzo" (iv_get iv9 o1 "__tzo") else ()) in
      let _ = (if map_has time_ltz (str_of_int o1) then map_set time_ltz (str_of_int o2) (map_get time_ltz (str_of_int o1)) else ()) in
-     if iv_has iv9 o1 "__off" then iv_set iv9 o2 "__off" (iv_get iv9 o1 "__off") else ())
+     let object_zone9 = iv_has iv9 o1 "__tzo"
+                        && (match iv_get iv9 o1 "__tzo" with VObj _ -> true | _ -> false) in
+     let _ = (if object_zone9 then iv_set iv9 o2 "__tzo_refresh" (VBool true) else ()) in
+     if iv_has iv9 o1 "__off"
+     then iv_set iv9 o2 "__off" (iv_get iv9 o1 "__off") else ())
   | _ -> ()
 
 // The epoch of civil fields read in the LOCAL zone. Two passes, because the
@@ -58498,7 +58731,7 @@ and attr_mark_vis = fn (cls: str) -> fn (mode: str) -> fn (syms: str list) -> fn
 and fb_world = fn (u: unit) -> (meths_g, cls_sup, obj_cls, ivars_g)
 and fb_iv = fn world -> fn (oid: int) -> fn (k: str) ->
   let (_, _, _, iv) = world in
-  if map_has iv (str_of_int oid ++ k) then map_get iv (str_of_int oid ++ k) else VNil
+  if iv_has_at iv oid k then iv_get_at iv oid k else VNil
 and fb_index_of = fn world -> fn (v: Val) ->
   match v with
   | VObj id -> (match fb_iv world id "@__fb_idx" with VInt i -> i | _ -> 0 - 1)
@@ -58566,8 +58799,7 @@ and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) ->
          //  masks, a copy of them: thread_create_core's
          //  pending_interrupt_mask_stack)
          let _ = (let (_, _, _, ivm) = world in
-                  let mk9 = str_of_int (sch_me ()) ++ "@__tmask" in
-                  match (if map_has ivm mk9 then map_get ivm mk9 else VNil) with
+                  match iv_get_or ivm (sch_me ()) "__tmask" VNil with
                   | VArr ma9 -> (match deref ma9 with
                                  | Nil -> ()
                                  | ms9 -> iv_set ivm tid "__tmask" (arr_new ms9))
@@ -58575,8 +58807,7 @@ and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) ->
          // (...and in its maker's ThreadGroup -- a frozen one takes no new
          //  thread: ruby's ThreadError)
          let (_, _, _, ivg9) = world in
-         let mg9 = str_of_int (sch_me ()) ++ "@__tgrp" in
-         let grp9 = (if map_has ivg9 mg9 then map_get ivg9 mg9 else VNil) in
+         let grp9 = iv_get_or ivg9 (sch_me ()) "__tgrp" VNil in
          if (match grp9 with VObj g9 -> ofrozen_get g9 | _ -> false)
          then raise_exc world "ThreadError" "can't start a new thread (frozen ThreadGroup)"
          else
@@ -60562,14 +60793,13 @@ and en_stop_raise = fn world -> fn (id: int) -> fn (res: Val) ->
 // collector, which never runs them. Killing is what gives the thread back.
 and en_ext_drop = fn world -> fn (id: int) ->
   let (_, _, _, iv) = world in
-  let k = str_of_int id in
   let _ = (match (iv_get_or iv id "__x_fb" VNil) with
            | VObj f -> (if fb_state_of (fb_index_of world (VObj f)) == 2 then (let _ = fb_kill world (VObj f) in ()) else ())
            | _ -> ()) in
   let rec del = fn (ns: str list) ->
     match ns with
     | Nil -> ()
-    | Cons (n, r) -> (let _ = (if map_has iv (k ++ n) then map_delete iv (k ++ n) else ()) in del r) in
+    | Cons (n, r) -> (let _ = iv_del_at_name iv id n in del r) in
   del (Cons ("@__x_fb", Cons ("@__x_done", Cons ("@__x_ret", Cons ("@__x_buf", Cons ("@__x_feed", Cons ("@__x_feedset",
        Cons ("@__e_buf", Cons ("@__e_pos", Cons ("@__x_stop", Nil))))))))))
 and fb_blocking_now = fn (u: unit) ->
@@ -61021,8 +61251,7 @@ and drive_enum = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (meth: str
 // inspector directly (dispatching #inspect from there would come back here).
 and enum_inspect_str = fn env -> fn world -> fn (oid: int) -> fn (cls: str) ->
   let (meths, sup, ocls, ivars) = world in
-  let key = str_of_int oid in
-  let gv = fn (k: str) -> (if map_has ivars (key ++ k) then map_get ivars (key ++ k) else VNil) in
+  let gv = fn (k: str) -> iv_get_at ivars oid k in
   let rec join9 = fn (xs: Val list) -> fn (acc: str) ->
     (match xs with
      | Nil -> acc
@@ -63434,16 +63663,16 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   //   answer; and a name that comes back to itself has none.
   let sk9 = src ++ "#" ++ n2 in
   let srcname9 = (if map_has alias_srcname sk9 then map_get alias_srcname sk9 else n2) in
-  let _ = (if str_eq n1 srcname9 then (if map_has alias_srcname (cls ++ "#" ++ n1) then map_delete alias_srcname (cls ++ "#" ++ n1) else ())
-           else map_set alias_srcname (cls ++ "#" ++ n1) srcname9) in
+  let _ = (if str_eq n1 srcname9 then (if map_has alias_srcname (cls ++ "#" ++ n1) then mrec_del_ss alias_srcname (cls ++ "#" ++ n1) else ())
+           else mrec_set_ss alias_srcname (cls ++ "#" ++ n1) srcname9) in
   // ...and when it CAME from an ancestor, `super` inside the copy has to
   // resume above THAT class, not above the aliasing one: alias_method records
   // the same thing in alias_origin, and without it the copy's super found the
   // module it was copied from again (bootstraptest's `include Forward; alias
   // bar foo` answered [:Forward, [:Forward, :SecondTerminus]]).
   let origin9 = (if map_has alias_origin sk9 then map_get alias_origin sk9 else src) in
-  let _ = (if str_eq origin9 cls then (if map_has alias_origin (cls ++ "#" ++ n1) then map_delete alias_origin (cls ++ "#" ++ n1) else ())
-           else map_set alias_origin (cls ++ "#" ++ n1) origin9) in
+  let _ = (if str_eq origin9 cls then (if map_has alias_origin (cls ++ "#" ++ n1) then mrec_del_ss alias_origin (cls ++ "#" ++ n1) else ())
+           else mrec_set_ss alias_origin (cls ++ "#" ++ n1) origin9) in
   let _ = if map_has meths (src ++ "#" ++ n2) then
             (let _ = set_meth meths (cls ++ "#" ++ n1) (map_get meths (src ++ "#" ++ n2)) in
              // an alias keeps the original's lexical scope (see alias_method)
@@ -63451,12 +63680,12 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
              let _ = (if meth_source_has (cls ++ "#" ++ n1) 0 then meth_source_set (cls ++ "#" ++ n1) 4 (VInt 1) else ()) in
              let _ = (if meth_source_has (src ++ "#" ++ n2) 0 then meth_source_set (src ++ "#" ++ n2) 4 (VInt 1) else ()) in
              if map_has meth_cref (src ++ "#" ++ n2)
-             then map_set meth_cref (cls ++ "#" ++ n1) (map_get meth_cref (src ++ "#" ++ n2)) else ())
+             then mrec_set_ss meth_cref (cls ++ "#" ++ n1) (map_get meth_cref (src ++ "#" ++ n2)) else ())
           // the source is a BUILTIN (no AST body): record that the new name
           // delegates to prim_method under the old one, exactly as alias_method
           // does. `alias _pack pack` in a reopened Array is how a wrapper keeps
           // hold of the original.
-          else (let _ = (if str_eq n1 n2 then () else map_set alias_srcname (cls ++ "#" ++ n1) n2) in
+          else (let _ = (if str_eq n1 n2 then () else mrec_set_ss alias_srcname (cls ++ "#" ++ n1) n2) in
                 set_builtin_alias world cls n1 n2) in
   // ...and it keeps the ORIGINAL'S VISIBILITY. `alias :aka :bar` under a
   // `private` copies a private method, and the copy is private too: it was
@@ -64102,7 +64331,7 @@ and native_definition_commit = fn world -> fn (cls: str) -> fn (body: Stmt list)
             | Cons (SDef (_, _, _, _), rest) ->
               let (methods, _, _, _) = world in
               let _ = set_fresh_meth methods cls key (Meth (params, defaults, method_body)) in
-              let _ = map_set meth_cref key (lex_pack ()) in
+              let _ = mrec_set_ss meth_cref key (lex_pack ()) in
               let _ = stamp_named_meth_src key name in
               let _ = (if map_has r2k_methods key then map_delete r2k_methods key else ()) in
               let _ = (if map_has protecteds key then map_delete protecteds key else ()) in
@@ -64514,14 +64743,14 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
          // constant-assignment door: a program that never defines the hook must
          // not pay a method lookup for every constant it sets.
          let _ = (if str_eq (meth_base mname) "const_added" then map_set hook_flags "ca" VNil else ()) in
-         let _ = map_set meth_cref key (lex_pack ()) in
+         let _ = mrec_set_ss meth_cref key (lex_pack ()) in
          let _ = stamp_meth_src key in
          // `module_function` mode: the instance method is ALSO a module method,
          // so register it in the module's singleton namespace too.
          let _ = if str_eq vis2 "module_function" && (if is_selfdef then false else true) && (if str_contains mname "#" then false else true)
                  then (let mk = "(sng:" ++ cls ++ ")#" ++ mname in
                        let _ = set_meth meths mk (Meth (params, defs, mbody)) in
-                       map_set meth_cref mk (lex_pack ()))
+                       mrec_set_ss meth_cref mk (lex_pack ()))
                  else () in
          let _ = if map_has undefs key then del_undef key else () in
          // a (re)definition is not ruby2_keywords until explicitly marked:
@@ -64912,7 +65141,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
            let _ = (match fargs with
                     | Cons (ESym nm, _) ->
                       (let _ = set_meth meths (cls ++ "#" ++ nm) (Meth (dm_params bp bb, meth_block_defaults (dm_params bp bb) bb, drop_defaults_prologue bb)) in
-                       let _ = map_set dm_methods (cls ++ "#" ++ nm) VNil in
+                       let _ = mrec_set_sv dm_methods (cls ++ "#" ++ nm) VNil in
                        let _ = stamp_meth_src (cls ++ "#" ++ nm) in
                        // the block is a CLOSURE: the class body it was written
                        // in may itself be inside a method (`Class.new do
@@ -64934,7 +65163,7 @@ and register_class_statement = fn world -> fn (cls: str) -> fn (body: Stmt list)
                        // that so a class variable and a bare constant in the
                        // body resolve against this class, and a method built
                        // from a block needs it just as much.
-                       let _ = map_set meth_cref (cls ++ "#" ++ nm) (lex_pack ()) in
+                       let _ = mrec_set_ss meth_cref (cls ++ "#" ++ nm) (lex_pack ()) in
                        // ...under the body's default visibility, as a def is:
                        // in `module_function` mode it is a module function too
                        let _ = (if str_eq vis2 "private" then set_private (cls ++ "#" ++ nm) VNil
@@ -65470,7 +65699,7 @@ and refine_import_methods = fn env -> fn world -> fn (rimpl: str) -> fn (args: V
                     let j9 = str_index_of cv9 (chr 14) in
                     let base9 = (if j9 < 0 then cv9 else substring cv9 0 j9) in
                     let rid9 = ref_cur_id () in
-                    map_set meth_cref nk (if rid9 > 0 then base9 ++ chr 14 ++ str_of_int rid9 else base9)) in
+                    mrec_set_ss meth_cref nk (if rid9 > 0 then base9 ++ chr 14 ++ str_of_int rid9 else base9)) in
            let _ = (if map_has privates nk then map_delete privates nk else ()) in
            let _ = (if map_has protecteds nk then map_delete protecteds nk else ()) in
            let _ = (if map_has privates k then set_private nk VNil
@@ -66819,7 +67048,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     //  -- p is not one, [Bug #11546])
     let _ = (if in_thread () then
                (let (_, _, _, ivp) = world in
-                if map_has ivp (str_of_int (sch_me ()) ++ "@__tpend") then sch_deliver world (sch_me ()) else VNil)
+                if iv_has ivp (sch_me ()) "__tpend" then sch_deliver world (sch_me ()) else VNil)
              else VNil) in
     let _ = (match vs0 with
              | Nil -> out_emit world "\n"
@@ -67007,8 +67236,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
             else if str_len recv > 1 && str_eq (char_at recv 0) "@" && lv_has env "self" then
               (match lv_get env "self" with
                | VObj oid9 ->
-                 (let k9 = str_of_int oid9 ++ recv in
-                  if map_has ivars k9 then map_get ivars k9 else VNil)
+                 iv_get_at ivars oid9 recv
                | _ -> VNil)
             else if lv_has env recv then lv_get env recv
             else VNil) in
@@ -67191,7 +67419,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        else name) in
     let _ = warn_redef world key (meth_base name) in
     let _ = set_meth meths key (Meth (params, defs, body)) in
-    let _ = map_set meth_cref key (lex_pack_env env) in
+    let _ = mrec_set_ss meth_cref key (lex_pack_env env) in
     let _ = stamp_meth_src key in
     // ...and a def run as a STATEMENT inside a class scope (an eval'd body, a
     // block in the body) takes that scope's default visibility ("__vis", see
@@ -67208,7 +67436,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                    else if str_eq m9 "module_function" then
                      (let mk9 = "(sng:" ++ c9 ++ ")#" ++ name in
                       let _ = set_meth meths mk9 (Meth (params, defs, body)) in
-                      let _ = map_set meth_cref mk9 (lex_pack_env env) in
+                      let _ = mrec_set_ss meth_cref mk9 (lex_pack_env env) in
                       set_private key VNil)
                    else ())
                 else ())
@@ -67246,7 +67474,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                 && (if str_len name > 5 && str_eq (substring name 0 5) "self." then false else true)
              then (let ok = "Object#" ++ name in
                    let _ = set_meth meths ok (Meth (params, defs, body)) in
-                   let _ = map_set meth_cref ok (lex_pack_env env) in
+                   let _ = mrec_set_ss meth_cref ok (lex_pack_env env) in
                    let _ = stamp_meth_src ok in
                    // (...a def RUN INSIDE A METHOD is public, as ruby has it:
                    //  the top level's private default is the top level's)
@@ -67648,8 +67876,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                   let _ = copy_meth_src n1 n2 in
                   let sk9 = "Object#" ++ n2 in
                   let src9 = (if map_has alias_srcname sk9 then map_get alias_srcname sk9 else n2) in
-                  if str_eq n1 src9 then (if map_has alias_srcname ("Object#" ++ n1) then map_delete alias_srcname ("Object#" ++ n1) else ())
-                  else map_set alias_srcname ("Object#" ++ n1) src9)
+                  if str_eq n1 src9 then (if map_has alias_srcname ("Object#" ++ n1) then mrec_del_ss alias_srcname ("Object#" ++ n1) else ())
+                  else mrec_set_ss alias_srcname ("Object#" ++ n1) src9)
                else (let _ = do_class_alias world "Object" n1 n2 in ()) in
        FNext VNil)
     else (let _ = do_class_alias world dcls n1 n2 in FNext VNil)
@@ -72320,7 +72548,12 @@ and vm_checkmatch = fn env -> fn world -> fn blk -> fn st -> fn (f: int) ->
        truthy (vm_eval env world blk (Cons (p, Cons (tgt, Nil))) (fn (es: Expr list) -> EBin ("===", vm_nth_e es 0, vm_nth_e es 1)))
      else truthy p) in
   let rec any = fn (ps: Val list) -> (match ps with Nil -> false | Cons (p, t) -> one p || any t) in
-  vm_push st (VBool (if f >= 4 then (match pat with VArr a -> any (deref a) | _ -> one pat) else one pat))
+  let hit = (if f >= 4 then (match pat with VArr a -> any (deref a) | _ -> one pat) else one pat) in
+  // (a rescue clause taken clears what C's rb_errinfo answers, as run_rescues
+  //  does and as entering CRuby's rescue clears ec->errinfo: a C method the
+  //  clause calls finds nil, whatever an earlier rb_protect left there)
+  let _ = (if ty == 3 && hit then capi_errinfo_clear () else 0) in
+  vm_push st (VBool hit)
 // the catch table's rescue or ensure entry whose region pc is in and that is
 // not being run yet -- the widest one (an ensure's reaches past the rescue
 // it is around), -1 when there is none
