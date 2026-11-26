@@ -45,3 +45,10 @@ p kept.grep(/\ACLOCK_MONOTONIC\z/), kept.map(&:to_s).grep(/\ACLOCK_REALTIME\z/)
 p kept_m, kept_own.sort, kept_own.map(&:to_s).sort.join(","), kept_own.frozen?
 kept_own << :W
 p kept_own.sort, M1071c.constants.sort
+
+# The clocks read once are kept where reflection does not see them: ruby's
+# Process has no instance variables, after a Symbol clock and a CLOCK_ one.
+Process.clock_gettime(:GETTIMEOFDAY_BASED_CLOCK_REALTIME)
+Process.clock_gettime(Process::CLOCK_MONOTONIC)
+p Process.instance_variables.grep(/clock/)
+p Process.instance_variable_defined?(:@__clock_ints), Process.instance_variable_defined?(:@__clock_sym_res)
