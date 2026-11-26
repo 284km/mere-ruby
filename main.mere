@@ -8968,6 +8968,24 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
      | VArr a9 when r.b == arr_len a9 && (if cfrozen_get 0 a9 then false else true) ->
        let _ = arr_push_many a9 (Cons (capi_in r.c, Nil)) in 1
      | _ -> 0)
+  // rb_thread_current (a 0) and rb_thread_local_aref (a 1, b: the thread, c:
+  // the key's Symbol): answered from the tables Thread.current and Thread#[]
+  // read, with no method looked up or called -- CRuby's look none up either.
+  // 0 when a thread-local is not this to answer (not a Thread, or a key that
+  // is no Symbol) or is false: C sends #[] then, which answers the same.
+  // (sqlite3 asks both on every prepare and step -- its callback frame --
+  //  and the two sends were most of a prepared statement's step.)
+  else if r.op == 37 then
+    (if r.a == 0 then
+       capi_out (if map_has cur_thr "t" then map_get cur_thr "t"
+                 else if map_has cur_thr "v" then map_get cur_thr "v" else VNil)
+     else
+       (match (capi_in r.b, capi_in r.c) with
+        | (VObj tid, VSym kk) when thr_obj_here world (VObj tid) "" ->
+          (let (_, _, _, ivars) = world in
+           let o9 = fb_tl_owner world tid "[]" in
+           capi_out (if iv_has ivars o9 ("__tl_" ++ kk) then iv_get ivars o9 ("__tl_" ++ kk) else VNil))
+        | _ -> 0))
   // C module insertion mutates the ancestry directly, without Ruby hooks.
   else if r.op == 36 then
     (let target9 = capi_in r.a in
@@ -59022,6 +59040,10 @@ and sch_deadline = fn env -> fn world -> fn (limit: Val) ->
 // collected before it first runs.
 and thread_start_sch = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) -> fn newblk ->
   let (_, _, _, iv3) = world in
+  let source9 = (if map_has pending_srcproc "v" then map_get pending_srcproc "v" else block_source_proc newblk) in
+  // A native Thread entry takes an unflagged argument copy now, before
+  // caller mutation or asynchronous binding. Keep keyword-given separately.
+  let args = (if arg_splat_any () then r2k_method_args world args else args) in
   let k = str_of_int tid in
   // (the creator's slice is a whole one when the first thread is made: the
   //  count started at 0, and the statement after `Thread.new` -- the one that
@@ -59041,7 +59063,17 @@ and thread_start_sch = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list
   let pid = (proc_next ()) in
   let _ = store_proc (str_of_int pid) newblk in
   let _ = iv_set iv3 tid "__tblk" (VProc pid) in
+  // A supplied Proc's policy can change before startup. Keep the actual
+  // Proc rooted, without another process-wide per-Thread metadata table.
+  let _ = (if source9 < 0 then () else iv_set iv3 tid "__tproc" (VProc source9)) in
+  let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
   let _ = iv_set iv3 tid "__targs" (arr_new args) in
+  // Startup may run after the creator's invocation retires its origin.
+  // Keep only provenance bits on the Thread; __targs already roots values.
+  let keywords9 = is_kw_hash (vlast args) in
+  let flags9 = (if keywords9 then 1 else 0)
+               + (if vec_get arg_notes 0 > 0 then 2 else 0) in
+  let _ = (if flags9 == 0 then () else iv_set iv3 tid "__tkw" (VInt flags9)) in
   // a new thread takes Thread.report_on_exception as it is now
   let _ = (if map_has thread_cfg "report_on_exception" && str_eq (map_get thread_cfg "report_on_exception") "0"
            then iv_set iv3 tid "__treport" (VBool false) else ()) in
@@ -59080,6 +59112,10 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
   let _ = map_set globals "?" VNil in
   let args = (match (iv_get_or iv3 tid "__targs" VNil) with
               | VArr aid -> deref aid | _ -> (Nil : Val list)) in
+  // Unbox before trace callbacks can collect/compact the ivar table.
+  let flags9 = (match iv_get_or iv3 tid "__tkw" VNil with VInt n9 -> n9 | _ -> 0) in
+  let source9 = (match iv_get_or iv3 tid "__tproc" VNil with VProc p9 -> p9 | _ -> 0 - 1) in
+  let _ = (if flags9 == 0 then () else iv_del iv3 tid "__tkw") in
   // (a TracePoint on every thread sees it begin and end, the thread as its
   //  self -- :thread_begin / :thread_end, note 448)
   let _ = (if hook_tp_on () then fire_tp_vlc world "thread_begin" "" "" VNil (VObj tid) (cur_line ()) "" "" else ()) in
@@ -59096,9 +59132,28 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
                                              | (_, _, _, penv9) -> (if map_has penv9 "__m~meth"
                                                                     then (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) else blk)) in
                                  let _ = vec_set thr_body_v 0 1 in
+                                 // The body owns its startup packet. Restore
+                                 // after thread_begin and other callbacks,
+                                 // immediately before its parameter binder.
+                                 let _ = arg_notes_reset () in
+                                 let _ = (if flags9 / 2 % 2 == 1 then arg_empty_set () else ()) in
+                                 let _ = (match vlast args with
+                                          | VHsh h9 ->
+                                            (let _ = (if flags9 % 2 == 1 then mark_kw h9 else ()) in
+                                             if flags9 % 2 == 1 && source9 >= 0
+                                                && map_has r2k_procs (r2k_root (str_of_int source9))
+                                             then mark_r2k_tail args else ())
+                                          | _ -> ()) in
                                  run_block_args world enc9 (proc_get (str_of_int pid)) args)
                  | _ -> FNext VNil)
                (FRaise VNil) in
+  let _ = arg_splat_consume () in
+  let _ = (if flags9 % 2 == 1 then
+             (match vlast args with
+              | VHsh h9 -> let key9 = str_of_int h9 in
+                           if map_has kwarg_marks key9 then map_delete kwarg_marks key9 else ()
+              | _ -> ())
+           else ()) in
   // Primitive failures carry their Ruby exception in the pending slots.
   // Materialize it before trace/report callbacks can reuse those slots.
   let result = (match result with
@@ -59150,6 +59205,7 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
                  if sch_waiting m then sch_unpark m else ())
            else ()) in
   let _ = (if iv_has iv3 tid "__targs" then iv_del iv3 tid "__targs" else ()) in
+  let _ = (if iv_has iv3 tid "__tproc" then iv_del iv3 tid "__tproc" else ()) in
   // (a ractor's own thread leaves the ractor's table when it ends; its body's
   //  thread is taken out by the body itself, __nonmain_off)
   let _ = (if map_len ractor_thr > 0 && map_has ractor_thr tid && map_get ractor_thr tid != tid then map_delete ractor_thr tid else ()) in
@@ -69065,11 +69121,13 @@ and do_eval0 = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     let prog2 = try_or (fn (u: unit) ->
       let toks = number_nls_at code (lex_src code) ebase9 in
       let _ = parse_line_reset (count_nls toks) in
-      let (p2, _) = parse_stmts toks Nil in
+      let (p2, tail9) = parse_stmts toks Nil in
+      let trailing9 = (match skip_nls tail9 with Cons (TEOF, _) -> false | Nil -> false | _ -> true) in
       let _ = rx_check_pending () in
       let _ = lvo_clear vw_outer in
       let _ = region LVN { lvo_fill eenv vw_outer } in
-      let _ = (if filemode9 then uv_program p2 (parse_time_file ()) false else uv_program_eval p2 (parse_time_file ())) in
+      let _ = (if filemode9 || trailing9 then uv_program p2 (parse_time_file ()) false else uv_program_eval p2 (parse_time_file ())) in
+      let _ = (if trailing9 then syn_refuse "__eval_trailing_tokens__" else ()) in
       let _ = lvo_clear vw_outer in
      let _ = warn_flush world in p2) sentinel in
     let _ = (if covev9 then cov_end () else ()) in
@@ -69145,7 +69203,17 @@ and do_eval0 = fn env -> fn world -> fn blk -> fn (args: Val list) ->
                                 (if i > 0 && (str_eq (char_at code (i - 1)) " " || str_eq (char_at code (i - 1)) "\n" || str_eq (char_at code (i - 1)) "\t")
                                  then tail9 (i - 1) else i) in
                              let i9 = tail9 (str_len code) in i9 > 0 && str_eq (char_at code (i9 - 1)) "=") in
-          let pr9 = (if (str_len why0 > 0 || eof_assign9 || str_contains why9 "expected a label as the key in the hash pattern") && (if str_contains code "BEGIN\{throw :__isq_ok, :ok}" then false else true)
+          let pr9 = (if str_eq sw9 "__eval_trailing_tokens__" then
+                       // The ISeq parse-only wrapper supplies its original
+                       // source; never infer it by searching user source text.
+                       (let original9 = (if lv_has env "__meth" && lv_has env "__isq_original"
+                                             && (match lv_get env "__meth" with VStr m9 -> str_eq (sget m9) "__isq_eval" | _ -> false)
+                                         then lv_get env "__isq_original" else VNil) in
+                        let (source9, line9) = (match original9 with
+                                              | VStr h9 -> (sget h9, eline9 + 1)
+                                              | _ -> (code, eline9)) in
+                        try_or (fn (u: unit) -> prism_report source9 efile9 line9) "")
+                     else if (str_len why0 > 0 || eof_assign9 || str_contains why9 "expected a label as the key in the hash pattern") && (if str_contains code "BEGIN\{throw :__isq_ok, :ok}" then false else true)
                      then try_or (fn (u: unit) -> prism_report code efile9 eline9) "" else "") in
           let msg = (if str_len pr9 > 0 then pr9
                      else if str_len why9 > 0 then efile9 ++ ":" ++ str_of_int (if sl9 > 0 then sl9 else if str_len why0 > 0 && rxl9 > 0 then rxl9 else el9) ++ ": " ++ why9 else try_or (fn (u: unit) ->

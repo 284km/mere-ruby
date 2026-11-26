@@ -15,7 +15,13 @@
 
 /* ---- threads -------------------------------------------------------------- */
 /* (the functions without the GVL, and rb_thread_call_with_gvl: capi/nogvl.c) */
-VALUE rb_thread_current(void) { return mr_call(rb_cThread, "current", 0); }
+/* (rb_thread_current and rb_thread_local_aref look no method up in CRuby, and
+ *  are answered so here: MR_THREAD -- 0 from it is a thread-local this cannot
+ *  answer, or false, and #[] is sent, which answers the same) */
+VALUE rb_thread_current(void) {
+    if (mr_without("builtin")) return mr_call(rb_cThread, "current", 0);
+    return mr_up1(MR_THREAD, 0);
+}
 VALUE rb_thread_main(void) { return mr_call(rb_cThread, "main", 0); }
 void rb_thread_schedule(void) { mr_call(rb_cThread, "pass", 0); }
 void rb_thread_check_ints(void) {}
@@ -32,7 +38,11 @@ VALUE rb_thread_wakeup_alive(VALUE thread) { return RTEST(mr_call(thread, "alive
 VALUE rb_thread_run(VALUE thread) { return mr_call(thread, "run", 0); }
 VALUE rb_thread_kill(VALUE thread) { return mr_call(thread, "kill", 0); }
 VALUE rb_thread_stop(void) { return mr_call(rb_cThread, "stop", 0); }
-VALUE rb_thread_local_aref(VALUE thread, ID id) { return mr_call(thread, "[]", 1, ID2SYM(id)); }
+VALUE rb_thread_local_aref(VALUE thread, ID id) {
+    VALUE key = ID2SYM(id), v = 0;
+    if (MR_HANDLE_P(thread) && !mr_without("builtin")) v = mr_up(MR_THREAD, 1, thread, key, 0, 0);
+    return v ? v : mr_call(thread, "[]", 1, key);
+}
 VALUE rb_thread_local_aset(VALUE thread, ID id, VALUE value) { return mr_call(thread, "[]=", 2, ID2SYM(id), value); }
 static VALUE thread_body(VALUE yielded, VALUE data, int argc, const VALUE *argv, VALUE block) {
     (void)yielded; (void)argc; (void)argv; (void)block;
