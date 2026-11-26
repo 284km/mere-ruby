@@ -66,6 +66,23 @@ Steps 1 and 2a missed these. With shapes, what they wrote went where the door no
 - The sweep's comment said deleting allocates nothing; what is dead is gathered in Vecs first. A duplicated comment line is gone (both from the review of #299).
 - Since #299 the sweep and the flush at exit match a File's names exactly, so a dead object's variable named like `@x@__f_fd` no longer closes a live File's descriptor.
 - Two bugs main has, left as they are: `instance_variable_set("@a@b", 1)` is accepted (ruby raises NameError), and a Thread's fiber-locals (`Thread#[]`) and its thread variables (`thread_variable_get`) share one listing.
+- Two more differences from ruby that main has as well (#322's review): a File dropped without `close` is not flushed when the collector frees it, and a program's own `@__x` is not listed by `instance_variables` (the interpreter's bookkeeping names start with `__`).
+
+## Reads around the door
+
+The embedding API (`tools/native_probe/embedding_api.mere`) read `"<id>@__status"` and `"<id>@__exception_message"` from the table by hand.
+With shapes they read nothing: an `exit 7` answered 1 and a RuntimeError lost its message. They go through `iv_get_or` now.
+`MERE_RUBY_SHAPES_CHECK=1` sees writes only, so `tools/iv_door_check.sh` (run by `run_corpus.sh`) looks at the source for an object key built by hand.
+
+Every other use of `ivars_g` and of a `"@__` name, in the interpreter, `tools/` and `capi/`:
+- `"$exc"` (m_driver, m_fiber, the embedding API): a key that is no object's.
+- `world`'s fourth member, `fb_world`, the class sweep and `map_compact` of the table itself.
+- `iv_has ivars_g id "__modbk"` (m_state): the door.
+- The Prism loader's `iv_put_new ivars_g`: a node in the table only.
+- `"@__as_*"`, `"@__lz_*"`, `"@__fb_*"`, `"@__x_*"` in main.mere: names passed to `iv_get_at` / `iv_has_at` / `iv_del_at_name`, the door.
+- `pack_assoc_key` (`"str:<h>@__pk_assoc"`): a String's, in the table in this step (step 2b' moves it behind the door).
+- `capi/`: `rb_ivar_get` / `rb_ivar_set` with `@__io_*` and `@__capi_*`, which reach the door by the C API's ivar call.
+- The rest are Ruby source in strings (`start_with?("@__")`) and comments.
 
 ## Checked
 

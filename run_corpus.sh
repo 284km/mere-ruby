@@ -77,6 +77,10 @@ done
 # never see -- green build, green corpus, and one program that fails for no
 # visible reason.
 ./tools/meth_writes_check.sh > /dev/null || { ./tools/meth_writes_check.sh; exit 1; }
+# ...and: no object's instance variable is read or written by its table key
+# "<id>@<name>" outside the door (m_state's iv_*). Since note 559 step 2b the
+# variable is in a shape's slot, and such a read finds nothing, quietly.
+./tools/iv_door_check.sh > /dev/null || { ./tools/iv_door_check.sh; exit 1; }
 # ...a seventh: every `name_set "tag"` has an arm in name_spec. A tag with no
 # arm builds an EMPTY table, which is a predicate answering false about every
 # name -- a wrong answer, not a crash.
