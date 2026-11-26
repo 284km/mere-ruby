@@ -252,3 +252,28 @@ end
 check_anonymous_isolation(:explicit_keywords_after_empty_frozen_spread) do
   anonymous_keyword_isolation(*[].freeze, a: 9)
 end
+
+# Keyword declarations snapshot positional rest when no keywords accompany
+# the spread. This differs from a plain anonymous rest and from explicit
+# keywords after a spread; frozen sources must not grant shareability.
+def snapshot_anonymous_kw_995(*, **) = proc { [*] }
+def snapshot_named_kw_995(*, option: 0) = proc { [*] }
+def snapshot_named_kwrest_995(*, **options) = proc { [*] }
+def snapshot_no_kw_995(*, **nil) = proc { [*] }
+def isolate_anonymous_kw_995(*, **) = Ractor.shareable_proc { [*] }
+def isolate_named_kw_995(*, option: 0) = Ractor.shareable_proc { [*] }
+def isolate_named_kwrest_995(*, **options) = Ractor.shareable_proc { [*] }
+def isolate_no_kw_995(*, **nil) = Ractor.shareable_proc { [*] }
+[:anonymous_kw, :named_kw, :named_kwrest, :no_kw].each do |kind|
+  capture = method("snapshot_#{kind}_995")
+  source = [1]
+  kept = capture.call(*source)
+  source << 2
+  source[0] = 9
+  GC.start
+  p [:keyword_method_snapshot, kind, kept.call]
+  isolate = method("isolate_#{kind}_995")
+  check_anonymous_isolation([:keyword_method_frozen_empty, kind]) { isolate.call(*[].freeze) }
+  check_anonymous_isolation([:keyword_method_frozen_value, kind]) { isolate.call(*[1].freeze) }
+  check_anonymous_isolation([:keyword_method_nil, kind]) { isolate.call(*nil) }
+end
