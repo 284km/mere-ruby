@@ -34,12 +34,44 @@ files above run one file at a time, against main and both candidate engines,
 with `--seed=1` and `MERE_RUBY_GC_TIGHT=1`. RSS is max resident bytes from
 `/usr/bin/time -l`. No gems are installed into the reference.
 
-The O2 binary uses compiler 9dec2ff6 and mgz 661a01d8. Full acceptance is
-running sequentially: `sh run_corpus.sh --both`, followed by
-`MERE_RUBY_VM=1 sh run_corpus.sh --both`. Each includes gc_roots,
-dup_defs, dead_defs, meth_writes, name_spec, rx_caps, ns_names, name_len
-and full record_hygiene. Generated C is checked with
-`MR_C=mr.c sh tools/bracket_depth_check.sh`; this loop record is also
-checked explicitly with record_hygiene. Focused passing cases are not a
-substitute for those pending sweeps. No full unit suite or Rails component
-suite was run; no workflow is changed.
+The O2 compiler/mgz pins are unchanged. The completed current-integration
+acceptance below supersedes the earlier queued sweeps. No full unit suite
+or Rails component suite was run; no new workflow changes.
+
+
+## Current-main integration
+
+The integration with main fd5f54b0 preserves fresh identities after removed
+constants outside boxes, while every newly defined box-owned class remains
+independent. Corpus 1112 and the expanded 1057 outside-box controls match
+stdout, stderr and status on both engines. Earlier 884/884 sweeps apply to
+the earlier head; fresh ordinary O2 r6 results are:
+
+- sh run_corpus.sh --both: 949/949, hash index ON/OFF, exit 0.
+- MERE_RUBY_VM=1 sh run_corpus.sh --both: 949/949, ON/OFF, exit 0.
+- All eight source gates and full/explicit record_hygiene: pass.
+- Generated-C bracket depth: 155 required / 1024 supplied, pass.
+- Staged/unstaged diff whitespace checks: pass.
+
+The exact binary SHA-256 is
+e97a2cc29797e4c19c2e0b022896cc621146cdfbb392bc760506d7881c8c739f.
+Clean Ruby 4.0.10 is selected through tools/ref_ruby.sh; compiler 9dec2ff6
+and mgz 661a01d8, matching the main fd5f54b0 control build.
+
+Unchanged ruby/test_box.rb selections add_constants_in_box,
+eval_with_constants, eval_with_classes and very_basic_method_calls_and_constants
+pass 4 tests / 53 assertions on reference and both candidate engines.
+Main completes only 8 assertions and errors at Timeout::State::GET_TIME
+in both engines; the corrected box lexical scope removes that error too.
+RSS therefore includes substantially more completed work in the candidate
+and is not a matched-workload heap-growth comparison. All invocations use
+MERE_RUBY_GC_TIGHT=1, fixed --seed=1, one file at a time. Max RSS bytes:
+
+| Engine | Main | Candidate |
+| --- | ---: | ---: |
+| Evaluator | 251674624 | 284033024 |
+| VM | 255967232 | 279822336 |
+
+The completed record is committed with the code integration in one push.
+No reference gems, full unit/Rails suite or new workflow behavior. Main
+commits newer than this pinned integration are not claimed runtime tested.

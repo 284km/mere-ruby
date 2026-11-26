@@ -134,11 +134,16 @@ name deliberately has no platform in it (a `.ruby-version` naming one platform i
 wrong on every other machine); the definition picks its tarball from `uname` and
 refuses, by name, a platform it has no build for.
 
-What this does **not** get you is `gem install` or `bundle install`. Those need a
-C-extension story and a memory footprint this does not have yet — `require
-"rubocop"` costs single-digit gigabytes. ruby-build's `mruby` and `picoruby`
-definitions ship without RubyGems too, so the bar for being installable is lower
-than the bar for being useful to a Gemfile.
+What this does **not** get you is `gem install` or `bundle install` out of the
+box. The package carries the binary and its documents and no standard library,
+and RubyGems and Bundler are standard library. That is a gap in the package, not
+in the interpreter: given CRuby's standard library on `RUBYLIB`, mere-ruby runs
+RubyGems and the published Bundler (see the RubyGems and Bundler paragraph
+below). It installs C-extension gems with `gem install` through its own mkmf and
+C API — nokogiri among them, compared with ruby by `tools/capi_gem_check.py`
+([capi/README.md](capi/README.md)) — and takes a real Rails application through
+Bundler, its dependencies, migration, boot, tests and Puma
+([railstest/README.md](railstest/README.md)).
 
 `-stack_size` is not optional. Parsing and evaluating recurse over the
 statement list, so native stack use grows with program size; on the

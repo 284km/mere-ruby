@@ -58,6 +58,16 @@ class TimingCheck(unittest.TestCase):
         self.assertIsNone(row['start_delay_seconds'])
         self.assertIsNone(row['steps'][0]['seconds'])
 
+    def test_a_skipped_job_leaves_the_report_complete_and_successful(self):
+        # unittest-vm runs on a schedule and on dispatch only: a push's run skips it.
+        skipped = job(id=11, name='unittest-vm', conclusion='skipped', started_at='2026-11-18T05:57:30Z',
+                      completed_at='2026-11-18T05:57:30Z', runner_name='', runner_id=0)
+        report = timing.summarize(run(), [job(), skipped], OBSERVED)
+        self.assertTrue(report['measured_jobs_complete'])
+        self.assertTrue(report['measured_jobs_successful'])
+        self.assertEqual(report['unknown_start_delay_jobs'], 0)
+        self.assertEqual(report['sum_execution_seconds'], 44)
+
     def test_running_and_cancelled_after_start_keep_elapsed_runtime(self):
         running = timing.job_timing(job(status='in_progress', conclusion=None, completed_at=None), OBSERVED)
         self.assertEqual(running['execution_seconds'], 503)
