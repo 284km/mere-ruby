@@ -1605,7 +1605,14 @@ and lex_go_b = fn (s: str) -> fn (i: int) ->
         // exactly that spacing, so the lexer marks the endless one -- and only
         // there, where the token before is a name and the one before that is
         // `def`, so no ordinary assignment is affected.
-        if str_eq two "==" || str_eq two "=>" || str_eq two "=~" then Cons (TP two, lex_go s (i + 2))
+        if str_eq c "=" && i > 0
+           && (str_eq (char_at s (i - 1)) " " || str_eq (char_at s (i - 1)) "\t")
+           && (if str_eq two "==" || str_eq two "=>" || str_eq two "=~" then false else true)
+           && line_is_def s i && (if def_eq_before s i then false else true)
+           && (let previous9 = prev_nonspace s (i - 1) in
+               previous9 >= 1 && str_eq (substring s (previous9 - 1) (previous9 + 1)) "[]")
+        then Cons (TP " =", lex_go s (i + 1))
+        else if str_eq two "==" || str_eq two "=>" || str_eq two "=~" then Cons (TP two, lex_go s (i + 2))
         else if str_eq c "=" && i > 0 && (str_eq (char_at s (i - 1)) " " || str_eq (char_at s (i - 1)) "\t")
                 && (let pj = prev_nonspace s (i - 1) in
                     pj >= 0 && (let pc = char_at s pj in is_alnum pc || str_eq pc "_" || str_eq pc "?" || str_eq pc "!")
@@ -5064,13 +5071,25 @@ let skip_then = fn toks ->
      | _ -> toks)
   | _ -> toks;
 
+// Array element positions reuse a logical line until parsing observes a
+// different line. Peeks may invalidate conservatively; semicolons on the
+// same physical line do not. This stores only counters, never token tails.
+let parse_line_epoch = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v (0 - 1) in v);
+let parse_note_line = fn (line9: int) ->
+  if vec_get parse_line_epoch 1 == line9 then ()
+  else (let _ = vec_set parse_line_epoch 1 line9 in
+        vec_set parse_line_epoch 0 (vec_get parse_line_epoch 0 + 1));
 let rec skip_nls = fn toks ->
-  match toks with Cons (TNL _, r) -> skip_nls r | _ -> toks;
+  match toks with
+  | Cons (TNL line9, r) -> let _ = parse_note_line line9 in skip_nls r
+  | _ -> toks;
 
 // the same, reporting how many newlines it passed: the statement loop keeps
 // the line counter with this, and no other caller cares.
 let rec skip_nls_n = fn toks -> fn (k: int) ->
-  match toks with Cons (TNL _, r) -> skip_nls_n r (k + 1) | _ -> (toks, k);
+  match toks with
+  | Cons (TNL line9, r) -> let _ = parse_note_line line9 in skip_nls_n r (k + 1)
+  | _ -> (toks, k);
 
 // how many newline tokens this stream holds (once per file, to clamp the
 // running count -- never per statement)
@@ -5147,6 +5166,8 @@ let rec tnl_before_eof = fn toks -> fn (ln: int) ->
   | Cons (TEOF, r) -> Cons (TNL ln, Cons (TEOF, r))
   | Cons (t, r) -> Cons (t, tnl_before_eof r ln);
 let number_nls_at = fn (s0: str) -> fn toks -> fn (base: int) ->
+  let _ = vec_set parse_line_epoch 0 (vec_get parse_line_epoch 0 + 1) in
+  let _ = vec_set parse_line_epoch 1 (0 - 1) in
   let s = crlf_norm s0 in
   let _ = (if map_len tc_ln > 0 then map_clear tc_ln else ()) in
   let _ = vec_set nl_cm 0 (0 - 1) in
@@ -5164,7 +5185,16 @@ let rec tok_line_d = fn toks -> fn (d: int) ->
   | Cons (TEOF, _) -> 0
   | Cons (_, r) -> tok_line_d r (d + 1)
   | Nil -> 0;
-let tok_line = fn toks -> tok_line_d toks 0;
+let tok_line = fn toks ->
+  let line9 = tok_line_d toks 0 in
+  let _ = parse_note_line line9 in line9;
+// The boundary is scanned once per observed logical line of an array.
+let rec tok_logical_line = fn toks ->
+  match toks with
+  | Cons (TNL line9, _) -> line9
+  | Cons (TEOF, _) -> 0
+  | Cons (_, rest9) -> tok_logical_line rest9
+  | Nil -> 0;
 let rec count_nls = fn toks ->
   match toks with
   | Nil -> 0
@@ -7457,10 +7487,10 @@ and parse_array_go = fn toks0 ->
   let toks = skip_nls toks0 in
   match toks with
   | Cons (TP p, r) ->
-    if str_eq p "]" then (EArr Nil, r) else parse_arr_items toks Nil
-  | _ -> parse_arr_items toks Nil
+    if str_eq p "]" then (EArr Nil, r) else parse_arr_items toks Nil (0, (0 - 1), false)
+  | _ -> parse_arr_items toks Nil (0, (0 - 1), false)
 
-and parse_arr_items = fn toks -> fn (acc: Expr list) ->
+and parse_arr_items = fn toks -> fn (acc: Expr list) -> fn cache9 ->
   // splat element [*x] and symbol-key trailing hash [.., k: v] forms.
   let bare = (match toks with
               | Cons (TP _, Cons (TP nx, _)) -> str_eq nx "," || str_eq nx "]"
@@ -7469,70 +7499,90 @@ and parse_arr_items = fn toks -> fn (acc: Expr list) ->
   | Cons (TP st, r0b) ->
     // a bare `*` / `**` forwards the method's anonymous rest / keyword rest,
     // as in a call: `def a(b: 1, **) [b, **] end` (test_keyword)
-    if bare && str_eq st "*" then (let _ = anon_use "r" in arr_items_sep (skip_nls r0b) (Cons (ESplat (EVar "__anonrest"), acc)))
+    if bare && str_eq st "*" then (let _ = anon_use "r" in arr_items_sep (skip_nls r0b) (Cons (ESplat (EVar "__anonrest"), acc)) cache9)
     else if bare && str_eq st "**" then
       let _ = anon_use "k" in
       arr_hash_items (skip_nls r0b) acc (Cons (EKwSplat (EVar "__anonkw"), Cons (EKwSplat (EVar "__anonkw"), Nil))) true
     else if str_eq st "*" then
       let (inner, r1) = parse_expr r0b in
-      arr_items_sep (skip_nls r1) (Cons (ESplat inner, acc))
+      arr_items_sep (skip_nls r1) (Cons (ESplat inner, acc)) cache9
     // `[**h]` starts the trailing hash, exactly as `[k: v]` does: everything
     // after it is a hash item, they all merge into ONE element, and Ruby drops
     // that element entirely when the merge comes out empty.
     else if str_eq st "**" then
       let (inner, r1) = parse_expr r0b in
       arr_hash_items (skip_nls r1) acc (Cons (EKwSplat inner, Cons (EKwSplat inner, Nil))) true
-    else parse_arr_expr toks acc
+    else parse_arr_expr toks acc cache9
   | Cons (TId n, Cons (TP col, r0c)) ->
     if str_eq col ":" then
       let (v, r1) = parse_expr (skip_nls r0c) in
       arr_hash_items (skip_nls r1) acc (Cons (v, Cons (ESym n, Nil))) false
-    else parse_arr_expr toks acc
-  | _ -> parse_arr_expr toks acc
+    else parse_arr_expr toks acc cache9
+  | _ -> parse_arr_expr toks acc cache9
 
-and arr_items_sep = fn r -> fn (acc: Expr list) ->
+and arr_items_sep = fn r -> fn (acc: Expr list) -> fn cache9 ->
   match r with
   | Cons (TP p, r2) ->
     if str_eq p "," then
       // `[1, 2,]` — a hanging comma before the closing bracket.
-      (match skip_nls r2 with
+      (let next9 = skip_nls r2 in
+       match next9 with
        | Cons (TP rb, r3) ->
          if str_eq rb "]" then (EArr (rev_app acc Nil), r3)
-         else parse_arr_items (skip_nls r2) acc
-       | _ -> parse_arr_items (skip_nls r2) acc)
+         else parse_arr_items next9 acc cache9
+       | _ -> parse_arr_items next9 acc cache9)
     else if str_eq p "]" then (EArr (rev_app acc Nil), r2)
     else (let __fm = ("mere-ruby: expected , or ] in array, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated array literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated array literal" ++ parsing_file ()))
 
-and parse_arr_expr = fn toks -> fn (acc: Expr list) ->
+and arr_expr_line = fn toks -> fn (epoch9: int) -> fn (cache9: int * int * bool) ->
+  let (_, previous9, _) = cache9 in
+  if previous9 == epoch9 then cache9
+  else (let logical9 = tok_logical_line toks in
+        let continued9 = logical9 < 0 in
+        (logical9, epoch9, continued9))
+
+and parse_arr_expr = fn toks -> fn (acc: Expr list) -> fn cache0 ->
   let _ = cmd_clear () in
+  let epoch9 = vec_get parse_line_epoch 0 in
   let (e0, r0) = parse_expr toks in
-  // Only expressions that can call need a line annotation. Literals do not
-  // use it; scanning to the line end once per element made long arrays
-  // quadratic. Keep the ordinary line calculation for observable calls.
-  let e = (match e0 with
-           | EMethod (_, m9, _) when str_len m9 > 2 && str_eq (substring m9 0 2) "__" -> e0
-           | ECall (m9, _) when str_len m9 > 2 && str_eq (substring m9 0 2) "__" -> e0
-           | EVar m9 when str_len m9 > 2 && str_eq (substring m9 0 2) "__" -> e0
-           | EMethod (_, _, _) -> ln_before e0 (tok_line toks)
-           | EMethodB (_, _, _, _, _) -> ln_before e0 (tok_line toks)
-           | ECall (_, _) -> ln_before e0 (tok_line toks)
-           | ECallB (_, _, _, _) -> ln_before e0 (tok_line toks)
-           | ESafe (_, _, _) -> ln_before e0 (tok_line toks)
-           | ESafeB (_, _, _, _, _) -> ln_before e0 (tok_line toks)
-           | EVar _ -> ln_before e0 (tok_line toks)
-           | _ -> e0) in
+  // Literals still need no position lookup. Call-capable expressions share
+  // one logical-line lookup; continued lines keep tc_phys's exact position.
+  let calls9 = (match e0 with
+    | EMethod (_, m9, _) when str_len m9 > 2 && str_eq (substring m9 0 2) "__" -> false
+    | ECall (m9, _) when str_len m9 > 2 && str_eq (substring m9 0 2) "__" -> false
+    | EVar m9 when str_len m9 > 2 && str_eq (substring m9 0 2) "__" -> false
+    | EBin (_, _, _) -> true | EUn (_, _) -> true
+    | EMethod (_, _, _) -> true | EMethodB (_, _, _, _, _) -> true
+    | ECall (_, _) -> true | ECallB (_, _, _, _) -> true
+    | ESafe (_, _, _) -> true | ESafeB (_, _, _, _, _) -> true
+    | EVar _ -> true | _ -> false) in
+  // A prior call on the same observed logical line already set the
+  // evaluator's line. Do not build another annotation node for it. Literal
+  // elements do not advance this cache, and nested parsing that observes a
+  // different line changes the epoch. Continued lines still need tc_phys.
+  let (_, previous9, continued0) = cache0 in
+  let changed9 = previous9 != epoch9 in
+  let cache9 = (if calls9 && changed9 then arr_expr_line toks epoch9 cache0 else cache0) in
+  let e = (if calls9 && (changed9 || continued0) then
+             (let (logical9, _, continued9) = cache9 in
+              let line9 = (if continued9 then tok_line toks else logical9) in
+              let current9 = (if map_has parser_flags "pstmt" then (match map_get parser_flags "pstmt" with VInt n9 -> n9 | _ -> 0) else 0) in
+              if line9 <= 0 || current9 <= 0 || line9 == current9 then e0
+              else EMethod (e0, "__lnb~", Cons (EInt line9, Nil)))
+           else e0) in
   let _ = cmd_refuse "unexpected local variable or method; expected a `,` separator for the array elements" in
   let r = skip_nls r0 in   // allow a newline before the , or ]
   let _ = comma_after_nl_check r0 r in
   match r with
   | Cons (TP p, r2) ->
     if str_eq p "," then
-      (match skip_nls r2 with
+      (let next9 = skip_nls r2 in
+       match next9 with
        | Cons (TP rb, r3) ->
          if str_eq rb "]" then (EArr (rev_app (Cons (e, acc)) Nil), r3)
-         else parse_arr_items (skip_nls r2) (Cons (e, acc))
-       | _ -> parse_arr_items (skip_nls r2) (Cons (e, acc)))
+         else parse_arr_items next9 (Cons (e, acc)) cache9
+       | _ -> parse_arr_items next9 (Cons (e, acc)) cache9)
     else if str_eq p "]" then (EArr (rev_app (Cons (e, acc)) Nil), r2)
     // trailing hash without braces: ["a", "b" => 1, "c" => 2]
     else if str_eq p "=>" then
@@ -10610,10 +10660,23 @@ and parse_for = fn toks ->
     let (e0, r3) = parse_for_expr r2 in
     let (e, body, r4) = parse_for_iter (for_bare_do r2) e0 r3 in
     (match targets with
-     | Cons (t, Nil) ->
+     | Cons (t, Nil) when (match t with ESplat _ -> false | _ -> true) ->
        (SExpr (EMethodB (e, "each", Nil, Cons ("__forv", Nil), Cons (for_xassign t (EVar "__forv"), body))), r4)
+     // (one splat -- `for *h[:k] in` -- collects what each gave, as `for *a`
+     //  does: for_rest_args)
+     | Cons (ESplat _, Nil) ->
+       (SExpr (EMethodB (e, "each", Nil, Cons ("*__forv", Nil),
+                         list_append_stmt (for_rest_args ()) (Cons (SMultiAssignX (targets, Cons (ESplat (EVar "__forv"), Nil)), body)))), r4)
+     // (several: as before. ruby 4.0 sends the writer of a call or index
+     //  target among several to one of the VALUES -- `for o.x, y in [[1,
+     //  2]]` calls 2.x = 1 -- which the VM, running ruby's sequence, does
+     //  too, and this does not; and a splat among them is refused here, as it
+     //  was, rather than taken in a way the VM's would not)
      | _ ->
-       (SExpr (EMethodB (e, "each", Nil, Cons ("*__forv", Nil), Cons (SMultiAssignX (targets, Cons (ESplat (EVar "__forv"), Nil)), body))), r4))
+       (if list_has_splat_x targets then
+          (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad assignment target")) in fail "mere-ruby: bad assignment target")
+        else
+          (SExpr (EMethodB (e, "each", Nil, Cons ("*__forv", Nil), Cons (SMultiAssignX (targets, Cons (ESplat (EVar "__forv"), Nil)), body))), r4)))
   else
   let (vars, r2) = parse_for_vars toks Nil in
   let (e0, r3) = parse_for_expr r2 in
@@ -10639,9 +10702,14 @@ and parse_for = fn toks ->
      // is the assignment `*r = [1,2]`, so r is [1,2]. for_assign would have
      // made a local literally NAMED "*r" and left r undefined -- and a real
      // `|*r|` block param would have wrapped the element one layer too deep.
+     // (...and it collects what each gave as ruby's for does: the values
+     //  given, or the one value as an Array when it converts to one --
+     //  for_rest_args. Bound through one `|__for|` it lost all but the first
+     //  of several values, and `yield` alone gave [nil].)
      (if str_len v > 1 && str_eq (char_at v 0) "*" then
-        (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil),
-                          Cons (SMultiAssign (Cons (v, Nil), Cons (EVar "__for", Nil)), body))), r4)
+        (SExpr (EMethodB (e, "each", Nil, Cons ("*__forv", Nil),
+                          list_append_stmt (for_rest_args ())
+                            (Cons (SMultiAssign (Cons (v, Nil), Cons (EVar "__forv", Nil)), body)))), r4)
       else if str_eq v "*" then
         // `for * in xs` binds nothing at all; the loop still runs.
         (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil), body)), r4)
@@ -10697,9 +10765,29 @@ and for_targets_complex = fn toks ->
     else for_targets_complex r
   | Cons (_, r) -> for_targets_complex r
 
-// parse comma-separated complex for-targets, terminated by `in`.
+// What a for loop's splat target takes (`for *a`, `for *h[:k]`): the
+// values each gave (the block's `*__forv`), or, when that is one value
+// that converts to an Array, that Array -- the sequence ruby compiles for
+// them (pm_compile_for_node_index): length, [], Array.try_convert, called.
+and for_rest_args = fn (u: unit) -> (Cons (SIf (Cons ((EBin ("==", EMethod (EVar "__forv", "length", Nil), EInt 1),
+                                       Cons (SAssign ("__fort", EMethod (EConst "::Array", "try_convert",
+                                                                         Cons (EMethod (EVar "__forv", "[]", Cons (EInt 0, Nil)), Nil))),
+                                             Cons (SIf (Cons ((EVar "__fort", Cons (SAssign ("__forv", EVar "__fort"), Nil)), Nil), Nil), Nil))), Nil),
+                               Nil),
+                      (Nil : Stmt list)))
+
+and list_has_splat_x = fn (ts: Expr list) ->
+  match ts with
+  | Nil -> false
+  | Cons (ESplat _, _) -> true
+  | Cons (_, t) -> list_has_splat_x t
+
+// parse comma-separated complex for-targets, terminated by `in` (a `*` in
+// front of one is its splat, as in a multiple assignment's)
 and parse_for_xtargets = fn toks -> fn (acc: Expr list) ->
-  let (t, r) = parse_x_target1 toks in
+  let (t, r) = (match toks with
+                | Cons (TP star, r0) when str_eq star "*" -> (let (i, r1) = parse_x_target1 r0 in (ESplat i, r1))
+                | _ -> parse_x_target1 toks) in
   match r with
   | Cons (TP c, r2) -> if str_eq c "," then parse_for_xtargets r2 (Cons (t, acc)) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected in after for" ++ parsing_file ()))) in fail ("mere-ruby: expected in after for" ++ parsing_file ()))
   | Cons (TId kw, r2) -> if str_eq kw "in" then (rev_app (Cons (t, acc)) Nil, r2) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected in after for" ++ parsing_file ()))) in fail ("mere-ruby: expected in after for" ++ parsing_file ()))
@@ -11543,6 +11631,47 @@ and parse_def = fn toks ->
   let _ = (if map_has parser_flags "defstmts" then map_delete parser_flags "defstmts" else ()) in
   r
 
+and parse_def_op_name = fn (op0: str) -> fn (r0: Tok list) ->
+    // the lexer space-marks a bracket / ampersand after "def " (` [`, ` &`);
+    // normalise to the bare operator name.
+    let op1 = if str_eq op0 " [" then "[" else if str_eq op0 " &" then "&" else op0 in
+    let answer9 =
+      if str_eq op1 "[" then
+        (match r0 with
+         | Cons (TP rb2, r1) ->
+           if str_eq rb2 "]" then
+             (match r1 with
+              | Cons (TP eq2, r2) -> if str_eq eq2 "=" then ("[]=", r2) else ("[]", r1)
+              | _ -> ("[]", r1))
+           else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected method name after def" ++ parsing_file ()))) in fail ("mere-ruby: expected method name after def" ++ parsing_file ()))
+         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected method name after def" ++ parsing_file ()))) in fail ("mere-ruby: expected method name after def" ++ parsing_file ())))
+      // ⚠ `def !@` / `def !` -- unary bang. RUBY NAMES BOTH `:!`, with no `@`
+      //   form at all (unlike +@ and -@), and this normalised them to "!@" --
+      //   a name nothing else looks up. `!obj` found it because the operator
+      //   arm asked for "!@" too, and `obj.send(:!)` did not, so the same
+      //   method was there through one spelling and missing through the other.
+      //   mspec's mocks stub `!` and call it by name.
+      else if str_eq op1 "!" then
+        (match r0 with
+         | Cons (TId at, r1) -> if str_eq at "@" then ("!", r1) else ("!", r0)
+         | _ -> ("!", r0))
+      // Preserve main's ~@ spelling; Ruby names both ~ and ~@ as :~.
+      else if str_eq op1 "~" then
+        (match r0 with
+         | Cons (TId at, r1) -> if str_eq at "@" then ("~", r1) else ("~", r0)
+         | _ -> ("~", r0))
+      // `def -@` / `def +@` — unary operator methods (op followed by @).
+      else if (str_eq op1 "-" || str_eq op1 "+") &&
+              (match r0 with Cons (TId at, _) -> str_len at >= 1 && str_eq (char_at at 0) "@" | _ -> false) then
+        (match r0 with
+         | Cons (TId at, r1) ->
+           if str_eq at "@" then (op1 ++ "@", r1)
+           // `-@x` lexes as the ivar @x after the op — split it back.
+           else (op1 ++ "@", Cons (TId (substring at 1 (str_len at)), r1))
+         | _ -> (op1 ++ "@", r0))
+      else if is_op_method_name op1 then (op1, r0)
+      else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected method name after def" ++ parsing_file ()))) in fail ("mere-ruby: expected method name after def" ++ parsing_file ())) in
+    answer9
 and parse_def_inner = fn toks ->
   match toks with
   // `def (expr).name; end` -- a singleton method on whatever the parenthesised
@@ -11565,12 +11694,13 @@ and parse_def_inner = fn toks ->
      // assignment and an operator name in one line. Only TId was accepted, so
      // both grep specs aborted at parse time -- the record's only two CRASHes.
      | Cons (TP rp0, Cons (TP dot0, Cons (TP opnm, r2b))) when
-         str_eq rp0 ")" && (str_eq dot0 "." || str_eq dot0 "::") && def_op_name opnm ->
-       (let (params, defs, r3) =
-          (match r2b with
-           | Cons (TP p, r4) -> if is_lparen p then parse_params r4 Nil Nil else (Nil, Nil, r2b)
-           | _ -> (Nil, Nil, r2b)) in
-        let (d, r5) = parse_def_tail opnm params defs r3 in
+         str_eq rp0 ")" && (str_eq dot0 "." || str_eq dot0 "::") && (def_op_name opnm || str_eq opnm "[") ->
+       (let (operator9, rest9) = parse_def_op_name opnm r2b in
+        let (params, defs, r3) =
+          (match rest9 with
+           | Cons (TP p, r4) -> if is_lparen p then parse_params r4 Nil Nil else (Nil, Nil, rest9)
+           | _ -> (Nil, Nil, rest9)) in
+        let (d, r5) = parse_def_tail operator9 params defs r3 in
         (SSingletonE (recv_e, Cons (d, Nil)), r5))
      | Cons (TP rp0, Cons (TP dot0, Cons (TId nm0, r2))) ->
        // (`def (a)::b`: `::` names the method as `.` does)
@@ -11606,49 +11736,7 @@ and parse_def_inner = fn toks ->
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected method name after def" ++ parsing_file ()))) in fail ("mere-ruby: expected method name after def" ++ parsing_file ())))
   // operator method names: def ==, def <=>, def []=, def +, def <<, ...
   | Cons (TP op0, r0) ->
-    // the lexer space-marks a bracket after "def " — same as a plain [.
-    // the lexer space-marks a bracket / ampersand after "def " (` [`, ` &`);
-    // normalise to the bare operator name.
-    let op1 = if str_eq op0 " [" then "[" else if str_eq op0 " &" then "&" else op0 in
-    let (name, r) =
-      if str_eq op1 "[" then
-        (match r0 with
-         | Cons (TP rb2, r1) ->
-           if str_eq rb2 "]" then
-             (match r1 with
-              | Cons (TP eq2, r2) -> if str_eq eq2 "=" then ("[]=", r2) else ("[]", r1)
-              | _ -> ("[]", r1))
-           else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected method name after def" ++ parsing_file ()))) in fail ("mere-ruby: expected method name after def" ++ parsing_file ()))
-         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected method name after def" ++ parsing_file ()))) in fail ("mere-ruby: expected method name after def" ++ parsing_file ())))
-      // ⚠ `def !@` / `def !` -- unary bang. RUBY NAMES BOTH `:!`, with no `@`
-      //   form at all (unlike +@ and -@), and this normalised them to "!@" --
-      //   a name nothing else looks up. `!obj` found it because the operator
-      //   arm asked for "!@" too, and `obj.send(:!)` did not, so the same
-      //   method was there through one spelling and missing through the other.
-      //   mspec's mocks stub `!` and call it by name.
-      else if str_eq op1 "!" then
-        (match r0 with
-         | Cons (TId at, r1) -> if str_eq at "@" then ("!", r1) else ("!", r0)
-         | _ -> ("!", r0))
-      // `def ~@` / `def ~` -- the same: ruby names both `:~`. This fell to
-      //   the operator arm below, which took `~` and left the `@` behind as a
-      //   parameter, so `~obj` raised "given 0, expected 1". Arel's Math
-      //   writes `def ~@` (Arel::Nodes::BitwiseNot).
-      else if str_eq op1 "~" then
-        (match r0 with
-         | Cons (TId at, r1) -> if str_eq at "@" then ("~", r1) else ("~", r0)
-         | _ -> ("~", r0))
-      // `def -@` / `def +@` — unary operator methods (op followed by @).
-      else if (str_eq op1 "-" || str_eq op1 "+") &&
-              (match r0 with Cons (TId at, _) -> str_len at >= 1 && str_eq (char_at at 0) "@" | _ -> false) then
-        (match r0 with
-         | Cons (TId at, r1) ->
-           if str_eq at "@" then (op1 ++ "@", r1)
-           // `-@x` lexes as the ivar @x after the op — split it back.
-           else (op1 ++ "@", Cons (TId (substring at 1 (str_len at)), r1))
-         | _ -> (op1 ++ "@", r0))
-      else if is_op_method_name op1 then (op1, r0)
-      else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected method name after def" ++ parsing_file ()))) in fail ("mere-ruby: expected method name after def" ++ parsing_file ())) in
+    let (name, r) = parse_def_op_name op0 r0 in
     let (params, defs, r2) =
       (match r with
        // (...and one that opens with a splat or a block: `def[]*a`,
@@ -11681,27 +11769,10 @@ and parse_def_inner = fn toks ->
             // method. Carry the receiver prefix like the TId case, so it
             // registers on the receiver's singleton rather than as a bare
             // top-level operator method (self. prefix for self, name# else).
-            | Cons (TP op2, r2) ->
+            | Cons (TP op2, r2) when is_op_method_name op2 || str_eq op2 "[" ->
               let pfx = if str_eq name0 "self" then "self." else name0 ++ "#" in
-              if str_eq op2 "[" then
-                (match r2 with
-                 | Cons (TP rb2, r3) ->
-                   if str_eq rb2 "]" then
-                     (match r3 with
-                      | Cons (TP eq2, r4) -> if str_eq eq2 "=" then (pfx ++ "[]=", r4) else (pfx ++ "[]", r3)
-                      | _ -> (pfx ++ "[]", r3))
-                   else (name0, r0)
-                 | _ -> (name0, r0))
-              // (a unary operator's `@`, as in the arm for `def -@` above:
-              //  `def o.-@` is :-@ and `def o.~@` is :~. The `@` was left
-              //  behind as a parameter, so `-o` found no :-@ at all.)
-              else if (str_eq op2 "-" || str_eq op2 "+" || str_eq op2 "!" || str_eq op2 "~")
-                      && (match r2 with Cons (TId at, _) -> str_eq at "@" | _ -> false) then
-                (match r2 with
-                 | Cons (_, r3) -> (pfx ++ op2 ++ (if str_eq op2 "-" || str_eq op2 "+" then "@" else ""), r3)
-                 | _ -> (pfx ++ op2, r2))
-              else if is_op_method_name op2 then (pfx ++ op2, r2)
-              else (name0, r0)
+              let (operator9, rest9) = parse_def_op_name op2 r2 in
+              (pfx ++ operator9, rest9)
             | _ -> (name0, r0))
          else (name0, r0)
        | _ -> (name0, r0)) in

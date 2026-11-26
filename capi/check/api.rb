@@ -39,6 +39,29 @@ check(said == '')
   end
 end
 
+# Native insertion refuses refinement arguments without leaking their methods.
+native_refinery = Module.new do
+  refine(String) { def native_refinement_leak = 123 }
+end
+native_refinement = native_refinery.refinements.first
+3.times do |operation|
+  target = operation == 2 ? String.new : Class.new(String)
+  ancestry = operation == 2 ? target.singleton_class : target
+  original_ancestors = ancestry.ancestors
+  error = raises(ArgumentError) { A.native_mixin(target, native_refinement, operation) }
+  check(error.message == "refinement module is not allowed")
+  check(ancestry.ancestors == original_ancestors)
+  check(!(operation == 2 ? target : target.new).respond_to?(:native_refinement_leak))
+  frozen_target = (operation == 2 ? Object.new : Class.new).freeze
+  raises(FrozenError) { A.native_mixin(frozen_target, native_refinement, operation) }
+end
+# The C API still permits an ordinary module to be inserted into a refinement.
+2.times do |operation|
+  plain_module = Module.new
+  A.native_mixin(native_refinement, plain_module, operation)
+  check(native_refinement.ancestors.include?(plain_module))
+end
+
 # Native flags never call a Ruby predicate, including during mirror refresh.
 [-> { Class.new }, -> { Module.new }, -> { Object.new }, -> { +'' },
  -> { [] }, -> { {} }, -> { proc {} }, -> { binding }].each do |factory|
@@ -186,6 +209,25 @@ check(e.message == "can't modify frozen String: \"s\"")
 list, len, last, frozen = A.row(5)
 check(list == [0, 'text', 2, 'text', 4] && len == 5 && last == 4 && frozen && list.frozen?)
 check(list[1].frozen? && A.row(0) == [[], 0, nil, true])
+# rb_thread_current is Thread.current, and rb_thread_local_aref reads what
+# Thread#[]= wrote -- a Fiber's own in a Fiber, another thread's of another
+# thread -- with no method looked up: a Thread subclass's #[] is not what C
+# reads (CRuby looks none up either)
+check(A.thread_current.equal?(Thread.current))
+Thread.current[:api_tl] = 41
+Thread.current[:api_false] = false
+check(A.thread_aref(Thread.current, :api_tl) == 41 && A.thread_aref(Thread.current, :api_none).nil?)
+check(A.thread_aref(Thread.current, :api_false) == false)
+check(Fiber.new { Thread.current[:api_tl] = 7; [A.thread_aref(Thread.current, :api_tl), A.thread_current.equal?(Thread.current)] }.resume == [7, true])
+check(A.thread_aref(Thread.current, :api_tl) == 41)
+api_t = Thread.new { Thread.current[:api_tl] = 5; A.thread_current }
+check(api_t.value.equal?(api_t) && A.thread_aref(api_t, :api_tl) == 5)
+class OverThread < Thread
+  def [](*) = :intercepted
+end
+api_ot = OverThread.new { Thread.current[:api_tl] = 6 }
+api_ot.join
+check(api_ot[:api_tl] == :intercepted && A.thread_aref(api_ot, :api_tl) == 6)
 # rb_default_internal_encoding answers what Encoding.default_internal was
 # last set to, nil when it was cleared
 verbose = $VERBOSE

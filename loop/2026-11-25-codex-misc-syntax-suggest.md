@@ -65,3 +65,44 @@ through tools/ref_ruby.sh.
 No full unit-test suite or Rails component suite was run. No workflow is
 changed by this PR. The code correction, integrated main, expanded fixture
 and this completed record are submitted in one push after local acceptance.
+
+## Current main integration after re-review
+
+The reviewer reported a prospective m_driver conflict. It is resolved
+against actual main 89ad241c by using its shaped-ivar iv_set operation
+while preserving the real CLI source/report and highlight:false keyword.
+The integration is validated by the completed r13 checks below.
+
+The shared origin/main ref advanced after fetch; Git's MERGE_HEAD records
+89ad241c. The first new build metadata label of 4920 is corrected in the
+provenance record; the binary itself is unchanged. A separately built
+exact 89ad241c control was then used for the comparisons below.
+
+Corpus 1109 (18 rows) and 445 (23 rows) match on both engines, stdout,
+stderr and exit status. Unchanged CRuby selections all pass on reference,
+matching main and candidate, --seed=1: Exception SyntaxError 2 tests /
+11 assertions; Module method_defined 3 / 339.
+
+| Tight-GC max RSS bytes | Reference | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Exception | 23576576 | 171819008 | 172654592 | 176439296 | 176898048 |
+| Module | 23511040 | 174686208 | 176816128 | 202932224 | 205258752 |
+
+The 5919-line syntax_suggest/OptionParser bundle regenerates byte for byte
+from clean Ruby 4.0.10. Current ordinary O2 binary SHA-256
+ac93a4c670d8b9d61e1937db3609f94e4e164c361dd31cd859448b1a24a6f7ff,
+compiler 9dec2ff6, mgz 661a01d8. The final r13 sweeps both pass 973/973 with hash indexing ON and OFF;
+the earlier 956 counts describe only the historical r12 integration.
+
+## Completed r13 integration acceptance
+
+- sh run_corpus.sh --both: 973/973 PASS, hash index ON and OFF, exit 0.
+- MERE_RUBY_VM=1 sh run_corpus.sh --both: 973/973 PASS, ON/OFF, exit 0.
+- Both binary proofs match the ac93a4c670d8 O2 binary above.
+- All eight source gates, generated-C bracket depth and iv_door PASS.
+- Full and explicit completed-loop record_hygiene and whitespace checks PASS.
+- Related original-file selections and tight-GC seed-1 RSS are recorded above.
+
+The m_driver conflict is resolved using the actual main shaped-ivar setter.
+There is no PR-owned workflow change; workflow updates in the merge are
+inherited byte for byte from integrated main. No full unit or Rails suite.

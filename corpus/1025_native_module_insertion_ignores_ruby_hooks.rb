@@ -46,4 +46,32 @@ Dir.mktmpdir('native-mixin-1025-') do |dir|
       p [operation, error.class]
     end
   end
+  refinery = Module.new do
+    refine(String) { def native_refinement_leak = 123 }
+  end
+  refinement = refinery.refinements.first
+  3.times do |operation|
+    target = operation == 2 ? String.new : Class.new(String)
+    ancestry = operation == 2 ? target.singleton_class : target
+    original_ancestors = ancestry.ancestors
+    error = nil
+    begin
+      native_mixin_insert_1025(target, refinement, operation)
+    rescue ArgumentError => caught
+      error = [caught.class, caught.message]
+    end
+    p [operation, error, ancestry.ancestors == original_ancestors,
+       (operation == 2 ? target : target.new).respond_to?(:native_refinement_leak)]
+    frozen_target = (operation == 2 ? Object.new : Class.new).freeze
+    begin
+      native_mixin_insert_1025(frozen_target, refinement, operation)
+    rescue FrozenError => caught
+      p [operation, caught.class]
+    end
+  end
+  2.times do |operation|
+    plain_module = Module.new
+    native_mixin_insert_1025(refinement, plain_module, operation)
+    p [operation, refinement.ancestors.include?(plain_module)]
+  end
 end
