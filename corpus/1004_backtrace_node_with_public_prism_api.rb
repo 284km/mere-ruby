@@ -82,3 +82,12 @@ rescue NoMethodError => error
   end
   p [found&.type, found&.name, found&.location&.start_line == location.lineno]
 end
+
+# Internal metadata must not introduce a Ruby local or a callable identifier.
+EvalNodeOwner1004.module_eval("def ordinary_identifier1004; __node_info; end", "identifier-control1004", 1)
+begin
+  receiver1004.ordinary_identifier1004
+  p [:ordinary_identifier, :leaked]
+rescue NameError
+  p [:ordinary_identifier, :missing]
+end
