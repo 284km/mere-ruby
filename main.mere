@@ -22952,8 +22952,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        // ...and a Numeric object is turned into its Float here, once, so every
        // arm below sees a number (`to_f` on a VObj answers 0.0 by itself).
        let args = (if str_len name == 5 && str_eq name "ldexp"
-                   then (match args with Cons (a9, t9) -> list_append (math_conv_args env world (Cons (a9, Nil))) t9 | Nil -> Nil)
-                   else math_conv_args env world args) in
+                   then (match args with Cons (a9, t9) -> list_append (math_conv_args env world name (Cons (a9, Nil))) t9 | Nil -> Nil)
+                   else math_conv_args env world name args) in
        let _ = (match args with
                 | Cons (v9, _) -> math_domain_check world name (to_f v9)
                 | Nil -> ()) in
@@ -34441,6 +34441,31 @@ and warn_output_fs = fn world ->
      && map_has warn_cats "deprecated" && truthy (map_get warn_cats "deprecated")
   then rb_warn world "$, is set to non-nil value"
   else ()
+// Public Integer-to-Float conversion warns; private fdiv conversion does not.
+and numeric_float_warn = fn world -> fn (value9: Val) ->
+  let float9 = to_f value9 in
+  let _ = (match value9 with
+           | VBig _ ->
+             if flt_is_inf float9
+                && (if map_has globals (gvar_slot "VERBOSE")
+                    then (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false)
+                    else false) then
+               (let block9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+                let message9 = cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: Integer out of Float range\n" in
+                let _ = invoke_val_c gc_cenv0 world block9 (VClass "Warning") "warn" (Cons (mkstr message9, Nil)) false in ())
+             else ()
+           | _ -> ()) in float9
+// Called only after a public conversion actually overflowed. The numeric
+// leaf can report this through its registered hook without a common dispatch
+// wrapper or a second decimal-to-Float conversion.
+and numeric_float_overflow_warning = fn world ->
+  if (if map_has globals (gvar_slot "VERBOSE")
+      then (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false)
+      else false) then
+    (let block9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     let message9 = cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: Integer out of Float range\n" in
+     let _ = invoke_val_c gc_cenv0 world block9 (VClass "Warning") "warn" (Cons (mkstr message9, Nil)) false in ())
+  else ()
 // ruby's rb_warning: said only when $VERBOSE is TRUE (`ruby -w`), where
 // rb_warn is silenced only by nil
 and rb_warning = fn world -> fn (msg: str) ->
@@ -42296,7 +42321,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
       || (str_len name == 1 && str_eq name "%") || (str_len name == 9 && str_eq name "remainder"))
      && (is_num recv || is_cpx recv)
      && (match args with Cons (a0, Nil) -> num_is_zero a0 | _ -> false) then
-    prim_raise "ZeroDivisionError" "divided by 0"
+    (let _ = (match (recv, args) with
+              | (VBig _, Cons (VFlt _, Nil)) when (if str_eq name "div" then false else true) ->
+                (let _ = public_to_f recv in ())
+              | _ -> ()) in
+     prim_raise "ZeroDivisionError" "divided by 0")
   // ...and pow's SECOND argument is a divisor as well: `2.pow(3, 0)` reached a
   // machine division by zero inside int_pow_mod, so it refused -- but as a
   // bare internal failure rather than by name.
@@ -42311,7 +42340,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           && (match args with Cons (VFlt y9, Nil) -> flt_is_inf y9 | _ -> false) then
     (match args with
      | Cons (VFlt y9, _) ->
-       (let xneg9 = num_isneg recv in
+       (let _ = (match recv with VBig _ -> (let _ = public_to_f recv in ()) | _ -> ()) in
+        let xneg9 = num_isneg recv in
         if (y9 > 0.0 && (if xneg9 then false else true)) || (y9 < 0.0 && xneg9) then VFlt (to_f recv) else recv)
      | _ -> recv)
   // ...and a Float receiver: x % y when the signs agree, x itself when they
@@ -42444,11 +42474,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            then VFlt (big_fdiv_s (num_dec recv) (num_dec a1))
            else (match (recv, a1) with
                  | (VBig number9, VFlt divisor9) -> big_float_fdiv number9 divisor9
+                 | (VFlt number9, VBig _) -> VFlt (number9 / public_to_f a1)
                  | _ -> VFlt (to_f recv / to_f a1)))
         else if (str_len name == 3 && str_eq name "div") then
           // the floor of the quotient, EXACTLY: int_of_float saturates, so
           // `9223372036854775808.div(1.0)` answered Int64 max.
-          (let q = to_f recv / to_f a1 in flt_floor_v q)
+          (let q = (match (recv, a1) with
+                    | (VBig _, VFlt divisor9) -> public_to_f recv / divisor9
+                    | (VFlt number9, VBig _) -> number9 / public_to_f a1
+                    | _ -> to_f recv / to_f a1) in flt_floor_v q)
         // remainder keeps the DIVIDEND's sign, where % keeps the divisor's
         else
           (let r = (match arith_bin "%" recv a1 with VInt n -> float_of_int n | VFlt f -> f | _ -> 0.0) in
@@ -43813,11 +43847,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Integer"))
      | _ -> prim_raise "NoMethodError" ("undefined method 'to_i' for " ++ for_recv_name recv))
   else if (str_len name == 4 && str_eq name "to_f") then
-    (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | VBig s -> VFlt (float_of_str s) | VRat (n, d) -> VFlt (rat_to_f n d) | VStr s -> (let e9 = enc_canon_name (senc_get s) in
+    (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | VBig s -> VFlt (public_to_f recv) | VRat (n, d) -> VFlt (rat_to_f n d) | VStr s -> (let e9 = enc_canon_name (senc_get s) in
                  if enc_ascii_compat e9 then VFlt (str_to_f_lenient (sget s))
                  else prim_raise "Encoding::CompatibilityError" ("ASCII incompatible encoding: " ++ e9)) | VNil -> VFlt 0.0
      | VCpx (cre, cim) ->
-       (if exact_zero_val cim then VFlt (to_f cre)
+       (if exact_zero_val cim then VFlt (public_to_f cre)
         else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Float"))
      | _ -> prim_raise "NoMethodError" ("undefined method 'to_f' for " ++ for_recv_name recv))
   // to_a returns self for a plain Array, but a plain Array (not the subclass)
@@ -44258,13 +44292,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VBig a ->
        (match args with
         | Cons (VFlt y9, _) ->
-          (match flt_divmod_pair (big_fdiv_s a "1") y9 with
+          (match flt_divmod_pair (public_big_float_result (big_fdiv_s a "1")) y9 with
            (d9, m9) -> arr_new (Cons (flt_floor_v d9, Cons (VFlt m9, Nil))))
         | Cons (VRat (_, _), _) -> (match args with Cons (b9, _) -> rat_divmod_pair recv b9 | _ -> VNil)
         | Cons (b, _) -> let bd = num_dec b in arr_new (Cons (norm_big (big_div_s a bd), Cons (norm_big (big_mod_s a bd), Nil)))
         | _ -> VNil)
      // Float#divmod: quotient floored to an Integer, remainder a Float.
-     | VFlt a -> (match args with Cons (b, _) -> (match flt_divmod_pair a (to_f b) with (d9, m9) -> arr_new (Cons (flt_floor_v d9, Cons (VFlt m9, Nil)))) | _ -> VNil)
+     | VFlt a -> (match args with Cons (b, _) -> (match flt_divmod_pair a (public_to_f b) with (d9, m9) -> arr_new (Cons (flt_floor_v d9, Cons (VFlt m9, Nil)))) | _ -> VNil)
      // Rational#divmod: the quotient is the FLOOR of the exact division and
      // the remainder is what the quotient leaves. An INTEGER receiver with a
      // Rational divisor is the same arithmetic -- it had no arm at all and
@@ -44375,7 +44409,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // a BIGNUM follows the Integer rules: an Integer pairs as it is, a Float
         // or a numeric String makes both Floats, anything else is refused
         | VBig _ -> (if (match o with VFlt _ -> true | _ -> false)
-                     then arr_new (Cons (o, Cons (VFlt (to_f recv), Nil)))
+                     then arr_new (Cons (o, Cons (VFlt (public_to_f recv), Nil)))
                      else if (match o with VInt _ -> true | VBig _ -> true | _ -> false) then arr_new (Cons (o, Cons (recv, Nil)))
                      else if (match o with VStr _ -> true | _ -> false)
                      then (match o with VStr h9 -> coerce_str recv h9 | _ -> VNil)
@@ -44383,7 +44417,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // Float#coerce answers two Floats: `2.5.coerce(1)` is [1.0, 2.5], not
         // [1, 2.5] -- the point of coercing is that both sides end up alike.
         | VFlt _ -> (if (match o with VCpx (_, _) -> true | _ -> false) then cpx_coerce_flt o recv
-                     else if is_num o then arr_new (Cons (VFlt (to_f o), Cons (recv, Nil)))
+                     else if is_num o then arr_new (Cons (VFlt (public_to_f o), Cons (recv, Nil)))
                      else if (match o with VStr _ -> true | _ -> false)
                      then (match o with VStr h9 -> coerce_str recv h9 | _ -> VNil)
                      // ruby coerces through Float(), so a String that is not a
@@ -48207,6 +48241,7 @@ and kernel_float = fn env -> fn world -> fn (args0: Val list) ->
   match pos with
   | Cons (VStr h9, _) when (if enc_ascii_compat (enc_canon_name (senc_get h9)) then false else true) ->
     raise_exc world "Encoding::CompatibilityError" ("ASCII incompatible encoding: " ++ enc_canon_name (senc_get h9))
+  | Cons (value9, _) when (match value9 with VBig _ -> true | _ -> false) -> VFlt (numeric_float_warn world value9)
   | _ ->
   if raising then kernel_float_go env world pos
   else
@@ -48219,17 +48254,12 @@ and kernel_float_go = fn env -> fn world -> fn (pos: Val list) ->
   match v with
   | VFlt f -> VFlt f
   | VInt n -> VFlt (float_of_int n)
-  | VBig _ -> VFlt (to_f v)
+  | VBig _ -> VFlt (numeric_float_warn world v)
   | VRat (_, _) -> VFlt (to_f v)
   // Kernel#Float's reading of a String is the strict one: no leading ".",
   // no trailing junk, single underscores only between digits.
   | VStr h -> VFlt (rb_flt_parse (sget h))
   | VNil -> (let _ = conv_fail "TypeError" "can't convert nil into Float" in VNil)
-  // a Complex converts only when it has no imaginary part.
-  | VCpx (re, im) ->
-    (if (match im with VInt 0 -> true | VFlt fz -> fz == 0.0 | _ -> false)
-     then VFlt (to_f re)
-     else (let _ = conv_fail "RangeError" ("can't convert " ++ to_s v ++ " into Float") in VNil))
   | other ->
     (if responds world other "to_f" then
        (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -48279,7 +48309,7 @@ and rb_fmt_flt = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VFlt f -> f
   | VInt x -> float_of_int x
-  | VBig _ -> to_f v
+  | VBig _ -> numeric_float_warn world v
   | VRat (_, _) -> to_f v
   | VNil -> (let _ = prim_raise "TypeError" "can't convert nil into Float" in 0.0)
   | VStr h -> rb_flt_parse (sget h)
@@ -48474,10 +48504,9 @@ and rb_fmt_one = fn env -> fn world -> fn state9 -> fn (flags: str) -> fn (width
          | other8 -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name av ++ " to String (" ++ class_name av ++ "#to_str gives " ++ class_name other8 ++ ")") in ""))) in
     rb_pad_str s flags width
   else if str_eq typ "f" || str_eq typ "e" || str_eq typ "E" || str_eq typ "g" || str_eq typ "G" then
-    let fv = rb_fmt_flt env world av in
-    // (an Integer and a Rational keep every digit under %f: they are written
-    //  from the exact value, not from the Float it converts to)
+    // Exact %f formatting never performs a public Float conversion.
     let exact9 = str_eq typ "f" && (match av with VInt _ -> true | VBig _ -> true | VRat (_, _) -> true | _ -> false) in
+    let fv = (if exact9 then 0.0 else rb_fmt_flt env world av) in
     let neg9 = (match av with
                 | VInt i9 -> i9 < 0
                 | VBig b9 -> big_sign b9 < 0
@@ -58294,7 +58323,7 @@ and pack_cv = fn env -> fn world -> fn (assoc: int) -> fn (kind: str) -> fn (v: 
     (match v with
      | VFlt _ -> v
      | VInt n -> VFlt (float_of_int n)
-     | VBig _ -> VFlt (to_f v)
+     | VBig _ -> VFlt (numeric_float_warn world v)
      | VRat (_, _) -> VFlt (to_f v)
      | VObj _ ->
        (if obj_is_a world (dispatch_cls_of world v) "Numeric" && responds world v "to_f" then
@@ -65048,7 +65077,7 @@ and math_domain_check = fn world -> fn (fname: str) -> fn (x: float) ->
                  ("Numerical argument is out of domain - " ++ fname) in ())
   else ()
 
-and math_conv_args = fn env -> fn world -> fn (xs: Val list) ->
+and math_conv_args = fn env -> fn world -> fn (name: str) -> fn (xs: Val list) ->
   match xs with
   | Nil -> Nil
   | Cons (h, t) ->
@@ -65059,10 +65088,14 @@ and math_conv_args = fn env -> fn world -> fn (xs: Val list) ->
            // converted through it, as rb_to_float does when the method is not
            // the basic one (test_math's test_override_*_to_f)
            | VInt _ -> math_conv_redef env world h "Integer"
-           | VBig _ -> math_conv_redef env world h "Integer"
+           | VBig _ ->
+             (match math_conv_redef env world h "Integer" with
+              | VBig _ when (if str_eq name "log" || str_eq name "log2" || str_eq name "log10" then false else true) ->
+                VFlt (numeric_float_warn world h)
+              | converted9 -> converted9)
            | VRat _ -> math_conv_redef env world h "Rational"
            | other -> other),
-          math_conv_args env world t)
+          math_conv_args env world name t)
 
 // The class a FrozenError names: rb_obj_class as ruby prints it, so an
 // anonymous class is #<Class:0x...> rather than the internal name (an object
