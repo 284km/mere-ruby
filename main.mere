@@ -6620,6 +6620,39 @@ and shift_width_v = fn env -> fn world -> fn (v: Val) ->
             ++ display_cls_msg world (dispatch_cls_of world ti) ++ ")") in VNil)
     else no_conv ()
 
+// Integer#to_s reads a non-Integer radix through NUM2INT. Keep the native
+// Integer argument path in the leaf so its separate width checks stay shared.
+and integer_radix_coerce = fn world -> fn (value: Val) ->
+  let env = gc_cenv0 in
+  let checked = fn (n: int) ->
+    if n > 2147483647 then prim_raise "RangeError" ("integer " ++ str_of_int n ++ " too big to convert to 'int'")
+    else if n < 0 - 2147483648 then prim_raise "RangeError" ("integer " ++ str_of_int n ++ " too small to convert to 'int'")
+    else VInt n in
+  let integer = fn (v: Val) ->
+    (match v with
+     | VInt n -> checked n
+     | VBig b ->
+       (if big_cmp_s b "9223372036854775807" > 0 || big_cmp_s b "-9223372036854775808" < 0
+        then prim_raise "RangeError" "bignum too big to convert into 'long'"
+        else checked (int_of_str b))
+     | bad -> prim_raise "TypeError"
+        ("can't convert " ++ display_cls_msg world (dispatch_cls_of world value) ++ " to Integer ("
+         ++ display_cls_msg world (dispatch_cls_of world value) ++ "#to_int gives "
+         ++ display_cls_msg world (dispatch_cls_of world bad) ++ ")")) in
+  match value with
+  | VNil -> prim_raise "TypeError" "no implicit conversion from nil to integer"
+  | VFlt f ->
+    (if flt_is_nan f then prim_raise "RangeError" "float NaN out of range of integer"
+     else if flt_is_inf f then prim_raise "RangeError" ("float " ++ (if f > 0.0 then "Inf" else "-Inf") ++ " out of range of integer")
+     else if f >= 9223372036854775808.0 || f < 0.0 - 9223372036854775808.0 then
+       prim_raise "RangeError" ("float " ++ (if f < 0.0 then "-" else "") ++ fmt_g_abs (VFlt (if f < 0.0 then 0.0 - f else f)) 10 false false ++ " out of range of integer")
+     else checked (int_of_float f))
+  | _ ->
+    (let cls = (match value with VClass c -> "(sng:" ++ c ++ ")" | _ -> dispatch_cls_of world value) in
+     if has_meth world cls "to_int" || hng_sng_has world value "to_int" || responds world value "to_int" then
+       integer (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) value "to_int" Nil false)
+     else prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name value ++ " into Integer"))
+
 // CRuby coerce_failed display: an immediate (nil/true/false/Integer/Float/
 // Symbol) shows its inspect; a heap object shows its class name.
 // Is this expression a desugared string / regexp LITERAL? Both are built as
@@ -8807,6 +8840,24 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
      | VArr a9 when r.b == arr_len a9 && (if cfrozen_get 0 a9 then false else true) ->
        let _ = arr_push_many a9 (Cons (capi_in r.c, Nil)) in 1
      | _ -> 0)
+  // rb_thread_current (a 0) and rb_thread_local_aref (a 1, b: the thread, c:
+  // the key's Symbol): answered from the tables Thread.current and Thread#[]
+  // read, with no method looked up or called -- CRuby's look none up either.
+  // 0 when a thread-local is not this to answer (not a Thread, or a key that
+  // is no Symbol) or is false: C sends #[] then, which answers the same.
+  // (sqlite3 asks both on every prepare and step -- its callback frame --
+  //  and the two sends were most of a prepared statement's step.)
+  else if r.op == 37 then
+    (if r.a == 0 then
+       capi_out (if map_has cur_thr "t" then map_get cur_thr "t"
+                 else if map_has cur_thr "v" then map_get cur_thr "v" else VNil)
+     else
+       (match (capi_in r.b, capi_in r.c) with
+        | (VObj tid, VSym kk) when thr_obj_here world (VObj tid) "" ->
+          (let (_, _, _, ivars) = world in
+           let o9 = fb_tl_owner world tid "[]" in
+           capi_out (if iv_has ivars o9 ("__tl_" ++ kk) then iv_get ivars o9 ("__tl_" ++ kk) else VNil))
+        | _ -> 0))
   // C module insertion mutates the ancestry directly, without Ruby hooks.
   else if r.op == 36 then
     (let target9 = capi_in r.a in
@@ -19033,7 +19084,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        // "UTC" for UTC, nothing for a fixed offset (it has no name), and the
        // local zone's abbreviation otherwise.
        else if (str_len name == 4 && str_eq name "zone") then
-         (if iv_has iv9 oid "__tzo" then iv_get iv9 oid "__tzo"
+         (if iv_has iv9 oid "__tzo" then
+            (let _ = time_off world recv in iv_get iv9 oid "__tzo")
           else if time_is_utc world recv then mkstr_ascii "UTC"
           else if time_is_fixed world recv then VNil
           else (match tz_local_in (time_tz_of oid) (time_tz_ep world recv (match prim_time_epoch world recv with VInt n -> n | _ -> 0)) with (_, nm9) -> mkstr_ascii nm9))
@@ -20446,6 +20498,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     // own methods dispatch and `super` still reaches Time.
     else if time_cls world c && ((str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm")
                                 || (str_len name == 5 && str_eq name "local") || (str_len name == 6 && str_eq name "mktime")) then
+      if not (str_eq c "Time") && not skip9 && cls_meth_own world c name
+         && not (str_eq (sng_user_owner world c name) "") then
+        (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name
+         then private_constructor_error world c name args
+         else invoke world blk recv ("(sng:" ++ c ++ ")") name args)
+      else
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
        let _ = map_set ocls9 id c in
@@ -20495,6 +20553,14 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     //  it included -- time_spec's "doesn't call Time.at directly")
     else if time_cls world c && ((str_len name == 3 && str_eq name "now") || (str_len name == 2 && str_eq name "at")
                                  || (str_len name == 9 && str_eq name "__capi_at")) then
+      // Inherited Ruby overrides precede the native constructor on a subclass.
+      // A saved builtin and the C API entry retain their native dispatch.
+      if not (str_eq c "Time") && not skip9 && not (str_eq name "__capi_at")
+         && cls_meth_own world c name && not (str_eq (sng_user_owner world c name) "") then
+        (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name
+         then private_constructor_error world c name args
+         else invoke world blk recv ("(sng:" ++ c ++ ")") name args)
+      else
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
        let _ = map_set ocls9 id c in
@@ -42453,15 +42519,23 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> VNil)
   // universal
   else if (str_len name == 4 && str_eq name "to_s") then
-    (match recv with
+    (let args = (if (match recv with VInt _ -> true | VBig _ -> true | _ -> false) then
+                   (match args with
+                    | Cons (base, rest) when (match base with VInt _ -> false | VBig _ -> false | _ -> true) ->
+                      Cons (integer_radix_coerce (fb_world ()) base, rest)
+                    | _ -> args)
+                 else args) in
+     match recv with
      // a Proc's description is BINARY: it carries an address, which is bytes
      // and not characters, so ruby stamps ASCII-8BIT on it.
      | VProc pid9 -> (let r = mkstr (proc_to_s pid9) in
                       (match r with VStr rid -> (let _ = senc_set rid "ASCII-8BIT" in r) | _ -> r))
      // a number's decimal (or base-N) text is US-ASCII in ruby, not the default
-     | VInt n -> (let r = (match args with Cons (VInt base, _) -> mkstr (int_to_base n (check_radix base)) | _ -> mkstr (to_s recv)) in
+     | VInt n -> (let r = (match args with Cons (VInt base, _) -> mkstr (int_to_base n (check_radix base))
+                            | Cons (VBig base, _) -> mkstr (int_to_base n (check_big_radix base)) | _ -> mkstr (to_s recv)) in
                   (match r with VStr rid -> (let _ = senc_set rid "US-ASCII" in r) | _ -> r))
-     | VBig bs -> (let r = (match args with Cons (VInt base, _) -> mkstr (big_to_base_s bs (check_radix base)) | _ -> mkstr bs) in
+     | VBig bs -> (let r = (match args with Cons (VInt base, _) -> mkstr (big_to_base_s bs (check_radix base))
+                             | Cons (VBig base, _) -> mkstr (big_to_base_s bs (check_big_radix base)) | _ -> mkstr bs) in
                    (match r with VStr rid -> (let _ = senc_set rid "US-ASCII" in r) | _ -> r))
      // ...and a Float's is too. Only Integer and Bignum had an arm here, so
      // `1.5.to_s.encoding` answered the default external where ruby says
@@ -56667,6 +56741,7 @@ and time_mil_pos = fn (c: str) -> fn (tab: str) -> fn (i: int) ->
 // Apply an offset argument to a Time object in place.
 and time_set_zone = fn world -> fn (oid: int) -> fn (args: Val list) ->
   let (_, _, _, iv9) = world in
+  let _ = (if iv_has iv9 oid "__tzo_refresh" then iv_del iv9 oid "__tzo_refresh" else ()) in
   let (kind9, secs9, ex9) = (match args with Cons (v9, _) -> time_parse_off3 world v9 | Nil -> (0, 0, VNil)) in
   let _ = (if iv_has iv9 oid "__utc" then iv_del iv9 oid "__utc" else ()) in
   let _ = (if iv_has iv9 oid "__off" then iv_del iv9 oid "__off" else ()) in
@@ -56685,7 +56760,8 @@ and time_set_zone = fn world -> fn (oid: int) -> fn (args: Val list) ->
      match ex9 with VRat (_, _) -> iv_set iv9 oid "__offx" ex9 | _ -> ())
   else ()
 
-// A derived Time (t + n, t.round, ...) shows what its source showed.
+// A derived Time keeps its source's zone. A timezone object's offset is
+// recomputed lazily at the new instant, as time.c's TZMODE_COPY does.
 and time_copy_zone = fn world -> fn (src: Val) -> fn (dst: Val) ->
   let (_, _, _, iv9) = world in
   match (src, dst) with
@@ -56694,7 +56770,11 @@ and time_copy_zone = fn world -> fn (src: Val) -> fn (dst: Val) ->
      let _ = (if iv_has iv9 o1 "__offx" then iv_set iv9 o2 "__offx" (iv_get iv9 o1 "__offx") else ()) in
      let _ = (if iv_has iv9 o1 "__tzo" then iv_set iv9 o2 "__tzo" (iv_get iv9 o1 "__tzo") else ()) in
      let _ = (if map_has time_ltz (str_of_int o1) then map_set time_ltz (str_of_int o2) (map_get time_ltz (str_of_int o1)) else ()) in
-     if iv_has iv9 o1 "__off" then iv_set iv9 o2 "__off" (iv_get iv9 o1 "__off") else ())
+     let object_zone9 = iv_has iv9 o1 "__tzo"
+                        && (match iv_get iv9 o1 "__tzo" with VObj _ -> true | _ -> false) in
+     let _ = (if object_zone9 then iv_set iv9 o2 "__tzo_refresh" (VBool true) else ()) in
+     if iv_has iv9 o1 "__off"
+     then iv_set iv9 o2 "__off" (iv_get iv9 o1 "__off") else ())
   | _ -> ()
 
 // The epoch of civil fields read in the LOCAL zone. Two passes, because the
@@ -68661,11 +68741,13 @@ and do_eval0 = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     let prog2 = try_or (fn (u: unit) ->
       let toks = number_nls_at code (lex_src code) ebase9 in
       let _ = parse_line_reset (count_nls toks) in
-      let (p2, _) = parse_stmts toks Nil in
+      let (p2, tail9) = parse_stmts toks Nil in
+      let trailing9 = (match skip_nls tail9 with Cons (TEOF, _) -> false | Nil -> false | _ -> true) in
       let _ = rx_check_pending () in
       let _ = lvo_clear vw_outer in
       let _ = region LVN { lvo_fill eenv vw_outer } in
-      let _ = (if filemode9 then uv_program p2 (parse_time_file ()) false else uv_program_eval p2 (parse_time_file ())) in
+      let _ = (if filemode9 || trailing9 then uv_program p2 (parse_time_file ()) false else uv_program_eval p2 (parse_time_file ())) in
+      let _ = (if trailing9 then syn_refuse "__eval_trailing_tokens__" else ()) in
       let _ = lvo_clear vw_outer in
      let _ = warn_flush world in p2) sentinel in
     let _ = (if covev9 then cov_end () else ()) in
@@ -68741,7 +68823,17 @@ and do_eval0 = fn env -> fn world -> fn blk -> fn (args: Val list) ->
                                 (if i > 0 && (str_eq (char_at code (i - 1)) " " || str_eq (char_at code (i - 1)) "\n" || str_eq (char_at code (i - 1)) "\t")
                                  then tail9 (i - 1) else i) in
                              let i9 = tail9 (str_len code) in i9 > 0 && str_eq (char_at code (i9 - 1)) "=") in
-          let pr9 = (if (str_len why0 > 0 || eof_assign9 || str_contains why9 "expected a label as the key in the hash pattern") && (if str_contains code "BEGIN\{throw :__isq_ok, :ok}" then false else true)
+          let pr9 = (if str_eq sw9 "__eval_trailing_tokens__" then
+                       // The ISeq parse-only wrapper supplies its original
+                       // source; never infer it by searching user source text.
+                       (let original9 = (if lv_has env "__meth" && lv_has env "__isq_original"
+                                             && (match lv_get env "__meth" with VStr m9 -> str_eq (sget m9) "__isq_eval" | _ -> false)
+                                         then lv_get env "__isq_original" else VNil) in
+                        let (source9, line9) = (match original9 with
+                                              | VStr h9 -> (sget h9, eline9 + 1)
+                                              | _ -> (code, eline9)) in
+                        try_or (fn (u: unit) -> prism_report source9 efile9 line9) "")
+                     else if (str_len why0 > 0 || eof_assign9 || str_contains why9 "expected a label as the key in the hash pattern") && (if str_contains code "BEGIN\{throw :__isq_ok, :ok}" then false else true)
                      then try_or (fn (u: unit) -> prism_report code efile9 eline9) "" else "") in
           let msg = (if str_len pr9 > 0 then pr9
                      else if str_len why9 > 0 then efile9 ++ ":" ++ str_of_int (if sl9 > 0 then sl9 else if str_len why0 > 0 && rxl9 > 0 then rxl9 else el9) ++ ": " ++ why9 else try_or (fn (u: unit) ->
@@ -72016,14 +72108,51 @@ and vm_ct_regions = fn (ct: (int * int * int * int * int * int) list) ->
   match ct with
   | Nil -> false
   | Cons ((k, _, s, e, _, _), t) -> ((k == 1 || k == 2) && e > s) || vm_ct_regions t
+// Can program id throw the jump signal vm_seg takes (vm_jump)? It is thrown
+// for a throw of a return, a break, a next or a redo (1, 2, 3, 5) inside a
+// region of the program's own (vm_loop), and for a rescue or an ensure
+// sequence of it left that way (vm_region's `after`) -- which is so when
+// that sequence has such a throw, a tail call (how 7), or a sequence of its
+// own that can. A re-raise (0) and a retry (4) travel as other signals.
+// Asked once a generation of the id: vm_jump_memo.
+and vm_may_jump = fn (id: int) ->
+  let (_, _, _, g, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
+  let m = (if map_has vm_jump_memo id then map_get vm_jump_memo id else 0) in
+  if m == g * 4 + 1 then false
+  else if m == g * 4 + 2 then true
+  else (let r = vm_may_jump_scan id in
+        let _ = map_set vm_jump_memo id (g * 4 + (if r then 2 else 1)) in
+        r)
+and vm_may_jump_scan = fn (id: int) ->
+  let (code, _, _, vcb, vcn) = vm_prog id in
+  let (_, _, _, _, _, _, _, _, _, _, _, _, _, ct) = vec_get vm_meta id in
+  let rec ins = fn (i: int) ->
+    (if i >= vcn then false
+     else (let o = vc code (vcb + i) 0 in
+           let a = vc code (vcb + i) 1 in
+           if o == 56 && (a == 1 || a == 2 || a == 3 || a == 5) then true
+           else if o == 29 && vm_bit a 128 then true
+           else ins (i + 1))) in
+  let rec kids = fn (es: (int * int * int * int * int * int) list) ->
+    (match es with
+     | Nil -> false
+     | Cons ((k, cid, _, _, _, _), t) -> ((k == 1 || k == 2) && cid >= 0 && vm_may_jump cid) || kids t) in
+  ins 0 || kids ct
 // vm_loop over [lo, hi), taking the jumps that land in it: a break / next /
 // redo a rescue or an ensure sequence threw (vm_region's `after`) whose
 // catch entry lies inside [lo, hi) -- or, for the frame's whole run (top),
 // any, a jump out of the frame among them. The jump travels as the
 // evaluator's flow signals do (a `fail` with flow_sig), so every
 // run_begin_f between its throw and here ran its ensure.
+// (...which only a program that can throw one needs: vm_may_jump. Without
+//  it the run is vm_loop's alone, and an exception raised in the region is
+//  not caught here to be raised again -- a fail handler and a message
+//  formatted once more for every raise through a rescue on the VM, most of
+//  app_raise's difference from the evaluator)
 and vm_seg = fn env -> fn world -> fn blk -> fn cd -> fn (ct: (int * int * int * int * int * int) list) -> fn st -> fn (pc: int) -> fn (lo: int) -> fn (hi: int) -> fn (act: int list) ->
   let (stk, regs) = st in
+  if (if vm_may_jump (vec_get regs 13) then false else true) then vm_loop env world blk cd ct st pc lo hi act
+  else
   let top = (match act with Nil -> true | _ -> false) in
   let r = try_or_msg (fn (u: unit) -> vm_loop env world blk cd ct st pc lo hi act)
             (fn (m: str) ->
