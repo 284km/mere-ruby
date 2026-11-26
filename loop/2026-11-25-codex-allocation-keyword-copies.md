@@ -1,9 +1,10 @@
 # Copied keyword Hash state and invocation lifetime
 
-Runtime source `fac12e8c75aac9574d9957bd1fc84c45f3b2da4b` incorporates main
-`89ad241c7cb81c8afa4dc45852b40a0ea9ee2a29`. All results below identify these
-ordinary O2 builds. A final documentation commit does not change runtime
-sources, generated C, binaries, corpus programs or upstream test inputs.
+Feature and resource results below identify accepted runtime
+`fac12e8c75aac9574d9957bd1fc84c45f3b2da4b` and main
+`89ad241c7cb81c8afa4dc45852b40a0ea9ee2a29`. The separate latest main-integration
+section records the new build and complete corpus checks after d4414ac2.
+Documentation commits preserve their respective runtime/test inputs.
 
 ## Observable behavior and review corrections
 
@@ -230,3 +231,40 @@ share one push. Automated mere-pr-review-watch inline comments are read after
 that push, and the repository owner performs the merge.
 
 The structured [validation record](2026-11-26-codex-allocation-keyword-copies.json) retains all twenty kernel samples, per-case comparisons, input hashes, focus checks and instruction counts without local paths.
+
+## Latest main integration after accepted re-review
+
+The re-review at ec548ffa accepted both Minors, the earlier Majors and the
+allocation RSS explanation against main 89ad241c. Those measurements remain
+identified by their original runtime; they are not relabeled as new results.
+
+Merged main `d4414ac2c36be3953f2ed7a98a408fd187b7c496` into runtime `4f4694ecbfe92525ce8377630fba056125c1ec9b`. The
+Method-call dispatch conflict retains the private shared native entry and
+main's frame doors in its moved body. The two moved self accesses now use
+fh_self_lv_has / fh_self_lv_get and fh_self_set. A token
+comparison of the complete moved Method-call body with main is identical
+after excluding this PR's existing argument-origin preparation. No new
+allocation policy or counting change is made.
+
+Fresh ordinary O2 validation on that merged runtime:
+
+- corpus `--both`: **978/978 match**, hash index ON and OFF,
+  697.076 s. The driver's iv-door and shape-statistics
+  preflights run unchanged.
+- VM corpus: **978 VM / 0 fallback / 0 differences / 0 failures**,
+  no fallback-list mismatch, 228.629 s.
+- Corpus 987: all 127 output lines, stderr and exit status match clean Ruby
+  4.0.10 in evaluator and VM modes, normally and with GC stress 50. Main's
+  831 method-record, 832 frame-restoration and 833 VM-ivar-cache regressions
+  also match in those configurations: **16 engine comparisons** total.
+- All **ten source gates PASS**, including iv_door and bracket-depth.
+  record_hygiene PASS before and after the full sweeps. Header/vendor and
+  CI-timing self-tests pass. No full upstream unit suite or Rails cold run.
+
+Binary SHA-256: `3b038941f8ba89c2441d2a5c78349ee292b73bcff21432031c7b87f8decad68b`.
+Generated C SHA-256: `bbe562ad5d4a2ed62e7a6b26affbf4360bd517f229552251a8b0c3f78b06c684`.
+Compiler 9dec2ff6 and mgz 661a01d8 remain pinned. The reference is the same
+independently built, clean Ruby 4.0.10; default/bundled gem audit and source
+revision are retained above. These checks use the shared two-run cap and
+serial own corpus sweeps. The final documentation-only commit preserves all
+runtime/test inputs and the validated binary. Code and record share one push.
