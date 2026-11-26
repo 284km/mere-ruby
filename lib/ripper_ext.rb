@@ -948,7 +948,9 @@ unless defined?(::Ripper)
                 if node.opening_loc.nil?
                   bounds(node.location)
 
-                  if node.arguments.nil? && !node.block.is_a?(BlockArgumentNode)
+                  constant_command = node.block.is_a?(BlockNode) && node.call_operator == "::" &&
+                    node.message.match?(/\A[[:upper:]]/)
+                  if node.arguments.nil? && !node.block.is_a?(BlockArgumentNode) && !constant_command
                     on_call(receiver, call_operator, message)
                   else
                     on_command_call(receiver, call_operator, message, arguments)
