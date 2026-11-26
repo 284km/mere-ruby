@@ -326,3 +326,43 @@ baseline and O2 builds, replay the focused controls and requested whole files,
 then the external kernel-counter resource plan. Final copy-memory, instruction,
 full corpus/index/VM, source and record gates remain required. Keep every older
 result attached to its actual source and retain the original failed RSS plan.
+## Asynchronous startup provenance after the invocation scopes
+
+Additional cross-context controls on the frozen 8f0bd866 O2 binary find a
+regression before final corpus acceptance: a flagged splat passed to
+Thread.new reaches its keyword block as positional after the native creator
+returns. Ruby and pinned main return 2; head returns 0, and a keyword lambda
+raises. A scheduled Thread must own its startup provenance independently of
+the creator's invocation. Save native provenance bits beside its existing
+rooted argument Array, restore them after thread-begin callbacks immediately
+before binding, and retire them on normal or exceptional completion. No new
+Ruby container or work on ordinary method calls is added. Corpus 987 adds
+deferred startup across GC, creator positional calls, lambda/start/fork,
+marked and ordinary rest blocks, copy metadata and thread-begin callbacks.
+
+The prior source and verified O2 binary/C are preserved in a clean snapshot.
+All main85 results remain identified historical evidence, not acceptance of
+this new source. Merge main d93de083 before rebuilding; that merge is clean.
+The earlier 148 focus comparisons, requested complete upstream files, all
+20 kernel-RSS samples and 44 PMU programs were completed, but final corpus
+acceptance was not reached and no corresponding completion is claimed.
+
+Resource diagnosis is still open. The largest child is the unchanged
+100,000-entry Hash literal; periodic sampling misses its short peak. The
+external 20-run plan retains actual runner medians +0.540% evaluator and
++0.436% VM, with nearly identical largest-child highwaters. A subsequent
+STORE_STATS=exit diagnostic finds more end-of-test frames/Hash capacity on
+evaluator, while VM has fewer captured frames. These values may contain
+uncollected garbage; do not claim they prove retained-state equivalence.
+STORE_STATS=1 counters from the initial diagnostic run before test/unit's
+at_exit and are excluded from post-test retention evidence. Compiler region
+statistics from process exit are separate. The planned diagnostic with one
+post-test GC stopped at the new Thread control before any allocation-file
+run. Its completion marker does not exist. No forced-GC diagnostic RSS may
+replace the original acceptance samples or be called a runtime fix.
+
+Repeat fresh source/build identity checks, both-engine normal/stress focus,
+the four requested complete upstream files, controlled resource attribution,
+copy/ivar and method/block/matrix instruction controls, source gates,
+record_hygiene and serial complete corpus/VM sweeps before the next batched
+push. The PR remains draft; no new code push or merge readiness is claimed.
