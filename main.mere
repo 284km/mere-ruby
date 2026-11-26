@@ -728,7 +728,7 @@ let gc_pressure = fn world ->
   let tight = vec_get gc_knob 2 == 1 in
   if gc_auto_off () then false
   else vec_get gc_knob 5 == 1
-  || map_len ivars + map_len ocls > limit
+  || iv_entries ivars + map_len ocls > limit
   // ...with the floor it had before, 4,000 entries, once a class has been
   // made since the last collection. Dead classes are not small, and a loop
   // that makes them beside its objects held twice the memory under the
@@ -738,7 +738,7 @@ let gc_pressure = fn world ->
   // method of its own, which makes a singleton class, copies that method
   // out of the whole method table, so `a.clone.set` in a loop ran four
   // times the instructions. Those loops collect as they did.
-  || (vec_get cls_made 0 != vec_get gc_knob 13 && map_len ivars + map_len ocls > vec_get gc_knob 14)
+  || (vec_get cls_made 0 != vec_get gc_knob 13 && iv_entries ivars + map_len ocls > vec_get gc_knob 14)
   // ...and the captured frames waiting in lv_cap, each a frame's arena (4 KB
   // and up) that no store's byte count sees: a loop that makes a lambda per
   // turn and nothing else ran 80k turns without one collection (note 272)
@@ -1250,6 +1250,29 @@ let gc_internal_ivar = fn live -> fn (key: str) -> fn (v: Val) ->
   let _ = gc_mark_val live v in
   if str_index_of key "@~m_" >= 0 || str_index_of key "@~um_" >= 0
   then (match v with VStr h -> gc_class_text (sget h) | _ -> ()) else ();
+// A SHAPED object's variables, where they are kept (note 559 step 2b): the
+// slots of its area, walked with its shape's names beside them -- a ~m_ or
+// ~um_ name holds a class's name, as gc_internal_ivar reads off a key. A
+// removed variable's mark is no value. (An object in the table is marked
+// through the owner chains of gc_fixpoint.)
+let gc_mark_area = fn live -> fn (o: int) ->
+  if map_has obj_iv o then
+    (let r = map_get obj_iv o in
+     if r <= 0 then ()
+     else
+       (let b = iv_rec_base r in
+        let rec walk = fn (t: int) ->
+          if t <= 0 then ()
+          else
+            (let v = vec_get iv_slab (b + sh_len t - 1) in
+             let _ = (if iv_is_absent v then ()
+                      else (let _ = gc_mark_val live v in
+                            let nm = vec_get iv_nm (sh_name t) in
+                            if str_starts_with nm "~m_" || str_starts_with nm "~um_"
+                            then (match v with VStr h -> gc_class_text (sget h) | _ -> ()) else ())) in
+             walk (sh_parent t)) in
+        walk (iv_rec_shape r)))
+  else ();
 // an id a half-evaluated statement built (fb_stack_wm): kind 0 object, 1 array,
 // 2 string, 3 hash. An id no store holds any more is skipped, not dereferenced.
 // An object id is marked only if it is an object still: a stopped stack's
@@ -1449,6 +1472,7 @@ let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
          if i >= stop then ()
          else (let o = vec_get gc_obj_pend i in
                let _ = (if map_has head o then mark_chain (map_get head o) else ()) in
+               let _ = gc_mark_area live o in
                each (i + 1)) in
        let _ = each start in drain stop (rounds + 1)) in
   let names_vec = gc_native_names in
@@ -2124,6 +2148,11 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = gc_sweep_class_table autoload_busy 2 compact in
   let _ = gc_sweep_class_table cvars 0 compact in
   let _ = gc_sweep_class_table ivars_g 0 compact in
+  // (a shape's per-class counts: the variations a class has made, the area
+  //  size its objects have come to need. The shape bound does not bound
+  //  them -- a Class.new a turn adds a key and no shape)
+  let _ = gc_sweep_class_table sh_cls_var 0 compact in
+  let _ = gc_sweep_class_table sh_cls_cap 0 compact in
   let _ = gc_sweep_class_table refine_cnt 0 compact in
   let _ = gc_sweep_class_table refine_tgt 0 compact in
   let _ = gc_sweep_class_table refine_cls 0 compact in
@@ -2379,8 +2408,9 @@ let gc_collect = fn env -> fn world ->
     // under a pin (a suspended stack pointing into the arena, Mere v0.1.589)
     // now leaves the table where it is, so the refill would have grown every
     // store by its live size at every collection a fiber was suspended for.
-    // Deleting the dead keys allocates nothing; the compaction after it, when
-    // it can happen, moves only the living.
+    // Deleting the dead keys adds nothing to the tables (what is dead is
+    // gathered in Vecs first, then deleted); the compaction after it, when it
+    // can happen, moves only the living.
     // (a dead object's variables: the object, its key, where the name starts)
     let dIVo = vec_new () in
     let dIVn = vec_new () in
@@ -2407,6 +2437,28 @@ let gc_collect = fn env -> fn world ->
          let _ = vec_push dIVo owner in
          let _ = vec_push dIVa at in
          vec_push dIVn s)) in
+    // (...and a dead SHAPED object's: its File's descriptor, as above, and its
+    //  area back to the free list. A dead object in the table -- obj_iv's -1 --
+    //  had its keys found by the walk above; its record goes too)
+    let dOI = vec_new () in
+    let _ = map_iter obj_iv (fn (o: int) -> fn (r: int) ->
+      if gc_live_has live (o * 8) then () else vec_push dOI o) in
+    let rec drop_oi = fn (i: int) ->
+      if i >= vec_len dOI then ()
+      else
+        (let o = vec_get dOI i in
+         let r = map_get obj_iv o in
+         let _ = (if r > 0 then
+                    (let _ = (match iv_get_or ivars o "__f_fd" VNil with
+                              | VInt fd9 ->
+                                (if fd9 > 2 && (if truthy (iv_get_or ivars o "__f_keep_fd" VNil) then false else true)
+                                 then vec_push dFD fd9 else ())
+                              | _ -> ()) in
+                     iv_rec_free r)
+                  else ()) in
+         let _ = map_delete obj_iv o in
+         drop_oi (i + 1)) in
+    let _ = drop_oi 0 in
     let rec close_fds = fn (i: int) ->
       if i >= vec_len dFD then ()
       else (let fd9 = vec_get dFD i in
@@ -2432,7 +2484,9 @@ let gc_collect = fn env -> fn world ->
       if i >= vec_len dIVo then () else (let _ = iv_del_at ivars (vec_get dIVo i) (vec_get dIVn i) (vec_get dIVa i) in drop_iv (i + 1)) in
     let _ = drop_iv 0 in
     let _ = (if nc then () else map_compact ivars) in
-    // (...and a dead owner's names in ivar_names_of's index, iv_idx)
+    // (the shaped objects' records, and the slab: a value written over is a
+    //  copy left in the slab's arena, as in the table's -- Mere's vec_set)
+    let _ = (if nc then () else (let _ = map_compact obj_iv in vec_compact iv_slab)) in
     // (...and a dead owner's names in ivar_names_of's index, iv_idx)
     let dIX = vec_new () in
     let _ = map_iter iv_idx (fn (k: str) -> fn (v: str) ->
@@ -2698,9 +2752,9 @@ let gc_collect = fn env -> fn world ->
     //  gc_pressure. Note 551 §8.)
     let scan = map_len arr_store + map_len hash_store + map_len ocls + vec_get gc_knob 10 in
     let delta = (if scan / 2 > 32000 then scan / 2 else 32000) in
-    let _ = vec_set gc_knob 0 (map_len ivars + map_len ocls + delta) in
+    let _ = vec_set gc_knob 0 (iv_entries ivars + map_len ocls + delta) in
     let _ = vec_set gc_knob 13 (vec_get cls_made 0) in
-    let _ = vec_set gc_knob 14 (map_len ivars + map_len ocls + (if scan / 2 > 4000 then scan / 2 else 4000)) in
+    let _ = vec_set gc_knob 14 (iv_entries ivars + map_len ocls + (if scan / 2 > 4000 then scan / 2 else 4000)) in
     let _ = vec_set gc_knob 1 (gc_store_bytes ()) in
     // ⚠ the dead slots' share of that baseline. A string handle is never
     //   reused, so every String ever made leaves a stub in str_store that no
@@ -8465,7 +8519,7 @@ and capi_gc_read = fn (r: CapiReq) ->
   else if r.op == 32 then
     (let (_, _, _, iv9) = world in
      match capi_in r.a with
-     | VObj oid9 -> (let k9 = str_of_int oid9 ++ mr_capi_text () in capi_out (if map_has iv9 k9 then map_get iv9 k9 else VNil))
+     | VObj oid9 -> (let t9 = mr_capi_text () in capi_out (iv_get_or iv9 oid9 (substring t9 1 (str_len t9)) VNil))
      // (a Proc, a Binding: T_DATA with no table here -- Qundef, which C
      //  refuses by name, never a made-up nil)
      | _ -> 36)
@@ -12569,11 +12623,10 @@ and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
 // unreachable start is nil. A negative step walks the span from its end.
 and arr_aseq_slice = fn env -> fn world -> fn (xs: Val list) -> fn (oid: int) ->
   let (_, _, _, ivars) = world in
-  let key = str_of_int oid in
-  let iv = fn (k: str) -> (if map_has ivars k then map_get ivars k else VNil) in
-  let b0 = iv (key ++ "@__as_begin") in let e0 = iv (key ++ "@__as_end") in
-  let excl0 = (match iv (key ++ "@__as_excl") with VBool x -> x | _ -> false) in
-  let step = (match iv (key ++ "@__as_step") with VInt k -> k | _ -> 1) in
+  let iv = fn (k: str) -> iv_get_or ivars oid k VNil in
+  let b0 = iv "__as_begin" in let e0 = iv "__as_end" in
+  let excl0 = (match iv "__as_excl" with VBool x -> x | _ -> false) in
+  let step = (match iv "__as_step" with VInt k -> k | _ -> 1) in
   let alen = val_list_len xs in
   let (b1, e1, excl1) =
     (if step < 0 then
@@ -15678,7 +15731,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
          if str_eq k "@~m_name" then method_text (method_core_field oid 0)
          else if str_eq k "@~m_owner" || str_eq k "@~um_cls" then method_text (method_core_field oid 1)
          else if str_eq k "@~um_name" then method_text (method_core_field oid 0)
-         else if map_has iv2 (str_of_int oid ++ k) then method_text (map_get iv2 (str_of_int oid ++ k)) else "" in
+         else if iv_has_at iv2 oid k then method_text (iv_get_at iv2 oid k) else "" in
        let own9 = (if str_eq cls "Method" then gv9 "@~m_owner" else gv9 "@~um_cls") in
        let nm9 = (if str_eq cls "Method" then gv9 "@~m_name" else gv9 "@~um_name") in
        let rcv9 = (if str_eq cls "Method" && map_has method_cores oid then method_core_field oid 2 else VMain) in
@@ -18028,7 +18081,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     (match (recv, args) with
      | (VArr aid9, Cons (VObj oid9, Nil)) ->
        (let (_, _, _, iv9) = world in
-        let gv = fn (nm: str) -> (if map_has iv9 (str_of_int oid9 ++ nm) then map_get iv9 (str_of_int oid9 ++ nm) else VNil) in
+        let gv = fn (nm: str) -> (if iv_has_at iv9 oid9 nm then iv_get_at iv9 oid9 nm else VNil) in
         let xs9 = deref aid9 in
         let n9 = val_list_len xs9 in
         let st9 = (match gv "@__as_step" with VInt k -> k | _ -> 1) in
@@ -29548,10 +29601,10 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                 || (str_len name == 4 && str_eq name "hash") || (str_len name == 4 && str_eq name "size") || (str_len name == 4 && str_eq name "last")) then
       // (no closure over `id` here: a lifted inner fn capturing a name that is
       // also a prelude function -- `id` -- resolved to the function)
-      (let key = str_of_int id in
-       let iv = fn (k: str) -> (if map_has ivars k then map_get ivars k else VNil) in
-       let b = iv (key ++ "@__as_begin") in let e = iv (key ++ "@__as_end") in let st = iv (key ++ "@__as_step") in
-       let excl = (match iv (key ++ "@__as_excl") with VBool x -> x | _ -> false) in
+      (let src9 = id in
+       let iv = fn (o: int) -> fn (k: str) -> iv_get_or ivars o k VNil in
+       let b = iv src9 "__as_begin" in let e = iv src9 "__as_end" in let st = iv src9 "__as_step" in
+       let excl = (match iv src9 "__as_excl" with VBool x -> x | _ -> false) in
        if (str_len name == 5 && str_eq name "begin") then b
        else if (str_len name == 3 && str_eq name "end") then e
        else if (str_len name == 4 && str_eq name "step") then st
@@ -29561,9 +29614,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
          (match args with
           | Cons (VObj oid, _) ->
             (if str_eq (map_get ocls oid) "Enumerator::ArithmeticSequence" then
-               (let okey = str_of_int oid in
-                VBool (rb_eq b (iv (okey ++ "@__as_begin")) && rb_eq e (iv (okey ++ "@__as_end")) && rb_eq st (iv (okey ++ "@__as_step"))
-                       && (match iv (okey ++ "@__as_excl") with VBool x -> x == excl | _ -> false)))
+               (VBool (rb_eq b (iv oid "__as_begin") && rb_eq e (iv oid "__as_end") && rb_eq st (iv oid "__as_step")
+                       && (match iv oid "__as_excl" with VBool x -> x == excl | _ -> false)))
              else VBool false)
           | _ -> VBool false)
        else if (str_len name == 4 && str_eq name "hash") then
@@ -30141,7 +30193,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           // (and where it was asked, owned and defined: a copy's #super_method
           //  and #== are the original's)
           let _ = list_iter (Cons ("@~um_def", Nil)) (fn (k9: str) ->
-                    if map_has ivars (str_of_int id ++ k9) then iv_put ivars (str_of_int nid ++ k9) (map_get ivars (str_of_int id ++ k9)) else ()) in
+                    if iv_has_at ivars id k9 then iv_set_at ivars nid k9 (iv_get_at ivars id k9) else ()) in
           let _ = msnap_carry world id "UnboundMethod" nid "UnboundMethod" in
           let _ = iv_copy world id nid in
           let _ = (if (str_len name == 5 && str_eq name "clone") && ofrozen_get id then ofrozen_set nid else ()) in
@@ -30952,17 +31004,19 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        //  and not in the index: they are copied by the members' names.)
        // (a let, not the match's `id`: cp9 is a closure -- see the
        //  rails-ar-ivar-api loop record)
+       // (a SHAPED object -- note 559 step 2b -- is copied whole: its shape,
+       //  and its area into one of the copy's. One in the table, name by name)
        let src9 = id in
-       let tmp = map_new () in
+       let whole9 = iv_copy_shaped src9 nid in
        let rec cp9 = fn (ns9: str list) ->
          (match ns9 with
           | Nil -> ()
           | Cons (nm9, t9) ->
-            (let _ = (if iv_has ivars src9 nm9 then map_set tmp (iv_key nid nm9) (iv_get ivars src9 nm9) else ()) in
+            (let _ = (if iv_has ivars src9 nm9 then iv_set ivars nid nm9 (iv_get ivars src9 nm9) else ()) in
              cp9 t9)) in
        // (a Struct's members first, as they were first in the table: each
        //  in its slot, by the members its class names)
-       let _ = (if is_struct_obj_cls world realcls then
+       let _ = (if (if whole9 then false else true) && is_struct_obj_cls world realcls then
                   (let mc9 = struct_members_cls world (ancestors_of world realcls) in
                    let rec sl9 = fn (ms9: Val list) ->
                      (match ms9 with
@@ -30972,8 +31026,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                    cp9 (sl9 (if str_eq mc9 "" then Nil
                              else (match map_get struct_mem mc9 with VArr a9 -> deref a9 | _ -> Nil))))
                 else ()) in
-       let _ = cp9 (ivar_names_of ivars id) in
-       let _ = map_iter tmp (fn (k: str) -> fn (v: Val) -> iv_put ivars k v) in
+       let _ = (if whole9 then () else cp9 (ivar_names_of ivars id)) in
        // (an instance of a Module subclass: the copy gets a module of its own,
        //  a copy of the original's (mod_inst_backing), so a def into one does
        //  not land in the other -- and a frozen original's copy, a dup or a
@@ -33994,6 +34047,12 @@ and flush_files_at_exit = fn world ->
                    | VStr h -> (if str_len (sget h) > 0 then map_set ids (str_of_int o) VNil else ())
                    | _ -> ())
              else ())) in
+  // (and a shaped object's, by the name's slot)
+  let _ = map_iter obj_iv (fn (o: int) -> fn (r: int) ->
+            if r <= 0 then ()
+            else (match iv_get_or ivars o "__f_buf" VNil with
+                  | VStr h -> (if str_len (sget h) > 0 then map_set ids (str_of_int o) VNil else ())
+                  | _ -> ())) in
   map_iter ids (fn (k: str) -> fn (v: Val) ->
     (let _ = try_or (fn (u: unit) -> file_flush_obj world (int_of_str k)) () in ()))
 
@@ -34946,7 +35005,7 @@ and class_subclasses_method_note = fn world -> fn (chain9: str list) -> fn (owne
   else (let (body9, native9) = native_owner_entry_after world chain9 owner9 (0 - 1) "subclasses" "Class" in
         if str_eq body9 "" then () else
         (let _ = msnap_note world id9 kind9 body9 "subclasses" in
-         let _ = iv_put ivars9 (str_of_int id9 ++ (if str_eq kind9 "Method" then "@~m_dk" else "@~um_dk")) (VClass body9) in
+         let _ = iv_set ivars9 id9 (if str_eq kind9 "Method" then "~m_dk" else "~um_dk") (VClass body9) in
          if native9 then native_owner_method_mark world id9 "Class" else ()))
 and class_subclasses_method_call = fn world -> fn blk -> fn (recv9: Val) -> fn (id9: int) -> fn (owner9: str) -> fn (name9: str) -> fn (args9: Val list) ->
   let body9 = msnap_cls world id9 "Method" owner9 in
@@ -51602,14 +51661,13 @@ and lookup_meth_cls = fn world -> fn (cls: str) -> fn (name: str) ->
 // unbind, a bind, a clone), the original's (slot "@~m_era" / "@~um_era")
 and msnap_era = fn world -> fn (id: int) -> fn (ocl: str) ->
   let (_, _, _, iv9) = world in
-  let k9 = str_of_int id ++ (if str_eq ocl "Method" then "@~m_era" else "@~um_era") in
-  if map_has iv9 k9 then (match map_get iv9 k9 with VInt e -> e | _ -> id) else id
+  (match iv_get_or iv9 id (if str_eq ocl "Method" then "~m_era" else "~um_era") VNil with VInt e -> e | _ -> id)
 // the class whose table has the body: cls, or the ancestor recorded when cls
 // only published the name (`public :z` over a superclass's z)
 and msnap_cls = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) ->
   let (_, _, _, iv9) = world in
-  let k9 = str_of_int id ++ (if str_eq ocl "Method" then "@~m_dk" else "@~um_dk") in
-  if map_has iv9 k9 then (method_text_or cls (map_get iv9 k9)) else cls
+  let n9 = (if str_eq ocl "Method" then "~m_dk" else "~um_dk") in
+  if iv_has iv9 id n9 then (method_text_or cls (iv_get iv9 id n9)) else cls
 // a Method or UnboundMethod is being made for cls#name: mark the key that has
 // the body (only a marked key is copied when it is written)
 and msnap_note = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) -> fn (name: str) ->
@@ -51619,19 +51677,19 @@ and msnap_note = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) -> f
   let k = dc ++ "#" ++ name in
   if (if str_eq dc "" then false else true) && map_has m9 k then
     (let _ = (if str_eq dc cls then ()
-              else iv_put iv9 (str_of_int id ++ (if str_eq ocl "Method" then "@~m_dk" else "@~um_dk")) (VClass dc)) in
+              else iv_set iv9 id (if str_eq ocl "Method" then "~m_dk" else "~um_dk") (VClass dc)) in
      if map_has meth_obj_seen k then () else map_set meth_obj_seen k 1)
   else ()
 // a made-from object (nid) is dated and placed as its source (id) is
 and msnap_carry = fn world -> fn (id: int) -> fn (ocl: str) -> fn (nid: int) -> fn (nocl: str) ->
   let (_, _, _, iv9) = world in
-  let _ = iv_put iv9 (str_of_int nid ++ (if str_eq nocl "Method" then "@~m_era" else "@~um_era")) (VInt (msnap_era world id ocl)) in
-  let dk9 = str_of_int id ++ (if str_eq ocl "Method" then "@~m_dk" else "@~um_dk") in
-  let nk9 = str_of_int nid ++ (if str_eq nocl "Method" then "@~m_dk" else "@~um_dk") in
+  let _ = iv_set iv9 nid (if str_eq nocl "Method" then "~m_era" else "~um_era") (VInt (msnap_era world id ocl)) in
+  let dk9 = (if str_eq ocl "Method" then "~m_dk" else "~um_dk") in
+  let nk9 = (if str_eq nocl "Method" then "~m_dk" else "~um_dk") in
   // (and nothing else: making nid looked the body up in the table as it is
   //  NOW, which after a remove_method is a superclass's)
-  if map_has iv9 dk9 then iv_put iv9 nk9 (map_get iv9 dk9)
-  else if map_has iv9 nk9 then map_delete iv9 nk9 else ()
+  if iv_has iv9 id dk9 then iv_set iv9 nid nk9 (iv_get iv9 id dk9)
+  else if iv_has iv9 nid nk9 then iv_del iv9 nid nk9 else ()
 // the first bound above era in "B1;B2;...", or -1
 and msnap_bound_above = fn (bs: str) -> fn (era: int) ->
   let rec go = fn (xs: str list) ->
@@ -58442,7 +58500,7 @@ and attr_mark_vis = fn (cls: str) -> fn (mode: str) -> fn (syms: str list) -> fn
 and fb_world = fn (u: unit) -> (meths_g, cls_sup, obj_cls, ivars_g)
 and fb_iv = fn world -> fn (oid: int) -> fn (k: str) ->
   let (_, _, _, iv) = world in
-  if map_has iv (str_of_int oid ++ k) then map_get iv (str_of_int oid ++ k) else VNil
+  if iv_has_at iv oid k then iv_get_at iv oid k else VNil
 and fb_index_of = fn world -> fn (v: Val) ->
   match v with
   | VObj id -> (match fb_iv world id "@__fb_idx" with VInt i -> i | _ -> 0 - 1)
@@ -58510,8 +58568,7 @@ and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) ->
          //  masks, a copy of them: thread_create_core's
          //  pending_interrupt_mask_stack)
          let _ = (let (_, _, _, ivm) = world in
-                  let mk9 = str_of_int (sch_me ()) ++ "@__tmask" in
-                  match (if map_has ivm mk9 then map_get ivm mk9 else VNil) with
+                  match iv_get_or ivm (sch_me ()) "__tmask" VNil with
                   | VArr ma9 -> (match deref ma9 with
                                  | Nil -> ()
                                  | ms9 -> iv_set ivm tid "__tmask" (arr_new ms9))
@@ -58519,8 +58576,7 @@ and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) ->
          // (...and in its maker's ThreadGroup -- a frozen one takes no new
          //  thread: ruby's ThreadError)
          let (_, _, _, ivg9) = world in
-         let mg9 = str_of_int (sch_me ()) ++ "@__tgrp" in
-         let grp9 = (if map_has ivg9 mg9 then map_get ivg9 mg9 else VNil) in
+         let grp9 = iv_get_or ivg9 (sch_me ()) "__tgrp" VNil in
          if (match grp9 with VObj g9 -> ofrozen_get g9 | _ -> false)
          then raise_exc world "ThreadError" "can't start a new thread (frozen ThreadGroup)"
          else
@@ -60468,14 +60524,13 @@ and en_stop_raise = fn world -> fn (id: int) -> fn (res: Val) ->
 // collector, which never runs them. Killing is what gives the thread back.
 and en_ext_drop = fn world -> fn (id: int) ->
   let (_, _, _, iv) = world in
-  let k = str_of_int id in
   let _ = (match (iv_get_or iv id "__x_fb" VNil) with
            | VObj f -> (if fb_state_of (fb_index_of world (VObj f)) == 2 then (let _ = fb_kill world (VObj f) in ()) else ())
            | _ -> ()) in
   let rec del = fn (ns: str list) ->
     match ns with
     | Nil -> ()
-    | Cons (n, r) -> (let _ = (if map_has iv (k ++ n) then map_delete iv (k ++ n) else ()) in del r) in
+    | Cons (n, r) -> (let _ = iv_del_at_name iv id n in del r) in
   del (Cons ("@__x_fb", Cons ("@__x_done", Cons ("@__x_ret", Cons ("@__x_buf", Cons ("@__x_feed", Cons ("@__x_feedset",
        Cons ("@__e_buf", Cons ("@__e_pos", Cons ("@__x_stop", Nil))))))))))
 and fb_blocking_now = fn (u: unit) ->
@@ -60927,8 +60982,7 @@ and drive_enum = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (meth: str
 // inspector directly (dispatching #inspect from there would come back here).
 and enum_inspect_str = fn env -> fn world -> fn (oid: int) -> fn (cls: str) ->
   let (meths, sup, ocls, ivars) = world in
-  let key = str_of_int oid in
-  let gv = fn (k: str) -> (if map_has ivars (key ++ k) then map_get ivars (key ++ k) else VNil) in
+  let gv = fn (k: str) -> iv_get_at ivars oid k in
   let rec join9 = fn (xs: Val list) -> fn (acc: str) ->
     (match xs with
      | Nil -> acc
@@ -66716,7 +66770,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     //  -- p is not one, [Bug #11546])
     let _ = (if in_thread () then
                (let (_, _, _, ivp) = world in
-                if map_has ivp (str_of_int (sch_me ()) ++ "@__tpend") then sch_deliver world (sch_me ()) else VNil)
+                if iv_has ivp (sch_me ()) "__tpend" then sch_deliver world (sch_me ()) else VNil)
              else VNil) in
     let _ = (match vs0 with
              | Nil -> out_emit world "\n"
@@ -66904,8 +66958,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
             else if str_len recv > 1 && str_eq (char_at recv 0) "@" && lv_has env "self" then
               (match lv_get env "self" with
                | VObj oid9 ->
-                 (let k9 = str_of_int oid9 ++ recv in
-                  if map_has ivars k9 then map_get ivars k9 else VNil)
+                 iv_get_at ivars oid9 recv
                | _ -> VNil)
             else if lv_has env recv then lv_get env recv
             else VNil) in
