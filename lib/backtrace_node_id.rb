@@ -44,8 +44,12 @@ module RubyVM::AbstractSyntaxTree
           #  the def, or the lambda / block define_method was given)
           [cands.select { |n| n[0] == :def_node && n[2].include?(own) },
            cands.select { |n| n[0] == :lambda_node || n[0] == :block_node }]
+        elsif want
+          # A recorded callee must match. An eval filename can name a file
+          # containing entirely different code; unrelated nodes are no fallback.
+          [cands.select { |n| __nid_call?(n) && n[2].include?(want) }]
         else
-          [want ? cands.select { |n| __nid_call?(n) && n[2].include?(want) } : [],
+          [[],
            # (a method written in C has a frame of its own, on its caller's
            #  line, named for the method: Integer#+)
            cands.select { |n| __nid_call?(n) && n[2].include?(own) },
