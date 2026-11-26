@@ -485,6 +485,14 @@ let sh_cls_var = map_new ();
 // (their own arenas: map_bytes and vec_bytes read them, and the collector
 //  compacts them where it compacts the table)
 let obj_iv = (let t = map_new () in let _ = map_compact t in t);
+// ...and which of its keys are a String's, an Array's or a Hash's (kinds 1-3):
+// the collector asks this small set, not obj_iv, of every String, Array and
+// Hash it marks -- and nothing at all while no such one has a variable.
+// Written with obj_iv by iv_rec_put, emptied of the dead at the sweep.
+let iv_hng = (let t = map_new () in let _ = map_compact t in t);
+let iv_rec_put = fn (ok: int) -> fn (r: int) ->
+  let _ = (if ok % 8 != 0 && (if map_has iv_hng ok then false else true) then map_set iv_hng ok 1 else ()) in
+  map_set obj_iv ok r;
 let iv_slab = (let v = vec_new () in let _ = vec_push v VNil in let _ = vec_compact v in v);
 // each area size's free list (2^k at k), -1 for none
 let iv_free = (let v = vec_new () in
@@ -508,6 +516,10 @@ let iv_key = fn (oid: int) -> fn (name: str) -> str_of_int oid ++ "@" ++ name;
 // `instance_variables` of every String, Array and Hash made that walk to
 // find nothing: 100,000 instructions a `"abc".dup` in a program with 7,000
 // instance variables alive. Until the count leaves zero nobody walks.
+// (Since note 559 step 2b' a String's, an Array's and a Hash's variables are
+//  in their shape and the slab, and are found through the door; only an
+//  owner in the table -- MERE_RUBY_SHAPES=0, or too complex -- is written
+//  here, and only for those is the walk made.)
 let hiv_made = (let v = vec_new () in let _ = vec_push v 0 in v);
 // (one `let rec`, not two: each top-level let is a level of bracket depth)
 let rec iv_idx_add = fn (k: str) ->
@@ -537,9 +549,14 @@ and iv_put = fn tbl -> fn (k: str) -> fn (v: Val) ->
   let c0 = (if str_len k > 0 then ord (char_at k 0) else 0) in
   // (MERE_RUBY_SHAPES_CHECK=1: an object's key written here while the object
   //  is not in the table is a writer that went around the door)
-  let _ = (if vec_get iv_knobs 2 > 0 && c0 >= 48 && c0 <= 57 && str_index_of k "@" > 0 then
-             (let o = int_of_str (substring k 0 (str_index_of k "@")) in
-              if map_has obj_iv o && map_get obj_iv o == 0 - 1 then ()
+  let _ = (if vec_get iv_knobs 2 > 0 && str_index_of k "@" > 0 then
+             (let at = str_index_of k "@" in
+              let ok = (if c0 >= 48 && c0 <= 57 then int_of_str (substring k 0 at) * 8
+                        else if at > 4 && str_starts_with k "str:" then int_of_str (substring k 4 at) * 8 + 1
+                        else if at > 4 && str_starts_with k "arr:" then int_of_str (substring k 4 at) * 8 + 2
+                        else if at > 4 && str_starts_with k "hsh:" then int_of_str (substring k 4 at) * 8 + 3
+                        else 0 - 1) in
+              if ok < 0 || (map_has obj_iv ok && map_get obj_iv ok == 0 - 1) then ()
               else print_err ("shapes: a table write around the door: " ++ k ++ "\n"))
            else ()) in
   let _ = (if c0 >= 48 && c0 <= 57 && (if map_has tbl k then false else true) then iv_idx_add k
@@ -606,15 +623,31 @@ let sh_find = fn (s: int) -> fn (nid: int) ->
   else (let k = s * 16777216 + nid in
         if map_has sh_slot k then map_get sh_slot k
         else (let i = sh_walk s nid in let _ = map_set sh_slot k i in i));
-// the child of shape s by name nid for object oid, made if new -- or -1 when
+// WHOSE variables: an OWNER KEY, the id times 8 and the kind, as the
+// collector's live set spells it -- 0 an object, 1 a String, 2 an Array, 3 a
+// Hash (note 559 step 2b'). obj_iv is keyed by it. The door below takes an
+// object's id (iv_*) or a String's, an Array's or a Hash's value (hiv_*).
+let iv_okind = fn (ok: int) -> ok % 8;
+// (the owner's keys in the table: "<id>@" for an object, "str:<id>@" and the
+// like for the others -- the table is where a too complex owner's are)
+let iv_tkey = fn (ok: int) -> fn (name: str) ->
+  let k = iv_okind ok in
+  (if k == 0 then str_of_int (ok / 8) ++ "@"
+   else (if k == 1 then "str:" else if k == 2 then "arr:" else "hsh:") ++ str_of_int (ok / 8) ++ "@")
+  ++ name;
+let iv_owner_cls = fn (ok: int) ->
+  let k = iv_okind ok in
+  if k == 0 then (if map_has obj_cls (ok / 8) then map_get obj_cls (ok / 8) else "Object")
+  else if k == 1 then "String" else if k == 2 then "Array" else "Hash";
+// the child of shape s by name nid for owner ok, made if new -- or -1 when
 // the object is to go to the table (TOO COMPLEX above)
-let sh_child = fn (s: int) -> fn (nid: int) -> fn (oid: int) ->
+let sh_child = fn (s: int) -> fn (nid: int) -> fn (ok: int) ->
   let k = s * 16777216 + nid in
   if map_has sh_next k then map_get sh_next k
   else if nid >= 16777216 || sh_count () >= vec_get iv_knobs 1 || sh_len s >= 4096 then 0 - 1
   else
     (let var = vec_get sh_tree (4 * s + 3) > 0 in
-     let cls = (if map_has obj_cls oid then map_get obj_cls oid else "Object") in
+     let cls = iv_owner_cls ok in
      let nv = (if var then (if map_has sh_cls_var cls then map_get sh_cls_var cls else 0) else 0) in
      if var && nv >= 8 then 0 - 1
      else
@@ -655,7 +688,8 @@ let iv_area_free = fn (b: int) -> fn (cap: int) ->
 // tenth higher).
 let iv_slots_add = fn (n: int) -> vec_set iv_knobs 3 (vec_get iv_knobs 3 + n);
 let iv_entries = fn tbl -> map_len tbl + vec_get iv_knobs 3;
-let iv_rec = fn (oid: int) -> if map_has obj_iv oid then map_get obj_iv oid else 0 - 2;
+let iv_rec_k = fn (ok: int) -> if map_has obj_iv ok then map_get obj_iv ok else 0 - 2;
+let iv_rec = fn (oid: int) -> iv_rec_k (oid * 8);
 // (a shaped record's area, given back -- the collector's sweep, the move to the table)
 let iv_rec_free = fn (r: int) ->
   let s = iv_rec_shape r in
@@ -667,22 +701,22 @@ let iv_shape_slots = fn (s: int) ->
    go s Nil);
 // an object's shaped variables moved to the table, in their order, for good
 // (TOO COMPLEX above), and its area given back
-let iv_to_table = fn tbl -> fn (oid: int) ->
-  let r = iv_rec oid in
+let iv_to_table = fn tbl -> fn (ok: int) ->
+  let r = iv_rec_k ok in
   // (in the table first: what is written there now is through the door)
-  let _ = map_set obj_iv oid (0 - 1) in
+  let _ = iv_rec_put ok (0 - 1) in
   if r > 0 then
     (let b = iv_rec_base r in
      let _ = list_iter (iv_shape_slots (iv_rec_shape r)) (fn (p: int * int) ->
                let (i, nid) = p in
                let v = vec_get iv_slab (b + i) in
-               if iv_is_absent v then () else iv_put tbl (iv_key oid (vec_get iv_nm nid)) v) in
+               if iv_is_absent v then () else iv_put tbl (iv_tkey ok (vec_get iv_nm nid)) v) in
      iv_rec_free r)
   else ();
 // the object (record r, 0 for none yet) moves to its shape's child c, and v
 // goes in c's last slot: into a bigger area when c's slots outgrow its own --
 // as big as its class's objects have come to need (sh_cls_cap)
-let iv_grow = fn (oid: int) -> fn (r: int) -> fn (c: int) -> fn (v: Val) ->
+let iv_grow = fn (ok: int) -> fn (r: int) -> fn (c: int) -> fn (v: Val) ->
   let s = iv_rec_shape r in
   let b = iv_rec_base r in
   let n0 = sh_len s in
@@ -691,9 +725,9 @@ let iv_grow = fn (oid: int) -> fn (r: int) -> fn (c: int) -> fn (v: Val) ->
   let _ = iv_slots_add 1 in
   if n1 <= cap0 then
     (let _ = vec_set iv_slab (b + n1 - 1) v in
-     map_set obj_iv oid (r - s + c))
+     iv_rec_put ok (r - s + c))
   else
-    (let cls = (if map_has obj_cls oid then map_get obj_cls oid else "Object") in
+    (let cls = iv_owner_cls ok in
      let h = (if map_has sh_cls_cap cls then map_get sh_cls_cap cls else 0) in
      let _ = (if n1 > h then map_set sh_cls_cap cls n1 else ()) in
      let cap1 = iv_cap_of (if n1 > h then n1 else h) in
@@ -702,10 +736,10 @@ let iv_grow = fn (oid: int) -> fn (r: int) -> fn (c: int) -> fn (v: Val) ->
      let _ = cp 0 in
      let _ = (if cap0 > 0 then iv_area_free b cap0 else ()) in
      let _ = vec_set iv_slab (nb + n1 - 1) v in
-     map_set obj_iv oid (iv_mk_rec nb cap1 c));
+     iv_rec_put ok (iv_mk_rec nb cap1 c));
 // a LISTED name set again after its removal goes last, as in ruby: the object
 // moves to the shape of its other names in their order and then that one
-let iv_readd = fn tbl -> fn (oid: int) -> fn (r: int) -> fn (nid: int) -> fn (v: Val) ->
+let iv_readd = fn tbl -> fn (ok: int) -> fn (r: int) -> fn (nid: int) -> fn (v: Val) ->
   let s = iv_rec_shape r in
   let b = iv_rec_base r in
   let rec kept = fn (xs: (int * int) list) ->
@@ -717,11 +751,11 @@ let iv_readd = fn tbl -> fn (oid: int) -> fn (r: int) -> fn (nid: int) -> fn (v:
   let keep = kept (iv_shape_slots s) in
   let rec path = fn (t: int) -> fn (xs: (int * int) list) ->
     (match xs with
-     | Nil -> sh_child t nid oid
-     | Cons ((_, n), rest) -> (let c = sh_child t n oid in if c < 0 then c else path c rest)) in
+     | Nil -> sh_child t nid ok
+     | Cons ((_, n), rest) -> (let c = sh_child t n ok in if c < 0 then c else path c rest)) in
   let c = path 0 keep in
   if c < 0 then
-    (let _ = iv_to_table tbl oid in iv_put tbl (iv_key oid (vec_get iv_nm nid)) v)
+    (let _ = iv_to_table tbl ok in iv_put tbl (iv_tkey ok (vec_get iv_nm nid)) v)
   else
     (let cap = iv_cap_of (sh_len c) in
      let nb = iv_area_new cap in
@@ -732,28 +766,27 @@ let iv_readd = fn tbl -> fn (oid: int) -> fn (r: int) -> fn (nid: int) -> fn (v:
      let _ = put 0 keep in
      let _ = iv_rec_free r in
      let _ = iv_slots_add (sh_len c) in
-     map_set obj_iv oid (iv_mk_rec nb cap c));
-// ...the door itself: by the object's id and the name without its "@"
-let iv_get_or = fn tbl -> fn (oid: int) -> fn (name: str) -> fn (d: Val) ->
-  let r = iv_rec oid in
+     iv_rec_put ok (iv_mk_rec nb cap c));
+// ...the door itself, by the owner key (iv_k_*) and the name without its "@"
+let iv_k_get_or = fn tbl -> fn (ok: int) -> fn (name: str) -> fn (d: Val) ->
+  let r = iv_rec_k ok in
   if r >= 0 then
     (let i = sh_find (iv_rec_shape r) (iv_nid_find name) in
      if i < 0 then d else iv_slot_read (iv_rec_base r) i d)
   else if r == 0 - 2 then d
-  else (let k = iv_key oid name in if map_has tbl k then map_get tbl k else d);
-let iv_get = fn tbl -> fn (oid: int) -> fn (name: str) -> iv_get_or tbl oid name VNil;
-let iv_has = fn tbl -> fn (oid: int) -> fn (name: str) ->
-  let r = iv_rec oid in
+  else (let k = iv_tkey ok name in if map_has tbl k then map_get tbl k else d);
+let iv_k_has = fn tbl -> fn (ok: int) -> fn (name: str) ->
+  let r = iv_rec_k ok in
   if r >= 0 then
     (let i = sh_find (iv_rec_shape r) (iv_nid_find name) in
      i >= 0 && (if iv_is_absent (vec_get iv_slab (iv_rec_base r + i)) then false else true))
   else if r == 0 - 2 then false
-  else map_has tbl (iv_key oid name);
-let iv_set = fn tbl -> fn (oid: int) -> fn (name: str) -> fn (v: Val) ->
-  let r = iv_rec oid in
-  if r == 0 - 1 then iv_put tbl (iv_key oid name) v
+  else map_has tbl (iv_tkey ok name);
+let iv_k_set = fn tbl -> fn (ok: int) -> fn (name: str) -> fn (v: Val) ->
+  let r = iv_rec_k ok in
+  if r == 0 - 1 then iv_put tbl (iv_tkey ok name) v
   else if r == 0 - 2 && vec_get iv_knobs 0 == 0 then
-    (let _ = map_set obj_iv oid (0 - 1) in iv_put tbl (iv_key oid name) v)
+    (let _ = iv_rec_put ok (0 - 1) in iv_put tbl (iv_tkey ok name) v)
   else
     (let r0 = (if r < 0 then 0 else r) in
      let s = iv_rec_shape r0 in
@@ -762,19 +795,32 @@ let iv_set = fn tbl -> fn (oid: int) -> fn (name: str) -> fn (v: Val) ->
      let i = sh_find s nid in
      if i >= 0 then
        (if iv_is_absent (vec_get iv_slab (b + i)) && (if iv_name_hidden name then false else true)
-        then iv_readd tbl oid r0 nid v
+        then iv_readd tbl ok r0 nid v
         else vec_set iv_slab (b + i) v)
      else
-       (let c = sh_child s nid oid in
-        if c < 0 then (let _ = iv_to_table tbl oid in iv_put tbl (iv_key oid name) v)
-        else iv_grow oid r0 c v));
-let iv_del = fn tbl -> fn (oid: int) -> fn (name: str) ->
-  let r = iv_rec oid in
+       (let c = sh_child s nid ok in
+        if c < 0 then (let _ = iv_to_table tbl ok in iv_put tbl (iv_tkey ok name) v)
+        else iv_grow ok r0 c v));
+let iv_k_del = fn tbl -> fn (ok: int) -> fn (name: str) ->
+  let r = iv_rec_k ok in
   if r >= 0 then
     (let i = sh_find (iv_rec_shape r) (iv_nid_find name) in
      if i < 0 then () else vec_set iv_slab (iv_rec_base r + i) iv_absent)
-  else if r == 0 - 1 then map_delete tbl (iv_key oid name)
+  else if r == 0 - 1 then map_delete tbl (iv_tkey ok name)
   else ();
+// an OBJECT's variable, by its id
+let iv_get_or = fn tbl -> fn (oid: int) -> fn (name: str) -> fn (d: Val) -> iv_k_get_or tbl (oid * 8) name d;
+let iv_get = fn tbl -> fn (oid: int) -> fn (name: str) -> iv_k_get_or tbl (oid * 8) name VNil;
+let iv_has = fn tbl -> fn (oid: int) -> fn (name: str) -> iv_k_has tbl (oid * 8) name;
+let iv_set = fn tbl -> fn (oid: int) -> fn (name: str) -> fn (v: Val) -> iv_k_set tbl (oid * 8) name v;
+let iv_del = fn tbl -> fn (oid: int) -> fn (name: str) -> iv_k_del tbl (oid * 8) name;
+// a STRING's, an ARRAY's or a HASH's: its owner key, or -1 for any other value
+let hiv_ok = fn (v: Val) ->
+  match v with
+  | VStr h -> h * 8 + 1
+  | VArr h -> h * 8 + 2
+  | VHsh h -> h * 8 + 3
+  | _ -> 0 - 1;
 // ...and the same by the name WITH its "@" (`k`, as the evaluator spells it)
 let iv_at = fn (k: str) -> if str_len k > 0 && str_eq (char_at k 0) "@" then substring k 1 (str_len k) else k;
 let iv_get_at = fn tbl -> fn (oid: int) -> fn (k: str) -> iv_get_or tbl oid (iv_at k) VNil;
@@ -789,20 +835,20 @@ let iv_del_at_name = fn tbl -> fn (oid: int) -> fn (k: str) -> iv_del tbl oid (i
 // iv_file_new / iv_put_new. A node type's shape is made once (iv_new_sh).
 let iv_new_sh = map_new ();
 let iv_new_obj = fn (oid: int) -> fn (names: str) ->
-  if vec_get iv_knobs 0 == 0 then (let _ = map_set obj_iv oid (0 - 1) in 0 - 1)
+  if vec_get iv_knobs 0 == 0 then (let _ = iv_rec_put (oid * 8) (0 - 1) in 0 - 1)
   else
     (let c = (if map_has iv_new_sh names then map_get iv_new_sh names
               else (let rec go = fn (t: int) -> fn (xs: str list) ->
                       (match xs with
                        | Nil -> t
-                       | Cons (n, rest) -> (let c = sh_child t (iv_nid n) oid in if c < 0 then c else go c rest)) in
+                       | Cons (n, rest) -> (let c = sh_child t (iv_nid n) (oid * 8) in if c < 0 then c else go c rest)) in
                     let c = go 0 (str_split names (chr 2)) in
                     let _ = (if c > 0 then map_set iv_new_sh names c else ()) in
                     c)) in
-     if c <= 0 then (let _ = map_set obj_iv oid (0 - 1) in 0 - 1)
+     if c <= 0 then (let _ = iv_rec_put (oid * 8) (0 - 1) in 0 - 1)
      else (let cap = iv_cap_of (sh_len c) in
            let nb = iv_area_new cap in
-           let _ = map_set obj_iv oid (iv_mk_rec nb cap c) in
+           let _ = iv_rec_put (oid * 8) (iv_mk_rec nb cap c) in
            let _ = iv_slots_add (sh_len c) in
            nb));
 let iv_file_new = fn (pfx: str) -> fn (names: str) -> map_set iv_idx pfx names;
@@ -811,10 +857,10 @@ let iv_put_new = fn tbl -> fn (k: str) -> fn (v: Val) -> map_set tbl k v;
 // area of the same size, the removed marks too. Answers false when the copy
 // is not this simple -- the source in the table, or the copy already holding
 // variables -- and the caller copies name by name.
-let iv_copy_shaped = fn (src: int) -> fn (dst: int) ->
-  let r = iv_rec src in
+let iv_k_copy = fn (src: int) -> fn (dst: int) ->
+  let r = iv_rec_k src in
   if r == 0 - 2 then true
-  else if r < 0 || iv_rec dst != 0 - 2 then false
+  else if r < 0 || iv_rec_k dst != 0 - 2 then false
   else
     (let s = iv_rec_shape r in
      if s == 0 then true
@@ -824,9 +870,10 @@ let iv_copy_shaped = fn (src: int) -> fn (dst: int) ->
         let nb = iv_area_new (iv_rec_cap r) in
         let rec cp = fn (i: int) -> if i >= n then () else (let _ = vec_set iv_slab (nb + i) (vec_get iv_slab (b + i)) in cp (i + 1)) in
         let _ = cp 0 in
-        let _ = map_set obj_iv dst (iv_mk_rec nb (iv_rec_cap r) s) in
+        let _ = iv_rec_put dst (iv_mk_rec nb (iv_rec_cap r) s) in
         let _ = iv_slots_add n in
         true));
+let iv_copy_shaped = fn (src: int) -> fn (dst: int) -> iv_k_copy (src * 8) (dst * 8);
 // one object's variable names in their order, Struct slots left out (they are
 // not instance variables) -- a shaped object's, from its shape, else Nil
 let iv_shape_names = fn (r: int) ->
@@ -837,6 +884,51 @@ let iv_shape_names = fn (r: int) ->
           if iv_is_absent (vec_get iv_slab (b + sh_len t - 1)) || str_contains nm (chr 1) then go (sh_parent t) acc
           else go (sh_parent t) (Cons (nm, acc))) in
   go (iv_rec_shape r) Nil;
+// ...an owner's, by its owner key: a shaped one's names, else Nil (one in the
+// table is listed by a walk of it, where hiv_made says there may be some)
+let iv_k_names = fn (ok: int) -> (let r = iv_rec_k ok in if r >= 0 then iv_shape_names r else (Nil : str list));
+// whether a shaped owner has any variable at all
+let iv_k_any = fn (ok: int) ->
+  (let r = iv_rec_k ok in r >= 0 && (match iv_shape_names r with Nil -> false | _ -> true));
+// whether an owner has any variable (a String's for `-str` and `$/ =`): a
+// shaped one's from its shape; one in the table by a walk of it, made only
+// when hiv_made says a String, an Array or a Hash ever had one there (and
+// with no Map made per question: hiv_seen is the one answer slot)
+let hiv_seen = (let v = vec_new () in let _ = vec_push v 0 in v);
+let iv_k_has_any = fn tbl -> fn (ok: int) ->
+  let r = iv_rec_k ok in
+  if r != 0 - 1 then iv_k_any ok
+  else if iv_okind ok != 0 && vec_get hiv_made 0 == 0 then false
+  else
+    (let pfx = iv_tkey ok "" in
+     let _ = vec_set hiv_seen 0 0 in
+     let _ = map_iter tbl (fn (k: str) -> fn (v: Val) ->
+               if str_len k > str_len pfx && str_starts_with k pfx then vec_set hiv_seen 0 1 else ()) in
+     vec_get hiv_seen 0 == 1);
+// every variable of owner src to owner dst (a String's, an Array's, a Hash's
+// dup and clone): the area whole when it can (iv_k_copy), else name by name
+// -- from src's shape, or from the table (gathered first: writing while
+// walking it moves it)
+let iv_k_copy_all = fn tbl -> fn (src: int) -> fn (dst: int) ->
+  if iv_k_copy src dst then ()
+  else
+    (let r = iv_rec_k src in
+     if r >= 0 then
+       (let b = iv_rec_base r in
+        list_iter (iv_shape_slots (iv_rec_shape r)) (fn (p: int * int) ->
+          let (i, nid) = p in
+          let v = vec_get iv_slab (b + i) in
+          if iv_is_absent v then () else iv_k_set tbl dst (vec_get iv_nm nid) v))
+     else if iv_okind src != 0 && vec_get hiv_made 0 == 0 then ()
+     else
+       (let pfx = iv_tkey src "" in
+        let ns = vec_new () in
+        let vs = vec_new () in
+        let _ = map_iter tbl (fn (k: str) -> fn (v: Val) ->
+                  if str_len k > str_len pfx && str_starts_with k pfx
+                  then (let _ = vec_push ns (substring k (str_len pfx) (str_len k)) in vec_push vs v) else ()) in
+        let rec put = fn (i: int) -> if i >= vec_len ns then () else (let _ = iv_k_set tbl dst (vec_get ns i) (vec_get vs i) in put (i + 1)) in
+        put 0));
 // A KEY OF THE WHOLE TABLE, for those that walk it -- the collector, the
 // copy of every variable, the listing's fallback, the files flushed at exit
 // (note 559 step 2a): whose it is, and where its name starts, is asked here,
@@ -2501,9 +2593,26 @@ let meth_broke = map_new ();
 let yscan_defined = map_new ();
 // class name -> the frozen String Module#name answers for it (one per class)
 let cls_name_str = map_new ();
-// hash ids that reached the current call as the LAST element of a splat (see
-// r2k_unflag_tail); cleared as each method binds its parameters
-let r2k_splat = map_new ();
+// Transient argument notes for the call being prepared: empty keywords,
+// the single final splatted ruby2_keywords Hash, and whether a marked Proc
+// keeps that Hash (slot 2 is valid only while slot 1 names a Hash).
+// Native integer slots replace two string/integer maps.
+// Reset at the argument-list boundary; splats publish after their tail has
+// evaluated, so nested calls cannot overwrite an outer call's note.
+let arg_notes = (let v = vec_new () in let _ = vec_push v 0 in
+                 let _ = vec_push v 0 in let _ = vec_push v 0 in v);
+let arg_notes_reset = fn (u: unit) ->
+  let _ = vec_set arg_notes 0 0 in vec_set arg_notes 1 0;
+let arg_empty_set = fn (u: unit) -> vec_set arg_notes 0 1;
+let arg_empty_take = fn (u: unit) ->
+  let set9 = vec_get arg_notes 0 == 1 in let _ = (if set9 then vec_set arg_notes 0 0 else ()) in set9;
+let arg_splat_has = fn (id: int) -> vec_get arg_notes 1 == id;
+let arg_splat_any = fn (u: unit) -> vec_get arg_notes 1 > 0;
+let arg_splat_note = fn (id: int) ->
+  let _ = vec_set arg_notes 1 id in vec_set arg_notes 2 0;
+let arg_splat_forget = fn (u: unit) -> vec_set arg_notes 1 0;
+let arg_splat_keep = fn (u: unit) -> vec_get arg_notes 2 == 1;
+let arg_splat_mark_keep = fn (u: unit) -> vec_set arg_notes 2 1;
 // The DEFAULT VISIBILITY for top-level `def`s. A bare `public` / `private` at
 // the top level is a MODE, not a call on names -- language/fixtures/def.rb
 // switches it with a bare `public` and the spec then asks Object for the
@@ -3163,13 +3272,16 @@ let pos_name_id = fn (s: str) ->
         let _ = vec_push pos_names s in
         let _ = map_set pos_name_ids s i in
         i);
-let cur_meth_set = fn (s: str) ->
-  let i = (if map_has meth_name_ids s then map_get meth_name_ids s
-           else (let n = vec_get meth_name_next 0 in
-                 let _ = vec_set meth_name_next 0 (n + 1) in
-                 let _ = map_set meth_names n s in
-                 let _ = map_set meth_name_ids s n in n)) in
-  vec_set cur_fm 1 i;
+// (a method label's number in meth_names, given one the first time it is
+//  asked: cur_meth_set, and a method's record, which keeps its label's --
+//  mrec_build -- so that a call sets it with no hashing)
+let meth_name_id = fn (s: str) ->
+  if map_has meth_name_ids s then map_get meth_name_ids s
+  else (let n = vec_get meth_name_next 0 in
+        let _ = vec_set meth_name_next 0 (n + 1) in
+        let _ = map_set meth_names n s in
+        let _ = map_set meth_name_ids s n in n);
+let cur_meth_set = fn (s: str) -> vec_set cur_fm 1 (meth_name_id s);
 // ⚠ A NAME-MEMBERSHIP TEST IS A SET LOOKUP, NOT A CHAIN OF COMPARISONS. These
 // three predicates ran 23-24 `str_eq` against literals, once per dispatch, and
 // the answer for almost every name is "no" -- so almost every call paid all 24.
@@ -3467,8 +3579,9 @@ let ns_modmeth = name_set "modmeth";
 let map_set_s = fn tbl -> fn (k: str) -> fn (v: str) ->
   if map_has tbl k && str_eq (map_get tbl k) v then () else map_set tbl k v;
 // the same, for a table keyed by an INT. The call-stack tables (call_names_s,
-// call_files_s, call_meths_s, call_lines, live_frames) are keyed by the call
-// DEPTH or a frame id, and they were keyed by its decimal spelling: nine
+// call_lines, live_frames; and call_file_ids, call_meth_ids, which keep
+// numbers) are keyed by the call DEPTH or a frame id, and they were keyed by
+// its decimal spelling: nine
 // `str_of_int` per method call, each one an asprintf. That was the single
 // largest cost in a dispatch-heavy program -- 1,207 of 4,600 samples in
 // method_body_flow alone.
@@ -3893,6 +4006,61 @@ let lv_set = fn env -> fn (n: str) -> fn (v: Val) ->
 // module's refinements, including the ones refined after it; see do_refine).
 // Detached immutable entries preserve the exact active table without
 // allocating an unpooled Map for every class body. Most bodies save Nil.
+// A FRAME'S HEAD (note 560, B): the entries a call writes into its frame for
+// the frame itself -- its self, the method it runs and the class it was
+// defined in, its cref and nesting, its arguments and parameters, its id --
+// are read and written through these, so that where they
+// are kept can change in one place (step 3: an area of the frame's own,
+// note 560 section 7). Today they are the frame's Map entries, as before.
+// One function a key and a use (fh_<key>_<use>), each naming its key as a
+// literal: a name fetched from a table at run time cost a call about 190
+// instructions (its hash, which a literal has ready).
+let fh_args_lv_get = fn env -> lv_get env "__args";
+let fh_args_set = fn env -> fn (v: Val) -> map_set env "__args" v;
+let fh_callee_get = fn env -> map_get env "__callee";
+let fh_callee_has = fn env -> map_has env "__callee";
+let fh_callee_lv_get = fn env -> lv_get env "__callee";
+let fh_callee_lv_has = fn env -> lv_has env "__callee";
+let fh_callee_set = fn env -> fn (v: Val) -> map_set env "__callee" v;
+let fh_cref_lv_get = fn env -> lv_get env "__cref";
+let fh_cref_lv_has = fn env -> lv_has env "__cref";
+let fh_cref_set = fn env -> fn (v: Val) -> map_set env "__cref" v;
+let fh_cvcls_lv_get = fn env -> lv_get env "__cvcls";
+let fh_cvcls_lv_has = fn env -> lv_has env "__cvcls";
+let fh_cvcls_set = fn env -> fn (v: Val) -> map_set env "__cvcls" v;
+let fh_defcls_get = fn env -> map_get env "__defcls";
+let fh_defcls_has = fn env -> map_has env "__defcls";
+let fh_defcls_lv_get = fn env -> lv_get env "__defcls";
+let fh_defcls_lv_has = fn env -> lv_has env "__defcls";
+let fh_defcls_set = fn env -> fn (v: Val) -> map_set env "__defcls" v;
+let fh_defidx_lv_get = fn env -> lv_get env "__defidx";
+let fh_defidx_lv_has = fn env -> lv_has env "__defidx";
+let fh_defidx_set = fn env -> fn (v: Val) -> map_set env "__defidx" v;
+let fh_fid_get = fn env -> map_get env "__fid";
+let fh_fid_has = fn env -> map_has env "__fid";
+let fh_fid_lv_get = fn env -> lv_get env "__fid";
+let fh_fid_lv_has = fn env -> lv_has env "__fid";
+let fh_fid_set = fn env -> fn (v: Val) -> map_set env "__fid" v;
+let fh_has_blk_lv_get = fn env -> lv_get env "__has_blk";
+let fh_has_blk_lv_has = fn env -> lv_has env "__has_blk";
+let fh_has_blk_set = fn env -> fn (v: Val) -> map_set env "__has_blk" v;
+let fh_meth_get = fn env -> map_get env "__meth";
+let fh_meth_has = fn env -> map_has env "__meth";
+let fh_meth_lv_get = fn env -> lv_get env "__meth";
+let fh_meth_lv_has = fn env -> lv_has env "__meth";
+let fh_meth_set = fn env -> fn (v: Val) -> map_set env "__meth" v;
+let fh_nest_lv_get = fn env -> lv_get env "__nest";
+let fh_nest_lv_has = fn env -> lv_has env "__nest";
+let fh_nest_set = fn env -> fn (v: Val) -> map_set env "__nest" v;
+let fh_params_lv_get = fn env -> lv_get env "__params";
+let fh_params_lv_has = fn env -> lv_has env "__params";
+let fh_params_set = fn env -> fn (v: Val) -> map_set env "__params" v;
+let fh_self_get = fn env -> map_get env "self";
+let fh_self_has = fn env -> map_has env "self";
+let fh_self_lv_get = fn env -> lv_get env "self";
+let fh_self_lv_has = fn env -> lv_has env "self";
+let fh_self_lv_set = fn env -> fn (v: Val) -> lv_set env "self" v;
+let fh_self_set = fn env -> fn (v: Val) -> map_set env "self" v;
 let ref_save_active = fn (u: unit) ->
   if map_len ref_active == 0 then (Nil : (str * Val) list)
   else region RFSAVE {
@@ -4093,10 +4261,8 @@ let next_fid = fn () ->
   n + 1;
 let proc_home = (let t = map_new () in let _ = map_compact t in t);  // str(proc id) -> VInt home-frame-id // (its own arena from birth, compacted by the sweep: note 300)
 let pending_home = map_new ();  // single slot: home fid of a &proc being passed as a block
-// "e": the argument list just evaluated passed keywords that came to nothing
-// (`**{}`, an empty ruby2_keywords hash), which ruby still counts as keywords
-// given; run_block takes it for the block it starts (bind_block_params)
-let blk_kwp = map_new ();
+// arg_notes slot 0 records keywords that came to nothing (`**{}` or an
+// empty ruby2_keywords Hash). run_block consumes it for auto-splat binding.
 let live_frames = map_new ();   // fid -> 1 while that method frame is on the stack
 // callcc's re-entry (note 541 round 14). Off until `require "continuation"`
 // (cont_on is a slot, read on every call: cont_invoke). While on, each call of
@@ -5144,8 +5310,13 @@ let load_ctx = (let t = map_new () in let _ = map_compact t in t);  // (its own 
 // where execution is: the line of the statement being run (0 = not known, e.g.
 // inside a body that was synthesised rather than parsed).
 let call_names_s = map_new ();
-let call_files_s = map_new ();
-let call_meths_s = map_new ();
+// the file and the method a call was made from, per call depth: their numbers
+// in pos_names and meth_names (cur_fm's two slots), kept as they were when
+// the call was made and put back when it returns (cur_file_back,
+// cur_meth_back) -- the names themselves were compared and hashed again at
+// every call (note 560, C). call_file_at reads one back as a name.
+let call_file_ids = map_new ();
+let call_meth_ids = map_new ();
 // the method the innermost frame is running ("" at the top level)
 let cur_meth = fn () -> map_get meth_names (vec_get cur_fm 1);
 // The label ruby writes in a frame. Through 3.3 it was the method alone, so
@@ -6024,7 +6195,7 @@ and box_set = fn (b: int) ->
   let _ = vec_set box_st 1 b in
   if vec_get box_st 0 == 1 then bx_switch b else ()
 // ...and a call's box comes back with its file when the call returns: the
-// depth's box is kept beside call_files_s (box_put / box_take), and the
+// depth's box is kept beside call_file_ids (box_put / box_take), and the
 // frames that save a file in a local save the box with it (box_back)
 and box_put = fn (d: int) -> if vec_get box_st 0 == 1 then map_set call_box d (vec_get box_st 1) else ()
 and box_take = fn (d: int) -> if vec_get box_st 0 == 1 && map_has call_box d then box_set (map_get call_box d) else ()
@@ -6039,6 +6210,21 @@ and cur_file_set = fn (s: str) ->
      let _ = box_set (int_of_str (substring s 1 j)) in
      vec_set cur_fm 0 (pos_name_id (substring s (j + 1) (str_len s))))
   else vec_set cur_fm 0 (pos_name_id s);
+// the file a call at depth d was made from, as a name ("" when none)
+let call_file_at = fn (d: int) ->
+  if map_has call_file_ids d then vec_get pos_names (map_get call_file_ids d) else "";
+// ...and the two put back when the call at depth d returns. (A file name
+// kept with its box's mark would go through cur_file_set, which enters the
+// box -- a guard: cur_file_set takes the mark off before pos_name_id, so
+// pos_names holds none today, and the branch is not expected to run.)
+let cur_file_back = fn (d: int) ->
+  if map_has call_file_ids d then
+    (let i = map_get call_file_ids d in
+     let s = vec_get pos_names i in
+     if str_len s > 2 && str_starts_with s chr1_s then cur_file_set s else vec_set cur_fm 0 i)
+  else cur_file_set "";
+let cur_meth_back = fn (d: int) ->
+  if map_has call_meth_ids d then vec_set cur_fm 1 (map_get call_meth_ids d) else cur_meth_set "";
 let set_inc = fn (k: str) -> fn (v: str) ->
   let _ = bx_note_inc k in
   let _ = mro_note_mixins v in let _ = class_sng_note k in let _ = mro_bump_class k in map_set includes k v;

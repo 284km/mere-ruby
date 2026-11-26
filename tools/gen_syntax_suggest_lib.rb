@@ -4,7 +4,8 @@
 require 'rbconfig'
 root = ARGV.fetch(0, RbConfig::CONFIG.fetch('rubylibdir'))
 files = [File.join(root, 'syntax_suggest.rb')] + Dir[File.join(root, 'syntax_suggest/**/*.rb')].sort
-# SyntaxSuggest loads its CLI from api.rb, which requires OptionParser.
+# The standalone SyntaxSuggest API requires OptionParser via its CLI.
+# These pure-Ruby dependencies are fallbacks after every actual load-path file.
 files += ['optparse.rb', 'optparse/version.rb'].map { |name| File.join(root, name) }
 abort 'syntax_suggest source tree is missing' unless files.size > 1
 

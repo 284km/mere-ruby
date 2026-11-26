@@ -106,3 +106,75 @@ the earlier 956 counts describe only the historical r12 integration.
 The m_driver conflict is resolved using the actual main shaped-ivar setter.
 There is no PR-owned workflow change; workflow updates in the merge are
 inherited byte for byte from integrated main. No full unit or Rails suite.
+
+## Follow-up review: ordinary OptionParser loading and boot cost
+
+Ordinary OptionParser loading now tries every real load-path file before
+its bundled fallback, including reference fallback directories and a newer
+user copy. Physical absolute/relative optparse loads retain their actual
+identity, so optparse/time does not execute the parent a second time.
+Other native-backed shipped libraries retain their existing selection rule.
+
+The unchanged SyntaxSuggest api.rb requires cli.rb, which requires
+OptionParser. The two embedded pure-Ruby dependencies remain a last fallback
+for standalone use without an external stdlib. Removing them outright loses
+existing standalone SyntaxError annotation; this revision preserves that
+behavior while fixing the real-file selection reported in review.
+
+Fresh ordinary O2 builds use pinned main
+8b9907bed0f330cf918582054aec34b63f1aeedf, compiler 9dec2ff6 and mgz 661a01d8.
+Main SHA-256 f5d08342fa4b1f36c0b96347f8abd128d0f31afd75844e611dd3d84859ae6d69;
+candidate abd7eb3d43163308923661cd6cccafe477ad8ce9b8c025b21b1b02a1c8607eaf.
+The unchanged 5919-line upstream bundle regenerates byte for byte. Integration
+with this pinned main is conflict-free; workflow changes belong to main.
+
+Corpus 1109 now matches all 24 rows on both engines, stdout, stderr and exit
+status, including verbose optparse/time, optparse/ac, optparse/kwargs,
+relative-first loading, a user copy and a path object. The original 18 rows
+continue to check standalone annotation and feature switches. Corpus 445
+also matches all 23 rows on both engines.
+
+An exploratory path-object counter records a separate existing difference:
+Ruby 4.0.10 calls to_path twice; exact main and candidate call it once on
+both engines. All select the actual user library with empty stderr. The
+committed case checks library selection; a separate five-phase probe keeps
+the exact counter results. No runtime change forces extra conversions.
+
+Unchanged original CRuby selections, --seed=1, all pass on reference,
+pinned main and candidate, both engines: Exception SyntaxError 2 tests /
+11 assertions; Module method_defined 3 / 339.
+
+| Tight-GC max RSS bytes | Reference | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Exception | 23773184 | 175374336 | 175456256 | 178323456 | 179388416 |
+| Module | 23363584 | 175374336 | 176193536 | 203112448 | 203227136 |
+
+Startup measurement runs p 1 after parsing --seed=1 and seeding srand,
+MERE_RUBY_GC_TIGHT=1, /usr/bin/time -l, three alternating main/candidate
+pairs per engine. RUBYLIB, RUBYOPT and RUBY_BOX are cleared. Instructions
+are hardware counts; RSS is the maximum of three runs, in bytes.
+
+| Engine | Main median instructions | Candidate median | Change | Main max RSS | Candidate max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Evaluator | 940983762 | 947117478 | +0.652% | 70909952 | 71712768 |
+| VM | 939645620 | 949321880 | +1.030% | 71614464 | 72515584 |
+
+Evaluator instruction ranges are 937397787-977318752 (main) and
+945358737-991407823 (candidate); VM ranges 939428436-950808726 and
+944738493-954667664. The ranges overlap; the positive medians are reported
+as measured overhead. Candidate --disable=syntax_suggest controls have
+median instructions 937996661 / 943912662 and max RSS 71057408 / 71827456
+for evaluator / VM. Wall times are noisy under shared machine load and
+are not used to claim a startup speed improvement.
+
+## Final r14 acceptance
+
+- `sh run_corpus.sh --both`: 984/984 PASS, hash index ON/OFF, exit 0.
+- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: 984/984 PASS, ON/OFF, exit 0.
+- Both full sweeps verify the same r14 candidate binary SHA-256 above.
+- All eight source gates, generated-C bracket depth and iv_door pass.
+- Full/explicit completed record_hygiene and staged/unstaged whitespace pass.
+
+No full unit or Rails component suite was run. The actual code correction,
+expanded fixture, integrated main and completed record are submitted together
+in one push after local acceptance.
