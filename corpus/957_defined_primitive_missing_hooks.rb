@@ -81,6 +81,10 @@ module DefinedHookGuard957
   def respond_to?(name, include_private = false)
     if name == :respond_to_missing?
       guard_events << :gate
+      if guard_mode == :gate_gc_raise
+        GC.start
+        raise "gate-gc957"
+      end
       raise "gate957" if guard_mode == :gate_raise
       raise Exception, "gate957" if guard_mode == :gate_exception
       throw :defined_guard_exit957, :gate_exit if guard_mode == :gate_throw
@@ -91,6 +95,10 @@ module DefinedHookGuard957
 
   def respond_to_missing?(name, include_private = false)
     guard_events << [:hook, name, include_private]
+    if guard_mode == :hook_gc_raise
+      GC.start
+      raise "hook-gc957"
+    end
     raise "hook957" if guard_mode == :hook_raise
     raise Exception, "hook957" if guard_mode == :hook_exception
     throw :defined_guard_exit957, :hook_exit if guard_mode == :hook_throw
@@ -122,7 +130,7 @@ end
 
 [Hash, String, Array].each do |base|
   klass = Class.new(base) { include DefinedHookGuard957 }
-  [:gate_raise, :hook_raise, :gate_exception, :hook_exception].each do |mode|
+  [:gate_raise, :hook_raise, :gate_exception, :hook_exception, :gate_gc_raise, :hook_gc_raise].each do |mode|
     value = klass.new
     value.guard_mode = mode
     p [:guarded, base.name, mode, defined_guard_answer957(value), value.guard_events, $!.nil?]
@@ -163,5 +171,46 @@ end
   [:gate_raise, :hook_raise].each do |mode|
     value.guard_mode = mode
     p [:singleton_guarded, value.class.name, mode, defined_guard_answer957(value), $!.nil?]
+  end
+end
+
+# Do not read $! before the probe: that would pin the pair and hide lost frames.
+def defined_guard_bare_rescue957(value, label)
+  begin
+    outer_line = __LINE__ + 1
+    raise "bare-outer957"
+  rescue
+    answer = defined?(value.virtual)
+    error = $!
+    p [:bare_outer, label, answer, error.message,
+       error.backtrace.first.include?(":#{outer_line}:in"),
+       error.backtrace_locations.first.lineno == outer_line]
+  end
+rescue Exception => error
+  p [:bare_outer, label, :leaked, error.class.name, error.message]
+end
+
+[Hash, String, Array].each do |base|
+  klass = Class.new(base) { include DefinedHookGuard957 }
+  [:gate_raise, :hook_raise, :gate_exception, :hook_exception, :gate_gc_raise, :hook_gc_raise].each do |mode|
+    value = klass.new
+    value.guard_mode = mode
+    defined_guard_bare_rescue957(value, [base.name, mode])
+  end
+end
+
+[Hash, String, Array].each do |base|
+  klass = Class.new(base) { include DefinedHookGuard957 }
+  [:gate_action, :hook_action].each do |mode|
+    value = klass.new
+    nested = klass.new
+    nested.guard_mode = :hook_gc_raise
+    value.guard_mode = mode
+    value.guard_action = proc do
+      defined?(nested.virtual)
+      GC.start
+      raise "nested957"
+    end
+    defined_guard_bare_rescue957(value, [:nested, base.name, mode])
   end
 end
