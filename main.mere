@@ -74926,6 +74926,39 @@ and rxc_null_any = fn (xs: RNode list) ->
 // differing fixed lengths (`(?<=\A|/)` is width 0 or 1). Compute the range
 // and let the matcher try each start; -1 still means unbounded, which no
 // engine can walk backwards.
+// An exact-once repetition is still one literal byte: an escaped
+// multibyte character's last byte may be wrapped in NRep by the parser.
+and rxc_lit_byte = fn (n: RNode) ->
+  match n with
+  | NChar b when str_len b == 1 -> b
+  | NRep (b, lo, hi, _) when lo == 1 && hi == 1 -> rxc_lit_byte b
+  | _ -> ""
+// A byte-node run may contain several characters (\u{65E5 672C}).
+// Decode at most six bytes at a time, including CESU-8 surrogate pairs,
+// so long runs stay linear. Return the remaining nodes to the sum path.
+and rxc_lit_run = fn (xs: RNode list) ->
+  let rec head = fn (ys: RNode list) -> fn (left: int) -> fn (acc: str) ->
+    if left <= 0 then acc else
+    (match ys with
+     | Cons (h, t) ->
+       (let b = rxc_lit_byte h in
+        if str_len b == 1 then head t (left - 1) (acc ++ b) else acc)
+     | _ -> acc) in
+  let rec skip_bytes = fn (ys: RNode list) -> fn (n: int) ->
+    if n <= 0 then ys else (match ys with Nil -> Nil | Cons (_, t) -> skip_bytes t (n - 1)) in
+  let rec count = fn (ys: RNode list) -> fn (n: int) ->
+    (match ys with
+     | Nil -> (n, Nil)
+     | Cons (h, t) ->
+       (let b = rxc_lit_byte h in
+        if str_len b != 1 then (n, ys)
+        else if ord b < 128 then count t (n + 1)
+        else (let s9 = head ys 6 "" in
+              let k9 = (if vec_get rxp_u8 0 == 1 then utf8_clen s9 0 else cut_clen s9 0) in
+              if k9 <= 0 || k9 > str_len s9 then count t (n + 1)
+              else count (skip_bytes ys k9) (n + 1)))
+     ) in
+  count xs 0
 and rxc_wmin = fn (n: RNode) ->
   match n with
   | NChar _ -> 1 | NCharCI _ -> 1 | NAny -> 1 | NAnyNL -> 1 | NClass (_, _, _) -> 1
@@ -74942,6 +74975,9 @@ and rxc_wmin = fn (n: RNode) ->
 and rxc_wmin_sum = fn (xs: RNode list) ->
   match xs with
   | Nil -> 0
+  | Cons (h, _) when str_len (rxc_lit_byte h) == 1 ->
+    (let (w, t) = rxc_lit_run xs in
+     let r = rxc_wmin_sum t in if r < 0 then 0 - 1 else w + r)
   | Cons (h, t) -> (let w = rxc_wmin h in if w < 0 then 0 - 1 else (let r = rxc_wmin_sum t in if r < 0 then 0 - 1 else w + r))
 and rxc_wmin_alt = fn (xs: RNode list) ->
   match xs with
@@ -74965,12 +75001,20 @@ and rxc_wmax = fn (n: RNode) ->
 and rxc_wmax_sum = fn (xs: RNode list) ->
   match xs with
   | Nil -> 0
+  | Cons (h, _) when str_len (rxc_lit_byte h) == 1 ->
+    (let (w, t) = rxc_lit_run xs in
+     let r = rxc_wmax_sum t in if r < 0 then 0 - 1 else w + r)
   | Cons (h, t) -> (let w = rxc_wmax h in if w < 0 then 0 - 1 else (let r = rxc_wmax_sum t in if r < 0 then 0 - 1 else w + r))
 and rxc_wmax_alt = fn (xs: RNode list) ->
   match xs with
   | Nil -> 0
   | Cons (h, Nil) -> rxc_wmax h
   | Cons (h, t) -> (let w = rxc_wmax h in let r = rxc_wmax_alt t in if w < 0 || r < 0 then 0 - 1 else (if w > r then w else r))
+
+// Keep top-level lookbehind alternatives in pattern order and let the
+// outer matcher backtrack between them, including their capture states.
+and rxc_lookb_alts = fn (xs: RNode list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> Cons (NLookB (h, false), rxc_lookb_alts t)
 
 and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
   match n with
@@ -75051,6 +75095,9 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
      let _ = map_set prog pc (IJmp (pc2 + 1)) in
      let _ = map_set prog (pc2 + 1) (ILook (subpc, negd)) in
      pc2 + 2)
+  // Keep the shared trial range when calls or capture state affect an arm.
+  | NLookB (NAlt xs, false) when rxq_plain (NAlt xs) ->
+    rxc_emit prog pc (NAlt (rxc_lookb_alts xs))
   | NLookB (b, negd) ->
     (let wlo = rxc_wmin b in
      let whi = rxc_wmax b in
@@ -76119,20 +76166,108 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (base:
        if negd then rxv_run prog s (pc + 1) i base else (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail))
   | IMeta (_, _) -> (if rxs_pop base then rxv_run prog s (vec_get rxs_res 0) (vec_get rxs_res 1) base else RFail)
 
-// a lookbehind body that ends exactly at `i`, starting anywhere between
-// i-whi and i-wlo (longest first, as ruby prefers).
+// Widths are characters, while VM positions are bytes. Find the longest
+// available start once, then advance by whole characters for shorter trials.
 and rxv_lookb_try = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
                    fn (wlo: int) -> fn (whi: int) ->
   if whi < wlo then RFail
-  else if i - whi < 0 then rxv_lookb_try prog s sub i wlo (whi - 1)
+  else if whi == 0 then rxv_lookb_from prog s sub i wlo i 0
+  else
+    (let k9 = vec_get cut_k 0 in
+     let (p9, n9) = (if k9 == 0 then (let n9 = (if i < whi then i else whi) in (i - n9, n9))
+                     else if k9 == 1 then rxv_lb_utf8_start s i whi 0
+                     else rxv_lb_legacy s i whi) in
+     rxv_lookb_from prog s sub i wlo p9 n9)
+and rxv_lb_utf8_head = fn (s: str) -> fn (p: int) ->
+  if p <= 0 then 0
+  else (let b9 = ord (char_at s p) in
+        if b9 >= 128 && b9 < 192 then rxv_lb_utf8_head s (p - 1) else p)
+and rxv_lb_utf8_start = fn (s: str) -> fn (p: int) -> fn (n: int) -> fn (taken: int) ->
+  if n <= 0 || p <= 0 then (p, taken)
+  else rxv_lb_utf8_start s (rxv_lb_utf8_head s (p - 1)) (n - 1) (taken + 1)
+// Step back from a known character boundary. In these double-byte families
+// lead bytes cannot stand alone, so a run of them determines the parity of
+// an ambiguous final ASCII or half-width byte. Do not rescan the whole prefix
+// for every lookbehind in scan/gsub.
+and rxv_lb_lead = fn (b: int) -> fn (lo: int) -> fn (hi: int) ->
+  if lo == 129 && hi == 252 then (b >= 129 && b <= 159) || (b >= 224 && b <= 252)
+  else b >= lo && b <= hi
+and rxv_lb_parity = fn (s: str) -> fn (p: int) -> fn (lo: int) -> fn (hi: int) -> fn (odd: bool) ->
+  if p < 0 then odd
+  else if rxv_lb_lead (ord (char_at s p)) lo hi then rxv_lb_parity s (p - 1) lo hi (not odd)
+  else odd
+and rxv_lb_back = fn (s: str) -> fn (p: int) -> fn (n: int) -> fn (taken: int) -> fn (lo: int) -> fn (hi: int) ->
+  if n <= 0 || p <= 0 then (p, taken)
+  else
+    (let b9 = ord (char_at s (p - 1)) in
+     let w9 = (if lo == 0 then
+                 (if b9 < 128 then 1 else if p >= 3 && ord (char_at s (p - 3)) == 143 then 3 else 2)
+               else if rxv_lb_lead b9 lo hi || rxv_lb_parity s (p - 2) lo hi false then 2 else 1) in
+     // Preserve the forward decoder's treatment of malformed byte sequences.
+     if w9 > 1 && (p < w9 || enc_clen s (vec_get cut_e 0) (p - w9) != w9)
+     then rxv_lb_enc_start s p n 0 taken
+     else rxv_lb_back s (p - w9) (n - 1) (taken + 1) lo hi)
+// EUC-TW and GB18030 have four-byte forms; CESU-8 has a surrogate pair.
+and rxv_lb_wide_width = fn (s: str) -> fn (p: int) -> fn (kind: int) ->
+  let b9 = ord (char_at s (p - 1)) in
+  if kind == 1 then
+    (if b9 < 128 then 1 else if p >= 4 && ord (char_at s (p - 4)) == 142 then 4 else 2)
+  else if kind == 2 then
+    (if p >= 4 && b9 >= 48 && b9 <= 57
+        && rxv_lb_lead (ord (char_at s (p - 2))) 129 254
+        && (let d9 = ord (char_at s (p - 3)) in d9 >= 48 && d9 <= 57)
+        && rxv_lb_lead (ord (char_at s (p - 4))) 129 254 then 4
+     else if rxv_lb_lead b9 129 254 || rxv_lb_parity s (p - 2) 129 254 false then 2 else 1)
+  else
+    (let q9 = rxv_lb_utf8_head s (p - 1) in
+     if p - q9 == 3 && q9 >= 3
+        && ord (char_at s q9) == 237 && ord (char_at s (q9 - 3)) == 237
+        && (let l9 = ord (char_at s (q9 + 1)) in l9 >= 176 && l9 <= 191)
+        && (let h9 = ord (char_at s (q9 - 2)) in h9 >= 160 && h9 <= 175)
+     then 6 else p - q9)
+and rxv_lb_wide = fn (s: str) -> fn (p: int) -> fn (n: int) -> fn (taken: int) -> fn (kind: int) ->
+  if n <= 0 || p <= 0 then (p, taken)
+  else
+    (let w9 = rxv_lb_wide_width s p kind in
+     if w9 > 1 && (p < w9 || enc_clen s (vec_get cut_e 0) (p - w9) != w9)
+     then rxv_lb_enc_start s p n 0 taken
+     else rxv_lb_wide s (p - w9) (n - 1) (taken + 1) kind)
+and rxv_lb_legacy = fn (s: str) -> fn (p: int) -> fn (n: int) ->
+  // Select the same canonical decoder as enc_clen, including canonical
+  // aliases. The modeled ASCII-compatible decoders have reverse steps;
+  // UTF-16/32 subjects are transcoded before the VM (rxv_search_e).
+  let e9 = enc_up (enc_tx_alias (vec_get cut_e 0)) in
+  if str_eq e9 "EUC-JP" || str_eq e9 "EUCJP-MS" || str_eq e9 "CP51932" then rxv_lb_back s p n 0 0 0
+  else if str_eq e9 "SHIFT_JIS" || str_eq e9 "WINDOWS-31J" || str_eq e9 "SJIS" || str_eq e9 "CP932" then rxv_lb_back s p n 0 129 252
+  else if str_eq e9 "EUC-KR" || str_eq e9 "GB2312" || str_eq e9 "GB12345" then rxv_lb_back s p n 0 161 254
+  else if str_eq e9 "BIG5" || str_eq e9 "CP950" || str_eq e9 "CP951"
+          || str_eq e9 "BIG5-HKSCS" || str_eq e9 "BIG5-UAO"
+          || str_eq e9 "GBK" || str_eq e9 "CP936" || str_eq e9 "CP949" then rxv_lb_back s p n 0 129 254
+  else if str_eq e9 "EUC-TW" then rxv_lb_wide s p n 0 1
+  else if str_eq e9 "GB18030" then rxv_lb_wide s p n 0 2
+  else if str_eq e9 "CESU-8" then rxv_lb_wide s p n 0 3
+  else if str_eq e9 "UTF-8" then rxv_lb_utf8_start s p n 0
+  else rxv_lb_enc_start s p n 0 0
+// Unknown legacy encodings retain the forward decoder's boundary rules.
+and rxv_lb_enc_start = fn (s: str) -> fn (finish: int) -> fn (n: int) -> fn (lead: int) -> fn (taken: int) ->
+  if n <= 0 then rxv_lb_enc_slide s finish lead 0 taken
+  else if lead >= finish then (0, taken)
+  else rxv_lb_enc_start s finish (n - 1) (lead + cut_clen s lead) (taken + 1)
+and rxv_lb_enc_slide = fn (s: str) -> fn (finish: int) -> fn (lead: int) -> fn (lag: int) -> fn (taken: int) ->
+  if lead >= finish then (lag, taken)
+  else rxv_lb_enc_slide s finish (lead + cut_clen s lead) (lag + cut_clen s lag) taken
+and rxv_lookb_from = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
+                    fn (wlo: int) -> fn (p: int) -> fn (n: int) ->
+  if n < wlo then RFail
   else
     (let prev = (if map_has rxv_lb_end "e" then map_get rxv_lb_end "e" else 0 - 1) in
      let _ = map_set rxv_lb_end "e" i in
-     let r = rxv_inner prog s sub (i - whi) in
+     let r = rxv_inner prog s sub p in
      let _ = map_set rxv_lb_end "e" prev in
      match r with
      | RFound (e, sv2) -> RFound (e, sv2)
-     | RFail -> rxv_lookb_try prog s sub i wlo (whi - 1))
+     | RFail -> if n == 0 then RFail
+                else rxv_lookb_from prog s sub i wlo (p + cut_clen s p) (n - 1))
 
 
 // does [i, e) of s contain a match of the sub-program? (the subject cut at e,
