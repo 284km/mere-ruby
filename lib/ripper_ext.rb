@@ -87,12 +87,16 @@ unless defined?(::Ripper)
     # The lexer state at the current token: the translation has no lexer
     # running while it walks the tree.
     def state
-      nil
+      @__parsing ? @__regexp_diagnostic_state : nil
     end
 
     # The current token: the same.
     def token
-      nil
+      @__parsing ? @__regexp_diagnostic_token : nil
+    end
+
+    def error?
+      @__regexp_error || result.failure?
     end
 
     alias __translation_parse parse
@@ -540,6 +544,39 @@ unless defined?(::Ripper)
   module Prism
     module Translation
       class Ripper
+        # parse.y compiles static regexp bodies after the closing token. Keep
+        # the event values and positions from the actual Prism node, then ask
+        # the runtime's regexp validator for errors Prism syntax accepts.
+        def visit_regular_expression_node(node)
+          bounds(node.opening_loc)
+          on_regexp_beg(node.opening)
+          bounds(node.content_loc)
+          parts = on_regexp_new
+          unless node.content.empty?
+            content = on_tstring_content(node.content)
+            bounds(node.closing_loc)
+            parts = on_regexp_add(parts, content)
+          end
+          closing_location = node.closing_loc
+          bounds(closing_location)
+          closing = on_regexp_end(node.closing)
+          @lineno = closing_location.end_line
+          @column = closing_location.end_column
+          message = Prism.__prism_ripper_regexp_error(node.content, node.closing[1..])
+          if message
+            begin
+              @__regexp_diagnostic_state = EXPR_END
+              @__regexp_diagnostic_token = ""
+              compile_error(message)
+            ensure
+              @__regexp_diagnostic_state = @__regexp_diagnostic_token = nil
+            end
+            # During compile_error the new error has not been recorded yet.
+            @__regexp_error = true
+          end
+          on_regexp_literal(parts, closing)
+        end
+
         # The translation's #parse (prism 1.9), with parse.y's way of reporting:
         #
         # - a magic comment's name has its "-" as "_" (parser_magic_comment);
