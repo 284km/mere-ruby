@@ -71,3 +71,24 @@ rescue => e
 end
 x = l.v; y = __LINE__
 p [x, y == __LINE__ - 1, caller_locations(0, 1).first.lineno == __LINE__]
+
+# a Method and an UnboundMethod keep the body they were taken from: a method
+# redefined as a reader afterwards does not make the old body one
+class M
+  def initialize = (@x = 1)
+  def x
+    @y = 2
+    @x
+  end
+end
+mo = M.new
+mm = mo.method(:x)
+um = M.instance_method(:x)
+class M
+  def x = @x
+end
+m2 = M.new
+p [m2.x, m2.instance_variable_get(:@y)]
+p [mm.call, mo.instance_variable_get(:@y)]
+m3 = M.new
+p [um.bind_call(m3), m3.instance_variable_get(:@y)]

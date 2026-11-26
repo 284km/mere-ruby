@@ -38,6 +38,15 @@ ObjectSpace's allocation trace is not a condition. A reader allocates nothing, a
 
 Both give the same `allocation_sourceline`, `allocation_method_id` and `allocation_sourcefile` as ruby.
 
+## Why the answer is not kept in the method's record (#335's review)
+
+The review asked whether to decide "is this body a reader" once per definition, as a field of the method's record (`mrec_build` / `mrec_top_build`). Then a call that is not a reader would pay one comparison, and a reader would not walk its body again. Tried; kept as it is, for two reasons.
+
+- **The record cannot say "a reader".** The record is keyed by `Class#name` and describes the method defined under that name now. A Method or UnboundMethod keeps the body it was taken from. Redefine `x` as a reader after `mm = o.method(:x)`, and the record says "reader" while `mm.call` must run the old body. That body sets `@y` (corpus 834's last case, which matches ruby on both engines today). So the record could only say "not a reader": a filter, with the body still checked when it lets a call through.
+- **As a filter, the cost moves rather than goes.** To filter, a call must fetch the record before the frameless arms. Today those arms (this one, `triv_or_init`, `triv_store`) fetch none, and only the full path does, further down (`defcls ++ "#" ++ name`, then a map lookup). Fetching earlier means every call to a frameless method pays a key build and a lookup. A key built at run time costs about 190 instructions to hash (step 1 of note 560 B measured this: `loop/2026-11-26-stage10-frame-head-doors.md`). A reader is about 2,000. The saving on a call that is not a reader is 30 to 95.
+
+Also tried: checking the shapes a reader can have inline in the guard, without calling `triv_reader_iv`. The loops did not move: a self call +0.18% / +0.23%, against +0.1% / +0.23% as it stands. That is within run-to-run noise, so it is not taken.
+
 ## Also here: the VM ivar cache and a moved self (#332's review)
 
 `vm_ivar_ok`'s comment now covers a method still running on an object that `Ractor#send(move: true)` took, once every Ractor has ended.
