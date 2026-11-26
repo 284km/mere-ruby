@@ -37,3 +37,12 @@ It runs `prism/templates/template.rb` with the reference ruby for each
 generated file and copies the hand-written ones. The templates are driven by
 `prism/config.yml`, so a version bump regenerates everything; the diff that
 needs reading is `src/prism.c`.
+
+## Local scanner provenance
+
+`tools/prism_ripper_spans.patch` retains a private invalid-escape location
+at the parser's actual escape cursor. Public diagnostic locations, messages
+and serialized data remain unchanged. The generation script reapplies the
+patch after copying upstream sources. The extra location is read only by
+the private Ripper glue; its source pointers die with the parser, and only
+copied offsets cross the boundary.

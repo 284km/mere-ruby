@@ -274,7 +274,7 @@ unless defined?(::Ripper)
 
       # Whether the last parse (scan / lex / tokenize) found a syntax error.
       def error?
-        !@errors.empty?
+        @__parse_error
       end
 
       def initialize(src, filename = "-", lineno = 1)
@@ -284,6 +284,7 @@ unless defined?(::Ripper)
         @filename = filename
         @lineno = lineno
         @errors = []
+        @__parse_error = false
       end
 
       attr_reader :filename
@@ -298,13 +299,13 @@ unless defined?(::Ripper)
 
       def scan(**kw)
         result = (parse(**kw) + errors).uniq.sort_by { |e| [*e.pos, (e.message ? -1 : 0)] }
+        # Keep ripper/lexer's recovery for an empty end-of-token diagnostic.
         result.each_with_index do |e, i|
-          if e.event == :on_parse_error and e.tok.empty? and (pre = result[i - 1]) and
-             pre.pos[0] == e.pos[0] and (pre.pos[1] + pre.tok.size) == e.pos[1]
+          if e.event == :on_parse_error && e.tok.empty? && (pre = result[i - 1]) &&
+             pre.pos[0] == e.pos[0] && pre.pos[1] + pre.tok.size == e.pos[1]
             e.tok = pre.tok
             e.pos[1] = pre.pos[1]
-            result[i - 1] = e
-            result[i] = pre
+            result[i - 1], result[i] = e, pre
           end
         end
         result
@@ -322,14 +323,7 @@ unless defined?(::Ripper)
       def parse(raise_errors: false)
         source = @source.to_s
         result = Prism.lex_compat(source, filepath: @filename, line: @lineno, version: "current")
-        @errors = result.errors.map do |error|
-          loc = error.location
-          Elem.new([loc.start_line, loc.start_column], :on_parse_error, "", 0, error.message)
-        end
-        if raise_errors and !@errors.empty?
-          raise SyntaxError, @errors.map(&:message).join(" ;")
-        end
-        lines = source.lines
+        lines = source.lines("\n")
         offsets = [0]
         lines.each { |l| offsets << offsets.last + l.bytesize }
         # (the tokens in SOURCE order: a heredoc's body is reported after
@@ -340,11 +334,40 @@ unless defined?(::Ripper)
           [start, pos, event, tok, st.to_int]
         end
         tokens.sort_by! { |t| [t[0] || 0, t[1]] }
+        escape_locations = unicode_literals = cuts = escape_by_start = ordered_ranges = character_errors = position_at = character_states = nil
+        unless result.errors.empty?
+          escape_locations, unicode_literals, cuts, escape_by_start, ordered_ranges, character_errors, position_at, character_states =
+            lexer_scanner_context(result, tokens, source, offsets)
+        end
+        cut_index = span_index = skip_until = 0
         elems = []
         cursor = 0
         state = 0
         prev_state = 0
         tokens.each do |(start, pos, event, tok, st)|
+          if start && start < skip_until
+            finish = start + tok.bytesize
+            next if finish <= skip_until
+            start = skip_until
+            pos = position_at.call(start)
+            tok = source.byteslice(start, finish - start)
+          end
+          if event == :on_tstring_content && start && ordered_ranges && !ordered_ranges.empty?
+            finish = start + tok.bytesize
+            original_finish = finish
+            span_index += 1 while span_index < ordered_ranges.length && ordered_ranges[span_index].end_offset <= start
+            while span_index < ordered_ranges.length && ordered_ranges[span_index].start_offset < finish
+              last = ordered_ranges[span_index].end_offset
+              finish = last if last > finish
+              span_index += 1
+            end
+            if finish > original_finish
+              # The scanner consumed the diagnostic's full escape even when
+              # Prism ended a content token before the offending character.
+              tok = source.byteslice(start, finish - start)
+              skip_until = finish
+            end
+          end
           if start && start > cursor
             gap = source.byteslice(cursor, start - cursor).b
             if gap.match?(/\A(?:[ \t\f\r\v]|\\[ \t\n])+\z/n)
@@ -365,7 +388,60 @@ unless defined?(::Ripper)
           #  parse.y scans the body and the end as one string, and Prism
           #  gives the end the state after the whole literal)
           st = state if event == :on_heredoc_end
-          elems << Elem.new(pos, event, tok, st)
+          if event == :on_CHAR && start && escape_by_start && (bad = escape_by_start[start])
+            # Keep the scanner's consumed range and its actual entry state.
+            # The following whitespace uses the real post-CHAR state.
+            elems << Elem.new(pos, :on_tstring_content, source.byteslice(start, bad.length),
+                              character_states.fetch(start, st))
+            skip_until = bad.end_offset
+            character_errors << bad
+            cursor = bad.end_offset if bad.end_offset > cursor
+            prev_state = state
+            state = st
+            next
+          elsif event == :on_CHAR && unicode_literals && (extra = unicode_literals[start])
+            # CRuby flushes accepted content before reporting the extra
+            # codepoints, then emits the actual remaining closing token.
+            prefix = extra.start_offset - start
+            scanner_state = character_states.fetch(extra.start_offset, st)
+            elems << Elem.new(pos, :on_tstring_content, source.byteslice(start, prefix), scanner_state) if prefix > 0
+            remaining = start + tok.bytesize - extra.end_offset
+            if remaining > 0
+              elems << Elem.new(position_at.call(extra.end_offset), :on_CHAR,
+                                source.byteslice(extra.end_offset, remaining), st)
+            else
+              st = scanner_state
+            end
+          elsif event == :on_tstring_content && start && cuts && !cuts.empty?
+            finish = start + tok.bytesize
+            cut_index += 1 while cut_index < cuts.length && cuts[cut_index] <= start
+            current = start
+            while cut_index < cuts.length && cuts[cut_index] < finish
+              boundary = cuts[cut_index]
+              elems << Elem.new(position_at.call(current), event,
+                                source.byteslice(current, boundary - current), st) if boundary > current
+              current = boundary
+              cut_index += 1
+            end
+            elems << Elem.new(position_at.call(current), event,
+                              source.byteslice(current, finish - current), st) if finish > current
+          elsif event == :on_words_sep && tok.include?("\n")
+            # parse.y returns a word separator at each physical newline.
+            # Split the real token text at those boundaries, retaining bytes,
+            # state and positions; leading spaces stay with their newline.
+            line, column = pos
+            tok.each_line("\n") do |piece|
+              elems << Elem.new([line, column], event, piece, st)
+              if piece.end_with?("\n")
+                line += 1
+                column = 0
+              else
+                column += piece.bytesize
+              end
+            end
+          else
+            elems << Elem.new(pos, event, tok, st)
+          end
           cursor = start + tok.bytesize if start && start + tok.bytesize > cursor
           prev_state = state
           state = st
@@ -385,7 +461,215 @@ unless defined?(::Ripper)
             end
           end
         end
+        # Match diagnostics to the actual scanner tokens. In particular,
+        # a diagnostic at the next token must not be moved to preceding space.
+        @errors = []
+        @__parse_error = !result.errors.empty?
+        if @__parse_error
+          diagnostics = lexer_errors(result.errors, elems, source, offsets, escape_locations, character_errors)
+          diagnostics.each do |error, element|
+            begin
+              @__error = error
+              if error.event == :compile_error
+                compile_error(error.message)
+              else
+                name = error.event.to_s.delete_prefix("on_").to_sym
+                if PARSER_EVENT_TABLE.fetch(name) == 2
+                  __send__(error.event, error.message, element)
+                else
+                  __send__(error.event, error.message)
+                end
+              end
+            ensure
+              @__error = nil
+            end
+          end
+        end
+        if raise_errors && !@errors.empty?
+          raise SyntaxError, @errors.map(&:message).join(" ;")
+        end
         elems
+      end
+
+      def token
+        @__error&.tok
+      end
+
+      def lineno
+        @__error&.pos&.first
+      end
+
+      def column
+        @__error&.pos&.last
+      end
+
+      def state
+        @__error&.state&.to_int
+      end
+
+      private
+
+      # These are ripper/lexer's normal error handlers. Installed overrides
+      # replace them, and super still reaches the default collection behavior.
+      def on_error1(message)
+        @errors << Elem.new([lineno, column], __callee__, token, state, message)
+      end
+
+      def on_error2(message, element)
+        if element
+          @errors << Elem.new(element.pos.dup, __callee__, element.tok, element.state, message)
+        else
+          @errors << Elem.new([lineno, column], __callee__, token, state, message)
+        end
+      end
+
+      PARSER_EVENTS.grep(/_error\z/).each do |event|
+        alias_method "on_#{event}", "on_error#{PARSER_EVENT_TABLE.fetch(event)}"
+      end
+      alias compile_error on_error1
+
+      def lexer_scanner_context(result, tokens, source, offsets)
+        # Native scanner provenance is distinct from Prism's public spans.
+        escape_locations = {}
+        character_states = {}
+        unicode_literals = nil
+        unless result.errors.empty?
+          if Prism.respond_to?(:__ripper_escape_locations, true)
+            ranges = Prism.__send__(:__ripper_escape_locations, source,
+                                    filepath: @filename, line: @lineno, version: "current")
+            ranges.each do |index, (start, length, scanner_state)|
+              character_states[start] = scanner_state unless scanner_state.nil?
+              error = result.errors.fetch(index)
+              location = error.location.copy(start_offset: start, length: length)
+              escape_locations[index] = location
+              if error.type == :escape_invalid_unicode_literal
+                # Locate the actual containing CHAR token; do not reconstruct
+                # an escape or guess its cursor from surrounding source text.
+                low, high = 0, tokens.length
+                while low < high
+                  middle = (low + high) / 2
+                  tokens[middle][0] <= start ? low = middle + 1 : high = middle
+                end
+                containing = low > 0 ? tokens[low - 1] : nil
+                if containing && containing[2] == :on_CHAR &&
+                   location.end_offset <= containing[0] + containing[3].bytesize
+                  unicode_literals ||= {}
+                  unicode_literals[containing[0]] = location
+                end
+              end
+            end
+          else
+            # Preserve real public ranges on other backends; never guess a
+            # scanner position by searching the source backward.
+            result.errors.each_with_index do |error, index|
+              escape_locations[index] = error.location if error.type.to_s.start_with?("escape_") || error.type == :invalid_escape_character
+            end
+          end
+        end
+        cuts = escape_locations.values.flat_map { |loc| [loc.start_offset, loc.end_offset] }.uniq.sort
+        escape_by_start = escape_locations.values.to_h { |loc| [loc.start_offset, loc] }
+        ordered_ranges = escape_locations.values.sort_by(&:start_offset)
+        character_errors = []
+        position_at = lambda do |offset|
+          low, high = 0, offsets.length
+          while low < high
+            middle = (low + high) / 2
+            offsets[middle] <= offset ? low = middle + 1 : high = middle
+          end
+          line = low > 0 ? low - 1 : 0
+          [line + @lineno, offset - offsets[line]]
+        end
+        [escape_locations, unicode_literals, cuts, escape_by_start, ordered_ranges, character_errors, position_at, character_states]
+      end
+
+      def lexer_errors(errors, elems, source, offsets, escape_locations = {}, character_errors = [])
+        return [] if errors.empty?
+        at = ->(elem) { offsets.fetch(elem.pos[0] - @lineno) + elem.pos[1] }
+        starts = elems.map { |elem| at.call(elem) }
+        parameters = nil
+        errors.each_with_index.map do |error, error_index|
+          loc = escape_locations.fetch(error_index, error.location)
+          if error.type == :expect_eol_after_statement && !character_errors.empty?
+            low, high = 0, character_errors.length
+            while low < high
+              middle = (low + high) / 2
+              character_errors[middle].start_offset <= loc.start_offset ? low = middle + 1 : high = middle
+            end
+            next if low > 0 && loc.end_offset <= character_errors[low - 1].end_offset
+          end
+          low, high = 0, starts.length
+          while low < high
+            mid = (low + high) / 2
+            starts[mid] <= loc.start_offset ? low = mid + 1 : high = mid
+          end
+          index = low - 1
+          # A zero-width parser diagnostic describes an absent token. Keep
+          # its actual empty slice, including at a newline token's start.
+          elem = loc.length > 0 && index >= 0 && loc.start_offset < starts[index] + elems[index].tok.bytesize ? elems[index] : nil
+          previous = index >= 0 ? elems[index] : nil
+          event, message = :on_parse_error, error.message
+          case error.type
+          when :escape_invalid_hexadecimal
+            message = "invalid hex escape"
+          when :escape_invalid_control_repeat, :escape_invalid_meta_repeat
+            message = "Invalid escape character syntax"
+          when :escape_invalid_unicode_short
+            message = "invalid Unicode escape"
+          when :escape_invalid_unicode_literal
+            message = "Multiple codepoints at single character literal"
+          when :string_interpolated_term, :string_literal_eof
+            event, message = :compile_error, "unterminated string meets end of file"
+            # EOF reports the scanner's actual final content, not its opener.
+            if elems.last && elems.last.event == :on_tstring_content
+              last = elems.last
+              loc = loc.copy(start_offset: at.call(last), length: last.tok.bytesize)
+              previous = last
+            end
+          when :alias_argument, :alias_argument_numbered_reference
+            event, message = :on_alias_error, "can't make alias for the number variables"
+          when :class_name, :module_name
+            event, message = :on_class_name_error, "class/module name must be CONSTANT"
+          when :argument_formal_class, :argument_formal_constant, :argument_format_constant,
+               :argument_formal_global, :argument_formal_ivar
+            event = :on_param_error
+            message = message.delete_prefix("invalid formal argument; ")
+          when :invalid_local_variable_write
+            # The same diagnostic also occurs in patterns: classify an invalid
+            # parameter from its real ParametersNode, rather than source text.
+            unless parameters
+              parameters = []
+              stack = [Prism.parse(source, filepath: @filename, line: @lineno).value]
+              until stack.empty?
+                node = stack.pop
+                parameters << node.location if node.is_a?(Prism::ParametersNode)
+                stack.concat(node.compact_child_nodes)
+              end
+            end
+            if parameters.any? { |range| range.start_offset <= loc.start_offset && loc.end_offset <= range.end_offset }
+              event, message = :on_param_error, "formal argument must be local variable"
+            end
+          when :expression_not_writable_nil, :expression_not_writable_true,
+               :expression_not_writable_false, :expression_not_writable_self
+            event = :on_assign_error
+            # These parser diagnostics point at the assignment operator; the
+            # scanner's offending target is the preceding significant token.
+            index -= 1 while index >= 0 && [:on_sp, :on_op].include?(elems[index].event)
+            elem = elems[index] if index >= 0
+          when :heredoc_term
+            event, message = :compile_error, message.delete_prefix("unterminated heredoc; ")
+          when :invalid_character, :invalid_printable_character,
+               :incomplete_variable_instance, :incomplete_variable_class,
+               :instance_variable_bare, :class_variable_bare, :global_variable_bare
+            event = :compile_error
+          end
+          diagnostic = if elem && event != :compile_error
+                         Elem.new(elem.pos.dup, event, elem.tok, elem.state.to_int, message)
+                       else
+                         Elem.new([loc.start_line, loc.start_column], event, loc.slice,
+                                  previous ? previous.state.to_int : EXPR_BEG, message)
+                       end
+          [diagnostic, elem]
+        end.compact.uniq { |error, _| [error.pos, error.event, error.tok, error.state.to_int, error.message] }
       end
     end
 
