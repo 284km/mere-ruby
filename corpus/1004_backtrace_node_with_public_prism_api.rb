@@ -13,7 +13,7 @@ def eval_node_result1004(label, source, error)
   id = RubyVM::AbstractSyntaxTree.node_id_for_backtrace_location(location)
   node = Prism.parse(source).value.breadth_first_search { |entry| entry.node_id == id }
   p [label, node&.type, node.respond_to?(:name) ? node.name : nil,
-     location.lineno]
+     location.base_label, location.lineno]
 end
 
 module EvalNodeOwner1004
@@ -54,7 +54,7 @@ end
 
 object1004 = Object.new
 instance_source1004 = "def instance_node1004\n  nil.missing_instance1004\nend\n"
-object1004.instance_eval(instance_source1004, 'synthetic-instance1004', 7)
+object1004.instance_eval(instance_source1004, 'synthetic-instance1004', 0)
 begin
   object1004.instance_node1004
 rescue NoMethodError => error
@@ -90,4 +90,14 @@ begin
   p [:ordinary_identifier, :leaked]
 rescue NameError
   p [:ordinary_identifier, :missing]
+end
+
+[["def integer_fail1004\n  Integer('not-an-integer1004')\nend\n", :integer_fail1004, ArgumentError],
+ ["def ruby_raise1004\n  raise 'eval-raise1004'\nend\n", :ruby_raise1004, RuntimeError]].each do |source, name, error_class|
+  EvalNodeOwner1004.module_eval(source, "synthetic-raise1004", 41)
+  begin
+    receiver1004.public_send(name)
+  rescue error_class => error
+    eval_node_result1004(name, source, error)
+  end
 end
