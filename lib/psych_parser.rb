@@ -23,7 +23,24 @@ module Psych
     FLOW_BREAKS = [':', "\r", "\n", '#', ',', '[', ']', '{', '}'].freeze
     SINGLE_BREAKS = ["'", "\n"].freeze
     DOUBLE_BREAKS = ['"', '\\', "\n"].freeze
-    private_constant :ESCAPES, :PLAIN_BREAKS, :FLOW_BREAKS, :SINGLE_BREAKS, :DOUBLE_BREAKS
+    # The scanner reads BYTES (Integers): the syntax of YAML is ASCII, and a
+    # one-byte String per character read was most of what a load made -- about
+    # 110 Strings a row of activerecord's citations fixture, 6 of them kept.
+    # What a token holds is cut from the source by byte position, as before.
+    PUNCTUATION = {91 => [:sequence, '['], 93 => [:sequence_end, ']'], 123 => [:mapping, '{'],
+                   125 => [:mapping_end, '}'], 44 => [:comma, ',']}.freeze
+    INDICATORS = {45 => [:entry, '-'], 63 => [:key, '?'], 58 => [:value, ':']}.freeze
+    BYTE_ESCAPES = ESCAPES.to_h { |k, v| [k.ord, v.b] }.freeze
+    HEX_ESCAPES = {120 => 2, 117 => 4, 85 => 8}.freeze
+    DOCUMENT_ENDS = [:eof, :document, :end_document].freeze
+    PROPERTIES = [:anchor, :tag].freeze
+    KEY_KINDS = [:scalar, :alias, :sequence, :mapping].freeze
+    OPENERS = [:sequence, :mapping].freeze
+    CLOSERS = [:sequence_end, :mapping_end].freeze
+    DOCUMENT_MARKS = ['---', '...'].freeze
+    private_constant :ESCAPES, :PLAIN_BREAKS, :FLOW_BREAKS, :SINGLE_BREAKS, :DOUBLE_BREAKS,
+                     :PUNCTUATION, :INDICATORS, :BYTE_ESCAPES, :HEX_ESCAPES, :DOCUMENT_ENDS,
+                     :PROPERTIES, :KEY_KINDS, :OPENERS, :CLOSERS, :DOCUMENT_MARKS
     attr_accessor :handler
     attr_writer :external_encoding
 
@@ -77,6 +94,9 @@ module Psych
         prefix = source[0, invalid.begin(0)].split("\n", -1)
         raise SyntaxError.new(path, [prefix.length, 1].max, (prefix.last || '').length + 1, 0, 'control characters are not allowed', nil)
       end
+      # (an ASCII-only source has one character per byte: a run's length is
+      #  its byte count, with no String cut out to count it -- __skip)
+      @ascii = source.ascii_only?
       @source, @path, @pos = source.b, path, 0
       @length = @source.bytesize
       @window_start = 0
@@ -112,13 +132,13 @@ module Psych
         ending = explicit ? __take[3] : __peek[2]
         __error("did not find expected <document start>") if (!version.empty? || !tags.empty?) && !explicit
         __event(:start_document, [version, tags, !explicit], start, ending)
-        if [:eof, :document, :end_document].include?(__peek[0])
+        if DOCUMENT_ENDS.include?(__peek[0])
           __empty(__peek[2])
         else
           __node(-1)
         end
         token = __peek
-        unless [:eof, :document, :end_document].include?(token[0])
+        unless DOCUMENT_ENDS.include?(token[0])
           # libyaml ends the document (implicitly) before it looks for the
           # start of the next one, so a handler has this document whole --
           # Psych.parse returns from its block there -- and only then is what
@@ -164,14 +184,25 @@ module Psych
 
     # Keep hot byte reads on a small source window. Repeated VM operations on
     # a multi-megabyte String otherwise promote that entire value repeatedly.
-    def __char(position)
+    def __byte(position)
       return nil if position < 0 || position >= @length
       if position < @window_start || position >= @window_end
         @window_start = position
         @window = @source.byteslice(position, 65536)
         @window_end = position + @window.bytesize
       end
-      @window[position - @window_start]
+      @window.getbyte(position - @window_start)
+    end
+
+    # (what /\s/ matched on a one-character String: \f and \v never reach the
+    #  scanner, parse refuses them as control characters)
+    def __blank?(byte)
+      byte == 32 || byte == 10 || byte == 9 || byte == 13
+    end
+
+    # , [ ] { }
+    def __flow_indicator?(byte)
+      byte == 44 || byte == 91 || byte == 93 || byte == 123 || byte == 125
     end
 
     def __slice(position, count)
@@ -199,12 +230,14 @@ module Psych
       nil
     end
 
+    # One character's first byte on, counted as libyaml counts its marks: a
+    # line at "\n", and a column and an index per character (a UTF-8
+    # continuation byte, 128..191, is not one). Answers the byte.
     def __advance
-      c = __char(@pos)
-      byte = c.nil? ? nil : c.ord
+      byte = __byte(@pos)
       __error('found unexpected end of stream') unless byte
       @pos += 1
-      if c == "\n"
+      if byte == 10
         @line += 1
         @column = 0
         @line_content = false
@@ -212,15 +245,14 @@ module Psych
         @column += 1
       end
       @index += 1 if byte < 128 || byte >= 192
-      @line_content = true unless c == ' ' || c == "\t" || c == "\r" || c == "\n"
-      c
+      @line_content = true unless __blank?(byte)
+      byte
     end
 
     # Skip a run without line breaks in one operation. A character loop makes
     # large scalars spend most of their time allocating transient Ruby strings.
     def __skip(finish)
-      text = __slice(@pos, finish - @pos).force_encoding('UTF-8')
-      count = text.length
+      count = @ascii ? finish - @pos : __slice(@pos, finish - @pos).force_encoding('UTF-8').length
       @index += count
       @column += count
       @line_content = true if finish > @pos
@@ -244,11 +276,11 @@ module Psych
 
     def __space
       loop do
-        c = __char(@pos)
-        __error('found character that cannot start any token') if c == "\t" && !@line_content
-        if c == ' ' || c == "\t" || c == "\r" || c == "\n"
+        c = __byte(@pos)
+        __error('found character that cannot start any token') if c == 9 && !@line_content
+        if __blank?(c)
           __advance
-        elsif c == '#'
+        elsif c == 35
           __skip(__index("\n", @pos) || @length)
         else
           break
@@ -283,50 +315,59 @@ module Psych
     def __scan
       __space
       start = __at
-      c = __char(@pos)
+      c = __byte(@pos)
       unless c
         start = [@index, @column == 0 ? @line : @line + 1, 0]
         return [:eof, nil, start, start, nil]
       end
-      if @column == 0 && c == '%'
-        value = +''
-        value << __advance while @pos < @length && __char(@pos) != "\n"
-        return [:directive, value.force_encoding('UTF-8'), start, __at, nil]
+      if @column == 0 && c == 37
+        from = @pos
+        __skip(__index("\n", @pos) || @length)
+        return [:directive, __slice(from, @pos - from).force_encoding('UTF-8'), start, __at, nil]
       end
-      head = __slice(@pos, 3)
-      if @column == 0 && (head == '---' || head == '...') && (__char(@pos + 3).nil? || __char(@pos + 3) =~ /\s/)
-        3.times { __advance }
-        return [head == '---' ? :document : :end_document, nil, start, __at, nil]
-      end
-      punctuation = {'[' => :sequence, ']' => :sequence_end, '{' => :mapping, '}' => :mapping_end, ',' => :comma}
-      if punctuation.key?(c)
-        __advance
-        @flow += 1 if c == '[' || c == '{'
-        @flow -= 1 if c == ']' || c == '}'
-        return [punctuation[c], c, start, __at, nil]
-      end
-      if (c == '-' || c == '?' || c == ':') && (__char(@pos + 1).nil? || __char(@pos + 1) =~ /\s/ || (@flow > 0 && c == ':'))
-        __advance
-        return [{'-' => :entry, '?' => :key, ':' => :value}[c], c, start, __at, nil]
-      end
-      if c == '&' || c == '*'
-        __advance
-        value = +''
-        while @pos < @length && __char(@pos) !~ /[\s,\[\]{}]/
-          value << __advance
+      if @column == 0 && (c == 45 || c == 46)
+        head = __slice(@pos, 3)
+        if (head == '---' || head == '...') && (__byte(@pos + 3).nil? || __blank?(__byte(@pos + 3)))
+          3.times { __advance }
+          return [head == '---' ? :document : :end_document, nil, start, __at, nil]
         end
-        __error('did not find expected alphabetic or numeric character') if value.empty?
-        return [c == '&' ? :anchor : :alias, value.force_encoding('UTF-8'), start, __at, nil]
       end
-      if c == '!'
-        value = +''
-        if __char(@pos + 1) == '<'
+      if (punctuation = PUNCTUATION[c])
+        __advance
+        @flow += 1 if c == 91 || c == 123
+        @flow -= 1 if c == 93 || c == 125
+        return [punctuation[0], punctuation[1], start, __at, nil]
+      end
+      if (indicator = INDICATORS[c])
+        following = __byte(@pos + 1)
+        if following.nil? || __blank?(following) || (@flow > 0 && c == 58)
+          __advance
+          return [indicator[0], indicator[1], start, __at, nil]
+        end
+      end
+      if c == 38 || c == 42
+        __advance
+        from = @pos
+        while @pos < @length && !(__blank?(__byte(@pos)) || __flow_indicator?(__byte(@pos)))
+          __advance
+        end
+        __error('did not find expected alphabetic or numeric character') if @pos == from
+        return [c == 38 ? :anchor : :alias, __slice(from, @pos - from).force_encoding('UTF-8'), start, __at, nil]
+      end
+      if c == 33
+        if __byte(@pos + 1) == 60
           2.times { __advance }
-          value << __advance while @pos < @length && __char(@pos) != '>'
-          __error('did not find expected >') unless __char(@pos) == '>'
+          from = @pos
+          __advance while @pos < @length && __byte(@pos) != 62
+          value = __slice(from, @pos - from)
+          __error('did not find expected >') unless __byte(@pos) == 62
           __advance
         else
-          value << __advance while @pos < @length && __char(@pos) !~ /[\s,\[\]{}]/
+          from = @pos
+          while @pos < @length && !(__blank?(__byte(@pos)) || __flow_indicator?(__byte(@pos)))
+            __advance
+          end
+          value = __slice(from, @pos - from)
           if (m = /\A(![^!]*!)(.*)\z/.match(value))
             __error('found undefined tag handle') unless @tag_handles.key?(m[1])
             value = @tag_handles[m[1]] + m[2]
@@ -336,12 +377,12 @@ module Psych
         end
         return [:tag, value.force_encoding('UTF-8'), start, __at, nil]
       end
-      if c == "'" || c == '"'
+      if c == 39 || c == 34
         quote = __advance
         value = []
         closed = false
         while @pos < @length
-          finish = __separator(quote == "'" ? SINGLE_BREAKS : DOUBLE_BREAKS)
+          finish = __separator(quote == 39 ? SINGLE_BREAKS : DOUBLE_BREAKS)
           if finish > @pos
             value << __slice(@pos, finish - @pos)
             __skip(finish)
@@ -349,17 +390,16 @@ module Psych
           end
           c = __advance
           if c == quote
-            if quote == "'" && __char(@pos) == "'"
-              value << __advance
+            if quote == 39 && __byte(@pos) == 39
+              __advance
+              value << "'"
               next
             end
             closed = true
             break
-          elsif c == '\\' && quote == '"'
+          elsif c == 92 && quote == 34
             escape = __advance
-            table = ESCAPES
-            if ['x', 'u', 'U'].include?(escape)
-              count = {'x' => 2, 'u' => 4, 'U' => 8}[escape]
+            if (count = HEX_ESCAPES[escape])
               hex = __slice(@pos, count)
               __error('did not find expected hexadecimal number') unless hex && hex.length == count && hex =~ /\A[0-9a-fA-F]+\z/
               count.times { __advance }
@@ -368,37 +408,40 @@ module Psych
               rescue RangeError
                 __error('found invalid Unicode character escape code')
               end
-            elsif escape == "\n"
-              __advance while __char(@pos) == ' ' || __char(@pos) == "\t"
-            elsif table.key?(escape)
-              value << table[escape].b
+            elsif escape == 10
+              __advance while __byte(@pos) == 32 || __byte(@pos) == 9
+            elsif (text = BYTE_ESCAPES[escape])
+              value << text
             else
               __error('found unknown escape character')
             end
-          elsif c == "\n"
+          elsif c == 10
             value[-1] = value.last.rstrip unless value.empty?
             count = 0
-            while __char(@pos) == ' ' || __char(@pos) == "\t" || __char(@pos) == "\n"
-              count += 1 if __advance == "\n"
+            while __byte(@pos) == 32 || __byte(@pos) == 9 || __byte(@pos) == 10
+              count += 1 if __advance == 10
             end
             value << (count == 0 ? ' ' : "\n" * count)
           else
-            value << c
+            value << c.chr
           end
         end
         __error('found unexpected end of stream', start, 'while scanning a quoted scalar') unless closed
-        return [:scalar, value.join.force_encoding('UTF-8'), start, __at, quote == "'" ? 2 : 3]
+        return [:scalar, value.join.force_encoding('UTF-8'), start, __at, quote == 39 ? 2 : 3]
       end
-      if c == '|' || c == '>'
-        style = __advance == '|' ? 4 : 5
-        modifiers = +''
-        modifiers << __advance while __char(@pos) && __char(@pos) =~ /[-+1-9]/
-        __advance while __char(@pos) == ' '
-        if __char(@pos) == '#'
-          __advance while __char(@pos) && __char(@pos) != "\n"
+      if c == 124 || c == 62
+        style = __advance == 124 ? 4 : 5
+        from = @pos
+        while (m = __byte(@pos)) && (m == 45 || m == 43 || (m >= 49 && m <= 57))
+          __advance
         end
-        __error('did not find expected comment or line break') unless __char(@pos).nil? || __char(@pos) == "\n"
-        __advance if __char(@pos) == "\n"
+        modifiers = __slice(from, @pos - from)
+        __advance while __byte(@pos) == 32
+        if __byte(@pos) == 35
+          __advance while __byte(@pos) && __byte(@pos) != 10
+        end
+        __error('did not find expected comment or line break') unless __byte(@pos).nil? || __byte(@pos) == 10
+        __advance if __byte(@pos) == 10
         lines = []
         indent = modifiers[/[1-9]/]&.to_i
         # Explicit indentation is relative to the enclosing block, not '|'.
@@ -406,9 +449,9 @@ module Psych
         loop do
           break if @pos >= @length
           p = @pos
-          p += 1 while __char(p) == ' '
+          p += 1 while __byte(p) == 32
           width = p - @pos
-          blank = __char(p).nil? || __char(p) == "\n" || __char(p) == "\r"
+          blank = __byte(p).nil? || __byte(p) == 10 || __byte(p) == 13
           indent ||= width unless blank
           break if !blank && (width < indent || width <= (@block_indent || -1))
           width.times { __advance }
@@ -416,7 +459,7 @@ module Psych
           __skip(__index("\n", @pos) || @length)
           body = __slice(body_start, @pos - body_start).force_encoding('UTF-8')
           body = (' ' * [width - (indent || width), 0].max) + body unless blank
-          newline = __char(@pos) == "\n"
+          newline = __byte(@pos) == 10
           __advance if newline
           lines << [body, newline]
         end
@@ -445,7 +488,7 @@ module Psych
         value = +'' if !modifiers.include?('+') && lines.all? { |body, _| body.empty? }
         return [:scalar, value, start, __at, style]
       end
-      __error('found character that cannot start any token') if ['`', '@', '%', "\t"].include?(c)
+      __error('found character that cannot start any token') if c == 96 || c == 64 || c == 37 || c == 9
       parts = []
       part_start = @pos
       while @pos < @length
@@ -454,37 +497,39 @@ module Psych
           __skip(finish)
           next
         end
-        c = __char(@pos)
-        if c == "\n" || c == "\r"
+        c = __byte(@pos)
+        if c == 10 || c == 13
           p = @pos
           breaks = 0
           line_start = p
-          while __char(p) && __char(p) =~ /[ \t\r\n]/
-            if __char(p) == "\n"
+          while (b = __byte(p)) && __blank?(b)
+            if b == 10
               breaks += 1
               line_start = p + 1
             end
             p += 1
           end
           indentation = p - line_start
-          next_text = __slice(p, 3)
-          break if !__char(p) || (@flow == 0 && indentation <= @block_indent) || __char(p) == '#' || (indentation == 0 && ['---', '...'].include?(next_text))
+          following = __byte(p)
+          break if !following || (@flow == 0 && indentation <= @block_indent) || following == 35 ||
+                   (indentation == 0 && (following == 45 || following == 46) && DOCUMENT_MARKS.include?(__slice(p, 3)))
           __advance while @pos < p
           parts << __slice(part_start, @pos - part_start).rstrip
           parts << (breaks > 1 ? "\n" * (breaks - 1) : ' ')
           part_start = @pos
           next
         end
-        break if @flow > 0 && [',', '[', ']', '{', '}'].include?(c)
-        following = __char(@pos + 1)
-        break if c == ':' && (following.nil? || following =~ /\s/ || (@flow > 0 && [',', '[', ']', '{', '}'].include?(following)))
-        break if c == '#' && (@pos == part_start || __char(@pos - 1) =~ /\s/)
+        break if @flow > 0 && __flow_indicator?(c)
+        following = __byte(@pos + 1)
+        break if c == 58 && (following.nil? || __blank?(following) || (@flow > 0 && __flow_indicator?(following)))
+        break if c == 35 && (@pos == part_start || __blank?(__byte(@pos - 1)))
         __advance
       end
-      parts << __slice(part_start, @pos - part_start)
-      value = parts.join.force_encoding('UTF-8')
+      last = __slice(part_start, @pos - part_start)
+      value = (parts.empty? ? last : (parts << last).join).force_encoding('UTF-8')
       __error('did not find expected node content') if value.empty?
-      trimmed = value.rstrip
+      # (a copy only when there is a blank to trim)
+      trimmed = __blank?(value.getbyte(value.bytesize - 1)) ? value.rstrip : value
       finish = [@index - value.length + trimmed.length, @line, @column - value.length + trimmed.length]
       [:scalar, trimmed, start, finish, 1]
     end
@@ -503,7 +548,7 @@ module Psych
         __take
         token = __peek
       end
-      if property_end && ([:eof, :document, :end_document].include?(token[0]) || (token[2][1] > property_end[1] && token[2][2] <= parent_indent && !(indentless && token[0] == :entry && token[2][2] == parent_indent)))
+      if property_end && (DOCUMENT_ENDS.include?(token[0]) || (token[2][1] > property_end[1] && token[2][2] <= parent_indent && !(indentless && token[0] == :entry && token[2][2] == parent_indent)))
         return __event(:scalar, [+'', anchor, tag, tag.nil?, false, 1], start, property_end)
       end
       if token[0] == :sequence || token[0] == :mapping
@@ -552,7 +597,7 @@ module Psych
           entry = __take
           @block_indent = indent
           following = __peek
-          if [:eof, :document, :end_document].include?(following[0]) || (following[2][1] > entry[2][1] && following[2][2] <= indent)
+          if DOCUMENT_ENDS.include?(following[0]) || (following[2][1] > entry[2][1] && following[2][2] <= indent)
             __empty(entry[3])
           else
             __node(indent)
@@ -582,19 +627,19 @@ module Psych
     def __mapping_key?
       return true if __peek[0] == :key
       index = 0
-      while [:anchor, :tag].include?(__peek(index)[0])
+      while PROPERTIES.include?(__peek(index)[0])
         index += 1
       end
       # Properties on their own line apply to the enclosing collection.
       return false if index > 0 && __peek(index)[2][1] != __peek[2][1]
       kind = __peek(index)[0]
-      return false unless [:scalar, :alias, :sequence, :mapping].include?(kind)
+      return false unless KEY_KINDS.include?(kind)
       if kind == :sequence || kind == :mapping
         depth = 0
         loop do
           current = __peek(index)[0]
-          depth += 1 if [:sequence, :mapping].include?(current)
-          depth -= 1 if [:sequence_end, :mapping_end].include?(current)
+          depth += 1 if OPENERS.include?(current)
+          depth -= 1 if CLOSERS.include?(current)
           return false if current == :eof
           break if depth == 0
           index += 1
@@ -622,7 +667,7 @@ module Psych
       __event(:start_mapping, [anchor, tag, tag.nil?, 1], start, __peek[2])
       loop do
         key = __peek
-        break if [:eof, :document, :end_document].include?(key[0]) || key[2][2] != indent
+        break if DOCUMENT_ENDS.include?(key[0]) || key[2][2] != indent
         explicit_key = key[0] == :key
         __error('did not find expected key') if key[0] == :value
         __take if explicit_key
@@ -632,7 +677,7 @@ module Psych
           __take
           @block_indent = indent
           following = __peek
-          if [:eof, :document, :end_document].include?(following[0]) || (following[2][1] > colon[2][1] && (following[2][2] < indent || (following[2][2] == indent && following[0] != :entry)))
+          if DOCUMENT_ENDS.include?(following[0]) || (following[2][1] > colon[2][1] && (following[2][2] < indent || (following[2][2] == indent && following[0] != :entry)))
             __empty(colon[3])
           else
             __node(indent, true, true)
