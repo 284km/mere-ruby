@@ -45,3 +45,24 @@ rescue ArgumentError => error
 end
 held.set_backtrace(nil)
 report(:cleared_backtrace, __LINE__) { native[held] }
+
+# A Method Proc invokes its captured entry even after public #call changes.
+[false, true].each do |override_first|
+  captured_method = Integer.method(:sqrt)
+  captured_proc = captured_method.to_proc unless override_first
+  def captured_method.call(*) = :singleton_replacement
+  captured_proc = captured_method.to_proc if override_first
+  [:call, :[], :yield, :===].each do |entry|
+    p [:captured_entry, override_first, entry, captured_proc.__send__(entry, 9)]
+  end
+  p [:captured_copies, override_first, captured_proc.dup[16], captured_proc.clone.yield(25)]
+  report(:captured_arity, __LINE__) { captured_proc[] }
+end
+map_method = [1, 2].method(:map)
+map_proc = map_method.to_proc
+def map_method.call(*) = :singleton_replacement
+p [:captured_block, map_proc.call { |value| value * 2 }]
+class Method
+  def call(*) = :class_replacement
+end
+p [:class_call_replaced, Integer.method(:sqrt).to_proc[36]]
