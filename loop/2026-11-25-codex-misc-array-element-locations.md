@@ -1,98 +1,78 @@
 # Parser follow-up 6: Array element source lines
 
-Branch codex-misc-array-element-locations starts from main 323706a7,
-including #239. Corpus 992 stays in the parser/lexer range.
+The evaluator now preserves the actual source lines of binary, unary,
+interpolated String and !call elements in multiline Array literals.
+Existing method, index and bare calls retain their correct lines. VM
+backtraces remain correct. Corpus 992 contains 36 output rows covering
+all shapes, actual files, nested expressions, continuations and heredocs.
 
-The evaluator now annotates call-capable binary and unary Array elements,
-which includes interpolation and !call. These use the actual element's
-source position. Existing method/index/bare-call annotations remain.
+Main 03694405 is integrated by merge 3c553557, including parser changes
+#247, #263 and #277. Review corrections share the parser's observed-line
+epoch across adjacent elements and emit a line annotation only when a
+call-capable element changes line. Literal elements do not advance that
+cache. A continued logical line uses its actual physical token position.
+Only line numbers and epochs are cached; token tails are not retained.
+No element rescans the remaining token tail. General ln_before behavior
+outside this Array-specific path is unchanged.
 
-A naive extra tok_line call per operator element was rejected during
-validation: a 10,000-element computed Array grew from about .011 s to
-.335 s. The final parser shares its logical-line lookup across consecutive
-elements and invalidates the cache when parsing observes another line.
-Continued lines retain the existing exact physical-position path. Only
-integer line/epoch counters are retained globally; token tails are not.
-Literals still avoid a position lookup entirely.
+## Final measurements and related original CRuby tests
 
-Corpus 992 checks all seven element shapes in eval and actual child files,
-a preceding multiline String, nested/multiline expressions, continuations,
-and a 100,000-element computed Array. Both engines match Ruby. The actual
-file cases preserve the VM's already-correct line behavior.
+After merging main 03694405, corpus 992 matches all 36 rows, stderr and
+status on evaluator and VM against clean Ruby 4.0.10. The ordinary O2
+candidate SHA-256 is cde6d7d1c1aef9b58ecdb0476a17a6a3f3fe19a22c7707465d24046a95bf2f7c.
+The matching main SHA-256 is 94473bd3a46d13124327720c4251a39f3604b584bafc4ef9c90ca670fe61a67c.
 
-## Large literal measurements
+Three alternating main/candidate pairs, fixed --seed=1, GC_TIGHT=1:
+| Shape / engine | Main seconds | Candidate seconds | Main max RSS bytes | Candidate max RSS bytes | Median instructions delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| array / evaluator | 0.050077 | 0.048989 | 142196736 | 142229504 | +0.300% |
+| array / VM | 0.049353 | 0.048235 | 143048704 | 143163392 | +0.432% |
+| hash / evaluator | 0.086950 | 0.090938 | 183631872 | 183697408 | -0.028% |
+| hash / VM | 0.087281 | 0.086178 | 202489856 | 202620928 | +0.094% |
+| operators / evaluator | 0.105362 | 0.103986 | 224198656 | 224313344 | +0.544% |
+| operators / VM | 0.102401 | 0.104664 | 225017856 | 225148928 | +0.507% |
 
-bench/large_literal_parse.rb runs with --seed=1 and tight GC, interleaving
-main and candidate three times each. Values below are medians of elapsed
-seconds and maxima of RSS bytes. The busy host makes elapsed times noisy;
-instruction counts are included separately.
+Array/Hash sizes remain 100,000 elements / 50,000 keys. Operator arrays
+contain 100,000 computed elements. The old ~14 MB annotation allocation
+and ~4.5% instruction increase are removed; the remaining instruction
+change is approximately 0.3–0.5% for Arrays and -0.03–0.09% for Hashes.
 
-| Shape / engine | Main seconds | Candidate seconds | Main RSS bytes | Candidate RSS bytes |
-| --- | ---: | ---: | ---: | ---: |
-| 100,000 Array / eval | 0.127494 | 0.094204 | 140820480 | 140853248 |
-| 100,000 Array / vm | 0.070281 | 0.107629 | 141770752 | 141623296 |
-| 50,000 Hash keys / eval | 0.119911 | 0.244550 | 182632448 | 184565760 |
-| 50,000 Hash keys / vm | 0.129745 | 0.104955 | 201310208 | 201408512 |
-| 100,000 operator Array / eval | 0.271213 | 0.258742 | 222937088 | 237240320 |
-| 100,000 operator Array / vm | 0.283328 | 0.490507 | 223789056 | 238075904 |
+test_backtrace unchanged original selections, --seed=1, GC_TIGHT=1:
 
-Median instructions for the bare 100,000-element Array are 1.615 G main
-versus 1.617 G candidate on evaluator, and 1.611 G versus 1.615 G on VM.
-For 50,000 Hash keys they are 3.624 G versus 3.634 G, and 4.198 G versus
-4.203 G. The computed 100,000-element Array takes 2.365 G / 2.373 G
-candidate instructions, versus 2.262 G / 2.260 G on main; it remains a
-linear parse instead of rescanning the rest of the line for each element.
+| Phase | Result | Max RSS bytes |
+| --- | --- | ---: |
+| ref-eval | 3 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 22855680 |
+| main-eval | 3 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 169852928 |
+| candidate-eval | 3 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 172146688 |
+| main-vm | 3 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 173572096 |
+| candidate-vm | 3 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 175472640 |
 
-The unchanged test_allocation.rb Literal selections run separately with
-their original 100,000-element Array and 100,000-key Hash sizes and original
-budgets. Both pass 2 tests / 8 assertions on both builds and engines:
+test_allocation unchanged original selections, --seed=1, GC_TIGHT=1:
 
-| Engine / case | Main seconds | Candidate seconds | Main file RSS bytes | Candidate file RSS bytes |
-| --- | ---: | ---: | ---: | ---: |
-| Evaluator / Array | 0.59 | 0.66 | 316473344 | 316522496 |
-| Evaluator / Hash | 1.07 | 1.21 | 316473344 | 316522496 |
-| VM / Array | 0.59 | 0.56 | 328024064 | 342196224 |
-| VM / Hash | 1.35 | 1.61 | 328024064 | 342196224 |
-
-## Related unchanged upstream backtrace file
-
-| File | Candidate result | Main evaluator RSS | Candidate evaluator RSS | Main VM RSS | Candidate VM RSS |
-| --- | --- | ---: | ---: | ---: | ---: |
-| ruby/test_backtrace.rb | 3 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 172048384 | 172441600 | 173916160 | 174653440 |
-
-## Validation policy
-
-The reference is the clean pinned Ruby 4.0.10. The unchanged upstream
-files above run one file at a time, against main and both candidate engines,
-with `--seed=1` and `MERE_RUBY_GC_TIGHT=1`. RSS is max resident bytes from
-`/usr/bin/time -l`. No gems are installed into the reference.
-
-The ordinary O2 binary uses compiler 9dec2ff6 and mgz 661a01d8, SHA-256
-29b1e5bd472f051cecd1b8831682c928ba4a4cdfb467b5a27a6cb90021265592.
-Both sh run_corpus.sh --both and MERE_RUBY_VM=1 sh run_corpus.sh --both
-complete 893/893 with hash indexing ON and OFF. All eight source gates
-and the full record_hygiene pass in each sweep. Generated-C bracket
-depth passes 155 required / 1024 supplied; explicit completed-note
-hygiene is checked before publishing these results. Current-main merge
-preflight at fd5f54b0 is clean, not a tested integration build.
-No full unit suite or Rails component suite was run; no workflow changes.
+| Phase | Result | Max RSS bytes |
+| --- | --- | ---: |
+| ref-eval | 2 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 77348864 |
+| main-eval | 2 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 312819712 |
+| candidate-eval | 2 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 311705600 |
+| main-vm | 2 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 322650112 |
+| candidate-vm | 2 tests, 8 assertions, 0 failures, 0 errors, 0 skips | 326483968 |
 
 
-## Review correction: repeated-line annotation cost and current main
 
-Review 6058821085 identifies the old operator-literal RSS/instruction
-increase and asks for current-main integration. Main 03160dc9 is merged
-locally before the correction. The array's existing line cache now avoids
-both the line-lookup helper call and the annotation node when an earlier
-call-capable element already established the same observed logical line.
-Literal elements do not advance the cached call line. Nested parsing that
-observes another line invalidates it; continued physical lines retain the
-exact tc_phys lookup. This retains real source positions without scanning
-the token tail for every element.
+## Completed acceptance
 
-Corpus 992 adds same-line successful/raising calls, preceding literals,
-nested/newline expressions and a heredoc whose body precedes the next
-source-order operation. Fresh focused/reference comparisons, fixed-seed
-GC_TIGHT instruction/RSS measurements and both full corpus sweeps on this
-merged tree are pending. Earlier 893/893 sweeps describe the earlier head.
-The completed new record will be committed with the code, in one push.
+- `sh run_corpus.sh --both`: **954/954 PASS**, hash index ON and OFF.
+- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: **954/954 PASS**, hash index ON and OFF.
+- Both sweeps used exactly the r4 binary and fixture tree measured above.
+- All eight source gates PASS: gc_roots, dup_defs, dead_defs, meth_writes,
+  name_spec, rx_caps, ns_names and name_len.
+- Generated-C bracket gate PASS: 155 required, 1024 supplied.
+- Full record_hygiene and explicit completed-loop record_hygiene PASS.
+- `git diff --check` and staged whitespace checks PASS.
+- Clean reference Ruby 4.0.10 selected with `tools/ref_ruby.sh`.
+
+Measurements use fixed --seed=1 and MERE_RUBY_GC_TIGHT=1. The reference,
+matching main, and both candidate engines run the unchanged related CRuby
+selections one file at a time. No full unit or Rails component suite is
+run; no workflow is changed. Ordinary O2, compiler 9dec2ff6, mgz 661a01d8.
+The correction and this completed record are submitted in one push.
