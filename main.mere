@@ -11932,7 +11932,7 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
              iter_result (FNext recv) recv))
     else if (str_len name == 3 && str_eq name "sum") then (match args with Cons (init, _) -> arr_sum_blk world encl theblk id 0 xs (arr_ver id) init (sum_native_number init) | Nil -> arr_sum_blk world encl theblk id 0 xs (arr_ver id) (VInt 0) true)
     else if (str_len name == 9 && str_eq name "partition") then arr_partition world encl theblk id 0 xs (arr_ver id) Nil Nil
-    else if (str_len name == 8 && str_eq name "group_by") then arr_group_by world encl theblk xs Nil
+    else if (str_len name == 8 && str_eq name "group_by") then arr_group_by world encl theblk xs
     else if (str_len name == 16 && str_eq name "each_with_object") then (match args with Cons (o, _) -> arr_each_with_object world encl theblk xs o | Nil -> VNil)
     else if (str_len name == 10 && str_eq name "take_while") then iter_result (arr_take_while world encl theblk id 0 xs (arr_ver id)) recv
     else if (str_len name == 10 && str_eq name "drop_while") then iter_result (arr_drop_while world encl theblk id 0 xs (arr_ver id)) recv
@@ -13631,24 +13631,102 @@ and arr_partition = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i: i
        else arr_partition world encl theblk id (i + 1) t ver yes (Cons (h, no)))
 
 // group_by: hash of block-value -> array of elements (first-seen order).
-and arr_group_by = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) ->
+// It is ruby's own loop (enum.c group_by_i): `h[k]`, then `h[k] = [x]` for a
+// new key or a push onto the array that is there (the append queue,
+// arr_push_many). A String key is stored as a frozen copy, as `[]=` stores
+// it, and a key with its own #hash / #eql? is grouped by them -- ActiveRecord's
+// preloader runs `loaders.group_by(&:loader_query)`, and each query was a
+// group of its own, one SELECT per association where ruby sends one.
+// ⚠ IT WAS n^2 TWICE, IN MEMORY. The groups lived in a `Val list` of pairs
+// rebuilt per new key, and a key seen before got a NEW array of its old list
+// plus one, every copy into arr_store's arena. 8,192 elements under one key
+// held 7.8 GB and took 18 s; 32,768 distinct keys, 9.8 GB. eager_test's
+// preloads ran out of memory here (rails-ar-group-by-linear). The arrays are
+// this call's own until it returns, so pushing onto them is not seen.
+// Two halves. Up to hsmall_max plain keys (gb_plain_key) the table is a list
+// made into the Hash once, at the end -- what a small hash IS (mkhash keeps
+// one of plain keys as its list alone). The Hash's own door for a new key
+// (hpush_new, and the read after it folding its queue) cost 2.4 times the old
+// list's work on `(1..10).group_by { |x| x % 10 }`. Past that, or at the first
+// key that is not plain, the list becomes the Hash and the rest go through it.
+and arr_group_by = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  gb_small world encl theblk xs (Nil : Val list) 0
+// acc: [group, key, group, key, ...], the NEWEST pair first; n: its keys
+and gb_small = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) -> fn (n: int) ->
   match xs with
-  | Nil -> hstored_seed gc_cenv0 world (mkhash acc)
-  | Cons (h, t) ->
-    let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
-    // a key with its own #hash / #eql? is grouped by them, as `h[k] <<= x`
-    // would: ActiveRecord's preloader runs `loaders.group_by(&:loader_query)`
-    // and each query was a group of its own -- one SELECT per association
-    // where ruby sends one for all of them
-    if elems_user_hash world (Cons (k, Nil)) then
-      (let (found9, cur9) = hash_lookup_w gc_cenv0 world (0 - 1) acc k in
-       let lst = (match cur9 with
-                  | VArr id -> (if found9 then list_append (deref id) (Cons (h, Nil)) else Cons (h, Nil))
-                  | _ -> Cons (h, Nil)) in
-       arr_group_by world encl theblk t (hash_put_w gc_cenv0 world (0 - 1) acc k (arr_new lst)))
-    else
-    let lst = (match hash_get acc k with VArr id -> list_append (deref id) (Cons (h, Nil)) | _ -> Cons (h, Nil)) in
-    arr_group_by world encl theblk t (hash_put acc k (arr_new lst))
+  | Nil -> gb_seal acc
+  | Cons (x9, t9) ->
+    (match run_block world encl theblk (Cons (x9, Nil)) with
+     // (`break v` in the block answers v, as partition's does; this one
+     //  stored v as a key and went on)
+     | FBreak v9 -> v9
+     | f9 ->
+       (let k9 = flow_value f9 in
+        if gb_plain_key k9 then
+          (match gb_find acc k9 with
+           | VArr id9 -> (let _ = arr_push_many id9 (Cons (x9, Nil)) in gb_small world encl theblk t9 acc n)
+           | _ ->
+             (if n < hsmall_max
+              then gb_small world encl theblk t9 (Cons (arr_new (Cons (x9, Nil)), Cons (gb_key world k9, acc))) (n + 1)
+              else gb_spill world encl theblk acc k9 x9 t9))
+        else gb_spill world encl theblk acc k9 x9 t9))
+and gb_spill = fn world -> fn encl -> fn theblk -> fn (acc: Val list) -> fn (k9: Val) -> fn (x9: Val) -> fn (t9: Val list) ->
+  let h9 = gb_seal acc in
+  let _ = gb_add world h9 k9 x9 in
+  gb_big world encl theblk h9 t9
+and gb_big = fn world -> fn encl -> fn theblk -> fn (h9: Val) -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> h9
+  | Cons (x9, t9) ->
+    (match run_block world encl theblk (Cons (x9, Nil)) with
+     | FBreak v9 -> v9
+     | f9 -> (let _ = gb_add world h9 (flow_value f9) x9 in gb_big world encl theblk h9 t9))
+// one element into the Hash: a plain key by the index, any other through `[]`
+// and `[]=`, which ask its #hash and #eql?
+and gb_add = fn world -> fn (h9: Val) -> fn (k9: Val) -> fn (x9: Val) ->
+  let hid9 = (match h9 with VHsh i9 -> i9 | _ -> 0) in
+  if gb_plain_key k9 then
+    (match gb_get hid9 k9 with
+     | VArr id9 -> arr_push_many id9 (Cons (x9, Nil))
+     | _ -> hpush_new hid9 (gb_key world k9) (arr_new (Cons (x9, Nil))))
+  else
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     match invoke_val_c gc_cenv0 world nb9 h9 "[]" (Cons (k9, Nil)) false with
+     | VArr id9 -> arr_push_many id9 (Cons (x9, Nil))
+     | _ -> (let _ = invoke_val_c gc_cenv0 world nb9 h9 "[]=" (Cons (k9, Cons (arr_new (Cons (x9, Nil)), Nil))) false in ()))
+// (keys that need no door: a value that compares by content and has no #hash
+//  of its own to ask)
+and gb_plain_key = fn (k: Val) ->
+  match k with
+  | VInt _ -> true | VSym _ -> true | VNil -> true | VBool _ -> true | VStr _ -> true
+  | VFlt f -> f == f
+  | _ -> false
+// a plain key as the Hash stores it: a String as its frozen copy
+// (hash_store_key's last step -- an absent key has no earlier key object to keep)
+and gb_key = fn world -> fn (k: Val) ->
+  match k with
+  | VStr sh9 -> (if sfrozen_get sh9 || skey_keep world sh9 then k else hkey_str_copy sh9)
+  | _ -> k
+and gb_find = fn (acc: Val list) -> fn (k: Val) ->
+  match acc with
+  | Cons (g9, Cons (k2, t9)) -> (if hkey_eql k2 k then g9 else gb_find t9 k)
+  | _ -> VNil
+// the list, oldest pair first, as the Hash
+and gb_seal = fn (acc: Val list) ->
+  let rec go9 = fn (ys: Val list) -> fn (out: Val list) ->
+    (match ys with
+     | Cons (g9, Cons (k9, t9)) -> go9 t9 (Cons (k9, Cons (g9, out)))
+     | _ -> out) in
+  mkhash (go9 acc Nil)
+// ...and a plain key's group in the Hash, if it has one: by the index when the
+// hash has one (a read through hderef folds the queue a new key just went
+// into, every time), else by the walk of a small list
+and gb_get = fn (hid: int) -> fn (k: Val) ->
+  if hidx_use hid then
+    (let d9 = hkey_dig hid k in
+     if str_eq d9 "" then hix_get hid false (hderef hid) k
+     else if hidx_has hid d9 then hidx_get hid d9 else VNil)
+  else hix_get hid false (hderef hid) k
 // A table built from pairs, entered again through `[]=` when a key carries
 // its own #hash / #eql? -- what a hash LITERAL does (EHsh). The structural
 // merge keeps two keys that say they are equal as two entries.
