@@ -1,3 +1,14 @@
+Current-main integration requested by the owner: merge 83bc5735. Resolve
+splat conversion by retaining native anonymous-rest/source handling and
+main's invoke_own boundary for Hash/Object to_a callbacks. Existing frame and
+ivar doors remain intact. The Major correction passed 32 focused engine
+comparisons, four unchanged whole files and isolated resource controls at
+05387e86 versus main6d; these retain those identities. Per the owner's
+latest request, repeat corpus --both, VM corpus and source gates on the
+integrated head, then push the code and records together and wait for the
+bot's exact-head review before ready/owner merge. No complete unit suite
+or Rails cold measurement is scheduled. Integrated acceptance is pending.
+
 The first follow-up build matched the 94-line corpus and the exact direct
 review witnesses, but an additional 48-control private matrix exposed empty
 keyword distinctions. A literal **{} snapshots the Array; an empty variable

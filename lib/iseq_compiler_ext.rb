@@ -1092,8 +1092,12 @@ class RubyVM::InstructionSequence
         #  stays as it was written -- reaching a value, not its receiver:
         #  ruby 4.0's `for o.x, y in [[1, 2]]` calls x= on the 2. The
         #  sequence is ruby's, and so is what it does.)
+        # (...and a splat's own target is compiled with no state at all, as
+        #  pm_compile_for_node_index hands it NULL: `for *h[:k] in o` writes
+        #  h[:k] with the receiver and the key where they were pushed, no
+        #  topn and nothing left to pop)
         if t.is_a?(Prism::MultiTargetNode) then multi_target(child, t, writes, cleanup, st)
-        else target(child, t, writes, cleanup, st)
+        else target(child, t, writes, cleanup, nil)
         end
         # (the four calls are on the value, with FCALL as ruby writes them:
         #  marked for the VM, to which FCALL is a call without a receiver)
@@ -2168,10 +2172,16 @@ class RubyVM::InstructionSequence
         winsn(writes, t, :setconstant, t.name)
       when Prism::ConstantPathTargetNode
         if t.parent then node(u, t.parent, false) else (here(u, t); u.insn(:putobject, Object)) end
-        tn = winsn(writes, t, :topn, 1)
-        mstate_push(st, [tn], 1)
+        # (with no state -- a for loop's splat target -- the parent is
+        #  swapped under the value and written to, as ruby's is)
+        if st.nil?
+          winsn(writes, t, :swap)
+        else
+          tn = winsn(writes, t, :topn, 1)
+          mstate_push(st, [tn], 1)
+        end
         winsn(writes, t, :setconstant, t.name)
-        winsn(cleanup, t, :pop)
+        winsn(cleanup, t, :pop) if st
       when Prism::CallTargetNode
         node(u, t.receiver, false)
         safe = nil
@@ -2181,27 +2191,32 @@ class RubyVM::InstructionSequence
           u.insn(:dup)
           u.insn(:branchnil, safe)
         end
-        tn = winsn(writes, t, :topn, 1)
-        mstate_push(st, [tn], 1)
-        winsn(writes, t, :swap)
+        if st
+          tn = winsn(writes, t, :topn, 1)
+          mstate_push(st, [tn], 1)
+          winsn(writes, t, :swap)
+        end
         flag = CALL_ARGS_SIMPLE
         flag |= CALL_FCALL if t.ignore_visibility?
         winsn(writes, t, :send, CallData.new(t.name, flag, 1, nil), nil)
+        writes << safe if safe && st.nil?
         winsn(writes, t, :pop)
-        writes << safe if safe
-        winsn(cleanup, t, :pop)
+        writes << safe if safe && st
+        winsn(cleanup, t, :pop) if st
       when Prism::IndexTargetNode
         node(u, t.receiver, false)
         argc, flag, kws = setup_args(u, t.arguments, t.block, [t.location.start_line, t.node_id])
         raise NotImplementedError, "RubyVM::InstructionSequence: an index target with keywords is not compiled yet" if kws
-        topns = [winsn(writes, t, :topn, argc + 1)]
-        mstate_push(st, topns, argc + 1)
-        if argc == 0
-          winsn(writes, t, :swap)
-        else
-          # (the update reaches the first argc + 1 of them, not the last)
-          argc.times { topns << winsn(writes, t, :topn, argc + 1) }
-          winsn(writes, t, :topn, argc + 1)
+        if st
+          topns = [winsn(writes, t, :topn, argc + 1)]
+          mstate_push(st, topns, argc + 1)
+          if argc == 0
+            winsn(writes, t, :swap)
+          else
+            # (the update reaches the first argc + 1 of them, not the last)
+            argc.times { topns << winsn(writes, t, :topn, argc + 1) }
+            winsn(writes, t, :topn, argc + 1)
+          end
         end
         ci_argc = argc + 1
         if flag & CALL_ARGS_SPLAT != 0
@@ -2212,8 +2227,10 @@ class RubyVM::InstructionSequence
         flag |= CALL_ARGS_SIMPLE if (flag & (CALL_ARGS_SPLAT | CALL_ARGS_BLOCKARG | CALL_KW_SPLAT)) == 0
         winsn(writes, t, :send, CallData.new(:[]=, flag, ci_argc, nil), nil)
         winsn(writes, t, :pop)
-        winsn(writes, t, :pop) if argc != 0
-        (argc + 1).times { winsn(cleanup, t, :pop) }
+        if st
+          winsn(writes, t, :pop) if argc != 0
+          (argc + 1).times { winsn(cleanup, t, :pop) }
+        end
       when Prism::MultiTargetNode
         before = st.position
         st.position -= 1
