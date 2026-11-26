@@ -602,8 +602,23 @@ unless defined?(::Ripper)
             walk = result.errors.all? { |error| PARSE_Y_WALKS.include?(error.type) }
             @__verrs = {} if walk
             heredoc_id = false
+            # A rejected expression can still have real scanner tokens before
+            # the diagnostic. Obtain only those tokens from the lexer; valid
+            # parses keep their existing single-parse path.
+            ignored = if source.include?("\n")
+              Prism.lex(source).value.filter_map { |token, _| token if token.type == :IGNORED_NEWLINE }
+            else
+              []
+            end
+            ignored_index = 0
+            __parse_parameter_prefix if result.errors.first&.type == :parameter_order
             result.errors.each do |error|
               location = error.location
+              while (token = ignored[ignored_index]) && token.location.start_offset <= location.start_offset
+                bounds(token.location)
+                on_ignored_nl(token.value)
+                ignored_index += 1
+              end
               bounds(location)
 
               # (`<<"` with nothing after: Prism ignores the `<<` and finds a
@@ -672,7 +687,93 @@ unless defined?(::Ripper)
           error ? on_assign_error(error.message, field) : field
         end
 
+        # Walk the parser's recovered AST only through the accepted parameter
+        # prefix. The real block parameter precedes the rejected parameter;
+        # continuing into the enclosing block would emit events after failure.
+        def __parse_parameter_prefix
+          error = result.errors.find { |item| item.type == :parameter_order }
+          stack = [result.value]
+          target = nil
+          until stack.empty?
+            node = stack.pop
+            if node.is_a?(ParametersNode) && node.block &&
+                node.block.location.end_offset <= error.location.start_offset &&
+                node.location.start_offset <= error.location.start_offset &&
+                error.location.end_offset <= node.location.end_offset
+              target = node
+              break
+            end
+            stack.concat(node.compact_child_nodes)
+          end
+          return unless target
+          @__parameter_prefix = target
+          catch(:__ripper_parameter_prefix_end) { result.value.accept(self) }
+        ensure
+          @__parameter_prefix = nil
+        end
+
         public
+
+        def visit_parameters_node(node)
+          unless node.equal?(@__parameter_prefix)
+            requireds = node.requireds.map { |required| required.is_a?(MultiTargetNode) ? visit_destructured_parameter_node(required) : visit(required) } if node.requireds.any?
+            optionals = visit_all(node.optionals) if node.optionals.any?
+            rest = visit(node.rest)
+            posts = node.posts.map { |post| post.is_a?(MultiTargetNode) ? visit_destructured_parameter_node(post) : visit(post) } if node.posts.any?
+            keywords = visit_all(node.keywords) if node.keywords.any?
+            keyword_rest = visit(node.keyword_rest)
+            block = visit(node.block)
+            bounds(node.location)
+            return on_params(requireds, optionals, rest, posts, keywords, keyword_rest, block)
+          end
+          ending = node.block.location.start_offset
+          before = ->(child) { child && child.location.end_offset <= ending }
+          requireds = node.requireds.select(&before).map { |child| visit(child) }
+          optionals = node.optionals.select(&before).map { |child| visit(child) }
+          rest = before.call(node.rest) ? visit(node.rest) : nil
+          posts = node.posts.select(&before).map { |child| visit(child) }
+          keywords = node.keywords.select(&before).map { |child| visit(child) }
+          keyword_rest = before.call(node.keyword_rest) ? visit(node.keyword_rest) : nil
+          block = visit(node.block)
+          bounds(node.location)
+          on_params(requireds.empty? ? nil : requireds, optionals.empty? ? nil : optionals,
+                    rest, posts.empty? ? nil : posts, keywords.empty? ? nil : keywords,
+                    keyword_rest, block)
+          throw :__ripper_parameter_prefix_end
+        end
+
+        alias __ordinary_string_node visit_string_node
+        def visit_string_node(node)
+          return __ordinary_string_node(node) unless node.heredoc? && !node.opening.start_with?("<<~")
+          bounds(node.opening_loc)
+          on_heredoc_beg(node.opening)
+          bounds(node.content_loc)
+          content = on_string_content
+          text = on_tstring_content(node.content) unless node.content.empty?
+          bounds(node.closing_loc)
+          on_heredoc_end(node.closing)
+          content = on_string_add(content, text) unless node.content.empty?
+          bounds(node.location)
+          on_string_literal(content)
+        end
+
+        alias __ordinary_interpolated_string_node visit_interpolated_string_node
+        def visit_interpolated_string_node(node)
+          return __ordinary_interpolated_string_node(node) unless node.heredoc? && !node.opening.start_with?("<<~")
+          bounds(node.opening_loc)
+          on_heredoc_beg(node.opening)
+          content = on_string_content
+          node.parts.each_with_index do |part, index|
+            value = visit_string_content(part)
+            if index == node.parts.length - 1
+              bounds(node.closing_loc)
+              on_heredoc_end(node.closing)
+            end
+            content = on_string_add(content, value)
+          end
+          bounds(node.location)
+          on_string_literal(content)
+        end
 
         def visit_global_variable_write_node(node)
           bounds(node.name_loc)
