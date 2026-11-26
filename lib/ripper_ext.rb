@@ -87,12 +87,16 @@ unless defined?(::Ripper)
     # The lexer state at the current token: the translation has no lexer
     # running while it walks the tree.
     def state
-      nil
+      @__parsing ? @__regexp_diagnostic_state : nil
     end
 
     # The current token: the same.
     def token
-      nil
+      @__parsing ? @__regexp_diagnostic_token : nil
+    end
+
+    def error?
+      @__regexp_error || result.failure?
     end
 
     alias __translation_parse parse
@@ -322,9 +326,24 @@ unless defined?(::Ripper)
       def parse(raise_errors: false)
         source = @source.to_s
         result = Prism.lex_compat(source, filepath: @filename, line: @lineno, version: "current")
-        @errors = result.errors.map do |error|
-          loc = error.location
-          Elem.new([loc.start_line, loc.start_column], :on_parse_error, "", 0, error.message)
+        errors = result.errors
+        if errors.empty?
+          @errors = []
+        else
+          # Recovery is a cold native parser path. Valid lexing uses the
+          # original public producer and does not scan recovery markers.
+          recover = errors.any? do |error|
+            error.type == :heredoc_term ||
+              (error.type == :unexpected_token_ignore && error.location.slice == "}")
+          end
+          if recover && Prism.respond_to?(:__ripper_lex_compat)
+            result = Prism.__ripper_lex_compat(source, filepath: @filename, line: @lineno, version: "current")
+            errors = result.errors
+          end
+          @errors = errors.map do |error|
+            loc = error.location
+            Elem.new([loc.start_line, loc.start_column], :on_parse_error, "", 0, error.message)
+          end
         end
         if raise_errors and !@errors.empty?
           raise SyntaxError, @errors.map(&:message).join(" ;")
@@ -540,6 +559,39 @@ unless defined?(::Ripper)
   module Prism
     module Translation
       class Ripper
+        # parse.y compiles static regexp bodies after the closing token. Keep
+        # the event values and positions from the actual Prism node, then ask
+        # the runtime's regexp validator for errors Prism syntax accepts.
+        def visit_regular_expression_node(node)
+          bounds(node.opening_loc)
+          on_regexp_beg(node.opening)
+          bounds(node.content_loc)
+          parts = on_regexp_new
+          unless node.content.empty?
+            content = on_tstring_content(node.content)
+            bounds(node.closing_loc)
+            parts = on_regexp_add(parts, content)
+          end
+          closing_location = node.closing_loc
+          bounds(closing_location)
+          closing = on_regexp_end(node.closing)
+          @lineno = closing_location.end_line
+          @column = closing_location.end_column
+          message = Prism.__prism_ripper_regexp_error(node.content, node.closing[1..])
+          if message
+            begin
+              @__regexp_diagnostic_state = EXPR_END
+              @__regexp_diagnostic_token = ""
+              compile_error(message)
+            ensure
+              @__regexp_diagnostic_state = @__regexp_diagnostic_token = nil
+            end
+            # During compile_error the new error has not been recorded yet.
+            @__regexp_error = true
+          end
+          on_regexp_literal(parts, closing)
+        end
+
         # The translation's #parse (prism 1.9), with parse.y's way of reporting:
         #
         # - a magic comment's name has its "-" as "_" (parser_magic_comment);
@@ -602,8 +654,23 @@ unless defined?(::Ripper)
             walk = result.errors.all? { |error| PARSE_Y_WALKS.include?(error.type) }
             @__verrs = {} if walk
             heredoc_id = false
+            # A rejected expression can still have real scanner tokens before
+            # the diagnostic. Obtain only those tokens from the lexer; valid
+            # parses keep their existing single-parse path.
+            ignored = if source.include?("\n")
+              Prism.lex(source).value.filter_map { |token, _| token if token.type == :IGNORED_NEWLINE }
+            else
+              []
+            end
+            ignored_index = 0
+            __parse_parameter_prefix if result.errors.first&.type == :parameter_order
             result.errors.each do |error|
               location = error.location
+              while (token = ignored[ignored_index]) && token.location.start_offset <= location.start_offset
+                bounds(token.location)
+                on_ignored_nl(token.value)
+                ignored_index += 1
+              end
               bounds(location)
 
               # (`<<"` with nothing after: Prism ignores the `<<` and finds a
@@ -672,7 +739,93 @@ unless defined?(::Ripper)
           error ? on_assign_error(error.message, field) : field
         end
 
+        # Walk the parser's recovered AST only through the accepted parameter
+        # prefix. The real block parameter precedes the rejected parameter;
+        # continuing into the enclosing block would emit events after failure.
+        def __parse_parameter_prefix
+          error = result.errors.find { |item| item.type == :parameter_order }
+          stack = [result.value]
+          target = nil
+          until stack.empty?
+            node = stack.pop
+            if node.is_a?(ParametersNode) && node.block &&
+                node.block.location.end_offset <= error.location.start_offset &&
+                node.location.start_offset <= error.location.start_offset &&
+                error.location.end_offset <= node.location.end_offset
+              target = node
+              break
+            end
+            stack.concat(node.compact_child_nodes)
+          end
+          return unless target
+          @__parameter_prefix = target
+          catch(:__ripper_parameter_prefix_end) { result.value.accept(self) }
+        ensure
+          @__parameter_prefix = nil
+        end
+
         public
+
+        def visit_parameters_node(node)
+          unless node.equal?(@__parameter_prefix)
+            requireds = node.requireds.map { |required| required.is_a?(MultiTargetNode) ? visit_destructured_parameter_node(required) : visit(required) } if node.requireds.any?
+            optionals = visit_all(node.optionals) if node.optionals.any?
+            rest = visit(node.rest)
+            posts = node.posts.map { |post| post.is_a?(MultiTargetNode) ? visit_destructured_parameter_node(post) : visit(post) } if node.posts.any?
+            keywords = visit_all(node.keywords) if node.keywords.any?
+            keyword_rest = visit(node.keyword_rest)
+            block = visit(node.block)
+            bounds(node.location)
+            return on_params(requireds, optionals, rest, posts, keywords, keyword_rest, block)
+          end
+          ending = node.block.location.start_offset
+          before = ->(child) { child && child.location.end_offset <= ending }
+          requireds = node.requireds.select(&before).map { |child| visit(child) }
+          optionals = node.optionals.select(&before).map { |child| visit(child) }
+          rest = before.call(node.rest) ? visit(node.rest) : nil
+          posts = node.posts.select(&before).map { |child| visit(child) }
+          keywords = node.keywords.select(&before).map { |child| visit(child) }
+          keyword_rest = before.call(node.keyword_rest) ? visit(node.keyword_rest) : nil
+          block = visit(node.block)
+          bounds(node.location)
+          on_params(requireds.empty? ? nil : requireds, optionals.empty? ? nil : optionals,
+                    rest, posts.empty? ? nil : posts, keywords.empty? ? nil : keywords,
+                    keyword_rest, block)
+          throw :__ripper_parameter_prefix_end
+        end
+
+        alias __ordinary_string_node visit_string_node
+        def visit_string_node(node)
+          return __ordinary_string_node(node) unless node.heredoc? && !node.opening.start_with?("<<~")
+          bounds(node.opening_loc)
+          on_heredoc_beg(node.opening)
+          bounds(node.content_loc)
+          content = on_string_content
+          text = on_tstring_content(node.content) unless node.content.empty?
+          bounds(node.closing_loc)
+          on_heredoc_end(node.closing)
+          content = on_string_add(content, text) unless node.content.empty?
+          bounds(node.location)
+          on_string_literal(content)
+        end
+
+        alias __ordinary_interpolated_string_node visit_interpolated_string_node
+        def visit_interpolated_string_node(node)
+          return __ordinary_interpolated_string_node(node) unless node.heredoc? && !node.opening.start_with?("<<~")
+          bounds(node.opening_loc)
+          on_heredoc_beg(node.opening)
+          content = on_string_content
+          node.parts.each_with_index do |part, index|
+            value = visit_string_content(part)
+            if index == node.parts.length - 1
+              bounds(node.closing_loc)
+              on_heredoc_end(node.closing)
+            end
+            content = on_string_add(content, value)
+          end
+          bounds(node.location)
+          on_string_literal(content)
+        end
 
         def visit_global_variable_write_node(node)
           bounds(node.name_loc)
@@ -948,7 +1101,9 @@ unless defined?(::Ripper)
                 if node.opening_loc.nil?
                   bounds(node.location)
 
-                  if node.arguments.nil? && !node.block.is_a?(BlockArgumentNode)
+                  constant_command = node.block.is_a?(BlockNode) && node.call_operator == "::" &&
+                    Prism::StringQuery.constant?(node.message)
+                  if node.arguments.nil? && !node.block.is_a?(BlockArgumentNode) && !constant_command
                     on_call(receiver, call_operator, message)
                   else
                     on_command_call(receiver, call_operator, message, arguments)
