@@ -200,6 +200,11 @@ module Psych
       byte == 32 || byte == 10 || byte == 9 || byte == 13
     end
 
+    # A-Z a-z 0-9 _ -
+    def __name_byte?(byte)
+      (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 45
+    end
+
     # , [ ] { }
     def __flow_indicator?(byte)
       byte == 44 || byte == 91 || byte == 93 || byte == 123 || byte == 125
@@ -277,7 +282,7 @@ module Psych
     def __space
       loop do
         c = __byte(@pos)
-        __error('found character that cannot start any token') if c == 9 && !@line_content
+        __error('found character that cannot start any token', nil, 'while scanning for the next token') if c == 9 && !@line_content
         if __blank?(c)
           __advance
         elsif c == 35
@@ -346,12 +351,18 @@ module Psych
         end
       end
       if c == 38 || c == 42
+        # (libyaml's name: letters, digits, '_' and '-', ended by a blank or
+        #  one of ? : , ] } % @ ` -- anything else is an error at the & or *)
         __advance
         from = @pos
-        while @pos < @length && !(__blank?(__byte(@pos)) || __flow_indicator?(__byte(@pos)))
-          __advance
+        __advance while (b = __byte(@pos)) && __name_byte?(b)
+        following = __byte(@pos)
+        if @pos == from || !(following.nil? || __blank?(following) || following == 63 || following == 58 ||
+                             following == 44 || following == 93 || following == 125 || following == 37 ||
+                             following == 64 || following == 96)
+          __error('did not find expected alphabetic or numeric character', start,
+                  c == 38 ? 'while scanning an anchor' : 'while scanning an alias')
         end
-        __error('did not find expected alphabetic or numeric character') if @pos == from
         return [c == 38 ? :anchor : :alias, __slice(from, @pos - from).force_encoding('UTF-8'), start, __at, nil]
       end
       if c == 33
@@ -440,6 +451,8 @@ module Psych
         if __byte(@pos) == 35
           __advance while __byte(@pos) && __byte(@pos) != 10
         end
+        # (a CRLF is one line break, as libyaml reads it)
+        __advance if __byte(@pos) == 13 && __byte(@pos + 1) == 10
         __error('did not find expected comment or line break') unless __byte(@pos).nil? || __byte(@pos) == 10
         __advance if __byte(@pos) == 10
         lines = []
@@ -457,7 +470,9 @@ module Psych
           width.times { __advance }
           body_start = @pos
           __skip(__index("\n", @pos) || @length)
-          body = __slice(body_start, @pos - body_start).force_encoding('UTF-8')
+          body_end = @pos
+          body_end -= 1 if body_end > body_start && __byte(body_end - 1) == 13 && __byte(body_end) == 10
+          body = __slice(body_start, body_end - body_start).force_encoding('UTF-8')
           body = (' ' * [width - (indent || width), 0].max) + body unless blank
           newline = __byte(@pos) == 10
           __advance if newline
@@ -488,7 +503,7 @@ module Psych
         value = +'' if !modifiers.include?('+') && lines.all? { |body, _| body.empty? }
         return [:scalar, value, start, __at, style]
       end
-      __error('found character that cannot start any token') if c == 96 || c == 64 || c == 37 || c == 9
+      __error('found character that cannot start any token', nil, 'while scanning for the next token') if c == 96 || c == 64 || c == 37 || c == 9
       parts = []
       part_start = @pos
       while @pos < @length
