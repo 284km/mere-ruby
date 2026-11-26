@@ -46,7 +46,7 @@ p [:module, VisibilityModule.private_instance_methods(false)]
 begin
   VisibilityTarget.hide_missing
 rescue NameError => error
-  p [:missing, error.class.name, error.name]
+  p [:missing, error.class.name]
 end
 
 VisibilityTarget.freeze
