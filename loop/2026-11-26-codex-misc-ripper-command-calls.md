@@ -48,3 +48,38 @@ Code, 11-row corpus and completed record are committed and pushed together.
 The comparison main is explicitly pinned to 03694405; the branch starts
 at d0843046. No whole unit/framework suite, workflow edit or reference gem
 installation.
+
+## Review correction: whole constant identifiers
+
+The review found that uppercase prefix matching also accepted C! and C?,
+which are method identifiers. Replace the prefix approximation with
+Prism::StringQuery.constant? on the actual complete message token. This
+uses Prism's own encoding-aware identifier scanner. Brace and do/end
+calls keep on_call for punctuation suffixes; actual constant command calls
+keep on_command_call. Ordinary argument calls keep their existing path.
+
+Corpus 1121 expands to 29 rows (21 sexps and 8 explicit callback/arity
+controls). Clean Ruby and the exact translation also match before the O2
+build; generated Ruby contains all six corresponding updated copies.
+The review-corrected ordinary O2 binary has SHA-256:
+7c4444e56c6140c80e08dd0a3107aef1777d5e5bb7f05dd1cd28f47227f8d54a.
+
+Both new complete sweeps use this binary:
+
+- `sh run_corpus.sh --both`: 958/958, hash index ON/OFF, exit 0.
+- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: 958/958, ON/OFF, exit 0.
+- Eight source gates, generated-C bracket depth, full and explicit loop
+  record_hygiene and whitespace checks: PASS.
+
+Unchanged original ripper/test_sexp.rb command / def_fname / defs_fname
+selections pass 3 tests / 9 assertions on reference and both candidates;
+main control 89ad241c has 3 / 9 with one failure on each engine.
+
+Maximum RSS bytes, tight GC and --seed=1:
+
+| Reference | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| ---: | ---: | ---: | ---: | ---: |
+| 22740992 | 221986816 | 227835904 | 220626944 | 226967552 |
+
+Code, expanded 29-row regression and completed record are pushed together.
+Earlier pre-review measurements remain historical and are superseded.

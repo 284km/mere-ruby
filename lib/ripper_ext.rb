@@ -949,7 +949,7 @@ unless defined?(::Ripper)
                   bounds(node.location)
 
                   constant_command = node.block.is_a?(BlockNode) && node.call_operator == "::" &&
-                    node.message.match?(/\A[[:upper:]]/)
+                    Prism::StringQuery.constant?(node.message)
                   if node.arguments.nil? && !node.block.is_a?(BlockArgumentNode) && !constant_command
                     on_call(receiver, call_operator, message)
                   else
