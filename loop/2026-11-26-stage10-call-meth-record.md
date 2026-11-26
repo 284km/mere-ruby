@@ -31,17 +31,17 @@ A define_method method still reads its closure's rows at each call, as before.
 
 ## Numbers
 
-Instructions, the median of three runs alternating main and this branch, both built with Mere 9dec2ff6 (CI's), main at 751362a3. The micro programs are per call, with the same loop without the call taken off.
+Instructions, the median of three runs alternating main and this branch, both built with Mere 9dec2ff6 (CI's), main at 0c89c8a3. The micro programs are per call, with the same loop without the call taken off.
 
 | program | evaluator: main | here | VM: main | here |
 |---|---|---|---|---|
-| a self call in a method (per call) | 21,930 | 19,380 (-11.6%) | 24,160 | 21,630 (-10.5%) |
-| a method calling another object's method (per call) | 27,810 | 25,270 (-9.1%) | 28,780 | 26,200 (-9.0%) |
-| a top-level method (per call) | 13,710 | 12,130 (-11.5%) | 15,680 | 14,100 (-10.1%) |
-| app_fib | 235.7 G | 215.4 G (-8.6%) | 227.5 G | 207.2 G (-8.9%) |
-| app_tak | 406.3 G | 378.0 G (-7.0%) | 366.6 G | 338.3 G (-7.7%) |
-| so_object | 175.9 G | 171.0 G (-2.8%) | 189.7 G | 184.9 G (-2.6%) |
-| Rails 8.1's warm boot (`bin/rails runner`) | 54.2 G | 53.6 G (-1.1%) | 53.4 G | 52.9 G (-0.9%) |
+| a self call in a method (per call) | 21,900 | 19,390 (-11.5%) | 24,230 | 21,620 (-10.8%) |
+| a method calling another object's method (per call) | 27,760 | 25,230 (-9.1%) | 28,720 | 26,230 (-8.7%) |
+| a top-level method (per call) | 13,730 | 12,160 (-11.5%) | 15,710 | 14,130 (-10.0%) |
+| app_fib | 236.1 G | 215.6 G (-8.7%) | 227.7 G | 207.3 G (-9.0%) |
+| app_tak | 406.2 G | 377.9 G (-7.0%) | 366.7 G | 338.4 G (-7.7%) |
+| so_object | 176.0 G | 171.1 G (-2.7%) | 189.8 G | 185.1 G (-2.5%) |
+| Rails 8.1's warm boot (`bin/rails runner`) | 54.3 G | 53.7 G (-1.1%) | 53.6 G | 52.9 G (-1.3%) |
 
 The boot gains less: it defines more than it calls, and each definition moves the epoch, so records are read again often there. Its maximum RSS under `MERE_RUBY_GC_TIGHT=1` is the same (the VM's median 755 MB on both).
 
@@ -56,6 +56,22 @@ The boot gains less: it defines more than it calls, and each definition moves th
   - **A gap it showed, not made.** `test_tracepoints_not_disabled_by_ractor_gc` counts the `:raise` events: 7 when the dead Ractor was collected (the RangeError `ObjectSpace._id2ref` raises then), 6 when not.
     A build of this round collected the Ractor where main does not, and the RangeError, raised in the prelude, is not reported to a TracePoint on either build (ruby reports a raise in a C method with its `method_id`).
     The final build does not collect it either, and the test reads as main. Recorded: a raise in the prelude is no `:raise` event.
+
+## #321's review
+
+- **A record written again was not given back.** A record replaced by one with other contents stayed in the table's arena: a named class's method redefined and called in a loop grew by about 220 bytes a turn (a class that comes and goes keeps no record, so the earlier fix did not reach it).
+  The rewrites are counted (`mrec_dirty`), and the collector compacts the record tables when 256 have piled up (`gc_sweep_classes`), where the stack it interrupted keeps what it borrowed. A compaction anywhere else would free the strings a running call holds of its record. Maximum RSS under `MERE_RUBY_GC_TIGHT=1`, main and here:
+
+  | loop | evaluator: main | here | VM: main | here |
+  |---|---|---|---|---|
+  | `K.define_method(:m) { \|x\| x }` and `o.m(i)`, 180,000 turns | 146.1 MB | 148.2 MB | 135.9 MB | 142.0 MB |
+  | the same, 360,000 turns | 185.3 MB | 188.5 MB | 163.0 MB | 165.3 MB |
+  | `K.class_eval("def m = 1", "x.rb", i + 1)` and `o.m`, 120,000 turns | 166.5 MB | 169.5 MB | 167.0 MB | 174.2 MB |
+  | the same, 240,000 turns | 241.5 MB | 242.1 MB | 239.1 MB | 245.3 MB |
+
+  Main's own grows with the turns; the difference does not.
+- **The parameters' memo moved the epoch.** `mrec_build` wrote it through the wrapper, so the first call of each method with parameters dropped every record, its own too. It is a memo of the Array the record keeps; written as before.
+- **The class tables' sweep** takes `mrec_tab` and `mrec_gen` too: a dead class's records go with its other rows.
 
 ## Witnesses
 
