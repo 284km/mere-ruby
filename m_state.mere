@@ -4358,6 +4358,54 @@ let tcp_buf = map_new ();
 let tcp_arena = fn () ->
   if map_has tcp_buf "p" then (match map_get tcp_buf "p" with VInt p -> p | _ -> 0)
   else (let p = mem_alloc 65536 in let _ = map_set tcp_buf "p" (VInt p) in p);
+// THE WHOLE OF WHAT A PATH GIVES. read_file takes a regular file's size and
+// reads that many bytes, which is right for a file on a disk and wrong for
+// everything that gives bytes without having a size: /proc/self/status (a
+// regular file of size 0, read as ""), a pipe or a terminal behind
+// /dev/stdin or /dev/fd/N (no size and no seek: read_file failed, and some of
+// the paths that used it died). ruby reads them all to end of file. So does
+// this: read_file for a regular file with a size, and a descriptor read until
+// it gives nothing for the rest.
+let read_path_whole = fn (path: str) ->
+  // (the stat is asked directly: file_stat answers non-zero for a path it
+  //  cannot stat, and read_file then refuses it as before. Wrapped in a
+  //  try_or it cost a seventh of a loop of small File.reads.)
+  let sized = file_stat path == 0
+              && bit_and (file_stat_field 2) 61440 == 32768 && file_stat_field 7 > 0 in
+  if sized then read_file path
+  else
+    (let fd = fd_open path "r" 0 in
+     if fd < 0 then read_file path
+     else
+       (let b = strbuf_new () in
+        let p = tcp_arena () in
+        let rec go = fn (u: unit) ->
+          (let n = fd_read fd p 65536 in
+           if n > 0 then (let _ = strbuf_push b (mem_to_str p n) in go ()) else ()) in
+        let _ = go () in
+        let _ = fd_close fd in
+        strbuf_to_str b));
+// A FILE OBJECT OVER SUCH A PATH reads it once. A File here is a path and a
+// position, and every read opens the path again at the position -- the line
+// reader reads ahead and seeks back over what it did not use. A pipe (or
+// /dev/fd/N of one) gives its bytes once, so the second line was gone; a
+// /proc file read as "". The first read of a pipe, or of a regular file of
+// size 0 that has bytes after all, keeps them on the object (__f_whole), and
+// every read, seek and eof? of it reads that. A regular file that is really
+// empty is not kept (a Tempfile written later, a log followed as it grows),
+// and neither is a character device (/dev/zero has no end to read to).
+let file_obj_stream = fn ivars -> fn (id: int) -> fn (path: str) ->
+  match iv_get_or ivars id "__f_whole" VNil with
+  | VStr h -> (true, sget h)
+  | VBool _ -> (false, "")
+  | _ ->
+    (let kind = (if file_stat path == 0 then bit_and (file_stat_field 2) 61440 else 0) in
+     let size = (if kind == 32768 then file_stat_field 7 else 0 - 1) in
+     if kind == 4096 || (kind == 32768 && size == 0) then
+       (let c = read_path_whole path in
+        if kind == 4096 || str_len c > 0 then (let _ = iv_set ivars id "__f_whole" (mkstr c) in (true, c))
+        else (false, ""))
+     else (let _ = iv_set ivars id "__f_whole" (VBool false) in (false, "")));
 
 
 // ⚠ STANDARD INPUT IS READ AS IT ARRIVES, one read(2) at a time, into the
